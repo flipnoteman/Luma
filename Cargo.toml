@@ -6,3 +6,4 @@ description = "GPU driven linear algebra/math library."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+wgpu = "22.0.0
