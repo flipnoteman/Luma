@@ -1,7 +1,6 @@
 
 # Luma
-### A cross-platform GPU-accelerated linear algebra library 
-## WIP
+A cross-platform GPU-accelerated linear algebra library WIP
 
 Current Usage Example:
 
