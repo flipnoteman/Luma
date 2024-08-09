@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use std::sync::OnceLock;
 use bytemuck::Pod;
+use uuid::Uuid;
 mod execution;
 use crate::execution::Executor;
 
@@ -37,6 +38,14 @@ static EXECUTOR: OnceLock<Executor> = OnceLock::new();
 #[derive(Debug)]
 pub struct Array {
     dimensions: [u64; 4],
+    id: String,
+}
+
+impl Drop for Array {
+    /// We need to handle when it goes out of scope by deleting it from our [Executor]
+    fn drop(&mut self) {
+        EXECUTOR.get().expect("Could not drop value").drop(&self.id);
+    }
 }
 
 impl Array {
@@ -56,17 +65,23 @@ impl Array {
             )
         }).join().unwrap().await;
 
+        let id = Uuid::new_v4();
         // Setup input output buffers with our data
         // TODO: Incorporate the dimensions array
-        EXECUTOR.get().unwrap().setup_buffers(data).await?;
+        EXECUTOR.get().unwrap().setup_buffers(data, id.into()).await?;
 
         Ok(Array {
             dimensions: *dimensions,
+            id: id.into()
         })
     }
 
-    pub async fn double_test(&self) -> Result<(), String> {
-        EXECUTOR.get().unwrap().test_fn().await
+    pub fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    pub async fn double_test(&self) -> Result<Vec<u32>, String> {
+        EXECUTOR.get().unwrap().execute_op(&self.id).await
     }
 }
 

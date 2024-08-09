@@ -36,8 +36,8 @@ impl GpuHandle {
 pub struct Executor {
     pub adapter: Option<Box<GpuHandle>>,
     pub shaders: Option<Box<ShaderResources>>,
-    storage_buffer: Arc<RwLock<Option<Buffer>>>,
-    staging_buffer: Arc<RwLock<Option<Buffer>>>,
+    storage_buffer: Arc<RwLock<HashMap<String, Buffer>>>,
+    staging_buffer: Arc<RwLock<HashMap<String, Buffer>>>,
 }
 
 impl Default for Executor {
@@ -45,8 +45,8 @@ impl Default for Executor {
         Executor {
             adapter: None,
             shaders: None,
-            storage_buffer: Arc::new(RwLock::new(None)),
-            staging_buffer: Arc::new(RwLock::new(None)),
+            storage_buffer: Arc::new(RwLock::new(HashMap::new())), // RwLock locks the value so that there can only be one writer at a time. Also, can be used for interior mutability.
+            staging_buffer: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -78,8 +78,13 @@ impl Executor {
         debug!("{:?}", self.adapter);
     }
 
+    pub fn drop(&self, id: &String) {
+        self.staging_buffer.write().unwrap().remove(id);
+        self.storage_buffer.write().unwrap().remove(id);
+    }
+
     /// Sets up storage and staging (input, output) buffers and adds them to the executor
-    pub async fn setup_buffers<T>(&self, data: &[T]) -> Result<(), String>
+    pub async fn setup_buffers<T>(&self, data: &[T], id: String) -> Result<(), String>
     where
         T: Pod,
     {
@@ -112,15 +117,15 @@ impl Executor {
             mapped_at_creation: false,
         });
 
-        *self.storage_buffer.write().unwrap() = Some(storage_buffer);
-        *self.staging_buffer.write().unwrap() = Some(staging_buffer);
+        self.storage_buffer.write().unwrap().insert(id.clone(), storage_buffer);
+        self.staging_buffer.write().unwrap().insert(id.clone(), staging_buffer);
 
         Ok(())
     }
 
     /// Test function.
     /// Doubles the array input
-    pub async fn test_fn(&self) -> Result<(), String> {
+    pub async fn execute_op(&self, id: &String) -> Result<Vec<u32>, String> {
         // Instantiate our Executor
         let Some(adapter) = self.adapter.as_ref() else {
             return Err("Not operations loaded".parse().unwrap());
@@ -131,9 +136,9 @@ impl Executor {
             return Err("Not operations loaded".parse().unwrap());
         };
         let storage_buf = self.storage_buffer.read().unwrap();
-        let storage_buffer = storage_buf.as_ref().unwrap();
+        let storage_buffer = storage_buf.get(id).unwrap();
         let staging_buf = self.staging_buffer.read().unwrap();
-        let staging_buffer = staging_buf.as_ref().unwrap();
+        let staging_buffer = staging_buf.get(id).unwrap();
 
         // A pipeline specifies the operation of a shader
         // Instantiates the pipeline.
@@ -213,10 +218,10 @@ impl Executor {
                                     //   myPointer = NULL;
                                     // It effectively frees the memory
 
-            println!("Result = {:?}", result);
-            Ok(())
+
+            Ok(result)
         } else {
-            panic!("failed to run compute on gpu!");
+            Err("failed to run compute on gpu!".into())
         }
     }
 }
