@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use bytemuck;
 use bytemuck::Pod;
 use flume;
@@ -5,11 +7,9 @@ use log::debug;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Index;
+use std::sync::{Arc, RwLock};
 use wgpu::util::DeviceExt;
-use wgpu::{
-    Buffer, Device, Features, InstanceDescriptor, InstanceFlags, MemoryHints, PowerPreference,
-    Queue, ShaderModule,
-};
+use wgpu::{Buffer, Device, Features, InstanceDescriptor, InstanceFlags, MemoryHints, PowerPreference, Queue, ShaderModule};
 
 pub type ShaderResources = HashMap<String, ShaderModule>;
 
@@ -30,12 +30,14 @@ impl GpuHandle {
     }
 }
 
+/// Executor object. Holds [ShaderResources], [GpuHandle] and [Buffer]s for dynamically executing commands on the GPU
+/// Shouldn't be called by the user. A static [Executor] must exist for the [Array] to execute operations.
 #[derive(Debug)]
 pub struct Executor {
     pub adapter: Option<Box<GpuHandle>>,
     pub shaders: Option<Box<ShaderResources>>,
-    storage_buffer: Option<Buffer>,
-    staging_buffer: Option<Buffer>,
+    storage_buffer: Arc<RwLock<Option<Buffer>>>,
+    staging_buffer: Arc<RwLock<Option<Buffer>>>,
 }
 
 impl Default for Executor {
@@ -43,8 +45,8 @@ impl Default for Executor {
         Executor {
             adapter: None,
             shaders: None,
-            storage_buffer: None,
-            staging_buffer: None,
+            storage_buffer: Arc::new(RwLock::new(None)),
+            staging_buffer: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -77,7 +79,7 @@ impl Executor {
     }
 
     /// Sets up storage and staging (input, output) buffers and adds them to the executor
-    pub async fn setup_buffers<T>(&mut self, data: &[T]) -> Result<(), String>
+    pub async fn setup_buffers<T>(&self, data: &[T]) -> Result<(), String>
     where
         T: Pod,
     {
@@ -110,8 +112,8 @@ impl Executor {
             mapped_at_creation: false,
         });
 
-        self.storage_buffer = Some(storage_buffer);
-        self.staging_buffer = Some(staging_buffer);
+        *self.storage_buffer.write().unwrap() = Some(storage_buffer);
+        *self.staging_buffer.write().unwrap() = Some(staging_buffer);
 
         Ok(())
     }
@@ -128,8 +130,10 @@ impl Executor {
         let Some(shaders) = self.shaders.as_ref() else {
             return Err("Not operations loaded".parse().unwrap());
         };
-        let storage_buffer = self.storage_buffer.as_ref().unwrap();
-        let staging_buffer = self.staging_buffer.as_ref().unwrap();
+        let storage_buf = self.storage_buffer.read().unwrap();
+        let storage_buffer = storage_buf.as_ref().unwrap();
+        let staging_buf = self.staging_buffer.read().unwrap();
+        let staging_buffer = staging_buf.as_ref().unwrap();
 
         // A pipeline specifies the operation of a shader
         // Instantiates the pipeline.
@@ -172,9 +176,9 @@ impl Executor {
         // Sets adds copy operation to command encoder.
         // Will copy data from storage buffer on GPU to staging buffer on CPU.
         encoder.copy_buffer_to_buffer(
-            &storage_buffer,
+            storage_buffer,
             0,
-            &staging_buffer,
+            staging_buffer,
             0,
             staging_buffer.size(),
         );
