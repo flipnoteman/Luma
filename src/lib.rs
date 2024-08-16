@@ -1,9 +1,11 @@
 #![allow(dead_code)]
+extern crate core;
+
 use std::sync::OnceLock;
 use bytemuck::Pod;
 use uuid::Uuid;
 mod execution;
-use crate::execution::Executor;
+use crate::execution::{Executor, Operation};
 
 /// Instantiates a new [Array]
 /// The first argument is the dimensions of the array, while the second is the data to initialize it
@@ -33,7 +35,9 @@ static EXECUTOR: OnceLock<Executor> = OnceLock::new();
 ///
 /// # Example
 /// ```
-///  let array1 = luma::Array::new(&[3u64, 1, 1, 1], &[1u32, 6u32, 5u32]).await.expect("Could not create Array.");;
+/// async {
+///     let array1 = luma::Array::new(&[3u64, 1, 1, 1], &[1u32, 6u32, 5u32]).await.expect("Could not create Array.");
+/// }
 /// ```
 #[derive(Debug)]
 pub struct Array {
@@ -81,7 +85,7 @@ impl Array {
     }
 
     pub async fn double_test(&self) -> Result<Vec<u32>, String> {
-        EXECUTOR.get().unwrap().execute_op(&self.id).await
+        EXECUTOR.get().unwrap().execute_op(&self.id, Operation::DOUBLE).await
     }
 }
 

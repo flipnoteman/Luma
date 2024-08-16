@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-
 use bytemuck;
 use bytemuck::Pod;
 use flume;
@@ -13,12 +12,31 @@ use wgpu::{Buffer, Device, Features, InstanceDescriptor, InstanceFlags, MemoryHi
 
 pub type ShaderResources = HashMap<String, ShaderModule>;
 
+fn decode_operation<'a>(op: Operation) -> &'a str {
+    match op {
+        Operation::DOUBLE => "double",
+        Operation::ADD => "add",
+        Operation::SUBTRACT => "subtract",
+        Operation::MULTIPLY => "multiply",
+        Operation::DIVIDE => "divide",
+    }
+}
+
 /// GpuHandle
 /// This will hold our [Device] and [Queue] for later executions
 #[derive(Debug)]
 pub struct GpuHandle {
     pub device: Box<Device>,
     pub queue: Box<Queue>,
+}
+
+/// Operations to be performed on the given data.
+pub enum Operation {
+    DOUBLE, // Still a test operation
+    ADD,
+    SUBTRACT,
+    MULTIPLY,
+    DIVIDE,
 }
 
 impl GpuHandle {
@@ -125,7 +143,7 @@ impl Executor {
 
     /// Test function.
     /// Doubles the array input
-    pub async fn execute_op(&self, id: &String) -> Result<Vec<u32>, String> {
+    pub async fn execute_op(&self, id: &String, operation: Operation) -> Result<Vec<u32>, String> {
         // Instantiate our Executor
         let Some(adapter) = self.adapter.as_ref() else {
             return Err("Not operations loaded".parse().unwrap());
@@ -135,6 +153,7 @@ impl Executor {
         let Some(shaders) = self.shaders.as_ref() else {
             return Err("Not operations loaded".parse().unwrap());
         };
+
         let storage_buf = self.storage_buffer.read().unwrap();
         let storage_buffer = storage_buf.get(id).unwrap();
         let staging_buf = self.staging_buffer.read().unwrap();
@@ -145,7 +164,7 @@ impl Executor {
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: None,
-            module: shaders.index("double"),
+            module: shaders.index(decode_operation(operation)),
             entry_point: "main",
             compilation_options: Default::default(),
             cache: None,
