@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 extern crate core;
-
 use std::sync::OnceLock;
 use bytemuck::Pod;
 use uuid::Uuid;
 mod execution;
+mod utils;
+
 use crate::execution::{Executor, Operation};
 
 /// Instantiates a new [Array]
@@ -36,12 +37,12 @@ static EXECUTOR: OnceLock<Executor> = OnceLock::new();
 /// # Example
 /// ```
 /// async {
-///     let array1 = luma::Array::new(&[3u64, 1, 1, 1], &[1u32, 6u32, 5u32]).await.expect("Could not create Array.");
+///     let array1 = luma::Array::new(&[3, 1, 1, 1], &[1u32, 6u32, 5u32]).await.expect("Could not create Array.");
 /// }
 /// ```
 #[derive(Debug)]
 pub struct Array {
-    dimensions: [u64; 4],
+    dimensions: [usize; 4],
     id: String,
 }
 
@@ -53,9 +54,9 @@ impl Drop for Array {
 }
 
 impl Array {
-    pub async fn new<T>(dimensions: &[u64; 4], data: &[T]) -> Result<Self, String>
+    pub async fn new<T>(dimensions: &[usize; 4], data: &[T]) -> Result<Self, String>
     where
-        T: Pod,
+        T: Pod + std::fmt::Debug,
     {
         // Set up the executor only if not already initialized.
         std::thread::spawn(|| {
@@ -69,10 +70,13 @@ impl Array {
             )
         }).join().unwrap().await;
 
+        // let test = vec![vec![3, 5, 6], vec![1, 2, 3], vec![2, 3, 6]];
+        // println!("Dimensions: {:?}", utils::extrapolate_dimensions(&test));
+
         let id = Uuid::new_v4();
         // Setup input output buffers with our data
         // TODO: Incorporate the dimensions array
-        EXECUTOR.get().unwrap().setup_buffers(data, id.into()).await?;
+        EXECUTOR.get().unwrap().setup_buffers(dimensions, data, id.into()).await?;
 
         Ok(Array {
             dimensions: *dimensions,

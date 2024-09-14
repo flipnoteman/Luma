@@ -30,6 +30,13 @@ pub struct GpuHandle {
     pub queue: Box<Queue>,
 }
 
+#[derive(Debug)]
+pub struct Buffers {
+    storage_buffer: Buffer,
+    staging_buffer: Buffer,
+    dimensions_buffer: Buffer,
+}
+
 /// Operations to be performed on the given data.
 pub enum Operation {
     DOUBLE, // Still a test operation
@@ -54,8 +61,7 @@ impl GpuHandle {
 pub struct Executor {
     pub adapter: Option<Box<GpuHandle>>,
     pub shaders: Option<Box<ShaderResources>>,
-    storage_buffer: Arc<RwLock<HashMap<String, Buffer>>>,
-    staging_buffer: Arc<RwLock<HashMap<String, Buffer>>>,
+    buffers: Arc<RwLock<HashMap<String, Buffers>>>,
 }
 
 impl Default for Executor {
@@ -63,8 +69,7 @@ impl Default for Executor {
         Executor {
             adapter: None,
             shaders: None,
-            storage_buffer: Arc::new(RwLock::new(HashMap::new())), // RwLock locks the value so that there can only be one writer at a time. Also, can be used for interior mutability.
-            staging_buffer: Arc::new(RwLock::new(HashMap::new())),
+            buffers: Arc::new(RwLock::new(HashMap::new())), // RwLock locks the value so that there can only be one writer at a time. Also, can be used for interior mutability.
         }
     }
 }
@@ -97,17 +102,16 @@ impl Executor {
     }
 
     pub fn drop(&self, id: &String) {
-        self.staging_buffer.write().unwrap().remove(id);
-        self.storage_buffer.write().unwrap().remove(id);
+        self.buffers.write().unwrap().remove(id);
     }
 
     /// Sets up storage and staging (input, output) buffers and adds them to the executor
-    pub async fn setup_buffers<T>(&self, data: &[T], id: String) -> Result<(), String>
+    pub async fn setup_buffers<T>(&self, dimensions: &[usize; 4], data: &[T], id: String) -> Result<(), String>
     where
         T: Pod,
     {
         let Some(ref adapter) = self.adapter else {
-            return Err("Not operations loaded".parse().unwrap());
+            return Err("No operations loaded".parse().unwrap());
         };
         // Instantiates buffer with data (`numbers`).
         // Usage allowing the buffer to be:
@@ -129,14 +133,27 @@ impl Executor {
         //   `BufferUsages::MAP_READ` allows it to be read (outside the shader).
         //   `BufferUsages::COPY_DST` allows it to be the destination of the copy.
         let staging_buffer = adapter.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
+            label: Some("Staging Buffer"),
             size: storage_buffer.size(),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        self.storage_buffer.write().unwrap().insert(id.clone(), storage_buffer);
-        self.staging_buffer.write().unwrap().insert(id.clone(), staging_buffer);
+        let dimensions_buffer = adapter.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Dimensions Buffer"),
+            contents:  bytemuck::cast_slice::<usize, u8>(dimensions),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+        });
+
+        self.buffers.write().unwrap().insert(
+            id.clone(),
+            Buffers {
+                storage_buffer,
+                staging_buffer,
+                dimensions_buffer
+            }
+        );
 
         Ok(())
     }
@@ -154,35 +171,82 @@ impl Executor {
             return Err("Not operations loaded".parse().unwrap());
         };
 
-        let storage_buf = self.storage_buffer.read().unwrap();
-        let storage_buffer = storage_buf.get(id).unwrap();
-        let staging_buf = self.staging_buffer.read().unwrap();
-        let staging_buffer = staging_buf.get(id).unwrap();
+        // Get our buffers from our data
+        let buffers = self.buffers.read().unwrap();
+        let buffer = buffers.get(id).unwrap();
+        let staging_buffer = &buffer.staging_buffer;
+        let storage_buffer = &buffer.storage_buffer;
+        let dimensions_buffer = &buffer.dimensions_buffer;
+
+        // A bind group defines how buffers are accessed by operations.
+        // It is to WebGPU what a descriptor set is to Vulkan.
+        // `binding` here refers to the `binding` of a buffer in the shader (`layout(set = 0, binding = 0) buffer`).
+        // Instantiates the bind group, once again specifying the binding of buffers.
+        // let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: false,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: true,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }
+            ]
+        });
+
+        // Now we need to create our bind groups with our buffers.
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dimensions_buffer.as_entire_binding(),
+                }
+            ],
+        });
+
+        // We need to define the layout of our pipeline (shader in this case) we're using as well.
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
 
         // A pipeline specifies the operation of a shader
         // Instantiates the pipeline.
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
-            layout: None,
+            label: Some("Compute Pipeline"),
+            layout: Some(&pipeline_layout),
             module: shaders.index(decode_operation(operation)),
             entry_point: "main",
             compilation_options: Default::default(),
             cache: None,
         });
 
-        // A bind group defines how buffers are accessed by operations.
-        // It is to WebGPU what a descriptor set is to Vulkan.
-        // `binding` here refers to the `binding` of a buffer in the shader (`layout(set = 0, binding = 0) buffer`).
-        // Instantiates the bind group, once again specifying the binding of buffers.
-        let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: storage_buffer.as_entire_binding(),
-            }],
-        });
         // A command encoder executes one or many pipelines.
         // It is to WebGPU what a command buffer is to Vulkan.
         let mut encoder =
@@ -236,7 +300,6 @@ impl Executor {
                                     //   delete myPointer;
                                     //   myPointer = NULL;
                                     // It effectively frees the memory
-
 
             Ok(result)
         } else {
