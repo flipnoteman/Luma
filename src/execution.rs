@@ -242,7 +242,7 @@ impl Executor {
             label: Some("Compute Pipeline"),
             layout: Some(&pipeline_layout),
             module: shaders.index(decode_operation(operation)),
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -313,11 +313,17 @@ impl Executor {
     /// Get device description. Should return the highest performance device on a system. Should only be called once unless you need to request another adapter.
     async fn get_adapter_info() -> Result<GpuHandle, String> {
         // Creates adapters and surfaces using the information in the ```InstanceDescriptor```
-        let instance = wgpu::Instance::new(InstanceDescriptor {
+        let instance = wgpu::Instance::new(&InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
+            backend_options: wgpu::BackendOptions {
+                gl: wgpu::GlBackendOptions {
+                    gles_minor_version: Default::default(), // Select which minor version of Open GL to use.
+                },
+                dx12: wgpu::Dx12BackendOptions {
+                    shader_compiler: Default::default(),
+                }
+            },
             flags: InstanceFlags::empty(), // Instance flags for debugging.
-            dx12_shader_compiler: Default::default(), // Select which DX12 compiler to use.
-            gles_minor_version: Default::default(), // Select which minor version of Open GL to use.
         });
 
         // Gives us a handle to all gpu compute adapters with the given ```RequestAdapterOptions```
