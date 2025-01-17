@@ -24,8 +24,8 @@ macro_rules! array {
     };
 }
 
-
-const SHADERS_PATH: &str = "./Luma/operations";
+const PROJECT_DIR: &str = env!("CARGO_MANIFEST_DIR");
+const SHADERS_PATH: &str = "./operations";
 
 /// Static thread-safe executor with interior mutability.
 static EXECUTOR: OnceLock<Executor> = OnceLock::new();
@@ -63,7 +63,7 @@ impl Array {
             Box::pin(
                 async {
                     if EXECUTOR.get().is_none() {
-                        let ex = Executor::new(SHADERS_PATH).await.unwrap();
+                        let ex = Executor::new(&format!("{}/{}", PROJECT_DIR, SHADERS_PATH)).await.unwrap();
                         EXECUTOR.set(ex).unwrap();
                     }
                 }
