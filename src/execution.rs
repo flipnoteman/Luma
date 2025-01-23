@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ops::Index;
 use std::sync::{Arc, RwLock};
 use wgpu::util::DeviceExt;
-use wgpu::{Buffer, Device, Features, InstanceDescriptor, InstanceFlags, MemoryHints, PowerPreference, Queue, ShaderModule};
+use wgpu::{Buffer, BindGroup, BindGroupLayout, Device, Features, InstanceDescriptor, InstanceFlags, MemoryHints, PowerPreference, Queue, ShaderModule};
 
 pub type ShaderResources = HashMap<String, ShaderModule>;
 
@@ -31,10 +31,17 @@ pub struct GpuHandle {
 }
 
 #[derive(Debug)]
+pub struct Binding {
+    bind_group: BindGroup,
+    bind_group_layout: BindGroupLayout,
+}
+
+#[derive(Debug)]
 pub struct Buffers {
     storage_buffer: Buffer,
     staging_buffer: Buffer,
     dimensions_buffer: Buffer,
+    binding: Binding,
 }
 
 /// Operations to be performed on the given data.
@@ -146,12 +153,69 @@ impl Executor {
                 | wgpu::BufferUsages::COPY_DST
         });
 
+        // A bind group defines how buffers are accessed by operations.
+        // It is to WebGPU what a descriptor set is to Vulkan.
+        // `binding` here refers to the `binding` of a buffer in the shader (`layout(set = 0, binding = 0) buffer`).
+        // Instantiates the bind group, once again specifying the binding of buffers.
+        // let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+        let bind_group_layout = adapter.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: false,
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+//                 wgpu::BindGroupLayoutEntry {
+//                     binding: 1,
+//                     visibility: wgpu::ShaderStages::COMPUTE,
+//                     ty: wgpu::BindingType::Buffer {
+//                         ty: wgpu::BufferBindingType::Storage {
+//                             read_only: true,
+//                         },
+//                         has_dynamic_offset: false,
+//                         min_binding_size: None,
+//                     },
+//                     count: None,
+//                 }
+            ]
+        });
+
+        // Now we need to create our bind groups with our buffers.
+        let bind_group = adapter.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: storage_buffer.as_entire_binding(),
+                },
+//                 wgpu::BindGroupEntry {
+//                     binding: 1,
+//                     resource: dimensions_buffer.as_entire_binding(),
+//                 }
+            ],
+        });
+
+        let binding = Binding {
+            bind_group,
+            bind_group_layout,
+        };
+
         self.buffers.write().unwrap().insert(
             id.clone(),
             Buffers {
                 storage_buffer,
                 staging_buffer,
-                dimensions_buffer
+                dimensions_buffer,
+                binding,
             }
         );
 
@@ -177,59 +241,10 @@ impl Executor {
         let staging_buffer = &buffer.staging_buffer;
         let storage_buffer = &buffer.storage_buffer;
         let dimensions_buffer = &buffer.dimensions_buffer;
+        let bind_group_layout = &buffer.binding.bind_group_layout;
+        let bind_group = &buffer.binding.bind_group;
 
-        // A bind group defines how buffers are accessed by operations.
-        // It is to WebGPU what a descriptor set is to Vulkan.
-        // `binding` here refers to the `binding` of a buffer in the shader (`layout(set = 0, binding = 0) buffer`).
-        // Instantiates the bind group, once again specifying the binding of buffers.
-        // let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bind_group_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage {
-                            read_only: false,
-                        },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage {
-                            read_only: true,
-                        },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }
-            ]
-        });
-
-        // Now we need to create our bind groups with our buffers.
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: storage_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dimensions_buffer.as_entire_binding(),
-                }
-            ],
-        });
-
-        // We need to define the layout of our pipeline (shader in this case) we're using as well.
+                  // We need to define the layout of our pipeline (shader in this case) we're using as well.
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
@@ -257,7 +272,7 @@ impl Executor {
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&compute_pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.set_bind_group(0, bind_group, &[]);
             cpass.insert_debug_marker("");
             cpass.dispatch_workgroups(storage_buffer.size() as u32, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
         }
