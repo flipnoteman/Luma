@@ -156,4 +156,27 @@ impl Array<f32> {
             _marker: PhantomData,
         })
     }
+
+    /// FFT-based 1D convolution. Returns the full linear convolution of
+    /// length `input_len + kernel_len - 1`. No stride or padding — those
+    /// are spatial-domain concepts; use `conv1d()` for that.
+    ///
+    /// This is O(n log n) and faster than spatial `conv1d` for large kernels.
+    pub async fn conv1d_fft(&self, kernel: &Array<f32>) -> Result<Array<f32>, String> {
+        if kernel.dimensions[1] != 1 || kernel.dimensions[2] != 1 || kernel.dimensions[3] != 1 {
+            return Err("Kernel must be 1D".into());
+        }
+
+        let (new_id, output_len) = EXECUTOR
+            .get()
+            .unwrap()
+            .execute_fft_conv1d_gpu(&self.id, &kernel.id)
+            .await?;
+
+        Ok(Array {
+            dimensions: [output_len, 1, 1, 1],
+            id: new_id,
+            _marker: PhantomData,
+        })
+    }
 }

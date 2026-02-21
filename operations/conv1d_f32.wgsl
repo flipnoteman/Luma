@@ -4,9 +4,14 @@
 @group(0) @binding(3) var<storage, read> params: array<u32, 3>;
 
 @compute
-@workgroup_size(1)
+@workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let out_idx = global_id.x;
+    let output_len = arrayLength(&output);
+    if (out_idx >= output_len) {
+        return;
+    }
+
     let kernel_len = params[0];
     let stride = params[1];
     let padding = params[2];

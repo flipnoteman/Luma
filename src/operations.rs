@@ -5,6 +5,7 @@ use wgpu::{Device, ShaderModule};
 pub type ShaderResources = HashMap<String, ShaderModule>;
 
 /// Operations to be performed on the given data.
+#[allow(non_camel_case_types)]
 pub enum Operation {
     DOUBLE,
     ADD,
@@ -12,6 +13,12 @@ pub enum Operation {
     MULTIPLY,
     DIVIDE,
     CONV1D,
+    FFT_BIT_REVERSE,
+    FFT_BUTTERFLY,
+    FFT_COMPLEX_MUL,
+    IFFT_BUTTERFLY,
+    FFT_EXTRACT_REAL,
+    FFT_COMPLEX_BIT_REVERSE,
 }
 
 pub fn decode_operation(op: &Operation) -> &str {
@@ -22,6 +29,12 @@ pub fn decode_operation(op: &Operation) -> &str {
         Operation::MULTIPLY => "multiply",
         Operation::DIVIDE => "divide",
         Operation::CONV1D => "conv1d",
+        Operation::FFT_BIT_REVERSE => "fft_bit_reverse",
+        Operation::FFT_BUTTERFLY => "fft_butterfly",
+        Operation::FFT_COMPLEX_MUL => "fft_complex_mul",
+        Operation::IFFT_BUTTERFLY => "ifft_butterfly",
+        Operation::FFT_EXTRACT_REAL => "fft_extract_real",
+        Operation::FFT_COMPLEX_BIT_REVERSE => "fft_complex_bit_reverse",
     }
 }
 

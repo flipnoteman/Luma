@@ -205,6 +205,95 @@ async fn conv1d_large_with_padding() {
     assert!((result[100] - expected).abs() < 1e-4);
 }
 
+// -- FFT Conv1D (f32 only) --
+
+#[tokio::test]
+async fn fft_conv1d_basic() {
+    // Full linear convolution: [1,2,3,4,5] * [1,0,-1] = [1, 2, 2, 2, 2, -4, -5]
+    let input = array!(&[5, 1, 1, 1], &[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    let kernel = array!(&[3, 1, 1, 1], &[1.0f32, 0.0, -1.0]);
+    let result = input.conv1d_fft(&kernel).await.unwrap();
+    assert_eq!(result.dimensions(), &[7, 1, 1, 1]);
+    let data = result.to_vec().await.unwrap();
+    let expected = vec![1.0f32, 2.0, 2.0, 2.0, 2.0, -4.0, -5.0];
+    for (i, (a, b)) in data.iter().zip(expected.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-3, "Mismatch at index {}: got {}, expected {}", i, a, b);
+    }
+}
+
+#[tokio::test]
+async fn fft_conv1d_identity_kernel() {
+    let input = array!(&[3, 1, 1, 1], &[3.0f32, 7.0, 11.0]);
+    let kernel = array!(&[1, 1, 1, 1], &[1.0f32]);
+    let result = input.conv1d_fft(&kernel).await.unwrap();
+    assert_eq!(result.dimensions(), &[3, 1, 1, 1]);
+    let data = result.to_vec().await.unwrap();
+    let expected = vec![3.0f32, 7.0, 11.0];
+    for (i, (a, b)) in data.iter().zip(expected.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-3, "Mismatch at index {}: got {}, expected {}", i, a, b);
+    }
+}
+
+#[tokio::test]
+async fn fft_conv1d_single_element() {
+    let input = array!(&[1, 1, 1, 1], &[5.0f32]);
+    let kernel = array!(&[1, 1, 1, 1], &[3.0f32]);
+    let result = input.conv1d_fft(&kernel).await.unwrap();
+    assert_eq!(result.dimensions(), &[1, 1, 1, 1]);
+    let data = result.to_vec().await.unwrap();
+    assert!((data[0] - 15.0).abs() < 1e-3, "Expected 15.0, got {}", data[0]);
+}
+
+#[tokio::test]
+async fn fft_conv1d_matches_spatial() {
+    // Compare FFT conv with spatial conv using a SYMMETRIC kernel.
+    // Spatial conv1d computes cross-correlation: sum(input[i+k] * kernel[k])
+    // FFT conv1d computes true convolution: sum(input[k] * kernel[n-k]) (kernel flipped)
+    // With a symmetric kernel these are equivalent in the valid region.
+    let input_data: Vec<f32> = (1..=10).map(|x| x as f32).collect();
+    let kernel_data = vec![0.25f32, 0.5, 0.25]; // symmetric
+
+    let input = array!(&[10, 1, 1, 1], &input_data);
+    let kernel = array!(&[3, 1, 1, 1], &kernel_data);
+
+    let spatial = input.conv1d(&kernel, 1, 0).await.unwrap().to_vec().await.unwrap();
+    let fft = input.conv1d_fft(&kernel).await.unwrap().to_vec().await.unwrap();
+
+    assert_eq!(fft.len(), 12); // 10 + 3 - 1
+    assert_eq!(spatial.len(), 8); // 10 - 3 + 1
+
+    // With symmetric kernel, spatial[i] should match fft[i + kernel_len - 1]
+    for i in 0..spatial.len() {
+        let fft_val = fft[i + 2]; // offset by kernel_len - 1 = 2
+        assert!(
+            (spatial[i] - fft_val).abs() < 1e-2,
+            "Mismatch at spatial[{}]={} vs fft[{}]={}", i, spatial[i], i + 2, fft_val
+        );
+    }
+}
+
+#[tokio::test]
+async fn fft_conv1d_large_kernel() {
+    // 512-element input, 128-element kernel
+    let input_data: Vec<f32> = (0..512).map(|x| (x as f32 * 0.01).sin()).collect();
+    let kernel_data: Vec<f32> = (0..128).map(|x| 1.0 / (1.0 + x as f32)).collect();
+
+    let input = array!(&[512, 1, 1, 1], &input_data);
+    let kernel = array!(&[128, 1, 1, 1], &kernel_data);
+
+    let result = input.conv1d_fft(&kernel).await.unwrap();
+    assert_eq!(result.dimensions(), &[639, 1, 1, 1]); // 512 + 128 - 1
+    let data = result.to_vec().await.unwrap();
+    assert_eq!(data.len(), 639);
+
+    // Spot-check first element: input[0] * kernel[0]
+    let expected_first = input_data[0] * kernel_data[0];
+    assert!(
+        (data[0] - expected_first).abs() < 1e-3,
+        "First element: got {}, expected {}", data[0], expected_first
+    );
+}
+
 // -- Chained operations --
 
 #[tokio::test]
