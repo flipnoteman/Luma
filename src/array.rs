@@ -129,3 +129,31 @@ impl<T: GpuType> Array<T> {
         })
     }
 }
+
+impl Array<f32> {
+    /// 1D convolution with the given kernel, stride, and zero-padding.
+    ///
+    /// Output length = floor((input_len - kernel_len + 2 * padding) / stride) + 1
+    pub async fn conv1d(
+        &self,
+        kernel: &Array<f32>,
+        stride: usize,
+        padding: usize,
+    ) -> Result<Array<f32>, String> {
+        if kernel.dimensions[1] != 1 || kernel.dimensions[2] != 1 || kernel.dimensions[3] != 1 {
+            return Err("Kernel must be 1D".into());
+        }
+
+        let (new_id, output_len) = EXECUTOR
+            .get()
+            .unwrap()
+            .execute_conv1d_gpu(&self.id, &kernel.id, stride as u32, padding as u32)
+            .await?;
+
+        Ok(Array {
+            dimensions: [output_len, 1, 1, 1],
+            id: new_id,
+            _marker: PhantomData,
+        })
+    }
+}

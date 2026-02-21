@@ -11,6 +11,7 @@ pub enum Operation {
     SUBTRACT,
     MULTIPLY,
     DIVIDE,
+    CONV1D,
 }
 
 pub fn decode_operation(op: &Operation) -> &str {
@@ -20,6 +21,7 @@ pub fn decode_operation(op: &Operation) -> &str {
         Operation::SUBTRACT => "subtract",
         Operation::MULTIPLY => "multiply",
         Operation::DIVIDE => "divide",
+        Operation::CONV1D => "conv1d",
     }
 }
 
