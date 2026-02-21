@@ -4,16 +4,29 @@ use luma::*;
 async fn main() {
     let t = std::time::Instant::now();
 
-    // Can now instantiate an [Array] with macros.
-    let array1 = array!(&[3, 1, 1, 1], &[1u32, 6u32, 5u32]);
-    let array2 = array!(&[3, 1, 1, 1], &[4u32, 12u32, 10u32]);
-    // [double_test] calls [test_fn()] in Executor which Doubles all the values in the array.
-    let test_1 = std::time::Instant::now();
-    let res1 = array1.double_test().await.unwrap();
-    println!("Result for {} = {:?}; time = {:?}", array1.id(), res1, test_1.elapsed());
-    let test_2 = std::time::Instant::now();
-    let res2 = array2.double_test().await.unwrap();
-    println!("Result for {} = {:?}; time = {:?}", array2.id(), res2, test_2.elapsed());
+    let a = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    let b = array!(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
 
-    println!("Program Time: {:?}", t.elapsed())
+    // Chain of operations — all GPU-resident, no CPU copies in between
+    //
+    //   a = [1, 2, 3]
+    //   b = [10, 20, 30]
+    //
+    //   step 1: add(a, b)           -> [11, 22, 33]
+    //   step 2: multiply(step1, a)  -> [11, 44, 99]
+    //   step 3: add_scalar(step2,1) -> [12, 45, 100]
+    //   step 4: double(step3)       -> [24, 90, 200]
+    //   step 5: subtract(step4, b)  -> [14, 70, 170]
+    //   step 6: divide_scalar(step5, 2) -> [7, 35, 85]
+    //
+    let result = a.add(&b).await.unwrap()              // [11, 22, 33]
+        .multiply(&a).await.unwrap()                   // [11, 44, 99]
+        .add_scalar(1u32).await.unwrap()               // [12, 45, 100]
+        .double().await.unwrap()                       // [24, 90, 200]
+        .subtract(&b).await.unwrap()                   // [14, 70, 170]
+        .divide_scalar(2u32).await.unwrap()            // [7, 35, 85]
+        .to_vec().await.unwrap();
+
+    println!("Chain result: {:?}", result);
+    println!("Program Time: {:?}", t.elapsed());
 }
