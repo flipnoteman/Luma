@@ -21,9 +21,13 @@ mod context;
 mod error;
 mod gpu;
 mod gpu_type;
+mod kernel;
 mod operations;
 
 pub use array::Array;
 pub use context::Context;
 pub use error::{LumaError, Result};
-pub use gpu_type::GpuType;
+pub use gpu_type::{GpuType, ScalarType};
+pub use kernel::{
+    uniform, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize,
+};

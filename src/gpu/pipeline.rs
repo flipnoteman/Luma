@@ -1,7 +1,7 @@
 use crate::array::{Array, DIMS_BYTES};
 use crate::context::{bind, Context, PARAMS_USAGE, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::GpuType;
+use crate::gpu_type::{GpuType, ScalarType};
 use crate::operations::Operation;
 
 /// Workgroup size used by every shader (`@workgroup_size(64)`).
@@ -38,17 +38,17 @@ fn same_context<T: GpuType, U: GpuType>(a: &Array<T>, b: &Array<U>) -> Result<()
 /// context's pool and handed back when this guard drops, i.e. right after the operation's
 /// commands were submitted (or it failed). That is safe while the GPU still runs them: any
 /// later reuse of a buffer is ordered after the work already submitted.
-struct Scratch<'a> {
+pub(crate) struct Scratch<'a> {
     ctx: &'a Context,
     held: Vec<wgpu::Buffer>,
 }
 
 impl<'a> Scratch<'a> {
-    fn new(ctx: &'a Context) -> Self {
+    pub(crate) fn new(ctx: &'a Context) -> Self {
         Scratch { ctx, held: Vec::new() }
     }
 
-    fn take(&mut self, bytes: u64, usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
+    pub(crate) fn take(&mut self, bytes: u64, usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
         let buffer = self.ctx.alloc_buffer(bytes, usage)?;
         self.held.push(buffer.clone());
         Ok(buffer)
@@ -80,7 +80,7 @@ impl Drop for Scratch<'_> {
 }
 
 /// Runs a unary operation on the GPU into a new array. The source array is untouched.
-pub(crate) fn unary<T: GpuType>(src: &Array<T>, operation: Operation) -> Result<Array<T>> {
+pub(crate) fn unary<T: ScalarType>(src: &Array<T>, operation: Operation) -> Result<Array<T>> {
     let ctx = src.context();
     let out = Array::<T>::alloc(ctx, src.shape())?;
     let bytes = src.byte_len();
@@ -103,7 +103,7 @@ pub(crate) fn unary<T: GpuType>(src: &Array<T>, operation: Operation) -> Result<
 
 /// Runs a binary operation on the GPU into a new array shaped like `lhs`. Both operands are
 /// untouched. `rhs` is either shaped like `lhs` or a single element broadcast over `lhs`.
-pub(crate) fn binary<T: GpuType>(
+pub(crate) fn binary<T: ScalarType>(
     lhs: &Array<T>,
     rhs: &Array<T>,
     operation: Operation,

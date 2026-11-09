@@ -10,3 +10,5 @@ wgpu = "30"
 bytemuck = "1.21.0"
 log = "0.4.25"
 pollster = "1.0.1"
+naga = { version = "30.0.1", features = ["wgsl-in"] }
+encase = "0.13.0"

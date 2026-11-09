@@ -9,6 +9,7 @@ use crate::error::{LumaError, Result};
 use crate::gpu::handle;
 use crate::gpu::pool::{self, BufferPool};
 use crate::gpu_type::GpuType;
+use crate::kernel::{KernelBuilder, KernelCore, KernelKey};
 use crate::operations::{self, Access, Operation, ShaderResources};
 
 /// Usage of every array storage buffer (and the FFT scratch buffers, so they share a pool class).
@@ -18,6 +19,9 @@ pub(crate) const STORAGE_USAGE: BufferUsages = BufferUsages::STORAGE
 
 /// Usage of dims and kernel-parameter buffers.
 pub(crate) const PARAMS_USAGE: BufferUsages = BufferUsages::STORAGE.union(BufferUsages::COPY_DST);
+
+/// Usage of uniform buffers (the kernel grid and user uniforms).
+pub(crate) const UNIFORM_USAGE: BufferUsages = BufferUsages::UNIFORM.union(BufferUsages::COPY_DST);
 
 /// Usage of readback buffers.
 pub(crate) const STAGING_USAGE: BufferUsages = BufferUsages::MAP_READ.union(BufferUsages::COPY_DST);
@@ -36,6 +40,8 @@ struct Inner {
     shaders: ShaderResources,
     /// One pipeline per (operation, element type), created on first use.
     pipelines: Mutex<HashMap<(Operation, &'static str), Arc<Pipeline>>>,
+    /// Custom kernels, built on first use of their (source, entry, workgroup).
+    kernels: Mutex<HashMap<KernelKey, Arc<KernelCore>>>,
     pool: Mutex<BufferPool>,
     /// Largest buffer that can be allocated *and* bound as a storage buffer.
     max_buffer_bytes: u64,
@@ -84,6 +90,7 @@ impl Context {
                 queue,
                 shaders,
                 pipelines: Mutex::new(HashMap::new()),
+                kernels: Mutex::new(HashMap::new()),
                 pool: Mutex::new(BufferPool::default()),
                 max_buffer_bytes,
                 max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
@@ -110,6 +117,18 @@ impl Context {
         encoder.clear_buffer(array.storage(), 0, Some(array.byte_len()));
         self.queue().submit(Some(encoder.finish()));
         Ok(array)
+    }
+
+    /// Starts building a custom compute kernel from WGSL source.
+    ///
+    /// See [`KernelBuilder`] for the options and [`Kernel`](crate::Kernel) for the binding
+    /// conventions.
+    pub fn kernel(&self, wgsl_src: &str) -> KernelBuilder<'_> {
+        KernelBuilder::new(self, wgsl_src)
+    }
+
+    pub(crate) fn kernel_cache(&self) -> MutexGuard<'_, HashMap<KernelKey, Arc<KernelCore>>> {
+        lock(&self.inner.kernels)
     }
 
     pub(crate) fn device(&self) -> &wgpu::Device {

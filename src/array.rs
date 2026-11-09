@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use crate::context::{Context, PARAMS_USAGE, STAGING_USAGE, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::gpu::pipeline;
-use crate::gpu_type::GpuType;
+use crate::gpu_type::{GpuType, ScalarType};
 use crate::operations::Operation;
 
 /// Size of the dims buffer: the shape as `array<u32, 4>`.
@@ -165,6 +165,9 @@ impl<T: GpuType> Array<T> {
         Ok(())
     }
 
+}
+
+impl<T: ScalarType> Array<T> {
     // -- Unary operations --
 
     pub fn double(&self) -> Result<Array<T>> {
