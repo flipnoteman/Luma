@@ -59,7 +59,7 @@ use crate::kernel::{self, KernelCore, KernelKey};
 pub(crate) use program::{evaluate, reduce_first_pass};
 
 /// Most operations one fused kernel contains unless configured otherwise.
-pub(crate) const DEFAULT_MAX_NODES: usize = 64;
+pub(crate) const DEFAULT_MAX_NODES: usize = 128;
 /// Upper bound of the configurable limit (the expression is walked recursively).
 const MAX_NODES_LIMIT: usize = 256;
 /// Most input buffers of one fused kernel, whatever the device allows.

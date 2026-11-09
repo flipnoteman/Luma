@@ -113,7 +113,7 @@ with a new `dt` every step) reuses the pipeline.
 
 A lazy array is the value its expression had when you wrote it down: overwriting an input
 afterwards (`write`, `+=`, a kernel taking `&mut`) does not change it. Errors still arise where
-the faulty operation is written, with its source location. Fusion stops at 64 operations per
+the faulty operation is written, with its source location. Fusion stops at 128 operations per
 kernel or at the device's binding limit (the expression is cut and continues in the next kernel),
 and a result used by several operations is computed once instead of inside each of them.
 `LUMA_FUSION_MAX_NODES=1` in the environment disables fusion (one kernel per operation); the

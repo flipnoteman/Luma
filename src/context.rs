@@ -640,7 +640,7 @@ impl Context {
         };
         {
             let mut view = staging.get_mapped_range_mut(..bytes).map_err(LumaError::MapRange)?;
-            view.copy_from_slice(data);
+            write_parallel(data, view.slice(..));
         }
         staging.unmap();
 
@@ -705,10 +705,22 @@ impl Context {
         self.take_gpu_error()?;
         mapped?;
 
-        // One copy, straight into the result (mapped ranges are aligned for any element type).
-        let result = slice.get_mapped_range().map(|view| match bytemuck::try_cast_slice::<u8, T>(&view) {
-            Ok(values) => values.to_vec(),
-            Err(_) => bytemuck::pod_collect_to_vec(&view),
+        let result = slice.get_mapped_range().map(|view| {
+            let mut out: Vec<T> = Vec::with_capacity(view.len() / std::mem::size_of::<T>());
+            let spare = out.spare_capacity_mut();
+            let len = spare.len();
+            // SAFETY: a `MaybeUninit<T>` slice viewed as the same bytes; `T: Pod` has no padding
+            // or invalid bit patterns, so any initialized bytes make valid elements.
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(
+                    spare.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                    len * std::mem::size_of::<T>(),
+                )
+            };
+            copy_parallel(&view[..dst.len()], dst);
+            // SAFETY: every byte of the first `len` elements was written just above.
+            unsafe { out.set_len(len) };
+            out
         });
         staging.unmap();
         result.map_err(LumaError::MapRange)
@@ -1008,6 +1020,55 @@ impl Drop for Scratch<'_> {
 
 /// Size of the `luma` grid uniform in bytes (`LumaGrid`).
 const GRID_BYTES: u64 = 16;
+
+/// Copies below this size stay on the calling thread.
+const PARALLEL_COPY_MIN: usize = 8 << 20;
+
+/// `dst.copy_from_slice(src)` split over several threads for large copies: one core cannot
+/// saturate unified memory, and the page faults of a fresh destination spread out too.
+fn copy_parallel(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    if src.len() < PARALLEL_COPY_MIN || threads == 1 {
+        dst.write_copy_of_slice(src);
+        return;
+    }
+    let chunk = src.len().div_ceil(threads).next_multiple_of(4096);
+    std::thread::scope(|scope| {
+        for (s, d) in src.chunks(chunk).zip(dst.chunks_mut(chunk)) {
+            scope.spawn(move || {
+                d.write_copy_of_slice(s);
+            });
+        }
+    });
+}
+
+/// [`copy_parallel`] into write-only mapped memory.
+fn write_parallel(src: &[u8], mut dst: wgpu::WriteOnly<'_, [u8]>) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    if src.len() < PARALLEL_COPY_MIN || threads == 1 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    /// A disjoint part of the mapping, handed to one thread.
+    struct Part(std::ptr::NonNull<[u8]>);
+    // SAFETY: parts are disjoint and outlive the scope the threads run in.
+    unsafe impl Send for Part {}
+
+    assert_eq!(src.len(), dst.len(), "source and destination lengths differ");
+    let base = dst.as_raw_ptr().cast::<u8>();
+    let chunk = src.len().div_ceil(threads).next_multiple_of(4096);
+    std::thread::scope(|scope| {
+        for (i, s) in src.chunks(chunk).enumerate() {
+            // SAFETY: `i * chunk + s.len() <= dst.len()`, so the part lies inside the mapping.
+            let part = Part(std::ptr::NonNull::slice_from_raw_parts(unsafe { base.add(i * chunk) }, s.len()));
+            scope.spawn(move || {
+                let part = part;
+                // SAFETY: the part is mapped for writing and no other thread touches it.
+                unsafe { wgpu::WriteOnly::new(part.0) }.copy_from_slice(s);
+            });
+        }
+    });
+}
 
 fn dynamic_offset(offset: u64) -> Result<u32> {
     u32::try_from(offset).map_err(|_| LumaError::Gpu("uniform arena offset exceeds u32".into()))

@@ -2,7 +2,7 @@
 //! launched (the counters of [`JitState`](super::JitState)). What the results of fused
 //! expressions must be is tested through the public API in `tests/fusion.rs`.
 
-use super::{StatsSnapshot, DEFAULT_MAX_NODES};
+use super::StatsSnapshot;
 use crate::array::Array;
 use crate::context::Context;
 use crate::ops::select;
@@ -83,7 +83,7 @@ fn fused_results_match_the_unfused_evaluation_of_the_same_expression() {
         let out = acc.to_vec().unwrap();
         (out, delta(before, ctx.jit().stats()).elementwise_launches)
     };
-    let (fused, fused_launches) = run(DEFAULT_MAX_NODES);
+    let (fused, fused_launches) = run(64);
     let (unfused, unfused_launches) = run(1);
     // 141 operations: three kernels of at most 64, or one per operation.
     assert_eq!(fused_launches, 3);
@@ -227,7 +227,7 @@ fn reducing_an_expression_does_not_evaluate_it() {
 #[test]
 fn deep_chains_are_split_at_the_node_limit() {
     let ctx = Context::new().unwrap();
-    assert_eq!(ctx.jit().max_nodes(), DEFAULT_MAX_NODES);
+    ctx.jit().set_max_nodes(64);
     let xs = values(500, 10, 0.5, 1.5);
     let x = f32s(&ctx, &xs);
 
@@ -244,7 +244,7 @@ fn deep_chains_are_split_at_the_node_limit() {
     }
     // The graph was cut while it was built; the rest runs at to_vec.
     let cut = delta(before, ctx.jit().stats()).elementwise_launches;
-    assert_eq!(cut, 3, "{DEFAULT_MAX_NODES}-operation pieces were evaluated early");
+    assert_eq!(cut, 3, "64-operation pieces were evaluated early");
     assert_close(&y.to_vec().unwrap(), &want, 1e-4, 1e-4);
     let d = delta(before, ctx.jit().stats());
     assert_eq!(d.elementwise_launches, 4);
@@ -283,7 +283,8 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
     assert!(launches >= 3, "{count} buffers with at most {max_inputs} inputs per kernel: {launches}");
 
-    // The same input many times is one binding.
+    // The same input many times is one binding: 81 operations, one kernel.
+    ctx.jit().set_max_nodes(128);
     let before = ctx.jit().stats();
     let mut acc = &arrays[0] * 1.0;
     for _ in 0..40 {
@@ -291,7 +292,7 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
     }
     let got = acc.to_vec().unwrap();
     assert_close(&got, &data[0].iter().map(|v| v * 21.0).collect::<Vec<_>>(), 1e-4, 1e-4);
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
 }
 
 #[test]
