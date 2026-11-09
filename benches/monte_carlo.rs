@@ -639,9 +639,8 @@ struct IsingParams {
 /// lattices stay bit-identical to `ISING`. Tile origins are multiples of 8 and `K` is even, so a
 /// tile-local `(lx, ly)` has the checkerboard color `(lx ^ ly) & 1` of its global site.
 ///
-/// The planes in memory hold four entries per `Cell`: a `vec4<f32>` of +-1 (the layout of
-/// `ISING`, so the same lattice feeds both kernels) or the packed word itself, which cuts the
-/// traffic to and from memory fourfold.
+/// The planes in memory hold four entries per `Cell`, a `vec4<f32>` of +-1 (the layout of
+/// `ISING`, so the same lattice feeds both kernels).
 const ISING_BLOCKED: &str = r#"
 struct Params { hw: u32, h: u32, base: u32, steps: u32, t4: u32, t8: u32 }
 @group(1) @binding(0) var<storage, read> src0: array<Cell>;
@@ -758,12 +757,6 @@ fn encode(v: u32) -> Cell {
 }
 "#;
 
-const CELL_PACKED: &str = r#"
-alias Cell = u32;
-fn decode(v: u32) -> u32 { return v; }
-fn encode(v: u32) -> u32 { return v; }
-"#;
-
 #[derive(encase::ShaderType)]
 struct IsingBlockedParams {
     hw: u32,
@@ -805,10 +798,10 @@ struct BlockedRun<T: GpuType> {
 }
 
 impl<T: GpuType> BlockedRun<T> {
-    /// `k` half-sweeps per launch; `packed` selects the cell type, which must match `T`.
-    fn new(k: u32, packed: bool, shape: IsingShape, state: [Array<T>; 2], scratch: [Array<T>; 2]) -> Self {
+    /// `k` half-sweeps per launch.
+    fn new(k: u32, shape: IsingShape, state: [Array<T>; 2], scratch: [Array<T>; 2]) -> Self {
         assert!(2 * shape.hw % TILE_X == 0 && shape.h % TILE_Y == 0, "ising: tiles must cover the lattice");
-        let cell = if packed { CELL_PACKED } else { CELL_FLOATS };
+        let cell = CELL_FLOATS;
         let source = format!(
             "const K: u32 = {k}u;\nconst TX: u32 = {TILE_X}u;\nconst TY: u32 = {TILE_Y}u;\n\
              const THREADS: u32 = {TILE_THREADS}u;\n{cell}{ISING_BLOCKED}"
@@ -988,8 +981,7 @@ fn ising(c: &mut Criterion) {
         ctx.sync().unwrap();
     };
 
-    // The blocked kernel takes four consecutive entries of a plane row per element, as floats or
-    // as a packed word.
+    // The blocked kernel takes four consecutive entries of a plane row per element.
     let to_floats = |planes: &[Vec<f32>; 2]| {
         planes.each_ref().map(|plane| {
             let quads: Vec<[f32; 4]> = plane.chunks_exact(4).map(|q| [q[0], q[1], q[2], q[3]]).collect();
@@ -998,22 +990,6 @@ fn ising(c: &mut Criterion) {
     };
     let from_floats = |planes: &[Array<[f32; 4]>; 2]| {
         planes.each_ref().map(|plane| plane.to_vec().unwrap().into_iter().flatten().collect::<Vec<f32>>())
-    };
-    let to_packed = |planes: &[Vec<f32>; 2]| {
-        planes.each_ref().map(|plane| {
-            let words: Vec<u32> = plane
-                .chunks_exact(4)
-                .map(|q| q.iter().enumerate().map(|(i, &s)| u32::from(s > 0.0) << (8 * i)).sum())
-                .collect();
-            Array::from_slice(&words, [hw / 4, h]).unwrap()
-        })
-    };
-    let from_packed = |planes: &[Array<u32>; 2]| {
-        planes.each_ref().map(|plane| {
-            let spin = |word: u32, i: u32| if (word >> (8 * i)) & 1 == 1 { 1.0 } else { -1.0 };
-            let words = plane.to_vec().unwrap();
-            words.into_iter().flat_map(|v| (0..4).map(move |i| spin(v, i))).collect::<Vec<f32>>()
-        })
     };
     let shape = IsingShape {
         hw: hw as u32,
@@ -1029,17 +1005,9 @@ fn ising(c: &mut Criterion) {
     let got = [gpu_planes[0].to_vec().unwrap(), gpu_planes[1].to_vec().unwrap()];
     assert!(got == cpu_planes, "ising: GPU and CPU lattices differ");
 
-    let mut float_run = BlockedRun::new(8, false, shape, to_floats(&initial), to_floats(&initial));
+    let mut float_run = BlockedRun::new(8, shape, to_floats(&initial), to_floats(&initial));
     float_run.run(ctx, shape);
     assert!(from_floats(&float_run.state) == cpu_planes, "ising: blocked GPU and CPU lattices differ");
-    let mut packed_runs = Vec::new();
-    for k in [2, 4, 8] {
-        let mut run = BlockedRun::new(k, true, shape, to_packed(&initial), to_packed(&initial));
-        run.run(ctx, shape);
-        let same = from_packed(&run.state) == cpu_planes;
-        assert!(same, "ising: packed blocked GPU (k = {k}) and CPU lattices differ");
-        packed_runs.push((k, run));
-    }
     let (m, e) = ising_observables(&cpu_planes, hw, h);
     eprintln!("ising: identical lattices; m {m0:.4} -> {m:.4}, E/N {e0:.4} -> {e:.4}");
     // A random lattice has E/N near 0; after 50 sweeps at beta 0.45 domains have formed.
@@ -1049,9 +1017,6 @@ fn ising(c: &mut Criterion) {
     group.throughput(Throughput::Elements((w * h * sweeps) as u64));
     group.bench_function("luma_per_half_sweep", |b| b.iter(|| per_half_sweep(&mut gpu_planes)));
     group.bench_function("luma_blocked_k8", |b| b.iter(|| float_run.run(ctx, shape)));
-    for (k, run) in &mut packed_runs {
-        group.bench_function(format!("luma_blocked_packed_k{k}"), |b| b.iter(|| run.run(ctx, shape)));
-    }
     group.bench_function("cpu", |b| {
         b.iter(|| ising_cpu(black_box(&mut cpu_planes), hw, h, sweeps, p4, p8))
     });
