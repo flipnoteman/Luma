@@ -103,7 +103,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    if want("fft") && n <= 1 << 24 {
+    if want("fft") {
         let k: Vec<f32> = (0..1024).map(|i| 1.0 / (i as f32 + 1.0)).collect();
         let ka = Array::from_slice(&k, 1024)?;
         let ms = median(|| x.conv1d_fft(&ka).eval().unwrap());

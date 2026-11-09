@@ -542,8 +542,9 @@ fn conv1d_matches_the_cpu_across_tile_and_chunk_boundaries() {
 
 #[test]
 fn fft_conv1d_matches_the_direct_sum_for_transforms_beyond_one_tile() {
-    // Kernels of up to half a tile take overlap-save (one or several blocks, the longest such
-    // kernel); longer ones the full transform of 2^12 (one column pass), 2^19 and 2^20 (two).
+    // Kernels short against the input take overlap-save (blocks of one tile, and of 2^12..2^14
+    // with a column pass); long ones the single transform of 2^12 (local only), 2^16 (one
+    // column pass) and 2^20 (two).
     let cases = [
         (3_000usize, 50usize),
         (1_500, 600),
@@ -552,7 +553,9 @@ fn fft_conv1d_matches_the_direct_sum_for_transforms_beyond_one_tile() {
         (600_000, 1_000),
         (2_000, 1_500),
         (300_000, 1_100),
-        (530_000, 1_100),
+        (530_000, 3_000),
+        (20_000, 20_000),
+        (1_000, 600_000),
     ];
     for (input_len, kernel_len) in cases {
         let input_data: Vec<f32> = (0..input_len).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
@@ -560,8 +563,8 @@ fn fft_conv1d_matches_the_direct_sum_for_transforms_beyond_one_tile() {
         let got = array(input_len, &input_data).conv1d_fft(&array(kernel_len, &kernel_data)).to_vec().unwrap();
         assert_eq!(got.len(), input_len + kernel_len - 1);
         let mut worst = 0.0f64;
-        // Both ends in full, every 7th output elsewhere (7 is coprime to every block step).
-        let ends = 2 * kernel_len + 2048;
+        // Both ends in full, every 7th output elsewhere.
+        let ends = 2048;
         for (o, g) in got.iter().enumerate().filter(|(o, _)| o % 7 == 0 || *o < ends || o + ends > got.len()) {
             let lo = o.saturating_sub(input_len - 1);
             let want: f64 = (lo..kernel_len.min(o + 1))

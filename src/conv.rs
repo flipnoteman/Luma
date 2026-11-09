@@ -117,10 +117,6 @@ fn run_conv1d_fft(input: &Array<f32>, kernel: &Array<f32>) -> Outcome<Array<f32>
     let input_len = to_u32(input.len(), "Input length")?;
     let kernel_len = to_u32(kernel.len(), "Kernel length")?;
     let output_len = input.len() + kernel.len() - 1;
-    let n = u32::try_from(output_len)
-        .ok()
-        .and_then(u32::checked_next_power_of_two)
-        .ok_or(LumaError::DimensionTooLarge { shape: [output_len, 1, 1, 1] })?;
 
     let output = Array::<f32>::alloc(ctx, Shape::from(output_len))?;
     let (out_buf, out_bytes) = output.ready()?;
@@ -131,6 +127,6 @@ fn run_conv1d_fft(input: &Array<f32>, kernel: &Array<f32>) -> Outcome<Array<f32>
         kernel: (k_buf, k_bytes, kernel_len),
         output: (out_buf, out_bytes, to_u32(output_len, "Output length")?),
     };
-    fft::convolve(ctx, &operands, n, &mut Scratch::new(ctx))?;
+    fft::convolve(ctx, &operands, &mut Scratch::new(ctx))?;
     Ok(output)
 }
