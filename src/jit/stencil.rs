@@ -173,7 +173,7 @@ impl Stencil {
             "var<workgroup> b0: array<f32, {cells}>;
 var<workgroup> b1: array<f32, {cells}>;
 
-fn wrap(v: i32, n: u32) -> u32 {{ let m = i32(n); return u32(((v % m) + m) % m); }}
+{wrap}
 
 @compute @workgroup_size({WORKGROUP})
 fn main(
@@ -192,6 +192,13 @@ fn main(
     workgroupBarrier();
 ",
             cells = lw * lh,
+            // Indices stay within one period of the array when a tile and its halo fit in it:
+            // two selects instead of two divisions.
+            wrap = if self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh) {
+                "fn wrap(v: i32, n: u32) -> u32 { let m = i32(n); return u32(select(select(v, v + m, v < 0), v - m, v >= m)); }"
+            } else {
+                "fn wrap(v: i32, n: u32) -> u32 { let m = i32(n); return u32(((v % m) + m) % m); }"
+            },
         );
         let out = self.instrs.len() - 1;
         for step in 1..=k {

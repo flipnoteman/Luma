@@ -10,7 +10,7 @@ use crate::context::{RawArg, Scratch, STORAGE_USAGE};
 use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d};
 
-use super::{Args, ElemTy, Node, Op, Src};
+use super::{Args, ElemTy, Node, Op, OpKind, Src};
 
 /// Size of every element the fused kernels handle (`f32` and `u32`).
 const ELEMENT_BYTES: u64 = 4;
@@ -26,6 +26,8 @@ pub(crate) enum Ref {
     Scalar(u32),
     /// The result of an earlier instruction.
     Tmp(u32),
+    /// A sub-program, evaluated at the element a shift reads (operand 0 of a shift only).
+    Sub(u32),
 }
 
 /// One operation of a program; instruction `k` defines `t{k}`.
@@ -53,6 +55,9 @@ pub(crate) struct FusedKey {
     pub(crate) scalar_tys: Vec<ElemTy>,
     /// The instructions whose values a store kernel writes, one output buffer each.
     pub(crate) outputs: Vec<u32>,
+    /// Programs of expressions read through shifts; sub-program `k` defines `sub{k}(i)`, its
+    /// last instruction being the value.
+    pub(crate) subs: Vec<Vec<Instr>>,
     pub(crate) tail: Tail,
 }
 
@@ -61,7 +66,6 @@ impl FusedKey {
     /// `Fused(Mul, Add, Sqrt) f32` or `FusedReduce(Sum: Mul, Add) f32`. Long programs are cut
     /// short.
     pub(crate) fn label(&self) -> String {
-        use super::OpKind;
         const SHOWN: usize = 6;
         let mut names: Vec<String> = self
             .instrs
@@ -129,7 +133,11 @@ fn collect(
             Err(error) => Err(Failure::Inherited(Arc::clone(error))),
         };
     };
-    for arg in args.iter().take(node.op().kind.arity()) {
+    for (index, arg) in args.iter().enumerate().take(node.op().kind.arity()) {
+        // A shifted expression is a sub-program of its own (see `Flattener::sub`).
+        if index == 0 && matches!(node.op().kind, OpKind::Shift(_)) {
+            continue;
+        }
         collect(arg, members, seen)?;
     }
     seen.push(key);
@@ -146,6 +154,9 @@ struct Flattener {
     scalars: Vec<u32>,
     /// Where the value of every member emitted so far lives.
     emitted: Vec<(*const Node, Ref)>,
+    /// Programs of the expressions read through shifts, and the node of each.
+    subs: Vec<Vec<Instr>>,
+    sub_nodes: Vec<*const Node>,
 }
 
 impl Flattener {
@@ -154,11 +165,49 @@ impl Flattener {
     fn emit(&mut self, op: Op, args: &[Src; 3]) -> Result<Ref, Failure> {
         let mut refs = [Ref::Unused; 3];
         for (index, (slot, arg)) in refs.iter_mut().zip(args).enumerate().take(op.kind.arity()) {
-            *slot = self.operand(arg, op.operand_ty(index))?;
+            *slot = match (op.kind, index, arg) {
+                (OpKind::Shift(_), 0, Src::Node(node)) if node.is_pending() => self.sub(node)?,
+                _ => self.operand(arg, op.operand_ty(index))?,
+            };
         }
         let at = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
         self.instrs.push(Instr { op, args: refs });
         Ok(Ref::Tmp(at))
+    }
+
+    /// The expression of `node` as a sub-program evaluated at another element (the operand of a
+    /// shift), recomputed instead of materialized. Shares the inputs and scalars of the program.
+    fn sub(&mut self, node: &Arc<Node>) -> Result<Ref, Failure> {
+        let key = Arc::as_ptr(node);
+        if let Some(at) = self.sub_nodes.iter().position(|&seen| seen == key) {
+            return Ok(Ref::Sub(at as u32));
+        }
+        let Some(args) = node.operands() else {
+            return self.operand(&Src::Node(Arc::clone(node)), node.op().out_ty());
+        };
+        let (mut members, mut seen) = (Vec::new(), vec![key]);
+        for arg in args.iter().take(node.op().kind.arity()) {
+            collect(arg, &mut members, &mut seen)?;
+        }
+        let outer_instrs = std::mem::take(&mut self.instrs);
+        let outer_emitted = std::mem::take(&mut self.emitted);
+        let result = (|| {
+            for member in &members {
+                let at = self.emit(member.node.op(), &member.args)?;
+                self.emitted.push((Arc::as_ptr(&member.node), at));
+            }
+            self.emit(node.op(), &args)
+        })();
+        let instrs = std::mem::replace(&mut self.instrs, outer_instrs);
+        self.emitted = outer_emitted;
+        result?;
+        for member in &members {
+            member.node.fused.store(true, Ordering::Relaxed);
+        }
+        node.fused.store(true, Ordering::Relaxed);
+        self.subs.push(instrs);
+        self.sub_nodes.push(key);
+        Ok(Ref::Sub(u32::try_from(self.subs.len() - 1).unwrap_or(u32::MAX)))
     }
 
     fn operand(&mut self, src: &Src, ty: ElemTy) -> Result<Ref, Failure> {
@@ -202,6 +251,7 @@ impl Flattener {
                 instrs: self.instrs,
                 input_tys: self.input_tys,
                 scalar_tys: self.scalar_tys,
+                subs: self.subs,
                 outputs,
                 tail,
             },

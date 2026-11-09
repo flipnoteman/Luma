@@ -627,6 +627,219 @@ struct IsingParams {
     p8: f32,
 }
 
+/// Temporal blocking. A workgroup loads a `TX x TY` interior plus a halo (`K` rows, one word of 8
+/// sites per side) into workgroup memory, runs up to `K` half-sweeps there (each invalidates one
+/// more ring of the halo) and writes the interior to the other pair of planes. Spins are one byte
+/// (0 or 1) per site, four consecutive sites of a plane row per `u32` that one invocation owns
+/// and updates, so tiles are four times smaller than as floats and never share a word between
+/// writers. The neighbor counts of four sites come from byte-wise adds. A site flips for sure
+/// unless at least 3 of its 4 neighbors agree with it, so only those draw a number: the hash is
+/// `pcg2d(site, tag).x` of `PCG` with the constant tag folded, and `u01(h) < p` is the integer
+/// compare `h >> 9 < t` against precomputed thresholds (exact: `u01` is exact in f32), so
+/// lattices stay bit-identical to `ISING`. Tile origins are multiples of 8 and `K` is even, so a
+/// tile-local `(lx, ly)` has the checkerboard color `(lx ^ ly) & 1` of its global site.
+///
+/// The planes in memory hold four entries per `Cell`: a `vec4<f32>` of +-1 (the layout of
+/// `ISING`, so the same lattice feeds both kernels) or the packed word itself, which cuts the
+/// traffic to and from memory fourfold.
+const ISING_BLOCKED: &str = r#"
+struct Params { hw: u32, h: u32, base: u32, steps: u32, t4: u32, t8: u32 }
+@group(1) @binding(0) var<storage, read> src0: array<Cell>;
+@group(1) @binding(1) var<storage, read> src1: array<Cell>;
+@group(1) @binding(2) var<storage, read_write> dst0: array<Cell>;
+@group(1) @binding(3) var<storage, read_write> dst1: array<Cell>;
+@group(1) @binding(4) var<uniform> p: Params;
+
+const WP: u32 = TX / 8u + 2u;
+const H: u32 = TY + 2u * K;
+const PL: u32 = H * WP;
+const M: u32 = 1664525u;
+const C: u32 = 1013904223u;
+// Planes by color, `PL` words each; word `w` of row `ly` holds entries `4 w .. 4 w + 3`.
+var<workgroup> t: array<u32, 2u * PL>;
+
+// `v` is below `2 n + 8`.
+fn wrap(v: u32, n: u32) -> u32 {
+    let r = select(v, v - n, v >= n);
+    return select(r, r - n, r >= n);
+}
+
+// The flip bit (at bit `sh`) of the site whose neighbors mostly agree with it: those with 3 or 4
+// agreeing neighbors (`draws`) flip when the draw is below the threshold, the others always flip
+// and are set by the caller. `a` is `site * M + C + y1 * M` and `y1 = tag * M + C` (the first
+// `pcg2d` mixing).
+fn flips(a: u32, y1: u32, draws: u32, all: u32, sh: u32) -> u32 {
+    if (((draws >> sh) & 1u) == 0u) { return 0u; }
+    let b = y1 + a * M;
+    let a3 = a ^ (a >> 16u);
+    let b3 = b ^ (b >> 16u);
+    let a4 = a3 + b3 * M;
+    let q = (a4 ^ (a4 >> 16u)) >> 9u;
+    return select(0u, 1u, q < select(p.t4, p.t8, ((all >> sh) & 1u) == 1u)) << sh;
+}
+
+@compute @workgroup_size(THREADS)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+    let hw = p.hw;
+    let gw = 2u * hw;
+    let hw4 = hw / 4u;
+    let x0 = wid.x * TX;
+    let y0 = wid.y * TY;
+
+    for (var n = li; n < PL; n += THREADS) {
+        let ly = n / WP;
+        let w = n - ly * WP;
+        let at = (wrap(x0 + 8u * w + gw - 8u, gw) >> 3u) + wrap(y0 + ly + p.h - K, p.h) * hw4;
+        t[n] = decode(src0[at]);
+        t[PL + n] = decode(src1[at]);
+    }
+    workgroupBarrier();
+
+    for (var s = 0u; s < p.steps; s++) {
+        let r = p.steps - 1u - s;
+        let mo = (s & 1u) * PL;
+        let oo = PL - mo;
+        let y1 = (p.base + s) * M + C;
+        let c1 = C + y1 * M;
+        let items = (TY + 2u * r) * WP;
+        for (var n = li; n < items; n += THREADS) {
+            let ry = n / WP;
+            let w = n - ry * WP;
+            if (r == 0u && (w == 0u || w == WP - 1u)) { continue; }
+            let ly = K - r + ry;
+            let at = ly * WP + w;
+            let par = (s ^ ly) & 1u;
+            let mine = t[mo + at];
+            let mid = t[oo + at];
+            let side = select(
+                (mid << 8u) | (t[oo + at - 1u] >> 24u),
+                (mid >> 8u) | (t[oo + at + 1u] << 24u),
+                par == 1u,
+            );
+            let count = t[oo + at - WP] + t[oo + at + WP] + mid + side;
+            // Per byte, the number of neighbors with the site's own spin: bit 2 set means all 4
+            // agree, and 3 or more is bit 2 or (bits 1 and 0).
+            let own = mine * 255u;
+            let agree = (count & own) | ((0x04040404u - count) & ~own);
+            let all = (agree >> 2u) & 0x01010101u;
+            let draws = all | ((agree >> 1u) & agree & 0x01010101u);
+            let gy = wrap(y0 + ly + p.h - K, p.h);
+            let site = wrap(x0 + 8u * w + gw - 8u, gw) + par + gy * gw;
+            let a = site * M + c1;
+            let flip = (draws ^ 0x01010101u)
+                | flips(a, y1, draws, all, 0u)
+                | flips(a + 2u * M, y1, draws, all, 8u)
+                | flips(a + 4u * M, y1, draws, all, 16u)
+                | flips(a + 6u * M, y1, draws, all, 24u);
+            t[mo + at] = mine ^ flip;
+        }
+        workgroupBarrier();
+    }
+
+    for (var n = li; n < TY * (WP - 2u); n += THREADS) {
+        let ry = n / (WP - 2u);
+        let w = n - ry * (WP - 2u) + 1u;
+        let at = ((x0 + 8u * w - 8u) >> 3u) + (y0 + ry) * hw4;
+        let word = (K + ry) * WP + w;
+        dst0[at] = encode(t[word]);
+        dst1[at] = encode(t[PL + word]);
+    }
+}
+"#;
+
+const CELL_FLOATS: &str = r#"
+alias Cell = vec4<f32>;
+fn decode(v: Cell) -> u32 {
+    return select(0u, 1u, v.x > 0.0) | (select(0u, 1u, v.y > 0.0) << 8u)
+        | (select(0u, 1u, v.z > 0.0) << 16u) | (select(0u, 1u, v.w > 0.0) << 24u);
+}
+fn encode(v: u32) -> Cell {
+    return vec4<f32>(f32(v & 1u), f32((v >> 8u) & 1u), f32((v >> 16u) & 1u), f32(v >> 24u)) * 2.0 - 1.0;
+}
+"#;
+
+const CELL_PACKED: &str = r#"
+alias Cell = u32;
+fn decode(v: u32) -> u32 { return v; }
+fn encode(v: u32) -> u32 { return v; }
+"#;
+
+#[derive(encase::ShaderType)]
+struct IsingBlockedParams {
+    hw: u32,
+    h: u32,
+    base: u32,
+    steps: u32,
+    t4: u32,
+    t8: u32,
+}
+
+/// Number of 23-bit draws `q` with `(q + 0.5) / 2^23 < accept`.
+fn draw_threshold(accept: f32) -> u32 {
+    (f64::from(accept) * 8388608.0 - 0.5).ceil().max(0.0) as u32
+}
+
+/// Interior of a workgroup's tile and its invocation count: the best measured shape whose tile
+/// fits workgroup memory, which slows kernels sharply beyond about 8 KiB per workgroup.
+const TILE_X: u32 = 128;
+const TILE_Y: u32 = 32;
+const TILE_THREADS: u32 = 128;
+
+/// Lattice size and generator thresholds shared by the blocked launches.
+#[derive(Clone, Copy)]
+struct IsingShape {
+    hw: u32,
+    h: u32,
+    half_sweeps: u32,
+    t4: u32,
+    t8: u32,
+}
+
+/// The planes a blocked kernel works on (`T` is a four-spin cell) and the plane pair it writes.
+struct BlockedRun<T: GpuType> {
+    kernel: Kernel,
+    groups: [u32; 3],
+    k: u32,
+    state: [Array<T>; 2],
+    scratch: [Array<T>; 2],
+}
+
+impl<T: GpuType> BlockedRun<T> {
+    /// `k` half-sweeps per launch; `packed` selects the cell type, which must match `T`.
+    fn new(k: u32, packed: bool, shape: IsingShape, state: [Array<T>; 2], scratch: [Array<T>; 2]) -> Self {
+        assert!(2 * shape.hw % TILE_X == 0 && shape.h % TILE_Y == 0, "ising: tiles must cover the lattice");
+        let cell = if packed { CELL_PACKED } else { CELL_FLOATS };
+        let source = format!(
+            "const K: u32 = {k}u;\nconst TX: u32 = {TILE_X}u;\nconst TY: u32 = {TILE_Y}u;\n\
+             const THREADS: u32 = {TILE_THREADS}u;\n{cell}{ISING_BLOCKED}"
+        );
+        BlockedRun {
+            kernel: Kernel::new(&source).unwrap(),
+            groups: [2 * shape.hw / TILE_X, shape.h / TILE_Y, 1],
+            k,
+            state,
+            scratch,
+        }
+    }
+
+    /// Runs all half-sweeps, `k` per launch. Each launch reads `state` and writes `scratch`, then
+    /// they swap, so a tile never reads what a neighbor has already advanced.
+    fn run(&mut self, ctx: &Context, shape: IsingShape) {
+        let IsingShape { hw, h, half_sweeps, t4, t8 } = shape;
+        let mut base = 0;
+        while base < half_sweeps {
+            let steps = self.k.min(half_sweeps - base);
+            let p = IsingBlockedParams { hw, h, base, steps, t4, t8 };
+            let [s0, s1] = &self.state;
+            let [d0, d1] = &mut self.scratch;
+            self.kernel.launch_raw(self.groups, args![s0, s1, d0, d1, uniform(&p)]).unwrap();
+            std::mem::swap(&mut self.state, &mut self.scratch);
+            base += steps;
+        }
+        ctx.sync().unwrap();
+    }
+}
+
 #[inline(always)]
 fn flip(s: f32, n: f32, site: u32, tag: u32, p4: f32, p8: f32) -> f32 {
     let e = s * n;
@@ -750,13 +963,17 @@ fn ising(c: &mut Criterion) {
         }
     }
     let (m0, e0) = ising_observables(&cpu_planes, hw, h);
-    let mut gpu_planes = [
-        Array::from_slice(&cpu_planes[0], [hw, h]).unwrap(),
-        Array::from_slice(&cpu_planes[1], [hw, h]).unwrap(),
-    ];
+    let upload = |planes: &[Vec<f32>; 2]| {
+        [
+            Array::from_slice(&planes[0], [hw, h]).unwrap(),
+            Array::from_slice(&planes[1], [hw, h]).unwrap(),
+        ]
+    };
+    let initial = cpu_planes.clone();
+    let ctx = &default_context().unwrap();
+
     let kernel = Kernel::new(&format!("{PCG}{ISING}")).unwrap();
-    let ctx = default_context().unwrap();
-    let run = |planes: &mut [Array<f32>; 2]| {
+    let per_half_sweep = |planes: &mut [Array<f32>; 2]| {
         let [a, b] = planes;
         for sweep in 0..sweeps {
             for color in 0..2u32 {
@@ -771,10 +988,58 @@ fn ising(c: &mut Criterion) {
         ctx.sync().unwrap();
     };
 
-    run(&mut gpu_planes);
+    // The blocked kernel takes four consecutive entries of a plane row per element, as floats or
+    // as a packed word.
+    let to_floats = |planes: &[Vec<f32>; 2]| {
+        planes.each_ref().map(|plane| {
+            let quads: Vec<[f32; 4]> = plane.chunks_exact(4).map(|q| [q[0], q[1], q[2], q[3]]).collect();
+            Array::from_slice(&quads, [hw / 4, h]).unwrap()
+        })
+    };
+    let from_floats = |planes: &[Array<[f32; 4]>; 2]| {
+        planes.each_ref().map(|plane| plane.to_vec().unwrap().into_iter().flatten().collect::<Vec<f32>>())
+    };
+    let to_packed = |planes: &[Vec<f32>; 2]| {
+        planes.each_ref().map(|plane| {
+            let words: Vec<u32> = plane
+                .chunks_exact(4)
+                .map(|q| q.iter().enumerate().map(|(i, &s)| u32::from(s > 0.0) << (8 * i)).sum())
+                .collect();
+            Array::from_slice(&words, [hw / 4, h]).unwrap()
+        })
+    };
+    let from_packed = |planes: &[Array<u32>; 2]| {
+        planes.each_ref().map(|plane| {
+            let spin = |word: u32, i: u32| if (word >> (8 * i)) & 1 == 1 { 1.0 } else { -1.0 };
+            let words = plane.to_vec().unwrap();
+            words.into_iter().flat_map(|v| (0..4).map(move |i| spin(v, i))).collect::<Vec<f32>>()
+        })
+    };
+    let shape = IsingShape {
+        hw: hw as u32,
+        h: h as u32,
+        half_sweeps: sweeps as u32 * 2,
+        t4: draw_threshold(p4),
+        t8: draw_threshold(p8),
+    };
+
+    let mut gpu_planes = upload(&initial);
+    per_half_sweep(&mut gpu_planes);
     ising_cpu(&mut cpu_planes, hw, h, sweeps, p4, p8);
     let got = [gpu_planes[0].to_vec().unwrap(), gpu_planes[1].to_vec().unwrap()];
     assert!(got == cpu_planes, "ising: GPU and CPU lattices differ");
+
+    let mut float_run = BlockedRun::new(8, false, shape, to_floats(&initial), to_floats(&initial));
+    float_run.run(ctx, shape);
+    assert!(from_floats(&float_run.state) == cpu_planes, "ising: blocked GPU and CPU lattices differ");
+    let mut packed_runs = Vec::new();
+    for k in [2, 4, 8] {
+        let mut run = BlockedRun::new(k, true, shape, to_packed(&initial), to_packed(&initial));
+        run.run(ctx, shape);
+        let same = from_packed(&run.state) == cpu_planes;
+        assert!(same, "ising: packed blocked GPU (k = {k}) and CPU lattices differ");
+        packed_runs.push((k, run));
+    }
     let (m, e) = ising_observables(&cpu_planes, hw, h);
     eprintln!("ising: identical lattices; m {m0:.4} -> {m:.4}, E/N {e0:.4} -> {e:.4}");
     // A random lattice has E/N near 0; after 50 sweeps at beta 0.45 domains have formed.
@@ -782,7 +1047,11 @@ fn ising(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("ising_2048x2048_50_sweeps");
     group.throughput(Throughput::Elements((w * h * sweeps) as u64));
-    group.bench_function("luma", |b| b.iter(|| run(&mut gpu_planes)));
+    group.bench_function("luma_per_half_sweep", |b| b.iter(|| per_half_sweep(&mut gpu_planes)));
+    group.bench_function("luma_blocked_k8", |b| b.iter(|| float_run.run(ctx, shape)));
+    for (k, run) in &mut packed_runs {
+        group.bench_function(format!("luma_blocked_packed_k{k}"), |b| b.iter(|| run.run(ctx, shape)));
+    }
     group.bench_function("cpu", |b| {
         b.iter(|| ising_cpu(black_box(&mut cpu_planes), hw, h, sweeps, p4, p8))
     });

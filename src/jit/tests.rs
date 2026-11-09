@@ -469,12 +469,29 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
     let before = ctx.jit().stats();
     let step = &u + (u.shift(1) + u.shift(-1) - &u * 2.0) * 0.1;
     let got = step.to_vec().unwrap();
-    // `u` is evaluated once for the shifts, then the whole step is one kernel.
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    // `u` is small: recomputed at the shifted elements, so the whole step is one kernel.
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     let f = |j: usize| xs[j % n] * 2.0;
     let want: Vec<f32> =
         (0..n).map(|i| f(i) + (f(i + n - 1) + f(i + 1) - f(i) * 2.0) * 0.1).collect();
     assert_close(&got, &want, 1e-5, 1e-5);
+
+    // A large expression is evaluated once for its shifts instead.
+    let mut big = &x * 1.0;
+    for _ in 0..20 {
+        big = &big * 0.5 + 0.25;
+    }
+    let before = ctx.jit().stats();
+    let got = (big.shift(1) - &big).to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    let g = |v: f32| (0..20).fold(v, |a, _| a * 0.5 + 0.25);
+    let want: Vec<f32> = (0..n).map(|i| g(xs[(i + n - 1) % n]) - g(xs[i])).collect();
+    assert_close(&got, &want, 1e-5, 1e-5);
+
+    // Shifts of shifted expressions nest.
+    let nested = ((&x * 2.0).shift(1) + 1.0).shift(1).to_vec().unwrap();
+    let want: Vec<f32> = (0..n).map(|i| xs[(i + 2 * n - 2) % n] * 2.0 + 1.0).collect();
+    assert_close(&nested, &want, 1e-6, 1e-6);
 
     // A shifted read inside a reduction's first pass.
     let before = ctx.jit().stats();

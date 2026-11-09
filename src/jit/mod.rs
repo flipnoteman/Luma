@@ -499,6 +499,15 @@ struct ReaderList {
     prune_at: usize,
 }
 
+/// Most operations of a lazy expression that a shift recomputes at the shifted element instead
+/// of evaluating it first. Every shift of it repeats them, but nothing goes through memory.
+const MAX_RECOMPUTED: usize = 16;
+
+/// Whether a shift of `node` reads its expression recomputed rather than evaluated.
+pub(crate) fn recompute_shifted(node: &Node) -> bool {
+    node.size() <= MAX_RECOMPUTED
+}
+
 /// Smallest list length worth pruning.
 const PRUNE_MIN: usize = 32;
 

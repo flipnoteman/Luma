@@ -71,6 +71,38 @@ fn black_scholes_luma(s: &Array<f32>, k: &Array<f32>, t: &Array<f32>) -> Array<f
     s * cnd_luma(&d1) - k * (t * -RATE).exp() * cnd_luma(&d2)
 }
 
+/// Call and put prices of the same options; they share every intermediate.
+fn call_put_luma(s: &Array<f32>, k: &Array<f32>, t: &Array<f32>) -> (Array<f32>, Array<f32>) {
+    let vol_sqrt_t = t.sqrt() * VOL;
+    let d1 = ((s / k).ln() + t * (RATE + 0.5 * VOL * VOL)) / &vol_sqrt_t;
+    let d2 = &d1 - &vol_sqrt_t;
+    let (n1, n2) = (cnd_luma(&d1), cnd_luma(&d2));
+    let discounted = k * (t * -RATE).exp();
+    let call = s * &n1 - &discounted * &n2;
+    let put = &discounted * (1.0 - &n2) - s * (1.0 - &n1);
+    (call, put)
+}
+
+fn call_put_cpu(s: &[f32], k: &[f32], t: &[f32], call: &mut [f32], put: &mut [f32]) {
+    std::thread::scope(|scope| {
+        let per = s.len().div_ceil(threads());
+        for (c, (cs, ps)) in call.chunks_mut(per).zip(put.chunks_mut(per)).enumerate() {
+            scope.spawn(move || {
+                for (i, (co, po)) in cs.iter_mut().zip(ps.iter_mut()).enumerate() {
+                    let j = c * per + i;
+                    let (s, k, t) = (s[j], k[j], t[j]);
+                    let vol_sqrt_t = VOL * t.sqrt();
+                    let d1 = ((s / k).ln() + (RATE + 0.5 * VOL * VOL) * t) / vol_sqrt_t;
+                    let (n1, n2) = (cnd_cpu(d1), cnd_cpu(d1 - vol_sqrt_t));
+                    let discounted = k * (-RATE * t).exp();
+                    *co = s * n1 - discounted * n2;
+                    *po = discounted * (1.0 - n2) - s * (1.0 - n1);
+                }
+            });
+        }
+    });
+}
+
 fn cnd_cpu(d: f32) -> f32 {
     let k = 1.0 / (1.0 + 0.2316419 * d.abs());
     let poly = k * (A[0] + k * (A[1] + k * (A[2] + k * (A[3] + k * A[4]))));
@@ -114,6 +146,29 @@ fn black_scholes(c: &mut Criterion) {
     });
     group.bench_function("cpu", |b| b.iter(|| black_scholes_cpu(&s, &k, &t, black_box(&mut out))));
     group.finish();
+
+    let (mut call, mut put) = (vec![0.0; n], vec![0.0; n]);
+    call_put_cpu(&s, &k, &t, &mut call, &mut put);
+    let (gc, gp) = call_put_luma(&gs, &gk, &gt);
+    eval_all(&[&gc, &gp]).unwrap();
+    check("call", &gc.to_vec().unwrap(), &call, 1e-4);
+    check("put", &gp.to_vec().unwrap(), &put, 1e-4);
+    let mut group = c.benchmark_group("black_scholes_call_and_put_16M_options");
+    group.throughput(Throughput::Elements(n as u64));
+    group.bench_function("luma_eval_all", |b| {
+        b.iter(|| {
+            let (call, put) = call_put_luma(&gs, &gk, &gt);
+            eval_all(&[&call, &put]).unwrap()
+        })
+    });
+    group.bench_function("luma_one_by_one", |b| {
+        b.iter(|| {
+            let (call, put) = call_put_luma(&gs, &gk, &gt);
+            call.eval().unwrap();
+            put.eval().unwrap()
+        })
+    });
+    group.bench_function("cpu", |b| b.iter(|| call_put_cpu(&s, &k, &t, black_box(&mut call), black_box(&mut put))));
 }
 
 // -- Mandelbrot set --

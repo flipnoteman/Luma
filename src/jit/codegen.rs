@@ -46,6 +46,7 @@ fn name(reference: Ref) -> String {
         Ref::Input(k) => format!("a{k}"),
         Ref::Scalar(k) => format!("p.s{k}"),
         Ref::Tmp(k) => format!("t{k}"),
+        Ref::Sub(k) => format!("sub{k}"),
     }
 }
 
@@ -58,12 +59,11 @@ pub(super) fn expression(instr: &Instr) -> String {
         OpKind::Powf => format!("pow({a}, {b})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
         OpKind::Select => format!("select({c}, {b}, {a} != 0u)"),
-        OpKind::Shift(kind) => {
-            let Ref::Input(k) = instr.args[0] else {
-                unreachable!("the operand of a shift is always an input buffer")
-            };
-            format!("in{k}[{}]", shift_index(kind, &b))
-        }
+        OpKind::Shift(kind) => match instr.args[0] {
+            Ref::Input(k) => format!("in{k}[{}]", shift_index(kind, &b)),
+            Ref::Sub(k) => format!("sub{k}({})", shift_index(kind, &b)),
+            _ => unreachable!("a shift reads an input buffer or a sub-program"),
+        },
     }
 }
 
@@ -141,6 +141,7 @@ pub(crate) fn source(key: &FusedKey) -> String {
             key.input_tys.len() + outputs.len()
         );
     }
+    src.push_str(&subs(key));
 
     match key.tail {
         Tail::Store => {
@@ -155,7 +156,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (i >= luma.size.x) {{ return; }}
 {}{stores}}}
 ",
-                body(key)
+                body(&key.instrs, &key.input_tys)
             );
         }
         Tail::Reduce(ops) => {
@@ -167,7 +168,7 @@ fn luma_eval(i: u32) -> {ty} {{
 {}    return t{last};
 }}
 {}",
-                body(key),
+                body(&key.instrs, &key.input_tys),
                 reduce_main(ty, ops, false, "luma_eval")
             );
         }
@@ -176,22 +177,33 @@ fn luma_eval(i: u32) -> {ty} {{
 }
 
 /// The loads of the inputs at element `i` and the instructions, as `let` bindings.
-fn body(key: &FusedKey) -> String {
+fn body(instrs: &[Instr], input_tys: &[ElemTy]) -> String {
     let mut src = String::new();
     // Inputs read only through shifts are not loaded at `i`.
     let direct = |k: u32| {
-        key.instrs.iter().any(|instr| {
+        instrs.iter().any(|instr| {
             let skip = usize::from(matches!(instr.op.kind, OpKind::Shift(_)));
             instr.args.iter().skip(skip).any(|arg| *arg == Ref::Input(k))
         })
     };
-    for (k, ty) in key.input_tys.iter().enumerate() {
+    for (k, ty) in input_tys.iter().enumerate() {
         if direct(k as u32) {
             let _ = writeln!(src, "    let a{k}: {} = in{k}[i];", ty.wgsl());
         }
     }
-    for (k, instr) in key.instrs.iter().enumerate() {
+    for (k, instr) in instrs.iter().enumerate() {
         let _ = writeln!(src, "    let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr));
+    }
+    src
+}
+
+/// One function `sub{k}(i)` per sub-program: the value of a shifted expression at element `i`.
+fn subs(key: &FusedKey) -> String {
+    let mut src = String::new();
+    for (k, instrs) in key.subs.iter().enumerate() {
+        let ty = instrs.last().map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
+        let last = instrs.len().saturating_sub(1);
+        let _ = write!(src, "\nfn sub{k}(i: u32) -> {ty} {{\n{}    return t{last};\n}}\n", body(instrs, &key.input_tys));
     }
     src
 }
