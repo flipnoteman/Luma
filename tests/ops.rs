@@ -418,3 +418,15 @@ fn reshape_shares_the_buffer_and_keeps_data() {
     assert_eq!((&grid + &grid).shape(), [3, 4, 1, 1]);
     assert_eq!(grid.shift([1isize, 0]).to_vec().unwrap(), shift_cpu(&data, [3, 4, 1, 1], [1, 0, 0, 0]));
 }
+
+#[test]
+fn u32_division_by_zero_gives_the_dividend() {
+    // WGSL defines `x / 0u` as `x`; fused and in-place kernels must keep that.
+    let a = u32s(&[7, 8, 9, 10]);
+    let b = u32s(&[0, 2, 0, 5]);
+    assert_eq!((&a / &b).to_vec().unwrap(), vec![7, 4, 9, 2]);
+    assert_eq!((&a / 0u32).to_vec().unwrap(), vec![7, 8, 9, 10]);
+    let mut c = u32s(&[7, 8, 9, 10]);
+    c /= &b;
+    assert_eq!(c.to_vec().unwrap(), vec![7, 4, 9, 2]);
+}

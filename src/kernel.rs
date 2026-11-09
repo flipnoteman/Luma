@@ -329,11 +329,17 @@ pub(crate) fn build_core(
         source: wgpu::ShaderSource::Wgsl(combined.into()),
     };
     let shader = if trusted {
+        // Integer division keeps its guards: WGSL defines `x / 0` and `x % 0`, and user data
+        // reaches luma's kernels.
+        let checks = wgpu::ShaderRuntimeChecks {
+            bounds_checks: false,
+            force_loop_bounding: false,
+            ..wgpu::ShaderRuntimeChecks::checked()
+        };
         // SAFETY: luma's built-in and generated kernels index storage buffers only below the
-        // lengths they are launched with, which never exceed the bound ranges.
-        unsafe {
-            device.create_shader_module_trusted(shader_desc, wgpu::ShaderRuntimeChecks::unchecked())
-        }
+        // lengths they are launched with, which never exceed the bound ranges, and all of their
+        // loops are bounded.
+        unsafe { device.create_shader_module_trusted(shader_desc, checks) }
     } else {
         device.create_shader_module(shader_desc)
     };
