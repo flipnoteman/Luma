@@ -45,6 +45,10 @@ pub(crate) enum PassKind {
     /// The `k` forward stages within contiguous blocks of `2^k`; with `multiply`, followed by the
     /// product with the spectrum `h` and the `k` inverse stages.
     Local { multiply: bool },
+    /// A whole overlap-save convolution of short kernels: each workgroup transforms two
+    /// overlapping blocks of the real input at once (as the real and imaginary part), multiplies
+    /// by the kernel's `2^k`-point spectrum `h`, transforms back and stores the valid outputs.
+    OverlapSave,
 }
 
 impl FftPass {
@@ -55,7 +59,7 @@ impl FftPass {
     }
 
     fn has_h(self) -> bool {
-        matches!(self.kind, PassKind::Local { multiply: true })
+        matches!(self.kind, PassKind::Local { multiply: true } | PassKind::OverlapSave)
     }
 }
 
@@ -68,6 +72,9 @@ struct Params {
     in_len: u32,
     out_len: u32,
     inv_n: f32,
+    /// Overlap-save: kernel length - 1, and the outputs one block contributes.
+    lead: u32,
+    step: u32,
 }
 
 /// The WGSL source of `pass`. Bindings in order: `data`, `src`, `h`, `dst` (those the pass
@@ -88,7 +95,7 @@ pub(crate) fn source(pass: FftPass) -> String {
     }
     bindings.push("var<uniform> p: Params");
     let mut src =
-        String::from("struct Params { s: u32, k: u32, in_len: u32, out_len: u32, inv_n: f32 }\n");
+        String::from("struct Params { s: u32, k: u32, in_len: u32, out_len: u32, inv_n: f32, lead: u32, step: u32 }\n");
     for (i, binding) in bindings.iter().enumerate() {
         src.push_str(&format!("@group(1) @binding({i}) {binding};\n"));
     }
@@ -121,6 +128,7 @@ fn twiddle(num: u32, log_den: u32, sign: f32) -> vec2<f32> {{
     match pass.kind {
         PassKind::Local { multiply } => src.push_str(&local_main(multiply)),
         PassKind::Columns { inverse } => src.push_str(&columns_main(inverse)),
+        PassKind::OverlapSave => src.push_str(&overlap_save_main()),
     }
     src
 }
@@ -135,15 +143,15 @@ fn butterfly(inverse: bool) -> &'static str {
     }
 }
 
-fn local_main(multiply: bool) -> String {
-    let stage = |inverse: bool| {
-        let header = if inverse {
-            "for (var t = 1u; t <= p.k; t = t + 1u)"
-        } else {
-            "for (var t = p.k; t > 0u; t = t - 1u)"
-        };
-        format!(
-            "    {header} {{
+/// The `k` radix-2 stages of a whole tile in workgroup memory.
+fn local_stages(inverse: bool) -> String {
+    let header = if inverse {
+        "for (var t = 1u; t <= p.k; t = t + 1u)"
+    } else {
+        "for (var t = p.k; t > 0u; t = t - 1u)"
+    };
+    format!(
+        "    {header} {{
         let d = 1u << (t - 1u);
         for (var q = lid; q < half; q = q + {WORKGROUP}u) {{
             let num = q & (d - 1u);
@@ -155,9 +163,12 @@ fn local_main(multiply: bool) -> String {
         workgroupBarrier();
     }}
 ",
-            butterfly(inverse)
-        )
-    };
+        butterfly(inverse)
+    )
+}
+
+fn local_main(multiply: bool) -> String {
+    let stage = local_stages;
     let middle = if multiply {
         format!(
             "    for (var e = lid; e < size; e = e + {WORKGROUP}u) {{ sh[e] = cmul(sh[e], h[base + e]); }}
@@ -185,6 +196,45 @@ fn main(
 }}
 ",
         stage(false)
+    )
+}
+
+fn overlap_save_main() -> String {
+    format!(
+        "
+fn input_at(g: i32) -> f32 {{
+    if (g >= 0 && u32(g) < p.in_len) {{ return src[u32(g)]; }}
+    return 0.0;
+}}
+
+@compute @workgroup_size({WORKGROUP})
+fn main(
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let size = 1u << p.k;
+    let half = size >> 1u;
+    // Blocks 2w and 2w + 1; block b holds input b * step - lead .. + size.
+    let first = (wid.x + wid.y * nwg.x) * 2u * p.step;
+    for (var e = lid; e < size; e = e + {WORKGROUP}u) {{
+        let g = i32(first + e) - i32(p.lead);
+        sh[e] = vec2<f32>(input_at(g), input_at(g + i32(p.step)));
+    }}
+    workgroupBarrier();
+{}    for (var e = lid; e < size; e = e + {WORKGROUP}u) {{ sh[e] = cmul(sh[e], h[e]); }}
+    workgroupBarrier();
+{}    // The first `lead` outputs of a circular convolution wrap around; the rest are valid.
+    for (var e = p.lead + lid; e < size; e = e + {WORKGROUP}u) {{
+        let o = first + e - p.lead;
+        let v = sh[e] * p.inv_n;
+        if (o < p.out_len) {{ dst[o] = v.x; }}
+        if (o + p.step < p.out_len) {{ dst[o + p.step] = v.y; }}
+    }}
+}}
+",
+        local_stages(false),
+        local_stages(true)
     )
 }
 
@@ -245,14 +295,50 @@ pub(crate) struct Operands<'a> {
     pub(crate) output: (&'a wgpu::Buffer, u64, u32),
 }
 
+/// [`convolve`] for a kernel of at most half a tile: blocks of [`TILE`] inputs, each yielding
+/// `TILE - kernel_len + 1` outputs, convolved in workgroup memory in one pass over the data.
+fn overlap_save(ctx: &Context, ops: &Operands<'_>, scratch: &mut Scratch<'_>) -> Result<(), LumaError> {
+    let lead = ops.kernel.2 - 1;
+    let step = TILE - lead;
+    let spectrum_bytes = u64::from(TILE) * 8;
+    let spectrum = scratch.take(spectrum_bytes)?;
+    let mut params = Params { s: 0, k: TILE_LOG, in_len: ops.kernel.2, out_len: 0, inv_n: 1.0 / TILE as f32, lead, step };
+
+    let pass = FftPass { kind: PassKind::Local { multiply: false }, real_in: true, real_out: false };
+    let core = ctx.builtin(Builtin::Fft(pass), "f32")?;
+    let args = [
+        RawArg::write(&spectrum, spectrum_bytes),
+        RawArg::read(ops.kernel.0, ops.kernel.1),
+        RawArg::Uniform(bytemuck::bytes_of(&params)),
+    ];
+    ctx.launch(&core, [1, 1, 1], [TILE, 1, 1], &args)?;
+
+    params.in_len = ops.input.2;
+    params.out_len = ops.output.2;
+    let pass = FftPass { kind: PassKind::OverlapSave, real_in: true, real_out: true };
+    let core = ctx.builtin(Builtin::Fft(pass), "f32")?;
+    let args = [
+        RawArg::read(ops.input.0, ops.input.1),
+        RawArg::read(&spectrum, spectrum_bytes),
+        RawArg::write(ops.output.0, ops.output.1),
+        RawArg::Uniform(bytemuck::bytes_of(&params)),
+    ];
+    let pairs = ops.output.2.div_ceil(step).div_ceil(2);
+    ctx.launch(&core, fold_workgroups(ctx, pairs)?, [ops.output.2, 1, 1], &args)
+}
+
 /// Records the full linear convolution of `ops.input` with `ops.kernel` into `ops.output`, with
-/// transforms of `n` (a power of two of at least the output length) points.
+/// transforms of `n` (a power of two of at least the output length) points; short kernels take
+/// [`overlap_save`] instead.
 pub(crate) fn convolve(
     ctx: &Context,
     ops: &Operands<'_>,
     n: u32,
     scratch: &mut Scratch<'_>,
 ) -> Result<(), LumaError> {
+    if n > TILE && ops.kernel.2 <= TILE / 2 {
+        return overlap_save(ctx, ops, scratch);
+    }
     let log_n = n.trailing_zeros();
     let local = log_n.min(TILE_LOG);
     let rest = log_n - local;
@@ -288,6 +374,8 @@ pub(crate) fn convolve(
             in_len: real_in.map_or(0, |(_, _, len)| len),
             out_len: real_out.map_or(0, |(_, _, len)| len),
             inv_n,
+            lead: 0,
+            step: 0,
         };
         let mut args = Vec::with_capacity(5);
         if pass.has_data() {

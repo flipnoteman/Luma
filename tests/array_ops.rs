@@ -542,14 +542,27 @@ fn conv1d_matches_the_cpu_across_tile_and_chunk_boundaries() {
 
 #[test]
 fn fft_conv1d_matches_the_direct_sum_for_transforms_beyond_one_tile() {
-    // Transform sizes 2^12 (one column pass), 2^17 and 2^20 (two column passes).
-    for (input_len, kernel_len) in [(3_000usize, 50usize), (70_000, 300), (600_000, 1_000)] {
+    // Kernels of up to half a tile take overlap-save (one or several blocks, the longest such
+    // kernel); longer ones the full transform of 2^12 (one column pass), 2^19 and 2^20 (two).
+    let cases = [
+        (3_000usize, 50usize),
+        (1_500, 600),
+        (70_000, 300),
+        (5_000, 1_024),
+        (600_000, 1_000),
+        (2_000, 1_500),
+        (300_000, 1_100),
+        (530_000, 1_100),
+    ];
+    for (input_len, kernel_len) in cases {
         let input_data: Vec<f32> = (0..input_len).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
         let kernel_data: Vec<f32> = (0..kernel_len).map(|k| ((k * 13 % 29) as f32 - 14.0) / 14.0).collect();
         let got = array(input_len, &input_data).conv1d_fft(&array(kernel_len, &kernel_data)).to_vec().unwrap();
         assert_eq!(got.len(), input_len + kernel_len - 1);
         let mut worst = 0.0f64;
-        for (o, g) in got.iter().enumerate() {
+        // Both ends in full, every 7th output elsewhere (7 is coprime to every block step).
+        let ends = 2 * kernel_len + 2048;
+        for (o, g) in got.iter().enumerate().filter(|(o, _)| o % 7 == 0 || *o < ends || o + ends > got.len()) {
             let lo = o.saturating_sub(input_len - 1);
             let want: f64 = (lo..kernel_len.min(o + 1))
                 .map(|k| f64::from(input_data[o - k]) * f64::from(kernel_data[k]))
