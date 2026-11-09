@@ -1,5 +1,5 @@
 use log::debug;
-use wgpu::{Device, Features, InstanceDescriptor, InstanceFlags, MemoryHints, PowerPreference, Queue};
+use wgpu::{Device, InstanceDescriptor, MemoryHints, PowerPreference, Queue};
 
 /// GpuHandle
 /// This will hold our [Device] and [Queue] for later executions
@@ -19,44 +19,31 @@ impl GpuHandle {
 }
 
 pub async fn get_adapter_info() -> Result<GpuHandle, String> {
-    let instance = wgpu::Instance::new(&InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        backend_options: wgpu::BackendOptions {
-            gl: wgpu::GlBackendOptions {
-                gles_minor_version: Default::default(),
-            },
-            dx12: wgpu::Dx12BackendOptions {
-                shader_compiler: Default::default(),
-            },
-        },
-        flags: InstanceFlags::empty(),
-    });
+    let mut instance_desc = InstanceDescriptor::new_without_display_handle();
+    instance_desc.backends = wgpu::Backends::PRIMARY;
+    let instance = wgpu::Instance::new(instance_desc);
 
-    let Some(adapter) = instance
+    let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
+            ..Default::default()
         })
         .await
-    else {
-        return Err("Found no adapters.".into());
-    };
+        .map_err(|e| format!("Found no adapters: {e}"))?;
 
     debug!("Adapter(s) = {:?}", adapter.get_info());
 
+    // Request the adapter's full limits so large arrays aren't capped by the
+    // conservative WebGPU defaults (e.g. 128 MiB storage bindings).
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("Device 1"),
-                required_features: Features::empty(),
-                required_limits: Default::default(),
-                memory_hints: MemoryHints::MemoryUsage,
-            },
-            None,
-        )
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("Device 1"),
+            required_limits: adapter.limits(),
+            memory_hints: MemoryHints::MemoryUsage,
+            ..Default::default()
+        })
         .await
-        .expect("Error requesting device.");
+        .map_err(|e| format!("Error requesting device: {e}"))?;
 
     Ok(GpuHandle::new(device, queue))
 }

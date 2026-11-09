@@ -28,12 +28,10 @@ use tokio::sync::OnceCell;
 macro_rules! array {
     ($dims:expr, $data:expr) => {
         Array::new($dims, $data)
-        .await.expect("Could not create Array.");
+        .await.expect("Could not create Array.")
     };
 }
 
-const PROJECT_DIR: &str = env!("CARGO_MANIFEST_DIR");
-const SHADERS_PATH: &str = "./operations";
 
 /// Static thread-safe executor with interior mutability.
 static EXECUTOR: OnceCell<Executor> = OnceCell::const_new();
@@ -42,6 +40,6 @@ static EXECUTOR: OnceCell<Executor> = OnceCell::const_new();
 /// concurrent callers wait for that initialization to finish.
 async fn ensure_executor() -> &'static Executor {
     EXECUTOR.get_or_init(|| async {
-        Executor::new(&format!("{}/{}", PROJECT_DIR, SHADERS_PATH)).await.unwrap()
+        Executor::new().await.unwrap()
     }).await
 }

@@ -9,6 +9,15 @@ use wgpu::Buffer;
 use crate::gpu::handle::{self, GpuHandle};
 use crate::operations::{self, ShaderResources};
 
+/// Converts host-side dimensions to the `array<u32, 4>` layout the shaders expect.
+fn dims_to_u32(dims: &[usize; 4]) -> Result<[u32; 4], String> {
+    let mut out = [0u32; 4];
+    for (o, d) in out.iter_mut().zip(dims) {
+        *o = u32::try_from(*d).map_err(|_| format!("Dimension {d} exceeds u32::MAX"))?;
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 pub struct Buffers {
     pub(crate) storage_buffer: Buffer,
@@ -38,18 +47,10 @@ impl Default for Executor {
 }
 
 impl Executor {
-    pub async fn new(shader_path_directory: &str) -> Result<Self, String> {
+    pub async fn new() -> Result<Self, String> {
         let mut ex = Executor::default();
         let adapter = handle::get_adapter_info().await?;
-        let shaders =
-            operations::add_shader_modules_from_directory(&adapter.device, shader_path_directory)
-                .await;
-
-        if let Some(shaders) = shaders {
-            ex.shaders = Some(Box::new(shaders))
-        } else {
-            ex.shaders = None
-        }
+        ex.shaders = Some(Box::new(operations::create_shader_modules(&adapter.device)));
         ex.adapter = Some(Box::new(adapter));
 
         Ok(ex)
@@ -86,7 +87,7 @@ impl Executor {
 
         let dimensions_buffer = adapter.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Dimensions Buffer"),
-            contents: bytemuck::cast_slice::<usize, u8>(dimensions),
+            contents: bytemuck::cast_slice::<u32, u8>(&dims_to_u32(dimensions)?),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -140,10 +141,14 @@ impl Executor {
         let (sender, receiver) = flume::bounded(1);
         buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
 
-        device.poll(wgpu::Maintain::wait()).panic_on_timeout();
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("GPU poll failed: {e}"))?;
 
         if let Ok(Ok(())) = receiver.recv_async().await {
-            let data = buffer_slice.get_mapped_range();
+            let data = buffer_slice
+                .get_mapped_range()
+                .map_err(|e| format!("Failed to map staging buffer: {e}"))?;
             let result: Vec<u8> = data.to_vec();
             drop(data);
             staging_buffer.unmap();

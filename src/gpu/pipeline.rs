@@ -3,6 +3,18 @@ use wgpu::util::DeviceExt;
 use crate::executor::{Buffers, Executor};
 use crate::operations::{shader_name, Operation};
 
+/// Workgroup size used by the elementwise shaders (`@workgroup_size(64)`).
+const ELEMENTWISE_WORKGROUP_SIZE: u32 = 64;
+
+/// Splits `element_count` elements into a 2D dispatch that stays within the
+/// per-dimension workgroup limit. Shaders linearize with `gid.x + gid.y * nwg.x * 64`.
+fn dispatch_dims(element_count: u32, max_per_dim: u32) -> (u32, u32) {
+    let groups = element_count.div_ceil(ELEMENTWISE_WORKGROUP_SIZE).max(1);
+    let x = groups.min(max_per_dim);
+    let y = groups.div_ceil(x);
+    (x, y)
+}
+
 impl Executor {
     /// Execute a unary operation on the GPU. Returns a new buffer id with the result.
     /// The original buffer is untouched.
@@ -93,7 +105,7 @@ impl Executor {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Unary Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -107,6 +119,7 @@ impl Executor {
         });
 
         let element_count = (src_size / element_size as u64) as u32;
+        let (gx, gy) = dispatch_dims(element_count, device.limits().max_compute_workgroups_per_dimension);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -115,7 +128,7 @@ impl Executor {
             });
             cpass.set_pipeline(&compute_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(element_count, 1, 1);
+            cpass.dispatch_workgroups(gx, gy, 1);
         }
         queue.submit(Some(encoder.finish()));
 
@@ -240,7 +253,7 @@ impl Executor {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Binary Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -254,6 +267,7 @@ impl Executor {
         });
 
         let element_count = (lhs_size / element_size as u64) as u32;
+        let (gx, gy) = dispatch_dims(element_count, device.limits().max_compute_workgroups_per_dimension);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -262,7 +276,7 @@ impl Executor {
             });
             cpass.set_pipeline(&compute_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(element_count, 1, 1);
+            cpass.dispatch_workgroups(gx, gy, 1);
         }
         queue.submit(Some(encoder.finish()));
 
@@ -335,7 +349,7 @@ impl Executor {
         });
 
         // Create dimensions buffer for the output
-        let dims: [usize; 4] = [output_len, 1, 1, 1];
+        let dims: [u32; 4] = [u32::try_from(output_len).map_err(|_| "Output length exceeds u32::MAX")?, 1, 1, 1];
         let dims_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Conv1D Output Dimensions Buffer"),
             contents: bytemuck::cast_slice(&dims),
@@ -416,7 +430,7 @@ impl Executor {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Conv1D Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -558,7 +572,7 @@ impl Executor {
 
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[&bind_group_layout],
+                bind_group_layouts: &[Some(&bind_group_layout)],
                 immediate_size: 0,
             });
 
@@ -759,7 +773,7 @@ impl Executor {
         queue.submit(Some(encoder.finish()));
 
         // Store result
-        let dims: [usize; 4] = [output_len, 1, 1, 1];
+        let dims: [u32; 4] = [u32::try_from(output_len).map_err(|_| "Output length exceeds u32::MAX")?, 1, 1, 1];
         let dims_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("FFT Conv1D Output Dimensions"),
             contents: bytemuck::cast_slice(&dims),

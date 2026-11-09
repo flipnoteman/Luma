@@ -80,6 +80,34 @@ async fn add_f32() {
     assert_eq!(result, vec![5.0f32, 8.0, 9.0]);
 }
 
+// -- Large arrays (exceed the 65,535 workgroups-per-dimension dispatch limit) --
+
+const LARGE_LEN: usize = 5_000_003; // > 65_535 * 64, and not a multiple of 64
+
+#[tokio::test]
+async fn add_f32_large_array() {
+    let lhs: Vec<f32> = (0..LARGE_LEN).map(|i| i as f32).collect();
+    let rhs = vec![0.5f32; LARGE_LEN];
+    let a = array!(&[LARGE_LEN, 1, 1, 1], &lhs);
+    let b = array!(&[LARGE_LEN, 1, 1, 1], &rhs);
+    let result = a.add(&b).await.unwrap().to_vec().await.unwrap();
+    assert_eq!(result.len(), LARGE_LEN);
+    for i in [0, 1, 63, 64, 65_535 * 64, LARGE_LEN - 1] {
+        assert_eq!(result[i], i as f32 + 0.5, "index {i}");
+    }
+}
+
+#[tokio::test]
+async fn double_u32_large_array() {
+    let data: Vec<u32> = (0..LARGE_LEN as u32).collect();
+    let a = array!(&[LARGE_LEN, 1, 1, 1], &data);
+    let result = a.double().await.unwrap().to_vec().await.unwrap();
+    assert_eq!(result.len(), LARGE_LEN);
+    for i in [0, 1, 63, 64, 65_535 * 64, LARGE_LEN - 1] {
+        assert_eq!(result[i], 2 * i as u32, "index {i}");
+    }
+}
+
 // -- Scalar operations (u32) --
 
 #[tokio::test]

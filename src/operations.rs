@@ -47,36 +47,37 @@ pub fn shader_name(op: &Operation, type_suffix: &str) -> String {
     }
 }
 
-pub async fn add_shader_modules_from_directory(
-    device: &Device,
-    shaders_directory: &str,
-) -> Option<ShaderResources> {
-    let mut shader_module_hm = HashMap::new();
+/// Shader sources embedded at compile time, keyed by file stem.
+const SHADER_SOURCES: &[(&str, &str)] = &[
+    ("add", include_str!("../operations/add.wgsl")),
+    ("add_f32", include_str!("../operations/add_f32.wgsl")),
+    ("conv1d_f32", include_str!("../operations/conv1d_f32.wgsl")),
+    ("divide", include_str!("../operations/divide.wgsl")),
+    ("divide_f32", include_str!("../operations/divide_f32.wgsl")),
+    ("double", include_str!("../operations/double.wgsl")),
+    ("double_f32", include_str!("../operations/double_f32.wgsl")),
+    ("fft_bit_reverse_f32", include_str!("../operations/fft_bit_reverse_f32.wgsl")),
+    ("fft_butterfly_f32", include_str!("../operations/fft_butterfly_f32.wgsl")),
+    ("fft_complex_bit_reverse_f32", include_str!("../operations/fft_complex_bit_reverse_f32.wgsl")),
+    ("fft_complex_mul_f32", include_str!("../operations/fft_complex_mul_f32.wgsl")),
+    ("fft_extract_real_f32", include_str!("../operations/fft_extract_real_f32.wgsl")),
+    ("ifft_butterfly_f32", include_str!("../operations/ifft_butterfly_f32.wgsl")),
+    ("multiply", include_str!("../operations/multiply.wgsl")),
+    ("multiply_f32", include_str!("../operations/multiply_f32.wgsl")),
+    ("subtract", include_str!("../operations/subtract.wgsl")),
+    ("subtract_f32", include_str!("../operations/subtract_f32.wgsl")),
+];
 
-    let shader_paths = match std::fs::read_dir(shaders_directory) {
-        Ok(s) => s,
-        Err(_) => return None,
-    }
-    .map(|path| path.unwrap().path().into_os_string().into_string().unwrap())
-    .collect::<Vec<String>>();
-
-    for path in shader_paths.iter() {
-        let file_name = std::path::Path::new(path)
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap();
-
-        let shader: Cow<str> = Cow::from(
-            std::fs::read_to_string(path)
-                .unwrap_or_else(|_| panic!("Could not read file contents from: {}", path)),
-        );
-        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(file_name),
-            source: wgpu::ShaderSource::Wgsl(shader),
-        });
-        shader_module_hm.insert(file_name.to_owned(), cs_module);
-    }
-
-    Some(shader_module_hm)
+/// Compiles all embedded shaders into [ShaderModule]s keyed by name.
+pub fn create_shader_modules(device: &Device) -> ShaderResources {
+    SHADER_SOURCES
+        .iter()
+        .map(|(name, source)| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(name),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
+            });
+            ((*name).to_owned(), module)
+        })
+        .collect()
 }
