@@ -8,6 +8,7 @@ use wgpu::{BindGroupEntry, BindingResource, Buffer, BufferBinding, BufferUsages}
 
 use crate::builtin::Builtin;
 use crate::error::{LumaError, Result};
+use crate::jit::JitState;
 use crate::gpu::handle;
 use crate::gpu::pool::{self, BufferPool};
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
@@ -145,6 +146,8 @@ struct Inner {
     queue: wgpu::Queue,
     /// Built-in kernels, built on first use of their (operation, element type).
     builtins: Mutex<HashMap<(Builtin, &'static str), Arc<KernelCore>>>,
+    /// Lazy-evaluation state: fused kernels and the pending expressions.
+    jit: JitState,
     /// Custom kernels, built on first use of their (source, entry, workgroup).
     kernels: Mutex<HashMap<KernelKey, Arc<KernelCore>>>,
     pool: Mutex<BufferPool>,
@@ -260,6 +263,7 @@ impl Context {
                 device,
                 queue,
                 builtins: Mutex::new(HashMap::new()),
+                jit: JitState::new(&limits),
                 kernels: Mutex::new(HashMap::new()),
                 pool: Mutex::new(BufferPool::default()),
                 batch: Mutex::new(batch),
@@ -281,11 +285,17 @@ impl Context {
     /// Submits everything recorded so far and waits until the GPU has executed it. Reports the
     /// first error the GPU raised while running luma's commands.
     pub fn sync(&self) -> Result<()> {
+        // Lazy arrays that are still alive are part of "everything recorded so far".
+        self.jit().evaluate_live();
         self.flush()?;
         self.device()
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| LumaError::Poll(Arc::new(e)))?;
         self.take_gpu_error()
+    }
+
+    pub(crate) fn jit(&self) -> &JitState {
+        &self.inner.jit
     }
 
     /// Submits the pending batch without waiting for it.
@@ -681,6 +691,9 @@ mod tests {
         let a = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap();
         let storage = a.buffer().unwrap().clone();
         let doubled = &a * 2.0;
+        // Operators are lazy: record the multiplication (without waiting for it) so that it is
+        // pending in the batch, reading a's buffer.
+        assert!(doubled.ready().is_ok());
         assert!(ctx.pending_dispatches() > 0, "the multiplication must still be pending");
         drop(a);
 

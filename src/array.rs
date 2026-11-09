@@ -1,10 +1,12 @@
 use std::marker::PhantomData;
 use std::panic::Location;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::context::{default_context, Context, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::GpuType;
+use crate::jit::{Node, Readers, Src};
 use crate::shape::Shape;
 
 /// Why an operation on arrays did not produce a result. Internal: operators turn it into a
@@ -36,9 +38,35 @@ impl Failure {
 /// using it is dropped.
 #[derive(Debug)]
 pub(crate) struct Storage {
+    id: u64,
     ctx: Context,
     /// May be larger than the data it holds; only the first `byte_len` bytes are the array.
     buffer: wgpu::Buffer,
+    /// Lazy operations that still have to read this buffer; they are evaluated before anything
+    /// overwrites it (see [`crate::jit`]).
+    pub(crate) readers: Readers,
+}
+
+static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
+
+impl Storage {
+    pub(crate) fn new(ctx: &Context, buffer: wgpu::Buffer) -> Self {
+        Storage {
+            id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
+            ctx: ctx.clone(),
+            buffer,
+            readers: Readers::default(),
+        }
+    }
+
+    /// Unique per storage; identifies it as an input of a fused kernel.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
 }
 
 impl Drop for Storage {
@@ -51,6 +79,9 @@ impl Drop for Storage {
 #[derive(Debug)]
 enum Repr {
     Valid(Arc<Storage>),
+    /// An elementwise expression that has not run yet; evaluated (once) when its buffer is
+    /// needed. See [`crate::jit`].
+    Lazy(Arc<Node>),
     /// An operation producing this array failed; see [`Array::error`].
     Poisoned(Arc<LumaError>),
 }
@@ -62,6 +93,15 @@ enum Repr {
 /// [`Context`]. Math is written like on the host: operators (`&a + &b * 2.0`), methods
 /// (`a.sqrt()`) and reductions (`a.sum()?`). Nothing waits for the GPU until a result is needed:
 /// [`Array::to_vec`], [`Array::eval`] and the reductions are the synchronization points.
+///
+/// # Lazy arrays and fusion
+///
+/// Elementwise operators and math functions do not run immediately: the result is a *lazy*
+/// array holding the expression, and a chain such as `(&x * 2.0 + &y).sqrt()` becomes a single
+/// generated kernel when the data is first needed (reading it back, `eval`, `write`, a shift, a
+/// convolution, a custom kernel, [`Context::sync`]). Reductions fuse the expression into their
+/// first pass. A lazy array behaves as the value its expression had when it was written: later
+/// changes of its inputs (`write`, `+=`, kernels taking `&mut`) do not affect it.
 ///
 /// # Errors do not panic: poisoned arrays
 ///
@@ -107,9 +147,14 @@ impl<T: GpuType> Array<T> {
         Ok(Array {
             ctx: ctx.clone(),
             shape,
-            repr: Repr::Valid(Arc::new(Storage { ctx: ctx.clone(), buffer })),
+            repr: Repr::Valid(Arc::new(Storage::new(ctx, buffer))),
             _marker: PhantomData,
         })
+    }
+
+    /// An array that is the (not yet evaluated) result of `node`.
+    pub(crate) fn from_node(ctx: &Context, shape: Shape, node: Arc<Node>) -> Self {
+        Array { ctx: ctx.clone(), shape, repr: Repr::Lazy(node), _marker: PhantomData }
     }
 
     fn poisoned(ctx: &Context, shape: Shape, error: Arc<LumaError>) -> Self {
@@ -197,8 +242,14 @@ impl<T: GpuType> Array<T> {
     /// The error this array is poisoned with, if any. It names the operation that failed and
     /// where it was called from.
     pub fn error(&self) -> Option<&LumaError> {
+        self.failed().map(|error| &**error)
+    }
+
+    /// The error of a poisoned array, or of a lazy array whose evaluation failed.
+    fn failed(&self) -> Option<&Arc<LumaError>> {
         match &self.repr {
             Repr::Valid(_) => None,
+            Repr::Lazy(node) => node.failure(),
             Repr::Poisoned(error) => Some(error),
         }
     }
@@ -206,18 +257,54 @@ impl<T: GpuType> Array<T> {
     /// `Err` with the error of a poisoned array, `Ok` otherwise. Errors reported by the GPU
     /// itself (as opposed to failed operations) only show up at synchronization points.
     pub fn check(&self) -> Result<()> {
+        match self.failed() {
+            None => Ok(()),
+            Some(error) => Err(LumaError::clone(error)),
+        }
+    }
+
+    /// The array's storage, evaluating the array first if it is still lazy (this records the
+    /// work; it does not wait for the GPU). Fails with the reason the array is not valid.
+    pub(crate) fn storage(&self) -> std::result::Result<&Arc<Storage>, Failure> {
         match &self.repr {
-            Repr::Valid(_) => Ok(()),
-            Repr::Poisoned(error) => Err(LumaError::clone(error)),
+            Repr::Valid(storage) => Ok(storage),
+            Repr::Lazy(node) => {
+                node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
+            }
+            Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
         }
     }
 
     /// The buffer and the number of bytes of it holding the array, or the reason the array is
-    /// not valid.
+    /// not valid. Evaluates a lazy array.
     pub(crate) fn ready(&self) -> std::result::Result<(&wgpu::Buffer, u64), Failure> {
+        Ok((self.storage()?.buffer(), self.byte_len()))
+    }
+
+    /// This array as an operand of a lazy operation, without evaluating it: its buffer, or the
+    /// pending expression that produces it.
+    pub(crate) fn src(&self) -> std::result::Result<Src, Failure> {
         match &self.repr {
-            Repr::Valid(storage) => Ok((&storage.buffer, self.byte_len())),
+            Repr::Valid(storage) => Ok(Src::Buffer(Arc::clone(storage))),
+            Repr::Lazy(node) => node.as_src(),
             Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
+        }
+    }
+
+    /// The expression behind this array if it has not been evaluated yet.
+    pub(crate) fn pending(&self) -> Option<&Arc<Node>> {
+        match &self.repr {
+            Repr::Lazy(node) if node.is_pending() => Some(node),
+            _ => None,
+        }
+    }
+
+    /// Evaluates every pending lazy operation that reads this array's buffer. Must run before
+    /// the buffer is overwritten, so those operations keep seeing the data they were recorded
+    /// against.
+    pub(crate) fn flush_readers(&self) {
+        if let Ok(storage) = self.storage() {
+            storage.readers.flush();
         }
     }
 
@@ -242,10 +329,10 @@ impl<T: GpuType> Array<T> {
         Ok(bytemuck::pod_collect_to_vec::<u8, T>(&raw))
     }
 
-    /// Submits the pending batch and waits until the GPU has executed it, without copying
-    /// anything back. Returns the array's error if it is poisoned.
+    /// Records the array's pending computation, submits the batch and waits until the GPU has
+    /// executed it, without copying anything back. Returns the array's error if it is poisoned.
     pub fn eval(&self) -> Result<()> {
-        self.check()?;
+        self.ready().map_err(Failure::into_error)?;
         self.ctx.sync()
     }
 
@@ -257,6 +344,8 @@ impl<T: GpuType> Array<T> {
         if data.len() != self.len() {
             return Err(LumaError::LengthMismatch { expected: self.len(), actual: data.len() });
         }
+        // Lazy operations recorded earlier still read the old contents.
+        self.flush_readers();
         self.ctx.upload(buffer, bytemuck::cast_slice(data))
     }
 
@@ -274,10 +363,9 @@ impl<T: GpuType> Array<T> {
     }
 
     fn reshaped(&self, shape: Shape) -> std::result::Result<Array<T>, Failure> {
-        let storage = match &self.repr {
-            Repr::Valid(storage) => storage,
-            Repr::Poisoned(error) => return Err(Failure::Inherited(Arc::clone(error))),
-        };
+        if let Some(error) = self.failed() {
+            return Err(Failure::Inherited(Arc::clone(error)));
+        }
         let len = shape.validate()?;
         if len != self.len() {
             return Err(LumaError::InvalidShape(format!(
@@ -288,6 +376,8 @@ impl<T: GpuType> Array<T> {
             ))
             .into());
         }
+        // A view shares the buffer, so the array has to exist.
+        let storage = self.storage()?;
         Ok(Array {
             ctx: self.ctx.clone(),
             shape,

@@ -81,6 +81,25 @@ dispatches piled up. Hundreds of small operations cost one submission, not hundr
 uniforms are recorded in order with the work around them, so reusing or overwriting an array never
 affects operations recorded before it.
 
+## Elementwise chains are fused
+
+Operators, math functions, comparisons, `select`, `powf` and `clamp` do not run when you write
+them: they build an expression, and the array you get back is *lazy*. When something needs its
+data (`to_vec`, `eval`, `write`, a shift or convolution, a custom kernel, `Context::sync`), the
+whole expression is compiled into **one** generated kernel that reads every input once and writes
+the result once, so `(&x * 2.0 + &y).sqrt() - 1.0` is a single dispatch with no temporaries.
+Reductions fold the expression into their first pass: `(&a * &b).sum()?` never materializes the
+product. Kernels are cached by the structure of the expression, so changing a scalar (`&x * dt`
+with a new `dt` every step) reuses the pipeline.
+
+A lazy array is the value its expression had when you wrote it down: overwriting an input
+afterwards (`write`, `+=`, a kernel taking `&mut`) does not change it. Errors still arise where
+the faulty operation is written, with its source location. Fusion stops at 64 operations per
+kernel or at the device's binding limit (the expression is cut and continues in the next kernel),
+and a result used by several operations is computed once instead of inside each of them.
+`LUMA_FUSION_MAX_NODES=1` in the environment disables fusion (one kernel per operation); the
+effect is measured by `cargo run --release --example bench_fusion`.
+
 ## Errors do not panic
 
 Operators and math methods return `Array<T>`, not `Result`. If an operation fails (shape
@@ -157,4 +176,5 @@ cargo run --example double_test                 # expressions, select, reduction
 cargo run --example conv1d
 cargo run --release --example bench_conv1d      # spatial vs FFT convolution
 cargo run --release --example bench_batching    # sync after every op vs batched
+cargo run --release --example bench_fusion      # one kernel per operation vs fused chains
 ```

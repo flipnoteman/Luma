@@ -368,6 +368,10 @@ pub struct KernelArg<'a> {
 }
 
 fn storage_arg<'a, T: GpuType>(array: &'a Array<T>, writable: bool) -> KernelArg<'a> {
+    if writable {
+        // Lazy operations recorded earlier still read the contents the kernel is about to change.
+        array.flush_readers();
+    }
     let repr = match array.ready() {
         Ok((buffer, bytes)) => ArgRepr::Storage {
             ctx: array.context(),
