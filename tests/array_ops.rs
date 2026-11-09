@@ -518,24 +518,28 @@ fn arrays_from_different_contexts_cannot_be_combined() {
 #[test]
 fn conv1d_matches_the_cpu_across_tile_and_chunk_boundaries() {
     // Lengths straddle the outputs one workgroup computes and the taps staged at a time; tap
-    // counts that are not a multiple of the outputs per invocation; padding on both sides.
+    // counts that are not a multiple of the outputs per invocation; padding on both sides;
+    // every tiled stride and one beyond.
     let cases = [(10_000usize, 300usize, 0usize), (9_001, 517, 7), (5_000, 1, 0), (4_113, 16, 2), (300, 260, 130)];
-    for (input_len, kernel_len, padding) in cases {
-        let input_data: Vec<f32> = (0..input_len).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01).collect();
-        let kernel_data: Vec<f32> = (0..kernel_len).map(|k| ((k * 13 % 29) as f32 - 14.0) * 0.05).collect();
-        let input = array(input_len, &input_data);
-        let kernel = array(kernel_len, &kernel_data);
-        let got = input.conv1d(&kernel, 1, padding).to_vec().unwrap();
-        let out_len = input_len + 2 * padding - kernel_len + 1;
-        assert_eq!(got.len(), out_len);
-        for (o, g) in got.iter().enumerate() {
-            let want: f32 = (0..kernel_len)
-                .filter_map(|k| {
-                    let at = (o + k).checked_sub(padding)?;
-                    input_data.get(at).map(|x| x * kernel_data[k])
-                })
-                .sum();
-            assert!((g - want).abs() < 1e-3, "{input_len}/{kernel_len}/{padding} at {o}: got {g}, want {want}");
+    for stride in 1..=5 {
+        for (input_len, kernel_len, padding) in cases {
+            let input_data: Vec<f32> = (0..input_len).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01).collect();
+            let kernel_data: Vec<f32> = (0..kernel_len).map(|k| ((k * 13 % 29) as f32 - 14.0) * 0.05).collect();
+            let input = array(input_len, &input_data);
+            let kernel = array(kernel_len, &kernel_data);
+            let got = input.conv1d(&kernel, stride, padding).to_vec().unwrap();
+            let out_len = (input_len + 2 * padding - kernel_len) / stride + 1;
+            assert_eq!(got.len(), out_len);
+            for (o, g) in got.iter().enumerate() {
+                let want: f32 = (0..kernel_len)
+                    .filter_map(|k| {
+                        let at = (o * stride + k).checked_sub(padding)?;
+                        input_data.get(at).map(|x| x * kernel_data[k])
+                    })
+                    .sum();
+                let case = format!("{input_len}/{kernel_len}/{padding} stride {stride}");
+                assert!((g - want).abs() < 1e-3, "{case} at {o}: got {g}, want {want}");
+            }
         }
     }
 }

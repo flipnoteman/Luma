@@ -18,14 +18,12 @@ pub(crate) const REDUCE_WORKGROUP: u32 = 256;
 pub(crate) const REDUCE_PER_THREAD: u32 = 4;
 /// Number of input elements one reduction workgroup consumes.
 pub(crate) const REDUCE_BLOCK: u32 = REDUCE_WORKGROUP * REDUCE_PER_THREAD;
-/// Invocations of the tiled convolution, and how many consecutive outputs each computes.
+/// Invocations of the tiled convolution, and how many consecutive outputs each computes at
+/// stride 1 (stride `s` computes `1 / s` as many).
 const CONV_WORKGROUP: u32 = 256;
 const CONV_PER_THREAD: u32 = 16;
-/// Outputs one workgroup of the tiled convolution computes.
-pub(crate) const CONV_TILE: u32 = CONV_WORKGROUP * CONV_PER_THREAD;
-/// Taps staged in workgroup memory at a time (one per invocation, a multiple of the outputs per
-/// invocation).
-const CONV_CHUNK: u32 = CONV_WORKGROUP;
+/// Largest stride the tiled convolution handles; larger ones run one output per invocation.
+pub(crate) const CONV_MAX_STRIDE: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum UnOp {
@@ -140,8 +138,9 @@ pub(crate) enum Builtin {
     Reduce(ReduceOp),
     /// Direct convolution, one output per invocation; any stride.
     Conv1d,
-    /// Direct convolution with stride 1, tiled; [`CONV_TILE`] outputs per workgroup.
-    Conv1dTiled,
+    /// Direct convolution with a stride of up to [`CONV_MAX_STRIDE`], tiled; [`conv_tile`]
+    /// outputs per workgroup.
+    Conv1dTiled(u32),
     /// One pass of the FFT convolution, see [`crate::fft`].
     Fft(crate::fft::FftPass),
 }
@@ -235,16 +234,21 @@ fn main(
     )
 }
 
-/// Stride-1 direct convolution, tiled. A workgroup computes [`CONV_TILE`] consecutive outputs,
-/// an invocation `R` = [`CONV_PER_THREAD`] consecutive ones in registers. The kernel is consumed
-/// in chunks of [`CONV_CHUNK`] taps whose weights and input window are staged in workgroup
-/// memory (zero outside the input, so the inner loop has no bounds checks). The inner loop
-/// takes `R` taps at a time from `2R - 1` window values: `R * R` FMAs per `3R - 1` loads, fully
-/// unrolled here. Window slots skip one word every 32 so that the `R`-strided reads of
+/// Direct convolution with stride `s` (1 to [`CONV_MAX_STRIDE`]), tiled. A workgroup computes
+/// [`conv_tile`] consecutive outputs, an invocation `R` = [`CONV_PER_THREAD`]` / s` consecutive
+/// ones in registers. The kernel is consumed in chunks of taps whose weights and input window
+/// are staged in workgroup memory (zero outside the input, so the inner loop has no bounds
+/// checks). The inner loop takes `R` taps at a time from the `(R - 1) s + R` window values they
+/// touch, fully unrolled. Window slots skip one word every 32 so that the strided reads of
 /// neighbouring invocations fall into different banks.
-fn conv1d_tiled() -> String {
-    let (wg, r, tile, chunk) = (CONV_WORKGROUP, CONV_PER_THREAD, CONV_TILE, CONV_CHUNK);
-    let window = (tile + chunk) + (tile + chunk) / 32 + 1;
+fn conv1d_tiled(stride: u32) -> String {
+    let (wg, s) = (CONV_WORKGROUP, stride);
+    let r = CONV_PER_THREAD / s;
+    let tile = conv_tile(s);
+    // A multiple of `R`, so that padding a chunk to whole groups of `R` taps stays within it.
+    let chunk = wg / r * r;
+    let span = tile * s + chunk;
+    let window = span + span / 32 + 1;
     let mut acc = String::new();
     let mut loads = String::new();
     let mut fmas = String::new();
@@ -256,12 +260,12 @@ fn conv1d_tiled() -> String {
             "    if (o + {i}u < params.output_len) {{ output[o + {i}u] = acc{i}; }}\n"
         ));
     }
-    for j in 0..2 * r - 1 {
-        loads.push_str(&format!("            let v{j} = window[slot(at + {j}u)];\n"));
+    for m in 0..(r - 1) * s + r {
+        loads.push_str(&format!("            let v{m} = window[slot(at + {m}u)];\n"));
     }
     for kk in 0..r {
         for i in 0..r {
-            fmas.push_str(&format!("            acc{i} = fma(v{}, w{kk}, acc{i});\n", i + kk));
+            fmas.push_str(&format!("            acc{i} = fma(v{}, w{kk}, acc{i});\n", i * s + kk));
         }
     }
     format!(
@@ -284,13 +288,14 @@ fn main(
 ) {{
     let first = (wid.x + wid.y * nwg.x) * {tile}u;
     if (first >= params.output_len) {{ return; }}
-    let start = i32(first) - i32(params.padding);
-    let base = lid * {r}u;
+    let start = i32(first * {s}u) - i32(params.padding);
 {acc}    for (var c = 0u; c < params.kernel_len; c = c + {chunk}u) {{
         let taps = min({chunk}u, params.kernel_len - c);
         let padded = (taps + {r}u - 1u) / {r}u * {r}u;
-        weights[lid] = select(0.0, kernel[min(c + lid, params.kernel_len - 1u)], lid < taps);
-        for (var j = lid; j < {tile}u + padded; j = j + {wg}u) {{
+        if (lid < {chunk}u) {{
+            weights[lid] = select(0.0, kernel[min(c + lid, params.kernel_len - 1u)], lid < taps);
+        }}
+        for (var j = lid; j < {tile_in}u + padded; j = j + {wg}u) {{
             let g = start + i32(c + j);
             var v = 0.0;
             if (g >= 0 && u32(g) < params.input_len) {{ v = input_data[u32(g)]; }}
@@ -298,14 +303,21 @@ fn main(
         }}
         workgroupBarrier();
         for (var k = 0u; k < padded; k = k + {r}u) {{
-            let at = base + k;
+            let at = lid * {rs}u + k;
 {loads}{fmas}        }}
         workgroupBarrier();
     }}
-    let o = first + base;
+    let o = first + lid * {r}u;
 {stores}}}
-"
+",
+        tile_in = tile * s,
+        rs = r * s,
     )
+}
+
+/// Outputs one workgroup of the tiled convolution with `stride` computes.
+pub(crate) fn conv_tile(stride: u32) -> u32 {
+    CONV_WORKGROUP * (CONV_PER_THREAD / stride)
 }
 
 fn fill_kernel(ty: &str) -> String {
@@ -332,7 +344,7 @@ impl Builtin {
             Builtin::Fill => fill_kernel(ty).into(),
             Builtin::Reduce(op) => reduce(ty, op).into(),
             Builtin::Conv1d => include_str!("../operations/conv1d.wgsl").into(),
-            Builtin::Conv1dTiled => conv1d_tiled().into(),
+            Builtin::Conv1dTiled(stride) => conv1d_tiled(stride).into(),
             Builtin::Fft(pass) => crate::fft::source(pass).into(),
         }
     }

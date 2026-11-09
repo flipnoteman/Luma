@@ -4,7 +4,7 @@
 use std::panic::Location;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{Builtin, CONV_TILE};
+use crate::builtin::{conv_tile, Builtin, CONV_MAX_STRIDE};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::fft;
@@ -99,9 +99,9 @@ fn run_conv1d(
         RawArg::read(k_buf, k_bytes),
         RawArg::Uniform(bytemuck::bytes_of(&params)),
     ];
-    if stride == 1 {
-        let core = ctx.builtin(Builtin::Conv1dTiled, "f32")?;
-        let groups = fold_workgroups(ctx, params[4].div_ceil(CONV_TILE))?;
+    if params[1] <= CONV_MAX_STRIDE {
+        let core = ctx.builtin(Builtin::Conv1dTiled(params[1]), "f32")?;
+        let groups = fold_workgroups(ctx, params[4].div_ceil(conv_tile(params[1])))?;
         ctx.launch(&core, groups, [params[4], 1, 1], &args)?;
     } else {
         let core = ctx.builtin(Builtin::Conv1d, "f32")?;
