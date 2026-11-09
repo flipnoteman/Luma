@@ -41,6 +41,7 @@
 
 mod codegen;
 mod program;
+mod stencil;
 #[cfg(test)]
 mod tests;
 
@@ -56,7 +57,8 @@ use crate::error::{LumaError, Result};
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 
-pub(crate) use program::{evaluate, reduce_first_pass};
+pub(crate) use program::{evaluate, evaluate_group, reduce_first_pass};
+pub(crate) use stencil::plan as stencil_plan;
 
 /// Most operations one fused kernel contains unless configured otherwise.
 pub(crate) const DEFAULT_MAX_NODES: usize = 128;
@@ -305,6 +307,16 @@ impl Node {
         }
     }
 
+    /// Stores `storage`, computed for this node inside a kernel with several outputs, as the
+    /// node's result, unless another thread evaluated it meanwhile.
+    fn finish(&self, storage: Storage) {
+        let storage = Arc::new(storage);
+        if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
+            storage.readers.absorb(&self.readers);
+            lock(&self.args).take();
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -537,6 +549,8 @@ impl Readers {
 pub(crate) struct JitState {
     /// Generated kernels by the structure of their program.
     kernels: Mutex<HashMap<program::FusedKey, Arc<KernelCore>>>,
+    /// Time-blocked stencil kernels (see [`stencil`]) by their source.
+    stencils: Mutex<HashMap<String, Arc<KernelCore>>>,
     /// Every node created and not yet known to be evaluated, oldest first, so that
     /// [`Context::sync`] can evaluate the live ones.
     live: Mutex<ReaderList>,
@@ -581,6 +595,7 @@ impl JitState {
             .clamp(1, MAX_INPUTS);
         JitState {
             kernels: Mutex::new(HashMap::new()),
+            stencils: Mutex::new(HashMap::new()),
             live: Mutex::new(ReaderList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             max_inputs,
@@ -616,20 +631,48 @@ impl JitState {
         }
     }
 
-    /// Evaluates every lazy array that is still alive, newest first: an expression is evaluated
-    /// as a whole before the operands it fused (which usually died with it) are looked at.
+    /// Evaluates every lazy array that is still alive, newest first (an expression is looked at
+    /// before the operands it fused, which usually died with it). Arrays of the same length are
+    /// computed together, as many per kernel as the bindings allow: inputs they share are read
+    /// once, and one of them that another uses is computed once.
     pub(crate) fn evaluate_live(&self) {
         let nodes = {
             let mut live = lock(&self.live);
             live.prune_at = 0;
             std::mem::take(&mut live.nodes)
         };
-        for weak in nodes.into_iter().rev() {
-            if let Some(node) = weak.upgrade() {
-                if !node.fused.load(Ordering::Relaxed) {
-                    let _ = node.force();
+        let mut pending: Vec<Arc<Node>> = nodes.into_iter().rev().filter_map(|weak| weak.upgrade()).collect();
+        while let Some(first) = pending.first() {
+            let len = first.len;
+            let (same, mut rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);
+            let mut group: Vec<Arc<Node>> = Vec::new();
+            let (mut inputs, mut below) = (Vec::new(), Vec::new());
+            for node in same {
+                // Computed inside a kernel of an earlier group.
+                if !node.is_pending() || node.fused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Part of an expression of the group: it is computed inside that kernel and only
+                // evaluated on its own afterwards if it is still pending then.
+                if below.binary_search(&node.id).is_ok() {
+                    rest.push(node);
+                    continue;
+                }
+                let mut more_inputs = inputs.clone();
+                node.inputs.iter().for_each(|&id| insert_sorted(&mut more_inputs, id));
+                let mut more_below = below.clone();
+                node.below.iter().for_each(|&id| insert_sorted(&mut more_below, id));
+                let fits = more_inputs.len() + group.len() < self.max_inputs + 1
+                    && more_below.len() + group.len() < MAX_NODES_LIMIT;
+                if fits || group.is_empty() {
+                    (inputs, below) = (more_inputs, more_below);
+                    group.push(node);
+                } else {
+                    rest.push(node);
                 }
             }
+            program::evaluate_group(&group);
+            pending = rest;
         }
     }
 
@@ -650,6 +693,17 @@ impl JitState {
         )?);
         self.stats.built.fetch_add(1, Ordering::Relaxed);
         cache.insert(key, Arc::clone(&core));
+        Ok(core)
+    }
+
+    /// The stencil kernel with WGSL `source`, compiled on first use.
+    fn stencil_kernel(&self, ctx: &Context, source: String, label: &str) -> Result<Arc<KernelCore>> {
+        let mut cache = lock(&self.stencils);
+        if let Some(core) = cache.get(&source) {
+            return Ok(Arc::clone(core));
+        }
+        let core = Arc::new(kernel::build_core(ctx, &KernelKey::new(source.clone(), "main", None), Some(label), true)?);
+        cache.insert(source, Arc::clone(&core));
         Ok(core)
     }
 }

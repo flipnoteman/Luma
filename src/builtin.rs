@@ -119,8 +119,51 @@ pub(crate) enum ReduceOp {
     Sum,
     Min,
     Max,
-    /// Sum of squares of the input; only used as the first pass of a norm.
+    /// Sum of squares of the input; the later passes over its partial results are sums.
     SumSquares,
+}
+
+impl ReduceOp {
+    /// The op the passes after the first apply to its partial results.
+    fn rest(self) -> ReduceOp {
+        match self {
+            ReduceOp::SumSquares => ReduceOp::Sum,
+            op => op,
+        }
+    }
+}
+
+/// Most reductions computed in one pass over the input.
+pub(crate) const MAX_REDUCTIONS: usize = 4;
+
+/// Reductions computed together, in order (a kernel cache key, so a fixed-size value).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ReduceList {
+    ops: [ReduceOp; MAX_REDUCTIONS],
+    len: u8,
+}
+
+impl ReduceList {
+    /// `ops` must hold between 1 and [`MAX_REDUCTIONS`] ops.
+    pub(crate) fn new(ops: &[ReduceOp]) -> Self {
+        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0 };
+        for (slot, &op) in list.ops.iter_mut().zip(ops) {
+            *slot = op;
+            list.len += 1;
+        }
+        list
+    }
+
+    pub(crate) fn as_slice(&self) -> &[ReduceOp] {
+        &self.ops[..usize::from(self.len)]
+    }
+
+    /// The ops of the passes after the first.
+    pub(crate) fn rest(self) -> Self {
+        let mut list = self;
+        list.ops.iter_mut().for_each(|op| *op = op.rest());
+        list
+    }
 }
 
 /// One built-in kernel. Together with the element type's WGSL name this is the cache key of the
@@ -133,9 +176,9 @@ pub(crate) enum Builtin {
     InPlaceScalar(BinOp),
     /// `out[i] = s`; arguments: out, uniform scalar.
     Fill,
-    /// One reduction pass: each workgroup reduces `REDUCE_BLOCK` elements of `a` into one element
-    /// of `out`; arguments: out, a, uniform `{n}`.
-    Reduce(ReduceOp),
+    /// One reduction pass for each op of the list (segmented: over the partial results of an
+    /// earlier pass); see [`reduce`]. Arguments: out, a, uniform `{n}`.
+    Reduce(ReduceList, bool),
     /// Direct convolution, one output per invocation; any stride.
     Conv1d,
     /// Direct convolution with a stride of up to [`CONV_MAX_STRIDE`], tiled; [`conv_tile`]
@@ -180,29 +223,76 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     )
 }
 
-fn reduce(ty: &str, op: ReduceOp) -> String {
-    // Out-of-range loads: sums read zero, min/max re-read the last element (harmless for them).
-    // Loads stay in bounds: trusted kernels run without bounds checks.
-    let (load, combine) = match op {
-        ReduceOp::Sum => ("select(zero, a[min(idx, p.n - 1u)], idx < p.n)", "u + v"),
-        ReduceOp::SumSquares => {
-            ("select(zero, a[min(idx, p.n - 1u)] * a[min(idx, p.n - 1u)], idx < p.n)", "u + v")
-        }
-        ReduceOp::Min => ("a[min(idx, p.n - 1u)]", "min(u, v)"),
-        ReduceOp::Max => ("a[min(idx, p.n - 1u)]", "max(u, v)"),
-    };
-    let wg = REDUCE_WORKGROUP;
-    let block = REDUCE_BLOCK;
+/// One reduction pass over `a` for every op of `ops`: each workgroup reduces `REDUCE_BLOCK`
+/// elements per op into `out[j * groups + group]`. `segmented` passes reduce the partial results
+/// of an earlier pass, op `j` over `a[j * p.n ..]`; otherwise every op reads the same `p.n`
+/// elements.
+fn reduce(ty: &str, ops: ReduceList, segmented: bool) -> String {
     format!(
         "struct Params {{ n: u32 }}
 @group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
 @group(1) @binding(1) var<storage, read> a: array<{ty}>;
 @group(1) @binding(2) var<uniform> p: Params;
 
-var<workgroup> sh: array<{ty}, {wg}>;
+fn load_at(i: u32) -> {ty} {{ return a[i]; }}
+{}",
+        reduce_main(ty, ops, segmented, "load_at")
+    )
+}
 
-fn combine(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}
+/// The entry point of a reduction pass computing every op of `ops` (see [`reduce`]). Element
+/// `i` comes from `{load}(i)`, and a `Params` uniform `p` with the element count `n` is bound.
+pub(crate) fn reduce_main(ty: &str, ops: ReduceList, segmented: bool, load: &str) -> String {
+    let (wg, block) = (REDUCE_WORKGROUP, REDUCE_BLOCK);
+    // The pairwise combination of the loads below assumes four per thread.
+    const _: () = assert!(REDUCE_PER_THREAD == 4);
+    let per_thread = REDUCE_PER_THREAD;
+    let mut body = String::new();
+    // Without segments every op reduces the same elements: load each once.
+    if !segmented {
+        for s in 0..per_thread {
+            body += &format!("    let e{s} = {load}(min(base + {wg}u * {s}u, p.n - 1u));\n");
+        }
+    }
+    let mut combines = String::new();
+    for (j, &op) in ops.as_slice().iter().enumerate() {
+        let combine = match op {
+            ReduceOp::Sum | ReduceOp::SumSquares => "u + v",
+            ReduceOp::Min => "min(u, v)",
+            ReduceOp::Max => "max(u, v)",
+        };
+        combines += &format!("fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}\n");
+        body += "    {\n";
+        for s in 0..per_thread {
+            if segmented {
+                body += &format!("        let e{s} = {load}({j}u * p.n + min(base + {wg}u * {s}u, p.n - 1u));\n");
+            }
+            // Out-of-range slots: sums take zero, min/max re-read the last element (harmless).
+            let value = match op {
+                ReduceOp::Sum => format!("select(zero, e{s}, base + {wg}u * {s}u < p.n)"),
+                ReduceOp::SumSquares => format!("select(zero, e{s} * e{s}, base + {wg}u * {s}u < p.n)"),
+                ReduceOp::Min | ReduceOp::Max => format!("e{s}"),
+            };
+            body += &format!("        let v{s} = {value};\n");
+        }
+        body += &format!(
+            "        sh[lid] = c{j}(c{j}(v0, v1), c{j}(v2, v3));
+        workgroupBarrier();
+        for (var s = {half}u; s > 0u; s = s >> 1u) {{
+            if (lid < s) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
+            workgroupBarrier();
+        }}
+        if (lid == 0u && group * {block}u < p.n) {{ out[{j}u * groups + group] = sh[0]; }}
+        workgroupBarrier();
+    }}
+",
+            half = wg / 2,
+        );
+    }
+    format!(
+        "var<workgroup> sh: array<{ty}, {wg}>;
 
+{combines}
 @compute @workgroup_size({wg})
 fn main(
     @builtin(local_invocation_index) lid: u32,
@@ -210,27 +300,11 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
     let group = wid.x + wid.y * nwg.x;
+    let groups = (p.n + {block}u - 1u) / {block}u;
     let base = group * {block}u + lid;
     let zero = {ty}();
-    let idx0 = base;
-    let idx1 = base + {wg}u;
-    let idx2 = base + {wg}u * 2u;
-    let idx3 = base + {wg}u * 3u;
-    var v0: {ty}; var v1: {ty}; var v2: {ty}; var v3: {ty};
-    {{ let idx = idx0; v0 = {load}; }}
-    {{ let idx = idx1; v1 = {load}; }}
-    {{ let idx = idx2; v2 = {load}; }}
-    {{ let idx = idx3; v3 = {load}; }}
-    sh[lid] = combine(combine(v0, v1), combine(v2, v3));
-    workgroupBarrier();
-    for (var s = {half}u; s > 0u; s = s >> 1u) {{
-        if (lid < s) {{ sh[lid] = combine(sh[lid], sh[lid + s]); }}
-        workgroupBarrier();
-    }}
-    if (lid == 0u && group * {block}u < p.n) {{ out[group] = sh[0]; }}
-}}
-",
-        half = wg / 2,
+{body}}}
+"
     )
 }
 
@@ -342,7 +416,7 @@ impl Builtin {
             Builtin::InPlaceArray(op) => in_place(ty, false, op.expr()).into(),
             Builtin::InPlaceScalar(op) => in_place(ty, true, op.expr()).into(),
             Builtin::Fill => fill_kernel(ty).into(),
-            Builtin::Reduce(op) => reduce(ty, op).into(),
+            Builtin::Reduce(ops, segmented) => reduce(ty, ops, segmented).into(),
             Builtin::Conv1d => include_str!("../operations/conv1d.wgsl").into(),
             Builtin::Conv1dTiled(stride) => conv1d_tiled(stride).into(),
             Builtin::Fft(pass) => crate::fft::source(pass).into(),

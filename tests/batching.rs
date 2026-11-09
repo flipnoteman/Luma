@@ -288,6 +288,40 @@ fn kernel_launches_interleaved_with_operators() {
     assert_close(&y.to_vec().unwrap(), &expected, 1e-3, 1e-3);
 }
 
+// Dropping the last handle of an array whose buffer a launch of the unsubmitted batch uses, then
+// uploading again into the same size class: with mappable (zero-copy) storage the recycled
+// buffer must only be mapped after that batch was submitted.
+#[test]
+fn dropped_uploads_used_by_unsubmitted_launches_are_remapped_only_after_submit() {
+    const COPY: &str = r#"
+    @group(1) @binding(0) var<storage, read> x: array<f32>;
+    @group(1) @binding(1) var<storage, read_write> y: array<f32>;
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        if (gid.x >= arrayLength(&y)) { return; }
+        y[gid.x] = x[gid.x] + 1.0;
+    }"#;
+
+    let ctx = Context::new().unwrap();
+    let kernel = ctx.kernel(COPY).build().unwrap();
+    let n = 1000usize;
+
+    let mut outputs = Vec::new();
+    let mut wanted = Vec::new();
+    for round in 0..20 {
+        let data = vec![round as f32; n];
+        let x = f32s_on(&ctx, &data);
+        let mut y = f32s_on(&ctx, &vec![0.0; n]);
+        kernel.launch([n as u32], args![&x, &mut y]).unwrap();
+        drop(x); // recycled while the launch is recorded but not submitted
+        outputs.push(y);
+        wanted.push(vec![round as f32 + 1.0; n]);
+    }
+    for (y, want) in outputs.iter().zip(&wanted) {
+        assert_eq!(&y.to_vec().unwrap(), want);
+    }
+}
+
 #[test]
 fn kernel_output_feeds_operators_in_the_same_batch() {
     const SRC: &str = r#"

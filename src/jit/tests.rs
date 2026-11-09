@@ -498,3 +498,61 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
         .collect();
     assert_close(&got, &want, 1e-6, 1e-6);
 }
+
+#[test]
+fn arrays_evaluated_together_share_one_kernel() {
+    let ctx = Context::new().unwrap();
+    let xs = values(3000, 50, 0.5, 2.0);
+    let ys = values(3000, 51, 0.5, 2.0);
+    let (x, y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+
+    let before = ctx.jit().stats();
+    let ratio = &x / &y;
+    let call = ratio.ln() * 2.0 + &x;
+    let put = ratio.ln() * 3.0 - &y;
+    // `ratio` is used by both: computed once, inside the same kernel.
+    crate::ops::eval_all(&[&call, &put]).unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want_call: Vec<f32> = xs.iter().zip(&ys).map(|(x, y)| (x / y).ln() * 2.0 + x).collect();
+    let want_put: Vec<f32> = xs.iter().zip(&ys).map(|(x, y)| (x / y).ln() * 3.0 - y).collect();
+    assert_close(&call.to_vec().unwrap(), &want_call, 1e-5, 1e-5);
+    assert_close(&put.to_vec().unwrap(), &want_put, 1e-5, 1e-5);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+    // Arrays still alive at a sync are grouped the same way; a mask output has its own type.
+    let before = ctx.jit().stats();
+    let scaled = &x * 4.0;
+    let mask = x.gt(1.0);
+    let other_len = f32s(&ctx, &[1.0, 2.0]) * 2.0;
+    ctx.sync().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    assert_close(&scaled.to_vec().unwrap(), &xs.iter().map(|v| v * 4.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+    assert_eq!(mask.to_vec().unwrap(), xs.iter().map(|&v| u32::from(v > 1.0)).collect::<Vec<_>>());
+    assert_eq!(other_len.to_vec().unwrap(), vec![2.0, 4.0]);
+}
+
+#[test]
+fn several_reductions_share_one_pass() {
+    use crate::ops::Reduction;
+    let ctx = Context::new().unwrap();
+    // More than one workgroup's block, so the later (segmented) passes run too.
+    let xs = values(300_001, 52, -3.0, 2.0);
+    let x = f32s(&ctx, &xs);
+    let lazy = &x * 2.0;
+    let before = ctx.jit().stats();
+    let [sum, lo, hi, squares] =
+        lazy.reduce([Reduction::Sum, Reduction::Min, Reduction::Max, Reduction::SumOfSquares]).unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!((d.reduce_launches, d.elementwise_launches), (1, 0));
+    let doubled: Vec<f64> = xs.iter().map(|&v| f64::from(v) * 2.0).collect();
+    let want_sum: f64 = doubled.iter().sum();
+    let want_squares: f64 = doubled.iter().map(|v| v * v).sum();
+    assert!((f64::from(sum) - want_sum).abs() < 1e-3 * want_squares.sqrt(), "{sum} vs {want_sum}");
+    assert!((f64::from(squares) - want_squares).abs() < 1e-4 * want_squares, "{squares} vs {want_squares}");
+    assert_eq!(lo, xs.iter().fold(f32::MAX, |m, &v| m.min(v * 2.0)));
+    assert_eq!(hi, xs.iter().fold(f32::MIN, |m, &v| m.max(v * 2.0)));
+
+    // On a materialized array, and an op repeated.
+    let [a, b] = x.reduce([Reduction::Max, Reduction::Max]).unwrap();
+    assert_eq!((a, b), (hi / 2.0, hi / 2.0));
+}

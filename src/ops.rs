@@ -16,7 +16,7 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{BinOp, Builtin, CmpOp, ReduceOp, UnOp, REDUCE_BLOCK};
+use crate::builtin::{BinOp, Builtin, CmpOp, ReduceList, ReduceOp, UnOp, MAX_REDUCTIONS, REDUCE_BLOCK};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{GpuType, ScalarType};
@@ -420,83 +420,138 @@ impl<T: ScalarType> Array<T> {
 
     // -- Reductions --
 
-    /// Reduces the whole array on the GPU, see [`reduce_array`].
-    fn reduce(&self, first: ReduceOp, rest: ReduceOp) -> Result<T> {
-        reduce_array(self, T::wgsl_type(), first, rest)
-    }
-
     /// The sum of all elements. Float sums use a tree reduction, whose error grows with the
     /// logarithm of the length rather than the length itself. `u32` sums wrap around.
     /// Synchronizes.
     pub fn sum(&self) -> Result<T> {
-        self.reduce(ReduceOp::Sum, ReduceOp::Sum)
+        Ok(self.reduce([Reduction::Sum])?[0])
     }
 
     /// The smallest element. Synchronizes.
     pub fn min(&self) -> Result<T> {
-        self.reduce(ReduceOp::Min, ReduceOp::Min)
+        Ok(self.reduce([Reduction::Min])?[0])
     }
 
     /// The largest element. Synchronizes.
     pub fn max(&self) -> Result<T> {
-        self.reduce(ReduceOp::Max, ReduceOp::Max)
+        Ok(self.reduce([Reduction::Max])?[0])
+    }
+
+    /// Several reductions of the array in one pass over it (up to four), for example
+    /// `let [lo, hi] = x.reduce([Reduction::Min, Reduction::Max])?;`. Reading the data once
+    /// instead of once per reduction is what makes it faster than separate calls on large arrays.
+    /// Synchronizes.
+    pub fn reduce<const N: usize>(&self, ops: [Reduction; N]) -> Result<[T; N]> {
+        reduce_n(self, T::wgsl_type(), ops)
     }
 }
 
-/// Reduces the whole array on the GPU with a workgroup tree reduction: every pass combines
-/// pairs, `first` for the first pass over the data and `rest` for the passes over partial
-/// results, until one element is left, which is read back. If the array is a pending lazy
-/// expression, the first pass computes it on the fly instead of reading a materialized buffer.
-/// `wgsl` is the WGSL type of the elements; for vectors (which are never lazy) the operations
-/// act on every component separately. Synchronizes.
-fn reduce_array<T: GpuType>(
-    array: &Array<T>,
-    wgsl: &'static str,
-    first: ReduceOp,
-    rest: ReduceOp,
-) -> Result<T> {
+/// Evaluates several arrays and waits for them, like [`Array::eval`] on each, but computes lazy
+/// arrays of the same length together: one fused kernel with an output per array (as many as
+/// the device's bindings allow), so inputs they share are read once, and an array that another
+/// one uses is computed once. `let (call, put) = ...; eval_all(&[&call, &put])?` prices both
+/// options in one pass over the market data.
+pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
+    let Some(first) = arrays.first() else { return Ok(()) };
+    let ctx = first.context();
+    if arrays.iter().any(|array| !ctx.same_as(array.context())) {
+        return Err(LumaError::ContextMismatch);
+    }
+    let mut pending: Vec<_> = arrays.iter().filter_map(|array| array.pending().cloned()).collect();
+    while let Some(node) = pending.first() {
+        let len = node.len();
+        let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len() == len);
+        jit::evaluate_group(&same);
+        pending = rest;
+    }
+    for array in arrays {
+        array.ready().map_err(Failure::into_error)?;
+    }
+    ctx.sync()
+}
+
+/// A reduction for [`Array::reduce`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Reduction {
+    Sum,
+    Min,
+    Max,
+    /// The sum of the squared elements.
+    SumOfSquares,
+}
+
+impl Reduction {
+    fn op(self) -> ReduceOp {
+        match self {
+            Reduction::Sum => ReduceOp::Sum,
+            Reduction::Min => ReduceOp::Min,
+            Reduction::Max => ReduceOp::Max,
+            Reduction::SumOfSquares => ReduceOp::SumSquares,
+        }
+    }
+}
+
+fn reduce_n<T: GpuType, const N: usize>(array: &Array<T>, wgsl: &'static str, ops: [Reduction; N]) -> Result<[T; N]> {
+    const { assert!(N >= 1 && N <= MAX_REDUCTIONS, "Array::reduce takes one to four reductions") };
+    let values = reduce_array(array, wgsl, ReduceList::new(&ops.map(Reduction::op)))?;
+    let mut out = [T::zeroed(); N];
+    for (slot, value) in out.iter_mut().zip(values) {
+        *slot = value;
+    }
+    Ok(out)
+}
+
+/// Reduces the whole array on the GPU with a workgroup tree reduction, once per op of `ops`:
+/// every pass combines pairs, until one element per op is left, which are read back together.
+/// The first pass reads the data once for all ops; if the array is a pending lazy expression, it
+/// computes it on the fly instead of reading a materialized buffer. `wgsl` is the WGSL type of
+/// the elements; for vectors (which are never lazy) the operations act on every component
+/// separately. Synchronizes.
+fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList) -> Result<Vec<T>> {
     let ctx = array.context();
     let elem = std::mem::size_of::<T>() as u64;
+    let count = ops.as_slice().len() as u64;
     let mut scratch = Scratch::new(ctx);
 
     let fused = match array.pending() {
-        Some(node) => {
-            jit::reduce_first_pass(node, first, &mut scratch).map_err(Failure::into_error)?
-        }
+        Some(node) => jit::reduce_first_pass(node, ops, &mut scratch).map_err(Failure::into_error)?,
         None => None,
     };
-    let (mut current, mut n, mut op, mut remaining) = match fused {
-        Some((partial, groups)) => (partial, groups, rest, groups > 1),
+    // `current` holds `n` elements per op, the ops' segments one after the other once
+    // `segmented`.
+    let (mut current, mut n, mut segmented) = match fused {
+        Some((partial, groups)) => (partial, groups, true),
         None => {
             let (input, _) = array.ready().map_err(Failure::into_error)?;
-            (input.clone(), len_u32(array.len())?, first, true)
+            (input.clone(), len_u32(array.len())?, false)
         }
     };
-    while remaining {
+    while !segmented || n > 1 {
         let groups = n.div_ceil(REDUCE_BLOCK);
-        let out = scratch.take(u64::from(groups) * elem)?;
-        let core = ctx.builtin(Builtin::Reduce(op), wgsl)?;
+        let list = if segmented { ops.rest() } else { ops };
+        let in_bytes = u64::from(n) * elem * if segmented { count } else { 1 };
+        let out = scratch.take(u64::from(groups) * elem * count)?;
+        let core = ctx.builtin(Builtin::Reduce(list, segmented), wgsl)?;
         ctx.launch(
             &core,
             fold_workgroups(ctx, groups)?,
             [n, 1, 1],
             &[
-                RawArg::write(&out, u64::from(groups) * elem),
-                RawArg::read(&current, u64::from(n) * elem),
+                RawArg::write(&out, u64::from(groups) * elem * count),
+                RawArg::read(&current, in_bytes),
                 RawArg::Uniform(bytemuck::bytes_of(&[n])),
             ],
         )?;
         current = out;
         n = groups;
-        op = rest;
-        remaining = groups > 1;
+        segmented = true;
     }
 
-    let values = ctx.read::<T>(&current, elem)?;
-    values
-        .first()
-        .copied()
-        .ok_or_else(|| LumaError::Gpu("reduction result is missing".into()))
+    let values = ctx.read::<T>(&current, elem * count)?;
+    if values.len() as u64 != count {
+        return Err(LumaError::Gpu("reduction results are missing".into()));
+    }
+    Ok(values)
 }
 
 /// Per-component reductions of `f32` vector arrays: the same tree reduction as the scalar
@@ -508,23 +563,29 @@ macro_rules! vector_reductions {
             /// error grows with the logarithm of the length rather than the length itself.
             /// Synchronizes.
             pub fn sum(&self) -> Result<[f32; $n]> {
-                reduce_array(self, $wgsl, ReduceOp::Sum, ReduceOp::Sum)
+                Ok(self.reduce([Reduction::Sum])?[0])
             }
 
             /// The smallest value of every component. Synchronizes.
             pub fn min(&self) -> Result<[f32; $n]> {
-                reduce_array(self, $wgsl, ReduceOp::Min, ReduceOp::Min)
+                Ok(self.reduce([Reduction::Min])?[0])
             }
 
             /// The largest value of every component. Synchronizes.
             pub fn max(&self) -> Result<[f32; $n]> {
-                reduce_array(self, $wgsl, ReduceOp::Max, ReduceOp::Max)
+                Ok(self.reduce([Reduction::Max])?[0])
             }
 
             /// The Euclidean (L2) norm of every component taken over the whole array: the square
             /// root of the sum of squares, per component. Synchronizes.
             pub fn norm(&self) -> Result<[f32; $n]> {
-                Ok(reduce_array(self, $wgsl, ReduceOp::SumSquares, ReduceOp::Sum)?.map(f32::sqrt))
+                Ok(self.reduce([Reduction::SumOfSquares])?[0].map(f32::sqrt))
+            }
+
+            /// Several per-component reductions in one pass over the array (up to four), like
+            /// [`Array::reduce`]. Synchronizes.
+            pub fn reduce<const N: usize>(&self, ops: [Reduction; N]) -> Result<[[f32; $n]; N]> {
+                reduce_n(self, $wgsl, ops)
             }
         }
     };
@@ -650,7 +711,55 @@ impl Array<f32> {
 
     /// The Euclidean (L2) norm: the square root of the sum of squares. Synchronizes.
     pub fn norm(&self) -> Result<f32> {
-        Ok(self.reduce(ReduceOp::SumSquares, ReduceOp::Sum)?.sqrt())
+        Ok(self.reduce([Reduction::SumOfSquares])?[0].sqrt())
+    }
+
+    /// `steps` applications of `step`: `u = step(u)`, starting from this array, like a loop but
+    /// run time-blocked where possible. When `step` is a stencil — one elementwise expression of
+    /// its argument, shifts of it by a few elements (circular, as [`Array::shift`]), scalars and
+    /// other arrays of the same shape that do not change — each launch loads a tile into
+    /// workgroup memory and runs several steps on it, so the data passes through memory once per
+    /// several steps instead of once per step. Any other `step` simply runs in a loop.
+    ///
+    /// `step` is called with a placeholder first to inspect the expression it builds; it must
+    /// compute its result from its argument and not keep it.
+    ///
+    /// ```no_run
+    /// # let u0 = luma::Array::<f32>::zeros([512, 512])?;
+    /// let alpha = 0.2;
+    /// let u = u0.iterate(100, |u| {
+    ///     let lap = u.shift([1, 0]) + u.shift([-1, 0]) + u.shift([0, 1]) + u.shift([0, -1]) - u * 4.0;
+    ///     u + lap * alpha
+    /// });
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    #[track_caller]
+    pub fn iterate(&self, steps: usize, step: impl Fn(&Array<f32>) -> Array<f32>) -> Array<f32> {
+        let location = Location::caller();
+        let result = self.run_iterate(steps, step);
+        Array::resolve(self.context(), self.shape(), result, "iterate", location)
+    }
+
+    fn run_iterate(&self, steps: usize, step: impl Fn(&Array<f32>) -> Array<f32>) -> Outcome<Array<f32>> {
+        if let Some(error) = self.error() {
+            return Err(Failure::Inherited(Arc::new(error.clone())));
+        }
+        if steps == 0 {
+            return Ok(self * 1.0);
+        }
+        let probe = Array::<f32>::alloc(self.context(), self.shape())?;
+        let stencil = jit::stencil_plan(&probe, &step(&probe));
+        match stencil {
+            Some(stencil) => stencil.run(self, steps),
+            None => {
+                let mut u = step(self);
+                for _ in 1..steps {
+                    u = step(&u);
+                }
+                u.check()?;
+                Ok(u)
+            }
+        }
     }
 }
 

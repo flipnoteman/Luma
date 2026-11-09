@@ -34,6 +34,9 @@ const UPLOAD_USAGE: BufferUsages = BufferUsages::MAP_WRITE.union(BufferUsages::C
 /// Most bytes of idle (mapped) upload staging buffers kept for reuse.
 const MAX_FREE_UPLOAD_BYTES: u64 = 1 << 30;
 
+/// Usage of storage buffers the host writes directly (zero-copy uploads).
+const MAPPABLE_STORAGE_USAGE: BufferUsages = STORAGE_USAGE.union(BufferUsages::MAP_WRITE);
+
 /// Mapped upload staging buffers ready to be written.
 #[derive(Debug, Default)]
 struct FreeUploads {
@@ -48,11 +51,20 @@ impl FreeUploads {
         Some(self.buffers.swap_remove(at))
     }
 
-    fn put(&mut self, buffer: Buffer) {
+    /// Keeps `buffer` unless that would exceed the cap; returns it otherwise.
+    fn put(&mut self, buffer: Buffer) -> Option<Buffer> {
         if self.bytes + buffer.size() <= MAX_FREE_UPLOAD_BYTES {
             self.bytes += buffer.size();
             self.buffers.push(buffer);
+            None
+        } else {
+            Some(buffer)
         }
+    }
+
+    fn drain(&mut self) -> Vec<Buffer> {
+        self.bytes = 0;
+        std::mem::take(&mut self.buffers)
     }
 }
 
@@ -271,9 +283,15 @@ struct Inner {
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the cached bind groups still holding them are dropped at the
     /// next submission, which frees them.
-    released: Mutex<Vec<Buffer>>,
+    released: Arc<Mutex<Vec<Buffer>>>,
     /// Mapped upload staging buffers, refilled by the map callbacks of submitted ones.
     uploads: Arc<Mutex<FreeUploads>>,
+    /// Mapped storage buffers (zero-copy uploads), refilled by the map callbacks of recycled ones.
+    mappable: Arc<Mutex<FreeUploads>>,
+    /// Recycled mappable storage buffers waiting for the next submission before they are mapped.
+    unmapped: Mutex<Vec<Buffer>>,
+    /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
+    zero_copy: bool,
     batch: Mutex<Batch>,
     /// The first error the GPU reported outside of a call that could return it.
     gpu_error: Arc<Mutex<Option<String>>>,
@@ -399,14 +417,17 @@ impl Context {
                 max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
                 max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
                 timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+                zero_copy: device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
                 device,
                 queue,
                 builtins: Mutex::new(FxMap::default()),
                 jit: JitState::new(&limits),
                 kernels: Mutex::new(FxMap::default()),
                 pool: Mutex::new(BufferPool::default()),
-                released: Mutex::new(Vec::new()),
+                released: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(FreeUploads::default())),
+                mappable: Arc::new(Mutex::new(FreeUploads::default())),
+                unmapped: Mutex::new(Vec::new()),
                 batch: Mutex::new(batch),
                 gpu_error,
                 grid_layout,
@@ -506,6 +527,8 @@ impl Context {
         if !released.is_empty() {
             batch.bind_groups.forget(&released);
         }
+        // Everything recorded that uses these buffers is in the batch submitted below.
+        let unmapped = std::mem::take(&mut *lock(&self.inner.unmapped));
         if let Some(encoder) = batch.encoder.take() {
             self.queue().submit(Some(encoder.finish()));
         }
@@ -515,6 +538,18 @@ impl Context {
             staging.slice(..).map_async(wgpu::MapMode::Write, move |result| {
                 if result.is_ok() {
                     lock(&free).put(buffer);
+                }
+            });
+        }
+        for storage in unmapped {
+            let free = Arc::clone(&self.inner.mappable);
+            let released = Arc::clone(&self.inner.released);
+            let buffer = storage.clone();
+            storage.slice(..).map_async(wgpu::MapMode::Write, move |result| {
+                if result.is_ok() {
+                    if let Some(dropped) = lock(&free).put(buffer) {
+                        lock(&released).push(dropped);
+                    }
                 }
             });
         }
@@ -582,7 +617,8 @@ impl Context {
         }
         // Out of memory: give back every idle buffer and the bind groups pinning them, then
         // try once more.
-        let idle = lock(&self.inner.pool).drain();
+        let mut idle = lock(&self.inner.pool).drain();
+        idle.extend(lock(&self.inner.mappable).drain());
         lock(&self.inner.released).extend(idle);
         self.flush_locked(&mut *self.batch()?);
         self.device()
@@ -611,6 +647,13 @@ impl Context {
     /// to pooled buffers outside the stream (`Queue::write_buffer` is only used for uniform
     /// slots, which are never pooled).
     pub(crate) fn recycle(&self, buffer: Buffer) {
+        if buffer.usage().contains(BufferUsages::MAP_WRITE) {
+            // May still be used by the unsubmitted batch, which mapping would invalidate; it is
+            // mapped after the next submission. This must not take the batch lock: it can be
+            // held by the caller.
+            lock(&self.inner.unmapped).push(buffer);
+            return;
+        }
         let released = lock(&self.inner.pool).put(buffer);
         if !released.is_empty() {
             lock(&self.inner.released).extend(released);
@@ -649,6 +692,46 @@ impl Context {
         encoder.copy_buffer_to_buffer(&staging, 0, dst, 0, bytes);
         guard.uploads.push(staging);
         Ok(())
+    }
+
+    /// Whether `from_slice` writes straight into mappable storage buffers (unified memory)
+    /// instead of copying out of a staging buffer.
+    pub(crate) fn zero_copy(&self) -> bool {
+        self.inner.zero_copy
+    }
+
+    /// A storage buffer holding `data` at its start, written by the host without a GPU copy.
+    /// Only with [`Context::zero_copy`]; give it back with [`Context::recycle`]. `data.len()`
+    /// must be a multiple of 4.
+    pub(crate) fn alloc_filled(&self, data: &[u8]) -> Result<Buffer> {
+        let bytes = data.len() as u64;
+        let max = self.inner.max_buffer_bytes;
+        let class = pool::size_class(bytes, max)
+            .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        let reused = lock(&self.inner.mappable).take(class);
+        if reused.is_none() {
+            // Recycled buffers are mapped again only after a submission: a loop of uploads that
+            // never syncs would otherwise keep allocating.
+            let waiting: u64 = lock(&self.inner.unmapped).iter().map(Buffer::size).sum();
+            if waiting > MAX_FREE_UPLOAD_BYTES {
+                self.flush_locked(&mut *self.batch()?);
+            }
+        }
+        let buffer = match reused {
+            Some(buffer) => buffer,
+            None => self.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("luma mappable buffer"),
+                size: class,
+                usage: MAPPABLE_STORAGE_USAGE,
+                mapped_at_creation: true,
+            }),
+        };
+        {
+            let mut view = buffer.get_mapped_range_mut(..bytes).map_err(LumaError::MapRange)?;
+            write_parallel(data, view.slice(..));
+        }
+        buffer.unmap();
+        Ok(buffer)
     }
 
     /// Records zeroing the first `bytes` bytes of `buffer`.
@@ -1141,9 +1224,12 @@ mod tests {
         assert!(ctx.pending_dispatches() > 0, "the multiplication must still be pending");
         drop(a);
 
-        // The new array takes over a's buffer, although the multiplication has not run yet.
+        // The new array takes over a's buffer, although the multiplication has not run yet. (A
+        // zero-copy buffer is only reusable after the next submission.)
         let b = Array::from_slice_on(&ctx, &[10.0f32, 20.0, 30.0], 3).unwrap();
-        assert_eq!(b.buffer().unwrap(), &storage);
+        if !ctx.zero_copy() {
+            assert_eq!(b.buffer().unwrap(), &storage);
+        }
         assert!(ctx.pending_dispatches() > 0);
 
         assert_eq!(doubled.to_vec().unwrap(), vec![2.0, 4.0, 6.0]);

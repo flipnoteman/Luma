@@ -1,16 +1,17 @@
 //! WGSL generation for fused programs.
 //!
-//! The source depends on the [`FusedKey`] only. Bindings, in order of the arguments: the output
-//! (`out`), the input buffers (`in0`, `in1`, ...), then, if the program has scalars (or is a
-//! reduction), one uniform `p` holding them (`p.s0`, `p.s1`, ... after `p.n` for reductions).
+//! The source depends on the [`FusedKey`] only. Bindings, in order of the arguments: the outputs
+//! (`out0`, `out1`, ...; a reduction has one, holding the partial results of every op), the
+//! input buffers (`in0`, `in1`, ...), then, if the program has scalars (or is a reduction), one
+//! uniform `p` holding them (`p.s0`, `p.s1`, ... after `p.n` for reductions).
 //!
-//! The program becomes a function `luma_eval(i)` that loads the inputs at element `i`, runs the
-//! instructions as `let` bindings and returns the last value. The kernel either stores it or
-//! feeds it into the tree reduction of the first pass.
+//! The program loads the inputs at element `i` and runs the instructions as `let` bindings. A
+//! store kernel writes its output instructions; a reduction wraps the program in `luma_eval(i)`
+//! and feeds the last value into the tree reductions of the first pass.
 
 use std::fmt::Write;
 
-use crate::builtin::{ReduceOp, ELEMENTWISE_WORKGROUP, REDUCE_BLOCK, REDUCE_WORKGROUP};
+use crate::builtin::{reduce_main, ELEMENTWISE_WORKGROUP};
 
 use super::program::{FusedKey, Instr, Ref, Tail};
 use super::{ElemTy, OpKind, ShiftKind};
@@ -48,7 +49,7 @@ fn name(reference: Ref) -> String {
     }
 }
 
-fn expression(instr: &Instr) -> String {
+pub(super) fn expression(instr: &Instr) -> String {
     let [a, b, c] = instr.args.map(name);
     match instr.op.kind {
         OpKind::Unary(op) => substitute(op.expr(), &a, ""),
@@ -102,7 +103,6 @@ fn shift_index(kind: ShiftKind, s: &str) -> String {
 
 /// The WGSL source of the kernel for `key`.
 pub(crate) fn source(key: &FusedKey) -> String {
-    let result_ty = key.instrs.last().map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     let reduce = matches!(key.tail, Tail::Reduce(_));
     let mut src = String::new();
 
@@ -116,20 +116,68 @@ pub(crate) fn source(key: &FusedKey) -> String {
         }
         src.push_str("}\n");
     }
-    let _ = writeln!(src, "@group(1) @binding(0) var<storage, read_write> out: array<{result_ty}>;");
+    let out_ty = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
+    let outputs: Vec<usize> = match key.tail {
+        Tail::Store => key.outputs.iter().map(|&at| at as usize).collect(),
+        Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
+    };
+    for (j, &at) in outputs.iter().enumerate() {
+        // A reduction's single output is `out`, as `reduce_main` expects.
+        let name = if reduce { "out".to_owned() } else { format!("out{j}") };
+        let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{}>;", out_ty(at));
+    }
     for (k, ty) in key.input_tys.iter().enumerate() {
         let _ = writeln!(
             src,
             "@group(1) @binding({}) var<storage, read> in{k}: array<{}>;",
-            k + 1,
+            k + outputs.len(),
             ty.wgsl()
         );
     }
     if reduce || !key.scalar_tys.is_empty() {
-        let _ = writeln!(src, "@group(1) @binding({}) var<uniform> p: Params;", key.input_tys.len() + 1);
+        let _ = writeln!(
+            src,
+            "@group(1) @binding({}) var<uniform> p: Params;",
+            key.input_tys.len() + outputs.len()
+        );
     }
 
-    let _ = writeln!(src, "\nfn luma_eval(i: u32) -> {result_ty} {{");
+    match key.tail {
+        Tail::Store => {
+            let wg = ELEMENTWISE_WORKGROUP;
+            let stores: String = outputs.iter().enumerate().map(|(j, at)| format!("    out{j}[i] = t{at};\n")).collect();
+            let _ = write!(
+                src,
+                "
+@compute @workgroup_size({wg})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let i = gid.x + gid.y * nwg.x * {wg}u;
+    if (i >= luma.size.x) {{ return; }}
+{}{stores}}}
+",
+                body(key)
+            );
+        }
+        Tail::Reduce(ops) => {
+            let (ty, last) = (out_ty(outputs[0]), outputs[0]);
+            let _ = write!(
+                src,
+                "
+fn luma_eval(i: u32) -> {ty} {{
+{}    return t{last};
+}}
+{}",
+                body(key),
+                reduce_main(ty, ops, false, "luma_eval")
+            );
+        }
+    }
+    src
+}
+
+/// The loads of the inputs at element `i` and the instructions, as `let` bindings.
+fn body(key: &FusedKey) -> String {
+    let mut src = String::new();
     // Inputs read only through shifts are not loaded at `i`.
     let direct = |k: u32| {
         key.instrs.iter().any(|instr| {
@@ -145,67 +193,5 @@ pub(crate) fn source(key: &FusedKey) -> String {
     for (k, instr) in key.instrs.iter().enumerate() {
         let _ = writeln!(src, "    let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr));
     }
-    let last = key.instrs.len().saturating_sub(1);
-    let _ = writeln!(src, "    return t{last};\n}}\n");
-
-    match key.tail {
-        Tail::Store => {
-            let wg = ELEMENTWISE_WORKGROUP;
-            let _ = write!(
-                src,
-                "@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {wg}u;
-    if (i >= luma.size.x) {{ return; }}
-    out[i] = luma_eval(i);
-}}
-"
-            );
-        }
-        Tail::Reduce(op) => reduce_main(&mut src, result_ty, op),
-    }
     src
-}
-
-/// The first pass of a reduction, like `builtin::reduce` but loading through `luma_eval`.
-fn reduce_main(src: &mut String, ty: &str, op: ReduceOp) {
-    // Out-of-range loads: sums read zero, min/max re-read the last element (harmless for them).
-    let (load, combine) = match op {
-        ReduceOp::Sum => ("if (idx < p.n) { v = luma_eval(idx); }", "u + v"),
-        ReduceOp::SumSquares => ("if (idx < p.n) { let e = luma_eval(idx); v = e * e; }", "u + v"),
-        ReduceOp::Min => ("v = luma_eval(min(idx, p.n - 1u));", "min(u, v)"),
-        ReduceOp::Max => ("v = luma_eval(min(idx, p.n - 1u));", "max(u, v)"),
-    };
-    let wg = REDUCE_WORKGROUP;
-    let block = REDUCE_BLOCK;
-    let half = wg / 2;
-    let _ = write!(
-        src,
-        "var<workgroup> sh: array<{ty}, {wg}>;
-
-fn combine(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}
-
-@compute @workgroup_size({wg})
-fn main(
-    @builtin(local_invocation_index) lid: u32,
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-) {{
-    let group = wid.x + wid.y * nwg.x;
-    let base = group * {block}u + lid;
-    var v0 = {ty}(0); var v1 = {ty}(0); var v2 = {ty}(0); var v3 = {ty}(0);
-    {{ let idx = base; var v = {ty}(0); {load} v0 = v; }}
-    {{ let idx = base + {wg}u; var v = {ty}(0); {load} v1 = v; }}
-    {{ let idx = base + {wg}u * 2u; var v = {ty}(0); {load} v2 = v; }}
-    {{ let idx = base + {wg}u * 3u; var v = {ty}(0); {load} v3 = v; }}
-    sh[lid] = combine(combine(v0, v1), combine(v2, v3));
-    workgroupBarrier();
-    for (var s = {half}u; s > 0u; s = s >> 1u) {{
-        if (lid < s) {{ sh[lid] = combine(sh[lid], sh[lid + s]); }}
-        workgroupBarrier();
-    }}
-    if (lid == 0u && group * {block}u < p.n) {{ out[group] = sh[0]; }}
-}}
-"
-    );
 }

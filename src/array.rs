@@ -196,6 +196,15 @@ impl<T: GpuType> Array<T> {
         if data.len() != len {
             return Err(LumaError::LengthMismatch { expected: len, actual: data.len() });
         }
+        if ctx.zero_copy() {
+            let buffer = ctx.alloc_filled(bytemuck::cast_slice(data))?;
+            return Ok(Array {
+                ctx: ctx.clone(),
+                shape,
+                repr: Repr::Valid(Arc::new(Storage::new(ctx, buffer))),
+                _marker: PhantomData,
+            });
+        }
         let array = Self::alloc(ctx, shape)?;
         let (buffer, _) = array.ready().map_err(Failure::into_error)?;
         ctx.upload(buffer, bytemuck::cast_slice(data))?;

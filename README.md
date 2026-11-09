@@ -63,6 +63,16 @@ let smooth = (u.shift(1) + &u + u.shift(-1)) / 3.0;
 // Whole-array reductions return host values (and synchronize).
 let (s, lo, hi) = (u.sum()?, u.min()?, u.max()?);
 let (mean, norm) = (u.mean()?, u.norm()?);
+// Several at once read the data once.
+let [s, lo, hi] = u.reduce([Reduction::Sum, Reduction::Min, Reduction::Max])?;
+
+// Several results of the same inputs, computed in one kernel (inputs read once).
+let ratio = (&spot / &strike).ln();
+let (up, down) = (&ratio * 2.0, &ratio * -2.0);
+eval_all(&[&up, &down])?;
+
+// Time stepping: a stencil step runs several steps per pass over memory.
+let heat = u0.iterate(100, |u| u + (u.shift([1, 0]) + u.shift([-1, 0]) + u.shift([0, 1]) + u.shift([0, -1]) - u * 4.0) * 0.2);
 
 // 1D convolutions
 let filtered = signal.conv1d(&kernel, 1, 0);

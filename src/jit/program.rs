@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::array::{Failure, Storage};
-use crate::builtin::{ReduceOp, REDUCE_BLOCK};
+use crate::builtin::{ReduceList, REDUCE_BLOCK};
 use crate::context::{RawArg, Scratch, STORAGE_USAGE};
 use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d};
@@ -35,13 +35,13 @@ pub(crate) struct Instr {
     pub(crate) args: [Ref; 3],
 }
 
-/// What happens to the value of the last instruction.
+/// What happens to the values the program computes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Tail {
-    /// It is stored: an elementwise kernel.
+    /// The outputs are stored: an elementwise kernel.
     Store,
-    /// It is reduced: the first pass of a reduction.
-    Reduce(ReduceOp),
+    /// The last instruction is reduced, once per op: the first pass of the reductions.
+    Reduce(ReduceList),
 }
 
 /// Everything the source of a fused kernel depends on, and nothing it does not (buffers and
@@ -51,6 +51,8 @@ pub(crate) struct FusedKey {
     pub(crate) instrs: Vec<Instr>,
     pub(crate) input_tys: Vec<ElemTy>,
     pub(crate) scalar_tys: Vec<ElemTy>,
+    /// The instructions whose values a store kernel writes, one output buffer each.
+    pub(crate) outputs: Vec<u32>,
     pub(crate) tail: Tail,
 }
 
@@ -78,18 +80,22 @@ impl FusedKey {
         let ty = self.instrs.last().map_or("f32", |instr| instr.op.out_ty().wgsl());
         let names = names.join(", ");
         match self.tail {
+            Tail::Store if self.outputs.len() > 1 => format!("Fused[{}]({names}) {ty}", self.outputs.len()),
             Tail::Store => format!("Fused({names}) {ty}"),
-            Tail::Reduce(op) => format!("FusedReduce({op:?}: {names}) {ty}"),
+            Tail::Reduce(ops) => {
+                let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
+                format!("FusedReduce({}: {names}) {ty}", ops.join("+"))
+            }
         }
     }
 }
 
 /// A flattened expression ready to run.
-struct Fused {
-    key: FusedKey,
-    inputs: Vec<Arc<Storage>>,
+pub(super) struct Fused {
+    pub(super) key: FusedKey,
+    pub(super) inputs: Vec<Arc<Storage>>,
     /// Bit patterns of the scalars, in the order of `key.scalar_tys`.
-    scalars: Vec<u32>,
+    pub(super) scalars: Vec<u32>,
 }
 
 /// A pending node below the root of an evaluation, with its operands.
@@ -190,12 +196,13 @@ impl Flattener {
         Ref::Input(u32::try_from(at).unwrap_or(u32::MAX))
     }
 
-    fn finish(self, tail: Tail) -> Fused {
+    fn finish(self, tail: Tail, outputs: Vec<u32>) -> Fused {
         Fused {
             key: FusedKey {
                 instrs: self.instrs,
                 input_tys: self.input_tys,
                 scalar_tys: self.scalar_tys,
+                outputs,
                 tail,
             },
             inputs: self.inputs,
@@ -204,23 +211,32 @@ impl Flattener {
     }
 }
 
-/// Flattens the expression of `root` (with operands `args`) into a program.
+/// Flattens the expressions of `roots` (each with its operands) into one program computing all
+/// of them; a root that another root uses is computed once. Returns the program with the
+/// instruction of every root, in order.
 ///
-/// A pending node that other pending operations (outside this expression) also use is evaluated
-/// first instead of being recomputed by each of them; shared nodes *within* the expression
-/// are one instruction.
-fn flatten(root: &Arc<Node>, args: &[Src; 3], tail: Tail) -> Result<Fused, Failure> {
-    let arity = root.op().kind.arity();
+/// A pending node that other pending operations (outside these expressions) also use is
+/// evaluated first instead of being recomputed by each of them; shared nodes *within* them are
+/// one instruction.
+pub(super) fn flatten(roots: &[(Arc<Node>, Args)], tail: Tail) -> Result<Fused, Failure> {
     let members = loop {
         let mut members = Vec::new();
         let mut seen = Vec::new();
-        for arg in args.iter().take(arity) {
-            collect(arg, &mut members, &mut seen)?;
+        for (root, args) in roots {
+            for arg in args.iter().take(root.op().kind.arity()) {
+                collect(arg, &mut members, &mut seen)?;
+            }
         }
-        seen.push(Arc::as_ptr(root));
+        for (root, args) in roots {
+            if !seen.contains(&Arc::as_ptr(root)) {
+                seen.push(Arc::as_ptr(root));
+                members.push(Member { node: Arc::clone(root), args: args.clone() });
+            }
+        }
+        let is_root = |node: &Arc<Node>| roots.iter().any(|(root, _)| Arc::ptr_eq(root, node));
         let shared: Vec<Arc<Node>> = members
             .iter()
-            .filter(|member| member.node.has_consumer_outside(&seen))
+            .filter(|member| !is_root(&member.node) && member.node.has_consumer_outside(&seen))
             .map(|member| Arc::clone(&member.node))
             .collect();
         if shared.is_empty() {
@@ -238,14 +254,21 @@ fn flatten(root: &Arc<Node>, args: &[Src; 3], tail: Tail) -> Result<Fused, Failu
         let at = flattener.emit(member.node.op(), &member.args)?;
         flattener.emitted.push((Arc::as_ptr(&member.node), at));
     }
-    flattener.emit(root.op(), args)?;
+    let mut outputs = Vec::with_capacity(roots.len());
+    for (root, _) in roots {
+        let found = flattener.emitted.iter().find(|(node, _)| *node == Arc::as_ptr(root));
+        match found {
+            Some(&(_, Ref::Tmp(at))) => outputs.push(at),
+            _ => return Err(Failure::New(LumaError::Gpu("fused root without an instruction".into()))),
+        }
+    }
     for member in &members {
-        member.node.fused.store(true, Ordering::Relaxed);
+        let root = roots.iter().any(|(root, _)| Arc::ptr_eq(root, &member.node));
+        if !root || matches!(tail, Tail::Reduce(_)) {
+            member.node.fused.store(true, Ordering::Relaxed);
+        }
     }
-    if matches!(tail, Tail::Reduce(_)) {
-        root.fused.store(true, Ordering::Relaxed);
-    }
-    Ok(flattener.finish(tail))
+    Ok(flattener.finish(tail, outputs))
 }
 
 fn len_u32(len: usize) -> Result<u32, LumaError> {
@@ -254,34 +277,77 @@ fn len_u32(len: usize) -> Result<u32, LumaError> {
 
 /// Evaluates `node`: one fused kernel computing its whole expression into a new buffer.
 pub(crate) fn evaluate(node: &Arc<Node>, args: Args) -> Result<Storage, Failure> {
-    let ctx = node.context();
-    let fused = flatten(node, &args, Tail::Store)?;
-    drop(args);
+    let roots = [(Arc::clone(node), args)];
+    let fused = flatten(&roots, Tail::Store)?;
+    drop(roots);
+    let mut outputs = run_store(node.context(), node.len(), fused)?;
+    outputs.pop().ok_or_else(|| Failure::New(LumaError::Gpu("fused kernel without output".into())))
+}
 
-    let n = len_u32(node.len())?;
+/// Evaluates the pending ones of `nodes` (all of the same length) in one fused kernel with one
+/// output per node. Failures are stored in the nodes, as [`Node::force`] does.
+pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
+    let roots: Vec<(Arc<Node>, Args)> = nodes
+        .iter()
+        .filter(|node| node.is_pending())
+        .filter_map(|node| node.operands().map(|args| (Arc::clone(node), args)))
+        .collect();
+    let grouped = roots.len() > 1
+        && roots.iter().all(|(node, _)| node.len() == roots[0].0.len())
+        && match flatten(&roots, Tail::Store) {
+            Ok(fused) if fused.inputs.len() + roots.len() <= roots[0].0.context().jit().max_inputs + 1 => {
+                let (first, _) = &roots[0];
+                match run_store(first.context(), first.len(), fused) {
+                    Ok(outputs) => {
+                        for ((node, _), storage) in roots.iter().zip(outputs) {
+                            node.finish(storage);
+                        }
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        };
+    if !grouped {
+        // One kernel each; this also reports every failure at its own node.
+        for (node, _) in &roots {
+            let _ = node.force();
+        }
+    }
+}
+
+/// Runs the store kernel of `fused` over `len` elements, one new buffer per output.
+fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
+    let n = len_u32(len)?;
     let bytes = u64::from(n) * ELEMENT_BYTES;
     let Fused { key, inputs, scalars } = fused;
+    let count = key.outputs.len();
     let core = ctx.jit().kernel(ctx, key)?;
 
-    let out = Storage::new(ctx, ctx.alloc_buffer(bytes, STORAGE_USAGE)?);
-    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(inputs.len() + 2);
-    raw.push(RawArg::write(out.buffer(), bytes));
+    let mut outputs = Vec::with_capacity(count);
+    for _ in 0..count {
+        outputs.push(Storage::new(ctx, ctx.alloc_buffer(bytes, STORAGE_USAGE)?));
+    }
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(count + inputs.len() + 1);
+    raw.extend(outputs.iter().map(|out| RawArg::write(out.buffer(), bytes)));
     raw.extend(inputs.iter().map(|input| RawArg::read(input.buffer(), bytes)));
     if !scalars.is_empty() {
         raw.push(RawArg::Uniform(bytemuck::cast_slice(&scalars)));
     }
     launch_1d(ctx, &core, n, &raw)?;
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
-    Ok(out)
+    Ok(outputs)
 }
 
-/// Runs the first pass of a reduction directly over the expression behind `node`, without
-/// materializing it: every workgroup evaluates `REDUCE_BLOCK` elements and reduces them. Returns
-/// the buffer of partial results and how many there are, or `None` if the node has already been
-/// evaluated (reduce its buffer instead).
+/// Runs the first pass of the reductions `ops` directly over the expression behind `node`,
+/// without materializing it: every workgroup evaluates `REDUCE_BLOCK` elements and reduces them,
+/// once per op. Returns the buffer of partial results (op `j` at `j * groups ..`) and how many
+/// there are per op, or `None` if the node has already been evaluated (reduce its buffer
+/// instead).
 pub(crate) fn reduce_first_pass(
     node: &Arc<Node>,
-    op: ReduceOp,
+    ops: ReduceList,
     scratch: &mut Scratch<'_>,
 ) -> Result<Option<(wgpu::Buffer, u32)>, Failure> {
     if !node.is_pending() {
@@ -289,21 +355,23 @@ pub(crate) fn reduce_first_pass(
     }
     let Some(args) = node.operands() else { return Ok(None) };
     let ctx = node.context();
-    let fused = flatten(node, &args, Tail::Reduce(op))?;
-    drop(args);
+    let roots = [(Arc::clone(node), args)];
+    let fused = flatten(&roots, Tail::Reduce(ops))?;
+    drop(roots);
 
     let n = len_u32(node.len())?;
     let bytes = u64::from(n) * ELEMENT_BYTES;
     let groups = n.div_ceil(REDUCE_BLOCK);
+    let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
     let Fused { key, inputs, scalars } = fused;
     let core = ctx.jit().kernel(ctx, key)?;
 
-    let out = scratch.take(u64::from(groups) * ELEMENT_BYTES)?;
+    let out = scratch.take(out_bytes)?;
     let mut params = Vec::with_capacity(scalars.len() + 1);
     params.push(n);
     params.extend_from_slice(&scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(inputs.len() + 2);
-    raw.push(RawArg::write(&out, u64::from(groups) * ELEMENT_BYTES));
+    raw.push(RawArg::write(&out, out_bytes));
     raw.extend(inputs.iter().map(|input| RawArg::read(input.buffer(), bytes)));
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
     ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;

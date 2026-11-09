@@ -53,6 +53,6 @@ pub use gpu_type::{GpuType, ScalarType};
 pub use kernel::{
     uniform, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize,
 };
-pub use ops::{select, Operand, Rhs};
+pub use ops::{eval_all, select, Operand, Reduction, Rhs};
 pub use profile::{KernelTiming, Profile};
 pub use shape::{Offsets, Shape};

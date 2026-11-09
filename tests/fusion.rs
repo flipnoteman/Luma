@@ -492,3 +492,53 @@ fn lazy_arrays_from_many_threads() {
         }
     });
 }
+
+#[test]
+fn iterate_matches_the_step_by_step_loop() {
+    let ctx = Context::new().unwrap();
+    // 2-D five-point heat step with a fixed source term, on a grid that is not a multiple of
+    // the tile, for more steps than one launch runs.
+    let (w, h) = (77usize, 45usize);
+    let data = values(w * h, 60, 0.0, 1.0);
+    let source = values(w * h, 61, -0.01, 0.01);
+    let u0 = Array::from_slice_on(&ctx, &data, [w, h]).unwrap();
+    let s = Array::from_slice_on(&ctx, &source, [w, h]).unwrap();
+    let step = |u: &Array<f32>| {
+        let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - u * 4.0;
+        u + lap * 0.2 + &s
+    };
+    let mut want = data.clone();
+    for _ in 0..23 {
+        let at = |x: isize, y: isize| want[x.rem_euclid(w as isize) as usize + w * y.rem_euclid(h as isize) as usize];
+        want = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as isize, (i / w) as isize);
+                let lap = at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1) - 4.0 * at(x, y);
+                at(x, y) + lap * 0.2 + source[i]
+            })
+            .collect();
+    }
+    let got = u0.iterate(23, step).to_vec().unwrap();
+    assert_close(&got, &want, 1e-4, 1e-4);
+    // The start is unchanged.
+    assert_eq!(u0.to_vec().unwrap(), data);
+
+    // 1-D, radius 2, one step only.
+    let xs = values(5000, 62, -1.0, 1.0);
+    let x = Array::from_slice_on(&ctx, &xs, xs.len()).unwrap();
+    let got = x.iterate(1, |u| (u.shift(2) + u.shift(-2)) * 0.5 - u * 0.1).to_vec().unwrap();
+    let n = xs.len();
+    let want: Vec<f32> = (0..n).map(|i| (xs[(i + n - 2) % n] + xs[(i + 2) % n]) * 0.5 - xs[i] * 0.1).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+
+    // A step that is not a stencil (a convolution) still iterates correctly.
+    let kernel = Array::from_slice_on(&ctx, &[0.25f32, 0.5, 0.25], 3).unwrap();
+    let got = x.iterate(2, |u| u.conv1d(&kernel, 1, 1)).to_vec().unwrap();
+    let once: Vec<f32> = (0..n)
+        .map(|i| 0.25 * if i > 0 { xs[i - 1] } else { 0.0 } + 0.5 * xs[i] + 0.25 * xs.get(i + 1).copied().unwrap_or(0.0))
+        .collect();
+    let twice: Vec<f32> = (0..n)
+        .map(|i| 0.25 * if i > 0 { once[i - 1] } else { 0.0 } + 0.5 * once[i] + 0.25 * once.get(i + 1).copied().unwrap_or(0.0))
+        .collect();
+    assert_close(&got, &twice, 1e-5, 1e-5);
+}

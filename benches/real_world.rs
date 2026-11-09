@@ -434,11 +434,16 @@ fn sgemm(c: &mut Criterion) {
 
 const ALPHA: f32 = 0.2;
 
-fn heat_luma(u0: &Array<f32>, steps: usize) -> Array<f32> {
+fn heat_step(u: &Array<f32>) -> Array<f32> {
+    let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - u * 4.0;
+    u + lap * ALPHA
+}
+
+/// One kernel per step.
+fn heat_luma_per_step(u0: &Array<f32>, steps: usize) -> Array<f32> {
     let mut u = u0 * 1.0;
     for _ in 0..steps {
-        let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - &u * 4.0;
-        u = &u + lap * ALPHA;
+        u = heat_step(&u);
     }
     u
 }
@@ -468,17 +473,25 @@ fn heat_cpu(w: usize, u0: &[f32], steps: usize, a: &mut Vec<f32>, b: &mut Vec<f3
 }
 
 fn heat(c: &mut Criterion) {
-    let (w, steps) = (2048usize, 20usize);
-    let u0 = values(w * w, 10, 0.0, 1.0);
-    let gu = Array::from_slice(&u0, [w, w]).unwrap();
-    let (mut a, mut b) = (vec![0.0; w * w], vec![0.0; w * w]);
-    heat_cpu(w, &u0, steps, &mut a, &mut b);
-    check("heat", &heat_luma(&gu, steps).to_vec().unwrap(), &a, 1e-5);
+    let steps = 20usize;
+    let mut group = c.benchmark_group("heat_20_steps");
+    for w in [2048usize, 4096] {
+        let u0 = values(w * w, 10, 0.0, 1.0);
+        let gu = Array::from_slice(&u0, [w, w]).unwrap();
+        let (mut a, mut b) = (vec![0.0; w * w], vec![0.0; w * w]);
+        heat_cpu(w, &u0, steps, &mut a, &mut b);
+        check("heat", &gu.iterate(steps, heat_step).to_vec().unwrap(), &a, 1e-5);
+        check("heat per step", &heat_luma_per_step(&gu, steps).to_vec().unwrap(), &a, 1e-5);
 
-    let mut group = c.benchmark_group("heat_2048x2048_20_steps");
-    group.throughput(Throughput::Elements((w * w * steps) as u64));
-    group.bench_function("luma", |bch| bch.iter(|| heat_luma(&gu, steps).eval().unwrap()));
-    group.bench_function("cpu", |bch| bch.iter(|| heat_cpu(w, &u0, steps, &mut a, &mut b)));
+        group.throughput(Throughput::Elements((w * w * steps) as u64));
+        group.bench_function(BenchmarkId::new("luma_iterate", w), |bch| {
+            bch.iter(|| gu.iterate(steps, heat_step).eval().unwrap())
+        });
+        group.bench_function(BenchmarkId::new("luma_per_step", w), |bch| {
+            bch.iter(|| heat_luma_per_step(&gu, steps).eval().unwrap())
+        });
+        group.bench_function(BenchmarkId::new("cpu", w), |bch| bch.iter(|| heat_cpu(w, &u0, steps, &mut a, &mut b)));
+    }
     group.finish();
 }
 
