@@ -612,11 +612,15 @@ impl Context {
         if let Some(buffer) = lock(&self.inner.pool).take(class, usage) {
             return Ok(buffer);
         }
-        if let Some(buffer) = self.create_buffer(class, usage) {
+        self.new_buffer(class, usage, false)
+    }
+
+    /// A new buffer; when the device is out of memory, gives back every idle buffer and the bind
+    /// groups pinning them, then tries once more.
+    fn new_buffer(&self, size: u64, usage: BufferUsages, mapped: bool) -> Result<Buffer> {
+        if let Some(buffer) = self.create_buffer(size, usage, mapped) {
             return Ok(buffer);
         }
-        // Out of memory: give back every idle buffer and the bind groups pinning them, then
-        // try once more.
         let mut idle = lock(&self.inner.pool).drain();
         idle.extend(lock(&self.inner.mappable).drain());
         lock(&self.inner.released).extend(idle);
@@ -624,17 +628,17 @@ impl Context {
         self.device()
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| LumaError::Poll(Arc::new(e)))?;
-        self.create_buffer(class, usage).ok_or(LumaError::OutOfMemory { requested: class })
+        self.create_buffer(size, usage, mapped).ok_or(LumaError::OutOfMemory { requested: size })
     }
 
     /// A new buffer, or `None` if the device is out of memory.
-    fn create_buffer(&self, size: u64, usage: BufferUsages) -> Option<Buffer> {
+    fn create_buffer(&self, size: u64, usage: BufferUsages, mapped: bool) -> Option<Buffer> {
         let scope = self.device().push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let buffer = self.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("luma buffer"),
             size,
             usage,
-            mapped_at_creation: false,
+            mapped_at_creation: mapped,
         });
         pollster::block_on(scope.pop()).is_none().then_some(buffer)
     }
@@ -708,23 +712,22 @@ impl Context {
         let max = self.inner.max_buffer_bytes;
         let class = pool::size_class(bytes, max)
             .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
-        let reused = lock(&self.inner.mappable).take(class);
+        let mut reused = lock(&self.inner.mappable).take(class);
         if reused.is_none() {
             // Recycled buffers are mapped again only after a submission: a loop of uploads that
-            // never syncs would otherwise keep allocating.
+            // never syncs would otherwise keep allocating. Submit, wait for the maps, retry.
             let waiting: u64 = lock(&self.inner.unmapped).iter().map(Buffer::size).sum();
             if waiting > MAX_FREE_UPLOAD_BYTES {
                 self.flush_locked(&mut *self.batch()?);
+                self.device()
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .map_err(|e| LumaError::Poll(Arc::new(e)))?;
+                reused = lock(&self.inner.mappable).take(class);
             }
         }
         let buffer = match reused {
             Some(buffer) => buffer,
-            None => self.device().create_buffer(&wgpu::BufferDescriptor {
-                label: Some("luma mappable buffer"),
-                size: class,
-                usage: MAPPABLE_STORAGE_USAGE,
-                mapped_at_creation: true,
-            }),
+            None => self.new_buffer(class, MAPPABLE_STORAGE_USAGE, true)?,
         };
         {
             let mut view = buffer.get_mapped_range_mut(..bytes).map_err(LumaError::MapRange)?;

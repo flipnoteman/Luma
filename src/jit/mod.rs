@@ -238,6 +238,9 @@ pub(crate) struct Node {
     /// Set once the node's value was computed inside another node's kernel (or a reduction).
     /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
     fused: AtomicBool,
+    /// Whether the expression reads a shifted lazy expression (recomputed, see
+    /// [`recompute_shifted`]).
+    recomputes: bool,
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
 }
@@ -444,6 +447,10 @@ pub(crate) fn create(
             None => break (below, inputs),
         }
     };
+    let recomputes = args.iter().take(arity).enumerate().any(|(i, arg)| match arg {
+        Src::Node(operand) => operand.recomputes || (i == 0 && matches!(op.kind, OpKind::Shift(_))),
+        _ => false,
+    });
 
     let node = Arc::new(Node {
         ctx: ctx.clone(),
@@ -458,6 +465,7 @@ pub(crate) fn create(
         inputs: inputs.into_boxed_slice(),
         consumers: AtomicU32::new(0),
         fused: AtomicBool::new(false),
+        recomputes,
         readers: Readers::default(),
     });
 
@@ -503,9 +511,11 @@ struct ReaderList {
 /// of evaluating it first. Every shift of it repeats them, but nothing goes through memory.
 const MAX_RECOMPUTED: usize = 16;
 
-/// Whether a shift of `node` reads its expression recomputed rather than evaluated.
+/// Whether a shift of `node` reads its expression recomputed rather than evaluated. Only one
+/// level: an expression that already recomputes a shifted one is evaluated, or every further
+/// stencil step would multiply the work by its number of shifts.
 pub(crate) fn recompute_shifted(node: &Node) -> bool {
-    node.size() <= MAX_RECOMPUTED
+    node.size() <= MAX_RECOMPUTED && !node.recomputes
 }
 
 /// Smallest list length worth pruning.
