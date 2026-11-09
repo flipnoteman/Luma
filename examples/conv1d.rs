@@ -13,11 +13,10 @@ fn main() -> Result<()> {
     println!("Kernel: {:?}", kernel_data);
     println!();
 
-    let ctx = Context::new()?;
-    let input = ctx.from_slice(&[12, 1, 1, 1], &input_data)?;
-    let kernel = ctx.from_slice(&[3, 1, 1, 1], &kernel_data)?;
+    let input = Array::from_slice(&input_data, 12)?;
+    let kernel = Array::from_slice(&kernel_data, 3)?;
 
-    let result = input.conv1d(&kernel, 1, 0)?.read()?;
+    let result = input.conv1d(&kernel, 1, 0).to_vec()?;
 
     println!("Conv1D output ({} elements):", result.len());
     println!("{:?}", result);

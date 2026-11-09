@@ -1,13 +1,8 @@
-#![recursion_limit = "256"]
-
 use luma::*;
-use std::sync::LazyLock;
 
-/// One device shared by all tests.
-static CTX: LazyLock<Context> = LazyLock::new(|| Context::new().expect("Could not create Context."));
-
-fn ctx() -> &'static Context {
-    &CTX
+/// The default device, shared by all tests.
+fn ctx() -> Context {
+    default_context().expect("Could not create Context.")
 }
 
 // -- SAXPY with an encase uniform --
@@ -38,8 +33,8 @@ fn saxpy_non_multiple_of_workgroup() {
     let ys: Vec<f32> = (0..n).map(|i| 100.0 - i as f32).collect();
     let alpha = 2.5f32;
 
-    let x = ctx().from_slice(&[n, 1, 1, 1], &xs).unwrap();
-    let mut y = ctx().from_slice(&[n, 1, 1, 1], &ys).unwrap();
+    let x = Array::from_slice(&xs, [n, 1, 1, 1]).unwrap();
+    let mut y = Array::from_slice(&ys, [n, 1, 1, 1]).unwrap();
 
     let kernel = ctx().kernel(SAXPY).label("saxpy").build().unwrap();
     assert_eq!(kernel.workgroup(), [64, 1, 1]);
@@ -47,11 +42,11 @@ fn saxpy_non_multiple_of_workgroup() {
     assert_eq!(kernel.bindings()[2].kind, BindingKind::Uniform);
 
     kernel
-        .dispatch([n as u32], args![&x, &mut y, uniform(&SaxpyParams { alpha, n: n as u32 })])
+        .launch([n as u32], args![&x, &mut y, uniform(&SaxpyParams { alpha, n: n as u32 })])
         .unwrap();
 
     let expected: Vec<f32> = xs.iter().zip(&ys).map(|(x, y)| alpha * x + y).collect();
-    assert_eq!(y.read().unwrap(), expected);
+    assert_eq!(y.to_vec().unwrap(), expected);
 }
 
 #[test]
@@ -100,17 +95,17 @@ fn jacobi_stencil_2d() {
         }
     }
 
-    let src = ctx().from_slice(&[nx, ny, 1, 1], &input).unwrap();
-    let mut dst = ctx().zeros::<f32>(&[nx, ny, 1, 1]).unwrap();
+    let src = Array::from_slice(&input, [nx, ny, 1, 1]).unwrap();
+    let mut dst = Array::<f32>::zeros([nx, ny, 1, 1]).unwrap();
     let kernel = ctx().kernel(JACOBI).build().unwrap();
     assert_eq!(kernel.workgroup(), [8, 8, 1]);
-    kernel.dispatch([nx as u32, ny as u32], args![&src, &mut dst]).unwrap();
+    kernel.launch([nx as u32, ny as u32], args![&src, &mut dst]).unwrap();
 
-    assert_eq!(dst.read().unwrap(), expected);
+    assert_eq!(dst.to_vec().unwrap(), expected);
 }
 
 #[test]
-fn dispatch_raw_sets_grid_to_workgroups_times_size() {
+fn launch_raw_sets_grid_to_workgroups_times_size() {
     const SRC: &str = r#"
     @group(1) @binding(0) var<storage, read_write> out: array<u32>;
     @compute @workgroup_size(4, 2, 1)
@@ -120,11 +115,11 @@ fn dispatch_raw_sets_grid_to_workgroups_times_size() {
             out[3] = luma_idx3(1u, 1u, 1u);
         }
     }"#;
-    let mut out = ctx().zeros::<u32>(&[4, 1, 1, 1]).unwrap();
+    let mut out = Array::<u32>::zeros([4, 1, 1, 1]).unwrap();
     let kernel = ctx().kernel(SRC).build().unwrap();
-    kernel.dispatch_raw([3, 5, 2], args![&mut out]).unwrap();
+    kernel.launch_raw([3, 5, 2], args![&mut out]).unwrap();
     // size = (12, 10, 2); idx3(1,1,1) = 1 + 12 * (1 + 10 * 1)
-    assert_eq!(out.read().unwrap(), vec![12, 10, 2, 133]);
+    assert_eq!(out.to_vec().unwrap(), vec![12, 10, 2, 133]);
 }
 
 // -- vec4 arrays --
@@ -142,25 +137,25 @@ fn vec4_array_round_trip() {
     }"#;
     let n = 50usize;
     let input: Vec<[f32; 4]> = (0..n).map(|i| [i as f32, 1.0, -2.0, 0.5 * i as f32]).collect();
-    let src = ctx().from_slice(&[n, 1, 1, 1], &input).unwrap();
-    let mut dst = ctx().zeros::<[f32; 4]>(&[n, 1, 1, 1]).unwrap();
+    let src = Array::from_slice(&input, [n, 1, 1, 1]).unwrap();
+    let mut dst = Array::<[f32; 4]>::zeros([n, 1, 1, 1]).unwrap();
 
-    ctx().kernel(SRC).build().unwrap().dispatch([n as u32], args![&src, &mut dst]).unwrap();
+    ctx().kernel(SRC).build().unwrap().launch([n as u32], args![&src, &mut dst]).unwrap();
 
     let expected: Vec<[f32; 4]> =
         input.iter().map(|v| [v[3] * 2.0, v[2] * 2.0, v[1] * 2.0, v[0] * 2.0]).collect();
-    assert_eq!(dst.read().unwrap(), expected);
-    assert_eq!(src.read().unwrap(), input);
+    assert_eq!(dst.to_vec().unwrap(), expected);
+    assert_eq!(src.to_vec().unwrap(), input);
 }
 
 #[test]
 fn other_vector_element_types_round_trip() {
-    let a = ctx().from_slice(&[2, 1, 1, 1], &[[1u32, 2], [3, 4]]).unwrap();
-    assert_eq!(a.read().unwrap(), vec![[1u32, 2], [3, 4]]);
-    let b = ctx().from_slice(&[1, 1, 1, 1], &[[1.0f32, 2.0]]).unwrap();
-    assert_eq!(b.read().unwrap(), vec![[1.0f32, 2.0]]);
-    let c = ctx().from_slice(&[1, 1, 1, 1], &[[1u32, 2, 3, 4]]).unwrap();
-    assert_eq!(c.read().unwrap(), vec![[1u32, 2, 3, 4]]);
+    let a = Array::from_slice(&[[1u32, 2], [3, 4]], [2, 1, 1, 1]).unwrap();
+    assert_eq!(a.to_vec().unwrap(), vec![[1u32, 2], [3, 4]]);
+    let b = Array::from_slice(&[[1.0f32, 2.0]], [1, 1, 1, 1]).unwrap();
+    assert_eq!(b.to_vec().unwrap(), vec![[1.0f32, 2.0]]);
+    let c = Array::from_slice(&[[1u32, 2, 3, 4]], [1, 1, 1, 1]).unwrap();
+    assert_eq!(c.to_vec().unwrap(), vec![[1u32, 2, 3, 4]]);
 }
 
 // -- Uniform layout that naive Pod would get wrong --
@@ -207,10 +202,10 @@ fn uniform_with_vec3_padding() {
     fn main() {
         out[0] = p.a; out[1] = p.v.x; out[2] = p.v.y; out[3] = p.v.z; out[4] = p.b;
     }"#;
-    let mut out = ctx().zeros::<f32>(&[5, 1, 1, 1]).unwrap();
+    let mut out = Array::<f32>::zeros([5, 1, 1, 1]).unwrap();
     let value = Padded { a: 1.0, v: Vec3([2.0, 3.0, 4.0]), b: 5.0 };
-    ctx().kernel(SRC).build().unwrap().dispatch([1], args![uniform(&value), &mut out]).unwrap();
-    assert_eq!(out.read().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    ctx().kernel(SRC).build().unwrap().launch([1], args![uniform(&value), &mut out]).unwrap();
+    assert_eq!(out.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
 }
 
 // -- Errors --
@@ -221,47 +216,47 @@ fn saxpy_args<'a>(x: &'a Array<f32>, y: &'a mut Array<f32>) -> Vec<KernelArg<'a>
 
 #[test]
 fn wrong_arg_count() {
-    let x = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
+    let x = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
     let kernel = ctx().kernel(SAXPY).build().unwrap();
-    let err = kernel.dispatch([4], args![&x]).unwrap_err();
+    let err = kernel.launch([4], args![&x]).unwrap_err();
     assert!(matches!(err, LumaError::KernelArgCount { expected: 3, actual: 1 }), "{err}");
 }
 
 #[test]
 fn shared_array_to_read_write_binding() {
-    let x = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
-    let y = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
+    let x = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
+    let y = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
     let kernel = ctx().kernel(SAXPY).build().unwrap();
     let err = kernel
-        .dispatch([4], args![&x, &y, uniform(&SaxpyParams { alpha: 1.0, n: 4 })])
+        .launch([4], args![&x, &y, uniform(&SaxpyParams { alpha: 1.0, n: 4 })])
         .unwrap_err();
     assert!(matches!(err, LumaError::KernelArgAccess { index: 1 }), "{err}");
 }
 
 #[test]
 fn mutable_array_to_read_binding_is_allowed() {
-    let mut x = ctx().from_slice(&[4, 1, 1, 1], &[1.0f32; 4]).unwrap();
-    let mut y = ctx().from_slice(&[4, 1, 1, 1], &[1.0f32; 4]).unwrap();
+    let mut x = Array::from_slice(&[1.0f32; 4], 4).unwrap();
+    let mut y = Array::from_slice(&[1.0f32; 4], 4).unwrap();
     let kernel = ctx().kernel(SAXPY).build().unwrap();
     kernel
-        .dispatch([4], args![&mut x, &mut y, uniform(&SaxpyParams { alpha: 2.0, n: 4 })])
+        .launch([4], args![&mut x, &mut y, uniform(&SaxpyParams { alpha: 2.0, n: 4 })])
         .unwrap();
-    assert_eq!(y.read().unwrap(), vec![3.0; 4]);
+    assert_eq!(y.to_vec().unwrap(), vec![3.0; 4]);
 }
 
 #[test]
 fn uniform_to_storage_binding_and_vice_versa() {
-    let x = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
-    let mut y = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
+    let x = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
+    let mut y = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
     let kernel = ctx().kernel(SAXPY).build().unwrap();
     let p = SaxpyParams { alpha: 1.0, n: 4 };
 
-    let err = kernel.dispatch([4], args![uniform(&p), &mut y, uniform(&p)]).unwrap_err();
+    let err = kernel.launch([4], args![uniform(&p), &mut y, uniform(&p)]).unwrap_err();
     assert!(
         matches!(err, LumaError::KernelArgKind { index: 0, expected: BindingKind::StorageRead, .. }),
         "{err}"
     );
-    let err = kernel.dispatch([4], args![&x, &mut y, &x]).unwrap_err();
+    let err = kernel.launch([4], args![&x, &mut y, &x]).unwrap_err();
     assert!(
         matches!(err, LumaError::KernelArgKind { index: 2, expected: BindingKind::Uniform, .. }),
         "{err}"
@@ -270,11 +265,11 @@ fn uniform_to_storage_binding_and_vice_versa() {
 
 #[test]
 fn element_size_mismatch() {
-    let x = ctx().zeros::<[f32; 4]>(&[4, 1, 1, 1]).unwrap();
-    let mut y = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
+    let x = Array::<[f32; 4]>::zeros([4, 1, 1, 1]).unwrap();
+    let mut y = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
     let kernel = ctx().kernel(SAXPY).build().unwrap();
     let err = kernel
-        .dispatch([4], args![&x, &mut y, uniform(&SaxpyParams { alpha: 1.0, n: 4 })])
+        .launch([4], args![&x, &mut y, uniform(&SaxpyParams { alpha: 1.0, n: 4 })])
         .unwrap_err();
     assert!(
         matches!(err, LumaError::KernelArgElementSize { index: 0, expected: 4, actual: 16 }),
@@ -285,10 +280,10 @@ fn element_size_mismatch() {
 #[test]
 fn arrays_from_another_context_are_rejected() {
     let other = Context::new().unwrap();
-    let x = other.zeros::<f32>(&[4, 1, 1, 1]).unwrap();
-    let mut y = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
+    let x = Array::<f32>::zeros_on(&other, [4, 1, 1, 1]).unwrap();
+    let mut y = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
     let kernel = ctx().kernel(SAXPY).build().unwrap();
-    let err = kernel.dispatch([4], saxpy_args(&x, &mut y)).unwrap_err();
+    let err = kernel.launch([4], saxpy_args(&x, &mut y)).unwrap_err();
     assert!(matches!(err, LumaError::ContextMismatch), "{err}");
 }
 
@@ -325,9 +320,9 @@ fn missing_entry_point() {
 
 #[test]
 fn grid_too_large() {
-    let mut y = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
-    let x = ctx().zeros::<f32>(&[4, 1, 1, 1]).unwrap();
+    let mut y = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
+    let x = Array::<f32>::zeros([4, 1, 1, 1]).unwrap();
     let kernel = ctx().kernel(SAXPY).build().unwrap();
-    let err = kernel.dispatch([u32::MAX], saxpy_args(&x, &mut y)).unwrap_err();
+    let err = kernel.launch([u32::MAX], saxpy_args(&x, &mut y)).unwrap_err();
     assert!(matches!(err, LumaError::KernelGridTooLarge { .. }), "{err}");
 }

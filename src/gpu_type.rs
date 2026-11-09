@@ -6,13 +6,13 @@ use bytemuck::Pod;
 /// `[u32; 4]`, whose layout matches WGSL's `vec2`/`vec4` (there is deliberately no `[f32; 3]`:
 /// `vec3` is 16-byte aligned in WGSL, which a plain 12-byte array is not).
 ///
-/// The built-in elementwise operations only exist for [`ScalarType`]s.
+/// The built-in math only exists for [`ScalarType`]s.
 pub trait GpuType: Pod + std::fmt::Debug {}
 
-/// Element types the built-in operations (`add`, `double`, ...) are implemented for.
+/// Element types the built-in operators, math functions and reductions are implemented for.
 pub trait ScalarType: GpuType {
-    /// Suffix of the embedded shader implementing an operation for this type.
-    fn type_suffix() -> &'static str;
+    /// The WGSL name of the type, used to generate the shaders of the built-in operations.
+    fn wgsl_type() -> &'static str;
 }
 
 impl GpuType for u32 {}
@@ -23,9 +23,13 @@ impl GpuType for [u32; 2] {}
 impl GpuType for [u32; 4] {}
 
 impl ScalarType for u32 {
-    fn type_suffix() -> &'static str { "" }
+    fn wgsl_type() -> &'static str {
+        "u32"
+    }
 }
 
 impl ScalarType for f32 {
-    fn type_suffix() -> &'static str { "_f32" }
+    fn wgsl_type() -> &'static str {
+        "f32"
+    }
 }

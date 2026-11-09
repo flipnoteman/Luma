@@ -1,22 +1,26 @@
-@group(0) @binding(0) var<storage, read_write> data: array<f32>;
-@group(0) @binding(1) var<storage, read> params: array<u32, 3>;
+// One radix-2 butterfly stage of the inverse FFT (conjugate twiddles), in place. The last stage
+// also divides by n. Launched with n / 2 invocations.
+struct Params { n: u32, stage: u32, is_last_stage: u32 }
+
+@group(1) @binding(0) var<storage, read_write> data: array<f32>;
+@group(1) @binding(1) var<uniform> params: Params;
 
 const PI: f32 = 3.14159265358979323846;
 
 @compute
 @workgroup_size(64)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let thread_id = global_id.x;
-    let n = params[0];
-    let stage = params[1];
-    let is_last_stage = params[2];
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let thread_id = gid.x + gid.y * nwg.x * 64u;
 
-    let half_n = n / 2u;
+    let half_n = params.n / 2u;
     if (thread_id >= half_n) {
         return;
     }
 
-    let pairs_per_group = 1u << (stage + 1u);
+    let pairs_per_group = 1u << (params.stage + 1u);
     let half_group = pairs_per_group / 2u;
     let group = thread_id / half_group;
     let pos_in_group = thread_id % half_group;
@@ -43,8 +47,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var new_bot_im = top_im - t_im;
 
     // Normalize on last stage
-    if (is_last_stage == 1u) {
-        let inv_n = 1.0 / f32(n);
+    if (params.is_last_stage == 1u) {
+        let inv_n = 1.0 / f32(params.n);
         new_top_re = new_top_re * inv_n;
         new_top_im = new_top_im * inv_n;
         new_bot_re = new_bot_re * inv_n;

@@ -3,12 +3,12 @@ use std::time::Instant;
 
 fn bench_spatial(input: &Array<f32>, kernel: &Array<f32>, iterations: u32) -> f64 {
     // Warmup
-    let _ = input.conv1d(kernel, 1, 0).unwrap().read().unwrap();
+    let _ = input.conv1d(kernel, 1, 0).to_vec().unwrap();
 
     let start = Instant::now();
     for _ in 0..iterations {
-        let result = input.conv1d(kernel, 1, 0).unwrap();
-        let _ = result.read().unwrap();
+        let result = input.conv1d(kernel, 1, 0);
+        let _ = result.to_vec().unwrap();
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / iterations as f64 * 1000.0 // ms per iteration
@@ -16,20 +16,18 @@ fn bench_spatial(input: &Array<f32>, kernel: &Array<f32>, iterations: u32) -> f6
 
 fn bench_fft(input: &Array<f32>, kernel: &Array<f32>, iterations: u32) -> f64 {
     // Warmup
-    let _ = input.conv1d_fft(kernel).unwrap().read().unwrap();
+    let _ = input.conv1d_fft(kernel).to_vec().unwrap();
 
     let start = Instant::now();
     for _ in 0..iterations {
-        let result = input.conv1d_fft(kernel).unwrap();
-        let _ = result.read().unwrap();
+        let result = input.conv1d_fft(kernel);
+        let _ = result.to_vec().unwrap();
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / iterations as f64 * 1000.0 // ms per iteration
 }
 
 fn main() -> Result<()> {
-    let ctx = Context::new()?;
-
     let configs: Vec<(usize, usize, u32)> = vec![
         // (input_len, kernel_len, iterations)
         // Small inputs — spatial should dominate
@@ -69,8 +67,8 @@ fn main() -> Result<()> {
         let input_data: Vec<f32> = (0..*input_len).map(|x| (x as f32 * 0.01).sin()).collect();
         let kernel_data: Vec<f32> = (0..*kernel_len).map(|x| 1.0 / (1.0 + x as f32)).collect();
 
-        let input = ctx.from_slice(&[*input_len, 1, 1, 1], &input_data)?;
-        let kernel = ctx.from_slice(&[*kernel_len, 1, 1, 1], &kernel_data)?;
+        let input = Array::from_slice(&input_data, *input_len)?;
+        let kernel = Array::from_slice(&kernel_data, *kernel_len)?;
 
         let spatial_ms = bench_spatial(&input, &kernel, *iterations);
         let fft_ms = bench_fft(&input, &kernel, *iterations);

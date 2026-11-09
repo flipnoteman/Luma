@@ -1,13 +1,12 @@
 //! Custom compute kernels: user WGSL run against [`Array`]s and uniforms.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use wgpu::{BindGroupEntry, BindingResource};
-
-use crate::array::Array;
-use crate::context::{bind, Context, UNIFORM_USAGE};
+use crate::array::{Array, Failure};
+use crate::context::{default_context, Context, RawArg};
 use crate::error::{LumaError, Result};
-use crate::gpu::pipeline::Scratch;
 use crate::gpu_type::GpuType;
 
 /// WGSL appended to every kernel. Declarations are order independent in WGSL, so appending (not
@@ -19,9 +18,6 @@ struct LumaGrid { size: vec3<u32>, _pad: u32 }
 fn luma_idx2(i: u32, j: u32) -> u32 { return i + j * luma.size.x; }
 fn luma_idx3(i: u32, j: u32, k: u32) -> u32 { return i + luma.size.x * (j + luma.size.y * k); }
 ";
-
-/// Size of `LumaGrid` in bytes.
-const GRID_BYTES: u64 = 16;
 
 /// What a kernel binding in `@group(1)` is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,15 +59,24 @@ pub(crate) struct KernelKey {
     workgroup: Option<[u32; 3]>,
 }
 
+impl KernelKey {
+    pub(crate) fn new(source: String, entry: &str, workgroup: Option<[u32; 3]>) -> Self {
+        KernelKey { source, entry: entry.to_owned(), workgroup }
+    }
+}
+
 /// Everything about a built kernel that does not depend on the caller; cached per context.
 #[derive(Debug)]
 pub(crate) struct KernelCore {
-    pipeline: wgpu::ComputePipeline,
-    grid_layout: wgpu::BindGroupLayout,
-    args_layout: wgpu::BindGroupLayout,
+    /// Unique per built kernel; identifies it in the bind group cache.
+    pub(crate) id: u64,
+    pub(crate) pipeline: wgpu::ComputePipeline,
+    pub(crate) args_layout: wgpu::BindGroupLayout,
     bindings: Vec<BindingInfo>,
-    workgroup: [u32; 3],
+    pub(crate) workgroup: [u32; 3],
 }
+
+static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Builds a [`Kernel`]; created by [`Context::kernel`].
 #[derive(Debug)]
@@ -125,7 +130,7 @@ impl<'a> KernelBuilder<'a> {
         if let Some(core) = cache.get(&key) {
             return Ok(Kernel { ctx: self.ctx.clone(), core: core.clone() });
         }
-        let core = std::sync::Arc::new(build_core(self.ctx, &key, self.label.as_deref())?);
+        let core = Arc::new(build_core(self.ctx, &key, self.label.as_deref())?);
         cache.insert(key, core.clone());
         Ok(Kernel { ctx: self.ctx.clone(), core })
     }
@@ -142,7 +147,7 @@ fn reflect_kind(space: naga::AddressSpace) -> Option<BindingKind> {
     }
 }
 
-fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) -> Result<KernelCore> {
+pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) -> Result<KernelCore> {
     let combined = format!("{}\n{PRELUDE}", key.source);
     let module = naga::front::wgsl::parse_str(&combined)
         .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
@@ -228,6 +233,11 @@ fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) -> Result<Ker
         ));
     }
     let workgroup = entry.workgroup_size;
+    if workgroup.contains(&0) {
+        return Err(LumaError::KernelWorkgroup(format!(
+            "@workgroup_size{workgroup:?} has a zero dimension"
+        )));
+    }
     if let Some(requested) = key.workgroup {
         if requested != workgroup {
             return Err(LumaError::KernelWorkgroup(format!(
@@ -252,36 +262,35 @@ fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) -> Result<Ker
         )));
     }
 
+    // The grid and every user uniform are bound at dynamic offsets into the uniform arena.
+    let uniforms = bindings.iter().filter(|b| b.kind == BindingKind::Uniform).count() as u32;
+    if uniforms + 1 > ctx.max_dynamic_uniforms() {
+        return Err(LumaError::KernelBinding(format!(
+            "{uniforms} uniform arguments exceed the device limit of {} dynamic uniform buffers \
+             per kernel (one is used by luma's grid)",
+            ctx.max_dynamic_uniforms().saturating_sub(1)
+        )));
+    }
+
     let device = ctx.device();
-    let uniform_entry = |binding: u32, read_only: Option<bool>| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: match read_only {
-                Some(read_only) => wgpu::BufferBindingType::Storage { read_only },
-                None => wgpu::BufferBindingType::Uniform,
-            },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    };
-    let grid_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label,
-        entries: &[uniform_entry(0, None)],
-    });
     let arg_entries: Vec<_> = bindings
         .iter()
         .enumerate()
-        .map(|(i, info)| {
-            uniform_entry(
-                i as u32,
-                match info.kind {
-                    BindingKind::Uniform => None,
-                    BindingKind::StorageRead => Some(true),
-                    BindingKind::StorageReadWrite => Some(false),
+        .map(|(i, info)| wgpu::BindGroupLayoutEntry {
+            binding: i as u32,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: match info.kind {
+                    BindingKind::Uniform => wgpu::BufferBindingType::Uniform,
+                    BindingKind::StorageRead => wgpu::BufferBindingType::Storage { read_only: true },
+                    BindingKind::StorageReadWrite => {
+                        wgpu::BufferBindingType::Storage { read_only: false }
+                    }
                 },
-            )
+                has_dynamic_offset: info.kind == BindingKind::Uniform,
+                min_binding_size: None,
+            },
+            count: None,
         })
         .collect();
     let args_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -290,7 +299,7 @@ fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) -> Result<Ker
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label,
-        bind_group_layouts: &[Some(&grid_layout), Some(&args_layout)],
+        bind_group_layouts: &[Some(ctx.grid_layout()), Some(&args_layout)],
         immediate_size: 0,
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -306,7 +315,13 @@ fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) -> Result<Ker
         cache: None,
     });
 
-    Ok(KernelCore { pipeline, grid_layout, args_layout, bindings, workgroup })
+    Ok(KernelCore {
+        id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
+        pipeline,
+        args_layout,
+        bindings,
+        workgroup,
+    })
 }
 
 /// A problem size in invocations: `[x]`, `[x, y]` or `[x, y, z]` (missing dimensions are 1).
@@ -341,6 +356,8 @@ enum ArgRepr<'a> {
         writable: bool,
     },
     Uniform(std::result::Result<Vec<u8>, String>),
+    /// The array passed here is poisoned; launching fails with its error.
+    Poisoned(Arc<LumaError>),
 }
 
 /// One kernel argument, bound to `@group(1)` at the position it has in [`args!`](crate::args).
@@ -350,37 +367,36 @@ pub struct KernelArg<'a> {
     repr: ArgRepr<'a>,
 }
 
+fn storage_arg<'a, T: GpuType>(array: &'a Array<T>, writable: bool) -> KernelArg<'a> {
+    let repr = match array.ready() {
+        Ok((buffer, bytes)) => ArgRepr::Storage {
+            ctx: array.context(),
+            buffer,
+            bytes,
+            element_size: std::mem::size_of::<T>() as u32,
+            writable,
+        },
+        Err(Failure::Inherited(error)) => ArgRepr::Poisoned(error),
+        Err(Failure::New(error)) => ArgRepr::Poisoned(Arc::new(error)),
+    };
+    KernelArg { repr }
+}
+
 impl<'a, T: GpuType> From<&'a Array<T>> for KernelArg<'a> {
     fn from(array: &'a Array<T>) -> Self {
-        KernelArg {
-            repr: ArgRepr::Storage {
-                ctx: array.context(),
-                buffer: array.storage(),
-                bytes: array.byte_len(),
-                element_size: std::mem::size_of::<T>() as u32,
-                writable: false,
-            },
-        }
+        storage_arg(array, false)
     }
 }
 
 impl<'a, T: GpuType> From<&'a mut Array<T>> for KernelArg<'a> {
     fn from(array: &'a mut Array<T>) -> Self {
-        KernelArg {
-            repr: ArgRepr::Storage {
-                ctx: array.context(),
-                buffer: array.storage(),
-                bytes: array.byte_len(),
-                element_size: std::mem::size_of::<T>() as u32,
-                writable: true,
-            },
-        }
+        storage_arg(array, true)
     }
 }
 
 /// Passes `value` as a uniform, laid out by encase according to WGSL's rules (so a `#[derive(
 /// encase::ShaderType)]` struct matches the shader's struct even where `repr(C)` would not).
-/// The value is copied at call time.
+/// The value is copied at call time, and every launch of a batch keeps its own copy.
 pub fn uniform<'a, T>(value: &T) -> KernelArg<'a>
 where
     T: encase::ShaderType + encase::internal::WriteInto,
@@ -393,7 +409,7 @@ where
     KernelArg { repr: ArgRepr::Uniform(bytes) }
 }
 
-/// Builds the `Vec<KernelArg>` for [`Kernel::dispatch`]: `args![&x, &mut y, uniform(&params)]`.
+/// Builds the `Vec<KernelArg>` for [`Kernel::launch`]: `args![&x, &mut y, uniform(&params)]`.
 #[macro_export]
 macro_rules! args {
     ($($arg:expr),* $(,)?) => {
@@ -406,16 +422,26 @@ macro_rules! args {
 /// Luma binds a uniform `luma: LumaGrid` (`size: vec3<u32>`, the problem size) at
 /// `@group(0) @binding(0)` and provides `luma_idx2(i, j)` / `luma_idx3(i, j, k)` (row-major,
 /// x fastest) in every kernel. The kernel's own resources must be in `@group(1)`, numbered from 0
-/// in the order of the arguments passed to [`Kernel::dispatch`].
+/// in the order of the arguments passed to [`Kernel::launch`].
+///
+/// Launches join the context's automatic batch: they are recorded in order with the operators
+/// and math functions on arrays and run when the batch is submitted (at the next
+/// [`Array::to_vec`], [`Array::eval`] or [`Context::sync`], or when the batch grows large).
 ///
 /// Kernels are cheap to clone; building the same source twice on a context reuses the pipeline.
 #[derive(Clone, Debug)]
 pub struct Kernel {
     ctx: Context,
-    core: std::sync::Arc<KernelCore>,
+    core: Arc<KernelCore>,
 }
 
 impl Kernel {
+    /// Builds a kernel on the [default context](crate::default_context) with the default entry
+    /// point `main`. Use [`Context::kernel`] to choose the context or other options.
+    pub fn new(wgsl_src: &str) -> Result<Kernel> {
+        default_context()?.kernel(wgsl_src).build()
+    }
+
     /// The reflected `@group(1)` bindings, in argument order.
     pub fn bindings(&self) -> &[BindingInfo] {
         &self.core.bindings
@@ -428,8 +454,8 @@ impl Kernel {
 
     /// Runs the kernel with at least `problem_size` invocations (`ceil(size / workgroup)`
     /// workgroups per dimension; `luma.size` is `problem_size`, so guard against
-    /// `global_invocation_id >= luma.size`). Submits without waiting.
-    pub fn dispatch(&self, problem_size: impl ProblemSize, args: Vec<KernelArg<'_>>) -> Result<()> {
+    /// `global_invocation_id >= luma.size`). Records the launch without waiting.
+    pub fn launch(&self, problem_size: impl ProblemSize, args: Vec<KernelArg<'_>>) -> Result<()> {
         let size = problem_size.into_size();
         if size.contains(&0) {
             return Err(LumaError::InvalidShape(format!(
@@ -437,12 +463,13 @@ impl Kernel {
             )));
         }
         let wg = self.core.workgroup;
-        let workgroups = std::array::from_fn(|i| size[i].div_ceil(wg[i]));
+        let [(sx, wx), (sy, wy), (sz, wz)] = [(size[0], wg[0]), (size[1], wg[1]), (size[2], wg[2])];
+        let workgroups = [sx.div_ceil(wx), sy.div_ceil(wy), sz.div_ceil(wz)];
         self.run(workgroups, size, &args)
     }
 
     /// Runs exactly `workgroups` workgroups; `luma.size` is `workgroups * workgroup`.
-    pub fn dispatch_raw(&self, workgroups: [u32; 3], args: Vec<KernelArg<'_>>) -> Result<()> {
+    pub fn launch_raw(&self, workgroups: [u32; 3], args: Vec<KernelArg<'_>>) -> Result<()> {
         if workgroups.contains(&0) {
             return Err(LumaError::InvalidShape(format!(
                 "Workgroup count {workgroups:?} has a zero dimension"
@@ -450,7 +477,8 @@ impl Kernel {
         }
         let wg = self.core.workgroup;
         // Within the device limit (checked in `run`) this cannot overflow; saturate otherwise.
-        let size = std::array::from_fn(|i| workgroups[i].saturating_mul(wg[i]));
+        let [x, y, z] = workgroups;
+        let size = [x.saturating_mul(wg[0]), y.saturating_mul(wg[1]), z.saturating_mul(wg[2])];
         self.run(workgroups, size, &args)
     }
 
@@ -469,12 +497,11 @@ impl Kernel {
             });
         }
 
-        let max_uniform = u64::from(ctx.device().limits().max_uniform_buffer_binding_size);
-        let mut scratch = Scratch::new(ctx);
-        // (buffer, bytes to bind) per argument.
-        let mut bound: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(args.len());
+        let max_uniform = ctx.max_uniform_bytes();
+        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(args.len());
         for (index, (arg, info)) in args.iter().zip(&core.bindings).enumerate() {
             match &arg.repr {
+                ArgRepr::Poisoned(error) => return Err(LumaError::clone(error)),
                 ArgRepr::Storage { ctx: arg_ctx, buffer, bytes, element_size, writable } => {
                     if !arg_ctx.same_as(ctx) {
                         return Err(LumaError::ContextMismatch);
@@ -506,7 +533,7 @@ impl Kernel {
                             });
                         }
                     }
-                    bound.push(((*buffer).clone(), *bytes));
+                    raw.push(RawArg::Storage { buffer, bytes: *bytes, writable: *writable });
                 }
                 ArgRepr::Uniform(encoded) => {
                     if info.kind != BindingKind::Uniform {
@@ -533,56 +560,11 @@ impl Kernel {
                     if bytes > max_uniform {
                         return Err(LumaError::BufferTooLarge { requested: bytes, max: max_uniform });
                     }
-                    let buffer = scratch.take(bytes, UNIFORM_USAGE)?;
-                    ctx.queue().write_buffer(&buffer, 0, data);
-                    bound.push((buffer, bytes));
+                    raw.push(RawArg::Uniform(data));
                 }
             }
         }
 
-        let grid = scratch.take(GRID_BYTES, UNIFORM_USAGE)?;
-        ctx.queue().write_buffer(
-            &grid,
-            0,
-            bytemuck::cast_slice(&[size[0], size[1], size[2], 0u32]),
-        );
-
-        let device = ctx.device();
-        let grid_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &core.grid_layout,
-            entries: &[BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::Buffer(bind(&grid, GRID_BYTES)),
-            }],
-        });
-        let entries: Vec<BindGroupEntry<'_>> = bound
-            .iter()
-            .enumerate()
-            .map(|(i, (buffer, bytes))| BindGroupEntry {
-                binding: i as u32,
-                resource: BindingResource::Buffer(bind(buffer, *bytes)),
-            })
-            .collect();
-        let args_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &core.args_layout,
-            entries: &entries,
-        });
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&core.pipeline);
-            pass.set_bind_group(0, &grid_group, &[]);
-            pass.set_bind_group(1, &args_group, &[]);
-            pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
-        }
-        ctx.queue().submit(Some(encoder.finish()));
-        Ok(())
+        ctx.launch(core, workgroups, size, &raw)
     }
 }

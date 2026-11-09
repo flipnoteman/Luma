@@ -1,6 +1,9 @@
-@group(0) @binding(0) var<storage, read_write> output: array<f32>;
-@group(0) @binding(1) var<storage, read> input_data: array<f32>;
-@group(0) @binding(2) var<storage, read> params: array<u32, 2>;
+// Copies a real signal, zero-padded to `n`, into a complex buffer in bit-reversed order.
+struct Params { n: u32, input_len: u32 }
+
+@group(1) @binding(0) var<storage, read_write> output: array<f32>;
+@group(1) @binding(1) var<storage, read> input_data: array<f32>;
+@group(1) @binding(2) var<uniform> params: Params;
 
 fn bit_reverse(x: u32, log2n: u32) -> u32 {
     var result: u32 = 0u;
@@ -24,20 +27,20 @@ fn count_trailing_zeros_pow2(n: u32) -> u32 {
 
 @compute
 @workgroup_size(64)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let idx = global_id.x;
-    let n = params[0];
-    let input_len = params[1];
-
-    if (idx >= n) {
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.x + gid.y * nwg.x * 64u;
+    if (idx >= params.n) {
         return;
     }
 
-    let log2n = count_trailing_zeros_pow2(n);
+    let log2n = count_trailing_zeros_pow2(params.n);
     let rev = bit_reverse(idx, log2n);
 
     var re: f32 = 0.0;
-    if (rev < input_len) {
+    if (rev < params.input_len) {
         re = input_data[rev];
     }
 
