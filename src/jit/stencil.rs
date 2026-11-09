@@ -18,11 +18,10 @@ use crate::ops::fold_workgroups;
 use super::codegen::expression;
 use super::program::{flatten, Instr, Ref, Tail};
 use super::{ElemTy, OpKind, ShiftKind};
+use crate::tuning::Tuning;
 
 /// Invocations per workgroup.
 const WORKGROUP: u32 = 256;
-/// Workgroup memory for the two tile buffers; more costs occupancy on Apple GPUs.
-const TILE_BYTES: u32 = 8 * 1024;
 
 /// Largest stencil radius (per axis) handled; wider stencils iterate one kernel per step.
 const MAX_RADIUS: u32 = 4;
@@ -127,10 +126,10 @@ pub(crate) fn plan(probe: &Array<f32>, next: &Array<f32>) -> Option<Stencil> {
 }
 
 /// Output tile of a launch and the steps it runs, for `radius`: the most steps whose two tile
-/// buffers (outputs plus halo) fit in [`TILE_BYTES`].
-fn layout(radius: (u32, u32), one_d: bool, steps: usize) -> ((u32, u32), u32) {
-    let (tx, ty) = if one_d { (1024, 1) } else { (32, 16) };
-    let fits = |k: u32| (tx + 2 * k * radius.0) * (ty + 2 * k * radius.1) * 8 <= TILE_BYTES;
+/// buffers (outputs plus halo) fit in the tuning's workgroup memory budget.
+fn layout(tuning: &Tuning, radius: (u32, u32), one_d: bool, steps: usize) -> ((u32, u32), u32) {
+    let (tx, ty) = if one_d { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
+    let fits = |k: u32| (tx + 2 * k * radius.0) * (ty + 2 * k * radius.1) * 8 <= tuning.stencil_tile_bytes;
     // A pointwise step needs no halo; cap it anyway, the program is unrolled per step.
     let mut k = 1;
     while k < 8 && fits(k + 1) {
@@ -267,7 +266,7 @@ fn main(
         let ctx = start.context();
         let jit = ctx.jit();
         let (w, h) = self.dims;
-        let (tile, per_launch) = layout(self.radius, h == 1, steps);
+        let (tile, per_launch) = layout(ctx.tuning(), self.radius, h == 1, steps);
         let tiles = [w.div_ceil(tile.0), h.div_ceil(tile.1)];
         let groups = fold_workgroups(ctx, tiles[0] * tiles[1])?;
         let mut params = vec![w, h, tiles[0]];

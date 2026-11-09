@@ -15,6 +15,7 @@ use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::pool::{self, BufferPool};
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
 use crate::profile::{Profile, Profiler};
+use crate::tuning::{Tuning, TuningProfile};
 
 /// Usage of every array storage buffer (and the scratch buffers of multi-pass operations, so they
 /// share a pool class).
@@ -292,6 +293,8 @@ struct Inner {
     unmapped: Mutex<Vec<Buffer>>,
     /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
     zero_copy: bool,
+    /// Kernel parameters for this GPU.
+    tuning: Tuning,
     batch: Mutex<Batch>,
     /// The first error the GPU reported outside of a call that could return it.
     gpu_error: Arc<Mutex<Option<String>>>,
@@ -369,7 +372,7 @@ pub fn flush() -> Result<()> {
 impl Context {
     /// Opens the default high-performance GPU. Blocks until the device is ready.
     pub fn new() -> Result<Context> {
-        let (device, queue) = pollster::block_on(handle::request_device())?;
+        let (device, queue, adapter) = pollster::block_on(handle::request_device())?;
         let limits = device.limits();
         let max_buffer_bytes = limits
             .max_buffer_size
@@ -418,6 +421,7 @@ impl Context {
                 max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
                 timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
                 zero_copy: device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
+                tuning: Tuning::for_adapter(&adapter, &limits),
                 device,
                 queue,
                 builtins: Mutex::new(FxMap::default()),
@@ -594,7 +598,7 @@ impl Context {
         if let Some(core) = cache.get(&(op, ty)) {
             return Ok(Arc::clone(core));
         }
-        let key = KernelKey::new(op.source(ty).into_owned(), "main", None);
+        let key = KernelKey::new(op.source(ty, &self.inner.tuning).into_owned(), "main", None);
         let label = format!("{op:?} {ty}");
         let core = Arc::new(kernel::build_core(self, &key, Some(&label), true)?);
         cache.insert((op, ty), Arc::clone(&core));
@@ -985,6 +989,15 @@ impl Context {
         }
         *dispatches += 1;
         Ok(())
+    }
+
+    /// The kernel parameter set chosen for this context's GPU (see [`TuningProfile`]).
+    pub fn tuning_profile(&self) -> TuningProfile {
+        self.inner.tuning.profile
+    }
+
+    pub(crate) fn tuning(&self) -> &Tuning {
+        &self.inner.tuning
     }
 
     // -- Profiling --

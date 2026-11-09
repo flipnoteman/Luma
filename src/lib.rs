@@ -45,6 +45,7 @@ mod kernel;
 mod ops;
 mod profile;
 mod shape;
+mod tuning;
 
 pub use array::Array;
 pub use context::{default_context, flush, Context};
@@ -56,3 +57,4 @@ pub use kernel::{
 pub use ops::{eval_all, select, Operand, Reduction, Rhs};
 pub use profile::{KernelTiming, Profile};
 pub use shape::{Offsets, Shape};
+pub use tuning::TuningProfile;

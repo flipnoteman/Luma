@@ -101,7 +101,7 @@ fn run_conv1d(
     ];
     if params[1] <= CONV_MAX_STRIDE {
         let core = ctx.builtin(Builtin::Conv1dTiled(params[1]), "f32")?;
-        let groups = fold_workgroups(ctx, params[4].div_ceil(conv_tile(params[1])))?;
+        let groups = fold_workgroups(ctx, params[4].div_ceil(conv_tile(params[1], ctx.tuning())))?;
         ctx.launch(&core, groups, [params[4], 1, 1], &args)?;
     } else {
         let core = ctx.builtin(Builtin::Conv1d, "f32")?;

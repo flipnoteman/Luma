@@ -11,7 +11,7 @@
 
 use std::fmt::Write;
 
-use crate::builtin::{reduce_main, ELEMENTWISE_WORKGROUP};
+use crate::builtin::reduce_main;
 
 use super::program::{FusedKey, Instr, Ref, Tail};
 use super::{ElemTy, OpKind, ShiftKind};
@@ -101,8 +101,9 @@ fn shift_index(kind: ShiftKind, s: &str) -> String {
     }
 }
 
-/// The WGSL source of the kernel for `key`.
-pub(crate) fn source(key: &FusedKey) -> String {
+/// The WGSL source of the kernel for `key`; elementwise kernels have `wg` invocations per
+/// workgroup.
+pub(crate) fn source(key: &FusedKey, wg: u32) -> String {
     let reduce = matches!(key.tail, Tail::Reduce(_));
     let mut src = String::new();
 
@@ -145,7 +146,6 @@ pub(crate) fn source(key: &FusedKey) -> String {
 
     match key.tail {
         Tail::Store => {
-            let wg = ELEMENTWISE_WORKGROUP;
             let stores: String = outputs.iter().enumerate().map(|(j, at)| format!("    out{j}[i] = t{at};\n")).collect();
             let _ = write!(
                 src,

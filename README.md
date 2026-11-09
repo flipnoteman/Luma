@@ -129,6 +129,14 @@ and a result used by several operations is computed once instead of inside each 
 `LUMA_FUSION_MAX_NODES=1` in the environment disables fusion (one kernel per operation); the
 effect is measured by `cargo run --release --example bench_fusion`.
 
+## Kernel parameters per GPU
+
+Workgroup sizes and tile shapes of the built-in kernels (elementwise, tiled `conv1d`, time-blocked
+`iterate`) are chosen when the context opens its device: Apple GPUs get the values measured on an
+M5 Pro, every other GPU common defaults that have not been measured yet. Both are shrunk to fit
+the device's limits. `ctx.tuning_profile()` reports the choice, and `LUMA_TUNING=apple` or
+`LUMA_TUNING=generic` in the environment forces one.
+
 ## Errors do not panic
 
 Operators and math methods return `Array<T>`, not `Result`. If an operation fails (shape

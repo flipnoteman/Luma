@@ -9,19 +9,13 @@
 
 use std::borrow::Cow;
 
-/// Workgroup size of the elementwise kernels; their index math (`gid.x + gid.y * nwg.x * 64`)
-/// folds one-dimensional problems into two dimensions to stay within the dispatch limit.
-pub(crate) const ELEMENTWISE_WORKGROUP: u32 = 64;
+use crate::tuning::Tuning;
 
 /// Workgroup size of the reduction kernels, and how many elements each thread loads.
 pub(crate) const REDUCE_WORKGROUP: u32 = 256;
 pub(crate) const REDUCE_PER_THREAD: u32 = 4;
 /// Number of input elements one reduction workgroup consumes.
 pub(crate) const REDUCE_BLOCK: u32 = REDUCE_WORKGROUP * REDUCE_PER_THREAD;
-/// Invocations of the tiled convolution, and how many consecutive outputs each computes at
-/// stride 1 (stride `s` computes `1 / s` as many).
-const CONV_WORKGROUP: u32 = 256;
-const CONV_PER_THREAD: u32 = 16;
 /// Largest stride the tiled convolution handles; larger ones run one output per invocation.
 pub(crate) const CONV_MAX_STRIDE: u32 = 4;
 
@@ -189,7 +183,7 @@ pub(crate) enum Builtin {
 }
 
 /// `a[i] = a[i] op b[i]` (or `a[i] op p.s` with `scalar`).
-fn in_place(ty: &str, scalar: bool, expr: &str) -> String {
+fn in_place(ty: &str, scalar: bool, expr: &str, wg: u32) -> String {
     let (decls, load) = if scalar {
         (
             format!(
@@ -212,9 +206,9 @@ fn in_place(ty: &str, scalar: bool, expr: &str) -> String {
     };
     format!(
         "{decls}
-@compute @workgroup_size({ELEMENTWISE_WORKGROUP})
+@compute @workgroup_size({wg})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {ELEMENTWISE_WORKGROUP}u;
+    let i = gid.x + gid.y * nwg.x * {wg}u;
     if (i >= luma.size.x) {{ return; }}
     {load}
     a[i] = {expr};
@@ -309,16 +303,16 @@ fn main(
 }
 
 /// Direct convolution with stride `s` (1 to [`CONV_MAX_STRIDE`]), tiled. A workgroup computes
-/// [`conv_tile`] consecutive outputs, an invocation `R` = [`CONV_PER_THREAD`]` / s` consecutive
-/// ones in registers. The kernel is consumed in chunks of taps whose weights and input window
-/// are staged in workgroup memory (zero outside the input, so the inner loop has no bounds
-/// checks). The inner loop takes `R` taps at a time from the `(R - 1) s + R` window values they
-/// touch, fully unrolled. Window slots skip one word every 32 so that the strided reads of
-/// neighbouring invocations fall into different banks.
-fn conv1d_tiled(stride: u32) -> String {
-    let (wg, s) = (CONV_WORKGROUP, stride);
-    let r = CONV_PER_THREAD / s;
-    let tile = conv_tile(s);
+/// [`conv_tile`] consecutive outputs, an invocation `R` = `conv_per_thread / s` consecutive ones
+/// in registers. The kernel is consumed in chunks of taps whose weights and input window are
+/// staged in workgroup memory (zero outside the input, so the inner loop has no bounds checks).
+/// The inner loop takes `R` taps at a time from the `(R - 1) s + R` window values they touch,
+/// fully unrolled. Window slots skip one word every 32 so that the strided reads of neighbouring
+/// invocations fall into different banks.
+fn conv1d_tiled(stride: u32, tuning: &Tuning) -> String {
+    let (wg, s) = (tuning.conv_workgroup, stride);
+    let r = tuning.conv_per_thread / s;
+    let tile = conv_tile(s, tuning);
     // A multiple of `R`, so that padding a chunk to whole groups of `R` taps stays within it.
     let chunk = wg / r * r;
     let span = tile * s + chunk;
@@ -390,18 +384,18 @@ fn main(
 }
 
 /// Outputs one workgroup of the tiled convolution with `stride` computes.
-pub(crate) fn conv_tile(stride: u32) -> u32 {
-    CONV_WORKGROUP * (CONV_PER_THREAD / stride)
+pub(crate) fn conv_tile(stride: u32, tuning: &Tuning) -> u32 {
+    tuning.conv_workgroup * (tuning.conv_per_thread / stride)
 }
 
-fn fill_kernel(ty: &str) -> String {
+fn fill_kernel(ty: &str, wg: u32) -> String {
     format!(
         "struct Params {{ s: {ty} }}
 @group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
 @group(1) @binding(1) var<uniform> p: Params;
-@compute @workgroup_size({ELEMENTWISE_WORKGROUP})
+@compute @workgroup_size({wg})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {ELEMENTWISE_WORKGROUP}u;
+    let i = gid.x + gid.y * nwg.x * {wg}u;
     if (i >= luma.size.x) {{ return; }}
     out[i] = p.s;
 }}
@@ -410,15 +404,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 
 impl Builtin {
-    /// The WGSL source of this kernel for elements of type `ty` (`"f32"` or `"u32"`).
-    pub(crate) fn source(self, ty: &str) -> Cow<'static, str> {
+    /// The WGSL source of this kernel for elements of type `ty` (`"f32"` or `"u32"`), with the
+    /// parameters `tuning` gives for the GPU.
+    pub(crate) fn source(self, ty: &str, tuning: &Tuning) -> Cow<'static, str> {
+        let wg = tuning.elementwise_workgroup;
         match self {
-            Builtin::InPlaceArray(op) => in_place(ty, false, op.expr()).into(),
-            Builtin::InPlaceScalar(op) => in_place(ty, true, op.expr()).into(),
-            Builtin::Fill => fill_kernel(ty).into(),
+            Builtin::InPlaceArray(op) => in_place(ty, false, op.expr(), wg).into(),
+            Builtin::InPlaceScalar(op) => in_place(ty, true, op.expr(), wg).into(),
+            Builtin::Fill => fill_kernel(ty, wg).into(),
             Builtin::Reduce(ops, segmented) => reduce(ty, ops, segmented).into(),
             Builtin::Conv1d => include_str!("../operations/conv1d.wgsl").into(),
-            Builtin::Conv1dTiled(stride) => conv1d_tiled(stride).into(),
+            Builtin::Conv1dTiled(stride) => conv1d_tiled(stride, tuning).into(),
             Builtin::Fft(pass) => crate::fft::source(pass).into(),
         }
     }

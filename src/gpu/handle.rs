@@ -3,8 +3,8 @@ use wgpu::{Device, InstanceDescriptor, MemoryHints, PowerPreference, Queue};
 
 use crate::error::{LumaError, Result};
 
-/// Picks an adapter and opens a [Device] / [Queue] pair on it.
-pub(crate) async fn request_device() -> Result<(Device, Queue)> {
+/// Picks an adapter and opens a [Device] / [Queue] pair on it; also returns what the adapter is.
+pub(crate) async fn request_device() -> Result<(Device, Queue, wgpu::AdapterInfo)> {
     let mut instance_desc = InstanceDescriptor::new_without_display_handle();
     instance_desc.backends = wgpu::Backends::PRIMARY;
     let instance = wgpu::Instance::new(instance_desc);
@@ -28,7 +28,7 @@ pub(crate) async fn request_device() -> Result<(Device, Queue)> {
         required_features |= adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
     }
 
-    adapter
+    let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("Device 1"),
             required_features,
@@ -37,5 +37,6 @@ pub(crate) async fn request_device() -> Result<(Device, Queue)> {
             ..Default::default()
         })
         .await
-        .map_err(LumaError::RequestDevice)
+        .map_err(LumaError::RequestDevice)?;
+    Ok((device, queue, adapter.get_info()))
 }

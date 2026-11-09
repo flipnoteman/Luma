@@ -702,7 +702,7 @@ impl JitState {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(core));
         }
-        let source = codegen::source(&key);
+        let source = codegen::source(&key, ctx.tuning().elementwise_workgroup);
         let label = key.label();
         let core = Arc::new(kernel::build_core(
             ctx,
