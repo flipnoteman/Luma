@@ -239,6 +239,12 @@ fn flatten(root: &Arc<Node>, args: &[Src; 3], tail: Tail) -> Result<Fused, Failu
         flattener.emitted.push((Arc::as_ptr(&member.node), at));
     }
     flattener.emit(root.op(), args)?;
+    for member in &members {
+        member.node.fused.store(true, Ordering::Relaxed);
+    }
+    if matches!(tail, Tail::Reduce(_)) {
+        root.fused.store(true, Ordering::Relaxed);
+    }
     Ok(flattener.finish(tail))
 }
 

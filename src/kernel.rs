@@ -137,7 +137,7 @@ impl<'a> KernelBuilder<'a> {
         if let Some(core) = cache.get(&key) {
             return Ok(Kernel { ctx: self.ctx.clone(), core: core.clone() });
         }
-        let core = Arc::new(build_core(self.ctx, &key, self.label.as_deref())?);
+        let core = Arc::new(build_core(self.ctx, &key, self.label.as_deref(), false)?);
         cache.insert(key, core.clone());
         Ok(Kernel { ctx: self.ctx.clone(), core })
     }
@@ -154,7 +154,14 @@ fn reflect_kind(space: naga::AddressSpace) -> Option<BindingKind> {
     }
 }
 
-pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) -> Result<KernelCore> {
+/// Compiles `key` into a pipeline. `trusted` kernels are luma's own, whose every storage access
+/// is in bounds by construction; they are compiled without wgpu's per-access bounds checks.
+pub(crate) fn build_core(
+    ctx: &Context,
+    key: &KernelKey,
+    label: Option<&str>,
+    trusted: bool,
+) -> Result<KernelCore> {
     let combined = format!("{}\n{PRELUDE}", key.source);
     let module = naga::front::wgsl::parse_str(&combined)
         .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
@@ -317,16 +324,29 @@ pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) ->
         bind_group_layouts: &[Some(ctx.grid_layout()), Some(&args_layout)],
         immediate_size: 0,
     });
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    let shader_desc = wgpu::ShaderModuleDescriptor {
         label,
         source: wgpu::ShaderSource::Wgsl(combined.into()),
-    });
+    };
+    let shader = if trusted {
+        // SAFETY: luma's built-in and generated kernels index storage buffers only below the
+        // lengths they are launched with, which never exceed the bound ranges.
+        unsafe {
+            device.create_shader_module_trusted(shader_desc, wgpu::ShaderRuntimeChecks::unchecked())
+        }
+    } else {
+        device.create_shader_module(shader_desc)
+    };
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label,
         layout: Some(&pipeline_layout),
         module: &shader,
         entry_point: Some(&key.entry),
-        compilation_options: Default::default(),
+        // Trusted kernels write their workgroup memory before reading it.
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: !trusted,
+            ..Default::default()
+        },
         cache: None,
     });
 

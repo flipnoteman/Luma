@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use wgpu::{Buffer, BufferUsages};
 
 /// Smallest buffer the pool hands out. Also the size class of every dims/params buffer.
 const MIN_BUFFER_SIZE: u64 = 16;
 
-/// Upper bound on the bytes the pool keeps alive in idle buffers. Buffers returned beyond this
-/// are released to the driver instead of being retained.
+/// Upper bound on the bytes the pool keeps alive in idle buffers. Past it the least recently
+/// returned buffers are released, so the pool keeps what a loop is reusing right now.
 const MAX_POOLED_BYTES: u64 = 1 << 30;
 
 /// Size class for a buffer holding `bytes` bytes: the next power of two (at least
@@ -24,31 +24,57 @@ pub(crate) fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
     Some(class.min(max_size))
 }
 
-/// Free lists of idle buffers keyed by (size class, usage flags).
+/// Free lists of idle buffers keyed by (size class, usage flags), each oldest first.
 #[derive(Debug, Default)]
 pub(crate) struct BufferPool {
-    free: HashMap<(u64, BufferUsages), Vec<Buffer>>,
+    free: HashMap<(u64, BufferUsages), VecDeque<(u64, Buffer)>>,
     pooled_bytes: u64,
+    /// Stamps buffers in the order they were returned.
+    clock: u64,
 }
 
 impl BufferPool {
-    /// Takes an idle buffer of exactly `class` bytes with exactly `usage`, if one exists.
+    /// Takes the most recently returned idle buffer of exactly `class` bytes with exactly
+    /// `usage`, if one exists.
     pub(crate) fn take(&mut self, class: u64, usage: BufferUsages) -> Option<Buffer> {
-        let buffer = self.free.get_mut(&(class, usage))?.pop()?;
+        let (_, buffer) = self.free.get_mut(&(class, usage))?.pop_back()?;
         self.pooled_bytes -= class;
         Some(buffer)
     }
 
-    /// Returns a buffer to the pool, or drops it if the pool is full. The buffer must not be
-    /// mapped. Its contents are left as they are: whoever takes it next must overwrite what
-    /// it reads.
-    pub(crate) fn put(&mut self, buffer: Buffer) {
+    /// Returns a buffer to the pool and releases the least recently returned ones while the
+    /// pool holds more than [`MAX_POOLED_BYTES`]; those are returned. A buffer larger than the
+    /// limit is still kept as long as nothing else is pooled. The buffer must not be mapped.
+    /// Its contents are left as they are: whoever takes it next must overwrite what it reads.
+    pub(crate) fn put(&mut self, buffer: Buffer) -> Vec<Buffer> {
         let class = buffer.size();
-        if self.pooled_bytes + class > MAX_POOLED_BYTES {
-            return;
-        }
+        self.clock += 1;
         self.pooled_bytes += class;
-        self.free.entry((class, buffer.usage())).or_default().push(buffer);
+        self.free.entry((class, buffer.usage())).or_default().push_back((self.clock, buffer));
+        let mut released = Vec::new();
+        while self.pooled_bytes > MAX_POOLED_BYTES {
+            let oldest = self
+                .free
+                .iter()
+                .filter_map(|(key, list)| list.front().map(|(stamp, _)| (*stamp, *key)))
+                .min_by_key(|(stamp, _)| *stamp);
+            let Some((stamp, key)) = oldest else { break };
+            if stamp == self.clock {
+                // Only the buffer just returned is left.
+                break;
+            }
+            if let Some((_, old)) = self.free.get_mut(&key).and_then(VecDeque::pop_front) {
+                self.pooled_bytes -= key.0;
+                released.push(old);
+            }
+        }
+        released
+    }
+
+    /// Empties the pool, returning every idle buffer.
+    pub(crate) fn drain(&mut self) -> Vec<Buffer> {
+        self.pooled_bytes = 0;
+        self.free.drain().flat_map(|(_, list)| list.into_iter().map(|(_, b)| b)).collect()
     }
 }
 

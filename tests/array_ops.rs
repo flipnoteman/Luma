@@ -514,3 +514,49 @@ fn arrays_from_different_contexts_cannot_be_combined() {
     let err = (&a + &b).to_vec().unwrap_err();
     assert!(matches!(err.root(), LumaError::ContextMismatch), "got: {err}");
 }
+
+#[test]
+fn conv1d_matches_the_cpu_across_tile_and_chunk_boundaries() {
+    // Lengths straddle the outputs one workgroup computes and the taps staged at a time; tap
+    // counts that are not a multiple of the outputs per invocation; padding on both sides.
+    let cases = [(10_000usize, 300usize, 0usize), (9_001, 517, 7), (5_000, 1, 0), (4_113, 16, 2), (300, 260, 130)];
+    for (input_len, kernel_len, padding) in cases {
+        let input_data: Vec<f32> = (0..input_len).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01).collect();
+        let kernel_data: Vec<f32> = (0..kernel_len).map(|k| ((k * 13 % 29) as f32 - 14.0) * 0.05).collect();
+        let input = array(input_len, &input_data);
+        let kernel = array(kernel_len, &kernel_data);
+        let got = input.conv1d(&kernel, 1, padding).to_vec().unwrap();
+        let out_len = input_len + 2 * padding - kernel_len + 1;
+        assert_eq!(got.len(), out_len);
+        for (o, g) in got.iter().enumerate() {
+            let want: f32 = (0..kernel_len)
+                .filter_map(|k| {
+                    let at = (o + k).checked_sub(padding)?;
+                    input_data.get(at).map(|x| x * kernel_data[k])
+                })
+                .sum();
+            assert!((g - want).abs() < 1e-3, "{input_len}/{kernel_len}/{padding} at {o}: got {g}, want {want}");
+        }
+    }
+}
+
+#[test]
+fn fft_conv1d_matches_the_direct_sum_for_transforms_beyond_one_tile() {
+    // Transform sizes 2^12 (one column pass), 2^17 and 2^20 (two column passes).
+    for (input_len, kernel_len) in [(3_000usize, 50usize), (70_000, 300), (600_000, 1_000)] {
+        let input_data: Vec<f32> = (0..input_len).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let kernel_data: Vec<f32> = (0..kernel_len).map(|k| ((k * 13 % 29) as f32 - 14.0) / 14.0).collect();
+        let got = array(input_len, &input_data).conv1d_fft(&array(kernel_len, &kernel_data)).to_vec().unwrap();
+        assert_eq!(got.len(), input_len + kernel_len - 1);
+        let mut worst = 0.0f64;
+        for (o, g) in got.iter().enumerate() {
+            let lo = o.saturating_sub(input_len - 1);
+            let want: f64 = (lo..kernel_len.min(o + 1))
+                .map(|k| f64::from(input_data[o - k]) * f64::from(kernel_data[k]))
+                .sum();
+            worst = worst.max((f64::from(*g) - want).abs());
+        }
+        // Values are O(sqrt(kernel_len)); f32 transforms of 2^20 points stay within ~1e-4 of that.
+        assert!(worst < 1e-3 * (kernel_len as f64).sqrt(), "{input_len}/{kernel_len}: max error {worst}");
+    }
+}

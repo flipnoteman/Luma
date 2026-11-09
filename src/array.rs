@@ -325,8 +325,7 @@ impl<T: GpuType> Array<T> {
     /// while running the batch) comes out.
     pub fn to_vec(&self) -> Result<Vec<T>> {
         let (buffer, bytes) = self.ready().map_err(Failure::into_error)?;
-        let raw = self.ctx.read_bytes(buffer, bytes)?;
-        Ok(bytemuck::pod_collect_to_vec::<u8, T>(&raw))
+        self.ctx.read(buffer, bytes)
     }
 
     /// Records the array's pending computation, submits the batch and waits until the GPU has

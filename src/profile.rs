@@ -1,10 +1,11 @@
 //! GPU timing of kernel launches with timestamp queries.
 //!
 //! While profiling is enabled (see [`Context::profile`](crate::Context::profile)) every launch
-//! runs in a compute pass of its own whose start and end the GPU timestamps. At each submission
-//! the timestamps are resolved into a small readback buffer, which
-//! [`Context::finish_profiling`](crate::Context::finish_profiling) maps and aggregates by kernel
-//! label.
+//! runs in a compute pass of its own whose start and end the GPU timestamps, each launch into
+//! timestamps of its own (no query is written twice). They are resolved only in
+//! [`Context::finish_profiling`](crate::Context::finish_profiling), after all profiled work has
+//! completed: Metal writes counter samples late enough that a resolve in the same command
+//! buffer reads zeros or the samples of a later batch.
 
 use std::fmt;
 use std::sync::Arc;
@@ -12,10 +13,8 @@ use std::time::Duration;
 
 use wgpu::{Buffer, BufferUsages};
 
-use crate::context::BATCH_LIMIT;
-
-/// Timestamps (a begin and an end per launch) that fit in one batch.
-const QUERIES: u32 = BATCH_LIMIT * 2;
+/// Timestamps (a begin and an end per launch) of one query set; more launches get more sets.
+const QUERIES: u32 = 512;
 
 /// Bytes of one resolved timestamp.
 pub(crate) const TIMESTAMP_BYTES: u64 = 8;
@@ -130,62 +129,53 @@ impl fmt::Display for Profile {
     }
 }
 
-/// Timestamps of a submitted batch, waiting to be read back.
-#[derive(Debug)]
-pub(crate) struct Resolved {
-    pub(crate) staging: Buffer,
-    pub(crate) labels: Vec<Arc<str>>,
-}
-
 /// The state of an enabled profile on a context.
 #[derive(Debug)]
 pub(crate) struct Profiler {
-    query_set: wgpu::QuerySet,
-    /// Labels of the launches recorded in the pending batch, in order; launch `i` owns
-    /// timestamps `2 i` and `2 i + 1`.
-    labels: Vec<Arc<str>>,
-    /// Batches that were submitted but not read back yet.
-    pub(crate) resolved: Vec<Resolved>,
+    /// Query sets in use, each with the labels of the launches it timed; launch `i` of a set
+    /// owns timestamps `2 i` and `2 i + 1`.
+    sets: Vec<(wgpu::QuerySet, Vec<Arc<str>>)>,
 }
 
 impl Profiler {
-    pub(crate) fn new(device: &wgpu::Device) -> Self {
-        Profiler {
-            query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
-                label: Some("luma timestamps"),
-                ty: wgpu::QueryType::Timestamp,
-                count: QUERIES,
-            }),
-            labels: Vec::new(),
-            resolved: Vec::new(),
-        }
-    }
-
-    /// `true` if the pending batch holds as many launches as the query set has room for.
-    pub(crate) fn is_full(&self) -> bool {
-        self.labels.len() * 2 >= QUERIES as usize
+    pub(crate) fn new() -> Self {
+        Profiler { sets: Vec::new() }
     }
 
     /// Reserves the timestamps of a launch labelled `label` and returns the descriptor that makes
     /// the compute pass write them.
-    pub(crate) fn writes(&mut self, label: &Arc<str>) -> wgpu::ComputePassTimestampWrites<'_> {
-        let begin = (self.labels.len() * 2) as u32;
-        self.labels.push(Arc::clone(label));
+    pub(crate) fn writes(
+        &mut self,
+        device: &wgpu::Device,
+        label: &Arc<str>,
+    ) -> wgpu::ComputePassTimestampWrites<'_> {
+        if self.sets.last().is_none_or(|(_, labels)| labels.len() * 2 >= QUERIES as usize) {
+            let set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("luma timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: QUERIES,
+            });
+            self.sets.push((set, Vec::new()));
+        }
+        let Some((set, labels)) = self.sets.last_mut() else { unreachable!("a set was just added") };
+        let begin = (labels.len() * 2) as u32;
+        labels.push(Arc::clone(label));
         wgpu::ComputePassTimestampWrites {
-            query_set: &self.query_set,
+            query_set: set,
             beginning_of_pass_write_index: Some(begin),
             end_of_pass_write_index: Some(begin + 1),
         }
     }
 
-    /// Records the copy of the pending batch's timestamps into a readback buffer. Call before
-    /// the batch's encoder is finished.
-    pub(crate) fn resolve(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
-        if self.labels.is_empty() {
-            return;
-        }
-        let count = self.labels.len() as u32 * 2;
-        let bytes = u64::from(count) * TIMESTAMP_BYTES;
+    /// Records the copy of every timestamp into one readback buffer; returns it with the labels
+    /// of the launches, in timestamp order.
+    pub(crate) fn resolve(
+        self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> (Buffer, Vec<Arc<str>>) {
+        let total: u64 = self.sets.iter().map(|(_, labels)| labels.len() as u64 * 2).sum();
+        let bytes = (total * TIMESTAMP_BYTES).max(TIMESTAMP_BYTES);
         let resolved = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("luma timestamps resolved"),
             size: bytes,
@@ -198,11 +188,15 @@ impl Profiler {
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        encoder.resolve_query_set(&self.query_set, 0..count, &resolved, 0);
+        let mut offset = 0;
+        let mut all = Vec::new();
+        for (set, labels) in self.sets {
+            let count = labels.len() as u32 * 2;
+            encoder.resolve_query_set(&set, 0..count, &resolved, offset);
+            offset += u64::from(count) * TIMESTAMP_BYTES;
+            all.extend(labels);
+        }
         encoder.copy_buffer_to_buffer(&resolved, 0, &staging, 0, bytes);
-        self.resolved.push(Resolved {
-            staging,
-            labels: std::mem::take(&mut self.labels),
-        });
+        (staging, all)
     }
 }

@@ -92,17 +92,21 @@ dispatches piled up. Hundreds of small operations cost one submission, not hundr
 context) submits what is pending *without waiting*, so the GPU starts while the host keeps
 recording: flush after each chunk of a time-stepping loop and read results back only once in a
 while. Live lazy arrays (see below) count as recorded work: `flush` evaluates them first, each as
-one fused kernel, so the GPU starts on elementwise chains too. Only `sync` and the readbacks wait. Host uploads, `write`, and the values of
+one fused kernel, so the GPU starts on elementwise chains too; arrays already computed inside
+another fused kernel (the temporaries of `(&x * 2.0 + &y).sqrt().eval()`) are not computed again.
+Only `sync` and the readbacks wait. Host uploads, `write`, and the values of
 uniforms are recorded in order with the work around them, so reusing or overwriting an array never
 affects operations recorded before it.
 
 ## Elementwise chains are fused
 
-Operators, math functions, comparisons, `select`, `powf` and `clamp` do not run when you write
-them: they build an expression, and the array you get back is *lazy*. When something needs its
-data (`to_vec`, `eval`, `write`, a shift or convolution, a custom kernel, `Context::sync`), the
+Operators, math functions, comparisons, `select`, `powf`, `clamp` and `shift` do not run when you
+write them: they build an expression, and the array you get back is *lazy*. When something needs
+its data (`to_vec`, `eval`, `write`, a convolution, a custom kernel, `Context::sync`), the
 whole expression is compiled into **one** generated kernel that reads every input once and writes
 the result once, so `(&x * 2.0 + &y).sqrt() - 1.0` is a single dispatch with no temporaries.
+A shift evaluates the array it shifts and becomes a shifted read in the kernel that uses it, so a
+stencil step `&u + (u.shift(1) + u.shift(-1) - &u * 2.0) * 0.1` reads `u` once.
 Reductions fold the expression into their first pass: `(&a * &b).sum()?` never materializes the
 product (the `[f32; 2]`/`[f32; 4]` arrays above are never lazy; they reduce a buffer). Kernels are cached by the structure of the expression, so changing a scalar (`&x * dt`
 with a new `dt` every step) reuses the pipeline.
@@ -228,6 +232,8 @@ timestamp queries these return `LumaError::Profiling` and everything else keeps 
 cargo run --example double_test                 # expressions, select, reductions
 cargo run --example conv1d
 cargo run --release --example bench_conv1d      # spatial vs FFT convolution
+cargo run --release --example bench_perf -- 67108864   # GPU throughput of large-array workloads
+cargo run --release --example bench_vs_cpu     # the same workloads against every CPU core
 cargo run --release --example bench_batching    # sync after every op vs batched
 cargo run --release --example bench_launch      # host cost per kernel launch, flush overlap
 cargo run --release --example bench_fusion      # one kernel per operation vs fused chains

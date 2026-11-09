@@ -3,6 +3,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
+use bytemuck::Pod;
+
 use wgpu::{BindGroupEntry, BindingResource, Buffer, BufferBinding, BufferUsages};
 
 use crate::builtin::Builtin;
@@ -12,7 +14,7 @@ use crate::gpu::handle;
 use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::pool::{self, BufferPool};
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
-use crate::profile::{Profile, Profiler, TIMESTAMP_BYTES};
+use crate::profile::{Profile, Profiler};
 
 /// Usage of every array storage buffer (and the scratch buffers of multi-pass operations, so they
 /// share a pool class).
@@ -25,6 +27,34 @@ const UNIFORM_USAGE: BufferUsages = BufferUsages::UNIFORM.union(BufferUsages::CO
 
 /// Usage of readback buffers.
 const STAGING_USAGE: BufferUsages = BufferUsages::MAP_READ.union(BufferUsages::COPY_DST);
+
+/// Usage of upload staging buffers.
+const UPLOAD_USAGE: BufferUsages = BufferUsages::MAP_WRITE.union(BufferUsages::COPY_SRC);
+
+/// Most bytes of idle (mapped) upload staging buffers kept for reuse.
+const MAX_FREE_UPLOAD_BYTES: u64 = 1 << 30;
+
+/// Mapped upload staging buffers ready to be written.
+#[derive(Debug, Default)]
+struct FreeUploads {
+    buffers: Vec<Buffer>,
+    bytes: u64,
+}
+
+impl FreeUploads {
+    fn take(&mut self, size: u64) -> Option<Buffer> {
+        let at = self.buffers.iter().position(|buffer| buffer.size() == size)?;
+        self.bytes -= size;
+        Some(self.buffers.swap_remove(at))
+    }
+
+    fn put(&mut self, buffer: Buffer) {
+        if self.bytes + buffer.size() <= MAX_FREE_UPLOAD_BYTES {
+            self.bytes += buffer.size();
+            self.buffers.push(buffer);
+        }
+    }
+}
 
 /// Number of dispatches after which the pending batch is submitted without waiting for a sync
 /// point. Bounds how much work piles up in one command buffer.
@@ -183,6 +213,18 @@ struct BindGroupCache {
     len: usize,
 }
 
+impl BindGroupCache {
+    /// Drops the groups binding any of `buffers`, so that the cache does not keep them alive.
+    /// Invalidates indices into buckets: only call it while nothing is bound.
+    fn forget(&mut self, buffers: &[Buffer]) {
+        self.buckets.retain(|_, bucket| {
+            bucket.retain(|group| !group.entries.iter().any(|(b, _)| buffers.contains(b)));
+            !bucket.is_empty()
+        });
+        self.len = self.buckets.values().map(Vec::len).sum();
+    }
+}
+
 /// What the open compute pass has bound; launches skip what is already in place.
 #[derive(Debug, Default, Clone, Copy)]
 struct Bound {
@@ -210,6 +252,8 @@ struct Batch {
     bind_groups: BindGroupCache,
     /// Dynamic offsets of the launch being recorded (kept to reuse its allocation).
     offsets: Vec<u32>,
+    /// Upload staging buffers copied from in this batch; mapped again once it is submitted.
+    uploads: Vec<Buffer>,
     /// Present while profiling is enabled.
     profiler: Option<Profiler>,
 }
@@ -225,6 +269,11 @@ struct Inner {
     /// Custom kernels, built on first use of their (source, entry, workgroup).
     kernels: Mutex<FxMap<KernelKey, Arc<KernelCore>>>,
     pool: Mutex<BufferPool>,
+    /// Buffers the pool released; the cached bind groups still holding them are dropped at the
+    /// next submission, which frees them.
+    released: Mutex<Vec<Buffer>>,
+    /// Mapped upload staging buffers, refilled by the map callbacks of submitted ones.
+    uploads: Arc<Mutex<FreeUploads>>,
     batch: Mutex<Batch>,
     /// The first error the GPU reported outside of a call that could return it.
     gpu_error: Arc<Mutex<Option<String>>>,
@@ -339,6 +388,7 @@ impl Context {
             grid_slots: Vec::new(),
             bind_groups: BindGroupCache::default(),
             offsets: Vec::new(),
+            uploads: Vec::new(),
             profiler: None,
         };
 
@@ -355,6 +405,8 @@ impl Context {
                 jit: JitState::new(&limits),
                 kernels: Mutex::new(FxMap::default()),
                 pool: Mutex::new(BufferPool::default()),
+                released: Mutex::new(Vec::new()),
+                uploads: Arc::new(Mutex::new(FreeUploads::default())),
                 batch: Mutex::new(batch),
                 gpu_error,
                 grid_layout,
@@ -392,7 +444,8 @@ impl Context {
     /// Lazy arrays that are still alive count as recorded work: `flush` evaluates them first (each
     /// as one fused kernel, so a chain is only cut at the flush point), which makes the GPU start
     /// on elementwise expressions too. Expressions whose arrays were already dropped are never
-    /// evaluated.
+    /// evaluated, nor are arrays already computed inside another node's fused kernel (usually
+    /// the temporaries of an expression).
     ///
     /// Only [`Context::sync`] and the operations that read results back
     /// ([`Array::to_vec`](crate::Array::to_vec), [`Array::eval`](crate::Array::eval),
@@ -449,11 +502,21 @@ impl Context {
             // In-flight work keeps what it uses alive; this only drops our references.
             batch.bind_groups = BindGroupCache::default();
         }
-        if let Some(mut encoder) = batch.encoder.take() {
-            if let Some(profiler) = &mut batch.profiler {
-                profiler.resolve(self.device(), &mut encoder);
-            }
+        let released = std::mem::take(&mut *lock(&self.inner.released));
+        if !released.is_empty() {
+            batch.bind_groups.forget(&released);
+        }
+        if let Some(encoder) = batch.encoder.take() {
             self.queue().submit(Some(encoder.finish()));
+        }
+        for staging in batch.uploads.drain(..) {
+            let free = Arc::clone(&self.inner.uploads);
+            let buffer = staging.clone();
+            staging.slice(..).map_async(wgpu::MapMode::Write, move |result| {
+                if result.is_ok() {
+                    lock(&free).put(buffer);
+                }
+            });
         }
     }
 
@@ -498,7 +561,7 @@ impl Context {
         }
         let key = KernelKey::new(op.source(ty).into_owned(), "main", None);
         let label = format!("{op:?} {ty}");
-        let core = Arc::new(kernel::build_core(self, &key, Some(&label))?);
+        let core = Arc::new(kernel::build_core(self, &key, Some(&label), true)?);
         cache.insert((op, ty), Arc::clone(&core));
         Ok(core)
     }
@@ -514,17 +577,30 @@ impl Context {
         if let Some(buffer) = lock(&self.inner.pool).take(class, usage) {
             return Ok(buffer);
         }
+        if let Some(buffer) = self.create_buffer(class, usage) {
+            return Ok(buffer);
+        }
+        // Out of memory: give back every idle buffer and the bind groups pinning them, then
+        // try once more.
+        let idle = lock(&self.inner.pool).drain();
+        lock(&self.inner.released).extend(idle);
+        self.flush_locked(&mut *self.batch()?);
+        self.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| LumaError::Poll(Arc::new(e)))?;
+        self.create_buffer(class, usage).ok_or(LumaError::OutOfMemory { requested: class })
+    }
+
+    /// A new buffer, or `None` if the device is out of memory.
+    fn create_buffer(&self, size: u64, usage: BufferUsages) -> Option<Buffer> {
         let scope = self.device().push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let buffer = self.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("luma buffer"),
-            size: class,
+            size,
             usage,
             mapped_at_creation: false,
         });
-        if pollster::block_on(scope.pop()).is_some() {
-            return Err(LumaError::OutOfMemory { requested: class });
-        }
-        Ok(buffer)
+        pollster::block_on(scope.pop()).is_none().then_some(buffer)
     }
 
     /// Returns a buffer from [`Context::alloc_buffer`] to the pool.
@@ -535,27 +611,43 @@ impl Context {
     /// to pooled buffers outside the stream (`Queue::write_buffer` is only used for uniform
     /// slots, which are never pooled).
     pub(crate) fn recycle(&self, buffer: Buffer) {
-        lock(&self.inner.pool).put(buffer);
+        let released = lock(&self.inner.pool).put(buffer);
+        if !released.is_empty() {
+            lock(&self.inner.released).extend(released);
+        }
     }
 
     /// Records a copy of `data` into the start of `dst`, ordered after everything recorded so
     /// far. `data.len()` must be a multiple of 4.
+    ///
+    /// The bytes go through a mappable staging buffer. Those are reused: once the batch that
+    /// copies out of one is submitted it is mapped again, and the next upload of its size class
+    /// writes straight into it.
     pub(crate) fn upload(&self, dst: &Buffer, data: &[u8]) -> Result<()> {
-        let staging = self.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("luma upload"),
-            size: data.len() as u64,
-            usage: BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
+        let bytes = data.len() as u64;
+        let max = self.inner.max_buffer_bytes;
+        let class = pool::size_class(bytes, max)
+            .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        let reused = lock(&self.inner.uploads).take(class);
+        let staging = match reused {
+            Some(buffer) => buffer,
+            None => self.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("luma upload"),
+                size: class,
+                usage: UPLOAD_USAGE,
+                mapped_at_creation: true,
+            }),
+        };
         {
-            let mut view = staging.get_mapped_range_mut(..).map_err(LumaError::MapRange)?;
+            let mut view = staging.get_mapped_range_mut(..bytes).map_err(LumaError::MapRange)?;
             view.copy_from_slice(data);
         }
         staging.unmap();
 
         let mut guard = self.batch()?;
         let encoder = self.encoder(&mut guard);
-        encoder.copy_buffer_to_buffer(&staging, 0, dst, 0, data.len() as u64);
+        encoder.copy_buffer_to_buffer(&staging, 0, dst, 0, bytes);
+        guard.uploads.push(staging);
         Ok(())
     }
 
@@ -579,8 +671,8 @@ impl Context {
     }
 
     /// Records a copy of the first `bytes` bytes of `buffer`, submits the batch and waits for the
-    /// bytes to arrive.
-    pub(crate) fn read_bytes(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<u8>> {
+    /// data to arrive.
+    pub(crate) fn read<T: Pod>(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<T>> {
         let staging = self.alloc_buffer(bytes, STAGING_USAGE)?;
         {
             let mut guard = self.batch()?;
@@ -594,7 +686,7 @@ impl Context {
 
     /// Waits for the GPU and returns the first `bytes` bytes of `staging`, a `MAP_READ` buffer
     /// whose contents were copied in by a submitted batch.
-    fn map_read(&self, staging: &Buffer, bytes: u64) -> Result<Vec<u8>> {
+    fn map_read<T: Pod>(&self, staging: &Buffer, bytes: u64) -> Result<Vec<T>> {
         let slice = staging.slice(..bytes);
         let (sender, receiver) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -613,7 +705,11 @@ impl Context {
         self.take_gpu_error()?;
         mapped?;
 
-        let result = slice.get_mapped_range().map(|view| view.to_vec());
+        // One copy, straight into the result (mapped ranges are aligned for any element type).
+        let result = slice.get_mapped_range().map(|view| match bytemuck::try_cast_slice::<u8, T>(&view) {
+            Ok(values) => values.to_vec(),
+            Err(_) => bytemuck::pod_collect_to_vec(&view),
+        });
         staging.unmap();
         result.map_err(LumaError::MapRange)
     }
@@ -632,9 +728,6 @@ impl Context {
         check_aliasing(args)?;
 
         let mut guard = self.batch()?;
-        if guard.profiler.as_ref().is_some_and(Profiler::is_full) {
-            self.flush_locked(&mut guard);
-        }
         self.record_launch(&mut guard, kernel, workgroups, size, args)?;
         if guard.dispatches >= BATCH_LIMIT {
             self.flush_locked(&mut guard);
@@ -656,7 +749,7 @@ impl Context {
         let inner = &*self.inner;
         let device = &inner.device;
         let align = inner.uniform_align;
-        let Batch { encoder, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler } =
+        let Batch { encoder, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler, .. } =
             batch;
 
         // Uniform values go into fresh arena slots, all of this launch's in one chunk. The grid
@@ -768,7 +861,7 @@ impl Context {
         let pass_slot = pass;
         let pass = pass_slot.get_or_insert_with(|| {
             *bound = Bound::default();
-            let timestamp_writes = profiler.as_mut().map(|p| p.writes(&kernel.label));
+            let timestamp_writes = profiler.as_mut().map(|p| p.writes(device, &kernel.label));
             encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes })
                 .forget_lifetime()
@@ -816,7 +909,7 @@ impl Context {
         }
         let mut batch = self.batch()?;
         if batch.profiler.is_none() {
-            batch.profiler = Some(Profiler::new(self.device()));
+            batch.profiler = Some(Profiler::new());
         }
         Ok(())
     }
@@ -830,28 +923,29 @@ impl Context {
         // Lazy arrays still alive were computed inside the profiled region; record their fused
         // kernels while the profiler is still on.
         self.jit().evaluate_live();
-        let resolved = {
+        let profiler = {
             let mut batch = self.batch()?;
-            if batch.profiler.is_none() {
+            let Some(profiler) = batch.profiler.take() else {
                 return Err(LumaError::Profiling("profiling is not enabled".into()));
-            }
+            };
             self.flush_locked(&mut batch);
-            match batch.profiler.take() {
-                Some(profiler) => profiler.resolved,
-                None => Vec::new(),
-            }
+            profiler
         };
         self.sync()?;
 
+        // Everything profiled has completed; only now are its timestamps reliably written.
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma timestamps") });
+        let (staging, labels) = profiler.resolve(self.device(), &mut encoder);
+        self.queue().submit(Some(encoder.finish()));
+        let stamps: Vec<u64> = self.map_read(&staging, staging.size())?;
+
         let period = f64::from(self.queue().get_timestamp_period());
         let mut samples = Vec::new();
-        for batch in resolved {
-            let bytes = self.map_read(&batch.staging, batch.labels.len() as u64 * 2 * TIMESTAMP_BYTES)?;
-            let stamps = bytemuck::pod_collect_to_vec::<u8, u64>(&bytes);
-            for (label, &[begin, end]) in batch.labels.iter().zip(stamps.as_chunks::<2>().0) {
-                let nanos = end.saturating_sub(begin) as f64 * period;
-                samples.push((Arc::clone(label), Duration::from_secs_f64(nanos * 1e-9)));
-            }
+        for (label, &[begin, end]) in labels.iter().zip(stamps.as_chunks::<2>().0) {
+            let nanos = end.saturating_sub(begin) as f64 * period;
+            samples.push((Arc::clone(label), Duration::from_secs_f64(nanos * 1e-9)));
         }
         Ok(Profile::from_samples(samples))
     }

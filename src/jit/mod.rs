@@ -1,7 +1,8 @@
 //! Lazy evaluation and fusion of elementwise operations.
 //!
-//! Elementwise operations (operators, math functions, comparisons, `select`, `powf`, `clamp`)
-//! do not run when they are written. They add a [`Node`] to a graph of pending expressions, and
+//! Elementwise operations (operators, math functions, comparisons, `select`, `powf`, `clamp`,
+//! and shifts as shifted reads of an evaluated array) do not run when they are written. They add
+//! a [`Node`] to a graph of pending expressions, and
 //! the resulting array is *lazy*. Everything that can fail on shapes, contexts or poisoned
 //! operands is still checked when the node is created, so errors and their source locations
 //! behave as they would without laziness.
@@ -45,7 +46,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::panic::Location;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use crate::array::{Failure, Storage};
@@ -110,13 +111,28 @@ pub(crate) enum OpKind {
     Clamp,
     /// `mask != 0 ? a : b`; operands: mask (`u32`), a, b.
     Select,
+    /// Circular shift of a materialized array; operand 0 is its buffer (see [`ShiftKind`]).
+    Shift(ShiftKind),
+}
+
+/// Which element a shift reads for element `i`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum ShiftKind {
+    /// `(i - s) mod n` over the flat array; `s` (in `0..n`) is the scalar operand 1.
+    Linear,
+    /// Every dimension of an array of `dims` shifted circularly by `shifts` (each in
+    /// `0..dim`). Part of the kernel's key, so the index math works on constants.
+    Dims { dims: [u32; 4], shifts: [u32; 4] },
 }
 
 impl OpKind {
     pub(crate) fn arity(self) -> usize {
         match self {
-            OpKind::Unary(_) => 1,
-            OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Powf => 2,
+            OpKind::Unary(_) | OpKind::Shift(ShiftKind::Dims { .. }) => 1,
+            OpKind::Binary(_)
+            | OpKind::Compare(_)
+            | OpKind::Powf
+            | OpKind::Shift(ShiftKind::Linear) => 2,
             OpKind::Clamp | OpKind::Select => 3,
         }
     }
@@ -144,7 +160,7 @@ impl Op {
     /// The element type operand `index` must have.
     pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
         match (self.kind, index) {
-            (OpKind::Select, 0) => ElemTy::U32,
+            (OpKind::Select, 0) | (OpKind::Shift(_), 1) => ElemTy::U32,
             _ => self.ty,
         }
     }
@@ -217,6 +233,9 @@ pub(crate) struct Node {
     inputs: Box<[u64]>,
     /// Number of nodes this one is an operand of (a pre-filter for sharing checks).
     consumers: AtomicU32,
+    /// Set once the node's value was computed inside another node's kernel (or a reduction).
+    /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
+    fused: AtomicBool,
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
 }
@@ -426,6 +445,7 @@ pub(crate) fn create(
         below: below.into_boxed_slice(),
         inputs: inputs.into_boxed_slice(),
         consumers: AtomicU32::new(0),
+        fused: AtomicBool::new(false),
         readers: Readers::default(),
     });
 
@@ -606,7 +626,9 @@ impl JitState {
         };
         for weak in nodes.into_iter().rev() {
             if let Some(node) = weak.upgrade() {
-                let _ = node.force();
+                if !node.fused.load(Ordering::Relaxed) {
+                    let _ = node.force();
+                }
             }
         }
     }
@@ -624,6 +646,7 @@ impl JitState {
             ctx,
             &KernelKey::new(source, "main", None),
             Some(&label),
+            true,
         )?);
         self.stats.built.fetch_add(1, Ordering::Relaxed);
         cache.insert(key, Arc::clone(&core));

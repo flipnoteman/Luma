@@ -3,8 +3,8 @@
 //!
 //! Elementwise operations on arrays are not kernels of their own: they are recorded lazily and
 //! fused into generated kernels, see [`crate::jit`]. What is left here are the in-place
-//! operators, fills, shifts, the reduction passes over partial results, and the convolution and
-//! FFT passes (embedded shader files). Every kernel declares its arguments in `@group(1)` and
+//! operators, fills, the reduction passes over partial results, and the convolution and FFT
+//! passes (generated here, in [`crate::fft`] and `operations/`). Every kernel declares its arguments in `@group(1)` and
 //! uses the `luma` grid uniform of the prelude.
 
 use std::borrow::Cow;
@@ -18,6 +18,14 @@ pub(crate) const REDUCE_WORKGROUP: u32 = 256;
 pub(crate) const REDUCE_PER_THREAD: u32 = 4;
 /// Number of input elements one reduction workgroup consumes.
 pub(crate) const REDUCE_BLOCK: u32 = REDUCE_WORKGROUP * REDUCE_PER_THREAD;
+/// Invocations of the tiled convolution, and how many consecutive outputs each computes.
+const CONV_WORKGROUP: u32 = 256;
+const CONV_PER_THREAD: u32 = 16;
+/// Outputs one workgroup of the tiled convolution computes.
+pub(crate) const CONV_TILE: u32 = CONV_WORKGROUP * CONV_PER_THREAD;
+/// Taps staged in workgroup memory at a time (one per invocation, a multiple of the outputs per
+/// invocation).
+const CONV_CHUNK: u32 = CONV_WORKGROUP;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum UnOp {
@@ -127,18 +135,15 @@ pub(crate) enum Builtin {
     InPlaceScalar(BinOp),
     /// `out[i] = s`; arguments: out, uniform scalar.
     Fill,
-    /// Circular shift; arguments: out, a, uniform `{dims, shifts}`.
-    Shift,
     /// One reduction pass: each workgroup reduces `REDUCE_BLOCK` elements of `a` into one element
     /// of `out`; arguments: out, a, uniform `{n}`.
     Reduce(ReduceOp),
+    /// Direct convolution, one output per invocation; any stride.
     Conv1d,
-    FftBitReverse,
-    FftButterfly,
-    FftComplexMul,
-    IfftButterfly,
-    FftExtractReal,
-    FftComplexBitReverse,
+    /// Direct convolution with stride 1, tiled; [`CONV_TILE`] outputs per workgroup.
+    Conv1dTiled,
+    /// One pass of the FFT convolution, see [`crate::fft`].
+    Fft(crate::fft::FftPass),
 }
 
 /// `a[i] = a[i] op b[i]` (or `a[i] op p.s` with `scalar`).
@@ -178,9 +183,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 
 fn reduce(ty: &str, op: ReduceOp) -> String {
     // Out-of-range loads: sums read zero, min/max re-read the last element (harmless for them).
+    // Loads stay in bounds: trusted kernels run without bounds checks.
     let (load, combine) = match op {
-        ReduceOp::Sum => ("select(zero, a[idx], idx < p.n)", "u + v"),
-        ReduceOp::SumSquares => ("select(zero, a[idx] * a[idx], idx < p.n)", "u + v"),
+        ReduceOp::Sum => ("select(zero, a[min(idx, p.n - 1u)], idx < p.n)", "u + v"),
+        ReduceOp::SumSquares => {
+            ("select(zero, a[min(idx, p.n - 1u)] * a[min(idx, p.n - 1u)], idx < p.n)", "u + v")
+        }
         ReduceOp::Min => ("a[min(idx, p.n - 1u)]", "min(u, v)"),
         ReduceOp::Max => ("a[min(idx, p.n - 1u)]", "max(u, v)"),
     };
@@ -227,6 +235,79 @@ fn main(
     )
 }
 
+/// Stride-1 direct convolution, tiled. A workgroup computes [`CONV_TILE`] consecutive outputs,
+/// an invocation `R` = [`CONV_PER_THREAD`] consecutive ones in registers. The kernel is consumed
+/// in chunks of [`CONV_CHUNK`] taps whose weights and input window are staged in workgroup
+/// memory (zero outside the input, so the inner loop has no bounds checks). The inner loop
+/// takes `R` taps at a time from `2R - 1` window values: `R * R` FMAs per `3R - 1` loads, fully
+/// unrolled here. Window slots skip one word every 32 so that the `R`-strided reads of
+/// neighbouring invocations fall into different banks.
+fn conv1d_tiled() -> String {
+    let (wg, r, tile, chunk) = (CONV_WORKGROUP, CONV_PER_THREAD, CONV_TILE, CONV_CHUNK);
+    let window = (tile + chunk) + (tile + chunk) / 32 + 1;
+    let mut acc = String::new();
+    let mut loads = String::new();
+    let mut fmas = String::new();
+    let mut stores = String::new();
+    for i in 0..r {
+        acc.push_str(&format!("    var acc{i} = 0.0;\n"));
+        loads.push_str(&format!("            let w{i} = weights[k + {i}u];\n"));
+        stores.push_str(&format!(
+            "    if (o + {i}u < params.output_len) {{ output[o + {i}u] = acc{i}; }}\n"
+        ));
+    }
+    for j in 0..2 * r - 1 {
+        loads.push_str(&format!("            let v{j} = window[slot(at + {j}u)];\n"));
+    }
+    for kk in 0..r {
+        for i in 0..r {
+            fmas.push_str(&format!("            acc{i} = fma(v{}, w{kk}, acc{i});\n", i + kk));
+        }
+    }
+    format!(
+        "struct Params {{ kernel_len: u32, stride: u32, padding: u32, input_len: u32, output_len: u32 }}
+@group(1) @binding(0) var<storage, read_write> output: array<f32>;
+@group(1) @binding(1) var<storage, read> input_data: array<f32>;
+@group(1) @binding(2) var<storage, read> kernel: array<f32>;
+@group(1) @binding(3) var<uniform> params: Params;
+
+var<workgroup> window: array<f32, {window}>;
+var<workgroup> weights: array<f32, {chunk}>;
+
+fn slot(i: u32) -> u32 {{ return i + (i >> 5u); }}
+
+@compute @workgroup_size({wg})
+fn main(
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let first = (wid.x + wid.y * nwg.x) * {tile}u;
+    if (first >= params.output_len) {{ return; }}
+    let start = i32(first) - i32(params.padding);
+    let base = lid * {r}u;
+{acc}    for (var c = 0u; c < params.kernel_len; c = c + {chunk}u) {{
+        let taps = min({chunk}u, params.kernel_len - c);
+        let padded = (taps + {r}u - 1u) / {r}u * {r}u;
+        weights[lid] = select(0.0, kernel[min(c + lid, params.kernel_len - 1u)], lid < taps);
+        for (var j = lid; j < {tile}u + padded; j = j + {wg}u) {{
+            let g = start + i32(c + j);
+            var v = 0.0;
+            if (g >= 0 && u32(g) < params.input_len) {{ v = input_data[u32(g)]; }}
+            window[slot(j)] = v;
+        }}
+        workgroupBarrier();
+        for (var k = 0u; k < padded; k = k + {r}u) {{
+            let at = base + k;
+{loads}{fmas}        }}
+        workgroupBarrier();
+    }}
+    let o = first + base;
+{stores}}}
+"
+    )
+}
+
 fn fill_kernel(ty: &str) -> String {
     format!(
         "struct Params {{ s: {ty} }}
@@ -242,33 +323,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     )
 }
 
-fn shift_kernel(ty: &str) -> String {
-    // out[c] = a[(c - shift) mod dims]; shifts are normalized to 0..dims on the host.
-    format!(
-        "struct Params {{ dims: vec4<u32>, shifts: vec4<u32> }}
-@group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
-@group(1) @binding(1) var<storage, read> a: array<{ty}>;
-@group(1) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size({ELEMENTWISE_WORKGROUP})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {ELEMENTWISE_WORKGROUP}u;
-    if (i >= luma.size.x) {{ return; }}
-    let c0 = i % p.dims.x;
-    let r1 = i / p.dims.x;
-    let c1 = r1 % p.dims.y;
-    let r2 = r1 / p.dims.y;
-    let c2 = r2 % p.dims.z;
-    let c3 = r2 / p.dims.z;
-    let s0 = (c0 + p.dims.x - p.shifts.x) % p.dims.x;
-    let s1 = (c1 + p.dims.y - p.shifts.y) % p.dims.y;
-    let s2 = (c2 + p.dims.z - p.shifts.z) % p.dims.z;
-    let s3 = (c3 + p.dims.w - p.shifts.w) % p.dims.w;
-    out[i] = a[s0 + p.dims.x * (s1 + p.dims.y * (s2 + p.dims.z * s3))];
-}}
-"
-    )
-}
-
 impl Builtin {
     /// The WGSL source of this kernel for elements of type `ty` (`"f32"` or `"u32"`).
     pub(crate) fn source(self, ty: &str) -> Cow<'static, str> {
@@ -276,17 +330,10 @@ impl Builtin {
             Builtin::InPlaceArray(op) => in_place(ty, false, op.expr()).into(),
             Builtin::InPlaceScalar(op) => in_place(ty, true, op.expr()).into(),
             Builtin::Fill => fill_kernel(ty).into(),
-            Builtin::Shift => shift_kernel(ty).into(),
             Builtin::Reduce(op) => reduce(ty, op).into(),
             Builtin::Conv1d => include_str!("../operations/conv1d.wgsl").into(),
-            Builtin::FftBitReverse => include_str!("../operations/fft_bit_reverse.wgsl").into(),
-            Builtin::FftButterfly => include_str!("../operations/fft_butterfly.wgsl").into(),
-            Builtin::FftComplexMul => include_str!("../operations/fft_complex_mul.wgsl").into(),
-            Builtin::IfftButterfly => include_str!("../operations/ifft_butterfly.wgsl").into(),
-            Builtin::FftExtractReal => include_str!("../operations/fft_extract_real.wgsl").into(),
-            Builtin::FftComplexBitReverse => {
-                include_str!("../operations/fft_complex_bit_reverse.wgsl").into()
-            }
+            Builtin::Conv1dTiled => conv1d_tiled().into(),
+            Builtin::Fft(pass) => crate::fft::source(pass).into(),
         }
     }
 }

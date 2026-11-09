@@ -4,10 +4,11 @@
 use std::panic::Location;
 
 use crate::array::{Array, Failure};
-use crate::builtin::Builtin;
+use crate::builtin::{Builtin, CONV_TILE};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
-use crate::ops::launch_1d;
+use crate::fft;
+use crate::ops::{fold_workgroups, launch_1d};
 use crate::shape::Shape;
 
 type Outcome<T> = std::result::Result<T, Failure>;
@@ -92,18 +93,20 @@ fn run_conv1d(
     let (out_buf, out_bytes) = output.ready()?;
     let (in_buf, in_bytes) = input.ready()?;
     let (k_buf, k_bytes) = kernel.ready()?;
-    let core = ctx.builtin(Builtin::Conv1d, "f32")?;
-    launch_1d(
-        ctx,
-        &core,
-        params[4],
-        &[
-            RawArg::write(out_buf, out_bytes),
-            RawArg::read(in_buf, in_bytes),
-            RawArg::read(k_buf, k_bytes),
-            RawArg::Uniform(bytemuck::bytes_of(&params)),
-        ],
-    )?;
+    let args = [
+        RawArg::write(out_buf, out_bytes),
+        RawArg::read(in_buf, in_bytes),
+        RawArg::read(k_buf, k_bytes),
+        RawArg::Uniform(bytemuck::bytes_of(&params)),
+    ];
+    if stride == 1 {
+        let core = ctx.builtin(Builtin::Conv1dTiled, "f32")?;
+        let groups = fold_workgroups(ctx, params[4].div_ceil(CONV_TILE))?;
+        ctx.launch(&core, groups, [params[4], 1, 1], &args)?;
+    } else {
+        let core = ctx.builtin(Builtin::Conv1d, "f32")?;
+        launch_1d(ctx, &core, params[4], &args)?;
+    }
     Ok(output)
 }
 
@@ -118,118 +121,16 @@ fn run_conv1d_fft(input: &Array<f32>, kernel: &Array<f32>) -> Outcome<Array<f32>
         .ok()
         .and_then(u32::checked_next_power_of_two)
         .ok_or(LumaError::DimensionTooLarge { shape: [output_len, 1, 1, 1] })?;
-    let log2n = n.trailing_zeros();
 
     let output = Array::<f32>::alloc(ctx, Shape::from(output_len))?;
     let (out_buf, out_bytes) = output.ready()?;
     let (in_buf, in_bytes) = input.ready()?;
     let (k_buf, k_bytes) = kernel.ready()?;
-
-    let mut scratch = Scratch::new(ctx);
-
-    // Complex buffers (interleaved re/im, so 2*N f32s each). Every pass writes all N entries of
-    // the buffer it produces, so stale pool contents never leak into the result.
-    let complex_bytes = u64::from(n) * 2 * 4;
-    let input_fft = scratch.take(complex_bytes)?;
-    let kernel_fft = scratch.take(complex_bytes)?;
-    let product = scratch.take(complex_bytes)?;
-
-    let bit_reverse = ctx.builtin(Builtin::FftBitReverse, "f32")?;
-    let butterfly = ctx.builtin(Builtin::FftButterfly, "f32")?;
-    let complex_mul = ctx.builtin(Builtin::FftComplexMul, "f32")?;
-    let complex_bit_reverse = ctx.builtin(Builtin::FftComplexBitReverse, "f32")?;
-    let ibutterfly = ctx.builtin(Builtin::IfftButterfly, "f32")?;
-    let extract_real = ctx.builtin(Builtin::FftExtractReal, "f32")?;
-
-    // --- Pass 1: Bit-reverse input ---
-    launch_1d(
-        ctx,
-        &bit_reverse,
-        n,
-        &[
-            RawArg::write(&input_fft, complex_bytes),
-            RawArg::read(in_buf, in_bytes),
-            RawArg::Uniform(bytemuck::bytes_of(&[n, input_len])),
-        ],
-    )?;
-
-    // --- Pass 2: Bit-reverse kernel ---
-    launch_1d(
-        ctx,
-        &bit_reverse,
-        n,
-        &[
-            RawArg::write(&kernel_fft, complex_bytes),
-            RawArg::read(k_buf, k_bytes),
-            RawArg::Uniform(bytemuck::bytes_of(&[n, kernel_len])),
-        ],
-    )?;
-
-    // --- Pass 3 + 4: FFT butterfly on input, then kernel (log2(N) stages each) ---
-    for fft_buffer in [&input_fft, &kernel_fft] {
-        for stage in 0..log2n {
-            launch_1d(
-                ctx,
-                &butterfly,
-                n / 2,
-                &[
-                    RawArg::write(fft_buffer, complex_bytes),
-                    RawArg::Uniform(bytemuck::bytes_of(&[n, stage])),
-                ],
-            )?;
-        }
-    }
-
-    // --- Pass 5: Complex multiply ---
-    launch_1d(
-        ctx,
-        &complex_mul,
-        n,
-        &[
-            RawArg::write(&product, complex_bytes),
-            RawArg::read(&input_fft, complex_bytes),
-            RawArg::read(&kernel_fft, complex_bytes),
-            RawArg::Uniform(bytemuck::bytes_of(&[n])),
-        ],
-    )?;
-
-    // --- Pass 6: Complex bit-reverse product -> input_fft (reused) for IFFT ---
-    launch_1d(
-        ctx,
-        &complex_bit_reverse,
-        n,
-        &[
-            RawArg::write(&input_fft, complex_bytes),
-            RawArg::read(&product, complex_bytes),
-            RawArg::Uniform(bytemuck::bytes_of(&[n])),
-        ],
-    )?;
-
-    // --- Pass 7: IFFT butterfly on input_fft (log2(N) stages) ---
-    for stage in 0..log2n {
-        let is_last = u32::from(stage + 1 == log2n);
-        launch_1d(
-            ctx,
-            &ibutterfly,
-            n / 2,
-            &[
-                RawArg::write(&input_fft, complex_bytes),
-                RawArg::Uniform(bytemuck::bytes_of(&[n, stage, is_last])),
-            ],
-        )?;
-    }
-
-    // --- Pass 8: Extract real ---
-    launch_1d(
-        ctx,
-        &extract_real,
-        to_u32(output_len, "Output length")?,
-        &[
-            RawArg::write(out_buf, out_bytes),
-            RawArg::read(&input_fft, complex_bytes),
-            RawArg::Uniform(bytemuck::bytes_of(&[output_len as u32])),
-        ],
-    )?;
-
+    let operands = fft::Operands {
+        input: (in_buf, in_bytes, input_len),
+        kernel: (k_buf, k_bytes, kernel_len),
+        output: (out_buf, out_bytes, to_u32(output_len, "Output length")?),
+    };
+    fft::convolve(ctx, &operands, n, &mut Scratch::new(ctx))?;
     Ok(output)
 }

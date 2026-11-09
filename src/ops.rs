@@ -1,9 +1,9 @@
 //! Operators, math functions and reductions on arrays.
 //!
-//! Elementwise operations (operators, math functions, comparisons, `select`, `powf`, `clamp`)
-//! are recorded as lazy expressions and fused into one generated kernel when their result is
-//! needed (see [`crate::jit`]); reductions fold the expression behind their input into their
-//! first pass. In-place operators, fills, shifts and the later reduction passes are plain
+//! Elementwise operations (operators, math functions, comparisons, `select`, `powf`, `clamp`,
+//! shifts) are recorded as lazy expressions and fused into one generated kernel when their result
+//! is needed (see [`crate::jit`]); reductions fold the expression behind their input into their
+//! first pass. In-place operators, fills and the later reduction passes are plain
 //! built-in kernels (see [`crate::builtin`]) recorded into the context's batch. Methods that
 //! return arrays never fail loudly: they return poisoned arrays (see [`Array`]). The `run_*`
 //! functions do the work and return the failure; the public methods turn it into a poisoned
@@ -20,7 +20,7 @@ use crate::builtin::{BinOp, Builtin, CmpOp, ReduceOp, UnOp, REDUCE_BLOCK};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{GpuType, ScalarType};
-use crate::jit::{self, ElemTy, Op, OpKind, Scalar, Src};
+use crate::jit::{self, ElemTy, Op, OpKind, Scalar, ShiftKind, Src};
 use crate::kernel::KernelCore;
 use crate::shape::{Offsets, Shape};
 
@@ -375,43 +375,47 @@ impl<T: ScalarType> Array<T> {
     /// Circular shift like `af::shift`: element `i` moves to `i + offset` in every dimension,
     /// wrapping around (`[1, 2, 3, 4].shift(1)` is `[4, 1, 2, 3]`; negative offsets shift the
     /// other way). Offsets can be larger than a dimension.
+    ///
+    /// The array is evaluated, but the shift itself is lazy: it fuses into the expression that
+    /// uses it as a shifted read, so a stencil like `u.shift(1) + u.shift(-1) - &u * 2.0` is one
+    /// kernel reading `u` once.
     #[track_caller]
     pub fn shift(&self, offsets: impl Into<Offsets>) -> Array<T> {
         let location = Location::caller();
-        let result = self.run_shift(offsets.into());
+        let result = self.run_shift(offsets.into(), location);
         Array::resolve(self.context(), self.shape(), result, "shift", location)
     }
 
-    fn run_shift(&self, offsets: Offsets) -> Outcome<Array<T>> {
-        let ctx = self.context();
-        let (a, a_bytes) = self.ready()?;
+    fn run_shift(&self, offsets: Offsets, location: &'static Location<'static>) -> Outcome<Array<T>> {
+        let storage = Arc::clone(self.storage()?);
         let dims = self.shape().dims();
-        // [dims, shifts], each a vec4<u32>; shifts normalized into 0..dim.
-        let mut params = [0u32; 8];
-        let (dims_out, shifts_out) = params.split_at_mut(4);
-        let slots = dims_out.iter_mut().zip(shifts_out.iter_mut());
-        for ((dim_out, shift_out), (&dim, &offset)) in slots.zip(dims.iter().zip(&offsets.0)) {
-            let dim = u32::try_from(dim).map_err(|_| LumaError::DimensionTooLarge { shape: dims })?;
-            *dim_out = dim;
+        let mut dims32 = [1u32; 4];
+        let mut shifts = [0u32; 4];
+        for axis in 0..4 {
+            let dim = u32::try_from(dims[axis]).map_err(|_| LumaError::DimensionTooLarge { shape: dims })?;
             // Valid arrays have dim > 0; the remainder is in 0..dim and so fits u32.
-            let shift = (offset as i64).rem_euclid(i64::from(dim.max(1)));
-            *shift_out = u32::try_from(shift)
-                .map_err(|_| LumaError::DimensionTooLarge { shape: dims })?;
+            let shift = (offsets.0[axis] as i64).rem_euclid(i64::from(dim.max(1)));
+            dims32[axis] = dim;
+            shifts[axis] = u32::try_from(shift).map_err(|_| LumaError::DimensionTooLarge { shape: dims })?;
         }
-        let out = Array::<T>::alloc(ctx, self.shape())?;
-        let (out_buf, out_bytes) = out.ready()?;
-        let core = ctx.builtin(Builtin::Shift, T::wgsl_type())?;
-        launch_1d(
-            ctx,
-            &core,
-            len_u32(self.len())?,
-            &[
-                RawArg::write(out_buf, out_bytes),
-                RawArg::read(a, a_bytes),
-                RawArg::Uniform(bytemuck::bytes_of(&params)),
-            ],
-        )?;
-        Ok(out)
+        // A shift of the outermost non-trivial dimension only is a shift of the flat array.
+        let top = shifts.iter().rposition(|&s| s != 0).unwrap_or(0);
+        let linear = dims32[top + 1..].iter().all(|&d| d == 1)
+            && shifts[..top].iter().all(|&s| s == 0);
+        let (kind, amount) = if linear {
+            let stride: u32 = dims32[..top].iter().product();
+            (ShiftKind::Linear, Src::Scalar(Scalar { ty: ElemTy::U32, bits: shifts[top] * stride }))
+        } else {
+            (ShiftKind::Dims { dims: dims32, shifts }, Src::unused())
+        };
+        lazy(
+            self.context(),
+            self.shape(),
+            Op::new(OpKind::Shift(kind), ElemTy::of::<T>()?),
+            [Src::Buffer(storage), amount, Src::unused()],
+            "shift",
+            location,
+        )
     }
 
     // -- Reductions --
@@ -488,9 +492,11 @@ fn reduce_array<T: GpuType>(
         remaining = groups > 1;
     }
 
-    let bytes = ctx.read_bytes(&current, elem)?;
-    bytemuck::try_pod_read_unaligned::<T>(&bytes)
-        .map_err(|e| LumaError::Gpu(format!("reduction result has the wrong size: {e}")))
+    let values = ctx.read::<T>(&current, elem)?;
+    values
+        .first()
+        .copied()
+        .ok_or_else(|| LumaError::Gpu("reduction result is missing".into()))
 }
 
 /// Per-component reductions of `f32` vector arrays: the same tree reduction as the scalar

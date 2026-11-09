@@ -440,3 +440,60 @@ fn many_pending_readers_of_one_buffer_are_pruned() {
     let readers = x.storage().ok().map(|s| s.readers.len()).unwrap_or(usize::MAX);
     assert!(readers < 200, "{readers}");
 }
+
+#[test]
+fn eval_does_not_materialize_the_temporaries_of_the_expression() {
+    let ctx = Context::new().unwrap();
+    let x = f32s(&ctx, &values(256, 40, 0.0, 1.0));
+    let before = ctx.jit().stats();
+    // The intermediate arrays are temporaries alive until the end of the statement.
+    ((&x * 2.0 + 1.0).sqrt() - 1.0).eval().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+    let before = ctx.jit().stats();
+    let product = &x * &x;
+    product.sum().unwrap();
+    // Reduced without being materialized; flushing does not compute it afterwards.
+    ctx.sync().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
+}
+
+#[test]
+fn shifts_fuse_into_the_expression_that_reads_them() {
+    let ctx = Context::new().unwrap();
+    let xs = values(1000, 41, -1.0, 1.0);
+    let n = xs.len();
+    let x = f32s(&ctx, &xs);
+    let u = &x * 2.0;
+    let before = ctx.jit().stats();
+    let step = &u + (u.shift(1) + u.shift(-1) - &u * 2.0) * 0.1;
+    let got = step.to_vec().unwrap();
+    // `u` is evaluated once for the shifts, then the whole step is one kernel.
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    let f = |j: usize| xs[j % n] * 2.0;
+    let want: Vec<f32> =
+        (0..n).map(|i| f(i) + (f(i + n - 1) + f(i + 1) - f(i) * 2.0) * 0.1).collect();
+    assert_close(&got, &want, 1e-5, 1e-5);
+
+    // A shifted read inside a reduction's first pass.
+    let before = ctx.jit().stats();
+    let lag = (&x * &x.shift(3)).sum().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
+    let want: f32 = (0..n).map(|i| xs[i] * xs[(i + n - 3) % n]).sum();
+    assert!((lag - want).abs() < 1e-3, "{lag} vs {want}");
+
+    // Multi-dimensional shifts of two arrays in one kernel.
+    let (nx, ny) = (7usize, 5usize);
+    let a = Array::from_slice_on(&ctx, &xs[..nx * ny], [nx, ny]).unwrap();
+    let got = (a.shift([1isize, -2]) - a.shift([-3isize, 0])).to_vec().unwrap();
+    let at = |cx: isize, cy: isize| {
+        xs[cx.rem_euclid(nx as isize) as usize + nx * cy.rem_euclid(ny as isize) as usize]
+    };
+    let want: Vec<f32> = (0..nx * ny)
+        .map(|i| {
+            let (cx, cy) = ((i % nx) as isize, (i / nx) as isize);
+            at(cx - 1, cy + 2) - at(cx + 3, cy)
+        })
+        .collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+}

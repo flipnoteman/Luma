@@ -13,7 +13,7 @@ use std::fmt::Write;
 use crate::builtin::{ReduceOp, ELEMENTWISE_WORKGROUP, REDUCE_BLOCK, REDUCE_WORKGROUP};
 
 use super::program::{FusedKey, Instr, Ref, Tail};
-use super::{ElemTy, OpKind};
+use super::{ElemTy, OpKind, ShiftKind};
 
 /// `template` with its operand identifiers `x` and `y` replaced by `a` and `b`.
 fn substitute(template: &str, a: &str, b: &str) -> String {
@@ -57,6 +57,46 @@ fn expression(instr: &Instr) -> String {
         OpKind::Powf => format!("pow({a}, {b})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
         OpKind::Select => format!("select({c}, {b}, {a} != 0u)"),
+        OpKind::Shift(kind) => {
+            let Ref::Input(k) = instr.args[0] else {
+                unreachable!("the operand of a shift is always an input buffer")
+            };
+            format!("in{k}[{}]", shift_index(kind, &b))
+        }
+    }
+}
+
+/// The index element `i` of a shift reads; `s` names the scalar shift of [`ShiftKind::Linear`].
+fn shift_index(kind: ShiftKind, s: &str) -> String {
+    match kind {
+        ShiftKind::Linear => format!("select(i - {s}, i + (luma.size.x - {s}), i < {s})"),
+        ShiftKind::Dims { dims, shifts } => {
+            let [d0, d1, d2, _] = dims;
+            let strides = [1, d0, d0 * d1, d0 * d1 * d2];
+            let mut terms = Vec::new();
+            for axis in 0..4 {
+                let (dim, shift, stride) = (dims[axis], shifts[axis], strides[axis]);
+                if dim == 1 {
+                    continue;
+                }
+                let coord = match (stride, axis) {
+                    (1, _) => format!("(i % {dim}u)"),
+                    (_, 3) => format!("(i / {stride}u)"),
+                    _ => format!("((i / {stride}u) % {dim}u)"),
+                };
+                let wrapped = if shift == 0 {
+                    coord
+                } else {
+                    format!("select({coord} - {shift}u, {coord} + {}u, {coord} < {shift}u)", dim - shift)
+                };
+                terms.push(if stride == 1 { wrapped } else { format!("{wrapped} * {stride}u") });
+            }
+            if terms.is_empty() {
+                "0u".to_owned()
+            } else {
+                terms.join(" + ")
+            }
+        }
     }
 }
 
@@ -90,8 +130,17 @@ pub(crate) fn source(key: &FusedKey) -> String {
     }
 
     let _ = writeln!(src, "\nfn luma_eval(i: u32) -> {result_ty} {{");
+    // Inputs read only through shifts are not loaded at `i`.
+    let direct = |k: u32| {
+        key.instrs.iter().any(|instr| {
+            let skip = usize::from(matches!(instr.op.kind, OpKind::Shift(_)));
+            instr.args.iter().skip(skip).any(|arg| *arg == Ref::Input(k))
+        })
+    };
     for (k, ty) in key.input_tys.iter().enumerate() {
-        let _ = writeln!(src, "    let a{k}: {} = in{k}[i];", ty.wgsl());
+        if direct(k as u32) {
+            let _ = writeln!(src, "    let a{k}: {} = in{k}[i];", ty.wgsl());
+        }
     }
     for (k, instr) in key.instrs.iter().enumerate() {
         let _ = writeln!(src, "    let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr));

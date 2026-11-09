@@ -165,3 +165,28 @@ fn profile_labels_fused_kernels_by_their_operations() {
     assert!(profile.kernels.iter().any(|k| k.label.starts_with("FusedReduce(Sum: Mul)")));
     assert!(z.to_vec().unwrap().iter().all(|&v| (v - 13.0f32.sqrt()).abs() < 1e-5));
 }
+
+#[test]
+fn every_launch_of_a_profile_gets_its_own_timing() {
+    // One batch per launch (each waited for), so timestamps of different submissions must
+    // neither be lost nor mixed up.
+    let ctx = Context::new().unwrap();
+    if !ctx.profiling_supported() {
+        return;
+    }
+    let spin = ctx.kernel(SPIN).label("spin").build().unwrap();
+    let n = 1 << 16;
+    let mut a = Array::<f32>::zeros_on(&ctx, n).unwrap();
+    let ((), profile) = ctx
+        .profile(|| {
+            for _ in 0..6 {
+                spin.launch([n as u32], args![&mut a, uniform(&Params { rounds: 2000 })]).unwrap();
+                ctx.sync().unwrap();
+            }
+        })
+        .unwrap();
+    let spin_time = profile.get("spin").unwrap();
+    assert_eq!(spin_time.launches, 6);
+    // A timestamp resolved before the GPU wrote it reads as zero.
+    assert!(!spin_time.min.is_zero(), "{profile}");
+}
