@@ -1,11 +1,11 @@
 use luma::*;
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<()> {
     let t = std::time::Instant::now();
 
-    let a = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
-    let b = array!(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
+    let ctx = Context::new()?;
+    let a = ctx.from_slice(&[3, 1, 1, 1], &[1u32, 2u32, 3u32])?;
+    let b = ctx.from_slice(&[3, 1, 1, 1], &[10u32, 20u32, 30u32])?;
 
     // Chain of operations — all GPU-resident, no CPU copies in between
     //
@@ -19,14 +19,16 @@ async fn main() {
     //   step 5: subtract(step4, b)  -> [14, 70, 170]
     //   step 6: divide_scalar(step5, 2) -> [7, 35, 85]
     //
-    let result = a.add(&b).await.unwrap()              // [11, 22, 33]
-        .multiply(&a).await.unwrap()                   // [11, 44, 99]
-        .add_scalar(1u32).await.unwrap()               // [12, 45, 100]
-        .double().await.unwrap()                       // [24, 90, 200]
-        .subtract(&b).await.unwrap()                   // [14, 70, 170]
-        .divide_scalar(2u32).await.unwrap()            // [7, 35, 85]
-        .to_vec().await.unwrap();
+    // Every step is submitted to the GPU without waiting; read() is the only sync point.
+    let result = a.add(&b)?                            // [11, 22, 33]
+        .multiply(&a)?                                 // [11, 44, 99]
+        .add_scalar(1u32)?                             // [12, 45, 100]
+        .double()?                                     // [24, 90, 200]
+        .subtract(&b)?                                 // [14, 70, 170]
+        .divide_scalar(2u32)?                          // [7, 35, 85]
+        .read()?;
 
     println!("Chain result: {:?}", result);
     println!("Program Time: {:?}", t.elapsed());
+    Ok(())
 }

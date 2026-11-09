@@ -1,82 +1,156 @@
+// wgpu's handle types nest deeply; proving `Context: Sync` for the `static` below exceeds the
+// default limit on recent nightlies (future-compat lint `recursion_depth_exceeding_limit`).
+#![recursion_limit = "256"]
+
 use luma::*;
+use std::sync::LazyLock;
+
+/// One device shared by all tests; creating a device per test would be slow and wasteful.
+static CTX: LazyLock<Context> = LazyLock::new(|| Context::new().expect("Could not create Context."));
+
+fn ctx() -> &'static Context {
+    &CTX
+}
+
+fn array<T: GpuType>(shape: &[usize; 4], data: &[T]) -> Array<T> {
+    ctx().from_slice(shape, data).expect("Could not create Array.")
+}
 
 // -- Creation & readback --
 
-#[tokio::test]
-async fn create_u32_array_and_readback() {
-    let a = array!(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
-    assert_eq!(a.to_vec().await.unwrap(), vec![10u32, 20, 30]);
+#[test]
+fn create_u32_array_and_readback() {
+    let a = array(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
+    assert_eq!(a.read().unwrap(), vec![10u32, 20, 30]);
 }
 
-#[tokio::test]
-async fn create_f32_array_and_readback() {
-    let a = array!(&[3, 1, 1, 1], &[1.5f32, 2.5f32, 3.5f32]);
-    assert_eq!(a.to_vec().await.unwrap(), vec![1.5f32, 2.5, 3.5]);
+#[test]
+fn create_f32_array_and_readback() {
+    let a = array(&[3, 1, 1, 1], &[1.5f32, 2.5f32, 3.5f32]);
+    assert_eq!(a.read().unwrap(), vec![1.5f32, 2.5, 3.5]);
 }
 
-#[tokio::test]
-async fn dimensions_returns_correct_value() {
-    let a = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
-    assert_eq!(a.dimensions(), &[3, 1, 1, 1]);
+#[test]
+fn shape_returns_correct_value() {
+    let a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    assert_eq!(a.shape(), &[3, 1, 1, 1]);
+    assert_eq!(a.len(), 3);
+}
+
+#[test]
+fn zeros_returns_zeroed_array() {
+    let a = ctx().zeros::<f32>(&[2, 3, 1, 1]).unwrap();
+    assert_eq!(a.shape(), &[2, 3, 1, 1]);
+    assert_eq!(a.read().unwrap(), vec![0.0f32; 6]);
+}
+
+// -- Write & shape validation --
+
+#[test]
+fn write_replaces_contents() {
+    let mut a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    a.write(&[7u32, 8u32, 9u32]).unwrap();
+    assert_eq!(a.read().unwrap(), vec![7u32, 8, 9]);
+}
+
+#[test]
+fn write_length_mismatch_returns_error() {
+    let mut a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+
+    let err = a.write(&[1u32, 2u32]).unwrap_err();
+    assert!(
+        matches!(err, LumaError::LengthMismatch { expected: 3, actual: 2 }),
+        "Expected LengthMismatch, got: {err}"
+    );
+    let err = a.write(&[1u32, 2u32, 3u32, 4u32]).unwrap_err();
+    assert!(
+        matches!(err, LumaError::LengthMismatch { expected: 3, actual: 4 }),
+        "Expected LengthMismatch, got: {err}"
+    );
+
+    // A rejected write leaves the array untouched.
+    assert_eq!(a.read().unwrap(), vec![1u32, 2, 3]);
+}
+
+#[test]
+fn from_slice_length_mismatch_returns_error() {
+    let err = ctx().from_slice(&[3, 1, 1, 1], &[1u32, 2u32]).unwrap_err();
+    assert!(
+        matches!(err, LumaError::LengthMismatch { expected: 3, actual: 2 }),
+        "Expected LengthMismatch, got: {err}"
+    );
+}
+
+#[test]
+fn invalid_shapes_return_errors() {
+    let err = ctx().zeros::<u32>(&[3, 0, 1, 1]).unwrap_err();
+    assert!(matches!(err, LumaError::InvalidShape(_)), "got: {err}");
+
+    let err = ctx().zeros::<u32>(&[u32::MAX as usize + 1, 1, 1, 1]).unwrap_err();
+    assert!(matches!(err, LumaError::DimensionTooLarge { .. }), "got: {err}");
+
+    // Each dimension fits u32, but the element count does not.
+    let err = ctx().zeros::<u32>(&[65_536, 65_536, 1, 1]).unwrap_err();
+    assert!(matches!(err, LumaError::DimensionTooLarge { .. }), "got: {err}");
 }
 
 // -- Unary: double --
 
-#[tokio::test]
-async fn double_u32() {
-    let a = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
-    let result = a.double().await.unwrap().to_vec().await.unwrap();
+#[test]
+fn double_u32() {
+    let a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    let result = a.double().unwrap().read().unwrap();
     assert_eq!(result, vec![2u32, 4, 6]);
 }
 
-#[tokio::test]
-async fn double_f32() {
-    let a = array!(&[2, 1, 1, 1], &[1.5f32, 2.5f32]);
-    let result = a.double().await.unwrap().to_vec().await.unwrap();
+#[test]
+fn double_f32() {
+    let a = array(&[2, 1, 1, 1], &[1.5f32, 2.5f32]);
+    let result = a.double().unwrap().read().unwrap();
     assert_eq!(result, vec![3.0f32, 5.0]);
 }
 
 // -- Binary operations (u32) --
 
-#[tokio::test]
-async fn add_u32() {
-    let a = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
-    let b = array!(&[3, 1, 1, 1], &[4u32, 5u32, 6u32]);
-    let result = a.add(&b).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn add_u32() {
+    let a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    let b = array(&[3, 1, 1, 1], &[4u32, 5u32, 6u32]);
+    let result = a.add(&b).unwrap().read().unwrap();
     assert_eq!(result, vec![5u32, 7, 9]);
 }
 
-#[tokio::test]
-async fn subtract_u32() {
-    let a = array!(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
-    let b = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
-    let result = a.subtract(&b).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn subtract_u32() {
+    let a = array(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
+    let b = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    let result = a.subtract(&b).unwrap().read().unwrap();
     assert_eq!(result, vec![9u32, 18, 27]);
 }
 
-#[tokio::test]
-async fn multiply_u32() {
-    let a = array!(&[3, 1, 1, 1], &[2u32, 3u32, 4u32]);
-    let b = array!(&[3, 1, 1, 1], &[5u32, 6u32, 7u32]);
-    let result = a.multiply(&b).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn multiply_u32() {
+    let a = array(&[3, 1, 1, 1], &[2u32, 3u32, 4u32]);
+    let b = array(&[3, 1, 1, 1], &[5u32, 6u32, 7u32]);
+    let result = a.multiply(&b).unwrap().read().unwrap();
     assert_eq!(result, vec![10u32, 18, 28]);
 }
 
-#[tokio::test]
-async fn divide_u32() {
-    let a = array!(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
-    let b = array!(&[3, 1, 1, 1], &[2u32, 4u32, 5u32]);
-    let result = a.divide(&b).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn divide_u32() {
+    let a = array(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
+    let b = array(&[3, 1, 1, 1], &[2u32, 4u32, 5u32]);
+    let result = a.divide(&b).unwrap().read().unwrap();
     assert_eq!(result, vec![5u32, 5, 6]);
 }
 
 // -- Binary operations (f32) --
 
-#[tokio::test]
-async fn add_f32() {
-    let a = array!(&[3, 1, 1, 1], &[1.0f32, 2.5f32, 3.0f32]);
-    let b = array!(&[3, 1, 1, 1], &[4.0f32, 5.5f32, 6.0f32]);
-    let result = a.add(&b).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn add_f32() {
+    let a = array(&[3, 1, 1, 1], &[1.0f32, 2.5f32, 3.0f32]);
+    let b = array(&[3, 1, 1, 1], &[4.0f32, 5.5f32, 6.0f32]);
+    let result = a.add(&b).unwrap().read().unwrap();
     assert_eq!(result, vec![5.0f32, 8.0, 9.0]);
 }
 
@@ -84,24 +158,24 @@ async fn add_f32() {
 
 const LARGE_LEN: usize = 5_000_003; // > 65_535 * 64, and not a multiple of 64
 
-#[tokio::test]
-async fn add_f32_large_array() {
+#[test]
+fn add_f32_large_array() {
     let lhs: Vec<f32> = (0..LARGE_LEN).map(|i| i as f32).collect();
     let rhs = vec![0.5f32; LARGE_LEN];
-    let a = array!(&[LARGE_LEN, 1, 1, 1], &lhs);
-    let b = array!(&[LARGE_LEN, 1, 1, 1], &rhs);
-    let result = a.add(&b).await.unwrap().to_vec().await.unwrap();
+    let a = array(&[LARGE_LEN, 1, 1, 1], &lhs);
+    let b = array(&[LARGE_LEN, 1, 1, 1], &rhs);
+    let result = a.add(&b).unwrap().read().unwrap();
     assert_eq!(result.len(), LARGE_LEN);
     for i in [0, 1, 63, 64, 65_535 * 64, LARGE_LEN - 1] {
         assert_eq!(result[i], i as f32 + 0.5, "index {i}");
     }
 }
 
-#[tokio::test]
-async fn double_u32_large_array() {
+#[test]
+fn double_u32_large_array() {
     let data: Vec<u32> = (0..LARGE_LEN as u32).collect();
-    let a = array!(&[LARGE_LEN, 1, 1, 1], &data);
-    let result = a.double().await.unwrap().to_vec().await.unwrap();
+    let a = array(&[LARGE_LEN, 1, 1, 1], &data);
+    let result = a.double().unwrap().read().unwrap();
     assert_eq!(result.len(), LARGE_LEN);
     for i in [0, 1, 63, 64, 65_535 * 64, LARGE_LEN - 1] {
         assert_eq!(result[i], 2 * i as u32, "index {i}");
@@ -110,94 +184,99 @@ async fn double_u32_large_array() {
 
 // -- Scalar operations (u32) --
 
-#[tokio::test]
-async fn add_scalar_u32() {
-    let a = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
-    let result = a.add_scalar(10u32).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn add_scalar_u32() {
+    let a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    let result = a.add_scalar(10u32).unwrap().read().unwrap();
     assert_eq!(result, vec![11u32, 12, 13]);
 }
 
-#[tokio::test]
-async fn subtract_scalar_u32() {
-    let a = array!(&[3, 1, 1, 1], &[5u32, 10u32, 15u32]);
-    let result = a.subtract_scalar(1u32).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn subtract_scalar_u32() {
+    let a = array(&[3, 1, 1, 1], &[5u32, 10u32, 15u32]);
+    let result = a.subtract_scalar(1u32).unwrap().read().unwrap();
     assert_eq!(result, vec![4u32, 9, 14]);
 }
 
-#[tokio::test]
-async fn multiply_scalar_u32() {
-    let a = array!(&[3, 1, 1, 1], &[2u32, 4u32, 6u32]);
-    let result = a.multiply_scalar(3u32).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn multiply_scalar_u32() {
+    let a = array(&[3, 1, 1, 1], &[2u32, 4u32, 6u32]);
+    let result = a.multiply_scalar(3u32).unwrap().read().unwrap();
     assert_eq!(result, vec![6u32, 12, 18]);
 }
 
-#[tokio::test]
-async fn divide_scalar_u32() {
-    let a = array!(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
-    let result = a.divide_scalar(2u32).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn divide_scalar_u32() {
+    let a = array(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
+    let result = a.divide_scalar(2u32).unwrap().read().unwrap();
     assert_eq!(result, vec![5u32, 10, 15]);
 }
 
 // -- Error case --
 
-#[tokio::test]
-async fn add_dimension_mismatch_returns_error() {
-    let a = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
-    let b = array!(&[2, 1, 1, 1], &[4u32, 5u32]);
-    let err = a.add(&b).await.unwrap_err();
+#[test]
+fn add_dimension_mismatch_returns_error() {
+    let a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    let b = array(&[2, 1, 1, 1], &[4u32, 5u32]);
+    let err = a.add(&b).unwrap_err();
+    assert!(
+        matches!(err, LumaError::ShapeMismatch { lhs: [3, 1, 1, 1], rhs: [2, 1, 1, 1] }),
+        "Expected ShapeMismatch, got: {err}"
+    );
+    let err = err.to_string();
     assert!(err.contains("Dimension mismatch"), "Expected 'Dimension mismatch', got: {err}");
 }
 
 // -- Conv1D (f32 only) --
 
-#[tokio::test]
-async fn conv1d_basic() {
-    let input = array!(&[5, 1, 1, 1], &[1.0f32, 2.0, 3.0, 4.0, 5.0]);
-    let kernel = array!(&[3, 1, 1, 1], &[1.0f32, 0.0, -1.0]);
-    let result = input.conv1d(&kernel, 1, 0).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn conv1d_basic() {
+    let input = array(&[5, 1, 1, 1], &[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    let kernel = array(&[3, 1, 1, 1], &[1.0f32, 0.0, -1.0]);
+    let result = input.conv1d(&kernel, 1, 0).unwrap().read().unwrap();
     assert_eq!(result, vec![-2.0f32, -2.0, -2.0]);
 }
 
-#[tokio::test]
-async fn conv1d_with_padding() {
-    let input = array!(&[3, 1, 1, 1], &[1.0f32, 2.0, 3.0]);
-    let kernel = array!(&[2, 1, 1, 1], &[1.0f32, 1.0]);
-    let result = input.conv1d(&kernel, 1, 1).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn conv1d_with_padding() {
+    let input = array(&[3, 1, 1, 1], &[1.0f32, 2.0, 3.0]);
+    let kernel = array(&[2, 1, 1, 1], &[1.0f32, 1.0]);
+    let result = input.conv1d(&kernel, 1, 1).unwrap().read().unwrap();
     assert_eq!(result, vec![1.0f32, 3.0, 5.0, 3.0]);
 }
 
-#[tokio::test]
-async fn conv1d_with_stride() {
-    let input = array!(&[6, 1, 1, 1], &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let kernel = array!(&[2, 1, 1, 1], &[1.0f32, 1.0]);
-    let result = input.conv1d(&kernel, 2, 0).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn conv1d_with_stride() {
+    let input = array(&[6, 1, 1, 1], &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let kernel = array(&[2, 1, 1, 1], &[1.0f32, 1.0]);
+    let result = input.conv1d(&kernel, 2, 0).unwrap().read().unwrap();
     assert_eq!(result, vec![3.0f32, 7.0, 11.0]);
 }
 
-#[tokio::test]
-async fn conv1d_identity_kernel() {
-    let input = array!(&[3, 1, 1, 1], &[3.0f32, 7.0, 11.0]);
-    let kernel = array!(&[1, 1, 1, 1], &[1.0f32]);
-    let result = input.conv1d(&kernel, 1, 0).await.unwrap().to_vec().await.unwrap();
+#[test]
+fn conv1d_identity_kernel() {
+    let input = array(&[3, 1, 1, 1], &[3.0f32, 7.0, 11.0]);
+    let kernel = array(&[1, 1, 1, 1], &[1.0f32]);
+    let result = input.conv1d(&kernel, 1, 0).unwrap().read().unwrap();
     assert_eq!(result, vec![3.0f32, 7.0, 11.0]);
 }
 
-#[tokio::test]
-async fn conv1d_kernel_too_large_returns_error() {
-    let input = array!(&[2, 1, 1, 1], &[1.0f32, 2.0]);
-    let kernel = array!(&[5, 1, 1, 1], &[1.0f32, 1.0, 1.0, 1.0, 1.0]);
-    let err = input.conv1d(&kernel, 1, 0).await.unwrap_err();
+#[test]
+fn conv1d_kernel_too_large_returns_error() {
+    let input = array(&[2, 1, 1, 1], &[1.0f32, 2.0]);
+    let kernel = array(&[5, 1, 1, 1], &[1.0f32, 1.0, 1.0, 1.0, 1.0]);
+    let err = input.conv1d(&kernel, 1, 0).unwrap_err().to_string();
     assert!(err.contains("larger"), "Expected kernel-too-large error, got: {err}");
 }
 
-#[tokio::test]
-async fn conv1d_large_input() {
+#[test]
+fn conv1d_large_input() {
     // 100-element input, 5-element averaging kernel, stride=1, pad=0 → 96 outputs
     let input_data: Vec<f32> = (1..=100).map(|x| x as f32).collect();
     let kernel_data = vec![0.2f32; 5]; // averaging kernel
-    let input = array!(&[100, 1, 1, 1], &input_data);
-    let kernel = array!(&[5, 1, 1, 1], &kernel_data);
-    let result = input.conv1d(&kernel, 1, 0).await.unwrap().to_vec().await.unwrap();
+    let input = array(&[100, 1, 1, 1], &input_data);
+    let kernel = array(&[5, 1, 1, 1], &kernel_data);
+    let result = input.conv1d(&kernel, 1, 0).unwrap().read().unwrap();
     assert_eq!(result.len(), 96);
     // First output: mean(1,2,3,4,5) = 3.0
     assert!((result[0] - 3.0).abs() < 1e-5);
@@ -205,27 +284,27 @@ async fn conv1d_large_input() {
     assert!((result[95] - 98.0).abs() < 1e-5);
 }
 
-#[tokio::test]
-async fn conv1d_large_with_stride() {
+#[test]
+fn conv1d_large_with_stride() {
     // 1000 elements, kernel size 3, stride=4, pad=0 → 250 outputs
     let input_data: Vec<f32> = (0..1000).map(|x| (x as f32).sin()).collect();
-    let kernel = array!(&[3, 1, 1, 1], &[0.25f32, 0.5, 0.25]);
-    let input = array!(&[1000, 1, 1, 1], &input_data);
-    let result = input.conv1d(&kernel, 4, 0).await.unwrap().to_vec().await.unwrap();
+    let kernel = array(&[3, 1, 1, 1], &[0.25f32, 0.5, 0.25]);
+    let input = array(&[1000, 1, 1, 1], &input_data);
+    let result = input.conv1d(&kernel, 4, 0).unwrap().read().unwrap();
     assert_eq!(result.len(), 250);
     // Spot-check first element: 0.25*in[0] + 0.5*in[1] + 0.25*in[2]
     let expected = 0.25 * (0f32).sin() + 0.5 * (1f32).sin() + 0.25 * (2f32).sin();
     assert!((result[0] - expected).abs() < 1e-5);
 }
 
-#[tokio::test]
-async fn conv1d_large_with_padding() {
+#[test]
+fn conv1d_large_with_padding() {
     // 512 elements, kernel size 7, stride=1, pad=3 → 512 outputs (same-size convolution)
     let input_data: Vec<f32> = (0..512).map(|x| (x % 10) as f32).collect();
     let kernel_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0]; // symmetric
-    let input = array!(&[512, 1, 1, 1], &input_data);
-    let kernel = array!(&[7, 1, 1, 1], &kernel_data);
-    let result = input.conv1d(&kernel, 1, 3).await.unwrap().to_vec().await.unwrap();
+    let input = array(&[512, 1, 1, 1], &input_data);
+    let kernel = array(&[7, 1, 1, 1], &kernel_data);
+    let result = input.conv1d(&kernel, 1, 3).unwrap().read().unwrap();
     // pad=3, kernel=7 → output_len = (512 - 7 + 6)/1 + 1 = 512
     assert_eq!(result.len(), 512);
     // Check a middle element (idx=100) where no padding is involved
@@ -233,47 +312,55 @@ async fn conv1d_large_with_padding() {
     assert!((result[100] - expected).abs() < 1e-4);
 }
 
+#[test]
+fn conv1d_zero_stride_returns_error() {
+    let input = array(&[3, 1, 1, 1], &[1.0f32, 2.0, 3.0]);
+    let kernel = array(&[1, 1, 1, 1], &[1.0f32]);
+    let err = input.conv1d(&kernel, 0, 0).unwrap_err();
+    assert!(matches!(err, LumaError::InvalidShape(_)), "got: {err}");
+}
+
 // -- FFT Conv1D (f32 only) --
 
-#[tokio::test]
-async fn fft_conv1d_basic() {
+#[test]
+fn fft_conv1d_basic() {
     // Full linear convolution: [1,2,3,4,5] * [1,0,-1] = [1, 2, 2, 2, 2, -4, -5]
-    let input = array!(&[5, 1, 1, 1], &[1.0f32, 2.0, 3.0, 4.0, 5.0]);
-    let kernel = array!(&[3, 1, 1, 1], &[1.0f32, 0.0, -1.0]);
-    let result = input.conv1d_fft(&kernel).await.unwrap();
-    assert_eq!(result.dimensions(), &[7, 1, 1, 1]);
-    let data = result.to_vec().await.unwrap();
+    let input = array(&[5, 1, 1, 1], &[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    let kernel = array(&[3, 1, 1, 1], &[1.0f32, 0.0, -1.0]);
+    let result = input.conv1d_fft(&kernel).unwrap();
+    assert_eq!(result.shape(), &[7, 1, 1, 1]);
+    let data = result.read().unwrap();
     let expected = vec![1.0f32, 2.0, 2.0, 2.0, 2.0, -4.0, -5.0];
     for (i, (a, b)) in data.iter().zip(expected.iter()).enumerate() {
         assert!((a - b).abs() < 1e-3, "Mismatch at index {}: got {}, expected {}", i, a, b);
     }
 }
 
-#[tokio::test]
-async fn fft_conv1d_identity_kernel() {
-    let input = array!(&[3, 1, 1, 1], &[3.0f32, 7.0, 11.0]);
-    let kernel = array!(&[1, 1, 1, 1], &[1.0f32]);
-    let result = input.conv1d_fft(&kernel).await.unwrap();
-    assert_eq!(result.dimensions(), &[3, 1, 1, 1]);
-    let data = result.to_vec().await.unwrap();
+#[test]
+fn fft_conv1d_identity_kernel() {
+    let input = array(&[3, 1, 1, 1], &[3.0f32, 7.0, 11.0]);
+    let kernel = array(&[1, 1, 1, 1], &[1.0f32]);
+    let result = input.conv1d_fft(&kernel).unwrap();
+    assert_eq!(result.shape(), &[3, 1, 1, 1]);
+    let data = result.read().unwrap();
     let expected = vec![3.0f32, 7.0, 11.0];
     for (i, (a, b)) in data.iter().zip(expected.iter()).enumerate() {
         assert!((a - b).abs() < 1e-3, "Mismatch at index {}: got {}, expected {}", i, a, b);
     }
 }
 
-#[tokio::test]
-async fn fft_conv1d_single_element() {
-    let input = array!(&[1, 1, 1, 1], &[5.0f32]);
-    let kernel = array!(&[1, 1, 1, 1], &[3.0f32]);
-    let result = input.conv1d_fft(&kernel).await.unwrap();
-    assert_eq!(result.dimensions(), &[1, 1, 1, 1]);
-    let data = result.to_vec().await.unwrap();
+#[test]
+fn fft_conv1d_single_element() {
+    let input = array(&[1, 1, 1, 1], &[5.0f32]);
+    let kernel = array(&[1, 1, 1, 1], &[3.0f32]);
+    let result = input.conv1d_fft(&kernel).unwrap();
+    assert_eq!(result.shape(), &[1, 1, 1, 1]);
+    let data = result.read().unwrap();
     assert!((data[0] - 15.0).abs() < 1e-3, "Expected 15.0, got {}", data[0]);
 }
 
-#[tokio::test]
-async fn fft_conv1d_matches_spatial() {
+#[test]
+fn fft_conv1d_matches_spatial() {
     // Compare FFT conv with spatial conv using a SYMMETRIC kernel.
     // Spatial conv1d computes cross-correlation: sum(input[i+k] * kernel[k])
     // FFT conv1d computes true convolution: sum(input[k] * kernel[n-k]) (kernel flipped)
@@ -281,11 +368,11 @@ async fn fft_conv1d_matches_spatial() {
     let input_data: Vec<f32> = (1..=10).map(|x| x as f32).collect();
     let kernel_data = vec![0.25f32, 0.5, 0.25]; // symmetric
 
-    let input = array!(&[10, 1, 1, 1], &input_data);
-    let kernel = array!(&[3, 1, 1, 1], &kernel_data);
+    let input = array(&[10, 1, 1, 1], &input_data);
+    let kernel = array(&[3, 1, 1, 1], &kernel_data);
 
-    let spatial = input.conv1d(&kernel, 1, 0).await.unwrap().to_vec().await.unwrap();
-    let fft = input.conv1d_fft(&kernel).await.unwrap().to_vec().await.unwrap();
+    let spatial = input.conv1d(&kernel, 1, 0).unwrap().read().unwrap();
+    let fft = input.conv1d_fft(&kernel).unwrap().read().unwrap();
 
     assert_eq!(fft.len(), 12); // 10 + 3 - 1
     assert_eq!(spatial.len(), 8); // 10 - 3 + 1
@@ -300,18 +387,18 @@ async fn fft_conv1d_matches_spatial() {
     }
 }
 
-#[tokio::test]
-async fn fft_conv1d_large_kernel() {
+#[test]
+fn fft_conv1d_large_kernel() {
     // 512-element input, 128-element kernel
     let input_data: Vec<f32> = (0..512).map(|x| (x as f32 * 0.01).sin()).collect();
     let kernel_data: Vec<f32> = (0..128).map(|x| 1.0 / (1.0 + x as f32)).collect();
 
-    let input = array!(&[512, 1, 1, 1], &input_data);
-    let kernel = array!(&[128, 1, 1, 1], &kernel_data);
+    let input = array(&[512, 1, 1, 1], &input_data);
+    let kernel = array(&[128, 1, 1, 1], &kernel_data);
 
-    let result = input.conv1d_fft(&kernel).await.unwrap();
-    assert_eq!(result.dimensions(), &[639, 1, 1, 1]); // 512 + 128 - 1
-    let data = result.to_vec().await.unwrap();
+    let result = input.conv1d_fft(&kernel).unwrap();
+    assert_eq!(result.shape(), &[639, 1, 1, 1]); // 512 + 128 - 1
+    let data = result.read().unwrap();
     assert_eq!(data.len(), 639);
 
     // Spot-check first element: input[0] * kernel[0]
@@ -324,18 +411,106 @@ async fn fft_conv1d_large_kernel() {
 
 // -- Chained operations --
 
-#[tokio::test]
-async fn chained_operations_produce_correct_result() {
-    let a = array!(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
-    let b = array!(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
+#[test]
+fn chained_operations_produce_correct_result() {
+    let a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    let b = array(&[3, 1, 1, 1], &[10u32, 20u32, 30u32]);
 
-    let result = a.add(&b).await.unwrap()              // [11, 22, 33]
-        .multiply(&a).await.unwrap()                   // [11, 44, 99]
-        .add_scalar(1u32).await.unwrap()               // [12, 45, 100]
-        .double().await.unwrap()                       // [24, 90, 200]
-        .subtract(&b).await.unwrap()                   // [14, 70, 170]
-        .divide_scalar(2u32).await.unwrap()            // [7, 35, 85]
-        .to_vec().await.unwrap();
+    let result = a.add(&b).unwrap()              // [11, 22, 33]
+        .multiply(&a).unwrap()                   // [11, 44, 99]
+        .add_scalar(1u32).unwrap()               // [12, 45, 100]
+        .double().unwrap()                       // [24, 90, 200]
+        .subtract(&b).unwrap()                   // [14, 70, 170]
+        .divide_scalar(2u32).unwrap()            // [7, 35, 85]
+        .read().unwrap();
 
     assert_eq!(result, vec![7u32, 35, 85]);
+}
+
+// -- Buffer pool --
+//
+// These tests use their own Context: the shared one is used by tests running in parallel, which
+// could take the pooled buffers before the test reuses them.
+
+#[test]
+fn pooled_buffer_reuse_keeps_length_and_ignores_stale_data() {
+    let ctx = Context::new().unwrap();
+
+    // 1000 and 600 u32s (4000 and 2400 bytes) share the 4096-byte size class.
+    let stale = vec![0xDEAD_BEEFu32; 1000];
+    let big = ctx.from_slice(&[1000, 1, 1, 1], &stale).unwrap();
+    let big_doubled = big.double().unwrap();
+    assert_eq!(big_doubled.read().unwrap().len(), 1000);
+    drop(big);
+    drop(big_doubled);
+
+    // Takes a recycled, dirty, larger-than-needed buffer.
+    let data: Vec<u32> = (0..600).collect();
+    let small = ctx.from_slice(&[600, 1, 1, 1], &data).unwrap();
+    assert_eq!(small.len(), 600);
+    assert_eq!(small.read().unwrap(), data);
+
+    let expected_doubled: Vec<u32> = data.iter().map(|x| x * 2).collect();
+    assert_eq!(small.double().unwrap().read().unwrap(), expected_doubled);
+    assert_eq!(small.add(&small).unwrap().read().unwrap(), expected_doubled);
+    let expected_plus_one: Vec<u32> = data.iter().map(|x| x + 1).collect();
+    assert_eq!(small.add_scalar(1u32).unwrap().read().unwrap(), expected_plus_one);
+
+    // zeros() must clear whatever the recycled buffer held before.
+    drop(small);
+    let zeros = ctx.zeros::<u32>(&[600, 1, 1, 1]).unwrap();
+    assert_eq!(zeros.read().unwrap(), vec![0u32; 600]);
+}
+
+#[test]
+fn pooled_scratch_reuse_does_not_change_conv_results() {
+    let ctx = Context::new().unwrap();
+
+    // Full linear convolution on the host.
+    let reference = |input: &[f32], kernel: &[f32]| -> Vec<f32> {
+        let mut out = vec![0.0f32; input.len() + kernel.len() - 1];
+        for (i, x) in input.iter().enumerate() {
+            for (k, w) in kernel.iter().enumerate() {
+                out[i + k] += x * w;
+            }
+        }
+        out
+    };
+
+    // Both convolutions have FFT size 128 (output lengths 119 and 109), so the second one runs
+    // on scratch buffers the first one left dirty; its output is shorter than the first one's.
+    for (input_len, kernel_len) in [(100usize, 20usize), (70, 40), (100, 20)] {
+        let input_data: Vec<f32> = (0..input_len).map(|x| (x as f32 * 0.1).sin()).collect();
+        let kernel_data: Vec<f32> = (0..kernel_len).map(|x| 1.0 / (1.0 + x as f32)).collect();
+        let input = ctx.from_slice(&[input_len, 1, 1, 1], &input_data).unwrap();
+        let kernel = ctx.from_slice(&[kernel_len, 1, 1, 1], &kernel_data).unwrap();
+
+        let result = input.conv1d_fft(&kernel).unwrap();
+        assert_eq!(result.shape(), &[input_len + kernel_len - 1, 1, 1, 1]);
+        let data = result.read().unwrap();
+        let expected = reference(&input_data, &kernel_data);
+        assert_eq!(data.len(), expected.len());
+        for (i, (a, b)) in data.iter().zip(&expected).enumerate() {
+            assert!((a - b).abs() < 1e-3, "Mismatch at index {i}: got {a}, expected {b}");
+        }
+
+        // Spatial conv on the same (recycled) buffers.
+        let spatial = input.conv1d(&kernel, 1, 0).unwrap().read().unwrap();
+        assert_eq!(spatial.len(), input_len - kernel_len + 1);
+        for (i, got) in spatial.iter().enumerate() {
+            let want: f32 = (0..kernel_len).map(|k| input_data[i + k] * kernel_data[k]).sum();
+            assert!((got - want).abs() < 1e-3, "Spatial mismatch at {i}: got {got}, want {want}");
+        }
+    }
+}
+
+// -- Contexts --
+
+#[test]
+fn arrays_from_different_contexts_cannot_be_combined() {
+    let other = Context::new().unwrap();
+    let a = array(&[3, 1, 1, 1], &[1u32, 2u32, 3u32]);
+    let b = other.from_slice(&[3, 1, 1, 1], &[4u32, 5u32, 6u32]).unwrap();
+    let err = a.add(&b).unwrap_err();
+    assert!(matches!(err, LumaError::ContextMismatch), "got: {err}");
 }

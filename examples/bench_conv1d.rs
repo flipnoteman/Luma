@@ -1,34 +1,35 @@
 use luma::*;
 use std::time::Instant;
 
-async fn bench_spatial(input: &Array<f32>, kernel: &Array<f32>, iterations: u32) -> f64 {
+fn bench_spatial(input: &Array<f32>, kernel: &Array<f32>, iterations: u32) -> f64 {
     // Warmup
-    let _ = input.conv1d(kernel, 1, 0).await.unwrap().to_vec().await.unwrap();
+    let _ = input.conv1d(kernel, 1, 0).unwrap().read().unwrap();
 
     let start = Instant::now();
     for _ in 0..iterations {
-        let result = input.conv1d(kernel, 1, 0).await.unwrap();
-        let _ = result.to_vec().await.unwrap();
+        let result = input.conv1d(kernel, 1, 0).unwrap();
+        let _ = result.read().unwrap();
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / iterations as f64 * 1000.0 // ms per iteration
 }
 
-async fn bench_fft(input: &Array<f32>, kernel: &Array<f32>, iterations: u32) -> f64 {
+fn bench_fft(input: &Array<f32>, kernel: &Array<f32>, iterations: u32) -> f64 {
     // Warmup
-    let _ = input.conv1d_fft(kernel).await.unwrap().to_vec().await.unwrap();
+    let _ = input.conv1d_fft(kernel).unwrap().read().unwrap();
 
     let start = Instant::now();
     for _ in 0..iterations {
-        let result = input.conv1d_fft(kernel).await.unwrap();
-        let _ = result.to_vec().await.unwrap();
+        let result = input.conv1d_fft(kernel).unwrap();
+        let _ = result.read().unwrap();
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / iterations as f64 * 1000.0 // ms per iteration
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<()> {
+    let ctx = Context::new()?;
+
     let configs: Vec<(usize, usize, u32)> = vec![
         // (input_len, kernel_len, iterations)
         // Small inputs — spatial should dominate
@@ -68,11 +69,11 @@ async fn main() {
         let input_data: Vec<f32> = (0..*input_len).map(|x| (x as f32 * 0.01).sin()).collect();
         let kernel_data: Vec<f32> = (0..*kernel_len).map(|x| 1.0 / (1.0 + x as f32)).collect();
 
-        let input = array!(&[*input_len, 1, 1, 1], &input_data);
-        let kernel = array!(&[*kernel_len, 1, 1, 1], &kernel_data);
+        let input = ctx.from_slice(&[*input_len, 1, 1, 1], &input_data)?;
+        let kernel = ctx.from_slice(&[*kernel_len, 1, 1, 1], &kernel_data)?;
 
-        let spatial_ms = bench_spatial(&input, &kernel, *iterations).await;
-        let fft_ms = bench_fft(&input, &kernel, *iterations).await;
+        let spatial_ms = bench_spatial(&input, &kernel, *iterations);
+        let fft_ms = bench_fft(&input, &kernel, *iterations);
 
         let speedup = if spatial_ms < fft_ms {
             format!("Spatial {:.1}x", fft_ms / spatial_ms)
@@ -87,4 +88,5 @@ async fn main() {
     }
 
     println!("{}", "=".repeat(80));
+    Ok(())
 }

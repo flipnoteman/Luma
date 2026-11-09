@@ -1,7 +1,6 @@
 use luma::*;
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<()> {
     // A signal with a spike pattern [1, 3, 1] hidden in noise/flat regions.
     // The kernel matches that exact pattern — convolution output will peak
     // wherever the pattern appears.
@@ -14,10 +13,11 @@ async fn main() {
     println!("Kernel: {:?}", kernel_data);
     println!();
 
-    let input = array!(&[12, 1, 1, 1], &input_data);
-    let kernel = array!(&[3, 1, 1, 1], &kernel_data);
+    let ctx = Context::new()?;
+    let input = ctx.from_slice(&[12, 1, 1, 1], &input_data)?;
+    let kernel = ctx.from_slice(&[3, 1, 1, 1], &kernel_data)?;
 
-    let result = input.conv1d(&kernel, 1, 0).await.unwrap().to_vec().await.unwrap();
+    let result = input.conv1d(&kernel, 1, 0)?.read()?;
 
     println!("Conv1D output ({} elements):", result.len());
     println!("{:?}", result);
@@ -35,4 +35,5 @@ async fn main() {
             );
         }
     }
+    Ok(())
 }

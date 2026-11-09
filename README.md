@@ -7,21 +7,23 @@ Current Usage Example:
 ```rs
 use luma::*;
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<()> {
     let t = std::time::Instant::now();
 
-    // Can now instantiate an [Array] with macros.
-    let array1 = array!(&[3u64, 1, 1, 1], &[1u32, 6u32, 5u32]);
-    let array2 = array!(&[3u64, 1, 1, 1], &[4u32, 12u32, 10u32]);
-    // [double_test] calls [test_fn()] in Executor which Doubles all the values in the array.
-    let test_1 = std::time::Instant::now();
-    let res1 = array1.double_test().await.unwrap();
-    println!("Result for {} = {:?}; time = {:?}", array1.id(), res1, test_1.elapsed());
-    let test_2 = std::time::Instant::now();
-    let res2 = array2.double_test().await.unwrap();
-    println!("Result for {} = {:?}; time = {:?}", array2.id(), res2, test_2.elapsed());
+    // A [Context] is an explicit handle to the GPU. It is cheap to clone and creates [Array]s.
+    let ctx = Context::new()?;
 
-    println!("Program Time: {:?}", t.elapsed())
+    let array1 = ctx.from_slice(&[3, 1, 1, 1], &[1u32, 6, 5])?;
+    let array2 = ctx.from_slice(&[3, 1, 1, 1], &[4u32, 12, 10])?;
+
+    // Operations are submitted to the GPU without waiting and return new arrays.
+    let sum = array1.add(&array2)?;     // [5, 18, 15]
+    let doubled = sum.double()?;        // [10, 36, 30]
+
+    // `read()` is the only call that waits for the GPU and copies data back to the host.
+    println!("Result = {:?}; shape = {:?}", doubled.read()?, doubled.shape());
+
+    println!("Program Time: {:?}", t.elapsed());
+    Ok(())
 }
 ```

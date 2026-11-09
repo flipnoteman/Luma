@@ -1,801 +1,337 @@
-use wgpu::util::DeviceExt;
+use crate::array::{Array, DIMS_BYTES};
+use crate::context::{bind, Context, PARAMS_USAGE, STORAGE_USAGE};
+use crate::error::{LumaError, Result};
+use crate::gpu_type::GpuType;
+use crate::operations::Operation;
 
-use crate::executor::{Buffers, Executor};
-use crate::operations::{shader_name, Operation};
-
-/// Workgroup size used by the elementwise shaders (`@workgroup_size(64)`).
-const ELEMENTWISE_WORKGROUP_SIZE: u32 = 64;
+/// Workgroup size used by every shader (`@workgroup_size(64)`).
+const WORKGROUP_SIZE: u32 = 64;
 
 /// Splits `element_count` elements into a 2D dispatch that stays within the
 /// per-dimension workgroup limit. Shaders linearize with `gid.x + gid.y * nwg.x * 64`.
 fn dispatch_dims(element_count: u32, max_per_dim: u32) -> (u32, u32) {
-    let groups = element_count.div_ceil(ELEMENTWISE_WORKGROUP_SIZE).max(1);
+    let groups = element_count.div_ceil(WORKGROUP_SIZE).max(1);
     let x = groups.min(max_per_dim);
     let y = groups.div_ceil(x);
     (x, y)
 }
 
-impl Executor {
-    /// Execute a unary operation on the GPU. Returns a new buffer id with the result.
-    /// The original buffer is untouched.
-    pub async fn execute_unary_gpu(&self, src_id: &str, operation: &Operation) -> Result<String, String> {
-        let adapter = self.adapter.as_ref().ok_or("No adapter loaded")?;
-        let shaders = self.shaders.as_ref().ok_or("No shaders loaded")?;
-        let device = &adapter.device;
-        let queue = &adapter.queue;
+/// 1D dispatch for shaders that index with `global_invocation_id.x` only.
+fn dispatch_1d(element_count: u32) -> (u32, u32) {
+    (element_count.div_ceil(WORKGROUP_SIZE), 1)
+}
 
-        // Read source buffer info
-        let buffers = self.buffers.read().unwrap();
-        let src = buffers.get(src_id).ok_or("Source buffer not found")?;
-        let src_size = src.storage_buffer.size();
-        let element_size = src.element_size;
-        let type_suffix = src.type_suffix.clone();
-        let dims_size = src.dimensions_buffer.size();
+fn new_encoder(ctx: &Context) -> wgpu::CommandEncoder {
+    ctx.device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+}
 
-        // Create new output storage buffer
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Unary Output Storage Buffer"),
-            size: src_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+fn same_context<T: GpuType, U: GpuType>(a: &Array<T>, b: &Array<U>) -> Result<()> {
+    if a.context().same_as(b.context()) {
+        Ok(())
+    } else {
+        Err(LumaError::ContextMismatch)
+    }
+}
 
-        // Create new dimensions buffer (copy of source dims)
-        let dims_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Unary Output Dimensions Buffer"),
-            size: dims_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+/// Temporary buffers of one operation (scratch space, kernel parameters). Taken from the
+/// context's pool and handed back when this guard drops, i.e. right after the operation's
+/// commands were submitted (or it failed). That is safe while the GPU still runs them: any
+/// later reuse of a buffer is ordered after the work already submitted.
+struct Scratch<'a> {
+    ctx: &'a Context,
+    held: Vec<wgpu::Buffer>,
+}
 
-        // Copy source data into new output buffer and dims
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(&src.storage_buffer, 0, &output_buffer, 0, src_size);
-        encoder.copy_buffer_to_buffer(&src.dimensions_buffer, 0, &dims_buffer, 0, dims_size);
-        queue.submit(Some(encoder.finish()));
-
-        // Now run the compute shader on the new output buffer
-        let name = shader_name(operation, &type_suffix);
-        let shader = shaders.get(&name).ok_or(format!("Shader '{}' not found", name))?;
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Unary Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Unary Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: output_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dims_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Unary Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Unary Compute Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let element_count = (src_size / element_size as u64) as u32;
-        let (gx, gy) = dispatch_dims(element_count, device.limits().max_compute_workgroups_per_dimension);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&compute_pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(gx, gy, 1);
-        }
-        queue.submit(Some(encoder.finish()));
-
-        // Store result under a new UUID
-        let new_id = uuid::Uuid::new_v4().to_string();
-        // Drop the read lock before acquiring write lock
-        drop(buffers);
-
-        self.buffers.write().unwrap().insert(
-            new_id.clone(),
-            Buffers {
-                storage_buffer: output_buffer,
-                staging_buffer: None,
-                dimensions_buffer: dims_buffer,
-                element_size,
-                type_suffix,
-            },
-        );
-
-        Ok(new_id)
+impl<'a> Scratch<'a> {
+    fn new(ctx: &'a Context) -> Self {
+        Scratch { ctx, held: Vec::new() }
     }
 
-    /// Execute a binary operation on the GPU. Returns a new buffer id with the result.
-    /// Both source buffers are untouched.
-    pub async fn execute_binary_gpu(&self, lhs_id: &str, rhs_id: &str, operation: &Operation) -> Result<String, String> {
-        let adapter = self.adapter.as_ref().ok_or("No adapter loaded")?;
-        let shaders = self.shaders.as_ref().ok_or("No shaders loaded")?;
-        let device = &adapter.device;
-        let queue = &adapter.queue;
-
-        let buffers = self.buffers.read().unwrap();
-        let lhs = buffers.get(lhs_id).ok_or("LHS buffer not found")?;
-        let rhs = buffers.get(rhs_id).ok_or("RHS buffer not found")?;
-
-        let lhs_size = lhs.storage_buffer.size();
-        let element_size = lhs.element_size;
-        let type_suffix = lhs.type_suffix.clone();
-        let dims_size = lhs.dimensions_buffer.size();
-
-        // Create new output buffer (same size as lhs), copy lhs data into it
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Binary Output Storage Buffer"),
-            size: lhs_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let dims_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Binary Output Dimensions Buffer"),
-            size: dims_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(&lhs.storage_buffer, 0, &output_buffer, 0, lhs_size);
-        encoder.copy_buffer_to_buffer(&lhs.dimensions_buffer, 0, &dims_buffer, 0, dims_size);
-        queue.submit(Some(encoder.finish()));
-
-        // Set up the 3-binding layout for binary ops: output (rw), rhs (r), dims (r)
-        let name = shader_name(operation, &type_suffix);
-        let shader = shaders.get(&name).ok_or(format!("Shader '{}' not found", name))?;
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Binary Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Binary Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: output_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: rhs.storage_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: dims_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Binary Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Binary Compute Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let element_count = (lhs_size / element_size as u64) as u32;
-        let (gx, gy) = dispatch_dims(element_count, device.limits().max_compute_workgroups_per_dimension);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&compute_pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups(gx, gy, 1);
-        }
-        queue.submit(Some(encoder.finish()));
-
-        let new_id = uuid::Uuid::new_v4().to_string();
-        drop(buffers);
-
-        self.buffers.write().unwrap().insert(
-            new_id.clone(),
-            Buffers {
-                storage_buffer: output_buffer,
-                staging_buffer: None,
-                dimensions_buffer: dims_buffer,
-                element_size,
-                type_suffix,
-            },
-        );
-
-        Ok(new_id)
+    fn take(&mut self, bytes: u64, usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
+        let buffer = self.ctx.alloc_buffer(bytes, usage)?;
+        self.held.push(buffer.clone());
+        Ok(buffer)
     }
 
-    /// Execute a 1D convolution on the GPU (f32 only).
-    /// Returns a new buffer id with the convolution result.
-    pub async fn execute_conv1d_gpu(
-        &self,
-        input_id: &str,
-        kernel_id: &str,
-        stride: u32,
-        padding: u32,
-    ) -> Result<(String, usize), String> {
-        let adapter = self.adapter.as_ref().ok_or("No adapter loaded")?;
-        let shaders = self.shaders.as_ref().ok_or("No shaders loaded")?;
-        let device = &adapter.device;
-        let queue = &adapter.queue;
-
-        let buffers = self.buffers.read().unwrap();
-        let input_buf = buffers.get(input_id).ok_or("Input buffer not found")?;
-        let kernel_buf = buffers.get(kernel_id).ok_or("Kernel buffer not found")?;
-
-        let input_len = (input_buf.storage_buffer.size() / input_buf.element_size as u64) as u32;
-        let kernel_len = (kernel_buf.storage_buffer.size() / kernel_buf.element_size as u64) as u32;
-
-        if input_len + 2 * padding < kernel_len {
-            return Err("Kernel is larger than padded input".into());
-        }
-
-        let output_len = ((input_len + 2 * padding - kernel_len) / stride + 1) as usize;
-        if output_len == 0 {
-            return Err("Output length is zero".into());
-        }
-
-        let shader_name = shader_name(&Operation::CONV1D, "_f32");
-        let shader = shaders.get(&shader_name).ok_or(format!("Shader '{}' not found", shader_name))?;
-
-        // Create output buffer
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Conv1D Output Buffer"),
-            size: (output_len * 4) as u64, // f32 = 4 bytes
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Create params buffer: [kernel_len, stride, padding]
-        let params: [u32; 3] = [kernel_len, stride, padding];
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Conv1D Params Buffer"),
-            contents: bytemuck::cast_slice(&params),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // Create dimensions buffer for the output
-        let dims: [u32; 4] = [u32::try_from(output_len).map_err(|_| "Output length exceeds u32::MAX")?, 1, 1, 1];
-        let dims_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Conv1D Output Dimensions Buffer"),
-            contents: bytemuck::cast_slice(&dims),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        // 4-binding layout: output(rw), input(r), kernel(r), params(r)
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Conv1D Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Conv1D Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: output_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input_buf.storage_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: kernel_buf.storage_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Conv1D Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Conv1D Compute Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&compute_pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            cpass.dispatch_workgroups((output_len as u32 + 63) / 64, 1, 1);
-        }
-        queue.submit(Some(encoder.finish()));
-
-        let new_id = uuid::Uuid::new_v4().to_string();
-        drop(buffers);
-
-        self.buffers.write().unwrap().insert(
-            new_id.clone(),
-            Buffers {
-                storage_buffer: output_buffer,
-                staging_buffer: None,
-                dimensions_buffer: dims_buffer,
-                element_size: 4, // f32
-                type_suffix: "_f32".to_string(),
-            },
-        );
-
-        Ok((new_id, output_len))
+    /// A scratch buffer of `bytes` bytes with unspecified contents.
+    fn storage(&mut self, bytes: u64) -> Result<wgpu::Buffer> {
+        self.take(bytes, STORAGE_USAGE)
     }
 
-    /// Execute FFT-based 1D convolution on the GPU (f32 only).
-    /// Returns full linear convolution of length `input_len + kernel_len - 1`.
-    pub async fn execute_fft_conv1d_gpu(
-        &self,
-        input_id: &str,
-        kernel_id: &str,
-    ) -> Result<(String, usize), String> {
-        let adapter = self.adapter.as_ref().ok_or("No adapter loaded")?;
-        let shaders = self.shaders.as_ref().ok_or("No shaders loaded")?;
-        let device = &adapter.device;
-        let queue = &adapter.queue;
+    /// A buffer holding `words`, returned with the number of bytes to bind. Every call hands out a
+    /// distinct buffer, so a single submission can use one parameter buffer per pass.
+    fn params(&mut self, words: &[u32]) -> Result<(wgpu::Buffer, u64)> {
+        let bytes = std::mem::size_of_val(words) as u64;
+        let buffer = self.take(bytes, PARAMS_USAGE)?;
+        self.ctx
+            .queue()
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(words));
+        Ok((buffer, bytes))
+    }
+}
 
-        let buffers = self.buffers.read().unwrap();
-        let input_buf = buffers.get(input_id).ok_or("Input buffer not found")?;
-        let kernel_buf = buffers.get(kernel_id).ok_or("Kernel buffer not found")?;
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        for buffer in self.held.drain(..) {
+            self.ctx.recycle(buffer);
+        }
+    }
+}
 
-        let input_len = (input_buf.storage_buffer.size() / input_buf.element_size as u64) as u32;
-        let kernel_len = (kernel_buf.storage_buffer.size() / kernel_buf.element_size as u64) as u32;
+/// Runs a unary operation on the GPU into a new array. The source array is untouched.
+pub(crate) fn unary<T: GpuType>(src: &Array<T>, operation: Operation) -> Result<Array<T>> {
+    let ctx = src.context();
+    let out = Array::<T>::alloc(ctx, src.shape())?;
+    let bytes = src.byte_len();
+    let groups = dispatch_dims(src.len() as u32, ctx.max_workgroups_per_dimension());
 
-        let output_len = (input_len + kernel_len - 1) as usize;
-        let n = (output_len as u32).next_power_of_two();
-        let log2n = n.trailing_zeros();
+    // The kernel works in place, so copy the source into the output first.
+    let mut encoder = new_encoder(ctx);
+    encoder.copy_buffer_to_buffer(src.storage(), 0, out.storage(), 0, bytes);
+    ctx.dispatch(
+        &mut encoder,
+        operation,
+        T::type_suffix(),
+        [bind(out.storage(), bytes), bind(out.dims_buffer(), DIMS_BYTES)],
+        groups,
+    )?;
+    ctx.queue().submit(Some(encoder.finish()));
 
-        // Allocate complex buffers (interleaved re/im, so 2*N f32s each)
-        let complex_buf_size = (n as u64) * 2 * 4;
-        let make_complex_buf = |label: &str| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: complex_buf_size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
+    Ok(out)
+}
 
-        let input_fft_buf = make_complex_buf("FFT Input Complex");
-        let kernel_fft_buf = make_complex_buf("FFT Kernel Complex");
-        let product_buf = make_complex_buf("FFT Product Complex");
+/// Runs a binary operation on the GPU into a new array shaped like `lhs`. Both operands are
+/// untouched. `rhs` is either shaped like `lhs` or a single element broadcast over `lhs`.
+pub(crate) fn binary<T: GpuType>(
+    lhs: &Array<T>,
+    rhs: &Array<T>,
+    operation: Operation,
+) -> Result<Array<T>> {
+    same_context(lhs, rhs)?;
+    let ctx = lhs.context();
+    let out = Array::<T>::alloc(ctx, lhs.shape())?;
+    let bytes = lhs.byte_len();
+    let groups = dispatch_dims(lhs.len() as u32, ctx.max_workgroups_per_dimension());
 
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("FFT Conv1D Output"),
-            size: (output_len * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+    // The kernel works in place on its output, so copy lhs into it first.
+    let mut encoder = new_encoder(ctx);
+    encoder.copy_buffer_to_buffer(lhs.storage(), 0, out.storage(), 0, bytes);
+    ctx.dispatch(
+        &mut encoder,
+        operation,
+        T::type_suffix(),
+        [
+            bind(out.storage(), bytes),
+            bind(rhs.storage(), rhs.byte_len()),
+            bind(out.dims_buffer(), DIMS_BYTES),
+            bind(rhs.dims_buffer(), DIMS_BYTES),
+        ],
+        groups,
+    )?;
+    ctx.queue().submit(Some(encoder.finish()));
 
-        // Helper: create a compute pipeline + bind group and dispatch
-        let dispatch = |encoder: &mut wgpu::CommandEncoder,
-                        shader_name: &str,
-                        bindings: &[(&wgpu::Buffer, bool)], // (buffer, read_only)
-                        workgroups: u32| -> Result<(), String> {
-            let shader = shaders
-                .get(shader_name)
-                .ok_or(format!("Shader '{}' not found", shader_name))?;
+    Ok(out)
+}
 
-            let layout_entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
-                .iter()
-                .enumerate()
-                .map(|(i, (_, read_only))| wgpu::BindGroupLayoutEntry {
-                    binding: i as u32,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: if *read_only {
-                            wgpu::BufferBindingType::Storage { read_only: true }
-                        } else {
-                            wgpu::BufferBindingType::Storage { read_only: false }
-                        },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                })
-                .collect();
+fn check_kernel(kernel: &Array<f32>) -> Result<()> {
+    if kernel.shape()[1..] != [1, 1, 1] {
+        return Err(LumaError::InvalidShape("Kernel must be 1D".into()));
+    }
+    Ok(())
+}
 
-            let bind_group_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: None,
-                    entries: &layout_entries,
-                });
+fn to_u32(value: usize, what: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| LumaError::InvalidShape(format!("{what} {value} exceeds u32::MAX")))
+}
 
-            let bg_entries: Vec<wgpu::BindGroupEntry> = bindings
-                .iter()
-                .enumerate()
-                .map(|(i, (buf, _))| wgpu::BindGroupEntry {
-                    binding: i as u32,
-                    resource: buf.as_entire_binding(),
-                })
-                .collect();
+/// Runs a 1D convolution on the GPU (f32 only) into a new array.
+pub(crate) fn conv1d(
+    input: &Array<f32>,
+    kernel: &Array<f32>,
+    stride: usize,
+    padding: usize,
+) -> Result<Array<f32>> {
+    same_context(input, kernel)?;
+    check_kernel(kernel)?;
+    let ctx = input.context();
 
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &bind_group_layout,
-                entries: &bg_entries,
-            });
+    let input_len = input.len();
+    let kernel_len = kernel.len();
+    if stride == 0 {
+        return Err(LumaError::InvalidShape("Stride must be non-zero".into()));
+    }
+    let padded_len = padding
+        .checked_mul(2)
+        .and_then(|doubled| doubled.checked_add(input_len))
+        .ok_or_else(|| LumaError::InvalidShape("Padding is too large".into()))?;
+    if padded_len < kernel_len {
+        return Err(LumaError::InvalidShape("Kernel is larger than padded input".into()));
+    }
+    let output_len = (padded_len - kernel_len) / stride + 1;
 
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            });
+    let output = Array::<f32>::alloc(ctx, &[output_len, 1, 1, 1])?;
 
-            let compute_pipeline =
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: None,
-                    layout: Some(&pipeline_layout),
-                    module: shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+    // Buffers can be larger than their arrays, so the kernel gets every length explicitly.
+    let mut scratch = Scratch::new(ctx);
+    let (params, params_bytes) = scratch.params(&[
+        kernel_len as u32,
+        to_u32(stride, "Stride")?,
+        to_u32(padding, "Padding")?,
+        input_len as u32,
+        output_len as u32,
+    ])?;
 
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&compute_pipeline);
-                cpass.set_bind_group(0, &bind_group, &[]);
-                cpass.dispatch_workgroups(workgroups, 1, 1);
-            }
+    let mut encoder = new_encoder(ctx);
+    ctx.dispatch(
+        &mut encoder,
+        Operation::CONV1D,
+        f32::type_suffix(),
+        [
+            bind(output.storage(), output.byte_len()),
+            bind(input.storage(), input.byte_len()),
+            bind(kernel.storage(), kernel.byte_len()),
+            bind(&params, params_bytes),
+        ],
+        dispatch_1d(output_len as u32),
+    )?;
+    ctx.queue().submit(Some(encoder.finish()));
 
-            Ok(())
-        };
+    Ok(output)
+}
 
-        // --- Pass 1: Bit-reverse input ---
-        let br_input_params: [u32; 2] = [n, input_len];
-        let br_input_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("BR Input Params"),
-            contents: bytemuck::cast_slice(&br_input_params),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+/// Runs an FFT-based 1D convolution on the GPU (f32 only) into a new array.
+/// The result is the full linear convolution, of length `input_len + kernel_len - 1`.
+pub(crate) fn conv1d_fft(input: &Array<f32>, kernel: &Array<f32>) -> Result<Array<f32>> {
+    same_context(input, kernel)?;
+    check_kernel(kernel)?;
+    let ctx = input.context();
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        dispatch(
-            &mut encoder,
-            "fft_bit_reverse_f32",
-            &[
-                (&input_fft_buf, false),
-                (&input_buf.storage_buffer, true),
-                (&br_input_params_buf, true),
-            ],
-            (n + 63) / 64,
-        )?;
-        queue.submit(Some(encoder.finish()));
+    let input_len = input.len() as u32;
+    let kernel_len = kernel.len() as u32;
+    let output_len = input.len() + kernel.len() - 1;
+    let n = u32::try_from(output_len)
+        .ok()
+        .and_then(u32::checked_next_power_of_two)
+        .ok_or(LumaError::DimensionTooLarge { shape: [output_len, 1, 1, 1] })?;
+    let log2n = n.trailing_zeros();
 
-        // --- Pass 2: Bit-reverse kernel ---
-        let br_kernel_params: [u32; 2] = [n, kernel_len];
-        let br_kernel_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("BR Kernel Params"),
-            contents: bytemuck::cast_slice(&br_kernel_params),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+    let output = Array::<f32>::alloc(ctx, &[output_len, 1, 1, 1])?;
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        dispatch(
-            &mut encoder,
-            "fft_bit_reverse_f32",
-            &[
-                (&kernel_fft_buf, false),
-                (&kernel_buf.storage_buffer, true),
-                (&br_kernel_params_buf, true),
-            ],
-            (n + 63) / 64,
-        )?;
-        queue.submit(Some(encoder.finish()));
+    let mut scratch = Scratch::new(ctx);
 
-        // --- Pass 3: FFT butterfly on input (log2(N) stages) ---
-        let half_n_workgroups = (n / 2 + 63) / 64;
+    // Complex buffers (interleaved re/im, so 2*N f32s each). Every pass writes all N entries of
+    // the buffer it produces, so stale pool contents never leak into the result.
+    let complex_bytes = u64::from(n) * 2 * 4;
+    let input_fft = scratch.storage(complex_bytes)?;
+    let kernel_fft = scratch.storage(complex_bytes)?;
+    let product = scratch.storage(complex_bytes)?;
+
+    let suffix = f32::type_suffix();
+    let n_groups = dispatch_1d(n);
+    let half_n_groups = dispatch_1d(n / 2);
+    let mut encoder = new_encoder(ctx);
+
+    // --- Pass 1: Bit-reverse input ---
+    let (params, params_bytes) = scratch.params(&[n, input_len])?;
+    ctx.dispatch(
+        &mut encoder,
+        Operation::FFT_BIT_REVERSE,
+        suffix,
+        [
+            bind(&input_fft, complex_bytes),
+            bind(input.storage(), input.byte_len()),
+            bind(&params, params_bytes),
+        ],
+        n_groups,
+    )?;
+
+    // --- Pass 2: Bit-reverse kernel ---
+    let (params, params_bytes) = scratch.params(&[n, kernel_len])?;
+    ctx.dispatch(
+        &mut encoder,
+        Operation::FFT_BIT_REVERSE,
+        suffix,
+        [
+            bind(&kernel_fft, complex_bytes),
+            bind(kernel.storage(), kernel.byte_len()),
+            bind(&params, params_bytes),
+        ],
+        n_groups,
+    )?;
+
+    // --- Pass 3 + 4: FFT butterfly on input, then kernel (log2(N) stages each) ---
+    for fft_buffer in [&input_fft, &kernel_fft] {
         for stage in 0..log2n {
-            let fft_params: [u32; 2] = [n, stage];
-            let fft_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("FFT Butterfly Params"),
-                contents: bytemuck::cast_slice(&fft_params),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            dispatch(
+            let (params, params_bytes) = scratch.params(&[n, stage])?;
+            ctx.dispatch(
                 &mut encoder,
-                "fft_butterfly_f32",
-                &[(&input_fft_buf, false), (&fft_params_buf, true)],
-                half_n_workgroups,
+                Operation::FFT_BUTTERFLY,
+                suffix,
+                [bind(fft_buffer, complex_bytes), bind(&params, params_bytes)],
+                half_n_groups,
             )?;
-            queue.submit(Some(encoder.finish()));
         }
-
-        // --- Pass 4: FFT butterfly on kernel (log2(N) stages) ---
-        for stage in 0..log2n {
-            let fft_params: [u32; 2] = [n, stage];
-            let fft_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("FFT Butterfly Params"),
-                contents: bytemuck::cast_slice(&fft_params),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            dispatch(
-                &mut encoder,
-                "fft_butterfly_f32",
-                &[(&kernel_fft_buf, false), (&fft_params_buf, true)],
-                half_n_workgroups,
-            )?;
-            queue.submit(Some(encoder.finish()));
-        }
-
-        // --- Pass 5: Complex multiply ---
-        let cmul_params: [u32; 1] = [n];
-        let cmul_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Complex Mul Params"),
-            contents: bytemuck::cast_slice(&cmul_params),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        dispatch(
-            &mut encoder,
-            "fft_complex_mul_f32",
-            &[
-                (&product_buf, false),
-                (&input_fft_buf, true),
-                (&kernel_fft_buf, true),
-                (&cmul_params_buf, true),
-            ],
-            (n + 63) / 64,
-        )?;
-        queue.submit(Some(encoder.finish()));
-
-        // --- Pass 6: Complex bit-reverse product → input_fft (reused) for IFFT ---
-        let cbr_params: [u32; 1] = [n];
-        let cbr_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Complex BR Params"),
-            contents: bytemuck::cast_slice(&cbr_params),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        dispatch(
-            &mut encoder,
-            "fft_complex_bit_reverse_f32",
-            &[
-                (&input_fft_buf, false),
-                (&product_buf, true),
-                (&cbr_params_buf, true),
-            ],
-            (n + 63) / 64,
-        )?;
-        queue.submit(Some(encoder.finish()));
-
-        // --- Pass 7: IFFT butterfly on input_fft_buf (log2(N) stages) ---
-        for stage in 0..log2n {
-            let is_last = if stage == log2n - 1 { 1u32 } else { 0u32 };
-            let ifft_params: [u32; 3] = [n, stage, is_last];
-            let ifft_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("IFFT Butterfly Params"),
-                contents: bytemuck::cast_slice(&ifft_params),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            dispatch(
-                &mut encoder,
-                "ifft_butterfly_f32",
-                &[(&input_fft_buf, false), (&ifft_params_buf, true)],
-                half_n_workgroups,
-            )?;
-            queue.submit(Some(encoder.finish()));
-        }
-
-        // --- Pass 8: Extract real ---
-        let extract_params: [u32; 1] = [output_len as u32];
-        let extract_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Extract Real Params"),
-            contents: bytemuck::cast_slice(&extract_params),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        dispatch(
-            &mut encoder,
-            "fft_extract_real_f32",
-            &[
-                (&output_buffer, false),
-                (&input_fft_buf, true),
-                (&extract_params_buf, true),
-            ],
-            (output_len as u32 + 63) / 64,
-        )?;
-        queue.submit(Some(encoder.finish()));
-
-        // Store result
-        let dims: [u32; 4] = [u32::try_from(output_len).map_err(|_| "Output length exceeds u32::MAX")?, 1, 1, 1];
-        let dims_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("FFT Conv1D Output Dimensions"),
-            contents: bytemuck::cast_slice(&dims),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        let new_id = uuid::Uuid::new_v4().to_string();
-        drop(buffers);
-
-        self.buffers.write().unwrap().insert(
-            new_id.clone(),
-            Buffers {
-                storage_buffer: output_buffer,
-                staging_buffer: None,
-                dimensions_buffer: dims_buffer,
-                element_size: 4,
-                type_suffix: "_f32".to_string(),
-            },
-        );
-
-        Ok((new_id, output_len))
     }
+
+    // --- Pass 5: Complex multiply ---
+    let (params, params_bytes) = scratch.params(&[n])?;
+    ctx.dispatch(
+        &mut encoder,
+        Operation::FFT_COMPLEX_MUL,
+        suffix,
+        [
+            bind(&product, complex_bytes),
+            bind(&input_fft, complex_bytes),
+            bind(&kernel_fft, complex_bytes),
+            bind(&params, params_bytes),
+        ],
+        n_groups,
+    )?;
+
+    // --- Pass 6: Complex bit-reverse product -> input_fft (reused) for IFFT ---
+    let (params, params_bytes) = scratch.params(&[n])?;
+    ctx.dispatch(
+        &mut encoder,
+        Operation::FFT_COMPLEX_BIT_REVERSE,
+        suffix,
+        [
+            bind(&input_fft, complex_bytes),
+            bind(&product, complex_bytes),
+            bind(&params, params_bytes),
+        ],
+        n_groups,
+    )?;
+
+    // --- Pass 7: IFFT butterfly on input_fft (log2(N) stages) ---
+    for stage in 0..log2n {
+        let is_last = u32::from(stage == log2n - 1);
+        let (params, params_bytes) = scratch.params(&[n, stage, is_last])?;
+        ctx.dispatch(
+            &mut encoder,
+            Operation::IFFT_BUTTERFLY,
+            suffix,
+            [bind(&input_fft, complex_bytes), bind(&params, params_bytes)],
+            half_n_groups,
+        )?;
+    }
+
+    // --- Pass 8: Extract real ---
+    let (params, params_bytes) = scratch.params(&[output_len as u32])?;
+    ctx.dispatch(
+        &mut encoder,
+        Operation::FFT_EXTRACT_REAL,
+        suffix,
+        [
+            bind(output.storage(), output.byte_len()),
+            bind(&input_fft, complex_bytes),
+            bind(&params, params_bytes),
+        ],
+        dispatch_1d(output_len as u32),
+    )?;
+
+    ctx.queue().submit(Some(encoder.finish()));
+
+    Ok(output)
 }

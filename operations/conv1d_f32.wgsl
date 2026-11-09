@@ -1,13 +1,15 @@
 @group(0) @binding(0) var<storage, read_write> output: array<f32>;
 @group(0) @binding(1) var<storage, read> input_data: array<f32>;
 @group(0) @binding(2) var<storage, read> kernel: array<f32>;
-@group(0) @binding(3) var<storage, read> params: array<u32, 3>;
+// [kernel_len, stride, padding, input_len, output_len]. Buffers may be larger than the arrays
+// they hold, so lengths are passed explicitly instead of using arrayLength().
+@group(0) @binding(3) var<storage, read> params: array<u32, 5>;
 
 @compute
 @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let out_idx = global_id.x;
-    let output_len = arrayLength(&output);
+    let output_len = params[4];
     if (out_idx >= output_len) {
         return;
     }
@@ -18,7 +20,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let in_start = i32(out_idx * stride) - i32(padding);
     var sum: f32 = 0.0;
-    let input_len = arrayLength(&input_data);
+    let input_len = params[3];
 
     for (var k: u32 = 0u; k < kernel_len; k = k + 1u) {
         let in_idx = in_start + i32(k);

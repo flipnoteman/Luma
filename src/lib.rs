@@ -1,45 +1,29 @@
-#![allow(dead_code)]
-extern crate core;
+//! GPU-driven linear algebra/math library.
+//!
+//! Everything starts at a [`Context`], an explicit handle to a GPU device. It creates [`Array`]s,
+//! which own their GPU buffer and run operations on the GPU. Operations are submitted without
+//! waiting for the GPU; [`Array::read`] is the one call that blocks until results are ready.
+//!
+//! # Example
+//! ```no_run
+//! let ctx = luma::Context::new()?;
+//!
+//! let a = ctx.from_slice(&[3, 1, 1, 1], &[1u32, 6, 5])?;
+//! let b = ctx.from_slice(&[3, 1, 1, 1], &[4u32, 12, 10])?;
+//!
+//! let sum = a.add(&b)?.double()?;
+//! assert_eq!(sum.read()?, vec![10, 36, 30]);
+//! # Ok::<(), luma::LumaError>(())
+//! ```
 
 mod array;
-mod executor;
+mod context;
+mod error;
 mod gpu;
 mod gpu_type;
 mod operations;
 
 pub use array::Array;
+pub use context::Context;
+pub use error::{LumaError, Result};
 pub use gpu_type::GpuType;
-
-use crate::executor::Executor;
-use tokio::sync::OnceCell;
-
-/// Instantiates a new [Array]
-/// The first argument is the dimensions of the array, while the second is the data to initialize it
-/// with.
-///
-/// # Example
-/// ```no_run
-/// use luma::Array;
-/// async {
-///     let array1 = luma::array!(&[3, 1, 1, 1], &[1u32, 6u32, 5u32]);
-/// };
-/// ```
-#[macro_export]
-macro_rules! array {
-    ($dims:expr, $data:expr) => {
-        Array::new($dims, $data)
-        .await.expect("Could not create Array.")
-    };
-}
-
-
-/// Static thread-safe executor with interior mutability.
-static EXECUTOR: OnceCell<Executor> = OnceCell::const_new();
-
-/// Ensure the executor is initialized. Only the first caller creates it;
-/// concurrent callers wait for that initialization to finish.
-async fn ensure_executor() -> &'static Executor {
-    EXECUTOR.get_or_init(|| async {
-        Executor::new().await.unwrap()
-    }).await
-}
