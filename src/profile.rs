@@ -26,7 +26,9 @@ pub struct KernelTiming {
     /// The label of the kernel: the one given to
     /// [`KernelBuilder::label`](crate::KernelBuilder::label), otherwise its entry point name.
     /// Built-in operations are labelled by operation and element type, for example
-    /// `Binary(Add, Arrays) f32`.
+    /// `Fill f32`. Fused elementwise kernels (see the lazy arrays in [`Array`](crate::Array)) are
+    /// labelled by the operations they contain, for example `Fused(Mul, Add, Sqrt) f32`, or
+    /// `FusedReduce(Sum: Mul, Add) f32` for a reduction whose first pass computes the expression.
     pub label: String,
     /// How many launches were measured.
     pub launches: u32,

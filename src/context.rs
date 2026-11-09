@@ -7,6 +7,7 @@ use wgpu::{BindGroupEntry, BindingResource, Buffer, BufferBinding, BufferUsages}
 
 use crate::builtin::Builtin;
 use crate::error::{LumaError, Result};
+use crate::jit::JitState;
 use crate::gpu::handle;
 use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::pool::{self, BufferPool};
@@ -219,6 +220,8 @@ struct Inner {
     queue: wgpu::Queue,
     /// Built-in kernels, built on first use of their (operation, element type).
     builtins: Mutex<FxMap<(Builtin, &'static str), Arc<KernelCore>>>,
+    /// Lazy-evaluation state: fused kernels and the pending expressions.
+    jit: JitState,
     /// Custom kernels, built on first use of their (source, entry, workgroup).
     kernels: Mutex<FxMap<KernelKey, Arc<KernelCore>>>,
     pool: Mutex<BufferPool>,
@@ -349,6 +352,7 @@ impl Context {
                 device,
                 queue,
                 builtins: Mutex::new(FxMap::default()),
+                jit: JitState::new(&limits),
                 kernels: Mutex::new(FxMap::default()),
                 pool: Mutex::new(BufferPool::default()),
                 batch: Mutex::new(batch),
@@ -377,9 +381,18 @@ impl Context {
         self.take_gpu_error()
     }
 
+    pub(crate) fn jit(&self) -> &JitState {
+        &self.inner.jit
+    }
+
     /// Submits the pending batch to the GPU and returns without waiting for it, so the GPU
     /// starts working while the host keeps recording. Everything recorded afterwards runs after
     /// it, in order. Does nothing if nothing is pending.
+    ///
+    /// Lazy arrays that are still alive count as recorded work: `flush` evaluates them first (each
+    /// as one fused kernel, so a chain is only cut at the flush point), which makes the GPU start
+    /// on elementwise expressions too. Expressions whose arrays were already dropped are never
+    /// evaluated.
     ///
     /// Only [`Context::sync`] and the operations that read results back
     /// ([`Array::to_vec`](crate::Array::to_vec), [`Array::eval`](crate::Array::eval),
@@ -400,6 +413,7 @@ impl Context {
     /// # Ok::<(), luma::LumaError>(())
     /// ```
     pub fn flush(&self) -> Result<()> {
+        self.jit().evaluate_live();
         let mut batch = self.batch()?;
         self.flush_locked(&mut batch);
         Ok(())
@@ -813,6 +827,9 @@ impl Context {
     ///
     /// Fails with [`LumaError::Profiling`] if profiling is not enabled.
     pub fn finish_profiling(&self) -> Result<Profile> {
+        // Lazy arrays still alive were computed inside the profiled region; record their fused
+        // kernels while the profiler is still on.
+        self.jit().evaluate_live();
         let resolved = {
             let mut batch = self.batch()?;
             if batch.profiler.is_none() {
@@ -963,6 +980,9 @@ mod tests {
         let a = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap();
         let storage = a.buffer().unwrap().clone();
         let doubled = &a * 2.0;
+        // Operators are lazy: record the multiplication (without waiting for it) so that it is
+        // pending in the batch, reading a's buffer.
+        assert!(doubled.ready().is_ok());
         assert!(ctx.pending_dispatches() > 0, "the multiplication must still be pending");
         drop(a);
 

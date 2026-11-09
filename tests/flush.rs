@@ -55,3 +55,12 @@ fn flush_returns_while_the_gpu_is_still_running() {
         "flush took {flush_time:?}, the sync after it {sync_time:?}"
     );
 }
+
+#[test]
+fn flush_evaluates_live_lazy_arrays() {
+    let ctx = Context::new().unwrap();
+    let x = Array::<f32>::full_on(&ctx, 64, 3.0).unwrap();
+    let y = &x * 2.0 + 1.0; // lazy: nothing recorded yet
+    ctx.flush().unwrap();
+    assert_eq!(y.to_vec().unwrap(), vec![7.0; 64]);
+}

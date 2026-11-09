@@ -39,6 +39,7 @@ mod conv;
 mod error;
 mod gpu;
 mod gpu_type;
+mod jit;
 mod kernel;
 mod ops;
 mod profile;

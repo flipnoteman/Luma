@@ -136,3 +136,32 @@ fn enable_and_finish_profiling_bracket_manual_sections() {
     assert_eq!(profile.launches(), 2);
     assert_eq!(x.to_vec().unwrap(), vec![4.0; 100]);
 }
+
+#[test]
+fn profile_labels_fused_kernels_by_their_operations() {
+    let ctx = Context::new().unwrap();
+    if !ctx.profiling_supported() {
+        return;
+    }
+    let n = 4096;
+    let x = Array::<f32>::full_on(&ctx, n, 4.0).unwrap();
+    let y = Array::<f32>::full_on(&ctx, n, 5.0).unwrap();
+    // `z` is still lazy when the closure returns; finishing the profile records its kernel.
+    let ((z, total), profile) = ctx
+        .profile(|| {
+            let z = (&x * 2.0 + &y).sqrt();
+            let total = (&x * &y).sum().unwrap();
+            (z, total)
+        })
+        .unwrap();
+    println!("{profile}");
+    assert_eq!(total, 20.0 * n as f32);
+    let fused = profile
+        .kernels
+        .iter()
+        .find(|k| k.label == "Fused(Mul, Add, Sqrt) f32")
+        .expect("the fused elementwise kernel is listed by its operations");
+    assert_eq!(fused.launches, 1);
+    assert!(profile.kernels.iter().any(|k| k.label.starts_with("FusedReduce(Sum: Mul)")));
+    assert!(z.to_vec().unwrap().iter().all(|&v| (v - 13.0f32.sqrt()).abs() < 1e-5));
+}

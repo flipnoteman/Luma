@@ -1,10 +1,13 @@
 //! Operators, math functions and reductions on arrays.
 //!
-//! Every operation is a built-in kernel (see [`crate::builtin`]) recorded into the context's
-//! batch. Methods that return arrays never fail loudly: they return poisoned arrays (see
-//! [`Array`]). The `run_*` functions do the work and return the failure; the public methods turn
-//! it into a poisoned array tagged with the caller's location, or into a plain `Err` for the
-//! `try_*` methods.
+//! Elementwise operations (operators, math functions, comparisons, `select`, `powf`, `clamp`)
+//! are recorded as lazy expressions and fused into one generated kernel when their result is
+//! needed (see [`crate::jit`]); reductions fold the expression behind their input into their
+//! first pass. In-place operators, fills, shifts and the later reduction passes are plain
+//! built-in kernels (see [`crate::builtin`]) recorded into the context's batch. Methods that
+//! return arrays never fail loudly: they return poisoned arrays (see [`Array`]). The `run_*`
+//! functions do the work and return the failure; the public methods turn it into a poisoned
+//! array tagged with the caller's location, or into a plain `Err` for the `try_*` methods.
 
 use std::ops::{
     Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign,
@@ -13,14 +16,13 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{
-    BinOp, Builtin, CmpOp, Operands, ReduceOp, UnOp, REDUCE_BLOCK,
-};
+use crate::builtin::{BinOp, Builtin, CmpOp, ReduceOp, UnOp, REDUCE_BLOCK};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{GpuType, ScalarType};
+use crate::jit::{self, ElemTy, Op, OpKind, Scalar, Src};
 use crate::kernel::KernelCore;
-use crate::shape::Offsets;
+use crate::shape::{Offsets, Shape};
 
 type Outcome<T> = std::result::Result<T, Failure>;
 
@@ -59,7 +61,7 @@ impl_operand!(u32);
 
 /// Splits `count` workgroups into a 2D grid within the per-dimension limit; shaders recombine
 /// them as `x + y * num_workgroups.x`.
-fn fold_workgroups(ctx: &Context, count: u32) -> Result<[u32; 3]> {
+pub(crate) fn fold_workgroups(ctx: &Context, count: u32) -> Result<[u32; 3]> {
     let max = ctx.max_workgroups_per_dimension();
     let groups = count.max(1);
     let x = groups.min(max).max(1);
@@ -86,37 +88,55 @@ fn len_u32(len: usize) -> Result<u32> {
     u32::try_from(len).map_err(|_| LumaError::InvalidShape(format!("{len} elements exceed u32")))
 }
 
-impl<T: ScalarType> Array<T> {
-    // -- Kernel runners --
+/// Records the lazy operation `op` on `args` as an array of `shape`. Nothing runs yet.
+fn lazy<O: GpuType>(
+    ctx: &Context,
+    shape: Shape,
+    op: Op,
+    args: [Src; 3],
+    name: &'static str,
+    location: &'static Location<'static>,
+) -> Outcome<Array<O>> {
+    let node = jit::create(ctx, shape.len(), op, args, name, location)?;
+    Ok(Array::from_node(ctx, shape, node))
+}
 
-    /// `out = f(self)` for a unary kernel.
-    fn run_unary(&self, op: Builtin) -> Outcome<Array<T>> {
-        let (a, a_bytes) = self.ready()?;
-        let out = Array::<T>::alloc(self.context(), self.shape())?;
-        let (out_buf, out_bytes) = out.ready()?;
-        let core = self.context().builtin(op, T::wgsl_type())?;
-        launch_1d(
+impl<T: ScalarType> Array<T> {
+    // -- Lazy operations --
+
+    /// `f(self)` for a unary operation.
+    fn run_unary(
+        &self,
+        op: UnOp,
+        location: &'static Location<'static>,
+    ) -> Outcome<Array<T>> {
+        let operand = self.src()?;
+        let op_kind = Op::new(OpKind::Unary(op), ElemTy::of::<T>()?);
+        lazy(
             self.context(),
-            &core,
-            len_u32(self.len())?,
-            &[RawArg::write(out_buf, out_bytes), RawArg::read(a, a_bytes)],
-        )?;
-        Ok(out)
+            self.shape(),
+            op_kind,
+            [operand, Src::unused(), Src::unused()],
+            op.name(),
+            location,
+        )
     }
 
-    /// `out = self op rhs` (or `rhs op self` if `scalar_left`, which only exists for scalars),
+    /// `self op rhs` (or `rhs op self` if `scalar_left`, which only exists for scalars),
     /// producing elements of type `O`.
     fn run_binary<O: GpuType>(
         &self,
         rhs: Rhs<'_, T>,
         scalar_left: bool,
-        kernel: impl Fn(Operands) -> Builtin,
+        kind: OpKind,
+        name: &'static str,
+        location: &'static Location<'static>,
     ) -> Outcome<Array<O>> {
         let ctx = self.context();
-        let (a, a_bytes) = self.ready()?;
-        match rhs {
+        let this = self.src()?;
+        let other = match rhs {
             Rhs::Array(other) => {
-                let (b, b_bytes) = other.ready()?;
+                let operand = other.src()?;
                 if !ctx.same_as(other.context()) {
                     return Err(LumaError::ContextMismatch.into());
                 }
@@ -127,45 +147,25 @@ impl<T: ScalarType> Array<T> {
                     }
                     .into());
                 }
-                let out = Array::<O>::alloc(ctx, self.shape())?;
-                let (out_buf, out_bytes) = out.ready()?;
-                let core = ctx.builtin(kernel(Operands::Arrays), T::wgsl_type())?;
-                launch_1d(
-                    ctx,
-                    &core,
-                    len_u32(self.len())?,
-                    &[
-                        RawArg::write(out_buf, out_bytes),
-                        RawArg::read(a, a_bytes),
-                        RawArg::read(b, b_bytes),
-                    ],
-                )?;
-                Ok(out)
+                operand
             }
-            Rhs::Scalar(scalar) => {
-                let out = Array::<O>::alloc(ctx, self.shape())?;
-                let (out_buf, out_bytes) = out.ready()?;
-                let operands =
-                    if scalar_left { Operands::ScalarArray } else { Operands::ArrayScalar };
-                let core = ctx.builtin(kernel(operands), T::wgsl_type())?;
-                launch_1d(
-                    ctx,
-                    &core,
-                    len_u32(self.len())?,
-                    &[
-                        RawArg::write(out_buf, out_bytes),
-                        RawArg::read(a, a_bytes),
-                        RawArg::Uniform(bytemuck::bytes_of(&scalar)),
-                    ],
-                )?;
-                Ok(out)
-            }
-        }
+            Rhs::Scalar(value) => Src::Scalar(Scalar::of(value)?),
+        };
+        let (left, right) = if scalar_left { (other, this) } else { (this, other) };
+        lazy(
+            ctx,
+            self.shape(),
+            Op::new(kind, ElemTy::of::<T>()?),
+            [left, right, Src::unused()],
+            name,
+            location,
+        )
     }
 
-    /// `self = self op rhs`.
+    /// `self = self op rhs`, as a kernel running now over the array's buffer.
     fn run_in_place(&self, rhs: Rhs<'_, T>, op: BinOp) -> Outcome<()> {
         let ctx = self.context();
+        let storage = self.storage()?;
         let (a, a_bytes) = self.ready()?;
         let n = len_u32(self.len())?;
         match rhs {
@@ -181,6 +181,8 @@ impl<T: ScalarType> Array<T> {
                     }
                     .into());
                 }
+                // Lazy operations recorded earlier still read the old contents.
+                storage.readers.flush();
                 let core = ctx.builtin(Builtin::InPlaceArray(op), T::wgsl_type())?;
                 launch_1d(
                     ctx,
@@ -190,6 +192,7 @@ impl<T: ScalarType> Array<T> {
                 )?;
             }
             Rhs::Scalar(scalar) => {
+                storage.readers.flush();
                 let core = ctx.builtin(Builtin::InPlaceScalar(op), T::wgsl_type())?;
                 launch_1d(
                     ctx,
@@ -216,26 +219,43 @@ impl<T: ScalarType> Array<T> {
         name: &'static str,
     ) -> Array<T> {
         let location = Location::caller();
-        let result = self.run_binary(rhs, scalar_left, |operands| Builtin::Binary(op, operands));
+        let result = self.run_binary(rhs, scalar_left, OpKind::Binary(op), name, location);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
 
     #[track_caller]
     fn compare(&self, rhs: Rhs<'_, T>, op: CmpOp, name: &'static str) -> Array<u32> {
         let location = Location::caller();
-        let result = self.run_binary(rhs, false, |operands| Builtin::Compare(op, operands));
+        let result = self.run_binary(rhs, false, OpKind::Compare(op), name, location);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
 
-    fn try_binary(&self, rhs: Rhs<'_, T>, op: BinOp) -> Result<Array<T>> {
-        self.run_binary(rhs, false, |operands| Builtin::Binary(op, operands))
-            .map_err(Failure::into_error)
+    /// Like [`Array::binary`], but fails immediately with the plain error, and evaluates the
+    /// result right away so that failures of the evaluation itself (out of memory, ...) are
+    /// reported here too.
+    #[track_caller]
+    fn try_binary(&self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str) -> Result<Array<T>> {
+        let location = Location::caller();
+        let out = self
+            .run_binary(rhs, false, OpKind::Binary(op), name, location)
+            .map_err(Failure::into_error)?;
+        out.ready().map_err(|failure| failure.into_error().root().clone())?;
+        Ok(out)
     }
 
     #[track_caller]
     pub(crate) fn assign(&mut self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str) {
         let location = Location::caller();
-        match self.run_in_place(rhs, op) {
+        let result = if self.pending().is_some() {
+            // The target is an expression without a buffer, so nothing can observe it changing:
+            // it simply becomes the expression `self op rhs`, and stays fusable.
+            self.run_binary(rhs, false, OpKind::Binary(op), name, location).map(|new: Array<T>| {
+                *self = new;
+            })
+        } else {
+            self.run_in_place(rhs, op)
+        };
+        match result {
             Ok(()) => {}
             // Already poisoned (by itself or by the right-hand side): keep that error.
             Err(Failure::Inherited(error)) => {
@@ -252,23 +272,27 @@ impl<T: ScalarType> Array<T> {
     // -- Eager arithmetic --
 
     /// `self + rhs`, failing immediately instead of returning a poisoned array.
+    #[track_caller]
     pub fn try_add(&self, rhs: impl Operand<T>) -> Result<Array<T>> {
-        self.try_binary(rhs.rhs(), BinOp::Add)
+        self.try_binary(rhs.rhs(), BinOp::Add, "add")
     }
 
     /// `self - rhs`, failing immediately instead of returning a poisoned array.
+    #[track_caller]
     pub fn try_sub(&self, rhs: impl Operand<T>) -> Result<Array<T>> {
-        self.try_binary(rhs.rhs(), BinOp::Sub)
+        self.try_binary(rhs.rhs(), BinOp::Sub, "sub")
     }
 
     /// `self * rhs`, failing immediately instead of returning a poisoned array.
+    #[track_caller]
     pub fn try_mul(&self, rhs: impl Operand<T>) -> Result<Array<T>> {
-        self.try_binary(rhs.rhs(), BinOp::Mul)
+        self.try_binary(rhs.rhs(), BinOp::Mul, "mul")
     }
 
     /// `self / rhs`, failing immediately instead of returning a poisoned array.
+    #[track_caller]
     pub fn try_div(&self, rhs: impl Operand<T>) -> Result<Array<T>> {
-        self.try_binary(rhs.rhs(), BinOp::Div)
+        self.try_binary(rhs.rhs(), BinOp::Div, "div")
     }
 
     // -- Elementwise min / max --
@@ -417,8 +441,10 @@ impl<T: ScalarType> Array<T> {
 
 /// Reduces the whole array on the GPU with a workgroup tree reduction: every pass combines
 /// pairs, `first` for the first pass over the data and `rest` for the passes over partial
-/// results, until one element is left, which is read back. `wgsl` is the WGSL type of the
-/// elements; for vectors the operations act on every component separately. Synchronizes.
+/// results, until one element is left, which is read back. If the array is a pending lazy
+/// expression, the first pass computes it on the fly instead of reading a materialized buffer.
+/// `wgsl` is the WGSL type of the elements; for vectors (which are never lazy) the operations
+/// act on every component separately. Synchronizes.
 fn reduce_array<T: GpuType>(
     array: &Array<T>,
     wgsl: &'static str,
@@ -426,14 +452,23 @@ fn reduce_array<T: GpuType>(
     rest: ReduceOp,
 ) -> Result<T> {
     let ctx = array.context();
-    let (input, _) = array.ready().map_err(Failure::into_error)?;
     let elem = std::mem::size_of::<T>() as u64;
     let mut scratch = Scratch::new(ctx);
 
-    let mut current = input.clone();
-    let mut n = len_u32(array.len())?;
-    let mut op = first;
-    loop {
+    let fused = match array.pending() {
+        Some(node) => {
+            jit::reduce_first_pass(node, first, &mut scratch).map_err(Failure::into_error)?
+        }
+        None => None,
+    };
+    let (mut current, mut n, mut op, mut remaining) = match fused {
+        Some((partial, groups)) => (partial, groups, rest, groups > 1),
+        None => {
+            let (input, _) = array.ready().map_err(Failure::into_error)?;
+            (input.clone(), len_u32(array.len())?, first, true)
+        }
+    };
+    while remaining {
         let groups = n.div_ceil(REDUCE_BLOCK);
         let out = scratch.take(u64::from(groups) * elem)?;
         let core = ctx.builtin(Builtin::Reduce(op), wgsl)?;
@@ -450,9 +485,7 @@ fn reduce_array<T: GpuType>(
         current = out;
         n = groups;
         op = rest;
-        if groups == 1 {
-            break;
-        }
+        remaining = groups > 1;
     }
 
     let bytes = ctx.read_bytes(&current, elem)?;
@@ -499,15 +532,20 @@ vector_reductions!(4, "vec4<f32>");
 #[track_caller]
 pub fn select<T: ScalarType>(mask: &Array<u32>, a: &Array<T>, b: &Array<T>) -> Array<T> {
     let location = Location::caller();
-    let result = run_select(mask, a, b);
+    let result = run_select(mask, a, b, location);
     Array::resolve(a.context(), a.shape(), result, "select", location)
 }
 
-fn run_select<T: ScalarType>(mask: &Array<u32>, a: &Array<T>, b: &Array<T>) -> Outcome<Array<T>> {
+fn run_select<T: ScalarType>(
+    mask: &Array<u32>,
+    a: &Array<T>,
+    b: &Array<T>,
+    location: &'static Location<'static>,
+) -> Outcome<Array<T>> {
     let ctx = a.context();
-    let (a_buf, a_bytes) = a.ready()?;
-    let (b_buf, b_bytes) = b.ready()?;
-    let (m_buf, m_bytes) = mask.ready()?;
+    let a_src = a.src()?;
+    let b_src = b.src()?;
+    let mask_src = mask.src()?;
     if !ctx.same_as(b.context()) || !ctx.same_as(mask.context()) {
         return Err(LumaError::ContextMismatch.into());
     }
@@ -516,21 +554,14 @@ fn run_select<T: ScalarType>(mask: &Array<u32>, a: &Array<T>, b: &Array<T>) -> O
             return Err(LumaError::ShapeMismatch { lhs: a.shape().dims(), rhs: other.dims() }.into());
         }
     }
-    let out = Array::<T>::alloc(ctx, a.shape())?;
-    let (out_buf, out_bytes) = out.ready()?;
-    let core = ctx.builtin(Builtin::Select, T::wgsl_type())?;
-    launch_1d(
+    lazy(
         ctx,
-        &core,
-        len_u32(a.len())?,
-        &[
-            RawArg::write(out_buf, out_bytes),
-            RawArg::read(m_buf, m_bytes),
-            RawArg::read(a_buf, a_bytes),
-            RawArg::read(b_buf, b_bytes),
-        ],
-    )?;
-    Ok(out)
+        a.shape(),
+        Op::new(OpKind::Select, ElemTy::of::<T>()?),
+        [mask_src, a_src, b_src],
+        "select",
+        location,
+    )
 }
 
 // -- Math functions on f32 arrays --
@@ -544,7 +575,7 @@ macro_rules! unary_methods {
                 pub fn $name(&self) -> Array<f32> {
                     let location = Location::caller();
                     let op: UnOp = $op;
-                    let result = self.run_unary(Builtin::Unary(op));
+                    let result = self.run_unary(op, location);
                     Array::resolve(self.context(), self.shape(), result, op.name(), location)
                 }
             )*
@@ -574,7 +605,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn powf(&self, exponent: f32) -> Array<f32> {
         let location = Location::caller();
-        let result = self.run_with_params(Builtin::Powf, bytemuck::bytes_of(&exponent));
+        let result = self.run_scalars(OpKind::Powf, [Some(Scalar::f32(exponent)), None], "powf", location);
         Array::resolve(self.context(), self.shape(), result, "powf", location)
     }
 
@@ -582,24 +613,26 @@ impl Array<f32> {
     #[track_caller]
     pub fn clamp(&self, lo: f32, hi: f32) -> Array<f32> {
         let location = Location::caller();
-        let result = self.run_with_params(Builtin::Clamp, bytemuck::bytes_of(&[lo, hi]));
+        let result = self.run_scalars(
+            OpKind::Clamp,
+            [Some(Scalar::f32(lo)), Some(Scalar::f32(hi))],
+            "clamp",
+            location,
+        );
         Array::resolve(self.context(), self.shape(), result, "clamp", location)
     }
 
-    /// `out = f(self)` for a kernel taking one uniform.
-    fn run_with_params(&self, op: Builtin, params: &[u8]) -> Outcome<Array<f32>> {
-        let ctx = self.context();
-        let (a, a_bytes) = self.ready()?;
-        let out = Array::<f32>::alloc(ctx, self.shape())?;
-        let (out_buf, out_bytes) = out.ready()?;
-        let core = ctx.builtin(op, f32::wgsl_type())?;
-        launch_1d(
-            ctx,
-            &core,
-            len_u32(self.len())?,
-            &[RawArg::write(out_buf, out_bytes), RawArg::read(a, a_bytes), RawArg::Uniform(params)],
-        )?;
-        Ok(out)
+    /// `f(self, scalars...)` for an operation whose other operands are scalars.
+    fn run_scalars(
+        &self,
+        kind: OpKind,
+        scalars: [Option<Scalar>; 2],
+        name: &'static str,
+        location: &'static Location<'static>,
+    ) -> Outcome<Array<f32>> {
+        let operand = self.src()?;
+        let [first, second] = scalars.map(|s| s.map_or_else(Src::unused, Src::Scalar));
+        lazy(self.context(), self.shape(), Op::new(kind, ElemTy::F32), [operand, first, second], name, location)
     }
 
     /// The mean of all elements (the sum computed on the GPU, divided on the host).
@@ -621,7 +654,7 @@ impl Neg for &Array<f32> {
     #[track_caller]
     fn neg(self) -> Array<f32> {
         let location = Location::caller();
-        let result = self.run_unary(Builtin::Unary(UnOp::Neg));
+        let result = self.run_unary(UnOp::Neg, location);
         Array::resolve(self.context(), self.shape(), result, "neg", location)
     }
 }

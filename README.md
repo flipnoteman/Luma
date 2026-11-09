@@ -91,9 +91,29 @@ dispatches piled up. Hundreds of small operations cost one submission, not hundr
 (`cargo run --release --example bench_batching`). `ctx.flush()` (or `luma::flush()` for the default
 context) submits what is pending *without waiting*, so the GPU starts while the host keeps
 recording: flush after each chunk of a time-stepping loop and read results back only once in a
-while. Only `sync` and the readbacks wait. Host uploads, `write`, and the values of
+while. Live lazy arrays (see below) count as recorded work: `flush` evaluates them first, each as
+one fused kernel, so the GPU starts on elementwise chains too. Only `sync` and the readbacks wait. Host uploads, `write`, and the values of
 uniforms are recorded in order with the work around them, so reusing or overwriting an array never
 affects operations recorded before it.
+
+## Elementwise chains are fused
+
+Operators, math functions, comparisons, `select`, `powf` and `clamp` do not run when you write
+them: they build an expression, and the array you get back is *lazy*. When something needs its
+data (`to_vec`, `eval`, `write`, a shift or convolution, a custom kernel, `Context::sync`), the
+whole expression is compiled into **one** generated kernel that reads every input once and writes
+the result once, so `(&x * 2.0 + &y).sqrt() - 1.0` is a single dispatch with no temporaries.
+Reductions fold the expression into their first pass: `(&a * &b).sum()?` never materializes the
+product (the `[f32; 2]`/`[f32; 4]` arrays above are never lazy; they reduce a buffer). Kernels are cached by the structure of the expression, so changing a scalar (`&x * dt`
+with a new `dt` every step) reuses the pipeline.
+
+A lazy array is the value its expression had when you wrote it down: overwriting an input
+afterwards (`write`, `+=`, a kernel taking `&mut`) does not change it. Errors still arise where
+the faulty operation is written, with its source location. Fusion stops at 64 operations per
+kernel or at the device's binding limit (the expression is cut and continues in the next kernel),
+and a result used by several operations is computed once instead of inside each of them.
+`LUMA_FUSION_MAX_NODES=1` in the environment disables fusion (one kernel per operation); the
+effect is measured by `cargo run --release --example bench_fusion`.
 
 ## Errors do not panic
 
@@ -179,7 +199,8 @@ operand.
 
 Where the adapter supports timestamp queries, `ctx.profile(|| { ... })` returns the GPU time of
 every kernel launched inside the closure, by label (a custom kernel's `.label(..)`, default its
-entry point; built-in operations by operation and element type):
+entry point; built-in operations by operation and element type; fused kernels by the operations
+they contain, e.g. `Fused(Mul, Add, Sqrt) f32`):
 
 ```rs
 let spin = ctx.kernel(SPIN).label("spin").build()?;
@@ -192,7 +213,7 @@ let (c, profile) = ctx.profile(|| {
 println!("{profile}");
 // kernel                        launches     total us      mean us       min us       max us
 // spin                                10     12137.63      1213.76      1211.94      1214.66
-// Binary(Mul, ArrayScalar) f32         1         3.74         3.74         3.74         3.74
+// Fused(Mul) f32                       1         3.74         3.74         3.74         3.74
 // (a run of this snippet's kernel on an RTX 3090)
 ```
 
@@ -209,4 +230,5 @@ cargo run --example conv1d
 cargo run --release --example bench_conv1d      # spatial vs FFT convolution
 cargo run --release --example bench_batching    # sync after every op vs batched
 cargo run --release --example bench_launch      # host cost per kernel launch, flush overlap
+cargo run --release --example bench_fusion      # one kernel per operation vs fused chains
 ```
