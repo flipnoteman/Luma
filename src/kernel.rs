@@ -19,6 +19,9 @@ fn luma_idx2(i: u32, j: u32) -> u32 { return i + j * luma.size.x; }
 fn luma_idx3(i: u32, j: u32, k: u32) -> u32 { return i + luma.size.x * (j + luma.size.y * k); }
 ";
 
+/// Arguments a launch validates into a stack array; more than this take one heap allocation.
+const INLINE_ARGS: usize = 16;
+
 /// What a kernel binding in `@group(1)` is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingKind {
@@ -70,6 +73,8 @@ impl KernelKey {
 pub(crate) struct KernelCore {
     /// Unique per built kernel; identifies it in the bind group cache.
     pub(crate) id: u64,
+    /// Names the kernel in a [`Profile`](crate::Profile).
+    pub(crate) label: Arc<str>,
     pub(crate) pipeline: wgpu::ComputePipeline,
     pub(crate) args_layout: wgpu::BindGroupLayout,
     bindings: Vec<BindingInfo>,
@@ -99,7 +104,8 @@ impl<'a> KernelBuilder<'a> {
         }
     }
 
-    /// Name of the `@compute` entry point. Defaults to `"main"`.
+    /// Name of the `@compute` entry point. Defaults to `"main"`. Only the bindings this entry
+    /// point uses become the kernel's arguments (see [`Kernel`]).
     pub fn entry(mut self, name: &str) -> Self {
         self.entry = name.to_owned();
         self
@@ -112,7 +118,8 @@ impl<'a> KernelBuilder<'a> {
         self
     }
 
-    /// Debug label for the GPU objects.
+    /// Debug label for the GPU objects. It also names the kernel in a
+    /// [`Profile`](crate::Profile); the default is the entry point name.
     pub fn label(mut self, label: &str) -> Self {
         self.label = Some(label.to_owned());
         self
@@ -152,11 +159,42 @@ pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) ->
     let module = naga::front::wgsl::parse_str(&combined)
         .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
 
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    );
+    let info = validator
+        .validate(&module)
+        .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
+
+    let (entry_index, entry) = module
+        .entry_points
+        .iter()
+        .enumerate()
+        .find(|(_, ep)| ep.name == key.entry && ep.stage == naga::ShaderStage::Compute)
+        .ok_or_else(|| {
+            let available: Vec<&str> = module
+                .entry_points
+                .iter()
+                .filter(|ep| ep.stage == naga::ShaderStage::Compute)
+                .map(|ep| ep.name.as_str())
+                .collect();
+            LumaError::KernelEntryPoint(format!(
+                "No @compute entry point `{}`; compute entry points: {available:?}",
+                key.entry
+            ))
+        })?;
+
     // Bindings: group 0 belongs to luma, user resources must be in group 1 with binding
-    // numbers 0..n.
+    // numbers 0..n. Only the globals the entry point uses count (directly or through the
+    // functions it calls), so one module can hold several entry points with different bindings.
+    let used = info.get_entry_point(entry_index);
     let mut user: Vec<(u32, BindingInfo)> = Vec::new();
-    for (_, var) in module.global_variables.iter() {
+    for (handle, var) in module.global_variables.iter() {
         let Some(rb) = var.binding else { continue };
+        if used[handle].is_empty() {
+            continue;
+        }
         let name = var.name.clone().unwrap_or_default();
         if rb.group == 0 {
             if name == "luma" && rb.binding == 0 {
@@ -195,38 +233,15 @@ pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) ->
     for (expected, (binding, info)) in user.iter().enumerate() {
         if *binding != expected as u32 {
             return Err(LumaError::KernelBinding(format!(
-                "@group(1) bindings must be numbered 0..n in argument order, but `{}` is \
-                 @binding({binding}) where @binding({expected}) was expected",
-                info.name
+                "the @group(1) bindings used by entry point `{}` must be numbered 0..n in \
+                 argument order, but `{}` is @binding({binding}) where @binding({expected}) \
+                 was expected",
+                key.entry, info.name
             )));
         }
     }
     let bindings: Vec<BindingInfo> = user.into_iter().map(|(_, info)| info).collect();
 
-    let mut validator = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
-    );
-    validator
-        .validate(&module)
-        .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
-
-    let entry = module
-        .entry_points
-        .iter()
-        .find(|ep| ep.name == key.entry && ep.stage == naga::ShaderStage::Compute)
-        .ok_or_else(|| {
-            let available: Vec<&str> = module
-                .entry_points
-                .iter()
-                .filter(|ep| ep.stage == naga::ShaderStage::Compute)
-                .map(|ep| ep.name.as_str())
-                .collect();
-            LumaError::KernelEntryPoint(format!(
-                "No @compute entry point `{}`; compute entry points: {available:?}",
-                key.entry
-            ))
-        })?;
     if entry.workgroup_size_overrides.is_some() {
         return Err(LumaError::KernelWorkgroup(
             "workgroup sizes that depend on `override` constants are not supported".into(),
@@ -317,6 +332,7 @@ pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>) ->
 
     Ok(KernelCore {
         id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
+        label: Arc::from(label.unwrap_or(&key.entry)),
         pipeline,
         args_layout,
         bindings,
@@ -355,9 +371,28 @@ enum ArgRepr<'a> {
         element_size: u32,
         writable: bool,
     },
-    Uniform(std::result::Result<Vec<u8>, String>),
+    Uniform(std::result::Result<UniformBytes, String>),
     /// The array passed here is poisoned; launching fails with its error.
     Poisoned(Arc<LumaError>),
+}
+
+/// Uniform values up to this many bytes are kept inside the [`KernelArg`], so passing one does
+/// not allocate.
+const INLINE_UNIFORM_BYTES: usize = 128;
+
+/// The encoded bytes of a uniform argument.
+enum UniformBytes {
+    Inline { len: usize, bytes: [u8; INLINE_UNIFORM_BYTES] },
+    Heap(Vec<u8>),
+}
+
+impl UniformBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            UniformBytes::Inline { len, bytes } => bytes.get(..*len).unwrap_or_default(),
+            UniformBytes::Heap(bytes) => bytes,
+        }
+    }
 }
 
 /// One kernel argument, bound to `@group(1)` at the position it has in [`args!`](crate::args).
@@ -401,19 +436,31 @@ pub fn uniform<'a, T>(value: &T) -> KernelArg<'a>
 where
     T: encase::ShaderType + encase::internal::WriteInto,
 {
-    let mut buffer = encase::UniformBuffer::new(Vec::<u8>::new());
-    let bytes = buffer
-        .write(value)
-        .map(|()| buffer.into_inner())
-        .map_err(|e| e.to_string());
-    KernelArg { repr: ArgRepr::Uniform(bytes) }
+    let size = value.size().get();
+    let encoded = match usize::try_from(size) {
+        Ok(len) if len <= INLINE_UNIFORM_BYTES => {
+            let mut buffer = encase::UniformBuffer::new([0u8; INLINE_UNIFORM_BYTES]);
+            buffer
+                .write(value)
+                .map(|()| UniformBytes::Inline { len, bytes: buffer.into_inner() })
+        }
+        _ => {
+            let mut buffer = encase::UniformBuffer::new(Vec::<u8>::new());
+            buffer.write(value).map(|()| UniformBytes::Heap(buffer.into_inner()))
+        }
+    };
+    KernelArg { repr: ArgRepr::Uniform(encoded.map_err(|e| e.to_string())) }
 }
 
-/// Builds the `Vec<KernelArg>` for [`Kernel::launch`]: `args![&x, &mut y, uniform(&params)]`.
+/// Builds the arguments for [`Kernel::launch`]: `args![&x, &mut y, uniform(&params)]`. The
+/// result is an array on the stack, so it does not allocate.
 #[macro_export]
 macro_rules! args {
-    ($($arg:expr),* $(,)?) => {
-        ::std::vec![$($crate::KernelArg::from($arg)),*]
+    () => {
+        [] as [$crate::KernelArg<'static>; 0]
+    };
+    ($($arg:expr),+ $(,)?) => {
+        [$($crate::KernelArg::from($arg)),+]
     };
 }
 
@@ -424,9 +471,16 @@ macro_rules! args {
 /// x fastest) in every kernel. The kernel's own resources must be in `@group(1)`, numbered from 0
 /// in the order of the arguments passed to [`Kernel::launch`].
 ///
+/// Only the globals the chosen entry point uses (directly or through the functions it calls)
+/// count: one WGSL module can hold several entry points that use different bindings, each built
+/// with [`KernelBuilder::entry`]. The bindings of an entry point must be numbered contiguously
+/// from 0 among *its* bindings; globals it does not use may be numbered, grouped or typed
+/// arbitrarily.
+///
 /// Launches join the context's automatic batch: they are recorded in order with the operators
 /// and math functions on arrays and run when the batch is submitted (at the next
-/// [`Array::to_vec`], [`Array::eval`] or [`Context::sync`], or when the batch grows large).
+/// [`Array::to_vec`], [`Array::eval`], [`Context::sync`] or [`Context::flush`], or when the batch
+/// grows large).
 ///
 /// Kernels are cheap to clone; building the same source twice on a context reuses the pipeline.
 #[derive(Clone, Debug)]
@@ -455,7 +509,11 @@ impl Kernel {
     /// Runs the kernel with at least `problem_size` invocations (`ceil(size / workgroup)`
     /// workgroups per dimension; `luma.size` is `problem_size`, so guard against
     /// `global_invocation_id >= luma.size`). Records the launch without waiting.
-    pub fn launch(&self, problem_size: impl ProblemSize, args: Vec<KernelArg<'_>>) -> Result<()> {
+    pub fn launch<'a>(
+        &self,
+        problem_size: impl ProblemSize,
+        args: impl AsRef<[KernelArg<'a>]>,
+    ) -> Result<()> {
         let size = problem_size.into_size();
         if size.contains(&0) {
             return Err(LumaError::InvalidShape(format!(
@@ -465,11 +523,15 @@ impl Kernel {
         let wg = self.core.workgroup;
         let [(sx, wx), (sy, wy), (sz, wz)] = [(size[0], wg[0]), (size[1], wg[1]), (size[2], wg[2])];
         let workgroups = [sx.div_ceil(wx), sy.div_ceil(wy), sz.div_ceil(wz)];
-        self.run(workgroups, size, &args)
+        self.run(workgroups, size, args.as_ref())
     }
 
     /// Runs exactly `workgroups` workgroups; `luma.size` is `workgroups * workgroup`.
-    pub fn launch_raw(&self, workgroups: [u32; 3], args: Vec<KernelArg<'_>>) -> Result<()> {
+    pub fn launch_raw<'a>(
+        &self,
+        workgroups: [u32; 3],
+        args: impl AsRef<[KernelArg<'a>]>,
+    ) -> Result<()> {
         if workgroups.contains(&0) {
             return Err(LumaError::InvalidShape(format!(
                 "Workgroup count {workgroups:?} has a zero dimension"
@@ -479,7 +541,7 @@ impl Kernel {
         // Within the device limit (checked in `run`) this cannot overflow; saturate otherwise.
         let [x, y, z] = workgroups;
         let size = [x.saturating_mul(wg[0]), y.saturating_mul(wg[1]), z.saturating_mul(wg[2])];
-        self.run(workgroups, size, &args)
+        self.run(workgroups, size, args.as_ref())
     }
 
     fn run(&self, workgroups: [u32; 3], size: [u32; 3], args: &[KernelArg<'_>]) -> Result<()> {
@@ -497,9 +559,21 @@ impl Kernel {
             });
         }
 
+        // The validated arguments, on the stack unless there are very many.
+        let mut inline = [RawArg::Uniform(&[]); INLINE_ARGS];
+        let mut heap;
+        let raw: &mut [RawArg<'_>] = match inline.get_mut(..args.len()) {
+            Some(raw) => raw,
+            None => {
+                heap = vec![RawArg::Uniform(&[]); args.len()];
+                &mut heap
+            }
+        };
+
         let max_uniform = ctx.max_uniform_bytes();
-        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(args.len());
-        for (index, (arg, info)) in args.iter().zip(&core.bindings).enumerate() {
+        for (index, ((arg, info), slot)) in
+            args.iter().zip(&core.bindings).zip(raw.iter_mut()).enumerate()
+        {
             match &arg.repr {
                 ArgRepr::Poisoned(error) => return Err(LumaError::clone(error)),
                 ArgRepr::Storage { ctx: arg_ctx, buffer, bytes, element_size, writable } => {
@@ -533,7 +607,7 @@ impl Kernel {
                             });
                         }
                     }
-                    raw.push(RawArg::Storage { buffer, bytes: *bytes, writable: *writable });
+                    *slot = RawArg::Storage { buffer, bytes: *bytes, writable: *writable };
                 }
                 ArgRepr::Uniform(encoded) => {
                     if info.kind != BindingKind::Uniform {
@@ -543,10 +617,13 @@ impl Kernel {
                             actual: BindingKind::Uniform,
                         });
                     }
-                    let data = encoded.as_ref().map_err(|message| LumaError::KernelArgUniform {
-                        index,
-                        message: message.clone(),
-                    })?;
+                    let data = encoded
+                        .as_ref()
+                        .map_err(|message| LumaError::KernelArgUniform {
+                            index,
+                            message: message.clone(),
+                        })?
+                        .as_slice();
                     let bytes = data.len() as u64;
                     if let Some(expected) = info.min_size {
                         if bytes < u64::from(expected) {
@@ -560,11 +637,11 @@ impl Kernel {
                     if bytes > max_uniform {
                         return Err(LumaError::BufferTooLarge { requested: bytes, max: max_uniform });
                     }
-                    raw.push(RawArg::Uniform(data));
+                    *slot = RawArg::Uniform(data);
                 }
             }
         }
 
-        ctx.launch(core, workgroups, size, &raw)
+        ctx.launch(core, workgroups, size, raw)
     }
 }

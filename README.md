@@ -39,7 +39,8 @@ Every constructor has a form for an explicit device, `Array::from_slice_on(&ctx,
 `Context`. A failure to open the GPU is reported as an `Err` by every call, not a panic.
 
 `u32` and `f32` have the built-in math; arrays of `[f32; 2]`, `[f32; 4]`, `[u32; 2]`, `[u32; 4]`
-(WGSL `vec2`/`vec4`) can be created, read back and passed to custom kernels.
+(WGSL `vec2`/`vec4`) can be created, read back and passed to custom kernels, and `[f32; 2]` /
+`[f32; 4]` arrays have per-component reductions (see below).
 
 ## Math
 
@@ -72,12 +73,25 @@ Operands need the same shape, or be a scalar; there is no general broadcasting y
 a workgroup tree reduction, so summing ten million elements is accurate to a few `1e-7`
 relative.
 
+Arrays of `[f32; 2]` and `[f32; 4]` reduce per component, with the same tree reduction (and so the
+same accuracy); the result has one value per component:
+
+```rs
+let state = Array::<[f32; 4]>::zeros([1000, 500])?;
+let total: [f32; 4] = state.sum()?;
+let (lo, hi) = (state.min()?, state.max()?);      // [f32; 4] each
+let l2: [f32; 4] = state.norm()?;                 // sqrt of the sum of squares, per component
+```
+
 ## Nothing waits until you ask
 
 Operations are recorded into the context's pending command buffer and submitted together: when
 you read a result (`to_vec`, `eval`, a reduction, `Context::sync`) and whenever a few hundred
 dispatches piled up. Hundreds of small operations cost one submission, not hundreds
-(`cargo run --release --example bench_batching`). Host uploads, `write`, and the values of
+(`cargo run --release --example bench_batching`). `ctx.flush()` (or `luma::flush()` for the default
+context) submits what is pending *without waiting*, so the GPU starts while the host keeps
+recording: flush after each chunk of a time-stepping loop and read results back only once in a
+while. Only `sync` and the readbacks wait. Host uploads, `write`, and the values of
 uniforms are recorded in order with the work around them, so reusing or overwriting an array never
 affects operations recorded before it.
 
@@ -146,9 +160,46 @@ fn main() -> Result<()> {
 }
 ```
 
+Only the globals an entry point uses (directly or through the functions it calls) are its
+arguments, so one WGSL module can hold several entry points with different bindings: build each
+with `ctx.kernel(src).entry("name")`. The bindings used by one entry point are numbered
+contiguously from 0 in `@group(1)`; other globals may be numbered, grouped or typed freely.
+
+`args![..]` builds a stack array (no allocation), uniforms up to 128 bytes are stored inline, and
+launches are cheap: the launches of a batch are recorded into one compute pass, bind groups are
+cached, and what is already bound is not bound again. On the development machine (RTX 3090,
+Vulkan) a launch of a cached kernel costs 0.6 – 0.9 microseconds of host time, down from 3.6 – 4.0
+(`cargo run --release --example bench_launch`).
+
 Arrays that share a buffer (through `reshape`) cannot be bound to one launch if one binding is
 writable; that is an error (`KernelArgAlias`), as is an in-place operation on a view of its own
 operand.
+
+## GPU timing
+
+Where the adapter supports timestamp queries, `ctx.profile(|| { ... })` returns the GPU time of
+every kernel launched inside the closure, by label (a custom kernel's `.label(..)`, default its
+entry point; built-in operations by operation and element type):
+
+```rs
+let spin = ctx.kernel(SPIN).label("spin").build()?;
+let (c, profile) = ctx.profile(|| {
+    for _ in 0..10 {
+        spin.launch([n], args![&mut a, uniform(&Params { rounds: 20_000 })]).unwrap();
+    }
+    &b * 3.0
+})?;
+println!("{profile}");
+// kernel                        launches     total us      mean us       min us       max us
+// spin                                10     12137.63      1213.76      1211.94      1214.66
+// Binary(Mul, ArrayScalar) f32         1         3.74         3.74         3.74         3.74
+// (a run of this snippet's kernel on an RTX 3090)
+```
+
+While profiling, every launch runs in a pass of its own (so the timings are those of single
+launches, and host cost is higher). `ctx.enable_profiling()` / `ctx.finish_profiling()` bracket
+manual sections, and `ctx.profiling_supported()` says whether the GPU can do it at all; without
+timestamp queries these return `LumaError::Profiling` and everything else keeps working.
 
 ## Examples
 
@@ -157,4 +208,5 @@ cargo run --example double_test                 # expressions, select, reduction
 cargo run --example conv1d
 cargo run --release --example bench_conv1d      # spatial vs FFT convolution
 cargo run --release --example bench_batching    # sync after every op vs batched
+cargo run --release --example bench_launch      # host cost per kernel launch, flush overlap
 ```

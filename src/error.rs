@@ -62,6 +62,8 @@ pub enum LumaError {
     Gpu(String),
     /// A lock inside the context was poisoned by a panic on another thread.
     LockPoisoned,
+    /// GPU timing is not available (the adapter has no timestamp queries) or not enabled.
+    Profiling(String),
     /// An operation on arrays failed. Produced when an operator or math method poisons its result:
     /// records which operation failed and where in the user's code it was called.
     /// [`LumaError::root`] gives the underlying error.
@@ -141,6 +143,7 @@ impl fmt::Display for LumaError {
             }
             LumaError::Gpu(msg) => write!(f, "GPU error: {msg}"),
             LumaError::LockPoisoned => f.write_str("A luma context lock was poisoned"),
+            LumaError::Profiling(msg) => write!(f, "GPU profiling: {msg}"),
             LumaError::Op { op, location, source } => write!(
                 f,
                 "`{op}` failed at {}:{}:{}: {source}",

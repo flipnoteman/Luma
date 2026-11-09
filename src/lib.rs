@@ -21,8 +21,11 @@
 //! * **Errors do not panic**: operators and math methods return poisoned arrays on failure; the
 //!   error (with the source location of the failed operation) comes out as `Err` at
 //!   [`Array::to_vec`], [`Array::eval`], a reduction, ... See [`Array`].
-//! * **Batching**: operations are recorded and submitted together, see [`Context`].
+//! * **Batching**: operations are recorded and submitted together, see [`Context`];
+//!   [`Context::flush`] hands the batch to the GPU without waiting for it.
 //! * **Custom kernels**: [`Kernel`] runs your own WGSL on arrays, in the same batch.
+//! * **GPU timing**: [`Context::profile`] measures the GPU time per kernel where the adapter
+//!   supports timestamp queries.
 
 // wgpu's handle types nest deeply; proving `Context: Sync` for the global default context
 // exceeds the default limit on recent nightlies (future-compat lint
@@ -38,14 +41,16 @@ mod gpu;
 mod gpu_type;
 mod kernel;
 mod ops;
+mod profile;
 mod shape;
 
 pub use array::Array;
-pub use context::{default_context, Context};
+pub use context::{default_context, flush, Context};
 pub use error::{LumaError, Result};
 pub use gpu_type::{GpuType, ScalarType};
 pub use kernel::{
     uniform, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize,
 };
 pub use ops::{select, Operand, Rhs};
+pub use profile::{KernelTiming, Profile};
 pub use shape::{Offsets, Shape};

@@ -270,7 +270,7 @@ fn main(
 ) {{
     let group = wid.x + wid.y * nwg.x;
     let base = group * {block}u + lid;
-    let zero = {ty}(0);
+    let zero = {ty}();
     let idx0 = base;
     let idx1 = base + {wg}u;
     let idx2 = base + {wg}u * 2u;

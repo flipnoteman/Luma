@@ -21,9 +21,13 @@ pub(crate) async fn request_device() -> Result<(Device, Queue)> {
 
     // Request the adapter's full limits so large arrays aren't capped by the
     // conservative WebGPU defaults (e.g. 128 MiB storage bindings).
+    // Timestamp queries are optional: they only serve `Context::profile`.
+    let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("Device 1"),
+            required_features,
             required_limits: adapter.limits(),
             memory_hints: MemoryHints::MemoryUsage,
             ..Default::default()

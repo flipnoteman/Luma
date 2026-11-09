@@ -392,43 +392,9 @@ impl<T: ScalarType> Array<T> {
 
     // -- Reductions --
 
-    /// Reduces the whole array on the GPU with a workgroup tree reduction: every pass combines
-    /// pairs, `first` for the first pass over the data and `rest` for the passes over partial
-    /// results, until one element is left, which is read back. Synchronizes.
+    /// Reduces the whole array on the GPU, see [`reduce_array`].
     fn reduce(&self, first: ReduceOp, rest: ReduceOp) -> Result<T> {
-        let ctx = self.context();
-        let (input, _) = self.ready().map_err(Failure::into_error)?;
-        let elem = std::mem::size_of::<T>() as u64;
-        let mut scratch = Scratch::new(ctx);
-
-        let mut current = input.clone();
-        let mut n = len_u32(self.len())?;
-        let mut op = first;
-        loop {
-            let groups = n.div_ceil(REDUCE_BLOCK);
-            let out = scratch.take(u64::from(groups) * elem)?;
-            let core = ctx.builtin(Builtin::Reduce(op), T::wgsl_type())?;
-            ctx.launch(
-                &core,
-                fold_workgroups(ctx, groups)?,
-                [n, 1, 1],
-                &[
-                    RawArg::write(&out, u64::from(groups) * elem),
-                    RawArg::read(&current, u64::from(n) * elem),
-                    RawArg::Uniform(bytemuck::bytes_of(&[n])),
-                ],
-            )?;
-            current = out;
-            n = groups;
-            op = rest;
-            if groups == 1 {
-                break;
-            }
-        }
-
-        let bytes = ctx.read_bytes(&current, elem)?;
-        bytemuck::try_pod_read_unaligned::<T>(&bytes)
-            .map_err(|e| LumaError::Gpu(format!("reduction result has the wrong size: {e}")))
+        reduce_array(self, T::wgsl_type(), first, rest)
     }
 
     /// The sum of all elements. Float sums use a tree reduction, whose error grows with the
@@ -448,6 +414,85 @@ impl<T: ScalarType> Array<T> {
         self.reduce(ReduceOp::Max, ReduceOp::Max)
     }
 }
+
+/// Reduces the whole array on the GPU with a workgroup tree reduction: every pass combines
+/// pairs, `first` for the first pass over the data and `rest` for the passes over partial
+/// results, until one element is left, which is read back. `wgsl` is the WGSL type of the
+/// elements; for vectors the operations act on every component separately. Synchronizes.
+fn reduce_array<T: GpuType>(
+    array: &Array<T>,
+    wgsl: &'static str,
+    first: ReduceOp,
+    rest: ReduceOp,
+) -> Result<T> {
+    let ctx = array.context();
+    let (input, _) = array.ready().map_err(Failure::into_error)?;
+    let elem = std::mem::size_of::<T>() as u64;
+    let mut scratch = Scratch::new(ctx);
+
+    let mut current = input.clone();
+    let mut n = len_u32(array.len())?;
+    let mut op = first;
+    loop {
+        let groups = n.div_ceil(REDUCE_BLOCK);
+        let out = scratch.take(u64::from(groups) * elem)?;
+        let core = ctx.builtin(Builtin::Reduce(op), wgsl)?;
+        ctx.launch(
+            &core,
+            fold_workgroups(ctx, groups)?,
+            [n, 1, 1],
+            &[
+                RawArg::write(&out, u64::from(groups) * elem),
+                RawArg::read(&current, u64::from(n) * elem),
+                RawArg::Uniform(bytemuck::bytes_of(&[n])),
+            ],
+        )?;
+        current = out;
+        n = groups;
+        op = rest;
+        if groups == 1 {
+            break;
+        }
+    }
+
+    let bytes = ctx.read_bytes(&current, elem)?;
+    bytemuck::try_pod_read_unaligned::<T>(&bytes)
+        .map_err(|e| LumaError::Gpu(format!("reduction result has the wrong size: {e}")))
+}
+
+/// Per-component reductions of `f32` vector arrays: the same tree reduction as the scalar
+/// reductions, run on all components at once, so the accuracy is that of the scalar sum.
+macro_rules! vector_reductions {
+    ($n:literal, $wgsl:literal) => {
+        impl Array<[f32; $n]> {
+            /// The sum of all elements, per component. Float sums use a tree reduction, whose
+            /// error grows with the logarithm of the length rather than the length itself.
+            /// Synchronizes.
+            pub fn sum(&self) -> Result<[f32; $n]> {
+                reduce_array(self, $wgsl, ReduceOp::Sum, ReduceOp::Sum)
+            }
+
+            /// The smallest value of every component. Synchronizes.
+            pub fn min(&self) -> Result<[f32; $n]> {
+                reduce_array(self, $wgsl, ReduceOp::Min, ReduceOp::Min)
+            }
+
+            /// The largest value of every component. Synchronizes.
+            pub fn max(&self) -> Result<[f32; $n]> {
+                reduce_array(self, $wgsl, ReduceOp::Max, ReduceOp::Max)
+            }
+
+            /// The Euclidean (L2) norm of every component taken over the whole array: the square
+            /// root of the sum of squares, per component. Synchronizes.
+            pub fn norm(&self) -> Result<[f32; $n]> {
+                Ok(reduce_array(self, $wgsl, ReduceOp::SumSquares, ReduceOp::Sum)?.map(f32::sqrt))
+            }
+        }
+    };
+}
+
+vector_reductions!(2, "vec2<f32>");
+vector_reductions!(4, "vec4<f32>");
 
 /// Picks `a[i]` where `mask[i] != 0` and `b[i]` elsewhere. All three arrays must have the same
 /// shape (the mask comes from the comparison methods).

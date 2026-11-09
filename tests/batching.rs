@@ -342,3 +342,59 @@ fn threads_share_a_context() {
         }
     });
 }
+
+// -- Non-blocking flush --
+
+#[test]
+fn flush_submits_without_waiting_and_recording_continues_in_order() {
+    let ctx = Context::new().unwrap();
+    flush_empty_batch_is_fine(&ctx);
+
+    // Different values per operation, flushed every few operations: slots of the uniform arena
+    // are reused by later batches while earlier ones may still be running.
+    let n = 1 << 20;
+    let mut x = Array::<u32>::zeros_on(&ctx, n).unwrap();
+    let mut expected = 0u32;
+    for round in 0..60u32 {
+        for k in 0..5u32 {
+            let v = round * 5 + k + 1;
+            x += v;
+            expected += v;
+        }
+        ctx.flush().unwrap();
+        // A write between flushes is ordered after the flushed work and before later work.
+        if round % 20 == 19 {
+            x.write(&vec![expected; n]).unwrap();
+        }
+    }
+    assert_eq!(x.to_vec().unwrap(), vec![expected; n]);
+}
+
+fn flush_empty_batch_is_fine(ctx: &Context) {
+    ctx.flush().unwrap();
+    ctx.flush().unwrap();
+    ctx.sync().unwrap();
+}
+
+#[test]
+fn default_context_flush() {
+    let x = Array::from_slice(&[1.0f32, 2.0, 3.0], 3).unwrap();
+    let y = &x * 2.0;
+    luma::flush().unwrap();
+    assert_eq!(y.to_vec().unwrap(), vec![2.0, 4.0, 6.0]);
+}
+
+#[test]
+fn dropping_a_context_with_unsubmitted_launches_is_clean() {
+    let ctx = Context::new().unwrap();
+    let mut x = Array::<f32>::zeros_on(&ctx, 64).unwrap();
+    for _ in 0..10 {
+        x += 1.0;
+    }
+    // Still pending, with the recording pass open: dropping everything must neither panic nor
+    // poison anything for the next context.
+    drop(x);
+    drop(ctx);
+    let ctx = Context::new().unwrap();
+    assert_eq!(Array::<u32>::full_on(&ctx, 4, 9).unwrap().to_vec().unwrap(), vec![9; 4]);
+}

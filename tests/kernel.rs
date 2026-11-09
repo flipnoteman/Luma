@@ -210,7 +210,7 @@ fn uniform_with_vec3_padding() {
 
 // -- Errors --
 
-fn saxpy_args<'a>(x: &'a Array<f32>, y: &'a mut Array<f32>) -> Vec<KernelArg<'a>> {
+fn saxpy_args<'a>(x: &'a Array<f32>, y: &'a mut Array<f32>) -> [KernelArg<'a>; 3] {
     args![x, y, uniform(&SaxpyParams { alpha: 1.0, n: 4 })]
 }
 
@@ -325,4 +325,206 @@ fn grid_too_large() {
     let kernel = ctx().kernel(SAXPY).build().unwrap();
     let err = kernel.launch([u32::MAX], saxpy_args(&x, &mut y)).unwrap_err();
     assert!(matches!(err, LumaError::KernelGridTooLarge { .. }), "{err}");
+}
+
+// -- Entry-point scoped reflection --
+
+/// One module, several entry points with different binding sets. `x` and `y` are bindings 0 and
+/// 1; `scale_params` is reached through a helper function; `junk` is used by no entry point and
+/// sits in a group luma does not allow.
+const MULTI: &str = r#"
+struct Params { factor: f32, n: u32 }
+@group(1) @binding(0) var<storage, read_write> x: array<f32>;
+@group(1) @binding(1) var<storage, read_write> y: array<f32>;
+@group(1) @binding(2) var<uniform> scale_params: Params;
+@group(2) @binding(0) var<storage, read> junk: array<f32>;
+
+fn factor() -> f32 { return scale_params.factor; }
+
+// Uses only `x`: one argument.
+@compute @workgroup_size(16)
+fn increment(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < luma.size.x) { x[gid.x] = x[gid.x] + 1.0; }
+}
+
+// Uses `x` and `y`: two arguments.
+@compute @workgroup_size(16)
+fn add(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < luma.size.x) { y[gid.x] = y[gid.x] + x[gid.x]; }
+}
+
+// Uses `x`, `y` and, through `factor()`, the uniform: three arguments.
+@compute @workgroup_size(16)
+fn scale_into(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < luma.size.x) { y[gid.x] = x[gid.x] * factor(); }
+}
+
+// Uses only `y` (@binding(1)): the numbering does not start at 0.
+@compute @workgroup_size(16)
+fn only_y(@builtin(global_invocation_id) gid: vec3<u32>) {
+    y[gid.x] = 0.0;
+}
+
+// Uses nothing but the grid.
+@compute @workgroup_size(16)
+fn nothing(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= luma.size.x) { return; }
+}
+"#;
+
+#[derive(encase::ShaderType)]
+struct ScaleParams {
+    factor: f32,
+    n: u32,
+}
+
+#[test]
+fn entry_points_of_one_module_have_their_own_bindings() {
+    let ctx = ctx();
+    let build = |entry: &str| ctx.kernel(MULTI).entry(entry).build();
+
+    let increment = build("increment").unwrap();
+    let add = build("add").unwrap();
+    let scale = build("scale_into").unwrap();
+    let nothing = build("nothing").unwrap();
+
+    let names = |k: &Kernel| k.bindings().iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&increment), ["x"]);
+    assert_eq!(names(&add), ["x", "y"]);
+    assert_eq!(names(&scale), ["x", "y", "scale_params"]);
+    assert_eq!(scale.bindings()[2].kind, BindingKind::Uniform);
+    assert!(nothing.bindings().is_empty());
+
+    let n = 100u32;
+    let mut x = Array::from_slice(&(0..n).map(|i| i as f32).collect::<Vec<_>>(), n as usize).unwrap();
+    let mut y = Array::<f32>::zeros(n as usize).unwrap();
+
+    increment.launch([n], args![&mut x]).unwrap(); // x = i + 1
+    add.launch([n], args![&mut x, &mut y]).unwrap(); // y = i + 1
+    add.launch([n], args![&mut x, &mut y]).unwrap(); // y = 2 (i + 1)
+    nothing.launch([n], args![]).unwrap();
+    nothing.launch([n], args![]).unwrap();
+    assert_eq!(
+        y.to_vec().unwrap(),
+        (0..n).map(|i| 2.0 * (i + 1) as f32).collect::<Vec<_>>()
+    );
+
+    scale.launch([n], args![&mut x, &mut y, uniform(&ScaleParams { factor: 3.0, n })]).unwrap();
+    assert_eq!(y.to_vec().unwrap(), (0..n).map(|i| 3.0 * (i + 1) as f32).collect::<Vec<_>>());
+
+    // The argument count is the entry point's, not the module's.
+    let err = increment.launch([n], args![&mut x, &mut y]).unwrap_err();
+    assert!(matches!(err, LumaError::KernelArgCount { expected: 1, actual: 2 }), "{err}");
+    let err = add.launch([n], args![&x]).unwrap_err();
+    assert!(matches!(err, LumaError::KernelArgCount { expected: 2, actual: 1 }), "{err}");
+}
+
+#[test]
+fn entry_point_bindings_must_still_be_contiguous_from_zero() {
+    let err = ctx().kernel(MULTI).entry("only_y").build().unwrap_err();
+    match err {
+        LumaError::KernelBinding(message) => {
+            assert!(message.contains("`y`") && message.contains("only_y"), "{message}")
+        }
+        other => panic!("expected KernelBinding, got {other}"),
+    }
+}
+
+#[test]
+fn unused_globals_in_unsupported_places_are_ignored_but_used_ones_are_not() {
+    // `junk` is in @group(2) in MULTI and builds fine because no entry point uses it.
+    const USES_JUNK: &str = r#"
+    @group(2) @binding(0) var<storage, read> junk: array<f32>;
+    @group(1) @binding(0) var<storage, read_write> out: array<f32>;
+    @compute @workgroup_size(1)
+    fn main() { out[0] = junk[0]; }"#;
+    assert!(matches!(
+        ctx().kernel(USES_JUNK).build(),
+        Err(LumaError::KernelBinding(message)) if message.contains("@group(2)")
+    ));
+
+    // Same module, a second entry point that does not touch it: builds.
+    const BOTH: &str = r#"
+    @group(2) @binding(0) var<storage, read> junk: array<f32>;
+    @group(1) @binding(0) var<storage, read_write> out: array<f32>;
+    @compute @workgroup_size(1)
+    fn uses_junk() { out[0] = junk[0]; }
+    @compute @workgroup_size(1)
+    fn fine() { out[0] = 7.0; }"#;
+    assert!(ctx().kernel(BOTH).entry("uses_junk").build().is_err());
+    let fine = ctx().kernel(BOTH).entry("fine").build().unwrap();
+    let mut out = Array::<f32>::zeros(1).unwrap();
+    fine.launch([1], args![&mut out]).unwrap();
+    assert_eq!(out.to_vec().unwrap(), vec![7.0]);
+}
+
+#[test]
+fn grid_uniform_slots_are_shared_per_size_without_mixing_sizes_up() {
+    const SRC: &str = r#"
+    @group(1) @binding(0) var<storage, read_write> out: array<u32>;
+    @group(1) @binding(1) var<uniform> slot: u32;
+    @compute @workgroup_size(1)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        if (gid.x == 0u && gid.y == 0u && gid.z == 0u) {
+            out[slot * 3u] = luma.size.x; out[slot * 3u + 1u] = luma.size.y; out[slot * 3u + 2u] = luma.size.z;
+        }
+    }"#;
+    #[derive(encase::ShaderType)]
+    struct Slot {
+        slot: u32,
+    }
+    let kernel = ctx().kernel(SRC).build().unwrap();
+    let sizes: [[u32; 3]; 4] = [[3, 1, 1], [5, 2, 1], [7, 3, 2], [3, 1, 1]];
+    // Enough launches to cross batch limits and several arena chunks, each size revisited.
+    let launches = 3000usize;
+    let mut out = Array::<u32>::zeros(launches * 3).unwrap();
+    let mut expected = vec![0u32; launches * 3];
+    for i in 0..launches {
+        let size = sizes[(i * 7 + i / 5) % sizes.len()];
+        kernel.launch(size, args![&mut out, uniform(&Slot { slot: i as u32 })]).unwrap();
+        expected[i * 3..i * 3 + 3].copy_from_slice(&size);
+    }
+    assert_eq!(out.to_vec().unwrap(), expected);
+}
+
+#[test]
+fn many_arguments_and_large_uniforms_take_the_allocating_paths() {
+    // 20 storage bindings (more than the inline argument buffer holds) and a uniform larger
+    // than the inline uniform buffer (256 bytes: 64 f32 in 16 vec4).
+    let mut src = String::from("struct Big { v: array<vec4<f32>, 16> }\n");
+    for i in 0..20 {
+        src += &format!("@group(1) @binding({i}) var<storage, read_write> b{i}: array<f32>;\n");
+    }
+    src += "@group(1) @binding(20) var<uniform> big: Big;\n";
+    src += "@compute @workgroup_size(1)\nfn main() {\n";
+    for i in 0..20 {
+        src += &format!("    b{i}[0] = big.v[15].w + {i}.0;\n");
+    }
+    src += "}\n";
+
+    #[derive(encase::ShaderType)]
+    struct Big {
+        v: [encase_vec4::V4; 16],
+    }
+    mod encase_vec4 {
+        #[derive(Clone, Copy, encase::ShaderType)]
+        pub struct V4 {
+            pub x: f32,
+            pub y: f32,
+            pub z: f32,
+            pub w: f32,
+        }
+    }
+    // An array of structs of four scalars has the stride 16 that uniform arrays need.
+    let big = Big { v: [encase_vec4::V4 { x: 0.0, y: 0.0, z: 0.0, w: 100.0 }; 16] };
+
+    let kernel = ctx().kernel(&src).build().unwrap();
+    assert_eq!(kernel.bindings().len(), 21);
+    let mut arrays: Vec<Array<f32>> = (0..20).map(|_| Array::<f32>::zeros(1).unwrap()).collect();
+    let mut launch_args: Vec<KernelArg<'_>> = arrays.iter_mut().map(KernelArg::from).collect();
+    launch_args.push(uniform(&big));
+    kernel.launch([1], launch_args).unwrap();
+    for (i, array) in arrays.iter().enumerate() {
+        assert_eq!(array.to_vec().unwrap(), vec![100.0 + i as f32]);
+    }
 }

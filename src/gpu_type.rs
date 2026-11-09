@@ -6,7 +6,8 @@ use bytemuck::Pod;
 /// `[u32; 4]`, whose layout matches WGSL's `vec2`/`vec4` (there is deliberately no `[f32; 3]`:
 /// `vec3` is 16-byte aligned in WGSL, which a plain 12-byte array is not).
 ///
-/// The built-in math only exists for [`ScalarType`]s.
+/// The built-in math only exists for [`ScalarType`]s; `[f32; 2]` and `[f32; 4]` arrays also have
+/// per-component reductions (`sum`, `min`, `max`, `norm`).
 pub trait GpuType: Pod + std::fmt::Debug {}
 
 /// Element types the built-in operators, math functions and reductions are implemented for.
