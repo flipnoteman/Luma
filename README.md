@@ -238,3 +238,16 @@ cargo run --release --example bench_batching    # sync after every op vs batched
 cargo run --release --example bench_launch      # host cost per kernel launch, flush overlap
 cargo run --release --example bench_fusion      # one kernel per operation vs fused chains
 ```
+
+## Benchmarks against the CPU
+
+Criterion benchmarks of application workloads, each run with Luma and with a multi-threaded
+CPU implementation of the same algorithm (vectorized loops; Accelerate for matrix products on
+macOS, `rustfft` for FFT filtering). Every group checks first that both give the same result.
+
+```sh
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench real_world    # Black-Scholes, Mandelbrot, n-body, SGEMM, 2-D heat, FIR
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench ml            # k-means, MLP forward pass, similarity matrix
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench monte_carlo   # option pricing, integration, Ising model
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench imaging       # blurs, 2-D convolution, bilateral filter, color pipeline, histogram
+```
