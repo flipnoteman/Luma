@@ -100,6 +100,16 @@ pub(super) struct Fused {
     pub(super) inputs: Vec<Arc<Storage>>,
     /// Bit patterns of the scalars, in the order of `key.scalar_tys`.
     pub(super) scalars: Vec<u32>,
+    /// Nodes computed inside this program (not as outputs of their own); marked fused once run.
+    fused_nodes: Vec<Arc<Node>>,
+}
+
+impl Fused {
+    pub(super) fn mark_fused(&self) {
+        for node in &self.fused_nodes {
+            node.fused.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A pending node below the root of an evaluation, with its operands.
@@ -157,6 +167,7 @@ struct Flattener {
     /// Programs of the expressions read through shifts, and the node of each.
     subs: Vec<Vec<Instr>>,
     sub_nodes: Vec<*const Node>,
+    fused_nodes: Vec<Arc<Node>>,
 }
 
 impl Flattener {
@@ -201,10 +212,8 @@ impl Flattener {
         let instrs = std::mem::replace(&mut self.instrs, outer_instrs);
         self.emitted = outer_emitted;
         result?;
-        for member in &members {
-            member.node.fused.store(true, Ordering::Relaxed);
-        }
-        node.fused.store(true, Ordering::Relaxed);
+        self.fused_nodes.extend(members.into_iter().map(|m| m.node));
+        self.fused_nodes.push(Arc::clone(node));
         self.subs.push(instrs);
         self.sub_nodes.push(key);
         Ok(Ref::Sub(u32::try_from(self.subs.len() - 1).unwrap_or(u32::MAX)))
@@ -257,6 +266,7 @@ impl Flattener {
             },
             inputs: self.inputs,
             scalars: self.scalars,
+            fused_nodes: self.fused_nodes,
         }
     }
 }
@@ -269,11 +279,30 @@ impl Flattener {
 /// evaluated first instead of being recomputed by each of them; shared nodes *within* them are
 /// one instruction.
 pub(super) fn flatten(roots: &[(Arc<Node>, Args)], tail: Tail) -> Result<Fused, Failure> {
+    flatten_inner(roots, tail, None)
+}
+
+pub(super) fn flatten_stencil(
+    node: &Arc<Node>,
+    args: Args,
+    probe_id: u64,
+) -> Result<Fused, Failure> {
+    flatten_inner(&[(Arc::clone(node), args)], Tail::Store, Some(probe_id))
+}
+
+fn flatten_inner(
+    roots: &[(Arc<Node>, Args)],
+    tail: Tail,
+    probe_id: Option<u64>,
+) -> Result<Fused, Failure> {
     let members = loop {
         let mut members = Vec::new();
         let mut seen = Vec::new();
         for (root, args) in roots {
-            for arg in args.iter().take(root.op().kind.arity()) {
+            for (index, arg) in args.iter().enumerate().take(root.op().kind.arity()) {
+                if index == 0 && matches!(root.op().kind, OpKind::Shift(_)) {
+                    continue;
+                }
                 collect(arg, &mut members, &mut seen)?;
             }
         }
@@ -283,14 +312,29 @@ pub(super) fn flatten(roots: &[(Arc<Node>, Args)], tail: Tail) -> Result<Fused, 
                 members.push(Member { node: Arc::clone(root), args: args.clone() });
             }
         }
+        let mut sub_members = Vec::new();
+        let mut all_seen = seen.clone();
+        for member in &members {
+            if matches!(member.node.op().kind, OpKind::Shift(_)) {
+                if let Src::Node(sub_root) = &member.args[0] {
+                    collect(&Src::Node(Arc::clone(sub_root)), &mut sub_members, &mut all_seen)?;
+                }
+            }
+        }
         let is_root = |node: &Arc<Node>| roots.iter().any(|(root, _)| Arc::ptr_eq(root, node));
         let shared: Vec<Arc<Node>> = members
             .iter()
-            .filter(|member| !is_root(&member.node) && member.node.has_consumer_outside(&seen))
+            .chain(&sub_members)
+            .filter(|member| !is_root(&member.node) && member.node.has_consumer_outside(&all_seen))
             .map(|member| Arc::clone(&member.node))
             .collect();
         if shared.is_empty() {
             break members;
+        }
+        if let Some(id) = probe_id {
+            if shared.iter().any(|node| node.depends_on(id)) {
+                return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
+            }
         }
         for node in shared {
             if let Err(error) = node.force() {
@@ -315,7 +359,7 @@ pub(super) fn flatten(roots: &[(Arc<Node>, Args)], tail: Tail) -> Result<Fused, 
     for member in &members {
         let root = roots.iter().any(|(root, _)| Arc::ptr_eq(root, &member.node));
         if !root || matches!(tail, Tail::Reduce(_)) {
-            member.node.fused.store(true, Ordering::Relaxed);
+            flattener.fused_nodes.push(Arc::clone(&member.node));
         }
     }
     Ok(flattener.finish(tail, outputs))
@@ -371,7 +415,8 @@ pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
 fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
     let n = len_u32(len)?;
     let bytes = u64::from(n) * ELEMENT_BYTES;
-    let Fused { key, inputs, scalars } = fused;
+    fused.mark_fused();
+    let Fused { key, inputs, scalars, .. } = fused;
     let count = key.outputs.len();
     let core = ctx.jit().kernel(ctx, key)?;
 
@@ -413,7 +458,8 @@ pub(crate) fn reduce_first_pass(
     let bytes = u64::from(n) * ELEMENT_BYTES;
     let groups = ctx.tuning().reduce_groups(n);
     let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
-    let Fused { key, inputs, scalars } = fused;
+    fused.mark_fused();
+    let Fused { key, inputs, scalars, .. } = fused;
     let core = ctx.jit().kernel(ctx, key)?;
 
     let out = scratch.take(out_bytes)?;

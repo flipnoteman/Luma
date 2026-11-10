@@ -46,6 +46,8 @@ const MAPPABLE_STORAGE_USAGE: BufferUsages = STORAGE_USAGE.union(BufferUsages::M
 struct FreeUploads {
     buffers: Vec<Buffer>,
     bytes: u64,
+    /// Bytes of buffers in the unsubmitted batch or waiting for a `map_async` callback.
+    in_flight: u64,
 }
 
 impl FreeUploads {
@@ -191,13 +193,13 @@ impl Arena {
     /// Writes the slots of every chunk to the GPU and empties the arena for the next batch,
     /// keeping the current chunk. Must run right before the batch is submitted: the writes are
     /// executed ahead of the submission's commands, and after everything submitted earlier.
-    fn upload(&mut self, queue: &wgpu::Queue) {
+    fn upload(&mut self, queue: &wgpu::Queue, released: &mut Vec<Buffer>) {
         for chunk in self.full.iter().chain(std::iter::once(&self.current)) {
             if !chunk.data.is_empty() {
                 queue.write_buffer(&chunk.buffer, 0, &chunk.data);
             }
         }
-        self.full.clear();
+        released.extend(self.full.drain(..).map(|chunk| chunk.buffer));
         self.current.data.clear();
     }
 }
@@ -537,13 +539,12 @@ impl Context {
         batch.dispatches = 0;
         // The slots of the arena are reused by the next batch.
         batch.grid_slots.clear();
-        batch.arena.upload(self.queue());
+        let mut released = std::mem::take(&mut *lock(&self.inner.released));
+        batch.arena.upload(self.queue(), &mut released);
         if batch.bind_groups.len > MAX_CACHED_BIND_GROUPS {
             // In-flight work keeps what it uses alive; this only drops our references.
             batch.bind_groups = BindGroupCache::default();
-        }
-        let released = std::mem::take(&mut *lock(&self.inner.released));
-        if !released.is_empty() {
+        } else if !released.is_empty() {
             batch.bind_groups.forget(&released);
         }
         // Everything recorded that uses these buffers is in the batch submitted below.
@@ -553,8 +554,10 @@ impl Context {
             let free = Arc::clone(&self.inner.uploads);
             let buffer = staging.clone();
             staging.slice(..).map_async(wgpu::MapMode::Write, move |result| {
+                let mut free = lock(&free);
+                free.in_flight = free.in_flight.saturating_sub(buffer.size());
                 if result.is_ok() {
-                    lock(&free).put(buffer);
+                    free.put(buffer);
                 }
             });
         }
@@ -563,10 +566,13 @@ impl Context {
             let released = Arc::clone(&self.inner.released);
             let buffer = storage.clone();
             storage.slice(..).map_async(wgpu::MapMode::Write, move |result| {
-                if result.is_ok() {
-                    if let Some(dropped) = lock(&free).put(buffer) {
-                        lock(&released).push(dropped);
-                    }
+                let dropped = {
+                    let mut free = lock(&free);
+                    free.in_flight = free.in_flight.saturating_sub(buffer.size());
+                    if result.is_ok() { free.put(buffer) } else { None }
+                };
+                if let Some(dropped) = dropped {
+                    lock(&released).push(dropped);
                 }
             });
         }
@@ -641,11 +647,17 @@ impl Context {
         }
         let mut idle = lock(&self.inner.pool).drain();
         idle.extend(lock(&self.inner.mappable).drain());
+        idle.extend(lock(&self.inner.uploads).drain());
         lock(&self.inner.released).extend(idle);
         self.flush_locked(&mut *self.batch()?);
         self.device()
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| LumaError::Poll(Arc::new(e)))?;
+        let mut late = lock(&self.inner.mappable).drain();
+        late.extend(lock(&self.inner.uploads).drain());
+        if !late.is_empty() {
+            self.batch()?.bind_groups.forget(&late);
+        }
         self.create_buffer(size, usage, mapped).ok_or(LumaError::OutOfMemory { requested: size })
     }
 
@@ -673,6 +685,7 @@ impl Context {
             // May still be used by the unsubmitted batch, which mapping would invalidate; it is
             // mapped after the next submission. This must not take the batch lock: it can be
             // held by the caller.
+            lock(&self.inner.mappable).in_flight += buffer.size();
             lock(&self.inner.unmapped).push(buffer);
             return;
         }
@@ -693,16 +706,7 @@ impl Context {
         let max = self.inner.max_buffer_bytes;
         let class = pool::size_class(bytes, max)
             .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
-        let reused = lock(&self.inner.uploads).take(class);
-        let staging = match reused {
-            Some(buffer) => buffer,
-            None => self.device().create_buffer(&wgpu::BufferDescriptor {
-                label: Some("luma upload"),
-                size: class,
-                usage: UPLOAD_USAGE,
-                mapped_at_creation: true,
-            }),
-        };
+        let staging = self.take_upload_buffer(&self.inner.uploads, class, UPLOAD_USAGE)?;
         {
             let mut view = staging.get_mapped_range_mut(..bytes).map_err(LumaError::MapRange)?;
             write_parallel(data, view.slice(..));
@@ -712,6 +716,7 @@ impl Context {
         let mut guard = self.batch()?;
         let encoder = self.encoder(&mut guard);
         encoder.copy_buffer_to_buffer(&staging, 0, dst, 0, bytes);
+        lock(&self.inner.uploads).in_flight += staging.size();
         guard.uploads.push(staging);
         Ok(())
     }
@@ -730,29 +735,41 @@ impl Context {
         let max = self.inner.max_buffer_bytes;
         let class = pool::size_class(bytes, max)
             .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
-        let mut reused = lock(&self.inner.mappable).take(class);
-        if reused.is_none() {
-            // Recycled buffers are mapped again only after a submission: a loop of uploads that
-            // never syncs would otherwise keep allocating. Submit, wait for the maps, retry.
-            let waiting: u64 = lock(&self.inner.unmapped).iter().map(Buffer::size).sum();
-            if waiting > MAX_FREE_UPLOAD_BYTES {
-                self.flush_locked(&mut *self.batch()?);
-                self.device()
-                    .poll(wgpu::PollType::wait_indefinitely())
-                    .map_err(|e| LumaError::Poll(Arc::new(e)))?;
-                reused = lock(&self.inner.mappable).take(class);
-            }
-        }
-        let buffer = match reused {
-            Some(buffer) => buffer,
-            None => self.new_buffer(class, MAPPABLE_STORAGE_USAGE, true)?,
-        };
+        let buffer = self.take_upload_buffer(&self.inner.mappable, class, MAPPABLE_STORAGE_USAGE)?;
         {
             let mut view = buffer.get_mapped_range_mut(..bytes).map_err(LumaError::MapRange)?;
             write_parallel(data, view.slice(..));
         }
         buffer.unmap();
         Ok(buffer)
+    }
+
+    /// Takes a mapped `MAP_WRITE` buffer of `class` bytes from `pool`, polling completed
+    /// submissions (and waiting if more than [`MAX_FREE_UPLOAD_BYTES`] are in flight) before
+    /// allocating a fresh one.
+    fn take_upload_buffer(
+        &self,
+        pool: &Mutex<FreeUploads>,
+        class: u64,
+        usage: BufferUsages,
+    ) -> Result<Buffer> {
+        if let Some(buffer) = lock(pool).take(class) {
+            return Ok(buffer);
+        }
+        let _ = self.device().poll(wgpu::PollType::Poll);
+        if let Some(buffer) = lock(pool).take(class) {
+            return Ok(buffer);
+        }
+        if lock(pool).in_flight > MAX_FREE_UPLOAD_BYTES {
+            self.flush_locked(&mut *self.batch()?);
+            self.device()
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| LumaError::Poll(Arc::new(e)))?;
+            if let Some(buffer) = lock(pool).take(class) {
+                return Ok(buffer);
+            }
+        }
+        self.new_buffer(class, usage, true)
     }
 
     /// Records zeroing the first `bytes` bytes of `buffer`.
@@ -783,15 +800,30 @@ impl Context {
         let mut staged = Vec::new();
         for offset in (0..bytes).step_by(chunk as usize) {
             let size = chunk.min(bytes - offset);
-            staged.push((offset, size, self.alloc_buffer(size, STAGING_USAGE)?));
+            match self.alloc_buffer(size, STAGING_USAGE) {
+                Ok(staging) => staged.push((offset, size, staging)),
+                Err(err) => {
+                    for (_, _, s) in staged {
+                        self.recycle(s);
+                    }
+                    return Err(err);
+                }
+            }
         }
         let mut maps = Vec::with_capacity(staged.len());
-        {
-            let mut guard = self.batch()?;
-            for (offset, size, staging) in &staged {
-                self.encoder(&mut guard).copy_buffer_to_buffer(buffer, *offset, staging, 0, *size);
-                let submission = self.flush_locked(&mut guard);
-                maps.push((submission, map_for_read(staging.slice(..*size))));
+        match self.batch() {
+            Ok(mut guard) => {
+                for (offset, size, staging) in &staged {
+                    self.encoder(&mut guard).copy_buffer_to_buffer(buffer, *offset, staging, 0, *size);
+                    let submission = self.flush_locked(&mut guard);
+                    maps.push((submission, map_for_read(staging.slice(..*size))));
+                }
+            }
+            Err(err) => {
+                for (_, _, s) in staged {
+                    self.recycle(s);
+                }
+                return Err(err);
             }
         }
 
@@ -803,13 +835,20 @@ impl Context {
             std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(), len * std::mem::size_of::<T>())
         };
         advise_huge_pages(dst);
-        for ((offset, size, staging), (submission, mapped)) in staged.into_iter().zip(maps) {
-            self.wait_map(submission, &mapped)?;
-            {
+        let mut staged_iter = staged.into_iter().zip(maps);
+        while let Some(((offset, size, staging), (submission, mapped))) = staged_iter.next() {
+            let step = self.wait_map(submission, &mapped).and_then(|()| {
                 let view = staging.slice(..size).get_mapped_range().map_err(LumaError::MapRange)?;
                 copy_parallel(&view, &mut dst[offset as usize..(offset + size) as usize]);
-            }
+                Ok(())
+            });
             staging.unmap();
+            if let Err(err) = step {
+                for ((_, _, rest), _) in staged_iter {
+                    rest.unmap();
+                }
+                return Err(err);
+            }
             self.recycle(staging);
         }
         // SAFETY: the chunks cover all `len * size_of::<T>()` bytes, each written just above.
@@ -1065,6 +1104,9 @@ impl Context {
     ///
     /// Fails with [`LumaError::Profiling`] if profiling is not enabled.
     pub fn finish_profiling(&self) -> Result<Profile> {
+        if self.batch()?.profiler.is_none() {
+            return Err(LumaError::Profiling("profiling is not enabled".into()));
+        }
         // Lazy arrays still alive were computed inside the profiled region; record their fused
         // kernels while the profiler is still on.
         self.jit().evaluate_live();

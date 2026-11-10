@@ -493,6 +493,20 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
     let want: Vec<f32> = (0..n).map(|i| xs[(i + 2 * n - 2) % n] * 2.0 + 1.0).collect();
     assert_close(&nested, &want, 1e-6, 1e-6);
 
+
+    // A shifted expression shared with an outside consumer is evaluated once instead of being
+    // recomputed inside the shift's kernel.
+    let before = ctx.jit().stats();
+    let shared = &x * 3.0 + 1.0;
+    let shifted = shared.shift(1);
+    let other = &shared - 2.0;
+    let got_shifted = shifted.to_vec().unwrap();
+    let got_other = other.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 3);
+    let want_shifted: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 3.0 + 1.0).collect();
+    let want_other: Vec<f32> = xs.iter().map(|&v| v * 3.0 - 1.0).collect();
+    assert_close(&got_shifted, &want_shifted, 1e-5, 1e-5);
+    assert_close(&got_other, &want_other, 1e-5, 1e-5);
     // A shifted read inside a reduction's first pass.
     let before = ctx.jit().stats();
     let lag = (&x * &x.shift(3)).sum().unwrap();

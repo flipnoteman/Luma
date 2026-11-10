@@ -751,12 +751,15 @@ impl Array<f32> {
         if steps == 0 {
             return Ok(self * 1.0);
         }
-        let probe = Array::<f32>::alloc(self.context(), self.shape())?;
-        let stencil = jit::stencil_plan(&probe, &step(&probe));
-        match stencil {
+        let probe = self.probe()?;
+        let first = step(&probe);
+        match jit::stencil_plan(&probe, &first) {
             Some(stencil) => stencil.run(self, steps),
             None => {
-                let mut u = step(self);
+                if let (Ok(owner), Ok(alias)) = (self.storage(), probe.storage()) {
+                    owner.readers.absorb(&alias.readers);
+                }
+                let mut u = first;
                 for _ in 1..steps {
                     u = step(&u);
                 }

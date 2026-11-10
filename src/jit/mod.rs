@@ -332,6 +332,10 @@ impl Node {
         &self.ctx
     }
 
+    pub(crate) fn depends_on(&self, storage_id: u64) -> bool {
+        self.inputs.binary_search(&storage_id).is_ok()
+    }
+
     /// Whether another pending node outside `group` (node pointers) reads this node. Evaluating
     /// this node separately then beats recomputing it in every consumer's kernel.
     pub(crate) fn has_consumer_outside(&self, group: &[*const Node]) -> bool {
@@ -539,7 +543,7 @@ impl Readers {
 
     /// Takes over the readers of `other`: a node that was evaluated passes its readers on to the
     /// buffer it produced.
-    fn absorb(&self, other: &Readers) {
+    pub(crate) fn absorb(&self, other: &Readers) {
         let moved = other.take();
         if moved.is_empty() {
             return;

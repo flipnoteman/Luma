@@ -541,4 +541,17 @@ fn iterate_matches_the_step_by_step_loop() {
         .map(|i| 0.25 * if i > 0 { once[i - 1] } else { 0.0 } + 0.5 * once[i] + 0.25 * once.get(i + 1).copied().unwrap_or(0.0))
         .collect();
     assert_close(&got, &twice, 1e-5, 1e-5);
+
+    // A step that materializes an intermediate result on `u` before combining with `u.shift`
+    // must not treat that intermediate buffer as a fixed stencil input.
+    let small = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0, 4.0], 4).unwrap();
+    let got = small
+        .iterate(3, |u| u.shift(1) + u.try_add(1.0).unwrap())
+        .to_vec()
+        .unwrap();
+    let mut want = vec![1.0f32, 2.0, 3.0, 4.0];
+    for _ in 0..3 {
+        want = (0..4).map(|i| want[(i + 3) % 4] + (want[i] + 1.0)).collect();
+    }
+    assert_close(&got, &want, 1e-6, 1e-6);
 }

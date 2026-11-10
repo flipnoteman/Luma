@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 use std::panic::Location;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::context::{default_context, Context, STORAGE_USAGE};
@@ -42,6 +42,10 @@ pub(crate) struct Storage {
     ctx: Context,
     /// May be larger than the data it holds; only the first `byte_len` bytes are the array.
     buffer: wgpu::Buffer,
+    /// Kept alive when this storage aliases another one's buffer (see [`Array::probe`]).
+    owner: Option<Arc<Storage>>,
+    /// Set once [`Array::ready`] bound this storage to an eager command or readback.
+    materialized: AtomicBool,
     /// Lazy operations that still have to read this buffer; they are evaluated before anything
     /// overwrites it (see [`crate::jit`]).
     pub(crate) readers: Readers,
@@ -55,6 +59,20 @@ impl Storage {
             id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             buffer,
+            owner: None,
+            materialized: AtomicBool::new(false),
+            readers: Readers::default(),
+        }
+    }
+
+    /// A distinct storage identity backed by `owner`'s buffer without recycling it separately.
+    pub(crate) fn alias(owner: &Arc<Storage>) -> Self {
+        Storage {
+            id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
+            ctx: owner.ctx.clone(),
+            buffer: owner.buffer.clone(),
+            owner: Some(Arc::clone(owner)),
+            materialized: AtomicBool::new(false),
             readers: Readers::default(),
         }
     }
@@ -65,14 +83,21 @@ impl Storage {
     }
 
     pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+        self.materialized.store(true, Ordering::Relaxed);
         &self.buffer
+    }
+
+    pub(crate) fn was_materialized(&self) -> bool {
+        self.materialized.load(Ordering::Relaxed)
     }
 }
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        // Cloning a wgpu buffer only bumps a reference count; it is still the same buffer.
-        self.ctx.recycle(self.buffer.clone());
+        if self.owner.is_none() {
+            // Cloning a wgpu buffer only bumps a reference count; it is still the same buffer.
+            self.ctx.recycle(self.buffer.clone());
+        }
     }
 }
 
@@ -155,6 +180,17 @@ impl<T: GpuType> Array<T> {
     /// An array that is the (not yet evaluated) result of `node`.
     pub(crate) fn from_node(ctx: &Context, shape: Shape, node: Arc<Node>) -> Self {
         Array { ctx: ctx.clone(), shape, repr: Repr::Lazy(node), _marker: PhantomData }
+    }
+
+    /// Placeholder sharing this array's buffer under a fresh [`Storage`] id, for [`Array::iterate`].
+    pub(crate) fn probe(&self) -> std::result::Result<Self, Failure> {
+        let storage = self.storage()?;
+        Ok(Array {
+            ctx: self.ctx.clone(),
+            shape: self.shape,
+            repr: Repr::Valid(Arc::new(Storage::alias(storage))),
+            _marker: PhantomData,
+        })
     }
 
     fn poisoned(ctx: &Context, shape: Shape, error: Arc<LumaError>) -> Self {

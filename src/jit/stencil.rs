@@ -16,7 +16,7 @@ use crate::error::LumaError;
 use crate::ops::fold_workgroups;
 
 use super::codegen::expression;
-use super::program::{flatten, Instr, Ref, Tail};
+use super::program::{flatten_stencil, Instr, Ref};
 use super::{ElemTy, OpKind, ShiftKind};
 use crate::tuning::{stencil_bytes, Tuning, STENCIL_RADIUS as MAX_RADIUS};
 
@@ -54,9 +54,17 @@ pub(crate) fn plan(probe: &Array<f32>, next: &Array<f32>) -> Option<Stencil> {
     }
     let (w, h) = (u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?);
     let probe = Arc::clone(probe.storage().ok()?);
+    // If `step(&probe)` bound `probe`'s buffer (eager ops or forced sub-expressions), it is not
+    // a single fused stencil expression.
+    if probe.was_materialized() {
+        return None;
+    }
     let node = next.pending()?;
     let args = node.operands()?;
-    let fused = flatten(&[(Arc::clone(node), args)], Tail::Store).ok()?;
+    let fused = flatten_stencil(node, args, probe.id()).ok()?;
+    if probe.was_materialized() || !fused.key.subs.is_empty() {
+        return None;
+    }
     let out = *fused.key.outputs.first()?;
     if fused.key.instrs.get(out as usize)?.op.out_ty() != ElemTy::F32 {
         return None;
@@ -78,7 +86,10 @@ pub(crate) fn plan(probe: &Array<f32>, next: &Array<f32>) -> Option<Stencil> {
             return None;
         }
         let (dx, dy) = match kind {
-            ShiftKind::Dims { shifts, .. } => (signed(shifts[0], w), signed(shifts[1], h)),
+            ShiftKind::Dims { dims: s_dims, shifts } if s_dims == [w, h, 1, 1] => {
+                (signed(shifts[0], w), signed(shifts[1], h))
+            }
+            ShiftKind::Dims { .. } => return None,
             ShiftKind::Linear => {
                 let Ref::Scalar(k) = instr.args[1] else {
                     return None;
@@ -104,6 +115,7 @@ pub(crate) fn plan(probe: &Array<f32>, next: &Array<f32>) -> Option<Stencil> {
     if radius.0 > MAX_RADIUS || radius.1 > MAX_RADIUS || (h == 1 && radius.1 > 0) {
         return None;
     }
+    fused.mark_fused();
     let inputs = fused
         .inputs
         .iter()
