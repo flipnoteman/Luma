@@ -18,13 +18,10 @@ use crate::ops::fold_workgroups;
 use super::codegen::expression;
 use super::program::{flatten, Instr, Ref, Tail};
 use super::{ElemTy, OpKind, ShiftKind};
-use crate::tuning::Tuning;
+use crate::tuning::{stencil_bytes, Tuning, STENCIL_RADIUS as MAX_RADIUS};
 
 /// Invocations per workgroup.
 const WORKGROUP: u32 = 256;
-
-/// Largest stencil radius (per axis) handled; wider stencils iterate one kernel per step.
-const MAX_RADIUS: u32 = 4;
 
 /// A step expression that can run time-blocked.
 pub(crate) struct Stencil {
@@ -129,7 +126,7 @@ pub(crate) fn plan(probe: &Array<f32>, next: &Array<f32>) -> Option<Stencil> {
 /// buffers (outputs plus halo) fit in the tuning's workgroup memory budget.
 fn layout(tuning: &Tuning, radius: (u32, u32), one_d: bool, steps: usize) -> ((u32, u32), u32) {
     let (tx, ty) = if one_d { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
-    let fits = |k: u32| (tx + 2 * k * radius.0) * (ty + 2 * k * radius.1) * 8 <= tuning.stencil_tile_bytes;
+    let fits = |k: u32| stencil_bytes((tx, ty), (k * radius.0, k * radius.1)) <= tuning.stencil_tile_bytes;
     // A pointwise step needs no halo; cap it anyway, the program is unrolled per step.
     let mut k = 1;
     while k < 8 && fits(k + 1) {

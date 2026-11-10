@@ -110,6 +110,15 @@ impl Tuning {
             }
         }
         self.stencil_tile_bytes = self.stencil_tile_bytes.min(limits.max_compute_workgroup_storage_size);
+        // `stencil::layout` always runs at least one step, whatever the budget.
+        while self.stencil_tile_1d > 32 && stencil_bytes((self.stencil_tile_1d, 1), (STENCIL_RADIUS, 0)) > self.stencil_tile_bytes {
+            self.stencil_tile_1d /= 2;
+        }
+        let radius = (STENCIL_RADIUS, STENCIL_RADIUS);
+        while self.stencil_tile_2d.0.max(self.stencil_tile_2d.1) > 4 && stencil_bytes(self.stencil_tile_2d, radius) > self.stencil_tile_bytes {
+            let (x, y) = &mut self.stencil_tile_2d;
+            if *x >= *y { *x /= 2 } else { *y /= 2 }
+        }
         self
     }
 
@@ -132,6 +141,15 @@ fn conv_workgroup_bytes(workgroup: u32, per_thread: u32) -> u32 {
     (span + span / 32 + 1 + workgroup) * 4
 }
 
+/// Largest stencil radius (per axis) time-blocked; wider stencils iterate one kernel per step.
+pub(crate) const STENCIL_RADIUS: u32 = 4;
+
+/// Workgroup memory of the two buffers of a stencil tile of `tile` outputs with a halo of
+/// `halo` cells per side and axis.
+pub(crate) fn stencil_bytes(tile: (u32, u32), halo: (u32, u32)) -> u32 {
+    (tile.0 + 2 * halo.0) * (tile.1 + 2 * halo.1) * 8
+}
+
 /// Apple's PCI vendor id, which wgpu reports for Apple GPUs on Metal.
 const APPLE_VENDOR: u32 = 0x106B;
 const NVIDIA_VENDOR: u32 = 0x10DE;
@@ -142,7 +160,7 @@ fn is_apple(info: &wgpu::AdapterInfo) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{conv_workgroup_bytes, Tuning};
+    use super::{conv_workgroup_bytes, stencil_bytes, Tuning, STENCIL_RADIUS};
 
     #[test]
     fn tunings_fit_the_smallest_webgpu_limits() {
@@ -153,6 +171,8 @@ mod tests {
                 assert!(conv_workgroup_bytes(t.conv_workgroup, per_thread) <= limits.max_compute_workgroup_storage_size, "{t:?}");
             }
             assert!(t.stencil_tile_bytes <= limits.max_compute_workgroup_storage_size);
+            assert!(stencil_bytes((t.stencil_tile_1d, 1), (STENCIL_RADIUS, 0)) <= t.stencil_tile_bytes, "{t:?}");
+            assert!(stencil_bytes(t.stencil_tile_2d, (STENCIL_RADIUS, STENCIL_RADIUS)) <= t.stencil_tile_bytes, "{t:?}");
             assert!(t.elementwise_workgroup <= limits.max_compute_invocations_per_workgroup);
         }
     }
