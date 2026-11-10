@@ -3,14 +3,15 @@
 //! The forward transform is decimation in frequency (natural order in, bit-reversed order out)
 //! and the inverse is decimation in time (bit-reversed in, natural out), so no pass ever
 //! permutes the data. Every pass moves one tile of complex values (as many as fit in the
-//! device's workgroup memory, see [`tile_log`]) through workgroup memory and applies several
-//! radix-2 stages to it:
+//! device's workgroup memory, see [`tile_log`]) and applies several radix-2 stages to it:
 //!
 //! * a *local* pass works on contiguous blocks and applies the stages of the smallest distances
-//!   (up to half a tile). In the convolution's middle pass it also multiplies by the kernel's
-//!   spectrum and runs the first inverse stages, all without leaving workgroup memory;
-//! * a *columns* pass applies up to [`MAX_COLUMN_STAGES`] stages of larger distances: a tile is
-//!   a few adjacent columns (so loads stay coalesced) of the rows those stages combine.
+//!   (up to half a tile), four at a time in registers (radix 16: one exchange through workgroup
+//!   memory per four stages). In the convolution's middle pass it also multiplies by the
+//!   kernel's spectrum and runs the first inverse stages, all without leaving the tile;
+//! * a *columns* pass applies up to [`MAX_COLUMN_STAGES`] stages of larger distances, one at a
+//!   time in workgroup memory: a tile is a few adjacent columns (so loads stay coalesced) of the
+//!   rows those stages combine.
 //!
 //! The passes transform a batch of independent `2^log_b`-point blocks laid out one after the
 //! other. A convolution either transforms the whole zero-padded input as one block, or (usually)
@@ -27,6 +28,8 @@ use crate::ops::fold_workgroups;
 /// Tiles of `2^TILE_LOG` complex values (32 KiB) where the device allows, else half that.
 const TILE_LOG: u32 = 12;
 const WORKGROUP: u32 = 256;
+// A local pass's register groups need at most one thread each from a workgroup.
+const _: () = assert!(TILE_LOG <= 12);
 /// Most stages of one columns pass; a tile then has `2^(tile_log - MAX_COLUMN_STAGES)` columns.
 const MAX_COLUMN_STAGES: u32 = 8;
 
@@ -46,7 +49,7 @@ pub(crate) enum PassKind {
     Columns { inverse: bool },
     /// The `k` forward stages within contiguous blocks of `2^k`; with `multiply`, followed by the
     /// product with the spectrum `h` and the `k` inverse stages.
-    Local { multiply: bool },
+    Local { multiply: bool, k: u32 },
 }
 
 /// Where a pass loads from or stores to.
@@ -69,7 +72,7 @@ impl FftPass {
     }
 
     fn has_h(self) -> bool {
-        matches!(self.kind, PassKind::Local { multiply: true })
+        matches!(self.kind, PassKind::Local { multiply: true, .. })
     }
 }
 
@@ -165,7 +168,7 @@ fn twiddle(num: u32, log_den: u32, sign: f32) -> vec2<f32> {{
         tile = 1u32 << pass.tile_log,
     ));
     match pass.kind {
-        PassKind::Local { multiply } => src.push_str(&local_main(multiply)),
+        PassKind::Local { multiply, k } => src.push_str(&local_main(multiply, k)),
         PassKind::Columns { inverse } => src.push_str(&columns_main(inverse, pass.tile_log)),
     }
     src
@@ -184,101 +187,281 @@ fn butterfly(inverse: bool, w: &str) -> String {
     }
 }
 
-/// The `k` stages of a whole tile in workgroup memory, two at a time (radix 4: one read and one
-/// write of workgroup memory and one barrier per two stages), plus one radix-2 stage if `k` is
-/// odd. Forward stages run from the largest distance down (decimation in frequency), inverse
-/// ones from the smallest up (decimation in time).
-fn local_stages(inverse: bool) -> String {
-    let radix4 = if inverse {
-        // Stages t (distance d) and t + 1 (distance 2d) on x0..x3 = base + {0, d, 2d, 3d}.
-        "let d = 1u << (t - 1u);
-            let j = q & (d - 1u);
-            let i0 = ((q >> (t - 1u)) << (t + 1u)) | j;
-            let wa = conj(twiddle(j, t, -1.0));
-            let x0 = sh[i0]; let x1 = cmul(sh[i0 + d], wa);
-            let x2 = sh[i0 + 2u * d]; let x3 = cmul(sh[i0 + 3u * d], wa);
-            let a0 = x0 + x1; let a1 = x0 - x1; let a2 = x2 + x3; let a3 = x2 - x3;
-            let b2 = cmul(a2, conj(twiddle(j, t + 1u, -1.0)));
-            let b3 = cmul(a3, conj(twiddle(j + d, t + 1u, -1.0)));
-            sh[i0] = a0 + b2; sh[i0 + 2u * d] = a0 - b2;
-            sh[i0 + d] = a1 + b3; sh[i0 + 3u * d] = a1 - b3;"
+/// Stages applied to `2^r` values in registers, spaced `2^s` apart within blocks of `2^(s + r)`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Group {
+    s: u32,
+    r: u32,
+}
+
+/// The `k` forward stages as groups of four, largest distances first, then the remainder.
+fn forward_groups(k: u32) -> Vec<Group> {
+    let mut groups: Vec<Group> = (0..k / 4)
+        .map(|i| Group {
+            s: k - 4 * (i + 1),
+            r: 4,
+        })
+        .collect();
+    if k % 4 != 0 {
+        groups.push(Group { s: 0, r: k % 4 });
+    }
+    groups
+}
+
+/// The `k` inverse stages, smallest distances first: the remainder, then groups of four.
+fn inverse_groups(k: u32) -> Vec<Group> {
+    let tail = k % 4;
+    let mut groups = Vec::new();
+    if tail != 0 {
+        groups.push(Group { s: 0, r: tail });
+    }
+    groups.extend((0..k / 4).map(|i| Group {
+        s: tail + 4 * i,
+        r: 4,
+    }));
+    groups
+}
+
+fn literal(x: f64) -> String {
+    format!("{:?}", x as f32)
+}
+
+/// `v * e^(sign 2 pi i num / den)` for constants, as an expression.
+fn rotate(v: &str, num: u32, den: u32, sign: f64) -> String {
+    let angle = 2.0 * std::f64::consts::PI * f64::from(num) / f64::from(den);
+    let (c, s) = (angle.cos(), sign * angle.sin());
+    if num == 0 {
+        v.to_string()
+    } else if 2 * num == den {
+        format!("(-{v})")
+    } else if 4 * num == den || 4 * num == 3 * den {
+        // Multiplication by +i or -i.
+        if s > 0.0 {
+            format!("vec2<f32>(-{v}.y, {v}.x)")
+        } else {
+            format!("vec2<f32>({v}.y, -{v}.x)")
+        }
+    } else if (8 * num) % den == 0 {
+        // Odd multiples of pi/4: both parts have magnitude 1/sqrt(2).
+        let sc = if c > 0.0 { "" } else { "-" };
+        let re = format!("{sc}{v}.x {} {v}.y", if s > 0.0 { "-" } else { "+" });
+        let im = format!("{sc}{v}.y {} {v}.x", if s > 0.0 { "+" } else { "-" });
+        let r = literal(std::f64::consts::FRAC_1_SQRT_2);
+        format!("(vec2<f32>({re}, {im}) * {r})")
     } else {
-        // Stages t (distance d) and t - 1 (distance d / 2) on x0..x3 = base + {0, h, d, d + h}.
-        "let d = 1u << (t - 1u);
-            let hd = d >> 1u;
-            let j = q & (hd - 1u);
-            let i0 = ((q >> (t - 2u)) << t) | j;
-            let x0 = sh[i0]; let x1 = sh[i0 + hd]; let x2 = sh[i0 + d]; let x3 = sh[i0 + d + hd];
-            let a0 = x0 + x2; let a2 = cmul(x0 - x2, twiddle(j, t, -1.0));
-            let a1 = x1 + x3; let a3 = cmul(x1 - x3, twiddle(j + hd, t, -1.0));
-            let w = twiddle(j, t - 1u, -1.0);
-            sh[i0] = a0 + a1; sh[i0 + hd] = cmul(a0 - a1, w);
-            sh[i0 + d] = a2 + a3; sh[i0 + d + hd] = cmul(a2 - a3, w);"
-    };
-    let radix2 = format!(
-        "let d = 1u << (t - 1u);
-            let num = q & (d - 1u);
-            let lo = ((q >> (t - 1u)) << t) | num;
-            let hi = lo + d;
-            let den = t;
-            {}",
-        butterfly(inverse, "twiddle(num, den, -1.0)")
-    );
-    if inverse {
+        format!("cmul({v}, vec2<f32>({}, {}))", literal(c), literal(s))
+    }
+}
+
+fn bit_reverse(p: u32, r: u32) -> u32 {
+    p.reverse_bits() >> (32 - r)
+}
+
+/// Where a region reads its values from or writes them to: global memory, or workgroup memory
+/// at the plain index or at its `sx` swizzle.
+#[derive(Clone, Copy, PartialEq)]
+enum Mem {
+    Global,
+    Plain,
+    Swizzled,
+}
+
+impl Mem {
+    fn slot(self, at: &str) -> String {
+        match self {
+            Mem::Global => unreachable!("global memory has no slots"),
+            Mem::Plain => format!("sh[{at}]"),
+            Mem::Swizzled => format!("sh[sx({at})]"),
+        }
+    }
+}
+
+/// One thread's step of a local pass: it reads its run of values into registers, applies the
+/// forward group (decimation in frequency: butterflies with constant twiddles, then each value
+/// times `w^bit_reverse(position)`), the product with the spectrum `h`, the inverse group (the
+/// same steps mirrored), and writes the run back. `fwd` and `inv` cover the same run when both
+/// are given.
+struct Region {
+    fwd: Option<Group>,
+    multiply: bool,
+    inv: Option<Group>,
+    read: Mem,
+    write: Mem,
+}
+
+impl Region {
+    /// The twiddle `w = e^(sign 2 pi i j / 2^(s + r))` of the thread's first value, applied to
+    /// every value as `w^bit_reverse(position)`. Powers are products of two nearer ones, used
+    /// as soon as they exist to keep few of them live.
+    fn twiddles(g: Group, sign: f64) -> String {
+        let mut out = format!("let p1 = twiddle(j, {}u, {sign:?});\n", g.s + g.r);
+        for e in 1..1u32 << g.r {
+            if e > 1 {
+                out += &format!("let p{e} = cmul(p{}, p{});\n", e / 2, e - e / 2);
+            }
+            let m = bit_reverse(e, g.r);
+            out += &format!("x{m} = cmul(x{m}, p{e});\n");
+        }
+        out
+    }
+
+    fn forward(g: Group) -> String {
+        let n = 1u32 << g.r;
+        let mut out = String::new();
+        for a in 0..g.r {
+            let dist = n >> (a + 1);
+            for m in (0..n).filter(|m| m & dist == 0) {
+                let rotated = rotate("d", m & (dist - 1), 2 * dist, -1.0);
+                out += &format!(
+                    "{{ let u = x{m}; let v = x{hi}; x{m} = u + v; let d = u - v; x{hi} = {rotated}; }}\n",
+                    hi = m + dist
+                );
+            }
+        }
+        if g.s > 0 {
+            out += &Self::twiddles(g, -1.0);
+        }
+        out
+    }
+
+    fn inverse(g: Group) -> String {
+        let n = 1u32 << g.r;
+        let mut out = String::new();
+        if g.s > 0 {
+            out += &Self::twiddles(g, 1.0);
+        }
+        for a in 0..g.r {
+            let dist = 1u32 << a;
+            for m in (0..n).filter(|m| m & dist == 0) {
+                let hi = m + dist;
+                let rotated = rotate(&format!("x{hi}"), m & (dist - 1), 2 * dist, 1.0);
+                out += &format!("{{ let u = x{m}; let v = {rotated}; x{m} = u + v; x{hi} = u - v; }}\n");
+            }
+        }
+        out
+    }
+
+    /// The statements for a tile of `2^k` values.
+    fn source(&self, k: u32) -> String {
+        let g = self.fwd.or(self.inv).expect("a region needs a group");
+        let n = 1u32 << g.r;
+        let spacing = 1u32 << g.s;
+        let at = |m: u32| format!("(i0 + {}u)", spacing * m);
+        let mut body = String::new();
+        for m in 0..n {
+            body += &match self.read {
+                Mem::Global => format!("var x{m} = load(base + {});\n", at(m)),
+                mem => format!("var x{m} = {};\n", mem.slot(&at(m))),
+            };
+        }
+        if let Some(f) = self.fwd {
+            body += &Self::forward(f);
+        }
+        if self.multiply {
+            for m in 0..n {
+                body += &format!("x{m} = cmul(x{m}, h[(base + {}) & mask]);\n", at(m));
+            }
+        }
+        if let Some(i) = self.inv {
+            body += &Self::inverse(i);
+        }
+        for m in 0..n {
+            body += &match self.write {
+                Mem::Global => format!("store(base + {}, x{m});\n", at(m)),
+                mem => format!("{} = x{m};\n", mem.slot(&at(m))),
+            };
+        }
+        let threads = 1u32 << (k - g.r);
+        let guard = if threads < WORKGROUP {
+            format!("if (lid < {threads}u) ")
+        } else {
+            String::new()
+        };
+        let barrier = if self.write == Mem::Global {
+            ""
+        } else {
+            "workgroupBarrier();\n"
+        };
         format!(
-            "    {{
-    var t = 1u;
-    for (; t + 1u <= p.k; t = t + 2u) {{
-        for (var q = lid; q < size / 4u; q = q + {WORKGROUP}u) {{
-            {radix4}
-        }}
-        workgroupBarrier();
-    }}
-    if (t == p.k) {{
-        for (var q = lid; q < half; q = q + {WORKGROUP}u) {{
-            {radix2}
-        }}
-        workgroupBarrier();
-    }}
-    }}
-"
-        )
-    } else {
-        format!(
-            "    {{
-    var t = p.k;
-    for (; t >= 2u; t = t - 2u) {{
-        for (var q = lid; q < size / 4u; q = q + {WORKGROUP}u) {{
-            {radix4}
-        }}
-        workgroupBarrier();
-    }}
-    if (t == 1u) {{
-        for (var q = lid; q < half; q = q + {WORKGROUP}u) {{
-            {radix2}
-        }}
-        workgroupBarrier();
-    }}
-    }}
-"
+            "{guard}{{
+let q = lid;
+let mask = (1u << p.log_b) - 1u;
+let j = q & {}u;
+let i0 = ((q >> {}u) << {}u) | j;
+{body}}}
+{barrier}",
+            spacing - 1,
+            g.s,
+            g.s + g.r
         )
     }
 }
 
-fn local_main(multiply: bool) -> String {
-    let middle = if multiply {
-        format!(
-            "    let mask = (1u << p.log_b) - 1u;
-    for (var e = lid; e < size; e = e + {WORKGROUP}u) {{ sh[e] = cmul(sh[e], h[(base + e) & mask]); }}
-    workgroupBarrier();
-{}",
-            local_stages(true)
-        )
+/// The body of a local pass over a tile of `2^k` values. Values are exchanged through workgroup
+/// memory between groups only; the last forward group and the first inverse group are the same
+/// run per thread, so the product with the spectrum sits between them in registers.
+fn local_body(multiply: bool, k: u32) -> String {
+    if k == 0 {
+        let value = if multiply {
+            "cmul(load(base), h[base & ((1u << p.log_b) - 1u)])"
+        } else {
+            "load(base)"
+        };
+        return format!("if (lid == 0u) {{ store(base, {value}); }}\n");
+    }
+    // (forward group, product, inverse group) per region.
+    let mut steps: Vec<(Option<Group>, bool, Option<Group>)> = Vec::new();
+    let forward = forward_groups(k);
+    if multiply {
+        let inverse = inverse_groups(k);
+        debug_assert_eq!(forward.last(), inverse.first());
+        steps.extend(forward[..forward.len() - 1].iter().map(|&g| (Some(g), false, None)));
+        steps.push((forward.last().copied(), true, inverse.first().copied()));
+        steps.extend(inverse[1..].iter().map(|&g| (None, false, Some(g))));
     } else {
-        String::new()
+        steps.extend(forward.iter().map(|&g| (Some(g), false, None)));
+    }
+    let run = |i: usize| steps[i].0.or(steps[i].2).expect("a region needs a group");
+    // Runs shorter than a bank row put every thread of a warp on the same banks, so those
+    // exchanges swizzle the indices; longer strides are conflict-free as they are.
+    let exchange = |i: usize| {
+        if run(i).s < 4 || run(i + 1).s < 4 {
+            Mem::Swizzled
+        } else {
+            Mem::Plain
+        }
     };
+    let last = steps.len() - 1;
+    let mut body = String::new();
+    for (i, &(fwd, multiply_here, inv)) in steps.iter().enumerate() {
+        let region = Region {
+            fwd,
+            multiply: multiply_here,
+            inv,
+            read: if i == 0 { Mem::Global } else { exchange(i - 1) },
+            write: match (i < last, multiply) {
+                (true, _) => exchange(i),
+                (false, true) => Mem::Global,
+                (false, false) => Mem::Swizzled,
+            },
+        };
+        body += &region.source(k);
+    }
+    if !multiply {
+        body += &format!(
+            "for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{ store(base + e, sh[sx(e)]); }}\n",
+            1u32 << k
+        );
+    }
+    body
+}
+
+fn local_main(multiply: bool, k: u32) -> String {
     format!(
         "
+// Swaps the low four bits with bits four to seven, so runs of 16 consecutive values hit
+// distinct memory banks.
+fn sx(i: u32) -> u32 {{ return i ^ ((i >> 4u) & 15u); }}
 
 @compute @workgroup_size({WORKGROUP})
 fn main(
@@ -286,15 +469,10 @@ fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
-    let size = 1u << p.k;
-    let half = size >> 1u;
-    let base = (wid.x + wid.y * nwg.x) * size;
-    for (var e = lid; e < size; e = e + {WORKGROUP}u) {{ sh[e] = load(base + e); }}
-    workgroupBarrier();
-{}{middle}    for (var e = lid; e < size; e = e + {WORKGROUP}u) {{ store(base + e, sh[e]); }}
-}}
+    let base = (wid.x + wid.y * nwg.x) << p.k;
+{}}}
 ",
-        local_stages(false),
+        local_body(multiply, k)
     )
 }
 
@@ -458,7 +636,10 @@ fn run(ctx: &Context, batch: &Batch<'_>) -> Result<(), LumaError> {
     }
     let Some((_, out)) = batch.dst else {
         return launch(
-            PassKind::Local { multiply: false },
+            PassKind::Local {
+                multiply: false,
+                k: local,
+            },
             (0, local),
             source(columns.is_empty()),
             Io::Complex,
@@ -466,7 +647,10 @@ fn run(ctx: &Context, batch: &Batch<'_>) -> Result<(), LumaError> {
     };
     let local_out = if columns.is_empty() { out } else { Io::Complex };
     launch(
-        PassKind::Local { multiply: true },
+        PassKind::Local {
+            multiply: true,
+            k: local,
+        },
         (0, local),
         source(columns.is_empty()),
         local_out,
