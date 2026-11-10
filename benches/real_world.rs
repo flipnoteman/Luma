@@ -271,10 +271,8 @@ const NBODY_PER_INVOCATION: usize = 8;
 /// Partners staged in workgroup memory per iteration.
 const NBODY_TILE: usize = 512;
 
-/// `(bodies per workgroup, accumulators reduced per pass)`. Each body is shared by
-/// `256 * NBODY_PER_INVOCATION / bodies` invocations that take a slice of every tile; Apple wants a whole
-/// subgroup on one slice so that partner reads are uniform, and a small workgroup memory footprint
-/// (the final reduction reuses the tile).
+/// `(bodies per workgroup, accumulators reduced per pass)`: Apple wants a whole subgroup on one slice
+/// and a small workgroup footprint, NVIDIA a single reduction pass.
 fn nbody_tuning(profile: TuningProfile) -> (usize, usize) {
     match profile {
         TuningProfile::Nvidia => (64, NBODY_PER_INVOCATION),
@@ -282,23 +280,49 @@ fn nbody_tuning(profile: TuningProfile) -> (usize, usize) {
     }
 }
 
+/// Each body is shared by `256 * NBODY_PER_INVOCATION / bodies` invocations that take a slice of
+/// every tile of partners; their partial sums are reduced through the tile, `chunk` accumulators at a time.
 fn nbody_source(bodies: usize, chunk: usize) -> String {
     let (r, tile) = (NBODY_PER_INVOCATION, NBODY_TILE);
     let (groups, slices) = (bodies / r, 256 * r / bodies);
     let each = |f: &dyn Fn(usize) -> String| (0..r).map(f).collect::<String>();
-    let lets = each(&|i| format!("    let me{i} = pos[min(first + {i}u, p.n - 1u)].xyz;\n    var a{i} = vec3<f32>(0.0);\n"));
+    let lets = each(&|i| {
+        format!(
+            r#"
+    let me{i} = pos[min(first + {i}u, p.n - 1u)].xyz;
+    var a{i} = vec3<f32>(0.0);"#
+        )
+    });
     let pairs = each(&|i| {
         format!(
-            "            let d{i} = o.xyz - me{i};\n            let i{i} = inverseSqrt(fma(d{i}.z, d{i}.z, fma(d{i}.y, d{i}.y, fma(d{i}.x, d{i}.x, p.eps2))));\n            let s{i} = o.w * i{i} * (i{i} * i{i});\n            a{i} = fma(d{i}, vec3<f32>(s{i}), a{i});\n"
+            r#"
+            let d{i} = o.xyz - me{i};
+            let i{i} = inverseSqrt(fma(d{i}.z, d{i}.z, fma(d{i}.y, d{i}.y, fma(d{i}.x, d{i}.x, p.eps2))));
+            let s{i} = o.w * i{i} * (i{i} * i{i});
+            a{i} = fma(d{i}, vec3<f32>(s{i}), a{i});"#
         )
     });
     let passes: String = (0..r / chunk)
         .map(|q| {
-            let stores: String = (0..chunk).map(|c| format!("    tile[lid + {}u] = vec4<f32>(a{}, 0.0);\n", c * 256, q * chunk + c)).collect();
+            let (first, active) = (q * chunk, groups * chunk);
+            let stores: String = (0..chunk).map(|c| format!("\n    tile[lid + {}u] = vec4<f32>(a{}, 0.0);", c * 256, first + c)).collect();
             format!(
-                "{stores}    workgroupBarrier();\n    if (lid < {n}u) {{\n        let r = lid % {chunk}u;\n        let g = lid / {chunk}u;\n        var sum = vec4<f32>(0.0);\n        for (var s = 0u; s < {slices}u; s = s + 1u) {{\n            sum = sum + tile[r * 256u + s * {groups}u + g];\n        }}\n        let body = first0 + g * {r}u + {base}u + r;\n        if (body < p.n) {{\n            acc[body] = sum;\n        }}\n    }}\n    workgroupBarrier();\n",
-                n = groups * chunk,
-                base = q * chunk
+                r#"{stores}
+    workgroupBarrier();
+    if (lid < {active}u) {{
+        let r = lid % {chunk}u;
+        let g = lid / {chunk}u;
+        var sum = vec4<f32>(0.0);
+        for (var s = 0u; s < {slices}u; s = s + 1u) {{
+            sum = sum + tile[r * 256u + s * {groups}u + g];
+        }}
+        let body = first0 + g * {r}u + {first}u + r;
+        if (body < p.n) {{
+            acc[body] = sum;
+        }}
+    }}
+    workgroupBarrier();
+"#
             )
         })
         .collect();
@@ -314,8 +338,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let slot = lid % {groups}u;
     let slice = lid / {groups}u;
     let first0 = wid.x * {bodies}u;
-    let first = first0 + slot * {r}u;
-{lets}    for (var base = 0u; base < p.n; base = base + {tile}u) {{
+    let first = first0 + slot * {r}u;{lets}
+    for (var base = 0u; base < p.n; base = base + {tile}u) {{
         for (var t = lid; t < {tile}u; t = t + 256u) {{
             let j = base + t;
             // Missing partners have no mass.
@@ -323,8 +347,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         }}
         workgroupBarrier();
         for (var k = slice; k < {tile}u; k = k + {slices}u) {{
-            let o = tile[k];
-{pairs}        }}
+            let o = tile[k];{pairs}
+        }}
         workgroupBarrier();
     }}
 {passes}}}
