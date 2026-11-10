@@ -265,49 +265,73 @@ fn mandelbrot(c: &mut Criterion) {
 
 // -- N-body gravitational accelerations --
 
-/// Bodies per workgroup; each is shared by `256 / NBODY_BODIES` invocations that take a slice of
-/// every tile of partners, so that `n` bodies keep four times as many invocations busy.
-const NBODY_BODIES: usize = 64;
+/// Bodies held in registers by each invocation, so that one partner load from workgroup memory
+/// feeds this many interactions.
+const NBODY_PER_INVOCATION: usize = 8;
+/// Partners staged in workgroup memory per iteration.
+const NBODY_TILE: usize = 512;
 
-const NBODY: &str = r#"
-struct Params { n: u32, eps2: f32 }
+/// `(bodies per workgroup, accumulators reduced per pass)`. Each body is shared by
+/// `256 * NBODY_PER_INVOCATION / bodies` invocations that take a slice of every tile; Apple wants a whole
+/// subgroup on one slice so that partner reads are uniform, and a small workgroup memory footprint
+/// (the final reduction reuses the tile).
+fn nbody_tuning(profile: TuningProfile) -> (usize, usize) {
+    match profile {
+        TuningProfile::Nvidia => (64, NBODY_PER_INVOCATION),
+        _ => (128, 2),
+    }
+}
+
+fn nbody_source(bodies: usize, chunk: usize) -> String {
+    let (r, tile) = (NBODY_PER_INVOCATION, NBODY_TILE);
+    let (groups, slices) = (bodies / r, 256 * r / bodies);
+    let each = |f: &dyn Fn(usize) -> String| (0..r).map(f).collect::<String>();
+    let lets = each(&|i| format!("    let me{i} = pos[min(first + {i}u, p.n - 1u)].xyz;\n    var a{i} = vec3<f32>(0.0);\n"));
+    let pairs = each(&|i| {
+        format!(
+            "            let d{i} = o.xyz - me{i};\n            let i{i} = inverseSqrt(fma(d{i}.z, d{i}.z, fma(d{i}.y, d{i}.y, fma(d{i}.x, d{i}.x, p.eps2))));\n            let s{i} = o.w * i{i} * (i{i} * i{i});\n            a{i} = fma(d{i}, vec3<f32>(s{i}), a{i});\n"
+        )
+    });
+    let passes: String = (0..r / chunk)
+        .map(|q| {
+            let stores: String = (0..chunk).map(|c| format!("    tile[lid + {}u] = vec4<f32>(a{}, 0.0);\n", c * 256, q * chunk + c)).collect();
+            format!(
+                "{stores}    workgroupBarrier();\n    if (lid < {n}u) {{\n        let r = lid % {chunk}u;\n        let g = lid / {chunk}u;\n        var sum = vec4<f32>(0.0);\n        for (var s = 0u; s < {slices}u; s = s + 1u) {{\n            sum = sum + tile[r * 256u + s * {groups}u + g];\n        }}\n        let body = first0 + g * {r}u + {base}u + r;\n        if (body < p.n) {{\n            acc[body] = sum;\n        }}\n    }}\n    workgroupBarrier();\n",
+                n = groups * chunk,
+                base = q * chunk
+            )
+        })
+        .collect();
+    format!(
+        r#"
+struct Params {{ n: u32, eps2: f32 }}
 @group(1) @binding(0) var<storage, read> pos: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> acc: array<vec4<f32>>;
 @group(1) @binding(2) var<uniform> p: Params;
-var<workgroup> tile: array<vec4<f32>, 256>;
-var<workgroup> part: array<vec4<f32>, 256>;
+var<workgroup> tile: array<vec4<f32>, {size}>;
 @compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    let body = wid.x * 64u + lid % 64u;
-    let first = (lid / 64u) * 64u;
-    let me = pos[min(body, p.n - 1u)].xyz;
-    // Two accumulators, so consecutive partners do not wait on each other's additions.
-    var a0 = vec3<f32>(0.0);
-    var a1 = vec3<f32>(0.0);
-    for (var base = 0u; base < p.n; base = base + 256u) {
-        let j = base + lid;
-        // Missing partners have no mass.
-        tile[lid] = select(vec4<f32>(0.0), pos[min(j, p.n - 1u)], j < p.n);
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {{
+    let slot = lid % {groups}u;
+    let slice = lid / {groups}u;
+    let first0 = wid.x * {bodies}u;
+    let first = first0 + slot * {r}u;
+{lets}    for (var base = 0u; base < p.n; base = base + {tile}u) {{
+        for (var t = lid; t < {tile}u; t = t + 256u) {{
+            let j = base + t;
+            // Missing partners have no mass.
+            tile[t] = select(vec4<f32>(0.0), pos[min(j, p.n - 1u)], j < p.n);
+        }}
         workgroupBarrier();
-        for (var k = first; k < first + 64u; k = k + 2u) {
-            let o0 = tile[k];
-            let o1 = tile[k + 1u];
-            let d0 = o0.xyz - me;
-            let d1 = o1.xyz - me;
-            let i0 = inverseSqrt(dot(d0, d0) + p.eps2);
-            let i1 = inverseSqrt(dot(d1, d1) + p.eps2);
-            a0 = a0 + d0 * (o0.w * i0 * i0 * i0);
-            a1 = a1 + d1 * (o1.w * i1 * i1 * i1);
-        }
+        for (var k = slice; k < {tile}u; k = k + {slices}u) {{
+            let o = tile[k];
+{pairs}        }}
         workgroupBarrier();
-    }
-    part[lid] = vec4<f32>(a0 + a1, 0.0);
-    workgroupBarrier();
-    if (lid < 64u && body < p.n) {
-        acc[body] = part[lid] + part[lid + 64u] + part[lid + 128u] + part[lid + 192u];
-    }
+    }}
+{passes}}}
+"#,
+        size = tile.max(256 * chunk)
+    )
 }
-"#;
 
 #[derive(encase::ShaderType)]
 struct NbodyParams {
@@ -346,11 +370,12 @@ fn nbody(c: &mut Criterion) {
     let aos: Vec<[f32; 4]> = (0..n).map(|i| [soa[0][i], soa[1][i], soa[2][i], soa[3][i]]).collect();
     let pos = Array::from_slice(&aos, n).unwrap();
     let mut acc = Array::<[f32; 4]>::from_slice(&vec![[0.0; 4]; n], n).unwrap();
-    let kernel = Kernel::new(NBODY).unwrap();
     let params = NbodyParams { n: n as u32, eps2: EPS2 };
     let ctx = default_context().unwrap();
+    let (bodies, chunk) = nbody_tuning(ctx.tuning_profile());
+    let kernel = Kernel::new(&nbody_source(bodies, chunk)).unwrap();
     let run = |acc: &mut Array<[f32; 4]>| {
-        kernel.launch_raw([n.div_ceil(NBODY_BODIES) as u32, 1, 1], args![&pos, &mut *acc, uniform(&params)]).unwrap();
+        kernel.launch_raw([n.div_ceil(bodies) as u32, 1, 1], args![&pos, &mut *acc, uniform(&params)]).unwrap();
         ctx.sync().unwrap();
     };
     run(&mut acc);
