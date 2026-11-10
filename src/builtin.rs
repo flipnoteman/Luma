@@ -316,8 +316,9 @@ fn main(
 /// registers. The kernel is consumed in chunks of taps whose weights and input window are staged
 /// in workgroup memory (zero outside the input, so the inner loop has no bounds checks). The
 /// inner loop takes `R` taps at a time from the `(R - 1) s + R` window values they touch, fully
-/// unrolled. Window slots skip one word every 32 so that the strided reads of neighbouring
-/// invocations fall into different banks.
+/// unrolled, with the weights read four at a time when `R` allows. Window slots skip one word
+/// every 32 so that the strided reads of neighbouring invocations fall into different banks.
+/// The accumulators go back through the window so that the stores are coalesced.
 fn conv1d_tiled(stride: u32, per_thread: u32, wg: u32) -> String {
     let s = stride;
     let r = per_thread / s;
@@ -329,12 +330,29 @@ fn conv1d_tiled(stride: u32, per_thread: u32, wg: u32) -> String {
     let mut acc = String::new();
     let mut loads = String::new();
     let mut fmas = String::new();
+    let mut stage = String::new();
+    let mut stash = String::new();
     let mut stores = String::new();
+    for m in 0..r * s {
+        stage.push_str(&format!(
+            "        window[slot(lid + {0}u)] = load(start + i32(c + lid + {0}u));\n",
+            m * wg
+        ));
+    }
     for i in 0..r {
         acc.push_str(&format!("    var acc{i} = 0.0;\n"));
-        loads.push_str(&format!("            let w{i} = weights[k + {i}u];\n"));
+        if r % 4 == 0 {
+            if i % 4 == 0 {
+                loads.push_str(&format!("            let q{} = weights[k / 4u + {}u];\n", i / 4, i / 4));
+            }
+            loads.push_str(&format!("            let w{i} = q{}.{};\n", i / 4, ["x", "y", "z", "w"][(i % 4) as usize]));
+        } else {
+            loads.push_str(&format!("            let w{i} = weights[k + {i}u];\n"));
+        }
+        stash.push_str(&format!("    window[slot(lid * {r}u + {i}u)] = acc{i};\n"));
         stores.push_str(&format!(
-            "    if (o + {i}u < params.output_len) {{ output[o + {i}u] = acc{i}; }}\n"
+            "    if (first + lid + {}u < params.output_len) {{ output[first + lid + {}u] = window[slot(lid + {}u)]; }}\n",
+            i * wg, i * wg, i * wg
         ));
     }
     for m in 0..(r - 1) * s + r {
@@ -353,9 +371,18 @@ fn conv1d_tiled(stride: u32, per_thread: u32, wg: u32) -> String {
 @group(1) @binding(3) var<uniform> params: Params;
 
 var<workgroup> window: array<f32, {window}>;
-var<workgroup> weights: array<f32, {chunk}>;
+var<workgroup> weights: array<{weights_ty}, {weights_len}>;
 
 fn slot(i: u32) -> u32 {{ return i + (i >> 5u); }}
+
+fn weight(c: u32, taps: u32, i: u32) -> f32 {{
+    return select(0.0, kernel[min(c + i, params.kernel_len - 1u)], i < taps);
+}}
+
+fn load(g: i32) -> f32 {{
+    let inside = g >= 0 && u32(g) < params.input_len;
+    return select(0.0, input_data[u32(max(g, 0))], inside);
+}}
 
 @compute @workgroup_size({wg})
 fn main(
@@ -369,14 +396,9 @@ fn main(
 {acc}    for (var c = 0u; c < params.kernel_len; c = c + {chunk}u) {{
         let taps = min({chunk}u, params.kernel_len - c);
         let padded = (taps + {r}u - 1u) / {r}u * {r}u;
-        if (lid < {chunk}u) {{
-            weights[lid] = select(0.0, kernel[min(c + lid, params.kernel_len - 1u)], lid < taps);
-        }}
-        for (var j = lid; j < {tile_in}u + padded; j = j + {wg}u) {{
-            let g = start + i32(c + j);
-            var v = 0.0;
-            if (g >= 0 && u32(g) < params.input_len) {{ v = input_data[u32(g)]; }}
-            window[slot(j)] = v;
+{weights_stage}
+{stage}        if (lid < padded) {{
+            window[slot({tile_in}u + lid)] = load(start + i32(c + {tile_in}u + lid));
         }}
         workgroupBarrier();
         for (var k = 0u; k < padded; k = k + {r}u) {{
@@ -384,11 +406,24 @@ fn main(
 {loads}{fmas}        }}
         workgroupBarrier();
     }}
-    let o = first + lid * {r}u;
+{stash}    workgroupBarrier();
 {stores}}}
 ",
         tile_in = tile * s,
         rs = r * s,
+        weights_ty = if r % 4 == 0 { "vec4<f32>" } else { "f32" },
+        weights_len = if r % 4 == 0 { chunk / 4 } else { chunk },
+        weights_stage = if r % 4 == 0 {
+            format!(
+                "        if (lid < {}u) {{
+            weights[lid] = vec4<f32>(weight(c, taps, lid * 4u), weight(c, taps, lid * 4u + 1u), weight(c, taps, lid * 4u + 2u), weight(c, taps, lid * 4u + 3u));
+        }}
+",
+                chunk / 4
+            )
+        } else {
+            format!("        if (lid < {chunk}u) {{ weights[lid] = weight(c, taps, lid); }}\n")
+        },
     )
 }
 

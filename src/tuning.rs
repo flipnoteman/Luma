@@ -20,21 +20,15 @@ pub enum TuningProfile {
     Generic,
 }
 
-/// Kernel lengths below these use the first, then the second entry of
-/// [`Tuning::conv_per_thread`]; longer kernels the third.
-const CONV_TAP_CLASSES: [usize; 2] = [128, 512];
-
 /// Kernel parameters of a context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Tuning {
     pub(crate) profile: TuningProfile,
     /// Invocations per workgroup of elementwise kernels (fused, fills, in-place operators).
     pub(crate) elementwise_workgroup: u32,
-    /// Tiled 1D convolution: invocations per workgroup, and outputs per invocation at stride 1
-    /// by kernel length (see [`CONV_TAP_CLASSES`]): short kernels gain from more invocations,
-    /// long ones from reusing each loaded input more often.
+    /// Tiled 1D convolution: invocations per workgroup, and outputs per invocation at stride 1.
     pub(crate) conv_workgroup: u32,
-    pub(crate) conv_per_thread: [u32; 3],
+    pub(crate) conv_per_thread: u32,
     /// Time-blocked stencils: workgroup memory for the two tile buffers, and the output tile of
     /// 2D and 1D arrays.
     pub(crate) stencil_tile_bytes: u32,
@@ -49,8 +43,8 @@ impl Tuning {
     const APPLE: Tuning = Tuning {
         profile: TuningProfile::Apple,
         elementwise_workgroup: 64,
-        conv_workgroup: 256,
-        conv_per_thread: [16, 16, 16],
+        conv_workgroup: 128,
+        conv_per_thread: 32,
         stencil_tile_bytes: 8 * 1024,
         stencil_tile_2d: (32, 16),
         // A wider 1D tile leaves no room in 8 KiB for the halo of a second step.
@@ -62,7 +56,7 @@ impl Tuning {
         profile: TuningProfile::Nvidia,
         elementwise_workgroup: 256,
         conv_workgroup: 256,
-        conv_per_thread: [8, 16, 32],
+        conv_per_thread: 32,
         stencil_tile_bytes: 32 * 1024,
         stencil_tile_2d: (64, 32),
         stencil_tile_1d: 2048,
@@ -73,7 +67,7 @@ impl Tuning {
         profile: TuningProfile::Generic,
         elementwise_workgroup: 256,
         conv_workgroup: 256,
-        conv_per_thread: [16, 16, 16],
+        conv_per_thread: 16,
         stencil_tile_bytes: 16 * 1024,
         stencil_tile_2d: (32, 16),
         stencil_tile_1d: 1024,
@@ -104,10 +98,8 @@ impl Tuning {
         let invocations = limits.max_compute_invocations_per_workgroup.min(limits.max_compute_workgroup_size_x);
         self.elementwise_workgroup = self.elementwise_workgroup.min(invocations);
         self.conv_workgroup = self.conv_workgroup.min(invocations);
-        for per_thread in &mut self.conv_per_thread {
-            while *per_thread > 4 && conv_workgroup_bytes(self.conv_workgroup, *per_thread) > limits.max_compute_workgroup_storage_size {
-                *per_thread /= 2;
-            }
+        while self.conv_per_thread > 4 && conv_workgroup_bytes(self.conv_workgroup, self.conv_per_thread) > limits.max_compute_workgroup_storage_size {
+            self.conv_per_thread /= 2;
         }
         self.stencil_tile_bytes = self.stencil_tile_bytes.min(limits.max_compute_workgroup_storage_size);
         // `stencil::layout` always runs at least one step, whatever the budget.
@@ -120,12 +112,6 @@ impl Tuning {
             if *x >= *y { *x /= 2 } else { *y /= 2 }
         }
         self
-    }
-
-    /// Outputs per invocation of the tiled convolution at stride 1, for a kernel of `taps` taps.
-    pub(crate) fn conv_per_thread(&self, taps: usize) -> u32 {
-        let class = CONV_TAP_CLASSES.iter().take_while(|&&limit| taps >= limit).count();
-        self.conv_per_thread[class]
     }
 
     /// Elements one reduction workgroup consumes.
@@ -167,9 +153,7 @@ mod tests {
         let limits = wgpu::Limits::downlevel_defaults();
         for tuning in [Tuning::APPLE, Tuning::NVIDIA, Tuning::GENERIC] {
             let t = tuning.within(&limits);
-            for per_thread in t.conv_per_thread {
-                assert!(conv_workgroup_bytes(t.conv_workgroup, per_thread) <= limits.max_compute_workgroup_storage_size, "{t:?}");
-            }
+            assert!(conv_workgroup_bytes(t.conv_workgroup, t.conv_per_thread) <= limits.max_compute_workgroup_storage_size, "{t:?}");
             assert!(t.stencil_tile_bytes <= limits.max_compute_workgroup_storage_size);
             assert!(stencil_bytes((t.stencil_tile_1d, 1), (STENCIL_RADIUS, 0)) <= t.stencil_tile_bytes, "{t:?}");
             assert!(stencil_bytes(t.stencil_tile_2d, (STENCIL_RADIUS, STENCIL_RADIUS)) <= t.stencil_tile_bytes, "{t:?}");
