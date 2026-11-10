@@ -116,7 +116,7 @@ fn sgemm_par_cpu(b_transposed: bool, n: usize, k: usize, a: &[f32], b: &[f32], c
 
 #[path = "common/sgemm.rs"]
 mod sgemm;
-use sgemm::{sgemm_source, SgemmParams, TILE};
+use sgemm::{sgemm_source, CoopKind, SgemmParams, TILE};
 
 // -- k-means: one assignment + centroid update iteration --
 
@@ -451,6 +451,8 @@ impl MlpHost {
 
 struct MlpGpu {
     gemm: Kernel,
+    /// Output tile edge of `gemm`.
+    tile: usize,
     softmax: Kernel,
     w: [Array<f32>; 3],
     b: [Array<f32>; 3],
@@ -461,7 +463,8 @@ struct MlpGpu {
 }
 
 impl MlpGpu {
-    fn new(host: &MlpHost) -> Self {
+    /// With `coop`, the GEMMs are the cooperative-matrix kernel of that kind.
+    fn new(host: &MlpHost, coop: Option<CoopKind>) -> Self {
         let pad = |w: &[f32], rows: usize, cols: usize| {
             let mut out = vec![0.0f32; rows * CLASSES_PADDED];
             for r in 0..rows {
@@ -473,7 +476,9 @@ impl MlpGpu {
         bias3.resize(CLASSES_PADDED, 0.0);
         let w3 = pad(&host.w[2], WIDTH, CLASSES);
         MlpGpu {
-            gemm: Kernel::new(&sgemm_source(false, true)).unwrap(),
+            gemm: Kernel::new(&coop.map_or_else(|| sgemm_source(false, true), |kind| kind.source(false, true)))
+                .unwrap(),
+            tile: coop.map_or(TILE, CoopKind::tile),
             softmax: Kernel::new(SOFTMAX).unwrap(),
             w: [
                 Array::from_slice(&host.w[0], [WIDTH, WIDTH]).unwrap(),
@@ -496,12 +501,13 @@ impl MlpGpu {
     fn forward(&mut self, x: &Array<f32>) {
         let hidden = SgemmParams { m: BATCH as u32, n: WIDTH as u32, k: WIDTH as u32, relu: 1 };
         let last = SgemmParams { m: BATCH as u32, n: CLASSES_PADDED as u32, k: WIDTH as u32, relu: 0 };
-        let (tiles_m, tiles_hidden) = ((BATCH / TILE) as u32, (WIDTH / TILE) as u32);
+        let (tiles_m, tiles_hidden) = ((BATCH / self.tile) as u32, (WIDTH / self.tile) as u32);
+        let tiles_last = (CLASSES_PADDED / self.tile) as u32;
         let g = &self.gemm;
         g.launch_raw([tiles_hidden, tiles_m, 1], args![x, &self.w[0], &mut self.h1, uniform(&hidden), &self.b[0]]).unwrap();
         g.launch_raw([tiles_hidden, tiles_m, 1], args![&self.h1, &self.w[1], &mut self.h2, uniform(&hidden), &self.b[1]])
             .unwrap();
-        g.launch_raw([1, tiles_m, 1], args![&self.h2, &self.w[2], &mut self.logits, uniform(&last), &self.b[2]]).unwrap();
+        g.launch_raw([tiles_last, tiles_m, 1], args![&self.h2, &self.w[2], &mut self.logits, uniform(&last), &self.b[2]]).unwrap();
         let sm = SoftmaxParams { rows: BATCH as u32, cols: CLASSES as u32, stride: CLASSES_PADDED as u32 };
         self.softmax.launch([BATCH as u32], args![&self.logits, &mut self.probs, uniform(&sm)]).unwrap();
     }
@@ -574,10 +580,12 @@ fn mlp(c: &mut Criterion) {
     let host = MlpHost::new();
     let x = values(BATCH * WIDTH, 16, -1.0, 1.0);
     let gx = Array::from_slice(&x, [WIDTH, BATCH]).unwrap();
-    let mut gpu = MlpGpu::new(&host);
+    let mut gpu = MlpGpu::new(&host, None);
     let ctx = default_context().unwrap();
     gpu.forward(&gx);
     ctx.sync().unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let gpu_f32_probs = gpu.probs.to_vec().unwrap();
 
     #[cfg(target_os = "macos")]
     let mut cpu = MlpCpuBuffers::new();
@@ -591,6 +599,22 @@ fn mlp(c: &mut Criterion) {
         }
     }
 
+    let mut coop = CoopKind::for_context(&ctx).map(|kind| (kind, MlpGpu::new(&host, Some(kind))));
+    if let Some((kind, gpu)) = &mut coop {
+        gpu.forward(&gx);
+        ctx.sync().unwrap();
+        // The CPU reference exists on macOS only; elsewhere the f32 kernels' result stands in.
+        #[cfg(target_os = "macos")]
+        let want = cpu.probs.clone();
+        #[cfg(not(target_os = "macos"))]
+        let want = gpu_f32_probs;
+        let got = gpu.probs.to_vec().unwrap();
+        check("mlp coop probabilities", &got, &want, kind.tolerance(1e-3, 5e-3));
+        for row in got.chunks_exact(CLASSES) {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-4, "mlp coop: probabilities do not sum to 1");
+        }
+    }
+
     let mut group = c.benchmark_group("mlp_forward_batch4096_1024x1024x1024x10");
     group.throughput(Throughput::Elements(BATCH as u64));
     group.bench_function("luma", |b| {
@@ -599,6 +623,14 @@ fn mlp(c: &mut Criterion) {
             ctx.sync().unwrap();
         })
     });
+    if let Some((_, gpu)) = &mut coop {
+        group.bench_function("luma_coop", |b| {
+            b.iter(|| {
+                gpu.forward(&gx);
+                ctx.sync().unwrap();
+            })
+        });
+    }
     group.bench_function("luma_with_transfers", |b| {
         b.iter(|| {
             let gx = Array::from_slice(&x, [WIDTH, BATCH]).unwrap();
@@ -676,6 +708,18 @@ fn cosine_similarity(c: &mut Criterion) {
     };
     run(&mut unit, &mut sim);
 
+    let mut coop_sim = CoopKind::for_context(&ctx).map(|kind| {
+        let mut out = Array::<f32>::zeros([EMB_N, EMB_N]).unwrap();
+        let gemm = Kernel::new(&kind.source(true, false)).unwrap();
+        let tiles = (EMB_N / kind.tile()) as u32;
+        let run = |out: &mut Array<f32>| {
+            gemm.launch_raw([tiles, tiles, 1], args![&unit, &unit, &mut *out, uniform(&dims)]).unwrap();
+            ctx.sync().unwrap();
+        };
+        run(&mut out);
+        (kind, out, gemm)
+    });
+
     #[cfg(target_os = "macos")]
     let mut cpu_unit = vec![0.0f32; EMB_N * EMB_D];
     #[cfg(target_os = "macos")]
@@ -690,10 +734,28 @@ fn cosine_similarity(c: &mut Criterion) {
         run_cpu(&mut cpu_unit, &mut cpu_sim);
         check("cosine similarity", &sim.to_vec().unwrap(), &cpu_sim, 1e-5);
     }
+    if let Some((kind, out, _)) = &coop_sim {
+        // The CPU reference exists on macOS only; elsewhere the f32 kernel's result stands in.
+        #[cfg(target_os = "macos")]
+        let want = cpu_sim.clone();
+        #[cfg(not(target_os = "macos"))]
+        let want = sim.to_vec().unwrap();
+        check("cosine similarity coop", &out.to_vec().unwrap(), &want, kind.tolerance(1e-5, 1e-3));
+    }
 
     let mut group = c.benchmark_group("cosine_similarity_8192x8192_dim128");
     group.throughput(Throughput::Elements((EMB_N * EMB_N) as u64));
     group.bench_function("luma", |b| b.iter(|| run(&mut unit, &mut sim)));
+    if let Some((kind, out, gemm)) = &mut coop_sim {
+        let tiles = (EMB_N / kind.tile()) as u32;
+        group.bench_function("luma_coop", |b| {
+            b.iter(|| {
+                normalize.launch([EMB_N as u32], args![&ge, &mut unit, uniform(&norm)]).unwrap();
+                gemm.launch_raw([tiles, tiles, 1], args![&unit, &unit, &mut *out, uniform(&dims)]).unwrap();
+                ctx.sync().unwrap();
+            })
+        });
+    }
     #[cfg(target_os = "macos")]
     group.bench_function("cpu", |b| b.iter(|| run_cpu(&mut cpu_unit, black_box(&mut cpu_sim))));
     group.finish();
