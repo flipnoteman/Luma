@@ -312,6 +312,36 @@ fn conv1d_large_with_padding() {
 }
 
 #[test]
+fn conv1d_matches_reference_across_tiles_and_chunks() {
+    // Spans several workgroup tiles and, for the longest kernel, several tap chunks.
+    let input_data: Vec<f32> = (0..20_000).map(|i| ((i * 37) % 101) as f32 * 0.01 - 0.5).collect();
+    let input = array([input_data.len(), 1, 1, 1], &input_data);
+    for taps in [1usize, 3, 17, 100, 300] {
+        let kernel_data: Vec<f32> = (0..taps).map(|i| ((i * 13) % 17) as f32 * 0.05 - 0.4).collect();
+        let kernel = array([taps, 1, 1, 1], &kernel_data);
+        for stride in 1..=4usize {
+            for padding in [0usize, 5] {
+                let result = input.conv1d(&kernel, stride, padding).to_vec().unwrap();
+                let outputs = (input_data.len() + 2 * padding - taps) / stride + 1;
+                assert_eq!(result.len(), outputs, "taps {taps} stride {stride} padding {padding}");
+                for (o, got) in result.iter().enumerate() {
+                    let expected: f64 = (0..taps)
+                        .filter_map(|k| {
+                            let x = input_data.get((o * stride + k).checked_sub(padding)?)?;
+                            Some(*x as f64 * kernel_data[k] as f64)
+                        })
+                        .sum();
+                    assert!(
+                        (expected - *got as f64).abs() < 1e-3,
+                        "taps {taps} stride {stride} padding {padding} output {o}: {got} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn conv1d_zero_stride_returns_error() {
     let input = array([3, 1, 1, 1], &[1.0f32, 2.0, 3.0]);
     let kernel = array([1, 1, 1, 1], &[1.0f32]);

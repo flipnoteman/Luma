@@ -100,7 +100,7 @@ fn run_conv1d(
         RawArg::Uniform(bytemuck::bytes_of(&params)),
     ];
     if params[1] <= CONV_MAX_STRIDE {
-        let (wg, per_thread) = (ctx.tuning().conv_workgroup, ctx.tuning().conv_per_thread(kernel_len));
+        let (wg, per_thread) = (ctx.tuning().conv_workgroup, ctx.tuning().conv_per_thread);
         let core = ctx.builtin(Builtin::Conv1dTiled(params[1], per_thread), "f32")?;
         let groups = fold_workgroups(ctx, params[4].div_ceil(conv_tile(params[1], per_thread, wg)))?;
         ctx.launch(&core, groups, [params[4], 1, 1], &args)?;
