@@ -371,7 +371,7 @@ fn nbody(c: &mut Criterion) {
 
 #[path = "common/sgemm.rs"]
 mod sgemm;
-use sgemm::{sgemm_source, SgemmParams, TILE};
+use sgemm::{sgemm_source, CoopKind, SgemmParams, TILE};
 
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
@@ -423,11 +423,33 @@ fn sgemm(c: &mut Criterion) {
         run(&mut gc);
         group.throughput(Throughput::Elements(2 * (n * n * n) as u64));
         group.bench_function(BenchmarkId::new("luma", n), |bch| bch.iter(|| run(&mut gc)));
+        let f32_result = gc.to_vec().unwrap();
+        if let Some(kind) = CoopKind::for_context(&ctx) {
+            let coop = Kernel::new(&kind.source(false, false)).unwrap();
+            let tiles = (n / kind.tile()) as u32;
+            let mut cc = Array::<f32>::zeros([n, n]).unwrap();
+            let run = |cc: &mut Array<f32>| {
+                coop.launch_raw([tiles, tiles, 1], args![&ga, &gb, &mut *cc, uniform(&params)]).unwrap();
+                ctx.sync().unwrap();
+            };
+            run(&mut cc);
+            // The CPU reference exists on macOS only; elsewhere the f32 kernel's result stands in.
+            #[cfg(target_os = "macos")]
+            let want = {
+                let mut out = vec![0.0; n * n];
+                sgemm_cpu(n, &a, &b, &mut out);
+                out
+            };
+            #[cfg(not(target_os = "macos"))]
+            let want = f32_result.clone();
+            check("sgemm coop", &cc.to_vec().unwrap(), &want, kind.tolerance(1e-4, 1e-3));
+            group.bench_function(BenchmarkId::new("luma_coop", n), |bch| bch.iter(|| run(&mut cc)));
+        }
         #[cfg(target_os = "macos")]
         {
             let mut out = vec![0.0; n * n];
             sgemm_cpu(n, &a, &b, &mut out);
-            check("sgemm", &gc.to_vec().unwrap(), &out, 1e-4);
+            check("sgemm", &f32_result, &out, 1e-4);
             group.bench_function(BenchmarkId::new("cpu_accelerate", n), |bch| {
                 bch.iter(|| sgemm_cpu(n, &a, &b, black_box(&mut out)))
             });
