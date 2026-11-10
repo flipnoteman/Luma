@@ -32,6 +32,9 @@ const STAGING_USAGE: BufferUsages = BufferUsages::MAP_READ.union(BufferUsages::C
 /// Usage of upload staging buffers.
 const UPLOAD_USAGE: BufferUsages = BufferUsages::MAP_WRITE.union(BufferUsages::COPY_SRC);
 
+/// Readbacks larger than twice this go in pieces of this size, see [`Context::read`].
+const READ_CHUNK: u64 = 32 << 20;
+
 /// Most bytes of idle (mapped) upload staging buffers kept for reuse.
 const MAX_FREE_UPLOAD_BYTES: u64 = 1 << 30;
 
@@ -515,7 +518,7 @@ impl Context {
     }
 
     /// Submits the pending batch (if there is one) and prepares the next. Never waits.
-    fn flush_locked(&self, batch: &mut Batch) {
+    fn flush_locked(&self, batch: &mut Batch) -> Option<wgpu::SubmissionIndex> {
         // The open pass has to end before the encoder can be finished.
         batch.pass = None;
         batch.bound = Bound::default();
@@ -533,9 +536,7 @@ impl Context {
         }
         // Everything recorded that uses these buffers is in the batch submitted below.
         let unmapped = std::mem::take(&mut *lock(&self.inner.unmapped));
-        if let Some(encoder) = batch.encoder.take() {
-            self.queue().submit(Some(encoder.finish()));
-        }
+        let submission = batch.encoder.take().map(|encoder| self.queue().submit(Some(encoder.finish())));
         for staging in batch.uploads.drain(..) {
             let free = Arc::clone(&self.inner.uploads);
             let buffer = staging.clone();
@@ -557,6 +558,7 @@ impl Context {
                 }
             });
         }
+        submission
     }
 
     pub(crate) fn device(&self) -> &wgpu::Device {
@@ -760,60 +762,74 @@ impl Context {
         })
     }
 
-    /// Records a copy of the first `bytes` bytes of `buffer`, submits the batch and waits for the
-    /// data to arrive.
+    /// Copies the first `bytes` bytes of `buffer` to the host, after everything recorded so far.
+    /// Large reads go in [`READ_CHUNK`] pieces, each its own submission, so copying one piece out
+    /// of its staging buffer overlaps the transfer of the next.
     pub(crate) fn read<T: Pod>(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<T>> {
-        let staging = self.alloc_buffer(bytes, STAGING_USAGE)?;
+        let len = usize::try_from(bytes).expect("array fits in memory") / std::mem::size_of::<T>();
+        let chunk = if bytes > 2 * READ_CHUNK { READ_CHUNK } else { bytes.max(1) };
+        let mut staged = Vec::new();
+        for offset in (0..bytes).step_by(chunk as usize) {
+            let size = chunk.min(bytes - offset);
+            staged.push((offset, size, self.alloc_buffer(size, STAGING_USAGE)?));
+        }
+        let mut maps = Vec::with_capacity(staged.len());
         {
             let mut guard = self.batch()?;
-            self.encoder(&mut guard).copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes);
-            self.flush_locked(&mut guard);
+            for (offset, size, staging) in &staged {
+                self.encoder(&mut guard).copy_buffer_to_buffer(buffer, *offset, staging, 0, *size);
+                let submission = self.flush_locked(&mut guard);
+                maps.push((submission, map_for_read(staging.slice(..*size))));
+            }
         }
-        let result = self.map_read(&staging, bytes)?;
-        self.recycle(staging);
-        Ok(result)
+
+        let mut out: Vec<T> = Vec::with_capacity(len);
+        let spare = out.spare_capacity_mut();
+        // SAFETY: a `MaybeUninit<T>` slice viewed as the same bytes; `T: Pod` has no padding or
+        // invalid bit patterns, so any initialized bytes make valid elements.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(), len * std::mem::size_of::<T>())
+        };
+        advise_huge_pages(dst);
+        for ((offset, size, staging), (submission, mapped)) in staged.into_iter().zip(maps) {
+            self.wait_map(submission, &mapped)?;
+            {
+                let view = staging.slice(..size).get_mapped_range().map_err(LumaError::MapRange)?;
+                copy_parallel(&view, &mut dst[offset as usize..(offset + size) as usize]);
+            }
+            staging.unmap();
+            self.recycle(staging);
+        }
+        // SAFETY: the chunks cover all `len * size_of::<T>()` bytes, each written just above.
+        unsafe { out.set_len(len) };
+        Ok(out)
     }
 
     /// Waits for the GPU and returns the first `bytes` bytes of `staging`, a `MAP_READ` buffer
     /// whose contents were copied in by a submitted batch.
     fn map_read<T: Pod>(&self, staging: &Buffer, bytes: u64) -> Result<Vec<T>> {
         let slice = staging.slice(..bytes);
-        let (sender, receiver) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
+        self.wait_map(None, &map_for_read(slice))?;
+        let result = slice.get_mapped_range().map(|view| bytemuck::pod_collect_to_vec(&view));
+        staging.unmap();
+        result.map_err(LumaError::MapRange)
+    }
+
+    /// Waits until `submission` (the latest one if `None`) has run and the mapping `mapped`
+    /// reports on is done.
+    fn wait_map(&self, submission: Option<wgpu::SubmissionIndex>, mapped: &MapReceiver) -> Result<()> {
         self.device()
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Wait { submission_index: submission, timeout: None })
             .map_err(|e| LumaError::Poll(Arc::new(e)))?;
         // The callback runs on whichever thread polls the device first, so it may still be
         // in flight on another thread after our poll returns; wait for it.
-        let mapped = receiver
+        let mapped = mapped
             .recv()
             .map_err(|_| LumaError::Map(wgpu::BufferAsyncError))?
             .map_err(LumaError::Map);
         // An error the GPU raised while running the batch explains a failed map better.
         self.take_gpu_error()?;
-        mapped?;
-
-        let result = slice.get_mapped_range().map(|view| {
-            let mut out: Vec<T> = Vec::with_capacity(view.len() / std::mem::size_of::<T>());
-            let spare = out.spare_capacity_mut();
-            let len = spare.len();
-            // SAFETY: a `MaybeUninit<T>` slice viewed as the same bytes; `T: Pod` has no padding
-            // or invalid bit patterns, so any initialized bytes make valid elements.
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(
-                    spare.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
-                    len * std::mem::size_of::<T>(),
-                )
-            };
-            copy_parallel(&view[..dst.len()], dst);
-            // SAFETY: every byte of the first `len` elements was written just above.
-            unsafe { out.set_len(len) };
-            out
-        });
-        staging.unmap();
-        result.map_err(LumaError::MapRange)
+        mapped
     }
 
     /// Records a dispatch of `kernel` and returns without waiting for it.
@@ -1140,6 +1156,36 @@ fn copy_parallel(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
         }
     });
 }
+
+/// The outcome of a `map_async` request, see [`map_for_read`].
+type MapReceiver = mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>;
+
+/// Requests a read mapping of `slice`; [`Context::wait_map`] waits for it.
+fn map_for_read(slice: wgpu::BufferSlice<'_>) -> MapReceiver {
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+/// Backs a large readback destination with transparent huge pages: faulting in, and later
+/// freeing, its 4 KiB pages one by one costs about as much as the copy itself.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(dst: &mut [std::mem::MaybeUninit<u8>]) {
+    const PAGE: usize = 4096;
+    if dst.len() < PARALLEL_COPY_MIN {
+        return;
+    }
+    let start = (dst.as_mut_ptr() as usize).next_multiple_of(PAGE);
+    let end = (dst.as_mut_ptr() as usize + dst.len()) & !(PAGE - 1);
+    // SAFETY: the page-aligned range lies within `dst`; `madvise` only changes how the kernel
+    // backs it, never its contents, and failure is harmless.
+    unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_huge_pages(_: &mut [std::mem::MaybeUninit<u8>]) {}
 
 /// [`copy_parallel`] into write-only mapped memory.
 fn write_parallel(src: &[u8], mut dst: wgpu::WriteOnly<'_, [u8]>) {

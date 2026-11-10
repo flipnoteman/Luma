@@ -114,116 +114,9 @@ fn sgemm_par_cpu(b_transposed: bool, n: usize, k: usize, a: &[f32], b: &[f32], c
 
 // -- Tiled SGEMM shared by the MLP and the similarity matrix --
 
-/// Output tile edge of the GEMM kernel.
-const TILE: usize = 128;
-
-/// Row-major `C = A B` (or `A Bᵀ`); each workgroup computes a 128x128 tile of `C`, each of its
-/// 16x16 invocations 8x8 of it, from 16-wide slices of `A` and `B` staged in workgroup memory.
-/// An invocation owns two 4-wide groups of rows and of columns, 64 apart, so that workgroup
-/// memory reads of neighbouring invocations are contiguous. Dimensions must be multiples of
-/// `TILE` (M, N) and 16 (K). The `@..@` markers are filled in by `sgemm_source`.
-const SGEMM: &str = r#"
-struct Params { m: u32, n: u32, k: u32, relu: u32 }
-@group(1) @binding(0) var<storage, read> a: array<f32>;
-@group(1) @binding(1) var<storage, read> b: array<f32>;
-@group(1) @binding(2) var<storage, read_write> c: array<f32>;
-@group(1) @binding(3) var<uniform> p: Params;
-@BIAS@
-// Scalar slots: neighbouring invocations write different components of a row group, and a
-// component store into a shared vec4 is not atomic on every backend.
-var<workgroup> at: array<f32, 2048>;
-var<workgroup> bt: array<f32, 2048>;
-@compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row0 = wid.y * 128u;
-    let col0 = wid.x * 128u;
-    let t = lid.y * 16u + lid.x;
-    @ACC_DECL@
-    for (var k0 = 0u; k0 < p.k; k0 = k0 + 16u) {
-        for (var q = 0u; q < 8u; q = q + 1u) {
-            let e = t + 256u * q;
-            // A slice: 128 rows x 16 k, stored k-major.
-            let r = e / 16u; let kk = e % 16u;
-            at[kk * 128u + r] = a[(row0 + r) * p.k + k0 + kk];
-            // B slice: 16 k x 128 columns.
-            @B_LOAD@
-        }
-        workgroupBarrier();
-        for (var kk = 0u; kk < 16u; kk = kk + 1u) {
-            let ia = kk * 128u + lid.y * 4u;
-            let ib = kk * 128u + lid.x * 4u;
-            let a0 = vec4<f32>(at[ia], at[ia + 1u], at[ia + 2u], at[ia + 3u]);
-            let a1 = vec4<f32>(at[ia + 64u], at[ia + 65u], at[ia + 66u], at[ia + 67u]);
-            let b0 = vec4<f32>(bt[ib], bt[ib + 1u], bt[ib + 2u], bt[ib + 3u]);
-            let b1 = vec4<f32>(bt[ib + 64u], bt[ib + 65u], bt[ib + 66u], bt[ib + 67u]);
-            @ACC_UPDATE@
-        }
-        workgroupBarrier();
-    }
-    @STORE@
-}
-"#;
-
-#[derive(encase::ShaderType)]
-struct SgemmParams {
-    m: u32,
-    n: u32,
-    k: u32,
-    relu: u32,
-}
-
-/// `B` is `k x n` with a per-column bias and optional ReLU applied to the result (arguments
-/// `a, b, c, params, bias`), or `n x k` without epilogue (arguments `a, b, c, params`).
-fn sgemm_source(biased: bool) -> String {
-    let (bias, b_load, epilogue) = if biased {
-        (
-            "@group(1) @binding(4) var<storage, read> bias: array<f32>;",
-            "let kb = e / 128u; let col = e % 128u;
-            bt[kb * 128u + col] = b[(k0 + kb) * p.n + col0 + col];",
-            "v = v + vec4<f32>(bias[col], bias[col + 1u], bias[col + 2u], bias[col + 3u]);
-            if p.relu != 0u { v = max(v, vec4<f32>(0.0)); }",
-        )
-    } else {
-        (
-            "",
-            // Consecutive invocations read consecutive k of one row of B, which is contiguous.
-            "let col = e / 16u; let kb = e % 16u;
-            bt[kb * 128u + col] = b[(col0 + col) * p.k + k0 + kb];",
-            "",
-        )
-    };
-    // Accumulator `c{2 i + h}` holds row `i` (of 8), columns half `h`. The loops are unrolled
-    // here so the accumulators stay in registers.
-    let mut decl = String::new();
-    let mut update = String::new();
-    let mut store = String::new();
-    for i in 0..8 {
-        let a_row = format!("a{}.{}", i / 4, ["x", "y", "z", "w"][i % 4]);
-        for h in 0..2 {
-            let acc = format!("c{}", i * 2 + h);
-            decl += &format!("var {acc} = vec4<f32>(0.0);\n    ");
-            update += &format!("{acc} = fma(vec4<f32>({a_row}), b{h}, {acc});\n            ");
-            store += &format!(
-                "{{
-        let r = row0 + {} + lid.y * 4u;
-        let col = col0 + {} + lid.x * 4u;
-        var v = {acc};
-        {epilogue}
-        let at_c = r * p.n + col;
-        c[at_c] = v.x; c[at_c + 1u] = v.y; c[at_c + 2u] = v.z; c[at_c + 3u] = v.w;
-    }}\n    ",
-                (i / 4) * 64 + i % 4,
-                h * 64
-            );
-        }
-    }
-    SGEMM
-        .replace("@BIAS@", bias)
-        .replace("@B_LOAD@", b_load)
-        .replace("@ACC_DECL@", &decl)
-        .replace("@ACC_UPDATE@", &update)
-        .replace("@STORE@", &store)
-}
+#[path = "common/sgemm.rs"]
+mod sgemm;
+use sgemm::{sgemm_source, SgemmParams, TILE};
 
 // -- k-means: one assignment + centroid update iteration --
 
@@ -580,7 +473,7 @@ impl MlpGpu {
         bias3.resize(CLASSES_PADDED, 0.0);
         let w3 = pad(&host.w[2], WIDTH, CLASSES);
         MlpGpu {
-            gemm: Kernel::new(&sgemm_source(true)).unwrap(),
+            gemm: Kernel::new(&sgemm_source(false, true)).unwrap(),
             softmax: Kernel::new(SOFTMAX).unwrap(),
             w: [
                 Array::from_slice(&host.w[0], [WIDTH, WIDTH]).unwrap(),
@@ -771,7 +664,7 @@ fn cosine_similarity(c: &mut Criterion) {
     let mut unit = Array::<f32>::zeros([EMB_D, EMB_N]).unwrap();
     let mut sim = Array::<f32>::zeros([EMB_N, EMB_N]).unwrap();
     let normalize = Kernel::new(NORMALIZE).unwrap();
-    let gemm = Kernel::new(&sgemm_source(false)).unwrap();
+    let gemm = Kernel::new(&sgemm_source(true, false)).unwrap();
     let ctx = default_context().unwrap();
     let norm = NormalizeParams { rows: EMB_N as u32, dim: EMB_D as u32 };
     let dims = SgemmParams { m: EMB_N as u32, n: EMB_N as u32, k: EMB_D as u32, relu: 0 };

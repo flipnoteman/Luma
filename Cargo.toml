@@ -13,6 +13,9 @@ pollster = "1.0.1"
 naga = { version = "30.0.1", features = ["wgsl-in"] }
 encase = "0.13.0"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = "0.8"
 rustfft = "6"

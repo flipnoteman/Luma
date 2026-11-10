@@ -131,11 +131,12 @@ effect is measured by `cargo run --release --example bench_fusion`.
 
 ## Kernel parameters per GPU
 
-Workgroup sizes and tile shapes of the built-in kernels (elementwise, tiled `conv1d`, time-blocked
-`iterate`) are chosen when the context opens its device: Apple GPUs get the values measured on an
-M5 Pro, every other GPU common defaults that have not been measured yet. Both are shrunk to fit
-the device's limits. `ctx.tuning_profile()` reports the choice, and `LUMA_TUNING=apple` or
-`LUMA_TUNING=generic` in the environment forces one.
+Workgroup sizes and tile shapes of the built-in kernels (elementwise, reductions, tiled `conv1d`,
+time-blocked `iterate`) are chosen when the context opens its device: Apple GPUs get the values
+measured on an M5 Pro, NVIDIA GPUs those measured on an RTX 3090, every other GPU common defaults
+that have not been measured yet. All are shrunk to fit the device's limits. `ctx.tuning_profile()`
+reports the choice, and `LUMA_TUNING=apple`, `LUMA_TUNING=nvidia` or `LUMA_TUNING=generic` in the
+environment forces one.
 
 ## Errors do not panic
 

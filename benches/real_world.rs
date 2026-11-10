@@ -351,77 +351,9 @@ fn nbody(c: &mut Criterion) {
 
 // -- Matrix multiply --
 
-/// Row-major `C = A B`; each workgroup computes a 128x128 tile of `C`, each of its 16x16
-/// invocations 8x8 of it (two 4-wide groups of rows and of columns, 64 apart, so that workgroup
-/// memory reads of neighbouring invocations are contiguous), from 16-wide slices of `A` and `B`
-/// staged in workgroup memory. Dimensions must be multiples of 128 (M, N) and 16 (K).
-fn sgemm_source() -> String {
-    // Accumulator `c{2 i + h}` holds row `i` (of 8), column half `h`; unrolled so they stay in
-    // registers.
-    let (mut decl, mut update, mut store) = (String::new(), String::new(), String::new());
-    for i in 0..8 {
-        let a_row = format!("a{}.{}", i / 4, ["x", "y", "z", "w"][i % 4]);
-        for h in 0..2 {
-            let acc = format!("c{}", i * 2 + h);
-            decl += &format!("    var {acc} = vec4<f32>(0.0);\n");
-            update += &format!("            {acc} = fma(vec4<f32>({a_row}), b{h}, {acc});\n");
-            store += &format!(
-                "    {{
-        let at_c = (row0 + {} + lid.y * 4u) * p.n + col0 + {} + lid.x * 4u;
-        c[at_c] = {acc}.x; c[at_c + 1u] = {acc}.y; c[at_c + 2u] = {acc}.z; c[at_c + 3u] = {acc}.w;
-    }}
-",
-                (i / 4) * 64 + i % 4,
-                h * 64
-            );
-        }
-    }
-    format!(
-        "struct Params {{ m: u32, n: u32, k: u32 }}
-@group(1) @binding(0) var<storage, read> a: array<f32>;
-@group(1) @binding(1) var<storage, read> b: array<f32>;
-@group(1) @binding(2) var<storage, read_write> c: array<f32>;
-@group(1) @binding(3) var<uniform> p: Params;
-// Scalar slots: neighbouring invocations write different components of the same row group,
-// and a component store into a shared vec4 is not atomic on every backend.
-var<workgroup> at: array<f32, 2048>;
-var<workgroup> bt: array<f32, 2048>;
-@compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
-    let row0 = wid.y * 128u;
-    let col0 = wid.x * 128u;
-    let t = lid.y * 16u + lid.x;
-{decl}    for (var k0 = 0u; k0 < p.k; k0 = k0 + 16u) {{
-        for (var q = 0u; q < 8u; q = q + 1u) {{
-            let e = t + 256u * q;
-            // A slice: 128 rows x 16 k, stored k-major; B slice: 16 k x 128 columns.
-            let r = e / 16u; let kk = e % 16u;
-            at[kk * 128u + r] = a[(row0 + r) * p.k + k0 + kk];
-            let kb = e / 128u; let col = e % 128u;
-            bt[kb * 128u + col] = b[(k0 + kb) * p.n + col0 + col];
-        }}
-        workgroupBarrier();
-        for (var kk = 0u; kk < 16u; kk = kk + 1u) {{
-            let ia = kk * 128u + lid.y * 4u;
-            let ib = kk * 128u + lid.x * 4u;
-            let a0 = vec4<f32>(at[ia], at[ia + 1u], at[ia + 2u], at[ia + 3u]);
-            let a1 = vec4<f32>(at[ia + 64u], at[ia + 65u], at[ia + 66u], at[ia + 67u]);
-            let b0 = vec4<f32>(bt[ib], bt[ib + 1u], bt[ib + 2u], bt[ib + 3u]);
-            let b1 = vec4<f32>(bt[ib + 64u], bt[ib + 65u], bt[ib + 66u], bt[ib + 67u]);
-{update}        }}
-        workgroupBarrier();
-    }}
-{store}}}
-"
-    )
-}
-
-#[derive(encase::ShaderType)]
-struct SgemmParams {
-    m: u32,
-    n: u32,
-    k: u32,
-}
+#[path = "common/sgemm.rs"]
+mod sgemm;
+use sgemm::{sgemm_source, SgemmParams, TILE};
 
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
@@ -462,11 +394,12 @@ fn sgemm(c: &mut Criterion) {
         let (a, b) = (values(n * n, 8, -1.0, 1.0), values(n * n, 9, -1.0, 1.0));
         let (ga, gb) = (Array::from_slice(&a, [n, n]).unwrap(), Array::from_slice(&b, [n, n]).unwrap());
         let mut gc = Array::<f32>::zeros([n, n]).unwrap();
-        let kernel = Kernel::new(&sgemm_source()).unwrap();
-        let params = SgemmParams { m: n as u32, n: n as u32, k: n as u32 };
+        let kernel = Kernel::new(&sgemm_source(false, false)).unwrap();
+        let params = SgemmParams { m: n as u32, n: n as u32, k: n as u32, relu: 0 };
         let ctx = default_context().unwrap();
+        let tiles = (n / TILE) as u32;
         let run = |gc: &mut Array<f32>| {
-            kernel.launch_raw([n as u32 / 128, n as u32 / 128, 1], args![&ga, &gb, &mut *gc, uniform(&params)]).unwrap();
+            kernel.launch_raw([tiles, tiles, 1], args![&ga, &gb, &mut *gc, uniform(&params)]).unwrap();
             ctx.sync().unwrap();
         };
         run(&mut gc);

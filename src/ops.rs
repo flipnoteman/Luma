@@ -16,7 +16,7 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{BinOp, Builtin, CmpOp, ReduceList, ReduceOp, UnOp, MAX_REDUCTIONS, REDUCE_BLOCK};
+use crate::builtin::{BinOp, Builtin, CmpOp, ReduceList, ReduceOp, UnOp, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{GpuType, ScalarType};
@@ -531,7 +531,7 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
         }
     };
     while !segmented || n > 1 {
-        let groups = n.div_ceil(REDUCE_BLOCK);
+        let groups = n.div_ceil(ctx.tuning().reduce_block());
         let list = if segmented { ops.rest() } else { ops };
         let in_bytes = u64::from(n) * elem * if segmented { count } else { 1 };
         let out = scratch.take(u64::from(groups) * elem * count)?;

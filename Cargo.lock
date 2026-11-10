@@ -621,6 +621,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "encase",
+ "libc",
  "log",
  "naga",
  "pollster",

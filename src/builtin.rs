@@ -11,11 +11,8 @@ use std::borrow::Cow;
 
 use crate::tuning::Tuning;
 
-/// Workgroup size of the reduction kernels, and how many elements each thread loads.
+/// Workgroup size of the reduction kernels.
 pub(crate) const REDUCE_WORKGROUP: u32 = 256;
-pub(crate) const REDUCE_PER_THREAD: u32 = 4;
-/// Number of input elements one reduction workgroup consumes.
-pub(crate) const REDUCE_BLOCK: u32 = REDUCE_WORKGROUP * REDUCE_PER_THREAD;
 /// Largest stride the tiled convolution handles; larger ones run one output per invocation.
 pub(crate) const CONV_MAX_STRIDE: u32 = 4;
 
@@ -175,9 +172,10 @@ pub(crate) enum Builtin {
     Reduce(ReduceList, bool),
     /// Direct convolution, one output per invocation; any stride.
     Conv1d,
-    /// Direct convolution with a stride of up to [`CONV_MAX_STRIDE`], tiled; [`conv_tile`]
-    /// outputs per workgroup.
-    Conv1dTiled(u32),
+    /// Direct convolution with a stride of up to [`CONV_MAX_STRIDE`] (first field), tiled with
+    /// the given outputs per invocation at stride 1 (second); [`conv_tile`] outputs per
+    /// workgroup.
+    Conv1dTiled(u32, u32),
     /// One pass of the FFT convolution, see [`crate::fft`].
     Fft(crate::fft::FftPass),
 }
@@ -217,11 +215,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     )
 }
 
-/// One reduction pass over `a` for every op of `ops`: each workgroup reduces `REDUCE_BLOCK`
-/// elements per op into `out[j * groups + group]`. `segmented` passes reduce the partial results
-/// of an earlier pass, op `j` over `a[j * p.n ..]`; otherwise every op reads the same `p.n`
-/// elements.
-fn reduce(ty: &str, ops: ReduceList, segmented: bool) -> String {
+/// One reduction pass over `a` for every op of `ops`: each workgroup reduces
+/// [`Tuning::reduce_block`] elements per op into `out[j * groups + group]`. `segmented` passes
+/// reduce the partial results of an earlier pass, op `j` over `a[j * p.n ..]`; otherwise every op
+/// reads the same `p.n` elements.
+fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String {
     format!(
         "struct Params {{ n: u32 }}
 @group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
@@ -230,17 +228,26 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool) -> String {
 
 fn load_at(i: u32) -> {ty} {{ return a[i]; }}
 {}",
-        reduce_main(ty, ops, segmented, "load_at")
+        reduce_main(ty, ops, segmented, "load_at", tuning)
     )
+}
+
+/// `c(..)` over `values`, combined pairwise so float sums keep their accuracy.
+fn pairwise(c: &str, values: &[String]) -> String {
+    match values {
+        [one] => one.clone(),
+        _ => {
+            let (l, r) = values.split_at(values.len() / 2);
+            format!("{c}({}, {})", pairwise(c, l), pairwise(c, r))
+        }
+    }
 }
 
 /// The entry point of a reduction pass computing every op of `ops` (see [`reduce`]). Element
 /// `i` comes from `{load}(i)`, and a `Params` uniform `p` with the element count `n` is bound.
-pub(crate) fn reduce_main(ty: &str, ops: ReduceList, segmented: bool, load: &str) -> String {
-    let (wg, block) = (REDUCE_WORKGROUP, REDUCE_BLOCK);
-    // The pairwise combination of the loads below assumes four per thread.
-    const _: () = assert!(REDUCE_PER_THREAD == 4);
-    let per_thread = REDUCE_PER_THREAD;
+pub(crate) fn reduce_main(ty: &str, ops: ReduceList, segmented: bool, load: &str, tuning: &Tuning) -> String {
+    let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
+    let per_thread = tuning.reduce_per_thread;
     let mut body = String::new();
     // Without segments every op reduces the same elements: load each once.
     if !segmented {
@@ -269,8 +276,9 @@ pub(crate) fn reduce_main(ty: &str, ops: ReduceList, segmented: bool, load: &str
             };
             body += &format!("        let v{s} = {value};\n");
         }
+        let values: Vec<String> = (0..per_thread).map(|s| format!("v{s}")).collect();
         body += &format!(
-            "        sh[lid] = c{j}(c{j}(v0, v1), c{j}(v2, v3));
+            "        sh[lid] = {};
         workgroupBarrier();
         for (var s = {half}u; s > 0u; s = s >> 1u) {{
             if (lid < s) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
@@ -280,6 +288,7 @@ pub(crate) fn reduce_main(ty: &str, ops: ReduceList, segmented: bool, load: &str
         workgroupBarrier();
     }}
 ",
+            pairwise(&format!("c{j}"), &values),
             half = wg / 2,
         );
     }
@@ -303,16 +312,16 @@ fn main(
 }
 
 /// Direct convolution with stride `s` (1 to [`CONV_MAX_STRIDE`]), tiled. A workgroup computes
-/// [`conv_tile`] consecutive outputs, an invocation `R` = `conv_per_thread / s` consecutive ones
-/// in registers. The kernel is consumed in chunks of taps whose weights and input window are
-/// staged in workgroup memory (zero outside the input, so the inner loop has no bounds checks).
-/// The inner loop takes `R` taps at a time from the `(R - 1) s + R` window values they touch,
-/// fully unrolled. Window slots skip one word every 32 so that the strided reads of neighbouring
+/// [`conv_tile`] consecutive outputs, an invocation `R` = `per_thread / s` consecutive ones in
+/// registers. The kernel is consumed in chunks of taps whose weights and input window are staged
+/// in workgroup memory (zero outside the input, so the inner loop has no bounds checks). The
+/// inner loop takes `R` taps at a time from the `(R - 1) s + R` window values they touch, fully
+/// unrolled. Window slots skip one word every 32 so that the strided reads of neighbouring
 /// invocations fall into different banks.
-fn conv1d_tiled(stride: u32, tuning: &Tuning) -> String {
-    let (wg, s) = (tuning.conv_workgroup, stride);
-    let r = tuning.conv_per_thread / s;
-    let tile = conv_tile(s, tuning);
+fn conv1d_tiled(stride: u32, per_thread: u32, wg: u32) -> String {
+    let s = stride;
+    let r = per_thread / s;
+    let tile = conv_tile(s, per_thread, wg);
     // A multiple of `R`, so that padding a chunk to whole groups of `R` taps stays within it.
     let chunk = wg / r * r;
     let span = tile * s + chunk;
@@ -383,9 +392,9 @@ fn main(
     )
 }
 
-/// Outputs one workgroup of the tiled convolution with `stride` computes.
-pub(crate) fn conv_tile(stride: u32, tuning: &Tuning) -> u32 {
-    tuning.conv_workgroup * (tuning.conv_per_thread / stride)
+/// Outputs one workgroup of the tiled convolution computes (see [`conv1d_tiled`]).
+pub(crate) fn conv_tile(stride: u32, per_thread: u32, wg: u32) -> u32 {
+    wg * (per_thread / stride)
 }
 
 fn fill_kernel(ty: &str, wg: u32) -> String {
@@ -412,9 +421,9 @@ impl Builtin {
             Builtin::InPlaceArray(op) => in_place(ty, false, op.expr(), wg).into(),
             Builtin::InPlaceScalar(op) => in_place(ty, true, op.expr(), wg).into(),
             Builtin::Fill => fill_kernel(ty, wg).into(),
-            Builtin::Reduce(ops, segmented) => reduce(ty, ops, segmented).into(),
+            Builtin::Reduce(ops, segmented) => reduce(ty, ops, segmented, tuning).into(),
             Builtin::Conv1d => include_str!("../operations/conv1d.wgsl").into(),
-            Builtin::Conv1dTiled(stride) => conv1d_tiled(stride, tuning).into(),
+            Builtin::Conv1dTiled(stride, per_thread) => conv1d_tiled(stride, per_thread, tuning.conv_workgroup).into(),
             Builtin::Fft(pass) => crate::fft::source(pass).into(),
         }
     }

@@ -12,6 +12,7 @@
 use std::fmt::Write;
 
 use crate::builtin::reduce_main;
+use crate::tuning::Tuning;
 
 use super::program::{FusedKey, Instr, Ref, Tail};
 use super::{ElemTy, OpKind, ShiftKind};
@@ -101,9 +102,9 @@ fn shift_index(kind: ShiftKind, s: &str) -> String {
     }
 }
 
-/// The WGSL source of the kernel for `key`; elementwise kernels have `wg` invocations per
-/// workgroup.
-pub(crate) fn source(key: &FusedKey, wg: u32) -> String {
+/// The WGSL source of the kernel for `key`, with the workgroup shapes `tuning` gives.
+pub(crate) fn source(key: &FusedKey, tuning: &Tuning) -> String {
+    let wg = tuning.elementwise_workgroup;
     let reduce = matches!(key.tail, Tail::Reduce(_));
     let mut src = String::new();
 
@@ -169,7 +170,7 @@ fn luma_eval(i: u32) -> {ty} {{
 }}
 {}",
                 body(&key.instrs, &key.input_tys),
-                reduce_main(ty, ops, false, "luma_eval")
+                reduce_main(ty, ops, false, "luma_eval", tuning)
             );
         }
     }
