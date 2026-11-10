@@ -265,29 +265,47 @@ fn mandelbrot(c: &mut Criterion) {
 
 // -- N-body gravitational accelerations --
 
+/// Bodies per workgroup; each is shared by `256 / NBODY_BODIES` invocations that take a slice of
+/// every tile of partners, so that `n` bodies keep four times as many invocations busy.
+const NBODY_BODIES: usize = 64;
+
 const NBODY: &str = r#"
 struct Params { n: u32, eps2: f32 }
 @group(1) @binding(0) var<storage, read> pos: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> acc: array<vec4<f32>>;
 @group(1) @binding(2) var<uniform> p: Params;
 var<workgroup> tile: array<vec4<f32>, 256>;
+var<workgroup> part: array<vec4<f32>, 256>;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    let me = pos[min(g.x, p.n - 1u)].xyz;
-    var a = vec3<f32>(0.0);
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let body = wid.x * 64u + lid % 64u;
+    let first = (lid / 64u) * 64u;
+    let me = pos[min(body, p.n - 1u)].xyz;
+    // Two accumulators, so consecutive partners do not wait on each other's additions.
+    var a0 = vec3<f32>(0.0);
+    var a1 = vec3<f32>(0.0);
     for (var base = 0u; base < p.n; base = base + 256u) {
         let j = base + lid;
+        // Missing partners have no mass.
         tile[lid] = select(vec4<f32>(0.0), pos[min(j, p.n - 1u)], j < p.n);
         workgroupBarrier();
-        for (var k = 0u; k < 256u; k = k + 1u) {
-            let other = tile[k];
-            let d = other.xyz - me;
-            let inv = inverseSqrt(dot(d, d) + p.eps2);
-            a = a + d * (other.w * inv * inv * inv);
+        for (var k = first; k < first + 64u; k = k + 2u) {
+            let o0 = tile[k];
+            let o1 = tile[k + 1u];
+            let d0 = o0.xyz - me;
+            let d1 = o1.xyz - me;
+            let i0 = inverseSqrt(dot(d0, d0) + p.eps2);
+            let i1 = inverseSqrt(dot(d1, d1) + p.eps2);
+            a0 = a0 + d0 * (o0.w * i0 * i0 * i0);
+            a1 = a1 + d1 * (o1.w * i1 * i1 * i1);
         }
         workgroupBarrier();
     }
-    if (g.x < p.n) { acc[g.x] = vec4<f32>(a, 0.0); }
+    part[lid] = vec4<f32>(a0 + a1, 0.0);
+    workgroupBarrier();
+    if (lid < 64u && body < p.n) {
+        acc[body] = part[lid] + part[lid + 64u] + part[lid + 128u] + part[lid + 192u];
+    }
 }
 "#;
 
@@ -332,7 +350,7 @@ fn nbody(c: &mut Criterion) {
     let params = NbodyParams { n: n as u32, eps2: EPS2 };
     let ctx = default_context().unwrap();
     let run = |acc: &mut Array<[f32; 4]>| {
-        kernel.launch([n as u32], args![&pos, &mut *acc, uniform(&params)]).unwrap();
+        kernel.launch_raw([n.div_ceil(NBODY_BODIES) as u32, 1, 1], args![&pos, &mut *acc, uniform(&params)]).unwrap();
         ctx.sync().unwrap();
     };
     run(&mut acc);
