@@ -136,7 +136,8 @@ time-blocked `iterate`) are chosen when the context opens its device: Apple GPUs
 measured on an M5 Pro, NVIDIA GPUs those measured on an RTX 3090, every other GPU common defaults
 that have not been measured yet. All are shrunk to fit the device's limits. `ctx.tuning_profile()`
 reports the choice, and `LUMA_TUNING=apple`, `LUMA_TUNING=nvidia` or `LUMA_TUNING=generic` in the
-environment forces one.
+environment forces one. Reductions combine within subgroups where the GPU has them;
+`LUMA_SUBGROUPS=off` falls back to a workgroup-memory tree.
 
 ## Errors do not panic
 
