@@ -391,7 +391,7 @@ fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<
 }
 
 /// Runs the first pass of the reductions `ops` directly over the expression behind `node`,
-/// without materializing it: every workgroup evaluates `Tuning::reduce_block` elements and reduces them,
+/// without materializing it: every workgroup evaluates its strided blocks of `Tuning::reduce_block` elements and reduces them,
 /// once per op. Returns the buffer of partial results (op `j` at `j * groups ..`) and how many
 /// there are per op, or `None` if the node has already been evaluated (reduce its buffer
 /// instead).
@@ -411,7 +411,7 @@ pub(crate) fn reduce_first_pass(
 
     let n = len_u32(node.len())?;
     let bytes = u64::from(n) * ELEMENT_BYTES;
-    let groups = n.div_ceil(ctx.tuning().reduce_block());
+    let groups = ctx.tuning().reduce_groups(n);
     let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
     let Fused { key, inputs, scalars } = fused;
     let core = ctx.jit().kernel(ctx, key)?;

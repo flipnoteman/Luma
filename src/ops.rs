@@ -424,9 +424,9 @@ impl<T: ScalarType> Array<T> {
 
     // -- Reductions --
 
-    /// The sum of all elements. Float sums use a tree reduction, whose error grows with the
-    /// logarithm of the length rather than the length itself. `u32` sums wrap around.
-    /// Synchronizes.
+    /// The sum of all elements. Float sums combine in trees and over at most a few hundred
+    /// sequential steps per invocation, so the error stays far below that of a sequential sum.
+    /// `u32` sums wrap around. Synchronizes.
     pub fn sum(&self) -> Result<T> {
         Ok(self.reduce([Reduction::Sum])?[0])
     }
@@ -505,8 +505,9 @@ fn reduce_n<T: GpuType, const N: usize>(array: &Array<T>, wgsl: &'static str, op
     Ok(out)
 }
 
-/// Reduces the whole array on the GPU with a workgroup tree reduction, once per op of `ops`:
-/// every pass combines pairs, until one element per op is left, which are read back together.
+/// Reduces the whole array on the GPU, once per op of `ops`: the first pass leaves at most
+/// `Tuning::reduce_max_groups` partial results per op, the next one workgroup's worth of them,
+/// until one element per op is left; those are read back together.
 /// The first pass reads the data once for all ops; if the array is a pending lazy expression, it
 /// computes it on the fly instead of reading a materialized buffer. `wgsl` is the WGSL type of
 /// the elements; for vectors (which are never lazy) the operations act on every component
@@ -531,7 +532,7 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
         }
     };
     while !segmented || n > 1 {
-        let groups = n.div_ceil(ctx.tuning().reduce_block());
+        let groups = ctx.tuning().reduce_groups(n);
         let list = if segmented { ops.rest() } else { ops };
         let in_bytes = u64::from(n) * elem * if segmented { count } else { 1 };
         let out = scratch.take(u64::from(groups) * elem * count)?;
@@ -563,8 +564,7 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
 macro_rules! vector_reductions {
     ($n:literal, $wgsl:literal) => {
         impl Array<[f32; $n]> {
-            /// The sum of all elements, per component. Float sums use a tree reduction, whose
-            /// error grows with the logarithm of the length rather than the length itself.
+            /// The sum of all elements, per component, with the accuracy of [`Array::sum`].
             /// Synchronizes.
             pub fn sum(&self) -> Result<[f32; $n]> {
                 Ok(self.reduce([Reduction::Sum])?[0])

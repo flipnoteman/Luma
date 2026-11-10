@@ -215,8 +215,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     )
 }
 
-/// One reduction pass over `a` for every op of `ops`: each workgroup reduces
-/// [`Tuning::reduce_block`] elements per op into `out[j * groups + group]`. `segmented` passes
+/// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
+/// elements into `out[j * groups + group]`, `groups` being [`Tuning::reduce_groups`]; a workgroup
+/// takes [`Tuning::reduce_block`] elements at a time, strided over the array. `segmented` passes
 /// reduce the partial results of an earlier pass, op `j` over `a[j * p.n ..]`; otherwise every op
 /// reads the same `p.n` elements.
 fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String {
@@ -243,19 +244,26 @@ fn pairwise(c: &str, values: &[String]) -> String {
     }
 }
 
+/// Most subgroups a reduction workgroup can have: the smallest subgroup size WebGPU allows is 4.
+const MAX_SUBGROUPS: u32 = REDUCE_WORKGROUP / 4;
+
 /// The entry point of a reduction pass computing every op of `ops` (see [`reduce`]). Element
 /// `i` comes from `{load}(i)`, and a `Params` uniform `p` with the element count `n` is bound.
+/// Every invocation accumulates its elements of the strided blocks, then the workgroup combines
+/// the accumulators: within subgroups with `subgroupAdd` and friends and across them through
+/// workgroup memory when the device has subgroups, by a shared-memory tree otherwise.
 pub(crate) fn reduce_main(ty: &str, ops: ReduceList, segmented: bool, load: &str, tuning: &Tuning) -> String {
     let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
     let per_thread = tuning.reduce_per_thread;
-    let mut body = String::new();
+    let mut combines = String::new();
+    let mut inits = String::new();
+    let mut loop_body = String::new();
     // Without segments every op reduces the same elements: load each once.
     if !segmented {
         for s in 0..per_thread {
-            body += &format!("    let e{s} = {load}(min(base + {wg}u * {s}u, p.n - 1u));\n");
+            loop_body += &format!("        let e{s} = {load}(min(base + {wg}u * {s}u, p.n - 1u));\n");
         }
     }
-    let mut combines = String::new();
     for (j, &op) in ops.as_slice().iter().enumerate() {
         let combine = match op {
             ReduceOp::Sum | ReduceOp::SumSquares => "u + v",
@@ -263,51 +271,99 @@ pub(crate) fn reduce_main(ty: &str, ops: ReduceList, segmented: bool, load: &str
             ReduceOp::Max => "max(u, v)",
         };
         combines += &format!("fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}\n");
-        body += "    {\n";
+        let segment = if segmented { format!("{j}u * p.n + ") } else { String::new() };
+        // Every group starts below `p.n`, so the first element is a real one for min and max.
+        inits += &match op {
+            ReduceOp::Sum | ReduceOp::SumSquares => format!("    var acc{j} = zero;\n"),
+            ReduceOp::Min | ReduceOp::Max => format!("    var acc{j} = {load}({segment}min(group * {block}u + lid, p.n - 1u));\n"),
+        };
         for s in 0..per_thread {
             if segmented {
-                body += &format!("        let e{s} = {load}({j}u * p.n + min(base + {wg}u * {s}u, p.n - 1u));\n");
+                loop_body += &format!("        let e{j}_{s} = {load}({segment}min(base + {wg}u * {s}u, p.n - 1u));\n");
             }
+            let e = if segmented { format!("e{j}_{s}") } else { format!("e{s}") };
             // Out-of-range slots: sums take zero, min/max re-read the last element (harmless).
             let value = match op {
-                ReduceOp::Sum => format!("select(zero, e{s}, base + {wg}u * {s}u < p.n)"),
-                ReduceOp::SumSquares => format!("select(zero, e{s} * e{s}, base + {wg}u * {s}u < p.n)"),
-                ReduceOp::Min | ReduceOp::Max => format!("e{s}"),
+                ReduceOp::Sum => format!("select(zero, {e}, base + {wg}u * {s}u < p.n)"),
+                ReduceOp::SumSquares => format!("select(zero, {e} * {e}, base + {wg}u * {s}u < p.n)"),
+                ReduceOp::Min | ReduceOp::Max => e,
             };
-            body += &format!("        let v{s} = {value};\n");
+            loop_body += &format!("        let v{j}_{s} = {value};\n");
         }
-        let values: Vec<String> = (0..per_thread).map(|s| format!("v{s}")).collect();
-        body += &format!(
-            "        sh[lid] = {};
-        workgroupBarrier();
-        for (var s = {half}u; s > 0u; s = s >> 1u) {{
-            if (lid < s) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
-            workgroupBarrier();
-        }}
-        if (lid == 0u && group * {block}u < p.n) {{ out[{j}u * groups + group] = sh[0]; }}
+        let values: Vec<String> = (0..per_thread).map(|s| format!("v{j}_{s}")).collect();
+        loop_body += &format!("        acc{j} = c{j}(acc{j}, {});\n", pairwise(&format!("c{j}"), &values));
+    }
+
+    let mut finish = String::new();
+    let (shared, extra_args) = if tuning.subgroups {
+        let n = ops.as_slice().len() as u32 * MAX_SUBGROUPS;
+        let mut lanes = String::new();
+        let mut first = String::new();
+        for (j, &op) in ops.as_slice().iter().enumerate() {
+            let (group_op, ident) = match op {
+                ReduceOp::Sum | ReduceOp::SumSquares => ("subgroupAdd", "zero".to_owned()),
+                ReduceOp::Min => ("subgroupMin", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
+                ReduceOp::Max => ("subgroupMax", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
+            };
+            lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
+            first += &format!(
+                "        var t{j} = {ident};
+        for (var k = lane; k < nsg; k += sg) {{ t{j} = c{j}(t{j}, sh[{}u + k]); }}
+        let f{j} = {group_op}(t{j});
+        if (lane == 0u) {{ out[{j}u * groups + group] = f{j}; }}
+",
+                j as u32 * MAX_SUBGROUPS
+            );
+        }
+        finish += &format!(
+            "    let sgid = lid / sg;
+{lanes}    workgroupBarrier();
+    if (sgid == 0u) {{
+        let nsg = ({wg}u + sg - 1u) / sg;
+{first}    }}
+"
+        );
+        (
+            format!("var<workgroup> sh: array<{ty}, {n}>;"),
+            "\n    @builtin(subgroup_invocation_id) lane: u32,\n    @builtin(subgroup_size) sg: u32,",
+        )
+    } else {
+        for j in 0..ops.as_slice().len() {
+            finish += &format!(
+                "    sh[lid] = acc{j};
+    workgroupBarrier();
+    for (var s = {half}u; s > 0u; s = s >> 1u) {{
+        if (lid < s) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
         workgroupBarrier();
     }}
+    if (lid == 0u) {{ out[{j}u * groups + group] = sh[0]; }}
+    workgroupBarrier();
 ",
-            pairwise(&format!("c{j}"), &values),
-            half = wg / 2,
-        );
-    }
+                half = wg / 2
+            );
+        }
+        (format!("var<workgroup> sh: array<{ty}, {wg}>;"), "")
+    };
     format!(
-        "var<workgroup> sh: array<{ty}, {wg}>;
+        "{shared}
 
 {combines}
 @compute @workgroup_size({wg})
 fn main(
     @builtin(local_invocation_index) lid: u32,
     @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,{extra_args}
 ) {{
     let group = wid.x + wid.y * nwg.x;
-    let groups = (p.n + {block}u - 1u) / {block}u;
-    let base = group * {block}u + lid;
+    let groups = min((p.n + {block}u - 1u) / {block}u, {cap}u);
+    if (group >= groups) {{ return; }}
     let zero = {ty}();
-{body}}}
-"
+{inits}    for (var b = group * {block}u; b < p.n; b += groups * {block}u) {{
+        let base = b + lid;
+{loop_body}    }}
+{finish}}}
+",
+        cap = tuning.reduce_max_groups
     )
 }
 

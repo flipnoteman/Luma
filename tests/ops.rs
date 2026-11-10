@@ -340,6 +340,19 @@ fn u32_reductions() {
 }
 
 #[test]
+fn u32_reductions_beyond_one_block_per_workgroup() {
+    // Past the workgroup cap of a pass, so workgroups stride over several blocks each.
+    let n = 6_000_011usize;
+    let mut xs: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2654435761u32) % 1000 + 3).collect();
+    xs[n - 2] = 1;
+    xs[n / 2 + 1] = 5000;
+    let a = u32s(&xs);
+    assert_eq!(a.sum().unwrap(), xs.iter().fold(0u32, |s, x| s.wrapping_add(*x)));
+    assert_eq!(a.min().unwrap(), 1);
+    assert_eq!(a.max().unwrap(), 5000);
+}
+
+#[test]
 fn reductions_ignore_stale_pool_contents() {
     // Fresh context so the pooled buffers of the first reduction are the ones the second reuses.
     let ctx = Context::new().unwrap();

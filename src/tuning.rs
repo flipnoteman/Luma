@@ -8,6 +8,8 @@
 
 /// Environment variable forcing a profile.
 const TUNING_ENV: &str = "LUMA_TUNING";
+/// `LUMA_SUBGROUPS=off` keeps the built-in kernels off subgroup operations.
+const SUBGROUPS_ENV: &str = "LUMA_SUBGROUPS";
 
 /// The GPU family a [`Tuning`] was measured on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -40,9 +42,12 @@ pub(crate) struct Tuning {
     pub(crate) stencil_tile_bytes: u32,
     pub(crate) stencil_tile_2d: (u32, u32),
     pub(crate) stencil_tile_1d: u32,
-    /// Elements each reduction invocation loads (and combines pairwise) before the workgroup
-    /// reduces them.
+    /// Elements each reduction invocation loads (and combines pairwise) per block.
     pub(crate) reduce_per_thread: u32,
+    /// Most workgroups of a reduction pass; they stride over arrays larger than that many blocks.
+    pub(crate) reduce_max_groups: u32,
+    /// Whether reductions combine within subgroups (the device has `Features::SUBGROUP`).
+    pub(crate) subgroups: bool,
 }
 
 impl Tuning {
@@ -56,6 +61,8 @@ impl Tuning {
         // A wider 1D tile leaves no room in 8 KiB for the halo of a second step.
         stencil_tile_1d: 512,
         reduce_per_thread: 4,
+        reduce_max_groups: 1024,
+        subgroups: false,
     };
 
     const NVIDIA: Tuning = Tuning {
@@ -67,6 +74,8 @@ impl Tuning {
         stencil_tile_2d: (64, 32),
         stencil_tile_1d: 2048,
         reduce_per_thread: 8,
+        reduce_max_groups: 2048,
+        subgroups: false,
     };
 
     const GENERIC: Tuning = Tuning {
@@ -78,10 +87,12 @@ impl Tuning {
         stencil_tile_2d: (32, 16),
         stencil_tile_1d: 1024,
         reduce_per_thread: 4,
+        reduce_max_groups: 1024,
+        subgroups: false,
     };
 
     /// The parameters for the GPU `info` describes, unless the environment forces a profile.
-    pub(crate) fn for_adapter(info: &wgpu::AdapterInfo, limits: &wgpu::Limits) -> Tuning {
+    pub(crate) fn for_adapter(info: &wgpu::AdapterInfo, limits: &wgpu::Limits, features: wgpu::Features) -> Tuning {
         let forced = std::env::var(TUNING_ENV).ok();
         let profile = match forced.as_deref().map(str::trim) {
             Some("apple") => TuningProfile::Apple,
@@ -96,7 +107,9 @@ impl Tuning {
             TuningProfile::Nvidia => Tuning::NVIDIA,
             TuningProfile::Generic => Tuning::GENERIC,
         };
-        tuning.within(limits)
+        let mut tuning = tuning.within(limits);
+        tuning.subgroups = features.contains(wgpu::Features::SUBGROUP) && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
+        tuning
     }
 
     /// Shrinks what the device cannot run.
@@ -128,9 +141,14 @@ impl Tuning {
         self.conv_per_thread[class]
     }
 
-    /// Elements one reduction workgroup consumes.
+    /// Elements one reduction workgroup consumes at a time.
     pub(crate) fn reduce_block(&self) -> u32 {
         crate::builtin::REDUCE_WORKGROUP * self.reduce_per_thread
+    }
+
+    /// Workgroups of a reduction pass over `n` elements.
+    pub(crate) fn reduce_groups(&self, n: u32) -> u32 {
+        n.div_ceil(self.reduce_block()).min(self.reduce_max_groups)
     }
 }
 

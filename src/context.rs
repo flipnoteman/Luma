@@ -436,7 +436,7 @@ impl Context {
                 max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
                 timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
                 zero_copy: device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
-                tuning: Tuning::for_adapter(&adapter, &limits),
+                tuning: Tuning::for_adapter(&adapter, &limits, device.features()),
                 device,
                 queue,
                 builtins: Mutex::new(FxMap::default()),
