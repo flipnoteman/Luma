@@ -23,6 +23,9 @@ pub(crate) async fn request_device() -> Result<(Device, Queue, wgpu::AdapterInfo
     // conservative WebGPU defaults (e.g. 128 MiB storage bindings).
     // Timestamp queries are optional: they only serve `Context::profile`.
     let mut required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+    // Shader features custom kernels may use; requested whenever the adapter has them.
+    required_features |= adapter.features()
+        & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16 | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
     // Only on unified memory: on a discrete GPU mappable storage buffers live in slow host memory.
     if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
         required_features |= adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
@@ -34,6 +37,9 @@ pub(crate) async fn request_device() -> Result<(Device, Queue, wgpu::AdapterInfo
             required_features,
             required_limits: adapter.limits(),
             memory_hints: MemoryHints::MemoryUsage,
+            // SAFETY: the only experimental feature requested is cooperative matrix, which only
+            // kernels that opt in with `enable wgpu_cooperative_matrix;` use.
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             ..Default::default()
         })
         .await

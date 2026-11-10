@@ -154,6 +154,22 @@ fn reflect_kind(space: naga::AddressSpace) -> Option<BindingKind> {
     }
 }
 
+/// What naga may accept in a kernel: the shader features the device was opened with.
+fn shader_capabilities(features: wgpu::Features) -> naga::valid::Capabilities {
+    use naga::valid::Capabilities as Caps;
+    let mut caps = Caps::empty();
+    if features.contains(wgpu::Features::SUBGROUP) {
+        caps |= Caps::SUBGROUP | Caps::SUBGROUP_BARRIER;
+    }
+    if features.contains(wgpu::Features::SHADER_F16) {
+        caps |= Caps::SHADER_FLOAT16;
+    }
+    if features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        caps |= Caps::COOPERATIVE_MATRIX;
+    }
+    caps
+}
+
 /// Compiles `key` into a pipeline. `trusted` kernels are luma's own, whose every storage access
 /// is in bounds by construction; they are compiled without wgpu's per-access bounds checks.
 pub(crate) fn build_core(
@@ -166,10 +182,7 @@ pub(crate) fn build_core(
     let module = naga::front::wgsl::parse_str(&combined)
         .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
 
-    let mut validator = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
-    );
+    let mut validator = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), shader_capabilities(ctx.device().features()));
     let info = validator
         .validate(&module)
         .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;

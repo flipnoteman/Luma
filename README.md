@@ -218,6 +218,11 @@ Arrays that share a buffer (through `reshape`) cannot be bound to one launch if 
 writable; that is an error (`KernelArgAlias`), as is an in-place operation on a view of its own
 operand.
 
+Kernels may use the shader features the GPU has: subgroup operations (`SUBGROUP`), `f16`
+(`SHADER_F16`, with `enable f16;`) and cooperative matrices (`EXPERIMENTAL_COOPERATIVE_MATRIX`,
+with `enable wgpu_cooperative_matrix;`: tensor cores on NVIDIA, simdgroup matrices on Apple).
+`ctx.features()` says which ones the device was opened with.
+
 ## GPU timing
 
 Where the adapter supports timestamp queries, `ctx.profile(|| { ... })` returns the GPU time of

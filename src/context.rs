@@ -375,6 +375,18 @@ pub fn flush() -> Result<()> {
 impl Context {
     /// Opens the default high-performance GPU. Blocks until the device is ready.
     pub fn new() -> Result<Context> {
+        // Unit tests open and drop a device each. The NVIDIA driver (615.71) then intermittently
+        // miscomputes on the next fresh device or deadlocks tearing one down, unless another device
+        // stays open for the whole process.
+        #[cfg(test)]
+        {
+            static KEEPALIVE: std::sync::LazyLock<Option<Context>> = std::sync::LazyLock::new(|| Context::open().ok());
+            std::sync::LazyLock::force(&KEEPALIVE);
+        }
+        Context::open()
+    }
+
+    fn open() -> Result<Context> {
         let (device, queue, adapter) = pollster::block_on(handle::request_device())?;
         let limits = device.limits();
         let max_buffer_bytes = limits
@@ -1014,6 +1026,12 @@ impl Context {
 
     pub(crate) fn tuning(&self) -> &Tuning {
         &self.inner.tuning
+    }
+
+    /// The features the device was opened with. Custom kernels may use the shader features
+    /// among them (`SUBGROUP`, `SHADER_F16`, `EXPERIMENTAL_COOPERATIVE_MATRIX`) when present.
+    pub fn features(&self) -> wgpu::Features {
+        self.device().features()
     }
 
     // -- Profiling --
