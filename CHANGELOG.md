@@ -19,7 +19,11 @@ All notable changes to Luma are listed here. The format follows
 - `Array::submit` and `submit_all` hold back up to 16 kernels while the GPU is still busy and hand
   them over with the next submitting or waiting call (one submission instead of one per call). Call
   `Context::flush` before long work that does not touch Luma.
-- `Context::sync` polls for up to 500 µs before blocking in the driver.
+- `Context::sync` and readbacks (`to_vec`, `read_into`, reductions) poll before blocking in the
+  driver, for 1.5x the longest of the last four waits (at least 500 µs; waits predicted beyond 4 ms
+  block as before), so a result that is about to arrive is not picked up late by a sleeping thread.
+- Uniform values of a batch are copied by the batch's own command buffer (first 4 KiB) instead of a
+  second one, saving about 2 µs per submission.
 - Building and flattening lazy expressions is cheaper (about 40% less host time for a 50-operation
   expression).
 
