@@ -461,7 +461,31 @@ impl<T: ScalarType> Array<T> {
 /// one uses is computed once. `let (call, put) = ...; eval_all(&[&call, &put])?` prices both
 /// options in one pass over the market data.
 pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
-    let Some(first) = arrays.first() else { return Ok(()) };
+    match record_all(arrays)? {
+        Some(ctx) => ctx.sync(),
+        None => Ok(()),
+    }
+}
+
+/// Like [`eval_all`], but does not wait: the lazy arrays are computed together the same way and
+/// the batch is handed to the GPU, which runs while the host keeps recording. Other lazy arrays
+/// stay lazy, unlike [`Context::flush`](crate::Context::flush). A loop of steps can end each
+/// with `submit_all` and read the result back once at the end.
+///
+/// Nothing waits, so an error the GPU raises while running the batch only shows up at the next
+/// call that waits ([`Context::sync`](crate::Context::sync), [`Array::to_vec`], [`eval_all`],
+/// reductions). A poisoned array returns its own error here.
+pub fn submit_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
+    match record_all(arrays)? {
+        Some(ctx) => ctx.submit(),
+        None => Ok(()),
+    }
+}
+
+/// Records the pending computation of `arrays`, grouped into fused multi-output kernels by
+/// length, for [`eval_all`] and [`submit_all`]. Returns their context (`None` for no arrays).
+fn record_all<'a, T: GpuType>(arrays: &[&'a Array<T>]) -> Result<Option<&'a Context>> {
+    let Some(first) = arrays.first() else { return Ok(None) };
     let ctx = first.context();
     if arrays.iter().any(|array| !ctx.same_as(array.context())) {
         return Err(LumaError::ContextMismatch);
@@ -476,7 +500,7 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     for array in arrays {
         array.storage().map_err(Failure::into_error)?;
     }
-    ctx.sync()
+    Ok(Some(ctx))
 }
 
 /// A reduction for [`Array::reduce`].
