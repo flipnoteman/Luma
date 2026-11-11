@@ -475,6 +475,13 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
 /// Nothing waits, so an error the GPU raises while running the batch only shows up at the next
 /// call that waits ([`Context::sync`](crate::Context::sync), [`Array::to_vec`], [`eval_all`],
 /// reductions). A poisoned array returns its own error here.
+///
+/// While the GPU is still busy with earlier work, up to 16 kernels are held back instead of
+/// being submitted one by one (each submission costs the host and leaves a gap on the GPU).
+/// They are handed over by the next Luma call that submits: another `submit_all` or
+/// [`Array::submit`], a [`Context::flush`](crate::Context::flush), anything that waits, or the
+/// batch limit. A program that calls `submit_all` and then does long work without touching Luma
+/// should call [`Context::flush`](crate::Context::flush) to force the hand-over.
 pub fn submit_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     match record_all(arrays)? {
         Some(ctx) => ctx.submit(),

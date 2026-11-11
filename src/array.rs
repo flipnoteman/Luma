@@ -521,6 +521,13 @@ impl<T: GpuType> Array<T> {
     ///
     /// Nothing waits, so an error the GPU raises while running the batch only shows up at the
     /// next call that waits ([`Context::sync`], [`Array::to_vec`], [`Array::eval`], reductions).
+    ///
+    /// While the GPU is still busy with earlier work, up to 16 kernels are held back instead of
+    /// being submitted one by one (each submission costs the host and leaves a gap on the GPU).
+    /// They are handed over by the next Luma call that submits: another `submit`, a
+    /// [`Context::flush`], anything that waits, or the batch limit. A program that calls `submit`
+    /// and then does long work without touching Luma should call [`Context::flush`] to force the
+    /// hand-over.
     pub fn submit(&self) -> Result<()> {
         self.storage().map_err(Failure::into_error)?;
         self.ctx.submit()

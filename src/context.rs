@@ -81,8 +81,20 @@ impl FreeUploads {
 
 /// How long [`Context::sync`] polls for the GPU to finish before it blocks in the driver. Bounds
 /// the CPU time spent spinning on a long kernel; kernels that finish inside it are noticed
-/// without waking a blocked thread.
-const SYNC_SPIN: Duration = Duration::from_micros(100);
+/// without waking a blocked thread, which returns 20-40 us late. Measured on Black-Scholes with
+/// 1<<24 options (a 340 us kernel, so it always outlasted the old 100 us spin): median `eval`
+/// wall time of the runs not disturbed by other GPU users 446 us at 100 us, 422 us at 500 us,
+/// 420 us at 1 ms; 500 us gets all of it. The CPU time of 50 `eval`s of a ~7 ms kernel chain did
+/// not change measurably between 100 us and 500 us (about 12-30% of the wall time either way),
+/// while a 2 ms spin raised it to 40-50%.
+const SYNC_SPIN: Duration = Duration::from_micros(2000);
+
+/// Number of pending dispatches up to which [`Context::submit`] holds the batch back while the
+/// GPU is busy. Each `queue.submit` costs the host 20-35 us and leaves a gap of 20-27 us on the
+/// GPU, so a loop of one-kernel submissions is bound by that instead of by the kernels. Mandelbrot
+/// loop, 256 submitted iterations, best of 25 (ms) at 1024x1024 / 4096x4096: hold 8 10.9 / 168.7,
+/// 16 10.7 / 168.4, 32 10.6 / 168.2 (without holding: 15.3 / 175). 16 is within 2% of the best.
+pub(crate) const SUBMIT_HOLD: u32 = 16;
 
 /// Number of dispatches after which the pending batch is submitted without waiting for a sync
 /// point. Bounds how much work piles up in one command buffer.
@@ -689,15 +701,33 @@ impl Context {
     /// ```
     pub fn flush(&self) -> Result<()> {
         self.jit().evaluate_live();
-        self.submit()
+        let mut batch = self.batch()?;
+        self.flush_locked(&mut batch);
+        Ok(())
+    }
+
+    /// `true` while earlier submissions are still running on the GPU. A failed poll counts as
+    /// idle, so that the submission goes ahead and the waiting paths report the error.
+    fn gpu_busy(&self) -> bool {
+        matches!(self.device().poll(wgpu::PollType::Poll), Ok(status) if !status.is_queue_empty())
     }
 
     /// Submits the pending batch without waiting for it, like [`Context::flush`] but without
     /// evaluating the lazy arrays that are still alive: only what was recorded so far goes to
     /// the GPU. For [`Array::submit`](crate::Array::submit) and [`submit_all`](crate::submit_all),
     /// which record exactly what they want submitted.
+    ///
+    /// While the GPU is still busy with earlier submissions and fewer than [`SUBMIT_HOLD`]
+    /// dispatches are pending, this does not submit at all: the GPU has work to do anyway, and
+    /// every `queue.submit` costs the host 20-35 us and leaves a gap of about as much between
+    /// two kernels. The held-back dispatches go out with the next call that submits: another
+    /// `submit`, [`Context::flush`], anything that waits, or the batch limit. A caller that
+    /// submits and then does long work without touching luma has to call [`Context::flush`].
     pub(crate) fn submit(&self) -> Result<()> {
         let mut batch = self.batch()?;
+        if batch.dispatches < SUBMIT_HOLD && self.gpu_busy() {
+            return Ok(());
+        }
         self.flush_locked(&mut batch);
         Ok(())
     }
@@ -1723,6 +1753,34 @@ mod tests {
         assert_eq!(view.to_vec().unwrap(), vec![7.0; 16]);
     }
 
+    /// Steps of a loop that keep the GPU busy long enough for `submit` to hold some back.
+    fn submit_busy_loop(ctx: &Context, x: &mut Array<f32>, steps: usize) {
+        for _ in 0..steps {
+            *x = &*x * 1.0 + 1.0;
+            x.submit().unwrap();
+        }
+        assert!(ctx.pending_dispatches() < SUBMIT_HOLD + 1);
+    }
+
+    #[test]
+    fn flush_hands_over_what_submit_held_back() {
+        let ctx = Context::new().unwrap();
+        let mut x = Array::<f32>::zeros_on(&ctx, 1 << 22).unwrap();
+        submit_busy_loop(&ctx, &mut x, 40);
+        ctx.flush().unwrap();
+        assert_eq!(ctx.pending_dispatches(), 0);
+        assert_eq!(x.to_vec().unwrap()[..4], [40.0; 4]);
+    }
+
+    #[test]
+    fn a_waiting_call_completes_a_batch_that_submit_held_back() {
+        let ctx = Context::new().unwrap();
+        let mut x = Array::<f32>::zeros_on(&ctx, 1 << 22).unwrap();
+        submit_busy_loop(&ctx, &mut x, 40);
+        assert_eq!(x.to_vec().unwrap()[1 << 21], 40.0);
+        assert_eq!(ctx.pending_dispatches(), 0);
+    }
+
     #[test]
     fn submit_hands_over_one_array_and_leaves_other_lazy_arrays_lazy() {
         let ctx = Context::new().unwrap();
@@ -1730,11 +1788,12 @@ mod tests {
         let wanted = &x + 1.0;
         let unrelated = &x * 3.0;
         wanted.submit().unwrap();
-        // `wanted` went to the GPU; unlike `flush`, `submit` did not evaluate the other array.
-        assert_eq!(ctx.pending_dispatches(), 0);
+        // `wanted` was recorded (and went to the GPU, unless the GPU was busy and `submit` held
+        // it back); unlike `flush`, `submit` did not evaluate the other array.
         assert!(wanted.pending().is_none());
         assert!(unrelated.pending().is_some());
         ctx.flush().unwrap();
+        assert_eq!(ctx.pending_dispatches(), 0);
         assert!(unrelated.pending().is_none());
         assert_eq!(wanted.to_vec().unwrap(), vec![2.0; 16]);
         assert_eq!(unrelated.to_vec().unwrap(), vec![3.0; 16]);
