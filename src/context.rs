@@ -87,7 +87,7 @@ impl FreeUploads {
 /// 420 us at 1 ms; 500 us gets all of it. The CPU time of 50 `eval`s of a ~7 ms kernel chain did
 /// not change measurably between 100 us and 500 us (about 12-30% of the wall time either way),
 /// while a 2 ms spin raised it to 40-50%.
-const SYNC_SPIN: Duration = Duration::from_micros(2000);
+const SYNC_SPIN: Duration = Duration::from_micros(500);
 
 /// Number of pending dispatches up to which [`Context::submit`] holds the batch back while the
 /// GPU is busy. Each `queue.submit` costs the host 20-35 us and leaves a gap of 20-27 us on the
