@@ -89,6 +89,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
 | `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel |
+| `LUMA_EXIT_WAIT` | `0` skips waiting at exit for NVIDIA's driver threads on Linux (saves about 50 ms; risks the driver's exit hang) |
 
 ### Examples
 

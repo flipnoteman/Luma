@@ -33,7 +33,13 @@ pub(crate) fn track(device: &wgpu::Device) {
     });
 }
 
+/// `0` skips the wait, for short-lived programs that accept the driver's exit race.
+const OPT_OUT_ENV: &str = "LUMA_EXIT_WAIT";
+
 extern "C" fn at_exit() {
+    if std::env::var_os(OPT_OUT_ENV).is_some_and(|value| value == "0") {
+        return;
+    }
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
         // `try_lock`: a thread still running at exit may hold it, and exit must not wait on it.
         if let Ok(devices) = DEVICES.try_lock() {

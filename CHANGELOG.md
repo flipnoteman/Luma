@@ -54,7 +54,8 @@ All notable changes to Luma are listed here. The format follows
   driver's own exit handler ran while its background worker threads were still busy (seen after
   long runs; about 1 in 4 full `luma-bench` runs on driver 615.78). Luma now registers an exit
   handler that runs first and waits, at most about 4 s, for the GPU and those workers to go idle.
-  It destroys nothing, so the driver's deadlock on destroying a device cannot occur.
+  It destroys nothing, so the driver's deadlock on destroying a device cannot occur. It adds
+  about 60 ms to every exit on such systems; `LUMA_EXIT_WAIT=0` skips it.
 - A fused expression whose operands were computed after it was built no longer exceeds the
   device's storage-buffer binding limit; its operands are computed first instead.
 - Arrays uploaded with `from_slice` on unified-memory GPUs now count against the memory budget and
