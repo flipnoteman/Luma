@@ -10,7 +10,7 @@ documentation = "https://docs.rs/luma"
 keywords = ["gpu", "wgpu", "array", "math", "compute"]
 categories = ["science", "mathematics", "concurrency"]
 rust-version = "1.99"
-exclude = [".github/"]
+exclude = [".github/", "benchmarks/"]
 
 [dependencies]
 wgpu = "30"

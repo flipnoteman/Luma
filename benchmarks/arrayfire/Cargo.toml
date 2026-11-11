@@ -1,0 +1,6 @@
+[workspace]
+members = ["common", "luma-bench", "af-bench"]
+resolver = "3"
+
+[profile.release]
+debug = false

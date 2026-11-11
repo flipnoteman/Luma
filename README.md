@@ -118,6 +118,13 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench monte_carlo   # option pric
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imaging       # blurs, 2D convolution, bilateral filter, histogram
 ```
 
+[`benchmarks/arrayfire`](benchmarks/arrayfire) compares Luma with ArrayFire (CUDA and OpenCL) on five workloads. It is a
+separate Cargo workspace and needs an ArrayFire install:
+
+```sh
+cd benchmarks/arrayfire && AF_PATH=/path/to/arrayfire ./run.sh
+```
+
 ## License
 
 Licensed under either of

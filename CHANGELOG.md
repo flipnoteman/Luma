@@ -8,6 +8,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- ArrayFire comparison benchmarks in `benchmarks/arrayfire` (separate workspace, not part of the crate).
 - `Array::submit` and `submit_all`: evaluate arrays without waiting for the GPU.
 - `select` accepts scalar branches; the result's shape and context come from the mask.
 
