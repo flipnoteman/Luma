@@ -478,7 +478,8 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     for array in arrays {
         array.request()?;
     }
-    ctx.submit_requested()
+    ctx.submit_requested()?;
+    arrays.iter().try_for_each(|array| array.check())
 }
 
 /// Runs `steps` iterations of `step` on several arrays at once: `step` gets the current values

@@ -258,8 +258,8 @@ impl<T: GpuType> Array<T> {
         })
     }
 
-    pub(crate) fn from_storage(ctx: &Context, shape: Shape, storage: Storage) -> Self {
-        Array { ctx: ctx.clone(), shape, repr: Repr::Valid(Arc::new(storage)), _marker: PhantomData }
+    pub(crate) fn from_storage(ctx: &Context, shape: Shape, storage: Arc<Storage>) -> Self {
+        Array { ctx: ctx.clone(), shape, repr: Repr::Valid(storage), _marker: PhantomData }
     }
 
     /// An array that is the (not yet evaluated) result of `node`.
@@ -524,14 +524,17 @@ impl<T: GpuType> Array<T> {
     /// next call that waits ([`Context::sync`], [`Array::to_vec`], reductions).
     ///
     /// While the GPU is still busy with earlier work, the computation is postponed to the next
-    /// `eval` that finds it idle (or anything that waits, or [`Context::flush`]). Arrays the
-    /// program drops before then are never computed, and the steps in between fuse, so a loop
-    /// that evaluates every step costs about what one evaluating every few steps does. A program
-    /// that calls `eval` and then does long work without touching Luma should call
-    /// [`Context::flush`] to start the GPU.
+    /// `eval` that finds it idle, [`Context::sync`] or [`Context::flush`]; reading the array
+    /// computes it at once. Arrays the program drops before then are never computed, and the
+    /// steps in between fuse, so a loop that evaluates every step costs about what one evaluating
+    /// every few steps does. A program that calls `eval` and then does long work without touching
+    /// Luma should call [`Context::flush`] to start the GPU. A failure while computing the array
+    /// is returned here if the computation was not postponed, and otherwise by the array's next
+    /// use.
     pub fn eval(&self) -> Result<()> {
         self.request()?;
-        self.ctx.submit_requested()
+        self.ctx.submit_requested()?;
+        self.check()
     }
 
     /// Asks for the array to be computed at the next submission, or returns its error.

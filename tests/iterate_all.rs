@@ -140,3 +140,26 @@ fn the_initial_arrays_keep_their_values() {
     assert_close(&y.to_vec().unwrap(), &want, 1e-6, 1e-6);
     assert_eq!(x.to_vec().unwrap(), xs);
 }
+
+#[test]
+fn many_captured_arrays_stay_correct() {
+    let ctx = Context::new().unwrap();
+    let n = 256;
+    let inputs: Vec<Vec<f32>> = (0..40).map(|k| values(n, 100 + k, 0.0, 1.0)).collect();
+    let arrays: Vec<Array<f32>> = inputs.iter().map(|data| f32s_on(&ctx, data)).collect();
+    let zero = Array::<f32>::zeros_on(&ctx, n).unwrap();
+    let [a, b] = iterate_all([&zero, &zero], 2, |[a, b]| {
+        let mut na = a * 1.0;
+        let mut nb = b * 1.0;
+        for k in 0..20 {
+            na += &arrays[k];
+            nb += &arrays[20 + k];
+        }
+        [na, nb]
+    });
+    let sum = |range: std::ops::Range<usize>| -> Vec<f32> {
+        (0..n).map(|i| 2.0 * range.clone().map(|k| inputs[k][i]).sum::<f32>()).collect()
+    };
+    assert_close(&a.to_vec().unwrap(), &sum(0..20), 1e-4, 1e-4);
+    assert_close(&b.to_vec().unwrap(), &sum(20..40), 1e-4, 1e-4);
+}

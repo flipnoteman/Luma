@@ -596,7 +596,7 @@ pub(crate) fn run_loop(
     inits: &[Arc<Storage>],
     outs: &[Arc<Node>],
     steps: u32,
-) -> Option<Result<Vec<Storage>, Failure>> {
+) -> Option<Result<Vec<Arc<Storage>>, Failure>> {
     let len = outs.first()?.len();
     if outs.iter().any(|out| out.len() != len || !out.is_pending())
         || outs.iter().enumerate().any(|(j, out)| outs[..j].iter().any(|other| Arc::ptr_eq(other, out)))
@@ -624,23 +624,43 @@ pub(crate) fn run_loop(
     }
     let states: Vec<Option<usize>> =
         fused.inputs.iter().map(|input| probes.iter().position(|probe| Arc::ptr_eq(probe, input))).collect();
+    let bindings = 2 * outs.len() + states.iter().filter(|state| state.is_none()).count();
+    if bindings > ctx.jit().max_inputs + 1 {
+        return None;
+    }
     let source = super::codegen::loop_source(key, &states, ctx.tuning());
     let label = format!("Loop{}", key.label().trim_start_matches("Fused"));
-    Some(launch_loop(ctx, &fused, &states, inits, len, steps, source, &label))
+    let budget = ctx.jit().loop_work.load(Ordering::Relaxed);
+    let per_launch = budget / (len as u64 * key.instrs.len().max(1) as u64).max(1);
+    let per_launch = u32::try_from(per_launch).unwrap_or(u32::MAX).max(1);
+    Some((|| {
+        let core = ctx.jit().stencil_kernel(ctx, source, &label)?;
+        let mut states_now: Vec<Arc<Storage>> = inits.to_vec();
+        let mut remaining = steps;
+        while remaining > 0 {
+            let count = remaining.min(per_launch);
+            let outputs = launch_loop(ctx, &core, &fused, &states, &states_now, len, count)?;
+            states_now = outputs.into_iter().map(Arc::new).collect();
+            remaining -= count;
+        }
+        Ok(states_now)
+    })())
 }
 
-#[expect(clippy::too_many_arguments, reason = "one call site, all parts of one launch")]
+/// Most element-instructions (elements x instructions x steps) one launch of a register loop
+/// runs: about 9 ms on an RTX 3080 Laptop, so a GPU 100 times slower still stays below the
+/// 2 s watchdog of Windows. Longer loops are split into several launches.
+pub(super) const LOOP_WORK_PER_LAUNCH: u64 = 1 << 36;
+
 fn launch_loop(
     ctx: &crate::context::Context,
+    core: &crate::kernel::KernelCore,
     fused: &Fused,
     states: &[Option<usize>],
     inits: &[Arc<Storage>],
     len: usize,
     steps: u32,
-    source: String,
-    label: &str,
 ) -> Result<Vec<Storage>, Failure> {
-    let core = ctx.jit().stencil_kernel(ctx, source, label)?;
     let n = len_u32(len)?;
     let bytes = u64::from(n) * ELEMENT_BYTES;
     let outputs: Vec<Storage> = inits.iter().map(|_| Storage::new(ctx, len, ELEMENT_BYTES as usize)).collect();
@@ -661,7 +681,7 @@ fn launch_loop(
     raw.extend(init_pins.iter().map(|pin| RawArg::read(pin.buffer(), bytes)));
     raw.extend(in_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
-    launch_1d(ctx, &core, n, &raw)?;
+    launch_1d(ctx, core, n, &raw)?;
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     Ok(outputs)
 }
@@ -671,15 +691,23 @@ fn len_u32(len: usize) -> Result<u32, LumaError> {
 }
 
 /// Evaluates `node`: one fused kernel computing its whole expression into a new buffer.
-pub(crate) fn evaluate(node: &Arc<Node>, mut args: Args) -> Result<Storage, Failure> {
+pub(crate) fn evaluate(node: &Arc<Node>, args: Args) -> Result<Storage, Failure> {
+    let (fused, args) = flatten_bounded(node, args, Tail::Store)?;
+    drop(args);
+    let mut outputs = run_store(node.context(), node.len(), fused)?;
+    outputs.pop().ok_or_else(|| Failure::New(LumaError::Gpu("fused kernel without output".into())))
+}
+
+/// Flattens the expression of `node` with operands `args`, which come back for the caller to drop.
+/// Nodes inside it that were computed after it was measured are buffers now, so it can read more
+/// buffers than the device binds; then its operands are computed first, one at a time.
+fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fused, Args), Failure> {
     let max_inputs = node.context().jit().max_inputs;
     loop {
         let roots = [(Arc::clone(node), args)];
-        let fused = flatten(&roots, Tail::Store)?;
+        let fused = flatten(&roots, tail)?;
         let [(_, returned)] = roots;
         args = returned;
-        // Nodes inside the expression that were computed after it was measured are buffers now,
-        // so it can read more buffers than the device binds.
         if fused.inputs.len() > max_inputs
             && let Some(i) = (0..node.op().kind.arity()).find(|&i| matches!(args.get(i), Some(Src::Node(_))))
         {
@@ -687,9 +715,7 @@ pub(crate) fn evaluate(node: &Arc<Node>, mut args: Args) -> Result<Storage, Fail
             super::evaluate_operand(&mut args, i)?;
             continue;
         }
-        drop(args);
-        let mut outputs = run_store(node.context(), node.len(), fused)?;
-        return outputs.pop().ok_or_else(|| Failure::New(LumaError::Gpu("fused kernel without output".into())));
+        return Ok((fused, args));
     }
 }
 
@@ -1047,9 +1073,8 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     let Some(args) = lock(&node.args).take() else {
         return Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into())));
     };
-    let roots = [(Arc::clone(node), args)];
-    let fused = flatten(&roots, Tail::Store)?;
-    drop(roots);
+    let (fused, args) = flatten_bounded(node, args, Tail::Store)?;
+    drop(args);
     let ctx = node.context();
     fused.mark_fused();
     let Fused { mut key, mut inputs, scalars, fused_nodes } = fused;
@@ -1083,9 +1108,8 @@ pub(crate) fn reduce_first_pass(
     }
     let Some(args) = node.operands() else { return Ok(None) };
     let ctx = node.context();
-    let roots = [(Arc::clone(node), args)];
-    let fused = flatten(&roots, Tail::Reduce(ops))?;
-    drop(roots);
+    let (fused, args) = flatten_bounded(node, args, Tail::Reduce(ops))?;
+    drop(args);
 
     fused.mark_fused();
     let Fused { mut key, inputs, scalars, .. } = fused;
