@@ -29,6 +29,18 @@ All notable changes to Luma are listed here. The format follows
 
 ### Fixed
 
+- Arrays uploaded with `from_slice` on unified-memory GPUs now count against the memory budget and
+  can be spilled; before, only arrays computed on the GPU did. Newly resident data is no longer
+  the first eviction candidate.
+- Moving a segment to host memory reads it back through a staging buffer of at most 32 MiB instead
+  of one as large as the segment, which could fail when the device was full.
+- FFT passes no longer read and write past the work buffer when the folded grid launches more
+  workgroups than there are tiles (more than 65535 tiles).
+- Batches without uniforms no longer copy the 4 KiB uniform prefix.
+- Chunked readbacks record one wait for the adaptive poll instead of one per piece, so short tail
+  waits no longer shrink the poll budget.
+- Freeing bind groups of reclaimed buffers ends the open compute pass first, so a later launch
+  cannot reuse a stale binding.
 - Uniform uploads no longer allocate and free a host-visible memory block on every submission
   (about 0.3 ms per submission on NVIDIA/Vulkan when no small upload buffer was alive).
 - Workgroup grids larger than one row are folded evenly. Before, 65536 workgroups (for example 2^24

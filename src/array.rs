@@ -317,7 +317,10 @@ impl<T: GpuType> Array<T> {
             let storage = Storage::new(ctx, len, std::mem::size_of::<T>());
             let mut buffers = Vec::with_capacity(storage.segments());
             for j in 0..storage.segments() {
-                match ctx.alloc_filled(bytemuck::cast_slice(&data[storage.range(j)])) {
+                let filled = ctx
+                    .make_room(storage.range(j).len() as u64 * std::mem::size_of::<T>() as u64)
+                    .and_then(|()| ctx.alloc_filled(bytemuck::cast_slice(&data[storage.range(j)])));
+                match filled {
                     Ok(buffer) => buffers.push(buffer),
                     Err(err) => {
                         for buffer in buffers {

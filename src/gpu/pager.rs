@@ -117,6 +117,7 @@ impl Pager {
     /// Records that `segment` now holds a device buffer of `size` bytes.
     fn register(&self, segment: &Arc<Segment>, size: u64) {
         self.resident_bytes.fetch_add(size, Ordering::Relaxed);
+        segment.stamp.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         let mut resident = lock(&self.resident);
         resident.list.push(Arc::downgrade(segment));
         if resident.list.len() > resident.prune_at.max(PRUNE_MIN) {
@@ -163,11 +164,7 @@ impl Segment {
                 self.stamp.store(pager.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
                 return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone() });
             }
-            if let Some(budget) = pager.budget {
-                // The budget is soft: with nothing left to evict the allocation goes ahead.
-                let class = pool::size_class(self.bytes, self.ctx.max_buffer_bytes()).unwrap_or(self.bytes);
-                while pager.resident_bytes.load(Ordering::Relaxed) + class > budget && self.ctx.evict_one()? { std::hint::spin_loop() }
-            }
+            self.ctx.make_room(self.bytes)?;
             let buffer = self.ctx.alloc_buffer(self.bytes, STORAGE_USAGE)?;
             let mut state = lock(&self.state);
             match &*state {
@@ -234,6 +231,16 @@ impl Drop for EvictingGuard {
 const SPILL_WARNING: &str = "luma: device memory is full; array data is being moved to host memory and back as needed. Results are unaffected; throughput drops to the transfer rate.";
 
 impl Context {
+    /// Evicts segments until `bytes` more fit in the memory budget. The budget is soft: with
+    /// nothing left to evict the allocation goes ahead.
+    pub(crate) fn make_room(&self, bytes: u64) -> Result<()> {
+        let pager = self.pager();
+        let Some(budget) = pager.budget else { return Ok(()) };
+        let class = pool::size_class(bytes, self.max_buffer_bytes()).unwrap_or(bytes);
+        while pager.resident_bytes.load(Ordering::Relaxed) + class > budget && self.evict_one()? { std::hint::spin_loop() }
+        Ok(())
+    }
+
     /// Moves the least recently pinned unpinned segment to host memory. `Ok(false)`: nothing to
     /// move. `Ok(true)`: a segment moved, or the choice raced with a pin; the caller retries.
     pub(crate) fn evict_one(&self) -> Result<bool> {
@@ -266,7 +273,7 @@ impl Context {
         }
         let buffer = buffer.clone();
         // Flushes and waits, so every recorded use of the buffer has run.
-        let data = self.read::<u8>(&buffer, victim.bytes)?;
+        let data = self.read_spill(&buffer, victim.bytes)?;
         *state = State::Host(data);
         pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
         pager.spilled_bytes.fetch_add(victim.bytes, Ordering::Relaxed);

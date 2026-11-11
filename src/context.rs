@@ -299,7 +299,7 @@ impl Arena {
     ///
     /// The first [`UNIFORM_PREFIX`] bytes of the chunk the batch started in are not part of
     /// them: `prefix` is the staging buffer the batch's own commands copy them out of (see
-    /// [`Context::new_encoder`]); they are written into it here.
+    /// [`Context::copy_prefix`]); they are written into it here.
     ///
     /// The staging buffers are the reusable mapped ones of [`Context::upload`] (pushed to
     /// `staged`, which the caller maps again after the submission), not `Queue::write_buffer`:
@@ -408,8 +408,8 @@ struct Bound {
     args: Option<(u64, usize)>,
 }
 
-/// The staging buffer the first [`UNIFORM_PREFIX`] bytes of a chunk are copied out of by the
-/// first command of the batch's encoder, and the chunk's arena epoch.
+/// The staging buffer the first [`UNIFORM_PREFIX`] bytes of a chunk are copied out of ahead of
+/// the batch's first dispatch, and the chunk's arena epoch.
 #[derive(Debug)]
 struct Prefix {
     staging: Buffer,
@@ -424,7 +424,7 @@ struct Batch {
     /// encoder so that it is dropped (ended) first.
     pass: Option<wgpu::ComputePass<'static>>,
     encoder: Option<wgpu::CommandEncoder>,
-    /// Present once `encoder` exists and a staging buffer was available for [`Prefix`].
+    /// Present once the batch has a dispatch and a staging buffer was available for [`Prefix`].
     prefix: Option<Prefix>,
     bound: Bound,
     dispatches: u32,
@@ -1010,7 +1010,10 @@ impl Context {
         let mut late = lock(&self.inner.mappable).drain();
         late.extend(lock(&self.inner.uploads).drain());
         if !late.is_empty() {
-            self.batch()?.bind_groups.forget(&late);
+            let mut batch = self.batch()?;
+            batch.pass = None;
+            batch.bound = Bound::default();
+            batch.bind_groups.forget(&late);
         }
         if let Some(buffer) = self.create_buffer(size, usage, mapped) {
             return Ok(buffer);
@@ -1028,7 +1031,10 @@ impl Context {
             let mut late = lock(&self.inner.mappable).drain();
             late.extend(lock(&self.inner.uploads).drain());
             if !late.is_empty() {
-                self.batch()?.bind_groups.forget(&late);
+                let mut batch = self.batch()?;
+                batch.pass = None;
+                batch.bound = Bound::default();
+                batch.bind_groups.forget(&late);
             }
             if let Some(buffer) = self.create_buffer(size, usage, mapped) {
                 return Ok(buffer);
@@ -1204,20 +1210,21 @@ impl Context {
         staging.unmap();
     }
 
-    /// A new command encoder for the batch. Its first command copies the first
-    /// [`UNIFORM_PREFIX`] bytes of the uniform chunk `chunk` (started in arena epoch `epoch`) out
-    /// of a staging buffer that [`Arena::upload`] fills when the batch is submitted, so that
-    /// the slots of a small batch need no command buffer of their own. Without a staging
-    /// buffer (the device is out of memory) everything goes through that separate buffer.
-    fn new_encoder(&self, prefix: &mut Option<Prefix>, chunk: &Buffer, epoch: u64) -> wgpu::CommandEncoder {
-        let mut encoder =
-            self.device().create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma batch") });
+    fn new_encoder(&self) -> wgpu::CommandEncoder {
+        self.device().create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma batch") })
+    }
+
+    /// Records copying the first [`UNIFORM_PREFIX`] bytes of the uniform chunk `chunk` (started in
+    /// arena epoch `epoch`) out of a staging buffer that [`Arena::upload`] fills when the batch is
+    /// submitted, so that the slots of a small batch need no command buffer of their own. Must
+    /// be recorded before the batch's first dispatch. Without a staging buffer (the device is
+    /// out of memory) everything goes through that separate buffer.
+    fn copy_prefix(&self, encoder: &mut wgpu::CommandEncoder, prefix: &mut Option<Prefix>, chunk: &Buffer, epoch: u64) {
         if let Some(staging) = self.mapped_staging(UNIFORM_PREFIX) {
             lock(&self.inner.uploads).in_flight += staging.size();
             encoder.copy_buffer_to_buffer(&staging, 0, chunk, 0, UNIFORM_PREFIX);
             *prefix = Some(Prefix { staging, epoch });
         }
-        encoder
     }
 
     /// Records zeroing the first `bytes` bytes of `buffer`.
@@ -1241,8 +1248,7 @@ impl Context {
     fn encoder<'a>(&self, batch: &'a mut Batch) -> &'a mut wgpu::CommandEncoder {
         batch.pass = None;
         batch.bound = Bound::default();
-        let Batch { encoder, prefix, arena, .. } = batch;
-        encoder.get_or_insert_with(|| self.new_encoder(prefix, &arena.current.buffer, arena.epoch))
+        batch.encoder.get_or_insert_with(|| self.new_encoder())
     }
 
     /// Copies the first `bytes` bytes of `buffer` into a new vector, see [`Context::read_into`].
@@ -1329,9 +1335,11 @@ impl Context {
             }
         }
 
+        let mut longest = Duration::ZERO;
         let mut staged_iter = staged.into_iter().zip(maps);
         while let Some(((offset, size, staging), (submission, mapped))) = staged_iter.next() {
-            let step = self.wait_map(submission, &mapped).and_then(|()| {
+            let step = self.wait_map(submission, &mapped).and_then(|waited| {
+                longest = longest.max(waited);
                 let view = staging.slice(..size).get_mapped_range().map_err(LumaError::MapRange)?;
                 copy_parallel(&view, &mut dst[offset as usize..(offset + size) as usize]);
                 Ok(())
@@ -1345,22 +1353,53 @@ impl Context {
             }
             self.recycle(staging);
         }
+        self.inner.waits.record(longest);
         Ok(())
+    }
+
+    /// Reads the first `bytes` bytes of `buffer` like [`Context::read`], but through one staging
+    /// buffer of at most [`READ_CHUNK`] bytes and without noting the waits in [`WaitHistory`].
+    /// For readbacks made while the device is full.
+    pub(crate) fn read_spill(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<u8>> {
+        self.read_vec(bytes, |dst| {
+            let chunk = READ_CHUNK.min(bytes).max(1);
+            let staging = self.alloc_buffer(chunk, STAGING_USAGE)?;
+            for offset in (0..bytes).step_by(chunk as usize) {
+                let size = chunk.min(bytes - offset);
+                let submission = {
+                    let mut guard = self.batch()?;
+                    self.encoder(&mut guard).copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
+                    self.flush_locked(&mut guard)
+                };
+                let mapped = map_for_read(staging.slice(..size));
+                let step = self.wait_map(submission, &mapped).and_then(|_| {
+                    let view = staging.slice(..size).get_mapped_range().map_err(LumaError::MapRange)?;
+                    copy_parallel(&view, &mut dst[offset as usize..(offset + size) as usize]);
+                    Ok(())
+                });
+                staging.unmap();
+                step?;
+            }
+            self.recycle(staging);
+            Ok(())
+        })
     }
 
     /// Waits for the GPU and returns the first `bytes` bytes of `staging`, a `MAP_READ` buffer
     /// whose contents were copied in by a submitted batch.
     fn map_read<T: Pod>(&self, staging: &Buffer, bytes: u64) -> Result<Vec<T>> {
         let slice = staging.slice(..bytes);
-        self.wait_map(None, &map_for_read(slice))?;
+        let waited = self.wait_map(None, &map_for_read(slice))?;
+        self.inner.waits.record(waited);
         let result = slice.get_mapped_range().map(|view| bytemuck::pod_collect_to_vec(&view));
         staging.unmap();
         result.map_err(LumaError::MapRange)
     }
 
     /// Waits until `submission` (the latest one if `None`) has run and the mapping `mapped`
-    /// reports on is done. Polls for it first, like [`Context::sync`].
-    fn wait_map(&self, submission: Option<wgpu::SubmissionIndex>, mapped: &MapReceiver) -> Result<()> {
+    /// reports on is done, and returns how long that took. Polls for it first, like
+    /// [`Context::sync`].
+    fn wait_map(&self, submission: Option<wgpu::SubmissionIndex>, mapped: &MapReceiver) -> Result<Duration> {
         let start = Instant::now();
         let mapped = match self.spin_for_map(mapped) {
             Some(received) => received,
@@ -1373,11 +1412,11 @@ impl Context {
                 mapped.recv()
             }
         };
-        self.inner.waits.record(start.elapsed());
+        let waited = start.elapsed();
         let mapped = mapped.map_err(|_| LumaError::Map(wgpu::BufferAsyncError))?.map_err(LumaError::Map);
         // An error the GPU raised while running the batch explains a failed map better.
         self.take_gpu_error()?;
-        mapped
+        mapped.map(|()| waited)
     }
 
     /// Polls without blocking for up to the spin budget ([`WaitHistory`]) until the mapping
@@ -1543,7 +1582,10 @@ impl Context {
         if profiled {
             *pass = None;
         }
-        let encoder = encoder.get_or_insert_with(|| self.new_encoder(prefix, uniforms, arena.epoch));
+        let encoder = encoder.get_or_insert_with(|| self.new_encoder());
+        if *dispatches == 0 && prefix.is_none() {
+            self.copy_prefix(encoder, prefix, uniforms, arena.epoch);
+        }
         let pass_slot = pass;
         let pass = pass_slot.get_or_insert_with(|| {
             *bound = Bound::default();
