@@ -555,3 +555,65 @@ fn iterate_matches_the_step_by_step_loop() {
     }
     assert_close(&got, &want, 1e-6, 1e-6);
 }
+
+// -- select with scalar branches --
+
+#[test]
+fn select_accepts_scalar_branches() {
+    let ctx = Context::new().unwrap();
+    let xs = [-2.0f32, -1.0, 0.0, 1.0, 2.0, 3.0, -4.0];
+    let x = f32s_on(&ctx, &xs);
+    let mask = x.gt(0.0);
+    let pick = |t: f32, f: f32| -> Vec<f32> { xs.iter().map(|&v| if v > 0.0 { t } else { f }).collect() };
+
+    assert_eq!(select(&mask, 1.0, 0.0).to_vec().unwrap(), pick(1.0, 0.0));
+    let want: Vec<f32> = xs.iter().map(|&v| if v > 0.0 { v } else { 0.5 }).collect();
+    assert_eq!(select(&mask, &x, 0.5).to_vec().unwrap(), want);
+    let want: Vec<f32> = xs.iter().map(|&v| if v > 0.0 { 7.0 } else { v }).collect();
+    assert_eq!(select(&mask, 7.0, &x).to_vec().unwrap(), want);
+
+    let ints = Array::from_slice_on(&ctx, &[5u32, 0, 9, 0], 4).unwrap();
+    let m = ints.gt(0u32);
+    assert_eq!(select(&m, 1u32, 0u32).to_vec().unwrap(), [1, 0, 1, 0]);
+    assert_eq!(select(&m, &ints, 3u32).to_vec().unwrap(), [5, 3, 9, 3]);
+    assert_eq!(select(&m, 8u32, &ints).to_vec().unwrap(), [8, 0, 8, 0]);
+
+    // Different scalars share one kernel and keep their own values inside a fused chain.
+    let a = select(&mask, 1.0, 0.0) * 2.0 + select(&mask, 10.0, 20.0);
+    let want: Vec<f32> = xs.iter().map(|&v| if v > 0.0 { 12.0 } else { 20.0 }).collect();
+    assert_eq!(a.to_vec().unwrap(), want);
+}
+
+#[test]
+fn select_scalar_branch_in_iterate_matches_the_loop() {
+    let ctx = Context::new().unwrap();
+    // Game of Life on a torus, with a scalar select in the step.
+    let (w, h) = (37usize, 29usize);
+    let cells: Vec<f32> = values(w * h, 70, 0.0, 1.0).iter().map(|&v| if v > 0.7 { 1.0 } else { 0.0 }).collect();
+    let u0 = Array::from_slice_on(&ctx, &cells, [w, h]).unwrap();
+    let step = |u: &Array<f32>| {
+        let mut n = u.shift([1isize, 0]);
+        for d in [[-1isize, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]] {
+            n = n + u.shift(d);
+        }
+        select(&n.eq(3.0), 1.0, &select(&n.eq(2.0), u, 0.0))
+    };
+    let got = u0.iterate(9, step).to_vec().unwrap();
+    let mut looped = Array::from_slice_on(&ctx, &cells, [w, h]).unwrap();
+    for _ in 0..9 {
+        looped = step(&looped);
+        looped.eval().unwrap();
+    }
+    assert_eq!(got, looped.to_vec().unwrap());
+}
+
+#[test]
+fn select_branch_shape_mismatch_poisons() {
+    let a = Array::from_slice(&[1.0f32, 2.0, 3.0], 3).unwrap();
+    let b = Array::from_slice(&[1.0f32, 2.0], 2).unwrap();
+    let mask = a.gt(1.0);
+    for bad in [select(&mask, &b, 0.0), select(&mask, 0.0, &b), select(&mask, &b, &a)] {
+        let err = bad.to_vec().unwrap_err();
+        assert!(matches!(err.root(), LumaError::ShapeMismatch { lhs: [3, 1, 1, 1], rhs: [2, 1, 1, 1] }), "{err}");
+    }
+}

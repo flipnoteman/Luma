@@ -633,36 +633,57 @@ macro_rules! vector_reductions {
 vector_reductions!(2, "vec2<f32>");
 vector_reductions!(4, "vec4<f32>");
 
-/// Picks `a[i]` where `mask[i] != 0` and `b[i]` elsewhere. All three arrays must have the same
-/// shape (the mask comes from the comparison methods).
+/// Picks `a[i]` where `mask[i] != 0` and `b[i]` elsewhere. Either branch is an `&Array<T>` or a
+/// single `T` applied to every element; a scalar is a uniform of the fused kernel, so no constant
+/// array is materialized or read from memory:
+///
+/// ```ignore
+/// let ones = select(&x.gt(0.0), 1.0, 0.0);
+/// let clipped = select(&x.gt(0.0), &x, 0.0);
+/// ```
+///
+/// The result takes the mask's shape and context; array branches must match both. A mismatch
+/// poisons the result with `ShapeMismatch` (reported as `lhs` = the mask's shape, `rhs` = the
+/// branch's) or `ContextMismatch`.
 #[track_caller]
-pub fn select<T: ScalarType>(mask: &Array<u32>, a: &Array<T>, b: &Array<T>) -> Array<T> {
+pub fn select<T: ScalarType>(mask: &Array<u32>, a: impl Operand<T>, b: impl Operand<T>) -> Array<T> {
     let location = Location::caller();
-    let result = run_select(mask, a, b, location);
-    Array::resolve(a.context(), a.shape(), result, "select", location)
+    let result = run_select(mask, a.rhs(), b.rhs(), location);
+    Array::resolve(mask.context(), mask.shape(), result, "select", location)
 }
 
 fn run_select<T: ScalarType>(
     mask: &Array<u32>,
-    a: &Array<T>,
-    b: &Array<T>,
+    a: Rhs<'_, T>,
+    b: Rhs<'_, T>,
     location: &'static Location<'static>,
 ) -> Outcome<Array<T>> {
-    let ctx = a.context();
-    let a_src = a.src()?;
-    let b_src = b.src()?;
+    let ctx = mask.context();
     let mask_src = mask.src()?;
-    if !ctx.same_as(b.context()) || !ctx.same_as(mask.context()) {
-        return Err(LumaError::ContextMismatch.into());
-    }
-    for other in [b.shape(), mask.shape()] {
-        if other != a.shape() {
-            return Err(LumaError::ShapeMismatch { lhs: a.shape().dims(), rhs: other.dims() }.into());
+    let branch = |rhs: Rhs<'_, T>| -> Outcome<Src> {
+        match rhs {
+            Rhs::Array(other) => {
+                let operand = other.src()?;
+                if !ctx.same_as(other.context()) {
+                    return Err(LumaError::ContextMismatch.into());
+                }
+                if mask.shape() != other.shape() {
+                    return Err(LumaError::ShapeMismatch {
+                        lhs: mask.shape().dims(),
+                        rhs: other.shape().dims(),
+                    }
+                    .into());
+                }
+                Ok(operand)
+            }
+            Rhs::Scalar(value) => Ok(Src::Scalar(Scalar::of(value)?)),
         }
-    }
+    };
+    let a_src = branch(a)?;
+    let b_src = branch(b)?;
     lazy(
         ctx,
-        a.shape(),
+        mask.shape(),
         Op::new(OpKind::Select, ElemTy::of::<T>()?),
         [mask_src, a_src, b_src],
         "select",
