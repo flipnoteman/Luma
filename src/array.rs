@@ -514,6 +514,18 @@ impl<T: GpuType> Array<T> {
         self.ctx.sync()
     }
 
+    /// Records the array's pending computation and hands the batch to the GPU, without waiting
+    /// for it: like [`Array::eval`], but the GPU runs while the host keeps recording the next
+    /// operations. Lazy arrays other than this one (and what it is computed from) stay lazy,
+    /// unlike [`Context::flush`]. Returns the array's error if it is poisoned.
+    ///
+    /// Nothing waits, so an error the GPU raises while running the batch only shows up at the
+    /// next call that waits ([`Context::sync`], [`Array::to_vec`], [`Array::eval`], reductions).
+    pub fn submit(&self) -> Result<()> {
+        self.storage().map_err(Failure::into_error)?;
+        self.ctx.submit()
+    }
+
     /// Overwrites the array's contents with `data`, which must have exactly [`Array::len`]
     /// elements. The upload is recorded in order with the operations before it and does not wait
     /// for the GPU: operations recorded earlier still see the old contents.

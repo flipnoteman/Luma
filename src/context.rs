@@ -1,7 +1,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytemuck::Pod;
 
@@ -79,6 +79,11 @@ impl FreeUploads {
     }
 }
 
+/// How long [`Context::sync`] polls for the GPU to finish before it blocks in the driver. Bounds
+/// the CPU time spent spinning on a long kernel; kernels that finish inside it are noticed
+/// without waking a blocked thread.
+const SYNC_SPIN: Duration = Duration::from_micros(100);
+
 /// Number of dispatches after which the pending batch is submitted without waiting for a sync
 /// point. Bounds how much work piles up in one command buffer.
 pub(crate) const BATCH_LIMIT: u32 = 256;
@@ -134,9 +139,11 @@ struct Chunk {
 
 /// Uniform values of the pending batch. Every value gets its own slot in a chunk that stays
 /// untouched until the batch executed, so each launch sees the value it was given even though
-/// the data is written (`Queue::write_buffer`, once per chunk when the batch is submitted) before
-/// the batch's commands run. Slots are only reused after the batch holding them was submitted; a
-/// write into a reused slot is ordered after that submission on the queue.
+/// the data is copied into the chunk (from a mapped staging buffer, once per chunk when the
+/// batch is submitted) before the batch's commands run: the copies are recorded into a command
+/// buffer of their own that goes first in the same submission. Slots are only reused after the
+/// batch holding them was submitted; the copy into a reused slot is ordered after that
+/// submission on the queue.
 #[derive(Debug)]
 struct Arena {
     /// The chunk slots are currently handed out from.
@@ -195,17 +202,46 @@ impl Arena {
         offset
     }
 
-    /// Writes the slots of every chunk to the GPU and empties the arena for the next batch,
-    /// keeping the current chunk. Must run right before the batch is submitted: the writes are
-    /// executed ahead of the submission's commands, and after everything submitted earlier.
-    fn upload(&mut self, queue: &wgpu::Queue, released: &mut Vec<Buffer>) {
+    /// Copies the slots of every chunk to the GPU and empties the arena for the next batch,
+    /// keeping the current chunk. Must run right before the batch is submitted: the returned
+    /// commands (the copies out of the staging buffers) have to be submitted ahead of the
+    /// batch's own, and so run after everything submitted earlier.
+    ///
+    /// The staging buffers are the reusable mapped ones of [`Context::upload`] (pushed to
+    /// `staged`, which the caller maps again after the submission), not `Queue::write_buffer`:
+    /// that one has wgpu create a staging buffer per call, which allocates and maps a fresh
+    /// block of host-visible memory whenever nothing else lives in it, and frees it again at
+    /// the next poll, on every submission.
+    fn upload(
+        &mut self,
+        ctx: &Context,
+        staged: &mut Vec<Buffer>,
+        released: &mut Vec<Buffer>,
+    ) -> Option<wgpu::CommandBuffer> {
+        let mut encoder: Option<wgpu::CommandEncoder> = None;
         for chunk in self.full.iter().chain(std::iter::once(&self.current)) {
-            if !chunk.data.is_empty() {
-                queue.write_buffer(&chunk.buffer, 0, &chunk.data);
+            if chunk.data.is_empty() {
+                continue;
+            }
+            match ctx.stage(&chunk.data) {
+                Some(staging) => {
+                    encoder
+                        .get_or_insert_with(|| {
+                            ctx.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("luma uniforms"),
+                            })
+                        })
+                        .copy_buffer_to_buffer(&staging, 0, &chunk.buffer, 0, chunk.data.len() as u64);
+                    staged.push(staging);
+                }
+                // No staging buffer to be had (the device is out of memory): `write_buffer`
+                // brings its own and is ordered the same way.
+                None => ctx.queue().write_buffer(&chunk.buffer, 0, &chunk.data),
             }
         }
         released.extend(self.full.drain(..).map(|chunk| chunk.buffer));
         self.current.data.clear();
+        encoder.map(wgpu::CommandEncoder::finish)
     }
 }
 
@@ -592,10 +628,31 @@ impl Context {
     /// first error the GPU raised while running luma's commands.
     pub fn sync(&self) -> Result<()> {
         self.flush()?;
-        self.device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| LumaError::Poll(Arc::new(e)))?;
+        if !self.spin_until_idle() {
+            self.device()
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| LumaError::Poll(Arc::new(e)))?;
+        }
         self.take_gpu_error()
+    }
+
+    /// Polls without blocking for up to [`SYNC_SPIN`]; `true` once the queue is empty. A thread
+    /// that notices the end of a short kernel while running returns about 20 us sooner than one
+    /// that was blocked in `poll` and has to be woken up.
+    fn spin_until_idle(&self) -> bool {
+        let deadline = Instant::now() + SYNC_SPIN;
+        loop {
+            match self.device().poll(wgpu::PollType::Poll) {
+                Ok(status) if status.is_queue_empty() => return true,
+                Ok(_) => {}
+                // The blocking wait reports it.
+                Err(_) => return false,
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     pub(crate) fn jit(&self) -> &JitState {
@@ -632,6 +689,14 @@ impl Context {
     /// ```
     pub fn flush(&self) -> Result<()> {
         self.jit().evaluate_live();
+        self.submit()
+    }
+
+    /// Submits the pending batch without waiting for it, like [`Context::flush`] but without
+    /// evaluating the lazy arrays that are still alive: only what was recorded so far goes to
+    /// the GPU. For [`Array::submit`](crate::Array::submit) and [`submit_all`](crate::submit_all),
+    /// which record exactly what they want submitted.
+    pub(crate) fn submit(&self) -> Result<()> {
         let mut batch = self.batch()?;
         self.flush_locked(&mut batch);
         Ok(())
@@ -663,7 +728,7 @@ impl Context {
         // The slots of the arena are reused by the next batch.
         batch.grid_slots.clear();
         let mut released = std::mem::take(&mut *lock(&self.inner.released));
-        batch.arena.upload(self.queue(), &mut released);
+        let uniforms = batch.arena.upload(self, &mut batch.uploads, &mut released);
         if batch.bind_groups.len > MAX_CACHED_BIND_GROUPS {
             // In-flight work keeps what it uses alive; this only drops our references.
             batch.bind_groups = BindGroupCache::default();
@@ -672,7 +737,10 @@ impl Context {
         }
         // Everything recorded that uses these buffers is in the batch submitted below.
         let unmapped = std::mem::take(&mut *lock(&self.inner.unmapped));
-        let submission = batch.encoder.take().map(|encoder| self.queue().submit(Some(encoder.finish())));
+        // The uniform copies go first: the batch's dispatches read what they write.
+        let commands = batch.encoder.take().map(|encoder| encoder.finish());
+        let submission = (uniforms.is_some() || commands.is_some())
+            .then(|| self.queue().submit(uniforms.into_iter().chain(commands)));
         for staging in batch.uploads.drain(..) {
             let free = Arc::clone(&self.inner.uploads);
             let buffer = staging.clone();
@@ -913,11 +981,7 @@ impl Context {
         class: u64,
         usage: BufferUsages,
     ) -> Result<Buffer> {
-        if let Some(buffer) = lock(pool).take(class) {
-            return Ok(buffer);
-        }
-        let _ = self.device().poll(wgpu::PollType::Poll);
-        if let Some(buffer) = lock(pool).take(class) {
+        if let Some(buffer) = self.take_idle(pool, class) {
             return Ok(buffer);
         }
         let (in_flight, cap) = {
@@ -934,6 +998,42 @@ impl Context {
             }
         }
         self.new_buffer(class, usage, true)
+    }
+
+    /// An idle mapped buffer of `class` bytes from `pool`. Polls completed submissions first,
+    /// which hands back the buffers whose `map_async` callback is due. Never submits or waits.
+    fn take_idle(&self, pool: &Mutex<FreeUploads>, class: u64) -> Option<Buffer> {
+        if let Some(buffer) = lock(pool).take(class) {
+            return Some(buffer);
+        }
+        let _ = self.device().poll(wgpu::PollType::Poll);
+        lock(pool).take(class)
+    }
+
+    /// A staging buffer holding `data` at its start, unmapped and ready to be copied out of, for
+    /// the uniform slots of [`Arena::upload`]. It counts as in flight: give it to
+    /// [`Batch::uploads`], which maps it again once the batch that copies out of it is
+    /// submitted. `None` if no staging buffer can be had (the device is out of memory).
+    ///
+    /// This runs while the batch is being submitted, with the batch locked, so unlike
+    /// [`Context::take_upload_buffer`] it must not flush or wait: it reuses an idle buffer or
+    /// creates a mapped one.
+    fn stage(&self, data: &[u8]) -> Option<Buffer> {
+        let bytes = data.len() as u64;
+        let class = pool::size_class(bytes, self.inner.max_buffer_bytes)?;
+        let staging = match self.take_idle(&self.inner.uploads, class) {
+            Some(buffer) => buffer,
+            None => self.create_buffer(class, UPLOAD_USAGE, true)?,
+        };
+        {
+            // A plain copy: the slots of one chunk are kilobytes, and `write_parallel` asks the
+            // OS for the thread count first, which costs more than copying them.
+            let mut view = staging.get_mapped_range_mut(..bytes).ok()?;
+            view.slice(..).copy_from_slice(data);
+        }
+        staging.unmap();
+        lock(&self.inner.uploads).in_flight += staging.size();
+        Some(staging)
     }
 
     /// Records zeroing the first `bytes` bytes of `buffer`.
@@ -1621,6 +1721,23 @@ mod tests {
         x += 1.0; // recorded after the flush, runs after it
         assert_eq!(ctx.pending_dispatches(), 1);
         assert_eq!(view.to_vec().unwrap(), vec![7.0; 16]);
+    }
+
+    #[test]
+    fn submit_hands_over_one_array_and_leaves_other_lazy_arrays_lazy() {
+        let ctx = Context::new().unwrap();
+        let x = Array::<f32>::full_on(&ctx, 16, 1.0).unwrap();
+        let wanted = &x + 1.0;
+        let unrelated = &x * 3.0;
+        wanted.submit().unwrap();
+        // `wanted` went to the GPU; unlike `flush`, `submit` did not evaluate the other array.
+        assert_eq!(ctx.pending_dispatches(), 0);
+        assert!(wanted.pending().is_none());
+        assert!(unrelated.pending().is_some());
+        ctx.flush().unwrap();
+        assert!(unrelated.pending().is_none());
+        assert_eq!(wanted.to_vec().unwrap(), vec![2.0; 16]);
+        assert_eq!(unrelated.to_vec().unwrap(), vec![3.0; 16]);
     }
 
     #[test]
