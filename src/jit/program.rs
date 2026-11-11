@@ -591,12 +591,26 @@ fn len_u32(len: usize) -> Result<u32, LumaError> {
 }
 
 /// Evaluates `node`: one fused kernel computing its whole expression into a new buffer.
-pub(crate) fn evaluate(node: &Arc<Node>, args: Args) -> Result<Storage, Failure> {
-    let roots = [(Arc::clone(node), args)];
-    let fused = flatten(&roots, Tail::Store)?;
-    drop(roots);
-    let mut outputs = run_store(node.context(), node.len(), fused)?;
-    outputs.pop().ok_or_else(|| Failure::New(LumaError::Gpu("fused kernel without output".into())))
+pub(crate) fn evaluate(node: &Arc<Node>, mut args: Args) -> Result<Storage, Failure> {
+    let max_inputs = node.context().jit().max_inputs;
+    loop {
+        let roots = [(Arc::clone(node), args)];
+        let fused = flatten(&roots, Tail::Store)?;
+        let [(_, returned)] = roots;
+        args = returned;
+        // Nodes inside the expression that were computed after it was measured are buffers now,
+        // so it can read more buffers than the device binds.
+        if fused.inputs.len() > max_inputs
+            && let Some(i) = (0..node.op().kind.arity()).find(|&i| matches!(args.get(i), Some(Src::Node(_))))
+        {
+            drop(fused);
+            super::evaluate_operand(&mut args, i)?;
+            continue;
+        }
+        drop(args);
+        let mut outputs = run_store(node.context(), node.len(), fused)?;
+        return outputs.pop().ok_or_else(|| Failure::New(LumaError::Gpu("fused kernel without output".into())));
+    }
 }
 
 /// Evaluates the pending ones of `nodes` (all of the same length) in one fused kernel with one

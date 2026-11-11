@@ -467,38 +467,23 @@ impl<T: ScalarType> Array<T> {
 /// arrays of the same length together: one fused kernel with an output per array (as many as
 /// the device's bindings allow), so inputs they share are read once, and an array that another
 /// one uses is computed once. `let (call, put) = ...; eval_all(&[&call, &put])?` prices both
-/// options in one pass over the market data.
+/// options in one pass over the market data. Postponed while the GPU is busy, like
+/// [`Array::eval`].
 pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
-    match record_all(arrays)? {
-        Some(ctx) => ctx.submit(),
-        None => Ok(()),
+    let Some(first) = arrays.first() else { return Ok(()) };
+    let ctx = first.context();
+    if arrays.iter().any(|array| !ctx.same_as(array.context())) {
+        return Err(LumaError::ContextMismatch);
     }
+    for array in arrays {
+        array.request()?;
+    }
+    ctx.submit_requested()
 }
 
 /// Same as [`eval_all`].
 pub fn submit_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     eval_all(arrays)
-}
-
-/// Records the pending computation of `arrays`, grouped into fused multi-output kernels by
-/// length, for [`eval_all`] and [`submit_all`]. Returns their context (`None` for no arrays).
-fn record_all<'a, T: GpuType>(arrays: &[&'a Array<T>]) -> Result<Option<&'a Context>> {
-    let Some(first) = arrays.first() else { return Ok(None) };
-    let ctx = first.context();
-    if arrays.iter().any(|array| !ctx.same_as(array.context())) {
-        return Err(LumaError::ContextMismatch);
-    }
-    let mut pending: Vec<_> = arrays.iter().filter_map(|array| array.pending().cloned()).collect();
-    while let Some(node) = pending.first() {
-        let len = node.len();
-        let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len() == len);
-        jit::evaluate_group(&same);
-        pending = rest;
-    }
-    for array in arrays {
-        array.storage().map_err(Failure::into_error)?;
-    }
-    Ok(Some(ctx))
 }
 
 /// A reduction for [`Array::reduce`].

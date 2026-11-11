@@ -19,6 +19,10 @@ All notable changes to Luma are listed here. The format follows
   error raised by the batch shows up at the next waiting call. `submit` and `submit_all` are now
   the same as `eval` and `eval_all`. A loop that evaluates every step no longer pays a full round
   trip per step (about 35 µs on NVIDIA/Vulkan on Linux).
+- `eval` and `eval_all` postpone the computation while the GPU is busy, until an `eval` finds it
+  idle or something waits. Requested arrays dropped in the meantime are never computed, and the
+  steps in between fuse. Mandelbrot evaluated every iteration (1024², 256 iterations): 25.6 to
+  4.8 ms on an RTX 3080 Laptop, against 25.1 ms for ArrayFire CUDA.
 - Work evaluated at the fusion limit is handed to the GPU right away, so a long chain built
   without `eval` runs while the host records the rest (mandelbrot 1024², 256 unevaluated
   iterations: 5.6 to 3.7 ms on an RTX 3080 Laptop).
@@ -37,6 +41,8 @@ All notable changes to Luma are listed here. The format follows
 
 ### Fixed
 
+- A fused expression whose operands were computed after it was built no longer exceeds the
+  device's storage-buffer binding limit; its operands are computed first instead.
 - Arrays uploaded with `from_slice` on unified-memory GPUs now count against the memory budget and
   can be spilled; before, only arrays computed on the GPU did. Newly resident data is no longer
   the first eviction candidate.

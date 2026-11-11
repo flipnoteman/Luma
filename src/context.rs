@@ -817,6 +817,7 @@ impl Context {
     /// # Ok::<(), luma::LumaError>(())
     /// ```
     pub fn flush(&self) -> Result<()> {
+        self.jit().evaluate_requested();
         self.jit().evaluate_live();
         let mut batch = self.batch()?;
         self.flush_locked(&mut batch);
@@ -845,6 +846,19 @@ impl Context {
         if batch.dispatches < SUBMIT_HOLD && self.gpu_busy() {
             return Ok(());
         }
+        self.flush_locked(&mut batch);
+        Ok(())
+    }
+
+    /// Like [`Context::submit`], but first computes what `eval` requested. While the GPU is busy
+    /// that is postponed too, so requested arrays the program drops in the meantime are never
+    /// computed and the steps between two submissions fuse.
+    pub(crate) fn submit_requested(&self) -> Result<()> {
+        if self.gpu_busy() && self.batch()?.dispatches < SUBMIT_HOLD {
+            return Ok(());
+        }
+        self.jit().evaluate_requested();
+        let mut batch = self.batch()?;
         self.flush_locked(&mut batch);
         Ok(())
     }

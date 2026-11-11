@@ -519,15 +519,26 @@ impl<T: GpuType> Array<T> {
     /// Nothing waits, so an error the GPU raises while running the batch only shows up at the
     /// next call that waits ([`Context::sync`], [`Array::to_vec`], reductions).
     ///
-    /// While the GPU is still busy with earlier work, up to 16 kernels are held back instead of
-    /// being submitted one by one (each submission costs the host and leaves a gap on the GPU).
-    /// They are handed over by the next Luma call that submits: another `eval`, a
-    /// [`Context::flush`], anything that waits, or the batch limit. A program that calls `eval`
-    /// and then does long work without touching Luma should call [`Context::flush`] to force the
-    /// hand-over.
+    /// While the GPU is still busy with earlier work, the computation is postponed to the next
+    /// `eval` that finds it idle (or anything that waits, or [`Context::flush`]). Arrays the
+    /// program drops before then are never computed, and the steps in between fuse, so a loop
+    /// that evaluates every step costs about what one evaluating every few steps does. A program
+    /// that calls `eval` and then does long work without touching Luma should call
+    /// [`Context::flush`] to start the GPU.
     pub fn eval(&self) -> Result<()> {
-        self.storage().map_err(Failure::into_error)?;
-        self.ctx.submit()
+        self.request()?;
+        self.ctx.submit_requested()
+    }
+
+    /// Asks for the array to be computed at the next submission, or returns its error.
+    pub(crate) fn request(&self) -> Result<()> {
+        match &self.repr {
+            Repr::Lazy(node) if node.is_pending() => {
+                self.ctx.jit().request(node);
+                Ok(())
+            }
+            _ => self.storage().map(|_| ()).map_err(Failure::into_error),
+        }
     }
 
     /// Same as [`Array::eval`].

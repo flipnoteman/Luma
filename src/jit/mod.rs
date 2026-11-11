@@ -75,6 +75,9 @@ use crate::kernel::{self, KernelCore, KernelKey};
 pub(crate) use program::{evaluate, evaluate_group, evaluate_into, reduce_first_pass};
 pub(crate) use stencil::plan as stencil_plan;
 
+/// Length of the requested list at which entries of dropped or computed nodes are pruned.
+const REQUESTED_PRUNE_AT: usize = 256;
+
 /// Most operations one fused kernel contains unless configured otherwise.
 pub(crate) const DEFAULT_MAX_NODES: usize = 128;
 /// Upper bound of the configurable limit (the expression is walked recursively).
@@ -790,6 +793,8 @@ pub(crate) struct JitState {
     /// Every node created and not yet known to be evaluated, oldest first, so that
     /// [`Context::sync`] can evaluate the live ones.
     live: Mutex<ReaderList>,
+    /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
+    requested: Mutex<Vec<Weak<Node>>>,
     max_nodes: AtomicUsize,
     max_inputs: usize,
     stats: Stats,
@@ -833,6 +838,7 @@ impl JitState {
             kernels: Mutex::new(FxMap::default()),
             stencils: Mutex::new(FxMap::default()),
             live: Mutex::new(ReaderList::default()),
+            requested: Mutex::new(Vec::new()),
             max_nodes: AtomicUsize::new(max_nodes),
             max_inputs,
             stats: Stats::default(),
@@ -871,6 +877,28 @@ impl JitState {
     /// before the operands it fused, which usually died with it). Arrays of the same length are
     /// computed together, as many per kernel as the bindings allow: inputs they share are read
     /// once, and one of them that another uses is computed once.
+    pub(crate) fn request(&self, node: &Arc<Node>) {
+        let mut requested = lock(&self.requested);
+        if requested.len() >= REQUESTED_PRUNE_AT {
+            requested.retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
+        }
+        requested.push(Arc::downgrade(node));
+    }
+
+    /// Computes the requested nodes that are still alive, those of one length together in
+    /// multi-output kernels.
+    pub(crate) fn evaluate_requested(&self) {
+        let requested = std::mem::take(&mut *lock(&self.requested));
+        let mut pending: Vec<Arc<Node>> =
+            requested.into_iter().filter_map(|weak| weak.upgrade()).filter(|node| node.is_pending()).collect();
+        while let Some(first) = pending.first() {
+            let len = first.len;
+            let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);
+            evaluate_group(&same);
+            pending = rest;
+        }
+    }
+
     pub(crate) fn evaluate_live(&self) {
         let nodes = {
             let mut live = lock(&self.live);
