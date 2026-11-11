@@ -23,7 +23,15 @@
 //! * An expression holds at most [`JitState::max_nodes`] operations (default
 //!   [`DEFAULT_MAX_NODES`], `LUMA_FUSION_MAX_NODES` overrides it) and as many distinct input
 //!   buffers as the device can bind. A new node that would exceed either evaluates its biggest
-//!   operand first, which splits long chains into several kernels.
+//!   operand first, which splits long chains into several kernels. The biggest operand is not
+//!   evaluated alone if other live arrays *of the same length* share pending operations with
+//!   it (they read nodes that its expression contains): those are computed in the same
+//!   multi-output kernel, as far as the limits allow. Arrays that advance in lock step (`x`, `y`,
+//!   `count` of an iteration) then split into a few multi-output kernels at the limit instead of
+//!   one single-output kernel per operand, each recomputing what the others compute. Live arrays
+//!   that share nothing stay lazy, so a single chain, or a chain beside unrelated arrays,
+//!   splits as before. Only if the expression is still too big afterwards is the next biggest
+//!   operand evaluated.
 //! * When an expression is evaluated, a pending node inside it that another pending, live
 //!   operation outside the expression also reads is evaluated on its own first, instead of
 //!   being recomputed in both kernels. Sharing within one expression is free: a shared node is
@@ -446,10 +454,35 @@ pub(crate) fn create(
 
     let max_nodes = jit.max_nodes();
     let max_inputs = jit.max_inputs;
+    // The first time the expression is over a limit, its biggest operand is evaluated together
+    // with the live arrays that share pending work with it (see the module documentation)
+    // instead of alone.
+    let mut batched = false;
     let (below, inputs) = loop {
         let (below, inputs) = measure(args.get(..arity).unwrap_or(&[]));
         if below.len() < max_nodes && inputs.len() <= max_inputs {
             break (below, inputs);
+        }
+        if !batched {
+            batched = true;
+            let seed = args
+                .iter()
+                .take(arity)
+                .filter_map(|arg| match arg {
+                    Src::Node(node) => Some(node),
+                    _ => None,
+                })
+                .max_by_key(|node| node.size())
+                .map(Arc::clone);
+            if let Some(seed) = seed {
+                jit.evaluate_alongside(seed);
+                for i in 0..arity {
+                    if matches!(args.get(i), Some(Src::Node(node)) if node.result.get().is_some()) {
+                        evaluate_operand(&mut args, i)?;
+                    }
+                }
+                continue;
+            }
         }
         let biggest = args
             .iter()
@@ -715,6 +748,48 @@ impl JitState {
             }
             program::evaluate_group(&group);
             pending = rest;
+        }
+    }
+
+    /// Evaluates `seed` (an operand of an expression that got too big) together with the live
+    /// pending arrays of its length that read nodes of its expression, newest first, as many as
+    /// one kernel takes: [`MAX_NODES_LIMIT`] operations (what [`Context::flush`] allows) and the
+    /// bindings the device allows. Computing them together evaluates what they share once.
+    fn evaluate_alongside(&self, seed: Arc<Node>) {
+        let candidates: Vec<Weak<Node>> = lock(&self.live).nodes.iter().rev().cloned().collect();
+        let mut inputs = seed.inputs.to_vec();
+        let mut below = seed.below.to_vec();
+        insert_sorted(&mut below, seed.id);
+        let mut group = vec![seed];
+        for weak in candidates {
+            // Upgraded one at a time and dropped unless taken: a strong reference keeps operands
+            // alive, and with them the buffers that a single-output kernel could overwrite.
+            let Some(node) = weak.upgrade() else { continue };
+            if node.len != group[0].len
+                || !node.is_pending()
+                || node.fused.load(Ordering::Relaxed)
+                || below.binary_search(&node.id).is_ok()
+                || !node.below.iter().any(|id| below.binary_search(id).is_ok())
+            {
+                continue;
+            }
+            let mut more_inputs = inputs.clone();
+            node.inputs.iter().for_each(|&id| insert_sorted(&mut more_inputs, id));
+            let mut more_below = below.clone();
+            node.below.iter().for_each(|&id| insert_sorted(&mut more_below, id));
+            if more_inputs.len() + group.len() < self.max_inputs + 1 && more_below.len() + group.len() < MAX_NODES_LIMIT {
+                (inputs, below) = (more_inputs, more_below);
+                insert_sorted(&mut below, node.id);
+                group.push(node);
+            }
+        }
+        match group.as_slice() {
+            // On its own, nothing but the node holds its operands, which lets its kernel
+            // overwrite a dying operand's buffer.
+            [node] => {
+                let _ = node.force();
+            }
+            _ => program::evaluate_group(&group),
         }
     }
 
