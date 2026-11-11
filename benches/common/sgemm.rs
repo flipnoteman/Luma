@@ -7,9 +7,11 @@ pub const TILE: usize = 128;
 /// 16x16 invocations 8x8 of it, from 16-wide slices of `A` and `B` staged in workgroup memory as
 /// vec4s of four rows (columns), so that one 16-byte read feeds four accumulators. An invocation
 /// owns two 4-wide groups of rows and of columns, 64 apart, so that workgroup memory reads of
-/// neighbouring invocations are contiguous; it loads the next slice into registers while the
-/// current one is consumed. Dimensions must be multiples of `TILE` (M, N) and 16 (K). The
-/// `@..@` markers are filled in by `sgemm_source`.
+/// neighbouring invocations are contiguous. The slice goes from global to workgroup memory
+/// without detour through registers (the 64 accumulators leave none to spare: holding the next
+/// slice there measured 20% slower on an M1 Max), and the loop over it is unrolled by two, which
+/// halves the loop overhead without hoisting so many reads that registers spill. Dimensions must
+/// be multiples of `TILE` (M, N) and 16 (K). The `@..@` markers are filled in by `sgemm_source`.
 const SGEMM: &str = r#"
 struct Params { m: u32, n: u32, k: u32, relu: u32 }
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -20,7 +22,7 @@ struct Params { m: u32, n: u32, k: u32, relu: u32 }
 var<workgroup> at: array<vec4<f32>, 512>;
 var<workgroup> bt: array<vec4<f32>, 512>;
 
-// Slot `e` of a slice stored k-major: k `e % 16` of rows `4 (e / 16) ..`.
+// Slot `e` of a slice stored k-major: k `e % 16`, rows `4 (e / 16) ..`.
 fn rows4(m: u32, k0: u32, e: u32) -> u32 { return (m + (e / 16u) * 4u) * p.k + k0 + e % 16u; }
 fn k_major(e: u32) -> u32 { return (e % 16u) * 32u + e / 16u; }
 fn load_a(row0: u32, k0: u32, e: u32) -> vec4<f32> {
@@ -35,27 +37,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let col0 = wid.x * 128u;
     let t = lid.y * 16u + lid.x;
     @ACC_DECL@
-    var pa0 = load_a(row0, 0u, t);
-    var pa1 = load_a(row0, 0u, t + 256u);
-    var pb0 = load_b(col0, 0u, t);
-    var pb1 = load_b(col0, 0u, t + 256u);
     for (var k0 = 0u; k0 < p.k; k0 = k0 + 16u) {
-        at[k_major(t)] = pa0;
-        at[k_major(t + 256u)] = pa1;
-        bt[b_slot(t)] = pb0;
-        bt[b_slot(t + 256u)] = pb1;
+        at[k_major(t)] = load_a(row0, k0, t);
+        at[k_major(t + 256u)] = load_a(row0, k0, t + 256u);
+        bt[b_slot(t)] = load_b(col0, k0, t);
+        bt[b_slot(t + 256u)] = load_b(col0, k0, t + 256u);
         workgroupBarrier();
-        if (k0 + 16u < p.k) {
-            pa0 = load_a(row0, k0 + 16u, t);
-            pa1 = load_a(row0, k0 + 16u, t + 256u);
-            pb0 = load_b(col0, k0 + 16u, t);
-            pb1 = load_b(col0, k0 + 16u, t + 256u);
-        }
-        for (var kk = 0u; kk < 16u; kk = kk + 1u) {
-            let a0 = at[kk * 32u + lid.y];
-            let a1 = at[kk * 32u + lid.y + 16u];
-            let b0 = bt[kk * 32u + lid.x];
-            let b1 = bt[kk * 32u + lid.x + 16u];
+        for (var kk = 0u; kk < 16u; kk = kk + 2u) {
             @ACC_UPDATE@
         }
         workgroupBarrier();
@@ -106,24 +94,42 @@ fn load_b(col0: u32, k0: u32, e: u32) -> vec4<f32> {
     let mut update = String::new();
     let mut store = String::new();
     for i in 0..8 {
-        let a_row = format!("a{}.{}", i / 4, ["x", "y", "z", "w"][i % 4]);
         for h in 0..2 {
-            let acc = format!("c{}", i * 2 + h);
-            decl += &format!("var {acc} = vec4<f32>(0.0);\n    ");
-            update += &format!("{acc} = fma(vec4<f32>({a_row}), b{h}, {acc});\n            ");
+            decl += &format!("var c{} = vec4<f32>(0.0);\n    ", i * 2 + h);
             store += &format!(
                 "{{
         let r = row0 + {} + lid.y * 4u;
         let col = col0 + {} + lid.x * 4u;
-        var v = {acc};
+        var v = c{};
         {epilogue}
         let i = r * p.n + col;
         c[i] = v.x; c[i + 1u] = v.y; c[i + 2u] = v.z; c[i + 3u] = v.w;
     }}\n    ",
                 (i / 4) * 64 + i % 4,
-                h * 64
+                h * 64,
+                i * 2 + h
             );
         }
+    }
+    // Two consecutive `k` per trip of the loop over the slice.
+    for u in 0..2 {
+        update += &format!(
+            "{{
+                let o = (kk + {u}u) * 32u;
+                let a0 = at[o + lid.y];
+                let a1 = at[o + lid.y + 16u];
+                let b0 = bt[o + lid.x];
+                let b1 = bt[o + lid.x + 16u];
+                "
+        );
+        for i in 0..8 {
+            let a_row = format!("a{}.{}", i / 4, ["x", "y", "z", "w"][i % 4]);
+            for h in 0..2 {
+                let acc = format!("c{}", i * 2 + h);
+                update += &format!("{acc} = fma(vec4<f32>({a_row}), b{h}, {acc});\n                ");
+            }
+        }
+        update += "}\n            ";
     }
     SGEMM
         .replace("@BIAS@", bias)

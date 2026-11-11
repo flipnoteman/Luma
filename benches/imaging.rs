@@ -66,14 +66,7 @@ fn test_image() -> Vec<f32> {
         .collect()
 }
 
-/// Source for the unrolled weighted sum `acc = fma(tile[base + off], weight, acc)`.
-fn taps_code(taps: impl Iterator<Item = (usize, f32)>) -> String {
-    let mut s = String::new();
-    for (off, w) in taps {
-        writeln!(s, "    acc = fma(tile[c + {off}u], {w:e}, acc);").unwrap();
-    }
-    s
-}
+const SWIZZLE: [&str; 4] = ["x", "y", "z", "w"];
 
 // -- Separable Gaussian blur --
 
@@ -89,70 +82,92 @@ fn gaussian_taps(radius: usize) -> Vec<f32> {
     w.iter().map(|v| (v / sum) as f32).collect()
 }
 
-/// One workgroup blurs 256 pixels of a row, staging them and their `radius` halo in workgroup
-/// memory.
-const GAUSS_H: &str = r#"
-@group(1) @binding(0) var<storage, read> src: array<f32>;
-@group(1) @binding(1) var<storage, read_write> dst: array<f32>;
-var<workgroup> tile: array<f32, @TILE@>;
+/// Horizontal pass: one workgroup blurs 1024 pixels of a row, 4 per invocation. The image is
+/// viewed as `vec4`s (problem size `[w / 4, h]`); the row segment plus halo is staged in workgroup
+/// memory with aligned `vec4` loads and each invocation reads its window into registers once.
+fn gauss_h_kernel(taps: &[f32]) -> Kernel {
+    let r = taps.len() / 2;
+    let pad = r.div_ceil(4);
+    let o = 4 * pad - r;
+    let nv = (o + 2 * r + 4).div_ceil(4);
+    let rv = 256 + nv - 1;
+    let mut src = format!(
+        r#"
+@group(1) @binding(0) var<storage, read> src: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> dst: array<vec4<f32>>;
+var<workgroup> tile: array<vec4<f32>, {rv}>;
 @compute @workgroup_size(256, 1)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let w = luma.size.x;
-    let x0 = i32(wid.x * 256u) - @R@;
-    let row = wid.y * w;
-    for (var i = lid.x; i < @TILE@u; i = i + 256u) {
-        tile[i] = src[row + u32(clamp(x0 + i32(i), 0, i32(w) - 1))];
-    }
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let wv = i32(luma.size.x);
+    let row = wid.y * luma.size.x;
+    let cv0 = i32(wid.x * 256u) - {pad};
+    for (var i = lid.x; i < {rv}u; i = i + 256u) {{
+        let cv = cv0 + i32(i);
+        var v: vec4<f32>;
+        if (cv < 0) {{
+            v = vec4<f32>(src[row].x);
+        }} else if (cv >= wv) {{
+            v = vec4<f32>(src[row + u32(wv) - 1u].w);
+        }} else {{
+            v = src[row + u32(cv)];
+        }}
+        tile[i] = v;
+    }}
     workgroupBarrier();
-    let c = lid.x;
-    var acc = 0.0;
-@TAPS@
-    dst[row + wid.x * 256u + c] = acc;
-}
-"#;
-
-/// One workgroup blurs a 16-column x 32-row tile; its 16x16 invocations each produce 2 rows.
-/// The tile stays under 8 KiB (for radius 32 as well): measured on this GPU, larger workgroup
-/// memory footprints cut occupancy so far that the pass gets 10-30x slower. The problem size is
-/// `[w, h / 2]` since an invocation row stands for 2 output rows.
-const GAUSS_V: &str = r#"
-@group(1) @binding(0) var<storage, read> src: array<f32>;
-@group(1) @binding(1) var<storage, read_write> dst: array<f32>;
-var<workgroup> tile: array<f32, @TILE@>;
-@compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let w = luma.size.x;
-    let h = i32(luma.size.y * 2u);
-    let x = wid.x * 16u + lid.x;
-    let y0 = i32(wid.y * 32u) - @R@;
-    for (var i = lid.y; i < @ROWS@u; i = i + 16u) {
-        tile[i * 16u + lid.x] = src[u32(clamp(y0 + i32(i), 0, h - 1)) * w + x];
+    var a0 = 0.0;
+    var a1 = 0.0;
+    var a2 = 0.0;
+    var a3 = 0.0;
+"#
+    );
+    for j in 0..nv {
+        writeln!(src, "    let q{j} = tile[lid.x + {j}u];").unwrap();
     }
-    workgroupBarrier();
-    for (var j = 0u; j < 2u; j = j + 1u) {
-        let c = (lid.y + 16u * j) * 16u + lid.x;
-        var acc = 0.0;
-@TAPS@
-        dst[(wid.y * 32u + lid.y + 16u * j) * w + x] = acc;
+    for (dx, w) in taps.iter().enumerate() {
+        for k in 0..4 {
+            let n = o + k + dx;
+            writeln!(src, "    a{k} = fma(q{}.{}, {w:e}, a{k});", n / 4, SWIZZLE[n % 4]).unwrap();
+        }
     }
+    src.push_str("    dst[row + wid.x * 256u + lid.x] = vec4<f32>(a0, a1, a2, a3);\n}\n");
+    Kernel::new(&src).unwrap()
 }
-"#;
 
 /// Rows each invocation of the vertical kernel produces.
-const V_ROWS: usize = 2;
+const V_ROWS: usize = 4;
 
-fn gauss_kernels(taps: &[f32]) -> (Kernel, Kernel) {
+/// Vertical pass: each invocation owns 4 adjacent columns (one `vec4`) and `V_ROWS` consecutive
+/// output rows, walking down the source rows once and feeding every row it touches to all the
+/// outputs it contributes to. Problem size `[w / 4, h / V_ROWS]`.
+fn gauss_v_kernel(taps: &[f32]) -> Kernel {
     let r = taps.len() / 2;
-    let h = GAUSS_H
-        .replace("@TILE@", &(256 + 2 * r).to_string())
-        .replace("@R@", &r.to_string())
-        .replace("@TAPS@", &taps_code(taps.iter().copied().enumerate()));
-    let v = GAUSS_V
-        .replace("@TILE@", &((32 + 2 * r) * 16).to_string())
-        .replace("@ROWS@", &(32 + 2 * r).to_string())
-        .replace("@R@", &r.to_string())
-        .replace("@TAPS@", &taps_code(taps.iter().copied().enumerate().map(|(k, w)| (k * 16, w))));
-    (Kernel::new(&h).unwrap(), Kernel::new(&v).unwrap())
+    let mut src = format!(
+        r#"
+@group(1) @binding(0) var<storage, read> src: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> dst: array<vec4<f32>>;
+@compute @workgroup_size(32, 2)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {{
+    let wv = luma.size.x;
+    let h = i32(luma.size.y) * {V_ROWS};
+    let y0 = i32(g.y) * {V_ROWS} - {r};
+"#
+    );
+    for j in 0..V_ROWS {
+        writeln!(src, "    var a{j} = vec4<f32>(0.0);").unwrap();
+    }
+    for t in 0..2 * r + V_ROWS {
+        writeln!(src, "    {{\n        let q = src[u32(clamp(y0 + {t}, 0, h - 1)) * wv + g.x];").unwrap();
+        for j in 0..V_ROWS {
+            let Some(k) = t.checked_sub(j).filter(|&k| k < taps.len()) else { continue };
+            writeln!(src, "        a{j} = fma(q, vec4<f32>({:e}), a{j});", taps[k]).unwrap();
+        }
+        src.push_str("    }\n");
+    }
+    for j in 0..V_ROWS {
+        writeln!(src, "    dst[(g.y * {V_ROWS}u + {j}u) * wv + g.x] = a{j};").unwrap();
+    }
+    src.push_str("}\n");
+    Kernel::new(&src).unwrap()
 }
 
 /// Horizontal pass: a row padded at both ends, taps outermost over a block of output pixels.
@@ -200,24 +215,25 @@ fn gauss_cpu(taps: &[f32], src: &[f32], tmp: &mut [f32], out: &mut [f32]) {
 
 fn gaussian(c: &mut Criterion) {
     let img = test_image();
-    let gsrc = Array::from_slice(&img, [W, H]).unwrap();
+    let quads: Vec<[f32; 4]> = img.as_chunks::<4>().0.to_vec();
+    let gsrc = Array::from_slice(&quads, [W / 4, H]).unwrap();
     let ctx = default_context().unwrap();
     let (mut tmp, mut out) = (vec![0.0f32; W * H], vec![0.0f32; W * H]);
     let mut group = c.benchmark_group("gaussian_blur_4096x4096");
     group.throughput(Throughput::Elements((W * H) as u64));
     for r in [8usize, 32] {
         let taps = gaussian_taps(r);
-        let (kh, kv) = gauss_kernels(&taps);
-        let mut gtmp = Array::<f32>::zeros([W, H]).unwrap();
-        let mut gout = Array::<f32>::zeros([W, H]).unwrap();
-        let run = |gtmp: &mut Array<f32>, gout: &mut Array<f32>| {
-            kh.launch([W as u32, H as u32], args![&gsrc, &mut *gtmp]).unwrap();
-            kv.launch([W as u32, (H / V_ROWS) as u32], args![&*gtmp, &mut *gout]).unwrap();
+        let (kh, kv) = (gauss_h_kernel(&taps), gauss_v_kernel(&taps));
+        let mut gtmp = Array::<[f32; 4]>::zeros([W / 4, H]).unwrap();
+        let mut gout = Array::<[f32; 4]>::zeros([W / 4, H]).unwrap();
+        let run = |gtmp: &mut Array<[f32; 4]>, gout: &mut Array<[f32; 4]>| {
+            kh.launch([W as u32 / 4, H as u32], args![&gsrc, &mut *gtmp]).unwrap();
+            kv.launch([W as u32 / 4, (H / V_ROWS) as u32], args![&*gtmp, &mut *gout]).unwrap();
             ctx.sync().unwrap();
         };
         run(&mut gtmp, &mut gout);
         gauss_cpu(&taps, &img, &mut tmp, &mut out);
-        check("gaussian", &gout.to_vec().unwrap(), &out, 1e-5);
+        check("gaussian", gout.to_vec().unwrap().as_flattened(), &out, 1e-5);
         group.bench_function(BenchmarkId::new("luma", format!("r{r}")), |b| b.iter(|| run(&mut gtmp, &mut gout)));
         group.bench_function(BenchmarkId::new("cpu", format!("r{r}")), |b| {
             b.iter(|| gauss_cpu(&taps, &img, &mut tmp, black_box(&mut out)))
@@ -308,16 +324,78 @@ fn conv_weights(size: usize) -> Vec<f32> {
     w.iter().map(|v| v / sum).collect()
 }
 
+/// Dense convolution where each invocation produces 4 adjacent pixels of a row, with the image
+/// viewed as `vec4`s (problem size `[w / 4, h]`). The workgroup stages a 64-wide tile (plus halo)
+/// with aligned `vec4` loads, so each lane reads consecutive `vec4`s (no bank conflicts); a
+/// window row is read into registers once and reused by all 4 outputs.
+const CONV_RP: usize = 2;
+
 fn conv_kernel(size: usize, weights: &[f32]) -> Kernel {
-    let t = 16 + size - 1;
-    let mut body = String::from("    var acc = 0.0;\n");
-    for dy in 0..size {
-        for dx in 0..size {
-            writeln!(body, "    acc = fma(tile[c + {}u], {:e}, acc);", dy * t + dx, weights[dy * size + dx]).unwrap();
+    let rp = CONV_RP;
+    let wy = 16 / rp;
+    let r = size / 2;
+    let pad = r.div_ceil(4); // halo in vec4s on the left
+    let o = 4 * pad - r; // offset of the window's first column within the staged vec4s
+    let nv = (o + size + 3).div_ceil(4);
+    let rv = 15 + nv;
+    let rows = 16 + size - 1;
+    let mut src = format!(
+        r#"
+@group(1) @binding(0) var<storage, read> src: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> dst: array<vec4<f32>>;
+var<workgroup> tile: array<vec4<f32>, {n}>;
+@compute @workgroup_size(16, {wy})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let wv = i32(luma.size.x);
+    let h = i32(luma.size.y) * {rp};
+    let cv0 = i32(wid.x * 16u) - {pad};
+    let y0 = i32(wid.y * 16u) - {r};
+    for (var i = lid.y * 16u + lid.x; i < {n}u; i = i + {nt}u) {{
+        let row = clamp(y0 + i32(i / {rv}u), 0, h - 1) * wv;
+        let cv = cv0 + i32(i % {rv}u);
+        var v: vec4<f32>;
+        if (cv < 0) {{
+            v = vec4<f32>(src[row].x);
+        }} else if (cv >= wv) {{
+            v = vec4<f32>(src[row + wv - 1].w);
+        }} else {{
+            v = src[row + cv];
+        }}
+        tile[i] = v;
+    }}
+    workgroupBarrier();
+"#,
+        n = rows * rv,
+        nt = 16 * wy,
+    );
+    for j in 0..rp {
+        for k in 0..4 {
+            writeln!(src, "    var a{j}{k} = 0.0;").unwrap();
         }
     }
-    body.push_str("    res = acc;");
-    stencil_kernel(size / 2, &body)
+    for t in 0..size + rp - 1 {
+        writeln!(src, "    {{\n        let rb = (lid.y * {rp}u + {t}u) * {rv}u + lid.x;").unwrap();
+        for j in 0..nv {
+            writeln!(src, "        let q{j} = tile[rb + {j}u];").unwrap();
+        }
+        for j in 0..rp {
+            let Some(dy) = t.checked_sub(j).filter(|&dy| dy < size) else { continue };
+            for dx in 0..size {
+                let wk = weights[dy * size + dx];
+                for k in 0..4 {
+                    let n = o + k + dx;
+                    writeln!(src, "        a{j}{k} = fma(q{}.{}, {wk:e}, a{j}{k});", n / 4, ["x", "y", "z", "w"][n % 4]).unwrap();
+                }
+            }
+        }
+        src.push_str("    }\n");
+    }
+    writeln!(src, "    let base = (wid.y * 16u + lid.y * {rp}u) * luma.size.x + wid.x * 16u + lid.x;").unwrap();
+    for j in 0..rp {
+        writeln!(src, "    dst[base + {j}u * luma.size.x] = vec4<f32>(a{j}0, a{j}1, a{j}2, a{j}3);").unwrap();
+    }
+    src.push_str("}\n");
+    Kernel::new(&src).unwrap()
 }
 
 fn conv_cpu(size: usize, weights: &[f32], src: &[f32], out: &mut [f32]) {
@@ -338,7 +416,8 @@ fn conv_cpu(size: usize, weights: &[f32], src: &[f32], out: &mut [f32]) {
 
 fn conv(c: &mut Criterion) {
     let img = test_image();
-    let gsrc = Array::from_slice(&img, [W, H]).unwrap();
+    let quads: Vec<[f32; 4]> = img.as_chunks::<4>().0.to_vec();
+    let gsrc = Array::from_slice(&quads, [W / 4, H]).unwrap();
     let ctx = default_context().unwrap();
     let mut out = vec![0.0f32; W * H];
     let mut group = c.benchmark_group("conv2d_dense_4096x4096");
@@ -346,14 +425,14 @@ fn conv(c: &mut Criterion) {
     for size in [5usize, 9] {
         let weights = conv_weights(size);
         let kernel = conv_kernel(size, &weights);
-        let mut gout = Array::<f32>::zeros([W, H]).unwrap();
-        let run = |gout: &mut Array<f32>| {
-            kernel.launch([W as u32, H as u32], args![&gsrc, &mut *gout]).unwrap();
+        let mut gout = Array::<[f32; 4]>::zeros([W / 4, H]).unwrap();
+        let run = |gout: &mut Array<[f32; 4]>| {
+            kernel.launch([W as u32 / 4, (H / CONV_RP) as u32], args![&gsrc, &mut *gout]).unwrap();
             ctx.sync().unwrap();
         };
         run(&mut gout);
         conv_cpu(size, &weights, &img, &mut out);
-        check("conv2d", &gout.to_vec().unwrap(), &out, 1e-5);
+        check("conv2d", gout.to_vec().unwrap().as_flattened(), &out, 1e-5);
         group.bench_function(BenchmarkId::new("luma", format!("{size}x{size}")), |b| b.iter(|| run(&mut gout)));
         group.bench_function(BenchmarkId::new("cpu", format!("{size}x{size}")), |b| {
             b.iter(|| conv_cpu(size, &weights, &img, black_box(&mut out)))
@@ -609,7 +688,30 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     atomicStore(&bins[lid.x], 0u);
     workgroupBarrier();
     let stride = nwg.x * 256u;
-    for (var i = wid.x * 256u + lid.x; i < p.n4; i = i + stride) {
+    var i = wid.x * 256u + lid.x;
+    for (; i + 3u * stride < p.n4; i = i + 4u * stride) {
+        let a = src[i] & vec4<u32>(255u);
+        let b = src[i + stride] & vec4<u32>(255u);
+        let c = src[i + 2u * stride] & vec4<u32>(255u);
+        let d = src[i + 3u * stride] & vec4<u32>(255u);
+        atomicAdd(&bins[a.x], 1u);
+        atomicAdd(&bins[b.x], 1u);
+        atomicAdd(&bins[c.x], 1u);
+        atomicAdd(&bins[d.x], 1u);
+        atomicAdd(&bins[a.y], 1u);
+        atomicAdd(&bins[b.y], 1u);
+        atomicAdd(&bins[c.y], 1u);
+        atomicAdd(&bins[d.y], 1u);
+        atomicAdd(&bins[a.z], 1u);
+        atomicAdd(&bins[b.z], 1u);
+        atomicAdd(&bins[c.z], 1u);
+        atomicAdd(&bins[d.z], 1u);
+        atomicAdd(&bins[a.w], 1u);
+        atomicAdd(&bins[b.w], 1u);
+        atomicAdd(&bins[c.w], 1u);
+        atomicAdd(&bins[d.w], 1u);
+    }
+    for (; i < p.n4; i = i + stride) {
         let v = src[i] & vec4<u32>(255u);
         atomicAdd(&bins[v.x], 1u);
         atomicAdd(&bins[v.y], 1u);
@@ -617,7 +719,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         atomicAdd(&bins[v.w], 1u);
     }
     workgroupBarrier();
-    atomicAdd(&hist[lid.x], atomicLoad(&bins[lid.x]));
+    let s = atomicLoad(&bins[lid.x]);
+    atomicAdd(&hist[lid.x], s);
 }
 "#;
 
