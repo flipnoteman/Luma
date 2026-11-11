@@ -76,9 +76,13 @@ fn check(name: &str, err: f32, tol: f32) {
     assert!(err <= tol, "{name}: error {err:e} exceeds tolerance {tol:e}");
 }
 
-fn report(row: Row, f: impl FnMut()) {
+fn report(row: Row, mut f: impl FnMut()) {
     eprintln!("  {} {} {}: err {:e}", row.workload, row.size, row.variant, row.err);
-    let t = time(f);
+    let ctx = default_context().unwrap();
+    let t = time(|| {
+        f();
+        ctx.sync().unwrap();
+    });
     print_row(&row, &t);
 }
 
@@ -178,7 +182,7 @@ fn mandelbrot(sz: &Sizes) {
         let (cx, cy) = mandel_c(w, w);
         let (cx, cy) = (Array::from_slice(&cx, [w, w]).unwrap(), Array::from_slice(&cy, [w, w]).unwrap());
         let zero = Array::<f32>::full([w, w], 0.0).unwrap();
-        let run = |every: usize, wait: bool| -> Array<f32> {
+        let run = |every: usize| -> Array<f32> {
             let (mut zx, mut zy, mut cnt) = (&zero * 1.0, &zero * 1.0, &zero * 1.0);
             for i in 1..=iters {
                 let inside = (&zx * &zx + &zy * &zy).le(4.0);
@@ -188,11 +192,7 @@ fn mandelbrot(sz: &Sizes) {
                 zy = select(&inside, &nzy, &zy);
                 cnt = &cnt + select(&inside, 1.0, 0.0);
                 if every > 0 && i % every == 0 {
-                    if wait {
-                        eval_all(&[&zx, &zy, &cnt]).unwrap();
-                    } else {
-                        submit_all(&[&zx, &zy, &cnt]).unwrap();
-                    }
+                    eval_all(&[&zx, &zy, &cnt]).unwrap();
                 }
             }
             eval_all(&[&zx, &zy, &cnt]).unwrap();
@@ -208,17 +208,11 @@ fn mandelbrot(sz: &Sizes) {
             unit: "Gpix-iter/s",
             err,
         };
-        for (variant, every, wait) in [
-            ("eval_every_1", 1usize, true),
-            ("eval_every_8", 8, true),
-            ("submit_every_1", 1, false),
-            ("submit_every_8", 8, false),
-            ("eval_end_only", 0, true),
-        ] {
-            let err = mismatch_frac(&run(every, wait).to_vec().unwrap(), &want);
+        for (variant, every) in [("eval_every_1", 1usize), ("eval_every_8", 8), ("eval_end_only", 0)] {
+            let err = mismatch_frac(&run(every).to_vec().unwrap(), &want);
             check(&format!("mandelbrot {w} {variant}"), err, 0.01);
             report(row(variant, err), || {
-                run(every, wait);
+                run(every);
             });
         }
 

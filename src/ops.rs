@@ -463,38 +463,21 @@ impl<T: ScalarType> Array<T> {
     }
 }
 
-/// Evaluates several arrays and waits for them, like [`Array::eval`] on each, but computes lazy
+/// Evaluates several arrays without waiting, like [`Array::eval`] on each, but computes lazy
 /// arrays of the same length together: one fused kernel with an output per array (as many as
 /// the device's bindings allow), so inputs they share are read once, and an array that another
 /// one uses is computed once. `let (call, put) = ...; eval_all(&[&call, &put])?` prices both
 /// options in one pass over the market data.
 pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     match record_all(arrays)? {
-        Some(ctx) => ctx.sync(),
+        Some(ctx) => ctx.submit(),
         None => Ok(()),
     }
 }
 
-/// Like [`eval_all`], but does not wait: the lazy arrays are computed together the same way and
-/// the batch is handed to the GPU, which runs while the host keeps recording. Other lazy arrays
-/// stay lazy, unlike [`Context::flush`](crate::Context::flush). A loop of steps can end each
-/// with `submit_all` and read the result back once at the end.
-///
-/// Nothing waits, so an error the GPU raises while running the batch only shows up at the next
-/// call that waits ([`Context::sync`](crate::Context::sync), [`Array::to_vec`], [`eval_all`],
-/// reductions). A poisoned array returns its own error here.
-///
-/// While the GPU is still busy with earlier work, up to 16 kernels are held back instead of
-/// being submitted one by one (each submission costs the host and leaves a gap on the GPU).
-/// They are handed over by the next Luma call that submits: another `submit_all` or
-/// [`Array::submit`], a [`Context::flush`](crate::Context::flush), anything that waits, or the
-/// batch limit. A program that calls `submit_all` and then does long work without touching Luma
-/// should call [`Context::flush`](crate::Context::flush) to force the hand-over.
+/// Same as [`eval_all`].
 pub fn submit_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
-    match record_all(arrays)? {
-        Some(ctx) => ctx.submit(),
-        None => Ok(()),
-    }
+    eval_all(arrays)
 }
 
 /// Records the pending computation of `arrays`, grouped into fused multi-output kernels by

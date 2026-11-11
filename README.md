@@ -34,7 +34,7 @@ I/O dependant, operations.
 - Reductions: sum, min, max, mean, norm
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
-- Non-blocking evaluation with `submit` / `submit_all`: the GPU runs while the host records the next steps
+- Non-blocking `eval` / `eval_all`: the GPU runs while the host records the next steps; reads and `sync` wait
 - Readback into a new `Vec` (`to_vec`) or into host memory you already own (`read_into`)
 - Multi-step stencils with `iterate`
 - Ability to use custom WGSL kernels

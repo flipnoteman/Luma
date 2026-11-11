@@ -510,30 +510,29 @@ impl<T: GpuType> Array<T> {
         self.ctx.read_storage_into(storage, dst)
     }
 
-    /// Records the array's pending computation, submits the batch and waits until the GPU has
-    /// executed it, without copying anything back. Returns the array's error if it is poisoned.
-    pub fn eval(&self) -> Result<()> {
-        self.storage().map_err(Failure::into_error)?;
-        self.ctx.sync()
-    }
-
-    /// Records the array's pending computation and hands the batch to the GPU, without waiting
-    /// for it: like [`Array::eval`], but the GPU runs while the host keeps recording the next
-    /// operations. Lazy arrays other than this one (and what it is computed from) stay lazy,
-    /// unlike [`Context::flush`]. Returns the array's error if it is poisoned.
+    /// Records the array's pending computation and hands the batch to the GPU without waiting
+    /// for it, like ArrayFire's `eval`: the GPU runs while the host records the next steps.
+    /// [`Context::sync`], [`Array::to_vec`] and reductions wait. Lazy arrays other than this one
+    /// (and what it is computed from) stay lazy, unlike [`Context::flush`]. Returns the array's
+    /// error if it is poisoned.
     ///
     /// Nothing waits, so an error the GPU raises while running the batch only shows up at the
-    /// next call that waits ([`Context::sync`], [`Array::to_vec`], [`Array::eval`], reductions).
+    /// next call that waits ([`Context::sync`], [`Array::to_vec`], reductions).
     ///
     /// While the GPU is still busy with earlier work, up to 16 kernels are held back instead of
     /// being submitted one by one (each submission costs the host and leaves a gap on the GPU).
-    /// They are handed over by the next Luma call that submits: another `submit`, a
-    /// [`Context::flush`], anything that waits, or the batch limit. A program that calls `submit`
+    /// They are handed over by the next Luma call that submits: another `eval`, a
+    /// [`Context::flush`], anything that waits, or the batch limit. A program that calls `eval`
     /// and then does long work without touching Luma should call [`Context::flush`] to force the
     /// hand-over.
-    pub fn submit(&self) -> Result<()> {
+    pub fn eval(&self) -> Result<()> {
         self.storage().map_err(Failure::into_error)?;
         self.ctx.submit()
+    }
+
+    /// Same as [`Array::eval`].
+    pub fn submit(&self) -> Result<()> {
+        self.eval()
     }
 
     /// Overwrites the array's contents with `data`, which must have exactly [`Array::len`]

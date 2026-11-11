@@ -21,14 +21,7 @@ def pairs(workload, variants):
     """(luma variant, arrayfire variant) pairs that do the same work."""
     out = []
     for v in variants:
-        if workload == "mandelbrot":
-            if v.startswith("submit_every_"):
-                out.append((v, "eval_every_" + v[len("submit_every_"):]))
-            elif v.startswith("eval_every_"):
-                out.append((v, v))
-            elif v == "eval_end_only":
-                out.append((v, v))
-        else:
+        if v not in EXCLUDED:
             out.append((v, v))
     return out
 

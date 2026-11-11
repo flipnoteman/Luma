@@ -14,6 +14,11 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- **Breaking:** `Array::eval` and `eval_all` no longer wait for the GPU, like ArrayFire's `eval`:
+  they record and hand the batch over, and `Context::sync`, readbacks and reductions wait. A GPU
+  error raised by the batch shows up at the next waiting call. `submit` and `submit_all` are now
+  the same as `eval` and `eval_all`. A loop that evaluates every step no longer pays a full round
+  trip per step (about 35 µs on NVIDIA/Vulkan on Linux).
 - At the fusion limit, live arrays that share pending work with the biggest operand are evaluated
   together in multi-output kernels, instead of that operand alone.
 - `Array::submit` and `submit_all` hold back up to 16 kernels while the GPU is still busy and hand

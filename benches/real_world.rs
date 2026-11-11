@@ -13,6 +13,12 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use luma::*;
 
+/// Evaluates `a` and waits for the GPU, so a timed closure includes device completion.
+fn finish(a: &Array<f32>) {
+    a.eval().unwrap();
+    a.context().sync().unwrap();
+}
+
 fn threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
@@ -137,7 +143,7 @@ fn black_scholes(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("black_scholes_16M_options");
     group.throughput(Throughput::Elements(n as u64));
-    group.bench_function("luma", |b| b.iter(|| black_scholes_luma(&gs, &gk, &gt).eval().unwrap()));
+    group.bench_function("luma", |b| b.iter(|| finish(&black_scholes_luma(&gs, &gk, &gt))));
     group.bench_function("luma_with_transfers", |b| {
         b.iter(|| {
             let up = |v: &[f32]| Array::from_slice(v, n).unwrap();
@@ -158,14 +164,15 @@ fn black_scholes(c: &mut Criterion) {
     group.bench_function("luma_eval_all", |b| {
         b.iter(|| {
             let (call, put) = call_put_luma(&gs, &gk, &gt);
-            eval_all(&[&call, &put]).unwrap()
+            eval_all(&[&call, &put]).unwrap();
+            call.context().sync().unwrap()
         })
     });
     group.bench_function("luma_one_by_one", |b| {
         b.iter(|| {
             let (call, put) = call_put_luma(&gs, &gk, &gt);
             call.eval().unwrap();
-            put.eval().unwrap()
+            finish(&put)
         })
     });
     group.bench_function("cpu", |b| b.iter(|| call_put_cpu(&s, &k, &t, black_box(&mut call), black_box(&mut put))));
@@ -562,10 +569,10 @@ fn heat(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements((w * w * steps) as u64));
         group.bench_function(BenchmarkId::new("luma_iterate", w), |bch| {
-            bch.iter(|| gu.iterate(steps, heat_step).eval().unwrap())
+            bch.iter(|| finish(&gu.iterate(steps, heat_step)))
         });
         group.bench_function(BenchmarkId::new("luma_per_step", w), |bch| {
-            bch.iter(|| heat_luma_per_step(&gu, steps).eval().unwrap())
+            bch.iter(|| finish(&heat_luma_per_step(&gu, steps)))
         });
         group.bench_function(BenchmarkId::new("cpu", w), |bch| bch.iter(|| heat_cpu(w, &u0, steps, &mut a, &mut b)));
     }
@@ -636,7 +643,7 @@ fn fir(c: &mut Criterion) {
         let mut out = vec![0.0; n + taps - 1];
         fir_cpu(&x, &h, block, &mut out);
         check("fir", &gx.conv1d_fft(&gh).to_vec().unwrap(), &out, 1e-4);
-        group.bench_function(BenchmarkId::new("luma", taps), |b| b.iter(|| gx.conv1d_fft(&gh).eval().unwrap()));
+        group.bench_function(BenchmarkId::new("luma", taps), |b| b.iter(|| finish(&gx.conv1d_fft(&gh))));
         group.bench_function(BenchmarkId::new("luma_with_transfers", taps), |b| {
             b.iter(|| black_box(Array::from_slice(&x, n).unwrap().conv1d_fft(&gh).to_vec().unwrap()))
         });

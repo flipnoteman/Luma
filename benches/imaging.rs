@@ -666,6 +666,7 @@ fn color(c: &mut Criterion) {
             for plane in color_luma(&planes) {
                 plane.eval().unwrap();
             }
+            default_context().unwrap().sync().unwrap()
         })
     });
     group.bench_function("cpu", |b| b.iter(|| color_cpu(&rgba, black_box(&mut out))));

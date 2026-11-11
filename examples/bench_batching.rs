@@ -10,6 +10,7 @@ fn sync_each(x: &Array<f32>, ops: usize) -> Result<f32> {
     for i in 0..ops {
         y += (i % 3) as f32 * 0.001 + 0.5;
         y.eval()?;
+        y.context().sync()?;
     }
     y.sum()
 }
