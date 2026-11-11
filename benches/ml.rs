@@ -39,7 +39,7 @@ fn check(name: &str, got: &[f32], want: &[f32], tolerance: f32) {
 
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     #[allow(clippy::too_many_arguments)]
     fn cblas_sgemm(
         order: i32,
@@ -97,6 +97,53 @@ fn sgemm_par_cpu(b_transposed: bool, n: usize, k: usize, a: &[f32], b: &[f32], c
         let m = rows.len() / n;
         sgemm_cpu(b_transposed, m, n, k, &a[first * k..][..m * k], b, rows);
     });
+}
+
+/// Runs `f(first_row, rows)` over contiguous runs of `row_len`-element rows of `out`, one run
+/// per thread.
+#[cfg(target_os = "macos")]
+fn par_rows<T: Send>(out: &mut [T], row_len: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    let rows = out.len() / row_len;
+    let per = rows.div_ceil(threads()).max(1);
+    std::thread::scope(|s| {
+        for (i, chunk) in out.chunks_mut(per * row_len).enumerate() {
+            let f = &f;
+            s.spawn(move || f(i * per, chunk));
+        }
+    });
+}
+
+/// `h = max(h + bias, 0)`, `bias` one per column of the row-major `h`.
+#[cfg(target_os = "macos")]
+fn bias_relu_cpu(h: &mut [f32], bias: &[f32]) {
+    par_rows(h, bias.len(), |_, rows| {
+        for row in rows.chunks_exact_mut(bias.len()) {
+            for (v, b) in row.iter_mut().zip(bias) {
+                *v = (*v + b).max(0.0);
+            }
+        }
+    });
+}
+
+/// Row-wise `probs = softmax(logits + bias)`, `bias` one per column.
+#[cfg(target_os = "macos")]
+fn softmax_cpu(logits: &[f32], bias: &[f32], probs: &mut [f32]) {
+    let cols = bias.len();
+    for (src, dst) in logits.chunks_exact(cols).zip(probs.chunks_exact_mut(cols)) {
+        let mut max = f32::NEG_INFINITY;
+        for ((d, l), b) in dst.iter_mut().zip(src).zip(bias) {
+            *d = l + b;
+            max = max.max(*d);
+        }
+        let mut sum = 0.0;
+        for d in dst.iter_mut() {
+            *d = (*d - max).exp();
+            sum += *d;
+        }
+        for d in dst.iter_mut() {
+            *d /= sum;
+        }
+    }
 }
 
 // -- Tiled SGEMM shared by the MLP and the similarity matrix --

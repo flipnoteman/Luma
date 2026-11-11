@@ -424,7 +424,7 @@ use sgemm::{sgemm_source, CoopKind, SgemmParams, TILE};
 
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     #[allow(clippy::too_many_arguments)]
     fn cblas_sgemm(
         order: i32,

@@ -1,5 +1,4 @@
-<!-- TODO: logo / banner -->
-<!-- <p align="center"><img src="assets/banner.png" alt="Luma" width="600"></p> -->
+<p align="center"><img src="assets/banner.png" alt="Luma" width="600"></p>
 
 # Luma
 
