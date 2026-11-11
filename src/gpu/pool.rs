@@ -5,10 +5,6 @@ use wgpu::{Buffer, BufferUsages};
 /// Smallest buffer the pool hands out. Also the size class of every dims/params buffer.
 const MIN_BUFFER_SIZE: u64 = 16;
 
-/// Upper bound on the bytes the pool keeps alive in idle buffers. Past it the least recently
-/// returned buffers are released, so the pool keeps what a loop is reusing right now.
-const MAX_POOLED_BYTES: u64 = 1 << 30;
-
 /// Size class for a buffer holding `bytes` bytes: the next power of two (at least
 /// [`MIN_BUFFER_SIZE`]), clamped to `max_size`. `None` if `bytes` itself exceeds `max_size`.
 ///
@@ -25,15 +21,24 @@ pub(crate) fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
 }
 
 /// Free lists of idle buffers keyed by (size class, usage flags), each oldest first.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BufferPool {
     free: HashMap<(u64, BufferUsages), VecDeque<(u64, Buffer)>>,
     pooled_bytes: u64,
     /// Stamps buffers in the order they were returned.
     clock: u64,
+    /// Upper bound on the bytes kept alive in idle buffers. Past it the least recently returned
+    /// buffers are released, so the pool keeps what a loop is reusing right now. Scales with the
+    /// context's memory budget, so idle buffers cannot crowd out array data.
+    cap: u64,
 }
 
 impl BufferPool {
+    /// An empty pool that keeps at most `cap` bytes of idle buffers.
+    pub(crate) fn new(cap: u64) -> Self {
+        BufferPool { free: HashMap::new(), pooled_bytes: 0, clock: 0, cap }
+    }
+
     /// Takes the most recently returned idle buffer of exactly `class` bytes with exactly
     /// `usage`, if one exists.
     pub(crate) fn take(&mut self, class: u64, usage: BufferUsages) -> Option<Buffer> {
@@ -43,7 +48,7 @@ impl BufferPool {
     }
 
     /// Returns a buffer to the pool and releases the least recently returned ones while the
-    /// pool holds more than [`MAX_POOLED_BYTES`]; those are returned. A buffer larger than the
+    /// pool holds more than its cap; those are returned. A buffer larger than the
     /// limit is still kept as long as nothing else is pooled. The buffer must not be mapped.
     /// Its contents are left as they are: whoever takes it next must overwrite what it reads.
     pub(crate) fn put(&mut self, buffer: Buffer) -> Vec<Buffer> {
@@ -52,7 +57,7 @@ impl BufferPool {
         self.pooled_bytes += class;
         self.free.entry((class, buffer.usage())).or_default().push_back((self.clock, buffer));
         let mut released = Vec::new();
-        while self.pooled_bytes > MAX_POOLED_BYTES {
+        while self.pooled_bytes > self.cap {
             let oldest = self
                 .free
                 .iter()

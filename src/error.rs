@@ -11,21 +11,44 @@ pub type Result<T, E = LumaError> = std::result::Result<T, E>;
 /// Errors are [`Clone`] because a poisoned [`Array`](crate::Array) hands its error out every time
 /// it is asked for it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum LumaError {
     /// No suitable GPU adapter was found.
     NoAdapter(wgpu::RequestAdapterError),
+    /// The requested kind of device is not available.
+    NoDevice(&'static str),
+    /// The operation cannot run over an array that is split into several buffers.
+    Chunked(&'static str),
     /// The adapter refused to create a device.
     RequestDevice(wgpu::RequestDeviceError),
     /// The operands of a binary operation have different shapes.
-    ShapeMismatch { lhs: [usize; 4], rhs: [usize; 4] },
+    ShapeMismatch {
+        /// Shape of the left operand.
+        lhs: [usize; 4],
+        /// Shape of the right operand.
+        rhs: [usize; 4],
+    },
     /// The number of host elements does not match the number of elements of the array.
-    LengthMismatch { expected: usize, actual: usize },
+    LengthMismatch {
+        /// Number of elements the array holds.
+        expected: usize,
+        /// Number of elements that were supplied.
+        actual: usize,
+    },
     /// A shape or operation argument is invalid (zero-sized dimension, kernel too large, ...).
     InvalidShape(String),
     /// A dimension or the total element count does not fit in `u32`, which the GPU kernels use.
-    DimensionTooLarge { shape: [usize; 4] },
+    DimensionTooLarge {
+        /// The offending shape.
+        shape: [usize; 4],
+    },
     /// A GPU buffer of this size exceeds the device's buffer or storage-binding limit.
-    BufferTooLarge { requested: u64, max: u64 },
+    BufferTooLarge {
+        /// Size of the requested buffer in bytes.
+        requested: u64,
+        /// The device's limit in bytes.
+        max: u64,
+    },
     /// A custom kernel's WGSL failed to parse or validate; holds naga's rendered message.
     ShaderCompile(String),
     /// A custom kernel declares resources luma cannot bind (group 0, groups above 1, gaps in the
@@ -36,27 +59,74 @@ pub enum LumaError {
     /// The workgroup size is invalid for the device or disagrees with the shader.
     KernelWorkgroup(String),
     /// A kernel was dispatched with the wrong number of arguments.
-    KernelArgCount { expected: usize, actual: usize },
+    KernelArgCount {
+        /// Number of bindings the kernel declares.
+        expected: usize,
+        /// Number of arguments that were passed.
+        actual: usize,
+    },
     /// Argument `index` is a storage buffer where a uniform is expected or vice versa.
-    KernelArgKind { index: usize, expected: crate::BindingKind, actual: crate::BindingKind },
+    KernelArgKind {
+        /// Index of the offending argument.
+        index: usize,
+        /// The kind of binding the shader declares.
+        expected: crate::BindingKind,
+        /// The kind of value that was passed.
+        actual: crate::BindingKind,
+    },
     /// A shared `&Array` was passed to a `read_write` storage binding; pass `&mut Array`.
-    KernelArgAccess { index: usize },
+    KernelArgAccess {
+        /// Index of the offending argument.
+        index: usize,
+    },
     /// The array's element size differs from the stride of the shader's `array<T>`.
-    KernelArgElementSize { index: usize, expected: u32, actual: u32 },
+    KernelArgElementSize {
+        /// Index of the offending argument.
+        index: usize,
+        /// Byte stride of the shader's array element type.
+        expected: u32,
+        /// Byte size of the array's elements.
+        actual: u32,
+    },
     /// The uniform value could not be serialized with encase.
-    KernelArgUniform { index: usize, message: String },
+    KernelArgUniform {
+        /// Index of the offending argument.
+        index: usize,
+        /// The encoder's error message.
+        message: String,
+    },
     /// The uniform value is smaller than the shader's uniform type.
-    KernelArgUniformSize { index: usize, expected: u64, actual: u64 },
+    KernelArgUniformSize {
+        /// Index of the offending argument.
+        index: usize,
+        /// Byte size of the shader's uniform type.
+        expected: u64,
+        /// Byte size of the value that was passed.
+        actual: u64,
+    },
     /// One buffer is bound twice to a launch and at least one of the bindings is writable. This
     /// happens when arrays that share a buffer (see [`Array::reshape`](crate::Array::reshape))
-    /// are passed together, or an in-place operation is given a view of its own array.
-    KernelArgAlias { first: usize, second: usize },
+    /// are passed together to a custom kernel.
+    KernelArgAlias {
+        /// Index of the first argument bound to the shared buffer.
+        first: usize,
+        /// Index of the second argument bound to the shared buffer.
+        second: usize,
+    },
     /// A launch needs more workgroups in a dimension than the device supports.
-    KernelGridTooLarge { workgroups: [u32; 3], max: u32 },
+    KernelGridTooLarge {
+        /// The workgroup counts the launch needs per dimension.
+        workgroups: [u32; 3],
+        /// The device's limit of workgroups per dimension.
+        max: u32,
+    },
     /// The arrays involved were created by different [`Context`](crate::Context)s.
     ContextMismatch,
     /// A buffer allocation of this many bytes failed because the device is out of memory.
-    OutOfMemory { requested: u64 },
+    OutOfMemory {
+        /// Size of the failed allocation in bytes.
+        requested: u64,
+    },
     /// The GPU reported an error (validation, internal, ...) while running luma's commands.
     /// It is reported at the next synchronization point.
     Gpu(String),
@@ -68,8 +138,11 @@ pub enum LumaError {
     /// records which operation failed and where in the user's code it was called.
     /// [`LumaError::root`] gives the underlying error.
     Op {
+        /// Name of the operation that failed (the operator or method).
         op: &'static str,
+        /// Where in the user's code the operation was called.
         location: &'static Location<'static>,
+        /// The error that made the operation fail.
         source: Arc<LumaError>,
     },
     /// Waiting for the GPU to finish failed.
@@ -84,6 +157,8 @@ impl fmt::Display for LumaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LumaError::NoAdapter(e) => write!(f, "Found no adapters: {e}"),
+            LumaError::NoDevice(e) => write!(f, "No suitable device: {e}"),
+            LumaError::Chunked(e) => write!(f, "Array spans several buffers: {e}"),
             LumaError::RequestDevice(e) => write!(f, "Error requesting device: {e}"),
             LumaError::ShapeMismatch { lhs, rhs } => {
                 write!(f, "Dimension mismatch: {lhs:?} vs {rhs:?}")

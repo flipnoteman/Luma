@@ -3,16 +3,18 @@
 //! Workgroup sizes and tile shapes that suit one GPU can cost another a lot (Apple GPUs, for
 //! example, lose occupancy sharply above about 8 KiB of workgroup memory per workgroup). A
 //! [`Tuning`] is chosen once per context from the adapter the device was opened on; the kernel
-//! generators read it instead of fixed constants. `LUMA_TUNING=apple`, `LUMA_TUNING=nvidia` or
-//! `LUMA_TUNING=generic` in the environment overrides the choice for new contexts.
+//! generator reads it instead of fixed constants. `LUMA_TUNING=apple`, `LUMA_TUNING=nvidia`,
+//! `LUMA_TUNING=cpu` or `LUMA_TUNING=generic` in the environment overrides the choice for new
+//! contexts.
 
 /// Environment variable forcing a profile.
 const TUNING_ENV: &str = "LUMA_TUNING";
 /// `LUMA_SUBGROUPS=off` keeps the built-in kernels off subgroup operations.
 const SUBGROUPS_ENV: &str = "LUMA_SUBGROUPS";
 
-/// The GPU family a [`Tuning`] was measured on.
+/// The device family a tuning profile was measured on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum TuningProfile {
     /// Apple GPUs (Metal), measured on an M5 Pro.
     Apple,
@@ -20,13 +22,15 @@ pub enum TuningProfile {
     Nvidia,
     /// Every other GPU: common defaults, not measured yet.
     Generic,
+    /// Software rasterizers on the CPU (Mesa llvmpipe), measured on a Ryzen 9 7950X.
+    Cpu,
 }
 
 /// Kernel parameters of a context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Tuning {
     pub(crate) profile: TuningProfile,
-    /// Invocations per workgroup of elementwise kernels (fused, fills, in-place operators).
+    /// Invocations per workgroup of elementwise kernels (fused and fills).
     pub(crate) elementwise_workgroup: u32,
     /// Tiled 1D convolution: invocations per workgroup, and outputs per invocation at stride 1.
     pub(crate) conv_workgroup: u32,
@@ -85,6 +89,10 @@ impl Tuning {
         subgroups: false,
     };
 
+    /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
+    /// that measured faster on llvmpipe.
+    const CPU: Tuning = Tuning { profile: TuningProfile::Cpu, elementwise_workgroup: 64, ..Tuning::GENERIC };
+
     /// The parameters for the GPU `info` describes, unless the environment forces a profile.
     pub(crate) fn for_adapter(info: &wgpu::AdapterInfo, limits: &wgpu::Limits, features: wgpu::Features) -> Tuning {
         let forced = std::env::var(TUNING_ENV).ok();
@@ -92,6 +100,8 @@ impl Tuning {
             Some("apple") => TuningProfile::Apple,
             Some("nvidia") => TuningProfile::Nvidia,
             Some("generic") => TuningProfile::Generic,
+            Some("cpu") => TuningProfile::Cpu,
+            _ if info.device_type == wgpu::DeviceType::Cpu => TuningProfile::Cpu,
             _ if is_apple(info) => TuningProfile::Apple,
             _ if info.vendor == NVIDIA_VENDOR => TuningProfile::Nvidia,
             _ => TuningProfile::Generic,
@@ -100,6 +110,7 @@ impl Tuning {
             TuningProfile::Apple => Tuning::APPLE,
             TuningProfile::Nvidia => Tuning::NVIDIA,
             TuningProfile::Generic => Tuning::GENERIC,
+            TuningProfile::Cpu => Tuning::CPU,
         };
         let mut tuning = tuning.within(limits);
         tuning.subgroups = features.contains(wgpu::Features::SUBGROUP) && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
@@ -169,7 +180,7 @@ mod tests {
     #[test]
     fn tunings_fit_the_smallest_webgpu_limits() {
         let limits = wgpu::Limits::downlevel_defaults();
-        for tuning in [Tuning::APPLE, Tuning::NVIDIA, Tuning::GENERIC] {
+        for tuning in [Tuning::APPLE, Tuning::NVIDIA, Tuning::GENERIC, Tuning::CPU] {
             let t = tuning.within(&limits);
             assert!(conv_workgroup_bytes(t.conv_workgroup, t.conv_per_thread) <= limits.max_compute_workgroup_storage_size, "{t:?}");
             assert!(t.stencil_tile_bytes <= limits.max_compute_workgroup_storage_size);

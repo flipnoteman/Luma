@@ -54,6 +54,11 @@ pub(crate) fn plan(probe: &Array<f32>, next: &Array<f32>) -> Option<Stencil> {
     }
     let (w, h) = (u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?);
     let probe = Arc::clone(probe.storage().ok()?);
+    // Tiles load circular halos from one buffer: arrays spanning several buffers take the
+    // step-by-step path.
+    if probe.segments() > 1 {
+        return None;
+    }
     // If `step(&probe)` bound `probe`'s buffer (eager ops or forced sub-expressions), it is not
     // a single fused stencil expression.
     if probe.was_materialized() {
@@ -242,7 +247,7 @@ fn main(
             for (t, instr) in self.instrs.iter().enumerate() {
                 let value = match self.offsets[t] {
                     Some((dx, dy)) => format!("{from}[u32(i32(c) + {})]", dx + dy * lw as i32),
-                    None => expression(instr),
+                    None => expression(instr, "i", "luma.size.x", false),
                 };
                 let _ = writeln!(
                     src,
@@ -302,14 +307,12 @@ fn main(
                 let from = current.as_ref().unwrap_or(start);
                 let (src, bytes) = from.ready()?;
                 let (dst, _) = next.ready()?;
+                let fixed_pins = fixed.iter().map(|input| input.pin_single()).collect::<Result<Vec<_>, _>>()?;
                 let mut raw = Vec::with_capacity(fixed.len() + 3);
-                raw.push(RawArg::write(dst, bytes));
-                raw.push(RawArg::read(src, bytes));
-                for input in &fixed {
-                    raw.push(RawArg::read(
-                        input.buffer(),
-                        u64::from(w) * u64::from(h) * 4,
-                    ));
+                raw.push(RawArg::write(dst.buffer(), bytes));
+                raw.push(RawArg::read(src.buffer(), bytes));
+                for pin in &fixed_pins {
+                    raw.push(RawArg::read(pin.buffer(), u64::from(w) * u64::from(h) * 4));
                 }
                 raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
                 ctx.launch(&core, groups, [w, h, 1], &raw)?;

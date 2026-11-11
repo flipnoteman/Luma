@@ -34,6 +34,27 @@ fn zeros_returns_zeroed_array() {
     assert_eq!(a.to_vec().unwrap(), vec![0.0f32; 6]);
 }
 
+#[test]
+fn read_into_fills_an_unaligned_host_slice_of_a_large_array() {
+    // Large enough for the threaded copy, with a length and a destination that leave partial
+    // cache lines at both ends of every thread's part.
+    let n = (3 << 20) + 5;
+    let data: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+    let a = array(n, &data);
+    let mut host = vec![0u32; n + 2];
+    a.read_into(&mut host[1..=n]).unwrap();
+    assert_eq!(host[0], 0);
+    assert_eq!(host[n + 1], 0);
+    assert!(host[1..=n] == data[..]);
+}
+
+#[test]
+fn read_into_length_mismatch_returns_error() {
+    let a = array(3, &[1u32, 2, 3]);
+    let err = a.read_into(&mut [0u32; 2]).unwrap_err();
+    assert!(matches!(err, LumaError::LengthMismatch { expected: 3, actual: 2 }), "{err}");
+}
+
 // -- Write & shape validation --
 
 #[test]
@@ -359,7 +380,7 @@ fn fft_conv1d_basic() {
     let result = input.conv1d_fft(&kernel);
     assert_eq!(result.shape(), [7, 1, 1, 1]);
     let data = result.to_vec().unwrap();
-    let expected = vec![1.0f32, 2.0, 2.0, 2.0, 2.0, -4.0, -5.0];
+    let expected = [1.0f32, 2.0, 2.0, 2.0, 2.0, -4.0, -5.0];
     for (i, (a, b)) in data.iter().zip(expected.iter()).enumerate() {
         assert!((a - b).abs() < 1e-3, "Mismatch at index {}: got {}, expected {}", i, a, b);
     }
@@ -372,7 +393,7 @@ fn fft_conv1d_identity_kernel() {
     let result = input.conv1d_fft(&kernel);
     assert_eq!(result.shape(), [3, 1, 1, 1]);
     let data = result.to_vec().unwrap();
-    let expected = vec![3.0f32, 7.0, 11.0];
+    let expected = [3.0f32, 7.0, 11.0];
     for (i, (a, b)) in data.iter().zip(expected.iter()).enumerate() {
         assert!((a - b).abs() < 1e-3, "Mismatch at index {}: got {}, expected {}", i, a, b);
     }

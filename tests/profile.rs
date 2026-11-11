@@ -107,6 +107,9 @@ fn profile_covers_more_launches_than_fit_in_one_batch() {
         return;
     }
     let mut x = Array::<f32>::zeros_on(&ctx, 1000).unwrap();
+    // A second array shares the buffer, so every `+=` is a kernel of its own (a solely owned
+    // array would fuse the whole loop).
+    let _view = x.reshape(1000);
     let launches = 1500;
     let ((), profile) = ctx
         .profile(|| {
@@ -127,13 +130,15 @@ fn enable_and_finish_profiling_bracket_manual_sections() {
         return;
     }
     let mut x = Array::<f32>::zeros_on(&ctx, 100).unwrap();
-    x += 1.0; // recorded before: not measured
+    x += 1.0;
+    ctx.flush().unwrap(); // evaluates the lazy `x`: recorded before, not measured
     ctx.enable_profiling().unwrap();
     ctx.enable_profiling().unwrap(); // idempotent
     x *= 3.0;
     x += 1.0;
     let profile = ctx.finish_profiling().unwrap();
-    assert_eq!(profile.launches(), 2);
+    // The two operators fuse into one kernel; the launch flushed before is not counted.
+    assert_eq!(profile.launches(), 1);
     assert_eq!(x.to_vec().unwrap(), vec![4.0; 100]);
 }
 

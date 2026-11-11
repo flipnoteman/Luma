@@ -374,7 +374,7 @@ fn bilateral_spatial() -> Vec<f32> {
     let mut w = Vec::with_capacity(BIL_T * BIL_T);
     for dy in 0..BIL_T {
         for dx in 0..BIL_T {
-            let d2 = ((dx as f64 - BIL_R as f64).powi(2) + (dy as f64 - BIL_R as f64).powi(2)) as f64;
+            let d2 = (dx as f64 - BIL_R as f64).powi(2) + (dy as f64 - BIL_R as f64).powi(2);
             w.push((-d2 / (2.0 * SIGMA_SPATIAL * SIGMA_SPATIAL)).exp() as f32);
         }
     }
@@ -413,7 +413,7 @@ fn exp_fast(x: f32) -> f32 {
     let p = p.mul_add(r, 8.333_452e-3);
     let p = p.mul_add(r, 4.166_579_6e-2);
     let p = p.mul_add(r, 1.666_666_5e-1);
-    let p = p.mul_add(r, 5.000_000_1e-1);
+    let p = p.mul_add(r, 5e-1);
     let y = (p * r * r) + r + 1.0;
     y * f32::from_bits(((n as i32 + 127) << 23) as u32)
 }
@@ -636,8 +636,7 @@ fn histogram_cpu(data: &[u32]) -> [u32; 256] {
             .map(|chunk| {
                 s.spawn(move || {
                     let mut h = [[0u32; 256]; 4];
-                    let quads = chunk.chunks_exact(4);
-                    let rest = quads.remainder();
+                    let (quads, rest) = chunk.as_chunks::<4>();
                     for q in quads {
                         for (j, v) in q.iter().enumerate() {
                             h[j][(v & 255) as usize] += 1;
@@ -666,7 +665,7 @@ fn histogram(c: &mut Criterion) {
     // Bell-shaped 8-bit intensities, so some bins are much hotter than others.
     let (a, b) = (values(W * H, 40, 0.0, 1.0), values(W * H, 41, 0.0, 1.0));
     let data: Vec<u32> = a.iter().zip(&b).map(|(a, b)| (((a + b) * 0.5) * 255.99) as u32).collect();
-    let quads: Vec<[u32; 4]> = data.chunks_exact(4).map(|q| [q[0], q[1], q[2], q[3]]).collect();
+    let quads: Vec<[u32; 4]> = data.as_chunks::<4>().0.iter().map(|q| [q[0], q[1], q[2], q[3]]).collect();
     let gsrc = Array::from_slice(&quads, [quads.len()]).unwrap();
     let kernel = Kernel::new(HISTOGRAM).unwrap();
     let ctx = default_context().unwrap();

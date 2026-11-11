@@ -53,7 +53,7 @@ fn check(name: &str, got: &[f32], want: &[f32], tolerance: f32) {
 
 const RATE: f32 = 0.02;
 const VOL: f32 = 0.3;
-const A: [f32; 5] = [0.319381530, -0.356563782, 1.781477937, -1.821255978, 1.330274429];
+const A: [f32; 5] = [0.319_381_54, -0.356_563_78, 1.781_477_9, -1.821_255_9, 1.330_274_5];
 const INV_SQRT_2PI: f32 = 0.398_942_3;
 
 /// Cumulative normal distribution (Abramowitz & Stegun 26.2.17).
@@ -372,7 +372,7 @@ fn nbody_cpu(soa: &[Vec<f32>; 4], out: &mut [[f32; 3]]) {
         for (i, o) in chunk.iter_mut().enumerate() {
             let (xi, yi, zi) = (px[first + i], py[first + i], pz[first + i]);
             let (mut ax, mut ay, mut az) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
-            let chunks = px.chunks_exact(8).zip(py.chunks_exact(8)).zip(pz.chunks_exact(8)).zip(pm.chunks_exact(8));
+            let chunks = px.as_chunks::<8>().0.iter().zip(py.as_chunks::<8>().0).zip(pz.as_chunks::<8>().0).zip(pm.as_chunks::<8>().0);
             for (((x, y), z), m) in chunks {
                 for l in 0..8 {
                     let (dx, dy, dz) = (x[l] - xi, y[l] - yi, z[l] - zi);

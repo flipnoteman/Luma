@@ -135,11 +135,13 @@ pub(crate) struct Profiler {
     /// Query sets in use, each with the labels of the launches it timed; launch `i` of a set
     /// owns timestamps `2 i` and `2 i + 1`.
     sets: Vec<(wgpu::QuerySet, Vec<Arc<str>>)>,
+    /// The set the next launch is recorded into; moved to `sets` when full.
+    current: Option<(wgpu::QuerySet, Vec<Arc<str>>)>,
 }
 
 impl Profiler {
     pub(crate) fn new() -> Self {
-        Profiler { sets: Vec::new() }
+        Profiler { sets: Vec::new(), current: None }
     }
 
     /// Reserves the timestamps of a launch labelled `label` and returns the descriptor that makes
@@ -149,15 +151,17 @@ impl Profiler {
         device: &wgpu::Device,
         label: &Arc<str>,
     ) -> wgpu::ComputePassTimestampWrites<'_> {
-        if self.sets.last().is_none_or(|(_, labels)| labels.len() * 2 >= QUERIES as usize) {
+        if self.current.as_ref().is_some_and(|(_, labels)| labels.len() * 2 >= QUERIES as usize) {
+            self.sets.extend(self.current.take());
+        }
+        let (set, labels) = self.current.get_or_insert_with(|| {
             let set = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("luma timestamps"),
                 ty: wgpu::QueryType::Timestamp,
                 count: QUERIES,
             });
-            self.sets.push((set, Vec::new()));
-        }
-        let Some((set, labels)) = self.sets.last_mut() else { unreachable!("a set was just added") };
+            (set, Vec::new())
+        });
         let begin = (labels.len() * 2) as u32;
         labels.push(Arc::clone(label));
         wgpu::ComputePassTimestampWrites {
@@ -174,7 +178,8 @@ impl Profiler {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
     ) -> (Buffer, Vec<Arc<str>>) {
-        let total: u64 = self.sets.iter().map(|(_, labels)| labels.len() as u64 * 2).sum();
+        let sets: Vec<_> = self.sets.into_iter().chain(self.current).collect();
+        let total: u64 = sets.iter().map(|(_, labels)| labels.len() as u64 * 2).sum();
         let bytes = (total * TIMESTAMP_BYTES).max(TIMESTAMP_BYTES);
         let resolved = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("luma timestamps resolved"),
@@ -190,7 +195,7 @@ impl Profiler {
         });
         let mut offset = 0;
         let mut all = Vec::new();
-        for (set, labels) in self.sets {
+        for (set, labels) in sets {
             let count = labels.len() as u32 * 2;
             encoder.resolve_query_set(&set, 0..count, &resolved, offset);
             offset += u64::from(count) * TIMESTAMP_BYTES;

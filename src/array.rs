@@ -3,7 +3,8 @@ use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::context::{default_context, Context, STORAGE_USAGE};
+use crate::context::{default_context, Context};
+use crate::gpu::pager::{Pin, Segment};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::GpuType;
 use crate::jit::{Node, Readers, Src};
@@ -34,17 +35,25 @@ impl Failure {
     }
 }
 
-/// A GPU buffer owned (shared) by arrays; goes back to the context's pool when the last array
-/// using it is dropped.
+/// The data of an array: one or several segments, each a device buffer for a contiguous element
+/// range, shared by the arrays using it. Segment buffers go back to the context's pool when the
+/// last array using them is dropped.
+///
+/// Segment `j` holds elements `j * C .. min(len, (j + 1) * C)` where `C` is
+/// [`Storage::segment_len`]; every storage of the same length and element size on a context has
+/// the same segmentation.
 #[derive(Debug)]
 pub(crate) struct Storage {
     id: u64,
     ctx: Context,
-    /// May be larger than the data it holds; only the first `byte_len` bytes are the array.
-    buffer: wgpu::Buffer,
-    /// Kept alive when this storage aliases another one's buffer (see [`Array::probe`]).
+    /// Number of elements.
+    len: usize,
+    /// Bytes per element.
+    elem: usize,
+    segments: Box<[Arc<Segment>]>,
+    /// Kept alive when this storage aliases another one's segments (see [`Array::probe`]).
     owner: Option<Arc<Storage>>,
-    /// Set once [`Array::ready`] bound this storage to an eager command or readback.
+    /// Set once a segment was handed out for an eager command or readback.
     materialized: AtomicBool,
     /// Lazy operations that still have to read this buffer; they are evaluated before anything
     /// overwrites it (see [`crate::jit`]).
@@ -53,25 +62,60 @@ pub(crate) struct Storage {
 
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Elements per full segment of arrays of `elem`-byte elements on `ctx`.
+fn segment_len(ctx: &Context, elem: usize) -> usize {
+    (usize::try_from(ctx.segment_bytes()).unwrap_or(usize::MAX) / elem).max(1)
+}
+
 impl Storage {
-    pub(crate) fn new(ctx: &Context, buffer: wgpu::Buffer) -> Self {
+    /// A storage of `len` elements of `elem` bytes whose segments have no buffers yet; they are
+    /// allocated when first pinned, so this cannot fail.
+    pub(crate) fn new(ctx: &Context, len: usize, elem: usize) -> Self {
+        let c = segment_len(ctx, elem);
+        let segments = (0..len.div_ceil(c))
+            .map(|j| Segment::empty(ctx, ((len.min((j + 1) * c) - j * c) * elem) as u64))
+            .collect();
+        Self::with_segments(ctx, len, elem, segments, None)
+    }
+
+    /// A storage whose segments are the given buffers, one per segment in order, each holding
+    /// its element range already. The segments recycle them when dropped.
+    pub(crate) fn adopt(ctx: &Context, len: usize, elem: usize, buffers: Vec<wgpu::Buffer>) -> Self {
+        let c = segment_len(ctx, elem);
+        let segments = buffers
+            .into_iter()
+            .enumerate()
+            .map(|(j, buffer)| Segment::filled(ctx, ((len.min((j + 1) * c) - j * c) * elem) as u64, buffer))
+            .collect();
+        Self::with_segments(ctx, len, elem, segments, None)
+    }
+
+    /// A distinct storage identity backed by `owner`'s segments without recycling them
+    /// separately.
+    pub(crate) fn alias(owner: &Arc<Storage>) -> Self {
+        Self::with_segments(
+            &owner.ctx,
+            owner.len,
+            owner.elem,
+            owner.segments.clone(),
+            Some(Arc::clone(owner)),
+        )
+    }
+
+    fn with_segments(
+        ctx: &Context,
+        len: usize,
+        elem: usize,
+        segments: Box<[Arc<Segment>]>,
+        owner: Option<Arc<Storage>>,
+    ) -> Self {
         Storage {
             id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
-            buffer,
-            owner: None,
-            materialized: AtomicBool::new(false),
-            readers: Readers::default(),
-        }
-    }
-
-    /// A distinct storage identity backed by `owner`'s buffer without recycling it separately.
-    pub(crate) fn alias(owner: &Arc<Storage>) -> Self {
-        Storage {
-            id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
-            ctx: owner.ctx.clone(),
-            buffer: owner.buffer.clone(),
-            owner: Some(Arc::clone(owner)),
+            len,
+            elem,
+            segments,
+            owner,
             materialized: AtomicBool::new(false),
             readers: Readers::default(),
         }
@@ -82,22 +126,60 @@ impl Storage {
         self.id
     }
 
-    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+    /// Number of segments.
+    pub(crate) fn segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Bytes per element.
+    pub(crate) fn elem(&self) -> usize {
+        self.elem
+    }
+
+    /// Bytes of data in the whole storage.
+    pub(crate) fn byte_len(&self) -> u64 {
+        (self.len * self.elem) as u64
+    }
+
+    /// Elements of a full segment, `C`.
+    pub(crate) fn segment_len(&self) -> usize {
+        segment_len(&self.ctx, self.elem)
+    }
+
+    /// The elements segment `j` holds.
+    pub(crate) fn range(&self, j: usize) -> std::ops::Range<usize> {
+        let c = self.segment_len();
+        j * c..self.len.min((j + 1) * c)
+    }
+
+    /// Segment `j` for an eager command or readback; marks the storage as materialized.
+    pub(crate) fn segment(&self, j: usize) -> &Arc<Segment> {
         self.materialized.store(true, Ordering::Relaxed);
-        &self.buffer
+        &self.segments[j]
+    }
+
+    /// Pins segment `j` on the device (allocating its buffer if needed); marks the storage as
+    /// materialized.
+    pub(crate) fn pin(&self, j: usize) -> Result<Pin> {
+        self.segment(j).pin()
+    }
+
+    /// Pins the only segment of a storage that fits one buffer; operations that cannot run
+    /// piecewise use this and fail with [`LumaError::Chunked`] on larger ones.
+    pub(crate) fn pin_single(&self) -> Result<Pin> {
+        if self.segments.len() > 1 {
+            return Err(LumaError::Chunked("this operation needs an array that fits one buffer"));
+        }
+        self.pin(0)
     }
 
     pub(crate) fn was_materialized(&self) -> bool {
         self.materialized.load(Ordering::Relaxed)
     }
-}
 
-impl Drop for Storage {
-    fn drop(&mut self) {
-        if self.owner.is_none() {
-            // Cloning a wgpu buffer only bumps a reference count; it is still the same buffer.
-            self.ctx.recycle(self.buffer.clone());
-        }
+    /// Whether this storage borrows another one's buffers.
+    pub(crate) fn is_alias(&self) -> bool {
+        self.owner.is_some()
     }
 }
 
@@ -167,12 +249,11 @@ impl<T: GpuType> Array<T> {
     /// Allocates a valid array of `shape` whose contents are unspecified.
     pub(crate) fn alloc(ctx: &Context, shape: Shape) -> Result<Self> {
         let len = shape.validate()?;
-        let bytes = len as u64 * std::mem::size_of::<T>() as u64;
-        let buffer = ctx.alloc_buffer(bytes, STORAGE_USAGE)?;
+        // The segments get their buffers when first pinned.
         Ok(Array {
             ctx: ctx.clone(),
             shape,
-            repr: Repr::Valid(Arc::new(Storage::new(ctx, buffer))),
+            repr: Repr::Valid(Arc::new(Storage::new(ctx, len, std::mem::size_of::<T>()))),
             _marker: PhantomData,
         })
     }
@@ -233,17 +314,33 @@ impl<T: GpuType> Array<T> {
             return Err(LumaError::LengthMismatch { expected: len, actual: data.len() });
         }
         if ctx.zero_copy() {
-            let buffer = ctx.alloc_filled(bytemuck::cast_slice(data))?;
+            let storage = Storage::new(ctx, len, std::mem::size_of::<T>());
+            let mut buffers = Vec::with_capacity(storage.segments());
+            for j in 0..storage.segments() {
+                match ctx.alloc_filled(bytemuck::cast_slice(&data[storage.range(j)])) {
+                    Ok(buffer) => buffers.push(buffer),
+                    Err(err) => {
+                        for buffer in buffers {
+                            ctx.recycle(buffer);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            let storage = Storage::adopt(ctx, len, std::mem::size_of::<T>(), buffers);
             return Ok(Array {
                 ctx: ctx.clone(),
                 shape,
-                repr: Repr::Valid(Arc::new(Storage::new(ctx, buffer))),
+                repr: Repr::Valid(Arc::new(storage)),
                 _marker: PhantomData,
             });
         }
         let array = Self::alloc(ctx, shape)?;
-        let (buffer, _) = array.ready().map_err(Failure::into_error)?;
-        ctx.upload(buffer, bytemuck::cast_slice(data))?;
+        let storage = array.storage().map_err(Failure::into_error)?;
+        for j in 0..storage.segments() {
+            let pin = storage.pin(j)?;
+            ctx.upload(pin.buffer(), bytemuck::cast_slice(&data[storage.range(j)]))?;
+        }
         Ok(array)
     }
 
@@ -255,9 +352,12 @@ impl<T: GpuType> Array<T> {
     /// [`Array::zeros`] on an explicit context.
     pub fn zeros_on(ctx: &Context, shape: impl Into<Shape>) -> Result<Self> {
         let array = Self::alloc(ctx, shape.into())?;
-        let (buffer, bytes) = array.ready().map_err(Failure::into_error)?;
-        // Pooled buffers hold stale data, so zeroing is required.
-        ctx.clear(buffer, bytes)?;
+        let storage = array.storage().map_err(Failure::into_error)?;
+        for j in 0..storage.segments() {
+            let pin = storage.pin(j)?;
+            // Pooled buffers hold stale data, so zeroing is required.
+            ctx.clear(pin.buffer(), (storage.range(j).len() * storage.elem()) as u64)?;
+        }
         Ok(array)
     }
 
@@ -320,10 +420,12 @@ impl<T: GpuType> Array<T> {
         }
     }
 
-    /// The buffer and the number of bytes of it holding the array, or the reason the array is
-    /// not valid. Evaluates a lazy array.
-    pub(crate) fn ready(&self) -> std::result::Result<(&wgpu::Buffer, u64), Failure> {
-        Ok((self.storage()?.buffer(), self.byte_len()))
+    /// A pin on the buffer holding the array and the number of bytes of it holding the array,
+    /// or the reason the array is not valid. Evaluates a lazy array. The pin keeps the buffer
+    /// on the device until the command using it is recorded; arrays split into several buffers
+    /// fail with [`LumaError::Chunked`].
+    pub(crate) fn ready(&self) -> std::result::Result<(Pin, u64), Failure> {
+        Ok((self.storage()?.pin_single()?, self.byte_len()))
     }
 
     /// This array as an operand of a lazy operation, without evaluating it: its buffer, or the
@@ -344,6 +446,20 @@ impl<T: GpuType> Array<T> {
         }
     }
 
+    /// Whether this array is the only holder of its own (non-aliased) buffer: nothing else can
+    /// observe the buffer changing. An evaluated lazy array holds it through its node.
+    pub(crate) fn sole_owner(&self) -> bool {
+        let storage = match &self.repr {
+            Repr::Valid(storage) => storage,
+            Repr::Lazy(node) if Arc::strong_count(node) == 1 => match node.evaluated() {
+                Some(storage) => storage,
+                None => return false,
+            },
+            _ => return false,
+        };
+        Arc::strong_count(storage) == 1 && !storage.is_alias()
+    }
+
     /// Evaluates every pending lazy operation that reads this array's buffer. Must run before
     /// the buffer is overwritten, so those operations keep seeing the data they were recorded
     /// against.
@@ -359,8 +475,8 @@ impl<T: GpuType> Array<T> {
     }
 
     #[cfg(test)]
-    pub(crate) fn buffer(&self) -> Option<&wgpu::Buffer> {
-        self.ready().ok().map(|(buffer, _)| buffer)
+    pub(crate) fn buffer(&self) -> Option<wgpu::Buffer> {
+        self.ready().ok().map(|(pin, _)| pin.buffer().clone())
     }
 
     // -- Synchronization --
@@ -369,14 +485,32 @@ impl<T: GpuType> Array<T> {
     /// finished it, so this is where a poisoned array's error (or an error the GPU reported
     /// while running the batch) comes out.
     pub fn to_vec(&self) -> Result<Vec<T>> {
-        let (buffer, bytes) = self.ready().map_err(Failure::into_error)?;
-        self.ctx.read(buffer, bytes)
+        let storage = self.storage().map_err(Failure::into_error)?;
+        self.ctx.read_storage(storage)
+    }
+
+    /// Like [`Array::to_vec`], but copies into `out`, which must have exactly [`Array::len`]
+    /// elements. A buffer the host already owns needs no fresh pages from the operating system,
+    /// which cost about as much as the transfer itself on large arrays: prefer this when
+    /// reading results back repeatedly.
+    pub fn read_into(&self, out: &mut [T]) -> Result<()> {
+        let storage = self.storage().map_err(Failure::into_error)?;
+        if out.len() != self.len() {
+            return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
+        }
+        let bytes: &mut [u8] = bytemuck::cast_slice_mut(out);
+        // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; only initialized bytes are
+        // written through the view, so `out` stays valid (`T: Pod`).
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(), bytes.len())
+        };
+        self.ctx.read_storage_into(storage, dst)
     }
 
     /// Records the array's pending computation, submits the batch and waits until the GPU has
     /// executed it, without copying anything back. Returns the array's error if it is poisoned.
     pub fn eval(&self) -> Result<()> {
-        self.ready().map_err(Failure::into_error)?;
+        self.storage().map_err(Failure::into_error)?;
         self.ctx.sync()
     }
 
@@ -384,13 +518,17 @@ impl<T: GpuType> Array<T> {
     /// elements. The upload is recorded in order with the operations before it and does not wait
     /// for the GPU: operations recorded earlier still see the old contents.
     pub fn write(&mut self, data: &[T]) -> Result<()> {
-        let (buffer, _) = self.ready().map_err(Failure::into_error)?;
+        let storage = self.storage().map_err(Failure::into_error)?;
         if data.len() != self.len() {
             return Err(LumaError::LengthMismatch { expected: self.len(), actual: data.len() });
         }
         // Lazy operations recorded earlier still read the old contents.
         self.flush_readers();
-        self.ctx.upload(buffer, bytemuck::cast_slice(data))
+        for j in 0..storage.segments() {
+            let pin = storage.pin(j)?;
+            self.ctx.upload(pin.buffer(), bytemuck::cast_slice(&data[storage.range(j)]))?;
+        }
+        Ok(())
     }
 
     // -- Views --

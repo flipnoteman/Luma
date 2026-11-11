@@ -2,8 +2,8 @@
 //! kernels.
 //!
 //! Elementwise operations on arrays are not kernels of their own: they are recorded lazily and
-//! fused into generated kernels, see [`crate::jit`]. What is left here are the in-place
-//! operators, fills, the reduction passes over partial results, and the convolution and FFT
+//! fused into generated kernels, see [`crate::jit`]. What is left here are the
+//! fills, the reduction passes over partial results, and the convolution and FFT
 //! passes (generated here, in [`crate::fft`] and `operations/`). Every kernel declares its arguments in `@group(1)` and
 //! uses the `luma` grid uniform of the prelude.
 
@@ -161,10 +161,6 @@ impl ReduceList {
 /// kernel in the context.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Builtin {
-    /// `a[i] = a[i] op b[i]`; arguments: a (read_write), b.
-    InPlaceArray(BinOp),
-    /// `a[i] = a[i] op s`; arguments: a (read_write), uniform scalar.
-    InPlaceScalar(BinOp),
     /// `out[i] = s`; arguments: out, uniform scalar.
     Fill,
     /// One reduction pass for each op of the list (segmented: over the partial results of an
@@ -178,41 +174,6 @@ pub(crate) enum Builtin {
     Conv1dTiled(u32, u32),
     /// One pass of the FFT convolution, see [`crate::fft`].
     Fft(crate::fft::FftPass),
-}
-
-/// `a[i] = a[i] op b[i]` (or `a[i] op p.s` with `scalar`).
-fn in_place(ty: &str, scalar: bool, expr: &str, wg: u32) -> String {
-    let (decls, load) = if scalar {
-        (
-            format!(
-                "struct Params {{ s: {ty} }}
-@group(1) @binding(0) var<storage, read_write> a: array<{ty}>;
-@group(1) @binding(1) var<uniform> p: Params;
-"
-            ),
-            "let x = a[i]; let y = p.s;",
-        )
-    } else {
-        (
-            format!(
-                "@group(1) @binding(0) var<storage, read_write> a: array<{ty}>;
-@group(1) @binding(1) var<storage, read> b: array<{ty}>;
-"
-            ),
-            "let x = a[i]; let y = b[i];",
-        )
-    };
-    format!(
-        "{decls}
-@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {wg}u;
-    if (i >= luma.size.x) {{ return; }}
-    {load}
-    a[i] = {expr};
-}}
-"
-    )
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -509,8 +470,6 @@ impl Builtin {
     pub(crate) fn source(self, ty: &str, tuning: &Tuning) -> Cow<'static, str> {
         let wg = tuning.elementwise_workgroup;
         match self {
-            Builtin::InPlaceArray(op) => in_place(ty, false, op.expr(), wg).into(),
-            Builtin::InPlaceScalar(op) => in_place(ty, true, op.expr(), wg).into(),
             Builtin::Fill => fill_kernel(ty, wg).into(),
             Builtin::Reduce(ops, segmented) => reduce(ty, ops, segmented, tuning).into(),
             Builtin::Conv1d => include_str!("../operations/conv1d.wgsl").into(),

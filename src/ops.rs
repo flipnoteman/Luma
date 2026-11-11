@@ -3,7 +3,7 @@
 //! Elementwise operations (operators, math functions, comparisons, `select`, `powf`, `clamp`,
 //! shifts) are recorded as lazy expressions and fused into one generated kernel when their result
 //! is needed (see [`crate::jit`]); reductions fold the expression behind their input into their
-//! first pass. In-place operators, fills and the later reduction passes are plain
+//! first pass. Fills and the later reduction passes are plain
 //! built-in kernels (see [`crate::builtin`]) recorded into the context's batch. Methods that
 //! return arrays never fail loudly: they return poisoned arrays (see [`Array`]). The `run_*`
 //! functions do the work and return the failure; the public methods turn it into a poisoned
@@ -162,15 +162,20 @@ impl<T: ScalarType> Array<T> {
         )
     }
 
-    /// `self = self op rhs`, as a kernel running now over the array's buffer.
-    fn run_in_place(&self, rhs: Rhs<'_, T>, op: BinOp) -> Outcome<()> {
+    /// `self = self op rhs` over the array's buffer, which other arrays or pending operations
+    /// share, as a fused kernel that writes it in place.
+    fn run_in_place(
+        &self,
+        rhs: Rhs<'_, T>,
+        op: BinOp,
+        name: &'static str,
+        location: &'static Location<'static>,
+    ) -> Outcome<()> {
         let ctx = self.context();
-        let storage = self.storage()?;
-        let (a, a_bytes) = self.ready()?;
-        let n = len_u32(self.len())?;
-        match rhs {
+        let storage = Arc::clone(self.storage()?);
+        let other = match rhs {
             Rhs::Array(other) => {
-                let (b, b_bytes) = other.ready()?;
+                let operand = other.src()?;
                 if !ctx.same_as(other.context()) {
                     return Err(LumaError::ContextMismatch.into());
                 }
@@ -181,31 +186,23 @@ impl<T: ScalarType> Array<T> {
                     }
                     .into());
                 }
-                // Lazy operations recorded earlier still read the old contents.
-                storage.readers.flush();
-                let core = ctx.builtin(Builtin::InPlaceArray(op), T::wgsl_type())?;
-                launch_1d(
-                    ctx,
-                    &core,
-                    n,
-                    &[RawArg::write(a, a_bytes), RawArg::read(b, b_bytes)],
-                )?;
+                operand
             }
-            Rhs::Scalar(scalar) => {
-                storage.readers.flush();
-                let core = ctx.builtin(Builtin::InPlaceScalar(op), T::wgsl_type())?;
-                launch_1d(
-                    ctx,
-                    &core,
-                    n,
-                    &[
-                        RawArg::write(a, a_bytes),
-                        RawArg::Uniform(bytemuck::bytes_of(&scalar)),
-                    ],
-                )?;
-            }
-        }
-        Ok(())
+            Rhs::Scalar(value) => Src::Scalar(Scalar::of(value)?),
+        };
+        // Lazy operations recorded earlier (the right-hand side's among them) still read the old
+        // contents: evaluate them before the buffer changes. Afterwards no pending expression
+        // reads it, so the new node sees it as a plain buffer.
+        storage.readers.flush();
+        let node = jit::create(
+            ctx,
+            self.len(),
+            Op::new(OpKind::Binary(op), ElemTy::of::<T>()?),
+            [Src::Buffer(Arc::clone(&storage)), other, Src::unused()],
+            name,
+            location,
+        )?;
+        jit::evaluate_into(&node, &storage)
     }
 
     // -- Result plumbing --
@@ -239,21 +236,22 @@ impl<T: ScalarType> Array<T> {
         let out = self
             .run_binary(rhs, false, OpKind::Binary(op), name, location)
             .map_err(Failure::into_error)?;
-        out.ready().map_err(|failure| failure.into_error().root().clone())?;
+        out.storage().map_err(|failure| failure.into_error().root().clone())?;
         Ok(out)
     }
 
     #[track_caller]
     pub(crate) fn assign(&mut self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str) {
         let location = Location::caller();
-        let result = if self.pending().is_some() {
-            // The target is an expression without a buffer, so nothing can observe it changing:
-            // it simply becomes the expression `self op rhs`, and stays fusable.
+        let result = if self.pending().is_some() || self.sole_owner() {
+            // The target is an expression without a buffer, or nothing else can observe its
+            // buffer changing: it simply becomes the expression `self op rhs`, stays fusable, and
+            // reuses its buffer when it is evaluated.
             self.run_binary(rhs, false, OpKind::Binary(op), name, location).map(|new: Array<T>| {
                 *self = new;
             })
         } else {
-            self.run_in_place(rhs, op)
+            self.run_in_place(rhs, op, name, location)
         };
         match result {
             Ok(()) => {}
@@ -359,14 +357,21 @@ impl<T: ScalarType> Array<T> {
     /// [`Array::full`] on an explicit context.
     pub fn full_on(ctx: &Context, shape: impl Into<crate::Shape>, value: T) -> Result<Array<T>> {
         let out = Array::<T>::alloc(ctx, shape.into())?;
-        let (buffer, bytes) = out.ready().map_err(Failure::into_error)?;
+        let storage = out.storage().map_err(Failure::into_error)?;
         let core = ctx.builtin(Builtin::Fill, T::wgsl_type())?;
-        launch_1d(
-            ctx,
-            &core,
-            len_u32(out.len())?,
-            &[RawArg::write(buffer, bytes), RawArg::Uniform(bytemuck::bytes_of(&value))],
-        )?;
+        for j in 0..storage.segments() {
+            let n = storage.range(j).len();
+            let pin = storage.pin(j)?;
+            launch_1d(
+                ctx,
+                &core,
+                len_u32(n)?,
+                &[
+                    RawArg::write(pin.buffer(), n as u64 * std::mem::size_of::<T>() as u64),
+                    RawArg::Uniform(bytemuck::bytes_of(&value)),
+                ],
+            )?;
+        }
         Ok(out)
     }
 
@@ -469,7 +474,7 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
         pending = rest;
     }
     for array in arrays {
-        array.ready().map_err(Failure::into_error)?;
+        array.storage().map_err(Failure::into_error)?;
     }
     ctx.sync()
 }
@@ -477,8 +482,11 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
 /// A reduction for [`Array::reduce`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Reduction {
+    /// The sum of the elements.
     Sum,
+    /// The smallest element.
     Min,
+    /// The largest element.
     Max,
     /// The sum of the squared elements.
     SumOfSquares,
@@ -518,39 +526,66 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
     let count = ops.as_slice().len() as u64;
     let mut scratch = Scratch::new(ctx);
 
+    // Runs passes over `current` (`n` elements, or `n` per op once `per_op`) until one element per
+    // op is left.
+    let finish = |scratch: &mut Scratch<'_>, mut current: wgpu::Buffer, mut n: u32, mut per_op: bool| -> Result<wgpu::Buffer> {
+        while !per_op || n > 1 {
+            let groups = ctx.tuning().reduce_groups(n);
+            let list = if per_op { ops.rest() } else { ops };
+            let in_bytes = u64::from(n) * elem * if per_op { count } else { 1 };
+            let out = scratch.take(u64::from(groups) * elem * count)?;
+            let core = ctx.builtin(Builtin::Reduce(list, per_op), wgsl)?;
+            ctx.launch(
+                &core,
+                fold_workgroups(ctx, groups)?,
+                [n, 1, 1],
+                &[
+                    RawArg::write(&out, u64::from(groups) * elem * count),
+                    RawArg::read(&current, in_bytes),
+                    RawArg::Uniform(bytemuck::bytes_of(&[n])),
+                ],
+            )?;
+            current = out;
+            n = groups;
+            per_op = true;
+        }
+        Ok(current)
+    };
+
     let fused = match array.pending() {
         Some(node) => jit::reduce_first_pass(node, ops, &mut scratch).map_err(Failure::into_error)?,
         None => None,
     };
-    // `current` holds `n` elements per op, the ops' segments one after the other once
-    // `segmented`.
-    let (mut current, mut n, mut segmented) = match fused {
-        Some((partial, groups)) => (partial, groups, true),
-        None => {
-            let (input, _) = array.ready().map_err(Failure::into_error)?;
-            (input.clone(), len_u32(array.len())?, false)
+    let mut results = Vec::new();
+    match fused {
+        Some(partials) => {
+            for (partial, groups) in partials {
+                results.push(finish(&mut scratch, partial, groups, true)?);
+            }
         }
-    };
-    while !segmented || n > 1 {
-        let groups = ctx.tuning().reduce_groups(n);
-        let list = if segmented { ops.rest() } else { ops };
-        let in_bytes = u64::from(n) * elem * if segmented { count } else { 1 };
-        let out = scratch.take(u64::from(groups) * elem * count)?;
-        let core = ctx.builtin(Builtin::Reduce(list, segmented), wgsl)?;
-        ctx.launch(
-            &core,
-            fold_workgroups(ctx, groups)?,
-            [n, 1, 1],
-            &[
-                RawArg::write(&out, u64::from(groups) * elem * count),
-                RawArg::read(&current, in_bytes),
-                RawArg::Uniform(bytemuck::bytes_of(&[n])),
-            ],
-        )?;
-        current = out;
-        n = groups;
-        segmented = true;
+        None => {
+            let storage = array.storage().map_err(Failure::into_error)?;
+            for j in 0..storage.segments() {
+                let n = len_u32(storage.range(j).len())?;
+                // Wgpu buffers are reference counted; the pin keeps it resident while it is bound.
+                let pin = storage.pin(j)?;
+                results.push(finish(&mut scratch, pin.buffer().clone(), n, false)?);
+            }
+        }
     }
+
+    let current = if results.len() == 1 {
+        results.swap_remove(0)
+    } else {
+        let segments = results.len() as u64;
+        let collect = scratch.take(segments * count * elem)?;
+        for i in 0..count {
+            for (j, partial) in results.iter().enumerate() {
+                ctx.copy(partial, i * elem, &collect, (i * segments + j as u64) * elem, elem)?;
+            }
+        }
+        finish(&mut scratch, collect, len_u32(results.len())?, true)?
+    };
 
     let values = ctx.read::<T>(&current, elem * count)?;
     if values.len() as u64 != count {

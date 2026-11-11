@@ -10,6 +10,8 @@ use wgpu::{BindGroupEntry, BindingResource, Buffer, BufferBinding, BufferUsages}
 use crate::builtin::Builtin;
 use crate::error::{LumaError, Result};
 use crate::jit::JitState;
+use crate::array::Storage;
+use crate::gpu::pager::Pager;
 use crate::gpu::handle;
 use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::pool::{self, BufferPool};
@@ -35,22 +37,25 @@ const UPLOAD_USAGE: BufferUsages = BufferUsages::MAP_WRITE.union(BufferUsages::C
 /// Readbacks larger than twice this go in pieces of this size, see [`Context::read`].
 const READ_CHUNK: u64 = 32 << 20;
 
-/// Most bytes of idle (mapped) upload staging buffers kept for reuse.
-const MAX_FREE_UPLOAD_BYTES: u64 = 1 << 30;
-
 /// Usage of storage buffers the host writes directly (zero-copy uploads).
 const MAPPABLE_STORAGE_USAGE: BufferUsages = STORAGE_USAGE.union(BufferUsages::MAP_WRITE);
 
 /// Mapped upload staging buffers ready to be written.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FreeUploads {
     buffers: Vec<Buffer>,
     bytes: u64,
     /// Bytes of buffers in the unsubmitted batch or waiting for a `map_async` callback.
     in_flight: u64,
+    /// Most bytes of idle buffers kept for reuse; scales with the memory budget.
+    cap: u64,
 }
 
 impl FreeUploads {
+    fn new(cap: u64) -> Self {
+        FreeUploads { buffers: Vec::new(), bytes: 0, in_flight: 0, cap }
+    }
+
     fn take(&mut self, size: u64) -> Option<Buffer> {
         let at = self.buffers.iter().position(|buffer| buffer.size() == size)?;
         self.bytes -= size;
@@ -59,7 +64,7 @@ impl FreeUploads {
 
     /// Keeps `buffer` unless that would exceed the cap; returns it otherwise.
     fn put(&mut self, buffer: Buffer) -> Option<Buffer> {
-        if self.bytes + buffer.size() <= MAX_FREE_UPLOAD_BYTES {
+        if self.bytes + buffer.size() <= self.cap {
             self.bytes += buffer.size();
             self.buffers.push(buffer);
             None
@@ -278,8 +283,6 @@ struct Batch {
 
 #[derive(Debug)]
 struct Inner {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     /// Built-in kernels, built on first use of their (operation, element type).
     builtins: Mutex<FxMap<(Builtin, &'static str), Arc<KernelCore>>>,
     /// Lazy-evaluation state: fused kernels and the pending expressions.
@@ -292,8 +295,11 @@ struct Inner {
     released: Arc<Mutex<Vec<Buffer>>>,
     /// Mapped upload staging buffers, refilled by the map callbacks of submitted ones.
     uploads: Arc<Mutex<FreeUploads>>,
-    /// Mapped storage buffers (zero-copy uploads), refilled by the map callbacks of recycled ones.
     mappable: Arc<Mutex<FreeUploads>>,
+    /// Bytes of a full segment of an array, see [`Storage`](crate::array::Storage).
+    segment_bytes: u64,
+    /// Which segments of arrays hold a device buffer.
+    pager: Pager,
     /// Recycled mappable storage buffers waiting for the next submission before they are mapped.
     unmapped: Mutex<Vec<Buffer>>,
     /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
@@ -313,14 +319,31 @@ struct Inner {
     max_dynamic_uniforms: u32,
     /// Whether the device was opened with timestamp queries (see [`Context::profile`]).
     timestamps: bool,
+    /// The leased GPU device. Must stay the last field: fields drop in declaration order, and the
+    /// lease hands the device to the next context, which must only happen once everything of
+    /// this one (open pass and encoder, buffer pools, bind groups, kernels) is gone.
+    gpu: Lease,
+}
+
+/// A [`Gpu`](handle::Gpu) borrowed from the process-wide pool; returned to it when dropped.
+/// The device is never destroyed, see [`handle`].
+#[derive(Debug)]
+struct Lease(handle::Gpu);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        handle::release(self.0.clone());
+    }
 }
 
 /// Handle to a GPU device and everything needed to run work on it: compiled kernels, a pool of
 /// reusable buffers and the batch of commands waiting to be submitted.
 ///
 /// A `Context` is cheap to [`Clone`] (it is reference counted) and can be shared between threads.
-/// Every [`Array`](crate::Array) holds a clone of the context it was created on, so the device
-/// lives as long as any of its arrays. Arrays can only be combined with arrays of the same
+/// Every [`Array`](crate::Array) holds a clone of the context it was created on. When the last
+/// handle (context or array) is dropped, the context's kernels and buffers are freed; the GPU
+/// device itself stays open and is reused by the next [`Context::new`]. Arrays can only be
+/// combined with arrays of the same
 /// context. Most programs never create one: [`default_context`] opens the GPU on first use and
 /// the constructors without an `_on` suffix use it.
 ///
@@ -336,6 +359,12 @@ struct Inner {
 /// recorded after every use of the old one), and every uniform value lives in its own slot until
 /// its batch is submitted. The launches of a batch are recorded into one compute pass, and
 /// everything that is already bound (pipeline, grid uniform, bind groups) is not bound again.
+///
+/// # Memory
+/// Array data beyond the device's memory budget (80% of the device-local memory on Vulkan GPUs,
+/// or [`ContextOptions::memory_budget`] / `LUMA_MEMORY_BUDGET`) or beyond what the driver will
+/// allocate is not an error: the least recently used buffers move to host memory and come back
+/// when an operation needs them, with a one-time warning. [`Context::spilled_bytes`] counts it.
 ///
 /// # Example
 /// ```no_run
@@ -374,31 +403,124 @@ pub fn flush() -> Result<()> {
     default_context()?.flush()
 }
 
-impl Context {
-    /// Opens the default high-performance GPU. Blocks until the device is ready.
-    pub fn new() -> Result<Context> {
-        // Unit tests open and drop a device each. The NVIDIA driver (615.71) then intermittently
-        // miscomputes on the next fresh device or deadlocks tearing one down, unless another device
-        // stays open for the whole process.
-        #[cfg(test)]
-        {
-            static KEEPALIVE: std::sync::LazyLock<Option<Context>> = std::sync::LazyLock::new(|| Context::open().ok());
-            std::sync::LazyLock::force(&KEEPALIVE);
-        }
-        Context::open()
+/// Which kind of device a [`Context`] runs on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DeviceKind {
+    /// A GPU if one opens, otherwise the CPU through a software driver. Resolved once per process.
+    #[default]
+    Auto,
+    /// A hardware GPU only; [`LumaError::NoDevice`] if only a software adapter exists.
+    Gpu,
+    /// A software (CPU) adapter such as Mesa llvmpipe.
+    Cpu,
+}
+
+/// How a [`Context`] is opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ContextOptions {
+    /// The kind of device to open.
+    pub device: DeviceKind,
+    /// Bytes of array data kept on the device. `None`: 80% of the device's memory where the
+    /// backend reports it (never on CPU devices), otherwise unlimited.
+    pub memory_budget: Option<u64>,
+    /// Largest buffer an array is split into: a power of two from 1024 up to the largest
+    /// bindable size. `None`: that size, or less when a memory budget is set.
+    pub chunk_bytes: Option<u64>,
+}
+
+impl ContextOptions {
+    /// Sets the kind of device to open.
+    pub fn device(mut self, kind: DeviceKind) -> Self {
+        self.device = kind;
+        self
     }
 
-    fn open() -> Result<Context> {
-        let (device, queue, adapter) = pollster::block_on(handle::request_device())?;
+    /// Sets the number of bytes of array data kept on the device.
+    pub fn memory_budget(mut self, bytes: u64) -> Self {
+        self.memory_budget = Some(bytes);
+        self
+    }
+
+    /// Sets the largest buffer an array is split into (a power of two from 1024 up to the
+    /// largest bindable size; checked by [`Context::with_options`]).
+    pub fn chunk_bytes(mut self, bytes: u64) -> Self {
+        self.chunk_bytes = Some(bytes);
+        self
+    }
+
+    /// Options from the environment: `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`),
+    /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts.
+    pub fn from_env() -> ContextOptions {
+        let device = match std::env::var("LUMA_DEVICE").ok().as_deref().map(str::trim) {
+            Some("gpu") => DeviceKind::Gpu,
+            Some("cpu") => DeviceKind::Cpu,
+            _ => DeviceKind::Auto,
+        };
+        let bytes = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        ContextOptions {
+            device,
+            memory_budget: bytes("LUMA_MEMORY_BUDGET"),
+            chunk_bytes: bytes("LUMA_CHUNK_BYTES"),
+        }
+    }
+}
+
+/// The largest power of two not above `x` (1 for `x` of 0 or 1): the segment size that fits a
+/// buffer limit or a fraction of the memory budget.
+fn pow2_floor(x: u64) -> u64 {
+    1 << (63 - x.max(1).leading_zeros())
+}
+
+impl Context {
+    /// Opens the device chosen by `LUMA_DEVICE` (`gpu` | `cpu`; by default the high-performance
+    /// GPU, or the CPU through a software driver such as Mesa llvmpipe when no GPU exists).
+    /// Blocks until the device is ready.
+    pub fn new() -> Result<Context> {
+        Context::with_options(ContextOptions::from_env())
+    }
+
+    /// Opens a software (CPU) device, for example Mesa llvmpipe, whatever GPUs exist.
+    pub fn cpu() -> Result<Context> {
+        Context::with_options(ContextOptions { device: DeviceKind::Cpu, ..ContextOptions::from_env() })
+    }
+
+    /// Whether this context runs on a software (CPU) device.
+    pub fn is_cpu(&self) -> bool {
+        self.inner.gpu.0.cpu
+    }
+
+    /// Opens a device as `options` say, without looking at the environment. Blocks until the
+    /// device is ready.
+    pub fn with_options(options: ContextOptions) -> Result<Context> {
+        // Leased at once: an early `Err` below must return the device to the pool, not destroy it.
+        let gpu = Lease(handle::acquire(options.device)?);
+        let device = gpu.0.device.clone();
         let limits = device.limits();
         let max_buffer_bytes = limits
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size);
+        let limit = pow2_floor(max_buffer_bytes & !3); // largest power of two <= the bindable size
+        // 80% of the device's memory, except on CPU devices, whose "device memory" is host RAM.
+        let budget = options.memory_budget.or(if gpu.0.cpu { None } else { gpu.0.memory.map(|m| m / 5 * 4) });
+        let segment_bytes = match options.chunk_bytes {
+            Some(b) if b.is_power_of_two() && (1024..=limit).contains(&b) => b,
+            Some(b) => {
+                return Err(LumaError::InvalidShape(format!(
+                    "chunk_bytes must be a power of two between 1024 and {limit}, got {b}"
+                )));
+            }
+            None => budget.map_or(limit, |b| pow2_floor(b / 8).clamp(1024, limit)),
+        };
+        // Idle buffer caches scale with the budget so that they cannot crowd out array data.
+        let cap = budget.map_or(1 << 30, |b| (b / 8).min(1 << 30));
 
         // wgpu panics on errors nobody handles. Record the first one instead and report it as an
         // `Err` at the next synchronization point.
         let gpu_error = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&gpu_error);
+        // Registered for every context: it replaces the previous owner's handler, so a reused device reports errors to its current context only.
         device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
             lock(&sink).get_or_insert_with(|| error.to_string());
         }));
@@ -438,16 +560,17 @@ impl Context {
                 max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
                 timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
                 zero_copy: device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
-                tuning: Tuning::for_adapter(&adapter, &limits, device.features()),
-                device,
-                queue,
+                tuning: Tuning::for_adapter(&gpu.0.adapter, &limits, device.features()),
+                gpu,
                 builtins: Mutex::new(FxMap::default()),
                 jit: JitState::new(&limits),
                 kernels: Mutex::new(FxMap::default()),
-                pool: Mutex::new(BufferPool::default()),
+                pool: Mutex::new(BufferPool::new(cap)),
                 released: Arc::new(Mutex::new(Vec::new())),
-                uploads: Arc::new(Mutex::new(FreeUploads::default())),
-                mappable: Arc::new(Mutex::new(FreeUploads::default())),
+                uploads: Arc::new(Mutex::new(FreeUploads::new(cap))),
+                mappable: Arc::new(Mutex::new(FreeUploads::new(cap))),
+                segment_bytes,
+                pager: Pager::new(budget),
                 unmapped: Mutex::new(Vec::new()),
                 batch: Mutex::new(batch),
                 gpu_error,
@@ -580,11 +703,26 @@ impl Context {
     }
 
     pub(crate) fn device(&self) -> &wgpu::Device {
-        &self.inner.device
+        &self.inner.gpu.0.device
     }
 
     pub(crate) fn queue(&self) -> &wgpu::Queue {
-        &self.inner.queue
+        &self.inner.gpu.0.queue
+    }
+
+    /// Bytes of a full segment of an array: the largest buffer an array is split into.
+    pub(crate) fn segment_bytes(&self) -> u64 {
+        self.inner.segment_bytes
+    }
+
+    /// Largest buffer that can be allocated and bound as a storage buffer.
+    pub(crate) fn max_buffer_bytes(&self) -> u64 {
+        self.inner.max_buffer_bytes
+    }
+
+    /// Which segments of arrays currently hold a device buffer.
+    pub(crate) fn pager(&self) -> &Pager {
+        &self.inner.pager
     }
 
     pub(crate) fn max_workgroups_per_dimension(&self) -> u32 {
@@ -658,7 +796,29 @@ impl Context {
         if !late.is_empty() {
             self.batch()?.bind_groups.forget(&late);
         }
-        self.create_buffer(size, usage, mapped).ok_or(LumaError::OutOfMemory { requested: size })
+        if let Some(buffer) = self.create_buffer(size, usage, mapped) {
+            return Ok(buffer);
+        }
+        // Still full: move array data to host memory, one segment at a time, until it fits.
+        while self.evict_one()? {
+            let mut idle = lock(&self.inner.pool).drain();
+            idle.extend(lock(&self.inner.mappable).drain());
+            idle.extend(lock(&self.inner.uploads).drain());
+            lock(&self.inner.released).extend(idle);
+            self.flush_locked(&mut *self.batch()?);
+            self.device()
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| LumaError::Poll(Arc::new(e)))?;
+            let mut late = lock(&self.inner.mappable).drain();
+            late.extend(lock(&self.inner.uploads).drain());
+            if !late.is_empty() {
+                self.batch()?.bind_groups.forget(&late);
+            }
+            if let Some(buffer) = self.create_buffer(size, usage, mapped) {
+                return Ok(buffer);
+            }
+        }
+        Err(LumaError::OutOfMemory { requested: size })
     }
 
     /// A new buffer, or `None` if the device is out of memory.
@@ -745,7 +905,7 @@ impl Context {
     }
 
     /// Takes a mapped `MAP_WRITE` buffer of `class` bytes from `pool`, polling completed
-    /// submissions (and waiting if more than [`MAX_FREE_UPLOAD_BYTES`] are in flight) before
+    /// submissions (and waiting if more bytes than the idle cap are in flight) before
     /// allocating a fresh one.
     fn take_upload_buffer(
         &self,
@@ -760,7 +920,11 @@ impl Context {
         if let Some(buffer) = lock(pool).take(class) {
             return Ok(buffer);
         }
-        if lock(pool).in_flight > MAX_FREE_UPLOAD_BYTES {
+        let (in_flight, cap) = {
+            let uploads = lock(pool);
+            (uploads.in_flight, uploads.cap)
+        };
+        if in_flight > cap {
             self.flush_locked(&mut *self.batch()?);
             self.device()
                 .poll(wgpu::PollType::wait_indefinitely())
@@ -779,6 +943,14 @@ impl Context {
         Ok(())
     }
 
+    /// Records copying `bytes` bytes from `src` at `src_offset` to `dst` at `dst_offset`, for
+    /// gathering the partial results of several segments into one buffer.
+    pub(crate) fn copy(&self, src: &Buffer, src_offset: u64, dst: &Buffer, dst_offset: u64, bytes: u64) -> Result<()> {
+        let mut guard = self.batch()?;
+        self.encoder(&mut guard).copy_buffer_to_buffer(src, src_offset, dst, dst_offset, bytes);
+        Ok(())
+    }
+
     /// The batch's command encoder, for commands that are not dispatches. The open compute pass
     /// (which borrows the encoder) ends first, so the commands recorded here run after the
     /// launches recorded before and before those recorded after.
@@ -791,11 +963,59 @@ impl Context {
         })
     }
 
-    /// Copies the first `bytes` bytes of `buffer` to the host, after everything recorded so far.
-    /// Large reads go in [`READ_CHUNK`] pieces, each its own submission, so copying one piece out
-    /// of its staging buffer overlaps the transfer of the next.
+    /// Copies the first `bytes` bytes of `buffer` into a new vector, see [`Context::read_into`].
     pub(crate) fn read<T: Pod>(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<T>> {
-        let len = usize::try_from(bytes).expect("array fits in memory") / std::mem::size_of::<T>();
+        self.read_vec(bytes, |dst| self.read_into(buffer, dst))
+    }
+
+    /// Copies the data of `storage` into a new vector, segment by segment.
+    pub(crate) fn read_storage<T: Pod>(&self, storage: &Storage) -> Result<Vec<T>> {
+        self.read_vec(storage.byte_len(), |dst| self.read_storage_into(storage, dst))
+    }
+
+    /// Copies the data of `storage` into `dst` (exactly `storage.byte_len()` bytes), after
+    /// everything recorded so far; on success every byte of `dst` is written.
+    pub(crate) fn read_storage_into(&self, storage: &Storage, dst: &mut [std::mem::MaybeUninit<u8>]) -> Result<()> {
+        let elem = storage.elem();
+        let mut rest = dst;
+        for j in 0..storage.segments() {
+            let (piece, tail) = rest.split_at_mut(storage.range(j).len() * elem);
+            storage.segment(j).read_into(piece)?;
+            rest = tail;
+        }
+        Ok(())
+    }
+
+    /// A vector of `bytes / size_of::<T>()` elements, in memory advised to use huge pages, that
+    /// `fill` writes completely.
+    fn read_vec<T: Pod>(
+        &self,
+        bytes: u64,
+        fill: impl FnOnce(&mut [std::mem::MaybeUninit<u8>]) -> Result<()>,
+    ) -> Result<Vec<T>> {
+        let len = usize::try_from(bytes)
+            .map_err(|_| LumaError::InvalidShape(format!("{bytes} bytes do not fit in host memory")))?
+            / std::mem::size_of::<T>();
+        let mut out: Vec<T> = Vec::with_capacity(len);
+        let spare = out.spare_capacity_mut();
+        // SAFETY: a `MaybeUninit<T>` slice viewed as the same bytes; `T: Pod` has no padding or
+        // invalid bit patterns, so any initialized bytes make valid elements.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(), len * std::mem::size_of::<T>())
+        };
+        advise_huge_pages(dst);
+        fill(dst)?;
+        // SAFETY: `fill` wrote all `len * size_of::<T>()` bytes.
+        unsafe { out.set_len(len) };
+        Ok(out)
+    }
+
+    /// Copies the first `dst.len()` bytes of `buffer` into `dst`, after everything recorded so
+    /// far; on success every byte of `dst` is written. Large reads go in [`READ_CHUNK`] pieces,
+    /// each its own submission, so copying one piece out of its staging buffer overlaps the
+    /// transfer of the next.
+    pub(crate) fn read_into(&self, buffer: &Buffer, dst: &mut [std::mem::MaybeUninit<u8>]) -> Result<()> {
+        let bytes = dst.len() as u64;
         let chunk = if bytes > 2 * READ_CHUNK { READ_CHUNK } else { bytes.max(1) };
         let mut staged = Vec::new();
         for offset in (0..bytes).step_by(chunk as usize) {
@@ -827,14 +1047,6 @@ impl Context {
             }
         }
 
-        let mut out: Vec<T> = Vec::with_capacity(len);
-        let spare = out.spare_capacity_mut();
-        // SAFETY: a `MaybeUninit<T>` slice viewed as the same bytes; `T: Pod` has no padding or
-        // invalid bit patterns, so any initialized bytes make valid elements.
-        let dst = unsafe {
-            std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(), len * std::mem::size_of::<T>())
-        };
-        advise_huge_pages(dst);
         let mut staged_iter = staged.into_iter().zip(maps);
         while let Some(((offset, size, staging), (submission, mapped))) = staged_iter.next() {
             let step = self.wait_map(submission, &mapped).and_then(|()| {
@@ -851,9 +1063,7 @@ impl Context {
             }
             self.recycle(staging);
         }
-        // SAFETY: the chunks cover all `len * size_of::<T>()` bytes, each written just above.
-        unsafe { out.set_len(len) };
-        Ok(out)
+        Ok(())
     }
 
     /// Waits for the GPU and returns the first `bytes` bytes of `staging`, a `MAP_READ` buffer
@@ -916,7 +1126,7 @@ impl Context {
         args: &[RawArg<'_>],
     ) -> Result<()> {
         let inner = &*self.inner;
-        let device = &inner.device;
+        let device = self.device();
         let align = inner.uniform_align;
         let Batch { encoder, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler, .. } =
             batch;
@@ -1200,8 +1410,9 @@ const GRID_BYTES: u64 = 16;
 const PARALLEL_COPY_MIN: usize = 8 << 20;
 
 /// `dst.copy_from_slice(src)` split over several threads for large copies: one core cannot
-/// saturate unified memory, and the page faults of a fresh destination spread out too.
-fn copy_parallel(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
+/// saturate unified memory, and the page faults of a fresh destination spread out too. The
+/// threads store past the cache (see [`copy_streaming`]).
+pub(crate) fn copy_parallel(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
     if src.len() < PARALLEL_COPY_MIN || threads == 1 {
         dst.write_copy_of_slice(src);
@@ -1210,11 +1421,45 @@ fn copy_parallel(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
     let chunk = src.len().div_ceil(threads).next_multiple_of(4096);
     std::thread::scope(|scope| {
         for (s, d) in src.chunks(chunk).zip(dst.chunks_mut(chunk)) {
-            scope.spawn(move || {
-                d.write_copy_of_slice(s);
-            });
+            scope.spawn(move || copy_streaming(s, d));
         }
     });
+}
+
+/// `dst.copy_from_slice(src)` with non-temporal stores: the destination lines are not read into
+/// the cache before being overwritten, which a large readback (bound by host memory bandwidth
+/// while the GPU's transfer writes the next chunk) would pay for with a third of its traffic.
+#[cfg(target_arch = "x86_64")]
+fn copy_streaming(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
+    use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
+    const LINE: usize = 64;
+    assert_eq!(src.len(), dst.len(), "source and destination lengths differ");
+    let head = dst.as_ptr().align_offset(LINE).min(dst.len());
+    let (dst_head, dst_body) = dst.split_at_mut(head);
+    let (src_head, src_body) = src.split_at(head);
+    dst_head.write_copy_of_slice(src_head);
+    let (src_lines, src_tail) = src_body.as_chunks::<LINE>();
+    let (dst_lines, dst_tail) = dst_body.as_chunks_mut::<LINE>();
+    for (s, d) in src_lines.iter().zip(dst_lines) {
+        for part in (0..LINE).step_by(16) {
+            // SAFETY: `part + 16 <= LINE`, so both pointers stay inside their 64-byte chunks;
+            // the load is unaligned, and `d` is 64-byte aligned (`head`), as the store requires.
+            // SSE2 is part of the x86_64 baseline.
+            unsafe {
+                let value = _mm_loadu_si128(s.as_ptr().add(part).cast::<__m128i>());
+                _mm_stream_si128(d.as_mut_ptr().add(part).cast::<__m128i>(), value);
+            }
+        }
+    }
+    // SAFETY: SSE is part of the x86_64 baseline. Orders the streaming stores before whatever
+    // reads the destination next, on any thread.
+    unsafe { _mm_sfence() };
+    dst_tail.write_copy_of_slice(src_tail);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn copy_streaming(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
+    dst.write_copy_of_slice(src);
 }
 
 /// The outcome of a `map_async` request, see [`map_for_read`].
@@ -1326,11 +1571,11 @@ mod tests {
         let ctx = Context::new().unwrap();
 
         let array = Array::<u32>::zeros_on(&ctx, 600).unwrap();
-        let storage = array.buffer().unwrap().clone();
+        let storage = array.buffer().unwrap();
         drop(array);
 
         let reused = Array::<u32>::zeros_on(&ctx, 1000).unwrap();
-        assert_eq!(reused.buffer().unwrap(), &storage);
+        assert_eq!(reused.buffer().unwrap(), storage);
     }
 
     #[test]
@@ -1338,7 +1583,7 @@ mod tests {
         let ctx = Context::new().unwrap();
 
         let a = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap();
-        let storage = a.buffer().unwrap().clone();
+        let storage = a.buffer().unwrap();
         let doubled = &a * 2.0;
         // Operators are lazy: record the multiplication (without waiting for it) so that it is
         // pending in the batch, reading a's buffer.
@@ -1350,7 +1595,7 @@ mod tests {
         // zero-copy buffer is only reusable after the next submission.)
         let b = Array::from_slice_on(&ctx, &[10.0f32, 20.0, 30.0], 3).unwrap();
         if !ctx.zero_copy() {
-            assert_eq!(b.buffer().unwrap(), &storage);
+            assert_eq!(b.buffer().unwrap(), storage);
         }
         assert!(ctx.pending_dispatches() > 0);
 
@@ -1365,6 +1610,8 @@ mod tests {
         assert_eq!(ctx.pending_dispatches(), 0);
 
         let mut x = Array::<f32>::zeros_on(&ctx, 16).unwrap();
+        // A view sharing the buffer makes every compound assignment a dispatch of its own.
+        let view = x.reshape(16);
         x += 2.0;
         x *= 3.0;
         assert_eq!(ctx.pending_dispatches(), 2);
@@ -1373,7 +1620,7 @@ mod tests {
 
         x += 1.0; // recorded after the flush, runs after it
         assert_eq!(ctx.pending_dispatches(), 1);
-        assert_eq!(x.to_vec().unwrap(), vec![7.0; 16]);
+        assert_eq!(view.to_vec().unwrap(), vec![7.0; 16]);
     }
 
     #[test]
@@ -1397,6 +1644,8 @@ mod tests {
     fn batch_is_submitted_at_the_dispatch_limit() {
         let ctx = Context::new().unwrap();
         let mut x = Array::<f32>::zeros_on(&ctx, 8).unwrap();
+        // A second array shares the buffer, so every `+=` is a dispatch of its own.
+        let _view = x.reshape(8);
         for i in 0..BATCH_LIMIT * 2 + 5 {
             x += 1.0;
             assert!(ctx.pending_dispatches() < BATCH_LIMIT, "after {i} operations");

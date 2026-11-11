@@ -248,9 +248,11 @@ fn deep_chains_are_split_at_the_node_limit() {
     assert_close(&y.to_vec().unwrap(), &want, 1e-4, 1e-4);
     let d = delta(before, ctx.jit().stats());
     assert_eq!(d.elementwise_launches, 4);
-    // Three full pieces share one pipeline, the remainder is another one.
-    assert_eq!(d.built, 2);
-    assert_eq!(d.hits, 2);
+    // The first piece reads `x`, which stays alive, so it writes a new buffer; the later pieces
+    // read a dying temporary and write over it, which is a different kernel. Of those, the
+    // second and third full pieces share one pipeline, the remainder is another one.
+    assert_eq!(d.built, 3);
+    assert_eq!(d.hits, 1);
 
     // With a limit of one, every operation is a kernel of its own.
     let ctx = Context::new().unwrap();
@@ -275,7 +277,7 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
     let before = ctx.jit().stats();
     let mut acc = &arrays[0] + &arrays[1];
     for a in &arrays[2..] {
-        acc = acc + a;
+        acc += a;
     }
     let got = acc.to_vec().unwrap();
     let want: Vec<f32> = (0..300).map(|j| data.iter().map(|d| d[j]).sum()).collect();
@@ -380,14 +382,84 @@ fn compound_assignment_on_a_lazy_array_fuses() {
     let want: Vec<f32> = xs.iter().map(|&v| (v * 2.0 + 1.0) * v - 0.5).collect();
     assert_close(&got, &want, 1e-5, 1e-5);
 
-    // An array that already has a buffer is updated in place, one dispatch per operator.
+    // An array that already has a buffer and no other holder is lazy too; evaluating it runs one
+    // kernel for both operators, in the array's own buffer.
     let mut z = f32s(&ctx, &xs);
     let before = ctx.jit().stats();
     z += 1.0;
     z *= 2.0;
-    assert_eq!(ctx.pending_dispatches(), 2);
+    assert_eq!(ctx.pending_dispatches(), 0);
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
     let want: Vec<f32> = xs.iter().map(|&v| (v + 1.0) * 2.0).collect();
+    assert_close(&z.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+}
+
+#[test]
+fn compound_assignment_on_a_solely_owned_array_reuses_its_buffer() {
+    let ctx = Context::new().unwrap();
+    let xs = values(1000, 15, -1.0, 1.0);
+    let mut z = f32s(&ctx, &xs);
+    let buffer = z.buffer();
+    let before = ctx.jit().stats();
+    z += 1.0;
+    z *= 2.0;
+    let got = z.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = xs.iter().map(|&v| (v + 1.0) * 2.0).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+    assert_eq!(z.buffer(), buffer, "the result lives in the old buffer");
+}
+
+#[test]
+fn compound_assignment_on_a_shared_buffer_is_one_in_place_kernel() {
+    let ctx = Context::new().unwrap();
+    let xs = values(500, 16, -1.0, 1.0);
+    let a = f32s(&ctx, &xs);
+    let b = f32s(&ctx, &values(500, 17, -1.0, 1.0));
+    let x = f32s(&ctx, &xs);
+    let view = x.reshape(500);
+    let mut y = x.reshape(500);
+    drop(x);
+
+    let before = ctx.jit().stats();
+    y += &(&a * &b);
+    // The product is part of the kernel, not a buffer of its own.
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = xs
+        .iter()
+        .zip(a.to_vec().unwrap().iter().zip(b.to_vec().unwrap()))
+        .map(|(&x, (&p, q))| x + p * q)
+        .collect();
+    assert_close(&y.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    assert_close(&view.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+}
+
+#[test]
+fn compound_assignment_does_not_change_earlier_expressions() {
+    let ctx = Context::new().unwrap();
+    let xs = values(64, 18, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let mut x2 = x.reshape(64);
+    let p = &x * 2.0;
+    x2 += 10.0;
+    let want: Vec<f32> = xs.iter().map(|&v| v * 2.0).collect();
+    assert_close(&p.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    let want: Vec<f32> = xs.iter().map(|&v| v + 10.0).collect();
+    assert_close(&x.to_vec().unwrap(), &want, 1e-6, 1e-6);
+}
+
+#[test]
+fn a_dying_input_read_through_a_shift_is_not_overwritten() {
+    let ctx = Context::new().unwrap();
+    let xs = values(257, 19, -1.0, 1.0);
+    let mut z = f32s(&ctx, &xs);
+    // `z` is the only holder of its buffer once the old array is replaced, but the expression
+    // reads it at other elements than the one it writes.
+    z = z.shift(1) + &z;
+    let n = xs.len();
+    let want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] + xs[i]).collect();
     assert_close(&z.to_vec().unwrap(), &want, 1e-6, 1e-6);
 }
 

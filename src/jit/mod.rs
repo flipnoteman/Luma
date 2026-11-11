@@ -38,6 +38,13 @@
 //! reads the buffer is evaluated ([`Readers`]). Nodes hold their input buffers, so a buffer is
 //! not recycled while a lazy array still needs it. Dropping a lazy array that was never used
 //! costs nothing.
+//!
+//! # Writing in place
+//!
+//! A store kernel whose output replaces an input that nothing else holds (a dying temporary or
+//! a solely owned array) reuses that buffer instead of allocating one, as long as the input is
+//! read only at the element being written (not through a shift). Compound assignment on an array
+//! whose buffer is shared is such a kernel too, forced onto the shared buffer.
 
 mod codegen;
 mod program;
@@ -57,7 +64,7 @@ use crate::error::{LumaError, Result};
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 
-pub(crate) use program::{evaluate, evaluate_group, reduce_first_pass};
+pub(crate) use program::{evaluate, evaluate_group, evaluate_into, reduce_first_pass};
 pub(crate) use stencil::plan as stencil_plan;
 
 /// Most operations one fused kernel contains unless configured otherwise.
@@ -263,6 +270,14 @@ impl Node {
 
     pub(crate) fn is_pending(&self) -> bool {
         self.result.get().is_none()
+    }
+
+    /// The buffer of a node that was evaluated successfully.
+    pub(crate) fn evaluated(&self) -> Option<&Arc<Storage>> {
+        match self.result.get() {
+            Some(Ok(storage)) => Some(storage),
+            _ => None,
+        }
     }
 
     /// The error of a failed evaluation.
@@ -519,7 +534,11 @@ const MAX_RECOMPUTED: usize = 16;
 /// level: an expression that already recomputes a shifted one is evaluated, or every further
 /// stencil step would multiply the work by its number of shifts.
 pub(crate) fn recompute_shifted(node: &Node) -> bool {
-    node.size() <= MAX_RECOMPUTED && !node.recomputes
+    // A recomputed expression runs inside kernels of segmented programs only if it fits one
+    // segment, so segmented programs have no sub-programs.
+    node.size() <= MAX_RECOMPUTED
+        && !node.recomputes
+        && node.len() as u64 * 4 <= node.context().segment_bytes()
 }
 
 /// Smallest list length worth pruning.
@@ -700,13 +719,14 @@ impl JitState {
     }
 
     /// The kernel for `key`, generated and compiled on first use.
-    fn kernel(&self, ctx: &Context, key: program::FusedKey) -> Result<Arc<KernelCore>> {
+    fn kernel(&self, ctx: &Context, key: &program::FusedKey) -> Result<Arc<KernelCore>> {
         let mut cache = lock(&self.kernels);
-        if let Some(core) = cache.get(&key) {
+        if let Some(core) = cache.get(key) {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(core));
         }
-        let source = codegen::source(&key, ctx.tuning());
+        let segment_len = u32::try_from(ctx.segment_bytes() / 4).unwrap_or(u32::MAX);
+        let source = codegen::source(key, ctx.tuning(), segment_len);
         let label = key.label();
         let core = Arc::new(kernel::build_core(
             ctx,
@@ -715,7 +735,7 @@ impl JitState {
             true,
         )?);
         self.stats.built.fetch_add(1, Ordering::Relaxed);
-        cache.insert(key, Arc::clone(&core));
+        cache.insert(key.clone(), Arc::clone(&core));
         Ok(core)
     }
 

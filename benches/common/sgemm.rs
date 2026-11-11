@@ -150,7 +150,7 @@ impl CoopKind {
         match ctx.tuning_profile() {
             luma::TuningProfile::Nvidia => Some(CoopKind::F16),
             luma::TuningProfile::Apple => Some(CoopKind::F32),
-            luma::TuningProfile::Generic => None,
+            _ => None,
         }
     }
 

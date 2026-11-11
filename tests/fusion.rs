@@ -44,7 +44,7 @@ fn chains_of_every_length_match_the_cpu() {
                     }
                 }
                 1 => {
-                    acc = acc * 0.99;
+                    acc *= 0.99;
                     want.iter_mut().for_each(|w| *w *= 0.99);
                 }
                 2 => {

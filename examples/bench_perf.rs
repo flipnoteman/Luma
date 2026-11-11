@@ -90,6 +90,27 @@ fn main() -> Result<()> {
         });
         report("z += 1.0", ms, nf * 8.0, "GB/s");
     }
+    if want("chain") {
+        let mut z = &x * 1.0;
+        z.eval()?;
+        let ms = median(|| {
+            z += &(&x * &y);
+            z *= 0.5;
+            z -= 0.25;
+            z.eval().unwrap();
+        });
+        report("z += x*y; z *= .5; z -= .25", ms, nf * 16.0, "GB/s(min)");
+    }
+    if want("view") {
+        let mut z = &x * 1.0;
+        z.eval()?;
+        let view = z.reshape(n);
+        let ms = median(|| {
+            z += &(&x * &y);
+            view.eval().unwrap();
+        });
+        report("shared z += x*y", ms, nf * 16.0, "GB/s(min)");
+    }
     if want("conv") {
         for taps in [64usize, 1024] {
             let k: Vec<f32> = (0..taps).map(|i| 1.0 / (i as f32 + 1.0)).collect();
@@ -134,6 +155,14 @@ fn main() -> Result<()> {
             black_box(x.to_vec().unwrap());
         });
         report("to_vec", ms, nf * 4.0, "GB/s");
+    }
+    if want("read_into") {
+        let mut host = vec![0.0f32; n];
+        let ms = median(|| {
+            x.read_into(&mut host).unwrap();
+            black_box(&host);
+        });
+        report("read_into", ms, nf * 4.0, "GB/s");
     }
     Ok(())
 }

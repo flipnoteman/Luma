@@ -171,16 +171,16 @@ fn reshape_with_the_wrong_element_count_is_poisoned() {
 }
 
 #[test]
-fn arrays_that_share_a_buffer_cannot_be_written_and_read_in_one_operation() {
+fn compound_assignment_with_a_view_of_the_same_buffer_reads_before_it_writes() {
     let a = f32s(&[1.0, 2.0, 3.0, 4.0]);
     let mut view = a.reshape([2, 2]);
     let same_shape = a.reshape([2, 2]);
-    view += &same_shape; // would read and write one buffer in a single dispatch
-    let err = view.to_vec().unwrap_err();
-    assert!(matches!(err.root(), LumaError::KernelArgAlias { .. }), "{err}");
+    view += &same_shape; // reads and writes one buffer: each element is read, then written
+    assert_eq!(view.to_vec().unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
 
-    // The original is unharmed.
-    assert_eq!(a.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    // The arrays sharing the buffer see the update.
+    assert_eq!(a.to_vec().unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
+    assert_eq!(same_shape.to_vec().unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
 }
 
 #[test]

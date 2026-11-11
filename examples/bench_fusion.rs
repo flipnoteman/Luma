@@ -48,9 +48,11 @@ fn gb_per_s(bytes: f64, ms: f64) -> f64 {
 
 fn main() -> Result<()> {
     // The fusion limit is read when a context is created.
-    std::env::set_var("LUMA_FUSION_MAX_NODES", "1");
+    // SAFETY: no other thread exists yet, so nothing reads the environment concurrently.
+    unsafe { std::env::set_var("LUMA_FUSION_MAX_NODES", "1") };
     let eager_ctx = Context::new()?;
-    std::env::remove_var("LUMA_FUSION_MAX_NODES");
+    // SAFETY: the only other threads are the first context's, which do not read the environment.
+    unsafe { std::env::remove_var("LUMA_FUSION_MAX_NODES") };
     let fused_ctx = Context::new()?;
 
     println!("Elementwise fusion: eager (one kernel per operation) vs fused (one kernel per chain)");

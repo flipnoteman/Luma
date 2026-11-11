@@ -241,7 +241,7 @@ fn rotate(v: &str, num: u32, den: u32, sign: f64) -> String {
         } else {
             format!("vec2<f32>({v}.y, -{v}.x)")
         }
-    } else if (8 * num) % den == 0 {
+    } else if (8 * num).is_multiple_of(den) {
         // Odd multiples of pi/4: both parts have magnitude 1/sqrt(2).
         let sc = if c > 0.0 { "" } else { "-" };
         let re = format!("{sc}{v}.x {} {v}.y", if s > 0.0 { "-" } else { "+" });
@@ -258,33 +258,23 @@ fn bit_reverse(p: u32, r: u32) -> u32 {
 }
 
 /// Where a region reads its values from or writes them to: global memory, or workgroup memory
-/// at the plain index or at its `sx` swizzle.
+/// at the `sx` swizzle of the index.
 #[derive(Clone, Copy, PartialEq)]
 enum Mem {
     Global,
-    Plain,
     Swizzled,
 }
 
-impl Mem {
-    fn slot(self, at: &str) -> String {
-        match self {
-            Mem::Global => unreachable!("global memory has no slots"),
-            Mem::Plain => format!("sh[{at}]"),
-            Mem::Swizzled => format!("sh[sx({at})]"),
-        }
-    }
-}
-
-/// One thread's step of a local pass: it reads its run of values into registers, applies the
-/// forward group (decimation in frequency: butterflies with constant twiddles, then each value
-/// times `w^bit_reverse(position)`), the product with the spectrum `h`, the inverse group (the
-/// same steps mirrored), and writes the run back. `fwd` and `inv` cover the same run when both
-/// are given.
+/// One thread's step of a local pass: it reads its run of values (`group`) into registers,
+/// applies the forward group if `fwd` (decimation in frequency: butterflies with constant
+/// twiddles, then each value times `w^bit_reverse(position)`), the product with the spectrum
+/// `h` if `multiply`, the inverse group if `inv` (the same steps mirrored), and writes the run
+/// back. A region with both `fwd` and `inv` applies the same group in both directions.
 struct Region {
-    fwd: Option<Group>,
+    group: Group,
+    fwd: bool,
     multiply: bool,
-    inv: Option<Group>,
+    inv: bool,
     read: Mem,
     write: Mem,
 }
@@ -343,7 +333,7 @@ impl Region {
 
     /// The statements for a tile of `2^k` values.
     fn source(&self, k: u32) -> String {
-        let g = self.fwd.or(self.inv).expect("a region needs a group");
+        let g = self.group;
         let n = 1u32 << g.r;
         let spacing = 1u32 << g.s;
         let at = |m: u32| format!("(i0 + {}u)", spacing * m);
@@ -351,24 +341,24 @@ impl Region {
         for m in 0..n {
             body += &match self.read {
                 Mem::Global => format!("var x{m} = load(base + {});\n", at(m)),
-                mem => format!("var x{m} = {};\n", mem.slot(&at(m))),
+                Mem::Swizzled => format!("var x{m} = sh[sx({})];\n", at(m)),
             };
         }
-        if let Some(f) = self.fwd {
-            body += &Self::forward(f);
+        if self.fwd {
+            body += &Self::forward(g);
         }
         if self.multiply {
             for m in 0..n {
                 body += &format!("x{m} = cmul(x{m}, h[(base + {}) & mask]);\n", at(m));
             }
         }
-        if let Some(i) = self.inv {
-            body += &Self::inverse(i);
+        if self.inv {
+            body += &Self::inverse(g);
         }
         for m in 0..n {
             body += &match self.write {
                 Mem::Global => format!("store(base + {}, x{m});\n", at(m)),
-                mem => format!("{} = x{m};\n", mem.slot(&at(m))),
+                Mem::Swizzled => format!("sh[sx({})] = x{m};\n", at(m)),
             };
         }
         let threads = 1u32 << (k - g.r);
@@ -400,6 +390,12 @@ let i0 = ((q >> {}u) << {}u) | j;
 /// The body of a local pass over a tile of `2^k` values. Values are exchanged through workgroup
 /// memory between groups only; the last forward group and the first inverse group are the same
 /// run per thread, so the product with the spectrum sits between them in registers.
+///
+/// Invariant: every region reads and writes workgroup memory at its own slots under one index
+/// mapping (the `sx` swizzle, which also spreads runs of 16 values over distinct memory banks).
+/// Mixing mappings inside a region makes a thread overwrite a slot another thread has not read
+/// yet, which is a data race that only goes unnoticed where 16 or more invocations run in
+/// lockstep.
 fn local_body(multiply: bool, k: u32) -> String {
     if k == 0 {
         let value = if multiply {
@@ -409,42 +405,33 @@ fn local_body(multiply: bool, k: u32) -> String {
         };
         return format!("if (lid == 0u) {{ store(base, {value}); }}\n");
     }
-    // (forward group, product, inverse group) per region.
-    let mut steps: Vec<(Option<Group>, bool, Option<Group>)> = Vec::new();
     let forward = forward_groups(k);
+    let mut regions: Vec<Region> = Vec::new();
+    for (i, &group) in forward.iter().enumerate() {
+        // With the product, the last forward group and the first inverse group are one run.
+        let fused = multiply && i + 1 == forward.len();
+        regions.push(Region { group, fwd: true, multiply: fused, inv: fused, read: Mem::Swizzled, write: Mem::Swizzled });
+    }
     if multiply {
         let inverse = inverse_groups(k);
         debug_assert_eq!(forward.last(), inverse.first());
-        steps.extend(forward[..forward.len() - 1].iter().map(|&g| (Some(g), false, None)));
-        steps.push((forward.last().copied(), true, inverse.first().copied()));
-        steps.extend(inverse[1..].iter().map(|&g| (None, false, Some(g))));
-    } else {
-        steps.extend(forward.iter().map(|&g| (Some(g), false, None)));
+        regions.extend(inverse.into_iter().skip(1).map(|group| Region {
+            group,
+            fwd: false,
+            multiply: false,
+            inv: true,
+            read: Mem::Swizzled,
+            write: Mem::Swizzled,
+        }));
     }
-    let run = |i: usize| steps[i].0.or(steps[i].2).expect("a region needs a group");
-    // Runs shorter than a bank row put every thread of a warp on the same banks, so those
-    // exchanges swizzle the indices; longer strides are conflict-free as they are.
-    let exchange = |i: usize| {
-        if run(i).s < 4 || run(i + 1).s < 4 {
-            Mem::Swizzled
-        } else {
-            Mem::Plain
-        }
-    };
-    let last = steps.len() - 1;
+    if let Some(first) = regions.first_mut() {
+        first.read = Mem::Global;
+    }
+    if multiply && let Some(last) = regions.last_mut() {
+        last.write = Mem::Global;
+    }
     let mut body = String::new();
-    for (i, &(fwd, multiply_here, inv)) in steps.iter().enumerate() {
-        let region = Region {
-            fwd,
-            multiply: multiply_here,
-            inv,
-            read: if i == 0 { Mem::Global } else { exchange(i - 1) },
-            write: match (i < last, multiply) {
-                (true, _) => exchange(i),
-                (false, true) => Mem::Global,
-                (false, false) => Mem::Swizzled,
-            },
-        };
+    for region in &regions {
         body += &region.source(k);
     }
     if !multiply {

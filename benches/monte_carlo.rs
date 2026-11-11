@@ -127,14 +127,14 @@ fn ln(x: f32) -> f32 {
     let p = p.mul_add(x, -1.666_805_8e-1);
     let p = p.mul_add(x, 2.000_071_5e-1);
     let p = p.mul_add(x, -2.499_999_4e-1);
-    let p = p.mul_add(x, 3.333_333_2e-1);
+    let p = p.mul_add(x, 3.333_333e-1);
     let y = p * x * z + e * -2.121_944_4e-4 - 0.5 * z;
     x + y + e * 0.693_359_4
 }
 
 #[inline(always)]
 fn exp(x: f32) -> f32 {
-    let x = x.max(-87.0).min(87.0);
+    let x = x.clamp(-87.0, 87.0);
     let n = (x * std::f32::consts::LOG2_E + 0.5).floor();
     let r = (-n).mul_add(0.693_359_4, x);
     let r = (-n).mul_add(-2.121_944_4e-4, r);
@@ -143,7 +143,7 @@ fn exp(x: f32) -> f32 {
     let p = p.mul_add(r, 8.333_452e-3);
     let p = p.mul_add(r, 4.166_579_6e-2);
     let p = p.mul_add(r, 1.666_666_5e-1);
-    let p = p.mul_add(r, 5.000_000_1e-1);
+    let p = p.mul_add(r, 5e-1);
     let y = (p * (r * r)) + r + 1.0;
     y * f32::from_bits(((n as i32 + 127) as u32) << 23)
 }
@@ -800,7 +800,7 @@ struct BlockedRun<T: GpuType> {
 impl<T: GpuType> BlockedRun<T> {
     /// `k` half-sweeps per launch.
     fn new(k: u32, shape: IsingShape, state: [Array<T>; 2], scratch: [Array<T>; 2]) -> Self {
-        assert!(2 * shape.hw % TILE_X == 0 && shape.h % TILE_Y == 0, "ising: tiles must cover the lattice");
+        assert!((2 * shape.hw).is_multiple_of(TILE_X) && shape.h.is_multiple_of(TILE_Y), "ising: tiles must cover the lattice");
         let cell = CELL_FLOATS;
         let source = format!(
             "const K: u32 = {k}u;\nconst TX: u32 = {TILE_X}u;\nconst TY: u32 = {TILE_Y}u;\n\
@@ -851,7 +851,7 @@ fn flip(s: f32, n: f32, site: u32, tag: u32, p4: f32, p8: f32) -> f32 {
 }
 
 /// Updates row `j` of the plane `mine` (color `c`) from the plane `other`.
-fn ising_row(mine: &mut [f32], other: &[f32], j: usize, h: usize, c: usize, tag: u32, p4: f32, p8: f32) {
+fn ising_row(mine: &mut [f32], other: &[f32], j: usize, h: usize, c: usize, tag: u32, (p4, p8): (f32, f32)) {
     let hw = mine.len();
     let up = &other[((j + h - 1) % h) * hw..][..hw];
     let down = &other[((j + 1) % h) * hw..][..hw];
@@ -906,7 +906,7 @@ fn ising_cpu(planes: &mut [Vec<f32>; 2], hw: usize, h: usize, sweeps: usize, p4:
                         let other = unsafe { std::slice::from_raw_parts(shared.plane(1 - c), hw * h) };
                         for j in rows.clone() {
                             let mine = unsafe { std::slice::from_raw_parts_mut(shared.plane(c).add(j * hw), hw) };
-                            ising_row(mine, other, j, h, c, (sweep * 2 + c) as u32, p4, p8);
+                            ising_row(mine, other, j, h, c, (sweep * 2 + c) as u32, (p4, p8));
                         }
                         barrier.wait();
                     }
@@ -984,7 +984,7 @@ fn ising(c: &mut Criterion) {
     // The blocked kernel takes four consecutive entries of a plane row per element.
     let to_floats = |planes: &[Vec<f32>; 2]| {
         planes.each_ref().map(|plane| {
-            let quads: Vec<[f32; 4]> = plane.chunks_exact(4).map(|q| [q[0], q[1], q[2], q[3]]).collect();
+            let quads: Vec<[f32; 4]> = plane.as_chunks::<4>().0.iter().map(|q| [q[0], q[1], q[2], q[3]]).collect();
             Array::from_slice(&quads, [hw / 4, h]).unwrap()
         })
     };

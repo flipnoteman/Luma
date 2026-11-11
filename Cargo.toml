@@ -1,9 +1,16 @@
 [package]
 name = "luma"
-version = "0.1.3"
-edition = "2026"
+version = "0.2.0"
+edition = "2024"
 description = "GPU driven linear algebra/math library."
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/flipnoteman/Luma"
+documentation = "https://docs.rs/luma"
+keywords = ["gpu", "wgpu", "array", "math", "compute"]
+categories = ["science", "mathematics", "concurrency"]
+rust-version = "1.99"
+exclude = [".github/"]
 
 [dependencies]
 wgpu = "30"

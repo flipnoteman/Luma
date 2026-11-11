@@ -35,14 +35,17 @@ I/O dependant, operations.
 - `vec2`/`vec4` element types
 - Built-in arithmetic operators, math functions, comparisons, `select`, `clamp`, circular `shift`
 - Reductions: sum, min, max, mean, norm
-- Lazy evaluation: elementwise chains compile into a single kernel
+- Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
+- Readback into a new `Vec` (`to_vec`) or into host memory you already own (`read_into`)
 - Multi-step stencils with `iterate`
 - Ability to use custom WGSL kernels
 - Subgroups, `f16` and cooperative matrices (tensor cores) on GPUs that support them
 - Kernel tuning per GPU vendor (Apple and NVIDIA measured, generic defaults elsewhere)
 - Useful error handling
 - Per-kernel GPU timing with `ctx.profile(..)`
+- CPU fallback through Mesa llvmpipe when no GPU is present
+- Arrays larger than one device buffer or than device memory
 
 ## Getting started
 
@@ -52,7 +55,7 @@ Add Luma to a project:
 
 ```toml
 [dependencies]
-luma = "0.1"
+luma = "0.2"
 ```
 
 Or build it from source:
@@ -64,10 +67,34 @@ cargo build --release
 cargo test
 ```
 
+### No GPU
+
+Without a GPU, Luma runs through Mesa's llvmpipe, a software Vulkan driver. It is not built into Luma: the driver has to be
+installed on the machine (`mesa-vulkan-drivers` on most Linux distributions), otherwise opening a context returns an error.
+It is picked automatically when no GPU opens. `LUMA_DEVICE=cpu` or `Context::cpu()` force it, and `LUMA_DEVICE=gpu` refuses
+the fallback and returns an error instead.
+
+### Large arrays
+
+An array bigger than one device buffer is split over several buffers automatically, and the built-in operations run over them
+in pieces. Array data beyond the device memory budget (80% of device memory on Vulkan GPUs) moves to host memory and back
+on demand, with a one-time warning. Custom kernels need arrays that fit one buffer.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `LUMA_DEVICE` | `gpu` or `cpu`: restrict the device kind (default: GPU, CPU as fallback) |
+| `LUMA_MEMORY_BUDGET` | Bytes of array data kept on the device before spilling to host memory |
+| `LUMA_CHUNK_BYTES` | Largest buffer an array is split into, in bytes (power of two) |
+| `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
+| `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
+| `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel |
+
 ### Examples
 
 ```sh
-cargo run --example double_test                        # expressions, select, reductions
+cargo run --example basics                             # expressions, select, reductions
 cargo run --example conv1d                             # 1D convolution
 cargo run --example custom_kernel                      # custom WGSL kernel
 cargo run --release --example bench_conv1d             # direct vs FFT convolution

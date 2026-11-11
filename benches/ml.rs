@@ -16,19 +16,6 @@ fn threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
-/// Runs `f(first_row, rows)` over contiguous runs of `row_len`-element rows of `out`, one run
-/// per thread.
-fn par_rows<T: Send>(out: &mut [T], row_len: usize, f: impl Fn(usize, &mut [T]) + Sync) {
-    let rows = out.len() / row_len;
-    let per = rows.div_ceil(threads()).max(1);
-    std::thread::scope(|s| {
-        for (i, chunk) in out.chunks_mut(per * row_len).enumerate() {
-            let f = &f;
-            s.spawn(move || f(i * per, chunk));
-        }
-    });
-}
-
 /// Deterministic values in `lo..hi`.
 fn values(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
     let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -513,39 +500,6 @@ impl MlpGpu {
     }
 }
 
-/// `h = max(h + bias, 0)` on every row.
-fn bias_relu_cpu(h: &mut [f32], bias: &[f32]) {
-    par_rows(h, bias.len(), |_, rows| {
-        for row in rows.chunks_exact_mut(bias.len()) {
-            for (v, b) in row.iter_mut().zip(bias) {
-                *v = (*v + *b).max(0.0);
-            }
-        }
-    });
-}
-
-/// Row-wise softmax of `logits + bias`, 10 classes per row.
-fn softmax_cpu(logits: &[f32], bias: &[f32], probs: &mut [f32]) {
-    par_rows(probs, CLASSES, |first, rows| {
-        for (i, out) in rows.chunks_exact_mut(CLASSES).enumerate() {
-            let row = &logits[(first + i) * CLASSES..][..CLASSES];
-            let mut z = [0.0f32; CLASSES];
-            for ((z, l), b) in z.iter_mut().zip(row).zip(bias) {
-                *z = l + b;
-            }
-            let max = z.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
-            let mut sum = 0.0;
-            for (o, z) in out.iter_mut().zip(z) {
-                *o = (z - max).exp();
-                sum += *o;
-            }
-            for o in out.iter_mut() {
-                *o /= sum;
-            }
-        }
-    });
-}
-
 #[cfg(target_os = "macos")]
 struct MlpCpuBuffers {
     h1: Vec<f32>,
@@ -610,7 +564,7 @@ fn mlp(c: &mut Criterion) {
         let want = gpu_f32_probs;
         let got = gpu.probs.to_vec().unwrap();
         check("mlp coop probabilities", &got, &want, kind.tolerance(1e-3, 5e-3));
-        for row in got.chunks_exact(CLASSES) {
+        for row in got.as_chunks::<CLASSES>().0 {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-4, "mlp coop: probabilities do not sum to 1");
         }
     }

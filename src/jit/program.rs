@@ -1,16 +1,19 @@
 //! Flattening an expression graph into a [`FusedKey`] (the structure a kernel is generated and
 //! cached by) plus the runtime data (buffers, scalar values) it runs with.
 
+use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::array::{Failure, Storage};
+use crate::gpu::pager::Pin;
 use crate::builtin::ReduceList;
-use crate::context::{RawArg, Scratch, STORAGE_USAGE};
+use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d};
 
-use super::{Args, ElemTy, Node, Op, OpKind, Src};
+use super::codegen::direct;
+use super::{lock, Args, ElemTy, Node, Op, OpKind, ShiftKind, Src};
 
 /// Size of every element the fused kernels handle (`f32` and `u32`).
 const ELEMENT_BYTES: u64 = 4;
@@ -59,6 +62,13 @@ pub(crate) struct FusedKey {
     /// last instruction being the value.
     pub(crate) subs: Vec<Vec<Instr>>,
     pub(crate) tail: Tail,
+    /// Input `k` is not bound separately: it is the buffer of output 0, read at element `i`
+    /// before being overwritten (see [`in_place_eligible`]).
+    pub(crate) in_place: Option<u32>,
+    /// Per input, how many segments of it the program reads through shifts (0 = never): the
+    /// program is the segmented variant of the generated kernel, run once per segment of arrays
+    /// spanning several buffers. Empty when the program runs unsegmented or has no shift.
+    pub(crate) spans: Vec<u8>,
 }
 
 impl FusedKey {
@@ -263,6 +273,8 @@ impl Flattener {
                 subs: self.subs,
                 outputs,
                 tail,
+                in_place: None,
+                spans: Vec::new(),
             },
             inputs: self.inputs,
             scalars: self.scalars,
@@ -315,11 +327,10 @@ fn flatten_inner(
         let mut sub_members = Vec::new();
         let mut all_seen = seen.clone();
         for member in &members {
-            if matches!(member.node.op().kind, OpKind::Shift(_)) {
-                if let Src::Node(sub_root) = &member.args[0] {
+            if matches!(member.node.op().kind, OpKind::Shift(_))
+                && let Src::Node(sub_root) = &member.args[0] {
                     collect(&Src::Node(Arc::clone(sub_root)), &mut sub_members, &mut all_seen)?;
                 }
-            }
         }
         let is_root = |node: &Arc<Node>| roots.iter().any(|(root, _)| Arc::ptr_eq(root, node));
         let shared: Vec<Arc<Node>> = members
@@ -331,11 +342,10 @@ fn flatten_inner(
         if shared.is_empty() {
             break members;
         }
-        if let Some(id) = probe_id {
-            if shared.iter().any(|node| node.depends_on(id)) {
+        if let Some(id) = probe_id
+            && shared.iter().any(|node| node.depends_on(id)) {
                 return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
             }
-        }
         for node in shared {
             if let Err(error) = node.force() {
                 return Err(Failure::Inherited(Arc::clone(error)));
@@ -411,28 +421,342 @@ pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
     }
 }
 
-/// Runs the store kernel of `fused` over `len` elements, one new buffer per output.
-fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
-    let n = len_u32(len)?;
-    let bytes = u64::from(n) * ELEMENT_BYTES;
-    fused.mark_fused();
-    let Fused { key, inputs, scalars, .. } = fused;
-    let count = key.outputs.len();
-    let core = ctx.jit().kernel(ctx, key)?;
+/// Whether input `k` of a store program can be the buffer of its output: every element is read
+/// before it is overwritten, by the invocation that overwrites it. That fails when the program
+/// has several outputs or types differ, and when `k` is read at another element: through a shift
+/// or inside a sub-program.
+fn in_place_eligible(key: &FusedKey, k: u32) -> bool {
+    let Some(&input_ty) = key.input_tys.get(k as usize) else { return false };
+    let out_ty = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map(|instr| instr.op.out_ty());
+    key.tail == Tail::Store
+        && key.outputs.len() == 1
+        && out_ty == Some(input_ty)
+        && !key.instrs.iter().any(|instr| {
+            matches!(instr.op.kind, OpKind::Shift(_)) && instr.args[0] == Ref::Input(k)
+        })
+        && !key.subs.iter().flatten().any(|instr| instr.args.contains(&Ref::Input(k)))
+}
 
-    let mut outputs = Vec::with_capacity(count);
-    for _ in 0..count {
-        outputs.push(Storage::new(ctx, ctx.alloc_buffer(bytes, STORAGE_USAGE)?));
+/// How a program with shifts runs on arrays spanning several segments (see [`spans`]).
+struct Shifted {
+    /// Elements of the arrays: the shifts wrap around this length.
+    len: usize,
+    /// Per output segment and input, the ids of the segments bound as slots.
+    ids: Vec<Vec<Vec<u32>>>,
+}
+
+/// Decides whether `key` needs the segmented variant on arrays of `len` elements and, if it does,
+/// sets `key.spans` and returns the segments to bind. `None` for arrays that fit one segment and
+/// programs without shifts: they run as plain per-segment launches.
+fn plan_shifts(
+    ctx: &crate::context::Context,
+    key: &mut FusedKey,
+    scalars: &[u32],
+    len: usize,
+) -> Result<Option<Shifted>, LumaError> {
+    let c = (ctx.segment_bytes() / ELEMENT_BYTES) as usize;
+    if len <= c {
+        return Ok(None);
     }
-    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(count + inputs.len() + 1);
-    raw.extend(outputs.iter().map(|out| RawArg::write(out.buffer(), bytes)));
-    raw.extend(inputs.iter().map(|input| RawArg::read(input.buffer(), bytes)));
-    if !scalars.is_empty() {
-        raw.push(RawArg::Uniform(bytemuck::cast_slice(&scalars)));
+    if !key.subs.is_empty() {
+        return Err(LumaError::Gpu("segmented program with sub-programs".into()));
     }
-    launch_1d(ctx, &core, n, &raw)?;
+    let Some((counts, ids)) = spans(key, scalars, len, c, ctx.jit().max_inputs + 1)? else {
+        return Ok(None);
+    };
+    key.spans = counts;
+    Ok(Some(Shifted { len, ids }))
+}
+
+/// Slot counts per input and, per output segment and input, the segment ids to bind (see [`spans`]).
+type SegmentSpans = (Vec<u8>, Vec<Vec<Vec<u32>>>);
+
+/// For a program with shifts on arrays of `len` elements in segments of `c`: how many segments
+/// of every input its shifted reads touch at most (slots, 0 = the input is never shifted) and,
+/// per output segment, the ids of the segments to bind in those slots (`ids[j][k]`, padded to
+/// the slot count by repeating the last id). `None` if the program has no shift. Fails if the
+/// binding count exceeds `max_bindings`.
+fn spans(
+    key: &FusedKey,
+    scalars: &[u32],
+    len: usize,
+    c: usize,
+    max_bindings: usize,
+) -> Result<Option<SegmentSpans>, LumaError> {
+    // Per shift instruction: its input and the translations (read index - written index) it
+    // applies, over the wrapped and unwrapped parts of every shifted axis.
+    let mut shifts: Vec<(usize, Vec<i64>)> = Vec::new();
+    for instr in &key.instrs {
+        let OpKind::Shift(kind) = instr.op.kind else { continue };
+        let Ref::Input(k) = instr.args[0] else {
+            return Err(LumaError::Gpu("segmented program with sub-programs".into()));
+        };
+        let deltas = match kind {
+            ShiftKind::Linear => {
+                let amount = match instr.args[1] {
+                    Ref::Scalar(q) => scalars.get(q as usize).copied(),
+                    _ => None,
+                };
+                let Some(amount) = amount else {
+                    return Err(LumaError::Gpu("shift without a scalar amount".into()));
+                };
+                let s = i64::from(amount);
+                if s == 0 { vec![0] } else { vec![-s, len as i64 - s] }
+            }
+            ShiftKind::Dims { dims, shifts } => {
+                let [d0, d1, d2, _] = dims.map(i64::from);
+                let strides = [1, d0, d0 * d1, d0 * d1 * d2];
+                let mut deltas = vec![0i64];
+                for axis in 0..4 {
+                    let (dim, shift) = (i64::from(dims[axis]), i64::from(shifts[axis]));
+                    if dim == 1 || shift == 0 {
+                        continue;
+                    }
+                    let stride = strides[axis];
+                    deltas = deltas
+                        .iter()
+                        .flat_map(|delta| [delta - shift * stride, delta + (dim - shift) * stride])
+                        .collect();
+                }
+                deltas
+            }
+        };
+        shifts.push((k as usize, deltas));
+    }
+    if shifts.is_empty() {
+        return Ok(None);
+    }
+
+    let inputs = key.input_tys.len();
+    let segments = len.div_ceil(c);
+    let last = len as i64 - 1;
+    let mut ids: Vec<Vec<Vec<u32>>> = Vec::with_capacity(segments);
+    for j in 0..segments {
+        let (a, b) = ((j * c) as i64, (len.min((j + 1) * c)) as i64);
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); inputs];
+        for (k, deltas) in &shifts {
+            let Some(list) = lists.get_mut(*k) else {
+                return Err(LumaError::Gpu("shift of an unknown input".into()));
+            };
+            for delta in deltas {
+                let (lo, hi) = ((a + delta).max(0), (b - 1 + delta).min(last));
+                if lo <= hi {
+                    list.extend((lo as usize / c..=hi as usize / c).map(|id| id as u32));
+                }
+            }
+        }
+        for list in &mut lists {
+            list.sort_unstable();
+            list.dedup();
+        }
+        ids.push(lists);
+    }
+    let mut counts = vec![0u8; inputs];
+    for (k, count) in counts.iter_mut().enumerate() {
+        let longest = ids.iter().map(|lists| lists[k].len()).max().unwrap_or(0);
+        *count = u8::try_from(longest)
+            .map_err(|_| LumaError::Chunked("a shift that reads this many buffers at once"))?;
+    }
+    for lists in &mut ids {
+        for (list, &count) in lists.iter_mut().zip(&counts) {
+            let pad = list.last().copied().unwrap_or(0);
+            list.resize(usize::from(count), pad);
+        }
+    }
+
+    let outputs = match key.tail {
+        Tail::Store => key.outputs.len(),
+        Tail::Reduce(_) => 1,
+    };
+    let direct = (0..inputs)
+        .filter(|&k| key.in_place != Some(k as u32) && direct(&key.instrs, k as u32))
+        .count();
+    let slots: usize = counts.iter().map(|&count| usize::from(count)).sum();
+    if outputs + direct + slots > max_bindings {
+        return Err(LumaError::Chunked("a shift that reads this many buffers at once"));
+    }
+    Ok(Some((counts, ids)))
+}
+
+/// The slot ids of output segment `j` (see [`Shifted`]); `None` when the launch is plain.
+fn segment_ids(shifted: Option<&Shifted>, j: usize) -> Result<Option<&[Vec<u32>]>, LumaError> {
+    match shifted {
+        None => Ok(None),
+        Some(shifted) => shifted
+            .ids
+            .get(j)
+            .map(|ids| Some(ids.as_slice()))
+            .ok_or_else(|| LumaError::Gpu("segment without slot ids".into())),
+    }
+}
+
+/// Pins what segment `j` (of `n` elements) of a launch binds as inputs, in the binding order of
+/// the generated source, each with the bytes to bind. `inputs` lack the in-place input of `key`.
+/// With `ids` (the segmented variant) an input is bound as itself only if the program loads it
+/// at the element being computed, then once per slot.
+fn pin_inputs(
+    key: &FusedKey,
+    inputs: &[Arc<Storage>],
+    ids: Option<&[Vec<u32>]>,
+    j: usize,
+    n: u32,
+) -> Result<Vec<(Pin, u64)>, LumaError> {
+    let bytes = u64::from(n) * ELEMENT_BYTES;
+    let mut pins = Vec::with_capacity(inputs.len());
+    let mut stored = inputs.iter();
+    for k in 0..key.input_tys.len() {
+        if key.in_place == Some(k as u32) {
+            continue;
+        }
+        let Some(input) = stored.next() else {
+            return Err(LumaError::Gpu("fused program with too few inputs".into()));
+        };
+        let Some(ids) = ids else {
+            pins.push((input.pin(j)?, bytes));
+            continue;
+        };
+        if direct(&key.instrs, k as u32) {
+            pins.push((input.pin(j)?, bytes));
+        }
+        for &id in ids.get(k).map_or(&[][..], Vec::as_slice) {
+            let id = id as usize;
+            pins.push((input.pin(id)?, input.range(id).len() as u64 * ELEMENT_BYTES));
+        }
+    }
+    Ok(pins)
+}
+
+/// The words of the uniform of segment `j`: `n` (reductions), then, for the segmented variant,
+/// the first element of the segment, the array length and the slot ids of every input, then the
+/// scalars. Borrows `scalars` when nothing else goes in front of them.
+fn params<'a>(
+    ids: Option<&[Vec<u32>]>,
+    n: Option<u32>,
+    base: usize,
+    len: usize,
+    scalars: &'a [u32],
+) -> Result<Cow<'a, [u32]>, LumaError> {
+    if ids.is_none() && n.is_none() {
+        return Ok(Cow::Borrowed(scalars));
+    }
+    let mut words = Vec::with_capacity(scalars.len() + 3);
+    words.extend(n);
+    if let Some(ids) = ids {
+        words.push(len_u32(base)?);
+        words.push(len_u32(len)?);
+        words.extend(ids.iter().flatten());
+    }
+    words.extend_from_slice(scalars);
+    Ok(Cow::Owned(words))
+}
+
+/// Launches the store kernel `core` of `key` once per segment of `outputs[0]`: `outputs`, then
+/// the inputs as reads (see [`pin_inputs`]), then the uniform (see [`params`]). Counts as one
+/// elementwise launch.
+fn launch_store(
+    ctx: &crate::context::Context,
+    core: &crate::kernel::KernelCore,
+    key: &FusedKey,
+    outputs: &[&Storage],
+    inputs: &[Arc<Storage>],
+    scalars: &[u32],
+    shifted: Option<&Shifted>,
+) -> Result<(), LumaError> {
+    let Some(first) = outputs.first() else { return Ok(()) };
+    for j in 0..first.segments() {
+        let range = first.range(j);
+        let n = len_u32(range.len())?;
+        let bytes = u64::from(n) * ELEMENT_BYTES;
+        let ids = segment_ids(shifted, j)?;
+        let out_pins = outputs.iter().map(|out| out.pin(j)).collect::<Result<Vec<_>, _>>()?;
+        let in_pins = pin_inputs(key, inputs, ids, j, n)?;
+        let words = params(ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
+        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outputs.len() + in_pins.len() + 1);
+        raw.extend(out_pins.iter().map(|pin| RawArg::write(pin.buffer(), bytes)));
+        raw.extend(in_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        if !words.is_empty() {
+            raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+        }
+        launch_1d(ctx, core, n, &raw)?;
+    }
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Runs the store kernel of `fused` over `len` elements, one new buffer per output. A single
+/// output takes over the buffer of an input that nothing else holds (see [`in_place_eligible`]),
+/// instead of a new one.
+fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
+    fused.mark_fused();
+    let Fused { mut key, mut inputs, scalars, fused_nodes } = fused;
+    // The fused nodes hold their operands; a dying input is only uniquely owned without them.
+    drop(fused_nodes);
+    let count = key.outputs.len();
+
+    let mut reused = None;
+    if count == 1 {
+        let candidate = (0..inputs.len()).find(|&k| {
+            let input = &inputs[k];
+            in_place_eligible(&key, k as u32)
+                && Arc::strong_count(input) == 1
+                && !input.is_alias()
+        });
+        if let Some(k) = candidate {
+            match Arc::try_unwrap(inputs.remove(k)) {
+                Ok(storage) => {
+                    key.in_place = Some(k as u32);
+                    reused = Some(storage);
+                }
+                Err(shared) => inputs.insert(k, shared),
+            }
+        }
+    }
+    let shifted = plan_shifts(ctx, &mut key, &scalars, len)?;
+    let core = ctx.jit().kernel(ctx, &key)?;
+
+    let outputs = match reused {
+        Some(storage) => vec![storage],
+        None => {
+            let mut outputs = Vec::with_capacity(count);
+            for _ in 0..count {
+                outputs.push(Storage::new(ctx, len, ELEMENT_BYTES as usize));
+            }
+            outputs
+        }
+    };
+    let refs: Vec<&Storage> = outputs.iter().collect();
+    launch_store(ctx, &core, &key, &refs, &inputs, &scalars, shifted.as_ref())?;
     Ok(outputs)
+}
+
+/// Evaluates `node` into `target`, one of its inputs, overwriting it in place: one fused kernel
+/// that reads every element of `target` before writing it. The node counts as evaluated, with
+/// `target` as its result. Callers must have evaluated every other pending operation that reads
+/// `target` (see [`super::Readers::flush`]) and the program must allow in-place execution; the
+/// compound assignment of an array guarantees both.
+pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(), Failure> {
+    let Some(args) = lock(&node.args).take() else {
+        return Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into())));
+    };
+    let roots = [(Arc::clone(node), args)];
+    let fused = flatten(&roots, Tail::Store)?;
+    drop(roots);
+    let ctx = node.context();
+    fused.mark_fused();
+    let Fused { mut key, mut inputs, scalars, fused_nodes } = fused;
+    drop(fused_nodes);
+    let at = inputs.iter().position(|input| Arc::ptr_eq(input, target));
+    let Some(k) = at.filter(|&k| in_place_eligible(&key, k as u32)) else {
+        return Err(Failure::New(LumaError::Gpu("in-place assignment cannot run in place".into())));
+    };
+    inputs.remove(k);
+    key.in_place = Some(k as u32);
+    let shifted = plan_shifts(ctx, &mut key, &scalars, node.len())?;
+    let core = ctx.jit().kernel(ctx, &key)?;
+    launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
+    // Another thread cannot have evaluated this node: its operands were taken above.
+    let _ = node.result.set(Ok(Arc::clone(target)));
+    Ok(())
 }
 
 /// Runs the first pass of the reductions `ops` directly over the expression behind `node`,
@@ -444,7 +768,7 @@ pub(crate) fn reduce_first_pass(
     node: &Arc<Node>,
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
-) -> Result<Option<(wgpu::Buffer, u32)>, Failure> {
+) -> Result<Option<Vec<(wgpu::Buffer, u32)>>, Failure> {
     if !node.is_pending() {
         return Ok(None);
     }
@@ -454,23 +778,33 @@ pub(crate) fn reduce_first_pass(
     let fused = flatten(&roots, Tail::Reduce(ops))?;
     drop(roots);
 
-    let n = len_u32(node.len())?;
-    let bytes = u64::from(n) * ELEMENT_BYTES;
-    let groups = ctx.tuning().reduce_groups(n);
-    let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
     fused.mark_fused();
-    let Fused { key, inputs, scalars, .. } = fused;
-    let core = ctx.jit().kernel(ctx, key)?;
+    let Fused { mut key, inputs, scalars, .. } = fused;
+    let Some(first) = inputs.first() else {
+        return Err(Failure::New(LumaError::Gpu("fused reduction without inputs".into())));
+    };
+    let segments = first.segments();
+    let shifted = plan_shifts(ctx, &mut key, &scalars, node.len())?;
+    let core = ctx.jit().kernel(ctx, &key)?;
 
-    let out = scratch.take(out_bytes)?;
-    let mut params = Vec::with_capacity(scalars.len() + 1);
-    params.push(n);
-    params.extend_from_slice(&scalars);
-    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(inputs.len() + 2);
-    raw.push(RawArg::write(&out, out_bytes));
-    raw.extend(inputs.iter().map(|input| RawArg::read(input.buffer(), bytes)));
-    raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
-    ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+    let mut partials = Vec::with_capacity(segments);
+    for j in 0..segments {
+        let range = first.range(j);
+        let n = len_u32(range.len())?;
+        let groups = ctx.tuning().reduce_groups(n);
+        let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
+        let out = scratch.take(out_bytes)?;
+        let ids = segment_ids(shifted.as_ref(), j)?;
+        let params = params(ids, Some(n), range.start, node.len(), &scalars)?;
+        let pins = pin_inputs(&key, &inputs, ids, j, n)?;
+        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
+        raw.push(RawArg::write(&out, out_bytes));
+        raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
+        ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+        drop(raw);
+        partials.push((out, groups));
+    }
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
-    Ok(Some((out, groups)))
+    Ok(Some(partials))
 }

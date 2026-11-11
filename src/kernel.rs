@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::array::{Array, Failure};
 use crate::context::{default_context, Context, RawArg};
+use crate::gpu::pager::Pin;
 use crate::error::{LumaError, Result};
 use crate::gpu_type::GpuType;
 
@@ -48,6 +49,7 @@ impl fmt::Display for BindingKind {
 pub struct BindingInfo {
     /// The variable's name in the shader.
     pub name: String,
+    /// Whether the binding is a read-only storage buffer, a read-write storage buffer or a uniform.
     pub kind: BindingKind,
     /// For storage bindings of `array<T>`: the byte stride of `T`. `None` when not an array.
     pub element_stride: Option<u32>,
@@ -273,13 +275,12 @@ pub(crate) fn build_core(
             "@workgroup_size{workgroup:?} has a zero dimension"
         )));
     }
-    if let Some(requested) = key.workgroup {
-        if requested != workgroup {
+    if let Some(requested) = key.workgroup
+        && requested != workgroup {
             return Err(LumaError::KernelWorkgroup(format!(
                 "requested {requested:?} but the shader declares @workgroup_size{workgroup:?}"
             )));
         }
-    }
     let limits = ctx.device().limits();
     let per_dim = [
         limits.max_compute_workgroup_size_x,
@@ -381,6 +382,7 @@ pub(crate) fn build_core(
 
 /// A problem size in invocations: `[x]`, `[x, y]` or `[x, y, z]` (missing dimensions are 1).
 pub trait ProblemSize {
+    /// The problem size as `[x, y, z]`, with missing dimensions set to 1.
     fn into_size(self) -> [u32; 3];
 }
 
@@ -405,7 +407,8 @@ impl ProblemSize for [u32; 3] {
 enum ArgRepr<'a> {
     Storage {
         ctx: &'a Context,
-        buffer: &'a wgpu::Buffer,
+        /// Keeps the buffer on the device until the launch is recorded.
+        pin: Pin,
         bytes: u64,
         element_size: u32,
         writable: bool,
@@ -447,9 +450,9 @@ fn storage_arg<'a, T: GpuType>(array: &'a Array<T>, writable: bool) -> KernelArg
         array.flush_readers();
     }
     let repr = match array.ready() {
-        Ok((buffer, bytes)) => ArgRepr::Storage {
+        Ok((pin, bytes)) => ArgRepr::Storage {
             ctx: array.context(),
-            buffer,
+            pin,
             bytes,
             element_size: std::mem::size_of::<T>() as u32,
             writable,
@@ -619,7 +622,7 @@ impl Kernel {
         {
             match &arg.repr {
                 ArgRepr::Poisoned(error) => return Err(LumaError::clone(error)),
-                ArgRepr::Storage { ctx: arg_ctx, buffer, bytes, element_size, writable } => {
+                ArgRepr::Storage { ctx: arg_ctx, pin, bytes, element_size, writable } => {
                     if !arg_ctx.same_as(ctx) {
                         return Err(LumaError::ContextMismatch);
                     }
@@ -641,16 +644,15 @@ impl Kernel {
                         }
                         _ => {}
                     }
-                    if let Some(stride) = info.element_stride {
-                        if stride != *element_size {
+                    if let Some(stride) = info.element_stride
+                        && stride != *element_size {
                             return Err(LumaError::KernelArgElementSize {
                                 index,
                                 expected: stride,
                                 actual: *element_size,
                             });
                         }
-                    }
-                    *slot = RawArg::Storage { buffer, bytes: *bytes, writable: *writable };
+                    *slot = RawArg::Storage { buffer: pin.buffer(), bytes: *bytes, writable: *writable };
                 }
                 ArgRepr::Uniform(encoded) => {
                     if info.kind != BindingKind::Uniform {
@@ -668,15 +670,14 @@ impl Kernel {
                         })?
                         .as_slice();
                     let bytes = data.len() as u64;
-                    if let Some(expected) = info.min_size {
-                        if bytes < u64::from(expected) {
+                    if let Some(expected) = info.min_size
+                        && bytes < u64::from(expected) {
                             return Err(LumaError::KernelArgUniformSize {
                                 index,
                                 expected: u64::from(expected),
                                 actual: bytes,
                             });
                         }
-                    }
                     if bytes > max_uniform {
                         return Err(LumaError::BufferTooLarge { requested: bytes, max: max_uniform });
                     }

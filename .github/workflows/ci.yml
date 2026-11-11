@@ -1,0 +1,19 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install software Vulkan (Mesa lavapipe)
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+      - run: cargo build --all-targets
+      - run: cargo test --release
+        env:
+          LUMA_DEVICE: cpu
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
