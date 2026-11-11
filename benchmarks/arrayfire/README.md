@@ -53,6 +53,7 @@ the median of timed calls, until 1 s and at least 5 runs have passed or 200 runs
 | `blackscholes` | Black-Scholes call prices, 2^24 and 2^26 options | `price`: compute and evaluate the price array. `price_sum`: reduce the prices to one scalar (no materialized output). |
 | `mandelbrot` | Fixed 256 iterations of the escape-time recurrence written as array ops (per-pixel freeze once outside, no early exit), 1024² and 4096² | `eval_every_N`: evaluate `z` and the count every N iterations (N = 1, 8). `eval` does not wait for the GPU in either library. `eval_end_only`: one evaluation after the whole chain. `iterate_all` (Luma only): the same step through `iterate_all`, one kernel for the whole loop. `custom_kernel` (Luma only): hand-written WGSL kernel with per-pixel early exit. |
 | `fir` | Full linear convolution of 2^24 samples with a filter of 127, 255, 4095 or 65535 taps | `fft`: FFT convolution. `direct`: spatial convolution (up to 4095 taps). |
+| `montecarlo` | Array-code Monte Carlo over 2^24 and 2^26 samples: an estimate of pi from two uniform arrays, and a European call from normal draws, both reduced to one mean | `pi`, `european`. Luma generates the random numbers inside the reduction kernel; ArrayFire's `randu`/`randn` write them to memory first. Checked against pi and the Black-Scholes price. |
 
 ## Reading the results
 

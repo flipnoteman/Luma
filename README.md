@@ -32,6 +32,7 @@ I/O dependant, operations.
 - `vec2`/`vec4` element types
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Reductions: sum, min, max, mean, norm
+- Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
 - Non-blocking `eval` / `eval_all`: the GPU runs while the host records the next steps; reads and `sync` wait

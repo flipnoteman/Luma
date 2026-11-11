@@ -8,6 +8,11 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- Generator arrays: `Array::uniform`, `Array::normal`, `Array::random_bits` (Threefry-2x32-20, a
+  counter-based generator: element `i` depends only on the seed and `i`), `Array::range` and
+  `Array::linspace`, each with an `_on` variant. They are computed inside the kernels that read
+  them, so a reduction over them reads no memory. Array-code Monte Carlo (pi, European call) over
+  2^24 samples: 2.1x and 2.3x faster than ArrayFire CUDA on an RTX 3080 Laptop.
 - `iterate_all`: a loop over several arrays (`[&zx, &zy, &count]`). When the step is elementwise,
   the whole loop runs as one kernel that keeps the state in registers, for any step count;
   anything else (shifts, arrays split into several buffers) runs step by step. Mandelbrot 1024²,

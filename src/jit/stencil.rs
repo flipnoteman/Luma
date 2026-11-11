@@ -67,7 +67,7 @@ pub(crate) fn plan(probe: &Array<f32>, next: &Array<f32>) -> Option<Stencil> {
     let node = next.pending()?;
     let args = node.operands()?;
     let fused = flatten_stencil(node, args, probe.id()).ok()?;
-    if probe.was_materialized() || !fused.key.subs.is_empty() {
+    if probe.was_materialized() || !fused.key.subs.is_empty() || super::codegen::generates(&fused.key) {
         return None;
     }
     let out = *fused.key.outputs.first()?;

@@ -935,13 +935,15 @@ fn pin_inputs(
 /// the first element of the segment, the array length and the slot ids of every input, then the
 /// scalars. Borrows `scalars` when nothing else goes in front of them.
 fn params<'a>(
+    key: &FusedKey,
     ids: Option<&[Vec<u32>]>,
     n: Option<u32>,
     base: usize,
     len: usize,
     scalars: &'a [u32],
 ) -> Result<Cow<'a, [u32]>, LumaError> {
-    if ids.is_none() && n.is_none() {
+    let based = ids.is_none() && super::codegen::generates(key);
+    if ids.is_none() && n.is_none() && !based {
         return Ok(Cow::Borrowed(scalars));
     }
     let mut words = Vec::with_capacity(scalars.len() + 3);
@@ -950,6 +952,8 @@ fn params<'a>(
         words.push(len_u32(base)?);
         words.push(len_u32(len)?);
         words.extend(ids.iter().flatten());
+    } else if based {
+        words.push(len_u32(base)?);
     }
     words.extend_from_slice(scalars);
     Ok(Cow::Owned(words))
@@ -975,7 +979,7 @@ fn launch_store(
         let ids = segment_ids(shifted, j)?;
         let out_pins = outputs.iter().map(|out| out.pin(j)).collect::<Result<Vec<_>, _>>()?;
         let in_pins = pin_inputs(key, inputs, ids, j, n)?;
-        let words = params(ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
+        let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outputs.len() + in_pins.len() + 1);
         raw.extend(out_pins.iter().map(|pin| RawArg::write(pin.buffer(), bytes)));
         raw.extend(in_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
@@ -1085,8 +1089,14 @@ pub(crate) fn reduce_first_pass(
 
     fused.mark_fused();
     let Fused { mut key, inputs, scalars, .. } = fused;
-    let Some(first) = inputs.first() else {
-        return Err(Failure::New(LumaError::Gpu("fused reduction without inputs".into())));
+    // Without inputs (only generators) the segments are those an array of this length would have.
+    let layout;
+    let first = match inputs.first() {
+        Some(first) => first,
+        None => {
+            layout = Storage::new(ctx, node.len(), ELEMENT_BYTES as usize);
+            &layout
+        }
     };
     let segments = first.segments();
     let shifted = plan_shifts(ctx, &mut key, &scalars, node.len())?;
@@ -1100,7 +1110,7 @@ pub(crate) fn reduce_first_pass(
         let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
         let out = scratch.take(out_bytes)?;
         let ids = segment_ids(shifted.as_ref(), j)?;
-        let params = params(ids, Some(n), range.start, node.len(), &scalars)?;
+        let params = params(&key, ids, Some(n), range.start, node.len(), &scalars)?;
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
         raw.push(RawArg::write(&out, out_bytes));

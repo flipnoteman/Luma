@@ -133,6 +133,23 @@ pub(crate) enum OpKind {
     Select,
     /// Circular shift of a materialized array; operand 0 is its buffer (see [`ShiftKind`]).
     Shift(ShiftKind),
+    /// A value computed from the element's index alone; no array operands (see [`Gen`]).
+    Generate(Gen),
+}
+
+/// What a [`OpKind::Generate`] computes for element `i` (its index in the whole array).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Gen {
+    /// Threefry-2x32-20 of counter `(i, 0)` under the key in operands 0 and 1: the first word.
+    Bits,
+    /// The top 24 bits of [`Gen::Bits`] scaled into `[0, 1)`.
+    Uniform,
+    /// Box-Muller on both Threefry words.
+    Normal,
+    /// The coordinate along one dimension, `(i / stride) % size`.
+    Range { stride: u32, size: u32 },
+    /// `start + i * step`; operands: start, step.
+    Linspace,
 }
 
 /// Which element a shift reads for element `i`.
@@ -154,6 +171,8 @@ impl OpKind {
             | OpKind::Powf
             | OpKind::Shift(ShiftKind::Linear) => 2,
             OpKind::Clamp | OpKind::Select => 3,
+            OpKind::Generate(Gen::Range { .. }) => 0,
+            OpKind::Generate(_) => 2,
         }
     }
 }
@@ -181,6 +200,7 @@ impl Op {
     pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
         match (self.kind, index) {
             (OpKind::Select, 0) | (OpKind::Shift(_), 1) => ElemTy::U32,
+            (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal), _) => ElemTy::U32,
             _ => self.ty,
         }
     }

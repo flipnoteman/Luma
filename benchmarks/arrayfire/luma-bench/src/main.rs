@@ -283,12 +283,57 @@ fn fir(sz: &Sizes) {
     }
 }
 
+fn montecarlo(sz: &Sizes) {
+    for &n in &sz.bs {
+        let row = |variant: &'static str, err: f32| Row {
+            workload: "montecarlo",
+            size: n.to_string(),
+            variant,
+            library: "luma",
+            backend: BACKEND,
+            work: n as f64,
+            unit: "Gsample/s",
+            err,
+        };
+        let pi = || -> f32 {
+            let u = Array::<f32>::uniform(n, 1).unwrap();
+            let v = Array::<f32>::uniform(n, 2).unwrap();
+            select(&(&u * &u + &v * &v).le(1.0), 4.0, 0.0).mean().unwrap()
+        };
+        let err = (pi() - std::f32::consts::PI).abs() / std::f32::consts::PI;
+        check(&format!("montecarlo {n} pi"), err, MC_PI_TOLERANCE);
+        report(row("pi", err), || {
+            std::hint::black_box(pi());
+        });
+
+        let (vst, drift, discount) =
+            (VOL * MC_YEARS.sqrt(), (RATE - 0.5 * VOL * VOL) * MC_YEARS, (-RATE * MC_YEARS).exp());
+        let call = || -> f32 {
+            let z = Array::<f32>::normal(n, 3).unwrap();
+            let spot = (z * vst + drift).exp() * MC_SPOT;
+            (spot - MC_STRIKE).maximum(0.0).mean().unwrap() * discount
+        };
+        let exact = mc_call_exact();
+        let err = ((f64::from(call()) - exact).abs() / exact) as f32;
+        check(&format!("montecarlo {n} european"), err, MC_CALL_TOLERANCE);
+        report(row("european", err), || {
+            std::hint::black_box(call());
+        });
+    }
+}
+
 fn main() {
     let args = parse_args();
     let sz = sizes(args.quick);
     print_header();
-    let workloads: [(&str, fn(&Sizes)); 5] =
-        [("heat", heat), ("life", life), ("blackscholes", blackscholes), ("mandelbrot", mandelbrot), ("fir", fir)];
+    let workloads: [(&str, fn(&Sizes)); 6] = [
+        ("heat", heat),
+        ("life", life),
+        ("blackscholes", blackscholes),
+        ("mandelbrot", mandelbrot),
+        ("fir", fir),
+        ("montecarlo", montecarlo),
+    ];
     for (name, f) in workloads {
         if wants(&args, name) {
             eprintln!("luma: {name}");

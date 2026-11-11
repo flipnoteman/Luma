@@ -45,6 +45,7 @@ mod context;
 mod conv;
 mod error;
 mod fft;
+mod generate;
 mod gpu;
 mod gpu_type;
 mod jit;

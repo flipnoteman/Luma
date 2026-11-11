@@ -275,6 +275,41 @@ fn fir(sz: &Sizes, be: &str) {
     }
 }
 
+fn montecarlo(sz: &Sizes, be: &str) {
+    for &n in &sz.bs {
+        let d = Dim4::new(&[n as u64, 1, 1, 1]);
+        let (one, four, zero) = (k(1.0, d), k(4.0, d), k(0.0, d));
+        let pi = || {
+            let u = af::randu::<f32>(d);
+            let v = af::randu::<f32>(d);
+            let inside = af::le(&(&u * &u + &v * &v), &one, false);
+            af::mean_all(&af::select(&four, &inside, &zero)).0 as f32
+        };
+        let err = (pi() - std::f32::consts::PI).abs() / std::f32::consts::PI;
+        assert!(err <= MC_PI_TOLERANCE, "montecarlo {n} pi: rel_err {err}");
+        emit("montecarlo", n.to_string(), "pi", be, n as f64, "Gsample/s", err, || {
+            std::hint::black_box(pi());
+        });
+
+        let vst = k(VOL * MC_YEARS.sqrt(), d);
+        let drift = k((RATE - 0.5 * VOL * VOL) * MC_YEARS, d);
+        let (spot0, strike) = (k(MC_SPOT, d), k(MC_STRIKE, d));
+        let discount = (-RATE * MC_YEARS).exp();
+        let call = || {
+            let z = af::randn::<f32>(d);
+            let spot = af::exp(&(z * &vst + &drift)) * &spot0;
+            let payoff = af::maxof(&(spot - &strike), &zero, false);
+            af::mean_all(&payoff).0 as f32 * discount
+        };
+        let exact = mc_call_exact();
+        let err = ((f64::from(call()) - exact).abs() / exact) as f32;
+        assert!(err <= MC_CALL_TOLERANCE, "montecarlo {n} european: rel_err {err}");
+        emit("montecarlo", n.to_string(), "european", be, n as f64, "Gsample/s", err, || {
+            std::hint::black_box(call());
+        });
+    }
+}
+
 fn main() {
     let args = parse_args();
     let be = args.backend.clone().unwrap_or_else(|| "cuda".into());
@@ -290,8 +325,14 @@ fn main() {
     let sz = sizes(args.quick);
     print_header();
     type W = fn(&Sizes, &str);
-    let list: [(&str, W); 5] =
-        [("heat", heat), ("life", life), ("blackscholes", blackscholes), ("mandelbrot", mandelbrot), ("fir", fir)];
+    let list: [(&str, W); 6] = [
+        ("heat", heat),
+        ("life", life),
+        ("blackscholes", blackscholes),
+        ("mandelbrot", mandelbrot),
+        ("fir", fir),
+        ("montecarlo", montecarlo),
+    ];
     for (name, f) in list {
         if wants(&args, name) {
             f(&sz, &be);
