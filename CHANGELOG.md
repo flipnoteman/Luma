@@ -25,6 +25,25 @@ All notable changes to Luma are listed here. The format follows
 - `luma::wgpu` re-export, so the wgpu types in `LumaError` and `Context::features` can be named.
 - `LumaError::NoDevice` and `LumaError::Chunked`.
 - CI workflow that builds and tests on the software driver.
+- Typed `Array<T>` (`u32` and `f32`) with elementwise add, subtract, multiply and divide, scalar
+  operations and operators (`+`, `-`, `*`, `/`), an `array!` macro, and several arrays alive at once.
+- `conv1d` with stride and padding, and `conv1d_fft` (FFT-based convolution for any kernel length).
+- Explicit `Context` that owns the device, queue, pipeline cache and a buffer pool; `LumaError`
+  and `luma::Result` replace string errors, with validation of shapes, strides and cross-context use.
+- Custom WGSL kernels: `ctx.kernel(wgsl).build()` reflects bindings and workgroup size with naga,
+  and `args!` checks read / read-write / uniform arguments.
+- Lazy evaluation: elementwise expressions are fused into one kernel (up to 128 operations,
+  several outputs), with in-place reuse of buffers, shifts and `Array::iterate` (time-blocked
+  stencils). Errors from lazy operations are reported when the result is read.
+- Vector reductions (`sum`, `min`, `max`, `norm`, several at once with `reduce`), using subgroup
+  operations where the device has them; `LUMA_SUBGROUPS` overrides.
+- `flush`, profiling and `Context::features` (subgroup, f16 and cooperative-matrix support).
+- Per-GPU tuning: Apple, NVIDIA and generic profiles chosen from the adapter, clamped to the
+  device limits; `LUMA_TUNING` overrides.
+- Zero-copy uploads on unified-memory devices; large uploads and readbacks use several threads.
+- Criterion benchmarks of application workloads against multi-threaded CPU baselines, and the
+  `bench_conv1d` example.
+- MIT and Apache-2.0 licenses, a rewritten README and a custom-kernel example.
 
 ### Changed
 
@@ -36,9 +55,20 @@ All notable changes to Luma are listed here. The format follows
 - On GPUs whose buffer limit is below 4 GiB of contiguous binding, arrays between 2 GiB and 4 GiB
   now span two buffers; custom kernels on such arrays fail with `LumaError::Chunked`.
 - The example `double_test` is now `basics`.
+- Upgraded to wgpu 30; the adapter's limits are requested and errors are returned instead of
+  panicking.
+- The global async executor (and the `tokio`, `uuid`, `flume` and `once_cell` dependencies) is
+  replaced by a synchronous `Context`; only reading data back waits for the GPU.
+- WGSL shaders are embedded in the crate instead of being read from a directory at run time.
 
 ### Fixed
 
+- Arrays larger than 65,535 workgroups of elementwise work are dispatched correctly, and the
+  dimensions are passed to shaders in the layout they expect.
+- Integer division by zero keeps its guard in fused kernels (`u32` `x / 0` gives `x`).
+- Stencil probe aliasing, shift root flattening and upload / staging buffer reuse; uploads reclaim
+  remapped buffers and retry on out-of-memory.
+- `conv1d` handles inputs larger than 65,535 elements.
 - `conv1d_fft` returned wrong results on devices that run fewer than 16 shader invocations in
   lockstep (a data race in the FFT's local pass). The fix makes `conv1d_fft` about 12% slower on
   an RTX 3090.
@@ -49,9 +79,27 @@ All notable changes to Luma are listed here. The format follows
 - Convolution weights must fit one buffer; on chunked inputs `conv1d` kernels are limited to half
   a buffer and `conv1d_fft` kernels to a sixteenth.
 
-## 0.1.x
+## 0.1.3 - 2024-08-08
 
-Earlier versions were not tracked in this file.
+### Added
+
+- `array!` macro for creating an `Array`.
+- A global `Executor` that is created once and shared by all arrays.
+
+### Changed
+
+- Updated the README and dependencies.
+
+## 0.1.0 - 2024-07-23
+
+> **Warning:** 0.1.0, the version published on crates.io, was non-functional and must not be
+> used. Use 0.2.0 or later.
+
+### Added
+
+- First crate with a `wgpu` dependency and an `Array` struct holding data and four dimensions.
+- A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
+- A library layout, with the shader loaded from a hard-coded relative path.
 
 [Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/flipnoteman/Luma/releases/tag/v0.2.0
