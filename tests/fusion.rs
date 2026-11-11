@@ -617,3 +617,38 @@ fn select_branch_shape_mismatch_poisons() {
         assert!(matches!(err.root(), LumaError::ShapeMismatch { lhs: [3, 1, 1, 1], rhs: [2, 1, 1, 1] }), "{err}");
     }
 }
+
+#[test]
+fn arrays_advanced_together_in_a_long_loop_match_the_cpu() {
+    // Far more than the fusion limit of operations, never evaluated inside the loop: the graph
+    // is cut while it is built, and the cuts must not change any value.
+    let ctx = Context::new().unwrap();
+    let n = 777;
+    let cxs = values(n, 30, -0.3, 0.3);
+    let cys = values(n, 31, -0.3, 0.3);
+    let (cx, cy) = (f32s_on(&ctx, &cxs), f32s_on(&ctx, &cys));
+    let zero = f32s_on(&ctx, &vec![0.0; n]);
+    let one = f32s_on(&ctx, &vec![1.0; n]);
+
+    let (mut zx, mut zy, mut cnt) = (&zero * 1.0, &zero * 1.0, &zero * 1.0);
+    let (mut wx, mut wy, mut wc) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+    for _ in 0..100 {
+        let inside = (&zx * &zx + &zy * &zy).le(4.0);
+        let nzx = &zx * &zx - &zy * &zy + &cx;
+        let nzy = &zx * &zy * 2.0 + &cy;
+        zx = select(&inside, &nzx, &zx);
+        zy = select(&inside, &nzy, &zy);
+        cnt = &cnt + select(&inside, &one, &zero);
+        for j in 0..n {
+            let (x, y) = (wx[j], wy[j]);
+            if x * x + y * y <= 4.0 {
+                wx[j] = x * x - y * y + cxs[j];
+                wy[j] = x * y * 2.0 + cys[j];
+                wc[j] += 1.0;
+            }
+        }
+    }
+    assert_close(&zx.to_vec().unwrap(), &wx, 1e-3, 1e-3);
+    assert_close(&zy.to_vec().unwrap(), &wy, 1e-3, 1e-3);
+    assert_close(&cnt.to_vec().unwrap(), &wc, 0.0, 0.0);
+}

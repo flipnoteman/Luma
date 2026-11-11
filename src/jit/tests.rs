@@ -659,3 +659,47 @@ fn several_reductions_share_one_pass() {
     let [a, b] = x.reduce([Reduction::Max, Reduction::Max]).unwrap();
     assert_eq!((a, b), (hi / 2.0, hi / 2.0));
 }
+
+#[test]
+fn arrays_advancing_together_are_split_into_multi_output_kernels() {
+    let n = 600;
+    let cxs = values(n, 20, -0.3, 0.3);
+    let cys = values(n, 21, -0.3, 0.3);
+    let ctx = Context::new().unwrap();
+    ctx.jit().set_max_nodes(64);
+    let (cx, cy) = (f32s(&ctx, &cxs), f32s(&ctx, &cys));
+    let zero = f32s(&ctx, &vec![0.0; n]);
+    let one = f32s(&ctx, &vec![1.0; n]);
+
+    let before = ctx.jit().stats();
+    let (mut zx, mut zy, mut cnt) = (&zero * 1.0, &zero * 1.0, &zero * 1.0);
+    let iterations = 40;
+    for _ in 0..iterations {
+        let inside = (&zx * &zx + &zy * &zy).le(4.0);
+        let nzx = &zx * &zx - &zy * &zy + &cx;
+        let nzy = &zx * &zy * 2.0 + &cy;
+        zx = select(&inside, &nzx, &zx);
+        zy = select(&inside, &nzy, &zy);
+        cnt = &cnt + select(&inside, &one, &zero);
+    }
+    let got = [zx.to_vec().unwrap(), zy.to_vec().unwrap(), cnt.to_vec().unwrap()];
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+
+    let (mut wx, mut wy, mut wc) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+    for _ in 0..iterations {
+        for j in 0..n {
+            let (x, y) = (wx[j], wy[j]);
+            if x * x + y * y <= 4.0 {
+                wx[j] = x * x - y * y + cxs[j];
+                wy[j] = x * y * 2.0 + cys[j];
+                wc[j] += 1.0;
+            }
+        }
+    }
+    assert_close(&got[0], &wx, 1e-3, 1e-3);
+    assert_close(&got[1], &wy, 1e-3, 1e-3);
+    assert_close(&got[2], &wc, 0.0, 0.0);
+    // About 14 operations per iteration across three results: a few kernels per 64 operations,
+    // not one single-output kernel per operand.
+    assert!(launches <= 20, "{launches} kernels");
+}
