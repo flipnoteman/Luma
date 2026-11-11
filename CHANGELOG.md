@@ -6,6 +6,22 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `Array::submit` and `submit_all`: evaluate arrays without waiting for the GPU.
+- `select` accepts scalar branches; the result's shape and context come from the mask.
+
+### Changed
+
+- At the fusion limit, live arrays that share pending work with the biggest operand are evaluated
+  together in multi-output kernels, instead of that operand alone.
+- `Context::sync` polls briefly before blocking.
+
+### Fixed
+
+- Uniform uploads no longer allocate and free a host-visible memory block on every submission
+  (about 0.3 ms per submission on NVIDIA/Vulkan when no small upload buffer was alive).
+
 ## [0.2.0] - 2026-11-10
 
 ### Added
