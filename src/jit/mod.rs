@@ -60,7 +60,6 @@ mod stencil;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -69,6 +68,7 @@ use crate::array::{Failure, Storage};
 use crate::builtin::{BinOp, CmpOp, UnOp};
 use crate::context::Context;
 use crate::error::{LumaError, Result};
+use crate::gpu::hash::FxMap;
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 
@@ -242,12 +242,11 @@ pub(crate) struct Node {
     location: &'static Location<'static>,
     /// Unique per node.
     id: u64,
-    /// Ids of the distinct nodes in the expression below this one, sorted. An upper bound once
-    /// parts of the expression have been evaluated.
-    below: Box<[u64]>,
-    /// Ids of the distinct buffers the expression reads, sorted. An upper bound once parts of
-    /// the expression have been evaluated.
-    inputs: Box<[u64]>,
+    /// Ids of the distinct nodes in the expression below this one (the first `below_len`),
+    /// followed by the ids of the distinct buffers the expression reads, each part sorted. Upper
+    /// bounds once parts of the expression have been evaluated. One allocation for both.
+    ids: Box<[u64]>,
+    below_len: usize,
     /// Number of nodes this one is an operand of (a pre-filter for sharing checks).
     consumers: AtomicU32,
     /// Set once the node's value was computed inside another node's kernel (or a reduction).
@@ -273,7 +272,17 @@ impl std::fmt::Debug for Node {
 impl Node {
     /// Operations in the expression behind this node, itself included.
     fn size(&self) -> usize {
-        self.below.len() + 1
+        self.below_len + 1
+    }
+
+    /// Ids of the distinct nodes in the expression below this one, sorted.
+    fn below(&self) -> &[u64] {
+        self.ids.get(..self.below_len).unwrap_or(&[])
+    }
+
+    /// Ids of the distinct buffers the expression reads, sorted.
+    fn inputs(&self) -> &[u64] {
+        self.ids.get(self.below_len..).unwrap_or(&[])
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -356,7 +365,7 @@ impl Node {
     }
 
     pub(crate) fn depends_on(&self, storage_id: u64) -> bool {
-        self.inputs.binary_search(&storage_id).is_ok()
+        self.inputs().binary_search(&storage_id).is_ok()
     }
 
     /// Whether another pending node outside `group` (node pointers) reads this node. Evaluating
@@ -366,10 +375,9 @@ impl Node {
         if self.consumers.load(Ordering::Relaxed) < 2 {
             return false;
         }
+        // Most readers are inside the group: tell by address and only upgrade the others.
         lock(&self.readers.list).nodes.iter().any(|weak| {
-            weak.upgrade().is_some_and(|reader| {
-                reader.is_pending() && !group.contains(&Arc::as_ptr(&reader))
-            })
+            !group.contains(&weak.as_ptr()) && weak.upgrade().is_some_and(|reader| reader.is_pending())
         })
     }
 
@@ -385,23 +393,115 @@ fn insert_sorted(ids: &mut Vec<u64>, id: u64) {
     }
 }
 
-/// The distinct nodes below and the distinct buffers read by an operation on `args`: sorted ids
-/// of both.
-fn measure(args: &[Src]) -> (Vec<u64>, Vec<u64>) {
-    let mut below: Vec<u64> = Vec::new();
-    let mut inputs: Vec<u64> = Vec::new();
-    for arg in args {
-        match arg {
-            Src::Scalar(_) => {}
-            Src::Buffer(storage) => insert_sorted(&mut inputs, storage.id()),
-            Src::Node(node) => {
-                insert_sorted(&mut below, node.id);
-                node.below.iter().for_each(|&id| insert_sorted(&mut below, id));
-                node.inputs.iter().for_each(|&id| insert_sorted(&mut inputs, id));
+/// Merges the sorted `other` into the sorted `ids` (a set union), through `tmp`.
+fn union_into(ids: &mut Vec<u64>, tmp: &mut Vec<u64>, other: &[u64]) {
+    let (Some(&first), Some(&last)) = (other.first(), other.last()) else { return };
+    // Operands are mostly nested or disjoint: nothing to interleave.
+    if ids.last().is_none_or(|&top| top < first) {
+        ids.extend_from_slice(other);
+        return;
+    }
+    if ids.first().is_some_and(|&bottom| bottom > last) {
+        tmp.clear();
+        tmp.extend_from_slice(other);
+        tmp.extend_from_slice(ids);
+        std::mem::swap(ids, tmp);
+        return;
+    }
+    tmp.clear();
+    tmp.reserve(ids.len() + other.len());
+    let (mut a, mut b) = (ids.as_slice(), other);
+    while let (Some(&x), Some(&y)) = (a.first(), b.first()) {
+        match x.cmp(&y) {
+            std::cmp::Ordering::Less => {
+                tmp.push(x);
+                a = a.get(1..).unwrap_or(&[]);
+            }
+            std::cmp::Ordering::Greater => {
+                tmp.push(y);
+                b = b.get(1..).unwrap_or(&[]);
+            }
+            std::cmp::Ordering::Equal => {
+                tmp.push(x);
+                a = a.get(1..).unwrap_or(&[]);
+                b = b.get(1..).unwrap_or(&[]);
             }
         }
     }
-    (below, inputs)
+    tmp.extend_from_slice(a);
+    tmp.extend_from_slice(b);
+    std::mem::swap(ids, tmp);
+}
+
+/// Working memory of [`measure`], kept per thread so that measuring allocates nothing.
+#[derive(Default)]
+struct Measured {
+    below: Vec<u64>,
+    inputs: Vec<u64>,
+    tmp: Vec<u64>,
+}
+
+thread_local! {
+    static MEASURED: std::cell::RefCell<Measured> = std::cell::RefCell::default();
+}
+
+/// The number of distinct nodes below and of distinct buffers read by an operation on `args`.
+/// The sorted ids of both stay in this thread's [`Measured`] until the next call, for
+/// [`measured_ids`].
+fn measure(args: &[Src]) -> (usize, usize) {
+    if let Some(node) = only_node(args) {
+        return (node.below_len + 1, node.inputs().len());
+    }
+    MEASURED.with_borrow_mut(|m| {
+        let Measured { below, inputs, tmp } = m;
+        below.clear();
+        inputs.clear();
+        let mut seen: Option<&Arc<Node>> = None;
+        for arg in args {
+            match arg {
+                Src::Scalar(_) => {}
+                Src::Buffer(storage) => insert_sorted(inputs, storage.id()),
+                Src::Node(node) => {
+                    // `x * x`: the second operand adds nothing.
+                    if seen.is_some_and(|first| Arc::ptr_eq(first, node)) {
+                        continue;
+                    }
+                    seen = seen.or(Some(node));
+                    union_into(below, tmp, node.below());
+                    insert_sorted(below, node.id);
+                    union_into(inputs, tmp, node.inputs());
+                }
+            }
+        }
+        (below.len(), inputs.len())
+    })
+}
+
+/// The node that is the only non-scalar operand (possibly several times) of an operation on
+/// `args`, whose ids then are its own plus the node's: nothing to merge.
+fn only_node(args: &[Src]) -> Option<&Arc<Node>> {
+    let mut found: Option<&Arc<Node>> = None;
+    for arg in args {
+        match arg {
+            Src::Scalar(_) => {}
+            Src::Buffer(_) => return None,
+            Src::Node(node) => match found {
+                Some(first) if !Arc::ptr_eq(first, node) => return None,
+                _ => found = Some(node),
+            },
+        }
+    }
+    found
+}
+
+/// The ids found by the last [`measure`] of `args` on this thread, as stored in a [`Node`]:
+/// nodes, then buffers.
+fn measured_ids(args: &[Src]) -> Box<[u64]> {
+    if let Some(node) = only_node(args) {
+        // The operand is the newest node of its expression: its id goes last.
+        return node.below().iter().copied().chain(Some(node.id)).chain(node.inputs().iter().copied()).collect();
+    }
+    MEASURED.with_borrow(|m| m.below.iter().chain(&m.inputs).copied().collect())
 }
 
 /// Replaces `args[i]` and every operand that is the same node by its evaluated buffer.
@@ -458,9 +558,9 @@ pub(crate) fn create(
     // with the live arrays that share pending work with it (see the module documentation)
     // instead of alone.
     let mut batched = false;
-    let (below, inputs) = loop {
+    let (below_len, _) = loop {
         let (below, inputs) = measure(args.get(..arity).unwrap_or(&[]));
-        if below.len() < max_nodes && inputs.len() <= max_inputs {
+        if below < max_nodes && inputs <= max_inputs {
             break (below, inputs);
         }
         if !batched {
@@ -513,8 +613,8 @@ pub(crate) fn create(
         name,
         location,
         id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
-        below: below.into_boxed_slice(),
-        inputs: inputs.into_boxed_slice(),
+        ids: measured_ids(args.get(..arity).unwrap_or(&[])),
+        below_len,
         consumers: AtomicU32::new(0),
         fused: AtomicBool::new(false),
         recomputes,
@@ -552,9 +652,61 @@ pub(crate) struct Readers {
     list: Mutex<ReaderList>,
 }
 
+/// Weak references to nodes. Most nodes are read by a single operation, so the first reference
+/// lives in the list itself: no allocation until a second one arrives.
+#[derive(Debug, Default)]
+struct Weaks {
+    first: Option<Weak<Node>>,
+    rest: Vec<Weak<Node>>,
+}
+
+impl Weaks {
+    fn push(&mut self, node: Weak<Node>) {
+        if self.first.is_none() {
+            self.first = Some(node);
+        } else {
+            self.rest.push(node);
+        }
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Weak<Node>> {
+        self.first.iter().chain(&self.rest)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Weak<Node>) -> bool) {
+        if self.first.as_ref().is_some_and(|weak| !keep(weak)) {
+            self.first = None;
+        }
+        self.rest.retain(|weak| keep(weak));
+        // `first` leads the list: refill it so that a single reader never needs the vector.
+        if self.first.is_none() && !self.rest.is_empty() {
+            self.first = Some(self.rest.remove(0));
+        }
+    }
+}
+
+impl IntoIterator for Weaks {
+    type Item = Weak<Node>;
+    type IntoIter = std::iter::Chain<std::option::IntoIter<Weak<Node>>, std::vec::IntoIter<Weak<Node>>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.first.into_iter().chain(self.rest)
+    }
+}
+
+impl Extend<Weak<Node>> for Weaks {
+    fn extend<I: IntoIterator<Item = Weak<Node>>>(&mut self, nodes: I) {
+        nodes.into_iter().for_each(|node| self.push(node));
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReaderList {
-    nodes: Vec<Weak<Node>>,
+    nodes: Weaks,
     /// Length at which dead and evaluated entries are dropped next.
     prune_at: usize,
 }
@@ -587,7 +739,7 @@ impl Readers {
         }
     }
 
-    fn take(&self) -> Vec<Weak<Node>> {
+    fn take(&self) -> Weaks {
         let mut list = lock(&self.list);
         list.prune_at = 0;
         std::mem::take(&mut list.nodes)
@@ -597,7 +749,7 @@ impl Readers {
     /// buffer it produced.
     pub(crate) fn absorb(&self, other: &Readers) {
         let moved = other.take();
-        if moved.is_empty() {
+        if moved.first.is_none() {
             return;
         }
         lock(&self.list).nodes.extend(moved);
@@ -623,9 +775,9 @@ impl Readers {
 #[derive(Debug)]
 pub(crate) struct JitState {
     /// Generated kernels by the structure of their program.
-    kernels: Mutex<HashMap<program::FusedKey, Arc<KernelCore>>>,
+    kernels: Mutex<FxMap<program::FusedKey, Arc<KernelCore>>>,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
-    stencils: Mutex<HashMap<String, Arc<KernelCore>>>,
+    stencils: Mutex<FxMap<String, Arc<KernelCore>>>,
     /// Every node created and not yet known to be evaluated, oldest first, so that
     /// [`Context::sync`] can evaluate the live ones.
     live: Mutex<ReaderList>,
@@ -669,8 +821,8 @@ impl JitState {
             .saturating_sub(1)
             .clamp(1, MAX_INPUTS);
         JitState {
-            kernels: Mutex::new(HashMap::new()),
-            stencils: Mutex::new(HashMap::new()),
+            kernels: Mutex::new(FxMap::default()),
+            stencils: Mutex::new(FxMap::default()),
             live: Mutex::new(ReaderList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             max_inputs,
@@ -734,9 +886,9 @@ impl JitState {
                     continue;
                 }
                 let mut more_inputs = inputs.clone();
-                node.inputs.iter().for_each(|&id| insert_sorted(&mut more_inputs, id));
+                node.inputs().iter().for_each(|&id| insert_sorted(&mut more_inputs, id));
                 let mut more_below = below.clone();
-                node.below.iter().for_each(|&id| insert_sorted(&mut more_below, id));
+                node.below().iter().for_each(|&id| insert_sorted(&mut more_below, id));
                 let fits = more_inputs.len() + group.len() < self.max_inputs + 1
                     && more_below.len() + group.len() < MAX_NODES_LIMIT;
                 if fits || group.is_empty() {
@@ -757,8 +909,8 @@ impl JitState {
     /// bindings the device allows. Computing them together evaluates what they share once.
     fn evaluate_alongside(&self, seed: Arc<Node>) {
         let candidates: Vec<Weak<Node>> = lock(&self.live).nodes.iter().rev().cloned().collect();
-        let mut inputs = seed.inputs.to_vec();
-        let mut below = seed.below.to_vec();
+        let mut inputs = seed.inputs().to_vec();
+        let mut below = seed.below().to_vec();
         insert_sorted(&mut below, seed.id);
         let mut group = vec![seed];
         for weak in candidates {
@@ -769,14 +921,14 @@ impl JitState {
                 || !node.is_pending()
                 || node.fused.load(Ordering::Relaxed)
                 || below.binary_search(&node.id).is_ok()
-                || !node.below.iter().any(|id| below.binary_search(id).is_ok())
+                || !node.below().iter().any(|id| below.binary_search(id).is_ok())
             {
                 continue;
             }
             let mut more_inputs = inputs.clone();
-            node.inputs.iter().for_each(|&id| insert_sorted(&mut more_inputs, id));
+            node.inputs().iter().for_each(|&id| insert_sorted(&mut more_inputs, id));
             let mut more_below = below.clone();
-            node.below.iter().for_each(|&id| insert_sorted(&mut more_below, id));
+            node.below().iter().for_each(|&id| insert_sorted(&mut more_below, id));
             if more_inputs.len() + group.len() < self.max_inputs + 1 && more_below.len() + group.len() < MAX_NODES_LIMIT {
                 (inputs, below) = (more_inputs, more_below);
                 insert_sorted(&mut below, node.id);
