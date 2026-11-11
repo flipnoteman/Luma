@@ -172,6 +172,13 @@ pub(crate) const BATCH_LIMIT: u32 = 256;
 /// `min_uniform_buffer_offset_alignment` slot each.
 const ARENA_CHUNK: u64 = 256 * 1024;
 
+/// Bytes at the start of the batch's first uniform chunk that are copied by the batch's own
+/// command buffer, as its first command. The slots of a handful of launches fit: the batch then
+/// needs no command buffer of its own for uniforms (a second encoder, its `finish` and a second
+/// command buffer in the submission cost the host about 2.5 us and delay the GPU by about 2 us
+/// per submission). Slots beyond it go through the separate command buffer.
+const UNIFORM_PREFIX: u64 = 4096;
+
 /// Bind groups cached per context before the cache is emptied (at the next flush).
 const MAX_CACHED_BIND_GROUPS: usize = 2048;
 
@@ -211,6 +218,8 @@ impl<'a> RawArg<'a> {
 #[derive(Debug)]
 struct Chunk {
     buffer: Buffer,
+    /// The arena epoch this chunk was started in.
+    epoch: u64,
     /// Host copy of the slots handed out so far (`data.len()` is the used size).
     data: Vec<u8>,
     /// Bind group of `@group(0)` for this chunk (the grid uniform at a dynamic offset).
@@ -234,8 +243,9 @@ struct Arena {
     epoch: u64,
 }
 
-fn new_chunk(device: &wgpu::Device, size: u64) -> Chunk {
+fn new_chunk(device: &wgpu::Device, size: u64, epoch: u64) -> Chunk {
     Chunk {
+        epoch,
         buffer: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("luma uniforms"),
             size,
@@ -254,7 +264,7 @@ fn slot_size(align: u64, len: usize) -> u64 {
 
 impl Arena {
     fn new(device: &wgpu::Device) -> Self {
-        Arena { current: new_chunk(device, ARENA_CHUNK), full: Vec::new(), epoch: 0 }
+        Arena { current: new_chunk(device, ARENA_CHUNK, 0), full: Vec::new(), epoch: 0 }
     }
 
     /// `true` if `bytes` more bytes of slots fit into the current chunk.
@@ -265,7 +275,7 @@ impl Arena {
     /// Starts a new chunk with room for at least `bytes` bytes; the old one is kept until the
     /// batch is submitted.
     fn roll(&mut self, device: &wgpu::Device, bytes: u64) {
-        let fresh = new_chunk(device, bytes.max(ARENA_CHUNK));
+        let fresh = new_chunk(device, bytes.max(ARENA_CHUNK), self.epoch + 1);
         self.full.push(std::mem::replace(&mut self.current, fresh));
         self.epoch += 1;
     }
@@ -287,6 +297,10 @@ impl Arena {
     /// commands (the copies out of the staging buffers) have to be submitted ahead of the
     /// batch's own, and so run after everything submitted earlier.
     ///
+    /// The first [`UNIFORM_PREFIX`] bytes of the chunk the batch started in are not part of
+    /// them: `prefix` is the staging buffer the batch's own commands copy them out of (see
+    /// [`Context::new_encoder`]); they are written into it here.
+    ///
     /// The staging buffers are the reusable mapped ones of [`Context::upload`] (pushed to
     /// `staged`, which the caller maps again after the submission), not `Queue::write_buffer`:
     /// that one has wgpu create a staging buffer per call, which allocates and maps a fresh
@@ -295,15 +309,28 @@ impl Arena {
     fn upload(
         &mut self,
         ctx: &Context,
+        prefix: Option<Prefix>,
         staged: &mut Vec<Buffer>,
         released: &mut Vec<Buffer>,
     ) -> Option<wgpu::CommandBuffer> {
         let mut encoder: Option<wgpu::CommandEncoder> = None;
+        // The staging buffer must be unmapped for the submission even if no slot went into it.
+        let mut prefix = prefix.map(|prefix| (prefix, false));
         for chunk in self.full.iter().chain(std::iter::once(&self.current)) {
             if chunk.data.is_empty() {
                 continue;
             }
-            match ctx.stage(&chunk.data) {
+            let mut from = 0;
+            if let Some((prefix, written)) = prefix.as_mut().filter(|(prefix, _)| prefix.epoch == chunk.epoch) {
+                from = chunk.data.len().min(UNIFORM_PREFIX as usize);
+                ctx.fill(&prefix.staging, &chunk.data[..from]);
+                *written = true;
+            }
+            let rest = &chunk.data[from..];
+            if rest.is_empty() {
+                continue;
+            }
+            match ctx.stage(rest) {
                 Some(staging) => {
                     encoder
                         .get_or_insert_with(|| {
@@ -311,13 +338,19 @@ impl Arena {
                                 label: Some("luma uniforms"),
                             })
                         })
-                        .copy_buffer_to_buffer(&staging, 0, &chunk.buffer, 0, chunk.data.len() as u64);
+                        .copy_buffer_to_buffer(&staging, 0, &chunk.buffer, from as u64, rest.len() as u64);
                     staged.push(staging);
                 }
                 // No staging buffer to be had (the device is out of memory): `write_buffer`
                 // brings its own and is ordered the same way.
-                None => ctx.queue().write_buffer(&chunk.buffer, 0, &chunk.data),
+                None => ctx.queue().write_buffer(&chunk.buffer, from as u64, rest),
             }
+        }
+        if let Some((prefix, written)) = prefix {
+            if !written {
+                ctx.fill(&prefix.staging, &[]);
+            }
+            staged.push(prefix.staging);
         }
         released.extend(self.full.drain(..).map(|chunk| chunk.buffer));
         self.current.data.clear();
@@ -375,6 +408,14 @@ struct Bound {
     args: Option<(u64, usize)>,
 }
 
+/// The staging buffer the first [`UNIFORM_PREFIX`] bytes of a chunk are copied out of by the
+/// first command of the batch's encoder, and the chunk's arena epoch.
+#[derive(Debug)]
+struct Prefix {
+    staging: Buffer,
+    epoch: u64,
+}
+
 /// The commands recorded since the last submission.
 #[derive(Debug)]
 struct Batch {
@@ -383,6 +424,8 @@ struct Batch {
     /// encoder so that it is dropped (ended) first.
     pass: Option<wgpu::ComputePass<'static>>,
     encoder: Option<wgpu::CommandEncoder>,
+    /// Present once `encoder` exists and a staging buffer was available for [`Prefix`].
+    prefix: Option<Prefix>,
     bound: Bound,
     dispatches: u32,
     arena: Arena,
@@ -660,6 +703,7 @@ impl Context {
         let batch = Batch {
             pass: None,
             encoder: None,
+            prefix: None,
             bound: Bound::default(),
             dispatches: 0,
             arena: Arena::new(&device),
@@ -831,7 +875,8 @@ impl Context {
         // The slots of the arena are reused by the next batch.
         batch.grid_slots.clear();
         let mut released = std::mem::take(&mut *lock(&self.inner.released));
-        let uniforms = batch.arena.upload(self, &mut batch.uploads, &mut released);
+        let prefix = batch.prefix.take();
+        let uniforms = batch.arena.upload(self, prefix, &mut batch.uploads, &mut released);
         if batch.bind_groups.len > MAX_CACHED_BIND_GROUPS {
             // In-flight work keeps what it uses alive; this only drops our references.
             batch.bind_groups = BindGroupCache::default();
@@ -1123,11 +1168,7 @@ impl Context {
     /// creates a mapped one.
     fn stage(&self, data: &[u8]) -> Option<Buffer> {
         let bytes = data.len() as u64;
-        let class = pool::size_class(bytes, self.inner.max_buffer_bytes)?;
-        let staging = match self.take_idle(&self.inner.uploads, class) {
-            Some(buffer) => buffer,
-            None => self.create_buffer(class, UPLOAD_USAGE, true)?,
-        };
+        let staging = self.mapped_staging(bytes)?;
         {
             // A plain copy: the slots of one chunk are kilobytes, and `write_parallel` asks the
             // OS for the thread count first, which costs more than copying them.
@@ -1137,6 +1178,46 @@ impl Context {
         staging.unmap();
         lock(&self.inner.uploads).in_flight += staging.size();
         Some(staging)
+    }
+
+    /// An upload staging buffer for `bytes` bytes, still mapped: an idle one, or a new one.
+    fn mapped_staging(&self, bytes: u64) -> Option<Buffer> {
+        let class = pool::size_class(bytes, self.inner.max_buffer_bytes)?;
+        match self.take_idle(&self.inner.uploads, class) {
+            Some(buffer) => Some(buffer),
+            None => self.create_buffer(class, UPLOAD_USAGE, true),
+        }
+    }
+
+    /// Writes `data` at the start of the mapped staging buffer `staging` and unmaps it, so that
+    /// the commands recorded to copy out of it can be submitted. Only [`Arena::upload`] calls
+    /// this, for the buffer of a [`Prefix`], which is mapped for as long as it is not filled.
+    fn fill(&self, staging: &Buffer, data: &[u8]) {
+        if !data.is_empty() {
+            match staging.get_mapped_range_mut(..data.len() as u64) {
+                Ok(mut view) => view.slice(..).copy_from_slice(data),
+                Err(error) => {
+                    lock(&self.inner.gpu_error).get_or_insert_with(|| format!("uniform staging buffer: {error}"));
+                }
+            }
+        }
+        staging.unmap();
+    }
+
+    /// A new command encoder for the batch. Its first command copies the first
+    /// [`UNIFORM_PREFIX`] bytes of the uniform chunk `chunk` (started in arena epoch `epoch`) out
+    /// of a staging buffer that [`Arena::upload`] fills when the batch is submitted, so that
+    /// the slots of a small batch need no command buffer of their own. Without a staging
+    /// buffer (the device is out of memory) everything goes through that separate buffer.
+    fn new_encoder(&self, prefix: &mut Option<Prefix>, chunk: &Buffer, epoch: u64) -> wgpu::CommandEncoder {
+        let mut encoder =
+            self.device().create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma batch") });
+        if let Some(staging) = self.mapped_staging(UNIFORM_PREFIX) {
+            lock(&self.inner.uploads).in_flight += staging.size();
+            encoder.copy_buffer_to_buffer(&staging, 0, chunk, 0, UNIFORM_PREFIX);
+            *prefix = Some(Prefix { staging, epoch });
+        }
+        encoder
     }
 
     /// Records zeroing the first `bytes` bytes of `buffer`.
@@ -1160,10 +1241,8 @@ impl Context {
     fn encoder<'a>(&self, batch: &'a mut Batch) -> &'a mut wgpu::CommandEncoder {
         batch.pass = None;
         batch.bound = Bound::default();
-        batch.encoder.get_or_insert_with(|| {
-            self.device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma batch") })
-        })
+        let Batch { encoder, prefix, arena, .. } = batch;
+        encoder.get_or_insert_with(|| self.new_encoder(prefix, &arena.current.buffer, arena.epoch))
     }
 
     /// Copies the first `bytes` bytes of `buffer` into a new vector, see [`Context::read_into`].
@@ -1358,7 +1437,7 @@ impl Context {
         let inner = &*self.inner;
         let device = self.device();
         let align = inner.uniform_align;
-        let Batch { encoder, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler, .. } =
+        let Batch { encoder, prefix, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler, .. } =
             batch;
 
         // Uniform values go into fresh arena slots, all of this launch's in one chunk. The grid
@@ -1464,9 +1543,7 @@ impl Context {
         if profiled {
             *pass = None;
         }
-        let encoder = encoder.get_or_insert_with(|| {
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma batch") })
-        });
+        let encoder = encoder.get_or_insert_with(|| self.new_encoder(prefix, uniforms, arena.epoch));
         let pass_slot = pass;
         let pass = pass_slot.get_or_insert_with(|| {
             *bound = Bound::default();
@@ -1956,5 +2033,22 @@ mod tests {
         }
         assert_eq!(x.to_vec().unwrap(), vec![(BATCH_LIMIT * 2 + 5) as f32; 8]);
         assert_eq!(ctx.pending_dispatches(), 0);
+    }
+
+    #[test]
+    fn uniform_slots_beyond_the_prefix_copy_reach_the_gpu() {
+        // The first slots of a batch are copied by its own command buffer, the rest by a separate
+        // one. A launch takes one slot and the grid of the shared size one more; with 256-byte
+        // slots `UNIFORM_PREFIX` holds 15 launches.
+        let ctx = Context::new().unwrap();
+        for launches in [1usize, 15, 16, 17, 40, 100] {
+            let mut x = Array::<f32>::zeros_on(&ctx, 8).unwrap();
+            let _view = x.reshape(8);
+            for i in 1..=launches {
+                x += i as f32;
+            }
+            let want: f32 = (1..=launches).map(|i| i as f32).sum();
+            assert_eq!(x.to_vec().unwrap(), vec![want; 8], "{launches} launches");
+        }
     }
 }
