@@ -558,6 +558,7 @@ pub(crate) fn create(
     // with the live arrays that share pending work with it (see the module documentation)
     // instead of alone.
     let mut batched = false;
+    let mut cut = false;
     let (below_len, _) = loop {
         let (below, inputs) = measure(args.get(..arity).unwrap_or(&[]));
         if below < max_nodes && inputs <= max_inputs {
@@ -575,6 +576,7 @@ pub(crate) fn create(
                 .max_by_key(|node| node.size())
                 .map(Arc::clone);
             if let Some(seed) = seed {
+                cut = true;
                 jit.evaluate_alongside(seed);
                 for i in 0..arity {
                     if matches!(args.get(i), Some(Src::Node(node)) if node.result.get().is_some()) {
@@ -594,11 +596,18 @@ pub(crate) fn create(
             })
             .max_by_key(|&(_, size)| size);
         match biggest {
-            Some((i, _)) => evaluate_operand(&mut args, i)?,
+            Some((i, _)) => {
+                cut = true;
+                evaluate_operand(&mut args, i)?;
+            }
             // Only buffers and scalars left: at most three operands, within any sane limit.
             None => break (below, inputs),
         }
     };
+    if cut {
+        // Without this, a long chain built without `eval` keeps the GPU idle until its end.
+        let _ = ctx.submit();
+    }
     let recomputes = args.iter().take(arity).enumerate().any(|(i, arg)| match arg {
         Src::Node(operand) => operand.recomputes || (i == 0 && matches!(op.kind, OpKind::Shift(_))),
         _ => false,

@@ -19,6 +19,9 @@ All notable changes to Luma are listed here. The format follows
   error raised by the batch shows up at the next waiting call. `submit` and `submit_all` are now
   the same as `eval` and `eval_all`. A loop that evaluates every step no longer pays a full round
   trip per step (about 35 µs on NVIDIA/Vulkan on Linux).
+- Work evaluated at the fusion limit is handed to the GPU right away, so a long chain built
+  without `eval` runs while the host records the rest (mandelbrot 1024², 256 unevaluated
+  iterations: 5.6 to 3.7 ms on an RTX 3080 Laptop).
 - At the fusion limit, live arrays that share pending work with the biggest operand are evaluated
   together in multi-output kernels, instead of that operand alone.
 - `Array::submit` and `submit_all` hold back up to 16 kernels while the GPU is still busy and hand
