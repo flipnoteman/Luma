@@ -1,5 +1,3 @@
-<p align="center"><img src="assets/banner.png" alt="Luma" width="600"></p>
-
 # Luma
 
 Async GPU compute library for Rust. Write code with ordinary arithmetic operations and methods, and Luma handles execution 
