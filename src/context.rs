@@ -1,4 +1,5 @@
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -79,15 +80,82 @@ impl FreeUploads {
     }
 }
 
-/// How long [`Context::sync`] polls for the GPU to finish before it blocks in the driver. Bounds
-/// the CPU time spent spinning on a long kernel; kernels that finish inside it are noticed
-/// without waking a blocked thread, which returns 20-40 us late. Measured on Black-Scholes with
-/// 1<<24 options (a 340 us kernel, so it always outlasted the old 100 us spin): median `eval`
-/// wall time of the runs not disturbed by other GPU users 446 us at 100 us, 422 us at 500 us,
-/// 420 us at 1 ms; 500 us gets all of it. The CPU time of 50 `eval`s of a ~7 ms kernel chain did
-/// not change measurably between 100 us and 500 us (about 12-30% of the wall time either way),
-/// while a 2 ms spin raised it to 40-50%.
-const SYNC_SPIN: Duration = Duration::from_micros(500);
+/// Fewest time a wait polls before it blocks in the driver, whatever the recent waits were. A
+/// thread blocked in the driver is woken late: 20-40 us on a desktop RTX 3090, 65 us on a laptop
+/// RTX 3080 (blocking at 500 us rather than polling to the end of a 733 us kernel returned the
+/// laptop's `eval` 130 us later). Burning a core for this long costs less than that on every
+/// job and is what this crate always did.
+const SYNC_SPIN_MIN: Duration = Duration::from_micros(500);
+
+/// Most a wait polls before it blocks in the driver, however long the recent waits were. It
+/// bounds the CPU time a wait burns on a job that runs much longer than predicted.
+const SYNC_SPIN_MAX: Duration = Duration::from_millis(4);
+
+/// Wait durations the spin budget is derived from, see [`WaitHistory`].
+const WAIT_SAMPLES: usize = 4;
+
+/// The durations of the last [`WAIT_SAMPLES`] waits of a context ([`Context::sync`] and the
+/// readbacks), which decide how long the next one polls for the GPU before it blocks.
+///
+/// A blocked thread is woken late, so a wait that is polled to its end returns sooner than one
+/// that blocks, but polling burns a core. The budget is one and a half times the longest of the
+/// last [`WAIT_SAMPLES`] waits, at least [`SYNC_SPIN_MIN`]; when that exceeds [`SYNC_SPIN_MAX`]
+/// it is [`SYNC_SPIN_MIN`] instead, because polling would not catch a job that long anyway and
+/// the wake-up delay is a small part of it. So a loop of evaluations that take up to
+/// 2.7 ms ([`SYNC_SPIN_MAX`] / 1.5) never blocks, a loop of longer ones polls for
+/// [`SYNC_SPIN_MIN`] per wait and then blocks, a wait that turns out much longer than predicted
+/// costs at most [`SYNC_SPIN_MAX`] of polling (normally at most 1.5 times the prediction), and a
+/// context starts with [`SYNC_SPIN_MIN`]. The newest sample replaces the oldest, so one outlier
+/// (a long job among short ones) is forgotten after [`WAIT_SAMPLES`] waits.
+///
+/// Racy by design: waits from several threads overwrite each other's samples, which only makes
+/// the prediction a little worse.
+///
+/// Measured (median of 300 `eval`s of Black-Scholes, wait phase after the submission, against
+/// the fixed 500 us poll; RTX 3090 / laptop RTX 3080; GPU kernel in brackets):
+/// - 1<<22 options: 95 us (78) / 205 us (186), unchanged: the kernel ends inside 500 us either way.
+/// - 1<<24: 319 us (302) / 910-965 us (733) before, 318 us / 789 us after. The laptop's kernel
+///   outlasts 500 us, so the old poll blocked and the wake-up cost 135 us.
+/// - 1<<26: 1235 us (1198) before, 1214 us after / 3220 us (2919), unchanged: a 3 ms wait is
+///   beyond [`SYNC_SPIN_MAX`] / 1.5.
+/// - Loops of Black-Scholes kernels of 1<<24 per `eval`: on the laptop 2 kernels take 1.83 ms
+///   before and 1.62 ms after, at 95% CPU instead of 38%; on the desktop 5 kernels take 1.62 ms
+///   before and 1.59 ms after, at 100% instead of 40%. Chains of 4-15 ms (desktop
+///   20 and 40 kernels, laptop 5, 10 and 20) and of 100 ms use the same CPU time as before
+///   (8-21% of the wall time, 15% for 100 ms on the laptop; 11-15% and 43% on the desktop,
+///   where recording the 320 kernels of the long chain is most of it).
+/// - Yielding the thread in the poll loop gives the same wait (789 us / 318 us), so it buys
+///   nothing and is not done.
+///
+/// What is left after the kernel, 17 us on the desktop and 20 us on the laptop (56 us on the
+/// laptop once the kernel moves more than about 170 MB or runs longer than about 450 us), is
+/// not on the host: a poll takes 0.14 us, the one that sees the end under 2 us.
+#[derive(Debug)]
+struct WaitHistory {
+    /// Microseconds, saturating.
+    samples: [AtomicU32; WAIT_SAMPLES],
+    next: AtomicU32,
+}
+
+impl WaitHistory {
+    fn new() -> Self {
+        WaitHistory { samples: std::array::from_fn(|_| AtomicU32::new(0)), next: AtomicU32::new(0) }
+    }
+
+    /// How long the next wait polls before it blocks.
+    fn budget(&self) -> Duration {
+        let longest = self.samples.iter().map(|s| s.load(Ordering::Relaxed)).max().unwrap_or(0);
+        let wanted = Duration::from_micros(3 * u64::from(longest) / 2);
+        if wanted > SYNC_SPIN_MAX { SYNC_SPIN_MIN } else { wanted.max(SYNC_SPIN_MIN) }
+    }
+
+    /// Notes how long a wait took, polling and blocking together.
+    fn record(&self, wait: Duration) {
+        let at = self.next.fetch_add(1, Ordering::Relaxed) as usize % WAIT_SAMPLES;
+        let micros = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+        self.samples[at].store(micros, Ordering::Relaxed);
+    }
+}
 
 /// Number of pending dispatches up to which [`Context::submit`] holds the batch back while the
 /// GPU is busy. Each `queue.submit` costs the host 20-35 us and leaves a gap of 20-27 us on the
@@ -355,6 +423,8 @@ struct Inner {
     /// Kernel parameters for this GPU.
     tuning: Tuning,
     batch: Mutex<Batch>,
+    /// How long recent waits took, which sets how long the next one polls before it blocks.
+    waits: WaitHistory,
     /// The first error the GPU reported outside of a call that could return it.
     gpu_error: Arc<Mutex<Option<String>>>,
     /// Layout of `@group(0)`: the grid uniform, at a dynamic offset into the arena.
@@ -621,6 +691,7 @@ impl Context {
                 pager: Pager::new(budget),
                 unmapped: Mutex::new(Vec::new()),
                 batch: Mutex::new(batch),
+                waits: WaitHistory::new(),
                 gpu_error,
                 grid_layout,
                 max_buffer_bytes,
@@ -640,19 +711,21 @@ impl Context {
     /// first error the GPU raised while running luma's commands.
     pub fn sync(&self) -> Result<()> {
         self.flush()?;
+        let start = Instant::now();
         if !self.spin_until_idle() {
             self.device()
                 .poll(wgpu::PollType::wait_indefinitely())
                 .map_err(|e| LumaError::Poll(Arc::new(e)))?;
         }
+        self.inner.waits.record(start.elapsed());
         self.take_gpu_error()
     }
 
-    /// Polls without blocking for up to [`SYNC_SPIN`]; `true` once the queue is empty. A thread
-    /// that notices the end of a short kernel while running returns about 20 us sooner than one
-    /// that was blocked in `poll` and has to be woken up.
+    /// Polls without blocking for up to the spin budget ([`WaitHistory`]); `true` once the queue
+    /// is empty. A thread that notices the end of a short kernel while running returns sooner
+    /// than one that was blocked in `poll` and has to be woken up.
     fn spin_until_idle(&self) -> bool {
-        let deadline = Instant::now() + SYNC_SPIN;
+        let deadline = Instant::now() + self.inner.waits.budget();
         loop {
             match self.device().poll(wgpu::PollType::Poll) {
                 Ok(status) if status.is_queue_empty() => return true,
@@ -1207,20 +1280,47 @@ impl Context {
     }
 
     /// Waits until `submission` (the latest one if `None`) has run and the mapping `mapped`
-    /// reports on is done.
+    /// reports on is done. Polls for it first, like [`Context::sync`].
     fn wait_map(&self, submission: Option<wgpu::SubmissionIndex>, mapped: &MapReceiver) -> Result<()> {
-        self.device()
-            .poll(wgpu::PollType::Wait { submission_index: submission, timeout: None })
-            .map_err(|e| LumaError::Poll(Arc::new(e)))?;
-        // The callback runs on whichever thread polls the device first, so it may still be
-        // in flight on another thread after our poll returns; wait for it.
-        let mapped = mapped
-            .recv()
-            .map_err(|_| LumaError::Map(wgpu::BufferAsyncError))?
-            .map_err(LumaError::Map);
+        let start = Instant::now();
+        let mapped = match self.spin_for_map(mapped) {
+            Some(received) => received,
+            None => {
+                self.device()
+                    .poll(wgpu::PollType::Wait { submission_index: submission, timeout: None })
+                    .map_err(|e| LumaError::Poll(Arc::new(e)))?;
+                // The callback runs on whichever thread polls the device first, so it may still
+                // be in flight on another thread after our poll returns; wait for it.
+                mapped.recv()
+            }
+        };
+        self.inner.waits.record(start.elapsed());
+        let mapped = mapped.map_err(|_| LumaError::Map(wgpu::BufferAsyncError))?.map_err(LumaError::Map);
         // An error the GPU raised while running the batch explains a failed map better.
         self.take_gpu_error()?;
         mapped
+    }
+
+    /// Polls without blocking for up to the spin budget ([`WaitHistory`]) until the mapping
+    /// `mapped` reports on is done. `None` if it is not (or a poll failed, which the blocking
+    /// wait reports).
+    fn spin_for_map(
+        &self,
+        mapped: &MapReceiver,
+    ) -> Option<std::result::Result<std::result::Result<(), wgpu::BufferAsyncError>, mpsc::RecvError>> {
+        let deadline = Instant::now() + self.inner.waits.budget();
+        loop {
+            self.device().poll(wgpu::PollType::Poll).ok()?;
+            match mapped.try_recv() {
+                Ok(result) => return Some(Ok(result)),
+                Err(mpsc::TryRecvError::Disconnected) => return Some(Err(mpsc::RecvError)),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Records a dispatch of `kernel` and returns without waiting for it.
@@ -1675,6 +1775,34 @@ fn check_aliasing(args: &[RawArg<'_>]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::array::Array;
+
+    #[test]
+    fn spin_budget_follows_the_recent_waits_up_to_the_cap() {
+        let waits = WaitHistory::new();
+        assert_eq!(waits.budget(), SYNC_SPIN_MIN);
+
+        // Short waits keep the minimum; one of 1 ms makes the next ones poll for 1.5 ms.
+        waits.record(Duration::from_micros(80));
+        assert_eq!(waits.budget(), SYNC_SPIN_MIN);
+        waits.record(Duration::from_millis(1));
+        assert_eq!(waits.budget(), Duration::from_micros(1500));
+
+        // Waits too long to be caught by polling fall back to the minimum.
+        waits.record(Duration::from_millis(3));
+        assert_eq!(waits.budget(), SYNC_SPIN_MIN);
+        waits.record(Duration::from_secs(5));
+        assert_eq!(waits.budget(), SYNC_SPIN_MIN);
+
+        // The outlier is forgotten after `WAIT_SAMPLES` more waits.
+        for _ in 0..WAIT_SAMPLES {
+            waits.record(Duration::from_micros(200));
+        }
+        assert_eq!(waits.budget(), SYNC_SPIN_MIN);
+        for _ in 0..WAIT_SAMPLES {
+            waits.record(Duration::from_millis(2));
+        }
+        assert_eq!(waits.budget(), Duration::from_millis(3));
+    }
 
     #[test]
     fn recycled_buffers_are_reused_per_size_class_and_usage() {
