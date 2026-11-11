@@ -703,3 +703,44 @@ fn arrays_advancing_together_are_split_into_multi_output_kernels() {
     // not one single-output kernel per operand.
     assert!(launches <= 20, "{launches} kernels");
 }
+
+#[test]
+fn the_node_limit_counts_distinct_nodes_only() {
+    let ctx = Context::new().unwrap();
+    ctx.jit().set_max_nodes(61);
+    let xs = values(300, 40, 0.5, 1.5);
+    let x = f32s(&ctx, &xs);
+
+    // Two chains of `rounds` steps (two nodes each) that both start at `common` and are built
+    // alternately, so their node ids interleave. `common` is read by both chains and by the
+    // last operation, yet counts once: `4 * rounds + 4` distinct nodes lie below the result.
+    let run = |rounds: usize| {
+        let before = ctx.jit().stats();
+        let common = &x * 1.1;
+        let (mut a, mut b) = (&common + 0.5, &common - 0.5);
+        for _ in 0..rounds {
+            a = &a * 1.01 * 1.02;
+            b = &b * 0.99 * 0.98;
+        }
+        let z = &a + &b + &common;
+        let got = z.to_vec().unwrap();
+        let want: Vec<f32> = xs
+            .iter()
+            .map(|&v| {
+                let common = v * 1.1;
+                let (mut a, mut b) = (common + 0.5, common - 0.5);
+                for _ in 0..rounds {
+                    a = a * 1.01 * 1.02;
+                    b = b * 0.99 * 0.98;
+                }
+                a + b + common
+            })
+            .collect();
+        assert_close(&got, &want, 1e-4, 1e-4);
+        delta(before, ctx.jit().stats()).elementwise_launches
+    };
+    // 60 distinct nodes fit the limit of 61, counted by what is shared and not by its paths.
+    assert_eq!(run(14), 1);
+    // 64 do not.
+    assert!(run(15) >= 2);
+}
