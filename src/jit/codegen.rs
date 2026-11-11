@@ -234,6 +234,68 @@ fn luma_eval(i: u32) -> {ty} {{
     src
 }
 
+/// A kernel running `p.steps` iterations of the store program `key` per element, with the
+/// state in registers. `states[k]` is the state that input `k` reads (`None`: a loop-invariant
+/// input). Bindings: one output and one initial value per state, the invariant inputs, `p`.
+pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tuning) -> String {
+    let wg = tuning.elementwise_workgroup;
+    let count = key.outputs.len();
+    let mut src = String::from("struct Params { steps: u32, ");
+    for (k, ty) in key.scalar_tys.iter().enumerate() {
+        let _ = write!(src, "s{k}: {}, ", ty.wgsl());
+    }
+    src.push_str("}\n");
+    let mut binding = 0;
+    for (role, access) in [("out", "read_write"), ("init", "read")] {
+        for j in 0..count {
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<f32>;");
+            binding += 1;
+        }
+    }
+    for (k, ty) in key.input_tys.iter().enumerate() {
+        if states.get(k).copied().flatten().is_none() {
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", ty.wgsl());
+            binding += 1;
+        }
+    }
+    let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
+    let _ = write!(
+        src,
+        "
+@compute @workgroup_size({wg})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let i = gid.x + gid.y * nwg.x * {wg}u;
+    if (i >= luma.size.x) {{ return; }}
+"
+    );
+    for j in 0..count {
+        let _ = writeln!(src, "    var s{j}: f32 = init{j}[i];");
+    }
+    for (k, ty) in key.input_tys.iter().enumerate() {
+        if states.get(k).copied().flatten().is_none() && direct(&key.instrs, k as u32) {
+            let _ = writeln!(src, "    let a{k}: {} = in{k}[i];", ty.wgsl());
+        }
+    }
+    src.push_str("    for (var step = 0u; step < p.steps; step = step + 1u) {\n");
+    for (k, state) in states.iter().enumerate() {
+        if let Some(j) = state {
+            let _ = writeln!(src, "        let a{k}: f32 = s{j};");
+        }
+    }
+    for (k, instr) in key.instrs.iter().enumerate() {
+        let _ = writeln!(src, "        let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr, "i", "luma.size.x", false));
+    }
+    for (j, at) in key.outputs.iter().enumerate() {
+        let _ = writeln!(src, "        s{j} = t{at};");
+    }
+    src.push_str("    }\n");
+    for j in 0..count {
+        let _ = writeln!(src, "    out{j}[i] = s{j};");
+    }
+    src.push_str("}\n");
+    src
+}
+
 /// The loads of the inputs at element `i` and the instructions, as `let` bindings. The input
 /// `in_place` (if any) is the output buffer `out0`, read before it is overwritten. `index`,
 /// `total` and `segmented` are those of [`expression`].

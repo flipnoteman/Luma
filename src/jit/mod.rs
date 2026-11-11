@@ -72,7 +72,7 @@ use crate::gpu::hash::FxMap;
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 
-pub(crate) use program::{evaluate, evaluate_group, evaluate_into, reduce_first_pass};
+pub(crate) use program::{evaluate, evaluate_group, evaluate_into, reduce_first_pass, run_loop};
 pub(crate) use stencil::plan as stencil_plan;
 
 /// Length of the requested list at which entries of dropped or computed nodes are pruned.

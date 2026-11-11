@@ -258,6 +258,10 @@ impl<T: GpuType> Array<T> {
         })
     }
 
+    pub(crate) fn from_storage(ctx: &Context, shape: Shape, storage: Storage) -> Self {
+        Array { ctx: ctx.clone(), shape, repr: Repr::Valid(Arc::new(storage)), _marker: PhantomData }
+    }
+
     /// An array that is the (not yet evaluated) result of `node`.
     pub(crate) fn from_node(ctx: &Context, shape: Shape, node: Arc<Node>) -> Self {
         Array { ctx: ctx.clone(), shape, repr: Repr::Lazy(node), _marker: PhantomData }

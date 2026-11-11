@@ -36,7 +36,7 @@ I/O dependant, operations.
 - Batched submission
 - Non-blocking `eval` / `eval_all`: the GPU runs while the host records the next steps; reads and `sync` wait
 - Readback into a new `Vec` (`to_vec`) or into host memory you already own (`read_into`)
-- Multi-step stencils with `iterate`
+- Multi-step stencils with `iterate`; elementwise loops over several arrays with `iterate_all`, compiled into one kernel that keeps the state in registers
 - Ability to use custom WGSL kernels
 - Subgroups, `f16` and cooperative matrices (tensor cores) on GPUs that support them
 - Kernel tuning per GPU vendor (Apple and NVIDIA measured, generic defaults elsewhere)

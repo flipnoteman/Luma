@@ -8,6 +8,10 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `iterate_all`: a loop over several arrays (`[&zx, &zy, &count]`). When the step is elementwise,
+  the whole loop runs as one kernel that keeps the state in registers, for any step count;
+  anything else (shifts, arrays split into several buffers) runs step by step. Mandelbrot 1024²,
+  256 iterations: 0.46 ms on an RTX 3080 Laptop, against 3.6 ms for the unevaluated chain.
 - ArrayFire comparison benchmarks in `benchmarks/arrayfire` (separate workspace, not part of the crate).
 - `Array::submit` and `submit_all`: evaluate arrays without waiting for the GPU.
 - `select` accepts scalar branches; the result's shape and context come from the mask.

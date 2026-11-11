@@ -216,6 +216,19 @@ fn mandelbrot(sz: &Sizes) {
             });
         }
 
+        let looped = || -> Array<f32> {
+            let [_, _, cnt] = iterate_all([&zero, &zero, &zero], iters, |[zx, zy, cnt]| {
+                let inside = (zx * zx + zy * zy).le(4.0);
+                let nzx = zx * zx - zy * zy + &cx;
+                let nzy = zx * zy * 2.0 + &cy;
+                [select(&inside, &nzx, zx), select(&inside, &nzy, zy), cnt + select(&inside, 1.0, 0.0)]
+            });
+            cnt
+        };
+        let err = mismatch_frac(&looped().to_vec().unwrap(), &want);
+        check(&format!("mandelbrot {w} iterate_all"), err, 0.01);
+        report(row("iterate_all", err), || looped().eval().unwrap());
+
         let kernel = Kernel::new(MANDELBROT).unwrap();
         let ctx = default_context().unwrap();
         let p = MandelbrotParams { x0: -2.2, y0: -1.4, dx: 3.2 / w as f32, dy: 2.8 / w as f32, max_iter: iters as u32 };

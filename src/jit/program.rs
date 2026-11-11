@@ -489,7 +489,7 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
 /// evaluated first instead of being recomputed by each of them; shared nodes *within* them are
 /// one instruction.
 pub(super) fn flatten(roots: &[(Arc<Node>, Args)], tail: Tail) -> Result<Fused, Failure> {
-    flatten_inner(roots, tail, None)
+    flatten_inner(roots, tail, &[])
 }
 
 pub(super) fn flatten_stencil(
@@ -497,15 +497,16 @@ pub(super) fn flatten_stencil(
     args: Args,
     probe_id: u64,
 ) -> Result<Fused, Failure> {
-    flatten_inner(&[(Arc::clone(node), args)], Tail::Store, Some(probe_id))
+    flatten_inner(&[(Arc::clone(node), args)], Tail::Store, &[probe_id])
 }
 
 fn flatten_inner(
     roots: &[(Arc<Node>, Args)],
     tail: Tail,
-    probe_id: Option<u64>,
+    probes: &[u64],
 ) -> Result<Fused, Failure> {
-    if let ([(root, args)], None) = (roots, probe_id)
+    if let [(root, args)] = roots
+        && probes.is_empty()
         && !root.recomputes
         && let Some(fused) = flatten_plain(root, args, tail)?
     {
@@ -550,10 +551,9 @@ fn flatten_inner(
         if shared.is_empty() {
             break members;
         }
-        if let Some(id) = probe_id
-            && shared.iter().any(|node| node.depends_on(id)) {
-                return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
-            }
+        if shared.iter().any(|node| probes.iter().any(|&id| node.depends_on(id))) {
+            return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
+        }
         for node in shared {
             if let Err(error) = node.force() {
                 return Err(Failure::Inherited(Arc::clone(error)));
@@ -584,6 +584,86 @@ fn flatten_inner(
         }
     }
     Ok(flattener.finish(tail, outputs))
+}
+
+/// Runs `steps` iterations of a traced step in one kernel that keeps the state in registers.
+/// `outs[j]` is the next value of state `j`, computed from `probes[j]` (aliases of `inits[j]`).
+/// `None` if the step is not a single-buffer elementwise program of `f32` values; the caller
+/// then runs the steps one by one.
+pub(crate) fn run_loop(
+    ctx: &crate::context::Context,
+    probes: &[Arc<Storage>],
+    inits: &[Arc<Storage>],
+    outs: &[Arc<Node>],
+    steps: u32,
+) -> Option<Result<Vec<Storage>, Failure>> {
+    let len = outs.first()?.len();
+    if outs.iter().any(|out| out.len() != len || !out.is_pending())
+        || outs.iter().enumerate().any(|(j, out)| outs[..j].iter().any(|other| Arc::ptr_eq(other, out)))
+        || probes.iter().any(|probe| probe.was_materialized())
+        || probes.iter().chain(inits).any(|storage| storage.segments() != 1)
+        || inits.iter().any(|init| init.byte_len() != len as u64 * ELEMENT_BYTES)
+    {
+        return None;
+    }
+    let roots: Vec<(Arc<Node>, Args)> =
+        outs.iter().map(|out| out.operands().map(|args| (Arc::clone(out), args))).collect::<Option<_>>()?;
+    let ids: Vec<u64> = probes.iter().map(|probe| probe.id()).collect();
+    let fused = flatten_inner(&roots, Tail::Store, &ids).ok()?;
+    drop(roots);
+    let key = &fused.key;
+    let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
+    let all_f32 = key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| i.op.out_ty() == ElemTy::F32));
+    if probes.iter().any(|probe| probe.was_materialized())
+        || shifts
+        || !key.subs.is_empty()
+        || !all_f32
+        || fused.inputs.iter().any(|input| input.segments() != 1)
+    {
+        return None;
+    }
+    let states: Vec<Option<usize>> =
+        fused.inputs.iter().map(|input| probes.iter().position(|probe| Arc::ptr_eq(probe, input))).collect();
+    let source = super::codegen::loop_source(key, &states, ctx.tuning());
+    let label = format!("Loop{}", key.label().trim_start_matches("Fused"));
+    Some(launch_loop(ctx, &fused, &states, inits, len, steps, source, &label))
+}
+
+#[expect(clippy::too_many_arguments, reason = "one call site, all parts of one launch")]
+fn launch_loop(
+    ctx: &crate::context::Context,
+    fused: &Fused,
+    states: &[Option<usize>],
+    inits: &[Arc<Storage>],
+    len: usize,
+    steps: u32,
+    source: String,
+    label: &str,
+) -> Result<Vec<Storage>, Failure> {
+    let core = ctx.jit().stencil_kernel(ctx, source, label)?;
+    let n = len_u32(len)?;
+    let bytes = u64::from(n) * ELEMENT_BYTES;
+    let outputs: Vec<Storage> = inits.iter().map(|_| Storage::new(ctx, len, ELEMENT_BYTES as usize)).collect();
+    let out_pins = outputs.iter().map(|out| out.pin(0)).collect::<Result<Vec<_>, _>>()?;
+    let init_pins = inits.iter().map(|init| init.pin(0)).collect::<Result<Vec<_>, _>>()?;
+    let in_pins = fused
+        .inputs
+        .iter()
+        .zip(states)
+        .filter(|(_, state)| state.is_none())
+        .map(|(input, _)| input.pin(0).map(|pin| (pin, input.byte_len())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut words = Vec::with_capacity(fused.scalars.len() + 1);
+    words.push(steps);
+    words.extend_from_slice(&fused.scalars);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(out_pins.len() * 2 + in_pins.len() + 1);
+    raw.extend(out_pins.iter().map(|pin| RawArg::write(pin.buffer(), bytes)));
+    raw.extend(init_pins.iter().map(|pin| RawArg::read(pin.buffer(), bytes)));
+    raw.extend(in_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+    launch_1d(ctx, &core, n, &raw)?;
+    ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
+    Ok(outputs)
 }
 
 fn len_u32(len: usize) -> Result<u32, LumaError> {
