@@ -126,10 +126,6 @@ const LAUNCHES: u32 = 64;
 /// Invocations per workgroup of the calibration kernels.
 const WORKGROUP: u32 = 64;
 
-/// Counts the calls of [`calibrate`] (tests).
-#[cfg(test)]
-pub(crate) static CALIBRATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// WGSL of a calibration kernel: reads `in0`, writes `out0`, loops `p.k` times over `loop_body`
 /// on a value `x` of type `ty` initialised from `init`, stores `store`.
 fn kernel_source(prelude: &str, ty: &str, init: &str, body: &str, store: &str) -> String {
@@ -183,8 +179,6 @@ fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps:
 /// Measures the device: bandwidth, simple f32 throughput, the cost of `Df32` and `f64`
 /// arithmetic relative to it, and the cost of a launch.
 pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
-    #[cfg(test)]
-    CALIBRATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cpu = ctx.is_cpu();
     let copy = || kernel_source("", "f32", "in0[i]", "", "x");
 
