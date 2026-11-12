@@ -1888,6 +1888,13 @@ fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
     assert_close(&got, &want, 1e-4, 1e-5);
 }
 
+/// [`arithmetic_bound`] where a launch also costs more than the halo a staged kernel computes
+/// twice: devices with small tiles, like the CPU's, would otherwise evaluate the padded
+/// expression first instead of staging it.
+fn halo_bound() -> CostModel {
+    CostModel { launch_us: 1000.0, ..arithmetic_bound() }
+}
+
 /// A cost model on which arithmetic is slow enough for computing an expression once per cell to
 /// beat recomputing it at every read, but a second launch still costs more than the recomputation
 /// it saves over staging.
@@ -1935,7 +1942,7 @@ fn expression_2d(ctx: &Context, nx: usize, ny: usize, seed: u64) -> (Array<f32>,
 /// checks the kernel stages the padded expression, one launch, against the host.
 fn stencil5_staged(nx: usize, ny: usize, seed: u64) {
     let ctx = ctx();
-    ctx.set_cost_model(arithmetic_bound());
+    ctx.set_cost_model(halo_bound());
     let (e, host) = expression_2d(&ctx, nx, ny, seed);
     let before = ctx.jit().stats();
     let got = five_point(&e, nx, ny).to_vec().unwrap();
@@ -2000,9 +2007,7 @@ fn a_df32_expression_read_at_five_offsets_is_staged() {
     use crate::view::PadMode;
     use crate::Df32;
     let ctx = ctx();
-    // Costly launches: evaluating the padded expression first (two kernels, no halo to compute) must not
-    // beat staging it on a device whose tiles are small (the CPU's).
-    ctx.set_cost_model(CostModel { launch_us: 200.0, ..arithmetic_bound() });
+    ctx.set_cost_model(halo_bound());
     let (nx, ny) = (64, 48);
     let xs = values(nx * ny, 204, 0.2, 1.2);
     let mut e = Array::from_slice_on(&ctx, &xs, [nx, ny]).unwrap().to_df32();

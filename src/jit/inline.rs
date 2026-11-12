@@ -29,7 +29,7 @@ use crate::gpu::hash::FxMap;
 use crate::profile::SplitReason;
 use crate::tuning::Tuning;
 
-use super::cost::{kernel_ns, op_weight, CostModel};
+use super::cost::{kernel_ns_on, op_weight, CostModel};
 use super::program::{shape_of, FusedKey, Instr, Ref, Tail};
 use super::staging::{self, Staging};
 use super::{Edge, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -661,7 +661,8 @@ fn stage(key: &FusedKey, cap: usize, cost: &CostModel, tuning: &Tuning) -> Optio
 
 /// The estimated time of one kernel running `programs` as `staging` lays them out over
 /// `elements` output cells: the main program at every cell, a staged sub-program at every cell of
-/// its region (and a store and a load of the value, counted as 4 operations).
+/// its region rounded up to whole rounds of the workgroup (and a store and a load of the value,
+/// counted as 4 operations).
 fn staged_time(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, elements: f64, cost: &CostModel) -> f64 {
     let tile = f64::from(staging.tile[0]) * f64::from(staging.tile[1]);
     let all = programs.bodies();
@@ -671,11 +672,17 @@ fn staged_time(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, ele
         .groups
         .iter()
         .filter_map(|group| {
+            // The workgroup computes the region in rounds of one cell per invocation, and a
+            // round costs the same however few invocations have a cell left in it: a region of
+            // 272 cells over 256 invocations is two rounds, not 1.06.
             let cells = staging.subs.get(*group.members.first()?)?.cells();
-            Some(f64::from(cells) / tile * (group.body.ops + 4.0 * group.members.len() as f64))
+            let workgroup = f64::from(super::stencil::WORKGROUP);
+            let computed = (f64::from(cells) / workgroup).ceil() * workgroup;
+            Some(computed / tile * (group.body.ops + 4.0 * group.members.len() as f64))
         })
         .sum();
-    kernel_ns(cost, io_bytes, (programs.main.ops + staged_ops) * elements)
+    let invocations = f64::from(staging.tiles()) * f64::from(super::stencil::WORKGROUP);
+    kernel_ns_on(cost, io_bytes, (programs.main.ops + staged_ops) * elements, invocations)
 }
 
 /// How much cheaper a staged kernel must be estimated than the one it replaces to be chosen.
@@ -741,7 +748,7 @@ fn written_out_ns(key: &FusedKey, len: usize, cost: &CostModel) -> f64 {
         }
     }
     let bytes = input_bytes(key, key.instrs.iter().chain(key.subs.iter().flatten()).flat_map(|instr| instr.args)) + output_bytes(key);
-    kernel_ns(cost, len as f64 * bytes, ops * len as f64)
+    kernel_ns_on(cost, len as f64 * bytes, ops * len as f64, len as f64)
 }
 
 impl Plans {
@@ -754,7 +761,7 @@ impl Plans {
             Verdict::Fits(inlined) => {
                 let reads = inlined.instrs.iter().flat_map(|flat| flat.args).chain(inlined.ctxs.iter().flat_map(|ctx| ctx.args));
                 let io_bytes = elements * (input_bytes(key, reads) + output_bytes(key));
-                let inline_ns = kernel_ns(env.cost, io_bytes, inlined.ops * elements);
+                let inline_ns = kernel_ns_on(env.cost, io_bytes, inlined.ops * elements, elements);
                 Plans { inlined: Ok(inlined), inline_ns, staged, staged_ns, unfit_ns: 0.0 }
             }
             Verdict::TooBig { sub } => Plans { inlined: Err(sub), inline_ns: f64::INFINITY, staged, staged_ns, unfit_ns: UNFIT_NS + written_out_ns(key, len, env.cost) },
@@ -945,7 +952,7 @@ fn worth_evaluating(key: &FusedKey, cost: &CostModel, limit: usize) -> Vec<u32> 
 }
 
 /// How many sub-programs are costed as the one to evaluate first at every level of the search.
-const CANDIDATES: usize = 4;
+const CANDIDATES: usize = 6;
 
 /// By what factor at most the cost of writing out two sub-programs that are evaluated together
 /// differ (the fields of one state differ little; another stage of a time step by orders of
@@ -978,7 +985,7 @@ impl Search<'_> {
         let like = |s: u32| alone.get(s as usize).zip(alone.get(seed as usize)).is_some_and(|(&a, &b)| a >= b / SIBLING && a <= b * SIBLING);
         let mut group = vec![seed];
         let Some((mut rest, mut originals)) = rest_key(key, &group) else { return group };
-        while group.len() < GROUP && !Plans::of(&rest, len, self.env).fits() {
+        while group.len() < GROUP {
             let Some(next) = worth_evaluating(&rest, self.env.cost, usize::MAX).into_iter().find(|&j| sub_len(&rest, j, len) == wide && like(originals[j as usize])) else { break };
             group.push(originals[next as usize]);
             let Some((smaller, kept)) = rest_key(&rest, &[next]) else { break };
@@ -999,7 +1006,19 @@ impl Search<'_> {
         }
         let mut best: Option<(Vec<u32>, f64)> = None;
         let mut tried: Vec<Vec<u32>> = Vec::new();
-        for seed in worth_evaluating(key, self.env.cost, CANDIDATES) {
+        // The one that wastes the most of each length: the padded state, the fluxes of each
+        // direction and the like are different groups, and the first of them alone would crowd
+        // the others out.
+        let mut lengths: Vec<f64> = Vec::new();
+        let seeds = worth_evaluating(key, self.env.cost, usize::MAX).into_iter().filter(|&s| {
+            let of = sub_len(key, s, len);
+            let new = !lengths.contains(&of);
+            if new {
+                lengths.push(of);
+            }
+            new
+        });
+        for seed in seeds.take(CANDIDATES).collect::<Vec<_>>() {
             let mut group = self.group(key, seed, len);
             group.sort_unstable();
             if tried.contains(&group) {
@@ -1007,7 +1026,9 @@ impl Search<'_> {
             }
             let (Some(own), Some((rest, _))) = (group_key(key, &group), rest_key(key, &group)) else { continue };
             let len_s = sub_len(key, group[0], len) as usize;
-            let t_rest = Plans::of(&rest, len, self.env).run_ns();
+            // What is left may evaluate one more group first (the fluxes of the other direction),
+            // which is as far as that is searched.
+            let t_rest = if left == SEARCH_DEPTH { self.best(&rest, len, 1) } else { Plans::of(&rest, len, self.env).run_ns() };
             let t = self.best(&own, len_s, left - 1) + t_rest;
             if t.is_finite() && best.as_ref().is_none_or(|&(_, t_best)| t < t_best) {
                 best = Some((group.clone(), t));

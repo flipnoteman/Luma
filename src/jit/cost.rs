@@ -117,6 +117,20 @@ pub(crate) fn kernel_ns(cost: &CostModel, bytes: f64, ops: f64) -> f64 {
     cost.launch_us * 1e3 + (bytes / cost.bandwidth_gbs).max(ops / cost.f32_ops_per_ns)
 }
 
+/// Invocations per f32 operation per nanosecond of throughput at which a kernel keeps the
+/// device's arithmetic units busy (a device that does more per nanosecond needs more invocations
+/// in flight: 2 x 16 000 for an RTX 3090). Fewer leave them idle: the work of every invocation
+/// runs in sequence, so a kernel of 20 000 cells does not run at the throughput calibration
+/// measures over a million, and a kernel that staged a region in workgroup tiles of 512 cells
+/// has half the invocations of one of 256.
+const SATURATION_PER_OP_RATE: f64 = 2.0;
+
+/// [`kernel_ns`] for a kernel that runs `invocations` invocations (see [`SATURATION_PER_OP_RATE`]).
+pub(crate) fn kernel_ns_on(cost: &CostModel, bytes: f64, ops: f64, invocations: f64) -> f64 {
+    let busy = (invocations / (SATURATION_PER_OP_RATE * cost.f32_ops_per_ns)).clamp(1e-3, 1.0);
+    cost.launch_us * 1e3 + (bytes / cost.bandwidth_gbs).max(ops / (cost.f32_ops_per_ns * busy))
+}
+
 /// Times of calibration kernels are the best of this many measurements.
 const BEST_OF: usize = 5;
 /// Launches recorded before one `sync` in a measurement, amortising submission and the wait.
