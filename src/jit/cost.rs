@@ -15,8 +15,8 @@ use crate::tuning::TuningProfile;
 
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind};
 
-/// Throughputs of a device, measured at context creation (see [`calibrate`]) or taken from a
-/// profile.
+/// Throughputs of a device, measured when a context opens (see
+/// [`ContextOptions::calibrate`](crate::ContextOptions::calibrate)) or taken from a profile.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CostModel {
     /// Host + GPU time of one dispatch of a tiny kernel, microseconds.
