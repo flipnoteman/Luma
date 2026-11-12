@@ -195,6 +195,9 @@ All notable changes to Luma are listed here. The format follows
 - wgpu's validation of indirect dispatches (an extra dispatch before every step of
   `iterate_until`/`iterate_until_all`) is off: the dispatch arguments are always written by the
   library's own gate kernels.
+- `x -= &x` with fast math and `x *= 0` on integers failed with "in-place assignment cannot run in
+  place": simplification removed the read of the target, and the compound assignment now runs as
+  a plain store into it.
 
 ## [0.2.0] - 2026-11-11
 

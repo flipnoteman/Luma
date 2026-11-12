@@ -803,7 +803,9 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
 }
 
 /// Evaluates `node` into `target`, one of its inputs, overwriting it in place: one fused kernel
-/// that reads every element of `target` before writing it. The node counts as evaluated, with
+/// that reads every element of `target` before writing it. When simplification removed every
+/// read of `target` (`x -= x` under fast math, `x *= 0` on integers), the node no longer has it
+/// as an input and the kernel is a plain store into `target`. The node counts as evaluated, with
 /// `target` as its result. Callers must have evaluated every other pending operation that reads
 /// `target` (see [`super::Readers::flush`]) and the program must allow in-place execution; the
 /// compound assignment of an array guarantees both.
@@ -819,11 +821,13 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     let Fused { mut key, mut inputs, scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     drop((fused_nodes, instr_nodes, sub_roots));
     let at = inputs.iter().position(|input| Arc::ptr_eq(input, target));
-    let Some(k) = at.filter(|&k| in_place_eligible(&key, k as u32)) else {
-        return Err(Failure::New(LumaError::Gpu("in-place assignment cannot run in place".into())));
-    };
-    inputs.remove(k);
-    key.in_place = vec![(k as u32, 0)];
+    if let Some(k) = at {
+        if !in_place_eligible(&key, k as u32) {
+            return Err(Failure::New(LumaError::Gpu("in-place assignment cannot run in place".into())));
+        }
+        inputs.remove(k);
+        key.in_place = vec![(k as u32, 0)];
+    }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, node.len())?;
     settle_staging(&mut key, node.len());
     if shifted.is_none() && key.staging.is_none() {

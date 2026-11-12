@@ -1004,7 +1004,6 @@ struct Known {
 }
 
 const KNOWN: &[Known] = &[
-    Known { id: "F1 compound assignment of a simplified expression", message: Some("in-place assignment cannot run in place"), shape: None },
     Known {
         id: "F2 bind group larger than the layout (shifted expression, max_nodes 2)",
         message: Some("Number of bindings in bind group descriptor"),
