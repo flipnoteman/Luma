@@ -70,8 +70,6 @@ pub(crate) struct Recording {
     /// Buffers released during the recording; they stay out of the pool while captured commands
     /// still refer to them.
     pub retired: Vec<Buffer>,
-    /// [`Storage::next_id`] when the recording began: older storages are not the recording's.
-    first_storage: u64,
     kernels: FxMap<u64, Arc<KernelCore>>,
 }
 
@@ -96,7 +94,6 @@ impl Context {
             owner: thread::current().id(),
             seed,
             cmds: Vec::new(),
-            first_storage: Storage::next_id(),
             pins: Vec::new(),
             retired: Vec::new(),
             kernels: FxMap::default(),
@@ -139,15 +136,6 @@ impl Context {
             RecState::Active(recording) => Some(recording),
             _ => None,
         }
-    }
-
-    /// Whether a launch may overwrite `storage` in place: always, unless this thread is recording
-    /// and the storage is older than the recording. A recorded launch runs again at every replay,
-    /// so it may only write buffers the recording itself made (they are rewritten from scratch
-    /// each time); an older buffer, such as the operand of an expression created before the
-    /// loop, would be overwritten once per replayed step.
-    pub(crate) fn may_overwrite(&self, storage: &Storage) -> bool {
-        self.with_recording(|recording| storage.id() >= recording.first_storage).unwrap_or(true)
     }
 
     /// Captures a launch if this thread is recording.

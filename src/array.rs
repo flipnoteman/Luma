@@ -127,11 +127,6 @@ impl Storage {
         }
     }
 
-    /// The id the next storage created gets: storages with a smaller id existed before the call.
-    pub(crate) fn next_id() -> u64 {
-        NEXT_STORAGE_ID.load(Ordering::Relaxed)
-    }
-
     /// Unique per storage; identifies it as an input of a fused kernel.
     pub(crate) fn id(&self) -> u64 {
         self.id
