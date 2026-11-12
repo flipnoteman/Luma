@@ -138,6 +138,7 @@ use crate::array::{Failure, Storage};
 use crate::builtin::{BinOp, CmpOp, UnOp};
 use crate::context::Context;
 use crate::error::{LumaError, Result};
+use crate::gpu::built::BuildCache;
 use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::lock;
 use crate::gpu_type::ScalarType;
@@ -590,6 +591,9 @@ pub(crate) type Args = [Src; 3];
 type NodeResult = std::result::Result<Arc<Storage>, Arc<LumaError>>;
 
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The ids of the [`JitState`]s.
+static NEXT_JIT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// One pending elementwise operation.
 pub(crate) struct Node {
@@ -1698,9 +1702,9 @@ pub(crate) fn recompute_viewed(node: &Node) -> bool {
 #[derive(Debug)]
 pub(crate) struct JitState {
     /// Generated kernels by the structure of their program.
-    kernels: Mutex<FxMap<program::FusedKey, Arc<KernelCore>>>,
+    kernels: BuildCache<program::FusedKey, Arc<KernelCore>>,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
-    stencils: Mutex<FxMap<String, Arc<KernelCore>>>,
+    stencils: BuildCache<String, Arc<KernelCore>>,
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
     /// that a loop run again does not generate and hash its source again.
     loops: Mutex<FxMap<program::FusedKey, Vec<(Vec<Option<usize>>, Arc<KernelCore>)>>>,
@@ -1749,8 +1753,8 @@ pub(crate) struct JitState {
     /// Most element-instructions per launch of a register loop, see [`launch::run_loop`].
     loop_work: AtomicU64,
     stats: Stats,
-    /// Follows consecutive `eval` calls to find loops (see [`looped`]).
-    tracker: Mutex<looped::Tracker>,
+    /// Tells this state from the ones of other contexts (the `eval` history of a thread is kept by the thread, see [`looped`]).
+    id: u64,
     /// Follows reduction readbacks to find loops that can be speculated (see [`speculate`]).
     speculation: Mutex<speculate::Tracker>,
 }
@@ -1790,8 +1794,8 @@ impl JitState {
             .saturating_sub(1)
             .clamp(1, MAX_INPUTS);
         JitState {
-            kernels: Mutex::new(FxMap::default()),
-            stencils: Mutex::new(FxMap::default()),
+            kernels: BuildCache::default(),
+            stencils: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             live: Readers::default(),
             requested: Mutex::new(RequestList::default()),
@@ -1820,7 +1824,7 @@ impl JitState {
             last_inlined_len: AtomicUsize::new(0),
             loop_work: AtomicU64::new(launch::LOOP_WORK_PER_LAUNCH),
             stats: Stats::default(),
-            tracker: Mutex::new(looped::Tracker::default()),
+            id: NEXT_JIT_ID.fetch_add(1, Ordering::Relaxed),
             speculation: Mutex::new(speculate::Tracker::new(
                 !std::env::var(SPECULATE_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
             )),
@@ -2272,18 +2276,23 @@ impl JitState {
         }
     }
 
-    /// The kernel for `key`, generated and compiled on first use.
+    /// The kernel for `key`, generated and compiled on first use. Compiling takes no lock of
+    /// the cache: threads that need other kernels carry on meanwhile (see [`BuildCache`]).
     fn kernel(&self, ctx: &Context, key: &program::FusedKey) -> Result<Arc<KernelCore>> {
         #[cfg(test)]
         {
             self.last_program_len.store(key.instrs.len(), Ordering::Relaxed);
             *lock(&self.last_staging) = key.staging.clone();
         }
-        let mut cache = lock(&self.kernels);
-        if let Some(core) = cache.get(key) {
+        let (core, built) = self.kernels.get_or_build(key, || self.build_kernel(ctx, key))?;
+        if !built {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::clone(core));
         }
+        Ok(core)
+    }
+
+    /// Generates and compiles the kernel of `key`.
+    fn build_kernel(&self, ctx: &Context, key: &program::FusedKey) -> Result<Arc<KernelCore>> {
         let segment_len = u32::try_from(ctx.segment_bytes() / 4).unwrap_or(u32::MAX);
         // Whatever the judgement was, the kernel runs the program as it is: `flatten_inner` cut
         // the ones the model wants cut, any other that got here is lowered in full.
@@ -2326,7 +2335,6 @@ impl JitState {
             true,
         )?);
         self.stats.built.fetch_add(1, Ordering::Relaxed);
-        cache.insert(key.clone(), Arc::clone(&core));
         Ok(core)
     }
 
@@ -2345,13 +2353,13 @@ impl JitState {
 
     /// The stencil kernel with WGSL `source`, compiled on first use.
     pub(crate) fn stencil_kernel(&self, ctx: &Context, source: String, label: &str) -> Result<Arc<KernelCore>> {
-        let mut cache = lock(&self.stencils);
-        if let Some(core) = cache.get(&source) {
-            return Ok(Arc::clone(core));
+        let (core, built) = self.stencils.get_or_build(&source, || {
+            let key = KernelKey::new(source.clone(), "main", None);
+            kernel::build_core(ctx, &key, Some(label), true).map(Arc::new)
+        })?;
+        if built {
+            self.stats.built.fetch_add(1, Ordering::Relaxed);
         }
-        let core = Arc::new(kernel::build_core(ctx, &KernelKey::new(source.clone(), "main", None), Some(label), true)?);
-        self.stats.built.fetch_add(1, Ordering::Relaxed);
-        cache.insert(source, Arc::clone(&core));
         Ok(core)
     }
 }

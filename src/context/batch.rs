@@ -206,12 +206,20 @@ impl Context {
     /// two kernels. The held-back dispatches go out with the next call that submits,
     /// [`Context::flush`], anything that waits, or the batch limit.
     pub(crate) fn submit(&self) -> Result<()> {
-        let mut batch = self.batch()?;
-        if batch.dispatches < SUBMIT_HOLD && self.gpu_busy() {
+        // Looked at without the lock of the batch: a thread that holds back does not wait for the
+        // ones that record or submit. One that submits in between only makes this flush a small batch.
+        if self.dispatches_pending() < SUBMIT_HOLD && self.gpu_busy() {
             return Ok(());
         }
+        let mut batch = self.batch()?;
         self.flush_locked(&mut batch);
         Ok(())
+    }
+
+    /// Dispatches recorded but not yet submitted, read without taking the lock of the batch (it
+    /// may be a moment out of date).
+    fn dispatches_pending(&self) -> u32 {
+        self.inner.dispatches_pending.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Submits the pending batch now, busy GPU or not.
@@ -226,7 +234,7 @@ impl Context {
     /// computed and the steps between two submissions fuse. Postponing stops once resident data
     /// reaches three quarters of the memory budget.
     pub(crate) fn submit_requested(&self) -> Result<()> {
-        if postpone(self.gpu_busy(), self.batch()?.dispatches, self.pager().under_pressure())
+        if postpone(self.gpu_busy(), self.dispatches_pending(), self.pager().under_pressure())
             && !self.jit().requested_stencil_chain()
         {
             return Ok(());
@@ -260,6 +268,7 @@ impl Context {
         batch.pass = None;
         batch.bound = Bound::default();
         batch.dispatches = 0;
+        self.inner.dispatches_pending.store(0, std::sync::atomic::Ordering::Relaxed);
         // The slots of the arena are reused by the next batch.
         batch.grid_slots.clear();
         let mut released = std::mem::take(&mut *lock(&self.inner.released));
@@ -548,6 +557,7 @@ impl Context {
             *pass_slot = None;
         }
         *dispatches += 1;
+        inner.dispatches_pending.store(*dispatches, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }

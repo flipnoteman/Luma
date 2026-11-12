@@ -1051,6 +1051,43 @@ fn an_eval_loop_of_an_elementwise_step_runs_as_one_loop() {
     assert_close(&y.to_vec().unwrap(), &want_y, 1e-5, 1e-5);
 }
 
+/// Every thread follows its own `eval` calls: two threads whose calls alternate (here step by step, on grids of
+/// different shapes) both still run their loops time blocked, instead of resetting each other's history (which
+/// leaves one kernel per step).
+#[test]
+fn eval_loops_of_threads_that_alternate_are_both_compressed() {
+    let ctx = ctx();
+    ctx.set_assume_busy(true);
+    let steps = 100;
+    let barrier = std::sync::Barrier::new(2);
+    let before = ctx.jit().stats();
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let threads: Vec<_> = [64usize, 48]
+            .into_iter()
+            .map(|n| {
+                let (ctx, barrier) = (&ctx, &barrier);
+                scope.spawn(move || {
+                    let g = Array::from_slice_on(ctx, &values(n * n, 62, 0.0, 1.0), [n, n]).unwrap();
+                    let mut u = &g * 1.0;
+                    for _ in 0..steps {
+                        u = heat_step(&u);
+                        barrier.wait();
+                        u.eval().unwrap();
+                    }
+                    ctx.sync().unwrap();
+                    (g.iterate(steps, heat_step).to_vec().unwrap(), u.to_vec().unwrap())
+                })
+            })
+            .collect();
+        threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+    });
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert!(launches < 40, "{launches} kernels for 2 x {steps} steps");
+    for (want, got) in results {
+        assert_close(&got, &want, 1e-6, 1e-6);
+    }
+}
+
 fn heat_step(u: &Array<f32>) -> Array<f32> {
     let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - u * 4.0;
     u + lap * 0.2

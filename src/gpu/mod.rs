@@ -1,3 +1,4 @@
+pub(crate) mod built;
 #[cfg(target_os = "linux")]
 mod exit;
 pub mod handle;
