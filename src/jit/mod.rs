@@ -55,7 +55,9 @@
 //! whose buffer is shared is such a kernel too, forced onto the shared buffer.
 
 mod codegen;
+mod launch;
 mod program;
+mod readers;
 mod stencil;
 #[cfg(test)]
 mod tests;
@@ -72,7 +74,8 @@ use crate::gpu::hash::FxMap;
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 
-pub(crate) use program::{evaluate, evaluate_group, evaluate_into, reduce_first_pass, run_loop};
+pub(crate) use launch::{evaluate, evaluate_group, evaluate_into, reduce_first_pass, run_loop};
+pub(crate) use readers::Readers;
 pub(crate) use stencil::plan as stencil_plan;
 
 /// Length of the requested list at which entries of dropped or computed nodes are pruned.
@@ -409,9 +412,7 @@ impl Node {
             return false;
         }
         // Most readers are inside the group: tell by address and only upgrade the others.
-        lock(&self.readers.list).nodes.iter().any(|weak| {
-            !group.contains(&weak.as_ptr()) && weak.upgrade().is_some_and(|reader| reader.is_pending())
-        })
+        self.readers.any_pending(|weak| !group.contains(&weak.as_ptr()))
     }
 
     /// A copy of the operands of a node that has not been evaluated.
@@ -686,74 +687,6 @@ pub(crate) fn create(
     Ok(node)
 }
 
-/// Pending lazy nodes that read one buffer (or the result of another pending node).
-///
-/// Whoever is about to overwrite the buffer calls [`Readers::flush`] first: that evaluates those
-/// nodes, recording their reads ahead of the write.
-#[derive(Debug, Default)]
-pub(crate) struct Readers {
-    list: Mutex<ReaderList>,
-}
-
-/// Weak references to nodes. Most nodes are read by a single operation, so the first reference
-/// lives in the list itself: no allocation until a second one arrives.
-#[derive(Debug, Default)]
-struct Weaks {
-    first: Option<Weak<Node>>,
-    rest: Vec<Weak<Node>>,
-}
-
-impl Weaks {
-    fn push(&mut self, node: Weak<Node>) {
-        if self.first.is_none() {
-            self.first = Some(node);
-        } else {
-            self.rest.push(node);
-        }
-    }
-
-    fn len(&self) -> usize {
-        usize::from(self.first.is_some()) + self.rest.len()
-    }
-
-    fn iter(&self) -> impl DoubleEndedIterator<Item = &Weak<Node>> {
-        self.first.iter().chain(&self.rest)
-    }
-
-    fn retain(&mut self, mut keep: impl FnMut(&Weak<Node>) -> bool) {
-        if self.first.as_ref().is_some_and(|weak| !keep(weak)) {
-            self.first = None;
-        }
-        self.rest.retain(|weak| keep(weak));
-        // `first` leads the list: refill it so that a single reader never needs the vector.
-        if self.first.is_none() && !self.rest.is_empty() {
-            self.first = Some(self.rest.remove(0));
-        }
-    }
-}
-
-impl IntoIterator for Weaks {
-    type Item = Weak<Node>;
-    type IntoIter = std::iter::Chain<std::option::IntoIter<Weak<Node>>, std::vec::IntoIter<Weak<Node>>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.first.into_iter().chain(self.rest)
-    }
-}
-
-impl Extend<Weak<Node>> for Weaks {
-    fn extend<I: IntoIterator<Item = Weak<Node>>>(&mut self, nodes: I) {
-        nodes.into_iter().for_each(|node| self.push(node));
-    }
-}
-
-#[derive(Debug, Default)]
-struct ReaderList {
-    nodes: Weaks,
-    /// Length at which dead and evaluated entries are dropped next.
-    prune_at: usize,
-}
-
 /// Most operations of a lazy expression that a shift recomputes at the shifted element instead
 /// of evaluating it first. Every shift of it repeats them, but nothing goes through memory.
 const MAX_RECOMPUTED: usize = 16;
@@ -769,51 +702,6 @@ pub(crate) fn recompute_shifted(node: &Node) -> bool {
         && node.len() as u64 * 4 <= node.context().segment_bytes()
 }
 
-/// Smallest list length worth pruning.
-const PRUNE_MIN: usize = 32;
-
-impl Readers {
-    pub(crate) fn add(&self, node: &Arc<Node>) {
-        let mut list = lock(&self.list);
-        list.nodes.push(Arc::downgrade(node));
-        if list.nodes.len() > list.prune_at.max(PRUNE_MIN) {
-            list.nodes.retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
-            list.prune_at = list.nodes.len().saturating_mul(2);
-        }
-    }
-
-    fn take(&self) -> Weaks {
-        let mut list = lock(&self.list);
-        list.prune_at = 0;
-        std::mem::take(&mut list.nodes)
-    }
-
-    /// Takes over the readers of `other`: a node that was evaluated passes its readers on to the
-    /// buffer it produced.
-    pub(crate) fn absorb(&self, other: &Readers) {
-        let moved = other.take();
-        if moved.first.is_none() {
-            return;
-        }
-        lock(&self.list).nodes.extend(moved);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        lock(&self.list).nodes.len()
-    }
-
-    /// Evaluates every pending node registered here.
-    pub(crate) fn flush(&self) {
-        for weak in self.take() {
-            if let Some(node) = weak.upgrade() {
-                // A failure is stored in the node and reported when its array is used.
-                let _ = node.force();
-            }
-        }
-    }
-}
-
 /// Per-context state of the fusion machinery.
 #[derive(Debug)]
 pub(crate) struct JitState {
@@ -823,12 +711,12 @@ pub(crate) struct JitState {
     stencils: Mutex<FxMap<String, Arc<KernelCore>>>,
     /// Every node created and not yet known to be evaluated, oldest first, so that
     /// [`Context::sync`] can evaluate the live ones.
-    live: Mutex<ReaderList>,
+    live: Readers,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
     requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
     max_inputs: usize,
-    /// Most element-instructions per launch of a register loop, see [`program::run_loop`].
+    /// Most element-instructions per launch of a register loop, see [`launch::run_loop`].
     loop_work: AtomicU64,
     stats: Stats,
 }
@@ -870,11 +758,11 @@ impl JitState {
         JitState {
             kernels: Mutex::new(FxMap::default()),
             stencils: Mutex::new(FxMap::default()),
-            live: Mutex::new(ReaderList::default()),
+            live: Readers::default(),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             max_inputs,
-            loop_work: AtomicU64::new(program::LOOP_WORK_PER_LAUNCH),
+            loop_work: AtomicU64::new(launch::LOOP_WORK_PER_LAUNCH),
             stats: Stats::default(),
         }
     }
@@ -909,12 +797,7 @@ impl JitState {
     }
 
     fn register(&self, node: &Arc<Node>) {
-        let mut live = lock(&self.live);
-        live.nodes.push(Arc::downgrade(node));
-        if live.nodes.len() > live.prune_at.max(PRUNE_MIN) {
-            live.nodes.retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
-            live.prune_at = live.nodes.len().saturating_mul(2);
-        }
+        self.live.add(node);
     }
 
     /// Evaluates every lazy array that is still alive, newest first (an expression is looked at
@@ -952,11 +835,7 @@ impl JitState {
     }
 
     pub(crate) fn evaluate_live(&self) {
-        let nodes = {
-            let mut live = lock(&self.live);
-            live.prune_at = 0;
-            std::mem::take(&mut live.nodes)
-        };
+        let nodes = self.live.take();
         let mut pending: Vec<Arc<Node>> = nodes.into_iter().rev().filter_map(|weak| weak.upgrade()).collect();
         while let Some(first) = pending.first() {
             let len = first.len;
@@ -987,7 +866,7 @@ impl JitState {
                     rest.push(node);
                 }
             }
-            program::evaluate_group(&group);
+            launch::evaluate_group(&group);
             pending = rest;
         }
     }
@@ -997,7 +876,7 @@ impl JitState {
     /// one kernel takes: [`MAX_NODES_LIMIT`] operations (what [`Context::flush`] allows) and the
     /// bindings the device allows. Computing them together evaluates what they share once.
     fn evaluate_alongside(&self, seed: Arc<Node>) {
-        let candidates: Vec<Weak<Node>> = lock(&self.live).nodes.iter().rev().cloned().collect();
+        let candidates = self.live.newest_first();
         let mut inputs = seed.inputs().to_vec();
         let mut below = seed.below().to_vec();
         insert_sorted(&mut below, seed.id);
@@ -1030,7 +909,7 @@ impl JitState {
             [node] => {
                 let _ = node.force();
             }
-            _ => program::evaluate_group(&group),
+            _ => launch::evaluate_group(&group),
         }
     }
 
