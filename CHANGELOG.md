@@ -183,6 +183,9 @@ All notable changes to Luma are listed here. The format follows
 
 - Two independently written equal expressions shared one node, so `assign`, `write` or `+=`
   through one of them changed the other.
+- A lazy reduction (`sum`, `min`, `max`, `reduce`) of a pending expression recorded before a write
+  into the reduced array, or into an array the expression reads, saw the written values; it keeps
+  the values it was recorded against, like every other lazy array.
 - A `Df32` kernel with only comparisons, `abs`, `minimum` or `maximum` failed to bind its uniform;
   casts from and to `Df32` could be cancelled by the shader compiler
   (`(&x - x.to_f32().to_df32()).to_f32()` was 0).

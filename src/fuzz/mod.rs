@@ -1004,7 +1004,8 @@ struct Known {
 }
 
 const KNOWN: &[Known] = &[
-    Known { id: "F3 lazy reduction reads a later write to its operand", message: None, shape: Some(reduction_then_write) },
+    Known { id: "F15 traced loop with sum_where in its body, result written elsewhere (unminimized)", message: None, shape: Some(traced_loop_with_sum_where) },
+    Known { id: "F14 receiver of a write through a view whose base a cache evaluated shows old data", message: None, shape: Some(cached_then_view_assigned) },
     Known {
         id: "F8 wrong value only when programs run concurrently on one context (unminimized; masks other concurrency failures)",
         message: Some("only when run concurrently"),
@@ -1012,13 +1013,36 @@ const KNOWN: &[Known] = &[
     },
 ];
 
-/// F3: a `Reduce` of a variable, and later a write into that variable.
-fn reduction_then_write(program: &Program) -> bool {
-    program.stmts.iter().enumerate().any(|(i, stmt)| {
-        let Stmt::Reduce { src, .. } = stmt else { return false };
-        program.stmts[i + 1..].iter().any(|later| {
-            matches!(later, Stmt::Assign { target, .. } | Stmt::Put { target, .. } | Stmt::Compound { target, .. } | Stmt::Write { target, .. } if target == src)
+/// F15: a traced loop (`iterate_all` / `iterate_until`) with a `SumWhere` in its body.
+fn traced_loop_with_sum_where(program: &Program) -> bool {
+    program.stmts.iter().any(|stmt| {
+        matches!(stmt, Stmt::Loop { kind: LoopKind::IterateAll | LoopKind::IterateUntilAll, body, .. }
+            if body.iter().any(|s| matches!(s, Stmt::SumWhere { .. })))
+    })
+}
+
+/// F14: an `Assign` through a variable that is a slice, flip or transpose view, after a `Cache`
+/// (which can evaluate a node the view's base shares with the cached array).
+fn cached_then_view_assigned(program: &Program) -> bool {
+    let created = created_counts(program);
+    let mut first = Vec::with_capacity(created.len());
+    let mut next = 0;
+    for c in &created {
+        first.push(next);
+        next += c;
+    }
+    let views: Vec<usize> = program
+        .stmts
+        .iter()
+        .enumerate()
+        .filter(|(i, stmt)| {
+            created[*i] == 1 && matches!(stmt, Stmt::View { view: ViewOp::Slice { .. } | ViewOp::Flip { .. } | ViewOp::Transpose, .. })
         })
+        .map(|(i, _)| first[i])
+        .collect();
+    program.stmts.iter().enumerate().any(|(i, stmt)| {
+        matches!(stmt, Stmt::Cache { .. })
+            && program.stmts[i + 1..].iter().any(|later| matches!(later, Stmt::Assign { target, .. } if views.contains(target)))
     })
 }
 

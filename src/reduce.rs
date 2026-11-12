@@ -5,11 +5,11 @@ use std::panic::Location;
 use std::sync::{Arc, OnceLock};
 
 use crate::array::{Array, Failure, Storage};
-use crate::builtin::{Builtin, ReduceList, ReduceOp, MAX_REDUCTIONS};
+use crate::builtin::{Builtin, ReduceList, ReduceOp, UnOp, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{GpuType, ScalarType};
-use crate::jit::{self, Node};
+use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
 use crate::ops::{fold_workgroups, len_u32, run_select, Rhs};
 use crate::shape::Shape;
 
@@ -108,11 +108,11 @@ impl<T: ScalarType> Array<T> {
 
     fn reduce_at<const N: usize>(&self, ops: [Reduction; N], name: &'static str, location: &'static Location<'static>) -> Array<T> {
         const { assert!(N >= 1 && N <= MAX_REDUCTIONS, "Array::reduce takes one to four reductions") };
-        let result = self.run_reduce(ReduceList::new(&ops.map(Reduction::op)));
+        let result = self.run_reduce(ReduceList::new(&ops.map(Reduction::op)), name, location);
         Array::resolve(self.context(), Shape::from(N), result, name, location)
     }
 
-    fn run_reduce(&self, ops: ReduceList) -> std::result::Result<Array<T>, Failure> {
+    fn run_reduce(&self, ops: ReduceList, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
         let shape = Shape::from(ops.as_slice().len());
         let elem = std::mem::size_of::<T>() as u64;
@@ -120,7 +120,13 @@ impl<T: ScalarType> Array<T> {
         // Poisoned operands pass their error on.
         self.src()?;
         if let Some(node) = self.pending() {
-            let reduced = Reduced { operand: Arc::clone(node), ops, wgsl, elem, result: OnceLock::new() };
+            // The reduction reads the operand later, so it is registered with it like any other
+            // reader: a write into the operand's buffer (or into what the operand reads)
+            // evaluates the readers first, which records the reduction's read ahead of the
+            // write. The reader is a copy of the operand that the reduction's first pass fuses.
+            let args = [Src::Node(Arc::clone(node)), Src::unused(), Src::unused()];
+            let reader = jit::create(ctx, node.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
+            let reduced = Reduced { operand: reader, ops, wgsl, elem, result: OnceLock::new() };
             return Ok(Array::from_reduced(ctx, shape, Arc::new(reduced)));
         }
         // Nothing is left to fuse: record the passes now.

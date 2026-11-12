@@ -65,7 +65,6 @@ fn shifted_expression_with_a_tight_node_limit_binds_too_many_buffers() {
 /// Finding 3: a lazy reduction recorded before a write into the array it reduces must keep the
 /// old sum; here the reduced array is a shift (not a view), so the write goes into its own buffer.
 #[test]
-#[ignore = "finding 3: a lazy reduction reads the reduced array's buffer after a later write"]
 fn lazy_reduction_sees_a_later_write_to_its_operand() {
     check(Program {
         config: Config::default_engine(),
@@ -80,7 +79,6 @@ fn lazy_reduction_sees_a_later_write_to_its_operand() {
 }
 
 #[test]
-#[ignore = "finding 3 (variant): the reduced array is an elementwise expression"]
 fn lazy_reduction_sees_a_later_write_to_its_elementwise_operand() {
     check(Program {
         config: Config::default_engine(),
@@ -218,7 +216,6 @@ fn captured_lazy_compound_assignment_is_replayed_with_the_loop() {
 /// Finding 3, indirect form (found on `LUMA_DEVICE=cpu`): the lazy reduction reduces an
 /// expression of `x`, and a later write goes into `x` (through an alias and a slice).
 #[test]
-#[ignore = "finding 3: a lazy reduction of an expression of x reads a later write into x"]
 fn lazy_reduction_of_an_expression_sees_a_later_write_to_its_input() {
     check(Program {
         config: Config::default_engine(),
@@ -304,6 +301,66 @@ fn view_of_a_view_recorded_before_a_transposed_write_keeps_the_old_data() {
             View { src: 1, view: Slice { axis: 0, lo: 0, hi: 1 } },
             Range { dims: [12, 1, 1, 1], axis: 0, ty: U32 },
             Select { mask: 3, a: Var(2), b: Const(-2.0), ty: F32 },
+        ],
+    });
+}
+
+/// Finding 3, hash-consed form (fuzz seed 101): `sum_where` builds `select(mask, x, 0)`, and the
+/// later `select` of the same operands is the same node; the lazy reduction recorded before the
+/// write through a flipped transpose of it must keep the old sum.
+#[test]
+fn sum_where_sees_a_later_write_to_the_equal_select() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [9, 6, 1, 1], ty: F32, seed: 0 },
+            Range { dims: [9, 6, 1, 1], axis: 1, ty: U32 },
+            SumWhere { src: 0, mask: 1 },
+            Select { mask: 1, a: Var(0), b: Const(0.0), ty: F32 },
+            Assign { target: 3, path: vec![InjFlip { axis: 1 }, InjTranspose], rhs: Const(-2.0) },
+        ],
+    });
+}
+
+/// Finding 14 (found while fixing finding 3; same family as finding 5): two equal expressions
+/// share one node, so `cache` of one evaluates the base of a flipped view of the other; the
+/// write through that view is not shown by the view (`v[6]` is `-1`, not `-2`).
+#[test]
+#[ignore = "finding 14: the receiver of a write through a view whose shared base node a cache evaluated shows old data"]
+fn view_shows_the_written_data_after_a_cache_evaluated_the_shared_base_node() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [7, 5, 1, 1], ty: U32, seed: 0 },
+            Select { mask: 0, a: Const(-2.0), b: Const(-1.0), ty: F32 },
+            Unary { src: 1, op: ToDf32 },
+            Unary { src: 1, op: ToDf32 },
+            View { src: 3, view: Flip { axis: 0 } },
+            Cache { src: 2 },
+            Assign { target: 4, path: vec![], rhs: Const(-2.0) },
+        ],
+    });
+}
+
+/// Finding 15 (found while fixing finding 3; fails on main without that fix too): an
+/// `iterate_all` whose body reduces with `sum_where` and selects on it, then a write of an
+/// expression of the result through a flip: `element 1` of the written array is `1`, not `0`.
+#[test]
+#[ignore = "finding 15: a traced iterate_all with sum_where in its body, then a write of an expression of its result"]
+fn write_of_an_expression_of_a_traced_loop_with_sum_where_is_wrong() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
+            Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
+            View { src: 1, view: Flip { axis: 1 } },
+            View { src: 1, view: Flip { axis: 1 } },
+            Loop { kind: IterateAll, steps: 1, states: vec![2], body: vec![Unary { src: 0, op: ToF32 }, View { src: 3, view: ShiftClamp { offs: vec![3, 0] } }, Scan { src: 4, axis: 0, op: ScanMin }, SumWhere { src: 7, mask: 7 }, Select { mask: 8, a: Const(4.0), b: Const(0.0), ty: F32 }], next: vec![6] },
+            Binary { lhs: Var(4), rhs: Const(2.0), op: Rem },
+            Assign { target: 3, path: vec![], rhs: Var(5) },
         ],
     });
 }
