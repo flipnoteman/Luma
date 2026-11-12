@@ -339,7 +339,8 @@ pub(crate) fn build_core(
     });
     let shader_desc = wgpu::ShaderModuleDescriptor {
         label,
-        source: wgpu::ShaderSource::Wgsl(combined.into()),
+        // The module luma parsed and validated, not its text: wgpu would parse it a second time.
+        source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
     };
     let shader = if trusted {
         // Integer division keeps its guards: WGSL defines `x / 0` and `x % 0`, and user data
@@ -366,8 +367,9 @@ pub(crate) fn build_core(
             zero_initialize_workgroup_memory: !trusted,
             ..Default::default()
         },
-        cache: None,
+        cache: ctx.disk_cache().pipelines(),
     });
+    ctx.disk_cache().built();
 
     Ok(KernelCore {
         id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),

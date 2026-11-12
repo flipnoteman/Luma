@@ -21,6 +21,13 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- On-disk cache: the driver's compiled pipelines (wgpu `PipelineCache`, Vulkan) and the calibrated
+  cost model are kept in `$XDG_CACHE_HOME/luma` (else `~/.cache/luma`; `LUMA_CACHE_DIR` moves it,
+  `LUMA_CACHE=off` disables it), one file per adapter and driver, written atomically; a damaged
+  file is ignored. A second process that builds the same kernels skips the driver's compile (the
+  multi-second first call of large `Df32` kernels), and the calibration runs once per machine. A
+  calibration worse than the profile's numbers by more than 4 times (a GPU shared with other
+  processes) is measured once more and then dropped, neither used nor stored.
 - `SplitReason::Materialised`: reported by profiling when the cost model evaluates a shared
   expression first because recomputing it at every read costs more than storing it.
 - Workgroup staging of views: an expression read through slices, shifted slices or pads of a 1-D or
@@ -38,7 +45,7 @@ All notable changes to Luma are listed here. The format follows
   a slice) reads of a padded array is staged at the summed offsets instead of the padded array
   being recomputed at every read.
 - `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
-  `Df32` and `f64` arithmetic), measured when a context opens (once per device and process;
+  `Df32` and `f64` arithmetic), measured when a context opens (once per machine, see the cache;
   `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).
 - Algebraic simplification when an operation is created: bit-exact rewrites always run (`x * 1`,
   `x / 1`, `x - 0`, `-(-x)`, `abs(abs(x))`, `floor(floor(x))`, `min(x, x)`, `select(m, a, a)`,

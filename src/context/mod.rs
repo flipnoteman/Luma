@@ -205,8 +205,13 @@ pub struct ContextOptions {
     /// The check synchronizes with the GPU once per evaluated array, so it is for finding the
     /// operation that first produces a non-finite value, not for production runs.
     pub check_finite: bool,
-    /// Measure the device's throughputs when the context opens (about 100 ms on a GPU, once per
-    /// device and process); `false` uses the profile's fixed numbers (see [`CostModel`]).
+    /// Measure the device's throughputs when the context opens (about 150 ms on a GPU), once
+    /// per machine: a clean result is kept in the cache directory (see `LUMA_CACHE`) and read by
+    /// later processes. Each kernel is timed as the best of several runs, and a result worse
+    /// than the profile's numbers by more than 4 times in any throughput (a device shared with
+    /// other processes during the measurement) is measured once more and, if still so, dropped:
+    /// the process then uses the profile's fixed numbers and nothing is stored. `false` uses
+    /// the profile's fixed numbers (see [`CostModel`]).
     pub calibrate: bool,
     /// Allows rewrites of expressions that are not exact: `x + 0` becomes `x` (a `-0.0`
     /// stays `-0.0` instead of becoming `0.0`), `x * 0` becomes `0` and `x - x` becomes `0` (wrong
@@ -423,7 +428,20 @@ impl Context {
         let profile = ctx.inner.tuning.profile;
         let model = if options.calibrate {
             *ctx.inner.gpu.0.cost.get_or_init(|| {
-                cost::calibrate(&ctx).unwrap_or_else(|_| CostModel::fallback(profile))
+                // Measured once per machine: a stored result for this device and driver wins,
+                // and only a measurement that does not look contended is stored (see
+                // `cost::contended`); otherwise this process runs on the profile's numbers.
+                let disk = ctx.disk_cache();
+                let fallback = CostModel::fallback(profile);
+                disk.load_cost().filter(|stored| !cost::contended(stored, &fallback)).unwrap_or_else(|| {
+                    match cost::calibrate_clean(&ctx, &fallback) {
+                        Ok(Some(measured)) => {
+                            disk.store_cost(&measured);
+                            measured
+                        }
+                        _ => fallback,
+                    }
+                })
             })
         } else {
             CostModel::fallback(profile)
@@ -540,6 +558,17 @@ impl Context {
 
     pub(crate) fn device(&self) -> &wgpu::Device {
         &self.inner.gpu.0.device
+    }
+
+    /// The on-disk cache of the device (pipelines, calibration).
+    pub(crate) fn disk_cache(&self) -> &crate::gpu::cache::DiskCache {
+        &self.inner.gpu.0.disk
+    }
+
+    /// The adapter the context runs on.
+    #[cfg(test)]
+    pub(crate) fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.inner.gpu.0.adapter
     }
 
     pub(crate) fn queue(&self) -> &wgpu::Queue {
