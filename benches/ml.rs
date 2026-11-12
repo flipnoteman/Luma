@@ -595,7 +595,7 @@ fn mlp(c: &mut Criterion) {
         mlp_cpu(&x, &host, &mut cpu);
         let got = gpu.probs.to_vec().unwrap();
         check("mlp probabilities", &got, &cpu.probs, 1e-3);
-        for row in got.chunks_exact(CLASSES) {
+        for row in got.as_chunks::<CLASSES>().0 {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-4, "mlp: probabilities do not sum to 1");
         }
     }
@@ -675,10 +675,10 @@ struct NormalizeParams {
 #[cfg(target_os = "macos")]
 fn normalize_cpu(e: &[f32], out: &mut [f32]) {
     par_rows(out, EMB_D, |first, rows| {
-        for (i, row) in rows.chunks_exact_mut(EMB_D).enumerate() {
+        for (i, row) in rows.as_chunks_mut::<EMB_D>().0.iter_mut().enumerate() {
             let src = &e[(first + i) * EMB_D..][..EMB_D];
             let mut lanes = [0.0f32; 8];
-            for chunk in src.chunks_exact(8) {
+            for chunk in src.as_chunks::<8>().0 {
                 for (l, v) in lanes.iter_mut().zip(chunk) {
                     *l += v * v;
                 }

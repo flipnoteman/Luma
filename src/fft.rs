@@ -204,7 +204,7 @@ fn forward_groups(k: u32) -> Vec<Group> {
             r: 4,
         })
         .collect();
-    if k % 4 != 0 {
+    if !k.is_multiple_of(4) {
         groups.push(Group { s: 0, r: k % 4 });
     }
     groups

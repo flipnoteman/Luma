@@ -60,7 +60,7 @@ fn test_image() -> Vec<f32> {
         .enumerate()
         .map(|(i, n)| {
             let (x, y) = ((i % W) as f32, (i / W) as f32);
-            let tile = if ((i % W) / 256 + (i / W) / 256) % 2 == 0 { 0.15 } else { 0.0 };
+            let tile = if ((i % W) / 256 + (i / W) / 256).is_multiple_of(2) { 0.15 } else { 0.0 };
             (0.5 + 0.3 * (x * 0.01).sin() * (y * 0.013).cos() + tile + n).clamp(0.0, 1.0)
         })
         .collect()

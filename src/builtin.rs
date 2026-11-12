@@ -358,7 +358,7 @@ fn conv1d_tiled(stride: u32, per_thread: u32, wg: u32) -> String {
     }
     for i in 0..r {
         acc.push_str(&format!("    var acc{i} = 0.0;\n"));
-        if r % 4 == 0 {
+        if r.is_multiple_of(4) {
             if i % 4 == 0 {
                 loads.push_str(&format!("            let q{} = weights[k / 4u + {}u];\n", i / 4, i / 4));
             }
@@ -428,9 +428,9 @@ fn main(
 ",
         tile_in = tile * s,
         rs = r * s,
-        weights_ty = if r % 4 == 0 { "vec4<f32>" } else { "f32" },
-        weights_len = if r % 4 == 0 { chunk / 4 } else { chunk },
-        weights_stage = if r % 4 == 0 {
+        weights_ty = if r.is_multiple_of(4) { "vec4<f32>" } else { "f32" },
+        weights_len = if r.is_multiple_of(4) { chunk / 4 } else { chunk },
+        weights_stage = if r.is_multiple_of(4) {
             format!(
                 "        if (lid < {}u) {{
             weights[lid] = vec4<f32>(weight(c, taps, lid * 4u), weight(c, taps, lid * 4u + 1u), weight(c, taps, lid * 4u + 2u), weight(c, taps, lid * 4u + 3u));
