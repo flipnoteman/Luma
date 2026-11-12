@@ -603,6 +603,43 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
 }
 
 #[test]
+fn a_life_step_recomputes_through_its_shifts() {
+    let ctx = Context::new().unwrap();
+    let (w, h) = (64usize, 64usize);
+    let cells: Vec<f32> = values(w * h, 7, 0.0, 1.0).into_iter().map(|v| if v > 0.5 { 1.0 } else { 0.0 }).collect();
+    let step = |u: &Array<f32>| {
+        let mut n = u.shift([1isize, 1]) + u.shift([1isize, 0]) + u.shift([1isize, -1]);
+        n = n + u.shift([0isize, 1]) + u.shift([0isize, -1]);
+        n = n + u.shift([-1isize, 1]) + u.shift([-1isize, 0]) + u.shift([-1isize, -1]);
+        let survive = select(&n.eq(2.0), u, 0.0);
+        select(&n.eq(3.0), 1.0, &survive)
+    };
+    let u = Array::from_slice_on(&ctx, &cells, [w, h]).unwrap();
+    let before = ctx.jit().stats();
+    let got = step(&step(&u)).to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+    let life = |g: &[f32]| -> Vec<f32> {
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as isize, (i / w) as isize);
+                let mut n = 0.0;
+                for dy in -1isize..=1 {
+                    for dx in -1isize..=1 {
+                        if (dx, dy) != (0, 0) {
+                            let j = (x + dx).rem_euclid(w as isize) as usize + w * (y + dy).rem_euclid(h as isize) as usize;
+                            n += g[j];
+                        }
+                    }
+                }
+                if n == 3.0 || (n == 2.0 && g[i] == 1.0) { 1.0 } else { 0.0 }
+            })
+            .collect()
+    };
+    assert_close(&got, &life(&life(&cells)), 0.0, 0.0);
+}
+
+#[test]
 fn arrays_evaluated_together_share_one_kernel() {
     let ctx = Context::new().unwrap();
     let xs = values(3000, 50, 0.5, 2.0);

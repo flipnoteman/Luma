@@ -682,17 +682,13 @@ pub(crate) fn create(
     Ok(node)
 }
 
-/// Most operations of a lazy expression that a shift recomputes at the shifted element instead
-/// of evaluating it first. Every shift of it repeats them, but nothing goes through memory.
-const MAX_RECOMPUTED: usize = 16;
-
 /// Whether a shift of `node` reads its expression recomputed rather than evaluated. Only one
 /// level: an expression that already recomputes a shifted one is evaluated, or every further
 /// stencil step would multiply the work by its number of shifts.
 pub(crate) fn recompute_shifted(node: &Node) -> bool {
     // A recomputed expression runs inside kernels of segmented programs only if it fits one
     // segment, so segmented programs have no sub-programs.
-    node.size() <= MAX_RECOMPUTED
+    node.size() <= node.context().tuning().max_recomputed
         && !node.recomputes
         && node.len() as u64 * 4 <= node.context().segment_bytes()
 }
