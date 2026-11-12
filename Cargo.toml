@@ -1,6 +1,6 @@
 [package]
 name = "luma"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Lazy GPU arrays for Rust on wgpu (Vulkan, Metal, DX12): fused elementwise kernels, reductions, FFT convolution, custom WGSL kernels"
 license = "MIT OR Apache-2.0"
