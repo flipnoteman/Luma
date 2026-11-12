@@ -64,6 +64,8 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     // copied from a template of valid counts or zeroed (see `jit::until`), so wgpu's check of
     // them, an extra validation dispatch in front of every indirect one, protects nothing.
     instance_desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+    #[cfg(target_os = "linux")]
+    let validated = instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION);
     let instance = wgpu::Instance::new(instance_desc);
 
     let adapter = instance
@@ -116,7 +118,7 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     });
     let memory = device_local_bytes(&adapter);
     #[cfg(target_os = "linux")]
-    super::exit::track(&device);
+    super::exit::track(&device, validated);
     Ok(Gpu { device, queue, adapter: adapter.get_info(), lost, cpu, memory })
 }
 

@@ -1491,7 +1491,9 @@ fn a_fusion_limit_scope_splits_the_expressions_written_in_it() {
 #[test]
 fn a_very_deep_chain_is_cut_and_evaluates_on_a_small_stack() {
     let handle = std::thread::Builder::new()
-        .stack_size(256 * 1024)
+        // The walk is bounded by `MAX_DEPTH`; unoptimized frames are several times larger, so a debug
+        // build gets the default stack of a test thread for the same depth.
+        .stack_size(if cfg!(debug_assertions) { 2 << 20 } else { 256 * 1024 })
         .spawn(|| {
             let ctx = Context::new().unwrap();
             let x = f32s(&ctx, &[1.0, 2.0, 3.0]);

@@ -808,6 +808,10 @@ impl Node {
             }
             return;
         }
+        // An empty set (a loop leaf) has no span: `base` was chosen without it.
+        if part.is_empty() {
+            return;
+        }
         let at = ((self.below_base - base) >> 6) as usize;
         for (word, &bits) in set.iter_mut().skip(at).zip(part) {
             *word |= bits;

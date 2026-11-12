@@ -6,6 +6,9 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
+/// The devices to wait for at exit. Devices of instances with validation on (debug builds) are
+/// left out: with two or more devices in the process, the Khronos validation layer no longer
+/// finds the later ones during `exit` and aborts in `vkWaitSemaphores`.
 static DEVICES: Mutex<Vec<wgpu::Device>> = Mutex::new(Vec::new());
 static REGISTER: Once = Once::new();
 
@@ -19,9 +22,12 @@ unsafe extern "C" {
     fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
 }
 
-/// Makes the exit handler wait for `device` too, registering the handler on first use.
-pub(crate) fn track(device: &wgpu::Device) {
-    if let Ok(mut devices) = DEVICES.lock() {
+/// Makes the exit handler wait for `device` too (unless its instance has `validated` layers, see
+/// [`DEVICES`]), registering the handler on first use.
+pub(crate) fn track(device: &wgpu::Device, validated: bool) {
+    if !validated
+        && let Ok(mut devices) = DEVICES.lock()
+    {
         devices.push(device.clone());
     }
     REGISTER.call_once(|| {
