@@ -73,6 +73,40 @@ fn emit(workload: &str, size: String, variant: &str, backend: &str, work: f64, u
     print_row(&Row { workload, size, variant, library: "arrayfire", backend, work, unit, err }, &t);
 }
 
+fn emit_cold(workload: &str, size: String, variant: &str, backend: &str, work: f64, unit: &str, f: impl FnOnce()) {
+    let t = time_once(f);
+    print_row(&Row { workload, size, variant, library: "arrayfire", backend, work, unit, err: 0.0 }, &t);
+}
+
+fn converge(sz: &Sizes, be: &str) {
+    for &w in &sz.converge {
+        let d = Dim4::new(&[w as u64, w as u64, 1, 1]);
+        let h0 = values(w * w, 10, 0.0, 1.0);
+        let u0 = Array::new(&h0, d);
+        let (c4, al) = (k(4.0, d), k(ALPHA, d));
+        let run = || {
+            let mut u = u0.copy();
+            for _ in 0..sz.converge_steps {
+                let next = heat_step(&u, &c4, &al);
+                let err = af::max_all(&af::abs(&(&next - &u))).0 as f32;
+                u = next;
+                if err < sz.converge_tol {
+                    break;
+                }
+            }
+            sync();
+            u
+        };
+        let want = heat_ref(w, w, &h0, sz.converge_steps);
+        let err = rel_err(&host(&run()), &want);
+        assert!(err <= 1e-4, "converge {w}: rel_err {err} > 1e-4");
+        let work = (w * w * sz.converge_steps) as f64;
+        emit("converge", format!("{w}x{w}"), "readback_every_step", be, work, "Gcell/s", err, || {
+            run();
+        });
+    }
+}
+
 fn heat(sz: &Sizes, be: &str) {
     for &w in &sz.heat {
         let d = Dim4::new(&[w as u64, w as u64, 1, 1]);
@@ -88,6 +122,9 @@ fn heat(sz: &Sizes, be: &str) {
             sync();
             u
         };
+        emit_cold("heat", format!("{w}x{w}"), "per_step_cold", be, (w * w * sz.heat_steps) as f64, "Gcell/s", || {
+            run();
+        });
         let want = heat_ref(w, w, &h0, sz.heat_steps);
         let err = rel_err(&host(&run()), &want);
         assert!(err <= 1e-4, "heat {w}: rel_err {err} > 1e-4");
@@ -189,6 +226,11 @@ fn mandelbrot(sz: &Sizes, be: &str) {
                 sync();
                 cnt
             };
+            if every == 1 {
+                emit_cold("mandelbrot", format!("{w}x{w}"), "eval_every_1_cold", be, (w * w * sz.mandel_iters) as f64, "Gpix-iter/s", || {
+                    run();
+                });
+            }
             let err = mismatch_frac(&host(&run()), &want);
             assert!(err < 0.01, "mandelbrot {w} every {every}: mismatch_frac {err} >= 0.01");
             emit(
@@ -313,6 +355,7 @@ fn montecarlo(sz: &Sizes, be: &str) {
 fn main() {
     let args = parse_args();
     let be = args.backend.clone().unwrap_or_else(|| "cuda".into());
+    let label = args.label.clone().unwrap_or_else(|| be.clone());
     let backend = match be.as_str() {
         "cuda" => af::Backend::CUDA,
         "opencl" => af::Backend::OPENCL,
@@ -325,8 +368,9 @@ fn main() {
     let sz = sizes(args.quick);
     print_header();
     type W = fn(&Sizes, &str);
-    let list: [(&str, W); 6] = [
+    let list: [(&str, W); 7] = [
         ("heat", heat),
+        ("converge", converge),
         ("life", life),
         ("blackscholes", blackscholes),
         ("mandelbrot", mandelbrot),
@@ -335,7 +379,7 @@ fn main() {
     ];
     for (name, f) in list {
         if wants(&args, name) {
-            f(&sz, &be);
+            f(&sz, &label);
             af::device_gc();
         }
     }

@@ -40,6 +40,10 @@ for b in ${AF_BACKENDS:-cuda opencl}; do
         echo "warning: af-bench backend '$b' failed; skipping it." >&2
         rm -f "results/af-$b.csv"
     fi
+    if ! AF_CUDA_MAX_JIT_LEN=256 AF_OPENCL_MAX_JIT_LEN=256 "$bin/af-bench" --backend "$b" --label "$b-tuned" "${quick[@]}" > "results/af-$b-tuned.csv"; then
+        echo "warning: tuned af-bench backend '$b' failed; skipping it." >&2
+        rm -f "results/af-$b-tuned.csv"
+    fi
 done
 
 python3 report.py results/*.csv > results/report.md

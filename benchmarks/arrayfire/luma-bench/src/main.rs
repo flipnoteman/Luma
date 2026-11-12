@@ -14,6 +14,15 @@ fn per_step(g0: &Array<f32>, steps: usize, step: impl Fn(&Array<f32>) -> Array<f
     let mut u = g0 * 1.0;
     for _ in 0..steps {
         u = step(&u);
+        u.eval().unwrap();
+    }
+    u
+}
+
+fn lazy_chain(g0: &Array<f32>, steps: usize, step: impl Fn(&Array<f32>) -> Array<f32>) -> Array<f32> {
+    let mut u = g0 * 1.0;
+    for _ in 0..steps {
+        u = step(&u);
     }
     u
 }
@@ -86,12 +95,34 @@ fn report(row: Row, mut f: impl FnMut()) {
     print_row(&row, &t);
 }
 
+fn cold(row: Row, f: impl FnOnce()) {
+    let ctx = default_context().unwrap();
+    let t = time_once(|| {
+        f();
+        ctx.sync().unwrap();
+    });
+    print_row(&row, &t);
+}
+
 fn heat(sz: &Sizes) {
     let steps = sz.heat_steps;
     for &w in &sz.heat {
         let u0 = values(w * w, 10, 0.0, 1.0);
         let want = heat_ref(w, w, &u0, steps);
         let g = Array::from_slice(&u0, [w, w]).unwrap();
+        cold(
+            Row {
+                workload: "heat",
+                size: format!("{w}x{w}"),
+                variant: "per_step_cold",
+                library: "luma",
+                backend: BACKEND,
+                work: (w * w * steps) as f64,
+                unit: "Gcell/s",
+                err: 0.0,
+            },
+            || per_step(&g, steps, heat_step).eval().unwrap(),
+        );
         let mk = |variant: &'static str, run: &dyn Fn() -> Array<f32>| {
             let err = rel_err(&run().to_vec().unwrap(), &want);
             check(&format!("heat {w} {variant}"), err, 1e-4);
@@ -110,6 +141,44 @@ fn heat(sz: &Sizes) {
         report(mk("iterate", &it), || it().eval().unwrap());
         let ps = || per_step(&g, steps, heat_step);
         report(mk("per_step", &ps), || ps().eval().unwrap());
+        let lc = || lazy_chain(&g, steps, heat_step);
+        report(mk("lazy_chain", &lc), || lc().eval().unwrap());
+    }
+}
+
+fn converge(sz: &Sizes) {
+    let steps = sz.converge_steps;
+    for &w in &sz.converge {
+        let u0 = values(w * w, 10, 0.0, 1.0);
+        let want = heat_ref(w, w, &u0, steps);
+        let g = Array::from_slice(&u0, [w, w]).unwrap();
+        let run = || {
+            let mut u = &g * 1.0;
+            for _ in 0..steps {
+                let next = heat_step(&u);
+                let err = (&next - &u).abs().max().unwrap();
+                u = next;
+                if err < sz.converge_tol {
+                    break;
+                }
+            }
+            u
+        };
+        let err = rel_err(&run().to_vec().unwrap(), &want);
+        check(&format!("converge {w} readback_every_step"), err, 1e-4);
+        report(
+            Row {
+                workload: "converge",
+                size: format!("{w}x{w}"),
+                variant: "readback_every_step",
+                library: "luma",
+                backend: BACKEND,
+                work: (w * w * steps) as f64,
+                unit: "Gcell/s",
+                err,
+            },
+            || run().eval().unwrap(),
+        );
     }
 }
 
@@ -137,6 +206,8 @@ fn life(sz: &Sizes) {
         report(mk("iterate", &it), || it().eval().unwrap());
         let ps = || per_step(&g, steps, life_step);
         report(mk("per_step", &ps), || ps().eval().unwrap());
+        let lc = || lazy_chain(&g, steps, life_step);
+        report(mk("lazy_chain", &lc), || lc().eval().unwrap());
     }
 }
 
@@ -208,6 +279,9 @@ fn mandelbrot(sz: &Sizes) {
             unit: "Gpix-iter/s",
             err,
         };
+        cold(row("eval_every_1_cold", 0.0), || {
+            run(1);
+        });
         for (variant, every) in [("eval_every_1", 1usize), ("eval_every_8", 8), ("eval_end_only", 0)] {
             let err = mismatch_frac(&run(every).to_vec().unwrap(), &want);
             check(&format!("mandelbrot {w} {variant}"), err, 0.01);
@@ -326,8 +400,9 @@ fn main() {
     let args = parse_args();
     let sz = sizes(args.quick);
     print_header();
-    let workloads: [(&str, fn(&Sizes)); 6] = [
+    let workloads: [(&str, fn(&Sizes)); 7] = [
         ("heat", heat),
+        ("converge", converge),
         ("life", life),
         ("blackscholes", blackscholes),
         ("mandelbrot", mandelbrot),
