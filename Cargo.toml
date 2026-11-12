@@ -17,7 +17,7 @@ members = ["luma-derive"]
 exclude = ["benchmarks/arrayfire"]
 
 [dependencies]
-wgpu = "30"
+wgpu = { version = "30", features = ["naga-ir"] }
 bytemuck = "1.21.0"
 log = "0.4.25"
 pollster = "1.0.1"

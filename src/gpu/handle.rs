@@ -6,6 +6,7 @@ use wgpu::{Device, InstanceDescriptor, MemoryHints, PowerPreference, Queue};
 
 use crate::context::DeviceKind;
 use crate::error::{LumaError, Result};
+use crate::gpu::cache::{self, DiskCache};
 use crate::gpu::lock;
 use crate::jit::cost::CostModel;
 
@@ -26,6 +27,8 @@ pub(crate) struct Gpu {
     /// The device's measured cost model, set by the first context that calibrates it, so that a
     /// pooled device is calibrated once per process.
     pub(crate) cost: Arc<OnceLock<CostModel>>,
+    /// The on-disk cache of pipelines and of the calibration (see [`super::cache`]).
+    pub(crate) disk: Arc<DiskCache>,
 }
 
 /// Total bytes of the device-local heaps of `adapter`: how much array data a device can hold at
@@ -100,6 +103,11 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
         required_features |= adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
     }
+    // The driver's compiled pipelines are kept between processes (see `cache`).
+    let cache_dir = cache::directory();
+    if cache_dir.is_some() {
+        required_features |= adapter.features() & wgpu::Features::PIPELINE_CACHE;
+    }
 
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
@@ -123,7 +131,13 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     let memory = device_local_bytes(&adapter);
     #[cfg(target_os = "linux")]
     super::exit::track(&device, validated);
-    Ok(Gpu { device, queue, adapter: adapter.get_info(), lost, cpu, memory, cost: Arc::new(OnceLock::new()) })
+    let info = adapter.get_info();
+    let disk = DiskCache::open(cache_dir, &device, &info);
+    #[cfg(target_os = "linux")]
+    if !validated {
+        cache::flush_at_exit(&disk);
+    }
+    Ok(Gpu { device, queue, adapter: info, lost, cpu, memory, cost: Arc::new(OnceLock::new()), disk })
 }
 
 /// Process-wide pool of opened GPU devices.
@@ -182,6 +196,7 @@ pub(crate) fn acquire(kind: DeviceKind) -> Result<Gpu> {
 /// thread returning a device must never wait for one being created.
 pub(crate) fn release(gpu: Gpu) {
     let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+    gpu.disk.flush();
     if gpu.lost.load(Ordering::Acquire) {
         return;
     }

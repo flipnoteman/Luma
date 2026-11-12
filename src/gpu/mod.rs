@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
 mod exit;
+pub(crate) mod cache;
 pub mod handle;
 pub mod hash;
 pub(crate) mod pager;

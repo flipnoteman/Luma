@@ -53,6 +53,7 @@ extern "C" fn at_exit() {
                 let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(GPU_WAIT) });
             }
         }
+        super::cache::flush_all();
         wait_for_driver_workers();
     }));
 }
