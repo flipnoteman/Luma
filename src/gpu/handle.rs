@@ -7,6 +7,7 @@ use wgpu::{Device, InstanceDescriptor, MemoryHints, PowerPreference, Queue};
 use crate::context::DeviceKind;
 use crate::error::{LumaError, Result};
 use crate::gpu::lock;
+use crate::jit::cost::CostModel;
 
 /// An opened device with its queue and what the adapter is. Clones are handles to the same
 /// device.
@@ -22,6 +23,9 @@ pub(crate) struct Gpu {
     /// Total bytes of the adapter's device-local memory heaps, if the backend can tell (Vulkan
     /// only): the basis of the default memory budget.
     pub(crate) memory: Option<u64>,
+    /// The device's measured cost model, set by the first context that calibrates it, so that a
+    /// pooled device is calibrated once per process.
+    pub(crate) cost: Arc<OnceLock<CostModel>>,
 }
 
 /// Total bytes of the device-local heaps of `adapter`: how much array data a device can hold at
@@ -119,7 +123,7 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     let memory = device_local_bytes(&adapter);
     #[cfg(target_os = "linux")]
     super::exit::track(&device, validated);
-    Ok(Gpu { device, queue, adapter: adapter.get_info(), lost, cpu, memory })
+    Ok(Gpu { device, queue, adapter: adapter.get_info(), lost, cpu, memory, cost: Arc::new(OnceLock::new()) })
 }
 
 /// Process-wide pool of opened GPU devices.

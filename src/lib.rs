@@ -78,6 +78,7 @@ pub use kernel::{
 pub use iterate::iterate_all;
 pub use until::{iterate_until_all, Cond, History, Run, Series, Stat, StopReason, Until};
 pub use linalg::{solve_block_tridiagonal, solve_block_tridiagonal_from, solve_tridiagonal, solve_tridiagonal_from};
+pub use jit::cost::CostModel;
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Operand, Rhs};
 pub use reduce::Reduction;

@@ -21,6 +21,9 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
+  `Df32` and `f64` arithmetic), measured when a context opens (once per device and process;
+  `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).
 - Line primitives: `solve_tridiagonal` / `solve_block_tridiagonal` (block size 1 to 8, with
   `_from` variants where each line starts at its own cell) solve one system per line along an axis
   with the (block) Thomas algorithm; `Array::scan(axis, op)`, `cumsum`, `sum_axis`, `min_axis` and

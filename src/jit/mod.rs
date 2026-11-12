@@ -96,6 +96,7 @@
 
 pub(crate) mod assign;
 mod codegen;
+pub(crate) mod cost;
 mod inline;
 mod launch;
 mod looped;
@@ -1629,6 +1630,9 @@ pub(crate) struct JitState {
     max_live: AtomicUsize,
     /// Overrides [`Tuning::max_inlined`] when not 0 (tests).
     max_inlined: AtomicUsize,
+    /// Replaces the context's cost model when set (tests).
+    #[cfg(test)]
+    cost_override: Mutex<Option<cost::CostModel>>,
     /// What lowering a program (see [`inline`]) found, by the structure of the program.
     verdicts: Mutex<FxMap<u64, Vec<VerdictEntry>>>,
     /// The programs seen so far by their shape hash, to make equal ones share their
@@ -1698,6 +1702,8 @@ impl JitState {
             inputs_limit: AtomicUsize::new(max_inputs),
             max_live: AtomicUsize::new(0),
             max_inlined: AtomicUsize::new(0),
+            #[cfg(test)]
+            cost_override: Mutex::new(None),
             verdicts: Mutex::new(FxMap::default()),
             structures: Mutex::new(FxMap::default()),
             write_epoch: AtomicU64::new(0),
@@ -1849,6 +1855,16 @@ impl JitState {
     /// Most input buffers one fused kernel binds: what the device allows, capped by [`MAX_INPUTS`].
     pub(crate) fn max_inputs(&self) -> usize {
         self.inputs_limit.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cost_override(&self, model: cost::CostModel) {
+        *lock(&self.cost_override) = Some(model);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cost_override(&self) -> Option<cost::CostModel> {
+        *lock(&self.cost_override)
     }
 
     #[cfg(test)]

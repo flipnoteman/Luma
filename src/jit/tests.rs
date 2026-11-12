@@ -4,8 +4,17 @@
 
 use super::StatsSnapshot;
 use crate::array::Array;
-use crate::context::Context;
+use crate::context::{Context, ContextOptions};
+use crate::jit::cost::CostModel;
 use crate::ops::select;
+
+/// A context with the calibration off and the cost model pinned, so that kernel counts do not
+/// depend on the machine.
+fn ctx() -> Context {
+    let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    ctx
+}
 
 fn values(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
     let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -41,7 +50,7 @@ fn delta(before: StatsSnapshot, after: StatsSnapshot) -> StatsSnapshot {
 
 #[test]
 fn a_chain_of_operations_is_one_kernel_and_matches_the_cpu() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(5000, 1, 0.5, 2.0);
     let ys = values(5000, 2, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
@@ -71,7 +80,7 @@ fn fused_results_match_the_unfused_evaluation_of_the_same_expression() {
     let xs = values(3001, 3, 0.1, 3.0);
     let ys = values(3001, 4, 0.1, 3.0);
     let run = |max_nodes: usize| {
-        let ctx = Context::new().unwrap();
+        let ctx = ctx();
         ctx.jit().set_max_nodes(max_nodes);
         let x = f32s(&ctx, &xs);
         let y = f32s(&ctx, &ys);
@@ -94,7 +103,7 @@ fn fused_results_match_the_unfused_evaluation_of_the_same_expression() {
 
 #[test]
 fn comparison_into_select_stays_in_one_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(2048, 5, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
 
@@ -121,7 +130,7 @@ fn comparison_into_select_stays_in_one_kernel() {
 
 #[test]
 fn scalar_values_do_not_change_the_cache_key() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(1000, 6, -2.0, 2.0);
     let x = f32s(&ctx, &xs);
 
@@ -145,7 +154,7 @@ fn scalar_values_do_not_change_the_cache_key() {
 
 #[test]
 fn reductions_fuse_their_input_expression() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 100_000;
     let xs = values(n, 7, -1.0, 1.0);
     let ys = values(n, 8, -1.0, 1.0);
@@ -203,7 +212,7 @@ fn reductions_fuse_their_input_expression() {
 
 #[test]
 fn reducing_an_expression_does_not_evaluate_it() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(777, 9, 0.0, 1.0);
     let a = f32s(&ctx, &xs);
     let t = &a * 3.0;
@@ -228,7 +237,7 @@ fn reducing_an_expression_does_not_evaluate_it() {
 
 #[test]
 fn deep_chains_are_split_at_the_node_limit() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_max_nodes(64);
     let xs = values(500, 10, 0.5, 1.5);
     let x = f32s(&ctx, &xs);
@@ -257,7 +266,7 @@ fn deep_chains_are_split_at_the_node_limit() {
     assert_eq!(d.hits, 1);
 
     // With a limit of one, every operation is a kernel of its own.
-    let ctx = Context::new().unwrap();
+    let ctx = self::ctx();
     ctx.jit().set_max_nodes(1);
     let x = f32s(&ctx, &xs);
     let before = ctx.jit().stats();
@@ -270,7 +279,7 @@ fn deep_chains_are_split_at_the_node_limit() {
 
 #[test]
 fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let max_inputs = ctx.jit().max_inputs();
     let count = max_inputs * 2 + 3;
     let data: Vec<Vec<f32>> = (0..count).map(|i| values(300, 100 + i as u64, -1.0, 1.0)).collect();
@@ -301,7 +310,7 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
 
 #[test]
 fn a_node_with_two_consumers_is_computed_once() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(400, 11, 0.5, 2.0);
     let ys = values(400, 12, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -335,7 +344,7 @@ fn a_node_with_two_consumers_is_computed_once() {
 
 #[test]
 fn sharing_inside_one_expression_is_one_instruction() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(1000, 15, 0.5, 2.0);
     let ys = values(1000, 16, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -371,7 +380,7 @@ fn sharing_inside_one_expression_is_one_instruction() {
 
 #[test]
 fn compound_assignment_on_a_lazy_array_fuses() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(333, 13, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
     let before = ctx.jit().stats();
@@ -399,7 +408,7 @@ fn compound_assignment_on_a_lazy_array_fuses() {
 
 #[test]
 fn compound_assignment_on_a_solely_owned_array_reuses_its_buffer() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(1000, 15, -1.0, 1.0);
     let mut z = f32s(&ctx, &xs);
     let buffer = z.buffer();
@@ -415,7 +424,7 @@ fn compound_assignment_on_a_solely_owned_array_reuses_its_buffer() {
 
 #[test]
 fn compound_assignment_on_a_shared_buffer_is_one_in_place_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(500, 16, -1.0, 1.0);
     let a = f32s(&ctx, &xs);
     let b = f32s(&ctx, &values(500, 17, -1.0, 1.0));
@@ -440,7 +449,7 @@ fn compound_assignment_on_a_shared_buffer_is_one_in_place_kernel() {
 
 #[test]
 fn compound_assignment_does_not_change_earlier_expressions() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(64, 18, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
     let mut x2 = x.reshape(64);
@@ -454,7 +463,7 @@ fn compound_assignment_does_not_change_earlier_expressions() {
 
 #[test]
 fn a_dying_input_read_through_a_shift_is_not_overwritten() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(257, 19, -1.0, 1.0);
     let mut z = f32s(&ctx, &xs);
     // `z` is the only holder of its buffer once the old array is replaced, but the expression
@@ -467,7 +476,7 @@ fn a_dying_input_read_through_a_shift_is_not_overwritten() {
 
 #[test]
 fn nothing_runs_for_arrays_that_are_dropped_and_sync_runs_the_live_ones() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let x = f32s(&ctx, &[1.0, 2.0, 3.0, 4.0]);
 
     let before = ctx.jit().stats();
@@ -487,7 +496,7 @@ fn nothing_runs_for_arrays_that_are_dropped_and_sync_runs_the_live_ones() {
 
 #[test]
 fn lazy_arrays_hold_their_inputs_alive() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let data = values(1000, 14, 0.0, 1.0);
     let x = f32s(&ctx, &data);
     let y = &x * 2.0 + 1.0;
@@ -503,7 +512,7 @@ fn lazy_arrays_hold_their_inputs_alive() {
 
 #[test]
 fn many_pending_readers_of_one_buffer_are_pruned() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let x = f32s(&ctx, &[1.0; 64]);
     // A million-style loop of expressions that die unevaluated must not pile up in the
     // bookkeeping of `x`.
@@ -518,7 +527,7 @@ fn many_pending_readers_of_one_buffer_are_pruned() {
 
 #[test]
 fn eval_does_not_materialize_the_temporaries_of_the_expression() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let x = f32s(&ctx, &values(256, 40, 0.0, 1.0));
     let before = ctx.jit().stats();
     // The intermediate arrays are temporaries alive until the end of the statement.
@@ -535,7 +544,7 @@ fn eval_does_not_materialize_the_temporaries_of_the_expression() {
 
 #[test]
 fn shifts_fuse_into_the_expression_that_reads_them() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(1000, 41, -1.0, 1.0);
     let n = xs.len();
     let x = f32s(&ctx, &xs);
@@ -606,7 +615,7 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
 
 #[test]
 fn a_life_step_recomputes_through_its_shifts() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let (w, h) = (64usize, 64usize);
     let cells: Vec<f32> = values(w * h, 7, 0.0, 1.0).into_iter().map(|v| if v > 0.5 { 1.0 } else { 0.0 }).collect();
     let step = |u: &Array<f32>| {
@@ -668,7 +677,7 @@ fn life_cpu(g: &[f32], w: usize, h: usize) -> Vec<f32> {
 
 #[test]
 fn a_lazy_chain_of_life_steps_is_staged_in_workgroup_memory() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     for (w, h) in [(64usize, 64usize), (37, 29)] {
         let cells: Vec<f32> = values(w * h, 9, 0.0, 1.0).into_iter().map(|v| if v > 0.5 { 1.0 } else { 0.0 }).collect();
         let mut want = cells.clone();
@@ -690,7 +699,7 @@ fn a_lazy_chain_of_life_steps_is_staged_in_workgroup_memory() {
 
 #[test]
 fn a_shifted_expression_also_read_directly_is_computed_once() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let cells = values(64 * 64, 10, 0.0, 1.0);
     let u = Array::from_slice_on(&ctx, &cells, [64, 64]).unwrap();
     // The life step reads `u` through eight shifts and once at the cell itself.
@@ -705,7 +714,7 @@ fn a_shifted_expression_also_read_directly_is_computed_once() {
 
 #[test]
 fn a_lazy_chain_of_heat_steps_matches_iterate() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let cells = values(64 * 64, 21, 0.0, 1.0);
     let g = Array::from_slice_on(&ctx, &cells, [64, 64]).unwrap();
     for steps in 1..=10 {
@@ -737,7 +746,7 @@ fn a_lazy_chain_of_heat_steps_matches_iterate() {
 
 #[test]
 fn a_shift_wider_than_the_staging_limit_still_gives_the_right_values() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 1000;
     let xs = values(n, 31, 0.0, 1.0);
     let x = f32s(&ctx, &xs);
@@ -759,7 +768,7 @@ fn a_shift_wider_than_the_staging_limit_still_gives_the_right_values() {
 
 #[test]
 fn mixed_types_and_scalars_in_a_staged_expression() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let (w, h) = (23usize, 14usize);
     let xs = values(w * h, 41, 0.0, 2.0);
     let x = Array::from_slice_on(&ctx, &xs, [w, h]).unwrap();
@@ -781,7 +790,7 @@ fn mixed_types_and_scalars_in_a_staged_expression() {
 
 #[test]
 fn arrays_evaluated_together_share_one_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(3000, 50, 0.5, 2.0);
     let ys = values(3000, 51, 0.5, 2.0);
     let (x, y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
@@ -814,7 +823,7 @@ fn arrays_evaluated_together_share_one_kernel() {
 #[test]
 fn several_reductions_share_one_pass() {
     use crate::reduce::Reduction;
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     // More than one workgroup's block, so the later (segmented) passes run too.
     let xs = values(300_001, 52, -3.0, 2.0);
     let x = f32s(&ctx, &xs);
@@ -842,7 +851,7 @@ fn arrays_advancing_together_are_split_into_multi_output_kernels() {
     let n = 600;
     let cxs = values(n, 20, -0.3, 0.3);
     let cys = values(n, 21, -0.3, 0.3);
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_max_nodes(64);
     let (cx, cy) = (f32s(&ctx, &cxs), f32s(&ctx, &cys));
     let zero = f32s(&ctx, &vec![0.0; n]);
@@ -888,7 +897,7 @@ fn arrays_advancing_together_for_many_iterations_split_into_few_kernels() {
     let n = 600;
     let cxs = values(n, 20, -0.3, 0.3);
     let cys = values(n, 21, -0.3, 0.3);
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let (cx, cy) = (f32s(&ctx, &cxs), f32s(&ctx, &cys));
     let zero = f32s(&ctx, &vec![0.0; n]);
     let one = f32s(&ctx, &vec![1.0; n]);
@@ -931,7 +940,7 @@ fn arrays_advancing_together_for_many_iterations_split_into_few_kernels() {
 
 #[test]
 fn the_node_limit_counts_distinct_nodes_only() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_max_nodes(61);
     let xs = values(300, 40, 0.5, 1.5);
     let x = f32s(&ctx, &xs);
@@ -972,7 +981,7 @@ fn the_node_limit_counts_distinct_nodes_only() {
 
 #[test]
 fn a_long_register_loop_is_split_into_launches_with_the_same_result() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 1000;
     let xs = values(n, 11, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
@@ -992,7 +1001,7 @@ fn a_long_register_loop_is_split_into_launches_with_the_same_result() {
 
 #[test]
 fn requesting_an_array_many_times_keeps_one_entry() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let x = f32s(&ctx, &values(64, 12, 0.0, 1.0));
     let y = &x * 2.0 + 1.0;
     let node = y.pending().unwrap().clone();
@@ -1021,7 +1030,7 @@ fn elementwise_steps(xs: &[f32], ys: &[f32], steps: usize) -> Vec<(Vec<f32>, Vec
 
 #[test]
 fn an_eval_loop_of_an_elementwise_step_runs_as_one_loop() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.set_assume_busy(true);
     let (xs, ys) = (values(4096, 60, 0.5, 1.5), values(4096, 61, 0.5, 1.5));
     let (mut x, mut y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
@@ -1048,7 +1057,7 @@ fn heat_step(u: &Array<f32>) -> Array<f32> {
 
 #[test]
 fn an_eval_loop_of_a_shift_step_runs_time_blocked() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.set_assume_busy(true);
     let g = Array::from_slice_on(&ctx, &values(64 * 64, 62, 0.0, 1.0), [64, 64]).unwrap();
 
@@ -1069,7 +1078,7 @@ fn an_eval_loop_of_a_shift_step_runs_time_blocked() {
 
 #[test]
 fn a_kept_intermediate_state_keeps_its_value() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.set_assume_busy(true);
     let (xs, ys) = (values(1024, 63, 0.5, 1.5), values(1024, 64, 0.5, 1.5));
     let (mut x, mut y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
@@ -1091,7 +1100,7 @@ fn a_kept_intermediate_state_keeps_its_value() {
 
 #[test]
 fn writing_a_fixed_input_after_a_compressed_loop_does_not_change_it() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.set_assume_busy(true);
     let (xs, cs) = (values(512, 65, 0.5, 1.5), values(512, 66, 0.5, 1.5));
     let mut c = f32s(&ctx, &cs);
@@ -1109,7 +1118,7 @@ fn writing_a_fixed_input_after_a_compressed_loop_does_not_change_it() {
 
 #[test]
 fn a_scalar_that_changes_every_step_still_gives_the_right_result() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.set_assume_busy(true);
     let xs = values(777, 67, 0.5, 1.5);
     let mut x = f32s(&ctx, &xs);
@@ -1125,7 +1134,7 @@ fn a_scalar_that_changes_every_step_still_gives_the_right_result() {
 
 #[test]
 fn kernels_built_stay_bounded_for_long_eval_loops() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let w = 128;
     let (dx, dy) = (3.2 / w as f32, 2.8 / w as f32);
     let cxs: Vec<f32> = (0..w * w).map(|i| -2.2 + (i % w) as f32 * dx).collect();
@@ -1170,7 +1179,7 @@ fn kernels_built_stay_bounded_for_long_eval_loops() {
 
 #[test]
 fn an_eval_loop_of_a_shift_step_over_two_states_matches_the_cpu() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.set_assume_busy(true);
     let n = 500;
     let (xs, ys) = (values(n, 70, 0.0, 1.0), values(n, 71, 0.0, 1.0));
@@ -1210,7 +1219,7 @@ fn an_eval_loop_over_chunked_arrays_matches_the_cpu() {
 
 #[test]
 fn reading_back_in_the_middle_of_an_eval_loop_gives_the_right_values() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.set_assume_busy(true);
     let start = values(32 * 32, 74, 0.0, 1.0);
     let g = Array::from_slice_on(&ctx, &start, [32, 32]).unwrap();
@@ -1236,7 +1245,7 @@ fn reading_back_in_the_middle_of_an_eval_loop_gives_the_right_values() {
 
 #[test]
 fn an_eval_loop_of_a_step_too_big_to_recompute_still_runs_as_one_loop() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.set_assume_busy(true);
     let extra = ctx.tuning().max_recomputed;
     // Longer than the recompute limit: a shift of the previous state evaluates it.
@@ -1295,28 +1304,28 @@ fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32
 
 #[test]
 fn a_readback_loop_gives_the_same_values_with_speculation() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     check_readback_loop(&ctx, 60, |_| 0.2, None);
     assert!(ctx.jit().speculation_hits() > 0, "no readback was answered ahead of time");
 }
 
 #[test]
 fn a_step_that_changes_turns_speculation_off_and_stays_correct() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     check_readback_loop(&ctx, 40, |k| 0.2 - k as f32 * 0.002, None);
     assert_eq!(ctx.jit().speculation_hits(), 0);
 }
 
 #[test]
 fn writing_an_input_between_readbacks_discards_the_prediction() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     check_readback_loop(&ctx, 40, |_| 0.2, Some(20));
     assert!(ctx.jit().speculation_hits() > 0);
 }
 
 #[test]
 fn a_readback_loop_does_not_speculate_when_it_is_off() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_speculate(false);
     check_readback_loop(&ctx, 40, |_| 0.2, None);
     assert_eq!(ctx.jit().speculation_hits(), 0);
@@ -1324,7 +1333,7 @@ fn a_readback_loop_does_not_speculate_when_it_is_off() {
 
 #[test]
 fn a_difference_of_slices_is_one_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let data = values(9, 21, -1.0, 1.0);
     let f = f32s(&ctx, &data);
     let before = ctx.jit().stats();
@@ -1344,7 +1353,7 @@ fn a_difference_of_slices_is_one_kernel() {
 
 #[test]
 fn a_boundary_assignment_reading_the_target_is_one_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let (ni, nj) = (8usize, 6usize);
     let data = values(ni * nj, 40, -1.0, 1.0);
     let want_ghost: Vec<f32> = (0..nj).flat_map(|j| [-data[3 + ni * j], -data[2 + ni * j]]).collect();
@@ -1376,7 +1385,7 @@ fn a_boundary_assignment_reading_the_target_is_one_kernel() {
 
 #[test]
 fn assigning_an_expression_of_the_whole_target_is_one_in_place_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let data = values(500, 41, -1.0, 1.0);
     let w = f32s(&ctx, &data);
     let before = ctx.jit().stats();
@@ -1389,7 +1398,7 @@ fn assigning_an_expression_of_the_whole_target_is_one_in_place_kernel() {
 #[test]
 fn a_record_ghost_assignment_is_one_kernel() {
     use crate::fields::Fields;
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let (ni, nj) = (8usize, 6usize);
     let data: Vec<Vec<f32>> = (0..4).map(|k| values(ni * nj, 50 + k, -1.0, 1.0)).collect();
     let record = |data: &[Vec<f32>]| -> [Array<f32>; 4] {
@@ -1435,7 +1444,7 @@ fn a_record_ghost_assignment_is_one_kernel() {
 
 #[test]
 fn a_wide_expression_of_hundreds_of_operations_is_one_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 777;
     let (xs, ys, zs) = (values(n, 90, 0.5, 1.5), values(n, 91, 0.5, 1.5), values(n, 92, 0.5, 1.5));
     let (x, y, z) = (f32s(&ctx, &xs), f32s(&ctx, &ys), f32s(&ctx, &zs));
@@ -1466,7 +1475,7 @@ fn a_wide_expression_of_hundreds_of_operations_is_one_kernel() {
 
 #[test]
 fn a_fusion_limit_scope_splits_the_expressions_written_in_it() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(500, 93, 0.5, 1.5);
     let x = f32s(&ctx, &xs);
     let chain = |x: &Array<f32>| {
@@ -1495,7 +1504,7 @@ fn a_very_deep_chain_is_cut_and_evaluates_on_a_small_stack() {
         // build gets the default stack of a test thread for the same depth.
         .stack_size(if cfg!(debug_assertions) { 2 << 20 } else { 256 * 1024 })
         .spawn(|| {
-            let ctx = Context::new().unwrap();
+            let ctx = ctx();
             let x = f32s(&ctx, &[1.0, 2.0, 3.0]);
             let mut acc = &x * 1.0;
             for _ in 0..300 {
@@ -1509,7 +1518,7 @@ fn a_very_deep_chain_is_cut_and_evaluates_on_a_small_stack() {
 
 #[test]
 fn identical_lazy_operations_are_one_node() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(200, 94, 0.0, 2.0);
     let mut x = f32s(&ctx, &xs);
     let f = |a: &Array<f32>| (a * 2.0 + 1.0).sqrt();
@@ -1529,7 +1538,7 @@ fn identical_lazy_operations_are_one_node() {
 
 #[test]
 fn held_nodes_are_not_shared_but_their_temporaries_are() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(200, 97, 0.0, 2.0);
     let x = f32s(&ctx, &xs);
     let f = |a: &Array<f32>| (a * 2.0 + 1.0).sqrt();
@@ -1546,7 +1555,7 @@ fn held_nodes_are_not_shared_but_their_temporaries_are() {
 #[test]
 fn cuts_of_an_expression_are_noted_with_their_reason_and_place() {
     use crate::profile::SplitReason;
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_max_nodes(16);
     ctx.jit().record_splits();
     let x = f32s(&ctx, &values(100, 96, 0.5, 1.5));
@@ -1565,7 +1574,7 @@ fn cuts_of_an_expression_are_noted_with_their_reason_and_place() {
 #[test]
 fn a_program_with_many_live_values_is_split_in_the_middle() {
     use crate::profile::SplitReason;
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_max_live(4);
     ctx.jit().record_splits();
     let xs = values(300, 97, 0.5, 2.0);
@@ -1585,7 +1594,7 @@ fn a_program_with_many_live_values_is_split_in_the_middle() {
 
 #[test]
 fn a_third_view_reader_recomputes_the_expression_inside_the_one_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 400;
     let xs = values(n, 98, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -1612,7 +1621,7 @@ fn a_third_view_reader_recomputes_the_expression_inside_the_one_kernel() {
 
 #[test]
 fn cache_evaluates_an_expression_once_for_every_later_read() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 400;
     let xs = values(n, 99, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -1630,7 +1639,7 @@ fn cache_evaluates_an_expression_once_for_every_later_read() {
 
 #[test]
 fn a_scalar_operand_shares_one_kernel_whatever_its_value() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(64, 7, 0.0, 1.0);
     let x = f32s(&ctx, &xs);
     let s = crate::scalar::Scalar::new(2.0f32);
@@ -1646,7 +1655,7 @@ fn a_scalar_operand_shares_one_kernel_whatever_its_value() {
 
 #[test]
 fn a_reduction_used_in_an_expression_is_one_reduce_launch_and_no_readback() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(500, 8, 0.5, 1.5);
     let x = f32s(&ctx, &xs);
     let before = ctx.jit().stats();
@@ -1663,7 +1672,7 @@ fn a_reduction_used_in_an_expression_is_one_reduce_launch_and_no_readback() {
 
 #[test]
 fn a_cached_step_is_traced_once_and_builds_no_kernels_per_step() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let x = f32s(&ctx, &values(128, 21, 0.0, 1.0));
     let calls = std::cell::Cell::new(0);
     let step = |[u]: &[Array<f32>; 1]| {
@@ -1690,7 +1699,7 @@ fn a_cached_step_is_traced_once_and_builds_no_kernels_per_step() {
 
 #[test]
 fn nested_views_of_a_lazy_expression_are_one_kernel_computing_each_index_once() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 20;
     let xs = values(n, 101, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -1717,7 +1726,7 @@ fn nested_views_of_a_lazy_expression_are_one_kernel_computing_each_index_once() 
 #[test]
 fn a_kernel_over_the_inlining_cap_is_cut_by_evaluating_a_sub_program() {
     use crate::profile::SplitReason;
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_max_inlined(16);
     ctx.jit().record_splits();
     let n = 64;
@@ -1745,7 +1754,7 @@ fn a_kernel_over_the_inlining_cap_is_cut_by_evaluating_a_sub_program() {
 #[test]
 fn views_with_every_edge_of_a_lazy_expression_nest() {
     use crate::view::PadMode;
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 10;
     let xs = values(n, 103, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -1769,7 +1778,7 @@ fn views_with_every_edge_of_a_lazy_expression_nest() {
 
 #[test]
 fn a_gather_of_a_lazy_expression_of_a_lazy_slice() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 16;
     let xs = values(n, 104, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
@@ -1787,7 +1796,7 @@ fn a_gather_of_a_lazy_expression_of_a_lazy_slice() {
 
 #[test]
 fn a_reduction_over_nested_lazy_views_is_one_pass_and_no_store_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let n = 1000;
     let xs = values(n, 105, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
@@ -1809,7 +1818,7 @@ fn a_reduction_over_nested_lazy_views_is_one_pass_and_no_store_kernel() {
 fn a_padded_record_assigned_through_launches_nothing_until_it_is_read() {
     use crate::fields::Fields;
     use crate::view::PadMode;
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let (ni, nj) = (8usize, 5usize);
     let data: Vec<Vec<f32>> = (0..4).map(|k| values(ni * nj, 110 + k, -1.0, 1.0)).collect();
     let q: [Array<f32>; 4] = std::array::from_fn(|k| Array::from_slice_on(&ctx, &data[k], [ni, nj]).unwrap());
@@ -1879,7 +1888,7 @@ fn long_chain_host(x: &[f32], depth: usize) -> Vec<f32> {
 
 #[test]
 fn concat_of_lazy_parts_is_one_kernel() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let (xs, ys) = (values(30, 301, -1.0, 1.0), values(20, 302, -1.0, 1.0));
     let (x, y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
 
@@ -1919,7 +1928,7 @@ fn concat_of_lazy_parts_is_one_kernel() {
 
 #[test]
 fn a_clone_of_a_lazy_array_shares_its_evaluation() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(300, 310, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
     let want: Vec<f32> = xs.iter().map(|&v| v * 2.0 + 1.0).collect();
@@ -1944,7 +1953,7 @@ fn a_clone_of_a_lazy_array_shares_its_evaluation() {
 
 #[test]
 fn an_input_buffer_is_not_reused_in_place_while_a_clone_of_its_array_lives() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(400, 311, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
     let doubled: Vec<f32> = xs.iter().map(|&v| v * 2.0).collect();
@@ -2004,7 +2013,7 @@ fn mix(xs: &[&F], seed: usize, depth: usize) -> F {
 /// `program::evaluation_fits`).
 #[test]
 fn cached_arrays_do_not_count_the_buffers_below_them() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_max_inputs(16);
     let n = 2000usize;
     let w: Vec<F> = (0..4)
@@ -2046,7 +2055,7 @@ fn cached_arrays_do_not_count_the_buffers_below_them() {
 /// reads one buffer of `x` and 8 of `other` and is one kernel on a device that binds 16.
 #[test]
 fn buffers_below_an_evaluated_part_of_an_expression_are_not_counted() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.jit().set_max_inputs(16);
     let n = 1000usize;
     let data: Vec<Vec<f32>> = (0..20).map(|i| values(n, 500 + i as u64, 0.5, 1.5)).collect();
@@ -2073,7 +2082,7 @@ fn buffers_below_an_evaluated_part_of_an_expression_are_not_counted() {
 /// buffers only the recording thread's launches may fill. Whoever reads an array computes it.
 #[test]
 fn sweeps_over_every_lazy_array_leave_the_arrays_of_other_threads_alone() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let xs = values(500, 7, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
     let lazy = &x * 2.0 + 1.0;
@@ -2106,7 +2115,7 @@ fn sweeps_over_every_lazy_array_leave_the_arrays_of_other_threads_alone() {
 #[test]
 fn a_ghost_assignment_into_a_pending_array_launches_nothing() {
     use crate::view::PadMode;
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let (ni, nj) = (8usize, 5usize);
     let data = values(ni * nj, 120, -1.0, 1.0);
     let x = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
@@ -2200,7 +2209,7 @@ mod euler {
 
     #[test]
     fn a_step_with_a_wall_condition_on_a_padded_state_is_one_launch_with_four_outputs() {
-        let ctx = Context::new().unwrap();
+        let ctx = ctx();
         // The software rasterizer's tuning limits kernels far below what this step lowers to.
         ctx.jit().set_max_inlined(4096);
         let (ni, nj) = (16usize, 12usize);
@@ -2224,7 +2233,7 @@ mod euler {
     /// and what the padded state's primitives are read through (nested views) belongs to the kernel.
     #[test]
     fn per_step_loops_compile_to_one_kernel_per_step_or_two_with_a_cached_padded_state() {
-        let ctx = Context::new().unwrap();
+        let ctx = ctx();
         ctx.jit().set_max_inlined(4096);
         let (ni, nj, steps) = (24usize, 16usize, 6usize);
         for (cache, per_step) in [(false, 1u64), (true, 2)] {
@@ -2255,7 +2264,7 @@ mod euler {
 
     #[test]
     fn stencil_steps_requested_one_after_the_other_are_a_chain_and_compute_in_order() {
-        let ctx = Context::new().unwrap();
+        let ctx = ctx();
         let (ni, nj) = (16usize, 12usize);
         let mut chained = state(&ctx, ni, nj);
         let mut eager = state(&ctx, ni, nj);
@@ -2298,7 +2307,7 @@ mod euler {
 /// a node shared by two threads is flattened, recorded and waited for by both.
 #[test]
 fn another_threads_pending_node_is_not_shared_by_hash_consing() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let here = Array::<u32>::range_on(&ctx, 100, 0).unwrap();
     let node = std::sync::Arc::clone(here.pending().unwrap());
     // The array is gone, the node lives on in the expression that reads it.

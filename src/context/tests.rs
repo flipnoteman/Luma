@@ -3,6 +3,14 @@ use super::transfer::{STAGING_USAGE, SYNC_SPIN_MIN, WAIT_SAMPLES};
 use super::*;
 use crate::array::Array;
 
+/// A context with the calibration off and the cost model pinned, so that kernel counts do not
+/// depend on the machine.
+fn ctx() -> Context {
+    let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    ctx
+}
+
 #[test]
 fn spin_budget_follows_the_recent_waits_up_to_the_cap() {
     let waits = WaitHistory::new();
@@ -33,7 +41,7 @@ fn spin_budget_follows_the_recent_waits_up_to_the_cap() {
 
 #[test]
 fn recycled_buffers_are_reused_per_size_class_and_usage() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
 
     let a = ctx.alloc_buffer(2400, STORAGE_USAGE).unwrap();
     assert_eq!(a.size(), 4096);
@@ -53,7 +61,7 @@ fn recycled_buffers_are_reused_per_size_class_and_usage() {
 
 #[test]
 fn dropping_an_array_returns_its_buffer_to_the_pool() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
 
     let array = Array::<u32>::zeros_on(&ctx, 600).unwrap();
     let storage = array.buffer().unwrap();
@@ -65,7 +73,7 @@ fn dropping_an_array_returns_its_buffer_to_the_pool() {
 
 #[test]
 fn dropped_buffer_is_reused_while_its_readers_are_still_pending() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
 
     let a = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap();
     let storage = a.buffer().unwrap();
@@ -90,7 +98,7 @@ fn dropped_buffer_is_reused_while_its_readers_are_still_pending() {
 
 #[test]
 fn flush_submits_the_pending_batch_and_keeps_the_results() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     ctx.flush().unwrap(); // nothing pending
     assert_eq!(ctx.pending_dispatches(), 0);
 
@@ -119,7 +127,7 @@ fn eval_busy_loop(ctx: &Context, x: &mut Array<f32>, steps: usize) {
 
 #[test]
 fn flush_hands_over_what_eval_held_back() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let mut x = Array::<f32>::zeros_on(&ctx, 1 << 22).unwrap();
     eval_busy_loop(&ctx, &mut x, 40);
     ctx.flush().unwrap();
@@ -129,7 +137,7 @@ fn flush_hands_over_what_eval_held_back() {
 
 #[test]
 fn a_waiting_call_completes_a_batch_that_eval_held_back() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let mut x = Array::<f32>::zeros_on(&ctx, 1 << 22).unwrap();
     eval_busy_loop(&ctx, &mut x, 40);
     assert_eq!(x.to_vec().unwrap()[1 << 21], 40.0);
@@ -138,7 +146,7 @@ fn a_waiting_call_completes_a_batch_that_eval_held_back() {
 
 #[test]
 fn eval_hands_over_one_array_and_leaves_other_lazy_arrays_lazy() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let x = Array::<f32>::full_on(&ctx, 16, 1.0).unwrap();
     let wanted = &x + 1.0;
     let unrelated = &x * 3.0;
@@ -157,7 +165,7 @@ fn eval_hands_over_one_array_and_leaves_other_lazy_arrays_lazy() {
 fn one_pass_per_batch_and_bound_state_survive_interleaved_commands() {
     // Uploads and clears between launches end the pass; the launches after them start a new
     // one and must bind everything again.
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let mut x = Array::<f32>::zeros_on(&ctx, 8).unwrap();
     for i in 0..50 {
         x += 1.0;
@@ -172,7 +180,7 @@ fn one_pass_per_batch_and_bound_state_survive_interleaved_commands() {
 
 #[test]
 fn batch_is_submitted_at_the_dispatch_limit() {
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     let mut x = Array::<f32>::zeros_on(&ctx, 8).unwrap();
     // A second array shares the buffer, so every `+=` is a dispatch of its own.
     let _view = x.reshape(8);
@@ -189,7 +197,7 @@ fn uniform_slots_beyond_the_prefix_copy_reach_the_gpu() {
     // The first slots of a batch are copied by its own command buffer, the rest by a separate
     // one. A launch takes one slot and the grid of the shared size one more; with 256-byte
     // slots `UNIFORM_PREFIX` holds 15 launches.
-    let ctx = Context::new().unwrap();
+    let ctx = ctx();
     for launches in [1usize, 15, 16, 17, 40, 100] {
         let mut x = Array::<f32>::zeros_on(&ctx, 8).unwrap();
         let _view = x.reshape(8);
@@ -208,4 +216,35 @@ fn postponing_stops_under_memory_pressure() {
     assert!(!postpone(true, 0, true));
     assert!(!postpone(false, 0, false));
     assert!(!postpone(true, SUBMIT_HOLD, false));
+}
+
+#[test]
+fn calibration_off_gives_the_profile_fallback() {
+    let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
+    assert_eq!(ctx.cost_model(), CostModel::fallback(ctx.tuning().profile));
+}
+
+#[test]
+fn calibration_is_measured_once_per_device() {
+    let first = Context::with_options(ContextOptions::from_env().calibrate(true)).unwrap();
+    let cell = first.device_cost();
+    let measured = *cell.get().expect("the context calibrated its device");
+    assert_eq!(measured, first.cost_model());
+    drop(first);
+
+    let calibrations = crate::jit::cost::CALIBRATIONS.load(std::sync::atomic::Ordering::Relaxed);
+    let second = Context::with_options(ContextOptions::from_env().calibrate(true)).unwrap();
+    // A pooled device keeps its calibration: nothing was measured again.
+    if Arc::ptr_eq(&cell, &second.device_cost()) {
+        assert_eq!(second.cost_model(), measured);
+        assert_eq!(crate::jit::cost::CALIBRATIONS.load(std::sync::atomic::Ordering::Relaxed), calibrations);
+    }
+}
+
+#[test]
+fn the_cost_model_can_be_overridden_in_tests() {
+    let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
+    let model = CostModel { launch_us: 123.0, ..CostModel::TEST };
+    ctx.set_cost_model(model);
+    assert_eq!(ctx.cost_model(), model);
 }

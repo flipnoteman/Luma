@@ -6,6 +6,7 @@ use wgpu::{Buffer, BufferUsages};
 
 use crate::builtin::Builtin;
 use crate::error::{LumaError, Result};
+use crate::jit::cost::{self, CostModel};
 use crate::jit::JitState;
 use crate::gpu::pager::Pager;
 use crate::gpu::handle;
@@ -70,6 +71,8 @@ struct Inner {
     zero_copy: bool,
     /// Kernel parameters for this GPU.
     tuning: Tuning,
+    /// What launches, memory traffic and arithmetic cost on this GPU, set once the context exists.
+    cost: OnceLock<CostModel>,
     batch: Mutex<Batch>,
     /// The launches captured by a recording, see [`record`].
     recording: Mutex<RecState>,
@@ -184,7 +187,7 @@ pub enum DeviceKind {
 }
 
 /// How a [`Context`] is opened.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContextOptions {
     /// The kind of device to open.
@@ -200,9 +203,30 @@ pub struct ContextOptions {
     /// The check synchronizes with the GPU once per evaluated array, so it is for finding the
     /// operation that first produces a non-finite value, not for production runs.
     pub check_finite: bool,
+    /// Measure the device's throughputs when the context opens (about 50 ms on a GPU, once per
+    /// device and process); `false` uses the profile's fixed numbers (see [`CostModel`]).
+    pub calibrate: bool,
+}
+
+impl Default for ContextOptions {
+    fn default() -> Self {
+        ContextOptions {
+            device: DeviceKind::default(),
+            memory_budget: None,
+            chunk_bytes: None,
+            check_finite: false,
+            calibrate: true,
+        }
+    }
 }
 
 impl ContextOptions {
+    /// Turns calibration of the cost model on or off (see [`ContextOptions::calibrate`]).
+    pub fn calibrate(mut self, on: bool) -> Self {
+        self.calibrate = on;
+        self
+    }
+
     /// Sets the kind of device to open.
     pub fn device(mut self, kind: DeviceKind) -> Self {
         self.device = kind;
@@ -230,7 +254,8 @@ impl ContextOptions {
 
     /// Options from the environment: `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`),
     /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
-    /// `1` | `on` | `true` for the finite check.
+    /// `1` | `on` | `true` for the finite check, `LUMA_CALIBRATE` = `0` | `off` | `false` to skip
+    /// calibration.
     pub fn from_env() -> ContextOptions {
         let device = match std::env::var("LUMA_DEVICE").ok().as_deref().map(str::trim) {
             Some("gpu") => DeviceKind::Gpu,
@@ -244,6 +269,8 @@ impl ContextOptions {
             chunk_bytes: bytes("LUMA_CHUNK_BYTES"),
             check_finite: std::env::var("LUMA_CHECK_FINITE")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
+            calibrate: !std::env::var("LUMA_CALIBRATE")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
         }
     }
 }
@@ -334,7 +361,8 @@ impl Context {
             profiler: None,
         };
 
-        Ok(Context {
+        let profile = Tuning::for_adapter(&gpu.0.adapter, &limits, device.features()).profile;
+        let ctx = Context {
             inner: Arc::new(Inner {
                 max_uniform_bytes: limits.max_uniform_buffer_binding_size,
                 uniform_align: u64::from(limits.min_uniform_buffer_offset_alignment).max(4),
@@ -343,6 +371,7 @@ impl Context {
                 timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
                 zero_copy: device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
                 tuning: Tuning::for_adapter(&gpu.0.adapter, &limits, device.features()),
+                cost: OnceLock::new(),
                 gpu,
                 builtins: Mutex::new(FxMap::default()),
                 jit: JitState::new(&limits),
@@ -365,7 +394,38 @@ impl Context {
                 grid_layout,
                 max_buffer_bytes,
             }),
-        })
+        };
+        let model = if options.calibrate {
+            *ctx.inner.gpu.0.cost.get_or_init(|| {
+                cost::calibrate(&ctx).unwrap_or_else(|_| CostModel::fallback(profile))
+            })
+        } else {
+            CostModel::fallback(profile)
+        };
+        let _ = ctx.inner.cost.set(model);
+        Ok(ctx)
+    }
+
+    /// The device's cost model: measured when the context opened (see
+    /// [`ContextOptions::calibrate`]), otherwise the fixed numbers of its tuning profile.
+    pub fn cost_model(&self) -> CostModel {
+        #[cfg(test)]
+        if let Some(model) = self.jit().cost_override() {
+            return model;
+        }
+        self.inner.cost.get().copied().unwrap_or_else(|| CostModel::fallback(self.inner.tuning.profile))
+    }
+
+    /// Replaces the cost model (tests).
+    #[cfg(test)]
+    pub(crate) fn set_cost_model(&self, model: CostModel) {
+        self.jit().set_cost_override(model);
+    }
+
+    /// The cost model cell of the device, shared by every context on it (tests).
+    #[cfg(test)]
+    pub(crate) fn device_cost(&self) -> Arc<OnceLock<CostModel>> {
+        Arc::clone(&self.inner.gpu.0.cost)
     }
 
     /// Starts building a custom compute kernel from WGSL source.
