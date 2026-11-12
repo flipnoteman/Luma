@@ -9,7 +9,7 @@ use crate::builtin::ReduceList;
 use crate::error::LumaError;
 
 use super::codegen::Tile;
-use super::{lock, Args, ElemTy, Node, Op, OpKind, Scalar, Src};
+use super::{lock, Args, ElemTy, Node, Op, OpKind, Scalar, ShiftKind, Src};
 
 /// Size of every element the fused kernels handle (`f32` and `u32`).
 pub(super) const ELEMENT_BYTES: u64 = 4;
@@ -170,6 +170,34 @@ fn collect(
     Ok(())
 }
 
+/// The nodes of `members` that a shift among them also reads, except `roots`, with the kind of
+/// that shift. Read directly, they take the value of their sub-program at offset zero instead of
+/// computing their expression a second time.
+fn shifted_members(members: &[Member], roots: &[*const Node]) -> Vec<(*const Node, ShiftKind)> {
+    let mut shifted: Vec<(*const Node, ShiftKind)> = Vec::new();
+    for member in members {
+        if let OpKind::Shift(kind) = member.node.op().kind
+            && let Src::Node(target) = &member.args[0]
+            && target.is_pending()
+        {
+            let at = Arc::as_ptr(target);
+            let direct = members.iter().any(|other| Arc::as_ptr(&other.node) == at);
+            if direct && !roots.contains(&at) && !shifted.iter().any(|&(known, _)| known == at) {
+                shifted.push((at, zero_shift(kind)));
+            }
+        }
+    }
+    shifted
+}
+
+/// A shift of the same kind as `kind` by nothing.
+fn zero_shift(kind: ShiftKind) -> ShiftKind {
+    match kind {
+        ShiftKind::Dims { dims, .. } => ShiftKind::Dims { dims, shifts: [0; 4] },
+        ShiftKind::Linear => ShiftKind::Linear,
+    }
+}
+
 #[derive(Default)]
 struct Flattener {
     /// Flattening for [`flatten_step`]: nothing may be evaluated, and a shifted expression is
@@ -187,6 +215,9 @@ struct Flattener {
     /// Programs of the expressions read through shifts, and the node of each.
     subs: Vec<Vec<Instr>>,
     sub_nodes: Vec<*const Node>,
+    /// Nodes read both through shifts and directly (see [`shifted_members`]); a direct read is a
+    /// shift by nothing of their sub-program.
+    shifted: Vec<(*const Node, ShiftKind)>,
     pub(super) fused_nodes: Vec<Arc<Node>>,
 }
 
@@ -223,6 +254,15 @@ impl Flattener {
         for arg in args.iter().take(node.op().kind.arity()) {
             collect(arg, &mut members, &mut seen, false)?;
         }
+        let shifted = shifted_members(&members, &[key]);
+        if !shifted.is_empty() {
+            (members, seen) = (Vec::new(), vec![key]);
+            seen.extend(shifted.iter().map(|&(at, _)| at));
+            for arg in args.iter().take(node.op().kind.arity()) {
+                collect(arg, &mut members, &mut seen, false)?;
+            }
+            self.shifted.extend(shifted);
+        }
         let outer_instrs = std::mem::take(&mut self.instrs);
         let outer_emitted = std::mem::take(&mut self.emitted);
         let result = (|| {
@@ -256,7 +296,13 @@ impl Flattener {
                 if let Some(&(_, found)) = self.emitted.iter().find(|(seen, _)| *seen == key) {
                     return Ok(found);
                 }
-                // Not a member: it was evaluated when the members were collected.
+                // Not a member: it was evaluated when the members were collected, or it is read
+                // through a shift too.
+                if let Some(&(_, kind)) = self.shifted.iter().find(|(seen, _)| *seen == key)
+                    && node.operands().is_some()
+                {
+                    return self.unshifted(node, kind);
+                }
                 if self.trace && node.is_pending() {
                     return Err(Failure::New(LumaError::Gpu("traced step reads an unevaluated node".into())));
                 }
@@ -266,6 +312,19 @@ impl Flattener {
                 }
             }
         }
+    }
+
+    /// The value of `node`'s sub-program at the element itself: a shift of `kind` by nothing.
+    fn unshifted(&mut self, node: &Arc<Node>, kind: ShiftKind) -> Result<Ref, Failure> {
+        let sub = self.sub(node)?;
+        let amount = match kind {
+            ShiftKind::Linear => self.operand(&Src::Scalar(Scalar { ty: ElemTy::U32, bits: 0 }), ElemTy::U32)?,
+            ShiftKind::Dims { .. } => Ref::Unused,
+        };
+        let at = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
+        self.instrs.push(Instr { op: Op::new(OpKind::Shift(kind), node.op().out_ty()), args: [sub, amount, Ref::Unused] });
+        self.emitted.push((Arc::as_ptr(node), Ref::Tmp(at)));
+        Ok(Ref::Tmp(at))
     }
 
     fn input(&mut self, storage: &Arc<Storage>, ty: ElemTy) -> Ref {
@@ -530,22 +589,36 @@ pub(super) fn flatten_inner(
         return Ok(fused);
     }
     let expected: usize = roots.iter().map(|(root, _)| root.size()).sum();
+    let mut shifted;
     let members = loop {
-        let mut members = Vec::with_capacity(expected);
-        let mut seen = Vec::with_capacity(expected);
-        for (root, args) in roots {
-            for (index, arg) in args.iter().enumerate().take(root.op().kind.arity()) {
-                if index == 0 && matches!(root.op().kind, OpKind::Shift(_)) {
-                    continue;
+        let gather = |seed: &[*const Node]| -> Result<(Vec<Member>, Vec<*const Node>), Failure> {
+            let mut members = Vec::with_capacity(expected);
+            let mut seen = Vec::with_capacity(expected + seed.len());
+            seen.extend_from_slice(seed);
+            for (root, args) in roots {
+                for (index, arg) in args.iter().enumerate().take(root.op().kind.arity()) {
+                    if index == 0 && matches!(root.op().kind, OpKind::Shift(_)) {
+                        continue;
+                    }
+                    collect(arg, &mut members, &mut seen, false)?;
                 }
-                collect(arg, &mut members, &mut seen, false)?;
             }
-        }
-        for (root, args) in roots {
-            if !seen.contains(&Arc::as_ptr(root)) {
-                seen.push(Arc::as_ptr(root));
-                members.push(Member { node: Arc::clone(root), args: args.clone() });
+            for (root, args) in roots {
+                if !seen.contains(&Arc::as_ptr(root)) {
+                    seen.push(Arc::as_ptr(root));
+                    members.push(Member { node: Arc::clone(root), args: args.clone() });
+                }
             }
+            Ok((members, seen))
+        };
+        let (mut members, mut seen) = gather(&[])?;
+        let root_ptrs: Vec<*const Node> = roots.iter().map(|(root, _)| Arc::as_ptr(root)).collect();
+        shifted = shifted_members(&members, &root_ptrs);
+        let mut targets = Vec::new();
+        if !shifted.is_empty() {
+            let ptrs: Vec<*const Node> = shifted.iter().map(|&(at, _)| at).collect();
+            targets = members.into_iter().filter(|member| ptrs.contains(&Arc::as_ptr(&member.node))).collect();
+            (members, seen) = gather(&ptrs)?;
         }
         let mut sub_members = Vec::new();
         // Only expressions read through shifts add to what was seen.
@@ -556,6 +629,14 @@ pub(super) fn flatten_inner(
                     let all_seen = with_subs.get_or_insert_with(|| seen.clone());
                     collect(&Src::Node(Arc::clone(sub_root)), &mut sub_members, all_seen, false)?;
                 }
+        }
+        // The shifted members are in `seen` already, so their expressions are collected here.
+        for target in targets {
+            let all_seen = with_subs.get_or_insert_with(|| seen.clone());
+            for arg in target.args.iter().take(target.node.op().kind.arity()) {
+                collect(arg, &mut sub_members, all_seen, false)?;
+            }
+            sub_members.push(target);
         }
         let all_seen = with_subs.as_deref().unwrap_or(&seen);
         let is_root = |node: &Arc<Node>| roots.iter().any(|(root, _)| Arc::ptr_eq(root, node));
@@ -578,7 +659,7 @@ pub(super) fn flatten_inner(
         }
     };
 
-    let mut flattener = Flattener::default();
+    let mut flattener = Flattener { shifted, ..Flattener::default() };
     flattener.instrs.reserve(members.len());
     flattener.emitted.reserve(members.len());
     for member in &members {

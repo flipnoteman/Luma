@@ -687,6 +687,21 @@ fn a_lazy_chain_of_life_steps_is_staged_in_workgroup_memory() {
 }
 
 #[test]
+fn a_shifted_expression_also_read_directly_is_computed_once() {
+    let ctx = Context::new().unwrap();
+    let cells = values(64 * 64, 10, 0.0, 1.0);
+    let u = Array::from_slice_on(&ctx, &cells, [64, 64]).unwrap();
+    // The life step reads `u` through eight shifts and once at the cell itself.
+    let two = life_step(&life_step(&u));
+    let node = two.pending().unwrap();
+    let fused = super::program::flatten(&[(std::sync::Arc::clone(node), node.operands().unwrap())], super::program::Tail::Store);
+    let fused = fused.ok().unwrap();
+    assert_eq!(fused.key.subs.len(), 1);
+    // The outer step plus one read of the inner step's staged value, not a second inner step.
+    assert_eq!(fused.key.instrs.len(), fused.key.subs[0].len() + 1);
+}
+
+#[test]
 fn a_lazy_chain_of_heat_steps_matches_iterate() {
     let ctx = Context::new().unwrap();
     let cells = values(64 * 64, 21, 0.0, 1.0);
