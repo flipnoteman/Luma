@@ -1010,9 +1010,9 @@ const KNOWN: &[Known] = &[
         message: Some("Number of bindings in bind group descriptor"),
         shape: None,
     },
-    Known { id: "F3 lazy reduction reads a later write to its operand", message: None, shape: Some(reduction_then_write) },
     Known { id: "F4 slice write after a flipped write into a lazy array is lost", message: None, shape: Some(flipped_write_then_slice_write) },
     Known { id: "F5 receiver of a write through an older view shows old data", message: None, shape: Some(view_assigned_after_base_write) },
+    Known { id: "F12 receiver of a write through a view whose base a cache evaluated shows old data", message: None, shape: Some(cached_then_view_assigned) },
     Known { id: "F6 traced loop with a gather corrupts an outer array (max_nodes <= 3)", message: None, shape: Some(traced_gather_with_tight_limit) },
     Known { id: "F7 lazy compound assignment captured by a traced loop is replayed", message: None, shape: Some(captured_compound_in_loop) },
     Known {
@@ -1040,6 +1040,31 @@ fn traced_gather_with_tight_limit(program: &Program) -> bool {
             matches!(stmt, Stmt::Loop { kind: LoopKind::IterateAll | LoopKind::IterateUntilAll, steps, body, .. }
                 if *steps >= 2 && body.iter().any(|s| matches!(s, Stmt::View { view: ViewOp::Take { .. }, .. })))
         })
+}
+
+/// F12: an `Assign` through a variable that is a slice, flip or transpose view, after a `Cache`
+/// (which can evaluate a node the view's base shares with the cached array).
+fn cached_then_view_assigned(program: &Program) -> bool {
+    let created = created_counts(program);
+    let mut first = Vec::with_capacity(created.len());
+    let mut next = 0;
+    for c in &created {
+        first.push(next);
+        next += c;
+    }
+    let views: Vec<usize> = program
+        .stmts
+        .iter()
+        .enumerate()
+        .filter(|(i, stmt)| {
+            created[*i] == 1 && matches!(stmt, Stmt::View { view: ViewOp::Slice { .. } | ViewOp::Flip { .. } | ViewOp::Transpose, .. })
+        })
+        .map(|(i, _)| first[i])
+        .collect();
+    program.stmts.iter().enumerate().any(|(i, stmt)| {
+        matches!(stmt, Stmt::Cache { .. })
+            && program.stmts[i + 1..].iter().any(|later| matches!(later, Stmt::Assign { target, .. } if views.contains(target)))
+    })
 }
 
 /// F5: a view of a variable that something touched (evaluated it, wrote its base, used it as
@@ -1080,16 +1105,6 @@ fn flipped_write_then_slice_write(program: &Program) -> bool {
         let Stmt::Assign { target, path, .. } = stmt else { return false };
         path.iter().any(|v| !matches!(v, InjView::InjSlice { .. }))
             && program.stmts[i + 1..].iter().any(|later| matches!(later, Stmt::Assign { target: t, path, .. } if t == target && !path.is_empty()))
-    })
-}
-
-/// F3: a `Reduce` of a variable, and later a write into that variable.
-fn reduction_then_write(program: &Program) -> bool {
-    program.stmts.iter().enumerate().any(|(i, stmt)| {
-        let Stmt::Reduce { src, .. } = stmt else { return false };
-        program.stmts[i + 1..].iter().any(|later| {
-            matches!(later, Stmt::Assign { target, .. } | Stmt::Put { target, .. } | Stmt::Compound { target, .. } | Stmt::Write { target, .. } if target == src)
-        })
     })
 }
 

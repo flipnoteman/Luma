@@ -185,11 +185,16 @@ impl FusedKey {
 
     /// A profile label naming the operations fused into the kernel, for example
     /// `Fused(Mul, Add, Sqrt) f32` or `FusedReduce(Sum: Mul, Add) f32`. Long programs are cut
-    /// short.
+    /// short. A trailing copy (the reader a reduction keeps of its operand, the store of an
+    /// assignment) computes nothing and is not named unless it is the whole program.
     pub(crate) fn label(&self) -> String {
         const SHOWN: usize = 6;
-        let mut names: Vec<String> = self
-            .instrs
+        let copy = |instr: &Instr| matches!(instr.op.kind, OpKind::Unary(UnOp::Id));
+        let named = match self.instrs.split_last() {
+            Some((last, rest)) if copy(last) && !rest.is_empty() => rest,
+            _ => &self.instrs[..],
+        };
+        let mut names: Vec<String> = named
             .iter()
             .take(SHOWN)
             .map(|instr| match instr.op.kind {
@@ -199,8 +204,8 @@ impl FusedKey {
                 other => format!("{other:?}"),
             })
             .collect();
-        if self.instrs.len() > SHOWN {
-            names.push(format!("+{} more", self.instrs.len() - SHOWN));
+        if named.len() > SHOWN {
+            names.push(format!("+{} more", named.len() - SHOWN));
         }
         let ty = self.instrs.last().map_or("f32", |instr| instr.op.out_ty().wgsl());
         let names = names.join(", ");
