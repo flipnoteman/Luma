@@ -1004,11 +1004,6 @@ struct Known {
 }
 
 const KNOWN: &[Known] = &[
-    Known {
-        id: "F2 bind group larger than the layout (shifted expression, max_nodes 2)",
-        message: Some("Number of bindings in bind group descriptor"),
-        shape: None,
-    },
     Known { id: "F3 lazy reduction reads a later write to its operand", message: None, shape: Some(reduction_then_write) },
     Known { id: "F4 slice write after a flipped write into a lazy array is lost", message: None, shape: Some(flipped_write_then_slice_write) },
     Known { id: "F5 receiver of a write through an older view shows old data", message: None, shape: Some(view_assigned_after_base_write) },
@@ -1019,7 +1014,36 @@ const KNOWN: &[Known] = &[
         message: Some("only when run concurrently"),
         shape: None,
     },
+    Known {
+        id: "F11 slice write into a lazy generator created after another slice write is lost",
+        message: None,
+        shape: Some(range_written_after_a_slice_write),
+    },
 ];
+
+/// F11: a write through a non-empty path, then a `Range` created, then a write through a
+/// non-empty path into that `Range`.
+fn range_written_after_a_slice_write(program: &Program) -> bool {
+    let created = created_counts(program);
+    let first: Vec<usize> = created
+        .iter()
+        .scan(0, |next, c| {
+            let at = *next;
+            *next += c;
+            Some(at)
+        })
+        .collect();
+    let sliced = |stmt: &Stmt| matches!(stmt, Stmt::Assign { path, .. } if !path.is_empty());
+    program.stmts.iter().enumerate().any(|(i, stmt)| {
+        sliced(stmt)
+            && program.stmts.iter().enumerate().skip(i + 1).any(|(j, range)| {
+                matches!(range, Stmt::Range { .. })
+                    && program.stmts[j + 1..]
+                        .iter()
+                        .any(|later| matches!(later, Stmt::Assign { target, path, .. } if *target == first[j] && !path.is_empty()))
+            })
+    })
+}
 
 /// F7: a compound assignment to a variable that a later traced loop reads (captured).
 fn captured_compound_in_loop(program: &Program) -> bool {

@@ -44,10 +44,11 @@ fn integer_multiplication_by_zero_does_not_run_in_place() {
     });
 }
 
-/// Finding 2: a lazy expression read at two circular offsets by one kernel, with the fusion
-/// limit cutting the batch: the launch binds three buffers, the kernel layout has two.
+/// Finding 2: an expression read directly and through a circular shift, with the fusion limit
+/// cutting the batch: the shift of the sub-program is staged with its amount baked into the
+/// source, so the kernel never reads its uniform and has no binding for it, but the launch
+/// bound the uniform.
 #[test]
-#[ignore = "finding 2: bind group has more bindings than the kernel layout (max_nodes = 2, circular shift of an expression)"]
 fn shifted_expression_with_a_tight_node_limit_binds_too_many_buffers() {
     check(Program {
         config: Config { max_nodes: 2, ..Config::default_engine() },
@@ -234,6 +235,24 @@ fn lazy_reduction_of_an_expression_sees_a_later_write_to_its_input() {
             Alias { src: 1 },
             Reduce { src: 2, op: Min },
             Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 0, hi: 1 }, InjSlice { axis: 1, lo: 2, hi: 5 }], rhs: Const(0.25) },
+        ],
+    });
+}
+
+/// Finding 11 (found while fixing finding 2, independent of it): a lazy `Range` of `u32`
+/// created after a slice write into a lazy expression loses its own slice write.
+#[test]
+#[ignore = "finding 11: a slice write into a lazy generator created after another lazy slice write is lost"]
+fn slice_write_into_a_range_created_after_another_slice_write_is_lost() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [7, 5, 1, 1], ty: F32, seed: 0 },
+            Unary { src: 0, op: Neg },
+            Assign { target: 1, path: vec![InjSlice { axis: 1, lo: 1, hi: 2 }], rhs: Const(-1.0) },
+            Range { dims: [7, 5, 1, 1], axis: 1, ty: U32 },
+            Assign { target: 2, path: vec![InjSlice { axis: 1, lo: 3, hi: 4 }], rhs: Const(0.0) },
         ],
     });
 }

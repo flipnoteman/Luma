@@ -198,6 +198,9 @@ All notable changes to Luma are listed here. The format follows
 - `x -= &x` with fast math and `x *= 0` on integers failed with "in-place assignment cannot run in
   place": simplification removed the read of the target, and the compound assignment now runs as
   a plain store into it.
+- A kernel whose only scalars are the amounts of circular shifts of a lazy expression
+  (`n + n.shift(-4)` with the fusion limit cutting the expression) failed with a bind group larger
+  than its layout: the staged kernel bakes the amounts in, so it has no uniform to bind.
 
 ## [0.2.0] - 2026-11-11
 

@@ -648,7 +648,8 @@ pub(super) fn params<'a>(
 ) -> Result<Cow<'a, [u32]>, LumaError> {
     let based = ids.is_none() && super::codegen::generates(key);
     if ids.is_none() && n.is_none() && !based {
-        return Ok(Cow::Borrowed(scalars));
+        // A kernel that bakes the scalars in has no binding for the uniform (see `reads_scalars`).
+        return Ok(Cow::Borrowed(if super::codegen::reads_scalars(key) { scalars } else { &[] }));
     }
     let mut words = Vec::with_capacity(scalars.len() + 3);
     words.extend(n);

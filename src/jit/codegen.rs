@@ -358,6 +358,23 @@ pub(super) fn direct(instrs: &[Instr], k: u32) -> bool {
     })
 }
 
+/// Whether the kernel for `key` reads a scalar from the uniform `p`. A tiled kernel (see
+/// [`Tile`]) bakes the amount of a shift of a sub-program into its source, so without another
+/// scalar the uniform stays unused: the kernel has no binding for it (only the globals an entry
+/// point uses count) and the launch must not bind it. The generated source and the launch code
+/// ([`super::launch::params`]) both decide by this rule. The guard (read by the arithmetic
+/// library, see [`library_for`]) is a scalar that no instruction names.
+pub(super) fn reads_scalars(key: &FusedKey) -> bool {
+    let programs = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice));
+    key.guard.is_some()
+        || programs.enumerate().any(|(p, instrs)| {
+            instrs.iter().enumerate().any(|(at, instr)| {
+                let baked = key.tile.as_ref().is_some_and(|tile| tile.offsets.get(p).and_then(|row| row.get(at)).is_some_and(Option::is_some));
+                !baked && instr.args.iter().any(|arg| matches!(arg, Ref::Scalar(_)))
+            })
+        })
+}
+
 /// The WGSL source of the kernel for `key`, with the workgroup shapes `tuning` gives.
 /// `segment_len` (a power of two) is the elements per segment of the arrays the segmented
 /// variant (`key.spans` not empty) runs on. `lowered` is the lowering of `key` (see
@@ -376,7 +393,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     let segmented = !key.spans.is_empty();
     let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
     let based = generates(key) && !segmented;
-    let uniform = reduce || !key.scalar_tys.is_empty() || segmented || based;
+    let uniform = reduce || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
     let mut src = String::new();
 
     if uniform {
