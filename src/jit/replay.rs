@@ -209,7 +209,7 @@ impl Trace {
     /// operand's buffer.
     pub(crate) fn start<T: GpuType>(init: &[&Array<T>]) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
         let ctx = init[0].context().clone();
-        ctx.jit().evaluate_live();
+        ctx.jit().evaluate_held();
         let mut storages = Vec::with_capacity(init.len());
         let mut probes = Vec::with_capacity(init.len());
         let mut probe_storages = Vec::with_capacity(init.len());

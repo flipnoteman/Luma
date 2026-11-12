@@ -307,3 +307,32 @@ fn view_of_a_view_recorded_before_a_transposed_write_keeps_the_old_data() {
         ],
     });
 }
+
+/// Finding 8 (found by `fuzz::threads`: wrong values, and `inf`, only when programs ran at once): the
+/// last step of an `eval` loop is postponed while another thread keeps the GPU busy, and the
+/// expression after it (`copysign`) computes that step inside its own kernel. The array of the
+/// loop is then still lazy when `iterate_until_all` traces its step, which reads it: the recording
+/// evaluated it in place over its operand's buffer and every replayed step squared it again. Run by
+/// itself the program never fails, so two copies run at once, many times.
+#[test]
+fn a_lazy_array_fused_into_another_kernel_is_not_evaluated_by_a_traced_loop() {
+    let program = Program {
+        config: Config::default_engine(),
+        math: true,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: U32, seed: 4036467767672712798 },
+            Input { dims: [7, 5, 1, 1], ty: F32, seed: 1466409304873250584 },
+            Compound { target: 1, op: Sub, rhs: Const(-1.0) },
+            Loop { kind: PerStepEval, steps: 3, states: vec![1], body: vec![Scan { src: 0, axis: 0, op: ScanMax }, Binary { lhs: Var(2), rhs: Var(2), op: Mul }, Binary { lhs: Var(4), rhs: Const(3.0), op: Maximum }], next: vec![5] },
+            Binary { lhs: Var(2), rhs: Const(0.5), op: Copysign },
+            Loop { kind: IterateUntilAll, steps: 10, states: vec![1], body: vec![View { src: 2, view: ShiftFill { offs: vec![-1, -2], value: 0.25 } }, Assign { target: 5, path: vec![], rhs: Var(3) }, View { src: 0, view: Take { idx: 0 } }, Alias { src: 6 }, Range { dims: [9, 6, 1, 1], axis: 0, ty: F32 }], next: vec![5] },
+        ],
+    };
+    check(program.clone());
+    let ctx = crate::default_context().unwrap();
+    let programs = [program.clone(), program];
+    for round in 0..60 {
+        let failures = super::run_concurrently(&ctx, &programs);
+        assert!(failures.is_empty(), "round {round}: {failures:?}");
+    }
+}

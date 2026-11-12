@@ -215,6 +215,12 @@ All notable changes to Luma are listed here. The format follows
   all been dropped (a temporary `r.flip(0)` that was assigned through).
 - A view taken from an array that was a view evaluated before a write into its base read the
   written base instead of the evaluated array (the old data it was recorded against).
+- `iterate`, `iterate_all` and `iterate_until_all` could still corrupt an array created before the
+  loop when threads shared a context (wrong values, `inf`). An array that had only been computed
+  inside the kernel of another one (the last step of an `eval` loop that a busy GPU postponed,
+  then read by the next expression) was left lazy when the loop was traced, and the recording
+  evaluated it in place over its operand's buffer, so that every replayed step overwrote it
+  again. Tracing now evaluates every array the thread holds first.
 
 ## [0.2.0] - 2026-11-11
 

@@ -2566,3 +2566,36 @@ fn lazy_arrays_captured_by_a_traced_loop_are_not_replayed_with_it() {
     assert_eq!(z.to_vec().unwrap(), host(&|v| v * -2.0));
     r.to_vec().unwrap();
 }
+
+/// An array that was only computed inside the kernel of another array (here `n`, inside the
+/// kernel of `held`) is still lazy, and its operand's buffer is only held by it: a traced loop that
+/// reads `n` must not evaluate it inside the recording, where its kernel would take over that
+/// buffer and be replayed at every step (`n` would be squared again at every step).
+#[test]
+fn an_array_computed_inside_another_arrays_kernel_is_evaluated_before_a_traced_loop() {
+    let ctx = ctx();
+    let xs: Vec<f32> = (0..12).map(|i| i as f32 / 8.0 + 0.25).collect();
+    let x = Array::<f32>::from_slice_on(&ctx, &xs, 12).unwrap();
+    let mid = (&x * 2.0).maximum(1.0);
+    mid.to_vec().unwrap(); // evaluated: its buffer is held by `mid` only
+    let n = &mid * &mid + 1.0;
+    drop(mid); // now `n` is the only holder of that buffer
+    let held = &n + 1.0;
+    let s = Array::<f32>::from_slice_on(&ctx, &xs, 12).unwrap();
+    let [r] = crate::iterate_all([&s], 3, |s| [s[0].cumsum(0) + n.cumsum(0)]);
+
+    let host_n: Vec<f32> = xs.iter().map(|&v| (v * 2.0).max(1.0)).map(|m| m * m + 1.0).collect();
+    let cumsum = |v: &[f32]| -> Vec<f32> { v.iter().scan(0.0f32, |acc, &e| { *acc += e; Some(*acc) }).collect() };
+    let mut host_r = xs.clone();
+    for _ in 0..3 {
+        host_r = cumsum(&host_r).iter().zip(cumsum(&host_n)).map(|(a, b)| a + b).collect();
+    }
+    let close = |got: Vec<f32>, want: &[f32]| {
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "{got:?} != {want:?}");
+        }
+    };
+    close(held.to_vec().unwrap(), &host_n.iter().map(|v| v + 1.0).collect::<Vec<_>>());
+    close(n.to_vec().unwrap(), &host_n);
+    close(r.to_vec().unwrap(), &host_r);
+}
