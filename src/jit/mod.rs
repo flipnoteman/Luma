@@ -53,9 +53,16 @@
 //! a solely owned array) reuses that buffer instead of allocating one, as long as the input is
 //! read only at the element being written (not through a shift). Compound assignment on an array
 //! whose buffer is shared is such a kernel too, forced onto the shared buffer.
+//!
+//! # Loops
+//!
+//! `eval` calls that advance the same arrays through the same step are a loop: the arrays of
+//! the newest call become *loop leaves* that stand for the step applied to the previous ones, so
+//! the pending graph stays one step deep and the postponed steps run at once (see [`looped`]).
 
 mod codegen;
 mod launch;
+mod looped;
 mod program;
 mod readers;
 mod stencil;
@@ -75,6 +82,8 @@ use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
+
+use looped::LoopPlan;
 
 pub(crate) use launch::{evaluate, evaluate_group, evaluate_into, reduce_first_pass, run_loop};
 pub(crate) use readers::Readers;
@@ -290,6 +299,10 @@ pub(crate) struct Node {
     readers: Readers,
     /// Whether the node is in [`JitState::requested`].
     requested: AtomicBool,
+    /// Set when the node was found to be a state of a repeating step (see [`looped`]): its value
+    /// is output `j` of the plan, which runs all the steps at once, and the node released its
+    /// own operands.
+    looped: OnceLock<(Arc<LoopPlan>, u32)>,
 }
 
 impl std::fmt::Debug for Node {
@@ -305,17 +318,29 @@ impl std::fmt::Debug for Node {
 impl Node {
     /// Operations in the expression behind this node, itself included.
     fn size(&self) -> usize {
-        self.below_len + 1
+        if self.looped.get().is_some() { 1 } else { self.below_len + 1 }
     }
 
     /// Ids of the distinct nodes in the expression below this one, sorted.
     fn below(&self) -> &[u64] {
+        if self.looped.get().is_some() {
+            return &[];
+        }
         self.ids.get(..self.below_len).unwrap_or(&[])
     }
 
     /// Ids of the distinct buffers the expression reads, sorted.
     fn inputs(&self) -> &[u64] {
-        self.ids.get(self.below_len..).unwrap_or(&[])
+        match self.looped.get() {
+            Some((plan, _)) => &plan.input_ids,
+            None => self.ids.get(self.below_len..).unwrap_or(&[]),
+        }
+    }
+
+    /// Whether the expression reads a shifted lazy expression (see [`recompute_shifted`]). The
+    /// plan of a loop leaf evaluates its inputs, so it reads none.
+    fn recomputes(&self) -> bool {
+        self.recomputes && self.looped.get().is_none()
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -356,12 +381,14 @@ impl Node {
     fn compute(self: &Arc<Self>) -> NodeResult {
         let args = lock(&self.args).take();
         let outcome = match args {
-            Some(args) => evaluate(self, args),
-            None => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
+            Some(args) => evaluate(self, args).map(Arc::new),
+            None => match self.looped.get() {
+                Some((plan, j)) => plan.output(&self.ctx, *j, self.name, self.location),
+                None => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
+            },
         };
         match outcome {
             Ok(storage) => {
-                let storage = Arc::new(storage);
                 storage.readers.absorb(&self.readers);
                 Ok(storage)
             }
@@ -481,7 +508,7 @@ thread_local! {
 /// [`measured_ids`].
 fn measure(args: &[Src]) -> (usize, usize) {
     if let Some(node) = only_node(args) {
-        return (node.below_len + 1, node.inputs().len());
+        return (node.size(), node.inputs().len());
     }
     MEASURED.with_borrow_mut(|m| {
         let Measured { below, inputs, tmp } = m;
@@ -640,7 +667,7 @@ pub(crate) fn create(
         let _ = ctx.submit();
     }
     let recomputes = args.iter().take(arity).enumerate().any(|(i, arg)| match arg {
-        Src::Node(operand) => operand.recomputes || (i == 0 && matches!(op.kind, OpKind::Shift(_))),
+        Src::Node(operand) => operand.recomputes() || (i == 0 && matches!(op.kind, OpKind::Shift(_))),
         _ => false,
     });
 
@@ -660,6 +687,7 @@ pub(crate) fn create(
         recomputes,
         readers: Readers::default(),
         requested: AtomicBool::new(false),
+        looped: OnceLock::new(),
     });
 
     for (i, arg) in args.iter().enumerate().take(arity) {
@@ -691,7 +719,7 @@ pub(crate) fn recompute_shifted(node: &Node) -> bool {
     // A recomputed expression runs inside kernels of segmented programs only if it fits one
     // segment, so segmented programs have no sub-programs.
     node.size() <= node.context().tuning().max_recomputed
-        && !node.recomputes
+        && !node.recomputes()
         && node.len() as u64 * 4 <= node.context().segment_bytes()
 }
 
@@ -712,6 +740,8 @@ pub(crate) struct JitState {
     /// Most element-instructions per launch of a register loop, see [`launch::run_loop`].
     loop_work: AtomicU64,
     stats: Stats,
+    /// Follows consecutive `eval` calls to find loops (see [`looped`]).
+    tracker: Mutex<looped::Tracker>,
 }
 
 /// Counters of the fusion machinery, read by tests.
@@ -757,6 +787,7 @@ impl JitState {
             max_inputs,
             loop_work: AtomicU64::new(launch::LOOP_WORK_PER_LAUNCH),
             stats: Stats::default(),
+            tracker: Mutex::new(looped::Tracker::default()),
         }
     }
 
@@ -934,6 +965,7 @@ impl JitState {
             return Ok(Arc::clone(core));
         }
         let core = Arc::new(kernel::build_core(ctx, &KernelKey::new(source.clone(), "main", None), Some(label), true)?);
+        self.stats.built.fetch_add(1, Ordering::Relaxed);
         cache.insert(source, Arc::clone(&core));
         Ok(core)
     }
