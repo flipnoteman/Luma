@@ -430,3 +430,71 @@ fn lazy_array_fused_into_the_loop_state_is_replayed_with_the_traced_step() {
         ],
     });
 }
+
+/// Finding 18 (GPU fuzz seed 1002): `s = select(c, 5, c)` is a lazy array, `a = s.clone()`, a
+/// lazy slice write into `s` replaces the expression both denote, and the expression is
+/// evaluated; then `s %= 3`. `sole_owner` counted the references of the replacing node (one,
+/// held by the link the arrays share) instead of the claims of the arrays, so `s` was rebound
+/// to a new expression instead of changing the shared buffer and the clone kept the old data
+/// (`a[1]` is `5`, not `2`).
+#[test]
+fn clone_of_a_lazy_array_misses_a_compound_assignment_after_a_lazy_slice_write() {
+    check(Program {
+        config: Config {
+            max_nodes: 2,
+            max_inlined: None,
+            max_live: None,
+            max_inputs: None,
+            assume_busy: false,
+            speculate: true,
+            simplify: true,
+            staging: false,
+            fast_math: false,
+            chunk_bytes: None,
+            memory_budget: None,
+            cost: Test,
+        },
+        math: true,
+        stmts: vec![
+            Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
+            View { src: 0, view: Concat { axis: 1, others: vec![0, 0] } },
+            Select { mask: 1, a: Const(5.0), b: Var(1), ty: U32 },
+            Alias { src: 2 },
+            Assign { target: 2, path: vec![InjSlice { axis: 1, lo: 6, hi: 13 }], rhs: Const(3.0) },
+            Compound { target: 2, op: Rem, rhs: Const(3.0) },
+        ],
+    });
+}
+
+/// Finding 19 (`LUMA_DEVICE=cpu`, seeds 2001 and 2003): `m = minimum(x, x)` simplifies to a copy
+/// of `x`, and the store of `x.flip(0).assign(&m)`, `Id(m)`, was simplified to `Id(x)` too
+/// (`Id(Id(x))`), so the write no longer saw the pending copy `m` that reads the target and
+/// had it evaluated first: it read the buffer it overwrites at other elements (`x[0]` is `0.5`,
+/// not the old `x[299]`). Only an execution order that lets a write overtake a read shows it
+/// (llvmpipe); `simplify: false` always passed.
+#[test]
+fn flipped_assign_of_a_simplified_self_minimum_reads_overwritten_data() {
+    check(Program {
+        config: Config::default_engine(),
+        math: true,
+        stmts: vec![
+            Input { dims: [300, 1, 1, 1], ty: F32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Var(0), op: Minimum },
+            Assign { target: 0, path: vec![InjFlip { axis: 0 }], rhs: Var(1) },
+        ],
+    });
+}
+
+/// Finding 19, second form: a `Df32` square, written through a transpose.
+#[test]
+fn transposed_assign_of_a_simplified_self_maximum_reads_overwritten_data() {
+    check(Program {
+        config: Config::default_engine(),
+        math: true,
+        stmts: vec![
+            Input { dims: [8, 8, 1, 1], ty: Df32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Var(0), op: Maximum },
+            Assign { target: 0, path: vec![InjTranspose], rhs: Var(1) },
+        ],
+    });
+}

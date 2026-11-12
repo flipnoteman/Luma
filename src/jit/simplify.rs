@@ -7,6 +7,11 @@
 //! A rewrite never returns an existing node: an identity becomes a `Unary(Id)` of the surviving
 //! operand and a constant a `Unary(Id)` of a scalar, because a node an array holds must not
 //! become a second array's node (see [`Held`](super::Held)).
+//!
+//! A `Unary(Id)` is never folded into the operation it reads (`Id(Id(x))` stays): the stores of
+//! `assign` and the readers of reductions are `Id` nodes whose edge to the expression they copy
+//! is what the hazard analysis walks, and a copy that read `x` directly would not see that the
+//! expression below it has to be evaluated before the write.
 
 use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Scalar, Src, UnOp};
 
@@ -138,7 +143,7 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
             let (iop, iargs) = inner(a)?;
             let OpKind::Unary(inner_un) = iop.kind else { return None };
             match (un, inner_un) {
-                (UnOp::Neg, UnOp::Neg) | (UnOp::Id, UnOp::Id) => identity(op, &iargs[0]),
+                (UnOp::Neg, UnOp::Neg) => identity(op, &iargs[0]),
                 (UnOp::Abs, UnOp::Abs | UnOp::Neg) => unary(UnOp::Abs, ty, &iargs[0]),
                 (UnOp::Floor, UnOp::Floor | UnOp::Ceil) | (UnOp::Ceil, UnOp::Ceil | UnOp::Floor) => {
                     unary(inner_un, ty, &iargs[0])
