@@ -2151,8 +2151,22 @@ impl JitState {
     }
 
     /// Computes the lazy arrays this thread created that are still alive (see
-    /// [`JitState::evaluate_requested`] for the other threads').
+    /// [`JitState::evaluate_requested`] for the other threads'). The ones whose value was only
+    /// computed inside the kernel of another array stay lazy: they are usually temporaries.
     pub(crate) fn evaluate_live(&self) {
+        self.evaluate_swept(false);
+    }
+
+    /// [`JitState::evaluate_live`], and also the arrays of this thread that were only computed
+    /// inside another array's kernel: afterwards no array this thread holds is lazy. A traced loop
+    /// needs that (see `Trace::start`): a lazy array it reads would be evaluated by the recording.
+    pub(crate) fn evaluate_held(&self) {
+        self.evaluate_swept(true);
+    }
+
+    /// The sweep of [`JitState::evaluate_live`]; `held` also computes the arrays that were
+    /// fused into the kernel of another one.
+    fn evaluate_swept(&self, held: bool) {
         let me = current_thread();
         let nodes = self.live.take_if(|node| node.thread == me);
         let mut pending: Vec<Arc<Node>> = nodes.into_iter().rev().filter_map(|weak| weak.upgrade()).collect();
@@ -2162,8 +2176,10 @@ impl JitState {
             let mut group: Vec<Arc<Node>> = Vec::new();
             let (mut inputs, mut below) = (Vec::new(), Vec::new());
             for node in same {
-                // Computed inside a kernel of an earlier group.
-                if !node.is_pending() || node.fused.load(Ordering::Relaxed) {
+                // Computed inside a kernel of an earlier group (the value of an array is wanted
+                // all the same when `held`).
+                let kept = held && node.handles.load(Ordering::Relaxed) > 0;
+                if !node.is_pending() || (node.fused.load(Ordering::Relaxed) && !kept) {
                     continue;
                 }
                 // Part of an expression of the group: it is computed inside that kernel and only

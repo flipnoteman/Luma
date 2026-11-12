@@ -321,3 +321,34 @@ fn iterate_all_of_lazily_assigned_steps_on_a_shared_context() {
         assert_close(&u.to_vec().unwrap(), &w, 1e-4, 1e-5);
     });
 }
+
+/// A step of an `eval` loop that is requested while another thread keeps the GPU busy stays lazy,
+/// and the expression that follows it (`held`) computes it inside its own kernel: the array `s` is
+/// then lazy, with a buffer it solely owns. A traced loop that reads `s` must find it computed: the
+/// recording once evaluated it in place over that buffer, and the replays applied the last step of
+/// the `eval` loop again at every step (it needs two threads, one of them busy, to happen).
+#[test]
+fn a_lazy_array_read_by_a_traced_loop_after_an_eval_loop_on_a_shared_context() {
+    let ctx = default_context().unwrap();
+    together(4, 40, |t, round| {
+        let x0 = data(t, round);
+        let mut s = on(&ctx, &x0);
+        let mut w = x0;
+        for _ in 0..3 {
+            s = &s * 1.5 + 0.25;
+            s.eval().unwrap();
+            w = w.iter().map(|v| v * 1.5 + 0.25).collect();
+        }
+        let held = &s + 1.0;
+        let u0 = data(t + 100, round);
+        let [u] = iterate_all([&on(&ctx, &u0)], 5, |[u]| [u.cumsum(0) * 0.01 + s.cumsum(0)]);
+        let cumsum = |v: &[f32]| -> Vec<f32> { v.iter().scan(0.0f32, |acc, &e| { *acc += e; Some(*acc) }).collect() };
+        let mut wu = u0;
+        for _ in 0..5 {
+            wu = cumsum(&wu).iter().zip(cumsum(&w)).map(|(a, b)| a * 0.01 + b).collect();
+        }
+        assert_close(&held.to_vec().unwrap(), &w.iter().map(|v| v + 1.0).collect::<Vec<_>>(), 1e-4, 1e-5);
+        assert_close(&s.to_vec().unwrap(), &w, 1e-4, 1e-5);
+        assert_close(&u.to_vec().unwrap(), &wu, 1e-3, 1e-4);
+    });
+}

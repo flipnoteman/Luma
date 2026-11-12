@@ -221,6 +221,12 @@ All notable changes to Luma are listed here. The format follows
 - A write through a view of a lazy expression left the view showing the old data when the view
   had been evaluated before the write (by `eval`, or by `cache` of an array that shares work with
   it); it now shows the written data.
+- `iterate`, `iterate_all` and `iterate_until_all` could still corrupt an array created before the
+  loop when threads shared a context (wrong values, `inf`). An array that had only been computed
+  inside the kernel of another one (the last step of an `eval` loop that a busy GPU postponed,
+  then read by the next expression) was left lazy when the loop was traced, and the recording
+  evaluated it in place over its operand's buffer, so that every replayed step overwrote it
+  again. Tracing now evaluates every array the thread holds first.
 
 ## [0.2.0] - 2026-11-11
 

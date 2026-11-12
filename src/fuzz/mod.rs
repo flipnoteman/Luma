@@ -1004,11 +1004,7 @@ struct Known {
 }
 
 const KNOWN: &[Known] = &[
-    Known {
-        id: "F8 wrong value only when programs run concurrently on one context (unminimized; masks other concurrency failures)",
-        message: Some("only when run concurrently"),
-        shape: None,
-    },
+
 ];
 
 /// Programs that failed in a way listed in [`KNOWN`], by finding.
@@ -1204,38 +1200,58 @@ fn programs() {
     drive("proptest-regressions/fuzz_programs.txt", generator::programs(), describe, |program| run_random(&program));
 }
 
+/// Runs each of `programs` (under the default engine configuration) on its own thread, all on
+/// `ctx`, and returns the failure of every one that failed (a panic is a failure).
+fn run_concurrently(ctx: &Context, programs: &[Program]) -> Vec<(usize, String)> {
+    let outcomes: Vec<Result<(), String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = programs
+            .iter()
+            .map(|program| {
+                let ctx = ctx.clone();
+                scope.spawn(move || {
+                    let mut program = program.clone();
+                    program.config = Config::default_engine();
+                    run_on(ctx, &program, Filter::Messages)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("a thread panicked".into()))).collect()
+    });
+    outcomes.into_iter().enumerate().filter_map(|(k, outcome)| outcome.err().map(|failure| (k, failure))).collect()
+}
+
+/// Whether `program` fails when it runs by itself on `ctx` (a panic counts as failing).
+fn fails_alone(ctx: &Context, program: &Program) -> bool {
+    let mut program = program.clone();
+    program.config = Config::default_engine();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_on(ctx.clone(), &program, Filter::Off)));
+    std::panic::set_hook(hook);
+    !matches!(outcome, Ok(Ok(())))
+}
+
 /// Four programs at once on four threads sharing the default context, each against its own
-/// oracle; the engine runs with its defaults. Run it with `--ignored` (finding F8: a wrong
-/// value, and in a later run a program that does not finish, only under concurrency).
+/// oracle; the engine runs with its defaults. Only what the concurrency changes fails here: a
+/// program that fails in the concurrent run is run again by itself on the same context, and if
+/// it fails then too it is a failure of `programs` (counted, not reported).
 #[test]
-#[ignore = "F8: wrong values / a hang when programs run concurrently; see fuzz-findings.md"]
 fn threads() {
     let set = (generator::programs(), generator::programs(), generator::programs(), generator::programs());
     drive("proptest-regressions/fuzz_threads.txt", set, |set| format!("{set:?}"), |set| {
         let ctx = crate::default_context().map_err(|e| e.to_string())?;
         let programs = [set.0, set.1, set.2, set.3];
-        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = programs
-                .iter()
-                .map(|program| {
-                    let ctx = ctx.clone();
-                    scope.spawn(move || {
-                        let mut program = program.clone();
-                        program.config = Config::default_engine();
-                        match run_on(ctx, &program, Filter::Messages) {
-                            Ok(()) => Ok(()),
-                            // Fails alone too: a known failure or a new one. Otherwise only the concurrency does it.
-                            Err(failure) if run_filtered(&program, Filter::Off).is_err() => run_random(&program).map_err(|_| failure),
-                            Err(failure) => Err(format!("only when run concurrently: {failure}")),
-                        }
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("a thread panicked".into()))).collect()
-        });
-        results.into_iter().collect()
+        for (k, failure) in run_concurrently(&ctx, &programs) {
+            if fails_alone(&ctx, &programs[k]) {
+                note_known("fails alone too (reported by fuzz::programs)");
+            } else {
+                return Err(format!("only when run concurrently: {failure}"));
+            }
+        }
+        Ok(())
     });
 }
+
 /// The generator produces every kind of statement, loops of every kind, both domains and
 /// invalid statements; and the programs mostly run to the end.
 #[test]
