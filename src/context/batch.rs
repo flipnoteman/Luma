@@ -20,6 +20,12 @@ use super::{lock, Context};
 /// 16 10.7 / 168.4, 32 10.6 / 168.2 (without holding: 15.3 / 175). 16 is within 2% of the best.
 pub(super) const SUBMIT_HOLD: u32 = 16;
 
+/// Whether `eval` leaves its request pending: the GPU has work to do anyway, the batch is small
+/// and postponed arrays don't keep memory the budget is short of.
+pub(super) fn postpone(busy: bool, dispatches: u32, pressure: bool) -> bool {
+    busy && dispatches < SUBMIT_HOLD && !pressure
+}
+
 /// Number of dispatches after which the pending batch is submitted without waiting for a sync
 /// point. Bounds how much work piles up in one command buffer.
 pub(super) const BATCH_LIMIT: u32 = 256;
@@ -192,9 +198,10 @@ impl Context {
 
     /// Like [`Context::submit`], but first computes what `eval` requested. While the GPU is busy
     /// that is postponed too, so requested arrays the program drops in the meantime are never
-    /// computed and the steps between two submissions fuse.
+    /// computed and the steps between two submissions fuse. Postponing stops once resident data
+    /// reaches three quarters of the memory budget.
     pub(crate) fn submit_requested(&self) -> Result<()> {
-        if self.gpu_busy() && self.batch()?.dispatches < SUBMIT_HOLD {
+        if postpone(self.gpu_busy(), self.batch()?.dispatches, self.pager().under_pressure()) {
             return Ok(());
         }
         self.jit().evaluate_requested();
