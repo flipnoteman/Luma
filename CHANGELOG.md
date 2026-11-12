@@ -195,6 +195,9 @@ All notable changes to Luma are listed here. The format follows
 - wgpu's validation of indirect dispatches (an extra dispatch before every step of
   `iterate_until`/`iterate_until_all`) is off: the dispatch arguments are always written by the
   library's own gate kernels.
+- A kernel whose only scalars are the amounts of circular shifts of a lazy expression
+  (`n + n.shift(-4)` with the fusion limit cutting the expression) failed with a bind group larger
+  than its layout: the staged kernel bakes the amounts in, so it has no uniform to bind.
 
 ## [0.2.0] - 2026-11-11
 
