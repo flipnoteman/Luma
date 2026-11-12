@@ -58,10 +58,11 @@ fn same(a: &Src, b: &Src) -> bool {
     }
 }
 
-/// The operation and operands of a pending, not yet evaluated node operand.
-fn inner(src: &Src) -> Option<(Op, Args)> {
+/// The operation and operands of a pending, not yet evaluated node operand whose operation
+/// `wanted` accepts (the operands are only copied then, which takes the node's lock).
+fn inner(src: &Src, wanted: fn(Op) -> bool) -> Option<(Op, Args)> {
     let Src::Node(node) = src else { return None };
-    if !node.is_pending() || is_looped(node) {
+    if !wanted(node.op()) || !node.is_pending() || is_looped(node) {
         return None;
     }
     node.operands().map(|args| (node.op(), args))
@@ -140,7 +141,10 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
             }
         }
         OpKind::Unary(un) => {
-            let (iop, iargs) = inner(a)?;
+            if !matches!(un, UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Sign) {
+                return None;
+            }
+            let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Unary(_)))?;
             let OpKind::Unary(inner_un) = iop.kind else { return None };
             match (un, inner_un) {
                 (UnOp::Neg, UnOp::Neg) => identity(op, &iargs[0]),
@@ -163,7 +167,7 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
         }
         OpKind::Compare(CmpOp::Lt | CmpOp::Gt) if same(a, b) => constant(op, 0.0),
         OpKind::Cast(ElemTy::F32) if matches!(ty, ElemTy::F64 | ElemTy::Df32) => {
-            let (iop, iargs) = inner(a)?;
+            let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Cast(_)))?;
             match iop.kind {
                 OpKind::Cast(through) if through == ty && iop.ty == ElemTy::F32 => {
                     identity(op, &iargs[0])
@@ -243,7 +247,7 @@ fn reassociate(op: Op, args: &Args) -> Option<(Op, Args)> {
         BinOp::Sub => (a, scalar(b)?),
         _ => return None,
     };
-    let (iop, iargs) = inner(operand)?;
+    let (iop, iargs) = inner(operand, |inside| matches!(inside.kind, OpKind::Binary(_)))?;
     let OpKind::Binary(inside) = iop.kind else { return None };
     if iop.ty != ty {
         return None;

@@ -618,11 +618,12 @@ pub(crate) struct Node {
     /// Unique per node.
     id: u64,
     /// The ids of the distinct nodes in the expression below this one (`below_len` of them) as a
-    /// bit set over `below_base..` (`below_words` words), or a sorted list of `below_words` ids
-    /// if they are spread too widely for that (`below_sparse`); followed by the ids of the
-    /// distinct buffers the expression reads, sorted. Upper bounds once parts of the expression
-    /// have been evaluated (`create` counts the buffers exactly by walking the expression
-    /// whenever the bound is over the device's limit). One allocation for both.
+    /// bit set over `below_base..` (`below_words` words), or sorted `(word, bits)` pairs (bit
+    /// `id & 63` of the entry for word `id >> 6`) if they are spread too widely for that
+    /// (`below_sparse`, `below_words` numbers); followed by the ids of the distinct buffers the
+    /// expression reads, sorted. Upper bounds once parts of the expression have been evaluated
+    /// (`create` counts the buffers exactly by walking the expression whenever the bound is over
+    /// the device's limit). One allocation for both.
     ids: Box<[u64]>,
     below_len: usize,
     /// The id that bit 0 of the first word stands for (a multiple of 64).
@@ -801,7 +802,7 @@ impl Node {
     fn below_span(&self) -> Option<(u64, u64)> {
         let part = self.below_part();
         if self.below_sparse {
-            return Some((*part.first()?, *part.last()?));
+            return Some((*part.first()? * 64, *part.get(part.len().checked_sub(2)?)? * 64 + 63));
         }
         (!part.is_empty()).then(|| (self.below_base, self.below_base + 64 * part.len() as u64 - 1))
     }
@@ -810,7 +811,10 @@ impl Node {
     pub(crate) fn below_contains(&self, id: u64) -> bool {
         let part = self.below_part();
         if self.below_sparse {
-            return part.binary_search(&id).is_ok();
+            let word = id >> 6;
+            let pairs = part.as_chunks::<2>().0;
+            let at = pairs.partition_point(|&[w, _]| w < word);
+            return pairs.get(at).is_some_and(|&[w, bits]| w == word && bits >> (id & 63) & 1 == 1);
         }
         let Some(offset) = id.checked_sub(self.below_base) else { return false };
         part.get((offset >> 6) as usize).is_some_and(|word| word >> (offset & 63) & 1 == 1)
@@ -820,7 +824,15 @@ impl Node {
     fn below_any(&self, mut f: impl FnMut(u64) -> bool) -> bool {
         let part = self.below_part();
         if self.below_sparse {
-            return part.iter().any(|&id| f(id));
+            for &[word, mut bits] in part.as_chunks::<2>().0 {
+                while bits != 0 {
+                    if f(word * 64 + u64::from(bits.trailing_zeros())) {
+                        return true;
+                    }
+                    bits &= bits - 1;
+                }
+            }
+            return false;
         }
         for (k, &word) in part.iter().enumerate() {
             let (mut bits, first) = (word, self.below_base + 64 * k as u64);
@@ -848,8 +860,10 @@ impl Node {
     fn mark_below(&self, set: &mut [u64], base: u64) {
         let part = self.below_part();
         if self.below_sparse {
-            for &id in part {
-                mark(set, base, id);
+            for &[word, bits] in part.as_chunks::<2>().0 {
+                if let Some(slot) = set.get_mut((word - (base >> 6)) as usize) {
+                    *slot |= bits;
+                }
             }
             return;
         }
@@ -1029,6 +1043,14 @@ fn union_into(ids: &mut Vec<u64>, tmp: &mut Vec<u64>, other: &[u64]) {
         ids.extend_from_slice(other);
         return;
     }
+    // Operands of one expression mostly read the same buffers, or a few more.
+    if ids.as_slice() == other {
+        return;
+    }
+    if let [id] = other {
+        insert_sorted(ids, *id);
+        return;
+    }
     if ids.first().is_some_and(|&bottom| bottom > last) {
         tmp.clear();
         tmp.extend_from_slice(other);
@@ -1069,6 +1091,72 @@ fn mark(set: &mut [u64], base: u64, id: u64) {
     }
 }
 
+/// Adds `id` to a set of ids kept as sorted `(word, bits)` pairs: bit `id & 63` of the entry for
+/// word `id >> 6`.
+fn add_id(set: &mut Vec<u64>, id: u64) {
+    let (word, bit) = (id >> 6, 1u64 << (id & 63));
+    // Ids are made in ascending order: the newest usually goes last.
+    match set.len().checked_sub(2).and_then(|last| Some((last, *set.get(last)?))) {
+        None => return set.extend([word, bit]),
+        Some((_, top)) if top < word => return set.extend([word, bit]),
+        Some((last, top)) if top == word => {
+            if let Some(bits) = set.get_mut(last + 1) {
+                *bits |= bit;
+            }
+            return;
+        }
+        Some(_) => {}
+    }
+    let at = set.as_chunks::<2>().0.partition_point(|&[w, _]| w < word);
+    match set.get_mut(2 * at..2 * at + 2) {
+        Some([w, bits]) if *w == word => *bits |= bit,
+        _ => {
+            set.splice(2 * at..2 * at, [word, bit]);
+        }
+    }
+}
+
+/// Merges the set `other` into `set` (both sorted `(word, bits)` pairs), through `tmp`.
+fn merge_sets(set: &mut Vec<u64>, tmp: &mut Vec<u64>, other: &[u64]) {
+    let (Some(&first), Some(&last)) = (other.first(), other.get(other.len().wrapping_sub(2))) else { return };
+    // Operands are mostly nested or disjoint: nothing to interleave.
+    match set.get(set.len().wrapping_sub(2)) {
+        None => return set.extend_from_slice(other),
+        Some(&top) if top < first => return set.extend_from_slice(other),
+        Some(_) => {}
+    }
+    if set.first().is_some_and(|&bottom| bottom > last) {
+        tmp.clear();
+        tmp.extend_from_slice(other);
+        tmp.extend_from_slice(set);
+        std::mem::swap(set, tmp);
+        return;
+    }
+    tmp.clear();
+    tmp.reserve(set.len() + other.len());
+    let (mut a, mut b) = (set.as_chunks::<2>().0, other.as_chunks::<2>().0);
+    while let (Some(&[wx, bx]), Some(&[wy, by])) = (a.first(), b.first()) {
+        match wx.cmp(&wy) {
+            std::cmp::Ordering::Less => {
+                tmp.extend([wx, bx]);
+                a = a.get(1..).unwrap_or(&[]);
+            }
+            std::cmp::Ordering::Greater => {
+                tmp.extend([wy, by]);
+                b = b.get(1..).unwrap_or(&[]);
+            }
+            std::cmp::Ordering::Equal => {
+                tmp.extend([wx, bx | by]);
+                a = a.get(1..).unwrap_or(&[]);
+                b = b.get(1..).unwrap_or(&[]);
+            }
+        }
+    }
+    tmp.extend(a.iter().flatten());
+    tmp.extend(b.iter().flatten());
+    std::mem::swap(set, tmp);
+}
+
 /// Working memory of [`measure`], kept per thread so that measuring allocates nothing but the
 /// ids it returns.
 #[derive(Default)]
@@ -1076,6 +1164,7 @@ struct Measured {
     inputs: Vec<u64>,
     below: Vec<u64>,
     decoded: Vec<u64>,
+    dense: Vec<u64>,
     tmp: Vec<u64>,
 }
 
@@ -1146,7 +1235,7 @@ struct Measure {
 /// The distinct nodes below and distinct buffers read by an operation on `args`.
 fn measure(args: &[Src]) -> Measure {
     MEASURED.with_borrow_mut(|m| {
-        let Measured { inputs, below, decoded, tmp } = m;
+        let Measured { inputs, below, decoded, tmp, dense } = m;
         inputs.clear();
         let mut nodes: [Option<&Arc<Node>>; 3] = [None; 3];
         let mut count = 0;
@@ -1168,58 +1257,69 @@ fn measure(args: &[Src]) -> Measure {
             }
         }
         let operands = || nodes.iter().take(count).flatten();
-        let (mut lo, mut hi, mut upper) = (u64::MAX, 0u64, 0usize);
+        let (mut lo, mut hi, mut upper, mut used) = (u64::MAX, 0u64, 0usize, 0usize);
         for node in operands() {
             (lo, hi, upper) = (lo.min(node.id), hi.max(node.id), upper + 1 + node.below_len());
+            used += 1 + if node.below_sparse { node.below_part().len() / 2 } else { node.below_part().len() };
             if let Some((first, last)) = node.below_span() {
                 (lo, hi) = (lo.min(first), hi.max(last));
             }
         }
         if count == 0 {
-            return Measure { below: 0, inputs: inputs.len(), ids: inputs.as_slice().into(), base: 0, words: 0, sparse: true };
+            return Measure { below: 0, inputs: inputs.len(), ids: concat_ids(&[], inputs), base: 0, words: 0, sparse: true };
         }
         // The ids of nodes made around the same time are close together: one bit each, which
-        // merges with a handful of word operations. Spread-out ones are merged as sorted lists.
+        // merges with a handful of word operations. Sets with big gaps between their words are
+        // merged as sorted lists of the words in use.
         let width = ((hi >> 6) - (lo >> 6) + 1) as usize;
-        if width <= 2 * upper + 16 {
+        if width <= 2 * used + 8 {
             let base = lo & !63;
-            let mut ids = Vec::with_capacity(width + inputs.len());
-            ids.resize(width, 0u64);
+            dense.clear();
+            dense.resize(width, 0u64);
             for node in operands() {
-                mark(&mut ids, base, node.id);
-                node.mark_below(&mut ids, base);
+                mark(dense, base, node.id);
+                node.mark_below(dense, base);
             }
             // One operand: its set plus itself, which is not in it.
-            let below = if count == 1 { upper } else { ids.iter().map(|word| word.count_ones() as usize).sum() };
-            ids.extend_from_slice(inputs);
-            return Measure { below, inputs: inputs.len(), ids: ids.into_boxed_slice(), base, words: width as u32, sparse: false };
+            let below = if count == 1 { upper } else { dense.iter().map(|word| word.count_ones() as usize).sum() };
+            return Measure { below, inputs: inputs.len(), ids: concat_ids(dense, inputs), base, words: width as u32, sparse: false };
         }
         below.clear();
         for node in operands() {
-            decoded.clear();
-            node.below_any(|id| {
-                decoded.push(id);
-                false
-            });
-            union_into(below, tmp, decoded);
-            insert_sorted(below, node.id);
+            let part = node.below_part();
+            if node.below_sparse || part.is_empty() {
+                merge_sets(below, tmp, part);
+            } else {
+                // A bit set: its words that are not empty, as pairs.
+                decoded.clear();
+                for (k, &word) in part.iter().enumerate() {
+                    if word != 0 {
+                        decoded.extend([(node.below_base >> 6) + k as u64, word]);
+                    }
+                }
+                merge_sets(below, tmp, decoded);
+            }
+            add_id(below, node.id);
         }
-        let mut ids = Vec::with_capacity(below.len() + inputs.len());
-        ids.extend_from_slice(below);
-        ids.extend_from_slice(inputs);
-        Measure { below: below.len(), inputs: inputs.len(), ids: ids.into_boxed_slice(), base: 0, words: below.len() as u32, sparse: true }
+        let distinct = below.as_chunks::<2>().0.iter().map(|&[_, bits]| bits.count_ones() as usize).sum();
+        Measure { below: distinct, inputs: inputs.len(), ids: concat_ids(below, inputs), base: 0, words: below.len() as u32, sparse: true }
     })
 }
 
 impl Measure {
     /// Replaces the buffers by `inputs` (sorted), counted exactly.
     fn set_inputs(&mut self, inputs: &[u64]) {
-        let mut ids = Vec::with_capacity(self.words as usize + inputs.len());
-        ids.extend_from_slice(self.ids.get(..self.words as usize).unwrap_or(&[]));
-        ids.extend_from_slice(inputs);
-        self.ids = ids.into_boxed_slice();
+        self.ids = concat_ids(self.ids.get(..self.words as usize).unwrap_or(&[]), inputs);
         self.inputs = inputs.len();
     }
+}
+
+/// The ids of a node: `below` (see [`Node::ids`]) followed by `inputs`, in one allocation.
+fn concat_ids(below: &[u64], inputs: &[u64]) -> Box<[u64]> {
+    let mut ids = Vec::with_capacity(below.len() + inputs.len());
+    ids.extend_from_slice(below);
+    ids.extend_from_slice(inputs);
+    ids.into_boxed_slice()
 }
 
 /// Sorted ids of the distinct buffers the expressions `args` read, counted by walking them (so
@@ -1350,9 +1450,9 @@ pub(crate) fn create(
     check_supported(ctx, op, name).map_err(Failure::New)?;
 
     // Equal operations on identical operands are one node (see `ConsTable`).
-    let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_key_of(op, len, &args));
-    if let Some(key) = &cons_key
-        && let Some(found) = jit.cons_lookup(key)
+    let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));
+    if let Some(hash) = cons_key
+        && let Some(found) = jit.cons_lookup(hash, op, len, &args)
     {
         return Ok(found);
     }
@@ -1460,30 +1560,19 @@ pub(crate) fn create(
         // Without this, a long chain built without `eval` keeps the GPU idle until its end.
         let _ = ctx.submit();
     }
-    let shift_depth = args
-        .iter()
-        .take(arity)
-        .enumerate()
-        .map(|(i, arg)| match arg {
-            Src::Node(operand) => operand.shift_depth().saturating_add(u8::from(i == 0 && matches!(op.kind, OpKind::Shift(_)))),
-            _ => 0,
-        })
-        .max()
-        .unwrap_or(0);
-
-    // An upper bound of the work of the expression (operands that are shared count once per use).
-    let weight = cost::op_weight(op, &ctx.cost_model())
-        + args.iter().take(arity).map(|arg| if let Src::Node(operand) = arg { operand.weight() } else { 0.0 }).sum::<f64>();
-
-    let depth = args
-        .iter()
-        .take(arity)
-        .filter_map(|arg| match arg {
-            Src::Node(operand) => Some(operand.depth()),
-            _ => None,
-        })
-        .max()
-        .map_or(0, |deepest| deepest.saturating_add(1));
+    // What the operands add up to: the levels of shifts and of nesting, and an upper bound of the
+    // work of the expression (operands that are shared count once per use).
+    let is_shift = matches!(op.kind, OpKind::Shift(_));
+    let (mut shift_depth, mut deepest, mut operand_weight) = (0u8, None::<u16>, 0.0);
+    for (i, arg) in args.iter().take(arity).enumerate() {
+        if let Src::Node(operand) = arg {
+            shift_depth = shift_depth.max(operand.shift_depth().saturating_add(u8::from(i == 0 && is_shift)));
+            deepest = deepest.max(Some(operand.depth()));
+            operand_weight += operand.weight();
+        }
+    }
+    let weight = cost::op_weight(op, &ctx.cost_model()) + operand_weight;
+    let depth = deepest.map_or(0, |deepest| deepest.saturating_add(1));
 
     let node = Arc::new(Node {
         thread: current_thread(),
@@ -1513,6 +1602,7 @@ pub(crate) fn create(
         link: Mutex::new(Weak::new()),
     });
 
+    let weak = Arc::downgrade(&node);
     for (i, arg) in args.iter().enumerate().take(arity) {
         let repeated = |other: &Src| match (arg, other) {
             (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
@@ -1523,17 +1613,17 @@ pub(crate) fn create(
             continue;
         }
         match arg {
-            Src::Buffer(storage) => storage.readers.add(&node),
+            Src::Buffer(storage) => storage.readers.add_weak(weak.clone()),
             Src::Node(operand) => {
                 operand.consumers.fetch_add(1, Ordering::Relaxed);
-                operand.readers.add(&node);
+                operand.readers.add_weak(weak.clone());
             }
             Src::Scalar(_) => {}
         }
     }
-    jit.register(&node);
-    if let Some(key) = cons_key {
-        jit.cons_insert(if cut { cons_key_of(op, len, &args) } else { key }, &node);
+    jit.live.add_weak(weak.clone());
+    if let Some(hash) = cons_key {
+        jit.cons_insert(if cut { cons_hash(op, len, &args) } else { hash }, weak);
     }
     Ok(node)
 }
@@ -1567,57 +1657,34 @@ struct JudgementEntry {
     estimates: inline::Estimates,
 }
 
-/// An operand of a node as [`ConsTable`] tells operations apart.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum ConsArg {
-    Unused,
-    Buffer(u64),
-    Node(u64),
-    Scalar(ElemTy, u64),
-}
-
-/// What makes two lazy operations the same value: the operation, the length and the operands
-/// (buffers and nodes by identity, scalars by value).
-#[derive(Clone, Copy, Debug)]
-struct ConsKey {
-    op: Op,
-    len: usize,
-    args: [ConsArg; 3],
-    /// Hash of the other fields, made once: the table is probed twice per operation and rehashes
-    /// its keys as it grows, and hashing an `Op` that holds a view is not cheap.
-    hash: u64,
-}
-
-impl PartialEq for ConsKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.len == other.len && self.args == other.args && self.op == other.op
-    }
-}
-
-impl Eq for ConsKey {}
-
-impl std::hash::Hash for ConsKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);
-    }
-}
-
-fn cons_key_of(op: Op, len: usize, args: &Args) -> ConsKey {
+/// Hash of what makes two lazy operations the same value: the operation, the length and the
+/// operands (buffers and nodes by identity, scalars by value).
+fn cons_hash(op: Op, len: usize, args: &Args) -> u64 {
     use std::hash::{Hash, Hasher};
-    let arity = op.kind.arity();
-    let mut slots = [ConsArg::Unused; 3];
-    for (slot, arg) in slots.iter_mut().zip(args).take(arity) {
-        *slot = match arg {
-            Src::Buffer(storage) => ConsArg::Buffer(storage.id()),
-            Src::Node(node) => ConsArg::Node(node.id),
-            Src::Scalar(scalar) => ConsArg::Scalar(scalar.ty, scalar.bits),
-        };
-    }
     let mut hasher = FxHasher::default();
     op.hash(&mut hasher);
-    len.hash(&mut hasher);
-    slots.hash(&mut hasher);
-    ConsKey { op, len, args: slots, hash: hasher.finish() }
+    hasher.write_usize(len);
+    for arg in args.iter().take(op.kind.arity()) {
+        match arg {
+            Src::Buffer(storage) => hasher.write_u64(storage.id() << 2),
+            Src::Node(node) => hasher.write_u64(node.id << 2 | 1),
+            Src::Scalar(scalar) => {
+                scalar.ty.hash(&mut hasher);
+                hasher.write_u64(scalar.bits);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+/// Whether `a` and `b` are the same operands of `op`: the same buffers and nodes, equal scalars.
+fn cons_same(op: Op, a: &Args, b: &Args) -> bool {
+    a.iter().zip(b).take(op.kind.arity()).all(|pair| match pair {
+        (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
+        (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
+        (Src::Scalar(a), Src::Scalar(b)) => a.ty == b.ty && a.bits == b.bits,
+        _ => false,
+    })
 }
 
 /// Pending nodes by what they compute, so that writing the same operation on the same operands
@@ -1628,7 +1695,7 @@ fn cons_key_of(op: Op, len: usize, args: &Args) -> ConsKey {
 #[derive(Debug, Default)]
 struct ConsTable {
     epoch: u64,
-    map: FxMap<ConsKey, Weak<Node>>,
+    map: FxMap<u64, Weak<Node>>,
     /// Entries at which dead ones are pruned before the next insert: [`CONS_PRUNE_AT`], or twice
     /// what survived the last pruning (a table of live entries is not scanned at every insert).
     prune_at: usize,
@@ -1940,8 +2007,9 @@ impl JitState {
         self.write_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The pending node that already computes `key`, if any.
-    fn cons_lookup(&self, key: &ConsKey) -> Option<Arc<Node>> {
+    /// The pending node that already computes the operation `op` on `args` (of `hash`, see
+    /// [`cons_hash`]), if any.
+    fn cons_lookup(&self, hash: u64, op: Op, len: usize, args: &Args) -> Option<Arc<Node>> {
         let mut table = lock(&self.cons);
         let epoch = self.write_epoch.load(Ordering::Relaxed);
         if table.epoch != epoch {
@@ -1949,7 +2017,7 @@ impl JitState {
             table.epoch = epoch;
             return None;
         }
-        let node = table.map.get(key)?.upgrade()?;
+        let node = table.map.get(&hash)?.upgrade()?;
         // A node computed inside another kernel is a dead temporary of an earlier expression:
         // sharing it would tie this expression to that one (and to its steps in a loop).
         // One created by another thread is that thread's (it may be recording it, flattening it or
@@ -1958,11 +2026,16 @@ impl JitState {
             && node.thread == current_thread()
             && node.handles.load(Ordering::Relaxed) == 0
             && !node.fused.load(Ordering::Relaxed)
-            && (lock(&node.args).is_some() || node.looped.get().is_some());
+            && match lock(&node.args).as_ref() {
+                // The table holds hashes only: a collision must not share a different value.
+                Some(theirs) => node.op == op && node.len == len && cons_same(op, theirs, args),
+                // A loop leaf has handed its operands to the plan.
+                None => node.looped.get().is_some(),
+            };
         usable.then_some(node)
     }
 
-    fn cons_insert(&self, key: ConsKey, node: &Arc<Node>) {
+    fn cons_insert(&self, hash: u64, weak: Weak<Node>) {
         let mut table = lock(&self.cons);
         let epoch = self.write_epoch.load(Ordering::Relaxed);
         if table.epoch != epoch {
@@ -1973,7 +2046,7 @@ impl JitState {
             table.map.retain(|_, weak| weak.strong_count() > 0);
             table.prune_at = 2 * table.map.len();
         }
-        table.map.insert(key, Arc::downgrade(node));
+        table.map.insert(hash, weak);
     }
 
     /// Starts recording the cuts of expressions (see [`FusionSplit`]).
@@ -2124,10 +2197,6 @@ impl JitState {
             reduce_launches: self.stats.reduce_launches.load(Ordering::Relaxed),
             reduce_passes: self.stats.reduce_passes.load(Ordering::Relaxed),
         }
-    }
-
-    fn register(&self, node: &Arc<Node>) {
-        self.live.add(node);
     }
 
     /// Evaluates every lazy array that is still alive, newest first (an expression is looked at
