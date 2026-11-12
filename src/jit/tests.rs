@@ -1068,6 +1068,8 @@ fn an_eval_loop_of_a_step_too_big_to_recompute_still_runs_as_one_loop() {
 
     let want = g.iterate(100, step).to_vec().unwrap();
     assert_close(&got, &want, 1e-6, 1e-6);
+}
+
 /// Runs `next = step(&u); err = (&next - &u).abs().max()?; u = next` on a 32×32 torus with a
 /// fixed source `c`, `alpha(k)` as the diffusion of step `k`, and `c` overwritten before step
 /// `rewrite_at`, and checks every `err` and the final state against a CPU loop.
