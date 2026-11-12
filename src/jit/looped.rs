@@ -19,6 +19,11 @@ use crate::shape::Shape;
 use super::program::{flatten_step, same_program, Fused, FusedKey, StateRef, Tail};
 use super::{launch, lock, stencil, JitState, Node, OpKind, Src};
 
+/// Instructions per element after which a plan runs without waiting for the GPU to go idle, so
+/// that the GPU computes these steps while the host records the next ones. Per element, so that
+/// the states' memory traffic stays small against the work at any array size.
+const PLAN_INSTRS: u64 = 1024;
+
 /// What a plan runs, until it does.
 struct Parts {
     /// The step, with one output per state; inputs `0..m` are the states, the others stay fixed.
@@ -337,12 +342,20 @@ impl JitState {
         let repeats = tracker.last.as_ref().is_some_and(|before| before.is_step_of(&traced.fused, states.len()));
         let alive: Option<Vec<Arc<Node>>> = prev.into_iter().map(|(node, _)| node).collect();
         let len = nodes[0].len();
+        let instrs = traced.fused.key.instrs.len() as u64;
+        let mut full = false;
         if repeats && let Some(plan) = LoopPlan::following(alive.as_deref(), &states, traced.fused, len, shape) {
             for (j, node) in nodes.iter().enumerate() {
                 node.redirect(&plan, j as u32);
             }
+            full = u64::from(plan.steps) * instrs >= PLAN_INSTRS;
         }
         tracker.remember(nodes, Some(shape));
         tracker.last = Some(last);
+        drop(guard);
+        if full {
+            launch::evaluate_group(nodes);
+            let _ = nodes[0].context().submit_now();
+        }
     }
 }

@@ -214,6 +214,13 @@ impl Context {
         Ok(())
     }
 
+    /// Submits the pending batch now, busy GPU or not.
+    pub(crate) fn submit_now(&self) -> Result<()> {
+        let mut batch = self.batch()?;
+        self.flush_locked(&mut batch);
+        Ok(())
+    }
+
     /// Like [`Context::submit`], but first computes what `eval` requested. While the GPU is busy
     /// that is postponed too, so requested arrays the program drops in the meantime are never
     /// computed and the steps between two submissions fuse. Postponing stops once resident data
