@@ -33,8 +33,14 @@ All notable changes to Luma are listed here. The format follows
   35 ms to 5.1 ms.
 - `eval` stops postponing work once resident array data reaches three quarters of the memory
   budget.
-- How much of a lazy expression a shift recomputes instead of evaluating first is now set per GPU
-  profile: 24 operations on Apple and generic GPUs, 32 on NVIDIA. It was 16 everywhere.
+- A lazy expression read through small shifts (up to 2 cells, 1D and 2D arrays) is computed once
+  per cell of a tile in workgroup memory, and the shifts read it there, instead of being
+  recomputed by every shift. Up to three stencil steps chained without `eval` become one
+  kernel. Game of Life chained without `eval` on an M-series Mac: 1024² 2.9 ms to 3.1 ms
+  against 0.2.0, 4096² 53 ms to 38 ms, 8192² 222 ms to 160 ms.
+- For other shifts, how much of a lazy expression a shift recomputes instead of evaluating it
+  first is now set per GPU profile: 24 operations on Apple and generic GPUs, 32 on NVIDIA. It
+  was 16 everywhere.
 
 ## [0.2.0] - 2026-11-11
 

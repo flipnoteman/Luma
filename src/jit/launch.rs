@@ -577,6 +577,9 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     inputs.remove(k);
     key.in_place = Some(k as u32);
     let shifted = plan_shifts(ctx, &mut key, &scalars, node.len())?;
+    if shifted.is_none() {
+        key.tile = super::codegen::plan_tile(&key, &scalars, node.len(), ctx.tuning());
+    }
     let core = ctx.jit().kernel(ctx, &key)?;
     launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
     // Another thread cannot have evaluated this node: its operands were taken above.
@@ -587,8 +590,8 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
 /// Runs the first pass of the reductions `ops` directly over the expression behind `node`,
 /// without materializing it: every workgroup evaluates its strided blocks of `Tuning::reduce_block` elements and reduces them,
 /// once per op. Returns the buffer of partial results (op `j` at `j * groups ..`) and how many
-/// there are per op, or `None` if the node has already been evaluated (reduce its buffer
-/// instead).
+/// there are per op, or `None` if the node has already been evaluated or is better evaluated
+/// first (reduce its buffer instead).
 pub(crate) fn reduce_first_pass(
     node: &Arc<Node>,
     ops: ReduceList,
@@ -600,6 +603,12 @@ pub(crate) fn reduce_first_pass(
     let Some(args) = node.operands() else { return Ok(None) };
     let (fused, args) = flatten_bounded(node, args, Tail::Reduce(ops))?;
     drop(args);
+    // A reduction calls its sub-programs once per shift; nested or large ones are cheaper staged
+    // by the store kernel of the node, whose buffer is then reduced.
+    let max = node.context().tuning().max_recomputed;
+    if fused.key.subs.iter().any(|sub| sub.len() > max || sub.iter().any(|instr| matches!(instr.args[0], Ref::Sub(_)))) {
+        return Ok(None);
+    }
     reduce_fused(node.context(), node.len(), fused, ops, scratch).map(Some)
 }
 
