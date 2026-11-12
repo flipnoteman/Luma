@@ -1007,8 +1007,11 @@ const KNOWN: &[Known] = &[
     Known { id: "F3 lazy reduction reads a later write to its operand", message: None, shape: Some(reduction_then_write) },
     Known { id: "F4 slice write after a flipped write into a lazy array is lost", message: None, shape: Some(flipped_write_then_slice_write) },
     Known { id: "F5 receiver of a write through an older view shows old data", message: None, shape: Some(view_assigned_after_base_write) },
-    Known { id: "F6 traced loop with a gather corrupts an outer array (max_nodes <= 3)", message: None, shape: Some(traced_gather_with_tight_limit) },
-    Known { id: "F7 lazy compound assignment captured by a traced loop is replayed", message: None, shape: Some(captured_compound_in_loop) },
+    Known {
+        id: "F10 write through a view taken after a flipped write into a lazy array is lost",
+        message: None,
+        shape: Some(view_written_after_flipped_write),
+    },
     Known {
         id: "F8 wrong value only when programs run concurrently on one context (unminimized; masks other concurrency failures)",
         message: Some("only when run concurrently"),
@@ -1044,27 +1047,6 @@ fn range_written_after_a_slice_write(program: &Program) -> bool {
             })
     })
 }
-
-/// F7: a compound assignment to a variable that a later traced loop reads (captured).
-fn captured_compound_in_loop(program: &Program) -> bool {
-    program.stmts.iter().enumerate().any(|(i, stmt)| {
-        let Stmt::Compound { target, .. } = stmt else { return false };
-        program.stmts[i + 1..].iter().any(|later| {
-            matches!(later, Stmt::Loop { kind: LoopKind::IterateAll | LoopKind::IterateUntilAll, .. }) && later.mentions().contains(target)
-        })
-    })
-}
-
-/// F6: a traced loop of two steps or more with a gather in its body, under a fusion limit of
-/// three nodes or fewer.
-fn traced_gather_with_tight_limit(program: &Program) -> bool {
-    program.config.max_nodes <= 3
-        && program.stmts.iter().any(|stmt| {
-            matches!(stmt, Stmt::Loop { kind: LoopKind::IterateAll | LoopKind::IterateUntilAll, steps, body, .. }
-                if *steps >= 2 && body.iter().any(|s| matches!(s, Stmt::View { view: ViewOp::Take { .. }, .. })))
-        })
-}
-
 /// F5: a view of a variable that something touched (evaluated it, wrote its base, used it as
 /// a loop state, ...) and that is then assigned through.
 fn view_assigned_after_base_write(program: &Program) -> bool {
@@ -1093,6 +1075,27 @@ fn view_assigned_after_base_write(program: &Program) -> bool {
                 !matches!(program.stmts[j], Stmt::View { .. }) && program.stmts[j].mentions().iter().any(|m| chain.contains(m))
             })
         })
+    })
+}
+
+/// F10: a write through a flip or transpose into a variable, then a view of it, then a write
+/// through that view.
+fn view_written_after_flipped_write(program: &Program) -> bool {
+    let created = created_counts(program);
+    let mut first = Vec::with_capacity(created.len());
+    let mut next = 0;
+    for c in &created {
+        first.push(next);
+        next += c;
+    }
+    program.stmts.iter().enumerate().any(|(i, stmt)| {
+        let Stmt::Assign { target, path, .. } = stmt else { return false };
+        path.iter().any(|v| !matches!(v, InjView::InjSlice { .. }))
+            && program.stmts.iter().enumerate().skip(i + 1).any(|(j, view)| {
+                matches!(view, Stmt::View { src, .. } if src == target)
+                    && created[j] == 1
+                    && program.stmts[j + 1..].iter().any(|later| matches!(later, Stmt::Assign { target: t, .. } if *t == first[j]))
+            })
     })
 }
 

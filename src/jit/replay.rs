@@ -199,10 +199,17 @@ pub(crate) struct Trace {
 }
 
 impl Trace {
-    /// Evaluates the `init` arrays, makes the probes that stand for them and starts recording.
-    /// Every `init` array must be valid and fit one buffer.
+    /// Evaluates the lazy arrays that exist, the `init` arrays among them, makes the probes that
+    /// stand for them and starts recording. Every `init` array must be valid and fit one buffer.
+    ///
+    /// The lazy arrays are evaluated first because the step may force one of them (it reads a
+    /// captured array): a launch evaluating an array that existed before the loop would be
+    /// recorded, and replayed at every step, although it has to run once, and it may read buffers
+    /// that the replayed step overwrites (`y = &x * 2.0; x += 1.0` in the step) or take over its
+    /// operand's buffer.
     pub(crate) fn start<T: GpuType>(init: &[&Array<T>]) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
         let ctx = init[0].context().clone();
+        ctx.jit().evaluate_live();
         let mut storages = Vec::with_capacity(init.len());
         let mut probes = Vec::with_capacity(init.len());
         let mut probe_storages = Vec::with_capacity(init.len());

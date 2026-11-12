@@ -201,6 +201,11 @@ All notable changes to Luma are listed here. The format follows
 - A kernel whose only scalars are the amounts of circular shifts of a lazy expression
   (`n + n.shift(-4)` with the fusion limit cutting the expression) failed with a bind group larger
   than its layout: the staged kernel bakes the amounts in, so it has no uniform to bind.
+- `iterate_all` (and `iterate_until_all`) corrupted arrays created before the loop: a lazy
+  expression of such an array that the traced step evaluated (a gather from a `concat`, a scan of
+  a `x *= c` result) ran inside the recording and took over its operand's buffer, so every
+  replayed step overwrote it again (`x *= -2` was applied once per step). Tracing now evaluates
+  the live lazy arrays first.
 
 ## [0.2.0] - 2026-11-11
 
