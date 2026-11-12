@@ -790,6 +790,42 @@ impl Plain {
     }
 }
 
+/// The nodes of `shared` that no other of them reads. Evaluating those first leaves the others
+/// without a reader outside the expression (what made them shared) once the readers that made
+/// them shared are evaluated: they are then computed inside those kernels, once, instead of in
+/// kernels of their own that nothing is left to read.
+fn outermost(shared: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
+    let outer: Vec<bool> = shared.iter().map(|node| !shared.iter().any(|other| !Arc::ptr_eq(other, node) && other.below_contains(node.id))).collect();
+    shared.into_iter().zip(outer).filter_map(|(node, outer)| outer.then_some(node)).collect()
+}
+
+/// `shared` and the pending nodes among `candidates` that are its siblings: of the same length,
+/// created by the same operation at the same place in the program (the other fields of a record
+/// that a loop builds), reading nodes the shared node reads, and not related to it by reading it
+/// or being read by it. A shared node evaluated alone would leave everything its siblings
+/// share with it with readers outside its own expression, and each such node would be evaluated
+/// first on its own, level by level; evaluated together they are one kernel.
+fn with_siblings<'a>(shared: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'a Arc<Node>> + Clone) -> Vec<Arc<Node>> {
+    let mut forced = shared.clone();
+    for node in &shared {
+        let below = node.below_vec();
+        for other in candidates.clone() {
+            if other.len() == node.len()
+                && other.name == node.name
+                && std::ptr::eq(other.location, node.location)
+                && other.is_pending()
+                && !forced.iter().any(|known| Arc::ptr_eq(known, other))
+                && !node.below_contains(other.id)
+                && !other.below_contains(node.id)
+                && other.below_vec().iter().any(|id| below.binary_search(id).is_ok())
+            {
+                forced.push(Arc::clone(other));
+            }
+        }
+    }
+    forced
+}
+
 /// Whether the `shared` nodes of the expressions `roots` can be evaluated before them without
 /// the program over them reading more buffers than a kernel binds. Each evaluated node is a
 /// buffer it reads (besides those it reads below it when others read them too): past the limit
@@ -820,7 +856,7 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
             .iter()
             .zip(&readers)
             .filter(|&(member, &inside)| {
-                member.consumers.load(Ordering::Relaxed) > inside && member.has_consumer_outside(&seen)
+                member.consumers.load(Ordering::Relaxed) > inside && super::worth_storing(member) && member.has_consumer_outside(&seen)
             })
             .map(|(member, _)| Arc::clone(member))
             .collect();
@@ -924,21 +960,28 @@ pub(super) fn flatten_inner(
         if fused.key.inlines() {
             let judgement = jit.judgement(ctx, &fused.key, first.len());
             match &*judgement {
-                Judgement::Materialise { sub, reason } => {
+                Judgement::Materialise { subs, reason } => {
                     jit.note_split(first.name, first.location, *reason);
-                    let node = fused.sub_roots.get(*sub as usize).cloned();
+                    let nodes: Vec<Arc<Node>> = subs.iter().filter_map(|&sub| fused.sub_roots.get(sub as usize).cloned()).collect();
                     drop(fused);
-                    if let Some(node) = node {
-                        // A cut forced by the instruction cap takes along the live arrays that
-                        // share work with the expression; one the cost model chose is priced as
-                        // that expression alone, recomputing what it shares with the rest.
-                        if matches!(reason, SplitReason::Inlined { .. }) {
-                            jit.evaluate_alongside(Arc::clone(&node));
+                    // A cut forced by the instruction cap takes along the live arrays that
+                    // share work with the expression; one the cost model chose is priced as
+                    // that expression alone, recomputing what it shares with the rest.
+                    let forced = matches!(reason, SplitReason::Inlined { .. });
+                    match nodes.as_slice() {
+                        [] => {}
+                        [node] if !forced => force_alone(node)?,
+                        [node] => {
+                            jit.evaluate_alongside(Arc::clone(node));
                             if let Err(error) = node.force() {
                                 return Err(Failure::Inherited(Arc::clone(error)));
                             }
-                        } else {
-                            force_alone(&node)?;
+                        }
+                        [first_node, ..] => {
+                            if forced {
+                                jit.evaluate_alongside(Arc::clone(first_node));
+                            }
+                            force_group(&nodes)?;
                         }
                     }
                     continue;
@@ -1037,20 +1080,22 @@ fn flatten_once(
         let shared: Vec<Arc<Node>> = members
             .iter()
             .chain(&sub_members)
-            .filter(|member| !alone && !is_root(&member.node) && member.node.has_consumer_outside(all_seen))
+            .filter(|member| !alone && !is_root(&member.node) && super::worth_storing(&member.node) && member.node.has_consumer_outside(all_seen))
             .chain(sub_members.iter().filter(|member| !is_root(&member.node)).filter(requested))
             .map(|member| Arc::clone(&member.node))
             .collect();
         if shared.is_empty() {
             break members;
         }
+        let shared = outermost(shared);
         if shared.iter().any(|node| probes.iter().any(|&id| node.depends_on(id))) {
             return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
         }
         if !evaluation_fits(roots.iter().map(|(root, args)| (root, args)), &shared) {
             break members;
         }
-        force_group(&shared)?;
+        let forced = with_siblings(shared, members.iter().chain(&sub_members).map(|member| &member.node).filter(|node| !is_root(node)));
+        force_group(&forced)?;
     };
 
     let mut flattener = Flattener { shifted, ..Flattener::default() };
