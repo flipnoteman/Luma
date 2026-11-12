@@ -524,3 +524,54 @@ fn assigned_clones_of_a_lazy_padded_state_on_a_shared_context() {
         assert_close(&u.to_vec().unwrap(), &w, 1e-4, 1e-5);
     });
 }
+
+/// Threads that trace a loop step at the same time all replay it: the recordings of the threads of a context do
+/// not exclude each other. A thread that could not record ran its loop on the host instead, calling the step
+/// closure at every step, which is what the call counts tell apart. Every thread waits inside its step until all
+/// of them are tracing.
+#[test]
+fn threads_that_trace_at_the_same_time_all_replay() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ctx = default_context().unwrap();
+    let threads = 4;
+    let (all_tracing, steps) = (Barrier::new(threads), 24);
+    let calls: Vec<[AtomicUsize; 2]> = (0..threads).map(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]).collect();
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let (ctx, all_tracing, calls) = (&ctx, &all_tracing, &calls);
+            scope.spawn(move || {
+                let u0 = data(t, 0);
+                let u = on(ctx, &u0);
+                let [u] = iterate_all([&u], steps, |[u]| {
+                    if calls[t][0].fetch_add(1, Ordering::SeqCst) == 0 {
+                        all_tracing.wait();
+                    }
+                    [padded_step(u)]
+                });
+                let mut w = u0.clone();
+                for _ in 0..steps {
+                    w = padded(&w);
+                }
+                assert_close(&u.to_vec().unwrap(), &w, 1e-4, 1e-5);
+
+                let u = on(ctx, &u0);
+                let run = iterate_until_all((u,), Until::new(steps).record("max", |s: &(Array<f32>,)| s.0.max()).check_every(8), |s, _| {
+                    if calls[t][1].fetch_add(1, Ordering::SeqCst) == 0 {
+                        all_tracing.wait();
+                    }
+                    (padded_step(&s.0),)
+                })
+                .unwrap();
+                let mut w = u0;
+                for _ in 0..steps {
+                    w = padded(&w);
+                }
+                assert_close(&run.state.0.to_vec().unwrap(), &w, 1e-4, 1e-5);
+            });
+        }
+    });
+    for (t, [all, until]) in calls.iter().enumerate() {
+        assert_eq!(all.load(Ordering::SeqCst), 1, "thread {t}: iterate_all called its step again instead of replaying it");
+        assert_eq!(until.load(Ordering::SeqCst), 1, "thread {t}: iterate_until_all called its step again instead of replaying it");
+    }
+}

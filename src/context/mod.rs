@@ -1,5 +1,5 @@
 use std::hash::Hash;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use wgpu::{Buffer, BufferUsages};
@@ -10,7 +10,7 @@ use crate::jit::cost::{self, CostModel};
 use crate::jit::JitState;
 use crate::gpu::pager::Pager;
 use crate::gpu::handle;
-use crate::gpu::hash::FxMap;
+use crate::gpu::built::BuildCache;
 use crate::gpu::lock;
 use crate::gpu::pool::{self, BufferPool};
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
@@ -26,7 +26,6 @@ mod tests;
 
 use batch::{Batch, BindGroupCache, Bound};
 pub(crate) use record::{Cmd, CmdArg, Recording};
-use record::RecState;
 pub(crate) use batch::RawArg;
 use transfer::{FreeUploads, WaitHistory};
 use uniforms::Arena;
@@ -47,11 +46,11 @@ const MAPPABLE_STORAGE_USAGE: BufferUsages = STORAGE_USAGE.union(BufferUsages::M
 #[derive(Debug)]
 struct Inner {
     /// Built-in kernels, built on first use of their (operation, element type).
-    builtins: Mutex<FxMap<(Builtin, &'static str), Arc<KernelCore>>>,
+    builtins: BuildCache<(Builtin, &'static str), Arc<KernelCore>>,
     /// Lazy-evaluation state: fused kernels and the pending expressions.
     jit: JitState,
     /// Custom kernels, built on first use of their (source, entry, workgroup).
-    kernels: Mutex<FxMap<KernelKey, Arc<KernelCore>>>,
+    kernels: BuildCache<KernelKey, Arc<KernelCore>>,
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the cached bind groups still holding them are dropped at the
     /// next submission, which frees them.
@@ -76,10 +75,11 @@ struct Inner {
     /// What launches, memory traffic and arithmetic cost on this GPU, set once the context exists.
     cost: OnceLock<CostModel>,
     batch: Mutex<Batch>,
-    /// The launches captured by a recording, see [`record`].
-    recording: Mutex<RecState>,
-    /// Whether `recording` is active: checked first so that launches pay one load when it is not.
-    recording_active: std::sync::atomic::AtomicBool,
+    /// `Batch::dispatches`, kept where threads that only decide whether to submit can read it
+    /// without the lock of the batch.
+    dispatches_pending: std::sync::atomic::AtomicU32,
+    /// Tells this context from the others of the process (the recordings of a thread are kept by it, see [`record`]).
+    id: u64,
     /// How long recent waits took, which sets how long the next one polls before it blocks.
     waits: WaitHistory,
     /// The first error the GPU reported outside of a call that could return it.
@@ -397,9 +397,9 @@ impl Context {
                 tuning: Tuning::for_adapter(&gpu.0.adapter, &limits, device.features()),
                 cost: OnceLock::new(),
                 gpu,
-                builtins: Mutex::new(FxMap::default()),
+                builtins: BuildCache::default(),
                 jit: JitState::new(&limits),
-                kernels: Mutex::new(FxMap::default()),
+                kernels: BuildCache::default(),
                 pool: Mutex::new(BufferPool::new(cap)),
                 released: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(FreeUploads::new(cap))),
@@ -410,8 +410,8 @@ impl Context {
                 pager: Pager::new(budget),
                 unmapped: Mutex::new(Vec::new()),
                 batch: Mutex::new(batch),
-                recording: Mutex::new(RecState::Idle),
-                recording_active: std::sync::atomic::AtomicBool::new(false),
+                dispatches_pending: std::sync::atomic::AtomicU32::new(0),
+                id: record::next_context_id(),
                 waits: WaitHistory::new(),
                 gpu_error,
                 #[cfg(test)]
@@ -587,21 +587,21 @@ impl Context {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    pub(crate) fn kernel_cache(&self) -> MutexGuard<'_, FxMap<KernelKey, Arc<KernelCore>>> {
-        lock(&self.inner.kernels)
+    /// The cache of custom kernels (see [`KernelBuilder::build`]).
+    pub(crate) fn kernel_cache(&self) -> &BuildCache<KernelKey, Arc<KernelCore>> {
+        &self.inner.kernels
     }
 
     /// The cached built-in kernel for `op` on elements of WGSL type `ty`, compiled on first use.
     pub(crate) fn builtin(&self, op: Builtin, ty: &'static str) -> Result<Arc<KernelCore>> {
-        let mut cache = lock(&self.inner.builtins);
-        if let Some(core) = cache.get(&(op, ty)) {
-            return Ok(Arc::clone(core));
-        }
-        let key = KernelKey::new(op.source(ty, &self.inner.tuning).into_owned(), "main", None);
-        let label = format!("{op:?} {ty}");
-        let core = Arc::new(kernel::build_core(self, &key, Some(&label), true)?);
-        cache.insert((op, ty), Arc::clone(&core));
-        Ok(core)
+        self.inner
+            .builtins
+            .get_or_build(&(op, ty), || {
+                let key = KernelKey::new(op.source(ty, &self.inner.tuning).into_owned(), "main", None);
+                let label = format!("{op:?} {ty}");
+                kernel::build_core(self, &key, Some(&label), true).map(Arc::new)
+            })
+            .map(|(core, _)| core)
     }
 
     /// Takes a buffer of at least `bytes` bytes with exactly `usage` from the pool, creating one

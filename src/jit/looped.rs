@@ -9,6 +9,7 @@
 //! long the loop runs, so the fusion limit never cuts it, and the kernels no longer depend on
 //! how many steps were postponed.
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::array::{Array, Failure, Storage};
@@ -297,12 +298,44 @@ fn produced_by(roots: &[Arc<Node>], id: u64) -> Option<Arc<Storage>> {
     None
 }
 
+thread_local! {
+    /// The `eval` histories of this thread by context (see [`JitState::tracker`]).
+    static TRACKERS: RefCell<Vec<(u64, Arc<Mutex<Tracker>>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Contexts a thread keeps a [`Tracker`] for (the one longest unused goes first).
+const MAX_TRACKERS: usize = 8;
+
+impl JitState {
+    /// The history of the calling thread's `eval` calls on this context. A loop is the `eval` calls
+    /// of one thread, so every thread follows its own: the calls of the threads that share a context
+    /// neither reset each other's history nor wait for each other's tracing.
+    fn tracker(&self) -> Arc<Mutex<Tracker>> {
+        let fresh = || Arc::new(Mutex::new(Tracker::default()));
+        TRACKERS
+            .try_with(|all| {
+                let mut all = all.borrow_mut();
+                if let Some((_, tracker)) = all.iter().find(|(id, _)| *id == self.id) {
+                    return Arc::clone(tracker);
+                }
+                if all.len() >= MAX_TRACKERS {
+                    all.remove(0);
+                }
+                let tracker = fresh();
+                all.push((self.id, Arc::clone(&tracker)));
+                tracker
+            })
+            .unwrap_or_else(|_| fresh())
+    }
+}
+
 impl JitState {
     /// Called by `eval_all` with the pending `nodes` it was asked for, all `f32` of one `shape`
     /// (no `nodes` if they are not). If they come from the previous call's arrays through the
     /// same step as the call before, they become loop leaves (see the module documentation).
     pub(crate) fn step_boundary(&self, nodes: &[Arc<Node>], shape: Shape) {
-        let mut guard = lock(&self.tracker);
+        let mine = self.tracker();
+        let mut guard = lock(&mine);
         let tracker = &mut *guard;
         if nodes.is_empty() {
             tracker.reset(nodes, None);

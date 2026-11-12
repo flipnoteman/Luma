@@ -110,6 +110,7 @@ cargo run --release --example bench_vs_cpu             # the same workloads on e
 cargo run --release --example bench_batching           # sync after every op vs batched
 cargo run --release --example bench_launch             # host cost per kernel launch
 cargo run --release --example bench_fusion             # one kernel per op vs fused chains
+cargo run --release --example bench_threads            # threads on one context vs a context each
 ```
 
 ### Benchmarks

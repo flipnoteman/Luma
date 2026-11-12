@@ -110,6 +110,8 @@ All notable changes to Luma are listed here. The format follows
   is checked for NaN and Inf right after its kernel, and the operation fails with
   `LumaError::NonFinite`, naming it and its source location (it waits for the GPU once per
   evaluated array: a debug mode). `LumaError::Unsupported` is new.
+- `examples/bench_threads`: threads that share one context against threads with a context each, for
+  `iterate_until_all`, `iterate_all` and an `eval` loop.
 
 ### Changed
 
@@ -204,6 +206,16 @@ All notable changes to Luma are listed here. The format follows
   `flush`, `sync` and `cache` evaluated the pending arrays of other threads (and fed them into a
   recording another thread had under way), and equal expressions were shared across threads. Each
   thread now only evaluates its own pending arrays.
+- Threads sharing a context ran up to ten times slower than threads with a context each (the
+  accuracy suite of bowshock-lazy, four threads on `default_context()`: 118 s against 11 s). A
+  kernel that one thread was compiling, which takes seconds for a large `Df32` kernel, blocked every
+  other thread's kernel lookups, and only one thread at a time could trace a loop of `iterate_all` /
+  `iterate_until_all`: the others ran theirs on the host, calling `step` and reading the state back
+  at every step. Kernels now compile outside the lock of the cache (threads that need different
+  kernels compile at the same time, one that needs a kernel somebody is compiling waits for that
+  compile), and every thread records its own loop. The history `eval` loops are recognised from
+  is per thread too: the calls of threads that alternate no longer reset each other's, which left
+  one kernel per step.
 - wgpu's validation of indirect dispatches (an extra dispatch before every step of
   `iterate_until`/`iterate_until_all`) is off: the dispatch arguments are always written by the
   library's own gate kernels.

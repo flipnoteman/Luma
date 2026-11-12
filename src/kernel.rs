@@ -135,12 +135,8 @@ impl<'a> KernelBuilder<'a> {
             entry: self.entry,
             workgroup: self.workgroup,
         };
-        let mut cache = self.ctx.kernel_cache();
-        if let Some(core) = cache.get(&key) {
-            return Ok(Kernel { ctx: self.ctx.clone(), core: core.clone() });
-        }
-        let core = Arc::new(build_core(self.ctx, &key, self.label.as_deref(), false)?);
-        cache.insert(key, core.clone());
+        let label = self.label.as_deref();
+        let (core, _) = self.ctx.kernel_cache().get_or_build(&key, || build_core(self.ctx, &key, label, false).map(Arc::new))?;
         Ok(Kernel { ctx: self.ctx.clone(), core })
     }
 }

@@ -245,3 +245,79 @@ fn the_cost_model_can_be_overridden_in_tests() {
     ctx.set_cost_model(model);
     assert_eq!(ctx.cost_model(), model);
 }
+
+/// Every thread that shares a context has a recording of its own: one thread recording neither stops the
+/// others from starting theirs nor captures their launches, and a thread's recording cannot be started twice.
+#[test]
+fn threads_record_side_by_side() {
+    let ctx = ctx();
+    let threads = 4;
+    let barrier = std::sync::Barrier::new(threads);
+    // Nothing is asserted before the last barrier: a thread that stopped would leave the others waiting.
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..threads)
+            .map(|t| {
+                let (ctx, barrier) = (&ctx, &barrier);
+                scope.spawn(move || {
+                    let x = Array::from_slice_on(ctx, &vec![1.0f32; 16 + t], 16 + t).unwrap();
+                    x.eval().unwrap();
+                    let began = ctx.begin_recording(Vec::new());
+                    let twice = ctx.begin_recording(Vec::new());
+                    // Everyone is recording now.
+                    barrier.wait();
+                    for _ in 0..t + 1 {
+                        let y = &x * 2.0;
+                        crate::jit::force(&[&y]).unwrap_or_else(|_| panic!("thread {t} could not launch"));
+                    }
+                    barrier.wait();
+                    let (here, recorded) = (ctx.recording_here(), ctx.recorded());
+                    let commands = ctx.end_recording().map(|recording| recording.cmds.len());
+                    let (still_here, ended_twice) = (ctx.recording_here(), ctx.end_recording().is_some());
+                    // Once it ended, the thread can record again.
+                    let again = ctx.begin_recording(Vec::new()) && ctx.end_recording().is_some();
+                    (began, twice, here, recorded, commands, still_here, ended_twice, again)
+                })
+            })
+            .collect();
+        threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+    });
+    for (t, (began, twice, here, recorded, commands, still_here, ended_twice, again)) in outcomes.into_iter().enumerate() {
+        assert!(began, "thread {t} could not start a recording");
+        assert!(!twice, "a thread has one recording per context");
+        assert!(here);
+        assert_eq!(recorded, t + 1, "thread {t} captured launches of others or lost its own");
+        assert_eq!(commands, Some(t + 1));
+        assert!(!still_here && !ended_twice);
+        assert!(again);
+    }
+}
+
+/// A recording that was aborted stays out of the way of a new one until its owner ends it, and only the
+/// owner's launches ran in the meantime.
+#[test]
+fn aborting_a_recording_concerns_only_its_thread() {
+    let ctx = ctx();
+    let x = Array::from_slice_on(&ctx, &[1.0f32; 8], 8).unwrap();
+    x.eval().unwrap();
+    assert!(ctx.begin_recording(Vec::new()));
+    let y = &x * 3.0;
+    crate::jit::force(&[&y]).unwrap_or_else(|_| panic!("launch"));
+    assert_eq!(ctx.recorded(), 1);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // Another thread's sync and readback do not abort this thread's recording.
+            let z = Array::from_slice_on(&ctx, &[2.0f32; 8], 8).unwrap();
+            assert_eq!((&z + 1.0).to_vec().unwrap(), vec![3.0; 8]);
+            ctx.sync().unwrap();
+        });
+    });
+    assert!(ctx.recording_here());
+    assert_eq!(ctx.recorded(), 1);
+    // Its own readback does: the captured launch runs, and the recording is aborted, not ended.
+    assert_eq!(y.to_vec().unwrap(), vec![3.0; 8]);
+    assert!(!ctx.recording_here());
+    assert!(!ctx.begin_recording(Vec::new()), "an aborted recording stays until its owner ends it");
+    assert!(ctx.end_recording().is_none());
+    assert!(ctx.begin_recording(Vec::new()));
+    assert!(ctx.end_recording().is_some());
+}
