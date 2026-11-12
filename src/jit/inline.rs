@@ -87,12 +87,31 @@ pub(crate) struct Inlined {
     pub(crate) ops: f64,
 }
 
-/// A key lowered for a workgroup-staged kernel: the main program and, in the order of
-/// [`Staging::subs`], one program per staged sub-program, each lowered at its own cell.
+/// Staged sub-programs of one level over the same region, lowered together: they run in one loop
+/// and an instruction that several of them compute (the wave speeds the four fields of a flux
+/// share) is one instruction.
+#[derive(Debug)]
+pub(crate) struct StagedGroup {
+    /// Indices into [`Staging::subs`] of the sub-programs of the group.
+    pub(crate) members: Vec<usize>,
+    /// Per member, the lowered instruction holding its value.
+    pub(crate) values: Vec<u32>,
+    pub(crate) body: Inlined,
+}
+
+/// A key lowered for a workgroup-staged kernel: the main program and the staged sub-programs
+/// in groups (in the order of [`Staging::subs`]), each lowered at its own cell.
 #[derive(Debug)]
 pub(crate) struct StagedPrograms {
     pub(crate) main: Inlined,
-    pub(crate) subs: Vec<Inlined>,
+    pub(crate) groups: Vec<StagedGroup>,
+}
+
+impl StagedPrograms {
+    /// The main program and the bodies of the groups.
+    pub(crate) fn bodies(&self) -> impl Iterator<Item = &Inlined> {
+        std::iter::once(&self.main).chain(self.groups.iter().map(|group| &group.body))
+    }
 }
 
 /// How a kernel's source is generated from its key.
@@ -547,23 +566,54 @@ fn lower_program(
     Some(lowering.finish(main, roots, cost))
 }
 
+/// Lowers the sub-programs of `members` (entries of `staging`) together at their own cell, with the
+/// reads of staged sub-programs left for workgroup memory. `None` past `cap` instructions.
+fn lower_group(key: &FusedKey, staging: &Staging, staged: &[bool], members: &[usize], cap: usize, cost: &CostModel) -> Option<StagedGroup> {
+    let mut lowering = Lowering::new(&key.subs, staged, cap);
+    let mut values = Vec::with_capacity(members.len());
+    for &member in members {
+        let program = key.subs.get(staging.subs.get(member)?.sub as usize)?;
+        values.push(lowering.lower(program, 0).last().copied().unwrap_or(0));
+    }
+    if lowering.over {
+        return None;
+    }
+    let body = lowering.finish(Vec::new(), values.clone(), cost);
+    Some(StagedGroup { members: members.to_vec(), values, body })
+}
+
 /// Lowers the main program of `key` and every sub-program `staging` stages, each at its own
-/// cell, with the reads of staged sub-programs left for workgroup memory. `None` if any
-/// program has more than `cap` instructions.
+/// cell, with the reads of staged sub-programs left for workgroup memory. The sub-programs of
+/// one level over the same region are lowered together (see [`StagedGroup`]), apart if together
+/// they have more than `cap` instructions. `None` if any program has more than `cap`.
 pub(crate) fn lower_staged(key: &FusedKey, staging: &Staging, cap: usize, cost: &CostModel) -> Option<StagedPrograms> {
     let mut staged = vec![false; key.subs.len()];
     for entry in &staging.subs {
         *staged.get_mut(entry.sub as usize)? = true;
     }
     let main = lower_program(&key.subs, &key.instrs, &staged, cap, cost, |main| key_roots(key, main))?;
-    let subs = staging
-        .subs
-        .iter()
-        .map(|entry| {
-            lower_program(&key.subs, key.subs.get(entry.sub as usize)?, &staged, cap, cost, |main| main.last().copied().into_iter().collect())
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(StagedPrograms { main, subs })
+    let mut groups = Vec::new();
+    for level in staging.levels.windows(2) {
+        let mut by_region: Vec<Vec<usize>> = Vec::new();
+        for member in level[0] as usize..level[1] as usize {
+            let own = staging.subs.get(member)?;
+            match by_region.iter_mut().find(|found| staging.subs.get(found[0]).is_some_and(|first| (first.dims, first.lo, first.hi) == (own.dims, own.lo, own.hi))) {
+                Some(found) => found.push(member),
+                None => by_region.push(vec![member]),
+            }
+        }
+        for members in by_region {
+            match lower_group(key, staging, &staged, &members, cap, cost) {
+                Some(group) => groups.push(group),
+                None => {
+                    for &member in &members {
+                        groups.push(lower_group(key, staging, &staged, &[member], cap, cost)?);
+                    }
+                }
+            }
+        }
+    }
+    Some(StagedPrograms { main, groups })
 }
 
 /// What [`judge`] decided.
@@ -648,10 +698,17 @@ fn stage(key: &FusedKey, cap: usize, cost: &CostModel, tuning: &Tuning) -> Optio
 /// its region (and a store and a load of the value, counted as 4 operations).
 fn staged_time(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, elements: f64, cost: &CostModel) -> f64 {
     let tile = f64::from(staging.tile[0]) * f64::from(staging.tile[1]);
-    let all = std::iter::once(&programs.main).chain(&programs.subs);
+    let all = programs.bodies();
     let reads = all.flat_map(|lowered| lowered.instrs.iter().flat_map(|flat| flat.args).chain(lowered.ctxs.iter().flat_map(|ctx| ctx.args)));
     let io_bytes = elements * (input_bytes(key, reads) + output_bytes(key));
-    let staged_ops: f64 = staging.subs.iter().zip(&programs.subs).map(|(entry, lowered)| f64::from(entry.cells()) / tile * (lowered.ops + 4.0)).sum();
+    let staged_ops: f64 = programs
+        .groups
+        .iter()
+        .filter_map(|group| {
+            let cells = staging.subs.get(*group.members.first()?)?.cells();
+            Some(f64::from(cells) / tile * (group.body.ops + 4.0 * group.members.len() as f64))
+        })
+        .sum();
     kernel_ns(cost, io_bytes, (programs.main.ops + staged_ops) * elements)
 }
 
@@ -1010,6 +1067,35 @@ mod tests {
         assert!(cheap.region.iter().all(|&region| region == Region::Top));
         let data = fits(inline(&region_key(20, true), 1000, &cost));
         assert!(data.branch.iter().all(|&branch| !branch));
+    }
+
+    #[test]
+    fn staged_sub_programs_over_one_region_share_their_instructions() {
+        use crate::jit::staging::StagedSub;
+        // Two sub-programs over the same region that share their first two instructions (like the
+        // fields of a flux), the main program reads each at two offsets.
+        let first = expression();
+        let second = vec![first[0].clone(), first[1].clone(), instr(OpKind::Unary(UnOp::Abs), [Ref::Tmp(1), Ref::Unused, Ref::Unused])];
+        let main = vec![
+            shift(slice(9, 1, 8), 0),
+            shift(slice(9, 0, 8), 0),
+            shift(slice(9, 1, 8), 1),
+            shift(slice(9, 0, 8), 1),
+            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(2), Ref::Tmp(3), Ref::Unused]),
+            instr(OpKind::Binary(BinOp::Mul), [Ref::Tmp(4), Ref::Tmp(5), Ref::Unused]),
+        ];
+        let key = key(main, vec![first, second]);
+        let region = |sub| StagedSub { sub, dims: [9, 1], lo: [0, 0], hi: [16, 0] };
+        let staging = Staging { dims: [8, 1], tile: [16, 1], subs: vec![region(0), region(1)], levels: vec![0, 2] };
+        let programs = lower_staged(&key, &staging, 1000, &CostModel::TEST).expect("lowers");
+        assert_eq!(programs.groups.len(), 1);
+        let group = &programs.groups[0];
+        assert_eq!(group.members, vec![0, 1]);
+        // Mul, Add, Sqrt, Abs: the first two are one instruction.
+        assert_eq!(group.body.instrs.len(), 4);
+        assert_eq!(group.values, vec![2, 3]);
+        assert_eq!(validate_inlined(&group.body, 1, true), Ok(()));
     }
 }
 

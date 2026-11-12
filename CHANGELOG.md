@@ -37,6 +37,10 @@ All notable changes to Luma are listed here. The format follows
 - Workgroup staging follows sub-programs that are not staged: what a flux read once (or a slice of
   a slice) reads of a padded array is staged at the summed offsets instead of the padded array
   being recomputed at every read.
+- Staged sub-programs of one level over the same region (the four fields of a flux) are lowered
+  and computed together, so what they share (the wave speeds of a Riemann solver) is computed
+  once per cell instead of once per field. bowshock-lazy `Staging::Fusion`, one `Df32` residual
+  evaluation at 200x100: 308-344 us -> 139 us, f32 17-19 us -> 11 us (kernel time on an RTX 3090).
 - `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
   `Df32` and `f64` arithmetic), measured when a context opens (once per device and process;
   `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).
