@@ -983,6 +983,7 @@ fn engine(config: &Config) -> Option<Context> {
     ctx.set_assume_busy(config.assume_busy);
     jit.set_speculate(config.speculate);
     jit.set_simplify(config.simplify);
+    jit.set_staging(config.staging);
     ctx.set_cost_model(match config.cost {
         CostChoice::Test => CostModel::TEST,
         CostChoice::SlowLaunch => CostModel { launch_us: 1e6, ..CostModel::TEST },

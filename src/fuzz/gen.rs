@@ -108,6 +108,8 @@ pub struct Config {
     pub assume_busy: bool,
     pub speculate: bool,
     pub simplify: bool,
+    /// Workgroup staging of views (`JitState::set_staging`).
+    pub staging: bool,
     pub fast_math: bool,
     pub chunk_bytes: Option<u64>,
     pub memory_budget: Option<u64>,
@@ -133,6 +135,7 @@ impl Config {
             assume_busy: false,
             speculate: true,
             simplify: true,
+            staging: true,
             fast_math: false,
             chunk_bytes: None,
             memory_budget: None,
@@ -1562,7 +1565,13 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         prop::sample::select(vec![Some(8usize), None]),
         prop::sample::select(vec![Some(4usize), Some(8), None]),
     );
-    let flags = (prop::bool::weighted(0.3), prop::bool::weighted(0.7), prop::bool::weighted(0.8), prop::bool::weighted(0.3));
+    let flags = (
+        prop::bool::weighted(0.3),
+        prop::bool::weighted(0.7),
+        prop::bool::weighted(0.8),
+        prop::bool::weighted(0.3),
+        prop::bool::weighted(0.7),
+    );
     let memory = (
         prop::sample::select(vec![None, None, Some(1024u64)]),
         prop::sample::select(vec![None, None, Some(1u64 << 20)]),
@@ -1576,6 +1585,7 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         assume_busy: flags.0,
         speculate: flags.1,
         simplify: flags.2,
+        staging: flags.4,
         fast_math: flags.3,
         chunk_bytes: memory.0,
         memory_budget: memory.1,
