@@ -203,7 +203,7 @@ pub struct ContextOptions {
     /// The check synchronizes with the GPU once per evaluated array, so it is for finding the
     /// operation that first produces a non-finite value, not for production runs.
     pub check_finite: bool,
-    /// Measure the device's throughputs when the context opens (about 50 ms on a GPU, once per
+    /// Measure the device's throughputs when the context opens (about 100 ms on a GPU, once per
     /// device and process); `false` uses the profile's fixed numbers (see [`CostModel`]).
     pub calibrate: bool,
 }
@@ -361,7 +361,6 @@ impl Context {
             profiler: None,
         };
 
-        let profile = Tuning::for_adapter(&gpu.0.adapter, &limits, device.features()).profile;
         let ctx = Context {
             inner: Arc::new(Inner {
                 max_uniform_bytes: limits.max_uniform_buffer_binding_size,
@@ -395,6 +394,7 @@ impl Context {
                 max_buffer_bytes,
             }),
         };
+        let profile = ctx.inner.tuning.profile;
         let model = if options.calibrate {
             *ctx.inner.gpu.0.cost.get_or_init(|| {
                 cost::calibrate(&ctx).unwrap_or_else(|_| CostModel::fallback(profile))
