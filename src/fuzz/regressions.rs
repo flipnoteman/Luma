@@ -498,3 +498,24 @@ fn transposed_assign_of_a_simplified_self_maximum_reads_overwritten_data() {
         ],
     });
 }
+
+/// Finding 20 (GPU fuzz seed 5007): `v = lin.slice(3..6).flip(0)` is evaluated by `c = v.cache()`
+/// (`c` shares `v`'s buffer, like a clone), then `v.assign(&d)` where the base `lin` is a lazy
+/// expression: the write replaced the lazy base and `v` was given a view of it, but the buffer
+/// `v` had been evaluated into, and `c` with it, kept the old data (`c[0]` is `2.8125`, not
+/// `5.875`).
+#[test]
+fn cache_of_an_evaluated_view_shows_a_write_through_the_view() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Linspace { start: 3.125, end: 2.625, n: 9 },
+            View { src: 0, view: Slice { axis: 0, lo: 3, hi: 6 } },
+            View { src: 1, view: Flip { axis: 0 } },
+            Cache { src: 2 },
+            Binary { lhs: Var(1), rhs: Const(0.5), op: Div },
+            Assign { target: 2, path: vec![], rhs: Var(4) },
+        ],
+    });
+}

@@ -323,13 +323,50 @@ fn evaluate_rhs(store: &Arc<Node>) -> Result<(), Failure> {
     }
 }
 
+/// If the receiver of a write (the array holding `claim`) was evaluated into a buffer of its own,
+/// writes `shows`, the expression of what it shows now, into that buffer in place and returns
+/// `None`; otherwise gives `shows` back. The arrays sharing the buffer (a `cache()` of the
+/// receiver, say) show the written data like the receiver does, and expressions recorded earlier
+/// that read it keep the old values (see the module documentation).
+pub(crate) fn write_evaluated_receiver(
+    ctx: &Context,
+    claim: &Held,
+    shows: Arc<Node>,
+    name: &'static str,
+    location: &'static Location<'static>,
+) -> Result<Option<Arc<Node>>, Failure> {
+    let Some(storage) = claim.latest().evaluated() else { return Ok(Some(shows)) };
+    if storage.segments() != 1 || storage.is_alias() {
+        return Ok(Some(shows));
+    }
+    let region = Region {
+        base: Arc::clone(storage),
+        map: ViewMap::identity(shows_dims(&shows)),
+        rhs: Src::Node(shows),
+        ty: claim.latest().op().out_ty(),
+        receiver: None,
+        claim: None,
+    };
+    assign(ctx, vec![region], name, location)?;
+    Ok(None)
+}
+
+/// The extents of the view node `shows` (its map's output).
+fn shows_dims(shows: &Node) -> [u32; 4] {
+    match shows.op().kind {
+        OpKind::Shift(ShiftKind::View { map, .. }) => map.out,
+        _ => [shows.len() as u32, 1, 1, 1],
+    }
+}
+
 /// Makes the array holding `claim`, the receiver of the write of `region`, show what the region
 /// of the base holds now. A receiver that is a pending view reading the base through the
-/// region's map already does; one that was evaluated into a buffer of its own (by the user, by
-/// an earlier write into the base, because the right-hand side read it) or that reads another
-/// buffer than the base (a view of an evaluated view) shows the data from before the write, so
-/// it is replaced by a read of the written base. Expressions recorded earlier that read the old
-/// receiver keep its old value.
+/// region's map already does. One that was evaluated into a buffer of its own (by the user, by
+/// an earlier write into the base, because the right-hand side read it) shows the data from
+/// before the write: that buffer is overwritten with the region (it may be shared with a
+/// `cache()` of the receiver). A receiver that reads another buffer than the base (a view of an
+/// evaluated view) is replaced by a read of the written base. Expressions recorded earlier that
+/// read the old receiver keep its old value.
 fn refresh_receiver(
     ctx: &Context,
     region: &Region,
@@ -347,7 +384,9 @@ fn refresh_receiver(
     let op = Op::new(OpKind::Shift(ShiftKind::View { map: region.map, edge: Edge::None }), region.ty);
     let args = [Src::Buffer(Arc::clone(&region.base)), Src::unused(), Src::unused()];
     let node = super::create(ctx, region.map.out_len(), op, args, name, location)?;
-    super::supersede(claim, node);
+    if let Some(node) = write_evaluated_receiver(ctx, claim, node, name, location)? {
+        super::supersede(claim, node);
+    }
     Ok(())
 }
 

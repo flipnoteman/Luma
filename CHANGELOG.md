@@ -234,6 +234,9 @@ All notable changes to Luma are listed here. The format follows
   elements of `x` after the write had overwritten them: the store of the assignment was folded
   into the copy and no longer had it evaluated first. A copy is no longer folded into the copy it
   reads.
+- An array sharing the buffer of a view that was evaluated before a write through the view (the
+  result of `v.cache()`) kept the old data: the write gave the view a replacement expression and
+  left the buffer alone. The buffer is now overwritten with the written data.
 
 ## [0.2.0] - 2026-11-11
 
