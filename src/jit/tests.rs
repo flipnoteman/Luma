@@ -1045,3 +1045,67 @@ fn reading_back_in_the_middle_of_an_eval_loop_gives_the_right_values() {
     }
     assert_close(&u.to_vec().unwrap(), &want, 1e-4, 1e-4);
 }
+
+/// Runs `next = step(&u); err = (&next - &u).abs().max()?; u = next` on a 32×32 torus with a
+/// fixed source `c`, `alpha(k)` as the diffusion of step `k`, and `c` overwritten before step
+/// `rewrite_at`, and checks every `err` and the final state against a CPU loop.
+fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32, rewrite_at: Option<usize>) {
+    const W: usize = 32;
+    let (u0, c0, c1) = (values(W * W, 80, 0.0, 1.0), values(W * W, 81, 0.0, 1.0), values(W * W, 82, 0.0, 1.0));
+    let mut c = Array::from_slice_on(ctx, &c0, [W, W]).unwrap();
+    let mut u = &Array::from_slice_on(ctx, &u0, [W, W]).unwrap() * 1.0;
+    let (mut cpu, mut source) = (u0, c0);
+    for k in 0..steps {
+        if rewrite_at == Some(k) {
+            c.write(&c1).unwrap();
+            source = c1.clone();
+        }
+        let a = alpha(k);
+        let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - &u * 4.0;
+        let next = &u + lap * a + &c * 0.01;
+        let err = (&next - &u).abs().max().unwrap();
+        u = next;
+
+        let at = |i: usize, j: usize| cpu[i % W * W + j % W];
+        let mut new = vec![0.0f32; W * W];
+        for i in 0..W {
+            for j in 0..W {
+                let lap = at(i + 1, j) + at(i + W - 1, j) + at(i, j + 1) + at(i, j + W - 1) - at(i, j) * 4.0;
+                new[i * W + j] = at(i, j) + lap * a + source[i * W + j] * 0.01;
+            }
+        }
+        let want = new.iter().zip(&cpu).map(|(n, o)| (n - o).abs()).fold(0.0, f32::max);
+        assert!((err - want).abs() <= 1e-4 * want + 1e-6, "step {k}: err {err}, want {want}");
+        cpu = new;
+    }
+    assert_close(&u.to_vec().unwrap(), &cpu, 1e-4, 1e-5);
+}
+
+#[test]
+fn a_readback_loop_gives_the_same_values_with_speculation() {
+    let ctx = Context::new().unwrap();
+    check_readback_loop(&ctx, 60, |_| 0.2, None);
+    assert!(ctx.jit().speculation_hits() > 0, "no readback was answered ahead of time");
+}
+
+#[test]
+fn a_step_that_changes_turns_speculation_off_and_stays_correct() {
+    let ctx = Context::new().unwrap();
+    check_readback_loop(&ctx, 40, |k| 0.2 - k as f32 * 0.002, None);
+    assert_eq!(ctx.jit().speculation_hits(), 0);
+}
+
+#[test]
+fn writing_an_input_between_readbacks_discards_the_prediction() {
+    let ctx = Context::new().unwrap();
+    check_readback_loop(&ctx, 40, |_| 0.2, Some(20));
+    assert!(ctx.jit().speculation_hits() > 0);
+}
+
+#[test]
+fn a_readback_loop_does_not_speculate_when_it_is_off() {
+    let ctx = Context::new().unwrap();
+    ctx.jit().set_speculate(false);
+    check_readback_loop(&ctx, 40, |_| 0.2, None);
+    assert_eq!(ctx.jit().speculation_hits(), 0);
+}
