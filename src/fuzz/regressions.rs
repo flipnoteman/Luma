@@ -343,3 +343,24 @@ fn view_shows_the_written_data_after_a_cache_evaluated_the_shared_base_node() {
         ],
     });
 }
+
+/// Finding 15 (found while fixing finding 3; fails on main without that fix too): an
+/// `iterate_all` whose body reduces with `sum_where` and selects on it, then a write of an
+/// expression of the result through a flip: `element 1` of the written array is `1`, not `0`.
+#[test]
+#[ignore = "finding 15: a traced iterate_all with sum_where in its body, then a write of an expression of its result"]
+fn write_of_an_expression_of_a_traced_loop_with_sum_where_is_wrong() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
+            Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
+            View { src: 1, view: Flip { axis: 1 } },
+            View { src: 1, view: Flip { axis: 1 } },
+            Loop { kind: IterateAll, steps: 1, states: vec![2], body: vec![Unary { src: 0, op: ToF32 }, View { src: 3, view: ShiftClamp { offs: vec![3, 0] } }, Scan { src: 4, axis: 0, op: ScanMin }, SumWhere { src: 7, mask: 7 }, Select { mask: 8, a: Const(4.0), b: Const(0.0), ty: F32 }], next: vec![6] },
+            Binary { lhs: Var(4), rhs: Const(2.0), op: Rem },
+            Assign { target: 3, path: vec![], rhs: Var(5) },
+        ],
+    });
+}
