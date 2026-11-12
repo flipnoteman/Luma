@@ -26,7 +26,6 @@ fn check(program: Program) {
 /// Finding 1: `x -= x` with `fast_math`: `Sub(x, x)` simplifies to the constant 0, the node no
 /// longer reads the buffer it is evaluated into, and the in-place evaluation refuses it.
 #[test]
-#[ignore = "finding 1: in-place compound assignment of an expression that no longer reads its target"]
 fn fast_math_self_subtraction_does_not_run_in_place() {
     check(Program {
         config: engine(true, true),
@@ -37,7 +36,6 @@ fn fast_math_self_subtraction_does_not_run_in_place() {
 
 /// Finding 1 without `fast_math`: `x *= 0` on integers (a buffer another handle shares) simplifies to the constant 0 (exact rule).
 #[test]
-#[ignore = "finding 1: in-place compound assignment of an expression that no longer reads its target"]
 fn integer_multiplication_by_zero_does_not_run_in_place() {
     check(Program {
         config: engine(true, false),
