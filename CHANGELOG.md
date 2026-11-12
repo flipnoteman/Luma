@@ -21,6 +21,12 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- Algebraic simplification when an operation is created: bit-exact rewrites always run (`x * 1`,
+  `x / 1`, `x - 0`, `-(-x)`, `abs(abs(x))`, `floor(floor(x))`, `min(x, x)`, `select(m, a, a)`,
+  `x < x`, `f32` through `f64`/`Df32` and back, and the `u32` identities), so `&x * 1.0` is one
+  copy. `ContextOptions::fast_math` / `LUMA_FAST_MATH=1` also allows the ones that change values
+  (`x + 0`, `x * 0`, `x - x`, `x / x`, constants of chained `*` / `+` combined, `x / c` as
+  `x * (1 / c)`, `powf` with exponent 1, 2 or 0.5).
 - Line primitives: `solve_tridiagonal` / `solve_block_tridiagonal` (block size 1 to 8, with
   `_from` variants where each line starts at its own cell) solve one system per line along an axis
   with the (block) Thomas algorithm; `Array::scan(axis, op)`, `cumsum`, `sum_axis`, `min_axis` and

@@ -238,7 +238,8 @@ fn deep_chains_are_split_at_the_node_limit() {
     let mut y = &x * 1.0001 + 0.001;
     let mut want: Vec<f32> = xs.iter().map(|&v| v * 1.0001 + 0.001).collect();
     for i in 0..99 {
-        let s = 1.0 + (i % 3) as f32 * 0.01;
+        // Never exactly 1: `y * 1.0` would be simplified away and the chain would be shorter.
+        let s = 1.0 + (i % 3 + 1) as f32 * 0.01;
         y = y * s + 0.001;
         for w in &mut want {
             *w = *w * s + 0.001;
