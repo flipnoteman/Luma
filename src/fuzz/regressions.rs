@@ -26,7 +26,6 @@ fn check(program: Program) {
 /// Finding 1: `x -= x` with `fast_math`: `Sub(x, x)` simplifies to the constant 0, the node no
 /// longer reads the buffer it is evaluated into, and the in-place evaluation refuses it.
 #[test]
-#[ignore = "finding 1: in-place compound assignment of an expression that no longer reads its target"]
 fn fast_math_self_subtraction_does_not_run_in_place() {
     check(Program {
         config: engine(true, true),
@@ -37,7 +36,6 @@ fn fast_math_self_subtraction_does_not_run_in_place() {
 
 /// Finding 1 without `fast_math`: `x *= 0` on integers (a buffer another handle shares) simplifies to the constant 0 (exact rule).
 #[test]
-#[ignore = "finding 1: in-place compound assignment of an expression that no longer reads its target"]
 fn integer_multiplication_by_zero_does_not_run_in_place() {
     check(Program {
         config: engine(true, false),
@@ -46,10 +44,11 @@ fn integer_multiplication_by_zero_does_not_run_in_place() {
     });
 }
 
-/// Finding 2: a lazy expression read at two circular offsets by one kernel, with the fusion
-/// limit cutting the batch: the launch binds three buffers, the kernel layout has two.
+/// Finding 2: an expression read directly and through a circular shift, with the fusion limit
+/// cutting the batch: the shift of the sub-program is staged with its amount baked into the
+/// source, so the kernel never reads its uniform and has no binding for it, but the launch
+/// bound the uniform.
 #[test]
-#[ignore = "finding 2: bind group has more bindings than the kernel layout (max_nodes = 2, circular shift of an expression)"]
 fn shifted_expression_with_a_tight_node_limit_binds_too_many_buffers() {
     check(Program {
         config: Config { max_nodes: 2, ..Config::default_engine() },
@@ -98,7 +97,6 @@ fn lazy_reduction_sees_a_later_write_to_its_elementwise_operand() {
 /// in place of the range, and with two flips; not with a slice-only first write or a second
 /// write of the whole array.
 #[test]
-#[ignore = "finding 4: write into a slice of a lazy array whose expression a flipped write replaced"]
 fn slice_write_after_a_flipped_write_into_a_lazy_array_is_lost() {
     check(Program {
         config: Config::default_engine(),
@@ -113,7 +111,6 @@ fn slice_write_after_a_flipped_write_into_a_lazy_array_is_lost() {
 }
 
 #[test]
-#[ignore = "finding 4: write into a slice of a lazy array whose expression a flipped write replaced"]
 fn slice_write_after_a_flipped_write_into_an_expression_is_lost() {
     check(Program {
         config: Config::default_engine(),
@@ -131,7 +128,6 @@ fn slice_write_after_a_flipped_write_into_an_expression_is_lost() {
 /// written but the view itself keeps showing the data it had (the old element), not the
 /// assigned data ("the receiver shows the new data", `tests/assign.rs`).
 #[test]
-#[ignore = "finding 5: the receiver of a write through a view taken before an earlier write into the base shows old data"]
 fn view_assigned_after_its_base_was_written_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
@@ -146,7 +142,6 @@ fn view_assigned_after_its_base_was_written_shows_the_old_data() {
 }
 
 #[test]
-#[ignore = "finding 5: the receiver of a write through a view taken before an earlier write into the base shows old data"]
 fn view_of_a_view_assigned_after_its_base_was_written_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
@@ -164,7 +159,6 @@ fn view_of_a_view_assigned_after_its_base_was_written_shows_the_old_data() {
 /// Finding 5, simplest form: an evaluated view keeps its own buffer, which a write through it
 /// does not update (the base is written, the view still shows the old values).
 #[test]
-#[ignore = "finding 5: the receiver of a write through an evaluated view shows old data"]
 fn evaluated_view_assigned_through_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
@@ -179,10 +173,10 @@ fn evaluated_view_assigned_through_shows_the_old_data() {
 }
 
 /// Finding 6: an `iterate_all` of two steps whose body takes from an array outside the loop,
-/// with the fusion limit at 3 nodes or fewer: afterwards the outside array holds wrong
-/// elements (`concat(x, x)[13]` is 1, not `x[1]`).
+/// with the fusion limit at 3 nodes or fewer: the pending `concat` read by the `take` ran inside
+/// the recording and took over its operand's buffer, so the replays overwrote it
+/// (`concat(x, x)[13]` was 1, not `x[1]`). Same cause as finding 7.
 #[test]
-#[ignore = "finding 6: iterate_all with a gather from an outer array corrupts it when max_nodes <= 3"]
 fn iterate_all_with_a_gather_and_a_tight_node_limit_corrupts_the_outer_array() {
     check(Program {
         config: Config { max_nodes: 2, ..Config::default_engine() },
@@ -202,10 +196,10 @@ fn iterate_all_with_a_gather_and_a_tight_node_limit_corrupts_the_outer_array() {
 }
 
 /// Finding 7: `x *= -2` is a lazy expression that reuses `x`'s buffer; a traced loop that reads
-/// `x` forces it inside the trace, so the recorded launches include `x *= -2` and every replayed
-/// step multiplies `x` again (`x[0]` ends at `-32` instead of `8`).
+/// `x` forces it inside the trace, and the recorded launch (which overwrote `x`'s old buffer) was
+/// replayed at every step (`x[0]` ended at `-32` instead of `8`). Fixed with finding 6: a
+/// recording never overwrites a buffer that is older than the recording.
 #[test]
-#[ignore = "finding 7: a lazy in-place compound assignment captured by a traced loop is replayed with the loop"]
 fn captured_lazy_compound_assignment_is_replayed_with_the_loop() {
     check(Program {
         config: Config::default_engine(),
@@ -237,23 +231,76 @@ fn lazy_reduction_of_an_expression_sees_a_later_write_to_its_input() {
     });
 }
 
-/// Finding 12 (found by FixF3 while fixing finding 3): two equal expressions share one node, so
-/// `cache` of one evaluates the base of a flipped view of the other; the write through that view
-/// is then not shown by the view (`v[6]` is `-1`, not `-2`). Same family as finding 5.
+/// Finding 11 (found while fixing finding 2, independent of it): a lazy `Range` of `u32`
+/// created after a slice write into a lazy expression loses its own slice write.
 #[test]
-#[ignore = "finding 12: the receiver of a write through a view whose shared base node a cache evaluated shows old data"]
-fn view_shows_old_data_after_a_cache_evaluated_the_shared_base_node() {
+fn slice_write_into_a_range_created_after_another_slice_write_is_lost() {
     check(Program {
         config: Config::default_engine(),
         math: false,
         stmts: vec![
-            Input { dims: [7, 5, 1, 1], ty: U32, seed: 0 },
-            Select { mask: 0, a: Const(-2.0), b: Const(-1.0), ty: F32 },
-            Unary { src: 1, op: ToDf32 },
-            Unary { src: 1, op: ToDf32 },
-            View { src: 3, view: Flip { axis: 0 } },
-            Cache { src: 2 },
-            Assign { target: 4, path: vec![], rhs: Const(-2.0) },
+            Input { dims: [7, 5, 1, 1], ty: F32, seed: 0 },
+            Unary { src: 0, op: Neg },
+            Assign { target: 1, path: vec![InjSlice { axis: 1, lo: 1, hi: 2 }], rhs: Const(-1.0) },
+            Range { dims: [7, 5, 1, 1], axis: 1, ty: U32 },
+            Assign { target: 2, path: vec![InjSlice { axis: 1, lo: 3, hi: 4 }], rhs: Const(0.0) },
+        ],
+    });
+}
+
+/// Finding 10 (found while fixing findings 6 and 7; no loop involved): a whole-array write
+/// through two flips replaces the lazy array's expression, a view of it is taken afterwards and
+/// written through; the write into the view does not reach the array (`element 40` keeps the
+/// old value). Same family as finding 4, through a view variable.
+#[test]
+fn view_of_a_lazy_array_after_a_flipped_write_loses_a_write_through_it() {
+    check(Program {
+        config: Config { staging: false, ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [8, 8, 1, 1], ty: F32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Const(0.5), op: Minimum },
+            Assign { target: 1, path: vec![InjFlip { axis: 0 }, InjFlip { axis: 0 }], rhs: Var(0) },
+            View { src: 1, view: Slice { axis: 1, lo: 4, hi: 7 } },
+            Assign { target: 2, path: vec![InjSlice { axis: 1, lo: 1, hi: 3 }, InjFlip { axis: 0 }], rhs: Const(1.0) },
+        ],
+    });
+}
+
+/// Finding 9: `v = x.slice(143..299); s = v.shift(3); v.assign(&s)`: the right-hand side reads
+/// the region being written at other elements than the one it stores, so the view is evaluated
+/// first (it is read before the write); the write was correct but the receiver `v` kept the
+/// evaluated old data instead of showing the assigned one (`v[0]` is 1.717 instead of 1.307).
+#[test]
+fn assign_of_a_shift_of_the_written_region_shows_the_assigned_data() {
+    check(Program {
+        config: Config { staging: false, ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [300, 1, 1, 1], ty: F32, seed: 0 },
+            View { src: 0, view: Slice { axis: 0, lo: 143, hi: 299 } },
+            View { src: 1, view: ShiftCirc { offs: vec![3] } },
+            Assign { target: 1, path: vec![], rhs: Var(2) },
+        ],
+    });
+}
+
+/// Finding 12 (found while fixing 4, 5 and 9): `v1 = x.slice(..); x.transpose().assign(0.0);
+/// v2 = v1.slice(..); select(r, &v2, -2.0)`. `v1` was evaluated by the write (it keeps the old
+/// element) but `v2`, a view of it, was composed with `v1`'s view of `x` instead of reading
+/// `v1`'s buffer, so it showed the written data (`select(r, v2, -2)[1]` is 0, not the old 1).
+#[test]
+fn view_of_a_view_recorded_before_a_transposed_write_keeps_the_old_data() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [300, 1, 1, 1], ty: F32, seed: 32202 },
+            View { src: 0, view: Slice { axis: 0, lo: 293, hi: 294 } },
+            Assign { target: 0, path: vec![InjTranspose], rhs: Const(0.0) },
+            View { src: 1, view: Slice { axis: 0, lo: 0, hi: 1 } },
+            Range { dims: [12, 1, 1, 1], axis: 0, ty: U32 },
+            Select { mask: 3, a: Var(2), b: Const(-2.0), ty: F32 },
         ],
     });
 }
@@ -272,6 +319,27 @@ fn sum_where_sees_a_later_write_to_the_equal_select() {
             SumWhere { src: 0, mask: 1 },
             Select { mask: 1, a: Var(0), b: Const(0.0), ty: F32 },
             Assign { target: 3, path: vec![InjFlip { axis: 1 }, InjTranspose], rhs: Const(-2.0) },
+        ],
+    });
+}
+
+/// Finding 14 (found while fixing finding 3; same family as finding 5): two equal expressions
+/// share one node, so `cache` of one evaluates the base of a flipped view of the other; the
+/// write through that view is not shown by the view (`v[6]` is `-1`, not `-2`).
+#[test]
+#[ignore = "finding 14: the receiver of a write through a view whose shared base node a cache evaluated shows old data"]
+fn view_shows_the_written_data_after_a_cache_evaluated_the_shared_base_node() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [7, 5, 1, 1], ty: U32, seed: 0 },
+            Select { mask: 0, a: Const(-2.0), b: Const(-1.0), ty: F32 },
+            Unary { src: 1, op: ToDf32 },
+            Unary { src: 1, op: ToDf32 },
+            View { src: 3, view: Flip { axis: 0 } },
+            Cache { src: 2 },
+            Assign { target: 4, path: vec![], rhs: Const(-2.0) },
         ],
     });
 }

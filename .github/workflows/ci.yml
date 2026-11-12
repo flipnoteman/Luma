@@ -25,7 +25,7 @@ jobs:
       - run: cargo nextest run --locked
       - run: cargo nextest run --release --locked
       - name: Differential fuzzer
-        run: cargo test --release --locked fuzz::
+        run: "cargo test --release --locked fuzz::"
         env:
           LUMA_FUZZ_CASES: 200
       - run: cargo doc --no-deps
@@ -41,7 +41,7 @@ jobs:
       - name: Install software Vulkan (Mesa lavapipe)
         run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
       - name: Differential fuzzer, long run
-        run: cargo test --release --locked fuzz:: -- --nocapture
+        run: "cargo test --release --locked fuzz:: -- --nocapture"
         env:
           LUMA_FUZZ_CASES: 5000
       - name: Keep the shrunk failures

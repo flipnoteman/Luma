@@ -75,27 +75,33 @@ impl<T: ScalarType> Array<T> {
             return Err(LumaError::InvalidShape(format!("view of {} outside of the array", self.shape())).into());
         }
 
-        // What the node reads, and through which map.
-        let (operand, read_map) = match (self.view(), edge, self.pending()) {
-            // A view of a view that was not evaluated reads the original data directly, through
-            // the composed map.
-            // (Not when an assignment through this very view replaced its expression: the data
-            // it shows now is the assigned one, not what `view.base` holds.)
-            (Some(view), Edge::None, Some(_)) if !self.is_superseded() => {
-                let base = match &view.base {
-                    Src::Node(node) if node.is_pending() && jit::recompute_viewed(node) => Src::Node(Arc::clone(node)),
+        // What the node reads, and through which map. A view of a view that was not evaluated
+        // reads what that view's node reads, through the composed map. (Not what `view.base`
+        // holds: the node may read a snapshot of it, a view evaluated before a write into its
+        // base, and an assignment through the view may have replaced its expression.)
+        let inner = match (self.view(), edge, self.pending()) {
+            (Some(_), Edge::None, Some(node)) => node.operands().and_then(|args| match node.op().kind {
+                OpKind::Shift(ShiftKind::View { map: inner, edge: Edge::None }) => Some((args[0].clone(), inner)),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let (operand, read_map) = match (inner, self.pending()) {
+            (Some((read, inner)), _) => {
+                let base = match read {
+                    Src::Node(node) if node.is_pending() && jit::recompute_viewed(&node) => Src::Node(node),
                     Src::Node(node) => {
-                        node.context().jit().evaluate_alongside(Arc::clone(node));
+                        node.context().jit().evaluate_alongside(Arc::clone(&node));
                         match node.force() {
                             Ok(storage) => Src::Buffer(Arc::clone(storage)),
                             Err(error) => return Err(Failure::Inherited(Arc::clone(error))),
                         }
                     }
-                    other => other.clone(),
+                    other => other,
                 };
-                (base, view.map.then(&map))
+                (base, inner.then(&map))
             }
-            (_, _, Some(node)) if jit::recompute_viewed(node) => (Src::Node(Arc::clone(node)), map),
+            (None, Some(node)) if jit::recompute_viewed(node) => (Src::Node(Arc::clone(node)), map),
             _ => (Src::Buffer(Arc::clone(self.storage_alongside()?)), map),
         };
 
@@ -513,7 +519,7 @@ impl<T: ScalarType> Array<T> {
     /// The region that writing `rhs` into this array overwrites.
     pub(crate) fn region(&self, rhs: Rhs<'_, T>) -> Outcome<Region> {
         let ctx = self.context();
-        let (base, map, receiver) = match self.view() {
+        let (base, map, receiver, claim) = match self.view() {
             Some(view) => {
                 self.src()?;
                 let base = match &view.base {
@@ -532,12 +538,12 @@ impl<T: ScalarType> Array<T> {
                     }
                     Src::Scalar(_) => return Err(LumaError::InvalidShape("view of a scalar".into()).into()),
                 };
-                (base, view.map, self.pending().cloned())
+                (base, view.map, self.pending().cloned(), self.held().map(Held::share))
             }
-            None => (Arc::clone(self.storage()?), ViewMap::identity(dims32(self.shape())?), None),
+            None => (Arc::clone(self.storage()?), ViewMap::identity(dims32(self.shape())?), None, None),
         };
         let rhs = self.write_operand(&rhs)?;
-        Ok(Region { base, map, rhs, ty: ElemTy::of::<T>()?, receiver })
+        Ok(Region { base, map, rhs, ty: ElemTy::of::<T>()?, receiver, claim })
     }
 
     /// The write of `rhs` into this array if the array it is a view of is a pending expression

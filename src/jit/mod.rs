@@ -638,8 +638,9 @@ pub(crate) struct Node {
     /// by the hash-consing table: a write through one array must not show in another.
     handles: AtomicU32,
     /// What the arrays holding this node share (see [`Link`]); weak, so that the graph does not
-    /// own what replaced the node: the node that took over may read this one.
-    link: OnceLock<Weak<Link>>,
+    /// own what replaced the node: the node that took over may read this one. Dead when no array
+    /// holds the node (the next claim makes a new link).
+    link: Mutex<Weak<Link>>,
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
     /// Whether the node is in [`JitState::requested`].
@@ -683,12 +684,15 @@ struct Link {
 impl Held {
     pub(crate) fn new(node: Arc<Node>) -> Self {
         node.handles.fetch_add(1, Ordering::Relaxed);
-        let link = match node.link.get().and_then(Weak::upgrade) {
-            Some(link) => link,
-            None => {
-                let link = Arc::new(Link::default());
-                let _ = node.link.set(Arc::downgrade(&link));
-                link
+        let link = {
+            let mut shared = lock(&node.link);
+            match shared.upgrade() {
+                Some(link) => link,
+                None => {
+                    let link = Arc::new(Link::default());
+                    *shared = Arc::downgrade(&link);
+                    link
+                }
             }
         };
         Held { node, link }
@@ -713,11 +717,6 @@ impl Held {
     /// The node that holds the value of the arrays that were created holding this one.
     pub(crate) fn latest(&self) -> &Arc<Node> {
         &self.end().node
-    }
-
-    /// Whether an assignment replaced the node this claim is on.
-    pub(crate) fn is_superseded(&self) -> bool {
-        self.link.next.get().is_some()
     }
 
     /// Whether another array holds a claim on the node too.
@@ -988,7 +987,7 @@ impl Node {
     }
 
     /// A copy of the operands of a node that has not been evaluated.
-    fn operands(&self) -> Option<Args> {
+    pub(crate) fn operands(&self) -> Option<Args> {
         lock(&self.args).clone()
     }
 }
@@ -1488,7 +1487,7 @@ pub(crate) fn create(
         requested: AtomicBool::new(false),
         looped: OnceLock::new(),
         handles: AtomicU32::new(0),
-        link: OnceLock::new(),
+        link: Mutex::new(Weak::new()),
     });
 
     for (i, arg) in args.iter().enumerate().take(arity) {

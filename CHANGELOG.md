@@ -198,6 +198,26 @@ All notable changes to Luma are listed here. The format follows
 - wgpu's validation of indirect dispatches (an extra dispatch before every step of
   `iterate_until`/`iterate_until_all`) is off: the dispatch arguments are always written by the
   library's own gate kernels.
+- `x -= &x` with fast math and `x *= 0` on integers failed with "in-place assignment cannot run in
+  place": simplification removed the read of the target, and the compound assignment now runs as
+  a plain store into it.
+- A kernel whose only scalars are the amounts of circular shifts of a lazy expression
+  (`n + n.shift(-4)` with the fusion limit cutting the expression) failed with a bind group larger
+  than its layout: the staged kernel bakes the amounts in, so it has no uniform to bind.
+- `iterate_all` (and `iterate_until_all`) corrupted arrays created before the loop: a lazy
+  expression of such an array that the traced step evaluated (a gather from a `concat`, a scan of
+  a `x *= c` result) ran inside the recording and took over its operand's buffer, so every
+  replayed step overwrote it again (`x *= -2` was applied once per step). Tracing now evaluates
+  the live lazy arrays first.
+- `assign` through a view that was evaluated (`v.eval()`, or evaluated because the right-hand side
+  read it or an earlier write into the base flushed it) left the receiver showing the data from
+  before the write; the receiver now denotes its region of the written base, as documented. This
+  also fixes `v.assign(&v.shift(3))`, whose receiver kept the old data.
+- A slice write into a lazy array after a flipped (or transposed) write into it was lost: the
+  claim an array has on its expression could not be shared again once the arrays holding it had
+  all been dropped (a temporary `r.flip(0)` that was assigned through).
+- A view taken from an array that was a view evaluated before a write into its base read the
+  written base instead of the evaluated array (the old data it was recorded against).
 
 ## [0.2.0] - 2026-11-11
 

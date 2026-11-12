@@ -1004,17 +1004,7 @@ struct Known {
 }
 
 const KNOWN: &[Known] = &[
-    Known { id: "F1 compound assignment of a simplified expression", message: Some("in-place assignment cannot run in place"), shape: None },
-    Known {
-        id: "F2 bind group larger than the layout (shifted expression, max_nodes 2)",
-        message: Some("Number of bindings in bind group descriptor"),
-        shape: None,
-    },
-    Known { id: "F4 slice write after a flipped write into a lazy array is lost", message: None, shape: Some(flipped_write_then_slice_write) },
-    Known { id: "F5 receiver of a write through an older view shows old data", message: None, shape: Some(view_assigned_after_base_write) },
-    Known { id: "F12 receiver of a write through a view whose base a cache evaluated shows old data", message: None, shape: Some(cached_then_view_assigned) },
-    Known { id: "F6 traced loop with a gather corrupts an outer array (max_nodes <= 3)", message: None, shape: Some(traced_gather_with_tight_limit) },
-    Known { id: "F7 lazy compound assignment captured by a traced loop is replayed", message: None, shape: Some(captured_compound_in_loop) },
+    Known { id: "F14 receiver of a write through a view whose base a cache evaluated shows old data", message: None, shape: Some(cached_then_view_assigned) },
     Known {
         id: "F8 wrong value only when programs run concurrently on one context (unminimized; masks other concurrency failures)",
         message: Some("only when run concurrently"),
@@ -1022,27 +1012,7 @@ const KNOWN: &[Known] = &[
     },
 ];
 
-/// F7: a compound assignment to a variable that a later traced loop reads (captured).
-fn captured_compound_in_loop(program: &Program) -> bool {
-    program.stmts.iter().enumerate().any(|(i, stmt)| {
-        let Stmt::Compound { target, .. } = stmt else { return false };
-        program.stmts[i + 1..].iter().any(|later| {
-            matches!(later, Stmt::Loop { kind: LoopKind::IterateAll | LoopKind::IterateUntilAll, .. }) && later.mentions().contains(target)
-        })
-    })
-}
-
-/// F6: a traced loop of two steps or more with a gather in its body, under a fusion limit of
-/// three nodes or fewer.
-fn traced_gather_with_tight_limit(program: &Program) -> bool {
-    program.config.max_nodes <= 3
-        && program.stmts.iter().any(|stmt| {
-            matches!(stmt, Stmt::Loop { kind: LoopKind::IterateAll | LoopKind::IterateUntilAll, steps, body, .. }
-                if *steps >= 2 && body.iter().any(|s| matches!(s, Stmt::View { view: ViewOp::Take { .. }, .. })))
-        })
-}
-
-/// F12: an `Assign` through a variable that is a slice, flip or transpose view, after a `Cache`
+/// F14: an `Assign` through a variable that is a slice, flip or transpose view, after a `Cache`
 /// (which can evaluate a node the view's base shares with the cached array).
 fn cached_then_view_assigned(program: &Program) -> bool {
     let created = created_counts(program);
@@ -1064,47 +1034,6 @@ fn cached_then_view_assigned(program: &Program) -> bool {
     program.stmts.iter().enumerate().any(|(i, stmt)| {
         matches!(stmt, Stmt::Cache { .. })
             && program.stmts[i + 1..].iter().any(|later| matches!(later, Stmt::Assign { target, .. } if views.contains(target)))
-    })
-}
-
-/// F5: a view of a variable that something touched (evaluated it, wrote its base, used it as
-/// a loop state, ...) and that is then assigned through.
-fn view_assigned_after_base_write(program: &Program) -> bool {
-    let created = created_counts(program);
-    let mut first = Vec::with_capacity(created.len());
-    let mut next = 0;
-    for c in &created {
-        first.push(next);
-        next += c;
-    }
-    // View variable -> (the oldest statement along its chain of views, the variables of the chain).
-    let mut views: std::collections::HashMap<usize, (usize, Vec<usize>)> = std::collections::HashMap::new();
-    for (i, stmt) in program.stmts.iter().enumerate() {
-        if let Stmt::View { src, view: ViewOp::Slice { .. } | ViewOp::Flip { .. } | ViewOp::Transpose } = stmt
-            && created[i] == 1
-        {
-            let (born, mut chain) = views.get(src).cloned().unwrap_or((i, vec![*src]));
-            chain.push(first[i]);
-            views.insert(first[i], (born, chain));
-        }
-    }
-    views.iter().any(|(&v, (born, chain))| {
-        let assigned = |k: usize| matches!(&program.stmts[k], Stmt::Assign { target, .. } if *target == v);
-        (born + 1..program.stmts.len()).filter(|&k| assigned(k)).any(|k| {
-            (born + 1..k).any(|j| {
-                !matches!(program.stmts[j], Stmt::View { .. }) && program.stmts[j].mentions().iter().any(|m| chain.contains(m))
-            })
-        })
-    })
-}
-
-/// F4: a write through a path with a flip or transpose into a variable, and later a write
-/// through a non-empty path into the same variable.
-fn flipped_write_then_slice_write(program: &Program) -> bool {
-    program.stmts.iter().enumerate().any(|(i, stmt)| {
-        let Stmt::Assign { target, path, .. } = stmt else { return false };
-        path.iter().any(|v| !matches!(v, InjView::InjSlice { .. }))
-            && program.stmts[i + 1..].iter().any(|later| matches!(later, Stmt::Assign { target: t, path, .. } if t == target && !path.is_empty()))
     })
 }
 

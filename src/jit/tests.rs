@@ -2542,3 +2542,27 @@ fn another_threads_pending_node_is_not_shared_by_hash_consing() {
     assert!(!std::sync::Arc::ptr_eq(&node, there.pending().unwrap()), "another thread's is its own");
     assert_eq!(user.to_vec().unwrap()[..3], [1, 2, 3]);
 }
+
+/// A lazy array created before a traced loop and read through a captured handle is evaluated
+/// once, before the loop: it must not be recorded with the step (and replayed against the buffers
+/// the step overwrites), nor take over its operand's buffer inside the recording.
+#[test]
+fn lazy_arrays_captured_by_a_traced_loop_are_not_replayed_with_it() {
+    let ctx = ctx();
+    let xs: Vec<f32> = (0..12).map(|i| i as f32 / 8.0 + 0.25).collect();
+    let x = Array::<f32>::from_slice_on(&ctx, &xs, 12).unwrap();
+    let s = Array::<f32>::from_slice_on(&ctx, &xs, 12).unwrap();
+    let y = &x * 2.0;
+    let mut z = Array::<f32>::from_slice_on(&ctx, &xs, 12).unwrap();
+    z *= -2.0;
+    let [r] = crate::iterate_all([&s], 3, |s| {
+        let mut shared = x.clone();
+        shared += 1.0; // overwrites x: `y` must have been computed from the old contents
+        [s[0].cumsum(0) + z.cumsum(0)]
+    });
+    let host = |f: &dyn Fn(f32) -> f32| xs.iter().map(|&v| f(v)).collect::<Vec<_>>();
+    assert_eq!(y.to_vec().unwrap(), host(&|v| v * 2.0));
+    assert_eq!(x.to_vec().unwrap(), host(&|v| v + 3.0));
+    assert_eq!(z.to_vec().unwrap(), host(&|v| v * -2.0));
+    r.to_vec().unwrap();
+}
