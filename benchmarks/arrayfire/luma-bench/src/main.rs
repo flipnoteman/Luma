@@ -14,6 +14,15 @@ fn per_step(g0: &Array<f32>, steps: usize, step: impl Fn(&Array<f32>) -> Array<f
     let mut u = g0 * 1.0;
     for _ in 0..steps {
         u = step(&u);
+        u.eval().unwrap();
+    }
+    u
+}
+
+fn lazy_chain(g0: &Array<f32>, steps: usize, step: impl Fn(&Array<f32>) -> Array<f32>) -> Array<f32> {
+    let mut u = g0 * 1.0;
+    for _ in 0..steps {
+        u = step(&u);
     }
     u
 }
@@ -76,12 +85,30 @@ fn check(name: &str, err: f32, tol: f32) {
     assert!(err <= tol, "{name}: error {err:e} exceeds tolerance {tol:e}");
 }
 
-fn report(row: Row, mut f: impl FnMut()) {
+/// `a`, requested; returned so the caller keeps it until the sync, since an array dropped
+/// before it is computed never is.
+fn requested(a: Array<f32>) -> Array<f32> {
+    a.eval().unwrap();
+    a
+}
+
+fn report<R>(row: Row, mut f: impl FnMut() -> R) {
     eprintln!("  {} {} {}: err {:e}", row.workload, row.size, row.variant, row.err);
     let ctx = default_context().unwrap();
     let t = time(|| {
-        f();
+        let kept = f();
         ctx.sync().unwrap();
+        drop(kept);
+    });
+    print_row(&row, &t);
+}
+
+fn cold<R>(row: Row, f: impl FnOnce() -> R) {
+    let ctx = default_context().unwrap();
+    let t = time_once(|| {
+        let kept = f();
+        ctx.sync().unwrap();
+        drop(kept);
     });
     print_row(&row, &t);
 }
@@ -92,6 +119,19 @@ fn heat(sz: &Sizes) {
         let u0 = values(w * w, 10, 0.0, 1.0);
         let want = heat_ref(w, w, &u0, steps);
         let g = Array::from_slice(&u0, [w, w]).unwrap();
+        cold(
+            Row {
+                workload: "heat",
+                size: format!("{w}x{w}"),
+                variant: "per_step_cold",
+                library: "luma",
+                backend: BACKEND,
+                work: (w * w * steps) as f64,
+                unit: "Gcell/s",
+                err: 0.0,
+            },
+            || requested(per_step(&g, steps, heat_step)),
+        );
         let mk = |variant: &'static str, run: &dyn Fn() -> Array<f32>| {
             let err = rel_err(&run().to_vec().unwrap(), &want);
             check(&format!("heat {w} {variant}"), err, 1e-4);
@@ -107,9 +147,63 @@ fn heat(sz: &Sizes) {
             }
         };
         let it = || g.iterate(steps, heat_step);
-        report(mk("iterate", &it), || it().eval().unwrap());
+        report(mk("iterate", &it), || requested(it()));
         let ps = || per_step(&g, steps, heat_step);
-        report(mk("per_step", &ps), || ps().eval().unwrap());
+        report(mk("per_step", &ps), || requested(ps()));
+        let lc = || lazy_chain(&g, steps, heat_step);
+        report(mk("lazy_chain", &lc), || requested(lc()));
+    }
+}
+
+fn converge(sz: &Sizes) {
+    let steps = sz.converge_steps;
+    for &w in &sz.converge {
+        let u0 = values(w * w, 10, 0.0, 1.0);
+        let want = heat_ref(w, w, &u0, steps);
+        let g = Array::from_slice(&u0, [w, w]).unwrap();
+        let run = || {
+            let mut u = &g * 1.0;
+            for _ in 0..steps {
+                let next = heat_step(&u);
+                let err = (&next - &u).abs().max().unwrap();
+                u = next;
+                if err < sz.converge_tol {
+                    break;
+                }
+            }
+            u
+        };
+        let err = rel_err(&run().to_vec().unwrap(), &want);
+        check(&format!("converge {w} readback_every_step"), err, 1e-4);
+        report(
+            Row {
+                workload: "converge",
+                size: format!("{w}x{w}"),
+                variant: "readback_every_step",
+                library: "luma",
+                backend: BACKEND,
+                work: (w * w * steps) as f64,
+                unit: "Gcell/s",
+                err,
+            },
+            || requested(run()),
+        );
+        let until = || g.iterate_until(steps, sz.converge_tol, heat_step);
+        let err = rel_err(&until().to_vec().unwrap(), &want);
+        check(&format!("converge {w} iterate_until"), err, 1e-4);
+        report(
+            Row {
+                workload: "converge",
+                size: format!("{w}x{w}"),
+                variant: "iterate_until",
+                library: "luma",
+                backend: BACKEND,
+                work: (w * w * steps) as f64,
+                unit: "Gcell/s",
+                err,
+            },
+            || requested(until()),
+        );
     }
 }
 
@@ -134,9 +228,11 @@ fn life(sz: &Sizes) {
             }
         };
         let it = || g.iterate(steps, life_step);
-        report(mk("iterate", &it), || it().eval().unwrap());
+        report(mk("iterate", &it), || requested(it()));
         let ps = || per_step(&g, steps, life_step);
-        report(mk("per_step", &ps), || ps().eval().unwrap());
+        report(mk("per_step", &ps), || requested(ps()));
+        let lc = || lazy_chain(&g, steps, life_step);
+        report(mk("lazy_chain", &lc), || requested(lc()));
     }
 }
 
@@ -164,7 +260,7 @@ fn blackscholes(sz: &Sizes) {
         };
         let err = rel_err(&black_scholes(&gs, &gk, &gt).to_vec().unwrap(), &want);
         check(&format!("blackscholes {n} price"), err, 1e-4);
-        report(row("price", err), || black_scholes(&gs, &gk, &gt).eval().unwrap());
+        report(row("price", err), || requested(black_scholes(&gs, &gk, &gt)));
 
         let got_sum = black_scholes(&gs, &gk, &gt).sum().unwrap() as f64;
         let err = ((got_sum - want_sum).abs() / want_sum.abs()) as f32;
@@ -208,12 +304,11 @@ fn mandelbrot(sz: &Sizes) {
             unit: "Gpix-iter/s",
             err,
         };
+        cold(row("eval_every_1_cold", 0.0), || run(1));
         for (variant, every) in [("eval_every_1", 1usize), ("eval_every_8", 8), ("eval_end_only", 0)] {
             let err = mismatch_frac(&run(every).to_vec().unwrap(), &want);
             check(&format!("mandelbrot {w} {variant}"), err, 0.01);
-            report(row(variant, err), || {
-                run(every);
-            });
+            report(row(variant, err), || run(every));
         }
 
         let looped = || -> Array<f32> {
@@ -227,7 +322,7 @@ fn mandelbrot(sz: &Sizes) {
         };
         let err = mismatch_frac(&looped().to_vec().unwrap(), &want);
         check(&format!("mandelbrot {w} iterate_all"), err, 0.01);
-        report(row("iterate_all", err), || looped().eval().unwrap());
+        report(row("iterate_all", err), || requested(looped()));
 
         let kernel = Kernel::new(MANDELBROT).unwrap();
         let ctx = default_context().unwrap();
@@ -271,14 +366,14 @@ fn fir(sz: &Sizes) {
         };
         let err = rel_err(&sample(&gx.conv1d_fft(&gh)), &want);
         check(&format!("fir {taps} fft"), err, if taps > 4095 { 1e-3 } else { 1e-4 });
-        report(row("fft", err), || gx.conv1d_fft(&gh).eval().unwrap());
+        report(row("fft", err), || requested(gx.conv1d_fft(&gh)));
 
         if taps <= sz.fir_direct_max_taps {
             let hr: Vec<f32> = h.iter().rev().copied().collect();
             let ghr = Array::from_slice(&hr, taps).unwrap();
             let err = rel_err(&sample(&gx.conv1d(&ghr, 1, taps - 1)), &want);
             check(&format!("fir {taps} direct"), err, 1e-4);
-            report(row("direct", err), || gx.conv1d(&ghr, 1, taps - 1).eval().unwrap());
+            report(row("direct", err), || requested(gx.conv1d(&ghr, 1, taps - 1)));
         }
     }
 }
@@ -326,8 +421,9 @@ fn main() {
     let args = parse_args();
     let sz = sizes(args.quick);
     print_header();
-    let workloads: [(&str, fn(&Sizes)); 6] = [
+    let workloads: [(&str, fn(&Sizes)); 7] = [
         ("heat", heat),
+        ("converge", converge),
         ("life", life),
         ("blackscholes", blackscholes),
         ("mandelbrot", mandelbrot),

@@ -53,12 +53,21 @@
 //! a solely owned array) reuses that buffer instead of allocating one, as long as the input is
 //! read only at the element being written (not through a shift). Compound assignment on an array
 //! whose buffer is shared is such a kernel too, forced onto the shared buffer.
+//!
+//! # Loops
+//!
+//! `eval` calls that advance the same arrays through the same step are a loop: the arrays of
+//! the newest call become *loop leaves* that stand for the step applied to the previous ones, so
+//! the pending graph stays one step deep and the postponed steps run at once (see [`looped`]).
 
 mod codegen;
 mod launch;
+mod looped;
 mod program;
 mod readers;
+pub(crate) mod speculate;
 mod stencil;
+mod until;
 #[cfg(test)]
 mod tests;
 
@@ -75,9 +84,12 @@ use crate::gpu::lock;
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 
+use looped::LoopPlan;
+
 pub(crate) use launch::{evaluate, evaluate_group, evaluate_into, reduce_first_pass, run_loop};
 pub(crate) use readers::Readers;
 pub(crate) use stencil::plan as stencil_plan;
+pub(crate) use until::run_until;
 
 /// Length of the requested list at which entries of dropped or computed nodes are pruned.
 const REQUESTED_PRUNE_AT: usize = 256;
@@ -99,6 +111,8 @@ const MAX_INPUTS: usize = 16;
 /// Environment variable overriding [`DEFAULT_MAX_NODES`] for new contexts. `1` makes every
 /// operation its own kernel.
 const MAX_NODES_ENV: &str = "LUMA_FUSION_MAX_NODES";
+/// Set to `off` to disable speculation at readbacks (see [`speculate`]).
+const SPECULATE_ENV: &str = "LUMA_SPECULATE";
 
 /// Element type of a lazy operation's operands and results.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -281,13 +295,17 @@ pub(crate) struct Node {
     /// Set once the node's value was computed inside another node's kernel (or a reduction).
     /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
     fused: AtomicBool,
-    /// Whether the expression reads a shifted lazy expression (recomputed, see
+    /// Levels of shifted lazy expressions nested in the expression (0: none; see
     /// [`recompute_shifted`]).
-    recomputes: bool,
+    shift_depth: u8,
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
     /// Whether the node is in [`JitState::requested`].
     requested: AtomicBool,
+    /// Set when the node was found to be a state of a repeating step (see [`looped`]): its value
+    /// is output `j` of the plan, which runs all the steps at once, and the node released its
+    /// own operands.
+    looped: OnceLock<(Arc<LoopPlan>, u32)>,
 }
 
 impl std::fmt::Debug for Node {
@@ -303,17 +321,29 @@ impl std::fmt::Debug for Node {
 impl Node {
     /// Operations in the expression behind this node, itself included.
     fn size(&self) -> usize {
-        self.below_len + 1
+        if self.looped.get().is_some() { 1 } else { self.below_len + 1 }
     }
 
     /// Ids of the distinct nodes in the expression below this one, sorted.
     fn below(&self) -> &[u64] {
+        if self.looped.get().is_some() {
+            return &[];
+        }
         self.ids.get(..self.below_len).unwrap_or(&[])
     }
 
     /// Ids of the distinct buffers the expression reads, sorted.
     fn inputs(&self) -> &[u64] {
-        self.ids.get(self.below_len..).unwrap_or(&[])
+        match self.looped.get() {
+            Some((plan, _)) => &plan.input_ids,
+            None => self.ids.get(self.below_len..).unwrap_or(&[]),
+        }
+    }
+
+    /// Levels of shifted lazy expressions in the expression (see [`recompute_shifted`]). The plan
+    /// of a loop leaf evaluates its inputs, so it has none.
+    fn shift_depth(&self) -> u8 {
+        if self.looped.get().is_some() { 0 } else { self.shift_depth }
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -354,12 +384,15 @@ impl Node {
     fn compute(self: &Arc<Self>) -> NodeResult {
         let args = lock(&self.args).take();
         let outcome = match args {
-            Some(args) => evaluate(self, args),
-            None => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
+            Some(args) => evaluate(self, args).map(Arc::new),
+            None => match self.looped.get() {
+                Some((plan, j)) => plan.output(&self.ctx, *j, self.name, self.location),
+                None => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
+            },
         };
         match outcome {
             Ok(storage) => {
-                let storage = Arc::new(storage);
+                storage.set_producer(self.id);
                 storage.readers.absorb(&self.readers);
                 Ok(storage)
             }
@@ -376,8 +409,13 @@ impl Node {
     /// Stores `storage`, computed for this node inside a kernel with several outputs, as the
     /// node's result, unless another thread evaluated it meanwhile.
     fn finish(&self, storage: Storage) {
-        let storage = Arc::new(storage);
+        self.finish_shared(Arc::new(storage));
+    }
+
+    /// [`Node::finish`] for a buffer that others hold too.
+    fn finish_shared(&self, storage: Arc<Storage>) {
         if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
+            storage.set_producer(self.id);
             storage.readers.absorb(&self.readers);
             lock(&self.args).take();
         }
@@ -479,7 +517,7 @@ thread_local! {
 /// [`measured_ids`].
 fn measure(args: &[Src]) -> (usize, usize) {
     if let Some(node) = only_node(args) {
-        return (node.below_len + 1, node.inputs().len());
+        return (node.size(), node.inputs().len());
     }
     MEASURED.with_borrow_mut(|m| {
         let Measured { below, inputs, tmp } = m;
@@ -637,10 +675,16 @@ pub(crate) fn create(
         // Without this, a long chain built without `eval` keeps the GPU idle until its end.
         let _ = ctx.submit();
     }
-    let recomputes = args.iter().take(arity).enumerate().any(|(i, arg)| match arg {
-        Src::Node(operand) => operand.recomputes || (i == 0 && matches!(op.kind, OpKind::Shift(_))),
-        _ => false,
-    });
+    let shift_depth = args
+        .iter()
+        .take(arity)
+        .enumerate()
+        .map(|(i, arg)| match arg {
+            Src::Node(operand) => operand.shift_depth().saturating_add(u8::from(i == 0 && matches!(op.kind, OpKind::Shift(_)))),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
 
     let node = Arc::new(Node {
         ctx: ctx.clone(),
@@ -655,9 +699,10 @@ pub(crate) fn create(
         below_len,
         consumers: AtomicU32::new(0),
         fused: AtomicBool::new(false),
-        recomputes,
+        shift_depth,
         readers: Readers::default(),
         requested: AtomicBool::new(false),
+        looped: OnceLock::new(),
     });
 
     for (i, arg) in args.iter().enumerate().take(arity) {
@@ -682,19 +727,31 @@ pub(crate) fn create(
     Ok(node)
 }
 
-/// Most operations of a lazy expression that a shift recomputes at the shifted element instead
-/// of evaluating it first. Every shift of it repeats them, but nothing goes through memory.
-const MAX_RECOMPUTED: usize = 16;
+/// Most levels of shifted lazy expressions a kernel stages in workgroup memory.
+const MAX_STAGES: u8 = 3;
 
-/// Whether a shift of `node` reads its expression recomputed rather than evaluated. Only one
-/// level: an expression that already recomputes a shifted one is evaluated, or every further
-/// stencil step would multiply the work by its number of shifts.
-pub(crate) fn recompute_shifted(node: &Node) -> bool {
-    // A recomputed expression runs inside kernels of segmented programs only if it fits one
-    // segment, so segmented programs have no sub-programs.
-    node.size() <= MAX_RECOMPUTED
-        && !node.recomputes
-        && node.len() as u64 * 4 <= node.context().segment_bytes()
+/// Whether a shift (of `dims`, by `offsets`) of `node` reads its expression lazily rather than
+/// evaluated. A staged sub-program costs its expression about once per cell plus the halo,
+/// while one called per shift costs it once per shift, so small shifts nest up to
+/// [`MAX_STAGES`] levels; anything else recomputes a small expression one level only, or every
+/// further stencil step would multiply the work by its number of shifts.
+pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 4]) -> bool {
+    // A lazy operand runs inside kernels of segmented programs only if it fits one segment, so
+    // segmented programs have no sub-programs.
+    if node.len() as u64 * 4 > node.context().segment_bytes() {
+        return false;
+    }
+    let small = |axis: usize| {
+        let dim = dims[axis] as isize;
+        let offset = offsets[axis].rem_euclid(dim.max(1));
+        (if offset > dim / 2 { offset - dim } else { offset }).abs() <= 2
+    };
+    let stageable = dims[2] == 1
+        && dims[3] == 1
+        && (0..2).all(small)
+        && node.shift_depth() < MAX_STAGES - 1
+        && node.size() <= 64;
+    stageable || (node.size() <= node.context().tuning().max_recomputed && node.shift_depth() == 0)
 }
 
 /// Per-context state of the fusion machinery.
@@ -714,6 +771,10 @@ pub(crate) struct JitState {
     /// Most element-instructions per launch of a register loop, see [`launch::run_loop`].
     loop_work: AtomicU64,
     stats: Stats,
+    /// Follows consecutive `eval` calls to find loops (see [`looped`]).
+    tracker: Mutex<looped::Tracker>,
+    /// Follows reduction readbacks to find loops that can be speculated (see [`speculate`]).
+    speculation: Mutex<speculate::Tracker>,
 }
 
 /// Counters of the fusion machinery, read by tests.
@@ -759,6 +820,10 @@ impl JitState {
             max_inputs,
             loop_work: AtomicU64::new(launch::LOOP_WORK_PER_LAUNCH),
             stats: Stats::default(),
+            tracker: Mutex::new(looped::Tracker::default()),
+            speculation: Mutex::new(speculate::Tracker::new(
+                !std::env::var(SPECULATE_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
+            )),
         }
     }
 
@@ -769,6 +834,16 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_loop_work(&self, work: u64) {
         self.loop_work.store(work.max(1), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn speculation_hits(&self) -> u64 {
+        lock(&self.speculation).hits
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_speculate(&self, on: bool) {
+        lock(&self.speculation).enabled = on;
     }
 
     #[cfg(test)]
@@ -936,6 +1011,7 @@ impl JitState {
             return Ok(Arc::clone(core));
         }
         let core = Arc::new(kernel::build_core(ctx, &KernelKey::new(source.clone(), "main", None), Some(label), true)?);
+        self.stats.built.fetch_add(1, Ordering::Relaxed);
         cache.insert(source, Arc::clone(&core));
         Ok(core)
     }

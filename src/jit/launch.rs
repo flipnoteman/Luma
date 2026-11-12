@@ -41,24 +41,38 @@ pub(crate) fn run_loop(
     let ids: Vec<u64> = probes.iter().map(|probe| probe.id()).collect();
     let fused = flatten_inner(&roots, Tail::Store, &ids).ok()?;
     drop(roots);
-    let key = &fused.key;
-    let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
-    let all_f32 = key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| i.op.out_ty() == ElemTy::F32));
-    if probes.iter().any(|probe| probe.was_materialized())
-        || shifts
-        || !key.subs.is_empty()
-        || !all_f32
-        || fused.inputs.iter().any(|input| input.segments() != 1)
-    {
+    if probes.iter().any(|probe| probe.was_materialized()) {
         return None;
     }
     let states: Vec<Option<usize>> =
         fused.inputs.iter().map(|input| probes.iter().position(|probe| Arc::ptr_eq(probe, input))).collect();
-    let bindings = 2 * outs.len() + states.iter().filter(|state| state.is_none()).count();
+    run_loop_fused(ctx, &fused, &states, inits, steps)
+}
+
+/// Runs `steps` iterations of the store program `fused` (one output per state, `outputs[j]` the
+/// next value of state `j`) in one kernel that keeps the states in registers. `states[k]` is the
+/// state that input `k` reads (`None`: an input that stays fixed) and `inits` the states before
+/// the first step. `None` if the program is not a single-buffer elementwise program of `f32`
+/// values.
+pub(super) fn run_loop_fused(
+    ctx: &crate::context::Context,
+    fused: &Fused,
+    states: &[Option<usize>],
+    inits: &[Arc<Storage>],
+    steps: u32,
+) -> Option<Result<Vec<Arc<Storage>>, Failure>> {
+    let key = &fused.key;
+    let len = usize::try_from(inits.first()?.byte_len() / ELEMENT_BYTES).ok()?;
+    let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
+    let all_f32 = key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| i.op.out_ty() == ElemTy::F32));
+    if shifts || !key.subs.is_empty() || !all_f32 || fused.inputs.iter().any(|input| input.segments() != 1) {
+        return None;
+    }
+    let bindings = 2 * key.outputs.len() + states.iter().filter(|state| state.is_none()).count();
     if bindings > ctx.jit().max_inputs + 1 {
         return None;
     }
-    let source = super::codegen::loop_source(key, &states, ctx.tuning());
+    let source = super::codegen::loop_source(key, states, ctx.tuning());
     let label = format!("Loop{}", key.label().trim_start_matches("Fused"));
     let budget = ctx.jit().loop_work.load(Ordering::Relaxed);
     let per_launch = budget / (len as u64 * key.instrs.len().max(1) as u64).max(1);
@@ -69,7 +83,7 @@ pub(crate) fn run_loop(
         let mut remaining = steps;
         while remaining > 0 {
             let count = remaining.min(per_launch);
-            let outputs = launch_loop(ctx, &core, &fused, &states, &states_now, len, count)?;
+            let outputs = launch_loop(ctx, &core, fused, states, &states_now, len, count)?;
             states_now = outputs.into_iter().map(Arc::new).collect();
             remaining -= count;
         }
@@ -116,7 +130,7 @@ fn launch_loop(
     Ok(outputs)
 }
 
-fn len_u32(len: usize) -> Result<u32, LumaError> {
+pub(super) fn len_u32(len: usize) -> Result<u32, LumaError> {
     u32::try_from(len).map_err(|_| LumaError::InvalidShape(format!("{len} elements exceed u32")))
 }
 
@@ -152,6 +166,10 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
 /// Evaluates the pending ones of `nodes` (all of the same length) in one fused kernel with one
 /// output per node. Failures are stored in the nodes, as [`Node::force`] does.
 pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
+    // A loop leaf has no operands to fuse: running its plan is its evaluation.
+    for node in nodes.iter().filter(|node| node.is_pending() && node.looped.get().is_some()) {
+        let _ = node.force();
+    }
     let roots: Vec<(Arc<Node>, Args)> = nodes
         .iter()
         .filter(|node| node.is_pending())
@@ -199,7 +217,7 @@ fn in_place_eligible(key: &FusedKey, k: u32) -> bool {
 }
 
 /// How a program with shifts runs on arrays spanning several segments (see [`spans`]).
-struct Shifted {
+pub(super) struct Shifted {
     /// Elements of the arrays: the shifts wrap around this length.
     len: usize,
     /// Per output segment and input, the ids of the segments bound as slots.
@@ -355,7 +373,7 @@ fn segment_ids(shifted: Option<&Shifted>, j: usize) -> Result<Option<&[Vec<u32>]
 /// the generated source, each with the bytes to bind. `inputs` lack the in-place input of `key`.
 /// With `ids` (the segmented variant) an input is bound as itself only if the program loads it
 /// at the element being computed, then once per slot.
-fn pin_inputs(
+pub(super) fn pin_inputs(
     key: &FusedKey,
     inputs: &[Arc<Storage>],
     ids: Option<&[Vec<u32>]>,
@@ -390,7 +408,7 @@ fn pin_inputs(
 /// The words of the uniform of segment `j`: `n` (reductions), then, for the segmented variant,
 /// the first element of the segment, the array length and the slot ids of every input, then the
 /// scalars. Borrows `scalars` when nothing else goes in front of them.
-fn params<'a>(
+pub(super) fn params<'a>(
     key: &FusedKey,
     ids: Option<&[Vec<u32>]>,
     n: Option<u32>,
@@ -415,9 +433,52 @@ fn params<'a>(
     Ok(Cow::Owned(words))
 }
 
-/// Launches the store kernel `core` of `key` once per segment of `outputs[0]`: `outputs`, then
-/// the inputs as reads (see [`pin_inputs`]), then the uniform (see [`params`]). Counts as one
-/// elementwise launch.
+/// What a launch of the store kernel `key` binds for segment `j` of `outputs[0]`: `outputs`, then
+/// the inputs as reads (see [`pin_inputs`]), then the uniform (see [`params`]).
+pub(super) struct StoreArgs<'a> {
+    pub(super) n: u32,
+    bytes: u64,
+    outs: Vec<Pin>,
+    ins: Vec<(Pin, u64)>,
+    words: Cow<'a, [u32]>,
+}
+
+impl StoreArgs<'_> {
+    pub(super) fn raw(&self) -> Vec<RawArg<'_>> {
+        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(self.outs.len() + self.ins.len() + 1);
+        raw.extend(self.outs.iter().map(|pin| RawArg::write(pin.buffer(), self.bytes)));
+        raw.extend(self.ins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        if !self.words.is_empty() {
+            raw.push(RawArg::Uniform(bytemuck::cast_slice(&self.words)));
+        }
+        raw
+    }
+}
+
+/// The arguments of the launch of segment `j` of `outputs[0]`; `outputs` must not be empty.
+pub(super) fn store_args<'a>(
+    key: &FusedKey,
+    outputs: &[&Storage],
+    inputs: &[Arc<Storage>],
+    scalars: &'a [u32],
+    shifted: Option<&Shifted>,
+    j: usize,
+) -> Result<StoreArgs<'a>, LumaError> {
+    let Some(first) = outputs.first() else {
+        return Err(LumaError::Gpu("fused kernel without output".into()));
+    };
+    let range = first.range(j);
+    let n = len_u32(range.len())?;
+    let bytes = u64::from(n) * ELEMENT_BYTES;
+    let ids = segment_ids(shifted, j)?;
+    let outs = outputs.iter().map(|out| out.pin(j)).collect::<Result<Vec<_>, _>>()?;
+    let ins = pin_inputs(key, inputs, ids, j, n)?;
+    let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
+    Ok(StoreArgs { n, bytes, outs, ins, words })
+}
+
+/// Launches the store kernel `core` of `key` once per segment of `outputs[0]`, with the arguments
+/// of [`store_args`]. Counts as one elementwise launch.
 fn launch_store(
     ctx: &crate::context::Context,
     core: &crate::kernel::KernelCore,
@@ -428,21 +489,18 @@ fn launch_store(
     shifted: Option<&Shifted>,
 ) -> Result<(), LumaError> {
     let Some(first) = outputs.first() else { return Ok(()) };
-    for j in 0..first.segments() {
-        let range = first.range(j);
-        let n = len_u32(range.len())?;
-        let bytes = u64::from(n) * ELEMENT_BYTES;
-        let ids = segment_ids(shifted, j)?;
-        let out_pins = outputs.iter().map(|out| out.pin(j)).collect::<Result<Vec<_>, _>>()?;
-        let in_pins = pin_inputs(key, inputs, ids, j, n)?;
-        let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
-        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outputs.len() + in_pins.len() + 1);
-        raw.extend(out_pins.iter().map(|pin| RawArg::write(pin.buffer(), bytes)));
-        raw.extend(in_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
-        if !words.is_empty() {
-            raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+    if let Some(tile) = &key.tile {
+        if first.segments() != 1 {
+            return Err(LumaError::Gpu("tiled program on an array of several segments".into()));
         }
-        launch_1d(ctx, core, n, &raw)?;
+        let args = store_args(key, outputs, inputs, scalars, shifted, 0)?;
+        let tiles = tile.dims.0.div_ceil(tile.tile.0) * tile.dims.1.div_ceil(tile.tile.1);
+        ctx.launch(core, fold_workgroups(ctx, tiles)?, [args.n, 1, 1], &args.raw())?;
+    } else {
+        for j in 0..first.segments() {
+            let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
+            launch_1d(ctx, core, args.n, &args.raw())?;
+        }
     }
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -451,7 +509,7 @@ fn launch_store(
 /// Runs the store kernel of `fused` over `len` elements, one new buffer per output. A single
 /// output takes over the buffer of an input that nothing else holds (see [`in_place_eligible`]),
 /// instead of a new one.
-fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
+pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
     fused.mark_fused();
     let Fused { mut key, mut inputs, scalars, fused_nodes } = fused;
     // The fused nodes hold their operands; a dying input is only uniquely owned without them.
@@ -477,6 +535,9 @@ fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<
         }
     }
     let shifted = plan_shifts(ctx, &mut key, &scalars, len)?;
+    if shifted.is_none() {
+        key.tile = super::codegen::plan_tile(&key, &scalars, len, ctx.tuning());
+    }
     let core = ctx.jit().kernel(ctx, &key)?;
 
     let outputs = match reused {
@@ -516,6 +577,9 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     inputs.remove(k);
     key.in_place = Some(k as u32);
     let shifted = plan_shifts(ctx, &mut key, &scalars, node.len())?;
+    if shifted.is_none() {
+        key.tile = super::codegen::plan_tile(&key, &scalars, node.len(), ctx.tuning());
+    }
     let core = ctx.jit().kernel(ctx, &key)?;
     launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
     // Another thread cannot have evaluated this node: its operands were taken above.
@@ -526,8 +590,8 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
 /// Runs the first pass of the reductions `ops` directly over the expression behind `node`,
 /// without materializing it: every workgroup evaluates its strided blocks of `Tuning::reduce_block` elements and reduces them,
 /// once per op. Returns the buffer of partial results (op `j` at `j * groups ..`) and how many
-/// there are per op, or `None` if the node has already been evaluated (reduce its buffer
-/// instead).
+/// there are per op, or `None` if the node has already been evaluated or is better evaluated
+/// first (reduce its buffer instead).
 pub(crate) fn reduce_first_pass(
     node: &Arc<Node>,
     ops: ReduceList,
@@ -537,10 +601,25 @@ pub(crate) fn reduce_first_pass(
         return Ok(None);
     }
     let Some(args) = node.operands() else { return Ok(None) };
-    let ctx = node.context();
     let (fused, args) = flatten_bounded(node, args, Tail::Reduce(ops))?;
     drop(args);
+    // A reduction calls its sub-programs once per shift; nested or large ones are cheaper staged
+    // by the store kernel of the node, whose buffer is then reduced.
+    let max = node.context().tuning().max_recomputed;
+    if fused.key.subs.iter().any(|sub| sub.len() > max || sub.iter().any(|instr| matches!(instr.args[0], Ref::Sub(_)))) {
+        return Ok(None);
+    }
+    reduce_fused(node.context(), node.len(), fused, ops, scratch).map(Some)
+}
 
+/// The first pass of [`reduce_first_pass`] for an already flattened expression of `len` elements.
+pub(super) fn reduce_fused(
+    ctx: &crate::context::Context,
+    len: usize,
+    fused: Fused,
+    ops: ReduceList,
+    scratch: &mut Scratch<'_>,
+) -> Result<Vec<(wgpu::Buffer, u32)>, Failure> {
     fused.mark_fused();
     let Fused { mut key, inputs, scalars, .. } = fused;
     // Without inputs (only generators) the segments are those an array of this length would have.
@@ -548,12 +627,12 @@ pub(crate) fn reduce_first_pass(
     let first = match inputs.first() {
         Some(first) => first,
         None => {
-            layout = Storage::new(ctx, node.len(), ELEMENT_BYTES as usize);
+            layout = Storage::new(ctx, len, ELEMENT_BYTES as usize);
             &layout
         }
     };
     let segments = first.segments();
-    let shifted = plan_shifts(ctx, &mut key, &scalars, node.len())?;
+    let shifted = plan_shifts(ctx, &mut key, &scalars, len)?;
     let core = ctx.jit().kernel(ctx, &key)?;
 
     let mut partials = Vec::with_capacity(segments);
@@ -564,7 +643,7 @@ pub(crate) fn reduce_first_pass(
         let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
         let out = scratch.take(out_bytes)?;
         let ids = segment_ids(shifted.as_ref(), j)?;
-        let params = params(&key, ids, Some(n), range.start, node.len(), &scalars)?;
+        let params = params(&key, ids, Some(n), range.start, len, &scalars)?;
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
         raw.push(RawArg::write(&out, out_bytes));
@@ -575,5 +654,5 @@ pub(crate) fn reduce_first_pass(
         partials.push((out, groups));
     }
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
-    Ok(Some(partials))
+    Ok(partials)
 }

@@ -200,3 +200,12 @@ fn uniform_slots_beyond_the_prefix_copy_reach_the_gpu() {
         assert_eq!(x.to_vec().unwrap(), vec![want; 8], "{launches} launches");
     }
 }
+
+#[test]
+fn postponing_stops_under_memory_pressure() {
+    use super::batch::postpone;
+    assert!(postpone(true, 0, false));
+    assert!(!postpone(true, 0, true));
+    assert!(!postpone(false, 0, false));
+    assert!(!postpone(true, SUBMIT_HOLD, false));
+}

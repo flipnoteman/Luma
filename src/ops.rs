@@ -73,6 +73,11 @@ fn fold_grid(count: u32, max: u32) -> [u32; 3] {
     [groups.div_ceil(y), y, 1]
 }
 
+/// The workgroups of a launch with one invocation per element for `n` elements.
+pub(crate) fn workgroups_1d(ctx: &Context, kernel: &KernelCore, n: u32) -> Result<[u32; 3]> {
+    fold_workgroups(ctx, n.div_ceil(kernel.workgroup[0]))
+}
+
 /// Launches a kernel with one invocation per element for `n` elements (`luma.size.x = n`).
 pub(crate) fn launch_1d(
     ctx: &Context,
@@ -80,8 +85,7 @@ pub(crate) fn launch_1d(
     n: u32,
     args: &[RawArg<'_>],
 ) -> Result<()> {
-    let groups = n.div_ceil(kernel.workgroup[0]);
-    ctx.launch(kernel, fold_workgroups(ctx, groups)?, [n, 1, 1], args)
+    ctx.launch(kernel, workgroups_1d(ctx, kernel, n)?, [n, 1, 1], args)
 }
 
 pub(crate) fn len_u32(len: usize) -> Result<u32> {
@@ -384,8 +388,9 @@ impl<T: ScalarType> Array<T> {
     ///
     /// The shift itself is lazy: it fuses into the expression that uses it as a shifted read,
     /// so a stencil like `u.shift(1) + u.shift(-1) - &u * 2.0` is one kernel reading `u` once. A
-    /// small lazy expression is not even evaluated: the kernel recomputes it at the shifted
-    /// element (`(&a * &b).shift(1)` reads `a` and `b` shifted); a larger one is evaluated first.
+    /// small lazy expression is not even evaluated: the kernel computes it at the shifted
+    /// element instead (`(&a * &b).shift(1)` reads `a` and `b` shifted), staged in workgroup
+    /// memory for small shifts; a larger one is evaluated first.
     #[track_caller]
     pub fn shift(&self, offsets: impl Into<Offsets>) -> Array<T> {
         let location = Location::caller();
@@ -394,11 +399,11 @@ impl<T: ScalarType> Array<T> {
     }
 
     fn run_shift(&self, offsets: Offsets, location: &'static Location<'static>) -> Outcome<Array<T>> {
+        let dims = self.shape().dims();
         let operand = match self.pending() {
-            Some(node) if jit::recompute_shifted(node) => Src::Node(Arc::clone(node)),
+            Some(node) if jit::recompute_shifted(node, dims, offsets.0) => Src::Node(Arc::clone(node)),
             _ => Src::Buffer(Arc::clone(self.storage()?)),
         };
-        let dims = self.shape().dims();
         let mut dims32 = [1u32; 4];
         let mut shifts = [0u32; 4];
         for axis in 0..4 {
@@ -434,7 +439,10 @@ impl<T: ScalarType> Array<T> {
 /// the device's bindings allow), so inputs they share are read once, and an array that another
 /// one uses is computed once. `let (call, put) = ...; eval_all(&[&call, &put])?` prices both
 /// options in one pass over the market data. Postponed while the GPU is busy, like
-/// [`Array::eval`].
+/// [`Array::eval`]. A loop of `x = step(&x); eval_all(&[&x])?` over `f32` arrays is recognized
+/// while evaluation is postponed: the steps are not chained into ever longer expressions but run
+/// together when a result is needed, in one kernel that keeps the values in registers, or time
+/// blocked for a stencil.
 pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     let Some(first) = arrays.first() else { return Ok(()) };
     let ctx = first.context();
@@ -444,6 +452,13 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     for array in arrays {
         array.request()?;
     }
+    // Consecutive calls that advance the same f32 arrays through the same step are a loop.
+    let shape = first.shape();
+    let nodes: Option<Vec<_>> = (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
+        && arrays.iter().all(|array| array.shape() == shape))
+    .then(|| arrays.iter().map(|array| array.pending().cloned()).collect())
+    .flatten();
+    ctx.jit().step_boundary(nodes.as_deref().unwrap_or(&[]), shape);
     ctx.submit_requested()?;
     arrays.iter().try_for_each(|array| array.check())
 }

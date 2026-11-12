@@ -2,7 +2,7 @@
 
 use crate::array::{Array, Failure};
 use crate::builtin::{Builtin, ReduceList, ReduceOp, MAX_REDUCTIONS};
-use crate::context::{RawArg, Scratch};
+use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{GpuType, ScalarType};
 use crate::jit;
@@ -94,43 +94,76 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
     let ctx = array.context();
     let elem = std::mem::size_of::<T>() as u64;
     let count = ops.as_slice().len() as u64;
+    if let Some(node) = array.pending()
+        && matches!(wgsl, "f32" | "u32")
+        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, wgsl, ops, scratch))
+    {
+        return Ok(bytemuck::cast_slice(&words?).to_vec());
+    }
     let mut scratch = Scratch::new(ctx);
+    let current = reduce_into(array, wgsl, ops, &mut scratch)?;
+    let values = ctx.read::<T>(&current, elem * count)?;
+    if values.len() as u64 != count {
+        return Err(LumaError::Gpu("reduction results are missing".into()));
+    }
+    Ok(values)
+}
 
-    // Runs passes over `current` (`n` elements, or `n` per op once `per_op`) until one element per
-    // op is left.
-    let finish = |scratch: &mut Scratch<'_>, mut current: wgpu::Buffer, mut n: u32, mut per_op: bool| -> Result<wgpu::Buffer> {
-        while !per_op || n > 1 {
-            let groups = ctx.tuning().reduce_groups(n);
-            let list = if per_op { ops.rest() } else { ops };
-            let in_bytes = u64::from(n) * elem * if per_op { count } else { 1 };
-            let out = scratch.take(u64::from(groups) * elem * count)?;
-            let core = ctx.builtin(Builtin::Reduce(list, per_op), wgsl)?;
-            ctx.launch(
-                &core,
-                fold_workgroups(ctx, groups)?,
-                [n, 1, 1],
-                &[
-                    RawArg::write(&out, u64::from(groups) * elem * count),
-                    RawArg::read(&current, in_bytes),
-                    RawArg::Uniform(bytemuck::bytes_of(&[n])),
-                ],
-            )?;
-            current = out;
-            n = groups;
-            per_op = true;
-        }
-        Ok(current)
+/// Runs passes over `current` (`n` elements, or `n` per op once `per_op`) until one element per
+/// op is left, and returns the buffer holding them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_passes(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    ops: ReduceList,
+    wgsl: &'static str,
+    elem: u64,
+    mut current: wgpu::Buffer,
+    mut n: u32,
+    mut per_op: bool,
+) -> Result<wgpu::Buffer> {
+    let count = ops.as_slice().len() as u64;
+    while !per_op || n > 1 {
+        let groups = ctx.tuning().reduce_groups(n);
+        let list = if per_op { ops.rest() } else { ops };
+        let in_bytes = u64::from(n) * elem * if per_op { count } else { 1 };
+        let out = scratch.take(u64::from(groups) * elem * count)?;
+        let core = ctx.builtin(Builtin::Reduce(list, per_op), wgsl)?;
+        ctx.launch(
+            &core,
+            fold_workgroups(ctx, groups)?,
+            [n, 1, 1],
+            &[
+                RawArg::write(&out, u64::from(groups) * elem * count),
+                RawArg::read(&current, in_bytes),
+                RawArg::Uniform(bytemuck::bytes_of(&[n])),
+            ],
+        )?;
+        current = out;
+        n = groups;
+        per_op = true;
+    }
+    Ok(current)
+}
+
+/// The reduction of `array` as a buffer holding one element per op; see [`reduce_array`].
+fn reduce_into<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, scratch: &mut Scratch<'_>) -> Result<wgpu::Buffer> {
+    let ctx = array.context();
+    let elem = std::mem::size_of::<T>() as u64;
+    let count = ops.as_slice().len() as u64;
+    let finish = |scratch: &mut Scratch<'_>, current: wgpu::Buffer, n: u32, per_op: bool| {
+        finish_passes(ctx, scratch, ops, wgsl, elem, current, n, per_op)
     };
 
     let fused = match array.pending() {
-        Some(node) => jit::reduce_first_pass(node, ops, &mut scratch).map_err(Failure::into_error)?,
+        Some(node) => jit::reduce_first_pass(node, ops, scratch).map_err(Failure::into_error)?,
         None => None,
     };
     let mut results = Vec::new();
     match fused {
         Some(partials) => {
             for (partial, groups) in partials {
-                results.push(finish(&mut scratch, partial, groups, true)?);
+                results.push(finish(scratch, partial, groups, true)?);
             }
         }
         None => {
@@ -139,29 +172,22 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
                 let n = len_u32(storage.range(j).len())?;
                 // Wgpu buffers are reference counted; the pin keeps it resident while it is bound.
                 let pin = storage.pin(j)?;
-                results.push(finish(&mut scratch, pin.buffer().clone(), n, false)?);
+                results.push(finish(scratch, pin.buffer().clone(), n, false)?);
             }
         }
     }
 
-    let current = if results.len() == 1 {
-        results.swap_remove(0)
-    } else {
-        let segments = results.len() as u64;
-        let collect = scratch.take(segments * count * elem)?;
-        for i in 0..count {
-            for (j, partial) in results.iter().enumerate() {
-                ctx.copy(partial, i * elem, &collect, (i * segments + j as u64) * elem, elem)?;
-            }
-        }
-        finish(&mut scratch, collect, len_u32(results.len())?, true)?
-    };
-
-    let values = ctx.read::<T>(&current, elem * count)?;
-    if values.len() as u64 != count {
-        return Err(LumaError::Gpu("reduction results are missing".into()));
+    if results.len() == 1 {
+        return Ok(results.swap_remove(0));
     }
-    Ok(values)
+    let segments = results.len() as u64;
+    let collect = scratch.take(segments * count * elem)?;
+    for i in 0..count {
+        for (j, partial) in results.iter().enumerate() {
+            ctx.copy(partial, i * elem, &collect, (i * segments + j as u64) * elem, elem)?;
+        }
+    }
+    finish(scratch, collect, len_u32(results.len())?, true)
 }
 
 /// Per-component reductions of `f32` vector arrays: the same tree reduction as the scalar

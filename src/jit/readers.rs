@@ -1,5 +1,6 @@
 //! Self-pruning lists of pending nodes: the readers of a buffer, and a context's live nodes.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::{lock, Node};
@@ -12,6 +13,8 @@ use super::{lock, Node};
 #[derive(Debug, Default)]
 pub(crate) struct Readers {
     list: Mutex<ReaderList>,
+    /// Counts the flushes: it changes whenever the buffer may be about to be overwritten.
+    generation: AtomicU64,
 }
 
 /// Weak references to nodes. Most nodes are read by a single operation, so the first reference
@@ -120,8 +123,13 @@ impl Readers {
         lock(&self.list).nodes.len()
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     /// Evaluates every pending node registered here.
     pub(crate) fn flush(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         for weak in self.take() {
             if let Some(node) = weak.upgrade() {
                 // A failure is stored in the node and reported when its array is used.

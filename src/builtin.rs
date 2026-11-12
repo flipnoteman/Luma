@@ -174,6 +174,10 @@ pub(crate) enum Builtin {
     Conv1dTiled(u32, u32),
     /// One pass of the FFT convolution, see [`crate::fft`].
     Fft(crate::fft::FftPass),
+    /// The convergence gate between the steps of `iterate_until`; arguments: the residual, the
+    /// state `[done, count]`, the indirect arguments of the next step, their template, uniform
+    /// `{tol, step, words}`.
+    UntilGate,
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -464,6 +468,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     )
 }
 
+/// Writes the indirect arguments of the next step of `iterate_until`: the template, or zeros
+/// once the residual is within the tolerance (a NaN residual never is) so that the steps after
+/// convergence dispatch no workgroups.
+const UNTIL_GATE: &str = "struct Params { tol: f32, step: u32, words: u32 }
+@group(1) @binding(0) var<storage, read> res: array<f32>;
+@group(1) @binding(1) var<storage, read_write> st: array<u32>;
+@group(1) @binding(2) var<storage, read_write> args: array<u32>;
+@group(1) @binding(3) var<storage, read> tmpl: array<u32>;
+@group(1) @binding(4) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let done = st[0] != 0u || res[0] <= p.tol;
+    if (g.x == 0u && st[0] == 0u) {
+        if (res[0] <= p.tol) { st[0] = 1u; }
+        st[1] = p.step + 1u;
+    }
+    if (g.x < p.words) { args[g.x] = select(tmpl[g.x], 0u, done); }
+}
+";
+
 impl Builtin {
     /// The WGSL source of this kernel for elements of type `ty` (`"f32"` or `"u32"`), with the
     /// parameters `tuning` gives for the GPU.
@@ -475,6 +499,7 @@ impl Builtin {
             Builtin::Conv1d => include_str!("../operations/conv1d.wgsl").into(),
             Builtin::Conv1dTiled(stride, per_thread) => conv1d_tiled(stride, per_thread, tuning.conv_workgroup).into(),
             Builtin::Fft(pass) => crate::fft::source(pass).into(),
+            Builtin::UntilGate => UNTIL_GATE.into(),
         }
     }
 }

@@ -46,6 +46,8 @@ pub(crate) struct Tuning {
     pub(crate) reduce_max_groups: u32,
     /// Whether reductions combine within subgroups (the device has `Features::SUBGROUP`).
     pub(crate) subgroups: bool,
+    /// Most operations of a lazy expression a shift recomputes at the shifted element instead of evaluating it first.
+    pub(crate) max_recomputed: usize,
 }
 
 impl Tuning {
@@ -61,6 +63,7 @@ impl Tuning {
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
         subgroups: false,
+        max_recomputed: 24,
     };
 
     const NVIDIA: Tuning = Tuning {
@@ -74,6 +77,7 @@ impl Tuning {
         reduce_per_thread: 8,
         reduce_max_groups: 2048,
         subgroups: false,
+        max_recomputed: 32,
     };
 
     const GENERIC: Tuning = Tuning {
@@ -87,6 +91,7 @@ impl Tuning {
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
         subgroups: false,
+        max_recomputed: 24,
     };
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups

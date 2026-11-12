@@ -19,9 +19,10 @@
 use std::fmt::Write;
 
 use crate::builtin::reduce_main;
-use crate::tuning::Tuning;
+use crate::tuning::{Tuning, STENCIL_RADIUS};
 
-use super::program::{FusedKey, Instr, Ref, Tail};
+use super::program::{FusedKey, Instr, Ref, Tail, ELEMENT_BYTES};
+use super::stencil::{signed, wrap_source, WORKGROUP};
 use super::{ElemTy, Gen, OpKind, ShiftKind};
 
 /// `template` with its operand identifiers `x` and `y` replaced by `a` and `b`.
@@ -257,7 +258,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
         }
     }
     src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
-    src.push_str(&subs(key));
+    if key.tile.is_none() {
+        src.push_str(&subs(key));
+    }
 
     let (index, total) = match (segmented, based) {
         (true, _) => ("gi", "p.total"),
@@ -268,6 +271,10 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
     match key.tail {
         Tail::Store => {
             let stores: String = outputs.iter().enumerate().map(|(j, at)| format!("    out{j}[i] = t{at};\n")).collect();
+            if let Some(tile) = &key.tile {
+                src.push_str(&tiled_main(key, tile, based, &stores));
+                return src;
+            }
             let _ = write!(
                 src,
                 "
@@ -371,6 +378,19 @@ fn body(
     total: &str,
     segmented: bool,
 ) -> String {
+    body_with(instrs, input_tys, in_place, index, total, segmented, &|_, _| None)
+}
+
+/// [`body`], where `staged(k, instr)` may replace the expression of instruction `k`.
+fn body_with(
+    instrs: &[Instr],
+    input_tys: &[ElemTy],
+    in_place: Option<u32>,
+    index: &str,
+    total: &str,
+    segmented: bool,
+    staged: &dyn Fn(usize, &Instr) -> Option<String>,
+) -> String {
     let mut src = String::new();
     // Inputs read only through shifts are not loaded at `i`.
     for (k, ty) in input_tys.iter().enumerate() {
@@ -380,8 +400,194 @@ fn body(
         }
     }
     for (k, instr) in instrs.iter().enumerate() {
-        let _ = writeln!(src, "    let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr, index, total, segmented));
+        let value = staged(k, instr).unwrap_or_else(|| expression(instr, index, total, segmented));
+        let _ = writeln!(src, "    let t{k}: {} = {value};", instr.op.out_ty().wgsl());
     }
+    src
+}
+
+/// The workgroup-memory staging of the sub-programs of a store kernel: each is computed once
+/// per cell of its region (the tile plus a halo) and the shifts read it there. Part of the
+/// [`FusedKey`] because the generated source bakes in the offsets, which for a
+/// [`ShiftKind::Linear`] shift come from a scalar value.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Tile {
+    /// Width and height of the array (`h == 1` for 1D).
+    pub(crate) dims: (u32, u32),
+    /// Output cells per workgroup.
+    pub(crate) tile: (u32, u32),
+    /// Per sub-program, the halo (cells per side and axis) its region extends beyond the tile.
+    pub(crate) need: Vec<(u32, u32)>,
+    /// Per program (0 = main, `1 + k` = `subs[k]`) and instruction, the cell offset (x, y) a
+    /// shift of a sub-program reads; `None` for every other instruction.
+    pub(crate) offsets: Vec<Vec<Option<(i32, i32)>>>,
+}
+
+/// The staging of `key` on arrays of `len` elements, if its sub-programs are read through
+/// small shifts only and their regions fit in workgroup memory. `None` keeps the sub-programs
+/// as functions called per shift.
+pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tuning) -> Option<Tile> {
+    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() {
+        return None;
+    }
+    let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)).collect();
+    let mut dims = None;
+    for instr in programs.iter().copied().flatten() {
+        if let OpKind::Shift(ShiftKind::Dims { dims: d, .. }) = instr.op.kind {
+            if d[2] != 1 || d[3] != 1 || dims.is_some_and(|known| known != (d[0], d[1])) {
+                return None;
+            }
+            dims = Some((d[0], d[1]));
+        }
+    }
+    let (w, h) = dims.unwrap_or((u32::try_from(len).ok()?, 1));
+    if u64::from(w) * u64::from(h) != len as u64 || w == 0 || h == 0 {
+        return None;
+    }
+
+    let mut offsets = Vec::with_capacity(programs.len());
+    for (p, instrs) in programs.iter().enumerate() {
+        let mut row = Vec::with_capacity(instrs.len());
+        for instr in *instrs {
+            let skip = usize::from(matches!(instr.op.kind, OpKind::Shift(_)));
+            if instr.args.iter().skip(skip).any(|arg| matches!(arg, Ref::Sub(_))) {
+                return None;
+            }
+            let at = match (instr.op.kind, instr.args[0]) {
+                // Sub-programs come before the programs reading them.
+                (OpKind::Shift(_), Ref::Sub(j)) if p > 0 && j as usize + 1 >= p || j as usize >= key.subs.len() => return None,
+                (OpKind::Shift(kind), Ref::Sub(_)) => {
+                    let (dx, dy) = match kind {
+                        ShiftKind::Dims { shifts, .. } => (signed(shifts[0], w), signed(shifts[1], h)),
+                        ShiftKind::Linear => {
+                            let Ref::Scalar(s) = instr.args[1] else { return None };
+                            let amount = *scalars.get(s as usize)?;
+                            if h == 1 {
+                                (signed(amount, w), 0)
+                            } else if amount % w == 0 {
+                                (0, signed(amount / w, h))
+                            } else {
+                                return None;
+                            }
+                        }
+                    };
+                    // Element `c` of a shift is `u[c - shift]`.
+                    let (ox, oy) = (-dx, -dy);
+                    if ox.unsigned_abs() > STENCIL_RADIUS || oy.unsigned_abs() > STENCIL_RADIUS {
+                        return None;
+                    }
+                    Some((ox, oy))
+                }
+                _ => None,
+            };
+            row.push(at);
+        }
+        offsets.push(row);
+    }
+
+    // Consumers first: the main program, then the sub-programs from the last (dependencies come first).
+    let mut need = vec![(0u32, 0u32); key.subs.len()];
+    for p in std::iter::once(0).chain((1..programs.len()).rev()) {
+        let own = if p == 0 { (0, 0) } else { need[p - 1] };
+        for (instr, at) in programs[p].iter().zip(&offsets[p]) {
+            if let (Some((ox, oy)), Ref::Sub(j)) = (at, instr.args[0]) {
+                let slot = &mut need[j as usize];
+                *slot = (slot.0.max(own.0 + ox.unsigned_abs()), slot.1.max(own.1 + oy.unsigned_abs()));
+            }
+        }
+    }
+
+    let (mut tx, mut ty) = if h == 1 { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
+    let bytes = |tx: u32, ty: u32| need.iter().map(|&(nx, ny)| (tx + 2 * nx) * (ty + 2 * ny) * ELEMENT_BYTES as u32).sum::<u32>();
+    while bytes(tx, ty) > tuning.stencil_tile_bytes {
+        if h == 1 || tx >= ty {
+            tx /= 2;
+        } else {
+            ty /= 2;
+        }
+        if tx < 4 || (h > 1 && ty < 4) {
+            return None;
+        }
+    }
+    Some(Tile { dims: (w, h), tile: (tx, ty), need, offsets })
+}
+
+/// The kernel of `key` with its sub-programs staged as `tile` says, running one workgroup per
+/// tile of the array. `based` and `stores` are those of the plain store kernel.
+fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str) -> String {
+    let ((w, h), (tx, ty)) = (tile.dims, tile.tile);
+    let region = |j: usize| (tx + 2 * tile.need[j].0, ty + 2 * tile.need[j].1);
+    let (halo_x, halo_y) = tile.need.iter().fold((0, 0), |(x, y), &(nx, ny)| (x.max(nx), y.max(ny)));
+    let (index, global) = if based { ("gi", "        let gi = p.base + i;\n") } else { ("i", "") };
+    // Cell (lx, ly) relative to the tile origin, as a global element.
+    let element = if h == 1 {
+        format!("wrap(i32(tile_x) + lx, {w}u)")
+    } else {
+        format!("wrap(i32(tile_x) + lx, {w}u) + wrap(i32(tile_y) + ly, {h}u) * {w}u")
+    };
+    let staged = |p: usize| {
+        move |at: usize, instr: &Instr| -> Option<String> {
+            let (ox, oy) = tile.offsets[p][at]?;
+            let Ref::Sub(j) = instr.args[0] else { return None };
+            let j = j as usize;
+            let ((nx, ny), (lw, _)) = (tile.need[j], region(j));
+            let row = if h == 1 { String::new() } else { format!(" + u32(ly + ({})) * {lw}u", oy + ny as i32) };
+            Some(format!("w{j}[u32(lx + ({})){row}]", ox + nx as i32))
+        }
+    };
+
+    let mut src = String::new();
+    for (k, instrs) in key.subs.iter().enumerate() {
+        let (lw, lh) = region(k);
+        let ty = instrs.last().map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
+        let _ = writeln!(src, "var<workgroup> w{k}: array<{ty}, {}>;", lw * lh);
+    }
+    let _ = write!(
+        src,
+        "
+{}
+@compute @workgroup_size({WORKGROUP})
+fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let g = wid.x + wid.y * nwg.x;
+    let tile_x = (g % {tiles_x}u) * {tx}u;
+    let tile_y = (g / {tiles_x}u) * {ty}u;
+",
+        wrap_source(w >= tx + 2 * halo_x && (h == 1 || h >= ty + 2 * halo_y)),
+        tiles_x = w.div_ceil(tx),
+    );
+    for (k, instrs) in key.subs.iter().enumerate() {
+        let ((nx, ny), (lw, lh)) = (tile.need[k], region(k));
+        let last = instrs.len().saturating_sub(1);
+        let _ = write!(
+            src,
+            "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
+        let lx = i32(e % {lw}u) - {nx};
+        let ly = i32(e / {lw}u) - {ny};
+        let i = {element};
+{global}{}        w{k}[e] = t{last};
+    }}
+    workgroupBarrier();
+",
+            lw * lh,
+            body_with(instrs, &key.input_tys, None, index, "luma.size.x", false, &staged(k + 1)),
+        );
+    }
+    let _ = write!(
+        src,
+        "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
+        let lx = i32(e % {tx}u);
+        let ly = i32(e / {tx}u);
+        let x = tile_x + u32(lx);
+        let y = tile_y + u32(ly);
+        if (x < {w}u && y < {h}u) {{
+            let i = x + y * {w}u;
+{global}{}{stores}        }}
+    }}
+}}
+",
+        tx * ty,
+        body_with(&key.instrs, &key.input_tys, key.in_place, index, "luma.size.x", false, &staged(0)),
+    );
     src
 }
 

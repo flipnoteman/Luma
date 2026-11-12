@@ -4,6 +4,45 @@ All notable changes to Luma are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Array::iterate_until(max_steps, tol, step)`: runs `step` until the largest change of a step is
+  at most `tol`. The convergence check runs on the GPU, and the host waits once per 16 steps.
+  On an M-series Mac, 200 heat steps on 1024² take 11.8 ms, against 41 ms for 0.2.0's loop with a
+  readback every step.
+- `LUMA_SPECULATE=off` turns off speculation at readbacks (see below).
+- Benchmarks: `per_step` now calls `eval` every step, like the ArrayFire side. Also new: a
+  Luma-only `lazy_chain` variant, `_cold` rows that time the first run with compilation, a
+  `converge` workload with a readback every step, and a tuned ArrayFire run in `run.sh`
+  (`AF_*_MAX_JIT_LEN=256`, `--label`).
+
+### Changed
+
+- Loops of `x = step(&x); x.eval()` (or `eval_all`) over `f32` arrays are recognized. The
+  postponed steps then run together, as one register loop, one time-blocked stencil, or step by
+  step, instead of chaining into ever longer expressions. Kernels no longer depend on how many
+  steps were postponed. On an M-series Mac against 0.2.0: Mandelbrot 1024², 256 iterations with
+  `eval_all` each, 5.6 ms to 1.4 ms (`iterate_all`: 0.83 ms); heat 4096², 100 steps with `eval`
+  each, 33 ms to 21.5 ms (`iterate`: 20.9 ms).
+- A readback in a loop of `next = step(&u); err = (&next - &u).abs().max()?; u = next` computes
+  the next steps and their residuals ahead, once the step has repeated. The readbacks that follow
+  are answered from that result, as long as they reduce the same program over the predicted states
+  and nothing they read was written in between. The heat `converge` loop at 256², 200 steps:
+  35 ms to 5.1 ms.
+- `eval` stops postponing work once resident array data reaches three quarters of the memory
+  budget.
+- A lazy expression read through small shifts (up to 2 cells, 1D and 2D arrays) is computed once
+  per cell of a tile in workgroup memory, and the shifts read it there, instead of being
+  recomputed by every shift; a direct read of it at the cell itself takes the same value. Up to
+  three stencil steps chained without `eval` become one kernel. 100 steps chained without
+  `eval` on an M-series Mac, against 0.2.0: Game of Life 1024² 2.9 ms to 2.1 ms, 4096² 53 ms to
+  24 ms, 8192² 222 ms to 96 ms; heat 1024² 2.0 ms to 1.6 ms, 8192² 112 ms to 78 ms.
+- For other shifts, how much of a lazy expression a shift recomputes instead of evaluating it
+  first is now set per GPU profile: 24 operations on Apple and generic GPUs, 32 on NVIDIA. It
+  was 16 everywhere.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added
@@ -158,4 +197,5 @@ All notable changes to Luma are listed here. The format follows
 - A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
 - A library layout, with the shader loaded from a hard-coded relative path.
 
+[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/flipnoteman/Luma/releases/tag/v0.2.0

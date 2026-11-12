@@ -20,6 +20,12 @@ use super::{lock, Context};
 /// 16 10.7 / 168.4, 32 10.6 / 168.2 (without holding: 15.3 / 175). 16 is within 2% of the best.
 pub(super) const SUBMIT_HOLD: u32 = 16;
 
+/// Whether `eval` leaves its request pending: the GPU has work to do anyway, the batch is small
+/// and postponed arrays don't keep memory the budget is short of.
+pub(super) fn postpone(busy: bool, dispatches: u32, pressure: bool) -> bool {
+    busy && dispatches < SUBMIT_HOLD && !pressure
+}
+
 /// Number of dispatches after which the pending batch is submitted without waiting for a sync
 /// point. Bounds how much work piles up in one command buffer.
 pub(super) const BATCH_LIMIT: u32 = 256;
@@ -165,11 +171,29 @@ fn check_aliasing(args: &[RawArg<'_>]) -> Result<()> {
     Ok(())
 }
 
+/// How a launch gets its workgroup counts: given, or read from a buffer when the dispatch runs.
+enum Dispatch<'a> {
+    Direct([u32; 3]),
+    Indirect(&'a Buffer, u64),
+}
+
 impl Context {
     /// `true` while earlier submissions are still running on the GPU. A failed poll counts as
     /// idle, so that the submission goes ahead and the waiting paths report the error.
     fn gpu_busy(&self) -> bool {
+        #[cfg(test)]
+        if self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         matches!(self.device().poll(wgpu::PollType::Poll), Ok(status) if !status.is_queue_empty())
+    }
+
+    /// Makes [`Context::submit`] and [`Context::submit_requested`] behave as if earlier
+    /// submissions were still running, so that tests of postponed evaluation do not depend on
+    /// how fast the GPU is.
+    #[cfg(test)]
+    pub(crate) fn set_assume_busy(&self, on: bool) {
+        self.inner.assume_busy.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Submits the pending batch without waiting for it, like [`Context::flush`] but without
@@ -190,11 +214,19 @@ impl Context {
         Ok(())
     }
 
+    /// Submits the pending batch now, busy GPU or not.
+    pub(crate) fn submit_now(&self) -> Result<()> {
+        let mut batch = self.batch()?;
+        self.flush_locked(&mut batch);
+        Ok(())
+    }
+
     /// Like [`Context::submit`], but first computes what `eval` requested. While the GPU is busy
     /// that is postponed too, so requested arrays the program drops in the meantime are never
-    /// computed and the steps between two submissions fuse.
+    /// computed and the steps between two submissions fuse. Postponing stops once resident data
+    /// reaches three quarters of the memory budget.
     pub(crate) fn submit_requested(&self) -> Result<()> {
-        if self.gpu_busy() && self.batch()?.dispatches < SUBMIT_HOLD {
+        if postpone(self.gpu_busy(), self.batch()?.dispatches, self.pager().under_pressure()) {
             return Ok(());
         }
         self.jit().evaluate_requested();
@@ -325,9 +357,28 @@ impl Context {
         args: &[RawArg<'_>],
     ) -> Result<()> {
         check_aliasing(args)?;
+        let mut guard = self.batch()?;
+        self.record_launch(&mut guard, kernel, Dispatch::Direct(workgroups), size, args)?;
+        if guard.dispatches >= BATCH_LIMIT {
+            self.flush_locked(&mut guard);
+        }
+        Ok(())
+    }
+
+    /// Like [`Context::launch`], but the workgroup counts are the three words of `args` at byte
+    /// `offset`, read when the dispatch runs; `args` needs `BufferUsages::INDIRECT`.
+    pub(crate) fn launch_indirect(
+        &self,
+        kernel: &KernelCore,
+        args: &Buffer,
+        offset: u64,
+        size: [u32; 3],
+        raw: &[RawArg<'_>],
+    ) -> Result<()> {
+        check_aliasing(raw)?;
 
         let mut guard = self.batch()?;
-        self.record_launch(&mut guard, kernel, workgroups, size, args)?;
+        self.record_launch(&mut guard, kernel, Dispatch::Indirect(args, offset), size, raw)?;
         if guard.dispatches >= BATCH_LIMIT {
             self.flush_locked(&mut guard);
         }
@@ -341,7 +392,7 @@ impl Context {
         &self,
         batch: &mut Batch,
         kernel: &KernelCore,
-        workgroups: [u32; 3],
+        dispatch: Dispatch<'_>,
         size: [u32; 3],
         args: &[RawArg<'_>],
     ) -> Result<()> {
@@ -481,7 +532,10 @@ impl Context {
             pass.set_bind_group(1, args_group, offsets.as_slice());
             bound.args = Some((key, index));
         }
-        pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+        match dispatch {
+            Dispatch::Direct([x, y, z]) => pass.dispatch_workgroups(x, y, z),
+            Dispatch::Indirect(buffer, offset) => pass.dispatch_workgroups_indirect(buffer, offset),
+        }
         if profiled {
             *pass_slot = None;
         }
