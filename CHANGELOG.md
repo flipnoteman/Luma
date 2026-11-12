@@ -195,6 +195,11 @@ All notable changes to Luma are listed here. The format follows
 - wgpu's validation of indirect dispatches (an extra dispatch before every step of
   `iterate_until`/`iterate_until_all`) is off: the dispatch arguments are always written by the
   library's own gate kernels.
+- `iterate_all` (and `iterate_until_all`) corrupted arrays created before the loop: a lazy
+  expression of such an array that the traced step evaluated (a gather from a `concat`, a scan of
+  a `x *= c` result) took over its operand's buffer inside the recording, so every replayed step
+  overwrote it again (`x *= -2` was applied once per step). A recording now only overwrites
+  buffers it created itself.
 
 ## [0.2.0] - 2026-11-11
 

@@ -181,10 +181,10 @@ fn evaluated_view_assigned_through_shows_the_old_data() {
 }
 
 /// Finding 6: an `iterate_all` of two steps whose body takes from an array outside the loop,
-/// with the fusion limit at 3 nodes or fewer: afterwards the outside array holds wrong
-/// elements (`concat(x, x)[13]` is 1, not `x[1]`).
+/// with the fusion limit at 3 nodes or fewer: the pending `concat` read by the `take` ran inside
+/// the recording and took over its operand's buffer, so the replays overwrote it
+/// (`concat(x, x)[13]` was 1, not `x[1]`). Same cause as finding 7.
 #[test]
-#[ignore = "finding 6: iterate_all with a gather from an outer array corrupts it when max_nodes <= 3"]
 fn iterate_all_with_a_gather_and_a_tight_node_limit_corrupts_the_outer_array() {
     check(Program {
         config: Config { max_nodes: 2, ..Config::default_engine() },
@@ -204,10 +204,10 @@ fn iterate_all_with_a_gather_and_a_tight_node_limit_corrupts_the_outer_array() {
 }
 
 /// Finding 7: `x *= -2` is a lazy expression that reuses `x`'s buffer; a traced loop that reads
-/// `x` forces it inside the trace, so the recorded launches include `x *= -2` and every replayed
-/// step multiplies `x` again (`x[0]` ends at `-32` instead of `8`).
+/// `x` forces it inside the trace, and the recorded launch (which overwrote `x`'s old buffer) was
+/// replayed at every step (`x[0]` ended at `-32` instead of `8`). Fixed with finding 6: a
+/// recording never overwrites a buffer that is older than the recording.
 #[test]
-#[ignore = "finding 7: a lazy in-place compound assignment captured by a traced loop is replayed with the loop"]
 fn captured_lazy_compound_assignment_is_replayed_with_the_loop() {
     check(Program {
         config: Config::default_engine(),
@@ -236,6 +236,26 @@ fn lazy_reduction_of_an_expression_sees_a_later_write_to_its_input() {
             Alias { src: 1 },
             Reduce { src: 2, op: Min },
             Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 0, hi: 1 }, InjSlice { axis: 1, lo: 2, hi: 5 }], rhs: Const(0.25) },
+        ],
+    });
+}
+
+/// Finding 10 (found while fixing findings 6 and 7; no loop involved): a whole-array write
+/// through two flips replaces the lazy array's expression, a view of it is taken afterwards and
+/// written through; the write into the view does not reach the array (`element 40` keeps the
+/// old value). Same family as finding 4, through a view variable.
+#[test]
+#[ignore = "finding 10: write through a view taken after a flipped write into a lazy array is lost"]
+fn view_of_a_lazy_array_after_a_flipped_write_loses_a_write_through_it() {
+    check(Program {
+        config: Config { staging: false, ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [8, 8, 1, 1], ty: F32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Const(0.5), op: Minimum },
+            Assign { target: 1, path: vec![InjFlip { axis: 0 }, InjFlip { axis: 0 }], rhs: Var(0) },
+            View { src: 1, view: Slice { axis: 1, lo: 4, hi: 7 } },
+            Assign { target: 2, path: vec![InjSlice { axis: 1, lo: 1, hi: 3 }, InjFlip { axis: 0 }], rhs: Const(1.0) },
         ],
     });
 }
