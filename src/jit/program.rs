@@ -1152,3 +1152,187 @@ pub(super) fn same_program(a: &Fused, b: &Fused, states: usize) -> bool {
         && a.inputs.len() == b.inputs.len()
         && a.inputs.iter().zip(&b.inputs).skip(states).all(|(x, y)| Arc::ptr_eq(x, y))
 }
+
+/// Checks the invariants the code generator and the launcher rely on: references point at
+/// earlier instructions, inputs and scalars that exist, sub-programs only at lower ones, views
+/// stay inside their sources, in-place inputs are read at their own element only, and the
+/// staging and tile layouts fit the program. Debug builds run it on every kernel built.
+#[cfg(any(debug_assertions, test))]
+pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<(), String> {
+    let programs = std::iter::once(&key.instrs[..]).chain(key.subs.iter().map(|sub| &sub[..]));
+    for (p, program) in programs.enumerate() {
+        let name = if p == 0 { "main program".to_string() } else { format!("sub-program {}", p - 1) };
+        for (at, instr) in program.iter().enumerate() {
+            let here = format!("{name}, instruction {at} ({:?})", instr.op.kind);
+            let arity = instr.op.kind.arity();
+            for (slot, &arg) in instr.args.iter().enumerate() {
+                if (slot < arity) == (arg == Ref::Unused) {
+                    return Err(format!("{here}: operand {slot} is {arg:?} but the arity is {arity}"));
+                }
+                match arg {
+                    Ref::Unused => {}
+                    Ref::Tmp(t) if t as usize >= at => return Err(format!("{here}: operand {slot} reads t{t}, not an earlier instruction")),
+                    Ref::Tmp(_) => {}
+                    Ref::Input(k) if k as usize >= inputs => return Err(format!("{here}: operand {slot} reads input {k} of {inputs}")),
+                    Ref::Input(_) => {}
+                    Ref::Scalar(s) => {
+                        let end = s as usize + instr.op.operand_ty(slot).slots();
+                        if end > scalars {
+                            return Err(format!("{here}: operand {slot} reads uniform slots up to {end} of {scalars}"));
+                        }
+                    }
+                    Ref::Sub(j) => {
+                        if slot != 0 || !matches!(instr.op.kind, OpKind::Shift(_)) {
+                            return Err(format!("{here}: operand {slot} is a sub-program but not operand 0 of a shift"));
+                        }
+                        if j as usize >= key.subs.len() {
+                            return Err(format!("{here}: reads sub-program {j} of {}", key.subs.len()));
+                        }
+                        if p != 0 && j as usize >= p - 1 {
+                            return Err(format!("{here}: reads sub-program {j}, not a lower one"));
+                        }
+                    }
+                }
+            }
+            if let OpKind::Shift(kind) = instr.op.kind {
+                if let ShiftKind::View { map, edge } = kind {
+                    if !map.fits() {
+                        return Err(format!("{here}: the view {map:?} does not fit the index arithmetic"));
+                    }
+                    if edge == Edge::None && !map.in_range() {
+                        return Err(format!("{here}: the view {map:?} reads outside its source"));
+                    }
+                }
+            }
+        }
+    }
+    if key.instrs.is_empty() {
+        return Err("the main program is empty".into());
+    }
+    if key.subs.iter().any(|sub| sub.is_empty()) {
+        return Err("an empty sub-program".into());
+    }
+    if let Some(&at) = key.outputs.iter().find(|&&at| at as usize >= key.instrs.len()) {
+        return Err(format!("output {at} of {} instructions", key.instrs.len()));
+    }
+    if matches!(key.tail, Tail::Scatter { .. }) && key.outputs.len() != 2 {
+        return Err(format!("a scatter has {} outputs, not 2", key.outputs.len()));
+    }
+    for &(k, j) in &key.in_place {
+        if k as usize >= inputs {
+            return Err(format!("in-place input {k} of {inputs}"));
+        }
+        if j as usize >= key.outputs.len() {
+            return Err(format!("in-place output {j} of {}", key.outputs.len()));
+        }
+        let shifted = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)) && instr.args[0] == Ref::Input(k));
+        let in_sub = key.subs.iter().flatten().any(|instr| instr.args.contains(&Ref::Input(k)));
+        // Mapped and scatter kernels (`run_mapped`) may read their base through shifts: the
+        // caller of `jit::assign` proved no element is read after another invocation wrote it.
+        if key.tail == Tail::Store && (shifted || in_sub) {
+            return Err(format!("in-place input {k} is read through a shift or in a sub-program"));
+        }
+    }
+    if let Some(tile) = &key.tile {
+        if tile.offsets.len() != 1 + key.subs.len() {
+            return Err(format!("tile offsets for {} programs, {} exist", tile.offsets.len(), 1 + key.subs.len()));
+        }
+        let lens = std::iter::once(key.instrs.len()).chain(key.subs.iter().map(Vec::len));
+        for (p, (row, len)) in tile.offsets.iter().zip(lens).enumerate() {
+            if row.len() != len {
+                return Err(format!("tile offsets of program {p} have {} rows for {len} instructions", row.len()));
+            }
+        }
+    }
+    if let Some(layout) = &key.staging {
+        super::staging::check(layout, key).map_err(|message| format!("invalid staging: {message}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+    use crate::builtin::BinOp;
+
+    fn instr(kind: OpKind, args: [Ref; 3]) -> Instr {
+        Instr { op: Op::new(kind, ElemTy::F32), args }
+    }
+
+    fn key(instrs: Vec<Instr>, subs: Vec<Vec<Instr>>) -> FusedKey {
+        let outputs = vec![instrs.len() as u32 - 1];
+        FusedKey {
+            shape: shape_of(&instrs, &subs),
+            instrs: Arc::new(instrs),
+            input_tys: vec![ElemTy::F32],
+            scalar_tys: vec![ElemTy::F32],
+            outputs,
+            subs: Arc::new(subs),
+            tail: Tail::Store,
+            in_place: Vec::new(),
+            spans: Vec::new(),
+            tile: None,
+            staging: None,
+            guard: None,
+        }
+    }
+
+    fn add(a: Ref, b: Ref) -> Instr {
+        instr(OpKind::Binary(BinOp::Add), [a, b, Ref::Unused])
+    }
+
+    fn check(key: &FusedKey) -> Result<(), String> {
+        validate(key, key.input_tys.len(), key.scalar_tys.len())
+    }
+
+    fn view(src: u32, start: i32, out: u32) -> Instr {
+        let mut map = ViewMap::identity([src, 1, 1, 1]);
+        map.out[0] = out;
+        map.axes[0].start = start;
+        instr(OpKind::Shift(ShiftKind::View { map, edge: Edge::None }), [Ref::Sub(0), Ref::Unused, Ref::Unused])
+    }
+
+    #[test]
+    fn a_well_formed_key_is_accepted() {
+        let sub = vec![add(Ref::Input(0), Ref::Scalar(0))];
+        let main = vec![view(9, 1, 8), view(9, 0, 8), add(Ref::Tmp(0), Ref::Tmp(1))];
+        assert_eq!(check(&key(main, vec![sub])), Ok(()));
+    }
+
+    #[test]
+    fn a_forward_temporary_is_rejected() {
+        let k = key(vec![add(Ref::Tmp(1), Ref::Input(0)), add(Ref::Tmp(0), Ref::Input(0))], vec![]);
+        assert!(check(&k).unwrap_err().contains("earlier"));
+    }
+
+    #[test]
+    fn an_input_or_scalar_out_of_range_is_rejected() {
+        assert!(check(&key(vec![add(Ref::Input(1), Ref::Scalar(0))], vec![])).unwrap_err().contains("input 1"));
+        assert!(check(&key(vec![add(Ref::Input(0), Ref::Scalar(1))], vec![])).unwrap_err().contains("uniform"));
+    }
+
+    #[test]
+    fn a_sub_program_reading_a_later_one_is_rejected() {
+        let first = vec![view(9, 1, 8)];
+        let second = vec![add(Ref::Input(0), Ref::Scalar(0))];
+        let main = vec![view(9, 0, 8)];
+        assert!(check(&key(main.clone(), vec![first, second.clone()])).unwrap_err().contains("lower"));
+        assert!(check(&key(vec![view(9, 0, 8)], vec![])).unwrap_err().contains("sub-program"));
+    }
+
+    #[test]
+    fn a_view_outside_its_source_is_rejected() {
+        let sub = vec![add(Ref::Input(0), Ref::Scalar(0))];
+        let k = key(vec![view(9, 2, 8)], vec![sub]);
+        assert!(check(&k).unwrap_err().contains("outside"));
+    }
+
+    #[test]
+    fn a_wrong_arity_or_in_place_shift_read_is_rejected() {
+        let k = key(vec![instr(OpKind::Binary(BinOp::Add), [Ref::Input(0), Ref::Unused, Ref::Unused])], vec![]);
+        assert!(check(&k).unwrap_err().contains("arity"));
+        let mut shifted = key(vec![instr(OpKind::Shift(ShiftKind::Linear), [Ref::Input(0), Ref::Scalar(0), Ref::Scalar(0)])], vec![]);
+        shifted.in_place = vec![(0, 0)];
+        assert!(check(&shifted).unwrap_err().contains("in-place"));
+    }
+}
