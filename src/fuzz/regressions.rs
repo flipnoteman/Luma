@@ -465,3 +465,36 @@ fn clone_of_a_lazy_array_misses_a_compound_assignment_after_a_lazy_slice_write()
         ],
     });
 }
+
+/// Finding 19 (`LUMA_DEVICE=cpu`, seeds 2001 and 2003): `m = minimum(x, x)` simplifies to a copy
+/// of `x`, and the store of `x.flip(0).assign(&m)`, `Id(m)`, was simplified to `Id(x)` too
+/// (`Id(Id(x))`), so the write no longer saw the pending copy `m` that reads the target and
+/// had it evaluated first: it read the buffer it overwrites at other elements (`x[0]` is `0.5`,
+/// not the old `x[299]`). Only an execution order that lets a write overtake a read shows it
+/// (llvmpipe); `simplify: false` always passed.
+#[test]
+fn flipped_assign_of_a_simplified_self_minimum_reads_overwritten_data() {
+    check(Program {
+        config: Config::default_engine(),
+        math: true,
+        stmts: vec![
+            Input { dims: [300, 1, 1, 1], ty: F32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Var(0), op: Minimum },
+            Assign { target: 0, path: vec![InjFlip { axis: 0 }], rhs: Var(1) },
+        ],
+    });
+}
+
+/// Finding 19, second form: a `Df32` square, written through a transpose.
+#[test]
+fn transposed_assign_of_a_simplified_self_maximum_reads_overwritten_data() {
+    check(Program {
+        config: Config::default_engine(),
+        math: true,
+        stmts: vec![
+            Input { dims: [8, 8, 1, 1], ty: Df32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Var(0), op: Maximum },
+            Assign { target: 0, path: vec![InjTranspose], rhs: Var(1) },
+        ],
+    });
+}
