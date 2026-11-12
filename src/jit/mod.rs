@@ -65,6 +65,7 @@ mod launch;
 mod looped;
 mod program;
 mod readers;
+pub(crate) mod speculate;
 mod stencil;
 mod until;
 #[cfg(test)]
@@ -110,6 +111,8 @@ const MAX_INPUTS: usize = 16;
 /// Environment variable overriding [`DEFAULT_MAX_NODES`] for new contexts. `1` makes every
 /// operation its own kernel.
 const MAX_NODES_ENV: &str = "LUMA_FUSION_MAX_NODES";
+/// Set to `off` to disable speculation at readbacks (see [`speculate`]).
+const SPECULATE_ENV: &str = "LUMA_SPECULATE";
 
 /// Element type of a lazy operation's operands and results.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -406,7 +409,11 @@ impl Node {
     /// Stores `storage`, computed for this node inside a kernel with several outputs, as the
     /// node's result, unless another thread evaluated it meanwhile.
     fn finish(&self, storage: Storage) {
-        let storage = Arc::new(storage);
+        self.finish_shared(Arc::new(storage));
+    }
+
+    /// [`Node::finish`] for a buffer that others hold too.
+    fn finish_shared(&self, storage: Arc<Storage>) {
         if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
             storage.set_producer(self.id);
             storage.readers.absorb(&self.readers);
@@ -744,6 +751,8 @@ pub(crate) struct JitState {
     stats: Stats,
     /// Follows consecutive `eval` calls to find loops (see [`looped`]).
     tracker: Mutex<looped::Tracker>,
+    /// Follows reduction readbacks to find loops that can be speculated (see [`speculate`]).
+    speculation: Mutex<speculate::Tracker>,
 }
 
 /// Counters of the fusion machinery, read by tests.
@@ -790,6 +799,9 @@ impl JitState {
             loop_work: AtomicU64::new(launch::LOOP_WORK_PER_LAUNCH),
             stats: Stats::default(),
             tracker: Mutex::new(looped::Tracker::default()),
+            speculation: Mutex::new(speculate::Tracker::new(
+                !std::env::var(SPECULATE_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
+            )),
         }
     }
 
@@ -800,6 +812,16 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_loop_work(&self, work: u64) {
         self.loop_work.store(work.max(1), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn speculation_hits(&self) -> u64 {
+        lock(&self.speculation).hits
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_speculate(&self, on: bool) {
+        lock(&self.speculation).enabled = on;
     }
 
     #[cfg(test)]

@@ -586,10 +586,19 @@ pub(crate) fn reduce_first_pass(
         return Ok(None);
     }
     let Some(args) = node.operands() else { return Ok(None) };
-    let ctx = node.context();
     let (fused, args) = flatten_bounded(node, args, Tail::Reduce(ops))?;
     drop(args);
+    reduce_fused(node.context(), node.len(), fused, ops, scratch).map(Some)
+}
 
+/// The first pass of [`reduce_first_pass`] for an already flattened expression of `len` elements.
+pub(super) fn reduce_fused(
+    ctx: &crate::context::Context,
+    len: usize,
+    fused: Fused,
+    ops: ReduceList,
+    scratch: &mut Scratch<'_>,
+) -> Result<Vec<(wgpu::Buffer, u32)>, Failure> {
     fused.mark_fused();
     let Fused { mut key, inputs, scalars, .. } = fused;
     // Without inputs (only generators) the segments are those an array of this length would have.
@@ -597,12 +606,12 @@ pub(crate) fn reduce_first_pass(
     let first = match inputs.first() {
         Some(first) => first,
         None => {
-            layout = Storage::new(ctx, node.len(), ELEMENT_BYTES as usize);
+            layout = Storage::new(ctx, len, ELEMENT_BYTES as usize);
             &layout
         }
     };
     let segments = first.segments();
-    let shifted = plan_shifts(ctx, &mut key, &scalars, node.len())?;
+    let shifted = plan_shifts(ctx, &mut key, &scalars, len)?;
     let core = ctx.jit().kernel(ctx, &key)?;
 
     let mut partials = Vec::with_capacity(segments);
@@ -613,7 +622,7 @@ pub(crate) fn reduce_first_pass(
         let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
         let out = scratch.take(out_bytes)?;
         let ids = segment_ids(shifted.as_ref(), j)?;
-        let params = params(&key, ids, Some(n), range.start, node.len(), &scalars)?;
+        let params = params(&key, ids, Some(n), range.start, len, &scalars)?;
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
         raw.push(RawArg::write(&out, out_bytes));
@@ -624,5 +633,5 @@ pub(crate) fn reduce_first_pass(
         partials.push((out, groups));
     }
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
-    Ok(Some(partials))
+    Ok(partials)
 }

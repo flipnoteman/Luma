@@ -609,7 +609,6 @@ pub(super) struct Traced {
     pub(super) fused: Fused,
     /// The node whose value instruction `k` computes, roots included. Callers that keep a traced
     /// step use it to find the nodes of its instructions.
-    #[allow(dead_code)]
     pub(super) members: Vec<Option<Arc<Node>>>,
 }
 
