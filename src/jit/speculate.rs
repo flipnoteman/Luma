@@ -13,7 +13,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::array::{Failure, Storage};
-use crate::builtin::ReduceList;
+use crate::builtin::{Finish, ReduceList};
 use crate::context::{Context, Scratch};
 use crate::error::{LumaError, Result};
 use crate::reduce::finish_passes;
@@ -249,9 +249,9 @@ fn compute_ahead(
     from: &[Arc<Storage>],
 ) -> Result<(Vec<Arc<Storage>>, wgpu::Buffer)> {
     debug_assert_eq!(from.len(), states);
-    let partials = launch::reduce_fused(ctx, len, with_states(template, from, None), ops, scratch, None).map_err(Failure::into_error)?;
+    let partials = launch::reduce_fused(ctx, len, with_states(template, from, None), ops, scratch, None, Finish::default()).map_err(Failure::into_error)?;
     let [(partial, groups)] = <[_; 1]>::try_from(partials).map_err(|_| LumaError::Gpu("speculated reduction spans segments".into()))?;
-    let residual = finish_passes(ctx, scratch, ops, wgsl, ElemTy::F32.bytes(), partial, groups, true, None)?;
+    let residual = finish_passes(ctx, scratch, ops, wgsl, ElemTy::F32.bytes(), partial, groups, true, None, Finish::default())?;
     let next = launch::run_store(ctx, len, with_states(template, from, Some(outs))).map_err(Failure::into_error)?;
     Ok((next.into_iter().map(Arc::new).collect(), residual))
 }

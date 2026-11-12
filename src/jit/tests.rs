@@ -45,6 +45,7 @@ fn delta(before: StatsSnapshot, after: StatsSnapshot) -> StatsSnapshot {
         hits: after.hits - before.hits,
         elementwise_launches: after.elementwise_launches - before.elementwise_launches,
         reduce_launches: after.reduce_launches - before.reduce_launches,
+        reduce_passes: after.reduce_passes - before.reduce_passes,
     }
 }
 
@@ -175,8 +176,8 @@ fn reductions_fuse_their_input_expression() {
     let max = (&a * 2.0 - 1.0).max().item().unwrap();
     let mean = (&a + &b).mean().item().unwrap();
     let d = delta(before, ctx.jit().stats());
-    // The expression is never materialized; `norm` and `mean` finish with a one-element kernel each.
-    assert_eq!(d.elementwise_launches, 2);
+    // The expression is never materialized; `norm` and `mean` finish inside the last pass of their reduction.
+    assert_eq!(d.elementwise_launches, 0);
     assert_eq!(d.reduce_launches, 4);
     let want_norm = xs
         .iter()
@@ -195,7 +196,7 @@ fn reductions_fuse_their_input_expression() {
     // u32: counting a mask.
     let count = a.gt(0.0).sum().item().unwrap();
     assert_eq!(count as usize, xs.iter().filter(|&&x| x > 0.0).count());
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
 
     // Sizes around the block boundaries, one-element arrays included.
     for len in [1usize, 2, 255, 1023, 1024, 1025, 4096, 4097, 1024 * 1024 + 3] {
@@ -232,7 +233,7 @@ fn reducing_an_expression_does_not_evaluate_it() {
     let before = ctx.jit().stats();
     let again = t.sum().item().unwrap();
     assert_eq!(again, s);
-    assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 0);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
 }
 
 #[test]
@@ -845,6 +846,134 @@ fn several_reductions_share_one_pass() {
     // On a materialized array, and an op repeated.
     let [a, b] = x.reduce([Reduction::Max, Reduction::Max]).to_array().unwrap();
     assert_eq!((a, b), (hi / 2.0, hi / 2.0));
+}
+
+/// Every kernel launched since `before`: fused elementwise kernels, first passes of reductions
+/// and their later passes.
+fn launches(d: StatsSnapshot) -> u64 {
+    d.elementwise_launches + d.reduce_launches + d.reduce_passes
+}
+
+fn sum_squares(xs: &[f32]) -> f64 {
+    xs.iter().map(|&v| f64::from(v) * f64::from(v)).sum()
+}
+
+#[test]
+fn the_epilogue_of_a_reduction_runs_in_its_last_pass() {
+    let ctx = ctx();
+    // Over a workgroup's block (a second pass over the partial results), and within one.
+    for (n, passes) in [(300_001usize, 2u64), (1000, 1)] {
+        let xs = values(n, 60, -1.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        let want = sum_squares(&xs).sqrt();
+        let rms = (sum_squares(&xs) / n as f64).sqrt();
+
+        // On the host.
+        let before = ctx.jit().stats();
+        let norm = x.norm().item().unwrap();
+        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "norm of {n} elements");
+        assert!((f64::from(norm) - want).abs() <= 1e-4 * want, "{norm} vs {want}");
+
+        // As a buffer on the GPU.
+        let before = ctx.jit().stats();
+        let rms_gpu = (&(&x * &x).sum() / (n as f32)).sqrt();
+        rms_gpu.eval().unwrap();
+        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "rms of {n} elements");
+        let got = f64::from(rms_gpu.item().unwrap());
+        assert!((got - rms).abs() <= 1e-4 * rms, "{got} vs {rms}");
+
+        // Of an expression, used in another expression.
+        let before = ctx.jit().stats();
+        let scaled = (x.sum() / (n as f32)).sqrt();
+        let y = &x * &scaled;
+        let ys = y.to_vec().unwrap();
+        let mean_abs = (xs.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64).abs().sqrt();
+        assert_eq!(launches(delta(before, ctx.jit().stats())), passes + 1, "x * sqrt(mean) of {n} elements");
+        for (got, want) in ys.iter().zip(&xs) {
+            assert!(
+                (f64::from(*got) - f64::from(*want) * mean_abs).abs() <= 1e-3 * f64::from(want.abs()).max(1e-3),
+                "{got} vs {want} * {mean_abs}"
+            );
+        }
+    }
+}
+
+#[test]
+fn steps_on_a_reduction_beyond_the_limit_run_as_an_expression() {
+    let ctx = ctx();
+    let xs = values(4000, 61, 0.5, 1.5);
+    let x = f32s(&ctx, &xs);
+    let sum: f64 = xs.iter().map(|&v| f64::from(v)).sum();
+    let before = ctx.jit().stats();
+    // Four steps are in the pass; the fifth is an expression on the buffer it leaves.
+    let r = (((x.sum() * 0.5).sqrt() + 1.0) * 2.0).abs().ln();
+    let got = f64::from(r.item().unwrap());
+    let want = (((sum * 0.5).sqrt() + 1.0) * 2.0).abs().ln();
+    assert!((got - want).abs() <= 1e-4 * want, "{got} vs {want}");
+    assert_eq!(launches(delta(before, ctx.jit().stats())), 3);
+
+    // The scalar on the left, and several reductions with the same steps.
+    let [lo, hi] = x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max]).to_array().unwrap();
+    let before = ctx.jit().stats();
+    let [a, b] = (2.0 - x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max])).to_array().unwrap();
+    assert_eq!(launches(delta(before, ctx.jit().stats())), 2);
+    assert_eq!((a, b), (2.0 - lo, 2.0 - hi));
+}
+
+#[test]
+fn a_reduction_that_ran_is_not_run_again_by_a_step_on_it() {
+    let ctx = ctx();
+    let xs = values(300_001, 62, -1.0, 1.0);
+    let n = xs.len() as f32;
+    let x = f32s(&ctx, &xs);
+    let sum: f64 = xs.iter().map(|&v| f64::from(v)).sum();
+    let total = x.sum();
+    let before = ctx.jit().stats();
+    total.eval().unwrap();
+    assert_eq!(launches(delta(before, ctx.jit().stats())), 2);
+    let before = ctx.jit().stats();
+    let mean = (&total / n).item().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    // The division of the sum's buffer, not the reduction again.
+    assert_eq!((d.reduce_launches + d.reduce_passes, d.elementwise_launches), (0, 1));
+    assert!((f64::from(total.item().unwrap()) - sum).abs() <= 1e-3);
+    assert!((f64::from(mean) - sum / f64::from(n)).abs() <= 1e-6, "{mean}");
+}
+
+#[test]
+fn the_temporaries_of_one_expression_do_not_keep_the_steps_out_of_the_pass() {
+    let ctx = ctx();
+    for (n, passes) in [(300_001usize, 2u64), (700, 1)] {
+        let xs = values(n, 64, -1.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        let want = (sum_squares(&xs) / n as f64).sqrt();
+        let before = ctx.jit().stats();
+        // `x * x` and the sum and the quotient are alive while the root is taken.
+        let got = (&(&x * &x).sum() / (n as f32)).sqrt().item().unwrap();
+        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "{n} elements");
+        assert!((f64::from(got) - want).abs() <= 1e-4 * want, "{got} vs {want}");
+    }
+}
+
+#[test]
+fn scalars_of_the_epilogue_are_not_part_of_the_kernel() {
+    let ctx = ctx();
+    let x = f32s(&ctx, &values(500, 63, 0.0, 1.0));
+    let sum = x.sum().item().unwrap();
+    assert_eq!((x.sum() * 2.0).item().unwrap(), sum * 2.0);
+    let before = ctx.jit().stats();
+    assert_eq!((x.sum() * 3.0).item().unwrap(), sum * 3.0);
+    assert_eq!(delta(before, ctx.jit().stats()).built, 0);
+}
+
+#[test]
+fn a_reduction_of_an_array_sees_the_array_as_it_was() {
+    let ctx = ctx();
+    let mut x = f32s(&ctx, &[1.0; 100]);
+    let norm = x.norm();
+    x += 1.0;
+    assert_eq!(x.sum().item().unwrap(), 200.0);
+    assert_eq!(norm.item().unwrap(), 10.0);
 }
 
 #[test]

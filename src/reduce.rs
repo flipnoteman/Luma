@@ -5,7 +5,7 @@ use std::panic::Location;
 use std::sync::{Arc, OnceLock};
 
 use crate::array::{Array, Failure, Storage};
-use crate::builtin::{Builtin, ReduceList, ReduceOp, UnOp, MAX_REDUCTIONS};
+use crate::builtin::{Builtin, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_EPILOGUE, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{GpuType, ScalarType};
@@ -17,18 +17,33 @@ use crate::shape::Shape;
 /// expression until the result is used on the GPU (then the passes are recorded into a buffer,
 /// without reading anything back) or on the host (then it is read like a synchronous reduction,
 /// which lets the speculation of [`crate::jit`] answer loops of readbacks).
+///
+/// Elementwise operations with scalars on the result (`(x.sum() / n).sqrt()`) do not create
+/// expressions: they extend the reduction by an epilogue that its last pass applies, so the
+/// whole is as many launches as the reduction alone (see [`Array::fuse_step`]). Such a reduction
+/// shares the operand with the one it extends but never reads its buffer (which a write through
+/// another array may change): if both are used they run separately.
 pub(crate) struct Reduced {
     operand: Arc<Node>,
     ops: ReduceList,
     wgsl: &'static str,
     /// Bytes of one element.
     elem: u64,
+    /// Whether the operand only reads a buffer (the reduction of an array that is already
+    /// evaluated), which no speculation of readbacks concerns.
+    buffer: bool,
+    /// The operations applied to the reduction's values (none for a plain reduction).
+    finish: Finish,
     result: OnceLock<std::result::Result<Arc<Storage>, Arc<LumaError>>>,
 }
 
 impl std::fmt::Debug for Reduced {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Reduced").field("ops", &self.ops).field("forced", &self.result.get().is_some()).finish()
+        f.debug_struct("Reduced")
+            .field("ops", &self.ops)
+            .field("steps", &self.finish.epilogue)
+            .field("forced", &self.result.get().is_some())
+            .finish()
     }
 }
 
@@ -54,14 +69,14 @@ impl Reduced {
         let pin = storage.pin(0)?;
         let array = Array::<u32>::from_node(ctx, Shape::from(self.operand.len()), Arc::clone(&self.operand));
         let mut scratch = Scratch::new(ctx);
-        reduce_into(&array, self.elem, self.wgsl, self.ops, &mut scratch, Some(pin.buffer()))?;
+        reduce_into(&array, self.elem, self.wgsl, self.ops, &mut scratch, Some(pin.buffer()), self.finish)?;
         Ok(storage)
     }
 
     /// The values on the host, without keeping them on the GPU.
     pub(crate) fn read<T: GpuType>(&self, ctx: &Context) -> Result<Vec<T>> {
         let array = Array::<T>::from_node(ctx, Shape::from(self.operand.len()), Arc::clone(&self.operand));
-        reduce_array(&array, self.wgsl, self.ops)
+        reduce_array(&array, self.wgsl, self.ops, self.finish, !self.buffer)
     }
 }
 
@@ -118,23 +133,59 @@ impl<T: ScalarType> Array<T> {
         let elem = std::mem::size_of::<T>() as u64;
         let wgsl = T::reduce_type();
         // Poisoned operands pass their error on.
-        self.src()?;
-        if let Some(node) = self.pending() {
+        let src = self.src()?;
+        // An `f32` reduction stays lazy even on a buffer, so that steps on its result fuse into
+        // its last pass (see `Reduced`); other types have no such steps and record at once.
+        let operand = match (self.pending(), src) {
+            (Some(node), _) => Some((Src::Node(Arc::clone(node)), false)),
+            (None, src @ Src::Buffer(_)) if wgsl == "f32" => Some((src, true)),
+            _ => None,
+        };
+        if let Some((operand, buffer)) = operand {
             // The reduction reads the operand later, so it is registered with it like any other
             // reader: a write into the operand's buffer (or into what the operand reads)
             // evaluates the readers first, which records the reduction's read ahead of the
             // write. The reader is a copy of the operand that the reduction's first pass fuses.
-            let args = [Src::Node(Arc::clone(node)), Src::unused(), Src::unused()];
-            let reader = jit::create(ctx, node.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
-            let reduced = Reduced { operand: reader, ops, wgsl, elem, result: OnceLock::new() };
+            let args = [operand, Src::unused(), Src::unused()];
+            let reader = jit::create(ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
+            let reduced = Reduced { operand: reader, ops, wgsl, elem, buffer, finish: Finish::default(), result: OnceLock::new() };
             return Ok(Array::from_reduced(ctx, shape, Arc::new(reduced)));
         }
         // Nothing is left to fuse: record the passes now.
         let storage = Arc::new(Storage::new(ctx, shape.len(), elem as usize));
         let pin = storage.pin(0)?;
         let mut scratch = Scratch::new(ctx);
-        reduce_into(self, elem, wgsl, ops, &mut scratch, Some(pin.buffer()))?;
+        reduce_into(self, elem, wgsl, ops, &mut scratch, Some(pin.buffer()), Finish::default())?;
         Ok(Array::from_storage(ctx, shape, storage))
+    }
+
+    /// This array, a reduction that has not been recorded yet, extended by `step` (with the
+    /// value `word` of its scalar operand, as `f32` bits), as an array of `O`; `None` if the
+    /// step cannot run inside the reduction's last pass: the array is not such a reduction of
+    /// `f32`, or it has run or failed, or it has [`MAX_EPILOGUE`] steps already.
+    pub(crate) fn fuse_step<O: ScalarType>(&self, step: EpilogueStep, word: u32) -> Option<Array<O>> {
+        let reduced = self.reduced()?;
+        if reduced.wgsl != "f32" || !reduced.is_unforced() || reduced.failure().is_some() {
+            return None;
+        }
+        if ElemTy::of::<T>().ok()? != ElemTy::F32 || ElemTy::of::<O>().ok()? != ElemTy::F32 || step == EpilogueStep::Unary(UnOp::Id) {
+            return None;
+        }
+        let mut finish = reduced.finish;
+        let at = finish.epilogue.steps().count();
+        finish.epilogue = finish.epilogue.then(step)?;
+        debug_assert!(at < MAX_EPILOGUE);
+        finish.words[at] = word;
+        let derived = Reduced {
+            operand: Arc::clone(&reduced.operand),
+            ops: reduced.ops,
+            wgsl: reduced.wgsl,
+            elem: reduced.elem,
+            buffer: reduced.buffer,
+            finish,
+            result: OnceLock::new(),
+        };
+        Some(Array::from_reduced(self.context(), self.shape(), Arc::new(derived)))
     }
 }
 
@@ -161,14 +212,17 @@ impl<T: GpuType> Array<T> {
 }
 
 impl Array<f32> {
-    /// The mean of all elements, as a lazy one-element array: the sum divided by the length.
+    /// The mean of all elements, as a lazy one-element array: the sum divided by the length. The
+    /// division happens in the last pass of the reduction.
     #[track_caller]
     pub fn mean(&self) -> Array<f32> {
         &self.sum() / (self.len() as f32)
     }
 
     /// The Euclidean (L2) norm: the square root of the sum of squares, as a lazy one-element
-    /// array.
+    /// array. The square root happens in the last pass of the reduction, so a norm is two
+    /// launches for a large array and one for a small one. Operations with scalars on any
+    /// reduction's result (`(x.sum() / n).sqrt()`, up to four) do the same.
     #[track_caller]
     pub fn norm(&self) -> Array<f32> {
         self.reduce([Reduction::SumOfSquares]).sqrt()
@@ -201,7 +255,7 @@ impl Reduction {
 
 fn reduce_n<T: GpuType, const N: usize>(array: &Array<T>, wgsl: &'static str, ops: [Reduction; N]) -> Result<[T; N]> {
     const { assert!(N >= 1 && N <= MAX_REDUCTIONS, "Array::reduce takes one to four reductions") };
-    let values = reduce_array(array, wgsl, ReduceList::new(&ops.map(Reduction::op)))?;
+    let values = reduce_array(array, wgsl, ReduceList::new(&ops.map(Reduction::op)), Finish::default(), true)?;
     let mut out = [T::zeroed(); N];
     for (slot, value) in out.iter_mut().zip(values) {
         *slot = value;
@@ -211,24 +265,26 @@ fn reduce_n<T: GpuType, const N: usize>(array: &Array<T>, wgsl: &'static str, op
 
 /// Reduces the whole array on the GPU, once per op of `ops`: the first pass leaves at most
 /// `Tuning::reduce_max_groups` partial results per op, the next one workgroup's worth of them,
-/// until one element per op is left; those are read back together.
+/// until one element per op is left; those are read back together, with `finish` applied.
 /// The first pass reads the data once for all ops; if the array is a pending lazy expression, it
 /// computes it on the fly instead of reading a materialized buffer. `wgsl` is the WGSL type of
 /// the elements; for vectors (which are never lazy) the operations act on every component
-/// separately. Synchronizes.
-fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList) -> Result<Vec<T>> {
+/// separately. A reduction without `finish` of an expression may be answered by the speculation
+/// of [`crate::jit`] if `speculate`. Synchronizes.
+fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, finish: Finish, speculate: bool) -> Result<Vec<T>> {
     let ctx = array.context();
     let elem = std::mem::size_of::<T>() as u64;
     let count = ops.as_slice().len() as u64;
     if let Some(node) = array.pending()
+        && speculate
+        && finish.epilogue.is_empty()
         && matches!(wgsl, "f32" | "u32")
-        && let Some(words) =
-            jit::speculate::readback(node, ops, |scratch| reduce_into(array, elem, wgsl, ops, scratch, None))
+        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, elem, wgsl, ops, scratch, None, finish))
     {
         return Ok(bytemuck::cast_slice(&words?).to_vec());
     }
     let mut scratch = Scratch::new(ctx);
-    let current = reduce_into(array, elem, wgsl, ops, &mut scratch, None)?;
+    let current = reduce_into(array, elem, wgsl, ops, &mut scratch, None, finish)?;
     let values = ctx.read::<T>(&current, elem * count)?;
     if values.len() as u64 != count {
         return Err(LumaError::Gpu("reduction results are missing".into()));
@@ -237,7 +293,7 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
 }
 
 /// Runs passes over `current` (`n` elements, or `n` per op once `per_op`) until one element per
-/// op is left, and returns the buffer holding them.
+/// op is left, and returns the buffer holding them. The last pass applies `finish`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_passes(
     ctx: &Context,
@@ -249,21 +305,34 @@ pub(crate) fn finish_passes(
     mut n: u32,
     mut per_op: bool,
     target: Option<&wgpu::Buffer>,
+    finish: Finish,
 ) -> Result<wgpu::Buffer> {
     let count = ops.as_slice().len() as u64;
     while !per_op || n > 1 {
         let groups = ctx.tuning().reduce_groups(n);
         let list = if per_op { ops.rest() } else { ops };
+        // The pass with one group is the last: its output is the final value.
+        let last = groups == 1;
+        let list = if last { list.with_epilogue(finish.epilogue) } else { list };
         let in_bytes = u64::from(n) * elem * if per_op { count } else { 1 };
         // The last pass leaves one element per op: into `target` if there is one.
         let out = match target {
-            Some(target) if groups == 1 => target.clone(),
+            Some(target) if last => target.clone(),
             _ => scratch.take(u64::from(groups) * elem * count)?,
         };
         let core = ctx.builtin(Builtin::Reduce(list, per_op), wgsl)?;
-        // The double-float pass has a second uniform field: the guard of its arithmetic (always 0).
-        let uniform = [n, 0u32];
-        let uniform = if wgsl == "df32" { &uniform[..] } else { &uniform[..1] };
+        // The uniform: `n`; the double-float pass has a second field, the guard of its arithmetic
+        // (always 0); the last pass the scalars of the epilogue.
+        let mut words = [0u32; 2 + MAX_EPILOGUE];
+        words[0] = n;
+        let mut used = if wgsl == "df32" { 2 } else { 1 };
+        if last {
+            for word in finish.uniform_words() {
+                words[used] = word;
+                used += 1;
+            }
+        }
+        ctx.jit().note_reduce_pass();
         ctx.launch(
             &core,
             fold_workgroups(ctx, groups)?,
@@ -271,7 +340,7 @@ pub(crate) fn finish_passes(
             &[
                 RawArg::write(&out, u64::from(groups) * elem * count),
                 RawArg::read(&current, in_bytes),
-                RawArg::Uniform(bytemuck::cast_slice(uniform)),
+                RawArg::Uniform(bytemuck::cast_slice(&words[..used])),
             ],
         )?;
         current = out;
@@ -283,7 +352,7 @@ pub(crate) fn finish_passes(
 
 /// The reduction of `array` as a buffer holding one element per op; see [`reduce_array`]. `elem`
 /// is the size of an element in bytes. The values end up in `target` when it is given (a buffer
-/// of at least `elem` bytes per op), without any copy.
+/// of at least `elem` bytes per op), without any copy. `finish` is applied by the last pass.
 fn reduce_into<T: GpuType>(
     array: &Array<T>,
     elem: u64,
@@ -291,15 +360,16 @@ fn reduce_into<T: GpuType>(
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
     target: Option<&wgpu::Buffer>,
+    finish: Finish,
 ) -> Result<wgpu::Buffer> {
     let ctx = array.context();
     let count = ops.as_slice().len() as u64;
-    let finish = |scratch: &mut Scratch<'_>, current: wgpu::Buffer, n: u32, per_op: bool, target: Option<&wgpu::Buffer>| {
-        finish_passes(ctx, scratch, ops, wgsl, elem, current, n, per_op, target)
+    let run_passes = |scratch: &mut Scratch<'_>, current: wgpu::Buffer, n: u32, per_op: bool, target: Option<&wgpu::Buffer>, finish: Finish| {
+        finish_passes(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish)
     };
 
     let fused = match array.pending() {
-        Some(node) => jit::reduce_first_pass(node, ops, scratch, target).map_err(Failure::into_error)?,
+        Some(node) => jit::reduce_first_pass(node, ops, scratch, target, finish).map_err(Failure::into_error)?,
         None => None,
     };
     let mut results = Vec::new();
@@ -307,18 +377,23 @@ fn reduce_into<T: GpuType>(
         Some(partials) => {
             // With several segments only the final collecting pass writes `target`.
             let target = target.filter(|_| partials.len() == 1);
+            let single = partials.len() == 1;
             for (partial, groups) in partials {
-                results.push(finish(scratch, partial, groups, true, target)?);
+                // A first pass with one segment and one group applied `finish` itself.
+                let rest = if single && groups != 1 { finish } else { Finish::default() };
+                results.push(run_passes(scratch, partial, groups, true, target, rest)?);
             }
         }
         None => {
             let storage = array.storage().map_err(Failure::into_error)?;
-            let target = target.filter(|_| storage.segments() == 1);
+            let single = storage.segments() == 1;
+            let target = target.filter(|_| single);
             for j in 0..storage.segments() {
                 let n = len_u32(storage.range(j).len())?;
                 // Wgpu buffers are reference counted; the pin keeps it resident while it is bound.
                 let pin = storage.pin(j)?;
-                results.push(finish(scratch, pin.buffer().clone(), n, false, target)?);
+                let rest = if single { finish } else { Finish::default() };
+                results.push(run_passes(scratch, pin.buffer().clone(), n, false, target, rest)?);
             }
         }
     }
@@ -333,7 +408,7 @@ fn reduce_into<T: GpuType>(
             ctx.copy(partial, i * elem, &collect, (i * segments + j as u64) * elem, elem)?;
         }
     }
-    finish(scratch, collect, len_u32(results.len())?, true, target)
+    run_passes(scratch, collect, len_u32(results.len())?, true, target, finish)
 }
 
 /// Per-component reductions of `f32` vector arrays: the same tree reduction as the scalar

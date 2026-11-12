@@ -1766,6 +1766,8 @@ struct Stats {
     elementwise_launches: AtomicU64,
     /// Fused first passes of reductions launched.
     reduce_launches: AtomicU64,
+    /// Passes of reductions after the first (over partial results, or over a buffer).
+    reduce_passes: AtomicU64,
 }
 
 /// A snapshot of the counters of a context's [`JitState`].
@@ -1776,6 +1778,7 @@ pub(crate) struct StatsSnapshot {
     pub(crate) hits: u64,
     pub(crate) elementwise_launches: u64,
     pub(crate) reduce_launches: u64,
+    pub(crate) reduce_passes: u64,
 }
 
 impl JitState {
@@ -1908,6 +1911,11 @@ impl JitState {
             *lock(&self.last_judgement) = Some(format!("{judgement:?} {_estimates:?}"));
         }
         judgement
+    }
+
+    /// Counts a reduction pass other than the fused first one (see [`Stats`]).
+    pub(crate) fn note_reduce_pass(&self) {
+        self.stats.reduce_passes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records that a buffer's contents are about to change (or did): operations written before
@@ -2093,6 +2101,7 @@ impl JitState {
             hits: self.stats.hits.load(Ordering::Relaxed),
             elementwise_launches: self.stats.elementwise_launches.load(Ordering::Relaxed),
             reduce_launches: self.stats.reduce_launches.load(Ordering::Relaxed),
+            reduce_passes: self.stats.reduce_passes.load(Ordering::Relaxed),
         }
     }
 

@@ -545,6 +545,14 @@ impl<T: GpuType> Array<T> {
         }
     }
 
+    /// The reduction this array is (recorded into a buffer or not), if it is one.
+    pub(crate) fn reduced(&self) -> Option<&Arc<Reduced>> {
+        match &self.repr {
+            Repr::Reduced(reduced) => Some(reduced),
+            _ => None,
+        }
+    }
+
     /// The claim this array has on its expression, if it is lazy.
     pub(crate) fn held(&self) -> Option<&Held> {
         match &self.repr {

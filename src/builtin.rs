@@ -18,6 +18,30 @@ pub(crate) const REDUCE_WORKGROUP: u32 = 256;
 /// Largest stride the tiled convolution handles; larger ones run one output per invocation.
 pub(crate) const CONV_MAX_STRIDE: u32 = 4;
 
+/// `template` with its operand identifiers `x` and `y` replaced by `a` and `b`.
+pub(crate) fn substitute(template: &str, a: &str, b: &str) -> String {
+    let mut out = String::with_capacity(template.len() + 16);
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        match word.as_str() {
+            "x" => out.push_str(a),
+            "y" => out.push_str(b),
+            other => out.push_str(other),
+        }
+        word.clear();
+    };
+    for c in template.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum UnOp {
     Neg,
@@ -213,17 +237,107 @@ impl ReduceOp {
 /// Most reductions computed in one pass over the input.
 pub(crate) const MAX_REDUCTIONS: usize = 4;
 
-/// Reductions computed together, in order (a kernel cache key, so a fixed-size value).
+/// Most elementwise operations fused behind the reduction passes (see [`Epilogue`]).
+pub(crate) const MAX_EPILOGUE: usize = 4;
+
+/// One elementwise operation on the result of a reduction, with a scalar operand if binary.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum EpilogueStep {
+    /// `op(value)`.
+    Unary(UnOp),
+    /// `value op scalar`, or `scalar op value` if `scalar_left`.
+    Binary { op: BinOp, scalar_left: bool },
+}
+
+/// Elementwise operations on `f32` applied to every value a reduction leaves, inside its last
+/// pass: `sqrt(sum / n)` is the reduction and two steps. Only the operations are part of the
+/// kernel (a kernel cache key); the values of the scalar operands are uniforms (see [`Finish`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub(crate) struct Epilogue {
+    steps: [Option<EpilogueStep>; MAX_EPILOGUE],
+    len: u8,
+}
+
+impl Epilogue {
+    /// This epilogue followed by `step`, `None` if it has [`MAX_EPILOGUE`] steps already.
+    pub(crate) fn then(self, step: EpilogueStep) -> Option<Self> {
+        let at = usize::from(self.len);
+        let mut next = self;
+        *next.steps.get_mut(at)? = Some(step);
+        next.len += 1;
+        Some(next)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The steps in order.
+    pub(crate) fn steps(&self) -> impl Iterator<Item = EpilogueStep> + '_ {
+        self.steps[..usize::from(self.len)].iter().flatten().copied()
+    }
+
+    /// The fields of the `Params` uniform that hold the scalar operands: `e{k}: f32,` for every
+    /// binary step `k`.
+    pub(crate) fn fields(&self) -> String {
+        let mut out = String::new();
+        for (k, step) in self.steps().enumerate() {
+            if matches!(step, EpilogueStep::Binary { .. }) {
+                let _ = write!(out, "e{k}: f32, ");
+            }
+        }
+        out
+    }
+
+    /// WGSL statements applying the steps to the `f32` expression `value` (`let {prefix}{k}` is
+    /// the result of step `k`) and the name of the final result (`value` if there are none).
+    pub(crate) fn statements(&self, value: &str, prefix: &str) -> (String, String) {
+        let mut out = String::new();
+        let mut last = value.to_owned();
+        for (k, step) in self.steps().enumerate() {
+            let expr = match step {
+                EpilogueStep::Unary(op) => substitute(op.expr(), &last, ""),
+                EpilogueStep::Binary { op, scalar_left: false } => substitute(op.expr(), &last, &format!("p.e{k}")),
+                EpilogueStep::Binary { op, scalar_left: true } => substitute(op.expr(), &format!("p.e{k}"), &last),
+            };
+            let _ = writeln!(out, "        let {prefix}{k}: f32 = {expr};");
+            last = format!("{prefix}{k}");
+        }
+        (out, last)
+    }
+}
+
+/// An [`Epilogue`] with the values of its scalar operands (the bit patterns of `f32`s).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Finish {
+    pub(crate) epilogue: Epilogue,
+    /// The value of the scalar of step `k`, for a binary step `k`.
+    pub(crate) words: [u32; MAX_EPILOGUE],
+}
+
+impl Finish {
+    /// The words the `Params` uniform holds after the fixed fields, in the order of
+    /// [`Epilogue::fields`].
+    pub(crate) fn uniform_words(&self) -> impl Iterator<Item = u32> + '_ {
+        self.epilogue.steps().enumerate().filter(|(_, step)| matches!(step, EpilogueStep::Binary { .. })).map(|(k, _)| self.words[k])
+    }
+}
+
+/// Reductions computed together, in order (a kernel cache key, so a fixed-size value), and what
+/// is applied to their results.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ReduceList {
     ops: [ReduceOp; MAX_REDUCTIONS],
     len: u8,
+    /// Applied to every value of the pass's output; only a pass that is the last (one group)
+    /// has one.
+    epilogue: Epilogue,
 }
 
 impl ReduceList {
     /// `ops` must hold between 1 and [`MAX_REDUCTIONS`] ops.
     pub(crate) fn new(ops: &[ReduceOp]) -> Self {
-        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0 };
+        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0, epilogue: Epilogue::default() };
         for (slot, &op) in list.ops.iter_mut().zip(ops) {
             *slot = op;
             list.len += 1;
@@ -240,6 +354,16 @@ impl ReduceList {
         let mut list = self;
         list.ops.iter_mut().for_each(|op| *op = op.rest());
         list
+    }
+
+    /// These reductions with `epilogue` applied to the results. The kernel must run as a single
+    /// group (the last pass): its output is the final value.
+    pub(crate) fn with_epilogue(self, epilogue: Epilogue) -> Self {
+        ReduceList { epilogue, ..self }
+    }
+
+    pub(crate) fn epilogue(&self) -> Epilogue {
+        self.epilogue
     }
 }
 
@@ -280,9 +404,11 @@ pub(crate) enum Builtin {
 /// reads the same `p.n` elements.
 fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String {
     // The double-float kernel takes the guard of its arithmetic (see `df_library`) as a uniform.
+    let fields = ops.epilogue().fields();
     let (elem, params) = match ty {
-        "df32" => (ReduceElem::Df32 { guard: "p.guard" }, "struct Params { n: u32, guard: u32 }"),
-        other => (ReduceElem::Plain(other), "struct Params { n: u32 }"),
+        "df32" => (ReduceElem::Df32 { guard: "p.guard" }, "struct Params { n: u32, guard: u32 }".to_owned()),
+        other if fields.is_empty() => (ReduceElem::Plain(other), "struct Params { n: u32 }".to_owned()),
+        other => (ReduceElem::Plain(other), format!("struct Params {{ n: u32, {fields}}}")),
     };
     let ty = elem.storage_ty();
     format!(
@@ -464,11 +590,12 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
                 ReduceOp::Max => ("subgroupMax", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
             };
             lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
+            let (lets, fin) = ops.epilogue().statements(&format!("f{j}"), &format!("g{j}_"));
             first += &format!(
                 "        var t{j} = {ident};
         for (var k = lane; k < nsg; k += sg) {{ t{j} = c{j}(t{j}, sh[{}u + k]); }}
         let f{j} = {group_op}(t{j});
-        if (lane == 0u) {{ out[{j}u * groups + group] = f{j}; }}
+        if (lane == 0u) {{ {lets}out[{j}u * groups + group] = {fin}; }}
 ",
                 j as u32 * MAX_SUBGROUPS
             );
@@ -487,6 +614,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         )
     } else {
         for j in 0..ops.as_slice().len() {
+            let (lets, fin) = ops.epilogue().statements("sh[0]", &format!("g{j}_"));
             finish += &format!(
                 "    sh[lid] = acc{j};
     workgroupBarrier();
@@ -494,7 +622,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         if (lid < s) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
         workgroupBarrier();
     }}
-    if (lid == 0u) {{ out[{j}u * groups + group] = sh[0]; }}
+    if (lid == 0u) {{ {lets}out[{j}u * groups + group] = {fin}; }}
     workgroupBarrier();
 ",
                 half = wg / 2
