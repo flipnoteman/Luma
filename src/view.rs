@@ -636,7 +636,11 @@ impl<T: ScalarType> Array<T> {
         };
         jit::supersede(base, new);
         if let Some((receiver, node)) = viewed {
-            jit::supersede(receiver, node);
+            // An array evaluated before the write keeps its buffer, which is overwritten (arrays
+            // sharing it, a `cache()`, show the written data); a pending one is replaced.
+            if let Some(node) = jit::assign::write_evaluated_receiver(ctx, receiver, node, "assign", location)? {
+                jit::supersede(receiver, node);
+            }
         }
         Ok(true)
     }
