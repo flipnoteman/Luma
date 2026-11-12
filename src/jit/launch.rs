@@ -489,9 +489,18 @@ fn launch_store(
     shifted: Option<&Shifted>,
 ) -> Result<(), LumaError> {
     let Some(first) = outputs.first() else { return Ok(()) };
-    for j in 0..first.segments() {
-        let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
-        launch_1d(ctx, core, args.n, &args.raw())?;
+    if let Some(tile) = &key.tile {
+        if first.segments() != 1 {
+            return Err(LumaError::Gpu("tiled program on an array of several segments".into()));
+        }
+        let args = store_args(key, outputs, inputs, scalars, shifted, 0)?;
+        let tiles = tile.dims.0.div_ceil(tile.tile.0) * tile.dims.1.div_ceil(tile.tile.1);
+        ctx.launch(core, fold_workgroups(ctx, tiles)?, [args.n, 1, 1], &args.raw())?;
+    } else {
+        for j in 0..first.segments() {
+            let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
+            launch_1d(ctx, core, args.n, &args.raw())?;
+        }
     }
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -526,6 +535,9 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
         }
     }
     let shifted = plan_shifts(ctx, &mut key, &scalars, len)?;
+    if shifted.is_none() {
+        key.tile = super::codegen::plan_tile(&key, &scalars, len, ctx.tuning());
+    }
     let core = ctx.jit().kernel(ctx, &key)?;
 
     let outputs = match reused {

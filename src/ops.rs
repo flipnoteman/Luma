@@ -388,8 +388,9 @@ impl<T: ScalarType> Array<T> {
     ///
     /// The shift itself is lazy: it fuses into the expression that uses it as a shifted read,
     /// so a stencil like `u.shift(1) + u.shift(-1) - &u * 2.0` is one kernel reading `u` once. A
-    /// small lazy expression is not even evaluated: the kernel recomputes it at the shifted
-    /// element (`(&a * &b).shift(1)` reads `a` and `b` shifted); a larger one is evaluated first.
+    /// small lazy expression is not even evaluated: the kernel computes it at the shifted
+    /// element instead (`(&a * &b).shift(1)` reads `a` and `b` shifted), staged in workgroup
+    /// memory for small shifts; a larger one is evaluated first.
     #[track_caller]
     pub fn shift(&self, offsets: impl Into<Offsets>) -> Array<T> {
         let location = Location::caller();
@@ -398,11 +399,11 @@ impl<T: ScalarType> Array<T> {
     }
 
     fn run_shift(&self, offsets: Offsets, location: &'static Location<'static>) -> Outcome<Array<T>> {
+        let dims = self.shape().dims();
         let operand = match self.pending() {
-            Some(node) if jit::recompute_shifted(node) => Src::Node(Arc::clone(node)),
+            Some(node) if jit::recompute_shifted(node, dims, offsets.0) => Src::Node(Arc::clone(node)),
             _ => Src::Buffer(Arc::clone(self.storage()?)),
         };
-        let dims = self.shape().dims();
         let mut dims32 = [1u32; 4];
         let mut shifts = [0u32; 4];
         for axis in 0..4 {

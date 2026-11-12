@@ -8,6 +8,7 @@ use crate::array::{Failure, Storage};
 use crate::builtin::ReduceList;
 use crate::error::LumaError;
 
+use super::codegen::Tile;
 use super::{lock, Args, ElemTy, Node, Op, OpKind, Scalar, Src};
 
 /// Size of every element the fused kernels handle (`f32` and `u32`).
@@ -64,6 +65,9 @@ pub(crate) struct FusedKey {
     /// program is the segmented variant of the generated kernel, run once per segment of arrays
     /// spanning several buffers. Empty when the program runs unsegmented or has no shift.
     pub(crate) spans: Vec<u8>,
+    /// Set by `launch::run_store` like `spans` and `in_place`: the source stages the sub-programs
+    /// in workgroup memory (see [`Tile`]) instead of calling them per shift.
+    pub(crate) tile: Option<Tile>,
 }
 
 impl FusedKey {
@@ -287,6 +291,7 @@ impl Flattener {
                 tail,
                 in_place: None,
                 spans: Vec::new(),
+                tile: None,
             },
             inputs: self.inputs,
             scalars: self.scalars,
@@ -519,7 +524,7 @@ pub(super) fn flatten_inner(
 ) -> Result<Fused, Failure> {
     if let [(root, args)] = roots
         && probes.is_empty()
-        && !root.recomputes()
+        && root.shift_depth() == 0
         && let Some(fused) = flatten_plain(root, args, tail)?
     {
         return Ok(fused);

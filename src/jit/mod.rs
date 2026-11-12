@@ -295,9 +295,9 @@ pub(crate) struct Node {
     /// Set once the node's value was computed inside another node's kernel (or a reduction).
     /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
     fused: AtomicBool,
-    /// Whether the expression reads a shifted lazy expression (recomputed, see
+    /// Levels of shifted lazy expressions nested in the expression (0: none; see
     /// [`recompute_shifted`]).
-    recomputes: bool,
+    shift_depth: u8,
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
     /// Whether the node is in [`JitState::requested`].
@@ -340,10 +340,10 @@ impl Node {
         }
     }
 
-    /// Whether the expression reads a shifted lazy expression (see [`recompute_shifted`]). The
-    /// plan of a loop leaf evaluates its inputs, so it reads none.
-    fn recomputes(&self) -> bool {
-        self.recomputes && self.looped.get().is_none()
+    /// Levels of shifted lazy expressions in the expression (see [`recompute_shifted`]). The plan
+    /// of a loop leaf evaluates its inputs, so it has none.
+    fn shift_depth(&self) -> u8 {
+        if self.looped.get().is_some() { 0 } else { self.shift_depth }
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -675,10 +675,16 @@ pub(crate) fn create(
         // Without this, a long chain built without `eval` keeps the GPU idle until its end.
         let _ = ctx.submit();
     }
-    let recomputes = args.iter().take(arity).enumerate().any(|(i, arg)| match arg {
-        Src::Node(operand) => operand.recomputes() || (i == 0 && matches!(op.kind, OpKind::Shift(_))),
-        _ => false,
-    });
+    let shift_depth = args
+        .iter()
+        .take(arity)
+        .enumerate()
+        .map(|(i, arg)| match arg {
+            Src::Node(operand) => operand.shift_depth().saturating_add(u8::from(i == 0 && matches!(op.kind, OpKind::Shift(_)))),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
 
     let node = Arc::new(Node {
         ctx: ctx.clone(),
@@ -693,7 +699,7 @@ pub(crate) fn create(
         below_len,
         consumers: AtomicU32::new(0),
         fused: AtomicBool::new(false),
-        recomputes,
+        shift_depth,
         readers: Readers::default(),
         requested: AtomicBool::new(false),
         looped: OnceLock::new(),
@@ -721,15 +727,31 @@ pub(crate) fn create(
     Ok(node)
 }
 
-/// Whether a shift of `node` reads its expression recomputed rather than evaluated. Only one
-/// level: an expression that already recomputes a shifted one is evaluated, or every further
-/// stencil step would multiply the work by its number of shifts.
-pub(crate) fn recompute_shifted(node: &Node) -> bool {
-    // A recomputed expression runs inside kernels of segmented programs only if it fits one
-    // segment, so segmented programs have no sub-programs.
-    node.size() <= node.context().tuning().max_recomputed
-        && !node.recomputes()
-        && node.len() as u64 * 4 <= node.context().segment_bytes()
+/// Most levels of shifted lazy expressions a kernel stages in workgroup memory.
+const MAX_STAGES: u8 = 3;
+
+/// Whether a shift (of `dims`, by `offsets`) of `node` reads its expression lazily rather than
+/// evaluated. A staged sub-program costs its expression about once per cell plus the halo,
+/// while one called per shift costs it once per shift, so small shifts nest up to
+/// [`MAX_STAGES`] levels; anything else recomputes a small expression one level only, or every
+/// further stencil step would multiply the work by its number of shifts.
+pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 4]) -> bool {
+    // A lazy operand runs inside kernels of segmented programs only if it fits one segment, so
+    // segmented programs have no sub-programs.
+    if node.len() as u64 * 4 > node.context().segment_bytes() {
+        return false;
+    }
+    let small = |axis: usize| {
+        let dim = dims[axis] as isize;
+        let offset = offsets[axis].rem_euclid(dim.max(1));
+        (if offset > dim / 2 { offset - dim } else { offset }).abs() <= 2
+    };
+    let stageable = dims[2] == 1
+        && dims[3] == 1
+        && (0..2).all(small)
+        && node.shift_depth() < MAX_STAGES - 1
+        && node.size() <= 64;
+    stageable || (node.size() <= node.context().tuning().max_recomputed && node.shift_depth() == 0)
 }
 
 /// Per-context state of the fusion machinery.

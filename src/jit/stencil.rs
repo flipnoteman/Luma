@@ -22,7 +22,7 @@ use super::{ElemTy, OpKind, ShiftKind};
 use crate::tuning::{stencil_bytes, Tuning, STENCIL_RADIUS as MAX_RADIUS};
 
 /// Invocations per workgroup.
-const WORKGROUP: u32 = 256;
+pub(super) const WORKGROUP: u32 = 256;
 
 /// A step expression that can run time-blocked.
 pub(crate) struct Stencil {
@@ -39,11 +39,21 @@ pub(crate) struct Stencil {
 }
 
 /// `s` in `0..dim` as the signed shift it stands for.
-fn signed(s: u32, dim: u32) -> i32 {
+pub(super) fn signed(s: u32, dim: u32) -> i32 {
     if s > dim / 2 {
         s as i32 - dim as i32
     } else {
         s as i32
+    }
+}
+
+/// WGSL of `wrap`, the index into a circular dimension. `small` (a tile and its halo fit in the
+/// dimension, so indices stay within one period) allows two selects instead of two divisions.
+pub(super) fn wrap_source(small: bool) -> &'static str {
+    if small {
+        "fn wrap(v: i32, n: u32) -> u32 { let m = i32(n); return u32(select(select(v, v + m, v < 0), v - m, v >= m)); }"
+    } else {
+        "fn wrap(v: i32, n: u32) -> u32 { let m = i32(n); return u32(((v % m) + m) % m); }"
     }
 }
 
@@ -220,13 +230,7 @@ fn main(
     workgroupBarrier();
 ",
             cells = lw * lh,
-            // Indices stay within one period of the array when a tile and its halo fit in it:
-            // two selects instead of two divisions.
-            wrap = if self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh) {
-                "fn wrap(v: i32, n: u32) -> u32 { let m = i32(n); return u32(select(select(v, v + m, v < 0), v - m, v >= m)); }"
-            } else {
-                "fn wrap(v: i32, n: u32) -> u32 { let m = i32(n); return u32(((v % m) + m) % m); }"
-            },
+            wrap = wrap_source(self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh)),
         );
         let out = self.instrs.len() - 1;
         for step in 1..=k {

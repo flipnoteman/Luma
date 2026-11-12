@@ -548,15 +548,15 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
         (0..n).map(|i| f(i) + (f(i + n - 1) + f(i + 1) - f(i) * 2.0) * 0.1).collect();
     assert_close(&got, &want, 1e-5, 1e-5);
 
-    // A large expression is evaluated once for its shifts instead.
+    // An expression beyond the staging limit is evaluated once for its shifts instead.
     let mut big = &x * 1.0;
-    for _ in 0..20 {
+    for _ in 0..40 {
         big = &big * 0.5 + 0.25;
     }
     let before = ctx.jit().stats();
     let got = (big.shift(1) - &big).to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
-    let g = |v: f32| (0..20).fold(v, |a, _| a * 0.5 + 0.25);
+    let g = |v: f32| (0..40).fold(v, |a, _| a * 0.5 + 0.25);
     let want: Vec<f32> = (0..n).map(|i| g(xs[(i + n - 1) % n]) - g(xs[i])).collect();
     assert_close(&got, &want, 1e-5, 1e-5);
 
@@ -637,6 +637,129 @@ fn a_life_step_recomputes_through_its_shifts() {
             .collect()
     };
     assert_close(&got, &life(&life(&cells)), 0.0, 0.0);
+}
+
+fn life_step(u: &Array<f32>) -> Array<f32> {
+    let mut n = u.shift([1isize, 1]) + u.shift([1isize, 0]) + u.shift([1isize, -1]);
+    n = n + u.shift([0isize, 1]) + u.shift([0isize, -1]);
+    n = n + u.shift([-1isize, 1]) + u.shift([-1isize, 0]) + u.shift([-1isize, -1]);
+    let survive = select(&n.eq(2.0), u, 0.0);
+    select(&n.eq(3.0), 1.0, &survive)
+}
+
+fn life_cpu(g: &[f32], w: usize, h: usize) -> Vec<f32> {
+    (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as isize, (i / w) as isize);
+            let mut n = 0.0;
+            for dy in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    if (dx, dy) != (0, 0) {
+                        n += g[(x + dx).rem_euclid(w as isize) as usize + w * (y + dy).rem_euclid(h as isize) as usize];
+                    }
+                }
+            }
+            if n == 3.0 || (n == 2.0 && g[i] == 1.0) { 1.0 } else { 0.0 }
+        })
+        .collect()
+}
+
+#[test]
+fn a_lazy_chain_of_life_steps_is_staged_in_workgroup_memory() {
+    let ctx = Context::new().unwrap();
+    for (w, h) in [(64usize, 64usize), (37, 29)] {
+        let cells: Vec<f32> = values(w * h, 9, 0.0, 1.0).into_iter().map(|v| if v > 0.5 { 1.0 } else { 0.0 }).collect();
+        let mut want = cells.clone();
+        for steps in 1..=6 {
+            want = life_cpu(&want, w, h);
+            let mut u = Array::from_slice_on(&ctx, &cells, [w, h]).unwrap();
+            let before = ctx.jit().stats();
+            for _ in 0..steps {
+                u = life_step(&u);
+            }
+            let got = u.to_vec().unwrap();
+            if steps == 3 {
+                assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{w}x{h}: three levels in one kernel");
+            }
+            assert_close(&got, &want, 0.0, 0.0);
+        }
+    }
+}
+
+#[test]
+fn a_lazy_chain_of_heat_steps_matches_iterate() {
+    let ctx = Context::new().unwrap();
+    let cells = values(64 * 64, 21, 0.0, 1.0);
+    let g = Array::from_slice_on(&ctx, &cells, [64, 64]).unwrap();
+    for steps in 1..=10 {
+        let mut u = Array::from_slice_on(&ctx, &cells, [64, 64]).unwrap();
+        for _ in 0..steps {
+            u = heat_step(&u);
+        }
+        assert_close(&u.to_vec().unwrap(), &g.iterate(steps, heat_step).to_vec().unwrap(), 1e-5, 1e-5);
+    }
+
+    let n = 1000;
+    let xs = values(n, 22, 0.0, 1.0);
+    let step = |x: &Array<f32>| x + (x.shift(1) + x.shift(-1) - x * 2.0) * 0.25;
+    let mut want = xs.clone();
+    for steps in 1..=8 {
+        want = (0..n).map(|i| want[i] + (want[(i + n - 1) % n] + want[(i + 1) % n] - want[i] * 2.0) * 0.25).collect();
+        let mut u = f32s(&ctx, &xs);
+        let before = ctx.jit().stats();
+        for _ in 0..steps {
+            u = step(&u);
+        }
+        let got = u.to_vec().unwrap();
+        if steps == 3 {
+            assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+        }
+        assert_close(&got, &want, 1e-5, 1e-5);
+    }
+}
+
+#[test]
+fn a_shift_wider_than_the_staging_limit_still_gives_the_right_values() {
+    let ctx = Context::new().unwrap();
+    let n = 1000;
+    let xs = values(n, 31, 0.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let got = ((&x * 2.0 + 1.0).shift(3) * 0.5 + (&x * 3.0).shift(-1)).to_vec().unwrap();
+    let want: Vec<f32> = (0..n).map(|i| (xs[(i + n - 3) % n] * 2.0 + 1.0) * 0.5 + xs[(i + 1) % n] * 3.0).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+
+    let (nx, ny, nz) = (4usize, 3usize, 5usize);
+    let cube = Array::from_slice_on(&ctx, &xs[..nx * ny * nz], [nx, ny, nz]).unwrap();
+    let got = ((&cube * 2.0).shift([1isize, 0, -1]) + 1.0).to_vec().unwrap();
+    let want: Vec<f32> = (0..nx * ny * nz)
+        .map(|i| {
+            let (cx, cy, cz) = (i % nx, (i / nx) % ny, i / (nx * ny));
+            xs[(cx + nx - 1) % nx + nx * (cy + ny * ((cz + 1) % nz))] * 2.0 + 1.0
+        })
+        .collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+}
+
+#[test]
+fn mixed_types_and_scalars_in_a_staged_expression() {
+    let ctx = Context::new().unwrap();
+    let (w, h) = (23usize, 14usize);
+    let xs = values(w * h, 41, 0.0, 2.0);
+    let x = Array::from_slice_on(&ctx, &xs, [w, h]).unwrap();
+    let scale = 1.5f32;
+    let mask = x.gt(1.0);
+    let got = (select(&mask.shift([1isize, 0]), &(&x * scale).shift([0isize, 1]), &x) + select(&mask.shift([-1isize, 1]), 1.0, 0.0))
+        .to_vec()
+        .unwrap();
+    let at = |cx: isize, cy: isize| (cx.rem_euclid(w as isize) as usize) + w * cy.rem_euclid(h as isize) as usize;
+    let want: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (cx, cy) = ((i % w) as isize, (i / w) as isize);
+            let first = if xs[at(cx - 1, cy)] > 1.0 { xs[at(cx, cy - 1)] * scale } else { xs[i] };
+            first + if xs[at(cx + 1, cy - 1)] > 1.0 { 1.0 } else { 0.0 }
+        })
+        .collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
 }
 
 #[test]
