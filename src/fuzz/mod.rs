@@ -1005,109 +1005,12 @@ struct Known {
 
 const KNOWN: &[Known] = &[
     Known { id: "F3 lazy reduction reads a later write to its operand", message: None, shape: Some(reduction_then_write) },
-    Known { id: "F4 slice write after a flipped write into a lazy array is lost", message: None, shape: Some(flipped_write_then_slice_write) },
-    Known { id: "F5 receiver of a write through an older view shows old data", message: None, shape: Some(view_assigned_after_base_write) },
-    Known {
-        id: "F10 write through a view taken after a flipped write into a lazy array is lost",
-        message: None,
-        shape: Some(view_written_after_flipped_write),
-    },
     Known {
         id: "F8 wrong value only when programs run concurrently on one context (unminimized; masks other concurrency failures)",
         message: Some("only when run concurrently"),
         shape: None,
     },
-    Known {
-        id: "F11 slice write into a lazy generator created after another slice write is lost",
-        message: None,
-        shape: Some(range_written_after_a_slice_write),
-    },
 ];
-
-/// F11: a write through a non-empty path, then a `Range` created, then a write through a
-/// non-empty path into that `Range`.
-fn range_written_after_a_slice_write(program: &Program) -> bool {
-    let created = created_counts(program);
-    let first: Vec<usize> = created
-        .iter()
-        .scan(0, |next, c| {
-            let at = *next;
-            *next += c;
-            Some(at)
-        })
-        .collect();
-    let sliced = |stmt: &Stmt| matches!(stmt, Stmt::Assign { path, .. } if !path.is_empty());
-    program.stmts.iter().enumerate().any(|(i, stmt)| {
-        sliced(stmt)
-            && program.stmts.iter().enumerate().skip(i + 1).any(|(j, range)| {
-                matches!(range, Stmt::Range { .. })
-                    && program.stmts[j + 1..]
-                        .iter()
-                        .any(|later| matches!(later, Stmt::Assign { target, path, .. } if *target == first[j] && !path.is_empty()))
-            })
-    })
-}
-/// F5: a view of a variable that something touched (evaluated it, wrote its base, used it as
-/// a loop state, ...) and that is then assigned through.
-fn view_assigned_after_base_write(program: &Program) -> bool {
-    let created = created_counts(program);
-    let mut first = Vec::with_capacity(created.len());
-    let mut next = 0;
-    for c in &created {
-        first.push(next);
-        next += c;
-    }
-    // View variable -> (the oldest statement along its chain of views, the variables of the chain).
-    let mut views: std::collections::HashMap<usize, (usize, Vec<usize>)> = std::collections::HashMap::new();
-    for (i, stmt) in program.stmts.iter().enumerate() {
-        if let Stmt::View { src, view: ViewOp::Slice { .. } | ViewOp::Flip { .. } | ViewOp::Transpose } = stmt
-            && created[i] == 1
-        {
-            let (born, mut chain) = views.get(src).cloned().unwrap_or((i, vec![*src]));
-            chain.push(first[i]);
-            views.insert(first[i], (born, chain));
-        }
-    }
-    views.iter().any(|(&v, (born, chain))| {
-        let assigned = |k: usize| matches!(&program.stmts[k], Stmt::Assign { target, .. } if *target == v);
-        (born + 1..program.stmts.len()).filter(|&k| assigned(k)).any(|k| {
-            (born + 1..k).any(|j| {
-                !matches!(program.stmts[j], Stmt::View { .. }) && program.stmts[j].mentions().iter().any(|m| chain.contains(m))
-            })
-        })
-    })
-}
-
-/// F10: a write through a flip or transpose into a variable, then a view of it, then a write
-/// through that view.
-fn view_written_after_flipped_write(program: &Program) -> bool {
-    let created = created_counts(program);
-    let mut first = Vec::with_capacity(created.len());
-    let mut next = 0;
-    for c in &created {
-        first.push(next);
-        next += c;
-    }
-    program.stmts.iter().enumerate().any(|(i, stmt)| {
-        let Stmt::Assign { target, path, .. } = stmt else { return false };
-        path.iter().any(|v| !matches!(v, InjView::InjSlice { .. }))
-            && program.stmts.iter().enumerate().skip(i + 1).any(|(j, view)| {
-                matches!(view, Stmt::View { src, .. } if src == target)
-                    && created[j] == 1
-                    && program.stmts[j + 1..].iter().any(|later| matches!(later, Stmt::Assign { target: t, .. } if *t == first[j]))
-            })
-    })
-}
-
-/// F4: a write through a path with a flip or transpose into a variable, and later a write
-/// through a non-empty path into the same variable.
-fn flipped_write_then_slice_write(program: &Program) -> bool {
-    program.stmts.iter().enumerate().any(|(i, stmt)| {
-        let Stmt::Assign { target, path, .. } = stmt else { return false };
-        path.iter().any(|v| !matches!(v, InjView::InjSlice { .. }))
-            && program.stmts[i + 1..].iter().any(|later| matches!(later, Stmt::Assign { target: t, path, .. } if t == target && !path.is_empty()))
-    })
-}
 
 /// F3: a `Reduce` of a variable, and later a write into that variable.
 fn reduction_then_write(program: &Program) -> bool {

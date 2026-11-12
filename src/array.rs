@@ -545,12 +545,6 @@ impl<T: GpuType> Array<T> {
         }
     }
 
-    /// Whether an assignment replaced the pending expression this array was created holding
-    /// (see [`crate::jit::supersede`]): the array now denotes another node.
-    pub(crate) fn is_superseded(&self) -> bool {
-        matches!(&self.repr, Repr::Lazy(held) if held.is_superseded())
-    }
-
     /// The claim this array has on its expression, if it is lazy.
     pub(crate) fn held(&self) -> Option<&Held> {
         match &self.repr {
