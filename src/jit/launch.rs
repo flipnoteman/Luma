@@ -768,6 +768,7 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
             in_place_eligible(&key, k as u32)
                 && Arc::strong_count(input) == 1
                 && !input.is_alias()
+                && ctx.may_overwrite(input)
         });
         if let Some(k) = candidate {
             match Arc::try_unwrap(inputs.remove(k)) {
