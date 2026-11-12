@@ -58,7 +58,7 @@ pub(crate) struct FusedKey {
     pub(crate) subs: Vec<Vec<Instr>>,
     pub(crate) tail: Tail,
     /// Input `k` is not bound separately: it is the buffer of output 0, read at element `i`
-    /// before being overwritten (see [`in_place_eligible`]).
+    /// before being overwritten (see `launch::in_place_eligible`).
     pub(crate) in_place: Option<u32>,
     /// Per input, how many segments of it the program reads through shifts (0 = never): the
     /// program is the segmented variant of the generated kernel, run once per segment of arrays

@@ -7,7 +7,7 @@
 //! operands is still checked when the node is created, so errors and their source locations
 //! behave as they would without laziness.
 //!
-//! A lazy array is evaluated when something needs its buffer: [`Array::to_vec`], `eval`, `write`,
+//! A lazy array is evaluated when something needs its buffer: [`Array::to_vec`](crate::Array::to_vec), `eval`, `write`,
 //! reshaping, passing it to a kernel, a shift or convolution, a compound assignment into a
 //! buffer, or [`Context::sync`]. Evaluating a node walks the expression behind it, assigns
 //! every distinct input buffer a binding and every scalar a slot of one uniform, and generates a

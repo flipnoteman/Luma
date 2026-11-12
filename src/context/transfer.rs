@@ -343,8 +343,8 @@ impl Context {
     }
 
     /// A staging buffer holding `data` at its start, unmapped and ready to be copied out of, for
-    /// the uniform slots of [`Arena::upload`]. It counts as in flight: give it to
-    /// [`Batch::uploads`], which maps it again once the batch that copies out of it is
+    /// the uniform slots of [`Arena::upload`](super::uniforms::Arena::upload). It counts as in flight: give it to
+    /// [`Batch::uploads`](super::batch::Batch::uploads), which maps it again once the batch that copies out of it is
     /// submitted. `None` if no staging buffer can be had (the device is out of memory).
     ///
     /// This runs while the batch is being submitted, with the batch locked, so unlike
@@ -374,8 +374,8 @@ impl Context {
     }
 
     /// Writes `data` at the start of the mapped staging buffer `staging` and unmaps it, so that
-    /// the commands recorded to copy out of it can be submitted. Only [`Arena::upload`] calls
-    /// this, for the buffer of a [`Prefix`], which is mapped for as long as it is not filled.
+    /// the commands recorded to copy out of it can be submitted. Only [`Arena::upload`](super::uniforms::Arena::upload) calls
+    /// this, for the buffer of a [`Prefix`](super::batch::Prefix), which is mapped for as long as it is not filled.
     pub(super) fn fill(&self, staging: &Buffer, data: &[u8]) {
         if !data.is_empty() {
             match staging.get_mapped_range_mut(..data.len() as u64) {
