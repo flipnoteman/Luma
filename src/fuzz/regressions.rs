@@ -519,3 +519,43 @@ fn cache_of_an_evaluated_view_shows_a_write_through_the_view() {
         ],
     });
 }
+
+/// Finding 21 (`LUMA_DEVICE=cpu`, seed 7002; also fails on the GPU): `m = minimum(x, 0)` is a lazy
+/// expression and a lazy slice write goes into it (the expression is replaced); `v = m.slice(..)`
+/// is a view of the replacement, then `m /= 1`. The compound assignment saw no sharing (it
+/// looked at the claims on the node `m` was created with, not on the replacement `v` holds), so
+/// it rebound `m` to a new expression reading the replacement, and the write through `v` went
+/// into a node `m` no longer denoted (`m[224]` is `0`, not `7`).
+#[test]
+fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost() {
+    check(Program {
+        config: Config::default_engine(),
+        math: true,
+        stmts: vec![
+            Input { dims: [24, 20, 1, 1], ty: U32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Const(0.0), op: Minimum },
+            Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 17, hi: 23 }, InjSlice { axis: 1, lo: 15, hi: 20 }], rhs: Const(1.0) },
+            View { src: 1, view: Slice { axis: 0, lo: 1, hi: 13 } },
+            Compound { target: 1, op: Div, rhs: Const(1.0) },
+            Assign { target: 2, path: vec![InjSlice { axis: 0, lo: 7, hi: 10 }, InjSlice { axis: 1, lo: 9, hi: 14 }], rhs: Const(7.0) },
+        ],
+    });
+}
+
+/// Finding 21 without simplification (`m /= 1` stays a division): the same failure, so the
+/// cause is not a simplification.
+#[test]
+fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost_without_simplify() {
+    check(Program {
+        config: Config { simplify: false, ..Config::default_engine() },
+        math: true,
+        stmts: vec![
+            Input { dims: [24, 20, 1, 1], ty: U32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Const(0.0), op: Minimum },
+            Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 17, hi: 23 }, InjSlice { axis: 1, lo: 15, hi: 20 }], rhs: Const(1.0) },
+            View { src: 1, view: Slice { axis: 0, lo: 1, hi: 13 } },
+            Compound { target: 1, op: Div, rhs: Const(1.0) },
+            Assign { target: 2, path: vec![InjSlice { axis: 0, lo: 7, hi: 10 }, InjSlice { axis: 1, lo: 9, hi: 14 }], rhs: Const(7.0) },
+        ],
+    });
+}
