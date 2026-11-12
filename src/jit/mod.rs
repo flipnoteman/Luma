@@ -2337,9 +2337,7 @@ impl JitState {
             let (inputs, scalars) = (key.input_tys.len(), key.scalar_tys.len());
             let checked = program::validate(key, inputs, scalars).and_then(|()| match &lowered {
                 Some(Lowered::Plain(inlined)) => inline::validate_inlined(inlined, inputs, false),
-                Some(Lowered::Staged(programs)) => std::iter::once(&programs.main)
-                    .chain(&programs.subs)
-                    .try_for_each(|inlined| inline::validate_inlined(inlined, inputs, true)),
+                Some(Lowered::Staged(programs)) => programs.bodies().try_for_each(|inlined| inline::validate_inlined(inlined, inputs, true)),
                 None => Ok(()),
             });
             if let Err(message) = checked {
@@ -2357,7 +2355,7 @@ impl JitState {
             let count = |inlined: &inline::Inlined| inlined.branch.iter().filter(|&&branch| branch).count();
             let branches = match &lowered {
                 Some(Lowered::Plain(inlined)) => count(inlined),
-                Some(Lowered::Staged(programs)) => count(&programs.main) + programs.subs.iter().map(count).sum::<usize>(),
+                Some(Lowered::Staged(programs)) => programs.bodies().map(count).sum::<usize>(),
                 None => 0,
             };
             self.last_branches.store(branches, Ordering::Relaxed);

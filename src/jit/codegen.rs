@@ -442,7 +442,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     }
     let views = match lowered {
         Some(Lowered::Plain(inlined)) => views_of_inlined(key, &[inlined]),
-        Some(Lowered::Staged(programs)) => views_of_inlined(key, &std::iter::once(&programs.main).chain(&programs.subs).collect::<Vec<_>>()),
+        Some(Lowered::Staged(programs)) => views_of_inlined(key, &programs.bodies().collect::<Vec<_>>()),
         None => views_of(key),
     };
     // The lowered instruction holding the value of main-program instruction `at`.
@@ -1015,7 +1015,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
 
 /// The kernel of `key` with its sub-programs staged as `staging` says: one workgroup per tile of
 /// output cells. Every level of staged sub-programs fills its workgroup-memory arrays `w{s}`
-/// (each cell of its region, strided over the invocations; `programs.subs` are their lowered
+/// (each cell of its region, strided over the invocations; `programs.groups` are the lowered
 /// bodies) before a barrier, then the main program reads them. `based` and `stores` are those
 /// of the plain store kernel.
 fn staged_main(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, based: bool, stores: &str, names: &Names) -> String {
@@ -1040,10 +1040,15 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
         tiles_x = w.div_ceil(tx),
     );
     for level in staging.levels.windows(2) {
-        let range = level[0] as usize..level[1] as usize;
-        for (entry, lowered) in staging.subs[range.clone()].iter().zip(&programs.subs[range]) {
+        for group in programs.groups.iter().filter(|group| group.members.first().is_some_and(|&first| (level[0] as usize..level[1] as usize).contains(&first))) {
+            let Some(entry) = group.members.first().and_then(|&first| staging.subs.get(first)) else { continue };
             let [dw, dh] = entry.dims;
-            let last = lowered.main.last().copied().unwrap_or(0);
+            let stores: String = group
+                .members
+                .iter()
+                .zip(&group.values)
+                .filter_map(|(&member, last)| Some(format!("            w{}[e] = t{last};\n", staging.subs.get(member)?.sub)))
+                .collect();
             let _ = write!(
                 src,
                 "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
@@ -1053,15 +1058,13 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
         let y = i32(tile_y) + ly;
         if (x >= 0 && x < {dw} && y >= 0 && y < {dh}) {{
             let i = u32(x) + u32(y) * {dw}u;
-{global}{}            w{}[e] = t{last};
-        }}
+{global}{}{stores}        }}
     }}
 ",
                 entry.cells(),
                 entry.lo[0],
                 entry.lo[1],
-                lowered_body(key, lowered, &sub_names, index, Some(staging)),
-                entry.sub,
+                lowered_body(key, &group.body, &sub_names, index, Some(staging)),
                 rw = entry.width(),
             );
         }
