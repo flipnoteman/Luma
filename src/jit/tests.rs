@@ -1786,6 +1786,25 @@ fn a_third_view_reader_recomputes_the_expression_inside_the_one_kernel() {
     assert_close(&got, &want, 1e-5, 1e-6);
 }
 
+/// A graph of the shape of an earlier one, over other buffers and scalars, is flattened by
+/// instantiating the program of the earlier one (checked against the flattened program in tests).
+#[test]
+fn graphs_of_one_shape_over_other_buffers_and_scalars_reuse_the_program() {
+    let ctx = ctx();
+    let n = 200;
+    for round in 0..5u64 {
+        let xs = values(n, 300 + round, 0.5, 2.0);
+        let x = f32s(&ctx, &xs);
+        let a = 1.5 + round as f32;
+        let e = (&x * a + 1.0).sqrt();
+        let host: Vec<f32> = xs.iter().map(|v| (v * a + 1.0).sqrt()).collect();
+        let got = (e.slice(0, 1..) - e.slice(0, ..n - 1)).to_vec().unwrap();
+        let want: Vec<f32> = (0..n - 1).map(|i| host[i + 1] - host[i]).collect();
+        assert_close(&got, &want, 1e-5, 1e-6);
+    }
+    assert!(ctx.jit().recipe_hits() >= 3, "recipe hits: {}", ctx.jit().recipe_hits());
+}
+
 /// A 40-operation expression of `x` and its host values.
 fn long_expression(x: &Array<f32>, xs: &[f32]) -> (Array<f32>, Vec<f32>) {
     let mut e = x.clone();
