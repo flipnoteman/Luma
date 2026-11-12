@@ -2251,12 +2251,6 @@ impl JitState {
             self.last_program_len.store(key.instrs.len(), Ordering::Relaxed);
             *lock(&self.last_staging) = key.staging.clone();
         }
-        #[cfg(debug_assertions)]
-        if let Some(layout) = &key.staging
-            && let Err(message) = staging::check(layout, key)
-        {
-            panic!("invalid staging: {message}\n{key:?}");
-        }
         let mut cache = lock(&self.kernels);
         if let Some(core) = cache.get(key) {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -2275,6 +2269,20 @@ impl JitState {
                 Verdict::TooBig { .. } => None,
             }).flatten(),
         };
+        #[cfg(debug_assertions)]
+        {
+            let (inputs, scalars) = (key.input_tys.len(), key.scalar_tys.len());
+            let checked = program::validate(key, inputs, scalars).and_then(|()| match &lowered {
+                Some(Lowered::Plain(inlined)) => inline::validate_inlined(inlined, inputs, false),
+                Some(Lowered::Staged(programs)) => std::iter::once(&programs.main)
+                    .chain(&programs.subs)
+                    .try_for_each(|inlined| inline::validate_inlined(inlined, inputs, true)),
+                None => Ok(()),
+            });
+            if let Err(message) = checked {
+                panic!("invalid fused program: {message}\n{key:?}");
+            }
+        }
         #[cfg(test)]
         match &lowered {
             Some(Lowered::Plain(inlined)) => self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed),

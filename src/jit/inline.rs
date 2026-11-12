@@ -507,6 +507,18 @@ mod tests {
     }
 
     #[test]
+    fn lowered_programs_pass_validation_and_broken_ones_do_not() {
+        let main = vec![shift(slice(9, 1, 8), 0), shift(slice(9, 0, 8), 0), instr(OpKind::Binary(BinOp::Sub), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused])];
+        let k = key(main, vec![expression()]);
+        assert_eq!(crate::jit::program::validate(&k, 1, 2), Ok(()));
+        let mut inlined = fits(inline(&k, 1000, &CostModel::TEST));
+        assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
+        assert!(validate_inlined(&inlined, 0, false).unwrap_err().contains("input 0"));
+        inlined.ctxs[1].parent = 1;
+        assert!(validate_inlined(&inlined, 1, false).unwrap_err().contains("parent"));
+    }
+
+    #[test]
     fn one_level_of_views_computes_the_expression_once_per_index() {
         // `e.slice(1..) - e.slice(..n - 1)` with n = 9.
         let main = vec![
@@ -655,4 +667,46 @@ mod tests {
         let (judgement, _) = judge(&difference_key(), 1 << 20, 2, &slow, &Tuning::for_tests(), true);
         assert!(matches!(judgement, Judgement::Materialise { reason: SplitReason::Inlined { limit: 2, .. }, .. }), "{judgement:?}");
     }
+}
+
+/// Checks the structure the code generator relies on in a lowered program of `key`'s kernel
+/// with `inputs` inputs: contexts descend from lower ones, temporaries refer backwards, contexts
+/// exist, and sub-program reads appear only as shifts of staged lowerings.
+#[cfg(any(debug_assertions, test))]
+pub(super) fn validate_inlined(inlined: &Inlined, inputs: usize, staged: bool) -> Result<(), String> {
+    for (id, ctx) in inlined.ctxs.iter().enumerate().skip(1) {
+        if ctx.parent as usize >= id {
+            return Err(format!("context {id} has parent {}", ctx.parent));
+        }
+    }
+    let n = inlined.instrs.len();
+    for (at, flat) in inlined.instrs.iter().enumerate() {
+        let here = format!("lowered instruction {at} ({:?})", flat.op.kind);
+        if flat.at as usize >= inlined.ctxs.len() || flat.child as usize >= inlined.ctxs.len() {
+            return Err(format!("{here}: context {} / {} of {}", flat.at, flat.child, inlined.ctxs.len()));
+        }
+        for (slot, &arg) in flat.args.iter().enumerate() {
+            match arg {
+                Ref::Tmp(t) if t as usize >= at => return Err(format!("{here}: operand {slot} reads t{t}, not an earlier instruction")),
+                Ref::Input(k) if k as usize >= inputs => return Err(format!("{here}: operand {slot} reads input {k} of {inputs}")),
+                Ref::Sub(_) if !(staged && slot == 0 && matches!(flat.op.kind, OpKind::Shift(_))) => {
+                    return Err(format!("{here}: operand {slot} is a sub-program"));
+                }
+                _ => {}
+            }
+        }
+    }
+    for ctx in inlined.ctxs.iter().skip(1) {
+        for arg in ctx.args {
+            if let Ref::Tmp(t) = arg
+                && t as usize >= n
+            {
+                return Err(format!("a context reads t{t} of {n}"));
+            }
+        }
+    }
+    if let Some(&at) = inlined.main.iter().find(|&&at| at as usize >= n) {
+        return Err(format!("main entry {at} of {n} lowered instructions"));
+    }
+    Ok(())
 }
