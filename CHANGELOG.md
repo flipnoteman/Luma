@@ -113,6 +113,13 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- Building a lazy expression costs less host time: a chain of a hundred operations over an old
+  operand takes a third fewer instructions (`cargo run --release --example bench_build`), the
+  solver's `eval` step about 8% fewer in `jit::create`. The sets of nodes below an expression keep
+  only the words in use when ids are spread widely (instead of listing every node), the sharing
+  table holds hashes and checks the operands on a hit, a new node's weak references are made once,
+  and the simplifier reads an operand's operands only for operations that have rewrites.
+
 - Fusion decisions use the cost model: a kernel that reads an expression through views at several
   indices (slices, pads, flips, `take`) recomputes it at every read, or evaluates it first and
   reads it back, whichever the device's `CostModel` estimates to be cheaper (evaluating first must
