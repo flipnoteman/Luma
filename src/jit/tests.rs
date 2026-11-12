@@ -636,7 +636,7 @@ fn arrays_evaluated_together_share_one_kernel() {
 
 #[test]
 fn several_reductions_share_one_pass() {
-    use crate::ops::Reduction;
+    use crate::reduce::Reduction;
     let ctx = Context::new().unwrap();
     // More than one workgroup's block, so the later (segmented) passes run too.
     let xs = values(300_001, 52, -3.0, 2.0);
@@ -752,13 +752,13 @@ fn a_long_register_loop_is_split_into_launches_with_the_same_result() {
     let xs = values(n, 11, -1.0, 1.0);
     let x = f32s(&ctx, &xs);
     let step = |[u, v]: &[Array<f32>; 2]| [u * 0.5 + v, v * 0.9];
-    let [u0, v0] = crate::ops::iterate_all([&x, &x], 9, step);
+    let [u0, v0] = crate::iterate::iterate_all([&x, &x], 9, step);
     let (u0, v0) = (u0.to_vec().unwrap(), v0.to_vec().unwrap());
 
     // Three steps of this program per launch.
     ctx.jit().set_loop_work(n as u64 * 4 * 3);
     let before = ctx.jit().stats();
-    let [u1, v1] = crate::ops::iterate_all([&x, &x], 9, step);
+    let [u1, v1] = crate::iterate::iterate_all([&x, &x], 9, step);
     let (u1, v1) = (u1.to_vec().unwrap(), v1.to_vec().unwrap());
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 3);
     assert_eq!(u1, u0);

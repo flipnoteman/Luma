@@ -48,10 +48,12 @@ mod fft;
 mod generate;
 mod gpu;
 mod gpu_type;
+mod iterate;
 mod jit;
 mod kernel;
 mod ops;
 mod profile;
+mod reduce;
 mod shape;
 mod tuning;
 
@@ -62,7 +64,9 @@ pub use gpu_type::{GpuType, ScalarType};
 pub use kernel::{
     uniform, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize,
 };
-pub use ops::{eval_all, iterate_all, select, Operand, Reduction, Rhs};
+pub use iterate::iterate_all;
+pub use ops::{eval_all, select, Operand, Rhs};
+pub use reduce::Reduction;
 pub use profile::{KernelTiming, Profile};
 pub use shape::{Offsets, Shape};
 pub use tuning::TuningProfile;
