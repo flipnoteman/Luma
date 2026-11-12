@@ -96,6 +96,11 @@ pub(crate) struct Pager {
 }
 
 impl Pager {
+    /// Whether resident array data has reached three quarters of the memory budget.
+    pub(crate) fn under_pressure(&self) -> bool {
+        self.budget.is_some_and(|budget| self.resident_bytes.load(Ordering::Relaxed) >= budget / 4 * 3)
+    }
+
     /// A pager with nothing resident that keeps `budget` bytes of array data on the device.
     pub(crate) fn new(budget: Option<u64>) -> Self {
         Pager {
@@ -289,5 +294,20 @@ impl Context {
     /// Bytes of array data moved from the device to host memory so far.
     pub fn spilled_bytes(&self) -> u64 {
         self.pager().spilled_bytes.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pressure_starts_at_three_quarters_of_the_budget() {
+        let pager = Pager::new(Some(1000));
+        pager.resident_bytes.store(749, Ordering::Relaxed);
+        assert!(!pager.under_pressure());
+        pager.resident_bytes.store(750, Ordering::Relaxed);
+        assert!(pager.under_pressure());
+        assert!(!Pager::new(None).under_pressure());
     }
 }
