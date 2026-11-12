@@ -63,6 +63,8 @@ struct Inner {
     segment_bytes: u64,
     /// Whether results are checked for NaN and Inf (see [`ContextOptions::check_finite`]).
     check_finite: bool,
+    /// Whether value-changing algebraic rewrites are allowed (see [`ContextOptions::fast_math`]).
+    fast_math: bool,
     /// Which segments of arrays hold a device buffer.
     pager: Pager,
     /// Recycled mappable storage buffers waiting for the next submission before they are mapped.
@@ -206,6 +208,14 @@ pub struct ContextOptions {
     /// Measure the device's throughputs when the context opens (about 100 ms on a GPU, once per
     /// device and process); `false` uses the profile's fixed numbers (see [`CostModel`]).
     pub calibrate: bool,
+    /// Allows rewrites of expressions that are not exact: `x + 0` becomes `x` (a `-0.0`
+    /// stays `-0.0` instead of becoming `0.0`), `x * 0` becomes `0` and `x - x` becomes `0` (wrong
+    /// for NaN and infinity), `x / x` becomes `1`, `x <= x`, `x >= x`, `x == x` become true and
+    /// `x != x` false (wrong for NaN), `(x * a) * b` and `(x + a) + b` combine their constants
+    /// (different rounding), `x / a` for a constant `a` becomes `x * (1 / a)`, and `powf(x, e)`
+    /// with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or `sqrt(x)`. Rewrites that keep every bit
+    /// (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
+    pub fast_math: bool,
 }
 
 impl Default for ContextOptions {
@@ -216,6 +226,7 @@ impl Default for ContextOptions {
             chunk_bytes: None,
             check_finite: false,
             calibrate: true,
+            fast_math: false,
         }
     }
 }
@@ -252,9 +263,16 @@ impl ContextOptions {
         self
     }
 
+    /// Allows the value-changing rewrites of expressions (see [`ContextOptions::fast_math`]).
+    pub fn fast_math(mut self, on: bool) -> Self {
+        self.fast_math = on;
+        self
+    }
+
     /// Options from the environment: `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`),
     /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
-    /// `1` | `on` | `true` for the finite check, `LUMA_CALIBRATE` = `0` | `off` | `false` to skip
+    /// `1` | `on` | `true` for the finite check, `LUMA_FAST_MATH` likewise for
+    /// [`ContextOptions::fast_math`], `LUMA_CALIBRATE` = `0` | `off` | `false` to skip
     /// calibration.
     pub fn from_env() -> ContextOptions {
         let device = match std::env::var("LUMA_DEVICE").ok().as_deref().map(str::trim) {
@@ -271,6 +289,8 @@ impl ContextOptions {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
             calibrate: !std::env::var("LUMA_CALIBRATE")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
+            fast_math: std::env::var("LUMA_FAST_MATH")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
         }
     }
 }
@@ -292,6 +312,11 @@ impl Context {
     /// Opens a software (CPU) device, for example Mesa llvmpipe, whatever GPUs exist.
     pub fn cpu() -> Result<Context> {
         Context::with_options(ContextOptions { device: DeviceKind::Cpu, ..ContextOptions::from_env() })
+    }
+
+    /// Whether value-changing algebraic rewrites are allowed.
+    pub(crate) fn fast_math(&self) -> bool {
+        self.inner.fast_math
     }
 
     /// Whether this context runs on a software (CPU) device.
@@ -381,6 +406,7 @@ impl Context {
                 mappable: Arc::new(Mutex::new(FreeUploads::new(cap))),
                 segment_bytes,
                 check_finite: options.check_finite,
+                fast_math: options.fast_math,
                 pager: Pager::new(budget),
                 unmapped: Mutex::new(Vec::new()),
                 batch: Mutex::new(batch),

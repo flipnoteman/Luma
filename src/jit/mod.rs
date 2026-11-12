@@ -104,6 +104,7 @@ mod operator;
 mod program;
 mod readers;
 mod replay;
+mod simplify;
 pub(crate) mod speculate;
 mod stencil;
 mod until;
@@ -1244,23 +1245,9 @@ fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(),
     Ok(())
 }
 
-/// Adds a lazy operation `op` on `args` (checked by the caller) producing `len` elements.
-///
-/// This is where fusion is limited: operands that already have a consumer, and the biggest operand
-/// while the expression is too large, are evaluated first (see the module documentation).
-pub(crate) fn create(
-    ctx: &Context,
-    len: usize,
-    op: Op,
-    mut args: Args,
-    name: &'static str,
-    location: &'static Location<'static>,
-) -> std::result::Result<Arc<Node>, Failure> {
-    let jit = ctx.jit();
-    let arity = op.kind.arity();
-    check_supported(ctx, op, name).map_err(Failure::New)?;
-
-    // Operands evaluated since they were created become plain buffers.
+/// Turns the operands among the first `arity` that were evaluated since they were created into
+/// plain buffers; an operand that failed makes the operation fail the same way.
+fn convert_evaluated(args: &mut Args, arity: usize) -> std::result::Result<(), Failure> {
     for i in 0..arity {
         let evaluated = match args.get(i) {
             Some(Src::Node(node)) => match node.result.get() {
@@ -1271,9 +1258,47 @@ pub(crate) fn create(
             _ => false,
         };
         if evaluated {
-            evaluate_operand(&mut args, i)?;
+            evaluate_operand(args, i)?;
         }
     }
+    Ok(())
+}
+
+/// Adds a lazy operation `op` on `args` (checked by the caller) producing `len` elements.
+///
+/// This is where fusion is limited: operands that already have a consumer, and the biggest operand
+/// while the expression is too large, are evaluated first (see the module documentation).
+pub(crate) fn create(
+    ctx: &Context,
+    len: usize,
+    mut op: Op,
+    mut args: Args,
+    name: &'static str,
+    location: &'static Location<'static>,
+) -> std::result::Result<Arc<Node>, Failure> {
+    let jit = ctx.jit();
+    let mut arity = op.kind.arity();
+
+    // Operands evaluated since they were created become plain buffers.
+    convert_evaluated(&mut args, arity)?;
+
+    // Algebraic simplification (see [`simplify`]); the operands a rewrite takes from a pending
+    // operand may have been evaluated since it was created.
+    if jit.simplify_enabled() {
+        let mut rounds = 0;
+        while rounds < 4
+            && let Some((rewritten, operands)) = simplify::rewrite(op, &args, ctx.fast_math())
+        {
+            op = rewritten;
+            args = operands;
+            rounds += 1;
+        }
+        if rounds > 0 {
+            arity = op.kind.arity();
+            convert_evaluated(&mut args, arity)?;
+        }
+    }
+    check_supported(ctx, op, name).map_err(Failure::New)?;
 
     // Equal operations on identical operands are one node (see `ConsTable`).
     let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_key_of(op, len, &args));
@@ -1646,6 +1671,9 @@ pub(crate) struct JitState {
     /// Instructions of the program of the last kernel looked up (tests).
     #[cfg(test)]
     last_program_len: AtomicUsize,
+    /// Whether [`simplify`] runs (tests switch it off to compare against the unsimplified result).
+    #[cfg(test)]
+    simplify: AtomicBool,
     /// Instructions of the last lowered program a kernel was built from (tests).
     #[cfg(test)]
     last_inlined_len: AtomicUsize,
@@ -1711,6 +1739,8 @@ impl JitState {
             splits: Mutex::new(None),
             #[cfg(test)]
             last_program_len: AtomicUsize::new(0),
+            #[cfg(test)]
+            simplify: AtomicBool::new(true),
             #[cfg(test)]
             last_inlined_len: AtomicUsize::new(0),
             loop_work: AtomicU64::new(launch::LOOP_WORK_PER_LAUNCH),
@@ -1875,6 +1905,19 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_max_inlined(&self, max_inlined: usize) {
         self.max_inlined.store(max_inlined, Ordering::Relaxed);
+    }
+
+    /// Whether operations are simplified when created (always, outside tests).
+    fn simplify_enabled(&self) -> bool {
+        #[cfg(test)]
+        return self.simplify.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_simplify(&self, on: bool) {
+        self.simplify.store(on, Ordering::Relaxed);
     }
 
     #[cfg(test)]
