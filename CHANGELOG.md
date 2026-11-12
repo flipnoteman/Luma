@@ -15,8 +15,10 @@ All notable changes to Luma are listed here. The format follows
   2^24 samples: 2.1x and 2.3x faster than ArrayFire CUDA on an RTX 3080 Laptop.
 - `iterate_all`: a loop over several arrays (`[&zx, &zy, &count]`). When the step is elementwise,
   the whole loop runs as one kernel that keeps the state in registers, for any step count;
-  anything else (shifts, arrays split into several buffers) runs step by step. Mandelbrot 1024²,
-  256 iterations: 0.46 ms on an RTX 3080 Laptop, against 3.6 ms for the unevaluated chain.
+  anything else (shifts, arrays split into several buffers) runs step by step. An element whose
+  state a step leaves bit-identical stops early. Mandelbrot, 256 iterations, RTX 3080 Laptop:
+  1024² 0.23 ms and 4096² 3.5 ms, against 3.6 and 47 ms for the unevaluated chain and 9.98 and
+  385 ms for ArrayFire CUDA's best variant.
 - ArrayFire comparison benchmarks in `benchmarks/arrayfire` (separate workspace, not part of the crate).
 - `Array::submit` and `submit_all`: evaluate arrays without waiting for the GPU.
 - `select` accepts scalar branches; the result's shape and context come from the mask.

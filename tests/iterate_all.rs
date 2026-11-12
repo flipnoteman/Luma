@@ -163,3 +163,14 @@ fn many_captured_arrays_stay_correct() {
     assert_close(&a.to_vec().unwrap(), &sum(0..20), 1e-4, 1e-4);
     assert_close(&b.to_vec().unwrap(), &sum(20..40), 1e-4, 1e-4);
 }
+
+#[test]
+fn a_state_stops_only_when_its_bits_stop_changing() {
+    let ctx = Context::new().unwrap();
+    let zero = Array::<f32>::zeros_on(&ctx, 64).unwrap();
+    // -0.0 == 0.0, but the next step from -0.0 is +0.0 again: two steps end at +0.0.
+    let [u] = iterate_all([&zero], 2, |[u]| [-u]);
+    assert!(u.to_vec().unwrap().iter().all(|v| v.to_bits() == 0.0f32.to_bits()));
+    let [v] = iterate_all([&zero], 3, |[u]| [-u]);
+    assert!(v.to_vec().unwrap().iter().all(|v| v.to_bits() == (-0.0f32).to_bits()));
+}

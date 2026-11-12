@@ -349,10 +349,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     for (k, instr) in key.instrs.iter().enumerate() {
         let _ = writeln!(src, "        let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr, "i", "luma.size.x", false));
     }
+    // The step is a pure function of the state, so a state it leaves bit-identical stays so.
+    let fixed: Vec<String> =
+        key.outputs.iter().enumerate().map(|(j, at)| format!("bitcast<u32>(t{at}) == bitcast<u32>(s{j})")).collect();
+    let _ = writeln!(src, "        let fixed = {};", fixed.join(" && "));
     for (j, at) in key.outputs.iter().enumerate() {
         let _ = writeln!(src, "        s{j} = t{at};");
     }
-    src.push_str("    }\n");
+    src.push_str("        if (fixed) { break; }\n    }\n");
     for j in 0..count {
         let _ = writeln!(src, "    out{j}[i] = s{j};");
     }
