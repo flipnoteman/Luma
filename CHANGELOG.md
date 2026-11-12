@@ -28,6 +28,15 @@ All notable changes to Luma are listed here. The format follows
   edge-padded expression) can be computed once per cell of a workgroup tile in workgroup memory
   instead of once per read, including expressions that read other staged expressions. The cost
   model chooses between recomputing, staging and storing; `LUMA_STAGING=off` disables staging.
+- Region `assign` into a lazy padded array no longer makes every reader recompute the ghost
+  expressions: a `select` whose mask depends on the coordinates only is generated as `if`/`else`
+  (the right-hand side is computed in the cells of the region, the old value elsewhere), and the
+  cost model weights those operations by the share of cells that take the branch. A padded record
+  with ghost expressions of any size read at four offsets in each direction is one launch without
+  cuts (bowshock-lazy `luma_issues` case 1: 4 launches and 2 cuts at 100 ghost operations before).
+- Workgroup staging follows sub-programs that are not staged: what a flux read once (or a slice of
+  a slice) reads of a padded array is staged at the summed offsets instead of the padded array
+  being recomputed at every read.
 - `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
   `Df32` and `f64` arithmetic), measured when a context opens (once per device and process;
   `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).

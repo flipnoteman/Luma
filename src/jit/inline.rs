@@ -30,7 +30,7 @@ use crate::tuning::Tuning;
 use super::cost::{kernel_ns, op_weight, CostModel};
 use super::program::{FusedKey, Instr, Ref, Tail};
 use super::staging::{self, Staging};
-use super::{Edge, Op, OpKind, ShiftKind, ViewMap};
+use super::{Edge, Gen, Op, OpKind, ShiftKind, ViewMap};
 
 /// How the index of a context derives from its parent's: the read index of one `Shift`.
 #[derive(Debug)]
@@ -56,6 +56,17 @@ pub(crate) struct Flat {
     pub(crate) child: u32,
 }
 
+/// Where an instruction of a lowered program is computed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Region {
+    /// For every cell.
+    Top,
+    /// Only where the mask of the branching `Select` (the lowered instruction) holds.
+    Taken(u32),
+    /// Only where the mask of the branching `Select` does not hold.
+    Skipped(u32),
+}
+
 /// A key written out at every index its sub-programs are read at.
 #[derive(Debug)]
 pub(crate) struct Inlined {
@@ -66,7 +77,13 @@ pub(crate) struct Inlined {
     pub(crate) main: Vec<u32>,
     /// Per sub-program, at how many contexts it was lowered.
     pub(crate) count: Vec<u32>,
-    /// The operations of the lowered program in f32-operation units (see [`op_weight`]), per element.
+    /// Per lowered instruction, where it is computed (see [`branches`]).
+    pub(crate) region: Vec<Region>,
+    /// Per lowered instruction, whether it is a `Select` computed as `if`/`else`: operand 1 only
+    /// where the mask holds, operand 2 only where it does not.
+    pub(crate) branch: Vec<bool>,
+    /// The operations of the lowered program in f32-operation units (see [`op_weight`]) per
+    /// element, those of a branch weighted by the share of elements that compute it.
     pub(crate) ops: f64,
 }
 
@@ -134,12 +151,202 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// The lowered program once `main` (the values of the program's instructions) is known. A
-    /// read of a staged sub-program counts as 2 operations: an index and a workgroup load.
-    fn finish(self, main: Vec<u32>, cost: &CostModel) -> Inlined {
-        let weight = |flat: &Flat| if matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(flat.op, cost) };
-        let ops = self.instrs.iter().map(weight).sum();
-        Inlined { ctxs: self.ctxs, instrs: self.instrs, main, count: self.count, ops }
+    /// The lowered program once `main` (the values of the program's instructions) is known and
+    /// `roots` (lowered instructions the code after it reads) are chosen. A read of a staged
+    /// sub-program counts as 2 operations: an index and a workgroup load.
+    fn finish(self, main: Vec<u32>, roots: Vec<u32>, cost: &CostModel) -> Inlined {
+        let staged_reads = self.staged.iter().any(|&staged| staged);
+        let found = branches(&self.instrs, &self.ctxs, &roots, cost, staged_reads);
+        Inlined {
+            ctxs: self.ctxs,
+            instrs: self.instrs,
+            main,
+            count: self.count,
+            region: found.region,
+            branch: found.branch,
+            ops: found.ops,
+        }
+    }
+}
+
+/// The weight of a lowered instruction in f32-operation units; with `staged_reads`, a read of a
+/// sub-program (staged in workgroup memory) is an index and a workgroup load.
+fn flat_weight(flat: &Flat, cost: &CostModel, staged_reads: bool) -> f64 {
+    if staged_reads && matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(flat.op, cost) }
+}
+
+/// What the least a branch must save, in f32-operation units per element, for a `Select` to be
+/// computed as `if`/`else`.
+const BRANCH_GAIN: f64 = 8.0;
+
+/// The result of [`branches`].
+struct Branches {
+    region: Vec<Region>,
+    branch: Vec<bool>,
+    ops: f64,
+}
+
+/// The share of the elements of a program that a `Select` with the mask `mask` takes its
+/// operand 1 at, as far as the program shows: the part of the destination a clamped view of a
+/// smaller array covers (a region assigned into an array: the right-hand side read at the
+/// coordinates of the whole array), else a half.
+fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> f64 {
+    let cells = |dims: [u32; 4]| dims.iter().map(|&d| f64::from(d)).product::<f64>();
+    if let Ref::Tmp(value) = select.args[1]
+        && let Some(taken) = flats.get(value as usize)
+        && let Some(Ctx { kind: ShiftKind::View { map, .. }, .. }) = ctxs.get(taken.at as usize)
+    {
+        return (cells(map.src) / cells(map.out)).clamp(1.0 / 4096.0, 1.0);
+    }
+    0.5
+}
+
+/// Finds the selects of a lowered program that are better computed as `if`/`else` than as a
+/// `select` of two values computed for every element, and what runs where.
+///
+/// A select qualifies if its mask depends on the coordinates only (generated ranges and the
+/// scalars they are compared with: the elements that take a branch are neighbours, so a
+/// warp mostly takes one) and the instructions only one of its branches reads (and that no
+/// branch outside it, no context, no stored value reads) are worth at least [`BRANCH_GAIN`]
+/// operations per element. Those instructions are computed inside the branch. The weighted
+/// operation count of the program counts them by the share of elements that take it.
+fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, staged_reads: bool) -> Branches {
+    let n = flats.len();
+    let weight: Vec<f64> = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).collect();
+    let mut users: Vec<Vec<(u32, usize)>> = vec![Vec::new(); n];
+    let mut pinned = vec![false; n];
+    for (at, flat) in flats.iter().enumerate() {
+        for (slot, arg) in flat.args.iter().enumerate() {
+            if let Ref::Tmp(t) = *arg
+                && let Some(list) = users.get_mut(t as usize)
+            {
+                list.push((at as u32, slot));
+            }
+        }
+    }
+    for ctx in ctxs {
+        for arg in ctx.args {
+            if let Ref::Tmp(t) = arg
+                && let Some(flag) = pinned.get_mut(t as usize)
+            {
+                *flag = true;
+            }
+        }
+    }
+    for &root in roots {
+        if let Some(flag) = pinned.get_mut(root as usize) {
+            *flag = true;
+        }
+    }
+    // Values that depend on the coordinates and scalars only.
+    let mut coordinates = vec![false; n];
+    for (at, flat) in flats.iter().enumerate() {
+        coordinates[at] = match flat.op.kind {
+            OpKind::Generate(Gen::Range { .. }) => true,
+            OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
+                flat.args.iter().take(flat.op.kind.arity()).all(|arg| match *arg {
+                    Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
+                    Ref::Scalar(_) | Ref::Unused => true,
+                    _ => false,
+                })
+            }
+            _ => false,
+        };
+    }
+    let candidate: Vec<bool> = flats
+        .iter()
+        .map(|flat| {
+            matches!(flat.op.kind, OpKind::Select)
+                && matches!(flat.args[0], Ref::Tmp(mask) if coordinates.get(mask as usize).copied().unwrap_or(false))
+                && (matches!(flat.args[1], Ref::Tmp(_)) || matches!(flat.args[2], Ref::Tmp(_)))
+        })
+        .collect();
+    let share: Vec<f64> = flats.iter().map(|flat| if matches!(flat.op.kind, OpKind::Select) { taken_share(flats, ctxs, flat) } else { 1.0 }).collect();
+
+    let mut branch = candidate.clone();
+    loop {
+        // The region of every instruction: the innermost one that holds all its uses.
+        let mut region = vec![Region::Top; n];
+        let parent = |region: &[Region], r: Region| match r {
+            Region::Top => Region::Top,
+            Region::Taken(s) | Region::Skipped(s) => region[s as usize],
+        };
+        let depth = |region: &[Region], mut r: Region| {
+            let mut d = 0;
+            while r != Region::Top {
+                r = parent(region, r);
+                d += 1;
+            }
+            d
+        };
+        for x in (0..n).rev() {
+            if pinned[x] || users[x].is_empty() {
+                continue;
+            }
+            let mut joint: Option<Region> = None;
+            for &(user, slot) in &users[x] {
+                let u = user as usize;
+                let used_in = match (branch[u], slot) {
+                    (true, 1) => Region::Taken(user),
+                    (true, 2) => Region::Skipped(user),
+                    _ => region[u],
+                };
+                joint = Some(match joint {
+                    None => used_in,
+                    Some(mut a) => {
+                        let mut b = used_in;
+                        let (mut da, mut db) = (depth(&region, a), depth(&region, b));
+                        while a != b {
+                            if da >= db {
+                                a = parent(&region, a);
+                                da -= 1;
+                            } else {
+                                b = parent(&region, b);
+                                db -= 1;
+                            }
+                        }
+                        a
+                    }
+                });
+            }
+            region[x] = joint.unwrap_or(Region::Top);
+        }
+        // The share of the elements that compute each region.
+        let mut chance = vec![1.0f64; n];
+        let region_chance = |chance: &[f64], r: Region| match r {
+            Region::Top => 1.0,
+            Region::Taken(s) => chance[s as usize] * share[s as usize],
+            Region::Skipped(s) => chance[s as usize] * (1.0 - share[s as usize]),
+        };
+        // Selects come after their branches: an enclosing select has the higher index.
+        for x in (0..n).rev() {
+            chance[x] = region_chance(&chance, region[x]);
+        }
+        // What each branch saves: the work of the instructions it computes, run by every
+        // element that reaches the select instead of the share that takes the branch.
+        let mut saved = vec![0.0f64; n];
+        for x in 0..n {
+            let mut r = region[x];
+            while r != Region::Top {
+                let (s, here) = match r {
+                    Region::Taken(s) => (s as usize, share[s as usize]),
+                    Region::Skipped(s) => (s as usize, 1.0 - share[s as usize]),
+                    Region::Top => break,
+                };
+                if here > 0.0 {
+                    saved[s] += weight[x] * chance[x] * (1.0 - here) / here;
+                }
+                r = parent(&region, r);
+            }
+        }
+        let useless: Vec<usize> = (0..n).filter(|&s| branch[s] && saved[s] < BRANCH_GAIN).collect();
+        if useless.is_empty() {
+            let ops = (0..n).map(|x| weight[x] * chance[x]).sum();
+            return Branches { region, branch, ops };
+        }
+        for s in useless {
+            branch[s] = false;
+        }
     }
 }
 
@@ -226,8 +433,9 @@ impl Lowering<'_> {
                     if let Ref::Sub(s) = source
                         && self.staged.get(s as usize).copied().unwrap_or(false)
                     {
-                        // Read from workgroup memory at the cell itself: equal reads are one instruction.
-                        debug_assert_eq!(ctx, 0, "a staged sub-program read away from the cell of its reader");
+                        // Read from workgroup memory at the cell the context stands for (a
+                        // translation of the cell of the program, see `staging`): equal reads
+                        // are one instruction.
                         let flat = Flat { op: instr.op, args: [source, b, Ref::Unused], at: ctx, child: 0 };
                         let value = self.push(flat);
                         local.push(value);
@@ -260,18 +468,30 @@ impl Lowering<'_> {
     }
 }
 
+/// The lowered instructions the code around the main program of `key` reads: what it stores,
+/// scatters or reduces. `main` holds the lowered instruction of every program instruction.
+fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
+    let value = |at: u32| main.get(at as usize).copied();
+    match key.tail {
+        Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().filter_map(|&at| value(at)).collect(),
+        Tail::Scatter { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
+        Tail::Reduce(_) => main.last().copied().into_iter().collect(),
+    }
+}
+
 /// What evaluating sub-program `s` of `key` on its own costs per element: its operations with
 /// the sub-programs it reads written out (see [`op_weight`]), and the bytes of the inputs it
 /// loads. `None` past `cap` instructions.
 fn alone(key: &FusedKey, s: usize, cap: usize, cost: &CostModel) -> Option<(f64, f64)> {
     let mut lowering = Lowering::new(&key.subs, &[], cap);
-    lowering.lower(key.subs.get(s)?, 0);
+    let main = lowering.lower(key.subs.get(s)?, 0);
     if lowering.over {
         return None;
     }
-    let ops = lowering.instrs.iter().map(|flat| op_weight(flat.op, cost)).sum();
-    let reads = lowering.instrs.iter().flat_map(|flat| flat.args).chain(lowering.ctxs.iter().flat_map(|ctx| ctx.args));
-    Some((ops, input_bytes(key, reads)))
+    let roots = main.last().copied().into_iter().collect();
+    let lowered = lowering.finish(main, roots, cost);
+    let reads = lowered.instrs.iter().flat_map(|flat| flat.args).chain(lowered.ctxs.iter().flat_map(|ctx| ctx.args));
+    Some((lowered.ops, input_bytes(key, reads)))
 }
 
 /// The operations per element (see [`op_weight`]) of `key` once sub-program `s` is read from its
@@ -280,8 +500,12 @@ fn alone(key: &FusedKey, s: usize, cap: usize, cost: &CostModel) -> Option<(f64,
 fn without(key: &FusedKey, s: u32, cap: usize, cost: &CostModel) -> Option<f64> {
     let mut lowering = Lowering::new(&key.subs, &[], cap);
     lowering.cut = Some(s);
-    lowering.lower(&key.instrs, 0);
-    (!lowering.over).then(|| lowering.instrs.iter().map(|flat| op_weight(flat.op, cost)).sum())
+    let main = lowering.lower(&key.instrs, 0);
+    if lowering.over {
+        return None;
+    }
+    let roots = key_roots(key, &main);
+    Some(lowering.finish(main, roots, cost).ops)
 }
 
 /// Lowers `key` (main program at context 0), giving up once more than `cap` instructions exist.
@@ -299,15 +523,28 @@ pub(crate) fn inline(key: &FusedKey, cap: usize, cost: &CostModel) -> Verdict {
             .unwrap_or(0);
         return Verdict::TooBig { sub: u32::try_from(sub).unwrap_or(u32::MAX) };
     }
-    Verdict::Fits(lowering.finish(main, cost))
+    let roots = key_roots(key, &main);
+    Verdict::Fits(lowering.finish(main, roots, cost))
 }
 
 /// Lowers `program` at its own cell (context 0), with the sub-programs `staged` left as reads
-/// from workgroup memory. `None` if more than `cap` instructions result.
-fn lower_program(subs: &[Vec<Instr>], program: &[Instr], staged: &[bool], cap: usize, cost: &CostModel) -> Option<Inlined> {
+/// from workgroup memory. `roots` picks the lowered instructions the code after it reads from the
+/// lowered instruction of each of the program's. `None` if more than `cap` instructions result.
+fn lower_program(
+    subs: &[Vec<Instr>],
+    program: &[Instr],
+    staged: &[bool],
+    cap: usize,
+    cost: &CostModel,
+    roots: impl FnOnce(&[u32]) -> Vec<u32>,
+) -> Option<Inlined> {
     let mut lowering = Lowering::new(subs, staged, cap);
     let main = lowering.lower(program, 0);
-    (!lowering.over).then(|| lowering.finish(main, cost))
+    if lowering.over {
+        return None;
+    }
+    let roots = roots(&main);
+    Some(lowering.finish(main, roots, cost))
 }
 
 /// Lowers the main program of `key` and every sub-program `staging` stages, each at its own
@@ -318,11 +555,13 @@ pub(crate) fn lower_staged(key: &FusedKey, staging: &Staging, cap: usize, cost: 
     for entry in &staging.subs {
         *staged.get_mut(entry.sub as usize)? = true;
     }
-    let main = lower_program(&key.subs, &key.instrs, &staged, cap, cost)?;
+    let main = lower_program(&key.subs, &key.instrs, &staged, cap, cost, |main| key_roots(key, main))?;
     let subs = staging
         .subs
         .iter()
-        .map(|entry| lower_program(&key.subs, key.subs.get(entry.sub as usize)?, &staged, cap, cost))
+        .map(|entry| {
+            lower_program(&key.subs, key.subs.get(entry.sub as usize)?, &staged, cap, cost, |main| main.last().copied().into_iter().collect())
+        })
         .collect::<Option<Vec<_>>>()?;
     Some(StagedPrograms { main, subs })
 }
@@ -492,9 +731,9 @@ pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtin::{BinOp, UnOp};
+    use crate::builtin::{BinOp, CmpOp, UnOp};
     use crate::jit::program::Tail;
-    use crate::jit::ElemTy;
+    use crate::jit::{ElemTy, Gen};
 
     fn instr(kind: OpKind, args: [Ref; 3]) -> Instr {
         Instr { op: Op::new(kind, ElemTy::F32), args }
@@ -718,6 +957,59 @@ mod tests {
         assert!(estimates.staged_ns.is_some() && estimates.inline_ns.is_infinite(), "{estimates:?}");
         let (judgement, _) = judge(&difference_key(), 1 << 20, 2, &slow, &Tuning::for_tests(), true);
         assert!(matches!(judgement, Judgement::Materialise { reason: SplitReason::Inlined { limit: 2, .. }, .. }), "{judgement:?}");
+    }
+
+    /// `select(coordinate >= s0, e read through a clamped view of a 4-cell array, input)` over 64
+    /// cells, `e` being `expression()` followed by `extra` square roots (or the mask read from
+    /// the input, which makes it depend on data).
+    fn region_key(extra: u32, data_mask: bool) -> FusedKey {
+        let mut long = expression();
+        for k in 0..extra {
+            long.push(instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(2 + k), Ref::Unused, Ref::Unused]));
+        }
+        let mut map = ViewMap::identity([4, 1, 1, 1]);
+        map.out[0] = 64;
+        let (first, mask) = if data_mask {
+            (Instr { op: Op::new(OpKind::Binary(BinOp::Add), ElemTy::U32), args: [Ref::Input(1), Ref::Input(1), Ref::Unused] }, Ref::Tmp(0))
+        } else {
+            (Instr { op: Op::new(OpKind::Generate(Gen::Range { stride: 1, size: 64 }), ElemTy::U32), args: [Ref::Unused; 3] }, Ref::Tmp(0))
+        };
+        let main = vec![
+            first,
+            Instr { op: Op::new(OpKind::Compare(CmpOp::Ge), ElemTy::U32), args: [mask, Ref::Scalar(0), Ref::Unused] },
+            instr(OpKind::Shift(ShiftKind::View { map, edge: Edge::Clamp }), [Ref::Sub(0), Ref::Unused, Ref::Unused]),
+            instr(OpKind::Select, [Ref::Tmp(1), Ref::Tmp(2), Ref::Input(0)]),
+        ];
+        let mut key = key(main, vec![long]);
+        key.input_tys = vec![ElemTy::F32, ElemTy::U32];
+        key
+    }
+
+    #[test]
+    fn a_select_on_coordinates_computes_the_operand_only_where_it_is_taken() {
+        let cost = CostModel::TEST;
+        let inlined = fits(inline(&region_key(20, false), 1000, &cost));
+        // The expression (3 + 20 instructions, no other reader) is computed where the mask holds.
+        let select = inlined.instrs.len() - 1;
+        assert_eq!(select, 25);
+        assert!(inlined.branch[select], "{:?}", inlined.region);
+        assert!(inlined.region[2..25].iter().all(|&region| region == Region::Taken(select as u32)), "{:?}", inlined.region);
+        assert!([0, 1, select].iter().all(|&n| inlined.region[n] == Region::Top), "{:?}", inlined.region);
+        // 4 of the 64 cells take it: the operations are the program's four plus 1/16 of the expression's.
+        let all: f64 = inlined.instrs.iter().map(|flat| op_weight(flat.op, &cost)).sum();
+        let expression: f64 = inlined.instrs.iter().zip(&inlined.region).filter(|&(_, &region)| region != Region::Top).map(|(flat, _)| op_weight(flat.op, &cost)).sum();
+        assert!((inlined.ops - (all - expression + expression / 16.0)).abs() < 1e-9, "{} of {all}, expression {expression}", inlined.ops);
+        assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
+    }
+
+    #[test]
+    fn a_cheap_branch_or_a_mask_that_reads_data_stays_a_select() {
+        let cost = CostModel::TEST;
+        let cheap = fits(inline(&region_key(0, false), 1000, &cost));
+        assert!(cheap.branch.iter().all(|&branch| !branch), "{:?}", cheap.region);
+        assert!(cheap.region.iter().all(|&region| region == Region::Top));
+        let data = fits(inline(&region_key(20, true), 1000, &cost));
+        assert!(data.branch.iter().all(|&branch| !branch));
     }
 }
 
