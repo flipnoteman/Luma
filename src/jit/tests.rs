@@ -310,9 +310,37 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
 }
 
+/// Where arithmetic costs more than a launch and a pass over the buffers, so that every pending
+/// node that two expressions read is worth evaluating first (see `worth_storing`).
+fn costly_arithmetic() -> CostModel {
+    CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }
+}
+
+#[test]
+fn a_cheap_node_with_two_consumers_is_computed_by_each() {
+    let ctx = ctx();
+    let xs = values(400, 11, 0.5, 2.0);
+    let ys = values(400, 12, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let y = f32s(&ctx, &ys);
+
+    // A launch costs more than computing `t` once more over 400 elements: no kernel is spent on it.
+    let before = ctx.jit().stats();
+    let t = (&x * &y).sqrt();
+    let u = &t + 1.0;
+    let v = &t * 2.0;
+    let got_u = u.to_vec().unwrap();
+    let got_v = v.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2, "u and v compute t each");
+    let t_ref: Vec<f32> = xs.iter().zip(&ys).map(|(&a, &b)| (a * b).sqrt()).collect();
+    assert_close(&got_u, &t_ref.iter().map(|v| v + 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+    assert_close(&got_v, &t_ref.iter().map(|v| v * 2.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+}
+
 #[test]
 fn a_node_with_two_consumers_is_computed_once() {
     let ctx = ctx();
+    ctx.set_cost_model(costly_arithmetic());
     let xs = values(400, 11, 0.5, 2.0);
     let ys = values(400, 12, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -580,7 +608,8 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
 
 
     // A shifted expression shared with an outside consumer is evaluated once instead of being
-    // recomputed inside the shift's kernel.
+    // recomputed inside the shift's kernel (where computing it costs more than a launch).
+    ctx.set_cost_model(costly_arithmetic());
     let before = ctx.jit().stats();
     let shared = &x * 3.0 + 1.0;
     let shifted = shared.shift(1);
@@ -592,6 +621,7 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
     let want_other: Vec<f32> = xs.iter().map(|&v| v * 3.0 - 1.0).collect();
     assert_close(&got_shifted, &want_shifted, 1e-5, 1e-5);
     assert_close(&got_other, &want_other, 1e-5, 1e-5);
+    ctx.set_cost_model(CostModel::TEST);
     // A shifted read inside a reduction's first pass.
     let before = ctx.jit().stats();
     let lag = (&x * &x.shift(3)).sum().item().unwrap();
@@ -1970,7 +2000,9 @@ fn a_df32_expression_read_at_five_offsets_is_staged() {
     use crate::view::PadMode;
     use crate::Df32;
     let ctx = ctx();
-    ctx.set_cost_model(arithmetic_bound());
+    // Costly launches: evaluating the padded expression first (two kernels, no halo to compute) must not
+    // beat staging it on a device whose tiles are small (the CPU's).
+    ctx.set_cost_model(CostModel { launch_us: 200.0, ..arithmetic_bound() });
     let (nx, ny) = (64, 48);
     let xs = values(nx * ny, 204, 0.2, 1.2);
     let mut e = Array::from_slice_on(&ctx, &xs, [nx, ny]).unwrap().to_df32();

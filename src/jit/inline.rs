@@ -23,12 +23,14 @@
 //! lowered programs as `Shift` instructions of `Ref::Sub` operands that the generated code
 //! turns into workgroup loads ([`lower_staged`]). [`judge`] weighs that against the other two.
 
+use std::sync::Arc;
+
 use crate::gpu::hash::FxMap;
 use crate::profile::SplitReason;
 use crate::tuning::Tuning;
 
 use super::cost::{kernel_ns, op_weight, CostModel};
-use super::program::{FusedKey, Instr, Ref, Tail};
+use super::program::{shape_of, FusedKey, Instr, Ref, Tail};
 use super::staging::{self, Staging};
 use super::{Edge, Gen, Op, OpKind, ShiftKind, ViewMap};
 
@@ -75,8 +77,6 @@ pub(crate) struct Inlined {
     pub(crate) instrs: Vec<Flat>,
     /// For every instruction of the main program `key.instrs`, the lowered instruction holding its value.
     pub(crate) main: Vec<u32>,
-    /// Per sub-program, at how many contexts it was lowered.
-    pub(crate) count: Vec<u32>,
     /// Per lowered instruction, where it is computed (see [`branches`]).
     pub(crate) region: Vec<Region>,
     /// Per lowered instruction, whether it is a `Select` computed as `if`/`else`: operand 1 only
@@ -145,9 +145,6 @@ struct Lowering<'a> {
     instances: FxMap<(u32, u32), u32>,
     /// Per sub-program, at how many contexts it was lowered.
     count: Vec<u32>,
-    /// A sub-program read from its evaluated buffer instead of being unfolded (for costing what
-    /// evaluating it first leaves of the program): its reads are one load each.
-    cut: Option<u32>,
     /// Set once more than `cap` instructions exist: nothing is lowered any further.
     over: bool,
 }
@@ -165,7 +162,6 @@ impl<'a> Lowering<'a> {
             numbered: FxMap::default(),
             instances: FxMap::default(),
             count: vec![0; subs.len()],
-            cut: None,
             over: false,
         }
     }
@@ -180,7 +176,6 @@ impl<'a> Lowering<'a> {
             ctxs: self.ctxs,
             instrs: self.instrs,
             main,
-            count: self.count,
             region: found.region,
             branch: found.branch,
             ops: found.ops,
@@ -467,7 +462,6 @@ impl Lowering<'_> {
                     };
                     let child = self.context(ctx, kind, context_args);
                     match source {
-                        Ref::Sub(s) if self.cut == Some(s) => self.push(Flat { op: instr.op, args: [source, b, Ref::Unused], at: ctx, child }),
                         Ref::Sub(s) => {
                             let value = self.instance(s, child);
                             if matches!(kind, ShiftKind::View { edge: Edge::Fill, .. }) {
@@ -496,35 +490,6 @@ fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
         Tail::Scatter { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
         Tail::Reduce(_) => main.last().copied().into_iter().collect(),
     }
-}
-
-/// What evaluating sub-program `s` of `key` on its own costs per element: its operations with
-/// the sub-programs it reads written out (see [`op_weight`]), and the bytes of the inputs it
-/// loads. `None` past `cap` instructions.
-fn alone(key: &FusedKey, s: usize, cap: usize, cost: &CostModel) -> Option<(f64, f64)> {
-    let mut lowering = Lowering::new(&key.subs, &[], cap);
-    let main = lowering.lower(key.subs.get(s)?, 0);
-    if lowering.over {
-        return None;
-    }
-    let roots = main.last().copied().into_iter().collect();
-    let lowered = lowering.finish(main, roots, cost);
-    let reads = lowered.instrs.iter().flat_map(|flat| flat.args).chain(lowered.ctxs.iter().flat_map(|ctx| ctx.args));
-    Some((lowered.ops, input_bytes(key, reads)))
-}
-
-/// The operations per element (see [`op_weight`]) of `key` once sub-program `s` is read from its
-/// evaluated buffer: what is left of the lowered program, with the sub-programs that `s` shares
-/// with the rest still computed. `None` past `cap` instructions.
-fn without(key: &FusedKey, s: u32, cap: usize, cost: &CostModel) -> Option<f64> {
-    let mut lowering = Lowering::new(&key.subs, &[], cap);
-    lowering.cut = Some(s);
-    let main = lowering.lower(&key.instrs, 0);
-    if lowering.over {
-        return None;
-    }
-    let roots = key_roots(key, &main);
-    Some(lowering.finish(main, roots, cost).ops)
 }
 
 /// Lowers `key` (main program at context 0), giving up once more than `cap` instructions exist.
@@ -622,8 +587,9 @@ pub(crate) enum Judgement {
     /// Run the program as one kernel: lowered by [`inline`], or by [`lower_staged`] if `staging`
     /// is set (it becomes the `staging` of the key).
     Run { staging: Option<Staging> },
-    /// Evaluate sub-program `sub` first (the kernel then reads its buffer) and flatten again.
-    Materialise { sub: u32, reason: SplitReason },
+    /// Evaluate the sub-programs `subs` first, together (the kernel then reads their buffers),
+    /// and flatten again.
+    Materialise { subs: Vec<u32>, reason: SplitReason },
 }
 
 /// The estimated times [`judge`] compared, in nanoseconds.
@@ -721,67 +687,388 @@ const STAGE_MARGIN: f64 = 0.9;
 /// MUSCL step at 2048² ran slower with a sub-program its estimate put at 11% cheaper).
 const MATERIALISE_MARGIN: f64 = 0.75;
 
+/// How [`judge`] weighs the ways of running a program: the instruction cap, the device's model,
+/// the tuning of workgroup staging and whether staging is allowed at all.
+#[derive(Clone, Copy)]
+struct Env<'a> {
+    cap: usize,
+    cost: &'a CostModel,
+    tuning: &'a Tuning,
+    staging_on: bool,
+}
+
+/// The ways of running a key as one kernel and what they cost over `elements` elements.
+struct Plans {
+    /// The program written out at every index its sub-programs are read at; past the
+    /// cap, the sub-program that saves the most instructions when evaluated first.
+    inlined: Result<Inlined, u32>,
+    /// One kernel running the lowered program (infinite if it exceeds the cap).
+    inline_ns: f64,
+    /// The workgroup staging of the sub-programs read through views and the programs it runs.
+    staged: Option<(Staging, StagedPrograms)>,
+    /// One kernel staging them, with its time.
+    staged_ns: Option<f64>,
+    /// What the program that does not fit costs (see [`Plans::run_ns`]).
+    unfit_ns: f64,
+}
+
+/// What a program that does not fit one kernel costs on top of its estimate: more than any
+/// program that does.
+const UNFIT_NS: f64 = 1e15;
+
+/// Whether evaluating sub-programs first (two kernels, estimated `t`) is worth it over the
+/// program as one kernel (estimated `run`): [`MATERIALISE_MARGIN`] times cheaper, or cheaper
+/// at all if the program does not fit.
+fn pays(t: f64, run: f64) -> bool {
+    if run >= UNFIT_NS { t < run } else { t < MATERIALISE_MARGIN * run }
+}
+
+/// The estimated time of `key` over `len` elements if it were written out in full: its
+/// operations and those of every sub-program it reads, counted once per distinct read (see
+/// [`recomputation`]), without the sharing of equal instructions the lowering finds, and the
+/// bytes of every input it reads.
+fn written_out_ns(key: &FusedKey, len: usize, cost: &CostModel) -> f64 {
+    let (_, alone) = recomputation(key, cost);
+    let mut reads: Vec<(u32, ShiftKind)> = Vec::new();
+    let mut ops = 0.0;
+    for instr in key.instrs.iter() {
+        ops += op_weight(instr.op, cost);
+        if let (OpKind::Shift(kind), Ref::Sub(j)) = (instr.op.kind, instr.args[0])
+            && !reads.contains(&(j, kind))
+        {
+            reads.push((j, kind));
+            ops += alone.get(j as usize).copied().unwrap_or(0.0);
+        }
+    }
+    let bytes = input_bytes(key, key.instrs.iter().chain(key.subs.iter().flatten()).flat_map(|instr| instr.args)) + output_bytes(key);
+    kernel_ns(cost, len as f64 * bytes, ops * len as f64)
+}
+
+impl Plans {
+    /// Finds the plans of `key` over `len` elements.
+    fn of(key: &FusedKey, len: usize, env: Env) -> Plans {
+        let elements = len as f64;
+        let staged = if env.staging_on { stage(key, env.cap, env.cost, env.tuning) } else { None };
+        let staged_ns = staged.as_ref().map(|(staging, programs)| staged_time(key, staging, programs, elements, env.cost));
+        match inline(key, env.cap, env.cost) {
+            Verdict::Fits(inlined) => {
+                let reads = inlined.instrs.iter().flat_map(|flat| flat.args).chain(inlined.ctxs.iter().flat_map(|ctx| ctx.args));
+                let io_bytes = elements * (input_bytes(key, reads) + output_bytes(key));
+                let inline_ns = kernel_ns(env.cost, io_bytes, inlined.ops * elements);
+                Plans { inlined: Ok(inlined), inline_ns, staged, staged_ns, unfit_ns: 0.0 }
+            }
+            Verdict::TooBig { sub } => Plans { inlined: Err(sub), inline_ns: f64::INFINITY, staged, staged_ns, unfit_ns: UNFIT_NS + written_out_ns(key, len, env.cost) },
+        }
+    }
+
+    /// Whether the program runs as one kernel: written out within the cap, or staged.
+    fn fits(&self) -> bool {
+        self.inlined.is_ok() || self.staged.is_some()
+    }
+
+    /// Whether the program runs staged: it must be estimated [`STAGE_MARGIN`] times cheaper than
+    /// one kernel without staging, unless that does not fit.
+    fn stages(&self) -> bool {
+        match self.staged_ns {
+            Some(t) => t < STAGE_MARGIN * self.inline_ns,
+            None => false,
+        }
+    }
+
+    /// The estimated time of the program as one kernel, the way it will run. A program that
+    /// does not fit costs [`UNFIT_NS`] more than any that does, and among those that do not
+    /// the estimate of what writing it out would cost orders them: the search then finds the
+    /// sub-programs to evaluate first even where no single one makes the rest fit.
+    fn run_ns(&self) -> f64 {
+        match self.staged_ns {
+            Some(t) if self.stages() => t,
+            _ if self.inlined.is_ok() => self.inline_ns,
+            _ => self.unfit_ns,
+        }
+    }
+}
+
+/// The sub-programs `main` reaches (those it reads through shifts, and those they read),
+/// renumbered in their order, and for each the number it had in `subs`; the reads of the
+/// sub-programs of `replaced` (pairs of sub-program and input) become reads of that input.
+fn reachable(main: &[Instr], subs: &[Vec<Instr>], replaced: &[(u32, u32)]) -> (Vec<Instr>, Vec<Vec<Instr>>, Vec<u32>) {
+    let kept = |reference: Ref| match reference {
+        Ref::Sub(j) if !replaced.iter().any(|&(sub, _)| sub == j) => Some(j as usize),
+        _ => None,
+    };
+    let mut used = vec![false; subs.len()];
+    for instr in main {
+        if let Some(slot) = kept(instr.args[0]).and_then(|j| used.get_mut(j)) {
+            *slot = true;
+        }
+    }
+    for (s, program) in subs.iter().enumerate().rev() {
+        if used[s] {
+            for instr in program {
+                if let Some(slot) = kept(instr.args[0]).and_then(|j| used.get_mut(j)) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    let mut renumbered = vec![0u32; subs.len()];
+    let mut originals = Vec::new();
+    for (s, &used) in used.iter().enumerate() {
+        if used {
+            renumbered[s] = u32::try_from(originals.len()).unwrap_or(u32::MAX);
+            originals.push(u32::try_from(s).unwrap_or(u32::MAX));
+        }
+    }
+    let rewrite = |program: &[Instr]| -> Vec<Instr> {
+        program
+            .iter()
+            .map(|instr| {
+                let mut instr = instr.clone();
+                if let Ref::Sub(j) = instr.args[0] {
+                    instr.args[0] = match replaced.iter().find(|&&(sub, _)| sub == j) {
+                        Some(&(_, input)) => Ref::Input(input),
+                        None => Ref::Sub(renumbered.get(j as usize).copied().unwrap_or(0)),
+                    };
+                }
+                instr
+            })
+            .collect()
+    };
+    let main = rewrite(main);
+    let subs = subs.iter().zip(&used).filter(|&(_, &used)| used).map(|(program, _)| rewrite(program)).collect();
+    (main, subs, originals)
+}
+
+/// `key` with the program replaced by `main` over `subs` (see [`reachable`]) and the tail,
+/// outputs and inputs given.
+fn rebuilt(key: &FusedKey, main: Vec<Instr>, subs: Vec<Vec<Instr>>, outputs: Vec<u32>, tail: Tail, input_tys: Vec<super::ElemTy>) -> FusedKey {
+    FusedKey {
+        shape: shape_of(&main, &subs),
+        instrs: Arc::new(main),
+        input_tys,
+        scalar_tys: key.scalar_tys.clone(),
+        outputs,
+        subs: Arc::new(subs),
+        tail,
+        in_place: Vec::new(),
+        spans: Vec::new(),
+        tile: None,
+        staging: None,
+        guard: key.guard,
+    }
+}
+
+/// The sub-programs `group` of `key` as one program storing all their values (equal
+/// instructions among them are one).
+fn group_key(key: &FusedKey, group: &[u32]) -> Option<FusedKey> {
+    let mut main: Vec<Instr> = Vec::new();
+    let mut outputs = Vec::new();
+    for &s in group {
+        let base = u32::try_from(main.len()).ok()?;
+        for instr in key.subs.get(s as usize)? {
+            let mut instr = instr.clone();
+            for arg in &mut instr.args {
+                if let Ref::Tmp(t) = arg {
+                    *t += base;
+                }
+            }
+            main.push(instr);
+        }
+        outputs.push(u32::try_from(main.len().checked_sub(1)?).ok()?);
+    }
+    let (main, subs, _) = reachable(&main, &key.subs, &[]);
+    Some(rebuilt(key, main, subs, outputs, Tail::Store, key.input_tys.clone()))
+}
+
+/// `key` once the sub-programs `group` are evaluated: its reads of them are reads of buffers.
+/// Also the number each of its sub-programs has in `key`.
+fn rest_key(key: &FusedKey, group: &[u32]) -> Option<(FusedKey, Vec<u32>)> {
+    let first = u32::try_from(key.input_tys.len()).ok()?;
+    let mut input_tys = key.input_tys.clone();
+    let mut replaced = Vec::with_capacity(group.len());
+    for (k, &s) in group.iter().enumerate() {
+        input_tys.push(key.subs.get(s as usize)?.last()?.op.out_ty());
+        replaced.push((s, first + u32::try_from(k).ok()?));
+    }
+    let (main, subs, originals) = reachable(&key.instrs, &key.subs, &replaced);
+    Some((rebuilt(key, main, subs, key.outputs.clone(), key.tail, input_tys), originals))
+}
+
+/// What the sub-programs of `key` cost when written out, by a count that ignores that equal
+/// instructions are one: per sub-program, the number of times the main program reaches it, and
+/// the operations (see [`op_weight`]) of its program with every sub-program it reads written out.
+fn recomputation(key: &FusedKey, cost: &CostModel) -> (Vec<f64>, Vec<f64>) {
+    let n = key.subs.len();
+    let reads = |program: &[Instr]| -> Vec<(u32, ShiftKind)> {
+        let mut found: Vec<(u32, ShiftKind)> = Vec::new();
+        for instr in program {
+            if let (OpKind::Shift(kind), Ref::Sub(j)) = (instr.op.kind, instr.args[0])
+                && !found.contains(&(j, kind))
+            {
+                found.push((j, kind));
+            }
+        }
+        found
+    };
+    let weight = |program: &[Instr]| program.iter().map(|instr| op_weight(instr.op, cost)).sum::<f64>();
+    let mut alone = vec![0.0f64; n];
+    for s in 0..n {
+        let own = &key.subs[s];
+        alone[s] = weight(own) + reads(own).iter().map(|&(j, _)| alone.get(j as usize).copied().unwrap_or(0.0)).sum::<f64>();
+    }
+    let mut times = vec![0.0f64; n];
+    for (j, _) in reads(&key.instrs) {
+        if let Some(t) = times.get_mut(j as usize) {
+            *t += 1.0;
+        }
+    }
+    for s in (0..n).rev() {
+        let t = times[s];
+        for (j, _) in reads(&key.subs[s]) {
+            if let Some(slot) = times.get_mut(j as usize) {
+                *slot += t;
+            }
+        }
+    }
+    (times, alone)
+}
+
+/// The `limit` sub-programs worth costing as the one to evaluate first: those the main program
+/// reaches more than once, the ones whose recomputation (see [`recomputation`]) wastes the most
+/// first.
+fn worth_evaluating(key: &FusedKey, cost: &CostModel, limit: usize) -> Vec<u32> {
+    let (times, alone) = recomputation(key, cost);
+    let mut found: Vec<(u32, f64)> = (0..key.subs.len()).filter(|&s| times[s] >= 2.0).map(|s| (s as u32, (times[s] - 1.0) * alone[s])).collect();
+    found.sort_by(|a, b| b.1.total_cmp(&a.1));
+    found.truncate(limit);
+    found.into_iter().map(|(s, _)| s).collect()
+}
+
+/// How many sub-programs are costed as the one to evaluate first at every level of the search.
+const CANDIDATES: usize = 4;
+
+/// By what factor at most the cost of writing out two sub-programs that are evaluated together
+/// differ (the fields of one state differ little; another stage of a time step by orders of
+/// magnitude).
+const SIBLING: f64 = 8.0;
+
+/// How many sub-programs are evaluated together at most.
+const GROUP: usize = 8;
+
+/// How many levels deep the search goes: evaluating a sub-program first is itself a program
+/// that is judged the same way.
+const SEARCH_DEPTH: u32 = 4;
+
+/// The search of [`judge`]: what to evaluate first, and what the program costs once it is.
+struct Search<'a> {
+    env: Env<'a>,
+    /// The best time found (and the levels it was searched with) per program structure and length.
+    memo: FxMap<(u64, usize, usize), (u32, f64)>,
+}
+
+impl Search<'_> {
+    /// The sub-programs to evaluate together with `seed` (over `len` elements): the ones of
+    /// the same length that cost about as much to write out and most waste recomputation,
+    /// until what is left of the program fits one kernel. Sub-programs that read the same
+    /// expression (the fields of a state) cost next to nothing to evaluate together and each
+    /// leaves the program too big otherwise; those of another stage do not belong to them.
+    fn group(&self, key: &FusedKey, seed: u32, len: usize) -> Vec<u32> {
+        let wide = sub_len(key, seed, len);
+        let (_, alone) = recomputation(key, self.env.cost);
+        let like = |s: u32| alone.get(s as usize).zip(alone.get(seed as usize)).is_some_and(|(&a, &b)| a >= b / SIBLING && a <= b * SIBLING);
+        let mut group = vec![seed];
+        let Some((mut rest, mut originals)) = rest_key(key, &group) else { return group };
+        while group.len() < GROUP && !Plans::of(&rest, len, self.env).fits() {
+            let Some(next) = worth_evaluating(&rest, self.env.cost, usize::MAX).into_iter().find(|&j| sub_len(&rest, j, len) == wide && like(originals[j as usize])) else { break };
+            group.push(originals[next as usize]);
+            let Some((smaller, kept)) = rest_key(&rest, &[next]) else { break };
+            originals = kept.iter().map(|&k| originals[k as usize]).collect();
+            rest = smaller;
+        }
+        group
+    }
+
+    /// The best group of sub-programs of `key` to evaluate first (over `len` elements, `plans`
+    /// being how it runs as one kernel), with the estimated time of both kernels, each run as
+    /// it will be; `None` if no sub-program is worth it or the search is out of levels.
+    fn evaluate_first(&mut self, key: &FusedKey, len: usize, plans: &Plans, left: u32) -> Option<(Vec<u32>, f64)> {
+        let run = plans.run_ns();
+        // Two launches alone cost more than the margin allows.
+        if left == 0 || 2.0 * self.env.cost.launch_us * 1e3 >= MATERIALISE_MARGIN * run {
+            return None;
+        }
+        let mut best: Option<(Vec<u32>, f64)> = None;
+        let mut tried: Vec<Vec<u32>> = Vec::new();
+        for seed in worth_evaluating(key, self.env.cost, CANDIDATES) {
+            let mut group = self.group(key, seed, len);
+            group.sort_unstable();
+            if tried.contains(&group) {
+                continue;
+            }
+            let (Some(own), Some((rest, _))) = (group_key(key, &group), rest_key(key, &group)) else { continue };
+            let len_s = sub_len(key, group[0], len) as usize;
+            let t_rest = Plans::of(&rest, len, self.env).run_ns();
+            let t = self.best(&own, len_s, left - 1) + t_rest;
+            if t.is_finite() && best.as_ref().is_none_or(|&(_, t_best)| t < t_best) {
+                best = Some((group.clone(), t));
+            }
+            tried.push(group);
+        }
+        best
+    }
+
+    /// The estimated time of `key` over `len` elements run the way [`judge`] would choose.
+    fn best(&mut self, key: &FusedKey, len: usize, left: u32) -> f64 {
+        let slot = (key.shape, len, key.input_tys.len());
+        if let Some(&(searched, t)) = self.memo.get(&slot)
+            && searched >= left
+        {
+            return t;
+        }
+        let plans = Plans::of(key, len, self.env);
+        let run = plans.run_ns();
+        let t = match self.evaluate_first(key, len, &plans, left) {
+            Some((_, t)) if pays(t, run) => t,
+            _ => run,
+        };
+        self.memo.insert(slot, (left, t));
+        t
+    }
+}
+
 /// Decides how to run `key` (which [`inlines`](FusedKey::inlines)) over `len` elements: as one
 /// kernel that computes every sub-program at each index it is read at, as one kernel that
 /// stages the sub-programs read through translations in workgroup memory (if `staging_on`), or
-/// with the sub-program whose repeated computation costs the most evaluated first (see the
-/// module documentation). Staging must be estimated below [`STAGE_MARGIN`] times the time of one
-/// kernel, and evaluating a sub-program first below [`MATERIALISE_MARGIN`] times the time of the
-/// choice before it. Lowered programs over `cap` instructions are always cut, unless staging
-/// makes them fit.
+/// with some sub-programs evaluated first (see the module documentation). What to evaluate
+/// first is searched for: of the sub-programs the program reads at the most indices, the group
+/// that makes both kernels cost least, each judged the same way (the sub-programs of a
+/// sub-program are evaluated first where that pays). Staging must be estimated below
+/// [`STAGE_MARGIN`] times the time of one kernel, and evaluating sub-programs first below
+/// [`MATERIALISE_MARGIN`] times the time of the choice before it. Lowered programs over `cap`
+/// instructions are always cut, unless staging makes them fit.
 pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tuning: &Tuning, staging_on: bool) -> (Judgement, Estimates) {
-    let elements = len as f64;
-    let staged = if staging_on { stage(key, cap, cost, tuning) } else { None };
-    let staged_ns = staged.as_ref().map(|(staging, programs)| staged_time(key, staging, programs, elements, cost));
-    let inlined = match inline(key, cap, cost) {
-        Verdict::Fits(inlined) => inlined,
-        Verdict::TooBig { sub } => {
-            let estimates = Estimates { inline_ns: f64::INFINITY, best_sub: None, staged_ns };
-            if let Some((staging, _)) = staged {
-                return (Judgement::Run { staging: Some(staging) }, estimates);
-            }
-            let reason = SplitReason::Inlined { instructions: cap.saturating_add(1), limit: cap };
-            return (Judgement::Materialise { sub, reason }, estimates);
+    let env = Env { cap, cost, tuning, staging_on };
+    let plans = Plans::of(key, len, env);
+    let run = plans.run_ns();
+    let mut search = Search { env, memo: FxMap::default() };
+    let first = search.evaluate_first(key, len, &plans, SEARCH_DEPTH);
+    let estimates = Estimates { inline_ns: plans.inline_ns, best_sub: first.as_ref().map(|(group, t)| (group[0], *t)), staged_ns: plans.staged_ns };
+    let over_cap = SplitReason::Inlined { instructions: cap.saturating_add(1), limit: cap };
+    match first {
+        Some((subs, t)) if pays(t, run) => {
+            let reason = if plans.fits() {
+                let (times, _) = recomputation(key, cost);
+                SplitReason::Materialised { instances: times[subs[0] as usize] as usize }
+            } else {
+                over_cap
+            };
+            (Judgement::Materialise { subs, reason }, estimates)
         }
-    };
-    let out_bytes = output_bytes(key);
-    let reads = inlined.instrs.iter().flat_map(|flat| flat.args).chain(inlined.ctxs.iter().flat_map(|ctx| ctx.args));
-    let io_bytes = elements * (input_bytes(key, reads) + out_bytes);
-    let inline_ns = kernel_ns(cost, io_bytes, inlined.ops * elements);
-
-    let mut best: Option<(u32, f64)> = None;
-    for (s, program) in key.subs.iter().enumerate() {
-        let instances = inlined.count.get(s).copied().unwrap_or(0);
-        if instances < 2 {
-            continue;
+        _ if plans.fits() => {
+            let staging = if plans.stages() { plans.staged.map(|(staging, _)| staging) } else { None };
+            (Judgement::Run { staging }, estimates)
         }
-        let s32 = u32::try_from(s).unwrap_or(u32::MAX);
-        // Evaluated on its own, the sub-program computes the sub-programs it reads too; what it
-        // shares with the rest of the program is still computed there.
-        let Some((once, in_s)) = alone(key, s, cap, cost) else { continue };
-        let Some(rest) = without(key, s32, cap, cost) else { continue };
-        let len_s = sub_len(key, s32, len);
-        let out_s = program.last().map_or(0.0, |instr| instr.op.out_ty().bytes() as f64);
-        let t = kernel_ns(cost, len_s * (in_s + out_s), once * len_s) + kernel_ns(cost, io_bytes + elements * out_s, rest * elements);
-        if best.is_none_or(|(_, t_best)| t < t_best) {
-            best = Some((s32, t));
-        }
-    }
-    let estimates = Estimates { inline_ns, best_sub: best, staged_ns };
-    let mut current = inline_ns;
-    let mut choice = None;
-    if let (Some((staging, _)), Some(t)) = (staged, staged_ns)
-        && t < STAGE_MARGIN * current
-    {
-        current = t;
-        choice = Some(staging);
-    }
-    match best {
-        Some((sub, t)) if t < MATERIALISE_MARGIN * current => {
-            let instances = inlined.count[sub as usize] as usize;
-            (Judgement::Materialise { sub, reason: SplitReason::Materialised { instances } }, estimates)
-        }
-        _ => (Judgement::Run { staging: choice }, estimates),
+        _ => (Judgement::Materialise { subs: vec![plans.inlined.err().unwrap_or(0)], reason: over_cap }, estimates),
     }
 }
 
@@ -989,9 +1276,8 @@ mod tests {
         let (cheap_launch, _) = judge(&key, len, 1000, &CostModel { launch_us: 1e6, ..CostModel::TEST }, &tuning, true);
         assert!(matches!(cheap_launch, Judgement::Run { .. }), "{cheap_launch:?}");
         let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, false);
-        let Judgement::Materialise { sub: 0, reason: SplitReason::Materialised { instances: 2 } } = cheap_memory else {
-            panic!("{cheap_memory:?} {estimates:?}");
-        };
+        let Judgement::Materialise { subs, reason: SplitReason::Materialised { instances: 2 } } = &cheap_memory else { panic!("{cheap_memory:?} {estimates:?}") };
+        assert_eq!(subs, &[0], "{cheap_memory:?}");
         assert!(estimates.best_sub.is_some_and(|(_, t)| t < estimates.inline_ns), "{estimates:?}");
         // A short expression costs less to recompute than its two reads through views.
         let (short, estimates) = judge(&difference_key(), len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, false);
@@ -1002,7 +1288,7 @@ mod tests {
     fn a_program_over_the_cap_is_cut_whatever_the_model_says() {
         let slow = CostModel { launch_us: 1e6, ..CostModel::TEST };
         let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &slow, &Tuning::for_tests(), false);
-        assert!(matches!(judgement, Judgement::Materialise { sub: 0, reason: SplitReason::Inlined { limit: 4, .. } }), "{judgement:?}");
+        assert!(matches!(judgement, Judgement::Materialise { reason: SplitReason::Inlined { limit: 4, .. }, .. }), "{judgement:?}");
         assert!(estimates.inline_ns.is_infinite());
     }
 
@@ -1096,6 +1382,74 @@ mod tests {
         assert_eq!(group.body.instrs.len(), 4);
         assert_eq!(group.values, vec![2, 3]);
         assert_eq!(validate_inlined(&group.body, 1, true), Ok(()));
+    }
+
+    /// `s0 = e(x)`, `s1 = sqrt(s0[..8])`, an unused `s2`, and a main program reading `s1` at two offsets.
+    fn chain_key() -> FusedKey {
+        let reads_s0 = vec![shift(slice(9, 0, 8), 0), instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(0), Ref::Unused, Ref::Unused])];
+        let main = vec![
+            shift(slice(8, 1, 7), 1),
+            shift(slice(8, 0, 7), 1),
+            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+        ];
+        key(main, vec![expression(), reads_s0, expression()])
+    }
+
+    #[test]
+    fn what_is_left_of_a_program_reads_the_evaluated_sub_program_from_a_buffer() {
+        let key = chain_key();
+        // `s1` evaluated: its reads are reads of a new input, and nothing else is reached.
+        let (rest, originals) = rest_key(&key, &[1]).expect("s1 has a value");
+        assert!(rest.subs.is_empty() && originals.is_empty(), "{rest:?}");
+        assert_eq!(rest.input_tys.len(), 2);
+        assert!(rest.instrs.iter().take(2).all(|instr| instr.args[0] == Ref::Input(1)), "{rest:?}");
+        // `s0` evaluated: `s1` is left, reading it; the unused `s2` is gone and `s1` is renumbered.
+        let (rest, originals) = rest_key(&key, &[0]).expect("s0 has a value");
+        assert_eq!(originals, vec![1]);
+        assert_eq!(rest.subs.len(), 1);
+        assert_eq!(rest.subs[0][0].args[0], Ref::Input(1));
+        assert_eq!(rest.instrs[0].args[0], Ref::Sub(0));
+    }
+
+    #[test]
+    fn sub_programs_evaluated_together_are_one_program_storing_each() {
+        let key = chain_key();
+        let together = group_key(&key, &[0, 1]).expect("both have values");
+        // `s0`'s three instructions, then `s1`'s two (after them), each stored; `s1` reads `s0`.
+        assert_eq!(together.instrs.len(), 5);
+        assert_eq!(together.outputs, vec![2, 4]);
+        assert_eq!(together.subs.len(), 1);
+        assert!(matches!(together.instrs[3].args[0], Ref::Sub(0)));
+        let alone = group_key(&key, &[1]).expect("s1 has a value");
+        assert_eq!((alone.instrs.len(), alone.subs.len(), alone.outputs.clone()), (2, 1, vec![1]));
+    }
+
+    #[test]
+    fn siblings_that_leave_too_much_alone_are_evaluated_together() {
+        // Two expressions read at two offsets each; over a cap of 10 instructions, evaluating one
+        // leaves 11, both leave 7.
+        let first = expression();
+        let second = vec![
+            instr(OpKind::Binary(BinOp::Mul), [Ref::Input(0), Ref::Scalar(1), Ref::Unused]),
+            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Scalar(0), Ref::Unused]),
+            instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(1), Ref::Unused, Ref::Unused]),
+        ];
+        let main = vec![
+            shift(slice(9, 1, 8), 0),
+            shift(slice(9, 0, 8), 0),
+            shift(slice(9, 1, 8), 1),
+            shift(slice(9, 0, 8), 1),
+            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(2), Ref::Tmp(3), Ref::Unused]),
+            instr(OpKind::Binary(BinOp::Mul), [Ref::Tmp(4), Ref::Tmp(5), Ref::Unused]),
+        ];
+        let key = key(main, vec![first, second]);
+        let (judgement, estimates) = judge(&key, 1 << 20, 10, &CostModel::TEST, &Tuning::for_tests(), false);
+        let Judgement::Materialise { subs, reason: SplitReason::Inlined { limit: 10, .. } } = &judgement else { panic!("{judgement:?} {estimates:?}") };
+        assert_eq!(subs, &[0, 1], "{estimates:?}");
+        // With room for the whole program nothing is cut.
+        let (judgement, estimates) = judge(&key, 1 << 20, 100, &CostModel::TEST, &Tuning::for_tests(), false);
+        assert!(matches!(judgement, Judgement::Run { staging: None }), "{judgement:?} {estimates:?}");
     }
 }
 
