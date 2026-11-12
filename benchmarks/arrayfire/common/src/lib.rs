@@ -20,6 +20,9 @@ pub struct Sizes {
     pub heat_steps: usize,
     pub life: Vec<usize>,
     pub life_steps: usize,
+    pub converge: Vec<usize>,
+    pub converge_steps: usize,
+    pub converge_tol: f32,
     pub bs: Vec<usize>,
     pub mandel: Vec<usize>,
     pub mandel_iters: usize,
@@ -35,6 +38,9 @@ pub fn sizes(quick: bool) -> Sizes {
             heat_steps: 100,
             life: vec![1024],
             life_steps: 100,
+            converge: vec![256],
+            converge_steps: 200,
+            converge_tol: 1e-30,
             bs: vec![1 << 20],
             mandel: vec![512],
             mandel_iters: 64,
@@ -48,6 +54,9 @@ pub fn sizes(quick: bool) -> Sizes {
             heat_steps: 100,
             life: vec![1024, 4096, 8192],
             life_steps: 100,
+            converge: vec![256, 1024],
+            converge_steps: 200,
+            converge_tol: 1e-30,
             bs: vec![1 << 24, 1 << 26],
             mandel: vec![1024, 4096],
             mandel_iters: 256,
@@ -62,17 +71,19 @@ pub struct Args {
     pub quick: bool,
     pub only: Option<String>,
     pub backend: Option<String>,
+    pub label: Option<String>,
 }
 
 pub fn parse_args() -> Args {
-    let mut args = Args { quick: false, only: None, backend: None };
+    let mut args = Args { quick: false, only: None, backend: None, label: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--quick" => args.quick = true,
             "--only" => args.only = Some(it.next().expect("--only needs a workload")),
             "--backend" => args.backend = Some(it.next().expect("--backend needs a value")),
-            other => panic!("unknown argument {other:?} (flags: --quick, --only <workload>, --backend <cuda|opencl|cpu>)"),
+            "--label" => args.label = Some(it.next().expect("--label needs a value")),
+            other => panic!("unknown argument {other:?} (flags: --quick, --only <workload>, --backend <cuda|opencl|cpu>, --label <name>)"),
         }
     }
     args
@@ -330,6 +341,14 @@ pub fn time(mut f: impl FnMut()) -> Timing {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median_ms = if reps % 2 == 1 { samples[reps / 2] } else { 0.5 * (samples[reps / 2 - 1] + samples[reps / 2]) };
     Timing { median_ms, min_ms: samples[0], reps }
+}
+
+/// One call, no warm-up: the cold cost including first-use compilation. The closure must include device completion.
+pub fn time_once(f: impl FnOnce()) -> Timing {
+    let t = Instant::now();
+    f();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    Timing { median_ms: ms, min_ms: ms, reps: 1 }
 }
 
 pub fn print_header() {

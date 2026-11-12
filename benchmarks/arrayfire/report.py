@@ -4,9 +4,10 @@ import csv
 import sys
 from collections import OrderedDict
 
-WORKLOADS = ["heat", "life", "blackscholes", "mandelbrot", "fir"]
+WORKLOADS = ["heat", "converge", "life", "blackscholes", "mandelbrot", "fir"]
 TITLES = {
     "heat": "Heat diffusion (periodic 5-point stencil)",
+    "converge": "Heat diffusion with a convergence readback every step",
     "life": "Game of Life (torus, f32 cells)",
     "blackscholes": "Black-Scholes call prices",
     "mandelbrot": "Mandelbrot (array-level, fixed iterations)",
@@ -14,7 +15,7 @@ TITLES = {
 }
 
 
-EXCLUDED = {"custom_kernel"}
+EXCLUDED = {"custom_kernel", "lazy_chain", "per_step_cold", "eval_every_1_cold"}
 
 
 def pairs(workload, variants):
