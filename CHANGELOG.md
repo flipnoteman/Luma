@@ -42,6 +42,15 @@ All notable changes to Luma are listed here. The format follows
   with the (block) Thomas algorithm; `Array::scan(axis, op)`, `cumsum`, `sum_axis`, `min_axis` and
   `max_axis` scan or reduce along an axis (the scan operator is an elementwise closure of two
   arguments, traced once and compiled into the scan kernels).
+- Cyclic-reduction path of `solve_tridiagonal` / `solve_block_tridiagonal` (and the `_from`
+  variants) for few, long lines: one workgroup solves a line in workgroup memory (rows beyond
+  `Tuning::line_bytes` spill to a global scratch buffer) instead of one invocation walking it
+  serially. Chosen automatically on NVIDIA GPUs when there are few lines (up to 8192 scalar lines
+  along the contiguous axis, fewer for strided lines and bigger blocks); the Thomas solve stays
+  for many lines and on other devices, where the choice is not measured. Same API;
+  `LUMA_TRIDIAGONAL=thomas|cyclic` forces one. RTX 3090 (`bench_pde -- --only tri/few_lines`):
+  200 lines of 4096 along axis 0 1.3 ms to 0.07 ms, along axis 1 2.0 to 0.12 ms; 100 lines of 1024
+  with 4x4 blocks 1.7 to 0.26 ms (axis 1) and 1.5 to 0.29 ms (axis 2).
 - `iterate_until_all(init, Until, step)`: loops a record of arrays until a stop rule holds, with the
   rule evaluated on the GPU between steps. `Until::new(max_steps)` takes `record(name, f)` (a
   one-element array computed from the state after every step, kept as history), `stop_when(f)`

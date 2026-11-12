@@ -46,6 +46,7 @@ mod array;
 mod builtin;
 mod context;
 mod conv;
+mod cyclic;
 mod error;
 mod fields;
 #[cfg(test)]

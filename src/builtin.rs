@@ -268,6 +268,11 @@ pub(crate) enum Builtin {
     /// size (1 = scalar), `starts` whether every line begins at its own cell, `workgroup` the
     /// invocations per workgroup (see [`tridiagonal_workgroup`]).
     Tridiagonal { block: u8, starts: bool, workgroup: u8 },
+    /// Cyclic-reduction solves, one workgroup per line; see [`crate::cyclic`]. `block` and
+    /// `starts` as for [`Builtin::Tridiagonal`], `workgroup` the invocations per workgroup, rows
+    /// that are a multiple of `1 << shift` live in workgroup memory (`shared_rows` of them), the
+    /// others in a scratch buffer.
+    CyclicTridiagonal { block: u8, starts: bool, workgroup: u16, shift: u8, shared_rows: u32 },
     /// `out[i] = 1` where word `i` of `a` is a NaN or an infinity (as `f32` bits), else 0;
     /// arguments: out, a. Element type `"u32"`. See `jit::check_finite`.
     NonFinite,
@@ -995,6 +1000,9 @@ impl Builtin {
             Builtin::Fft(pass) => crate::fft::source(pass).into(),
             Builtin::UntilGate => UNTIL_GATE.into(),
             Builtin::Tridiagonal { block, starts, workgroup } => tridiagonal(block as u32, starts, u32::from(workgroup)).into(),
+            Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
+                crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows).into()
+            }
             Builtin::NonFinite => format!(
                 "@group(1) @binding(0) var<storage, read_write> out: array<u32>;
 @group(1) @binding(1) var<storage, read> a: array<u32>;
