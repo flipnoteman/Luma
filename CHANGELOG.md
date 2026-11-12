@@ -237,6 +237,10 @@ All notable changes to Luma are listed here. The format follows
 - An array sharing the buffer of a view that was evaluated before a write through the view (the
   result of `v.cache()`) kept the old data: the write gave the view a replacement expression and
   left the buffer alone. The buffer is now overwritten with the written data.
+- A write through a view taken from a lazy array after a lazy slice write into it was lost when
+  the array was then updated with `x /= c` (or another compound assignment): the update rebound
+  the array to a new expression the view did not write into. An array a view of its replaced
+  expression was taken from is now updated in place.
 
 ## [0.2.0] - 2026-11-11
 

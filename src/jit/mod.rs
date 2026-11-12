@@ -719,9 +719,21 @@ impl Held {
         &self.end().node
     }
 
-    /// Whether another array holds a claim on the node too.
+    /// Whether another array holds a claim on the node too, or on a node that replaced it (see
+    /// [`supersede`]): a view taken from the replacement writes into the value this array
+    /// denotes, so rebinding the array to a new expression would not reach it. The chain holds
+    /// one claim of its own on every replacement.
     pub(crate) fn is_shared(&self) -> bool {
-        self.node.handles.load(Ordering::Relaxed) > 1
+        let mut held = self;
+        loop {
+            if held.node.handles.load(Ordering::Relaxed) > 1 {
+                return true;
+            }
+            match held.link.next.get() {
+                Some(next) => held = next,
+                None => return false,
+            }
+        }
     }
 }
 
