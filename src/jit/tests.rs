@@ -779,3 +779,232 @@ fn requesting_an_array_many_times_keeps_one_entry() {
     assert_eq!(ctx.jit().requested_len(), 0);
     assert!(y.pending().is_none());
 }
+
+/// `x = x * 0.5 + y; y = y * 0.9 + 0.1` on the CPU; the states after every step.
+fn elementwise_steps(xs: &[f32], ys: &[f32], steps: usize) -> Vec<(Vec<f32>, Vec<f32>)> {
+    let (mut x, mut y) = (xs.to_vec(), ys.to_vec());
+    let mut states = Vec::new();
+    for _ in 0..steps {
+        for (x, y) in x.iter_mut().zip(&y) {
+            *x = *x * 0.5 + y;
+        }
+        y.iter_mut().for_each(|y| *y = *y * 0.9 + 0.1);
+        states.push((x.clone(), y.clone()));
+    }
+    states
+}
+
+#[test]
+fn an_eval_loop_of_an_elementwise_step_runs_as_one_loop() {
+    let ctx = Context::new().unwrap();
+    ctx.set_assume_busy(true);
+    let (xs, ys) = (values(4096, 60, 0.5, 1.5), values(4096, 61, 0.5, 1.5));
+    let (mut x, mut y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+
+    let before = ctx.jit().stats();
+    for _ in 0..50 {
+        x = &x * 0.5 + &y;
+        y = &y * 0.9 + 0.1;
+        crate::ops::eval_all(&[&x, &y]).unwrap();
+    }
+    ctx.sync().unwrap();
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert!(launches <= 3, "{launches} kernels for 50 steps");
+
+    let (want_x, want_y) = elementwise_steps(&xs, &ys, 50).pop().unwrap();
+    assert_close(&x.to_vec().unwrap(), &want_x, 1e-5, 1e-5);
+    assert_close(&y.to_vec().unwrap(), &want_y, 1e-5, 1e-5);
+}
+
+fn heat_step(u: &Array<f32>) -> Array<f32> {
+    let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - u * 4.0;
+    u + lap * 0.2
+}
+
+#[test]
+fn an_eval_loop_of_a_shift_step_runs_time_blocked() {
+    let ctx = Context::new().unwrap();
+    ctx.set_assume_busy(true);
+    let g = Array::from_slice_on(&ctx, &values(64 * 64, 62, 0.0, 1.0), [64, 64]).unwrap();
+
+    let before = ctx.jit().stats();
+    let mut u = &g * 1.0;
+    for _ in 0..100 {
+        u = heat_step(&u);
+        u.eval().unwrap();
+    }
+    ctx.sync().unwrap();
+    let got = u.to_vec().unwrap();
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert!(launches < 20, "{launches} kernels for 100 steps");
+
+    let want = g.iterate(100, heat_step).to_vec().unwrap();
+    assert_close(&got, &want, 1e-6, 1e-6);
+}
+
+#[test]
+fn a_kept_intermediate_state_keeps_its_value() {
+    let ctx = Context::new().unwrap();
+    ctx.set_assume_busy(true);
+    let (xs, ys) = (values(1024, 63, 0.5, 1.5), values(1024, 64, 0.5, 1.5));
+    let (mut x, mut y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+
+    let mut kept = None;
+    for i in 0..50 {
+        x = &x * 0.5 + &y;
+        y = &y * 0.9 + 0.1;
+        crate::ops::eval_all(&[&x, &y]).unwrap();
+        if i == 9 {
+            kept = Some(&x * 1.0);
+        }
+    }
+    let states = elementwise_steps(&xs, &ys, 50);
+    assert_close(&kept.unwrap().to_vec().unwrap(), &states[9].0, 1e-5, 1e-5);
+    assert_close(&x.to_vec().unwrap(), &states[49].0, 1e-5, 1e-5);
+    assert_close(&y.to_vec().unwrap(), &states[49].1, 1e-5, 1e-5);
+}
+
+#[test]
+fn writing_a_fixed_input_after_a_compressed_loop_does_not_change_it() {
+    let ctx = Context::new().unwrap();
+    ctx.set_assume_busy(true);
+    let (xs, cs) = (values(512, 65, 0.5, 1.5), values(512, 66, 0.5, 1.5));
+    let mut c = f32s(&ctx, &cs);
+    let mut x = f32s(&ctx, &xs);
+    for _ in 0..30 {
+        x = &x * 0.5 + &c;
+        x.eval().unwrap();
+    }
+    c.write(&vec![1.0; 512]).unwrap();
+
+    let want: Vec<f32> = xs.iter().zip(&cs).map(|(&x, &c)| (0..30).fold(x, |x, _| x * 0.5 + c)).collect();
+    assert_close(&x.to_vec().unwrap(), &want, 1e-5, 1e-5);
+    assert_eq!(c.to_vec().unwrap(), vec![1.0; 512]);
+}
+
+#[test]
+fn a_scalar_that_changes_every_step_still_gives_the_right_result() {
+    let ctx = Context::new().unwrap();
+    ctx.set_assume_busy(true);
+    let xs = values(777, 67, 0.5, 1.5);
+    let mut x = f32s(&ctx, &xs);
+    let mut want = xs.clone();
+    for k in 0..40 {
+        let dt = 0.5 + k as f32 * 0.001;
+        x = &x * dt + 1.0;
+        x.eval().unwrap();
+        want.iter_mut().for_each(|w| *w = *w * dt + 1.0);
+    }
+    assert_close(&x.to_vec().unwrap(), &want, 1e-5, 1e-5);
+}
+
+#[test]
+fn kernels_built_stay_bounded_for_long_eval_loops() {
+    let ctx = Context::new().unwrap();
+    let w = 128;
+    let (dx, dy) = (3.2 / w as f32, 2.8 / w as f32);
+    let cxs: Vec<f32> = (0..w * w).map(|i| -2.2 + (i % w) as f32 * dx).collect();
+    let cys: Vec<f32> = (0..w * w).map(|i| -1.4 + (i / w) as f32 * dy).collect();
+    let iters = 200;
+    let cx = Array::from_slice_on(&ctx, &cxs, [w, w]).unwrap();
+    let cy = Array::from_slice_on(&ctx, &cys, [w, w]).unwrap();
+    let zero = Array::<f32>::full_on(&ctx, [w, w], 0.0).unwrap();
+
+    let before = ctx.jit().stats();
+    let (mut zx, mut zy, mut cnt) = (&zero * 1.0, &zero * 1.0, &zero * 1.0);
+    for _ in 0..iters {
+        let inside = (&zx * &zx + &zy * &zy).le(4.0);
+        let nzx = &zx * &zx - &zy * &zy + &cx;
+        let nzy = &zx * &zy * 2.0 + &cy;
+        zx = select(&inside, &nzx, &zx);
+        zy = select(&inside, &nzy, &zy);
+        cnt = &cnt + select(&inside, 1.0, 0.0);
+        crate::ops::eval_all(&[&zx, &zy, &cnt]).unwrap();
+    }
+    let got = cnt.to_vec().unwrap();
+    let built = delta(before, ctx.jit().stats()).built;
+    assert!(built <= 8, "{built} kernels built for {iters} steps");
+
+    let want: Vec<f32> = cxs
+        .iter()
+        .zip(&cys)
+        .map(|(&cx, &cy)| {
+            let (mut x, mut y, mut count) = (0.0f32, 0.0f32, 0.0f32);
+            for _ in 0..iters {
+                if x * x + y * y <= 4.0 {
+                    (x, y) = (x * x - y * y + cx, x * y * 2.0 + cy);
+                    count += 1.0;
+                }
+            }
+            count
+        })
+        .collect();
+    let mismatched = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+    assert!((mismatched as f32) < want.len() as f32 * 0.01, "{mismatched} of {} pixels differ", want.len());
+}
+
+#[test]
+fn an_eval_loop_of_a_shift_step_over_two_states_matches_the_cpu() {
+    let ctx = Context::new().unwrap();
+    ctx.set_assume_busy(true);
+    let n = 500;
+    let (xs, ys) = (values(n, 70, 0.0, 1.0), values(n, 71, 0.0, 1.0));
+    let (mut a, mut b) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+    let (mut want_a, mut want_b) = (xs.clone(), ys.clone());
+    for _ in 0..30 {
+        let (next_a, next_b) = (&a + b.shift(1) * 0.1, &b * 0.99 + a.shift(-1) * 0.05);
+        (a, b) = (next_a, next_b);
+        crate::ops::eval_all(&[&a, &b]).unwrap();
+        let (old_a, old_b) = (want_a.clone(), want_b.clone());
+        for i in 0..n {
+            want_a[i] = old_a[i] + old_b[(i + n - 1) % n] * 0.1;
+            want_b[i] = old_b[i] * 0.99 + old_a[(i + 1) % n] * 0.05;
+        }
+    }
+    assert_close(&a.to_vec().unwrap(), &want_a, 1e-5, 1e-5);
+    assert_close(&b.to_vec().unwrap(), &want_b, 1e-5, 1e-5);
+}
+
+#[test]
+fn an_eval_loop_over_chunked_arrays_matches_the_cpu() {
+    let options = crate::ContextOptions::default().chunk_bytes(1 << 12);
+    let ctx = Context::with_options(options).unwrap();
+    ctx.set_assume_busy(true);
+    let n = 10_000;
+    let (xs, ys) = (values(n, 72, 0.5, 1.5), values(n, 73, 0.5, 1.5));
+    let (mut x, mut y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+    for _ in 0..30 {
+        x = &x * 0.5 + &y;
+        y = &y * 0.9 + 0.1;
+        crate::ops::eval_all(&[&x, &y]).unwrap();
+    }
+    let (want_x, want_y) = elementwise_steps(&xs, &ys, 30).pop().unwrap();
+    assert_close(&x.to_vec().unwrap(), &want_x, 1e-5, 1e-5);
+    assert_close(&y.to_vec().unwrap(), &want_y, 1e-5, 1e-5);
+}
+
+#[test]
+fn reading_back_in_the_middle_of_an_eval_loop_gives_the_right_values() {
+    let ctx = Context::new().unwrap();
+    ctx.set_assume_busy(true);
+    let start = values(32 * 32, 74, 0.0, 1.0);
+    let g = Array::from_slice_on(&ctx, &start, [32, 32]).unwrap();
+    let mut u = &g * 1.0;
+    let mut want = start;
+    for i in 0..60 {
+        u = heat_step(&u);
+        u.eval().unwrap();
+        let old = want.clone();
+        for (j, w) in want.iter_mut().enumerate() {
+            let (x, y) = (j % 32, j / 32);
+            let at = |x: usize, y: usize| old[x % 32 + (y % 32) * 32];
+            let lap = at(x + 31, y) + at(x + 1, y) + at(x, y + 31) + at(x, y + 1) - old[j] * 4.0;
+            *w = old[j] + lap * 0.2;
+        }
+        // A read-back ends the compressed loop; the next steps start another one.
+        if i % 7 == 0 {
+            assert_close(&u.to_vec().unwrap(), &want, 1e-4, 1e-4);
+        }
+    }
+    assert_close(&u.to_vec().unwrap(), &want, 1e-4, 1e-4);
+}

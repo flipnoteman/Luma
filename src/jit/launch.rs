@@ -41,24 +41,38 @@ pub(crate) fn run_loop(
     let ids: Vec<u64> = probes.iter().map(|probe| probe.id()).collect();
     let fused = flatten_inner(&roots, Tail::Store, &ids).ok()?;
     drop(roots);
-    let key = &fused.key;
-    let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
-    let all_f32 = key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| i.op.out_ty() == ElemTy::F32));
-    if probes.iter().any(|probe| probe.was_materialized())
-        || shifts
-        || !key.subs.is_empty()
-        || !all_f32
-        || fused.inputs.iter().any(|input| input.segments() != 1)
-    {
+    if probes.iter().any(|probe| probe.was_materialized()) {
         return None;
     }
     let states: Vec<Option<usize>> =
         fused.inputs.iter().map(|input| probes.iter().position(|probe| Arc::ptr_eq(probe, input))).collect();
-    let bindings = 2 * outs.len() + states.iter().filter(|state| state.is_none()).count();
+    run_loop_fused(ctx, &fused, &states, inits, steps)
+}
+
+/// Runs `steps` iterations of the store program `fused` (one output per state, `outputs[j]` the
+/// next value of state `j`) in one kernel that keeps the states in registers. `states[k]` is the
+/// state that input `k` reads (`None`: an input that stays fixed) and `inits` the states before
+/// the first step. `None` if the program is not a single-buffer elementwise program of `f32`
+/// values.
+pub(super) fn run_loop_fused(
+    ctx: &crate::context::Context,
+    fused: &Fused,
+    states: &[Option<usize>],
+    inits: &[Arc<Storage>],
+    steps: u32,
+) -> Option<Result<Vec<Arc<Storage>>, Failure>> {
+    let key = &fused.key;
+    let len = usize::try_from(inits.first()?.byte_len() / ELEMENT_BYTES).ok()?;
+    let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
+    let all_f32 = key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| i.op.out_ty() == ElemTy::F32));
+    if shifts || !key.subs.is_empty() || !all_f32 || fused.inputs.iter().any(|input| input.segments() != 1) {
+        return None;
+    }
+    let bindings = 2 * key.outputs.len() + states.iter().filter(|state| state.is_none()).count();
     if bindings > ctx.jit().max_inputs + 1 {
         return None;
     }
-    let source = super::codegen::loop_source(key, &states, ctx.tuning());
+    let source = super::codegen::loop_source(key, states, ctx.tuning());
     let label = format!("Loop{}", key.label().trim_start_matches("Fused"));
     let budget = ctx.jit().loop_work.load(Ordering::Relaxed);
     let per_launch = budget / (len as u64 * key.instrs.len().max(1) as u64).max(1);
@@ -69,7 +83,7 @@ pub(crate) fn run_loop(
         let mut remaining = steps;
         while remaining > 0 {
             let count = remaining.min(per_launch);
-            let outputs = launch_loop(ctx, &core, &fused, &states, &states_now, len, count)?;
+            let outputs = launch_loop(ctx, &core, fused, states, &states_now, len, count)?;
             states_now = outputs.into_iter().map(Arc::new).collect();
             remaining -= count;
         }
@@ -152,6 +166,10 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
 /// Evaluates the pending ones of `nodes` (all of the same length) in one fused kernel with one
 /// output per node. Failures are stored in the nodes, as [`Node::force`] does.
 pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
+    // A loop leaf has no operands to fuse: running its plan is its evaluation.
+    for node in nodes.iter().filter(|node| node.is_pending() && node.looped.get().is_some()) {
+        let _ = node.force();
+    }
     let roots: Vec<(Arc<Node>, Args)> = nodes
         .iter()
         .filter(|node| node.is_pending())
@@ -451,7 +469,7 @@ fn launch_store(
 /// Runs the store kernel of `fused` over `len` elements, one new buffer per output. A single
 /// output takes over the buffer of an input that nothing else holds (see [`in_place_eligible`]),
 /// instead of a new one.
-fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
+pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
     fused.mark_fused();
     let Fused { mut key, mut inputs, scalars, fused_nodes } = fused;
     // The fused nodes hold their operands; a dying input is only uniquely owned without them.

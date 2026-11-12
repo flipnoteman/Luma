@@ -70,6 +70,9 @@ struct Inner {
     waits: WaitHistory,
     /// The first error the GPU reported outside of a call that could return it.
     gpu_error: Arc<Mutex<Option<String>>>,
+    /// Tests: report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
+    #[cfg(test)]
+    assume_busy: std::sync::atomic::AtomicBool,
     /// Layout of `@group(0)`: the grid uniform, at a dynamic offset into the arena.
     grid_layout: wgpu::BindGroupLayout,
     /// Largest buffer that can be allocated *and* bound as a storage buffer.
@@ -331,6 +334,8 @@ impl Context {
                 batch: Mutex::new(batch),
                 waits: WaitHistory::new(),
                 gpu_error,
+                #[cfg(test)]
+                assume_busy: std::sync::atomic::AtomicBool::new(false),
                 grid_layout,
                 max_buffer_bytes,
             }),
