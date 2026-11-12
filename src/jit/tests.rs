@@ -2599,3 +2599,187 @@ fn an_array_computed_inside_another_arrays_kernel_is_evaluated_before_a_traced_l
     close(n.to_vec().unwrap(), &host_n);
     close(r.to_vec().unwrap(), &host_r);
 }
+
+// ---- Risk areas (plan step 6d.4): supersede chains, postponed stencil chains, writes between speculated readbacks.
+
+/// One step of a padded state whose clones are assigned through slices: the second assignment
+/// supersedes the expression the first clone holds (`Held::latest`), the first clone is read after both.
+fn clone_assign_step(u: &Array<f32>) -> Array<f32> {
+    use crate::view::PadMode;
+    let n = u.len();
+    let w = u.pad([(1, 1)], PadMode::Edge);
+    let (left, right) = (w.clone(), w.clone());
+    left.slice(0, ..1).assign(0.5).unwrap();
+    right.slice(0, n + 1..).assign(0.25).unwrap();
+    (w.slice(0, 1..n + 1) * 0.5 + left.slice(0, ..n) * 0.25 + right.slice(0, 2..n + 2) * 0.25) * 0.99 + 0.001
+}
+
+fn clone_assign_host(u: &[f32]) -> Vec<f32> {
+    let n = u.len();
+    let w: Vec<f32> = std::iter::once(0.5).chain(u.iter().copied()).chain(std::iter::once(0.25)).collect();
+    (0..n).map(|i| (0.5 * w[i + 1] + 0.25 * w[i] + 0.25 * w[i + 2]) * 0.99 + 0.001).collect()
+}
+
+/// Clones of a lazy padded state, assigned through slices inside a per-step `eval` loop (with the
+/// evaluation postponed or not, and under tight node limits) and inside a traced `iterate_all`.
+#[test]
+fn clones_of_a_lazy_state_assigned_through_slices_in_loop_steps_keep_their_values() {
+    let xs = values(40, 150, 0.0, 1.0);
+    for (busy, max_nodes) in [(false, 1024), (true, 1024), (true, 4), (false, 2)] {
+        let ctx = ctx();
+        ctx.set_assume_busy(busy);
+        ctx.jit().set_max_nodes(max_nodes);
+        let mut u = f32s(&ctx, &xs);
+        let mut w = xs.clone();
+        for step in 0..30 {
+            u = clone_assign_step(&u);
+            u.eval().unwrap();
+            w = clone_assign_host(&w);
+            if step % 9 == 8 {
+                assert_close(&u.to_vec().unwrap(), &w, 1e-4, 1e-5);
+            }
+        }
+        assert_close(&u.to_vec().unwrap(), &w, 1e-4, 1e-5);
+
+        let [r] = crate::iterate_all([&f32s(&ctx, &xs)], 12, |[u]| [clone_assign_step(u)]);
+        let mut w = xs.clone();
+        for _ in 0..12 {
+            w = clone_assign_host(&w);
+        }
+        assert_close(&r.to_vec().unwrap(), &w, 1e-4, 1e-5);
+    }
+}
+
+/// A 1-D stencil step through slices and shifts of the previous (postponed) result, two states.
+fn chain_step(u: &Array<f32>, v: &Array<f32>) -> (Array<f32>, Array<f32>) {
+    let nu = (u.shift(1) + u.shift(-1)) * 0.25 + u * 0.5 + v * 0.01;
+    let nv = v * 0.9 + nu.slice(0, 1..).pad([(0, 1)], crate::view::PadMode::Edge) * 0.1;
+    (nu, nv)
+}
+
+fn chain_host(u: &[f32], v: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let n = u.len();
+    let nu: Vec<f32> = (0..n).map(|i| (u[(i + 1) % n] + u[(i + n - 1) % n]) * 0.25 + u[i] * 0.5 + v[i] * 0.01).collect();
+    let nv = (0..n).map(|i| v[i] * 0.9 + nu[(i + 1).min(n - 1)] * 0.1).collect();
+    (nu, nv)
+}
+
+/// With the device assumed busy every `eval` is postponed, so each step's stencil reads the previous
+/// step's result while it is still pending: the chain must be cut and computed in order, however
+/// the pending steps pile up, and whatever readbacks and node limits interrupt them.
+#[test]
+fn postponed_stencil_chains_compute_in_order() {
+    let (xs, ys) = (values(48, 160, 0.0, 1.0), values(48, 161, 0.0, 1.0));
+    for max_nodes in [1024, 8, 2] {
+        for read_every in [0usize, 1, 5, 7] {
+            let ctx = ctx();
+            ctx.set_assume_busy(true);
+            ctx.jit().set_max_nodes(max_nodes);
+            let (mut u, mut v) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+            let (mut hu, mut hv) = (xs.clone(), ys.clone());
+            for step in 1..=25 {
+                (u, v) = chain_step(&u, &v);
+                u.eval().unwrap();
+                v.eval().unwrap();
+                (hu, hv) = chain_host(&hu, &hv);
+                if read_every != 0 && step % read_every == 0 {
+                    assert_close(&u.to_vec().unwrap(), &hu, 1e-4, 1e-5);
+                }
+            }
+            assert_close(&u.to_vec().unwrap(), &hu, 1e-4, 1e-5);
+            assert_close(&v.to_vec().unwrap(), &hv, 1e-4, 1e-5);
+        }
+    }
+}
+
+/// Two-dimensional steps requested while nothing ran in between with the euler step's views.
+#[test]
+fn postponed_2d_stencil_steps_read_through_views_compute_in_order() {
+    let ctx = ctx();
+    ctx.set_assume_busy(true);
+    let g = f32s(&ctx, &values(24 * 20, 162, 0.0, 1.0));
+    let g = g.reshape([24, 20]);
+    let mut u = &g * 1.0;
+    for _ in 0..30 {
+        u = heat_step(&u);
+        u.eval().unwrap();
+    }
+    let want = g.iterate(30, heat_step).to_vec().unwrap();
+    assert_close(&u.to_vec().unwrap(), &want, 1e-5, 1e-5);
+}
+
+/// What happens to the input `c` of a step between two readbacks.
+#[derive(Clone, Copy, Debug)]
+enum Rewrite {
+    Write,
+    AssignSlice,
+    AssignScalar,
+}
+
+/// `check_readback_loop` where `c` is rewritten in several ways at `events` (step, rewrite) once the
+/// speculation has had steps to start; every error value and the final state are compared to the host.
+fn check_readback_loop_with_writes(ctx: &Context, steps: usize, events: &[(usize, Rewrite)]) {
+    const W: usize = 32;
+    let u0 = values(W * W, 90, 0.0, 1.0);
+    let mut source = values(W * W, 91, 0.0, 1.0);
+    let c = Array::from_slice_on(ctx, &source, [W, W]).unwrap();
+    let mut u = &Array::from_slice_on(ctx, &u0, [W, W]).unwrap() * 1.0;
+    let mut cpu = u0;
+    for k in 0..steps {
+        for &(at, how) in events.iter().filter(|e| e.0 == k) {
+            match how {
+                Rewrite::Write => {
+                    source = values(W * W, 92 + at as u64, 0.0, 1.0);
+                    c.clone().write(&source).unwrap();
+                }
+                Rewrite::AssignSlice => {
+                    c.slice(0, 4..8).slice(1, 2..30).assign(0.75).unwrap();
+                    for i in 4..8 {
+                        for j in 2..30 {
+                            source[j * W + i] = 0.75; // axis 0 is the contiguous one
+                        }
+                    }
+                }
+                Rewrite::AssignScalar => {
+                    c.assign(0.125).unwrap();
+                    source.iter_mut().for_each(|s| *s = 0.125);
+                }
+            }
+        }
+        let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - &u * 4.0;
+        let next = &u + lap * 0.2 + &c * 0.01;
+        let err = (&next - &u).abs().max().item().unwrap();
+        u = next;
+
+        let at = |i: usize, j: usize| cpu[i % W * W + j % W];
+        let mut new = vec![0.0f32; W * W];
+        for i in 0..W {
+            for j in 0..W {
+                let lap = at(i + 1, j) + at(i + W - 1, j) + at(i, j + 1) + at(i, j + W - 1) - at(i, j) * 4.0;
+                new[i * W + j] = at(i, j) + lap * 0.2 + source[i * W + j] * 0.01;
+            }
+        }
+        let want = new.iter().zip(&cpu).map(|(n, o)| (n - o).abs()).fold(0.0, f32::max);
+        assert!((err - want).abs() <= 1e-4 * want + 1e-6, "step {k} ({events:?}): err {err}, want {want}");
+        cpu = new;
+    }
+    assert_close(&u.to_vec().unwrap(), &cpu, 1e-4, 1e-5);
+}
+
+/// A write, a slice assignment or a fill of an input of the step between two readbacks, after the
+/// speculation has started answering readbacks ahead of time: the prediction made before the write
+/// must not be used for the readback after it, and the speculation may start again afterwards.
+#[test]
+fn writes_between_speculated_readbacks_are_seen_by_the_next_readback() {
+    for events in [
+        &[(20, Rewrite::AssignSlice)][..],
+        &[(20, Rewrite::AssignScalar)],
+        &[(15, Rewrite::Write), (16, Rewrite::AssignSlice), (30, Rewrite::AssignScalar)],
+        &[(12, Rewrite::AssignSlice), (13, Rewrite::AssignSlice), (14, Rewrite::Write), (15, Rewrite::Write)],
+        &[(10, Rewrite::Write), (20, Rewrite::Write), (30, Rewrite::Write)],
+    ] {
+        let ctx = ctx();
+        check_readback_loop_with_writes(&ctx, 45, events);
+        assert!(ctx.jit().speculation_hits() > 0, "{events:?}: no readback was answered ahead of time");
+    }
+}
