@@ -30,6 +30,7 @@ libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.8"
+proptest = "1"
 rustfft = "6"
 
 [[bench]]

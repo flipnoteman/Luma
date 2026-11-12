@@ -1,19 +1,52 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  schedule:
+    # The long fuzz run, nightly.
+    - cron: "0 3 * * *"
+
+env:
+  LUMA_DEVICE: cpu
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install software Vulkan (Mesa lavapipe)
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
-      - run: cargo build --all-targets --locked
+        run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+      - run: cargo test --locked
       - run: cargo test --release --locked
+      - run: cargo install cargo-nextest --locked
+      - run: cargo nextest run --locked
+      - run: cargo nextest run --release --locked
+      - name: Differential fuzzer
+        run: cargo test --release --locked fuzz::
         env:
-          LUMA_DEVICE: cpu
+          LUMA_FUZZ_CASES: 200
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  fuzz:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install software Vulkan (Mesa lavapipe)
+        run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+      - name: Differential fuzzer, long run
+        run: cargo test --release --locked fuzz:: -- --nocapture
+        env:
+          LUMA_FUZZ_CASES: 5000
+      - name: Keep the shrunk failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions
+          path: proptest-regressions/

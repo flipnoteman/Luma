@@ -48,6 +48,8 @@ mod context;
 mod conv;
 mod error;
 mod fields;
+#[cfg(test)]
+mod fuzz;
 mod fft;
 mod generate;
 mod gpu;
