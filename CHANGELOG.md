@@ -62,6 +62,17 @@ All notable changes to Luma are listed here. The format follows
   346 us -> 8 launches / 38-47 us GPU (hand-cached `Fluxes`: 12 / 53 us); steady us/iteration
   f32 252 -> 31 (`Fluxes` 46), `Df32` 1123 -> 536 (`Fluxes` 250). `euler/until_all` of `bench_pde` 454 -> 204 launches
   (2048x2048: 72 -> 18 ms), `muscl` 16-29% faster.
+- The cost model prices what small kernels really cost: a kernel whose invocations do not keep
+  the arithmetic units busy (fewer than twice the calibrated f32 operations per nanosecond: 20 000
+  cells on an RTX 3090 run at a fraction of the calibrated throughput) is slower by that factor,
+  and a staged region is computed in whole rounds of the workgroup (272 cells over 256 invocations
+  are two rounds, not 1.06). Both fit the measurements of the `Df32` flux kernels of
+  bowshock-lazy (one staged residual kernel: estimated 134 us, measured 135 us), so the search
+  now evaluates the fluxes first (the fields of each direction as one group, also when what is
+  left would fit) instead of staging them with the padded state recomputed in halos. The seeds of
+  the search are the best sub-program of each length, and a reduction waits for the arrays `eval`
+  asked for. bowshock-lazy `Staging::Fusion` `Df32`, 200x100: residual of a stored state 135 us
+  -> 77 us (hand-cached `Fluxes`: 57-65 us), RK3 step 730-790 us -> 527 us (`Fluxes` 223-250 us).
 - `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
   `Df32` and `f64` arithmetic), measured when a context opens (once per machine, see the cache;
   `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).

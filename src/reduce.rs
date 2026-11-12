@@ -64,6 +64,10 @@ impl Reduced {
     }
 
     fn record(&self, ctx: &Context) -> Result<Arc<Storage>> {
+        // The arrays `eval` asked for and a submission postponed are computed first: a reduction that
+        // shares work with them (the residual of a step is summed, and is also what the update of
+        // the state reads) then reads it from their kernel instead of computing it alone.
+        ctx.jit().evaluate_requested();
         let count = self.ops.as_slice().len();
         let storage = Arc::new(Storage::new(ctx, count, self.elem as usize));
         let pin = storage.pin(0)?;
