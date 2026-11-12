@@ -12,6 +12,13 @@
 //! In the **math** domain inputs are arbitrary floats, `/ sqrt exp ...` are allowed, values stay
 //! in `[-1e4, 1e4]` away from the poles, and results compare with a tolerance; comparisons,
 //! `floor` and `select` masks need exact operands.
+//!
+//! The math domain also tracks a bound on how far the engine's values can be from the oracle's
+//! (`Info::err`: rounding, the engine's less accurate functions, the order of additions in a
+//! reduction) and does not build a value whose bound exceeds what its comparison tolerates. So
+//! an ill-conditioned operation (`cos` of a large sum, a division by a small number, `atan2` at
+//! the origin) is only generated where the operand's discrepancy cannot be amplified past the
+//! tolerance: a failure in this domain is a real difference, not a conditioning artefact.
 
 use luma::PadMode;
 use proptest::prelude::*;
@@ -226,13 +233,25 @@ impl Tape {
 // -- Value bounds --
 
 /// What is known about the values of an array: they are multiples of `2^lsb` within `lo..=hi`,
-/// and `exact` says that every `f32` operation on them is exact (few enough bits).
+/// `exact` says that every `f32` operation on them is exact (few enough bits), and `err` bounds
+/// how far the engine's value can be from the oracle's (math domain only, zero in the exact one).
+///
+/// The error bound exists because the comparison tolerance (`abs 1e-4 + rel 2e-3`) is only
+/// sound for the value itself: an ill-conditioned consumer (`cos` of a sum near a zero of cos,
+/// a division by a small number, `atan2` near the origin) amplifies a discrepancy the earlier
+/// operations are allowed to have. The discrepancy comes from the engine's functions being less
+/// accurate than the oracle's (WGSL allows many ulps for `atan2`, `sin`, `exp`, ...; llvmpipe's
+/// `atan2` is off by about 5e-6 at 0.78), from reductions adding in another order than the
+/// oracle, and from `f32` rounding. A value whose bound exceeds what its own comparison would
+/// accept is not generated (see `finish`), so no consumer ever sees an operand it cannot
+/// tolerate.
 #[derive(Clone, Copy, Debug)]
 struct Info {
     lsb: i32,
     lo: f64,
     hi: f64,
     exact: bool,
+    err: f64,
 }
 
 impl Info {
@@ -252,14 +271,14 @@ impl Info {
 
     /// Bounds of an integer array (wrapping arithmetic: nothing to track).
     fn int() -> Info {
-        Info { lsb: 0, lo: 0.0, hi: 4e9, exact: true }
+        Info { lsb: 0, lo: 0.0, hi: 4e9, exact: true, err: 0.0 }
     }
 
     fn of_const(c: f32) -> Info {
         let mut v = f64::from(c).abs();
         let mut lsb = 0;
         if v == 0.0 {
-            return Info { lsb: 0, lo: 0.0, hi: 0.0, exact: true };
+            return Info { lsb: 0, lo: 0.0, hi: 0.0, exact: true, err: 0.0 };
         }
         while v.fract() != 0.0 {
             v *= 2.0;
@@ -269,19 +288,45 @@ impl Info {
             v /= 2.0;
             lsb += 1;
         }
-        Info { lsb, lo: f64::from(c), hi: f64::from(c), exact: true }
+        Info { lsb, lo: f64::from(c), hi: f64::from(c), exact: true, err: 0.0 }
     }
 
     fn join(a: Info, b: Info) -> Info {
-        Info { lsb: a.lsb.min(b.lsb), lo: a.lo.min(b.lo), hi: a.hi.max(b.hi), exact: a.exact && b.exact }
+        Info { lsb: a.lsb.min(b.lsb), lo: a.lo.min(b.lo), hi: a.hi.max(b.hi), exact: a.exact && b.exact, err: a.err.max(b.err) }
     }
 
-    /// The values of `n` of them summed.
+    /// The values of up to `n` of them summed (a prefix sum).
     fn summed(self, n: usize) -> Info {
         let n = n as f64;
-        Info { lo: (self.lo * n).min(self.lo), hi: (self.hi * n).max(self.hi), ..self }
+        Info { lo: (self.lo * n).min(self.lo), hi: (self.hi * n).max(self.hi), err: self.sum_err(n), ..self }
+    }
+
+    /// The sum of exactly `n` of them.
+    fn total(self, n: usize) -> Info {
+        let n = n as f64;
+        Info { lo: self.lo * n, hi: self.hi * n, err: self.sum_err(n), ..self }
+    }
+
+    /// The discrepancy of a sum of `n` values: each term's, plus the other order of the
+    /// additions (`n` roundings of at most half an ulp of a partial sum, for both sides). Sums
+    /// of exact values are exact.
+    fn sum_err(self, n: f64) -> f64 {
+        let order = if self.exact { 0.0 } else { 2.0 * n * n * self.mag() * 2f64.powi(-24) };
+        n * self.err + order
+    }
+
+    /// The largest discrepancy the comparison of an array of these values accepts: the
+    /// tolerance is `abs + rel * |value|` and the value may be anywhere in `lo..=hi`.
+    fn budget(&self) -> f64 {
+        let nearest = if self.lo <= 0.0 && self.hi >= 0.0 { 0.0 } else { self.lo.abs().min(self.hi.abs()) };
+        TOLERANCE_ABS + TOLERANCE_REL * nearest
     }
 }
+
+/// The absolute tolerance of the math domain's comparison (`compare` in `mod.rs`).
+const TOLERANCE_ABS: f64 = 1e-4;
+/// The relative tolerance of the math domain's comparison.
+const TOLERANCE_REL: f64 = 2e-3;
 
 fn limit(ty: Ty) -> i32 {
     match ty {
@@ -291,12 +336,30 @@ fn limit(ty: Ty) -> i32 {
     }
 }
 
-/// Floats of `ty` bounded and exact enough, or `None` if the domain does not allow the value.
+/// The relative rounding error of an operation in `ty`, bounded generously (two ulps).
+fn rounding(ty: Ty) -> f64 {
+    match ty {
+        Ty::F32 => 2f64.powi(-22),
+        Ty::Df32 => 2f64.powi(-40),
+        Ty::U32 => 0.0,
+    }
+}
+
+/// The relative accuracy assumed of the engine's transcendental functions (`sin`, `exp`, `ln`,
+/// `hypot`, ...) against the oracle's: WGSL allows far more, devices give a few ulps.
+const FUNCTION_ERR: f64 = 1.0 / 1_048_576.0;
+
+/// The same for `atan2`, which llvmpipe computes to only about 4e-6 relative (measured on
+/// `atan2(x, x)` of values in `0.5..2`).
+const ATAN2_ERR: f64 = 1.0 / 65_536.0;
+
+/// Floats of `ty` bounded and exact enough, or `None` if the domain does not allow the value
+/// (including a math-domain discrepancy beyond what comparing the value accepts).
 fn finish(ty: Ty, math: bool, mut info: Info) -> Option<Info> {
     if ty == Ty::U32 {
         return Some(Info::int());
     }
-    if !(info.lo.is_finite() && info.hi.is_finite()) {
+    if !(info.lo.is_finite() && info.hi.is_finite() && info.err.is_finite()) {
         return None;
     }
     let bound = if math { 1e4 } else { 268_435_456.0 };
@@ -304,9 +367,15 @@ fn finish(ty: Ty, math: bool, mut info: Info) -> Option<Info> {
         return None;
     }
     if info.bits() > limit(ty) {
+        if info.exact {
+            info.err += rounding(ty) * info.mag();
+        }
         info.exact = false;
     }
     if !math && !info.exact {
+        return None;
+    }
+    if math && info.err > info.budget() {
         return None;
     }
     Some(info)
@@ -315,6 +384,40 @@ fn finish(ty: Ty, math: bool, mut info: Info) -> Option<Info> {
 fn corners(a: Info, b: Info, f: impl Fn(f64, f64) -> f64) -> (f64, f64) {
     let c = [f(a.lo, b.lo), f(a.lo, b.hi), f(a.hi, b.lo), f(a.hi, b.hi)];
     (c.iter().copied().fold(f64::INFINITY, f64::min), c.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+}
+
+/// The discrepancy bound of `a op b` whose bounds are `r` (`a` and `b` finite, `ty` a float
+/// type, math domain), or `None` if the operation would amplify the operands' discrepancies
+/// without limit (a divisor, a sign or an `atan2` abscissa that could cross zero).
+fn bin_err(ty: Ty, op: BinOp, a: Info, b: Info, r: &Info) -> Option<f64> {
+    let round = if r.exact { 0.0 } else { rounding(ty) * r.mag() };
+    let function = FUNCTION_ERR * r.mag();
+    let smallest = |x: &Info| if x.lo > 0.0 { x.lo } else if x.hi < 0.0 { -x.hi } else { 0.0 };
+    Some(match op {
+        BinOp::Add | BinOp::Sub | BinOp::Minimum | BinOp::Maximum => a.err + b.err + round,
+        BinOp::Mul => a.err * b.mag() + b.err * a.mag() + a.err * b.err + round,
+        BinOp::Div => {
+            let bmin = smallest(&b);
+            if bmin <= 0.0 || 2.0 * b.err > bmin {
+                return None;
+            }
+            2.0 * (a.err + b.err * (a.mag() + a.err) / bmin) / bmin + round
+        }
+        BinOp::Hypot => a.err + b.err + function,
+        BinOp::Atan2 => {
+            if 2.0 * b.err > b.lo {
+                return None;
+            }
+            2.0 * (a.err + b.err) / b.lo + ATAN2_ERR * r.mag()
+        }
+        BinOp::Copysign => {
+            if 2.0 * b.err > smallest(&b) {
+                return None;
+            }
+            a.err + round
+        }
+        BinOp::Rem => return None,
+    })
 }
 
 /// The bounds of `a op b` for `ty` (before `finish`); `b_const` is the right operand if it is one.
@@ -326,14 +429,14 @@ fn bin_info(ty: Ty, math: bool, op: BinOp, a: Info, b: Info, b_const: Option<f32
     let info = match op {
         BinOp::Add | BinOp::Sub => {
             let (lo, hi) = corners(a, b, |x, y| if op == BinOp::Add { x + y } else { x - y });
-            Info { lsb: a.lsb.min(b.lsb), lo, hi, exact: both }
+            Info { lsb: a.lsb.min(b.lsb), lo, hi, exact: both, err: 0.0 }
         }
         BinOp::Mul => {
             let (lo, hi) = corners(a, b, |x, y| x * y);
-            Info { lsb: a.lsb + b.lsb, lo, hi, exact: both }
+            Info { lsb: a.lsb + b.lsb, lo, hi, exact: both, err: 0.0 }
         }
-        BinOp::Minimum => Info { lsb: a.lsb.min(b.lsb), lo: a.lo.min(b.lo), hi: a.hi.min(b.hi), exact: both },
-        BinOp::Maximum => Info { lsb: a.lsb.min(b.lsb), lo: a.lo.max(b.lo), hi: a.hi.max(b.hi), exact: both },
+        BinOp::Minimum => Info { lsb: a.lsb.min(b.lsb), lo: a.lo.min(b.lo), hi: a.hi.min(b.hi), exact: both, err: 0.0 },
+        BinOp::Maximum => Info { lsb: a.lsb.min(b.lsb), lo: a.lo.max(b.lo), hi: a.hi.max(b.hi), exact: both, err: 0.0 },
         BinOp::Div => {
             // Dividing by a power of two is exact; in the math domain any divisor away from zero.
             let pow2 = b_const.filter(|c| *c != 0.0 && (f64::from(c.abs()).log2().fract() == 0.0));
@@ -343,27 +446,66 @@ fn bin_info(ty: Ty, math: bool, op: BinOp, a: Info, b: Info, b_const: Option<f32
             if let Some(c) = pow2 {
                 let k = f64::from(c.abs()).log2() as i32;
                 let (lo, hi) = (a.lo / f64::from(c), a.hi / f64::from(c));
-                Info { lsb: a.lsb - k, lo: lo.min(hi), hi: lo.max(hi), exact: a.exact }
+                Info { lsb: a.lsb - k, lo: lo.min(hi), hi: lo.max(hi), exact: a.exact, err: 0.0 }
             } else if math && (b.lo > 0.25 || b.hi < -0.25) {
                 let (lo, hi) = corners(a, b, |x, y| x / y);
-                Info { lsb: -60, lo, hi, exact: false }
+                Info { lsb: -60, lo, hi, exact: false, err: 0.0 }
             } else {
                 return None;
             }
         }
         BinOp::Hypot if math => {
             let m = a.mag().hypot(b.mag());
-            Info { lsb: -60, lo: 0.0, hi: m, exact: false }
+            Info { lsb: -60, lo: 0.0, hi: m, exact: false, err: 0.0 }
         }
-        BinOp::Atan2 if math && b.lo > 0.25 => Info { lsb: -60, lo: -1.58, hi: 1.58, exact: false },
+        BinOp::Atan2 if math && b.lo > 0.25 => Info { lsb: -60, lo: -1.58, hi: 1.58, exact: false, err: 0.0 },
         BinOp::Copysign if math && (b.lo > 0.05 || b.hi < -0.05) => {
             let m = a.mag();
-            Info { lsb: -60, lo: -m, hi: m, exact: false }
+            Info { lsb: -60, lo: -m, hi: m, exact: false, err: 0.0 }
         }
         BinOp::Rem => return None,
         _ => return None,
     };
-    finish(ty, math, info)
+    let err = if math { bin_err(ty, op, a, b, &info)? } else { 0.0 };
+    finish(ty, math, Info { err, ..info })
+}
+
+/// The discrepancy bound of `op(a)` whose bounds are `r` (math domain), or `None` if the
+/// function would amplify the operand's discrepancy without limit.
+fn un_err(ty: Ty, op: UnOp, a: Info, r: &Info) -> Option<f64> {
+    let round = if r.exact { 0.0 } else { rounding(ty) * r.mag() };
+    let function = FUNCTION_ERR * (1.0 + r.mag());
+    let e = a.err;
+    Some(match op {
+        UnOp::Neg | UnOp::Abs | UnOp::Clamp { .. } | UnOp::Floor | UnOp::Ceil | UnOp::Sign => e,
+        UnOp::ToDf32 => e,
+        UnOp::ToF32 => e + rounding(Ty::F32) * r.mag(),
+        UnOp::Sqrt => {
+            let step = if a.lo > 2.0 * e { e / a.lo.sqrt() } else { 1.5 * e.sqrt() };
+            step + round
+        }
+        UnOp::Exp => r.hi * (e.exp() - 1.0) + FUNCTION_ERR * r.hi,
+        UnOp::Ln => {
+            if 2.0 * e > a.lo {
+                return None;
+            }
+            2.0 * e / a.lo + function
+        }
+        UnOp::Sin | UnOp::Cos => e + function,
+        UnOp::Tan => {
+            let at = (a.mag() + e).min(1.5);
+            e / at.cos().powi(2) + function
+        }
+        UnOp::Tanh => e + function,
+        UnOp::Powf(p) => {
+            let p = f64::from(p);
+            if 2.0 * e > a.lo {
+                return None;
+            }
+            let slope = |x: f64| p.abs() * x.powf(p - 1.0);
+            e * slope(a.lo - e).max(slope(a.hi + e)) + FUNCTION_ERR * r.mag()
+        }
+    })
 }
 
 /// The bounds of `op(a)` for `ty`.
@@ -371,7 +513,7 @@ fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
     if ty == Ty::U32 {
         return None;
     }
-    let inexact = |lo: f64, hi: f64| Info { lsb: -60, lo, hi, exact: false };
+    let inexact = |lo: f64, hi: f64| Info { lsb: -60, lo, hi, exact: false, err: 0.0 };
     let info = match op {
         UnOp::Neg => Info { lo: -a.hi, hi: -a.lo, ..a },
         UnOp::Abs => {
@@ -380,12 +522,12 @@ fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
         }
         UnOp::Floor | UnOp::Ceil if a.exact => {
             let (lo, hi) = if op == UnOp::Floor { (a.lo.floor(), a.hi.floor()) } else { (a.lo.ceil(), a.hi.ceil()) };
-            Info { lsb: a.lsb.max(0), lo, hi, exact: true }
+            Info { lsb: a.lsb.max(0), lo, hi, exact: true, err: 0.0 }
         }
-        UnOp::Sign if a.exact => Info { lsb: 0, lo: if a.lo < 0.0 { -1.0 } else { 0.0 }, hi: if a.hi > 0.0 { 1.0 } else { 0.0 }, exact: true },
+        UnOp::Sign if a.exact => Info { lsb: 0, lo: if a.lo < 0.0 { -1.0 } else { 0.0 }, hi: if a.hi > 0.0 { 1.0 } else { 0.0 }, exact: true, err: 0.0 },
         UnOp::Clamp { lo, hi } => {
             let (l, h) = (Info::of_const(lo), Info::of_const(hi));
-            Info { lsb: a.lsb.min(l.lsb).min(h.lsb), lo: a.lo.max(f64::from(lo)).min(f64::from(hi)), hi: a.hi.min(f64::from(hi)).max(f64::from(lo)), exact: a.exact }
+            Info { lsb: a.lsb.min(l.lsb).min(h.lsb), lo: a.lo.max(f64::from(lo)).min(f64::from(hi)), hi: a.hi.min(f64::from(hi)).max(f64::from(lo)), exact: a.exact, err: 0.0 }
         }
         UnOp::ToDf32 | UnOp::ToF32 => a,
         UnOp::Sqrt if math && a.lo >= 0.0 => inexact(a.lo.sqrt(), a.hi.sqrt()),
@@ -400,7 +542,8 @@ fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
         }
         _ => return None,
     };
-    finish(ty, math, info)
+    let err = if math { un_err(ty, op, a, &info)? } else { 0.0 };
+    finish(ty, math, Info { err, ..info })
 }
 
 // -- Scope --
@@ -504,7 +647,7 @@ impl Scope {
                         let vals = values(*seed, *ty, len_of(*dims), math);
                         let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
                         let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        Info { lsb: if math { -23 } else { -3 }, lo: f64::from(lo), hi: f64::from(hi), exact: !math }
+                        Info { lsb: if math { -23 } else { -3 }, lo: f64::from(lo), hi: f64::from(hi), exact: !math, err: 0.0 }
                     }
                 };
                 e.new.push(Scope::fresh(*ty, *dims, info));
@@ -515,19 +658,19 @@ impl Scope {
             }
             Stmt::Range { dims, axis, ty } => {
                 let hi = dims[*axis] as f64 - 1.0;
-                let info = if *ty == Ty::U32 { Info::int() } else { Info { lsb: 0, lo: 0.0, hi, exact: true } };
+                let info = if *ty == Ty::U32 { Info::int() } else { Info { lsb: 0, lo: 0.0, hi, exact: true, err: 0.0 } };
                 e.new.push(Scope::fresh(*ty, *dims, info));
             }
             Stmt::Linspace { start, end, n } => {
                 let (s, t) = (f64::from(*start), f64::from(*end));
                 // Exact when the step `(end - start) / (n - 1)` is a dyadic number.
                 let info = if math {
-                    Info { lsb: -23, lo: s.min(t), hi: s.max(t), exact: false }
+                    Info { lsb: -23, lo: s.min(t), hi: s.max(t), exact: false, err: rounding(Ty::F32) * s.abs().max(t.abs()) }
                 } else {
                     if !(*n - 1).is_power_of_two() {
                         return None;
                     }
-                    Info { lsb: -3 - (*n - 1).ilog2() as i32, lo: s.min(t), hi: s.max(t), exact: true }
+                    Info { lsb: -3 - (*n - 1).ilog2() as i32, lo: s.min(t), hi: s.max(t), exact: true, err: 0.0 }
                 };
                 e.new.push(Scope::fresh(Ty::F32, [*n, 1, 1, 1], finish(Ty::F32, math, info)?));
             }
@@ -661,7 +804,7 @@ impl Scope {
             Stmt::Reduce { src, op } => {
                 let v = self.var(*src)?;
                 let info = self.info(v);
-                let info = if *op == RedOp::Sum { info.summed(len_of(v.dims)) } else { info };
+                let info = if *op == RedOp::Sum { info.total(len_of(v.dims)) } else { info };
                 e.new.push(Scope::fresh(v.ty, [1, 1, 1, 1], finish(v.ty, math, info)?));
             }
             Stmt::SumWhere { src, mask } => {
@@ -688,7 +831,7 @@ impl Scope {
                     return None;
                 }
                 let info = self.info(v);
-                let info = if *op == RedOp::Sum { info.summed(v.dims[*axis]) } else { info };
+                let info = if *op == RedOp::Sum { info.total(v.dims[*axis]) } else { info };
                 let mut dims = v.dims;
                 dims[*axis] = 1;
                 e.new.push(Scope::fresh(v.ty, dims, finish(v.ty, math, info)?));
@@ -776,7 +919,7 @@ impl Scope {
                     let vals = values(*seed, t.ty, len_of(t.dims), math);
                     let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
                     let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    finish(t.ty, math, Info { lsb: if math { -23 } else { -3 }, lo: f64::from(lo), hi: f64::from(hi), exact: !math })?
+                    finish(t.ty, math, Info { lsb: if math { -23 } else { -3 }, lo: f64::from(lo), hi: f64::from(hi), exact: !math, err: 0.0 })?
                 };
                 e.set.push((t.cell, info));
             }
@@ -1596,4 +1739,55 @@ fn config_strategy() -> impl Strategy<Value = Config> {
 /// Programs under random configurations.
 pub fn programs() -> impl Strategy<Value = Program> {
     (config_strategy(), any::<bool>(), prop::collection::vec(any::<u32>(), 40..500)).prop_map(|(config, math, tape)| build(config, math, tape))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Applies `stmts` to an empty scope in the math domain: the index of the first one the
+    /// builder refuses, if any.
+    fn first_refused(stmts: &[Stmt]) -> Option<usize> {
+        let mut scope = Scope::default();
+        for (i, stmt) in stmts.iter().enumerate() {
+            match scope.effect(stmt, true) {
+                Some(effect) => scope.commit(effect),
+                None => return Some(i),
+            }
+        }
+        None
+    }
+
+    /// Finding 17: `cos(sum(atan2(x, x)))` over 54 values. The sum is 13.5 pi, a zero of
+    /// `cos`, and the engine's `atan2` is off by 3e-6 per value on llvmpipe, so the sum is off
+    /// by 2e-4 and `cos` returns -1.8e-4 against the oracle's 2e-6: a failure of the
+    /// comparison's tolerance, not of the engine. The builder refuses the sum (its discrepancy
+    /// bound exceeds what the sum's own comparison accepts), so nothing consumes it.
+    #[test]
+    fn a_sum_of_inaccurate_values_is_not_generated_for_an_ill_conditioned_consumer() {
+        let program = [
+            Stmt::Input { dims: [9, 6, 1, 1], ty: Ty::F32, seed: 0 },
+            Stmt::Binary { lhs: Opd::Var(0), rhs: Opd::Var(0), op: BinOp::Atan2 },
+            Stmt::Reduce { src: 1, op: RedOp::Sum },
+            Stmt::View { src: 2, view: ViewOp::Transpose },
+            Stmt::AxisReduce { src: 3, axis: 0, op: RedOp::Sum },
+            Stmt::Unary { src: 4, op: UnOp::Cos },
+        ];
+        assert_eq!(first_refused(&program), Some(2));
+    }
+
+    /// The bound does not forbid what is well conditioned: sums of inputs, `cos` of a small
+    /// accurate value, and a division by a value well away from zero.
+    #[test]
+    fn well_conditioned_math_programs_are_still_generated() {
+        let program = [
+            Stmt::Input { dims: [300, 1, 1, 1], ty: Ty::F32, seed: 0 },
+            Stmt::Reduce { src: 0, op: RedOp::Sum },
+            Stmt::Input { dims: [12, 1, 1, 1], ty: Ty::F32, seed: 0 },
+            Stmt::Unary { src: 2, op: UnOp::Cos },
+            Stmt::Reduce { src: 3, op: RedOp::Sum },
+            Stmt::Binary { lhs: Opd::Var(2), rhs: Opd::Var(2), op: BinOp::Div },
+        ];
+        assert_eq!(first_refused(&program), None);
+    }
 }
