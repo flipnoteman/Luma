@@ -1004,7 +1004,6 @@ struct Known {
 }
 
 const KNOWN: &[Known] = &[
-    Known { id: "F15 traced loop with sum_where in its body, result written elsewhere (unminimized)", message: None, shape: Some(traced_loop_with_sum_where) },
     Known { id: "F14 receiver of a write through a view whose base a cache evaluated shows old data", message: None, shape: Some(cached_then_view_assigned) },
     Known {
         id: "F8 wrong value only when programs run concurrently on one context (unminimized; masks other concurrency failures)",
@@ -1012,14 +1011,6 @@ const KNOWN: &[Known] = &[
         shape: None,
     },
 ];
-
-/// F15: a traced loop (`iterate_all` / `iterate_until`) with a `SumWhere` in its body.
-fn traced_loop_with_sum_where(program: &Program) -> bool {
-    program.stmts.iter().any(|stmt| {
-        matches!(stmt, Stmt::Loop { kind: LoopKind::IterateAll | LoopKind::IterateUntilAll, body, .. }
-            if body.iter().any(|s| matches!(s, Stmt::SumWhere { .. })))
-    })
-}
 
 /// F14: an `Assign` through a variable that is a slice, flip or transpose view, after a `Cache`
 /// (which can evaluate a node the view's base shares with the cached array).

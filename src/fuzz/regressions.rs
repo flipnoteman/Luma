@@ -344,23 +344,41 @@ fn view_shows_the_written_data_after_a_cache_evaluated_the_shared_base_node() {
     });
 }
 
-/// Finding 15 (found while fixing finding 3; fails on main without that fix too): an
-/// `iterate_all` whose body reduces with `sum_where` and selects on it, then a write of an
-/// expression of the result through a flip: `element 1` of the written array is `1`, not `0`.
+/// Finding 15 (found while fixing finding 3; same cause as finding 14): a view that was
+/// evaluated (here by `eval`) and is then written through with an expression that reads it shows
+/// the data from before the write (`v[1]` is `1`, not `0`). Minimized from a program with a traced
+/// `iterate_all` (see the next test): no loop is needed.
 #[test]
-#[ignore = "finding 15: a traced iterate_all with sum_where in its body, then a write of an expression of its result"]
-fn write_of_an_expression_of_a_traced_loop_with_sum_where_is_wrong() {
+#[ignore = "finding 15: fixed by fix-f14 (the receiver of a write through an evaluated view shows old data)"]
+fn evaluated_view_written_with_an_expression_of_itself_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
         math: false,
         stmts: vec![
-            Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
             Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
-            View { src: 1, view: Flip { axis: 1 } },
-            View { src: 1, view: Flip { axis: 1 } },
-            Loop { kind: IterateAll, steps: 1, states: vec![2], body: vec![Unary { src: 0, op: ToF32 }, View { src: 3, view: ShiftClamp { offs: vec![3, 0] } }, Scan { src: 4, axis: 0, op: ScanMin }, SumWhere { src: 7, mask: 7 }, Select { mask: 8, a: Const(4.0), b: Const(0.0), ty: F32 }], next: vec![6] },
-            Binary { lhs: Var(4), rhs: Const(2.0), op: Rem },
-            Assign { target: 3, path: vec![], rhs: Var(5) },
+            View { src: 0, view: Flip { axis: 1 } },
+            EvalVars { vars: vec![1] },
+            View { src: 1, view: ShiftClamp { offs: vec![3, 0] } },
+            Binary { lhs: Var(2), rhs: Const(2.0), op: Rem },
+            Assign { target: 1, path: vec![], rhs: Var(3) },
+        ],
+    });
+}
+
+/// Finding 15, the original form: the view is evaluated because a traced `iterate_all` reads it.
+#[test]
+#[ignore = "finding 15: fixed by fix-f14 (the receiver of a write through an evaluated view shows old data)"]
+fn view_read_by_a_traced_loop_shows_the_old_data_after_a_write_through_it() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
+            View { src: 0, view: Flip { axis: 1 } },
+            View { src: 0, view: Flip { axis: 1 } },
+            Loop { kind: IterateAll, steps: 1, states: vec![1], body: vec![View { src: 2, view: ShiftClamp { offs: vec![3, 0] } }], next: vec![4] },
+            Binary { lhs: Var(3), rhs: Const(2.0), op: Rem },
+            Assign { target: 2, path: vec![], rhs: Var(4) },
         ],
     });
 }
