@@ -560,11 +560,14 @@ impl<T: GpuType> Array<T> {
     }
 
     /// Whether this array is the only holder of its own (non-aliased) buffer: nothing else can
-    /// observe the buffer changing. An evaluated lazy array holds it through its node.
+    /// observe the buffer changing. An evaluated lazy array holds it through its node; the
+    /// arrays that denote that node through a replacement (see [`crate::jit::supersede`]) are
+    /// counted as claims on the node they were created holding, not by the reference count of
+    /// the node that took over.
     pub(crate) fn sole_owner(&self) -> bool {
         let storage = match &self.repr {
             Repr::Valid(storage) => storage,
-            Repr::Lazy(held) if Arc::strong_count(held.latest()) == 1 => match held.latest().evaluated() {
+            Repr::Lazy(held) if Arc::strong_count(held.latest()) == 1 && !held.is_shared() => match held.latest().evaluated() {
                 Some(storage) => storage,
                 None => return false,
             },

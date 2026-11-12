@@ -227,6 +227,9 @@ All notable changes to Luma are listed here. The format follows
   then read by the next expression) was left lazy when the loop was traced, and the recording
   evaluated it in place over its operand's buffer, so that every replayed step overwrote it
   again. Tracing now evaluates every array the thread holds first.
+- `x += c` (and the other compound assignments) on an evaluated lazy array whose expression had
+  been replaced by a write through a view (`x.slice(..).assign(..)`) rebound `x` instead of
+  changing the buffer it shares with its clones, so the clones did not show the update.
 
 ## [0.2.0] - 2026-11-11
 
