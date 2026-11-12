@@ -48,6 +48,20 @@ All notable changes to Luma are listed here. The format follows
   and computed together, so what they share (the wave speeds of a Riemann solver) is computed
   once per cell instead of once per field. bowshock-lazy `Staging::Fusion`, one `Df32` residual
   evaluation at 200x100: 308-344 us -> 139 us, f32 17-19 us -> 11 us (kernel time on an RTX 3090).
+- The cost model searches for what to evaluate first instead of guessing: of the sub-programs a
+  kernel reads at several indices it costs the groups that would be evaluated together (the fields
+  of one state), each judged the same way, so the stage state of a time step that reads the stage
+  before it through views is evaluated once instead of being recomputed by every cell (staged or
+  not) that reads it; a program that fits no plan is ordered by what writing it out would cost
+  rather than cut where the most instructions repeat. The fusion limit defaults to 4096
+  operations (`LUMA_FUSION_MAX_NODES`), which the search makes safe. A pending node that two
+  expressions read is only evaluated first if recomputing it costs more than a launch and a pass
+  over its bytes, and then together with its siblings (the other fields of its record) and
+  without the nodes below it that only it was reading. bowshock-lazy `Staging::Fusion` (no
+  hand-placed `cache()`), 200x100, per SSP-RK3 step as `iterate_all` replays it: f32 76 launches /
+  346 us -> 8 launches / 38-47 us GPU (hand-cached `Fluxes`: 12 / 53 us); steady us/iteration
+  f32 252 -> 31 (`Fluxes` 46), `Df32` 1123 -> 536 (`Fluxes` 250). `euler/until_all` of `bench_pde` 454 -> 204 launches
+  (2048x2048: 72 -> 18 ms), `muscl` 16-29% faster.
 - `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
   `Df32` and `f64` arithmetic), measured when a context opens (once per machine, see the cache;
   `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).

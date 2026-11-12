@@ -21,7 +21,7 @@
 //! # Where fusion stops
 //!
 //! * An expression holds at most [`JitState::max_nodes`] operations (default
-//!   [`DEFAULT_MAX_NODES`] = 1024, at most `MAX_NODES_LIMIT` = 4096; `LUMA_FUSION_MAX_NODES`
+//!   [`DEFAULT_MAX_NODES`] = 4096, at most `MAX_NODES_LIMIT` = 4096; `LUMA_FUSION_MAX_NODES`
 //!   overrides the default and [`fusion_limit`] a scope), nests at most `MAX_DEPTH` = 256 levels
 //!   (the flattening walk is recursive, so this bounds its stack) and reads as many distinct input
 //!   buffers as the device can bind. A new node that would exceed one of them evaluates its
@@ -42,7 +42,14 @@
 //! * Operations that are the same (same operation, length and operands, scalars by value) are one
 //!   node: `create` looks them up in a table of weak references that is dropped whenever a buffer
 //!   is written (`JitState::note_write`), and skips nodes computed inside another kernel. A
-//!   fused kernel computes a shared node once.
+//!   fused kernel computes a shared node once; a pending node that an expression outside the one
+//!   being flattened also reads is evaluated first only if computing it once more costs more than
+//!   writing and reading it back (`worth_storing`, the rule of circular shifts), otherwise each
+//!   expression computes it. Of those, only the outermost are evaluated, together with their
+//!   siblings (pending nodes of the same length made by the same operation at the same place in
+//!   the program: the other fields of a record, see `program::with_siblings`), so that a residual
+//!   that a step update and a convergence norm both read is one multi-output kernel, not its
+//!   first field alone and then every shared intermediate of the others, level by level.
 //! * A view or gather (slice, pad, flip, transpose, `take`, broadcast) of a pending expression
 //!   that fits one buffer reads it lazily, as a sub-program computed at the read index, whatever
 //!   its size and however often it is read. The kernel computes every (expression, index) pair
@@ -50,14 +57,20 @@
 //!   one view, and equal instructions are one (see [`inline`]). Then the cost model
 //!   ([`CostModel`]) decides per program (`inline::judge`), choosing in turn the one kernel that
 //!   recomputes every read (the baseline), the one kernel that computes a sub-program once per
-//!   cell of a workgroup tile in workgroup memory (below), and the evaluation of the sub-program
-//!   read at several indices first (one kernel writing it and recomputing what it shares with
-//!   the rest, one reading it back), each if it is estimated to take less than 0.9 (staging) or
-//!   0.75 (evaluating first) times the time of the choice before it
-//!   ([`SplitReason::Materialised`] for the last). A kernel that would grow past
+//!   cell of a workgroup tile in workgroup memory (below), and the evaluation of sub-programs
+//!   read at several indices first (one kernel writing them and recomputing what they share
+//!   with the rest, one reading them back), each if it is estimated to take less than 0.9
+//!   (staging) or 0.75 (evaluating first) times the time of the choice before it
+//!   ([`SplitReason::Materialised`] for the last). What to evaluate first is searched for, not
+//!   guessed: of the sub-programs the program reads most often, the group (the fields of one
+//!   state go together, or the program is still too big) whose two kernels cost least, the
+//!   first of which is judged the same way, so that the stage state of a time step that reads
+//!   the stage before it through views is evaluated once, not recomputed by every cell that
+//!   reads it. A program that fits no plan costs more than any that does, ordered by what
+//!   writing it out would cost. A kernel that would grow past
 //!   `Tuning::max_inlined` instructions (`LUMA_FUSION_MAX_INLINED`) is cut whatever the model
-//!   says, by evaluating the sub-program whose repeats cost the most
-//!   ([`SplitReason::Inlined`]), and expressions over arrays split over several buffers are read
+//!   says, at the group that search finds ([`SplitReason::Inlined`]), and expressions over arrays
+//!   split over several buffers are read
 //!   from their evaluated buffers. Circular shifts keep their own rule: a small expression is
 //!   recomputed at up to eight offsets as long as one more computation (by its operation
 //!   weights) costs less than writing it and reading it back, or staged in workgroup memory;
@@ -175,7 +188,7 @@ struct RequestList {
 }
 
 /// Most operations one fused kernel contains unless configured otherwise.
-pub(crate) const DEFAULT_MAX_NODES: usize = 1024;
+pub(crate) const DEFAULT_MAX_NODES: usize = 4096;
 /// Upper bound of the configurable limit.
 const MAX_NODES_LIMIT: usize = 4096;
 /// Deepest nesting of one fused expression: the expression is walked recursively, so this bounds
@@ -195,7 +208,7 @@ thread_local! {
 }
 
 /// Runs `f` with the fusion limit of lazy operations created on this thread set to `max_nodes`
-/// operations per kernel (instead of the context's, 1024 unless `LUMA_FUSION_MAX_NODES`
+/// operations per kernel (instead of the context's, 4096 unless `LUMA_FUSION_MAX_NODES`
 /// changes it), restoring the previous limit afterwards. The value is clamped to `1..=4096`;
 /// `1` makes every operation its own kernel. Only the limit at the time an operation is
 /// *written* matters, so the expressions built inside `f` keep it when they are evaluated later.
@@ -1693,6 +1706,19 @@ fn claim_recompute(node: &Node) -> bool {
             Err(now) => reads = now,
         }
     }
+}
+
+/// Whether the pending `node`, which an expression outside the one being flattened reads too,
+/// costs more to compute once more than to write and read back (by the cost model, as in
+/// [`claim_recompute`]): then it is evaluated before the expressions that share it, otherwise
+/// each computes it again and no kernel is spent on it.
+pub(crate) fn worth_storing(node: &Node) -> bool {
+    if node.looped.get().is_some() {
+        return true;
+    }
+    let cost = node.context().cost_model();
+    let len = node.len() as f64;
+    node.weight() * len / cost.f32_ops_per_ns > cost::kernel_ns(&cost, len * node.op().out_ty().bytes() as f64 * 2.0, 0.0)
 }
 
 /// Whether a view or gather of the pending `node` reads its expression lazily (as a sub-program
