@@ -8,10 +8,9 @@ use crate::array::{Failure, Storage};
 use crate::builtin::{BinOp, ReduceList, UnOp};
 use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
-use crate::profile::SplitReason;
 
 use super::codegen::Tile;
-use super::inline::Verdict;
+use super::inline::Judgement;
 use super::launch::force_group;
 use super::{lock, Args, Edge, Flattening, ElemTy, Node, Op, OpKind, Scalar, ShiftKind, Src, ViewMap};
 
@@ -80,7 +79,7 @@ pub(crate) enum Tail {
 ///
 /// The instructions are behind `Arc`s that [`JitState::intern`](super::JitState::intern) makes
 /// the same for equal programs, so that looking a key up compares them by address (equal keys
-/// are found, and kernels and verdicts cached, once per program) and the hash of the
+/// are found, and kernels and judgements cached, once per program) and the hash of the
 /// instructions is made once.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct FusedKey {
@@ -881,10 +880,9 @@ pub(super) fn flatten_inner(
             continue;
         }
         if fused.key.inlines()
-            && let Verdict::TooBig { sub } = &*jit.inline_verdict(ctx.tuning(), &fused.key)
+            && let Judgement::Materialise { sub, reason } = &*jit.judgement(ctx, &fused.key, first.len())
         {
-            let limit = jit.max_inlined(ctx.tuning());
-            jit.note_split(first.name, first.location, SplitReason::Inlined { instructions: limit + 1, limit });
+            jit.note_split(first.name, first.location, *reason);
             let node = fused.sub_roots.get(*sub as usize).cloned();
             drop(fused);
             if let Some(node) = node {

@@ -21,6 +21,8 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- `SplitReason::Materialised`: reported by profiling when the cost model evaluates a shared
+  expression first because recomputing it at every read costs more than storing it.
 - `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
   `Df32` and `f64` arithmetic), measured when a context opens (once per device and process;
   `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).
@@ -106,6 +108,11 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- Fusion decisions use the cost model: a kernel that reads an expression through views at several
+  indices (slices, pads, flips, `take`) recomputes it at every read, or evaluates it first and
+  reads it back, whichever the device's `CostModel` estimates to be cheaper (the old rule always
+  recomputed within the instruction cap, which stays as a size bound). Circular shifts accept up
+  to eight lazy readers of a cheap expression instead of two, and fewer of an expensive one.
 - `iterate` and `iterate_all` trace their step once and replay the recorded kernels for steps that
   do not fuse into one kernel (shifts, `cache()`, `assign`, reductions), instead of calling `step`
   once per step. `step` is now called exactly once, and must compute its results from its argument

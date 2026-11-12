@@ -11,11 +11,17 @@
 //! same context and its expression is computed once.
 //!
 //! The lowering is a pure function of the structure of the key (no nodes, no buffers), so it runs
-//! only when a kernel is built or judged (see `JitState::inline_verdict`).
+//! only when a kernel is built or judged (see `JitState::judgement`). [`judge`] weighs the
+//! lowered program against storing a sub-program that is read at several indices with the
+//! device's [`CostModel`]: the estimated time of one kernel that recomputes it at every read
+//! against two kernels, the first writing it once, the second reading it back. The instruction
+//! cap only bounds the size of the generated code.
 
 use crate::gpu::hash::FxMap;
+use crate::profile::SplitReason;
 
-use super::program::{FusedKey, Instr, Ref};
+use super::cost::{kernel_ns, op_weight, CostModel};
+use super::program::{FusedKey, Instr, Ref, Tail};
 use super::{Edge, Op, OpKind, ShiftKind, ViewMap};
 
 /// How the index of a context derives from its parent's: the read index of one `Shift`.
@@ -49,6 +55,10 @@ pub(crate) struct Inlined {
     pub(crate) instrs: Vec<Flat>,
     /// For every instruction of the main program `key.instrs`, the lowered instruction holding its value.
     pub(crate) main: Vec<u32>,
+    /// Per sub-program, at how many contexts it was lowered.
+    pub(crate) count: Vec<u32>,
+    /// The operations of the lowered program in f32-operation units (see [`op_weight`]), per element.
+    pub(crate) ops: f64,
 }
 
 /// What [`inline`] found.
@@ -182,7 +192,7 @@ impl Lowering<'_> {
 }
 
 /// Lowers `key` (main program at context 0), giving up once more than `cap` instructions exist.
-pub(crate) fn inline(key: &FusedKey, cap: usize) -> Verdict {
+pub(crate) fn inline(key: &FusedKey, cap: usize, cost: &CostModel) -> Verdict {
     let placeholder = Ctx { parent: 0, kind: ShiftKind::Dims { dims: [1; 4], shifts: [0; 4] }, args: [Ref::Unused; 2] };
     let mut lowering = Lowering {
         subs: &key.subs,
@@ -207,7 +217,117 @@ pub(crate) fn inline(key: &FusedKey, cap: usize) -> Verdict {
             .unwrap_or(0);
         return Verdict::TooBig { sub: u32::try_from(sub).unwrap_or(u32::MAX) };
     }
-    Verdict::Fits(Inlined { ctxs: lowering.ctxs, instrs: lowering.instrs, main })
+    let ops = lowering.instrs.iter().map(|flat| op_weight(flat.op, cost)).sum();
+    Verdict::Fits(Inlined { ctxs: lowering.ctxs, instrs: lowering.instrs, main, count: lowering.count, ops })
+}
+
+/// What [`judge`] decided.
+#[derive(Debug)]
+pub(crate) enum Judgement {
+    /// Run the program as one kernel (lowered by [`inline`]).
+    Run,
+    /// Evaluate sub-program `sub` first (the kernel then reads its buffer) and flatten again.
+    Materialise { sub: u32, reason: SplitReason },
+}
+
+/// The estimated times [`judge`] compared, in nanoseconds.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // only tests read them (as the text of the judgement)
+pub(crate) struct Estimates {
+    /// One kernel running the lowered program (infinite if it exceeds the cap).
+    pub(crate) inline_ns: f64,
+    /// The best way of evaluating one sub-program first, with its two kernels' time.
+    pub(crate) best_sub: Option<(u32, f64)>,
+}
+
+/// Bytes per element of the distinct inputs among the operands `refs` read.
+fn input_bytes(key: &FusedKey, refs: impl Iterator<Item = Ref>) -> f64 {
+    let mut seen = vec![false; key.input_tys.len()];
+    let mut bytes = 0.0;
+    for reference in refs {
+        if let Ref::Input(k) = reference
+            && let Some(slot) = seen.get_mut(k as usize)
+            && !*slot
+        {
+            *slot = true;
+            bytes += key.input_tys[k as usize].bytes() as f64;
+        }
+    }
+    bytes
+}
+
+/// Bytes per element the program writes: every output of a store, the value of a scatter,
+/// nothing for a reduction (its partial sums are negligible).
+fn output_bytes(key: &FusedKey) -> f64 {
+    let bytes = |index: &u32| key.instrs.get(*index as usize).map_or(0.0, |instr| instr.op.out_ty().bytes() as f64);
+    match key.tail {
+        Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().map(bytes).sum(),
+        Tail::Scatter { .. } => key.outputs.first().map_or(0.0, bytes),
+        Tail::Reduce(_) => 0.0,
+    }
+}
+
+/// The number of elements of sub-program `s`, from the first shift that reads it (`len`, the
+/// elements of the kernel, for a flat circular shift).
+fn sub_len(key: &FusedKey, s: u32, len: usize) -> f64 {
+    for instr in key.instrs.iter().chain(key.subs.iter().flatten()) {
+        if let OpKind::Shift(kind) = instr.op.kind
+            && instr.args[0] == Ref::Sub(s)
+        {
+            return match kind {
+                ShiftKind::View { map, .. } => map.src.iter().map(|&d| f64::from(d)).product(),
+                ShiftKind::Take { len } => f64::from(len),
+                ShiftKind::Dims { dims, .. } => dims.iter().map(|&d| f64::from(d)).product(),
+                ShiftKind::Linear => len as f64,
+            };
+        }
+    }
+    len as f64
+}
+
+/// Decides how to run `key` (which [`inlines`](FusedKey::inlines)) over `len` elements: as one
+/// kernel that computes every sub-program at each index it is read at, or with the sub-program
+/// whose repeated computation costs the most evaluated first (see the module documentation).
+/// Lowered programs over `cap` instructions are always cut.
+pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel) -> (Judgement, Estimates) {
+    let inlined = match inline(key, cap, cost) {
+        Verdict::Fits(inlined) => inlined,
+        Verdict::TooBig { sub } => {
+            let reason = SplitReason::Inlined { instructions: cap.saturating_add(1), limit: cap };
+            return (Judgement::Materialise { sub, reason }, Estimates { inline_ns: f64::INFINITY, best_sub: None });
+        }
+    };
+    let elements = len as f64;
+    let out_bytes = output_bytes(key);
+    let reads = inlined.instrs.iter().flat_map(|flat| flat.args).chain(inlined.ctxs.iter().flat_map(|ctx| ctx.args));
+    let io_bytes = elements * (input_bytes(key, reads) + out_bytes);
+    let inline_ns = kernel_ns(cost, io_bytes, inlined.ops * elements);
+
+    let mut best: Option<(u32, f64)> = None;
+    for (s, program) in key.subs.iter().enumerate() {
+        let instances = inlined.count.get(s).copied().unwrap_or(0);
+        if instances < 2 {
+            continue;
+        }
+        let s32 = u32::try_from(s).unwrap_or(u32::MAX);
+        let once: f64 = program.iter().map(|instr| op_weight(instr.op, cost)).sum();
+        let len_s = sub_len(key, s32, len);
+        let in_s = input_bytes(key, program.iter().flat_map(|instr| instr.args));
+        let out_s = program.last().map_or(0.0, |instr| instr.op.out_ty().bytes() as f64);
+        let rest = (inlined.ops - f64::from(instances) * once).max(0.0);
+        let t = kernel_ns(cost, len_s * (in_s + out_s), once * len_s) + kernel_ns(cost, io_bytes + elements * out_s, rest * elements);
+        if best.is_none_or(|(_, t_best)| t < t_best) {
+            best = Some((s32, t));
+        }
+    }
+    let estimates = Estimates { inline_ns, best_sub: best };
+    match best {
+        Some((sub, t)) if t < 0.9 * inline_ns => {
+            let instances = inlined.count[sub as usize] as usize;
+            (Judgement::Materialise { sub, reason: SplitReason::Materialised { instances } }, estimates)
+        }
+        _ => (Judgement::Run, estimates),
+    }
 }
 
 #[cfg(test)]
@@ -274,7 +394,7 @@ mod tests {
             shift(slice(9, 0, 8), 0),
             instr(OpKind::Binary(BinOp::Sub), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
         ];
-        let inlined = fits(inline(&key(main, vec![expression()]), 1000));
+        let inlined = fits(inline(&key(main, vec![expression()]), 1000, &CostModel::TEST));
         // Two indices of `e` (three instructions each) and the difference; the shifts are aliases.
         assert_eq!(inlined.instrs.len(), 7);
         assert_eq!(inlined.ctxs.len(), 3);
@@ -297,7 +417,7 @@ mod tests {
             instr(OpKind::Binary(BinOp::Mul), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
             instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(2), Ref::Tmp(0), Ref::Unused]),
         ];
-        let inlined = fits(inline(&key(g, vec![expression(), f]), 1000));
+        let inlined = fits(inline(&key(g, vec![expression(), f]), 1000, &CostModel::TEST));
         // `e` at the starts 0, 1 and 2 (1 is reached twice): 3 x 3; `f` at two indices; `*` and `+`.
         assert_eq!(inlined.instrs.len(), 13);
         // Contexts: the two slices of `f`, and the three composed slices of `e`.
@@ -318,7 +438,7 @@ mod tests {
     fn a_view_of_everything_is_the_element_itself() {
         let identity = ShiftKind::View { map: ViewMap::identity([9, 1, 1, 1]), edge: Edge::None };
         let main = vec![shift(identity, 0), instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Input(0), Ref::Unused])];
-        let inlined = fits(inline(&key(main, vec![expression()]), 1000));
+        let inlined = fits(inline(&key(main, vec![expression()]), 1000, &CostModel::TEST));
         assert_eq!(inlined.ctxs.len(), 1);
         assert!(inlined.instrs.iter().all(|flat| flat.at == 0));
     }
@@ -331,7 +451,7 @@ mod tests {
             instr(OpKind::Shift(ShiftKind::View { map, edge: Edge::Fill }), [Ref::Sub(0), Ref::Scalar(0), Ref::Unused]),
             shift(ShiftKind::View { map, edge: Edge::Clamp }, 0),
         ];
-        let inlined = fits(inline(&key(main, vec![expression()]), 1000));
+        let inlined = fits(inline(&key(main, vec![expression()]), 1000, &CostModel::TEST));
         // The fill is one instruction on top of the expression at its context; clamp is an alias
         // of the expression at another context.
         assert_eq!(inlined.instrs.len(), 3 + 1 + 3);
@@ -348,7 +468,7 @@ mod tests {
             shift(slice(9, 1, 8), 1),
             instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
         ];
-        let inlined = fits(inline(&key(main, vec![a, b]), 1000));
+        let inlined = fits(inline(&key(main, vec![a, b]), 1000, &CostModel::TEST));
         // Mul, Add shared; Abs, Neg; the sum.
         assert_eq!(inlined.instrs.len(), 5);
     }
@@ -367,10 +487,40 @@ mod tests {
             shift(slice(9, 4, 5), 0),
             instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
         ];
-        let verdict = inline(&key(main.clone(), vec![long, short]), 8);
+        let verdict = inline(&key(main.clone(), vec![long, short]), 8, &CostModel::TEST);
         assert!(matches!(verdict, Verdict::TooBig { sub: 0 }), "{verdict:?}");
         // Within the cap it fits.
-        let again = inline(&key(main, vec![expression(), vec![expression()[0].clone()]]), 100);
+        let again = inline(&key(main, vec![expression(), vec![expression()[0].clone()]]), 100, &CostModel::TEST);
         assert!(matches!(again, Verdict::Fits(_)));
+    }
+
+    /// `e.slice(1..) - e.slice(..n - 1)` over a long array.
+    fn difference_key() -> FusedKey {
+        let main = vec![
+            shift(slice(1 << 20, 1, (1 << 20) - 1), 0),
+            shift(slice(1 << 20, 0, (1 << 20) - 1), 0),
+            instr(OpKind::Binary(BinOp::Sub), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+        ];
+        key(main, vec![expression()])
+    }
+
+    #[test]
+    fn costly_launches_keep_the_recomputation_and_costly_arithmetic_stores_the_expression() {
+        let key = difference_key();
+        let len = 1 << 20;
+        let (cheap_launch, _) = judge(&key, len, 1000, &CostModel { launch_us: 1e6, ..CostModel::TEST });
+        assert!(matches!(cheap_launch, Judgement::Run), "{cheap_launch:?}");
+        let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST });
+        let Judgement::Materialise { sub: 0, reason: SplitReason::Materialised { instances: 2 } } = cheap_memory else {
+            panic!("{cheap_memory:?} {estimates:?}");
+        };
+        assert!(estimates.best_sub.is_some_and(|(_, t)| t < estimates.inline_ns), "{estimates:?}");
+    }
+
+    #[test]
+    fn a_program_over_the_cap_is_cut_whatever_the_model_says() {
+        let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &CostModel { launch_us: 1e6, ..CostModel::TEST });
+        assert!(matches!(judgement, Judgement::Materialise { sub: 0, reason: SplitReason::Inlined { limit: 4, .. } }), "{judgement:?}");
+        assert!(estimates.inline_ns.is_infinite());
     }
 }

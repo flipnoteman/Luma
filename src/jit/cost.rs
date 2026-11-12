@@ -71,7 +71,6 @@ impl CostModel {
 }
 
 /// The cost of `op` per element in f32-operation units.
-#[allow(dead_code)] // used from Step 3
 pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
     let base = match op.kind {
         OpKind::Unary(u) => match u {
@@ -114,7 +113,6 @@ pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
 }
 
 /// Estimated nanoseconds of one kernel moving `bytes` and doing `ops` f32-operation units of work.
-#[allow(dead_code)] // used from Step 3
 pub(crate) fn kernel_ns(cost: &CostModel, bytes: f64, ops: f64) -> f64 {
     cost.launch_us * 1e3 + (bytes / cost.bandwidth_gbs).max(ops / cost.f32_ops_per_ns)
 }

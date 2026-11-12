@@ -1620,6 +1620,56 @@ fn a_third_view_reader_recomputes_the_expression_inside_the_one_kernel() {
     assert_close(&got, &want, 1e-5, 1e-6);
 }
 
+/// A 40-operation expression of `x` and its host values.
+fn long_expression(x: &Array<f32>, xs: &[f32]) -> (Array<f32>, Vec<f32>) {
+    let mut e = x.clone();
+    let mut host = xs.to_vec();
+    for _ in 0..20 {
+        e = &e * 0.9 + 0.2;
+        for v in &mut host {
+            *v = *v * 0.9 + 0.2;
+        }
+    }
+    (e, host)
+}
+
+#[test]
+fn prohibitive_launches_keep_a_view_read_at_three_offsets_in_one_kernel() {
+    let ctx = ctx();
+    ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+    let n = 1 << 16;
+    let xs = values(n, 101, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let (e, host) = long_expression(&x, &xs);
+
+    let before = ctx.jit().stats();
+    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n)).to_vec().unwrap();
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert_eq!(launches, 1, "{:?}", ctx.jit().last_judgement());
+    let want: Vec<f32> = (0..n - 2).map(|i| host[i] + host[i + 1] + host[i + 2]).collect();
+    assert_close(&got, &want, 1e-4, 1e-5);
+}
+
+#[test]
+fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
+    let ctx = ctx();
+    ctx.set_cost_model(CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST });
+    ctx.jit().record_splits();
+    let n = 1 << 16;
+    let xs = values(n, 102, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let (e, host) = long_expression(&x, &xs);
+
+    let before = ctx.jit().stats();
+    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n)).to_vec().unwrap();
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert_eq!(launches, 2, "{:?}", ctx.jit().last_judgement());
+    let splits = ctx.jit().take_splits();
+    assert!(splits.iter().any(|split| split.reason == crate::profile::SplitReason::Materialised { instances: 3 }), "{splits:?}");
+    let want: Vec<f32> = (0..n - 2).map(|i| host[i] + host[i + 1] + host[i + 2]).collect();
+    assert_close(&got, &want, 1e-4, 1e-5);
+}
+
 #[test]
 fn cache_evaluates_an_expression_once_for_every_later_read() {
     let ctx = ctx();

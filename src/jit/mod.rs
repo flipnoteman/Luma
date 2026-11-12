@@ -45,16 +45,21 @@
 //!   fused kernel computes a shared node once.
 //! * A view or gather (slice, pad, flip, transpose, `take`, broadcast) of a pending expression
 //!   that fits one buffer reads it lazily, as a sub-program computed at the read index, whatever
-//!   its size and however often it is read: arithmetic costs far less than writing and reading
-//!   a buffer. The kernel computes every (expression, index) pair once: nested views are
-//!   written out at every index they are read at, a view of a view is one view, and equal
-//!   instructions are one (see [`inline`]). A kernel that would grow past
-//!   `Tuning::max_inlined` instructions (`LUMA_FUSION_MAX_INLINED`) is cut by evaluating the
-//!   sub-program whose repeats cost the most ([`SplitReason::Inlined`]), and expressions over
-//!   arrays split over several buffers are read from their evaluated buffers. Circular shifts
-//!   keep their own rule: a small expression is recomputed at up to two offsets or staged in
-//!   workgroup memory, the third reader evaluates it (with the live arrays that share work with
-//!   it, see `JitState::evaluate_alongside`). [`Array::cache`](crate::Array::cache) evaluates on
+//!   its size and however often it is read. The kernel computes every (expression, index) pair
+//!   once: nested views are written out at every index they are read at, a view of a view is
+//!   one view, and equal instructions are one (see [`inline`]). Then the cost model
+//!   ([`CostModel`]) decides per program (`inline::judge`): if evaluating a sub-program that
+//!   is read at several indices first (one kernel writing it, one reading it back) is
+//!   estimated to take less than 0.9 times the one kernel that recomputes it at every read, it
+//!   is evaluated first ([`SplitReason::Materialised`]). A kernel that would grow past
+//!   `Tuning::max_inlined` instructions (`LUMA_FUSION_MAX_INLINED`) is cut whatever the model
+//!   says, by evaluating the sub-program whose repeats cost the most
+//!   ([`SplitReason::Inlined`]), and expressions over arrays split over several buffers are read
+//!   from their evaluated buffers. Circular shifts keep their own rule: a small expression is
+//!   recomputed at up to eight offsets as long as one more computation (by its operation
+//!   weights) costs less than writing it and reading it back, or staged in workgroup memory;
+//!   the reader beyond that evaluates it (with the live arrays that share work with it, see
+//!   `JitState::evaluate_alongside`). [`Array::cache`](crate::Array::cache) evaluates on
 //!   request.
 //! * When an expression is evaluated, a pending node inside it that another pending, live
 //!   operation outside the expression also reads is evaluated on its own first, instead of
@@ -125,7 +130,7 @@ use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 use crate::profile::{FusionSplit, SplitReason};
 
-use inline::{inline, Verdict};
+use inline::{inline, Judgement, Verdict};
 use looped::LoopPlan;
 use program::Instr;
 
@@ -610,6 +615,8 @@ pub(crate) struct Node {
     /// Levels of the expression below this node: 1 + the greatest of its operands' (0 for none),
     /// shifted operands included. Bounded by [`MAX_DEPTH`].
     depth: u16,
+    /// The operations of the expression in f32-operation units (see [`Node::weight`]).
+    weight: f64,
     /// How many shifts, views and gathers read this node lazily, as a sub-program (see
     /// [`recompute_shifted`]).
     shifted_reads: AtomicU32,
@@ -832,6 +839,12 @@ impl Node {
     /// of a loop leaf evaluates its inputs, so it has none.
     fn shift_depth(&self) -> u8 {
         if self.looped.get().is_some() { 0 } else { self.shift_depth }
+    }
+
+    /// The operations of the expression in f32-operation units, an upper bound (see
+    /// [`cost::op_weight`]). A loop leaf has none: its plan evaluates its inputs.
+    fn weight(&self) -> f64 {
+        if self.looped.get().is_some() { 0.0 } else { self.weight }
     }
 
     /// Levels of the expression below this node. The plan of a loop leaf evaluates its inputs,
@@ -1422,6 +1435,10 @@ pub(crate) fn create(
         .max()
         .unwrap_or(0);
 
+    // An upper bound of the work of the expression (operands that are shared count once per use).
+    let weight = cost::op_weight(op, &ctx.cost_model())
+        + args.iter().take(arity).map(|arg| if let Src::Node(operand) = arg { operand.weight() } else { 0.0 }).sum::<f64>();
+
     let depth = args
         .iter()
         .take(arity)
@@ -1451,6 +1468,7 @@ pub(crate) fn create(
         fused: AtomicBool::new(false),
         shift_depth,
         depth,
+        weight,
         shifted_reads: AtomicU32::new(0),
         readers: Readers::default(),
         requested: AtomicBool::new(false),
@@ -1498,13 +1516,19 @@ pub(crate) fn supersede(old: &Held, new: Arc<Node>) {
     let _ = old.end().link.next.set(Held::new(new));
 }
 
-/// A program structure with the verdict of lowering it (see [`JitState::inline_verdict`]).
+/// A program structure with the judgement of it (see [`JitState::judgement`]).
 #[derive(Debug)]
-struct VerdictEntry {
+struct JudgementEntry {
     cap: usize,
+    /// The length class (a power of two) the program was judged at.
+    class: usize,
     instrs: Arc<Vec<Instr>>,
     subs: Arc<Vec<Vec<Instr>>>,
-    verdict: Arc<Verdict>,
+    input_tys: Vec<ElemTy>,
+    outputs: Vec<u32>,
+    tail: program::Tail,
+    judgement: Arc<Judgement>,
+    estimates: inline::Estimates,
 }
 
 /// An operand of a node as [`ConsTable`] tells operations apart.
@@ -1604,17 +1628,28 @@ pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 
     stageable || claim_recompute(node)
 }
 
+/// Most lazy reads a node accepts however cheap its expression is.
+const MAX_LAZY_READS: u32 = 8;
+
 /// Whether a shift or view that reads `node` lazily (as a sub-program, once per read) may do so:
-/// the expression is small enough, holds no shifted sub-expression and has been read lazily
-/// fewer than twice so far. The third reader, which would compute the expression a third
-/// time, takes the evaluated buffer instead. Counts the read when it answers `true`.
+/// the expression is small enough, holds no shifted sub-expression, has been read lazily fewer
+/// than [`MAX_LAZY_READS`] times so far, and one more computation of it costs less than writing
+/// it and reading it back (by the cost model: the operations of the expression over all its
+/// elements against two passes over its bytes). The reader that would be one too many takes
+/// the evaluated buffer instead. Counts the read when it answers `true`.
 fn claim_recompute(node: &Node) -> bool {
     if node.size() > node.context().tuning().max_recomputed || node.shift_depth() != 0 {
         return false;
     }
+    let cost = node.context().cost_model();
+    let len = node.len() as f64;
+    let one_more = node.weight() * len / cost.f32_ops_per_ns;
+    if one_more > cost::kernel_ns(&cost, len * node.op().out_ty().bytes() as f64 * 2.0, 0.0) {
+        return false;
+    }
     let mut reads = node.shifted_reads.load(Ordering::Relaxed);
     loop {
-        if reads >= 2 {
+        if reads >= MAX_LAZY_READS {
             return false;
         }
         match node.shifted_reads.compare_exchange_weak(reads, reads + 1, Ordering::Relaxed, Ordering::Relaxed) {
@@ -1658,8 +1693,11 @@ pub(crate) struct JitState {
     /// Replaces the context's cost model when set (tests).
     #[cfg(test)]
     cost_override: Mutex<Option<cost::CostModel>>,
-    /// What lowering a program (see [`inline`]) found, by the structure of the program.
-    verdicts: Mutex<FxMap<u64, Vec<VerdictEntry>>>,
+    /// What judging a program (see [`inline::judge`]) found, by the structure of the program.
+    judgements: Mutex<FxMap<u64, Vec<JudgementEntry>>>,
+    /// The estimates of the last judgement made, as text (tests).
+    #[cfg(test)]
+    last_judgement: Mutex<Option<String>>,
     /// The programs seen so far by their shape hash, to make equal ones share their
     /// instructions (see [`JitState::intern`]).
     structures: Mutex<FxMap<u64, Vec<(Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>)>>>,
@@ -1732,7 +1770,9 @@ impl JitState {
             max_inlined: AtomicUsize::new(0),
             #[cfg(test)]
             cost_override: Mutex::new(None),
-            verdicts: Mutex::new(FxMap::default()),
+            judgements: Mutex::new(FxMap::default()),
+            #[cfg(test)]
+            last_judgement: Mutex::new(None),
             structures: Mutex::new(FxMap::default()),
             write_epoch: AtomicU64::new(0),
             cons: Mutex::new(ConsTable::default()),
@@ -1789,22 +1829,50 @@ impl JitState {
         }
     }
 
-    /// What lowering `key` (which [`inlines`](program::FusedKey::inlines)) gives with the cap of
-    /// `tuning`, found once per program structure.
-    pub(crate) fn inline_verdict(&self, tuning: &crate::tuning::Tuning, key: &program::FusedKey) -> Arc<Verdict> {
+    /// How to run `key` (which [`inlines`](program::FusedKey::inlines)) over about `len`
+    /// elements, found once per program structure and length class (see [`inline::judge`]).
+    pub(crate) fn judgement(&self, ctx: &Context, key: &program::FusedKey, len: usize) -> Arc<Judgement> {
         use std::hash::{Hash, Hasher};
-        let cap = self.max_inlined(tuning);
+        let cap = self.max_inlined(ctx.tuning());
+        let class = len.next_power_of_two();
         let mut hasher = FxHasher::default();
-        (cap, key.shape).hash(&mut hasher);
+        (cap, key.shape, class).hash(&mut hasher);
         let hash = hasher.finish();
-        let mut verdicts = lock(&self.verdicts);
-        let entries = verdicts.entry(hash).or_default();
-        if let Some(entry) = entries.iter().find(|entry| entry.cap == cap && entry.instrs == key.instrs && entry.subs == key.subs) {
-            return Arc::clone(&entry.verdict);
+        let mut judgements = lock(&self.judgements);
+        let entries = judgements.entry(hash).or_default();
+        let same = |entry: &JudgementEntry| {
+            entry.cap == cap
+                && entry.class == class
+                && (Arc::ptr_eq(&entry.instrs, &key.instrs) || entry.instrs == key.instrs)
+                && (Arc::ptr_eq(&entry.subs, &key.subs) || entry.subs == key.subs)
+                && entry.input_tys == key.input_tys
+                && entry.outputs == key.outputs
+                && entry.tail == key.tail
+        };
+        let (judgement, _estimates) = match entries.iter().find(|entry| same(entry)) {
+            Some(entry) => (Arc::clone(&entry.judgement), entry.estimates),
+            None => {
+                let (judgement, estimates) = inline::judge(key, class, cap, &ctx.cost_model());
+                let judgement = Arc::new(judgement);
+                entries.push(JudgementEntry {
+                    cap,
+                    class,
+                    instrs: Arc::clone(&key.instrs),
+                    subs: Arc::clone(&key.subs),
+                    input_tys: key.input_tys.clone(),
+                    outputs: key.outputs.clone(),
+                    tail: key.tail,
+                    judgement: Arc::clone(&judgement),
+                    estimates,
+                });
+                (judgement, estimates)
+            }
+        };
+        #[cfg(test)]
+        {
+            *lock(&self.last_judgement) = Some(format!("{judgement:?} {_estimates:?}"));
         }
-        let verdict = Arc::new(inline(key, cap));
-        entries.push(VerdictEntry { cap, instrs: Arc::clone(&key.instrs), subs: Arc::clone(&key.subs), verdict: Arc::clone(&verdict) });
-        verdict
+        judgement
     }
 
     /// Records that a buffer's contents are about to change (or did): operations written before
@@ -1890,11 +1958,18 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_cost_override(&self, model: cost::CostModel) {
         *lock(&self.cost_override) = Some(model);
+        lock(&self.judgements).clear();
     }
 
     #[cfg(test)]
     pub(crate) fn cost_override(&self) -> Option<cost::CostModel> {
         *lock(&self.cost_override)
+    }
+
+    /// The estimates behind the last judgement made, as text (tests).
+    #[cfg(test)]
+    pub(crate) fn last_judgement(&self) -> Option<String> {
+        lock(&self.last_judgement).clone()
     }
 
     #[cfg(test)]
@@ -2135,21 +2210,13 @@ impl JitState {
             return Ok(Arc::clone(core));
         }
         let segment_len = u32::try_from(ctx.segment_bytes() / 4).unwrap_or(u32::MAX);
-        // A program that was judged too big on the way here (it did not come from
-        // `flatten_inner`, which cuts those) is lowered in full.
-        let judged = key.inlines().then(|| self.inline_verdict(ctx.tuning(), key));
-        let uncapped;
-        let inlined = match judged.as_deref() {
-            Some(Verdict::Fits(inlined)) => Some(inlined),
-            Some(Verdict::TooBig { .. }) => {
-                uncapped = inline(key, usize::MAX);
-                match &uncapped {
-                    Verdict::Fits(inlined) => Some(inlined),
-                    Verdict::TooBig { .. } => None,
-                }
-            }
-            None => None,
-        };
+        // Whatever the judgement was, the kernel runs the program as it is: `flatten_inner` cut
+        // the ones the model wants cut, any other that got here is lowered in full.
+        let lowered = key.inlines().then(|| match inline(key, usize::MAX, &ctx.cost_model()) {
+            Verdict::Fits(inlined) => Some(inlined),
+            Verdict::TooBig { .. } => None,
+        });
+        let inlined = lowered.as_ref().and_then(Option::as_ref);
         #[cfg(test)]
         if let Some(inlined) = inlined {
             self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed);

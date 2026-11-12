@@ -85,6 +85,13 @@ pub enum SplitReason {
         /// The threshold of the device's tuning (`LUMA_FUSION_MAX_INLINED` overrides it).
         limit: usize,
     },
+    /// An expression read at several indices (through views) is stored once and read back: the
+    /// cost model estimates that computing it at every read costs more than the write and the
+    /// extra kernel.
+    Materialised {
+        /// Times the kernel would have computed the expression.
+        instances: usize,
+    },
 }
 
 /// A point where an expression was cut into several kernels, and why.
@@ -107,6 +114,7 @@ impl fmt::Display for FusionSplit {
             SplitReason::Inputs { inputs, limit } => write!(f, "{inputs} input buffers > {limit}"),
             SplitReason::Live { live, limit } => write!(f, "{live} live values > {limit}"),
             SplitReason::Inlined { instructions, limit } => write!(f, "{instructions} inlined operations > {limit}"),
+            SplitReason::Materialised { instances } => write!(f, "{instances} recomputations of an expression cost more than storing it"),
         }
     }
 }
