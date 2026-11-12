@@ -1,7 +1,6 @@
 use std::hash::Hash;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
-
 
 use wgpu::{Buffer, BufferUsages};
 
@@ -11,6 +10,7 @@ use crate::jit::JitState;
 use crate::gpu::pager::Pager;
 use crate::gpu::handle;
 use crate::gpu::hash::FxMap;
+use crate::gpu::lock;
 use crate::gpu::pool::{self, BufferPool};
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
 use crate::profile::{Profile, Profiler};
@@ -21,7 +21,6 @@ mod transfer;
 mod uniforms;
 #[cfg(test)]
 mod tests;
-
 
 use batch::{Batch, BindGroupCache, Bound};
 pub(crate) use batch::RawArg;
@@ -139,12 +138,6 @@ impl Drop for Lease {
 #[derive(Clone, Debug)]
 pub struct Context {
     inner: Arc<Inner>,
-}
-
-/// Locks `mutex`, ignoring poisoning: the guarded caches and free lists stay consistent even if
-/// a holder panicked.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 static DEFAULT_CONTEXT: OnceLock<Result<Context>> = OnceLock::new();

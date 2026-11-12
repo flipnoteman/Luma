@@ -1,11 +1,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use log::debug;
 use wgpu::{Device, InstanceDescriptor, MemoryHints, PowerPreference, Queue};
 
 use crate::context::DeviceKind;
 use crate::error::{LumaError, Result};
+use crate::gpu::lock;
 
 /// An opened device with its queue and what the adapter is. Clones are handles to the same
 /// device.
@@ -126,11 +127,6 @@ static IDLE: Mutex<Vec<Gpu>> = Mutex::new(Vec::new());
 /// while the devices of finished contexts are about to come back, and the driver caps how many
 /// devices can be alive at once (around 60 on NVIDIA; `RequestDevice(Device(Lost))` beyond).
 static OPENING: Mutex<()> = Mutex::new(());
-
-/// Locks `mutex`, ignoring poisoning: the guarded data stays consistent if a holder panicked.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// What [`DeviceKind::Auto`] resolved to the first time: `true` when it ended up on a CPU
 /// device. Fixed for the process so that every `Auto` context uses the same kind of device.

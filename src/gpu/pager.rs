@@ -10,17 +10,12 @@
 use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use crate::context::{copy_parallel, Context, STORAGE_USAGE};
 use crate::error::Result;
 use crate::gpu::pool;
-
-/// Locks `mutex`, ignoring poisoning: the guarded lists stay consistent even if a holder
-/// panicked.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
+use crate::gpu::lock;
 
 /// Smallest list length worth pruning.
 const PRUNE_MIN: usize = 32;

@@ -532,9 +532,7 @@ impl<T: GpuType> Array<T> {
     /// is returned here if the computation was not postponed, and otherwise by the array's next
     /// use.
     pub fn eval(&self) -> Result<()> {
-        self.request()?;
-        self.ctx.submit_requested()?;
-        self.check()
+        crate::eval_all(&[self])
     }
 
     /// Asks for the array to be computed at the next submission, or returns its error.

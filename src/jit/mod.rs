@@ -64,13 +64,14 @@ mod tests;
 
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::array::{Failure, Storage};
 use crate::builtin::{BinOp, CmpOp, UnOp};
 use crate::context::Context;
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::FxMap;
+use crate::gpu::lock;
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 
@@ -98,12 +99,6 @@ const MAX_INPUTS: usize = 16;
 /// Environment variable overriding [`DEFAULT_MAX_NODES`] for new contexts. `1` makes every
 /// operation its own kernel.
 const MAX_NODES_ENV: &str = "LUMA_FUSION_MAX_NODES";
-
-/// Locks `mutex`, ignoring poisoning: the guarded lists stay consistent even if a holder
-/// panicked.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Element type of a lazy operation's operands and results.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
