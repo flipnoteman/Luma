@@ -113,6 +113,15 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- A scalar reduction followed by elementwise operations with scalars on its one-element result
+  (`x.norm()`, `x.mean()`, `(x.sum() / n).sqrt()`; up to four operations on `f32`) finishes inside
+  the last pass of the reduction instead of launching an elementwise kernel for the result: the
+  norm of a large array is 2 launches (first pass, one pass over the partial results), of a
+  small one 1 (was 3 and 2). The result stays a lazy one-element array that other expressions
+  broadcast. A reduction of an `f32` array that is already evaluated is now lazy too (it records
+  when its result is used, like the reduction of an expression; a write into the array before
+  that evaluates a copy first). If a reduction and a step on it are both used, the reduction
+  runs twice unless it ran first.
 - Fusion decisions use the cost model: a kernel that reads an expression through views at several
   indices (slices, pads, flips, `take`) recomputes it at every read, or evaluates it first and
   reads it back, whichever the device's `CostModel` estimates to be cheaper (evaluating first must

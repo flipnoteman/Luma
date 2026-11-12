@@ -18,7 +18,7 @@
 
 use std::fmt::Write;
 
-use crate::builtin::{df_library, reduce_main, ReduceElem};
+use crate::builtin::{df_library, reduce_main, substitute, ReduceElem};
 use crate::tuning::{Tuning, STENCIL_RADIUS};
 
 use super::inline::{Inlined, Lowered, StagedPrograms};
@@ -26,30 +26,6 @@ use super::program::{calls_df_library, FusedKey, Instr, Ref, Tail};
 use super::staging::Staging;
 use super::stencil::{signed, wrap_source, WORKGROUP};
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
-
-/// `template` with its operand identifiers `x` and `y` replaced by `a` and `b`.
-fn substitute(template: &str, a: &str, b: &str) -> String {
-    let mut out = String::with_capacity(template.len() + 16);
-    let mut word = String::new();
-    let flush = |word: &mut String, out: &mut String| {
-        match word.as_str() {
-            "x" => out.push_str(a),
-            "y" => out.push_str(b),
-            other => out.push_str(other),
-        }
-        word.clear();
-    };
-    for c in template.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            word.push(c);
-        } else {
-            flush(&mut word, &mut out);
-            out.push(c);
-        }
-    }
-    flush(&mut word, &mut out);
-    out
-}
 
 /// The WGSL name of an operand of type `ty`. The scalars of an `f64` or `Df32` operand are
 /// several `f32` slots of the uniform (see `Scalar::words`).
@@ -413,6 +389,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         }
         for (k, ty) in key.scalar_tys.iter().enumerate() {
             let _ = write!(src, "s{k}: {}, ", ty.wgsl());
+        }
+        if let Tail::Reduce(ops) = key.tail {
+            src.push_str(&ops.epilogue().fields());
         }
         src.push_str("}\n");
     }

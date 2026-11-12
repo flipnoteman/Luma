@@ -1066,6 +1066,12 @@ fn scalars(b: &mut Bench) {
     let hsum = |d: &Dat| d.ha.iter().map(|&v| f64::from(v)).sum::<f64>();
 
     b.scalar("reduce/sum", one, small, false, 1.0, 1e-4, &|d| f64::from(d.a.sum().item().unwrap()), &hsum);
+    // The square root runs in the last pass of the reduction (item 5): two launches, not three.
+    b.scalar(
+        "reduce/norm", one, small, false, 1.0, 1e-4,
+        &|d| f64::from(d.a.norm().item().unwrap()),
+        &|d| d.ha.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt(),
+    );
     b.scalar(
         "reduce/sum_of_expr", one, small, true, 2.0, 1e-4,
         &|d| f64::from((&d.a * &d.b + 1.0).sum().item().unwrap()),

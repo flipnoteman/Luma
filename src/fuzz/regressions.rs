@@ -559,3 +559,20 @@ fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost_wit
         ],
     });
 }
+
+/// Epilogue fusion (item 5): `a = abs(sum(x))` is a step on a lazy reduction; the reduction is
+/// then written in place (`s -= s`, which records it into its own buffer). `a` is the value the
+/// sum had when `a` was written, so it must not read the buffer afterwards.
+#[test]
+fn a_step_on_a_reduction_does_not_read_the_buffer_the_reduction_is_later_written_through() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Reduce { src: 0, op: Sum },
+            Unary { src: 1, op: Abs },
+            Compound { target: 1, op: Sub, rhs: Var(1) },
+        ],
+    });
+}
