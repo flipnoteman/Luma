@@ -174,3 +174,14 @@ fn a_state_stops_only_when_its_bits_stop_changing() {
     let [v] = iterate_all([&zero], 3, |[u]| [-u]);
     assert!(v.to_vec().unwrap().iter().all(|v| v.to_bits() == (-0.0f32).to_bits()));
 }
+
+#[test]
+fn a_state_that_cycles_never_stops_early() {
+    let ctx = Context::new().unwrap();
+    let start = Array::<f32>::full_on(&ctx, 64, 0.25).unwrap();
+    for steps in [7, 8, 9, 16, 17, 33] {
+        let [u] = iterate_all([&start], steps, |[u]| [1.0 - u]);
+        let want = if steps % 2 == 0 { 0.25 } else { 0.75 };
+        assert!(u.to_vec().unwrap().iter().all(|&v| v == want), "{steps} steps");
+    }
+}
