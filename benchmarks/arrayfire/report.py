@@ -15,7 +15,7 @@ TITLES = {
 }
 
 
-EXCLUDED = {"custom_kernel", "lazy_chain", "per_step_cold", "eval_every_1_cold"}
+EXCLUDED = {"custom_kernel", "lazy_chain", "per_step_cold", "eval_every_1_cold", "iterate_until"}
 
 
 def pairs(workload, variants):

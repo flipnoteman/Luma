@@ -171,6 +171,12 @@ fn check_aliasing(args: &[RawArg<'_>]) -> Result<()> {
     Ok(())
 }
 
+/// How a launch gets its workgroup counts: given, or read from a buffer when the dispatch runs.
+enum Dispatch<'a> {
+    Direct([u32; 3]),
+    Indirect(&'a Buffer, u64),
+}
+
 impl Context {
     /// `true` while earlier submissions are still running on the GPU. A failed poll counts as
     /// idle, so that the submission goes ahead and the waiting paths report the error.
@@ -332,9 +338,28 @@ impl Context {
         args: &[RawArg<'_>],
     ) -> Result<()> {
         check_aliasing(args)?;
+        let mut guard = self.batch()?;
+        self.record_launch(&mut guard, kernel, Dispatch::Direct(workgroups), size, args)?;
+        if guard.dispatches >= BATCH_LIMIT {
+            self.flush_locked(&mut guard);
+        }
+        Ok(())
+    }
+
+    /// Like [`Context::launch`], but the workgroup counts are the three words of `args` at byte
+    /// `offset`, read when the dispatch runs; `args` needs `BufferUsages::INDIRECT`.
+    pub(crate) fn launch_indirect(
+        &self,
+        kernel: &KernelCore,
+        args: &Buffer,
+        offset: u64,
+        size: [u32; 3],
+        raw: &[RawArg<'_>],
+    ) -> Result<()> {
+        check_aliasing(raw)?;
 
         let mut guard = self.batch()?;
-        self.record_launch(&mut guard, kernel, workgroups, size, args)?;
+        self.record_launch(&mut guard, kernel, Dispatch::Indirect(args, offset), size, raw)?;
         if guard.dispatches >= BATCH_LIMIT {
             self.flush_locked(&mut guard);
         }
@@ -348,7 +373,7 @@ impl Context {
         &self,
         batch: &mut Batch,
         kernel: &KernelCore,
-        workgroups: [u32; 3],
+        dispatch: Dispatch<'_>,
         size: [u32; 3],
         args: &[RawArg<'_>],
     ) -> Result<()> {
@@ -488,7 +513,10 @@ impl Context {
             pass.set_bind_group(1, args_group, offsets.as_slice());
             bound.args = Some((key, index));
         }
-        pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+        match dispatch {
+            Dispatch::Direct([x, y, z]) => pass.dispatch_workgroups(x, y, z),
+            Dispatch::Indirect(buffer, offset) => pass.dispatch_workgroups_indirect(buffer, offset),
+        }
         if profiled {
             *pass_slot = None;
         }

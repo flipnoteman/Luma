@@ -59,6 +59,7 @@ mod launch;
 mod program;
 mod readers;
 mod stencil;
+mod until;
 #[cfg(test)]
 mod tests;
 
@@ -78,6 +79,7 @@ use crate::kernel::{self, KernelCore, KernelKey};
 pub(crate) use launch::{evaluate, evaluate_group, evaluate_into, reduce_first_pass, run_loop};
 pub(crate) use readers::Readers;
 pub(crate) use stencil::plan as stencil_plan;
+pub(crate) use until::run_until;
 
 /// Length of the requested list at which entries of dropped or computed nodes are pruned.
 const REQUESTED_PRUNE_AT: usize = 256;

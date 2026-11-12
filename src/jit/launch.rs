@@ -116,7 +116,7 @@ fn launch_loop(
     Ok(outputs)
 }
 
-fn len_u32(len: usize) -> Result<u32, LumaError> {
+pub(super) fn len_u32(len: usize) -> Result<u32, LumaError> {
     u32::try_from(len).map_err(|_| LumaError::InvalidShape(format!("{len} elements exceed u32")))
 }
 
@@ -199,7 +199,7 @@ fn in_place_eligible(key: &FusedKey, k: u32) -> bool {
 }
 
 /// How a program with shifts runs on arrays spanning several segments (see [`spans`]).
-struct Shifted {
+pub(super) struct Shifted {
     /// Elements of the arrays: the shifts wrap around this length.
     len: usize,
     /// Per output segment and input, the ids of the segments bound as slots.
@@ -355,7 +355,7 @@ fn segment_ids(shifted: Option<&Shifted>, j: usize) -> Result<Option<&[Vec<u32>]
 /// the generated source, each with the bytes to bind. `inputs` lack the in-place input of `key`.
 /// With `ids` (the segmented variant) an input is bound as itself only if the program loads it
 /// at the element being computed, then once per slot.
-fn pin_inputs(
+pub(super) fn pin_inputs(
     key: &FusedKey,
     inputs: &[Arc<Storage>],
     ids: Option<&[Vec<u32>]>,
@@ -390,7 +390,7 @@ fn pin_inputs(
 /// The words of the uniform of segment `j`: `n` (reductions), then, for the segmented variant,
 /// the first element of the segment, the array length and the slot ids of every input, then the
 /// scalars. Borrows `scalars` when nothing else goes in front of them.
-fn params<'a>(
+pub(super) fn params<'a>(
     key: &FusedKey,
     ids: Option<&[Vec<u32>]>,
     n: Option<u32>,
@@ -415,9 +415,52 @@ fn params<'a>(
     Ok(Cow::Owned(words))
 }
 
-/// Launches the store kernel `core` of `key` once per segment of `outputs[0]`: `outputs`, then
-/// the inputs as reads (see [`pin_inputs`]), then the uniform (see [`params`]). Counts as one
-/// elementwise launch.
+/// What a launch of the store kernel `key` binds for segment `j` of `outputs[0]`: `outputs`, then
+/// the inputs as reads (see [`pin_inputs`]), then the uniform (see [`params`]).
+pub(super) struct StoreArgs<'a> {
+    pub(super) n: u32,
+    bytes: u64,
+    outs: Vec<Pin>,
+    ins: Vec<(Pin, u64)>,
+    words: Cow<'a, [u32]>,
+}
+
+impl StoreArgs<'_> {
+    pub(super) fn raw(&self) -> Vec<RawArg<'_>> {
+        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(self.outs.len() + self.ins.len() + 1);
+        raw.extend(self.outs.iter().map(|pin| RawArg::write(pin.buffer(), self.bytes)));
+        raw.extend(self.ins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        if !self.words.is_empty() {
+            raw.push(RawArg::Uniform(bytemuck::cast_slice(&self.words)));
+        }
+        raw
+    }
+}
+
+/// The arguments of the launch of segment `j` of `outputs[0]`; `outputs` must not be empty.
+pub(super) fn store_args<'a>(
+    key: &FusedKey,
+    outputs: &[&Storage],
+    inputs: &[Arc<Storage>],
+    scalars: &'a [u32],
+    shifted: Option<&Shifted>,
+    j: usize,
+) -> Result<StoreArgs<'a>, LumaError> {
+    let Some(first) = outputs.first() else {
+        return Err(LumaError::Gpu("fused kernel without output".into()));
+    };
+    let range = first.range(j);
+    let n = len_u32(range.len())?;
+    let bytes = u64::from(n) * ELEMENT_BYTES;
+    let ids = segment_ids(shifted, j)?;
+    let outs = outputs.iter().map(|out| out.pin(j)).collect::<Result<Vec<_>, _>>()?;
+    let ins = pin_inputs(key, inputs, ids, j, n)?;
+    let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
+    Ok(StoreArgs { n, bytes, outs, ins, words })
+}
+
+/// Launches the store kernel `core` of `key` once per segment of `outputs[0]`, with the arguments
+/// of [`store_args`]. Counts as one elementwise launch.
 fn launch_store(
     ctx: &crate::context::Context,
     core: &crate::kernel::KernelCore,
@@ -429,20 +472,8 @@ fn launch_store(
 ) -> Result<(), LumaError> {
     let Some(first) = outputs.first() else { return Ok(()) };
     for j in 0..first.segments() {
-        let range = first.range(j);
-        let n = len_u32(range.len())?;
-        let bytes = u64::from(n) * ELEMENT_BYTES;
-        let ids = segment_ids(shifted, j)?;
-        let out_pins = outputs.iter().map(|out| out.pin(j)).collect::<Result<Vec<_>, _>>()?;
-        let in_pins = pin_inputs(key, inputs, ids, j, n)?;
-        let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
-        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outputs.len() + in_pins.len() + 1);
-        raw.extend(out_pins.iter().map(|pin| RawArg::write(pin.buffer(), bytes)));
-        raw.extend(in_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
-        if !words.is_empty() {
-            raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
-        }
-        launch_1d(ctx, core, n, &raw)?;
+        let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
+        launch_1d(ctx, core, args.n, &args.raw())?;
     }
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     Ok(())
