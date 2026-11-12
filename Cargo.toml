@@ -2,7 +2,7 @@
 name = "luma"
 version = "0.2.0"
 edition = "2024"
-description = "GPU driven linear algebra/math library."
+description = "Lazy GPU arrays for Rust on wgpu (Vulkan, Metal, DX12): fused elementwise kernels, reductions, FFT convolution, custom WGSL kernels"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/flipnoteman/Luma"
