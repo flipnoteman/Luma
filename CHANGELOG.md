@@ -23,8 +23,9 @@ All notable changes to Luma are listed here. The format follows
 
 - On-disk cache: the driver's compiled pipelines (wgpu `PipelineCache`, Vulkan) and the calibrated
   cost model are kept in `$XDG_CACHE_HOME/luma` (else `~/.cache/luma`; `LUMA_CACHE_DIR` moves it,
-  `LUMA_CACHE=off` disables it), one file per adapter and driver, written atomically; a damaged
-  file is ignored. A second process that builds the same kernels skips the driver's compile (the
+  `LUMA_CACHE=off` disables it), one file per adapter and driver, written atomically when a
+  context's device is released and at process exit; a damaged file is ignored. A second process
+  that builds the same kernels skips the driver's compile (the
   multi-second first call of large `Df32` kernels), and the calibration runs once per machine. A
   calibration worse than the profile's numbers by more than 4 times (a GPU shared with other
   processes) is measured once more and then dropped, neither used nor stored.

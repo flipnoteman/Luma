@@ -15,7 +15,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use log::debug;
 
@@ -30,9 +29,6 @@ const PIPELINES: [u8; 8] = *b"LUMAPIPE";
 const COST: [u8; 8] = *b"LUMACOST";
 /// Magic, format, payload length, payload checksum.
 const HEADER: usize = 8 + 4 + 8 + 8;
-/// The pipeline cache is written at most this often while pipelines keep being built (and once
-/// more when the context goes away or the process exits).
-const SAVE_EVERY: Duration = Duration::from_secs(2);
 
 /// FNV-1a: a stable 64-bit hash, for checksums and file names.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -130,12 +126,10 @@ fn write_blob(path: &Path, magic: [u8; 8], payload: &[u8]) -> std::io::Result<()
     written
 }
 
-/// What was last written, and when.
+/// What was last written.
 struct Saved {
     /// Hash of the pipeline cache data on disk (or loaded from it), 0 if none.
     hash: u64,
-    /// When the pipeline cache was last written.
-    at: Instant,
     /// Whether pipelines were built since.
     pending: bool,
 }
@@ -187,7 +181,7 @@ impl DiskCache {
             dir,
             key,
             pipelines,
-            saved: Mutex::new(Saved { hash, at: Instant::now().checked_sub(SAVE_EVERY).unwrap_or_else(Instant::now), pending: false }),
+            saved: Mutex::new(Saved { hash, pending: false }),
         })
     }
 
@@ -196,39 +190,37 @@ impl DiskCache {
         self.pipelines.as_ref()
     }
 
-    /// Notes that a pipeline was just created with [`pipelines`](Self::pipelines), and writes
-    /// the cache out unless that happened less than [`SAVE_EVERY`] ago.
+    /// Notes that a pipeline was just created with [`pipelines`](Self::pipelines). The cache is
+    /// written when the context's device is released and at process exit
+    /// ([`flush`](Self::flush)), never while pipelines are being built: reading the driver's cache
+    /// data and writing megabytes of it slowed the first launches of a run by tens of
+    /// milliseconds even from a background thread.
     pub(crate) fn built(&self) {
-        if self.pipelines.is_none() {
-            return;
-        }
-        let mut saved = lock(&self.saved);
-        saved.pending = true;
-        if saved.at.elapsed() >= SAVE_EVERY {
-            self.save(&mut saved);
+        if self.pipelines.is_some() {
+            lock(&self.saved).pending = true;
         }
     }
 
-    /// Writes the pipeline cache out if pipelines were built since it was last written.
+    /// Writes the pipeline cache out, on the calling thread, if pipelines were built since it was
+    /// last written.
     pub(crate) fn flush(&self) {
-        let mut saved = lock(&self.saved);
-        if saved.pending {
-            self.save(&mut saved);
+        let pending = std::mem::take(&mut lock(&self.saved).pending);
+        if pending {
+            self.write_out();
         }
     }
 
-    /// Writes the data of the pipeline cache if it changed.
-    fn save(&self, saved: &mut Saved) {
-        saved.pending = false;
-        saved.at = Instant::now();
+    /// Writes the data of the pipeline cache if it changed since the last write. Holds the lock
+    /// on [`Saved`] only to compare and record the hash, so that builds never wait for the disk.
+    fn write_out(&self) {
         let (Some(dir), Some(pipelines)) = (&self.dir, &self.pipelines) else { return };
         let Some(data) = pipelines.get_data() else { return };
         let hash = fnv1a(&data);
-        if hash == saved.hash {
+        if hash == lock(&self.saved).hash {
             return;
         }
         match write_blob(&dir.join(format!("pipelines-{}.bin", self.key)), PIPELINES, &data) {
-            Ok(()) => saved.hash = hash,
+            Ok(()) => lock(&self.saved).hash = hash,
             Err(error) => debug!("luma: writing the pipeline cache failed: {error}"),
         }
     }
