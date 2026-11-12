@@ -1249,6 +1249,56 @@ fn lines(b: &mut Bench) {
         let mut f = || solve_block_tridiagonal(4, 1, &lo, &diag, &up, &rhs).eval().unwrap();
         b.time("tri/block4_axis1", &format!("4x{blk}x{blk}"), Tp::Bytes((3.0 * 16.0 + 2.0 * 4.0) * 4.0 * (blk * blk) as f64), true, &mut f);
     });
+
+    // Few, long lines: the one-invocation-per-line Thomas solve leaves the device idle, a workgroup
+    // per line (cyclic reduction) does not. 200 lines of 4096 along each axis, and 4x4 blocks:
+    // 100 lines of 1024 along each axis. Each result is checked against the host in full.
+    for (axis, label) in [(0usize, "axis0"), (1, "axis1")] {
+        let name = format!("tri/few_lines_{label}");
+        b.guarded(&name, |b| {
+            let ctx = b.ctx.clone();
+            let (len, lines) = (4096, 200);
+            let dims = if axis == 0 { [len, lines] } else { [lines, len] };
+            let n = len * lines;
+            let host = [
+                values(n, 61, -1.0, 1.0),
+                values(n, 62, -1.0, 1.0).iter().map(|v| 4.0 + v).collect::<Vec<_>>(),
+                values(n, 63, -1.0, 1.0),
+                values(n, 64, -1.0, 1.0),
+            ];
+            let [lo, diag, up, rhs]: [A; 4] = std::array::from_fn(|k| Array::from_slice_on(&ctx, &host[k], dims).unwrap());
+            let got = solve_tridiagonal(axis, &lo, &diag, &up, &rhs).to_vec().unwrap();
+            let want = host_tri(1, [dims[0], dims[1], 1], axis, &host[0], &host[1], &host[2], &host[3]);
+            check(&name, &got, &want, 1e-4, 1e-4);
+            let mut f = || solve_tridiagonal(axis, &lo, &diag, &up, &rhs).eval().unwrap();
+            b.time(&name, &format!("{}x{}", dims[0], dims[1]), Tp::Bytes(5.0 * 4.0 * n as f64), true, &mut f);
+        });
+    }
+    for (axis, label) in [(1usize, "axis1"), (2, "axis2")] {
+        let name = format!("tri/few_lines_block4_{label}");
+        b.guarded(&name, |b| {
+            let ctx = b.ctx.clone();
+            let (len, lines) = (1024, 100);
+            let grid = if axis == 1 { [len, lines] } else { [lines, len] };
+            let cells = len * lines;
+            let mut diag = values(cells * 16, 72, -1.0, 1.0);
+            for (k, v) in diag.iter_mut().enumerate() {
+                if (k % 16) / 4 == k % 4 {
+                    *v += 8.0;
+                }
+            }
+            let host = [values(cells * 16, 71, -1.0, 1.0), diag, values(cells * 16, 73, -1.0, 1.0), values(cells * 4, 74, -1.0, 1.0)];
+            let [lo, diag, up, rhs]: [A; 4] = std::array::from_fn(|k| {
+                let c = if k == 3 { 4 } else { 16 };
+                Array::from_slice_on(&ctx, &host[k], [c, grid[0], grid[1]]).unwrap()
+            });
+            let got = solve_block_tridiagonal(4, axis, &lo, &diag, &up, &rhs).to_vec().unwrap();
+            let want = host_tri(4, [grid[0], grid[1], 1], axis - 1, &host[0], &host[1], &host[2], &host[3]);
+            check(&name, &got, &want, 1e-3, 1e-3);
+            let mut f = || solve_block_tridiagonal(4, axis, &lo, &diag, &up, &rhs).eval().unwrap();
+            b.time(&name, &format!("4x{}x{}", grid[0], grid[1]), Tp::Bytes((3.0 * 16.0 + 2.0 * 4.0) * 4.0 * cells as f64), true, &mut f);
+        });
+    }
 }
 
 /// Dense solve of `m x = r` (`n x n`, row-major) with partial pivoting in f64.
@@ -1277,7 +1327,8 @@ fn dense_solve(mut m: Vec<f64>, mut r: Vec<f64>, n: usize) -> Vec<f64> {
     r
 }
 
-/// Host block-tridiagonal solve of every line of `grid` along `axis`; blocks of `b` (coefficients
+/// Host block-tridiagonal solve of every line of `grid` along `axis` (block Thomas algorithm in
+/// `f64`, each `b x b` pivot solved densely with partial pivoting); blocks of `b` (coefficients
 /// `b * b` per cell, `rhs` `b`).
 #[allow(clippy::too_many_arguments)]
 fn host_tri(b: usize, grid: [usize; 3], axis: usize, lo: &[f32], diag: &[f32], up: &[f32], rhs: &[f32]) -> Vec<f32> {
@@ -1285,32 +1336,46 @@ fn host_tri(b: usize, grid: [usize; 3], axis: usize, lo: &[f32], diag: &[f32], u
     let n = grid[axis];
     let stride: usize = grid[..axis].iter().product();
     let mut x = vec![0.0f32; cells * b];
+    let block = |a: &[f32], q: usize| -> Vec<f64> { (0..b * b).map(|k| f64::from(a[q * b * b + k])).collect() };
     for l in 0..cells / n {
         let base = (l % stride) + (l / stride) * stride * n;
-        let size = n * b;
-        let mut matrix = vec![0.0f64; size * size];
-        let mut r = vec![0.0f64; size];
+        // Swept upper blocks `c[s]` (row-major `b x b`) and right-hand sides `d[s]`.
+        let mut c: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut d: Vec<Vec<f64>> = Vec::with_capacity(n);
         for s in 0..n {
             let q = base + s * stride;
-            for i in 0..b {
-                r[s * b + i] = f64::from(rhs[q * b + i]);
-                for j in 0..b {
-                    matrix[(s * b + i) * size + s * b + j] = f64::from(diag[q * b * b + i * b + j]);
-                    if s > 0 {
-                        matrix[(s * b + i) * size + (s - 1) * b + j] = f64::from(lo[q * b * b + i * b + j]);
-                    }
-                    if s + 1 < n {
-                        matrix[(s * b + i) * size + (s + 1) * b + j] = f64::from(up[q * b * b + i * b + j]);
+            let mut m = block(diag, q);
+            let mut r: Vec<f64> = (0..b).map(|i| f64::from(rhs[q * b + i])).collect();
+            if s > 0 {
+                let lq = block(lo, q);
+                for i in 0..b {
+                    for k in 0..b {
+                        for j in 0..b {
+                            m[i * b + j] -= lq[i * b + k] * c[s - 1][k * b + j];
+                        }
+                        r[i] -= lq[i * b + k] * d[s - 1][k];
                     }
                 }
             }
-        }
-        let sol = dense_solve(matrix, r, size);
-        for s in 0..n {
-            let q = base + s * stride;
-            for i in 0..b {
-                x[q * b + i] = sol[s * b + i] as f32;
+            let uq = block(up, q);
+            let mut cs = vec![0.0f64; b * b];
+            for j in 0..b {
+                let column = dense_solve(m.clone(), (0..b).map(|i| uq[i * b + j]).collect(), b);
+                for i in 0..b {
+                    cs[i * b + j] = column[i];
+                }
             }
+            d.push(dense_solve(m, r, b));
+            c.push(cs);
+        }
+        let mut next = vec![0.0f64; b];
+        for s in (0..n).rev() {
+            let q = base + s * stride;
+            let cur: Vec<f64> = (0..b).map(|i| d[s][i] - (0..b).map(|k| c[s][i * b + k] * next[k]).sum::<f64>()).collect();
+            for i in 0..b {
+                x[q * b + i] = cur[i] as f32;
+            }
+            next = cur;
         }
     }
     x
