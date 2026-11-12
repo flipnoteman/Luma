@@ -23,6 +23,11 @@ All notable changes to Luma are listed here. The format follows
 
 - `SplitReason::Materialised`: reported by profiling when the cost model evaluates a shared
   expression first because recomputing it at every read costs more than storing it.
+- Workgroup staging of views: an expression read through slices, shifted slices or pads of a 1-D or
+  2-D array at several offsets (a face flux read by the two cells that share it, a stencil of an
+  edge-padded expression) can be computed once per cell of a workgroup tile in workgroup memory
+  instead of once per read, including expressions that read other staged expressions. The cost
+  model chooses between recomputing, staging and storing; `LUMA_STAGING=off` disables staging.
 - `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
   `Df32` and `f64` arithmetic), measured when a context opens (once per device and process;
   `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).

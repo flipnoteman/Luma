@@ -12,6 +12,7 @@ use crate::gpu::hash::FxMap;
 use super::codegen::Tile;
 use super::inline::Judgement;
 use super::launch::force_group;
+use super::staging::Staging;
 use super::{lock, Args, Edge, Flattening, ElemTy, Node, Op, OpKind, Scalar, ShiftKind, Src, ViewMap};
 
 
@@ -106,6 +107,9 @@ pub(crate) struct FusedKey {
     /// Set by `launch::run_store` like `spans` and `in_place`: the source stages the sub-programs
     /// in workgroup memory (see [`Tile`]) instead of calling them per shift.
     pub(crate) tile: Option<Tile>,
+    /// Set by `JitState::judgement` (and cleared by `launch::run_store` where staging cannot run):
+    /// the source stages sub-programs read through views in workgroup memory (see [`Staging`]).
+    pub(crate) staging: Option<Staging>,
     /// The uniform slot (a `u32`, always 0) the double-float library hides its operations behind
     /// (see `builtin::df_library`); set when the program runs arithmetic or casts of a `Df32`
     /// (`reads_guard`), or reduces one.
@@ -146,6 +150,7 @@ impl std::hash::Hash for FusedKey {
         self.in_place.hash(state);
         self.spans.hash(state);
         self.tile.hash(state);
+        self.staging.hash(state);
         self.guard.hash(state);
     }
 }
@@ -610,6 +615,7 @@ impl Flattener {
                 in_place: Vec::new(),
                 spans: Vec::new(),
                 tile: None,
+                staging: None,
                 guard,
             },
             inputs: self.inputs,
@@ -879,19 +885,23 @@ pub(super) fn flatten_inner(
             force_group(&sub_roots)?;
             continue;
         }
-        if fused.key.inlines()
-            && let Judgement::Materialise { sub, reason } = &*jit.judgement(ctx, &fused.key, first.len())
-        {
-            jit.note_split(first.name, first.location, *reason);
-            let node = fused.sub_roots.get(*sub as usize).cloned();
-            drop(fused);
-            if let Some(node) = node {
-                jit.evaluate_alongside(Arc::clone(&node));
-                if let Err(error) = node.force() {
-                    return Err(Failure::Inherited(Arc::clone(error)));
+        if fused.key.inlines() {
+            let judgement = jit.judgement(ctx, &fused.key, first.len());
+            match &*judgement {
+                Judgement::Materialise { sub, reason } => {
+                    jit.note_split(first.name, first.location, *reason);
+                    let node = fused.sub_roots.get(*sub as usize).cloned();
+                    drop(fused);
+                    if let Some(node) = node {
+                        jit.evaluate_alongside(Arc::clone(&node));
+                        if let Err(error) = node.force() {
+                            return Err(Failure::Inherited(Arc::clone(error)));
+                        }
+                    }
+                    continue;
                 }
+                Judgement::Run { staging } => fused.key.staging = staging.clone(),
             }
-            continue;
         }
         return Ok(fused);
     }

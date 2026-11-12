@@ -21,8 +21,9 @@ use std::fmt::Write;
 use crate::builtin::{df_library, reduce_main, ReduceElem};
 use crate::tuning::{Tuning, STENCIL_RADIUS};
 
-use super::inline::Inlined;
+use super::inline::{Inlined, Lowered, StagedPrograms};
 use super::program::{calls_df_library, FusedKey, Instr, Ref, Tail};
+use super::staging::Staging;
 use super::stencil::{signed, wrap_source, WORKGROUP};
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
 
@@ -149,11 +150,12 @@ pub(super) fn views_of(key: &FusedKey) -> Vec<(ViewMap, Edge)> {
     views
 }
 
-/// [`views_of`] for a lowered key: the distinct views of the contexts of `inlined` (which include
-/// the compositions no instruction of the key names), in order of creation.
-fn views_of_inlined(key: &FusedKey, inlined: &Inlined) -> Vec<(ViewMap, Edge)> {
+/// [`views_of`] for a lowered key: the distinct views of the contexts of `lowered` (the programs
+/// of one kernel; they include the compositions no instruction of the key names), in order of
+/// creation.
+fn views_of_inlined(key: &FusedKey, lowered: &[&Inlined]) -> Vec<(ViewMap, Edge)> {
     let mut views = Vec::new();
-    for ctx in &inlined.ctxs {
+    for ctx in lowered.iter().flat_map(|inlined| &inlined.ctxs) {
         if let ShiftKind::View { map, edge } = ctx.kind
             && !views.contains(&(map, edge))
         {
@@ -358,10 +360,17 @@ pub(super) fn direct(instrs: &[Instr], k: u32) -> bool {
 
 /// The WGSL source of the kernel for `key`, with the workgroup shapes `tuning` gives.
 /// `segment_len` (a power of two) is the elements per segment of the arrays the segmented
-/// variant (`key.spans` not empty) runs on. `inlined` is the lowering of `key` (see
+/// variant (`key.spans` not empty) runs on. `lowered` is the lowering of `key` (see
 /// `jit::inline`) if it [`inlines`](FusedKey::inlines): the body then computes every
-/// sub-program at the indices it is read at, and no `sub{k}` functions exist.
-pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, inlined: Option<&Inlined>) -> String {
+/// sub-program at the indices it is read at, and no `sub{k}` functions exist; for a
+/// [`Lowered::Staged`] key (`key.staging` set) the staged sub-programs are computed into
+/// workgroup memory instead.
+pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lowered>) -> String {
+    let inlined = match lowered {
+        Some(Lowered::Plain(inlined)) => Some(inlined),
+        Some(Lowered::Staged(programs)) => Some(&programs.main),
+        None => None,
+    };
     let wg = tuning.elementwise_workgroup;
     let reduce = matches!(key.tail, Tail::Reduce(_));
     let segmented = !key.spans.is_empty();
@@ -434,7 +443,11 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, inlined:
             let _ = writeln!(src, "    return in{k}_{}[o];\n}}", m - 1);
         }
     }
-    let views = inlined.map_or_else(|| views_of(key), |inlined| views_of_inlined(key, inlined));
+    let views = match lowered {
+        Some(Lowered::Plain(inlined)) => views_of_inlined(key, &[inlined]),
+        Some(Lowered::Staged(programs)) => views_of_inlined(key, &std::iter::once(&programs.main).chain(&programs.subs).collect::<Vec<_>>()),
+        None => views_of(key),
+    };
     // The lowered instruction holding the value of main-program instruction `at`.
     let value = |at: usize| inlined.and_then(|inlined| inlined.main.get(at)).map_or(at, |&lowered| lowered as usize);
     // A reduction of `Df32` brings the library itself (see `reduce_main`).
@@ -445,7 +458,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, inlined:
     src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
     src.push_str(&view_helpers(&views));
     let names = Names { views: &views, in_place: &key.in_place };
-    if key.tile.is_none() && inlined.is_none() {
+    if key.tile.is_none() && lowered.is_none() {
         src.push_str(&subs(key, &views, &key.in_place));
     }
 
@@ -471,6 +484,10 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, inlined:
                 src.push_str(&tiled_main(key, tile, based, &stores, &names));
                 return src;
             }
+            if let (Some(Lowered::Staged(programs)), Some(staging)) = (lowered, &key.staging) {
+                src.push_str(&staged_main(key, staging, programs, based, &stores, &names));
+                return src;
+            }
             let _ = write!(
                 src,
                 "
@@ -481,7 +498,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 {global}{}{stores}}}
 ",
                 match inlined {
-                    Some(inlined) => lowered_body(key, inlined, &names, index),
+                    Some(inlined) => lowered_body(key, inlined, &names, index, None),
                     None => body(&key.instrs, &key.input_tys, &names, index, segmented),
                 }
             );
@@ -498,7 +515,7 @@ fn luma_eval(i: u32) -> {ty} {{
 }}
 {}",
                 match inlined {
-                    Some(inlined) => lowered_body(key, inlined, &Names { views: &views, in_place: &[] }, index),
+                    Some(inlined) => lowered_body(key, inlined, &Names { views: &views, in_place: &[] }, index, None),
                     None => body(&key.instrs, &key.input_tys, &Names { views: &views, in_place: &[] }, index, segmented),
                 },
                 value(last),
@@ -618,7 +635,7 @@ fn flat_name(reference: Ref, ty: ElemTy, at: u32) -> String {
 /// The body of a lowered key (see [`Inlined`]): the index of every context, the inputs loaded at
 /// them, then the instructions, each defined (`t{n}`) after everything it reads. `names` and
 /// `index` are those of [`expression`].
-fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str) -> String {
+fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, staging: Option<&Staging>) -> String {
     struct Emit<'a> {
         key: &'a FusedKey,
         inlined: &'a Inlined,
@@ -703,6 +720,14 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str) -
                 let read = match flat.args[0] {
                     Ref::Input(k) => format!("{}[{at}]", emit.buffer(k)),
                     Ref::Tmp(v) => format!("t{v}"),
+                    Ref::Sub(s) => match (staging.and_then(|layout| layout.find(s)), kind) {
+                        // A read from workgroup memory: the region's cell `(lx, ly) + offset`.
+                        (Some(entry), ShiftKind::View { map, .. }) => {
+                            let (dx, dy) = (map.axes[0].start - entry.lo[0], map.axes[1].start - entry.lo[1]);
+                            format!("w{s}[u32(lx + ({dx})) + u32(ly + ({dy})) * {}u]", entry.width())
+                        }
+                        _ => format!("{}[{at}]", name(Ref::Sub(s), ElemTy::U32)),
+                    },
                     other => format!("{}[{at}]", name(other, ElemTy::U32)),
                 };
                 match kind {
@@ -913,6 +938,79 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
 ",
         tx * ty,
         body_with(&key.instrs, &key.input_tys, names, index, false, &staged(0)),
+    );
+    src
+}
+
+/// The kernel of `key` with its sub-programs staged as `staging` says: one workgroup per tile of
+/// output cells. Every level of staged sub-programs fills its workgroup-memory arrays `w{s}`
+/// (each cell of its region, strided over the invocations; `programs.subs` are their lowered
+/// bodies) before a barrier, then the main program reads them. `based` and `stores` are those
+/// of the plain store kernel.
+fn staged_main(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, based: bool, stores: &str, names: &Names) -> String {
+    let [w, h] = staging.dims;
+    let [tx, ty] = staging.tile;
+    let (index, global) = if based { ("gi", "            let gi = p.base + i;\n") } else { ("i", "") };
+    let sub_names = Names { views: names.views, in_place: &[] };
+    let mut src = String::new();
+    for entry in &staging.subs {
+        let ty = key.subs.get(entry.sub as usize).and_then(|program| program.last()).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
+        let _ = writeln!(src, "var<workgroup> w{}: array<{ty}, {}>;", entry.sub, entry.cells());
+    }
+    let _ = write!(
+        src,
+        "
+@compute @workgroup_size({WORKGROUP})
+fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let g = wid.x + wid.y * nwg.x;
+    let tile_x = (g % {tiles_x}u) * {tx}u;
+    let tile_y = (g / {tiles_x}u) * {ty}u;
+",
+        tiles_x = w.div_ceil(tx),
+    );
+    for level in staging.levels.windows(2) {
+        let range = level[0] as usize..level[1] as usize;
+        for (entry, lowered) in staging.subs[range.clone()].iter().zip(&programs.subs[range]) {
+            let [dw, dh] = entry.dims;
+            let last = lowered.main.last().copied().unwrap_or(0);
+            let _ = write!(
+                src,
+                "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
+        let lx = i32(e % {rw}u) + ({});
+        let ly = i32(e / {rw}u) + ({});
+        let x = i32(tile_x) + lx;
+        let y = i32(tile_y) + ly;
+        if (x >= 0 && x < {dw} && y >= 0 && y < {dh}) {{
+            let i = u32(x) + u32(y) * {dw}u;
+{global}{}            w{}[e] = t{last};
+        }}
+    }}
+",
+                entry.cells(),
+                entry.lo[0],
+                entry.lo[1],
+                lowered_body(key, lowered, &sub_names, index, Some(staging)),
+                entry.sub,
+                rw = entry.width(),
+            );
+        }
+        src.push_str("    workgroupBarrier();\n");
+    }
+    let _ = write!(
+        src,
+        "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
+        let lx = i32(e % {tx}u);
+        let ly = i32(e / {tx}u);
+        let x = tile_x + u32(lx);
+        let y = tile_y + u32(ly);
+        if (x < {w}u && y < {h}u) {{
+            let i = x + y * {w}u;
+{global}{}{stores}        }}
+    }}
+}}
+",
+        tx * ty,
+        lowered_body(key, &programs.main, names, index, Some(staging)),
     );
     src
 }

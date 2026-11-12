@@ -16,12 +16,20 @@
 //! device's [`CostModel`]: the estimated time of one kernel that recomputes it at every read
 //! against two kernels, the first writing it once, the second reading it back. The instruction
 //! cap only bounds the size of the generated code.
+//!
+//! Where several cells of a workgroup read the same expression through translation views (see
+//! `jit::staging`), the lowered program has a third form: the expression is computed once per
+//! cell of the workgroup's region into workgroup memory, and the reads of it stay in the
+//! lowered programs as `Shift` instructions of `Ref::Sub` operands that the generated code
+//! turns into workgroup loads ([`lower_staged`]). [`judge`] weighs that against the other two.
 
 use crate::gpu::hash::FxMap;
 use crate::profile::SplitReason;
+use crate::tuning::Tuning;
 
 use super::cost::{kernel_ns, op_weight, CostModel};
 use super::program::{FusedKey, Instr, Ref, Tail};
+use super::staging::{self, Staging};
 use super::{Edge, Op, OpKind, ShiftKind, ViewMap};
 
 /// How the index of a context derives from its parent's: the read index of one `Shift`.
@@ -39,7 +47,8 @@ pub(crate) struct Ctx {
 pub(crate) struct Flat {
     pub(crate) op: Op,
     /// `Ref::Tmp(n)` is lowered instruction `n`; `Ref::Input(k)` is input `k` read at the index
-    /// of context `at` (operand 0 of a `Shift`: at the index of context `child`); never `Ref::Sub`.
+    /// of context `at` (operand 0 of a `Shift`: at the index of context `child`). `Ref::Sub(s)`
+    /// is operand 0 of the reads of a sub-program that is staged in workgroup memory only.
     pub(crate) args: [Ref; 3],
     /// The context whose index this instruction is computed at (0: the element itself).
     pub(crate) at: u32,
@@ -61,6 +70,23 @@ pub(crate) struct Inlined {
     pub(crate) ops: f64,
 }
 
+/// A key lowered for a workgroup-staged kernel: the main program and, in the order of
+/// [`Staging::subs`], one program per staged sub-program, each lowered at its own cell.
+#[derive(Debug)]
+pub(crate) struct StagedPrograms {
+    pub(crate) main: Inlined,
+    pub(crate) subs: Vec<Inlined>,
+}
+
+/// How a kernel's source is generated from its key.
+#[derive(Debug)]
+pub(crate) enum Lowered {
+    /// Sub-programs written out at every index they are read at.
+    Plain(Inlined),
+    /// Some sub-programs staged in workgroup memory (the key's `staging`).
+    Staged(StagedPrograms),
+}
+
 /// What [`inline`] found.
 #[derive(Debug)]
 pub(crate) enum Verdict {
@@ -72,6 +98,8 @@ pub(crate) enum Verdict {
 
 struct Lowering<'a> {
     subs: &'a [Vec<Instr>],
+    /// Per sub-program, whether it is staged in workgroup memory: its reads are not unfolded.
+    staged: &'a [bool],
     cap: usize,
     ctxs: Vec<Ctx>,
     context_ids: FxMap<(u32, ShiftKind, [Ref; 2]), u32>,
@@ -83,6 +111,32 @@ struct Lowering<'a> {
     count: Vec<u32>,
     /// Set once more than `cap` instructions exist: nothing is lowered any further.
     over: bool,
+}
+
+impl<'a> Lowering<'a> {
+    fn new(subs: &'a [Vec<Instr>], staged: &'a [bool], cap: usize) -> Lowering<'a> {
+        let placeholder = Ctx { parent: 0, kind: ShiftKind::Dims { dims: [1; 4], shifts: [0; 4] }, args: [Ref::Unused; 2] };
+        Lowering {
+            subs,
+            staged,
+            cap,
+            ctxs: vec![placeholder],
+            context_ids: FxMap::default(),
+            instrs: Vec::new(),
+            numbered: FxMap::default(),
+            instances: FxMap::default(),
+            count: vec![0; subs.len()],
+            over: false,
+        }
+    }
+
+    /// The lowered program once `main` (the values of the program's instructions) is known. A
+    /// read of a staged sub-program counts as 2 operations: an index and a workgroup load.
+    fn finish(self, main: Vec<u32>, cost: &CostModel) -> Inlined {
+        let weight = |flat: &Flat| if matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(flat.op, cost) };
+        let ops = self.instrs.iter().map(weight).sum();
+        Inlined { ctxs: self.ctxs, instrs: self.instrs, main, count: self.count, ops }
+    }
 }
 
 impl Lowering<'_> {
@@ -165,6 +219,16 @@ impl Lowering<'_> {
             let value = match instr.op.kind {
                 OpKind::Shift(kind) => {
                     let [source, b, c] = [instr.args[0], args[1], args[2]];
+                    if let Ref::Sub(s) = source
+                        && self.staged.get(s as usize).copied().unwrap_or(false)
+                    {
+                        // Read from workgroup memory at the cell itself: equal reads are one instruction.
+                        debug_assert_eq!(ctx, 0, "a staged sub-program read away from the cell of its reader");
+                        let flat = Flat { op: instr.op, args: [source, b, Ref::Unused], at: ctx, child: 0 };
+                        let value = self.push(flat);
+                        local.push(value);
+                        continue;
+                    }
                     let context_args = match kind {
                         ShiftKind::Linear => [b, c],
                         ShiftKind::Take { .. } => [b, Ref::Unused],
@@ -193,18 +257,7 @@ impl Lowering<'_> {
 
 /// Lowers `key` (main program at context 0), giving up once more than `cap` instructions exist.
 pub(crate) fn inline(key: &FusedKey, cap: usize, cost: &CostModel) -> Verdict {
-    let placeholder = Ctx { parent: 0, kind: ShiftKind::Dims { dims: [1; 4], shifts: [0; 4] }, args: [Ref::Unused; 2] };
-    let mut lowering = Lowering {
-        subs: &key.subs,
-        cap,
-        ctxs: vec![placeholder],
-        context_ids: FxMap::default(),
-        instrs: Vec::new(),
-        numbered: FxMap::default(),
-        instances: FxMap::default(),
-        count: vec![0; key.subs.len()],
-        over: false,
-    };
+    let mut lowering = Lowering::new(&key.subs, &[], cap);
     let main = lowering.lower(&key.instrs, 0);
     if lowering.over {
         // Saves the most: the sub-program whose extra instances cost the most instructions;
@@ -217,15 +270,40 @@ pub(crate) fn inline(key: &FusedKey, cap: usize, cost: &CostModel) -> Verdict {
             .unwrap_or(0);
         return Verdict::TooBig { sub: u32::try_from(sub).unwrap_or(u32::MAX) };
     }
-    let ops = lowering.instrs.iter().map(|flat| op_weight(flat.op, cost)).sum();
-    Verdict::Fits(Inlined { ctxs: lowering.ctxs, instrs: lowering.instrs, main, count: lowering.count, ops })
+    Verdict::Fits(lowering.finish(main, cost))
+}
+
+/// Lowers `program` at its own cell (context 0), with the sub-programs `staged` left as reads
+/// from workgroup memory. `None` if more than `cap` instructions result.
+fn lower_program(subs: &[Vec<Instr>], program: &[Instr], staged: &[bool], cap: usize, cost: &CostModel) -> Option<Inlined> {
+    let mut lowering = Lowering::new(subs, staged, cap);
+    let main = lowering.lower(program, 0);
+    (!lowering.over).then(|| lowering.finish(main, cost))
+}
+
+/// Lowers the main program of `key` and every sub-program `staging` stages, each at its own
+/// cell, with the reads of staged sub-programs left for workgroup memory. `None` if any
+/// program has more than `cap` instructions.
+pub(crate) fn lower_staged(key: &FusedKey, staging: &Staging, cap: usize, cost: &CostModel) -> Option<StagedPrograms> {
+    let mut staged = vec![false; key.subs.len()];
+    for entry in &staging.subs {
+        *staged.get_mut(entry.sub as usize)? = true;
+    }
+    let main = lower_program(&key.subs, &key.instrs, &staged, cap, cost)?;
+    let subs = staging
+        .subs
+        .iter()
+        .map(|entry| lower_program(&key.subs, key.subs.get(entry.sub as usize)?, &staged, cap, cost))
+        .collect::<Option<Vec<_>>>()?;
+    Some(StagedPrograms { main, subs })
 }
 
 /// What [`judge`] decided.
 #[derive(Debug)]
 pub(crate) enum Judgement {
-    /// Run the program as one kernel (lowered by [`inline`]).
-    Run,
+    /// Run the program as one kernel: lowered by [`inline`], or by [`lower_staged`] if `staging`
+    /// is set (it becomes the `staging` of the key).
+    Run { staging: Option<Staging> },
     /// Evaluate sub-program `sub` first (the kernel then reads its buffer) and flatten again.
     Materialise { sub: u32, reason: SplitReason },
 }
@@ -238,6 +316,8 @@ pub(crate) struct Estimates {
     pub(crate) inline_ns: f64,
     /// The best way of evaluating one sub-program first, with its two kernels' time.
     pub(crate) best_sub: Option<(u32, f64)>,
+    /// One kernel staging the sub-programs read at several offsets in workgroup memory.
+    pub(crate) staged_ns: Option<f64>,
 }
 
 /// Bytes per element of the distinct inputs among the operands `refs` read.
@@ -285,19 +365,50 @@ fn sub_len(key: &FusedKey, s: u32, len: usize) -> f64 {
     len as f64
 }
 
+/// The workgroup staging of `key` and its lowered programs, if it has one within `cap`
+/// instructions per program.
+fn stage(key: &FusedKey, cap: usize, cost: &CostModel, tuning: &Tuning) -> Option<(Staging, StagedPrograms)> {
+    let found = staging::candidates(key)?;
+    let bytes = |s: u32| key.subs.get(s as usize).and_then(|program| program.last()).map_or(4, |instr| instr.op.out_ty().bytes() as u64);
+    let staging = staging::plan(&found, tuning, bytes)?;
+    let programs = lower_staged(key, &staging, cap, cost)?;
+    Some((staging, programs))
+}
+
+/// The estimated time of one kernel running `programs` as `staging` lays them out over
+/// `elements` output cells: the main program at every cell, a staged sub-program at every cell of
+/// its region (and a store and a load of the value, counted as 4 operations).
+fn staged_time(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, elements: f64, cost: &CostModel) -> f64 {
+    let tile = f64::from(staging.tile[0]) * f64::from(staging.tile[1]);
+    let all = std::iter::once(&programs.main).chain(&programs.subs);
+    let reads = all.flat_map(|lowered| lowered.instrs.iter().flat_map(|flat| flat.args).chain(lowered.ctxs.iter().flat_map(|ctx| ctx.args)));
+    let io_bytes = elements * (input_bytes(key, reads) + output_bytes(key));
+    let staged_ops: f64 = staging.subs.iter().zip(&programs.subs).map(|(entry, lowered)| f64::from(entry.cells()) / tile * (lowered.ops + 4.0)).sum();
+    kernel_ns(cost, io_bytes, (programs.main.ops + staged_ops) * elements)
+}
+
 /// Decides how to run `key` (which [`inlines`](FusedKey::inlines)) over `len` elements: as one
-/// kernel that computes every sub-program at each index it is read at, or with the sub-program
-/// whose repeated computation costs the most evaluated first (see the module documentation).
-/// Lowered programs over `cap` instructions are always cut.
-pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel) -> (Judgement, Estimates) {
+/// kernel that computes every sub-program at each index it is read at, as one kernel that
+/// stages the sub-programs read through translations in workgroup memory (if `staging_on`), or
+/// with the sub-program whose repeated computation costs the most evaluated first (see the
+/// module documentation). Each choice must be estimated below 0.9 times the time of the one
+/// before it, in that order. Lowered programs over `cap` instructions are always cut, unless
+/// staging makes them fit.
+pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tuning: &Tuning, staging_on: bool) -> (Judgement, Estimates) {
+    let elements = len as f64;
+    let staged = if staging_on { stage(key, cap, cost, tuning) } else { None };
+    let staged_ns = staged.as_ref().map(|(staging, programs)| staged_time(key, staging, programs, elements, cost));
     let inlined = match inline(key, cap, cost) {
         Verdict::Fits(inlined) => inlined,
         Verdict::TooBig { sub } => {
+            let estimates = Estimates { inline_ns: f64::INFINITY, best_sub: None, staged_ns };
+            if let Some((staging, _)) = staged {
+                return (Judgement::Run { staging: Some(staging) }, estimates);
+            }
             let reason = SplitReason::Inlined { instructions: cap.saturating_add(1), limit: cap };
-            return (Judgement::Materialise { sub, reason }, Estimates { inline_ns: f64::INFINITY, best_sub: None });
+            return (Judgement::Materialise { sub, reason }, estimates);
         }
     };
-    let elements = len as f64;
     let out_bytes = output_bytes(key);
     let reads = inlined.instrs.iter().flat_map(|flat| flat.args).chain(inlined.ctxs.iter().flat_map(|ctx| ctx.args));
     let io_bytes = elements * (input_bytes(key, reads) + out_bytes);
@@ -320,13 +431,21 @@ pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel) ->
             best = Some((s32, t));
         }
     }
-    let estimates = Estimates { inline_ns, best_sub: best };
+    let estimates = Estimates { inline_ns, best_sub: best, staged_ns };
+    let mut current = inline_ns;
+    let mut choice = None;
+    if let (Some((staging, _)), Some(t)) = (staged, staged_ns)
+        && t < 0.9 * current
+    {
+        current = t;
+        choice = Some(staging);
+    }
     match best {
-        Some((sub, t)) if t < 0.9 * inline_ns => {
+        Some((sub, t)) if t < 0.9 * current => {
             let instances = inlined.count[sub as usize] as usize;
             (Judgement::Materialise { sub, reason: SplitReason::Materialised { instances } }, estimates)
         }
-        _ => (Judgement::Run, estimates),
+        _ => (Judgement::Run { staging: choice }, estimates),
     }
 }
 
@@ -354,6 +473,7 @@ mod tests {
             in_place: Vec::new(),
             spans: Vec::new(),
             tile: None,
+            staging: None,
             guard: None,
         }
     }
@@ -508,9 +628,10 @@ mod tests {
     fn costly_launches_keep_the_recomputation_and_costly_arithmetic_stores_the_expression() {
         let key = difference_key();
         let len = 1 << 20;
-        let (cheap_launch, _) = judge(&key, len, 1000, &CostModel { launch_us: 1e6, ..CostModel::TEST });
-        assert!(matches!(cheap_launch, Judgement::Run), "{cheap_launch:?}");
-        let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST });
+        let tuning = Tuning::for_tests();
+        let (cheap_launch, _) = judge(&key, len, 1000, &CostModel { launch_us: 1e6, ..CostModel::TEST }, &tuning, true);
+        assert!(matches!(cheap_launch, Judgement::Run { .. }), "{cheap_launch:?}");
+        let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, true);
         let Judgement::Materialise { sub: 0, reason: SplitReason::Materialised { instances: 2 } } = cheap_memory else {
             panic!("{cheap_memory:?} {estimates:?}");
         };
@@ -519,8 +640,19 @@ mod tests {
 
     #[test]
     fn a_program_over_the_cap_is_cut_whatever_the_model_says() {
-        let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &CostModel { launch_us: 1e6, ..CostModel::TEST });
+        let slow = CostModel { launch_us: 1e6, ..CostModel::TEST };
+        let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &slow, &Tuning::for_tests(), false);
         assert!(matches!(judgement, Judgement::Materialise { sub: 0, reason: SplitReason::Inlined { limit: 4, .. } }), "{judgement:?}");
         assert!(estimates.inline_ns.is_infinite());
+    }
+
+    #[test]
+    fn a_program_over_the_cap_is_staged_when_staging_makes_it_fit() {
+        let slow = CostModel { launch_us: 1e6, ..CostModel::TEST };
+        let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &slow, &Tuning::for_tests(), true);
+        assert!(matches!(judgement, Judgement::Run { staging: Some(_) }), "{judgement:?} {estimates:?}");
+        assert!(estimates.staged_ns.is_some() && estimates.inline_ns.is_infinite(), "{estimates:?}");
+        let (judgement, _) = judge(&difference_key(), 1 << 20, 2, &slow, &Tuning::for_tests(), true);
+        assert!(matches!(judgement, Judgement::Materialise { reason: SplitReason::Inlined { limit: 2, .. }, .. }), "{judgement:?}");
     }
 }

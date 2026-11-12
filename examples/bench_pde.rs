@@ -800,6 +800,93 @@ fn views(b: &mut Bench) {
             (0..d.w - 2).map(|i| (e[i + 2] + e[i + 1] - 2.0 * e[i]) as f32).collect()
         },
     });
+
+    // An expensive expression read at five offsets through an edge pad: the case workgroup
+    // staging of views is for (`LUMA_STAGING=off` recomputes it five times per cell).
+    let stencil = [2048, 2048];
+    b.arr(Arr {
+        name: "view/stencil5_f32", big: stencil, small: small2, need_b: false, need_idx: false, touched: 2.0, prof: true, tol: (1e-4, 1e-4),
+        build: &|d| stencil5(&heavy(&d.a)),
+        host: &|d| stencil5_host(&d.ha, d.w, d.h),
+    });
+    b.guarded("view/stencil5_df32", |b| {
+        let ctx = b.ctx.clone();
+        let build = |ha: &[f32], w: usize, h: usize| {
+            let x = Array::from_slice_on(&ctx, ha, [w, h]).unwrap();
+            x.eval().unwrap();
+            x
+        };
+        let small = small2;
+        let hs = values(small[0] * small[1], 1, 0.2, 1.2);
+        let xs = build(&hs, small[0], small[1]);
+        let got: Vec<f32> = stencil5_df32(&heavy_df32(&xs.to_df32())).to_vec().unwrap().into_iter().map(|v| v.to_f64() as f32).collect();
+        check("view/stencil5_df32", &got, &stencil5_host(&hs, small[0], small[1]), 1e-4, 1e-4);
+        let hb = values(stencil[0] * stencil[1], 1, 0.2, 1.2);
+        let xb = build(&hb, stencil[0], stencil[1]);
+        let bytes = 2.0 * (stencil[0] * stencil[1]) as f64 * 8.0;
+        let mut f = || stencil5_df32(&heavy_df32(&xb.to_df32())).eval().unwrap();
+        b.time("view/stencil5_df32", &size_str(stencil[0], stencil[1]), Tp::Bytes(bytes), true, &mut f);
+    });
+}
+
+/// A 24-operation elementwise expression: four rounds of `max(|sqrt(e * 0.9 + 0.2)|, e * 0.5)`.
+fn heavy(x: &A) -> A {
+    let mut e = x.clone();
+    for _ in 0..4 {
+        e = (&e * 0.9 + 0.2).sqrt().abs().maximum(&e * 0.5);
+    }
+    e
+}
+
+/// [`heavy`] on `Df32`.
+fn heavy_df32(x: &Array<Df32>) -> Array<Df32> {
+    let (a, b, c) = (Df32::from(0.9), Df32::from(0.2), Df32::from(0.5));
+    let mut e = x.clone();
+    for _ in 0..4 {
+        e = (&e * a + b).sqrt().abs().maximum(&e * c);
+    }
+    e
+}
+
+/// The five-point stencil of `e` with edge handling: the neighbours read through slices of a
+/// padded copy, so `e` is a sub-program read at five offsets.
+fn stencil5(e: &A) -> A {
+    let d = e.shape().dims();
+    let (w, h) = (d[0], d[1]);
+    let p = e.pad([(1, 1), (1, 1)], PadMode::Edge);
+    let at = |x: usize, y: usize| p.slice(0, x..x + w).slice(1, y..y + h);
+    at(0, 1) + at(2, 1) + at(1, 0) + at(1, 2) - at(1, 1) * 4.0
+}
+
+/// [`stencil5`] on `Df32`.
+fn stencil5_df32(e: &Array<Df32>) -> Array<Df32> {
+    let d = e.shape().dims();
+    let (w, h) = (d[0], d[1]);
+    let p = e.pad([(1, 1), (1, 1)], PadMode::Edge);
+    let at = |x: usize, y: usize| p.slice(0, x..x + w).slice(1, y..y + h);
+    at(0, 1) + at(2, 1) + at(1, 0) + at(1, 2) - at(1, 1) * Df32::from(4.0)
+}
+
+/// Host values of `stencil5(heavy(a))` over `w x h` cells, in f64.
+fn stencil5_host(a: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let e: Vec<f64> = a
+        .iter()
+        .map(|&v| {
+            let mut e = f64::from(v);
+            for _ in 0..4 {
+                e = (e * 0.9 + 0.2).sqrt().abs().max(e * 0.5);
+            }
+            e
+        })
+        .collect();
+    let at = |x: isize, y: isize| e[x.clamp(0, w as isize - 1) as usize + w * y.clamp(0, h as isize - 1) as usize];
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            out.push((at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1) - 4.0 * at(x, y)) as f32);
+        }
+    }
+    out
 }
 
 /// Transpose of a `w x h` array (x fastest): the result is `h x w`.

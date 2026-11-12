@@ -15,6 +15,8 @@ const SUBGROUPS_ENV: &str = "LUMA_SUBGROUPS";
 const MAX_LIVE_ENV: &str = "LUMA_FUSION_MAX_LIVE";
 /// `LUMA_FUSION_MAX_INLINED=n` overrides [`Tuning::max_inlined`] (clamped to `16..=16384`).
 const MAX_INLINED_ENV: &str = "LUMA_FUSION_MAX_INLINED";
+/// `LUMA_STAGING=off` keeps sub-programs read through views out of workgroup memory (see `jit::staging`).
+const STAGING_ENV: &str = "LUMA_STAGING";
 
 /// The device family a tuning profile was measured on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -58,6 +60,9 @@ pub(crate) struct Tuning {
     /// out at every index they are read at (see `jit::inline`); a bigger one is cut by evaluating
     /// one of its sub-programs first.
     pub(crate) max_inlined: usize,
+    /// Whether sub-programs read through translation views at several offsets may be computed once
+    /// per workgroup tile in workgroup memory (see `jit::staging`); `LUMA_STAGING=off` clears it.
+    pub(crate) staging: bool,
 }
 
 impl Tuning {
@@ -76,6 +81,7 @@ impl Tuning {
         max_recomputed: 24,
         max_live: 64,
         max_inlined: 1024,
+        staging: true,
     };
 
     const NVIDIA: Tuning = Tuning {
@@ -92,6 +98,7 @@ impl Tuning {
         max_recomputed: 32,
         max_live: 96,
         max_inlined: 1536,
+        staging: true,
     };
 
     const GENERIC: Tuning = Tuning {
@@ -108,6 +115,7 @@ impl Tuning {
         max_recomputed: 24,
         max_live: 96,
         max_inlined: 1024,
+        staging: true,
     };
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
@@ -141,7 +149,14 @@ impl Tuning {
             tuning.max_inlined = inlined.clamp(16, 16384);
         }
         tuning.subgroups = features.contains(wgpu::Features::SUBGROUP) && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
+        tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
         tuning
+    }
+
+    /// The generic parameters, for tests that need a `Tuning` without a device.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Tuning {
+        Tuning::GENERIC
     }
 
     /// Shrinks what the device cannot run.

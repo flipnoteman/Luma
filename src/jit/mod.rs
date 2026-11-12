@@ -48,10 +48,12 @@
 //!   its size and however often it is read. The kernel computes every (expression, index) pair
 //!   once: nested views are written out at every index they are read at, a view of a view is
 //!   one view, and equal instructions are one (see [`inline`]). Then the cost model
-//!   ([`CostModel`]) decides per program (`inline::judge`): if evaluating a sub-program that
-//!   is read at several indices first (one kernel writing it, one reading it back) is
-//!   estimated to take less than 0.9 times the one kernel that recomputes it at every read, it
-//!   is evaluated first ([`SplitReason::Materialised`]). A kernel that would grow past
+//!   ([`CostModel`]) decides per program (`inline::judge`), choosing in turn the one kernel that
+//!   recomputes every read (the baseline), the one kernel that computes a sub-program once per
+//!   cell of a workgroup tile in workgroup memory (below), and the evaluation of the sub-program
+//!   read at several indices first (one kernel writing it, one reading it back), each if it is
+//!   estimated to take less than 0.9 times the time of the choice before it
+//!   ([`SplitReason::Materialised`] for the last). A kernel that would grow past
 //!   `Tuning::max_inlined` instructions (`LUMA_FUSION_MAX_INLINED`) is cut whatever the model
 //!   says, by evaluating the sub-program whose repeats cost the most
 //!   ([`SplitReason::Inlined`]), and expressions over arrays split over several buffers are read
@@ -61,6 +63,16 @@
 //!   the reader beyond that evaluates it (with the live arrays that share work with it, see
 //!   `JitState::evaluate_alongside`). [`Array::cache`](crate::Array::cache) evaluates on
 //!   request.
+//! * Sub-programs read through translations of 2-D (or 1-D) arrays (slices, shifted slices of
+//!   padded arrays: the flux a cell and its neighbour both read) at several offsets can be
+//!   staged: a store kernel runs one workgroup per tile of output cells, computes each staged
+//!   sub-program once per cell of its region (the tile plus the offsets reached, and what the
+//!   sub-programs staged after it need) into workgroup memory, and the reads come from there
+//!   (see `staging`, `LUMA_STAGING=off` to switch it off). The tile shrinks until the regions
+//!   fit `Tuning::stencil_tile_bytes`. Sub-programs read through anything else (edge handling,
+//!   gathers, strides, a view of a staged sub-program that is not itself staged) are
+//!   recomputed per read as above, and a program over arrays split over several buffers is
+//!   never staged.
 //! * When an expression is evaluated, a pending node inside it that another pending, live
 //!   operation outside the expression also reads is evaluated on its own first, instead of
 //!   being recomputed in both kernels. Sharing within one expression is free: a shared node is
@@ -111,6 +123,7 @@ mod readers;
 mod replay;
 mod simplify;
 pub(crate) mod speculate;
+mod staging;
 mod stencil;
 mod until;
 #[cfg(test)]
@@ -130,7 +143,7 @@ use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 use crate::profile::{FusionSplit, SplitReason};
 
-use inline::{inline, Judgement, Verdict};
+use inline::{inline, Judgement, Lowered, Verdict};
 use looped::LoopPlan;
 use program::Instr;
 
@@ -1693,6 +1706,12 @@ pub(crate) struct JitState {
     /// Replaces the context's cost model when set (tests).
     #[cfg(test)]
     cost_override: Mutex<Option<cost::CostModel>>,
+    /// Whether workgroup staging may be chosen (tests switch it off to compare).
+    #[cfg(test)]
+    staging: AtomicBool,
+    /// The staging of the last kernel looked up (tests).
+    #[cfg(test)]
+    last_staging: Mutex<Option<staging::Staging>>,
     /// What judging a program (see [`inline::judge`]) found, by the structure of the program.
     judgements: Mutex<FxMap<u64, Vec<JudgementEntry>>>,
     /// The estimates of the last judgement made, as text (tests).
@@ -1770,6 +1789,10 @@ impl JitState {
             max_inlined: AtomicUsize::new(0),
             #[cfg(test)]
             cost_override: Mutex::new(None),
+            #[cfg(test)]
+            staging: AtomicBool::new(true),
+            #[cfg(test)]
+            last_staging: Mutex::new(None),
             judgements: Mutex::new(FxMap::default()),
             #[cfg(test)]
             last_judgement: Mutex::new(None),
@@ -1852,7 +1875,7 @@ impl JitState {
         let (judgement, _estimates) = match entries.iter().find(|entry| same(entry)) {
             Some(entry) => (Arc::clone(&entry.judgement), entry.estimates),
             None => {
-                let (judgement, estimates) = inline::judge(key, class, cap, &ctx.cost_model());
+                let (judgement, estimates) = inline::judge(key, class, cap, &ctx.cost_model(), ctx.tuning(), ctx.tuning().staging && self.staging_enabled());
                 let judgement = Arc::new(judgement);
                 entries.push(JudgementEntry {
                     cap,
@@ -1970,6 +1993,27 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn last_judgement(&self) -> Option<String> {
         lock(&self.last_judgement).clone()
+    }
+
+    /// Whether workgroup staging may be chosen (always, outside tests).
+    fn staging_enabled(&self) -> bool {
+        #[cfg(test)]
+        return self.staging.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        true
+    }
+
+    /// Allows or forbids workgroup staging, and forgets the judgements made (tests).
+    #[cfg(test)]
+    pub(crate) fn set_staging(&self, on: bool) {
+        self.staging.store(on, Ordering::Relaxed);
+        lock(&self.judgements).clear();
+    }
+
+    /// The staging of the kernel of the last program looked up (tests).
+    #[cfg(test)]
+    pub(crate) fn last_staging(&self) -> Option<staging::Staging> {
+        lock(&self.last_staging).clone()
     }
 
     #[cfg(test)]
@@ -2203,7 +2247,16 @@ impl JitState {
     /// The kernel for `key`, generated and compiled on first use.
     fn kernel(&self, ctx: &Context, key: &program::FusedKey) -> Result<Arc<KernelCore>> {
         #[cfg(test)]
-        self.last_program_len.store(key.instrs.len(), Ordering::Relaxed);
+        {
+            self.last_program_len.store(key.instrs.len(), Ordering::Relaxed);
+            *lock(&self.last_staging) = key.staging.clone();
+        }
+        #[cfg(debug_assertions)]
+        if let Some(layout) = &key.staging
+            && let Err(message) = staging::check(layout, key)
+        {
+            panic!("invalid staging: {message}\n{key:?}");
+        }
         let mut cache = lock(&self.kernels);
         if let Some(core) = cache.get(key) {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -2212,16 +2265,23 @@ impl JitState {
         let segment_len = u32::try_from(ctx.segment_bytes() / 4).unwrap_or(u32::MAX);
         // Whatever the judgement was, the kernel runs the program as it is: `flatten_inner` cut
         // the ones the model wants cut, any other that got here is lowered in full.
-        let lowered = key.inlines().then(|| match inline(key, usize::MAX, &ctx.cost_model()) {
-            Verdict::Fits(inlined) => Some(inlined),
-            Verdict::TooBig { .. } => None,
-        });
-        let inlined = lowered.as_ref().and_then(Option::as_ref);
+        let cost = ctx.cost_model();
+        let lowered = match &key.staging {
+            Some(layout) => Some(Lowered::Staged(
+                inline::lower_staged(key, layout, usize::MAX, &cost).expect("a staged program lowers without a cap"),
+            )),
+            None => key.inlines().then(|| match inline(key, usize::MAX, &cost) {
+                Verdict::Fits(inlined) => Some(Lowered::Plain(inlined)),
+                Verdict::TooBig { .. } => None,
+            }).flatten(),
+        };
         #[cfg(test)]
-        if let Some(inlined) = inlined {
-            self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed);
+        match &lowered {
+            Some(Lowered::Plain(inlined)) => self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed),
+            Some(Lowered::Staged(programs)) => self.last_inlined_len.store(programs.main.instrs.len(), Ordering::Relaxed),
+            None => {}
         }
-        let source = codegen::source(key, ctx.tuning(), segment_len, inlined);
+        let source = codegen::source(key, ctx.tuning(), segment_len, lowered.as_ref());
         let label = key.label();
         let core = Arc::new(kernel::build_core(
             ctx,

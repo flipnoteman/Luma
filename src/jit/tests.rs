@@ -1670,6 +1670,172 @@ fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
     assert_close(&got, &want, 1e-4, 1e-5);
 }
 
+/// A cost model on which arithmetic is slow enough for computing an expression once per cell to
+/// beat recomputing it at every read, but a second launch still costs more than the recomputation
+/// it saves over staging.
+fn arithmetic_bound() -> CostModel {
+    CostModel { f32_ops_per_ns: 10.0, ..CostModel::TEST }
+}
+
+/// `e` read through an edge pad at the five offsets of the five-point stencil of an
+/// `nx x ny` array.
+fn five_point(e: &Array<f32>, nx: usize, ny: usize) -> Array<f32> {
+    use crate::view::PadMode;
+    let p = e.pad([(1, 1), (1, 1)], PadMode::Edge);
+    let at = |x: usize, y: usize| p.slice(0, x..x + nx).slice(1, y..y + ny);
+    at(0, 1) + at(2, 1) + at(1, 0) + at(1, 2) - at(1, 1) * 4.0
+}
+
+/// The host values of [`five_point`] of `e`.
+fn five_point_host(e: &[f32], nx: usize, ny: usize) -> Vec<f32> {
+    let at = |x: isize, y: isize| e[x.clamp(0, nx as isize - 1) as usize + nx * y.clamp(0, ny as isize - 1) as usize];
+    let mut out = Vec::with_capacity(nx * ny);
+    for y in 0..ny as isize {
+        for x in 0..nx as isize {
+            out.push(at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1) - at(x, y) * 4.0);
+        }
+    }
+    out
+}
+
+/// A 2-D array of random values, a 40-operation expression of it and the expression's host values.
+fn expression_2d(ctx: &Context, nx: usize, ny: usize, seed: u64) -> (Array<f32>, Vec<f32>) {
+    let xs = values(nx * ny, seed, 0.2, 1.2);
+    let x = Array::from_slice_on(ctx, &xs, [nx, ny]).unwrap();
+    let mut e = x.clone();
+    let mut host = xs;
+    for _ in 0..10 {
+        e = (&e * 0.9 + 0.2).sqrt() * 1.1 - 0.05;
+        for v in &mut host {
+            *v = (*v * 0.9 + 0.2).sqrt() * 1.1 - 0.05;
+        }
+    }
+    (e, host)
+}
+
+/// Runs the five-point stencil of an expression over `nx x ny` cells with the staging on and
+/// checks the kernel stages the padded expression, one launch, against the host.
+fn stencil5_staged(nx: usize, ny: usize, seed: u64) {
+    let ctx = ctx();
+    ctx.set_cost_model(arithmetic_bound());
+    let (e, host) = expression_2d(&ctx, nx, ny, seed);
+    let before = ctx.jit().stats();
+    let got = five_point(&e, nx, ny).to_vec().unwrap();
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert_eq!(launches, 1, "{:?}", ctx.jit().last_judgement());
+    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    // `e` read through the clamping pad is recomputed per cell of the padded expression's region.
+    assert_eq!(staging.subs.len(), 1, "{staging:?}");
+    let [tx, ty] = staging.tile;
+    assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([0, 0], [tx as i32 + 1, ty as i32 + 1]), "{staging:?}");
+    assert_eq!(staging.subs[0].dims, [nx as u32 + 2, ny as u32 + 2]);
+    assert_close(&got, &five_point_host(&host, nx, ny), 1e-4, 1e-4);
+}
+
+#[test]
+fn a_five_point_stencil_of_an_expression_stages_the_padded_expression() {
+    stencil5_staged(64, 48, 201);
+}
+
+#[test]
+fn staging_covers_tiles_that_do_not_divide_the_array() {
+    stencil5_staged(61, 47, 202);
+}
+
+#[test]
+fn the_stencil_without_staging_is_one_launch_with_the_same_values() {
+    let ctx = ctx();
+    ctx.jit().set_staging(false);
+    let (nx, ny) = (64, 48);
+    // Small enough for the lowered program to stay under every device's instruction cap.
+    let xs = values(nx * ny, 201, 0.2, 1.2);
+    let e = (&Array::from_slice_on(&ctx, &xs, [nx, ny]).unwrap() * 1.5 + 0.25).sqrt();
+    let host: Vec<f32> = xs.iter().map(|v| (v * 1.5 + 0.25).sqrt()).collect();
+    let before = ctx.jit().stats();
+    let got = five_point(&e, nx, ny).to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
+    assert_eq!(ctx.jit().last_staging(), None);
+    assert_close(&got, &five_point_host(&host, nx, ny), 1e-4, 1e-4);
+}
+
+#[test]
+fn a_1d_expression_read_at_three_offsets_is_staged() {
+    let ctx = ctx();
+    ctx.set_cost_model(arithmetic_bound());
+    let n = 1000;
+    let xs = values(n, 203, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let (e, host) = long_expression(&x, &xs);
+    let before = ctx.jit().stats();
+    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n)).to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
+    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    assert_eq!(staging.dims, [n as u32 - 2, 1]);
+    assert_eq!(staging.subs.len(), 1);
+    assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([0, 0], [staging.tile[0] as i32 + 1, 0]));
+    let want: Vec<f32> = (0..n - 2).map(|i| host[i] + host[i + 1] + host[i + 2]).collect();
+    assert_close(&got, &want, 1e-4, 1e-5);
+}
+
+#[test]
+fn a_df32_expression_read_at_five_offsets_is_staged() {
+    use crate::view::PadMode;
+    use crate::Df32;
+    let ctx = ctx();
+    ctx.set_cost_model(arithmetic_bound());
+    let (nx, ny) = (64, 48);
+    let xs = values(nx * ny, 204, 0.2, 1.2);
+    let mut e = Array::from_slice_on(&ctx, &xs, [nx, ny]).unwrap().to_df32();
+    let mut host: Vec<f64> = xs.iter().map(|&v| f64::from(v)).collect();
+    for _ in 0..6 {
+        e = (&e * Df32::from(0.9) + Df32::from(0.2)).sqrt();
+        for v in &mut host {
+            *v = (*v * 0.9 + 0.2).sqrt();
+        }
+    }
+    let p = e.pad([(1, 1), (1, 1)], PadMode::Edge);
+    let at = |x: usize, y: usize| p.slice(0, x..x + nx).slice(1, y..y + ny);
+    let r = at(0, 1) + at(2, 1) + at(1, 0) + at(1, 2) - at(1, 1) * Df32::from(4.0);
+    let before = ctx.jit().stats();
+    let got: Vec<f64> = r.to_vec().unwrap().into_iter().map(Df32::to_f64).collect();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
+    assert_eq!(ctx.jit().last_staging().map(|staging| staging.subs.len()), Some(1), "{:?}", ctx.jit().last_judgement());
+    let hat = |x: isize, y: isize| host[x.clamp(0, nx as isize - 1) as usize + nx * y.clamp(0, ny as isize - 1) as usize];
+    for y in 0..ny {
+        for x in 0..nx {
+            let (xi, yi) = (x as isize, y as isize);
+            let want = hat(xi - 1, yi) + hat(xi + 1, yi) + hat(xi, yi - 1) + hat(xi, yi + 1) - 4.0 * hat(xi, yi);
+            let g = got[x + nx * y];
+            assert!((g - want).abs() <= 1e-6, "cell ({x}, {y}): got {g}, want {want}");
+        }
+    }
+}
+
+#[test]
+fn a_staged_expression_read_by_another_staged_expression_is_computed_a_level_earlier() {
+    let ctx = ctx();
+    ctx.set_cost_model(arithmetic_bound());
+    let n = 1000;
+    let xs = values(n, 205, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let (p, host) = long_expression(&x, &xs);
+    // A flux of two reads of `p`, and the difference of two reads of the flux.
+    let g = |a: Array<f32>| &a * &a * 0.5 + &a;
+    let m = n - 1;
+    let f = g(p.slice(0, 0..m)) - g(p.slice(0, 1..m + 1));
+    let r = f.slice(0, 0..m - 1) + f.slice(0, 1..m);
+    let before = ctx.jit().stats();
+    let got = r.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
+    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    assert_eq!(staging.subs.len(), 2, "{staging:?}");
+    assert_eq!(staging.levels, vec![0, 1, 2], "{staging:?}");
+    let gh = |a: f32| a * a * 0.5 + a;
+    let fh: Vec<f32> = (0..m).map(|i| gh(host[i]) - gh(host[i + 1])).collect();
+    let want: Vec<f32> = (0..m - 1).map(|i| fh[i] + fh[i + 1]).collect();
+    assert_close(&got, &want, 1e-3, 1e-4);
+}
+
 #[test]
 fn cache_evaluates_an_expression_once_for_every_later_read() {
     let ctx = ctx();
@@ -1779,6 +1945,8 @@ fn a_kernel_over_the_inlining_cap_is_cut_by_evaluating_a_sub_program() {
     use crate::profile::SplitReason;
     let ctx = ctx();
     ctx.jit().set_max_inlined(16);
+    // Staged, the three levels fit the cap; the cap is what cuts the program otherwise.
+    ctx.jit().set_staging(false);
     ctx.jit().record_splits();
     let n = 64;
     let xs = values(n, 102, 0.5, 2.0);

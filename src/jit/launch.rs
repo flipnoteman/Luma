@@ -720,12 +720,16 @@ fn launch_store(
     shifted: Option<&Shifted>,
 ) -> Result<(), LumaError> {
     let Some(first) = outputs.first() else { return Ok(()) };
-    if let Some(tile) = &key.tile {
+    let tiles = match (&key.tile, &key.staging) {
+        (Some(tile), _) => Some(tile.dims.0.div_ceil(tile.tile.0) * tile.dims.1.div_ceil(tile.tile.1)),
+        (None, Some(staging)) => Some(staging.tiles()),
+        (None, None) => None,
+    };
+    if let Some(tiles) = tiles {
         if first.segments() != 1 {
             return Err(LumaError::Gpu("tiled program on an array of several segments".into()));
         }
         let args = store_args(key, outputs, inputs, scalars, shifted, 0)?;
-        let tiles = tile.dims.0.div_ceil(tile.tile.0) * tile.dims.1.div_ceil(tile.tile.1);
         ctx.launch(core, fold_workgroups(ctx, tiles)?, [args.n, 1, 1], &args.raw())?;
     } else {
         for j in 0..first.segments() {
@@ -735,6 +739,16 @@ fn launch_store(
     }
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// Drops the staging the judgement chose (see `inline::judge`) if the launch cannot run it: the
+/// kernel runs over segments (`key.spans`), or `len` is not the cells of the staged output.
+fn settle_staging(key: &mut FusedKey, len: usize) {
+    if let Some(staging) = &key.staging
+        && (!key.spans.is_empty() || u64::from(staging.dims[0]) * u64::from(staging.dims[1]) != len as u64)
+    {
+        key.staging = None;
+    }
 }
 
 /// Runs the store kernel of `fused` over `len` elements, one new buffer per output. A single
@@ -767,7 +781,8 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
         }
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
-    if shifted.is_none() {
+    settle_staging(&mut key, len);
+    if shifted.is_none() && key.staging.is_none() {
         key.tile = super::codegen::plan_tile(&key, &scalars, len, ctx.tuning());
     }
     let core = ctx.jit().kernel(ctx, &key)?;
@@ -810,7 +825,8 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     inputs.remove(k);
     key.in_place = vec![(k as u32, 0)];
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, node.len())?;
-    if shifted.is_none() {
+    settle_staging(&mut key, node.len());
+    if shifted.is_none() && key.staging.is_none() {
         key.tile = super::codegen::plan_tile(&key, &scalars, node.len(), ctx.tuning());
     }
     let core = ctx.jit().kernel(ctx, &key)?;
