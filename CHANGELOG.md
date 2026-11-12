@@ -190,4 +190,5 @@ All notable changes to Luma are listed here. The format follows
 - A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
 - A library layout, with the shader loaded from a hard-coded relative path.
 
+[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/flipnoteman/Luma/releases/tag/v0.2.0
