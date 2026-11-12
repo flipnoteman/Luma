@@ -218,6 +218,9 @@ All notable changes to Luma are listed here. The format follows
   all been dropped (a temporary `r.flip(0)` that was assigned through).
 - A view taken from an array that was a view evaluated before a write into its base read the
   written base instead of the evaluated array (the old data it was recorded against).
+- A write through a view of a lazy expression left the view showing the old data when the view
+  had been evaluated before the write (by `eval`, or by `cache` of an array that shares work with
+  it); it now shows the written data.
 
 ## [0.2.0] - 2026-11-11
 
