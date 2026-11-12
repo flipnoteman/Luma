@@ -220,3 +220,22 @@ fn captured_lazy_compound_assignment_is_replayed_with_the_loop() {
         ],
     });
 }
+
+/// Finding 3, indirect form (found on `LUMA_DEVICE=cpu`): the lazy reduction reduces an
+/// expression of `x`, and a later write goes into `x` (through an alias and a slice).
+#[test]
+#[ignore = "finding 3: a lazy reduction of an expression of x reads a later write into x"]
+fn lazy_reduction_of_an_expression_sees_a_later_write_to_its_input() {
+    check(Program {
+        config: Config::default_engine(),
+        math: true,
+        stmts: vec![
+            Input { dims: [9, 6, 1, 1], ty: F32, seed: 0 },
+            Compound { target: 0, op: Mul, rhs: Const(0.5) },
+            Binary { lhs: Var(0), rhs: Var(0), op: Add },
+            Alias { src: 1 },
+            Reduce { src: 2, op: Min },
+            Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 0, hi: 1 }, InjSlice { axis: 1, lo: 2, hi: 5 }], rhs: Const(0.25) },
+        ],
+    });
+}
