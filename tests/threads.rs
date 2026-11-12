@@ -352,3 +352,175 @@ fn a_lazy_array_read_by_a_traced_loop_after_an_eval_loop_on_a_shared_context() {
         assert_close(&u.to_vec().unwrap(), &wu, 1e-3, 1e-4);
     });
 }
+
+// ---- Risk areas: sweeps racing with drops, recycling under replays, nested flattening, supersede chains.
+
+/// Thread 0 creates lazy arrays and drops them at once or after a few more operations (the node is
+/// dying while it records further work) and traces loops; the other threads sweep over every
+/// lazy array of the context with `eval`, `flush` and `sync` all the time. A sweep that upgraded the
+/// weak reference of a node that is being dropped, and released its buffer, would show as a wrong value
+/// or an error in the dropping thread.
+#[test]
+fn sweeps_of_other_threads_do_not_release_the_buffers_of_arrays_that_are_being_dropped() {
+    let ctx = default_context().unwrap();
+    together(4, 25, |t, round| {
+        let u0 = data(t, round);
+        if t == 0 {
+            let u = on(&ctx, &u0);
+            let mut keep = Vec::new();
+            for k in 0..60 {
+                let scale = 1.0 + k as f32 * 0.01;
+                let a = &u * scale + 0.5;
+                let b = a.shift(1) * 0.5 + &a;
+                let want: Vec<f32> = {
+                    let a: Vec<f32> = u0.iter().map(|v| v * scale + 0.5).collect();
+                    (0..N).map(|i| a[(i + N - 1) % N] * 0.5 + a[i]).collect()
+                };
+                match k % 4 {
+                    0 => drop(a),
+                    1 => {
+                        drop(a);
+                        drop(b);
+                    }
+                    2 => {
+                        drop(b);
+                        keep.push((a, None));
+                    }
+                    _ => keep.push((a, Some((b, want)))),
+                }
+            }
+            for (_, b) in &keep {
+                if let Some((b, want)) = b {
+                    assert_close(&b.to_vec().unwrap(), want, 1e-4, 1e-5);
+                }
+            }
+            let [r] = iterate_all([&u], 9, |[u]| [padded_step(u)]);
+            let mut w = u0;
+            for _ in 0..9 {
+                w = padded(&w);
+            }
+            assert_close(&r.to_vec().unwrap(), &w, 1e-4, 1e-5);
+        } else {
+            let mut u = on(&ctx, &u0);
+            for step in 0..80 {
+                let half = &u * 0.5 + 0.25;
+                u = &half + 0.0 * &u;
+                match step % 3 {
+                    0 => u.eval().unwrap(),
+                    1 => ctx.flush().unwrap(),
+                    _ => ctx.sync().unwrap(),
+                }
+            }
+            u.to_vec().unwrap();
+        }
+    });
+}
+
+/// A traced loop replays its recorded launches over buffers it holds; other threads allocate and
+/// drop arrays of the same size class all the time, so their buffers are recycled through the pool
+/// the recording's buffers came from. Every thread checks what it computed.
+#[test]
+fn recycled_buffers_do_not_reach_into_the_plan_another_thread_replays() {
+    let ctx = default_context().unwrap();
+    together(5, 20, |t, round| {
+        let u0 = data(t, round);
+        if t == 0 {
+            let u = on(&ctx, &u0);
+            let [u] = iterate_all([&u], 31, |[u]| [padded_step(u)]);
+            let mut w = u0;
+            for _ in 0..31 {
+                w = padded(&w);
+            }
+            assert_close(&u.to_vec().unwrap(), &w, 1e-4, 1e-5);
+        } else {
+            for k in 0..40 {
+                let scale = 1.0 + (k % 5) as f32;
+                let a = on(&ctx, &u0);
+                let b = (&a * scale).cache();
+                let c = &b + 1.0;
+                drop(a);
+                let got = c.to_vec().unwrap();
+                drop(b);
+                let want: Vec<f32> = u0.iter().map(|v| v * scale + 1.0).collect();
+                assert_close(&got, &want, 1e-5, 1e-6);
+                if k % 7 == 0 {
+                    ctx.sync().unwrap();
+                }
+            }
+        }
+    });
+}
+
+/// A long chain over the node limit: its operands are cut into several kernels, and evaluating one
+/// array evaluates the others that share work with it alongside (flattening inside flattening,
+/// `COMPUTING` guards inside each other), while the other threads do the same with their own.
+#[test]
+fn evaluating_alongside_under_a_tight_node_limit_on_a_shared_context() {
+    let ctx = default_context().unwrap();
+    together(6, 15, |t, round| {
+        let u0 = data(t, round);
+        let u = on(&ctx, &u0);
+        let (a, b, c, d) = luma::fusion_limit(4, || {
+            let a = (((&u * 1.5 + 0.25) * 0.5 + 0.125) * 0.75 + 0.0625) * 0.5 + 0.25;
+            let b = luma::fusion_limit(3, || ((&a * 2.0 - 0.5) * 0.5 + a.shift(1) * 0.25) * 0.5 + 0.125);
+            let c = (a.shift(-1) + &b) * 0.5 + (&b * &a) * 0.125;
+            let d = &c * 0.5 + &a * 0.25;
+            (a, b, c, d)
+        });
+        let ha: Vec<f32> = u0.iter().map(|v| (((v * 1.5 + 0.25) * 0.5 + 0.125) * 0.75 + 0.0625) * 0.5 + 0.25).collect();
+        let hb: Vec<f32> = (0..N).map(|i| ((ha[i] * 2.0 - 0.5) * 0.5 + ha[(i + N - 1) % N] * 0.25) * 0.5 + 0.125).collect();
+        let hc: Vec<f32> = (0..N).map(|i| (ha[(i + 1) % N] + hb[i]) * 0.5 + hb[i] * ha[i] * 0.125).collect();
+        let hd: Vec<f32> = (0..N).map(|i| hc[i] * 0.5 + ha[i] * 0.25).collect();
+        // Read in an order that makes the first one pull the others in alongside.
+        let order = [(t + round) % 4, (t + round + 1) % 4, (t + round + 2) % 4, (t + round + 3) % 4];
+        for which in order {
+            match which {
+                0 => assert_close(&a.to_vec().unwrap(), &ha, 1e-4, 1e-5),
+                1 => assert_close(&b.to_vec().unwrap(), &hb, 1e-4, 1e-5),
+                2 => assert_close(&c.to_vec().unwrap(), &hc, 1e-4, 1e-5),
+                _ => assert_close(&d.to_vec().unwrap(), &hd, 1e-4, 1e-5),
+            }
+        }
+    });
+}
+
+/// The padded state is cloned and the clones are assigned through slices: each assignment supersedes
+/// the expression the earlier clones hold, in a per-step `eval` loop and in a traced loop, on several threads.
+#[test]
+fn assigned_clones_of_a_lazy_padded_state_on_a_shared_context() {
+    let ctx = default_context().unwrap();
+    // One step: `w` padded, two clones assigned at both ends through slices, read through the clones.
+    fn step(u: &Array<f32>) -> Array<f32> {
+        let n = u.len();
+        let w = u.pad([(1, 1)], PadMode::Edge);
+        let left = w.clone();
+        let right = w.clone();
+        left.slice(0, ..1).assign(0.5).unwrap();
+        right.slice(0, n + 1..).assign(0.25).unwrap();
+        (w.slice(0, 1..n + 1) * 0.5 + left.slice(0, ..n) * 0.25 + right.slice(0, 2..n + 2) * 0.25) * 0.99 + 0.001
+    }
+    fn host(u: &[f32]) -> Vec<f32> {
+        let n = u.len();
+        let w: Vec<f32> = std::iter::once(0.5).chain(u.iter().copied()).chain(std::iter::once(0.25)).collect();
+        // `w` is one array: both clones see both writes.
+        (0..n).map(|i| (0.5 * w[i + 1] + 0.25 * w[i] + 0.25 * w[i + 2]) * 0.99 + 0.001).collect()
+    }
+    together(6, 10, |t, round| {
+        let u0 = data(t, round);
+        let mut u = on(&ctx, &u0);
+        let mut w = u0.clone();
+        for _ in 0..15 {
+            u = step(&u);
+            u.eval().unwrap();
+            w = host(&w);
+        }
+        assert_close(&u.to_vec().unwrap(), &w, 1e-4, 1e-5);
+        let u = on(&ctx, &u0);
+        let [u] = iterate_all([&u], 11, |[u]| [step(u)]);
+        let mut w = u0;
+        for _ in 0..11 {
+            w = host(&w);
+        }
+        assert_close(&u.to_vec().unwrap(), &w, 1e-4, 1e-5);
+    });
+}
