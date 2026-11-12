@@ -115,8 +115,10 @@ All notable changes to Luma are listed here. The format follows
 
 - Fusion decisions use the cost model: a kernel that reads an expression through views at several
   indices (slices, pads, flips, `take`) recomputes it at every read, or evaluates it first and
-  reads it back, whichever the device's `CostModel` estimates to be cheaper (the old rule always
-  recomputed within the instruction cap, which stays as a size bound). Circular shifts accept up
+  reads it back, whichever the device's `CostModel` estimates to be cheaper (evaluating first must
+  be estimated 25% cheaper, and recomputes what it shares with the rest of the program instead of
+  evaluating that too). The old rule always recomputed within the instruction cap, which stays as
+  a size bound. Circular shifts accept up
   to eight lazy readers of a cheap expression instead of two, and fewer of an expensive one.
 - `iterate` and `iterate_all` trace their step once and replay the recorded kernels for steps that
   do not fuse into one kernel (shifts, `cache()`, `assign`, reductions), instead of calling `step`

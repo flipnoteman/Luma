@@ -109,6 +109,9 @@ struct Lowering<'a> {
     instances: FxMap<(u32, u32), u32>,
     /// Per sub-program, at how many contexts it was lowered.
     count: Vec<u32>,
+    /// A sub-program read from its evaluated buffer instead of being unfolded (for costing what
+    /// evaluating it first leaves of the program): its reads are one load each.
+    cut: Option<u32>,
     /// Set once more than `cap` instructions exist: nothing is lowered any further.
     over: bool,
 }
@@ -126,6 +129,7 @@ impl<'a> Lowering<'a> {
             numbered: FxMap::default(),
             instances: FxMap::default(),
             count: vec![0; subs.len()],
+            cut: None,
             over: false,
         }
     }
@@ -236,6 +240,7 @@ impl Lowering<'_> {
                     };
                     let child = self.context(ctx, kind, context_args);
                     match source {
+                        Ref::Sub(s) if self.cut == Some(s) => self.push(Flat { op: instr.op, args: [source, b, Ref::Unused], at: ctx, child }),
                         Ref::Sub(s) => {
                             let value = self.instance(s, child);
                             if matches!(kind, ShiftKind::View { edge: Edge::Fill, .. }) {
@@ -253,6 +258,30 @@ impl Lowering<'_> {
         }
         local
     }
+}
+
+/// What evaluating sub-program `s` of `key` on its own costs per element: its operations with
+/// the sub-programs it reads written out (see [`op_weight`]), and the bytes of the inputs it
+/// loads. `None` past `cap` instructions.
+fn alone(key: &FusedKey, s: usize, cap: usize, cost: &CostModel) -> Option<(f64, f64)> {
+    let mut lowering = Lowering::new(&key.subs, &[], cap);
+    lowering.lower(key.subs.get(s)?, 0);
+    if lowering.over {
+        return None;
+    }
+    let ops = lowering.instrs.iter().map(|flat| op_weight(flat.op, cost)).sum();
+    let reads = lowering.instrs.iter().flat_map(|flat| flat.args).chain(lowering.ctxs.iter().flat_map(|ctx| ctx.args));
+    Some((ops, input_bytes(key, reads)))
+}
+
+/// The operations per element (see [`op_weight`]) of `key` once sub-program `s` is read from its
+/// evaluated buffer: what is left of the lowered program, with the sub-programs that `s` shares
+/// with the rest still computed. `None` past `cap` instructions.
+fn without(key: &FusedKey, s: u32, cap: usize, cost: &CostModel) -> Option<f64> {
+    let mut lowering = Lowering::new(&key.subs, &[], cap);
+    lowering.cut = Some(s);
+    lowering.lower(&key.instrs, 0);
+    (!lowering.over).then(|| lowering.instrs.iter().map(|flat| op_weight(flat.op, cost)).sum())
 }
 
 /// Lowers `key` (main program at context 0), giving up once more than `cap` instructions exist.
@@ -387,13 +416,23 @@ fn staged_time(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, ele
     kernel_ns(cost, io_bytes, (programs.main.ops + staged_ops) * elements)
 }
 
+/// How much cheaper a staged kernel must be estimated than the one it replaces to be chosen.
+const STAGE_MARGIN: f64 = 0.9;
+
+/// How much cheaper evaluating a sub-program first must be estimated than the kernel it replaces.
+/// Stricter than [`STAGE_MARGIN`]: the program is flattened again on the host, which the estimate
+/// leaves out, and the operation counts err most on long programs bound by memory latency (the
+/// MUSCL step at 2048² ran slower with a sub-program its estimate put at 11% cheaper).
+const MATERIALISE_MARGIN: f64 = 0.75;
+
 /// Decides how to run `key` (which [`inlines`](FusedKey::inlines)) over `len` elements: as one
 /// kernel that computes every sub-program at each index it is read at, as one kernel that
 /// stages the sub-programs read through translations in workgroup memory (if `staging_on`), or
 /// with the sub-program whose repeated computation costs the most evaluated first (see the
-/// module documentation). Each choice must be estimated below 0.9 times the time of the one
-/// before it, in that order. Lowered programs over `cap` instructions are always cut, unless
-/// staging makes them fit.
+/// module documentation). Staging must be estimated below [`STAGE_MARGIN`] times the time of one
+/// kernel, and evaluating a sub-program first below [`MATERIALISE_MARGIN`] times the time of the
+/// choice before it. Lowered programs over `cap` instructions are always cut, unless staging
+/// makes them fit.
 pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tuning: &Tuning, staging_on: bool) -> (Judgement, Estimates) {
     let elements = len as f64;
     let staged = if staging_on { stage(key, cap, cost, tuning) } else { None };
@@ -421,11 +460,12 @@ pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tu
             continue;
         }
         let s32 = u32::try_from(s).unwrap_or(u32::MAX);
-        let once: f64 = program.iter().map(|instr| op_weight(instr.op, cost)).sum();
+        // Evaluated on its own, the sub-program computes the sub-programs it reads too; what it
+        // shares with the rest of the program is still computed there.
+        let Some((once, in_s)) = alone(key, s, cap, cost) else { continue };
+        let Some(rest) = without(key, s32, cap, cost) else { continue };
         let len_s = sub_len(key, s32, len);
-        let in_s = input_bytes(key, program.iter().flat_map(|instr| instr.args));
         let out_s = program.last().map_or(0.0, |instr| instr.op.out_ty().bytes() as f64);
-        let rest = (inlined.ops - f64::from(instances) * once).max(0.0);
         let t = kernel_ns(cost, len_s * (in_s + out_s), once * len_s) + kernel_ns(cost, io_bytes + elements * out_s, rest * elements);
         if best.is_none_or(|(_, t_best)| t < t_best) {
             best = Some((s32, t));
@@ -435,13 +475,13 @@ pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tu
     let mut current = inline_ns;
     let mut choice = None;
     if let (Some((staging, _)), Some(t)) = (staged, staged_ns)
-        && t < 0.9 * current
+        && t < STAGE_MARGIN * current
     {
         current = t;
         choice = Some(staging);
     }
     match best {
-        Some((sub, t)) if t < 0.9 * current => {
+        Some((sub, t)) if t < MATERIALISE_MARGIN * current => {
             let instances = inlined.count[sub as usize] as usize;
             (Judgement::Materialise { sub, reason: SplitReason::Materialised { instances } }, estimates)
         }
@@ -636,18 +676,30 @@ mod tests {
         key(main, vec![expression()])
     }
 
+    /// [`difference_key`] of an expression of 20 operations.
+    fn long_difference_key() -> FusedKey {
+        let mut long = expression();
+        for k in 2..19 {
+            long.push(instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(k), Ref::Unused, Ref::Unused]));
+        }
+        FusedKey { subs: std::sync::Arc::new(vec![long]), ..difference_key() }
+    }
+
     #[test]
     fn costly_launches_keep_the_recomputation_and_costly_arithmetic_stores_the_expression() {
-        let key = difference_key();
+        let key = long_difference_key();
         let len = 1 << 20;
         let tuning = Tuning::for_tests();
         let (cheap_launch, _) = judge(&key, len, 1000, &CostModel { launch_us: 1e6, ..CostModel::TEST }, &tuning, true);
         assert!(matches!(cheap_launch, Judgement::Run { .. }), "{cheap_launch:?}");
-        let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, true);
+        let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, false);
         let Judgement::Materialise { sub: 0, reason: SplitReason::Materialised { instances: 2 } } = cheap_memory else {
             panic!("{cheap_memory:?} {estimates:?}");
         };
         assert!(estimates.best_sub.is_some_and(|(_, t)| t < estimates.inline_ns), "{estimates:?}");
+        // A short expression costs less to recompute than its two reads through views.
+        let (short, estimates) = judge(&difference_key(), len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, false);
+        assert!(matches!(short, Judgement::Run { staging: None }), "{short:?} {estimates:?}");
     }
 
     #[test]

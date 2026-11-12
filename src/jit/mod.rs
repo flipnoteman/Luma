@@ -51,8 +51,9 @@
 //!   ([`CostModel`]) decides per program (`inline::judge`), choosing in turn the one kernel that
 //!   recomputes every read (the baseline), the one kernel that computes a sub-program once per
 //!   cell of a workgroup tile in workgroup memory (below), and the evaluation of the sub-program
-//!   read at several indices first (one kernel writing it, one reading it back), each if it is
-//!   estimated to take less than 0.9 times the time of the choice before it
+//!   read at several indices first (one kernel writing it and recomputing what it shares with
+//!   the rest, one reading it back), each if it is estimated to take less than 0.9 (staging) or
+//!   0.75 (evaluating first) times the time of the choice before it
 //!   ([`SplitReason::Materialised`] for the last). A kernel that would grow past
 //!   `Tuning::max_inlined` instructions (`LUMA_FUSION_MAX_INLINED`) is cut whatever the model
 //!   says, by evaluating the sub-program whose repeats cost the most

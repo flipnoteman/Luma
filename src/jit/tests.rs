@@ -1654,6 +1654,9 @@ fn prohibitive_launches_keep_a_view_read_at_three_offsets_in_one_kernel() {
 fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
     let ctx = ctx();
     ctx.set_cost_model(CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST });
+    // Staging the expression once per cell would win on this model too; this is about the
+    // choice between recomputing and storing.
+    ctx.jit().set_staging(false);
     ctx.jit().record_splits();
     let n = 1 << 16;
     let xs = values(n, 102, 0.5, 2.0);

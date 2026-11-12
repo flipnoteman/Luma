@@ -8,6 +8,7 @@ use crate::array::{Failure, Storage};
 use crate::builtin::{BinOp, ReduceList, UnOp};
 use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
+use crate::profile::SplitReason;
 
 use super::codegen::Tile;
 use super::inline::Judgement;
@@ -818,7 +819,7 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
             })
             .map(|(member, _)| Arc::clone(member))
             .collect();
-        if !shared.is_empty() && evaluation_fits(std::iter::once((root, args)), &shared) {
+        if !shared.is_empty() && !is_alone(root) && evaluation_fits(std::iter::once((root, args)), &shared) {
             force_group(&shared)?;
             continue;
         }
@@ -829,6 +830,36 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
             flat.fused_nodes.push(Arc::clone(root));
         }
         return Ok(Some(flat.finish(tail, outputs)));
+    }
+}
+
+thread_local! {
+    /// The node [`force_alone`] is evaluating on this thread, if any.
+    static ALONE: std::cell::Cell<*const Node> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Whether `root` is being evaluated by [`force_alone`].
+fn is_alone(root: &Arc<Node>) -> bool {
+    ALONE.with(|alone| std::ptr::eq(alone.get(), Arc::as_ptr(root)))
+}
+
+/// Restores the previous [`ALONE`] node when dropped.
+struct Alone(*const Node);
+
+impl Drop for Alone {
+    fn drop(&mut self) {
+        ALONE.with(|alone| alone.set(self.0));
+    }
+}
+
+/// Evaluates `node` as one kernel that recomputes the nodes its expression shares with other
+/// pending operations, instead of evaluating those first: what `inline::judge` priced when it
+/// chose to evaluate the sub-program `node` computes before the program reading it.
+fn force_alone(node: &Arc<Node>) -> Result<(), Failure> {
+    let _restore = Alone(ALONE.with(|alone| alone.replace(Arc::as_ptr(node))));
+    match node.force() {
+        Ok(_) => Ok(()),
+        Err(error) => Err(Failure::Inherited(Arc::clone(error))),
     }
 }
 
@@ -893,9 +924,16 @@ pub(super) fn flatten_inner(
                     let node = fused.sub_roots.get(*sub as usize).cloned();
                     drop(fused);
                     if let Some(node) = node {
-                        jit.evaluate_alongside(Arc::clone(&node));
-                        if let Err(error) = node.force() {
-                            return Err(Failure::Inherited(Arc::clone(error)));
+                        // A cut forced by the instruction cap takes along the live arrays that
+                        // share work with the expression; one the cost model chose is priced as
+                        // that expression alone, recomputing what it shares with the rest.
+                        if matches!(reason, SplitReason::Inlined { .. }) {
+                            jit.evaluate_alongside(Arc::clone(&node));
+                            if let Err(error) = node.force() {
+                                return Err(Failure::Inherited(Arc::clone(error)));
+                            }
+                        } else {
+                            force_alone(&node)?;
                         }
                     }
                     continue;
@@ -990,10 +1028,11 @@ fn flatten_once(
         // A node that `eval` asked for (and whose evaluation was postponed) is computed on its
         // own once anyway: read inside a sub-program, it would be recomputed at every instance.
         let requested = |member: &&Member| member.node.requested.load(Ordering::Relaxed) && member.node.is_pending();
+        let alone = matches!(roots, [(root, _)] if is_alone(root));
         let shared: Vec<Arc<Node>> = members
             .iter()
             .chain(&sub_members)
-            .filter(|member| !is_root(&member.node) && member.node.has_consumer_outside(all_seen))
+            .filter(|member| !alone && !is_root(&member.node) && member.node.has_consumer_outside(all_seen))
             .chain(sub_members.iter().filter(|member| !is_root(&member.node)).filter(requested))
             .map(|member| Arc::clone(&member.node))
             .collect();
