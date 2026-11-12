@@ -262,6 +262,7 @@ impl Context {
     /// copies out of one is submitted it is mapped again, and the next upload of its size class
     /// writes straight into it.
     pub(crate) fn upload(&self, dst: &Buffer, data: &[u8]) -> Result<()> {
+        self.abort_recording()?;
         let bytes = data.len() as u64;
         let max = self.inner.max_buffer_bytes;
         let class = pool::size_class(bytes, max)
@@ -440,6 +441,7 @@ impl Context {
     /// each its own submission, so copying one piece out of its staging buffer overlaps the
     /// transfer of the next.
     pub(crate) fn read_into(&self, buffer: &Buffer, dst: &mut [std::mem::MaybeUninit<u8>]) -> Result<()> {
+        self.abort_recording()?;
         let bytes = dst.len() as u64;
         let chunk = if bytes > 2 * READ_CHUNK { READ_CHUNK } else { bytes.max(1) };
         let mut staged = Vec::new();
@@ -498,6 +500,7 @@ impl Context {
     /// buffer of at most [`READ_CHUNK`] bytes and without noting the waits in [`WaitHistory`].
     /// For readbacks made while the device is full.
     pub(crate) fn read_spill(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<u8>> {
+        self.abort_recording()?;
         self.read_vec(bytes, |dst| {
             let chunk = READ_CHUNK.min(bytes).max(1);
             let staging = self.alloc_buffer(chunk, STAGING_USAGE)?;
@@ -525,6 +528,7 @@ impl Context {
     /// Waits for the GPU and returns the first `bytes` bytes of `staging`, a `MAP_READ` buffer
     /// whose contents were copied in by a submitted batch.
     pub(super) fn map_read<T: Pod>(&self, staging: &Buffer, bytes: u64) -> Result<Vec<T>> {
+        self.abort_recording()?;
         let slice = staging.slice(..bytes);
         let waited = self.wait_map(None, &map_for_read(slice))?;
         self.inner.waits.record(waited);

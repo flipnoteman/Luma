@@ -609,7 +609,7 @@ fn color_cpu(src: &[[f32; 4]], out: &mut [[f32; 4]]) {
 }
 
 fn to_linear_luma(c: &Array<f32>) -> Array<f32> {
-    select(&c.le(0.04045), &(c / 12.92), &(((c + 0.055) / 1.055).powf(2.4)))
+    select(&c.le(0.04045), &(c / 12.92), ((c + 0.055) / 1.055).powf(2.4))
 }
 
 fn to_srgb_luma(c: &Array<f32>) -> Array<f32> {

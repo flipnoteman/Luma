@@ -11,6 +11,10 @@
 const TUNING_ENV: &str = "LUMA_TUNING";
 /// `LUMA_SUBGROUPS=off` keeps the built-in kernels off subgroup operations.
 const SUBGROUPS_ENV: &str = "LUMA_SUBGROUPS";
+/// `LUMA_FUSION_MAX_LIVE=n` overrides [`Tuning::max_live`] (clamped to `8..=4096`).
+const MAX_LIVE_ENV: &str = "LUMA_FUSION_MAX_LIVE";
+/// `LUMA_FUSION_MAX_INLINED=n` overrides [`Tuning::max_inlined`] (clamped to `16..=16384`).
+const MAX_INLINED_ENV: &str = "LUMA_FUSION_MAX_INLINED";
 
 /// The device family a tuning profile was measured on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -48,6 +52,12 @@ pub(crate) struct Tuning {
     pub(crate) subgroups: bool,
     /// Most operations of a lazy expression a shift recomputes at the shifted element instead of evaluating it first.
     pub(crate) max_recomputed: usize,
+    /// Most values a fused kernel keeps live at once before it is split in two (register pressure).
+    pub(crate) max_live: usize,
+    /// Most instructions of a kernel that reads sub-programs through views once they are written
+    /// out at every index they are read at (see `jit::inline`); a bigger one is cut by evaluating
+    /// one of its sub-programs first.
+    pub(crate) max_inlined: usize,
 }
 
 impl Tuning {
@@ -64,6 +74,8 @@ impl Tuning {
         reduce_max_groups: 1024,
         subgroups: false,
         max_recomputed: 24,
+        max_live: 64,
+        max_inlined: 1024,
     };
 
     const NVIDIA: Tuning = Tuning {
@@ -78,6 +90,8 @@ impl Tuning {
         reduce_max_groups: 2048,
         subgroups: false,
         max_recomputed: 32,
+        max_live: 96,
+        max_inlined: 1536,
     };
 
     const GENERIC: Tuning = Tuning {
@@ -92,11 +106,13 @@ impl Tuning {
         reduce_max_groups: 1024,
         subgroups: false,
         max_recomputed: 24,
+        max_live: 96,
+        max_inlined: 1024,
     };
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
     /// that measured faster on llvmpipe.
-    const CPU: Tuning = Tuning { profile: TuningProfile::Cpu, elementwise_workgroup: 64, ..Tuning::GENERIC };
+    const CPU: Tuning = Tuning { profile: TuningProfile::Cpu, elementwise_workgroup: 64, max_live: 256, max_inlined: 192, ..Tuning::GENERIC };
 
     /// The parameters for the GPU `info` describes, unless the environment forces a profile.
     pub(crate) fn for_adapter(info: &wgpu::AdapterInfo, limits: &wgpu::Limits, features: wgpu::Features) -> Tuning {
@@ -118,6 +134,12 @@ impl Tuning {
             TuningProfile::Cpu => Tuning::CPU,
         };
         let mut tuning = tuning.within(limits);
+        if let Some(live) = std::env::var(MAX_LIVE_ENV).ok().and_then(|value| value.trim().parse::<usize>().ok()) {
+            tuning.max_live = live.clamp(8, 4096);
+        }
+        if let Some(inlined) = std::env::var(MAX_INLINED_ENV).ok().and_then(|value| value.trim().parse::<usize>().ok()) {
+            tuning.max_inlined = inlined.clamp(16, 16384);
+        }
         tuning.subgroups = features.contains(wgpu::Features::SUBGROUP) && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
         tuning
     }

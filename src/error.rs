@@ -132,6 +132,14 @@ pub enum LumaError {
     Gpu(String),
     /// A lock inside the context was poisoned by a panic on another thread.
     LockPoisoned,
+    /// The array cannot be written into: it is the state handed to a traced iteration step.
+    ReadOnly(&'static str),
+    /// The operation does not exist for this element type or on this device (`f64` and
+    /// `Df32` arrays have a reduced set of operations; `f64` needs 64-bit shader floats).
+    Unsupported(String),
+    /// The finite check (see `ContextOptions::check_finite`) found a NaN or an infinity in the
+    /// result of an operation.
+    NonFinite,
     /// GPU timing is not available (the adapter has no timestamp queries) or not enabled.
     Profiling(String),
     /// An operation on arrays failed. Produced when an operator or math method poisons its result:
@@ -218,6 +226,9 @@ impl fmt::Display for LumaError {
             }
             LumaError::Gpu(msg) => write!(f, "GPU error: {msg}"),
             LumaError::LockPoisoned => f.write_str("A luma context lock was poisoned"),
+            LumaError::ReadOnly(what) => write!(f, "cannot write into {what}"),
+            LumaError::Unsupported(what) => f.write_str(what),
+            LumaError::NonFinite => f.write_str("the result contains NaN or Inf"),
             LumaError::Profiling(msg) => write!(f, "GPU profiling: {msg}"),
             LumaError::Op { op, location, source } => write!(
                 f,

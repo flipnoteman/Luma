@@ -165,7 +165,7 @@ fn converge(sz: &Sizes) {
             let mut u = &g * 1.0;
             for _ in 0..steps {
                 let next = heat_step(&u);
-                let err = (&next - &u).abs().max().unwrap();
+                let err = (&next - &u).abs().max().item().unwrap();
                 u = next;
                 if err < sz.converge_tol {
                     break;
@@ -262,11 +262,11 @@ fn blackscholes(sz: &Sizes) {
         check(&format!("blackscholes {n} price"), err, 1e-4);
         report(row("price", err), || requested(black_scholes(&gs, &gk, &gt)));
 
-        let got_sum = black_scholes(&gs, &gk, &gt).sum().unwrap() as f64;
+        let got_sum = black_scholes(&gs, &gk, &gt).sum().item().unwrap() as f64;
         let err = ((got_sum - want_sum).abs() / want_sum.abs()) as f32;
         check(&format!("blackscholes {n} price_sum"), err, 1e-3);
         report(row("price_sum", err), || {
-            std::hint::black_box(black_scholes(&gs, &gk, &gt).sum().unwrap());
+            std::hint::black_box(black_scholes(&gs, &gk, &gt).sum().item().unwrap());
         });
     }
 }
@@ -393,7 +393,7 @@ fn montecarlo(sz: &Sizes) {
         let pi = || -> f32 {
             let u = Array::<f32>::uniform(n, 1).unwrap();
             let v = Array::<f32>::uniform(n, 2).unwrap();
-            select(&(&u * &u + &v * &v).le(1.0), 4.0, 0.0).mean().unwrap()
+            select(&(&u * &u + &v * &v).le(1.0), 4.0, 0.0).mean().item().unwrap()
         };
         let err = (pi() - std::f32::consts::PI).abs() / std::f32::consts::PI;
         check(&format!("montecarlo {n} pi"), err, MC_PI_TOLERANCE);
@@ -406,7 +406,7 @@ fn montecarlo(sz: &Sizes) {
         let call = || -> f32 {
             let z = Array::<f32>::normal(n, 3).unwrap();
             let spot = (z * vst + drift).exp() * MC_SPOT;
-            (spot - MC_STRIKE).maximum(0.0).mean().unwrap() * discount
+            (spot - MC_STRIKE).maximum(0.0).mean().item().unwrap() * discount
         };
         let exact = mc_call_exact();
         let err = ((f64::from(call()) - exact).abs() / exact) as f32;

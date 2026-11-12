@@ -78,7 +78,8 @@ fn fused_results_match_the_unfused_evaluation_of_the_same_expression() {
         let before = ctx.jit().stats();
         let mut acc = &x * &y;
         for i in 0..20 {
-            acc = (&acc + &x * (i as f32 * 0.1)).sqrt() * 1.1 - &y / 7.0 + 0.5;
+            // A different divisor each round: identical operations would be one node.
+            acc = (&acc + &x * (i as f32 * 0.1)).sqrt() * 1.1 - &y / (7.0 + i as f32) + 0.5;
         }
         let out = acc.to_vec().unwrap();
         (out, delta(before, ctx.jit().stats()).elementwise_launches)
@@ -152,7 +153,7 @@ fn reductions_fuse_their_input_expression() {
     let b = f32s(&ctx, &ys);
 
     let before = ctx.jit().stats();
-    let sum = (&a * &b).sum().unwrap();
+    let sum = (&a * &b).sum().item().unwrap();
     let d = delta(before, ctx.jit().stats());
     assert_eq!(d.elementwise_launches, 0, "the product is never materialized");
     assert_eq!(d.reduce_launches, 1);
@@ -160,12 +161,13 @@ fn reductions_fuse_their_input_expression() {
     assert!((f64::from(sum) - want).abs() < 1e-2, "{sum} vs {want}");
 
     let before = ctx.jit().stats();
-    let norm = (&a - &b).norm().unwrap();
-    let min = (&a * 2.0 - 1.0).min().unwrap();
-    let max = (&a * 2.0 - 1.0).max().unwrap();
-    let mean = (&a + &b).mean().unwrap();
+    let norm = (&a - &b).norm().item().unwrap();
+    let min = (&a * 2.0 - 1.0).min().item().unwrap();
+    let max = (&a * 2.0 - 1.0).max().item().unwrap();
+    let mean = (&a + &b).mean().item().unwrap();
     let d = delta(before, ctx.jit().stats());
-    assert_eq!(d.elementwise_launches, 0);
+    // The expression is never materialized; `norm` and `mean` finish with a one-element kernel each.
+    assert_eq!(d.elementwise_launches, 2);
     assert_eq!(d.reduce_launches, 4);
     let want_norm = xs
         .iter()
@@ -182,18 +184,18 @@ fn reductions_fuse_their_input_expression() {
     assert!((f64::from(mean) - want_mean).abs() < 1e-4, "{mean} vs {want_mean}");
 
     // u32: counting a mask.
-    let count = a.gt(0.0).sum().unwrap();
+    let count = a.gt(0.0).sum().item().unwrap();
     assert_eq!(count as usize, xs.iter().filter(|&&x| x > 0.0).count());
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
 
     // Sizes around the block boundaries, one-element arrays included.
     for len in [1usize, 2, 255, 1023, 1024, 1025, 4096, 4097, 1024 * 1024 + 3] {
         let data = values(len, len as u64, 0.0, 1.0);
         let x = f32s(&ctx, &data);
-        let got = (&x * 2.0).sum().unwrap();
+        let got = (&x * 2.0).sum().item().unwrap();
         let want: f64 = data.iter().map(|&v| f64::from(v) * 2.0).sum();
         assert!((f64::from(got) - want).abs() <= 1e-4 * want.abs().max(1.0), "{len}: {got} vs {want}");
-        let got_max = (&x + 1.0).max().unwrap();
+        let got_max = (&x + 1.0).max().item().unwrap();
         let want_max = data.iter().map(|&v| v + 1.0).fold(f32::NEG_INFINITY, f32::max);
         assert_eq!(got_max, want_max, "{len}");
     }
@@ -207,7 +209,7 @@ fn reducing_an_expression_does_not_evaluate_it() {
     let t = &a * 3.0;
 
     let before = ctx.jit().stats();
-    let s = t.sum().unwrap();
+    let s = t.sum().item().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
     // The expression is still usable afterwards, and gets evaluated on its own.
     let want: Vec<f32> = xs.iter().map(|&v| v * 3.0).collect();
@@ -219,7 +221,7 @@ fn reducing_an_expression_does_not_evaluate_it() {
 
     // Once evaluated, reductions read its buffer.
     let before = ctx.jit().stats();
-    let again = t.sum().unwrap();
+    let again = t.sum().item().unwrap();
     assert_eq!(again, s);
     assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 0);
 }
@@ -269,7 +271,7 @@ fn deep_chains_are_split_at_the_node_limit() {
 #[test]
 fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
     let ctx = Context::new().unwrap();
-    let max_inputs = ctx.jit().max_inputs;
+    let max_inputs = ctx.jit().max_inputs();
     let count = max_inputs * 2 + 3;
     let data: Vec<Vec<f32>> = (0..count).map(|i| values(300, 100 + i as u64, -1.0, 1.0)).collect();
     let arrays: Vec<Array<f32>> = data.iter().map(|d| f32s(&ctx, d)).collect();
@@ -525,7 +527,7 @@ fn eval_does_not_materialize_the_temporaries_of_the_expression() {
 
     let before = ctx.jit().stats();
     let product = &x * &x;
-    product.sum().unwrap();
+    product.sum().item().unwrap();
     // Reduced without being materialized; flushing does not compute it afterwards.
     ctx.sync().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
@@ -581,7 +583,7 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
     assert_close(&got_other, &want_other, 1e-5, 1e-5);
     // A shifted read inside a reduction's first pass.
     let before = ctx.jit().stats();
-    let lag = (&x * &x.shift(3)).sum().unwrap();
+    let lag = (&x * &x.shift(3)).sum().item().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
     let want: f32 = (0..n).map(|i| xs[i] * xs[(i + n - 3) % n]).sum();
     assert!((lag - want).abs() < 1e-3, "{lag} vs {want}");
@@ -763,7 +765,7 @@ fn mixed_types_and_scalars_in_a_staged_expression() {
     let x = Array::from_slice_on(&ctx, &xs, [w, h]).unwrap();
     let scale = 1.5f32;
     let mask = x.gt(1.0);
-    let got = (select(&mask.shift([1isize, 0]), &(&x * scale).shift([0isize, 1]), &x) + select(&mask.shift([-1isize, 1]), 1.0, 0.0))
+    let got = (select(&mask.shift([1isize, 0]), (&x * scale).shift([0isize, 1]), &x) + select(&mask.shift([-1isize, 1]), 1.0, 0.0))
         .to_vec()
         .unwrap();
     let at = |cx: isize, cy: isize| (cx.rem_euclid(w as isize) as usize) + w * cy.rem_euclid(h as isize) as usize;
@@ -819,7 +821,7 @@ fn several_reductions_share_one_pass() {
     let lazy = &x * 2.0;
     let before = ctx.jit().stats();
     let [sum, lo, hi, squares] =
-        lazy.reduce([Reduction::Sum, Reduction::Min, Reduction::Max, Reduction::SumOfSquares]).unwrap();
+        lazy.reduce([Reduction::Sum, Reduction::Min, Reduction::Max, Reduction::SumOfSquares]).to_array().unwrap();
     let d = delta(before, ctx.jit().stats());
     assert_eq!((d.reduce_launches, d.elementwise_launches), (1, 0));
     let doubled: Vec<f64> = xs.iter().map(|&v| f64::from(v) * 2.0).collect();
@@ -831,7 +833,7 @@ fn several_reductions_share_one_pass() {
     assert_eq!(hi, xs.iter().fold(f32::MIN, |m, &v| m.max(v * 2.0)));
 
     // On a materialized array, and an op repeated.
-    let [a, b] = x.reduce([Reduction::Max, Reduction::Max]).unwrap();
+    let [a, b] = x.reduce([Reduction::Max, Reduction::Max]).to_array().unwrap();
     assert_eq!((a, b), (hi / 2.0, hi / 2.0));
 }
 
@@ -876,7 +878,55 @@ fn arrays_advancing_together_are_split_into_multi_output_kernels() {
     assert_close(&got[2], &wc, 0.0, 0.0);
     // About 14 operations per iteration across three results: a few kernels per 64 operations,
     // not one single-output kernel per operand.
-    assert!(launches <= 20, "{launches} kernels");
+    // (The operations the three results share, like `inside`, are one node each and computed on
+    // their own where several kernels read them, which costs a few more kernels than recomputing.)
+    assert!(launches <= 32, "{launches} kernels");
+}
+
+#[test]
+fn arrays_advancing_together_for_many_iterations_split_into_few_kernels() {
+    let n = 600;
+    let cxs = values(n, 20, -0.3, 0.3);
+    let cys = values(n, 21, -0.3, 0.3);
+    let ctx = Context::new().unwrap();
+    let (cx, cy) = (f32s(&ctx, &cxs), f32s(&ctx, &cys));
+    let zero = f32s(&ctx, &vec![0.0; n]);
+    let one = f32s(&ctx, &vec![1.0; n]);
+
+    let before = ctx.jit().stats();
+    let (mut zx, mut zy, mut cnt) = (&zero * 1.0, &zero * 1.0, &zero * 1.0);
+    let iterations = 90;
+    // No `eval` while building: the limits of `create` alone cut the chains. The three arrays
+    // are evaluated together at the end (`flush` computes the live arrays that share work in
+    // multi-output kernels; reading them one by one would force `zx` alone, which makes every
+    // node that `zy` and `cnt` also read a kernel of its own).
+    for _ in 0..iterations {
+        let inside = (&zx * &zx + &zy * &zy).le(4.0);
+        let nzx = &zx * &zx - &zy * &zy + &cx;
+        let nzy = &zx * &zy * 2.0 + &cy;
+        zx = select(&inside, &nzx, &zx);
+        zy = select(&inside, &nzy, &zy);
+        cnt = &cnt + select(&inside, &one, &zero);
+    }
+    ctx.flush().unwrap();
+    let got = [zx.to_vec().unwrap(), zy.to_vec().unwrap(), cnt.to_vec().unwrap()];
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+
+    let (mut wx, mut wy, mut wc) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+    for _ in 0..iterations {
+        for j in 0..n {
+            let (x, y) = (wx[j], wy[j]);
+            if x * x + y * y <= 4.0 {
+                wx[j] = x * x - y * y + cxs[j];
+                wy[j] = x * y * 2.0 + cys[j];
+                wc[j] += 1.0;
+            }
+        }
+    }
+    assert_close(&got[0], &wx, 1e-3, 1e-3);
+    assert_close(&got[1], &wy, 1e-3, 1e-3);
+    assert_close(&got[2], &wc, 0.0, 0.0);
+    assert!(launches <= 16, "{launches} kernels");
 }
 
 #[test]
@@ -1208,7 +1258,7 @@ fn an_eval_loop_of_a_step_too_big_to_recompute_still_runs_as_one_loop() {
     assert_close(&got, &want, 1e-6, 1e-6);
 }
 
-/// Runs `next = step(&u); err = (&next - &u).abs().max()?; u = next` on a 32×32 torus with a
+/// Runs `next = step(&u); err = (&next - &u).abs().max().item()?; u = next` on a 32×32 torus with a
 /// fixed source `c`, `alpha(k)` as the diffusion of step `k`, and `c` overwritten before step
 /// `rewrite_at`, and checks every `err` and the final state against a CPU loop.
 fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32, rewrite_at: Option<usize>) {
@@ -1225,7 +1275,7 @@ fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32
         let a = alpha(k);
         let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - &u * 4.0;
         let next = &u + lap * a + &c * 0.01;
-        let err = (&next - &u).abs().max().unwrap();
+        let err = (&next - &u).abs().max().item().unwrap();
         u = next;
 
         let at = |i: usize, j: usize| cpu[i % W * W + j % W];
@@ -1270,4 +1320,992 @@ fn a_readback_loop_does_not_speculate_when_it_is_off() {
     ctx.jit().set_speculate(false);
     check_readback_loop(&ctx, 40, |_| 0.2, None);
     assert_eq!(ctx.jit().speculation_hits(), 0);
+}
+
+#[test]
+fn a_difference_of_slices_is_one_kernel() {
+    let ctx = Context::new().unwrap();
+    let data = values(9, 21, -1.0, 1.0);
+    let f = f32s(&ctx, &data);
+    let before = ctx.jit().stats();
+    let got = (f.slice(0, 1..) - f.slice(0, ..8)).to_vec().unwrap();
+    let want: Vec<f32> = (0..8).map(|i| data[i + 1] - data[i]).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+    // A slice of a lazy expression is computed inside the kernel of its user.
+    let before = ctx.jit().stats();
+    let e = &f * 2.0 + 1.0;
+    let got = (e.slice(0, 1..) - e.slice(0, ..8)).to_vec().unwrap();
+    let want: Vec<f32> = (0..8).map(|i| (data[i + 1] * 2.0 + 1.0) - (data[i] * 2.0 + 1.0)).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+}
+
+#[test]
+fn a_boundary_assignment_reading_the_target_is_one_kernel() {
+    let ctx = Context::new().unwrap();
+    let (ni, nj) = (8usize, 6usize);
+    let data = values(ni * nj, 40, -1.0, 1.0);
+    let want_ghost: Vec<f32> = (0..nj).flat_map(|j| [-data[3 + ni * j], -data[2 + ni * j]]).collect();
+    let check = |w: &Array<f32>| {
+        let got = w.to_vec().unwrap();
+        for j in 0..nj {
+            assert_eq!(&got[ni * j..ni * j + 2], &want_ghost[2 * j..2 * j + 2]);
+            assert_eq!(&got[ni * j + 2..ni * (j + 1)], &data[ni * j + 2..ni * (j + 1)]);
+        }
+    };
+
+    // By value: the expression is private to the write, so it all fuses into it.
+    let w = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
+    let before = ctx.jit().stats();
+    w.slice(0, ..2).assign(w.slice(0, 2..4).flip(0) * -1.0).unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    check(&w);
+
+    // By reference: the expression stays pending and reads the columns the write leaves alone.
+    let w = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
+    let g = w.slice(0, 2..4).flip(0) * -1.0;
+    let before = ctx.jit().stats();
+    w.slice(0, ..2).assign(&g).unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    check(&w);
+    let want_g: Vec<f32> = (0..nj).flat_map(|j| [-data[3 + ni * j], -data[2 + ni * j]]).collect();
+    assert_eq!(g.to_vec().unwrap(), want_g);
+}
+
+#[test]
+fn assigning_an_expression_of_the_whole_target_is_one_in_place_kernel() {
+    let ctx = Context::new().unwrap();
+    let data = values(500, 41, -1.0, 1.0);
+    let w = f32s(&ctx, &data);
+    let before = ctx.jit().stats();
+    w.assign((&w * 2.0 + 1.0) * 0.5 - &w * 0.25).unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = data.iter().map(|v| (v * 2.0 + 1.0) * 0.5 - v * 0.25).collect();
+    assert_close(&w.to_vec().unwrap(), &want, 1e-5, 1e-6);
+}
+
+#[test]
+fn a_record_ghost_assignment_is_one_kernel() {
+    use crate::fields::Fields;
+    let ctx = Context::new().unwrap();
+    let (ni, nj) = (8usize, 6usize);
+    let data: Vec<Vec<f32>> = (0..4).map(|k| values(ni * nj, 50 + k, -1.0, 1.0)).collect();
+    let record = |data: &[Vec<f32>]| -> [Array<f32>; 4] {
+        std::array::from_fn(|k| Array::from_slice_on(&ctx, &data[k], [ni, nj]).unwrap())
+    };
+    // ghost field k combines inner fields k and k + 1.
+    let want: Vec<Vec<f32>> = (0..4)
+        .map(|k| {
+            (0..nj)
+                .flat_map(|j| {
+                    let inner = |x: usize| data[k][x + ni * j] * 2.0 + data[(k + 1) % 4][x + ni * j];
+                    [inner(3), inner(2)]
+                })
+                .collect()
+        })
+        .collect();
+    let check = |w: &[Array<f32>; 4]| {
+        for k in 0..4 {
+            let got = w[k].to_vec().unwrap();
+            for j in 0..nj {
+                assert_eq!(&got[ni * j..ni * j + 2], &want[k][2 * j..2 * j + 2], "field {k} row {j}");
+                assert_eq!(&got[ni * j + 2..ni * (j + 1)], &data[k][ni * j + 2..ni * (j + 1)]);
+            }
+        }
+    };
+
+    let w = record(&data);
+    let inner = w.slice(0, 2..4).flip(0);
+    let ghost: [Array<f32>; 4] = std::array::from_fn(|k| &inner[k] * 2.0 + &inner[(k + 1) % 4]);
+    drop(inner);
+    let before = ctx.jit().stats();
+    w.slice(0, ..2).assign(ghost).unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    check(&w);
+
+    // Kept alive and by reference: same values.
+    let w = record(&data);
+    let inner = w.slice(0, 2..4).flip(0);
+    let ghost: [Array<f32>; 4] = std::array::from_fn(|k| &inner[k] * 2.0 + &inner[(k + 1) % 4]);
+    w.slice(0, ..2).assign(&ghost).unwrap();
+    check(&w);
+}
+
+#[test]
+fn a_wide_expression_of_hundreds_of_operations_is_one_kernel() {
+    let ctx = Context::new().unwrap();
+    let n = 777;
+    let (xs, ys, zs) = (values(n, 90, 0.5, 1.5), values(n, 91, 0.5, 1.5), values(n, 92, 0.5, 1.5));
+    let (x, y, z) = (f32s(&ctx, &xs), f32s(&ctx, &ys), f32s(&ctx, &zs));
+    let terms = 150;
+
+    let before = ctx.jit().stats();
+    // Four operations per term; every constant differs, so no two terms share a node.
+    let mut acc = &x * 0.0;
+    for i in 0..terms {
+        let c = 0.01 * (i + 1) as f32;
+        acc = acc + ((&x * c + &y) * &z - c * 0.5);
+    }
+    let got = acc.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+    let want: Vec<f32> = (0..n)
+        .map(|j| {
+            let mut sum = xs[j] * 0.0;
+            for i in 0..terms {
+                let c = 0.01 * (i + 1) as f32;
+                sum += (xs[j] * c + ys[j]) * zs[j] - c * 0.5;
+            }
+            sum
+        })
+        .collect();
+    assert_close(&got, &want, 1e-4, 1e-3);
+}
+
+#[test]
+fn a_fusion_limit_scope_splits_the_expressions_written_in_it() {
+    let ctx = Context::new().unwrap();
+    let xs = values(500, 93, 0.5, 1.5);
+    let x = f32s(&ctx, &xs);
+    let chain = |x: &Array<f32>| {
+        let mut acc = x * 1.0;
+        for _ in 0..20 {
+            acc = &acc * 1.01 + 0.5;
+        }
+        acc
+    };
+
+    let before = ctx.jit().stats();
+    let limited = crate::fusion_limit(8, || chain(&x));
+    let a = limited.to_vec().unwrap();
+    assert!(delta(before, ctx.jit().stats()).elementwise_launches > 1);
+
+    let before = ctx.jit().stats();
+    let b = chain(&x).to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    assert_close(&a, &b, 1e-5, 1e-6);
+}
+
+#[test]
+fn a_very_deep_chain_is_cut_and_evaluates_on_a_small_stack() {
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let ctx = Context::new().unwrap();
+            let x = f32s(&ctx, &[1.0, 2.0, 3.0]);
+            let mut acc = &x * 1.0;
+            for _ in 0..300 {
+                acc = &acc + 1.0;
+            }
+            assert_eq!(acc.to_vec().unwrap(), vec![301.0, 302.0, 303.0]);
+        })
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn identical_lazy_operations_are_one_node() {
+    let ctx = Context::new().unwrap();
+    let xs = values(200, 94, 0.0, 2.0);
+    let mut x = f32s(&ctx, &xs);
+    let f = |a: &Array<f32>| (a * 2.0 + 1.0).sqrt();
+
+    let got = (f(&x) + f(&x)).to_vec().unwrap();
+    // Multiply, add, square root, the second (held, so unshared) square root and the sum.
+    assert_eq!(ctx.jit().last_program_len(), 5);
+    let want: Vec<f32> = xs.iter().map(|v| 2.0 * (v * 2.0 + 1.0).sqrt()).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+
+    // After a write the same expression is a new value.
+    let fresh = values(200, 95, 0.0, 2.0);
+    x.write(&fresh).unwrap();
+    let want: Vec<f32> = fresh.iter().map(|v| (v * 2.0 + 1.0).sqrt()).collect();
+    assert_close(&f(&x).to_vec().unwrap(), &want, 1e-5, 1e-6);
+}
+
+#[test]
+fn held_nodes_are_not_shared_but_their_temporaries_are() {
+    let ctx = Context::new().unwrap();
+    let xs = values(200, 97, 0.0, 2.0);
+    let x = f32s(&ctx, &xs);
+    let f = |a: &Array<f32>| (a * 2.0 + 1.0).sqrt();
+    let u = f(&x);
+    let v = f(&x);
+    crate::ops::eval_all(&[&u, &v]).unwrap();
+    // Multiply and add are shared; the two held square roots are not.
+    assert!(ctx.jit().last_program_len() <= 5, "{}", ctx.jit().last_program_len());
+    let want: Vec<f32> = xs.iter().map(|v| (v * 2.0 + 1.0).sqrt()).collect();
+    assert_close(&u.to_vec().unwrap(), &want, 1e-5, 1e-6);
+    assert_close(&v.to_vec().unwrap(), &want, 1e-5, 1e-6);
+}
+
+#[test]
+fn cuts_of_an_expression_are_noted_with_their_reason_and_place() {
+    use crate::profile::SplitReason;
+    let ctx = Context::new().unwrap();
+    ctx.jit().set_max_nodes(16);
+    ctx.jit().record_splits();
+    let x = f32s(&ctx, &values(100, 96, 0.5, 1.5));
+    let mut acc = &x * 1.0;
+    for _ in 0..20 {
+        acc = &acc * 1.01 + 0.5;
+    }
+    acc.eval().unwrap();
+    let splits = ctx.jit().take_splits();
+    let first = splits.first().expect("the chain exceeds the limit");
+    assert!(matches!(first.reason, SplitReason::Nodes { limit: 16, .. }), "{first:?}");
+    assert!(first.location.file().ends_with("tests.rs"), "{}", first.location);
+    assert!(first.to_string().contains("operations > 16"), "{first}");
+}
+
+#[test]
+fn a_program_with_many_live_values_is_split_in_the_middle() {
+    use crate::profile::SplitReason;
+    let ctx = Context::new().unwrap();
+    ctx.jit().set_max_live(4);
+    ctx.jit().record_splits();
+    let xs = values(300, 97, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let count = 12;
+    // The first value stays live until the last sum: `v1 + (v2 + (v3 + ..))`.
+    let terms: Vec<Array<f32>> = (1..=count).map(|k| (&x * k as f32).sqrt()).collect();
+    let total = terms.into_iter().rev().reduce(|acc, v| v + acc).unwrap();
+    drop(x);
+    let got = total.to_vec().unwrap();
+    let splits = ctx.jit().take_splits();
+    assert!(splits.iter().any(|split| matches!(split.reason, SplitReason::Live { limit: 4, .. })), "{splits:?}");
+
+    let want: Vec<f32> = xs.iter().map(|v| (1..=count).map(|k| (v * k as f32).sqrt()).rev().fold(0.0, |acc, t| t + acc)).collect();
+    assert_close(&got, &want, 1e-4, 1e-5);
+}
+
+#[test]
+fn a_third_view_reader_recomputes_the_expression_inside_the_one_kernel() {
+    let ctx = Context::new().unwrap();
+    let n = 400;
+    let xs = values(n, 98, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let e = (&x * 2.0 + 1.0).sqrt();
+    let host: Vec<f32> = xs.iter().map(|v| (v * 2.0 + 1.0).sqrt()).collect();
+
+    // Two readers recompute the three operations at their offsets.
+    let before = ctx.jit().stats();
+    let got = (e.slice(0, 1..) - e.slice(0, ..n - 1)).to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = (0..n - 1).map(|i| host[i + 1] - host[i]).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+
+    // A third reader recomputes it too (once per distinct index, inside the one kernel): views
+    // of a pending expression no longer evaluate it by reader count.
+    let e = (&x * 2.5 + 1.0).sqrt();
+    let host: Vec<f32> = xs.iter().map(|v| (v * 2.5 + 1.0).sqrt()).collect();
+    let before = ctx.jit().stats();
+    let got = (e.slice(0, 2..) - e.slice(0, 1..n - 1) + e.slice(0, ..n - 2)).to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = (0..n - 2).map(|i| host[i + 2] - host[i + 1] + host[i]).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+}
+
+#[test]
+fn cache_evaluates_an_expression_once_for_every_later_read() {
+    let ctx = Context::new().unwrap();
+    let n = 400;
+    let xs = values(n, 99, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let host: Vec<f32> = xs.iter().map(|v| (v * 2.0 + 1.0).sqrt()).collect();
+
+    let before = ctx.jit().stats();
+    let f = (&x * 2.0 + 1.0).sqrt().cache();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let got = (f.slice(0, 1..) - f.slice(0, ..n - 1) + f.slice(0, 1..)).to_vec().unwrap();
+    // The expression ran once; the readers of `f` are one more kernel.
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    let want: Vec<f32> = (0..n - 1).map(|i| host[i + 1] - host[i] + host[i + 1]).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+}
+
+#[test]
+fn a_scalar_operand_shares_one_kernel_whatever_its_value() {
+    let ctx = Context::new().unwrap();
+    let xs = values(64, 7, 0.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let s = crate::scalar::Scalar::new(2.0f32);
+    let before = ctx.jit().stats();
+    let a = &x * &s;
+    s.set(3.0);
+    let b = &x * &s;
+    let (a, b) = (a.to_vec().unwrap(), b.to_vec().unwrap());
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+    assert_eq!(a, xs.iter().map(|v| v * 2.0).collect::<Vec<_>>());
+    assert_eq!(b, xs.iter().map(|v| v * 3.0).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_reduction_used_in_an_expression_is_one_reduce_launch_and_no_readback() {
+    let ctx = Context::new().unwrap();
+    let xs = values(500, 8, 0.5, 1.5);
+    let x = f32s(&ctx, &xs);
+    let before = ctx.jit().stats();
+    let total = (&x * 2.0).sum();
+    // Used as a broadcast operand: recorded into a buffer, nothing is read back.
+    let normalized = &x / &total;
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 1);
+    let sum: f32 = xs.iter().map(|v| v * 2.0).sum();
+    let want: Vec<f32> = xs.iter().map(|v| v / sum).collect();
+    assert_close(&normalized.to_vec().unwrap(), &want, 1e-4, 1e-7);
+    assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 1);
+}
+
+#[test]
+fn a_cached_step_is_traced_once_and_builds_no_kernels_per_step() {
+    let ctx = Context::new().unwrap();
+    let x = f32s(&ctx, &values(128, 21, 0.0, 1.0));
+    let calls = std::cell::Cell::new(0);
+    let step = |[u]: &[Array<f32>; 1]| {
+        calls.set(calls.get() + 1);
+        let smooth = (u * 0.5 + 0.1).cache();
+        [smooth.shift(1) * 0.25 + smooth.shift(-1) * 0.25 + u * 0.5]
+    };
+    let [short] = crate::iterate_all([&x], 5, step);
+    short.eval().unwrap();
+    assert_eq!(calls.get(), 1);
+    let before = ctx.jit().stats();
+    let [long] = crate::iterate_all([&x], 50, step);
+    long.eval().unwrap();
+    assert_eq!(calls.get(), 2, "one trace per call");
+    assert_eq!(delta(before, ctx.jit().stats()).built, 0, "the replayed kernels are reused");
+    // Same values as a host loop.
+    let mut want = &x * 1.0;
+    for _ in 0..50 {
+        let [next] = step(&[want]);
+        want = next;
+    }
+    assert_close(&long.to_vec().unwrap(), &want.to_vec().unwrap(), 1e-5, 1e-6);
+}
+
+#[test]
+fn nested_views_of_a_lazy_expression_are_one_kernel_computing_each_index_once() {
+    let ctx = Context::new().unwrap();
+    let n = 20;
+    let xs = values(n, 101, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let e = (&x * 2.0 + 1.0).sqrt();
+    let f = e.slice(0, 1..) - e.slice(0, ..n - 1);
+    let g = f.slice(0, 1..) * f.slice(0, ..n - 2) + f.slice(0, 1..);
+
+    let before = ctx.jit().stats();
+    let got = g.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+    let eh: Vec<f32> = xs.iter().map(|v| (v * 2.0 + 1.0).sqrt()).collect();
+    let fh: Vec<f32> = (0..n - 1).map(|i| eh[i + 1] - eh[i]).collect();
+    let want: Vec<f32> = (0..n - 2).map(|i| fh[i + 1] * fh[i] + fh[i + 1]).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+
+    // `e` is read at the offsets 2, 1 (twice: `f` shifted by 1 then `e` by 0, and `f` by 0 then
+    // `e` by 1: the same context) and 0, so its three operations exist at 3 indices, not 4:
+    // 9. `f` (its subtraction) exists at the 2 offsets `g` reads it at: 2. `g` adds the product
+    // and the sum: 2. The shifts themselves are aliases of the values they read.
+    assert_eq!(ctx.jit().last_inlined_len(), 3 * 3 + 2 + 2);
+}
+
+#[test]
+fn a_kernel_over_the_inlining_cap_is_cut_by_evaluating_a_sub_program() {
+    use crate::profile::SplitReason;
+    let ctx = Context::new().unwrap();
+    ctx.jit().set_max_inlined(16);
+    ctx.jit().record_splits();
+    let n = 64;
+    let xs = values(n, 102, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    // Six operations, read at 7 offsets by three levels of three-point stencils.
+    let e = (((&x * 1.5 + 0.5).sqrt() * 2.0) - 0.25).abs();
+    let level = |a: &Array<f32>| {
+        let m = a.shape().len();
+        a.slice(0, ..m - 2) + a.slice(0, 1..m - 1) + a.slice(0, 2..)
+    };
+    let c = level(&level(&level(&e)));
+
+    let before = ctx.jit().stats();
+    let got = c.to_vec().unwrap();
+    assert!(delta(before, ctx.jit().stats()).elementwise_launches > 1);
+
+    let eh: Vec<f32> = xs.iter().map(|v| (((v * 1.5 + 0.5).sqrt() * 2.0) - 0.25).abs()).collect();
+    let stencil = |a: &[f32]| -> Vec<f32> { (0..a.len() - 2).map(|i| a[i] + a[i + 1] + a[i + 2]).collect() };
+    assert_close(&got, &stencil(&stencil(&stencil(&eh))), 1e-4, 1e-5);
+    let splits = ctx.jit().take_splits();
+    assert!(splits.iter().any(|split| matches!(split.reason, SplitReason::Inlined { limit: 16, .. })), "{splits:?}");
+}
+
+#[test]
+fn views_with_every_edge_of_a_lazy_expression_nest() {
+    use crate::view::PadMode;
+    let ctx = Context::new().unwrap();
+    let n = 10;
+    let xs = values(n, 103, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let e = &x * 2.0 + 1.0;
+    let eh: Vec<f32> = xs.iter().map(|v| v * 2.0 + 1.0).collect();
+    let (ni, mirror) = (n as isize, |c: isize| if c < 0 { -c - 1 } else if c >= n as isize { 2 * n as isize - 1 - c } else { c });
+    let a_val = |j: usize| eh[(j as isize - 1).clamp(0, ni - 1) as usize];
+    let b_val = |j: usize| eh[mirror(j as isize - 2) as usize];
+
+    let a = e.pad([(1, 2)], PadMode::Edge);
+    let b = e.pad([(2, 1)], PadMode::Mirror);
+    let sum = a.slice(0, 1..n + 2).slice(0, 1..n) + b.slice(0, ..n + 1).slice(0, 2..n + 1);
+    let r = sum.shift_fill(2, 9.0);
+
+    let before = ctx.jit().stats();
+    let got = r.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = (0..n - 1).map(|m| if m >= 2 { a_val(m) + b_val(m) } else { 9.0 }).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+}
+
+#[test]
+fn a_gather_of_a_lazy_expression_of_a_lazy_slice() {
+    let ctx = Context::new().unwrap();
+    let n = 16;
+    let xs = values(n, 104, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let e = x.slice(0, 2..) * 3.0 + 1.0;
+    let idx_host = [3u32, 0, 0, 99, 13, 7];
+    let idx = Array::from_slice_on(&ctx, &idx_host, idx_host.len()).unwrap();
+    let t = e.take(&idx);
+
+    let before = ctx.jit().stats();
+    let got = t.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = idx_host.iter().map(|&i| xs[2 + (i as usize).min(n - 3)] * 3.0 + 1.0).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+}
+
+#[test]
+fn a_reduction_over_nested_lazy_views_is_one_pass_and_no_store_kernel() {
+    let ctx = Context::new().unwrap();
+    let n = 1000;
+    let xs = values(n, 105, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let f = &x * 2.0 + 1.0;
+    let g = f.slice(0, 1..) - f.slice(0, ..n - 1);
+    let m = (g.slice(0, 1..) - g.slice(0, ..n - 2)).abs().max();
+
+    let before = ctx.jit().stats();
+    let got = m.item().unwrap();
+    let after = delta(before, ctx.jit().stats());
+    assert_eq!((after.reduce_launches, after.elementwise_launches), (1, 0));
+    let fh: Vec<f32> = xs.iter().map(|v| v * 2.0 + 1.0).collect();
+    let gh: Vec<f32> = (0..n - 1).map(|i| fh[i + 1] - fh[i]).collect();
+    let want = (0..n - 2).map(|i| (gh[i + 1] - gh[i]).abs()).fold(0.0f32, f32::max);
+    assert!((got - want).abs() <= 1e-4, "{got} vs {want}");
+}
+
+#[test]
+fn a_padded_record_assigned_through_launches_nothing_until_it_is_read() {
+    use crate::fields::Fields;
+    use crate::view::PadMode;
+    let ctx = Context::new().unwrap();
+    let (ni, nj) = (8usize, 5usize);
+    let data: Vec<Vec<f32>> = (0..4).map(|k| values(ni * nj, 110 + k, -1.0, 1.0)).collect();
+    let q: [Array<f32>; 4] = std::array::from_fn(|k| Array::from_slice_on(&ctx, &data[k], [ni, nj]).unwrap());
+    let p: [Array<f32>; 4] = q.map(|a| &a * 2.0 + 1.0);
+    let w = p.pad([(2, 0)], PadMode::Edge);
+    let ghost: [Array<f32>; 4] = std::array::from_fn(|k| w[k].slice(0, 2..4).flip(0) * -1.0);
+
+    let before = ctx.jit().stats();
+    w.slice(0, ..2).assign(ghost).unwrap();
+    // The padded fields are still expressions: the write launches nothing.
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
+    for k in 0..4 {
+        let got = w[k].to_vec().unwrap();
+        let p_at = |x: usize, y: usize| data[k][x.saturating_sub(2) + ni * y] * 2.0 + 1.0;
+        for y in 0..nj {
+            for x in 0..ni + 2 {
+                let want = match x {
+                    0 => -p_at(3, y),
+                    1 => -p_at(2, y),
+                    _ => p_at(x, y),
+                };
+                assert!((got[x + (ni + 2) * y] - want).abs() <= 1e-5, "field {k} ({x}, {y})");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_view_that_grows_beyond_one_buffer_evaluates_the_lazy_expression_it_reads_first() {
+    use crate::view::PadMode;
+    let ctx = Context::with_options(crate::ContextOptions::default().chunk_bytes(1024)).unwrap();
+    let xs = values(100, 106, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    // 100 elements fit one buffer, the 500 of the padded array do not.
+    let p = x.pad([(0, 400)], PadMode::Edge) * 2.0 + 1.0;
+    let got = p.to_vec().unwrap();
+    let want: Vec<f32> = (0..500).map(|j| xs[j.min(99)] * 2.0 + 1.0).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+
+    let e = &x * 3.0 - 1.0;
+    let q = e.pad([(0, 400)], PadMode::Edge) + 1.0;
+    let got = q.to_vec().unwrap();
+    let want: Vec<f32> = (0..500).map(|j| xs[j.min(99)] * 3.0 - 1.0 + 1.0).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+}
+
+/// A ghost-cell style expression of `len` elements: `depth` elementwise steps over `x`.
+fn long_chain(x: &Array<f32>, depth: usize) -> Array<f32> {
+    let mut acc = x * 1.5;
+    for k in 0..depth {
+        acc = (&acc * 0.99 + x) * 0.5 - (k as f32) * 0.001;
+    }
+    acc
+}
+
+fn long_chain_host(x: &[f32], depth: usize) -> Vec<f32> {
+    x.iter()
+        .map(|&v| {
+            let mut acc = v * 1.5;
+            for k in 0..depth {
+                acc = (acc * 0.99 + v) * 0.5 - (k as f32) * 0.001;
+            }
+            acc
+        })
+        .collect()
+}
+
+#[test]
+fn concat_of_lazy_parts_is_one_kernel() {
+    let ctx = Context::new().unwrap();
+    let (xs, ys) = (values(30, 301, -1.0, 1.0), values(20, 302, -1.0, 1.0));
+    let (x, y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+
+    // Small expressions, and one with more operations than a shifted read recomputes.
+    for depth in [1, 3, 12] {
+        let before = ctx.jit().stats();
+        let joined = crate::concat(0, [&long_chain(&x, depth), &(long_chain(&y, depth) * 2.0)]);
+        let got = joined.to_vec().unwrap();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "depth {depth}");
+        let mut want = long_chain_host(&xs, depth);
+        want.extend(long_chain_host(&ys, depth).iter().map(|v| v * 2.0));
+        assert_close(&got, &want, 1e-5, 1e-5);
+    }
+
+    // A part that is itself a stencil of a lazy expression.
+    let before = ctx.jit().stats();
+    let stencil = (&x * 2.0).shift(1) + (&x * 2.0).shift(-1);
+    let joined = crate::concat(0, [&stencil, &(&y + 1.0)]);
+    let got = joined.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let n = xs.len();
+    let mut want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 2.0 + xs[(i + 1) % n] * 2.0).collect();
+    want.extend(ys.iter().map(|v| v + 1.0));
+    assert_close(&got, &want, 1e-5, 1e-5);
+
+    // Three parts along the second axis, parts that are views of lazy expressions, and the join
+    // read through a shift of its own.
+    let a = Array::from_slice_on(&ctx, &values(12, 303, -1.0, 1.0), [4, 3]).unwrap();
+    let before = ctx.jit().stats();
+    let (p, q, r) = (&a * 2.0 + 1.0, a.slice(1, ..2).flip(0) * -1.0, a.transpose().slice(0, ..2).transpose() + 0.5);
+    let joined = crate::concat(1, [&p, &q, &r]);
+    let out = joined.slice(1, 1..7) * 3.0;
+    out.eval().unwrap();
+    out.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+}
+
+#[test]
+fn a_clone_of_a_lazy_array_shares_its_evaluation() {
+    let ctx = Context::new().unwrap();
+    let xs = values(300, 310, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let want: Vec<f32> = xs.iter().map(|&v| v * 2.0 + 1.0).collect();
+
+    let e = &x * 2.0 + 1.0;
+    let c = e.clone();
+    let before = ctx.jit().stats();
+    assert_close(&c.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    assert_close(&e.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "evaluated once, by whichever clone came first");
+
+    // Both clones in one expression are one operand: still one kernel, computing the node once.
+    let e = (&x * 3.0).abs().sqrt();
+    let c = e.clone();
+    let before = ctx.jit().stats();
+    let sum = &e + &c;
+    let got = sum.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = xs.iter().map(|&v| 2.0 * (v * 3.0).abs().sqrt()).collect();
+    assert_close(&got, &want, 1e-5, 1e-6);
+}
+
+#[test]
+fn an_input_buffer_is_not_reused_in_place_while_a_clone_of_its_array_lives() {
+    let ctx = Context::new().unwrap();
+    let xs = values(400, 311, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let doubled: Vec<f32> = xs.iter().map(|&v| v * 2.0).collect();
+
+    // Control: the only holder of an evaluated buffer lets the kernel that consumes it write over it.
+    let t = &x * 2.0;
+    t.eval().unwrap();
+    let buffer = t.buffer();
+    let u = &t * 3.0;
+    drop(t);
+    u.to_vec().unwrap();
+    assert_eq!(u.buffer(), buffer, "without a clone the buffer is reused");
+
+    // A live clone (of an evaluated lazy array, and of a valid one) forbids it.
+    let t = &x * 2.0;
+    t.eval().unwrap();
+    let buffer = t.buffer();
+    let kept = t.clone();
+    let u = &t * 3.0;
+    drop(t);
+    let got = u.to_vec().unwrap();
+    assert_ne!(u.buffer(), buffer);
+    assert_close(&kept.to_vec().unwrap(), &doubled, 1e-6, 1e-6);
+    let want: Vec<f32> = xs.iter().map(|&v| v * 6.0).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+
+    let v = f32s(&ctx, &xs);
+    let kept = v.clone();
+    let u = &v * 3.0;
+    drop(v);
+    u.to_vec().unwrap();
+    assert_eq!(kept.to_vec().unwrap(), xs);
+    assert_ne!(u.buffer(), kept.buffer());
+}
+
+type F = Array<f32>;
+
+/// A chain of `depth` mixed operations over `xs`.
+fn mix(xs: &[&F], seed: usize, depth: usize) -> F {
+    let mut acc = xs[seed % xs.len()] * 1.0;
+    for k in 0..depth {
+        let y = xs[(seed + k + 1) % xs.len()];
+        acc = match k % 4 {
+            0 => &acc * y + 0.1,
+            1 => (&acc - y).abs() + 0.2,
+            2 => &acc / (y + 1.5),
+            _ => &acc + y * 0.5,
+        };
+    }
+    acc
+}
+
+/// A solver step staged with `cache()` over 14 distinct buffers, on a device that binds 16 per kernel,
+/// stays at the launches its stages need (4 `l`, 4 `r`, 4 `f`, and 3 `s` when they are staged too). Before,
+/// the expression of `f` was cut for "21 input buffers > 16" and became 68 launches: the nodes it shares with
+/// the other `f` were evaluated first, which made each of them one more buffer to bind (see
+/// `program::evaluation_fits`).
+#[test]
+fn cached_arrays_do_not_count_the_buffers_below_them() {
+    let ctx = Context::new().unwrap();
+    ctx.jit().set_max_inputs(16);
+    let n = 2000usize;
+    let w: Vec<F> = (0..4)
+        .map(|k| f32s(&ctx, &(0..n + 4).map(|i| 1.0 + 0.1 * ((i + k) as f32 * 0.37).sin()).collect::<Vec<_>>()))
+        .collect();
+    let (nx, nr) = (f32s(&ctx, &vec![0.5f32; n]), f32s(&ctx, &vec![0.7f32; n]));
+    for cache_s in [false, true] {
+        let build = || {
+            let m1: Vec<F> = w.iter().map(|a| a.slice(0, 1..n + 1)).collect();
+            let p0: Vec<F> = w.iter().map(|a| a.slice(0, 2..n + 2)).collect();
+            let views: Vec<&F> = m1.iter().chain(p0.iter()).collect();
+            let l: Vec<F> = (0..4).map(|k| mix(&views, k, 12).cache()).collect();
+            let r: Vec<F> = (0..4).map(|k| mix(&views, k + 4, 12).cache()).collect();
+            let lr: Vec<&F> = l.iter().chain(r.iter()).chain([&nx, &nr]).collect();
+            let s: Vec<F> = (0..3).map(|k| if cache_s { mix(&lr, k, 16).cache() } else { mix(&lr, k, 16) }).collect();
+            let lrs: Vec<&F> = lr.iter().copied().chain(s.iter()).collect();
+            let f: Vec<F> = (0..4).map(|k| mix(&lrs, k, 24)).collect();
+            let t = (&p0[3] - &m1[3]).abs() / m1[3].minimum(&p0[3]);
+            f.iter().map(|f| (f * &t).cache()).collect::<Vec<_>>()
+        };
+        drop(build());
+        ctx.sync().unwrap();
+        ctx.jit().record_splits();
+        let before = ctx.jit().stats();
+        let out = build();
+        ctx.sync().unwrap();
+        let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+        let splits = ctx.jit().take_splits();
+        // 4 l, 4 r and the 4 f; the 3 s as well when they are cached.
+        let want = if cache_s { 15 } else { 12 };
+        assert_eq!(launches, want, "s cached: {cache_s}, splits: {splits:?}");
+        assert!(splits.iter().all(|split| !matches!(split.reason, crate::profile::SplitReason::Inputs { .. })), "{splits:?}");
+        drop(out);
+    }
+}
+
+/// What an expression reads is counted from what is pending now, not from what its operands read when
+/// they were created: `p` was recorded over the 12 buffers of `x`, `x` was evaluated since, so `p + other`
+/// reads one buffer of `x` and 8 of `other` and is one kernel on a device that binds 16.
+#[test]
+fn buffers_below_an_evaluated_part_of_an_expression_are_not_counted() {
+    let ctx = Context::new().unwrap();
+    ctx.jit().set_max_inputs(16);
+    let n = 1000usize;
+    let data: Vec<Vec<f32>> = (0..20).map(|i| values(n, 500 + i as u64, 0.5, 1.5)).collect();
+    let b: Vec<Array<f32>> = data.iter().map(|d| f32s(&ctx, d)).collect();
+    let sum = |arrays: &[Array<f32>]| arrays.iter().skip(1).fold(&arrays[0] * 1.0, |acc, a| acc + a);
+
+    let x = sum(&b[..12]);
+    let p = &x * 2.0;
+    let before = ctx.jit().stats();
+    x.eval().unwrap();
+    let other = sum(&b[12..]);
+    let z = &p + &other;
+    let got = z.to_vec().unwrap();
+    // `x` once, then `p + other` in one kernel.
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    let want: Vec<f32> = (0..n)
+        .map(|i| 2.0 * (0..12).map(|k| data[k][i]).sum::<f32>() + (12..20).map(|k| data[k][i]).sum::<f32>())
+        .collect();
+    assert_close(&got, &want, 1e-5, 1e-5);
+}
+
+/// `flush`, `sync` and the evaluation of requested arrays only compute what the calling thread
+/// created: another thread may be flattening it that moment, or tracing it into a recording whose
+/// buffers only the recording thread's launches may fill. Whoever reads an array computes it.
+#[test]
+fn sweeps_over_every_lazy_array_leave_the_arrays_of_other_threads_alone() {
+    let ctx = Context::new().unwrap();
+    let xs = values(500, 7, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let lazy = &x * 2.0 + 1.0;
+    let requested = &x * 3.0;
+    ctx.jit().request(requested.pending().unwrap());
+
+    let before = ctx.jit().stats();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // Its own lazy array is computed by these, the main thread's is not.
+            let mine = &f32s(&ctx, &xs) * 5.0;
+            ctx.flush().unwrap();
+            ctx.sync().unwrap();
+            ctx.jit().evaluate_requested();
+            assert!(mine.pending().is_none());
+        });
+    });
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "only the thread's own array");
+    assert!(lazy.pending().is_some());
+    assert!(requested.pending().is_some());
+
+    // The thread that created them computes them, here or when it reads them.
+    ctx.flush().unwrap();
+    assert!(lazy.pending().is_none());
+    assert!(requested.pending().is_none());
+    assert_close(&lazy.to_vec().unwrap(), &xs.iter().map(|v| v * 2.0 + 1.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+    assert_close(&requested.to_vec().unwrap(), &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+}
+
+#[test]
+fn a_ghost_assignment_into_a_pending_array_launches_nothing() {
+    use crate::view::PadMode;
+    let ctx = Context::new().unwrap();
+    let (ni, nj) = (8usize, 5usize);
+    let data = values(ni * nj, 120, -1.0, 1.0);
+    let x = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
+    let w = (&x * 2.0 + 1.0).pad([(2, 0)], PadMode::Edge);
+
+    let before = ctx.jit().stats();
+    w.slice(0, ..2).assign(w.slice(0, 2..4).flip(0) * -1.0).unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
+
+    let n = ni + 2;
+    let before = ctx.jit().stats();
+    let got = (w.slice(0, 1..) - w.slice(0, ..n - 1)).to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let p = |x: usize, y: usize| data[x.saturating_sub(2) + ni * y] * 2.0 + 1.0;
+    let cell = |x: usize, y: usize| match x {
+        0 => -p(3, y),
+        1 => -p(2, y),
+        _ => p(x, y),
+    };
+    let want: Vec<f32> = (0..nj).flat_map(|y| (0..n - 1).map(move |x| (x, y))).map(|(x, y)| cell(x + 1, y) - cell(x, y)).collect();
+    assert_close(&got, &want, 1e-5, 1e-5);
+}
+
+#[cfg(test)]
+mod euler {
+    use super::*;
+    use crate::fields::Fields;
+    use crate::view::PadMode;
+
+    type A = Array<f32>;
+
+    #[derive(crate::Fields)]
+    pub struct R {
+        pub a: A,
+        pub b: A,
+        pub c: A,
+        pub d: A,
+    }
+
+    fn prim(q: &R) -> R {
+        let u = &q.b / &q.a;
+        let v = &q.c / &q.a;
+        let p = 0.4 * (&q.d - 0.5 * &q.a * (&u * &u + &v * &v));
+        R { a: &q.a * 1.0, b: u, c: v, d: p }
+    }
+
+    fn cons(w: &R) -> R {
+        let ke = 0.5 * &w.a * (&w.b * &w.b + &w.c * &w.c);
+        R { a: &w.a * 1.0, b: &w.a * &w.b, c: &w.a * &w.c, d: &w.d / 0.4 + ke }
+    }
+
+    fn flux(w: &R) -> R {
+        let q = cons(w);
+        R { a: &q.b * 1.0, b: &q.b * &w.b + &w.d, c: &q.c * &w.b, d: (&q.d + &w.d) * &w.b }
+    }
+
+    fn rusanov(l: &R, r: &R) -> R {
+        let speed = |w: &R| w.b.abs() + (1.4 * &w.d / &w.a).sqrt();
+        let smax = speed(l).maximum(speed(r));
+        let (ul, ur) = (cons(l), cons(r));
+        let (fl, fr) = (flux(l), flux(r));
+        0.5 * (&fl + &fr) - 0.5 * &smax * (&ur - &ul)
+    }
+
+    /// One first-order step with a mirror wall on the low side of the first axis; `cache_w`
+    /// evaluates the padded state before the ghost cells are assigned.
+    fn step(q: &R, ni: usize, nj: usize, cache_w: bool) -> R {
+        step_cached(q, ni, nj, cache_w, false)
+    }
+
+    /// [`step`] that can also evaluate the padded state after the ghost cells were assigned.
+    fn step_cached(q: &R, ni: usize, nj: usize, cache_before: bool, cache_after: bool) -> R {
+        let padded = prim(q).pad([(1, 1), (1, 1)], PadMode::Edge);
+        let w = if cache_before { padded.cache() } else { padded };
+        let g = w.slice(0, 1..2);
+        let g = R { a: &g.a * 1.0, b: -&g.b, c: &g.c * 1.0, d: &g.d * 1.0 };
+        w.slice(0, ..1).assign(g).unwrap();
+        let w = if cache_after { w.cache() } else { w };
+        let wi = w.slice(1, 1..nj + 1);
+        let fi = rusanov(&wi.slice(0, 0..ni + 1), &wi.slice(0, 1..ni + 2));
+        let wj = w.slice(0, 1..ni + 1);
+        let fj = rusanov(&wj.slice(1, 0..nj + 1), &wj.slice(1, 1..nj + 2));
+        let r = -(fi.slice(0, 1..) - fi.slice(0, ..ni)) - (fj.slice(1, 1..) - fj.slice(1, ..nj));
+        R { a: &q.a + 0.01 * &r.a, b: &q.b + 0.01 * &r.b, c: &q.c + 0.01 * &r.c, d: &q.d + 0.01 * &r.d }
+    }
+
+    fn state(ctx: &Context, ni: usize, nj: usize) -> R {
+        let up = |k: u64, lo: f32, hi: f32| Array::from_slice_on(ctx, &values(ni * nj, 130 + k, lo, hi), [ni, nj]).unwrap();
+        R { a: up(0, 0.8, 1.2), b: up(1, -0.3, 0.3), c: up(2, -0.3, 0.3), d: up(3, 2.0, 3.0) }
+    }
+
+    #[test]
+    fn a_step_with_a_wall_condition_on_a_padded_state_is_one_launch_with_four_outputs() {
+        let ctx = Context::new().unwrap();
+        // The software rasterizer's tuning limits kernels far below what this step lowers to.
+        ctx.jit().set_max_inlined(4096);
+        let (ni, nj) = (16usize, 12usize);
+        let q = state(&ctx, ni, nj);
+        let next = step(&q, ni, nj, false);
+        let before = ctx.jit().stats();
+        next.eval().unwrap();
+        ctx.sync().unwrap();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+        // The same step with the padded state evaluated before the ghost cells are written.
+        let want = step(&state(&ctx, ni, nj), ni, nj, true);
+        for (got, want) in next.arrays().into_iter().zip(want.arrays()) {
+            assert_close(&got.to_vec().unwrap(), &want.to_vec().unwrap(), 1e-5, 1e-5);
+        }
+    }
+
+    /// Steps evaluated one after the other compile to the same kernels every time: one per step
+    /// (two with the padded state evaluated before the ghost cells are read), whatever else is
+    /// pending. The mask of the assigned region reads no buffer and is recomputed, not evaluated,
+    /// and what the padded state's primitives are read through (nested views) belongs to the kernel.
+    #[test]
+    fn per_step_loops_compile_to_one_kernel_per_step_or_two_with_a_cached_padded_state() {
+        let ctx = Context::new().unwrap();
+        ctx.jit().set_max_inlined(4096);
+        let (ni, nj, steps) = (24usize, 16usize, 6usize);
+        for (cache, per_step) in [(false, 1u64), (true, 2)] {
+            let mut q = state(&ctx, ni, nj);
+            ctx.sync().unwrap();
+            let before = ctx.jit().stats();
+            for _ in 0..steps {
+                q = step_cached(&q, ni, nj, false, cache);
+                q.eval().unwrap();
+            }
+            ctx.sync().unwrap();
+            assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, per_step * steps as u64, "cache {cache}");
+        }
+
+        // The same with the evaluation of every step postponed until the last is requested.
+        let before = ctx.jit().stats();
+        let mut q = state(&ctx, ni, nj);
+        for _ in 0..steps {
+            q = step_cached(&q, ni, nj, false, true);
+            for array in q.arrays() {
+                ctx.jit().request(array.pending().unwrap());
+            }
+        }
+        ctx.jit().evaluate_requested();
+        ctx.sync().unwrap();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2 * steps as u64, "postponed");
+    }
+
+    #[test]
+    fn stencil_steps_requested_one_after_the_other_are_a_chain_and_compute_in_order() {
+        let ctx = Context::new().unwrap();
+        let (ni, nj) = (16usize, 12usize);
+        let mut chained = state(&ctx, ni, nj);
+        let mut eager = state(&ctx, ni, nj);
+        for _ in 0..3 {
+            chained = step(&chained, ni, nj, false);
+            chained.eval().unwrap();
+            eager = step(&eager, ni, nj, true);
+            eager.eval().unwrap();
+            ctx.sync().unwrap();
+        }
+        for (got, want) in chained.arrays().into_iter().zip(eager.arrays()) {
+            assert_close(&got.to_vec().unwrap(), &want.to_vec().unwrap(), 1e-4, 1e-4);
+        }
+
+        // Two steps requested while nothing ran in between: a stencil reading a postponed one.
+        let first = step(&state(&ctx, ni, nj), ni, nj, false);
+        ctx.jit().request(first.a.pending().unwrap());
+        assert!(!ctx.jit().requested_stencil_chain());
+        let second = step(&first, ni, nj, false);
+        ctx.jit().request(second.a.pending().unwrap());
+        assert!(ctx.jit().requested_stencil_chain());
+        ctx.jit().evaluate_requested();
+        ctx.sync().unwrap();
+        assert!(!ctx.jit().requested_stencil_chain());
+        let want = step(&step(&state(&ctx, ni, nj), ni, nj, true), ni, nj, true);
+        assert_close(&second.a.to_vec().unwrap(), &want.a.to_vec().unwrap(), 1e-4, 1e-4);
+
+        // An elementwise chain is not one that must be cut.
+        let x = f32s(&ctx, &values(64, 140, 0.5, 1.5));
+        let (y, z) = (&x * 2.0, &x * 3.0);
+        ctx.jit().request(y.pending().unwrap());
+        let z2 = &y + &z;
+        ctx.jit().request(z2.pending().unwrap());
+        assert!(!ctx.jit().requested_stencil_chain());
+        ctx.jit().evaluate_requested();
+    }
+}
+
+/// Operations without operands of their own (the same generator, say) are one node only within a thread:
+/// a node shared by two threads is flattened, recorded and waited for by both.
+#[test]
+fn another_threads_pending_node_is_not_shared_by_hash_consing() {
+    let ctx = Context::new().unwrap();
+    let here = Array::<u32>::range_on(&ctx, 100, 0).unwrap();
+    let node = std::sync::Arc::clone(here.pending().unwrap());
+    // The array is gone, the node lives on in the expression that reads it.
+    let user = &here + 1u32;
+    drop(here);
+    let again = Array::<u32>::range_on(&ctx, 100, 0).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&node, again.pending().unwrap()), "within a thread it is one node");
+    drop(again);
+    let there = std::thread::scope(|scope| scope.spawn(|| Array::<u32>::range_on(&ctx, 100, 0).unwrap()).join().unwrap());
+    assert!(!std::sync::Arc::ptr_eq(&node, there.pending().unwrap()), "another thread's is its own");
+    assert_eq!(user.to_vec().unwrap()[..3], [1, 2, 3]);
 }

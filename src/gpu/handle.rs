@@ -60,6 +60,10 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     // budget (Vulkan with VK_EXT_memory_budget, DX12) instead of failing later in a command.
     instance_desc.memory_budget_thresholds.for_resource_creation = Some(90);
     instance_desc.backends = wgpu::Backends::PRIMARY;
+    // Indirect dispatches only ever read workgroup counts that a gate kernel of this crate
+    // copied from a template of valid counts or zeroed (see `jit::until`), so wgpu's check of
+    // them, an extra validation dispatch in front of every indirect one, protects nothing.
+    instance_desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
     let instance = wgpu::Instance::new(instance_desc);
 
     let adapter = instance
@@ -82,7 +86,10 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     let mut required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
     // Shader features custom kernels may use; requested whenever the adapter has them.
     required_features |= adapter.features()
-        & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16 | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+        & (wgpu::Features::SUBGROUP
+            | wgpu::Features::SHADER_F16
+            | wgpu::Features::SHADER_F64
+            | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
     // Only on unified memory: on a discrete GPU mappable storage buffers live in slow host memory.
     if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
         required_features |= adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;

@@ -163,12 +163,12 @@ fn reductions_over_materialized_and_lazy_arrays() {
     let hi = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let lazy = &x * 1.0;
     for array in [&x, &lazy] {
-        close(array.sum().unwrap(), sum as f32, 1e-4);
-        assert_eq!(array.min().unwrap(), lo);
-        assert_eq!(array.max().unwrap(), hi);
-        close(array.norm().unwrap(), squares.sqrt() as f32, 1e-4);
+        close(array.sum().item().unwrap(), sum as f32, 1e-4);
+        assert_eq!(array.min().item().unwrap(), lo);
+        assert_eq!(array.max().item().unwrap(), hi);
+        close(array.norm().item().unwrap(), squares.sqrt() as f32, 1e-4);
         let [s, mn, mx, sq] =
-            array.reduce([Reduction::Sum, Reduction::Min, Reduction::Max, Reduction::SumOfSquares]).unwrap();
+            array.reduce([Reduction::Sum, Reduction::Min, Reduction::Max, Reduction::SumOfSquares]).to_array().unwrap();
         close(s, sum as f32, 1e-4);
         assert_eq!((mn, mx), (lo, hi));
         close(sq, squares as f32, 1e-4);
@@ -181,9 +181,9 @@ fn u32_sum_wraps_around() {
     let data: Vec<u32> = (0..N as u32).map(|i| u32::MAX / 3 + i).collect();
     let want = data.iter().fold(0u32, |a, &v| a.wrapping_add(v));
     let x = Array::from_slice_on(&ctx, &data, N).unwrap();
-    assert_eq!(x.reduce([Reduction::Sum]).unwrap()[0], want);
+    assert_eq!(x.reduce([Reduction::Sum]).item().unwrap(), want);
     let lazy = &x + 0u32;
-    assert_eq!(lazy.reduce([Reduction::Sum]).unwrap()[0], want);
+    assert_eq!(lazy.reduce([Reduction::Sum]).item().unwrap(), want);
 }
 
 #[test]
@@ -278,7 +278,7 @@ fn shifted_expression_inside_a_reduction() {
     let lazy = u.shift(1) + &u;
     let shifted = shift_host(&xs, &[N], &[1]);
     let want: f64 = shifted.iter().zip(&xs).map(|(a, b)| f64::from(*a) + f64::from(*b)).sum();
-    close(lazy.sum().unwrap(), want as f32, 1e-4);
+    close(lazy.sum().item().unwrap(), want as f32, 1e-4);
 }
 
 #[test]

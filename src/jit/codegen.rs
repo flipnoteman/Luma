@@ -18,12 +18,13 @@
 
 use std::fmt::Write;
 
-use crate::builtin::reduce_main;
+use crate::builtin::{df_library, reduce_main, ReduceElem};
 use crate::tuning::{Tuning, STENCIL_RADIUS};
 
-use super::program::{FusedKey, Instr, Ref, Tail, ELEMENT_BYTES};
+use super::inline::Inlined;
+use super::program::{calls_df_library, FusedKey, Instr, Ref, Tail};
 use super::stencil::{signed, wrap_source, WORKGROUP};
-use super::{ElemTy, Gen, OpKind, ShiftKind};
+use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
 
 /// `template` with its operand identifiers `x` and `y` replaced by `a` and `b`.
 fn substitute(template: &str, a: &str, b: &str) -> String {
@@ -49,40 +50,208 @@ fn substitute(template: &str, a: &str, b: &str) -> String {
     out
 }
 
-fn name(reference: Ref) -> String {
+/// The WGSL name of an operand of type `ty`. The scalars of an `f64` or `Df32` operand are
+/// several `f32` slots of the uniform (see `Scalar::words`).
+fn name(reference: Ref, ty: ElemTy) -> String {
     match reference {
         Ref::Unused => "0u".to_owned(),
         Ref::Input(k) => format!("a{k}"),
-        Ref::Scalar(k) => format!("p.s{k}"),
+        Ref::Scalar(k) => match ty {
+            ElemTy::F64 => format!("(f64(p.s{k}) + f64(p.s{}) + f64(p.s{}))", k + 1, k + 2),
+            ElemTy::Df32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
+            ElemTy::F32 | ElemTy::U32 => format!("p.s{k}"),
+        },
         Ref::Tmp(k) => format!("t{k}"),
         Ref::Sub(k) => format!("sub{k}"),
     }
 }
 
-/// The WGSL expression of `instr`. `index` names the element a shift is relative to and `total`
-/// the array length; `segmented` makes shifts of inputs read through the accessors `ld{k}`
-/// (which take a flat index over all segments) instead of indexing `in{k}` directly.
-pub(super) fn expression(instr: &Instr, index: &str, total: &str, segmented: bool) -> String {
-    let [a, b, c] = instr.args.map(name);
-    match instr.op.kind {
-        OpKind::Unary(op) => substitute(op.expr(), &a, ""),
-        OpKind::Binary(op) => substitute(op.expr(), &a, &b),
-        OpKind::Compare(op) => substitute(op.expr(), &a, &b),
+/// What the WGSL of a program refers to beyond its own instructions.
+pub(super) struct Names<'a> {
+    /// The distinct views of the kernel (see [`views_of`]); view `n` is the functions `view{n}`.
+    pub(super) views: &'a [(ViewMap, Edge)],
+    /// Pairs (input `k`, output `j`): input `k` is read from the output buffer `out{j}`.
+    pub(super) in_place: &'a [(u32, u32)],
+}
+
+/// [`Names`] of a program without views or in-place inputs.
+pub(super) const NO_NAMES: Names<'static> = Names { views: &[], in_place: &[] };
+
+/// The WGSL expression of the operation `op` (anything but a shift) on the operands named `a`,
+/// `b` and `c`; `index` names the element it is computed at. `None` for a shift.
+fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
+    let ty = op.ty;
+    Some(match op.kind {
+        OpKind::Unary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, ""),
+        OpKind::Binary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b),
+        OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
         OpKind::Powf => format!("pow({a}, {b})"),
+        OpKind::Clamp if ty == ElemTy::Df32 => format!("df_min(df_max({a}, {b}), {c})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
         OpKind::Select => format!("select({c}, {b}, {a} != 0u)"),
-        OpKind::Generate(kind) => generate(kind, instr.op.out_ty(), index, &a, &b),
-        OpKind::Shift(kind) => {
-            let at = shift_index(kind, &b, index, total);
-            match instr.args[0] {
-                Ref::Input(k) if segmented => format!("ld{k}({at})"),
-                Ref::Input(k) => format!("in{k}[{at}]"),
-                Ref::Sub(k) => format!("sub{k}({at})"),
-                // A shift only reads an input buffer or a sub-program; anything else is not
-                // valid shader code and surfaces as a shader compile error.
-                other => format!("{}[{at}]", name(other)),
-            }
+        OpKind::Cast(to) => cast(ty, to, a),
+        OpKind::Generate(kind) => generate(kind, op.out_ty(), index, a, b),
+        OpKind::Shift(_) => return None,
+    })
+}
+
+/// The WGSL expression of `instr`. `index` names the element a shift is relative to;
+/// `segmented` makes shifts of inputs read through the accessors `ld{k}`
+/// (which take a flat index over all segments) instead of indexing `in{k}` directly.
+pub(super) fn expression(instr: &Instr, index: &str, segmented: bool, names: &Names) -> String {
+    let [a, b, c] = [0, 1, 2].map(|i| name(instr.args[i], instr.op.operand_ty(i)));
+    if let Some(value) = operation(instr.op, &a, &b, &c, index) {
+        return value;
+    }
+    let OpKind::Shift(kind) = instr.op.kind else { return String::new() };
+    let (at, view) = match kind {
+        ShiftKind::View { map, edge } => {
+            let n = names.views.iter().position(|&known| known == (map, edge));
+            // A view missing from `names` is not valid shader code and surfaces as a
+            // shader compile error.
+            (format!("view{}({index})", n.map_or_else(|| "_missing".to_owned(), |n| n.to_string())), n.filter(|_| edge == Edge::Fill))
         }
+        _ => (shift_index(kind, &b, index, &c), None),
+    };
+    let read = match instr.args[0] {
+        Ref::Input(k) if segmented => format!("ld{k}({at})"),
+        Ref::Input(k) => match names.in_place.iter().find(|&&(input, _)| input == k) {
+            Some(&(_, j)) => format!("out{j}[{at}]"),
+            None => format!("in{k}[{at}]"),
+        },
+        Ref::Sub(k) => format!("sub{k}({at})"),
+        // A shift only reads an input buffer or a sub-program; anything else is not
+        // valid shader code and surfaces as a shader compile error.
+        other => format!("{}[{at}]", name(other, ElemTy::U32)),
+    };
+    match view {
+        Some(n) => format!("select({b}, {read}, view{n}_in({index}))"),
+        None => read,
+    }
+}
+
+/// The distinct views of `key`, in order of first appearance: the index of a view in this list
+/// names its functions.
+pub(super) fn views_of(key: &FusedKey) -> Vec<(ViewMap, Edge)> {
+    let mut views = Vec::new();
+    for instr in key.instrs.iter().chain(key.subs.iter().flatten()) {
+        if let OpKind::Shift(ShiftKind::View { map, edge }) = instr.op.kind
+            && !views.contains(&(map, edge))
+        {
+            views.push((map, edge));
+        }
+    }
+    if let Tail::StoreMapped(map) = key.tail
+        && !views.contains(&(map, Edge::None))
+    {
+        views.push((map, Edge::None));
+    }
+    views
+}
+
+/// [`views_of`] for a lowered key: the distinct views of the contexts of `inlined` (which include
+/// the compositions no instruction of the key names), in order of creation.
+fn views_of_inlined(key: &FusedKey, inlined: &Inlined) -> Vec<(ViewMap, Edge)> {
+    let mut views = Vec::new();
+    for ctx in &inlined.ctxs {
+        if let ShiftKind::View { map, edge } = ctx.kind
+            && !views.contains(&(map, edge))
+        {
+            views.push((map, edge));
+        }
+    }
+    if let Tail::StoreMapped(map) = key.tail
+        && !views.contains(&(map, Edge::None))
+    {
+        views.push((map, Edge::None));
+    }
+    views
+}
+
+/// The WGSL functions of `views`: `view{n}(i)` is the flat source index view `n` reads for
+/// output element `i` and, for [`Edge::Fill`], `view{n}_in(i)` whether it lies inside the source.
+pub(super) fn view_helpers(views: &[(ViewMap, Edge)]) -> String {
+    if views.is_empty() {
+        return String::new();
+    }
+    let mut src = String::from(
+        "fn luma_clamp_i(c: i32, n: i32) -> i32 { return clamp(c, 0, n - 1); }
+fn luma_mirror_i(c: i32, n: i32) -> i32 { let a = select(c, -c - 1, c < 0); let b = select(a, 2 * n - 1 - a, a >= n); return clamp(b, 0, n - 1); }
+fn luma_wrap_i(c: i32, n: i32) -> i32 { return ((c % n) + n) % n; }
+",
+    );
+    for (n, &(map, edge)) in views.iter().enumerate() {
+        let mut out_stride = [1u64; 4];
+        let mut src_stride = [1u64; 4];
+        for d in 1..4 {
+            out_stride[d] = out_stride[d - 1] * u64::from(map.out[d - 1]);
+            src_stride[d] = src_stride[d - 1] * u64::from(map.src[d - 1]);
+        }
+        // The unclipped source coordinate of axis `a`.
+        let raw = |a: usize| {
+            let axis = map.axes[a];
+            let from = axis.from as usize;
+            if map.out[from] == 1 {
+                return format!("{}", axis.start);
+            }
+            let quotient = if out_stride[from] == 1 { "i".to_owned() } else { format!("(i / {}u)", out_stride[from]) };
+            format!("(i32(({quotient}) % {}u) * ({}) + ({}))", map.out[from], axis.step, axis.start)
+        };
+        // Whether the unclipped coordinate of axis `a` is always inside the source.
+        let inside = |a: usize| {
+            let (first, last) = map.ends(a);
+            let size = i64::from(map.src[a]);
+            (0..size).contains(&first) && (0..size).contains(&last)
+        };
+        let mut terms = Vec::new();
+        for a in (0..4).filter(|&a| map.src[a] > 1) {
+            let size = map.src[a];
+            let coord = match edge {
+                _ if inside(a) => raw(a),
+                Edge::None => raw(a),
+                Edge::Clamp | Edge::Fill => format!("luma_clamp_i({}, {size})", raw(a)),
+                Edge::Mirror => format!("luma_mirror_i({}, {size})", raw(a)),
+                Edge::Wrap => format!("luma_wrap_i({}, {size})", raw(a)),
+            };
+            terms.push(if src_stride[a] == 1 { format!("u32({coord})") } else { format!("u32({coord}) * {}u", src_stride[a]) });
+        }
+        let sum = if terms.is_empty() { "0u".to_owned() } else { terms.join(" + ") };
+        let _ = writeln!(src, "fn view{n}(i: u32) -> u32 {{ return {sum}; }}");
+        if edge == Edge::Fill {
+            let tests: Vec<String> = (0..4)
+                .filter(|&a| !inside(a))
+                .map(|a| format!("{0} >= 0 && {0} < {1}", raw(a), map.src[a]))
+                .collect();
+            let all = if tests.is_empty() { "true".to_owned() } else { tests.join(" && ") };
+            let _ = writeln!(src, "fn view{n}_in(i: u32) -> bool {{ return {all}; }}");
+        }
+    }
+    src
+}
+
+/// `value` of type `from` converted to `to`. Every conversion that has a `Df32` end passes the
+/// value that a reassociating compiler could fold away through `luma_o` (see
+/// `builtin::df_library`), so that `x - to_df32(to_f32(x))` keeps the low word of `x`.
+fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
+    match (from, to) {
+        (ElemTy::F32, ElemTy::F64) => format!("f64({value})"),
+        (ElemTy::F64, ElemTy::F32) => format!("f32({value})"),
+        (ElemTy::F32, ElemTy::Df32) => format!("vec2<f32>(luma_o({value}), 0.0)"),
+        (ElemTy::Df32, ElemTy::F32) => format!("luma_o({value}.x + {value}.y)"),
+        (ElemTy::F64, ElemTy::Df32) => format!("vec2<f32>(luma_o(f32({value})), f32({value} - f64(luma_o(f32({value})))))"),
+        (ElemTy::Df32, ElemTy::F64) => format!("(f64(luma_o({value}.x)) + f64({value}.y))"),
+        _ => value.to_owned(),
+    }
+}
+
+/// The double-float library a kernel of `key` defines (a reduction of `Df32` brings its own,
+/// see `reduce_main`): behind the guard uniform when the program has one, else with a constant
+/// guard, for the functions that never read it (ordering, minimum, maximum, absolute value).
+pub(super) fn library_for(key: &FusedKey) -> String {
+    match key.guard {
+        Some(guard) => df_library(&format!("p.s{guard}")),
+        None if key.instrs.iter().chain(key.subs.iter().flatten()).any(calls_df_library) => df_library("0u"),
+        None => String::new(),
     }
 }
 
@@ -92,8 +261,9 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Uniform => format!("luma_uniform(luma_threefry({index}, {a}, {b}).x)"),
         Gen::Normal => format!("luma_normal(luma_threefry({index}, {a}, {b}))"),
         Gen::Range { stride, size } => match ty {
-            ElemTy::F32 => format!("f32(({index} / {stride}u) % {size}u)"),
             ElemTy::U32 => format!("(({index} / {stride}u) % {size}u)"),
+            // Generators of the 8-byte types are refused when they are recorded.
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} / {stride}u) % {size}u)"),
         },
         Gen::Linspace => format!("({a} + f32({index}) * {b})"),
     }
@@ -141,10 +311,12 @@ pub(super) fn generates(key: &FusedKey) -> bool {
 }
 
 /// The index element `i` of a shift reads; `s` names the scalar shift of [`ShiftKind::Linear`],
-/// `i` the element the shift is relative to and `total` the array length.
+/// `i` the element the shift is relative to and `total` the array length (scalar operand 2).
 fn shift_index(kind: ShiftKind, s: &str, i: &str, total: &str) -> String {
     match kind {
         ShiftKind::Linear => format!("select({i} - {s}, {i} + ({total} - {s}), {i} < {s})"),
+        ShiftKind::View { .. } => unreachable!("views are indexed by their own functions"),
+        ShiftKind::Take { len } => format!("min({s}, {}u)", len.saturating_sub(1)),
         ShiftKind::Dims { dims, shifts } => {
             let [d0, d1, d2, _] = dims;
             let strides = [1, d0, d0 * d1, d0 * d1 * d2];
@@ -186,8 +358,10 @@ pub(super) fn direct(instrs: &[Instr], k: u32) -> bool {
 
 /// The WGSL source of the kernel for `key`, with the workgroup shapes `tuning` gives.
 /// `segment_len` (a power of two) is the elements per segment of the arrays the segmented
-/// variant (`key.spans` not empty) runs on.
-pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> String {
+/// variant (`key.spans` not empty) runs on. `inlined` is the lowering of `key` (see
+/// `jit::inline`) if it [`inlines`](FusedKey::inlines): the body then computes every
+/// sub-program at the indices it is read at, and no `sub{k}` functions exist.
+pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, inlined: Option<&Inlined>) -> String {
     let wg = tuning.elementwise_workgroup;
     let reduce = matches!(key.tail, Tail::Reduce(_));
     let segmented = !key.spans.is_empty();
@@ -218,7 +392,8 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
     }
     let out_ty = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     let outputs: Vec<usize> = match key.tail {
-        Tail::Store => key.outputs.iter().map(|&at| at as usize).collect(),
+        Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().map(|&at| at as usize).collect(),
+        Tail::Scatter { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
     };
     for (j, &at) in outputs.iter().enumerate() {
@@ -228,7 +403,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
     }
     let mut binding = outputs.len();
     for (k, ty) in key.input_tys.iter().enumerate() {
-        if key.in_place == Some(k as u32) {
+        if key.in_place.iter().any(|&(paired, _)| paired == k as u32) {
             continue;
         }
         if !segmented || direct(&key.instrs, k as u32) {
@@ -244,12 +419,14 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
         let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
     }
     if segmented {
-        let (log, mask) = (segment_len.trailing_zeros(), segment_len.wrapping_sub(1));
         for (k, ty) in key.input_tys.iter().enumerate() {
             let m = slots(k);
             if m == 0 {
                 continue;
             }
+            // `segment_len` counts 4-byte words: an 8-byte element halves it.
+            let per = segment_len / (ty.bytes() as u32 / 4).max(1);
+            let (log, mask) = (per.trailing_zeros(), per.wrapping_sub(1));
             let _ = writeln!(src, "fn ld{k}(g: u32) -> {} {{\n    let c = g >> {log}u; let o = g & {mask}u;", ty.wgsl());
             for s in 0..m - 1 {
                 let _ = writeln!(src, "    if (c == p.c{k}_{s}) {{ return in{k}_{s}[o]; }}");
@@ -257,22 +434,41 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
             let _ = writeln!(src, "    return in{k}_{}[o];\n}}", m - 1);
         }
     }
+    let views = inlined.map_or_else(|| views_of(key), |inlined| views_of_inlined(key, inlined));
+    // The lowered instruction holding the value of main-program instruction `at`.
+    let value = |at: usize| inlined.and_then(|inlined| inlined.main.get(at)).map_or(at, |&lowered| lowered as usize);
+    // A reduction of `Df32` brings the library itself (see `reduce_main`).
+    let reduces_df = reduce && out_ty(outputs[0]) == "vec2<f32>";
+    if !reduces_df {
+        src.push_str(&library_for(key));
+    }
     src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
-    if key.tile.is_none() {
-        src.push_str(&subs(key));
+    src.push_str(&view_helpers(&views));
+    let names = Names { views: &views, in_place: &key.in_place };
+    if key.tile.is_none() && inlined.is_none() {
+        src.push_str(&subs(key, &views, &key.in_place));
     }
 
-    let (index, total) = match (segmented, based) {
-        (true, _) => ("gi", "p.total"),
-        (false, true) => ("gi", "luma.size.x"),
-        (false, false) => ("i", "luma.size.x"),
+    let index = match (segmented, based) {
+        (true, _) | (false, true) => "gi",
+        (false, false) => "i",
     };
     let global = if segmented || based { "    let gi = p.base + i;\n" } else { "" };
     match key.tail {
-        Tail::Store => {
-            let stores: String = outputs.iter().enumerate().map(|(j, at)| format!("    out{j}[i] = t{at};\n")).collect();
+        Tail::Store | Tail::StoreMapped(_) | Tail::Scatter { .. } => {
+            let stores: String = match key.tail {
+                Tail::StoreMapped(map) => {
+                    let n = views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0);
+                    outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[view{n}(i)] = t{};\n", value(at))).collect()
+                }
+                Tail::Scatter { len } => {
+                    let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
+                    format!("    let j = t{};\n    if (j < {len}u) {{ out0[j] = t{}; }}\n", value(index as usize), value(stored as usize))
+                }
+                _ => outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[i] = t{};\n", value(at))).collect(),
+            };
             if let Some(tile) = &key.tile {
-                src.push_str(&tiled_main(key, tile, based, &stores));
+                src.push_str(&tiled_main(key, tile, based, &stores, &names));
                 return src;
             }
             let _ = write!(
@@ -284,20 +480,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (i >= luma.size.x) {{ return; }}
 {global}{}{stores}}}
 ",
-                body(&key.instrs, &key.input_tys, key.in_place, index, total, segmented)
+                match inlined {
+                    Some(inlined) => lowered_body(key, inlined, &names, index),
+                    None => body(&key.instrs, &key.input_tys, &names, index, segmented),
+                }
             );
         }
         Tail::Reduce(ops) => {
             let (ty, last) = (out_ty(outputs[0]), outputs[0]);
+            let guard = format!("p.s{}", key.guard.unwrap_or(0));
+            let elem = if reduces_df { ReduceElem::Df32 { guard: &guard } } else { ReduceElem::Plain(ty) };
             let _ = write!(
                 src,
                 "
 fn luma_eval(i: u32) -> {ty} {{
-{global}{}    return t{last};
+{global}{}    return t{};
 }}
 {}",
-                body(&key.instrs, &key.input_tys, None, index, total, segmented),
-                reduce_main(ty, ops, false, "luma_eval", tuning)
+                match inlined {
+                    Some(inlined) => lowered_body(key, inlined, &Names { views: &views, in_place: &[] }, index),
+                    None => body(&key.instrs, &key.input_tys, &Names { views: &views, in_place: &[] }, index, segmented),
+                },
+                value(last),
+                reduce_main(elem, ops, false, "luma_eval", tuning)
             );
         }
     }
@@ -354,7 +559,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
     }
     for (k, instr) in key.instrs.iter().enumerate() {
-        let _ = writeln!(src, "        let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr, "i", "luma.size.x", false));
+        let _ = writeln!(src, "        let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr, "i", false, &NO_NAMES));
     }
     for (j, at) in key.outputs.iter().enumerate() {
         let _ = writeln!(src, "        s{j} = t{at};");
@@ -367,27 +572,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     src
 }
 
-/// The loads of the inputs at element `i` and the instructions, as `let` bindings. The input
-/// `in_place` (if any) is the output buffer `out0`, read before it is overwritten. `index`,
-/// `total` and `segmented` are those of [`expression`].
-fn body(
-    instrs: &[Instr],
-    input_tys: &[ElemTy],
-    in_place: Option<u32>,
-    index: &str,
-    total: &str,
-    segmented: bool,
-) -> String {
-    body_with(instrs, input_tys, in_place, index, total, segmented, &|_, _| None)
+/// The loads of the inputs at element `i` and the instructions, as `let` bindings. The inputs
+/// `names.in_place` lists are read from the output buffers, before they are overwritten.
+/// `index` and `segmented` are those of [`expression`].
+fn body(instrs: &[Instr], input_tys: &[ElemTy], names: &Names, index: &str, segmented: bool) -> String {
+    body_with(instrs, input_tys, names, index, segmented, &|_, _| None)
 }
 
 /// [`body`], where `staged(k, instr)` may replace the expression of instruction `k`.
 fn body_with(
     instrs: &[Instr],
     input_tys: &[ElemTy],
-    in_place: Option<u32>,
+    names: &Names,
     index: &str,
-    total: &str,
     segmented: bool,
     staged: &dyn Fn(usize, &Instr) -> Option<String>,
 ) -> String {
@@ -395,15 +592,142 @@ fn body_with(
     // Inputs read only through shifts are not loaded at `i`.
     for (k, ty) in input_tys.iter().enumerate() {
         if direct(instrs, k as u32) {
-            let buffer = if in_place == Some(k as u32) { "out0".to_owned() } else { format!("in{k}") };
+            let buffer = match names.in_place.iter().find(|&&(input, _)| input == k as u32) {
+                Some(&(_, j)) => format!("out{j}"),
+                None => format!("in{k}"),
+            };
             let _ = writeln!(src, "    let a{k}: {} = {buffer}[i];", ty.wgsl());
         }
     }
     for (k, instr) in instrs.iter().enumerate() {
-        let value = staged(k, instr).unwrap_or_else(|| expression(instr, index, total, segmented));
+        let value = staged(k, instr).unwrap_or_else(|| expression(instr, index, segmented, names));
         let _ = writeln!(src, "    let t{k}: {} = {value};", instr.op.out_ty().wgsl());
     }
     src
+}
+
+/// The name of an operand of a lowered instruction computed at context `at`: an input is the
+/// value loaded at that context's index.
+fn flat_name(reference: Ref, ty: ElemTy, at: u32) -> String {
+    match reference {
+        Ref::Input(k) if at != 0 => format!("a{k}_{at}"),
+        other => name(other, ty),
+    }
+}
+
+/// The body of a lowered key (see [`Inlined`]): the index of every context, the inputs loaded at
+/// them, then the instructions, each defined (`t{n}`) after everything it reads. `names` and
+/// `index` are those of [`expression`].
+fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str) -> String {
+    struct Emit<'a> {
+        key: &'a FusedKey,
+        inlined: &'a Inlined,
+        names: &'a Names<'a>,
+        index: &'a str,
+        src: String,
+        defined: Vec<bool>,
+        loaded: Vec<(u32, u32)>,
+    }
+    impl Emit<'_> {
+        /// The index of context `c`.
+        fn index_of(&self, c: u32) -> String {
+            if c == 0 { self.index.to_owned() } else { format!("i{c}") }
+        }
+
+        /// The buffer input `k` is read from.
+        fn buffer(&self, k: u32) -> String {
+            match self.names.in_place.iter().find(|&&(input, _)| input == k) {
+                Some(&(_, j)) => format!("out{j}"),
+                None => format!("in{k}"),
+            }
+        }
+
+        /// Declares the index of context `c`, after its parents'.
+        fn define(&mut self, c: u32) {
+            let Some(ctx) = self.inlined.ctxs.get(c as usize) else { return };
+            if c == 0 || self.defined[c as usize] {
+                return;
+            }
+            self.defined[c as usize] = true;
+            self.define(ctx.parent);
+            let from = self.index_of(ctx.parent);
+            let expr = match ctx.kind {
+                ShiftKind::View { map, edge } => {
+                    let n = self.names.views.iter().position(|&known| known == (map, edge));
+                    format!("view{}({from})", n.map_or_else(|| "_missing".to_owned(), |n| n.to_string()))
+                }
+                kind => {
+                    if let Ref::Input(k) = ctx.args[0] {
+                        self.load(k, ctx.parent);
+                    }
+                    let [s, total] = ctx.args.map(|reference| flat_name(reference, ElemTy::U32, ctx.parent));
+                    shift_index(kind, &s, &from, &total)
+                }
+            };
+            let _ = writeln!(self.src, "    let i{c}: u32 = {expr};");
+        }
+
+        /// Declares input `k` read at the index of context `c`.
+        fn load(&mut self, k: u32, c: u32) {
+            if self.loaded.contains(&(k, c)) {
+                return;
+            }
+            self.loaded.push((k, c));
+            self.define(c);
+            let ty = self.key.input_tys.get(k as usize).map_or("f32", |ty| ty.wgsl());
+            let buffer = self.buffer(k);
+            if c == 0 {
+                let _ = writeln!(self.src, "    let a{k}: {ty} = {buffer}[i];");
+            } else {
+                let _ = writeln!(self.src, "    let a{k}_{c}: {ty} = {buffer}[i{c}];");
+            }
+        }
+    }
+
+    let mut emit = Emit {
+        key,
+        inlined,
+        names,
+        index,
+        src: String::new(),
+        defined: vec![false; inlined.ctxs.len()],
+        loaded: Vec::new(),
+    };
+    for (n, flat) in inlined.instrs.iter().enumerate() {
+        emit.define(flat.at);
+        let op = flat.op;
+        let value = match op.kind {
+            OpKind::Shift(kind) => {
+                emit.define(flat.child);
+                let at = emit.index_of(flat.child);
+                let read = match flat.args[0] {
+                    Ref::Input(k) => format!("{}[{at}]", emit.buffer(k)),
+                    Ref::Tmp(v) => format!("t{v}"),
+                    other => format!("{}[{at}]", name(other, ElemTy::U32)),
+                };
+                match kind {
+                    ShiftKind::View { map, edge: Edge::Fill } => {
+                        let fill = flat_name(flat.args[1], op.operand_ty(1), flat.at);
+                        let view = names.views.iter().position(|&known| known == (map, Edge::Fill));
+                        let inside = format!("view{}_in({})", view.map_or_else(|| "_missing".to_owned(), |n| n.to_string()), emit.index_of(flat.at));
+                        format!("select({fill}, {read}, {inside})")
+                    }
+                    _ => read,
+                }
+            }
+            _ => {
+                for reference in flat.args.iter().take(op.kind.arity()) {
+                    if let Ref::Input(k) = *reference {
+                        emit.load(k, flat.at);
+                    }
+                }
+                let [a, b, c] = [0, 1, 2].map(|i| flat_name(flat.args[i], op.operand_ty(i), flat.at));
+                operation(op, &a, &b, &c, &emit.index_of(flat.at)).unwrap_or_default()
+            }
+        };
+        let _ = writeln!(emit.src, "    let t{n}: {} = {value};", op.out_ty().wgsl());
+    }
+    emit.src
 }
 
 /// The workgroup-memory staging of the sub-programs of a store kernel: each is computed once
@@ -427,7 +751,8 @@ pub(crate) struct Tile {
 /// small shifts only and their regions fit in workgroup memory. `None` keeps the sub-programs
 /// as functions called per shift.
 pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tuning) -> Option<Tile> {
-    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() {
+    // Staged values are 4 bytes wide; programs of the 8-byte types call their sub-programs.
+    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || !key.narrow() {
         return None;
     }
     let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)).collect();
@@ -458,6 +783,7 @@ pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tu
                 (OpKind::Shift(_), Ref::Sub(j)) if p > 0 && j as usize + 1 >= p || j as usize >= key.subs.len() => return None,
                 (OpKind::Shift(kind), Ref::Sub(_)) => {
                     let (dx, dy) = match kind {
+                        ShiftKind::View { .. } | ShiftKind::Take { .. } => return None,
                         ShiftKind::Dims { shifts, .. } => (signed(shifts[0], w), signed(shifts[1], h)),
                         ShiftKind::Linear => {
                             let Ref::Scalar(s) = instr.args[1] else { return None };
@@ -498,7 +824,7 @@ pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tu
     }
 
     let (mut tx, mut ty) = if h == 1 { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
-    let bytes = |tx: u32, ty: u32| need.iter().map(|&(nx, ny)| (tx + 2 * nx) * (ty + 2 * ny) * ELEMENT_BYTES as u32).sum::<u32>();
+    let bytes = |tx: u32, ty: u32| need.iter().map(|&(nx, ny)| (tx + 2 * nx) * (ty + 2 * ny) * 4).sum::<u32>();
     while bytes(tx, ty) > tuning.stencil_tile_bytes {
         if h == 1 || tx >= ty {
             tx /= 2;
@@ -514,7 +840,7 @@ pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tu
 
 /// The kernel of `key` with its sub-programs staged as `tile` says, running one workgroup per
 /// tile of the array. `based` and `stores` are those of the plain store kernel.
-fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str) -> String {
+fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str, names: &Names) -> String {
     let ((w, h), (tx, ty)) = (tile.dims, tile.tile);
     let region = |j: usize| (tx + 2 * tile.need[j].0, ty + 2 * tile.need[j].1);
     let (halo_x, halo_y) = tile.need.iter().fold((0, 0), |(x, y), &(nx, ny)| (x.max(nx), y.max(ny)));
@@ -569,7 +895,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
     workgroupBarrier();
 ",
             lw * lh,
-            body_with(instrs, &key.input_tys, None, index, "luma.size.x", false, &staged(k + 1)),
+            body_with(instrs, &key.input_tys, &Names { views: names.views, in_place: &[] }, index, false, &staged(k + 1)),
         );
     }
     let _ = write!(
@@ -586,14 +912,14 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
 }}
 ",
         tx * ty,
-        body_with(&key.instrs, &key.input_tys, key.in_place, index, "luma.size.x", false, &staged(0)),
+        body_with(&key.instrs, &key.input_tys, names, index, false, &staged(0)),
     );
     src
 }
 
 /// One function `sub{k}(i)` per sub-program: the value of a shifted expression at element `i`.
 /// Programs with sub-programs never run segmented.
-fn subs(key: &FusedKey) -> String {
+fn subs(key: &FusedKey, views: &[(ViewMap, Edge)], in_place: &[(u32, u32)]) -> String {
     let mut src = String::new();
     for (k, instrs) in key.subs.iter().enumerate() {
         let ty = instrs.last().map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
@@ -601,7 +927,7 @@ fn subs(key: &FusedKey) -> String {
         let _ = write!(
             src,
             "\nfn sub{k}(i: u32) -> {ty} {{\n{}    return t{last};\n}}\n",
-            body(instrs, &key.input_tys, None, "i", "luma.size.x", false)
+            body(instrs, &key.input_tys, &Names { views, in_place }, "i", false)
         );
     }
     src

@@ -8,6 +8,7 @@
 //! buffer reads zeros or the samples of a later batch.
 
 use std::fmt;
+use std::panic::Location;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,70 @@ impl KernelTiming {
     }
 }
 
+/// Why the fusion engine ended a kernel before the expression did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SplitReason {
+    /// The expression held more operations than the fusion limit allows.
+    Nodes {
+        /// Operations the expression would have held.
+        nodes: usize,
+        /// The limit in force (see [`fusion_limit`](crate::fusion_limit)).
+        limit: usize,
+    },
+    /// The expression was nested deeper than the engine walks in one kernel.
+    Depth {
+        /// The limit on the nesting depth.
+        limit: usize,
+    },
+    /// The expression read more distinct buffers than a kernel can bind.
+    Inputs {
+        /// Buffers the expression would have read.
+        inputs: usize,
+        /// Buffers a kernel can bind.
+        limit: usize,
+    },
+    /// The kernel would have kept more values live at once than is good for register pressure.
+    Live {
+        /// Values live at the busiest point.
+        live: usize,
+        /// The threshold of the device's tuning (`LUMA_FUSION_MAX_LIVE` overrides it).
+        limit: usize,
+    },
+    /// A kernel reading expressions through views would have computed more operations than the
+    /// device's tuning allows once every expression is written out at each index it is read at.
+    Inlined {
+        /// Operations the kernel would have computed.
+        instructions: usize,
+        /// The threshold of the device's tuning (`LUMA_FUSION_MAX_INLINED` overrides it).
+        limit: usize,
+    },
+}
+
+/// A point where an expression was cut into several kernels, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FusionSplit {
+    /// The operation whose creation (or evaluation) caused the cut.
+    pub op: &'static str,
+    /// Where that operation was written.
+    pub location: &'static Location<'static>,
+    /// Why the expression was cut.
+    pub reason: SplitReason,
+}
+
+impl fmt::Display for FusionSplit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "split at {} (`{}`): ", self.location, self.op)?;
+        match self.reason {
+            SplitReason::Nodes { nodes, limit } => write!(f, "{nodes} operations > {limit}"),
+            SplitReason::Depth { limit } => write!(f, "depth > {limit}"),
+            SplitReason::Inputs { inputs, limit } => write!(f, "{inputs} input buffers > {limit}"),
+            SplitReason::Live { live, limit } => write!(f, "{live} live values > {limit}"),
+            SplitReason::Inlined { instructions, limit } => write!(f, "{instructions} inlined operations > {limit}"),
+        }
+    }
+}
+
 /// GPU durations per kernel, measured with timestamp queries; see
 /// [`Context::profile`](crate::Context::profile).
 ///
@@ -56,6 +121,9 @@ impl KernelTiming {
 pub struct Profile {
     /// One entry per kernel label, the one with the most total time first.
     pub kernels: Vec<KernelTiming>,
+    /// Where lazy expressions were cut into several kernels while profiling, in the order they
+    /// happened (see [`SplitReason`]).
+    pub splits: Vec<FusionSplit>,
 }
 
 impl Profile {
@@ -94,7 +162,7 @@ impl Profile {
             }
         }
         kernels.sort_by_key(|k| std::cmp::Reverse(k.total));
-        Profile { kernels }
+        Profile { kernels, splits: Vec::new() }
     }
 }
 
@@ -124,6 +192,9 @@ impl fmt::Display for Profile {
                 us(k.min),
                 us(k.max)
             )?;
+        }
+        for split in &self.splits {
+            writeln!(f, "{split}")?;
         }
         Ok(())
     }

@@ -616,17 +616,27 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "luma"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "criterion",
  "encase",
  "libc",
  "log",
+ "luma-derive",
  "naga",
  "pollster",
  "rustfft",
  "wgpu",
+]
+
+[[package]]
+name = "luma-derive"
+version = "0.3.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.96",
 ]
 
 [[package]]

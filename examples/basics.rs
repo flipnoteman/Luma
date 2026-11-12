@@ -28,7 +28,14 @@ fn main() -> Result<()> {
     let relu = select(&x.gt(0.0), &x, &Array::zeros(5)?);
     println!("relu(x)   = {:?}", relu.to_vec()?);
     println!("sqrt(|x|) = {:?}", x.abs().sqrt().to_vec()?);
-    println!("sum, min, max, mean, norm = {}, {}, {}, {}, {}", x.sum()?, x.min()?, x.max()?, x.mean()?, x.norm()?);
+    println!(
+        "sum, min, max, mean, norm = {}, {}, {}, {}, {}",
+        x.sum().item()?,
+        x.min().item()?,
+        x.max().item()?,
+        x.mean().item()?,
+        x.norm().item()?
+    );
 
     println!("Program Time: {:?}", t.elapsed());
     Ok(())

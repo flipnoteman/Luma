@@ -6,27 +6,140 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Breaking
+
+- Reductions are lazy: `sum`, `min`, `max`, `mean`, `norm` and `reduce` on scalar arrays return an
+  `Array` of one element (`N` for `reduce`) instead of a host value, and no longer wait for the
+  GPU. Read the value with `.item()?`, or `.to_array()?` for `reduce`:
+  `x.sum()?` becomes `x.sum().item()?`, `let [lo, hi] = x.reduce([Min, Max])?` becomes
+  `let [lo, hi] = x.reduce([Min, Max]).to_array()?`. The reductions of `[f32; 2]` / `[f32; 4]`
+  arrays still return `Result` host values.
+- An array of one element combines with an array of any shape: `&x / &x.sum()` normalizes on the GPU
+  without a readback, and `&x.max() * &x` takes the shape of `x`. Shapes that differ, with neither
+  a single element, are still a `ShapeMismatch`; a one-element array that is the target of `+=` is
+  never broadcast.
+
 ### Added
 
+- Line primitives: `solve_tridiagonal` / `solve_block_tridiagonal` (block size 1 to 8, with
+  `_from` variants where each line starts at its own cell) solve one system per line along an axis
+  with the (block) Thomas algorithm; `Array::scan(axis, op)`, `cumsum`, `sum_axis`, `min_axis` and
+  `max_axis` scan or reduce along an axis (the scan operator is an elementwise closure of two
+  arguments, traced once and compiled into the scan kernels).
+- `iterate_until_all(init, Until, step)`: loops a record of arrays until a stop rule holds, with the
+  rule evaluated on the GPU between steps. `Until::new(max_steps)` takes `record(name, f)` (a
+  one-element array computed from the state after every step, kept as history), `stop_when(f)`
+  (a `Cond` built from `History`, `Series`, `Stat`: `last`, `first`, `peak`, `trough`,
+  `window_max`/`window_min`, `step`, arithmetic, `abs`, `lt`/`le`/`gt`/`ge`, `and`/`or`/`not`, as in
+  `(h["residual"].peak() / h["residual"].last()).ge(1e6)`) and `check_every`. The step also gets
+  its 0-based index as a one-element array. `Run` has the final state, `steps`, the `StopReason`
+  (`MaxSteps` or `Predicate(i)`) and `history(name)`, one value per step run.
+- `Array::item()` (the host value of a one-element array) and `Array::to_array::<N>()`.
+- `Array::sum_where(&mask)`: the sum of the elements where `mask` is non-zero, in one pass.
+- `luma::Scalar`: a host number shared between clones, usable wherever a number is
+  (`&x * &s`, `x += &s`). The value is read when the operation is recorded and is a kernel uniform,
+  so changing it with `set` never recompiles.
+- Views: `Array::slice(axis, range)`, `shift_fill`, `shift_clamp`, `shift_mirror` (shifts that do
+  not wrap), `pad(widths, PadMode)` (`Edge`, `Mirror`, `Wrap`, `Zero`), `flip`, `transpose`,
+  `index(axis)`, `take(&indices)` and `concat(axis, [..])`. A view moves no data: it is a lazy read
+  through an index map that fuses into the expression using it, so `f.slice(0, 1..) - f.slice(0, ..n)`
+  is one kernel.
+- `Array::assign(rhs)` writes an expression into the array a slice, flip or transpose was taken
+  from, in place, and `Array::put(&indices, values)` scatters. The expression may read the target
+  (`w.slice(0, ..2).assign(w.slice(0, 2..4).flip(0) * -1.0)` fills ghost cells); passed by value it
+  fuses into the write as one kernel. Both return `Result<()>`; `LumaError::ReadOnly` is new.
+- `tanh`, `sign`, `floor`, `ceil`, `atan2`, `hypot`, `copysign` on `Array<f32>`, and `%` on
+  `Array<u32>`.
+- Records: the `Fields` trait and `#[derive(Fields)]` (new crate `luma-derive`, re-exported as
+  `luma::Fields`) for a struct of arrays of one element type (`f32`, `Df32`, `f64`; the derive
+  reads it from the fields, `#[fields(elem = T)]` sets it for a record of records), nested
+  records, arrays and tuples. A record has `+ - * /` (with records, scalars and arrays), `-`,
+  `dot`, `slice`, `pad`, `flip`, `transpose`, `shift*`, `take`, `select`, `assign` (one kernel for
+  all fields), `put` and `eval`. `iterate_all` and `iterate_until_all` take states of any element
+  type.
+- `Array` is `Clone`: a clone is another handle on the same data (a write through one is seen by
+  the other, as with `reshape`); `&a * 1.0` is an independent copy.
 - `Array::iterate_until(max_steps, tol, step)`: runs `step` until the largest change of a step is
-  at most `tol`. The convergence check runs on the GPU, and the host waits once per 16 steps.
+  at most `tol`. The convergence check runs on the GPU, and the host waits once per block of
+  steps (16, doubling up to 128 while the loop runs on; `Until::check_every` fixes it for
+  `iterate_until_all`).
   On an M-series Mac, 200 heat steps on 1024² take 11.8 ms, against 41 ms for 0.2.0's loop with a
   readback every step.
+- `luma::fusion_limit(max_nodes, || ..)` sets the fusion limit of the expressions written inside
+  the closure. `Array::cache()` and `Fields::cache()` evaluate an expression now, so that every
+  later slice, shift or gather reads its buffer instead of recomputing it.
+- `Profile::splits`: where a profiled expression was cut into several kernels, as `FusionSplit`
+  entries with a `SplitReason` (operation count, nesting depth, input buffers, live values) and
+  the source location of the operation that caused the cut; `Display` lists them.
+- `LUMA_FUSION_MAX_LIVE` overrides the most values a fused kernel keeps live at once (see below).
 - `LUMA_SPECULATE=off` turns off speculation at readbacks (see below).
 - Benchmarks: `per_step` now calls `eval` every step, like the ArrayFire side. Also new: a
   Luma-only `lazy_chain` variant, `_cold` rows that time the first run with compilation, a
   `converge` workload with a readback every step, and a tuned ArrayFire run in `run.sh`
   (`AF_*_MAX_JIT_LEN=256`, `--label`).
+- Extended precision. `f64` arrays (`Array<f64>`; Vulkan devices with 64-bit shader floats, else the
+  result is poisoned with `LumaError::Unsupported`) have `+ - * /`, `sqrt`, `abs`, `sign`, `floor`,
+  `ceil`, comparisons, `minimum`/`maximum`, `select`, views, `assign` and reductions;
+  everything else on them (`exp`, trigonometry, generators, ...) is refused with `Unsupported`.
+  There is no scalar `Operand<f64>` for comparisons, `minimum`/`maximum` and `select` (a second float
+  type there would make `select(&mask, 1.0, 0.0)` infer `f64`); the operators take `f64` scalars.
+  `Df32` (`{ hi, lo }`, about 48 bits, computed in `f32` arithmetic that no compiler can
+  reassociate, on every device) has `+ - * /`, `sqrt`, `abs`, comparisons, `minimum`/`maximum`,
+  `select`, views and reductions. Casts: `to_f64` / `to_df32` on `f32`, `to_f32` / `to_df32` on
+  `f64`, `to_f32` / `to_f64` on `Df32`. `Array<f32>::sum_compensated()` and `norm_compensated()`
+  accumulate in double-float, so the result does not depend on the reduction tree. Programs
+  that mix 4- and 8-byte elements (including the casts) on arrays split over several buffers
+  fail with `LumaError::Chunked`; scans and reductions along an axis are not available for them.
+- `ContextOptions::check_finite(true)` / `LUMA_CHECK_FINITE=1`: every array an operation computes
+  is checked for NaN and Inf right after its kernel, and the operation fails with
+  `LumaError::NonFinite`, naming it and its source location (it waits for the GPU once per
+  evaluated array: a debug mode). `LumaError::Unsupported` is new.
 
 ### Changed
 
+- `iterate` and `iterate_all` trace their step once and replay the recorded kernels for steps that
+  do not fuse into one kernel (shifts, `cache()`, `assign`, reductions), instead of calling `step`
+  once per step. `step` is now called exactly once, and must compute its results from its argument
+  and captured arrays only. A step that reads a value back, or states that span several buffers,
+  run step by step as before.
+- Fusion scales to large expressions: a kernel now holds up to 1024 operations by default
+  (`LUMA_FUSION_MAX_NODES`, `fusion_limit`; at most 4096), where it held 128. Nesting is cut at
+  256 levels, which bounds the recursion on long chains, and a program that would keep more values
+  live than the GPU profile suits (96, 64 on Apple, 256 on the CPU device) is split in the middle
+  where fewest values are live.
+- Identical lazy operations on identical operands (`spectral(&w, ..)` called twice) are one node,
+  which a fused kernel computes once. The sharing ends when a buffer is written.
+- A slice, pad, flip, transpose, gather or `concat` of a lazy expression reads it lazily: nested
+  views are unfolded into the reading kernel, each distinct (expression, index) pair computed once,
+  instead of evaluating the expression into a buffer. A kernel that would grow beyond
+  `LUMA_FUSION_MAX_INLINED` operations evaluates its most repeated view first (a split note
+  `Inlined` in profiles). A first-order Euler step written with records, `pad`, a ghost `assign`
+  and slices is one kernel per step. RTX 3090, 50 steps at 2048² (`examples/bench_pde.rs`):
+  `iterate_all` 40.8 ms (6 kernels per step) to 8.4 ms (1), within 1.2x of a hand-written kernel
+  (8.5 ms); with `eval` every step 51.8 ms to 9.8 ms; MUSCL, 20 steps, 16.9 ms to 6.6 ms. A lazy
+  Mandelbrot chain of 256 iterations at 4096² evaluated once at the end: 1.99 s to 9.4 ms.
+- `assign` through a slice, flip or transpose of an array that is still a lazy expression
+  launches nothing: the array becomes `select(region, rhs, old)`, and fuses into what reads it.
+  Arrays and slices recorded before the write keep the old values.
+- Scans and reductions along an axis are restructured for coalesced memory access (workgroup scans
+  on contiguous lines, line-fastest order on strided ones): `cumsum` of 2^26 elements 29 ms to
+  1.0 ms, along axis 0 of 8192² 18.9 ms to 1.0 ms, `sum_axis(0)` 2.4 ms to 0.35 ms. Block
+  tridiagonal solves are straight-line code per block size up to 5 (4x4 blocks on 1024² lines:
+  31.6 ms to 3.1 ms), and the scalar solve along the contiguous axis picks its workgroup size from
+  the number of lines (4096²: 9.0 ms to 5.0 ms).
+- `iterate_until` and `iterate_until_all` check the stop rule in blocks that grow from 16 to 128
+  steps while the loop runs on (64² state: 41.5 to 14.1 us per step).
+- Less host time per lazy operation and evaluation: node id sets as bit sets, hash-consing keys
+  and kernel keys hashed once and interned, no copies of the live-node list (an Euler step graph:
+  127 to 66 us to build).
+- The crate is a workspace with `luma-derive`; releases publish both crates.
 - Loops of `x = step(&x); x.eval()` (or `eval_all`) over `f32` arrays are recognized. The
   postponed steps then run together, as one register loop, one time-blocked stencil, or step by
   step, instead of chaining into ever longer expressions. Kernels no longer depend on how many
   steps were postponed. On an M-series Mac against 0.2.0: Mandelbrot 1024², 256 iterations with
   `eval_all` each, 5.6 ms to 1.4 ms (`iterate_all`: 0.83 ms); heat 4096², 100 steps with `eval`
   each, 33 ms to 21.5 ms (`iterate`: 20.9 ms).
-- A readback in a loop of `next = step(&u); err = (&next - &u).abs().max()?; u = next` computes
+- A readback in a loop of `next = step(&u); err = (&next - &u).abs().max().item()?; u = next` computes
   the next steps and their residuals ahead, once the step has repeated. The readbacks that follow
   are answered from that result, as long as they reduce the same program over the predicted states
   and nothing they read was written in between. The heat `converge` loop at 256², 200 steps:
@@ -42,6 +155,23 @@ All notable changes to Luma are listed here. The format follows
 - For other shifts, how much of a lazy expression a shift recomputes instead of evaluating it
   first is now set per GPU profile: 24 operations on Apple and generic GPUs, 32 on NVIDIA. It
   was 16 everywhere.
+
+### Fixed
+
+- Two independently written equal expressions shared one node, so `assign`, `write` or `+=`
+  through one of them changed the other.
+- A `Df32` kernel with only comparisons, `abs`, `minimum` or `maximum` failed to bind its uniform;
+  casts from and to `Df32` could be cancelled by the shader compiler
+  (`(&x - x.to_f32().to_df32()).to_f32()` was 0).
+- After `cache()`, the buffers below the cached part still counted towards the input limit of a
+  kernel, which cut expressions that fit.
+- Threads sharing a context (`default_context()`, parallel tests) got wrong results: `eval`,
+  `flush`, `sync` and `cache` evaluated the pending arrays of other threads (and fed them into a
+  recording another thread had under way), and equal expressions were shared across threads. Each
+  thread now only evaluates its own pending arrays.
+- wgpu's validation of indirect dispatches (an extra dispatch before every step of
+  `iterate_until`/`iterate_until_all`) is off: the dispatch arguments are always written by the
+  library's own gate kernels.
 
 ## [0.2.0] - 2026-11-11
 

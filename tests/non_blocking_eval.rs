@@ -84,7 +84,7 @@ fn eval_all_takes_arrays_of_different_lengths_and_no_arrays() {
 #[test]
 fn poisoned_arrays_return_their_error_from_submit() {
     let a = f32s(&[1.0, 2.0, 3.0]);
-    let bad = &a + &f32s(&[1.0]);
+    let bad = &a + &f32s(&[1.0, 2.0]);
 
     let err = bad.eval().unwrap_err();
     assert!(matches!(err.root(), LumaError::ShapeMismatch { .. }), "{err}");

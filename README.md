@@ -16,7 +16,7 @@ fn main() -> Result<()> {
 
     // Execution deferred until host requires result.
     println!("{:?}", z.to_vec()?);          // [3.46.., 4.89.., 6.0, 6.92..]
-    println!("{}", (&x * &y).sum()?);       // 300
+    println!("{}", (&x * &y).sum().item()?);  // 300
     Ok(())
 }
 ```
@@ -88,8 +88,11 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 | `LUMA_CHUNK_BYTES` | Largest buffer an array is split into, in bytes (power of two) |
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
-| `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel |
-| `LUMA_SPECULATE` | `off` stops readbacks in a loop (`step` then `.max()?` every iteration) from computing the next steps ahead |
+| `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel (default 1024, at most 4096) |
+| `LUMA_FUSION_MAX_LIVE` | Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, `8..=4096`) |
+| `LUMA_FUSION_MAX_INLINED` | Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; `16..=16384`) |
+| `LUMA_SPECULATE` | `off` stops readbacks in a loop (`step` then `.max().item()?` every iteration) from computing the next steps ahead |
+| `LUMA_CHECK_FINITE` | `1`, `on` or `true`: fail any operation whose result holds a NaN or Inf (debug mode, waits for the GPU after every evaluated array) |
 | `LUMA_EXIT_WAIT` | `0` skips waiting at exit for NVIDIA's driver threads on Linux (saves about 50 ms; risks the driver's exit hang) |
 
 ### Examples

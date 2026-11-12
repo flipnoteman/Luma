@@ -5,15 +5,19 @@ use std::sync::Arc;
 
 use crate::array::{Array, Failure, Storage};
 use crate::error::LumaError;
-use crate::jit;
+use crate::gpu_type::ScalarType;
+use crate::jit::{self, Trace};
 use crate::ops::Outcome;
 
-/// Runs `steps` iterations of `step` on several arrays at once: `step` gets the current values
+/// Runs `steps` iterations of `step` on several arrays at once (of any [`ScalarType`], `f32`,
+/// [`Df32`](crate::Df32), `f64`, ...): `step` gets the current values
 /// and returns the next ones, as a loop calling it `steps` times would. When every result is an
 /// elementwise expression of the states, of other arrays of the same length and of scalars, the
 /// whole loop is one kernel that keeps the states in registers and writes them once, for any
-/// `steps` (one pipeline per step expression). Anything else, such as shifts, runs step by step.
-/// `step` is called once more than that to trace it.
+/// `steps` (one pipeline per step expression); that loop exists for `f32` only. Anything else, such as
+/// shifts, `cache()` or `assign` or states of another type, is traced once and its
+/// recorded kernels are replayed, step by step. `step` is called once to trace it; it must compute its results from its arguments and captured
+/// arrays only.
 ///
 /// ```
 /// # use luma::*;
@@ -27,11 +31,11 @@ use crate::ops::Outcome;
 /// # Ok::<(), luma::LumaError>(())
 /// ```
 #[track_caller]
-pub fn iterate_all<const N: usize>(
-    init: [&Array<f32>; N],
+pub fn iterate_all<T: ScalarType, const N: usize>(
+    init: [&Array<T>; N],
     steps: usize,
-    step: impl Fn(&[Array<f32>; N]) -> [Array<f32>; N],
-) -> [Array<f32>; N] {
+    step: impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+) -> [Array<T>; N] {
     const { assert!(N >= 1, "iterate_all takes at least one array") };
     let location = Location::caller();
     let ctx = init[0].context();
@@ -51,11 +55,11 @@ pub fn iterate_all<const N: usize>(
     }
 }
 
-fn run_iterate_all<const N: usize>(
-    init: [&Array<f32>; N],
+fn run_iterate_all<T: ScalarType, const N: usize>(
+    init: [&Array<T>; N],
     steps: usize,
-    step: &impl Fn(&[Array<f32>; N]) -> [Array<f32>; N],
-) -> Outcome<[Array<f32>; N]> {
+    step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+) -> Outcome<[Array<T>; N]> {
     let ctx = init[0].context();
     if init.iter().any(|array| !ctx.same_as(array.context())) {
         return Err(Failure::New(LumaError::ContextMismatch));
@@ -66,13 +70,83 @@ fn run_iterate_all<const N: usize>(
         }
     }
     if steps == 0 {
-        return Ok(init.map(|array| array * 1.0));
+        return Ok(init.map(Array::copied));
     }
+    let mut single = true;
+    for array in &init {
+        single &= array.storage()?.segments() == 1;
+    }
+    if single {
+        return replayed_all(init, steps, step);
+    }
+    iterate_all_aliased(init, steps, step)
+}
+
+/// `iterate_all` for states of one buffer each: `step` is traced once on placeholders while the
+/// context records its launches, and the recorded launches are replayed `steps` times.
+fn replayed_all<T: ScalarType, const N: usize>(
+    init: [&Array<T>; N],
+    steps: usize,
+    step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+) -> Outcome<[Array<T>; N]> {
+    let ctx = init[0].context();
+    let (mut trace, probes) = Trace::start(&init)?;
+    let Ok(probes): std::result::Result<[Array<T>; N], _> = probes.try_into() else { unreachable!() };
+    let first = step(&probes);
+    let shapes_match = first.iter().zip(&init).all(|(next, array)| next.shape() == array.shape());
+
+    if trace.untouched() {
+        // Only lazy expressions: they may be a loop that runs in one kernel.
+        trace.pause();
+        let traced: Option<Vec<Arc<jit::Node>>> = first.iter().map(|next| next.pending().cloned()).collect();
+        if shapes_match
+            && let (Ok(count), Some(outs)) = (u32::try_from(steps), traced)
+            && let Some(result) = jit::run_loop(ctx, &trace.probe_storages, &trace.init, &outs, count)
+        {
+            let mut outputs = result?.into_iter();
+            return Ok(init.map(|array| match outputs.next() {
+                Some(storage) => Array::from_storage(ctx, array.shape(), storage),
+                None => unreachable!(),
+            }));
+        }
+        trace.resume()?;
+    }
+
+    let stepper = trace.finish(&first.each_ref(), shapes_match)?;
+    let Some(stepper) = stepper else {
+        // Everything ran on the placeholders already: carry on from the first result.
+        let mut states = first;
+        for _ in 1..steps {
+            states = step(&states);
+        }
+        for state in &states {
+            state.check()?;
+        }
+        return Ok(states);
+    };
+    for t in 1..=steps {
+        stepper.plan().replay(&stepper.subst(t), None)?;
+    }
+    let mut finals = stepper.state_after(steps).iter();
+    Ok(init.map(|array| match finals.next() {
+        Some(storage) => Array::from_storage(ctx, array.shape(), Arc::clone(storage)),
+        None => unreachable!(),
+    }))
+}
+
+/// The step-by-step loop of `iterate_all` on placeholders that alias the states' buffers, for
+/// states that span several buffers.
+fn iterate_all_aliased<T: ScalarType, const N: usize>(
+    init: [&Array<T>; N],
+    steps: usize,
+    step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+) -> Outcome<[Array<T>; N]> {
+    let ctx = init[0].context();
     let mut probes = Vec::with_capacity(N);
     for array in &init {
         probes.push(array.probe()?);
     }
-    let Ok(probes): std::result::Result<[Array<f32>; N], _> = probes.try_into() else { unreachable!() };
+    let Ok(probes): std::result::Result<[Array<T>; N], _> = probes.try_into() else { unreachable!() };
     let first = step(&probes);
 
     let shapes_match = first.iter().zip(&init).all(|(next, array)| next.shape() == array.shape());
@@ -80,7 +154,7 @@ fn run_iterate_all<const N: usize>(
     if shapes_match
         && let (Ok(count), Some(outs)) = (u32::try_from(steps), traced)
     {
-        let storages = |arrays: &[&Array<f32>]| -> Outcome<Vec<Arc<Storage>>> {
+        let storages = |arrays: &[&Array<T>]| -> Outcome<Vec<Arc<Storage>>> {
             arrays.iter().map(|array| array.storage().map(Arc::clone)).collect()
         };
         let probe_storages = storages(&probes.each_ref())?;
@@ -115,10 +189,12 @@ impl Array<f32> {
     /// its argument, shifts of it by a few elements (circular, as [`Array::shift`]), scalars and
     /// other arrays of the same shape that do not change — each launch loads a tile into
     /// workgroup memory and runs several steps on it, so the data passes through memory once per
-    /// several steps instead of once per step. Any other `step` simply runs in a loop.
+    /// several steps instead of once per step. Any other `step` (shifts of a computed expression,
+    /// `cache()`, `assign`, reductions) is traced once and its recorded kernels are replayed, step
+    /// by step.
     ///
-    /// `step` is called with a placeholder first to inspect the expression it builds; it must
-    /// compute its result from its argument and not keep it.
+    /// `step` is called once, with a placeholder, to trace it; it must compute its result from its
+    /// argument and captured arrays only, and not keep the argument.
     ///
     /// ```no_run
     /// # let u0 = luma::Array::<f32>::zeros([512, 512])?;
@@ -143,6 +219,9 @@ impl Array<f32> {
         if steps == 0 {
             return Ok(self * 1.0);
         }
+        if self.storage()?.segments() == 1 {
+            return self.replayed(steps, step);
+        }
         let probe = self.probe()?;
         let first = step(&probe);
         match jit::stencil_plan(&probe, &first) {
@@ -161,9 +240,41 @@ impl Array<f32> {
         }
     }
 
+    /// `iterate` for a state of one buffer: stencils run time-blocked, any other step is traced
+    /// once and its recorded launches replayed.
+    fn replayed(&self, steps: usize, step: impl Fn(&Array<f32>) -> Array<f32>) -> Outcome<Array<f32>> {
+        let (mut trace, mut probes) = Trace::start(&[self])?;
+        let Some(probe) = probes.pop() else { unreachable!() };
+        let first = step(&probe);
+        if trace.untouched() {
+            trace.pause();
+            if let Some(stencil) = jit::stencil_plan(&probe, &first) {
+                return stencil.run(self, steps);
+            }
+            trace.resume()?;
+        }
+        let Some(stepper) = trace.finish(&[&first], first.shape() == self.shape())? else {
+            let mut u = first;
+            for _ in 1..steps {
+                u = step(&u);
+            }
+            u.check()?;
+            return Ok(u);
+        };
+        for t in 1..=steps {
+            stepper.plan().replay(&stepper.subst(t), None)?;
+        }
+        match stepper.state_after(steps).first() {
+            Some(storage) => Ok(Array::from_storage(self.context(), self.shape(), Arc::clone(storage))),
+            None => unreachable!(),
+        }
+    }
+
     /// Runs `step` until the largest `|next - prev|` of a step is at most `tol`, or `max_steps` steps,
     /// and returns the last state. Convergence is checked on the GPU; the host waits once per
-    /// block of steps, and steps after convergence run no work.
+    /// block of steps (the first block is 16 steps, every block that ends without convergence doubles
+    /// the next one, up to 128), and steps after convergence run no work. The result does not depend
+    /// on the block schedule.
     #[track_caller]
     pub fn iterate_until(&self, max_steps: usize, tol: f32, step: impl Fn(&Array<f32>) -> Array<f32>) -> Array<f32> {
         let location = Location::caller();
@@ -198,7 +309,7 @@ impl Array<f32> {
         }
         let (mut u, mut change) = (first, change);
         for done in 1..=max_steps {
-            if done == max_steps || change.max().map_err(Failure::New)? <= tol {
+            if done == max_steps || change.max().item().map_err(Failure::New)? <= tol {
                 break;
             }
             let next = step(&u);

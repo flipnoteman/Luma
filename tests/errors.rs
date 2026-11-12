@@ -39,11 +39,11 @@ fn shape_mismatch_mid_chain_surfaces_at_to_vec_with_the_location_of_the_faulty_l
     assert!(text.contains("Dimension mismatch"), "{text}");
 
     assert!(matches!(d.eval().unwrap_err().root(), LumaError::ShapeMismatch { .. }));
-    assert!(d.sum().is_err());
-    assert!(d.min().is_err());
-    assert!(d.max().is_err());
-    assert!(d.mean().is_err());
-    assert!(d.norm().is_err());
+    assert!(d.sum().item().is_err());
+    assert!(d.min().item().is_err());
+    assert!(d.max().item().is_err());
+    assert!(d.mean().item().is_err());
+    assert!(d.norm().item().is_err());
 
     // The arrays the failed op was built from are unharmed.
     assert_eq!(ok.to_vec().unwrap(), vec![2.0, 4.0, 6.0]);
@@ -77,7 +77,7 @@ fn compound_assignment_poisons_the_left_hand_side() {
 
     // A poisoned right-hand side poisons a healthy lhs.
     let mut x = f32s(&[1.0, 2.0]);
-    let bad = &f32s(&[1.0]) + &f32s(&[1.0, 2.0]);
+    let bad = &f32s(&[1.0, 2.0, 3.0]) + &f32s(&[1.0, 2.0]);
     x -= &bad;
     assert!(x.error().is_some());
     assert!(x.to_vec().is_err());
@@ -110,7 +110,7 @@ fn try_methods_fail_immediately() {
 #[test]
 fn poisoned_arrays_reject_every_sink() {
     let a = f32s(&[1.0, 2.0, 3.0]);
-    let mut bad = &a + &f32s(&[1.0]);
+    let mut bad = &a + &f32s(&[1.0, 2.0]);
 
     assert!(bad.write(&[1.0, 2.0, 3.0]).is_err());
     assert!(bad.to_vec().is_err());
@@ -128,7 +128,7 @@ fn poisoned_arrays_reject_every_sink() {
 
 #[test]
 fn every_math_method_propagates_poison() {
-    let bad = &f32s(&[1.0, 2.0]) + &f32s(&[1.0]);
+    let bad = &f32s(&[1.0, 2.0]) + &f32s(&[1.0, 2.0, 3.0]);
     let outputs: Vec<Array<f32>> = vec![
         bad.sqrt(),
         bad.exp(),
@@ -140,7 +140,7 @@ fn every_math_method_propagates_poison() {
         bad.powf(2.0),
         bad.clamp(0.0, 1.0),
         bad.minimum(0.5),
-        bad.maximum(&f32s(&[1.0, 2.0])),
+        bad.maximum(f32s(&[1.0, 2.0])),
         bad.shift(1),
         bad.reshape(2),
         -&bad,

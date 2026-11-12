@@ -25,7 +25,7 @@ fn generated<T: ScalarType>(
 }
 
 fn seed_args(seed: u64) -> [Src; 3] {
-    let word = |bits: u32| Src::Scalar(Scalar { ty: ElemTy::U32, bits });
+    let word = |bits: u32| Src::Scalar(Scalar::u32(bits));
     [word(seed as u32), word((seed >> 32) as u32), Src::unused()]
 }
 

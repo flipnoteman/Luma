@@ -25,7 +25,7 @@ fn arrays_larger_than_the_budget_compute_correctly() {
     let expected: Vec<f32> = x.iter().zip(&y).map(|(x, y)| x * 2.0 + y).collect();
     assert_eq!(c.to_vec().unwrap(), expected);
 
-    let sum = c.sum().unwrap();
+    let sum = c.sum().item().unwrap();
     let reference: f64 = expected.iter().map(|&v| f64::from(v)).sum();
     assert!((f64::from(sum) - reference).abs() <= reference * 1e-4, "{sum} vs {reference}");
     assert!(ctx.spilled_bytes() > 0);

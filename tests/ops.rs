@@ -148,10 +148,10 @@ fn math_functions_match_cpu() {
     assert_eq!(got, want);
 
     let other = values(n, 10, -3.0, 3.0);
-    let got = f32s(&signed).minimum(&f32s(&other)).to_vec().unwrap();
+    let got = f32s(&signed).minimum(f32s(&other)).to_vec().unwrap();
     let want: Vec<f32> = signed.iter().zip(&other).map(|(a, b)| a.min(*b)).collect();
     assert_eq!(got, want);
-    let got = f32s(&signed).maximum(&f32s(&other)).to_vec().unwrap();
+    let got = f32s(&signed).maximum(f32s(&other)).to_vec().unwrap();
     let want: Vec<f32> = signed.iter().zip(&other).map(|(a, b)| a.max(*b)).collect();
     assert_eq!(got, want);
     assert_eq!(
@@ -196,7 +196,7 @@ fn comparisons_produce_masks() {
 
     let u = u32s(&[1, 5, 9]);
     assert_eq!(mask(u.lt(5u32)), vec![1, 0, 0]);
-    assert_eq!(mask(u.ge(&u32s(&[2, 5, 8]))), vec![0, 1, 1]);
+    assert_eq!(mask(u.ge(u32s(&[2, 5, 8]))), vec![0, 1, 1]);
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn select_picks_per_element() {
     let x = f32s(&xs);
 
     // relu via select
-    let relu = select(&x.gt(0.0), &x, &Array::zeros(n).unwrap());
+    let relu = select(&x.gt(0.0), &x, Array::zeros(n).unwrap());
     let want: Vec<f32> = xs.iter().map(|v| v.max(0.0)).collect();
     assert_eq!(relu.to_vec().unwrap(), want);
 
@@ -312,18 +312,18 @@ fn reductions_on_small_and_odd_sizes() {
         let xs = values(n, n as u64, -10.0, 10.0);
         let a = f32s(&xs);
         let want_sum: f64 = xs.iter().map(|&x| f64::from(x)).sum();
-        let got = f64::from(a.sum().unwrap());
+        let got = f64::from(a.sum().item().unwrap());
         let scale: f64 = xs.iter().map(|&x| f64::from(x).abs()).sum();
         assert!((got - want_sum).abs() <= 1e-6 * scale + 1e-6, "sum n={n}: got {got}, want {want_sum}");
 
-        assert_eq!(a.min().unwrap(), xs.iter().copied().fold(f32::INFINITY, f32::min), "min n={n}");
-        assert_eq!(a.max().unwrap(), xs.iter().copied().fold(f32::NEG_INFINITY, f32::max), "max n={n}");
+        assert_eq!(a.min().item().unwrap(), xs.iter().copied().fold(f32::INFINITY, f32::min), "min n={n}");
+        assert_eq!(a.max().item().unwrap(), xs.iter().copied().fold(f32::NEG_INFINITY, f32::max), "max n={n}");
 
-        let mean = f64::from(a.mean().unwrap());
+        let mean = f64::from(a.mean().item().unwrap());
         assert!((mean - want_sum / n as f64).abs() <= 1e-6 * scale / n as f64 + 1e-6, "mean n={n}");
 
         let want_norm = xs.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
-        let norm = f64::from(a.norm().unwrap());
+        let norm = f64::from(a.norm().item().unwrap());
         assert!((norm - want_norm).abs() <= 1e-5 * want_norm + 1e-6, "norm n={n}: {norm} vs {want_norm}");
     }
 }
@@ -333,9 +333,9 @@ fn u32_reductions() {
     for n in [1usize, 7, 1025, 5000] {
         let xs: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2654435761u32) % 1000 + 3).collect();
         let a = u32s(&xs);
-        assert_eq!(a.sum().unwrap(), xs.iter().fold(0u32, |s, x| s.wrapping_add(*x)), "n={n}");
-        assert_eq!(a.min().unwrap(), *xs.iter().min().unwrap(), "n={n}");
-        assert_eq!(a.max().unwrap(), *xs.iter().max().unwrap(), "n={n}");
+        assert_eq!(a.sum().item().unwrap(), xs.iter().fold(0u32, |s, x| s.wrapping_add(*x)), "n={n}");
+        assert_eq!(a.min().item().unwrap(), *xs.iter().min().unwrap(), "n={n}");
+        assert_eq!(a.max().item().unwrap(), *xs.iter().max().unwrap(), "n={n}");
     }
 }
 
@@ -347,9 +347,9 @@ fn u32_reductions_beyond_one_block_per_workgroup() {
     xs[n - 2] = 1;
     xs[n / 2 + 1] = 5000;
     let a = u32s(&xs);
-    assert_eq!(a.sum().unwrap(), xs.iter().fold(0u32, |s, x| s.wrapping_add(*x)));
-    assert_eq!(a.min().unwrap(), 1);
-    assert_eq!(a.max().unwrap(), 5000);
+    assert_eq!(a.sum().item().unwrap(), xs.iter().fold(0u32, |s, x| s.wrapping_add(*x)));
+    assert_eq!(a.min().item().unwrap(), 1);
+    assert_eq!(a.max().item().unwrap(), 5000);
 }
 
 #[test]
@@ -357,12 +357,12 @@ fn reductions_ignore_stale_pool_contents() {
     // Fresh context so the pooled buffers of the first reduction are the ones the second reuses.
     let ctx = Context::new().unwrap();
     let big = Array::from_slice_on(&ctx, &vec![1000.0f32; 50_000], 50_000).unwrap();
-    assert_eq!(big.sum().unwrap(), 50_000_000.0);
+    assert_eq!(big.sum().item().unwrap(), 50_000_000.0);
     drop(big);
     let small = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap();
-    assert_eq!(small.sum().unwrap(), 6.0);
-    assert_eq!(small.min().unwrap(), 1.0);
-    assert_eq!(small.max().unwrap(), 3.0);
+    assert_eq!(small.sum().item().unwrap(), 6.0);
+    assert_eq!(small.min().item().unwrap(), 1.0);
+    assert_eq!(small.max().item().unwrap(), 3.0);
 }
 
 #[test]
@@ -372,7 +372,7 @@ fn f32_sum_of_ten_million_elements_is_accurate() {
     let want: f64 = xs.iter().map(|&x| f64::from(x)).sum();
     let a = f32s(&xs);
 
-    let got = f64::from(a.sum().unwrap());
+    let got = f64::from(a.sum().item().unwrap());
     let relative = ((got - want) / want).abs();
     assert!(relative < 2e-6, "sum of {n} elements: got {got}, want {want}, relative error {relative}");
 
@@ -381,12 +381,12 @@ fn f32_sum_of_ten_million_elements_is_accurate() {
     let naive_error = ((f64::from(naive) - want) / want).abs();
     assert!(relative <= naive_error.max(2e-6), "tree {relative} vs naive {naive_error}");
 
-    let mean = f64::from(a.mean().unwrap());
+    let mean = f64::from(a.mean().item().unwrap());
     assert!(((mean - want / n as f64) / (want / n as f64)).abs() < 2e-6);
     let want_norm = xs.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
-    let norm = f64::from(a.norm().unwrap());
+    let norm = f64::from(a.norm().item().unwrap());
     assert!(((norm - want_norm) / want_norm).abs() < 2e-6, "norm: {norm} vs {want_norm}");
-    assert!(a.min().unwrap() >= 0.0 && a.max().unwrap() < 1.0);
+    assert!(a.min().item().unwrap() >= 0.0 && a.max().item().unwrap() < 1.0);
 }
 
 #[test]
@@ -395,7 +395,7 @@ fn reduction_of_an_expression() {
     let n = 100_000;
     let xs = values(n, 20, -1.0, 1.0);
     let ys = values(n, 21, -1.0, 1.0);
-    let dot = (&f32s(&xs) * &f32s(&ys)).sum().unwrap();
+    let dot = (&f32s(&xs) * &f32s(&ys)).sum().item().unwrap();
     let want: f64 = xs.iter().zip(&ys).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
     assert!((f64::from(dot) - want).abs() < 1e-3, "{dot} vs {want}");
 }

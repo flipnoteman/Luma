@@ -1,6 +1,6 @@
 //! Speculation at per-step readbacks.
 //!
-//! A loop `next = step(&u); e = f(&next, &u).max()?; u = next;` waits for the GPU once per step,
+//! A loop `next = step(&u); e = f(&next, &u).max().item()?; u = next;` waits for the GPU once per step,
 //! though the step does little work. Once the same step has been seen repeating, a readback also
 //! computes the next few steps and their residuals and reads everything in one round trip. The
 //! readbacks that follow are answered from memory, if the expression they reduce is the same
@@ -18,7 +18,7 @@ use crate::context::{Context, Scratch};
 use crate::error::{LumaError, Result};
 use crate::reduce::finish_passes;
 
-use super::program::{flatten_step, same_program, Fused, StateRef, Tail, Traced, ELEMENT_BYTES};
+use super::program::{flatten_step, same_program, Fused, StateRef, Tail, Traced};
 use super::{launch, ElemTy, Node, Src};
 
 /// Most steps computed ahead by one readback.
@@ -249,9 +249,9 @@ fn compute_ahead(
     from: &[Arc<Storage>],
 ) -> Result<(Vec<Arc<Storage>>, wgpu::Buffer)> {
     debug_assert_eq!(from.len(), states);
-    let partials = launch::reduce_fused(ctx, len, with_states(template, from, None), ops, scratch).map_err(Failure::into_error)?;
+    let partials = launch::reduce_fused(ctx, len, with_states(template, from, None), ops, scratch, None).map_err(Failure::into_error)?;
     let [(partial, groups)] = <[_; 1]>::try_from(partials).map_err(|_| LumaError::Gpu("speculated reduction spans segments".into()))?;
-    let residual = finish_passes(ctx, scratch, ops, wgsl, ELEMENT_BYTES, partial, groups, true)?;
+    let residual = finish_passes(ctx, scratch, ops, wgsl, ElemTy::F32.bytes(), partial, groups, true, None)?;
     let next = launch::run_store(ctx, len, with_states(template, from, Some(outs))).map_err(Failure::into_error)?;
     Ok((next.into_iter().map(Arc::new).collect(), residual))
 }

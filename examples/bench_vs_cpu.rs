@@ -237,15 +237,15 @@ fn main() -> Result<()> {
 
         // dot: 8 B/elem
         let gpu = median(it, || {
-            black_box((&x * &y).sum().unwrap());
+            black_box((&x * &y).sum().item().unwrap());
         });
         let kern = gpu_kernel_ms(|| {
-            black_box((&x * &y).sum().unwrap());
+            black_box((&x * &y).sum().item().unwrap());
         });
         let cpu = median(it, || {
             black_box(par_dot(&xs, &ys));
         });
-        let rel = ((&x * &y).sum()? - par_dot(&xs, &ys)).abs() / par_dot(&xs, &ys);
+        let rel = ((&x * &y).sum().item()? - par_dot(&xs, &ys)).abs() / par_dot(&xs, &ys);
         print(Row {
             name: "dot (rel err)",
             n,

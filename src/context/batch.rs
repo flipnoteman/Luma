@@ -226,7 +226,9 @@ impl Context {
     /// computed and the steps between two submissions fuse. Postponing stops once resident data
     /// reaches three quarters of the memory budget.
     pub(crate) fn submit_requested(&self) -> Result<()> {
-        if postpone(self.gpu_busy(), self.batch()?.dispatches, self.pager().under_pressure()) {
+        if postpone(self.gpu_busy(), self.batch()?.dispatches, self.pager().under_pressure())
+            && !self.jit().requested_stencil_chain()
+        {
             return Ok(());
         }
         self.jit().evaluate_requested();
@@ -323,6 +325,7 @@ impl Context {
 
     /// Records zeroing the first `bytes` bytes of `buffer`.
     pub(crate) fn clear(&self, buffer: &Buffer, bytes: u64) -> Result<()> {
+        self.abort_recording()?;
         let mut guard = self.batch()?;
         self.encoder(&mut guard).clear_buffer(buffer, 0, Some(bytes));
         Ok(())
@@ -331,6 +334,7 @@ impl Context {
     /// Records copying `bytes` bytes from `src` at `src_offset` to `dst` at `dst_offset`, for
     /// gathering the partial results of several segments into one buffer.
     pub(crate) fn copy(&self, src: &Buffer, src_offset: u64, dst: &Buffer, dst_offset: u64, bytes: u64) -> Result<()> {
+        self.abort_recording()?;
         let mut guard = self.batch()?;
         self.encoder(&mut guard).copy_buffer_to_buffer(src, src_offset, dst, dst_offset, bytes);
         Ok(())
@@ -357,6 +361,9 @@ impl Context {
         args: &[RawArg<'_>],
     ) -> Result<()> {
         check_aliasing(args)?;
+        if self.capture(kernel, workgroups, size, args) {
+            return Ok(());
+        }
         let mut guard = self.batch()?;
         self.record_launch(&mut guard, kernel, Dispatch::Direct(workgroups), size, args)?;
         if guard.dispatches >= BATCH_LIMIT {
@@ -376,6 +383,7 @@ impl Context {
         raw: &[RawArg<'_>],
     ) -> Result<()> {
         check_aliasing(raw)?;
+        self.abort_recording()?;
 
         let mut guard = self.batch()?;
         self.record_launch(&mut guard, kernel, Dispatch::Indirect(args, offset), size, raw)?;

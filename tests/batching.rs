@@ -180,7 +180,7 @@ fn reductions_inside_long_chains() {
     let x = f32s_on(&ctx, &[1.0; 1000]);
     let mut total = 0.0f32;
     for i in 0..300 {
-        total += (&x * (i as f32)).sum().unwrap();
+        total += (&x * (i as f32)).sum().item().unwrap();
     }
     let want: f32 = (0..300).map(|i| 1000.0 * i as f32).sum();
     assert_eq!(total, want);

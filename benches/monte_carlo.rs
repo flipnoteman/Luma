@@ -408,7 +408,7 @@ fn asian_cpu(units: Range<usize>, p: &AsianParams) -> (f64, f64) {
 }
 
 fn gpu_estimate(sums: &Array<f32>, squares: &Array<f32>, n: usize) -> Estimate {
-    estimate(f64::from(sums.sum().unwrap()), f64::from(squares.sum().unwrap()), n)
+    estimate(f64::from(sums.sum().item().unwrap()), f64::from(squares.sum().item().unwrap()), n)
 }
 
 fn european(c: &mut Criterion) {

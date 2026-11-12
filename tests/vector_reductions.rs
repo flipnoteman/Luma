@@ -188,7 +188,7 @@ fn vector_reductions_work_next_to_fused_scalar_reductions() {
     let v = Array::<[f32; 4]>::from_slice_on(&ctx, &vec![[1.0, 2.0, 3.0, 4.0]; n], n).unwrap();
     let x = Array::<f32>::full_on(&ctx, n, 2.0).unwrap();
     // A fused scalar reduction and a vector reduction in one batch.
-    let lazy_sum = (&x * &x + 1.0).sum().unwrap();
+    let lazy_sum = (&x * &x + 1.0).sum().item().unwrap();
     let sum = v.sum().unwrap();
     assert_eq!(lazy_sum, 5.0 * n as f32);
     assert_eq!(sum, [n as f32, 2.0 * n as f32, 3.0 * n as f32, 4.0 * n as f32]);

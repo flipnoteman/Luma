@@ -50,14 +50,14 @@ fn random_bits_and_uniform_match_the_cpu_exactly() {
 fn uniform_and_normal_have_the_expected_moments() {
     let n = 1 << 20;
     let u = Array::<f32>::uniform(n, 7).unwrap();
-    let mean = u.mean().unwrap();
-    let var = (&u * &u).mean().unwrap() - mean * mean;
+    let mean = u.mean().item().unwrap();
+    let var = (&u * &u).mean().item().unwrap() - mean * mean;
     assert!((mean - 0.5).abs() < 2e-3, "uniform mean {mean}");
     assert!((var - 1.0 / 12.0).abs() < 2e-3, "uniform variance {var}");
 
     let z = Array::<f32>::normal(n, 7).unwrap();
-    let mean = z.mean().unwrap();
-    let var = (&z * &z).mean().unwrap() - mean * mean;
+    let mean = z.mean().item().unwrap();
+    let var = (&z * &z).mean().item().unwrap() - mean * mean;
     assert!(mean.abs() < 5e-3, "normal mean {mean}");
     assert!((var - 1.0).abs() < 1e-2, "normal variance {var}");
     assert!(z.to_vec().unwrap().iter().all(|v| v.is_finite()));
@@ -72,7 +72,7 @@ fn a_reduction_of_generators_launches_no_store_kernel() {
             let u = Array::<f32>::uniform_on(&ctx, n, 1).unwrap();
             let v = Array::<f32>::uniform_on(&ctx, n, 2).unwrap();
             let inside = (&u * &u + &v * &v).le(1.0);
-            select(&inside, 4.0, 0.0).mean().unwrap()
+            select(&inside, 4.0, 0.0).sum().item().unwrap() / n as f32
         })
         .unwrap();
     assert!((pi - std::f32::consts::PI).abs() < 1e-2, "pi estimate {pi}");
@@ -89,7 +89,7 @@ fn chunked_arrays_see_the_same_values() {
     let want = uniform_cpu(n, SEED);
     assert_eq!((&u * 1.0).to_vec().unwrap(), want);
     let sum: f64 = want.iter().map(|&v| f64::from(v)).sum();
-    assert!((f64::from(u.sum().unwrap()) - sum).abs() < sum * 1e-5);
+    assert!((f64::from(u.sum().item().unwrap()) - sum).abs() < sum * 1e-5);
     let ramp = Array::<f32>::range_on(&ctx, n, 0).unwrap() * 1.0;
     assert_eq!(ramp.to_vec().unwrap(), (0..n).map(|i| i as f32).collect::<Vec<_>>());
 }

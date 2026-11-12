@@ -2,6 +2,8 @@
 //! workgroup counts from an argument buffer that a gate kernel, run after the step, either
 //! copies from a template or zeroes once the residual is within the tolerance, so the steps after
 //! convergence dispatch no workgroups and the host waits once per block instead of once per step.
+//! The first block is [`FIRST_BLOCK`] steps and every block that ends without a stop doubles the
+//! next one, up to [`MAX_BLOCK`]; the result does not depend on the schedule.
 
 use std::sync::Arc;
 
@@ -14,14 +16,26 @@ use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d, workgroups_1d};
 
 use super::launch::{len_u32, params, pin_inputs, store_args};
-use super::program::{flatten, flatten_inner, Fused, Tail, ELEMENT_BYTES};
+use super::program::{flatten, flatten_inner, Fused, Tail};
 use super::{ElemTy, Node};
 
-/// Steps recorded between two waits of the host.
-const UNTIL_BLOCK: usize = 16;
+/// Steps of the first block recorded before the host waits.
+pub(crate) const FIRST_BLOCK: usize = 16;
+
+/// Largest block of the growing schedule.
+pub(crate) const MAX_BLOCK: usize = 128;
+
+/// Steps of the block after one of `current` steps that ended without a stop: `fixed` if given,
+/// else double, up to `MAX_BLOCK`.
+pub(crate) fn next_block(current: usize, fixed: Option<usize>) -> usize {
+    fixed.unwrap_or_else(|| (current * 2).min(MAX_BLOCK))
+}
 
 /// Bytes of one word of the argument buffers.
 const WORD: u64 = 4;
+
+/// Bytes of one element of the `f32` states this machinery handles.
+const ELEMENT_BYTES: u64 = 4;
 
 /// Runs `first` (one step from `probe`, an alias of `from`) repeatedly, each time from the state
 /// the last step wrote, until the largest `|next - prev|` (`residual`, computed from `probe`
@@ -54,7 +68,7 @@ pub(crate) fn run_until(
     let one_buffer = |fused: &Fused| {
         fused.key.subs.is_empty()
             && fused.inputs.iter().all(|input| input.segments() == 1)
-            && fused.inputs.len() < ctx.jit().max_inputs
+            && fused.inputs.len() < ctx.jit().max_inputs()
     };
     let stores_f32 = body
         .key
@@ -68,6 +82,8 @@ pub(crate) fn run_until(
         || !stores_f32
         || !reads_f32
         || !one_buffer(&body)
+        || !body.key.narrow()
+        || !check.key.narrow()
         || !one_buffer(&check)
     {
         return None;
@@ -116,7 +132,7 @@ fn run(
     let words = len_u32(template.len())?;
     let args_bytes = u64::from(words) * WORD;
     let indirect = STORAGE_USAGE | BufferUsages::INDIRECT;
-    let mut owned = Vec::with_capacity(UNTIL_BLOCK + 3);
+    let mut owned = Vec::new();
     let mut take = |bytes: u64, usage: BufferUsages| -> Result<wgpu::Buffer, LumaError> {
         let buffer = ctx.alloc_buffer(bytes, usage)?;
         owned.push(buffer.clone());
@@ -126,15 +142,18 @@ fn run(
         let tmpl = take(args_bytes, STORAGE_USAGE)?;
         ctx.upload(&tmpl, bytemuck::cast_slice(&template))?;
         let state = take(2 * WORD, STORAGE_USAGE)?;
-        let steps: Vec<wgpu::Buffer> =
-            (0..=UNTIL_BLOCK).map(|_| take(args_bytes, indirect)).collect::<Result<_, _>>()?;
+        let mut steps: Vec<wgpu::Buffer> = Vec::new();
         let ping = [Arc::new(Storage::new(ctx, len, ELEMENT_BYTES as usize)), Arc::new(Storage::new(ctx, len, ELEMENT_BYTES as usize))];
         let body_state = body.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
         let check_state = check.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
 
         let mut base = 0;
+        let mut block = FIRST_BLOCK;
         loop {
-            let in_block = UNTIL_BLOCK.min(max_steps - base);
+            let in_block = block.min(max_steps - base);
+            while steps.len() <= in_block {
+                steps.push(take(args_bytes, indirect)?);
+            }
             ctx.upload(&state, bytemuck::cast_slice(&[0u32, 0]))?;
             ctx.upload(&steps[0], bytemuck::cast_slice(&template))?;
             for k in 0..in_block {
@@ -199,6 +218,7 @@ fn run(
                 return Err(Failure::New(LumaError::Gpu("iterate_until state is missing".into())));
             };
             base += in_block;
+            block = next_block(in_block, None);
             if done != 0 || base >= max_steps {
                 let steps_run = if done != 0 { count as usize } else { base };
                 return Ok(Arc::clone(&ping[(steps_run - 1) % 2]));

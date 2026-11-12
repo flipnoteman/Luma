@@ -154,12 +154,12 @@ fn reductions_of_lazy_expressions() {
     let x = f32s_on(&ctx, &xs);
     let y = f32s_on(&ctx, &ys);
 
-    let dot = (&x * &y).sum().unwrap();
+    let dot = (&x * &y).sum().item().unwrap();
     let want: f64 = xs.iter().zip(&ys).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
     assert!((f64::from(dot) - want).abs() < 1e-2, "{dot} vs {want}");
 
     let lazy = &x * 2.0 + &y;
-    let (min, max) = (lazy.min().unwrap(), lazy.max().unwrap());
+    let (min, max) = (lazy.min().item().unwrap(), lazy.max().item().unwrap());
     let want_min = xs.iter().zip(&ys).map(|(&a, &b)| a * 2.0 + b).fold(f32::INFINITY, f32::min);
     let want_max = xs.iter().zip(&ys).map(|(&a, &b)| a * 2.0 + b).fold(f32::NEG_INFINITY, f32::max);
     assert_eq!((min, max), (want_min, want_max));
@@ -167,7 +167,7 @@ fn reductions_of_lazy_expressions() {
     let want: Vec<f32> = xs.iter().zip(&ys).map(|(&a, &b)| a * 2.0 + b).collect();
     assert_close(&lazy.to_vec().unwrap(), &want, 1e-6, 1e-6);
 
-    let positives = x.gt(0.0).sum().unwrap();
+    let positives = x.gt(0.0).sum().item().unwrap();
     assert_eq!(positives as usize, xs.iter().filter(|&&v| v > 0.0).count());
 }
 
@@ -195,8 +195,8 @@ fn a_faulty_operation_inside_a_lazy_chain_reports_its_own_location() {
     }
     assert_eq!(later.error().unwrap().location().unwrap().line(), line);
     // Reductions and eval report it too.
-    assert!(sum_of_later.sum().is_err());
-    assert!(sum_of_later.norm().is_err());
+    assert!(sum_of_later.sum().item().is_err());
+    assert!(sum_of_later.norm().item().is_err());
     assert!(sum_of_later.eval().is_err());
     // The healthy part is unharmed, and was never poisoned by the later failure.
     let want: Vec<f32> = [1.0f32, 2.0, 3.0].iter().map(|v| (v * 2.0).sqrt() + 1.0).collect();
@@ -596,7 +596,7 @@ fn select_scalar_branch_in_iterate_matches_the_loop() {
         for d in [[-1isize, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]] {
             n = n + u.shift(d);
         }
-        select(&n.eq(3.0), 1.0, &select(&n.eq(2.0), u, 0.0))
+        select(&n.eq(3.0), 1.0, select(&n.eq(2.0), u, 0.0))
     };
     let got = u0.iterate(9, step).to_vec().unwrap();
     let mut looped = Array::from_slice_on(&ctx, &cells, [w, h]).unwrap();

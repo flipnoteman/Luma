@@ -21,10 +21,13 @@
 //! # Where fusion stops
 //!
 //! * An expression holds at most [`JitState::max_nodes`] operations (default
-//!   [`DEFAULT_MAX_NODES`], `LUMA_FUSION_MAX_NODES` overrides it) and as many distinct input
-//!   buffers as the device can bind. A new node that would exceed either evaluates its biggest
-//!   operand first, which splits long chains into several kernels. The biggest operand is not
-//!   evaluated alone if other live arrays *of the same length* share pending operations with
+//!   [`DEFAULT_MAX_NODES`] = 1024, at most `MAX_NODES_LIMIT` = 4096; `LUMA_FUSION_MAX_NODES`
+//!   overrides the default and [`fusion_limit`] a scope), nests at most `MAX_DEPTH` = 256 levels
+//!   (the flattening walk is recursive, so this bounds its stack) and reads as many distinct input
+//!   buffers as the device can bind. A new node that would exceed one of them evaluates its
+//!   biggest (for the depth: its deepest) operand first, which splits long chains into several
+//!   kernels. Profiles list every such cut with its reason ([`FusionSplit`]).
+//!   The biggest operand is not evaluated alone if other live arrays *of the same length* share pending operations with
 //!   it (they read nodes that its expression contains): those are computed in the same
 //!   multi-output kernel, as far as the limits allow. Arrays that advance in lock step (`x`, `y`,
 //!   `count` of an iteration) then split into a few multi-output kernels at the limit instead of
@@ -32,6 +35,27 @@
 //!   that share nothing stay lazy, so a single chain, or a chain beside unrelated arrays,
 //!   splits as before. Only if the expression is still too big afterwards is the next biggest
 //!   operand evaluated.
+//! * A program that would keep more values live at once than `Tuning::max_live` (register
+//!   pressure; `LUMA_FUSION_MAX_LIVE`) is cut when its single root is evaluated: the values
+//!   crossing the point in its middle half where fewest are live are evaluated first, in one
+//!   multi-output kernel, and the rest is flattened again (up to four times).
+//! * Operations that are the same (same operation, length and operands, scalars by value) are one
+//!   node: `create` looks them up in a table of weak references that is dropped whenever a buffer
+//!   is written (`JitState::note_write`), and skips nodes computed inside another kernel. A
+//!   fused kernel computes a shared node once.
+//! * A view or gather (slice, pad, flip, transpose, `take`, broadcast) of a pending expression
+//!   that fits one buffer reads it lazily, as a sub-program computed at the read index, whatever
+//!   its size and however often it is read: arithmetic costs far less than writing and reading
+//!   a buffer. The kernel computes every (expression, index) pair once: nested views are
+//!   written out at every index they are read at, a view of a view is one view, and equal
+//!   instructions are one (see [`inline`]). A kernel that would grow past
+//!   `Tuning::max_inlined` instructions (`LUMA_FUSION_MAX_INLINED`) is cut by evaluating the
+//!   sub-program whose repeats cost the most ([`SplitReason::Inlined`]), and expressions over
+//!   arrays split over several buffers are read from their evaluated buffers. Circular shifts
+//!   keep their own rule: a small expression is recomputed at up to two offsets or staged in
+//!   workgroup memory, the third reader evaluates it (with the live arrays that share work with
+//!   it, see `JitState::evaluate_alongside`). [`Array::cache`](crate::Array::cache) evaluates on
+//!   request.
 //! * When an expression is evaluated, a pending node inside it that another pending, live
 //!   operation outside the expression also reads is evaluated on its own first, instead of
 //!   being recomputed in both kernels. Sharing within one expression is free: a shared node is
@@ -47,6 +71,16 @@
 //! not recycled while a lazy array still needs it. Dropping a lazy array that was never used
 //! costs nothing.
 //!
+//! # Assigning into a pending array
+//!
+//! `assign` through a slice, flip or transpose of an array that is still an expression needs no
+//! buffer: the arrays holding the expression are made to denote `select(in_region, rhs, old)`
+//! from then on (see [`supersede`] and `Array::assign_lazy`), so a padded state with its ghost
+//! cells assigned stays one expression that fuses into the kernels reading it. `old` is the
+//! replaced node itself, which keeps its value for expressions recorded before the write. The
+//! replacement is owned by the claims arrays hold on a node ([`Held`]), never by the node, as the
+//! right-hand side typically reads the node it replaces.
+//!
 //! # Writing in place
 //!
 //! A store kernel whose output replaces an input that nothing else holds (a dying temporary or
@@ -60,11 +94,15 @@
 //! the newest call become *loop leaves* that stand for the step applied to the previous ones, so
 //! the pending graph stays one step deep and the postponed steps run at once (see [`looped`]).
 
+pub(crate) mod assign;
 mod codegen;
+mod inline;
 mod launch;
 mod looped;
+mod operator;
 mod program;
 mod readers;
+mod replay;
 pub(crate) mod speculate;
 mod stencil;
 mod until;
@@ -79,17 +117,22 @@ use crate::array::{Failure, Storage};
 use crate::builtin::{BinOp, CmpOp, UnOp};
 use crate::context::Context;
 use crate::error::{LumaError, Result};
-use crate::gpu::hash::FxMap;
+use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::lock;
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
+use crate::profile::{FusionSplit, SplitReason};
 
+use inline::{inline, Verdict};
 use looped::LoopPlan;
+use program::Instr;
 
-pub(crate) use launch::{evaluate, evaluate_group, evaluate_into, reduce_first_pass, run_loop};
+pub(crate) use launch::{check_finite, evaluate, evaluate_group, evaluate_into, force_group, reduce_first_pass, run_loop};
+pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
+pub(crate) use replay::{force, Plan, Stepper, Trace};
 pub(crate) use stencil::plan as stencil_plan;
-pub(crate) use until::run_until;
+pub(crate) use until::{next_block, run_until, FIRST_BLOCK};
 
 /// Length of the requested list at which entries of dropped or computed nodes are pruned.
 const REQUESTED_PRUNE_AT: usize = 256;
@@ -103,22 +146,60 @@ struct RequestList {
 }
 
 /// Most operations one fused kernel contains unless configured otherwise.
-pub(crate) const DEFAULT_MAX_NODES: usize = 128;
-/// Upper bound of the configurable limit (the expression is walked recursively).
-const MAX_NODES_LIMIT: usize = 256;
+pub(crate) const DEFAULT_MAX_NODES: usize = 1024;
+/// Upper bound of the configurable limit.
+const MAX_NODES_LIMIT: usize = 4096;
+/// Deepest nesting of one fused expression: the expression is walked recursively, so this bounds
+/// the stack the walk needs whatever the node limit.
+const MAX_DEPTH: u16 = 256;
 /// Most input buffers of one fused kernel, whatever the device allows.
-const MAX_INPUTS: usize = 16;
+const MAX_INPUTS: usize = 256;
 /// Environment variable overriding [`DEFAULT_MAX_NODES`] for new contexts. `1` makes every
 /// operation its own kernel.
 const MAX_NODES_ENV: &str = "LUMA_FUSION_MAX_NODES";
 /// Set to `off` to disable speculation at readbacks (see [`speculate`]).
 const SPECULATE_ENV: &str = "LUMA_SPECULATE";
 
+thread_local! {
+    /// The node limit [`fusion_limit`] set on this thread.
+    static FUSION_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the fusion limit of lazy operations created on this thread set to `max_nodes`
+/// operations per kernel (instead of the context's, 1024 unless `LUMA_FUSION_MAX_NODES`
+/// changes it), restoring the previous limit afterwards. The value is clamped to `1..=4096`;
+/// `1` makes every operation its own kernel. Only the limit at the time an operation is
+/// *written* matters, so the expressions built inside `f` keep it when they are evaluated later.
+///
+/// ```
+/// # fn main() -> luma::Result<()> {
+/// let ctx = luma::Context::new()?;
+/// let x = luma::Array::<f32>::from_slice_on(&ctx, &[1.0; 8], 8)?;
+/// // Every operation is a kernel of its own.
+/// let y = luma::fusion_limit(1, || ((&x + 1.0) * 2.0).sqrt());
+/// assert_eq!(y.to_vec()?, vec![(4.0f32).sqrt(); 8]);
+/// # Ok(()) }
+/// ```
+pub fn fusion_limit<R>(max_nodes: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FUSION_LIMIT.with(|limit| limit.set(self.0));
+        }
+    }
+    let _restore = Restore(FUSION_LIMIT.with(|limit| limit.replace(Some(max_nodes))));
+    f()
+}
+
 /// Element type of a lazy operation's operands and results.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ElemTy {
     F32,
     U32,
+    /// 64-bit float (needs `wgpu::Features::SHADER_F64`).
+    F64,
+    /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
+    Df32,
 }
 
 impl ElemTy {
@@ -126,6 +207,8 @@ impl ElemTy {
         match T::wgsl_type() {
             "f32" => Ok(ElemTy::F32),
             "u32" => Ok(ElemTy::U32),
+            "f64" => Ok(ElemTy::F64),
+            "vec2<f32>" => Ok(ElemTy::Df32),
             other => Err(LumaError::InvalidShape(format!("Unsupported element type {other}"))),
         }
     }
@@ -134,6 +217,35 @@ impl ElemTy {
         match self {
             ElemTy::F32 => "f32",
             ElemTy::U32 => "u32",
+            ElemTy::F64 => "f64",
+            ElemTy::Df32 => "vec2<f32>",
+        }
+    }
+
+    /// Bytes per element.
+    pub(crate) fn bytes(self) -> u64 {
+        match self {
+            ElemTy::F32 | ElemTy::U32 => 4,
+            ElemTy::F64 | ElemTy::Df32 => 8,
+        }
+    }
+
+    /// How many `f32` uniform slots a scalar of this type takes (see `Flattener::operand`).
+    pub(crate) fn slots(self) -> usize {
+        match self {
+            ElemTy::F32 | ElemTy::U32 => 1,
+            ElemTy::Df32 => 2,
+            ElemTy::F64 => 3,
+        }
+    }
+
+    /// The name users know the type by, for error messages.
+    pub(crate) fn display(self) -> &'static str {
+        match self {
+            ElemTy::F32 => "f32",
+            ElemTy::U32 => "u32",
+            ElemTy::F64 => "f64",
+            ElemTy::Df32 => "Df32",
         }
     }
 }
@@ -153,6 +265,8 @@ pub(crate) enum OpKind {
     Select,
     /// Circular shift of a materialized array; operand 0 is its buffer (see [`ShiftKind`]).
     Shift(ShiftKind),
+    /// Converts operand 0 (of the op's type) to the given type.
+    Cast(ElemTy),
     /// A value computed from the element's index alone; no array operands (see [`Gen`]).
     Generate(Gen),
 }
@@ -175,22 +289,160 @@ pub(crate) enum Gen {
 /// Which element a shift reads for element `i`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ShiftKind {
-    /// `(i - s) mod n` over the flat array; `s` (in `0..n`) is the scalar operand 1.
+    /// `(i - s) mod n` over the flat array; `s` (in `0..n`) is the scalar operand 1 and `n` (the
+    /// array length) the scalar operand 2.
     Linear,
     /// Every dimension of an array of `dims` shifted circularly by `shifts` (each in
     /// `0..dim`). Part of the kernel's key, so the index math works on constants.
     Dims { dims: [u32; 4], shifts: [u32; 4] },
+    /// A [`ViewMap`] of the source with `edge` handling coordinates outside it. Operand 1 is
+    /// the fill value of [`Edge::Fill`].
+    View { map: ViewMap, edge: Edge },
+    /// Element `i` reads element `min(indices[i], len - 1)` of the flat source of `len`
+    /// elements; operand 1 is the `u32` index array.
+    Take { len: u32 },
+}
+
+/// One source axis of a view: source coordinate `start + step * o`, `o` = output coordinate along `from`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct AxisMap {
+    pub(crate) from: u8,
+    pub(crate) start: i32,
+    pub(crate) step: i32,
+}
+
+/// Reads an array of dims `src` as an array of dims `out`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ViewMap {
+    pub(crate) src: [u32; 4],
+    pub(crate) out: [u32; 4],
+    pub(crate) axes: [AxisMap; 4],
+}
+
+/// What a view reads where the source coordinate leaves `0..src[axis]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Edge {
+    /// Never out of range (checked when the view is built).
+    None,
+    /// The value of scalar operand 1.
+    Fill,
+    /// The nearest element.
+    Clamp,
+    /// Symmetric about the boundary face: `-1 -> 0`, `-2 -> 1`, `n -> n - 1`.
+    Mirror,
+    /// Circular.
+    Wrap,
+}
+
+impl ViewMap {
+    /// The view that reads an array of `dims` as itself.
+    pub(crate) fn identity(dims: [u32; 4]) -> ViewMap {
+        let mut axes = [AxisMap { from: 0, start: 0, step: 1 }; 4];
+        for (a, axis) in axes.iter_mut().enumerate() {
+            axis.from = a as u8;
+        }
+        ViewMap { src: dims, out: dims, axes }
+    }
+
+    /// Elements of the output.
+    pub(crate) fn out_len(&self) -> usize {
+        self.out.iter().map(|&d| d as usize).product()
+    }
+
+    /// The source coordinates `start` and `start + step * (out - 1)` of axis `a`, unclipped.
+    pub(crate) fn ends(&self, a: usize) -> (i64, i64) {
+        let axis = self.axes[a];
+        let first = i64::from(axis.start);
+        let last = first + i64::from(axis.step) * (i64::from(self.out[axis.from as usize]) - 1);
+        (first, last)
+    }
+
+    /// Whether every coordinate read lies inside the source.
+    pub(crate) fn in_range(&self) -> bool {
+        (0..4).all(|a| {
+            let (first, last) = self.ends(a);
+            let n = i64::from(self.src[a]);
+            (0..n).contains(&first) && (0..n).contains(&last)
+        })
+    }
+
+    /// Whether distinct output elements read distinct source elements.
+    pub(crate) fn is_injective(&self) -> bool {
+        let mut seen = [false; 4];
+        for axis in &self.axes {
+            match seen.get_mut(axis.from as usize) {
+                Some(slot) if !*slot && axis.step != 0 => *slot = true,
+                _ => return false,
+            }
+        }
+        self.in_range()
+    }
+
+    /// `outer` applied to the output of this view (`outer.src == self.out`).
+    pub(crate) fn then(&self, outer: &ViewMap) -> ViewMap {
+        let mut axes = self.axes;
+        for axis in &mut axes {
+            let b = axis.from as usize;
+            let o = outer.axes[b];
+            let (start, step) = (i64::from(axis.start), i64::from(axis.step));
+            *axis = AxisMap {
+                from: o.from,
+                start: (start + step * i64::from(o.start)) as i32,
+                step: (step * i64::from(o.step)) as i32,
+            };
+        }
+        ViewMap { src: self.src, out: outer.out, axes }
+    }
+
+    /// Per source axis the inclusive range of coordinates read.
+    pub(crate) fn src_box(&self, edge: Edge) -> [(u32, u32); 4] {
+        self.src_box_in(edge, self.out.map(|d| (0, d.saturating_sub(1))))
+    }
+
+    /// [`ViewMap::src_box`] for the output coordinates in `region` (inclusive, per output axis) only.
+    /// A superset of what is read where the edge folds coordinates back in.
+    pub(crate) fn src_box_in(&self, edge: Edge, region: [(u32, u32); 4]) -> [(u32, u32); 4] {
+        let mut out = [(0, 0); 4];
+        for (a, slot) in out.iter_mut().enumerate() {
+            let axis = self.axes[a];
+            let (o_lo, o_hi) = region[axis.from as usize];
+            let first = i64::from(axis.start) + i64::from(axis.step) * i64::from(o_lo);
+            let last = i64::from(axis.start) + i64::from(axis.step) * i64::from(o_hi);
+            let (lo, hi) = (first.min(last), first.max(last));
+            let n = i64::from(self.src[a]);
+            let top = n.max(1) - 1;
+            let (lo, hi) = match edge {
+                Edge::None => (lo, hi),
+                Edge::Clamp | Edge::Fill => (lo.clamp(0, top), hi.clamp(0, top)),
+                Edge::Mirror | Edge::Wrap if lo >= 0 && hi < n => (lo, hi),
+                Edge::Mirror | Edge::Wrap => (0, top),
+            };
+            *slot = (lo.clamp(0, top) as u32, hi.clamp(0, top) as u32);
+        }
+        out
+    }
+
+    /// Whether every extent, offset and step fits the `i32` arithmetic of the generated index math.
+    pub(crate) fn fits(&self) -> bool {
+        let limit = i64::from(i32::MAX);
+        let dims_ok = self.src.iter().chain(&self.out).all(|&d| i64::from(d) <= limit);
+        dims_ok
+            && self.axes.iter().all(|axis| {
+                let span = i64::from(axis.step) * i64::from(self.out[axis.from as usize]);
+                i64::from(axis.start).abs() <= limit && span.abs() <= limit && (i64::from(axis.start) + span).abs() <= limit
+            })
+    }
 }
 
 impl OpKind {
     pub(crate) fn arity(self) -> usize {
         match self {
-            OpKind::Unary(_) | OpKind::Shift(ShiftKind::Dims { .. }) => 1,
+            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
             OpKind::Binary(_)
             | OpKind::Compare(_)
             | OpKind::Powf
-            | OpKind::Shift(ShiftKind::Linear) => 2,
-            OpKind::Clamp | OpKind::Select => 3,
+            | OpKind::Shift(ShiftKind::View { edge: Edge::Fill, .. } | ShiftKind::Take { .. }) => 2,
+            OpKind::Shift(ShiftKind::Linear) | OpKind::Clamp | OpKind::Select => 3,
             OpKind::Generate(Gen::Range { .. }) => 0,
             OpKind::Generate(_) => 2,
         }
@@ -198,20 +450,42 @@ impl OpKind {
 }
 
 /// An operation together with the element type of its operands.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Op {
     pub(crate) kind: OpKind,
     pub(crate) ty: ElemTy,
+    /// A hash of `kind` and `ty`, made once: operations are hashed for every node, program
+    /// and kernel lookup, and a view makes a long list of words to hash.
+    fingerprint: u64,
+}
+
+impl PartialEq for Op {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint && self.ty == other.ty && self.kind == other.kind
+    }
+}
+
+impl Eq for Op {}
+
+impl std::hash::Hash for Op {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.fingerprint);
+    }
 }
 
 impl Op {
     pub(crate) fn new(kind: OpKind, ty: ElemTy) -> Self {
-        Op { kind, ty }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = FxHasher::default();
+        kind.hash(&mut hasher);
+        ty.hash(&mut hasher);
+        Op { kind, ty, fingerprint: hasher.finish() }
     }
 
     pub(crate) fn out_ty(self) -> ElemTy {
         match self.kind {
             OpKind::Compare(_) => ElemTy::U32,
+            OpKind::Cast(to) => to,
             _ => self.ty,
         }
     }
@@ -219,30 +493,56 @@ impl Op {
     /// The element type operand `index` must have.
     pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
         match (self.kind, index) {
-            (OpKind::Select, 0) | (OpKind::Shift(_), 1) => ElemTy::U32,
+            (OpKind::Shift(ShiftKind::View { .. }), 1) => self.ty,
+            (OpKind::Select, 0) | (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
             (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal), _) => ElemTy::U32,
             _ => self.ty,
         }
     }
 }
 
-/// A scalar operand: a uniform of the fused kernel, never part of its cache key.
+/// A scalar operand: a uniform of the fused kernel, never part of its cache key. `bits` is the
+/// value's bit pattern: the low 32 bits for a 4-byte type, `f64::to_bits` for `F64`, `hi` in the
+/// low and `lo` in the high word for `Df32`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Scalar {
     pub(crate) ty: ElemTy,
-    pub(crate) bits: u32,
+    pub(crate) bits: u64,
 }
 
 impl Scalar {
     pub(crate) fn f32(value: f32) -> Self {
-        Scalar { ty: ElemTy::F32, bits: value.to_bits() }
+        Scalar { ty: ElemTy::F32, bits: u64::from(value.to_bits()) }
+    }
+
+    pub(crate) fn u32(value: u32) -> Self {
+        Scalar { ty: ElemTy::U32, bits: u64::from(value) }
     }
 
     pub(crate) fn of<T: ScalarType>(value: T) -> std::result::Result<Self, LumaError> {
         let ty = ElemTy::of::<T>()?;
-        let bits = bytemuck::try_pod_read_unaligned::<u32>(bytemuck::bytes_of(&value))
-            .map_err(|e| LumaError::InvalidShape(format!("Scalar is not 32 bits wide: {e}")))?;
+        let bits = match ty.bytes() {
+            4 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value))),
+            _ => bytemuck::pod_read_unaligned::<u64>(bytemuck::bytes_of(&value)),
+        };
         Ok(Scalar { ty, bits })
+    }
+
+    /// The `f32` uniform slots (as bit patterns) this scalar occupies in a program: one for a
+    /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32`.
+    pub(crate) fn words(self) -> [u32; 3] {
+        match self.ty {
+            ElemTy::F32 | ElemTy::U32 => [self.bits as u32, 0, 0],
+            ElemTy::Df32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
+            ElemTy::F64 => {
+                let v = f64::from_bits(self.bits);
+                let a = v as f32;
+                let r = v - f64::from(a);
+                let b = r as f32;
+                let c = (r - f64::from(b)) as f32;
+                [a.to_bits(), b.to_bits(), c.to_bits()]
+            }
+        }
     }
 }
 
@@ -285,11 +585,18 @@ pub(crate) struct Node {
     location: &'static Location<'static>,
     /// Unique per node.
     id: u64,
-    /// Ids of the distinct nodes in the expression below this one (the first `below_len`),
-    /// followed by the ids of the distinct buffers the expression reads, each part sorted. Upper
-    /// bounds once parts of the expression have been evaluated. One allocation for both.
+    /// The ids of the distinct nodes in the expression below this one (`below_len` of them) as a
+    /// bit set over `below_base..` (`below_words` words), or a sorted list of `below_words` ids
+    /// if they are spread too widely for that (`below_sparse`); followed by the ids of the
+    /// distinct buffers the expression reads, sorted. Upper bounds once parts of the expression
+    /// have been evaluated (`create` counts the buffers exactly by walking the expression
+    /// whenever the bound is over the device's limit). One allocation for both.
     ids: Box<[u64]>,
     below_len: usize,
+    /// The id that bit 0 of the first word stands for (a multiple of 64).
+    below_base: u64,
+    below_words: u32,
+    below_sparse: bool,
     /// Number of nodes this one is an operand of (a pre-filter for sharing checks).
     consumers: AtomicU32,
     /// Set once the node's value was computed inside another node's kernel (or a reduction).
@@ -298,6 +605,18 @@ pub(crate) struct Node {
     /// Levels of shifted lazy expressions nested in the expression (0: none; see
     /// [`recompute_shifted`]).
     shift_depth: u8,
+    /// Levels of the expression below this node: 1 + the greatest of its operands' (0 for none),
+    /// shifted operands included. Bounded by [`MAX_DEPTH`].
+    depth: u16,
+    /// How many shifts, views and gathers read this node lazily, as a sub-program (see
+    /// [`recompute_shifted`]).
+    shifted_reads: AtomicU32,
+    /// How many array handles ([`Held`]) are on this node. A held node is never handed out again
+    /// by the hash-consing table: a write through one array must not show in another.
+    handles: AtomicU32,
+    /// What the arrays holding this node share (see [`Link`]); weak, so that the graph does not
+    /// own what replaced the node: the node that took over may read this one.
+    link: OnceLock<Weak<Link>>,
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
     /// Whether the node is in [`JitState::requested`].
@@ -306,6 +625,102 @@ pub(crate) struct Node {
     /// is output `j` of the plan, which runs all the steps at once, and the node released its
     /// own operands.
     looped: OnceLock<(Arc<LoopPlan>, u32)>,
+    /// The thread that created the node. The sweeps that evaluate "every lazy array" (`eval`,
+    /// `flush`, `sync`, evaluating alongside) only take the nodes of the calling thread: another
+    /// thread may be flattening the expression this very moment, or have a recording under way
+    /// that must only capture its own launches. A node is still evaluated by whoever uses it.
+    thread: std::thread::ThreadId,
+}
+
+thread_local! {
+    static THREAD: std::thread::ThreadId = std::thread::current().id();
+}
+
+/// The calling thread, without the reference count of `thread::current`.
+fn current_thread() -> std::thread::ThreadId {
+    THREAD.with(|thread| *thread)
+}
+
+/// An array's claim on a node (see [`Node::handles`]).
+pub(crate) struct Held {
+    node: Arc<Node>,
+    link: Arc<Link>,
+}
+
+/// What the claims on one node share: the node that replaced it as the value of the arrays
+/// holding it, once an assignment did (see [`supersede`]). Kept by the claims, not by the node:
+/// expressions recorded earlier keep reading the node and its old value, and the node that took
+/// over may read them, so the graph owning the replacement would be a cycle.
+#[derive(Default)]
+struct Link {
+    /// Held, so the node that took over is never handed out again to another array.
+    next: OnceLock<Held>,
+}
+
+impl Held {
+    pub(crate) fn new(node: Arc<Node>) -> Self {
+        node.handles.fetch_add(1, Ordering::Relaxed);
+        let link = match node.link.get().and_then(Weak::upgrade) {
+            Some(link) => link,
+            None => {
+                let link = Arc::new(Link::default());
+                let _ = node.link.set(Arc::downgrade(&link));
+                link
+            }
+        };
+        Held { node, link }
+    }
+
+    /// Another claim on the same node (and on whatever replaces it).
+    pub(crate) fn share(&self) -> Held {
+        self.node.handles.fetch_add(1, Ordering::Relaxed);
+        Held { node: Arc::clone(&self.node), link: Arc::clone(&self.link) }
+    }
+
+    /// The claim on the node that holds the value of the arrays that were created holding this
+    /// one: the end of the chain of [`supersede`]s (this claim if the node was never replaced).
+    pub(crate) fn end(&self) -> &Held {
+        let mut held = self;
+        while let Some(next) = held.link.next.get() {
+            held = next;
+        }
+        held
+    }
+
+    /// The node that holds the value of the arrays that were created holding this one.
+    pub(crate) fn latest(&self) -> &Arc<Node> {
+        &self.end().node
+    }
+
+    /// Whether an assignment replaced the node this claim is on.
+    pub(crate) fn is_superseded(&self) -> bool {
+        self.link.next.get().is_some()
+    }
+
+    /// Whether another array holds a claim on the node too.
+    pub(crate) fn is_shared(&self) -> bool {
+        self.node.handles.load(Ordering::Relaxed) > 1
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.node.handles.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for Held {
+    type Target = Arc<Node>;
+
+    fn deref(&self) -> &Arc<Node> {
+        &self.node
+    }
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.node.fmt(f)
+    }
 }
 
 impl std::fmt::Debug for Node {
@@ -321,22 +736,89 @@ impl std::fmt::Debug for Node {
 impl Node {
     /// Operations in the expression behind this node, itself included.
     fn size(&self) -> usize {
-        if self.looped.get().is_some() { 1 } else { self.below_len + 1 }
+        self.below_len() + 1
     }
 
-    /// Ids of the distinct nodes in the expression below this one, sorted.
-    fn below(&self) -> &[u64] {
+    /// Distinct nodes in the expression below this one.
+    fn below_len(&self) -> usize {
+        if self.looped.get().is_some() { 0 } else { self.below_len }
+    }
+
+    /// The part of `ids` that holds the nodes below this one.
+    fn below_part(&self) -> &[u64] {
         if self.looped.get().is_some() {
             return &[];
         }
-        self.ids.get(..self.below_len).unwrap_or(&[])
+        self.ids.get(..self.below_words as usize).unwrap_or(&[])
+    }
+
+    /// The first and last id that can be below this node (a superset), if there are any.
+    fn below_span(&self) -> Option<(u64, u64)> {
+        let part = self.below_part();
+        if self.below_sparse {
+            return Some((*part.first()?, *part.last()?));
+        }
+        (!part.is_empty()).then(|| (self.below_base, self.below_base + 64 * part.len() as u64 - 1))
+    }
+
+    /// Whether node `id` is below this one.
+    pub(crate) fn below_contains(&self, id: u64) -> bool {
+        let part = self.below_part();
+        if self.below_sparse {
+            return part.binary_search(&id).is_ok();
+        }
+        let Some(offset) = id.checked_sub(self.below_base) else { return false };
+        part.get((offset >> 6) as usize).is_some_and(|word| word >> (offset & 63) & 1 == 1)
+    }
+
+    /// Calls `f` with the ids of the distinct nodes below this one, ascending, until it says yes.
+    fn below_any(&self, mut f: impl FnMut(u64) -> bool) -> bool {
+        let part = self.below_part();
+        if self.below_sparse {
+            return part.iter().any(|&id| f(id));
+        }
+        for (k, &word) in part.iter().enumerate() {
+            let (mut bits, first) = (word, self.below_base + 64 * k as u64);
+            while bits != 0 {
+                if f(first + u64::from(bits.trailing_zeros())) {
+                    return true;
+                }
+                bits &= bits - 1;
+            }
+        }
+        false
+    }
+
+    /// The ids of the distinct nodes below this one, sorted.
+    fn below_vec(&self) -> Vec<u64> {
+        let mut ids = Vec::with_capacity(self.below_len());
+        self.below_any(|id| {
+            ids.push(id);
+            false
+        });
+        ids
+    }
+
+    /// Adds the nodes below this one to `set`, whose bit 0 stands for id `base`.
+    fn mark_below(&self, set: &mut [u64], base: u64) {
+        let part = self.below_part();
+        if self.below_sparse {
+            for &id in part {
+                mark(set, base, id);
+            }
+            return;
+        }
+        let at = ((self.below_base - base) >> 6) as usize;
+        for (word, &bits) in set.iter_mut().skip(at).zip(part) {
+            *word |= bits;
+        }
     }
 
     /// Ids of the distinct buffers the expression reads, sorted.
     fn inputs(&self) -> &[u64] {
         match self.looped.get() {
             Some((plan, _)) => &plan.input_ids,
-            None => self.ids.get(self.below_len..).unwrap_or(&[]),
+            None => self.ids.get(self.below_words as usize..).unwrap_or(&[]),
         }
     }
 
@@ -344,6 +826,12 @@ impl Node {
     /// of a loop leaf evaluates its inputs, so it has none.
     fn shift_depth(&self) -> u8 {
         if self.looped.get().is_some() { 0 } else { self.shift_depth }
+    }
+
+    /// Levels of the expression below this node. The plan of a loop leaf evaluates its inputs,
+    /// so it has none.
+    fn depth(&self) -> u16 {
+        if self.looped.get().is_some() { 0 } else { self.depth }
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -382,6 +870,7 @@ impl Node {
     }
 
     fn compute(self: &Arc<Self>) -> NodeResult {
+        let _computing = Computing::enter(self.id);
         let args = lock(&self.args).take();
         let outcome = match args {
             Some(args) => evaluate(self, args).map(Arc::new),
@@ -392,6 +881,9 @@ impl Node {
         };
         match outcome {
             Ok(storage) => {
+                if let Err(error) = check_finite(&self.ctx, &storage, self.op.out_ty()) {
+                    return Err(Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) }));
+                }
                 storage.set_producer(self.id);
                 storage.readers.absorb(&self.readers);
                 Ok(storage)
@@ -403,6 +895,15 @@ impl Node {
                 location: self.location,
                 source: Arc::new(error),
             })),
+        }
+    }
+
+    /// Records that the node's value, computed inside a kernel with several outputs, failed a
+    /// check: the node's result is `error`, reported as an error of this operation.
+    fn fail(&self, error: LumaError) {
+        let failed = Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) });
+        if self.result.set(Err(failed)).is_ok() {
+            lock(&self.args).take();
         }
     }
 
@@ -439,13 +940,18 @@ impl Node {
 
     /// Whether another pending node outside `group` (node pointers) reads this node. Evaluating
     /// this node separately then beats recomputing it in every consumer's kernel.
-    pub(crate) fn has_consumer_outside(&self, group: &[*const Node]) -> bool {
+    pub(crate) fn has_consumer_outside(&self, group: &program::Seen) -> bool {
         // Cheap filter: nodes with a single consumer cannot be shared.
         if self.consumers.load(Ordering::Relaxed) < 2 {
             return false;
         }
+        // An expression that reads no buffer (the mask of a region, a coordinate) costs less to
+        // recompute than to write and read again.
+        if self.inputs().is_empty() {
+            return false;
+        }
         // Most readers are inside the group: tell by address and only upgrade the others.
-        self.readers.any_pending(|weak| !group.contains(&weak.as_ptr()))
+        self.readers.any_pending(|weak| !group.contains(weak.as_ptr()))
     }
 
     /// A copy of the operands of a node that has not been evaluated.
@@ -500,75 +1006,198 @@ fn union_into(ids: &mut Vec<u64>, tmp: &mut Vec<u64>, other: &[u64]) {
     std::mem::swap(ids, tmp);
 }
 
-/// Working memory of [`measure`], kept per thread so that measuring allocates nothing.
+/// Sets the bit of `id` in `set`, whose bit 0 stands for id `base`.
+fn mark(set: &mut [u64], base: u64, id: u64) {
+    let offset = id - base;
+    if let Some(word) = set.get_mut((offset >> 6) as usize) {
+        *word |= 1 << (offset & 63);
+    }
+}
+
+/// Working memory of [`measure`], kept per thread so that measuring allocates nothing but the
+/// ids it returns.
 #[derive(Default)]
 struct Measured {
-    below: Vec<u64>,
     inputs: Vec<u64>,
+    below: Vec<u64>,
+    decoded: Vec<u64>,
     tmp: Vec<u64>,
+}
+
+thread_local! {
+    /// The roots of the expressions being flattened on this thread, outermost first.
+    static FLATTENING: std::cell::RefCell<Vec<*const Node>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// The ids of the nodes this thread is computing (see [`Node::force`]), outermost first.
+    static COMPUTING: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Marks a node as being computed by this thread until it is dropped.
+struct Computing;
+
+impl Computing {
+    fn enter(id: u64) -> Self {
+        COMPUTING.with_borrow_mut(|computing| computing.push(id));
+        Computing
+    }
+}
+
+impl Drop for Computing {
+    fn drop(&mut self) {
+        COMPUTING.with_borrow_mut(|computing| computing.pop());
+    }
+}
+
+/// Marks nodes as being flattened by this thread until it is dropped: they have been taken to
+/// be evaluated already, so [`JitState::evaluate_alongside`] must not take them along (a group
+/// containing the very expression that is too big to compile would be too big again).
+pub(super) struct Flattening(usize);
+
+impl Flattening {
+    pub(super) fn enter(roots: impl Iterator<Item = *const Node>) -> Self {
+        FLATTENING.with_borrow_mut(|flying| {
+            let before = flying.len();
+            flying.extend(roots);
+            Flattening(before)
+        })
+    }
+}
+
+impl Drop for Flattening {
+    fn drop(&mut self) {
+        FLATTENING.with_borrow_mut(|flying| flying.truncate(self.0));
+    }
 }
 
 thread_local! {
     static MEASURED: std::cell::RefCell<Measured> = std::cell::RefCell::default();
 }
 
-/// The number of distinct nodes below and of distinct buffers read by an operation on `args`.
-/// The sorted ids of both stay in this thread's [`Measured`] until the next call, for
-/// [`measured_ids`].
-fn measure(args: &[Src]) -> (usize, usize) {
-    if let Some(node) = only_node(args) {
-        return (node.size(), node.inputs().len());
-    }
+/// What an operation on some operands has below it: the counts, and the ids as a [`Node`] keeps
+/// them.
+struct Measure {
+    /// Distinct nodes below.
+    below: usize,
+    /// Distinct buffers read.
+    inputs: usize,
+    ids: Box<[u64]>,
+    base: u64,
+    words: u32,
+    sparse: bool,
+}
+
+/// The distinct nodes below and distinct buffers read by an operation on `args`.
+fn measure(args: &[Src]) -> Measure {
     MEASURED.with_borrow_mut(|m| {
-        let Measured { below, inputs, tmp } = m;
-        below.clear();
+        let Measured { inputs, below, decoded, tmp } = m;
         inputs.clear();
-        let mut seen: Option<&Arc<Node>> = None;
+        let mut nodes: [Option<&Arc<Node>>; 3] = [None; 3];
+        let mut count = 0;
         for arg in args {
             match arg {
                 Src::Scalar(_) => {}
                 Src::Buffer(storage) => insert_sorted(inputs, storage.id()),
                 Src::Node(node) => {
                     // `x * x`: the second operand adds nothing.
-                    if seen.is_some_and(|first| Arc::ptr_eq(first, node)) {
+                    if nodes.iter().take(count).flatten().any(|first| Arc::ptr_eq(first, node)) {
                         continue;
                     }
-                    seen = seen.or(Some(node));
-                    union_into(below, tmp, node.below());
-                    insert_sorted(below, node.id);
+                    if let Some(slot) = nodes.get_mut(count) {
+                        *slot = Some(node);
+                        count += 1;
+                    }
                     union_into(inputs, tmp, node.inputs());
                 }
             }
         }
-        (below.len(), inputs.len())
+        let operands = || nodes.iter().take(count).flatten();
+        let (mut lo, mut hi, mut upper) = (u64::MAX, 0u64, 0usize);
+        for node in operands() {
+            (lo, hi, upper) = (lo.min(node.id), hi.max(node.id), upper + 1 + node.below_len());
+            if let Some((first, last)) = node.below_span() {
+                (lo, hi) = (lo.min(first), hi.max(last));
+            }
+        }
+        if count == 0 {
+            return Measure { below: 0, inputs: inputs.len(), ids: inputs.as_slice().into(), base: 0, words: 0, sparse: true };
+        }
+        // The ids of nodes made around the same time are close together: one bit each, which
+        // merges with a handful of word operations. Spread-out ones are merged as sorted lists.
+        let width = ((hi >> 6) - (lo >> 6) + 1) as usize;
+        if width <= 2 * upper + 16 {
+            let base = lo & !63;
+            let mut ids = Vec::with_capacity(width + inputs.len());
+            ids.resize(width, 0u64);
+            for node in operands() {
+                mark(&mut ids, base, node.id);
+                node.mark_below(&mut ids, base);
+            }
+            // One operand: its set plus itself, which is not in it.
+            let below = if count == 1 { upper } else { ids.iter().map(|word| word.count_ones() as usize).sum() };
+            ids.extend_from_slice(inputs);
+            return Measure { below, inputs: inputs.len(), ids: ids.into_boxed_slice(), base, words: width as u32, sparse: false };
+        }
+        below.clear();
+        for node in operands() {
+            decoded.clear();
+            node.below_any(|id| {
+                decoded.push(id);
+                false
+            });
+            union_into(below, tmp, decoded);
+            insert_sorted(below, node.id);
+        }
+        let mut ids = Vec::with_capacity(below.len() + inputs.len());
+        ids.extend_from_slice(below);
+        ids.extend_from_slice(inputs);
+        Measure { below: below.len(), inputs: inputs.len(), ids: ids.into_boxed_slice(), base: 0, words: below.len() as u32, sparse: true }
     })
 }
 
-/// The node that is the only non-scalar operand (possibly several times) of an operation on
-/// `args`, whose ids then are its own plus the node's: nothing to merge.
-fn only_node(args: &[Src]) -> Option<&Arc<Node>> {
-    let mut found: Option<&Arc<Node>> = None;
-    for arg in args {
-        match arg {
-            Src::Scalar(_) => {}
-            Src::Buffer(_) => return None,
-            Src::Node(node) => match found {
-                Some(first) if !Arc::ptr_eq(first, node) => return None,
-                _ => found = Some(node),
-            },
-        }
+impl Measure {
+    /// Replaces the buffers by `inputs` (sorted), counted exactly.
+    fn set_inputs(&mut self, inputs: &[u64]) {
+        let mut ids = Vec::with_capacity(self.words as usize + inputs.len());
+        ids.extend_from_slice(self.ids.get(..self.words as usize).unwrap_or(&[]));
+        ids.extend_from_slice(inputs);
+        self.ids = ids.into_boxed_slice();
+        self.inputs = inputs.len();
     }
-    found
 }
 
-/// The ids found by the last [`measure`] of `args` on this thread, as stored in a [`Node`]:
-/// nodes, then buffers.
-fn measured_ids(args: &[Src]) -> Box<[u64]> {
-    if let Some(node) = only_node(args) {
-        // The operand is the newest node of its expression: its id goes last.
-        return node.below().iter().copied().chain(Some(node.id)).chain(node.inputs().iter().copied()).collect();
+/// Sorted ids of the distinct buffers the expressions `args` read, counted by walking them (so
+/// not for every operation, see [`create`]): an evaluated node is its buffer, a node of `stop`
+/// (which the caller is about to evaluate) is one buffer of its own, with the top bit of its id
+/// set. Unlike [`Node::inputs`] this does not count what lies below a part of the expression
+/// that was evaluated after the node was created.
+fn count_inputs(args: &[Src], stop: &[Arc<Node>]) -> Vec<u64> {
+    const STOPPED: u64 = 1 << 63;
+    let mut ids = Vec::new();
+    let mut seen: FxMap<u64, ()> = FxMap::default();
+    let mut work: Vec<Src> = args.to_vec();
+    while let Some(src) = work.pop() {
+        let Src::Node(node) = src else {
+            if let Src::Buffer(storage) = src {
+                insert_sorted(&mut ids, storage.id());
+            }
+            continue;
+        };
+        if seen.insert(node.id, ()).is_some() {
+            continue;
+        }
+        if let Some(storage) = node.evaluated() {
+            insert_sorted(&mut ids, storage.id());
+        } else if stop.iter().any(|stopped| Arc::ptr_eq(stopped, &node)) {
+            insert_sorted(&mut ids, STOPPED | node.id);
+        } else if let Some(operands) = node.operands() {
+            work.extend(operands.into_iter().take(node.op.kind.arity()));
+        } else {
+            node.inputs().iter().for_each(|&id| insert_sorted(&mut ids, id));
+        }
     }
-    MEASURED.with_borrow(|m| m.below.iter().chain(&m.inputs).copied().collect())
+    ids
 }
 
 /// Replaces `args[i]` and every operand that is the same node by its evaluated buffer.
@@ -589,6 +1218,27 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
     Ok(())
 }
 
+/// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
+/// no transcendental functions (and needs a device with 64-bit shader floats), `Df32` only the
+/// operations of its library, and neither has generators or `powf`.
+fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(), LumaError> {
+    if matches!(op.ty, ElemTy::F64 | ElemTy::Df32) {
+        let exists = match op.kind {
+            OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
+            OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
+            OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
+            OpKind::Powf | OpKind::Generate(_) => false,
+        };
+        if !exists {
+            return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", op.ty.display())));
+        }
+    }
+    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(wgpu::Features::SHADER_F64) {
+        return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
+    }
+    Ok(())
+}
+
 /// Adds a lazy operation `op` on `args` (checked by the caller) producing `len` elements.
 ///
 /// This is where fusion is limited: operands that already have a consumer, and the biggest operand
@@ -603,6 +1253,7 @@ pub(crate) fn create(
 ) -> std::result::Result<Arc<Node>, Failure> {
     let jit = ctx.jit();
     let arity = op.kind.arity();
+    check_supported(ctx, op, name).map_err(Failure::New)?;
 
     // Operands evaluated since they were created become plain buffers.
     for i in 0..arity {
@@ -619,17 +1270,72 @@ pub(crate) fn create(
         }
     }
 
-    let max_nodes = jit.max_nodes();
-    let max_inputs = jit.max_inputs;
+    // Equal operations on identical operands are one node (see `ConsTable`).
+    let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_key_of(op, len, &args));
+    if let Some(key) = &cons_key
+        && let Some(found) = jit.cons_lookup(key)
+    {
+        return Ok(found);
+    }
+
+    let max_nodes = FUSION_LIMIT.with(std::cell::Cell::get).unwrap_or_else(|| jit.max_nodes()).clamp(1, MAX_NODES_LIMIT);
+    let max_inputs = jit.max_inputs();
     // The first time the expression is over a limit, its biggest operand is evaluated together
     // with the live arrays that share pending work with it (see the module documentation)
     // instead of alone.
     let mut batched = false;
     let mut cut = false;
-    let (below_len, _) = loop {
-        let (below, inputs) = measure(args.get(..arity).unwrap_or(&[]));
-        if below < max_nodes && inputs <= max_inputs {
-            break (below, inputs);
+    let mut noted = false;
+    let measured = loop {
+        let mut measured = measure(args.get(..arity).unwrap_or(&[]));
+        let (below, mut inputs) = (measured.below, measured.inputs);
+        if inputs > max_inputs {
+            // `measure` adds up what the operands read when they were created: a part of the
+            // expression evaluated since reads its one buffer now. Count what is read.
+            let ids = count_inputs(args.get(..arity).unwrap_or(&[]), &[]);
+            inputs = ids.len();
+            measured.set_inputs(&ids);
+        }
+        let deepest = args.iter().take(arity).filter_map(|arg| match arg {
+            Src::Node(node) => Some(node.depth()),
+            _ => None,
+        });
+        let deep = deepest.max().unwrap_or(0) >= MAX_DEPTH;
+        let too_big = below >= max_nodes || inputs > max_inputs;
+        if !too_big && !deep {
+            break measured;
+        }
+        if !noted {
+            noted = true;
+            let reason = if below >= max_nodes {
+                SplitReason::Nodes { nodes: below + 1, limit: max_nodes }
+            } else if inputs > max_inputs {
+                SplitReason::Inputs { inputs, limit: max_inputs }
+            } else {
+                SplitReason::Depth { limit: usize::from(MAX_DEPTH) }
+            };
+            jit.note_split(name, location, reason);
+        }
+        if !too_big {
+            // Only the nesting: evaluating the deepest operand cuts the chain.
+            let deepest = args
+                .iter()
+                .take(arity)
+                .enumerate()
+                .filter_map(|(i, a)| match a {
+                    Src::Node(n) => Some((i, n.depth())),
+                    _ => None,
+                })
+                .max_by_key(|&(_, depth)| depth);
+            if let Some((i, _)) = deepest {
+                cut = true;
+                // Like the cut on the node limit: with the live arrays that share its work.
+                if let Some(Src::Node(seed)) = args.get(i) {
+                    jit.evaluate_alongside(Arc::clone(seed));
+                }
+                evaluate_operand(&mut args, i)?;
+            }
+            continue;
         }
         if !batched {
             batched = true;
@@ -668,7 +1374,7 @@ pub(crate) fn create(
                 evaluate_operand(&mut args, i)?;
             }
             // Only buffers and scalars left: at most three operands, within any sane limit.
-            None => break (below, inputs),
+            None => break measured,
         }
     };
     if cut {
@@ -686,7 +1392,18 @@ pub(crate) fn create(
         .max()
         .unwrap_or(0);
 
+    let depth = args
+        .iter()
+        .take(arity)
+        .filter_map(|arg| match arg {
+            Src::Node(operand) => Some(operand.depth()),
+            _ => None,
+        })
+        .max()
+        .map_or(0, |deepest| deepest.saturating_add(1));
+
     let node = Arc::new(Node {
+        thread: current_thread(),
         ctx: ctx.clone(),
         op,
         len,
@@ -695,14 +1412,21 @@ pub(crate) fn create(
         name,
         location,
         id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
-        ids: measured_ids(args.get(..arity).unwrap_or(&[])),
-        below_len,
+        ids: measured.ids,
+        below_len: measured.below,
+        below_base: measured.base,
+        below_words: measured.words,
+        below_sparse: measured.sparse,
         consumers: AtomicU32::new(0),
         fused: AtomicBool::new(false),
         shift_depth,
+        depth,
+        shifted_reads: AtomicU32::new(0),
         readers: Readers::default(),
         requested: AtomicBool::new(false),
         looped: OnceLock::new(),
+        handles: AtomicU32::new(0),
+        link: OnceLock::new(),
     });
 
     for (i, arg) in args.iter().enumerate().take(arity) {
@@ -724,8 +1448,104 @@ pub(crate) fn create(
         }
     }
     jit.register(&node);
+    if let Some(key) = cons_key {
+        jit.cons_insert(if cut { cons_key_of(op, len, &args) } else { key }, &node);
+    }
     Ok(node)
 }
+
+/// Whether the value of the arrays holding `node` can be replaced by another expression with
+/// [`supersede`]: `node` is a pending expression that has not been taken apart yet, and kernels
+/// can read it as a sub-program (see [`recompute_viewed`]).
+pub(crate) fn can_supersede(node: &Arc<Node>) -> bool {
+    node.is_pending() && recompute_viewed(node) && lock(&node.args).is_some()
+}
+
+/// From now on the arrays that hold `old` (a claim on the latest node of their value, see
+/// [`Held::end`]) denote `new`. Expressions recorded earlier that read the node as an operand
+/// keep its value. `new` may read that node; the claims own `new`, not the node (see [`Link`]).
+pub(crate) fn supersede(old: &Held, new: Arc<Node>) {
+    let _ = old.end().link.next.set(Held::new(new));
+}
+
+/// A program structure with the verdict of lowering it (see [`JitState::inline_verdict`]).
+#[derive(Debug)]
+struct VerdictEntry {
+    cap: usize,
+    instrs: Arc<Vec<Instr>>,
+    subs: Arc<Vec<Vec<Instr>>>,
+    verdict: Arc<Verdict>,
+}
+
+/// An operand of a node as [`ConsTable`] tells operations apart.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ConsArg {
+    Unused,
+    Buffer(u64),
+    Node(u64),
+    Scalar(ElemTy, u64),
+}
+
+/// What makes two lazy operations the same value: the operation, the length and the operands
+/// (buffers and nodes by identity, scalars by value).
+#[derive(Clone, Copy, Debug)]
+struct ConsKey {
+    op: Op,
+    len: usize,
+    args: [ConsArg; 3],
+    /// Hash of the other fields, made once: the table is probed twice per operation and rehashes
+    /// its keys as it grows, and hashing an `Op` that holds a view is not cheap.
+    hash: u64,
+}
+
+impl PartialEq for ConsKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.len == other.len && self.args == other.args && self.op == other.op
+    }
+}
+
+impl Eq for ConsKey {}
+
+impl std::hash::Hash for ConsKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+fn cons_key_of(op: Op, len: usize, args: &Args) -> ConsKey {
+    use std::hash::{Hash, Hasher};
+    let arity = op.kind.arity();
+    let mut slots = [ConsArg::Unused; 3];
+    for (slot, arg) in slots.iter_mut().zip(args).take(arity) {
+        *slot = match arg {
+            Src::Buffer(storage) => ConsArg::Buffer(storage.id()),
+            Src::Node(node) => ConsArg::Node(node.id),
+            Src::Scalar(scalar) => ConsArg::Scalar(scalar.ty, scalar.bits),
+        };
+    }
+    let mut hasher = FxHasher::default();
+    op.hash(&mut hasher);
+    len.hash(&mut hasher);
+    slots.hash(&mut hasher);
+    ConsKey { op, len, args: slots, hash: hasher.finish() }
+}
+
+/// Pending nodes by what they compute, so that writing the same operation on the same operands
+/// twice yields one node, which a fused kernel computes once. Valid for one `epoch` of
+/// [`JitState::write_epoch`]: no buffer changed its contents since, so equal operations on
+/// identical operands are equal values. Holds weak references only: a node nobody else holds
+/// stays droppable, and [`assign`] counts the owners of the nodes it walks.
+#[derive(Debug, Default)]
+struct ConsTable {
+    epoch: u64,
+    map: FxMap<ConsKey, Weak<Node>>,
+    /// Entries at which dead ones are pruned before the next insert: [`CONS_PRUNE_AT`], or twice
+    /// what survived the last pruning (a table of live entries is not scanned at every insert).
+    prune_at: usize,
+}
+
+/// Entries of the table at which dead ones are pruned before the next insert, at least.
+const CONS_PRUNE_AT: usize = 4096;
 
 /// Most levels of shifted lazy expressions a kernel stages in workgroup memory.
 const MAX_STAGES: u8 = 3;
@@ -751,7 +1571,37 @@ pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 
         && (0..2).all(small)
         && node.shift_depth() < MAX_STAGES - 1
         && node.size() <= 64;
-    stageable || (node.size() <= node.context().tuning().max_recomputed && node.shift_depth() == 0)
+    stageable || claim_recompute(node)
+}
+
+/// Whether a shift or view that reads `node` lazily (as a sub-program, once per read) may do so:
+/// the expression is small enough, holds no shifted sub-expression and has been read lazily
+/// fewer than twice so far. The third reader, which would compute the expression a third
+/// time, takes the evaluated buffer instead. Counts the read when it answers `true`.
+fn claim_recompute(node: &Node) -> bool {
+    if node.size() > node.context().tuning().max_recomputed || node.shift_depth() != 0 {
+        return false;
+    }
+    let mut reads = node.shifted_reads.load(Ordering::Relaxed);
+    loop {
+        if reads >= 2 {
+            return false;
+        }
+        match node.shifted_reads.compare_exchange_weak(reads, reads + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(now) => reads = now,
+        }
+    }
+}
+
+/// Whether a view or gather of the pending `node` reads its expression lazily (as a sub-program
+/// computed at the read index) instead of evaluating it: whenever it fits one buffer, which is
+/// what a kernel computing sub-programs needs. Arithmetic costs far less than the memory traffic
+/// of a buffer that is written and read again, so the expression is computed in the kernel that
+/// reads it, once per distinct index (see [`inline`]); the node limit of [`create`] and the
+/// size check of `program::flatten_inner` bound the kernel.
+pub(crate) fn recompute_viewed(node: &Node) -> bool {
+    node.len() as u64 * node.op().out_ty().bytes() <= node.context().segment_bytes() && !node.requested.load(Ordering::Relaxed)
 }
 
 /// Per-context state of the fusion machinery.
@@ -761,13 +1611,36 @@ pub(crate) struct JitState {
     kernels: Mutex<FxMap<program::FusedKey, Arc<KernelCore>>>,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
     stencils: Mutex<FxMap<String, Arc<KernelCore>>>,
+    /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
+    /// that a loop run again does not generate and hash its source again.
+    loops: Mutex<FxMap<program::FusedKey, Vec<(Vec<Option<usize>>, Arc<KernelCore>)>>>,
     /// Every node created and not yet known to be evaluated, oldest first, so that
     /// [`Context::sync`] can evaluate the live ones.
     live: Readers,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
     requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
-    max_inputs: usize,
+    inputs_limit: AtomicUsize,
+    /// Overrides [`Tuning::max_live`] when not 0 (tests).
+    max_live: AtomicUsize,
+    /// Overrides [`Tuning::max_inlined`] when not 0 (tests).
+    max_inlined: AtomicUsize,
+    /// What lowering a program (see [`inline`]) found, by the structure of the program.
+    verdicts: Mutex<FxMap<u64, Vec<VerdictEntry>>>,
+    /// The programs seen so far by their shape hash, to make equal ones share their
+    /// instructions (see [`JitState::intern`]).
+    structures: Mutex<FxMap<u64, Vec<(Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>)>>>,
+    /// Counts the writes into buffers, so that [`ConsTable`] never outlives a change of contents.
+    write_epoch: AtomicU64,
+    cons: Mutex<ConsTable>,
+    /// The cuts of expressions made while profiling (or recording them in tests), if on.
+    splits: Mutex<Option<Vec<FusionSplit>>>,
+    /// Instructions of the program of the last kernel looked up (tests).
+    #[cfg(test)]
+    last_program_len: AtomicUsize,
+    /// Instructions of the last lowered program a kernel was built from (tests).
+    #[cfg(test)]
+    last_inlined_len: AtomicUsize,
     /// Most element-instructions per launch of a register loop, see [`launch::run_loop`].
     loop_work: AtomicU64,
     stats: Stats,
@@ -814,10 +1687,22 @@ impl JitState {
         JitState {
             kernels: Mutex::new(FxMap::default()),
             stencils: Mutex::new(FxMap::default()),
+            loops: Mutex::new(FxMap::default()),
             live: Readers::default(),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
-            max_inputs,
+            inputs_limit: AtomicUsize::new(max_inputs),
+            max_live: AtomicUsize::new(0),
+            max_inlined: AtomicUsize::new(0),
+            verdicts: Mutex::new(FxMap::default()),
+            structures: Mutex::new(FxMap::default()),
+            write_epoch: AtomicU64::new(0),
+            cons: Mutex::new(ConsTable::default()),
+            splits: Mutex::new(None),
+            #[cfg(test)]
+            last_program_len: AtomicUsize::new(0),
+            #[cfg(test)]
+            last_inlined_len: AtomicUsize::new(0),
             loop_work: AtomicU64::new(launch::LOOP_WORK_PER_LAUNCH),
             stats: Stats::default(),
             tracker: Mutex::new(looped::Tracker::default()),
@@ -829,6 +1714,157 @@ impl JitState {
 
     pub(crate) fn max_nodes(&self) -> usize {
         self.max_nodes.load(Ordering::Relaxed)
+    }
+
+    /// Most values a fused kernel keeps live at once (see [`launch`]).
+    pub(crate) fn max_live(&self, tuning: &crate::tuning::Tuning) -> usize {
+        match self.max_live.load(Ordering::Relaxed) {
+            0 => tuning.max_live,
+            forced => forced,
+        }
+    }
+
+    /// Most instructions of a lowered program (see [`inline`]).
+    pub(crate) fn max_inlined(&self, tuning: &crate::tuning::Tuning) -> usize {
+        match self.max_inlined.load(Ordering::Relaxed) {
+            0 => tuning.max_inlined,
+            forced => forced,
+        }
+    }
+
+    /// Makes the instructions of `key` the ones every equal program shares, so that comparing
+    /// keys from here on is a comparison of addresses.
+    pub(crate) fn intern(&self, key: &mut program::FusedKey) {
+        let mut structures = lock(&self.structures);
+        let entries = structures.entry(key.shape).or_default();
+        let same = |known: &(Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>)| {
+            (Arc::ptr_eq(&known.0, &key.instrs) || known.0 == key.instrs) && (Arc::ptr_eq(&known.1, &key.subs) || known.1 == key.subs)
+        };
+        match entries.iter().find(|known| same(known)) {
+            Some((instrs, subs)) => {
+                key.instrs = Arc::clone(instrs);
+                key.subs = Arc::clone(subs);
+            }
+            None => entries.push((Arc::clone(&key.instrs), Arc::clone(&key.subs))),
+        }
+    }
+
+    /// What lowering `key` (which [`inlines`](program::FusedKey::inlines)) gives with the cap of
+    /// `tuning`, found once per program structure.
+    pub(crate) fn inline_verdict(&self, tuning: &crate::tuning::Tuning, key: &program::FusedKey) -> Arc<Verdict> {
+        use std::hash::{Hash, Hasher};
+        let cap = self.max_inlined(tuning);
+        let mut hasher = FxHasher::default();
+        (cap, key.shape).hash(&mut hasher);
+        let hash = hasher.finish();
+        let mut verdicts = lock(&self.verdicts);
+        let entries = verdicts.entry(hash).or_default();
+        if let Some(entry) = entries.iter().find(|entry| entry.cap == cap && entry.instrs == key.instrs && entry.subs == key.subs) {
+            return Arc::clone(&entry.verdict);
+        }
+        let verdict = Arc::new(inline(key, cap));
+        entries.push(VerdictEntry { cap, instrs: Arc::clone(&key.instrs), subs: Arc::clone(&key.subs), verdict: Arc::clone(&verdict) });
+        verdict
+    }
+
+    /// Records that a buffer's contents are about to change (or did): operations written before
+    /// are not the same values as identical ones written after.
+    pub(crate) fn note_write(&self) {
+        self.write_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The pending node that already computes `key`, if any.
+    fn cons_lookup(&self, key: &ConsKey) -> Option<Arc<Node>> {
+        let mut table = lock(&self.cons);
+        let epoch = self.write_epoch.load(Ordering::Relaxed);
+        if table.epoch != epoch {
+            table.map.clear();
+            table.epoch = epoch;
+            return None;
+        }
+        let node = table.map.get(key)?.upgrade()?;
+        // A node computed inside another kernel is a dead temporary of an earlier expression:
+        // sharing it would tie this expression to that one (and to its steps in a loop).
+        // One created by another thread is that thread's (it may be recording it, flattening it or
+        // waiting for what this thread evaluates: two threads sharing a node can deadlock).
+        let usable = node.is_pending()
+            && node.thread == current_thread()
+            && node.handles.load(Ordering::Relaxed) == 0
+            && !node.fused.load(Ordering::Relaxed)
+            && (lock(&node.args).is_some() || node.looped.get().is_some());
+        usable.then_some(node)
+    }
+
+    fn cons_insert(&self, key: ConsKey, node: &Arc<Node>) {
+        let mut table = lock(&self.cons);
+        let epoch = self.write_epoch.load(Ordering::Relaxed);
+        if table.epoch != epoch {
+            table.map.clear();
+            table.epoch = epoch;
+        }
+        if table.map.len() > table.prune_at.max(CONS_PRUNE_AT) {
+            table.map.retain(|_, weak| weak.strong_count() > 0);
+            table.prune_at = 2 * table.map.len();
+        }
+        table.map.insert(key, Arc::downgrade(node));
+    }
+
+    /// Starts recording the cuts of expressions (see [`FusionSplit`]).
+    pub(crate) fn start_splits(&self) {
+        *lock(&self.splits) = Some(Vec::new());
+    }
+
+    /// Stops recording cuts and returns them.
+    pub(crate) fn take_split_notes(&self) -> Vec<FusionSplit> {
+        lock(&self.splits).take().unwrap_or_default()
+    }
+
+    /// Notes that an expression was cut into several kernels, if anyone listens.
+    pub(crate) fn note_split(&self, op: &'static str, location: &'static Location<'static>, reason: SplitReason) {
+        if let Some(splits) = lock(&self.splits).as_mut() {
+            splits.push(FusionSplit { op, location, reason });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_splits(&self) {
+        self.start_splits();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_splits(&self) -> Vec<FusionSplit> {
+        self.take_split_notes()
+    }
+
+    /// Overrides the most input buffers of a kernel (tests, to behave like a device with fewer bindings).
+    #[cfg(test)]
+    pub(crate) fn set_max_inputs(&self, max_inputs: usize) {
+        self.inputs_limit.store(max_inputs, Ordering::Relaxed);
+    }
+
+    /// Most input buffers one fused kernel binds: what the device allows, capped by [`MAX_INPUTS`].
+    pub(crate) fn max_inputs(&self) -> usize {
+        self.inputs_limit.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_live(&self, max_live: usize) {
+        self.max_live.store(max_live, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_inlined(&self, max_inlined: usize) {
+        self.max_inlined.store(max_inlined, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_inlined_len(&self) -> usize {
+        self.last_inlined_len.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_program_len(&self) -> usize {
+        self.last_program_len.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -886,16 +1922,44 @@ impl JitState {
         requested.nodes.push(Arc::downgrade(node));
     }
 
-    /// Computes the requested nodes that are still alive, those of one length together in
-    /// multi-output kernels.
+    /// Whether one of the newest requested nodes reads other expressions through views and
+    /// depends on a requested node that is still pending: a stencil step whose input is the
+    /// postponed result of the step before. Postponing such steps chains them into one expression
+    /// (the stencil recomputes its input at every index it reads), so they are computed as they
+    /// are requested.
+    pub(crate) fn requested_stencil_chain(&self) -> bool {
+        const NEWEST: usize = 8;
+        let requested = lock(&self.requested);
+        let pending = |weak: &Weak<Node>| weak.upgrade().filter(|node| node.is_pending());
+        requested.nodes.iter().rev().take(NEWEST).filter_map(pending).filter(|node| node.shift_depth() > 0).any(|node| {
+            requested.nodes.iter().filter_map(pending).any(|other| !Arc::ptr_eq(&node, &other) && node.below_contains(other.id))
+        })
+    }
+
+    /// Computes the requested nodes that are still alive and were created by this thread, those
+    /// of one length together in multi-output kernels. What other threads requested stays
+    /// requested: they are building and flattening those expressions right now, and a recording
+    /// they may have under way must not be fed with launches of another thread (see
+    /// [`Node::thread`]).
     pub(crate) fn evaluate_requested(&self) {
+        let me = current_thread();
         let requested = std::mem::take(&mut lock(&self.requested).nodes);
-        let mut pending: Vec<Arc<Node>> = requested
-            .into_iter()
-            .filter_map(|weak| weak.upgrade())
-            .inspect(|node| node.requested.store(false, Ordering::Relaxed))
-            .filter(|node| node.is_pending())
-            .collect();
+        let mut others = Vec::new();
+        let mut pending: Vec<Arc<Node>> = Vec::with_capacity(requested.len());
+        for weak in requested {
+            let Some(node) = weak.upgrade() else { continue };
+            if node.thread != me {
+                others.push(weak);
+                continue;
+            }
+            node.requested.store(false, Ordering::Relaxed);
+            if node.is_pending() {
+                pending.push(node);
+            }
+        }
+        if !others.is_empty() {
+            lock(&self.requested).nodes.extend(others);
+        }
         while let Some(first) = pending.first() {
             let len = first.len;
             let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);
@@ -904,8 +1968,11 @@ impl JitState {
         }
     }
 
+    /// Computes the lazy arrays this thread created that are still alive (see
+    /// [`JitState::evaluate_requested`] for the other threads').
     pub(crate) fn evaluate_live(&self) {
-        let nodes = self.live.take();
+        let me = current_thread();
+        let nodes = self.live.take_if(|node| node.thread == me);
         let mut pending: Vec<Arc<Node>> = nodes.into_iter().rev().filter_map(|weak| weak.upgrade()).collect();
         while let Some(first) = pending.first() {
             let len = first.len;
@@ -923,11 +1990,12 @@ impl JitState {
                     rest.push(node);
                     continue;
                 }
+                let mut tmp = Vec::new();
                 let mut more_inputs = inputs.clone();
-                node.inputs().iter().for_each(|&id| insert_sorted(&mut more_inputs, id));
+                union_into(&mut more_inputs, &mut tmp, node.inputs());
                 let mut more_below = below.clone();
-                node.below().iter().for_each(|&id| insert_sorted(&mut more_below, id));
-                let fits = more_inputs.len() + group.len() < self.max_inputs + 1
+                union_into(&mut more_below, &mut tmp, &node.below_vec());
+                let fits = more_inputs.len() + group.len() < self.max_inputs() + 1
                     && more_below.len() + group.len() < MAX_NODES_LIMIT;
                 if fits || group.is_empty() {
                     (inputs, below) = (more_inputs, more_below);
@@ -945,34 +2013,45 @@ impl JitState {
     /// pending arrays of its length that read nodes of its expression, newest first, as many as
     /// one kernel takes: [`MAX_NODES_LIMIT`] operations (what [`Context::flush`] allows) and the
     /// bindings the device allows. Computing them together evaluates what they share once.
-    fn evaluate_alongside(&self, seed: Arc<Node>) {
-        let candidates = self.live.newest_first();
+    pub(crate) fn evaluate_alongside(&self, seed: Arc<Node>) {
+        let me = current_thread();
         let mut inputs = seed.inputs().to_vec();
-        let mut below = seed.below().to_vec();
+        let mut below = seed.below_vec();
         insert_sorted(&mut below, seed.id);
+        let len = seed.len;
         let mut group = vec![seed];
-        for weak in candidates {
+        let flying = FLATTENING.with_borrow(Clone::clone);
+        // A node that reads a node this thread is computing right now cannot be computed before
+        // that one is: it would wait for it forever.
+        let computing = COMPUTING.with_borrow(Clone::clone);
+        let mut tmp = Vec::new();
+        self.live.for_each_newest(|weak| {
             // Upgraded one at a time and dropped unless taken: a strong reference keeps operands
             // alive, and with them the buffers that a single-output kernel could overwrite.
-            let Some(node) = weak.upgrade() else { continue };
-            if node.len != group[0].len
+            let Some(node) = weak.upgrade() else { return };
+            if node.len != len
+                || node.thread != me
                 || !node.is_pending()
                 || node.fused.load(Ordering::Relaxed)
+                || flying.contains(&Arc::as_ptr(&node))
+                || computing.iter().any(|&id| node.below_contains(id))
                 || below.binary_search(&node.id).is_ok()
-                || !node.below().iter().any(|id| below.binary_search(id).is_ok())
             {
-                continue;
+                return;
             }
-            let mut more_inputs = inputs.clone();
-            node.inputs().iter().for_each(|&id| insert_sorted(&mut more_inputs, id));
-            let mut more_below = below.clone();
-            node.below().iter().for_each(|&id| insert_sorted(&mut more_below, id));
-            if more_inputs.len() + group.len() < self.max_inputs + 1 && more_below.len() + group.len() < MAX_NODES_LIMIT {
-                (inputs, below) = (more_inputs, more_below);
+            let node_below = node.below_vec();
+            if !node_below.iter().any(|id| below.binary_search(id).is_ok()) {
+                return;
+            }
+            let new_inputs = node.inputs().iter().filter(|id| inputs.binary_search(id).is_err()).count();
+            let new_below = node_below.iter().filter(|id| below.binary_search(id).is_err()).count();
+            if inputs.len() + new_inputs + group.len() < self.max_inputs() + 1 && below.len() + new_below + group.len() < MAX_NODES_LIMIT {
+                union_into(&mut inputs, &mut tmp, node.inputs());
+                union_into(&mut below, &mut tmp, &node_below);
                 insert_sorted(&mut below, node.id);
                 group.push(node);
             }
-        }
+        });
         match group.as_slice() {
             // On its own, nothing but the node holds its operands, which lets its kernel
             // overwrite a dying operand's buffer.
@@ -985,13 +2064,34 @@ impl JitState {
 
     /// The kernel for `key`, generated and compiled on first use.
     fn kernel(&self, ctx: &Context, key: &program::FusedKey) -> Result<Arc<KernelCore>> {
+        #[cfg(test)]
+        self.last_program_len.store(key.instrs.len(), Ordering::Relaxed);
         let mut cache = lock(&self.kernels);
         if let Some(core) = cache.get(key) {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(core));
         }
         let segment_len = u32::try_from(ctx.segment_bytes() / 4).unwrap_or(u32::MAX);
-        let source = codegen::source(key, ctx.tuning(), segment_len);
+        // A program that was judged too big on the way here (it did not come from
+        // `flatten_inner`, which cuts those) is lowered in full.
+        let judged = key.inlines().then(|| self.inline_verdict(ctx.tuning(), key));
+        let uncapped;
+        let inlined = match judged.as_deref() {
+            Some(Verdict::Fits(inlined)) => Some(inlined),
+            Some(Verdict::TooBig { .. }) => {
+                uncapped = inline(key, usize::MAX);
+                match &uncapped {
+                    Verdict::Fits(inlined) => Some(inlined),
+                    Verdict::TooBig { .. } => None,
+                }
+            }
+            None => None,
+        };
+        #[cfg(test)]
+        if let Some(inlined) = inlined {
+            self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed);
+        }
+        let source = codegen::source(key, ctx.tuning(), segment_len, inlined);
         let label = key.label();
         let core = Arc::new(kernel::build_core(
             ctx,
@@ -1004,8 +2104,21 @@ impl JitState {
         Ok(core)
     }
 
+    /// The kernel that runs the store program `key` for several steps with its states
+    /// (`states[k]`: the state input `k` reads) in registers, generated and compiled on first use.
+    pub(crate) fn loop_kernel(&self, ctx: &Context, key: &program::FusedKey, states: &[Option<usize>]) -> Result<Arc<KernelCore>> {
+        if let Some(core) = lock(&self.loops).get(key).and_then(|known| known.iter().find(|(layout, _)| layout == states)) {
+            return Ok(Arc::clone(&core.1));
+        }
+        let source = codegen::loop_source(key, states, ctx.tuning());
+        let label = format!("Loop{}", key.label().trim_start_matches("Fused"));
+        let core = self.stencil_kernel(ctx, source, &label)?;
+        lock(&self.loops).entry(key.clone()).or_default().push((states.to_vec(), Arc::clone(&core)));
+        Ok(core)
+    }
+
     /// The stencil kernel with WGSL `source`, compiled on first use.
-    fn stencil_kernel(&self, ctx: &Context, source: String, label: &str) -> Result<Arc<KernelCore>> {
+    pub(crate) fn stencil_kernel(&self, ctx: &Context, source: String, label: &str) -> Result<Arc<KernelCore>> {
         let mut cache = lock(&self.stencils);
         if let Some(core) = cache.get(&source) {
             return Ok(Arc::clone(core));

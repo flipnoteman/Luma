@@ -55,6 +55,12 @@ pub(crate) struct Pin {
 }
 
 impl Pin {
+    /// Another pin of the same segment.
+    pub(crate) fn dup(&self) -> Pin {
+        self.segment.pins.fetch_add(1, Ordering::Acquire);
+        Pin { segment: Arc::clone(&self.segment), buffer: self.buffer.clone() }
+    }
+
     /// The segment's device buffer.
     pub(crate) fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
@@ -157,6 +163,12 @@ impl Segment {
     /// The segment's buffer, allocating it (and bringing its data back from host memory) on
     /// first use. It stays on the device until the returned [`Pin`] is dropped.
     pub(crate) fn pin(self: &Arc<Self>) -> Result<Pin> {
+        let pin = self.pin_unrecorded()?;
+        self.ctx.keep_pin(&pin);
+        Ok(pin)
+    }
+
+    fn pin_unrecorded(self: &Arc<Self>) -> Result<Pin> {
         let pager = self.ctx.pager();
         loop {
             if let State::Device(buffer) = &*lock(&self.state) {

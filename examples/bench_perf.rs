@@ -53,13 +53,13 @@ fn main() -> Result<()> {
     }
     if want("dot") {
         let ms = median(|| {
-            black_box((&x * &y).sum().unwrap());
+            black_box((&x * &y).sum().item().unwrap());
         });
         report("dot", ms, nf * 8.0, "GB/s");
     }
     if want("sum") {
         let ms = median(|| {
-            black_box(x.sum().unwrap());
+            black_box(x.sum().item().unwrap());
         });
         report("sum", ms, nf * 4.0, "GB/s");
     }

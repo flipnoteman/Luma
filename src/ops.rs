@@ -3,7 +3,7 @@
 //! with the caller's location, or into `Err` for the `try_*` methods.
 
 use std::ops::{
-    Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign,
+    Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Rem, RemAssign, Sub, SubAssign,
 };
 use std::panic::Location;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, Builtin, CmpOp, UnOp};
 use crate::context::{Context, RawArg};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{GpuType, ScalarType};
+use crate::gpu_type::{Df32, GpuType, ScalarType};
 use crate::jit::{self, ElemTy, Op, OpKind, Scalar, ShiftKind, Src};
 use crate::kernel::KernelCore;
 use crate::shape::{Offsets, Shape};
@@ -33,24 +33,47 @@ pub trait Operand<T: ScalarType> {
     fn rhs(&self) -> Rhs<'_, T>;
 }
 
-macro_rules! impl_operand {
+macro_rules! impl_value_operand {
     ($t:ty) => {
         impl Operand<$t> for $t {
             fn rhs(&self) -> Rhs<'_, $t> {
                 Rhs::Scalar(*self)
             }
         }
+    };
+}
 
-        impl Operand<$t> for &Array<$t> {
+macro_rules! impl_scalar_operand {
+    ($t:ty) => {
+        impl Operand<$t> for &crate::scalar::Scalar<$t> {
             fn rhs(&self) -> Rhs<'_, $t> {
-                Rhs::Array(*self)
+                Rhs::Scalar(self.get())
             }
         }
     };
 }
 
-impl_operand!(f32);
-impl_operand!(u32);
+impl<T: ScalarType> Operand<T> for &Array<T> {
+    fn rhs(&self) -> Rhs<'_, T> {
+        Rhs::Array(*self)
+    }
+}
+
+impl<T: ScalarType> Operand<T> for Array<T> {
+    fn rhs(&self) -> Rhs<'_, T> {
+        Rhs::Array(self)
+    }
+}
+
+impl_value_operand!(f32);
+impl_value_operand!(u32);
+impl_value_operand!(Df32);
+// There is deliberately no `Operand<f64> for f64`: a second float type among the scalar
+// operands would make `select(&mask, 1.0, 0.0)` and every other call that only has float
+// literals to go by infer `f64` instead of `f32`. The operators (`&x * 2.0`) take `f64`
+// scalars; comparisons, `minimum`/`maximum` and `select` take `f64` arrays.
+impl_scalar_operand!(f32);
+impl_scalar_operand!(u32);
 
 /// Splits `count` workgroups into a 2D grid within the per-dimension limit; shaders recombine
 /// them as `x + y * num_workgroups.x`.
@@ -94,7 +117,7 @@ pub(crate) fn len_u32(len: usize) -> Result<u32> {
 }
 
 /// Records the lazy operation `op` on `args` as an array of `shape`. Nothing runs yet.
-fn lazy<O: GpuType>(
+pub(crate) fn lazy<O: GpuType>(
     ctx: &Context,
     shape: Shape,
     op: Op,
@@ -127,6 +150,21 @@ impl<T: ScalarType> Array<T> {
         )
     }
 
+    /// `-self` reporting failures at `location`.
+    pub(crate) fn neg_at(&self, location: &'static Location<'static>) -> Array<T> {
+        let result = self.run_unary(UnOp::Neg, location);
+        Array::resolve(self.context(), self.shape(), result, "neg", location)
+    }
+
+    /// A lazy copy of the array's current contents (not a shared handle), reporting failures at
+    /// the caller.
+    #[track_caller]
+    pub(crate) fn copied(&self) -> Array<T> {
+        let location = Location::caller();
+        let result = self.run_unary(UnOp::Id, location);
+        Array::resolve(self.context(), self.shape(), result, "copy", location)
+    }
+
     /// `self op rhs` (or `rhs op self` if `scalar_left`, which only exists for scalars),
     /// producing elements of type `O`.
     fn run_binary<O: GpuType>(
@@ -139,27 +177,32 @@ impl<T: ScalarType> Array<T> {
     ) -> Outcome<Array<O>> {
         let ctx = self.context();
         let this = self.src()?;
-        let other = match rhs {
+        let (this, other, shape) = match rhs {
             Rhs::Array(other) => {
                 let operand = other.src()?;
                 if !ctx.same_as(other.context()) {
                     return Err(LumaError::ContextMismatch.into());
                 }
-                if self.shape() != other.shape() {
+                if self.shape() == other.shape() {
+                    (this, operand, self.shape())
+                } else if other.len() == 1 {
+                    (this, other.broadcast(self.shape(), location)?, self.shape())
+                } else if self.len() == 1 {
+                    (self.broadcast(other.shape(), location)?, operand, other.shape())
+                } else {
                     return Err(LumaError::ShapeMismatch {
                         lhs: self.shape().dims(),
                         rhs: other.shape().dims(),
                     }
                     .into());
                 }
-                operand
             }
-            Rhs::Scalar(value) => Src::Scalar(Scalar::of(value)?),
+            Rhs::Scalar(value) => (this, Src::Scalar(Scalar::of(value)?), self.shape()),
         };
         let (left, right) = if scalar_left { (other, this) } else { (this, other) };
         lazy(
             ctx,
-            self.shape(),
+            shape,
             Op::new(kind, ElemTy::of::<T>()?),
             [left, right, Src::unused()],
             name,
@@ -184,14 +227,17 @@ impl<T: ScalarType> Array<T> {
                 if !ctx.same_as(other.context()) {
                     return Err(LumaError::ContextMismatch.into());
                 }
-                if self.shape() != other.shape() {
+                if self.shape() == other.shape() {
+                    operand
+                } else if other.len() == 1 {
+                    other.broadcast(self.shape(), location)?
+                } else {
                     return Err(LumaError::ShapeMismatch {
                         lhs: self.shape().dims(),
                         rhs: other.shape().dims(),
                     }
                     .into());
                 }
-                operand
             }
             Rhs::Scalar(value) => Src::Scalar(Scalar::of(value)?),
         };
@@ -199,6 +245,7 @@ impl<T: ScalarType> Array<T> {
         // contents: evaluate them before the buffer changes. Afterwards no pending expression
         // reads it, so the new node sees it as a plain buffer.
         storage.readers.flush();
+        ctx.jit().note_write();
         let node = jit::create(
             ctx,
             self.len(),
@@ -220,14 +267,35 @@ impl<T: ScalarType> Array<T> {
         scalar_left: bool,
         name: &'static str,
     ) -> Array<T> {
-        let location = Location::caller();
+        self.binary_at(rhs, op, scalar_left, name, Location::caller())
+    }
+
+    /// [`Array::binary`] reporting failures at `location`.
+    pub(crate) fn binary_at(
+        &self,
+        rhs: Rhs<'_, T>,
+        op: BinOp,
+        scalar_left: bool,
+        name: &'static str,
+        location: &'static Location<'static>,
+    ) -> Array<T> {
         let result = self.run_binary(rhs, scalar_left, OpKind::Binary(op), name, location);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
 
     #[track_caller]
     fn compare(&self, rhs: Rhs<'_, T>, op: CmpOp, name: &'static str) -> Array<u32> {
-        let location = Location::caller();
+        self.compare_at(rhs, op, name, Location::caller())
+    }
+
+    /// [`Array::compare`] reporting failures at `location`.
+    pub(crate) fn compare_at(
+        &self,
+        rhs: Rhs<'_, T>,
+        op: CmpOp,
+        name: &'static str,
+        location: &'static Location<'static>,
+    ) -> Array<u32> {
         let result = self.run_binary(rhs, false, OpKind::Compare(op), name, location);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
@@ -246,14 +314,19 @@ impl<T: ScalarType> Array<T> {
     }
 
     #[track_caller]
-    pub(crate) fn assign(&mut self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str) {
+    pub(crate) fn assign_op(&mut self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str) {
         let location = Location::caller();
-        let result = if self.pending().is_some() || self.sole_owner() {
+        let result = if (self.pending().is_some() && !self.expression_shared()) || self.sole_owner() {
             // The target is an expression without a buffer, or nothing else can observe its
             // buffer changing: it simply becomes the expression `self op rhs`, stays fusable, and
             // reuses its buffer when it is evaluated.
-            self.run_binary(rhs, false, OpKind::Binary(op), name, location).map(|new: Array<T>| {
+            self.run_binary(rhs, false, OpKind::Binary(op), name, location).and_then(|new: Array<T>| {
+                // A one-element target is never broadcast to the right-hand side's shape.
+                if new.shape() != self.shape() {
+                    return Err(LumaError::ShapeMismatch { lhs: self.shape().dims(), rhs: new.shape().dims() }.into());
+                }
                 *self = new;
+                Ok(())
             })
         } else {
             self.run_in_place(rhs, op, name, location)
@@ -361,7 +434,13 @@ impl<T: ScalarType> Array<T> {
 
     /// [`Array::full`] on an explicit context.
     pub fn full_on(ctx: &Context, shape: impl Into<crate::Shape>, value: T) -> Result<Array<T>> {
-        let out = Array::<T>::alloc(ctx, shape.into())?;
+        let shape = shape.into();
+        if T::wgsl_type() == "f64" {
+            // A uniform cannot hold an `f64`: upload the values instead.
+            let len = shape.validate()?;
+            return Array::from_slice_on(ctx, &vec![value; len], shape);
+        }
+        let out = Array::<T>::alloc(ctx, shape)?;
         let storage = out.storage().map_err(Failure::into_error)?;
         let core = ctx.builtin(Builtin::Fill, T::wgsl_type())?;
         for j in 0..storage.segments() {
@@ -393,8 +472,12 @@ impl<T: ScalarType> Array<T> {
     /// memory for small shifts; a larger one is evaluated first.
     #[track_caller]
     pub fn shift(&self, offsets: impl Into<Offsets>) -> Array<T> {
-        let location = Location::caller();
-        let result = self.run_shift(offsets.into(), location);
+        self.shift_at(offsets.into(), Location::caller())
+    }
+
+    /// [`Array::shift`] reporting failures at `location`.
+    pub(crate) fn shift_at(&self, offsets: Offsets, location: &'static Location<'static>) -> Array<T> {
+        let result = self.run_shift(offsets, location);
         Array::resolve(self.context(), self.shape(), result, "shift", location)
     }
 
@@ -402,7 +485,7 @@ impl<T: ScalarType> Array<T> {
         let dims = self.shape().dims();
         let operand = match self.pending() {
             Some(node) if jit::recompute_shifted(node, dims, offsets.0) => Src::Node(Arc::clone(node)),
-            _ => Src::Buffer(Arc::clone(self.storage()?)),
+            _ => Src::Buffer(Arc::clone(self.storage_alongside()?)),
         };
         let mut dims32 = [1u32; 4];
         let mut shifts = [0u32; 4];
@@ -417,17 +500,21 @@ impl<T: ScalarType> Array<T> {
         let top = shifts.iter().rposition(|&s| s != 0).unwrap_or(0);
         let linear = dims32[top + 1..].iter().all(|&d| d == 1)
             && shifts[..top].iter().all(|&s| s == 0);
-        let (kind, amount) = if linear {
+        let (kind, amount, total) = if linear {
             let stride: u32 = dims32[..top].iter().product();
-            (ShiftKind::Linear, Src::Scalar(Scalar { ty: ElemTy::U32, bits: shifts[top] * stride }))
+            (
+                ShiftKind::Linear,
+                Src::Scalar(Scalar::u32(shifts[top] * stride)),
+                Src::Scalar(Scalar::u32(len_u32(self.len())?)),
+            )
         } else {
-            (ShiftKind::Dims { dims: dims32, shifts }, Src::unused())
+            (ShiftKind::Dims { dims: dims32, shifts }, Src::unused(), Src::unused())
         };
         lazy(
             self.context(),
             self.shape(),
             Op::new(OpKind::Shift(kind), ElemTy::of::<T>()?),
-            [operand, amount, Src::unused()],
+            [operand, amount, total],
             "shift",
             location,
         )
@@ -477,12 +564,21 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
 /// branch's) or `ContextMismatch`.
 #[track_caller]
 pub fn select<T: ScalarType>(mask: &Array<u32>, a: impl Operand<T>, b: impl Operand<T>) -> Array<T> {
-    let location = Location::caller();
+    select_at(mask, a, b, Location::caller())
+}
+
+/// [`select`] reporting failures at `location`.
+pub(crate) fn select_at<T: ScalarType>(
+    mask: &Array<u32>,
+    a: impl Operand<T>,
+    b: impl Operand<T>,
+    location: &'static Location<'static>,
+) -> Array<T> {
     let result = run_select(mask, a.rhs(), b.rhs(), location);
     Array::resolve(mask.context(), mask.shape(), result, "select", location)
 }
 
-fn run_select<T: ScalarType>(
+pub(crate) fn run_select<T: ScalarType>(
     mask: &Array<u32>,
     a: Rhs<'_, T>,
     b: Rhs<'_, T>,
@@ -497,14 +593,17 @@ fn run_select<T: ScalarType>(
                 if !ctx.same_as(other.context()) {
                     return Err(LumaError::ContextMismatch.into());
                 }
-                if mask.shape() != other.shape() {
-                    return Err(LumaError::ShapeMismatch {
+                if mask.shape() == other.shape() {
+                    Ok(operand)
+                } else if other.len() == 1 {
+                    other.broadcast(mask.shape(), location)
+                } else {
+                    Err(LumaError::ShapeMismatch {
                         lhs: mask.shape().dims(),
                         rhs: other.shape().dims(),
                     }
-                    .into());
+                    .into())
                 }
-                Ok(operand)
             }
             Rhs::Scalar(value) => Ok(Src::Scalar(Scalar::of(value)?)),
         }
@@ -555,9 +654,35 @@ unary_methods! {
     cos => UnOp::Cos;
     /// Elementwise tangent (radians).
     tan => UnOp::Tan;
+    /// Elementwise hyperbolic tangent.
+    tanh => UnOp::Tanh;
+    /// Elementwise sign: `-1`, `0` or `1`.
+    sign => UnOp::Sign;
+    /// Elementwise largest integer not above `x`.
+    floor => UnOp::Floor;
+    /// Elementwise smallest integer not below `x`.
+    ceil => UnOp::Ceil;
 }
 
 impl Array<f32> {
+    /// Elementwise `atan2(self, x)`: the angle of the point `(x, self)`, `self` being `y`.
+    #[track_caller]
+    pub fn atan2(&self, x: impl Operand<f32>) -> Array<f32> {
+        self.binary(x.rhs(), BinOp::Atan2, false, "atan2")
+    }
+
+    /// Elementwise `sqrt(self^2 + other^2)` without intermediate overflow.
+    #[track_caller]
+    pub fn hypot(&self, other: impl Operand<f32>) -> Array<f32> {
+        self.binary(other.rhs(), BinOp::Hypot, false, "hypot")
+    }
+
+    /// Elementwise magnitude of `self` with the sign of `sign`.
+    #[track_caller]
+    pub fn copysign(&self, sign: impl Operand<f32>) -> Array<f32> {
+        self.binary(sign.rhs(), BinOp::Copysign, false, "copysign")
+    }
+
     /// Elementwise `x` raised to `exponent`.
     #[track_caller]
     pub fn powf(&self, exponent: f32) -> Array<f32> {
@@ -598,9 +723,7 @@ impl Neg for &Array<f32> {
 
     #[track_caller]
     fn neg(self) -> Array<f32> {
-        let location = Location::caller();
-        let result = self.run_unary(UnOp::Neg, location);
-        Array::resolve(self.context(), self.shape(), result, "neg", location)
+        self.neg_at(Location::caller())
     }
 }
 
@@ -611,6 +734,63 @@ impl Neg for Array<f32> {
     fn neg(self) -> Array<f32> {
         -&self
     }
+}
+
+// -- Math functions on the 8-byte types --
+
+macro_rules! wide_unary_methods {
+    ($t:ty; $($(#[$doc:meta])* $name:ident => $op:expr;)*) => {
+        impl Array<$t> {
+            $(
+                $(#[$doc])*
+                #[track_caller]
+                pub fn $name(&self) -> Array<$t> {
+                    let location = Location::caller();
+                    let op: UnOp = $op;
+                    let result = self.run_unary(op, location);
+                    Array::resolve(self.context(), self.shape(), result, op.name(), location)
+                }
+            )*
+        }
+
+        impl Neg for &Array<$t> {
+            type Output = Array<$t>;
+
+            #[track_caller]
+            fn neg(self) -> Array<$t> {
+                self.neg_at(Location::caller())
+            }
+        }
+
+        impl Neg for Array<$t> {
+            type Output = Array<$t>;
+
+            #[track_caller]
+            fn neg(self) -> Array<$t> {
+                -&self
+            }
+        }
+    };
+}
+
+wide_unary_methods! { f64;
+    /// Elementwise square root.
+    sqrt => UnOp::Sqrt;
+    /// Elementwise absolute value.
+    abs => UnOp::Abs;
+    /// Elementwise sign: `-1`, `0` or `1`.
+    sign => UnOp::Sign;
+    /// Elementwise largest integer not above `x`.
+    floor => UnOp::Floor;
+    /// Elementwise smallest integer not below `x`.
+    ceil => UnOp::Ceil;
+}
+
+wide_unary_methods! { Df32;
+    /// Elementwise square root (accurate to about 44 bits).
+    sqrt => UnOp::Sqrt;
+    /// Elementwise absolute value.
+    abs => UnOp::Abs;
 }
 
 // -- Operators --
@@ -683,19 +863,67 @@ macro_rules! impl_binary_operator {
     };
 }
 
+/// The operators with a shared host-side [`crate::Scalar`] (32-bit types only).
+macro_rules! impl_binary_scalar {
+    ($t:ty, $Trait:ident, $method:ident, $op:expr, $name:literal) => {
+        impl $Trait<&crate::scalar::Scalar<$t>> for &Array<$t> {
+            type Output = Array<$t>;
+            #[track_caller]
+            fn $method(self, rhs: &crate::scalar::Scalar<$t>) -> Array<$t> {
+                self.binary(Rhs::Scalar(rhs.get()), $op, false, $name)
+            }
+        }
+
+        impl $Trait<&crate::scalar::Scalar<$t>> for Array<$t> {
+            type Output = Array<$t>;
+            #[track_caller]
+            fn $method(self, rhs: &crate::scalar::Scalar<$t>) -> Array<$t> {
+                self.binary(Rhs::Scalar(rhs.get()), $op, false, $name)
+            }
+        }
+
+        impl $Trait<&Array<$t>> for &crate::scalar::Scalar<$t> {
+            type Output = Array<$t>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<$t>) -> Array<$t> {
+                rhs.binary(Rhs::Scalar(self.get()), $op, true, $name)
+            }
+        }
+
+        impl $Trait<Array<$t>> for &crate::scalar::Scalar<$t> {
+            type Output = Array<$t>;
+            #[track_caller]
+            fn $method(self, rhs: Array<$t>) -> Array<$t> {
+                rhs.binary(Rhs::Scalar(self.get()), $op, true, $name)
+            }
+        }
+    };
+}
+
 macro_rules! impl_assign_operator {
     ($t:ty, $Trait:ident, $method:ident, $op:expr, $name:literal) => {
         impl $Trait<&Array<$t>> for Array<$t> {
             #[track_caller]
             fn $method(&mut self, rhs: &Array<$t>) {
-                self.assign(Rhs::Array(rhs), $op, $name)
+                self.assign_op(Rhs::Array(rhs), $op, $name)
             }
         }
 
         impl $Trait<$t> for Array<$t> {
             #[track_caller]
             fn $method(&mut self, rhs: $t) {
-                self.assign(Rhs::Scalar(rhs), $op, $name)
+                self.assign_op(Rhs::Scalar(rhs), $op, $name)
+            }
+        }
+    };
+}
+
+macro_rules! impl_assign_scalar {
+    ($t:ty, $Trait:ident, $method:ident, $op:expr, $name:literal) => {
+        impl $Trait<&crate::scalar::Scalar<$t>> for Array<$t> {
+            #[track_caller]
+            fn $method(&mut self, rhs: &crate::scalar::Scalar<$t>) {
+                self.assign_op(Rhs::Scalar(rhs.get()), $op, $name)
             }
         }
     };
@@ -714,8 +942,29 @@ macro_rules! impl_operators {
     };
 }
 
+macro_rules! impl_scalar_operators {
+    ($t:ty) => {
+        impl_binary_scalar!($t, Add, add, BinOp::Add, "add");
+        impl_binary_scalar!($t, Sub, sub, BinOp::Sub, "sub");
+        impl_binary_scalar!($t, Mul, mul, BinOp::Mul, "mul");
+        impl_binary_scalar!($t, Div, div, BinOp::Div, "div");
+        impl_assign_scalar!($t, AddAssign, add_assign, BinOp::Add, "add_assign");
+        impl_assign_scalar!($t, SubAssign, sub_assign, BinOp::Sub, "sub_assign");
+        impl_assign_scalar!($t, MulAssign, mul_assign, BinOp::Mul, "mul_assign");
+        impl_assign_scalar!($t, DivAssign, div_assign, BinOp::Div, "div_assign");
+    };
+}
+
 impl_operators!(f32);
 impl_operators!(u32);
+impl_operators!(f64);
+impl_operators!(Df32);
+impl_scalar_operators!(f32);
+impl_scalar_operators!(u32);
+impl_binary_operator!(u32, Rem, rem, BinOp::Rem, "rem");
+impl_binary_scalar!(u32, Rem, rem, BinOp::Rem, "rem");
+impl_assign_operator!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
+impl_assign_scalar!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 
 #[cfg(test)]
 mod tests {

@@ -12,7 +12,7 @@ fn sync_each(x: &Array<f32>, ops: usize) -> Result<f32> {
         y.eval()?;
         y.context().sync()?;
     }
-    y.sum()
+    y.sum().item()
 }
 
 /// The same operations, synchronizing once at the end.
@@ -21,7 +21,7 @@ fn batched(x: &Array<f32>, ops: usize) -> Result<f32> {
     for i in 0..ops {
         y += (i % 3) as f32 * 0.001 + 0.5;
     }
-    y.sum()
+    y.sum().item()
 }
 
 fn time(iterations: u32, mut f: impl FnMut() -> Result<f32>) -> Result<(f64, f32)> {

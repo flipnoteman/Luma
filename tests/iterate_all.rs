@@ -185,3 +185,82 @@ fn a_state_that_cycles_never_stops_early() {
         assert!(u.to_vec().unwrap().iter().all(|&v| v == want), "{steps} steps");
     }
 }
+
+/// `steps` applications of `step` written as a host loop.
+fn by_hand<const N: usize>(
+    init: [&Array<f32>; N],
+    steps: usize,
+    step: impl Fn(&[Array<f32>; N]) -> [Array<f32>; N],
+) -> [Array<f32>; N] {
+    let mut state = init.map(|array| array * 1.0);
+    for _ in 0..steps {
+        state = step(&state);
+    }
+    state
+}
+
+#[test]
+fn a_step_that_caches_in_the_middle_is_replayed() {
+    let ctx = Context::new().unwrap();
+    let x = f32s_on(&ctx, &values(200, 11, 0.0, 1.0));
+    let step = |[u]: &[Array<f32>; 1]| {
+        let smooth = (u * 0.5 + 0.1).cache();
+        [smooth.shift(1) * 0.25 + smooth.shift(-1) * 0.25 + u * 0.5]
+    };
+    let [got] = iterate_all([&x], 37, step);
+    let [want] = by_hand([&x], 37, step);
+    assert_close(&got.to_vec().unwrap(), &want.to_vec().unwrap(), 1e-5, 1e-6);
+}
+
+#[test]
+fn a_step_that_assigns_a_boundary_into_a_padded_temporary_is_replayed() {
+    let ctx = Context::new().unwrap();
+    let n = 24;
+    let x = f32s_on(&ctx, &values(n, 12, 0.0, 1.0));
+    let calls = std::cell::Cell::new(0);
+    let step = |[u]: &[Array<f32>; 1]| {
+        calls.set(calls.get() + 1);
+        let w = u.pad([(1, 1)], PadMode::Edge);
+        w.slice(0, ..1).assign(0.0).unwrap();
+        [w.slice(0, 1..n + 1) * 0.5 + w.slice(0, 0..n) * 0.25 + w.slice(0, 2..n + 2) * 0.25]
+    };
+    let [got] = iterate_all([&x], 37, step);
+    assert_eq!(calls.get(), 1, "traced once");
+    let [want] = by_hand([&x], 37, step);
+    assert_close(&got.to_vec().unwrap(), &want.to_vec().unwrap(), 1e-5, 1e-6);
+    // The state the loop started from is untouched.
+    assert_eq!(x.to_vec().unwrap(), values(n, 12, 0.0, 1.0));
+}
+
+#[test]
+fn a_step_that_reads_back_gives_the_host_loop_result() {
+    let ctx = Context::new().unwrap();
+    let x = f32s_on(&ctx, &values(50, 13, 1.0, 2.0));
+    let y = f32s_on(&ctx, &values(50, 14, 1.0, 2.0));
+    let step = |[a, b]: &[Array<f32>; 2]| {
+        let m = a.max().item().unwrap();
+        [a * (1.0 / m) + b * 0.25, b.shift(1) * 0.5 + a * 0.25]
+    };
+    let [ga, gb] = iterate_all([&x, &y], 9, step);
+    let [wa, wb] = by_hand([&x, &y], 9, step);
+    assert_close(&ga.to_vec().unwrap(), &wa.to_vec().unwrap(), 1e-5, 1e-6);
+    assert_close(&gb.to_vec().unwrap(), &wb.to_vec().unwrap(), 1e-5, 1e-6);
+}
+
+#[test]
+fn iterate_replays_a_step_with_a_cache_and_an_assignment() {
+    let ctx = Context::new().unwrap();
+    let n = 30;
+    let x = f32s_on(&ctx, &values(n, 15, 0.0, 1.0));
+    let step = |u: &Array<f32>| {
+        let w = u.pad([(1, 1)], PadMode::Mirror);
+        w.slice(0, n + 1..).assign(0.5).unwrap();
+        (w.slice(0, 1..n + 1) * 0.5 + w.slice(0, 2..n + 2) * 0.25 + u.cache().shift(1) * 0.25) * 0.9
+    };
+    let got = x.iterate(21, step);
+    let mut want = &x * 1.0;
+    for _ in 0..21 {
+        want = step(&want);
+    }
+    assert_close(&got.to_vec().unwrap(), &want.to_vec().unwrap(), 1e-5, 1e-6);
+}

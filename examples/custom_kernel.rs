@@ -84,7 +84,7 @@ fn main() -> Result<()> {
     println!("t ({h}x{w}):  {:?}", t.to_vec()?);
 
     // Built-in reductions work on the output like on any other array.
-    println!("sum of t:  {}", t.sum()?); // 0 + 1 + ... + 11 = 66
+    println!("sum of t:  {}", t.sum().item()?); // 0 + 1 + ... + 11 = 66
 
     // Mistakes in the arguments are reported as errors, not panics.
     let err = transpose.launch([w, h], args![&a, &mut t]).unwrap_err();

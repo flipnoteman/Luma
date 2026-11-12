@@ -31,6 +31,24 @@ fn stops_in_a_later_block() {
 }
 
 #[test]
+fn stops_after_the_blocks_have_grown() {
+    // The change of step k is 0.5^k, first at most 1e-16 at k = 54: past the blocks of 16 and 32.
+    let x = Array::from_slice(&[1.0f32; 100], 100).unwrap();
+    let got = x.iterate_until(200, 1e-16, halve).to_vec().unwrap();
+    let mut host = 1.0f32;
+    for _ in 0..200 {
+        let next = host * 0.5;
+        let change = host - next;
+        host = next;
+        if change <= 1e-16 {
+            break;
+        }
+    }
+    assert_eq!(host, 0.5f32.powi(54));
+    assert_close(&got, &[host; 100], 1e-6, 0.0);
+}
+
+#[test]
 fn max_steps_bounds_the_loop() {
     let x = Array::from_slice(&[1.0f32; 100], 100).unwrap();
     let got = x.iterate_until(20, 0.0, halve).to_vec().unwrap();
@@ -46,7 +64,7 @@ fn a_shift_step_matches_the_host_loop() {
     let mut u = &u0 * 1.0;
     for _ in 0..300 {
         let next = heat_step(&u);
-        let change = (&next - &u).abs().max().unwrap();
+        let change = (&next - &u).abs().max().item().unwrap();
         u = next;
         if change <= 1e-5 {
             break;
@@ -62,4 +80,20 @@ fn zero_steps_returns_a_copy() {
     let got = x.iterate_until(0, 1e-3, halve);
     assert_eq!(got.to_vec().unwrap(), data);
     assert_eq!(x.to_vec().unwrap(), data);
+}
+
+#[test]
+fn assigning_into_the_state_of_a_step_is_read_only() {
+    let x = Array::from_slice(&[1.0f32; 16], 16).unwrap();
+    let error = std::cell::RefCell::new(None);
+    let _ = x
+        .iterate_until(3, 0.0, |u| {
+            if let Err(e) = u.slice(0, ..1).assign(0.0) {
+                *error.borrow_mut() = Some(e);
+            }
+            u * 0.5
+        })
+        .to_vec();
+    let error = error.into_inner().expect("the assignment must fail");
+    assert!(matches!(error.root(), LumaError::ReadOnly(_)), "{error}");
 }

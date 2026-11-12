@@ -16,7 +16,7 @@ use crate::error::LumaError;
 use crate::ops::fold_workgroups;
 use crate::shape::Shape;
 
-use super::codegen::expression;
+use super::codegen::{expression, NO_NAMES};
 use super::program::{flatten_stencil, Fused, Instr, Ref};
 use super::{ElemTy, OpKind, ShiftKind};
 use crate::tuning::{stencil_bytes, Tuning, STENCIL_RADIUS as MAX_RADIUS};
@@ -97,7 +97,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
         return None;
     }
     let (w, h) = (u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?);
-    if !fused.key.subs.is_empty() || super::codegen::generates(&fused.key) {
+    if !fused.key.subs.is_empty() || !fused.key.narrow() || super::codegen::generates(&fused.key) {
         return None;
     }
     let out = *fused.key.outputs.first()?;
@@ -106,7 +106,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
     }
     let mut offsets = Vec::with_capacity(fused.key.instrs.len());
     let mut radius = (0u32, 0u32);
-    for instr in &fused.key.instrs {
+    for instr in fused.key.instrs.iter() {
         let OpKind::Shift(kind) = instr.op.kind else {
             offsets.push(None);
             continue;
@@ -119,7 +119,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
             ShiftKind::Dims { dims: s_dims, shifts } if s_dims == [w, h, 1, 1] => {
                 (signed(shifts[0], w), signed(shifts[1], h))
             }
-            ShiftKind::Dims { .. } => return None,
+            ShiftKind::Dims { .. } | ShiftKind::View { .. } | ShiftKind::Take { .. } => return None,
             ShiftKind::Linear => {
                 let Ref::Scalar(k) = instr.args[1] else {
                     return None;
@@ -153,7 +153,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
         .zip(fused.key.input_tys.iter().copied())
         .collect();
     Some(Stencil {
-        instrs: fused.key.instrs,
+        instrs: fused.key.instrs.to_vec(),
         inputs,
         u,
         scalar_tys: fused.key.scalar_tys,
@@ -266,7 +266,7 @@ fn main(
             for (t, instr) in self.instrs.iter().enumerate() {
                 let value = match self.offsets[t] {
                     Some((dx, dy)) => format!("{from}[u32(i32(c) + {})]", dx + dy * lw as i32),
-                    None => expression(instr, "i", "luma.size.x", false),
+                    None => expression(instr, "i", false, &NO_NAMES),
                 };
                 let _ = writeln!(
                     src,

@@ -193,7 +193,7 @@ impl LoopPlan {
             for (slot, state) in inputs.iter_mut().zip(states.drain(..)) {
                 *slot = state;
             }
-            let fused = Fused { key: body.key.clone(), inputs, scalars: body.scalars.clone(), fused_nodes: Vec::new() };
+            let fused = Fused { key: body.key.clone(), inputs, scalars: body.scalars.clone(), fused_nodes: Vec::new(), instr_nodes: Vec::new(), sub_roots: Vec::new() };
             states = launch::run_store(ctx, self.len, fused)?.into_iter().map(Arc::new).collect();
         }
         Ok(states)
@@ -279,9 +279,9 @@ impl Tracker {
 /// only found through its buffer.
 fn produced_by(roots: &[Arc<Node>], id: u64) -> Option<Arc<Storage>> {
     let mut stack: Vec<Arc<Node>> = roots.to_vec();
-    let mut seen: Vec<*const Node> = Vec::new();
+    let mut seen = super::program::Seen::default();
     while let Some(node) = stack.pop() {
-        if seen.contains(&Arc::as_ptr(&node)) {
+        if seen.contains(Arc::as_ptr(&node)) {
             continue;
         }
         seen.push(Arc::as_ptr(&node));
@@ -334,10 +334,11 @@ impl JitState {
             };
             states.push(state);
         }
-        let Some(traced) = flatten_step(nodes, &states, Tail::Store) else {
+        let Some(mut traced) = flatten_step(nodes, &states, Tail::Store) else {
             tracker.reset(nodes, Some(shape));
             return;
         };
+        self.intern(&mut traced.fused.key);
         let last = Last::of(&traced.fused, states.len());
         let repeats = tracker.last.as_ref().is_some_and(|before| before.is_step_of(&traced.fused, states.len()));
         let alive: Option<Vec<Arc<Node>>> = prev.into_iter().map(|(node, _)| node).collect();

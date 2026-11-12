@@ -71,7 +71,7 @@ impl KernelKey {
 }
 
 /// Everything about a built kernel that does not depend on the caller; cached per context.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct KernelCore {
     /// Unique per built kernel; identifies it in the bind group cache.
     pub(crate) id: u64,
@@ -165,6 +165,9 @@ fn shader_capabilities(features: wgpu::Features) -> naga::valid::Capabilities {
     }
     if features.contains(wgpu::Features::SHADER_F16) {
         caps |= Caps::SHADER_FLOAT16;
+    }
+    if features.contains(wgpu::Features::SHADER_F64) {
+        caps |= Caps::FLOAT64;
     }
     if features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
         caps |= Caps::COOPERATIVE_MATRIX;

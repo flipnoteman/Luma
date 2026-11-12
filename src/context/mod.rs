@@ -17,12 +17,15 @@ use crate::profile::{Profile, Profiler};
 use crate::tuning::{Tuning, TuningProfile};
 
 mod batch;
+mod record;
 mod transfer;
 mod uniforms;
 #[cfg(test)]
 mod tests;
 
 use batch::{Batch, BindGroupCache, Bound};
+pub(crate) use record::{Cmd, CmdArg, Recording};
+use record::RecState;
 pub(crate) use batch::RawArg;
 use transfer::{FreeUploads, WaitHistory};
 use uniforms::Arena;
@@ -57,6 +60,8 @@ struct Inner {
     mappable: Arc<Mutex<FreeUploads>>,
     /// Bytes of a full segment of an array, see [`Storage`](crate::array::Storage).
     segment_bytes: u64,
+    /// Whether results are checked for NaN and Inf (see [`ContextOptions::check_finite`]).
+    check_finite: bool,
     /// Which segments of arrays hold a device buffer.
     pager: Pager,
     /// Recycled mappable storage buffers waiting for the next submission before they are mapped.
@@ -66,6 +71,10 @@ struct Inner {
     /// Kernel parameters for this GPU.
     tuning: Tuning,
     batch: Mutex<Batch>,
+    /// The launches captured by a recording, see [`record`].
+    recording: Mutex<RecState>,
+    /// Whether `recording` is active: checked first so that launches pay one load when it is not.
+    recording_active: std::sync::atomic::AtomicBool,
     /// How long recent waits took, which sets how long the next one polls before it blocks.
     waits: WaitHistory,
     /// The first error the GPU reported outside of a call that could return it.
@@ -186,6 +195,11 @@ pub struct ContextOptions {
     /// Largest buffer an array is split into: a power of two from 1024 up to the largest
     /// bindable size. `None`: that size, or less when a memory budget is set.
     pub chunk_bytes: Option<u64>,
+    /// Debug mode: every array an operation computes is checked for NaN and infinities right
+    /// after its kernel, and the operation fails with [`LumaError::NonFinite`] if it holds one.
+    /// The check synchronizes with the GPU once per evaluated array, so it is for finding the
+    /// operation that first produces a non-finite value, not for production runs.
+    pub check_finite: bool,
 }
 
 impl ContextOptions {
@@ -208,8 +222,15 @@ impl ContextOptions {
         self
     }
 
+    /// Turns the finite check on or off (see [`ContextOptions::check_finite`]).
+    pub fn check_finite(mut self, on: bool) -> Self {
+        self.check_finite = on;
+        self
+    }
+
     /// Options from the environment: `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`),
-    /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts.
+    /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
+    /// `1` | `on` | `true` for the finite check.
     pub fn from_env() -> ContextOptions {
         let device = match std::env::var("LUMA_DEVICE").ok().as_deref().map(str::trim) {
             Some("gpu") => DeviceKind::Gpu,
@@ -221,6 +242,8 @@ impl ContextOptions {
             device,
             memory_budget: bytes("LUMA_MEMORY_BUDGET"),
             chunk_bytes: bytes("LUMA_CHUNK_BYTES"),
+            check_finite: std::env::var("LUMA_CHECK_FINITE")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
         }
     }
 }
@@ -329,9 +352,12 @@ impl Context {
                 uploads: Arc::new(Mutex::new(FreeUploads::new(cap))),
                 mappable: Arc::new(Mutex::new(FreeUploads::new(cap))),
                 segment_bytes,
+                check_finite: options.check_finite,
                 pager: Pager::new(budget),
                 unmapped: Mutex::new(Vec::new()),
                 batch: Mutex::new(batch),
+                recording: Mutex::new(RecState::Idle),
+                recording_active: std::sync::atomic::AtomicBool::new(false),
                 waits: WaitHistory::new(),
                 gpu_error,
                 #[cfg(test)]
@@ -353,6 +379,7 @@ impl Context {
     /// Submits everything recorded so far and waits until the GPU has executed it. Reports the
     /// first error the GPU raised while running luma's commands.
     pub fn sync(&self) -> Result<()> {
+        self.abort_recording()?;
         self.flush()?;
         let start = Instant::now();
         if !self.spin_until_idle() {
@@ -395,11 +422,13 @@ impl Context {
     /// as one fused kernel, so a chain is only cut at the flush point), which makes the GPU start
     /// on elementwise expressions too. Expressions whose arrays were already dropped are never
     /// evaluated, nor are arrays already computed inside another node's fused kernel (usually
-    /// the temporaries of an expression).
+    /// the temporaries of an expression). It only evaluates the arrays the calling thread created:
+    /// those of other threads using the context at the same time are theirs to evaluate (reading an
+    /// array always does).
     ///
     /// Only [`Context::sync`] and the operations that read results back
-    /// ([`Array::to_vec`](crate::Array::to_vec), [`Array::eval`](crate::Array::eval),
-    /// reductions) wait, and only they report an error the GPU raises while running the batch.
+    /// ([`Array::to_vec`](crate::Array::to_vec), [`Array::item`](crate::Array::item))
+    /// wait, and only they report an error the GPU raises while running the batch.
     /// A typical time-stepping loop records a few steps, calls `flush`, records the next few
     /// while the GPU runs the first, and reads results back once in a while:
     ///
@@ -412,7 +441,7 @@ impl Context {
     ///     }
     ///     ctx.flush()?; // the GPU runs this chunk while the next one is recorded
     /// }
-    /// println!("{}", x.sum()?);
+    /// println!("{}", x.sum().item()?);
     /// # Ok::<(), luma::LumaError>(())
     /// ```
     pub fn flush(&self) -> Result<()> {
@@ -434,6 +463,11 @@ impl Context {
     /// Bytes of a full segment of an array: the largest buffer an array is split into.
     pub(crate) fn segment_bytes(&self) -> u64 {
         self.inner.segment_bytes
+    }
+
+    /// Whether the finite check is on (see [`ContextOptions::check_finite`]).
+    pub(crate) fn check_finite(&self) -> bool {
+        self.inner.check_finite
     }
 
     /// Largest buffer that can be allocated and bound as a storage buffer.
@@ -568,6 +602,7 @@ impl Context {
     /// to pooled buffers outside the stream (`Queue::write_buffer` is only used for uniform
     /// slots, which are never pooled).
     pub(crate) fn recycle(&self, buffer: Buffer) {
+        let Some(buffer) = self.retire(buffer) else { return };
         if buffer.usage().contains(BufferUsages::MAP_WRITE) {
             // May still be used by the unsubmitted batch, which mapping would invalidate; it is
             // mapped after the next submission. This must not take the batch lock: it can be
@@ -592,7 +627,8 @@ impl Context {
     }
 
     /// The features the device was opened with. Custom kernels may use the shader features
-    /// among them (`SUBGROUP`, `SHADER_F16`, `EXPERIMENTAL_COOPERATIVE_MATRIX`) when present.
+    /// among them (`SUBGROUP`, `SHADER_F16`, `SHADER_F64`, `EXPERIMENTAL_COOPERATIVE_MATRIX`) when
+    /// present. `SHADER_F64` is also what `f64` arrays need.
     pub fn features(&self) -> wgpu::Features {
         self.device().features()
     }
@@ -618,6 +654,7 @@ impl Context {
         let mut batch = self.batch()?;
         if batch.profiler.is_none() {
             batch.profiler = Some(Profiler::new());
+            self.jit().start_splits();
         }
         Ok(())
     }
@@ -628,6 +665,7 @@ impl Context {
     ///
     /// Fails with [`LumaError::Profiling`] if profiling is not enabled.
     pub fn finish_profiling(&self) -> Result<Profile> {
+        self.abort_recording()?;
         if self.batch()?.profiler.is_none() {
             return Err(LumaError::Profiling("profiling is not enabled".into()));
         }
@@ -642,6 +680,7 @@ impl Context {
             self.flush_locked(&mut batch);
             profiler
         };
+        let splits = self.jit().take_split_notes();
         self.sync()?;
 
         // Everything profiled has completed; only now are its timestamps reliably written.
@@ -658,7 +697,9 @@ impl Context {
             let nanos = end.saturating_sub(begin) as f64 * period;
             samples.push((Arc::clone(label), Duration::from_secs_f64(nanos * 1e-9)));
         }
-        Ok(Profile::from_samples(samples))
+        let mut profile = Profile::from_samples(samples);
+        profile.splits = splits;
+        Ok(profile)
     }
 
     /// Runs `f` and measures the GPU time of every kernel launch recorded during it (and, since
@@ -675,7 +716,7 @@ impl Context {
     /// ```no_run
     /// # let ctx = luma::Context::new()?;
     /// let x = luma::Array::from_slice_on(&ctx, &[1.0f32; 1 << 20], 1 << 20)?;
-    /// let (sum, profile) = ctx.profile(|| (&x * 2.0).sum())?;
+    /// let (sum, profile) = ctx.profile(|| (&x * 2.0).sum().item())?;
     /// println!("sum = {}\n{profile}", sum?);
     /// # Ok::<(), luma::LumaError>(())
     /// ```

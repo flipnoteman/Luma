@@ -7,8 +7,10 @@ use crate::context::{default_context, Context};
 use crate::gpu::pager::{Pin, Segment};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::GpuType;
-use crate::jit::{Node, Readers, Src};
+use crate::jit::{Held, Node, Readers, Src};
+use crate::reduce::Reduced;
 use crate::shape::Shape;
+use crate::view::ViewOf;
 
 /// Why an operation on arrays did not produce a result. Internal: operators turn it into a
 /// poisoned array, `try_*` methods into a plain error.
@@ -143,6 +145,11 @@ impl Storage {
         self.segments.len()
     }
 
+    /// Number of elements.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
     /// Bytes per element.
     pub(crate) fn elem(&self) -> usize {
         self.elem
@@ -176,6 +183,12 @@ impl Storage {
         self.segment(j).pin()
     }
 
+    /// [`Storage::pin`] without marking the storage as materialized: the tracers of `iterate` take
+    /// a materialized probe for one that was used eagerly.
+    pub(crate) fn pin_quiet(&self, j: usize) -> Result<Pin> {
+        self.segments[j].pin()
+    }
+
     /// Pins the only segment of a storage that fits one buffer; operations that cannot run
     /// piecewise use this and fail with [`LumaError::Chunked`] on larger ones.
     pub(crate) fn pin_single(&self) -> Result<Pin> {
@@ -200,9 +213,12 @@ enum Repr {
     Valid(Arc<Storage>),
     /// An elementwise expression that has not run yet; evaluated (once) when its buffer is
     /// needed. See [`crate::jit`].
-    Lazy(Arc<Node>),
+    Lazy(Held),
     /// An operation producing this array failed; see [`Array::error`].
     Poisoned(Arc<LumaError>),
+    /// A reduction of a pending expression: recorded into a buffer when the GPU needs it, read
+    /// from the expression when the host does. See [`crate::reduce`].
+    Reduced(Arc<Reduced>),
 }
 
 /// GPU-resident array of up to four dimensions.
@@ -210,8 +226,8 @@ enum Repr {
 /// Arrays are created from host data ([`Array::from_slice`], [`Array::zeros`], ...) on the
 /// [default context](crate::default_context) or, with the `_on` variants, on an explicit
 /// [`Context`]. Math is written like on the host: operators (`&a + &b * 2.0`), methods
-/// (`a.sqrt()`) and reductions (`a.sum()?`). Nothing waits for the GPU until a result is needed:
-/// [`Array::to_vec`], [`Array::eval`] and the reductions are the synchronization points.
+/// (`a.sqrt()`) and reductions (`a.sum()`). Nothing waits for the GPU until a result is needed:
+/// [`Array::to_vec`] and [`Array::item`] are the synchronization points.
 ///
 /// # Lazy arrays and fusion
 ///
@@ -219,7 +235,9 @@ enum Repr {
 /// array holding the expression, and a chain such as `(&x * 2.0 + &y).sqrt()` becomes a single
 /// generated kernel when the data is first needed (reading it back, `eval`, `write`, a shift, a
 /// convolution, a custom kernel, [`Context::sync`]). Reductions fuse the expression into their
-/// first pass. A lazy array behaves as the value its expression had when it was written: later
+/// first pass and are lazy themselves: `x.sum()` is a one-element array, so `&x / &x.sum()`
+/// normalizes on the GPU without reading anything back, and [`Array::item`] gives the host value.
+/// A lazy array behaves as the value its expression had when it was written: later
 /// changes of its inputs (`write`, `+=`, kernels taking `&mut`) do not affect it.
 ///
 /// # Errors do not panic: poisoned arrays
@@ -243,8 +261,12 @@ enum Repr {
 ///
 /// # Sharing
 ///
-/// [`Array::reshape`] shares the buffer. In-place operations (`+=`), [`Array::write`] and kernels
-/// taking the array as `&mut` therefore change every array sharing it.
+/// [`Array::reshape`] and [`Clone::clone`] share the buffer (or, for an array that has not run
+/// yet, the pending expression: it is evaluated once, whichever clone needs it first). A clone is
+/// a cheap handle, not a copy: in-place operations (`+=`), [`Array::write`],
+/// [`Array::assign`] and kernels taking the array as `&mut` therefore change every array sharing
+/// the data, clones and reshapes alike. Lazy expressions recorded before the write keep the
+/// values they were recorded against. Use `&a * 1.0` for an independent copy.
 ///
 /// Dropping an array returns its buffer to the context's pool for reuse.
 #[derive(Debug)]
@@ -252,7 +274,24 @@ pub struct Array<T: GpuType> {
     ctx: Context,
     shape: Shape,
     repr: Repr,
+    /// Set on views that write through to the array they read (see [`Array::slice`]).
+    view: Option<Arc<ViewOf>>,
     _marker: PhantomData<T>,
+}
+
+impl<T: GpuType> Clone for Array<T> {
+    /// Another handle on the same data: the buffer, or the pending expression (counted as a
+    /// second handle, so that nothing treats the expression as private to one array). See
+    /// "Sharing" in the type's documentation.
+    fn clone(&self) -> Self {
+        let repr = match &self.repr {
+            Repr::Valid(storage) => Repr::Valid(Arc::clone(storage)),
+            Repr::Lazy(node) => Repr::Lazy(node.share()),
+            Repr::Poisoned(error) => Repr::Poisoned(Arc::clone(error)),
+            Repr::Reduced(reduced) => Repr::Reduced(Arc::clone(reduced)),
+        };
+        Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), _marker: PhantomData }
+    }
 }
 
 impl<T: GpuType> Array<T> {
@@ -266,17 +305,23 @@ impl<T: GpuType> Array<T> {
             ctx: ctx.clone(),
             shape,
             repr: Repr::Valid(Arc::new(Storage::new(ctx, len, std::mem::size_of::<T>()))),
+            view: None,
             _marker: PhantomData,
         })
     }
 
     pub(crate) fn from_storage(ctx: &Context, shape: Shape, storage: Arc<Storage>) -> Self {
-        Array { ctx: ctx.clone(), shape, repr: Repr::Valid(storage), _marker: PhantomData }
+        Array { ctx: ctx.clone(), shape, repr: Repr::Valid(storage), view: None, _marker: PhantomData }
     }
 
     /// An array that is the (not yet evaluated) result of `node`.
     pub(crate) fn from_node(ctx: &Context, shape: Shape, node: Arc<Node>) -> Self {
-        Array { ctx: ctx.clone(), shape, repr: Repr::Lazy(node), _marker: PhantomData }
+        Array { ctx: ctx.clone(), shape, repr: Repr::Lazy(Held::new(node)), view: None, _marker: PhantomData }
+    }
+
+    /// The (not yet recorded) reduction `reduced` as an array of `shape`.
+    pub(crate) fn from_reduced(ctx: &Context, shape: Shape, reduced: Arc<Reduced>) -> Self {
+        Array { ctx: ctx.clone(), shape, repr: Repr::Reduced(reduced), view: None, _marker: PhantomData }
     }
 
     /// Placeholder sharing this array's buffer under a fresh [`Storage`] id, for [`Array::iterate`].
@@ -286,12 +331,20 @@ impl<T: GpuType> Array<T> {
             ctx: self.ctx.clone(),
             shape: self.shape,
             repr: Repr::Valid(Arc::new(Storage::alias(storage))),
+            view: None,
             _marker: PhantomData,
         })
     }
 
+    /// A placeholder with a new buffer of unspecified contents, for tracing a step that is
+    /// recorded and replayed (see `jit::replay`). Fails like [`Array::probe`] on a poisoned array.
+    pub(crate) fn fresh_probe(&self) -> std::result::Result<Self, Failure> {
+        self.storage()?;
+        Ok(Array::alloc(&self.ctx, self.shape)?)
+    }
+
     fn poisoned(ctx: &Context, shape: Shape, error: Arc<LumaError>) -> Self {
-        Array { ctx: ctx.clone(), shape, repr: Repr::Poisoned(error), _marker: PhantomData }
+        Array { ctx: ctx.clone(), shape, repr: Repr::Poisoned(error), view: None, _marker: PhantomData }
     }
 
     /// Turns the outcome of an operation into the array it returns: a failure becomes a poisoned
@@ -351,6 +404,7 @@ impl<T: GpuType> Array<T> {
                 ctx: ctx.clone(),
                 shape,
                 repr: Repr::Valid(Arc::new(storage)),
+                view: None,
                 _marker: PhantomData,
             });
         }
@@ -413,8 +467,9 @@ impl<T: GpuType> Array<T> {
     fn failed(&self) -> Option<&Arc<LumaError>> {
         match &self.repr {
             Repr::Valid(_) => None,
-            Repr::Lazy(node) => node.failure(),
+            Repr::Lazy(held) => held.latest().failure(),
             Repr::Poisoned(error) => Some(error),
+            Repr::Reduced(reduced) => reduced.failure(),
         }
     }
 
@@ -432,11 +487,24 @@ impl<T: GpuType> Array<T> {
     pub(crate) fn storage(&self) -> std::result::Result<&Arc<Storage>, Failure> {
         match &self.repr {
             Repr::Valid(storage) => Ok(storage),
-            Repr::Lazy(node) => {
-                node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
+            Repr::Lazy(held) => {
+                held.latest().force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
             }
             Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
+            Repr::Reduced(reduced) => {
+                reduced.force(&self.ctx).as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))
+            }
         }
+    }
+
+    /// [`Array::storage`] for a shift, view or gather that decided to read this array evaluated:
+    /// a pending expression is computed together with the live arrays that share work with it
+    /// (the other fields of a record, say) in one multi-output kernel instead of alone.
+    pub(crate) fn storage_alongside(&self) -> std::result::Result<&Arc<Storage>, Failure> {
+        if let Some(node) = self.pending() {
+            self.ctx.jit().evaluate_alongside(Arc::clone(node));
+        }
+        self.storage()
     }
 
     /// A pin on the buffer holding the array and the number of bytes of it holding the array,
@@ -452,17 +520,49 @@ impl<T: GpuType> Array<T> {
     pub(crate) fn src(&self) -> std::result::Result<Src, Failure> {
         match &self.repr {
             Repr::Valid(storage) => Ok(Src::Buffer(Arc::clone(storage))),
-            Repr::Lazy(node) => node.as_src(),
+            Repr::Lazy(held) => held.latest().as_src(),
             Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
+            Repr::Reduced(_) => Ok(Src::Buffer(Arc::clone(self.storage()?))),
         }
+    }
+
+    /// This array marked as writing through to what `view` reads (see [`ViewOf`]).
+    pub(crate) fn with_view(mut self, view: ViewOf) -> Self {
+        self.view = Some(Arc::new(view));
+        self
+    }
+
+    /// What this array is a view of, if it is an injective view of another array's data.
+    pub(crate) fn view(&self) -> Option<&ViewOf> {
+        self.view.as_deref()
     }
 
     /// The expression behind this array if it has not been evaluated yet.
     pub(crate) fn pending(&self) -> Option<&Arc<Node>> {
         match &self.repr {
-            Repr::Lazy(node) if node.is_pending() => Some(node),
+            Repr::Lazy(held) => Some(held.latest()).filter(|node| node.is_pending()),
             _ => None,
         }
+    }
+
+    /// Whether an assignment replaced the pending expression this array was created holding
+    /// (see [`crate::jit::supersede`]): the array now denotes another node.
+    pub(crate) fn is_superseded(&self) -> bool {
+        matches!(&self.repr, Repr::Lazy(held) if held.is_superseded())
+    }
+
+    /// The claim this array has on its expression, if it is lazy.
+    pub(crate) fn held(&self) -> Option<&Held> {
+        match &self.repr {
+            Repr::Lazy(held) => Some(held),
+            _ => None,
+        }
+    }
+
+    /// Whether another array holds the pending expression this one is (a clone or a view that
+    /// reads its data back): rebinding this array to a new expression would not reach it.
+    pub(crate) fn expression_shared(&self) -> bool {
+        matches!(&self.repr, Repr::Lazy(node) if node.is_shared())
     }
 
     /// Whether this array is the only holder of its own (non-aliased) buffer: nothing else can
@@ -470,7 +570,7 @@ impl<T: GpuType> Array<T> {
     pub(crate) fn sole_owner(&self) -> bool {
         let storage = match &self.repr {
             Repr::Valid(storage) => storage,
-            Repr::Lazy(node) if Arc::strong_count(node) == 1 => match node.evaluated() {
+            Repr::Lazy(held) if Arc::strong_count(held.latest()) == 1 => match held.latest().evaluated() {
                 Some(storage) => storage,
                 None => return false,
             },
@@ -485,6 +585,7 @@ impl<T: GpuType> Array<T> {
     pub(crate) fn flush_readers(&self) {
         if let Ok(storage) = self.storage() {
             storage.readers.flush();
+            self.ctx.jit().note_write();
         }
     }
 
@@ -504,6 +605,11 @@ impl<T: GpuType> Array<T> {
     /// finished it, so this is where a poisoned array's error (or an error the GPU reported
     /// while running the batch) comes out.
     pub fn to_vec(&self) -> Result<Vec<T>> {
+        if let Repr::Reduced(reduced) = &self.repr
+            && reduced.is_unforced()
+        {
+            return reduced.read::<T>(&self.ctx);
+        }
         let storage = self.storage().map_err(Failure::into_error)?;
         self.ctx.read_storage(storage)
     }
@@ -513,6 +619,15 @@ impl<T: GpuType> Array<T> {
     /// which cost about as much as the transfer itself on large arrays: prefer this when
     /// reading results back repeatedly.
     pub fn read_into(&self, out: &mut [T]) -> Result<()> {
+        if let Repr::Reduced(reduced) = &self.repr
+            && reduced.is_unforced()
+        {
+            if out.len() != self.len() {
+                return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
+            }
+            out.copy_from_slice(&reduced.read::<T>(&self.ctx)?);
+            return Ok(());
+        }
         let storage = self.storage().map_err(Failure::into_error)?;
         if out.len() != self.len() {
             return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
@@ -528,12 +643,12 @@ impl<T: GpuType> Array<T> {
 
     /// Records the array's pending computation and hands the batch to the GPU without waiting
     /// for it, like ArrayFire's `eval`: the GPU runs while the host records the next steps.
-    /// [`Context::sync`], [`Array::to_vec`] and reductions wait. Lazy arrays other than this one
+    /// [`Context::sync`], [`Array::to_vec`] and [`Array::item`] wait. Lazy arrays other than this one
     /// (and what it is computed from) stay lazy, unlike [`Context::flush`]. Returns the array's
     /// error if it is poisoned.
     ///
     /// Nothing waits, so an error the GPU raises while running the batch only shows up at the
-    /// next call that waits ([`Context::sync`], [`Array::to_vec`], reductions).
+    /// next call that waits ([`Context::sync`], [`Array::to_vec`], [`Array::item`]).
     ///
     /// While the GPU is still busy with earlier work, the computation is postponed to the next
     /// `eval` that finds it idle, [`Context::sync`] or [`Context::flush`]; reading the array
@@ -549,12 +664,12 @@ impl<T: GpuType> Array<T> {
 
     /// Asks for the array to be computed at the next submission, or returns its error.
     pub(crate) fn request(&self) -> Result<()> {
-        match &self.repr {
-            Repr::Lazy(node) if node.is_pending() => {
+        match self.pending() {
+            Some(node) => {
                 self.ctx.jit().request(node);
                 Ok(())
             }
-            _ => self.storage().map(|_| ()).map_err(Failure::into_error),
+            None => self.storage().map(|_| ()).map_err(Failure::into_error),
         }
     }
 
@@ -608,6 +723,7 @@ impl<T: GpuType> Array<T> {
             ctx: self.ctx.clone(),
             shape,
             repr: Repr::Valid(Arc::clone(storage)),
+            view: None,
             _marker: PhantomData,
         })
     }

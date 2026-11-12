@@ -155,7 +155,7 @@ fn profile_labels_fused_kernels_by_their_operations() {
     let ((z, total), profile) = ctx
         .profile(|| {
             let z = (&x * 2.0 + &y).sqrt();
-            let total = (&x * &y).sum().unwrap();
+            let total = (&x * &y).sum().item().unwrap();
             (z, total)
         })
         .unwrap();
