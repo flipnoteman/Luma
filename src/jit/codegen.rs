@@ -19,9 +19,10 @@
 use std::fmt::Write;
 
 use crate::builtin::{df_library, reduce_main, ReduceElem};
+use crate::gpu::hash::FxMap;
 use crate::tuning::{Tuning, STENCIL_RADIUS};
 
-use super::inline::{Inlined, Lowered, StagedPrograms};
+use super::inline::{Inlined, Lowered, Region, StagedPrograms};
 use super::program::{calls_df_library, FusedKey, Instr, Ref, Tail};
 use super::staging::Staging;
 use super::stencil::{signed, wrap_source, WORKGROUP};
@@ -650,17 +651,23 @@ fn flat_name(reference: Ref, ty: ElemTy, at: u32) -> String {
 }
 
 /// The body of a lowered key (see [`Inlined`]): the index of every context, the inputs loaded at
-/// them, then the instructions, each defined (`t{n}`) after everything it reads. `names` and
-/// `index` are those of [`expression`].
+/// them, then the instructions, each defined (`t{n}`) after everything it reads. A `Select` the
+/// lowering marks as a branch is an `if`/`else` that computes the instructions only its own
+/// operand needs. `names` and `index` are those of [`expression`].
 fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, staging: Option<&Staging>) -> String {
     struct Emit<'a> {
         key: &'a FusedKey,
         inlined: &'a Inlined,
         names: &'a Names<'a>,
         index: &'a str,
+        staging: Option<&'a Staging>,
         src: String,
+        /// The contexts whose index is declared, and the inputs loaded at them, in the block
+        /// being written (a block that ends forgets what it declared).
         defined: Vec<bool>,
         loaded: Vec<(u32, u32)>,
+        /// The instructions of every region not written yet, in order.
+        members: FxMap<Region, Vec<u32>>,
     }
     impl Emit<'_> {
         /// The index of context `c`.
@@ -716,59 +723,127 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                 let _ = writeln!(self.src, "    let a{k}_{c}: {ty} = {buffer}[i{c}];");
             }
         }
+
+        /// Writes the instructions computed in `region`.
+        fn region(&mut self, region: Region) {
+            for n in self.members.remove(&region).unwrap_or_default() {
+                self.instruction(n as usize);
+            }
+        }
+
+        /// How far the cell of context `c` is from the cell of the program: the starts of the
+        /// translation views on the way (what `staging` lets a staged read be through).
+        fn translation(&self, mut c: u32) -> [i32; 2] {
+            let mut offset = [0, 0];
+            while c != 0 {
+                let Some(ctx) = self.inlined.ctxs.get(c as usize) else { break };
+                if let ShiftKind::View { map, .. } = ctx.kind {
+                    offset[0] += map.axes[0].start;
+                    offset[1] += map.axes[1].start;
+                }
+                c = ctx.parent;
+            }
+            offset
+        }
+
+        /// Writes instruction `n`.
+        fn instruction(&mut self, n: usize) {
+            let inlined = self.inlined;
+            let Some(flat) = inlined.instrs.get(n) else { return };
+            // A read from workgroup memory needs no index: the cell is `(lx, ly)` plus offsets.
+            let staged_read = match (flat.op.kind, flat.args[0]) {
+                (OpKind::Shift(_), Ref::Sub(s)) => self.staging.is_some_and(|layout| layout.find(s).is_some()),
+                _ => false,
+            };
+            if !staged_read {
+                self.define(flat.at);
+            }
+            if inlined.branch.get(n).copied().unwrap_or(false) {
+                return self.branch(n);
+            }
+            let op = flat.op;
+            let value = match op.kind {
+                OpKind::Shift(kind) => {
+                    self.define(flat.child);
+                    let at = self.index_of(flat.child);
+                    let read = match flat.args[0] {
+                        Ref::Input(k) => format!("{}[{at}]", self.buffer(k)),
+                        Ref::Tmp(v) => format!("t{v}"),
+                        Ref::Sub(s) => match (self.staging.and_then(|layout| layout.find(s)), kind) {
+                            // A read from workgroup memory: the region's cell `(lx, ly)` plus the
+                            // offsets of the contexts the read is in and of the read itself.
+                            (Some(entry), ShiftKind::View { map, .. }) => {
+                                let base = self.translation(flat.at);
+                                let (dx, dy) = (map.axes[0].start + base[0] - entry.lo[0], map.axes[1].start + base[1] - entry.lo[1]);
+                                format!("w{s}[u32(lx + ({dx})) + u32(ly + ({dy})) * {}u]", entry.width())
+                            }
+                            _ => format!("{}[{at}]", name(Ref::Sub(s), ElemTy::U32)),
+                        },
+                        other => format!("{}[{at}]", name(other, ElemTy::U32)),
+                    };
+                    match kind {
+                        ShiftKind::View { map, edge: Edge::Fill } => {
+                            let fill = flat_name(flat.args[1], op.operand_ty(1), flat.at);
+                            let view = self.names.views.iter().position(|&known| known == (map, Edge::Fill));
+                            let inside = format!("view{}_in({})", view.map_or_else(|| "_missing".to_owned(), |n| n.to_string()), self.index_of(flat.at));
+                            format!("select({fill}, {read}, {inside})")
+                        }
+                        _ => read,
+                    }
+                }
+                _ => {
+                    for reference in flat.args.iter().take(op.kind.arity()) {
+                        if let Ref::Input(k) = *reference {
+                            self.load(k, flat.at);
+                        }
+                    }
+                    let [a, b, c] = [0, 1, 2].map(|i| flat_name(flat.args[i], op.operand_ty(i), flat.at));
+                    operation(op, &a, &b, &c, &self.index_of(flat.at)).unwrap_or_default()
+                }
+            };
+            let _ = writeln!(self.src, "    let t{n}: {} = {value};", op.out_ty().wgsl());
+        }
+
+        /// Writes the `Select` `n` as `if`/`else`, each branch computing its own instructions
+        /// before it takes its operand.
+        fn branch(&mut self, n: usize) {
+            let inlined = self.inlined;
+            let Some(flat) = inlined.instrs.get(n) else { return };
+            let mask = flat_name(flat.args[0], ElemTy::U32, flat.at);
+            let _ = writeln!(self.src, "    var t{n}: {};\n    if ({mask} != 0u) {{", flat.op.out_ty().wgsl());
+            for (side, slot) in [(Region::Taken(n as u32), 1), (Region::Skipped(n as u32), 2)] {
+                if slot == 2 {
+                    self.src.push_str("    } else {\n");
+                }
+                let outer = (self.defined.clone(), self.loaded.clone());
+                self.region(side);
+                if let Ref::Input(k) = flat.args[slot] {
+                    self.load(k, flat.at);
+                }
+                let value = flat_name(flat.args[slot], flat.op.operand_ty(slot), flat.at);
+                let _ = writeln!(self.src, "    t{n} = {value};");
+                (self.defined, self.loaded) = outer;
+            }
+            self.src.push_str("    }\n");
+        }
     }
 
+    let mut members: FxMap<Region, Vec<u32>> = FxMap::default();
+    for (n, &region) in inlined.region.iter().enumerate() {
+        members.entry(region).or_default().push(n as u32);
+    }
     let mut emit = Emit {
         key,
         inlined,
         names,
         index,
+        staging,
         src: String::new(),
         defined: vec![false; inlined.ctxs.len()],
         loaded: Vec::new(),
+        members,
     };
-    for (n, flat) in inlined.instrs.iter().enumerate() {
-        emit.define(flat.at);
-        let op = flat.op;
-        let value = match op.kind {
-            OpKind::Shift(kind) => {
-                emit.define(flat.child);
-                let at = emit.index_of(flat.child);
-                let read = match flat.args[0] {
-                    Ref::Input(k) => format!("{}[{at}]", emit.buffer(k)),
-                    Ref::Tmp(v) => format!("t{v}"),
-                    Ref::Sub(s) => match (staging.and_then(|layout| layout.find(s)), kind) {
-                        // A read from workgroup memory: the region's cell `(lx, ly) + offset`.
-                        (Some(entry), ShiftKind::View { map, .. }) => {
-                            let (dx, dy) = (map.axes[0].start - entry.lo[0], map.axes[1].start - entry.lo[1]);
-                            format!("w{s}[u32(lx + ({dx})) + u32(ly + ({dy})) * {}u]", entry.width())
-                        }
-                        _ => format!("{}[{at}]", name(Ref::Sub(s), ElemTy::U32)),
-                    },
-                    other => format!("{}[{at}]", name(other, ElemTy::U32)),
-                };
-                match kind {
-                    ShiftKind::View { map, edge: Edge::Fill } => {
-                        let fill = flat_name(flat.args[1], op.operand_ty(1), flat.at);
-                        let view = names.views.iter().position(|&known| known == (map, Edge::Fill));
-                        let inside = format!("view{}_in({})", view.map_or_else(|| "_missing".to_owned(), |n| n.to_string()), emit.index_of(flat.at));
-                        format!("select({fill}, {read}, {inside})")
-                    }
-                    _ => read,
-                }
-            }
-            _ => {
-                for reference in flat.args.iter().take(op.kind.arity()) {
-                    if let Ref::Input(k) = *reference {
-                        emit.load(k, flat.at);
-                    }
-                }
-                let [a, b, c] = [0, 1, 2].map(|i| flat_name(flat.args[i], op.operand_ty(i), flat.at));
-                operation(op, &a, &b, &c, &emit.index_of(flat.at)).unwrap_or_default()
-            }
-        };
-        let _ = writeln!(emit.src, "    let t{n}: {} = {value};", op.out_ty().wgsl());
-    }
+    emit.region(Region::Top);
     emit.src
 }
 

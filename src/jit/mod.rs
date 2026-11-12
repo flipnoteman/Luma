@@ -70,10 +70,17 @@
 //!   sub-program once per cell of its region (the tile plus the offsets reached, and what the
 //!   sub-programs staged after it need) into workgroup memory, and the reads come from there
 //!   (see `staging`, `LUMA_STAGING=off` to switch it off). The tile shrinks until the regions
-//!   fit `Tuning::stencil_tile_bytes`. Sub-programs read through anything else (edge handling,
-//!   gathers, strides, a view of a staged sub-program that is not itself staged) are
-//!   recomputed per read as above, and a program over arrays split over several buffers is
-//!   never staged.
+//!   fit `Tuning::stencil_tile_bytes`. A sub-program that is read once (or that only views another
+//!   one) is computed inside the programs that read it, so what it reads is staged at the sum of
+//!   the offsets on the way: a ghost-padded record read at four offsets by a flux that a cell reads
+//!   once is staged all the same. Sub-programs read through anything else (edge handling,
+//!   gathers, strides) are recomputed per read as above, and a program over arrays split over
+//!   several buffers is never staged.
+//! * A `select` whose mask depends on the coordinates only (the mask of an `assign` into a region
+//!   of a lazy array) is written as `if`/`else` when the expressions only one of its operands
+//!   reads are worth at least 8 f32 operations per element: a ghost expression is computed in
+//!   the ghost cells, not at every cell that reads the padded array. The cost model counts those
+//!   operations by the share of cells that take the branch (see `inline::branches`).
 //! * When an expression is evaluated, a pending node inside it that another pending, live
 //!   operation outside the expression also reads is evaluated on its own first, instead of
 //!   being recomputed in both kernels. Sharing within one expression is free: a shared node is
@@ -1740,6 +1747,9 @@ pub(crate) struct JitState {
     /// Instructions of the program of the last kernel looked up (tests).
     #[cfg(test)]
     last_program_len: AtomicUsize,
+    /// Selects computed as `if`/`else` in the last kernel built (tests).
+    #[cfg(test)]
+    last_branches: AtomicUsize,
     /// Whether [`simplify`] runs (tests switch it off to compare against the unsimplified result).
     #[cfg(test)]
     simplify: AtomicBool,
@@ -1814,6 +1824,8 @@ impl JitState {
             splits: Mutex::new(None),
             #[cfg(test)]
             last_program_len: AtomicUsize::new(0),
+            #[cfg(test)]
+            last_branches: AtomicUsize::new(0),
             #[cfg(test)]
             simplify: AtomicBool::new(true),
             #[cfg(test)]
@@ -2059,6 +2071,11 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn last_program_len(&self) -> usize {
         self.last_program_len.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_branches(&self) -> usize {
+        self.last_branches.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -2316,6 +2333,16 @@ impl JitState {
             Some(Lowered::Plain(inlined)) => self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed),
             Some(Lowered::Staged(programs)) => self.last_inlined_len.store(programs.main.instrs.len(), Ordering::Relaxed),
             None => {}
+        }
+        #[cfg(test)]
+        {
+            let count = |inlined: &inline::Inlined| inlined.branch.iter().filter(|&&branch| branch).count();
+            let branches = match &lowered {
+                Some(Lowered::Plain(inlined)) => count(inlined),
+                Some(Lowered::Staged(programs)) => count(&programs.main) + programs.subs.iter().map(count).sum::<usize>(),
+                None => 0,
+            };
+            self.last_branches.store(branches, Ordering::Relaxed);
         }
         let source = codegen::source(key, ctx.tuning(), segment_len, lowered.as_ref());
         let label = key.label();

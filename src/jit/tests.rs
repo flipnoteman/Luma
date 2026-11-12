@@ -2783,3 +2783,99 @@ fn writes_between_speculated_readbacks_are_seen_by_the_next_readback() {
         assert!(ctx.jit().speculation_hits() > 0, "{events:?}: no readback was answered ahead of time");
     }
 }
+
+/// A padded 2-D array with ghost cells on two sides assigned an expression of the edge cells,
+/// read by a stencil at five offsets (a boundary condition of a solver). Every read of the padded
+/// array used to compute the ghost expressions at the cell it reads; they are only worth computing
+/// in the ghost cells, which the generated code does with `if`/`else` instead of a `select`.
+#[test]
+fn ghost_regions_are_computed_only_where_they_are_assigned() {
+    use crate::view::PadMode;
+    let (n, m) = (40usize, 24usize);
+    let data = values(n * m, 77, 0.5, 1.5);
+    // The ghost expression: seven chained operations of the edge value.
+    let ghost = |e: &Array<f32>| {
+        let mut a = e * 1.5 + 0.25;
+        for k in 0..6 {
+            a = (&a * 0.9 + 0.1).sqrt() + e * (0.01 * (k + 1) as f32);
+        }
+        a
+    };
+    let ghost_host = |e: f32| {
+        let mut a = e * 1.5 + 0.25;
+        for k in 0..6 {
+            a = (a * 0.9 + 0.1).sqrt() + e * (0.01 * (k + 1) as f32);
+        }
+        a
+    };
+    // The padded array on the host: edge padding, the two ghost regions assigned over it.
+    let (wn, wm) = (n + 4, m + 4);
+    let at = |x: usize, y: usize| data[x.saturating_sub(2).min(n - 1) + n * y.saturating_sub(2).min(m - 1)];
+    let mut padded = vec![0.0f32; wn * wm];
+    for y in 0..wm {
+        for x in 0..wn {
+            padded[x + wn * y] = if x < 2 && (2..m + 2).contains(&y) {
+                ghost_host(at(2, y))
+            } else if y < 2 && (2..n + 2).contains(&x) {
+                ghost_host(at(x, 2))
+            } else {
+                at(x, y)
+            };
+        }
+    }
+    let read = |x: usize, y: usize| padded[x + wn * y];
+    let mut want = vec![0.0f32; n * m];
+    for y in 0..m {
+        for x in 0..n {
+            want[x + n * y] = read(x + 1, y + 2) + read(x + 3, y + 2) + read(x + 2, y + 1) + read(x + 2, y + 3) - read(x + 2, y + 2) * 4.0;
+        }
+    }
+
+    // Launches prohibitively expensive: the expression stays one kernel, which staging may lay out.
+    for staging in [true, false] {
+        let ctx = ctx();
+        ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+        ctx.jit().set_staging(staging);
+        ctx.jit().set_max_inlined(1536);
+        ctx.jit().record_splits();
+        let u = Array::from_slice_on(&ctx, &data, [n, m]).unwrap();
+        let w = u.pad([(2, 2), (2, 2)], PadMode::Edge);
+        let left = u.pad([(2, 0)], PadMode::Edge).slice(0, 0..2);
+        w.slice(0, ..2).slice(1, 2..m + 2).assign(ghost(&left)).unwrap();
+        let bottom = u.pad([(0, 0), (2, 0)], PadMode::Edge).slice(1, 0..2);
+        w.slice(1, ..2).slice(0, 2..n + 2).assign(ghost(&bottom)).unwrap();
+        let r = w.slice(0, 1..n + 1).slice(1, 2..m + 2) + w.slice(0, 3..n + 3).slice(1, 2..m + 2) + w.slice(0, 2..n + 2).slice(1, 1..m + 1)
+            + w.slice(0, 2..n + 2).slice(1, 3..m + 3)
+            - w.slice(0, 2..n + 2).slice(1, 2..m + 2) * 4.0;
+        let before = ctx.jit().stats();
+        let got = r.to_vec().unwrap();
+        let judgement = ctx.jit().last_judgement();
+        let splits = ctx.jit().take_splits();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "staging {staging}: {judgement:?} {splits:?}");
+        assert!(ctx.jit().last_branches() > 0, "staging {staging}: no select was computed as a branch ({judgement:?})");
+        assert_close(&got, &want, 1e-5, 1e-5);
+    }
+}
+
+/// `r = g[1..]` with `g = e[..n - 2] + e[2..]` (an expression `e`): the main program reads `g`
+/// once, so it is computed inside the main program, and what it reads of `e` (at two offsets) is
+/// read from the cell the main program computes it at: `e` is staged, read at offsets 1 and 3.
+#[test]
+fn a_sub_program_read_once_does_not_keep_what_it_reads_from_being_staged() {
+    let ctx = ctx();
+    ctx.set_cost_model(arithmetic_bound());
+    let n = 1000;
+    let xs = values(n, 150, 0.5, 2.0);
+    let (e, host) = long_expression(&f32s(&ctx, &xs), &xs);
+    let g = e.slice(0, 0..n - 2) + e.slice(0, 2..n);
+    let r = g.slice(0, 1..n - 2) * 1.5 + 0.25;
+    let before = ctx.jit().stats();
+    let got = r.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
+    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    assert_eq!(staging.subs.len(), 1, "{staging:?}");
+    let tx = staging.tile[0] as i32;
+    assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([1, 0], [tx + 2, 0]), "{staging:?}");
+    let want: Vec<f32> = (0..n - 3).map(|i| (host[i + 1] + host[i + 3]) * 1.5 + 0.25).collect();
+    assert_close(&got, &want, 1e-4, 1e-4);
+}
