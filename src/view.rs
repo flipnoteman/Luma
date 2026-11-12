@@ -553,8 +553,8 @@ impl<T: ScalarType> Array<T> {
     /// The base then has no buffer to protect and nothing is launched: from now on the arrays
     /// holding it denote `select(in_region, rhs, old base)`, `old` being the base's
     /// expression and `rhs` read at base coordinates through the inverse of the view. Expressions
-    /// recorded earlier keep reading the old base, and the receiver, if it is a pending view
-    /// too, becomes a view of the new base.
+    /// recorded earlier keep reading the old base, and the receiver, pending or evaluated,
+    /// becomes a view of the new base.
     pub(crate) fn assign_lazy(&self, rhs: Rhs<'_, T>, location: &'static Location<'static>) -> Outcome<bool> {
         let Some(view) = self.view() else { return Ok(false) };
         let Some(base) = &view.held else { return Ok(false) };
@@ -623,14 +623,16 @@ impl<T: ScalarType> Array<T> {
             },
         };
 
-        // What the receiver shows afterwards: its region of the new base.
-        let viewed = match (self.held(), self.pending()) {
-            (Some(receiver), Some(node)) if jit::can_supersede(node) => {
+        // What the receiver shows afterwards: its region of the new base, whether it was still
+        // pending or an evaluation (by `eval`, or together with the arrays sharing work with
+        // another one) gave it a buffer with the data from before the write.
+        let viewed = match self.held() {
+            Some(receiver) => {
                 let op = Op::new(OpKind::Shift(ShiftKind::View { map, edge: Edge::None }), ty);
                 let args = [Src::Node(Arc::clone(&new)), Src::unused(), Src::unused()];
                 Some((receiver, jit::create(ctx, self.len(), op, args, "assign", location)?))
             }
-            _ => None,
+            None => None,
         };
         jit::supersede(base, new);
         if let Some((receiver, node)) = viewed {

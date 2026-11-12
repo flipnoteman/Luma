@@ -323,11 +323,11 @@ fn sum_where_sees_a_later_write_to_the_equal_select() {
     });
 }
 
-/// Finding 14 (found while fixing finding 3; same family as finding 5): two equal expressions
-/// share one node, so `cache` of one evaluates the base of a flipped view of the other; the
-/// write through that view is not shown by the view (`v[6]` is `-1`, not `-2`).
+/// Finding 14 (found while fixing finding 3; same family as finding 5): `cache` of `a` evaluates
+/// the arrays sharing work with it, among them the flipped view `v` of the equal expression `b`.
+/// The write through `v` then replaced `b`'s lazy expression but left `v`, already evaluated to
+/// the old data, alone (`v[6]` is `-1`, not `-2`).
 #[test]
-#[ignore = "finding 14: the receiver of a write through a view whose shared base node a cache evaluated shows old data"]
 fn view_shows_the_written_data_after_a_cache_evaluated_the_shared_base_node() {
     check(Program {
         config: Config::default_engine(),
