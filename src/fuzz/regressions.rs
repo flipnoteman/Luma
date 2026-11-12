@@ -409,3 +409,24 @@ fn a_lazy_array_fused_into_another_kernel_is_not_evaluated_by_a_traced_loop() {
         assert!(failures.is_empty(), "round {round}: {failures:?}");
     }
 }
+
+/// Finding 16 (GPU fuzz seed 204; same cause as finding 8): `c = concat(x, x); c /= 2` is a lazy
+/// expression that reuses its operand's buffer, and `select(c, ..)` fuses it into its own kernel
+/// without materializing it (it stays pending, flagged as fused). Tracing skipped fused nodes when
+/// it evaluated the live lazy arrays, so the traced step (which reads `c` through `max_axis`)
+/// forced `c` inside the recording: the division ran again at every replayed step (`c[0]` was `2`,
+/// not `4`, after 2 steps). Needs a fusion limit of 2 or 3 nodes.
+#[test]
+fn lazy_array_fused_into_the_loop_state_is_replayed_with_the_traced_step() {
+    check(Program {
+        config: Config { max_nodes: 2, ..Config::default_engine() },
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: U32, seed: 0 },
+            View { src: 0, view: Concat { axis: 0, others: vec![0] } },
+            Compound { target: 1, op: Div, rhs: Const(2.0) },
+            Select { mask: 1, a: Const(0.0), b: Const(2.0), ty: F32 },
+            Loop { kind: IterateAll, steps: 2, states: vec![2], body: vec![Unary { src: 3, op: Neg }, AxisReduce { src: 1, axis: 0, op: Max }], next: vec![4] },
+        ],
+    });
+}
