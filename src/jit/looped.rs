@@ -67,25 +67,32 @@ impl LoopPlan {
         }
     }
 
-    /// The plan for the step `body` applied to the arrays `prev` that lead to the arrays of this
-    /// `eval`. If `prev` are the outputs of a plan that has not run and runs the same step, that
-    /// plan gains one step; otherwise `prev` are the initial values of a new one.
-    fn following(prev: &[Arc<Node>], body: Fused, shape: Shape) -> Option<Arc<LoopPlan>> {
-        let first = prev.first()?;
-        let len = first.len();
-        let states = prev.len();
-        if let Some((plan, _)) = first.looped.get()
+    /// The plan for the step `body` applied to `states`, the values of the arrays `prev` that
+    /// lead to the arrays of this `eval` (`None` if some of them are gone). If `prev` are the
+    /// outputs of a plan that has not run and runs the same step, that plan gains one step;
+    /// otherwise `states` are the initial values of a new one.
+    fn following(prev: Option<&[Arc<Node>]>, states: &[StateRef], body: Fused, len: usize, shape: Shape) -> Option<Arc<LoopPlan>> {
+        let count = states.len();
+        if let Some(prev) = prev
+            && let Some((plan, _)) = prev.first()?.looped.get()
             && plan.steps < u32::MAX
             && prev.iter().enumerate().all(|(j, node)| {
                 matches!(node.looped.get(), Some((other, at)) if Arc::ptr_eq(other, plan) && *at == j as u32)
             })
             && plan.result.get().is_none()
             && let Some(parts) = lock(&plan.parts).as_ref()
-            && same_program(&parts.body, &body, states)
+            && same_program(&parts.body, &body, count)
         {
             return Some(Arc::new(LoopPlan::new(body, parts.inits.clone(), plan.steps + 1, len, shape)));
         }
-        let inits = prev.iter().map(|node| node.as_src()).collect::<Result<Vec<_>, _>>().ok()?;
+        let inits = states
+            .iter()
+            .map(|state| match state {
+                StateRef::Node(node) => node.as_src(),
+                StateRef::Buffer(storage) => Ok(Src::Buffer(Arc::clone(storage))),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
         Some(Arc::new(LoopPlan::new(body, inits, 1, len, shape)))
     }
 
@@ -242,8 +249,8 @@ impl Last {
 /// What [`JitState::step_boundary`] remembers of the previous `eval`.
 #[derive(Debug, Default)]
 pub(super) struct Tracker {
-    /// The arrays of the previous `eval` and their shape.
-    prev: Vec<Weak<Node>>,
+    /// The arrays of the previous `eval` with their node ids, and their shape.
+    prev: Vec<(Weak<Node>, u64)>,
     prev_shape: Option<Shape>,
     /// The step that led to `prev`, if it could be traced.
     last: Option<Last>,
@@ -257,9 +264,32 @@ impl Tracker {
     }
 
     fn remember(&mut self, nodes: &[Arc<Node>], shape: Option<Shape>) {
-        self.prev = nodes.iter().map(Arc::downgrade).collect();
+        self.prev = nodes.iter().map(|node| (Arc::downgrade(node), node.id)).collect();
         self.prev_shape = shape;
     }
+}
+
+/// The buffer computed by node `id` that the expressions of `roots` read, if any. A step whose
+/// shifts cannot recompute the previous state evaluates it and drops its node, so the state is
+/// only found through its buffer.
+fn produced_by(roots: &[Arc<Node>], id: u64) -> Option<Arc<Storage>> {
+    let mut stack: Vec<Arc<Node>> = roots.to_vec();
+    let mut seen: Vec<*const Node> = Vec::new();
+    while let Some(node) = stack.pop() {
+        if seen.contains(&Arc::as_ptr(&node)) {
+            continue;
+        }
+        seen.push(Arc::as_ptr(&node));
+        let Some(args) = node.operands() else { continue };
+        for arg in args.iter().take(node.op().kind.arity()) {
+            match arg {
+                Src::Buffer(storage) if storage.producer() == id => return Some(Arc::clone(storage)),
+                Src::Node(operand) if operand.is_pending() => stack.push(Arc::clone(operand)),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 impl JitState {
@@ -277,30 +307,37 @@ impl JitState {
             tracker.reset(nodes, Some(shape));
             return;
         }
-        let Some(prev) = tracker.prev.iter().map(Weak::upgrade).collect::<Option<Vec<_>>>() else {
-            // An array of the previous call is gone (it was evaluated and replaced): there is
-            // nothing to trace now, but the step seen before still counts.
-            tracker.remember(nodes, Some(shape));
-            return;
-        };
+        let prev: Vec<(Option<Arc<Node>>, u64)> = tracker.prev.iter().map(|(weak, id)| (weak.upgrade(), *id)).collect();
         let mut states = Vec::with_capacity(prev.len());
-        for node in &prev {
-            states.push(match node.result.get() {
-                Some(Ok(storage)) => StateRef::Buffer(Arc::clone(storage)),
-                Some(Err(_)) => {
-                    tracker.reset(nodes, Some(shape));
-                    return;
-                }
-                None => StateRef::Node(Arc::clone(node)),
-            });
+        for (node, id) in &prev {
+            let state = match node {
+                Some(node) => match node.result.get() {
+                    Some(Ok(storage)) => Some(StateRef::Buffer(Arc::clone(storage))),
+                    Some(Err(_)) => {
+                        tracker.reset(nodes, Some(shape));
+                        return;
+                    }
+                    None => Some(StateRef::Node(Arc::clone(node))),
+                },
+                None => produced_by(nodes, *id).map(StateRef::Buffer),
+            };
+            let Some(state) = state else {
+                // The array is gone and its buffer is not read: nothing to trace now, but the
+                // step seen before still counts.
+                tracker.remember(nodes, Some(shape));
+                return;
+            };
+            states.push(state);
         }
         let Some(traced) = flatten_step(nodes, &states, Tail::Store) else {
             tracker.reset(nodes, Some(shape));
             return;
         };
-        let last = Last::of(&traced.fused, prev.len());
-        let repeats = tracker.last.as_ref().is_some_and(|before| before.is_step_of(&traced.fused, prev.len()));
-        if repeats && let Some(plan) = LoopPlan::following(&prev, traced.fused, shape) {
+        let last = Last::of(&traced.fused, states.len());
+        let repeats = tracker.last.as_ref().is_some_and(|before| before.is_step_of(&traced.fused, states.len()));
+        let alive: Option<Vec<Arc<Node>>> = prev.into_iter().map(|(node, _)| node).collect();
+        let len = nodes[0].len();
+        if repeats && let Some(plan) = LoopPlan::following(alive.as_deref(), &states, traced.fused, len, shape) {
             for (j, node) in nodes.iter().enumerate() {
                 node.redirect(&plan, j as u32);
             }

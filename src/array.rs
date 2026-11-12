@@ -58,6 +58,9 @@ pub(crate) struct Storage {
     /// Lazy operations that still have to read this buffer; they are evaluated before anything
     /// overwrites it (see [`crate::jit`]).
     pub(crate) readers: Readers,
+    /// Id of the lazy node this is the result of, `u64::MAX` if none; finds the state of a loop
+    /// whose node was dropped (see `jit::looped`).
+    producer: AtomicU64,
 }
 
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -118,12 +121,21 @@ impl Storage {
             owner,
             materialized: AtomicBool::new(false),
             readers: Readers::default(),
+            producer: AtomicU64::new(u64::MAX),
         }
     }
 
     /// Unique per storage; identifies it as an input of a fused kernel.
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn producer(&self) -> u64 {
+        self.producer.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_producer(&self, node: u64) {
+        self.producer.store(node, Ordering::Relaxed);
     }
 
     /// Number of segments.

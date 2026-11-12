@@ -389,6 +389,7 @@ impl Node {
         };
         match outcome {
             Ok(storage) => {
+                storage.set_producer(self.id);
                 storage.readers.absorb(&self.readers);
                 Ok(storage)
             }
@@ -407,6 +408,7 @@ impl Node {
     fn finish(&self, storage: Storage) {
         let storage = Arc::new(storage);
         if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
+            storage.set_producer(self.id);
             storage.readers.absorb(&self.readers);
             lock(&self.args).take();
         }

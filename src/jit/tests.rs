@@ -1045,3 +1045,27 @@ fn reading_back_in_the_middle_of_an_eval_loop_gives_the_right_values() {
     }
     assert_close(&u.to_vec().unwrap(), &want, 1e-4, 1e-4);
 }
+
+#[test]
+fn an_eval_loop_of_a_step_too_big_to_recompute_still_runs_as_one_loop() {
+    let ctx = Context::new().unwrap();
+    ctx.set_assume_busy(true);
+    let extra = ctx.tuning().max_recomputed;
+    // Longer than the recompute limit: a shift of the previous state evaluates it.
+    let step = |u: &Array<f32>| (0..extra).fold(heat_step(u), |r, _| r * 1.0 + 0.0);
+    let g = Array::from_slice_on(&ctx, &values(64 * 64, 65, 0.0, 1.0), [64, 64]).unwrap();
+
+    let before = ctx.jit().stats();
+    let mut u = &g * 1.0;
+    for _ in 0..100 {
+        u = step(&u);
+        u.eval().unwrap();
+    }
+    ctx.sync().unwrap();
+    let got = u.to_vec().unwrap();
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert!(launches < 20, "{launches} kernels for 100 steps");
+
+    let want = g.iterate(100, step).to_vec().unwrap();
+    assert_close(&got, &want, 1e-6, 1e-6);
+}
