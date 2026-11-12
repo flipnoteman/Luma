@@ -100,7 +100,6 @@ fn lazy_reduction_sees_a_later_write_to_its_elementwise_operand() {
 /// in place of the range, and with two flips; not with a slice-only first write or a second
 /// write of the whole array.
 #[test]
-#[ignore = "finding 4: write into a slice of a lazy array whose expression a flipped write replaced"]
 fn slice_write_after_a_flipped_write_into_a_lazy_array_is_lost() {
     check(Program {
         config: Config::default_engine(),
@@ -115,7 +114,6 @@ fn slice_write_after_a_flipped_write_into_a_lazy_array_is_lost() {
 }
 
 #[test]
-#[ignore = "finding 4: write into a slice of a lazy array whose expression a flipped write replaced"]
 fn slice_write_after_a_flipped_write_into_an_expression_is_lost() {
     check(Program {
         config: Config::default_engine(),
@@ -133,7 +131,6 @@ fn slice_write_after_a_flipped_write_into_an_expression_is_lost() {
 /// written but the view itself keeps showing the data it had (the old element), not the
 /// assigned data ("the receiver shows the new data", `tests/assign.rs`).
 #[test]
-#[ignore = "finding 5: the receiver of a write through a view taken before an earlier write into the base shows old data"]
 fn view_assigned_after_its_base_was_written_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
@@ -148,7 +145,6 @@ fn view_assigned_after_its_base_was_written_shows_the_old_data() {
 }
 
 #[test]
-#[ignore = "finding 5: the receiver of a write through a view taken before an earlier write into the base shows old data"]
 fn view_of_a_view_assigned_after_its_base_was_written_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
@@ -166,7 +162,6 @@ fn view_of_a_view_assigned_after_its_base_was_written_shows_the_old_data() {
 /// Finding 5, simplest form: an evaluated view keeps its own buffer, which a write through it
 /// does not update (the base is written, the view still shows the old values).
 #[test]
-#[ignore = "finding 5: the receiver of a write through an evaluated view shows old data"]
 fn evaluated_view_assigned_through_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
@@ -236,6 +231,57 @@ fn lazy_reduction_of_an_expression_sees_a_later_write_to_its_input() {
             Alias { src: 1 },
             Reduce { src: 2, op: Min },
             Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 0, hi: 1 }, InjSlice { axis: 1, lo: 2, hi: 5 }], rhs: Const(0.25) },
+        ],
+    });
+}
+
+/// Finding 9: `v = x.slice(143..299); s = v.shift(3); v.assign(&s)`: the right-hand side reads
+/// the region being written at other elements than the one it stores, so the view is evaluated
+/// first (it is read before the write); the write was correct but the receiver `v` kept the
+/// evaluated old data instead of showing the assigned one (`v[0]` is 1.717 instead of 1.307).
+#[test]
+fn assign_of_a_shift_of_the_written_region_shows_the_assigned_data() {
+    check(Program {
+        config: Config {
+            max_nodes: 1024,
+            max_inlined: None,
+            max_live: None,
+            max_inputs: None,
+            assume_busy: false,
+            speculate: true,
+            simplify: true,
+            staging: false,
+            fast_math: false,
+            chunk_bytes: None,
+            memory_budget: None,
+            cost: Test,
+        },
+        math: true,
+        stmts: vec![
+            Input { dims: [300, 1, 1, 1], ty: F32, seed: 0 },
+            View { src: 0, view: Slice { axis: 0, lo: 143, hi: 299 } },
+            View { src: 1, view: ShiftCirc { offs: vec![3] } },
+            Assign { target: 1, path: vec![], rhs: Var(2) },
+        ],
+    });
+}
+
+/// Finding 10 (found while fixing 4, 5 and 9): `v1 = x.slice(..); x.transpose().assign(0.0);
+/// v2 = v1.slice(..); select(r, &v2, -2.0)`. `v1` was evaluated by the write (it keeps the old
+/// element) but `v2`, a view of it, was composed with `v1`'s view of `x` instead of reading
+/// `v1`'s buffer, so it showed the written data (`select(r, v2, -2)[1]` is 0, not the old 1).
+#[test]
+fn view_of_a_view_recorded_before_a_transposed_write_keeps_the_old_data() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [300, 1, 1, 1], ty: F32, seed: 32202 },
+            View { src: 0, view: Slice { axis: 0, lo: 293, hi: 294 } },
+            Assign { target: 0, path: vec![InjTranspose], rhs: Const(0.0) },
+            View { src: 1, view: Slice { axis: 0, lo: 0, hi: 1 } },
+            Range { dims: [12, 1, 1, 1], axis: 0, ty: U32 },
+            Select { mask: 3, a: Var(2), b: Const(-2.0), ty: F32 },
         ],
     });
 }

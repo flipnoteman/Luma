@@ -376,3 +376,47 @@ fn errors_of_a_lazy_write_are_those_of_an_evaluated_one() {
     // Nothing was written.
     assert_eq!(w.to_vec().unwrap(), vec![1.0; 8]);
 }
+
+/// The receiver of a write through a view shows the written data whether the view was lazy,
+/// evaluated before the write, or evaluated by the write itself (its right-hand side reads it).
+#[test]
+fn the_receiver_of_a_write_through_an_evaluated_view_shows_the_new_data() {
+    let ctx = Context::new().unwrap();
+    let xs = values(20, 3, -1.0, 1.0);
+    let x = Array::from_slice_on(&ctx, &xs, [4, 5]).unwrap();
+    let v = x.slice(1, 2..4);
+    v.eval().unwrap();
+    v.assign(4.0).unwrap();
+    assert_eq!(v.to_vec().unwrap(), vec![4.0; 8]);
+    assert_eq!(&x.to_vec().unwrap()[8..16], &[4.0; 8]);
+
+    // A view of an evaluated view.
+    let flipped = v.flip(0);
+    x.slice(1, 2..3).assign(-2.0).unwrap();
+    flipped.assign(5.0).unwrap();
+    assert_eq!(flipped.to_vec().unwrap(), vec![5.0; 8]);
+
+    // The right-hand side reads the receiver at other elements: `w.assign(w shifted by 3)`.
+    let ys: Vec<f32> = (0..30).map(|i| i as f32).collect();
+    let y = Array::from_slice_on(&ctx, &ys, 30).unwrap();
+    let w = y.slice(0, 5..25);
+    let s = w.shift(3);
+    w.assign(&s).unwrap();
+    let want: Vec<f32> = (0..20).map(|i| (5 + (i + 17) % 20) as f32).collect();
+    assert_eq!(w.to_vec().unwrap(), want);
+    assert_eq!(&y.to_vec().unwrap()[5..25], &want[..]);
+}
+
+/// A slice write into a lazy array after a flipped write into it (through a temporary view).
+#[test]
+fn a_slice_write_after_a_flipped_write_into_a_lazy_array_is_kept() {
+    let ctx = Context::new().unwrap();
+    let xs = values(12, 5, -1.0, 1.0);
+    let x = Array::from_slice_on(&ctx, &xs, 12).unwrap();
+    let r = Array::<f32>::range_on(&ctx, [12], 0).unwrap();
+    r.flip(0).assign(&x).unwrap();
+    r.slice(0, 0..1).assign(-2.0).unwrap();
+    let mut want: Vec<f32> = xs.iter().rev().copied().collect();
+    want[0] = -2.0;
+    assert_eq!(r.to_vec().unwrap(), want);
+}

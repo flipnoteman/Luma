@@ -195,6 +195,15 @@ All notable changes to Luma are listed here. The format follows
 - wgpu's validation of indirect dispatches (an extra dispatch before every step of
   `iterate_until`/`iterate_until_all`) is off: the dispatch arguments are always written by the
   library's own gate kernels.
+- `assign` through a view that was evaluated (`v.eval()`, or evaluated because the right-hand side
+  read it or an earlier write into the base flushed it) left the receiver showing the data from
+  before the write; the receiver now denotes its region of the written base, as documented. This
+  also fixes `v.assign(&v.shift(3))`, whose receiver kept the old data.
+- A slice write into a lazy array after a flipped (or transposed) write into it was lost: the
+  claim an array has on its expression could not be shared again once the arrays holding it had
+  all been dropped (a temporary `r.flip(0)` that was assigned through).
+- A view taken from an array that was a view evaluated before a write into its base read the
+  written base instead of the evaluated array (the old data it was recorded against).
 
 ## [0.2.0] - 2026-11-11
 

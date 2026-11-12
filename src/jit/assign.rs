@@ -27,7 +27,7 @@ use crate::context::Context;
 use crate::error::LumaError;
 
 use super::program::{flatten, Tail};
-use super::{launch, lock, Args, Edge, ElemTy, Node, Op, OpKind, ShiftKind, Src, ViewMap};
+use super::{launch, lock, Args, Edge, ElemTy, Held, Node, Op, OpKind, ShiftKind, Src, ViewMap};
 
 /// One region of an array that `assign` overwrites.
 pub(crate) struct Region {
@@ -43,6 +43,10 @@ pub(crate) struct Region {
     /// The pending view node of the array `assign` was called on. It is not evaluated because of
     /// the write: read afterwards it shows the assigned data.
     pub(crate) receiver: Option<Arc<Node>>,
+    /// The claim of the array `assign` was called on, if it is a view: once the write is done the
+    /// array denotes its region of the written base (see [`refresh_receiver`]), whatever buffer or
+    /// expression it held before.
+    pub(crate) claim: Option<Held>,
 }
 
 fn is_identity(map: &ViewMap) -> bool {
@@ -319,6 +323,34 @@ fn evaluate_rhs(store: &Arc<Node>) -> Result<(), Failure> {
     }
 }
 
+/// Makes the array holding `claim`, the receiver of the write of `region`, show what the region
+/// of the base holds now. A receiver that is a pending view reading the base through the
+/// region's map already does; one that was evaluated into a buffer of its own (by the user, by
+/// an earlier write into the base, because the right-hand side read it) or that reads another
+/// buffer than the base (a view of an evaluated view) shows the data from before the write, so
+/// it is replaced by a read of the written base. Expressions recorded earlier that read the old
+/// receiver keep its old value.
+fn refresh_receiver(
+    ctx: &Context,
+    region: &Region,
+    claim: &Held,
+    name: &'static str,
+    location: &'static Location<'static>,
+) -> Result<(), Failure> {
+    let latest = claim.latest();
+    let shows_region = latest.is_pending()
+        && matches!(latest.op().kind, OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) if map == region.map)
+        && reads(latest, &region.base).is_some_and(|reads| reads.first && !reads.others);
+    if shows_region {
+        return Ok(());
+    }
+    let op = Op::new(OpKind::Shift(ShiftKind::View { map: region.map, edge: Edge::None }), region.ty);
+    let args = [Src::Buffer(Arc::clone(&region.base)), Src::unused(), Src::unused()];
+    let node = super::create(ctx, region.map.out_len(), op, args, name, location)?;
+    super::supersede(claim, node);
+    Ok(())
+}
+
 /// Releases a store node that ran: its operands go, and it counts as evaluated to the buffer it wrote.
 fn retire(store: &Arc<Node>, base: &Arc<Storage>) {
     lock(&store.args).take();
@@ -388,6 +420,11 @@ pub(crate) fn assign(
         retire(store, &region.base);
     }
     result?;
+    for region in &regions {
+        if let Some(claim) = &region.claim {
+            refresh_receiver(ctx, region, claim, name, location)?;
+        }
+    }
     // The written bases are the results of this operation.
     for region in &regions {
         super::check_finite(ctx, &region.base, region.ty)?;
