@@ -35,7 +35,8 @@ pub(super) struct LoopPlan {
     pub(super) steps: u32,
     len: usize,
     shape: Shape,
-    /// Sorted ids of the buffers the plan reads: the fixed inputs and the buffer states.
+    /// Sorted ids of the buffers the plan reads: the fixed inputs, the buffer states and those
+    /// the pending states read.
     pub(super) input_ids: Vec<u64>,
     result: OnceLock<Result<(), Arc<LumaError>>>,
     /// The states after the last step, each handed out to the loop leaf it belongs to.
@@ -46,10 +47,13 @@ impl LoopPlan {
     fn new(body: Fused, inits: Vec<Src>, steps: u32, len: usize, shape: Shape) -> LoopPlan {
         let states = inits.len();
         let mut input_ids: Vec<u64> = body.inputs.iter().skip(states).map(|input| input.id()).collect();
-        input_ids.extend(inits.iter().filter_map(|init| match init {
-            Src::Buffer(storage) => Some(storage.id()),
-            _ => None,
-        }));
+        for init in &inits {
+            match init {
+                Src::Buffer(storage) => input_ids.push(storage.id()),
+                Src::Node(node) => input_ids.extend_from_slice(node.inputs()),
+                Src::Scalar(_) => {}
+            }
+        }
         input_ids.sort_unstable();
         input_ids.dedup();
         LoopPlan {
