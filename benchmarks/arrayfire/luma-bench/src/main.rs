@@ -179,6 +179,22 @@ fn converge(sz: &Sizes) {
             },
             || run().eval().unwrap(),
         );
+        let until = || g.iterate_until(steps, sz.converge_tol, heat_step);
+        let err = rel_err(&until().to_vec().unwrap(), &want);
+        check(&format!("converge {w} iterate_until"), err, 1e-4);
+        report(
+            Row {
+                workload: "converge",
+                size: format!("{w}x{w}"),
+                variant: "iterate_until",
+                library: "luma",
+                backend: BACKEND,
+                work: (w * w * steps) as f64,
+                unit: "Gcell/s",
+                err,
+            },
+            || until().eval().unwrap(),
+        );
     }
 }
 

@@ -160,4 +160,52 @@ impl Array<f32> {
             }
         }
     }
+
+    /// Runs `step` until the largest `|next - prev|` of a step is at most `tol`, or `max_steps` steps,
+    /// and returns the last state. Convergence is checked on the GPU; the host waits once per
+    /// block of steps, and steps after convergence run no work.
+    #[track_caller]
+    pub fn iterate_until(&self, max_steps: usize, tol: f32, step: impl Fn(&Array<f32>) -> Array<f32>) -> Array<f32> {
+        let location = Location::caller();
+        let result = self.run_iterate_until(max_steps, tol, step);
+        Array::resolve(self.context(), self.shape(), result, "iterate_until", location)
+    }
+
+    fn run_iterate_until(
+        &self,
+        max_steps: usize,
+        tol: f32,
+        step: impl Fn(&Array<f32>) -> Array<f32>,
+    ) -> Outcome<Array<f32>> {
+        if let Some(error) = self.error() {
+            return Err(Failure::Inherited(Arc::new(error.clone())));
+        }
+        if max_steps == 0 {
+            return Ok(self * 1.0);
+        }
+        let probe = self.probe()?;
+        let first = step(&probe);
+        let change = (&first - &probe).abs();
+        if first.shape() == self.shape()
+            && let (Some(first), Some(change)) = (first.pending(), change.pending())
+            && let (Ok(from), Ok(alias)) = (self.storage(), probe.storage())
+            && let Some(result) = jit::run_until(self.context(), from, alias, first, change, max_steps, tol)
+        {
+            return Ok(Array::from_storage(self.context(), self.shape(), result?));
+        }
+        if let (Ok(owner), Ok(alias)) = (self.storage(), probe.storage()) {
+            owner.readers.absorb(&alias.readers);
+        }
+        let (mut u, mut change) = (first, change);
+        for done in 1..=max_steps {
+            if done == max_steps || change.max().map_err(Failure::New)? <= tol {
+                break;
+            }
+            let next = step(&u);
+            change = (&next - &u).abs();
+            u = next;
+        }
+        u.check()?;
+        Ok(u)
+    }
 }

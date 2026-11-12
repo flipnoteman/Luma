@@ -73,6 +73,11 @@ fn fold_grid(count: u32, max: u32) -> [u32; 3] {
     [groups.div_ceil(y), y, 1]
 }
 
+/// The workgroups of a launch with one invocation per element for `n` elements.
+pub(crate) fn workgroups_1d(ctx: &Context, kernel: &KernelCore, n: u32) -> Result<[u32; 3]> {
+    fold_workgroups(ctx, n.div_ceil(kernel.workgroup[0]))
+}
+
 /// Launches a kernel with one invocation per element for `n` elements (`luma.size.x = n`).
 pub(crate) fn launch_1d(
     ctx: &Context,
@@ -80,8 +85,7 @@ pub(crate) fn launch_1d(
     n: u32,
     args: &[RawArg<'_>],
 ) -> Result<()> {
-    let groups = n.div_ceil(kernel.workgroup[0]);
-    ctx.launch(kernel, fold_workgroups(ctx, groups)?, [n, 1, 1], args)
+    ctx.launch(kernel, workgroups_1d(ctx, kernel, n)?, [n, 1, 1], args)
 }
 
 pub(crate) fn len_u32(len: usize) -> Result<u32> {
