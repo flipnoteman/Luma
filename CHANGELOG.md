@@ -173,6 +173,14 @@ All notable changes to Luma are listed here. The format follows
   only the words in use when ids are spread widely (instead of listing every node), the sharing
   table holds hashes and checks the operands on a hit, a new node's weak references are made once,
   and the simplifier reads an operand's operands only for operations that have rewrites.
+- Flattening an expression whose views read pending expressions takes 58% fewer instructions (the
+  solver's step: 581M to 244M in `flatten_inner` over 100 steps) and the step builds about 17%
+  faster. The pending nodes below it are read once into an indexed graph (instead of being
+  collected, locked and looked up by address again for the main program and for every
+  sub-program), and a graph of the same shape as one flattened before (the step of a loop built
+  again) is turned into its program from a stored recipe over its own buffers and scalars,
+  without being walked or emitted again. Tests and debug builds check every such program against
+  the flattened one.
 - Fusion decisions use the cost model: a kernel that reads an expression through views at several
   indices (slices, pads, flips, `take`) recomputes it at every read, or evaluates it first and
   reads it back, whichever the device's `CostModel` estimates to be cheaper (evaluating first must

@@ -1,6 +1,7 @@
 //! Flattening an expression graph into a [`FusedKey`] (the structure a kernel is generated and
 //! cached by) plus the runtime data (buffers, scalar values) it runs with.
 
+use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use super::codegen::Tile;
 use super::inline::Judgement;
 use super::launch::force_group;
 use super::staging::Staging;
-use super::{lock, Args, Edge, Flattening, ElemTy, Node, Op, OpKind, Scalar, ShiftKind, Src, ViewMap};
+use super::{lock, Args, Edge, Flattening, ElemTy, JitState, Node, Op, OpKind, Scalar, ShiftKind, Src, ViewMap};
 
 
 /// Where an instruction finds a value.
@@ -46,11 +47,20 @@ impl std::hash::Hash for Ref {
 }
 
 /// One operation of a program; instruction `k` defines `t{k}`.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Instr {
     pub(crate) op: Op,
     pub(crate) args: [Ref; 3],
 }
+
+impl PartialEq for Instr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.args == other.args && self.op == other.op
+    }
+}
+
+impl Eq for Instr {}
 
 impl std::hash::Hash for Instr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -263,13 +273,6 @@ impl Seen {
         Seen { list: Vec::with_capacity(n), index: None }
     }
 
-    /// A list that holds `first` and has room for `n` nodes.
-    pub(super) fn of_sized(first: *const Node, n: usize) -> Self {
-        let mut seen = Seen::with_capacity(n + 1);
-        seen.push(first);
-        seen
-    }
-
     pub(super) fn position(&self, ptr: *const Node) -> Option<u32> {
         match &self.index {
             Some(index) => index.get(&ptr).copied(),
@@ -300,110 +303,248 @@ impl Seen {
     }
 }
 
-/// Where the value of every node emitted so far lives, by address.
-#[derive(Default)]
-struct Emitted {
-    list: Vec<(*const Node, Ref)>,
-    index: Option<FxMap<*const Node, Ref>>,
-}
+/// No item: an operand that is no pending node (a scalar, a buffer), or a node the walks treat
+/// as a leaf (evaluated, evaluated by another thread, or a state of a traced step).
+const NONE: u32 = u32::MAX;
 
-impl Emitted {
-    fn with_capacity(n: usize) -> Self {
-        Emitted { list: Vec::with_capacity(n), index: None }
-    }
-
-    fn get(&self, ptr: *const Node) -> Option<Ref> {
-        match &self.index {
-            Some(index) => index.get(&ptr).copied(),
-            None => self.list.iter().find(|(known, _)| *known == ptr).map(|&(_, at)| at),
-        }
-    }
-
-    fn push(&mut self, ptr: *const Node, at: Ref) {
-        self.list.push((ptr, at));
-        match &mut self.index {
-            // The first entry of an address wins, as with the linear search.
-            Some(index) => {
-                index.entry(ptr).or_insert(at);
-            }
-            None if self.list.len() > INDEXED_AT => {
-                let mut index = FxMap::with_capacity_and_hasher(self.list.capacity(), Default::default());
-                for &(known, at) in &self.list {
-                    index.entry(known).or_insert(at);
-                }
-                self.index = Some(index);
-            }
-            None => {}
-        }
-    }
-}
-
-/// A pending node below the root of an evaluation, with its operands.
-struct Member {
+/// A pending node met while flattening, with its operands read once.
+struct Item {
     node: Arc<Node>,
     args: Args,
+    /// The item of each operand that is a pending node, `NONE` for the others.
+    kids: [u32; 3],
+    /// The uniform slot of each scalar operand once emitted, `NONE` before: a node emitted in
+    /// several programs (the main one and sub-programs) reads its scalars from the same slots,
+    /// so that its copies are equal instructions (see `inline`).
+    slots: [Cell<u32>; 3],
+    /// The type each operand must have (see [`Op::operand_ty`]).
+    tys: [ElemTy; 3],
+    arity: u8,
+    /// Whether the node is a shift: its operand 0 is read through a sub-program.
+    shift: bool,
 }
 
-/// Collects the pending nodes below `src` into `members`, operands before the nodes using them.
-/// `seen` holds the nodes already collected (each is collected once, so shared nodes are shared in
-/// the program too). Evaluated nodes are leaves. With `trace`, a node that cannot be read
-/// without waiting for another thread's evaluation aborts instead of being forced.
-fn collect(
-    src: &Src,
-    members: &mut Vec<Member>,
-    seen: &mut Seen,
+impl Item {
+    fn new(node: &Arc<Node>, args: Args, kids: [u32; 3], arity: usize) -> Self {
+        let op = &node.op;
+        let tys = [op.operand_ty(0), op.operand_ty(1), op.operand_ty(2)];
+        Item {
+            node: Arc::clone(node),
+            args,
+            kids,
+            slots: [Cell::new(NONE), Cell::new(NONE), Cell::new(NONE)],
+            tys,
+            arity: u8::try_from(arity).unwrap_or(3),
+            shift: matches!(op.kind, OpKind::Shift(_)),
+        }
+    }
+
+    /// The item a shift reads through a sub-program; `NONE` for any other node.
+    fn source(&self) -> u32 {
+        if self.shift { self.kids[0] } else { NONE }
+    }
+}
+
+/// The pending nodes below some roots, each read once: a node's operands are copied out under
+/// its lock, and the operands that are pending nodes become indices. Collecting the members of
+/// the main program and of every sub-program, and emitting their instructions, then follow
+/// indices instead of looking nodes up by address and locking them again (a node is a member of
+/// the main program and of every sub-program that reads it).
+struct Graph {
+    items: Vec<Item>,
+    index: Index,
+    /// Flattening for [`flatten_step`]: nothing may be evaluated, and a shifted expression is
+    /// not followed (it is not a sub-program).
     trace: bool,
-) -> Result<(), Failure> {
-    let Src::Node(node) = src else { return Ok(()) };
-    let key = Arc::as_ptr(node);
-    if seen.contains(key) {
-        return Ok(());
-    }
-    match node.result.get() {
-        Some(Ok(_)) => return Ok(()),
-        Some(Err(error)) => return Err(Failure::Inherited(Arc::clone(error))),
-        None => {}
-    }
-    let Some(args) = node.operands() else {
-        if trace {
-            return Err(Failure::New(LumaError::Gpu("traced step reads a node under evaluation".into())));
-        }
-        // Another thread is evaluating it right now; wait for its buffer.
-        return match node.force() {
-            Ok(_) => Ok(()),
-            Err(error) => Err(Failure::Inherited(Arc::clone(error))),
-        };
-    };
-    for (index, arg) in args.iter().enumerate().take(node.op().kind.arity()) {
-        // A shifted expression is a sub-program of its own (see `Flattener::sub`).
-        if index == 0 && matches!(node.op().kind, OpKind::Shift(_)) {
-            continue;
-        }
-        collect(arg, members, seen, trace)?;
-    }
-    seen.push(key);
-    members.push(Member { node: Arc::clone(node), args });
-    Ok(())
+    /// Pending nodes (by address) that stand for an input: leaves.
+    boundary: Vec<*const Node>,
 }
 
-/// The nodes of `members` that a shift among them also reads, except `roots`, with the kind of
-/// that shift. Read directly, they take the value of their sub-program at offset zero instead of
-/// computing their expression a second time.
-fn shifted_members(members: &[Member], roots: &[*const Node]) -> Vec<(*const Node, ShiftKind)> {
-    let mut shifted: Vec<(*const Node, ShiftKind)> = Vec::new();
-    for member in members {
-        if let OpKind::Shift(kind) = member.node.op().kind
-            && let Src::Node(target) = &member.args[0]
-            && target.is_pending()
-        {
-            let at = Arc::as_ptr(target);
-            let direct = members.iter().any(|other| Arc::as_ptr(&other.node) == at);
-            if direct && !roots.contains(&at) && !shifted.iter().any(|&(known, _)| known == at) {
-                shifted.push((at, zero_shift(kind)));
+/// The item of a node, by the id of the node: an array over the ids that can be below the roots
+/// (see [`Node::below_span`]), a hash map for any other.
+struct Index {
+    base: u64,
+    dense: Vec<u32>,
+    spill: FxMap<u64, u32>,
+}
+
+impl Index {
+    fn new<'a>(roots: impl Iterator<Item = &'a Arc<Node>> + Clone, expected: usize) -> Self {
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for root in roots {
+            let (first, last) = root.below_span().unwrap_or((root.id, root.id));
+            lo = lo.min(first).min(root.id);
+            hi = hi.max(last).max(root.id);
+        }
+        // Ids are handed out as nodes are made, so those of an expression are close together; one
+        // that holds the ids of old nodes too would take a lot of room.
+        let width = hi.checked_sub(lo).and_then(|span| usize::try_from(span).ok()).map_or(0, |span| span.saturating_add(1));
+        let (base, dense) = if width != 0 && width <= expected.saturating_mul(64).saturating_add(1024) {
+            (lo, vec![NONE; width])
+        } else {
+            (0, Vec::new())
+        };
+        Index { base, dense, spill: FxMap::default() }
+    }
+
+    fn get(&self, id: u64) -> u32 {
+        match self.dense.get(id.wrapping_sub(self.base) as usize) {
+            Some(&at) if id >= self.base => at,
+            _ if self.spill.is_empty() => NONE,
+            _ => self.spill.get(&id).copied().unwrap_or(NONE),
+        }
+    }
+
+    fn insert(&mut self, id: u64, at: u32) {
+        match self.dense.get_mut(id.wrapping_sub(self.base) as usize) {
+            Some(slot) if id >= self.base => *slot = at,
+            _ => {
+                self.spill.insert(id, at);
             }
         }
     }
-    shifted
+}
+
+impl Graph {
+    fn new<'a>(roots: impl Iterator<Item = &'a Arc<Node>> + Clone, trace: bool, boundary: Vec<*const Node>) -> Self {
+        let expected: usize = roots.clone().map(|root| root.size()).sum();
+        Graph { items: Vec::with_capacity(expected), index: Index::new(roots, expected), trace, boundary }
+    }
+
+    /// The items by the address of their nodes.
+    fn by_address(&self) -> FxMap<*const Node, u32> {
+        let mut map = FxMap::with_capacity_and_hasher(self.items.len(), Default::default());
+        for (at, item) in self.items.iter().enumerate() {
+            map.insert(Arc::as_ptr(&item.node), at as u32);
+        }
+        map
+    }
+
+    /// Adds a root with the operands it is `given` (a node being evaluated has taken its own),
+    /// and says its item and whether it is new (a root twice is one item). Its operands are read
+    /// by [`Graph::link_root`] once all roots are added, so that a root another one reads is
+    /// that item.
+    fn add_root(&mut self, node: &Arc<Node>, args: Args) -> (u32, bool) {
+        let known = self.index.get(node.id);
+        if known != NONE {
+            return (known, false);
+        }
+        let at = u32::try_from(self.items.len()).unwrap_or(u32::MAX);
+        self.index.insert(node.id, at);
+        let arity = node.op.kind.arity();
+        self.items.push(Item::new(node, args, [NONE; 3], arity));
+        (at, true)
+    }
+
+    /// Reads the operands below the root `at`.
+    fn link_root(&mut self, at: u32) -> Result<(), Failure> {
+        let item = &mut self.items[at as usize];
+        let node = Arc::clone(&item.node);
+        let args = std::mem::replace(&mut item.args, [Src::unused(), Src::unused(), Src::unused()]);
+        let kids = self.link(&node, &args, usize::from(self.items[at as usize].arity));
+        let item = &mut self.items[at as usize];
+        item.args = args;
+        item.kids = kids?;
+        Ok(())
+    }
+
+    /// The items of the operands `args` of `node` (which has `arity` of them), made if they are
+    /// not there yet.
+    fn link(&mut self, node: &Node, args: &Args, arity: usize) -> Result<[u32; 3], Failure> {
+        let skip_source = self.trace && matches!(node.op.kind, OpKind::Shift(_));
+        let mut kids = [NONE; 3];
+        for (index, (kid, arg)) in kids.iter_mut().zip(args).enumerate().take(arity) {
+            if skip_source && index == 0 {
+                continue;
+            }
+            *kid = self.kid(arg)?;
+        }
+        Ok(kids)
+    }
+
+    /// The item of `src` if it is a pending node, `NONE` if it is something else or a leaf. An
+    /// evaluated node is a leaf; so is one another thread evaluates right now (waited for); with
+    /// `trace` that is an error instead.
+    fn kid(&mut self, src: &Src) -> Result<u32, Failure> {
+        let Src::Node(node) = src else { return Ok(NONE) };
+        // Evaluated nodes are most of the operands: told from the node itself, not looked up.
+        match node.result.get() {
+            Some(Ok(_)) => return Ok(NONE),
+            Some(Err(error)) => return Err(Failure::Inherited(Arc::clone(error))),
+            None => {}
+        }
+        let known = self.index.get(node.id);
+        if known != NONE {
+            return Ok(known);
+        }
+        if !self.boundary.is_empty() && self.boundary.contains(&Arc::as_ptr(node)) {
+            return Ok(NONE);
+        }
+        let Some(args) = node.operands() else {
+            if self.trace {
+                return Err(Failure::New(LumaError::Gpu("traced step reads a node under evaluation".into())));
+            }
+            // Another thread is evaluating it right now; wait for its buffer.
+            return match node.force() {
+                Ok(_) => Ok(NONE),
+                Err(error) => Err(Failure::Inherited(Arc::clone(error))),
+            };
+        };
+        let arity = node.op.kind.arity();
+        let kids = self.link(node, &args, arity)?;
+        let at = u32::try_from(self.items.len()).unwrap_or(u32::MAX);
+        self.index.insert(node.id, at);
+        self.items.push(Item::new(node, args, kids, arity));
+        Ok(at)
+    }
+
+    /// Appends item `at` and the items below it to `members`, operands before the items using
+    /// them. `seen` holds the items already collected (each is collected once, so shared nodes
+    /// are shared in the program too).
+    fn collect(&self, at: u32, members: &mut Vec<u32>, seen: &mut [bool]) {
+        if seen[at as usize] {
+            return;
+        }
+        self.collect_kids(at, true, members, seen);
+        seen[at as usize] = true;
+        members.push(at);
+    }
+
+    /// [`Graph::collect`] for the items below item `at` only. A shifted expression is a
+    /// sub-program of its own (see [`Flattener::sub`]), so the walk of a program leaves the
+    /// source of a shift out when `without_source`.
+    fn collect_kids(&self, at: u32, without_source: bool, members: &mut Vec<u32>, seen: &mut [bool]) {
+        let item = &self.items[at as usize];
+        for (index, &kid) in item.kids.iter().enumerate() {
+            if kid != NONE && !(without_source && index == 0 && item.shift) {
+                self.collect(kid, members, seen);
+            }
+        }
+    }
+
+    /// The items of `members` that a shift among them also reads (`direct` tells the members),
+    /// except `roots`, with the kind of that shift. Read directly, they take the value of their
+    /// sub-program at offset zero instead of computing their expression a second time.
+    fn shifted_members(&self, members: &[u32], direct: &[bool], roots: &[u32]) -> Vec<(u32, ShiftKind)> {
+        let mut shifted: Vec<(u32, ShiftKind)> = Vec::new();
+        for &at in members {
+            let item = &self.items[at as usize];
+            if let OpKind::Shift(kind) = item.node.op().kind
+                && let Src::Node(target) = &item.args[0]
+                && target.is_pending()
+            {
+                let target = item.kids[0];
+                if target != NONE
+                    && direct[target as usize]
+                    && !roots.contains(&target)
+                    && !shifted.iter().any(|&(known, _)| known == target)
+                {
+                    shifted.push((target, zero_shift(kind)));
+                }
+            }
+        }
+        shifted
+    }
 }
 
 /// A shift of the same kind as `kind` by nothing.
@@ -421,169 +562,261 @@ struct Flattener {
     /// Flattening for [`flatten_step`]: nothing may be evaluated, and a shifted expression is
     /// not a sub-program.
     trace: bool,
-    /// Pending nodes (by address) that stand for an input and are not flattened.
-    boundary: Vec<*const Node>,
+    /// Pending nodes (by address) that stand for an input and are not flattened, with it.
+    boundary: Vec<(*const Node, Ref)>,
     instrs: Vec<Instr>,
     input_tys: Vec<ElemTy>,
     inputs: Vec<Arc<Storage>>,
     scalar_tys: Vec<ElemTy>,
     scalars: Vec<u32>,
-    /// Where the value of every member emitted so far lives.
-    emitted: Emitted,
-    /// Programs of the expressions read through shifts, and the node of each.
+    /// Where the value of every item emitted so far in the program being built lives, by item
+    /// (`Ref::Unused`: nowhere yet).
+    emitted: Vec<Ref>,
+    /// Programs of the expressions read through shifts, and per item the one that computes it
+    /// (`NONE` if none does).
     subs: Vec<Vec<Instr>>,
-    sub_nodes: Vec<*const Node>,
-    /// The nodes of `sub_nodes`, kept alive for [`Fused::sub_roots`].
+    sub_of: Vec<u32>,
+    /// The items computed inside the sub-programs, in emission order, and the item of each
+    /// sub-program (see [`Fused::fused_nodes`] and [`Fused::sub_roots`]).
+    fused_items: Vec<u32>,
+    sub_root_items: Vec<u32>,
+    /// The nodes of the sub-programs, kept alive for [`Fused::sub_roots`].
     sub_roots: Vec<Arc<Node>>,
-    /// Nodes read both through shifts and directly (see [`shifted_members`]); a direct read is a
-    /// shift by nothing of their sub-program.
-    shifted: Vec<(*const Node, ShiftKind)>,
+    /// Per item: for those read both through shifts and directly (see [`Graph::shifted_members`])
+    /// the kind of the first shift; a direct read is a shift by nothing of their sub-program.
+    shifted: Vec<Option<ShiftKind>>,
     pub(super) fused_nodes: Vec<Arc<Node>>,
     /// The node each main-program instruction computes (see [`Fused::instr_nodes`]).
     instr_nodes: Vec<Option<Arc<Node>>>,
-    /// The uniform slot of the scalar operand `index` of a node, by address (see [`Flattener::emit`]).
-    scalar_slots: FxMap<(*const Node, usize), u32>,
+    /// Notes where inputs and scalars come from (see [`Recipe`]), if asked to.
+    record: Option<Record>,
+}
+
+/// Where a scalar of a program comes from.
+#[derive(Clone, Copy)]
+enum ScalarSrc {
+    /// Operand `slot` of item `item`.
+    Operand(u32, u8),
+    /// A value the flattening made up.
+    Const(Scalar),
+}
+
+/// What a [`Flattener`] notes about the inputs and scalars of the program it builds.
+#[derive(Default)]
+struct Record {
+    /// The operand being emitted: (item, slot).
+    cursor: (u32, u8),
+    /// Per input, the operand that made it one.
+    inputs: Vec<(u32, u8)>,
+    /// Per scalar emitted, where it comes from.
+    scalars: Vec<ScalarSrc>,
+    /// Set when the program depends on something other than the graph: a node evaluated since the
+    /// graph was read.
+    impure: bool,
 }
 
 impl Flattener {
-    /// Emits the instruction for `op` on `args`, whose pending operands were emitted before, and
-    /// returns where the result lives. `node` is the node the instruction computes (`None` for
-    /// instructions made up while flattening): the same node emitted in several programs (the
-    /// main one and sub-programs) reads its scalars from the same uniform slots, so that its
-    /// copies are equal instructions (see `inline`).
-    fn emit(&mut self, op: Op, args: &[Src; 3], node: Option<*const Node>) -> Result<Ref, Failure> {
-        let mut refs = [Ref::Unused; 3];
-        for (index, (slot, arg)) in refs.iter_mut().zip(args).enumerate().take(op.kind.arity()) {
-            *slot = match (op.kind, index, arg) {
-                // A source evaluated since the members were collected (by another thread, say) is
-                // read as its buffer: `emitted` may hold the instruction that computes it.
-                (OpKind::Shift(_), 0, Src::Node(node)) if let Some(storage) = node.evaluated() => self.input(storage, op.operand_ty(0)),
-                (OpKind::Shift(_), 0, Src::Node(node)) if node.is_pending() && !self.boundary.contains(&Arc::as_ptr(node)) => self.sub(node)?,
-                (_, _, Src::Scalar(_)) if let Some(owner) = node => {
-                    let known = self.scalar_slots.get(&(owner, index)).copied();
-                    match known {
-                        Some(at) => Ref::Scalar(at),
-                        None => {
-                            let operand = self.operand(arg, op.operand_ty(index))?;
-                            if let Ref::Scalar(at) = operand {
-                                self.scalar_slots.insert((owner, index), at);
-                            }
-                            operand
-                        }
-                    }
-                }
-                _ => self.operand(arg, op.operand_ty(index))?,
-            };
-        }
-        let at = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
-        self.instrs.push(Instr { op, args: refs });
-        Ok(Ref::Tmp(at))
+    /// Makes room for the items of a graph of `n`.
+    fn begin(&mut self, n: usize) {
+        self.emitted = vec![Ref::Unused; n];
+        self.sub_of = vec![NONE; n];
+        self.shifted = vec![None; n];
     }
 
-    /// The expression of `node` as a sub-program evaluated at another element (the operand of a
-    /// shift), recomputed instead of materialized. Shares the inputs and scalars of the program.
-    fn sub(&mut self, node: &Arc<Node>) -> Result<Ref, Failure> {
+    fn is_boundary(&self, ptr: *const Node) -> bool {
+        self.boundary.iter().any(|&(known, _)| known == ptr)
+    }
+
+    /// Notes that the program is not a function of the graph alone.
+    fn impure(&mut self) {
+        if let Some(record) = &mut self.record {
+            record.impure = true;
+        }
+    }
+
+    /// Records where the value of item `at` lives in the program being built; the first stays.
+    fn mark(&mut self, at: u32, value: Ref) {
+        if let Some(slot) = self.emitted.get_mut(at as usize)
+            && *slot == Ref::Unused
+        {
+            *slot = value;
+        }
+    }
+
+    /// Emits the instruction of item `at`, whose pending operands were emitted before, and returns
+    /// where the result lives.
+    fn emit(&mut self, g: &Graph, at: u32) -> Result<Ref, Failure> {
+        let item = &g.items[at as usize];
+        let mut refs = [Ref::Unused; 3];
+        for (index, (slot, arg)) in refs.iter_mut().zip(&item.args).enumerate().take(usize::from(item.arity)) {
+            if let Some(record) = &mut self.record {
+                record.cursor = (at, index as u8);
+            }
+            *slot = match arg {
+                Src::Scalar(scalar) => match item.slots[index].get() {
+                    NONE => {
+                        let value = self.scalar(scalar);
+                        if let Ref::Scalar(first) = value {
+                            item.slots[index].set(first);
+                        }
+                        if let Some(record) = &mut self.record {
+                            record.scalars.push(ScalarSrc::Operand(at, index as u8));
+                        }
+                        value
+                    }
+                    first => Ref::Scalar(first),
+                },
+                Src::Buffer(storage) => self.input(storage, item.tys[index]),
+                // A source evaluated since the members were collected (by another thread, say) is
+                // read as its buffer: `emitted` may hold the instruction that computes it.
+                Src::Node(node) if item.shift && index == 0 && let Some(storage) = node.evaluated() => {
+                    if item.kids[0] != NONE {
+                        self.impure();
+                    }
+                    self.input(storage, item.tys[0])
+                }
+                Src::Node(node) if item.shift && index == 0 && node.is_pending() && !self.is_boundary(Arc::as_ptr(node)) => {
+                    self.sub(g, item.kids[0], node)?
+                }
+                Src::Node(node) => self.node_operand(g, item.kids[index], node, item.tys[index])?,
+            };
+        }
+        let value = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
+        self.instrs.push(Instr { op: item.node.op, args: refs });
+        Ok(Ref::Tmp(value))
+    }
+
+    /// The expression of item `kid` (`node`) as a sub-program evaluated at another element (the
+    /// operand of a shift), recomputed instead of materialized. Shares the inputs and scalars of
+    /// the program.
+    fn sub(&mut self, g: &Graph, kid: u32, node: &Arc<Node>) -> Result<Ref, Failure> {
         if self.trace {
             return Err(Failure::New(LumaError::Gpu("traced step shifts an unevaluated expression".into())));
         }
-        let key = Arc::as_ptr(node);
-        if let Some(at) = self.sub_nodes.iter().position(|&seen| seen == key) {
-            return Ok(Ref::Sub(at as u32));
+        if let Some(&done) = self.sub_of.get(kid as usize)
+            && done != NONE
+        {
+            return Ok(Ref::Sub(done));
         }
-        let Some(args) = node.operands() else {
+        if kid == NONE || !node.has_operands() {
             // Evaluated (or being evaluated by another thread, which `force` waits for), possibly
             // since it was collected: a shift reads its buffer, never the instruction that
             // computed it in this program.
+            self.impure();
             return match node.force() {
                 Ok(storage) => Ok(self.input(storage, node.op().out_ty())),
                 Err(error) => Err(Failure::Inherited(Arc::clone(error))),
             };
-        };
-        let (mut members, mut seen) = (Vec::with_capacity(node.size()), Seen::of_sized(key, node.size()));
-        for arg in args.iter().take(node.op().kind.arity()) {
-            collect(arg, &mut members, &mut seen, false)?;
         }
-        let shifted = shifted_members(&members, &[key]);
+        let n = g.items.len();
+        let mut members = Vec::new();
+        let mut seen = vec![false; n];
+        seen[kid as usize] = true;
+        g.collect_kids(kid, false, &mut members, &mut seen);
+        let shifted = g.shifted_members(&members, &seen, &[kid]);
         if !shifted.is_empty() {
-            (members, seen) = (Vec::with_capacity(node.size()), Seen::of_sized(key, node.size()));
+            members.clear();
+            seen.fill(false);
+            seen[kid as usize] = true;
             for &(at, _) in &shifted {
-                seen.push(at);
+                seen[at as usize] = true;
             }
-            for arg in args.iter().take(node.op().kind.arity()) {
-                collect(arg, &mut members, &mut seen, false)?;
+            g.collect_kids(kid, false, &mut members, &mut seen);
+            for (at, kind) in shifted {
+                if let Some(slot) = self.shifted.get_mut(at as usize)
+                    && slot.is_none()
+                {
+                    *slot = Some(kind);
+                }
             }
-            self.shifted.extend(shifted);
         }
         let outer_instrs = std::mem::replace(&mut self.instrs, Vec::with_capacity(members.len() + 1));
-        let outer_emitted = std::mem::replace(&mut self.emitted, Emitted::with_capacity(members.len() + 1));
+        let outer_emitted = std::mem::replace(&mut self.emitted, vec![Ref::Unused; n]);
         let result = (|| {
-            for member in &members {
-                let at = self.emit(member.node.op(), &member.args, Some(Arc::as_ptr(&member.node)))?;
-                self.emitted.push(Arc::as_ptr(&member.node), at);
+            for &at in &members {
+                let value = self.emit(g, at)?;
+                self.mark(at, value);
             }
-            self.emit(node.op(), &args, Some(key))
+            self.emit(g, kid)
         })();
         let instrs = std::mem::replace(&mut self.instrs, outer_instrs);
         self.emitted = outer_emitted;
         result?;
-        self.fused_nodes.extend(members.into_iter().map(|m| m.node));
-        self.fused_nodes.push(Arc::clone(node));
+        self.fused_items.extend_from_slice(&members);
+        self.fused_items.push(kid);
         self.subs.push(instrs);
-        self.sub_nodes.push(key);
-        self.sub_roots.push(Arc::clone(node));
-        Ok(Ref::Sub(u32::try_from(self.subs.len() - 1).unwrap_or(u32::MAX)))
+        let done = u32::try_from(self.subs.len() - 1).unwrap_or(u32::MAX);
+        if let Some(slot) = self.sub_of.get_mut(kid as usize) {
+            *slot = done;
+        }
+        self.sub_root_items.push(kid);
+        Ok(Ref::Sub(done))
     }
 
-    fn operand(&mut self, src: &Src, ty: ElemTy) -> Result<Ref, Failure> {
-        match src {
-            Src::Scalar(scalar) => {
-                let at = u32::try_from(self.scalars.len()).unwrap_or(u32::MAX);
-                // The uniform has `f32` fields: a wide scalar takes several (see `Scalar::words`).
-                let slot_ty = if scalar.ty.bytes() == 4 { scalar.ty } else { ElemTy::F32 };
-                for &word in scalar.words().iter().take(scalar.ty.slots()) {
-                    self.scalar_tys.push(slot_ty);
-                    self.scalars.push(word);
-                }
-                Ok(Ref::Scalar(at))
+    /// The first uniform slot of `scalar`.
+    fn scalar(&mut self, scalar: &Scalar) -> Ref {
+        let at = u32::try_from(self.scalars.len()).unwrap_or(u32::MAX);
+        // The uniform has `f32` fields: a wide scalar takes several (see `Scalar::words`).
+        let slot_ty = if scalar.ty.bytes() == 4 { scalar.ty } else { ElemTy::F32 };
+        for &word in scalar.words().iter().take(scalar.ty.slots()) {
+            self.scalar_tys.push(slot_ty);
+            self.scalars.push(word);
+        }
+        Ref::Scalar(at)
+    }
+
+    /// A scalar the flattening makes up.
+    fn constant(&mut self, scalar: Scalar) -> Ref {
+        if let Some(record) = &mut self.record {
+            record.scalars.push(ScalarSrc::Const(scalar));
+        }
+        self.scalar(&scalar)
+    }
+
+    /// Where the pending node operand `node` (item `kid` if it was pending when the graph was
+    /// read) of an instruction lives.
+    fn node_operand(&mut self, g: &Graph, kid: u32, node: &Arc<Node>, ty: ElemTy) -> Result<Ref, Failure> {
+        if kid != NONE {
+            if let Some(&found) = self.emitted.get(kid as usize)
+                && found != Ref::Unused
+            {
+                return Ok(found);
             }
-            Src::Buffer(storage) => Ok(self.input(storage, ty)),
-            Src::Node(node) => {
-                let key = Arc::as_ptr(node);
-                if let Some(found) = self.emitted.get(key) {
-                    return Ok(found);
-                }
-                // Not a member: it was evaluated when the members were collected, or it is read
-                // through a shift too.
-                if let Some(&(_, kind)) = self.shifted.iter().find(|(seen, _)| *seen == key)
-                    && node.operands().is_some()
-                {
-                    return self.unshifted(node, kind);
-                }
-                if self.trace && node.is_pending() {
-                    return Err(Failure::New(LumaError::Gpu("traced step reads an unevaluated node".into())));
-                }
-                match node.force() {
-                    Ok(storage) => Ok(self.input(storage, ty)),
-                    Err(error) => Err(Failure::Inherited(Arc::clone(error))),
-                }
+            // Not a member: it was evaluated when the members were collected, or it is read
+            // through a shift too.
+            if let Some(&Some(kind)) = self.shifted.get(kid as usize)
+                && node.has_operands()
+            {
+                return self.unshifted(g, kid, kind);
             }
+            self.impure();
+        } else if let Some(&(_, found)) = self.boundary.iter().find(|&&(known, _)| known == Arc::as_ptr(node)) {
+            return Ok(found);
+        }
+        if self.trace && node.is_pending() {
+            return Err(Failure::New(LumaError::Gpu("traced step reads an unevaluated node".into())));
+        }
+        if node.evaluated().is_none() {
+            self.impure();
+        }
+        match node.force() {
+            Ok(storage) => Ok(self.input(storage, ty)),
+            Err(error) => Err(Failure::Inherited(Arc::clone(error))),
         }
     }
 
-    /// The value of `node`'s sub-program at the element itself: a shift of `kind` by nothing.
-    fn unshifted(&mut self, node: &Arc<Node>, kind: ShiftKind) -> Result<Ref, Failure> {
-        let sub = self.sub(node)?;
+    /// The value of the sub-program of item `kid` at the element itself: a shift of `kind` by nothing.
+    fn unshifted(&mut self, g: &Graph, kid: u32, kind: ShiftKind) -> Result<Ref, Failure> {
+        let node = &g.items[kid as usize].node;
+        let sub = self.sub(g, kid, node)?;
         let (amount, total) = match kind {
-            ShiftKind::Linear => (
-                self.operand(&Src::Scalar(Scalar::u32(0)), ElemTy::U32)?,
-                self.operand(&Src::Scalar(Scalar::u32(node.len() as u32)), ElemTy::U32)?,
-            ),
+            ShiftKind::Linear => (self.constant(Scalar::u32(0)), self.constant(Scalar::u32(node.len() as u32))),
             ShiftKind::Dims { .. } | ShiftKind::View { .. } | ShiftKind::Take { .. } => (Ref::Unused, Ref::Unused),
         };
-        let at = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
+        let value = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
         self.instrs.push(Instr { op: Op::new(OpKind::Shift(kind), node.op().out_ty()), args: [sub, amount, total] });
-        self.emitted.push(Arc::as_ptr(node), Ref::Tmp(at));
-        Ok(Ref::Tmp(at))
+        self.mark(kid, Ref::Tmp(value));
+        Ok(Ref::Tmp(value))
     }
 
     fn input(&mut self, storage: &Arc<Storage>, ty: ElemTy) -> Ref {
@@ -592,6 +825,9 @@ impl Flattener {
             None => {
                 self.inputs.push(Arc::clone(storage));
                 self.input_tys.push(ty);
+                if let Some(record) = &mut self.record {
+                    record.inputs.push(record.cursor);
+                }
                 self.inputs.len() - 1
             }
         };
@@ -766,7 +1002,7 @@ impl Plain {
         for (index, (slot, operand)) in refs.iter_mut().zip(operands).enumerate().take(op.kind.arity()) {
             let ty = op.operand_ty(index);
             *slot = match operand {
-                Resolved::Scalar(scalar) => self.flat.operand(&Src::Scalar(*scalar), ty)?,
+                Resolved::Scalar(scalar) => self.flat.scalar(scalar),
                 Resolved::Buffer(storage) => self.flat.input(storage, ty),
                 Resolved::Input(at) => Ref::Input(*at),
                 Resolved::Tmp(at) => {
@@ -856,7 +1092,9 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
             .iter()
             .zip(&readers)
             .filter(|&(member, &inside)| {
-                member.consumers.load(Ordering::Relaxed) > inside && super::worth_storing(member) && member.has_consumer_outside(&seen)
+                member.consumers.load(Ordering::Relaxed) > inside
+                    && super::worth_storing(member)
+                    && member.has_consumer_outside(|ptr| seen.contains(ptr))
             })
             .map(|(member, _)| Arc::clone(member))
             .collect();
@@ -1006,131 +1244,485 @@ fn flatten_once(
     {
         return Ok(fused);
     }
-    let expected: usize = roots.iter().map(|(root, _)| root.size()).sum();
-    let mut shifted;
-    let members = loop {
-        let gather = |seed: &[*const Node]| -> Result<(Vec<Member>, Seen), Failure> {
-            let mut members = Vec::with_capacity(expected);
-            let mut seen = Seen::with_capacity(expected + seed.len());
-            for &ptr in seed {
-                seen.push(ptr);
+    let jit = roots.first().map(|(root, _)| root.context().jit());
+    let (graph, root_at, passes, signature) = loop {
+        // Every pending node below the roots is read once, here: the walks below only follow
+        // indices (see [`Graph`]).
+        let mut graph = Graph::new(roots.iter().map(|(root, _)| root), false, Vec::new());
+        let added: Vec<(u32, bool)> = roots.iter().map(|(root, args)| graph.add_root(root, args.clone())).collect();
+        for &(at, new) in &added {
+            if new {
+                graph.link_root(at)?;
             }
-            for (root, args) in roots {
-                for (index, arg) in args.iter().enumerate().take(root.op().kind.arity()) {
-                    if index == 0 && matches!(root.op().kind, OpKind::Shift(_)) {
-                        continue;
-                    }
-                    collect(arg, &mut members, &mut seen, false)?;
-                }
-            }
-            for (root, args) in roots {
-                if !seen.contains(Arc::as_ptr(root)) {
-                    seen.push(Arc::as_ptr(root));
-                    members.push(Member { node: Arc::clone(root), args: args.clone() });
-                }
-            }
-            Ok((members, seen))
-        };
-        let (mut members, mut seen) = gather(&[])?;
-        let root_ptrs: Vec<*const Node> = roots.iter().map(|(root, _)| Arc::as_ptr(root)).collect();
-        shifted = shifted_members(&members, &root_ptrs);
-        let mut targets = Vec::new();
-        if !shifted.is_empty() {
-            let ptrs: Vec<*const Node> = shifted.iter().map(|&(at, _)| at).collect();
-            targets = members.into_iter().filter(|member| ptrs.contains(&Arc::as_ptr(&member.node))).collect();
-            (members, seen) = gather(&ptrs)?;
         }
+        let root_at: Vec<u32> = added.iter().map(|&(at, _)| at).collect();
+        let n = graph.items.len();
+        // Something is shared with another operation only if a node has a reader outside the
+        // program and its sub-programs, which are the nodes of the graph. Most nodes have all their
+        // readers there, which counting tells without looking at them; only if one may not, the
+        // nodes of each program are told apart (below).
+        let alone = matches!(roots, [(root, _)] if is_alone(root));
+        let root_count = root_at.iter().copied().max().map_or(0, |last| last as usize + 1);
+        let mut readers = vec![0u32; n];
+        for item in &graph.items {
+            for (slot, &kid) in item.kids.iter().enumerate() {
+                if kid != NONE && !item.kids[..slot].contains(&kid) {
+                    readers[kid as usize] += 1;
+                }
+            }
+        }
+        let by_address_map = std::cell::OnceCell::new();
+        let by_address = || by_address_map.get_or_init(|| graph.by_address());
+        let in_graph = |ptr: *const Node| by_address().contains_key(&ptr);
+        let may_share = graph.items.iter().enumerate().skip(root_count).any(|(at, item)| {
+            let node = &item.node;
+            (node.requested.load(Ordering::Relaxed) && node.is_pending())
+                || (!alone && node.consumers.load(Ordering::Relaxed) > readers[at] && super::worth_storing(node) && node.has_consumer_outside(&in_graph))
+        });
+        if !may_share {
+            // The program of a graph of the same shape as one flattened before is that program
+            // over the buffers and scalars of this one.
+            let signature = jit.and_then(|_| graph.signature(&root_at, tail));
+            if let (Some(jit), Some(signature)) = (jit, &signature)
+                && let Some(fused) = jit.recipe(signature).and_then(|recipe| recipe.instantiate(&graph, tail))
+            {
+                #[cfg(any(test, debug_assertions))]
+                verify_recipe(&graph, &root_at, tail, &fused)?;
+                return Ok(fused);
+            }
+            let passes = graph.passes(&root_at);
+            break (graph, root_at, passes, signature);
+        }
+        let passes = graph.passes(&root_at);
         let mut sub_members = Vec::new();
         // Only expressions read through shifts add to what was seen.
-        let mut with_subs: Option<Seen> = None;
-        for member in &members {
-            if matches!(member.node.op().kind, OpKind::Shift(_))
-                && let Src::Node(sub_root) = &member.args[0] {
-                    let all_seen = with_subs.get_or_insert_with(|| seen.clone());
-                    collect(&Src::Node(Arc::clone(sub_root)), &mut sub_members, all_seen, false)?;
-                }
+        let mut with_subs: Option<Vec<bool>> = None;
+        for &at in &passes.members {
+            let kid = graph.items[at as usize].source();
+            if kid != NONE {
+                let all_seen = with_subs.get_or_insert_with(|| passes.seen.clone());
+                graph.collect(kid, &mut sub_members, all_seen);
+            }
         }
         // The shifted members are in `seen` already, so their expressions are collected here.
-        for target in targets {
-            let all_seen = with_subs.get_or_insert_with(|| seen.clone());
-            for arg in target.args.iter().take(target.node.op().kind.arity()) {
-                collect(arg, &mut sub_members, all_seen, false)?;
-            }
-            sub_members.push(target);
+        for &at in &passes.targets {
+            let all_seen = with_subs.get_or_insert_with(|| passes.seen.clone());
+            graph.collect_kids(at, false, &mut sub_members, all_seen);
+            sub_members.push(at);
         }
         // Sub-programs read further sub-programs through shifts of their own: those expressions
         // are part of the kernel too, and nothing in them is read from outside it.
         let mut next = 0;
-        while let Some(member) = sub_members.get(next) {
+        while let Some(&at) = sub_members.get(next) {
             next += 1;
-            if matches!(member.node.op().kind, OpKind::Shift(_))
-                && let Src::Node(sub_root) = &member.args[0]
-            {
-                let sub_root = Arc::clone(sub_root);
-                let all_seen = with_subs.get_or_insert_with(|| seen.clone());
-                collect(&Src::Node(sub_root), &mut sub_members, all_seen, false)?;
+            let kid = graph.items[at as usize].source();
+            if kid != NONE {
+                let all_seen = with_subs.get_or_insert_with(|| passes.seen.clone());
+                graph.collect(kid, &mut sub_members, all_seen);
             }
         }
-        let all_seen = with_subs.as_ref().unwrap_or(&seen);
-        let is_root = |node: &Arc<Node>| roots.iter().any(|(root, _)| Arc::ptr_eq(root, node));
+        let all_seen = with_subs.as_ref().unwrap_or(&passes.seen);
+        let inside = |ptr: *const Node| by_address().get(&ptr).is_some_and(|&at| all_seen[at as usize]);
+        let is_root = |at: u32| root_at.contains(&at);
         // A node that `eval` asked for (and whose evaluation was postponed) is computed on its
         // own once anyway: read inside a sub-program, it would be recomputed at every instance.
-        let requested = |member: &&Member| member.node.requested.load(Ordering::Relaxed) && member.node.is_pending();
-        let alone = matches!(roots, [(root, _)] if is_alone(root));
-        let shared: Vec<Arc<Node>> = members
+        let requested = |at: u32| {
+            let node = &graph.items[at as usize].node;
+            node.requested.load(Ordering::Relaxed) && node.is_pending()
+        };
+        let shared: Vec<Arc<Node>> = passes
+            .members
             .iter()
             .chain(&sub_members)
-            .filter(|member| !alone && !is_root(&member.node) && super::worth_storing(&member.node) && member.node.has_consumer_outside(all_seen))
-            .chain(sub_members.iter().filter(|member| !is_root(&member.node)).filter(requested))
-            .map(|member| Arc::clone(&member.node))
+            .filter(|&&at| {
+                !alone && !is_root(at) && super::worth_storing(&graph.items[at as usize].node) && graph.items[at as usize].node.has_consumer_outside(&inside)
+            })
+            .chain(sub_members.iter().filter(|&&at| !is_root(at) && requested(at)))
+            .map(|&at| Arc::clone(&graph.items[at as usize].node))
             .collect();
         if shared.is_empty() {
-            break members;
+            break (graph, root_at, passes, None);
         }
         let shared = outermost(shared);
         if shared.iter().any(|node| probes.iter().any(|&id| node.depends_on(id))) {
             return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
         }
         if !evaluation_fits(roots.iter().map(|(root, args)| (root, args)), &shared) {
-            break members;
+            break (graph, root_at, passes, None);
         }
-        let forced = with_siblings(shared, members.iter().chain(&sub_members).map(|member| &member.node).filter(|node| !is_root(node)));
+        let candidates = passes.members.iter().chain(&sub_members).filter(|&&at| !is_root(at)).map(|&at| &graph.items[at as usize].node);
+        let forced = with_siblings(shared, candidates);
         force_group(&forced)?;
     };
 
-    let mut flattener = Flattener { shifted, ..Flattener::default() };
-    flattener.instrs.reserve(members.len());
-    flattener.emitted.list.reserve(members.len());
-    let mut member_at = Vec::with_capacity(members.len());
-    for member in &members {
-        let at = flattener.emit(member.node.op(), &member.args, Some(Arc::as_ptr(&member.node)))?;
-        flattener.emitted.push(Arc::as_ptr(&member.node), at);
-        member_at.push(at);
-    }
-    let mut instr_nodes: Vec<Option<Arc<Node>>> = vec![None; flattener.instrs.len()];
-    for (member, at) in members.iter().zip(&member_at) {
-        if let Ref::Tmp(k) = at
-            && let Some(slot) = instr_nodes.get_mut(*k as usize)
-        {
-            *slot = Some(Arc::clone(&member.node));
+    let (mut fused, recorded) = emit_program(&graph, &root_at, &passes.members, passes.shifted, tail, signature.is_some())?;
+    if let (Some(jit), Some(signature), Some(recorded)) = (jit, signature, recorded)
+        && !recorded.record.impure
+    {
+        // The recipe keeps the program every equal one shares (see `JitState::intern`).
+        jit.intern(&mut fused.key);
+        if let Some(recipe) = Recipe::new(signature, &fused, recorded) {
+            jit.keep_recipe(recipe);
         }
     }
-    flattener.instr_nodes = instr_nodes;
-    let mut outputs = Vec::with_capacity(roots.len());
-    for (root, _) in roots {
-        match flattener.emitted.get(Arc::as_ptr(root)) {
-            Some(Ref::Tmp(at)) => outputs.push(at),
+    Ok(fused)
+}
+
+/// What the main program's walks found for a graph.
+struct Passes {
+    /// The pending nodes below the roots (not through shifts), each once, operands before the
+    /// nodes using them, without the `shifted` ones.
+    members: Vec<u32>,
+    /// Which items the walk saw (members and the shifted ones).
+    seen: Vec<bool>,
+    /// The shifted members, with the kind of shift that reads them (see [`Graph::shifted_members`]).
+    shifted: Vec<(u32, ShiftKind)>,
+    /// The members the walk left out because a shift reads them.
+    targets: Vec<u32>,
+}
+
+impl Graph {
+    fn passes(&self, root_at: &[u32]) -> Passes {
+        let n = self.items.len();
+        let gather = |seed: &[(u32, ShiftKind)]| -> (Vec<u32>, Vec<bool>) {
+            let mut members = Vec::with_capacity(n);
+            let mut seen = vec![false; n];
+            for &(at, _) in seed {
+                seen[at as usize] = true;
+            }
+            for &at in root_at {
+                self.collect_kids(at, true, &mut members, &mut seen);
+            }
+            for &at in root_at {
+                if !seen[at as usize] {
+                    seen[at as usize] = true;
+                    members.push(at);
+                }
+            }
+            (members, seen)
+        };
+        let (mut members, mut seen) = gather(&[]);
+        let shifted = self.shifted_members(&members, &seen, root_at);
+        let mut targets = Vec::new();
+        if !shifted.is_empty() {
+            let mut is_target = vec![false; n];
+            for &(at, _) in &shifted {
+                is_target[at as usize] = true;
+            }
+            targets = members.iter().copied().filter(|&at| is_target[at as usize]).collect();
+            (members, seen) = gather(&shifted);
+        }
+        Passes { members, seen, shifted, targets }
+    }
+}
+
+/// What [`emit_program`] noted besides the program.
+struct Recorded {
+    record: Record,
+    /// The items whose nodes are computed inside the program, the one each main instruction
+    /// computes (`NONE`: none), and the one each sub-program computes.
+    fused_items: Vec<u32>,
+    instr_items: Vec<u32>,
+    sub_root_items: Vec<u32>,
+}
+
+/// The program of `members` (the main program) and of the sub-programs they read, over the items
+/// of `graph`; `record` notes where its buffers and scalars come from.
+fn emit_program(
+    graph: &Graph,
+    root_at: &[u32],
+    members: &[u32],
+    shifted: Vec<(u32, ShiftKind)>,
+    tail: Tail,
+    record: bool,
+) -> Result<(Fused, Option<Recorded>), Failure> {
+    let mut flattener = Flattener::default();
+    if record {
+        flattener.record = Some(Record::default());
+    }
+    flattener.begin(graph.items.len());
+    for (at, kind) in shifted {
+        flattener.shifted[at as usize] = Some(kind);
+    }
+    flattener.instrs.reserve(members.len());
+    let mut member_at = Vec::with_capacity(members.len());
+    for &at in members {
+        let value = flattener.emit(graph, at)?;
+        flattener.mark(at, value);
+        member_at.push(value);
+    }
+    let mut instr_items = vec![NONE; flattener.instrs.len()];
+    for (&at, value) in members.iter().zip(&member_at) {
+        if let Ref::Tmp(k) = value
+            && let Some(slot) = instr_items.get_mut(*k as usize)
+        {
+            *slot = at;
+        }
+    }
+    let mut outputs = Vec::with_capacity(root_at.len());
+    for &at in root_at {
+        match flattener.emitted.get(at as usize) {
+            Some(Ref::Tmp(value)) => outputs.push(*value),
             _ => return Err(Failure::New(LumaError::Gpu("fused root without an instruction".into()))),
         }
     }
-    flattener.fused_nodes.reserve(members.len());
-    for member in members {
-        let root = roots.iter().any(|(root, _)| Arc::ptr_eq(root, &member.node));
-        if !root || matches!(tail, Tail::Reduce(_)) {
-            flattener.fused_nodes.push(member.node);
+    let mut fused_items = std::mem::take(&mut flattener.fused_items);
+    for &at in members {
+        if !root_at.contains(&at) || matches!(tail, Tail::Reduce(_)) {
+            fused_items.push(at);
         }
     }
-    Ok(flattener.finish(tail, outputs))
+    let sub_root_items = std::mem::take(&mut flattener.sub_root_items);
+    let node = |at: u32| Arc::clone(&graph.items[at as usize].node);
+    flattener.fused_nodes = fused_items.iter().map(|&at| node(at)).collect();
+    flattener.sub_roots = sub_root_items.iter().map(|&at| node(at)).collect();
+    flattener.instr_nodes = instr_items.iter().map(|&at| (at != NONE).then(|| node(at))).collect();
+    let record = flattener.record.take();
+    let fused = flattener.finish(tail, outputs);
+    Ok((fused, record.map(|record| Recorded { record, fused_items, instr_items, sub_root_items })))
+}
+
+/// Where an operand of a graph stands in the program built from it, by what that program
+/// depends on: scalars by type (their values are not part of the program), buffers by the order
+/// they are first read in (two reads of one buffer are one input), pending nodes by item.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArgSig {
+    Unused,
+    Scalar(ElemTy),
+    Input(u32),
+    Item(u32),
+}
+
+impl ArgSig {
+    fn code(self) -> u64 {
+        match self {
+            ArgSig::Unused => 0,
+            ArgSig::Scalar(ty) => 1 | (ty as u64) << 8,
+            ArgSig::Input(k) => 2 | u64::from(k) << 8,
+            ArgSig::Item(k) => 3 | u64::from(k) << 8,
+        }
+    }
+}
+
+#[derive(PartialEq)]
+struct ItemSig {
+    op: Op,
+    len: usize,
+    args: [ArgSig; 3],
+}
+
+/// Everything the program built from a graph is a function of, besides the buffers it reads and
+/// the values of its scalars: two graphs with the same signature flatten to the same program.
+#[derive(PartialEq)]
+struct Signature {
+    hash: u64,
+    items: Vec<ItemSig>,
+    roots: Vec<u32>,
+    tail: Tail,
+}
+
+impl Graph {
+    /// The signature of the graph of the roots `root_at`; `None` if an operand is a node that
+    /// has no buffer (and is not an item), which the program then depends on.
+    fn signature(&self, root_at: &[u32], tail: Tail) -> Option<Signature> {
+        use std::hash::{Hash, Hasher};
+        let mut buffers: Vec<*const Storage> = Vec::new();
+        let mut canon = |storage: &Arc<Storage>| -> u32 {
+            let ptr = Arc::as_ptr(storage);
+            let at = buffers.iter().position(|&known| known == ptr).unwrap_or_else(|| {
+                buffers.push(ptr);
+                buffers.len() - 1
+            });
+            u32::try_from(at).unwrap_or(u32::MAX)
+        };
+        let mut hasher = crate::gpu::hash::FxHasher::default();
+        let mut items = Vec::with_capacity(self.items.len());
+        for item in &self.items {
+            let mut args = [ArgSig::Unused; 3];
+            for (index, (slot, arg)) in args.iter_mut().zip(&item.args).enumerate().take(usize::from(item.arity)) {
+                *slot = match (arg, item.kids[index]) {
+                    (Src::Scalar(scalar), _) => ArgSig::Scalar(scalar.ty),
+                    (Src::Buffer(storage), _) => ArgSig::Input(canon(storage)),
+                    (Src::Node(_), kid) if kid != NONE => ArgSig::Item(kid),
+                    (Src::Node(node), _) => ArgSig::Input(canon(node.evaluated()?)),
+                };
+            }
+            let (op, len) = (item.node.op, item.node.len);
+            op.hash(&mut hasher);
+            hasher.write_usize(len);
+            for arg in args {
+                hasher.write_u64(arg.code());
+            }
+            items.push(ItemSig { op, len, args });
+        }
+        root_at.hash(&mut hasher);
+        tail.hash(&mut hasher);
+        Some(Signature { hash: hasher.finish(), items, roots: root_at.to_vec(), tail })
+    }
+}
+
+/// The program built from a graph, to be built again from another graph with the same
+/// [`Signature`] without walking it: the program itself (the instructions every equal program
+/// shares), and where the buffers, scalars and nodes of the program come from in the graph (by
+/// item).
+pub(super) struct Recipe {
+    sig: Signature,
+    instrs: Arc<Vec<Instr>>,
+    subs: Arc<Vec<Vec<Instr>>>,
+    input_tys: Vec<ElemTy>,
+    scalar_tys: Vec<ElemTy>,
+    outputs: Vec<u32>,
+    guard: Option<u32>,
+    shape: u64,
+    inputs: Vec<(u32, u8)>,
+    scalars: Vec<ScalarSrc>,
+    fused: Vec<u32>,
+    instr_items: Vec<u32>,
+    sub_roots: Vec<u32>,
+}
+
+impl Recipe {
+    fn new(sig: Signature, fused: &Fused, recorded: Recorded) -> Option<Recipe> {
+        let Recorded { record, fused_items, instr_items, sub_root_items } = recorded;
+        (record.inputs.len() == fused.inputs.len()).then(|| Recipe {
+            sig,
+            instrs: Arc::clone(&fused.key.instrs),
+            subs: Arc::clone(&fused.key.subs),
+            input_tys: fused.key.input_tys.clone(),
+            scalar_tys: fused.key.scalar_tys.clone(),
+            outputs: fused.key.outputs.clone(),
+            guard: fused.key.guard,
+            shape: fused.key.shape,
+            inputs: record.inputs,
+            scalars: record.scalars,
+            fused: fused_items,
+            instr_items,
+            sub_roots: sub_root_items,
+        })
+    }
+
+    /// The program over the buffers, scalars and nodes of `graph`, which has this recipe's
+    /// signature. `None` if the graph does not have what the program reads (a node that is not
+    /// evaluated any more).
+    fn instantiate(&self, graph: &Graph, tail: Tail) -> Option<Fused> {
+        let operand = |item: u32, slot: u8| graph.items.get(item as usize).and_then(|item| item.args.get(usize::from(slot)));
+        let mut inputs = Vec::with_capacity(self.inputs.len());
+        for &(item, slot) in &self.inputs {
+            inputs.push(match operand(item, slot)? {
+                Src::Buffer(storage) => Arc::clone(storage),
+                Src::Node(node) => Arc::clone(node.evaluated()?),
+                Src::Scalar(_) => return None,
+            });
+        }
+        let mut scalars = Vec::with_capacity(self.scalar_tys.len());
+        for source in &self.scalars {
+            let scalar = match *source {
+                ScalarSrc::Const(scalar) => scalar,
+                ScalarSrc::Operand(item, slot) => match operand(item, slot)? {
+                    Src::Scalar(scalar) => *scalar,
+                    _ => return None,
+                },
+            };
+            scalars.extend(scalar.words().iter().take(scalar.ty.slots()));
+        }
+        if self.guard.is_some() {
+            scalars.push(0);
+        }
+        if scalars.len() != self.scalar_tys.len() {
+            return None;
+        }
+        let node = |at: u32| graph.items.get(at as usize).map(|item| Arc::clone(&item.node));
+        let fused_nodes: Option<Vec<Arc<Node>>> = self.fused.iter().map(|&at| node(at)).collect();
+        let sub_roots: Option<Vec<Arc<Node>>> = self.sub_roots.iter().map(|&at| node(at)).collect();
+        let instr_nodes: Option<Vec<Option<Arc<Node>>>> =
+            self.instr_items.iter().map(|&at| if at == NONE { Some(None) } else { node(at).map(Some) }).collect();
+        Some(Fused {
+            key: FusedKey {
+                shape: self.shape,
+                instrs: Arc::clone(&self.instrs),
+                input_tys: self.input_tys.clone(),
+                scalar_tys: self.scalar_tys.clone(),
+                subs: Arc::clone(&self.subs),
+                outputs: self.outputs.clone(),
+                tail,
+                in_place: Vec::new(),
+                spans: Vec::new(),
+                tile: None,
+                staging: None,
+                guard: self.guard,
+            },
+            inputs,
+            scalars,
+            fused_nodes: fused_nodes?,
+            instr_nodes: instr_nodes?,
+            sub_roots: sub_roots?,
+        })
+    }
+}
+
+/// The recipes of a context by the hash of their signatures.
+#[derive(Default)]
+pub(super) struct RecipeTable {
+    map: FxMap<u64, Vec<Arc<Recipe>>>,
+    /// Items in the signatures kept.
+    items: usize,
+}
+
+impl std::fmt::Debug for RecipeTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RecipeTable({} signatures, {} items)", self.map.len(), self.items)
+    }
+}
+
+/// Signatures kept before the table starts again.
+const RECIPE_ITEMS: usize = 60_000;
+
+impl JitState {
+    /// The recipe whose signature is `signature`, if one was kept.
+    fn recipe(&self, signature: &Signature) -> Option<Arc<Recipe>> {
+        let candidates = lock(&self.recipes).map.get(&signature.hash)?.clone();
+        let found = candidates.into_iter().find(|recipe| recipe.sig == *signature);
+        #[cfg(test)]
+        if found.is_some() {
+            self.recipe_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        found
+    }
+
+    fn keep_recipe(&self, recipe: Recipe) {
+        let mut table = lock(&self.recipes);
+        if table.items + recipe.sig.items.len() > RECIPE_ITEMS {
+            table.map.clear();
+            table.items = 0;
+        }
+        table.items += recipe.sig.items.len();
+        table.map.entry(recipe.sig.hash).or_default().push(Arc::new(recipe));
+    }
+}
+
+/// Checks a program made from a recipe against the one flattening the graph builds.
+#[cfg(any(test, debug_assertions))]
+fn verify_recipe(graph: &Graph, root_at: &[u32], tail: Tail, fast: &Fused) -> Result<(), Failure> {
+    let passes = graph.passes(root_at);
+    let (slow, _) = emit_program(graph, root_at, &passes.members, passes.shifted, tail, false)?;
+    let same_nodes = |a: &[Arc<Node>], b: &[Arc<Node>]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y));
+    let same_inputs = fast.inputs.len() == slow.inputs.len() && fast.inputs.iter().zip(&slow.inputs).all(|(x, y)| Arc::ptr_eq(x, y));
+    let same_instr_nodes = fast.instr_nodes.len() == slow.instr_nodes.len()
+        && fast.instr_nodes.iter().zip(&slow.instr_nodes).all(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+            (None, None) => true,
+            _ => false,
+        });
+    assert!(
+        fast.key == slow.key
+            && fast.scalars == slow.scalars
+            && same_inputs
+            && same_nodes(&fast.fused_nodes, &slow.fused_nodes)
+            && same_nodes(&fast.sub_roots, &slow.sub_roots)
+            && same_instr_nodes,
+        "a program made from a recipe differs from the flattened one:\nrecipe {fast:?}\nflattened {slow:?}"
+    );
+    Ok(())
 }
 
 /// What a traced step reads as state `j`: a pending node (matched by address) or a buffer.
@@ -1156,7 +1748,6 @@ pub(super) struct Traced {
 pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail) -> Option<Traced> {
     let ctx = roots.first()?.context();
     let mut flat = Flattener { trace: true, ..Flattener::default() };
-    let mut seen = Seen::default();
     for (j, state) in states.iter().enumerate() {
         let (storage, node) = match state {
             StateRef::Buffer(storage) => (Arc::clone(storage), None),
@@ -1172,55 +1763,58 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
             return None;
         }
         if let Some(node) = node {
-            let key = Arc::as_ptr(node);
-            flat.emitted.push(key, at);
-            flat.boundary.push(key);
-            seen.push(key);
+            flat.boundary.push((Arc::as_ptr(node), at));
         }
     }
     if roots.iter().enumerate().any(|(i, root)| {
-        seen.contains(Arc::as_ptr(root)) || roots[..i].iter().any(|other| Arc::ptr_eq(other, root))
+        flat.is_boundary(Arc::as_ptr(root)) || roots[..i].iter().any(|other| Arc::ptr_eq(other, root))
     }) {
         return None;
     }
 
-    let mut members: Vec<Member> = Vec::new();
-    let mut root_args = Vec::with_capacity(roots.len());
+    let mut graph = Graph::new(roots.iter(), true, flat.boundary.iter().map(|&(ptr, _)| ptr).collect());
+    let mut root_at = Vec::with_capacity(roots.len());
     for root in roots {
         if !root.is_pending() {
             return None;
         }
-        let args = root.operands()?;
-        for (index, arg) in args.iter().enumerate().take(root.op().kind.arity()) {
-            if index == 0 && matches!(root.op().kind, OpKind::Shift(_)) {
-                continue;
-            }
-            collect(arg, &mut members, &mut seen, true).ok()?;
-        }
-        root_args.push(args);
+        root_at.push(graph.add_root(root, root.operands()?).0);
     }
-    for (root, args) in roots.iter().zip(root_args) {
-        if !seen.contains(Arc::as_ptr(root)) {
-            seen.push(Arc::as_ptr(root));
-            members.push(Member { node: Arc::clone(root), args });
+    for &at in &root_at {
+        graph.link_root(at).ok()?;
+    }
+    let n = graph.items.len();
+    let mut members = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    for &at in &root_at {
+        graph.collect_kids(at, true, &mut members, &mut seen);
+    }
+    for &at in &root_at {
+        if !seen[at as usize] {
+            seen[at as usize] = true;
+            members.push(at);
         }
     }
-    let is_root = |node: &Arc<Node>| roots.iter().any(|root| Arc::ptr_eq(root, node));
-    if members.iter().any(|member| !is_root(&member.node) && member.node.has_consumer_outside(&seen)) {
+    let by_address_map = std::cell::OnceCell::new();
+    let inside = |ptr: *const Node| {
+        flat.is_boundary(ptr) || by_address_map.get_or_init(|| graph.by_address()).get(&ptr).is_some_and(|&at| seen[at as usize])
+    };
+    if members.iter().any(|&at| !root_at.contains(&at) && graph.items[at as usize].node.has_consumer_outside(&inside)) {
         return None;
     }
 
     let mut nodes = Vec::with_capacity(members.len());
+    flat.begin(n);
     flat.instrs.reserve(members.len());
-    for member in &members {
-        let at = flat.emit(member.node.op(), &member.args, Some(Arc::as_ptr(&member.node))).ok()?;
-        flat.emitted.push(Arc::as_ptr(&member.node), at);
-        nodes.push(Some(Arc::clone(&member.node)));
+    for &at in &members {
+        let value = flat.emit(&graph, at).ok()?;
+        flat.mark(at, value);
+        nodes.push(Some(Arc::clone(&graph.items[at as usize].node)));
     }
     let mut outputs = Vec::with_capacity(roots.len());
-    for root in roots {
-        match flat.emitted.get(Arc::as_ptr(root)) {
-            Some(Ref::Tmp(at)) => outputs.push(at),
+    for &at in &root_at {
+        match flat.emitted.get(at as usize) {
+            Some(Ref::Tmp(value)) => outputs.push(*value),
             _ => return None,
         }
     }

@@ -502,6 +502,7 @@ pub(crate) struct Op {
 }
 
 impl PartialEq for Op {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.fingerprint == other.fingerprint && self.ty == other.ty && self.kind == other.kind
     }
@@ -1020,9 +1021,10 @@ impl Node {
         self.inputs().binary_search(&storage_id).is_ok()
     }
 
-    /// Whether another pending node outside `group` (node pointers) reads this node. Evaluating
-    /// this node separately then beats recomputing it in every consumer's kernel.
-    pub(crate) fn has_consumer_outside(&self, group: &program::Seen) -> bool {
+    /// Whether another pending node outside the group (the nodes `inside` tells by address) reads
+    /// this node. Evaluating this node separately then beats recomputing it in every consumer's
+    /// kernel.
+    pub(crate) fn has_consumer_outside(&self, inside: impl Fn(*const Node) -> bool) -> bool {
         // Cheap filter: nodes with a single consumer cannot be shared.
         if self.consumers.load(Ordering::Relaxed) < 2 {
             return false;
@@ -1033,12 +1035,17 @@ impl Node {
             return false;
         }
         // Most readers are inside the group: tell by address and only upgrade the others.
-        self.readers.any_pending(|weak| !group.contains(weak.as_ptr()))
+        self.readers.any_pending(|weak| !inside(weak.as_ptr()))
     }
 
     /// A copy of the operands of a node that has not been evaluated.
     pub(crate) fn operands(&self) -> Option<Args> {
         lock(&self.args).clone()
+    }
+
+    /// Whether the node has operands, which it does not once it is evaluated or being evaluated.
+    pub(crate) fn has_operands(&self) -> bool {
+        lock(&self.args).is_some()
     }
 }
 
@@ -1836,6 +1843,12 @@ pub(crate) struct JitState {
     /// The programs seen so far by their shape hash, to make equal ones share their
     /// instructions (see [`JitState::intern`]).
     structures: Mutex<FxMap<u64, Vec<(Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>)>>>,
+    /// The programs built from graphs seen so far, to build them again from graphs of the same
+    /// shape without walking them (see [`program::Recipe`]).
+    recipes: Mutex<program::RecipeTable>,
+    /// How many programs were built from a recipe (tests).
+    #[cfg(test)]
+    recipe_hits: AtomicU64,
     /// Counts the writes into buffers, so that [`ConsTable`] never outlives a change of contents.
     write_epoch: AtomicU64,
     cons: Mutex<ConsTable>,
@@ -1919,6 +1932,9 @@ impl JitState {
             #[cfg(test)]
             last_judgement: Mutex::new(None),
             structures: Mutex::new(FxMap::default()),
+            recipes: Mutex::new(program::RecipeTable::default()),
+            #[cfg(test)]
+            recipe_hits: AtomicU64::new(0),
             write_epoch: AtomicU64::new(0),
             cons: Mutex::new(ConsTable::default()),
             splits: Mutex::new(None),
@@ -2182,6 +2198,11 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn last_program_len(&self) -> usize {
         self.last_program_len.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recipe_hits(&self) -> u64 {
+        self.recipe_hits.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
