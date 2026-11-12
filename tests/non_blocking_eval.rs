@@ -1,7 +1,7 @@
 // wgpu's handle types nest deeply; see tests/batching.rs.
 #![recursion_limit = "256"]
 
-//! `Array::submit` and `submit_all` record and hand the batch to the GPU without waiting for it.
+//! `eval` and `eval_all` record and hand the batch to the GPU without waiting for it.
 
 mod common;
 
@@ -19,14 +19,14 @@ fn submit_then_to_vec_gives_what_eval_gives() {
     let evaluated = &x * 2.0 + 1.0;
     evaluated.eval().unwrap();
     let submitted = &x * 2.0 + 1.0;
-    submitted.submit().unwrap();
+    submitted.eval().unwrap();
 
     assert_eq!(submitted.to_vec().unwrap(), evaluated.to_vec().unwrap());
     assert_eq!(submitted.to_vec().unwrap(), vec![3.0, 5.0, 7.0, 9.0]);
 
     // An array that is already computed, and submitting twice, are fine.
-    submitted.submit().unwrap();
-    x.submit().unwrap();
+    submitted.eval().unwrap();
+    x.eval().unwrap();
     assert_eq!(x.to_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
 }
 
@@ -36,14 +36,14 @@ fn submitted_work_runs_in_order_with_what_is_recorded_after_it() {
     // A view sharing the buffer makes every compound assignment a dispatch of its own.
     let view = x.reshape(8);
     x += 2.0;
-    x.submit().unwrap();
+    x.eval().unwrap();
     x *= 3.0;
     x += 1.0;
     assert_eq!(view.to_vec().unwrap(), vec![7.0; 8]);
 }
 
 #[test]
-fn a_loop_of_submit_all_steps_needs_one_read_back() {
+fn a_loop_of_eval_all_steps_needs_one_read_back() {
     const N: usize = 1000;
     let c = values(N, 7, -1.0, 1.0);
     let carr = f32s(&c);
@@ -54,7 +54,7 @@ fn a_loop_of_submit_all_steps_needs_one_read_back() {
     for _ in 0..steps {
         z = &z * 0.5 + &carr;
         sum = &sum + &z;
-        submit_all(&[&z, &sum]).unwrap();
+        eval_all(&[&z, &sum]).unwrap();
     }
 
     let (mut want_z, mut want_sum) = (vec![0.0f32; N], vec![0.0f32; N]);
@@ -69,13 +69,13 @@ fn a_loop_of_submit_all_steps_needs_one_read_back() {
 }
 
 #[test]
-fn submit_all_takes_arrays_of_different_lengths_and_no_arrays() {
-    submit_all::<f32>(&[]).unwrap();
+fn eval_all_takes_arrays_of_different_lengths_and_no_arrays() {
+    eval_all::<f32>(&[]).unwrap();
 
     let a = &f32s(&[1.0, 2.0, 3.0]) * 2.0;
     let b = &f32s(&[10.0, 20.0, 30.0, 40.0, 50.0]) + 1.0;
     let c = &f32s(&[1.0; 3]) + &a; // the same length as `a`, and uses it
-    submit_all(&[&a, &b, &c]).unwrap();
+    eval_all(&[&a, &b, &c]).unwrap();
     assert_eq!(a.to_vec().unwrap(), vec![2.0, 4.0, 6.0]);
     assert_eq!(b.to_vec().unwrap(), vec![11.0, 21.0, 31.0, 41.0, 51.0]);
     assert_eq!(c.to_vec().unwrap(), vec![3.0, 5.0, 7.0]);
@@ -86,23 +86,23 @@ fn poisoned_arrays_return_their_error_from_submit() {
     let a = f32s(&[1.0, 2.0, 3.0]);
     let bad = &a + &f32s(&[1.0]);
 
-    let err = bad.submit().unwrap_err();
+    let err = bad.eval().unwrap_err();
     assert!(matches!(err.root(), LumaError::ShapeMismatch { .. }), "{err}");
 
-    let err = submit_all(&[&a, &bad]).unwrap_err();
+    let err = eval_all(&[&a, &bad]).unwrap_err();
     assert!(matches!(err.root(), LumaError::ShapeMismatch { .. }), "{err}");
 
     // The healthy array is unharmed.
-    a.submit().unwrap();
+    a.eval().unwrap();
     assert_eq!(a.to_vec().unwrap(), vec![1.0, 2.0, 3.0]);
 }
 
 #[test]
-fn submit_all_rejects_arrays_of_different_contexts() {
+fn eval_all_rejects_arrays_of_different_contexts() {
     let one = Context::new().unwrap();
     let two = Context::new().unwrap();
     let a = Array::from_slice_on(&one, &[1.0f32, 2.0], 2).unwrap();
     let b = Array::from_slice_on(&two, &[1.0f32, 2.0], 2).unwrap();
-    let err = submit_all(&[&a, &b]).unwrap_err();
+    let err = eval_all(&[&a, &b]).unwrap_err();
     assert!(matches!(err, LumaError::ContextMismatch), "{err}");
 }

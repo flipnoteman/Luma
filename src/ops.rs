@@ -583,11 +583,6 @@ fn run_iterate_all<const N: usize>(
     Ok(states)
 }
 
-/// Same as [`eval_all`].
-pub fn submit_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
-    eval_all(arrays)
-}
-
 /// A reduction for [`Array::reduce`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Reduction {

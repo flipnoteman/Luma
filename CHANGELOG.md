@@ -18,7 +18,6 @@ All notable changes to Luma are listed here. The format follows
   anything else (shifts, arrays split into several buffers) runs step by step. Mandelbrot 1024²,
   256 iterations: 0.46 ms on an RTX 3080 Laptop, against 3.6 ms for the unevaluated chain.
 - ArrayFire comparison benchmarks in `benchmarks/arrayfire` (separate workspace, not part of the crate).
-- `Array::submit` and `submit_all`: evaluate arrays without waiting for the GPU.
 - `select` accepts scalar branches; the result's shape and context come from the mask.
 - CPU fallback: when no GPU opens, Luma runs through Mesa llvmpipe (a software Vulkan driver that
   must be installed). `LUMA_DEVICE=cpu` or `Context::cpu()` force it, `LUMA_DEVICE=gpu` refuses it.
@@ -59,9 +58,8 @@ All notable changes to Luma are listed here. The format follows
 
 - **Breaking:** `Array::eval` and `eval_all` no longer wait for the GPU, like ArrayFire's `eval`:
   they record and hand the batch over, and `Context::sync`, readbacks and reductions wait. A GPU
-  error raised by the batch shows up at the next waiting call. `submit` and `submit_all` are now
-  the same as `eval` and `eval_all`. A loop that evaluates every step no longer pays a full round
-  trip per step (about 35 µs on NVIDIA/Vulkan on Linux).
+  error raised by the batch shows up at the next waiting call. A loop that evaluates every step
+  no longer pays a full round trip per step (about 35 µs on NVIDIA/Vulkan on Linux).
 - `eval` and `eval_all` postpone the computation while the GPU is busy, until an `eval` finds it
   idle or something waits. Requested arrays dropped in the meantime are never computed, and the
   steps in between fuse. Mandelbrot evaluated every iteration (1024², 256 iterations): 25.6 to
@@ -71,9 +69,9 @@ All notable changes to Luma are listed here. The format follows
   iterations: 5.6 to 3.7 ms on an RTX 3080 Laptop).
 - At the fusion limit, live arrays that share pending work with the biggest operand are evaluated
   together in multi-output kernels, instead of that operand alone.
-- `Array::submit` and `submit_all` hold back up to 16 kernels while the GPU is still busy and hand
-  them over with the next submitting or waiting call (one submission instead of one per call). Call
-  `Context::flush` before long work that does not touch Luma.
+- `eval` holds back up to 16 kernels while the GPU is still busy and hands them over with the next
+  submitting or waiting call (one submission instead of one per call). Call `Context::flush`
+  before long work that does not touch Luma.
 - `Context::sync` and readbacks (`to_vec`, `read_into`, reductions) poll before blocking in the
   driver, for 1.5x the longest of the last four waits (at least 500 µs; waits predicted beyond 4 ms
   block as before), so a result that is about to arrive is not picked up late by a sleeping thread.

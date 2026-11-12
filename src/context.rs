@@ -832,15 +832,13 @@ impl Context {
 
     /// Submits the pending batch without waiting for it, like [`Context::flush`] but without
     /// evaluating the lazy arrays that are still alive: only what was recorded so far goes to
-    /// the GPU. For [`Array::submit`](crate::Array::submit) and [`submit_all`](crate::submit_all),
-    /// which record exactly what they want submitted.
+    /// the GPU. For the fusion-limit cuts in `jit::create`.
     ///
     /// While the GPU is still busy with earlier submissions and fewer than [`SUBMIT_HOLD`]
     /// dispatches are pending, this does not submit at all: the GPU has work to do anyway, and
     /// every `queue.submit` costs the host 20-35 us and leaves a gap of about as much between
-    /// two kernels. The held-back dispatches go out with the next call that submits: another
-    /// `submit`, [`Context::flush`], anything that waits, or the batch limit. A caller that
-    /// submits and then does long work without touching luma has to call [`Context::flush`].
+    /// two kernels. The held-back dispatches go out with the next call that submits,
+    /// [`Context::flush`], anything that waits, or the batch limit.
     pub(crate) fn submit(&self) -> Result<()> {
         let mut batch = self.batch()?;
         if batch.dispatches < SUBMIT_HOLD && self.gpu_busy() {
@@ -2014,43 +2012,42 @@ mod tests {
         assert_eq!(view.to_vec().unwrap(), vec![7.0; 16]);
     }
 
-    /// Steps of a loop that keep the GPU busy long enough for `submit` to hold some back.
-    fn submit_busy_loop(ctx: &Context, x: &mut Array<f32>, steps: usize) {
+    /// Steps of a loop that keep the GPU busy long enough for `eval` to hold some back.
+    fn eval_busy_loop(ctx: &Context, x: &mut Array<f32>, steps: usize) {
         for _ in 0..steps {
             *x = &*x * 1.0 + 1.0;
-            x.submit().unwrap();
+            x.eval().unwrap();
         }
         assert!(ctx.pending_dispatches() < SUBMIT_HOLD + 1);
     }
 
     #[test]
-    fn flush_hands_over_what_submit_held_back() {
+    fn flush_hands_over_what_eval_held_back() {
         let ctx = Context::new().unwrap();
         let mut x = Array::<f32>::zeros_on(&ctx, 1 << 22).unwrap();
-        submit_busy_loop(&ctx, &mut x, 40);
+        eval_busy_loop(&ctx, &mut x, 40);
         ctx.flush().unwrap();
         assert_eq!(ctx.pending_dispatches(), 0);
         assert_eq!(x.to_vec().unwrap()[..4], [40.0; 4]);
     }
 
     #[test]
-    fn a_waiting_call_completes_a_batch_that_submit_held_back() {
+    fn a_waiting_call_completes_a_batch_that_eval_held_back() {
         let ctx = Context::new().unwrap();
         let mut x = Array::<f32>::zeros_on(&ctx, 1 << 22).unwrap();
-        submit_busy_loop(&ctx, &mut x, 40);
+        eval_busy_loop(&ctx, &mut x, 40);
         assert_eq!(x.to_vec().unwrap()[1 << 21], 40.0);
         assert_eq!(ctx.pending_dispatches(), 0);
     }
 
     #[test]
-    fn submit_hands_over_one_array_and_leaves_other_lazy_arrays_lazy() {
+    fn eval_hands_over_one_array_and_leaves_other_lazy_arrays_lazy() {
         let ctx = Context::new().unwrap();
         let x = Array::<f32>::full_on(&ctx, 16, 1.0).unwrap();
         let wanted = &x + 1.0;
         let unrelated = &x * 3.0;
-        wanted.submit().unwrap();
-        // `wanted` was recorded (and went to the GPU, unless the GPU was busy and `submit` held
-        // it back); unlike `flush`, `submit` did not evaluate the other array.
+        wanted.eval().unwrap();
+        // Unlike `flush`, `eval` does not evaluate the other array.
         assert!(wanted.pending().is_none());
         assert!(unrelated.pending().is_some());
         ctx.flush().unwrap();

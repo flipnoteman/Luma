@@ -62,7 +62,7 @@ pub use gpu_type::{GpuType, ScalarType};
 pub use kernel::{
     uniform, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize,
 };
-pub use ops::{eval_all, iterate_all, select, submit_all, Operand, Reduction, Rhs};
+pub use ops::{eval_all, iterate_all, select, Operand, Reduction, Rhs};
 pub use profile::{KernelTiming, Profile};
 pub use shape::{Offsets, Shape};
 pub use tuning::TuningProfile;

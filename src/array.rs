@@ -548,11 +548,6 @@ impl<T: GpuType> Array<T> {
         }
     }
 
-    /// Same as [`Array::eval`].
-    pub fn submit(&self) -> Result<()> {
-        self.eval()
-    }
-
     /// Overwrites the array's contents with `data`, which must have exactly [`Array::len`]
     /// elements. The upload is recorded in order with the operations before it and does not wait
     /// for the GPU: operations recorded earlier still see the old contents.
