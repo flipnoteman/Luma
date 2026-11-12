@@ -22,7 +22,7 @@ use crate::builtin::reduce_main;
 use crate::tuning::Tuning;
 
 use super::program::{FusedKey, Instr, Ref, Tail};
-use super::{ElemTy, OpKind, ShiftKind};
+use super::{ElemTy, Gen, OpKind, ShiftKind};
 
 /// `template` with its operand identifiers `x` and `y` replaced by `a` and `b`.
 fn substitute(template: &str, a: &str, b: &str) -> String {
@@ -70,6 +70,7 @@ pub(super) fn expression(instr: &Instr, index: &str, total: &str, segmented: boo
         OpKind::Powf => format!("pow({a}, {b})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
         OpKind::Select => format!("select({c}, {b}, {a} != 0u)"),
+        OpKind::Generate(kind) => generate(kind, instr.op.out_ty(), index, &a, &b),
         OpKind::Shift(kind) => {
             let at = shift_index(kind, &b, index, total);
             match instr.args[0] {
@@ -82,6 +83,60 @@ pub(super) fn expression(instr: &Instr, index: &str, total: &str, segmented: boo
             }
         }
     }
+}
+
+fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
+    match kind {
+        Gen::Bits => format!("luma_threefry({index}, {a}, {b}).x"),
+        Gen::Uniform => format!("luma_uniform(luma_threefry({index}, {a}, {b}).x)"),
+        Gen::Normal => format!("luma_normal(luma_threefry({index}, {a}, {b}))"),
+        Gen::Range { stride, size } => match ty {
+            ElemTy::F32 => format!("f32(({index} / {stride}u) % {size}u)"),
+            ElemTy::U32 => format!("(({index} / {stride}u) % {size}u)"),
+        },
+        Gen::Linspace => format!("({a} + f32({index}) * {b})"),
+    }
+}
+
+/// Rotation amounts of Threefry-2x32 (Random123).
+const THREEFRY_ROTATIONS: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
+
+/// The WGSL helpers of the random generators, if any instruction of `programs` uses them.
+pub(super) fn generator_helpers<'a>(programs: impl IntoIterator<Item = &'a [Instr]>) -> String {
+    let random = programs.into_iter().flatten().any(|instr| {
+        matches!(instr.op.kind, OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal))
+    });
+    if !random {
+        return String::new();
+    }
+    let keys = ["k0", "k1", "k2"];
+    let mut src =
+        String::from("fn luma_threefry(c: u32, k0: u32, k1: u32) -> vec2<u32> {\n    let k2 = 0x1BD11BDAu ^ k0 ^ k1;\n    var x0 = c + k0;\n    var x1 = k1;\n");
+    for round in 0..20 {
+        let r = THREEFRY_ROTATIONS[round % 8];
+        let _ = writeln!(src, "    x0 = x0 + x1; x1 = ((x1 << {r}u) | (x1 >> {}u)) ^ x0;", 32 - r);
+        if round % 4 == 3 {
+            let s = round / 4 + 1;
+            let _ = writeln!(src, "    x0 = x0 + {}; x1 = x1 + {} + {s}u;", keys[s % 3], keys[(s + 1) % 3]);
+        }
+    }
+    src.push_str(
+        "    return vec2<u32>(x0, x1);
+}
+fn luma_uniform(w: u32) -> f32 { return f32(w >> 8u) * 5.9604645e-8; }
+fn luma_normal(w: vec2<u32>) -> f32 {
+    let u1 = (f32(w.x >> 8u) + 1.0) * 5.9604645e-8;
+    return sqrt(-2.0 * log(u1)) * cos(6.2831855 * f32(w.y >> 8u) * 5.9604645e-8);
+}
+",
+    );
+    src
+}
+
+/// Whether a program uses the element's index in the whole array, so a kernel run per segment
+/// needs the segment's first index.
+pub(super) fn generates(key: &FusedKey) -> bool {
+    key.instrs.iter().chain(key.subs.iter().flatten()).any(|instr| matches!(instr.op.kind, OpKind::Generate(_)))
 }
 
 /// The index element `i` of a shift reads; `s` names the scalar shift of [`ShiftKind::Linear`],
@@ -136,7 +191,8 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
     let reduce = matches!(key.tail, Tail::Reduce(_));
     let segmented = !key.spans.is_empty();
     let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
-    let uniform = reduce || !key.scalar_tys.is_empty() || segmented;
+    let based = generates(key) && !segmented;
+    let uniform = reduce || !key.scalar_tys.is_empty() || segmented || based;
     let mut src = String::new();
 
     if uniform {
@@ -151,6 +207,8 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
                     let _ = write!(src, "c{k}_{s}: u32, ");
                 }
             }
+        } else if based {
+            src.push_str("base: u32, ");
         }
         for (k, ty) in key.scalar_tys.iter().enumerate() {
             let _ = write!(src, "s{k}: {}, ", ty.wgsl());
@@ -198,10 +256,15 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32) -> Strin
             let _ = writeln!(src, "    return in{k}_{}[o];\n}}", m - 1);
         }
     }
+    src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
     src.push_str(&subs(key));
 
-    let (index, total) = if segmented { ("gi", "p.total") } else { ("i", "luma.size.x") };
-    let global = if segmented { "    let gi = p.base + i;\n" } else { "" };
+    let (index, total) = match (segmented, based) {
+        (true, _) => ("gi", "p.total"),
+        (false, true) => ("gi", "luma.size.x"),
+        (false, false) => ("i", "luma.size.x"),
+    };
+    let global = if segmented || based { "    let gi = p.base + i;\n" } else { "" };
     match key.tail {
         Tail::Store => {
             let stores: String = outputs.iter().enumerate().map(|(j, at)| format!("    out{j}[i] = t{at};\n")).collect();
@@ -231,6 +294,69 @@ fn luma_eval(i: u32) -> {ty} {{
             );
         }
     }
+    src
+}
+
+/// A kernel running `p.steps` iterations of the store program `key` per element, with the
+/// state in registers. `states[k]` is the state that input `k` reads (`None`: a loop-invariant
+/// input). Bindings: one output and one initial value per state, the invariant inputs, `p`.
+pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tuning) -> String {
+    let wg = tuning.elementwise_workgroup;
+    let count = key.outputs.len();
+    let mut src = String::from("struct Params { steps: u32, ");
+    for (k, ty) in key.scalar_tys.iter().enumerate() {
+        let _ = write!(src, "s{k}: {}, ", ty.wgsl());
+    }
+    src.push_str("}\n");
+    let mut binding = 0;
+    for (role, access) in [("out", "read_write"), ("init", "read")] {
+        for j in 0..count {
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<f32>;");
+            binding += 1;
+        }
+    }
+    for (k, ty) in key.input_tys.iter().enumerate() {
+        if states.get(k).copied().flatten().is_none() {
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", ty.wgsl());
+            binding += 1;
+        }
+    }
+    let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
+    src.push_str(&generator_helpers([key.instrs.as_slice()]));
+    let _ = write!(
+        src,
+        "
+@compute @workgroup_size({wg})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let i = gid.x + gid.y * nwg.x * {wg}u;
+    if (i >= luma.size.x) {{ return; }}
+"
+    );
+    for j in 0..count {
+        let _ = writeln!(src, "    var s{j}: f32 = init{j}[i];");
+    }
+    for (k, ty) in key.input_tys.iter().enumerate() {
+        if states.get(k).copied().flatten().is_none() && direct(&key.instrs, k as u32) {
+            let _ = writeln!(src, "    let a{k}: {} = in{k}[i];", ty.wgsl());
+        }
+    }
+    src.push_str("    for (var step = 0u; step < p.steps; step = step + 1u) {\n");
+    for (k, state) in states.iter().enumerate() {
+        if let Some(j) = state {
+            let _ = writeln!(src, "        let a{k}: f32 = s{j};");
+        }
+    }
+    for (k, instr) in key.instrs.iter().enumerate() {
+        let _ = writeln!(src, "        let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr, "i", "luma.size.x", false));
+    }
+    for (j, at) in key.outputs.iter().enumerate() {
+        let _ = writeln!(src, "        s{j} = t{at};");
+    }
+    src.push_str("    }\n");
+    for j in 0..count {
+        let _ = writeln!(src, "    out{j}[i] = s{j};");
+    }
+    src.push_str("}\n");
     src
 }
 

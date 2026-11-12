@@ -489,7 +489,7 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
 /// evaluated first instead of being recomputed by each of them; shared nodes *within* them are
 /// one instruction.
 pub(super) fn flatten(roots: &[(Arc<Node>, Args)], tail: Tail) -> Result<Fused, Failure> {
-    flatten_inner(roots, tail, None)
+    flatten_inner(roots, tail, &[])
 }
 
 pub(super) fn flatten_stencil(
@@ -497,15 +497,16 @@ pub(super) fn flatten_stencil(
     args: Args,
     probe_id: u64,
 ) -> Result<Fused, Failure> {
-    flatten_inner(&[(Arc::clone(node), args)], Tail::Store, Some(probe_id))
+    flatten_inner(&[(Arc::clone(node), args)], Tail::Store, &[probe_id])
 }
 
 fn flatten_inner(
     roots: &[(Arc<Node>, Args)],
     tail: Tail,
-    probe_id: Option<u64>,
+    probes: &[u64],
 ) -> Result<Fused, Failure> {
-    if let ([(root, args)], None) = (roots, probe_id)
+    if let [(root, args)] = roots
+        && probes.is_empty()
         && !root.recomputes
         && let Some(fused) = flatten_plain(root, args, tail)?
     {
@@ -550,10 +551,9 @@ fn flatten_inner(
         if shared.is_empty() {
             break members;
         }
-        if let Some(id) = probe_id
-            && shared.iter().any(|node| node.depends_on(id)) {
-                return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
-            }
+        if shared.iter().any(|node| probes.iter().any(|&id| node.depends_on(id))) {
+            return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
+        }
         for node in shared {
             if let Err(error) = node.force() {
                 return Err(Failure::Inherited(Arc::clone(error)));
@@ -586,17 +586,137 @@ fn flatten_inner(
     Ok(flattener.finish(tail, outputs))
 }
 
+/// Runs `steps` iterations of a traced step in one kernel that keeps the state in registers.
+/// `outs[j]` is the next value of state `j`, computed from `probes[j]` (aliases of `inits[j]`).
+/// `None` if the step is not a single-buffer elementwise program of `f32` values; the caller
+/// then runs the steps one by one.
+pub(crate) fn run_loop(
+    ctx: &crate::context::Context,
+    probes: &[Arc<Storage>],
+    inits: &[Arc<Storage>],
+    outs: &[Arc<Node>],
+    steps: u32,
+) -> Option<Result<Vec<Arc<Storage>>, Failure>> {
+    let len = outs.first()?.len();
+    if outs.iter().any(|out| out.len() != len || !out.is_pending())
+        || outs.iter().enumerate().any(|(j, out)| outs[..j].iter().any(|other| Arc::ptr_eq(other, out)))
+        || probes.iter().any(|probe| probe.was_materialized())
+        || probes.iter().chain(inits).any(|storage| storage.segments() != 1)
+        || inits.iter().any(|init| init.byte_len() != len as u64 * ELEMENT_BYTES)
+    {
+        return None;
+    }
+    let roots: Vec<(Arc<Node>, Args)> =
+        outs.iter().map(|out| out.operands().map(|args| (Arc::clone(out), args))).collect::<Option<_>>()?;
+    let ids: Vec<u64> = probes.iter().map(|probe| probe.id()).collect();
+    let fused = flatten_inner(&roots, Tail::Store, &ids).ok()?;
+    drop(roots);
+    let key = &fused.key;
+    let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
+    let all_f32 = key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| i.op.out_ty() == ElemTy::F32));
+    if probes.iter().any(|probe| probe.was_materialized())
+        || shifts
+        || !key.subs.is_empty()
+        || !all_f32
+        || fused.inputs.iter().any(|input| input.segments() != 1)
+    {
+        return None;
+    }
+    let states: Vec<Option<usize>> =
+        fused.inputs.iter().map(|input| probes.iter().position(|probe| Arc::ptr_eq(probe, input))).collect();
+    let bindings = 2 * outs.len() + states.iter().filter(|state| state.is_none()).count();
+    if bindings > ctx.jit().max_inputs + 1 {
+        return None;
+    }
+    let source = super::codegen::loop_source(key, &states, ctx.tuning());
+    let label = format!("Loop{}", key.label().trim_start_matches("Fused"));
+    let budget = ctx.jit().loop_work.load(Ordering::Relaxed);
+    let per_launch = budget / (len as u64 * key.instrs.len().max(1) as u64).max(1);
+    let per_launch = u32::try_from(per_launch).unwrap_or(u32::MAX).max(1);
+    Some((|| {
+        let core = ctx.jit().stencil_kernel(ctx, source, &label)?;
+        let mut states_now: Vec<Arc<Storage>> = inits.to_vec();
+        let mut remaining = steps;
+        while remaining > 0 {
+            let count = remaining.min(per_launch);
+            let outputs = launch_loop(ctx, &core, &fused, &states, &states_now, len, count)?;
+            states_now = outputs.into_iter().map(Arc::new).collect();
+            remaining -= count;
+        }
+        Ok(states_now)
+    })())
+}
+
+/// Most element-instructions (elements x instructions x steps) one launch of a register loop
+/// runs: about 9 ms on an RTX 3080 Laptop, so a GPU 100 times slower still stays below the
+/// 2 s watchdog of Windows. Longer loops are split into several launches.
+pub(super) const LOOP_WORK_PER_LAUNCH: u64 = 1 << 36;
+
+fn launch_loop(
+    ctx: &crate::context::Context,
+    core: &crate::kernel::KernelCore,
+    fused: &Fused,
+    states: &[Option<usize>],
+    inits: &[Arc<Storage>],
+    len: usize,
+    steps: u32,
+) -> Result<Vec<Storage>, Failure> {
+    let n = len_u32(len)?;
+    let bytes = u64::from(n) * ELEMENT_BYTES;
+    let outputs: Vec<Storage> = inits.iter().map(|_| Storage::new(ctx, len, ELEMENT_BYTES as usize)).collect();
+    let out_pins = outputs.iter().map(|out| out.pin(0)).collect::<Result<Vec<_>, _>>()?;
+    let init_pins = inits.iter().map(|init| init.pin(0)).collect::<Result<Vec<_>, _>>()?;
+    let in_pins = fused
+        .inputs
+        .iter()
+        .zip(states)
+        .filter(|(_, state)| state.is_none())
+        .map(|(input, _)| input.pin(0).map(|pin| (pin, input.byte_len())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut words = Vec::with_capacity(fused.scalars.len() + 1);
+    words.push(steps);
+    words.extend_from_slice(&fused.scalars);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(out_pins.len() * 2 + in_pins.len() + 1);
+    raw.extend(out_pins.iter().map(|pin| RawArg::write(pin.buffer(), bytes)));
+    raw.extend(init_pins.iter().map(|pin| RawArg::read(pin.buffer(), bytes)));
+    raw.extend(in_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+    launch_1d(ctx, core, n, &raw)?;
+    ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
+    Ok(outputs)
+}
+
 fn len_u32(len: usize) -> Result<u32, LumaError> {
     u32::try_from(len).map_err(|_| LumaError::InvalidShape(format!("{len} elements exceed u32")))
 }
 
 /// Evaluates `node`: one fused kernel computing its whole expression into a new buffer.
 pub(crate) fn evaluate(node: &Arc<Node>, args: Args) -> Result<Storage, Failure> {
-    let roots = [(Arc::clone(node), args)];
-    let fused = flatten(&roots, Tail::Store)?;
-    drop(roots);
+    let (fused, args) = flatten_bounded(node, args, Tail::Store)?;
+    drop(args);
     let mut outputs = run_store(node.context(), node.len(), fused)?;
     outputs.pop().ok_or_else(|| Failure::New(LumaError::Gpu("fused kernel without output".into())))
+}
+
+/// Flattens the expression of `node` with operands `args`, which come back for the caller to drop.
+/// Nodes inside it that were computed after it was measured are buffers now, so it can read more
+/// buffers than the device binds; then its operands are computed first, one at a time.
+fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fused, Args), Failure> {
+    let max_inputs = node.context().jit().max_inputs;
+    loop {
+        let roots = [(Arc::clone(node), args)];
+        let fused = flatten(&roots, tail)?;
+        let [(_, returned)] = roots;
+        args = returned;
+        if fused.inputs.len() > max_inputs
+            && let Some(i) = (0..node.op().kind.arity()).find(|&i| matches!(args.get(i), Some(Src::Node(_))))
+        {
+            drop(fused);
+            super::evaluate_operand(&mut args, i)?;
+            continue;
+        }
+        return Ok((fused, args));
+    }
 }
 
 /// Evaluates the pending ones of `nodes` (all of the same length) in one fused kernel with one
@@ -841,13 +961,15 @@ fn pin_inputs(
 /// the first element of the segment, the array length and the slot ids of every input, then the
 /// scalars. Borrows `scalars` when nothing else goes in front of them.
 fn params<'a>(
+    key: &FusedKey,
     ids: Option<&[Vec<u32>]>,
     n: Option<u32>,
     base: usize,
     len: usize,
     scalars: &'a [u32],
 ) -> Result<Cow<'a, [u32]>, LumaError> {
-    if ids.is_none() && n.is_none() {
+    let based = ids.is_none() && super::codegen::generates(key);
+    if ids.is_none() && n.is_none() && !based {
         return Ok(Cow::Borrowed(scalars));
     }
     let mut words = Vec::with_capacity(scalars.len() + 3);
@@ -856,6 +978,8 @@ fn params<'a>(
         words.push(len_u32(base)?);
         words.push(len_u32(len)?);
         words.extend(ids.iter().flatten());
+    } else if based {
+        words.push(len_u32(base)?);
     }
     words.extend_from_slice(scalars);
     Ok(Cow::Owned(words))
@@ -881,7 +1005,7 @@ fn launch_store(
         let ids = segment_ids(shifted, j)?;
         let out_pins = outputs.iter().map(|out| out.pin(j)).collect::<Result<Vec<_>, _>>()?;
         let in_pins = pin_inputs(key, inputs, ids, j, n)?;
-        let words = params(ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
+        let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outputs.len() + in_pins.len() + 1);
         raw.extend(out_pins.iter().map(|pin| RawArg::write(pin.buffer(), bytes)));
         raw.extend(in_pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
@@ -949,9 +1073,8 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     let Some(args) = lock(&node.args).take() else {
         return Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into())));
     };
-    let roots = [(Arc::clone(node), args)];
-    let fused = flatten(&roots, Tail::Store)?;
-    drop(roots);
+    let (fused, args) = flatten_bounded(node, args, Tail::Store)?;
+    drop(args);
     let ctx = node.context();
     fused.mark_fused();
     let Fused { mut key, mut inputs, scalars, fused_nodes } = fused;
@@ -985,14 +1108,19 @@ pub(crate) fn reduce_first_pass(
     }
     let Some(args) = node.operands() else { return Ok(None) };
     let ctx = node.context();
-    let roots = [(Arc::clone(node), args)];
-    let fused = flatten(&roots, Tail::Reduce(ops))?;
-    drop(roots);
+    let (fused, args) = flatten_bounded(node, args, Tail::Reduce(ops))?;
+    drop(args);
 
     fused.mark_fused();
     let Fused { mut key, inputs, scalars, .. } = fused;
-    let Some(first) = inputs.first() else {
-        return Err(Failure::New(LumaError::Gpu("fused reduction without inputs".into())));
+    // Without inputs (only generators) the segments are those an array of this length would have.
+    let layout;
+    let first = match inputs.first() {
+        Some(first) => first,
+        None => {
+            layout = Storage::new(ctx, node.len(), ELEMENT_BYTES as usize);
+            &layout
+        }
     };
     let segments = first.segments();
     let shifted = plan_shifts(ctx, &mut key, &scalars, node.len())?;
@@ -1006,7 +1134,7 @@ pub(crate) fn reduce_first_pass(
         let out_bytes = u64::from(groups) * ELEMENT_BYTES * ops.as_slice().len() as u64;
         let out = scratch.take(out_bytes)?;
         let ids = segment_ids(shifted.as_ref(), j)?;
-        let params = params(ids, Some(n), range.start, node.len(), &scalars)?;
+        let params = params(&key, ids, Some(n), range.start, node.len(), &scalars)?;
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
         raw.push(RawArg::write(&out, out_bytes));

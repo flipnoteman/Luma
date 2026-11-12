@@ -744,3 +744,38 @@ fn the_node_limit_counts_distinct_nodes_only() {
     // 64 do not.
     assert!(run(15) >= 2);
 }
+
+#[test]
+fn a_long_register_loop_is_split_into_launches_with_the_same_result() {
+    let ctx = Context::new().unwrap();
+    let n = 1000;
+    let xs = values(n, 11, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let step = |[u, v]: &[Array<f32>; 2]| [u * 0.5 + v, v * 0.9];
+    let [u0, v0] = crate::ops::iterate_all([&x, &x], 9, step);
+    let (u0, v0) = (u0.to_vec().unwrap(), v0.to_vec().unwrap());
+
+    // Three steps of this program per launch.
+    ctx.jit().set_loop_work(n as u64 * 4 * 3);
+    let before = ctx.jit().stats();
+    let [u1, v1] = crate::ops::iterate_all([&x, &x], 9, step);
+    let (u1, v1) = (u1.to_vec().unwrap(), v1.to_vec().unwrap());
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 3);
+    assert_eq!(u1, u0);
+    assert_eq!(v1, v0);
+}
+
+#[test]
+fn requesting_an_array_many_times_keeps_one_entry() {
+    let ctx = Context::new().unwrap();
+    let x = f32s(&ctx, &values(64, 12, 0.0, 1.0));
+    let y = &x * 2.0 + 1.0;
+    let node = y.pending().unwrap().clone();
+    for _ in 0..1000 {
+        ctx.jit().request(&node);
+    }
+    assert_eq!(ctx.jit().requested_len(), 1);
+    ctx.jit().evaluate_requested();
+    assert_eq!(ctx.jit().requested_len(), 0);
+    assert!(y.pending().is_none());
+}

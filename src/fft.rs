@@ -89,6 +89,8 @@ struct Params {
     step: u32,
     /// Size of one transformed block, as a power of two.
     log_b: u32,
+    /// Workgroups that have a tile; the grid may launch more.
+    groups: u32,
 }
 
 /// The WGSL source of `pass`. Bindings in order: `data`, `src`, `h`, `dst` (those the pass
@@ -109,7 +111,7 @@ pub(crate) fn source(pass: FftPass) -> String {
     }
     bindings.push("var<uniform> p: Params");
     let mut src = String::from(
-        "struct Params { s: u32, k: u32, in_len: u32, out_len: u32, inv_n: f32, lead: u32, step: u32, log_b: u32 }\n",
+        "struct Params { s: u32, k: u32, in_len: u32, out_len: u32, inv_n: f32, lead: u32, step: u32, log_b: u32, groups: u32 }\n",
     );
     for (i, binding) in bindings.iter().enumerate() {
         src.push_str(&format!("@group(1) @binding({i}) {binding};\n"));
@@ -456,7 +458,9 @@ fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
-    let base = (wid.x + wid.y * nwg.x) << p.k;
+    let g = wid.x + wid.y * nwg.x;
+    if (g >= p.groups) {{ return; }}
+    let base = g << p.k;
 {}}}
 ",
         local_body(multiply, k)
@@ -481,6 +485,7 @@ fn main(
     let log_c = {tile_log}u - p.k;
     let cols = 1u << log_c;
     let g = wid.x + wid.y * nwg.x;
+    if (g >= p.groups) {{ return; }}
     let per_block = (1u << p.s) >> log_c;
     let c0 = (g % per_block) << log_c;
     let origin = ((g / per_block) << (p.s + p.k)) + c0;
@@ -582,9 +587,11 @@ fn run(ctx: &Context, batch: &Batch<'_>) -> Result<(), LumaError> {
                 tile_log: batch.tile_log,
             };
             let core = ctx.builtin(Builtin::Fft(pass), "f32")?;
+            let groups = batch.total >> local;
             let params = Params {
                 s,
                 k,
+                groups,
                 ..batch.params
             };
             let mut args = Vec::with_capacity(5);
@@ -607,7 +614,7 @@ fn run(ctx: &Context, batch: &Batch<'_>) -> Result<(), LumaError> {
             // One tile per workgroup (one block for a transform smaller than a tile).
             ctx.launch(
                 &core,
-                fold_workgroups(ctx, batch.total >> local)?,
+                fold_workgroups(ctx, groups)?,
                 [batch.total, 1, 1],
                 &args,
             )
@@ -699,6 +706,7 @@ pub(crate) fn convolve(
         lead: 0,
         step: 0,
         log_b: 0,
+        groups: 0,
     };
     let (log_b, total, input, output, lead, step) = match blocks {
         Some((log_b, _)) => {

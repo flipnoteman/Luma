@@ -76,9 +76,13 @@ fn check(name: &str, err: f32, tol: f32) {
     assert!(err <= tol, "{name}: error {err:e} exceeds tolerance {tol:e}");
 }
 
-fn report(row: Row, f: impl FnMut()) {
+fn report(row: Row, mut f: impl FnMut()) {
     eprintln!("  {} {} {}: err {:e}", row.workload, row.size, row.variant, row.err);
-    let t = time(f);
+    let ctx = default_context().unwrap();
+    let t = time(|| {
+        f();
+        ctx.sync().unwrap();
+    });
     print_row(&row, &t);
 }
 
@@ -178,7 +182,7 @@ fn mandelbrot(sz: &Sizes) {
         let (cx, cy) = mandel_c(w, w);
         let (cx, cy) = (Array::from_slice(&cx, [w, w]).unwrap(), Array::from_slice(&cy, [w, w]).unwrap());
         let zero = Array::<f32>::full([w, w], 0.0).unwrap();
-        let run = |every: usize, wait: bool| -> Array<f32> {
+        let run = |every: usize| -> Array<f32> {
             let (mut zx, mut zy, mut cnt) = (&zero * 1.0, &zero * 1.0, &zero * 1.0);
             for i in 1..=iters {
                 let inside = (&zx * &zx + &zy * &zy).le(4.0);
@@ -188,11 +192,7 @@ fn mandelbrot(sz: &Sizes) {
                 zy = select(&inside, &nzy, &zy);
                 cnt = &cnt + select(&inside, 1.0, 0.0);
                 if every > 0 && i % every == 0 {
-                    if wait {
-                        eval_all(&[&zx, &zy, &cnt]).unwrap();
-                    } else {
-                        submit_all(&[&zx, &zy, &cnt]).unwrap();
-                    }
+                    eval_all(&[&zx, &zy, &cnt]).unwrap();
                 }
             }
             eval_all(&[&zx, &zy, &cnt]).unwrap();
@@ -208,19 +208,26 @@ fn mandelbrot(sz: &Sizes) {
             unit: "Gpix-iter/s",
             err,
         };
-        for (variant, every, wait) in [
-            ("eval_every_1", 1usize, true),
-            ("eval_every_8", 8, true),
-            ("submit_every_1", 1, false),
-            ("submit_every_8", 8, false),
-            ("eval_end_only", 0, true),
-        ] {
-            let err = mismatch_frac(&run(every, wait).to_vec().unwrap(), &want);
+        for (variant, every) in [("eval_every_1", 1usize), ("eval_every_8", 8), ("eval_end_only", 0)] {
+            let err = mismatch_frac(&run(every).to_vec().unwrap(), &want);
             check(&format!("mandelbrot {w} {variant}"), err, 0.01);
             report(row(variant, err), || {
-                run(every, wait);
+                run(every);
             });
         }
+
+        let looped = || -> Array<f32> {
+            let [_, _, cnt] = iterate_all([&zero, &zero, &zero], iters, |[zx, zy, cnt]| {
+                let inside = (zx * zx + zy * zy).le(4.0);
+                let nzx = zx * zx - zy * zy + &cx;
+                let nzy = zx * zy * 2.0 + &cy;
+                [select(&inside, &nzx, zx), select(&inside, &nzy, zy), cnt + select(&inside, 1.0, 0.0)]
+            });
+            cnt
+        };
+        let err = mismatch_frac(&looped().to_vec().unwrap(), &want);
+        check(&format!("mandelbrot {w} iterate_all"), err, 0.01);
+        report(row("iterate_all", err), || looped().eval().unwrap());
 
         let kernel = Kernel::new(MANDELBROT).unwrap();
         let ctx = default_context().unwrap();
@@ -276,12 +283,57 @@ fn fir(sz: &Sizes) {
     }
 }
 
+fn montecarlo(sz: &Sizes) {
+    for &n in &sz.bs {
+        let row = |variant: &'static str, err: f32| Row {
+            workload: "montecarlo",
+            size: n.to_string(),
+            variant,
+            library: "luma",
+            backend: BACKEND,
+            work: n as f64,
+            unit: "Gsample/s",
+            err,
+        };
+        let pi = || -> f32 {
+            let u = Array::<f32>::uniform(n, 1).unwrap();
+            let v = Array::<f32>::uniform(n, 2).unwrap();
+            select(&(&u * &u + &v * &v).le(1.0), 4.0, 0.0).mean().unwrap()
+        };
+        let err = (pi() - std::f32::consts::PI).abs() / std::f32::consts::PI;
+        check(&format!("montecarlo {n} pi"), err, MC_PI_TOLERANCE);
+        report(row("pi", err), || {
+            std::hint::black_box(pi());
+        });
+
+        let (vst, drift, discount) =
+            (VOL * MC_YEARS.sqrt(), (RATE - 0.5 * VOL * VOL) * MC_YEARS, (-RATE * MC_YEARS).exp());
+        let call = || -> f32 {
+            let z = Array::<f32>::normal(n, 3).unwrap();
+            let spot = (z * vst + drift).exp() * MC_SPOT;
+            (spot - MC_STRIKE).maximum(0.0).mean().unwrap() * discount
+        };
+        let exact = mc_call_exact();
+        let err = ((f64::from(call()) - exact).abs() / exact) as f32;
+        check(&format!("montecarlo {n} european"), err, MC_CALL_TOLERANCE);
+        report(row("european", err), || {
+            std::hint::black_box(call());
+        });
+    }
+}
+
 fn main() {
     let args = parse_args();
     let sz = sizes(args.quick);
     print_header();
-    let workloads: [(&str, fn(&Sizes)); 5] =
-        [("heat", heat), ("life", life), ("blackscholes", blackscholes), ("mandelbrot", mandelbrot), ("fir", fir)];
+    let workloads: [(&str, fn(&Sizes)); 6] = [
+        ("heat", heat),
+        ("life", life),
+        ("blackscholes", blackscholes),
+        ("mandelbrot", mandelbrot),
+        ("fir", fir),
+        ("montecarlo", montecarlo),
+    ];
     for (name, f) in workloads {
         if wants(&args, name) {
             eprintln!("luma: {name}");

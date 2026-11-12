@@ -258,6 +258,10 @@ impl<T: GpuType> Array<T> {
         })
     }
 
+    pub(crate) fn from_storage(ctx: &Context, shape: Shape, storage: Arc<Storage>) -> Self {
+        Array { ctx: ctx.clone(), shape, repr: Repr::Valid(storage), _marker: PhantomData }
+    }
+
     /// An array that is the (not yet evaluated) result of `node`.
     pub(crate) fn from_node(ctx: &Context, shape: Shape, node: Arc<Node>) -> Self {
         Array { ctx: ctx.clone(), shape, repr: Repr::Lazy(node), _marker: PhantomData }
@@ -317,7 +321,10 @@ impl<T: GpuType> Array<T> {
             let storage = Storage::new(ctx, len, std::mem::size_of::<T>());
             let mut buffers = Vec::with_capacity(storage.segments());
             for j in 0..storage.segments() {
-                match ctx.alloc_filled(bytemuck::cast_slice(&data[storage.range(j)])) {
+                let filled = ctx
+                    .make_room(storage.range(j).len() as u64 * std::mem::size_of::<T>() as u64)
+                    .and_then(|()| ctx.alloc_filled(bytemuck::cast_slice(&data[storage.range(j)])));
+                match filled {
                     Ok(buffer) => buffers.push(buffer),
                     Err(err) => {
                         for buffer in buffers {
@@ -507,30 +514,43 @@ impl<T: GpuType> Array<T> {
         self.ctx.read_storage_into(storage, dst)
     }
 
-    /// Records the array's pending computation, submits the batch and waits until the GPU has
-    /// executed it, without copying anything back. Returns the array's error if it is poisoned.
-    pub fn eval(&self) -> Result<()> {
-        self.storage().map_err(Failure::into_error)?;
-        self.ctx.sync()
-    }
-
-    /// Records the array's pending computation and hands the batch to the GPU, without waiting
-    /// for it: like [`Array::eval`], but the GPU runs while the host keeps recording the next
-    /// operations. Lazy arrays other than this one (and what it is computed from) stay lazy,
-    /// unlike [`Context::flush`]. Returns the array's error if it is poisoned.
+    /// Records the array's pending computation and hands the batch to the GPU without waiting
+    /// for it, like ArrayFire's `eval`: the GPU runs while the host records the next steps.
+    /// [`Context::sync`], [`Array::to_vec`] and reductions wait. Lazy arrays other than this one
+    /// (and what it is computed from) stay lazy, unlike [`Context::flush`]. Returns the array's
+    /// error if it is poisoned.
     ///
     /// Nothing waits, so an error the GPU raises while running the batch only shows up at the
-    /// next call that waits ([`Context::sync`], [`Array::to_vec`], [`Array::eval`], reductions).
+    /// next call that waits ([`Context::sync`], [`Array::to_vec`], reductions).
     ///
-    /// While the GPU is still busy with earlier work, up to 16 kernels are held back instead of
-    /// being submitted one by one (each submission costs the host and leaves a gap on the GPU).
-    /// They are handed over by the next Luma call that submits: another `submit`, a
-    /// [`Context::flush`], anything that waits, or the batch limit. A program that calls `submit`
-    /// and then does long work without touching Luma should call [`Context::flush`] to force the
-    /// hand-over.
+    /// While the GPU is still busy with earlier work, the computation is postponed to the next
+    /// `eval` that finds it idle, [`Context::sync`] or [`Context::flush`]; reading the array
+    /// computes it at once. Arrays the program drops before then are never computed, and the
+    /// steps in between fuse, so a loop that evaluates every step costs about what one evaluating
+    /// every few steps does. A program that calls `eval` and then does long work without touching
+    /// Luma should call [`Context::flush`] to start the GPU. A failure while computing the array
+    /// is returned here if the computation was not postponed, and otherwise by the array's next
+    /// use.
+    pub fn eval(&self) -> Result<()> {
+        self.request()?;
+        self.ctx.submit_requested()?;
+        self.check()
+    }
+
+    /// Asks for the array to be computed at the next submission, or returns its error.
+    pub(crate) fn request(&self) -> Result<()> {
+        match &self.repr {
+            Repr::Lazy(node) if node.is_pending() => {
+                self.ctx.jit().request(node);
+                Ok(())
+            }
+            _ => self.storage().map(|_| ()).map_err(Failure::into_error),
+        }
+    }
+
+    /// Same as [`Array::eval`].
     pub fn submit(&self) -> Result<()> {
-        self.storage().map_err(Failure::into_error)?;
-        self.ctx.submit()
+        self.eval()
     }
 
     /// Overwrites the array's contents with `data`, which must have exactly [`Array::len`]

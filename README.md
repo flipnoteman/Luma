@@ -32,11 +32,12 @@ I/O dependant, operations.
 - `vec2`/`vec4` element types
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Reductions: sum, min, max, mean, norm
+- Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
-- Non-blocking evaluation with `submit` / `submit_all`: the GPU runs while the host records the next steps
+- Non-blocking `eval` / `eval_all`: the GPU runs while the host records the next steps; reads and `sync` wait
 - Readback into a new `Vec` (`to_vec`) or into host memory you already own (`read_into`)
-- Multi-step stencils with `iterate`
+- Multi-step stencils with `iterate`; elementwise loops over several arrays with `iterate_all`, compiled into one kernel that keeps the state in registers
 - Ability to use custom WGSL kernels
 - Subgroups, `f16` and cooperative matrices (tensor cores) on GPUs that support them
 - Kernel tuning per GPU vendor (Apple and NVIDIA measured, generic defaults elsewhere)
@@ -88,6 +89,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
 | `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel |
+| `LUMA_EXIT_WAIT` | `0` skips waiting at exit for NVIDIA's driver threads on Linux (saves about 50 ms; risks the driver's exit hang) |
 
 ### Examples
 

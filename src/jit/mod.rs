@@ -72,8 +72,19 @@ use crate::gpu::hash::FxMap;
 use crate::gpu_type::ScalarType;
 use crate::kernel::{self, KernelCore, KernelKey};
 
-pub(crate) use program::{evaluate, evaluate_group, evaluate_into, reduce_first_pass};
+pub(crate) use program::{evaluate, evaluate_group, evaluate_into, reduce_first_pass, run_loop};
 pub(crate) use stencil::plan as stencil_plan;
+
+/// Length of the requested list at which entries of dropped or computed nodes are pruned.
+const REQUESTED_PRUNE_AT: usize = 256;
+
+/// The nodes of [`JitState::requested`], pruned of dropped and computed ones once the list
+/// doubles.
+#[derive(Debug, Default)]
+struct RequestList {
+    nodes: Vec<Weak<Node>>,
+    prune_at: usize,
+}
 
 /// Most operations one fused kernel contains unless configured otherwise.
 pub(crate) const DEFAULT_MAX_NODES: usize = 128;
@@ -130,6 +141,23 @@ pub(crate) enum OpKind {
     Select,
     /// Circular shift of a materialized array; operand 0 is its buffer (see [`ShiftKind`]).
     Shift(ShiftKind),
+    /// A value computed from the element's index alone; no array operands (see [`Gen`]).
+    Generate(Gen),
+}
+
+/// What a [`OpKind::Generate`] computes for element `i` (its index in the whole array).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Gen {
+    /// Threefry-2x32-20 of counter `(i, 0)` under the key in operands 0 and 1: the first word.
+    Bits,
+    /// The top 24 bits of [`Gen::Bits`] scaled into `[0, 1)`.
+    Uniform,
+    /// Box-Muller on both Threefry words.
+    Normal,
+    /// The coordinate along one dimension, `(i / stride) % size`.
+    Range { stride: u32, size: u32 },
+    /// `start + i * step`; operands: start, step.
+    Linspace,
 }
 
 /// Which element a shift reads for element `i`.
@@ -151,6 +179,8 @@ impl OpKind {
             | OpKind::Powf
             | OpKind::Shift(ShiftKind::Linear) => 2,
             OpKind::Clamp | OpKind::Select => 3,
+            OpKind::Generate(Gen::Range { .. }) => 0,
+            OpKind::Generate(_) => 2,
         }
     }
 }
@@ -178,6 +208,7 @@ impl Op {
     pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
         match (self.kind, index) {
             (OpKind::Select, 0) | (OpKind::Shift(_), 1) => ElemTy::U32,
+            (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal), _) => ElemTy::U32,
             _ => self.ty,
         }
     }
@@ -257,6 +288,8 @@ pub(crate) struct Node {
     recomputes: bool,
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
+    /// Whether the node is in [`JitState::requested`].
+    requested: AtomicBool,
 }
 
 impl std::fmt::Debug for Node {
@@ -558,6 +591,7 @@ pub(crate) fn create(
     // with the live arrays that share pending work with it (see the module documentation)
     // instead of alone.
     let mut batched = false;
+    let mut cut = false;
     let (below_len, _) = loop {
         let (below, inputs) = measure(args.get(..arity).unwrap_or(&[]));
         if below < max_nodes && inputs <= max_inputs {
@@ -575,6 +609,7 @@ pub(crate) fn create(
                 .max_by_key(|node| node.size())
                 .map(Arc::clone);
             if let Some(seed) = seed {
+                cut = true;
                 jit.evaluate_alongside(seed);
                 for i in 0..arity {
                     if matches!(args.get(i), Some(Src::Node(node)) if node.result.get().is_some()) {
@@ -594,11 +629,18 @@ pub(crate) fn create(
             })
             .max_by_key(|&(_, size)| size);
         match biggest {
-            Some((i, _)) => evaluate_operand(&mut args, i)?,
+            Some((i, _)) => {
+                cut = true;
+                evaluate_operand(&mut args, i)?;
+            }
             // Only buffers and scalars left: at most three operands, within any sane limit.
             None => break (below, inputs),
         }
     };
+    if cut {
+        // Without this, a long chain built without `eval` keeps the GPU idle until its end.
+        let _ = ctx.submit();
+    }
     let recomputes = args.iter().take(arity).enumerate().any(|(i, arg)| match arg {
         Src::Node(operand) => operand.recomputes || (i == 0 && matches!(op.kind, OpKind::Shift(_))),
         _ => false,
@@ -619,6 +661,7 @@ pub(crate) fn create(
         fused: AtomicBool::new(false),
         recomputes,
         readers: Readers::default(),
+        requested: AtomicBool::new(false),
     });
 
     for (i, arg) in args.iter().enumerate().take(arity) {
@@ -781,8 +824,12 @@ pub(crate) struct JitState {
     /// Every node created and not yet known to be evaluated, oldest first, so that
     /// [`Context::sync`] can evaluate the live ones.
     live: Mutex<ReaderList>,
+    /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
+    requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
     max_inputs: usize,
+    /// Most element-instructions per launch of a register loop, see [`program::run_loop`].
+    loop_work: AtomicU64,
     stats: Stats,
 }
 
@@ -824,14 +871,26 @@ impl JitState {
             kernels: Mutex::new(FxMap::default()),
             stencils: Mutex::new(FxMap::default()),
             live: Mutex::new(ReaderList::default()),
+            requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             max_inputs,
+            loop_work: AtomicU64::new(program::LOOP_WORK_PER_LAUNCH),
             stats: Stats::default(),
         }
     }
 
     pub(crate) fn max_nodes(&self) -> usize {
         self.max_nodes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_loop_work(&self, work: u64) {
+        self.loop_work.store(work.max(1), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn requested_len(&self) -> usize {
+        lock(&self.requested).nodes.len()
     }
 
     #[cfg(test)]
@@ -862,6 +921,36 @@ impl JitState {
     /// before the operands it fused, which usually died with it). Arrays of the same length are
     /// computed together, as many per kernel as the bindings allow: inputs they share are read
     /// once, and one of them that another uses is computed once.
+    pub(crate) fn request(&self, node: &Arc<Node>) {
+        if node.requested.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut requested = lock(&self.requested);
+        if requested.nodes.len() >= requested.prune_at.max(REQUESTED_PRUNE_AT) {
+            requested.nodes.retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
+            requested.prune_at = requested.nodes.len().saturating_mul(2);
+        }
+        requested.nodes.push(Arc::downgrade(node));
+    }
+
+    /// Computes the requested nodes that are still alive, those of one length together in
+    /// multi-output kernels.
+    pub(crate) fn evaluate_requested(&self) {
+        let requested = std::mem::take(&mut lock(&self.requested).nodes);
+        let mut pending: Vec<Arc<Node>> = requested
+            .into_iter()
+            .filter_map(|weak| weak.upgrade())
+            .inspect(|node| node.requested.store(false, Ordering::Relaxed))
+            .filter(|node| node.is_pending())
+            .collect();
+        while let Some(first) = pending.first() {
+            let len = first.len;
+            let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);
+            evaluate_group(&same);
+            pending = rest;
+        }
+    }
+
     pub(crate) fn evaluate_live(&self) {
         let nodes = {
             let mut live = lock(&self.live);

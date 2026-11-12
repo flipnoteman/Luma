@@ -107,6 +107,8 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
         flag.store(true, Ordering::Release);
     });
     let memory = device_local_bytes(&adapter);
+    #[cfg(target_os = "linux")]
+    super::exit::track(&device);
     Ok(Gpu { device, queue, adapter: adapter.get_info(), lost, cpu, memory })
 }
 

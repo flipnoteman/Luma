@@ -9,6 +9,11 @@ pub const RATE: f32 = 0.02;
 pub const VOL: f32 = 0.3;
 pub const A: [f32; 5] = [0.319_381_54, -0.356_563_78, 1.781_477_9, -1.821_255_9, 1.330_274_5];
 pub const INV_SQRT_2PI: f32 = 0.398_942_3;
+pub const MC_SPOT: f32 = 100.0;
+pub const MC_STRIKE: f32 = 100.0;
+pub const MC_YEARS: f32 = 1.0;
+pub const MC_PI_TOLERANCE: f32 = 1e-3;
+pub const MC_CALL_TOLERANCE: f32 = 5e-3;
 
 pub struct Sizes {
     pub heat: Vec<usize>,
@@ -190,6 +195,19 @@ fn cnd(d: f32) -> f32 {
     let poly = k * (A[0] + k * (A[1] + k * (A[2] + k * (A[3] + k * A[4]))));
     let tail = INV_SQRT_2PI * (-0.5 * d * d).exp() * poly;
     if d > 0.0 { 1.0 - tail } else { tail }
+}
+
+/// The Black-Scholes call price the Monte Carlo workload converges to.
+pub fn mc_call_exact() -> f64 {
+    let (s, k, t, r, v) = (f64::from(MC_SPOT), f64::from(MC_STRIKE), f64::from(MC_YEARS), f64::from(RATE), f64::from(VOL));
+    let cnd = |d: f64| {
+        let kk = 1.0 / (1.0 + 0.231_641_9 * d.abs());
+        let poly = kk * (0.319_381_530 + kk * (-0.356_563_782 + kk * (1.781_477_937 + kk * (-1.821_255_978 + kk * 1.330_274_429))));
+        let tail = (-0.5 * d * d).exp() / (2.0 * std::f64::consts::PI).sqrt() * poly;
+        if d > 0.0 { 1.0 - tail } else { tail }
+    };
+    let d1 = ((s / k).ln() + (r + 0.5 * v * v) * t) / (v * t.sqrt());
+    s * cnd(d1) - k * (-r * t).exp() * cnd(d1 - v * t.sqrt())
 }
 
 pub fn bs_ref(s: &[f32], k: &[f32], t: &[f32]) -> Vec<f32> {

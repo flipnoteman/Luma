@@ -45,6 +45,7 @@ mod context;
 mod conv;
 mod error;
 mod fft;
+mod generate;
 mod gpu;
 mod gpu_type;
 mod jit;
@@ -61,7 +62,7 @@ pub use gpu_type::{GpuType, ScalarType};
 pub use kernel::{
     uniform, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize,
 };
-pub use ops::{eval_all, select, submit_all, Operand, Reduction, Rhs};
+pub use ops::{eval_all, iterate_all, select, submit_all, Operand, Reduction, Rhs};
 pub use profile::{KernelTiming, Profile};
 pub use shape::{Offsets, Shape};
 pub use tuning::TuningProfile;

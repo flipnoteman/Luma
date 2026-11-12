@@ -9,11 +9,13 @@ use std::time::Instant;
 fn median<F: FnMut()>(iters: usize, mut f: F) -> f64 {
     for _ in 0..2 {
         f();
+        default_context().unwrap().sync().unwrap();
     }
     let mut s: Vec<f64> = (0..iters)
         .map(|_| {
             let t = Instant::now();
             f();
+            default_context().unwrap().sync().unwrap();
             t.elapsed().as_secs_f64() * 1e3
         })
         .collect();

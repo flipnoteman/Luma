@@ -11,11 +11,13 @@ fn median(mut f: impl FnMut()) -> f64 {
     let start = Instant::now();
     while start.elapsed() < warm {
         f();
+        default_context().unwrap().sync().unwrap();
     }
     let mut s: Vec<f64> = (0..15)
         .map(|_| {
             let t = Instant::now();
             f();
+            default_context().unwrap().sync().unwrap();
             t.elapsed().as_secs_f64() * 1e3
         })
         .collect();

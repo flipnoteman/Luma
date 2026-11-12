@@ -15,7 +15,7 @@ use std::ops::{
 use std::panic::Location;
 use std::sync::Arc;
 
-use crate::array::{Array, Failure};
+use crate::array::{Array, Failure, Storage};
 use crate::builtin::{BinOp, Builtin, CmpOp, ReduceList, ReduceOp, UnOp, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
@@ -463,59 +463,129 @@ impl<T: ScalarType> Array<T> {
     }
 }
 
-/// Evaluates several arrays and waits for them, like [`Array::eval`] on each, but computes lazy
+/// Evaluates several arrays without waiting, like [`Array::eval`] on each, but computes lazy
 /// arrays of the same length together: one fused kernel with an output per array (as many as
 /// the device's bindings allow), so inputs they share are read once, and an array that another
 /// one uses is computed once. `let (call, put) = ...; eval_all(&[&call, &put])?` prices both
-/// options in one pass over the market data.
+/// options in one pass over the market data. Postponed while the GPU is busy, like
+/// [`Array::eval`].
 pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
-    match record_all(arrays)? {
-        Some(ctx) => ctx.sync(),
-        None => Ok(()),
-    }
-}
-
-/// Like [`eval_all`], but does not wait: the lazy arrays are computed together the same way and
-/// the batch is handed to the GPU, which runs while the host keeps recording. Other lazy arrays
-/// stay lazy, unlike [`Context::flush`](crate::Context::flush). A loop of steps can end each
-/// with `submit_all` and read the result back once at the end.
-///
-/// Nothing waits, so an error the GPU raises while running the batch only shows up at the next
-/// call that waits ([`Context::sync`](crate::Context::sync), [`Array::to_vec`], [`eval_all`],
-/// reductions). A poisoned array returns its own error here.
-///
-/// While the GPU is still busy with earlier work, up to 16 kernels are held back instead of
-/// being submitted one by one (each submission costs the host and leaves a gap on the GPU).
-/// They are handed over by the next Luma call that submits: another `submit_all` or
-/// [`Array::submit`], a [`Context::flush`](crate::Context::flush), anything that waits, or the
-/// batch limit. A program that calls `submit_all` and then does long work without touching Luma
-/// should call [`Context::flush`](crate::Context::flush) to force the hand-over.
-pub fn submit_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
-    match record_all(arrays)? {
-        Some(ctx) => ctx.submit(),
-        None => Ok(()),
-    }
-}
-
-/// Records the pending computation of `arrays`, grouped into fused multi-output kernels by
-/// length, for [`eval_all`] and [`submit_all`]. Returns their context (`None` for no arrays).
-fn record_all<'a, T: GpuType>(arrays: &[&'a Array<T>]) -> Result<Option<&'a Context>> {
-    let Some(first) = arrays.first() else { return Ok(None) };
+    let Some(first) = arrays.first() else { return Ok(()) };
     let ctx = first.context();
     if arrays.iter().any(|array| !ctx.same_as(array.context())) {
         return Err(LumaError::ContextMismatch);
     }
-    let mut pending: Vec<_> = arrays.iter().filter_map(|array| array.pending().cloned()).collect();
-    while let Some(node) = pending.first() {
-        let len = node.len();
-        let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len() == len);
-        jit::evaluate_group(&same);
-        pending = rest;
-    }
     for array in arrays {
-        array.storage().map_err(Failure::into_error)?;
+        array.request()?;
     }
-    Ok(Some(ctx))
+    ctx.submit_requested()?;
+    arrays.iter().try_for_each(|array| array.check())
+}
+
+/// Runs `steps` iterations of `step` on several arrays at once: `step` gets the current values
+/// and returns the next ones, as a loop calling it `steps` times would. When every result is an
+/// elementwise expression of the states, of other arrays of the same length and of scalars, the
+/// whole loop is one kernel that keeps the states in registers and writes them once, for any
+/// `steps` (one pipeline per step expression). Anything else, such as shifts, runs step by step.
+/// `step` is called once more than that to trace it.
+///
+/// ```
+/// # use luma::*;
+/// let c = Array::from_slice(&[0.1f32, -0.5, 0.3, 0.25], 4)?;
+/// let zero = Array::<f32>::zeros(4)?;
+/// let [x, count] = iterate_all([&zero, &zero], 64, |[x, count]| {
+///     let inside = x.le(2.0);
+///     [select(&inside, &(x * x + &c), x), count + select(&inside, 1.0, 0.0)]
+/// });
+/// # x.to_vec()?; count.to_vec()?;
+/// # Ok::<(), luma::LumaError>(())
+/// ```
+#[track_caller]
+pub fn iterate_all<const N: usize>(
+    init: [&Array<f32>; N],
+    steps: usize,
+    step: impl Fn(&[Array<f32>; N]) -> [Array<f32>; N],
+) -> [Array<f32>; N] {
+    const { assert!(N >= 1, "iterate_all takes at least one array") };
+    let location = Location::caller();
+    let ctx = init[0].context();
+    match run_iterate_all(init, steps, &step) {
+        Ok(states) => states,
+        Err(failure) => {
+            let error = match failure {
+                Failure::Inherited(error) => error,
+                Failure::New(error) => {
+                    Arc::new(LumaError::Op { op: "iterate_all", location, source: Arc::new(error) })
+                }
+            };
+            init.map(|array| {
+                Array::resolve(ctx, array.shape(), Err(Failure::Inherited(Arc::clone(&error))), "iterate_all", location)
+            })
+        }
+    }
+}
+
+fn run_iterate_all<const N: usize>(
+    init: [&Array<f32>; N],
+    steps: usize,
+    step: &impl Fn(&[Array<f32>; N]) -> [Array<f32>; N],
+) -> Outcome<[Array<f32>; N]> {
+    let ctx = init[0].context();
+    if init.iter().any(|array| !ctx.same_as(array.context())) {
+        return Err(Failure::New(LumaError::ContextMismatch));
+    }
+    for array in &init {
+        if let Some(error) = array.error() {
+            return Err(Failure::Inherited(Arc::new(error.clone())));
+        }
+    }
+    if steps == 0 {
+        return Ok(init.map(|array| array * 1.0));
+    }
+    let mut probes = Vec::with_capacity(N);
+    for array in &init {
+        probes.push(array.probe()?);
+    }
+    let Ok(probes): std::result::Result<[Array<f32>; N], _> = probes.try_into() else { unreachable!() };
+    let first = step(&probes);
+
+    let shapes_match = first.iter().zip(&init).all(|(next, array)| next.shape() == array.shape());
+    let traced: Option<Vec<Arc<jit::Node>>> = first.iter().map(|next| next.pending().cloned()).collect();
+    if shapes_match
+        && let (Ok(count), Some(outs)) = (u32::try_from(steps), traced)
+    {
+        let storages = |arrays: &[&Array<f32>]| -> Outcome<Vec<Arc<Storage>>> {
+            arrays.iter().map(|array| array.storage().map(Arc::clone)).collect()
+        };
+        let probe_storages = storages(&probes.each_ref())?;
+        let init_storages = storages(&init)?;
+        if let Some(result) = jit::run_loop(ctx, &probe_storages, &init_storages, &outs, count) {
+            let mut outputs = result?.into_iter();
+            return Ok(init.map(|array| match outputs.next() {
+                Some(storage) => Array::from_storage(ctx, array.shape(), storage),
+                None => unreachable!(),
+            }));
+        }
+    }
+
+    for (array, probe) in init.iter().zip(&probes) {
+        if let (Ok(owner), Ok(alias)) = (array.storage(), probe.storage()) {
+            owner.readers.absorb(&alias.readers);
+        }
+    }
+    let mut states = first;
+    for _ in 1..steps {
+        states = step(&states);
+    }
+    for state in &states {
+        state.check()?;
+    }
+    Ok(states)
+}
+
+/// Same as [`eval_all`].
+pub fn submit_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
+    eval_all(arrays)
 }
 
 /// A reduction for [`Array::reduce`].

@@ -36,6 +36,7 @@ fn time_ms(x: &Array<f32>, ops: usize, iterations: usize) -> Result<f64> {
         let start = Instant::now();
         let y = chain(x, ops);
         y.eval()?;
+        y.context().sync()?;
         samples.push(start.elapsed().as_secs_f64() * 1e3);
     }
     samples.sort_by(f64::total_cmp);
