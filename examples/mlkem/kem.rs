@@ -69,8 +69,8 @@ pub struct Kem<'a> {
 }
 
 impl<'a> Kem<'a> {
-    pub fn new(ctx: &'a Context, p: Params, n: usize, fuse: usize) -> Result<Kem<'a>> {
-        Ok(Kem { ctx, p, n, tables: Tables::new(ctx, fuse)?, blocks: 4 })
+    pub fn new(ctx: &'a Context, p: Params, n: usize) -> Result<Kem<'a>> {
+        Ok(Kem { ctx, p, n, tables: Tables::new(ctx)?, blocks: 4 })
     }
 
     fn u32(&self, rows: usize, value: u32) -> Array<u32> {

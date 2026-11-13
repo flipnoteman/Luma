@@ -374,7 +374,7 @@ impl Context {
             None => budget.map_or(limit, |b| pow2_floor(b / 8).clamp(1024, limit)),
         };
         // Idle buffer caches scale with the budget so that they cannot crowd out array data.
-        let cap = budget.map_or(1 << 30, |b| (b / 8).min(1 << 30));
+        let cap = budget.map_or(1 << 30, |b| (b / 2).min(16 << 30));
 
         // wgpu panics on errors nobody handles. Record the first one instead and report it as an
         // `Err` at the next synchronization point.

@@ -353,7 +353,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
                 r = parent(&region, r);
             }
         }
-        let useless: Vec<usize> = (0..n).filter(|&s| branch[s] && saved[s] < BRANCH_GAIN).collect();
+        let useless: Vec<usize> = (0..n).filter(|&s| branch[s] && saved[s] < BRANCH_GAIN * chance[s]).collect();
         if useless.is_empty() {
             let ops = (0..n).map(|x| weight[x] * chance[x]).sum();
             return Branches { region, branch, ops };
