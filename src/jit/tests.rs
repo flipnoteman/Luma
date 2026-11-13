@@ -3370,3 +3370,59 @@ mod reruns {
         assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     }
 }
+
+#[test]
+fn a_cut_inside_the_evaluation_of_a_cut_evaluates_nothing_else() {
+    use crate::view::PadMode;
+    let ctx = ctx();
+    // Eight steps of a stencil update, every stage still alive: the last one is far over the cap, is
+    // cut at the stage before, which is cut at the one before it, and so on. Taking along the live
+    // arrays that read what is being evaluated, as the first cut does, would evaluate the later
+    // stages piece by piece inside every cut below it.
+    ctx.jit().set_max_inlined(48);
+    ctx.jit().set_staging(false);
+    let n = 300;
+    let xs = values(n, 107, 0.5, 1.5);
+    let f = |a: f32| (a * 1.5 + 0.5).sqrt() * 0.5;
+    let mut u = f32s(&ctx, &xs);
+    let mut host = xs.clone();
+    let mut stages = Vec::new();
+    for _ in 0..8 {
+        let p = u.pad([(1, 1)], PadMode::Edge);
+        let fp = |a: &Array<f32>| (a * 1.5 + 0.5).sqrt() * 0.5;
+        let lap = fp(&p).slice(0, 0..n) + fp(&p).slice(0, 2..n + 2) - fp(&u) * 2.0;
+        u = &u + lap * 0.1;
+        stages.push(u.clone());
+        host = (0..n).map(|i| host[i] + 0.1 * (f(host[i.saturating_sub(1)]) + f(host[(i + 1).min(n - 1)]) - 2.0 * f(host[i]))).collect();
+    }
+    let before = ctx.jit().stats();
+    let got = u.to_vec().unwrap();
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert!(launches <= 12, "{launches} kernels for 8 stages");
+    assert_close(&got, &host, 1e-4, 1e-5);
+}
+
+#[test]
+fn a_shared_expression_is_weighed_by_its_distinct_nodes() {
+    let ctx = ctx();
+    let xs = values(300, 108, 0.5, 1.5);
+    let x = f32s(&ctx, &xs);
+    // Every level reads the one below twice: unfolded into a tree, the work doubles with each level.
+    let mut t = &x + 1.0;
+    for _ in 0..30 {
+        t = &t * 0.5 + &t * 0.25;
+    }
+    let node = std::sync::Arc::clone(t.pending().unwrap());
+    assert!(node.weight() <= node.size() as f64 * 8.0, "weight {} of {} nodes", node.weight(), node.size());
+    // It is cheap to compute again: two arrays that read it do not store it first.
+    let u = &t + 1.0;
+    let v = &t * 2.0;
+    drop((t, node));
+    let before = ctx.jit().stats();
+    let got_u = u.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "the shared expression is computed inside the kernel that reads it");
+    let level = |a: f32| a * 0.5 + a * 0.25;
+    let host = |seed: f32| (0..30).fold(seed + 1.0, |a, _| level(a));
+    assert_close(&got_u, &xs.iter().map(|&v| host(v) + 1.0).collect::<Vec<_>>(), 1e-4, 1e-5);
+    assert_close(&v.to_vec().unwrap(), &xs.iter().map(|&v| host(v) * 2.0).collect::<Vec<_>>(), 1e-4, 1e-5);
+}

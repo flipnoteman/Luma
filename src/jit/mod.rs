@@ -1242,6 +1242,14 @@ impl Flattening {
     }
 }
 
+impl Flattening {
+    /// Whether another expression was being flattened already when this one began: this
+    /// flattening is part of evaluating a part of that one.
+    pub(super) fn nested(&self) -> bool {
+        self.0 > 0
+    }
+}
+
 impl Drop for Flattening {
     fn drop(&mut self) {
         FLATTENING.with_borrow_mut(|flying| flying.truncate(self.0));
@@ -1698,7 +1706,11 @@ pub(crate) fn create(
             operand_weight += operand.weight();
         }
     }
-    let weight = cost::op_weight(op, &ctx.cost_model()) + operand_weight;
+    // Operands that share nodes count them once per use (`operand_weight` unfolds the expression into
+    // a tree, which doubles with every level of a flux that two readers read, say): no operation
+    // weighs more than `MAX_AVERAGE_WEIGHT` on average, so that is what an expression of that many
+    // distinct nodes is bounded by.
+    let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight).min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
     let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
 
     let trace = rerun::created(op, len, &args, arity);
@@ -1902,6 +1914,10 @@ pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 
     stageable || claim_recompute(node)
 }
 
+/// The most an operation of an expression weighs on average, in f32 operations (see [`Node::weight`]):
+/// a division or square root is 4, a transcendental function 8 to 16 and rare.
+const MAX_AVERAGE_WEIGHT: f64 = 8.0;
+
 /// Most lazy reads a node accepts however cheap its expression is.
 const MAX_LAZY_READS: u32 = 8;
 
@@ -1933,12 +1949,21 @@ fn claim_recompute(node: &Node) -> bool {
     }
 }
 
+/// Most nodes of a shared expression that a second expression computes again instead of reading it
+/// evaluated (see [`worth_storing`]): a quarter of the node limit.
+const ALWAYS_STORED_NODES: usize = MAX_NODES_LIMIT / 4;
+
 /// Whether the pending `node`, which an expression outside the one being flattened reads too,
 /// costs more to compute once more than to write and read back (by the cost model, as in
 /// [`claim_recompute`]): then it is evaluated before the expressions that share it, otherwise
 /// each computes it again and no kernel is spent on it.
 pub(crate) fn worth_storing(node: &Node) -> bool {
     if node.looped.get().is_some() {
+        return true;
+    }
+    // The code of an expression this big is not worth writing into a second kernel whatever the
+    // time says: the model does not see what it costs to compile and to keep in registers.
+    if node.size() >= ALWAYS_STORED_NODES {
         return true;
     }
     let cost = node.context().cost_model();

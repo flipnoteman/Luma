@@ -1175,7 +1175,7 @@ pub(super) fn flatten_inner(
     tail: Tail,
     probes: &[u64],
 ) -> Result<Fused, Failure> {
-    let _flattening = Flattening::enter(roots.iter().map(|(root, _)| Arc::as_ptr(root)));
+    let flattening = Flattening::enter(roots.iter().map(|(root, _)| Arc::as_ptr(root)));
     loop {
         let mut fused = flatten_once(roots, tail, probes)?;
         if let Some((first, _)) = roots.first() {
@@ -1207,8 +1207,13 @@ pub(super) fn flatten_inner(
                     drop(fused);
                     // A cut forced by the instruction cap takes along the live arrays that
                     // share work with the expression; one the cost model chose is priced as
-                    // that expression alone, recomputing what it shares with the rest.
-                    let forced = matches!(reason, SplitReason::Inlined { .. });
+                    // that expression alone, recomputing what it shares with the rest. Inside
+                    // the evaluation of a part of another expression (an expression that is
+                    // cut again on the way down) nothing is taken along: the arrays that share
+                    // work with it include everything built on top of the expression being
+                    // evaluated, and evaluating those first evaluates the program in pieces,
+                    // each of which is cut again.
+                    let forced = matches!(reason, SplitReason::Inlined { .. }) && !flattening.nested();
                     match nodes.as_slice() {
                         [] => {}
                         [node] if !forced => force_alone(node)?,
