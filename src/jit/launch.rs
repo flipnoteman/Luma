@@ -19,7 +19,7 @@ use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Tail};
 
 /// Runs `steps` iterations of a traced step in one kernel that keeps the state in registers.
 /// `outs[j]` is the next value of state `j`, computed from `probes[j]` (aliases of `inits[j]`).
-/// `None` if the step is not a single-buffer elementwise program of `f32` values; the caller
+/// `None` if the step is not a single-buffer elementwise program of `f32` (or `u32`) values; the caller
 /// then runs the steps one by one.
 pub(crate) fn run_loop(
     ctx: &crate::context::Context,
@@ -54,7 +54,7 @@ pub(crate) fn run_loop(
 /// next value of state `j`) in one kernel that keeps the states in registers. `states[k]` is the
 /// state that input `k` reads (`None`: an input that stays fixed) and `inits` the states before
 /// the first step. `None` if the program is not a single-buffer elementwise program of `f32`
-/// values.
+/// (or all `u32`) values.
 pub(super) fn run_loop_fused(
     ctx: &crate::context::Context,
     fused: &Fused,
@@ -65,8 +65,12 @@ pub(super) fn run_loop_fused(
     let key = &fused.key;
     let len = inits.first()?.len();
     let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
-    let all_f32 = key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| i.op.out_ty() == ElemTy::F32));
-    if shifts || !key.subs.is_empty() || !all_f32 || !key.narrow() || fused.inputs.iter().any(|input| input.segments() != 1) {
+    // The states are all `f32` or all `u32`, and what a state input reads is of that type.
+    let state_ty = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map(|i| i.op.out_ty());
+    let typed = matches!(state_ty, Some(ElemTy::F32 | ElemTy::U32))
+        && key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| Some(i.op.out_ty()) == state_ty))
+        && states.iter().zip(&key.input_tys).all(|(state, ty)| state.is_none() || Some(*ty) == state_ty);
+    if shifts || !key.subs.is_empty() || !typed || !key.narrow() || fused.inputs.iter().any(|input| input.segments() != 1) {
         return None;
     }
     let bindings = 2 * key.outputs.len() + states.iter().filter(|state| state.is_none()).count();
@@ -163,6 +167,23 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
             && let Some(i) = (0..node.op().kind.arity()).find(|&i| matches!(args.get(i), Some(Src::Node(_))))
         {
             jit.note_split(node.name, node.location, SplitReason::Inputs { inputs: fused.inputs.len(), limit: max_inputs });
+            drop(fused);
+            super::evaluate_operand(&mut args, i)?;
+            continue;
+        }
+        // The scalars are fields of one uniform buffer. (The node limit lets an expression of
+        // `f64` scalars, three words each, outgrow it.)
+        let max_words = usize::try_from(node.context().max_uniform_bytes() / 4).unwrap_or(usize::MAX).saturating_sub(64);
+        if fused.scalars.len() > max_words
+            && let Some(i) = (0..node.op().kind.arity())
+                .filter_map(|i| match args.get(i) {
+                    Some(Src::Node(operand)) => Some((i, operand.size())),
+                    _ => None,
+                })
+                .max_by_key(|&(_, size)| size)
+                .map(|(i, _)| i)
+        {
+            jit.note_split(node.name, node.location, SplitReason::Scalars { words: fused.scalars.len(), limit: max_words });
             drop(fused);
             super::evaluate_operand(&mut args, i)?;
             continue;

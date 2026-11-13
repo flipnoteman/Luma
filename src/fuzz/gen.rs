@@ -421,6 +421,8 @@ fn bin_err(ty: Ty, op: BinOp, a: Info, b: Info, r: &Info) -> Option<f64> {
             a.err + round
         }
         BinOp::Rem => return None,
+        op if op.bitwise() => return None,
+        _ => unreachable!(),
     })
 }
 
@@ -483,6 +485,7 @@ fn un_err(ty: Ty, op: UnOp, a: Info, r: &Info) -> Option<f64> {
     Some(match op {
         UnOp::Neg | UnOp::Abs | UnOp::Clamp { .. } | UnOp::Floor | UnOp::Ceil | UnOp::Sign => e,
         UnOp::ToDf32 => e,
+        UnOp::Not => return None,
         UnOp::ToF32 => e + rounding(Ty::F32) * r.mag(),
         UnOp::Sqrt => {
             let step = if a.lo > 2.0 * e { e / a.lo.sqrt() } else { 1.5 * e.sqrt() };
@@ -515,7 +518,7 @@ fn un_err(ty: Ty, op: UnOp, a: Info, r: &Info) -> Option<f64> {
 /// The bounds of `op(a)` for `ty`.
 fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
     if ty == Ty::U32 {
-        return None;
+        return (op == UnOp::Not).then(Info::int);
     }
     let inexact = |lo: f64, hi: f64| Info { lsb: -60, lo, hi, exact: false, err: 0.0 };
     let info = match op {
@@ -680,6 +683,9 @@ impl Scope {
             }
             Stmt::Unary { src, op } => {
                 let v = self.var(*src)?;
+                if (*op == UnOp::Not) != (v.ty == Ty::U32) {
+                    return None;
+                }
                 let ty = match op {
                     UnOp::ToDf32 if v.ty == Ty::F32 => Ty::Df32,
                     UnOp::ToF32 if v.ty == Ty::Df32 => Ty::F32,
@@ -701,7 +707,10 @@ impl Scope {
                 };
                 let (ld, li, _) = self.opd(lhs, ty)?;
                 let (rd, ri, rc) = self.opd(rhs, ty)?;
-                if matches!(lhs, Opd::Const(_)) && !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                if matches!(lhs, Opd::Const(_)) && !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && !(ty == Ty::U32 && op.bitwise()) {
+                    return None;
+                }
+                if ty != Ty::U32 && op.bitwise() {
                     return None;
                 }
                 if matches!(op, BinOp::Rem | BinOp::Div) && ty == Ty::U32 && !matches!(rc, Some(c) if c >= 1.0) {
@@ -903,7 +912,7 @@ impl Scope {
                 if rd.is_some_and(|d| d != t.dims && len_of(d) != 1) {
                     return None;
                 }
-                if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) || (t.ty != Ty::U32 && *op == BinOp::Rem) {
+                if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) && !op.bitwise() || (t.ty != Ty::U32 && (*op == BinOp::Rem || op.bitwise())) {
                     return None;
                 }
                 if matches!(op, BinOp::Rem | BinOp::Div) && t.ty == Ty::U32 && !matches!(rc, Some(c) if c >= 1.0) {
@@ -986,6 +995,9 @@ const SHAPES: [Dims; 6] = [[12, 1, 1, 1], [7, 5, 1, 1], [9, 6, 1, 1], [8, 8, 1, 
 const EXACT_CONSTS: [f32; 8] = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 4.0];
 const MATH_CONSTS: [f32; 7] = [0.5, 1.0, 1.5, 2.0, 3.0, -1.0, 0.25];
 const INT_CONSTS: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 5.0, 7.0];
+/// Constants of the bitwise operations: edge shift amounts (modulo 32), and `2^32` (saturates
+/// to `u32::MAX`, all ones).
+const BIT_CONSTS: [f32; 8] = [0.0, 1.0, 5.0, 31.0, 32.0, 33.0, 12.0, 4_294_967_296.0];
 const POW2_CONSTS: [f32; 5] = [-2.0, -0.5, 0.5, 2.0, 4.0];
 
 impl Builder {
@@ -1132,9 +1144,11 @@ impl Builder {
     }
 
     fn g_unary(&mut self) -> Option<Stmt> {
-        let src = self.pick(|v| v.ty != Ty::U32)?;
+        let src = self.pick(|_| true)?;
         let ty = self.scope.var(src)?.ty;
-        let op = if ty == Ty::Df32 {
+        let op = if ty == Ty::U32 {
+            UnOp::Not
+        } else if ty == Ty::Df32 {
             match self.tape.below(5) {
                 0 => UnOp::Neg,
                 1 => UnOp::Abs,
@@ -1180,7 +1194,21 @@ impl Builder {
     fn g_binary(&mut self) -> Option<Stmt> {
         let ty = self.any_ty();
         let ops: &[BinOp] = match (ty, self.math) {
-            (Ty::U32, _) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Rem, BinOp::Minimum, BinOp::Maximum],
+            (Ty::U32, _) => &[
+                BinOp::Add,
+                BinOp::Sub,
+                BinOp::Mul,
+                BinOp::Div,
+                BinOp::Rem,
+                BinOp::Minimum,
+                BinOp::Maximum,
+                BinOp::BitAnd,
+                BinOp::BitOr,
+                BinOp::BitXor,
+                BinOp::Shl,
+                BinOp::Shr,
+                BinOp::Rotl,
+            ],
             (Ty::Df32, false) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Minimum, BinOp::Maximum],
             (Ty::Df32, true) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Minimum, BinOp::Maximum],
             (Ty::F32, false) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Minimum, BinOp::Maximum, BinOp::Div],
@@ -1197,7 +1225,7 @@ impl Builder {
             ],
         };
         let op = self.tape.pick(ops);
-        let lhs_const = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && self.tape.chance(1, 8);
+        let lhs_const = (matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) || op.bitwise()) && self.tape.chance(1, 8);
         let lhs = if lhs_const {
             Opd::Const(self.constant(ty))
         } else {
@@ -1211,6 +1239,8 @@ impl Builder {
             Opd::Var(self.pick_ty(ty)?)
         } else if (op == BinOp::Div && ty == Ty::U32) || (op == BinOp::Rem) {
             Opd::Const(self.tape.pick(&[1.0f32, 2.0, 3.0, 7.0]))
+        } else if op.bitwise() && self.tape.chance(1, 2) {
+            Opd::Const(self.tape.pick(&BIT_CONSTS))
         } else if op == BinOp::Div && !self.math {
             Opd::Const(self.tape.pick(&POW2_CONSTS))
         } else {
@@ -1375,7 +1405,19 @@ impl Builder {
         let target = self.pick(|v| v.root.is_none() && v.cell >= local_from)?;
         let t = self.scope.var(target)?.clone();
         let op = match t.ty {
-            Ty::U32 => self.tape.pick(&[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Rem]),
+            Ty::U32 => self.tape.pick(&[
+                BinOp::Add,
+                BinOp::Sub,
+                BinOp::Mul,
+                BinOp::Div,
+                BinOp::Rem,
+                BinOp::BitAnd,
+                BinOp::BitOr,
+                BinOp::BitXor,
+                BinOp::Shl,
+                BinOp::Shr,
+                BinOp::Rotl,
+            ]),
             _ => self.tape.pick(&[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div]),
         };
         let rhs = if (t.ty == Ty::U32 && matches!(op, BinOp::Div | BinOp::Rem)) || (op == BinOp::Div && !self.math) {

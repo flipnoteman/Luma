@@ -21,8 +21,8 @@
 //! # Where fusion stops
 //!
 //! * An expression holds at most [`JitState::max_nodes`] operations (default
-//!   [`DEFAULT_MAX_NODES`] = 4096, at most `MAX_NODES_LIMIT` = 4096; `LUMA_FUSION_MAX_NODES`
-//!   overrides the default and [`fusion_limit`] a scope), nests at most `MAX_DEPTH` = 256 levels
+//!   [`DEFAULT_MAX_NODES`] = 16384, at most `MAX_NODES_LIMIT` = 16384; `LUMA_FUSION_MAX_NODES`
+//!   overrides the default and [`fusion_limit`] a scope), nests at most `MAX_DEPTH` = 512 levels (256 in builds with debug assertions)
 //!   (the flattening walk is recursive, so this bounds its stack) and reads as many distinct input
 //!   buffers as the device can bind. A new node that would exceed one of them evaluates its
 //!   biggest (for the depth: its deepest) operand first, which splits long chains into several
@@ -188,12 +188,17 @@ struct RequestList {
 }
 
 /// Most operations one fused kernel contains unless configured otherwise.
-pub(crate) const DEFAULT_MAX_NODES: usize = 4096;
+pub(crate) const DEFAULT_MAX_NODES: usize = 16384;
+/// How many times too high the number of operations below an operation must be (it adds up what
+/// its operands held when they were made, evaluated since or not) before `create` counts them
+/// again.
+const STALE_COUNT: usize = 10;
 /// Upper bound of the configurable limit.
-const MAX_NODES_LIMIT: usize = 4096;
+const MAX_NODES_LIMIT: usize = 16384;
 /// Deepest nesting of one fused expression: the expression is walked recursively, so this bounds
-/// the stack the walk needs whatever the node limit.
-const MAX_DEPTH: u16 = 256;
+/// the stack the walk needs whatever the node limit (an unoptimised build has frames several
+/// times bigger, which a test thread's 2 MB does not hold at 512 levels).
+const MAX_DEPTH: u16 = if cfg!(debug_assertions) { 256 } else { 512 };
 /// Most input buffers of one fused kernel, whatever the device allows.
 const MAX_INPUTS: usize = 256;
 /// Environment variable overriding [`DEFAULT_MAX_NODES`] for new contexts. `1` makes every
@@ -208,8 +213,8 @@ thread_local! {
 }
 
 /// Runs `f` with the fusion limit of lazy operations created on this thread set to `max_nodes`
-/// operations per kernel (instead of the context's, 4096 unless `LUMA_FUSION_MAX_NODES`
-/// changes it), restoring the previous limit afterwards. The value is clamped to `1..=4096`;
+/// operations per kernel (instead of the context's, 16384 unless `LUMA_FUSION_MAX_NODES`
+/// changes it), restoring the previous limit afterwards. The value is clamped to `1..=16384`;
 /// `1` makes every operation its own kernel. Only the limit at the time an operation is
 /// *written* matters, so the expressions built inside `f` keep it when they are evaluated later.
 ///
@@ -1379,6 +1384,79 @@ fn count_inputs(args: &[Src], stop: &[Arc<Node>]) -> Vec<u64> {
     ids
 }
 
+/// Sorted ids of the pending operations the expressions `args` consist of, counted by walking
+/// them: unlike [`Node::below_len`] this does not count what lies below a part of the expression
+/// that was evaluated after the node was created.
+fn count_pending(args: &[Src]) -> Vec<u64> {
+    let mut ids = Vec::new();
+    let mut seen: FxMap<u64, ()> = FxMap::default();
+    let mut work: Vec<Arc<Node>> = args.iter().filter_map(|arg| if let Src::Node(node) = arg { Some(Arc::clone(node)) } else { None }).collect();
+    while let Some(node) = work.pop() {
+        if seen.insert(node.id, ()).is_some() || node.evaluated().is_some() {
+            continue;
+        }
+        ids.push(node.id);
+        if node.looped.get().is_some() {
+            continue;
+        }
+        if let Some(operands) = node.operands() {
+            work.extend(operands.into_iter().take(node.op.kind.arity()).filter_map(|operand| if let Src::Node(inner) = operand { Some(inner) } else { None }));
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+/// The greatest depth (see [`Node::depth`]) among the node operands `args` have, counting only
+/// what is still pending.
+fn pending_depth(args: &[Src]) -> Option<u16> {
+    let mut memo: FxMap<u64, u16> = FxMap::default();
+    let roots: Vec<Arc<Node>> = args.iter().filter_map(|arg| if let Src::Node(node) = arg { Some(Arc::clone(node)) } else { None }).collect();
+    let mut stack: Vec<(Arc<Node>, bool)> = roots.iter().map(|node| (Arc::clone(node), false)).collect();
+    while let Some((node, expanded)) = stack.pop() {
+        if memo.contains_key(&node.id) {
+            continue;
+        }
+        let operands = if node.evaluated().is_some() || node.looped.get().is_some() { None } else { node.operands() };
+        let Some(operands) = operands else {
+            memo.insert(node.id, node.depth());
+            continue;
+        };
+        let inner: Vec<Arc<Node>> = operands
+            .into_iter()
+            .take(node.op.kind.arity())
+            .filter_map(|operand| match operand {
+                Src::Node(inner) if inner.evaluated().is_none() => Some(inner),
+                _ => None,
+            })
+            .collect();
+        if !expanded {
+            stack.push((Arc::clone(&node), true));
+            stack.extend(inner.into_iter().filter(|operand| !memo.contains_key(&operand.id)).map(|operand| (operand, false)));
+            continue;
+        }
+        let depth = inner.iter().filter_map(|operand| memo.get(&operand.id)).map(|d| d.saturating_add(1)).max().unwrap_or(0);
+        memo.insert(node.id, depth);
+    }
+    roots.iter().filter_map(|node| memo.get(&node.id).copied()).max()
+}
+
+/// The [`Measure`] of `old` with the nodes below replaced by the sorted `pending` ids (as sorted
+/// words of 64 ids, see [`Node::ids`]).
+fn measure_pending(pending: &[u64], old: &Measure) -> Measure {
+    let mut pairs: Vec<u64> = Vec::new();
+    for &id in pending {
+        let n = pairs.len();
+        if n >= 2 && pairs[n - 2] == id >> 6 {
+            pairs[n - 1] |= 1 << (id & 63);
+        } else {
+            pairs.extend([id >> 6, 1 << (id & 63)]);
+        }
+    }
+    let inputs = old.ids.get(old.words as usize..).unwrap_or(&[]);
+    Measure { below: pending.len(), inputs: old.inputs, ids: concat_ids(&pairs, inputs), base: 0, words: pairs.len() as u32, sparse: true }
+}
+
 /// Replaces `args[i]` and every operand that is the same node by its evaluated buffer.
 fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failure> {
     let node = match args.get(i) {
@@ -1399,18 +1477,18 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 
 /// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
 /// no transcendental functions (and needs a device with 64-bit shader floats), `Df32` only the
-/// operations of its library, and neither has generators or `powf`.
+/// operations of its library, and neither has generators or `powf`; the bitwise operations only
+/// exist for `u32`, and `u32` has no negation.
 fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(), LumaError> {
-    if matches!(op.ty, ElemTy::F64 | ElemTy::Df32) {
-        let exists = match op.kind {
-            OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
-            OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
-            OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
-            OpKind::Powf | OpKind::Generate(_) => false,
-        };
-        if !exists {
-            return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", op.ty.display())));
-        }
+    let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32);
+    let exists = match op.kind {
+        OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
+        OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
+        OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
+        OpKind::Powf | OpKind::Generate(_) => !wide,
+    };
+    if !exists {
+        return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", op.ty.display())));
     }
     if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(wgpu::Features::SHADER_F64) {
         return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
@@ -1489,9 +1567,22 @@ pub(crate) fn create(
     let mut batched = false;
     let mut cut = false;
     let mut noted = false;
+    let mut exact_depth: Option<Option<u16>>;
     let measured = loop {
         let mut measured = measure(args.get(..arity).unwrap_or(&[]));
-        let (below, mut inputs) = (measured.below, measured.inputs);
+        let (mut below, mut inputs) = (measured.below, measured.inputs);
+        if below >= max_nodes {
+            // `measure` adds up what the operands held when they were created, which includes
+            // what has been evaluated since: count the pending operations that are left. A count
+            // that is a little too high is left alone (the cut it makes comes early, which keeps
+            // arrays that advance together in the same kernels, see the tests); one that is
+            // several times too high would cut every operation made after a cut.
+            let pending = count_pending(args.get(..arity).unwrap_or(&[]));
+            if pending.len() * STALE_COUNT <= below {
+                measured = measure_pending(&pending, &measured);
+                below = measured.below;
+            }
+        }
         if inputs > max_inputs {
             // `measure` adds up what the operands read when they were created: a part of the
             // expression evaluated since reads its one buffer now. Count what is read.
@@ -1503,7 +1594,14 @@ pub(crate) fn create(
             Src::Node(node) => Some(node.depth()),
             _ => None,
         });
-        let deep = deepest.max().unwrap_or(0) >= MAX_DEPTH;
+        let mut deepest_operand = deepest.max();
+        exact_depth = None;
+        if deepest_operand.unwrap_or(0) >= MAX_DEPTH {
+            // Like the count of operations, the depth includes what was evaluated since.
+            deepest_operand = pending_depth(args.get(..arity).unwrap_or(&[]));
+            exact_depth = Some(deepest_operand);
+        }
+        let deep = deepest_operand.unwrap_or(0) >= MAX_DEPTH;
         let too_big = below >= max_nodes || inputs > max_inputs;
         if !too_big && !deep {
             break measured;
@@ -1596,7 +1694,7 @@ pub(crate) fn create(
         }
     }
     let weight = cost::op_weight(op, &ctx.cost_model()) + operand_weight;
-    let depth = deepest.map_or(0, |deepest| deepest.saturating_add(1));
+    let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
 
     let node = Arc::new(Node {
         thread: current_thread(),

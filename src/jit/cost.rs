@@ -74,13 +74,14 @@ impl CostModel {
 pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
     let base = match op.kind {
         OpKind::Unary(u) => match u {
-            UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id => 1.0,
+            UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
             UnOp::Sqrt => 4.0,
             UnOp::Exp | UnOp::Ln | UnOp::Sin | UnOp::Cos => 8.0,
             UnOp::Tan | UnOp::Tanh => 16.0,
         },
         OpKind::Binary(b) => match b {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Min | BinOp::Max | BinOp::Copysign => 1.0,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Rotl => 1.0,
             BinOp::Div | BinOp::Rem => 4.0,
             BinOp::Hypot => 6.0,
             BinOp::Atan2 => 16.0,

@@ -28,7 +28,7 @@ I/O dependant, operations.
 
 ## Features
 
-- Arrays of `f32` and `u32` with up to 4 dimensions
+- Arrays of `f32` and `u32` with up to 4 dimensions; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
 - `vec2`/`vec4` element types
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Reductions: sum, min, max, mean, norm
@@ -88,7 +88,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 | `LUMA_CHUNK_BYTES` | Largest buffer an array is split into, in bytes (power of two) |
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
-| `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel (default 1024, at most 4096) |
+| `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels |
 | `LUMA_FUSION_MAX_LIVE` | Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, `8..=4096`) |
 | `LUMA_FUSION_MAX_INLINED` | Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; `16..=16384`) |
 | `LUMA_STAGING` | `off` keeps expressions read through slices and pads at several offsets (fluxes, stencils of an expression) out of workgroup memory: the kernel recomputes them per read instead of computing each once per cell of a workgroup tile (the cost model picks between them) |

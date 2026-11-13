@@ -245,6 +245,12 @@ fn lbin(op: BinOp) -> LBin {
         BinOp::Atan2 => LBin::Atan2,
         BinOp::Hypot => LBin::Hypot,
         BinOp::Copysign => LBin::Copysign,
+        BinOp::BitAnd => LBin::BitAnd,
+        BinOp::BitOr => LBin::BitOr,
+        BinOp::BitXor => LBin::BitXor,
+        BinOp::Shl => LBin::Shl,
+        BinOp::Shr => LBin::Shr,
+        BinOp::Rotl => LBin::Rotl,
     }
 }
 
@@ -271,6 +277,7 @@ fn unary(a: &Arr, op: UnOp) -> Arr {
         (Arr::F(x), UnOp::Clamp { lo, hi }) => Arr::F(x.clamp(lo, hi)),
         (Arr::F(x), UnOp::Powf(e)) => Arr::F(x.powf(e)),
         (Arr::F(x), UnOp::ToDf32) => Arr::D(x.to_df32()),
+        (Arr::U(x), UnOp::Not) => Arr::U(!x),
         (Arr::D(x), UnOp::Neg) => Arr::D(-x),
         (Arr::D(x), UnOp::Abs) => Arr::D(x.abs()),
         (Arr::D(x), UnOp::Sqrt) => Arr::D(x.sqrt()),
@@ -1272,6 +1279,11 @@ fn generator_covers_the_statements() {
                 *out.entry(format!("Loop/{kind:?}")).or_default() += 1;
                 walk(body, out);
             }
+            match stmt {
+                Stmt::Binary { op, .. } | Stmt::Compound { op, .. } if op.bitwise() => *out.entry("Bitwise".to_owned()).or_default() += 1,
+                Stmt::Unary { op: UnOp::Not, .. } => *out.entry("Not".to_owned()).or_default() += 1,
+                _ => {}
+            }
             if let Stmt::View { view, .. } = stmt {
                 let name = format!("{view:?}");
                 let name = name.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_owned();
@@ -1296,7 +1308,7 @@ fn generator_covers_the_statements() {
         "Input", "Full", "Range", "Linspace", "Unary", "Binary", "Compare", "Select", "View", "Reduce", "SumWhere", "Scan", "AxisReduce",
         "Assign", "Put", "Compound", "Write", "Cache", "EvalVars", "Alias", "Release", "Fetch", "Loop/PerStepEval", "Loop/IterateAll",
         "Loop/IterateUntilAll", "View/Slice", "View/Pad", "View/Flip", "View/Transpose", "View/ShiftCirc", "View/ShiftFill",
-        "View/ShiftClamp", "View/ShiftMirror", "View/Take", "View/Concat",
+        "View/ShiftClamp", "View/ShiftMirror", "View/Take", "View/Concat", "Bitwise", "Not",
     ] {
         assert!(counts.get(kind).copied().unwrap_or(0) >= 5, "{kind} is rare: {counts:?}");
     }

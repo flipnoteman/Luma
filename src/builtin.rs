@@ -58,6 +58,30 @@ pub(crate) enum UnOp {
     Ceil,
     /// The identity: a copy of the operand (internal).
     Id,
+    /// Bitwise complement (`u32` only).
+    BitNot,
+    /// Shift left by a constant amount `0..32` (`u32` only). The amount is part of the
+    /// operation, so it is a literal of the kernel: the compiler turns a rotation by a constant
+    /// into a funnel shift, which one by a value read from the uniform is not.
+    Shl(u8),
+    /// Logical shift right by a constant amount `0..32`.
+    Shr(u8),
+    /// Rotation left by a constant amount `0..32`.
+    Rotl(u8),
+}
+
+/// The WGSL of the shifts and rotations by a constant (kind 0, 1, 2: `Shl`, `Shr`, `Rotl`).
+fn by_constant(kind: usize, amount: u8) -> &'static str {
+    static TABLES: std::sync::OnceLock<[Vec<String>; 3]> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        let table = |f: &dyn Fn(u32) -> String| (0..32).map(|k| if k == 0 { "x".to_owned() } else { f(k) }).collect();
+        [
+            table(&|k| format!("(x << {k}u)")),
+            table(&|k| format!("(x >> {k}u)")),
+            table(&|k| format!("((x << {k}u) | (x >> {}u))", 32 - k)),
+        ]
+    });
+    &tables[kind][usize::from(amount & 31)]
 }
 
 impl UnOp {
@@ -77,6 +101,10 @@ impl UnOp {
             UnOp::Floor => "floor(x)",
             UnOp::Ceil => "ceil(x)",
             UnOp::Id => "x",
+            UnOp::BitNot => "~x",
+            UnOp::Shl(k) => by_constant(0, k),
+            UnOp::Shr(k) => by_constant(1, k),
+            UnOp::Rotl(k) => by_constant(2, k),
         }
     }
 
@@ -95,6 +123,29 @@ impl UnOp {
             UnOp::Floor => "floor",
             UnOp::Ceil => "ceil",
             UnOp::Id => "copy",
+            UnOp::BitNot => "not",
+            UnOp::Shl(_) => "shl",
+            UnOp::Shr(_) => "shr",
+            UnOp::Rotl(_) => "rotate_left",
+        }
+    }
+}
+
+impl UnOp {
+    /// Whether the operation only exists for `u32`.
+    pub(crate) fn is_bitwise(self) -> bool {
+        matches!(self, UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_))
+    }
+
+    /// The operation that shifts or rotates by the constant `amount` (taken modulo 32) in place
+    /// of the binary `op`, if there is one.
+    pub(crate) fn by_constant(op: BinOp, amount: u32) -> Option<UnOp> {
+        let k = (amount & 31) as u8;
+        match op {
+            BinOp::Shl => Some(UnOp::Shl(k)),
+            BinOp::Shr => Some(UnOp::Shr(k)),
+            BinOp::Rotl => Some(UnOp::Rotl(k)),
+            _ => None,
         }
     }
 }
@@ -104,7 +155,12 @@ impl UnOp {
     /// (`f64` has the exact built-ins, `Df32` the library ones, see [`df_library`]).
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
-            ElemTy::F32 | ElemTy::U32 => Some(self.expr()),
+            ElemTy::U32 => match self {
+                UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => Some(self.expr()),
+                _ => None,
+            },
+            ElemTy::F32 if self.is_bitwise() => None,
+            ElemTy::F32 => Some(self.expr()),
             ElemTy::F64 => match self {
                 UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id => Some(self.expr()),
                 _ => None,
@@ -132,6 +188,20 @@ pub(crate) enum BinOp {
     Hypot,
     Copysign,
     Rem,
+    /// Bitwise operations on `u32` (shift and rotate amounts are taken modulo 32).
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Rotl,
+}
+
+impl BinOp {
+    /// Whether the operation only exists for `u32`.
+    pub(crate) fn is_bitwise(self) -> bool {
+        matches!(self, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Rotl)
+    }
 }
 
 impl BinOp {
@@ -148,6 +218,12 @@ impl BinOp {
             BinOp::Hypot => "length(vec2<f32>(x, y))",
             BinOp::Copysign => "bitcast<f32>((bitcast<u32>(x) & 0x7fffffffu) | (bitcast<u32>(y) & 0x80000000u))",
             BinOp::Rem => "x % y",
+            BinOp::BitAnd => "x & y",
+            BinOp::BitOr => "x | y",
+            BinOp::BitXor => "x ^ y",
+            BinOp::Shl => "x << (y & 31u)",
+            BinOp::Shr => "x >> (y & 31u)",
+            BinOp::Rotl => "((x << (y & 31u)) | (x >> ((32u - y) & 31u)))",
         }
     }
 }
@@ -156,7 +232,8 @@ impl BinOp {
     /// [`BinOp::expr`] for elements of type `ty`, `None` if the operation does not exist for it.
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
-            ElemTy::F32 | ElemTy::U32 => Some(self.expr()),
+            ElemTy::U32 => Some(self.expr()),
+            ElemTy::F32 => (!self.is_bitwise()).then(|| self.expr()),
             ElemTy::F64 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max => Some(self.expr()),
                 _ => None,
@@ -1172,5 +1249,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
             )
             .into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitwise_operations_only_exist_for_u32() {
+        let bitwise = [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Shl, BinOp::Shr, BinOp::Rotl];
+        for op in bitwise {
+            assert!(op.expr_for(ElemTy::U32).is_some(), "{op:?}");
+            for ty in [ElemTy::F32, ElemTy::F64, ElemTy::Df32] {
+                assert!(op.expr_for(ty).is_none(), "{op:?} on {ty:?}");
+            }
+        }
+        for op in [UnOp::BitNot, UnOp::Shl(3), UnOp::Shr(31), UnOp::Rotl(0)] {
+            assert!(op.expr_for(ElemTy::U32).is_some());
+            for ty in [ElemTy::F32, ElemTy::F64, ElemTy::Df32] {
+                assert!(op.expr_for(ty).is_none(), "{op:?} on {ty:?}");
+            }
+        }
+        assert_eq!(UnOp::Rotl(5).expr(), "((x << 5u) | (x >> 27u))");
+        assert_eq!(UnOp::Rotl(0).expr(), "x");
+        assert_eq!(UnOp::by_constant(BinOp::Shr, 33), Some(UnOp::Shr(1)));
+        // There is no negation of an unsigned integer.
+        assert!(UnOp::Neg.expr_for(ElemTy::U32).is_none());
     }
 }
