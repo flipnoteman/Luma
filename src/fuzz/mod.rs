@@ -962,6 +962,9 @@ impl Arr {
 /// The context of a program under its configuration; `None` if the device refuses it.
 fn engine(config: &Config) -> Option<Context> {
     let mut options = ContextOptions::from_env().calibrate(false).fast_math(config.fast_math);
+    if config.df_split {
+        options = options.df_fma(false);
+    }
     if let Some(bytes) = config.chunk_bytes {
         options = options.chunk_bytes(bytes);
     }
@@ -1138,7 +1141,7 @@ fn minimize(program: Program, quick: bool) -> Program {
             return best;
         }
         let default = Config::default_engine();
-        let resets: [fn(&mut Config, &Config); 11] = [
+        let resets: [fn(&mut Config, &Config); 12] = [
             |c, d| c.max_nodes = d.max_nodes,
             |c, d| c.max_inlined = d.max_inlined,
             |c, d| c.max_live = d.max_live,
@@ -1147,6 +1150,7 @@ fn minimize(program: Program, quick: bool) -> Program {
             |c, d| c.speculate = d.speculate,
             |c, d| c.simplify = d.simplify,
             |c, d| c.fast_math = d.fast_math,
+            |c, d| c.df_split = d.df_split,
             |c, d| c.chunk_bytes = d.chunk_bytes,
             |c, d| c.memory_budget = d.memory_budget,
             |c, d| c.cost = d.cost,

@@ -226,10 +226,11 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
 /// The double-float library a kernel of `key` defines (a reduction of `Df32` brings its own,
 /// see `reduce_main`): behind the guard uniform when the program has one, else with a constant
 /// guard, for the functions that never read it (ordering, minimum, maximum, absolute value).
-pub(super) fn library_for(key: &FusedKey) -> String {
+pub(super) fn library_for(key: &FusedKey, tuning: &Tuning) -> String {
+    let library = |guard: &str| df_library(guard, tuning.df_fma, tuning.df_sloppy_add);
     match key.guard {
-        Some(guard) => df_library(&format!("p.s{guard}")),
-        None if key.instrs.iter().chain(key.subs.iter().flatten()).any(calls_df_library) => df_library("0u"),
+        Some(guard) => library(&format!("p.s{guard}")),
+        None if key.instrs.iter().chain(key.subs.iter().flatten()).any(calls_df_library) => library("0u"),
         None => String::new(),
     }
 }
@@ -450,7 +451,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     // A reduction of `Df32` brings the library itself (see `reduce_main`).
     let reduces_df = reduce && out_ty(outputs[0]) == "vec2<f32>";
     if !reduces_df {
-        src.push_str(&library_for(key));
+        src.push_str(&library_for(key, tuning));
     }
     src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
     src.push_str(&view_helpers(&views));
@@ -503,7 +504,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         Tail::Reduce(ops) => {
             let (ty, last) = (out_ty(outputs[0]), outputs[0]);
             let guard = format!("p.s{}", key.guard.unwrap_or(0));
-            let elem = if reduces_df { ReduceElem::Df32 { guard: &guard } } else { ReduceElem::Plain(ty) };
+            let elem = if reduces_df { ReduceElem::Df32 { guard: &guard, fma: tuning.df_fma } } else { ReduceElem::Plain(ty) };
             let _ = write!(
                 src,
                 "

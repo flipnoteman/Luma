@@ -411,7 +411,7 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String
     // The double-float kernel takes the guard of its arithmetic (see `df_library`) as a uniform.
     let fields = ops.epilogue().fields();
     let (elem, params) = match ty {
-        "df32" => (ReduceElem::Df32 { guard: "p.guard" }, "struct Params { n: u32, guard: u32 }".to_owned()),
+        "df32" => (ReduceElem::Df32 { guard: "p.guard", fma: tuning.df_fma }, "struct Params { n: u32, guard: u32 }".to_owned()),
         other if fields.is_empty() => (ReduceElem::Plain(other), "struct Params { n: u32 }".to_owned()),
         other => (ReduceElem::Plain(other), format!("struct Params {{ n: u32, {fields}}}")),
     };
@@ -435,7 +435,7 @@ pub(crate) enum ReduceElem<'a> {
     Plain(&'a str),
     /// A double-float (`vec2<f32>`) combined with the library of [`df_library`]; `guard` names
     /// the uniform that is always 0.
-    Df32 { guard: &'a str },
+    Df32 { guard: &'a str, fma: bool },
 }
 
 impl<'a> ReduceElem<'a> {
@@ -474,7 +474,7 @@ impl<'a> ReduceElem<'a> {
     fn library(self) -> String {
         match self {
             ReduceElem::Plain(_) => String::new(),
-            ReduceElem::Df32 { guard } => df_library(guard),
+            ReduceElem::Df32 { guard, fma } => df_library(guard, fma, false),
         }
     }
 }
@@ -484,45 +484,73 @@ impl<'a> ReduceElem<'a> {
 /// but unknown to the shader compiler): no reassociation or fast-math contraction can cancel
 /// the transformations. (It is an OR, not an XOR, so that `luma_o(luma_o(x))`, as in a cast
 /// feeding a cast, cannot fold back to `x`: the guard would cancel with itself.)
-pub(crate) fn df_library(guard: &str) -> String {
-    const LIBRARY: &str = "fn luma_o(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) | {G}); }
+///
+/// The error of a product is exact either way: with `fma` (the device's `fma` is fused, see
+/// [`Tuning::df_fma`]) it is `fma(a, b, -p)`, otherwise Dekker's splitting of both factors costs
+/// about ten times as many operations. Division and square root start from the hardware
+/// quotient or root of the high words and add one correction computed from an exact remainder
+/// (an accuracy of about 2^-45), instead of three Newton steps of full double-float products
+/// and sums.
+///
+/// `sloppy_add` (`fast_math`) adds with one error-free sum of the high words and a plain sum of
+/// the low ones, about half the operations: the error stays below 2^-47 of the larger operand,
+/// but the relative error of a sum grows with the cancellation (a result 2^k times smaller than
+/// the operands has about 2^(k-47)), where the default addition keeps 2^-46 of the result.
+pub(crate) fn df_library(guard: &str, fma: bool, sloppy_add: bool) -> String {
+    const ADD_ACCURATE: &str = "fn df_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let s = df_two_sum(a.x, b.x); let t = df_two_sum(a.y, b.y);
+    let c = df_quick(s.x, luma_o(s.y + t.x)); return df_quick(c.x, luma_o(c.y + t.y));
+}
+";
+    const ADD_SLOPPY: &str = "fn df_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let s = df_two_sum(a.x, b.x); return df_quick(s.x, luma_o(s.y + luma_o(a.y + b.y)));
+}
+";
+    const COMMON: &str = "fn luma_o(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) | {G}); }
 fn df_two_sum(a: f32, b: f32) -> vec2<f32> {
     let s = luma_o(a + b); let bb = luma_o(s - a);
     let da = luma_o(a - luma_o(s - bb)); let db = luma_o(b - bb);
     return vec2<f32>(s, da + db);
 }
 fn df_quick(a: f32, b: f32) -> vec2<f32> { let s = luma_o(a + b); return vec2<f32>(s, b - luma_o(s - a)); }
-fn df_split(a: f32) -> vec2<f32> { let t = luma_o(4097.0 * a); let hi = luma_o(t - luma_o(t - a)); return vec2<f32>(hi, luma_o(a - hi)); }
+fn df_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let p = df_two_prod(a.x, b.x); return df_quick(p.x, luma_o(p.y + luma_o(a.x * b.y + a.y * b.x)));
+}
+fn df_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let q1 = a.x / b.x;
+    let p = df_two_prod(b.x, q1);
+    let r = luma_o(luma_o(luma_o(a.x - p.x) - p.y) + luma_o(a.y - luma_o(b.y * q1)));
+    return df_quick(q1, r / b.x);
+}
+fn df_sqrt(a: vec2<f32>) -> vec2<f32> {
+    if (a.x <= 0.0) { return vec2<f32>(sqrt(a.x), 0.0); }
+    let s = sqrt(a.x);
+    let p = df_two_prod(s, s);
+    let e = luma_o(luma_o(luma_o(a.x - p.x) - p.y) + a.y);
+    return df_quick(s, e / (2.0 * s));
+}
+fn df_lt(a: vec2<f32>, b: vec2<f32>) -> bool { return (a.x < b.x) | ((a.x == b.x) & (a.y < b.y)); }
+fn df_le(a: vec2<f32>, b: vec2<f32>) -> bool { return (a.x < b.x) | ((a.x == b.x) & (a.y <= b.y)); }
+fn df_eq(a: vec2<f32>, b: vec2<f32>) -> bool { return (a.x == b.x) & (a.y == b.y); }
+fn df_min(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return select(b, a, df_lt(a, b)); }
+fn df_max(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return select(a, b, df_lt(a, b)); }
+fn df_abs(a: vec2<f32>) -> vec2<f32> { return select(a, -a, (a.x < 0.0) | ((a.x == 0.0) & (a.y < 0.0))); }
+";
+    const PRODUCT_FMA: &str = "fn df_two_prod(a: f32, b: f32) -> vec2<f32> { let p = luma_o(a * b); return vec2<f32>(p, fma(a, b, -p)); }
+";
+    const PRODUCT_DEKKER: &str = "fn df_split(a: f32) -> vec2<f32> { let t = luma_o(4097.0 * a); let hi = luma_o(t - luma_o(t - a)); return vec2<f32>(hi, luma_o(a - hi)); }
 fn df_two_prod(a: f32, b: f32) -> vec2<f32> {
     let p = luma_o(a * b); let x = df_split(a); let y = df_split(b);
     let e1 = luma_o(x.x * y.x - p); let e2 = luma_o(e1 + x.x * y.y); let e3 = luma_o(e2 + x.y * y.x);
     return vec2<f32>(p, e3 + x.y * y.y);
 }
-fn df_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    let s = df_two_sum(a.x, b.x); let t = df_two_sum(a.y, b.y);
-    let c = df_quick(s.x, luma_o(s.y + t.x)); return df_quick(c.x, luma_o(c.y + t.y));
-}
-fn df_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    let p = df_two_prod(a.x, b.x); return df_quick(p.x, luma_o(p.y + luma_o(a.x * b.y + a.y * b.x)));
-}
-fn df_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    let q1 = a.x / b.x; let r1 = df_add(a, -df_mul(b, vec2<f32>(q1, 0.0)));
-    let q2 = r1.x / b.x; let r2 = df_add(r1, -df_mul(b, vec2<f32>(q2, 0.0)));
-    let q3 = r2.x / b.x; return df_add(df_quick(q1, q2), vec2<f32>(q3, 0.0));
-}
-fn df_sqrt(a: vec2<f32>) -> vec2<f32> {
-    if (a.x <= 0.0) { return vec2<f32>(sqrt(a.x), 0.0); }
-    let x = 1.0 / sqrt(a.x); let ax = luma_o(a.x * x);
-    let e = df_add(a, -df_two_prod(ax, ax)); return df_two_sum(ax, e.x * (x * 0.5));
-}
-fn df_lt(a: vec2<f32>, b: vec2<f32>) -> bool { return a.x < b.x || (a.x == b.x && a.y < b.y); }
-fn df_le(a: vec2<f32>, b: vec2<f32>) -> bool { return a.x < b.x || (a.x == b.x && a.y <= b.y); }
-fn df_eq(a: vec2<f32>, b: vec2<f32>) -> bool { return a.x == b.x && a.y == b.y; }
-fn df_min(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return select(b, a, df_lt(a, b)); }
-fn df_max(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return select(a, b, df_lt(a, b)); }
-fn df_abs(a: vec2<f32>) -> vec2<f32> { return select(a, -a, df_lt(a, vec2<f32>(0.0, 0.0))); }
 ";
-    LIBRARY.replace("{G}", guard)
+    format!(
+        "{COMMON}{}{}",
+        if sloppy_add { ADD_SLOPPY } else { ADD_ACCURATE },
+        if fma { PRODUCT_FMA } else { PRODUCT_DEKKER }
+    )
+    .replace("{G}", guard)
 }
 
 /// `c(..)` over `values`, combined pairwise so float sums keep their accuracy.

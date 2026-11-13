@@ -168,6 +168,18 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- `Df32` arithmetic is 1.5 to 2 times faster in kernels full of it (a double-float flux kernel
+  1.9 times, a Runge-Kutta step of such kernels 1.7 times): the error of a product comes from a fused `fma` instead of
+  Dekker's splitting, where a one-time test kernel finds the device's `fma` fused (stored with
+  the calibration, `ContextOptions::df_fma` / `LUMA_DF_FMA=on|off` force either form; llvmpipe and
+  the RTX 3090 pass, a device that lowers `fma` to a multiplication and an addition keeps the
+  splitting); division and square root add one correction from an exact remainder instead of
+  three Newton steps of full double-float products (about 2^-45 relative error); ordering,
+  minimum, maximum and absolute value are branch free. The results of products are bit for bit
+  those of the splitting. With `fast_math`, `Df32` sums and differences take the cheaper
+  algorithm whose error is below 2^-47 of the larger operand (a further 15 to 20 percent on that
+  kernel), except in reductions, which keep the accurate one.
+
 - `eval_all` of arrays together with a reduction computes the arrays first (the reduction is
   recorded when it is requested, after the arrays asked for before it): a reduction that shares
   work with them (a step's residual is summed and also read by the state update) no longer

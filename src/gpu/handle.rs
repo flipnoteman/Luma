@@ -29,6 +29,8 @@ pub(crate) struct Gpu {
     pub(crate) cost: Arc<OnceLock<CostModel>>,
     /// The on-disk cache of pipelines and of the calibration (see [`super::cache`]).
     pub(crate) disk: Arc<DiskCache>,
+    /// Whether the device's `fma` is fused (see [`super::fma`]).
+    pub(crate) df_fma: bool,
 }
 
 /// Total bytes of the device-local heaps of `adapter`: how much array data a device can hold at
@@ -137,7 +139,13 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     if !validated {
         cache::flush_at_exit(&disk);
     }
-    Ok(Gpu { device, queue, adapter: info, lost, cpu, memory, cost: Arc::new(OnceLock::new()), disk })
+    // Found out once per machine: the result is kept next to the calibration.
+    let df_fma = disk.load_fma().unwrap_or_else(|| {
+        let fused = super::fma::fused(&device, &queue);
+        disk.store_fma(fused);
+        fused
+    });
+    Ok(Gpu { device, queue, adapter: info, lost, cpu, memory, cost: Arc::new(OnceLock::new()), disk, df_fma })
 }
 
 /// Process-wide pool of opened GPU devices.
