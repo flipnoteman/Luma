@@ -45,7 +45,9 @@ impl FieldOp {
 /// Implemented by `Array<T>` (one field), `[F; N]` and tuples of up to six records, and by
 /// every struct with `#[derive(Fields)]` (`luma::Fields` also names the derive macro). All
 /// the arrays of a record have the same element type [`Fields::Elem`]: `f32` for the usual
-/// state, [`Df32`](crate::Df32) or `f64` for one that needs more precision.
+/// state, [`Df32`](crate::Df32) or `f64` for one that needs more precision, `u32` for integer
+/// state (the lanes of a hash function: a record of `u32` arrays is the state of
+/// [`iterate_all`](crate::iterate_all), and has no unary `-`).
 ///
 /// ```ignore
 /// #[derive(luma::Fields)]

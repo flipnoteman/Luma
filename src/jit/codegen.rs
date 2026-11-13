@@ -530,6 +530,8 @@ fn luma_eval(i: u32) -> {ty} {{
 pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tuning) -> String {
     let wg = tuning.elementwise_workgroup;
     let count = key.outputs.len();
+    // The type of the states (`run_loop_fused` checked that they agree).
+    let state_ty = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map_or("f32", |instr| instr.op.out_ty().wgsl());
     let mut src = String::from("struct Params { steps: u32, ");
     for (k, ty) in key.scalar_tys.iter().enumerate() {
         let _ = write!(src, "s{k}: {}, ", ty.wgsl());
@@ -538,7 +540,7 @@ pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
     let mut binding = 0;
     for (role, access) in [("out", "read_write"), ("init", "read")] {
         for j in 0..count {
-            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<f32>;");
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<{state_ty}>;");
             binding += 1;
         }
     }
@@ -560,7 +562,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "
     );
     for j in 0..count {
-        let _ = writeln!(src, "    var s{j}: f32 = init{j}[i];");
+        let _ = writeln!(src, "    var s{j}: {state_ty} = init{j}[i];");
     }
     for (k, ty) in key.input_tys.iter().enumerate() {
         if states.get(k).copied().flatten().is_none() && direct(&key.instrs, k as u32) {
@@ -570,7 +572,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     src.push_str("    for (var step = 0u; step < p.steps; step = step + 1u) {\n");
     for (k, state) in states.iter().enumerate() {
         if let Some(j) = state {
-            let _ = writeln!(src, "        let a{k}: f32 = s{j};");
+            let _ = writeln!(src, "        let a{k}: {state_ty} = s{j};");
         }
     }
     for (k, instr) in key.instrs.iter().enumerate() {

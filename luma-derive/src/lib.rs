@@ -7,7 +7,7 @@ use syn::{Data, DeriveInput, Fields, GenericArgument, PathArguments, Type, parse
 
 /// Derives `luma::Fields` for a struct of named fields, each of which implements `Fields`
 /// (`Array<T>`, arrays or tuples of records, nested records). All the fields must have the same element
-/// type `T` (`f32`, `Df32`, `f64`), which becomes `Fields::Elem` of the record; a mismatch is a type error.
+/// type `T` (`f32`, `Df32`, `f64`, `u32`), which becomes `Fields::Elem` of the record; a mismatch is a type error.
 ///
 /// The element type is read from the field types: the first `Array<T>` named in them (also inside
 /// arrays, tuples and references). A record whose fields are all other records has none to read:
@@ -19,7 +19,7 @@ use syn::{Data, DeriveInput, Fields, GenericArgument, PathArguments, Type, parse
 /// - The operators `+ - * /` between two records, a record and an element value (`f32` for `f32` records), and
 ///   a record and an `Array<Elem>` (the array applies to every field), in every reference/owned combination
 ///   and with the scalar or array on either side; `+= -= *= /=` with `&Record`, an element value and
-///   `&Array<Elem>`; and unary `-` on `&Record` and `Record`.
+///   `&Array<Elem>`; and unary `-` on `&Record` and `Record` (not for `u32` records).
 ///   Every operator borrows its operands and forwards to the hidden methods of `luma::Fields`.
 #[proc_macro_derive(Fields, attributes(fields))]
 pub fn derive_fields(input: TokenStream) -> TokenStream {
@@ -208,6 +208,10 @@ fn expand(input: &DeriveInput) -> Tokens {
         });
     }
 
+    // Unsigned arrays have no negation.
+    if elem.to_string() == "u32" {
+        return out;
+    }
     out.extend(quote! {
         impl ::core::ops::Neg for &#name {
             type Output = #name;

@@ -56,6 +56,8 @@ pub enum UnOp {
     Powf(f32),
     ToDf32,
     ToF32,
+    /// Bitwise complement (`u32` only).
+    Not,
 }
 
 /// Elementwise binary operations.
@@ -71,6 +73,20 @@ pub enum BinOp {
     Atan2,
     Hypot,
     Copysign,
+    /// `u32` only; shift and rotate amounts are taken modulo 32.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Rotl,
+}
+
+impl BinOp {
+    /// Whether the operation exists for `u32` only.
+    pub fn bitwise(self) -> bool {
+        matches!(self, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Rotl)
+    }
 }
 
 /// Comparisons.
@@ -234,6 +250,8 @@ pub fn apply_bin(ty: Ty, op: BinOp, a: f64, b: f64) -> f64 {
                 BinOp::Hypot => a.hypot(b),
                 BinOp::Copysign => a.copysign(b),
                 BinOp::Rem => unreachable!("rem of floats"),
+                op if op.bitwise() => unreachable!("bitwise {op:?} of floats"),
+                _ => unreachable!(),
             })
         }
         Ty::U32 => {
@@ -246,6 +264,12 @@ pub fn apply_bin(ty: Ty, op: BinOp, a: f64, b: f64) -> f64 {
                 BinOp::Rem => a.checked_rem(b).unwrap_or(0),
                 BinOp::Minimum => a.min(b),
                 BinOp::Maximum => a.max(b),
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                BinOp::Shl => a.wrapping_shl(b & 31),
+                BinOp::Shr => a.wrapping_shr(b & 31),
+                BinOp::Rotl => a.rotate_left(b & 31),
                 _ => unreachable!("math on integers"),
             })
         }
@@ -282,12 +306,13 @@ pub fn apply_un(ty: Ty, op: UnOp, a: f64) -> f64 {
                 UnOp::Tanh => x.tanh(),
                 UnOp::Clamp { lo, hi } => x.max(lo).min(hi),
                 UnOp::Powf(e) => x.powf(e),
-                UnOp::ToDf32 | UnOp::ToF32 => unreachable!(),
+                UnOp::ToDf32 | UnOp::ToF32 | UnOp::Not => unreachable!(),
             })
         }
         (Ty::Df32, UnOp::Neg) => -a,
         (Ty::Df32, UnOp::Abs) => a.abs(),
         (Ty::Df32, UnOp::Sqrt) => a.sqrt(),
+        (Ty::U32, UnOp::Not) => f64::from(!(a as u32)),
         (ty, op) => unreachable!("{op:?} on {ty:?}"),
     }
 }

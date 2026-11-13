@@ -21,6 +21,10 @@ All notable changes to Luma are listed here. The format follows
 - Writes: `assign` through a view (lazy, in place) and `put` (scatter); `LumaError::ReadOnly`.
 - Records: `Fields` trait and `#[derive(Fields)]` (crate `luma-derive`) for structs of arrays,
   with arithmetic, `dot`, views and `assign` in one kernel for all fields.
+- Bitwise operations on `u32` arrays, fused like the rest: `& | ^ !`, `<< >>` (and `+=`-style
+  assignments), `rotate_left`, `rotate_right`; amounts are taken modulo 32. `u32` states work in
+  `Fields` records and `iterate_all` (register loop). Example `keccak`: Keccak-f[1600], SHA3-256
+  and SHAKE128 over a batch of inputs in lazy array operations only.
 - Math: `tanh`, `sign`, `floor`, `ceil`, `atan2`, `hypot`, `copysign`; `%` on `u32`.
 - Precision: `Array<f64>` (devices with 64-bit shader floats) and `Df32` double-float (about 48
   bits, every device), casts between them, `sum_compensated` / `norm_compensated`.
@@ -47,7 +51,11 @@ All notable changes to Luma are listed here. The format follows
 
 - Fusion is decided by the cost model: an expression read at several indices is recomputed,
   staged in workgroup memory, or evaluated first (with its sibling fields), whichever is cheapest.
-  The fusion limit is 4096 operations; identical expressions are one node.
+  The fusion limit is 16384 operations (nesting 512 levels); identical expressions are one node.
+- Cuts count the operations that are still pending: after a cut, later operations no longer
+  inherit the size of what was evaluated (a 10,000-operation chain made hundreds of kernels).
+  An expression whose scalars outgrow one uniform buffer is cut (`SplitReason::Scalars`).
+- Shifts and rotations by a constant are compiled with the amount as a literal.
 - Region `assign` compiles to `if`/`else`, so ghost expressions cost only their own cells.
 - `iterate*` trace the step once and replay its kernels; `eval` loops are recognized and batched;
   readbacks in convergence loops can be answered from steps computed ahead.

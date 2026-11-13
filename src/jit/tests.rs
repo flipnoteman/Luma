@@ -3127,3 +3127,25 @@ fn a_reduction_requested_with_arrays_that_share_its_expression_waits_for_them() 
     let sum: f32 = (0..n).map(|i| r(i) * r(i)).sum();
     assert!((norm.item().unwrap() - sum).abs() <= 1e-3 * sum.abs(), "{} vs {sum}", norm.item().unwrap());
 }
+
+/// Scalars are the fields of one uniform buffer: an expression of more of them than it holds is
+/// cut, not rejected (`f64` scalars take three words each).
+#[test]
+fn an_expression_with_more_scalars_than_a_uniform_holds_is_cut() {
+    let ctx = ctx();
+    if !ctx.features().contains(wgpu::Features::SHADER_F64) {
+        return;
+    }
+    let words = usize::try_from(ctx.max_uniform_bytes() / 4).unwrap();
+    let terms = words / 3 + 200;
+    let x = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap().to_f64();
+    let mut sums: Vec<Array<f64>> = (0..terms).map(|k| &x * (k % 7) as f64 + 0.5).collect();
+    while sums.len() > 1 {
+        sums = sums.chunks(2).map(|pair| if pair.len() == 2 { &pair[0] + &pair[1] } else { pair[0].clone() }).collect();
+    }
+    let got = sums[0].to_vec().unwrap();
+    let k_sum: f64 = (0..terms).map(|k| (k % 7) as f64).sum();
+    for (g, v) in got.iter().zip([1.0f64, 2.0, 3.0]) {
+        assert!((g - (v * k_sum + 0.5 * terms as f64)).abs() < 1e-6 * k_sum * 3.0, "{g}");
+    }
+}

@@ -137,17 +137,27 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
                 }
                 BinOp::Min | BinOp::Max if same(a, b) => identity(op, a),
                 BinOp::Rem if u32s && is_value(sb, ty, 1.0) => constant(op, 0.0),
+                BinOp::BitXor | BinOp::BitOr if is_value(sb, ty, 0.0) => identity(op, a),
+                BinOp::BitXor | BinOp::BitOr if is_value(sa, ty, 0.0) => identity(op, b),
+                BinOp::BitXor if same(a, b) => constant(op, 0.0),
+                BinOp::BitOr | BinOp::BitAnd if same(a, b) => identity(op, a),
+                BinOp::BitAnd if is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0) => constant(op, 0.0),
+                BinOp::BitAnd if is_value(sb, ty, f64::from(u32::MAX)) => identity(op, a),
+                BinOp::BitAnd if is_value(sa, ty, f64::from(u32::MAX)) => identity(op, b),
+                // The amount is taken modulo 32: a multiple of 32 moves nothing.
+                BinOp::Shl | BinOp::Shr | BinOp::Rotl if sb.is_some_and(|s| s.ty == ty && s.bits & 31 == 0) => identity(op, a),
                 _ => None,
             }
         }
+        OpKind::Unary(UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0)) => identity(op, a),
         OpKind::Unary(un) => {
-            if !matches!(un, UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Sign) {
+            if !matches!(un, UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Sign | UnOp::BitNot) {
                 return None;
             }
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Unary(_)))?;
             let OpKind::Unary(inner_un) = iop.kind else { return None };
             match (un, inner_un) {
-                (UnOp::Neg, UnOp::Neg) => identity(op, &iargs[0]),
+                (UnOp::Neg, UnOp::Neg) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
                 (UnOp::Abs, UnOp::Abs | UnOp::Neg) => unary(UnOp::Abs, ty, &iargs[0]),
                 (UnOp::Floor, UnOp::Floor | UnOp::Ceil) | (UnOp::Ceil, UnOp::Ceil | UnOp::Floor) => {
                     unary(inner_un, ty, &iargs[0])
@@ -375,7 +385,7 @@ mod tests {
         assert_eq!(ctx.jit().last_program_len(), 2);
     }
 
-    #[allow(clippy::type_complexity, clippy::erasing_op, clippy::modulo_one)]
+    #[allow(clippy::type_complexity, clippy::erasing_op, clippy::modulo_one, clippy::eq_op)]
     #[test]
     fn simplify_exact_u32_rules() {
         let ctx = context(false);
@@ -387,6 +397,25 @@ mod tests {
             ("div one", false, |u| mask(&(u / 1u32))),
             ("mul zero", true, |u| mask(&(u * 0u32))),
             ("rem one", false, |u| mask(&(u % 1u32))),
+            ("xor zero", false, |u| mask(&(u ^ 0u32))),
+            ("zero xor", false, |u| mask(&(0u32 ^ u))),
+            ("or zero", false, |u| mask(&(u | 0u32))),
+            ("and all ones", false, |u| mask(&(u & u32::MAX))),
+            ("all ones and", false, |u| mask(&(u32::MAX & u))),
+            ("and zero", true, |u| mask(&(u & 0u32))),
+            ("shl zero", false, |u| mask(&(u << 0u32))),
+            ("shr 32", false, |u| mask(&(u >> 32u32))),
+            ("rotl 0", false, |u| mask(&u.rotate_left(0u32))),
+            ("rotl 64", false, |u| mask(&u.rotate_left(64u32))),
+            ("rotr 0", false, |u| mask(&u.rotate_right(0u32))),
+            ("xor self", true, |u| mask(&(u ^ u))),
+            ("and self", false, |u| mask(&(u & u))),
+            ("or self", false, |u| mask(&(u | u))),
+            ("not not", true, |u| mask(&!!u)),
+            // Not rules: the amounts and masks that change the value stay operations.
+            ("shl one", false, |u| mask(&(u << 1u32))),
+            ("rotl 33", false, |u| mask(&u.rotate_left(33u32))),
+            ("and mask", false, |u| mask(&(u & 0xFF00u32))),
         ];
         for (name, shorter, case) in cases {
             let mut results = Vec::new();

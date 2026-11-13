@@ -77,6 +77,13 @@ pub enum SplitReason {
         /// The threshold of the device's tuning (`LUMA_FUSION_MAX_LIVE` overrides it).
         limit: usize,
     },
+    /// The scalar operands of the expression would not fit the uniform buffer of one kernel.
+    Scalars {
+        /// 32-bit words the scalars would have taken.
+        words: usize,
+        /// Words a kernel's uniform buffer holds.
+        limit: usize,
+    },
     /// A kernel reading expressions through views would have computed more operations than the
     /// device's tuning allows once every expression is written out at each index it is read at.
     Inlined {
@@ -113,6 +120,7 @@ impl fmt::Display for FusionSplit {
             SplitReason::Depth { limit } => write!(f, "depth > {limit}"),
             SplitReason::Inputs { inputs, limit } => write!(f, "{inputs} input buffers > {limit}"),
             SplitReason::Live { live, limit } => write!(f, "{live} live values > {limit}"),
+            SplitReason::Scalars { words, limit } => write!(f, "{words} scalar words > {limit}"),
             SplitReason::Inlined { instructions, limit } => write!(f, "{instructions} inlined operations > {limit}"),
             SplitReason::Materialised { instances } => write!(f, "{instances} recomputations of an expression cost more than storing it"),
         }

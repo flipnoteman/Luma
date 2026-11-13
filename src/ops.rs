@@ -3,7 +3,8 @@
 //! with the caller's location, or into `Err` for the `try_*` methods.
 
 use std::ops::{
-    Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Rem, RemAssign, Sub, SubAssign,
+    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div, DivAssign, Mul, MulAssign,
+    Neg, Not, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
 };
 use std::panic::Location;
 use std::sync::Arc;
@@ -283,6 +284,16 @@ impl<T: ScalarType> Array<T> {
         name: &'static str,
         location: &'static Location<'static>,
     ) -> Array<T> {
+        // A shift or rotation by a constant is an operation of its own: its amount is in the kernel.
+        if let Rhs::Scalar(value) = &rhs
+            && !scalar_left
+            && let Ok(scalar) = Scalar::of(*value)
+            && scalar.ty == ElemTy::U32
+            && let Some(by) = UnOp::by_constant(op, scalar.bits as u32)
+        {
+            let result = self.run_unary(by, location);
+            return Array::resolve(self.context(), self.shape(), result, name, location);
+        }
         if let Rhs::Scalar(value) = &rhs
             && let Ok(scalar) = Scalar::of(*value)
             && let Some(fused) = self.fuse_step::<T>(EpilogueStep::Binary { op, scalar_left }, scalar.words()[0])
@@ -983,6 +994,122 @@ impl_binary_operator!(u32, Rem, rem, BinOp::Rem, "rem");
 impl_binary_scalar!(u32, Rem, rem, BinOp::Rem, "rem");
 impl_assign_operator!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 impl_assign_scalar!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
+
+// -- Bitwise operations on u32 arrays --
+
+macro_rules! impl_bitwise_operator {
+    ($Trait:ident, $method:ident, $AssignTrait:ident, $assign_method:ident, $op:expr, $name:literal, $assign_name:literal) => {
+        impl_binary_operator!(u32, $Trait, $method, $op, $name);
+        impl_binary_scalar!(u32, $Trait, $method, $op, $name);
+        impl_assign_operator!(u32, $AssignTrait, $assign_method, $op, $assign_name);
+        impl_assign_scalar!(u32, $AssignTrait, $assign_method, $op, $assign_name);
+    };
+}
+
+impl_bitwise_operator!(BitAnd, bitand, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand", "bitand_assign");
+impl_bitwise_operator!(BitOr, bitor, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor", "bitor_assign");
+impl_bitwise_operator!(BitXor, bitxor, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor", "bitxor_assign");
+impl_bitwise_operator!(Shl, shl, ShlAssign, shl_assign, BinOp::Shl, "shl", "shl_assign");
+impl_bitwise_operator!(Shr, shr, ShrAssign, shr_assign, BinOp::Shr, "shr", "shr_assign");
+
+impl Not for &Array<u32> {
+    type Output = Array<u32>;
+
+    /// Elementwise bitwise complement.
+    ///
+    /// ```
+    /// # use luma::*;
+    /// let x = Array::from_slice(&[0u32, 1, 0xFFFF_FFFF], 3)?;
+    /// assert_eq!((!&x).to_vec()?, [0xFFFF_FFFF, 0xFFFF_FFFE, 0]);
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    #[track_caller]
+    fn not(self) -> Array<u32> {
+        let location = Location::caller();
+        let result = self.run_unary(UnOp::BitNot, location);
+        Array::resolve(self.context(), self.shape(), result, "not", location)
+    }
+}
+
+impl Not for Array<u32> {
+    type Output = Array<u32>;
+
+    #[track_caller]
+    fn not(self) -> Array<u32> {
+        !&self
+    }
+}
+
+impl Array<u32> {
+    /// Elementwise `self << amount`, with an array of the same shape or a single `u32` as the
+    /// amount; the amount is taken modulo 32 (so a shift by 32 is no shift) and bits shifted
+    /// out are lost. The operator `&x << n` is the same.
+    ///
+    /// ```
+    /// # use luma::*;
+    /// let x = Array::from_slice(&[1u32, 0x8000_0001, 3], 3)?;
+    /// assert_eq!(x.shl(4u32).to_vec()?, [16, 16, 48]);
+    /// assert_eq!(x.shl(33u32).to_vec()?, [2, 2, 6]);
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    #[track_caller]
+    pub fn shl(&self, amount: impl Operand<u32>) -> Array<u32> {
+        self.binary(amount.rhs(), BinOp::Shl, false, "shl")
+    }
+
+    /// Elementwise logical `self >> amount` (zeros come in from the left), with an array of the
+    /// same shape or a single `u32` as the amount; the amount is taken modulo 32. The operator
+    /// `&x >> n` is the same.
+    ///
+    /// ```
+    /// # use luma::*;
+    /// let x = Array::from_slice(&[0x8000_0000u32, 0xF0, 3], 3)?;
+    /// assert_eq!(x.shr(4u32).to_vec()?, [0x0800_0000, 0xF, 0]);
+    /// assert_eq!(x.shr(32u32).to_vec()?, x.to_vec()?);
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    #[track_caller]
+    pub fn shr(&self, amount: impl Operand<u32>) -> Array<u32> {
+        self.binary(amount.rhs(), BinOp::Shr, false, "shr")
+    }
+
+    /// Elementwise rotation of the 32 bits to the left by `amount` (an array of the same shape
+    /// or a single `u32`), taken modulo 32.
+    ///
+    /// ```
+    /// # use luma::*;
+    /// let x = Array::from_slice(&[0x8000_0001u32, 0x1234_5678], 2)?;
+    /// assert_eq!(x.rotate_left(4u32).to_vec()?, [0x0000_0018, 0x2345_6781]);
+    /// assert_eq!(x.rotate_left(32u32).to_vec()?, x.to_vec()?);
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    #[track_caller]
+    pub fn rotate_left(&self, amount: impl Operand<u32>) -> Array<u32> {
+        self.binary(amount.rhs(), BinOp::Rotl, false, "rotate_left")
+    }
+
+    /// Elementwise rotation of the 32 bits to the right by `amount` (an array of the same shape
+    /// or a single `u32`), taken modulo 32: `rotate_left(32 - amount)`.
+    ///
+    /// ```
+    /// # use luma::*;
+    /// let x = Array::from_slice(&[0x8000_0001u32, 0x1234_5678], 2)?;
+    /// assert_eq!(x.rotate_right(4u32).to_vec()?, [0x1800_0000, 0x8123_4567]);
+    /// assert_eq!(x.rotate_right(0u32).to_vec()?, x.to_vec()?);
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    #[track_caller]
+    pub fn rotate_right(&self, amount: impl Operand<u32>) -> Array<u32> {
+        let location = Location::caller();
+        match amount.rhs() {
+            Rhs::Scalar(n) => self.binary_at(Rhs::Scalar(32u32.wrapping_sub(n)), BinOp::Rotl, false, "rotate_right", location),
+            Rhs::Array(n) => {
+                let complement = n.binary_at(Rhs::Scalar(32), BinOp::Sub, true, "rotate_right", location);
+                self.binary_at(Rhs::Array(&complement), BinOp::Rotl, false, "rotate_right", location)
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
