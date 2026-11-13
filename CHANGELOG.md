@@ -75,6 +75,16 @@ All notable changes to Luma are listed here. The format follows
 - Differential fuzzer against a CPU oracle, invariant validation in debug builds, CI on lavapipe
   with a nightly fuzz job.
 
+### Known limitations
+
+- NVIDIA Linux driver 615.x can still crash or hang in its own shader-compiler thread at
+  process exit; luma's exit wait and `_exit` fallback make it rare, not impossible.
+- On NVIDIA, creating a device (`Context::new`) blocks submissions of other devices in the
+  process until their in-flight GPU work finishes (once per device creation).
+- RADV integrated GPUs give wrong results for kernels that use workgroup memory (scans,
+  staging, cyclic tridiagonal solves); the cyclic solver is only chosen automatically on NVIDIA.
+- `solve_tridiagonal` / `solve_block_tridiagonal` take `f32` arrays only.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

@@ -54,7 +54,7 @@ Add Luma to a project:
 
 ```toml
 [dependencies]
-luma = "0.2"
+luma = "0.3"
 ```
 
 Or build it from source:
