@@ -84,7 +84,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 | Variable | Effect |
 | --- | --- |
 | `LUMA_DEVICE` | `gpu` or `cpu`: restrict the device kind (default: GPU, CPU as fallback) |
-| `LUMA_MEMORY_BUDGET` | Bytes of array data kept on the device before spilling to host memory |
+| `LUMA_MEMORY_BUDGET` | Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it) |
 | `LUMA_CHUNK_BYTES` | Largest buffer an array is split into, in bytes (power of two) |
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
