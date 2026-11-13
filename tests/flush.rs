@@ -1,7 +1,9 @@
 //! `Context::flush` hands the batch to the GPU without waiting for it.
 //!
-//! This test measures wall-clock time, so it lives in a binary of its own: other tests sharing
-//! the GPU at the same time can stall submissions for milliseconds.
+//! This test measures wall-clock time, so it must be the only test in its binary: on NVIDIA,
+//! creating a device (`Context::new` in a test running in parallel) blocks `vkQueueSubmit` on
+//! every other device of the process until the GPU work in flight finishes, which made this
+//! flush take as long as the kernel it submits. Do not add tests to this file.
 
 use luma::*;
 
@@ -54,13 +56,4 @@ fn flush_returns_while_the_gpu_is_still_running() {
         flush_time * 4 < sync_time,
         "flush took {flush_time:?}, the sync after it {sync_time:?}"
     );
-}
-
-#[test]
-fn flush_evaluates_live_lazy_arrays() {
-    let ctx = Context::new().unwrap();
-    let x = Array::<f32>::full_on(&ctx, 64, 3.0).unwrap();
-    let y = &x * 2.0 + 1.0; // lazy: nothing recorded yet
-    ctx.flush().unwrap();
-    assert_eq!(y.to_vec().unwrap(), vec![7.0; 64]);
 }

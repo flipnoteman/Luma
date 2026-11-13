@@ -432,3 +432,12 @@ fn dropping_a_context_with_unsubmitted_launches_is_clean() {
     let ctx = Context::new().unwrap();
     assert_eq!(Array::<u32>::full_on(&ctx, 4, 9).unwrap().to_vec().unwrap(), vec![9; 4]);
 }
+
+#[test]
+fn flush_evaluates_live_lazy_arrays() {
+    let ctx = Context::new().unwrap();
+    let x = Array::<f32>::full_on(&ctx, 64, 3.0).unwrap();
+    let y = &x * 2.0 + 1.0; // lazy: nothing recorded yet
+    ctx.flush().unwrap();
+    assert_eq!(y.to_vec().unwrap(), vec![7.0; 64]);
+}
