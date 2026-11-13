@@ -100,6 +100,14 @@ pub enum CmpOp {
     NotEqual,
 }
 
+/// What `is_finite`, `is_nan` and `is_inf` test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    Finite,
+    Nan,
+    Inf,
+}
+
 /// Reductions (over everything, or along an axis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RedOp {
@@ -547,6 +555,49 @@ impl HostArray {
         let data = self.data();
         let out = idx.data().into_iter().map(|i| data[(i as usize).min(data.len() - 1)]).collect();
         HostArray::new(idx.dims, self.ty, out)
+    }
+
+    /// The parts joined along a new axis inserted at `axis` (`dims[3]` of every part is 1).
+    pub fn stack(axis: usize, parts: &[&HostArray]) -> Res<HostArray> {
+        let first = parts[0];
+        if axis >= 4 || first.dims[3] != 1 {
+            return Err(ErrKind::InvalidShape);
+        }
+        if parts[1..].iter().any(|part| part.dims != first.dims) {
+            return Err(ErrKind::ShapeMismatch);
+        }
+        let mut dims = first.dims;
+        dims.copy_within(axis..3, axis + 1);
+        dims[axis] = parts.len();
+        let mut data = vec![0.0; len_of(dims)];
+        for (k, part) in parts.iter().enumerate() {
+            for (i, v) in part.data().into_iter().enumerate() {
+                let mut c = [0; 4];
+                let from = coords(i, part.dims);
+                c[..axis].copy_from_slice(&from[..axis]);
+                c[axis] = k;
+                c[axis + 1..].copy_from_slice(&from[axis..3]);
+                data[flat(c, dims)] = v;
+            }
+        }
+        Ok(HostArray::new(dims, first.ty, data))
+    }
+
+    /// The same data (shared, like `cache`) with other dimensions of as many elements, and no
+    /// view of another array.
+    pub fn reshaped(&self, dims: Dims) -> HostArray {
+        assert_eq!(len_of(dims), self.len());
+        HostArray { dims, view: None, ..self.clone() }
+    }
+
+    /// `1` where the element is of class `class`, else `0`, as `u32`.
+    pub fn classify(&self, class: Class) -> HostArray {
+        let data = self.data().into_iter().map(|v| f64::from(u32::from(match class {
+            Class::Finite => v.is_finite(),
+            Class::Nan => v.is_nan(),
+            Class::Inf => v.is_infinite(),
+        }))).collect();
+        HostArray::new(self.dims, Ty::U32, data)
     }
 
     pub fn concat(axis: usize, parts: &[&HostArray]) -> Res<HostArray> {

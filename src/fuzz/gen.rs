@@ -23,7 +23,7 @@
 use luma::PadMode;
 use proptest::prelude::*;
 
-use super::oracle::{BinOp, CmpOp, Dims, RedOp, ScanOp, Ty, UnOp};
+use super::oracle::{BinOp, Class, CmpOp, Dims, RedOp, ScanOp, Ty, UnOp};
 
 /// An operand: a variable or a constant (a scalar of the statement's element type).
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +45,8 @@ pub enum ViewOp {
     ShiftMirror { offs: Vec<isize> },
     Take { idx: usize },
     Concat { axis: usize, others: Vec<usize> },
+    /// The array and `others` (of its shape) along a new axis at `axis`.
+    Stack { axis: usize, others: Vec<usize> },
 }
 
 /// The views a write goes through: they keep every element distinct.
@@ -89,6 +91,10 @@ pub enum Stmt {
     Compound { target: usize, op: BinOp, rhs: Opd },
     Write { target: usize, seed: u64 },
     Cache { src: usize },
+    /// The same data with other dimensions.
+    Reshape { src: usize, dims: Dims },
+    /// `is_finite`, `is_nan` or `is_inf` of a float array.
+    Classify { src: usize, class: Class },
     EvalVars { vars: Vec<usize> },
     Alias { src: usize },
     Release { var: usize },
@@ -812,6 +818,26 @@ impl Scope {
                         }
                         e.new.push(Scope::fresh(v.ty, dims, finish(v.ty, math, joined)?));
                     }
+                    ViewOp::Stack { axis, others } => {
+                        if *axis >= 4 || v.dims[3] != 1 {
+                            return None;
+                        }
+                        let mut joined = info;
+                        for o in others {
+                            let p = self.var(*o)?;
+                            if p.ty != v.ty || p.dims != v.dims {
+                                return None;
+                            }
+                            joined = Info::join(joined, self.info(p));
+                        }
+                        let mut dims = v.dims;
+                        dims.copy_within(*axis..3, *axis + 1);
+                        dims[*axis] = others.len() + 1;
+                        if len_of(dims) > 4096 {
+                            return None;
+                        }
+                        e.new.push(Scope::fresh(v.ty, dims, finish(v.ty, math, joined)?));
+                    }
                 }
             }
             Stmt::Reduce { src, op } => {
@@ -943,6 +969,21 @@ impl Scope {
             Stmt::Alias { src } => {
                 let v = self.var(*src)?;
                 e.new.push(New { ty: v.ty, dims: v.dims, cell: CellRef::Shared(v.cell), root: v.root });
+            }
+            Stmt::Reshape { src, dims } => {
+                let v = self.var(*src)?;
+                if len_of(*dims) != len_of(v.dims) {
+                    return None;
+                }
+                e.new.push(New { ty: v.ty, dims: *dims, cell: CellRef::Shared(v.cell), root: None });
+            }
+            Stmt::Classify { src, class: _ } => {
+                let v = self.var(*src)?;
+                // Values rounded differently by the GPU and the oracle could be infinite on one side.
+                if v.ty == Ty::U32 || !self.info(v).exact {
+                    return None;
+                }
+                e.new.push(Scope::fresh(Ty::U32, v.dims, Info::int()));
             }
             Stmt::EvalVars { vars } => {
                 for v in vars {
@@ -1106,7 +1147,11 @@ impl Builder {
             86..=87 => self.g_put(),
             88..=90 => self.g_compound(),
             91 if ctx != Ctx::Traced => self.g_write(),
-            92 => self.g_cache(),
+            92 => match self.tape.below(3) {
+                0 => self.g_cache(),
+                1 => self.g_reshape(),
+                _ => self.g_classify(),
+            },
             93..=94 if host => self.g_eval(),
             95 => self.g_alias(),
             96 if loops => self.g_release(),
@@ -1271,7 +1316,7 @@ impl Builder {
         let src = self.pick(|_| true)?;
         let v = self.scope.var(src)?.clone();
         let nd = Self::ndim(v.dims);
-        let view = match self.tape.below(14) {
+        let view = match self.tape.below(15) {
             0..=2 => {
                 let axis = self.tape.below(nd);
                 let n = v.dims[axis];
@@ -1296,6 +1341,16 @@ impl Builder {
             9 => ViewOp::ShiftClamp { offs: self.offsets(v.dims, nd) },
             10 => ViewOp::ShiftMirror { offs: self.offsets(v.dims, nd) },
             11 | 12 => ViewOp::Take { idx: self.pick_ty(Ty::U32)? },
+            14 => {
+                let axis = self.tape.below(4);
+                let dims = v.dims;
+                let count = 1 + self.tape.below(5);
+                let others: Vec<usize> = (0..count).filter_map(|_| self.pick(|p| p.ty == v.ty && p.dims == dims)).collect();
+                if others.is_empty() {
+                    return None;
+                }
+                ViewOp::Stack { axis, others }
+            }
             _ => {
                 let axis = self.tape.below(nd);
                 let dims = v.dims;
@@ -1453,6 +1508,30 @@ impl Builder {
             }
         }
         Some(Stmt::EvalVars { vars })
+    }
+
+    /// A reshape to the flat shape, or to a split of the first extent, or merging the first two.
+    fn g_reshape(&mut self) -> Option<Stmt> {
+        let src = self.pick(|_| true)?;
+        let d = self.scope.var(src)?.dims;
+        let n = len_of(d);
+        let dims = match self.tape.below(3) {
+            0 => [n, 1, 1, 1],
+            1 => {
+                let factors: Vec<usize> = (1..=n).filter(|f| n.is_multiple_of(*f)).collect();
+                let f = self.tape.pick(&factors);
+                [f, n / f, 1, 1]
+            }
+            _ => [d[0] * d[1], d[2], d[3], 1],
+        };
+        Some(Stmt::Reshape { src, dims })
+    }
+
+    fn g_classify(&mut self) -> Option<Stmt> {
+        let ty = if self.tape.below(2) == 0 { Ty::F32 } else { Ty::Df32 };
+        let src = self.pick_ty(ty)?;
+        let class = self.tape.pick(&[Class::Finite, Class::Nan, Class::Inf]);
+        Some(Stmt::Classify { src, class })
     }
 
     fn g_alias(&mut self) -> Option<Stmt> {
@@ -1689,6 +1768,7 @@ impl Stmt {
                 let view = match view {
                     ViewOp::Take { idx } => ViewOp::Take { idx: f(*idx)? },
                     ViewOp::Concat { axis, others } => ViewOp::Concat { axis: *axis, others: all(others)? },
+                    ViewOp::Stack { axis, others } => ViewOp::Stack { axis: *axis, others: all(others)? },
                     other => other.clone(),
                 };
                 Stmt::View { src: f(*src)?, view }
@@ -1704,6 +1784,8 @@ impl Stmt {
             Stmt::Cache { src } => Stmt::Cache { src: f(*src)? },
             Stmt::EvalVars { vars } => Stmt::EvalVars { vars: all(vars)? },
             Stmt::Alias { src } => Stmt::Alias { src: f(*src)? },
+            Stmt::Reshape { src, dims } => Stmt::Reshape { src: f(*src)?, dims: *dims },
+            Stmt::Classify { src, class } => Stmt::Classify { src: f(*src)?, class: *class },
             Stmt::Release { var } => Stmt::Release { var: f(*var)? },
             Stmt::Fetch { var } => Stmt::Fetch { var: f(*var)? },
             Stmt::Loop { kind, steps, states, body, next } => Stmt::Loop {

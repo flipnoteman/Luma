@@ -8,7 +8,7 @@
 #![allow(unused_imports)]
 
 use super::generator::{CostChoice::*, Config, InjView, InjView::*, LoopKind::*, Opd::*, Program, Stmt::*, ViewOp::*};
-use super::oracle::{BinOp::*, CmpOp::*, RedOp::*, ScanOp::*, Ty::*, UnOp::*};
+use super::oracle::{BinOp::*, Class::*, CmpOp::*, RedOp::*, ScanOp::*, Ty::*, UnOp::*};
 use super::run;
 use crate::PadMode::{Edge, Mirror, Wrap, Zero};
 
@@ -574,6 +574,38 @@ fn a_step_on_a_reduction_does_not_read_the_buffer_the_reduction_is_later_written
             Reduce { src: 0, op: Sum },
             Unary { src: 1, op: Abs },
             Compound { target: 1, op: Sub, rhs: Var(1) },
+        ],
+    });
+}
+
+/// A stack of generated values (`Range`): the kernel that writes the stacked layout through
+/// workgroup memory must define the global index the generators read, like the plain one.
+#[test]
+fn stack_of_a_generated_range_defines_the_global_index() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [9, 6, 1, 1], ty: F32, seed: 0 },
+            Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
+            Select { mask: 1, a: Var(1), b: Const(2.0), ty: U32 },
+            View { src: 2, view: Stack { axis: 0, others: vec![1] } },
+        ],
+    });
+}
+
+/// A register loop (`iterate_all`) whose step tests the class of a value: the loop kernel
+/// defines the guard library the test reads its bits through.
+#[test]
+fn iterate_all_with_a_class_test_defines_the_guard_library() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Compare { lhs: 0, rhs: Const(1.0), op: Le },
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 1 },
+            Loop { kind: IterateAll, steps: 11, states: vec![1], body: vec![Classify { src: 2, class: Finite }], next: vec![3] },
         ],
     });
 }

@@ -35,6 +35,12 @@ All notable changes to Luma are listed here. The format follows
   cyclic-reduction solver on NVIDIA (`LUMA_TRIDIAGONAL=thomas|cyclic`), 3-22x faster.
 - `item`, `to_array`, `sum_where`, `luma::Scalar` (uniform that changes without recompiling),
   `Array: Clone`, `cache()`, `fusion_limit`.
+- `stack` / `stack_slice`: equal-shaped arrays joined along a new axis in one kernel that computes
+  one element of every part and writes the stacked layout (16 lazy expressions of 144x70 into
+  `[16, 144, 70]`: one launch, the host cost of 16 views, 15 selects and a coordinate array gone).
+- `is_finite`, `is_nan`, `is_inf` on `f32`, `f64` and `Df32` arrays (lazy `u32` masks, tested on
+  the bits of the exponent through the guard the double-float library uses, so a device's
+  fast math cannot fold the test of a computed value).
 - Cost model: `CostModel` / `Context::cost_model`, calibrated per device
   (`ContextOptions::calibrate`, `LUMA_CALIBRATE`).
 - Simplification of operations as they are built; value-changing rewrites and a cheaper `Df32`
@@ -55,6 +61,9 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- `reshape` of a lazy view (slice, flip, transpose, pad, shift) stays lazy, a handle on the
+  pending view as a clone is: `x.slice(0, k..k + 1).reshape([ni, nj])` reads `x` inside the kernel
+  that uses it instead of evaluating the slice. Other lazy arrays are still evaluated by it.
 - Fusion is decided by the cost model: an expression read at several indices is recomputed,
   staged in workgroup memory, or evaluated first (with its sibling fields), whichever is cheapest.
   The fusion limit is 16384 operations (nesting 512 levels); identical expressions are one node.

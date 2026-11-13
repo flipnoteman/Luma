@@ -33,11 +33,11 @@ use proptest::test_runner::{FileFailurePersistence, RngSeed};
 use crate::builtin::BinOp as LBin;
 use crate::ops::{Operand, Rhs};
 use crate::{
-    concat, eval_all, iterate_all, iterate_until_all, select, Array, Context, ContextOptions, CostModel, Df32, LumaError, ScalarType, Shape,
+    concat, eval_all, stack, stack_slice, iterate_all, iterate_until_all, select, Array, Context, ContextOptions, CostModel, Df32, LumaError, ScalarType, Shape,
     Until,
 };
 use generator::{CostChoice, Config, InjView, LoopKind, Opd, Program, Stmt, ViewOp};
-use oracle::{BinOp, CmpOp, Dims, Edge, ErrKind, HostArray, RedOp, Rhs as HRhs, ScanOp, Ty, UnOp};
+use oracle::{BinOp, Class, CmpOp, Dims, Edge, ErrKind, HostArray, RedOp, Rhs as HRhs, ScanOp, Ty, UnOp};
 
 /// Programs that ended early because luma reported a documented limit.
 static ENDED_EARLY: AtomicUsize = AtomicUsize::new(0);
@@ -346,6 +346,15 @@ fn view<T: Num>(env: &Env, a: &Array<T>, view: &ViewOp) -> Array<T> {
             [b, c, d, e, f] => concat(*axis, [a, get::<T>(env, b), get::<T>(env, c), get::<T>(env, d), get::<T>(env, e), get::<T>(env, f)]),
             _ => panic!("concat of {} parts", others.len() + 1),
         },
+        ViewOp::Stack { axis, others } => match others[..] {
+            [b] => stack(*axis, [a, get::<T>(env, b)]),
+            [b, c] => stack(*axis, [a, get::<T>(env, b), get::<T>(env, c)]),
+            // The slice form, for the longer ones.
+            _ => {
+                let parts: Vec<Array<T>> = std::iter::once(a).chain(others.iter().map(|&o| get::<T>(env, o))).cloned().collect();
+                stack_slice(*axis, &parts)
+            }
+        },
     }
 }
 
@@ -479,6 +488,22 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
             let out = env[*src].clone().expect("live");
             push(env, out)
         }
+        Stmt::Reshape { src, dims } => by_ty!(ty_of(env, *src), T => {
+            let out = get::<T>(env, *src).reshape(Shape::new(*dims));
+            push(env, T::wrap(out))
+        }),
+        Stmt::Classify { src, class } => {
+            let out = match (env[*src].as_ref().expect("live"), class) {
+                (Arr::F(x), Class::Finite) => x.is_finite(),
+                (Arr::F(x), Class::Nan) => x.is_nan(),
+                (Arr::F(x), Class::Inf) => x.is_inf(),
+                (Arr::D(x), Class::Finite) => x.is_finite(),
+                (Arr::D(x), Class::Nan) => x.is_nan(),
+                (Arr::D(x), Class::Inf) => x.is_inf(),
+                (Arr::U(_), _) => unreachable!("classes of integers are not generated"),
+            };
+            push(env, Arr::U(out))
+        }
         Stmt::EvalVars { vars } => {
             eval_group::<f32>(env, vars)?;
             eval_group::<u32>(env, vars)?;
@@ -608,6 +633,11 @@ fn host_view(env: &HostEnv, a: &HostArray, view: &ViewOp) -> Result<HostArray, E
             parts.extend(others.iter().map(|&o| host_get(env, o)));
             HostArray::concat(*axis, &parts)?
         }
+        ViewOp::Stack { axis, others } => {
+            let mut parts = vec![a];
+            parts.extend(others.iter().map(|&o| host_get(env, o)));
+            HostArray::stack(*axis, &parts)?
+        }
     })
 }
 
@@ -677,6 +707,8 @@ fn host_stmt(env: &mut HostEnv, stmt: &Stmt, math: bool) -> Result<(), ErrKind> 
         }
         Stmt::Cache { src } => Some(host_get(env, *src).cached()),
         Stmt::Alias { src } => Some(host_get(env, *src).clone()),
+        Stmt::Reshape { src, dims } => Some(host_get(env, *src).reshaped(*dims)),
+        Stmt::Classify { src, class } => Some(host_get(env, *src).classify(*class)),
         Stmt::EvalVars { .. } | Stmt::Fetch { .. } => None,
         Stmt::Release { var } => {
             env[*var] = None;
@@ -1322,7 +1354,7 @@ fn generator_covers_the_statements() {
         "Input", "Full", "Range", "Linspace", "Unary", "Binary", "Compare", "Select", "View", "Reduce", "SumWhere", "Scan", "AxisReduce",
         "Assign", "Put", "Compound", "Write", "Cache", "EvalVars", "Alias", "Release", "Fetch", "Loop/PerStepEval", "Loop/IterateAll",
         "Loop/IterateUntilAll", "View/Slice", "View/Pad", "View/Flip", "View/Transpose", "View/ShiftCirc", "View/ShiftFill",
-        "View/ShiftClamp", "View/ShiftMirror", "View/Take", "View/Concat", "Bitwise", "Not",
+        "View/ShiftClamp", "View/ShiftMirror", "View/Take", "View/Concat", "View/Stack", "Reshape", "Classify", "Bitwise", "Not",
     ] {
         assert!(counts.get(kind).copied().unwrap_or(0) >= 5, "{kind} is rare: {counts:?}");
     }

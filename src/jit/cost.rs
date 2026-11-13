@@ -91,6 +91,7 @@ pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
             CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge | CmpOp::Eq | CmpOp::Ne => 1.0,
         },
         OpKind::Select => 1.0,
+        OpKind::Classify(_) => 2.0,
         OpKind::Clamp => 2.0,
         OpKind::Cast(to) => {
             if to == ElemTy::Df32 || op.ty == ElemTy::Df32 {

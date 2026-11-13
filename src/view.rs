@@ -705,10 +705,11 @@ pub(crate) fn finish(result: Outcome<()>, op: &'static str, location: &'static L
 /// for `axis >= 4`). Lazy: every part is read through a view and the pieces are selected by the
 /// coordinate along `axis`, so the result fuses into the expression using it. The parts may be
 /// lazy expressions too (ghost cells computed from the state, say): they are not evaluated
-/// first but computed inside the kernel that reads the join, which evaluates every part at
-/// every cell and keeps the one the coordinate selects. Only an expression too large to unfold
+/// first but computed inside the kernel that reads the join, which evaluates only the part the
+/// coordinate selects at every cell. Only an expression too large to unfold
 /// there (more than `LUMA_FUSION_MAX_INLINED` instructions in all) is evaluated into a buffer
-/// first; [`Array::cache`] makes that choice explicit.
+/// first; [`Array::cache`] makes that choice explicit. To join many expressions into an array
+/// that is read as a whole (the entries of a block matrix), [`stack`] writes them in one kernel.
 #[track_caller]
 pub fn concat<T: ScalarType, const N: usize>(axis: usize, parts: [&Array<T>; N]) -> Array<T> {
     const { assert!(N >= 1) };
@@ -757,11 +758,124 @@ fn run_concat<T: ScalarType>(
         offsets.push(offset);
         offset += part.shape().dims()[axis];
     }
+    select_parts(shape, axis, &views, &offsets, location)
+}
+
+/// The array of `shape` whose element is that of `views[j]`, `j` being the last part that starts
+/// at or below its coordinate along `axis` (`offsets[j]` is where part `j` starts): a chain of
+/// selects on the coordinate.
+fn select_parts<T: ScalarType>(
+    shape: Shape,
+    axis: usize,
+    views: &[Array<T>],
+    offsets: &[usize],
+    location: &'static Location<'static>,
+) -> Outcome<Array<T>> {
+    let ctx = views[0].context();
     let coord = Array::<u32>::range_on(ctx, shape, axis)?;
-    let mut acc = views.pop().ok_or_else(|| LumaError::InvalidShape("concat of no arrays".into()))?;
-    for j in (0..views.len()).rev() {
+    let mut acc = views.last().ok_or_else(|| LumaError::InvalidShape("join of no arrays".into()))?.clone();
+    for j in (0..views.len() - 1).rev() {
         let below = coord.lt(offsets[j + 1] as u32);
         acc = run_select(&below, Rhs::Array(&views[j]), Rhs::Array(&acc), location)?;
     }
     Ok(acc)
+}
+
+/// Joins equal-shaped `parts` along a new axis inserted at position `axis` (0 varies fastest):
+/// element `k` of the result along `axis` is `parts[k]`, so stacking `[ni, nj]` arrays along
+/// axis 0 gives a `[parts, ni, nj]` array (and `[ni, nj, parts]` along axis 2). The parts must
+/// share a context and a shape whose last extent is 1 (the new axis takes its place), and
+/// `axis <= 3`; otherwise the result is poisoned ([`LumaError::ShapeMismatch`],
+/// [`LumaError::ContextMismatch`], [`LumaError::InvalidShape`]).
+///
+/// The parts may be lazy expressions: they are fused into one kernel that computes one element
+/// of every part and writes them side by side in the stacked layout, so every output element is
+/// computed once and the cost is close to writing the result. The result is an evaluated array
+/// (the kernel is recorded when `stack` is called, as for [`Array::cache`]); a result too large
+/// for one buffer, or parts that read arrays split over several buffers, are joined lazily
+/// instead, like [`concat()`] does.
+#[track_caller]
+pub fn stack<T: ScalarType, const N: usize>(axis: usize, parts: [&Array<T>; N]) -> Array<T> {
+    const { assert!(N >= 1) };
+    let location = Location::caller();
+    stack_of(axis, &parts, location)
+}
+
+/// [`stack`] of the arrays of a slice. An empty slice gives a poisoned array
+/// ([`LumaError::InvalidShape`]) on the [`default_context`](crate::default_context).
+#[track_caller]
+pub fn stack_slice<T: ScalarType>(axis: usize, parts: &[Array<T>]) -> Array<T> {
+    let location = Location::caller();
+    let refs: Vec<&Array<T>> = parts.iter().collect();
+    stack_of(axis, &refs, location)
+}
+
+fn stack_of<T: ScalarType>(axis: usize, parts: &[&Array<T>], location: &'static Location<'static>) -> Array<T> {
+    let Some(&first) = parts.first() else {
+        let error = LumaError::InvalidShape("stack of no arrays".into());
+        let error = LumaError::Op { op: "stack", location, source: Arc::new(error) };
+        let ctx = crate::default_context().unwrap_or_else(|e| panic!("stack of no arrays: no default context: {e}"));
+        return Array::poisoned(&ctx, Shape::new([1; 4]), Arc::new(error));
+    };
+    let mut dims = first.shape().dims();
+    let at = axis.min(3);
+    dims.copy_within(at..3, at + 1);
+    dims[at] = parts.len();
+    let result = run_stack(axis, parts, location);
+    Array::resolve(first.context(), Shape::new(dims), result, "stack", location)
+}
+
+fn run_stack<T: ScalarType>(
+    axis: usize,
+    parts: &[&Array<T>],
+    location: &'static Location<'static>,
+) -> Outcome<Array<T>> {
+    let first = parts[0];
+    let ctx = first.context();
+    let mut srcs = Vec::with_capacity(parts.len());
+    for part in parts {
+        srcs.push(part.src()?);
+        if !ctx.same_as(part.context()) {
+            return Err(LumaError::ContextMismatch.into());
+        }
+    }
+    let dims = first.shape().dims();
+    if axis >= 4 || dims[3] != 1 {
+        return Err(LumaError::InvalidShape(format!("stack along axis {axis} of shape {}", first.shape())).into());
+    }
+    for part in &parts[1..] {
+        if part.shape() != first.shape() {
+            return Err(LumaError::ShapeMismatch { lhs: dims, rhs: part.shape().dims() }.into());
+        }
+    }
+    let mut out_dims = dims;
+    out_dims.copy_within(axis..3, axis + 1);
+    out_dims[axis] = parts.len();
+    let shape = Shape::new(out_dims);
+    shape.validate()?;
+
+    let block: usize = dims[..axis].iter().product();
+    let ty = ElemTy::of::<T>()?;
+    if let Some(storage) = jit::stack::run(ctx, &srcs, ty, first.len(), block, "stack", location)? {
+        return Ok(Array::from_storage(ctx, shape, storage));
+    }
+
+    // The part `k` read as an array of the stacked shape: its own coordinates, the new axis
+    // skipped.
+    let out = dims32(shape)?;
+    let mut views = Vec::with_capacity(parts.len());
+    for part in parts {
+        let mut map = ViewMap::identity(dims32(part.shape())?);
+        map.out = out;
+        for (a, slot) in map.axes.iter_mut().enumerate() {
+            *slot = match a {
+                _ if a < axis => AxisMap { from: a as u8, start: 0, step: 1 },
+                0..=2 => AxisMap { from: a as u8 + 1, start: 0, step: 1 },
+                _ => AxisMap { from: 0, start: 0, step: 0 },
+            };
+        }
+        views.push(part.run_view(map, Edge::None, None, shape, "stack", location)?);
+    }
+    let offsets: Vec<usize> = (0..parts.len()).collect();
+    select_parts(shape, axis, &views, &offsets, location)
 }

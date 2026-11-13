@@ -292,6 +292,53 @@ impl CmpOp {
     }
 }
 
+/// A test of what kind of floating-point value an element is, read from the bits of its
+/// exponent: comparisons with `NaN` or infinity are what a compiler that assumes neither exists
+/// may fold away.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Class {
+    /// Neither infinite nor `NaN`.
+    Finite,
+    Nan,
+    /// Positive or negative infinity.
+    Inf,
+}
+
+impl Class {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Class::Finite => "is_finite",
+            Class::Nan => "is_nan",
+            Class::Inf => "is_inf",
+        }
+    }
+
+    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1: the bits of `x`
+    /// below the sign are compared with those of infinity. They come through `luma_bits` of the
+    /// double-float library, which ORs them with the guard uniform (always 0): a compiler that
+    /// assumes no `NaN` or infinity arises in the arithmetic of the kernel (a device's fast
+    /// math) would otherwise fold a test of the bits of a computed value to its finite answer.
+    pub(crate) fn expr(self) -> &'static str {
+        match self {
+            Class::Finite => "select(0u, 1u, (luma_bits(x) & 0x7fffffffu) < 0x7f800000u)",
+            Class::Nan => "select(0u, 1u, (luma_bits(x) & 0x7fffffffu) > 0x7f800000u)",
+            Class::Inf => "select(0u, 1u, (luma_bits(x) & 0x7fffffffu) == 0x7f800000u)",
+        }
+    }
+}
+
+/// An `f32` with the class of the value `a` of type `ty` (see [`Class`]): `f32` itself; the high
+/// word of a `Df32` (the low word cannot make a finite value of it infinite); an `f64` scaled
+/// into the range of `f32` by `2^-1000` (there is no bit cast of `f64`), which keeps `NaN` and
+/// infinity and turns every finite value finite.
+pub(crate) fn class_operand(ty: ElemTy, a: &str) -> String {
+    match ty {
+        ElemTy::Df32 => format!("{a}.x"),
+        ElemTy::F64 => format!("f32({a} * 9.332636185032189e-302lf)"),
+        _ => a.to_owned(),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ReduceOp {
     Sum,
@@ -584,6 +631,7 @@ pub(crate) fn df_library(guard: &str, fma: bool, sloppy_add: bool) -> String {
 }
 ";
     const COMMON: &str = "fn luma_o(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) | {G}); }
+fn luma_bits(x: f32) -> u32 { return bitcast<u32>(x) | {G}; }
 fn df_two_sum(a: f32, b: f32) -> vec2<f32> {
     let s = luma_o(a + b); let bb = luma_o(s - a);
     let da = luma_o(a - luma_o(s - bb)); let db = luma_o(b - bb);

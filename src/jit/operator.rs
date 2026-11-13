@@ -32,7 +32,7 @@ pub(crate) fn operator_source(
     let Some(last) = key.instrs.len().checked_sub(1) else { return Ok(None) };
     let bad = !key.subs.is_empty()
         || key.outputs != [last as u32]
-        || key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_) | OpKind::Generate(_)));
+        || key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_) | OpKind::Generate(_) | OpKind::Classify(_)));
     if bad {
         return Ok(None);
     }

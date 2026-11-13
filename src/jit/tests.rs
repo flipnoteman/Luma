@@ -3426,3 +3426,243 @@ fn a_shared_expression_is_weighed_by_its_distinct_nodes() {
     assert_close(&got_u, &xs.iter().map(|&v| host(v) + 1.0).collect::<Vec<_>>(), 1e-4, 1e-5);
     assert_close(&v.to_vec().unwrap(), &xs.iter().map(|&v| host(v) * 2.0).collect::<Vec<_>>(), 1e-4, 1e-5);
 }
+
+/// Host value of element `(k, i)` of the stacked expressions of the stack tests: part `k` is
+/// `x * (k + 1) * 0.25 + sqrt(y)`.
+fn stack_part(x: &Array<f32>, y: &Array<f32>, k: usize) -> Array<f32> {
+    x * ((k + 1) as f32 * 0.25) + y.sqrt()
+}
+
+fn stack_host(xs: &[f32], ys: &[f32], k: usize) -> Vec<f32> {
+    xs.iter().zip(ys).map(|(&x, &y)| x * ((k + 1) as f32 * 0.25) + y.sqrt()).collect()
+}
+
+#[test]
+fn stacked_lazy_parts_are_one_kernel_writing_the_stacked_layout() {
+    let ctx = ctx();
+    let (w, h) = (9, 7);
+    let (xs, ys) = (values(w * h, 501, 0.2, 1.2), values(w * h, 502, 0.2, 1.2));
+    let (x, y) = (Array::from_slice_on(&ctx, &xs, [w, h]).unwrap(), Array::from_slice_on(&ctx, &ys, [w, h]).unwrap());
+    x.eval().unwrap();
+    y.eval().unwrap();
+    let hosts: Vec<Vec<f32>> = (0..16).map(|k| stack_host(&xs, &ys, k)).collect();
+
+    // New axis 0: element `(k, i)` is part `k` at `i`; one launch for sixteen expressions.
+    let before = ctx.jit().stats();
+    let parts: Vec<Array<f32>> = (0..16).map(|k| stack_part(&x, &y, k)).collect();
+    let stacked = crate::stack_slice(0, &parts);
+    drop(parts);
+    assert_eq!(stacked.shape().dims(), [16, w, h, 1]);
+    let got = stacked.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = (0..w * h).flat_map(|i| (0..16).map(|k| hosts[k][i]).collect::<Vec<_>>()).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+
+    // The other positions of the new axis, and the array form.
+    for axis in 1..=3 {
+        let parts = [stack_part(&x, &y, 0), stack_part(&x, &y, 1), stack_part(&x, &y, 2)];
+        let before = ctx.jit().stats();
+        let stacked = crate::stack(axis, [&parts[0], &parts[1], &parts[2]]);
+        let mut dims = [w, h, 1, 1];
+        dims.copy_within(axis..3, axis + 1);
+        dims[axis] = 3;
+        assert_eq!(stacked.shape().dims(), dims, "axis {axis}");
+        let got = stacked.to_vec().unwrap();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "axis {axis}");
+        // Blocks of `block` elements of every part in turn.
+        let block: usize = [w, h, 1, 1][..axis].iter().product();
+        let want: Vec<f32> = (0..w * h * 3)
+            .map(|o| {
+                let (q, r) = (o / (3 * block), o % block);
+                let k = (o / block) % 3;
+                hosts[k][q * block + r]
+            })
+            .collect();
+        assert_close(&got, &want, 1e-6, 1e-6);
+    }
+}
+
+#[test]
+fn a_stack_that_reads_too_many_buffers_or_is_too_large_still_stacks() {
+    let (w, h) = (6, 5);
+    let n = w * h;
+    let inputs: Vec<Vec<f32>> = (0..12).map(|k| values(n, 510 + k as u64, 0.2, 1.2)).collect();
+    let want = |f: &dyn Fn(usize, usize) -> f32| -> Vec<f32> { (0..n).flat_map(|i| (0..12).map(move |k| (i, k))).map(|(i, k)| f(i, k)).collect() };
+
+    // More buffers than a kernel binds: the stack runs in pieces, and a part that alone reads
+    // too many is computed first.
+    let make = ctx;
+    let ctx = make();
+    ctx.jit().set_max_inputs(4);
+    let arrays: Vec<Array<f32>> = inputs.iter().map(|d| Array::from_slice_on(&ctx, d, [w, h]).unwrap()).collect();
+    let parts: Vec<Array<f32>> = (0..12).map(|k| &arrays[k] + &arrays[(k + 1) % 12] * 2.0 + &arrays[(k + 5) % 12] * &arrays[(k + 7) % 12] + &arrays[(k + 2) % 12]).collect();
+    let got = crate::stack_slice(0, &parts).to_vec().unwrap();
+    let f = |i: usize, k: usize| inputs[k][i] + inputs[(k + 1) % 12][i] * 2.0 + inputs[(k + 5) % 12][i] * inputs[(k + 7) % 12][i] + inputs[(k + 2) % 12][i];
+    assert_close(&got, &want(&f), 1e-5, 1e-6);
+
+    // Few live values: groups of a part or two.
+    let ctx = make();
+    ctx.jit().set_max_live(8);
+    let before = ctx.jit().stats();
+    let x = Array::from_slice_on(&ctx, &inputs[0], [w, h]).unwrap();
+    let y = Array::from_slice_on(&ctx, &inputs[1], [w, h]).unwrap();
+    let parts: Vec<Array<f32>> = (0..12).map(|k| stack_part(&x, &y, k)).collect();
+    let got = crate::stack_slice(1, &parts).to_vec().unwrap();
+    assert!(delta(before, ctx.jit().stats()).elementwise_launches > 1);
+    let block = w;
+    let want_axis1: Vec<f32> = (0..n * 12)
+        .map(|o| {
+            let (q, r) = (o / (12 * block), o % block);
+            let k = (o / block) % 12;
+            stack_host(&inputs[0], &inputs[1], k)[q * block + r]
+        })
+        .collect();
+    assert_close(&got, &want_axis1, 1e-6, 1e-6);
+
+    // Arrays and a result that do not fit one buffer are joined lazily instead.
+    let ctx = Context::with_options(crate::ContextOptions::default().chunk_bytes(1024)).unwrap();
+    let x = Array::from_slice_on(&ctx, &inputs[0], [w, h]).unwrap();
+    let y = Array::from_slice_on(&ctx, &inputs[1], [w, h]).unwrap();
+    let parts: Vec<Array<f32>> = (0..12).map(|k| stack_part(&x, &y, k)).collect();
+    let stacked = crate::stack_slice(0, &parts);
+    assert_eq!(stacked.shape().dims(), [12, w, h, 1]);
+    let hosts: Vec<Vec<f32>> = (0..12).map(|k| stack_host(&inputs[0], &inputs[1], k)).collect();
+    assert_close(&stacked.to_vec().unwrap(), &want(&|i, k| hosts[k][i]), 1e-6, 1e-6);
+}
+
+#[test]
+fn stacks_of_every_element_type_read_views_and_take_writes() {
+    let ctx = ctx();
+    let (w, h) = (5, 4);
+    let xs = values(w * h, 520, 0.2, 1.2);
+    let x = Array::from_slice_on(&ctx, &xs, [w, h]).unwrap();
+
+    // `Df32` parts are 8 bytes wide; `u32` parts are integers.
+    let df = x.to_df32();
+    let stacked = crate::stack(0, [&(&df * &df), &(&df + &df), &df]);
+    let got = stacked.to_f32().to_vec().unwrap();
+    let want: Vec<f32> = xs.iter().flat_map(|&v| [v * v, v + v, v]).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+    let idx = Array::<u32>::range_on(&ctx, crate::Shape::new([w, h, 1, 1]), 0).unwrap();
+    let ints = crate::stack(2, [&idx, &(&idx + 10u32)]);
+    let want: Vec<u32> = (0..2).flat_map(|k| (0..w * h).map(move |i| (i % w) as u32 + 10 * k)).collect();
+    assert_eq!(ints.to_vec().unwrap(), want);
+
+    // The stack is an array like any other: read through views (a slice picks a part), and
+    // written in place.
+    let parts = [&x * 2.0, &x * 3.0, &x * 4.0];
+    let stacked = crate::stack(0, [&parts[0], &parts[1], &parts[2]]);
+    let middle = stacked.slice(0, 1..2);
+    assert_close(&middle.to_vec().unwrap(), &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+    middle.assign(0.0).unwrap();
+    let got = stacked.to_vec().unwrap();
+    let want: Vec<f32> = xs.iter().flat_map(|&v| [v * 2.0, 0.0, v * 4.0]).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+    // The parts, still lazy and held, are unchanged.
+    assert_close(&parts[1].to_vec().unwrap(), &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+
+    // A part used twice, and the same part as another stack's.
+    let p = &x + 1.0;
+    let twice = crate::stack(1, [&p, &p]);
+    assert_eq!(twice.shape().dims(), [w, 2, h, 1]);
+    let got = twice.to_vec().unwrap();
+    let want: Vec<f32> = (0..h).flat_map(|j| (0..2).flat_map(move |_| (0..w).map(move |i| (i, j)))).map(|(i, j)| xs[i + w * j] + 1.0).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+}
+
+#[test]
+fn stack_reports_what_concat_reports() {
+    let ctx = ctx();
+    let a = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2]).unwrap();
+    let b = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0, 4.0], [2, 2]).unwrap();
+    let other = Context::with_options(crate::ContextOptions::from_env().calibrate(false)).unwrap();
+    let c = Array::from_slice_on(&other, &[1.0f32; 6], [3, 2]).unwrap();
+    let four = Array::from_slice_on(&ctx, &[1.0f32; 8], [2, 2, 2, 1]).unwrap().reshape([1, 2, 2, 2]);
+
+    let mismatch = crate::stack(0, [&a, &b]);
+    assert!(matches!(mismatch.check().unwrap_err().root(), crate::LumaError::ShapeMismatch { lhs: [3, 2, 1, 1], rhs: [2, 2, 1, 1] }));
+    assert!(matches!(crate::stack(0, [&a, &c]).check().unwrap_err().root(), crate::LumaError::ContextMismatch));
+    assert!(matches!(crate::stack(4, [&a, &a]).check().unwrap_err().root(), crate::LumaError::InvalidShape(_)));
+    // Four dimensions leave no room for another.
+    assert!(matches!(crate::stack(0, [&four, &four]).check().unwrap_err().root(), crate::LumaError::InvalidShape(_)));
+    // A poisoned part poisons the stack with its error.
+    let bad = a.reshape([7]);
+    assert!(crate::stack(0, [&a, &bad]).check().is_err());
+    assert!(crate::stack_slice(0, &[a.clone(), a.clone()]).check().is_ok());
+    assert!(matches!(crate::stack_slice::<f32>(0, &[]).check().unwrap_err().root(), crate::LumaError::InvalidShape(_)));
+}
+
+#[test]
+fn reshape_of_a_lazy_view_stays_lazy() {
+    let ctx = ctx();
+    let (ni, nj) = (6, 5);
+    let xs = values(16 * ni * nj, 530, -1.0, 1.0);
+    let x = Array::from_slice_on(&ctx, &xs, [16, ni, nj]).unwrap();
+    x.eval().unwrap();
+    let want = |k: usize| -> Vec<f32> { (0..ni * nj).map(|i| xs[k + 16 * i] * 2.0 + 1.0).collect() };
+
+    // A slice of the fastest axis reads every 16th element, a slice of the slowest one a stretch:
+    // both are index maps, and the reshape keeps the order of the view's elements.
+    let before = ctx.jit().stats();
+    let part = x.slice(0, 3..4).reshape([ni, nj]);
+    let r = &part * 2.0 + 1.0;
+    assert_eq!(r.shape().dims(), [ni, nj, 1, 1]);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0, "reshaping launched a kernel");
+    assert_close(&r.to_vec().unwrap(), &want(3), 1e-6, 1e-6);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "the slice, the reshape and the arithmetic are one kernel");
+
+    let tail = Array::from_slice_on(&ctx, &xs, [ni, nj, 16]).unwrap();
+    tail.eval().unwrap();
+    let before = ctx.jit().stats();
+    let plane = tail.slice(2, 5..6).reshape([ni * nj]);
+    let r = plane.sqrt().abs() + 1.0;
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
+    let got = r.to_vec().unwrap();
+    let want: Vec<f32> = (0..ni * nj).map(|i| xs[i + ni * nj * 5].sqrt().abs() + 1.0).collect();
+    assert_eq!(got.len(), want.len());
+    for (g, w) in got.iter().zip(&want) {
+        assert!((g.is_nan() && w.is_nan()) || (g - w).abs() <= 1e-6, "{g} vs {w}");
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+    // Flipped and transposed views are index maps too.
+    let before = ctx.jit().stats();
+    let flipped = x.slice(0, 3..4).flip(1).reshape([ni * nj]);
+    let r = &flipped * 2.0;
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
+    let got = r.to_vec().unwrap();
+    let want: Vec<f32> = (0..ni * nj).map(|i| xs[3 + 16 * ((ni - 1 - i % ni) + ni * (i / ni))] * 2.0).collect();
+    assert_close(&got, &want, 1e-6, 1e-6);
+
+    // An expression that is not a view is evaluated by the reshape (what reads it through
+    // several slices would otherwise compute it for each): it shares the buffer, and a write
+    // through one shows in the other, as for a clone.
+    let before = ctx.jit().stats();
+    let lazy = &x * 2.0;
+    let mut flat = lazy.reshape([16 * ni * nj]);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    flat += 1.0;
+    let got = lazy.to_vec().unwrap();
+    assert_close(&got, &xs.iter().map(|v| v * 2.0 + 1.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+
+    // A write into a reshaped slice goes to the data the reshape shares with that slice, not
+    // to the array the slice was taken from.
+    let slice = x.slice(0, 2..3);
+    let reshaped = slice.reshape([ni, nj]);
+    reshaped.assign(7.0).unwrap();
+    assert_eq!(reshaped.to_vec().unwrap(), vec![7.0; ni * nj]);
+    assert_eq!(slice.to_vec().unwrap(), vec![7.0; ni * nj]);
+    assert_close(&x.to_vec().unwrap(), &xs, 0.0, 0.0);
+}
+
+#[test]
+fn the_class_tests_of_a_float_array_fuse_into_one_kernel() {
+    let ctx = ctx();
+    let xs = [1.0f32, f32::NAN, f32::INFINITY, -2.0, 0.0, 1.0e30];
+    let x = f32s(&ctx, &xs);
+    let before = ctx.jit().stats();
+    let damped = crate::select(&(&x * &x).is_finite(), &(&x * 3.0), f32s(&ctx, &[0.0; 6]));
+    let got = damped.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    assert_eq!(got, vec![3.0, 0.0, 0.0, -6.0, 0.0, 0.0]);
+}
