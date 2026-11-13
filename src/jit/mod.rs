@@ -44,7 +44,9 @@
 //!   is written (`JitState::note_write`), and skips nodes computed inside another kernel. A
 //!   fused kernel computes a shared node once; a pending node that an expression outside the one
 //!   being flattened also reads is evaluated first only if computing it once more costs more than
-//!   writing and reading it back (`worth_storing`, the rule of circular shifts), otherwise each
+//!   writing and reading it back (`worth_storing`, the rule of circular shifts; the work of an
+//!   expression is at most 8 f32 operations per distinct node, however often the expressions
+//!   below it share one; one of a quarter of the node limit is always stored), otherwise each
 //!   expression computes it. Of those, only the outermost are evaluated, together with their
 //!   siblings (pending nodes of the same length made by the same operation at the same place in
 //!   the program: the other fields of a record, see `program::with_siblings`), so that a residual
@@ -69,7 +71,9 @@
 //!   reads it. A program that fits no plan costs more than any that does, ordered by what
 //!   writing it out would cost. A kernel that would grow past
 //!   `Tuning::max_inlined` instructions (`LUMA_FUSION_MAX_INLINED`) is cut whatever the model
-//!   says, at the group that search finds ([`SplitReason::Inlined`]), and expressions over arrays
+//!   says, at the group that search finds ([`SplitReason::Inlined`]; the live arrays that share
+//!   work with it are evaluated in the same kernel, except in a cut inside the evaluation of
+//!   another cut's group: those include everything built on top of it), and expressions over arrays
 //!   split over several buffers are read
 //!   from their evaluated buffers. Circular shifts keep their own rule: a small expression is
 //!   recomputed at up to eight offsets as long as one more computation (by its operation
@@ -918,7 +922,8 @@ impl Node {
     }
 
     /// The operations of the expression in f32-operation units, an upper bound (see
-    /// [`cost::op_weight`]). A loop leaf has none: its plan evaluates its inputs.
+    /// [`cost::op_weight`]) that counts a node an expression reads twice twice, up to
+    /// [`MAX_AVERAGE_WEIGHT`] per distinct node. A loop leaf has none: its plan evaluates its inputs.
     fn weight(&self) -> f64 {
         if self.looped.get().is_some() { 0.0 } else { self.weight }
     }
@@ -1239,6 +1244,12 @@ impl Flattening {
             flying.extend(roots);
             Flattening(before)
         })
+    }
+
+    /// Whether another expression was being flattened already when this one began: this
+    /// flattening is part of evaluating a part of that one.
+    pub(super) fn nested(&self) -> bool {
+        self.0 > 0
     }
 }
 
@@ -1698,7 +1709,11 @@ pub(crate) fn create(
             operand_weight += operand.weight();
         }
     }
-    let weight = cost::op_weight(op, &ctx.cost_model()) + operand_weight;
+    // Operands that share nodes count them once per use (`operand_weight` unfolds the expression into
+    // a tree, which doubles with every level of a flux that two readers read, say): no operation
+    // weighs more than `MAX_AVERAGE_WEIGHT` on average, so that is what an expression of that many
+    // distinct nodes is bounded by.
+    let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight).min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
     let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
 
     let trace = rerun::created(op, len, &args, arity);
@@ -1902,6 +1917,10 @@ pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 
     stageable || claim_recompute(node)
 }
 
+/// The most an operation of an expression weighs on average, in f32 operations (see [`Node::weight`]):
+/// a division or square root is 4, a transcendental function 8 to 16 and rare.
+const MAX_AVERAGE_WEIGHT: f64 = 8.0;
+
 /// Most lazy reads a node accepts however cheap its expression is.
 const MAX_LAZY_READS: u32 = 8;
 
@@ -1933,12 +1952,21 @@ fn claim_recompute(node: &Node) -> bool {
     }
 }
 
+/// From this many nodes on, an expression that another one shares is always evaluated first (see
+/// [`worth_storing`]): a quarter of the node limit.
+const ALWAYS_STORED_NODES: usize = MAX_NODES_LIMIT / 4;
+
 /// Whether the pending `node`, which an expression outside the one being flattened reads too,
 /// costs more to compute once more than to write and read back (by the cost model, as in
 /// [`claim_recompute`]): then it is evaluated before the expressions that share it, otherwise
 /// each computes it again and no kernel is spent on it.
 pub(crate) fn worth_storing(node: &Node) -> bool {
     if node.looped.get().is_some() {
+        return true;
+    }
+    // The code of an expression this big is not worth writing into a second kernel whatever the
+    // time says: the model does not see what it costs to compile and to keep in registers.
+    if node.size() >= ALWAYS_STORED_NODES {
         return true;
     }
     let cost = node.context().cost_model();
