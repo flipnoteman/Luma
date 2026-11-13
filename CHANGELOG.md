@@ -40,6 +40,7 @@ All notable changes to Luma are listed here. The format follows
   expressions: a `select` whose mask depends on the coordinates only is generated as `if`/`else`
   (the right-hand side is computed in the cells of the region, the old value elsewhere), and the
   cost model weights those operations by the share of cells that take the branch. A padded record
+  with ghost expressions of any size read at four offsets in each direction is one launch without
   cuts (before: 4 launches and 2 cuts at 100 ghost operations).
 - Workgroup staging follows sub-programs that are not staged: what a flux read once (or a slice of
   a slice) reads of a padded array is staged at the summed offsets instead of the padded array
