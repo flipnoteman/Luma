@@ -141,6 +141,7 @@ mod looped;
 mod operator;
 mod program;
 mod readers;
+mod rerun;
 mod replay;
 mod simplify;
 pub(crate) mod speculate;
@@ -172,6 +173,7 @@ use program::Instr;
 pub(crate) use launch::{check_finite, evaluate, evaluate_group, evaluate_into, force_group, reduce_first_pass, run_loop};
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
+pub(crate) use rerun::{Attempt, Site};
 pub(crate) use replay::{force, Plan, Stepper, Trace};
 pub(crate) use stencil::plan as stencil_plan;
 pub(crate) use until::{next_block, run_until, FIRST_BLOCK};
@@ -688,6 +690,8 @@ pub(crate) struct Node {
     /// thread may be flattening the expression this very moment, or have a recording under way
     /// that must only capture its own launches. A node is still evaluated by whoever uses it.
     thread: std::thread::ThreadId,
+    /// The trace the node was created in and its number there (0: none; see [`rerun`]).
+    trace: u64,
 }
 
 thread_local! {
@@ -1556,6 +1560,7 @@ pub(crate) fn create(
     if let Some(hash) = cons_key
         && let Some(found) = jit.cons_lookup(hash, op, len, &args)
     {
+        rerun::reused(&found);
         return Ok(found);
     }
 
@@ -1696,7 +1701,9 @@ pub(crate) fn create(
     let weight = cost::op_weight(op, &ctx.cost_model()) + operand_weight;
     let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
 
+    let trace = rerun::created(op, len, &args, arity);
     let node = Arc::new(Node {
+        trace,
         thread: current_thread(),
         ctx: ctx.clone(),
         op,
@@ -1759,6 +1766,7 @@ pub(crate) fn create(
 pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate::reduce::Reduced>, name: &'static str, location: &'static Location<'static>) -> Arc<Node> {
     let measured = measure(&[]);
     let node = Arc::new(Node {
+        trace: 0,
         thread: current_thread(),
         ctx: ctx.clone(),
         op: Op::new(OpKind::Unary(UnOp::Id), ty),
@@ -2016,13 +2024,16 @@ pub(crate) struct JitState {
     /// Instructions of the last lowered program a kernel was built from (tests).
     #[cfg(test)]
     last_inlined_len: AtomicUsize,
-    /// Most element-instructions per launch of a register loop, see [`launch::run_loop`].
+    /// Most element-instructions per launch of a register loop; 0: sized by the cost model (see
+    /// `launch::steps_per_launch`). Only tests set it.
     loop_work: AtomicU64,
     stats: Stats,
     /// Tells this state from the ones of other contexts (the `eval` history of a thread is kept by the thread, see [`looped`]).
     id: u64,
     /// Follows reduction readbacks to find loops that can be speculated (see [`speculate`]).
     speculation: Mutex<speculate::Tracker>,
+    /// The programs of register loops that ran before, by call site (see [`rerun`]).
+    reruns: Mutex<rerun::Cache>,
 }
 
 /// Counters of the fusion machinery, read by tests.
@@ -2038,6 +2049,10 @@ struct Stats {
     reduce_launches: AtomicU64,
     /// Passes of reductions after the first (over partial results, or over a buffer).
     reduce_passes: AtomicU64,
+    /// Register loops run from a rerun instead of a flattened trace (see [`rerun`]).
+    replays: AtomicU64,
+    /// Of those, the ones whose launches had started before the step ran.
+    speculated: AtomicU64,
 }
 
 /// A snapshot of the counters of a context's [`JitState`].
@@ -2049,6 +2064,8 @@ pub(crate) struct StatsSnapshot {
     pub(crate) elementwise_launches: u64,
     pub(crate) reduce_launches: u64,
     pub(crate) reduce_passes: u64,
+    pub(crate) replays: u64,
+    pub(crate) speculated: u64,
 }
 
 impl JitState {
@@ -2096,12 +2113,13 @@ impl JitState {
             simplify: AtomicBool::new(true),
             #[cfg(test)]
             last_inlined_len: AtomicUsize::new(0),
-            loop_work: AtomicU64::new(launch::LOOP_WORK_PER_LAUNCH),
+            loop_work: AtomicU64::new(0),
             stats: Stats::default(),
             id: NEXT_JIT_ID.fetch_add(1, Ordering::Relaxed),
             speculation: Mutex::new(speculate::Tracker::new(
                 !std::env::var(SPECULATE_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
             )),
+            reruns: Mutex::new(rerun::Cache::default()),
         }
     }
 
@@ -2393,6 +2411,8 @@ impl JitState {
             elementwise_launches: self.stats.elementwise_launches.load(Ordering::Relaxed),
             reduce_launches: self.stats.reduce_launches.load(Ordering::Relaxed),
             reduce_passes: self.stats.reduce_passes.load(Ordering::Relaxed),
+            replays: self.stats.replays.load(Ordering::Relaxed),
+            speculated: self.stats.speculated.load(Ordering::Relaxed),
         }
     }
 

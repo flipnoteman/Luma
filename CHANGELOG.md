@@ -59,6 +59,11 @@ All notable changes to Luma are listed here. The format follows
 - Region `assign` compiles to `if`/`else`, so ghost expressions cost only their own cells.
 - `iterate*` trace the step once and replay its kernels; `eval` loops are recognized and batched;
   readbacks in convergence loops can be answered from steps computed ahead.
+- `iterate_all` register loops called again from the same place with the same step graph over
+  other arrays reuse the earlier program (no flattening), and from the third call on the GPU
+  starts before `step` is traced; the steps of a loop are cut into launches of about 40 ms by
+  the cost model instead of a fixed work budget (32 lazy Keccak permutations over 2^20 states:
+  one launch, 25.7 to 15.7 ms).
 - Reductions fuse their elementwise input and short epilogues (`norm`: 2 launches); an operation
   on a reduction no longer forces it early.
 - `Df32` arithmetic 1.5-2x faster (`fma` products where the device's `fma` is fused, one-step

@@ -1523,6 +1523,32 @@ fn tiny(b: &mut Bench) {
         b.time("tiny/host_loop", size, Tp::PerOp(steps as f64, "us/step"), false, &mut f);
     });
 
+    // A register loop called again and again from one place: later calls run from the program of
+    // the first and start on the GPU before the step is traced (see `iterate_all`).
+    b.guarded("tiny/register_repeat", |b| {
+        let ctx = b.ctx.clone();
+        let (x, y) = mk(&ctx);
+        let calls = if b.quick { 50 } else { 400 };
+        let reg_step = |x: &A, y: &A| [x * 0.99 + y * 0.01, y * 0.995 + x * 0.005];
+        let reg = |x: &A, y: &A, steps: usize| iterate_all([x, y], steps, |s| reg_step(&s[0], &s[1]));
+        let [mut wx, mut wy] = reg_step(&x, &y);
+        for _ in 1..8 {
+            [wx, wy] = reg_step(&wx, &wy);
+        }
+        for _ in 0..3 {
+            let got = reg(&x, &y, 8);
+            check("tiny/register_repeat", &got[0].to_vec().unwrap(), &wx.to_vec().unwrap(), 1e-4, 1e-5);
+            check("tiny/register_repeat", &got[1].to_vec().unwrap(), &wy.to_vec().unwrap(), 1e-4, 1e-5);
+        }
+        let mut f = || {
+            for _ in 0..calls {
+                black_box(reg(&x, &y, 8));
+            }
+            ctx.sync().unwrap();
+        };
+        b.time("tiny/register_repeat", size, Tp::PerOp(calls as f64, "us/call"), false, &mut f);
+    });
+
     b.guarded("tiny/lazy_build", |b| {
         let ctx = b.ctx.clone();
         // No wall: the ghost assign would evaluate the padded state while building.

@@ -46,6 +46,8 @@ fn delta(before: StatsSnapshot, after: StatsSnapshot) -> StatsSnapshot {
         elementwise_launches: after.elementwise_launches - before.elementwise_launches,
         reduce_launches: after.reduce_launches - before.reduce_launches,
         reduce_passes: after.reduce_passes - before.reduce_passes,
+        replays: after.replays - before.replays,
+        speculated: after.speculated - before.speculated,
     }
 }
 
@@ -3147,5 +3149,192 @@ fn an_expression_with_more_scalars_than_a_uniform_holds_is_cut() {
     let k_sum: f64 = (0..terms).map(|k| (k % 7) as f64).sum();
     for (g, v) in got.iter().zip([1.0f64, 2.0, 3.0]) {
         assert!((g - (v * k_sum + 0.5 * terms as f64)).abs() < 1e-6 * k_sum * 3.0, "{g}");
+    }
+}
+
+/// Register loops that run again (see `jit::rerun`): the same `iterate_all` call site over new
+/// arrays runs from the program of an earlier call, started before the step is traced once the
+/// call before did the same.
+mod reruns {
+    use super::*;
+
+    /// One call site: `steps` of `u = u * k + c * 0.5 + 1` (or `- 1`), with `c` captured.
+    fn run(x: &Array<f32>, c: &Array<f32>, k: f32, plus: bool, steps: usize) -> Array<f32> {
+        let [r] = crate::iterate_all([x], steps, |[u]| [if plus { u * k + c * 0.5 + 1.0 } else { u * k + c * 0.5 - 1.0 }]);
+        r
+    }
+
+    fn host(xs: &[f32], cs: &[f32], k: f32, plus: bool, steps: usize) -> Vec<f32> {
+        let sign = if plus { 1.0 } else { -1.0 };
+        xs.iter()
+            .zip(cs)
+            .map(|(&x, &c)| {
+                let mut u = x;
+                for _ in 0..steps {
+                    u = u * k + c * 0.5 + sign;
+                }
+                u
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_repeated_over_new_arrays_runs_from_its_program_and_starts_before_the_step() {
+        let ctx = ctx();
+        let cs = values(300, 1, -1.0, 1.0);
+        let c = f32s(&ctx, &cs);
+        let before = ctx.jit().stats();
+        for call in 0..6u64 {
+            let xs = values(300, 10 + call, -1.0, 1.0);
+            let steps = [5, 5, 9, 9, 1, 40][call as usize];
+            let got = run(&f32s(&ctx, &xs), &c, 0.9, true, steps).to_vec().unwrap();
+            assert_close(&got, &host(&xs, &cs, 0.9, true, steps), 1e-4, 1e-5);
+        }
+        let d = delta(before, ctx.jit().stats());
+        assert_eq!(d.replays, 5, "every call after the first runs from the program of the first");
+        assert_eq!(d.speculated, 4, "from the third on the loop starts before the step is traced");
+    }
+
+    #[test]
+    fn another_captured_array_is_read_and_not_the_one_the_program_was_made_with() {
+        let ctx = ctx();
+        let (c1, c2) = (values(300, 2, -1.0, 1.0), values(300, 3, -1.0, 1.0));
+        let (a1, a2) = (f32s(&ctx, &c1), f32s(&ctx, &c2));
+        let xs = values(300, 4, -1.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        for _ in 0..3 {
+            let got = run(&x, &a1, 0.9, true, 6).to_vec().unwrap();
+            assert_close(&got, &host(&xs, &c1, 0.9, true, 6), 1e-4, 1e-5);
+        }
+        // The guess made before the step (`a1`) was wrong: it is dropped, the call reads `a2`.
+        let before = ctx.jit().stats();
+        let got = run(&x, &a2, 0.9, true, 6).to_vec().unwrap();
+        assert_close(&got, &host(&xs, &c2, 0.9, true, 6), 1e-4, 1e-5);
+        let d = delta(before, ctx.jit().stats());
+        assert_eq!((d.replays, d.speculated), (1, 0));
+        for _ in 0..4 {
+            let got = run(&x, &a2, 0.9, true, 6).to_vec().unwrap();
+            assert_close(&got, &host(&xs, &c2, 0.9, true, 6), 1e-4, 1e-5);
+        }
+        let got = run(&x, &a1, 0.9, true, 6).to_vec().unwrap();
+        assert_close(&got, &host(&xs, &c1, 0.9, true, 6), 1e-4, 1e-5);
+    }
+
+    #[test]
+    fn a_changed_scalar_or_structure_is_not_run_from_an_earlier_program() {
+        let ctx = ctx();
+        let cs = values(200, 5, -1.0, 1.0);
+        let c = f32s(&ctx, &cs);
+        let xs = values(200, 6, -1.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        for _ in 0..3 {
+            run(&x, &c, 0.9, true, 4).eval().unwrap();
+        }
+        let before = ctx.jit().stats();
+        let got = run(&x, &c, 0.8, true, 4).to_vec().unwrap();
+        assert_close(&got, &host(&xs, &cs, 0.8, true, 4), 1e-4, 1e-5);
+        let got = run(&x, &c, 0.8, false, 4).to_vec().unwrap();
+        assert_close(&got, &host(&xs, &cs, 0.8, false, 4), 1e-4, 1e-5);
+        let d = delta(before, ctx.jit().stats());
+        assert_eq!((d.replays, d.speculated), (0, 0), "new scalar, new operation: new programs");
+        // Back to the first: its program is still known.
+        let got = run(&x, &c, 0.9, true, 4).to_vec().unwrap();
+        assert_close(&got, &host(&xs, &cs, 0.9, true, 4), 1e-4, 1e-5);
+        assert_eq!(delta(before, ctx.jit().stats()).replays, 1);
+    }
+
+    #[test]
+    fn captured_arrays_that_are_one_array_are_another_program_than_two_arrays() {
+        let ctx = ctx();
+        let run = |x: &Array<f32>, a: &Array<f32>, b: &Array<f32>| {
+            let [r] = crate::iterate_all([x], 3, |[u]| [u * 0.5 + a + b * 2.0]);
+            r.to_vec().unwrap()
+        };
+        let (xs, as_, bs) = (values(100, 30, -1.0, 1.0), values(100, 31, -1.0, 1.0), values(100, 32, -1.0, 1.0));
+        let (x, a, b) = (f32s(&ctx, &xs), f32s(&ctx, &as_), f32s(&ctx, &bs));
+        let host = |x: &[f32], a: &[f32], b: &[f32]| -> Vec<f32> {
+            (0..x.len()).map(|i| (0..3).fold(x[i], |u, _| u * 0.5 + a[i] + b[i] * 2.0)).collect()
+        };
+        for _ in 0..4 {
+            // Two arrays, then one array twice, then x itself as a captured array.
+            assert_close(&run(&x, &a, &b), &host(&xs, &as_, &bs), 1e-4, 1e-5);
+            assert_close(&run(&x, &a, &a), &host(&xs, &as_, &as_), 1e-4, 1e-5);
+            assert_close(&run(&x, &x, &b), &host(&xs, &xs, &bs), 1e-4, 1e-5);
+        }
+    }
+
+    #[test]
+    fn programs_alternating_at_one_site_are_never_started_on_a_guess() {
+        let ctx = ctx();
+        let cs = values(200, 5, -1.0, 1.0);
+        let c = f32s(&ctx, &cs);
+        let xs = values(200, 6, -1.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        let before = ctx.jit().stats();
+        for call in 0..8 {
+            let plus = call % 2 == 0;
+            let got = run(&x, &c, 0.9, plus, 4).to_vec().unwrap();
+            assert_close(&got, &host(&xs, &cs, 0.9, plus, 4), 1e-4, 1e-5);
+        }
+        let d = delta(before, ctx.jit().stats());
+        assert_eq!((d.replays, d.speculated), (6, 0));
+    }
+
+    #[test]
+    fn a_captured_array_written_between_calls_is_read_as_it_is_then() {
+        let ctx = ctx();
+        let mut cs = values(200, 7, -1.0, 1.0);
+        let mut c = f32s(&ctx, &cs);
+        let xs = values(200, 8, -1.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        for round in 0..6 {
+            let got = run(&x, &c, 0.9, true, 5).to_vec().unwrap();
+            assert_close(&got, &host(&xs, &cs, 0.9, true, 5), 1e-4, 1e-5);
+            if round % 2 == 0 {
+                c *= 2.0;
+                cs.iter_mut().for_each(|v| *v *= 2.0);
+            }
+        }
+    }
+
+    #[test]
+    fn threads_calling_one_site_over_their_own_captured_arrays_get_their_own_results() {
+        let ctx = ctx();
+        std::thread::scope(|scope| {
+            for t in 0..4u64 {
+                let ctx = ctx.clone();
+                scope.spawn(move || {
+                    let cs = values(500, 20 + t, -1.0, 1.0);
+                    let c = f32s(&ctx, &cs);
+                    for call in 0..8u64 {
+                        let xs = values(500, 100 * t + call, -1.0, 1.0);
+                        let got = run(&f32s(&ctx, &xs), &c, 0.9, true, 7).to_vec().unwrap();
+                        assert_close(&got, &host(&xs, &cs, 0.9, true, 7), 1e-4, 1e-5);
+                    }
+                });
+            }
+        });
+    }
+
+    /// The steps of a launch are sized by the cost model: a few operations per element on a slow
+    /// device is a launch of a thousand steps, and `2500` steps are three launches.
+    #[test]
+    fn the_steps_per_launch_follow_the_cost_model() {
+        let ctx = ctx();
+        ctx.set_cost_model(CostModel { f32_ops_per_ns: 0.05, ..CostModel::TEST });
+        let n = 1000;
+        let xs = values(n, 9, 0.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        let before = ctx.jit().stats();
+        let [r] = crate::iterate_all([&x], 2500, |[u]| [u * 0.5 + 1.0]);
+        let got = r.to_vec().unwrap();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 3);
+        assert_close(&got, &vec![2.0; n], 1e-5, 1e-5);
+
+        ctx.set_cost_model(CostModel::TEST);
+        let before = ctx.jit().stats();
+        let [r] = crate::iterate_all([&x], 2500, |[u]| [u * 0.5 + 1.0]);
+        r.eval().unwrap();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     }
 }

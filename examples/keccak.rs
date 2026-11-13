@@ -8,7 +8,10 @@
 //! The results are checked against the known answers (the permutation of the zero state, SHA3-256
 //! and SHAKE128 of the empty message) and against a plain-Rust reference on random messages, then
 //! the throughput of one permutation per `eval` and of `iterate_all` over many permutations is
-//! printed with the kernels launched per permutation and where the expression was cut.
+//! printed with the kernels launched per permutation and where the expression was cut. Every row
+//! is the best of five calls of the same code: the later calls of `iterate_all` run from the
+//! program of the first (see `iterate_all`), which is why `host ms`, the time until the call
+//! returns, is only the tracing of the step.
 
 use luma::*;
 use std::time::Instant;
@@ -354,23 +357,29 @@ fn looped(state: &State, reps: usize) -> Result<State> {
     Ok(out)
 }
 
-fn best_of(runs: usize, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
-    let mut best = f64::INFINITY;
+/// The best of `runs` calls of `f`: seconds until `f` returned (the host's share: tracing and
+/// launching) and until the GPU finished what it launched.
+fn best_of(ctx: &Context, runs: usize, mut f: impl FnMut() -> Result<()>) -> Result<(f64, f64)> {
+    let (mut host, mut wall) = (f64::INFINITY, f64::INFINITY);
     for _ in 0..runs {
         let start = Instant::now();
         f()?;
-        best = best.min(start.elapsed().as_secs_f64());
+        let returned = start.elapsed().as_secs_f64();
+        ctx.sync()?;
+        host = host.min(returned);
+        wall = wall.min(start.elapsed().as_secs_f64());
     }
-    Ok(best)
+    Ok((host, wall))
 }
 
-fn row(name: &str, n: usize, reps: usize, seconds: f64, profile: &Profile) {
+fn row(name: &str, n: usize, reps: usize, (host, wall): (f64, f64), profile: &Profile) {
     let perms = (n * reps) as f64;
     println!(
-        "{:<34} {:>10.1} {:>12.1} {:>14.2} {:>9.2}",
+        "{:<34} {:>10.1} {:>12.1} {:>9.1} {:>14.2} {:>9.2}",
         name,
-        seconds * 1e3,
-        perms / seconds / 1e6,
+        wall * 1e3,
+        perms / wall / 1e6,
+        host * 1e3,
         f64::from(profile.launches()) / reps as f64,
         profile.total().as_secs_f64() * 1e3,
     );
@@ -390,7 +399,7 @@ fn main() -> Result<()> {
 
     println!("Keccak-f[1600] on {n} independent states ({} MB of state), lazy array operations only", n * 200 / 1_000_000);
     println!("{}", "=".repeat(90));
-    println!("{:<34} {:>10} {:>12} {:>14} {:>9}", "case", "ms", "M perm/s", "launches/perm", "gpu ms");
+    println!("{:<34} {:>10} {:>12} {:>9} {:>14} {:>9}", "case", "wall ms", "M perm/s", "host ms", "launches/perm", "gpu ms");
     println!("{}", "-".repeat(90));
     let data = state_data(n);
     let state = state_from(&ctx, &data)?;
@@ -418,10 +427,7 @@ fn main() -> Result<()> {
     for (name, run) in cases {
         let out = run(&state, reps)?;
         assert!(matches_host(&out)?, "{name}: result differs from the reference");
-        let seconds = best_of(3, || {
-            run(&state, reps)?;
-            ctx.sync()
-        })?;
+        let seconds = best_of(&ctx, 5, || run(&state, reps).map(drop))?;
         let (_, profile) = ctx.profile(|| run(&state, reps).and_then(|_| ctx.sync()))?;
         row(name, n, reps, seconds, &profile);
         profiles.push((name, profile));

@@ -1,5 +1,6 @@
 //! Loops over arrays: `Array::iterate` (time-blocked stencils) and `iterate_all` (register loops).
 
+use std::any::TypeId;
 use std::panic::Location;
 use std::sync::Arc;
 
@@ -14,10 +15,18 @@ use crate::ops::Outcome;
 /// and returns the next ones, as a loop calling it `steps` times would. When every result is an
 /// elementwise expression of the states, of other arrays of the same length and of scalars, the
 /// whole loop is one kernel that keeps the states in registers and writes them once, for any
-/// `steps` (one pipeline per step expression); that loop exists for `f32` only. Anything else, such as
-/// shifts, `cache()` or `assign` or states of another type, is traced once and its
-/// recorded kernels are replayed, step by step. `step` is called once to trace it; it must compute its results from its arguments and captured
+/// `steps` (one pipeline per step expression); that loop exists for `f32` and `u32` states (all of
+/// one type). It runs in launches of about 40 ms of GPU time by the device's [`CostModel`](crate::CostModel), so a
+/// long loop is a handful of launches. Anything else, such as shifts, `cache()` or `assign` or
+/// states of another type, is traced once and its recorded kernels are replayed, step by step.
+/// `step` is called once to trace it; it must compute its results from its arguments and captured
 /// arrays only.
+///
+/// A register loop called again from the same place in the source whose step builds the same
+/// graph (the same operations and scalar values) over other arrays, states or captured, is not
+/// flattened again, and once two calls in a row did that, the GPU starts the loop before `step` is
+/// traced (on the guess that it builds the same graph again; a wrong guess only wastes GPU time).
+/// `step` is still called once per call, and a captured array is read when the loop runs.
 ///
 /// ```
 /// # use luma::*;
@@ -39,7 +48,7 @@ pub fn iterate_all<T: ScalarType, const N: usize>(
     const { assert!(N >= 1, "iterate_all takes at least one array") };
     let location = Location::caller();
     let ctx = init[0].context();
-    match run_iterate_all(init, steps, &step) {
+    match run_iterate_all(init, steps, &step, location) {
         Ok(states) => states,
         Err(failure) => {
             let error = match failure {
@@ -59,6 +68,7 @@ fn run_iterate_all<T: ScalarType, const N: usize>(
     init: [&Array<T>; N],
     steps: usize,
     step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+    location: &'static Location<'static>,
 ) -> Outcome<[Array<T>; N]> {
     let ctx = init[0].context();
     if init.iter().any(|array| !ctx.same_as(array.context())) {
@@ -77,22 +87,31 @@ fn run_iterate_all<T: ScalarType, const N: usize>(
         single &= array.storage()?.segments() == 1;
     }
     if single {
-        return replayed_all(init, steps, step);
+        return replayed_all(init, steps, step, location);
     }
     iterate_all_aliased(init, steps, step)
 }
 
 /// `iterate_all` for states of one buffer each: `step` is traced once on placeholders while the
-/// context records its launches, and the recorded launches are replayed `steps` times.
+/// context records its launches, and the recorded launches are replayed `steps` times. A step that
+/// turns out to be one elementwise program runs as a register loop, from the program of the last
+/// call at `location` when the step builds the same graph (see `jit::Attempt`).
 fn replayed_all<T: ScalarType, const N: usize>(
     init: [&Array<T>; N],
     steps: usize,
     step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+    location: &'static Location<'static>,
 ) -> Outcome<[Array<T>; N]> {
     let ctx = init[0].context();
-    let (mut trace, probes) = Trace::start(&init)?;
+    let (mut trace, probes) = Trace::prepare(&init)?;
+    let site = jit::Site::new(location, TypeId::of::<T>(), N, trace.init[0].len());
+    let mut attempt = jit::Attempt::begin(ctx, site, &trace.init, &trace.probe_storages, steps);
+    trace.begin()?;
     let Ok(probes): std::result::Result<[Array<T>; N], _> = probes.try_into() else { unreachable!() };
     let first = step(&probes);
+    if let Some(attempt) = &mut attempt {
+        attempt.stepped();
+    }
     let shapes_match = first.iter().zip(&init).all(|(next, array)| next.shape() == array.shape());
 
     if trace.untouched() {
@@ -101,7 +120,10 @@ fn replayed_all<T: ScalarType, const N: usize>(
         let traced: Option<Vec<Arc<jit::Node>>> = first.iter().map(|next| next.pending().cloned()).collect();
         if shapes_match
             && let (Ok(count), Some(outs)) = (u32::try_from(steps), traced)
-            && let Some(result) = jit::run_loop(ctx, &trace.probe_storages, &trace.init, &outs, count)
+            && let Some(result) = match attempt.take() {
+                Some(attempt) => attempt.run(&trace.probe_storages, &trace.init, &outs),
+                None => jit::run_loop(ctx, &trace.probe_storages, &trace.init, &outs, count),
+            }
         {
             let mut outputs = result?.into_iter();
             return Ok(init.map(|array| match outputs.next() {
