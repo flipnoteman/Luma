@@ -46,7 +46,11 @@ pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
             Some(p) => p | term,
             None => term,
         });
-        before = before + a;
+        // A new lazy array, not `+=`: that would write into the buffer `before` may share.
+        #[allow(clippy::assign_op_pattern)]
+        {
+            before = before + a;
+        }
     }
     let count = before; // accepted candidates of the whole group
     let first_slot = count.cumsum(2) - &count;
