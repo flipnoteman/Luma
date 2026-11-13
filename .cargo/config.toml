@@ -1,0 +1,4 @@
+[env]
+# Tests, examples and benchmarks run from this repository keep their compiled-pipeline and calibration cache
+# in `target/` instead of the user's cache directory (see `LUMA_CACHE_DIR` in the README).
+LUMA_CACHE_DIR = { value = "target/luma-cache", relative = true }

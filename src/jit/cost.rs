@@ -37,7 +37,7 @@ impl CostModel {
         launch_us: 2.9,
         bandwidth_gbs: 740.0,
         f32_ops_per_ns: 16000.0,
-        df32_factor: 36.0,
+        df32_factor: 27.0,
         f64_factor: Some(41.0),
     };
     /// Every other GPU, measured on a RADV Raphael iGPU (median of 5 runs).
@@ -58,7 +58,7 @@ impl CostModel {
     };
     /// The numbers tests pin so that kernel counts do not depend on the machine.
     #[cfg(test)]
-    pub(crate) const TEST: CostModel = CostModel::NVIDIA;
+    pub(crate) const TEST: CostModel = CostModel { launch_us: 2.9, bandwidth_gbs: 740.0, f32_ops_per_ns: 16000.0, df32_factor: 36.0, f64_factor: Some(41.0) };
 
     /// The fixed numbers of a tuning profile, used when calibration is off or fails.
     pub fn fallback(profile: TuningProfile) -> CostModel {
@@ -117,8 +117,22 @@ pub(crate) fn kernel_ns(cost: &CostModel, bytes: f64, ops: f64) -> f64 {
     cost.launch_us * 1e3 + (bytes / cost.bandwidth_gbs).max(ops / cost.f32_ops_per_ns)
 }
 
+/// Invocations per f32 operation per nanosecond of throughput at which a kernel keeps the
+/// device's arithmetic units busy (a device that does more per nanosecond needs more invocations
+/// in flight: 2 x 16 000 for an RTX 3090). Fewer leave them idle: the work of every invocation
+/// runs in sequence, so a kernel of 20 000 cells does not run at the throughput calibration
+/// measures over a million, and a kernel that staged a region in workgroup tiles of 512 cells
+/// has half the invocations of one of 256.
+const SATURATION_PER_OP_RATE: f64 = 2.0;
+
+/// [`kernel_ns`] for a kernel that runs `invocations` invocations (see [`SATURATION_PER_OP_RATE`]).
+pub(crate) fn kernel_ns_on(cost: &CostModel, bytes: f64, ops: f64, invocations: f64) -> f64 {
+    let busy = (invocations / (SATURATION_PER_OP_RATE * cost.f32_ops_per_ns)).clamp(1e-3, 1.0);
+    cost.launch_us * 1e3 + (bytes / cost.bandwidth_gbs).max(ops / (cost.f32_ops_per_ns * busy))
+}
+
 /// Times of calibration kernels are the best of this many measurements.
-const BEST_OF: usize = 3;
+const BEST_OF: usize = 5;
 /// Launches recorded before one `sync` in a measurement, amortising submission and the wait.
 const REPS: u32 = 4;
 /// Launches of the launch-overhead measurement.
@@ -194,7 +208,7 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
     let per_op_f32 = t_alu / (2.0 * f64::from(k_alu) * f64::from(n_alu));
 
     let df = kernel_source(
-        &df_library("p.g"),
+        &df_library("p.g", ctx.tuning().df_fma, false),
         "vec2<f32>",
         "vec2<f32>(in0[i], 0.0)",
         "x = df_add(df_mul(x, vec2<f32>(1.0001, 0.0)), vec2<f32>(0.5, 0.0));",
@@ -213,6 +227,36 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
 
     let t_launch = time_kernel(ctx, copy(), "CostLaunch", 1, 0, LAUNCHES)?;
     Ok(CostModel { launch_us: t_launch / 1000.0, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor })
+}
+
+/// How much worse than the profile's numbers a measurement may be before it counts as taken
+/// under contention (another process using the device) and is not believed.
+const CONTENDED: f64 = 4.0;
+
+/// Whether `measured` is worse than `reference` (the profile's fixed numbers) by more than
+/// [`CONTENDED`] in any number: a slower launch, less bandwidth or arithmetic throughput, or a
+/// costlier `Df32` or `f64` operation. Better than the reference is never suspicious (the
+/// reference is a typical device, not a limit).
+pub(crate) fn contended(measured: &CostModel, reference: &CostModel) -> bool {
+    let slower = |m: f64, r: f64| m > r * CONTENDED;
+    let lower = |m: f64, r: f64| m < r / CONTENDED;
+    slower(measured.launch_us, reference.launch_us)
+        || lower(measured.bandwidth_gbs, reference.bandwidth_gbs)
+        || lower(measured.f32_ops_per_ns, reference.f32_ops_per_ns)
+        || slower(measured.df32_factor, reference.df32_factor)
+        || matches!((measured.f64_factor, reference.f64_factor), (Some(m), Some(r)) if slower(m, r))
+}
+
+/// [`calibrate`], measured again once if the result looks contended (see [`contended`]):
+/// `None` if both measurements do, so that the caller neither uses nor keeps them.
+pub(crate) fn calibrate_clean(ctx: &Context, reference: &CostModel) -> Result<Option<CostModel>> {
+    for _ in 0..2 {
+        let model = calibrate(ctx)?;
+        if !contended(&model, reference) {
+            return Ok(Some(model));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -238,5 +282,29 @@ mod tests {
         let cost = CostModel { launch_us: 5.0, bandwidth_gbs: 100.0, f32_ops_per_ns: 1000.0, ..CostModel::TEST };
         assert_eq!(kernel_ns(&cost, 1e6, 0.0), 5000.0 + 1e4);
         assert_eq!(kernel_ns(&cost, 1e3, 1e8), 5000.0 + 1e5);
+    }
+
+    #[test]
+    fn only_a_measurement_much_worse_than_the_profile_counts_as_contended() {
+        let reference = CostModel::NVIDIA;
+        assert!(!contended(&reference, &reference));
+        let better = CostModel { launch_us: 1.0, bandwidth_gbs: 5000.0, f32_ops_per_ns: 1e5, df32_factor: 5.0, f64_factor: Some(2.0) };
+        assert!(!contended(&better, &reference), "a faster device is no sign of contention");
+        let slightly_worse = CostModel { launch_us: reference.launch_us * 3.9, bandwidth_gbs: reference.bandwidth_gbs / 3.9, ..reference };
+        assert!(!contended(&slightly_worse, &reference));
+        let worse = |change: fn(&mut CostModel)| {
+            let mut model = reference;
+            change(&mut model);
+            contended(&model, &reference)
+        };
+        assert!(worse(|m| m.launch_us *= 4.5), "launches 4.5 times slower");
+        assert!(worse(|m| m.bandwidth_gbs /= 4.5), "a quarter of the bandwidth");
+        assert!(worse(|m| m.f32_ops_per_ns /= 4.5), "a quarter of the arithmetic");
+        assert!(worse(|m| m.df32_factor *= 4.5), "Df32 4.5 times costlier");
+        assert!(worse(|m| m.f64_factor = m.f64_factor.map(|f| f * 4.5)), "f64 4.5 times costlier");
+        assert!(!worse(|m| m.f64_factor = None), "a device without f64 has nothing to compare");
+        // The spread HangHunt saw between processes sharing one GPU.
+        let busy = CostModel { launch_us: 57.9, bandwidth_gbs: 139.0, f32_ops_per_ns: 1282.0, ..reference };
+        assert!(contended(&busy, &reference));
     }
 }

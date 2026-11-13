@@ -1,5 +1,5 @@
 use std::hash::Hash;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use wgpu::{Buffer, BufferUsages};
@@ -10,7 +10,7 @@ use crate::jit::cost::{self, CostModel};
 use crate::jit::JitState;
 use crate::gpu::pager::Pager;
 use crate::gpu::handle;
-use crate::gpu::hash::FxMap;
+use crate::gpu::built::BuildCache;
 use crate::gpu::lock;
 use crate::gpu::pool::{self, BufferPool};
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
@@ -26,7 +26,6 @@ mod tests;
 
 use batch::{Batch, BindGroupCache, Bound};
 pub(crate) use record::{Cmd, CmdArg, Recording};
-use record::RecState;
 pub(crate) use batch::RawArg;
 use transfer::{FreeUploads, WaitHistory};
 use uniforms::Arena;
@@ -47,11 +46,11 @@ const MAPPABLE_STORAGE_USAGE: BufferUsages = STORAGE_USAGE.union(BufferUsages::M
 #[derive(Debug)]
 struct Inner {
     /// Built-in kernels, built on first use of their (operation, element type).
-    builtins: Mutex<FxMap<(Builtin, &'static str), Arc<KernelCore>>>,
+    builtins: BuildCache<(Builtin, &'static str), Arc<KernelCore>>,
     /// Lazy-evaluation state: fused kernels and the pending expressions.
     jit: JitState,
     /// Custom kernels, built on first use of their (source, entry, workgroup).
-    kernels: Mutex<FxMap<KernelKey, Arc<KernelCore>>>,
+    kernels: BuildCache<KernelKey, Arc<KernelCore>>,
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the cached bind groups still holding them are dropped at the
     /// next submission, which frees them.
@@ -76,10 +75,11 @@ struct Inner {
     /// What launches, memory traffic and arithmetic cost on this GPU, set once the context exists.
     cost: OnceLock<CostModel>,
     batch: Mutex<Batch>,
-    /// The launches captured by a recording, see [`record`].
-    recording: Mutex<RecState>,
-    /// Whether `recording` is active: checked first so that launches pay one load when it is not.
-    recording_active: std::sync::atomic::AtomicBool,
+    /// `Batch::dispatches`, kept where threads that only decide whether to submit can read it
+    /// without the lock of the batch.
+    dispatches_pending: std::sync::atomic::AtomicU32,
+    /// Tells this context from the others of the process (the recordings of a thread are kept by it, see [`record`]).
+    id: u64,
     /// How long recent waits took, which sets how long the next one polls before it blocks.
     waits: WaitHistory,
     /// The first error the GPU reported outside of a call that could return it.
@@ -205,17 +205,31 @@ pub struct ContextOptions {
     /// The check synchronizes with the GPU once per evaluated array, so it is for finding the
     /// operation that first produces a non-finite value, not for production runs.
     pub check_finite: bool,
-    /// Measure the device's throughputs when the context opens (about 100 ms on a GPU, once per
-    /// device and process); `false` uses the profile's fixed numbers (see [`CostModel`]).
+    /// Measure the device's throughputs when the context opens (about 150 ms on a GPU), once
+    /// per machine: a clean result is kept in the cache directory (see `LUMA_CACHE`) and read by
+    /// later processes. Each kernel is timed as the best of several runs, and a result worse
+    /// than the profile's numbers by more than 4 times in any throughput (a device shared with
+    /// other processes during the measurement) is measured once more and, if still so, dropped:
+    /// the process then uses the profile's fixed numbers and nothing is stored. `false` uses
+    /// the profile's fixed numbers (see [`CostModel`]).
     pub calibrate: bool,
     /// Allows rewrites of expressions that are not exact: `x + 0` becomes `x` (a `-0.0`
     /// stays `-0.0` instead of becoming `0.0`), `x * 0` becomes `0` and `x - x` becomes `0` (wrong
     /// for NaN and infinity), `x / x` becomes `1`, `x <= x`, `x >= x`, `x == x` become true and
     /// `x != x` false (wrong for NaN), `(x * a) * b` and `(x + a) + b` combine their constants
     /// (different rounding), `x / a` for a constant `a` becomes `x * (1 / a)`, and `powf(x, e)`
-    /// with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or `sqrt(x)`. Rewrites that keep every bit
-    /// (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
+    /// with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or `sqrt(x)`. `Df32` additions and
+    /// subtractions take the cheaper algorithm whose relative error grows with the cancellation
+    /// (below 2^-47 of the larger operand instead of 2^-46 of the result), except in reductions.
+    /// Rewrites that keep every bit (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
     pub fast_math: bool,
+    /// Whether the device's `fma` is a fused multiply-add, which makes the products of `Df32`
+    /// arithmetic several times cheaper (see `Df32` in the crate docs). `None`: found out by a
+    /// small test kernel when the device is first opened (`true` on Vulkan GPUs that fuse,
+    /// `false` where `fma` is a multiplication and an addition, as on some software
+    /// rasterizers); `Some(false)` forces the splitting everywhere, `Some(true)` trusts the
+    /// caller. `LUMA_DF_FMA=on|off`. The results are the same either way.
+    pub df_fma: Option<bool>,
 }
 
 impl Default for ContextOptions {
@@ -227,6 +241,7 @@ impl Default for ContextOptions {
             check_finite: false,
             calibrate: true,
             fast_math: false,
+            df_fma: None,
         }
     }
 }
@@ -235,6 +250,13 @@ impl ContextOptions {
     /// Turns calibration of the cost model on or off (see [`ContextOptions::calibrate`]).
     pub fn calibrate(mut self, on: bool) -> Self {
         self.calibrate = on;
+        self
+    }
+
+    /// Forces the `Df32` library's products to use `fma` (`true`) or Dekker's splitting
+    /// (`false`) instead of what the device's test says (see [`ContextOptions::df_fma`]).
+    pub fn df_fma(mut self, fused: bool) -> Self {
+        self.df_fma = Some(fused);
         self
     }
 
@@ -291,6 +313,11 @@ impl ContextOptions {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
             fast_math: std::env::var("LUMA_FAST_MATH")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
+            df_fma: std::env::var("LUMA_DF_FMA").ok().and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "on" | "true" => Some(true),
+                "0" | "off" | "false" => Some(false),
+                _ => None,
+            }),
         }
     }
 }
@@ -394,12 +421,17 @@ impl Context {
                 max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
                 timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
                 zero_copy: device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
-                tuning: Tuning::for_adapter(&gpu.0.adapter, &limits, device.features()),
+                tuning: {
+                    let mut tuning = Tuning::for_adapter(&gpu.0.adapter, &limits, device.features());
+                    tuning.df_fma = options.df_fma.unwrap_or(gpu.0.df_fma);
+                    tuning.df_sloppy_add = options.fast_math;
+                    tuning
+                },
                 cost: OnceLock::new(),
                 gpu,
-                builtins: Mutex::new(FxMap::default()),
+                builtins: BuildCache::default(),
                 jit: JitState::new(&limits),
-                kernels: Mutex::new(FxMap::default()),
+                kernels: BuildCache::default(),
                 pool: Mutex::new(BufferPool::new(cap)),
                 released: Arc::new(Mutex::new(Vec::new())),
                 uploads: Arc::new(Mutex::new(FreeUploads::new(cap))),
@@ -410,8 +442,8 @@ impl Context {
                 pager: Pager::new(budget),
                 unmapped: Mutex::new(Vec::new()),
                 batch: Mutex::new(batch),
-                recording: Mutex::new(RecState::Idle),
-                recording_active: std::sync::atomic::AtomicBool::new(false),
+                dispatches_pending: std::sync::atomic::AtomicU32::new(0),
+                id: record::next_context_id(),
                 waits: WaitHistory::new(),
                 gpu_error,
                 #[cfg(test)]
@@ -423,7 +455,20 @@ impl Context {
         let profile = ctx.inner.tuning.profile;
         let model = if options.calibrate {
             *ctx.inner.gpu.0.cost.get_or_init(|| {
-                cost::calibrate(&ctx).unwrap_or_else(|_| CostModel::fallback(profile))
+                // Measured once per machine: a stored result for this device and driver wins,
+                // and only a measurement that does not look contended is stored (see
+                // `cost::contended`); otherwise this process runs on the profile's numbers.
+                let disk = ctx.disk_cache();
+                let fallback = CostModel::fallback(profile);
+                disk.load_cost().filter(|stored| !cost::contended(stored, &fallback)).unwrap_or_else(|| {
+                    match cost::calibrate_clean(&ctx, &fallback) {
+                        Ok(Some(measured)) => {
+                            disk.store_cost(&measured);
+                            measured
+                        }
+                        _ => fallback,
+                    }
+                })
             })
         } else {
             CostModel::fallback(profile)
@@ -542,6 +587,17 @@ impl Context {
         &self.inner.gpu.0.device
     }
 
+    /// The on-disk cache of the device (pipelines, calibration).
+    pub(crate) fn disk_cache(&self) -> &crate::gpu::cache::DiskCache {
+        &self.inner.gpu.0.disk
+    }
+
+    /// The adapter the context runs on.
+    #[cfg(test)]
+    pub(crate) fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.inner.gpu.0.adapter
+    }
+
     pub(crate) fn queue(&self) -> &wgpu::Queue {
         &self.inner.gpu.0.queue
     }
@@ -587,21 +643,21 @@ impl Context {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    pub(crate) fn kernel_cache(&self) -> MutexGuard<'_, FxMap<KernelKey, Arc<KernelCore>>> {
-        lock(&self.inner.kernels)
+    /// The cache of custom kernels (see [`KernelBuilder::build`]).
+    pub(crate) fn kernel_cache(&self) -> &BuildCache<KernelKey, Arc<KernelCore>> {
+        &self.inner.kernels
     }
 
     /// The cached built-in kernel for `op` on elements of WGSL type `ty`, compiled on first use.
     pub(crate) fn builtin(&self, op: Builtin, ty: &'static str) -> Result<Arc<KernelCore>> {
-        let mut cache = lock(&self.inner.builtins);
-        if let Some(core) = cache.get(&(op, ty)) {
-            return Ok(Arc::clone(core));
-        }
-        let key = KernelKey::new(op.source(ty, &self.inner.tuning).into_owned(), "main", None);
-        let label = format!("{op:?} {ty}");
-        let core = Arc::new(kernel::build_core(self, &key, Some(&label), true)?);
-        cache.insert((op, ty), Arc::clone(&core));
-        Ok(core)
+        self.inner
+            .builtins
+            .get_or_build(&(op, ty), || {
+                let key = KernelKey::new(op.source(ty, &self.inner.tuning).into_owned(), "main", None);
+                let label = format!("{op:?} {ty}");
+                kernel::build_core(self, &key, Some(&label), true).map(Arc::new)
+            })
+            .map(|(core, _)| core)
     }
 
     /// Takes a buffer of at least `bytes` bytes with exactly `usage` from the pool, creating one

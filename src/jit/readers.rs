@@ -81,8 +81,14 @@ const PRUNE_MIN: usize = 32;
 
 impl Readers {
     pub(crate) fn add(&self, node: &Arc<Node>) {
+        self.add_weak(Arc::downgrade(node));
+    }
+
+    /// [`Readers::add`] for a caller that made the weak reference already (making one is an
+    /// atomic compare-and-swap; cloning one is cheaper).
+    pub(super) fn add_weak(&self, weak: Weak<Node>) {
         let mut list = lock(&self.list);
-        list.nodes.push(Arc::downgrade(node));
+        list.nodes.push(weak);
         if list.nodes.len() > list.prune_at.max(PRUNE_MIN) {
             list.nodes.retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
             list.prune_at = list.nodes.len().saturating_mul(2);

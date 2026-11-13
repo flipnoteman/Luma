@@ -4,17 +4,22 @@
 //! the GPU state to be real (copies, uploads, readbacks, syncs, indirect launches) first aborts
 //! the recording: the captured commands are then encoded in order, as if they had never been held
 //! back, and the traced code carries on running normally.
+//!
+//! A recording belongs to the thread that began it and only that thread's launches are captured
+//! by it, so the recordings of the threads that share a context live in thread-local storage:
+//! every thread has its own (traces of several threads run side by side, none waits for or
+//! disturbs another's), and the launch path of a thread that is not recording looks at nothing
+//! but its own thread-local list.
 
-use std::sync::atomic::Ordering;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread::{self, ThreadId};
 
 use wgpu::Buffer;
 
 use crate::array::Storage;
 use crate::error::Result;
 use crate::gpu::hash::FxMap;
-use crate::gpu::lock;
 use crate::gpu::pager::Pin;
 use crate::kernel::KernelCore;
 
@@ -61,7 +66,6 @@ impl Cmd {
 /// What a recording has captured so far, and what keeps it valid.
 #[derive(Debug)]
 pub(crate) struct Recording {
-    owner: ThreadId,
     /// `(from, to)`: `to` must hold the contents of `from` before any captured command runs.
     pub seed: Vec<(Arc<Storage>, Arc<Storage>)>,
     pub cmds: Vec<Cmd>,
@@ -73,44 +77,77 @@ pub(crate) struct Recording {
     kernels: FxMap<u64, Arc<KernelCore>>,
 }
 
-#[derive(Debug, Default)]
-pub(super) enum RecState {
-    #[default]
-    Idle,
+/// The state of this thread's recording on a context; a thread without an entry has none.
+#[derive(Debug)]
+enum RecState {
     Active(Recording),
-    /// The recording was aborted; the owner's `end_recording` returns to `Idle`.
+    /// The recording was aborted; `end_recording` removes it.
     Aborted,
 }
 
+/// The numbers that tell contexts apart in [`RECORDINGS`] (the address of a dropped context can come back).
+static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A number no other context of the process has.
+pub(super) fn next_context_id() -> u64 {
+    NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The recordings of the current thread by context id (at most one per context).
+    static RECORDINGS: RefCell<Vec<(u64, RecState)>> = const { RefCell::new(Vec::new()) };
+}
+
 impl Context {
-    /// Starts capturing this thread's launches. `false` (nothing started) unless no recording is
-    /// active or aborted on the context.
+    /// Runs `f` on this thread's entry for this context (if it has one) in [`RECORDINGS`].
+    fn with_entry<R>(&self, f: impl FnOnce(&mut RecState) -> R) -> Option<R> {
+        let id = self.inner.id;
+        // A thread that is being torn down has no recordings left to look at.
+        RECORDINGS
+            .try_with(|all| {
+                let mut all = all.borrow_mut();
+                if all.is_empty() {
+                    return None;
+                }
+                all.iter_mut().find(|(known, _)| *known == id).map(|(_, state)| f(state))
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Starts capturing this thread's launches. `false` (nothing started) if this thread has a
+    /// recording (active or aborted) on the context already. Other threads' recordings do not
+    /// matter.
     pub(crate) fn begin_recording(&self, seed: Vec<(Arc<Storage>, Arc<Storage>)>) -> bool {
-        let mut state = lock(&self.inner.recording);
-        if !matches!(*state, RecState::Idle) {
-            return false;
-        }
-        *state = RecState::Active(Recording {
-            owner: thread::current().id(),
-            seed,
-            cmds: Vec::new(),
-            pins: Vec::new(),
-            retired: Vec::new(),
-            kernels: FxMap::default(),
-        });
-        self.inner.recording_active.store(true, Ordering::Release);
-        true
+        let id = self.inner.id;
+        RECORDINGS
+            .try_with(|all| {
+                let mut all = all.borrow_mut();
+                if all.iter().any(|(known, _)| *known == id) {
+                    return false;
+                }
+                all.push((
+                    id,
+                    RecState::Active(Recording {
+                        seed,
+                        cmds: Vec::new(),
+                        pins: Vec::new(),
+                        retired: Vec::new(),
+                        kernels: FxMap::default(),
+                    }),
+                ));
+                true
+            })
+            .unwrap_or(false)
     }
 
     /// Runs `f` on the recording if one is active on the calling thread.
     fn with_recording<R>(&self, f: impl FnOnce(&mut Recording) -> R) -> Option<R> {
-        if !self.inner.recording_active.load(Ordering::Relaxed) {
-            return None;
-        }
-        match &mut *lock(&self.inner.recording) {
-            RecState::Active(recording) if recording.owner == thread::current().id() => Some(f(recording)),
-            _ => None,
-        }
+        self.with_entry(|state| match state {
+            RecState::Active(recording) => Some(f(recording)),
+            RecState::Aborted => None,
+        })
+        .flatten()
     }
 
     /// Whether this thread has an active recording.
@@ -123,17 +160,19 @@ impl Context {
         self.with_recording(|recording| recording.cmds.len()).unwrap_or(0)
     }
 
-    /// Ends this thread's recording and returns it, or `None` if it was aborted.
+    /// Ends this thread's recording and returns it, or `None` if it was aborted (or there is none).
     pub(crate) fn end_recording(&self) -> Option<Recording> {
-        let mut state = lock(&self.inner.recording);
-        match &*state {
-            RecState::Active(recording) if recording.owner != thread::current().id() => return None,
-            RecState::Idle => return None,
-            _ => {}
-        }
-        self.inner.recording_active.store(false, Ordering::Release);
-        match std::mem::take(&mut *state) {
-            RecState::Active(recording) => Some(recording),
+        let id = self.inner.id;
+        let state = RECORDINGS
+            .try_with(|all| {
+                let mut all = all.borrow_mut();
+                let at = all.iter().position(|(known, _)| *known == id)?;
+                Some(all.swap_remove(at).1)
+            })
+            .ok()
+            .flatten();
+        match state {
+            Some(RecState::Active(recording)) => Some(recording),
             _ => None,
         }
     }
@@ -174,20 +213,13 @@ impl Context {
     /// Ends the recording of this thread, if any, as if it had never been held back: the seeds
     /// are copied and the captured commands encoded, in order.
     pub(crate) fn abort_recording(&self) -> Result<()> {
-        if !self.inner.recording_active.load(Ordering::Relaxed) {
+        // Taken out (and left aborted) before anything is encoded: the commands must not be captured again.
+        let Some(recording) = self.with_entry(|state| match std::mem::replace(state, RecState::Aborted) {
+            RecState::Active(recording) => Some(recording),
+            RecState::Aborted => None,
+        })
+        .flatten() else {
             return Ok(());
-        }
-        let recording = {
-            let mut state = lock(&self.inner.recording);
-            match &*state {
-                RecState::Active(recording) if recording.owner == thread::current().id() => {}
-                _ => return Ok(()),
-            }
-            self.inner.recording_active.store(false, Ordering::Release);
-            match std::mem::replace(&mut *state, RecState::Aborted) {
-                RecState::Active(recording) => recording,
-                _ => return Ok(()),
-            }
         };
         let result = (|| {
             for (from, to) in &recording.seed {

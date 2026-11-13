@@ -9,7 +9,7 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{BinOp, Builtin, CmpOp, UnOp};
+use crate::builtin::{BinOp, Builtin, CmpOp, EpilogueStep, UnOp};
 use crate::context::{Context, RawArg};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{Df32, GpuType, ScalarType};
@@ -138,6 +138,10 @@ impl<T: ScalarType> Array<T> {
         op: UnOp,
         location: &'static Location<'static>,
     ) -> Outcome<Array<T>> {
+        // A reduction that has not run takes the operation into its last pass.
+        if let Some(fused) = self.fuse_step::<T>(EpilogueStep::Unary(op), 0) {
+            return Ok(fused);
+        }
         let operand = self.src()?;
         let op_kind = Op::new(OpKind::Unary(op), ElemTy::of::<T>()?);
         lazy(
@@ -279,6 +283,12 @@ impl<T: ScalarType> Array<T> {
         name: &'static str,
         location: &'static Location<'static>,
     ) -> Array<T> {
+        if let Rhs::Scalar(value) = &rhs
+            && let Ok(scalar) = Scalar::of(*value)
+            && let Some(fused) = self.fuse_step::<T>(EpilogueStep::Binary { op, scalar_left }, scalar.words()[0])
+        {
+            return fused;
+        }
         let result = self.run_binary(rhs, scalar_left, OpKind::Binary(op), name, location);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
@@ -537,6 +547,14 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
         return Err(LumaError::ContextMismatch);
     }
     for array in arrays {
+        // A reduction is recorded when it is requested, whatever the postponement: the arrays asked
+        // for before it are computed first, so that what it shares with them (the residual of a
+        // step is summed, and is also what the update of the state reads) is computed once, by
+        // their kernel, and not by the reduction alone with every intermediate evaluated on its
+        // own.
+        if array.reduced().is_some_and(|reduced| reduced.is_unforced()) {
+            ctx.jit().evaluate_requested();
+        }
         array.request()?;
     }
     // Consecutive calls that advance the same f32 arrays through the same step are a loop.

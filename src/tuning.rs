@@ -17,6 +17,20 @@ const MAX_LIVE_ENV: &str = "LUMA_FUSION_MAX_LIVE";
 const MAX_INLINED_ENV: &str = "LUMA_FUSION_MAX_INLINED";
 /// `LUMA_STAGING=off` keeps sub-programs read through views out of workgroup memory (see `jit::staging`).
 const STAGING_ENV: &str = "LUMA_STAGING";
+/// `LUMA_TRIDIAGONAL=thomas|cyclic|auto` picks the line solver of `solve_tridiagonal` (see [`LineSolver`]).
+const LINE_SOLVER_ENV: &str = "LUMA_TRIDIAGONAL";
+
+/// The algorithm of the tridiagonal and block-tridiagonal line solves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LineSolver {
+    /// Cyclic reduction for few, long lines when a line fits the workgroup memory budget
+    /// ([`Tuning::line_bytes`], spilling the rest to global memory), Thomas otherwise.
+    Auto,
+    /// One invocation per line, always.
+    Thomas,
+    /// One workgroup per line whenever the device can run it.
+    Cyclic,
+}
 
 /// The device family a tuning profile was measured on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -63,6 +77,24 @@ pub(crate) struct Tuning {
     /// Whether sub-programs read through translation views at several offsets may be computed once
     /// per workgroup tile in workgroup memory (see `jit::staging`); `LUMA_STAGING=off` clears it.
     pub(crate) staging: bool,
+    /// Whether the device's `fma` is a fused multiply-add (one rounding), so that the library's
+    /// `Df32` products take the exact error of a product from it instead of splitting the
+    /// factors. Measured when the device opens (see `gpu::fma`) or forced with
+    /// `ContextOptions::df_fma`; the constants say `false` and the context fills it in.
+    pub(crate) df_fma: bool,
+    /// Whether `Df32` additions use the cheaper algorithm whose relative error grows with the
+    /// cancellation (set by `ContextOptions::fast_math`, see `builtin::df_library`).
+    pub(crate) df_sloppy_add: bool,
+    /// Workgroup memory the rows of one line of a cyclic-reduction tridiagonal solve may take; the
+    /// rows beyond it live in global memory (see `cyclic`).
+    pub(crate) line_bytes: u32,
+    /// Most lines, weighted by `block^2` (lines along the contiguous axis) or `4 * block`
+    /// (strided lines), the automatic choice still solves by cyclic reduction: with more lines the
+    /// one-invocation-per-line Thomas solve fills the device and is faster (see `cyclic::plan`);
+    /// 0 never chooses cyclic reduction on its own.
+    pub(crate) line_cyclic_work: u32,
+    /// Which tridiagonal solver runs; `LUMA_TRIDIAGONAL` overrides.
+    pub(crate) line_solver: LineSolver,
 }
 
 impl Tuning {
@@ -82,6 +114,12 @@ impl Tuning {
         max_live: 64,
         max_inlined: 1024,
         staging: true,
+        df_fma: false,
+        df_sloppy_add: false,
+        line_bytes: 16 * 1024,
+        // Not measured on Apple GPUs: Thomas unless forced.
+        line_cyclic_work: 0,
+        line_solver: LineSolver::Auto,
     };
 
     const NVIDIA: Tuning = Tuning {
@@ -99,6 +137,12 @@ impl Tuning {
         max_live: 96,
         max_inlined: 1536,
         staging: true,
+        df_fma: false,
+        df_sloppy_add: false,
+        line_bytes: 32 * 1024,
+        // RTX 3090, see `cyclic::plan`.
+        line_cyclic_work: 8192,
+        line_solver: LineSolver::Auto,
     };
 
     const GENERIC: Tuning = Tuning {
@@ -116,6 +160,12 @@ impl Tuning {
         max_live: 96,
         max_inlined: 1024,
         staging: true,
+        df_fma: false,
+        df_sloppy_add: false,
+        line_bytes: 16 * 1024,
+        // Not measured on other GPUs (a RADV iGPU was slower, 8.7 vs 3.0 ms for 200 lines of 4096): Thomas unless forced.
+        line_cyclic_work: 0,
+        line_solver: LineSolver::Auto,
     };
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
@@ -150,6 +200,11 @@ impl Tuning {
         }
         tuning.subgroups = features.contains(wgpu::Features::SUBGROUP) && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
         tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
+        tuning.line_solver = match std::env::var(LINE_SOLVER_ENV).as_deref().map(str::trim) {
+            Ok("thomas") => LineSolver::Thomas,
+            Ok("cyclic") => LineSolver::Cyclic,
+            _ => LineSolver::Auto,
+        };
         tuning
     }
 
@@ -168,6 +223,7 @@ impl Tuning {
             self.conv_per_thread /= 2;
         }
         self.stencil_tile_bytes = self.stencil_tile_bytes.min(limits.max_compute_workgroup_storage_size);
+        self.line_bytes = self.line_bytes.min(limits.max_compute_workgroup_storage_size);
         // `stencil::layout` always runs at least one step, whatever the budget.
         while self.stencil_tile_1d > 32 && stencil_bytes((self.stencil_tile_1d, 1), (STENCIL_RADIUS, 0)) > self.stencil_tile_bytes {
             self.stencil_tile_1d /= 2;
@@ -226,6 +282,7 @@ mod tests {
             let t = tuning.within(&limits);
             assert!(conv_workgroup_bytes(t.conv_workgroup, t.conv_per_thread) <= limits.max_compute_workgroup_storage_size, "{t:?}");
             assert!(t.stencil_tile_bytes <= limits.max_compute_workgroup_storage_size);
+            assert!(t.line_bytes <= limits.max_compute_workgroup_storage_size);
             assert!(stencil_bytes((t.stencil_tile_1d, 1), (STENCIL_RADIUS, 0)) <= t.stencil_tile_bytes, "{t:?}");
             assert!(stencil_bytes(t.stencil_tile_2d, (STENCIL_RADIUS, STENCIL_RADIUS)) <= t.stencil_tile_bytes, "{t:?}");
             assert!(t.elementwise_workgroup <= limits.max_compute_invocations_per_workgroup);

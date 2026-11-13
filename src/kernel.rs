@@ -135,12 +135,8 @@ impl<'a> KernelBuilder<'a> {
             entry: self.entry,
             workgroup: self.workgroup,
         };
-        let mut cache = self.ctx.kernel_cache();
-        if let Some(core) = cache.get(&key) {
-            return Ok(Kernel { ctx: self.ctx.clone(), core: core.clone() });
-        }
-        let core = Arc::new(build_core(self.ctx, &key, self.label.as_deref(), false)?);
-        cache.insert(key, core.clone());
+        let label = self.label.as_deref();
+        let (core, _) = self.ctx.kernel_cache().get_or_build(&key, || build_core(self.ctx, &key, label, false).map(Arc::new))?;
         Ok(Kernel { ctx: self.ctx.clone(), core })
     }
 }
@@ -343,7 +339,8 @@ pub(crate) fn build_core(
     });
     let shader_desc = wgpu::ShaderModuleDescriptor {
         label,
-        source: wgpu::ShaderSource::Wgsl(combined.into()),
+        // The module luma parsed and validated, not its text: wgpu would parse it a second time.
+        source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
     };
     let shader = if trusted {
         // Integer division keeps its guards: WGSL defines `x / 0` and `x % 0`, and user data
@@ -360,7 +357,7 @@ pub(crate) fn build_core(
     } else {
         device.create_shader_module(shader_desc)
     };
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let pipeline = crate::gpu::exit::driver_call(|| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label,
         layout: Some(&pipeline_layout),
         module: &shader,
@@ -370,8 +367,9 @@ pub(crate) fn build_core(
             zero_initialize_workgroup_memory: !trusted,
             ..Default::default()
         },
-        cache: None,
-    });
+        cache: ctx.disk_cache().pipelines(),
+    }));
+    ctx.disk_cache().built();
 
     Ok(KernelCore {
         id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),

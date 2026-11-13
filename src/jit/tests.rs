@@ -45,6 +45,7 @@ fn delta(before: StatsSnapshot, after: StatsSnapshot) -> StatsSnapshot {
         hits: after.hits - before.hits,
         elementwise_launches: after.elementwise_launches - before.elementwise_launches,
         reduce_launches: after.reduce_launches - before.reduce_launches,
+        reduce_passes: after.reduce_passes - before.reduce_passes,
     }
 }
 
@@ -175,8 +176,8 @@ fn reductions_fuse_their_input_expression() {
     let max = (&a * 2.0 - 1.0).max().item().unwrap();
     let mean = (&a + &b).mean().item().unwrap();
     let d = delta(before, ctx.jit().stats());
-    // The expression is never materialized; `norm` and `mean` finish with a one-element kernel each.
-    assert_eq!(d.elementwise_launches, 2);
+    // The expression is never materialized; `norm` and `mean` finish inside the last pass of their reduction.
+    assert_eq!(d.elementwise_launches, 0);
     assert_eq!(d.reduce_launches, 4);
     let want_norm = xs
         .iter()
@@ -195,7 +196,7 @@ fn reductions_fuse_their_input_expression() {
     // u32: counting a mask.
     let count = a.gt(0.0).sum().item().unwrap();
     assert_eq!(count as usize, xs.iter().filter(|&&x| x > 0.0).count());
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
 
     // Sizes around the block boundaries, one-element arrays included.
     for len in [1usize, 2, 255, 1023, 1024, 1025, 4096, 4097, 1024 * 1024 + 3] {
@@ -232,7 +233,7 @@ fn reducing_an_expression_does_not_evaluate_it() {
     let before = ctx.jit().stats();
     let again = t.sum().item().unwrap();
     assert_eq!(again, s);
-    assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 0);
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
 }
 
 #[test]
@@ -309,9 +310,37 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
 }
 
+/// Where arithmetic costs more than a launch and a pass over the buffers, so that every pending
+/// node that two expressions read is worth evaluating first (see `worth_storing`).
+fn costly_arithmetic() -> CostModel {
+    CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }
+}
+
+#[test]
+fn a_cheap_node_with_two_consumers_is_computed_by_each() {
+    let ctx = ctx();
+    let xs = values(400, 11, 0.5, 2.0);
+    let ys = values(400, 12, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let y = f32s(&ctx, &ys);
+
+    // A launch costs more than computing `t` once more over 400 elements: no kernel is spent on it.
+    let before = ctx.jit().stats();
+    let t = (&x * &y).sqrt();
+    let u = &t + 1.0;
+    let v = &t * 2.0;
+    let got_u = u.to_vec().unwrap();
+    let got_v = v.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2, "u and v compute t each");
+    let t_ref: Vec<f32> = xs.iter().zip(&ys).map(|(&a, &b)| (a * b).sqrt()).collect();
+    assert_close(&got_u, &t_ref.iter().map(|v| v + 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+    assert_close(&got_v, &t_ref.iter().map(|v| v * 2.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+}
+
 #[test]
 fn a_node_with_two_consumers_is_computed_once() {
     let ctx = ctx();
+    ctx.set_cost_model(costly_arithmetic());
     let xs = values(400, 11, 0.5, 2.0);
     let ys = values(400, 12, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
@@ -579,7 +608,8 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
 
 
     // A shifted expression shared with an outside consumer is evaluated once instead of being
-    // recomputed inside the shift's kernel.
+    // recomputed inside the shift's kernel (where computing it costs more than a launch).
+    ctx.set_cost_model(costly_arithmetic());
     let before = ctx.jit().stats();
     let shared = &x * 3.0 + 1.0;
     let shifted = shared.shift(1);
@@ -591,6 +621,7 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
     let want_other: Vec<f32> = xs.iter().map(|&v| v * 3.0 - 1.0).collect();
     assert_close(&got_shifted, &want_shifted, 1e-5, 1e-5);
     assert_close(&got_other, &want_other, 1e-5, 1e-5);
+    ctx.set_cost_model(CostModel::TEST);
     // A shifted read inside a reduction's first pass.
     let before = ctx.jit().stats();
     let lag = (&x * &x.shift(3)).sum().item().unwrap();
@@ -847,6 +878,134 @@ fn several_reductions_share_one_pass() {
     assert_eq!((a, b), (hi / 2.0, hi / 2.0));
 }
 
+/// Every kernel launched since `before`: fused elementwise kernels, first passes of reductions
+/// and their later passes.
+fn launches(d: StatsSnapshot) -> u64 {
+    d.elementwise_launches + d.reduce_launches + d.reduce_passes
+}
+
+fn sum_squares(xs: &[f32]) -> f64 {
+    xs.iter().map(|&v| f64::from(v) * f64::from(v)).sum()
+}
+
+#[test]
+fn the_epilogue_of_a_reduction_runs_in_its_last_pass() {
+    let ctx = ctx();
+    // Over a workgroup's block (a second pass over the partial results), and within one.
+    for (n, passes) in [(300_001usize, 2u64), (1000, 1)] {
+        let xs = values(n, 60, -1.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        let want = sum_squares(&xs).sqrt();
+        let rms = (sum_squares(&xs) / n as f64).sqrt();
+
+        // On the host.
+        let before = ctx.jit().stats();
+        let norm = x.norm().item().unwrap();
+        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "norm of {n} elements");
+        assert!((f64::from(norm) - want).abs() <= 1e-4 * want, "{norm} vs {want}");
+
+        // As a buffer on the GPU.
+        let before = ctx.jit().stats();
+        let rms_gpu = (&(&x * &x).sum() / (n as f32)).sqrt();
+        rms_gpu.eval().unwrap();
+        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "rms of {n} elements");
+        let got = f64::from(rms_gpu.item().unwrap());
+        assert!((got - rms).abs() <= 1e-4 * rms, "{got} vs {rms}");
+
+        // Of an expression, used in another expression.
+        let before = ctx.jit().stats();
+        let scaled = (x.sum() / (n as f32)).sqrt();
+        let y = &x * &scaled;
+        let ys = y.to_vec().unwrap();
+        let mean_abs = (xs.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64).abs().sqrt();
+        assert_eq!(launches(delta(before, ctx.jit().stats())), passes + 1, "x * sqrt(mean) of {n} elements");
+        for (got, want) in ys.iter().zip(&xs) {
+            assert!(
+                (f64::from(*got) - f64::from(*want) * mean_abs).abs() <= 1e-3 * f64::from(want.abs()).max(1e-3),
+                "{got} vs {want} * {mean_abs}"
+            );
+        }
+    }
+}
+
+#[test]
+fn steps_on_a_reduction_beyond_the_limit_run_as_an_expression() {
+    let ctx = ctx();
+    let xs = values(4000, 61, 0.5, 1.5);
+    let x = f32s(&ctx, &xs);
+    let sum: f64 = xs.iter().map(|&v| f64::from(v)).sum();
+    let before = ctx.jit().stats();
+    // Four steps are in the pass; the fifth is an expression on the buffer it leaves.
+    let r = (((x.sum() * 0.5).sqrt() + 1.0) * 2.0).abs().ln();
+    let got = f64::from(r.item().unwrap());
+    let want = (((sum * 0.5).sqrt() + 1.0) * 2.0).abs().ln();
+    assert!((got - want).abs() <= 1e-4 * want, "{got} vs {want}");
+    assert_eq!(launches(delta(before, ctx.jit().stats())), 3);
+
+    // The scalar on the left, and several reductions with the same steps.
+    let [lo, hi] = x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max]).to_array().unwrap();
+    let before = ctx.jit().stats();
+    let [a, b] = (2.0 - x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max])).to_array().unwrap();
+    assert_eq!(launches(delta(before, ctx.jit().stats())), 2);
+    assert_eq!((a, b), (2.0 - lo, 2.0 - hi));
+}
+
+#[test]
+fn a_reduction_that_ran_is_not_run_again_by_a_step_on_it() {
+    let ctx = ctx();
+    let xs = values(300_001, 62, -1.0, 1.0);
+    let n = xs.len() as f32;
+    let x = f32s(&ctx, &xs);
+    let sum: f64 = xs.iter().map(|&v| f64::from(v)).sum();
+    let total = x.sum();
+    let before = ctx.jit().stats();
+    total.eval().unwrap();
+    assert_eq!(launches(delta(before, ctx.jit().stats())), 2);
+    let before = ctx.jit().stats();
+    let mean = (&total / n).item().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    // The division of the sum's buffer, not the reduction again.
+    assert_eq!((d.reduce_launches + d.reduce_passes, d.elementwise_launches), (0, 1));
+    assert!((f64::from(total.item().unwrap()) - sum).abs() <= 1e-3);
+    assert!((f64::from(mean) - sum / f64::from(n)).abs() <= 1e-6, "{mean}");
+}
+
+#[test]
+fn the_temporaries_of_one_expression_do_not_keep_the_steps_out_of_the_pass() {
+    let ctx = ctx();
+    for (n, passes) in [(300_001usize, 2u64), (700, 1)] {
+        let xs = values(n, 64, -1.0, 1.0);
+        let x = f32s(&ctx, &xs);
+        let want = (sum_squares(&xs) / n as f64).sqrt();
+        let before = ctx.jit().stats();
+        // `x * x` and the sum and the quotient are alive while the root is taken.
+        let got = (&(&x * &x).sum() / (n as f32)).sqrt().item().unwrap();
+        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "{n} elements");
+        assert!((f64::from(got) - want).abs() <= 1e-4 * want, "{got} vs {want}");
+    }
+}
+
+#[test]
+fn scalars_of_the_epilogue_are_not_part_of_the_kernel() {
+    let ctx = ctx();
+    let x = f32s(&ctx, &values(500, 63, 0.0, 1.0));
+    let sum = x.sum().item().unwrap();
+    assert_eq!((x.sum() * 2.0).item().unwrap(), sum * 2.0);
+    let before = ctx.jit().stats();
+    assert_eq!((x.sum() * 3.0).item().unwrap(), sum * 3.0);
+    assert_eq!(delta(before, ctx.jit().stats()).built, 0);
+}
+
+#[test]
+fn a_reduction_of_an_array_sees_the_array_as_it_was() {
+    let ctx = ctx();
+    let mut x = f32s(&ctx, &[1.0; 100]);
+    let norm = x.norm();
+    x += 1.0;
+    assert_eq!(x.sum().item().unwrap(), 200.0);
+    assert_eq!(norm.item().unwrap(), 10.0);
+}
+
 #[test]
 fn arrays_advancing_together_are_split_into_multi_output_kernels() {
     let n = 600;
@@ -1049,6 +1208,43 @@ fn an_eval_loop_of_an_elementwise_step_runs_as_one_loop() {
     let (want_x, want_y) = elementwise_steps(&xs, &ys, 50).pop().unwrap();
     assert_close(&x.to_vec().unwrap(), &want_x, 1e-5, 1e-5);
     assert_close(&y.to_vec().unwrap(), &want_y, 1e-5, 1e-5);
+}
+
+/// Every thread follows its own `eval` calls: two threads whose calls alternate (here step by step, on grids of
+/// different shapes) both still run their loops time blocked, instead of resetting each other's history (which
+/// leaves one kernel per step).
+#[test]
+fn eval_loops_of_threads_that_alternate_are_both_compressed() {
+    let ctx = ctx();
+    ctx.set_assume_busy(true);
+    let steps = 100;
+    let barrier = std::sync::Barrier::new(2);
+    let before = ctx.jit().stats();
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let threads: Vec<_> = [64usize, 48]
+            .into_iter()
+            .map(|n| {
+                let (ctx, barrier) = (&ctx, &barrier);
+                scope.spawn(move || {
+                    let g = Array::from_slice_on(ctx, &values(n * n, 62, 0.0, 1.0), [n, n]).unwrap();
+                    let mut u = &g * 1.0;
+                    for _ in 0..steps {
+                        u = heat_step(&u);
+                        barrier.wait();
+                        u.eval().unwrap();
+                    }
+                    ctx.sync().unwrap();
+                    (g.iterate(steps, heat_step).to_vec().unwrap(), u.to_vec().unwrap())
+                })
+            })
+            .collect();
+        threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+    });
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert!(launches < 40, "{launches} kernels for 2 x {steps} steps");
+    for (want, got) in results {
+        assert_close(&got, &want, 1e-6, 1e-6);
+    }
 }
 
 fn heat_step(u: &Array<f32>) -> Array<f32> {
@@ -1620,6 +1816,25 @@ fn a_third_view_reader_recomputes_the_expression_inside_the_one_kernel() {
     assert_close(&got, &want, 1e-5, 1e-6);
 }
 
+/// A graph of the shape of an earlier one, over other buffers and scalars, is flattened by
+/// instantiating the program of the earlier one (checked against the flattened program in tests).
+#[test]
+fn graphs_of_one_shape_over_other_buffers_and_scalars_reuse_the_program() {
+    let ctx = ctx();
+    let n = 200;
+    for round in 0..5u64 {
+        let xs = values(n, 300 + round, 0.5, 2.0);
+        let x = f32s(&ctx, &xs);
+        let a = 1.5 + round as f32;
+        let e = (&x * a + 1.0).sqrt();
+        let host: Vec<f32> = xs.iter().map(|v| (v * a + 1.0).sqrt()).collect();
+        let got = (e.slice(0, 1..) - e.slice(0, ..n - 1)).to_vec().unwrap();
+        let want: Vec<f32> = (0..n - 1).map(|i| host[i + 1] - host[i]).collect();
+        assert_close(&got, &want, 1e-5, 1e-6);
+    }
+    assert!(ctx.jit().recipe_hits() >= 3, "recipe hits: {}", ctx.jit().recipe_hits());
+}
+
 /// A 40-operation expression of `x` and its host values.
 fn long_expression(x: &Array<f32>, xs: &[f32]) -> (Array<f32>, Vec<f32>) {
     let mut e = x.clone();
@@ -1673,6 +1888,13 @@ fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
     assert_close(&got, &want, 1e-4, 1e-5);
 }
 
+/// [`arithmetic_bound`] where a launch also costs more than the halo a staged kernel computes
+/// twice: devices with small tiles, like the CPU's, would otherwise evaluate the padded
+/// expression first instead of staging it.
+fn halo_bound() -> CostModel {
+    CostModel { launch_us: 1000.0, ..arithmetic_bound() }
+}
+
 /// A cost model on which arithmetic is slow enough for computing an expression once per cell to
 /// beat recomputing it at every read, but a second launch still costs more than the recomputation
 /// it saves over staging.
@@ -1720,7 +1942,7 @@ fn expression_2d(ctx: &Context, nx: usize, ny: usize, seed: u64) -> (Array<f32>,
 /// checks the kernel stages the padded expression, one launch, against the host.
 fn stencil5_staged(nx: usize, ny: usize, seed: u64) {
     let ctx = ctx();
-    ctx.set_cost_model(arithmetic_bound());
+    ctx.set_cost_model(halo_bound());
     let (e, host) = expression_2d(&ctx, nx, ny, seed);
     let before = ctx.jit().stats();
     let got = five_point(&e, nx, ny).to_vec().unwrap();
@@ -1785,7 +2007,7 @@ fn a_df32_expression_read_at_five_offsets_is_staged() {
     use crate::view::PadMode;
     use crate::Df32;
     let ctx = ctx();
-    ctx.set_cost_model(arithmetic_bound());
+    ctx.set_cost_model(halo_bound());
     let (nx, ny) = (64, 48);
     let xs = values(nx * ny, 204, 0.2, 1.2);
     let mut e = Array::from_slice_on(&ctx, &xs, [nx, ny]).unwrap().to_df32();
@@ -2782,4 +3004,126 @@ fn writes_between_speculated_readbacks_are_seen_by_the_next_readback() {
         check_readback_loop_with_writes(&ctx, 45, events);
         assert!(ctx.jit().speculation_hits() > 0, "{events:?}: no readback was answered ahead of time");
     }
+}
+
+/// A padded 2-D array with ghost cells on two sides assigned an expression of the edge cells,
+/// read by a stencil at five offsets (a boundary condition of a solver). Every read of the padded
+/// array used to compute the ghost expressions at the cell it reads; they are only worth computing
+/// in the ghost cells, which the generated code does with `if`/`else` instead of a `select`.
+#[test]
+fn ghost_regions_are_computed_only_where_they_are_assigned() {
+    use crate::view::PadMode;
+    let (n, m) = (40usize, 24usize);
+    let data = values(n * m, 77, 0.5, 1.5);
+    // The ghost expression: seven chained operations of the edge value.
+    let ghost = |e: &Array<f32>| {
+        let mut a = e * 1.5 + 0.25;
+        for k in 0..6 {
+            a = (&a * 0.9 + 0.1).sqrt() + e * (0.01 * (k + 1) as f32);
+        }
+        a
+    };
+    let ghost_host = |e: f32| {
+        let mut a = e * 1.5 + 0.25;
+        for k in 0..6 {
+            a = (a * 0.9 + 0.1).sqrt() + e * (0.01 * (k + 1) as f32);
+        }
+        a
+    };
+    // The padded array on the host: edge padding, the two ghost regions assigned over it.
+    let (wn, wm) = (n + 4, m + 4);
+    let at = |x: usize, y: usize| data[x.saturating_sub(2).min(n - 1) + n * y.saturating_sub(2).min(m - 1)];
+    let mut padded = vec![0.0f32; wn * wm];
+    for y in 0..wm {
+        for x in 0..wn {
+            padded[x + wn * y] = if x < 2 && (2..m + 2).contains(&y) {
+                ghost_host(at(2, y))
+            } else if y < 2 && (2..n + 2).contains(&x) {
+                ghost_host(at(x, 2))
+            } else {
+                at(x, y)
+            };
+        }
+    }
+    let read = |x: usize, y: usize| padded[x + wn * y];
+    let mut want = vec![0.0f32; n * m];
+    for y in 0..m {
+        for x in 0..n {
+            want[x + n * y] = read(x + 1, y + 2) + read(x + 3, y + 2) + read(x + 2, y + 1) + read(x + 2, y + 3) - read(x + 2, y + 2) * 4.0;
+        }
+    }
+
+    // Launches prohibitively expensive: the expression stays one kernel, which staging may lay out.
+    for staging in [true, false] {
+        let ctx = ctx();
+        ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+        ctx.jit().set_staging(staging);
+        ctx.jit().set_max_inlined(1536);
+        ctx.jit().record_splits();
+        let u = Array::from_slice_on(&ctx, &data, [n, m]).unwrap();
+        let w = u.pad([(2, 2), (2, 2)], PadMode::Edge);
+        let left = u.pad([(2, 0)], PadMode::Edge).slice(0, 0..2);
+        w.slice(0, ..2).slice(1, 2..m + 2).assign(ghost(&left)).unwrap();
+        let bottom = u.pad([(0, 0), (2, 0)], PadMode::Edge).slice(1, 0..2);
+        w.slice(1, ..2).slice(0, 2..n + 2).assign(ghost(&bottom)).unwrap();
+        let r = w.slice(0, 1..n + 1).slice(1, 2..m + 2) + w.slice(0, 3..n + 3).slice(1, 2..m + 2) + w.slice(0, 2..n + 2).slice(1, 1..m + 1)
+            + w.slice(0, 2..n + 2).slice(1, 3..m + 3)
+            - w.slice(0, 2..n + 2).slice(1, 2..m + 2) * 4.0;
+        let before = ctx.jit().stats();
+        let got = r.to_vec().unwrap();
+        let judgement = ctx.jit().last_judgement();
+        let splits = ctx.jit().take_splits();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "staging {staging}: {judgement:?} {splits:?}");
+        assert!(ctx.jit().last_branches() > 0, "staging {staging}: no select was computed as a branch ({judgement:?})");
+        assert_close(&got, &want, 1e-5, 1e-5);
+    }
+}
+
+/// `r = g[1..]` with `g = e[..n - 2] + e[2..]` (an expression `e`): the main program reads `g`
+/// once, so it is computed inside the main program, and what it reads of `e` (at two offsets) is
+/// read from the cell the main program computes it at: `e` is staged, read at offsets 1 and 3.
+#[test]
+fn a_sub_program_read_once_does_not_keep_what_it_reads_from_being_staged() {
+    let ctx = ctx();
+    ctx.set_cost_model(arithmetic_bound());
+    let n = 1000;
+    let xs = values(n, 150, 0.5, 2.0);
+    let (e, host) = long_expression(&f32s(&ctx, &xs), &xs);
+    let g = e.slice(0, 0..n - 2) + e.slice(0, 2..n);
+    let r = g.slice(0, 1..n - 2) * 1.5 + 0.25;
+    let before = ctx.jit().stats();
+    let got = r.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
+    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    assert_eq!(staging.subs.len(), 1, "{staging:?}");
+    let tx = staging.tile[0] as i32;
+    assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([1, 0], [tx + 2, 0]), "{staging:?}");
+    let want: Vec<f32> = (0..n - 3).map(|i| (host[i + 1] + host[i + 3]) * 1.5 + 0.25).collect();
+    assert_close(&got, &want, 1e-4, 1e-4);
+}
+
+/// `eval_all` of arrays and a reduction of an expression the arrays read too, while submissions are
+/// postponed: the arrays are computed first, so the expression is evaluated once for both
+/// (the reduction reads it from their kernel) and not by the reduction on its own.
+#[test]
+fn a_reduction_requested_with_arrays_that_share_its_expression_waits_for_them() {
+    let ctx = ctx();
+    ctx.set_assume_busy(true);
+    let xs = values(5000, 31, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let residual = ((&x * &x + 1.0).sqrt() * 3.0).shift(1) - (&x * 2.0 + 0.5).sqrt();
+    let update = &x + &residual * 0.5;
+    let norm = (&residual * &residual).sum();
+    let before = ctx.jit().stats();
+    crate::eval_all(&[&update, &norm]).unwrap();
+    let got = update.to_vec().unwrap();
+    let launches = delta(before, ctx.jit().stats());
+    // The residual once (it is shared and shifted), the update, the reduction's passes.
+    assert!(launches.elementwise_launches <= 2, "{launches:?}");
+    let n = xs.len();
+    let r = |i: usize| ((xs[(i + n - 1) % n] * xs[(i + n - 1) % n] + 1.0).sqrt() * 3.0) - (xs[i] * 2.0 + 0.5).sqrt();
+    let want: Vec<f32> = (0..n).map(|i| xs[i] + r(i) * 0.5).collect();
+    assert_close(&got, &want, 1e-4, 1e-4);
+    let sum: f32 = (0..n).map(|i| r(i) * r(i)).sum();
+    assert!((norm.item().unwrap() - sum).abs() <= 1e-3 * sum.abs(), "{} vs {sum}", norm.item().unwrap());
 }

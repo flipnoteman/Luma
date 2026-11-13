@@ -450,6 +450,7 @@ fn clone_of_a_lazy_array_misses_a_compound_assignment_after_a_lazy_slice_write()
             simplify: true,
             staging: false,
             fast_math: false,
+            df_split: false,
             chunk_bytes: None,
             memory_budget: None,
             cost: Test,
@@ -556,6 +557,23 @@ fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost_wit
             View { src: 1, view: Slice { axis: 0, lo: 1, hi: 13 } },
             Compound { target: 1, op: Div, rhs: Const(1.0) },
             Assign { target: 2, path: vec![InjSlice { axis: 0, lo: 7, hi: 10 }, InjSlice { axis: 1, lo: 9, hi: 14 }], rhs: Const(7.0) },
+        ],
+    });
+}
+
+/// Epilogue fusion (item 5): `a = abs(sum(x))` is a step on a lazy reduction; the reduction is
+/// then written in place (`s -= s`, which records it into its own buffer). `a` is the value the
+/// sum had when `a` was written, so it must not read the buffer afterwards.
+#[test]
+fn a_step_on_a_reduction_does_not_read_the_buffer_the_reduction_is_later_written_through() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Reduce { src: 0, op: Sum },
+            Unary { src: 1, op: Abs },
+            Compound { target: 1, op: Sub, rhs: Var(1) },
         ],
     });
 }

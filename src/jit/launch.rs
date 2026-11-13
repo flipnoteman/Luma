@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::array::{Failure, Storage};
 use crate::gpu::pager::Pin;
-use crate::builtin::{Builtin, ReduceList, ReduceOp};
+use crate::builtin::{Builtin, Finish, ReduceList, ReduceOp};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d};
@@ -264,7 +264,7 @@ fn live_split(fused: &Fused, max_inputs: usize, max_live: usize) -> Option<(Vec<
 /// output per node. Failures are stored in the nodes, as [`Node::force`] does.
 pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
     // A loop leaf has no operands to fuse: running its plan is its evaluation.
-    for node in nodes.iter().filter(|node| node.is_pending() && node.looped.get().is_some()) {
+    for node in nodes.iter().filter(|node| node.is_pending() && (node.looped.get().is_some() || node.deferred.get().is_some())) {
         let _ = node.force();
     }
     let roots: Vec<(Arc<Node>, Args)> = nodes
@@ -896,12 +896,15 @@ pub(super) fn run_mapped(
 /// once per op. Returns the buffer of partial results (op `j` at `j * groups ..`) and how many
 /// there are per op, or `None` if the node has already been evaluated or is better evaluated
 /// first (reduce its buffer instead). With one segment and one group per op the partials are
-/// the final values and are written into `target` when it is given.
+/// the final values and are written into `target` when it is given; `finish` is applied to them
+/// then, inside the pass (the caller sees that this happened: one segment and one group), and
+/// not otherwise.
 pub(crate) fn reduce_first_pass(
     node: &Arc<Node>,
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
     target: Option<&wgpu::Buffer>,
+    finish: Finish,
 ) -> Result<Option<Vec<(wgpu::Buffer, u32)>>, Failure> {
     if !node.is_pending() {
         return Ok(None);
@@ -916,10 +919,11 @@ pub(crate) fn reduce_first_pass(
     if !fused.key.inlines() && fused.key.subs.iter().any(|sub| sub.len() > max || sub.iter().any(|instr| matches!(instr.args[0], Ref::Sub(_)))) {
         return Ok(None);
     }
-    reduce_fused(node.context(), node.len(), fused, ops, scratch, target).map(Some)
+    reduce_fused(node.context(), node.len(), fused, ops, scratch, target, finish).map(Some)
 }
 
-/// The first pass of [`reduce_first_pass`] for an already flattened expression of `len` elements.
+/// The first pass of [`reduce_first_pass`] for an already flattened expression of `len` elements,
+/// applying `finish` if the pass is the last.
 pub(super) fn reduce_fused(
     ctx: &crate::context::Context,
     len: usize,
@@ -927,6 +931,7 @@ pub(super) fn reduce_fused(
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
     target: Option<&wgpu::Buffer>,
+    finish: Finish,
 ) -> Result<Vec<(wgpu::Buffer, u32)>, Failure> {
     fused.mark_fused();
     let Fused { mut key, inputs, scalars, .. } = fused;
@@ -934,6 +939,11 @@ pub(super) fn reduce_fused(
     let layout = layout_elem(&key, &inputs, len);
     let first = Storage::new(ctx, len, layout as usize);
     let segments = first.segments();
+    // One segment and one group: this pass leaves the final values, so the epilogue goes in it.
+    let last = !finish.epilogue.is_empty() && segments == 1 && ctx.tuning().reduce_groups(len_u32(first.range(0).len())?) == 1;
+    if last {
+        key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue));
+    }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
     let core = ctx.jit().kernel(ctx, &key)?;
 
@@ -948,7 +958,10 @@ pub(super) fn reduce_fused(
             _ => scratch.take(out_bytes)?,
         };
         let ids = segment_ids(shifted.as_ref(), j)?;
-        let params = params(&key, ids, Some(n), range.start, len, &scalars)?;
+        let mut params = params(&key, ids, Some(n), range.start, len, &scalars)?;
+        if last {
+            params.to_mut().extend(finish.uniform_words());
+        }
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
         let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
         raw.push(RawArg::write(&out, out_bytes));
@@ -978,7 +991,7 @@ pub(crate) fn check_finite(ctx: &crate::context::Context, storage: &Storage, ty:
         let pin = storage.pin(j)?;
         let flags = scratch.take(u64::from(words) * 4)?;
         launch_1d(ctx, &core, words, &[RawArg::write(&flags, u64::from(words) * 4), RawArg::read(pin.buffer(), bytes)])?;
-        let result = crate::reduce::finish_passes(ctx, &mut scratch, max, "u32", 4, flags, words, false, None)?;
+        let result = crate::reduce::finish_passes(ctx, &mut scratch, max, "u32", 4, flags, words, false, None, Finish::default())?;
         if ctx.read::<u32>(&result, 4)?.first().is_some_and(|&flag| flag != 0) {
             return Err(LumaError::NonFinite);
         }
