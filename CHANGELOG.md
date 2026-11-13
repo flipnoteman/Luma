@@ -164,6 +164,13 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- A shared node evaluated first together with its siblings (the other fields of its record, see
+  `with_siblings`) no longer takes the earlier generations of those fields along when the
+  record was assigned into several times: a lazy padded record with ghost region assigns that
+  the program still holds is evaluated as one kernel (plus the stencil reading it) instead of
+  one kernel per assign generation and field (a 4-field record with 40 operations per ghost
+  layer: 6 launches -> 2).
+
 - A scalar reduction followed by elementwise operations with scalars on its one-element result
   (`x.norm()`, `x.mean()`, `(x.sum() / n).sqrt()`; up to four operations on `f32`) finishes inside
   the last pass of the reduction instead of launching an elementwise kernel for the result: the

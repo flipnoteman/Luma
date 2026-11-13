@@ -1053,6 +1053,9 @@ fn with_siblings<'a>(shared: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'
                 && !forced.iter().any(|known| Arc::ptr_eq(known, other))
                 && !node.below_contains(other.id)
                 && !other.below_contains(node.id)
+                // An earlier generation of a field that was assigned into several times is read by
+                // the next one: computed inside its kernel, not on its own.
+                && !other.readers.any_pending(|weak| weak.upgrade().is_some_and(|reader| reader.name == other.name && std::ptr::eq(reader.location, other.location)))
                 && other.below_vec().iter().any(|id| below.binary_search(id).is_ok())
             {
                 forced.push(Arc::clone(other));
