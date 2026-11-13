@@ -3121,7 +3121,7 @@ fn a_reduction_requested_with_arrays_that_share_its_expression_waits_for_them() 
     // The residual once (it is shared and shifted), the update, the reduction's passes.
     assert!(launches.elementwise_launches <= 2, "{launches:?}");
     let n = xs.len();
-    let r = |i: usize| (((xs[(i + n - 1) % n] * xs[(i + n - 1) % n] + 1.0).sqrt() * 3.0) - (xs[i] * 2.0 + 0.5).sqrt());
+    let r = |i: usize| ((xs[(i + n - 1) % n] * xs[(i + n - 1) % n] + 1.0).sqrt() * 3.0) - (xs[i] * 2.0 + 0.5).sqrt();
     let want: Vec<f32> = (0..n).map(|i| xs[i] + r(i) * 0.5).collect();
     assert_close(&got, &want, 1e-4, 1e-4);
     let sum: f32 = (0..n).map(|i| r(i) * r(i)).sum();
