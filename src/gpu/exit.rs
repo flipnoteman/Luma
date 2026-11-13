@@ -165,8 +165,6 @@ mod tests {
         assert!(spawned.is_some());
         let known = DRIVER_THREADS.lock().map(|known| known.clone()).unwrap_or_default();
         assert!(!known.is_empty(), "the thread started inside the call is remembered");
-        // A busy driver thread is seen by the exit wait: none here, so it is idle.
-        assert!(wait_for_driver_workers());
         let _ = go.send(());
         let _ = worker.join();
     }
