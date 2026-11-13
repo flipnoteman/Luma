@@ -482,7 +482,7 @@ fn out_elems(key: &FusedKey) -> Vec<u64> {
     let bytes = |at: u32| key.instrs.get(at as usize).map_or(4, |instr| instr.op.out_ty().bytes());
     match key.tail {
         Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().map(|&at| bytes(at)).collect(),
-        Tail::Scatter { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
+        Tail::Scatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().checked_sub(1).map_or(4, |at| bytes(at as u32))],
     }
 }
@@ -618,7 +618,7 @@ fn spans(
 
     let outputs = match key.tail {
         Tail::Store | Tail::StoreMapped(_) => key.outputs.len(),
-        Tail::Scatter { .. } | Tail::Reduce(_) => 1,
+        Tail::Scatter { .. } | Tail::Stack { .. } | Tail::Reduce(_) => 1,
     };
     let direct = (0..input_count)
         .filter(|&k| !key.in_place.iter().any(|&(paired, _)| paired as usize == k) && direct(&key.instrs, k as u32))

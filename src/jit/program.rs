@@ -84,6 +84,10 @@ pub(crate) enum Tail {
     /// `outputs == [value, index]`: element `i` writes `value` to element `index` of the one
     /// bound buffer of `len` elements if `index < len` (`Array::put`).
     Scatter { len: u32 },
+    /// The outputs are the parts `first..` of `total` equal-length parts that the one bound
+    /// buffer holds interleaved in blocks of `block` elements: element `i` of part `k` goes to
+    /// `(i / block) * total * block + k * block + i % block` (see `jit::stack`).
+    Stack { total: u32, first: u32, block: u32 },
 }
 
 /// Everything the source of a fused kernel depends on, and nothing it does not (buffers and
@@ -128,7 +132,8 @@ pub(crate) struct FusedKey {
 }
 
 /// Whether the WGSL of `instr` calls a function of the double-float library
-/// (`builtin::df_library`): the arithmetic, the ordering, and every cast involving a `Df32`.
+/// (`builtin::df_library`): the arithmetic, the ordering, and every cast involving a `Df32`, and
+/// the tests of what kind of value an element is (`luma_bits`).
 pub(super) fn calls_df_library(instr: &Instr) -> bool {
     let df = instr.op.ty == ElemTy::Df32;
     match instr.op.kind {
@@ -136,12 +141,13 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
         OpKind::Binary(op) => df && op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains("df_")),
         OpKind::Compare(_) | OpKind::Clamp => df,
         OpKind::Cast(to) => df || to == ElemTy::Df32,
+        OpKind::Classify(_) => true,
         _ => false,
     }
 }
 
 /// Whether `instr` reads the guard uniform: the arithmetic and the casts, whose error-free
-/// transformations go through `luma_o`. Ordering, minimum, maximum and absolute value never
+/// transformations go through `luma_o`, and the tests of the class of a value. Ordering, minimum, maximum and absolute value never
 /// call it: nothing there can be reassociated away.
 pub(super) fn reads_guard(instr: &Instr) -> bool {
     calls_df_library(instr)
@@ -211,6 +217,7 @@ impl FusedKey {
                 OpKind::Unary(op) => format!("{op:?}"),
                 OpKind::Binary(op) => format!("{op:?}"),
                 OpKind::Compare(op) => format!("{op:?}"),
+                OpKind::Classify(class) => class.name().to_owned(),
                 other => format!("{other:?}"),
             })
             .collect();
@@ -224,6 +231,7 @@ impl FusedKey {
             Tail::Store => format!("Fused({names}) {ty}"),
             Tail::StoreMapped(_) => format!("FusedAssign({names}) {ty}"),
             Tail::Scatter { .. } => format!("FusedPut({names}) {ty}"),
+            Tail::Stack { .. } => format!("FusedStack({names}) {ty}"),
             Tail::Reduce(ops) => {
                 let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
                 format!("FusedReduce({}: {names}) {ty}", ops.join("+"))
@@ -1906,6 +1914,11 @@ pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<
     }
     if matches!(key.tail, Tail::Scatter { .. }) && key.outputs.len() != 2 {
         return Err(format!("a scatter has {} outputs, not 2", key.outputs.len()));
+    }
+    if let Tail::Stack { total, first, block } = key.tail
+        && (key.outputs.is_empty() || block == 0 || u64::from(first) + key.outputs.len() as u64 > u64::from(total))
+    {
+        return Err(format!("a stack of parts {first}.. of {total} with {} outputs, block {block}", key.outputs.len()));
     }
     for &(k, j) in &key.in_place {
         if k as usize >= inputs {

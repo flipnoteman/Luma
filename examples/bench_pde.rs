@@ -829,6 +829,59 @@ fn views(b: &mut Bench) {
     });
 }
 
+/// Part `k` of the stack cases: a few operations on two arrays.
+fn stack_part(x: &A, y: &A, k: usize) -> A {
+    x * (0.05 * (k + 1) as f32) + y.sqrt()
+}
+
+fn stack_part_host(x: f32, y: f32, k: usize) -> f32 {
+    x * (0.05 * (k + 1) as f32) + y.sqrt()
+}
+
+/// 16 lazy expressions of `[ni, nj]` joined along a new fastest axis (the layout of a block
+/// system's `[16, ni, nj]` entries): `concat` of `[1, ni, nj]` parts and `stack`, alone and
+/// read by a following elementwise kernel.
+fn stacks(b: &mut Bench) {
+    const PARTS: usize = 16;
+    let sizes: [[usize; 2]; 2] = [[144, 70], [288, 140]];
+    for [ni, nj] in sizes {
+        let n = ni * nj;
+        let size = format!("{PARTS}x{ni}x{nj}");
+        let hx = values(n, 1, 0.2, 1.2);
+        let hy = values(n, 2, 0.2, 1.2);
+        let want: Vec<f32> = (0..n * PARTS).map(|i| stack_part_host(hx[i / PARTS], hy[i / PARTS], i % PARTS)).collect();
+        let want_used: Vec<f32> = want.iter().map(|v| v * 2.0 + 1.0).collect();
+        let bytes = (n * PARTS) as f64 * 4.0 + 2.0 * n as f64 * 4.0;
+        let ctx = b.ctx.clone();
+        let build_concat = |x: &A, y: &A| -> A {
+            let parts: Vec<A> = (0..PARTS).map(|k| stack_part(x, y, k)).collect();
+            concat::<f32, PARTS>(0, std::array::from_fn(|k| &parts[k]))
+        };
+        let build_stack = |x: &A, y: &A| -> A {
+            let parts: Vec<A> = (0..PARTS).map(|k| stack_part(x, y, k)).collect();
+            stack::<f32, PARTS>(0, std::array::from_fn(|k| &parts[k]))
+        };
+        let cases: [(&str, bool, bool); 4] =
+            [("stack/concat16", false, false), ("stack/stack16", true, false), ("stack/concat16_use", false, true), ("stack/stack16_use", true, true)];
+        for (name, stacked, used) in cases {
+            b.guarded(name, |b| {
+                let dims: [usize; 3] = if stacked { [ni, nj, 1] } else { [1, ni, nj] };
+                let x = Array::from_slice_on(&ctx, &hx, [dims[0], dims[1], dims[2]]).unwrap();
+                let y = Array::from_slice_on(&ctx, &hy, [dims[0], dims[1], dims[2]]).unwrap();
+                x.eval().unwrap();
+                y.eval().unwrap();
+                let build = |x: &A, y: &A| -> A {
+                    let s = if stacked { build_stack(x, y) } else { build_concat(x, y) };
+                    if used { &s * 2.0 + 1.0 } else { s }
+                };
+                check(name, &build(&x, &y).to_vec().unwrap(), if used { &want_used } else { &want }, 1e-5, 1e-6);
+                let mut f = || build(&x, &y).eval().unwrap();
+                b.time(name, &size, Tp::Bytes(bytes), true, &mut f);
+            });
+        }
+    }
+}
+
 /// A 24-operation elementwise expression: four rounds of `max(|sqrt(e * 0.9 + 0.2)|, e * 0.5)`.
 fn heavy(x: &A) -> A {
     let mut e = x.clone();
@@ -1703,6 +1756,7 @@ fn main() {
     euler(&mut b);
     muscl(&mut b);
     views(&mut b);
+    stacks(&mut b);
     writes(&mut b);
     scalars(&mut b);
     lines(&mut b);

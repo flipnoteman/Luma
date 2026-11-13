@@ -123,6 +123,14 @@
 //! replacement is owned by the claims arrays hold on a node ([`Held`]), never by the node, as the
 //! right-hand side typically reads the node it replaces.
 //!
+//! # Stacking
+//!
+//! [`crate::stack`] joins equal-shaped expressions along a new axis in one kernel of the tail
+//! `Tail::Stack`: an invocation computes its element of every part and writes them next to each
+//! other (through workgroup memory when the new axis is the fastest, so that the stores are
+//! coalesced), see [`stack`]. It is recorded when called and returns an evaluated array; what it
+//! cannot write (arrays split over several buffers) it joins lazily like `concat`.
+//!
 //! # Writing in place
 //!
 //! A store kernel whose output replaces an input that nothing else holds (a dying temporary or
@@ -149,6 +157,7 @@ mod rerun;
 mod replay;
 mod simplify;
 pub(crate) mod speculate;
+pub(crate) mod stack;
 mod staging;
 mod stencil;
 mod until;
@@ -160,7 +169,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::array::{Failure, Storage};
-use crate::builtin::{BinOp, CmpOp, UnOp};
+use crate::builtin::{BinOp, Class, CmpOp, UnOp};
 use crate::context::Context;
 use crate::error::{LumaError, Result};
 use crate::gpu::built::BuildCache;
@@ -310,6 +319,8 @@ pub(crate) enum OpKind {
     Binary(BinOp),
     /// Comparison; the result is a `u32` mask.
     Compare(CmpOp),
+    /// Whether the floating-point operand is finite, infinite or `NaN`; the result is a `u32` mask.
+    Classify(Class),
     /// `pow(x, exponent)`; operands: x, exponent (a scalar).
     Powf,
     /// `clamp(x, lo, hi)`; operands: x, lo, hi (scalars).
@@ -490,7 +501,7 @@ impl ViewMap {
 impl OpKind {
     pub(crate) fn arity(self) -> usize {
         match self {
-            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
+            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
             OpKind::Binary(_)
             | OpKind::Compare(_)
             | OpKind::Powf
@@ -538,7 +549,7 @@ impl Op {
 
     pub(crate) fn out_ty(self) -> ElemTy {
         match self.kind {
-            OpKind::Compare(_) => ElemTy::U32,
+            OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::U32,
             OpKind::Cast(to) => to,
             _ => self.ty,
         }
@@ -552,6 +563,14 @@ impl Op {
             (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal), _) => ElemTy::U32,
             _ => self.ty,
         }
+    }
+}
+
+impl Node {
+    /// Whether the node is an unevaluated view: a pure index map of what it reads (a slice, flip,
+    /// transpose, pad or non-circular shift), no arithmetic.
+    pub(crate) fn is_pending_view(&self) -> bool {
+        self.is_pending() && matches!(self.op.kind, OpKind::Shift(ShiftKind::View { .. }))
     }
 }
 
@@ -1500,6 +1519,7 @@ fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(),
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
         OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
+        OpKind::Classify(_) => op.ty != ElemTy::U32,
         OpKind::Powf | OpKind::Generate(_) => !wide,
     };
     if !exists {

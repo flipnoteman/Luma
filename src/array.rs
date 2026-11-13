@@ -343,7 +343,7 @@ impl<T: GpuType> Array<T> {
         Ok(Array::alloc(&self.ctx, self.shape)?)
     }
 
-    fn poisoned(ctx: &Context, shape: Shape, error: Arc<LumaError>) -> Self {
+    pub(crate) fn poisoned(ctx: &Context, shape: Shape, error: Arc<LumaError>) -> Self {
         Array { ctx: ctx.clone(), shape, repr: Repr::Poisoned(error), view: None, _marker: PhantomData }
     }
 
@@ -704,6 +704,13 @@ impl<T: GpuType> Array<T> {
     /// The same data with a different shape. Only metadata changes: the result shares the
     /// buffer, no copy is made (see "Sharing" in the type's documentation). The element count
     /// must stay the same; otherwise the result is poisoned.
+    ///
+    /// The reshape of a lazy view (a slice, flip, transpose, pad or non-circular shift that has
+    /// not run) stays lazy: it is another handle on the pending view, which fuses into whatever
+    /// reads it, so `x.slice(0, k..k + 1).reshape([ni, nj])` of an `[n, ni, nj]` array reads `x`
+    /// inside the kernel that uses it. The result does not write through to the array the view
+    /// was taken from: [`Array::assign`] on it writes the data it shares with that view. Any other
+    /// array that has not run yet is evaluated first (the data it shares must exist).
     #[track_caller]
     pub fn reshape(&self, shape: impl Into<Shape>) -> Array<T> {
         let location = Location::caller();
@@ -725,6 +732,15 @@ impl<T: GpuType> Array<T> {
                 len
             ))
             .into());
+        }
+        // A pending view (an index map of what it reads) is shared like by a clone (evaluated
+        // once, by whichever handle needs it first): an expression is a sequence of elements,
+        // whatever its shape. Other expressions are evaluated first (below): what reads them
+        // through several slices would recompute them.
+        if let Repr::Lazy(held) = &self.repr
+            && held.latest().is_pending_view()
+        {
+            return Ok(Array { ctx: self.ctx.clone(), shape, repr: Repr::Lazy(held.share()), view: None, _marker: PhantomData });
         }
         // A view shares the buffer, so the array has to exist.
         let storage = self.storage()?;

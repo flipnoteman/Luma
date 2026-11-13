@@ -10,7 +10,7 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{BinOp, Builtin, CmpOp, EpilogueStep, UnOp};
+use crate::builtin::{BinOp, Builtin, Class, CmpOp, EpilogueStep, UnOp};
 use crate::context::{Context, RawArg};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{Df32, GpuType, ScalarType};
@@ -153,6 +153,15 @@ impl<T: ScalarType> Array<T> {
             op.name(),
             location,
         )
+    }
+
+    /// The test `class` of every element, as a `u32` mask (see [`Class`]).
+    fn classify(&self, class: Class, location: &'static Location<'static>) -> Array<u32> {
+        let result = self.src().and_then(|operand| {
+            let op = Op::new(OpKind::Classify(class), ElemTy::of::<T>()?);
+            lazy(self.context(), self.shape(), op, [operand, Src::unused(), Src::unused()], class.name(), location)
+        });
+        Array::resolve(self.context(), self.shape(), result, class.name(), location)
     }
 
     /// `-self` reporting failures at `location`.
@@ -692,6 +701,37 @@ unary_methods! {
     /// Elementwise smallest integer not below `x`.
     ceil => UnOp::Ceil;
 }
+
+macro_rules! impl_float_classes {
+    ($($ty:ty),*) => {$(
+        impl Array<$ty> {
+            /// Elementwise: `1` where the element is neither infinite nor `NaN`, else `0`; a
+            /// lazy `u32` array that fuses like any elementwise operation. The test reads the
+            /// bits of the exponent, so it does not depend on how the device compares `NaN`
+            /// (a compiler may assume no `NaN` exists and fold `x != x`). For [`Df32`] it is the
+            /// high word that counts.
+            #[track_caller]
+            pub fn is_finite(&self) -> Array<u32> {
+                self.classify(Class::Finite, Location::caller())
+            }
+
+            /// Elementwise: `1` where the element is `NaN`, else `0` (see [`Array::is_finite`]).
+            #[track_caller]
+            pub fn is_nan(&self) -> Array<u32> {
+                self.classify(Class::Nan, Location::caller())
+            }
+
+            /// Elementwise: `1` where the element is positive or negative infinity, else `0`
+            /// (see [`Array::is_finite`]).
+            #[track_caller]
+            pub fn is_inf(&self) -> Array<u32> {
+                self.classify(Class::Inf, Location::caller())
+            }
+        }
+    )*};
+}
+
+impl_float_classes!(f32, f64, Df32);
 
 impl Array<f32> {
     /// Elementwise `atan2(self, x)`: the angle of the point `(x, self)`, `self` being `y`.

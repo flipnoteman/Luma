@@ -260,7 +260,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
     for (at, flat) in flats.iter().enumerate() {
         coordinates[at] = match flat.op.kind {
             OpKind::Generate(Gen::Range { .. }) => true,
-            OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
+            OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
                 flat.args.iter().take(flat.op.kind.arity()).all(|arg| match *arg {
                     Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
                     Ref::Scalar(_) | Ref::Unused => true,
@@ -489,7 +489,7 @@ impl Lowering<'_> {
 fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
     let value = |at: u32| main.get(at as usize).copied();
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().filter_map(|&at| value(at)).collect(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::Stack { .. } => key.outputs.iter().filter_map(|&at| value(at)).collect(),
         Tail::Scatter { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
         Tail::Reduce(_) => main.last().copied().into_iter().collect(),
     }
@@ -628,7 +628,7 @@ fn input_bytes(key: &FusedKey, refs: impl Iterator<Item = Ref>) -> f64 {
 fn output_bytes(key: &FusedKey) -> f64 {
     let bytes = |index: &u32| key.instrs.get(*index as usize).map_or(0.0, |instr| instr.op.out_ty().bytes() as f64);
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().map(bytes).sum(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::Stack { .. } => key.outputs.iter().map(bytes).sum(),
         Tail::Scatter { .. } => key.outputs.first().map_or(0.0, bytes),
         Tail::Reduce(_) => 0.0,
     }

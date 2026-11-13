@@ -90,7 +90,7 @@ pub use profile::{FusionSplit, KernelTiming, Profile, SplitReason};
 pub use shape::{Offsets, Shape};
 pub use tuning::TuningProfile;
 pub use luma_derive::Fields;
-pub use view::{concat, PadMode};
+pub use view::{concat, stack, stack_slice, PadMode};
 
 /// The `wgpu` crate luma is built on. wgpu types appear in the public API ([`LumaError`]
 /// variants, [`Context::features`]); naming them through this re-export guarantees the same

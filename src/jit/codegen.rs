@@ -18,7 +18,7 @@
 
 use std::fmt::Write;
 
-use crate::builtin::{df_library, reduce_main, substitute, ReduceElem};
+use crate::builtin::{class_operand, df_library, reduce_main, substitute, ReduceElem};
 use crate::gpu::hash::FxMap;
 use crate::tuning::{Tuning, STENCIL_RADIUS};
 
@@ -63,6 +63,7 @@ fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
         OpKind::Unary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, ""),
         OpKind::Binary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b),
         OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
+        OpKind::Classify(class) => substitute(class.expr(), &class_operand(ty, a), ""),
         OpKind::Powf => format!("pow({a}, {b})"),
         OpKind::Clamp if ty == ElemTy::Df32 => format!("df_min(df_max({a}, {b}), {c})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
@@ -353,6 +354,20 @@ pub(super) fn reads_scalars(key: &FusedKey) -> bool {
         })
 }
 
+/// Workgroup memory a stack kernel may use to write its cells together.
+const STACK_STAGE_BYTES: u64 = 16384;
+
+/// Whether the kernel of a [`Tail::Stack`] key writes through workgroup memory: when it holds all
+/// the parts of an array stacked along the fastest axis, an invocation's values are `total`
+/// neighbours in the result and the workgroup's cells are one contiguous stretch of it; written
+/// by the invocations of the workgroup in order it is a coalesced store instead of one stride
+/// of `total` elements per invocation. Needs the stretch (`wg * total` elements of `ty`) to fit.
+fn stack_stages(key: &FusedKey, wg: u32, ty: &str) -> bool {
+    let Tail::Stack { total, first: 0, block: 1 } = key.tail else { return false };
+    let bytes = if ty == "f32" || ty == "u32" || ty == "i32" { 4 } else { 8 };
+    key.outputs.len() == total as usize && total > 1 && u64::from(wg) * u64::from(total) * bytes <= STACK_STAGE_BYTES
+}
+
 /// The WGSL source of the kernel for `key`, with the workgroup shapes `tuning` gives.
 /// `segment_len` (a power of two) is the elements per segment of the arrays the segmented
 /// variant (`key.spans` not empty) runs on. `lowered` is the lowering of `key` (see
@@ -400,7 +415,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     let out_ty = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     let outputs: Vec<usize> = match key.tail {
         Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().map(|&at| at as usize).collect(),
-        Tail::Scatter { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
+        Tail::Scatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
     };
     for (j, &at) in outputs.iter().enumerate() {
@@ -466,7 +481,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     };
     let global = if segmented || based { "    let gi = p.base + i;\n" } else { "" };
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::Scatter { .. } => {
+        Tail::Store | Tail::StoreMapped(_) | Tail::Scatter { .. } | Tail::Stack { .. } => {
             let stores: String = match key.tail {
                 Tail::StoreMapped(map) => {
                     let n = views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0);
@@ -476,6 +491,24 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                     let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
                     format!("    let j = t{};\n    if (j < {len}u) {{ out0[j] = t{}; }}\n", value(index as usize), value(stored as usize))
                 }
+                Tail::Stack { total, .. } if stack_stages(key, wg, out_ty(outputs[0])) => {
+                    let mut stores = String::new();
+                    for (j, &at) in key.outputs.iter().enumerate() {
+                        let _ = writeln!(stores, "        luma_stage[lid.x * {total}u + {j}u] = t{};", value(at as usize));
+                    }
+                    stores
+                }
+                Tail::Stack { total, first, block } => {
+                    let mut stores = if block == 1 {
+                        format!("    let o = i * {total}u + {first}u;\n")
+                    } else {
+                        format!("    let q = i / {block}u;\n    let o = q * {}u + (i - q * {block}u) + {}u;\n", u64::from(total) * u64::from(block), u64::from(first) * u64::from(block))
+                    };
+                    for (j, &at) in key.outputs.iter().enumerate() {
+                        let _ = writeln!(stores, "    out0[o + {}u] = t{};", j as u64 * u64::from(block), value(at as usize));
+                    }
+                    stores
+                }
                 _ => outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[i] = t{};\n", value(at))).collect(),
             };
             if let Some(tile) = &key.tile {
@@ -484,6 +517,37 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
             }
             if let (Some(Lowered::Staged(programs)), Some(staging)) = (lowered, &key.staging) {
                 src.push_str(&staged_main(key, staging, programs, based, &stores, &names));
+                return src;
+            }
+            if let Tail::Stack { total, .. } = key.tail
+                && stack_stages(key, wg, out_ty(outputs[0]))
+            {
+                // Each invocation computes its cell's `total` values into workgroup memory, then
+                // the workgroup writes its contiguous stretch of the result, coalesced.
+                let _ = write!(
+                    src,
+                    "
+var<workgroup> luma_stage: array<{}, {}>;
+@compute @workgroup_size({wg})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let base = gid.x - lid.x + gid.y * nwg.x * {wg}u;
+    let i = base + lid.x;
+    if (i < luma.size.x) {{
+{global}{}{stores}    }}
+    workgroupBarrier();
+    let cells = min({wg}u, luma.size.x - base);
+    for (var e = lid.x; e < cells * {total}u; e = e + {wg}u) {{
+        out0[base * {total}u + e] = luma_stage[e];
+    }}
+}}
+",
+                    out_ty(outputs[0]),
+                    wg * total,
+                    match inlined {
+                        Some(inlined) => lowered_body(key, inlined, &names, index, None),
+                        None => body(&key.instrs, &key.input_tys, &names, index, segmented),
+                    }
+                );
                 return src;
             }
             let _ = write!(
@@ -551,6 +615,8 @@ pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
         }
     }
     let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
+    // The tests of the class of a value (`luma_bits`) come with the library of the guard.
+    src.push_str(&library_for(key, tuning));
     src.push_str(&generator_helpers([key.instrs.as_slice()]));
     let _ = write!(
         src,
