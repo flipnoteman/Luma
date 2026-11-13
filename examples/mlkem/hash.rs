@@ -33,8 +33,10 @@ fn round_constant(lfsr: &Array<u32>) -> (Array<u32>, Array<u32>, Array<u32>) {
 /// Keccak-f[1600]: the 24 rounds as a register loop of one traced round.
 pub fn keccak_f_loop(a: &State) -> State {
     let one = Array::<u32>::full_on(a[0].context(), a[0].shape(), 1).expect("a register");
-    // The absorbed words are one kernel, not one per word.
+    // The absorbed words are one kernel, not one per word: requested together, then recorded (and
+    // the GPU started on everything before this) rather than postponed while it is busy.
     eval_all(&a.iter().collect::<Vec<_>>()).expect("absorbed state");
+    a[0].context().flush().expect("flush");
     let init: [&Array<u32>; 51] = std::array::from_fn(|i| if i < 50 { &a[i] } else { &one });
     let out = iterate_all(init, 24, |s: &[Array<u32>; 51]| {
         let state: State = std::array::from_fn(|i| s[i].clone());
