@@ -3101,3 +3101,29 @@ fn a_sub_program_read_once_does_not_keep_what_it_reads_from_being_staged() {
     let want: Vec<f32> = (0..n - 3).map(|i| (host[i + 1] + host[i + 3]) * 1.5 + 0.25).collect();
     assert_close(&got, &want, 1e-4, 1e-4);
 }
+
+/// `eval_all` of arrays and a reduction of an expression the arrays read too, while submissions are
+/// postponed: the arrays are computed first, so the expression is evaluated once for both
+/// (the reduction reads it from their kernel) and not by the reduction on its own.
+#[test]
+fn a_reduction_requested_with_arrays_that_share_its_expression_waits_for_them() {
+    let ctx = ctx();
+    ctx.set_assume_busy(true);
+    let xs = values(5000, 31, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let residual = ((&x * &x + 1.0).sqrt() * 3.0).shift(1) - (&x * 2.0 + 0.5).sqrt();
+    let update = &x + &residual * 0.5;
+    let norm = (&residual * &residual).sum();
+    let before = ctx.jit().stats();
+    crate::eval_all(&[&update, &norm]).unwrap();
+    let got = update.to_vec().unwrap();
+    let launches = delta(before, ctx.jit().stats());
+    // The residual once (it is shared and shifted), the update, the reduction's passes.
+    assert!(launches.elementwise_launches <= 2, "{launches:?}");
+    let n = xs.len();
+    let r = |i: usize| (((xs[(i + n - 1) % n] * xs[(i + n - 1) % n] + 1.0).sqrt() * 3.0) - (xs[i] * 2.0 + 0.5).sqrt());
+    let want: Vec<f32> = (0..n).map(|i| xs[i] + r(i) * 0.5).collect();
+    assert_close(&got, &want, 1e-4, 1e-4);
+    let sum: f32 = (0..n).map(|i| r(i) * r(i)).sum();
+    assert!((norm.item().unwrap() - sum).abs() <= 1e-3 * sum.abs(), "{} vs {sum}", norm.item().unwrap());
+}

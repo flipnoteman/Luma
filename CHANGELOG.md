@@ -168,6 +168,12 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- `eval_all` of arrays together with a reduction computes the arrays first (the reduction is
+  recorded when it is requested, after the arrays asked for before it): a reduction that shares
+  work with them (a step's residual is summed and also read by the state update) no longer
+  evaluates it on its own with every shared intermediate in a kernel of its own. A per-step
+  `eval_all` loop of an f32 residual and update is 8 launches again instead of 28.
+
 - An elementwise operation on a reduction that cannot extend its last pass (any operation on the
   sum of a `Df32` array, or an operation with an array on an `f32` one) no longer records the
   reduction while the expression is built: it reads a node that stands for the reduction's value
