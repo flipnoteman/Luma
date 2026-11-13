@@ -230,7 +230,7 @@ pub fn base_multiply_sum(t: &Tables, kappa: &Array<u32>, terms: &[Term]) -> Arra
     let mut acc: Option<Array<u32>> = None;
     for term in terms {
         // The factor of `f1` in the product: g1 gamma for an even element, g0 (the other one) for an odd one.
-        let scaled = select(&odd, &term.g_other, &mont(&(&term.g_other * &gamma)));
+        let scaled = select(&odd, &term.g_other, mont(&(&term.g_other * &gamma)));
         let first = select(&odd, &term.f_other, &term.f);
         let second = select(&odd, &term.f, &term.f_other);
         let product = &first * &term.g + &second * &scaled;

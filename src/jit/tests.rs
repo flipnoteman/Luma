@@ -3079,6 +3079,38 @@ fn ghost_regions_are_computed_only_where_they_are_assigned() {
     }
 }
 
+/// A join of many evaluated parts along a slow axis is a chain of selects on the coordinate; each
+/// one is computed as `if`/`else` (a nested one saves a load per cell that reaches it, however few
+/// do), so a cell loads the one part it takes and not every part.
+#[test]
+fn a_join_of_many_parts_loads_only_the_part_each_cell_takes() {
+    let ctx = ctx();
+    let (n, parts) = (24usize, 12usize);
+    let arrays: Vec<Array<u32>> = (0..parts).map(|p| Array::<u32>::range_on(&ctx, [n, 1], 0).unwrap() * 10 + p as u32).collect();
+    let refs: Vec<&Array<u32>> = arrays.iter().collect();
+    crate::eval_all(&refs).unwrap();
+    // A balanced tree of two-part joins along the second axis.
+    fn join(parts: &[Array<u32>]) -> Array<u32> {
+        match parts {
+            [one] => one.clone(),
+            [a, b] => crate::concat(1, [a, b]),
+            _ => {
+                let (a, b) = parts.split_at(parts.len() / 2);
+                crate::concat(1, [&join(a), &join(b)])
+            }
+        }
+    }
+    let joined = join(&arrays);
+    let got = joined.to_vec().unwrap();
+    for p in 0..parts {
+        for i in 0..n {
+            assert_eq!(got[i + n * p], (i * 10 + p) as u32, "part {p}, element {i}");
+        }
+    }
+    // Eleven selects, all branches.
+    assert_eq!(ctx.jit().last_branches(), parts - 1, "{:?}", ctx.jit().last_judgement());
+}
+
 /// `r = g[1..]` with `g = e[..n - 2] + e[2..]` (an expression `e`): the main program reads `g`
 /// once, so it is computed inside the main program, and what it reads of `e` (at two offsets) is
 /// read from the cell the main program computes it at: `e` is staged, read at offsets 1 and 3.

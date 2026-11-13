@@ -206,7 +206,7 @@ impl Op {
 
 /// Natural layout (instance after instance) of `items` as `u32` words.
 fn natural(items: &[Vec<u8>]) -> Vec<u32> {
-    items.iter().flat_map(|item| item.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect()
+    items.iter().flat_map(|item| item.chunks(4).map(|c| u32::from_le_bytes(c.try_into().expect("strings of whole words")))).collect()
 }
 
 /// A `[words, n]` array from host data in natural layout.
@@ -451,16 +451,28 @@ fn main() -> Result<()> {
     let sizes: Vec<usize> = value("--n").map_or(vec![32768, 65536], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());
     let sets: Vec<Params> = params::ALL.into_iter().filter(|p| value("--set").is_none_or(|s| p.name.ends_with(&s))).collect();
     let ops: Vec<Op> = Op::ALL.into_iter().filter(|o| value("--op").is_none_or(|s| o.name().eq_ignore_ascii_case(&s))).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    println!("device profile {:?}, CPU baseline on {threads} threads", ctx.tuning_profile());
     print_header();
-    let mut all = Vec::new();
     for &n in &sizes {
         for &p in &sets {
             let case = Case { p, n, cpu: !flag("--no-cpu") };
             for row in case.run(&ops)? {
                 print_row(&row);
-                all.push(row);
+                if flag("--splits") {
+                    for split in &row.splits {
+                        println!("    {split}");
+                    }
+                }
             }
         }
     }
+    println!(
+        "\nM ops/s: operations (one KeyGen, Encaps or Decaps of one instance) per second, with the inputs and outputs on the device (best of 5; the time from \
+         the call to `sync`).\nms: that time for the batch. gpu ms: the kernels' own time from timestamp queries. M ops/s +xfer: including the upload of \
+         the inputs and the readback of the outputs (best of 3).\nhost ms: until the call returned (graph building and recording; the GPU runs meanwhile). \
+         launches: kernels per batch. splits: cuts of fused expressions (`--splits` lists them).\n1st ms: the first call in a new context \
+         (compiling the kernels; `LUMA_CACHE=off` for a cold disk cache). CPU: the `ml-kem` crate on all threads."
+    );
     Ok(())
 }

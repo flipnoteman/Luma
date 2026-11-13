@@ -1299,7 +1299,7 @@ impl Builder {
             _ => {
                 let axis = self.tape.below(nd);
                 let dims = v.dims;
-                let count = 1 + self.tape.below(2);
+                let count = 1 + self.tape.below(5);
                 let others: Vec<usize> = (0..count)
                     .filter_map(|_| self.pick(|p| p.ty == v.ty && (0..4).all(|a| a == axis || p.dims[a] == dims[a])))
                     .collect();

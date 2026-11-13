@@ -115,6 +115,8 @@ cargo run --release --example bench_batching           # sync after every op vs 
 cargo run --release --example bench_launch             # host cost per kernel launch
 cargo run --release --example bench_fusion             # one kernel per op vs fused chains
 cargo run --release --example bench_threads            # threads on one context vs a context each
+cargo run --release --example keccak                   # Keccak-f, SHA3-256 and SHAKE128 in lazy array operations
+cargo run --release --example mlkem                    # ML-KEM (FIPS 203) KeyGen / Encaps / Decaps over batches, checked against RustCrypto and NIST vectors
 ```
 
 ### Benchmarks

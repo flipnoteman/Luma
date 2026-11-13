@@ -50,15 +50,16 @@ pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
     }
     let count = before; // accepted candidates of the whole group
     let first_slot = count.cumsum(2) - &count;
-    let info = (first_slot | (packed_before.expect("eight candidates") << 9u32)).cache();
-    let ends = (info.clone() & 0x1FFu32) + &count; // last group: 448 candidates at most: its end slot
+    let ends = &first_slot + &count;
+    // Slots from 256 on are dropped, so the count is clamped to fit its 9 bits however many blocks there are.
+    let info = (first_slot.minimum(256u32) | (packed_before.expect("eight candidates") << 9u32)).cache();
     let accepted_in_row = ends.slice(2, groups - 1..groups);
     let least = accepted_in_row.min();
 
     // Every candidate: `c` fastest, so that neighbouring threads write neighbouring slots of one
     // polynomial, then a few rows, so that the threads that read the words of a group read
     // neighbouring words.
-    let near = [8usize, 4, 2, 1].into_iter().find(|n| rows % n == 0).expect("1 divides every row count");
+    let near = [8usize, 4, 2, 1].into_iter().find(|&n| rows.is_multiple_of(n)).expect("1 divides every row count");
     let shape = [PER_GROUP, near, groups, rows / near];
     let coordinate = |axis: usize| Array::<u32>::range_on(ctx, shape, axis).expect("index array");
     let (c, g) = (coordinate(0), coordinate(2));

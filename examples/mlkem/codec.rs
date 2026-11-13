@@ -55,7 +55,7 @@ pub fn pack(coefficients: &Array<u32>, d: u32) -> Array<u32> {
         let up = select(&from_left, &(&at - &start), 0u32);
         let down = select(&from_left, 0u32, &(&start - &at));
         let inside = up.lt(32u32) | (1u32 - &from_left);
-        let placed = select(&from_left, &c.shl(&up), &c.shr(&down));
+        let placed = select(&from_left, c.shl(&up), c.shr(&down));
         let term = select(&inside, &placed, 0u32);
         acc = Some(match acc {
             Some(sum) => sum | term,
