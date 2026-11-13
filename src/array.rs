@@ -522,7 +522,11 @@ impl<T: GpuType> Array<T> {
             Repr::Valid(storage) => Ok(Src::Buffer(Arc::clone(storage))),
             Repr::Lazy(held) => held.latest().as_src(),
             Repr::Poisoned(error) => Err(Failure::Inherited(Arc::clone(error))),
-            Repr::Reduced(_) => Ok(Src::Buffer(Arc::clone(self.storage()?))),
+            Repr::Reduced(reduced) => match reduced.result_if_recorded() {
+                Some(result) => result.as_ref().map(|storage| Src::Buffer(Arc::clone(storage))).map_err(|error| Failure::Inherited(Arc::clone(error))),
+                // Not recorded yet: an operation on it is built without recording it.
+                None => Ok(Src::Node(reduced.leaf(&self.ctx, self.len()))),
+            },
         }
     }
 

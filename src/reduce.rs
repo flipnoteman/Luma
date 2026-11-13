@@ -35,6 +35,13 @@ pub(crate) struct Reduced {
     /// The operations applied to the reduction's values (none for a plain reduction).
     finish: Finish,
     result: OnceLock<std::result::Result<Arc<Storage>, Arc<LumaError>>>,
+    /// The element type, and where the reduction was asked for (for the node that stands for its value).
+    ty: ElemTy,
+    name: &'static str,
+    location: &'static Location<'static>,
+    /// The nodes that stand for the value in expressions (see [`Reduced::leaf`]): they get the buffer when the passes are
+    /// recorded for any other reason, so that what reads them is a reader of that buffer (a write into it evaluates it first).
+    leaves: std::sync::Mutex<Vec<std::sync::Weak<Node>>>,
 }
 
 impl std::fmt::Debug for Reduced {
@@ -53,6 +60,18 @@ impl Reduced {
         self.operand.failure().or_else(|| self.result.get().and_then(|result| result.as_ref().err()))
     }
 
+    /// The buffer of the reduction if its passes have been recorded (or the error), without recording them.
+    pub(crate) fn result_if_recorded(&self) -> Option<&std::result::Result<Arc<Storage>, Arc<LumaError>>> {
+        self.result.get()
+    }
+
+    /// A node standing for the value of this reduction in expressions: evaluating it records the passes.
+    pub(crate) fn leaf(self: &Arc<Self>, ctx: &Context, len: usize) -> Arc<Node> {
+        let leaf = jit::deferred(ctx, len, self.ty, Arc::clone(self), self.name, self.location);
+        crate::gpu::lock(&self.leaves).push(Arc::downgrade(&leaf));
+        leaf
+    }
+
     /// Whether the passes have not been recorded into a buffer yet.
     pub(crate) fn is_unforced(&self) -> bool {
         self.result.get().is_none()
@@ -60,14 +79,23 @@ impl Reduced {
 
     /// Records the passes into a new buffer (once) and returns it. Nothing is read back.
     pub(crate) fn force(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
+        let result = self.record_once(ctx);
+        if let Ok(storage) = result {
+            for leaf in std::mem::take(&mut *crate::gpu::lock(&self.leaves)) {
+                if let Some(leaf) = leaf.upgrade() {
+                    leaf.finish_shared(Arc::clone(storage));
+                }
+            }
+        }
+        result
+    }
+
+    /// [`Reduced::force`] for the node that stands for the value: it takes the buffer itself.
+    pub(crate) fn record_once(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
         self.result.get_or_init(|| self.record(ctx).map_err(Arc::new))
     }
 
     fn record(&self, ctx: &Context) -> Result<Arc<Storage>> {
-        // The arrays `eval` asked for and a submission postponed are computed first: a reduction that
-        // shares work with them (the residual of a step is summed, and is also what the update of
-        // the state reads) then reads it from their kernel instead of computing it alone.
-        ctx.jit().evaluate_requested();
         let count = self.ops.as_slice().len();
         let storage = Arc::new(Storage::new(ctx, count, self.elem as usize));
         let pin = storage.pin(0)?;
@@ -152,7 +180,7 @@ impl<T: ScalarType> Array<T> {
             // write. The reader is a copy of the operand that the reduction's first pass fuses.
             let args = [operand, Src::unused(), Src::unused()];
             let reader = jit::create(ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
-            let reduced = Reduced { operand: reader, ops, wgsl, elem, buffer, finish: Finish::default(), result: OnceLock::new() };
+            let reduced = Reduced { operand: reader, ops, wgsl, elem, buffer, finish: Finish::default(), result: OnceLock::new(), ty: ElemTy::of::<T>()?, name, location, leaves: Default::default() };
             return Ok(Array::from_reduced(ctx, shape, Arc::new(reduced)));
         }
         // Nothing is left to fuse: record the passes now.
@@ -188,6 +216,10 @@ impl<T: ScalarType> Array<T> {
             buffer: reduced.buffer,
             finish,
             result: OnceLock::new(),
+            ty: reduced.ty,
+            name: reduced.name,
+            location: reduced.location,
+            leaves: Default::default(),
         };
         Some(Array::from_reduced(self.context(), self.shape(), Arc::new(derived)))
     }

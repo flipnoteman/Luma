@@ -168,6 +168,15 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- An elementwise operation on a reduction that cannot extend its last pass (any operation on the
+  sum of a `Df32` array, or an operation with an array on an `f32` one) no longer records the
+  reduction while the expression is built: it reads a node that stands for the reduction's value
+  and records it when something that needs the value is evaluated, after the arrays that share
+  work with the reduction operand. Before, building `(x * x).sum() / n` over a `Df32` residual
+  evaluated the whole residual on its own right away (unstaged, with every shared intermediate
+  evaluated level by level), and a step that was one residual and its update became 60
+  launches; a `Df32` Euler step of 200x100 cells is 33 launches and 310 us instead of 60 and 520 us.
+
 - A shared node evaluated first together with its siblings (the other fields of its record, see
   `with_siblings`) no longer takes the earlier generations of those fields along when the
   record was assigned into several times: a lazy padded record with ghost region assigns that
