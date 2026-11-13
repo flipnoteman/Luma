@@ -1263,7 +1263,7 @@ fn generator_covers_the_statements() {
     use proptest::strategy::{Strategy, ValueTree};
     use std::collections::BTreeMap;
 
-    fn walk<'a>(stmts: &'a [Stmt], out: &mut BTreeMap<String, usize>) {
+    fn walk(stmts: &[Stmt], out: &mut BTreeMap<String, usize>) {
         for stmt in stmts {
             let name = format!("{stmt:?}");
             let name = name.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_owned();

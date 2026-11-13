@@ -255,6 +255,7 @@ mod tests {
 
     /// Block Thomas algorithm in `f64` for the cells `start..n` of one line; `cell(s)` gives the
     /// blocks `(lo, diag, up, rhs)` of cell `s`. Returns `x` of the cells `start..n`.
+    #[allow(clippy::type_complexity)]
     fn host_line(b: usize, start: usize, n: usize, cell: &dyn Fn(usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)) -> Vec<Vec<f64>> {
         let mut c: Vec<Vec<f64>> = Vec::new();
         let mut d: Vec<Vec<f64>> = Vec::new();
@@ -294,6 +295,7 @@ mod tests {
     /// Runs one solve of `lines` lines of `n` cells of `block`-blocks (`b == 0`: the scalar form)
     /// along grid axis `axis` (0 or 1) of an `n x lines` or `lines x n` grid with `tuning`, with
     /// per-line starts if `starts`, and compares it with the host solve.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     #[track_caller]
     fn check(ctx: &Context, tuning: Tuning, b: usize, n: usize, lines: usize, axis: usize, starts: bool, seed: u64) {
         let bs = b.max(1);

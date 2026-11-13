@@ -100,13 +100,13 @@ impl Bench {
         };
         let rate = if rate < 10.0 { format!("{rate:.3}") } else { format!("{rate:.1}") };
         let (kernels, gpu) = if profiled {
-            match self.ctx.profile(|| f()) {
+            match self.ctx.profile(f) {
                 Ok(((), p)) => {
                     let row = (p.launches().to_string(), format!("{:.3}", p.total().as_secs_f64() * 1e3));
                     self.profiles.push((name.to_string(), size.to_string(), p));
                     row
                 }
-                Err(e) => (format!("err"), format!("{e}")),
+                Err(e) => ("err".to_string(), format!("{e}")),
             }
         } else {
             ("-".to_string(), "-".to_string())
@@ -288,7 +288,7 @@ fn rusanov(l: &Prim, r: &Prim, dir: usize) -> Cons {
 }
 
 fn minmod(a: &A, b: &A) -> A {
-    let smaller = select(&a.abs().lt(&b.abs()), a, b);
+    let smaller = select(&a.abs().lt(b.abs()), a, b);
     select(&(a * b).gt(0.0), &smaller, 0.0)
 }
 
@@ -297,8 +297,8 @@ fn minmod(a: &A, b: &A) -> A {
 fn muscl_faces(w: &Prim, axis: usize, n: usize, dir: usize) -> Cons {
     let s = |k: usize| w.slice(axis, k..k + n + 1);
     let (a, b, c, d) = (s(0), s(1), s(2), s(3));
-    let sl = (&b - &a).zip(&(&c - &b), |x, y| minmod(x, y));
-    let sr = (&c - &b).zip(&(&d - &c), |x, y| minmod(x, y));
+    let sl = (&b - &a).zip(&(&c - &b), minmod);
+    let sr = (&c - &b).zip(&(&d - &c), minmod);
     let l = &b + 0.5 * &sl;
     let r = &c - 0.5 * &sr;
     rusanov(&l, &r, dir)
@@ -1011,7 +1011,7 @@ fn writes(b: &mut Bench) {
             let idx = permutation(n, 5);
             let vals = values(n, 6, 0.2, 1.2);
             let x = Array::<f32>::zeros_on(&ctx, n).unwrap();
-            x.put(&Array::from_slice_on(&ctx, &idx, n).unwrap(), &Array::from_slice_on(&ctx, &vals, n).unwrap()).unwrap();
+            x.put(&Array::from_slice_on(&ctx, &idx, n).unwrap(), Array::from_slice_on(&ctx, &vals, n).unwrap()).unwrap();
             let mut want = vec![0.0f32; n];
             for i in 0..n {
                 want[idx[i] as usize] = vals[i];

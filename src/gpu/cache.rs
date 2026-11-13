@@ -244,7 +244,7 @@ impl DiskCache {
     pub(crate) fn load_cost(&self) -> Option<CostModel> {
         let dir = self.dir.as_ref()?;
         let bytes = read_blob(&dir.join(format!("cost-{}.bin", self.key)), COST)?;
-        let numbers: Vec<f64> = bytes.chunks_exact(8).map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap_or_default())).collect();
+        let numbers: Vec<f64> = bytes.as_chunks::<8>().0.iter().map(|chunk| f64::from_le_bytes(*chunk)).collect();
         let [launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor] = numbers[..] else { return None };
         let f64_factor = (!f64_factor.is_nan()).then_some(f64_factor);
         let model = CostModel { launch_us, bandwidth_gbs, f32_ops_per_ns, df32_factor, f64_factor };

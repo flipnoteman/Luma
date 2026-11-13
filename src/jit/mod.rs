@@ -1850,7 +1850,14 @@ pub(crate) fn recompute_viewed(node: &Node) -> bool {
     node.len() as u64 * node.op().out_ty().bytes() <= node.context().segment_bytes() && !node.requested.load(Ordering::Relaxed)
 }
 
+/// The compiled kernels of one loop program, with the state layout each one was built for.
+type LoopKernels = Vec<(Vec<Option<usize>>, Arc<KernelCore>)>;
+
+/// The instructions of a program and of its sub-programs, as shared by equal programs.
+type Structure = (Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>);
+
 /// Per-context state of the fusion machinery.
+
 #[derive(Debug)]
 pub(crate) struct JitState {
     /// Generated kernels by the structure of their program.
@@ -1859,7 +1866,7 @@ pub(crate) struct JitState {
     stencils: BuildCache<String, Arc<KernelCore>>,
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
     /// that a loop run again does not generate and hash its source again.
-    loops: Mutex<FxMap<program::FusedKey, Vec<(Vec<Option<usize>>, Arc<KernelCore>)>>>,
+    loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
     /// Every node created and not yet known to be evaluated, oldest first, so that
     /// [`Context::sync`] can evaluate the live ones.
     live: Readers,
@@ -1887,7 +1894,7 @@ pub(crate) struct JitState {
     last_judgement: Mutex<Option<String>>,
     /// The programs seen so far by their shape hash, to make equal ones share their
     /// instructions (see [`JitState::intern`]).
-    structures: Mutex<FxMap<u64, Vec<(Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>)>>>,
+    structures: Mutex<FxMap<u64, Vec<Structure>>>,
     /// The programs built from graphs seen so far, to build them again from graphs of the same
     /// shape without walking them (see [`program::Recipe`]).
     recipes: Mutex<program::RecipeTable>,

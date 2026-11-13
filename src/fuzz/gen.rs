@@ -49,6 +49,7 @@ pub enum ViewOp {
 
 /// The views a write goes through: they keep every element distinct.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum InjView {
     InjSlice { axis: usize, lo: usize, hi: usize },
     InjFlip { axis: usize },

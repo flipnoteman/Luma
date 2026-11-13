@@ -220,9 +220,9 @@ fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
             CmpOp::Lt | CmpOp::Gt => None,
         },
         OpKind::Powf => match scalar(b).and_then(value_of)? {
-            e if e == 1.0 => identity(op, a),
-            e if e == 2.0 => Some((Op::new(OpKind::Binary(BinOp::Mul), ty), args_of(a.clone(), a.clone(), Src::unused()))),
-            e if e == 0.5 => unary(UnOp::Sqrt, ty, a),
+            1.0 => identity(op, a),
+            2.0 => Some((Op::new(OpKind::Binary(BinOp::Mul), ty), args_of(a.clone(), a.clone(), Src::unused()))),
+            0.5 => unary(UnOp::Sqrt, ty, a),
             _ => None,
         },
         _ => None,
@@ -375,6 +375,7 @@ mod tests {
         assert_eq!(ctx.jit().last_program_len(), 2);
     }
 
+    #[allow(clippy::type_complexity, clippy::erasing_op, clippy::modulo_one)]
     #[test]
     fn simplify_exact_u32_rules() {
         let ctx = context(false);
@@ -403,6 +404,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::erasing_op)]
     #[test]
     fn simplify_constants_of_every_type_evaluate() {
         let ctx = context(true);
@@ -454,6 +456,7 @@ mod tests {
 
     /// Fast rules: not applied without the flag, applied with it (checked by program length or
     /// by the exact operation they turn into).
+    #[allow(clippy::type_complexity, clippy::erasing_op, clippy::eq_op)]
     fn fast_cases() -> Vec<(&'static str, bool, FloatCase, FloatCase)> {
         vec![
             ("add zero", false, |b, _| host(&(b + 0.0)), |b, _| host(b)),

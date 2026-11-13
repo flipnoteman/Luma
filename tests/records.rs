@@ -60,6 +60,7 @@ fn operator_forms_agree() {
     let (a, b) = (cons(&ctx, &ha), cons(&ctx, &hb));
     let lam = Array::from_slice_on(&ctx, &hl, SHAPE).unwrap();
 
+    #[allow(clippy::type_complexity)]
     let cases: Vec<(Cons, Box<dyn Fn(f32, f32, f32) -> f32>)> = vec![
         (&a - &b, Box::new(|x, y, _| x - y)),
         (a.map(|x| x * 1.0) * b.map(|x| x * 1.0), Box::new(|x, y, _| x * y)),

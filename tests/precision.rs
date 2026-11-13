@@ -183,8 +183,8 @@ fn df32_casts_are_exact_under_fusion() {
         for (g, d) in lows.iter().zip(&data) {
             assert_eq!(*g, d.lo, "{d:?}");
         }
-        let ones = Array::<f64>::from_slice_on(&ctx, &vec![1.0e8; 8], 8).unwrap();
-        let tiny = Array::<f64>::from_slice_on(&ctx, &vec![1.0; 8], 8).unwrap();
+        let ones = Array::<f64>::from_slice_on(&ctx, &[1.0e8; 8], 8).unwrap();
+        let tiny = Array::<f64>::from_slice_on(&ctx, &[1.0; 8], 8).unwrap();
         let s = (&ones + &tiny).to_df32();
         let r = (&s - &ones.to_df32()).to_f32().to_vec().unwrap();
         assert_eq!(r, vec![1.0; 8]);

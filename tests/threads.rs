@@ -255,7 +255,7 @@ fn flushing_threads_do_not_disturb_a_recorded_step() {
                 let mut u = on(&ctx, &u0);
                 let mut w = u0;
                 for step in 0..40 {
-                    u = &u * 0.5 + (&u).shift(1) * 0.25 + 0.01;
+                    u = &u * 0.5 + u.shift(1) * 0.25 + 0.01;
                     w = (0..N).map(|i| w[i] * 0.5 + w[(i + N - 1) % N] * 0.25 + 0.01).collect();
                     match step % 3 {
                         0 => u.eval().unwrap(),
