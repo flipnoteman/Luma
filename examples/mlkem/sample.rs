@@ -81,7 +81,7 @@ pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
     // Rejected candidates and the ones past slot 255 go beyond the array.
     let valid = value.lt(Q) * slot.lt(256u32);
     let index = select(&valid, &(&slot + &row * 256u32), rows as u32 * 256);
-    let polynomials = Array::<u32>::zeros_on(ctx, [256, rows]).expect("polynomials");
+    let mut polynomials = Array::<u32>::zeros_on(ctx, [256, rows]).expect("polynomials");
     polynomials.put(&index, &value).expect("scatter");
     (polynomials, least)
 }

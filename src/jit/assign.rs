@@ -246,6 +246,20 @@ impl Hazards<'_> {
         {
             return true;
         }
+        // A private view of exactly the region, read by the invocation that overwrites the cell
+        // after computing its value: each invocation reads and writes its own cell only.
+        if !conservative
+            && reads.first
+            && !reads.others
+            && let OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) = m.op().kind
+            && map == region.map
+            && map.is_injective()
+            && walked.is_some_and(|entry| {
+                entry.private && !entry.under_shift && (self.same || entry.owners == 1u64.checked_shl(j as u32).unwrap_or(0))
+            })
+        {
+            return true;
+        }
         // An operation private to the right-hand side that reads the element its own invocation
         // overwrites, before writing it.
         let direct = !(matches!(m.op().kind, OpKind::Shift(_)) && reads.first);

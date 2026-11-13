@@ -104,8 +104,10 @@ fn run(
 ) -> Result<Arc<Storage>, Failure> {
     let n = len_u32(len)?;
     let max_ops = ReduceList::new(&[ReduceOp::Max]);
-    let body_core = ctx.jit().kernel(ctx, &body.key)?;
-    let check_core = ctx.jit().kernel(ctx, &check.key)?;
+    let (mut body_key, mut body_scalars) = (body.key.clone(), body.scalars.clone());
+    let (mut check_key, mut check_scalars) = (check.key.clone(), check.scalars.clone());
+    let body_core = ctx.jit().kernel(ctx, &mut body_key, &mut body_scalars)?;
+    let check_core = ctx.jit().kernel(ctx, &mut check_key, &mut check_scalars)?;
     let gate_core = ctx.builtin(Builtin::UntilGate, "u32")?;
     let finish_core = ctx.builtin(Builtin::Reduce(max_ops.rest(), true), "f32")?;
 
@@ -165,7 +167,7 @@ fn run(
                 if let Some(at) = body_state {
                     inputs[at] = Arc::clone(current);
                 }
-                let args = store_args(&body.key, &[&**next], &inputs, &body.scalars, None, 0)?;
+                let args = store_args(&body_key, &[&**next], &inputs, &body_scalars, None, 0)?;
                 ctx.jit().stats.elementwise_launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 ctx.launch_indirect(&body_core, &steps[k], 0, [n, 1, 1], &args.raw())?;
 
@@ -173,8 +175,8 @@ fn run(
                 if let Some(at) = check_state {
                     inputs[at] = Arc::clone(current);
                 }
-                let pins = pin_inputs(&check.key, &inputs, None, 0, n)?;
-                let uniform = params(&check.key, None, Some(n), 0, len, &check.scalars)?;
+                let pins = pin_inputs(&check_key, &inputs, None, 0, n)?;
+                let uniform = params(&check_key, None, Some(n), 0, len, &check_scalars)?;
                 let (first_out, first_bytes) = &partials[0];
                 let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
                 raw.push(RawArg::write(first_out, *first_bytes));

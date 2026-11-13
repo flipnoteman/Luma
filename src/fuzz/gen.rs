@@ -49,7 +49,8 @@ pub enum ViewOp {
     Stack { axis: usize, others: Vec<usize> },
 }
 
-/// The views a write goes through: they keep every element distinct.
+/// The regions a write goes through (`slice_mut`, `flip_mut`, `transpose_mut`, then the same
+/// refinements of the region): they keep every element distinct.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub enum InjView {
@@ -86,6 +87,8 @@ pub enum Stmt {
     SumWhere { src: usize, mask: usize },
     Scan { src: usize, axis: usize, op: ScanOp },
     AxisReduce { src: usize, axis: usize, op: RedOp },
+    /// Writes `rhs` into the region of `target` that `path` selects (the array itself if empty);
+    /// `target` is not a view, which is read-only.
     Assign { target: usize, path: Vec<InjView>, rhs: Opd },
     Put { target: usize, idx: Vec<u32>, vals: Opd },
     Compound { target: usize, op: BinOp, rhs: Opd },
@@ -566,8 +569,9 @@ struct Var {
     ty: Ty,
     dims: Dims,
     cell: usize,
-    /// The cell an assignment through this array writes (set for slices, flips, transposes).
-    root: Option<usize>,
+    /// Set for slices, flips and transposes, and aliases and reshapes of them: read-only views,
+    /// which every write rejects.
+    read_only: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -587,7 +591,7 @@ struct New {
     ty: Ty,
     dims: Dims,
     cell: CellRef,
-    root: Option<usize>,
+    read_only: bool,
 }
 
 #[derive(Default)]
@@ -622,7 +626,7 @@ impl Scope {
                 }
                 CellRef::Shared(c) => c,
             };
-            self.vars.push(Some(Var { ty: new.ty, dims: new.dims, cell, root: new.root }));
+            self.vars.push(Some(Var { ty: new.ty, dims: new.dims, cell, read_only: new.read_only }));
         }
         for k in e.kill {
             self.vars[k] = None;
@@ -630,7 +634,7 @@ impl Scope {
     }
 
     fn fresh(ty: Ty, dims: Dims, info: Info) -> New {
-        New { ty, dims, cell: CellRef::Fresh(info), root: None }
+        New { ty, dims, cell: CellRef::Fresh(info), read_only: false }
     }
 
     /// The info and typing of an operand of type `ty`.
@@ -644,9 +648,10 @@ impl Scope {
         }
     }
 
-    /// Whether writes into cell `c` (and through view roots) are allowed in this scope.
+    /// Whether `v` may be written in this scope: it is not a read-only view and its cell is not
+    /// one of an enclosing scope of a loop body.
     fn writable(&self, v: &Var) -> bool {
-        v.cell >= self.local_from && v.root.is_none_or(|r| r >= self.local_from)
+        !v.read_only && v.cell >= self.local_from
     }
 
     /// The effect of `stmt`, or `None` if it is not valid here (in the value domain `math`).
@@ -726,6 +731,9 @@ impl Scope {
                     return None;
                 }
                 let dims = bcast(ld, rd)?;
+                if len_of(dims) > 4096 {
+                    return None;
+                }
                 let info = bin_info(ty, math, *op, li, ri, rc)?;
                 e.new.push(Scope::fresh(ty, dims, info));
             }
@@ -737,6 +745,9 @@ impl Scope {
                     return None;
                 }
                 let dims = bcast(Some(v.dims), rd)?;
+                if len_of(dims) > 4096 {
+                    return None;
+                }
                 e.new.push(Scope::fresh(Ty::U32, dims, Info::int()));
             }
             Stmt::Select { mask, a, b, ty } => {
@@ -747,7 +758,7 @@ impl Scope {
                 let (ad, ai, _) = self.opd(a, *ty)?;
                 let (bd, bi, _) = self.opd(b, *ty)?;
                 for d in [ad, bd].into_iter().flatten() {
-                    if d != m.dims && len_of(d) != 1 {
+                    if !fits(d, m.dims) {
                         return None;
                     }
                 }
@@ -757,7 +768,6 @@ impl Scope {
             Stmt::View { src, view } => {
                 let v = self.var(*src)?;
                 let info = self.info(v);
-                let root = v.root.unwrap_or(v.cell);
                 match view {
                     ViewOp::Slice { axis, lo, hi } => {
                         if *axis >= 4 || lo >= hi || *hi > v.dims[*axis] {
@@ -765,17 +775,17 @@ impl Scope {
                         }
                         let mut dims = v.dims;
                         dims[*axis] = hi - lo;
-                        e.new.push(New { root: Some(root), ..Scope::fresh(v.ty, dims, info) });
+                        e.new.push(New { read_only: true, ..Scope::fresh(v.ty, dims, info) });
                     }
                     ViewOp::Flip { axis } => {
                         if *axis >= 4 {
                             return None;
                         }
-                        e.new.push(New { root: Some(root), ..Scope::fresh(v.ty, v.dims, info) });
+                        e.new.push(New { read_only: true, ..Scope::fresh(v.ty, v.dims, info) });
                     }
                     ViewOp::Transpose => {
                         let d = v.dims;
-                        e.new.push(New { root: Some(root), ..Scope::fresh(v.ty, [d[1], d[0], d[2], d[3]], info) });
+                        e.new.push(New { read_only: true, ..Scope::fresh(v.ty, [d[1], d[0], d[2], d[3]], info) });
                     }
                     ViewOp::Pad { widths, mode } => {
                         let mut dims = v.dims;
@@ -877,6 +887,10 @@ impl Scope {
             }
             Stmt::Assign { target, path, rhs } => {
                 let t = self.var(*target)?;
+                // A view is read-only: the array it is a view of is written, through a path.
+                if !self.writable(t) {
+                    return None;
+                }
                 let mut dims = t.dims;
                 for step in path {
                     match step {
@@ -898,28 +912,17 @@ impl Scope {
                 if rd.is_some_and(|d| d != dims) {
                     return None;
                 }
-                let viewed = !path.is_empty() || t.root.is_some();
-                let root = t.root.unwrap_or(t.cell);
-                if viewed {
-                    // The root is written; a named receiver also shows the new data.
-                    if root < self.local_from || (path.is_empty() && t.cell < self.local_from) {
-                        return None;
-                    }
-                    let joined = finish(t.ty, math, Info::join(self.cells[root], ri))?;
-                    e.set.push((root, joined));
-                    if path.is_empty() {
-                        e.set.push((t.cell, ri));
-                    }
-                } else {
-                    if t.cell < self.local_from {
-                        return None;
-                    }
+                if path.is_empty() {
                     e.set.push((t.cell, ri));
+                } else {
+                    // Part of the array is written: its values are those of both.
+                    let joined = finish(t.ty, math, Info::join(self.info(t), ri))?;
+                    e.set.push((t.cell, joined));
                 }
             }
             Stmt::Put { target, idx, vals } => {
                 let t = self.var(*target)?;
-                if t.root.is_some() || !self.writable(t) {
+                if !self.writable(t) {
                     return None;
                 }
                 let (vd, vi, _) = self.opd(vals, t.ty)?;
@@ -931,11 +934,11 @@ impl Scope {
             }
             Stmt::Compound { target, op, rhs } => {
                 let t = self.var(*target)?;
-                if t.root.is_some() || !self.writable(t) {
+                if !self.writable(t) {
                     return None;
                 }
                 let (rd, ri, rc) = self.opd(rhs, t.ty)?;
-                if rd.is_some_and(|d| d != t.dims && len_of(d) != 1) {
+                if rd.is_some_and(|d| !fits(d, t.dims)) {
                     return None;
                 }
                 if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) && !op.bitwise() || (t.ty != Ty::U32 && (*op == BinOp::Rem || op.bitwise())) {
@@ -949,7 +952,7 @@ impl Scope {
             }
             Stmt::Write { target, seed } => {
                 let t = self.var(*target)?;
-                if t.root.is_some() || !self.writable(t) {
+                if !self.writable(t) {
                     return None;
                 }
                 let info = if t.ty == Ty::U32 {
@@ -964,18 +967,18 @@ impl Scope {
             }
             Stmt::Cache { src } => {
                 let v = self.var(*src)?;
-                e.new.push(New { ty: v.ty, dims: v.dims, cell: CellRef::Shared(v.cell), root: None });
+                e.new.push(New { ty: v.ty, dims: v.dims, cell: CellRef::Shared(v.cell), read_only: false });
             }
             Stmt::Alias { src } => {
                 let v = self.var(*src)?;
-                e.new.push(New { ty: v.ty, dims: v.dims, cell: CellRef::Shared(v.cell), root: v.root });
+                e.new.push(New { ty: v.ty, dims: v.dims, cell: CellRef::Shared(v.cell), read_only: v.read_only });
             }
             Stmt::Reshape { src, dims } => {
                 let v = self.var(*src)?;
                 if len_of(*dims) != len_of(v.dims) {
                     return None;
                 }
-                e.new.push(New { ty: v.ty, dims: *dims, cell: CellRef::Shared(v.cell), root: None });
+                e.new.push(New { ty: v.ty, dims: *dims, cell: CellRef::Shared(v.cell), read_only: v.read_only });
             }
             Stmt::Classify { src, class: _ } => {
                 let v = self.var(*src)?;
@@ -1003,16 +1006,31 @@ impl Scope {
     }
 }
 
-/// The shape of a binary operation on operands of shapes `a` and `b` (a constant has none).
+/// The shape of a binary operation on operands of shapes `a` and `b` (a constant has none): along
+/// every axis the common extent, or the other one where one side has extent 1.
 fn bcast(a: Option<Dims>, b: Option<Dims>) -> Option<Dims> {
     match (a, b) {
-        (Some(a), Some(b)) if a == b => Some(a),
-        (Some(a), Some(b)) if len_of(b) == 1 => Some(a),
-        (Some(a), Some(b)) if len_of(a) == 1 => Some(b),
-        (Some(_), Some(_)) => None,
+        (Some(a), Some(b)) => {
+            let mut out = a;
+            for k in 0..4 {
+                out[k] = match (a[k], b[k]) {
+                    (x, y) if x == y => x,
+                    (1, y) => y,
+                    (x, 1) => x,
+                    _ => return None,
+                };
+            }
+            Some(out)
+        }
         (Some(d), None) | (None, Some(d)) => Some(d),
         (None, None) => None,
     }
+}
+
+/// Whether an array of shape `d` broadcasts to `into`: along every axis its extent is `into`'s
+/// or 1.
+fn fits(d: Dims, into: Dims) -> bool {
+    (0..4).all(|k| d[k] == into[k] || d[k] == 1)
 }
 
 // -- The builder --
@@ -1092,16 +1110,22 @@ impl Builder {
         Self::float_from(self.math, word)
     }
 
-    /// An operand for an operation on `ty` with `like` the shape it must fit: a variable of the
-    /// type with that shape (or one element), or a constant.
-    fn operand(&mut self, ty: Ty, like: Option<Dims>, const_chance: (usize, usize)) -> Opd {
+    /// An operand for an operation on `ty`: a variable of the type whose shape satisfies `ok`, or
+    /// a constant.
+    fn operand(&mut self, ty: Ty, ok: impl Fn(Dims) -> bool, const_chance: (usize, usize)) -> Opd {
         if !self.tape.chance(const_chance.0, const_chance.1) {
-            let pick = self.pick(|v| v.ty == ty && like.is_none_or(|d| v.dims == d || len_of(v.dims) == 1));
+            let pick = self.pick(|v| v.ty == ty && ok(v.dims));
             if let Some(i) = pick {
                 return Opd::Var(i);
             }
         }
         Opd::Const(self.constant(ty))
+    }
+
+    /// Whether an operand of shape `d` combines with one of shape `like` (a constant has none)
+    /// into an array of at most 4096 elements.
+    fn combines(like: Option<Dims>, d: Dims) -> bool {
+        bcast(like, Some(d)).is_some_and(|out| len_of(out) <= 4096)
     }
 
     fn try_stmt(&mut self, stmt: Stmt) -> Option<Stmt> {
@@ -1289,7 +1313,7 @@ impl Builder {
         } else if op == BinOp::Div && !self.math {
             Opd::Const(self.tape.pick(&POW2_CONSTS))
         } else {
-            self.operand(ty, like, (1, 4))
+            self.operand(ty, |d| Self::combines(like, d), (1, 4))
         };
         Some(Stmt::Binary { lhs, rhs, op })
     }
@@ -1298,7 +1322,7 @@ impl Builder {
         let ty = self.any_ty();
         let lhs = self.pick_ty(ty)?;
         let like = self.scope.var(lhs).map(|v| v.dims);
-        let rhs = self.operand(ty, like, (1, 3));
+        let rhs = self.operand(ty, |d| Self::combines(like, d), (1, 3));
         let op = self.tape.pick(&[CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge, CmpOp::Equal, CmpOp::NotEqual]);
         Some(Stmt::Compare { lhs, rhs, op })
     }
@@ -1307,8 +1331,8 @@ impl Builder {
         let mask = self.pick_ty(Ty::U32)?;
         let dims = self.scope.var(mask)?.dims;
         let ty = self.any_ty();
-        let a = self.operand(ty, Some(dims), (1, 4));
-        let b = self.operand(ty, Some(dims), (1, 3));
+        let a = self.operand(ty, |d| fits(d, dims), (1, 4));
+        let b = self.operand(ty, |d| fits(d, dims), (1, 3));
         Some(Stmt::Select { mask, a, b, ty })
     }
 
@@ -1396,7 +1420,7 @@ impl Builder {
 
     fn g_assign(&mut self) -> Option<Stmt> {
         let local_from = self.scope.local_from;
-        let target = self.pick(|v| v.cell >= local_from)?;
+        let target = self.pick(|v| !v.read_only && v.cell >= local_from)?;
         let t = self.scope.var(target)?.clone();
         let mut dims = t.dims;
         let mut path = Vec::new();
@@ -1430,7 +1454,7 @@ impl Builder {
 
     fn g_put(&mut self) -> Option<Stmt> {
         let local_from = self.scope.local_from;
-        let target = self.pick(|v| v.root.is_none() && v.cell >= local_from)?;
+        let target = self.pick(|v| !v.read_only && v.cell >= local_from)?;
         let t = self.scope.var(target)?.clone();
         let len = len_of(t.dims);
         let vals = if self.tape.chance(1, 3) {
@@ -1457,7 +1481,7 @@ impl Builder {
 
     fn g_compound(&mut self) -> Option<Stmt> {
         let local_from = self.scope.local_from;
-        let target = self.pick(|v| v.root.is_none() && v.cell >= local_from)?;
+        let target = self.pick(|v| !v.read_only && v.cell >= local_from)?;
         let t = self.scope.var(target)?.clone();
         let op = match t.ty {
             Ty::U32 => self.tape.pick(&[
@@ -1479,16 +1503,15 @@ impl Builder {
             let pool: &[f32] = if t.ty == Ty::U32 { &[1.0, 2.0, 3.0, 7.0] } else { &POW2_CONSTS };
             Opd::Const(self.tape.pick(pool))
         } else {
-            // A one-element target is never broadcast to a larger right-hand side.
-            let like = Some(t.dims);
-            self.operand(t.ty, like, (1, 3))
+            // The right-hand side repeats along its extents of 1; the target never grows.
+            self.operand(t.ty, |d| fits(d, t.dims), (1, 3))
         };
         Some(Stmt::Compound { target, op, rhs })
     }
 
     fn g_write(&mut self) -> Option<Stmt> {
         let local_from = self.scope.local_from;
-        let target = self.pick(|v| v.root.is_none() && v.cell >= local_from)?;
+        let target = self.pick(|v| !v.read_only && v.cell >= local_from)?;
         let _t = self.scope.var(target)?.clone();
         let seed = u64::from(self.tape.next()) << 32 | u64::from(self.tape.next());
         Some(Stmt::Write { target, seed })
@@ -1553,7 +1576,7 @@ impl Builder {
                 let ty = self.any_ty();
                 let a = self.pick_ty(ty)?;
                 let da = self.scope.var(a)?.dims;
-                let b = self.pick(|v| v.ty == ty && v.dims != da && len_of(v.dims) != 1 && len_of(da) != 1)?;
+                let b = self.pick(|v| v.ty == ty && bcast(Some(da), Some(v.dims)).is_none())?;
                 Some(Stmt::Binary { lhs: Opd::Var(a), rhs: Opd::Var(b), op: BinOp::Add })
             }
             1 => {
@@ -1565,21 +1588,28 @@ impl Builder {
             }
             2 => {
                 let local_from = self.scope.local_from;
-                let target = self.pick(|v| v.cell >= local_from)?;
+                let target = self.pick(|v| !v.read_only && v.cell >= local_from)?;
                 let t = self.scope.var(target)?.clone();
                 let rhs = self.pick(|v| v.ty == t.ty && v.dims != t.dims)?;
                 Some(Stmt::Assign { target, path: vec![], rhs: Opd::Var(rhs) })
             }
             3 => {
-                let target = self.pick(|v| v.root.is_some())?;
+                // A write into a read-only view.
+                let target = self.pick(|v| v.read_only)?;
                 let ty = self.scope.var(target)?.ty;
-                Some(Stmt::Put { target, idx: vec![0], vals: Opd::Const(self.constant(ty)) })
+                let value = Opd::Const(self.constant(ty));
+                Some(match self.tape.below(4) {
+                    0 => Stmt::Put { target, idx: vec![0], vals: value },
+                    1 => Stmt::Write { target, seed: u64::from(self.tape.next()) },
+                    2 => Stmt::Assign { target, path: vec![], rhs: value },
+                    _ => Stmt::Assign { target, path: vec![InjView::InjFlip { axis: 0 }], rhs: value },
+                })
             }
             4 => {
                 let mask = self.pick_ty(Ty::U32)?;
                 let dims = self.scope.var(mask)?.dims;
                 let ty = self.any_ty();
-                let b = self.pick(|v| v.ty == ty && v.dims != dims && len_of(v.dims) != 1)?;
+                let b = self.pick(|v| v.ty == ty && !fits(v.dims, dims))?;
                 Some(Stmt::Select { mask, a: Opd::Var(b), b: Opd::Const(self.constant(ty)), ty })
             }
             _ => {
@@ -1659,7 +1689,7 @@ impl Builder {
             let candidates: Vec<usize> = self
                 .alive()
                 .filter(|(i, v)| {
-                    *i >= base + n && v.ty == want.ty && v.dims == want.dims && v.root.is_none() && v.cell >= local_from && !used.contains(&v.cell)
+                    *i >= base + n && v.ty == want.ty && v.dims == want.dims && !v.read_only && v.cell >= local_from && !used.contains(&v.cell)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -1919,5 +1949,45 @@ mod tests {
             Stmt::Binary { lhs: Opd::Var(2), rhs: Opd::Var(2), op: BinOp::Div },
         ];
         assert_eq!(first_refused(&program), None);
+    }
+
+    /// Operands broadcast along their extents of 1 (`[7, 1]` and `[1, 5]` make `[7, 5]`) in
+    /// binary operations, `select` and `+=`; a target never grows to its right-hand side.
+    #[test]
+    fn extents_of_one_broadcast_per_axis() {
+        let program = [
+            Stmt::Input { dims: [7, 5, 1, 1], ty: Ty::F32, seed: 0 },
+            Stmt::AxisReduce { src: 0, axis: 1, op: RedOp::Max },
+            Stmt::AxisReduce { src: 0, axis: 0, op: RedOp::Max },
+            Stmt::Binary { lhs: Opd::Var(1), rhs: Opd::Var(2), op: BinOp::Add },
+            Stmt::Range { dims: [7, 5, 1, 1], axis: 0, ty: Ty::U32 },
+            Stmt::Select { mask: 4, a: Opd::Var(1), b: Opd::Var(2), ty: Ty::F32 },
+            Stmt::Compound { target: 0, op: BinOp::Add, rhs: Opd::Var(2) },
+        ];
+        assert_eq!(first_refused(&program), None);
+        let mut grows = program[..3].to_vec();
+        grows.push(Stmt::Compound { target: 1, op: BinOp::Add, rhs: Opd::Var(0) });
+        assert_eq!(first_refused(&grows), Some(3));
+    }
+
+    /// A view is read-only: the array it is a view of is written, through a path.
+    #[test]
+    fn a_view_is_not_written_but_its_array_is() {
+        let mut program = vec![
+            Stmt::Input { dims: [7, 5, 1, 1], ty: Ty::F32, seed: 0 },
+            Stmt::View { src: 0, view: ViewOp::Slice { axis: 0, lo: 1, hi: 3 } },
+            Stmt::Assign { target: 0, path: vec![InjView::InjSlice { axis: 0, lo: 1, hi: 3 }], rhs: Opd::Const(1.0) },
+        ];
+        assert_eq!(first_refused(&program), None);
+        for write in [
+            Stmt::Assign { target: 1, path: vec![], rhs: Opd::Const(1.0) },
+            Stmt::Put { target: 1, idx: vec![0], vals: Opd::Const(1.0) },
+            Stmt::Compound { target: 1, op: BinOp::Add, rhs: Opd::Const(1.0) },
+            Stmt::Write { target: 1, seed: 0 },
+        ] {
+            program.truncate(2);
+            program.push(write);
+            assert_eq!(first_refused(&program), Some(2));
+        }
     }
 }

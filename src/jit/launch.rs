@@ -481,8 +481,8 @@ fn plan_shifts(
 fn out_elems(key: &FusedKey) -> Vec<u64> {
     let bytes = |at: u32| key.instrs.get(at as usize).map_or(4, |instr| instr.op.out_ty().bytes());
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().map(|&at| bytes(at)).collect(),
-        Tail::Scatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => key.outputs.iter().map(|&at| bytes(at)).collect(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().checked_sub(1).map_or(4, |at| bytes(at as u32))],
     }
 }
@@ -525,7 +525,7 @@ fn spans(
         };
         let reach = match kind {
             ShiftKind::View { map, edge } => Reach::View(map, edge),
-            ShiftKind::Take { .. } => Reach::All,
+            ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamView { .. } => Reach::All,
             ShiftKind::Linear => {
                 let amount = match instr.args[1] {
                     Ref::Scalar(q) => scalars.get(q as usize).copied(),
@@ -617,8 +617,8 @@ fn spans(
     }
 
     let outputs = match key.tail {
-        Tail::Store | Tail::StoreMapped(_) => key.outputs.len(),
-        Tail::Scatter { .. } | Tail::Stack { .. } | Tail::Reduce(_) => 1,
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => key.outputs.len(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } | Tail::Reduce(_) => 1,
     };
     let direct = (0..input_count)
         .filter(|&k| !key.in_place.iter().any(|&(paired, _)| paired as usize == k) && direct(&key.instrs, k as u32))
@@ -831,7 +831,7 @@ fn settle_staging(key: &mut FusedKey, len: usize) {
 /// instead of a new one.
 pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
     fused.mark_fused();
-    let Fused { mut key, mut inputs, scalars, fused_nodes, instr_nodes, sub_roots } = fused;
+    let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     // The fused nodes hold their operands; a dying input is only uniquely owned without them.
     drop((fused_nodes, instr_nodes, sub_roots));
     let count = key.outputs.len();
@@ -860,7 +860,7 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
     if shifted.is_none() && key.staging.is_none() {
         key.tile = super::codegen::plan_tile(&key, &scalars, len, ctx.tuning());
     }
-    let core = ctx.jit().kernel(ctx, &key)?;
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
 
     let outputs = match reused {
         Some(storage) => vec![storage],
@@ -893,7 +893,7 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     let ctx = node.context();
     ctx.jit().note_write();
     fused.mark_fused();
-    let Fused { mut key, mut inputs, scalars, fused_nodes, instr_nodes, sub_roots } = fused;
+    let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     drop((fused_nodes, instr_nodes, sub_roots));
     let at = inputs.iter().position(|input| Arc::ptr_eq(input, target));
     if let Some(k) = at {
@@ -908,7 +908,7 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     if shifted.is_none() && key.staging.is_none() {
         key.tile = super::codegen::plan_tile(&key, &scalars, node.len(), ctx.tuning());
     }
-    let core = ctx.jit().kernel(ctx, &key)?;
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
     check_finite(ctx, target, node.op().out_ty())?;
     // Another thread cannot have evaluated this node: its operands were taken above.
@@ -934,7 +934,7 @@ pub(super) fn run_mapped(
     n: usize,
 ) -> Result<(), Failure> {
     fused.mark_fused();
-    let Fused { mut key, mut inputs, scalars, fused_nodes, instr_nodes, sub_roots } = fused;
+    let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     // The fused nodes hold their operands; dropping them lets the buffers go once the kernel ran.
     drop((fused_nodes, instr_nodes, sub_roots));
     for k in (0..inputs.len()).rev() {
@@ -950,7 +950,7 @@ pub(super) fn run_mapped(
         return Err(LumaError::Chunked("assigning into an array split over several buffers").into());
     }
     let n = len_u32(n)?;
-    let core = ctx.jit().kernel(ctx, &key)?;
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     let outs = bases.iter().map(|base| base.pin(0)).collect::<Result<Vec<_>, _>>()?;
     let ins = pin_inputs(&key, &inputs, None, 0, n)?;
     let words = params(&key, None, None, 0, n as usize, &scalars)?;
@@ -1008,7 +1008,7 @@ pub(super) fn reduce_fused(
     finish: Finish,
 ) -> Result<Vec<(wgpu::Buffer, u32)>, Failure> {
     fused.mark_fused();
-    let Fused { mut key, inputs, scalars, .. } = fused;
+    let Fused { mut key, inputs, mut scalars, .. } = fused;
     // The segments are those an array of this length has: the inputs may be of other lengths.
     let layout = layout_elem(&key, &inputs, len);
     let first = Storage::new(ctx, len, layout as usize);
@@ -1019,7 +1019,7 @@ pub(super) fn reduce_fused(
         key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue));
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
-    let core = ctx.jit().kernel(ctx, &key)?;
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
 
     let mut partials = Vec::with_capacity(segments);
     for j in 0..segments {

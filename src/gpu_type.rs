@@ -1,3 +1,16 @@
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
+impl sealed::Sealed for u32 {}
+impl sealed::Sealed for f32 {}
+impl sealed::Sealed for f64 {}
+impl sealed::Sealed for Df32 {}
+impl sealed::Sealed for [f32; 2] {}
+impl sealed::Sealed for [f32; 4] {}
+impl sealed::Sealed for [u32; 2] {}
+impl sealed::Sealed for [u32; 4] {}
+
 use bytemuck::{Pod, Zeroable};
 
 /// Element types that can be stored in an [`Array`](crate::Array) and read by custom kernels.
@@ -9,15 +22,17 @@ use bytemuck::{Pod, Zeroable};
 ///
 /// The built-in math only exists for [`ScalarType`]s; `[f32; 2]` and `[f32; 4]` arrays also have
 /// per-component reductions (`sum`, `min`, `max`, `norm`).
-pub trait GpuType: Pod + std::fmt::Debug {}
+pub trait GpuType: Pod + std::fmt::Debug + sealed::Sealed {}
 
 /// Element types the built-in operators, math functions and reductions are implemented for.
 pub trait ScalarType: GpuType {
     /// The WGSL name of the type, used to generate the shaders of the built-in operations.
+    #[doc(hidden)]
     fn wgsl_type() -> &'static str;
 
     /// The type name the reduction kernels are keyed by: the WGSL type, except for types whose
     /// arithmetic is a library (`"df32"` for [`Df32`]).
+    #[doc(hidden)]
     fn reduce_type() -> &'static str {
         Self::wgsl_type()
     }

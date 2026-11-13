@@ -151,6 +151,7 @@ mod inline;
 mod launch;
 mod looped;
 mod operator;
+mod params;
 mod program;
 mod readers;
 mod rerun;
@@ -344,8 +345,12 @@ pub(crate) enum Gen {
     Uniform,
     /// Box-Muller on both Threefry words.
     Normal,
-    /// The coordinate along one dimension, `(i / stride) % size`.
-    Range { stride: u32, size: u32 },
+    /// The flat element index `i` itself (`range` along the sole active axis).
+    Index,
+    /// `(i >> shift) & mask` for power-of-two `stride` and `size`; operands: shift, mask.
+    RangePow2,
+    /// `(i / stride) % size` with non-power-of-two constants baked into the shader.
+    RangeConst { stride: u32, size: u32 },
     /// `start + i * step`; operands: start, step.
     Linspace,
 }
@@ -365,6 +370,11 @@ pub(crate) enum ShiftKind {
     /// Element `i` reads element `min(indices[i], len - 1)` of the flat source of `len`
     /// elements; operand 1 is the `u32` index array.
     Take { len: u32 },
+    /// [`ShiftKind::View`] with its numbers in the uniform (see `params`); `id` names the view
+    /// among those of the kernel.
+    ParamView { id: u16, spec: params::ViewSpec },
+    /// [`ShiftKind::Take`] with `len - 1` in uniform slot `max_slot`.
+    ParamTake { max_slot: u32 },
 }
 
 /// One source axis of a view: source coordinate `start + step * o`, `o` = output coordinate along `from`.
@@ -502,12 +512,13 @@ impl OpKind {
     pub(crate) fn arity(self) -> usize {
         match self {
             OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
+            OpKind::Shift(ShiftKind::ParamView { spec, .. }) if spec.edge != Edge::Fill => 1,
             OpKind::Binary(_)
             | OpKind::Compare(_)
             | OpKind::Powf
-            | OpKind::Shift(ShiftKind::View { edge: Edge::Fill, .. } | ShiftKind::Take { .. }) => 2,
+            | OpKind::Shift(ShiftKind::View { edge: Edge::Fill, .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => 2,
             OpKind::Shift(ShiftKind::Linear) | OpKind::Clamp | OpKind::Select => 3,
-            OpKind::Generate(Gen::Range { .. }) => 0,
+            OpKind::Generate(Gen::Index | Gen::RangeConst { .. }) => 0,
             OpKind::Generate(_) => 2,
         }
     }
@@ -558,9 +569,9 @@ impl Op {
     /// The element type operand `index` must have.
     pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
         match (self.kind, index) {
-            (OpKind::Shift(ShiftKind::View { .. }), 1) => self.ty,
+            (OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. }), 1) => self.ty,
             (OpKind::Select, 0) | (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
-            (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal), _) => ElemTy::U32,
+            (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal | Gen::RangePow2), _) => ElemTy::U32,
             _ => self.ty,
         }
     }
@@ -2016,6 +2027,9 @@ type Structure = (Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>);
 pub(crate) struct JitState {
     /// Generated kernels by the structure of their program.
     kernels: BuildCache<program::FusedKey, Arc<KernelCore>>,
+    /// Pre-parameterized keys mapped straight to their compiled kernel and appended uniform words,
+    /// so repeating a step skips lowering and rewriting `key` on every launch.
+    fast_kernels: Mutex<FxMap<u64, Vec<FastKernel>>>,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
     stencils: BuildCache<String, Arc<KernelCore>>,
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
@@ -2123,12 +2137,14 @@ impl JitState {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_NODES)
             .clamp(1, MAX_NODES_LIMIT);
-        // One storage binding of the stage is the output.
+        // One storage binding is the output, plus luma's grid uniform and Params uniform (counted
+        // against the same per-stage buffer table on Metal).
         let max_inputs = (limits.max_storage_buffers_per_shader_stage as usize)
-            .saturating_sub(1)
+            .saturating_sub(3)
             .clamp(1, MAX_INPUTS);
         JitState {
             kernels: BuildCache::default(),
+            fast_kernels: Mutex::new(FxMap::default()),
             stencils: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             live: Readers::default(),
@@ -2349,6 +2365,7 @@ impl JitState {
     pub(crate) fn set_cost_override(&self, model: cost::CostModel) {
         *lock(&self.cost_override) = Some(model);
         lock(&self.judgements).clear();
+        lock(&self.fast_kernels).clear();
     }
 
     #[cfg(test)]
@@ -2375,6 +2392,7 @@ impl JitState {
     pub(crate) fn set_staging(&self, on: bool) {
         self.staging.store(on, Ordering::Relaxed);
         lock(&self.judgements).clear();
+        lock(&self.fast_kernels).clear();
     }
 
     /// The staging of the kernel of the last program looked up (tests).
@@ -2636,19 +2654,110 @@ impl JitState {
         }
     }
 
-    /// The kernel for `key`, generated and compiled on first use. Compiling takes no lock of
-    /// the cache: threads that need other kernels carry on meanwhile (see [`BuildCache`]).
-    fn kernel(&self, ctx: &Context, key: &program::FusedKey) -> Result<Arc<KernelCore>> {
+    /// The kernel for `key`, generated and compiled on first use. Unless it stages values in
+    /// workgroup memory, `key` first gets the numbers of its views, gathers and scatter read from
+    /// the uniform (see [`params`]), which `scalars` then holds too: kernels that differ in
+    /// those only are one kernel. Compiling takes no lock of the cache: threads that need other
+    /// kernels carry on meanwhile (see [`BuildCache`]).
+    pub(crate) fn kernel(&self, ctx: &Context, key: &mut program::FusedKey, scalars: &mut Vec<u32>) -> Result<Arc<KernelCore>> {
         #[cfg(test)]
         {
             self.last_program_len.store(key.instrs.len(), Ordering::Relaxed);
             *lock(&self.last_staging) = key.staging.clone();
         }
+        if key.staging.is_none() && key.tile.is_none() {
+            let fast_hash = fast_key_hash(key);
+            if let Some(hit) = lock(&self.fast_kernels).get(&fast_hash).and_then(|list| list.iter().find(|entry| entry.matches(key))) {
+                scalars.extend_from_slice(&hit.extra_words);
+                key.params = hit.params.clone();
+                #[cfg(test)]
+                if let Some((inlined_len, branches)) = hit.inlined_stats {
+                    self.last_inlined_len.store(inlined_len, Ordering::Relaxed);
+                    self.last_branches.store(branches, Ordering::Relaxed);
+                }
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(Arc::clone(&hit.core));
+            }
+            let orig_instrs = Arc::clone(&key.instrs);
+            let orig_subs = Arc::clone(&key.subs);
+            let orig_input_tys = key.input_tys.clone();
+            let orig_scalar_tys = key.scalar_tys.clone();
+            let orig_outputs = key.outputs.clone();
+            let orig_tail = key.tail;
+            let orig_in_place = key.in_place.clone();
+            let orig_spans = key.spans.clone();
+            let orig_guard = key.guard;
+            let base_words = scalars.len();
+
+            self.parameterize(ctx, key, scalars);
+            let key_ref = &*key;
+            let (core, built) = self.kernels.get_or_build(key_ref, || self.build_kernel(ctx, key_ref))?;
+            if !built {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            }
+            let extra_words: Box<[u32]> = scalars[base_words..].into();
+            let params_marker = key.params.as_ref().map(|p| Arc::new(params::Parameterized { inlined: None, slots: p.slots }));
+            #[cfg(test)]
+            let inlined_stats = key.params.as_ref().and_then(|p| p.inlined.as_ref()).map(|inl| {
+                (inl.instrs.len(), inl.branch.iter().filter(|&&b| b).count())
+            });
+            let mut fast = lock(&self.fast_kernels);
+            if fast.len() >= 4096 {
+                fast.clear();
+            }
+            fast.entry(fast_hash).or_default().push(FastKernel {
+                instrs: orig_instrs,
+                subs: orig_subs,
+                input_tys: orig_input_tys,
+                scalar_tys: orig_scalar_tys,
+                outputs: orig_outputs,
+                tail: orig_tail,
+                in_place: orig_in_place,
+                spans: orig_spans,
+                guard: orig_guard,
+                extra_words,
+                params: params_marker,
+                core: Arc::clone(&core),
+                #[cfg(test)]
+                inlined_stats,
+            });
+            return Ok(core);
+        }
+        let key = &*key;
         let (core, built) = self.kernels.get_or_build(key, || self.build_kernel(ctx, key))?;
         if !built {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
         }
         Ok(core)
+    }
+
+    /// Lowers `key` if it [inlines](program::FusedKey::inlines) and rewrites it by [`params::apply`].
+    fn parameterize(&self, ctx: &Context, key: &mut program::FusedKey, scalars: &mut Vec<u32>) {
+        let inlined = if key.inlines() {
+            match inline(key, usize::MAX, &ctx.cost_model()) {
+                Verdict::Fits(inlined) => Some(inlined),
+                Verdict::TooBig { .. } => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(debug_assertions)]
+        {
+            let (inputs, slots) = (key.input_tys.len(), key.scalar_tys.len());
+            let checked = program::validate(key, inputs, slots).and_then(|()| match &inlined {
+                Some(inlined) => inline::validate_inlined(inlined, inputs, false),
+                None => Ok(()),
+            });
+            if let Err(message) = checked {
+                panic!("invalid fused program: {message}\n{key:?}");
+            }
+        }
+        #[cfg(test)]
+        if let Some(inlined) = &inlined {
+            self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed);
+            self.last_branches.store(inlined.branch.iter().filter(|&&branch| branch).count(), Ordering::Relaxed);
+        }
+        params::apply(key, inlined.as_ref(), scalars);
     }
 
     /// Generates and compiles the kernel of `key`.
@@ -2657,17 +2766,18 @@ impl JitState {
         // Whatever the judgement was, the kernel runs the program as it is: `flatten_inner` cut
         // the ones the model wants cut, any other that got here is lowered in full.
         let cost = ctx.cost_model();
-        let lowered = match &key.staging {
-            Some(layout) => Some(Lowered::Staged(
+        let lowered = match (&key.params, &key.staging) {
+            (Some(params), _) => params.inlined.clone().map(Lowered::Plain),
+            (None, Some(layout)) => Some(Lowered::Staged(
                 inline::lower_staged(key, layout, usize::MAX, &cost).expect("a staged program lowers without a cap"),
             )),
-            None => key.inlines().then(|| match inline(key, usize::MAX, &cost) {
+            (None, None) => key.inlines().then(|| match inline(key, usize::MAX, &cost) {
                 Verdict::Fits(inlined) => Some(Lowered::Plain(inlined)),
                 Verdict::TooBig { .. } => None,
             }).flatten(),
         };
         #[cfg(debug_assertions)]
-        {
+        if key.params.is_none() {
             let (inputs, scalars) = (key.input_tys.len(), key.scalar_tys.len());
             let checked = program::validate(key, inputs, scalars).and_then(|()| match &lowered {
                 Some(Lowered::Plain(inlined)) => inline::validate_inlined(inlined, inputs, false),
@@ -2679,13 +2789,12 @@ impl JitState {
             }
         }
         #[cfg(test)]
-        match &lowered {
-            Some(Lowered::Plain(inlined)) => self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed),
-            Some(Lowered::Staged(programs)) => self.last_inlined_len.store(programs.main.instrs.len(), Ordering::Relaxed),
-            None => {}
-        }
-        #[cfg(test)]
-        {
+        if key.params.is_none() {
+            match &lowered {
+                Some(Lowered::Plain(inlined)) => self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed),
+                Some(Lowered::Staged(programs)) => self.last_inlined_len.store(programs.main.instrs.len(), Ordering::Relaxed),
+                None => {}
+            }
             let count = |inlined: &inline::Inlined| inlined.branch.iter().filter(|&&branch| branch).count();
             let branches = match &lowered {
                 Some(Lowered::Plain(inlined)) => count(inlined),
@@ -2730,4 +2839,48 @@ impl JitState {
         }
         Ok(core)
     }
+}
+
+/// Pre-parameterized lookup entry for [`JitState::fast_kernels`].
+#[derive(Debug)]
+struct FastKernel {
+    instrs: Arc<Vec<Instr>>,
+    subs: Arc<Vec<Vec<Instr>>>,
+    input_tys: Vec<ElemTy>,
+    scalar_tys: Vec<ElemTy>,
+    outputs: Vec<u32>,
+    tail: program::Tail,
+    in_place: Vec<(u32, u32)>,
+    spans: Vec<u8>,
+    guard: Option<u32>,
+    extra_words: Box<[u32]>,
+    params: Option<Arc<params::Parameterized>>,
+    core: Arc<KernelCore>,
+    #[cfg(test)]
+    inlined_stats: Option<(usize, usize)>,
+}
+
+impl FastKernel {
+    fn matches(&self, key: &program::FusedKey) -> bool {
+        (Arc::ptr_eq(&self.instrs, &key.instrs) || self.instrs == key.instrs)
+            && (Arc::ptr_eq(&self.subs, &key.subs) || self.subs == key.subs)
+            && self.tail == key.tail
+            && self.in_place == key.in_place
+            && self.input_tys == key.input_tys
+            && self.scalar_tys == key.scalar_tys
+            && self.outputs == key.outputs
+            && self.spans == key.spans
+            && self.guard == key.guard
+    }
+}
+
+fn fast_key_hash(key: &program::FusedKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = FxHasher::default();
+    key.shape.hash(&mut hasher);
+    key.tail.hash(&mut hasher);
+    key.in_place.hash(&mut hasher);
+    key.spans.hash(&mut hasher);
+    key.guard.hash(&mut hasher);
+    hasher.finish()
 }

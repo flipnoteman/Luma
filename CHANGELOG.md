@@ -11,16 +11,21 @@ All notable changes to Luma are listed here. The format follows
 - Reductions (`sum`, `min`, `max`, `mean`, `norm`, `reduce`) are lazy and return a one-element
   `Array`; read it with `.item()?` (or `.to_array()?` for `reduce`). `[f32; 2]` / `[f32; 4]`
   reductions still return host values.
-- A one-element array broadcasts against any shape (`&x / &x.sum()` stays on the GPU).
+- Arrays broadcast per axis over extents of 1 (`[N, 1] + [1, M]` -> `[N, M]`, `select` branches,
+  compound assignment), plus explicit `broadcast_to(shape)`; `&x / &x.sum()` stays on the GPU.
 
 ### Added
 
 - Views that fuse into the reading kernel: `slice`, `shift_fill` / `shift_clamp` /
   `shift_mirror`, `pad` (`Edge`, `Mirror`, `Wrap`, `Zero`), `flip`, `transpose`, `index`, `take`,
-  `concat`.
-- Writes: `assign` through a view (lazy, in place) and `put` (scatter); `LumaError::ReadOnly`.
+  `concat` / `concat_slice`, `broadcast_to`, and `Array::copy` (`Fields::copy`).
+- Mutable views (`ViewMut` via `slice_mut`, `flip_mut`, `transpose_mut`) with in-place `assign`
+  (lazy when the base is pending) and compound assignment (`+=`, `-=`, ...), `put` (scatter),
+  `luma::view` for strided custom-kernel reads, `LumaError::ReadOnly`, and `pub use encase`. Read
+  views reject mutating operations instead of detaching.
 - Records: `Fields` trait and `#[derive(Fields)]` (crate `luma-derive`) for structs of arrays,
-  with arithmetic, `dot`, views and `assign` in one kernel for all fields.
+  with arithmetic, `dot`, `copy`, `broadcast_to`, views and `ViewMut` (`assign`, `+=`) in one
+  kernel for all fields.
 - Bitwise operations on `u32` arrays, fused like the rest: `& | ^ !`, `<< >>` (and `+=`-style
   assignments), `rotate_left`, `rotate_right`; amounts are taken modulo 32. `u32` states work in
   `Fields` records and `iterate_all` (register loop). Example `keccak`: Keccak-f[1600], SHA3-256

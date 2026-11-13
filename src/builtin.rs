@@ -637,7 +637,7 @@ fn df_two_sum(a: f32, b: f32) -> vec2<f32> {
     let da = luma_o(a - luma_o(s - bb)); let db = luma_o(b - bb);
     return vec2<f32>(s, da + db);
 }
-fn df_quick(a: f32, b: f32) -> vec2<f32> { let s = luma_o(a + b); return vec2<f32>(s, b - luma_o(s - a)); }
+fn df_quick(a: f32, b: f32) -> vec2<f32> { let s = luma_o(a + b); return vec2<f32>(s, luma_o(b - luma_o(s - a))); }
 fn df_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     let p = df_two_prod(a.x, b.x); return df_quick(p.x, luma_o(p.y + luma_o(a.x * b.y + a.y * b.x)));
 }
@@ -666,8 +666,8 @@ fn df_abs(a: vec2<f32>) -> vec2<f32> { return select(a, -a, (a.x < 0.0) | ((a.x 
     const PRODUCT_DEKKER: &str = "fn df_split(a: f32) -> vec2<f32> { let t = luma_o(4097.0 * a); let hi = luma_o(t - luma_o(t - a)); return vec2<f32>(hi, luma_o(a - hi)); }
 fn df_two_prod(a: f32, b: f32) -> vec2<f32> {
     let p = luma_o(a * b); let x = df_split(a); let y = df_split(b);
-    let e1 = luma_o(x.x * y.x - p); let e2 = luma_o(e1 + x.x * y.y); let e3 = luma_o(e2 + x.y * y.x);
-    return vec2<f32>(p, e3 + x.y * y.y);
+    let e1 = luma_o(luma_o(x.x * y.x) - p); let e2 = luma_o(e1 + luma_o(x.x * y.y)); let e3 = luma_o(e2 + luma_o(x.y * y.x));
+    return vec2<f32>(p, luma_o(e3 + luma_o(x.y * y.y)));
 }
 ";
     format!(

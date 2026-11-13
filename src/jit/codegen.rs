@@ -23,6 +23,7 @@ use crate::gpu::hash::FxMap;
 use crate::tuning::{Tuning, STENCIL_RADIUS};
 
 use super::inline::{Inlined, Lowered, Region, StagedPrograms};
+use super::params;
 use super::program::{calls_df_library, FusedKey, Instr, Ref, Tail};
 use super::staging::Staging;
 use super::stencil::{signed, wrap_source, WORKGROUP};
@@ -88,8 +89,12 @@ pub(super) fn expression(instr: &Instr, index: &str, segmented: bool, names: &Na
             let n = names.views.iter().position(|&known| known == (map, edge));
             // A view missing from `names` is not valid shader code and surfaces as a
             // shader compile error.
-            (format!("view{}({index})", n.map_or_else(|| "_missing".to_owned(), |n| n.to_string())), n.filter(|_| edge == Edge::Fill))
+            (
+                format!("view{}({index})", n.map_or_else(|| "_missing".to_owned(), |n| n.to_string())),
+                n.filter(|_| edge == Edge::Fill).map(|n| format!("view{n}_in({index})")),
+            )
         }
+        ShiftKind::ParamView { id, spec } => (format!("pview{id}({index})"), (spec.edge == Edge::Fill).then(|| format!("pview{id}_in({index})"))),
         _ => (shift_index(kind, &b, index, &c), None),
     };
     let read = match instr.args[0] {
@@ -104,7 +109,7 @@ pub(super) fn expression(instr: &Instr, index: &str, segmented: bool, names: &Na
         other => format!("{}[{at}]", name(other, ElemTy::U32)),
     };
     match view {
-        Some(n) => format!("select({b}, {read}, view{n}_in({index}))"),
+        Some(inside) => format!("select({b}, {read}, {inside})"),
         None => read,
     }
 }
@@ -148,18 +153,19 @@ fn views_of_inlined(key: &FusedKey, lowered: &[&Inlined]) -> Vec<(ViewMap, Edge)
     views
 }
 
+/// The WGSL functions that fold a coordinate back into `0..n`.
+pub(super) const EDGE_HELPERS: &str = "fn luma_clamp_i(c: i32, n: i32) -> i32 { return clamp(c, 0, n - 1); }
+fn luma_mirror_i(c: i32, n: i32) -> i32 { let a = select(c, -c - 1, c < 0); let b = select(a, 2 * n - 1 - a, a >= n); return clamp(b, 0, n - 1); }
+fn luma_wrap_i(c: i32, n: i32) -> i32 { return ((c % n) + n) % n; }
+";
+
 /// The WGSL functions of `views`: `view{n}(i)` is the flat source index view `n` reads for
 /// output element `i` and, for [`Edge::Fill`], `view{n}_in(i)` whether it lies inside the source.
 pub(super) fn view_helpers(views: &[(ViewMap, Edge)]) -> String {
     if views.is_empty() {
         return String::new();
     }
-    let mut src = String::from(
-        "fn luma_clamp_i(c: i32, n: i32) -> i32 { return clamp(c, 0, n - 1); }
-fn luma_mirror_i(c: i32, n: i32) -> i32 { let a = select(c, -c - 1, c < 0); let b = select(a, 2 * n - 1 - a, a >= n); return clamp(b, 0, n - 1); }
-fn luma_wrap_i(c: i32, n: i32) -> i32 { return ((c % n) + n) % n; }
-",
-    );
+    let mut src = String::from(EDGE_HELPERS);
     for (n, &(map, edge)) in views.iter().enumerate() {
         let mut out_stride = [1u64; 4];
         let mut src_stride = [1u64; 4];
@@ -241,11 +247,21 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Bits => format!("luma_threefry({index}, {a}, {b}).x"),
         Gen::Uniform => format!("luma_uniform(luma_threefry({index}, {a}, {b}).x)"),
         Gen::Normal => format!("luma_normal(luma_threefry({index}, {a}, {b}))"),
-        Gen::Range { stride, size } => match ty {
-            ElemTy::U32 => format!("(({index} / {stride}u) % {size}u)"),
-            // Generators of the 8-byte types are refused when they are recorded.
-            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} / {stride}u) % {size}u)"),
+        Gen::Index => match ty {
+            ElemTy::U32 => index.to_owned(),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({index})"),
         },
+        Gen::RangePow2 => match ty {
+            ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
+        },
+        Gen::RangeConst { stride, size } => {
+            let coord = if stride == 1 { format!("({index} % {size}u)") } else { format!("(({index} / {stride}u) % {size}u)") };
+            match ty {
+                ElemTy::U32 => coord,
+                ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({coord})"),
+            }
+        }
         Gen::Linspace => format!("({a} + f32({index}) * {b})"),
     }
 }
@@ -296,8 +312,9 @@ pub(super) fn generates(key: &FusedKey) -> bool {
 fn shift_index(kind: ShiftKind, s: &str, i: &str, total: &str) -> String {
     match kind {
         ShiftKind::Linear => format!("select({i} - {s}, {i} + ({total} - {s}), {i} < {s})"),
-        ShiftKind::View { .. } => unreachable!("views are indexed by their own functions"),
+        ShiftKind::View { .. } | ShiftKind::ParamView { .. } => unreachable!("views are indexed by their own functions"),
         ShiftKind::Take { len } => format!("min({s}, {}u)", len.saturating_sub(1)),
+        ShiftKind::ParamTake { max_slot } => format!("min({s}, p.s{max_slot})"),
         ShiftKind::Dims { dims, shifts } => {
             let [d0, d1, d2, _] = dims;
             let strides = [1, d0, d0 * d1, d0 * d1 * d2];
@@ -346,6 +363,7 @@ pub(super) fn direct(instrs: &[Instr], k: u32) -> bool {
 pub(super) fn reads_scalars(key: &FusedKey) -> bool {
     let programs = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice));
     key.guard.is_some()
+        || key.params.as_ref().is_some_and(|params| params.slots)
         || programs.enumerate().any(|(p, instrs)| {
             instrs.iter().enumerate().any(|(at, instr)| {
                 let baked = key.tile.as_ref().is_some_and(|tile| tile.offsets.get(p).and_then(|row| row.get(at)).is_some_and(Option::is_some));
@@ -414,8 +432,8 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     }
     let out_ty = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     let outputs: Vec<usize> = match key.tail {
-        Tail::Store | Tail::StoreMapped(_) => key.outputs.iter().map(|&at| at as usize).collect(),
-        Tail::Scatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => key.outputs.iter().map(|&at| at as usize).collect(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
     };
     for (j, &at) in outputs.iter().enumerate() {
@@ -470,6 +488,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     }
     src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
     src.push_str(&view_helpers(&views));
+    if key.params.is_some() {
+        src.push_str(&params::view_helpers(&params::views_used(key, inlined)));
+    }
     let names = Names { views: &views, in_place: &key.in_place };
     if key.tile.is_none() && lowered.is_none() {
         src.push_str(&subs(key, &views, &key.in_place));
@@ -481,15 +502,23 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     };
     let global = if segmented || based { "    let gi = p.base + i;\n" } else { "" };
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::Scatter { .. } | Tail::Stack { .. } => {
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => {
             let stores: String = match key.tail {
                 Tail::StoreMapped(map) => {
                     let n = views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0);
                     outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[view{n}(i)] = t{};\n", value(at))).collect()
                 }
-                Tail::Scatter { len } => {
+                Tail::ParamStoreMapped { id, .. } => {
+                    outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[pview{id}(i)] = t{};\n", value(at))).collect()
+                }
+                Tail::Scatter { .. } | Tail::ParamScatter { .. } => {
+                    let len = match key.tail {
+                        Tail::ParamScatter { len_slot } => format!("p.s{len_slot}"),
+                        Tail::Scatter { len } => format!("{len}u"),
+                        _ => unreachable!(),
+                    };
                     let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
-                    format!("    let j = t{};\n    if (j < {len}u) {{ out0[j] = t{}; }}\n", value(index as usize), value(stored as usize))
+                    format!("    let j = t{};\n    if (j < {len}) {{ out0[j] = t{}; }}\n", value(index as usize), value(stored as usize))
                 }
                 Tail::Stack { total, .. } if stack_stages(key, wg, out_ty(outputs[0])) => {
                     let mut stores = String::new();
@@ -745,6 +774,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                     let n = self.names.views.iter().position(|&known| known == (map, edge));
                     format!("view{}({from})", n.map_or_else(|| "_missing".to_owned(), |n| n.to_string()))
                 }
+                ShiftKind::ParamView { id, .. } => format!("pview{id}({from})"),
                 kind => {
                     if let Ref::Input(k) = ctx.args[0] {
                         self.load(k, ctx.parent);
@@ -835,6 +865,10 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                             let view = self.names.views.iter().position(|&known| known == (map, Edge::Fill));
                             let inside = format!("view{}_in({})", view.map_or_else(|| "_missing".to_owned(), |n| n.to_string()), self.index_of(flat.at));
                             format!("select({fill}, {read}, {inside})")
+                        }
+                        ShiftKind::ParamView { id, spec } if spec.edge == Edge::Fill => {
+                            let fill = flat_name(flat.args[1], op.operand_ty(1), flat.at);
+                            format!("select({fill}, {read}, pview{id}_in({}))", self.index_of(flat.at))
                         }
                         _ => read,
                     }
@@ -948,7 +982,7 @@ pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tu
                 (OpKind::Shift(_), Ref::Sub(j)) if p > 0 && j as usize + 1 >= p || j as usize >= key.subs.len() => return None,
                 (OpKind::Shift(kind), Ref::Sub(_)) => {
                     let (dx, dy) = match kind {
-                        ShiftKind::View { .. } | ShiftKind::Take { .. } => return None,
+                        ShiftKind::View { .. } | ShiftKind::Take { .. } | ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => return None,
                         ShiftKind::Dims { shifts, .. } => (signed(shifts[0], w), signed(shifts[1], h)),
                         ShiftKind::Linear => {
                             let Ref::Scalar(s) = instr.args[1] else { return None };

@@ -105,8 +105,18 @@ impl<T: ScalarType> Array<T> {
         };
         let stride: usize = dims[..dim].iter().product();
         let fits = |v: usize| u32::try_from(v).map_err(|_| LumaError::InvalidShape(format!("{v} exceeds u32")));
-        let kind = Gen::Range { stride: fits(stride)?, size: fits(size)? };
-        let args = [Src::unused(), Src::unused(), Src::unused()];
+        let (stride32, size32) = (fits(stride)?, fits(size)?);
+        let top = (dim + 1..4).all(|d| dims[d] == 1);
+        let (kind, args) = if stride32 == 1 && top {
+            (Gen::Index, [Src::unused(), Src::unused(), Src::unused()])
+        } else if stride32.is_power_of_two() && size32.is_power_of_two() {
+            (
+                Gen::RangePow2,
+                [Src::Scalar(Scalar::u32(stride32.trailing_zeros())), Src::Scalar(Scalar::u32(size32 - 1)), Src::unused()],
+            )
+        } else {
+            (Gen::RangeConst { stride: stride32, size: size32 }, [Src::unused(), Src::unused(), Src::unused()])
+        };
         generated(ctx, shape, kind, args, "range", Location::caller())
     }
 }

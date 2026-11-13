@@ -10,9 +10,10 @@
 //! [`gen`] for the programs and the value domains, [`oracle`] for the reference semantics.
 //!
 //! Where luma documents no behaviour, the choices of the generator are:
-//! * `+=`, `write` and `put` only target arrays that are not views (what a view does after
-//!   such a write is unspecified); `assign` goes through views, which keep their link to the
-//!   array they were taken from.
+//! * A slice, flip or transpose (and a reshape of one) is read-only, so `assign`, `+=`, `write`
+//!   and `put` only target arrays that are not such views (the invalid statements aim at views
+//!   on purpose); `assign` writes a region of the array itself, through `slice_mut`,
+//!   `flip_mut` and `transpose_mut`.
 //! * Nothing writes an array that a loop body did not create (iterate steps are traced once
 //!   and must compute from their arguments), and no traced step uploads data or reads back.
 //! * An operation that fails on luma with `Chunked` or `Unsupported` (documented limits of
@@ -175,6 +176,8 @@ enum R<'a, T: ScalarType> {
     V(T),
 }
 
+impl<T: ScalarType> crate::ops::operand_sealed::Sealed for R<'_, T> {}
+
 impl<T: ScalarType> Operand<T> for R<'_, T> {
     fn rhs(&self) -> Rhs<'_, T> {
         match self {
@@ -223,6 +226,21 @@ fn operand<'a, T: Num>(env: &'a Env, o: &Opd) -> R<'a, T> {
     match o {
         Opd::Var(i) => R::A(get::<T>(env, *i)),
         Opd::Const(c) => R::V(T::from_f32(*c)),
+    }
+}
+
+/// A clone of `t`, the array of variable `target`, if `rhs` reads that variable: `take` removes
+/// it from the environment while the write runs.
+fn own_rhs<T: Num>(t: &Array<T>, target: usize, rhs: &Opd) -> Option<Array<T>> {
+    matches!(rhs, Opd::Var(i) if *i == target).then(|| t.clone())
+}
+
+/// The right-hand side of a write into a variable taken out of `env`: `rhs` as an operand, or
+/// `own` (see [`own_rhs`]) if it is the target itself.
+fn written_with<'a, T: Num>(env: &'a Env, own: &'a Option<Array<T>>, rhs: &Opd) -> R<'a, T> {
+    match own {
+        Some(copy) => R::A(copy),
+        None => operand::<T>(env, rhs),
     }
 }
 
@@ -439,34 +457,51 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
             push(env, T::wrap(out))
         }),
         Stmt::Assign { target, path, rhs } => by_ty!(ty_of(env, *target), T => {
-            let t = get::<T>(env, *target);
-            let mut receiver: Option<Array<T>> = None;
-            for step in path {
-                let base = receiver.as_ref().unwrap_or(t);
-                receiver = Some(match step {
-                    InjView::InjSlice { axis, lo, hi } => base.slice(*axis, *lo..*hi),
-                    InjView::InjFlip { axis } => base.flip(*axis),
-                    InjView::InjTranspose => base.transpose(),
-                });
-            }
-            receiver.as_ref().unwrap_or(t).assign(operand::<T>(env, rhs))
+            let mut t = take::<T>(env, *target);
+            let own = own_rhs(&t, *target, rhs);
+            let r = written_with(env, &own, rhs);
+            // The region is a `ViewMut` of the array: a view variable is read-only and fails.
+            let done = match path.split_first() {
+                None => t.assign(r),
+                Some((first, rest)) => {
+                    let mut region = match first {
+                        InjView::InjSlice { axis, lo, hi } => t.slice_mut(*axis, *lo..*hi),
+                        InjView::InjFlip { axis } => t.flip_mut(*axis),
+                        InjView::InjTranspose => t.transpose_mut(),
+                    };
+                    for step in rest {
+                        region = match step {
+                            InjView::InjSlice { axis, lo, hi } => region.slice(*axis, *lo..*hi),
+                            InjView::InjFlip { axis } => region.flip(*axis),
+                            InjView::InjTranspose => region.transpose(),
+                        };
+                    }
+                    match r {
+                        R::A(a) => region.assign(a),
+                        R::V(v) => region.assign(v),
+                    }
+                }
+            };
+            env[*target] = Some(T::wrap(t));
+            done
         }),
         Stmt::Put { target, idx, vals } => by_ty!(ty_of(env, *target), T => {
-            let r = operand::<T>(env, vals);
             let shape = match vals {
                 Opd::Var(i) => get::<T>(env, *i).shape(),
                 Opd::Const(_) => Shape::new([idx.len(), 1, 1, 1]),
             };
             let indices = Array::<u32>::from_slice_on(ctx, idx, shape)?;
-            get::<T>(env, *target).put(&indices, r)
+            let mut t = take::<T>(env, *target);
+            let own = own_rhs(&t, *target, vals);
+            let r = written_with(env, &own, vals);
+            let done = t.put(&indices, r);
+            env[*target] = Some(T::wrap(t));
+            done
         }),
         Stmt::Compound { target, op, rhs } => by_ty!(ty_of(env, *target), T => {
             let mut t = take::<T>(env, *target);
-            let own = matches!(rhs, Opd::Var(i) if i == target).then(|| t.clone());
-            let r = match &own {
-                Some(copy) => R::A(copy),
-                None => operand::<T>(env, rhs),
-            };
+            let own = own_rhs(&t, *target, rhs);
+            let r = written_with(env, &own, rhs);
             t.assign_op(r.rhs(), lbin(*op), "fuzz_assign_op");
             let failed = t.check();
             env[*target] = Some(T::wrap(t));
@@ -674,15 +709,15 @@ fn host_stmt(env: &mut HostEnv, stmt: &Stmt, math: bool) -> Result<(), ErrKind> 
         Stmt::AxisReduce { src, axis, op } => Some(host_get(env, *src).reduce_axis(*axis, *op)),
         Stmt::Assign { target, path, rhs } => {
             let t = host_get(env, *target);
-            let mut receiver = t.clone();
+            let mut region = t.clone();
             for step in path {
-                receiver = match step {
-                    InjView::InjSlice { axis, lo, hi } => receiver.slice(*axis, *lo, *hi)?,
-                    InjView::InjFlip { axis } => receiver.flip(*axis)?,
-                    InjView::InjTranspose => receiver.transpose(),
+                region = match step {
+                    InjView::InjSlice { axis, lo, hi } => region.slice_mut(*axis, *lo, *hi)?,
+                    InjView::InjFlip { axis } => region.flip_mut(*axis)?,
+                    InjView::InjTranspose => region.transpose_mut()?,
                 };
             }
-            receiver.assign(host_rhs(env, rhs, t.ty))?;
+            region.assign(host_rhs(env, rhs, t.ty))?;
             None
         }
         Stmt::Put { target, idx, vals } => {
@@ -1004,9 +1039,9 @@ impl Machine {
 }
 
 impl Arr {
-    /// A new array holding the current values (`Array::copied`).
+    /// A new array holding the current values (`Array::copy`).
     fn from_copy<T: Num>(a: &Array<T>) -> Arr {
-        T::wrap(a.copied())
+        T::wrap(a.copy())
     }
 }
 

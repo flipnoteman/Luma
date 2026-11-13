@@ -35,7 +35,7 @@ use super::staging::{self, Staging};
 use super::{Edge, Gen, Op, OpKind, ShiftKind, ViewMap};
 
 /// How the index of a context derives from its parent's: the read index of one `Shift`.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Ctx {
     pub(crate) parent: u32,
     pub(crate) kind: ShiftKind,
@@ -45,7 +45,7 @@ pub(crate) struct Ctx {
 }
 
 /// One instruction of the lowered program; instruction `n` defines `t{n}`.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Flat {
     pub(crate) op: Op,
     /// `Ref::Tmp(n)` is lowered instruction `n`; `Ref::Input(k)` is input `k` read at the index
@@ -70,7 +70,7 @@ pub(crate) enum Region {
 }
 
 /// A key written out at every index its sub-programs are read at.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Inlined {
     /// `ctxs[0]` is a placeholder for the element itself.
     pub(crate) ctxs: Vec<Ctx>,
@@ -85,6 +85,25 @@ pub(crate) struct Inlined {
     /// The operations of the lowered program in f32-operation units (see [`op_weight`]) per
     /// element, those of a branch weighted by the share of elements that compute it.
     pub(crate) ops: f64,
+}
+
+/// Lowered programs are equal when the code generated from them is: `ops` only weighs them.
+impl PartialEq for Inlined {
+    fn eq(&self, other: &Self) -> bool {
+        self.ctxs == other.ctxs && self.instrs == other.instrs && self.main == other.main && self.region == other.region && self.branch == other.branch
+    }
+}
+
+impl Eq for Inlined {}
+
+impl std::hash::Hash for Inlined {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ctxs.hash(state);
+        self.instrs.hash(state);
+        self.main.hash(state);
+        self.region.hash(state);
+        self.branch.hash(state);
+    }
 }
 
 /// Staged sub-programs of one level over the same region, lowered together: they run in one loop
@@ -259,7 +278,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
     let mut coordinates = vec![false; n];
     for (at, flat) in flats.iter().enumerate() {
         coordinates[at] = match flat.op.kind {
-            OpKind::Generate(Gen::Range { .. }) => true,
+            OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. }) => true,
             OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
                 flat.args.iter().take(flat.op.kind.arity()).all(|arg| match *arg {
                     Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
@@ -460,8 +479,8 @@ impl Lowering<'_> {
                     }
                     let context_args = match kind {
                         ShiftKind::Linear => [b, c],
-                        ShiftKind::Take { .. } => [b, Ref::Unused],
-                        ShiftKind::View { .. } | ShiftKind::Dims { .. } => [Ref::Unused; 2],
+                        ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } => [b, Ref::Unused],
+                        ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Dims { .. } => [Ref::Unused; 2],
                     };
                     let child = self.context(ctx, kind, context_args);
                     match source {
@@ -489,8 +508,8 @@ impl Lowering<'_> {
 fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
     let value = |at: u32| main.get(at as usize).copied();
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::Stack { .. } => key.outputs.iter().filter_map(|&at| value(at)).collect(),
-        Tail::Scatter { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } => key.outputs.iter().filter_map(|&at| value(at)).collect(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
         Tail::Reduce(_) => main.last().copied().into_iter().collect(),
     }
 }
@@ -628,8 +647,8 @@ fn input_bytes(key: &FusedKey, refs: impl Iterator<Item = Ref>) -> f64 {
 fn output_bytes(key: &FusedKey) -> f64 {
     let bytes = |index: &u32| key.instrs.get(*index as usize).map_or(0.0, |instr| instr.op.out_ty().bytes() as f64);
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::Stack { .. } => key.outputs.iter().map(bytes).sum(),
-        Tail::Scatter { .. } => key.outputs.first().map_or(0.0, bytes),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } => key.outputs.iter().map(bytes).sum(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } => key.outputs.first().map_or(0.0, bytes),
         Tail::Reduce(_) => 0.0,
     }
 }
@@ -644,6 +663,7 @@ fn sub_len(key: &FusedKey, s: u32, len: usize) -> f64 {
             return match kind {
                 ShiftKind::View { map, .. } => map.src.iter().map(|&d| f64::from(d)).product(),
                 ShiftKind::Take { len } => f64::from(len),
+                ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => len as f64,
                 ShiftKind::Dims { dims, .. } => dims.iter().map(|&d| f64::from(d)).product(),
                 ShiftKind::Linear => len as f64,
             };
@@ -865,6 +885,7 @@ fn rebuilt(key: &FusedKey, main: Vec<Instr>, subs: Vec<Vec<Instr>>, outputs: Vec
         tile: None,
         staging: None,
         guard: key.guard,
+        params: None,
     }
 }
 
@@ -1123,6 +1144,7 @@ mod tests {
             tile: None,
             staging: None,
             guard: None,
+            params: None,
         }
     }
 
@@ -1340,7 +1362,7 @@ mod tests {
         let (first, mask) = if data_mask {
             (Instr { op: Op::new(OpKind::Binary(BinOp::Add), ElemTy::U32), args: [Ref::Input(1), Ref::Input(1), Ref::Unused] }, Ref::Tmp(0))
         } else {
-            (Instr { op: Op::new(OpKind::Generate(Gen::Range { stride: 1, size: 64 }), ElemTy::U32), args: [Ref::Unused; 3] }, Ref::Tmp(0))
+            (Instr { op: Op::new(OpKind::Generate(Gen::RangePow2), ElemTy::U32), args: [Ref::Scalar(0), Ref::Scalar(0), Ref::Unused] }, Ref::Tmp(0))
         };
         let main = vec![
             first,

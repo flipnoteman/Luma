@@ -528,3 +528,142 @@ fn many_arguments_and_large_uniforms_take_the_allocating_paths() {
         assert_eq!(array.to_vec().unwrap(), vec![100.0 + i as f32]);
     }
 }
+
+// -- strided views --
+
+const VIEW_COPY: &str = r#"
+@group(1) @binding(0) var<storage, read> src: array<f32>;
+@group(1) @binding(1) var<uniform> src_view: LumaView;
+@group(1) @binding(2) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= luma.size.x || gid.y >= luma.size.y) { return; }
+    out[luma_idx2(gid.x, gid.y)] = src[luma_view_idx2(src_view, gid.x, gid.y)];
+}
+"#;
+
+const VIEW_FILL: &str = r#"
+@group(1) @binding(0) var<storage, read_write> dst: array<f32>;
+@group(1) @binding(1) var<uniform> dst_view: LumaView;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= luma.size.x || gid.y >= luma.size.y) { return; }
+    dst[luma_view_idx2(dst_view, gid.x, gid.y)] = 100.0 + f32(gid.x) + 10.0 * f32(gid.y);
+}
+"#;
+
+const VIEW_FILL_LINEAR: &str = r#"
+@group(1) @binding(0) var<storage, read_write> dst: array<f32>;
+@group(1) @binding(1) var<uniform> dst_view: LumaView;
+
+@compute @workgroup_size(16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= dst_view.len) { return; }
+    dst[luma_view_idx(dst_view, gid.x)] = f32(gid.x);
+}
+"#;
+
+fn grid() -> Vec<f32> {
+    (0..12).map(|n| n as f32).collect()
+}
+
+#[test]
+fn read_view_reads_a_flipped_slice_in_place() {
+    let a = Array::from_slice(&grid(), [4, 3, 1, 1]).unwrap();
+    let v = a.slice(0, 1..3).flip(1);
+    let out = Array::<f32>::zeros([2, 3, 1, 1]).unwrap();
+    let mut out = out;
+    let kernel = ctx().kernel(VIEW_COPY).build().unwrap();
+    assert_eq!(kernel.bindings().len(), 3);
+    kernel.launch([2, 3], args![luma::view(&v), &mut out]).unwrap();
+
+    let mut expected = vec![0.0; 6];
+    for j in 0..3 {
+        for i in 0..2 {
+            expected[i + 2 * j] = ((1 + i) + 4 * (2 - j)) as f32;
+        }
+    }
+    assert_eq!(out.to_vec().unwrap(), expected);
+}
+
+#[test]
+fn read_view_reads_a_transpose() {
+    let a = Array::from_slice(&grid(), [4, 3, 1, 1]).unwrap();
+    let t = a.transpose();
+    let mut out = Array::<f32>::zeros([3, 4, 1, 1]).unwrap();
+    let kernel = ctx().kernel(VIEW_COPY).build().unwrap();
+    kernel.launch([3, 4], args![luma::view(&t), &mut out]).unwrap();
+
+    let mut expected = vec![0.0; 12];
+    for j in 0..4 {
+        for i in 0..3 {
+            expected[i + 3 * j] = (j + 4 * i) as f32;
+        }
+    }
+    assert_eq!(out.to_vec().unwrap(), expected);
+}
+
+#[test]
+fn mutable_view_writes_a_subregion_and_flushes_earlier_readers() {
+    let mut dst = Array::<f32>::zeros([4, 3, 1, 1]).unwrap();
+    let before = &dst + 1.0;
+
+    let kernel = ctx().kernel(VIEW_FILL).build().unwrap();
+    {
+        let mut v = dst.slice_mut(0, 1..3);
+        kernel.launch([2, 3], args![&mut v]).unwrap();
+    }
+
+    assert_eq!(before.to_vec().unwrap(), vec![1.0; 12]);
+    let mut expected = vec![0.0; 12];
+    for j in 0..3 {
+        for i in 0..2 {
+            expected[(1 + i) + 4 * j] = 100.0 + i as f32 + 10.0 * j as f32;
+        }
+    }
+    assert_eq!(dst.to_vec().unwrap(), expected);
+}
+
+#[test]
+fn mutable_view_linear_index_follows_view_order() {
+    let mut dst = Array::<f32>::zeros([4, 3, 1, 1]).unwrap();
+    let kernel = ctx().kernel(VIEW_FILL_LINEAR).build().unwrap();
+    {
+        let mut v = dst.slice_mut(1, 1..3);
+        kernel.launch([8], args![&mut v]).unwrap();
+    }
+    let mut expected = vec![0.0; 12];
+    for (n, slot) in expected[4..12].iter_mut().enumerate() {
+        *slot = n as f32;
+    }
+    assert_eq!(dst.to_vec().unwrap(), expected);
+}
+
+#[test]
+fn read_only_view_cannot_be_passed_as_mut_array() {
+    let a = Array::from_slice(&grid(), [4, 3, 1, 1]).unwrap();
+    let mut s = a.slice(0, 1..3);
+    let kernel = ctx().kernel(SAXPY).build().unwrap();
+    let x = Array::<f32>::zeros([2, 1, 1, 1]).unwrap();
+    let result = kernel.launch([2], args![&x, &mut s, uniform(&SaxpyParams { alpha: 1.0, n: 2 })]);
+    assert!(matches!(result, Err(LumaError::InvalidShape(_))));
+}
+
+#[test]
+fn read_view_keeps_snapshot_after_base_is_overwritten() {
+    let mut a = Array::from_slice(&grid(), [4, 3, 1, 1]).unwrap();
+    let s = a.slice(0, 1..3);
+    a.write(&[99.0; 12]).unwrap();
+    let s2 = s.slice(0, 1..2);
+
+    let kernel = ctx().kernel(VIEW_COPY).build().unwrap();
+    let mut out1 = Array::<f32>::zeros([2, 3, 1, 1]).unwrap();
+    kernel.launch([2, 3], args![luma::view(&s), &mut out1]).unwrap();
+    assert_eq!(out1.to_vec().unwrap(), vec![1.0, 2.0, 5.0, 6.0, 9.0, 10.0]);
+
+    let mut out2 = Array::<f32>::zeros([1, 3, 1, 1]).unwrap();
+    kernel.launch([1, 3], args![luma::view(&s2), &mut out2]).unwrap();
+    assert_eq!(out2.to_vec().unwrap(), vec![2.0, 6.0, 10.0]);
+}

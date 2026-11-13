@@ -119,7 +119,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
             ShiftKind::Dims { dims: s_dims, shifts } if s_dims == [w, h, 1, 1] => {
                 (signed(shifts[0], w), signed(shifts[1], h))
             }
-            ShiftKind::Dims { .. } | ShiftKind::View { .. } | ShiftKind::Take { .. } => return None,
+            ShiftKind::Dims { .. } | ShiftKind::View { .. } | ShiftKind::Take { .. } | ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => return None,
             ShiftKind::Linear => {
                 let Ref::Scalar(k) = instr.args[1] else {
                     return None;

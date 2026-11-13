@@ -26,7 +26,7 @@ fn a_division_by_zero_is_reported_at_its_line() {
 
     // A NaN is non-finite, too (0 / 0), and a finite result passes.
     let zero = Array::<f32>::zeros_on(&ctx, 8).unwrap();
-    let err = (&zero / &zero).to_vec().unwrap_err();
+    let err = (&zero / 0.0).to_vec().unwrap_err();
     assert!(matches!(err.root(), LumaError::NonFinite), "{err}");
     let fine = (&x * 2.0 + 1.0).to_vec().unwrap();
     assert_eq!(fine.len(), 32);
@@ -45,9 +45,9 @@ fn results_computed_together_are_checked_one_by_one() {
 #[test]
 fn writes_into_arrays_are_checked() {
     let ctx = checked();
-    let w = Array::<f32>::zeros_on(&ctx, [4, 2]).unwrap();
+    let mut w = Array::<f32>::zeros_on(&ctx, [4, 2]).unwrap();
     let bad = Array::from_slice_on(&ctx, &[1.0, f32::INFINITY, 1.0, 1.0], [4, 1]).unwrap();
-    let err = w.slice(1, 0..1).assign(&bad).unwrap_err();
+    let err = w.slice_mut(1, 0..1).assign(&bad).unwrap_err();
     assert!(matches!(err.root(), LumaError::NonFinite), "{err}");
     assert_eq!(err.location().map(|l| l.file().ends_with("check_finite.rs")), Some(true));
 }

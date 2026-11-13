@@ -8,7 +8,7 @@ use crate::array::{Array, Failure};
 use crate::context::{default_context, Context, RawArg};
 use crate::gpu::pager::Pin;
 use crate::error::{LumaError, Result};
-use crate::gpu_type::GpuType;
+use crate::gpu_type::{GpuType, ScalarType};
 
 /// WGSL appended to every kernel. Declarations are order independent in WGSL, so appending (not
 /// prepending) keeps the line numbers of compile errors identical to the user's source and
@@ -17,7 +17,30 @@ const PRELUDE: &str = "
 struct LumaGrid { size: vec3<u32>, _pad: u32 }
 @group(0) @binding(0) var<uniform> luma: LumaGrid;
 fn luma_idx2(i: u32, j: u32) -> u32 { return i + j * luma.size.x; }
-fn luma_idx3(i: u32, j: u32, k: u32) -> u32 { return i + luma.size.x * (j + luma.size.y * k); }
+fn luma_idx3(i: u32, j: u32, k: u32) -> u32 { return i + j * luma.size.x * (j + luma.size.y * k); }
+";
+
+const VIEW_PRELUDE: &str = "
+struct LumaView { offset: u32, len: u32, _pad: vec2<u32>, stride: vec4<i32>, dims: vec4<u32> }
+fn luma_view_idx2(v: LumaView, i: u32, j: u32) -> u32 {
+    return u32(i32(v.offset) + v.stride.x * i32(i) + v.stride.y * i32(j));
+}
+fn luma_view_idx3(v: LumaView, i: u32, j: u32, k: u32) -> u32 {
+    return u32(i32(v.offset) + v.stride.x * i32(i) + v.stride.y * i32(j) + v.stride.z * i32(k));
+}
+fn luma_view_idx4(v: LumaView, c: vec4<u32>) -> u32 {
+    let d = vec4<i32>(c) * v.stride;
+    return u32(i32(v.offset) + d.x + d.y + d.z + d.w);
+}
+fn luma_view_idx(v: LumaView, i: u32) -> u32 {
+    let c0 = i % v.dims.x;
+    let r0 = i / v.dims.x;
+    let c1 = r0 % v.dims.y;
+    let r1 = r0 / v.dims.y;
+    let c2 = r1 % v.dims.z;
+    let c3 = r1 / v.dims.z;
+    return luma_view_idx4(v, vec4<u32>(c0, c1, c2, c3));
+}
 ";
 
 /// Arguments a launch validates into a stack array; more than this take one heap allocation.
@@ -179,7 +202,11 @@ pub(crate) fn build_core(
     label: Option<&str>,
     trusted: bool,
 ) -> Result<KernelCore> {
-    let combined = format!("{}\n{PRELUDE}", key.source);
+    let combined = if !trusted && key.source.contains("LumaView") {
+        format!("{}\n{PRELUDE}{VIEW_PRELUDE}", key.source)
+    } else {
+        format!("{}\n{PRELUDE}", key.source)
+    };
     let module = naga::front::wgsl::parse_str(&combined)
         .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
 
@@ -382,10 +409,20 @@ pub(crate) fn build_core(
 }
 
 /// A problem size in invocations: `[x]`, `[x, y]` or `[x, y, z]` (missing dimensions are 1).
-pub trait ProblemSize {
+pub trait ProblemSize: sealed::SizeSealed {
     /// The problem size as `[x, y, z]`, with missing dimensions set to 1.
+    #[doc(hidden)]
     fn into_size(self) -> [u32; 3];
 }
+
+mod sealed {
+    pub trait SizeSealed {}
+    pub trait UniformSealed {}
+}
+
+impl sealed::SizeSealed for [u32; 1] {}
+impl sealed::SizeSealed for [u32; 2] {}
+impl sealed::SizeSealed for [u32; 3] {}
 
 impl ProblemSize for [u32; 1] {
     fn into_size(self) -> [u32; 3] {
@@ -414,6 +451,15 @@ enum ArgRepr<'a> {
         element_size: u32,
         writable: bool,
     },
+    /// A strided view: the buffer and its `LumaView` descriptor, two consecutive bindings.
+    View {
+        ctx: &'a Context,
+        pin: Pin,
+        bytes: u64,
+        element_size: u32,
+        writable: bool,
+        desc: crate::view::RawViewDesc,
+    },
     Uniform(std::result::Result<UniformBytes, String>),
     /// The array passed here is poisoned; launching fails with its error.
     Poisoned(Arc<LumaError>),
@@ -424,7 +470,8 @@ enum ArgRepr<'a> {
 const INLINE_UNIFORM_BYTES: usize = 128;
 
 /// The encoded bytes of a uniform argument.
-enum UniformBytes {
+#[doc(hidden)]
+pub enum UniformBytes {
     Inline { len: usize, bytes: [u8; INLINE_UNIFORM_BYTES] },
     Heap(Vec<u8>),
 }
@@ -446,6 +493,16 @@ pub struct KernelArg<'a> {
 }
 
 fn storage_arg<'a, T: GpuType>(array: &'a Array<T>, writable: bool) -> KernelArg<'a> {
+    if writable && array.is_read_view() {
+        if let Some(error) = array.error() {
+            return KernelArg { repr: ArgRepr::Poisoned(Arc::new(error.clone())) };
+        }
+        return KernelArg {
+            repr: ArgRepr::Poisoned(Arc::new(LumaError::InvalidShape(
+                "cannot pass a read-only view as &mut Array; use slice_mut, flip_mut or transpose_mut".into(),
+            ))),
+        };
+    }
     if writable {
         // Lazy operations recorded earlier still read the contents the kernel is about to change.
         array.flush_readers();
@@ -464,6 +521,20 @@ fn storage_arg<'a, T: GpuType>(array: &'a Array<T>, writable: bool) -> KernelArg
     KernelArg { repr }
 }
 
+fn view_arg<'a>(
+    ctx: &'a Context,
+    element_size: u32,
+    writable: bool,
+    ready: std::result::Result<(Pin, u64, crate::view::RawViewDesc), Failure>,
+) -> KernelArg<'a> {
+    let repr = match ready {
+        Ok((pin, bytes, desc)) => ArgRepr::View { ctx, pin, bytes, element_size, writable, desc },
+        Err(Failure::Inherited(error)) => ArgRepr::Poisoned(error),
+        Err(Failure::New(error)) => ArgRepr::Poisoned(Arc::new(error)),
+    };
+    KernelArg { repr }
+}
+
 impl<'a, T: GpuType> From<&'a Array<T>> for KernelArg<'a> {
     fn from(array: &'a Array<T>) -> Self {
         storage_arg(array, false)
@@ -476,27 +547,59 @@ impl<'a, T: GpuType> From<&'a mut Array<T>> for KernelArg<'a> {
     }
 }
 
+impl<'a, 'b, T: ScalarType> From<&'a crate::view::ViewMut<'b, Array<T>>> for KernelArg<'a> {
+    fn from(view: &'a crate::view::ViewMut<'b, Array<T>>) -> Self {
+        view_arg(view.context(), std::mem::size_of::<T>() as u32, false, view.ready_view(false))
+    }
+}
+
+impl<'a, 'b, T: ScalarType> From<&'a mut crate::view::ViewMut<'b, Array<T>>> for KernelArg<'a> {
+    fn from(view: &'a mut crate::view::ViewMut<'b, Array<T>>) -> Self {
+        view_arg(view.context(), std::mem::size_of::<T>() as u32, true, view.ready_view(true))
+    }
+}
+
+/// Passes a strided read view of `array` (for example `array.slice(0, 1..5).flip(1)`) without
+/// materializing a copy. It binds two consecutive `@group(1)` slots: the buffer
+/// (`var<storage, read> a: array<T>`) and a `var<uniform> a_view: LumaView`, indexed with
+/// `luma_view_idx{,2,3,4}`.
+pub fn view<'a, T: GpuType>(array: &'a Array<T>) -> KernelArg<'a> {
+    view_arg(array.context(), std::mem::size_of::<T>() as u32, false, array.ready_view())
+}
+
+/// A value [`uniform`] can pass: any type encase can lay out as a WGSL uniform
+/// (`#[derive(encase::ShaderType)]`, scalars, vectors, matrices, arrays). Sealed.
+pub trait UniformValue: sealed::UniformSealed {
+    #[doc(hidden)]
+    fn encode_uniform(&self) -> std::result::Result<UniformBytes, String>;
+}
+
+impl<T: encase::ShaderType + encase::internal::WriteInto> sealed::UniformSealed for T {}
+
+impl<T: encase::ShaderType + encase::internal::WriteInto> UniformValue for T {
+    fn encode_uniform(&self) -> std::result::Result<UniformBytes, String> {
+        let size = self.size().get();
+        let encoded = match usize::try_from(size) {
+            Ok(len) if len <= INLINE_UNIFORM_BYTES => {
+                let mut buffer = encase::UniformBuffer::new([0u8; INLINE_UNIFORM_BYTES]);
+                buffer
+                    .write(self)
+                    .map(|()| UniformBytes::Inline { len, bytes: buffer.into_inner() })
+            }
+            _ => {
+                let mut buffer = encase::UniformBuffer::new(Vec::<u8>::new());
+                buffer.write(self).map(|()| UniformBytes::Heap(buffer.into_inner()))
+            }
+        };
+        encoded.map_err(|e| e.to_string())
+    }
+}
+
 /// Passes `value` as a uniform, laid out by encase according to WGSL's rules (so a `#[derive(
 /// encase::ShaderType)]` struct matches the shader's struct even where `repr(C)` would not).
 /// The value is copied at call time, and every launch of a batch keeps its own copy.
-pub fn uniform<'a, T>(value: &T) -> KernelArg<'a>
-where
-    T: encase::ShaderType + encase::internal::WriteInto,
-{
-    let size = value.size().get();
-    let encoded = match usize::try_from(size) {
-        Ok(len) if len <= INLINE_UNIFORM_BYTES => {
-            let mut buffer = encase::UniformBuffer::new([0u8; INLINE_UNIFORM_BYTES]);
-            buffer
-                .write(value)
-                .map(|()| UniformBytes::Inline { len, bytes: buffer.into_inner() })
-        }
-        _ => {
-            let mut buffer = encase::UniformBuffer::new(Vec::<u8>::new());
-            buffer.write(value).map(|()| UniformBytes::Heap(buffer.into_inner()))
-        }
-    };
-    KernelArg { repr: ArgRepr::Uniform(encoded.map_err(|e| e.to_string())) }
+pub fn uniform<'a, T: UniformValue>(value: &T) -> KernelArg<'a> {
+    KernelArg { repr: ArgRepr::Uniform(value.encode_uniform()) }
 }
 
 /// Builds the arguments for [`Kernel::launch`]: `args![&x, &mut y, uniform(&params)]`. The
@@ -599,61 +702,64 @@ impl Kernel {
         if workgroups.iter().any(|&w| w > max) {
             return Err(LumaError::KernelGridTooLarge { workgroups, max });
         }
-        if args.len() != core.bindings.len() {
-            return Err(LumaError::KernelArgCount {
-                expected: core.bindings.len(),
-                actual: args.len(),
-            });
+        let total: usize = args.iter().map(|a| if matches!(a.repr, ArgRepr::View { .. }) { 2 } else { 1 }).sum();
+        if total != core.bindings.len() {
+            return Err(LumaError::KernelArgCount { expected: core.bindings.len(), actual: total });
         }
 
         // The validated arguments, on the stack unless there are very many.
         let mut inline = [RawArg::Uniform(&[]); INLINE_ARGS];
         let mut heap;
-        let raw: &mut [RawArg<'_>] = match inline.get_mut(..args.len()) {
+        let raw: &mut [RawArg<'_>] = match inline.get_mut(..total) {
             Some(raw) => raw,
             None => {
-                heap = vec![RawArg::Uniform(&[]); args.len()];
+                heap = vec![RawArg::Uniform(&[]); total];
                 &mut heap
             }
         };
 
         let max_uniform = ctx.max_uniform_bytes();
-        for (index, ((arg, info), slot)) in
-            args.iter().zip(&core.bindings).zip(raw.iter_mut()).enumerate()
-        {
+        let mut index = 0;
+        for arg in args {
+            let info = &core.bindings[index];
             match &arg.repr {
                 ArgRepr::Poisoned(error) => return Err(LumaError::clone(error)),
+                ArgRepr::View { ctx: arg_ctx, pin, bytes, element_size, writable, desc } => {
+                    if !arg_ctx.same_as(ctx) {
+                        return Err(LumaError::ContextMismatch);
+                    }
+                    check_storage(info, index, *element_size, *writable)?;
+                    let desc_info = &core.bindings[index + 1];
+                    if desc_info.kind != BindingKind::Uniform {
+                        return Err(LumaError::KernelArgKind {
+                            index: index + 1,
+                            expected: desc_info.kind,
+                            actual: BindingKind::Uniform,
+                        });
+                    }
+                    let desc_bytes = std::mem::size_of::<crate::view::RawViewDesc>() as u64;
+                    if let Some(expected) = desc_info.min_size
+                        && desc_bytes < u64::from(expected) {
+                            return Err(LumaError::KernelArgUniformSize {
+                                index: index + 1,
+                                expected: u64::from(expected),
+                                actual: desc_bytes,
+                            });
+                        }
+                    if desc_bytes > max_uniform {
+                        return Err(LumaError::BufferTooLarge { requested: desc_bytes, max: max_uniform });
+                    }
+                    raw[index] = RawArg::Storage { buffer: pin.buffer(), bytes: *bytes, writable: *writable };
+                    raw[index + 1] = RawArg::Uniform(bytemuck::bytes_of(desc));
+                    index += 2;
+                    continue;
+                }
                 ArgRepr::Storage { ctx: arg_ctx, pin, bytes, element_size, writable } => {
                     if !arg_ctx.same_as(ctx) {
                         return Err(LumaError::ContextMismatch);
                     }
-                    let actual = if *writable {
-                        BindingKind::StorageReadWrite
-                    } else {
-                        BindingKind::StorageRead
-                    };
-                    match info.kind {
-                        BindingKind::Uniform => {
-                            return Err(LumaError::KernelArgKind {
-                                index,
-                                expected: info.kind,
-                                actual,
-                            })
-                        }
-                        BindingKind::StorageReadWrite if !writable => {
-                            return Err(LumaError::KernelArgAccess { index })
-                        }
-                        _ => {}
-                    }
-                    if let Some(stride) = info.element_stride
-                        && stride != *element_size {
-                            return Err(LumaError::KernelArgElementSize {
-                                index,
-                                expected: stride,
-                                actual: *element_size,
-                            });
-                        }
-                    *slot = RawArg::Storage { buffer: pin.buffer(), bytes: *bytes, writable: *writable };
+                    check_storage(info, index, *element_size, *writable)?;
+                    raw[index] = RawArg::Storage { buffer: pin.buffer(), bytes: *bytes, writable: *writable };
                 }
                 ArgRepr::Uniform(encoded) => {
                     if info.kind != BindingKind::Uniform {
@@ -682,11 +788,29 @@ impl Kernel {
                     if bytes > max_uniform {
                         return Err(LumaError::BufferTooLarge { requested: bytes, max: max_uniform });
                     }
-                    *slot = RawArg::Uniform(data);
+                    raw[index] = RawArg::Uniform(data);
                 }
             }
+            index += 1;
         }
 
         ctx.launch(core, workgroups, size, raw)
     }
+}
+
+/// Checks a storage argument against the binding it lands on.
+fn check_storage(info: &BindingInfo, index: usize, element_size: u32, writable: bool) -> Result<()> {
+    let actual = if writable { BindingKind::StorageReadWrite } else { BindingKind::StorageRead };
+    match info.kind {
+        BindingKind::Uniform => {
+            return Err(LumaError::KernelArgKind { index, expected: info.kind, actual })
+        }
+        BindingKind::StorageReadWrite if !writable => return Err(LumaError::KernelArgAccess { index }),
+        _ => {}
+    }
+    if let Some(stride) = info.element_stride
+        && stride != element_size {
+            return Err(LumaError::KernelArgElementSize { index, expected: stride, actual: element_size });
+        }
+    Ok(())
 }

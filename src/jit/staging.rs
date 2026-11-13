@@ -429,6 +429,7 @@ mod tests {
             tile: None,
             staging: None,
             guard: None,
+            params: None,
         }
     }
 

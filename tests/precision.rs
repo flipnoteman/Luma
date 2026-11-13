@@ -98,10 +98,10 @@ fn df32_views_and_assign_round_trip() {
     assert_eq!(a.flip(0).to_vec().unwrap()[0], data[3]);
     assert_eq!(a.shift_clamp(-1).to_vec().unwrap()[3], data[3]);
 
-    let w = Array::<Df32>::zeros_on(&ctx, [4, 3]).unwrap();
+    let mut w = Array::<Df32>::zeros_on(&ctx, [4, 3]).unwrap();
     let row: Vec<Df32> = data[4..8].to_vec();
     let row = Array::from_slice_on(&ctx, &row, [4, 1]).unwrap();
-    w.slice(1, 2..3).assign(&row).unwrap();
+    w.slice_mut(1, 2..3).assign(&row).unwrap();
     let got = w.to_vec().unwrap();
     assert_eq!(&got[8..], &data[4..8]);
     assert!(got[..8].iter().all(|v| *v == Df32::default()));
@@ -244,8 +244,8 @@ fn f64_arrays_compute_in_double_precision() {
         for (g, x) in clamped.iter().zip(&data_a) {
             assert_eq!(*g, x.clamp(1.2, 1.5));
         }
-        let w = Array::<f64>::zeros_on(&ctx, [4, 2]).unwrap();
-        w.slice(1, 1..2).assign(Array::from_slice_on(&ctx, &data_a[..4], [4, 1]).unwrap()).unwrap();
+        let mut w = Array::<f64>::zeros_on(&ctx, [4, 2]).unwrap();
+        w.slice_mut(1, 1..2).assign(Array::from_slice_on(&ctx, &data_a[..4], [4, 1]).unwrap()).unwrap();
         assert_eq!(&w.to_vec().unwrap()[4..], &data_a[..4]);
         let filled = Array::<f64>::full_on(&ctx, 3, 0.1).unwrap().to_vec().unwrap();
         assert_eq!(filled, vec![0.1; 3]);

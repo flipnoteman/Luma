@@ -1,6 +1,12 @@
 pub(crate) mod built;
 #[cfg(target_os = "linux")]
 pub(crate) mod exit;
+#[cfg(not(target_os = "linux"))]
+pub(crate) mod exit {
+    pub(crate) fn driver_call<R>(call: impl FnOnce() -> R) -> R {
+        call()
+    }
+}
 pub(crate) mod cache;
 pub mod handle;
 mod fma;

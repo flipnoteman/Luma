@@ -27,15 +27,23 @@ pub enum Rhs<'a, T: ScalarType> {
     Scalar(T),
 }
 
+/// Seals [`Operand`]: only the types below are right-hand sides.
+pub(crate) mod operand_sealed {
+    pub trait Sealed {}
+}
+
 /// A right-hand side accepted by the `try_*` methods, comparisons and `minimum`/`maximum`:
-/// an `&Array<T>` of the same shape or a single `T` applied to every element.
-pub trait Operand<T: ScalarType> {
+/// an `&Array<T>` or `Array<T>` or a single `T` applied to every element. An array broadcasts
+/// along its extent-1 axes ([`Array::broadcast_to`]) to the shape the operation works at.
+pub trait Operand<T: ScalarType>: operand_sealed::Sealed {
     #[doc(hidden)]
     fn rhs(&self) -> Rhs<'_, T>;
 }
 
 macro_rules! impl_value_operand {
     ($t:ty) => {
+        impl operand_sealed::Sealed for $t {}
+
         impl Operand<$t> for $t {
             fn rhs(&self) -> Rhs<'_, $t> {
                 Rhs::Scalar(*self)
@@ -46,6 +54,8 @@ macro_rules! impl_value_operand {
 
 macro_rules! impl_scalar_operand {
     ($t:ty) => {
+        impl operand_sealed::Sealed for &crate::scalar::Scalar<$t> {}
+
         impl Operand<$t> for &crate::scalar::Scalar<$t> {
             fn rhs(&self) -> Rhs<'_, $t> {
                 Rhs::Scalar(self.get())
@@ -53,6 +63,9 @@ macro_rules! impl_scalar_operand {
         }
     };
 }
+
+impl<T: ScalarType> operand_sealed::Sealed for &Array<T> {}
+impl<T: ScalarType> operand_sealed::Sealed for Array<T> {}
 
 impl<T: ScalarType> Operand<T> for &Array<T> {
     fn rhs(&self) -> Rhs<'_, T> {
@@ -130,6 +143,23 @@ pub(crate) fn lazy<O: GpuType>(
     Ok(Array::from_node(ctx, shape, node))
 }
 
+/// The shape two operands of shapes `lhs` and `rhs` broadcast to: per axis the common extent, or
+/// the other one where one side has extent 1. `None` if some axis has two different extents
+/// other than 1.
+pub(crate) fn broadcast_shape(lhs: Shape, rhs: Shape) -> Option<Shape> {
+    let (l, r) = (lhs.dims(), rhs.dims());
+    let mut out = l;
+    for k in 0..4 {
+        out[k] = match (l[k], r[k]) {
+            (a, b) if a == b => a,
+            (1, b) => b,
+            (a, 1) => a,
+            _ => return None,
+        };
+    }
+    Some(Shape::new(out))
+}
+
 impl<T: ScalarType> Array<T> {
     // -- Lazy operations --
 
@@ -199,16 +229,12 @@ impl<T: ScalarType> Array<T> {
                 }
                 if self.shape() == other.shape() {
                     (this, operand, self.shape())
-                } else if other.len() == 1 {
-                    (this, other.broadcast(self.shape(), location)?, self.shape())
-                } else if self.len() == 1 {
-                    (self.broadcast(other.shape(), location)?, operand, other.shape())
                 } else {
-                    return Err(LumaError::ShapeMismatch {
-                        lhs: self.shape().dims(),
-                        rhs: other.shape().dims(),
-                    }
-                    .into());
+                    let mismatch = || LumaError::ShapeMismatch { lhs: self.shape().dims(), rhs: other.shape().dims() };
+                    let out = broadcast_shape(self.shape(), other.shape()).ok_or_else(mismatch)?;
+                    let this = if self.shape() == out { this } else { self.broadcast_axis(out, location)? };
+                    let operand = if other.shape() == out { operand } else { other.broadcast_axis(out, location)? };
+                    (this, operand, out)
                 }
             }
             Rhs::Scalar(value) => (this, Src::Scalar(Scalar::of(value)?), self.shape()),
@@ -237,21 +263,10 @@ impl<T: ScalarType> Array<T> {
         let storage = Arc::clone(self.storage()?);
         let other = match rhs {
             Rhs::Array(other) => {
-                let operand = other.src()?;
                 if !ctx.same_as(other.context()) {
                     return Err(LumaError::ContextMismatch.into());
                 }
-                if self.shape() == other.shape() {
-                    operand
-                } else if other.len() == 1 {
-                    other.broadcast(self.shape(), location)?
-                } else {
-                    return Err(LumaError::ShapeMismatch {
-                        lhs: self.shape().dims(),
-                        rhs: other.shape().dims(),
-                    }
-                    .into());
-                }
+                other.broadcast_operand(self.shape(), location)?
             }
             Rhs::Scalar(value) => Src::Scalar(Scalar::of(value)?),
         };
@@ -346,12 +361,16 @@ impl<T: ScalarType> Array<T> {
     #[track_caller]
     pub(crate) fn assign_op(&mut self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str) {
         let location = Location::caller();
-        let result = if (self.pending().is_some() && !self.expression_shared()) || self.sole_owner() {
+        let result = if self.is_read_view() {
+            self.src().and_then(|_| -> Outcome<()> {
+                Err(LumaError::InvalidShape("cannot mutate a read-only view; use slice_mut, flip_mut or transpose_mut".into()).into())
+            })
+        } else if (self.pending().is_some() && !self.expression_shared()) || self.sole_owner() {
             // The target is an expression without a buffer, or nothing else can observe its
             // buffer changing: it simply becomes the expression `self op rhs`, stays fusable, and
             // reuses its buffer when it is evaluated.
             self.run_binary(rhs, false, OpKind::Binary(op), name, location).and_then(|new: Array<T>| {
-                // A one-element target is never broadcast to the right-hand side's shape.
+                // The target never grows to the right-hand side's shape.
                 if new.shape() != self.shape() {
                     return Err(LumaError::ShapeMismatch { lhs: self.shape().dims(), rhs: new.shape().dims() }.into());
                 }
@@ -597,9 +616,11 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
 /// let clipped = select(&x.gt(0.0), &x, 0.0);
 /// ```
 ///
-/// The result takes the mask's shape and context; array branches must match both. A mismatch
-/// poisons the result with `ShapeMismatch` (reported as `lhs` = the mask's shape, `rhs` = the
-/// branch's) or `ContextMismatch`.
+/// The result takes the mask's shape and context. An array branch has the mask's shape or
+/// extent 1 on the axes where it differs (a `[n, 1]` branch under an `[n, m]` mask is read at
+/// every column, see [`Array::broadcast_to`]). A mismatch poisons the result with
+/// `ShapeMismatch` (reported as `lhs` = the mask's shape, `rhs` = the branch's) or
+/// `ContextMismatch`.
 #[track_caller]
 pub fn select<T: ScalarType>(mask: &Array<u32>, a: impl Operand<T>, b: impl Operand<T>) -> Array<T> {
     select_at(mask, a, b, Location::caller())
@@ -627,21 +648,10 @@ pub(crate) fn run_select<T: ScalarType>(
     let branch = |rhs: Rhs<'_, T>| -> Outcome<Src> {
         match rhs {
             Rhs::Array(other) => {
-                let operand = other.src()?;
                 if !ctx.same_as(other.context()) {
                     return Err(LumaError::ContextMismatch.into());
                 }
-                if mask.shape() == other.shape() {
-                    Ok(operand)
-                } else if other.len() == 1 {
-                    other.broadcast(mask.shape(), location)
-                } else {
-                    Err(LumaError::ShapeMismatch {
-                        lhs: mask.shape().dims(),
-                        rhs: other.shape().dims(),
-                    }
-                    .into())
-                }
+                other.broadcast_operand(mask.shape(), location)
             }
             Rhs::Scalar(value) => Ok(Src::Scalar(Scalar::of(value)?)),
         }

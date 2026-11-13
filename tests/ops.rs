@@ -443,3 +443,86 @@ fn u32_division_by_zero_gives_the_dividend() {
     c /= &b;
     assert_eq!(c.to_vec().unwrap(), vec![7, 4, 9, 2]);
 }
+
+// -- Broadcasting along size-1 axes --
+
+fn col_and_row() -> (Array<f32>, Array<f32>) {
+    let col = Array::from_slice(&[1.0f32, 2.0, 3.0], [3, 1]).unwrap();
+    let row = Array::from_slice(&[10.0f32, 20.0], [1, 2]).unwrap();
+    (col, row)
+}
+
+#[test]
+fn size_one_axes_broadcast_in_operators() {
+    let (col, row) = col_and_row();
+    let sum = &col + &row;
+    assert_eq!(sum.shape().dims(), [3, 2, 1, 1]);
+    assert_eq!(sum.to_vec().unwrap(), [11.0, 12.0, 13.0, 21.0, 22.0, 23.0]);
+    assert_eq!((&row - &col).to_vec().unwrap(), [9.0, 8.0, 7.0, 19.0, 18.0, 17.0]);
+    assert_eq!((&col * &row).to_vec().unwrap(), [10.0, 20.0, 30.0, 20.0, 40.0, 60.0]);
+
+    // A one-element array broadcasts to every shape, on either side.
+    let one = Array::from_slice(&[2.0f32], 1).unwrap();
+    assert_eq!((&one * &col).to_vec().unwrap(), [2.0, 4.0, 6.0]);
+    let both = &sum + &one;
+    assert_eq!(both.shape().dims(), [3, 2, 1, 1]);
+    assert_eq!(both.to_vec().unwrap(), [13.0, 14.0, 15.0, 23.0, 24.0, 25.0]);
+
+    // Other extents still have to agree.
+    let bad = &sum + &Array::<f32>::zeros([2, 3]).unwrap();
+    let err = bad.to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::ShapeMismatch { lhs: [3, 2, 1, 1], rhs: [2, 3, 1, 1] }), "{err}");
+}
+
+#[test]
+fn comparisons_and_select_broadcast() {
+    let (col, _) = col_and_row();
+    let thr = Array::from_slice(&[1.5f32, 2.5], [1, 2]).unwrap();
+    let mask = col.gt(&thr);
+    assert_eq!(mask.shape().dims(), [3, 2, 1, 1]);
+    assert_eq!(mask.to_vec().unwrap(), [0, 1, 1, 0, 0, 1]);
+
+    // An `[n, 1]` branch under an `[n, m]` mask is read at every column.
+    let picked = select(&mask, &col, 0.0);
+    assert_eq!(picked.to_vec().unwrap(), [0.0, 2.0, 3.0, 0.0, 0.0, 3.0]);
+    let picked = select(&mask, 1.0f32, &thr);
+    assert_eq!(picked.to_vec().unwrap(), [1.5, 1.0, 1.0, 2.5, 2.5, 1.0]);
+
+    // The mask's shape is the result's: a branch cannot grow it.
+    let wide = Array::<f32>::zeros([3, 2]).unwrap();
+    let err = select(&col.gt(1.0), &wide, 0.0).to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::ShapeMismatch { lhs: [3, 1, 1, 1], rhs: [3, 2, 1, 1] }), "{err}");
+}
+
+#[test]
+fn compound_assignment_broadcasts_the_right_hand_side_only() {
+    let (col, row) = col_and_row();
+    let mut m = Array::<f32>::zeros([3, 2]).unwrap();
+    m += &row;
+    assert_eq!(m.to_vec().unwrap(), [10.0, 10.0, 10.0, 20.0, 20.0, 20.0]);
+    m += &col;
+    assert_eq!(m.to_vec().unwrap(), [11.0, 12.0, 13.0, 21.0, 22.0, 23.0]);
+
+    // The target never grows.
+    let mut c = col.copy();
+    c += &row;
+    let err = c.to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::ShapeMismatch { .. }), "{err}");
+}
+
+#[test]
+fn broadcast_to_repeats_size_one_axes() {
+    let (col, row) = col_and_row();
+    let b = col.broadcast_to([3, 2]);
+    assert_eq!(b.shape().dims(), [3, 2, 1, 1]);
+    assert_eq!(b.to_vec().unwrap(), [1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    assert_eq!(row.broadcast_to([3, 2]).to_vec().unwrap(), [10.0, 10.0, 10.0, 20.0, 20.0, 20.0]);
+    assert_eq!(col.broadcast_to([3, 1]).to_vec().unwrap(), [1.0, 2.0, 3.0]);
+
+    // It is an ordinary lazy array: it fuses and is not a view that writes through.
+    let outer = col.broadcast_to([3, 2]) * &row.broadcast_to([3, 2]) + 1.0;
+    assert_eq!(outer.to_vec().unwrap(), [11.0, 21.0, 31.0, 21.0, 41.0, 61.0]);
+
+    let err = col.broadcast_to([4, 2]).to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::ShapeMismatch { lhs: [3, 1, 1, 1], rhs: [4, 2, 1, 1] }), "{err}");
+}

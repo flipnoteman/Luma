@@ -111,6 +111,10 @@ fn expand(input: &DeriveInput) -> Tokens {
                 #( <#types as ::luma::Fields>::each(&self.#names, f); )*
             }
 
+            fn each_mut<'a>(&'a mut self, f: &mut dyn ::core::ops::FnMut(&'a mut ::luma::Array<Self::Elem>)) {
+                #( <#types as ::luma::Fields>::each_mut(&mut self.#names, f); )*
+            }
+
             fn build(next: &mut dyn ::core::ops::FnMut() -> ::luma::Array<Self::Elem>) -> Self {
                 Self { #( #names: <#types as ::luma::Fields>::build(next), )* }
             }
@@ -131,7 +135,7 @@ fn expand(input: &DeriveInput) -> Tokens {
         let method = format_ident!("{method}");
         let assign_method = format_ident!("{assign_method}");
         let assign_trait = format_ident!("{assign_trait}");
-        let op = quote! { ::luma::FieldOp::#variant };
+        let op = quote! { ::luma::__private::FieldOp::#variant };
         let trait_path = quote! { ::core::ops::#variant };
         let assign_path = quote! { ::core::ops::#assign_trait };
 

@@ -4,7 +4,7 @@
 mod common;
 
 use common::{assert_close, values};
-use luma::{concat, Array, Context, ContextOptions, LumaError, PadMode};
+use luma::{concat, concat_slice, Array, Context, ContextOptions, LumaError, PadMode};
 
 /// Element `(x, y)` of a `[w, h]` array held in a `Vec`.
 fn at(data: &[f32], w: usize, x: usize, y: usize) -> f32 {
@@ -317,4 +317,64 @@ fn views_are_copies_across_small_chunks() {
     let idx = Array::from_slice_on(&ctx, &(0..1000u32).map(|i| (i * 7) % 1000).collect::<Vec<_>>(), 1000).unwrap();
     let want: Vec<f32> = (0..1000usize).map(|i| a[(i * 7) % 1000]).collect();
     assert_eq!(x.take(&idx).to_vec().unwrap(), want);
+}
+
+#[test]
+fn concat_slice_joins_parts_along_an_axis() {
+    let ctx = Context::new().unwrap();
+    let a = Array::from_slice_on(&ctx, &[1.0f32, 2.0], 2).unwrap();
+    let b = Array::from_slice_on(&ctx, &[3.0f32, 4.0, 5.0], 3).unwrap();
+    let c = Array::from_slice_on(&ctx, &[6.0f32], 1).unwrap();
+    let parts = [a.clone(), b.clone(), c];
+
+    assert_eq!(concat_slice(0, &parts).to_vec().unwrap(), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(concat_slice(0, &parts[..1]).to_vec().unwrap(), [1.0, 2.0]);
+    assert_eq!(concat_slice(0, &parts[..2]).to_vec().unwrap(), concat(0, [&a, &b]).to_vec().unwrap());
+
+    // Along the second axis.
+    let p = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0, 4.0], [2, 2]).unwrap();
+    let q = Array::from_slice_on(&ctx, &[5.0f32, 6.0], [2, 1]).unwrap();
+    let joined = concat_slice(1, &[p, q]);
+    assert_eq!(joined.shape().dims(), [2, 3, 1, 1]);
+    assert_eq!(joined.to_vec().unwrap(), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+    // It fuses with the arithmetic around it, and its parts may be expressions.
+    let lazy = [&a * 10.0, &b + 1.0];
+    let got = (concat_slice(0, &lazy) * 2.0 + 1.0).to_vec().unwrap();
+    assert_eq!(got, [21.0, 41.0, 9.0, 11.0, 13.0]);
+}
+
+#[test]
+fn concat_slice_of_no_arrays_and_mismatched_parts_fail() {
+    let ctx = Context::new().unwrap();
+    let empty: [Array<f32>; 0] = [];
+    let err = concat_slice(0, &empty).to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::InvalidShape(_)), "{err}");
+
+    let p = Array::<f32>::zeros_on(&ctx, [2, 2]).unwrap();
+    let q = Array::<f32>::zeros_on(&ctx, [3, 1]).unwrap();
+    let err = concat_slice(1, &[p, q]).to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::ShapeMismatch { .. }), "{err}");
+}
+
+#[test]
+fn mutable_views_write_through_and_read_only_ones_do_not() {
+    let ctx = Context::new().unwrap();
+    let mut w = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0, 4.0], 4).unwrap();
+    let mut v = w.slice_mut(0, 1..3);
+    v += 10.0;
+    assert_eq!(w.to_vec().unwrap(), [1.0, 12.0, 13.0, 4.0]);
+
+    // The read-only slice sees the data and keeps rejecting writes.
+    let mut s = w.slice(0, 1..3);
+    assert_eq!(s.to_vec().unwrap(), [12.0, 13.0]);
+    s += 1.0;
+    let err = s.to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::InvalidShape(_)), "{err}");
+    assert_eq!(w.to_vec().unwrap(), [1.0, 12.0, 13.0, 4.0]);
+
+    // `to_array` of a mutable view is a read-only array of its region.
+    let mut region = w.slice_mut(0, 2..).to_array();
+    assert_eq!(region.to_vec().unwrap(), [13.0, 4.0]);
+    assert!(region.assign(0.0).is_err());
 }

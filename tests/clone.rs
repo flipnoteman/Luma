@@ -14,7 +14,7 @@ fn f32s(ctx: &Context, data: &[f32]) -> Array<f32> {
 fn clones_of_an_evaluated_array_see_each_others_writes() {
     let ctx = Context::new().unwrap();
     let mut a = f32s(&ctx, &[1.0, 2.0, 3.0, 4.0]);
-    let b = a.clone();
+    let mut b = a.clone();
 
     a.write(&[5.0, 6.0, 7.0, 8.0]).unwrap();
     assert_eq!(b.to_vec().unwrap(), [5.0, 6.0, 7.0, 8.0]);
@@ -23,14 +23,18 @@ fn clones_of_an_evaluated_array_see_each_others_writes() {
     assert_eq!(b.to_vec().unwrap(), [6.0, 7.0, 8.0, 9.0]);
     assert_eq!(a.to_vec().unwrap(), [6.0, 7.0, 8.0, 9.0]);
 
-    b.slice(0, ..2).assign(0.0).unwrap();
+    b.slice_mut(0, ..2).assign(0.0).unwrap();
     assert_eq!(a.to_vec().unwrap(), [0.0, 0.0, 8.0, 9.0]);
 
-    // A view clones too and still writes through to the array it was taken from.
-    let v = a.slice(0, 2..);
-    let w = v.clone();
-    w.assign(1.0).unwrap();
-    assert_eq!(v.to_vec().unwrap(), [1.0, 1.0]);
+    // A slice taken through `&a` is read-only (a clone of it too); `slice_mut` writes through.
+    let mut s = a.slice(0, 2..);
+    assert!(matches!(s.assign(1.0).unwrap_err().root(), LumaError::InvalidShape(_)));
+    assert!(matches!(s.clone().write(&[1.0, 1.0]).unwrap_err().root(), LumaError::InvalidShape(_)));
+    s += 1.0;
+    assert!(matches!(s.error().unwrap().root(), LumaError::InvalidShape(_)));
+    assert_eq!(b.to_vec().unwrap(), [0.0, 0.0, 8.0, 9.0]);
+    b.slice_mut(0, 2..).assign(1.0).unwrap();
+    assert_eq!(a.to_vec().unwrap(), [0.0, 0.0, 1.0, 1.0]);
     assert_eq!(b.to_vec().unwrap(), [0.0, 0.0, 1.0, 1.0]);
 
     // Expressions recorded before a write keep the values they were recorded against.
@@ -38,6 +42,37 @@ fn clones_of_an_evaluated_array_see_each_others_writes() {
     a += 10.0;
     assert_eq!(old.to_vec().unwrap(), [0.0, 0.0, 1.0, 1.0]);
     assert_eq!(b.to_vec().unwrap(), [10.0, 10.0, 11.0, 11.0]);
+}
+
+#[test]
+fn copy_is_independent_of_the_original() {
+    let ctx = Context::new().unwrap();
+    let a = f32s(&ctx, &[1.0, 2.0, 3.0, 4.0]);
+
+    let mut c = a.copy();
+    c += 1.0;
+    assert_eq!(c.to_vec().unwrap(), [2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(a.to_vec().unwrap(), [1.0, 2.0, 3.0, 4.0]);
+
+    // The copy of a slice is an ordinary array that writes only itself.
+    let mut sv = a.slice(0, 1..3).copy();
+    sv += 1.0;
+    sv.write(&[7.0, 8.0]).unwrap();
+    assert_eq!(sv.to_vec().unwrap(), [7.0, 8.0]);
+    assert_eq!(a.to_vec().unwrap(), [1.0, 2.0, 3.0, 4.0]);
+    let mut sm = a.copy();
+    sm.slice_mut(0, ..2).assign(0.0).unwrap();
+    assert_eq!(a.to_vec().unwrap(), [1.0, 2.0, 3.0, 4.0]);
+
+    // The copy of a poisoned array is poisoned with the same error.
+    let bad = &a + &f32s(&ctx, &[1.0, 2.0]);
+    assert!(matches!(bad.copy().to_vec().unwrap_err().root(), LumaError::ShapeMismatch { .. }));
+
+    // Element types without built-in arithmetic are copied on the device.
+    let mut v = Array::<[f32; 2]>::from_slice_on(&ctx, &[[1.0, 2.0], [3.0, 4.0]], 2).unwrap();
+    let w = v.copy();
+    v.write(&[[0.0, 0.0], [0.0, 0.0]]).unwrap();
+    assert_eq!(w.to_vec().unwrap(), [[1.0, 2.0], [3.0, 4.0]]);
 }
 
 #[test]
@@ -63,8 +98,8 @@ fn clones_of_a_lazy_array_share_the_expression_and_its_writes() {
     assert_eq!(b.to_vec().unwrap(), data);
 
     let a = &x * 2.0;
-    let b = a.clone();
-    b.slice(0, ..10).assign(0.0).unwrap();
+    let mut b = a.clone();
+    b.slice_mut(0, ..10).assign(0.0).unwrap();
     let got = a.to_vec().unwrap();
     assert!(got[..10].iter().all(|&v| v == 0.0));
     assert_close(&got[10..], &twice[10..], 1e-6, 1e-6);
@@ -105,9 +140,9 @@ struct Pair {
 #[test]
 fn a_record_of_arrays_can_derive_clone() {
     let ctx = Context::new().unwrap();
-    let p = Pair { a: f32s(&ctx, &[1.0, 2.0]), b: f32s(&ctx, &[3.0, 4.0]) };
+    let mut p = Pair { a: f32s(&ctx, &[1.0, 2.0]), b: f32s(&ctx, &[3.0, 4.0]) };
     let q = p.clone();
-    p.a.slice(0, ..1).assign(9.0).unwrap();
+    p.a.slice_mut(0, ..1).assign(9.0).unwrap();
     assert_eq!(q.a.to_vec().unwrap(), [9.0, 2.0]);
     assert_eq!(q.b.to_vec().unwrap(), [3.0, 4.0]);
 }

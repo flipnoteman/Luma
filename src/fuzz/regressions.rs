@@ -124,11 +124,11 @@ fn slice_write_after_a_flipped_write_into_an_expression_is_lost() {
     });
 }
 
-/// Finding 5: a view taken before a write into its base, then assigned through: the base is
-/// written but the view itself keeps showing the data it had (the old element), not the
-/// assigned data ("the receiver shows the new data", `tests/assign.rs`).
+/// Finding 5: a view taken before a write into its base keeps showing the data it had (the old
+/// element) when a region of the base is written afterwards (through `slice_mut`: a view is
+/// read-only, `tests/assign.rs`).
 #[test]
-fn view_assigned_after_its_base_was_written_shows_the_old_data() {
+fn view_taken_before_a_write_into_its_base_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
         math: false,
@@ -136,13 +136,13 @@ fn view_assigned_after_its_base_was_written_shows_the_old_data() {
             Input { dims: [8, 8, 1, 1], ty: F32, seed: 0 },
             View { src: 0, view: Slice { axis: 0, lo: 3, hi: 4 } },
             Assign { target: 0, path: vec![], rhs: Const(-2.0) },
-            Assign { target: 1, path: vec![], rhs: Const(4.0) },
+            Assign { target: 0, path: vec![InjSlice { axis: 0, lo: 3, hi: 4 }], rhs: Const(4.0) },
         ],
     });
 }
 
 #[test]
-fn view_of_a_view_assigned_after_its_base_was_written_shows_the_old_data() {
+fn view_of_a_view_taken_before_a_write_into_its_base_shows_the_old_data() {
     check(Program {
         config: Config::default_engine(),
         math: false,
@@ -151,15 +151,15 @@ fn view_of_a_view_assigned_after_its_base_was_written_shows_the_old_data() {
             View { src: 0, view: Slice { axis: 0, lo: 3, hi: 4 } },
             Assign { target: 0, path: vec![InjFlip { axis: 1 }, InjSlice { axis: 0, lo: 3, hi: 5 }], rhs: Const(-2.0) },
             View { src: 1, view: Flip { axis: 1 } },
-            Assign { target: 2, path: vec![], rhs: Const(4.0) },
+            Assign { target: 0, path: vec![InjSlice { axis: 0, lo: 3, hi: 4 }, InjFlip { axis: 1 }], rhs: Const(4.0) },
         ],
     });
 }
 
-/// Finding 5, simplest form: an evaluated view keeps its own buffer, which a write through it
-/// does not update (the base is written, the view still shows the old values).
+/// Finding 5, simplest form: an evaluated view keeps its own buffer, which a write into its base
+/// does not update (the base region is written, the view still shows the old values).
 #[test]
-fn evaluated_view_assigned_through_shows_the_old_data() {
+fn evaluated_view_keeps_the_old_data_after_a_write_into_its_base() {
     check(Program {
         config: Config::default_engine(),
         math: false,
@@ -167,7 +167,7 @@ fn evaluated_view_assigned_through_shows_the_old_data() {
             Input { dims: [8, 8, 1, 1], ty: F32, seed: 0 },
             View { src: 0, view: Slice { axis: 0, lo: 3, hi: 4 } },
             EvalVars { vars: vec![1] },
-            Assign { target: 1, path: vec![], rhs: Const(4.0) },
+            Assign { target: 0, path: vec![InjSlice { axis: 0, lo: 3, hi: 4 }], rhs: Const(4.0) },
         ],
     });
 }
@@ -249,11 +249,11 @@ fn slice_write_into_a_range_created_after_another_slice_write_is_lost() {
 }
 
 /// Finding 10 (found while fixing findings 6 and 7; no loop involved): a whole-array write
-/// through two flips replaces the lazy array's expression, a view of it is taken afterwards and
-/// written through; the write into the view does not reach the array (`element 40` keeps the
-/// old value). Same family as finding 4, through a view variable.
+/// through two flips replaces the lazy array's expression, a view of it is taken afterwards, and
+/// a region of the array (the view's, then a smaller one) is written; the write does not reach
+/// the array (`element 40` keeps the old value). Same family as finding 4.
 #[test]
-fn view_of_a_lazy_array_after_a_flipped_write_loses_a_write_through_it() {
+fn slice_write_after_a_flipped_write_and_a_view_of_the_lazy_array_is_lost() {
     check(Program {
         config: Config { staging: false, ..Config::default_engine() },
         math: true,
@@ -262,17 +262,18 @@ fn view_of_a_lazy_array_after_a_flipped_write_loses_a_write_through_it() {
             Binary { lhs: Var(0), rhs: Const(0.5), op: Minimum },
             Assign { target: 1, path: vec![InjFlip { axis: 0 }, InjFlip { axis: 0 }], rhs: Var(0) },
             View { src: 1, view: Slice { axis: 1, lo: 4, hi: 7 } },
-            Assign { target: 2, path: vec![InjSlice { axis: 1, lo: 1, hi: 3 }, InjFlip { axis: 0 }], rhs: Const(1.0) },
+            Assign { target: 1, path: vec![InjSlice { axis: 1, lo: 4, hi: 7 }, InjSlice { axis: 1, lo: 1, hi: 3 }, InjFlip { axis: 0 }], rhs: Const(1.0) },
         ],
     });
 }
 
-/// Finding 9: `v = x.slice(143..299); s = v.shift(3); v.assign(&s)`: the right-hand side reads
-/// the region being written at other elements than the one it stores, so the view is evaluated
-/// first (it is read before the write); the write was correct but the receiver `v` kept the
-/// evaluated old data instead of showing the assigned one (`v[0]` is 1.717 instead of 1.307).
+/// Finding 9: `v = x.slice(143..299); s = v.shift(3); x.slice_mut(143..299).assign(&s)`: the
+/// right-hand side reads the region being written at other elements than the one it stores, so
+/// the view is evaluated first (it is read before the write). The region must show the assigned
+/// data (formerly the receiver `v` of the write kept the evaluated old data: `v[0]` was 1.717
+/// instead of 1.307).
 #[test]
-fn assign_of_a_shift_of_the_written_region_shows_the_assigned_data() {
+fn assign_of_a_shift_of_the_written_region_reads_the_old_data() {
     check(Program {
         config: Config { staging: false, ..Config::default_engine() },
         math: true,
@@ -280,7 +281,7 @@ fn assign_of_a_shift_of_the_written_region_shows_the_assigned_data() {
             Input { dims: [300, 1, 1, 1], ty: F32, seed: 0 },
             View { src: 0, view: Slice { axis: 0, lo: 143, hi: 299 } },
             View { src: 1, view: ShiftCirc { offs: vec![3] } },
-            Assign { target: 1, path: vec![], rhs: Var(2) },
+            Assign { target: 0, path: vec![InjSlice { axis: 0, lo: 143, hi: 299 }], rhs: Var(2) },
         ],
     });
 }
@@ -325,10 +326,10 @@ fn sum_where_sees_a_later_write_to_the_equal_select() {
 
 /// Finding 14 (found while fixing finding 3; same family as finding 5): `cache` of `a` evaluates
 /// the arrays sharing work with it, among them the flipped view `v` of the equal expression `b`.
-/// The write through `v` then replaced `b`'s lazy expression but left `v`, already evaluated to
-/// the old data, alone (`v[6]` is `-1`, not `-2`).
+/// The write through `b.flip_mut(0)` then replaced `b`'s lazy expression and must leave `v`,
+/// already evaluated to the old data, alone (`v[6]` is `-1`).
 #[test]
-fn view_shows_the_written_data_after_a_cache_evaluated_the_shared_base_node() {
+fn view_keeps_the_old_data_after_a_cache_evaluated_the_shared_base_node() {
     check(Program {
         config: Config::default_engine(),
         math: false,
@@ -339,17 +340,17 @@ fn view_shows_the_written_data_after_a_cache_evaluated_the_shared_base_node() {
             Unary { src: 1, op: ToDf32 },
             View { src: 3, view: Flip { axis: 0 } },
             Cache { src: 2 },
-            Assign { target: 4, path: vec![], rhs: Const(-2.0) },
+            Assign { target: 3, path: vec![InjFlip { axis: 0 }], rhs: Const(-2.0) },
         ],
     });
 }
 
 /// Finding 15 (found while fixing finding 3; same cause as finding 14): a view that was
-/// evaluated (here by `eval`) and is then written through with an expression that reads it shows
-/// the data from before the write (`v[1]` is `1`, not `0`). Minimized from a program with a traced
-/// `iterate_all` (see the next test): no loop is needed.
+/// evaluated (here by `eval`), and an expression that reads it, written back through the same
+/// flipped region of the array: the view keeps the data from before the write (`v[1]` is `1`).
+/// Minimized from a program with a traced `iterate_all` (see the next test): no loop is needed.
 #[test]
-fn evaluated_view_written_with_an_expression_of_itself_shows_the_old_data() {
+fn evaluated_view_keeps_the_old_data_when_its_array_is_written_with_an_expression_of_it() {
     check(Program {
         config: Config::default_engine(),
         math: false,
@@ -359,14 +360,14 @@ fn evaluated_view_written_with_an_expression_of_itself_shows_the_old_data() {
             EvalVars { vars: vec![1] },
             View { src: 1, view: ShiftClamp { offs: vec![3, 0] } },
             Binary { lhs: Var(2), rhs: Const(2.0), op: Rem },
-            Assign { target: 1, path: vec![], rhs: Var(3) },
+            Assign { target: 0, path: vec![InjFlip { axis: 1 }], rhs: Var(3) },
         ],
     });
 }
 
 /// Finding 15, the original form: the view is evaluated because a traced `iterate_all` reads it.
 #[test]
-fn view_read_by_a_traced_loop_shows_the_old_data_after_a_write_through_it() {
+fn view_read_by_a_traced_loop_keeps_the_old_data_after_a_write_into_its_array() {
     check(Program {
         config: Config::default_engine(),
         math: false,
@@ -376,7 +377,7 @@ fn view_read_by_a_traced_loop_shows_the_old_data_after_a_write_through_it() {
             View { src: 0, view: Flip { axis: 1 } },
             Loop { kind: IterateAll, steps: 1, states: vec![1], body: vec![View { src: 2, view: ShiftClamp { offs: vec![3, 0] } }], next: vec![4] },
             Binary { lhs: Var(3), rhs: Const(2.0), op: Rem },
-            Assign { target: 2, path: vec![], rhs: Var(4) },
+            Assign { target: 0, path: vec![InjFlip { axis: 1 }], rhs: Var(4) },
         ],
     });
 }
@@ -501,12 +502,11 @@ fn transposed_assign_of_a_simplified_self_maximum_reads_overwritten_data() {
 }
 
 /// Finding 20 (GPU fuzz seed 5007): `v = lin.slice(3..6).flip(0)` is evaluated by `c = v.cache()`
-/// (`c` shares `v`'s buffer, like a clone), then `v.assign(&d)` where the base `lin` is a lazy
-/// expression: the write replaced the lazy base and `v` was given a view of it, but the buffer
-/// `v` had been evaluated into, and `c` with it, kept the old data (`c[0]` is `2.8125`, not
-/// `5.875`).
+/// (`c` shares `v`'s buffer, like a clone), then `lin.slice_mut(3..6).flip_mut(0).assign(&d)`
+/// where the base `lin` is a lazy expression: the write replaces the lazy base, and the buffer
+/// `v` had been evaluated into, and `c` with it, must keep the old data (`c[0]` is `5.875`).
 #[test]
-fn cache_of_an_evaluated_view_shows_a_write_through_the_view() {
+fn cache_of_an_evaluated_view_keeps_the_old_data_after_a_write_into_its_lazy_base() {
     check(Program {
         config: Config::default_engine(),
         math: false,
@@ -516,7 +516,7 @@ fn cache_of_an_evaluated_view_shows_a_write_through_the_view() {
             View { src: 1, view: Flip { axis: 0 } },
             Cache { src: 2 },
             Binary { lhs: Var(1), rhs: Const(0.5), op: Div },
-            Assign { target: 2, path: vec![], rhs: Var(4) },
+            Assign { target: 0, path: vec![InjSlice { axis: 0, lo: 3, hi: 6 }, InjFlip { axis: 0 }], rhs: Var(4) },
         ],
     });
 }
@@ -525,10 +525,10 @@ fn cache_of_an_evaluated_view_shows_a_write_through_the_view() {
 /// expression and a lazy slice write goes into it (the expression is replaced); `v = m.slice(..)`
 /// is a view of the replacement, then `m /= 1`. The compound assignment saw no sharing (it
 /// looked at the claims on the node `m` was created with, not on the replacement `v` holds), so
-/// it rebound `m` to a new expression reading the replacement, and the write through `v` went
-/// into a node `m` no longer denoted (`m[224]` is `0`, not `7`).
+/// it rebound `m` to a new expression reading the replacement, and the later slice write into
+/// `m` went into a node `m` no longer denoted (`m[224]` is `0`, not `7`).
 #[test]
-fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost() {
+fn slice_write_after_a_compound_assignment_of_a_lazy_array_is_lost() {
     check(Program {
         config: Config::default_engine(),
         math: true,
@@ -538,7 +538,7 @@ fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost() {
             Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 17, hi: 23 }, InjSlice { axis: 1, lo: 15, hi: 20 }], rhs: Const(1.0) },
             View { src: 1, view: Slice { axis: 0, lo: 1, hi: 13 } },
             Compound { target: 1, op: Div, rhs: Const(1.0) },
-            Assign { target: 2, path: vec![InjSlice { axis: 0, lo: 7, hi: 10 }, InjSlice { axis: 1, lo: 9, hi: 14 }], rhs: Const(7.0) },
+            Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 1, hi: 13 }, InjSlice { axis: 0, lo: 7, hi: 10 }, InjSlice { axis: 1, lo: 9, hi: 14 }], rhs: Const(7.0) },
         ],
     });
 }
@@ -546,7 +546,7 @@ fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost() {
 /// Finding 21 without simplification (`m /= 1` stays a division): the same failure, so the
 /// cause is not a simplification.
 #[test]
-fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost_without_simplify() {
+fn slice_write_after_a_compound_assignment_of_a_lazy_array_is_lost_without_simplify() {
     check(Program {
         config: Config { simplify: false, ..Config::default_engine() },
         math: true,
@@ -556,7 +556,7 @@ fn write_through_a_view_after_a_compound_assignment_of_its_lazy_base_is_lost_wit
             Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 17, hi: 23 }, InjSlice { axis: 1, lo: 15, hi: 20 }], rhs: Const(1.0) },
             View { src: 1, view: Slice { axis: 0, lo: 1, hi: 13 } },
             Compound { target: 1, op: Div, rhs: Const(1.0) },
-            Assign { target: 2, path: vec![InjSlice { axis: 0, lo: 7, hi: 10 }, InjSlice { axis: 1, lo: 9, hi: 14 }], rhs: Const(7.0) },
+            Assign { target: 1, path: vec![InjSlice { axis: 0, lo: 1, hi: 13 }, InjSlice { axis: 0, lo: 7, hi: 10 }, InjSlice { axis: 1, lo: 9, hi: 14 }], rhs: Const(7.0) },
         ],
     });
 }
@@ -606,6 +606,46 @@ fn iterate_all_with_a_class_test_defines_the_guard_library() {
             Compare { lhs: 0, rhs: Const(1.0), op: Le },
             Input { dims: [12, 1, 1, 1], ty: F32, seed: 1 },
             Loop { kind: IterateAll, steps: 11, states: vec![1], body: vec![Classify { src: 2, class: Finite }], next: vec![3] },
+        ],
+    });
+}
+
+/// Operands broadcast along their extents of 1: `[7, 1] + [1, 5]` is `[7, 5]`, in binary
+/// operations and `select`; `+=` repeats its right-hand side to the target's shape.
+#[test]
+fn extents_of_one_broadcast_along_each_axis() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [7, 5, 1, 1], ty: F32, seed: 0 },
+            AxisReduce { src: 0, axis: 1, op: Max },
+            AxisReduce { src: 0, axis: 0, op: Max },
+            Binary { lhs: Var(1), rhs: Var(2), op: Add },
+            Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
+            Select { mask: 4, a: Var(1), b: Var(2), ty: F32 },
+            Compound { target: 0, op: Add, rhs: Var(2) },
+        ],
+    });
+}
+
+/// A slice, flip or transpose, and a reshape of one, is read-only: `assign`, `put` and `write`
+/// into it fail with `InvalidShape` (a clone of the array is written through `slice_mut`).
+#[test]
+fn writes_into_read_only_views_fail() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [7, 5, 1, 1], ty: F32, seed: 0 },
+            View { src: 0, view: Slice { axis: 0, lo: 1, hi: 3 } },
+            Assign { target: 1, path: vec![], rhs: Const(1.0) },
+            Assign { target: 1, path: vec![InjFlip { axis: 0 }], rhs: Const(1.0) },
+            Put { target: 1, idx: vec![0], vals: Const(1.0) },
+            Write { target: 1, seed: 3 },
+            Reshape { src: 1, dims: [10, 1, 1, 1] },
+            Assign { target: 2, path: vec![], rhs: Const(1.0) },
+            Assign { target: 0, path: vec![InjSlice { axis: 0, lo: 1, hi: 3 }], rhs: Const(1.0) },
         ],
     });
 }

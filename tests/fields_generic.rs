@@ -120,10 +120,11 @@ fn records_of_records_and_tuples_keep_their_element_type() {
 fn a_df32_record_is_assigned_through_its_slices() {
     let ctx = Context::new().unwrap();
     let (hu, hv) = (host(7), host(8));
-    let w = dd(&ctx, &hu, &hv);
+    let mut w = dd(&ctx, &hu, &hv);
 
     // The mirror ghost rule of a wall: columns 0, 1 take minus columns 3, 2.
-    w.slice(0, ..2).assign(w.slice(0, 2..4).flip(0) * Df32::from(-1.0)).unwrap();
+    let rhs = w.slice(0, 2..4).flip(0) * Df32::from(-1.0);
+    w.slice_mut(0, ..2).assign(rhs).unwrap();
     for (got, h) in [(read(&w.u), &hu), (read(&w.v), &hv)] {
         for y in 0..4 {
             for x in 0..6 {
@@ -137,9 +138,9 @@ fn a_df32_record_is_assigned_through_its_slices() {
     }
 
     // The same by reference.
-    let w = dd(&ctx, &hu, &hv);
+    let mut w = dd(&ctx, &hu, &hv);
     let ghost = w.slice(0, 2..4).flip(0) * Df32::from(-1.0);
-    w.slice(0, ..2).assign(&ghost).unwrap();
+    w.slice_mut(0, ..2).assign(&ghost).unwrap();
     let got = read(&w.u);
     assert!((got[0] + hu[3]).abs() <= 1e-12);
     assert!((read(&ghost.u)[0] + hu[3]).abs() <= 1e-12, "the right-hand side keeps its values");

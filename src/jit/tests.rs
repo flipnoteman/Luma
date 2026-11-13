@@ -1565,17 +1565,18 @@ fn a_boundary_assignment_reading_the_target_is_one_kernel() {
     };
 
     // By value: the expression is private to the write, so it all fuses into it.
-    let w = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
+    let mut w = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
     let before = ctx.jit().stats();
-    w.slice(0, ..2).assign(w.slice(0, 2..4).flip(0) * -1.0).unwrap();
+    let rhs = w.slice(0, 2..4).flip(0) * -1.0;
+    w.slice_mut(0, ..2).assign(rhs).unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     check(&w);
 
     // By reference: the expression stays pending and reads the columns the write leaves alone.
-    let w = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
+    let mut w = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
     let g = w.slice(0, 2..4).flip(0) * -1.0;
     let before = ctx.jit().stats();
-    w.slice(0, ..2).assign(&g).unwrap();
+    w.slice_mut(0, ..2).assign(&g).unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     check(&w);
     let want_g: Vec<f32> = (0..nj).flat_map(|j| [-data[3 + ni * j], -data[2 + ni * j]]).collect();
@@ -1586,7 +1587,7 @@ fn a_boundary_assignment_reading_the_target_is_one_kernel() {
 fn assigning_an_expression_of_the_whole_target_is_one_in_place_kernel() {
     let ctx = ctx();
     let data = values(500, 41, -1.0, 1.0);
-    let w = f32s(&ctx, &data);
+    let mut w = f32s(&ctx, &data);
     let before = ctx.jit().stats();
     w.assign((&w * 2.0 + 1.0) * 0.5 - &w * 0.25).unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
@@ -1624,20 +1625,20 @@ fn a_record_ghost_assignment_is_one_kernel() {
         }
     };
 
-    let w = record(&data);
+    let mut w = record(&data);
     let inner = w.slice(0, 2..4).flip(0);
     let ghost: [Array<f32>; 4] = std::array::from_fn(|k| &inner[k] * 2.0 + &inner[(k + 1) % 4]);
     drop(inner);
     let before = ctx.jit().stats();
-    w.slice(0, ..2).assign(ghost).unwrap();
+    w.slice_mut(0, ..2).assign(ghost).unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     check(&w);
 
     // Kept alive and by reference: same values.
-    let w = record(&data);
+    let mut w = record(&data);
     let inner = w.slice(0, 2..4).flip(0);
     let ghost: [Array<f32>; 4] = std::array::from_fn(|k| &inner[k] * 2.0 + &inner[(k + 1) % 4]);
-    w.slice(0, ..2).assign(&ghost).unwrap();
+    w.slice_mut(0, ..2).assign(&ghost).unwrap();
     check(&w);
 }
 
@@ -2269,11 +2270,11 @@ fn a_padded_record_assigned_through_launches_nothing_until_it_is_read() {
     let data: Vec<Vec<f32>> = (0..4).map(|k| values(ni * nj, 110 + k, -1.0, 1.0)).collect();
     let q: [Array<f32>; 4] = std::array::from_fn(|k| Array::from_slice_on(&ctx, &data[k], [ni, nj]).unwrap());
     let p: [Array<f32>; 4] = q.map(|a| &a * 2.0 + 1.0);
-    let w = p.pad([(2, 0)], PadMode::Edge);
+    let mut w = p.pad([(2, 0)], PadMode::Edge);
     let ghost: [Array<f32>; 4] = std::array::from_fn(|k| w[k].slice(0, 2..4).flip(0) * -1.0);
 
     let before = ctx.jit().stats();
-    w.slice(0, ..2).assign(ghost).unwrap();
+    w.slice_mut(0, ..2).assign(ghost).unwrap();
     // The padded fields are still expressions: the write launches nothing.
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
     for k in 0..4 {
@@ -2565,10 +2566,11 @@ fn a_ghost_assignment_into_a_pending_array_launches_nothing() {
     let (ni, nj) = (8usize, 5usize);
     let data = values(ni * nj, 120, -1.0, 1.0);
     let x = Array::from_slice_on(&ctx, &data, [ni, nj]).unwrap();
-    let w = (&x * 2.0 + 1.0).pad([(2, 0)], PadMode::Edge);
+    let mut w = (&x * 2.0 + 1.0).pad([(2, 0)], PadMode::Edge);
 
     let before = ctx.jit().stats();
-    w.slice(0, ..2).assign(w.slice(0, 2..4).flip(0) * -1.0).unwrap();
+    let rhs = w.slice(0, 2..4).flip(0) * -1.0;
+    w.slice_mut(0, ..2).assign(rhs).unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
 
     let n = ni + 2;
@@ -2635,10 +2637,10 @@ mod euler {
     /// [`step`] that can also evaluate the padded state after the ghost cells were assigned.
     fn step_cached(q: &R, ni: usize, nj: usize, cache_before: bool, cache_after: bool) -> R {
         let padded = prim(q).pad([(1, 1), (1, 1)], PadMode::Edge);
-        let w = if cache_before { padded.cache() } else { padded };
+        let mut w = if cache_before { padded.cache() } else { padded };
         let g = w.slice(0, 1..2);
         let g = R { a: &g.a * 1.0, b: -&g.b, c: &g.c * 1.0, d: &g.d * 1.0 };
-        w.slice(0, ..1).assign(g).unwrap();
+        w.slice_mut(0, ..1).assign(g).unwrap();
         let w = if cache_after { w.cache() } else { w };
         let wi = w.slice(1, 1..nj + 1);
         let fi = rusanov(&wi.slice(0, 0..ni + 1), &wi.slice(0, 1..ni + 2));
@@ -2832,9 +2834,9 @@ fn clone_assign_step(u: &Array<f32>) -> Array<f32> {
     use crate::view::PadMode;
     let n = u.len();
     let w = u.pad([(1, 1)], PadMode::Edge);
-    let (left, right) = (w.clone(), w.clone());
-    left.slice(0, ..1).assign(0.5).unwrap();
-    right.slice(0, n + 1..).assign(0.25).unwrap();
+    let (mut left, mut right) = (w.clone(), w.clone());
+    left.slice_mut(0, ..1).assign(0.5).unwrap();
+    right.slice_mut(0, n + 1..).assign(0.25).unwrap();
     (w.slice(0, 1..n + 1) * 0.5 + left.slice(0, ..n) * 0.25 + right.slice(0, 2..n + 2) * 0.25) * 0.99 + 0.001
 }
 
@@ -2946,7 +2948,7 @@ fn check_readback_loop_with_writes(ctx: &Context, steps: usize, events: &[(usize
     const W: usize = 32;
     let u0 = values(W * W, 90, 0.0, 1.0);
     let mut source = values(W * W, 91, 0.0, 1.0);
-    let c = Array::from_slice_on(ctx, &source, [W, W]).unwrap();
+    let mut c = Array::from_slice_on(ctx, &source, [W, W]).unwrap();
     let mut u = &Array::from_slice_on(ctx, &u0, [W, W]).unwrap() * 1.0;
     let mut cpu = u0;
     for k in 0..steps {
@@ -2957,7 +2959,7 @@ fn check_readback_loop_with_writes(ctx: &Context, steps: usize, events: &[(usize
                     c.clone().write(&source).unwrap();
                 }
                 Rewrite::AssignSlice => {
-                    c.slice(0, 4..8).slice(1, 2..30).assign(0.75).unwrap();
+                    c.slice_mut(0, 4..8).slice(1, 2..30).assign(0.75).unwrap();
                     for i in 4..8 {
                         for j in 2..30 {
                             source[j * W + i] = 0.75; // axis 0 is the contiguous one
@@ -3063,11 +3065,11 @@ fn ghost_regions_are_computed_only_where_they_are_assigned() {
         ctx.jit().set_max_inlined(1536);
         ctx.jit().record_splits();
         let u = Array::from_slice_on(&ctx, &data, [n, m]).unwrap();
-        let w = u.pad([(2, 2), (2, 2)], PadMode::Edge);
+        let mut w = u.pad([(2, 2), (2, 2)], PadMode::Edge);
         let left = u.pad([(2, 0)], PadMode::Edge).slice(0, 0..2);
-        w.slice(0, ..2).slice(1, 2..m + 2).assign(ghost(&left)).unwrap();
+        w.slice_mut(0, ..2).slice(1, 2..m + 2).assign(ghost(&left)).unwrap();
         let bottom = u.pad([(0, 0), (2, 0)], PadMode::Edge).slice(1, 0..2);
-        w.slice(1, ..2).slice(0, 2..n + 2).assign(ghost(&bottom)).unwrap();
+        w.slice_mut(1, ..2).slice(0, 2..n + 2).assign(ghost(&bottom)).unwrap();
         let r = w.slice(0, 1..n + 1).slice(1, 2..m + 2) + w.slice(0, 3..n + 3).slice(1, 2..m + 2) + w.slice(0, 2..n + 2).slice(1, 1..m + 1)
             + w.slice(0, 2..n + 2).slice(1, 3..m + 3)
             - w.slice(0, 2..n + 2).slice(1, 2..m + 2) * 4.0;
@@ -3123,7 +3125,7 @@ fn a_sub_program_read_once_does_not_keep_what_it_reads_from_being_staged() {
     let n = 1000;
     let xs = values(n, 150, 0.5, 2.0);
     let (e, host) = long_expression(&f32s(&ctx, &xs), &xs);
-    let g = e.slice(0, 0..n - 2) + e.slice(0, 2..n);
+    let g = e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n);
     let r = g.slice(0, 1..n - 2) * 1.5 + 0.25;
     let before = ctx.jit().stats();
     let got = r.to_vec().unwrap();
@@ -3132,7 +3134,7 @@ fn a_sub_program_read_once_does_not_keep_what_it_reads_from_being_staged() {
     assert_eq!(staging.subs.len(), 1, "{staging:?}");
     let tx = staging.tile[0] as i32;
     assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([1, 0], [tx + 2, 0]), "{staging:?}");
-    let want: Vec<f32> = (0..n - 3).map(|i| (host[i + 1] + host[i + 3]) * 1.5 + 0.25).collect();
+    let want: Vec<f32> = (0..n - 3).map(|i| (host[i + 1] + host[i + 2] + host[i + 3]) * 1.5 + 0.25).collect();
     assert_close(&got, &want, 1e-4, 1e-4);
 }
 
@@ -3551,10 +3553,10 @@ fn stacks_of_every_element_type_read_views_and_take_writes() {
     // The stack is an array like any other: read through views (a slice picks a part), and
     // written in place.
     let parts = [&x * 2.0, &x * 3.0, &x * 4.0];
-    let stacked = crate::stack(0, [&parts[0], &parts[1], &parts[2]]);
+    let mut stacked = crate::stack(0, [&parts[0], &parts[1], &parts[2]]);
     let middle = stacked.slice(0, 1..2);
     assert_close(&middle.to_vec().unwrap(), &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(), 1e-6, 1e-6);
-    middle.assign(0.0).unwrap();
+    stacked.slice_mut(0, 1..2).assign(0.0).unwrap();
     let got = stacked.to_vec().unwrap();
     let want: Vec<f32> = xs.iter().flat_map(|&v| [v * 2.0, 0.0, v * 4.0]).collect();
     assert_close(&got, &want, 1e-6, 1e-6);
@@ -3645,13 +3647,15 @@ fn reshape_of_a_lazy_view_stays_lazy() {
     let got = lazy.to_vec().unwrap();
     assert_close(&got, &xs.iter().map(|v| v * 2.0 + 1.0).collect::<Vec<_>>(), 1e-6, 1e-6);
 
-    // A write into a reshaped slice goes to the data the reshape shares with that slice, not
-    // to the array the slice was taken from.
+    // A reshaped slice is a read-only view: writing needs a copy, which leaves `x` alone.
     let slice = x.slice(0, 2..3);
     let reshaped = slice.reshape([ni, nj]);
-    reshaped.assign(7.0).unwrap();
-    assert_eq!(reshaped.to_vec().unwrap(), vec![7.0; ni * nj]);
-    assert_eq!(slice.to_vec().unwrap(), vec![7.0; ni * nj]);
+    let mut view = reshaped.clone();
+    assert!(matches!(view.assign(7.0).unwrap_err().root(), crate::LumaError::InvalidShape(_)));
+    let mut copy = reshaped.copy();
+    copy.assign(7.0).unwrap();
+    assert_eq!(copy.to_vec().unwrap(), vec![7.0; ni * nj]);
+    assert_eq!(slice.to_vec().unwrap(), reshaped.to_vec().unwrap());
     assert_close(&x.to_vec().unwrap(), &xs, 0.0, 0.0);
 }
 
@@ -3665,4 +3669,95 @@ fn the_class_tests_of_a_float_array_fuse_into_one_kernel() {
     let got = damped.to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     assert_eq!(got, vec![3.0, 0.0, 0.0, -6.0, 0.0, 0.0]);
+}
+
+#[test]
+fn dynamic_views_ranges_gathers_and_scatters_reuse_one_pipeline() {
+    let ctx = ctx();
+    let xs = values(40, 5, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    // Slices at every offset of arrays of different extents: one kernel.
+    let before = ctx.jit().stats();
+    for k in 0..16 {
+        let y = x.slice(0, k..k + 4) * 2.0 + 1.0;
+        let want: Vec<f32> = xs[k..k + 4].iter().map(|v| v * 2.0 + 1.0).collect();
+        assert_close(&y.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    }
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!((d.built, d.hits), (1, 15));
+    let before = ctx.jit().stats();
+    for (w, h) in [(6, 5), (10, 3), (18, 7)] {
+        let data = values(w * h, 6, -1.0, 1.0);
+        let a = Array::from_slice_on(&ctx, &data, [w, h]).unwrap();
+        let y = a.slice(0, 1..w - 1).slice(1, 1..h) * 2.0 + 1.0;
+        assert_eq!(y.to_vec().unwrap().len(), (w - 2) * (h - 1));
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+    let before = ctx.jit().stats();
+    let grid = Array::from_slice_on(&ctx, &values(7 * 6, 7, -1.0, 1.0), [7, 6]).unwrap();
+    for (i0, j0) in [(0, 0), (1, 2), (2, 1)] {
+        let y = grid.slice(0, i0..i0 + 5).slice(1, j0..j0 + 3) * 2.0 + 1.0;
+        assert_eq!(y.to_vec().unwrap().len(), 15);
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+
+    // The view of a lazy sub-program, lowered into the kernel.
+    let a = f32s(&ctx, &xs);
+    let before = ctx.jit().stats();
+    for k in 0..8 {
+        let y = (&a + 1.0).slice(0, k..k + 3) * 2.0;
+        let want: Vec<f32> = xs[k..k + 3].iter().map(|v| (v + 1.0) * 2.0).collect();
+        assert_close(&y.to_vec().unwrap(), &want, 1e-6, 1e-6);
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+
+    // Ranges over several shapes and axes.
+    let before = ctx.jit().stats();
+    for n in [6usize, 9, 7] {
+        let r = Array::<f32>::range_on(&ctx, n, 0).unwrap().to_vec().unwrap();
+        assert_eq!(r, (0..n).map(|i| i as f32).collect::<Vec<_>>());
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+    let before = ctx.jit().stats();
+    for ([w, h], dim) in [([4usize, 8usize], 0usize), ([4, 8], 1), ([16, 4], 1)] {
+        let r = Array::<f32>::range_on(&ctx, [w, h], dim).unwrap().to_vec().unwrap();
+        let want: Vec<f32> = (0..w * h).map(|i| if dim == 0 { (i % w) as f32 } else { (i / w) as f32 }).collect();
+        assert_eq!(r, want);
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+    let r = Array::<f32>::range_on(&ctx, [3, 4], 1).unwrap().to_vec().unwrap();
+    assert_eq!(r, (0..12).map(|i| (i / 3) as f32).collect::<Vec<_>>());
+
+    // Gathers from sources of different lengths.
+    let before = ctx.jit().stats();
+    for n in [10usize, 20, 30] {
+        let src = f32s(&ctx, &xs[..n]);
+        let idx = Array::<u32>::from_slice_on(&ctx, &[0, 3, 100], 3).unwrap();
+        let got = src.take(&idx).to_vec().unwrap();
+        assert_eq!(got, vec![xs[0], xs[3], xs[n - 1]]);
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+
+    // Scatters into targets of different lengths.
+    let before = ctx.jit().stats();
+    for n in [6usize, 9, 12] {
+        let mut target = f32s(&ctx, &vec![0.0; n]);
+        let idx = Array::<u32>::from_slice_on(&ctx, &[1, 2], 2).unwrap();
+        target.put(&idx, f32s(&ctx, &[5.0, 6.0])).unwrap();
+        let mut want = vec![0.0; n];
+        want[1] = 5.0;
+        want[2] = 6.0;
+        assert_eq!(target.to_vec().unwrap(), want);
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+
+    // Region writes at every offset.
+    let mut w = f32s(&ctx, &xs);
+    let before = ctx.jit().stats();
+    for k in 0..8 {
+        w.slice_mut(0, k..k + 2).assign(1.5).unwrap();
+        let got = w.to_vec().unwrap();
+        assert_eq!(&got[k..k + 2], &[1.5, 1.5]);
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
 }

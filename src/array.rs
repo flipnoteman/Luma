@@ -7,7 +7,8 @@ use crate::context::{default_context, Context};
 use crate::gpu::pager::{Pin, Segment};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::GpuType;
-use crate::jit::{Held, Node, Readers, Src};
+use crate::builtin::UnOp;
+use crate::jit::{ElemTy, Held, Node, Op, OpKind, Readers, Src};
 use crate::reduce::Reduced;
 use crate::shape::Shape;
 use crate::view::ViewOf;
@@ -266,7 +267,7 @@ enum Repr {
 /// a cheap handle, not a copy: in-place operations (`+=`), [`Array::write`],
 /// [`Array::assign`] and kernels taking the array as `&mut` therefore change every array sharing
 /// the data, clones and reshapes alike. Lazy expressions recorded before the write keep the
-/// values they were recorded against. Use `&a * 1.0` for an independent copy.
+/// values they were recorded against. Use [`Array::copy`] for an independent copy.
 ///
 /// Dropping an array returns its buffer to the context's pool for reuse.
 #[derive(Debug)]
@@ -276,6 +277,9 @@ pub struct Array<T: GpuType> {
     repr: Repr,
     /// Set on views that write through to the array they read (see [`Array::slice`]).
     view: Option<Arc<ViewOf>>,
+    /// Set on slices, flips and transposes (and reshapes of them) taken through `&self`: they
+    /// read the array they came from but reject every write (see [`Array::slice_mut`]).
+    read_view: bool,
     _marker: PhantomData<T>,
 }
 
@@ -290,7 +294,7 @@ impl<T: GpuType> Clone for Array<T> {
             Repr::Poisoned(error) => Repr::Poisoned(Arc::clone(error)),
             Repr::Reduced(reduced) => Repr::Reduced(Arc::clone(reduced)),
         };
-        Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), _marker: PhantomData }
+        Array { ctx: self.ctx.clone(), shape: self.shape, repr, view: self.view.clone(), read_view: self.read_view, _marker: PhantomData }
     }
 }
 
@@ -300,40 +304,31 @@ impl<T: GpuType> Array<T> {
     /// Allocates a valid array of `shape` whose contents are unspecified.
     pub(crate) fn alloc(ctx: &Context, shape: Shape) -> Result<Self> {
         let len = shape.validate()?;
-        // The segments get their buffers when first pinned.
-        Ok(Array {
-            ctx: ctx.clone(),
-            shape,
-            repr: Repr::Valid(Arc::new(Storage::new(ctx, len, std::mem::size_of::<T>()))),
-            view: None,
-            _marker: PhantomData,
-        })
+        Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(Storage::new(ctx, len, std::mem::size_of::<T>())))))
+    }
+
+    fn new(ctx: &Context, shape: Shape, repr: Repr) -> Self {
+        Array { ctx: ctx.clone(), shape, repr, view: None, read_view: false, _marker: PhantomData }
     }
 
     pub(crate) fn from_storage(ctx: &Context, shape: Shape, storage: Arc<Storage>) -> Self {
-        Array { ctx: ctx.clone(), shape, repr: Repr::Valid(storage), view: None, _marker: PhantomData }
+        Self::new(ctx, shape, Repr::Valid(storage))
     }
 
     /// An array that is the (not yet evaluated) result of `node`.
     pub(crate) fn from_node(ctx: &Context, shape: Shape, node: Arc<Node>) -> Self {
-        Array { ctx: ctx.clone(), shape, repr: Repr::Lazy(Held::new(node)), view: None, _marker: PhantomData }
+        Self::new(ctx, shape, Repr::Lazy(Held::new(node)))
     }
 
     /// The (not yet recorded) reduction `reduced` as an array of `shape`.
     pub(crate) fn from_reduced(ctx: &Context, shape: Shape, reduced: Arc<Reduced>) -> Self {
-        Array { ctx: ctx.clone(), shape, repr: Repr::Reduced(reduced), view: None, _marker: PhantomData }
+        Self::new(ctx, shape, Repr::Reduced(reduced))
     }
 
     /// Placeholder sharing this array's buffer under a fresh [`Storage`] id, for [`Array::iterate`].
     pub(crate) fn probe(&self) -> std::result::Result<Self, Failure> {
         let storage = self.storage()?;
-        Ok(Array {
-            ctx: self.ctx.clone(),
-            shape: self.shape,
-            repr: Repr::Valid(Arc::new(Storage::alias(storage))),
-            view: None,
-            _marker: PhantomData,
-        })
+        Ok(Self::new(&self.ctx, self.shape, Repr::Valid(Arc::new(Storage::alias(storage)))))
     }
 
     /// A placeholder with a new buffer of unspecified contents, for tracing a step that is
@@ -344,7 +339,7 @@ impl<T: GpuType> Array<T> {
     }
 
     pub(crate) fn poisoned(ctx: &Context, shape: Shape, error: Arc<LumaError>) -> Self {
-        Array { ctx: ctx.clone(), shape, repr: Repr::Poisoned(error), view: None, _marker: PhantomData }
+        Self::new(ctx, shape, Repr::Poisoned(error))
     }
 
     /// Turns the outcome of an operation into the array it returns: a failure becomes a poisoned
@@ -400,13 +395,7 @@ impl<T: GpuType> Array<T> {
                 }
             }
             let storage = Storage::adopt(ctx, len, std::mem::size_of::<T>(), buffers);
-            return Ok(Array {
-                ctx: ctx.clone(),
-                shape,
-                repr: Repr::Valid(Arc::new(storage)),
-                view: None,
-                _marker: PhantomData,
-            });
+            return Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(storage))));
         }
         let array = Self::alloc(ctx, shape)?;
         let storage = array.storage().map_err(Failure::into_error)?;
@@ -530,9 +519,28 @@ impl<T: GpuType> Array<T> {
         }
     }
 
-    /// This array marked as writing through to what `view` reads (see [`ViewOf`]).
+    /// This array marked as writing through to what `view` reads (see [`ViewMut`]).
     pub(crate) fn with_view(mut self, view: ViewOf) -> Self {
         self.view = Some(Arc::new(view));
+        self
+    }
+
+    /// Marks this array as a read-only view (rejects every write).
+    pub(crate) fn into_read_view(mut self) -> Self {
+        self.read_view = true;
+        self
+    }
+
+    /// Whether this array is a slice, flip or transpose taken through `&self` (or a reshape of
+    /// one): it reads the array it came from but rejects every write.
+    pub(crate) fn is_read_view(&self) -> bool {
+        self.read_view
+    }
+
+    /// This array without the link to what it is a view of: an ordinary array holding the same data.
+    pub(crate) fn without_view(mut self) -> Self {
+        self.view = None;
+        self.read_view = false;
         self
     }
 
@@ -686,6 +694,12 @@ impl<T: GpuType> Array<T> {
     /// elements. The upload is recorded in order with the operations before it and does not wait
     /// for the GPU: operations recorded earlier still see the old contents.
     pub fn write(&mut self, data: &[T]) -> Result<()> {
+        if self.is_read_view() {
+            self.check()?;
+            return Err(LumaError::InvalidShape(
+                "cannot write into a read-only view; use slice_mut, flip_mut or transpose_mut".into(),
+            ));
+        }
         let storage = self.storage().map_err(Failure::into_error)?;
         if data.len() != self.len() {
             return Err(LumaError::LengthMismatch { expected: self.len(), actual: data.len() });
@@ -699,6 +713,57 @@ impl<T: GpuType> Array<T> {
         Ok(())
     }
 
+    /// An independent array holding the current contents: later writes, in-place operations and
+    /// kernels taking either array as `&mut` do not reach the other (unlike [`Clone::clone`] and
+    /// [`Array::reshape`], which share the data). The copy of a slice, flip or transpose is an
+    /// ordinary array. Lazy for `f32`, `u32`, `f64` and [`Df32`](crate::Df32) elements: the copy
+    /// fuses into whatever reads it and moves no data of its own; other element types are copied
+    /// on the device at once. A poisoned array copies to a poisoned array with the same error.
+    #[track_caller]
+    pub fn copy(&self) -> Array<T> {
+        self.copy_at(Location::caller())
+    }
+
+    /// [`Array::copy`] reporting failures at `location`.
+    pub(crate) fn copy_at(&self, location: &'static Location<'static>) -> Array<T> {
+        let result = self.run_copy(location);
+        Self::resolve(&self.ctx, self.shape, result, "copy", location)
+    }
+
+    fn run_copy(&self, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
+        let src = self.src()?;
+        if let Some(ty) = Self::scalar_ty() {
+            let args = [src, Src::unused(), Src::unused()];
+            let node = crate::jit::create(&self.ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ty), args, "copy", location)?;
+            return Ok(Self::from_node(&self.ctx, self.shape, node));
+        }
+        let from = self.storage()?;
+        let out = Self::alloc(&self.ctx, self.shape)?;
+        let to = out.storage()?;
+        for j in 0..from.segments() {
+            let (source, target) = (from.pin(j)?, to.pin(j)?);
+            let bytes = (from.range(j).len() * from.elem()) as u64;
+            self.ctx.copy(source.buffer(), 0, target.buffer(), 0, bytes)?;
+        }
+        Ok(out)
+    }
+
+    /// The element type of the built-in arithmetic, if `T` is one.
+    fn scalar_ty() -> Option<ElemTy> {
+        let id = std::any::TypeId::of::<T>();
+        if id == std::any::TypeId::of::<f32>() {
+            Some(ElemTy::F32)
+        } else if id == std::any::TypeId::of::<u32>() {
+            Some(ElemTy::U32)
+        } else if id == std::any::TypeId::of::<f64>() {
+            Some(ElemTy::F64)
+        } else if id == std::any::TypeId::of::<crate::gpu_type::Df32>() {
+            Some(ElemTy::Df32)
+        } else {
+            None
+        }
+    }
+
     // -- Views --
 
     /// The same data with a different shape. Only metadata changes: the result shares the
@@ -709,8 +774,8 @@ impl<T: GpuType> Array<T> {
     /// not run) stays lazy: it is another handle on the pending view, which fuses into whatever
     /// reads it, so `x.slice(0, k..k + 1).reshape([ni, nj])` of an `[n, ni, nj]` array reads `x`
     /// inside the kernel that uses it. The result does not write through to the array the view
-    /// was taken from: [`Array::assign`] on it writes the data it shares with that view. Any other
-    /// array that has not run yet is evaluated first (the data it shares must exist).
+    /// was taken from, and the reshape of a read-only slice, flip or transpose is read-only too.
+    /// Any other array that has not run yet is evaluated first (the data it shares must exist).
     #[track_caller]
     pub fn reshape(&self, shape: impl Into<Shape>) -> Array<T> {
         let location = Location::caller();
@@ -740,7 +805,14 @@ impl<T: GpuType> Array<T> {
         if let Repr::Lazy(held) = &self.repr
             && held.latest().is_pending_view()
         {
-            return Ok(Array { ctx: self.ctx.clone(), shape, repr: Repr::Lazy(held.share()), view: None, _marker: PhantomData });
+            return Ok(Array {
+                ctx: self.ctx.clone(),
+                shape,
+                repr: Repr::Lazy(held.share()),
+                view: None,
+                read_view: self.read_view,
+                _marker: PhantomData,
+            });
         }
         // A view shares the buffer, so the array has to exist.
         let storage = self.storage()?;
@@ -749,6 +821,7 @@ impl<T: GpuType> Array<T> {
             shape,
             repr: Repr::Valid(Arc::clone(storage)),
             view: None,
+            read_view: self.read_view,
             _marker: PhantomData,
         })
     }

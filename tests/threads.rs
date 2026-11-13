@@ -33,8 +33,8 @@ fn padded(u: &[f32]) -> Vec<f32> {
 
 fn padded_step(u: &Array<f32>) -> Array<f32> {
     let n = u.len();
-    let w = u.pad([(1, 1)], PadMode::Edge);
-    w.slice(0, ..1).assign(0.5).unwrap();
+    let mut w = u.pad([(1, 1)], PadMode::Edge);
+    w.slice_mut(0, ..1).assign(0.5).unwrap();
     let c = (w.slice(0, 1..n + 1) * 0.5 + w.slice(0, ..n) * 0.25 + w.slice(0, 2..n + 2) * 0.25).cache();
     c * 0.99 + 0.001
 }
@@ -310,8 +310,8 @@ fn iterate_all_of_lazily_assigned_steps_on_a_shared_context() {
         let u = on(&ctx, &u0);
         let [u] = iterate_all([&u], 13, |[u]| {
             let n = u.len();
-            let w = u.pad([(1, 1)], PadMode::Edge);
-            w.slice(0, ..1).assign(0.5).unwrap();
+            let mut w = u.pad([(1, 1)], PadMode::Edge);
+            w.slice_mut(0, ..1).assign(0.5).unwrap();
             [(w.slice(0, 1..n + 1) * 0.5 + w.slice(0, ..n) * 0.25 + w.slice(0, 2..n + 2) * 0.25) * 0.99 + 0.001]
         });
         let mut w = u0;
@@ -493,10 +493,10 @@ fn assigned_clones_of_a_lazy_padded_state_on_a_shared_context() {
     fn step(u: &Array<f32>) -> Array<f32> {
         let n = u.len();
         let w = u.pad([(1, 1)], PadMode::Edge);
-        let left = w.clone();
-        let right = w.clone();
-        left.slice(0, ..1).assign(0.5).unwrap();
-        right.slice(0, n + 1..).assign(0.25).unwrap();
+        let mut left = w.clone();
+        let mut right = w.clone();
+        left.slice_mut(0, ..1).assign(0.5).unwrap();
+        right.slice_mut(0, n + 1..).assign(0.25).unwrap();
         (w.slice(0, 1..n + 1) * 0.5 + left.slice(0, ..n) * 0.25 + right.slice(0, 2..n + 2) * 0.25) * 0.99 + 0.001
     }
     fn host(u: &[f32]) -> Vec<f32> {

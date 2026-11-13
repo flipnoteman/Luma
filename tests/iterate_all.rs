@@ -220,8 +220,8 @@ fn a_step_that_assigns_a_boundary_into_a_padded_temporary_is_replayed() {
     let calls = std::cell::Cell::new(0);
     let step = |[u]: &[Array<f32>; 1]| {
         calls.set(calls.get() + 1);
-        let w = u.pad([(1, 1)], PadMode::Edge);
-        w.slice(0, ..1).assign(0.0).unwrap();
+        let mut w = u.pad([(1, 1)], PadMode::Edge);
+        w.slice_mut(0, ..1).assign(0.0).unwrap();
         [w.slice(0, 1..n + 1) * 0.5 + w.slice(0, 0..n) * 0.25 + w.slice(0, 2..n + 2) * 0.25]
     };
     let [got] = iterate_all([&x], 37, step);
@@ -253,8 +253,8 @@ fn iterate_replays_a_step_with_a_cache_and_an_assignment() {
     let n = 30;
     let x = f32s_on(&ctx, &values(n, 15, 0.0, 1.0));
     let step = |u: &Array<f32>| {
-        let w = u.pad([(1, 1)], PadMode::Mirror);
-        w.slice(0, n + 1..).assign(0.5).unwrap();
+        let mut w = u.pad([(1, 1)], PadMode::Mirror);
+        w.slice_mut(0, n + 1..).assign(0.5).unwrap();
         (w.slice(0, 1..n + 1) * 0.5 + w.slice(0, 2..n + 2) * 0.25 + u.cache().shift(1) * 0.25) * 0.9
     };
     let got = x.iterate(21, step);

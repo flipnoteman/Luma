@@ -73,26 +73,36 @@ mod view;
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceKind};
 pub use error::{LumaError, Result};
-pub use fields::{FieldOp, Fields};
+pub use fields::Fields;
 pub use gpu_type::{Df32, GpuType, ScalarType};
-pub use kernel::{
-    uniform, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize,
-};
+pub use kernel::{uniform, view, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
 pub use until::{iterate_until_all, Cond, History, Run, Series, Stat, StopReason, Until};
 pub use linalg::{solve_block_tridiagonal, solve_block_tridiagonal_from, solve_tridiagonal, solve_tridiagonal_from};
 pub use jit::cost::CostModel;
 pub use jit::fusion_limit;
-pub use ops::{eval_all, select, Operand, Rhs};
+pub use ops::{eval_all, select, Operand};
 pub use reduce::Reduction;
 pub use scalar::Scalar;
 pub use profile::{FusionSplit, KernelTiming, Profile, SplitReason};
 pub use shape::{Offsets, Shape};
 pub use tuning::TuningProfile;
 pub use luma_derive::Fields;
-pub use view::{concat, stack, stack_slice, PadMode};
+pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
+
+/// Plumbing of `#[derive(Fields)]`; not part of the public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::fields::FieldOp;
+    pub use crate::ops::Rhs;
+}
 
 /// The `wgpu` crate luma is built on. wgpu types appear in the public API ([`LumaError`]
 /// variants, [`Context::features`]); naming them through this re-export guarantees the same
 /// version.
 pub use wgpu;
+
+/// The `encase` crate [`uniform`] values are written with; deriving `encase::ShaderType` on a
+/// struct makes it a [`UniformValue`]. Naming it through this re-export guarantees the same
+/// version.
+pub use encase;

@@ -238,8 +238,9 @@ fn a_step_that_assigns_into_its_state_leaves_the_initial_state_alone() {
     let x0 = values(n, 35, 0.5, 1.5);
     let x = Array::from_slice_on(&ctx, &x0, n).unwrap();
     let step = |s: &One, _: &Array<f32>| {
-        s.0.slice(0, ..1).assign(0.0).unwrap();
-        (&s.0 * 0.5 + 1.0,)
+        let mut c = s.0.clone();
+        c.slice_mut(0, ..1).assign(0.0).unwrap();
+        (&c * 0.5 + 1.0,)
     };
     let run = iterate_until_all(
         (Array::from_slice_on(&ctx, &x0, n).unwrap(),),

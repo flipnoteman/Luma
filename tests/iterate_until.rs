@@ -88,7 +88,8 @@ fn assigning_into_the_state_of_a_step_is_read_only() {
     let error = std::cell::RefCell::new(None);
     let _ = x
         .iterate_until(3, 0.0, |u| {
-            if let Err(e) = u.slice(0, ..1).assign(0.0) {
+            let mut c = u.clone();
+            if let Err(e) = c.slice_mut(0, ..1).assign(0.0) {
                 *error.borrow_mut() = Some(e);
             }
             u * 0.5

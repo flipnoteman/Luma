@@ -305,10 +305,11 @@ fn muscl_faces(w: &Prim, axis: usize, n: usize, dir: usize) -> Cons {
 }
 
 fn ghosted(w: Prim, g: usize, o: Opts) -> Prim {
-    let w = w.pad([(g, g), (g, g)], PadMode::Edge);
+    let mut w = w.pad([(g, g), (g, g)], PadMode::Edge);
     if o.wall {
         let src = if g == 1 { w.slice(0, 1..2) } else { w.slice(0, 2..4).flip(0) };
-        w.slice(0, ..g).assign(mirror(src)).unwrap();
+        let rhs = mirror(src);
+        w.slice_mut(0, ..g).assign(rhs).unwrap();
     }
     if o.cache { w.cache() } else { w }
 }
@@ -967,19 +968,19 @@ fn writes(b: &mut Bench) {
         let ctx = b.ctx.clone();
         {
             let ha = values(sw * sh, 1, 0.2, 1.2);
-            let w = Array::from_slice_on(&ctx, &ha, [sw, sh]).unwrap();
-            w.slice(0, ..1).assign(0.0).unwrap();
+            let mut w = Array::from_slice_on(&ctx, &ha, [sw, sh]).unwrap();
+            w.slice_mut(0, ..1).assign(0.0).unwrap();
             let mut want = ha.clone();
             for y in 0..sh {
                 want[sw * y] = 0.0;
             }
             check("assign/ghost_scalar", &w.to_vec().unwrap(), &want, 0.0, 0.0);
         }
-        let w = Array::<f32>::full_on(&ctx, [big, big], 1.0).unwrap();
+        let mut w = Array::<f32>::full_on(&ctx, [big, big], 1.0).unwrap();
         w.eval().unwrap();
         let mut f = || {
             for _ in 0..100 {
-                w.slice(0, ..1).assign(0.0).unwrap();
+                w.slice_mut(0, ..1).assign(0.0).unwrap();
             }
         };
         b.time("assign/ghost_scalar", &format!("{big}x{big}"), Tp::PerOp(reps, "us/assign"), false, &mut f);
@@ -989,8 +990,9 @@ fn writes(b: &mut Bench) {
         let ctx = b.ctx.clone();
         {
             let ha = values(sw * sh, 2, 0.2, 1.2);
-            let w = Array::from_slice_on(&ctx, &ha, [sw, sh]).unwrap();
-            w.slice(0, ..2).assign(w.slice(0, 2..4).flip(0) * -1.0).unwrap();
+            let mut w = Array::from_slice_on(&ctx, &ha, [sw, sh]).unwrap();
+            let rhs = w.slice(0, 2..4).flip(0) * -1.0;
+            w.slice_mut(0, ..2).assign(rhs).unwrap();
             let mut want = ha.clone();
             for y in 0..sh {
                 want[sw * y] = -ha[3 + sw * y];
@@ -998,11 +1000,12 @@ fn writes(b: &mut Bench) {
             }
             check("assign/ghost_mirror", &w.to_vec().unwrap(), &want, 0.0, 0.0);
         }
-        let w = Array::<f32>::full_on(&ctx, [big, big], 1.0).unwrap();
+        let mut w = Array::<f32>::full_on(&ctx, [big, big], 1.0).unwrap();
         w.eval().unwrap();
         let mut f = || {
             for _ in 0..100 {
-                w.slice(0, ..2).assign(w.slice(0, 2..4).flip(0) * -1.0).unwrap();
+                let rhs = w.slice(0, 2..4).flip(0) * -1.0;
+                w.slice_mut(0, ..2).assign(rhs).unwrap();
             }
         };
         b.time("assign/ghost_mirror", &format!("{big}x{big}"), Tp::PerOp(reps, "us/assign"), false, &mut f);
@@ -1013,14 +1016,14 @@ fn writes(b: &mut Bench) {
         {
             let ha = values(4096, 3, 0.2, 1.2);
             let a = Array::from_slice_on(&ctx, &ha, 4096).unwrap();
-            let w = Array::<f32>::zeros_on(&ctx, 4096).unwrap();
+            let mut w = Array::<f32>::zeros_on(&ctx, 4096).unwrap();
             w.assign(&a * 2.0).unwrap();
             let want: Vec<f32> = ha.iter().map(|v| v * 2.0).collect();
             check("assign/full", &w.to_vec().unwrap(), &want, 0.0, 0.0);
         }
         let n = if b.quick { 1 << 20 } else { 1 << 26 };
         let a = Array::<f32>::full_on(&ctx, n, 1.5).unwrap();
-        let w = Array::<f32>::zeros_on(&ctx, n).unwrap();
+        let mut w = Array::<f32>::zeros_on(&ctx, n).unwrap();
         a.eval().unwrap();
         let mut f = || w.assign(&a * 2.0).unwrap();
         b.time("assign/full", &format!("{n}"), Tp::Bytes(8.0 * n as f64), false, &mut f);
@@ -1033,9 +1036,9 @@ fn writes(b: &mut Bench) {
             (upload(ctx, &host, w, h), host)
         };
         {
-            let (q, host) = fields(&ctx, sw, sh, 10);
+            let (mut q, host) = fields(&ctx, sw, sh, 10);
             let ghost = q.slice(0, 2..4).flip(0) * -1.0;
-            q.slice(0, ..2).assign(ghost).unwrap();
+            q.slice_mut(0, ..2).assign(ghost).unwrap();
             let got = host_of(&q);
             for k in 0..4 {
                 let mut want = host[k].clone();
@@ -1047,11 +1050,11 @@ fn writes(b: &mut Bench) {
             }
         }
         let host: [Vec<f32>; 4] = std::array::from_fn(|_| vec![1.0; rec * rec]);
-        let q = upload(&ctx, &host, rec, rec);
+        let mut q = upload(&ctx, &host, rec, rec);
         let mut f = || {
             for _ in 0..100 {
                 let ghost = q.slice(0, 2..4).flip(0) * -1.0;
-                q.slice(0, ..2).assign(ghost).unwrap();
+                q.slice_mut(0, ..2).assign(ghost).unwrap();
             }
         };
         b.time("assign/record4", &format!("4x{rec}x{rec}"), Tp::PerOp(reps, "us/assign"), false, &mut f);
@@ -1063,7 +1066,7 @@ fn writes(b: &mut Bench) {
             let n = 4096;
             let idx = permutation(n, 5);
             let vals = values(n, 6, 0.2, 1.2);
-            let x = Array::<f32>::zeros_on(&ctx, n).unwrap();
+            let mut x = Array::<f32>::zeros_on(&ctx, n).unwrap();
             x.put(&Array::from_slice_on(&ctx, &idx, n).unwrap(), Array::from_slice_on(&ctx, &vals, n).unwrap()).unwrap();
             let mut want = vec![0.0f32; n];
             for i in 0..n {
@@ -1074,7 +1077,7 @@ fn writes(b: &mut Bench) {
         let n = put_n;
         let idx = Array::from_slice_on(&ctx, &permutation(n, 7), n).unwrap();
         let vals = Array::from_slice_on(&ctx, &values(n, 8, 0.2, 1.2), n).unwrap();
-        let x = Array::<f32>::zeros_on(&ctx, n).unwrap();
+        let mut x = Array::<f32>::zeros_on(&ctx, n).unwrap();
         let mut f = || x.put(&idx, &vals).unwrap();
         b.time("put/scatter", &format!("{n}"), Tp::Bytes(12.0 * n as f64), false, &mut f);
     });

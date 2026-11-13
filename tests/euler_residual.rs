@@ -105,8 +105,9 @@ fn the_euler_residual_of_records_matches_an_f64_host_implementation() {
     let q = Cons { rho: upload(0), mu: upload(1), mv: upload(2), e: upload(3) };
 
     // Primitive state with two ghost layers; the left wall mirrors the first two interior columns.
-    let w = prim(&q).pad([(2, 2), (2, 2)], PadMode::Edge);
-    w.slice(0, ..2).assign(mirror(w.slice(0, 2..4).flip(0))).unwrap();
+    let mut w = prim(&q).pad([(2, 2), (2, 2)], PadMode::Edge);
+    let ghost = mirror(w.slice(0, 2..4).flip(0));
+    w.slice_mut(0, ..2).assign(ghost).unwrap();
 
     // Faces `0..=NI` along the first axis, interior rows only.
     let l = w.slice(0, 1..NI + 2).slice(1, 2..NJ + 2);

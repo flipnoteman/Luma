@@ -132,9 +132,9 @@ fn a_padded_record_takes_its_ghost_cells_by_assignment() {
     let ctx = Context::new().unwrap();
     let ha = host(10);
     let a = cons(&ctx, &ha);
-    let w = a.pad([(2, 2), (0, 0)], PadMode::Edge);
+    let mut w = a.pad([(2, 2), (0, 0)], PadMode::Edge);
     let ghost = w.slice(0, 2..4).flip(0) * -1.0;
-    w.slice(0, ..2).assign(&ghost).unwrap();
+    w.slice_mut(0, ..2).assign(&ghost).unwrap();
     let got = fields(&w);
     for k in 0..4 {
         for y in 0..4 {
@@ -163,9 +163,9 @@ fn a_record_with_some_fields_evaluated_takes_ghost_cells_like_one_without() {
             let p = (f * 2.0).pad([(2, 2), (0, 0)], PadMode::Edge);
             if evaluate.contains(&k) { p.cache() } else { p }
         };
-        let w = Cons { rho: padded(0, &a.rho), mu: padded(1, &a.mu), mv: padded(2, &a.mv), e: padded(3, &a.e) };
+        let mut w = Cons { rho: padded(0, &a.rho), mu: padded(1, &a.mu), mv: padded(2, &a.mv), e: padded(3, &a.e) };
         let ghost = w.slice(0, 2..4).flip(0) * -1.0;
-        w.slice(0, ..2).assign(ghost).unwrap();
+        w.slice_mut(0, ..2).assign(ghost).unwrap();
         fields(&w)
     };
     let lazy = ghosted(&[]);
@@ -205,7 +205,7 @@ fn put_and_take_work_on_every_field() {
     for k in 0..4 {
         assert_eq!(got[k], vec![ha[k][3], ha[k][0], ha[k][19]]);
     }
-    let dst = cons(&ctx, &host(13)).map(|x| x * 0.0);
+    let mut dst = cons(&ctx, &host(13)).map(|x| x * 0.0);
     dst.put(&idx, &t).unwrap();
     let got = fields(&dst);
     for k in 0..4 {

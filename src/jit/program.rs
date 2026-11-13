@@ -13,6 +13,7 @@ use crate::profile::SplitReason;
 
 use super::codegen::Tile;
 use super::inline::Judgement;
+use super::params::{Parameterized, ViewSpec};
 use super::launch::force_group;
 use super::staging::Staging;
 use super::{lock, Args, Edge, Flattening, ElemTy, JitState, Node, Op, OpKind, Scalar, ShiftKind, Src, ViewMap};
@@ -88,6 +89,10 @@ pub(crate) enum Tail {
     /// buffer holds interleaved in blocks of `block` elements: element `i` of part `k` goes to
     /// `(i / block) * total * block + k * block + i % block` (see `jit::stack`).
     Stack { total: u32, first: u32, block: u32 },
+    /// [`Tail::StoreMapped`] with the numbers of the view in the uniform (see `params`).
+    ParamStoreMapped { id: u16, spec: ViewSpec },
+    /// [`Tail::Scatter`] with `len` in uniform slot `len_slot`.
+    ParamScatter { len_slot: u32 },
 }
 
 /// Everything the source of a fused kernel depends on, and nothing it does not (buffers and
@@ -129,6 +134,9 @@ pub(crate) struct FusedKey {
     /// (see `builtin::df_library`); set when the program runs arithmetic or casts of a `Df32`
     /// (`reads_guard`), or reduces one.
     pub(crate) guard: Option<u32>,
+    /// Set by `JitState::kernel`: the numbers of views, gathers and the scatter are read from the
+    /// uniform, and this is what the lowering of the key is (see `params`).
+    pub(crate) params: Option<Arc<Parameterized>>,
 }
 
 /// Whether the WGSL of `instr` calls a function of the double-float library
@@ -169,6 +177,7 @@ impl std::hash::Hash for FusedKey {
         self.tile.hash(state);
         self.staging.hash(state);
         self.guard.hash(state);
+        self.params.hash(state);
     }
 }
 
@@ -195,7 +204,7 @@ impl FusedKey {
     /// (and the workgroup-memory staging of `codegen::plan_tile`).
     pub(crate) fn inlines(&self) -> bool {
         self.instrs.iter().chain(self.subs.iter().flatten()).any(|instr| {
-            matches!(instr.op.kind, OpKind::Shift(ShiftKind::View { .. } | ShiftKind::Take { .. })) && matches!(instr.args[0], Ref::Sub(_))
+            matches!(instr.op.kind, OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. })) && matches!(instr.args[0], Ref::Sub(_))
         })
     }
 
@@ -229,8 +238,8 @@ impl FusedKey {
         match self.tail {
             Tail::Store if self.outputs.len() > 1 => format!("Fused[{}]({names}) {ty}", self.outputs.len()),
             Tail::Store => format!("Fused({names}) {ty}"),
-            Tail::StoreMapped(_) => format!("FusedAssign({names}) {ty}"),
-            Tail::Scatter { .. } => format!("FusedPut({names}) {ty}"),
+            Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => format!("FusedAssign({names}) {ty}"),
+            Tail::Scatter { .. } | Tail::ParamScatter { .. } => format!("FusedPut({names}) {ty}"),
             Tail::Stack { .. } => format!("FusedStack({names}) {ty}"),
             Tail::Reduce(ops) => {
                 let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
@@ -562,6 +571,7 @@ fn zero_shift(kind: ShiftKind) -> ShiftKind {
         ShiftKind::Linear => ShiftKind::Linear,
         ShiftKind::View { map, .. } => ShiftKind::View { map: ViewMap::identity(map.src), edge: Edge::None },
         ShiftKind::Take { len } => ShiftKind::View { map: ViewMap::identity([len, 1, 1, 1]), edge: Edge::None },
+        ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => kind,
     }
 }
 
@@ -819,7 +829,7 @@ impl Flattener {
         let sub = self.sub(g, kid, node)?;
         let (amount, total) = match kind {
             ShiftKind::Linear => (self.constant(Scalar::u32(0)), self.constant(Scalar::u32(node.len() as u32))),
-            ShiftKind::Dims { .. } | ShiftKind::View { .. } | ShiftKind::Take { .. } => (Ref::Unused, Ref::Unused),
+            ShiftKind::Dims { .. } | ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } => (Ref::Unused, Ref::Unused),
         };
         let value = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
         self.instrs.push(Instr { op: Op::new(OpKind::Shift(kind), node.op().out_ty()), args: [sub, amount, total] });
@@ -867,6 +877,7 @@ impl Flattener {
                 tile: None,
                 staging: None,
                 guard,
+                params: None,
             },
             inputs: self.inputs,
             scalars: self.scalars,
@@ -1666,6 +1677,7 @@ impl Recipe {
                 tile: None,
                 staging: None,
                 guard: self.guard,
+                params: None,
             },
             inputs,
             scalars,
@@ -1976,6 +1988,7 @@ mod validate_tests {
             tile: None,
             staging: None,
             guard: None,
+            params: None,
         }
     }
 

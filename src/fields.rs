@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use crate::array::Array;
 use crate::builtin::BinOp;
-use crate::error::Result;
+use crate::error::{LumaError, Result};
 use crate::gpu_type::ScalarType;
 use crate::jit::assign::{self, Region};
 use crate::jit;
 use crate::ops::{eval_all, select_at, Rhs};
-use crate::shape::Offsets;
-use crate::view::{finish, PadMode};
+use crate::shape::{Offsets, Shape};
+use crate::view::{finish, PadMode, ViewMut};
 
 /// The operator of a record operation (an implementation detail of `#[derive(Fields)]`).
 #[doc(hidden)]
@@ -69,6 +69,9 @@ pub trait Fields: Sized {
     /// Calls `f` with every array, in declaration order.
     fn each<'a>(&'a self, f: &mut dyn FnMut(&'a Array<Self::Elem>));
 
+    /// Calls `f` with every array, mutably, in declaration order.
+    fn each_mut<'a>(&'a mut self, f: &mut dyn FnMut(&'a mut Array<Self::Elem>));
+
     /// Builds a record from `COUNT` arrays taken from `next`, in declaration order.
     fn build(next: &mut dyn FnMut() -> Array<Self::Elem>) -> Self;
 
@@ -106,11 +109,21 @@ pub trait Fields: Sized {
         acc.expect("a record has at least one field")
     }
 
-    /// [`Array::slice`] of every field.
+    /// [`Array::slice`] of every field: read-only, like the slice of an array.
     #[track_caller]
-    fn slice(&self, axis: usize, range: impl RangeBounds<usize> + Clone) -> Self {
+    fn slice(&self, axis: usize, range: impl RangeBounds<usize>) -> Self {
         let location = Location::caller();
-        self.map(|a| a.slice_at(axis, range.clone(), location))
+        let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
+        self.map(|a| a.slice_at(axis, bounds, false, location))
+    }
+
+    /// [`Array::slice_mut`] of every field: the region of the record that writes through.
+    #[track_caller]
+    fn slice_mut(&mut self, axis: usize, range: impl RangeBounds<usize>) -> ViewMut<'_, Self> {
+        let location = Location::caller();
+        let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
+        let inner = self.map(|a| a.slice_at(axis, bounds, true, location));
+        ViewMut { inner, owner: self }
     }
 
     /// [`Array::pad`] of every field.
@@ -124,14 +137,44 @@ pub trait Fields: Sized {
     #[track_caller]
     fn flip(&self, axis: usize) -> Self {
         let location = Location::caller();
-        self.map(|a| a.flip_at(axis, location))
+        self.map(|a| a.flip_at(axis, false, location))
+    }
+
+    /// [`Array::flip_mut`] of every field.
+    #[track_caller]
+    fn flip_mut(&mut self, axis: usize) -> ViewMut<'_, Self> {
+        let location = Location::caller();
+        let inner = self.map(|a| a.flip_at(axis, true, location));
+        ViewMut { inner, owner: self }
     }
 
     /// [`Array::transpose`] of every field.
     #[track_caller]
     fn transpose(&self) -> Self {
         let location = Location::caller();
-        self.map(|a| a.transpose_at(location))
+        self.map(|a| a.transpose_at(false, location))
+    }
+
+    /// [`Array::transpose_mut`] of every field.
+    #[track_caller]
+    fn transpose_mut(&mut self) -> ViewMut<'_, Self> {
+        let location = Location::caller();
+        let inner = self.map(|a| a.transpose_at(true, location));
+        ViewMut { inner, owner: self }
+    }
+
+    /// [`Array::copy`] of every field: an independent record.
+    #[track_caller]
+    fn copy(&self) -> Self {
+        let location = Location::caller();
+        self.map(|a| a.copy_at(location))
+    }
+
+    /// [`Array::broadcast_to`] of every field.
+    #[track_caller]
+    fn broadcast_to(&self, shape: impl Into<Shape>) -> Self {
+        let (location, shape) = (Location::caller(), shape.into());
+        self.map(|a| a.broadcast_to_at(shape, location))
     }
 
     /// [`Array::shift`] of every field.
@@ -179,96 +222,26 @@ pub trait Fields: Sized {
         from_vec(out)
     }
 
-    /// Writes `rhs` into the arrays this record's fields are slices, flips or transposes of
-    /// (see [`Array::assign`]), field by field, in one kernel (several outputs). `rhs` is a
-    /// record (`&rec`, or `rec` by value, which lets its expressions fuse into the write).
-    /// `w.slice(0, ..2).assign(mirror(w.slice(0, 2..4).flip(0)))` fills the ghost cells of a
-    /// whole state. Fields whose base is still a pending expression are not written at all:
+    /// Writes `rhs` into the arrays of this record, field by field, in one kernel (several
+    /// outputs). `rhs` is a record (`&rec`, or `rec` by value, which lets its expressions fuse
+    /// into the write). Through a region of the record, write with [`Fields::slice_mut`],
+    /// [`Fields::flip_mut`] or [`Fields::transpose_mut`] ([`ViewMut::assign`]):
+    /// `w.slice_mut(0, ..2).assign(mirror(w.slice(0, 2..4).flip(0)))` fills the ghost cells of
+    /// a whole state. Fields whose base is still a pending expression are not written at all:
     /// the record denotes the new values from then on and nothing is launched, so a padded
     /// record with ghost cells assigned stays one expression.
     #[track_caller]
-    fn assign(&self, rhs: impl Borrow<Self>) -> Result<()> {
-        let location = Location::caller();
-        let theirs = rhs.borrow().arrays();
-        // Everything that can fail is checked before the first field is written.
-        let mut checked = Ok(());
-        let mut k = 0;
-        self.each(&mut |a| {
-            if checked.is_ok() {
-                checked = a.src().and_then(|_| a.check_write(Rhs::Array(theirs[k])));
-            }
-            k += 1;
-        });
-        let ctx = self.arrays()[0].context();
-        // Fields of pending bases are written lazily; the others are collected for the kernel.
-        let mut eager = vec![true; Self::COUNT];
-        if checked.is_ok() {
-            let mut k = 0;
-            self.each(&mut |a| {
-                if checked.is_ok() {
-                    match a.assign_lazy(Rhs::Array(theirs[k]), location) {
-                        Ok(done) => eager[k] = !done,
-                        Err(error) => checked = Err(error),
-                    }
-                }
-                k += 1;
-            });
-        }
-        let regions: crate::ops::Outcome<Vec<Region>> = match checked {
-            Err(error) => Err(error),
-            Ok(()) => {
-                // The pending bases the remaining fields are views of are evaluated together,
-                // one kernel per length, instead of one kernel per field when each region forces
-                // its own. A failure surfaces when the field's region forces its base.
-                let mut bases = Vec::new();
-                let mut k = 0;
-                self.each(&mut |a| {
-                    if eager[k]
-                        && let Some(view) = a.view()
-                        && let Some(held) = &view.held
-                        && held.latest().is_pending()
-                    {
-                        bases.push(Arc::clone(held.latest()));
-                    }
-                    k += 1;
-                });
-                let _ = jit::force_group(&bases);
-                let mut regions = Vec::with_capacity(Self::COUNT);
-                let mut failure = None;
-                let mut k = 0;
-                self.each(&mut |a| {
-                    if eager[k] && failure.is_none() {
-                        match a.region(Rhs::Array(theirs[k])) {
-                            Ok(region) => regions.push(region),
-                            Err(error) => failure = Some(error),
-                        }
-                    }
-                    k += 1;
-                });
-                match failure {
-                    Some(error) => Err(error),
-                    None => Ok(regions),
-                }
-            }
-        };
-        // Only the regions hold the right-hand side now: an owned record's temporaries are
-        // private to the kernel that stores them.
-        drop(rhs);
-        let result = match regions {
-            Ok(regions) if regions.is_empty() => Ok(()),
-            Ok(regions) => assign::assign(ctx, regions, "assign", location),
-            Err(error) => Err(error),
-        };
-        finish(result, "assign", location)
+    fn assign(&mut self, rhs: impl Borrow<Self>) -> Result<()> {
+        assign_fields(self, rhs, Location::caller())
     }
 
     /// [`Array::put`] on every field: `self.k[indices[i]] = values.k[i]`, one kernel per field.
     #[track_caller]
-    fn put(&self, indices: &Array<u32>, values: &Self) -> Result<()> {
+    fn put(&mut self, indices: &Array<u32>, values: &Self) -> Result<()> {
         let theirs = values.arrays();
         let mut result = Ok(());
         let mut k = 0;
-        self.each(&mut |a| {
+        self.each_mut(&mut |a| {
             if result.is_ok() {
                 result = a.put(indices, theirs[k]);
             }
@@ -328,6 +301,95 @@ pub trait Fields: Sized {
     }
 }
 
+/// [`Fields::assign`] on a record that is not borrowed mutably (the regions of a
+/// [`ViewMut`] write through shared handles).
+pub(crate) fn assign_fields<F: Fields>(
+    target: &F,
+    rhs: impl Borrow<F>,
+    location: &'static Location<'static>,
+) -> Result<()> {
+    let theirs = rhs.borrow().arrays();
+    // Everything that can fail is checked before the first field is written.
+    let mut checked = Ok(());
+    let mut k = 0;
+    target.each(&mut |a| {
+        if checked.is_ok() {
+            checked = if a.is_read_view() {
+                a.src().and_then(|_| {
+                    Err(LumaError::InvalidShape(
+                        "cannot assign through a read-only view; use slice_mut, flip_mut or transpose_mut".into(),
+                    )
+                    .into())
+                })
+            } else {
+                a.src().and_then(|_| a.check_write(Rhs::Array(theirs[k])))
+            };
+        }
+        k += 1;
+    });
+    let ctx = target.arrays()[0].context();
+    // Fields of pending bases are written lazily; the others are collected for the kernel.
+    let mut eager = vec![true; F::COUNT];
+    if checked.is_ok() {
+        let mut k = 0;
+        target.each(&mut |a| {
+            if checked.is_ok() {
+                match a.assign_lazy(Rhs::Array(theirs[k]), location) {
+                    Ok(done) => eager[k] = !done,
+                    Err(error) => checked = Err(error),
+                }
+            }
+            k += 1;
+        });
+    }
+    let regions: crate::ops::Outcome<Vec<Region>> = match checked {
+        Err(error) => Err(error),
+        Ok(()) => {
+            // The pending bases the remaining fields are views of are evaluated together,
+            // one kernel per length, instead of one kernel per field when each region forces
+            // its own. A failure surfaces when the field's region forces its base.
+            let mut bases = Vec::new();
+            let mut k = 0;
+            target.each(&mut |a| {
+                if eager[k]
+                    && let Some(view) = a.view()
+                    && let Some(held) = &view.held
+                    && held.latest().is_pending()
+                {
+                    bases.push(Arc::clone(held.latest()));
+                }
+                k += 1;
+            });
+            let _ = jit::force_group(&bases);
+            let mut regions = Vec::with_capacity(F::COUNT);
+            let mut failure = None;
+            let mut k = 0;
+            target.each(&mut |a| {
+                if eager[k] && failure.is_none() {
+                    match a.region(Rhs::Array(theirs[k])) {
+                        Ok(region) => regions.push(region),
+                        Err(error) => failure = Some(error),
+                    }
+                }
+                k += 1;
+            });
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(regions),
+            }
+        }
+    };
+    // Only the regions hold the right-hand side now: an owned record's temporaries are
+    // private to the kernel that stores them.
+    drop(rhs);
+    let result = match regions {
+        Ok(regions) if regions.is_empty() => Ok(()),
+        Ok(regions) => assign::assign(ctx, regions, "assign", location),
+        Err(error) => Err(error),
+    };
+    finish(result, "assign", location)
+}
+
 /// `f(field, other field)` for every field.
 fn zip_vec<F: Fields>(
     lhs: &F,
@@ -354,6 +416,10 @@ impl<T: ScalarType> Fields for Array<T> {
         f(self);
     }
 
+    fn each_mut<'a>(&'a mut self, f: &mut dyn FnMut(&'a mut Array<Self::Elem>)) {
+        f(self);
+    }
+
     fn build(next: &mut dyn FnMut() -> Array<Self::Elem>) -> Self {
         next()
     }
@@ -366,6 +432,12 @@ impl<F: Fields, const N: usize> Fields for [F; N] {
     fn each<'a>(&'a self, f: &mut dyn FnMut(&'a Array<Self::Elem>)) {
         for field in self {
             field.each(f);
+        }
+    }
+
+    fn each_mut<'a>(&'a mut self, f: &mut dyn FnMut(&'a mut Array<Self::Elem>)) {
+        for field in self {
+            field.each_mut(f);
         }
     }
 
@@ -384,6 +456,12 @@ macro_rules! tuple_fields {
                 let ($f, $($n,)*) = self;
                 $f.each(f);
                 $($n.each(f);)*
+            }
+
+            fn each_mut<'a>(&'a mut self, f: &mut dyn FnMut(&'a mut Array<Self::Elem>)) {
+                let ($f, $($n,)*) = self;
+                $f.each_mut(f);
+                $($n.each_mut(f);)*
             }
 
             fn build(next: &mut dyn FnMut() -> Array<Self::Elem>) -> Self {

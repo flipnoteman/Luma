@@ -7,10 +7,14 @@
 //! * A clone, and the result of `cache`, is another handle on the same data (the `Rc` is shared).
 //! * Every other operation creates a new array holding the value as of now: a lazy array is the
 //!   value as of when it was written, so later writes never reach it.
-//! * A slice, flip or transpose (of a view, composed) remembers the array it is a view of and
-//!   the index map: `assign` writes through the map into that array's data, and shows the
-//!   assigned data itself; views taken earlier keep their data.
+//! * A slice, flip or transpose taken through the read methods (and a clone or reshape of one) is
+//!   read-only: `assign`, `put`, `write` and `+=` on it fail with `InvalidShape`. A writable
+//!   region (`slice_mut`, `flip_mut`, `transpose_mut`, composed) remembers the array it is a
+//!   region of and the index map: `assign` writes through the map into that array's data, and
+//!   shows the assigned data itself; views taken earlier keep their data.
 //! * `write`, `+=` and `put` change the data the handle shares with its clones, not other arrays.
+//! * Binary operations, comparisons and `select` broadcast along the extents of 1 of each
+//!   operand; `+=` broadcasts its right-hand side to the fixed shape of the target.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -190,8 +194,10 @@ pub struct HostArray {
     pub dims: Dims,
     pub ty: Ty,
     cell: Rc<RefCell<Cell>>,
-    /// The array this one is a slice, flip or transpose of, and the map into it.
+    /// For a writable region (`slice_mut`, ...): the array it is a region of, and the map into it.
     view: Option<(Rc<RefCell<Cell>>, ViewMap)>,
+    /// A slice, flip or transpose of the read methods (or a clone or reshape of one): writes fail.
+    read_only: bool,
 }
 
 pub type Res<T> = Result<T, ErrKind>;
@@ -212,6 +218,42 @@ fn coords(i: usize, dims: Dims) -> [usize; 4] {
 fn flat(c: [usize; 4], dims: Dims) -> usize {
     let s = strides(dims);
     (0..4).map(|a| c[a] * s[a]).sum()
+}
+
+/// The shape two operands of shapes `a` and `b` broadcast to: per axis the common extent, or the
+/// other one where one side has extent 1; `None` if an axis has two extents that differ from 1.
+fn broadcast_dims(a: Dims, b: Dims) -> Option<Dims> {
+    let mut out = a;
+    for k in 0..4 {
+        out[k] = match (a[k], b[k]) {
+            (x, y) if x == y => x,
+            (1, y) => y,
+            (x, 1) => x,
+            _ => return None,
+        };
+    }
+    Some(out)
+}
+
+/// `data` of an array of shape `from` read at every cell of shape `to`, repeating along the axes
+/// where `from` has extent 1; `None` unless every extent of `from` is `to`'s or 1.
+fn spread(data: &[f64], from: Dims, to: Dims) -> Option<Vec<f64>> {
+    if (0..4).any(|k| from[k] != to[k] && from[k] != 1) {
+        return None;
+    }
+    Some(
+        (0..len_of(to))
+            .map(|i| {
+                let mut c = coords(i, to);
+                for k in 0..4 {
+                    if from[k] == 1 {
+                        c[k] = 0;
+                    }
+                }
+                data[flat(c, from)]
+            })
+            .collect(),
+    )
 }
 
 /// `v` as a value of `ty` (what a store of that type does to it).
@@ -341,7 +383,7 @@ impl HostArray {
     pub fn new(dims: Dims, ty: Ty, data: Vec<f64>) -> HostArray {
         assert_eq!(data.len(), len_of(dims));
         let data = data.into_iter().map(|v| store(ty, v)).collect();
-        HostArray { dims, ty, cell: Rc::new(RefCell::new(Cell { data })), view: None }
+        HostArray { dims, ty, cell: Rc::new(RefCell::new(Cell { data })), view: None, read_only: false }
     }
 
     pub fn len(&self) -> usize {
@@ -353,9 +395,9 @@ impl HostArray {
         self.cell.borrow().data.clone()
     }
 
-    /// The array that `cache` returns: the same data, no view relation.
+    /// The array that `cache` returns: the same data, no view relation, writable.
     pub fn cached(&self) -> HostArray {
-        HostArray { view: None, ..self.clone() }
+        HostArray { view: None, read_only: false, ..self.clone() }
     }
 
     /// A new array holding the elements now (`self * 1`).
@@ -397,21 +439,16 @@ impl HostArray {
         HostArray::new(self.dims, ty, data)
     }
 
-    /// The two operands of `self op rhs` as vectors of the result's shape, broadcasting a
-    /// one-element operand.
+    /// The two operands of `self op rhs` as vectors of the result's shape: along every axis the
+    /// extents are equal or one of them is 1, and that operand is repeated.
     fn operands(&self, rhs: Rhs<'_>) -> Res<(Dims, Vec<f64>, Vec<f64>)> {
         match rhs {
             Rhs::Val(v) => Ok((self.dims, self.data(), vec![v; self.len()])),
             Rhs::Array(o) => {
-                if self.dims == o.dims {
-                    Ok((self.dims, self.data(), o.data()))
-                } else if o.len() == 1 {
-                    Ok((self.dims, self.data(), vec![o.data()[0]; self.len()]))
-                } else if self.len() == 1 {
-                    Ok((o.dims, vec![self.data()[0]; o.len()], o.data()))
-                } else {
-                    Err(ErrKind::ShapeMismatch)
-                }
+                let dims = broadcast_dims(self.dims, o.dims).ok_or(ErrKind::ShapeMismatch)?;
+                let a = spread(&self.data(), self.dims, dims).ok_or(ErrKind::ShapeMismatch)?;
+                let b = spread(&o.data(), o.dims, dims).ok_or(ErrKind::ShapeMismatch)?;
+                Ok((dims, a, b))
             }
         }
     }
@@ -433,16 +470,14 @@ impl HostArray {
         Ok(HostArray::new(dims, Ty::U32, data))
     }
 
-    /// `mask != 0 ? a : b` with the shape of the mask; a branch is an array of that shape, one
-    /// element or a value.
+    /// `mask != 0 ? a : b` with the shape of the mask; a branch is a value or an array whose
+    /// extents are the mask's or 1 (repeated along those axes).
     pub fn select(&self, a: Rhs<'_>, b: Rhs<'_>, ty: Ty) -> Res<HostArray> {
         let n = self.len();
         let branch = |rhs: Rhs<'_>| -> Res<Vec<f64>> {
             match rhs {
                 Rhs::Val(v) => Ok(vec![v; n]),
-                Rhs::Array(o) if o.dims == self.dims => Ok(o.data()),
-                Rhs::Array(o) if o.len() == 1 => Ok(vec![o.data()[0]; n]),
-                Rhs::Array(_) => Err(ErrKind::ShapeMismatch),
+                Rhs::Array(o) => spread(&o.data(), o.dims, self.dims).ok_or(ErrKind::ShapeMismatch),
             }
         };
         let (a, b) = (branch(a)?, branch(b)?);
@@ -484,45 +519,82 @@ impl HostArray {
             .collect()
     }
 
-    /// The view of `self` through `map`. Without an edge rule it is injective and writes through.
+    /// The array `self` reads through `map`, holding the values now. Without an edge rule it is a
+    /// slice, flip or transpose, which is read-only like luma's.
     fn read_through(&self, map: ViewMap, edge: Edge) -> HostArray {
         let data = self.gather(&map, edge);
         let mut out = HostArray::new(map.out, self.ty, data);
-        if edge == Edge::None {
-            out.view = Some(match &self.view {
-                Some((base, inner)) => (Rc::clone(base), inner.then(&map)),
-                None => (Rc::clone(&self.cell), map),
-            });
-        }
+        out.read_only = edge == Edge::None;
         out
     }
 
-    pub fn slice(&self, axis: usize, lo: usize, hi: usize) -> Res<HostArray> {
+    /// The region of `self` through `map` that writes through (`slice_mut`, `flip_mut`,
+    /// `transpose_mut`, and the refinements of a region); a read-only `self` has none.
+    fn write_through(&self, map: ViewMap) -> Res<HostArray> {
+        if self.read_only {
+            return Err(ErrKind::InvalidShape);
+        }
+        let mut out = HostArray::new(map.out, self.ty, self.gather(&map, Edge::None));
+        out.view = Some(match &self.view {
+            Some((base, inner)) => (Rc::clone(base), inner.then(&map)),
+            None => (Rc::clone(&self.cell), map),
+        });
+        Ok(out)
+    }
+
+    fn slice_map(&self, axis: usize, lo: usize, hi: usize) -> Res<ViewMap> {
         if axis >= 4 || lo >= hi || hi > self.dims[axis] {
             return Err(ErrKind::InvalidShape);
         }
         let mut map = ViewMap::identity(self.dims);
         map.out[axis] = hi - lo;
         map.axes[axis].start = lo as i64;
-        Ok(self.read_through(map, Edge::None))
+        Ok(map)
     }
 
-    pub fn flip(&self, axis: usize) -> Res<HostArray> {
+    fn flip_map(&self, axis: usize) -> Res<ViewMap> {
         if axis >= 4 {
             return Err(ErrKind::InvalidShape);
         }
         let mut map = ViewMap::identity(self.dims);
         map.axes[axis] = Axis { from: axis, start: self.dims[axis] as i64 - 1, step: -1 };
-        Ok(self.read_through(map, Edge::None))
+        Ok(map)
     }
 
-    pub fn transpose(&self) -> HostArray {
+    fn transpose_map(&self) -> ViewMap {
         let d = self.dims;
         let mut map = ViewMap::identity(d);
         map.out = [d[1], d[0], d[2], d[3]];
         map.axes[0].from = 1;
         map.axes[1].from = 0;
-        self.read_through(map, Edge::None)
+        map
+    }
+
+    pub fn slice(&self, axis: usize, lo: usize, hi: usize) -> Res<HostArray> {
+        Ok(self.read_through(self.slice_map(axis, lo, hi)?, Edge::None))
+    }
+
+    pub fn flip(&self, axis: usize) -> Res<HostArray> {
+        Ok(self.read_through(self.flip_map(axis)?, Edge::None))
+    }
+
+    pub fn transpose(&self) -> HostArray {
+        self.read_through(self.transpose_map(), Edge::None)
+    }
+
+    /// `slice` that writes through (`slice_mut`, or `slice` of a writable region).
+    pub fn slice_mut(&self, axis: usize, lo: usize, hi: usize) -> Res<HostArray> {
+        self.write_through(self.slice_map(axis, lo, hi)?)
+    }
+
+    /// `flip` that writes through.
+    pub fn flip_mut(&self, axis: usize) -> Res<HostArray> {
+        self.write_through(self.flip_map(axis)?)
+    }
+
+    /// `transpose` that writes through.
+    pub fn transpose_mut(&self) -> Res<HostArray> {
+        self.write_through(self.transpose_map())
     }
 
     /// `widths[k]` cells before and after along axis `k`.
@@ -584,7 +656,7 @@ impl HostArray {
     }
 
     /// The same data (shared, like `cache`) with other dimensions of as many elements, and no
-    /// view of another array.
+    /// region of another array; the reshape of a read-only view is read-only.
     pub fn reshaped(&self, dims: Dims) -> HostArray {
         assert_eq!(len_of(dims), self.len());
         HostArray { dims, view: None, ..self.clone() }
@@ -703,9 +775,12 @@ impl HostArray {
         }
     }
 
-    /// Writes `rhs` into the array this one is a view of (this one itself if it is none), and
-    /// makes this one show `rhs`.
+    /// Writes `rhs` into the array this region is of (this one itself if it is no region), and
+    /// makes this one show `rhs`; a read-only view fails.
     pub fn assign(&self, rhs: Rhs<'_>) -> Res<()> {
+        if self.read_only {
+            return Err(ErrKind::InvalidShape);
+        }
         let values = self.values_of(rhs)?;
         if let Some((base, map)) = &self.view {
             let mut base = base.borrow_mut();
@@ -720,7 +795,7 @@ impl HostArray {
 
     /// `self[idx[i]] = values[i]` for the `idx[i] < len`; `values` has the shape of `idx`.
     pub fn put(&self, idx: &HostArray, values: Rhs<'_>) -> Res<()> {
-        if self.view.is_some() {
+        if self.read_only || self.view.is_some() {
             return Err(ErrKind::InvalidShape);
         }
         let values = match values {
@@ -737,8 +812,11 @@ impl HostArray {
         Ok(())
     }
 
-    /// Replaces the elements (for every handle on the data).
+    /// Replaces the elements (for every handle on the data); a read-only view fails.
     pub fn write(&self, values: &[f64]) -> Res<()> {
+        if self.read_only {
+            return Err(ErrKind::InvalidShape);
+        }
         if values.len() != self.len() {
             return Err(ErrKind::LengthMismatch);
         }
@@ -746,13 +824,15 @@ impl HostArray {
         Ok(())
     }
 
-    /// `self = self op rhs` on the shared data.
+    /// `self = self op rhs` on the shared data; the right-hand side is repeated along its extents
+    /// of 1 up to the shape of `self`, which does not grow. A read-only view fails.
     pub fn compound(&self, op: BinOp, rhs: Rhs<'_>) -> Res<()> {
+        if self.read_only {
+            return Err(ErrKind::InvalidShape);
+        }
         let b = match rhs {
             Rhs::Val(v) => vec![v; self.len()],
-            Rhs::Array(o) if o.dims == self.dims => o.data(),
-            Rhs::Array(o) if o.len() == 1 => vec![o.data()[0]; self.len()],
-            Rhs::Array(_) => return Err(ErrKind::ShapeMismatch),
+            Rhs::Array(o) => spread(&o.data(), o.dims, self.dims).ok_or(ErrKind::ShapeMismatch)?,
         };
         let data = self.data().into_iter().zip(b).map(|(a, b)| apply_bin(self.ty, op, a, store(self.ty, b))).collect();
         self.cell.borrow_mut().data = data;
@@ -816,7 +896,7 @@ mod tests {
         let b = a.clone();
         let old = a.binary(BinOp::Mul, Rhs::Val(1.0), false).unwrap();
         let earlier = a.slice(0, 0, 2).unwrap();
-        let v = b.slice(0, 1, 3).unwrap().flip(0).unwrap();
+        let v = b.slice_mut(0, 1, 3).unwrap().flip_mut(0).unwrap();
         v.assign(Rhs::Array(&line(&[10.0, 20.0]))).unwrap();
         assert_eq!(a.data(), [1.0, 20.0, 10.0, 4.0]);
         assert_eq!(b.data(), [1.0, 20.0, 10.0, 4.0]);
@@ -840,6 +920,31 @@ mod tests {
         x.put(&idx, Rhs::Array(&line(&[1.0, 2.0, 3.0]))).unwrap();
         assert_eq!(x.data(), [0.0, 2.0, 0.0, 0.0, 1.0]);
         assert_eq!(x.slice(0, 0, 2).unwrap().put(&idx, Rhs::Val(1.0)), Err(ErrKind::InvalidShape));
+    }
+
+    #[test]
+    fn read_only_views_reject_every_write_and_every_region_of_them() {
+        let a = line(&[1.0, 2.0, 3.0, 4.0]);
+        let v = a.slice(0, 0, 2).unwrap();
+        let idx = HostArray::new([1, 1, 1, 1], Ty::U32, vec![0.0]);
+        assert_eq!(v.assign(Rhs::Val(0.0)), Err(ErrKind::InvalidShape));
+        assert_eq!(v.put(&idx, Rhs::Val(0.0)), Err(ErrKind::InvalidShape));
+        assert_eq!(v.write(&[5.0, 6.0]), Err(ErrKind::InvalidShape));
+        assert_eq!(v.compound(BinOp::Add, Rhs::Val(1.0)), Err(ErrKind::InvalidShape));
+        assert_eq!(v.slice_mut(0, 0, 1).err(), Some(ErrKind::InvalidShape));
+        assert_eq!(v.flip_mut(0).err(), Some(ErrKind::InvalidShape));
+        assert_eq!(v.transpose_mut().err(), Some(ErrKind::InvalidShape));
+        // A clone and a reshape of one are read-only too; a cache and a copy are writable.
+        assert_eq!(v.clone().write(&[5.0, 6.0]), Err(ErrKind::InvalidShape));
+        assert_eq!(v.reshaped([1, 2, 1, 1]).assign(Rhs::Val(0.0)), Err(ErrKind::InvalidShape));
+        v.cached().write(&[5.0, 6.0]).unwrap();
+        assert_eq!(v.data(), [5.0, 6.0]);
+        v.copied().write(&[7.0, 8.0]).unwrap();
+        assert_eq!(v.data(), [5.0, 6.0]);
+        assert_eq!(a.data(), [1.0, 2.0, 3.0, 4.0]);
+        // The array itself has writable regions, which compose.
+        a.slice_mut(0, 1, 4).unwrap().flip_mut(0).unwrap().assign(Rhs::Array(&line(&[9.0, 8.0, 7.0]))).unwrap();
+        assert_eq!(a.data(), [1.0, 7.0, 8.0, 9.0]);
     }
 
     #[test]
@@ -870,5 +975,31 @@ mod tests {
         assert_eq!(HostArray::concat(0, &[&a, &one]).unwrap().data(), [1.0, 2.0, 3.0, 10.0]);
         let u = HostArray::new([1, 1, 1, 1], Ty::U32, vec![0.0]);
         assert_eq!(u.binary(BinOp::Sub, Rhs::Val(1.0), false).unwrap().data(), [f64::from(u32::MAX)]);
+    }
+
+    #[test]
+    fn operations_broadcast_per_axis_over_extents_of_one() {
+        let col = HostArray::new([3, 1, 1, 1], Ty::F32, vec![1.0, 2.0, 3.0]);
+        let row = HostArray::new([1, 2, 1, 1], Ty::F32, vec![10.0, 20.0]);
+        let outer = col.binary(BinOp::Mul, Rhs::Array(&row), false).unwrap();
+        assert_eq!(outer.dims, [3, 2, 1, 1]);
+        assert_eq!(outer.data(), [10.0, 20.0, 30.0, 20.0, 40.0, 60.0]);
+        assert_eq!(col.compare(CmpOp::Lt, Rhs::Array(&row)).unwrap().data(), [1.0; 6]);
+        let g = grid(3, 2);
+        assert_eq!(g.binary(BinOp::Add, Rhs::Array(&row), false).unwrap().data(), [10.0, 11.0, 12.0, 23.0, 24.0, 25.0]);
+        assert_eq!(g.binary(BinOp::Add, Rhs::Array(&line(&[1.0, 2.0])), false).err(), Some(ErrKind::ShapeMismatch));
+        // `select` repeats a branch along its extents of 1.
+        let mask = g.compare(CmpOp::Gt, Rhs::Val(2.5)).unwrap();
+        let picked = mask.select(Rhs::Array(&col), Rhs::Array(&row), Ty::F32).unwrap();
+        assert_eq!(picked.data(), [10.0, 10.0, 10.0, 1.0, 2.0, 3.0]);
+        assert_eq!(mask.select(Rhs::Array(&line(&[1.0, 2.0])), Rhs::Val(0.0), Ty::F32).err(), Some(ErrKind::ShapeMismatch));
+        // `+=` keeps the shape of the target: the right-hand side repeats, a smaller target never grows.
+        g.compound(BinOp::Add, Rhs::Array(&col)).unwrap();
+        assert_eq!(g.data(), [1.0, 3.0, 5.0, 4.0, 6.0, 8.0]);
+        let two = HostArray::new([1, 1, 1, 1], Ty::F32, vec![2.0]);
+        g.compound(BinOp::Mul, Rhs::Array(&two)).unwrap();
+        assert_eq!(g.data(), [2.0, 6.0, 10.0, 8.0, 12.0, 16.0]);
+        assert_eq!(two.compound(BinOp::Add, Rhs::Array(&col)), Err(ErrKind::ShapeMismatch));
+        assert_eq!(two.data(), [2.0]);
     }
 }
