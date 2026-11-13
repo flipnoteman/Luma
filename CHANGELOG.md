@@ -91,6 +91,10 @@ All notable changes to Luma are listed here. The format follows
   `LUMA_TRIDIAGONAL=thomas|cyclic` forces one. RTX 3090 (`bench_pde -- --only tri/few_lines`):
   200 lines of 4096 along axis 0 1.3 ms to 0.07 ms, along axis 1 2.0 to 0.12 ms; 100 lines of 1024
   with 4x4 blocks 1.7 to 0.26 ms (axis 1) and 1.5 to 0.29 ms (axis 2).
+  Line relaxation of a 2-D grid (`bench_pde -- --only tri/fv`: grids 100x50 to 400x200, lines along
+  both axes, scalar / 2x2 / 4x4 blocks) is chosen automatically and is 2.6x to 22x faster than the
+  Thomas solve (4x4 blocks on 400x200: 0.67 to 0.12 ms along axis 0, 0.29 to 0.09 ms along axis 1);
+  blocks of 3 and more use fewer invocations per workgroup for lines of 100 to 400 cells.
 - `iterate_until_all(init, Until, step)`: loops a record of arrays until a stop rule holds, with the
   rule evaluated on the GPU between steps. `Until::new(max_steps)` takes `record(name, f)` (a
   one-element array computed from the state after every step, kept as history), `stop_when(f)`

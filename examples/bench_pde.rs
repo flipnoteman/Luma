@@ -1299,6 +1299,43 @@ fn lines(b: &mut Bench) {
             b.time(&name, &format!("4x{}x{}", grid[0], grid[1]), Tp::Bytes((3.0 * 16.0 + 2.0 * 4.0) * 4.0 * cells as f64), true, &mut f);
         });
     }
+
+    // Line relaxation of an implicit 2-D finite-volume solver: grids ni x nj, a solve along every
+    // line of both axes (nj lines of ni cells, ni lines of nj cells), scalar, 2x2 and 4x4 blocks.
+    for (ni, nj) in [(100usize, 50usize), (200, 100), (400, 200)] {
+        for bs in [1usize, 2, 4] {
+            for axis in 0..2usize {
+                let name = format!("tri/fv_b{bs}_{ni}x{nj}_axis{axis}");
+                b.guarded(&name, |b| {
+                    let ctx = b.ctx.clone();
+                    let (bb, cells) = (bs * bs, ni * nj);
+                    let mut diag = values(cells * bb, 82, -1.0, 1.0);
+                    for (k, v) in diag.iter_mut().enumerate() {
+                        if (k % bb) / bs == k % bs {
+                            *v += 2.0 * bs as f32 + 2.0;
+                        }
+                    }
+                    let host = [values(cells * bb, 81, -1.0, 1.0), diag, values(cells * bb, 83, -1.0, 1.0), values(cells * bs, 84, -1.0, 1.0)];
+                    let [lo, diag, up, rhs]: [A; 4] = std::array::from_fn(|k| {
+                        let c = if k == 3 { bs } else { bb };
+                        if bs == 1 { Array::from_slice_on(&ctx, &host[k], [ni, nj]).unwrap() } else { Array::from_slice_on(&ctx, &host[k], [c, ni, nj]).unwrap() }
+                    });
+                    let run = || {
+                        if bs == 1 {
+                            solve_tridiagonal(axis, &lo, &diag, &up, &rhs)
+                        } else {
+                            solve_block_tridiagonal(bs, axis + 1, &lo, &diag, &up, &rhs)
+                        }
+                    };
+                    let got = run().to_vec().unwrap();
+                    let want = host_tri(bs, [ni, nj, 1], axis, &host[0], &host[1], &host[2], &host[3]);
+                    check(&name, &got, &want, 1e-3, 1e-3);
+                    let mut f = || run().eval().unwrap();
+                    b.time(&name, &format!("{bs}:{ni}x{nj}"), Tp::Bytes(((3 * bb + 2 * bs) * 4 * cells) as f64), true, &mut f);
+                });
+            }
+        }
+    }
 }
 
 /// Dense solve of `m x = r` (`n x n`, row-major) with partial pivoting in f64.
