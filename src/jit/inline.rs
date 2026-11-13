@@ -653,7 +653,7 @@ fn sub_len(key: &FusedKey, s: u32, len: usize) -> f64 {
 /// instructions per program.
 fn stage(key: &FusedKey, cap: usize, cost: &CostModel, tuning: &Tuning) -> Option<(Staging, StagedPrograms)> {
     let found = staging::candidates(key)?;
-    let bytes = |s: u32| key.subs.get(s as usize).and_then(|program| program.last()).map_or(4, |instr| instr.op.out_ty().bytes() as u64);
+    let bytes = |s: u32| key.subs.get(s as usize).and_then(|program| program.last()).map_or(4, |instr| instr.op.out_ty().bytes());
     let staging = staging::plan(&found, tuning, bytes)?;
     let programs = lower_staged(key, &staging, cap, cost)?;
     Some((staging, programs))
@@ -1093,6 +1093,7 @@ pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tu
     }
 }
 
+    #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -131,8 +131,8 @@ impl Readers {
 
     /// Calls `f` with every registered node, newest first, without copying the list. `f` must
     /// not register nodes.
-    pub(super) fn for_each_newest(&self, mut f: impl FnMut(&Weak<Node>)) {
-        lock(&self.list).nodes.iter().rev().for_each(|weak| f(weak));
+    pub(super) fn for_each_newest(&self, f: impl FnMut(&Weak<Node>)) {
+        lock(&self.list).nodes.iter().rev().for_each(f);
     }
 
     /// Whether a reader that `consider` accepts is still pending. Only accepted readers are

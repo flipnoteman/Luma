@@ -1280,7 +1280,7 @@ fn flatten_once(
         let may_share = graph.items.iter().enumerate().skip(root_count).any(|(at, item)| {
             let node = &item.node;
             (node.requested.load(Ordering::Relaxed) && node.is_pending())
-                || (!alone && node.consumers.load(Ordering::Relaxed) > readers[at] && super::worth_storing(node) && node.has_consumer_outside(&in_graph))
+                || (!alone && node.consumers.load(Ordering::Relaxed) > readers[at] && super::worth_storing(node) && node.has_consumer_outside(in_graph))
         });
         if !may_share {
             // The program of a graph of the same shape as one flattened before is that program
@@ -1338,7 +1338,7 @@ fn flatten_once(
             .iter()
             .chain(&sub_members)
             .filter(|&&at| {
-                !alone && !is_root(at) && super::worth_storing(&graph.items[at as usize].node) && graph.items[at as usize].node.has_consumer_outside(&inside)
+                !alone && !is_root(at) && super::worth_storing(&graph.items[at as usize].node) && graph.items[at as usize].node.has_consumer_outside(inside)
             })
             .chain(sub_members.iter().filter(|&&at| !is_root(at) && requested(at)))
             .map(|&at| Arc::clone(&graph.items[at as usize].node))
@@ -1802,7 +1802,7 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
     let inside = |ptr: *const Node| {
         flat.is_boundary(ptr) || by_address_map.get_or_init(|| graph.by_address()).get(&ptr).is_some_and(|&at| seen[at as usize])
     };
-    if members.iter().any(|&at| !root_at.contains(&at) && graph.items[at as usize].node.has_consumer_outside(&inside)) {
+    if members.iter().any(|&at| !root_at.contains(&at) && graph.items[at as usize].node.has_consumer_outside(inside)) {
         return None;
     }
 
@@ -1880,14 +1880,12 @@ pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<
                     }
                 }
             }
-            if let OpKind::Shift(kind) = instr.op.kind {
-                if let ShiftKind::View { map, edge } = kind {
-                    if !map.fits() {
-                        return Err(format!("{here}: the view {map:?} does not fit the index arithmetic"));
-                    }
-                    if edge == Edge::None && !map.in_range() {
-                        return Err(format!("{here}: the view {map:?} reads outside its source"));
-                    }
+            if let OpKind::Shift(ShiftKind::View { map, edge }) = instr.op.kind {
+                if !map.fits() {
+                    return Err(format!("{here}: the view {map:?} does not fit the index arithmetic"));
+                }
+                if edge == Edge::None && !map.in_range() {
+                    return Err(format!("{here}: the view {map:?} reads outside its source"));
                 }
             }
         }

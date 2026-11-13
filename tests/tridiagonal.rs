@@ -39,6 +39,7 @@ fn dense_solve(mut m: Vec<f64>, mut r: Vec<f64>, n: usize) -> Vec<f64> {
 /// along, `b` the block size; coefficient arrays hold `b * b` values per cell, `rhs` `b`.
 /// `start[l]` is the first cell of line `l` (0 if `None`). Returns the solution (`b` per cell) and
 /// the largest residual of the equations.
+#[allow(clippy::too_many_arguments)]
 fn reference(
     b: usize,
     grid: [usize; 4],
