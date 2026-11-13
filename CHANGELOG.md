@@ -293,6 +293,18 @@ All notable changes to Luma are listed here. The format follows
 
 ### Fixed
 
+- On Linux with the NVIDIA driver (615.71.09), a process that had compiled pipelines could abort
+  with `free(): chunks in smallbin corrupted` / `corrupted double-linked list`, segfault, or hang
+  for good in `exit` (one run in five or more). The faulting thread is one of the driver's
+  compiler workers (`libnvidia-gpucomp`, started by the driver while a device or pipeline is
+  created; it keeps the name of the thread that started it, so the wait for the `[vk..]` workers
+  never saw it) that is still working when the process ends. The exit handler now also waits for
+  the threads the driver started during device and pipeline creation (2 s) and, if one is still
+  busy, ends the process with `_exit` and the status `exit` was given instead of running the
+  driver's exit handler, which would hang on a lock that worker holds.
+- The on-disk pipeline cache is dropped when it exceeds 32 MB (not loaded, not written): a cache of
+  116 MB that had collected the kernels of many programs kept those compiler workers busy for
+  half a minute after a run.
 - Two independently written equal expressions shared one node, so `assign`, `write` or `+=`
   through one of them changed the other.
 - A lazy reduction (`sum`, `min`, `max`, `reduce`) of a pending expression recorded before a write

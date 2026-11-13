@@ -30,6 +30,12 @@ const PIPELINES: [u8; 8] = *b"LUMAPIPE";
 const COST: [u8; 8] = *b"LUMACOS2";
 /// Magic of the file with the result of the `fma` test.
 const FMA: [u8; 8] = *b"LUMAFMA ";
+/// The largest pipeline cache that is kept, in bytes. NVIDIA's driver (615.71.09) works through a
+/// loaded cache on compiler threads of its own, and with a cache of 116 MB (the kernels of many
+/// programs and versions) those threads were still busy when the process ended and corrupted the
+/// heap or crashed in about one run in five; caches of a few MB never did. A larger cache is
+/// dropped (not loaded, not written) and starts again from empty.
+const MAX_PIPELINES: usize = 32 << 20;
 /// Magic, format, payload length, payload checksum.
 const HEADER: usize = 8 + 4 + 8 + 8;
 
@@ -166,7 +172,7 @@ impl DiskCache {
         let key = adapter_key(info);
         let mut hash = 0;
         let pipelines = dir.as_ref().filter(|_| device.features().contains(wgpu::Features::PIPELINE_CACHE)).map(|dir| {
-            let stored = read_blob(&dir.join(format!("pipelines-{key}.bin")), PIPELINES);
+            let stored = read_blob(&dir.join(format!("pipelines-{key}.bin")), PIPELINES).filter(|stored| stored.len() <= MAX_PIPELINES);
             hash = stored.as_deref().map_or(0, fnv1a);
             // SAFETY: the data is empty or was returned by `PipelineCache::get_data` (the
             // checksum guards against a damaged file), and wgpu and the driver check that it
@@ -218,11 +224,17 @@ impl DiskCache {
     fn write_out(&self) {
         let (Some(dir), Some(pipelines)) = (&self.dir, &self.pipelines) else { return };
         let Some(data) = pipelines.get_data() else { return };
+        let path = dir.join(format!("pipelines-{}.bin", self.key));
+        if data.len() > MAX_PIPELINES {
+            // Too big to load again (see `MAX_PIPELINES`): the next process starts from empty.
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
         let hash = fnv1a(&data);
         if hash == lock(&self.saved).hash {
             return;
         }
-        match write_blob(&dir.join(format!("pipelines-{}.bin", self.key)), PIPELINES, &data) {
+        match write_blob(&path, PIPELINES, &data) {
             Ok(()) => lock(&self.saved).hash = hash,
             Err(error) => debug!("luma: writing the pipeline cache failed: {error}"),
         }

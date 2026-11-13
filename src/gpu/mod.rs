@@ -1,6 +1,6 @@
 pub(crate) mod built;
 #[cfg(target_os = "linux")]
-mod exit;
+pub(crate) mod exit;
 pub(crate) mod cache;
 pub mod handle;
 mod fma;
