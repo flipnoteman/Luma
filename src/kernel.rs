@@ -17,7 +17,7 @@ const PRELUDE: &str = "
 struct LumaGrid { size: vec3<u32>, _pad: u32 }
 @group(0) @binding(0) var<uniform> luma: LumaGrid;
 fn luma_idx2(i: u32, j: u32) -> u32 { return i + j * luma.size.x; }
-fn luma_idx3(i: u32, j: u32, k: u32) -> u32 { return i + j * luma.size.x * (j + luma.size.y * k); }
+fn luma_idx3(i: u32, j: u32, k: u32) -> u32 { return i + luma.size.x * (j + luma.size.y * k); }
 ";
 
 const VIEW_PRELUDE: &str = "

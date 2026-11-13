@@ -112,14 +112,14 @@ fn launch_raw_sets_grid_to_workgroups_times_size() {
     fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (gid.x == 0u && gid.y == 0u && gid.z == 0u) {
             out[0] = luma.size.x; out[1] = luma.size.y; out[2] = luma.size.z;
-            out[3] = luma_idx3(1u, 1u, 1u);
+            out[3] = luma_idx3(1u, 2u, 1u);
         }
     }"#;
     let mut out = Array::<u32>::zeros([4, 1, 1, 1]).unwrap();
     let kernel = ctx().kernel(SRC).build().unwrap();
     kernel.launch_raw([3, 5, 2], args![&mut out]).unwrap();
-    // size = (12, 10, 2); idx3(1,1,1) = 1 + 12 * (1 + 10 * 1)
-    assert_eq!(out.to_vec().unwrap(), vec![12, 10, 2, 133]);
+    // size = (12, 10, 2); idx3(1,2,1) = 1 + 12 * (2 + 10 * 1)
+    assert_eq!(out.to_vec().unwrap(), vec![12, 10, 2, 145]);
 }
 
 // -- vec4 arrays --
