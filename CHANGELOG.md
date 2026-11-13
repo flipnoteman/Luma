@@ -49,9 +49,9 @@ All notable changes to Luma are listed here. The format follows
 - Example `mlkem`: ML-KEM (FIPS 203) KeyGen, Encaps and Decaps for ML-KEM-512, -768 and -1024 over
   batches of independent instances in lazy array operations only (no custom kernel), checked byte
   for byte against the RustCrypto `ml-kem` crate (implicit rejection included) and NIST ACVP
-  vectors (test `mlkem`). RTX 3090, batches of 65536, keys and ciphertexts on the device: 2.5 / 2.2 /
-  1.9 M ops/s (KeyGen / Encaps / Decaps) for ML-KEM-1024, 3.7 / 3.1 / 2.7 for -768 and 6.0 / 4.7 /
-  4.2 for -512; all 32 threads of a Ryzen 9 with the `ml-kem` crate do 0.12-0.45.
+  vectors (test `mlkem`). RTX 3090, batches of 65536, keys and ciphertexts on the device: 2.4 / 2.1 /
+  1.9 M ops/s (KeyGen / Encaps / Decaps) for ML-KEM-1024, 3.7 / 3.0 / 2.7 for -768 and 6.1 / 4.8 /
+  4.2 for -512; all 32 CPU threads with the `ml-kem` crate do 0.15-0.52.
 
 ### Changed
 
