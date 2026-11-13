@@ -450,6 +450,7 @@ fn clone_of_a_lazy_array_misses_a_compound_assignment_after_a_lazy_slice_write()
             simplify: true,
             staging: false,
             fast_math: false,
+            df_split: false,
             chunk_bytes: None,
             memory_budget: None,
             cost: Test,

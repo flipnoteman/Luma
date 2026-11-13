@@ -3,6 +3,7 @@ pub(crate) mod built;
 mod exit;
 pub(crate) mod cache;
 pub mod handle;
+mod fma;
 pub mod hash;
 pub(crate) mod pager;
 pub mod pool;

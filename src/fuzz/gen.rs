@@ -118,6 +118,8 @@ pub struct Config {
     /// Workgroup staging of views (`JitState::set_staging`).
     pub staging: bool,
     pub fast_math: bool,
+    /// `Df32` products take Dekker's splitting even where `fma` is fused (`ContextOptions::df_fma`).
+    pub df_split: bool,
     pub chunk_bytes: Option<u64>,
     pub memory_budget: Option<u64>,
     pub cost: CostChoice,
@@ -144,6 +146,7 @@ impl Config {
             simplify: true,
             staging: true,
             fast_math: false,
+            df_split: false,
             chunk_bytes: None,
             memory_budget: None,
             cost: CostChoice::Test,
@@ -1714,6 +1717,7 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         prop::bool::weighted(0.8),
         prop::bool::weighted(0.3),
         prop::bool::weighted(0.7),
+        prop::bool::weighted(0.3),
     );
     let memory = (
         prop::sample::select(vec![None, None, Some(1024u64)]),
@@ -1730,6 +1734,7 @@ fn config_strategy() -> impl Strategy<Value = Config> {
         simplify: flags.2,
         staging: flags.4,
         fast_math: flags.3,
+        df_split: flags.5,
         chunk_bytes: memory.0,
         memory_budget: memory.1,
         cost: memory.2,

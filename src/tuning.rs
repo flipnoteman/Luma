@@ -77,6 +77,14 @@ pub(crate) struct Tuning {
     /// Whether sub-programs read through translation views at several offsets may be computed once
     /// per workgroup tile in workgroup memory (see `jit::staging`); `LUMA_STAGING=off` clears it.
     pub(crate) staging: bool,
+    /// Whether the device's `fma` is a fused multiply-add (one rounding), so that the library's
+    /// `Df32` products take the exact error of a product from it instead of splitting the
+    /// factors. Measured when the device opens (see `gpu::fma`) or forced with
+    /// `ContextOptions::df_fma`; the constants say `false` and the context fills it in.
+    pub(crate) df_fma: bool,
+    /// Whether `Df32` additions use the cheaper algorithm whose relative error grows with the
+    /// cancellation (set by `ContextOptions::fast_math`, see `builtin::df_library`).
+    pub(crate) df_sloppy_add: bool,
     /// Workgroup memory the rows of one line of a cyclic-reduction tridiagonal solve may take; the
     /// rows beyond it live in global memory (see `cyclic`).
     pub(crate) line_bytes: u32,
@@ -106,6 +114,8 @@ impl Tuning {
         max_live: 64,
         max_inlined: 1024,
         staging: true,
+        df_fma: false,
+        df_sloppy_add: false,
         line_bytes: 16 * 1024,
         // Not measured on Apple GPUs: Thomas unless forced.
         line_cyclic_work: 0,
@@ -127,6 +137,8 @@ impl Tuning {
         max_live: 96,
         max_inlined: 1536,
         staging: true,
+        df_fma: false,
+        df_sloppy_add: false,
         line_bytes: 32 * 1024,
         // RTX 3090, see `cyclic::plan`.
         line_cyclic_work: 8192,
@@ -148,6 +160,8 @@ impl Tuning {
         max_live: 96,
         max_inlined: 1024,
         staging: true,
+        df_fma: false,
+        df_sloppy_add: false,
         line_bytes: 16 * 1024,
         // Not measured on other GPUs (a RADV iGPU was slower, 8.7 vs 3.0 ms for 200 lines of 4096): Thomas unless forced.
         line_cyclic_work: 0,

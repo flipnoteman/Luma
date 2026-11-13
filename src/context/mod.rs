@@ -218,9 +218,18 @@ pub struct ContextOptions {
     /// for NaN and infinity), `x / x` becomes `1`, `x <= x`, `x >= x`, `x == x` become true and
     /// `x != x` false (wrong for NaN), `(x * a) * b` and `(x + a) + b` combine their constants
     /// (different rounding), `x / a` for a constant `a` becomes `x * (1 / a)`, and `powf(x, e)`
-    /// with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or `sqrt(x)`. Rewrites that keep every bit
-    /// (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
+    /// with `e` of 1, 2 or 0.5 becomes `x`, `x * x` or `sqrt(x)`. `Df32` additions and
+    /// subtractions take the cheaper algorithm whose relative error grows with the cancellation
+    /// (below 2^-47 of the larger operand instead of 2^-46 of the result), except in reductions.
+    /// Rewrites that keep every bit (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
     pub fast_math: bool,
+    /// Whether the device's `fma` is a fused multiply-add, which makes the products of `Df32`
+    /// arithmetic several times cheaper (see `Df32` in the crate docs). `None`: found out by a
+    /// small test kernel when the device is first opened (`true` on Vulkan GPUs that fuse,
+    /// `false` where `fma` is a multiplication and an addition, as on some software
+    /// rasterizers); `Some(false)` forces the splitting everywhere, `Some(true)` trusts the
+    /// caller. `LUMA_DF_FMA=on|off`. The results are the same either way.
+    pub df_fma: Option<bool>,
 }
 
 impl Default for ContextOptions {
@@ -232,6 +241,7 @@ impl Default for ContextOptions {
             check_finite: false,
             calibrate: true,
             fast_math: false,
+            df_fma: None,
         }
     }
 }
@@ -240,6 +250,13 @@ impl ContextOptions {
     /// Turns calibration of the cost model on or off (see [`ContextOptions::calibrate`]).
     pub fn calibrate(mut self, on: bool) -> Self {
         self.calibrate = on;
+        self
+    }
+
+    /// Forces the `Df32` library's products to use `fma` (`true`) or Dekker's splitting
+    /// (`false`) instead of what the device's test says (see [`ContextOptions::df_fma`]).
+    pub fn df_fma(mut self, fused: bool) -> Self {
+        self.df_fma = Some(fused);
         self
     }
 
@@ -296,6 +313,11 @@ impl ContextOptions {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
             fast_math: std::env::var("LUMA_FAST_MATH")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
+            df_fma: std::env::var("LUMA_DF_FMA").ok().and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "on" | "true" => Some(true),
+                "0" | "off" | "false" => Some(false),
+                _ => None,
+            }),
         }
     }
 }
@@ -399,7 +421,12 @@ impl Context {
                 max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
                 timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
                 zero_copy: device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
-                tuning: Tuning::for_adapter(&gpu.0.adapter, &limits, device.features()),
+                tuning: {
+                    let mut tuning = Tuning::for_adapter(&gpu.0.adapter, &limits, device.features());
+                    tuning.df_fma = options.df_fma.unwrap_or(gpu.0.df_fma);
+                    tuning.df_sloppy_add = options.fast_math;
+                    tuning
+                },
                 cost: OnceLock::new(),
                 gpu,
                 builtins: BuildCache::default(),

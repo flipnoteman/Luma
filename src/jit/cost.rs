@@ -37,7 +37,7 @@ impl CostModel {
         launch_us: 2.9,
         bandwidth_gbs: 740.0,
         f32_ops_per_ns: 16000.0,
-        df32_factor: 36.0,
+        df32_factor: 27.0,
         f64_factor: Some(41.0),
     };
     /// Every other GPU, measured on a RADV Raphael iGPU (median of 5 runs).
@@ -58,7 +58,7 @@ impl CostModel {
     };
     /// The numbers tests pin so that kernel counts do not depend on the machine.
     #[cfg(test)]
-    pub(crate) const TEST: CostModel = CostModel::NVIDIA;
+    pub(crate) const TEST: CostModel = CostModel { launch_us: 2.9, bandwidth_gbs: 740.0, f32_ops_per_ns: 16000.0, df32_factor: 36.0, f64_factor: Some(41.0) };
 
     /// The fixed numbers of a tuning profile, used when calibration is off or fails.
     pub fn fallback(profile: TuningProfile) -> CostModel {
@@ -208,7 +208,7 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
     let per_op_f32 = t_alu / (2.0 * f64::from(k_alu) * f64::from(n_alu));
 
     let df = kernel_source(
-        &df_library("p.g"),
+        &df_library("p.g", ctx.tuning().df_fma, false),
         "vec2<f32>",
         "vec2<f32>(in0[i], 0.0)",
         "x = df_add(df_mul(x, vec2<f32>(1.0001, 0.0)), vec2<f32>(0.5, 0.0));",

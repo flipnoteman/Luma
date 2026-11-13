@@ -25,8 +25,11 @@ use crate::jit::cost::CostModel;
 const FORMAT: u32 = 1;
 /// Magic of the pipeline cache file.
 const PIPELINES: [u8; 8] = *b"LUMAPIPE";
-/// Magic of the calibration file.
-const COST: [u8; 8] = *b"LUMACOST";
+/// Magic of the calibration file (2: measured with the faster `Df32` library, so older files
+/// are not read).
+const COST: [u8; 8] = *b"LUMACOS2";
+/// Magic of the file with the result of the `fma` test.
+const FMA: [u8; 8] = *b"LUMAFMA ";
 /// Magic, format, payload length, payload checksum.
 const HEADER: usize = 8 + 4 + 8 + 8;
 
@@ -244,6 +247,25 @@ impl DiskCache {
         let bytes: Vec<u8> = numbers.iter().flat_map(|x| x.to_le_bytes()).collect();
         if let Err(error) = write_blob(&dir.join(format!("cost-{}.bin", self.key)), COST, &bytes) {
             debug!("luma: writing the calibration failed: {error}");
+        }
+    }
+
+    /// Whether this device and driver were found to have a fused `fma` (see `gpu::fma`), if
+    /// that was stored.
+    pub(crate) fn load_fma(&self) -> Option<bool> {
+        let dir = self.dir.as_ref()?;
+        match read_blob(&dir.join(format!("fma-{}.bin", self.key)), FMA)?[..] {
+            [0] => Some(false),
+            [1] => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Stores whether this device and driver have a fused `fma`.
+    pub(crate) fn store_fma(&self, fused: bool) {
+        let Some(dir) = &self.dir else { return };
+        if let Err(error) = write_blob(&dir.join(format!("fma-{}.bin", self.key)), FMA, &[u8::from(fused)]) {
+            debug!("luma: writing the fma test result failed: {error}");
         }
     }
 }
