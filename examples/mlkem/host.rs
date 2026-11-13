@@ -2,6 +2,7 @@
 //! implementation is checked against, and the CPU baseline of the benchmark.
 
 use ml_kem::kem::{Decapsulate, KeyExport};
+#[allow(deprecated)]
 use ml_kem::{DecapsulationKey, ExpandedKeyEncoding, MlKem1024, MlKem512, MlKem768, Seed, B32};
 
 use super::params::Params;

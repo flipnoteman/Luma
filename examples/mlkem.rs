@@ -1,4 +1,39 @@
-//! ML-KEM (FIPS 203) in lazy array operations.
+//! ML-KEM (FIPS 203) KeyGen, Encaps and Decaps for ML-KEM-512, -768 and -1024 over a batch of
+//! independent instances, written only with lazy array operations: no custom kernel, no WGSL.
+//!
+//! `cargo run --release --example mlkem -- [--n <batch sizes, comma separated>] [--set 512|768|1024]
+//! [--op keygen|encaps|decaps] [--no-verify] [--no-cpu]`
+//!
+//! The results are checked byte for byte against the RustCrypto `ml-kem` crate on random instances
+//! (a tampered ciphertext per instance included: implicit rejection) and against NIST ACVP vectors.
+//! Then, per parameter set, operation and batch size, the table gives operations per second with
+//! the inputs and outputs on the device (time from the call to `sync`) and with the upload of the
+//! inputs and readback of the outputs, the GPU time of the kernels, the host time spent building and
+//! recording the operation, launches per batch, the first call (kernel compilation: run with
+//! `LUMA_CACHE=off` for a cold cache) and the same operation on all CPU threads with the `ml-kem`
+//! crate. `MLKEM_PROFILE=1` lists the kernels of every row, `MLKEM_TRACE=1` splits the wall time into
+//! graph building, evaluation and waiting.
+//!
+//! How it is written (`examples/mlkem/`):
+//!
+//! * Keccak-f[1600] is `keccak_f_loop`: one round traced, 24 of them run by `iterate_all` as one
+//!   kernel with the 1600 state bits of a batch of sponges in registers; the round constants come from
+//!   the Keccak LFSR carried as a 51st state word. Hash inputs are views of the byte-string arrays.
+//! * A batch of byte strings (keys, ciphertexts, seeds) is a `[words, n]` array of `u32` words:
+//!   the bytes of an instance are contiguous, as in memory, so uploads and readbacks need no reshuffle.
+//! * A batch of polynomials is a `[256, rows]` array, one row per (instance, polynomial) pair. The
+//!   NTT is two kernels of register butterflies without recomputation (four layers over sixteen
+//!   slices of the polynomial, three over eight slices of every block of sixteen), each followed by
+//!   a join of its outputs; base multiplication works on the pair of neighbours `kappa ^ 1`.
+//! * SampleNTT is a fixed number of SHAKE128 blocks per matrix entry with the rejection done by
+//!   a scan over the groups of eight candidates and one scatter (`put`); when some polynomial gets
+//!   fewer than 256 accepted candidates (about 10^-30 per polynomial with 4 blocks) the operation is
+//!   repeated with more blocks, so the result is right for every input.
+//! * ByteEncode / ByteDecode, Compress / Decompress and the noise sampler are gathers (`take`) with
+//!   shifts; Montgomery reduction with R = 2^16 does the products modulo q = 3329 in `u32`.
+//!
+//! Not implemented: the input checks of FIPS 203 (the modulus check of an encapsulation key, the
+//! hash check of a decapsulation key); keys are trusted, and the code is not constant-time.
 
 #[allow(dead_code)]
 #[path = "keccak.rs"]
@@ -10,17 +45,17 @@ mod field;
 #[path = "mlkem/hash.rs"]
 mod hash;
 #[path = "mlkem/host.rs"]
-mod host;
+pub mod host;
 #[path = "mlkem/kem.rs"]
-mod kem;
+pub mod kem;
 #[path = "mlkem/params.rs"]
-mod params;
+pub mod params;
 #[path = "mlkem/sample.rs"]
 mod sample;
 
 use luma::*;
 
-use kem::{Checked, Kem, Words};
+pub use kem::{Checked, Kem, Words};
 use params::Params;
 
 /// A `[len / 4, n]` array of the byte strings (all of length `len`, a multiple of 4): the bytes of
@@ -98,6 +133,50 @@ pub fn verify(ctx: &Context, p: Params, n: usize) -> Result<()> {
     let host_rejected: Vec<[u8; 32]> = (0..n).map(|i| host::decaps(p, &host_keys[i].dk, &tampered[i])).collect();
     check(&format!("{} Decaps: implicit rejection of tampered ciphertexts", p.name), (0..n).all(|i| key_b[i] == host_rejected[i]));
     check(&format!("{} Decaps: rejected keys differ from the real ones", p.name), (0..n).all(|i| key_b[i] != host_enc[i].key));
+    Ok(())
+}
+
+/// NIST ACVP-Server test vectors: KeyGen (`d`, `z` to `ek`, `dk`), Encaps (`ek`, `m` to `c`, `k`) and
+/// Decaps (`dk`, `c` to `k`, a valid ciphertext and a modified one), a few per parameter set.
+pub const ACVP: &str = include_str!("../tests/data/ml_kem_acvp.txt");
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).expect("hex digits")).collect()
+}
+
+/// Checks the operations against the ACVP vectors of `ACVP`.
+pub fn verify_acvp(ctx: &Context) -> Result<()> {
+    for p in params::ALL {
+        // `kind` lines of this parameter set, fields decoded.
+        let cases = |kind: &str| -> Vec<Vec<Vec<u8>>> {
+            ACVP.lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| line.split_whitespace().collect::<Vec<_>>())
+                .filter(|f| f.len() > 2 && f[0] == kind && f[1] == p.k.to_string())
+                .map(|f| f[2..].iter().map(|x| unhex(x)).collect())
+                .collect()
+        };
+        let column = |cases: &[Vec<Vec<u8>>], i: usize| -> Vec<Vec<u8>> { cases.iter().map(|c| c[i].clone()).collect() };
+        let kem_for = |n: usize| Kem::new(ctx, p, n);
+
+        let keygen = cases("keygen");
+        let mut kem = kem_for(keygen.len())?;
+        let (d, z) = (upload(ctx, &column(&keygen, 0))?, upload(ctx, &column(&keygen, 1))?);
+        let (ek, dk) = complete(&mut kem, |kem| kem.keygen(&d, &z), |(ek, dk)| eval_all(&[ek, dk]))?;
+        check(&format!("{} ACVP KeyGen ({} vectors)", p.name, keygen.len()), download(&ek)? == column(&keygen, 2) && download(&dk)? == column(&keygen, 3));
+
+        let encaps = cases("encaps");
+        let mut kem = kem_for(encaps.len())?;
+        let (ek, m) = (upload(ctx, &column(&encaps, 0))?, upload(ctx, &column(&encaps, 1))?);
+        let (ct, key) = complete(&mut kem, |kem| kem.encaps(&ek, &m), |(ct, key)| eval_all(&[ct, key]))?;
+        check(&format!("{} ACVP Encaps ({} vectors)", p.name, encaps.len()), download(&ct)? == column(&encaps, 2) && download(&key)? == column(&encaps, 3));
+
+        let decaps = cases("decaps");
+        let mut kem = kem_for(decaps.len())?;
+        let (dk, ct) = (upload(ctx, &column(&decaps, 0))?, upload(ctx, &column(&decaps, 1))?);
+        let key = complete(&mut kem, |kem| kem.decaps(&dk, &ct), |key| key.eval())?;
+        check(&format!("{} ACVP Decaps, valid and modified ciphertexts ({} vectors)", p.name, decaps.len()), download(&key)? == column(&decaps, 2));
+    }
     Ok(())
 }
 
@@ -361,10 +440,11 @@ fn main() -> Result<()> {
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let ctx = Context::new()?;
     if !flag("--no-verify") {
-        println!("Correctness against the RustCrypto ml-kem crate");
+        println!("Correctness against the RustCrypto ml-kem crate and the NIST ACVP vectors");
         for p in params::ALL {
             verify(&ctx, p, 200)?;
         }
+        verify_acvp(&ctx)?;
         println!();
     }
     let sizes: Vec<usize> = value("--n").map_or(vec![32768, 65536], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());

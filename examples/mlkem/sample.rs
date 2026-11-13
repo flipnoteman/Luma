@@ -26,7 +26,6 @@ pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
     let ctx = words.context();
     let [rows, total_words, ..] = words.shape().dims();
     let groups = total_words / GROUP_WORDS;
-    let candidates = groups * PER_GROUP;
 
     // Per group: the 12-bit fields of its three words.
     let by_word = words.reshape([rows, GROUP_WORDS, groups]);
