@@ -114,7 +114,10 @@ fn workgroup_size(tuning: &Tuning, block: u32, n: u32) -> u16 {
         2..=5 => 128,
         _ => 64,
     };
-    let wanted = n.div_ceil(2).next_power_of_two().clamp(32, cap);
+    // Blocks of 3 and more: the per-row solve is long and serial, so shorter lines want fewer
+    // threads (64 for 100 to 400 rows).
+    let rows_per_thread = if block >= 3 { 8 } else { 2 };
+    let wanted = n.div_ceil(rows_per_thread).next_power_of_two().clamp(32, cap);
     wanted.min(tuning.elementwise_workgroup.max(1)) as u16
 }
 

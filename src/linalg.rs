@@ -394,6 +394,21 @@ mod tests {
         }
     }
 
+    /// The shapes of a line relaxation of a 2-D finite-volume grid: a few hundred lines of 100 to
+    /// 400 cells along either axis, with scalar, 2x2 and 4x4 blocks (the long lines spill).
+    #[test]
+    fn line_relaxation_shapes() {
+        let ctx = Context::new().unwrap();
+        for (b, n, lines) in [(0, 400, 20), (2, 400, 20), (4, 300, 8), (4, 100, 20), (2, 100, 20)] {
+            for axis in 0..2 {
+                check(&ctx, thomas(), b, n, lines, axis, false, 7);
+                for bytes in [32 * 1024, 4096] {
+                    check(&ctx, cyclic(bytes), b, n, lines, axis, false, 7);
+                }
+            }
+        }
+    }
+
     #[test]
     fn plan_follows_the_workgroup_memory_budget() {
         let tuning = Tuning { line_solver: LineSolver::Cyclic, line_bytes: 16 * 1024, ..Tuning::for_tests() };
