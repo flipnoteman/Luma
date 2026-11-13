@@ -237,8 +237,8 @@ All notable changes to Luma are listed here. The format follows
   once per step. `step` is now called exactly once, and must compute its results from its argument
   and captured arrays only. A step that reads a value back, or states that span several buffers,
   run step by step as before.
-- Fusion scales to large expressions: a kernel now holds up to 1024 operations by default
-  (`LUMA_FUSION_MAX_NODES`, `fusion_limit`; at most 4096), where it held 128. Nesting is cut at
+- Fusion scales to large expressions: a kernel now holds up to 4096 operations by default
+  (`LUMA_FUSION_MAX_NODES`, `fusion_limit`), where it held 128. Nesting is cut at
   256 levels, which bounds the recursion on long chains, and a program that would keep more values
   live than the GPU profile suits (96, 64 on Apple, 256 on the CPU device) is split in the middle
   where fewest values are live.
