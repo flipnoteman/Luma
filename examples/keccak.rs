@@ -97,7 +97,7 @@ pub fn sponge_host(message: &[u8], rate: usize, suffix: u8, out_len: usize) -> V
 
 /// The 25 lanes of every instance: word `2 i` is the low half of lane `i`, word `2 i + 1` the high
 /// half. Every array has one element per instance.
-type State = [Array<u32>; 50];
+pub type State = [Array<u32>; 50];
 
 /// `(lo, hi)` rotated left by `r` bits, `r` a constant: halves swap from 32, then funnel shifts.
 fn rotl64(lo: &Array<u32>, hi: &Array<u32>, r: u32) -> (Array<u32>, Array<u32>) {
@@ -108,7 +108,19 @@ fn rotl64(lo: &Array<u32>, hi: &Array<u32>, r: u32) -> (Array<u32>, Array<u32>) 
     ((lo << k) | (hi >> (32 - k)), (hi << k) | (lo >> (32 - k)))
 }
 
+/// What the iota step xors into lane 0: a constant of the round, or lanes of per-instance values
+/// (a loop over rounds derives them from a counter, so that one traced round serves all 24).
+pub enum Iota<'a> {
+    Constant(u64),
+    Lanes(&'a Array<u32>, &'a Array<u32>),
+}
+
 fn keccak_round(a: &State, rc: u64) -> State {
+    keccak_round_with(a, Iota::Constant(rc))
+}
+
+/// One round of Keccak-f[1600] on every instance.
+pub fn keccak_round_with(a: &State, iota: Iota) -> State {
     // Word `h` (0: low, 1: high) of lane `i`.
     let word = |i: usize, h: usize| &a[2 * i + h];
     // theta
@@ -139,8 +151,16 @@ fn keccak_round(a: &State, rc: u64) -> State {
             let mut l = &this.0 ^ ((!&next.0) & &after.0);
             let mut h = &this.1 ^ ((!&next.1) & &after.1);
             if x + 5 * y == 0 {
-                l ^= rc as u32;
-                h ^= (rc >> 32) as u32;
+                match iota {
+                    Iota::Constant(rc) => {
+                        l ^= rc as u32;
+                        h ^= (rc >> 32) as u32;
+                    }
+                    Iota::Lanes(lo, hi) => {
+                        l = &l ^ lo;
+                        h = &h ^ hi;
+                    }
+                }
             }
             out.push(l);
             out.push(h);
@@ -150,7 +170,7 @@ fn keccak_round(a: &State, rc: u64) -> State {
 }
 
 /// Keccak-f[1600] on every instance: 24 rounds, about 10 000 elementwise operations.
-fn keccak_f(a: &State) -> State {
+pub fn keccak_f(a: &State) -> State {
     let mut state = keccak_round(a, RC[0]);
     for rc in &RC[1..] {
         state = keccak_round(&state, *rc);
@@ -162,6 +182,21 @@ fn keccak_f(a: &State) -> State {
 /// `len` bytes each, `inputs[w]` holding word `w` of every instance (bytes past `len` are
 /// ignored); the result is `out_len` bytes per instance as `out_len / 4` rounded up words.
 pub fn sponge(ctx: &Context, n: usize, inputs: &[Array<u32>], len: usize, rate: usize, suffix: u8, out_len: usize) -> Result<Vec<Array<u32>>> {
+    sponge_with(ctx, n, inputs, len, rate, suffix, out_len, &keccak_f)
+}
+
+/// [`sponge`] with another implementation of the permutation (a loop of rounds, say).
+#[allow(clippy::too_many_arguments)]
+pub fn sponge_with(
+    ctx: &Context,
+    n: usize,
+    inputs: &[Array<u32>],
+    len: usize,
+    rate: usize,
+    suffix: u8,
+    out_len: usize,
+    permute: &dyn Fn(&State) -> State,
+) -> Result<Vec<Array<u32>>> {
     let zero = Array::<u32>::full_on(ctx, n, 0)?;
     let mut state: State = std::array::from_fn(|_| zero.clone());
     let words = rate / 4;
@@ -195,7 +230,7 @@ pub fn sponge(ctx: &Context, n: usize, inputs: &[Array<u32>], len: usize, rate: 
                 state[w] = &state[w] ^ word;
             }
         }
-        state = keccak_f(&state);
+        state = permute(&state);
     }
     let mut out = Vec::new();
     loop {
@@ -204,7 +239,7 @@ pub fn sponge(ctx: &Context, n: usize, inputs: &[Array<u32>], len: usize, rate: 
             out.truncate(out_len.div_ceil(4));
             return Ok(out);
         }
-        state = keccak_f(&state);
+        state = permute(&state);
     }
 }
 
