@@ -40,15 +40,13 @@ All notable changes to Luma are listed here. The format follows
   expressions: a `select` whose mask depends on the coordinates only is generated as `if`/`else`
   (the right-hand side is computed in the cells of the region, the old value elsewhere), and the
   cost model weights those operations by the share of cells that take the branch. A padded record
-  with ghost expressions of any size read at four offsets in each direction is one launch without
-  cuts (bowshock-lazy `luma_issues` case 1: 4 launches and 2 cuts at 100 ghost operations before).
+  cuts (before: 4 launches and 2 cuts at 100 ghost operations).
 - Workgroup staging follows sub-programs that are not staged: what a flux read once (or a slice of
   a slice) reads of a padded array is staged at the summed offsets instead of the padded array
   being recomputed at every read.
 - Staged sub-programs of one level over the same region (the four fields of a flux) are lowered
   and computed together, so what they share (the wave speeds of a Riemann solver) is computed
-  once per cell instead of once per field. bowshock-lazy `Staging::Fusion`, one `Df32` residual
-  evaluation at 200x100: 308-344 us -> 139 us, f32 17-19 us -> 11 us (kernel time on an RTX 3090).
+  once per cell instead of once per field.
 - The cost model searches for what to evaluate first instead of guessing: of the sub-programs a
   kernel reads at several indices it costs the groups that would be evaluated together (the fields
   of one state), each judged the same way, so the stage state of a time step that reads the stage
@@ -58,22 +56,17 @@ All notable changes to Luma are listed here. The format follows
   operations (`LUMA_FUSION_MAX_NODES`), which the search makes safe. A pending node that two
   expressions read is only evaluated first if recomputing it costs more than a launch and a pass
   over its bytes, and then together with its siblings (the other fields of its record) and
-  without the nodes below it that only it was reading. bowshock-lazy `Staging::Fusion` (no
-  hand-placed `cache()`), 200x100, per SSP-RK3 step as `iterate_all` replays it: f32 76 launches /
-  346 us -> 8 launches / 38-47 us GPU (hand-cached `Fluxes`: 12 / 53 us); steady us/iteration
-  f32 252 -> 31 (`Fluxes` 46), `Df32` 1123 -> 536 (`Fluxes` 250). `euler/until_all` of `bench_pde` 454 -> 204 launches
-  (2048x2048: 72 -> 18 ms), `muscl` 16-29% faster.
+  without the nodes below it that only it was reading. `euler/until_all` of `bench_pde` 454 -> 204
+  launches (2048x2048: 72 -> 18 ms), `muscl` 16-29% faster.
 - The cost model prices what small kernels really cost: a kernel whose invocations do not keep
   the arithmetic units busy (fewer than twice the calibrated f32 operations per nanosecond: 20 000
   cells on an RTX 3090 run at a fraction of the calibrated throughput) is slower by that factor,
   and a staged region is computed in whole rounds of the workgroup (272 cells over 256 invocations
-  are two rounds, not 1.06). Both fit the measurements of the `Df32` flux kernels of
-  bowshock-lazy (one staged residual kernel: estimated 134 us, measured 135 us), so the search
-  now evaluates the fluxes first (the fields of each direction as one group, also when what is
-  left would fit) instead of staging them with the padded state recomputed in halos. The seeds of
-  the search are the best sub-program of each length, and a reduction waits for the arrays `eval`
-  asked for. bowshock-lazy `Staging::Fusion` `Df32`, 200x100: residual of a stored state 135 us
-  -> 77 us (hand-cached `Fluxes`: 57-65 us), RK3 step 730-790 us -> 527 us (`Fluxes` 223-250 us).
+  are two rounds, not 1.06). With both, the estimate of a staged `Df32` flux kernel matches its
+  measured time, so the search now evaluates the fluxes first (the fields of each direction as
+  one group, also when what is left would fit) instead of staging them with the padded state
+  recomputed in halos. The seeds of the search are the best sub-program of each length, and a
+  reduction waits for the arrays `eval` asked for.
 - `CostModel` and `Context::cost_model`: throughputs of the device (launch, memory bandwidth, f32,
   `Df32` and `f64` arithmetic), measured when a context opens (once per machine, see the cache;
   `ContextOptions::calibrate`, `LUMA_CALIBRATE=off` to use the profile's fixed numbers instead).
@@ -275,8 +268,7 @@ All notable changes to Luma are listed here. The format follows
   `flush`, `sync` and `cache` evaluated the pending arrays of other threads (and fed them into a
   recording another thread had under way), and equal expressions were shared across threads. Each
   thread now only evaluates its own pending arrays.
-- Threads sharing a context ran up to ten times slower than threads with a context each (the
-  accuracy suite of bowshock-lazy, four threads on `default_context()`: 118 s against 11 s). A
+- Threads sharing a context ran up to ten times slower than threads with a context each. A
   kernel that one thread was compiling, which takes seconds for a large `Df32` kernel, blocked every
   other thread's kernel lookups, and only one thread at a time could trace a loop of `iterate_all` /
   `iterate_until_all`: the others ran theirs on the host, calling `step` and reading the state back
