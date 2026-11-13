@@ -93,6 +93,12 @@ All notable changes to Luma are listed here. The format follows
   before them), found by the new differential fuzzer.
 - `Df32` kernels failing to bind their uniform; casts cancelled by the shader compiler.
 - Input-buffer count wrong after `cache()`.
+- Region assigns into lazy expressions (the ghost cells and solid blocks of a finite-volume
+  solver) made up to 30 times as many launches: the work of a shared expression was counted once
+  per path through it (doubling with every level), so small ghost expressions were evaluated in
+  kernels of their own, and a cut forced by the instruction cap inside another cut evaluated the
+  arrays built on top of the expression piece by piece. One SSP-RK3 step with a solid block on a
+  156x76 grid, single precision, no `cache()`: 89 launches / 320 us to 14 / 60 us.
 - NVIDIA driver hang or crash in `exit`: luma waits for driver-started threads and ends the
   process with `_exit` if one stays busy (`LUMA_EXIT_WAIT=0` skips the wait).
 
