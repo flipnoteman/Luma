@@ -373,8 +373,11 @@ impl Context {
             }
             None => budget.map_or(limit, |b| pow2_floor(b / 8).clamp(1024, limit)),
         };
-        // Idle buffer caches scale with the budget so that they cannot crowd out array data.
-        let cap = budget.map_or(1 << 30, |b| (b / 8).min(1 << 30));
+        // Idle buffer caches scale with the budget (half of it): they are given back when the device
+        // runs out of memory, so they cannot crowd out array data. A program that cycles through
+        // gigabytes of temporaries (a batch of large arrays per call) reuses them instead of
+        // allocating them again, which costs about as much as writing them ten times over.
+        let cap = budget.map_or(1 << 30, |b| b / 2);
 
         // wgpu panics on errors nobody handles. Record the first one instead and report it as an
         // `Err` at the next synchronization point.

@@ -341,6 +341,9 @@ fn view<T: Num>(env: &Env, a: &Array<T>, view: &ViewOp) -> Array<T> {
         ViewOp::Concat { axis, others } => match others[..] {
             [b] => concat(*axis, [a, get::<T>(env, b)]),
             [b, c] => concat(*axis, [a, get::<T>(env, b), get::<T>(env, c)]),
+            [b, c, d] => concat(*axis, [a, get::<T>(env, b), get::<T>(env, c), get::<T>(env, d)]),
+            [b, c, d, e] => concat(*axis, [a, get::<T>(env, b), get::<T>(env, c), get::<T>(env, d), get::<T>(env, e)]),
+            [b, c, d, e, f] => concat(*axis, [a, get::<T>(env, b), get::<T>(env, c), get::<T>(env, d), get::<T>(env, e), get::<T>(env, f)]),
             _ => panic!("concat of {} parts", others.len() + 1),
         },
     }

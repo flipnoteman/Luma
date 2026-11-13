@@ -189,8 +189,9 @@ fn flat_weight(flat: &Flat, cost: &CostModel, staged_reads: bool) -> f64 {
     if staged_reads && matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(flat.op, cost) }
 }
 
-/// What the least a branch must save, in f32-operation units per element, for a `Select` to be
-/// computed as `if`/`else`.
+/// What the least a branch must save, in f32-operation units per element that reaches the `Select`
+/// (the branch itself costs about that much to every one of them), for it to be computed as
+/// `if`/`else`.
 const BRANCH_GAIN: f64 = 8.0;
 
 /// The result of [`branches`].
@@ -222,8 +223,10 @@ fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> f64 {
 /// scalars they are compared with: the elements that take a branch are neighbours, so a
 /// warp mostly takes one) and the instructions only one of its branches reads (and that no
 /// branch outside it, no context, no stored value reads) are worth at least [`BRANCH_GAIN`]
-/// operations per element. Those instructions are computed inside the branch. The weighted
-/// operation count of the program counts them by the share of elements that take it.
+/// operations per element that reaches the select (the join of many parts is a chain of nested
+/// selects: each is judged by the elements that get to it, not by all of them). Those
+/// instructions are computed inside the branch. The weighted operation count of the program counts
+/// them by the share of elements that take it.
 fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, staged_reads: bool) -> Branches {
     let n = flats.len();
     let weight: Vec<f64> = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).collect();
@@ -353,7 +356,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
                 r = parent(&region, r);
             }
         }
-        let useless: Vec<usize> = (0..n).filter(|&s| branch[s] && saved[s] < BRANCH_GAIN).collect();
+        let useless: Vec<usize> = (0..n).filter(|&s| branch[s] && saved[s] < BRANCH_GAIN * chance[s]).collect();
         if useless.is_empty() {
             let ops = (0..n).map(|x| weight[x] * chance[x]).sum();
             return Branches { region, branch, ops };

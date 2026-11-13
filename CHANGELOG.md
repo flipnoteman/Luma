@@ -46,6 +46,12 @@ All notable changes to Luma are listed here. The format follows
 - Settings: `LUMA_FUSION_MAX_NODES`, `LUMA_FUSION_MAX_LIVE`, `LUMA_STAGING`, `LUMA_SPECULATE`,
   `LUMA_DF_FMA`, `ContextOptions::df_fma`.
 - Benchmarks `bench_pde`, `bench_build`, `bench_threads`; new `luma-bench` workloads.
+- Example `mlkem`: ML-KEM (FIPS 203) KeyGen, Encaps and Decaps for ML-KEM-512, -768 and -1024 over
+  batches of independent instances in lazy array operations only (no custom kernel), checked byte
+  for byte against the RustCrypto `ml-kem` crate (implicit rejection included) and NIST ACVP
+  vectors (test `mlkem`). RTX 3090, batches of 65536, keys and ciphertexts on the device: 2.4 / 2.1 /
+  1.9 M ops/s (KeyGen / Encaps / Decaps) for ML-KEM-1024, 3.7 / 3.0 / 2.7 for -768 and 6.1 / 4.8 /
+  4.2 for -512; all 32 CPU threads with the `ml-kem` crate do 0.15-0.52.
 
 ### Changed
 
@@ -57,6 +63,13 @@ All notable changes to Luma are listed here. The format follows
   An expression whose scalars outgrow one uniform buffer is cut (`SplitReason::Scalars`).
 - Shifts and rotations by a constant are compiled with the amount as a literal.
 - Region `assign` compiles to `if`/`else`, so ghost expressions cost only their own cells.
+- A select on the coordinates is judged by the work it saves per cell that reaches it, not per
+  cell of the kernel, so the chain of nested selects that `concat` of many parts makes computes
+  every part only where it is taken: joining 168 arrays of 590 000 elements 13.8 to 1.0 ms.
+- The pool of idle buffers keeps up to half of the memory budget (was an eighth, at most 1 GB):
+  a program that cycles through gigabytes of temporaries every call reuses them instead of
+  allocating again, which costs about 20 ms per GB on an RTX 3090 (ML-KEM-768 KeyGen of 65536
+  instances 137 to 37 ms).
 - `iterate*` trace the step once and replay its kernels; `eval` loops are recognized and batched;
   readbacks in convergence loops can be answered from steps computed ahead.
 - `iterate_all` register loops called again from the same place with the same step graph over
