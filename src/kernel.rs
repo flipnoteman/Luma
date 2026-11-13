@@ -357,7 +357,7 @@ pub(crate) fn build_core(
     } else {
         device.create_shader_module(shader_desc)
     };
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let pipeline = crate::gpu::exit::driver_call(|| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label,
         layout: Some(&pipeline_layout),
         module: &shader,
@@ -368,7 +368,7 @@ pub(crate) fn build_core(
             ..Default::default()
         },
         cache: ctx.disk_cache().pipelines(),
-    });
+    }));
     ctx.disk_cache().built();
 
     Ok(KernelCore {

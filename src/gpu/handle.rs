@@ -188,7 +188,7 @@ pub(crate) fn acquire(kind: DeviceKind) -> Result<Gpu> {
             return Ok(idle.remove(at));
         }
     }
-    let gpu = pollster::block_on(request_device(kind))?;
+    let gpu = super::exit::driver_call(|| pollster::block_on(request_device(kind)))?;
     if kind == DeviceKind::Auto && *AUTO_IS_CPU.get_or_init(|| gpu.cpu) {
         log::info!("luma: no GPU found, running on the CPU through {}", gpu.adapter.name);
     }
