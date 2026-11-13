@@ -208,6 +208,14 @@ impl Trace {
     /// that the replayed step overwrites (`y = &x * 2.0; x += 1.0` in the step) or take over its
     /// operand's buffer.
     pub(crate) fn start<T: GpuType>(init: &[&Array<T>]) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
+        let (mut trace, probes) = Trace::prepare(init)?;
+        trace.begin()?;
+        Ok((trace, probes))
+    }
+
+    /// [`Trace::start`] without starting the recording: the caller may launch for real first
+    /// (see `jit::Attempt`) and then [`Trace::begin`] it.
+    pub(crate) fn prepare<T: GpuType>(init: &[&Array<T>]) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
         let ctx = init[0].context().clone();
         ctx.jit().evaluate_held();
         let mut storages = Vec::with_capacity(init.len());
@@ -219,12 +227,10 @@ impl Trace {
             probe_storages.push(Arc::clone(probe.storage()?));
             probes.push(probe);
         }
-        let mut trace = Trace { ctx, init: storages, probe_storages, recording: false };
-        trace.begin()?;
-        Ok((trace, probes))
+        Ok((Trace { ctx, init: storages, probe_storages, recording: false }, probes))
     }
 
-    fn begin(&mut self) -> std::result::Result<(), Failure> {
+    pub(crate) fn begin(&mut self) -> std::result::Result<(), Failure> {
         let seed: Vec<_> = self.init.iter().cloned().zip(self.probe_storages.iter().cloned()).collect();
         self.recording = self.ctx.begin_recording(seed.clone());
         if !self.recording {

@@ -28,6 +28,18 @@ pub(crate) fn run_loop(
     outs: &[Arc<Node>],
     steps: u32,
 ) -> Option<Result<Vec<Arc<Storage>>, Failure>> {
+    let (fused, states) = prepare_loop(probes, inits, outs)?;
+    run_loop_fused(ctx, &fused, &states, inits, steps)
+}
+
+/// Flattens the traced step with next states `outs`, computed from `probes`, into a store program
+/// with one output per state; `states[k]` is the state that input `k` reads (`None`: an input
+/// that stays fixed). `None` if the step is not a single-buffer elementwise program.
+pub(super) fn prepare_loop(
+    probes: &[Arc<Storage>],
+    inits: &[Arc<Storage>],
+    outs: &[Arc<Node>],
+) -> Option<(Fused, Vec<Option<usize>>)> {
     let len = outs.first()?.len();
     if outs.iter().any(|out| out.len() != len || !out.is_pending())
         || outs.iter().enumerate().any(|(j, out)| outs[..j].iter().any(|other| Arc::ptr_eq(other, out)))
@@ -47,7 +59,29 @@ pub(crate) fn run_loop(
     }
     let states: Vec<Option<usize>> =
         fused.inputs.iter().map(|input| probes.iter().position(|probe| Arc::ptr_eq(probe, input))).collect();
-    run_loop_fused(ctx, &fused, &states, inits, steps)
+    Some((fused, states))
+}
+
+/// The weight of the store program `key` per element and step (see [`super::cost::op_weight`]) if
+/// it can run as a register loop over `states` (`states[k]`: the state input `k` reads): a
+/// single-buffer elementwise program of 4-byte values whose states are all `f32` or all `u32` and
+/// that binds no more buffers than the device allows. `None` otherwise.
+pub(super) fn loop_ops(ctx: &crate::context::Context, key: &FusedKey, states: &[Option<usize>]) -> Option<f64> {
+    let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
+    // The states are all `f32` or all `u32`, and what a state input reads is of that type.
+    let state_ty = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map(|i| i.op.out_ty());
+    let typed = matches!(state_ty, Some(ElemTy::F32 | ElemTy::U32))
+        && key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| Some(i.op.out_ty()) == state_ty))
+        && states.iter().zip(&key.input_tys).all(|(state, ty)| state.is_none() || Some(*ty) == state_ty);
+    if shifts || !key.subs.is_empty() || !typed || !key.narrow() {
+        return None;
+    }
+    let bindings = 2 * key.outputs.len() + states.iter().filter(|state| state.is_none()).count();
+    if bindings > ctx.jit().max_inputs() + 1 {
+        return None;
+    }
+    let cost = ctx.cost_model();
+    Some(key.instrs.iter().map(|instr| super::cost::op_weight(instr.op, &cost)).sum())
 }
 
 /// Runs `steps` iterations of the store program `fused` (one output per state, `outputs[j]` the
@@ -62,48 +96,73 @@ pub(super) fn run_loop_fused(
     inits: &[Arc<Storage>],
     steps: u32,
 ) -> Option<Result<Vec<Arc<Storage>>, Failure>> {
-    let key = &fused.key;
-    let len = inits.first()?.len();
-    let shifts = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)));
-    // The states are all `f32` or all `u32`, and what a state input reads is of that type.
-    let state_ty = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map(|i| i.op.out_ty());
-    let typed = matches!(state_ty, Some(ElemTy::F32 | ElemTy::U32))
-        && key.outputs.iter().all(|&at| key.instrs.get(at as usize).is_some_and(|i| Some(i.op.out_ty()) == state_ty))
-        && states.iter().zip(&key.input_tys).all(|(state, ty)| state.is_none() || Some(*ty) == state_ty);
-    if shifts || !key.subs.is_empty() || !typed || !key.narrow() || fused.inputs.iter().any(|input| input.segments() != 1) {
+    let ops = loop_ops(ctx, &fused.key, states)?;
+    if fused.inputs.iter().any(|input| input.segments() != 1) {
         return None;
     }
-    let bindings = 2 * key.outputs.len() + states.iter().filter(|state| state.is_none()).count();
-    if bindings > ctx.jit().max_inputs() + 1 {
-        return None;
-    }
-    let budget = ctx.jit().loop_work.load(Ordering::Relaxed);
-    let per_launch = budget / (len as u64 * key.instrs.len().max(1) as u64).max(1);
-    let per_launch = u32::try_from(per_launch).unwrap_or(u32::MAX).max(1);
-    Some((|| {
-        let core = ctx.jit().loop_kernel(ctx, key, states)?;
-        let mut states_now: Vec<Arc<Storage>> = inits.to_vec();
-        let mut remaining = steps;
-        while remaining > 0 {
-            let count = remaining.min(per_launch);
-            let outputs = launch_loop(ctx, &core, fused, states, &states_now, len, count)?;
-            states_now = outputs.into_iter().map(Arc::new).collect();
-            remaining -= count;
-        }
-        Ok(states_now)
-    })())
+    let fixed: Vec<Arc<Storage>> =
+        fused.inputs.iter().zip(states).filter(|(_, state)| state.is_none()).map(|(input, _)| Arc::clone(input)).collect();
+    Some(run_loop_program(ctx, &fused.key, &fused.scalars, states, &fixed, inits, steps, ops))
 }
 
-/// Most element-instructions (elements x instructions x steps) one launch of a register loop
-/// runs: about 9 ms on an RTX 3080 Laptop, so a GPU 100 times slower still stays below the
-/// 2 s watchdog of Windows. Longer loops are split into several launches.
-pub(super) const LOOP_WORK_PER_LAUNCH: u64 = 1 << 36;
+/// Runs the register loop `key` (checked by [`loop_ops`], which returned `ops`) for `steps`
+/// steps over `inits`, with the inputs that stay fixed (`states[k] == None`, in input order) bound
+/// to `fixed`. The steps are cut into launches by [`steps_per_launch`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_loop_program(
+    ctx: &crate::context::Context,
+    key: &FusedKey,
+    scalars: &[u32],
+    states: &[Option<usize>],
+    fixed: &[Arc<Storage>],
+    inits: &[Arc<Storage>],
+    steps: u32,
+    ops: f64,
+) -> Result<Vec<Arc<Storage>>, Failure> {
+    let len = inits.first().map_or(0, |init| init.len());
+    let per_launch = steps_per_launch(ctx, len, ops, key.instrs.len());
+    let core = ctx.jit().loop_kernel(ctx, key, states)?;
+    let mut states_now: Vec<Arc<Storage>> = inits.to_vec();
+    let mut remaining = steps;
+    while remaining > 0 {
+        let count = remaining.min(per_launch);
+        let outputs = launch_loop(ctx, &core, scalars, fixed, &states_now, len, count)?;
+        states_now = outputs.into_iter().map(Arc::new).collect();
+        remaining -= count;
+    }
+    Ok(states_now)
+}
+
+/// Time one launch of a register loop is sized to take, by the device's [`CostModel`]. Long enough
+/// that the launches and the states' round trips through memory vanish (a 1M-instance Keccak
+/// permutation is half a millisecond, so one launch runs a few dozen of them), short enough that a
+/// device several times slower than the model says stays far below the 2 s watchdog of Windows.
+const LAUNCH_TARGET_NS: f64 = 40e6;
+
+/// Nanoseconds one invocation takes per operation when nothing runs beside it: the dependent
+/// chain of a step, which bounds the time of a loop over a few elements however little work it is.
+const SERIAL_NS_PER_OP: f64 = 2.0;
+
+/// How many steps of a register loop (`ops` per element and step by the cost model, `instrs`
+/// instructions) one launch of `len` elements runs: as many as take about [`LAUNCH_TARGET_NS`],
+/// at least one. A test that sets the work per launch (`JitState::set_loop_work`, in
+/// element-instructions) gets that.
+fn steps_per_launch(ctx: &crate::context::Context, len: usize, ops: f64, instrs: usize) -> u32 {
+    let work = ctx.jit().loop_work.load(Ordering::Relaxed);
+    if work > 0 {
+        return u32::try_from(work / (len as u64 * instrs.max(1) as u64).max(1)).unwrap_or(u32::MAX).max(1);
+    }
+    let cost = ctx.cost_model();
+    let ops = ops.max(1.0);
+    let step_ns = (ops * len as f64 / cost.f32_ops_per_ns).max(ops * SERIAL_NS_PER_OP);
+    (LAUNCH_TARGET_NS / step_ns).clamp(1.0, f64::from(u32::MAX)) as u32
+}
 
 fn launch_loop(
     ctx: &crate::context::Context,
     core: &crate::kernel::KernelCore,
-    fused: &Fused,
-    states: &[Option<usize>],
+    scalars: &[u32],
+    fixed: &[Arc<Storage>],
     inits: &[Arc<Storage>],
     len: usize,
     steps: u32,
@@ -113,16 +172,10 @@ fn launch_loop(
     let outputs: Vec<Storage> = inits.iter().map(|_| Storage::new(ctx, len, 4)).collect();
     let out_pins = outputs.iter().map(|out| out.pin(0)).collect::<Result<Vec<_>, _>>()?;
     let init_pins = inits.iter().map(|init| init.pin(0)).collect::<Result<Vec<_>, _>>()?;
-    let in_pins = fused
-        .inputs
-        .iter()
-        .zip(states)
-        .filter(|(_, state)| state.is_none())
-        .map(|(input, _)| input.pin(0).map(|pin| (pin, input.byte_len())))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut words = Vec::with_capacity(fused.scalars.len() + 1);
+    let in_pins = fixed.iter().map(|input| input.pin(0).map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?;
+    let mut words = Vec::with_capacity(scalars.len() + 1);
     words.push(steps);
-    words.extend_from_slice(&fused.scalars);
+    words.extend_from_slice(scalars);
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(out_pins.len() * 2 + in_pins.len() + 1);
     raw.extend(out_pins.iter().map(|pin| RawArg::write(pin.buffer(), bytes)));
     raw.extend(init_pins.iter().map(|pin| RawArg::read(pin.buffer(), bytes)));

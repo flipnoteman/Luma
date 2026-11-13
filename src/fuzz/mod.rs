@@ -934,17 +934,28 @@ impl Machine {
         let ty = ty_of(&self.luma, states[0]);
         let cx = &self.cx;
         let env = &mut self.luma;
-        let run: Result<(Vec<Arr>, Option<usize>), LumaError> = match (until, ty, states.len()) {
-            (false, Ty::F32, 1) => luma_iterate_all::<f32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
-            (false, Ty::F32, 2) => luma_iterate_all::<f32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
-            (false, Ty::U32, 1) => luma_iterate_all::<u32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
-            (false, Ty::U32, 2) => luma_iterate_all::<u32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
-            (false, Ty::Df32, 1) => luma_iterate_all::<Df32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
-            (false, Ty::Df32, 2) => luma_iterate_all::<Df32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
-            (true, Ty::F32, 1) => luma_iterate_until::<1>(cx, env, steps, states, body, next).map(|(r, s)| (r, Some(s))),
-            (true, Ty::F32, 2) => luma_iterate_until::<2>(cx, env, steps, states, body, next).map(|(r, s)| (r, Some(s))),
-            _ => panic!("loop over {} {ty:?} states", states.len()),
+        let mut once = || -> Result<(Vec<Arr>, Option<usize>), LumaError> {
+            match (until, ty, states.len()) {
+                (false, Ty::F32, 1) => luma_iterate_all::<f32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::F32, 2) => luma_iterate_all::<f32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::U32, 1) => luma_iterate_all::<u32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::U32, 2) => luma_iterate_all::<u32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::Df32, 1) => luma_iterate_all::<Df32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::Df32, 2) => luma_iterate_all::<Df32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (true, Ty::F32, 1) => luma_iterate_until::<1>(cx, env, steps, states, body, next).map(|(r, s)| (r, Some(s))),
+                (true, Ty::F32, 2) => luma_iterate_until::<2>(cx, env, steps, states, body, next).map(|(r, s)| (r, Some(s))),
+                _ => panic!("loop over {} {ty:?} states", states.len()),
+            }
         };
+        // A loop whose body only builds arrays runs again twice first, from the same call site, so
+        // that the call whose result is checked runs from the program of the earlier ones and from
+        // a launch started before the body was traced (see `jit::rerun`).
+        if !until && body.iter().all(Stmt::creates_only) {
+            for _ in 0..2 {
+                drop(once());
+            }
+        }
+        let run = once();
         let (results, luma_steps) = run.map_err(|e| limit_or_fail(&e, &format!("{at}: loop")))?;
         if let Some(luma_steps) = luma_steps
             && luma_steps != host_steps
