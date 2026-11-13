@@ -207,7 +207,12 @@ struct Tracing {
 
 impl Tracing {
     fn begin(seed: u64, probes: &[Arc<Storage>]) -> Tracing {
-        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+        let generation = loop {
+            let g = GENERATION.fetch_add(1, Ordering::Relaxed);
+            if g != 0 {
+                break g;
+            }
+        };
         let mut state = State {
             generation,
             next: 0,
@@ -347,6 +352,8 @@ impl Cache {
 struct Speculation {
     rerun: Arc<Rerun>,
     fixed: Vec<Arc<Storage>>,
+    /// The readers generation of each of `fixed` when the guess started.
+    generations: Vec<u64>,
     outputs: Vec<Arc<Storage>>,
 }
 
@@ -467,6 +474,8 @@ impl Attempt {
             Arc::ptr_eq(&speculation.rerun, rerun)
                 && speculation.fixed.len() == fixed.len()
                 && speculation.fixed.iter().zip(&fixed).all(|(a, b)| Arc::ptr_eq(a, b))
+                // A write since the loop started on the guess changed what it read.
+                && speculation.fixed.iter().zip(&speculation.generations).all(|(s, &g)| s.readers.generation() == g)
         }) && let Some(speculation) = self.speculation.take()
         {
             jit.stats.speculated.fetch_add(1, Ordering::Relaxed);
@@ -505,8 +514,9 @@ fn speculate(ctx: &Context, site: &Site, inits: &[Arc<Storage>], steps: u32) -> 
     {
         return None;
     }
+    let generations = fixed.iter().map(|storage| storage.readers.generation()).collect();
     let outputs = launch::run_loop_program(ctx, &rerun.key, &rerun.scalars, &rerun.states, &fixed, inits, steps, rerun.ops).ok()?;
     // The GPU starts now, while the host builds the graph that tells whether this was the loop.
     let _ = ctx.submit();
-    Some(Speculation { rerun, fixed, outputs })
+    Some(Speculation { rerun, fixed, generations, outputs })
 }

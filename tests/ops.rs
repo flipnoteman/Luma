@@ -526,3 +526,25 @@ fn broadcast_to_repeats_size_one_axes() {
     let err = col.broadcast_to([4, 2]).to_vec().unwrap_err();
     assert!(matches!(err.root(), LumaError::ShapeMismatch { lhs: [3, 1, 1, 1], rhs: [4, 2, 1, 1] }), "{err}");
 }
+
+#[test]
+fn hypot_neither_overflows_nor_underflows() {
+    let xs = [0.0f32, 3e20, 3e-25, f32::INFINITY, -3.0, 0.0];
+    let ys = [0.0f32, 4e20, 4e-25, f32::INFINITY, 4.0, -2.0];
+    let got = f32s(&xs).hypot(f32s(&ys)).to_vec().unwrap();
+    let want = [0.0f32, 5e20, 5e-25, f32::INFINITY, 5.0, 2.0];
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        if w.is_infinite() {
+            assert_eq!(g, w, "index {i}");
+        } else {
+            assert!((g - w).abs() <= 1e-5 * w, "index {i}: got {g}, want {w}");
+        }
+    }
+}
+
+#[test]
+fn tanh_saturates_to_plus_or_minus_one_on_large_inputs() {
+    let xs = [-f32::INFINITY, -1000.0, -44.0, 0.0, 44.0, 1000.0, f32::INFINITY];
+    let got = f32s(&xs).tanh().to_vec().unwrap();
+    assert_eq!(got, [-1.0, -1.0, -1.0, 0.0, 1.0, 1.0, 1.0]);
+}

@@ -167,7 +167,7 @@ fn main() -> Result<()> {
             measure(
                 || {
                     for i in 0..LAUNCHES {
-                        if i % 2 == 0 {
+                        if i.is_multiple_of(2) {
                             copy.launch([n], args![&a, &mut b])?;
                         } else {
                             copy.launch([n], args![&b, &mut a])?;
@@ -277,13 +277,13 @@ fn flush_overlap(ctx: &Context, copy: &Kernel, n: u32) -> Result<()> {
         let mut best = f64::MAX;
         for _ in 0..REPEATS + 1 {
             let start = Instant::now();
-            for i in 0..launches {
-                if i % 2 == 0 {
+            for i in 0usize..launches {
+                if i.is_multiple_of(2) {
                     copy.launch([n], args![&a, &mut b])?;
                 } else {
                     copy.launch([n], args![&b, &mut a])?;
                 }
-                if every.is_some_and(|every| (i + 1) % every == 0) {
+                if every.is_some_and(|every| (i + 1).is_multiple_of(every)) {
                     ctx.flush()?;
                 }
             }

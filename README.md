@@ -28,16 +28,17 @@ I/O dependant, operations.
 
 ## Features
 
-- Arrays of `f32` and `u32` with up to 4 dimensions; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
-- `vec2`/`vec4` element types
+- Arrays of `f32`, `u32`, `f64` and `Df32` (double-float, about 48-bit) with up to 4 dimensions; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
+- `vec2`/`vec4` element types and `#[derive(Fields)]` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
-- Reductions: sum, min, max, mean, norm
+- Views: slicing, mutable slices (`ViewMut`), `broadcast_to`
+- Reductions: sum, min, max, mean, norm, along axes; `scan` / `cumsum`; `solve_tridiagonal`
 - Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
 - Non-blocking `eval` / `eval_all`: the GPU runs while the host records the next steps; reads and `sync` wait
 - Readback into a new `Vec` (`to_vec`) or into host memory you already own (`read_into`)
-- Multi-step stencils with `iterate`; elementwise loops over several arrays with `iterate_all`, compiled into one kernel that keeps the state in registers
+- Multi-step stencils with `iterate`; elementwise loops over several arrays with `iterate_all`, compiled into one kernel that keeps the state in registers; `iterate_until` / `iterate_until_all` stop on a device-side condition
 - Ability to use custom WGSL kernels
 - Subgroups, `f16` and cooperative matrices (tensor cores) on GPUs that support them
 - Kernel tuning per GPU vendor (Apple and NVIDIA measured, generic defaults elsewhere)
@@ -100,7 +101,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 | `LUMA_CALIBRATE` | `0`, `off` or `false`: skip measuring the device's throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see `LUMA_CACHE`; a measurement that looks contended by other processes is dropped) and use the tuning profile's fixed cost model |
 | `LUMA_CACHE` | `0`, `off` or `false`: do not keep anything between processes. By default luma stores the driver's compiled pipelines (wgpu `PipelineCache`, Vulkan) and the measured cost model per adapter and driver, so a second run skips the multi-second compile of large (`Df32`) kernels and the calibration |
 | `LUMA_CACHE_DIR` | Directory of that cache (default `$XDG_CACHE_HOME/luma`, else `~/.cache/luma`); files are written atomically, so processes may share it, and a damaged file is ignored |
-| `LUMA_EXIT_WAIT` | `0` skips waiting at exit for NVIDIA's driver threads on Linux (saves about 50 ms; risks the driver's exit hang or abort). By default exit waits up to 30 s for busy driver compiler threads and then ends the process with `_exit` |
+| `LUMA_EXIT_WAIT` | `0` skips waiting at exit for NVIDIA's driver threads on Linux (saves about 50 ms; risks the driver's exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads and then ends the process with `_exit` |
 
 ### Examples
 

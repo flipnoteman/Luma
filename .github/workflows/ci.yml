@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     # The long fuzz run, nightly.
@@ -19,16 +20,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install software Vulkan (Mesa lavapipe)
         run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
-      - run: cargo test --locked
-      - run: cargo test --release --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo install cargo-nextest --locked
       - run: cargo nextest run --locked
       - run: cargo nextest run --release --locked
+      - run: cargo test --doc --locked
       - name: Differential fuzzer
         run: "cargo test --release --locked fuzz::"
         env:
           LUMA_FUZZ_CASES: 200
-      - run: cargo doc --no-deps
+      - run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
 

@@ -4,7 +4,7 @@ All notable changes to Luma are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-13
 
 ### Breaking
 
@@ -115,6 +115,11 @@ All notable changes to Luma are listed here. The format follows
   156x76 grid, single precision, no `cache()`: 89 launches / 320 us to 14 / 60 us.
 - NVIDIA driver hang or crash in `exit`: luma waits for driver-started threads and ends the
   process with `_exit` if one stays busy (`LUMA_EXIT_WAIT=0` skips the wait).
+- Cyclic-reduction index wrap above $2^{23}$ cells, pager self-deadlock when spilling during a
+  traced `iterate*` step, `ReadOnly` alias checks on `+=`/`write`/mutable kernel args, `NaN`
+  residuals falsely converging `iterate_until*`, `#[derive(Fields)]` `+=` mutating shared buffers in
+  place, `hypot` overflow and Metal `tanh` saturation above `|x| >= 44`, tiled `conv1d` out-of-window
+  `Inf` contamination, and Linux `musl` builds.
 
 ### Testing
 
@@ -285,5 +290,5 @@ All notable changes to Luma are listed here. The format follows
 - A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
 - A library layout, with the shader loaded from a hard-coded relative path.
 
-[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.2.0...HEAD
+[0.3.0]: https://github.com/flipnoteman/Luma/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/flipnoteman/Luma/releases/tag/v0.2.0

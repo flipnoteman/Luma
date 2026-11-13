@@ -63,11 +63,13 @@ casts! { Df32 =>
 }
 
 impl Array<f32> {
-    /// The sum of all elements, accumulated in double-float arithmetic and rounded to `f32`
-    /// at the end: a lazy one-element array like [`Array::sum`]. The accumulation does not
-    /// depend on the reduction tree (workgroup sizes, subgroups), so the result is the exact sum
-    /// rounded to `f32` up to the last place; use it for residual norms and in regression tests.
-    /// Costs several times the plain sum's arithmetic and reads the array once.
+    /// The sum of all elements, accumulated in double-float arithmetic and rounded to `f32` at
+    /// the end: a lazy one-element array like [`Array::sum`]. The accumulator keeps roughly twice
+    /// the precision of `f32`, so the result is the exact sum rounded to `f32` except for sums
+    /// whose terms cancel almost completely; the order of the reduction tree (workgroup sizes,
+    /// subgroups) can still change the bits below `f32` precision. Use it for residual norms and
+    /// in regression tests. Costs several times the plain sum's arithmetic and reads the array
+    /// once.
     #[track_caller]
     pub fn sum_compensated(&self) -> Array<f32> {
         self.to_df32().sum().to_f32()

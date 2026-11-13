@@ -275,3 +275,34 @@ fn constants_may_be_infinite() {
     .unwrap();
     assert_eq!((run.steps, run.reason), (7, StopReason::Predicate(1)));
 }
+
+#[test]
+fn a_nan_state_never_satisfies_a_condition() {
+    let ctx = Context::new().unwrap();
+    let mut data = [1.0f32; 8];
+    data[5] = f32::NAN;
+    let init = (Array::from_slice_on(&ctx, &data, 8).unwrap(),);
+    let run = iterate_until_all(
+        init,
+        Until::new(50)
+            .record("sum", |s: &One| s.0.sum())
+            .stop_when(|h| h["sum"].last().le(1e30))
+            .stop_when(|h| h["sum"].peak().le(1e30))
+            .stop_when(|h| h["sum"].trough().le(1e30))
+            .stop_when(|h| h["sum"].window_max(4).ge(-1e30)),
+        |s, _| (&s.0 * 0.5,),
+    )
+    .unwrap();
+    assert_eq!((run.steps, run.reason), (50, StopReason::MaxSteps));
+    assert!(run.history("sum").unwrap().iter().all(|v| v.is_nan()));
+}
+
+#[test]
+fn zero_steps_return_a_copy_that_does_not_alias_the_input() {
+    let ctx = Context::new().unwrap();
+    let x = ones(&ctx, 4);
+    let mut run = iterate_until_all((x.clone(),), Until::new(0), |s, _| (&s.0 * 0.5,)).unwrap();
+    run.state.0 += 1.0;
+    assert_eq!(run.state.0.to_vec().unwrap(), vec![2.0; 4]);
+    assert_eq!(x.to_vec().unwrap(), vec![1.0; 4]);
+}

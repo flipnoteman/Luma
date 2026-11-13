@@ -989,7 +989,7 @@ pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tu
                             let amount = *scalars.get(s as usize)?;
                             if h == 1 {
                                 (signed(amount, w), 0)
-                            } else if amount % w == 0 {
+                            } else if amount.is_multiple_of(w) {
                                 (0, signed(amount / w, h))
                             } else {
                                 return None;

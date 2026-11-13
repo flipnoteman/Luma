@@ -18,7 +18,7 @@ use wgpu::{Buffer, BufferUsages};
 const QUERIES: u32 = 512;
 
 /// Bytes of one resolved timestamp.
-pub(crate) const TIMESTAMP_BYTES: u64 = 8;
+const TIMESTAMP_BYTES: u64 = 8;
 
 /// The GPU time one kernel took, summed over all of its launches in a profile.
 #[derive(Debug, Clone, PartialEq, Eq)]

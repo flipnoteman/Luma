@@ -85,11 +85,14 @@ pub(crate) struct KernelKey {
     source: String,
     entry: String,
     workgroup: Option<[u32; 3]>,
+    /// Part of the key so that a cached kernel is named as the caller asked: the profile lists
+    /// the label of the kernel it launched.
+    label: Option<String>,
 }
 
 impl KernelKey {
     pub(crate) fn new(source: String, entry: &str, workgroup: Option<[u32; 3]>) -> Self {
-        KernelKey { source, entry: entry.to_owned(), workgroup }
+        KernelKey { source, entry: entry.to_owned(), workgroup, label: None }
     }
 }
 
@@ -157,8 +160,9 @@ impl<'a> KernelBuilder<'a> {
             source: self.source,
             entry: self.entry,
             workgroup: self.workgroup,
+            label: self.label,
         };
-        let label = self.label.as_deref();
+        let label = key.label.as_deref();
         let (core, _) = self.ctx.kernel_cache().get_or_build(&key, || build_core(self.ctx, &key, label, false).map(Arc::new))?;
         Ok(Kernel { ctx: self.ctx.clone(), core })
     }
@@ -502,6 +506,12 @@ fn storage_arg<'a, T: GpuType>(array: &'a Array<T>, writable: bool) -> KernelArg
                 "cannot pass a read-only view as &mut Array; use slice_mut, flip_mut or transpose_mut".into(),
             ))),
         };
+    }
+    if writable
+        && let Ok(storage) = array.storage()
+        && storage.is_alias()
+    {
+        return KernelArg { repr: ArgRepr::Poisoned(Arc::new(LumaError::ReadOnly("the state passed to an iteration step"))) };
     }
     if writable {
         // Lazy operations recorded earlier still read the contents the kernel is about to change.

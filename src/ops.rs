@@ -261,6 +261,9 @@ impl<T: ScalarType> Array<T> {
     ) -> Outcome<()> {
         let ctx = self.context();
         let storage = Arc::clone(self.storage()?);
+        if storage.is_alias() {
+            return Err(LumaError::ReadOnly("the state passed to an iteration step").into());
+        }
         let other = match rhs {
             Rhs::Array(other) => {
                 if !ctx.same_as(other.context()) {
@@ -360,7 +363,11 @@ impl<T: ScalarType> Array<T> {
 
     #[track_caller]
     pub(crate) fn assign_op(&mut self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str) {
-        let location = Location::caller();
+        self.assign_op_at(rhs, op, name, Location::caller());
+    }
+
+    /// [`Array::assign_op`] reporting failures at `location`.
+    pub(crate) fn assign_op_at(&mut self, rhs: Rhs<'_, T>, op: BinOp, name: &'static str, location: &'static Location<'static>) {
         let result = if self.is_read_view() {
             self.src().and_then(|_| -> Outcome<()> {
                 Err(LumaError::InvalidShape("cannot mutate a read-only view; use slice_mut, flip_mut or transpose_mut".into()).into())

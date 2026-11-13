@@ -10,7 +10,7 @@ use crate::gpu::pager::Pin;
 use crate::builtin::{Builtin, Finish, ReduceList, ReduceOp};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
-use crate::ops::{fold_workgroups, launch_1d};
+use crate::ops::{fold_workgroups, launch_1d, len_u32};
 
 use super::codegen::direct;
 use super::{lock, Args, Edge, ElemTy, Node, OpKind, ShiftKind, Src, ViewMap};
@@ -184,10 +184,6 @@ fn launch_loop(
     launch_1d(ctx, core, n, &raw)?;
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     Ok(outputs)
-}
-
-pub(super) fn len_u32(len: usize) -> Result<u32, LumaError> {
-    u32::try_from(len).map_err(|_| LumaError::InvalidShape(format!("{len} elements exceed u32")))
 }
 
 /// Evaluates `node`: one fused kernel computing its whole expression into a new buffer.

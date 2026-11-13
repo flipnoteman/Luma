@@ -148,7 +148,7 @@ pub(crate) enum Verdict {
     Fits(Inlined),
     /// The lowered program has more instructions than allowed; evaluating sub-program `sub` first
     /// (reading its buffer instead of recomputing it) is what saves the most.
-    TooBig { sub: u32 },
+    TooBig { sub: u32, instructions: usize },
 }
 
 struct Lowering<'a> {
@@ -230,7 +230,7 @@ fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> f64 {
         && let Some(taken) = flats.get(value as usize)
         && let Some(Ctx { kind: ShiftKind::View { map, .. }, .. }) = ctxs.get(taken.at as usize)
     {
-        return (cells(map.src) / cells(map.out)).clamp(1.0 / 4096.0, 1.0);
+        return if cells(map.out) == 0.0 { 1.0 } else { (cells(map.src) / cells(map.out)).clamp(1.0 / 4096.0, 1.0) };
     }
     0.5
 }
@@ -527,7 +527,7 @@ pub(crate) fn inline(key: &FusedKey, cap: usize, cost: &CostModel) -> Verdict {
                 (u64::from(lowering.count[s].saturating_sub(1)) * length, length)
             })
             .unwrap_or(0);
-        return Verdict::TooBig { sub: u32::try_from(sub).unwrap_or(u32::MAX) };
+        return Verdict::TooBig { sub: u32::try_from(sub).unwrap_or(u32::MAX), instructions: lowering.instrs.len() };
     }
     let roots = key_roots(key, &main);
     Verdict::Fits(lowering.finish(main, roots, cost))
@@ -687,25 +687,25 @@ fn stage(key: &FusedKey, cap: usize, cost: &CostModel, tuning: &Tuning) -> Optio
 /// its region rounded up to whole rounds of the workgroup (and a store and a load of the value,
 /// counted as 4 operations).
 fn staged_time(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, elements: f64, cost: &CostModel) -> f64 {
-    let tile = f64::from(staging.tile[0]) * f64::from(staging.tile[1]);
     let all = programs.bodies();
     let reads = all.flat_map(|lowered| lowered.instrs.iter().flat_map(|flat| flat.args).chain(lowered.ctxs.iter().flat_map(|ctx| ctx.args)));
     let io_bytes = elements * (input_bytes(key, reads) + output_bytes(key));
-    let staged_ops: f64 = programs
+    // The workgroup computes the region in rounds of one cell per invocation, and a round costs
+    // the same however few invocations have a cell left in it: a region of 272 cells over 256
+    // invocations is two rounds, not 1.06. Every workgroup of the launch does the whole of it.
+    let per_tile: f64 = programs
         .groups
         .iter()
         .filter_map(|group| {
-            // The workgroup computes the region in rounds of one cell per invocation, and a
-            // round costs the same however few invocations have a cell left in it: a region of
-            // 272 cells over 256 invocations is two rounds, not 1.06.
             let cells = staging.subs.get(*group.members.first()?)?.cells();
             let workgroup = f64::from(super::stencil::WORKGROUP);
             let computed = (f64::from(cells) / workgroup).ceil() * workgroup;
-            Some(computed / tile * (group.body.ops + 4.0 * group.members.len() as f64))
+            Some(computed * (group.body.ops + 4.0 * group.members.len() as f64))
         })
         .sum();
+    let staged_ops = f64::from(staging.tiles()) * per_tile;
     let invocations = f64::from(staging.tiles()) * f64::from(super::stencil::WORKGROUP);
-    kernel_ns_on(cost, io_bytes, (programs.main.ops + staged_ops) * elements, invocations)
+    kernel_ns_on(cost, io_bytes, programs.main.ops * elements + staged_ops, invocations)
 }
 
 /// How much cheaper a staged kernel must be estimated than the one it replaces to be chosen.
@@ -731,7 +731,7 @@ struct Env<'a> {
 struct Plans {
     /// The program written out at every index its sub-programs are read at; past the
     /// cap, the sub-program that saves the most instructions when evaluated first.
-    inlined: Result<Inlined, u32>,
+    inlined: Result<Inlined, (u32, usize)>,
     /// One kernel running the lowered program (infinite if it exceeds the cap).
     inline_ns: f64,
     /// The workgroup staging of the sub-programs read through views and the programs it runs.
@@ -787,7 +787,7 @@ impl Plans {
                 let inline_ns = kernel_ns_on(env.cost, io_bytes, inlined.ops * elements, elements);
                 Plans { inlined: Ok(inlined), inline_ns, staged, staged_ns, unfit_ns: 0.0 }
             }
-            Verdict::TooBig { sub } => Plans { inlined: Err(sub), inline_ns: f64::INFINITY, staged, staged_ns, unfit_ns: UNFIT_NS + written_out_ns(key, len, env.cost) },
+            Verdict::TooBig { sub, instructions } => Plans { inlined: Err((sub, instructions)), inline_ns: f64::INFINITY, staged, staged_ns, unfit_ns: UNFIT_NS + written_out_ns(key, len, env.cost) },
         }
     }
 
@@ -1098,7 +1098,8 @@ pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tu
     let mut search = Search { env, memo: FxMap::default() };
     let first = search.evaluate_first(key, len, &plans, SEARCH_DEPTH);
     let estimates = Estimates { inline_ns: plans.inline_ns, best_sub: first.as_ref().map(|(group, t)| (group[0], *t)), staged_ns: plans.staged_ns };
-    let over_cap = SplitReason::Inlined { instructions: cap.saturating_add(1), limit: cap };
+    let instructions = plans.inlined.as_ref().err().map_or(cap.saturating_add(1), |&(_, instructions)| instructions);
+    let over_cap = SplitReason::Inlined { instructions, limit: cap };
     match first {
         Some((subs, t)) if pays(t, run) => {
             let reason = if plans.fits() {
@@ -1113,11 +1114,52 @@ pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tu
             let staging = if plans.stages() { plans.staged.map(|(staging, _)| staging) } else { None };
             (Judgement::Run { staging }, estimates)
         }
-        _ => (Judgement::Materialise { subs: vec![plans.inlined.err().unwrap_or(0)], reason: over_cap }, estimates),
+        _ => (Judgement::Materialise { subs: vec![plans.inlined.err().map_or(0, |(sub, _)| sub)], reason: over_cap }, estimates),
     }
 }
 
-    #[allow(clippy::items_after_test_module)]
+/// Checks the structure the code generator relies on in a lowered program of `key`'s kernel
+/// with `inputs` inputs: contexts descend from lower ones, temporaries refer backwards, contexts
+/// exist, and sub-program reads appear only as shifts of staged lowerings.
+#[cfg(any(debug_assertions, test))]
+pub(super) fn validate_inlined(inlined: &Inlined, inputs: usize, staged: bool) -> Result<(), String> {
+    for (id, ctx) in inlined.ctxs.iter().enumerate().skip(1) {
+        if ctx.parent as usize >= id {
+            return Err(format!("context {id} has parent {}", ctx.parent));
+        }
+    }
+    let n = inlined.instrs.len();
+    for (at, flat) in inlined.instrs.iter().enumerate() {
+        let here = format!("lowered instruction {at} ({:?})", flat.op.kind);
+        if flat.at as usize >= inlined.ctxs.len() || flat.child as usize >= inlined.ctxs.len() {
+            return Err(format!("{here}: context {} / {} of {}", flat.at, flat.child, inlined.ctxs.len()));
+        }
+        for (slot, &arg) in flat.args.iter().enumerate() {
+            match arg {
+                Ref::Tmp(t) if t as usize >= at => return Err(format!("{here}: operand {slot} reads t{t}, not an earlier instruction")),
+                Ref::Input(k) if k as usize >= inputs => return Err(format!("{here}: operand {slot} reads input {k} of {inputs}")),
+                Ref::Sub(_) if !(staged && slot == 0 && matches!(flat.op.kind, OpKind::Shift(_))) => {
+                    return Err(format!("{here}: operand {slot} is a sub-program"));
+                }
+                _ => {}
+            }
+        }
+    }
+    for ctx in inlined.ctxs.iter().skip(1) {
+        for arg in ctx.args {
+            if let Ref::Tmp(t) = arg
+                && t as usize >= n
+            {
+                return Err(format!("a context reads t{t} of {n}"));
+            }
+        }
+    }
+    if let Some(&at) = inlined.main.iter().find(|&&at| at as usize >= n) {
+        return Err(format!("main entry {at} of {n} lowered instructions"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,7 +1214,7 @@ mod tests {
     fn fits(verdict: Verdict) -> Inlined {
         match verdict {
             Verdict::Fits(inlined) => inlined,
-            Verdict::TooBig { sub } => panic!("too big: sub {sub}"),
+            Verdict::TooBig { sub, instructions } => panic!("too big: sub {sub}, {instructions} instructions"),
         }
     }
 
@@ -1290,7 +1332,7 @@ mod tests {
             instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
         ];
         let verdict = inline(&key(main.clone(), vec![long, short]), 8, &CostModel::TEST);
-        assert!(matches!(verdict, Verdict::TooBig { sub: 0 }), "{verdict:?}");
+        assert!(matches!(verdict, Verdict::TooBig { sub: 0, .. }), "{verdict:?}");
         // Within the cap it fits.
         let again = inline(&key(main, vec![expression(), vec![expression()[0].clone()]]), 100, &CostModel::TEST);
         assert!(matches!(again, Verdict::Fits(_)));
@@ -1500,44 +1542,3 @@ mod tests {
     }
 }
 
-/// Checks the structure the code generator relies on in a lowered program of `key`'s kernel
-/// with `inputs` inputs: contexts descend from lower ones, temporaries refer backwards, contexts
-/// exist, and sub-program reads appear only as shifts of staged lowerings.
-#[cfg(any(debug_assertions, test))]
-pub(super) fn validate_inlined(inlined: &Inlined, inputs: usize, staged: bool) -> Result<(), String> {
-    for (id, ctx) in inlined.ctxs.iter().enumerate().skip(1) {
-        if ctx.parent as usize >= id {
-            return Err(format!("context {id} has parent {}", ctx.parent));
-        }
-    }
-    let n = inlined.instrs.len();
-    for (at, flat) in inlined.instrs.iter().enumerate() {
-        let here = format!("lowered instruction {at} ({:?})", flat.op.kind);
-        if flat.at as usize >= inlined.ctxs.len() || flat.child as usize >= inlined.ctxs.len() {
-            return Err(format!("{here}: context {} / {} of {}", flat.at, flat.child, inlined.ctxs.len()));
-        }
-        for (slot, &arg) in flat.args.iter().enumerate() {
-            match arg {
-                Ref::Tmp(t) if t as usize >= at => return Err(format!("{here}: operand {slot} reads t{t}, not an earlier instruction")),
-                Ref::Input(k) if k as usize >= inputs => return Err(format!("{here}: operand {slot} reads input {k} of {inputs}")),
-                Ref::Sub(_) if !(staged && slot == 0 && matches!(flat.op.kind, OpKind::Shift(_))) => {
-                    return Err(format!("{here}: operand {slot} is a sub-program"));
-                }
-                _ => {}
-            }
-        }
-    }
-    for ctx in inlined.ctxs.iter().skip(1) {
-        for arg in ctx.args {
-            if let Ref::Tmp(t) = arg
-                && t as usize >= n
-            {
-                return Err(format!("a context reads t{t} of {n}"));
-            }
-        }
-    }
-    if let Some(&at) = inlined.main.iter().find(|&&at| at as usize >= n) {
-        return Err(format!("main entry {at} of {n} lowered instructions"));
-    }
-    Ok(())
-}

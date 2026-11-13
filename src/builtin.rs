@@ -96,7 +96,9 @@ impl UnOp {
             UnOp::Sin => "sin(x)",
             UnOp::Cos => "cos(x)",
             UnOp::Tan => "tan(x)",
-            UnOp::Tanh => "tanh(x)",
+            // Metal's `tanh` overflows `exp(2x)` to `Inf / Inf = 0` from `|x| >= 44`; for `f32`,
+            // `tanh(+-15)` is already `+-1.0` to the last bit.
+            UnOp::Tanh => "tanh(clamp(x, -15.0, 15.0))",
             UnOp::Sign => "sign(x)",
             UnOp::Floor => "floor(x)",
             UnOp::Ceil => "ceil(x)",
@@ -215,7 +217,8 @@ impl BinOp {
             BinOp::Min => "min(x, y)",
             BinOp::Max => "max(x, y)",
             BinOp::Atan2 => "atan2(x, y)",
-            BinOp::Hypot => "length(vec2<f32>(x, y))",
+            // Scaled by the larger magnitude so that squaring neither overflows nor underflows.
+            BinOp::Hypot => "select(max(abs(x), abs(y)), max(abs(x), abs(y)) * length(vec2<f32>(x / max(abs(x), abs(y)), y / max(abs(x), abs(y)))), max(abs(x), abs(y)) > 0.0 && max(abs(x), abs(y)) < 3.4028235e38)",
             BinOp::Copysign => "bitcast<f32>((bitcast<u32>(x) & 0x7fffffffu) | (bitcast<u32>(y) & 0x80000000u))",
             BinOp::Rem => "x % y",
             BinOp::BitAnd => "x & y",
@@ -843,7 +846,7 @@ fn conv1d_tiled(stride: u32, per_thread: u32, wg: u32) -> String {
     for i in 0..r {
         acc.push_str(&format!("    var acc{i} = 0.0;\n"));
         if r.is_multiple_of(4) {
-            if i % 4 == 0 {
+            if i.is_multiple_of(4) {
                 loads.push_str(&format!("            let q{} = weights[k / 4u + {}u];\n", i / 4, i / 4));
             }
             loads.push_str(&format!("            let w{i} = q{}.{};\n", i / 4, ["x", "y", "z", "w"][(i % 4) as usize]));
@@ -860,9 +863,12 @@ fn conv1d_tiled(stride: u32, per_thread: u32, wg: u32) -> String {
         loads.push_str(&format!("            let v{m} = window[slot(at + {m}u)];\n"));
     }
     for kk in 0..r {
+        // Taps past the end of the chunk have zero weights; their inputs may be anything.
+        fmas.push_str(&format!("            if (k + {kk}u < taps) {{\n"));
         for i in 0..r {
-            fmas.push_str(&format!("            acc{i} = fma(v{}, w{kk}, acc{i});\n", i * s + kk));
+            fmas.push_str(&format!("                acc{i} = fma(v{}, w{kk}, acc{i});\n", i * s + kk));
         }
+        fmas.push_str("            }\n");
     }
     format!(
         "struct Params {{ kernel_len: u32, stride: u32, padding: u32, input_len: u32, output_len: u32 }}
@@ -1259,9 +1265,12 @@ const UNTIL_GATE: &str = "struct Params { tol: f32, step: u32, words: u32 }
 @group(1) @binding(4) var<uniform> p: Params;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-    let done = st[0] != 0u || res[0] <= p.tol;
+    // Fast math may not honour NaN comparisons, so the bits are tested too.
+    let bits = bitcast<u32>(res[0]);
+    let hit = (bits & 0x7fffffffu) <= 0x7f800000u && res[0] <= p.tol;
+    let done = st[0] != 0u || hit;
     if (g.x == 0u && st[0] == 0u) {
-        if (res[0] <= p.tol) { st[0] = 1u; }
+        if (hit) { st[0] = 1u; }
         st[1] = p.step + 1u;
     }
     if (g.x < p.words) { args[g.x] = select(tmpl[g.x], 0u, done); }

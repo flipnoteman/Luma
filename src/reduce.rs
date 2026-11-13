@@ -68,7 +68,12 @@ impl Reduced {
     /// A node standing for the value of this reduction in expressions: evaluating it records the passes.
     pub(crate) fn leaf(self: &Arc<Self>, ctx: &Context, len: usize) -> Arc<Node> {
         let leaf = jit::deferred(ctx, len, self.ty, Arc::clone(self), self.name, self.location);
-        crate::gpu::lock(&self.leaves).push(Arc::downgrade(&leaf));
+        let mut leaves = crate::gpu::lock(&self.leaves);
+        // Dead leaves (their expressions were dropped) are pruned as the list doubles.
+        if leaves.len() >= 32 && leaves.len().is_power_of_two() {
+            leaves.retain(|weak| weak.strong_count() > 0);
+        }
+        leaves.push(Arc::downgrade(&leaf));
         leaf
     }
 

@@ -25,7 +25,7 @@ use crate::error::{LumaError, Result};
 use crate::gpu_type::ScalarType;
 use crate::jit::{operator_source, ElemTy, Operator};
 use crate::kernel::KernelCore;
-use crate::ops::{fold_workgroups, Outcome, Rhs};
+use crate::ops::{fold_workgroups, workgroups_1d, Outcome, Rhs};
 use crate::shape::Shape;
 
 // Measured on an RTX 3090 (`bench_pde --only scan` and `reduce/sum_axis`, 2^26 `f32`): every
@@ -417,7 +417,7 @@ impl<'a> Lines<'a> {
             return self.ctx.launch(&core, fold_workgroups(self.ctx, groups)?, [groups, 1, 1], &args);
         }
         let count = if pass == Pass::Seq { lines } else { lines * nb };
-        let workgroups = fold_workgroups(self.ctx, count.div_ceil(core.workgroup[0]))?;
+        let workgroups = workgroups_1d(self.ctx, &core, count)?;
         self.ctx.launch(&core, workgroups, [count, 1, 1], &args)
     }
 

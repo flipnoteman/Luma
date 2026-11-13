@@ -1,7 +1,5 @@
 //! The arena uniform values of a batch are packed into.
 
-
-
 use wgpu::Buffer;
 
 use super::batch::Prefix;

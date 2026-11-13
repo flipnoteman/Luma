@@ -1,6 +1,6 @@
 // Spatial 1D convolution (cross-correlation). Launched with one invocation per output element,
-// `luma.size.x` = output length. Buffers may be larger than the arrays they hold, so lengths come
-// from the parameters, never from arrayLength().
+// folded over x and y workgroups (`out_idx = gid.x + gid.y * nwg.x * 64`). Buffers may be larger
+// than the arrays they hold, so lengths come from the parameters, never from arrayLength().
 struct Params {
     kernel_len: u32,
     stride: u32,

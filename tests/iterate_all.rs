@@ -181,7 +181,7 @@ fn a_state_that_cycles_never_stops_early() {
     let start = Array::<f32>::full_on(&ctx, 64, 0.25).unwrap();
     for steps in [7, 8, 9, 16, 17, 33] {
         let [u] = iterate_all([&start], steps, |[u]| [1.0 - u]);
-        let want = if steps % 2 == 0 { 0.25 } else { 0.75 };
+        let want = if steps.is_multiple_of(2) { 0.25 } else { 0.75 };
         assert!(u.to_vec().unwrap().iter().all(|&v| v == want), "{steps} steps");
     }
 }

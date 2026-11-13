@@ -173,7 +173,7 @@ impl Stepper {
         for j in 0..states {
             if t == 1 {
                 swaps.push((self.probes[j].clone(), self.init[j].clone()));
-            } else if t % 2 == 0 {
+            } else if t.is_multiple_of(2) {
                 swaps.push((self.probes[j].clone(), self.ping_buffers[j].clone()));
                 swaps.push((self.ping_buffers[j].clone(), self.pong_buffers[j].clone()));
             } else {

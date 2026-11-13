@@ -370,6 +370,49 @@ fn conv1d_zero_stride_returns_error() {
     assert!(matches!(err.root(), LumaError::InvalidShape(_)), "got: {err}");
 }
 
+#[test]
+fn conv1d_infinite_input_only_reaches_the_outputs_that_read_it() {
+    // Taps past the end of the kernel (padding of the tiled kernel's groups) must not see inputs
+    // of the next outputs: 0 * inf would be NaN.
+    let n = 4096;
+    let mut input_data = vec![1.0f32; n];
+    input_data[100] = f32::INFINITY;
+    input_data[2500] = f32::INFINITY;
+    let input = array([n, 1, 1, 1], &input_data);
+    let kernel_data = [0.5f32, 1.0, 1.5, 2.0, 2.5];
+    let kernel = array([5, 1, 1, 1], &kernel_data);
+    for stride in [1usize, 2] {
+        let got = input.conv1d(&kernel, stride, 0).to_vec().unwrap();
+        assert_eq!(got.len(), (n - 5) / stride + 1);
+        for (o, g) in got.iter().enumerate() {
+            let reaches = |i: usize| (o * stride..o * stride + 5).contains(&i);
+            if reaches(100) || reaches(2500) {
+                assert_eq!(*g, f32::INFINITY, "stride {stride} output {o}");
+            } else {
+                assert_eq!(*g, 7.5, "stride {stride} output {o}");
+            }
+        }
+    }
+}
+
+#[test]
+fn conv1d_rejects_multidimensional_input() {
+    let input = array([4, 2, 1, 1], &[1.0f32; 8]);
+    let kernel = array([2, 1, 1, 1], &[1.0f32, 1.0]);
+    let err = input.conv1d(&kernel, 1, 0).to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::InvalidShape(_)), "got: {err}");
+    let err = input.conv1d_fft(&kernel).to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::InvalidShape(_)), "got: {err}");
+}
+
+#[test]
+fn conv1d_rejects_padding_beyond_i32() {
+    let input = array([3, 1, 1, 1], &[1.0f32, 2.0, 3.0]);
+    let kernel = array([1, 1, 1, 1], &[1.0f32]);
+    let err = input.conv1d(&kernel, 1, 1 << 31).to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::InvalidShape(_)), "got: {err}");
+}
+
 // -- FFT Conv1D (f32 only) --
 
 #[test]
@@ -620,7 +663,7 @@ fn fft_conv1d_matches_the_direct_sum_for_transforms_beyond_one_tile() {
         let mut worst = 0.0f64;
         // Both ends in full, every 7th output elsewhere.
         let ends = 2048;
-        for (o, g) in got.iter().enumerate().filter(|(o, _)| o % 7 == 0 || *o < ends || o + ends > got.len()) {
+        for (o, g) in got.iter().enumerate().filter(|(o, _)| o.is_multiple_of(7) || *o < ends || o + ends > got.len()) {
             let lo = o.saturating_sub(input_len - 1);
             let want: f64 = (lo..kernel_len.min(o + 1))
                 .map(|k| f64::from(input_data[o - k]) * f64::from(kernel_data[k]))

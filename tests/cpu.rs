@@ -37,7 +37,7 @@ fn fft_convolution_is_exact_without_lockstep_invocations() {
         assert_eq!(got.len(), input_len + kernel_len - 1);
         let mut worst = 0.0f64;
         let ends = 2048;
-        for (o, g) in got.iter().enumerate().filter(|(o, _)| o % 7 == 0 || *o < ends || o + ends > got.len()) {
+        for (o, g) in got.iter().enumerate().filter(|(o, _)| o.is_multiple_of(7) || *o < ends || o + ends > got.len()) {
             let lo = o.saturating_sub(input_len - 1);
             let want: f64 = (lo..kernel_len.min(o + 1))
                 .map(|k| f64::from(input_data[o - k]) * f64::from(kernel_data[k]))

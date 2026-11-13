@@ -235,3 +235,44 @@ fn a_shape_mismatch_poisons_the_fields_at_the_callers_location() {
     let error = sliced.rho.error().unwrap();
     assert!(error.location().unwrap().file().ends_with("records.rs"));
 }
+
+#[test]
+fn compound_assignment_writes_the_shared_buffers_in_place() {
+    let ctx = Context::new().unwrap();
+    let ha = host(15);
+    let mut p = cons(&ctx, &ha);
+    let q = Cons { rho: p.rho.clone(), mu: p.mu.clone(), mv: p.mv.clone(), e: p.e.clone() };
+    p += 1.0;
+    let (got_p, got_q) = (fields(&p), fields(&q));
+    for k in 0..4 {
+        let want: Vec<f32> = ha[k].iter().map(|v| v + 1.0).collect();
+        assert_close(&got_p[k], &want, 1e-6, 1e-6);
+        assert_close(&got_q[k], &want, 1e-6, 1e-6);
+    }
+    // The array and record forms write in place as well.
+    let hb = host(16);
+    let r = Cons { rho: p.rho.clone(), mu: p.mu.clone(), mv: p.mv.clone(), e: p.e.clone() };
+    p -= &cons(&ctx, &hb);
+    p *= &Array::from_slice_on(&ctx, &[2.0f32; 20], SHAPE).unwrap();
+    let (got_p, got_r) = (fields(&p), fields(&r));
+    for k in 0..4 {
+        let want: Vec<f32> = (0..20).map(|i| (ha[k][i] + 1.0 - hb[k][i]) * 2.0).collect();
+        assert_close(&got_p[k], &want, 1e-5, 1e-6);
+        assert_close(&got_r[k], &want, 1e-5, 1e-6);
+    }
+}
+
+#[test]
+fn compound_assignment_to_a_slice_poisons_it_instead_of_detaching() {
+    let ctx = Context::new().unwrap();
+    let ha = host(17);
+    let p = cons(&ctx, &ha);
+    let mut s = p.slice(0, 1..3);
+    s += 1.0;
+    for f in s.arrays() {
+        let error = f.error().expect("poisoned");
+        assert!(matches!(error.root(), LumaError::InvalidShape(_)), "{error}");
+        assert!(error.location().unwrap().file().ends_with("records.rs"));
+    }
+    assert_eq!(fields(&p), ha);
+}

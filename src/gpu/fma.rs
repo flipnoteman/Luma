@@ -33,13 +33,14 @@ fn pairs() -> Vec<(f32, f32)> {
     (0..64).map(|_| (next(), next())).collect()
 }
 
-/// Runs the exactness test on `device`: `true` when every `fma(a, b, -p)` returned exactly the
-/// rounding error of `a * b`. Any failure to run the test counts as not fused.
-pub(crate) fn fused(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+/// Runs the exactness test on `device`: `Some(true)` when every `fma(a, b, -p)` returned exactly
+/// the rounding error of `a * b`. `None` when the test could not run (buffer, poll or readback
+/// failure), so the caller does not keep a transient failure.
+pub(crate) fn fused(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<bool> {
     let pairs = pairs();
     let expected: Vec<f32> = pairs.iter().map(|&(a, b)| (f64::from(a) * f64::from(b) - f64::from(a * b)) as f32).collect();
     if expected.iter().all(|&e| e == 0.0) {
-        return false;
+        return Some(false);
     }
     let bytes = (pairs.len() * 4) as u64;
     let a: Vec<f32> = pairs.iter().map(|p| p.0).collect();
@@ -90,13 +91,13 @@ pub(crate) fn fused(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
         let _ = sender.send(result);
     });
     if device.poll(wgpu::PollType::wait_indefinitely()).is_err() || !matches!(receiver.recv(), Ok(Ok(()))) {
-        return false;
+        return None;
     }
-    let Ok(view) = read.slice(..).get_mapped_range() else { return false };
+    let Ok(view) = read.slice(..).get_mapped_range() else { return None };
     let got: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
     drop(view);
     read.unmap();
-    got.iter().zip(&expected).all(|(g, e)| g.to_bits() == e.to_bits())
+    Some(got.iter().zip(&expected).all(|(g, e)| g.to_bits() == e.to_bits()))
 }
 
 #[cfg(test)]
@@ -110,7 +111,7 @@ mod tests {
         assert_eq!(first, super::fused(ctx.device(), ctx.queue()));
         if std::env::var_os("LUMA_DF_FMA").is_none() {
             // The stored answer of an earlier process may be used instead of a new test, but both are one device.
-            assert_eq!(ctx.tuning().df_fma, first);
+            assert_eq!(Some(ctx.tuning().df_fma), first);
         }
         let forced = Context::with_options(ContextOptions::from_env().calibrate(false).df_fma(false)).unwrap();
         assert!(!forced.tuning().df_fma);

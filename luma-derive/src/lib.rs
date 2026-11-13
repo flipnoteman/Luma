@@ -194,19 +194,19 @@ fn expand(input: &DeriveInput) -> Tokens {
             impl #assign_path<&#name> for #name {
                 #[track_caller]
                 fn #assign_method(&mut self, rhs: &#name) {
-                    *self = ::luma::Fields::binary(&*self, rhs, #op);
+                    ::luma::Fields::assign_op(self, rhs, #op);
                 }
             }
             impl #assign_path<#elem> for #name {
                 #[track_caller]
                 fn #assign_method(&mut self, rhs: #elem) {
-                    *self = ::luma::Fields::binary_scalar(&*self, rhs, #op, false);
+                    ::luma::Fields::assign_op_scalar(self, rhs, #op);
                 }
             }
             impl #assign_path<&#arr> for #name {
                 #[track_caller]
                 fn #assign_method(&mut self, rhs: &#arr) {
-                    *self = ::luma::Fields::binary_array(&*self, rhs, #op, false);
+                    ::luma::Fields::assign_op_array(self, rhs, #op);
                 }
             }
         });

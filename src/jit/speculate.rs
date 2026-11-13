@@ -18,7 +18,7 @@ use crate::context::{Context, Scratch};
 use crate::error::{LumaError, Result};
 use crate::reduce::finish_passes;
 
-use super::program::{flatten_step, same_program, Fused, StateRef, Tail, Traced};
+use super::program::{flatten_step, Fused, FusedKey, StateRef, Tail, Traced};
 use super::{launch, ElemTy, Node, Src};
 
 /// Most steps computed ahead by one readback.
@@ -27,15 +27,31 @@ const SPEC_MAX_DEPTH: usize = 16;
 const WALK_MAX: usize = 1024;
 /// A round trip that is not hidden by speculation, assumed until measured.
 const FLOOR: Duration = Duration::from_micros(1);
+/// Readbacks that go without speculation after three misses in a row.
+const COOLDOWN: u32 = 16;
 
 /// The step program of the last readback that could be traced.
 #[derive(Debug)]
 struct Template {
     /// The reduction of the readback; inputs `0..states` are the states.
-    fused: Fused,
+    key: FusedKey,
+    scalars: Vec<u32>,
     states: usize,
+    /// The inputs after the states. Weak: a finished loop must not keep its buffers alive.
+    fixed: Vec<Weak<Storage>>,
     /// The node of each instruction. Weak, so that a freed address never compares equal.
     members: Vec<Weak<Node>>,
+}
+
+impl Template {
+    /// Whether `fused` is this step: the same program with the same scalar values and the same
+    /// buffers behind every input after the states.
+    fn is_step(&self, fused: &Fused) -> bool {
+        self.key == fused.key
+            && self.scalars == fused.scalars
+            && fused.inputs.len() == self.states + self.fixed.len()
+            && fused.inputs[self.states..].iter().zip(&self.fixed).all(|(a, w)| std::ptr::eq(Arc::as_ptr(a), w.as_ptr()))
+    }
 }
 
 /// What was computed ahead.
@@ -63,7 +79,8 @@ pub(super) struct Tracker {
     repeats: u32,
     pub(super) hits: u64,
     misses_in_row: u32,
-    disabled: bool,
+    /// Readbacks left to skip after repeated misses.
+    cooldown: u32,
     /// The shortest readback without speculation, and the shortest time per step computed ahead
     /// seen so far.
     wait: Option<Duration>,
@@ -81,11 +98,15 @@ impl Tracker {
             repeats: 0,
             hits: 0,
             misses_in_row: 0,
-            disabled: false,
+            cooldown: 0,
             wait: None,
             step: None,
             cache: None,
         }
+    }
+
+    pub(super) fn clear_cache(&mut self) {
+        self.cache = None;
     }
 
     fn forget_step(&mut self) {
@@ -119,7 +140,7 @@ impl Tracker {
         }
         let states: Vec<StateRef> = cache.cur.iter().cloned().map(StateRef::Buffer).collect();
         let traced = flatten_step(std::slice::from_ref(node), &states, tail)?;
-        let known = same_program(&traced.fused, &template.fused, template.states)
+        let known = template.is_step(&traced.fused)
             && outs.iter().all(|&out| traced.members.get(out as usize).is_some_and(Option::is_some));
         known.then_some(traced)
     }
@@ -152,12 +173,15 @@ impl Tracker {
     ) -> Result<Vec<u32>> {
         let count = ops.as_slice().len();
         let snapshot = self.template.as_ref().zip(self.outs.as_ref());
-        let Some((fused, states, outs)) = snapshot.map(|(template, outs)| (template.fused.clone(), template.states, outs.clone())) else {
+        let Some((key, scalars, states, outs)) =
+            snapshot.map(|(template, outs)| (template.key.clone(), template.scalars.clone(), template.states, outs.clone()))
+        else {
             return self.plain(ctx, count, reduce);
         };
         let nexts: Option<Vec<Arc<Node>>> =
             outs.iter().map(|&out| traced.members.get(out as usize).cloned().flatten()).collect();
-        let Some(nexts) = nexts.filter(|_| fused.inputs[states..].iter().all(|input| input.segments() == 1)) else {
+        let fixed: Vec<Arc<Storage>> = traced.fused.inputs.get(states..).unwrap_or_default().to_vec();
+        let Some(nexts) = nexts.filter(|_| fixed.iter().all(|input| input.segments() == 1)) else {
             return self.plain(ctx, count, reduce);
         };
         drop(traced);
@@ -170,6 +194,14 @@ impl Tracker {
             return self.plain(ctx, count, reduce);
         };
         drop(nexts);
+        let fused = Fused {
+            key,
+            inputs: cur.iter().chain(&fixed).cloned().collect(),
+            scalars,
+            fused_nodes: Vec::new(),
+            instr_nodes: Vec::new(),
+            sub_roots: Vec::new(),
+        };
 
         let mut scratch = Scratch::new(ctx);
         let mut finals = vec![reduce(&mut scratch)?];
@@ -199,7 +231,7 @@ impl Tracker {
             let per_step = start.elapsed().saturating_sub(self.wait.unwrap_or_default()) / steps as u32;
             self.step = Some(self.step.map_or(per_step, |step| step.min(per_step)));
         }
-        let generations = fused.inputs[states..]
+        let generations = fixed
             .iter()
             .chain(cur.iter())
             .chain(ahead.iter().flatten())
@@ -332,7 +364,11 @@ pub(crate) fn readback(
     let ctx = node.context();
     let mut guard = ctx.jit().speculation.try_lock().ok()?;
     let tracker = &mut *guard;
-    if !tracker.enabled || tracker.disabled {
+    if !tracker.enabled {
+        return None;
+    }
+    if tracker.cooldown > 0 {
+        tracker.cooldown -= 1;
         return None;
     }
     let tail = Tail::Reduce(ops);
@@ -360,10 +396,13 @@ pub(crate) fn readback(
             None => {
                 if !cache.values.is_empty() {
                     tracker.misses_in_row += 1;
-                    tracker.disabled = tracker.misses_in_row >= 3;
+                    if tracker.misses_in_row >= 3 {
+                        tracker.cooldown = COOLDOWN;
+                        tracker.misses_in_row = 0;
+                    }
                 }
                 tracker.forget_step();
-                if tracker.disabled {
+                if tracker.cooldown > 0 {
                     return None;
                 }
             }
@@ -393,9 +432,7 @@ pub(crate) fn readback(
 
     let before = tracker.template.take();
     let states = frontier.len();
-    let same = before.as_ref().is_some_and(|before| {
-        before.states == states && same_program(&traced.fused, &before.fused, states)
-    });
+    let same = before.as_ref().is_some_and(|before| before.states == states && before.is_step(&traced.fused));
     tracker.repeats = if same { tracker.repeats + 1 } else { 0 };
     // Where the previous template computed the states this readback reads.
     tracker.outs = before.as_ref().filter(|before| before.states == states).and_then(|before| {
@@ -407,11 +444,11 @@ pub(crate) fn readback(
             })
             .collect()
     });
-    let mut fused = traced.fused.clone();
-    fused.fused_nodes.clear();
     tracker.template = Some(Template {
-        fused,
+        key: traced.fused.key.clone(),
+        scalars: traced.fused.scalars.clone(),
         states,
+        fixed: traced.fused.inputs[states..].iter().map(Arc::downgrade).collect(),
         members: traced.members.iter().map(|member| member.as_ref().map_or_else(Weak::new, Arc::downgrade)).collect(),
     });
 

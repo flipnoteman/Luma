@@ -176,6 +176,9 @@ impl Segment {
                 self.stamp.store(pager.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
                 return Ok(Pin { segment: Arc::clone(self), buffer: buffer.clone() });
             }
+            if matches!(&*lock(&self.state), State::Host(_)) {
+                self.ctx.abort_recording()?;
+            }
             self.ctx.make_room(self.bytes)?;
             let buffer = self.ctx.alloc_buffer(self.bytes, STORAGE_USAGE)?;
             let mut state = lock(&self.state);
@@ -258,6 +261,13 @@ impl Context {
     pub(crate) fn evict_one(&self) -> Result<bool> {
         if EVICTING.with(Cell::get) {
             return Ok(false);
+        }
+        // Before any lock: aborting a recording can pin (and so lock) the victim's segment.
+        self.abort_recording()?;
+        let before = self.pager().resident_bytes.load(Ordering::Relaxed);
+        self.jit().drop_speculated();
+        if self.pager().resident_bytes.load(Ordering::Relaxed) < before {
+            return Ok(true);
         }
         EVICTING.with(|flag| flag.set(true));
         let _guard = EvictingGuard;

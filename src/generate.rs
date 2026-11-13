@@ -103,6 +103,7 @@ impl<T: ScalarType> Array<T> {
         let Some(&size) = dims.get(dim) else {
             return Err(LumaError::InvalidShape(format!("range along dimension {dim} of a 4-dimensional shape")));
         };
+        shape.validate()?;
         let stride: usize = dims[..dim].iter().product();
         let fits = |v: usize| u32::try_from(v).map_err(|_| LumaError::InvalidShape(format!("{v} exceeds u32")));
         let (stride32, size32) = (fits(stride)?, fits(size)?);

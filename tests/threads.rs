@@ -443,7 +443,7 @@ fn recycled_buffers_do_not_reach_into_the_plan_another_thread_replays() {
                 drop(b);
                 let want: Vec<f32> = u0.iter().map(|v| v * scale + 1.0).collect();
                 assert_close(&got, &want, 1e-5, 1e-6);
-                if k % 7 == 0 {
+                if (k as u32).is_multiple_of(7) {
                     ctx.sync().unwrap();
                 }
             }

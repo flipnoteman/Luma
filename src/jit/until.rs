@@ -13,9 +13,9 @@ use crate::array::{Failure, Storage};
 use crate::builtin::{Builtin, ReduceList, ReduceOp};
 use crate::context::{Context, RawArg, Scratch, STORAGE_USAGE};
 use crate::error::LumaError;
-use crate::ops::{fold_workgroups, launch_1d, workgroups_1d};
+use crate::ops::{fold_workgroups, launch_1d, len_u32, workgroups_1d};
 
-use super::launch::{len_u32, params, pin_inputs, store_args};
+use super::launch::{params, pin_inputs, store_args};
 use super::program::{flatten, flatten_inner, Fused, Tail};
 use super::{ElemTy, Node};
 

@@ -222,8 +222,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     src.push_str(&sync("true").replace("        ", "    "));
 
     // Forward levels.
-    src.push_str("    var h = 1u;\n    for (; h < m; h = h << 1u) {\n");
-    src.push_str("        for (var r = 2u * h * li; r < m; r += 2u * h * WG) {\n");
+    src.push_str("    var h = 1u;\n    for (; h < m; ) {\n");
+    src.push_str("        let step = 2u * h;\n        let count = (m - 1u) / step + 1u;\n        for (var j = li; j < count; j += WG) {\n            let r = j * step;\n");
     let ind = "            ";
     for i in 0..b {
         for j in 0..b {
@@ -254,10 +254,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     store_row(&mut src, ind, "r", b);
     src.push_str("        }\n");
     src.push_str(&sync("2u * h < KS"));
-    src.push_str("    }\n");
+    src.push_str("        if (h >= 0x80000000u) { break; }\n        h = h << 1u;\n    }\n");
 
     // Backward levels.
-    src.push_str("    while (h > 1u) {\n        h = h >> 1u;\n        for (var r = h + 2u * h * li; r < m; r += 2u * h * WG) {\n");
+    src.push_str("    while (h > 1u) {\n        h = h >> 1u;\n        let step = 2u * h;\n        let count = (m - 1u - h) / step + 1u;\n        for (var j = li; j < count; j += WG) {\n            let r = h + j * step;\n");
     for k in 0..b {
         let _ = writeln!(src, "{ind}let xl{k} = ld(r - h, {}u);", 2 * bb + k);
     }

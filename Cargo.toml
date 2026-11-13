@@ -1,20 +1,27 @@
 [package]
 name = "luma"
-version = "0.3.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Lazy GPU arrays for Rust on wgpu (Vulkan, Metal, DX12): fused elementwise kernels, reductions, FFT convolution, custom WGSL kernels"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 readme = "README.md"
-repository = "https://github.com/flipnoteman/Luma"
+repository.workspace = true
 documentation = "https://docs.rs/luma"
 keywords = ["gpu", "wgpu", "array", "math", "compute"]
 categories = ["science", "mathematics", "concurrency"]
-rust-version = "1.99"
+rust-version.workspace = true
 exclude = [".github/", "benchmarks/"]
 
 [workspace]
 members = ["luma-derive"]
 exclude = ["benchmarks/arrayfire"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/flipnoteman/Luma"
+rust-version = "1.99"
 
 [dependencies]
 wgpu = { version = "30", features = ["naga-ir"] }

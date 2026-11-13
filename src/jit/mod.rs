@@ -1932,7 +1932,7 @@ const MAX_STAGES: u8 = 3;
 pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 4]) -> bool {
     // A lazy operand runs inside kernels of segmented programs only if it fits one segment, so
     // segmented programs have no sub-programs.
-    if node.len() as u64 * 4 > node.context().segment_bytes() {
+    if node.len() as u64 * node.op().out_ty().bytes() > node.context().segment_bytes() {
         return false;
     }
     let small = |axis: usize| {
@@ -2207,10 +2207,18 @@ impl JitState {
         }
     }
 
+    /// Returns the buffers of precomputed speculation to the pool.
+    pub(crate) fn drop_speculated(&self) {
+        lock(&self.speculation).clear_cache();
+    }
+
     /// Makes the instructions of `key` the ones every equal program shares, so that comparing
     /// keys from here on is a comparison of addresses.
     pub(crate) fn intern(&self, key: &mut program::FusedKey) {
         let mut structures = lock(&self.structures);
+        if structures.len() >= 4096 {
+            structures.clear();
+        }
         let entries = structures.entry(key.shape).or_default();
         let same = |known: &(Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>)| {
             (Arc::ptr_eq(&known.0, &key.instrs) || known.0 == key.instrs) && (Arc::ptr_eq(&known.1, &key.subs) || known.1 == key.subs)
@@ -2234,6 +2242,9 @@ impl JitState {
         (cap, key.shape, class).hash(&mut hasher);
         let hash = hasher.finish();
         let mut judgements = lock(&self.judgements);
+        if judgements.len() >= 4096 {
+            judgements.clear();
+        }
         let entries = judgements.entry(hash).or_default();
         let same = |entry: &JudgementEntry| {
             entry.cap == cap
@@ -2304,7 +2315,7 @@ impl JitState {
                 // The table holds hashes only: a collision must not share a different value.
                 Some(theirs) => node.op == op && node.len == len && cons_same(op, theirs, args),
                 // A loop leaf has handed its operands to the plan.
-                None => node.looped.get().is_some(),
+                None => node.looped.get().is_some() && node.op == op && node.len == len,
             };
         usable.then_some(node)
     }
@@ -2574,6 +2585,10 @@ impl JitState {
                 // all the same when `held`).
                 let kept = held && node.handles.load(Ordering::Relaxed) > 0;
                 if !node.is_pending() || (node.fused.load(Ordering::Relaxed) && !kept) {
+                    // Still wanted by a later `evaluate_held`.
+                    if !held && node.is_pending() && node.handles.load(Ordering::Relaxed) > 0 {
+                        self.live.add_weak(Arc::downgrade(&node));
+                    }
                     continue;
                 }
                 // Part of an expression of the group: it is computed inside that kernel and only

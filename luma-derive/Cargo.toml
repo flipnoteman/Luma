@@ -1,11 +1,11 @@
 [package]
 name = "luma-derive"
-version = "0.3.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Derive macro for luma::Fields"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/flipnoteman/Luma"
-rust-version = "1.99"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [lib]
 proc-macro = true

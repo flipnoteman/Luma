@@ -295,6 +295,32 @@ pub trait Fields: Sized {
 
     #[doc(hidden)]
     #[track_caller]
+    fn assign_op(&mut self, other: &Self, op: FieldOp) {
+        let (location, (op, name)) = (Location::caller(), op.parts());
+        let theirs = other.arrays();
+        let mut k = 0;
+        self.each_mut(&mut |a| {
+            a.assign_op_at(Rhs::Array(theirs[k]), op, name, location);
+            k += 1;
+        });
+    }
+
+    #[doc(hidden)]
+    #[track_caller]
+    fn assign_op_scalar(&mut self, scalar: Self::Elem, op: FieldOp) {
+        let (location, (op, name)) = (Location::caller(), op.parts());
+        self.each_mut(&mut |a| a.assign_op_at(Rhs::Scalar(scalar), op, name, location));
+    }
+
+    #[doc(hidden)]
+    #[track_caller]
+    fn assign_op_array(&mut self, other: &Array<Self::Elem>, op: FieldOp) {
+        let (location, (op, name)) = (Location::caller(), op.parts());
+        self.each_mut(&mut |a| a.assign_op_at(Rhs::Array(other), op, name, location));
+    }
+
+    #[doc(hidden)]
+    #[track_caller]
     fn negate(&self) -> Self {
         let location = Location::caller();
         self.map(|a| a.neg_at(location))

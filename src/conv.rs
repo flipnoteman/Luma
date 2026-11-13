@@ -3,15 +3,13 @@
 
 use std::panic::Location;
 
-use crate::array::{Array, Failure, Storage};
+use crate::array::{Array, Storage};
 use crate::builtin::{conv_tile, Builtin, CONV_MAX_STRIDE};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::fft;
-use crate::ops::{fold_workgroups, launch_1d};
+use crate::ops::{fold_workgroups, launch_1d, Outcome};
 use crate::shape::Shape;
-
-type Outcome<T> = std::result::Result<T, Failure>;
 
 impl Array<f32> {
     /// 1D convolution (cross-correlation) with the given kernel, stride and zero-padding.
@@ -46,6 +44,9 @@ fn check_operands(input: &Array<f32>, kernel: &Array<f32>) -> Outcome<()> {
     if !input.context().same_as(kernel.context()) {
         return Err(LumaError::ContextMismatch.into());
     }
+    if input.shape().dims()[1..] != [1, 1, 1] {
+        return Err(LumaError::InvalidShape("Input must be 1D".into()).into());
+    }
     if kernel.shape().dims()[1..] != [1, 1, 1] {
         return Err(LumaError::InvalidShape("Kernel must be 1D".into()).into());
     }
@@ -70,6 +71,9 @@ fn run_conv1d(
     let kernel_len = kernel.len();
     if stride == 0 {
         return Err(LumaError::InvalidShape("Stride must be non-zero".into()).into());
+    }
+    if padding > i32::MAX as usize {
+        return Err(LumaError::InvalidShape("Padding is too large".into()).into());
     }
     let padded_len = padding
         .checked_mul(2)

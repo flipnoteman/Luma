@@ -35,6 +35,8 @@ pub(crate) struct Stencil {
     /// Read offset (x, y) of every shift instruction, by instruction index.
     offsets: Vec<Option<(i32, i32)>>,
     radius: (u32, u32),
+    /// The instruction computing the next value of `u`.
+    out: u32,
     dims: (u32, u32),
 }
 
@@ -127,7 +129,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
                 let amount = *fused.scalars.get(k as usize)?;
                 if h == 1 {
                     (signed(amount, w), 0)
-                } else if amount % w == 0 {
+                } else if amount.is_multiple_of(w) {
                     (0, signed(amount / w, h))
                 } else {
                     return None;
@@ -160,6 +162,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
         scalars: fused.scalars,
         offsets,
         radius,
+        out,
         dims: (w, h),
     })
 }
@@ -232,7 +235,7 @@ fn main(
             cells = lw * lh,
             wrap = wrap_source(self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh)),
         );
-        let out = self.instrs.len() - 1;
+        let out = self.out;
         for step in 1..=k {
             let (from, to) = if step % 2 == 1 {
                 ("b0", "b1")

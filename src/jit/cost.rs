@@ -32,7 +32,7 @@ pub struct CostModel {
 }
 
 impl CostModel {
-    /// RTX 3090 (Vulkan), measured by [`calibrate`] (median of 5 runs).
+    /// RTX 3090 (Vulkan), measured by [`calibrate`] (best of [`BEST_OF`] runs).
     pub(crate) const NVIDIA: CostModel = CostModel {
         launch_us: 2.9,
         bandwidth_gbs: 740.0,
@@ -40,7 +40,7 @@ impl CostModel {
         df32_factor: 27.0,
         f64_factor: Some(41.0),
     };
-    /// Every other GPU, measured on a RADV Raphael iGPU (median of 5 runs).
+    /// Every other GPU, measured on a RADV Raphael iGPU (best of 5 runs).
     pub(crate) const GENERIC: CostModel = CostModel {
         launch_us: 2.0,
         bandwidth_gbs: 62.0,
@@ -48,7 +48,7 @@ impl CostModel {
         df32_factor: 44.0,
         f64_factor: Some(11.0),
     };
-    /// Mesa llvmpipe on a Ryzen 9 7950X (median of 5 runs).
+    /// Mesa llvmpipe on a Ryzen 9 7950X (best of 5 runs).
     pub(crate) const CPU: CostModel = CostModel {
         launch_us: 32.0,
         bandwidth_gbs: 31.0,
@@ -107,7 +107,8 @@ pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
         OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::Linspace) => 2.0,
         OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal) => 60.0,
     };
-    let arithmetic = matches!(op.kind, OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Clamp | OpKind::Compare(_));
+    let arithmetic = matches!(op.kind, OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Clamp | OpKind::Compare(_))
+        && !matches!(op.kind, OpKind::Unary(UnOp::Id));
     match op.ty {
         ElemTy::Df32 if arithmetic => base * cost.df32_factor,
         ElemTy::F64 if arithmetic => base * cost.f64_factor.unwrap_or(32.0),

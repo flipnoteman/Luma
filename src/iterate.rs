@@ -239,7 +239,7 @@ impl Array<f32> {
             return Err(Failure::Inherited(Arc::new(error.clone())));
         }
         if steps == 0 {
-            return Ok(self * 1.0);
+            return Ok(self.copied());
         }
         if self.storage()?.segments() == 1 {
             return self.replayed(steps, step);
@@ -314,11 +314,11 @@ impl Array<f32> {
             return Err(Failure::Inherited(Arc::new(error.clone())));
         }
         if max_steps == 0 {
-            return Ok(self * 1.0);
+            return Ok(self.copied());
         }
         let probe = self.probe()?;
         let first = step(&probe);
-        let change = (&first - &probe).abs();
+        let change = nan_to_inf((&first - &probe).abs());
         if first.shape() == self.shape()
             && let (Some(first), Some(change)) = (first.pending(), change.pending())
             && let (Ok(from), Ok(alias)) = (self.storage(), probe.storage())
@@ -335,10 +335,15 @@ impl Array<f32> {
                 break;
             }
             let next = step(&u);
-            change = (&next - &u).abs();
+            change = nan_to_inf((&next - &u).abs());
             u = next;
         }
         u.check()?;
         Ok(u)
     }
+}
+
+/// `diff` with every NaN replaced by infinity, so that a NaN step never counts as converged.
+fn nan_to_inf(diff: Array<f32>) -> Array<f32> {
+    crate::ops::select(&diff.is_nan(), f32::INFINITY, &diff)
 }

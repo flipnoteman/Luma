@@ -203,6 +203,12 @@ fn scalar_of(ty: ElemTy, value: f64) -> Src {
     Src::Scalar(Scalar { ty, bits: const_bits(ty, value) })
 }
 
+/// Whether `value` stays finite (and non-zero, if `nonzero`) when rounded to `ty`.
+fn survives(ty: ElemTy, value: f64, nonzero: bool) -> bool {
+    let rounded = if ty == ElemTy::F32 { f64::from(value as f32) } else { value };
+    rounded.is_finite() && (!nonzero || rounded != 0.0)
+}
+
 /// The rewrites that may change rounding, the sign of zero or the handling of NaN and infinity.
 fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
     let [a, b, _] = args;
@@ -219,7 +225,11 @@ fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
                 BinOp::Div if float && same(a, b) => constant(op, 1.0),
                 BinOp::Div if matches!(ty, ElemTy::F32 | ElemTy::F64) => {
                     let divisor = sb.and_then(value_of).filter(|v| *v != 0.0)?;
-                    binary(BinOp::Mul, ty, a, scalar_of(ty, 1.0 / divisor))
+                    let recip = 1.0 / divisor;
+                    if !survives(ty, recip, true) {
+                        return None;
+                    }
+                    binary(BinOp::Mul, ty, a, scalar_of(ty, recip))
                 }
                 _ => reassociate(op, args),
             }
@@ -279,6 +289,11 @@ fn reassociate(op: Op, args: &Args) -> Option<(Op, Args)> {
         (BinOp::Sub, BinOp::Add) => (BinOp::Add, k - c),
         _ => return None,
     };
+    // A constant that overflows or underflows in `ty` would turn finite results into infinities
+    // or zeros.
+    if !survives(ty, folded, kind == BinOp::Mul && k != 0.0 && c != 0.0) {
+        return None;
+    }
     binary(kind, ty, x, scalar_of(ty, folded))
 }
 
@@ -545,6 +560,28 @@ mod tests {
         assert_eq!(factor.bits, u64::from((1.0f32 / 3.0).to_bits()));
         let zero = [args[0].clone(), Src::Scalar(Scalar::f32(0.0)), Src::unused()];
         assert!(rewrite(op, &zero, true).is_none());
+    }
+
+    #[test]
+    fn simplify_fast_rules_keep_finite_values_finite() {
+        let ctx = context(true);
+        let x = Array::from_slice_on(&ctx, &W, 6).unwrap();
+        let buffer = Src::Buffer(std::sync::Arc::clone(x.storage().ok().unwrap()));
+        let div = Op::new(OpKind::Binary(BinOp::Div), ElemTy::F32);
+        // Dividing by infinity or a subnormal whose reciprocal overflows `f32` must not fold.
+        let by_inf = [buffer.clone(), Src::Scalar(Scalar::f32(f32::INFINITY)), Src::unused()];
+        assert!(rewrite(div, &by_inf, true).is_none());
+        let by_subnormal = [buffer, Src::Scalar(Scalar::f32(1e-40)), Src::unused()];
+        assert!(rewrite(div, &by_subnormal, true).is_none());
+        // A combined constant outside the range of `f32` must stay two operations (`fusion_limit(1)`
+        // keeps the shader compiler's own fast-math from reassociating across the two steps).
+        let near = |got: Vec<f32>, want: [f32; 2]| {
+            assert!(got.iter().zip(want).all(|(g, w)| w != 0.0 && g.is_finite() && (g - w).abs() <= w.abs() * 1e-5), "{got:?} vs {want:?}");
+        };
+        let large = Array::from_slice_on(&ctx, &[1e20f32, 3e20], 2).unwrap();
+        near(crate::fusion_limit(1, || &(&large * 1e-25) * 1e-25).to_vec().unwrap(), [1e-30, 3e-30]);
+        let tiny = Array::from_slice_on(&ctx, &[1e-30f32, 2e-30], 2).unwrap();
+        near(crate::fusion_limit(1, || &(&tiny * 1e30) * 1e30).to_vec().unwrap(), [1e30, 2e30]);
     }
 
     fn f32s(bits: &[u32]) -> Vec<f32> {

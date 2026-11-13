@@ -84,18 +84,6 @@ impl Storage {
         Self::with_segments(ctx, len, elem, segments, None)
     }
 
-    /// A storage whose segments are the given buffers, one per segment in order, each holding
-    /// its element range already. The segments recycle them when dropped.
-    pub(crate) fn adopt(ctx: &Context, len: usize, elem: usize, buffers: Vec<wgpu::Buffer>) -> Self {
-        let c = segment_len(ctx, elem);
-        let segments = buffers
-            .into_iter()
-            .enumerate()
-            .map(|(j, buffer)| Segment::filled(ctx, ((len.min((j + 1) * c) - j * c) * elem) as u64, buffer))
-            .collect();
-        Self::with_segments(ctx, len, elem, segments, None)
-    }
-
     /// A distinct storage identity backed by `owner`'s segments without recycling them
     /// separately.
     pub(crate) fn alias(owner: &Arc<Storage>) -> Self {
@@ -378,23 +366,19 @@ impl<T: GpuType> Array<T> {
             return Err(LumaError::LengthMismatch { expected: len, actual: data.len() });
         }
         if ctx.zero_copy() {
-            let storage = Storage::new(ctx, len, std::mem::size_of::<T>());
-            let mut buffers = Vec::with_capacity(storage.segments());
-            for j in 0..storage.segments() {
-                let filled = ctx
-                    .make_room(storage.range(j).len() as u64 * std::mem::size_of::<T>() as u64)
-                    .and_then(|()| ctx.alloc_filled(bytemuck::cast_slice(&data[storage.range(j)])));
-                match filled {
-                    Ok(buffer) => buffers.push(buffer),
-                    Err(err) => {
-                        for buffer in buffers {
-                            ctx.recycle(buffer);
-                        }
-                        return Err(err);
-                    }
-                }
+            let elem = std::mem::size_of::<T>();
+            let c = segment_len(ctx, elem);
+            // Registered as they are filled, so dropping them on failure recycles them and
+            // making room for the next one sees them.
+            let mut segments = Vec::with_capacity(len.div_ceil(c));
+            for start in (0..len).step_by(c) {
+                let end = len.min(start + c);
+                let bytes = ((end - start) * elem) as u64;
+                ctx.make_room(bytes)?;
+                let buffer = ctx.alloc_filled(bytemuck::cast_slice(&data[start..end]))?;
+                segments.push(Segment::filled(ctx, bytes, buffer));
             }
-            let storage = Storage::adopt(ctx, len, std::mem::size_of::<T>(), buffers);
+            let storage = Storage::with_segments(ctx, len, elem, segments.into_boxed_slice(), None);
             return Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(storage))));
         }
         let array = Self::alloc(ctx, shape)?;
@@ -701,6 +685,9 @@ impl<T: GpuType> Array<T> {
             ));
         }
         let storage = self.storage().map_err(Failure::into_error)?;
+        if storage.is_alias() {
+            return Err(LumaError::ReadOnly("the state passed to an iteration step"));
+        }
         if data.len() != self.len() {
             return Err(LumaError::LengthMismatch { expected: self.len(), actual: data.len() });
         }

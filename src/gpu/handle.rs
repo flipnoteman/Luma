@@ -73,7 +73,7 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     // copied from a template of valid counts or zeroed (see `jit::until`), so wgpu's check of
     // them, an extra validation dispatch in front of every indirect one, protects nothing.
     instance_desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let validated = instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION);
     let instance = wgpu::Instance::new(instance_desc);
 
@@ -131,19 +131,21 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
         flag.store(true, Ordering::Release);
     });
     let memory = device_local_bytes(&adapter);
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     super::exit::track(&device, validated);
     let info = adapter.get_info();
     let disk = DiskCache::open(cache_dir, &device, &info);
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     if !validated {
         cache::flush_at_exit(&disk);
     }
     // Found out once per machine: the result is kept next to the calibration.
-    let df_fma = disk.load_fma().unwrap_or_else(|| {
-        let fused = super::fma::fused(&device, &queue);
-        disk.store_fma(fused);
-        fused
+    let df_fma = disk.load_fma().unwrap_or_else(|| match super::fma::fused(&device, &queue) {
+        Some(fused) => {
+            disk.store_fma(fused);
+            fused
+        }
+        None => false,
     });
     Ok(Gpu { device, queue, adapter: info, lost, cpu, memory, cost: Arc::new(OnceLock::new()), disk, df_fma })
 }

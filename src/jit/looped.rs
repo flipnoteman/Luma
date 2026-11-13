@@ -315,8 +315,10 @@ impl JitState {
         TRACKERS
             .try_with(|all| {
                 let mut all = all.borrow_mut();
-                if let Some((_, tracker)) = all.iter().find(|(id, _)| *id == self.id) {
-                    return Arc::clone(tracker);
+                if let Some(at) = all.iter().position(|(id, _)| *id == self.id) {
+                    let last = all.len() - 1;
+                    all[at..].rotate_left(1);
+                    return Arc::clone(&all[last].1);
                 }
                 if all.len() >= MAX_TRACKERS {
                     all.remove(0);

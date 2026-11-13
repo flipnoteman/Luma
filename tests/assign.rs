@@ -304,7 +304,7 @@ fn what_was_recorded_before_a_lazy_write_keeps_the_old_values() {
     assert_eq!(g.slice(1, 1..3).to_array().to_vec().unwrap(), vec![7.0; 2]);
     let got = w.to_vec().unwrap();
     for (k, v) in got.iter().enumerate() {
-        assert_eq!(*v, if k % wi == 0 { 7.0 } else { before[k] }, "{k}");
+        assert_eq!(*v, if k.is_multiple_of(wi) { 7.0 } else { before[k] }, "{k}");
     }
 }
 

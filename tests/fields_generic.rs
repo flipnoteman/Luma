@@ -67,7 +67,7 @@ fn a_df32_record_does_arithmetic_with_scalars_and_arrays() {
     // Record with record, element scalar (both sides), array, negation.
     let r = (&a * &b + &a / &b - Df32::from(0.5) * &a) * Df32::from(1.25) - &b * &lam;
     let neg = -&a;
-    let mut acc = Dd { u: a.u.clone(), v: a.v.clone() };
+    let mut acc = a.copy();
     acc += &b;
     acc *= Df32::from(0.5);
     acc -= &lam;

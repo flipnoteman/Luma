@@ -11,7 +11,7 @@ use wgpu::{Buffer, BufferUsages};
 
 use crate::error::{LumaError, Result};
 use crate::array::Storage;
-use crate::gpu::pool::{self};
+use crate::gpu::pool;
 
 use super::{lock, Context, MAPPABLE_STORAGE_USAGE};
 
@@ -24,7 +24,7 @@ const UPLOAD_USAGE: BufferUsages = BufferUsages::MAP_WRITE.union(BufferUsages::C
 /// Readbacks larger than twice this go in pieces of this size, see [`Context::read`].
 const READ_CHUNK: u64 = 32 << 20;
 
-/// Mapped upload staging buffers ready to be written.
+/// Reusable mapped `MAP_WRITE` buffers, ready to be written: upload staging or mappable storage.
 #[derive(Debug)]
 pub(super) struct FreeUploads {
     buffers: Vec<Buffer>,

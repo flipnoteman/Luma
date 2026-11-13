@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use wgpu::{Buffer, BufferUsages};
 
-/// Smallest buffer the pool hands out. Also the size class of every dims/params buffer.
+/// Smallest buffer the pool hands out.
 const MIN_BUFFER_SIZE: u64 = 16;
 
 /// Size class for a buffer holding `bytes` bytes: the next power of two (at least

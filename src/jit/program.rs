@@ -571,7 +571,7 @@ fn zero_shift(kind: ShiftKind) -> ShiftKind {
         ShiftKind::Linear => ShiftKind::Linear,
         ShiftKind::View { map, .. } => ShiftKind::View { map: ViewMap::identity(map.src), edge: Edge::None },
         ShiftKind::Take { len } => ShiftKind::View { map: ViewMap::identity([len, 1, 1, 1]), edge: Edge::None },
-        ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => kind,
+        ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => unreachable!("parameterized shifts only exist after flattening"),
     }
 }
 

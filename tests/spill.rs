@@ -79,3 +79,32 @@ fn a_default_context_does_not_spill_small_workloads() {
     assert_eq!(c.to_vec().unwrap(), expected);
     assert_eq!(ctx.spilled_bytes(), 0);
 }
+
+#[test]
+fn eviction_while_tracing_an_iterate_step_completes() {
+    let ctx = small_budget();
+    let len = 16_384;
+    // The state is the oldest resident segment; the fillers bring the context to its budget.
+    let x = Array::from_slice_on(&ctx, &values(len, 0), len).unwrap();
+    let fillers: Vec<Array<f32>> = (0..14).map(|k| Array::from_slice_on(&ctx, &values(len, k + 1), len).unwrap()).collect();
+    let step = |[u]: &[Array<f32>; 1]| {
+        let a = (u * 0.5 + 1.0).cache();
+        let b = (&a * 0.5 + u).cache();
+        let c = (&b * 0.25 + &a).cache();
+        [c * 0.5]
+    };
+    let [got] = luma::iterate_all([&x], 5, step);
+    let mut want = values(len, 0);
+    for _ in 0..5 {
+        for v in &mut want {
+            let a = *v * 0.5 + 1.0;
+            let b = a * 0.5 + *v;
+            *v = (b * 0.25 + a) * 0.5;
+        }
+    }
+    let got = got.to_vec().unwrap();
+    assert!(got.iter().zip(&want).all(|(g, w)| (g - w).abs() <= w.abs() * 1e-5 + 1e-5));
+    for (k, f) in fillers.iter().enumerate() {
+        assert_eq!(f.to_vec().unwrap(), values(len, k + 1));
+    }
+}

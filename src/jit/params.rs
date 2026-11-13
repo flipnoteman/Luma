@@ -38,10 +38,9 @@ pub(crate) enum DivRemSpec {
 /// What of one source axis of a view the generated code depends on; the rest are uniform words.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct AxisSpec {
-    pub(crate) from: u8,
     /// The source has more than one element along the axis (a unit axis adds nothing to the index).
     pub(crate) active: bool,
-    /// The output has one element along `from`: the coordinate is its start.
+    /// The output has one element along the axis the coordinate comes from: it is the start.
     pub(crate) out_unit: bool,
     pub(crate) out_div: DivRemSpec,
     pub(crate) out_rem: DivRemSpec,
@@ -70,7 +69,6 @@ pub(crate) struct Parameterized {
 }
 
 const UNUSED_AXIS: AxisSpec = AxisSpec {
-    from: 0,
     active: false,
     out_unit: true,
     out_div: DivRemSpec::None,
@@ -139,7 +137,6 @@ impl Builder {
                 DivRemSpec::Const(dim_out)
             };
             let spec = AxisSpec {
-                from: axis.from,
                 active: map.src[a] > 1,
                 out_unit: dim_out == 1,
                 out_div,

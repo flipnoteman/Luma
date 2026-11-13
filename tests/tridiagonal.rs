@@ -305,3 +305,31 @@ fn lazy_operands_and_errors() {
     let err = solve_tridiagonal_from(0, &lo, &diag, &up, &rhs, &short).to_vec().unwrap_err();
     assert!(matches!(err.root(), LumaError::InvalidShape(_)), "{err}");
 }
+
+#[test]
+fn long_lines_of_every_parity_satisfy_their_equations() {
+    // Lengths around powers of two exercise every level of the reduction, forward and backward.
+    let ctx = Context::new().unwrap();
+    let lines = 3;
+    for n in [1usize, 2, 3, 7, 1023, 1024, 1025, 4099] {
+        let sys = scalar_system(n * lines, n as u64);
+        let arr = |d: &[f32]| Array::from_slice_on(&ctx, d, [n, lines]).unwrap();
+        let (lo, diag, up, rhs) = (arr(&sys.lo), arr(&sys.diag), arr(&sys.up), arr(&sys.rhs));
+        let got = solve_tridiagonal(0, &lo, &diag, &up, &rhs).to_vec().unwrap();
+        let mut worst = 0.0f64;
+        for l in 0..lines {
+            for s in 0..n {
+                let q = l * n + s;
+                let mut e = f64::from(sys.diag[q]) * f64::from(got[q]) - f64::from(sys.rhs[q]);
+                if s > 0 {
+                    e += f64::from(sys.lo[q]) * f64::from(got[q - 1]);
+                }
+                if s + 1 < n {
+                    e += f64::from(sys.up[q]) * f64::from(got[q + 1]);
+                }
+                worst = worst.max(e.abs());
+            }
+        }
+        assert!(worst < 1e-4, "n {n}: residual {worst}");
+    }
+}

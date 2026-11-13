@@ -98,3 +98,68 @@ fn assigning_into_the_state_of_a_step_is_read_only() {
     let error = error.into_inner().expect("the assignment must fail");
     assert!(matches!(error.root(), LumaError::ReadOnly(_)), "{error}");
 }
+
+/// Runs three steps of `iterate_until` whose `step` calls `attempt` on a clone of the state (the
+/// state of a step is read-only), and checks that it fails with `ReadOnly` and leaves `x` alone.
+fn state_of_a_step_rejects(attempt: impl Fn(&mut Array<f32>) -> Result<()>) {
+    let x = Array::from_slice(&[1.0f32; 16], 16).unwrap();
+    let error = std::cell::RefCell::new(None);
+    let _ = x
+        .iterate_until(3, 0.0, |u| {
+            let mut c = u.clone();
+            if let Err(e) = attempt(&mut c) {
+                *error.borrow_mut() = Some(e);
+            }
+            u * 0.5
+        })
+        .to_vec();
+    let error = error.into_inner().expect("the mutation must fail");
+    assert!(matches!(error.root(), LumaError::ReadOnly(_)), "{error}");
+    assert_eq!(x.to_vec().unwrap(), vec![1.0f32; 16]);
+}
+
+#[test]
+fn compound_assignment_to_the_state_of_a_step_is_read_only() {
+    state_of_a_step_rejects(|v| {
+        *v += 1.0;
+        v.check()
+    });
+}
+
+#[test]
+fn write_to_the_state_of_a_step_is_read_only() {
+    state_of_a_step_rejects(|v| v.write(&[5.0f32; 16]));
+}
+
+#[test]
+fn mutable_kernel_argument_from_the_state_of_a_step_is_read_only() {
+    const FILL: &str = r#"
+    @group(1) @binding(0) var<storage, read_write> y: array<f32>;
+    @compute @workgroup_size(16)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) { if (gid.x < luma.size.x) { y[gid.x] = 7.0; } }
+    "#;
+    let kernel = default_context().unwrap().kernel(FILL).build().unwrap();
+    state_of_a_step_rejects(|v| kernel.launch([16], args![v]));
+}
+
+#[test]
+fn a_nan_cell_never_counts_as_converged() {
+    let mut data = [1.0f32; 8];
+    data[3] = f32::NAN;
+    let x = Array::from_slice(&data, 8).unwrap();
+    // The other cells change by less than `tol` after ten steps, but the NaN cell never settles.
+    let got = x.iterate_until(100, 1e-3, halve).to_vec().unwrap();
+    assert!(got[3].is_nan());
+    for (i, v) in got.iter().enumerate().filter(|&(i, _)| i != 3) {
+        assert!(*v < 1e-20, "cell {i} stopped early at {v}");
+    }
+}
+
+#[test]
+fn zero_steps_keeps_the_sign_of_zero() {
+    let x = Array::from_slice(&[-0.0f32, 1.0], 2).unwrap();
+    let got = x.iterate_until(0, 1e-3, halve).to_vec().unwrap();
+    assert!(got[0].is_sign_negative());
+    let got = x.iterate(0, halve).to_vec().unwrap();
+    assert!(got[0].is_sign_negative());
+}

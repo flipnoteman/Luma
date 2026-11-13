@@ -12,7 +12,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Update Rust toolchain
         run: rustup update stable && rustup default stable
@@ -30,7 +30,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
         
       - name: Run tests
-        run: cargo test --all-features --locked
+        run: cargo test --locked
         env:
           LUMA_DEVICE: cpu
 

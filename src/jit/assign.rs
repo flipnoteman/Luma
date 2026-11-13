@@ -514,9 +514,8 @@ pub(crate) fn scatter(
     };
     let values = own(values, ty)?;
     let indices = own(indices, ElemTy::U32)?;
-    let unused = || Src::unused();
-    let value = super::create(ctx, count, Op::new(OpKind::Unary(UnOp::Id), ty), [values, unused(), unused()], name, location)?;
-    let index = super::create(ctx, count, Op::new(OpKind::Unary(UnOp::Id), ElemTy::U32), [indices, unused(), unused()], name, location)?;
+    let value = super::create(ctx, count, Op::new(OpKind::Unary(UnOp::Id), ty), [values, Src::unused(), Src::unused()], name, location)?;
+    let index = super::create(ctx, count, Op::new(OpKind::Unary(UnOp::Id), ElemTy::U32), [indices, Src::unused(), Src::unused()], name, location)?;
     let stores = [value, index];
     // As in `assign`: only this function evaluates its stores.
     for store in &stores {

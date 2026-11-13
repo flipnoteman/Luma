@@ -57,6 +57,7 @@ struct Inner {
     released: Arc<Mutex<Vec<Buffer>>>,
     /// Mapped upload staging buffers, refilled by the map callbacks of submitted ones.
     uploads: Arc<Mutex<FreeUploads>>,
+    /// Recycled mappable storage buffers (unified memory), mapped again for zero-copy uploads.
     mappable: Arc<Mutex<FreeUploads>>,
     /// Bytes of a full segment of an array, see [`Storage`](crate::array::Storage).
     segment_bytes: u64,
@@ -683,6 +684,23 @@ impl Context {
         if let Some(buffer) = self.create_buffer(size, usage, mapped) {
             return Ok(buffer);
         }
+        self.reclaim_idle_buffers()?;
+        if let Some(buffer) = self.create_buffer(size, usage, mapped) {
+            return Ok(buffer);
+        }
+        // Still full: move array data to host memory, one segment at a time, until it fits.
+        while self.evict_one()? {
+            self.reclaim_idle_buffers()?;
+            if let Some(buffer) = self.create_buffer(size, usage, mapped) {
+                return Ok(buffer);
+            }
+        }
+        Err(LumaError::OutOfMemory { requested: size })
+    }
+
+    /// Gives back every idle buffer: queues them for release, submits, waits for the device, then
+    /// drops the bind groups that pinned the mapped ones.
+    fn reclaim_idle_buffers(&self) -> Result<()> {
         let mut idle = lock(&self.inner.pool).drain();
         idle.extend(lock(&self.inner.mappable).drain());
         idle.extend(lock(&self.inner.uploads).drain());
@@ -699,32 +717,7 @@ impl Context {
             batch.bound = Bound::default();
             batch.bind_groups.forget(&late);
         }
-        if let Some(buffer) = self.create_buffer(size, usage, mapped) {
-            return Ok(buffer);
-        }
-        // Still full: move array data to host memory, one segment at a time, until it fits.
-        while self.evict_one()? {
-            let mut idle = lock(&self.inner.pool).drain();
-            idle.extend(lock(&self.inner.mappable).drain());
-            idle.extend(lock(&self.inner.uploads).drain());
-            lock(&self.inner.released).extend(idle);
-            self.flush_locked(&mut *self.batch()?);
-            self.device()
-                .poll(wgpu::PollType::wait_indefinitely())
-                .map_err(|e| LumaError::Poll(Arc::new(e)))?;
-            let mut late = lock(&self.inner.mappable).drain();
-            late.extend(lock(&self.inner.uploads).drain());
-            if !late.is_empty() {
-                let mut batch = self.batch()?;
-                batch.pass = None;
-                batch.bound = Bound::default();
-                batch.bind_groups.forget(&late);
-            }
-            if let Some(buffer) = self.create_buffer(size, usage, mapped) {
-                return Ok(buffer);
-            }
-        }
-        Err(LumaError::OutOfMemory { requested: size })
+        Ok(())
     }
 
     /// A new buffer, or `None` if the device is out of memory.

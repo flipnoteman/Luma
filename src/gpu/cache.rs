@@ -161,7 +161,7 @@ impl std::fmt::Debug for DiskCache {
 }
 
 /// The caches the exit handler writes (see [`flush_at_exit`]).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 static OPEN: Mutex<Vec<Arc<DiskCache>>> = Mutex::new(Vec::new());
 
 impl DiskCache {
@@ -284,7 +284,7 @@ impl DiskCache {
 
 /// Writes every cache registered with [`flush_at_exit`] that has unwritten pipelines. Called
 /// from the exit handler.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(crate) fn flush_all() {
     // `try_lock`: this runs at exit, when a thread still running may hold the list.
     if let Ok(open) = OPEN.try_lock() {
@@ -296,7 +296,7 @@ pub(crate) fn flush_all() {
 
 /// Has the exit handler write `cache` too. Not for devices of instances with validation layers
 /// (see `exit::track`): at exit the layer no longer finds them and aborts on the first call.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(crate) fn flush_at_exit(cache: &Arc<DiskCache>) {
     if cache.pipelines.is_some() {
         lock(&OPEN).push(Arc::clone(cache));

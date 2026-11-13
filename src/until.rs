@@ -369,16 +369,26 @@ impl<S> Run<S> {
 
 // -- The two evaluations of a stop rule. --
 
+/// `f32::max` that propagates NaN, like the gate kernel.
+fn nan_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() { f32::NAN } else { a.max(b) }
+}
+
+/// `f32::min` that propagates NaN, like the gate kernel.
+fn nan_min(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() { f32::NAN } else { a.min(b) }
+}
+
 fn eval_stat(stat: &Stat, histories: &[Vec<f32>], done: usize) -> f32 {
     let window = |r: usize, k: usize| &histories[r][done - k.min(done)..done];
     match &*stat.0 {
         StatNode::Const(c) => *c,
         StatNode::Last(r) => histories[*r][done - 1],
         StatNode::First(r) => histories[*r][0],
-        StatNode::Peak(r) => histories[*r][..done].iter().copied().fold(f32::NEG_INFINITY, f32::max),
-        StatNode::Trough(r) => histories[*r][..done].iter().copied().fold(f32::INFINITY, f32::min),
-        StatNode::WindowMax(r, k) => window(*r, *k).iter().copied().fold(f32::NEG_INFINITY, f32::max),
-        StatNode::WindowMin(r, k) => window(*r, *k).iter().copied().fold(f32::INFINITY, f32::min),
+        StatNode::Peak(r) => histories[*r][..done].iter().copied().fold(f32::NEG_INFINITY, nan_max),
+        StatNode::Trough(r) => histories[*r][..done].iter().copied().fold(f32::INFINITY, nan_min),
+        StatNode::WindowMax(r, k) => window(*r, *k).iter().copied().fold(f32::NEG_INFINITY, nan_max),
+        StatNode::WindowMin(r, k) => window(*r, *k).iter().copied().fold(f32::INFINITY, nan_min),
         StatNode::Step => done as f32,
         StatNode::Bin(op, a, b) => {
             let (a, b) = (eval_stat(a, histories, done), eval_stat(b, histories, done));
@@ -444,7 +454,9 @@ fn cond_source(cond: &Cond) -> String {
                 Compare::Gt => ">",
                 Compare::Ge => ">=",
             };
-            format!("({} {symbol} {})", stat_source(a), stat_source(b))
+            // A comparison with a NaN never holds, even where fast math ignores NaNs.
+            let (a, b) = (stat_source(a), stat_source(b));
+            format!("(!isn({a}) && !isn({b}) && ({a} {symbol} {b}))")
         }
         CondNode::And(a, b) => format!("({} && {})", cond_source(a), cond_source(b)),
         CondNode::Or(a, b) => format!("({} || {})", cond_source(a), cond_source(b)),
@@ -468,14 +480,17 @@ fn gate_source(records: usize, conds: &[Cond]) -> String {
     }
     let _ = writeln!(s, "@group(1) @binding({}) var<uniform> p: Params;", 6 + records);
     s.push_str(
-        "fn wmax(i: u32, r: u32, k: u32) -> f32 {
+        "fn isn(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
+fn fmax(a: f32, b: f32) -> f32 { return select(select(max(a, b), a, isn(a)), b, isn(b)); }
+fn fmin(a: f32, b: f32) -> f32 { return select(select(min(a, b), a, isn(a)), b, isn(b)); }
+fn wmax(i: u32, r: u32, k: u32) -> f32 {
     var m = hist[r * p.max_steps + i];
-    for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = max(m, hist[r * p.max_steps + j]); }
+    for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = fmax(m, hist[r * p.max_steps + j]); }
     return m;
 }
 fn wmin(i: u32, r: u32, k: u32) -> f32 {
     var m = hist[r * p.max_steps + i];
-    for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = min(m, hist[r * p.max_steps + j]); }
+    for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = fmin(m, hist[r * p.max_steps + j]); }
     return m;
 }
 @compute @workgroup_size(1)
@@ -494,8 +509,8 @@ fn main() {
     for r in 0..records {
         let _ = writeln!(s, "    let v{r} = rec{r}[0];");
         let _ = writeln!(s, "    hist[{r}u * p.max_steps + i] = v{r};");
-        let _ = writeln!(s, "    agg[{}u] = max(agg[{}u], v{r});", 2 * r, 2 * r);
-        let _ = writeln!(s, "    agg[{}u] = min(agg[{}u], v{r});", 2 * r + 1, 2 * r + 1);
+        let _ = writeln!(s, "    agg[{}u] = fmax(agg[{}u], v{r});", 2 * r, 2 * r);
+        let _ = writeln!(s, "    agg[{}u] = fmin(agg[{}u], v{r});", 2 * r + 1, 2 * r + 1);
     }
     s.push_str("    var reason = 0u;\n");
     for (c, cond) in conds.iter().enumerate() {
@@ -577,7 +592,7 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
     let conds: Vec<Cond> = until.stops.iter().map(|stop| stop(&history)).collect();
     if until.max_steps == 0 {
         let history = names.into_iter().map(|name| (name, Vec::new())).collect();
-        return Ok(Run { state: init, steps: 0, reason: StopReason::MaxSteps, history });
+        return Ok(Run { state: init.copy(), steps: 0, reason: StopReason::MaxSteps, history });
     }
 
     // The step index: a one-element array that the gate advances.

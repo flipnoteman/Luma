@@ -667,3 +667,24 @@ fn read_view_keeps_snapshot_after_base_is_overwritten() {
     kernel.launch([1, 3], args![luma::view(&s2), &mut out2]).unwrap();
     assert_eq!(out2.to_vec().unwrap(), vec![2.0, 6.0, 10.0]);
 }
+
+#[test]
+fn identical_source_keeps_the_label_each_builder_asked_for() {
+    let ctx = Context::new().unwrap();
+    if !ctx.profiling_supported() {
+        return;
+    }
+    let first = ctx.kernel(SAXPY).label("first").build().unwrap();
+    let second = ctx.kernel(SAXPY).label("second").build().unwrap();
+    let x = Array::<f32>::zeros_on(&ctx, 64).unwrap();
+    let mut y = Array::<f32>::zeros_on(&ctx, 64).unwrap();
+    let ((), profile) = ctx
+        .profile(|| {
+            for kernel in [&first, &second, &second] {
+                kernel.launch([64], args![&x, &mut y, uniform(&SaxpyParams { alpha: 1.0, n: 64 })]).unwrap();
+            }
+        })
+        .unwrap();
+    assert_eq!(profile.get("first").map(|k| k.launches), Some(1), "{profile}");
+    assert_eq!(profile.get("second").map(|k| k.launches), Some(2), "{profile}");
+}

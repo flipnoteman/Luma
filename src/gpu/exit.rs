@@ -48,11 +48,10 @@ fn task_ids() -> HashSet<u32> {
 pub(crate) fn driver_call<R>(call: impl FnOnce() -> R) -> R {
     let before = task_ids();
     let result = call();
-    let started: Vec<u32> = task_ids().difference(&before).copied().collect();
-    if !started.is_empty()
-        && let Ok(mut known) = DRIVER_THREADS.lock()
-    {
-        known.extend(started);
+    let after = task_ids();
+    if let Ok(mut known) = DRIVER_THREADS.lock() {
+        known.retain(|id| after.contains(id));
+        known.extend(after.difference(&before));
     }
     result
 }

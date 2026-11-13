@@ -2793,6 +2793,30 @@ fn lazy_arrays_captured_by_a_traced_loop_are_not_replayed_with_it() {
     r.to_vec().unwrap();
 }
 
+/// An array that `flush` skipped because it was fused into the kernel of another one is still
+/// wanted: the traced loop that follows must find it and evaluate it before the step overwrites
+/// its operand.
+#[test]
+fn a_flushed_array_fused_into_another_is_evaluated_before_a_traced_loop() {
+    let ctx = ctx();
+    let xs: Vec<f32> = (0..12).map(|i| i as f32 / 8.0 + 0.25).collect();
+    let a = Array::<f32>::from_slice_on(&ctx, &xs, 12).unwrap();
+    let s = Array::<f32>::from_slice_on(&ctx, &xs, 12).unwrap();
+    let t = &a * 2.0;
+    let u = &t + 1.0;
+    u.eval().unwrap();
+    ctx.flush().unwrap();
+    let [r] = crate::iterate_all([&s], 3, |s| {
+        let mut shared = a.clone();
+        shared += 1.0; // overwrites a: `t` must have been computed from the old contents
+        [&s[0] + &t]
+    });
+    let host = |f: &dyn Fn(f32) -> f32| xs.iter().map(|&v| f(v)).collect::<Vec<_>>();
+    assert_eq!(t.to_vec().unwrap(), host(&|v| v * 2.0));
+    assert_eq!(u.to_vec().unwrap(), host(&|v| v * 2.0 + 1.0));
+    assert_close(&r.to_vec().unwrap(), &host(&|v| v + 3.0 * (v * 2.0)), 1e-4, 1e-5);
+}
+
 /// An array that was only computed inside the kernel of another array (here `n`, inside the
 /// kernel of `held`) is still lazy, and its operand's buffer is only held by it: a traced loop that
 /// reads `n` must not evaluate it inside the recording, where its kernel would take over that
@@ -2903,12 +2927,12 @@ fn postponed_stencil_chains_compute_in_order() {
             ctx.jit().set_max_nodes(max_nodes);
             let (mut u, mut v) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
             let (mut hu, mut hv) = (xs.clone(), ys.clone());
-            for step in 1..=25 {
+            for step in 1usize..=25 {
                 (u, v) = chain_step(&u, &v);
                 u.eval().unwrap();
                 v.eval().unwrap();
                 (hu, hv) = chain_host(&hu, &hv);
-                if read_every != 0 && step % read_every == 0 {
+                if read_every != 0 && step.is_multiple_of(read_every) {
                     assert_close(&u.to_vec().unwrap(), &hu, 1e-4, 1e-5);
                 }
             }
