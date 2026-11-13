@@ -1,7 +1,7 @@
 //! Arithmetic modulo q = 3329 on `u32` arrays, the number-theoretic transform and the products of
-//! the NTT domain, all as lazy array operations on polynomials stored as `[rows, 256]` arrays
-//! (coefficient `k` of polynomial `r` is element `r + rows * k`: coefficients of different
-//! polynomials are neighbours in memory, so a thread per element reads coalesced).
+//! the NTT domain, all as lazy array operations on polynomials stored as `[256, rows]` arrays
+//! (coefficient `k` of polynomial `r` is element `k + 256 r`: the 256 coefficients of a polynomial
+//! are contiguous, like a byte string).
 
 use luma::*;
 
@@ -78,8 +78,8 @@ pub fn sub_mod(a: &Array<u32>, b: &Array<u32>) -> Array<u32> {
 
 fn rows_of(x: &Array<u32>) -> usize {
     let dims = x.shape().dims();
-    assert!(dims[1] == 256 && dims[2] == 1, "a polynomial array is [rows, 256], got {}", x.shape());
-    dims[0]
+    assert!(dims[0] == 256 && dims[2] == 1, "a polynomial array is [256, rows], got {}", x.shape());
+    dims[1]
 }
 
 /// The coordinate `axis` of every element of an array of `shape`.
@@ -118,8 +118,8 @@ fn evaluate(arrays: &[Array<u32>]) {
 /// layers whose butterflies pair coefficients `16` or more apart (sixteen slices of the
 /// polynomial, one per `kappa / 16`, with the zetas as constants), and the three that pair
 /// coefficients 8, 4 and 2 apart (eight slices of the 16 coefficients of a block by `kappa / 2 mod
-/// 8`, the zetas looked up by block). Each group is one kernel with a write per element: its
-/// results are separate arrays, joined into one afterwards.
+/// 8`, the zetas looked up by block). A group is one kernel without recomputation: its results are
+/// separate arrays, joined into one afterwards.
 const BLOCKS: usize = 16;
 
 /// FIPS 203 Algorithm 9 on every row: the coefficients in, the NTT out.
@@ -127,8 +127,8 @@ pub fn ntt(t: &Tables, x: &Array<u32>) -> Array<u32> {
     let ctx = x.context();
     let rows = rows_of(x);
     // Layers 1-4: 16 slices `v[c]` of the coefficients `16 c ..= 16 c + 15`.
-    let blocks = x.reshape([rows, 16, BLOCKS]);
-    let mut v: Vec<Array<u32>> = (0..BLOCKS).map(|c| blocks.slice(2, c..c + 1)).collect();
+    let blocks = x.reshape([16, BLOCKS, rows]);
+    let mut v: Vec<Array<u32>> = (0..BLOCKS).map(|c| blocks.slice(1, c..c + 1)).collect();
     for step in [8, 4, 2, 1] {
         let len = 16 * step;
         for i in (0..BLOCKS).filter(|i| i & step == 0) {
@@ -139,10 +139,10 @@ pub fn ntt(t: &Tables, x: &Array<u32>) -> Array<u32> {
     }
     evaluate(&v);
     // Layers 5-7: 8 slices `s[m]` of the elements `2 m + j` of every block.
-    let y = join(2, &v).cache().reshape([rows, 2, 8, BLOCKS]);
-    let s: Vec<Array<u32>> = (0..8).map(|m| y.slice(2, m..m + 1)).collect();
-    let shape = [rows, 2, 1, BLOCKS];
-    let block = coordinate(ctx, shape, 3);
+    let y = join(1, &v).cache().reshape([2, 8, BLOCKS, rows]);
+    let s: Vec<Array<u32>> = (0..8).map(|m| y.slice(1, m..m + 1)).collect();
+    let shape = [2, 1, BLOCKS, rows];
+    let block = coordinate(ctx, shape, 2);
     let zeta = |base: u32, per_block: u32, extra: u32| t.zetas.take(&(&block * per_block + (base + extra)));
     let mut s = s;
     // Layer 5 (8 apart): block `c`'s zeta is `zetas[16 + c]`.
@@ -164,7 +164,7 @@ pub fn ntt(t: &Tables, x: &Array<u32>) -> Array<u32> {
         (s[m], s[m + 1]) = (lo, hi);
     }
     evaluate(&s);
-    join(2, &s).reshape([rows, 256])
+    join(1, &s).reshape([256, rows])
 }
 
 /// FIPS 203 Algorithm 10 on every row (including the final multiplication by 128^-1).
@@ -172,10 +172,10 @@ pub fn inv_ntt(t: &Tables, x: &Array<u32>) -> Array<u32> {
     let ctx = x.context();
     let rows = rows_of(x);
     // Layers 1-3 (2, 4 and 8 apart), in the grouping of the last three layers of `ntt`.
-    let y = x.reshape([rows, 2, 8, BLOCKS]);
-    let mut s: Vec<Array<u32>> = (0..8).map(|m| y.slice(2, m..m + 1)).collect();
-    let shape = [rows, 2, 1, BLOCKS];
-    let block = coordinate(ctx, shape, 3);
+    let y = x.reshape([2, 8, BLOCKS, rows]);
+    let mut s: Vec<Array<u32>> = (0..8).map(|m| y.slice(1, m..m + 1)).collect();
+    let shape = [2, 1, BLOCKS, rows];
+    let block = coordinate(ctx, shape, 2);
     // The zeta of a layer is `zetas[2^(8 - j) - 1 - b]` for the block `b` of the 2^j-apart pairs: reversed counts.
     let zeta = |top: u32, per_block: u32, extra: u32| t.zetas.take(&(top - (&block * per_block + extra)));
     let z2: Vec<Array<u32>> = (0..4).map(|q| zeta(127, 4, q)).collect();
@@ -195,8 +195,8 @@ pub fn inv_ntt(t: &Tables, x: &Array<u32>) -> Array<u32> {
     }
     evaluate(&s);
     // Layers 4-7 (16, 32, 64 and 128 apart).
-    let blocks = join(2, &s).cache().reshape([rows, 16, BLOCKS]);
-    let mut v: Vec<Array<u32>> = (0..BLOCKS).map(|c| blocks.slice(2, c..c + 1)).collect();
+    let blocks = join(1, &s).cache().reshape([16, BLOCKS, rows]);
+    let mut v: Vec<Array<u32>> = (0..BLOCKS).map(|c| blocks.slice(1, c..c + 1)).collect();
     for step in [1, 2, 4, 8] {
         let len = 16 * step;
         for i in (0..BLOCKS).filter(|i| i & step == 0) {
@@ -208,7 +208,7 @@ pub fn inv_ntt(t: &Tables, x: &Array<u32>) -> Array<u32> {
     let scale = to_mont(INV128);
     let v: Vec<Array<u32>> = v.iter().map(|p| mont(&(p * scale))).collect();
     evaluate(&v);
-    join(2, &v).reshape([rows, 256])
+    join(1, &v).reshape([256, rows])
 }
 
 /// A term of an inner product in the NTT domain: the two polynomials' elements, and the element

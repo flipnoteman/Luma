@@ -32,7 +32,9 @@ fn round_constant(lfsr: &Array<u32>) -> (Array<u32>, Array<u32>, Array<u32>) {
 
 /// Keccak-f[1600]: the 24 rounds as a register loop of one traced round.
 pub fn keccak_f_loop(a: &State) -> State {
-    let one = Array::<u32>::full_on(a[0].context(), a[0].len(), 1).expect("a register");
+    let one = Array::<u32>::full_on(a[0].context(), a[0].shape(), 1).expect("a register");
+    // The absorbed words are one kernel, not one per word.
+    eval_all(&a.iter().collect::<Vec<_>>()).expect("absorbed state");
     let init: [&Array<u32>; 51] = std::array::from_fn(|i| if i < 50 { &a[i] } else { &one });
     let out = iterate_all(init, 24, |s: &[Array<u32>; 51]| {
         let state: State = std::array::from_fn(|i| s[i].clone());
@@ -46,7 +48,7 @@ pub fn keccak_f_loop(a: &State) -> State {
 
 /// The sponge of every row with the looped permutation.
 #[allow(clippy::too_many_arguments)]
-pub fn sponge(ctx: &Context, rows: usize, inputs: &[Array<u32>], len: usize, rate: usize, suffix: u8, out_len: usize) -> Result<Vec<Array<u32>>> {
+pub fn sponge(ctx: &Context, rows: impl Into<Shape>, inputs: &[Array<u32>], len: usize, rate: usize, suffix: u8, out_len: usize) -> Result<Vec<Array<u32>>> {
     sponge_with(ctx, rows, inputs, len, rate, suffix, out_len, &keccak_f_loop)
 }
 
@@ -54,21 +56,21 @@ const SHA3: u8 = 0x06;
 const SHAKE: u8 = 0x1F;
 
 /// SHA3-256 of `len`-byte messages: 8 words per row.
-pub fn sha3_256(ctx: &Context, rows: usize, input: &[Array<u32>], len: usize) -> Result<Vec<Array<u32>>> {
+pub fn sha3_256(ctx: &Context, rows: impl Into<Shape>, input: &[Array<u32>], len: usize) -> Result<Vec<Array<u32>>> {
     sponge(ctx, rows, input, len, 136, SHA3, 32)
 }
 
 /// SHA3-512 of `len`-byte messages: 16 words per row.
-pub fn sha3_512(ctx: &Context, rows: usize, input: &[Array<u32>], len: usize) -> Result<Vec<Array<u32>>> {
+pub fn sha3_512(ctx: &Context, rows: impl Into<Shape>, input: &[Array<u32>], len: usize) -> Result<Vec<Array<u32>>> {
     sponge(ctx, rows, input, len, 72, SHA3, 64)
 }
 
 /// SHAKE256 of `len`-byte messages, `out_len` bytes per row.
-pub fn shake256(ctx: &Context, rows: usize, input: &[Array<u32>], len: usize, out_len: usize) -> Result<Vec<Array<u32>>> {
+pub fn shake256(ctx: &Context, rows: impl Into<Shape>, input: &[Array<u32>], len: usize, out_len: usize) -> Result<Vec<Array<u32>>> {
     sponge(ctx, rows, input, len, 136, SHAKE, out_len)
 }
 
 /// SHAKE128 of `len`-byte messages, `out_len` bytes per row.
-pub fn shake128(ctx: &Context, rows: usize, input: &[Array<u32>], len: usize, out_len: usize) -> Result<Vec<Array<u32>>> {
+pub fn shake128(ctx: &Context, rows: impl Into<Shape>, input: &[Array<u32>], len: usize, out_len: usize) -> Result<Vec<Array<u32>>> {
     sponge(ctx, rows, input, len, 168, SHAKE, out_len)
 }

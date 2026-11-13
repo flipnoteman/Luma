@@ -23,23 +23,18 @@ use luma::*;
 use kem::{Checked, Kem, Words};
 use params::Params;
 
-/// A `[n, len / 4]` array of the byte strings (all of length `len`, a multiple of 4).
+/// A `[len / 4, n]` array of the byte strings (all of length `len`, a multiple of 4): the bytes of
+/// every string are contiguous, as in the host's memory.
 pub fn upload(ctx: &Context, items: &[Vec<u8>]) -> Result<Words> {
     let (n, len) = (items.len(), items[0].len());
-    let mut data = vec![0u32; n * len / 4];
-    for (i, item) in items.iter().enumerate() {
-        for (w, chunk) in item.chunks_exact(4).enumerate() {
-            data[i + n * w] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-    }
-    Array::from_slice_on(ctx, &data, [n, len / 4])
+    Array::from_slice_on(ctx, &natural(items), [len / 4, n])
 }
 
-/// The byte strings of a `[n, words]` array.
+/// The byte strings of a `[words, n]` array.
 pub fn download(words: &Words) -> Result<Vec<Vec<u8>>> {
-    let [n, w, ..] = words.shape().dims();
+    let [w, n, ..] = words.shape().dims();
     let data = words.to_vec()?;
-    Ok((0..n).map(|i| (0..w).flat_map(|x| data[i + n * x].to_le_bytes()).collect()).collect())
+    Ok((0..n).map(|i| data[i * w..(i + 1) * w].iter().flat_map(|x| x.to_le_bytes()).collect()).collect())
 }
 
 /// Runs `op` with the squeezed blocks of SampleNTT doubled until every polynomial got its 256
@@ -135,14 +130,14 @@ fn natural(items: &[Vec<u8>]) -> Vec<u32> {
     items.iter().flat_map(|item| item.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect()
 }
 
-/// A `[n, words]` array from natural-layout host data uploaded as `[words, n]` and transposed on the device.
+/// A `[words, n]` array from host data in natural layout.
 fn from_natural(ctx: &Context, data: &[u32], n: usize) -> Result<Words> {
-    Ok(Array::from_slice_on(ctx, data, [data.len() / n, n])?.transpose().cache())
+    Array::from_slice_on(ctx, data, [data.len() / n, n])
 }
 
-/// The natural-layout words of a `[n, words]` array, read back.
+/// The natural-layout words of a `[words, n]` array, read back.
 fn to_natural(words: &Words) -> Result<Vec<u32>> {
-    words.transpose().to_vec()
+    words.to_vec()
 }
 
 fn best_of(runs: usize, mut f: impl FnMut() -> Result<Duration>) -> Result<Duration> {

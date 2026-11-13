@@ -1,9 +1,9 @@
 //! ByteEncode / ByteDecode, Compress / Decompress and the sampling of noise (FIPS 203 Algorithms 5,
 //! 6, 7 and 8) as lazy array operations.
 //!
-//! Byte strings are little-endian `u32` words. A batch of byte strings is a `[n, words]` array
-//! (word `w` of instance `i` is element `i + n * w`, so threads of neighbouring instances read
-//! neighbouring words); a polynomial batch is `[rows, 256]` (see `field`).
+//! Byte strings are little-endian `u32` words. A batch of byte strings is a `[words, n]` array
+//! (word `w` of instance `i` is element `w + words * i`: the bytes of an instance are contiguous,
+//! as in memory); a polynomial batch is `[256, rows]` (see `field`).
 
 use luma::*;
 
@@ -23,30 +23,32 @@ fn window(bit: &Array<u32>, bits: u32, word: impl Fn(&Array<u32>) -> Array<u32>)
 }
 
 /// `ByteDecode_d` of one polynomial per instance: coefficient `kappa` is the `d` bits at bit
-/// `d * kappa` of the words `first..first + 8 d` of `words`, a `[n, w]` array. The result is `[n, 256]`.
+/// `d * kappa` of the words `first..first + 8 d` of `words`, a `[words, n]` array. The result is
+/// `[256, n]`.
 pub fn unpack(words: &Array<u32>, first: usize, d: u32) -> Array<u32> {
     let ctx = words.context();
-    let n = words.shape().dims()[0];
-    let row = Array::<u32>::range_on(ctx, [n, 256], 0).expect("index array");
-    let kappa = Array::<u32>::range_on(ctx, [n, 256], 1).expect("index array");
+    let [len, n, ..] = words.shape().dims();
+    let kappa = Array::<u32>::range_on(ctx, [256, n], 0).expect("index array");
+    let instance = Array::<u32>::range_on(ctx, [256, n], 1).expect("index array");
     let bit = &kappa * d;
-    window(&bit, d, |index| words.take(&(&row + (index + first as u32) * n as u32)))
+    window(&bit, d, |index| words.take(&((index + first as u32) + &instance * len as u32)))
 }
 
-/// `ByteEncode_d` of one polynomial per instance (`coefficients` is `[n, 256]` with values below
-/// `2^d`): the result is `[n, 8 d]` words.
+/// `ByteEncode_d` of one polynomial per instance (`coefficients` is `[256, n]` with values below
+/// `2^d`): the result is `[8 d, n]` words.
 pub fn pack(coefficients: &Array<u32>, d: u32) -> Array<u32> {
     let ctx = coefficients.context();
-    let n = coefficients.shape().dims()[0];
-    let row = Array::<u32>::range_on(ctx, [n, 8 * d as usize], 0).expect("index array");
-    let word = Array::<u32>::range_on(ctx, [n, 8 * d as usize], 1).expect("index array");
+    let n = coefficients.shape().dims()[1];
+    let words = 8 * d as usize;
+    let word = Array::<u32>::range_on(ctx, [words, n], 0).expect("index array");
+    let instance = Array::<u32>::range_on(ctx, [words, n], 1).expect("index array");
     let start = &word * 32u32;
     // The coefficients that have bits in word `w`: `32 w / d` up to `(32 w + 31) / d`.
     let first = &start / d;
     let mut acc: Option<Array<u32>> = None;
     for t in 0..(31 / d + 2) {
         let kappa = &first + t;
-        let c = coefficients.take(&(&row + &kappa * n as u32));
+        let c = coefficients.take(&(&kappa + &instance * 256u32));
         let at = &kappa * d;
         // Bit offset of the coefficient in the word: negative when it began in the word before.
         let from_left = at.ge(&start);
@@ -77,13 +79,13 @@ pub fn decompress(y: &Array<u32>, d: u32) -> Array<u32> {
     (y * Q + (1u32 << (d - 1))) >> d
 }
 
-/// `CBD_eta` of the PRF output of every row: `words` is `[rows, 16 eta]`; the result `[rows, 256]`
+/// `CBD_eta` of the PRF output of every row: `words` is `[rows, 16 eta]`; the result `[256, rows]`
 /// has coefficient `x - y mod q` with `x`, `y` the sums of `eta` bits each (Algorithm 8).
 pub fn cbd(words: &Array<u32>, eta: u32) -> Array<u32> {
     let ctx = words.context();
     let rows = words.shape().dims()[0];
-    let row = Array::<u32>::range_on(ctx, [rows, 256], 0).expect("index array");
-    let kappa = Array::<u32>::range_on(ctx, [rows, 256], 1).expect("index array");
+    let kappa = Array::<u32>::range_on(ctx, [256, rows], 0).expect("index array");
+    let row = Array::<u32>::range_on(ctx, [256, rows], 1).expect("index array");
     let bits = 2 * eta;
     let v = window(&(&kappa * bits), bits, |index| words.take(&(&row + index * rows as u32)));
     let count = |from: u32| (0..eta).map(|b| (&v >> (from + b)) & 1u32).reduce(|a, b| a + b).expect("eta >= 1");

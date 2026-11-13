@@ -181,7 +181,7 @@ pub fn keccak_f(a: &State) -> State {
 /// The sponge on every instance: `inputs` are the words (little-endian) of the messages of
 /// `len` bytes each, `inputs[w]` holding word `w` of every instance (bytes past `len` are
 /// ignored); the result is `out_len` bytes per instance as `out_len / 4` rounded up words.
-pub fn sponge(ctx: &Context, n: usize, inputs: &[Array<u32>], len: usize, rate: usize, suffix: u8, out_len: usize) -> Result<Vec<Array<u32>>> {
+pub fn sponge(ctx: &Context, n: impl Into<Shape>, inputs: &[Array<u32>], len: usize, rate: usize, suffix: u8, out_len: usize) -> Result<Vec<Array<u32>>> {
     sponge_with(ctx, n, inputs, len, rate, suffix, out_len, &keccak_f)
 }
 
@@ -189,7 +189,7 @@ pub fn sponge(ctx: &Context, n: usize, inputs: &[Array<u32>], len: usize, rate: 
 #[allow(clippy::too_many_arguments)]
 pub fn sponge_with(
     ctx: &Context,
-    n: usize,
+    n: impl Into<Shape>,
     inputs: &[Array<u32>],
     len: usize,
     rate: usize,
@@ -197,7 +197,8 @@ pub fn sponge_with(
     out_len: usize,
     permute: &dyn Fn(&State) -> State,
 ) -> Result<Vec<Array<u32>>> {
-    let zero = Array::<u32>::full_on(ctx, n, 0)?;
+    let shape = n.into();
+    let zero = Array::<u32>::full_on(ctx, shape, 0)?;
     let mut state: State = std::array::from_fn(|_| zero.clone());
     let words = rate / 4;
     let blocks = len / rate + 1;
@@ -223,7 +224,7 @@ pub fn sponge_with(
             if last && *pad != 0 {
                 word = Some(match word {
                     Some(m) => m ^ *pad,
-                    None => Array::full_on(ctx, n, *pad)?,
+                    None => Array::full_on(ctx, shape, *pad)?,
                 });
             }
             if let Some(word) = word {

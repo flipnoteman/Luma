@@ -20,7 +20,7 @@ const GROUP_WORDS: usize = 3;
 pub const BLOCK_WORDS: usize = 42;
 
 /// The polynomials sampled from `words` (`[rows, 42 * blocks]`, the squeezed streams) as a
-/// `[rows, 256]` array, and the smallest number of candidates any row accepted (at least 256 when
+/// `[256, rows]` array, and the smallest number of candidates any row accepted (at least 256 when
 /// every row is complete).
 pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
     let ctx = words.context();
@@ -56,10 +56,14 @@ pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
     let accepted_in_row = ends.slice(2, groups - 1..groups);
     let least = accepted_in_row.min();
 
-    // Every candidate: its slot, from its group's word, and its value.
-    let row = Array::<u32>::range_on(ctx, [rows, candidates], 0).expect("index array");
-    let p = Array::<u32>::range_on(ctx, [rows, candidates], 1).expect("index array");
-    let (g, c) = (&p >> 3u32, &p & 7u32);
+    // Every candidate: `c` fastest, so that neighbouring threads write neighbouring slots of one
+    // polynomial, then a few rows, so that the threads that read the words of a group read
+    // neighbouring words.
+    let near = [8usize, 4, 2, 1].into_iter().find(|n| rows % n == 0).expect("1 divides every row count");
+    let shape = [PER_GROUP, near, groups, rows / near];
+    let coordinate = |axis: usize| Array::<u32>::range_on(ctx, shape, axis).expect("index array");
+    let (c, g) = (coordinate(0), coordinate(2));
+    let row = coordinate(1) + coordinate(3) * near as u32;
     let word = |a: Array<u32>| words.take(&(&row + a * rows as u32));
     let bit = &c * 12u32;
     let a = (&bit >> 5u32) + &g * 3u32;
@@ -71,8 +75,9 @@ pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
     let before_in_group = (packed.clone() >> (&c * 3u32 + 6u32)) & 7u32;
     let slot = (&packed & 0x1FFu32) + before_in_group * c.gt(0u32);
     // Rejected candidates and the ones past slot 255 go beyond the array.
-    let index = &row + select(&value.lt(Q), &slot, 256u32) * rows as u32;
-    let polynomials = Array::<u32>::zeros_on(ctx, [rows, 256]).expect("polynomials");
+    let valid = value.lt(Q) * slot.lt(256u32);
+    let index = select(&valid, &(&slot + &row * 256u32), rows as u32 * 256);
+    let polynomials = Array::<u32>::zeros_on(ctx, [256, rows]).expect("polynomials");
     polynomials.put(&index, &value).expect("scatter");
     (polynomials, least)
 }
