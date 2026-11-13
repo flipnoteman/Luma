@@ -248,16 +248,17 @@ fn ops_per_second(n: usize, t: Duration) -> f64 {
     n as f64 / t.as_secs_f64()
 }
 
-struct Case<'a> {
-    ctx: &'a Context,
+struct Case {
     p: Params,
     n: usize,
     cpu: bool,
 }
 
-impl Case<'_> {
+impl Case {
     fn run(&self, ops: &[Op]) -> Result<Vec<Row>> {
-        let (ctx, p, n) = (self.ctx, self.p, self.n);
+        // A context of its own: the idle buffers of the cases before it do not shape this one's allocations.
+        let ctx = &Context::new()?;
+        let (p, n) = (self.p, self.n);
         let mut kem = Kem::new(ctx, p, n)?;
         let (d, z, m) = (random_items(11, n, 32), random_items(12, n, 32), random_items(13, n, 32));
         let (d_w, z_w, m_w) = (upload(ctx, &d)?, upload(ctx, &z)?, upload(ctx, &m)?);
@@ -454,7 +455,7 @@ fn main() -> Result<()> {
     let mut all = Vec::new();
     for &n in &sizes {
         for &p in &sets {
-            let case = Case { ctx: &ctx, p, n, cpu: !flag("--no-cpu") };
+            let case = Case { p, n, cpu: !flag("--no-cpu") };
             for row in case.run(&ops)? {
                 print_row(&row);
                 all.push(row);
