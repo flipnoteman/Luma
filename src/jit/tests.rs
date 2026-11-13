@@ -3244,6 +3244,26 @@ mod reruns {
     }
 
     #[test]
+    fn captured_arrays_that_are_one_array_are_another_program_than_two_arrays() {
+        let ctx = ctx();
+        let run = |x: &Array<f32>, a: &Array<f32>, b: &Array<f32>| {
+            let [r] = crate::iterate_all([x], 3, |[u]| [u * 0.5 + a + b * 2.0]);
+            r.to_vec().unwrap()
+        };
+        let (xs, as_, bs) = (values(100, 30, -1.0, 1.0), values(100, 31, -1.0, 1.0), values(100, 32, -1.0, 1.0));
+        let (x, a, b) = (f32s(&ctx, &xs), f32s(&ctx, &as_), f32s(&ctx, &bs));
+        let host = |x: &[f32], a: &[f32], b: &[f32]| -> Vec<f32> {
+            (0..x.len()).map(|i| (0..3).fold(x[i], |u, _| u * 0.5 + a[i] + b[i] * 2.0)).collect()
+        };
+        for _ in 0..4 {
+            // Two arrays, then one array twice, then x itself as a captured array.
+            assert_close(&run(&x, &a, &b), &host(&xs, &as_, &bs), 1e-4, 1e-5);
+            assert_close(&run(&x, &a, &a), &host(&xs, &as_, &as_), 1e-4, 1e-5);
+            assert_close(&run(&x, &x, &b), &host(&xs, &xs, &bs), 1e-4, 1e-5);
+        }
+    }
+
+    #[test]
     fn programs_alternating_at_one_site_are_never_started_on_a_guess() {
         let ctx = ctx();
         let cs = values(200, 5, -1.0, 1.0);
