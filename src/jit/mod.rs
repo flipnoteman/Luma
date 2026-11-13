@@ -675,6 +675,9 @@ pub(crate) struct Node {
     /// is output `j` of the plan, which runs all the steps at once, and the node released its
     /// own operands.
     looped: OnceLock<(Arc<LoopPlan>, u32)>,
+    /// Set when the node stands for a reduction that is recorded when the node is evaluated (see
+    /// [`deferred`]).
+    deferred: OnceLock<Arc<crate::reduce::Reduced>>,
     /// The thread that created the node. The sweeps that evaluate "every lazy array" (`eval`,
     /// `flush`, `sync`, evaluating alongside) only take the nodes of the calling thread: another
     /// thread may be flattening the expression this very moment, or have a recording under way
@@ -957,9 +960,10 @@ impl Node {
         let args = lock(&self.args).take();
         let outcome = match args {
             Some(args) => evaluate(self, args).map(Arc::new),
-            None => match self.looped.get() {
-                Some((plan, j)) => plan.output(&self.ctx, *j, self.name, self.location),
-                None => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
+            None => match (self.looped.get(), self.deferred.get()) {
+                (Some((plan, j)), _) => plan.output(&self.ctx, *j, self.name, self.location),
+                (None, Some(reduced)) => reduced.record_once(&self.ctx).clone().map_err(Failure::Inherited),
+                (None, None) => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
             },
         };
         match outcome {
@@ -997,7 +1001,7 @@ impl Node {
     }
 
     /// [`Node::finish`] for a buffer that others hold too.
-    fn finish_shared(&self, storage: Arc<Storage>) {
+    pub(crate) fn finish_shared(&self, storage: Arc<Storage>) {
         if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
             storage.set_producer(self.id);
             storage.readers.absorb(&self.readers);
@@ -1618,6 +1622,7 @@ pub(crate) fn create(
         readers: Readers::default(),
         requested: AtomicBool::new(false),
         looped: OnceLock::new(),
+        deferred: OnceLock::new(),
         handles: AtomicU32::new(0),
         link: Mutex::new(Weak::new()),
     });
@@ -1646,6 +1651,46 @@ pub(crate) fn create(
         jit.cons_insert(if cut { cons_hash(op, len, &args) } else { hash }, weak);
     }
     Ok(node)
+}
+
+/// A node of `len` elements of type `ty` that stands for the value of `reduced`: evaluating it
+/// records the reduction. Operations on a reduction that cannot extend its last pass (any on a
+/// `Df32` sum) read this node, so that building them evaluates nothing; the reduction is
+/// recorded when something that needs the value is, after the arrays it shares work with. It has
+/// no operands: expressions that read it find it evaluated first, like a loop leaf.
+pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate::reduce::Reduced>, name: &'static str, location: &'static Location<'static>) -> Arc<Node> {
+    let measured = measure(&[]);
+    let node = Arc::new(Node {
+        thread: current_thread(),
+        ctx: ctx.clone(),
+        op: Op::new(OpKind::Unary(UnOp::Id), ty),
+        len,
+        args: Mutex::new(None),
+        result: OnceLock::new(),
+        name,
+        location,
+        id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
+        ids: measured.ids,
+        below_len: measured.below,
+        below_base: measured.base,
+        below_words: measured.words,
+        below_sparse: measured.sparse,
+        consumers: AtomicU32::new(0),
+        fused: AtomicBool::new(false),
+        shift_depth: 0,
+        depth: 0,
+        weight: 0.0,
+        shifted_reads: AtomicU32::new(0),
+        readers: Readers::default(),
+        requested: AtomicBool::new(false),
+        looped: OnceLock::new(),
+        deferred: OnceLock::new(),
+        handles: AtomicU32::new(0),
+        link: Mutex::new(Weak::new()),
+    });
+    let _ = node.deferred.set(reduced);
+    ctx.jit().live.add_weak(Arc::downgrade(&node));
+    node
 }
 
 /// Whether the value of the arrays holding `node` can be replaced by another expression with

@@ -264,7 +264,7 @@ fn live_split(fused: &Fused, max_inputs: usize, max_live: usize) -> Option<(Vec<
 /// output per node. Failures are stored in the nodes, as [`Node::force`] does.
 pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
     // A loop leaf has no operands to fuse: running its plan is its evaluation.
-    for node in nodes.iter().filter(|node| node.is_pending() && node.looped.get().is_some()) {
+    for node in nodes.iter().filter(|node| node.is_pending() && (node.looped.get().is_some() || node.deferred.get().is_some())) {
         let _ = node.force();
     }
     let roots: Vec<(Arc<Node>, Args)> = nodes
