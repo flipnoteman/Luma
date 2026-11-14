@@ -184,7 +184,7 @@ use inline::{inline, Judgement, Lowered, Verdict};
 use looped::LoopPlan;
 use program::Instr;
 
-pub(crate) use launch::{check_finite, evaluate, evaluate_group, evaluate_into, force_group, reduce_first_pass, run_loop};
+pub(crate) use launch::{check_finite, evaluate, evaluate_group, evaluate_into, force_group, matmul, reduce_first_pass, run_loop, MatmulKernel, MatmulSide};
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};

@@ -95,6 +95,7 @@ mod iterate;
 mod jit;
 mod kernel;
 mod linalg;
+mod matmul;
 mod ops;
 mod precision;
 mod profile;
@@ -115,6 +116,7 @@ pub use kernel::{uniform, view, BindingInfo, BindingKind, Kernel, KernelArg, Ker
 pub use iterate::iterate_all;
 pub use until::{iterate_until_all, Cond, History, Run, Series, Stat, StopReason, Until};
 pub use linalg::{solve_block_tridiagonal, solve_block_tridiagonal_from, solve_tridiagonal, solve_tridiagonal_from};
+pub use matmul::matmul;
 pub use jit::cost::CostModel;
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Operand};
