@@ -47,5 +47,5 @@ These only affect the differential fuzzer in the crate's own test suite (`cargo 
 | Variable | Effect |
 | --- | --- |
 | `LUMA_FUZZ_CASES` | Number of random programs per fuzz test (default 256, 24 in debug builds) |
-| `LUMA_FUZZ_SEED` | Fixed seed (default: random; failing cases are also kept in `proptest-regressions/`) |
+| `LUMA_FUZZ_SEED` | Fixed seed (default: random; failing cases are also kept in `tests/proptest-regressions/`) |
 | `LUMA_FUZZ_VERBOSE` | Set to anything: print every generated program |

@@ -4,7 +4,7 @@
 //!
 //! * `LUMA_FUZZ_CASES`: number of programs per entry point (default 256).
 //! * `LUMA_FUZZ_SEED`: fixed seed of the random number generator (default: random; proptest
-//!   prints the seed of a failing run and persists failures in `proptest-regressions/`).
+//!   prints the seed of a failing run and persists failures in `tests/proptest-regressions/`).
 //!
 //! A failure prints the shrunk program as a Rust literal; paste it into `regressions.rs`. See
 //! [`gen`] for the programs and the value domains, [`oracle`] for the reference semantics.
@@ -1289,7 +1289,7 @@ fn programs() {
         let minimal = minimize(program, false);
         format!("{}\n{}", run_filtered(&minimal, Filter::Messages).err().unwrap_or_default(), minimal.rust())
     };
-    drive("proptest-regressions/fuzz_programs.txt", generator::programs(), describe, |program| run_random(&program));
+    drive("tests/proptest-regressions/fuzz_programs.txt", generator::programs(), describe, |program| run_random(&program));
 }
 
 /// Runs each of `programs` (under the default engine configuration) on its own thread, all on
@@ -1330,7 +1330,7 @@ fn fails_alone(ctx: &Context, program: &Program) -> bool {
 #[test]
 fn threads() {
     let set = (generator::programs(), generator::programs(), generator::programs(), generator::programs());
-    drive("proptest-regressions/fuzz_threads.txt", set, |set| format!("{set:?}"), |set| {
+    drive("tests/proptest-regressions/fuzz_threads.txt", set, |set| format!("{set:?}"), |set| {
         let ctx = crate::default_context().map_err(|e| e.to_string())?;
         let programs = [set.0, set.1, set.2, set.3];
         for (k, failure) in run_concurrently(&ctx, &programs) {
