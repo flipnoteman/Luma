@@ -226,20 +226,22 @@ impl Bench {
 const GAMMA: f32 = 1.4;
 const DT: f32 = 0.1;
 
-#[derive(Fields)]
-struct Cons {
-    rho: Array<f32>,
-    mu: Array<f32>,
-    mv: Array<f32>,
-    e: Array<f32>,
+luma::fields! {
+    struct Cons {
+        rho: Array<f32>,
+        mu: Array<f32>,
+        mv: Array<f32>,
+        e: Array<f32>,
+    }
 }
 
-#[derive(Fields)]
-struct Prim {
-    rho: Array<f32>,
-    u: Array<f32>,
-    v: Array<f32>,
-    p: Array<f32>,
+luma::fields! {
+    struct Prim {
+        rho: Array<f32>,
+        u: Array<f32>,
+        v: Array<f32>,
+        p: Array<f32>,
+    }
 }
 
 #[derive(Clone, Copy)]

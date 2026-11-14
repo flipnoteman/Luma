@@ -49,6 +49,7 @@ mod conv;
 mod cyclic;
 mod error;
 mod fields;
+mod fields_macro;
 #[cfg(test)]
 mod fuzz;
 mod fft;
@@ -87,10 +88,9 @@ pub use scalar::Scalar;
 pub use profile::{FusionSplit, KernelTiming, Profile, SplitReason};
 pub use shape::{Offsets, Shape};
 pub use tuning::TuningProfile;
-pub use luma_derive::Fields;
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 
-/// Plumbing of `#[derive(Fields)]`; not part of the public API.
+/// Plumbing of `fields!`; not part of the public API.
 #[doc(hidden)]
 pub mod __private {
     pub use crate::fields::FieldOp;

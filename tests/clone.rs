@@ -4,7 +4,7 @@
 mod common;
 
 use common::{assert_close, values};
-use luma::{Array, Context, Fields, LumaError};
+use luma::{Array, Context, LumaError};
 
 fn f32s(ctx: &Context, data: &[f32]) -> Array<f32> {
     Array::from_slice_on(ctx, data, data.len()).unwrap()
@@ -131,10 +131,12 @@ fn clones_of_failed_and_reduced_arrays_keep_what_they_are() {
     assert_eq!((&x / &copy).to_vec().unwrap(), [1.0 / 12.0, 2.0 / 12.0, 3.0 / 12.0]);
 }
 
-#[derive(Clone, Fields)]
-struct Pair {
-    a: Array<f32>,
-    b: Array<f32>,
+luma::fields! {
+    #[derive(Clone)]
+    struct Pair {
+        a: Array<f32>,
+        b: Array<f32>,
+    }
 }
 
 #[test]

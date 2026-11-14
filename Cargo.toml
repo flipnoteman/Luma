@@ -13,7 +13,6 @@ rust-version.workspace = true
 exclude = [".github/", "benchmarks/"]
 
 [workspace]
-members = ["luma-derive"]
 exclude = ["benchmarks/arrayfire"]
 
 [workspace.package]
@@ -30,7 +29,6 @@ log = "0.4.25"
 pollster = "1.0.1"
 naga = { version = "30.0.1", features = ["wgsl-in"] }
 encase = "0.13.0"
-luma-derive = { version = "=0.3.0", path = "luma-derive" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

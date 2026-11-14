@@ -29,7 +29,7 @@ I/O dependent, operations.
 ## Features
 
 - Arrays of `f32`, `u32`, `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
-- `vec2`/`vec4` element types and `#[derive(Fields)]` records of arrays
+- `vec2`/`vec4` element types and `luma::fields!` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Views: `slice` (`ViewMut` for writes), `pad`, `flip`, `transpose`, `take`, `put`, `concat`, `stack`, `broadcast_to`
 - Reductions: sum, min, max, mean, norm, along axes; `scan` / `cumsum`; `solve_tridiagonal`

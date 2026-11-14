@@ -7,22 +7,26 @@ mod common;
 use common::values;
 use luma::*;
 
-#[derive(Fields)]
-struct Dd {
-    u: Array<Df32>,
-    v: Array<Df32>,
+luma::fields! {
+    struct Dd {
+        u: Array<Df32>,
+        v: Array<Df32>,
+    }
 }
 
-#[derive(Fields)]
-struct Wide {
-    a: Array<f64>,
-    b: Array<f64>,
+luma::fields! {
+    struct Wide {
+        a: Array<f64>,
+        b: Array<f64>,
+    }
 }
 
-#[derive(Fields)]
-struct Nested {
-    d: Dd,
-    t: [Array<Df32>; 2],
+luma::fields! {
+    #[elem = Df32]
+    struct Nested {
+        d: Dd,
+        t: [Array<Df32>; 2],
+    }
 }
 
 const N: usize = 24;

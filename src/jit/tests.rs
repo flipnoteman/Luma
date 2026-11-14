@@ -2595,12 +2595,14 @@ mod euler {
 
     type A = Array<f32>;
 
-    #[derive(crate::Fields)]
-    pub struct R {
-        pub a: A,
-        pub b: A,
-        pub c: A,
-        pub d: A,
+    crate::fields! {
+        #[elem = f32]
+        pub struct R {
+            pub a: A,
+            pub b: A,
+            pub c: A,
+            pub d: A,
+        }
     }
 
     fn prim(q: &R) -> R {

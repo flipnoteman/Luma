@@ -432,10 +432,11 @@ fn a_slice_write_after_a_flipped_write_into_a_lazy_array_is_kept() {
     assert_eq!(r.to_vec().unwrap(), want);
 }
 
-#[derive(Fields)]
-struct Pair {
-    a: Array<f32>,
-    b: Array<f32>,
+luma::fields! {
+    struct Pair {
+        a: Array<f32>,
+        b: Array<f32>,
+    }
 }
 
 #[test]

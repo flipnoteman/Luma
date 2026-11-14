@@ -1,4 +1,4 @@
-//! Records of arrays (`Fields` and `#[derive(Fields)]`): every operation must equal the same
+//! Records of arrays (`Fields` and `luma::fields!`): every operation must equal the same
 //! operation on each field.
 
 mod common;
@@ -6,18 +6,21 @@ mod common;
 use common::{assert_close, values};
 use luma::{Array, Context, Fields, LumaError, PadMode};
 
-#[derive(Fields)]
-struct Cons {
-    rho: Array<f32>,
-    mu: Array<f32>,
-    mv: Array<f32>,
-    e: Array<f32>,
+luma::fields! {
+    struct Cons {
+        rho: Array<f32>,
+        mu: Array<f32>,
+        mv: Array<f32>,
+        e: Array<f32>,
+    }
 }
 
-#[derive(Fields)]
-struct Both {
-    q: Cons,
-    t: [Array<f32>; 2],
+luma::fields! {
+    #[elem = f32]
+    struct Both {
+        q: Cons,
+        t: [Array<f32>; 2],
+    }
 }
 
 const SHAPE: [usize; 2] = [5, 4];

@@ -824,22 +824,12 @@ dependencies = [
  "encase",
  "libc",
  "log",
- "luma-derive",
  "ml-kem",
  "naga",
  "pollster",
  "proptest",
  "rustfft",
  "wgpu",
-]
-
-[[package]]
-name = "luma-derive"
-version = "0.3.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.96",
 ]
 
 [[package]]
