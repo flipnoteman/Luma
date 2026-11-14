@@ -218,7 +218,10 @@ impl BinOp {
             BinOp::Max => "max(x, y)",
             BinOp::Atan2 => "atan2(x, y)",
             // Scaled by the larger magnitude so that squaring neither overflows nor underflows.
-            BinOp::Hypot => "select(max(abs(x), abs(y)), max(abs(x), abs(y)) * length(vec2<f32>(x / max(abs(x), abs(y)), y / max(abs(x), abs(y)))), max(abs(x), abs(y)) > 0.0 && max(abs(x), abs(y)) < 3.4028235e38)",
+            // Where that does not apply (zero, infinity, or a NaN that `max` skipped) the result is
+            // `|x| + |y|`, which is NaN with a NaN operand; an infinite operand gives infinity even
+            // with a NaN (IEEE). The tests are comparisons, false for NaN, as in `tanh`.
+            BinOp::Hypot => "select(select(abs(x) + abs(y), max(abs(x), abs(y)) * length(vec2<f32>(x / max(abs(x), abs(y)), y / max(abs(x), abs(y)))), max(abs(x), abs(y)) > 0.0 && max(abs(x), abs(y)) < 3.4028235e38), bitcast<f32>(0x7f800000u), abs(x) > 3.4028235e38 || abs(y) > 3.4028235e38)",
             BinOp::Copysign => "bitcast<f32>((bitcast<u32>(x) & 0x7fffffffu) | (bitcast<u32>(y) & 0x80000000u))",
             BinOp::Rem => "x % y",
             BinOp::BitAnd => "x & y",

@@ -2209,7 +2209,10 @@ impl JitState {
 
     /// Returns the buffers of precomputed speculation to the pool.
     pub(crate) fn drop_speculated(&self) {
-        lock(&self.speculation).clear_cache();
+        // A readback holds the lock while it computes (and may evict, which lands here): skip then.
+        if let Ok(mut tracker) = self.speculation.try_lock() {
+            tracker.clear_cache();
+        }
     }
 
     /// Makes the instructions of `key` the ones every equal program shares, so that comparing

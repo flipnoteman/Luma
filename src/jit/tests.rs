@@ -1900,7 +1900,9 @@ fn halo_bound() -> CostModel {
 
 /// A cost model on which arithmetic is slow enough for computing an expression once per cell to
 /// beat recomputing it at every read, but a second launch still costs more than the recomputation
-/// it saves over staging.
+/// it saves over staging. Tests with it use arrays of many workgroup tiles: the staged kernel
+/// computes its region in whole rounds of the workgroup, which on a few tiles costs about as
+/// much as the recomputation (the estimate is right; a 1000-element array is at the margin).
 fn arithmetic_bound() -> CostModel {
     CostModel { f32_ops_per_ns: 10.0, ..CostModel::TEST }
 }
@@ -1990,7 +1992,7 @@ fn the_stencil_without_staging_is_one_launch_with_the_same_values() {
 fn a_1d_expression_read_at_three_offsets_is_staged() {
     let ctx = ctx();
     ctx.set_cost_model(arithmetic_bound());
-    let n = 1000;
+    let n = 1 << 14;
     let xs = values(n, 203, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
     let (e, host) = long_expression(&x, &xs);
@@ -2043,7 +2045,7 @@ fn a_df32_expression_read_at_five_offsets_is_staged() {
 fn a_staged_expression_read_by_another_staged_expression_is_computed_a_level_earlier() {
     let ctx = ctx();
     ctx.set_cost_model(arithmetic_bound());
-    let n = 1000;
+    let n = 1 << 14;
     let xs = values(n, 205, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
     let (p, host) = long_expression(&x, &xs);
@@ -3146,7 +3148,7 @@ fn a_join_of_many_parts_loads_only_the_part_each_cell_takes() {
 fn a_sub_program_read_once_does_not_keep_what_it_reads_from_being_staged() {
     let ctx = ctx();
     ctx.set_cost_model(arithmetic_bound());
-    let n = 1000;
+    let n = 1 << 14;
     let xs = values(n, 150, 0.5, 2.0);
     let (e, host) = long_expression(&f32s(&ctx, &xs), &xs);
     let g = e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n);

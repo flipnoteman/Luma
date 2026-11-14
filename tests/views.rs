@@ -378,3 +378,63 @@ fn mutable_views_write_through_and_read_only_ones_do_not() {
     assert_eq!(region.to_vec().unwrap(), [13.0, 4.0]);
     assert!(region.assign(0.0).is_err());
 }
+
+/// `a` is `[4, 4]` holding its flat index; the read-only view `[2, 4]` of its first two columns
+/// reshaped to `[8]` is the elements `0, 1, 4, 5, 8, 9, 12, 13`.
+fn reshaped_view() -> (Context, Array<f32>, [f32; 8]) {
+    let ctx = Context::new().unwrap();
+    let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    let a = Array::from_slice_on(&ctx, &data, [4, 4]).unwrap();
+    (ctx, a, [0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 12.0, 13.0])
+}
+
+#[test]
+fn slicing_a_reshaped_view_reads_the_reshaped_elements() {
+    let (_ctx, a, flat) = reshaped_view();
+    let r = a.slice(0, 0..2).reshape([8]);
+    assert_eq!(r.slice(0, 2..4).to_vec().unwrap(), flat[2..4]);
+    assert_eq!(r.slice(0, 5..).to_vec().unwrap(), flat[5..]);
+    // Reshaped to another 2-D shape.
+    let q = a.slice(0, 0..2).reshape([4, 2]);
+    assert_eq!(q.slice(1, 1..2).to_vec().unwrap(), [flat[4], flat[5], flat[6], flat[7]]);
+    assert_eq!(q.slice(0, 1..3).to_vec().unwrap(), [flat[1], flat[2], flat[5], flat[6]]);
+}
+
+#[test]
+fn flipping_and_transposing_a_reshaped_view_read_the_reshaped_elements() {
+    let (_ctx, a, flat) = reshaped_view();
+    let r = a.slice(0, 0..2).reshape([8]);
+    let want: Vec<f32> = flat.iter().rev().copied().collect();
+    assert_eq!(r.flip(0).to_vec().unwrap(), want);
+
+    let q = a.slice(0, 0..2).reshape([4, 2]);
+    let t = q.transpose();
+    assert_eq!(t.shape().dims(), [2, 4, 1, 1]);
+    let want: Vec<f32> = (0..4).flat_map(|y| (0..2).map(move |x| flat[y + 4 * x])).collect();
+    assert_eq!(t.to_vec().unwrap(), want);
+    let want: Vec<f32> = (0..2).flat_map(|y| (0..4).map(move |x| flat[3 - x + 4 * y])).collect();
+    assert_eq!(q.flip(0).to_vec().unwrap(), want);
+}
+
+#[test]
+fn broadcasting_and_selecting_from_a_reshaped_view_read_the_reshaped_elements() {
+    let (_ctx, a, flat) = reshaped_view();
+    let r = a.slice(0, 0..2).reshape([4, 2]);
+    let col = r.slice(1, 1..2).reshape([4, 1]);
+    let want: Vec<f32> = (0..2).flat_map(|_| (0..4).map(|x| flat[x + 4])).collect();
+    assert_eq!(col.broadcast_to([4, 2]).to_vec().unwrap(), want);
+
+    let mask = r.slice(1, 0..1).gt(3.0);
+    let picked = luma::select(&mask, r.slice(1, 1..2), 0.0);
+    let want: Vec<f32> = (0..4).map(|x| if flat[x] > 3.0 { flat[x + 4] } else { 0.0 }).collect();
+    assert_eq!(picked.to_vec().unwrap(), want);
+}
+
+#[test]
+fn a_mutable_view_array_reshaped_then_sliced_reads_the_reshaped_elements() {
+    let (_ctx, mut a, flat) = reshaped_view();
+    let region = a.slice_mut(0, 0..2).to_array();
+    let r = region.reshape([8]);
+    assert_eq!(r.slice(0, 2..4).to_vec().unwrap(), flat[2..4]);
+    assert_eq!(r.flip(0).slice(0, 0..2).to_vec().unwrap(), [flat[7], flat[6]]);
+}
