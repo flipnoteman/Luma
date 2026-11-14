@@ -6,8 +6,28 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Breaking
+
+- Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) and `is_finite` / `is_nan` / `is_inf` return
+  `Array<Mask>` instead of `Array<u32>`; `select`, `sum_where` and `Fields::select` take
+  `&Array<Mask>`. Where a mask was used as a number, convert it with `.to_u32()` or `.to_f32()`
+  (`x.gt(0.0).to_f32()`). Masks passed to `select` or `sum_where` need no change. `sum`, `cumsum`,
+  `scan` and `sum_axis` of a mask array fail with `LumaError::Unsupported`: use `count()`,
+  `any()`, `all()` or convert first. See the migration chapter of the guide.
+
 ### Added
 
+- `Array<i32>`: `+ - * / %` (wrapping; `x / 0` is `x`, `i32::MIN / -1` is `i32::MIN`, `x % 0` is
+  0), unary minus, `abs`, `sign`, `& | ^ !`, arithmetic `<< >>`, `minimum` / `maximum`,
+  comparisons, `select`, views, reductions, scans and loops; `i32` scalars and `luma::Scalar<i32>`.
+- Casts between `f32`, `u32` and `i32`: `to_f32` (from `u32`, `i32`), `to_u32` (from `f32`,
+  `i32`), `to_i32` (from `f32`, `u32`). Float to integer truncates toward zero and saturates
+  (`u32` at `4294967040`, `i32` at `-2147483648..=2147483520`); NaN becomes 0. `u32` and `i32`
+  convert by reinterpreting the bits.
+- `luma::Mask`, the element type of comparisons and classifications (`Mask::TRUE`, `Mask::FALSE`,
+  `From<bool>`, `From<Mask> for bool`): `& | ^ !`, `count()` (a `u32` array), `any()` and `all()`
+  (mask arrays), `to_u32()` and `to_f32()`, `min` / `max`, views, `select` and loops.
+- The fuzzer covers `i32`, masks and the new casts.
 - A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
   version per release (`/vX.Y.Z/`) and `/main/`: arrays, lazy evaluation and fusion, views and
   writes, reductions and scans, records, loops, precision, integer and bit operations, custom
@@ -16,6 +36,9 @@ All notable changes to Luma are listed here. The format follows
 - `Array::reduce_axis` (up to four of sum, min, max and sum of squares along an axis in one pass
   over the data) and, for `f32`, `mean_axis`, `var_axis` (population variance, two-pass) and
   `std_axis`.
+- `sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis` for `u32`, `i32` and
+  `f32` arrays (`SortKey`): a stable radix sort on the GPU, about 2 ms for 2^24 keys on an RTX 3090.
+  Floats sort in total order, NaNs last.
 
 ### Changed
 

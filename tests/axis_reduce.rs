@@ -135,6 +135,38 @@ fn every_reduction_on_every_axis_u32() {
 }
 
 #[test]
+fn every_reduction_on_every_axis_i32() {
+    let ctx = Context::new().unwrap();
+    let dims = [37usize, 45, 3];
+    let len: usize = dims.iter().product();
+    let a: Vec<i32> = (0..len as u32).map(|i| (i.wrapping_mul(2654435761) >> 8) as i32 - (1 << 23)).collect();
+    let x = Array::from_slice_on(&ctx, &a, dims).unwrap();
+    let evaluated = x.clone();
+    evaluated.eval().unwrap();
+    let pending = &x + 7i32;
+    let shifted: Vec<i32> = a.iter().map(|v| v.wrapping_add(7)).collect();
+    for axis in 0..3 {
+        for (input, data) in [(&evaluated, &a), (&pending, &shifted)] {
+            let [min, max, sum, squares] = input.reduce_axis(axis, ALL);
+            let stride: usize = dims[..axis].iter().product();
+            let n = dims[axis];
+            let lines = len / n;
+            let line = |l: usize| {
+                let base = l % stride + (l / stride) * stride * n;
+                (0..n).map(move |s| data[base + s * stride])
+            };
+            let want = |f: &dyn Fn(i32, i32) -> i32, g: &dyn Fn(i32) -> i32| -> Vec<i32> {
+                (0..lines).map(|l| line(l).map(g).reduce(f).unwrap()).collect()
+            };
+            assert_eq!(min.to_vec().unwrap(), want(&|a, b| a.min(b), &|v| v), "min axis {axis}");
+            assert_eq!(max.to_vec().unwrap(), want(&|a, b| a.max(b), &|v| v), "max axis {axis}");
+            assert_eq!(sum.to_vec().unwrap(), want(&|a, b| a.wrapping_add(b), &|v| v), "sum axis {axis}");
+            assert_eq!(squares.to_vec().unwrap(), want(&|a, b| a.wrapping_add(b), &|v| v.wrapping_mul(v)), "squares axis {axis}");
+        }
+    }
+}
+
+#[test]
 fn line_shapes_short_long_few_and_many() {
     let ctx = Context::new().unwrap();
     // (dims, axis): contiguous short and long lines, strided with few and many lines.
@@ -228,4 +260,20 @@ fn bad_arguments_poison_the_results() {
     assert!(none.is_empty());
     let [bad] = x.reduce_axis(4, [Reduction::Sum]);
     assert!(matches!(bad.error().map(LumaError::root), Some(LumaError::InvalidShape(_))), "{:?}", bad.error());
+}
+
+#[test]
+fn mask_arrays_reduce_by_min_and_max_only() {
+    let ctx = Context::new().unwrap();
+    let x = Array::from_slice_on(&ctx, &[1.0f32, -1.0, 2.0, 3.0, -4.0, -5.0], [3, 2]).unwrap();
+    let m = x.gt(0.0);
+    for result in m.reduce_axis(0, [Reduction::Sum]).iter().chain(m.reduce_axis(0, [Reduction::Min, Reduction::SumOfSquares]).iter()) {
+        assert!(matches!(result.error().map(LumaError::root), Some(LumaError::Unsupported(_))), "{:?}", result.error());
+    }
+    assert!(matches!(m.sum_axis(0).error().map(LumaError::root), Some(LumaError::Unsupported(_))));
+    assert!(matches!(m.cumsum(0).error().map(LumaError::root), Some(LumaError::Unsupported(_))));
+    let max = m.max_axis(0).to_vec().unwrap();
+    assert_eq!(max, vec![luma::Mask::TRUE, luma::Mask::TRUE]);
+    let min = m.min_axis(0).to_vec().unwrap();
+    assert_eq!(min, vec![luma::Mask::FALSE, luma::Mask::FALSE]);
 }

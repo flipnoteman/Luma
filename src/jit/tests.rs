@@ -111,7 +111,7 @@ fn comparison_into_select_stays_in_one_kernel() {
     let x = f32s(&ctx, &xs);
 
     let before = ctx.jit().stats();
-    // f32 inputs, a u32 mask in the middle, f32 out.
+    // f32 inputs, a mask in the middle, f32 out.
     let mask = x.gt(0.25);
     let out = select(&mask, &(&x * 3.0), &(&x - 1.0)) + 1.0;
     let got = out.to_vec().unwrap();
@@ -126,7 +126,7 @@ fn comparison_into_select_stays_in_one_kernel() {
     let ints: Vec<u32> = (0..1000).collect();
     let u = Array::from_slice_on(&ctx, &ints, 1000).unwrap();
     let flags = (&u + 3u32).ge(500u32);
-    let got = (&flags * 7u32 + 1u32).to_vec().unwrap();
+    let got = (&flags.to_u32() * 7u32 + 1u32).to_vec().unwrap();
     let want: Vec<u32> = ints.iter().map(|&v| u32::from(v + 3 >= 500) * 7 + 1).collect();
     assert_eq!(got, want);
 }
@@ -196,7 +196,7 @@ fn reductions_fuse_their_input_expression() {
     assert!((f64::from(mean) - want_mean).abs() < 1e-4, "{mean} vs {want_mean}");
 
     // u32: counting a mask.
-    let count = a.gt(0.0).sum().item().unwrap();
+    let count = a.gt(0.0).count().item().unwrap();
     assert_eq!(count as usize, xs.iter().filter(|&&x| x > 0.0).count());
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
 
@@ -850,7 +850,7 @@ fn arrays_evaluated_together_share_one_kernel() {
     ctx.sync().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
     assert_close(&scaled.to_vec().unwrap(), &xs.iter().map(|v| v * 4.0).collect::<Vec<_>>(), 1e-6, 1e-6);
-    assert_eq!(mask.to_vec().unwrap(), xs.iter().map(|&v| u32::from(v > 1.0)).collect::<Vec<_>>());
+    assert_eq!(mask.to_u32().to_vec().unwrap(), xs.iter().map(|&v| u32::from(v > 1.0)).collect::<Vec<_>>());
     assert_eq!(other_len.to_vec().unwrap(), vec![2.0, 4.0]);
 }
 

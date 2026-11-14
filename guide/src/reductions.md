@@ -33,7 +33,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 | `sum()`, `min()`, `max()` | any element type; `u32` sums wrap around |
 | `mean()`, `norm()` | `f32`; the norm is the Euclidean (L2) norm |
 | `reduce([Reduction; N])` | `N` of `Sum`, `Min`, `Max`, `SumOfSquares` (one to four) in one pass, as an `N`-element array |
-| `sum_where(&mask)` | the sum of the elements where a `u32` mask is non-zero, in one pass |
+| `sum_where(&mask)` | the sum of the elements where a `Mask` is true, in one pass |
 | `item()` | the value of a one-element array |
 | `to_array::<N>()` | the values of an `N`-element array |
 
@@ -110,8 +110,8 @@ are the ones a host loop would give.
 
 ### Masks
 
-`sum_where(&mask)` sums where a `u32` mask is non-zero (comparisons return such masks), the
-count of a condition is the sum of the mask itself:
+`sum_where(&mask)` sums where a `Mask` is true (comparisons return masks); `count()` of a mask is
+the number of true elements, as a `u32` array:
 
 ```rust
 use luma::*;
@@ -119,7 +119,7 @@ use luma::*;
 let x = Array::from_slice(&[1.0f32, -2.0, 3.0, -4.0], 4)?;
 let positive = x.gt(0.0);
 assert_eq!(x.sum_where(&positive).item()?, 4.0);
-assert_eq!(positive.sum().item()?, 2);
+assert_eq!(positive.count().item()?, 2);
 # Ok::<(), luma::LumaError>(())
 ```
 
@@ -175,6 +175,29 @@ changing them does not recompile); anything else poisons the result. Non-associa
 give unspecified results, because the kernels regroup operands. Scans and axis reductions do not
 fuse into the expression behind them: the arrays are evaluated first. They are available for
 `f32` and `u32` arrays only (`f64` and `Df32` fail with `Unsupported`).
+
+## Sorting
+
+`sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis(axis)` order `u32`,
+`i32` and `f32` arrays with a stable radix sort on the GPU. `argsort` returns the flat indices
+that sort the array, so equal elements keep their input order. The results are recorded like any
+other operation; the input is evaluated first.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[3.0f32, -1.0, f32::NAN, 2.0, -1.0, 0.5], [3, 2])?;
+assert_eq!(x.argsort().to_vec()?, vec![1, 4, 5, 3, 0, 2]);
+// Sorts every line along axis 0 (the first dimension varies fastest).
+let lines = x.sort_axis(0).to_vec()?;
+assert_eq!(&lines[..2], &[-1.0, 3.0]);
+assert!(lines[2].is_nan());
+assert_eq!(&lines[3..], &[-1.0, 0.5, 2.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+Floats sort in the total order of their bits: `-inf < .. < -0.0 < +0.0 < .. < +inf < NaN`, so NaNs
+come last (first when descending) and `-0.0` sorts before `+0.0`.
 
 ## Precision
 

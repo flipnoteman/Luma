@@ -225,7 +225,7 @@ pub struct Term {
 /// for an even `kappa` and `f0 g1 + f1 g0` for an odd one. `kappa` is the coefficient index of every
 /// element of the terms' (equal) shape.
 pub fn base_multiply_sum(t: &Tables, kappa: &Array<u32>, terms: &[Term]) -> Array<u32> {
-    let odd = kappa & 1u32;
+    let odd = (kappa & 1u32).ne(0u32);
     let gamma = t.gammas.take(&(kappa >> 1u32));
     let mut acc: Option<Array<u32>> = None;
     for term in terms {

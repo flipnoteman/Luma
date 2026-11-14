@@ -35,7 +35,9 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 | Type | Use |
 | --- | --- |
 | `f32` | the default float; every operation |
-| `u32` | indices, masks, [bit operations](integers.md) (comparisons return `Array<u32>`, `0` or `1`) |
+| `u32` | indices, counters, [bit operations](integers.md) |
+| `i32` | signed integers, [casts](integers.md#signed-integers-and-casts) |
+| `Mask` | the result of comparisons: a boolean per element ([masks](integers.md#comparisons-masks-and-select)) |
 | `Df32` | double-float, about 48 bits of mantissa, runs on every device ([Precision](precision.md)) |
 | `f64` | 64-bit float, only on devices with `SHADER_F64` |
 

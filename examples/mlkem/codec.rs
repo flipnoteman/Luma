@@ -54,7 +54,7 @@ pub fn pack(coefficients: &Array<u32>, d: u32) -> Array<u32> {
         let from_left = at.ge(&start);
         let up = select(&from_left, &(&at - &start), 0u32);
         let down = select(&from_left, 0u32, &(&start - &at));
-        let inside = up.lt(32u32) | (1u32 - &from_left);
+        let inside = up.lt(32u32) | !&from_left;
         let placed = select(&from_left, c.shl(&up), c.shr(&down));
         let term = select(&inside, &placed, 0u32);
         acc = Some(match acc {
@@ -69,7 +69,7 @@ pub fn pack(coefficients: &Array<u32>, d: u32) -> Array<u32> {
 pub fn compress(x: &Array<u32>, d: u32) -> Array<u32> {
     if d == 1 {
         // 833 ..= 2496 round to 1.
-        return x.gt(832u32) * x.lt(2497u32);
+        return (x.gt(832u32) & x.lt(2497u32)).to_u32();
     }
     (((x << d) + (Q / 2)) / Q) & ((1u32 << d) - 1)
 }

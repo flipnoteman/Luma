@@ -737,18 +737,7 @@ impl<T: GpuType> Array<T> {
 
     /// The element type of the built-in arithmetic, if `T` is one.
     fn scalar_ty() -> Option<ElemTy> {
-        let id = std::any::TypeId::of::<T>();
-        if id == std::any::TypeId::of::<f32>() {
-            Some(ElemTy::F32)
-        } else if id == std::any::TypeId::of::<u32>() {
-            Some(ElemTy::U32)
-        } else if id == std::any::TypeId::of::<f64>() {
-            Some(ElemTy::F64)
-        } else if id == std::any::TypeId::of::<crate::gpu_type::Df32>() {
-            Some(ElemTy::Df32)
-        } else {
-            None
-        }
+        ElemTy::try_of::<T>()
     }
 
     // -- Views --

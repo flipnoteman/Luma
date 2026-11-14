@@ -58,6 +58,16 @@ impl Word for u32 {
     }
 }
 
+impl Word for i32 {
+    fn to_word(self) -> u32 {
+        self as u32
+    }
+
+    fn from_word(word: u32) -> Self {
+        word as i32
+    }
+}
+
 impl<T: Word> Scalar<T> {
     /// A scalar holding `value`.
     pub fn new(value: T) -> Self {

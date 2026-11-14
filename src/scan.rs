@@ -531,7 +531,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
 }
 
 /// The kernels of one operator and what they run on.
-struct Lines<'a> {
+pub(crate) struct Lines<'a> {
     ctx: &'a Context,
     op: &'a Operator,
     scratch: Scratch<'a>,
@@ -542,9 +542,9 @@ struct Lines<'a> {
 
 /// A buffer and the bytes bound of it.
 #[derive(Clone, Copy)]
-struct Bound<'b> {
-    buffer: &'b Buffer,
-    bytes: u64,
+pub(crate) struct Bound<'b> {
+    pub(crate) buffer: &'b Buffer,
+    pub(crate) bytes: u64,
 }
 
 /// The lines a reduction runs over: `lines` lines of `n` cells, `stride` apart.
@@ -586,9 +586,19 @@ fn rows_per_group(n: u32) -> u32 {
     (ROWS_TILE / (n | 1)).min(rows_width(n))
 }
 
+/// The operator `+` on `u32`, for [`Lines::words`].
+pub(crate) fn add_operator(ctx: &Context) -> Outcome<Operator> {
+    Array::<u32>::alloc(ctx, Shape::from(1usize))?.trace_operator(&add)
+}
+
 impl<'a> Lines<'a> {
     fn new(ctx: &'a Context, op: &'a Operator, ty: &'static str) -> Self {
         Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), reduce_cores: Vec::new(), ty }
+    }
+
+    /// The scan kernels of `op`, which must be [`add_operator`] or another operator on `u32`.
+    pub(crate) fn words(ctx: &'a Context, op: &'a Operator) -> Self {
+        Lines::new(ctx, op, "u32")
     }
 
     fn core(&mut self, pass: Pass) -> Result<Arc<KernelCore>> {
@@ -686,7 +696,7 @@ impl<'a> Lines<'a> {
     }
 
     /// The inclusive scan of every line of `input` into `out`.
-    fn scan(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
+    pub(crate) fn scan(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
         let seq = [n, stride, lines, 1, n];
         if stride == 1 {
             if n <= SHORT_LINE {
@@ -847,7 +857,7 @@ impl<T: ScalarType> Array<T> {
 
     #[track_caller]
     fn scan_axis(&self, axis: usize, op: &ScanOp<'_, T>, name: &'static str, location: &'static Location<'static>) -> Array<T> {
-        let result = self.run_scan(axis, op);
+        let result = if ElemTy::try_of::<T>() == Some(ElemTy::Mask) { Err(mask_sum_error(name)) } else { self.run_scan(axis, op) };
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
 
@@ -858,7 +868,10 @@ impl<T: ScalarType> Array<T> {
             dims[axis] = 1;
         }
         let shape = Shape::from(dims);
-        let result = if (1..=MAX_REDUCTIONS).contains(&N) {
+        let sums_mask = ElemTy::try_of::<T>() == Some(ElemTy::Mask) && ops.iter().any(|r| matches!(r, Reduction::Sum | Reduction::SumOfSquares));
+        let result = if sums_mask {
+            Err(mask_sum_error(name))
+        } else if (1..=MAX_REDUCTIONS).contains(&N) {
             self.run_axis_reduce(axis, ReduceList::new(&ops.map(Reduction::op)))
         } else {
             Err(LumaError::InvalidShape(format!("{N} reductions along an axis: one to {MAX_REDUCTIONS} are computed together")).into())
@@ -937,6 +950,8 @@ impl<T: ScalarType> Array<T> {
     /// [`Reduction::SumOfSquares`] of integers wraps, as [`Array::reduce`] does. Contiguous lines
     /// (`axis` 0) are reduced by a workgroup per chunk of a line, short ones a group of lines per
     /// workgroup, strided lines by blocks that an invocation walks (see [`scan`](Array::scan)).
+    /// On [`Mask`](crate::Mask) arrays only `Min` and `Max` are available; `Sum` and
+    /// `SumOfSquares` poison every result with [`LumaError::Unsupported`].
     #[track_caller]
     pub fn reduce_axis<const N: usize>(&self, axis: usize, ops: [Reduction; N]) -> [Array<T>; N] {
         self.reduce_lines(axis, ops, "reduce_axis", Location::caller())
@@ -968,6 +983,11 @@ impl Array<f32> {
     pub fn std_axis(&self, axis: usize) -> Array<f32> {
         self.var_axis(axis).sqrt()
     }
+}
+
+/// The failure of an operation that would leave the values 0 and 1 on a [`crate::Mask`] array.
+pub(crate) fn mask_sum_error(name: &str) -> Failure {
+    LumaError::Unsupported(format!("{name} on Mask arrays; use count/any/all or to_u32")).into()
 }
 
 fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {

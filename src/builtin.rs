@@ -161,6 +161,15 @@ impl UnOp {
                 UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => Some(self.expr()),
                 _ => None,
             },
+            ElemTy::Mask => match self {
+                UnOp::Id => Some("x"),
+                UnOp::BitNot => Some("(x ^ 1u)"),
+                _ => None,
+            },
+            ElemTy::I32 => match self {
+                UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
+                _ => None,
+            },
             ElemTy::F32 if self.is_bitwise() => None,
             ElemTy::F32 => Some(self.expr()),
             ElemTy::F64 => match self {
@@ -239,6 +248,16 @@ impl BinOp {
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
             ElemTy::U32 => Some(self.expr()),
+            ElemTy::Mask => match self {
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Min | BinOp::Max => Some(self.expr()),
+                _ => None,
+            },
+            ElemTy::I32 => match self {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Min | BinOp::Max | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Some(self.expr()),
+                BinOp::Shl => Some("x << (bitcast<u32>(y) & 31u)"),
+                BinOp::Shr => Some("x >> (bitcast<u32>(y) & 31u)"),
+                _ => None,
+            },
             ElemTy::F32 => (!self.is_bitwise()).then(|| self.expr()),
             ElemTy::F64 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max => Some(self.expr()),
@@ -268,7 +287,7 @@ pub(crate) enum CmpOp {
 }
 
 impl CmpOp {
-    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1.
+    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1 (a mask).
     pub(crate) fn expr(self) -> &'static str {
         match self {
             CmpOp::Lt => "select(0u, 1u, x < y)",
@@ -319,7 +338,7 @@ impl Class {
         }
     }
 
-    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1: the bits of `x`
+    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1 (a mask): the bits of `x`
     /// below the sign are compared with those of infinity. They come through `luma_bits` of the
     /// double-float library, which ORs them with the guard uniform (always 0): a compiler that
     /// assumes no `NaN` or infinity arises in the arithmetic of the kernel (a device's fast
@@ -530,6 +549,23 @@ pub(crate) enum Builtin {
     /// `out[i] = 1` where word `i` of `a` is a NaN or an infinity (as `f32` bits), else 0;
     /// arguments: out, a. Element type `"u32"`. See `jit::check_finite`.
     NonFinite,
+    /// The counting kernel of a radix sort pass on bits `shift..shift + 8`: digit histogram of every
+    /// tile of keys into `counts[digit * tiles + tile]`; see [`crate::sort`]. Element type
+    /// `"u32"`. `first` passes read the user's keys through `transform` (and `descending`).
+    RadixCount { shift: u8, first: bool, transform: crate::sort::KeyTransform, descending: bool },
+    /// The scatter kernel of a radix sort pass: ranks the keys of a tile stably by the digit and
+    /// writes keys and payload to their global positions; see [`crate::sort`]. Element type
+    /// `"u32"`. `last` passes store keys through the inverse of `transform`; `store_keys == false`
+    /// stores the payload only.
+    RadixScatter {
+        shift: u8,
+        first: bool,
+        last: bool,
+        store_keys: bool,
+        payload: crate::sort::PayloadKind,
+        transform: crate::sort::KeyTransform,
+        descending: bool,
+    },
     /// Tiled matrix product of the operands (buffers) `a` and `b`; see [`crate::matmul`].
     /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
     /// dimension and writes every slice's partial product after the previous one.
@@ -606,7 +642,7 @@ impl<'a> ReduceElem<'a> {
 
     /// Whether the workgroup built-ins (`subgroupAdd`, ...) work on the type.
     fn subgroups(self) -> bool {
-        matches!(self, ReduceElem::Plain("f32" | "u32" | "vec2<f32>" | "vec4<f32>"))
+        matches!(self, ReduceElem::Plain("f32" | "u32" | "i32" | "vec2<f32>" | "vec4<f32>"))
     }
 
     fn library(self) -> String {
@@ -1304,6 +1340,10 @@ impl Builtin {
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
                 crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows).into()
             }
+            Builtin::RadixCount { shift, first, transform, descending } => crate::sort::count_source(shift, first, transform, descending).into(),
+            Builtin::RadixScatter { shift, first, last, store_keys, payload, transform, descending } => {
+                crate::sort::scatter_source(shift, first, last, store_keys, payload, transform, descending).into()
+            }
             Builtin::Matmul { tile, aligned, split } => crate::matmul::builtin_source(tile, aligned, split).into(),
             Builtin::MatmulSum => crate::matmul::sum_source(wg).into(),
             Builtin::NonFinite => format!(
@@ -1346,5 +1386,12 @@ mod tests {
         assert_eq!(UnOp::by_constant(BinOp::Shr, 33), Some(UnOp::Shr(1)));
         // There is no negation of an unsigned integer.
         assert!(UnOp::Neg.expr_for(ElemTy::U32).is_none());
+        // `i32` has the integer operations only: no float math, no rotations.
+        for op in [UnOp::Sqrt, UnOp::Exp, UnOp::Floor, UnOp::Rotl(3)] {
+            assert!(op.expr_for(ElemTy::I32).is_none(), "{op:?}");
+        }
+        assert!(BinOp::Rotl.expr_for(ElemTy::I32).is_none());
+        assert!(BinOp::Atan2.expr_for(ElemTy::I32).is_none());
+        assert!(UnOp::Neg.expr_for(ElemTy::I32).is_some());
     }
 }

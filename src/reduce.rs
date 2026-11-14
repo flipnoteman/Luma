@@ -8,7 +8,7 @@ use crate::array::{Array, Failure, Storage};
 use crate::builtin::{Builtin, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_EPILOGUE, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{GpuType, ScalarType};
+use crate::gpu_type::{GpuType, Mask, ScalarType};
 use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
 use crate::ops::{fold_workgroups, len_u32, run_select, Rhs};
 use crate::shape::Shape;
@@ -148,10 +148,10 @@ impl<T: ScalarType> Array<T> {
         self.reduce_at(ops, "reduce", Location::caller())
     }
 
-    /// The sum of the elements where `mask` is non-zero: `select(mask, self, 0).sum()` in one
+    /// The sum of the elements where `mask` is true: `select(mask, self, 0).sum()` in one
     /// pass. Lazy like [`Array::sum`].
     #[track_caller]
-    pub fn sum_where(&self, mask: &Array<u32>) -> Array<T> {
+    pub fn sum_where(&self, mask: &Array<Mask>) -> Array<T> {
         let location = Location::caller();
         let selected = run_select(mask, Rhs::Array(self), Rhs::Scalar(T::zeroed()), location);
         let selected = Array::resolve(mask.context(), mask.shape(), selected, "sum_where", location);
@@ -167,6 +167,9 @@ impl<T: ScalarType> Array<T> {
     fn run_reduce(&self, ops: ReduceList, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
         let shape = Shape::from(ops.as_slice().len());
+        if ElemTy::try_of::<T>() == Some(ElemTy::Mask) && ops.as_slice().iter().any(|op| matches!(op, ReduceOp::Sum | ReduceOp::SumSquares)) {
+            return Err(crate::scan::mask_sum_error(name));
+        }
         let elem = std::mem::size_of::<T>() as u64;
         let wgsl = T::reduce_type();
         // Poisoned operands pass their error on.

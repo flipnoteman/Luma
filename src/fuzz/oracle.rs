@@ -1,6 +1,6 @@
 //! The CPU oracle of the fuzzer: every operation computes eagerly on a `Vec<f64>` with plain
-//! loops, in the arithmetic of the array's type (`f32` operations are done in `f32`, `u32` ones
-//! wrap, [`Ty::Df32`] values are exact `f64`s). It is the reference, so it is kept simple.
+//! loops, in the arithmetic of the array's type (`f32` operations are done in `f32`, `u32` and
+//! `i32` ones wrap, [`Ty::Mask`] values are 0 or 1, [`Ty::Df32`] values are exact `f64`s). It is the reference, so it is kept simple.
 //!
 //! Sharing follows luma's documented rules (`tests/clone.rs`, `tests/assign.rs`):
 //!
@@ -27,6 +27,9 @@ pub type Dims = [usize; 4];
 pub enum Ty {
     F32,
     U32,
+    I32,
+    /// A boolean: 0 or 1.
+    Mask,
     Df32,
 }
 
@@ -59,8 +62,14 @@ pub enum UnOp {
     Clamp { lo: f32, hi: f32 },
     Powf(f32),
     ToDf32,
+    /// `Df32`, `u32`, `i32` or mask to `f32`.
     ToF32,
-    /// Bitwise complement (`u32` only).
+    /// `f32` (truncates toward zero, saturates, NaN is 0), `i32` (reinterprets the bits) or mask
+    /// to `u32`.
+    ToU32,
+    /// `f32` (as `ToU32`) or `u32` (reinterprets the bits) to `i32`.
+    ToI32,
+    /// Bitwise complement (`u32` and `i32`), logical negation (mask).
     Not,
 }
 
@@ -77,7 +86,8 @@ pub enum BinOp {
     Atan2,
     Hypot,
     Copysign,
-    /// `u32` only; shift and rotate amounts are taken modulo 32.
+    /// Integers and masks (the shifts and `Rotl` not masks, `Rotl` not `i32`); shift and rotate
+    /// amounts are taken modulo 32.
     BitAnd,
     BitOr,
     BitXor,
@@ -87,7 +97,7 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    /// Whether the operation exists for `u32` only.
+    /// Whether the operation exists for integers (and masks) only.
     pub fn bitwise(self) -> bool {
         matches!(self, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Rotl)
     }
@@ -261,6 +271,8 @@ pub fn store(ty: Ty, v: f64) -> f64 {
     match ty {
         Ty::F32 => f64::from(v as f32),
         Ty::U32 => f64::from(v as i64 as u32),
+        Ty::I32 => f64::from(v as i32),
+        Ty::Mask => f64::from(u8::from(v != 0.0)),
         Ty::Df32 => v,
     }
 }
@@ -323,6 +335,37 @@ pub fn apply_bin(ty: Ty, op: BinOp, a: f64, b: f64) -> f64 {
                 _ => unreachable!("math on integers"),
             })
         }
+        Ty::I32 => {
+            let (a, b) = (a as i32, b as i32);
+            f64::from(match op {
+                BinOp::Add => a.wrapping_add(b),
+                BinOp::Sub => a.wrapping_sub(b),
+                BinOp::Mul => a.wrapping_mul(b),
+                // WGSL: `x / 0 = x`, `i32::MIN / -1 = i32::MIN`, `x % 0 = 0`, `i32::MIN % -1 = 0`
+                // (measured on the RTX 3090 and llvmpipe).
+                BinOp::Div => if b == 0 { a } else { a.wrapping_div(b) },
+                BinOp::Rem => if b == 0 { 0 } else { a.wrapping_rem(b) },
+                BinOp::Minimum => a.min(b),
+                BinOp::Maximum => a.max(b),
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                BinOp::Shl => a.wrapping_shl(b as u32 & 31),
+                BinOp::Shr => a.wrapping_shr(b as u32 & 31),
+                _ => unreachable!("{op:?} on i32"),
+            })
+        }
+        Ty::Mask => {
+            let (a, b) = (a as u32, b as u32);
+            f64::from(match op {
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                BinOp::Minimum => a.min(b),
+                BinOp::Maximum => a.max(b),
+                _ => unreachable!("{op:?} on masks"),
+            })
+        }
         Ty::Df32 => match op {
             BinOp::Add => a + b,
             BinOp::Sub => a - b,
@@ -339,6 +382,12 @@ pub fn apply_un(ty: Ty, op: UnOp, a: f64) -> f64 {
     match (ty, op) {
         (_, UnOp::ToDf32) => a,
         (_, UnOp::ToF32) => f64::from(a as f32),
+        // The GPU saturates at the largest `f32` below the range (`4294967040`, `2147483520`).
+        (Ty::F32, UnOp::ToU32) => f64::from((a as f32 as u32).min(4_294_967_040)),
+        (Ty::F32, UnOp::ToI32) => f64::from((a as f32 as i32).min(2_147_483_520)),
+        (Ty::I32, UnOp::ToU32) => f64::from(a as i32 as u32),
+        (Ty::U32, UnOp::ToI32) => f64::from(a as u32 as i32),
+        (Ty::Mask, UnOp::ToU32) => a,
         (Ty::F32, op) => {
             let x = a as f32;
             f64::from(match op {
@@ -356,13 +405,18 @@ pub fn apply_un(ty: Ty, op: UnOp, a: f64) -> f64 {
                 UnOp::Tanh => x.tanh(),
                 UnOp::Clamp { lo, hi } => x.max(lo).min(hi),
                 UnOp::Powf(e) => x.powf(e),
-                UnOp::ToDf32 | UnOp::ToF32 | UnOp::Not => unreachable!(),
+                UnOp::ToDf32 | UnOp::ToF32 | UnOp::ToU32 | UnOp::ToI32 | UnOp::Not => unreachable!(),
             })
         }
         (Ty::Df32, UnOp::Neg) => -a,
         (Ty::Df32, UnOp::Abs) => a.abs(),
         (Ty::Df32, UnOp::Sqrt) => a.sqrt(),
         (Ty::U32, UnOp::Not) => f64::from(!(a as u32)),
+        (Ty::I32, UnOp::Not) => f64::from(!(a as i32)),
+        (Ty::I32, UnOp::Neg) => f64::from((a as i32).wrapping_neg()),
+        (Ty::I32, UnOp::Abs) => f64::from((a as i32).wrapping_abs()),
+        (Ty::I32, UnOp::Sign) => f64::from((a as i32).signum()),
+        (Ty::Mask, UnOp::Not) => f64::from(a as u32 ^ 1),
         (ty, op) => unreachable!("{op:?} on {ty:?}"),
     }
 }
@@ -433,6 +487,8 @@ impl HostArray {
         let ty = match op {
             UnOp::ToDf32 => Ty::Df32,
             UnOp::ToF32 => Ty::F32,
+            UnOp::ToU32 => Ty::U32,
+            UnOp::ToI32 => Ty::I32,
             _ => self.ty,
         };
         let data = self.data().into_iter().map(|v| apply_un(self.ty, op, v)).collect();
@@ -467,7 +523,7 @@ impl HostArray {
     pub fn compare(&self, op: CmpOp, rhs: Rhs<'_>) -> Res<HostArray> {
         let (dims, a, b) = self.operands(rhs)?;
         let data = a.into_iter().zip(b).map(|(a, b)| apply_cmp(op, a, b)).collect();
-        Ok(HostArray::new(dims, Ty::U32, data))
+        Ok(HostArray::new(dims, Ty::Mask, data))
     }
 
     /// `mask != 0 ? a : b` with the shape of the mask; a branch is a value or an array whose
@@ -662,14 +718,14 @@ impl HostArray {
         HostArray { dims, view: None, ..self.clone() }
     }
 
-    /// `1` where the element is of class `class`, else `0`, as `u32`.
+    /// `1` where the element is of class `class`, else `0`, as a mask.
     pub fn classify(&self, class: Class) -> HostArray {
         let data = self.data().into_iter().map(|v| f64::from(u32::from(match class {
             Class::Finite => v.is_finite(),
             Class::Nan => v.is_nan(),
             Class::Inf => v.is_infinite(),
         }))).collect();
-        HostArray::new(self.dims, Ty::U32, data)
+        HostArray::new(self.dims, Ty::Mask, data)
     }
 
     pub fn concat(axis: usize, parts: &[&HostArray]) -> Res<HostArray> {
@@ -715,6 +771,11 @@ impl HostArray {
 
     pub fn reduce(&self, op: RedOp) -> HostArray {
         HostArray::new([1, 1, 1, 1], self.ty, vec![self.fold(op, &self.data())])
+    }
+
+    /// The number of non-zero elements of a mask, as a one-element `u32` array.
+    pub fn count(&self) -> HostArray {
+        HostArray::new([1, 1, 1, 1], Ty::U32, vec![self.data().iter().sum()])
     }
 
     pub fn sum_where(&self, mask: &HostArray) -> Res<HostArray> {

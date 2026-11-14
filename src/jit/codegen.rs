@@ -24,7 +24,7 @@ use crate::tuning::{Tuning, STENCIL_RADIUS};
 
 use super::inline::{Inlined, Lowered, Region, StagedPrograms};
 use super::params;
-use super::program::{calls_df_library, FusedKey, Instr, Ref, Tail};
+use super::program::{calls_df_library, AtomicOp, FusedKey, Instr, Ref, Tail};
 use super::staging::Staging;
 use super::stencil::{signed, wrap_source, WORKGROUP};
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -38,7 +38,7 @@ fn name(reference: Ref, ty: ElemTy) -> String {
         Ref::Scalar(k) => match ty {
             ElemTy::F64 => format!("(f64(p.s{k}) + f64(p.s{}) + f64(p.s{}))", k + 1, k + 2),
             ElemTy::Df32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
-            ElemTy::F32 | ElemTy::U32 => format!("p.s{k}"),
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => format!("p.s{k}"),
         },
         Ref::Tmp(k) => format!("t{k}"),
         Ref::Sub(k) => format!("sub{k}"),
@@ -226,7 +226,14 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
         (ElemTy::Df32, ElemTy::F32) => format!("luma_o({value}.x + {value}.y)"),
         (ElemTy::F64, ElemTy::Df32) => format!("vec2<f32>(luma_o(f32({value})), f32({value} - f64(luma_o(f32({value})))))"),
         (ElemTy::Df32, ElemTy::F64) => format!("(f64(luma_o({value}.x)) + f64({value}.y))"),
-        _ => value.to_owned(),
+        (ElemTy::U32, ElemTy::F32) | (ElemTy::I32, ElemTy::F32) | (ElemTy::Mask, ElemTy::F32) => format!("f32({value})"),
+        (ElemTy::F32, ElemTy::U32) => format!("select(0u, u32(clamp({value}, 0.0, 4294967040.0)), {value} == {value})"),
+        (ElemTy::F32, ElemTy::I32) => format!("select(0i, i32(clamp({value}, -2147483648.0, 2147483520.0)), {value} == {value})"),
+        (ElemTy::U32, ElemTy::I32) => format!("bitcast<i32>({value})"),
+        (ElemTy::I32, ElemTy::U32) => format!("bitcast<u32>({value})"),
+        (ElemTy::Mask, ElemTy::U32) => value.to_owned(),
+        _ if from == to => value.to_owned(),
+        _ => unreachable!("cast {from:?} -> {to:?}"),
     }
 }
 
@@ -248,17 +255,20 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Uniform => format!("luma_uniform(luma_threefry({index}, {a}, {b}).x)"),
         Gen::Normal => format!("luma_normal(luma_threefry({index}, {a}, {b}))"),
         Gen::Index => match ty {
-            ElemTy::U32 => index.to_owned(),
+            ElemTy::U32 | ElemTy::Mask => index.to_owned(),
+            ElemTy::I32 => format!("bitcast<i32>({index})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
-            ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
+            ElemTy::U32 | ElemTy::Mask => format!("(({index} >> {a}) & {b})"),
+            ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
         },
         Gen::RangeConst { stride, size } => {
             let coord = if stride == 1 { format!("({index} % {size}u)") } else { format!("(({index} / {stride}u) % {size}u)") };
             match ty {
-                ElemTy::U32 => coord,
+                ElemTy::U32 | ElemTy::Mask => coord,
+                ElemTy::I32 => format!("bitcast<i32>({coord})"),
                 ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({coord})"),
             }
         }
@@ -445,7 +455,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     let out_ty = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     let outputs: Vec<usize> = match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => key.outputs.iter().map(|&at| at as usize).collect(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
         // The roots are the operands, read by `luma_lhs` / `luma_rhs`; the output is `c`.
         Tail::Matmul { .. } => Vec::new(),
@@ -465,7 +475,13 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     for (j, &at) in outputs.iter().enumerate() {
         // A reduction's single output is `out`, as `reduce_main` expects.
         let name = if reduce { "out".to_owned() } else { format!("out{j}") };
-        let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{}>;", out_ty(at));
+        // An atomic scatter binds its target as atomics (floats as their bits).
+        let elem = match (key.tail, out_ty(at)) {
+            (Tail::ScatterAdd { .. }, "i32") => "atomic<i32>",
+            (Tail::ScatterAdd { .. }, _) => "atomic<u32>",
+            (_, ty) => ty,
+        };
+        let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{elem}>;");
     }
     let mut binding = outputs.len() + usize::from(matmul) + axis_outputs;
     for (k, ty) in key.input_tys.iter().enumerate() {
@@ -537,7 +553,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     };
     let global = if segmented || based { "    let gi = p.base + i;\n" } else { "" };
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => {
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => {
             let stores: String = match key.tail {
                 Tail::StoreMapped(map) => {
                     let n = views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0);
@@ -555,6 +571,12 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                     let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
                     format!("    let j = t{};\n    if (j < {len}) {{ out0[j] = t{}; }}\n", value(index as usize), value(stored as usize))
                 }
+                Tail::ScatterAdd { len, op, private: false } => {
+                    let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
+                    let apply = atomic_apply(out_ty(outputs[0]), op, "out0[j]", &format!("t{}", value(stored as usize)), "    ");
+                    format!("    let j = t{};\n    if (j < {len}u) {{\n{apply}    }}\n", value(index as usize))
+                }
+                Tail::ScatterAdd { private: true, .. } => String::new(),
                 Tail::Stack { total, .. } if stack_stages(key, wg, out_ty(outputs[0])) => {
                     let mut stores = String::new();
                     for (j, &at) in key.outputs.iter().enumerate() {
@@ -575,6 +597,46 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                 }
                 _ => outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[i] = t{};\n", value(at))).collect(),
             };
+            if let Tail::ScatterAdd { len, op, private: true } = key.tail {
+                let (stored, slot) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
+                let ty = out_ty(outputs[0]);
+                let bins = (len as usize).next_multiple_of(wg as usize);
+                let atom = if ty == "i32" { "i32" } else { "u32" };
+                let seed = atomic_seed(ty, op);
+                let apply = atomic_apply(ty, op, "acc[j]", &format!("t{}", value(stored as usize)), "            ");
+                let merge = atomic_apply(ty, op, "out0[b]", &if ty == "f32" { "bitcast<f32>(a)".to_owned() } else { "a".to_owned() }, "            ");
+                let _ = write!(
+                    src,
+                    "
+var<workgroup> acc: array<atomic<{atom}>, {bins}>;
+@compute @workgroup_size({wg})
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let group = wid.x + wid.y * nwg.x;
+    for (var b = lid.x; b < {bins}u; b = b + {wg}u) {{
+        atomicStore(&acc[b], {seed});
+    }}
+    workgroupBarrier();
+    for (var i = group * {wg}u + lid.x; i < luma.size.x; i = i + nwg.x * nwg.y * {wg}u) {{
+{global}{}        let j = t{};
+        if (j < {len}u) {{
+{apply}        }}
+    }}
+    workgroupBarrier();
+    for (var b = lid.x; b < {len}u; b = b + {wg}u) {{
+        let a = atomicLoad(&acc[b]);
+        if (a != {seed}) {{
+{merge}        }}
+    }}
+}}
+",
+                    match inlined {
+                        Some(inlined) => lowered_body(key, inlined, &names, index, None, None),
+                        None => body(&key.instrs, &key.input_tys, &names, index, segmented),
+                    },
+                    value(slot as usize)
+                );
+                return src;
+            }
             if let Some(tile) = &key.tile {
                 src.push_str(&tiled_main(key, tile, based, &stores, &names));
                 return src;
@@ -1321,4 +1383,47 @@ fn subs(key: &FusedKey, views: &[(ViewMap, Edge)], in_place: &[(u32, u32)]) -> S
         );
     }
     src
+}
+
+/// The statements applying `op` with `value` (of WGSL type `ty`) to the atomic `target`: floats
+/// are held as their bits, so `f32` retries a compare-and-exchange until it lands (or, for a
+/// min or max, until it would not change the element).
+fn atomic_apply(ty: &str, op: AtomicOp, target: &str, value: &str, pad: &str) -> String {
+    if ty != "f32" {
+        let call = match op {
+            AtomicOp::Add => "atomicAdd",
+            AtomicOp::Min => "atomicMin",
+            AtomicOp::Max => "atomicMax",
+        };
+        return format!("{pad}_ = {call}(&{target}, {value});\n");
+    }
+    let (combine, stable) = match op {
+        AtomicOp::Add => ("bitcast<f32>(old) + v", ""),
+        AtomicOp::Min => ("min(bitcast<f32>(old), v)", "if (nv == old) { break; }\n"),
+        AtomicOp::Max => ("max(bitcast<f32>(old), v)", "if (nv == old) { break; }\n"),
+    };
+    let mut out = format!("{pad}{{\n{pad}    let v = {value};\n{pad}    var old = atomicLoad(&{target});\n{pad}    loop {{\n");
+    let _ = writeln!(out, "{pad}        let nv = bitcast<u32>({combine});");
+    if !stable.is_empty() {
+        let _ = write!(out, "{pad}        {stable}");
+    }
+    let _ = write!(
+        out,
+        "{pad}        let r = atomicCompareExchangeWeak(&{target}, old, nv);\n{pad}        if (r.exchanged) {{ break; }}\n{pad}        old = r.old_value;\n{pad}    }}\n{pad}}}\n"
+    );
+    out
+}
+
+/// What a private accumulator starts as for `op` on elements of type `ty`, as a WGSL value (the
+/// merge skips the elements still holding it).
+fn atomic_seed(ty: &str, op: AtomicOp) -> &'static str {
+    match (ty, op) {
+        ("f32", AtomicOp::Add) | ("u32", AtomicOp::Add | AtomicOp::Max) => "0u",
+        ("f32", AtomicOp::Min) => "0x7F800000u",
+        ("f32", AtomicOp::Max) => "0xFF800000u",
+        ("i32", AtomicOp::Add) => "0i",
+        ("i32", AtomicOp::Min) => "2147483647i",
+        ("i32", AtomicOp::Max) => "bitcast<i32>(0x80000000u)",
+        _ => "0xFFFFFFFFu",
+    }
 }

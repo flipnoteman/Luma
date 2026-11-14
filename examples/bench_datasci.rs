@@ -29,7 +29,6 @@ use std::time::Instant;
 static PANIC: Mutex<String> = Mutex::new(String::new());
 
 /// Default `--gate` threshold on `luma GPU time / hand GPU time`.
-#[allow(dead_code)]
 const DEFAULT_GATE: f64 = 1.05;
 /// Warm-up runs before timing.
 const WARMUPS: usize = 2;
@@ -187,7 +186,6 @@ fn check(name: &str, got: &[f32], want: &[f32], rel: f32, abs: f32) {
     }
 }
 
-#[allow(dead_code)]
 fn check_exact<T: PartialEq + Debug>(name: &str, got: &[T], want: &[T]) {
     assert_eq!(got.len(), want.len(), "{name}: length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -207,7 +205,6 @@ fn values(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
 }
 
 /// `n` pseudo-random codes in `0..modulo`.
-#[allow(dead_code)]
 fn codes(n: usize, seed: u64, modulo: u32) -> Vec<u32> {
     let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     (0..n)
@@ -428,20 +425,20 @@ fn bench_axis(b: &mut Bench) {
     });
 }
 
-/// Checks the privatised histogram (256 and 4096 bins) exactly against the host bucket function,
-/// inputs covering below `lo`, above `hi` and NaN, then times it over `2^26` values.
-fn sanity_hist(b: &mut Bench) {
-    b.guarded("hand/hist", |b| {
-        let ctx = b.ctx.clone();
-        let n = if b.quick { 1usize << 20 } else { 1 << 26 };
-        let (lo, hi) = (0.0f32, 1.0f32);
-        let mut hx = values(n, 50, -0.25, 1.25);
-        for i in (0..n).step_by(100_003) {
-            hx[i] = f32::NAN;
-        }
-        let x = Array::from_slice_on(&ctx, &hx, n).unwrap();
-        let zero = hand::HandZero::new(&ctx).unwrap();
-        for bins in [256usize, 4096] {
+/// `x.histogram(bins, lo, hi)` against the privatised workgroup-atomic hand histogram over `2^26`
+/// values (below `lo`, above `hi` and NaN included). Both sides are verified exactly against the
+/// host bucket function first.
+fn case_hist(b: &mut Bench) {
+    for bins in [256usize, 4096] {
+        b.guarded(&format!("hist/{bins}"), |b| {
+            let ctx = b.ctx.clone();
+            let n = if b.quick { 1usize << 20 } else { 1 << 26 };
+            let (lo, hi) = (0.0f32, 1.0f32);
+            let mut hx = values(n, 50, -0.25, 1.25);
+            for i in (0..n).step_by(100_003) {
+                hx[i] = f32::NAN;
+            }
+            let x = Array::from_slice_on(&ctx, &hx, n).unwrap();
             let scale = bins as f32 / (hi - lo);
             let mut want = vec![0u32; bins];
             for &v in &hx {
@@ -449,17 +446,29 @@ fn sanity_hist(b: &mut Bench) {
                 let u = if t.is_nan() { 0 } else { t.clamp(0.0, 4294967040.0) as u32 };
                 want[u.min(bins as u32 - 1) as usize] += 1;
             }
+            let zero = hand::HandZero::new(&ctx).unwrap();
             let hist = hand::HandHist::new(&ctx, bins).unwrap();
             let mut out = Array::<u32>::zeros_on(&ctx, bins).unwrap();
+
+            let h = x.histogram(bins, lo, hi);
+            h.eval().unwrap();
+            check_exact(&format!("hist/{bins} luma"), &h.to_vec().unwrap(), &want);
             hist.run(&x, &mut out, n, lo, scale);
-            check_exact(&format!("hand/hist{bins}"), &out.to_vec().unwrap(), &want);
-            report_hand(b, &format!("hand/hist{bins} n={n}"), 4.0 * n as f64, &mut || {
-                zero.run(&mut out, bins);
-                hist.run(&x, &mut out, n, lo, scale);
-            });
-        }
-        println!("hand hist ok");
-    });
+            check_exact(&format!("hist/{bins} hand"), &out.to_vec().unwrap(), &want);
+
+            b.compare(
+                &format!("hist/{bins}"),
+                &n.to_string(),
+                Work::Bytes(4.0 * n as f64),
+                Some(DEFAULT_GATE),
+                &mut || x.histogram(bins, lo, hi).eval().unwrap(),
+                &mut || {
+                    zero.run(&mut out, bins);
+                    hist.run(&x, &mut out, n, lo, scale);
+                },
+            );
+        });
+    }
 }
 
 /// Host f64 scatter-add of `val` by `idx` (indices `>= len` skipped) and the per-bin `sum |v|`.
@@ -483,10 +492,10 @@ fn check_sums(name: &str, got: &[f32], sum: &[f64], mag: &[f64]) {
     }
 }
 
-/// Checks the hand-written CAS scatter-add (with out-of-range indices) against host f64 sums and
-/// times it for `2^24` pairs into `2^20` bins.
-fn sanity_scatter(b: &mut Bench) {
-    b.guarded("hand/scatter_add", |b| {
+/// `put_add` of `2^24` `f32` values into `2^20` bins (a few indices out of range) against the hand
+/// global CAS-loop kernel. Both sides are verified against host f64 sums first.
+fn case_scatter_add(b: &mut Bench) {
+    b.guarded("scatter_add/f32", |b| {
         let ctx = b.ctx.clone();
         let n = if b.quick { 1usize << 18 } else { 1 << 24 };
         let len = if b.quick { 1usize << 14 } else { 1 << 20 };
@@ -498,13 +507,29 @@ fn sanity_scatter(b: &mut Bench) {
         let zero = hand::HandZero::new(&ctx).unwrap();
         let hand = hand::HandScatterAddF32::new(&ctx).unwrap();
         let mut out = Array::<f32>::zeros_on(&ctx, len).unwrap();
+
+        let mut t = Array::<f32>::zeros_on(&ctx, len).unwrap();
+        t.put_add(&idx, &val).unwrap();
+        t.eval().unwrap();
+        check_sums("scatter_add/f32 luma", &t.to_vec().unwrap(), &sum, &mag);
         hand.run(&idx, &val, &mut out, n, len);
-        check_sums("hand/scatter_add", &out.to_vec().unwrap(), &sum, &mag);
-        println!("hand scatter_add ok");
-        report_hand(b, &format!("hand/scatter_add n={n} len={len}"), 8.0 * n as f64, &mut || {
-            zero.run(&mut out, len);
-            hand.run(&idx, &val, &mut out, n, len);
-        });
+        check_sums("scatter_add/f32 hand", &out.to_vec().unwrap(), &sum, &mag);
+
+        b.compare(
+            "scatter_add/f32",
+            &format!("{n}->{len}"),
+            Work::Bytes(8.0 * n as f64),
+            Some(DEFAULT_GATE),
+            &mut || {
+                let mut t = Array::<f32>::zeros_on(&ctx, len).unwrap();
+                t.put_add(&idx, &val).unwrap();
+                t.eval().unwrap();
+            },
+            &mut || {
+                zero.run(&mut out, len);
+                hand.run(&idx, &val, &mut out, n, len);
+            },
+        );
     });
 }
 
@@ -532,6 +557,133 @@ fn sanity_group_sum(b: &mut Bench) {
             });
         }
         println!("hand group_sum ok");
+    });
+}
+
+/// Entries `(row, column)` of an `m x n` result to verify: all of them if few, else a
+/// pseudo-random sample (a host GEMM at 4096^3 is too slow).
+fn sample_entries(m: usize, n: usize, seed: u64) -> Vec<(usize, usize)> {
+    if m * n <= 1 << 16 {
+        return (0..m).flat_map(|r| (0..n).map(move |c| (r, c))).collect();
+    }
+    let r = codes(512, seed, m as u32);
+    let c = codes(512, seed + 1, n as u32);
+    r.into_iter().zip(c).take(256).map(|(r, c)| (r as usize, c as usize)).collect()
+}
+
+/// Checks `got` (row-major `m x n`) against `A B` (row-major `m x k` and `k x n`) in f64 on the
+/// sampled entries.
+fn check_gemm(name: &str, got: &[f32], ha: &[f32], hb: &[f32], m: usize, n: usize, k: usize) {
+    let entries = sample_entries(m, n, 77);
+    let want: Vec<f32> =
+        entries.iter().map(|&(r, c)| (0..k).map(|i| ha[r * k + i] as f64 * hb[i * n + c] as f64).sum::<f64>() as f32).collect();
+    let have: Vec<f32> = entries.iter().map(|&(r, c)| got[r * n + c]).collect();
+    check(name, &have, &want, 1e-3, 1e-3 * (k as f32).sqrt());
+}
+
+/// `matmul/square` (luma against the hand SGEMM at the same size) and `matmul/odd` (luma at an
+/// odd size against the hand SGEMM at the next multiple of 128).
+fn cmp_matmul(b: &mut Bench) {
+    let hand = hand::HandSgemm::new(&b.ctx).unwrap();
+    let square: &[usize] = if b.quick { &[256] } else { &[1024, 2048, 4096] };
+    let odd: &[(usize, usize)] = if b.quick { &[(200, 256)] } else { &[(1000, 1024), (3000, 3072)] };
+    for &n in square {
+        if !b.want("matmul/square") {
+            continue;
+        }
+        b.guarded("matmul/square", |b| {
+            let ctx = b.ctx.clone();
+            let (ha, hb) = (values(n * n, 41, -1.0, 1.0), values(n * n, 42, -1.0, 1.0));
+            let a = Array::from_slice_on(&ctx, &ha, [n, n]).unwrap();
+            let bm = Array::from_slice_on(&ctx, &hb, [n, n]).unwrap();
+            let mut c = Array::<f32>::zeros_on(&ctx, n * n).unwrap();
+            let r = a.matmul(&bm);
+            check_gemm("matmul/square luma", &r.to_vec().unwrap(), &ha, &hb, n, n, n);
+            hand.run(&a, &bm, &mut c, n, n, n);
+            check_gemm("matmul/square hand", &c.to_vec().unwrap(), &ha, &hb, n, n, n);
+            b.compare(
+                "matmul/square",
+                &n.to_string(),
+                Work::Flops(2.0 * (n * n * n) as f64),
+                Some(DEFAULT_GATE),
+                &mut || {
+                    a.matmul(&bm).eval().unwrap();
+                },
+                &mut || hand.run(&a, &bm, &mut c, n, n, n),
+            );
+        });
+    }
+    for &(n, padded) in odd {
+        if !b.want("matmul/odd") {
+            continue;
+        }
+        b.guarded("matmul/odd", |b| {
+            let ctx = b.ctx.clone();
+            let (ha, hb) = (values(n * n, 43, -1.0, 1.0), values(n * n, 44, -1.0, 1.0));
+            let (pa, pb) = (values(padded * padded, 45, -1.0, 1.0), values(padded * padded, 46, -1.0, 1.0));
+            let a = Array::from_slice_on(&ctx, &ha, [n, n]).unwrap();
+            let bm = Array::from_slice_on(&ctx, &hb, [n, n]).unwrap();
+            let ap = Array::from_slice_on(&ctx, &pa, [padded, padded]).unwrap();
+            let bp = Array::from_slice_on(&ctx, &pb, [padded, padded]).unwrap();
+            let mut c = Array::<f32>::zeros_on(&ctx, padded * padded).unwrap();
+            let r = a.matmul(&bm);
+            check_gemm("matmul/odd luma", &r.to_vec().unwrap(), &ha, &hb, n, n, n);
+            hand.run(&ap, &bp, &mut c, padded, padded, padded);
+            check_gemm("matmul/odd hand", &c.to_vec().unwrap(), &pa, &pb, padded, padded, padded);
+            b.compare(
+                "matmul/odd",
+                &format!("{n} vs {padded}"),
+                Work::Flops(2.0 * (n * n * n) as f64),
+                Some(1.10),
+                &mut || {
+                    a.matmul(&bm).eval().unwrap();
+                },
+                &mut || hand.run(&ap, &bp, &mut c, padded, padded, padded),
+            );
+        });
+    }
+}
+
+/// `matmul/gram_fused`: `Zᵀ Z` of the standardised `Z = (X - c) * s`, both operands pending.
+fn cmp_gram(b: &mut Bench) {
+    b.guarded("matmul/gram_fused", |b| {
+        let ctx = b.ctx.clone();
+        let f = 64usize;
+        let k = if b.quick { 1usize << 14 } else { 1 << 20 };
+        let hx = values(f * k, 51, -1.0, 1.0);
+        let hc = values(f, 52, -0.5, 0.5);
+        let hs = values(f, 53, 0.5, 2.0);
+        let x = Array::from_slice_on(&ctx, &hx, [f, k]).unwrap();
+        let c = Array::from_slice_on(&ctx, &hc, [f, 1]).unwrap();
+        let s = Array::from_slice_on(&ctx, &hs, [f, 1]).unwrap();
+        let (cv, sv) = (Array::from_slice_on(&ctx, &hc, f).unwrap(), Array::from_slice_on(&ctx, &hs, f).unwrap());
+        let mut out = Array::<f32>::zeros_on(&ctx, f * f).unwrap();
+        let hand = hand::HandGram::new(&ctx).unwrap();
+        let z: Vec<f64> = (0..f * k).map(|i| ((hx[i] - hc[i % f]) * hs[i % f]) as f64).collect();
+        let entries = sample_entries(f, f, 78);
+        let want: Vec<f32> =
+            entries.iter().map(|&(a, bb)| (0..k).map(|r| z[r * f + a] * z[r * f + bb]).sum::<f64>() as f32).collect();
+        let pick = |got: &[f32]| entries.iter().map(|&(a, bb)| got[a * f + bb]).collect::<Vec<f32>>();
+        let gram = || {
+            let z = (&x - &c) * &s;
+            z.transpose().matmul(&z)
+        };
+        let r = gram();
+        assert_eq!(r.len(), f * f, "gram shape");
+        let tol = 1e-3 * (k as f32).sqrt();
+        check("matmul/gram_fused luma", &pick(&r.to_vec().unwrap()), &want, 1e-3, tol);
+        hand.run(&x, &cv, &sv, &mut out, f as u32, k as u32);
+        check("matmul/gram_fused hand", &pick(&out.to_vec().unwrap()), &want, 1e-3, tol);
+        b.compare(
+            "matmul/gram_fused",
+            &format!("{f}x{k}"),
+            Work::Flops(2.0 * (f * f * k) as f64),
+            Some(DEFAULT_GATE),
+            &mut || {
+                gram().eval().unwrap();
+            },
+            &mut || hand.run(&x, &cv, &sv, &mut out, f as u32, k as u32),
+        );
     });
 }
 
@@ -567,6 +719,48 @@ fn smoke_axpy(b: &mut Bench) {
     });
 }
 
+/// Radix sort: no hand-written competitor (the library kernels are the hand-written algorithm), so
+/// the gate is the achieved bandwidth: bytes per pass are 12 per key (the count pass reads, the
+/// scatter pass reads and writes) plus 8 per key with a payload (read and written), 4 passes.
+fn case_sort(b: &mut Bench) {
+    let n = if b.quick { 1 << 16 } else { 1 << 24 };
+    let size = n.to_string();
+    let passes = 4.0;
+    // The fraction of the bandwidth is only meaningful for arrays large enough to hide the launches.
+    let min = if b.quick { 0.0 } else { 0.5 };
+    let ctx = b.ctx.clone();
+    b.guarded("sort/u32", |b| {
+        let host: Vec<u32> = codes(n, 21, u32::MAX).iter().zip(codes(n, 22, 2)).map(|(c, bit)| c ^ (bit << 31)).collect();
+        let x = Array::from_slice_on(&ctx, &host, n).unwrap();
+        let mut want = host.clone();
+        want.sort();
+        check_exact("sort/u32", &x.sort().to_vec().unwrap(), &want);
+        b.roofline("sort/u32", &size, passes * 12.0 * n as f64, min, &mut || {
+            x.sort().eval().unwrap();
+        });
+    });
+    b.guarded("sort/u32_payload", |b| {
+        let host = codes(n, 23, u32::MAX);
+        let x = Array::from_slice_on(&ctx, &host, n).unwrap();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by_key(|&i| host[i as usize]);
+        check_exact("sort/u32_payload", &x.argsort().to_vec().unwrap(), &order);
+        b.roofline("sort/u32_payload", &size, passes * 20.0 * n as f64, min, &mut || {
+            x.argsort().eval().unwrap();
+        });
+    });
+    b.guarded("sort/f32", |b| {
+        let host = values(n, 24, -1e6, 1e6);
+        let x = Array::from_slice_on(&ctx, &host, n).unwrap();
+        let mut want = host.clone();
+        want.sort_by(f32::total_cmp);
+        check_exact("sort/f32", &x.sort().to_vec().unwrap(), &want);
+        b.roofline("sort/f32", &size, passes * 12.0 * n as f64, min, &mut || {
+            x.sort().eval().unwrap();
+        });
+    });
+}
+
 fn main() {
     let mut quick = false;
     let mut gate = false;
@@ -598,9 +792,12 @@ fn main() {
     sanity_gram(&mut b);
     sanity_axis(&mut b);
     bench_axis(&mut b);
-    sanity_hist(&mut b);
-    sanity_scatter(&mut b);
+    case_hist(&mut b);
+    case_scatter_add(&mut b);
     sanity_group_sum(&mut b);
+    case_sort(&mut b);
+    cmp_matmul(&mut b);
+    cmp_gram(&mut b);
     smoke_axpy(&mut b);
 
     if !b.skipped.is_empty() {
