@@ -83,6 +83,10 @@ impl ScalarType for f64 {
 /// A boolean per element: the result of comparisons and classifications, and the first operand of
 /// [`select`](crate::select). It is stored as a `u32` that is 0 (false) or 1 (true); the field is
 /// private, so masks read back from the GPU or built with [`Mask::from`] only ever hold 0 or 1.
+/// The library relies on that: `!`, [`count`](crate::Array::count), [`any`](crate::Array::any)
+/// and [`all`](crate::Array::all) give unspecified results for a mask holding another word,
+/// which only a reinterpretation of raw bits through `bytemuck` (`Mask` is `Pod`) can build.
+/// Generators (`range` and the like) do not exist for masks.
 /// Arrays of masks have `&`, `|`, `^` and `!`, [`count`](crate::Array::count),
 /// [`any`](crate::Array::any), [`all`](crate::Array::all), `min`/`max` and the casts
 /// [`to_u32`](crate::Array::to_u32) and [`to_f32`](crate::Array::to_f32); arithmetic and sums
@@ -94,7 +98,8 @@ pub struct Mask(u32);
 // SAFETY: `#[repr(transparent)]` over `u32`: no padding, and the all-zero pattern is valid.
 unsafe impl Zeroable for Mask {}
 // SAFETY: see above. Bit patterns other than 0 and 1 are never produced by the library, but
-// they are not undefined behaviour either (every operation reads the word as an integer).
+// they are not undefined behaviour either (every operation reads the word as an integer); the
+// results of the mask operations for them are unspecified (see the type's documentation).
 unsafe impl Pod for Mask {}
 
 impl Mask {

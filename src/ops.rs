@@ -107,7 +107,7 @@ pub(crate) fn fold_workgroups(ctx: &Context, count: u32) -> Result<[u32; 3]> {
 /// launch a nearly empty second row for 65536 groups with the usual limit of 65535, and the
 /// groups past the end that exit at once cost a measurable share of a bandwidth-bound kernel
 /// (about 35 us of 340 for 2^24 elements). Fewer than `y` groups at the end are idle.
-fn fold_grid(count: u32, max: u32) -> [u32; 3] {
+pub(crate) fn fold_grid(count: u32, max: u32) -> [u32; 3] {
     let groups = count.max(1);
     let y = groups.div_ceil(max.max(1));
     [groups.div_ceil(y), y, 1]

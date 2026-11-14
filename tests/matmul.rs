@@ -72,6 +72,38 @@ fn matches_the_host_product_for_every_kernel_shape() {
     }
 }
 
+/// Rows past what a grid dimension can number are folded over the grid: `[16, 1 << 22]` by `[8, 16]`
+/// has 131072 row tiles of one column tile. Sampled rows (the first, the last, and every 9973rd).
+/// The large shape is skipped on a device whose buffers cannot hold it (the small one still folds).
+#[test]
+fn a_tall_product_folds_its_tiles_over_the_grid() {
+    let m = 1 << 22;
+    let rows: Vec<usize> = (0..m).step_by(9973).chain([m - 1]).collect();
+    let mut ran = 0;
+    for (k, n) in [(16, 8), (4, 2)] {
+        let case = Case::new(k, m, n);
+        let sample = |a: &[f32], b: &[f32], what: &str, c: &Array<f32>| -> bool {
+            if matches!(c.error().map(LumaError::root), Some(LumaError::Chunked(_))) {
+                return false;
+            }
+            let got = c.to_vec().unwrap();
+            assert_eq!(got.len(), n * m, "{what}");
+            for &row in &rows {
+                let want = host(&a[row * k..(row + 1) * k], b, k, 1, n);
+                check(&got[row * n..(row + 1) * n], &want, k, a, b, &format!("{what} k {k} row {row}"));
+            }
+            true
+        };
+        let a2: Vec<f32> = case.a.iter().map(|&x| x * 2.0 + 1.0).collect();
+        let b2: Vec<f32> = case.b.iter().map(|&x| x * 0.5).collect();
+        let plain = sample(&case.a, &case.b, "buffers", &case.lhs().matmul(&case.rhs()));
+        // Fused operands go through the other source of the same kernel.
+        let fused = sample(&a2, &b2, "fused", &(&case.lhs() * 2.0 + 1.0).matmul(&(&case.rhs() * 0.5)));
+        ran += usize::from(plain && fused);
+    }
+    assert!(ran >= 1, "no shape fit the device's buffers");
+}
+
 #[test]
 fn the_free_function_is_the_method() {
     let case = Case::new(40, 33, 129);

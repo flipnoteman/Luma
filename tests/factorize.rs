@@ -119,3 +119,17 @@ fn nan_and_zero_are_one_value() {
     assert!(u[2].is_nan());
     assert_eq!(c.to_vec().unwrap(), [2, 0, 0, 1, 2, 1]);
 }
+
+#[test]
+fn the_unique_of_signed_zeros_is_the_first_in_sorted_order() {
+    // Many copies, so that a race between the writes of a run would show.
+    let data: Vec<f32> = (0..1 << 16).map(|i| if i % 3 == 0 { 0.0 } else if i % 3 == 1 { -0.0 } else { 1.0 }).collect();
+    for _ in 0..4 {
+        let x = Array::from_slice(&data, data.len()).unwrap();
+        let bits: Vec<u32> = x.unique().to_vec().unwrap().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(bits, [(-0.0f32).to_bits(), 1.0f32.to_bits()]);
+    }
+    let (u, c) = Array::from_slice(&[0.0f32, -0.0, 1.0, -0.0], 4).unwrap().factorize();
+    assert_eq!(u.to_vec().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>(), [(-0.0f32).to_bits(), 1.0f32.to_bits()]);
+    assert_eq!(c.to_vec().unwrap(), [0, 0, 1, 0]);
+}

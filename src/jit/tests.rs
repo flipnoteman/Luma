@@ -3779,6 +3779,17 @@ fn dynamic_views_ranges_gathers_and_scatters_reuse_one_pipeline() {
     }
     assert_eq!(delta(before, ctx.jit().stats()).built, 1);
 
+    // Atomic scatters into targets of different lengths (the global path: few elements per bin).
+    let before = ctx.jit().stats();
+    for n in [10_000usize, 20_000] {
+        let mut target = Array::<u32>::from_slice_on(&ctx, &vec![0; n], n).unwrap();
+        let idx = Array::<u32>::from_slice_on(&ctx, &[1, 2, 2, n as u32], 4).unwrap();
+        target.put_add(&idx, Array::<u32>::from_slice_on(&ctx, &[1, 1, 1, 1], 4).unwrap()).unwrap();
+        let got = target.to_vec().unwrap();
+        assert_eq!((got.len(), got[1], got[2], got.iter().sum::<u32>()), (n, 1, 2, 3));
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+
     // Region writes at every offset.
     let mut w = f32s(&ctx, &xs);
     let before = ctx.jit().stats();
@@ -3788,4 +3799,26 @@ fn dynamic_views_ranges_gathers_and_scatters_reuse_one_pipeline() {
         assert_eq!(&got[k..k + 2], &[1.5, 1.5]);
     }
     assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+}
+
+/// An expression with more inputs than the scattering kernel of a sort's first pass may bind
+/// beside its buffers, but that the counting kernel can: both kernels decide together.
+#[test]
+fn a_sort_of_an_expression_at_the_input_limit_fuses_into_both_first_pass_kernels_or_neither() {
+    let n = 5000;
+    let host: Vec<Vec<u32>> = (0..4).map(|k| (0..n).map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(k * 977)) >> 7).collect()).collect();
+    let sums: Vec<u32> = (0..n).map(|i| host.iter().fold(0u32, |sum, column| sum.wrapping_add(column[i]))).collect();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by_key(|&i| sums[i as usize]);
+    let mut sorted = sums.clone();
+    sorted.sort_unstable();
+    for limit in [5, 6, 7, 8] {
+        let ctx = ctx();
+        ctx.jit().set_max_inputs(limit);
+        let a: Vec<Array<u32>> = host.iter().map(|column| Array::from_slice_on(&ctx, column, n).unwrap()).collect();
+        let keys = || &a[0] + &a[1] + &a[2] + &a[3];
+        assert_eq!(keys().sort().to_vec().unwrap(), sorted, "sort, limit {limit}");
+        assert_eq!(keys().argsort().to_vec().unwrap(), order, "argsort, limit {limit}");
+        assert_eq!(keys().sort_descending().to_vec().unwrap(), sorted.iter().rev().copied().collect::<Vec<_>>(), "descending, limit {limit}");
+    }
 }

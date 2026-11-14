@@ -533,7 +533,7 @@ pub(crate) fn scatter(
     let len = u32::try_from(base.len()).map_err(|_| LumaError::DimensionTooLarge { shape: [base.len(), 1, 1, 1] })?;
     let tail = match atomic {
         None => Tail::Scatter { len },
-        Some(op) => Tail::ScatterAdd { len, op, private: base.len() <= PRIVATE_BINS && count / PRIVATE_RATIO >= base.len() },
+        Some(op) => Tail::ScatterAdd { len, op, private: base.len() <= PRIVATE_BINS && count / PRIVATE_RATIO >= base.len(), len_slot: None },
     };
     let bases = [Arc::clone(base)];
 

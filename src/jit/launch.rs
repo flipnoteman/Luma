@@ -1280,7 +1280,9 @@ pub(crate) fn axis_reduce(
 /// followed by the expression's scalars. Binds `writes`, the buffers of the expression, then
 /// `reads`. Returns `false`, having recorded nothing, if the node has been evaluated already or
 /// the expression cannot be fused (see [`fusable`]): the caller evaluates it and runs the kernel
-/// over its buffer.
+/// over its buffer. `bindings` is how many buffers the kernels of the whole pass bind in the
+/// worst case, so that both kernels fuse or neither does.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn radix_pass(
     ctx: &crate::context::Context,
     node: &Arc<Node>,
@@ -1289,6 +1291,7 @@ pub(crate) fn radix_pass(
     groups: [u32; 3],
     writes: &[RawArg<'_>],
     reads: &[RawArg<'_>],
+    bindings: usize,
 ) -> Result<bool, Failure> {
     if !node.is_pending() {
         return Ok(false);
@@ -1296,7 +1299,7 @@ pub(crate) fn radix_pass(
     let Some(args) = node.operands() else { return Ok(false) };
     let (fused, args) = flatten_bounded(node, args, Tail::Radix(pass))?;
     drop(args);
-    if !fusable(ctx, &fused, writes.len() + reads.len()) {
+    if !fusable(ctx, &fused, bindings) {
         return Ok(false);
     }
     fused.mark_fused();

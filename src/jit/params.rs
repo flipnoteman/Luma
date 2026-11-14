@@ -217,6 +217,7 @@ impl Builder {
                 Tail::ParamStoreMapped { id, spec }
             }
             Tail::Scatter { len } => Tail::ParamScatter { len_slot: self.word(len) },
+            Tail::ScatterAdd { len, op, private: false, .. } => Tail::ScatterAdd { len: 0, op, private: false, len_slot: Some(self.word(len)) },
             other => other,
         })
     }
@@ -245,7 +246,7 @@ impl Builder {
 
 /// Whether `key` has a view, gather or scatter to move into the uniform.
 fn has_numbers(key: &FusedKey) -> bool {
-    matches!(key.tail, Tail::StoreMapped(_) | Tail::Scatter { .. })
+    matches!(key.tail, Tail::StoreMapped(_) | Tail::Scatter { .. } | Tail::ScatterAdd { private: false, .. })
         || key.instrs.iter().chain(key.subs.iter().flatten()).any(|instr| matches!(instr.op.kind, OpKind::Shift(ShiftKind::View { .. } | ShiftKind::Take { .. })))
 }
 

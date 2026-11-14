@@ -27,7 +27,7 @@ use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::jit::{self, MatmulSide};
-use crate::ops::{launch_1d, Outcome};
+use crate::ops::{fold_grid, launch_1d, Outcome};
 
 /// Output tile of the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -151,7 +151,10 @@ fn plan(m: u32, n: u32, k: u32, max_groups: u32, max_bytes: u64) -> Result<Plan,
     let (slices, kc) = split_of(tiles, k)
         .filter(|&(slices, _)| u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes)
         .unwrap_or((1, k));
-    let groups = [columns, rows, slices];
+    // Row-major tile numbers (see `body`): the grid is `[columns, rows]` if that fits, else the
+    // tiles are folded over it, the groups past the last tile exiting at once.
+    let [x, y, _] = if columns <= max_groups && rows <= max_groups { [columns, rows, 1] } else { fold_grid(tiles, max_groups) };
+    let groups = [x, y, slices];
     if groups.iter().any(|&count| count > max_groups) {
         return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
     }
@@ -491,9 +494,13 @@ fn k_major(e: u32) -> u32 {{ return (e % 16u) * 32u + e / 16u; }}
 {load_b}
 
 @compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
-    let row0 = wid.y * 128u;
-    let col0 = wid.x * 128u;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // The output tiles are numbered along the folded grid (see `plan`).
+    let columns = (p.n + 127u) / 128u;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= columns * ((p.m + 127u) / 128u)) {{ return; }}
+    let row0 = (tile / columns) * 128u;
+    let col0 = (tile % columns) * 128u;
     let t = lid.y * 16u + lid.x;
 {declare}    {decl}
     for (var k0 = {k_begin}; k0 < {k_end}; k0 = k0 + 16u) {{
@@ -563,9 +570,13 @@ fn k_major(e: u32) -> u32 {{ return (e % 16u) * 32u + e / 16u; }}
 {load_b}
 
 @compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
-    let row0 = wid.y * 32u;
-    let col0 = wid.x * 32u;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // The output tiles are numbered along the folded grid (see `plan`).
+    let columns = (p.n + 31u) / 32u;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= columns * ((p.m + 31u) / 32u)) {{ return; }}
+    let row0 = (tile / columns) * 32u;
+    let col0 = (tile % columns) * 32u;
     let t = lid.y * 16u + lid.x;
 {declare}    var c00 = 0.0;
     var c01 = 0.0;
@@ -623,6 +634,10 @@ mod tests {
         assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T32, true, 256, [2, 2, 256]));
         // The partial sums must fit a buffer.
         assert_eq!(plan(64, 64, 1 << 20, 65535, 1000).unwrap().slices, 1);
-        assert!(plan(1 << 22, 64, 16, 65535, u64::MAX).is_err());
+        // Tall products fold their row tiles over the grid.
+        let p = plan(1 << 22, 8, 16, 65535, u64::MAX).unwrap();
+        assert_eq!((p.tile, p.groups), (MatmulTile::T32, [43691, 3, 1]));
+        assert!(p.groups[0] * p.groups[1] >= 1 << 17);
+        assert!(plan(1 << 22, 64, 16, 65535, u64::MAX).is_ok());
     }
 }

@@ -4,6 +4,7 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::Array;
+use crate::ops::select;
 use crate::error::Result;
 use crate::shape::Shape;
 use crate::sort::SortKey;
@@ -12,7 +13,7 @@ impl<T: SortKey> Array<T> {
     /// The sorted distinct values of the array (one dimension) and, shaped like this array, the
     /// index into them of every element: `uniques.take(&codes)` is the array again. Works on the
     /// flat array. Floats compare as in NumPy's `unique`: all NaNs are one value (the last) and
-    /// `-0.0` and `+0.0` are one value. The values are sorted with [`Array::argsort`], so the
+    /// `-0.0` and `+0.0` are one value (the unique is `-0.0`, which sorts first). The values are sorted with [`Array::argsort`], so the
     /// array is evaluated and the number of distinct values read back, which synchronizes once.
     /// Errors poison both results.
     #[track_caller]
@@ -53,7 +54,9 @@ impl<T: SortKey> Array<T> {
         let ids = flags.to_u32().cumsum(0) - 1u32;
         let count = ids.slice(0, n - 1..).item()? as usize + 1;
         let mut uniques = Array::<T>::zeros_on(ctx, count)?;
-        uniques.put(&ids, &sorted)?;
+        // Only the first element of a run writes, so that equal keys that differ in bits (`-0.0`
+        // and `+0.0`) leave the first in sorted order, not whichever write lands last.
+        uniques.put(&select(&flags, &ids, u32::MAX), &sorted)?;
         let mut codes = Array::<u32>::zeros_on(ctx, n)?;
         codes.put(&perm, &ids)?;
         Ok((uniques, codes.reshape(self.shape())))

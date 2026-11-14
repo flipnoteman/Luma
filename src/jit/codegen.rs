@@ -255,19 +255,22 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Uniform => format!("luma_uniform(luma_threefry({index}, {a}, {b}).x)"),
         Gen::Normal => format!("luma_normal(luma_threefry({index}, {a}, {b}))"),
         Gen::Index => match ty {
-            ElemTy::U32 | ElemTy::Mask => index.to_owned(),
+            ElemTy::U32 => index.to_owned(),
+            ElemTy::Mask => unreachable!("masks have no generators"),
             ElemTy::I32 => format!("bitcast<i32>({index})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
-            ElemTy::U32 | ElemTy::Mask => format!("(({index} >> {a}) & {b})"),
+            ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
+            ElemTy::Mask => unreachable!("masks have no generators"),
             ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
         },
         Gen::RangeConst { stride, size } => {
             let coord = if stride == 1 { format!("({index} % {size}u)") } else { format!("(({index} / {stride}u) % {size}u)") };
             match ty {
-                ElemTy::U32 | ElemTy::Mask => coord,
+                ElemTy::U32 => coord,
+                ElemTy::Mask => unreachable!("masks have no generators"),
                 ElemTy::I32 => format!("bitcast<i32>({coord})"),
                 ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({coord})"),
             }
@@ -586,10 +589,11 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                     let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
                     format!("    let j = t{};\n    if (j < {len}) {{ out0[j] = t{}; }}\n", value(index as usize), value(stored as usize))
                 }
-                Tail::ScatterAdd { len, op, private: false } => {
+                Tail::ScatterAdd { len, op, private: false, len_slot } => {
+                    let len = len_slot.map_or_else(|| format!("{len}u"), |slot| format!("p.s{slot}"));
                     let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
                     let apply = atomic_apply(out_ty(outputs[0]), op, "out0[j]", &format!("t{}", value(stored as usize)), "    ");
-                    format!("    let j = t{};\n    if (j < {len}u) {{\n{apply}    }}\n", value(index as usize))
+                    format!("    let j = t{};\n    if (j < {len}) {{\n{apply}    }}\n", value(index as usize))
                 }
                 Tail::ScatterAdd { private: true, .. } => String::new(),
                 Tail::Stack { total, .. } if stack_stages(key, wg, out_ty(outputs[0])) => {
@@ -612,7 +616,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                 }
                 _ => outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[i] = t{};\n", value(at))).collect(),
             };
-            if let Tail::ScatterAdd { len, op, private: true } = key.tail {
+            if let Tail::ScatterAdd { len, op, private: true, .. } = key.tail {
                 let (stored, slot) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
                 let ty = out_ty(outputs[0]);
                 let bins = (len as usize).next_multiple_of(wg as usize);

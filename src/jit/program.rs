@@ -103,8 +103,9 @@ pub(crate) enum Tail {
     /// [`Tail::Scatter`] that combines instead of overwriting: element `i` applies `op`
     /// atomically to element `index` of the one bound buffer (`Array::put_add` and its kin). With
     /// `private`, every workgroup first accumulates into workgroup memory (the target is small
-    /// next to the number of elements) and merges it into the buffer once.
-    ScatterAdd { len: u32, op: AtomicOp, private: bool },
+    /// next to the number of elements) and merges it into the buffer once. Without, `len` may
+    /// move to uniform slot `len_slot` (see `params`), so that targets of any size share a kernel.
+    ScatterAdd { len: u32, op: AtomicOp, private: bool, len_slot: Option<u32> },
     /// [`Tail::StoreMapped`] with the numbers of the view in the uniform (see `params`).
     ParamStoreMapped { id: u16, spec: ViewSpec },
     /// [`Tail::Scatter`] with `len` in uniform slot `len_slot`.

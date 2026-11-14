@@ -68,3 +68,10 @@ fn sums_of_masks_are_rejected() {
     assert_eq!(m.min().item().unwrap(), Mask::TRUE);
     assert_eq!(m.max_axis(0).to_u32().to_vec().unwrap(), [1]);
 }
+
+#[test]
+fn masks_have_no_generators() {
+    for range in [Array::<Mask>::range(4, 0), Array::<Mask>::range([4, 3], 1), Array::<Mask>::range([8, 8], 0)] {
+        assert!(matches!(range.map(|_| ()).unwrap_err().root(), LumaError::Unsupported(_)));
+    }
+}

@@ -710,21 +710,6 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
         let (transform, descending) = if first || last { (spec.transform, spec.descending) } else { (KeyTransform::Identity, false) };
         let count_pass = RadixPass { kind: RadixKind::Count { ballot }, shift, transform, descending };
 
-        let count_args = [RawArg::write(&counts, count_bytes)];
-        if let (true, Keys::Pending(node)) = (first, keys) {
-            fused = jit::radix_pass(ctx, node, count_pass, params, count_grid, &count_args, &[])?;
-            if !fused {
-                key_pin = Some(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?.pin_single()?);
-            }
-        }
-        if !(first && fused) {
-            let src_keys = if first { key_pin.as_ref().expect("the first pass has keys").buffer() } else { &mid_keys[(pass as usize - 1) % 2] };
-            let count = ctx.builtin(Builtin::Radix { pass: count_pass, first }, "u32")?;
-            ctx.launch(&count, count_grid, [n32, 1, 1], &[count_args[0], RawArg::read(src_keys, bytes), RawArg::Uniform(bytemuck::bytes_of(&params))])?;
-        }
-        lines
-            .scan(Bound { buffer: &counts, bytes: count_bytes }, count_words as u32, 1, 1, Bound { buffer: &scanned, bytes: count_bytes })?;
-
         let store_keys = dst_keys.is_some();
         let scatter_pass = RadixPass { kind: RadixKind::Scatter { last, store_keys, payload: kind, ballot }, shift, transform, descending };
         let mut writes = Vec::with_capacity(2);
@@ -739,11 +724,31 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
             reads.push(RawArg::read(src_pay.expect("a payload sort has payload buffers"), bytes));
         }
         reads.push(RawArg::read(&scanned, count_bytes));
-        if let (true, Keys::Pending(node), true) = (first, keys, fused) {
-            if !jit::radix_pass(ctx, node, scatter_pass, params, groups, &writes, &reads)? {
-                return Err(LumaError::Gpu("a sort's keys fused into the counting kernel but not into the scattering one".into()).into());
+        let count_args = [RawArg::write(&counts, count_bytes)];
+        if let (true, Keys::Pending(node)) = (first, keys) {
+            // One decision for both kernels of the pass: the scatter binds more buffers, so
+            // fusing into the count kernel alone could strand the scatter.
+            let bindings = writes.len() + reads.len();
+            fused = jit::radix_pass(ctx, node, count_pass, params, count_grid, &count_args, &[], bindings)?;
+            if !fused {
+                key_pin = Some(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?.pin_single()?);
             }
-            continue;
+        }
+        if !(first && fused) {
+            let src_keys = if first { key_pin.as_ref().expect("the first pass has keys").buffer() } else { &mid_keys[(pass as usize - 1) % 2] };
+            let count = ctx.builtin(Builtin::Radix { pass: count_pass, first }, "u32")?;
+            ctx.launch(&count, count_grid, [n32, 1, 1], &[count_args[0], RawArg::read(src_keys, bytes), RawArg::Uniform(bytemuck::bytes_of(&params))])?;
+        }
+        lines
+            .scan(Bound { buffer: &counts, bytes: count_bytes }, count_words as u32, 1, 1, Bound { buffer: &scanned, bytes: count_bytes })?;
+
+        if let (true, Keys::Pending(node), true) = (first, keys, fused) {
+            if jit::radix_pass(ctx, node, scatter_pass, params, groups, &writes, &reads, writes.len() + reads.len())? {
+                continue;
+            }
+            // Evaluated by someone else since the count kernel fused it: the counts stay valid,
+            // so the buffer kernel scatters.
+            key_pin = Some(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?.pin_single()?);
         }
         let src_keys = if first { key_pin.as_ref().expect("the first pass has keys").buffer() } else { &mid_keys[(pass as usize - 1) % 2] };
         let mut args = writes;
