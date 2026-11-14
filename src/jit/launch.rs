@@ -10,6 +10,7 @@ use crate::gpu::pager::Pin;
 use crate::builtin::{Builtin, Finish, ReduceList, ReduceOp};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
+use crate::matmul::{MatmulOperand, MatmulTile};
 use crate::ops::{fold_workgroups, launch_1d, len_u32};
 
 use super::codegen::direct;
@@ -477,7 +478,7 @@ fn plan_shifts(
 fn out_elems(key: &FusedKey) -> Vec<u64> {
     let bytes = |at: u32| key.instrs.get(at as usize).map_or(4, |instr| instr.op.out_ty().bytes());
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => key.outputs.iter().map(|&at| bytes(at)).collect(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.iter().map(|&at| bytes(at)).collect(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().checked_sub(1).map_or(4, |at| bytes(at as u32))],
     }
@@ -613,7 +614,7 @@ fn spans(
     }
 
     let outputs = match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => key.outputs.len(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.len(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } | Tail::Reduce(_) => 1,
     };
     let direct = (0..input_count)
@@ -1075,5 +1076,160 @@ pub(crate) fn check_finite(ctx: &crate::context::Context, storage: &Storage, ty:
             return Err(LumaError::NonFinite);
         }
     }
+    Ok(())
+}
+
+/// One operand of the product [`matmul`] computes.
+pub(crate) enum MatmulSide {
+    /// An evaluated array: a pin on its buffer and the bytes of it the array holds.
+    Ready(Pin, u64),
+    /// A lazy expression, fused into the loads of the kernel unless it cannot be (see
+    /// [`fusable`]).
+    Pending(Arc<Node>),
+}
+
+/// What the source of the kernel of a product depends on (see `matmul::body`).
+#[derive(Clone, Copy)]
+pub(crate) struct MatmulKernel {
+    pub(crate) tile: MatmulTile,
+    pub(crate) aligned: bool,
+    pub(crate) split: bool,
+}
+
+/// Whether the product kernel can run `fused`, the program of the operands that are expressions,
+/// with `unfused` more operands bound as buffers: sub-programs of circular shifts are evaluated
+/// before a kernel that reads every element many times calls them (those read through views
+/// are computed at the index they are read at, see `inline`), arrays split over several
+/// buffers cannot be bound, and the buffers and scalars have to fit what a kernel binds.
+fn fusable(ctx: &crate::context::Context, fused: &Fused, unfused: usize) -> bool {
+    let max_words = usize::try_from(ctx.max_uniform_bytes() / 4).unwrap_or(usize::MAX).saturating_sub(64 + 4);
+    (fused.key.subs.is_empty() || fused.key.inlines())
+        && fused.inputs.iter().all(|input| input.segments() == 1)
+        && fused.inputs.len() + unfused <= ctx.jit().max_inputs()
+        && fused.scalars.len() <= max_words
+}
+
+/// Whether the matrix `node` (of `dims`) is a view that reads its source transposed: the
+/// elements that are neighbours along axis 1 of the matrix are neighbours in memory, those along
+/// axis 0 are not. The kernel then divides the slices of that operand differently (see
+/// [`MatmulOperand::Transposed`]).
+fn stored_transposed(node: &Node, dims: [u32; 2]) -> bool {
+    let OpKind::Shift(ShiftKind::View { map, .. }) = node.op().kind else { return false };
+    if map.out != [dims[0], dims[1], 1, 1] {
+        return false;
+    }
+    // The distance in the source buffer of the elements that are neighbours along the axes.
+    let mut distance = [0i64; 2];
+    let mut below = 1i64;
+    for (axis, &size) in map.axes.iter().zip(&map.src) {
+        if let Some(d) = distance.get_mut(usize::from(axis.from)).filter(|_| size > 1) {
+            *d += i64::from(axis.step) * below;
+        }
+        below *= i64::from(size);
+    }
+    distance[1].abs() == 1 && distance[0].abs() != 1
+}
+
+/// Flattens the operands in `slots` (the lazy ones, by side) into one product program, or `None`
+/// if there are none or they cannot be fused: those that cannot be fused alone (all, if only
+/// together they are too much) are then evaluated into `ready` and the rest is tried again.
+fn flatten_operands(
+    ctx: &crate::context::Context,
+    kernel: MatmulKernel,
+    transposed: [bool; 2],
+    slots: &mut [Option<Arc<Node>>; 2],
+    ready: &mut [Option<(Pin, u64)>; 2],
+) -> Result<Option<Fused>, Failure> {
+    let attempt = |slots: &[Option<Arc<Node>>; 2], sides: &[usize]| -> Result<Option<Fused>, Failure> {
+        let mut roots = Vec::with_capacity(2);
+        for &s in sides {
+            let Some(node) = &slots[s] else { return Ok(None) };
+            // A node another thread evaluates meanwhile has no operands: it is read as a buffer.
+            let Some(args) = node.operands() else { return Ok(None) };
+            roots.push((Arc::clone(node), args));
+        }
+        let operand = |s: usize| match (sides.contains(&s), transposed[s]) {
+            (false, _) => MatmulOperand::Buffer,
+            (true, false) => MatmulOperand::Fused,
+            (true, true) => MatmulOperand::Transposed,
+        };
+        let tail = Tail::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split, lhs: operand(0), rhs: operand(1) };
+        let fused = flatten(&roots, tail)?;
+        drop(roots);
+        Ok(fusable(ctx, &fused, 2 - sides.len()).then_some(fused))
+    };
+    loop {
+        let live: Vec<usize> = (0..2).filter(|&s| slots[s].is_some()).collect();
+        if live.is_empty() {
+            return Ok(None);
+        }
+        if let Some(fused) = attempt(slots, &live)? {
+            return Ok(Some(fused));
+        }
+        let mut evaluate = Vec::with_capacity(2);
+        for &s in &live {
+            if attempt(slots, &[s])?.is_none() {
+                evaluate.push(s);
+            }
+        }
+        if evaluate.is_empty() {
+            evaluate = live;
+        }
+        for s in evaluate {
+            if let Some(node) = slots[s].take() {
+                let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
+                ready[s] = Some((storage.pin_single()?, storage.byte_len()));
+            }
+        }
+    }
+}
+
+/// Records the product of `sides` (`[lhs, rhs]`) into the buffer `out`: one launch of the GEMM
+/// kernel of `kernel` over `groups` workgroups. `words` are `m, n, k, kc` (see `matmul::body`).
+/// Operands that are lazy expressions are fused into the kernel when they can be (see
+/// [`fusable`]); otherwise they are evaluated and the kernel reads their buffers.
+pub(crate) fn matmul(
+    ctx: &crate::context::Context,
+    sides: [MatmulSide; 2],
+    kernel: MatmulKernel,
+    words: [u32; 4],
+    groups: [u32; 3],
+    out: RawArg<'_>,
+) -> Result<(), Failure> {
+    let mut slots: [Option<Arc<Node>>; 2] = [None, None];
+    let mut ready: [Option<(Pin, u64)>; 2] = [None, None];
+    for (s, side) in sides.into_iter().enumerate() {
+        match side {
+            MatmulSide::Ready(pin, bytes) => ready[s] = Some((pin, bytes)),
+            MatmulSide::Pending(node) => slots[s] = Some(node),
+        }
+    }
+    let size = [words[1], words[0], 1];
+    // `lhs` is `[K, M]`, `rhs` `[N, K]`.
+    let dims = [[words[2], words[0]], [words[1], words[2]]];
+    let transposed = [0, 1].map(|s| slots[s].as_ref().is_some_and(|node| stored_transposed(node, dims[s])));
+    let fused = flatten_operands(ctx, kernel, transposed, &mut slots, &mut ready)?;
+    let Some(fused) = fused else {
+        let core = ctx.builtin(Builtin::Matmul { tile: kernel.tile, aligned: kernel.aligned, split: kernel.split }, "f32")?;
+        let (Some((a, a_bytes)), Some((b, b_bytes))) = (&ready[0], &ready[1]) else {
+            return Err(Failure::New(LumaError::Gpu("matrix product operand neither evaluated nor fused".into())));
+        };
+        ctx.launch(&core, groups, size, &[out, RawArg::read(a.buffer(), *a_bytes), RawArg::read(b.buffer(), *b_bytes), RawArg::Uniform(bytemuck::cast_slice(&words))])?;
+        return Ok(());
+    };
+    fused.mark_fused();
+    let Fused { mut key, inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
+    drop((fused_nodes, instr_nodes, sub_roots));
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+    let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
+    let mut uniform = Vec::with_capacity(words.len() + scalars.len());
+    uniform.extend_from_slice(&words);
+    uniform.extend_from_slice(&scalars);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
+    raw.push(out);
+    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(ready.iter().flatten().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
+    ctx.launch(&core, groups, size, &raw)?;
     Ok(())
 }

@@ -33,7 +33,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 | `sum()`, `min()`, `max()` | any element type; `u32` sums wrap around |
 | `mean()`, `norm()` | `f32`; the norm is the Euclidean (L2) norm |
 | `reduce([Reduction; N])` | `N` of `Sum`, `Min`, `Max`, `SumOfSquares` (one to four) in one pass, as an `N`-element array |
-| `sum_where(&mask)` | the sum of the elements where a `u32` mask is non-zero, in one pass |
+| `sum_where(&mask)` | the sum of the elements where a `Mask` is true, in one pass |
 | `item()` | the value of a one-element array |
 | `to_array::<N>()` | the values of an `N`-element array |
 
@@ -110,8 +110,8 @@ are the ones a host loop would give.
 
 ### Masks
 
-`sum_where(&mask)` sums where a `u32` mask is non-zero (comparisons return such masks), the
-count of a condition is the sum of the mask itself:
+`sum_where(&mask)` sums where a `Mask` is true (comparisons return masks); `count()` of a mask is
+the number of true elements, as a `u32` array:
 
 ```rust
 use luma::*;
@@ -119,7 +119,7 @@ use luma::*;
 let x = Array::from_slice(&[1.0f32, -2.0, 3.0, -4.0], 4)?;
 let positive = x.gt(0.0);
 assert_eq!(x.sum_where(&positive).item()?, 4.0);
-assert_eq!(positive.sum().item()?, 2);
+assert_eq!(positive.count().item()?, 2);
 # Ok::<(), luma::LumaError>(())
 ```
 

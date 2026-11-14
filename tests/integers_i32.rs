@@ -98,10 +98,10 @@ fn comparisons_order_negatives_below_positives() {
     let (xs, ys) = (words(1000, 7), words(1000, 8));
     let (a, b) = (i32s(&xs), i32s(&ys));
     let want = |f: fn(i32, i32) -> bool| -> Vec<u32> { xs.iter().zip(&ys).map(|(&x, &y)| u32::from(f(x, y))).collect() };
-    assert_eq!(a.lt(&b).to_vec().unwrap(), want(|x, y| x < y));
-    assert_eq!(a.ge(&b).to_vec().unwrap(), want(|x, y| x >= y));
-    assert_eq!(a.eq(&b).to_vec().unwrap(), want(|x, y| x == y));
-    assert_eq!(a.lt(0).to_vec().unwrap(), xs.iter().map(|&x| u32::from(x < 0)).collect::<Vec<_>>());
+    assert_eq!(a.lt(&b).to_u32().to_vec().unwrap(), want(|x, y| x < y));
+    assert_eq!(a.ge(&b).to_u32().to_vec().unwrap(), want(|x, y| x >= y));
+    assert_eq!(a.eq(&b).to_u32().to_vec().unwrap(), want(|x, y| x == y));
+    assert_eq!(a.lt(0).to_u32().to_vec().unwrap(), xs.iter().map(|&x| u32::from(x < 0)).collect::<Vec<_>>());
     let picked = select(&a.lt(0), &a, 0);
     assert_eq!(picked.to_vec().unwrap(), xs.iter().map(|&x| if x < 0 { x } else { 0 }).collect::<Vec<_>>());
 }

@@ -9,6 +9,7 @@ use crate::array::{Failure, Storage};
 use crate::builtin::{BinOp, ReduceList, UnOp};
 use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
+use crate::matmul::{MatmulOperand, MatmulTile};
 use crate::profile::SplitReason;
 
 use super::codegen::Tile;
@@ -106,6 +107,19 @@ pub(crate) enum Tail {
     ParamStoreMapped { id: u16, spec: ViewSpec },
     /// [`Tail::Scatter`] with `len` in uniform slot `len_slot`.
     ParamScatter { len_slot: u32 },
+    /// The matrix product of the roots, which are the operands that are expressions: output 0
+    /// the left one if `lhs` is fused, then the right one if `rhs` is; an operand that is not one
+    /// is the buffer `a` / `b`. The program becomes `luma_lhs(i)` / `luma_rhs(i)`, the loads of
+    /// the GEMM kernel of `matmul::body` (see `launch::matmul`).
+    Matmul { tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand },
+}
+
+impl Tail {
+    /// Whether the roots of a program with this tail are read by it and never stored, so that
+    /// they count as computed inside it (their nodes are fused, not evaluated).
+    pub(super) fn consumes_roots(self) -> bool {
+        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. })
+    }
 }
 
 /// Everything the source of a fused kernel depends on, and nothing it does not (buffers and
@@ -255,6 +269,7 @@ impl FusedKey {
             Tail::Scatter { .. } | Tail::ParamScatter { .. } => format!("FusedPut({names}) {ty}"),
             Tail::ScatterAdd { op, .. } => format!("FusedPut{op:?}({names}) {ty}"),
             Tail::Stack { .. } => format!("FusedStack({names}) {ty}"),
+            Tail::Matmul { .. } => format!("FusedMatmul({names}) {ty}"),
             Tail::Reduce(ops) => {
                 let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
                 format!("FusedReduce({}: {names}) {ty}", ops.join("+"))
@@ -1141,7 +1156,7 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
         let outputs = vec![u32::try_from(flat.instrs.len() - 1).unwrap_or(u32::MAX)];
         flat.instr_nodes = members.iter().map(|member| Some(Arc::clone(member))).chain(Some(Some(Arc::clone(root)))).collect();
         flat.fused_nodes = members;
-        if matches!(tail, Tail::Reduce(_)) {
+        if tail.consumes_roots() {
             flat.fused_nodes.push(Arc::clone(root));
         }
         return Ok(Some(flat.finish(tail, outputs)));
@@ -1509,7 +1524,7 @@ fn emit_program(
     }
     let mut fused_items = std::mem::take(&mut flattener.fused_items);
     for &at in members {
-        if !root_at.contains(&at) || matches!(tail, Tail::Reduce(_)) {
+        if !root_at.contains(&at) || tail.consumes_roots() {
             fused_items.push(at);
         }
     }

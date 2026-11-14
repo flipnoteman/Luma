@@ -182,7 +182,7 @@ fn comparisons_produce_masks() {
     let a = f32s(&xs);
     let b = f32s(&[5.0, 2.0, 1.0, 4.0, 0.0, 3.0]);
 
-    let mask = |m: Array<u32>| m.to_vec().unwrap();
+    let mask = |m: Array<Mask>| m.to_u32().to_vec().unwrap();
     assert_eq!(mask(a.lt(&b)), vec![1, 0, 0, 0, 0, 0]);
     assert_eq!(mask(a.le(&b)), vec![1, 1, 0, 1, 0, 1]);
     assert_eq!(mask(a.gt(&b)), vec![0, 0, 1, 0, 1, 0]);
@@ -480,7 +480,7 @@ fn comparisons_and_select_broadcast() {
     let thr = Array::from_slice(&[1.5f32, 2.5], [1, 2]).unwrap();
     let mask = col.gt(&thr);
     assert_eq!(mask.shape().dims(), [3, 2, 1, 1]);
-    assert_eq!(mask.to_vec().unwrap(), [0, 1, 1, 0, 0, 1]);
+    assert_eq!(mask.to_u32().to_vec().unwrap(), [0, 1, 1, 0, 0, 1]);
 
     // An `[n, 1]` branch under an `[n, m]` mask is read at every column.
     let picked = select(&mask, &col, 0.0);

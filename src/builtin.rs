@@ -161,6 +161,11 @@ impl UnOp {
                 UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => Some(self.expr()),
                 _ => None,
             },
+            ElemTy::Mask => match self {
+                UnOp::Id => Some("x"),
+                UnOp::BitNot => Some("(x ^ 1u)"),
+                _ => None,
+            },
             ElemTy::I32 => match self {
                 UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
                 _ => None,
@@ -243,6 +248,10 @@ impl BinOp {
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
             ElemTy::U32 => Some(self.expr()),
+            ElemTy::Mask => match self {
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Min | BinOp::Max => Some(self.expr()),
+                _ => None,
+            },
             ElemTy::I32 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Min | BinOp::Max | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Some(self.expr()),
                 BinOp::Shl => Some("x << (bitcast<u32>(y) & 31u)"),
@@ -278,7 +287,7 @@ pub(crate) enum CmpOp {
 }
 
 impl CmpOp {
-    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1.
+    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1 (a mask).
     pub(crate) fn expr(self) -> &'static str {
         match self {
             CmpOp::Lt => "select(0u, 1u, x < y)",
@@ -329,7 +338,7 @@ impl Class {
         }
     }
 
-    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1: the bits of `x`
+    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1 (a mask): the bits of `x`
     /// below the sign are compared with those of infinity. They come through `luma_bits` of the
     /// double-float library, which ORs them with the guard uniform (always 0): a compiler that
     /// assumes no `NaN` or infinity arises in the arithmetic of the kernel (a device's fast
@@ -557,6 +566,14 @@ pub(crate) enum Builtin {
         transform: crate::sort::KeyTransform,
         descending: bool,
     },
+    /// Tiled matrix product of the operands (buffers) `a` and `b`; see [`crate::matmul`].
+    /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
+    /// dimension and writes every slice's partial product after the previous one.
+    Matmul { tile: crate::matmul::MatmulTile, aligned: bool, split: bool },
+    /// `out[i] = Σ_z part[z * size + i]` for `p.s` slices `z`: the sum of the partial products of
+    /// a split [`Builtin::Matmul`]. Arguments: out, part, uniform `{s}`; `luma.size.x` is the
+    /// elements of `out`.
+    MatmulSum,
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -1327,6 +1344,8 @@ impl Builtin {
             Builtin::RadixScatter { shift, first, last, store_keys, payload, transform, descending } => {
                 crate::sort::scatter_source(shift, first, last, store_keys, payload, transform, descending).into()
             }
+            Builtin::Matmul { tile, aligned, split } => crate::matmul::builtin_source(tile, aligned, split).into(),
+            Builtin::MatmulSum => crate::matmul::sum_source(wg).into(),
             Builtin::NonFinite => format!(
                 "@group(1) @binding(0) var<storage, read_write> out: array<u32>;
 @group(1) @binding(1) var<storage, read> a: array<u32>;

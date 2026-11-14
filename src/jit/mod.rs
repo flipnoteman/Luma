@@ -185,7 +185,7 @@ use looped::LoopPlan;
 use program::Instr;
 pub(crate) use program::AtomicOp;
 
-pub(crate) use launch::{check_finite, evaluate, evaluate_group, evaluate_into, force_group, reduce_first_pass, run_loop};
+pub(crate) use launch::{check_finite, evaluate, evaluate_group, evaluate_into, force_group, matmul, reduce_first_pass, run_loop, MatmulKernel, MatmulSide};
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};
@@ -261,6 +261,8 @@ pub(crate) enum ElemTy {
     F32,
     U32,
     I32,
+    /// A boolean stored as a `u32` holding 0 or 1 ([`crate::Mask`]).
+    Mask,
     /// 64-bit float (needs `wgpu::Features::SHADER_F64`).
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
@@ -279,6 +281,8 @@ impl ElemTy {
             Some(ElemTy::U32)
         } else if id == TypeId::of::<i32>() {
             Some(ElemTy::I32)
+        } else if id == TypeId::of::<crate::gpu_type::Mask>() {
+            Some(ElemTy::Mask)
         } else if id == TypeId::of::<f64>() {
             Some(ElemTy::F64)
         } else if id == TypeId::of::<crate::gpu_type::Df32>() {
@@ -295,7 +299,7 @@ impl ElemTy {
     pub(crate) fn wgsl(self) -> &'static str {
         match self {
             ElemTy::F32 => "f32",
-            ElemTy::U32 => "u32",
+            ElemTy::U32 | ElemTy::Mask => "u32",
             ElemTy::I32 => "i32",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "vec2<f32>",
@@ -305,7 +309,7 @@ impl ElemTy {
     /// Bytes per element.
     pub(crate) fn bytes(self) -> u64 {
         match self {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => 4,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => 4,
             ElemTy::F64 | ElemTy::Df32 => 8,
         }
     }
@@ -313,7 +317,7 @@ impl ElemTy {
     /// How many `f32` uniform slots a scalar of this type takes (see `Flattener::operand`).
     pub(crate) fn slots(self) -> usize {
         match self {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => 1,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => 1,
             ElemTy::Df32 => 2,
             ElemTy::F64 => 3,
         }
@@ -325,6 +329,7 @@ impl ElemTy {
             ElemTy::F32 => "f32",
             ElemTy::U32 => "u32",
             ElemTy::I32 => "i32",
+            ElemTy::Mask => "mask",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "Df32",
         }
@@ -336,9 +341,9 @@ impl ElemTy {
 pub(crate) enum OpKind {
     Unary(UnOp),
     Binary(BinOp),
-    /// Comparison; the result is a `u32` mask.
+    /// Comparison; the result is a [`ElemTy::Mask`].
     Compare(CmpOp),
-    /// Whether the floating-point operand is finite, infinite or `NaN`; the result is a `u32` mask.
+    /// Whether the floating-point operand is finite, infinite or `NaN`; the result is a [`ElemTy::Mask`].
     Classify(Class),
     /// `pow(x, exponent)`; operands: x, exponent (a scalar).
     Powf,
@@ -578,7 +583,7 @@ impl Op {
 
     pub(crate) fn out_ty(self) -> ElemTy {
         match self.kind {
-            OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::U32,
+            OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::Mask,
             OpKind::Cast(to) => to,
             _ => self.ty,
         }
@@ -588,7 +593,8 @@ impl Op {
     pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
         match (self.kind, index) {
             (OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. }), 1) => self.ty,
-            (OpKind::Select, 0) | (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
+            (OpKind::Select, 0) => ElemTy::Mask,
+            (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
             (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal | Gen::RangePow2), _) => ElemTy::U32,
             _ => self.ty,
         }
@@ -634,7 +640,7 @@ impl Scalar {
     /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32`.
     pub(crate) fn words(self) -> [u32; 3] {
         match self.ty {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => [self.bits as u32, 0, 0],
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => [self.bits as u32, 0, 0],
             ElemTy::Df32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
             ElemTy::F64 => {
                 let v = f64::from_bits(self.bits);
@@ -1549,7 +1555,7 @@ fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(),
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
         OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
-        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32),
+        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Mask),
         OpKind::Powf | OpKind::Generate(_) => !wide,
     };
     if !exists {
