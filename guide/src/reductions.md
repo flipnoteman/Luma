@@ -176,6 +176,29 @@ give unspecified results, because the kernels regroup operands. Scans and axis r
 fuse into the expression behind them: the arrays are evaluated first. They are available for
 `f32` and `u32` arrays only (`f64` and `Df32` fail with `Unsupported`).
 
+## Sorting
+
+`sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis(axis)` order `u32`,
+`i32` and `f32` arrays with a stable radix sort on the GPU. `argsort` returns the flat indices
+that sort the array, so equal elements keep their input order. The results are recorded like any
+other operation; the input is evaluated first.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[3.0f32, -1.0, f32::NAN, 2.0, -1.0, 0.5], [3, 2])?;
+assert_eq!(x.argsort().to_vec()?, vec![1, 4, 5, 3, 0, 2]);
+// Sorts every line along axis 0 (the first dimension varies fastest).
+let lines = x.sort_axis(0).to_vec()?;
+assert_eq!(&lines[..2], &[-1.0, 3.0]);
+assert!(lines[2].is_nan());
+assert_eq!(&lines[3..], &[-1.0, 0.5, 2.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+Floats sort in the total order of their bits: `-inf < .. < -0.0 < +0.0 < .. < +inf < NaN`, so NaNs
+come last (first when descending) and `-0.0` sorts before `+0.0`.
+
 ## Precision
 
 Float reductions run in the element type of the array. For more accuracy, reduce in a wider

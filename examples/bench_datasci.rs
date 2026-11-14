@@ -513,6 +513,48 @@ fn smoke_axpy(b: &mut Bench) {
     });
 }
 
+/// Radix sort: no hand-written competitor (the library kernels are the hand-written algorithm), so
+/// the gate is the achieved bandwidth: bytes per pass are 12 per key (the count pass reads, the
+/// scatter pass reads and writes) plus 8 per key with a payload (read and written), 4 passes.
+fn case_sort(b: &mut Bench) {
+    let n = if b.quick { 1 << 16 } else { 1 << 24 };
+    let size = n.to_string();
+    let passes = 4.0;
+    // The fraction of the bandwidth is only meaningful for arrays large enough to hide the launches.
+    let min = if b.quick { 0.0 } else { 0.5 };
+    let ctx = b.ctx.clone();
+    b.guarded("sort/u32", |b| {
+        let host: Vec<u32> = codes(n, 21, u32::MAX).iter().zip(codes(n, 22, 2)).map(|(c, bit)| c ^ (bit << 31)).collect();
+        let x = Array::from_slice_on(&ctx, &host, n).unwrap();
+        let mut want = host.clone();
+        want.sort();
+        check_exact("sort/u32", &x.sort().to_vec().unwrap(), &want);
+        b.roofline("sort/u32", &size, passes * 12.0 * n as f64, min, &mut || {
+            x.sort().eval().unwrap();
+        });
+    });
+    b.guarded("sort/u32_payload", |b| {
+        let host = codes(n, 23, u32::MAX);
+        let x = Array::from_slice_on(&ctx, &host, n).unwrap();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by_key(|&i| host[i as usize]);
+        check_exact("sort/u32_payload", &x.argsort().to_vec().unwrap(), &order);
+        b.roofline("sort/u32_payload", &size, passes * 20.0 * n as f64, min, &mut || {
+            x.argsort().eval().unwrap();
+        });
+    });
+    b.guarded("sort/f32", |b| {
+        let host = values(n, 24, -1e6, 1e6);
+        let x = Array::from_slice_on(&ctx, &host, n).unwrap();
+        let mut want = host.clone();
+        want.sort_by(f32::total_cmp);
+        check_exact("sort/f32", &x.sort().to_vec().unwrap(), &want);
+        b.roofline("sort/f32", &size, passes * 12.0 * n as f64, min, &mut || {
+            x.sort().eval().unwrap();
+        });
+    });
+}
+
 fn main() {
     let mut quick = false;
     let mut gate = false;
@@ -546,6 +588,7 @@ fn main() {
     case_hist(&mut b);
     case_scatter_add(&mut b);
     sanity_group_sum(&mut b);
+    case_sort(&mut b);
     smoke_axpy(&mut b);
 
     if !b.skipped.is_empty() {

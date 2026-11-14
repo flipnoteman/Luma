@@ -13,6 +13,9 @@ All notable changes to Luma are listed here. The format follows
   writes, reductions and scans, records, loops, precision, integer and bit operations, custom
   kernels, a performance guide and worked examples (heat equation, Euler solver, ML-KEM, Keccak,
   CPA). Its code blocks are tested as doctests.
+- `sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis` for `u32`, `i32` and
+  `f32` arrays (`SortKey`): a stable radix sort on the GPU, about 2 ms for 2^24 keys on an RTX 3090.
+  Floats sort in total order, NaNs last.
 
 ### Removed
 

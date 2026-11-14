@@ -540,6 +540,23 @@ pub(crate) enum Builtin {
     /// `out[i] = 1` where word `i` of `a` is a NaN or an infinity (as `f32` bits), else 0;
     /// arguments: out, a. Element type `"u32"`. See `jit::check_finite`.
     NonFinite,
+    /// The counting kernel of a radix sort pass on bits `shift..shift + 8`: digit histogram of every
+    /// tile of keys into `counts[digit * tiles + tile]`; see [`crate::sort`]. Element type
+    /// `"u32"`. `first` passes read the user's keys through `transform` (and `descending`).
+    RadixCount { shift: u8, first: bool, transform: crate::sort::KeyTransform, descending: bool },
+    /// The scatter kernel of a radix sort pass: ranks the keys of a tile stably by the digit and
+    /// writes keys and payload to their global positions; see [`crate::sort`]. Element type
+    /// `"u32"`. `last` passes store keys through the inverse of `transform`; `store_keys == false`
+    /// stores the payload only.
+    RadixScatter {
+        shift: u8,
+        first: bool,
+        last: bool,
+        store_keys: bool,
+        payload: crate::sort::PayloadKind,
+        transform: crate::sort::KeyTransform,
+        descending: bool,
+    },
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -1305,6 +1322,10 @@ impl Builtin {
             Builtin::Tridiagonal { block, starts, workgroup } => tridiagonal(block as u32, starts, u32::from(workgroup)).into(),
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
                 crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows).into()
+            }
+            Builtin::RadixCount { shift, first, transform, descending } => crate::sort::count_source(shift, first, transform, descending).into(),
+            Builtin::RadixScatter { shift, first, last, store_keys, payload, transform, descending } => {
+                crate::sort::scatter_source(shift, first, last, store_keys, payload, transform, descending).into()
             }
             Builtin::NonFinite => format!(
                 "@group(1) @binding(0) var<storage, read_write> out: array<u32>;

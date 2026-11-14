@@ -103,6 +103,7 @@ mod scan;
 mod scatter;
 mod scalar;
 mod shape;
+mod sort;
 mod tuning;
 mod until;
 mod view;
@@ -124,6 +125,7 @@ pub use scalar::Scalar;
 pub use scatter::{bincount, AtomicElem};
 pub use profile::{FusionSplit, KernelTiming, Profile, SplitReason};
 pub use shape::{Offsets, Shape};
+pub use sort::SortKey;
 pub use tuning::TuningProfile;
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 

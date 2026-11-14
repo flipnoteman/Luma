@@ -341,7 +341,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
 }
 
 /// The kernels of one operator and what they run on.
-struct Lines<'a> {
+pub(crate) struct Lines<'a> {
     ctx: &'a Context,
     op: &'a Operator,
     scratch: Scratch<'a>,
@@ -351,9 +351,9 @@ struct Lines<'a> {
 
 /// A buffer and the bytes bound of it.
 #[derive(Clone, Copy)]
-struct Bound<'b> {
-    buffer: &'b Buffer,
-    bytes: u64,
+pub(crate) struct Bound<'b> {
+    pub(crate) buffer: &'b Buffer,
+    pub(crate) bytes: u64,
 }
 
 /// The cells one invocation walks in a blocked pass over strided lines, or `None` when the lines
@@ -378,7 +378,17 @@ fn rows_per_group(n: u32) -> u32 {
     (ROWS_TILE / (n | 1)).min(rows_width(n))
 }
 
+/// The operator `+` on `u32`, for [`Lines::words`].
+pub(crate) fn add_operator(ctx: &Context) -> Outcome<Operator> {
+    Array::<u32>::alloc(ctx, Shape::from(1usize))?.trace_operator(&add)
+}
+
 impl<'a> Lines<'a> {
+    /// The scan kernels of `op`, which must be [`add_operator`] or another operator on `u32`.
+    pub(crate) fn words(ctx: &'a Context, op: &'a Operator) -> Self {
+        Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), ty: "u32" }
+    }
+
     fn core(&mut self, pass: Pass) -> Result<Arc<KernelCore>> {
         if let Some((_, core)) = self.cores.iter().find(|(p, _)| *p == pass) {
             return Ok(Arc::clone(core));
@@ -427,7 +437,7 @@ impl<'a> Lines<'a> {
     }
 
     /// The inclusive scan of every line of `input` into `out`.
-    fn scan(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
+    pub(crate) fn scan(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
         let seq = [n, stride, lines, 1, n];
         if stride == 1 {
             if n <= SHORT_LINE {
