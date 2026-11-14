@@ -161,6 +161,10 @@ impl UnOp {
                 UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => Some(self.expr()),
                 _ => None,
             },
+            ElemTy::I32 => match self {
+                UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
+                _ => None,
+            },
             ElemTy::F32 if self.is_bitwise() => None,
             ElemTy::F32 => Some(self.expr()),
             ElemTy::F64 => match self {
@@ -239,6 +243,12 @@ impl BinOp {
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
             ElemTy::U32 => Some(self.expr()),
+            ElemTy::I32 => match self {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Min | BinOp::Max | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Some(self.expr()),
+                BinOp::Shl => Some("x << (bitcast<u32>(y) & 31u)"),
+                BinOp::Shr => Some("x >> (bitcast<u32>(y) & 31u)"),
+                _ => None,
+            },
             ElemTy::F32 => (!self.is_bitwise()).then(|| self.expr()),
             ElemTy::F64 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max => Some(self.expr()),
@@ -598,7 +608,7 @@ impl<'a> ReduceElem<'a> {
 
     /// Whether the workgroup built-ins (`subgroupAdd`, ...) work on the type.
     fn subgroups(self) -> bool {
-        matches!(self, ReduceElem::Plain("f32" | "u32" | "vec2<f32>" | "vec4<f32>"))
+        matches!(self, ReduceElem::Plain("f32" | "u32" | "i32" | "vec2<f32>" | "vec4<f32>"))
     }
 
     fn library(self) -> String {
@@ -1336,5 +1346,12 @@ mod tests {
         assert_eq!(UnOp::by_constant(BinOp::Shr, 33), Some(UnOp::Shr(1)));
         // There is no negation of an unsigned integer.
         assert!(UnOp::Neg.expr_for(ElemTy::U32).is_none());
+        // `i32` has the integer operations only: no float math, no rotations.
+        for op in [UnOp::Sqrt, UnOp::Exp, UnOp::Floor, UnOp::Rotl(3)] {
+            assert!(op.expr_for(ElemTy::I32).is_none(), "{op:?}");
+        }
+        assert!(BinOp::Rotl.expr_for(ElemTy::I32).is_none());
+        assert!(BinOp::Atan2.expr_for(ElemTy::I32).is_none());
+        assert!(UnOp::Neg.expr_for(ElemTy::I32).is_some());
     }
 }

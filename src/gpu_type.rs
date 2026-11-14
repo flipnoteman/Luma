@@ -3,6 +3,7 @@ pub(crate) mod sealed {
 }
 
 impl sealed::Sealed for u32 {}
+impl sealed::Sealed for i32 {}
 impl sealed::Sealed for f32 {}
 impl sealed::Sealed for f64 {}
 impl sealed::Sealed for Df32 {}
@@ -39,6 +40,7 @@ pub trait ScalarType: GpuType {
 }
 
 impl GpuType for u32 {}
+impl GpuType for i32 {}
 impl GpuType for f32 {}
 impl GpuType for f64 {}
 impl GpuType for [f32; 2] {}
@@ -49,6 +51,12 @@ impl GpuType for [u32; 4] {}
 impl ScalarType for u32 {
     fn wgsl_type() -> &'static str {
         "u32"
+    }
+}
+
+impl ScalarType for i32 {
+    fn wgsl_type() -> &'static str {
+        "i32"
     }
 }
 

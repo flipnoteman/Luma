@@ -31,6 +31,7 @@ fn const_bits(ty: ElemTy, value: f64) -> u64 {
         ElemTy::F32 | ElemTy::Df32 => u64::from((value as f32).to_bits()),
         ElemTy::F64 => value.to_bits(),
         ElemTy::U32 => u64::from(value as u32),
+        ElemTy::I32 => u64::from(value as i32 as u32),
     }
 }
 
@@ -107,7 +108,7 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
         OpKind::Binary(bin) => {
             let (sa, sb) = (scalar(a), scalar(b));
             let float = is_float(ty);
-            let u32s = ty == ElemTy::U32;
+            let u32s = matches!(ty, ElemTy::U32 | ElemTy::I32);
             match bin {
                 BinOp::Mul => {
                     if is_value(sb, ty, 1.0) {

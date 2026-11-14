@@ -41,11 +41,31 @@ macro_rules! casts {
 }
 
 casts! { f32 =>
+    /// The elements as `u32`: truncates toward zero and saturates to the nearest `f32` inside the
+    /// range (`4294967040` at the top, `0` at the bottom); NaN becomes 0.
+    to_u32 -> u32;
+    /// The elements as `i32`: truncates toward zero and saturates to the nearest `f32` inside
+    /// the range (`-2147483648..=2147483520`); NaN becomes 0.
+    to_i32 -> i32;
     /// The elements as `f64`. Needs a device with 64-bit shader floats; otherwise the result is
     /// poisoned with [`LumaError::Unsupported`](crate::LumaError).
     to_f64 -> f64;
     /// The elements as double-floats (`lo` is zero).
     to_df32 -> Df32;
+}
+
+casts! { u32 =>
+    /// The elements as `f32` (rounded to nearest above 2^24).
+    to_f32 -> f32;
+    /// The elements as `i32`: a two's-complement reinterpretation of the bits.
+    to_i32 -> i32;
+}
+
+casts! { i32 =>
+    /// The elements as `f32` (rounded to nearest above 2^24).
+    to_f32 -> f32;
+    /// The elements as `u32`: a two's-complement reinterpretation of the bits.
+    to_u32 -> u32;
 }
 
 casts! { f64 =>

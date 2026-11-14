@@ -81,6 +81,7 @@ impl<T: ScalarType> Operand<T> for Array<T> {
 
 impl_value_operand!(f32);
 impl_value_operand!(u32);
+impl_value_operand!(i32);
 impl_value_operand!(Df32);
 // There is deliberately no `Operand<f64> for f64`: a second float type among the scalar
 // operands would make `select(&mask, 1.0, 0.0)` and every other call that only has float
@@ -88,6 +89,7 @@ impl_value_operand!(Df32);
 // scalars; comparisons, `minimum`/`maximum` and `select` take `f64` arrays.
 impl_scalar_operand!(f32);
 impl_scalar_operand!(u32);
+impl_scalar_operand!(i32);
 
 /// Splits `count` workgroups into a 2D grid within the per-dimension limit; shaders recombine
 /// them as `x + y * num_workgroups.x`.
@@ -315,7 +317,7 @@ impl<T: ScalarType> Array<T> {
         if let Rhs::Scalar(value) = &rhs
             && !scalar_left
             && let Ok(scalar) = Scalar::of(*value)
-            && scalar.ty == ElemTy::U32
+            && matches!(scalar.ty, ElemTy::U32 | ElemTy::I32)
             && let Some(by) = UnOp::by_constant(op, scalar.bits as u32)
         {
             let result = self.run_unary(by, location);
@@ -872,6 +874,13 @@ wide_unary_methods! { f64;
     ceil => UnOp::Ceil;
 }
 
+wide_unary_methods! { i32;
+    /// Elementwise absolute value (`i32::MIN` stays `i32::MIN`).
+    abs => UnOp::Abs;
+    /// Elementwise sign: `-1`, `0` or `1`.
+    sign => UnOp::Sign;
+}
+
 wide_unary_methods! { Df32;
     /// Elementwise square root (accurate to about 44 bits).
     sqrt => UnOp::Sqrt;
@@ -1043,31 +1052,44 @@ macro_rules! impl_scalar_operators {
 
 impl_operators!(f32);
 impl_operators!(u32);
+impl_operators!(i32);
 impl_operators!(f64);
 impl_operators!(Df32);
 impl_scalar_operators!(f32);
 impl_scalar_operators!(u32);
+impl_scalar_operators!(i32);
 impl_binary_operator!(u32, Rem, rem, BinOp::Rem, "rem");
 impl_binary_scalar!(u32, Rem, rem, BinOp::Rem, "rem");
 impl_assign_operator!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 impl_assign_scalar!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
+impl_binary_operator!(i32, Rem, rem, BinOp::Rem, "rem");
+impl_binary_scalar!(i32, Rem, rem, BinOp::Rem, "rem");
+impl_assign_operator!(i32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
+impl_assign_scalar!(i32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 
-// -- Bitwise operations on u32 arrays --
+// -- Bitwise operations on u32 and i32 arrays --
 
 macro_rules! impl_bitwise_operator {
-    ($Trait:ident, $method:ident, $AssignTrait:ident, $assign_method:ident, $op:expr, $name:literal, $assign_name:literal) => {
-        impl_binary_operator!(u32, $Trait, $method, $op, $name);
-        impl_binary_scalar!(u32, $Trait, $method, $op, $name);
-        impl_assign_operator!(u32, $AssignTrait, $assign_method, $op, $assign_name);
-        impl_assign_scalar!(u32, $AssignTrait, $assign_method, $op, $assign_name);
+    ($t:ty, $Trait:ident, $method:ident, $AssignTrait:ident, $assign_method:ident, $op:expr, $name:literal, $assign_name:literal) => {
+        impl_binary_operator!($t, $Trait, $method, $op, $name);
+        impl_binary_scalar!($t, $Trait, $method, $op, $name);
+        impl_assign_operator!($t, $AssignTrait, $assign_method, $op, $assign_name);
+        impl_assign_scalar!($t, $AssignTrait, $assign_method, $op, $assign_name);
     };
 }
 
-impl_bitwise_operator!(BitAnd, bitand, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand", "bitand_assign");
-impl_bitwise_operator!(BitOr, bitor, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor", "bitor_assign");
-impl_bitwise_operator!(BitXor, bitxor, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor", "bitxor_assign");
-impl_bitwise_operator!(Shl, shl, ShlAssign, shl_assign, BinOp::Shl, "shl", "shl_assign");
-impl_bitwise_operator!(Shr, shr, ShrAssign, shr_assign, BinOp::Shr, "shr", "shr_assign");
+macro_rules! impl_bitwise_operators {
+    ($t:ty) => {
+        impl_bitwise_operator!($t, BitAnd, bitand, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand", "bitand_assign");
+        impl_bitwise_operator!($t, BitOr, bitor, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor", "bitor_assign");
+        impl_bitwise_operator!($t, BitXor, bitxor, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor", "bitxor_assign");
+        impl_bitwise_operator!($t, Shl, shl, ShlAssign, shl_assign, BinOp::Shl, "shl", "shl_assign");
+        impl_bitwise_operator!($t, Shr, shr, ShrAssign, shr_assign, BinOp::Shr, "shr", "shr_assign");
+    };
+}
+
+impl_bitwise_operators!(u32);
+impl_bitwise_operators!(i32);
 
 impl Not for &Array<u32> {
     type Output = Array<u32>;
@@ -1094,6 +1116,45 @@ impl Not for Array<u32> {
     #[track_caller]
     fn not(self) -> Array<u32> {
         !&self
+    }
+}
+
+impl Not for &Array<i32> {
+    type Output = Array<i32>;
+
+    /// Elementwise bitwise complement (`-x - 1`).
+    #[track_caller]
+    fn not(self) -> Array<i32> {
+        let location = Location::caller();
+        let result = self.run_unary(UnOp::BitNot, location);
+        Array::resolve(self.context(), self.shape(), result, "not", location)
+    }
+}
+
+impl Not for Array<i32> {
+    type Output = Array<i32>;
+
+    #[track_caller]
+    fn not(self) -> Array<i32> {
+        !&self
+    }
+}
+
+impl Array<i32> {
+    /// Elementwise `self << amount`, with an array of the same shape or a single `i32` as the
+    /// amount; the amount's bits are taken modulo 32 and bits shifted out are lost. The operator
+    /// `&x << n` is the same.
+    #[track_caller]
+    pub fn shl(&self, amount: impl Operand<i32>) -> Array<i32> {
+        self.binary(amount.rhs(), BinOp::Shl, false, "shl")
+    }
+
+    /// Elementwise arithmetic `self >> amount` (the sign bit comes in from the left), with an
+    /// array of the same shape or a single `i32` as the amount, taken modulo 32. The operator
+    /// `&x >> n` is the same.
+    #[track_caller]
+    pub fn shr(&self, amount: impl Operand<i32>) -> Array<i32> {
+        self.binary(amount.rhs(), BinOp::Shr, false, "shr")
     }
 }
 
