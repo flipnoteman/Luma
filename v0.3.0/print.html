@@ -1,0 +1,725 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>The Luma Guide</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/versions-b71651b3.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-61a8d153.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Luma Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/flipnoteman/Luma" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<p>Luma is an array library for Rust that runs on the GPU. You write ordinary arithmetic on <code>Array</code>s;
+Luma records it, fuses chains of elementwise operations into a single kernel, and runs the result
+on whatever hardware you have (Vulkan, Metal or DX12, through <a href="https://wgpu.rs">wgpu</a>). If no GPU
+opens it falls back to Mesa’s llvmpipe software driver.</p>
+<p>It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
+solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels. You do not write
+shaders, manage buffers or schedule submissions. When you need something Luma does not have, a
+<a href="#custom-kernels">custom WGSL kernel</a> runs in the same batch as the built-in operations.</p>
+<p>This guide explains how to use the library and why it behaves as it does. The
+<a href="https://docs.rs/luma">API reference</a> lists every method; the guide shows how they fit together.</p>
+<h2 id="install"><a class="header" href="#install">Install</a></h2>
+<p>You need a recent stable Rust toolchain and a GPU with Vulkan, Metal or DX12 drivers. Add Luma
+to a project:</p>
+<pre><code class="language-toml">[dependencies]
+luma = "0.3"
+</code></pre>
+<p>Without a GPU, install a software Vulkan driver (<code>mesa-vulkan-drivers</code> on most Linux
+distributions). Luma picks it up automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces
+it. See the <a href="#choosing-a-device">FAQ</a>.</p>
+<h2 id="a-first-program"><a class="header" href="#a-first-program">A first program</a></h2>
+<pre><code class="language-rust">use luma::*;
+
+fn main() -&gt; Result&lt;()&gt; {
+    // Arrays live on the GPU. The first one opens the default device.
+    let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+    let y = Array::from_slice(&amp;[10.0f32, 20.0, 30.0, 40.0], 4)?;
+
+    // Operators and math methods are recorded, not run.
+    let z = (&amp;x * 2.0 + &amp;y).sqrt();
+
+    // The host asks for a result: the batch is compiled, run, and read back.
+    let z = z.to_vec()?;
+    assert_eq!(z[2], 6.0);
+
+    // Reductions are lazy one-element arrays; `item` reads the value.
+    assert_eq!((&amp;x * &amp;y).sum().item()?, 300.0);
+    Ok(())
+}</code></pre>
+<p>Three things to notice:</p>
+<ul>
+<li><code>&amp;x * 2.0 + &amp;y</code> does not compute anything. It builds an expression. The multiply, the add and
+the square root become one kernel when something needs the values
+(<a href="#lazy-evaluation-and-fusion">Lazy evaluation and fusion</a>).</li>
+<li>Operators take references (<code>&amp;x</code>) so the array stays usable; scalars (<code>2.0</code>) are broadcast.</li>
+<li>Errors do not panic. A failing operation returns a poisoned array, and the error comes out as
+<code>Err</code> at the next call that reads or evaluates it (<code>to_vec</code>, <code>item</code>, <code>eval</code>), with the source
+location of the operation that failed.</li>
+</ul>
+<h2 id="where-to-go-next"><a class="header" href="#where-to-go-next">Where to go next</a></h2>
+<ul>
+<li><a href="#arrays">Arrays</a>: creation, element types, shapes, broadcasting, reading back.</li>
+<li><a href="#lazy-evaluation-and-fusion">Lazy evaluation and fusion</a>: when kernels run, <code>eval</code>, <code>flush</code>, <code>sync</code>, <code>cache</code>.</li>
+<li><a href="#worked-examples">Worked examples</a>: heat equation, Euler solver, ML-KEM, CPA.</li>
+<li><a href="#environment-variables">Environment variables</a> and the <a href="#faq-and-troubleshooting">FAQ</a> when something does not behave.</li>
+</ul>
+<p>The source repository, with the runnable programs referred to throughout the guide, is at
+<a href="https://github.com/flipnoteman/Luma">github.com/flipnoteman/Luma</a>. Every code block in this guide
+is compiled and run by <code>cargo test --doc</code>, so what you read here works with the version of Luma
+the page belongs to (see the version selector in the menu bar).</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="arrays"><a class="header" href="#arrays">Arrays</a></h1>
+<p>An <code>Array&lt;T&gt;</code> is a block of elements on the device with a shape of up to four dimensions.</p>
+<h2 id="creating-arrays"><a class="header" href="#creating-arrays">Creating arrays</a></h2>
+<pre><code class="language-rust">use luma::*;
+
+// From host data. The first dimension varies fastest: a [3, 2] array holds two columns of three.
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?;
+assert_eq!(a.shape(), Shape::from([3, 2]));
+assert_eq!(a.len(), 6);
+
+// Constants and generators. Generators are computed inside the kernel that reads them,
+// they are not stored.
+let zeros = Array::&lt;f32&gt;::zeros([3, 2])?;
+let twos = Array::&lt;f32&gt;::full([3, 2], 2.0)?;
+let ramp = Array::linspace(0.0, 1.0, 5)?;
+let rows = Array::&lt;f32&gt;::range([3, 2], 0)?;   // the index along dimension 0
+let noise = Array::&lt;f32&gt;::uniform([1000], 42)?; // counter-based, same seed -&gt; same numbers
+
+assert_eq!((&amp;a + &amp;twos).to_vec()?, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+assert_eq!(ramp.to_vec()?, vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+assert_eq!(rows.to_vec()?, vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
+assert_eq!(zeros.len() + noise.len(), 1006);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Every constructor has an <code>_on(&amp;ctx, ..)</code> form that takes an explicit <a href="#choosing-a-device"><code>Context</code></a>
+instead of the lazily opened default one. Arrays of different contexts cannot be mixed.</p>
+<h2 id="element-types"><a class="header" href="#element-types">Element types</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>Use</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f32</code></td><td>the default float; every operation</td></tr>
+<tr><td><code>u32</code></td><td>indices, masks, <a href="#integer-and-bit-operations">bit operations</a> (comparisons return <code>Array&lt;u32&gt;</code>, <code>0</code> or <code>1</code>)</td></tr>
+<tr><td><code>Df32</code></td><td>double-float, about 48 bits of mantissa, runs on every device (<a href="#precision">Precision</a>)</td></tr>
+<tr><td><code>f64</code></td><td>64-bit float, only on devices with <code>SHADER_F64</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>vec2</code> / <code>vec4</code> element types exist for custom kernels, and <a href="#records">records</a> group several
+arrays behind one struct. Convert between float types with <code>to_f64</code>, <code>to_df32</code> and <code>to_f32</code>:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+let d = x.to_df32();                  // exact, `lo` is zero
+let back = (&amp;d / &amp;d).to_f32();
+assert_eq!(back.to_vec()?, vec![1.0, 1.0, 1.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="shapes-and-broadcasting"><a class="header" href="#shapes-and-broadcasting">Shapes and broadcasting</a></h2>
+<p>Operators need equal shapes, with two exceptions: a scalar broadcasts, and an extent of 1
+broadcasts per axis.</p>
+<pre><code class="language-rust">use luma::*;
+
+let col = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], [3, 1])?;
+let row = Array::from_slice(&amp;[10.0f32, 20.0], [1, 2])?;
+let table = &amp;col + &amp;row;                      // [3, 1] + [1, 2] -&gt; [3, 2]
+assert_eq!(table.shape(), Shape::from([3, 2]));
+assert_eq!(table.to_vec()?, vec![11.0, 12.0, 13.0, 21.0, 22.0, 23.0]);
+
+// A reduction is a one-element array; it broadcasts against the array it came from
+// and never leaves the GPU.
+let x = Array::from_slice(&amp;[1.0f32, 3.0], 2)?;
+let normalised = &amp;x / &amp;x.sum();
+assert_eq!(normalised.to_vec()?, vec![0.25, 0.75]);
+
+// Explicit form:
+assert_eq!(col.broadcast_to([3, 4]).shape(), Shape::from([3, 4]));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>reshape</code> changes the shape without moving data (it shares the buffer, like <code>clone</code>); use
+<code>copy()</code> for an independent array.</p>
+<h2 id="reading-back"><a class="header" href="#reading-back">Reading back</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Call</th><th>What it does</th></tr>
+</thead>
+<tbody>
+<tr><td><code>to_vec()</code></td><td>copies into a new <code>Vec</code>; submits the pending batch and waits</td></tr>
+<tr><td><code>read_into(&amp;mut buf)</code></td><td>copies into host memory you own (cheaper when repeated)</td></tr>
+<tr><td><code>item()</code></td><td>the value of a one-element array</td></tr>
+<tr><td><code>to_array::&lt;N&gt;()</code></td><td>the <code>N</code> values of an <code>N</code>-element array</td></tr>
+<tr><td><code>write(&amp;data)</code></td><td>overwrites the contents; operations recorded earlier still see the old ones</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-rust">use luma::*;
+
+let mut x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+let before = &amp;x * 10.0;          // recorded against the current contents
+x.write(&amp;[7.0, 8.0, 9.0])?;      // does not disturb `before`
+let mut out = [0.0f32; 3];
+before.read_into(&amp;mut out)?;
+assert_eq!(out, [10.0, 20.0, 30.0]);
+assert_eq!(x.to_vec()?, vec![7.0, 8.0, 9.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p>Operators return arrays, not <code>Result</code>s, so expressions stay readable. A failing operation (a shape
+mismatch, a slice out of range) returns a poisoned array; everything built from it is poisoned
+with the same error, and the first call that reads it reports it:</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+let b = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+let c = (&amp;a + &amp;b) * 2.0;                 // no panic here
+assert!(c.check().is_err());             // `check` asks without waiting for the GPU
+assert!(c.to_vec().is_err());            // the error names the failed `+` and its source line
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="lazy-evaluation-and-fusion"><a class="header" href="#lazy-evaluation-and-fusion">Lazy evaluation and fusion</a></h1>
+<h2 id="what-a--b--c-does"><a class="header" href="#what-a--b--c-does">What <code>a * b + c</code> does</a></h2>
+<pre><code class="language-rust">use luma::*;
+
+let n = 1 &lt;&lt; 20;
+let a = Array::&lt;f32&gt;::full(n, 2.0)?;
+let b = Array::&lt;f32&gt;::full(n, 3.0)?;
+let c = Array::&lt;f32&gt;::full(n, 1.0)?;
+
+let r = &amp;a * &amp;b + &amp;c;        // records two operations, launches nothing
+assert_eq!(r.to_vec()?[0], 7.0); // one kernel: out[i] = a[i] * b[i] + c[i]
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Each operator creates a node in a graph that remembers its inputs. <code>r</code> is the node for the add;
+nothing is allocated for the product. When the host needs the values, Luma flattens the graph
+below <code>r</code> into one program, generates a WGSL kernel for it, and launches it. The product never
+exists in memory: the kernel reads <code>a</code>, <code>b</code> and <code>c</code> once and writes <code>r</code> once. A chain of 20
+elementwise operations is still one launch and one pass over memory.</p>
+<p>A lazy array is the value as of when it was written. If you later change an input with <code>write</code>,
+an in-place <code>+=</code>, or a mutable view, expressions recorded before the change still see the old
+contents:</p>
+<pre><code class="language-rust">use luma::*;
+
+let mut x = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+let y = &amp;x * 10.0;   // lazy, reads x
+x += 1.0;            // in-place, fused too; y is computed first, so it keeps the old x
+assert_eq!(y.to_vec()?, vec![10.0, 20.0]);
+assert_eq!(x.to_vec()?, vec![2.0, 3.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="when-kernels-run"><a class="header" href="#when-kernels-run">When kernels run</a></h2>
+<p>A kernel runs when one of these happens:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Call</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>to_vec</code>, <code>read_into</code>, <code>item</code>, <code>to_array</code></td><td>compute what the array needs, submit, wait, copy back</td></tr>
+<tr><td><code>a.eval()</code> / <code>eval_all(&amp;[&amp;a, &amp;b])</code></td><td>compute these arrays and hand the batch to the GPU <strong>without waiting</strong></td></tr>
+<tr><td><code>ctx.flush()</code> / <code>luma::flush()</code></td><td>compute <strong>every</strong> pending array and hand the batch to the GPU without waiting</td></tr>
+<tr><td><code>ctx.sync()</code></td><td>submit and wait until the GPU is idle</td></tr>
+<tr><td>a custom <a href="#custom-kernels"><code>Kernel</code></a> reads or writes the array</td><td>the array is computed first</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>eval</code> is how you keep the GPU busy: it returns as soon as the work is recorded, so the host
+builds step <em>n + 1</em> while the GPU runs step <em>n</em>. Reads and <code>sync</code> wait. If the GPU is still busy
+with earlier work, Luma may postpone an <code>eval</code> to the next one that finds it idle; the steps in
+between fuse, and arrays you drop before then are never computed. A program that calls <code>eval</code> and
+then does long work without touching Luma should call <code>flush</code> so the GPU starts.</p>
+<pre><code class="language-rust">use luma::*;
+
+let ctx = Context::new()?;
+let mut u = Array::&lt;f32&gt;::full_on(&amp;ctx, 1 &lt;&lt; 16, 1.0)?;
+for _ in 0..100 {
+    u = (&amp;u * 0.99 + 0.01).sqrt();
+    u.eval()?;               // non-blocking
+}
+ctx.sync()?;                 // wait once, at the end
+assert!((u.to_vec()?[0] - 1.0).abs() &lt; 1e-3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Errors the GPU raises while running a batch show up at the next call that waits.</p>
+<h2 id="what-fuses"><a class="header" href="#what-fuses">What fuses</a></h2>
+<p>Fused into the kernel that reads them: all elementwise operations, comparisons, <code>select</code>, casts,
+generators (<code>range</code>, <code>linspace</code>, <code>uniform</code>), <a href="#views-and-writes">views</a> (<code>slice</code>, <code>pad</code>, <code>flip</code>,
+<code>transpose</code>, <code>shift</code>, <code>take</code>, <code>concat</code>), compound assignment, and the elementwise prologue and
+epilogue of a <a href="#reductions-and-scans">reduction</a>. A view of a lazy expression is recomputed at the
+reader’s index, staged in workgroup memory, or evaluated first, whichever the
+<a href="#the-cost-model">cost model</a> estimates is cheapest.</p>
+<p>Not fused, because they need whole-array structure: <code>scan</code>, <code>sum_axis</code>, tridiagonal solves, FFT
+convolution, and your own kernels. They read the arrays they are given, which are computed first.</p>
+<p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
+<code>LUMA_FUSION_MAX_LIVE</code>, <code>LUMA_FUSION_MAX_INLINED</code>) or when evaluating a shared piece first is
+cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html"><code>Profile::splits</code></a> tells you where
+and why.</p>
+<h2 id="cache"><a class="header" href="#cache"><code>cache()</code></a></h2>
+<p><code>x.cache()</code> marks an expression as shared: it is evaluated once into a buffer and later readers
+load it instead of recomputing it. Luma decides this itself for views, so you need <code>cache()</code> only
+when you know better: an expensive expression read at many unrelated places.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::linspace(0.0, 1.0, 1000)?;
+let e = (x.sin() * x.cos()).exp().cache();     // computed once
+let r = &amp;e + &amp;e.slice(0, 1..1000).pad([(0, 1)], PadMode::Edge);
+assert_eq!(r.len(), 1000);
+<span class="boring">r.to_vec()?;
+</span><span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="looking-at-what-ran-profile"><a class="header" href="#looking-at-what-ran-profile">Looking at what ran: <code>Profile</code></a></h2>
+<p><code>ctx.profile(|| ..)</code> runs a closure and returns the GPU time of every kernel launched during it,
+by label, and the places where expressions were split. It needs timestamp queries on the adapter
+(<a href="https://docs.rs/luma/latest/luma/struct.Context.html"><code>Context::profiling_supported</code></a>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let ctx = Context::new()?;
+let x = Array::from_slice_on(&amp;ctx, &amp;[1.0f32; 1 &lt;&lt; 20], 1 &lt;&lt; 20)?;
+if ctx.profiling_supported() {
+    let (sum, profile) = ctx.profile(|| (&amp;x * 2.0).sum().item())?;
+    assert_eq!(sum?, 2.0 * (1 &lt;&lt; 20) as f32);
+    println!("{profile}");
+    assert!(profile.launches() &gt;= 1);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>While profiling, every launch gets a compute pass of its own, so use it to find where the GPU time
+goes, not to measure throughput. Counting <code>profile.launches()</code> before and after a change is a
+quick way to check that something still fuses.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="views-and-writes"><a class="header" href="#views-and-writes">Views and writes</a></h1>
+<p>This chapter is not written yet. Views (<code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>shift</code>, <code>take</code>, <code>concat</code>, <code>stack</code>, <code>broadcast_to</code>) read the array they are made from inside the kernel that uses them, so they cost no copy; writes go through mutable views (<code>slice_mut</code>, <code>flip_mut</code>, <code>transpose_mut</code>) with <code>assign</code>, compound assignment and <code>put</code>. See <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.slice"><code>Array::slice</code></a>, <a href="https://docs.rs/luma/latest/luma/enum.PadMode.html"><code>PadMode</code></a>, <a href="https://docs.rs/luma/latest/luma/struct.ViewMut.html"><code>ViewMut</code></a>, <a href="https://docs.rs/luma/latest/luma/fn.concat.html"><code>concat</code></a> and <a href="https://docs.rs/luma/latest/luma/fn.stack.html"><code>stack</code></a>. Runnable material: <a href="https://github.com/flipnoteman/Luma/blob/main/tests/views.rs"><code>tests/views.rs</code></a> and <a href="https://github.com/flipnoteman/Luma/blob/main/tests/assign.rs"><code>tests/assign.rs</code></a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="reductions-and-scans"><a class="header" href="#reductions-and-scans">Reductions and scans</a></h1>
+<p>This chapter is not written yet. <code>sum</code>, <code>min</code>, <code>max</code>, <code>mean</code> and <code>norm</code> return lazy one-element arrays (read them with <code>item()</code>, see <a href="#broadcasting">Arrays</a>); <code>sum_axis</code>, <code>min_axis</code> and <code>max_axis</code> reduce along one dimension; <code>scan</code> and <code>cumsum</code> are prefix operations; <code>solve_tridiagonal</code> solves many tridiagonal systems at once. See <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.sum"><code>Array::sum</code></a>, <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.reduce"><code>Array::reduce</code></a>, <a href="https://docs.rs/luma/latest/luma/enum.Reduction.html"><code>Reduction</code></a> and <a href="https://docs.rs/luma/latest/luma/fn.solve_tridiagonal.html"><code>solve_tridiagonal</code></a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="records"><a class="header" href="#records">Records</a></h1>
+<p>This chapter is not written yet. A record is a struct of arrays declared with <a href="https://docs.rs/luma/latest/luma/macro.fields.html"><code>luma::fields!</code></a>: arithmetic, <code>select</code>, views, <code>assign</code> and <code>+=</code> act on every field in one kernel, and a record can be the state of a loop. See the <a href="https://docs.rs/luma/latest/luma/trait.Fields.html"><code>Fields</code></a> trait and <a href="https://github.com/flipnoteman/Luma/blob/main/tests/records.rs"><code>tests/records.rs</code></a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="loops"><a class="header" href="#loops">Loops</a></h1>
+<p>This chapter is not written yet. <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate"><code>Array::iterate</code></a> runs multi-step stencils, <a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a> runs elementwise loops over several arrays as one kernel that keeps the state in registers, and <a href="https://docs.rs/luma/latest/luma/fn.iterate_until_all.html"><code>iterate_until_all</code></a> stops on a device-side condition. The step function is traced once and its kernels are replayed; a loop called again from the same place reuses the earlier program. A per-step <code>eval</code> loop is recognised too; see <a href="#when-kernels-run">Lazy evaluation and fusion</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="precision"><a class="header" href="#precision">Precision</a></h1>
+<p>This chapter is not written yet. <code>f32</code> is the default; <a href="https://docs.rs/luma/latest/luma/struct.Df32.html"><code>Df32</code></a> is a double-float of about 48 mantissa bits that runs on every device, <code>Array&lt;f64&gt;</code> needs <code>SHADER_F64</code>, and <code>to_f64</code> / <code>to_df32</code> / <code>to_f32</code> convert between them. <code>sum_compensated</code> and <code>norm_compensated</code> accumulate in double-float, <code>is_finite</code> / <code>is_nan</code> / <code>is_inf</code> give lazy masks, and <a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions::fast_math</code></a> allows value-changing rewrites (see <a href="#environment-variables">Environment variables</a>).</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="integer-and-bit-operations"><a class="header" href="#integer-and-bit-operations">Integer and bit operations</a></h1>
+<p>This chapter is not written yet. <code>u32</code> arrays support <code>+ - * / %</code>, <code>&amp; | ^ !</code>, <code>&lt;&lt; &gt;&gt;</code> (amounts modulo 32), <code>rotate_left</code> and <code>rotate_right</code>, all fused like float operations, and <code>take</code> for table lookups such as an S-box. The <code>keccak</code> example (<a href="https://github.com/flipnoteman/Luma/blob/main/examples/keccak.rs"><code>examples/keccak.rs</code></a>) computes Keccak-f[1600], SHA3-256 and SHAKE128 from lazy array operations only. See <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.take"><code>Array::take</code></a> and <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.rotate_left"><code>Array::rotate_left</code></a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="custom-kernels"><a class="header" href="#custom-kernels">Custom kernels</a></h1>
+<p>This chapter is not written yet. <a href="https://docs.rs/luma/latest/luma/struct.Context.html#method.kernel"><code>Context::kernel</code></a> builds a WGSL kernel from source; arrays bind as storage buffers, <a href="https://docs.rs/luma/latest/luma/fn.uniform.html"><code>uniform</code></a> passes parameters, and <code>luma.size</code> gives the launch size. A kernel runs in the same batch as the built-in operations; ping-pong buffers are swapped with <code>std::mem::swap</code>. See <a href="https://docs.rs/luma/latest/luma/struct.Kernel.html"><code>Kernel</code></a> and <a href="https://github.com/flipnoteman/Luma/blob/main/examples/custom_kernel.rs"><code>examples/custom_kernel.rs</code></a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="performance-guide"><a class="header" href="#performance-guide">Performance guide</a></h1>
+<p>Tools: <a href="#looking-at-what-ran-profile"><code>Context::profile</code></a> times each kernel and lists where an expression was split (<code>Profile::splits</code>, <a href="https://docs.rs/luma/latest/luma/enum.SplitReason.html"><code>SplitReason</code></a>). When an expression can be recomputed, staged in workgroup memory or evaluated first, a cost model measured per device decides: see <a href="https://docs.rs/luma/latest/luma/struct.CostModel.html"><code>CostModel</code></a> and <code>Context::cost_model</code>. The rest of this chapter is not written yet; the settings that shape fusion are in <a href="#environment-variables">Environment variables</a> (<code>LUMA_FUSION_*</code>, <code>LUMA_STAGING</code>, <code>LUMA_CALIBRATE</code>, <code>LUMA_CACHE</code>).</p>
+<h2 id="the-cost-model"><a class="header" href="#the-cost-model">The cost model</a></h2>
+<p><code>Context::cost_model()</code> returns the throughputs Luma uses to compare plans (launch cost, memory bandwidth, <code>f32</code> rate, the cost of <code>Df32</code> and <code>f64</code> arithmetic relative to <code>f32</code>).</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="worked-examples"><a class="header" href="#worked-examples">Worked examples</a></h1>
+<p>This chapter is not written yet. The repository has the programs: heat equation and other workloads in <a href="https://github.com/flipnoteman/Luma/blob/main/benches/real_world.rs"><code>benches/real_world.rs</code></a>, the Euler solver in <a href="https://github.com/flipnoteman/Luma/blob/main/tests/euler_residual.rs"><code>tests/euler_residual.rs</code></a> and <a href="https://github.com/flipnoteman/Luma/blob/main/examples/bench_pde.rs"><code>examples/bench_pde.rs</code></a>, ML-KEM (FIPS 203) in <a href="https://github.com/flipnoteman/Luma/blob/main/examples/mlkem.rs"><code>examples/mlkem.rs</code></a>, and Keccak in <a href="https://github.com/flipnoteman/Luma/blob/main/examples/keccak.rs"><code>examples/keccak.rs</code></a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h1>
+<p>Luma reads these when a context opens. <code>ContextOptions::from_env()</code> collects the ones that have
+a <a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions</code></a> field, and the
+builder methods override them:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th><code>ContextOptions</code></th></tr>
+</thead>
+<tbody>
+<tr><td><code>LUMA_DEVICE</code></td><td><code>device</code> / <code>.device(kind)</code></td></tr>
+<tr><td><code>LUMA_MEMORY_BUDGET</code></td><td><code>memory_budget</code> / <code>.memory_budget(bytes)</code></td></tr>
+<tr><td><code>LUMA_CHUNK_BYTES</code></td><td><code>chunk_bytes</code> / <code>.chunk_bytes(bytes)</code></td></tr>
+<tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>check_finite</code> / <code>.check_finite(on)</code></td></tr>
+<tr><td><code>LUMA_CALIBRATE</code></td><td><code>calibrate</code> / <code>.calibrate(on)</code></td></tr>
+<tr><td><code>LUMA_FAST_MATH</code></td><td><code>fast_math</code> / <code>.fast_math(on)</code></td></tr>
+<tr><td><code>LUMA_DF_FMA</code></td><td><code>df_fma</code> / <code>.df_fma(fused)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_FUSION_*</code>, <code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>,
+<code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
+<h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>LUMA_DEVICE</code></td><td><code>gpu</code> or <code>cpu</code>: restrict the device kind (default: GPU, CPU as fallback)</td></tr>
+<tr><td><code>LUMA_MEMORY_BUDGET</code></td><td>Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it)</td></tr>
+<tr><td><code>LUMA_CHUNK_BYTES</code></td><td>Largest buffer an array is split into, in bytes (power of two)</td></tr>
+<tr><td><code>LUMA_TUNING</code></td><td><code>apple</code>, <code>nvidia</code>, <code>generic</code> or <code>cpu</code>: override the kernel tuning profile</td></tr>
+<tr><td><code>LUMA_SUBGROUPS</code></td><td><code>off</code> keeps the built-in kernels off subgroup operations</td></tr>
+<tr><td><code>LUMA_FUSION_MAX_NODES</code></td><td>Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels</td></tr>
+<tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
+<tr><td><code>LUMA_FUSION_MAX_INLINED</code></td><td>Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; <code>16..=16384</code>)</td></tr>
+<tr><td><code>LUMA_STAGING</code></td><td><code>off</code> keeps expressions read through slices and pads at several offsets (fluxes, stencils of an expression) out of workgroup memory: the kernel recomputes them per read instead of computing each once per cell of a workgroup tile (the cost model picks between them)</td></tr>
+<tr><td><code>LUMA_TRIDIAGONAL</code></td><td><code>thomas</code> or <code>cyclic</code>: force the algorithm of <code>solve_tridiagonal</code> / <code>solve_block_tridiagonal</code> (one invocation per line, or one workgroup per line by cyclic reduction); the default picks cyclic reduction for few lines</td></tr>
+<tr><td><code>LUMA_SPECULATE</code></td><td><code>off</code> stops readbacks in a loop (<code>step</code> then <code>.max().item()?</code> every iteration) from computing the next steps ahead</td></tr>
+<tr><td><code>LUMA_FAST_MATH</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: allow rewrites that change values (<code>x + 0</code>, <code>x * 0</code>, <code>x - x</code>, <code>x / x</code>, constant reassociation, <code>x / c</code> as <code>x * (1 / c)</code>, <code>powf</code> with exponent 1, 2 or 0.5) and the cheaper <code>Df32</code> addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (<code>x * 1</code>, <code>-(-x)</code>) always run</td></tr>
+<tr><td><code>LUMA_DF_FMA</code></td><td><code>off</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>on</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
+<tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: fail any operation whose result holds a NaN or Inf (debug mode, waits for the GPU after every evaluated array)</td></tr>
+<tr><td><code>LUMA_CALIBRATE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: skip measuring the device’s throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see <code>LUMA_CACHE</code>; a measurement that looks contended by other processes is dropped) and use the tuning profile’s fixed cost model</td></tr>
+<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan) and the measured cost model per adapter and driver, so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
+<tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code>, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored</td></tr>
+<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for NVIDIA’s driver threads on Linux (saves about 50 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads and then ends the process with <code>_exit</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="testing-variables"><a class="header" href="#testing-variables">Testing variables</a></h2>
+<p>These only affect the differential fuzzer in the crate’s own test suite (<code>cargo test fuzz::</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>LUMA_FUZZ_CASES</code></td><td>Number of random programs per fuzz test (default 256, 24 in debug builds)</td></tr>
+<tr><td><code>LUMA_FUZZ_SEED</code></td><td>Fixed seed (default: random; failing cases are also kept in <code>tests/proptest-regressions/</code>)</td></tr>
+<tr><td><code>LUMA_FUZZ_VERBOSE</code></td><td>Set to anything: print every generated program</td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="faq-and-troubleshooting"><a class="header" href="#faq-and-troubleshooting">FAQ and troubleshooting</a></h1>
+<h2 id="choosing-a-device"><a class="header" href="#choosing-a-device">Choosing a device</a></h2>
+<p><strong>Which device does Luma use?</strong> <code>Context::new()</code> and the default context ask wgpu for the
+high-performance adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls back
+to a software Vulkan driver (Mesa llvmpipe). <code>LUMA_DEVICE</code> or <code>ContextOptions::device</code> narrow this:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setting</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>LUMA_DEVICE=gpu</code> / <code>DeviceKind::Gpu</code></td><td>a hardware GPU only; <code>LumaError::NoDevice</code> if only a software adapter exists</td></tr>
+<tr><td><code>LUMA_DEVICE=cpu</code> / <code>DeviceKind::Cpu</code> / <code>Context::cpu()</code></td><td>the software adapter, whatever GPUs exist</td></tr>
+<tr><td>unset / <code>DeviceKind::Auto</code></td><td>GPU, CPU as fallback</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-rust">use luma::*;
+
+let cpu = Context::cpu()?;
+assert!(cpu.is_cpu());
+let x = Array::from_slice_on(&amp;cpu, &amp;[1.0f32, 2.0], 2)?;
+assert_eq!((&amp;x + &amp;x).to_vec()?, vec![2.0, 4.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong>Opening a context returns “No suitable adapter”.</strong> There is no Vulkan, Metal or DX12 driver
+Luma can use. On Linux install <code>mesa-vulkan-drivers</code> (lavapipe) for the CPU fallback, or your GPU
+vendor’s Vulkan driver. CI runners need the former.</p>
+<p><strong>I have two GPUs and want the other one.</strong> Luma asks for the high-performance adapter and has no
+adapter-by-name setting. On Linux the Vulkan loader decides which drivers wgpu sees, so pointing
+<code>VK_ICD_FILENAMES</code> at one driver’s <code>.json</code> file (for example
+<code>/usr/share/vulkan/icd.d/radeon_icd.x86_64.json</code>) selects that driver. Note the RADV issue below.</p>
+<p><strong>Arrays of different contexts.</strong> Every <code>Array</code> belongs to one <code>Context</code>; mixing arrays of two
+contexts is an error. The <code>_on(&amp;ctx, ..)</code> constructors take a context explicitly, and the
+<code>default_context()</code> is shared by every constructor without it.</p>
+<h2 id="nvidia"><a class="header" href="#nvidia">NVIDIA</a></h2>
+<p><strong>The process hangs or aborts when it exits.</strong> NVIDIA’s Linux driver can crash or hang in its own
+shader-compiler threads during <code>exit</code>. Luma waits at exit for the GPU (up to 2 s) and for busy
+driver compiler threads (up to 2 s), then ends the process with <code>_exit</code>. That makes the problem
+rare, not impossible (driver 615.x was seen to still do it). <code>LUMA_EXIT_WAIT=0</code> skips the wait,
+which saves about 50 ms of exit time and risks the hang. A normal <code>main</code> return goes through
+this path; calling <code>std::process::exit</code> yourself does too.</p>
+<p><strong>Opening a second device stalls.</strong> On NVIDIA, creating a device (<code>Context::new</code>) blocks
+submissions of <em>other</em> devices in the process until their in-flight GPU work finishes. This
+happens once per device creation. Create your contexts up front, before starting long GPU work,
+or use one context (the default one is shared by threads).</p>
+<h2 id="radv-integrated-gpus-give-wrong-results"><a class="header" href="#radv-integrated-gpus-give-wrong-results">RADV integrated GPUs give wrong results</a></h2>
+<p>Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (<code>scan</code>, <code>cumsum</code>,
+axis reductions), workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
+cyclic solver is chosen automatically only on NVIDIA; elsewhere (and with
+<code>LUMA_TRIDIAGONAL=thomas</code>) the solver does not use it. If you see wrong results on such a GPU:</p>
+<ul>
+<li><code>LUMA_STAGING=off</code> keeps expressions out of workgroup memory (the kernel recomputes them),</li>
+<li><code>LUMA_TRIDIAGONAL=thomas</code> pins the solver that does not use workgroup memory,</li>
+<li>scans and axis reductions have no switch: run on another device (<code>LUMA_DEVICE=cpu</code>, or a
+different GPU through <code>VK_ICD_FILENAMES</code>).</li>
+</ul>
+<h2 id="results-and-errors"><a class="header" href="#results-and-errors">Results and errors</a></h2>
+<p><strong>An operation “did nothing”.</strong> Operators do not panic or return <code>Result</code>; they return a poisoned
+array and the error comes out at <code>to_vec</code>, <code>item</code>, <code>eval</code> or <code>check()</code>. Call <code>check()</code> on an
+array to find the first failure early. The error carries the source location of the operation.</p>
+<p><strong>I get <code>NaN</code> or <code>Inf</code> and do not know where it starts.</strong> Set <code>LUMA_CHECK_FINITE=1</code> (or
+<code>ContextOptions::check_finite</code>): every evaluated array is checked and the first operation whose
+result holds a non-finite value fails with <code>LumaError::NonFinite</code>. It waits for the GPU after every
+array, so use it for debugging only. For <code>f32</code>, <code>f64</code> and <code>Df32</code> arrays,
+<code>is_finite()</code> / <code>is_nan()</code> / <code>is_inf()</code> give lazy <code>u32</code> masks you can use in expressions.</p>
+<p><strong><code>Array&lt;f64&gt;</code> fails with <code>Unsupported</code>.</strong> The device has no 64-bit shader floats. Check
+<code>ctx.features().contains(luma::wgpu::Features::SHADER_F64)</code>, or use <code>Df32</code>
+(<a href="#precision">Precision</a>), which runs everywhere.</p>
+<p><strong>Out of memory.</strong> Array data beyond the memory budget (80% of device memory on Vulkan GPUs)
+moves to host memory and back on demand, with a one-time warning. <code>LUMA_MEMORY_BUDGET</code> sets the
+budget. Custom kernels need arrays that fit one buffer (<code>LumaError::Chunked</code> otherwise).</p>
+<h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
+<p><strong>The first run is slow, later ones are fast.</strong> Large kernels (especially <code>Df32</code>) take seconds
+to compile on some drivers. Luma keeps the driver’s compiled pipelines and the measured cost
+model in <code>$XDG_CACHE_HOME/luma</code> (<code>~/.cache/luma</code>), so the second process skips that. Set
+<code>LUMA_CACHE=off</code> to turn it off or <code>LUMA_CACHE_DIR</code> to move it.</p>
+<p><strong>Context creation takes about 150 ms.</strong> That is the device calibration (once per machine; the
+result is cached). <code>LUMA_CALIBRATE=0</code> skips it and uses fixed numbers for the GPU kind.</p>
+<p><strong>My loop is slow.</strong> See the <a href="#performance-guide">Performance guide</a> and <a href="#loops">Loops</a>: use
+<code>iterate</code>/<code>iterate_all</code> where they apply, <code>eval</code> each step instead of reading, and look at
+<code>ctx.profile(..)</code> for kernel counts and split reasons.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="migration-from-02"><a class="header" href="#migration-from-02">Migration from 0.2</a></h1>
+<p>0.3 changes two things your 0.2 code can trip over. Everything else in 0.3 is added.</p>
+<h2 id="reductions-are-lazy-arrays"><a class="header" href="#reductions-are-lazy-arrays">Reductions are lazy arrays</a></h2>
+<p>In 0.2, <code>sum</code>, <code>min</code>, <code>max</code>, <code>mean</code>, <code>norm</code> and <code>reduce</code> returned host values. In 0.3 they return a
+one-element <code>Array</code> that fuses with what follows, so <code>&amp;x / &amp;x.sum()</code> stays on the GPU. Read the
+value with <code>item()?</code> (and <code>reduce</code> results with <code>to_array()?</code>):</p>
+<pre><code class="language-text">// 0.2
+let total: f32 = x.sum()?;
+// 0.3
+let total: f32 = x.sum().item()?;
+</code></pre>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+assert_eq!(x.sum().item()?, 10.0);
+assert_eq!(x.max().item()?, 4.0);
+
+// Several reductions in one pass over the data come back as an array:
+let both = x.reduce([Reduction::Min, Reduction::Max]);
+assert_eq!(both.to_array::&lt;2&gt;()?, [1.0, 4.0]);
+
+// Staying on the GPU:
+let mean_removed = &amp;x - &amp;x.mean();
+assert_eq!(mean_removed.to_vec()?, vec![-1.5, -0.5, 0.5, 1.5]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The <code>[f32; 2]</code> and <code>[f32; 4]</code> reductions (<code>vec2</code> / <code>vec4</code> element arrays) still return host values.</p>
+<h2 id="broadcasting-per-axis"><a class="header" href="#broadcasting-per-axis">Broadcasting per axis</a></h2>
+<p>An extent of 1 now broadcasts: <code>[N, 1] + [1, M]</code> is <code>[N, M]</code>, also for the branches of <code>select</code> and
+in compound assignment. Code that relied on a shape mismatch being an error between such shapes
+now gets a result. <code>broadcast_to(shape)</code> makes it explicit.</p>
+<h2 id="new-in-03-that-you-may-want"><a class="header" href="#new-in-03-that-you-may-want">New in 0.3 that you may want</a></h2>
+<ul>
+<li><a href="#views-and-writes">Views</a> that fuse into the reading kernel (<code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>take</code>,
+<code>concat</code>, …) and mutable views with <code>assign</code>.</li>
+<li><a href="#records">Records</a> (<code>luma::fields!</code>) for solver state.</li>
+<li><a href="#integer-and-bit-operations">Bit operations</a> on <code>u32</code>, <a href="#precision"><code>Df32</code> and <code>f64</code></a>.</li>
+<li><a href="#loops"><code>iterate_until_all</code></a> with a device-side stop rule.</li>
+<li><code>Context::cost_model</code>, <code>Profile::splits</code>, <code>LUMA_CHECK_FINITE</code>, and an on-disk cache of compiled
+pipelines (<a href="#environment-variables">Environment variables</a>).</li>
+</ul>
+<p>The complete list, including performance changes and fixes, is in the
+<a href="https://github.com/flipnoteman/Luma/blob/main/CHANGELOG.md">changelog</a>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="theme/versions-85bad2c7.js"></script>
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
