@@ -11,6 +11,10 @@ All notable changes to Luma are listed here. The format follows
 - A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
   version per release (`/vX.Y.Z/`) and `/main/`; its code blocks are tested as doctests.
 
+### Removed
+
+- The ArrayFire comparison benchmarks (`benchmarks/arrayfire`, the `luma-bench` crate).
+
 ## [0.3.0] - 2026-11-13
 
 ### Breaking

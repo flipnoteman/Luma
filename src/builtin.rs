@@ -4,7 +4,7 @@
 //! Elementwise operations on arrays are not kernels of their own: they are recorded lazily and
 //! fused into generated kernels, see [`crate::jit`]. What is left here are the
 //! fills, the reduction passes over partial results, and the convolution and FFT
-//! passes (generated here, in [`crate::fft`] and `operations/`). Every kernel declares its arguments in `@group(1)` and
+//! passes (generated here, in [`crate::fft`] and `conv1d.wgsl`). Every kernel declares its arguments in `@group(1)` and
 //! uses the `luma` grid uniform of the prelude.
 
 use std::borrow::Cow;
@@ -1288,7 +1288,7 @@ impl Builtin {
         match self {
             Builtin::Fill => fill_kernel(ty, wg).into(),
             Builtin::Reduce(ops, segmented) => reduce(ty, ops, segmented, tuning).into(),
-            Builtin::Conv1d => include_str!("../operations/conv1d.wgsl").into(),
+            Builtin::Conv1d => include_str!("conv1d.wgsl").into(),
             Builtin::Conv1dTiled(stride, per_thread) => conv1d_tiled(stride, per_thread, tuning.conv_workgroup).into(),
             Builtin::Fft(pass) => crate::fft::source(pass).into(),
             Builtin::UntilGate => UNTIL_GATE.into(),

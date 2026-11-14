@@ -10,10 +10,9 @@ documentation = "https://docs.rs/luma"
 keywords = ["gpu", "wgpu", "array", "math", "compute"]
 categories = ["science", "mathematics", "concurrency"]
 rust-version.workspace = true
-exclude = [".github/", "benchmarks/"]
+exclude = [".github/"]
 
 [workspace]
-exclude = ["benchmarks/arrayfire"]
 
 [workspace.package]
 version = "0.3.0"

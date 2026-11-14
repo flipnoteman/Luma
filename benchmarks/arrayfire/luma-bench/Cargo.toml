@@ -1,9 +1,0 @@
-[package]
-name = "luma-bench"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-common = { path = "../common" }
-luma = { path = "../../.." }
-encase = "0.13"
