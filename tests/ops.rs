@@ -549,3 +549,16 @@ fn tanh_saturates_to_plus_or_minus_one_on_large_inputs() {
     assert_eq!(&got[..7], &[-1.0, -1.0, -1.0, 0.0, 1.0, 1.0, 1.0]);
     assert!(got[7].is_nan());
 }
+
+#[test]
+fn hypot_of_nan_is_nan_unless_the_other_operand_is_infinite() {
+    let n = f32::NAN;
+    let inf = f32::INFINITY;
+    let xs = [n, 0.0, n, -0.0, n, inf, n, -inf, 3.0, n];
+    let ys = [0.0f32, n, -0.0, n, 2.0, n, inf, n, n, n];
+    let got = f32s(&xs).hypot(f32s(&ys)).to_vec().unwrap();
+    for (i, g) in got.iter().enumerate() {
+        let want = xs[i].hypot(ys[i]);
+        assert!(g.to_bits() == want.to_bits() || (g.is_nan() && want.is_nan()), "index {i}: hypot({}, {}) = {g}, want {want}", xs[i], ys[i]);
+    }
+}

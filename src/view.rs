@@ -111,7 +111,8 @@ impl<T: ScalarType> Array<T> {
         // base, and an assignment through the view may have replaced its expression.)
         let inner = match (self.is_read_view() || self.view().is_some(), edge, self.pending()) {
             (true, Edge::None, Some(node)) => node.operands().and_then(|args| match node.op().kind {
-                OpKind::Shift(ShiftKind::View { map: inner, edge: Edge::None }) => Some((args[0].clone(), inner)),
+                // Only when `inner` produces the shape `map` reads: a reshaped handle shares the node.
+                OpKind::Shift(ShiftKind::View { map: inner, edge: Edge::None }) if inner.out == map.src => Some((args[0].clone(), inner)),
                 _ => None,
             }),
             _ => None,

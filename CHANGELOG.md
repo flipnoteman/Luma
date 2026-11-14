@@ -107,6 +107,9 @@ All notable changes to Luma are listed here. The format follows
   before them), found by the new differential fuzzer.
 - `Df32` kernels failing to bind their uniform; casts cancelled by the shader compiler.
 - Input-buffer count wrong after `cache()`.
+- Slicing, flipping or transposing a reshaped read-only view read the wrong elements.
+- A deadlock in `item()` readbacks that evict under a memory budget while speculating.
+- `hypot` with a NaN operand and a zero operand returned 0 instead of NaN.
 - Region assigns into lazy expressions (the ghost cells and solid blocks of a finite-volume
   solver) made up to 30 times as many launches: the work of a shared expression was counted once
   per path through it (doubling with every level), so small ghost expressions were evaluated in
