@@ -1,0 +1,3 @@
+# Integer and bit operations
+
+This chapter is not written yet. `u32` arrays support `+ - * / %`, `& | ^ !`, `<< >>` (amounts modulo 32), `rotate_left` and `rotate_right`, all fused like float operations, and `take` for table lookups such as an S-box. The `keccak` example ([`examples/keccak.rs`](https://github.com/flipnoteman/Luma/blob/main/examples/keccak.rs)) computes Keccak-f[1600], SHA3-256 and SHAKE128 from lazy array operations only. See [`Array::take`](https://docs.rs/luma/latest/luma/struct.Array.html#method.take) and [`Array::rotate_left`](https://docs.rs/luma/latest/luma/struct.Array.html#method.rotate_left).

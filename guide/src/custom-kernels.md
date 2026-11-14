@@ -1,0 +1,3 @@
+# Custom kernels
+
+This chapter is not written yet. [`Context::kernel`](https://docs.rs/luma/latest/luma/struct.Context.html#method.kernel) builds a WGSL kernel from source; arrays bind as storage buffers, [`uniform`](https://docs.rs/luma/latest/luma/fn.uniform.html) passes parameters, and `luma.size` gives the launch size. A kernel runs in the same batch as the built-in operations; ping-pong buffers are swapped with `std::mem::swap`. See [`Kernel`](https://docs.rs/luma/latest/luma/struct.Kernel.html) and [`examples/custom_kernel.rs`](https://github.com/flipnoteman/Luma/blob/main/examples/custom_kernel.rs).

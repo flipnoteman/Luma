@@ -4,6 +4,13 @@ All notable changes to Luma are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
+  version per release (`/vX.Y.Z/`) and `/main/`; its code blocks are tested as doctests.
+
 ## [0.3.0] - 2026-11-13
 
 ### Breaking
@@ -293,5 +300,6 @@ All notable changes to Luma are listed here. The format follows
 - A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
 - A library layout, with the shader loaded from a hard-coded relative path.
 
+[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/flipnoteman/Luma/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/flipnoteman/Luma/releases/tag/v0.2.0

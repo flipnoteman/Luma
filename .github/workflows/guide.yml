@@ -1,0 +1,145 @@
+# Builds the user guide (guide/, an mdBook) and publishes it to the `gh-pages` branch, one
+# directory per version: /main/ for the tip of `main`, /vX.Y.Z/ for every release. GitHub Pages
+# serves that branch at https://flipnoteman.github.io/Luma/.
+#
+# - push to main:      build and publish to /main/
+# - release published: build the release tag and publish to /<tag>/
+# - workflow_dispatch: build `ref` and publish it as `version`. `v0.3.0` was tagged before
+#   guide/ existed, so it is built once by hand: ref=main version=v0.3.0.
+#
+# After every run /versions.json (version switcher) and the root /index.html (redirect to the
+# newest release, or to /main/ when there is none) are regenerated. Other versions are never
+# deleted. The `gh-pages` branch is created as an orphan on the first run.
+name: Guide
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "guide/**"
+      - "src/**"
+      - ".github/workflows/guide.yml"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag or commit) to build the guide from"
+        required: true
+        default: main
+      version:
+        description: "Directory to publish it as: main, or a release such as v0.3.0"
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+# One deploy at a time: every run commits to the same branch.
+concurrency:
+  group: guide-deploy
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: "0.5.4"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide what to build
+        id: meta
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          TAG: ${{ github.event.release.tag_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          case "$EVENT" in
+            push) ref="$SHA"; version=main ;;
+            release) ref="refs/tags/$TAG"; version="$TAG" ;;
+            *) ref="$INPUT_REF"; version="$INPUT_VERSION" ;;
+          esac
+          if ! printf '%s' "$version" | grep -Eq '^(main|v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)$'; then
+            echo "::error::version '$version' must be 'main' or look like v1.2.3"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Install mdBook
+        run: |
+          curl -sSfL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build the guide
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          test -f guide/book.toml || { echo "::error::this ref has no guide/"; exit 1; }
+          # The 404 page and the search index need the version's own URL.
+          MDBOOK_OUTPUT__HTML__SITE_URL="/Luma/${VERSION}/" mdbook build guide -d "$RUNNER_TEMP/site"
+
+      - name: Check out gh-pages (an orphan branch on the first run)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin gh-pages > /dev/null; then
+            git fetch --no-tags origin gh-pages
+            git worktree add "$RUNNER_TEMP/pages" -B gh-pages FETCH_HEAD
+          else
+            git worktree add --detach "$RUNNER_TEMP/pages"
+            git -C "$RUNNER_TEMP/pages" checkout --orphan gh-pages
+            git -C "$RUNNER_TEMP/pages" rm -rfq .
+          fi
+
+      - name: Publish the version and refresh the index
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        working-directory: ${{ runner.temp }}/pages
+        run: |
+          touch .nojekyll
+          rm -rf "./$VERSION"
+          mkdir "./$VERSION"
+          cp -r "$RUNNER_TEMP/site/." "./$VERSION/"
+
+          # Release directories, newest first.
+          releases=$(find . -maxdepth 1 -type d -name 'v[0-9]*' -printf '%f\n' | sort -rV)
+          stable=$(printf '%s\n' "$releases" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          newest=$(printf '%s\n' "$stable" | head -n 1)
+          [ -n "$newest" ] || newest=main
+
+          {
+            printf '['
+            sep=''
+            for v in $releases main; do
+              if [ -d "$v" ]; then printf '%s"%s"' "$sep" "$v"; sep=', '; fi
+            done
+            printf ']\n'
+          } > versions.json
+
+          cat > index.html <<HTML
+          <!DOCTYPE html>
+          <meta charset="utf-8">
+          <title>The Luma Guide</title>
+          <meta http-equiv="refresh" content="0; url=${newest}/">
+          <link rel="canonical" href="${newest}/">
+          <script>location.replace("${newest}/" + location.hash);</script>
+          <a href="${newest}/">The Luma Guide</a>
+          HTML
+
+          cat versions.json
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing changed."
+          else
+            git commit -qm "Guide ${VERSION} (${GITHUB_SHA::7})"
+            git push origin HEAD:gh-pages
+          fi

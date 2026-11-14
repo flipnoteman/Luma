@@ -2,3 +2,4 @@
 .idea
 *.xml
 .claude/
+/guide/book
