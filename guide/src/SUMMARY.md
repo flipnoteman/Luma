@@ -6,6 +6,7 @@
 - [Lazy evaluation and fusion](lazy.md)
 - [Views and writes](views.md)
 - [Reductions and scans](reductions.md)
+- [Matrices, statistics and grouping](data.md)
 - [Records](records.md)
 - [Loops](loops.md)
 - [Precision](precision.md)

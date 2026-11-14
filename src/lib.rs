@@ -52,6 +52,8 @@ mod guide {
     pub mod views {}
     #[doc = include_str!("../guide/src/reductions.md")]
     pub mod reductions {}
+    #[doc = include_str!("../guide/src/data.md")]
+    pub mod data {}
     #[doc = include_str!("../guide/src/records.md")]
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]

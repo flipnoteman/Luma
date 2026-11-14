@@ -231,6 +231,11 @@ assert_eq!(a.to_vec()?, vec![9.0, 0.0, 0.0, 0.0, 9.0, 0.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
+`put` overwrites: with equal indices one write wins. To accumulate instead, `put_add`, `put_min`
+and `put_max` (`u32`, `i32` and `f32` arrays) combine every value that lands on a cell, with the
+same index rules ([Accumulating scatters](data.md#accumulating-scatters)); `bincount` and the `group_*`
+methods are built on them.
+
 `take` and `put` are the gather and scatter pair; the [integer chapter](integers.md#lookup-tables-with-take)
 uses `take` for table lookups, and the ML-KEM example uses `put` for rejection sampling.
 
@@ -252,5 +257,7 @@ uses `take` for table lookups, and the ML-KEM example uses `put` for rejection s
   more computation costs less than storing it and reading it back, or staged; otherwise it is
   evaluated first.
 
-What does not fuse: `scan` and axis reductions ([Reductions](reductions.md)), and custom kernels,
-which see the arrays computed.
+What does not fuse: `scan` (it reads its operand twice, so the operand is computed first) and custom
+kernels, which see the arrays computed. The operands of `matmul`, of axis reductions and of
+`put_add` / `put_min` / `put_max` are read inside their own kernels
+([Performance guide](performance.md#what-fuses-and-what-cuts)).

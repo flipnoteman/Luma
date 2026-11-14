@@ -42,7 +42,47 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 | `f64` | 64-bit float, only on devices with `SHADER_F64` |
 
 `vec2` / `vec4` element types exist for custom kernels, and [records](records.md) group several
-arrays behind one struct. Convert between float types with `to_f64`, `to_df32` and `to_f32`:
+arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `Df32` and `f64`
+(the *scalar* types); what each type supports is listed in the chapters named in the table.
+
+### Masks
+
+A `Mask` is a boolean. Comparisons and `is_nan` / `is_finite` / `is_inf` produce `Array<Mask>`;
+you can also upload one from `Mask::TRUE` / `Mask::FALSE` (or `Mask::from(bool)`). On the host a
+mask reads back as `Mask`, and `bool::from` converts it. `item()` of a one-element mask (the
+result of `any()` and `all()`) reads one value. Masks have no arithmetic and no generators
+(`range`, `uniform`): they combine with `& | ^ !`, count with `count()`, steer `select`, and convert
+with `to_u32()` / `to_f32()` ([Comparisons, masks and `select`](integers.md#comparisons-masks-and-select)).
+
+```rust
+use luma::*;
+
+let m = Array::from_slice(&[Mask::TRUE, Mask::FALSE, Mask::from(true)], 3)?;
+assert_eq!(m.to_vec()?, vec![Mask::TRUE, Mask::FALSE, Mask::TRUE]);
+assert!(bool::from(m.to_vec()?[0]));
+assert_eq!(m.count().item()?, 2);                       // a `u32`
+assert_eq!(bool::from(m.any().item()?), true);
+assert_eq!(bool::from(m.all().item()?), false);
+assert_eq!(m.to_f32().to_vec()?, vec![1.0, 0.0, 1.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+### Casts
+
+Casts are methods named for the type they produce. They are lazy and fuse like any elementwise
+operation.
+
+| From | Methods | Rule |
+| --- | --- | --- |
+| `f32` | `to_u32`, `to_i32` | truncates toward zero, saturates, NaN becomes 0 ([values](integers.md#signed-integers-and-casts)) |
+| `u32` | `to_f32`, `to_i32` | `to_f32` rounds above 2^24; `to_i32` reinterprets the bits |
+| `i32` | `to_f32`, `to_u32` | `to_f32` rounds above 2^24; `to_u32` reinterprets the bits |
+| `Mask` | `to_u32`, `to_f32` | 1 where true, 0 where false |
+| `f32` | `to_f64`, `to_df32` | exact (`to_f64` needs `SHADER_F64`) |
+| `f64`, `Df32` | `to_f32`, `to_df32` / `to_f64` | rounds to `f32`; `f64` to `Df32` is exact to 48 bits |
+
+There is no cast to `Mask`: write a comparison (`x.ne(0u32)`). A cast pair not in the table does
+not exist, so a type mix-up is a compile error rather than a silent conversion.
 
 ```rust
 use luma::*;
@@ -51,6 +91,56 @@ let x = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
 let d = x.to_df32();                  // exact, `lo` is zero
 let back = (&d / &d).to_f32();
 assert_eq!(back.to_vec()?, vec![1.0, 1.0, 1.0]);
+
+let k = Array::from_slice(&[0u32, 1, 2], 3)?;
+assert_eq!((&x * k.to_f32()).to_vec()?, vec![0.0, 2.0, 6.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+## Elementwise operations
+
+Operators `+ - * /` (and `%` on integers, unary `-` on floats and `i32`) take references or
+values, arrays or scalars, and exist in compound forms (`+=`). Methods cover the rest; they are all
+lazy and fuse:
+
+| Type | Methods |
+| --- | --- |
+| `f32` | `sqrt`, `exp`, `ln`, `abs`, `sin`, `cos`, `tan`, `tanh`, `sign`, `floor`, `ceil`; `powf(exponent)`, `clamp(lo, hi)` (host scalars); `atan2(x)`, `hypot(other)`, `copysign(sign)` (array or scalar) |
+| `f64` | `sqrt`, `abs`, `sign`, `floor`, `ceil` |
+| `Df32` | `sqrt`, `abs`, `sign`, `floor`, `ceil` ([Precision](precision.md)) |
+| `i32` | `abs`, `sign`, `shl`, `shr` ([Signed integers](integers.md#signed-integers-and-casts)) |
+| `u32` | bit operations, `shl`, `shr`, `rotate_left`, `rotate_right` ([Integers](integers.md)) |
+| every scalar type | `minimum(rhs)`, `maximum(rhs)`, `lt` `le` `gt` `ge` `eq` `ne` (masks), `select(&mask, a, b)` |
+
+`atan2(x)` is `atan2(self, x)` with `self` the `y`. The right-hand side of `minimum`, the comparisons and the
+`try_` methods is an `Operand`: an array or reference to one (equal shapes, or extents of 1 that
+broadcast), a host value, or a [`Scalar`](lazy.md#scalars-that-change) handle.
+
+```rust
+use luma::*;
+
+let y = Array::from_slice(&[1.0f32, -1.0, 0.0], 3)?;
+assert_eq!(y.abs().sqrt().to_vec()?, vec![1.0, 1.0, 0.0]);
+assert_eq!(y.clamp(-0.5, 0.5).to_vec()?, vec![0.5, -0.5, 0.0]);
+assert_eq!(y.maximum(0.25).to_vec()?, vec![1.0, 0.25, 0.25]);
+assert_eq!(y.hypot(0.0).to_vec()?, vec![1.0, 1.0, 0.0]);
+assert_eq!(Array::from_slice(&[3.0f32], 1)?.copysign(&y.slice(0, 1..2)).to_vec()?, vec![-3.0]);
+assert!(y.powf(2.0).to_vec()?[1].is_nan());                  // a negative base has no real power
+assert!(y.sin().to_vec()?[0] > 0.84 && (y.atan2(1.0).to_vec()?[0] - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
+# Ok::<(), luma::LumaError>(())
+```
+
+Operators do not return `Result`s, so a mistake shows up late. `try_add`, `try_sub`, `try_mul` and
+`try_div` check at once: they return `Err` for a shape or context mismatch instead of a poisoned
+array ([Errors](#errors)).
+
+```rust
+use luma::*;
+
+let a = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
+let b = Array::from_slice(&[1.0f32, 2.0], 2)?;
+assert_eq!(a.try_add(&a)?.to_vec()?, vec![2.0, 4.0, 6.0]);
+assert!(a.try_add(&b).is_err());
 # Ok::<(), luma::LumaError>(())
 ```
 
@@ -102,6 +192,31 @@ let mut out = [0.0f32; 3];
 before.read_into(&mut out)?;
 assert_eq!(out, [10.0, 20.0, 30.0]);
 assert_eq!(x.to_vec()?, vec![7.0, 8.0, 9.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+## Convolution
+
+`x.conv1d(&kernel, stride, padding)` is a 1-D cross-correlation of an `f32` array with a kernel
+(the kernel is not flipped), with zero padding on both sides; the output has
+`(len - kernel_len + 2 * padding) / stride + 1` elements. `x.conv1d_fft(&kernel)` is the full
+*linear convolution* (the kernel is flipped), `len + kernel_len - 1` elements, computed with FFTs:
+use it for long kernels, where it is faster than the direct loop, and expect `f32` rounding error in
+its result. Both evaluate their operands and fail (poisoned array) for a bad geometry such as a
+kernel longer than the padded input or a zero stride.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0], 5)?;
+let k = Array::from_slice(&[1.0f32, 0.0, -1.0], 3)?;
+assert_eq!(x.conv1d(&k, 1, 0).to_vec()?, vec![-2.0, -2.0, -2.0]);       // x[i] - x[i + 2]
+assert_eq!(x.conv1d(&k, 2, 0).to_vec()?, vec![-2.0, -2.0]);
+assert_eq!(x.conv1d(&k, 1, 1).to_vec()?, vec![-2.0, -2.0, -2.0, -2.0, 4.0]);
+
+let full = x.conv1d_fft(&k).to_vec()?;                                  // k is flipped
+let want = [1.0f32, 2.0, 2.0, 2.0, 2.0, -4.0, -5.0];
+assert!(full.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4));
 # Ok::<(), luma::LumaError>(())
 ```
 

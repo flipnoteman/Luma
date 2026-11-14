@@ -8,7 +8,7 @@ on the GPU:
 | Primitive | Use |
 | --- | --- |
 | [`Array::iterate`](https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate) | `steps` applications of a step on one `f32` array; stencils run time-blocked |
-| [`iterate_all`](https://docs.rs/luma/latest/luma/fn.iterate_all.html) | `steps` applications of a step on several arrays of one element type; elementwise `f32` and `u32` steps keep the state in registers |
+| [`iterate_all`](https://docs.rs/luma/latest/luma/fn.iterate_all.html) | `steps` applications of a step on several arrays of one element type; elementwise `f32`, `u32` and `i32` steps keep the state in registers |
 | [`Array::iterate_until`](https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate_until) | a step until the largest change is below a tolerance |
 | [`iterate_until_all`](https://docs.rs/luma/latest/luma/fn.iterate_until_all.html) | a step on any [record](records.md) until a rule over recorded scalars holds |
 
@@ -78,7 +78,7 @@ assert_eq!(count.to_vec()?, vec![64.0, 64.0, 2.0, 3.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-The states may be `u32` as well, which makes register loops of integer recurrences, hash rounds
+The states may be `u32` or `i32` as well, which makes register loops of integer recurrences, hash rounds
 and counters (see [Integer and bit operations](integers.md)):
 
 ```rust
@@ -265,3 +265,55 @@ several steps. Values are those of the program as written; a miss only costs the
 work. `LUMA_SPECULATE=off` disables it ([Environment variables](environment.md)). If the loop
 only needs a convergence test, `iterate_until` and `iterate_until_all` wait once per block of
 steps instead of once per step.
+
+## Line solvers: `solve_tridiagonal`
+
+An implicit time step (diffusion, a pressure correction) solves one tridiagonal system per grid
+line. `solve_tridiagonal(axis, &lo, &diag, &up, &rhs)` solves
+`lo[s] x[s-1] + diag[s] x[s] + up[s] x[s+1] = rhs[s]` along `axis` for every line of four
+`f32` arrays of one shape (`lo` at the first and `up` at the last cell of a line are ignored); the
+result has the shape of `rhs`. It evaluates the operands and does not wait for the GPU. A zero
+pivot gives `Inf` / `NaN` in that line; Luma does not check. A shape or context mismatch poisons
+the result.
+
+```rust
+use luma::*;
+
+// Two lines of four cells along axis 0 (shape [4, 2]): the matrix tridiag(-1, 2, -1).
+let lo = Array::from_slice(&[0.0f32, -1.0, -1.0, -1.0, 0.0, -1.0, -1.0, -1.0], [4, 2])?;
+let diag = Array::full([4, 2], 2.0f32)?;
+let up = Array::from_slice(&[-1.0f32, -1.0, -1.0, 0.0, -1.0, -1.0, -1.0, 0.0], [4, 2])?;
+let rhs = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 5.0], [4, 2])?;
+
+let x = solve_tridiagonal(0, &lo, &diag, &up, &rhs).to_vec()?;
+let want = [1.0f32, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0];
+assert!(x.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5));
+
+// `_from`: line `l` starts at cell `start[l]`; the cells before it are 0.
+let start = Array::from_slice(&[0u32, 2], 2)?;
+let y = solve_tridiagonal_from(0, &lo, &diag, &up, &rhs, &start).to_vec()?;
+assert_eq!(&y[4..6], &[0.0, 0.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+`solve_block_tridiagonal(block, axis, &lo, &diag, &up, &rhs)` is the same with `block x block`
+blocks (`1 <= block <= 8`, partial pivoting), for coupled unknowns per cell. `rhs` has shape `[block, g0, g1, g2]`; `lo`, `diag` and `up` have
+`[block * block, g0, g1, g2]`, entry `(row, col)` of a block at `row * block + col`; `axis` is
+`1..=3`. `solve_block_tridiagonal_from` takes a `start` array like the scalar form.
+
+```rust
+use luma::*;
+
+// Block 2, three cells along axis 1, diagonal blocks 2 * identity, no coupling: x = rhs / 2.
+let zero = Array::<f32>::zeros([4, 3])?;
+let diag = Array::from_slice(&[2.0f32, 0.0, 0.0, 2.0].repeat(3), [4, 3])?;
+let rhs = Array::from_slice(&[2.0f32, 4.0, 6.0, 8.0, 10.0, 12.0], [2, 3])?;
+let x = solve_block_tridiagonal(2, 1, &zero, &diag, &zero, &rhs);
+assert_eq!(x.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+Which algorithm runs (one invocation per line, or one workgroup per line by cyclic reduction)
+is chosen automatically; `LUMA_TRIDIAGONAL` forces one
+([Environment variables](environment.md)). The cyclic one uses workgroup memory
+([FAQ](faq.md#radv-integrated-gpus-give-wrong-results)).

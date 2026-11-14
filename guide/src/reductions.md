@@ -140,7 +140,11 @@ assert_eq!(v.max()?, [3.0, 30.0]);
 ## Along an axis
 
 `sum_axis`, `min_axis` and `max_axis` reduce along one axis and leave extent 1 there. The result
-broadcasts back against the array:
+broadcasts back against the array. They are available for `f32`, `u32` and `i32` arrays. A
+pending operand is not evaluated first: its expression is computed inside the first pass of the
+reduction, so `(&x * &y).sum_axis(1)` never stores the product. `reduce_axis`, `mean_axis`,
+`var_axis` and `std_axis` are in [Matrices, statistics and
+grouping](data.md#statistics-along-an-axis).
 
 ```rust
 use luma::*;
@@ -172,61 +176,17 @@ assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec()?, vec![3.0, 3.0, 4.0, 4.0, 5.
 `op` is called once with placeholders and compiled into the scan kernels, so it must be an
 elementwise expression of its two arguments and scalars (scalars it captures are uniforms:
 changing them does not recompile); anything else poisons the result. Non-associative operators
-give unspecified results, because the kernels regroup operands. Scans and axis reductions do not
-fuse into the expression behind them: the arrays are evaluated first. They are available for
-`f32` and `u32` arrays only (`f64` and `Df32` fail with `Unsupported`).
+give unspecified results, because the kernels regroup operands. Scans do not fuse into the
+expression behind them: the array is evaluated first (it is read twice). Scans and axis
+reductions are available for `f32`, `u32` and `i32` arrays (`f64` and `Df32` fail with
+`Unsupported`); on `Mask` arrays `cumsum` and the sums along an axis fail with `Unsupported` (use
+`to_u32()`), `min_axis` and `max_axis` work.
 
-## Sorting
+## Sorting, groups, unique values and quantiles
 
-`sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis(axis)` order `u32`,
-`i32` and `f32` arrays with a stable radix sort on the GPU. `argsort` returns the flat indices
-that sort the array, so equal elements keep their input order. The results are recorded like any
-other operation; the input is evaluated first.
-
-```rust
-use luma::*;
-
-let x = Array::from_slice(&[3.0f32, -1.0, f32::NAN, 2.0, -1.0, 0.5], [3, 2])?;
-assert_eq!(x.argsort().to_vec()?, vec![1, 4, 5, 3, 0, 2]);
-// Sorts every line along axis 0 (the first dimension varies fastest).
-let lines = x.sort_axis(0).to_vec()?;
-assert_eq!(&lines[..2], &[-1.0, 3.0]);
-assert!(lines[2].is_nan());
-assert_eq!(&lines[3..], &[-1.0, 0.5, 2.0]);
-# Ok::<(), luma::LumaError>(())
-```
-
-Floats sort in the total order of their bits: `-inf < .. < -0.0 < +0.0 < .. < +inf < NaN`, so NaNs
-come last (first when descending) and `-0.0` sorts before `+0.0`.
-
-## Groups, unique values and quantiles
-
-`group_sum`, `group_min`, `group_max`, `group_mean` and `group_count` reduce the elements that
-share a code (a groupby over dense codes `0..groups`); codes of `groups` or more are skipped. The
-values and codes fuse into one scatter kernel. `factorize` finds the sorted distinct values and
-the code of every element (one host sync), `quantile` and `median` interpolate linearly in the
-sorted array like NumPy.
-
-```rust
-use luma::*;
-
-let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], 4)?;
-let codes = Array::from_slice(&[0u32, 1, 0, 1], 4)?;
-assert_eq!(x.group_sum(&codes, 2).to_vec()?, [4.0, 6.0]);
-assert_eq!(x.group_mean(&codes, 2).to_vec()?, [2.0, 3.0]);
-
-let (uniques, ids) = Array::from_slice(&[5u32, 3, 5, 9], 4)?.factorize();
-assert_eq!(uniques.to_vec()?, [3, 5, 9]);
-assert_eq!(ids.to_vec()?, [1, 0, 1, 2]);
-
-assert_eq!(x.median().item()?, 2.5);
-assert_eq!(x.quantile(0.25).item()?, 1.75);
-# Ok::<(), luma::LumaError>(())
-```
-
-Empty groups give 0 for sums and counts, NaN for means and the identity (`+inf` / `-inf`, the
-integer maximum / minimum) for `group_min` / `group_max`. NaNs sort last, so they only affect the
-high quantiles.
+`sort`, `argsort`, `group_sum` and the other group reductions, `factorize` / `unique`, `histogram`
+and `quantile` / `median` have their own chapter: [Matrices, statistics and
+grouping](data.md).
 
 ## Precision
 

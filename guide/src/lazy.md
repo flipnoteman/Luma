@@ -36,6 +36,31 @@ assert_eq!(x.to_vec()?, vec![2.0, 3.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
+## Scalars that change
+
+A number in an expression is a uniform of the kernel, not part of it, so `&x * 2.0` and
+`&x * 3.0` share one compiled kernel. A [`Scalar`](https://docs.rs/luma/latest/luma/struct.Scalar.html)
+is a number you can change between operations: `Scalar::new(v)`, `set(v)`, `get()`. It holds an
+`f32`, `u32` or `i32` and works wherever a plain number does. The value is read when the operation
+is **recorded**: operations recorded before a `set` keep the old value, also if they run later.
+Clones share the value.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, 2.0], 2)?;
+let s = Scalar::new(2.0f32);
+let a = &x * &s;                 // doubles
+s.set(3.0);
+let b = &x * &s;                 // triples; `a` still doubles
+assert_eq!(a.to_vec()?, vec![2.0, 4.0]);
+assert_eq!(b.to_vec()?, vec![3.0, 6.0]);
+assert_eq!(s.get(), 3.0);
+# Ok::<(), luma::LumaError>(())
+```
+
+This is how a loop varies a parameter (a time step, a coefficient) without recompiling.
+
 ## When kernels run
 
 A kernel runs when one of these happens:
@@ -80,8 +105,13 @@ reader's index, staged in workgroup memory, or evaluated first, whichever the
 [cost model](performance.md#the-cost-model) estimates is cheapest (within the caps below: a kernel
 that would exceed `LUMA_FUSION_MAX_INLINED` is cut whatever the model says).
 
-Not fused, because they need whole-array structure: `scan`, `sum_axis`, tridiagonal solves, FFT
-convolution, and your own kernels. They read the arrays they are given, which are computed first.
+Not fused, because they need whole-array structure: `scan`, tridiagonal solves, FFT convolution,
+and your own kernels. They read the arrays they are given, which are computed first.
+`matmul`, the axis reductions (`sum_axis`, `reduce_axis`, ...), the scatters (`put_add`, ...) and
+the sorts are kernels of their own too, but they compute a pending operand *inside* their loads
+instead of storing it, and `matmul`, the axis reductions and the sorts are eager: the result is
+evaluated when the call returns, so what reads it is another kernel
+([Performance guide](performance.md#primitives-that-read-an-expression)).
 
 An expression is cut into several kernels when it would grow past a limit (`LUMA_FUSION_MAX_NODES`,
 `LUMA_FUSION_MAX_LIVE`, `LUMA_FUSION_MAX_INLINED`) or when evaluating a shared piece first is

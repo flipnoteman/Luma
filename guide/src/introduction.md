@@ -6,7 +6,8 @@ on whatever hardware you have (Vulkan, Metal or DX12, through [wgpu](https://wgp
 opens it falls back to Mesa's llvmpipe software driver.
 
 It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
-solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels. You do not write
+solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
+products, group-bys, sorts and statistics of data-analysis tools. You do not write
 shaders, manage buffers or schedule submissions. When you need something Luma does not have, a
 [custom WGSL kernel](custom-kernels.md) runs in the same batch as the built-in operations.
 
@@ -62,8 +63,9 @@ Three things to notice:
 
 ## Where to go next
 
-- [Arrays](arrays.md): creation, element types, shapes, broadcasting, reading back.
+- [Arrays](arrays.md): creation, element types, casts, elementwise math, shapes, broadcasting, reading back.
 - [Lazy evaluation and fusion](lazy.md): when kernels run, `eval`, `flush`, `sync`, `cache`.
+- [Matrices, statistics and grouping](data.md): `matmul`, axis statistics, scatter-add, histograms, sort, group-by, quantiles.
 - [Worked examples](examples.md): heat equation, Euler solver, ML-KEM, CPA.
 - [Environment variables](environment.md) and the [FAQ](faq.md) when something does not behave.
 

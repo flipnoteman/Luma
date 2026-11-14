@@ -62,7 +62,8 @@ array of amounts costs a mask and a variable shift per element.
 ## Comparisons, masks and `select`
 
 Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) of any element type return `Array<Mask>`: a boolean
-per element, stored as a `u32` that is 0 or 1. Masks combine with `&`, `|` and `^`, and `!` negates
+per element, stored as a `u32` that is 0 or 1 ([how to make and read one](arrays.md#masks)).
+Masks combine with `&`, `|` and `^` (and the compound forms `&=`, `|=`, `^=`), and `!` negates
 them. `select(&mask, a, b)` takes `a` where the mask is true and `b` elsewhere, for any element
 type; `a` and `b` are arrays or scalars. `count()` is the number of true elements (a `u32`
 array), `any()` and `all()` are one-element masks; read a mask value with `item()` and
@@ -83,8 +84,19 @@ assert_eq!(clamped.to_vec()?, vec![3, 9, 10, 5]);
 // `count` counts the true elements; `sum_where` sums values under a mask.
 assert_eq!(in_range.count().item()?, 2);
 assert_eq!(x.sum_where(&in_range).item()?, 14);
+
+// `any` and `all` are one-element masks; `bool::from` reads them. `&=`, `|=`, `^=` work in place.
+assert!(bool::from(in_range.any().item()?));
+assert!(!bool::from(in_range.all().item()?));
+let mut flags = x.ge(4u32);
+flags &= &x.lt(10u32);
+assert_eq!(flags.to_u32().to_vec()?, vec![0, 1, 0, 1]);
 # Ok::<(), luma::LumaError>(())
 ```
+
+Comparisons with a NaN are the GPU's: `lt`, `le`, `gt`, `ge` and `eq` are false for a NaN operand,
+and `ne` was false too on every device the tests ran on (NVIDIA, llvmpipe), so `x.ne(&x)` is **not** a NaN test. Use
+`is_nan()` ([Precision](precision.md)).
 
 `u32` has no unary minus. To use a mask in float arithmetic write `mask.to_f32()` or
 `select(&mask, 1.0, 0.0)`; both fuse.
@@ -203,9 +215,11 @@ assert!(corr[best] > 0.999);
 # Ok::<(), luma::LumaError>(())
 ```
 
-The gathers and the elementwise arithmetic fuse, but `sum_axis` does not fuse its operand
-([Reductions](reductions.md#scans)): the arrays it reduces (`hc * tc`, ...) are computed into
-`[traces, 256]` buffers first. Wrap the analysis in `ctx.profile(..)` to see the kernels.
+The gathers and the elementwise arithmetic fuse, and `sum_axis` computes its operand inside its
+first pass ([What fuses](performance.md#what-fuses-and-what-cuts)): `hc * tc` is never stored.
+`h` and the centred columns are read by several reductions, so the
+[cost model](performance.md#the-cost-model) may still evaluate them into `[traces, 256]`
+buffers. Wrap the analysis in `ctx.profile(..)` to see the kernels.
 
 ## States in `iterate_all`
 

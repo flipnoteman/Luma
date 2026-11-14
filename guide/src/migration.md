@@ -1,6 +1,7 @@
 # Migration from 0.3
 
 0.4 changes the type of comparisons: they return masks (`Array<Mask>`) instead of `Array<u32>`.
+Everything else in 0.4 is added ([the list below](#new-in-04-that-you-may-want)).
 
 ## Comparisons return `Array<Mask>`
 
@@ -39,6 +40,18 @@ assert_eq!(select(&above, 1.0f32, 0.0).to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
 
 Sums of masks (`sum`, `cumsum`, `sum_axis`, `mean`) are not defined, since the result would no
 longer be a mask; `count()` is the sum of the true elements, `min` and `max` are `all` and `any`.
+
+## New in 0.4 that you may want
+
+- [`i32` arrays, casts and `Mask`](arrays.md#element-types) (`to_u32`, `to_i32`, `to_f32`; `count`,
+  `any`, `all`).
+- [`matmul`, axis statistics (`reduce_axis`, `mean_axis`, `var_axis`, `std_axis`), accumulating
+  scatters (`put_add`, `bincount`, `histogram`), sorting, group-by, `unique` and quantiles](data.md).
+  Axis reductions no longer evaluate a pending operand first
+  ([What fuses](performance.md#primitives-that-read-an-expression)).
+- Guide pages for [`Scalar`](lazy.md#scalars-that-change), [elementwise math](arrays.md#elementwise-operations),
+  [convolution](arrays.md#convolution) and the [tridiagonal solvers](loops.md#line-solvers-solve_tridiagonal),
+  which earlier releases already had.
 
 # Migration from 0.2
 

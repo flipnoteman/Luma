@@ -52,14 +52,15 @@ or use one context (the default one is shared by threads).
 ## RADV integrated GPUs give wrong results
 
 Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (`scan`, `cumsum`,
-axis reductions), workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
+axis reductions), `matmul`, sorts (and what builds on them), scatters into targets of up to 4096
+elements, workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
 cyclic solver is chosen automatically only on the NVIDIA tuning profile (a GPU detected as NVIDIA,
 or `LUMA_TUNING=nvidia`); elsewhere (and with `LUMA_TRIDIAGONAL=thomas`) the solver does not use it. If you see wrong results on such a GPU:
 
 - `LUMA_STAGING=off` keeps expressions read through views out of workgroup memory (the cost model
   then recomputes them or evaluates them first),
 - `LUMA_TRIDIAGONAL=thomas` pins the solver that does not use workgroup memory,
-- scans and axis reductions have no switch: run on another device (`LUMA_DEVICE=cpu`, or a
+- scans, axis reductions, `matmul`, sorts and scatters have no switch: run on another device (`LUMA_DEVICE=cpu`, or a
   different GPU through `VK_ICD_FILENAMES`).
 
 ## Results and errors
@@ -81,6 +82,53 @@ array, so use it for debugging only. For `f32`, `f64` and `Df32` arrays,
 **Out of memory.** Array data beyond the memory budget (80% of device memory on Vulkan GPUs)
 moves to host memory and back on demand, with a one-time warning. `LUMA_MEMORY_BUDGET` sets the
 budget. Custom kernels need arrays that fit one buffer (`LumaError::Chunked` otherwise).
+
+## Numbers
+
+**`put_add`, `group_sum` or `histogram` of `f32` gives slightly different sums on every run.**
+Equal indices are accumulated with atomics in no fixed order, and float addition is not
+associative, so the last bits of an `f32` sum differ between runs (and devices). Integer sums
+(`u32`, `i32`, `bincount`, `group_count`) are exact, and `put_min` / `put_max` do not depend on the
+order. If you need a reproducible float sum, scatter into integers (fixed point) or sort first and
+reduce ([Accumulating scatters](data.md#accumulating-scatters)).
+
+**Where do NaNs go in a sort or a quantile?** `sort`, `argsort` and `sort_axis` order floats as
+`-inf < .. < -0.0 < +0.0 < .. < +inf < NaN`: NaNs are last (first in the descending forms), and
+`-0.0` sorts before `+0.0`. A quantile is read from the sorted array, so a NaN in the data makes the
+high quantiles NaN and leaves the low ones alone; NumPy returns NaN for every quantile in that case.
+`factorize` and `unique` treat all NaNs as one value (the last) and `-0.0` and `0.0` as one. In
+`histogram` a NaN goes to bin 0.
+
+**`x.ne(&x)` does not find the NaNs.** Comparisons with a NaN are the GPU's. `lt`, `le`, `gt`,
+`ge` and `eq` give false for a NaN operand, and `ne` gave false as well on NVIDIA and on
+llvmpipe (the tests that ran), where IEEE says true. Use `x.is_nan()`, and `select(&x.is_nan(), a, b)`
+to replace them. `LUMA_FAST_MATH` additionally folds a comparison of an array with itself.
+
+**What does a float-to-integer cast give out of range?** `to_u32` and `to_i32` truncate toward
+zero and saturate at the largest `f32` inside the range, and NaN becomes 0:
+
+| Cast | Value | Result |
+| --- | --- | --- |
+| `to_u32` | negative, `-0.5`, NaN | 0 |
+| `to_u32` | `1e20`, `+inf` | `4294967040` |
+| `to_i32` | `-1e20`, `-inf` | `-2147483648` |
+| `to_i32` | `1e20`, `+inf` | `2147483520` |
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[-1.5f32, f32::NAN, 1e20, -1e20, f32::INFINITY], 5)?;
+assert_eq!(x.to_u32().to_vec()?, vec![0, 0, 4_294_967_040, 0, 4_294_967_040]);
+assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_520]);
+# Ok::<(), luma::LumaError>(())
+```
+
+**Integer division by zero** gives the dividend (`x / 0 == x`) and nothing fails; for `i32`,
+`x % 0` is 0 and `i32::MIN / -1` is `i32::MIN` ([Integers](integers.md#signed-integers-and-casts)).
+
+**Which matrix shape is `matmul`'s?** Axis 0 varies fastest, so the shapes are NumPy's
+`a @ b` reversed: `lhs` `[K, M]`, `rhs` `[N, K]`, result `[N, M]`
+([Matrix products](data.md#matrix-products)).
 
 ## Performance
 
