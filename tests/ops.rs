@@ -544,7 +544,8 @@ fn hypot_neither_overflows_nor_underflows() {
 
 #[test]
 fn tanh_saturates_to_plus_or_minus_one_on_large_inputs() {
-    let xs = [-f32::INFINITY, -1000.0, -44.0, 0.0, 44.0, 1000.0, f32::INFINITY];
+    let xs = [-f32::INFINITY, -1000.0, -44.0, 0.0, 44.0, 1000.0, f32::INFINITY, f32::NAN];
     let got = f32s(&xs).tanh().to_vec().unwrap();
-    assert_eq!(got, [-1.0, -1.0, -1.0, 0.0, 1.0, 1.0, 1.0]);
+    assert_eq!(&got[..7], &[-1.0, -1.0, -1.0, 0.0, 1.0, 1.0, 1.0]);
+    assert!(got[7].is_nan());
 }

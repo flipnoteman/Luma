@@ -98,7 +98,7 @@ impl UnOp {
             UnOp::Tan => "tan(x)",
             // Metal's `tanh` overflows `exp(2x)` to `Inf / Inf = 0` from `|x| >= 44`; for `f32`,
             // `tanh(+-15)` is already `+-1.0` to the last bit.
-            UnOp::Tanh => "tanh(clamp(x, -15.0, 15.0))",
+            UnOp::Tanh => "select(tanh(x), select(-1.0, 1.0, x > 0.0), abs(x) > 15.0)",
             UnOp::Sign => "sign(x)",
             UnOp::Floor => "floor(x)",
             UnOp::Ceil => "ceil(x)",
