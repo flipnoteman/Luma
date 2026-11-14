@@ -93,7 +93,10 @@ impl<T: ScalarType> Array<T> {
         self.src()?;
         if writable && self.is_read_view() {
             return Err(LumaError::InvalidShape(
-                "cannot take a mutable view of a read-only view; use slice_mut, flip_mut or transpose_mut on the array".into(),
+                "cannot take a mutable view of a read-only view: this array is a read-only view of another array; \
+                 use slice_mut, flip_mut or transpose_mut on the array that owns the data (a slice of a slice \
+                 is `owner.slice_mut(axis, range)` with the combined range)"
+                    .into(),
             )
             .into());
         }
@@ -241,7 +244,9 @@ impl<T: ScalarType> Array<T> {
     /// [`ViewMut`], which [`ViewMut::assign`] and the compound operators (`+=`, ...) write into
     /// this array. `w.slice_mut(1, ..1).assign(0.0)` zeros the first row of `w` for every array
     /// sharing its buffer. An invalid range, or a read-only array, poisons the view: its writes
-    /// fail.
+    /// fail. An array made by [`Array::slice`], [`Array::flip`] or [`Array::transpose`] is
+    /// read-only, so the view of a slice of `w` is taken on `w` with the combined range
+    /// (`w.slice_mut(0, 3..5)` for `w.slice(0, 2..).slice_mut(0, 1..3)`).
     #[track_caller]
     pub fn slice_mut(&mut self, axis: usize, range: impl RangeBounds<usize>) -> ViewMut<'_, Array<T>> {
         let inner = self.slice_at(axis, range, true, Location::caller());

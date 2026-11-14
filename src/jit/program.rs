@@ -184,11 +184,17 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
     match instr.op.kind {
         OpKind::Unary(op) => df && op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains("df_")),
         OpKind::Binary(op) => df && op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains("df_")),
-        OpKind::Compare(_) | OpKind::Clamp => df,
+        OpKind::Compare(_) | OpKind::Clamp | OpKind::Powf => df,
         OpKind::Cast(to) => df || to == ElemTy::Df32,
         OpKind::Classify(_) => true,
         _ => false,
     }
+}
+
+/// Whether the WGSL of `instr` calls a function of the double-float math library
+/// (`builtin::DF_MATH_LIBRARY`): `exp`, `ln`, `tanh` and `powf` of a `Df32`.
+pub(super) fn calls_df_math(instr: &Instr) -> bool {
+    instr.op.ty == ElemTy::Df32 && matches!(instr.op.kind, OpKind::Unary(UnOp::Exp | UnOp::Ln | UnOp::Tanh) | OpKind::Powf)
 }
 
 /// Whether `instr` reads the guard uniform: the arithmetic and the casts, whose error-free

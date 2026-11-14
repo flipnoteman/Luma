@@ -358,6 +358,10 @@ fn unary(a: &Arr, op: UnOp) -> Arr {
         (Arr::D(x), UnOp::Neg) => Arr::D(-x),
         (Arr::D(x), UnOp::Abs) => Arr::D(x.abs()),
         (Arr::D(x), UnOp::Sqrt) => Arr::D(x.sqrt()),
+        (Arr::D(x), UnOp::Exp) => Arr::D(x.exp()),
+        (Arr::D(x), UnOp::Ln) => Arr::D(x.ln()),
+        (Arr::D(x), UnOp::Tanh) => Arr::D(x.tanh()),
+        (Arr::D(x), UnOp::Powf(e)) => Arr::D(x.powf(Df32::from(e))),
         (Arr::D(x), UnOp::ToF32) => Arr::F(x.to_f32()),
         _ => panic!("{op:?} is not defined for {:?}", a.ty()),
     }

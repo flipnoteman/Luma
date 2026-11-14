@@ -885,8 +885,38 @@ wide_unary_methods! { i32;
 wide_unary_methods! { Df32;
     /// Elementwise square root (accurate to about 44 bits).
     sqrt => UnOp::Sqrt;
+    /// Elementwise `e^x`, accurate to about 44 bits; infinity above `88.72` and `0` below `-87.33`.
+    /// A result below `2^-126` (where the low word stops being a normal `f32`) is `0`.
+    exp => UnOp::Exp;
+    /// Elementwise natural logarithm, accurate to about 44 bits (relative to the result, also near
+    /// `1`); `-inf` at `0`, `NaN` below it.
+    ln => UnOp::Ln;
+    /// Elementwise hyperbolic tangent, accurate to about 44 bits (relative to the result, also
+    /// near `0`); `+-1` from `|x| > 20`.
+    tanh => UnOp::Tanh;
     /// Elementwise absolute value.
     abs => UnOp::Abs;
+}
+
+impl Array<Df32> {
+    /// Elementwise `x` raised to `exponent`, accurate to about 44 bits for results in the range of
+    /// `exp` and `|exponent * ln x|` up to a few hundred. `NaN` for a negative base, `1` for an
+    /// exponent of `0` (also of `NaN`), and as `pow` for a base of `0` or infinity.
+    #[track_caller]
+    pub fn powf(&self, exponent: Df32) -> Array<Df32> {
+        let location = Location::caller();
+        let result = self.src().and_then(|operand| {
+            lazy(
+                self.context(),
+                self.shape(),
+                Op::new(OpKind::Powf, ElemTy::Df32),
+                [operand, Src::Scalar(Scalar::of(exponent)?), Src::unused()],
+                "powf",
+                location,
+            )
+        });
+        Array::resolve(self.context(), self.shape(), result, "powf", location)
+    }
 }
 
 // -- Operators --

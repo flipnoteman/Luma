@@ -562,6 +562,31 @@ fn read_only_views_reject_writes() {
 }
 
 #[test]
+fn a_mutable_view_of_a_read_only_view_names_the_array_to_take_it_on() {
+    let ctx = Context::new().unwrap();
+    let owner = Array::<f32>::zeros_on(&ctx, [4, 4]).unwrap();
+    // A slice of a pending expression, as a consumer holds it, and of an evaluated array.
+    let lazy = (&owner + 1.0).slice(0, 1..);
+    let evaluated = owner.slice(0, 1..);
+    for mut read_only in [lazy, evaluated] {
+        let messages = [
+            read_only.slice_mut(0, ..2).assign(1.0).unwrap_err().to_string(),
+            read_only.flip_mut(0).assign(1.0).unwrap_err().to_string(),
+            read_only.transpose_mut().assign(1.0).unwrap_err().to_string(),
+        ];
+        for message in messages {
+            for phrase in ["read-only view of another array", "owns the data", "owner.slice_mut(axis, range)"] {
+                assert!(message.contains(phrase), "missing `{phrase}`: {message}");
+            }
+        }
+    }
+    // The fix the message names works.
+    let mut owner = owner;
+    owner.slice_mut(0, 1..3).assign(2.0).unwrap();
+    assert_eq!(owner.to_vec().unwrap().iter().filter(|&&v| v == 2.0).count(), 8);
+}
+
+#[test]
 fn the_error_of_a_poisoned_read_only_view_is_its_own() {
     let ctx = Context::new().unwrap();
     let a = Array::<f32>::zeros_on(&ctx, 4).unwrap();

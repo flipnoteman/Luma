@@ -18,13 +18,13 @@
 
 use std::fmt::Write;
 
-use crate::builtin::{class_operand, df_library, reduce_main, substitute, ReduceElem};
+use crate::builtin::{class_operand, df_library, reduce_main, substitute, ReduceElem, DF_MATH_LIBRARY};
 use crate::gpu::hash::FxMap;
 use crate::tuning::{Tuning, STENCIL_RADIUS};
 
 use super::inline::{Inlined, Lowered, Region, StagedPrograms};
 use super::params;
-use super::program::{calls_df_library, AtomicOp, FusedKey, Instr, Ref, Tail};
+use super::program::{calls_df_library, calls_df_math, AtomicOp, FusedKey, Instr, Ref, Tail};
 use super::staging::Staging;
 use super::stencil::{signed, wrap_source, WORKGROUP};
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -65,6 +65,7 @@ fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
         OpKind::Binary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b),
         OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
         OpKind::Classify(class) => substitute(class.expr(), &class_operand(ty, a), ""),
+        OpKind::Powf if ty == ElemTy::Df32 => format!("df_pow({a}, {b})"),
         OpKind::Powf => format!("pow({a}, {b})"),
         OpKind::Clamp if ty == ElemTy::Df32 => format!("df_min(df_max({a}, {b}), {c})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
@@ -242,9 +243,11 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
 /// guard, for the functions that never read it (ordering, minimum, maximum, absolute value).
 pub(super) fn library_for(key: &FusedKey, tuning: &Tuning) -> String {
     let library = |guard: &str| df_library(guard, tuning.df_fma, tuning.df_sloppy_add);
+    let instrs = || key.instrs.iter().chain(key.subs.iter().flatten());
+    let math = if instrs().any(calls_df_math) { DF_MATH_LIBRARY } else { "" };
     match key.guard {
-        Some(guard) => library(&format!("p.s{guard}")),
-        None if key.instrs.iter().chain(key.subs.iter().flatten()).any(calls_df_library) => library("0u"),
+        Some(guard) => library(&format!("p.s{guard}")) + math,
+        None if instrs().any(calls_df_library) => library("0u") + math,
         None => String::new(),
     }
 }

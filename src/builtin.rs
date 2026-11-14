@@ -180,6 +180,9 @@ impl UnOp {
                 UnOp::Neg => Some("-x"),
                 UnOp::Abs => Some("df_abs(x)"),
                 UnOp::Sqrt => Some("df_sqrt(x)"),
+                UnOp::Exp => Some("df_exp(x)"),
+                UnOp::Ln => Some("df_ln(x)"),
+                UnOp::Tanh => Some("df_tanh(x)"),
                 UnOp::Id => Some("x"),
                 _ => None,
             },
@@ -713,6 +716,127 @@ fn df_two_prod(a: f32, b: f32) -> vec2<f32> {
     )
     .replace("{G}", guard)
 }
+
+/// `exp`, `ln`, `tanh` and `pow` on `vec2<f32>` double-floats, on top of [`df_library`] (a kernel
+/// that calls them defines both; see `codegen::library_for`).
+///
+/// Every function is accurate to a relative 2^-43 (`tests/df32_library.rs` measures 4.3e-14 at
+/// most) for results of about `1e-25` and up. Below that the low word of a `Df32` is under the
+/// smallest normal `f32` and loses bits whatever the function; a result below `2^-126` is 0 and
+/// one above `f32::MAX` is infinity.
+///
+/// - `exp`: `x = k ln 2 + r`, `|r| <= ln 2 / 2`, with `ln 2` in three words (the first two of 16
+///   bits, so that `k` times them is exact). `e^r - 1` is a Taylor series of `r / 16` (the terms
+///   from the fourth power on in `f32`) squared four times as `(1 + p)^2 - 1 = 2p + p^2`, which
+///   keeps the relative accuracy of the small values; the result is scaled by `2^k`.
+/// - `ln`: `x = 2^e m`, `m` in `[1/sqrt 2, sqrt 2)`, and `ln m = 2 atanh((m - 1) / (m + 1))`, a
+///   series in `z^2`, `|z| <= 0.172`: the relative accuracy holds near `x = 1`.
+/// - `tanh`: `(e^{2|x|} - 1) / (e^{2|x|} + 1)` from the same `e^r - 1`, so small arguments keep
+///   their relative accuracy; `1` from `|x| > 20`.
+/// - `pow(x, y)` is `2^(y e) * exp(y ln m)` for `x = 2^e m` with `y e` split exactly into an
+///   integer and a fraction, so that the error does not grow with `y ln x` (it is that of an
+///   `exp` and an `ln` and a product of at most `y ln m`, `|ln m| <= 0.35`). `NaN` for a negative
+///   base, `x^0 = 1`, and the infinite and zero cases of IEEE `pow` for a base of 0 or infinity.
+pub(crate) const DF_MATH_LIBRARY: &str = "struct DfLog { e: f32, l: vec2<f32> }
+fn df_isnan(a: f32) -> bool { return (bitcast<u32>(a) & 0x7fffffffu) > 0x7f800000u; }
+fn df_inf() -> f32 { return bitcast<f32>(0x7f800000u); }
+fn df_scale(a: vec2<f32>, k: i32) -> vec2<f32> {
+    let k1 = k >> 1u; let k2 = k - k1;
+    let s1 = bitcast<f32>(u32(k1 + 127) << 23u); let s2 = bitcast<f32>(u32(k2 + 127) << 23u);
+    let t = vec2<f32>(luma_o(a.x * s1), luma_o(a.y * s1));
+    return vec2<f32>(luma_o(t.x * s2), luma_o(t.y * s2));
+}
+fn df_expm1_small(r: vec2<f32>) -> vec2<f32> {
+    let u = r * 0.0625;
+    let s = df_mul(u, u);
+    let h = u.x;
+    let c = 0.041666668 + h * (0.008333334 + h * (0.0013888889 + h * (0.00019841270 + h * 0.000024801587)));
+    let v = df_add(vec2<f32>(0.16666667, -4.9670539e-9), vec2<f32>(h * c, 0.0));
+    let w = df_add(vec2<f32>(0.5, 0.0), df_mul(u, v));
+    var p = df_add(u, df_mul(s, w));
+    for (var i = 0; i < 4; i++) { p = df_add(p * 2.0, df_mul(p, p)); }
+    return p;
+}
+fn df_exp_reduce(x: vec2<f32>, k: f32) -> vec2<f32> {
+    let a = df_two_sum(x.x - k * 0.693145752, x.y);
+    return df_add(a, df_two_sum(-(k * 1.42861973e-6), -(k * -1.29053200e-11)));
+}
+fn df_exp_scaled(x: vec2<f32>, extra: f32) -> vec2<f32> {
+    let k = round(x.x * 1.44269502);
+    let e = df_add(vec2<f32>(1.0, 0.0), df_expm1_small(df_exp_reduce(x, k)));
+    let v = df_scale(e, i32(clamp(k + extra, -250.0, 250.0)));
+    if (v.x < 1.17549435e-38) { return vec2<f32>(0.0, 0.0); }
+    if (v.x > 3.40282347e38) { return vec2<f32>(df_inf(), 0.0); }
+    return v;
+}
+fn df_exp(x: vec2<f32>) -> vec2<f32> {
+    if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
+    if (x.x > 88.722) { return vec2<f32>(df_inf(), 0.0); }
+    if (x.x < -87.33) { return vec2<f32>(0.0, 0.0); }
+    return df_exp_scaled(x, 0.0);
+}
+fn df_log_split(a: vec2<f32>) -> DfLog {
+    let small = a.x < 1.17549435e-38;
+    let x = select(a, a * 1.84467441e19, small);
+    let bits = bitcast<u32>(x.x);
+    let big = bitcast<f32>((bits & 0x007fffffu) | 0x3f800000u) > 1.41421354;
+    let e = i32(bits >> 23u) - 127 + select(0, 1, big);
+    let m = df_scale(x, -e);
+    let z = df_div(df_add(m, vec2<f32>(-1.0, 0.0)), df_add(m, vec2<f32>(1.0, 0.0)));
+    let w = df_mul(z, z);
+    let h = w.x;
+    let c = 0.11111111 + h * (0.09090909 + h * (0.07692308 + h * (0.06666667 + h * (0.05882353 + h * 0.05263158))));
+    let q7 = df_add(vec2<f32>(0.14285715, -6.3862120e-9), vec2<f32>(h * c, 0.0));
+    let q5 = df_add(vec2<f32>(0.2, -2.9802323e-9), df_mul(w, q7));
+    let q3 = df_add(vec2<f32>(0.33333334, -9.9341078e-9), df_mul(w, q5));
+    let q1 = df_add(vec2<f32>(1.0, 0.0), df_mul(w, q3));
+    return DfLog(f32(e - select(0, 64, small)), df_mul(z, q1) * 2.0);
+}
+fn df_ln(x: vec2<f32>) -> vec2<f32> {
+    if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
+    if (x.x < 0.0) { return vec2<f32>(bitcast<f32>(0x7fc00000u), 0.0); }
+    if (x.x == 0.0) { return vec2<f32>(-df_inf(), 0.0); }
+    if (x.x > 3.40282347e38) { return vec2<f32>(x.x, 0.0); }
+    let s = df_log_split(x);
+    return df_add(df_mul(vec2<f32>(s.e, 0.0), vec2<f32>(0.693147182, -1.90465421e-9)), s.l);
+}
+fn df_tanh(x: vec2<f32>) -> vec2<f32> {
+    if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
+    let neg = (bitcast<u32>(x.x) >> 31u) != 0u;
+    let a = select(x, -x, neg);
+    if (a.x > 20.0) { return select(vec2<f32>(1.0, 0.0), vec2<f32>(-1.0, 0.0), neg); }
+    let z = a * 2.0;
+    let k = round(z.x * 1.44269502);
+    let p = df_expm1_small(df_exp_reduce(z, k));
+    var t = p;
+    if (k != 0.0) { t = df_add(df_scale(df_add(vec2<f32>(1.0, 0.0), p), i32(k)), vec2<f32>(-1.0, 0.0)); }
+    let th = df_div(t, df_add(t, vec2<f32>(2.0, 0.0)));
+    return select(th, -th, neg);
+}
+fn df_pow(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> {
+    let nan = vec2<f32>(bitcast<f32>(0x7fc00000u), 0.0);
+    if (y.x == 0.0) { return vec2<f32>(1.0, 0.0); }
+    if (df_isnan(x.x) | df_isnan(y.x) | (x.x < 0.0)) { return nan; }
+    let zero = vec2<f32>(0.0, 0.0);
+    let inf = vec2<f32>(df_inf(), 0.0);
+    if (abs(y.x) > 1.0e30) {
+        if ((x.x == 1.0) & (x.y == 0.0)) { return vec2<f32>(1.0, 0.0); }
+        let grows = (x.x > 1.0) | ((x.x == 1.0) & (x.y > 0.0));
+        return select(zero, inf, grows == (y.x > 0.0));
+    }
+    if (x.x == 0.0) { return select(inf, zero, y.x > 0.0); }
+    if (x.x > 3.40282347e38) { return select(zero, inf, y.x > 0.0); }
+    let s = df_log_split(x);
+    let a = df_two_prod(y.x, s.e);
+    let b = df_two_prod(y.y, s.e);
+    if (abs(a.x) > 400.0) { return select(zero, inf, a.x > 0.0); }
+    let n = round(a.x);
+    let f = df_add(df_two_sum(a.x - n, b.x), df_two_sum(a.y, b.y));
+    let arg = df_add(df_mul(f, vec2<f32>(0.693147182, -1.90465421e-9)), df_mul(y, s.l));
+    if (abs(arg.x) > 100.0) { return select(zero, inf, n * 0.693147182 + arg.x > 0.0); }
+    return df_exp_scaled(arg, n);
+}
+";
 
 /// `c(..)` over `values`, combined pairwise so float sums keep their accuracy.
 fn pairwise(c: &str, values: &[String]) -> String {

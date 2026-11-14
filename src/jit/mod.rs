@@ -1545,8 +1545,8 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 }
 
 /// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
-/// no transcendental functions (and needs a device with 64-bit shader floats), `Df32` only the
-/// operations of its library, and neither has generators or `powf`; the bitwise operations only
+/// no transcendental functions or `powf` (and needs a device with 64-bit shader floats), `Df32`
+/// only the operations of its library, and neither has generators; the bitwise operations only
 /// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
 /// no float math. Masks have no generators (their values would not be 0 or 1).
 fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(), LumaError> {
@@ -1556,7 +1556,7 @@ fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(),
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
         OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
         OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Mask),
-        OpKind::Powf => !wide,
+        OpKind::Powf => op.ty != ElemTy::F64,
         // A mask holds only 0 or 1, which no ramp or counter keeps.
         OpKind::Generate(_) => !wide && op.ty != ElemTy::Mask,
     };

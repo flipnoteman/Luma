@@ -421,7 +421,7 @@ fn bin_valid(ty: Ty, op: BinOp) -> bool {
 fn un_valid(ty: Ty, op: UnOp) -> bool {
     match ty {
         Ty::F32 => !matches!(op, UnOp::Not | UnOp::ToF32),
-        Ty::Df32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::ToF32),
+        Ty::Df32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Exp | UnOp::Ln | UnOp::Tanh | UnOp::Powf(_) | UnOp::ToF32),
         Ty::U32 => matches!(op, UnOp::Not | UnOp::ToF32 | UnOp::ToI32),
         Ty::I32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Not | UnOp::ToF32 | UnOp::ToU32),
         Ty::Mask => matches!(op, UnOp::Not | UnOp::ToU32 | UnOp::ToF32),
@@ -665,12 +665,12 @@ fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
             Info { lsb: 0, lo: a.lo.trunc().clamp(lo, hi), hi: a.hi.trunc().clamp(lo, hi), exact: true, err: 0.0 }
         }
         UnOp::Sqrt if math && a.lo >= 0.0 => inexact(a.lo.sqrt(), a.hi.sqrt()),
-        UnOp::Exp if math && ty == Ty::F32 && a.hi <= 11.0 => inexact(a.lo.exp(), a.hi.exp()),
-        UnOp::Ln if math && ty == Ty::F32 && a.lo >= 0.05 => inexact(a.lo.ln(), a.hi.ln()),
+        UnOp::Exp if math && matches!(ty, Ty::F32 | Ty::Df32) && a.hi <= 11.0 => inexact(a.lo.exp(), a.hi.exp()),
+        UnOp::Ln if math && matches!(ty, Ty::F32 | Ty::Df32) && a.lo >= 0.05 => inexact(a.lo.ln(), a.hi.ln()),
         UnOp::Sin | UnOp::Cos if math && ty == Ty::F32 && a.mag() <= 100.0 => inexact(-1.0, 1.0),
         UnOp::Tan if math && ty == Ty::F32 && a.mag() <= 1.2 => inexact(a.lo.tan(), a.hi.tan()),
-        UnOp::Tanh if math && ty == Ty::F32 => inexact(a.lo.tanh(), a.hi.tanh()),
-        UnOp::Powf(e) if math && ty == Ty::F32 && a.lo >= 0.25 => {
+        UnOp::Tanh if math && matches!(ty, Ty::F32 | Ty::Df32) => inexact(a.lo.tanh(), a.hi.tanh()),
+        UnOp::Powf(e) if math && matches!(ty, Ty::F32 | Ty::Df32) && a.lo >= 0.25 => {
             let (x, y) = (a.lo.powf(f64::from(e)), a.hi.powf(f64::from(e)));
             inexact(x.min(y), x.max(y))
         }
@@ -1352,11 +1352,15 @@ impl Builder {
         } else if ty == Ty::Mask {
             self.tape.pick(&[UnOp::Not, UnOp::ToU32, UnOp::ToF32])
         } else if ty == Ty::Df32 {
-            match self.tape.below(5) {
+            match self.tape.below(if self.math { 9 } else { 5 }) {
                 0 => UnOp::Neg,
                 1 => UnOp::Abs,
                 2 if self.math => UnOp::Sqrt,
                 3 | 4 => UnOp::ToF32,
+                5 => UnOp::Exp,
+                6 => UnOp::Ln,
+                7 => UnOp::Tanh,
+                8 => UnOp::Powf(self.tape.pick(&[-1.5f32, -0.5, 0.5, 1.5, 2.5, 3.0])),
                 _ => UnOp::Neg,
             }
         } else if self.math {

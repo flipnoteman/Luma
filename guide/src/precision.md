@@ -67,10 +67,36 @@ assert!((f64::from(tiny) - ((1.0 + 1e-12) - 1.0)).abs() < 1e-18);
 ```
 
 `Array<Df32>` has `+ - * /`, `sqrt`, `abs`, comparisons, `minimum`, `maximum`, `select`, views,
-`assign`, and reductions (`sum`, `min`, `max`; `item()` gives a `Df32`). It has no `exp` or
-trigonometry: cast to `f32` and back around such a call. Scalars may be `Df32` values;
-a Rust `f32` literal in a `Df32` expression is not converted for you (write `Df32::from(1.0f32)`
-or build the array with `to_df32()`).
+`assign`, and reductions (`sum`, `min`, `max`; `item()` gives a `Df32`). It also has `exp`, `ln`,
+`tanh` and `powf` (below). It has no trigonometry: cast to `f32` and back around such a call.
+Scalars may be `Df32` values; a Rust `f32` literal in a `Df32` expression is not converted for you
+(write `Df32::from(1.0f32)` or build the array with `to_df32()`).
+
+**Functions.** `exp`, `ln`, `tanh` and `powf(Df32)` are built from `Df32` arithmetic and fuse like
+it. Their relative error is below `2^-43` (`1e-13`; at most `4.3e-14` measured against `f64` on the
+RTX 3090 and on llvmpipe): `exp` on `[-55, 80]`, `ln` from `1e-24` to `1e30` (and near 1, where the
+error is relative to the result), `tanh` on `[-30, 30]` (also near 0), and `x^1.5` or `x^0.7` for
+`x` in `[1, 3000]`. `powf` splits the exponent of `x` exactly, so its error does not grow with
+`y ln x`. Where a `Df32` is below about `1e-25` its low word is under the smallest normal `f32`
+and loses bits, which limits every function there: `exp` of an argument under `-55` has a relative
+error of about `1e-38` over the result, and a result below `2^-126` is `0`. Out of range `exp` is
+infinity above `88.72` and `0` below `-87.33`, `tanh` is `+-1` from `|x| > 20`, and `ln` and `powf`
+follow `f32` (`ln(0)` is `-inf`, `ln` and `powf` of a negative base are `NaN`, `x^0` is `1`, zero
+and infinite bases give the `pow` results). `f64` arrays have none of these functions.
+
+```rust
+use luma::*;
+
+let t = Array::from_slice(&[Df32::from(300.0), Df32::from(2000.0)], 2)?;
+// Sutherland-type T^1.5 and an SST blending function, kept in Df32.
+let power = t.powf(Df32::from(1.5)).to_vec()?;
+assert!((power[0].to_f64() / 300f64.powf(1.5) - 1.0).abs() < 1e-13);
+let blend = (&t * Df32::from(0.001)).tanh().to_vec()?;
+assert!((blend[1].to_f64() / 2f64.tanh() - 1.0).abs() < 1e-13);
+let back = (t.ln()).exp().to_vec()?;
+assert!((back[1].to_f64() / 2000.0 - 1.0).abs() < 1e-13);
+# Ok::<(), luma::LumaError>(())
+```
 
 **Cost.** One `Df32` add or multiply costs `df32_factor` `f32` operations: 27 on the RTX 3090
 and 44 on the integrated GPU the model was measured on, 2.3 on llvmpipe. The

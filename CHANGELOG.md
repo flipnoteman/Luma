@@ -25,6 +25,10 @@ All notable changes to Luma are listed here. The format follows
 - `Array<i32>`: `+ - * / %` (wrapping; `x / 0` is `x`, `i32::MIN / -1` is `i32::MIN`, `x % 0` is
   0), unary minus, `abs`, `sign`, `& | ^ !`, arithmetic `<< >>`, `minimum` / `maximum`,
   comparisons, `select`, views, reductions, scans and loops; `i32` scalars and `luma::Scalar<i32>`.
+- `Array<Df32>::exp`, `ln`, `tanh` and `powf(Df32)`: lazy, fused like the other `Df32` operations,
+  relative error below `1e-13` (at most `4.3e-14` measured) for `exp` on `[-55, 80]`, `ln` from
+  `1e-24` to `1e30` and near 1, `tanh` on `[-30, 30]` and `powf` of `x` in `[1, 3000]` or
+  `[1e-6, 1e6]` with exponents `-0.5..3`. `f64` arrays still have none of them.
 - Casts between `f32`, `u32` and `i32`: `to_f32` (from `u32`, `i32`), `to_u32` (from `f32`,
   `i32`), `to_i32` (from `f32`, `u32`). Float to integer truncates toward zero and saturates
   (`u32` at `4294967040`, `i32` at `-2147483648..=2147483520`); NaN becomes 0. `u32` and `i32`
@@ -60,6 +64,9 @@ All notable changes to Luma are listed here. The format follows
 
 - `sum_axis`, `min_axis` and `max_axis` no longer evaluate a pending operand first: its expression
   is computed inside the first pass of the reduction (scans still evaluate it).
+- The error of `slice_mut`, `flip_mut` or `transpose_mut` on a read-only view (an array made by
+  `slice`, `flip` or `transpose`) says that the array is a view of another one and that the
+  mutable view is taken on the array that owns the data, with the combined range.
 
 ### Removed
 
