@@ -405,11 +405,12 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     let wg = tuning.elementwise_workgroup;
     let reduce = matches!(key.tail, Tail::Reduce(_));
     let matmul = matches!(key.tail, Tail::Matmul { .. });
+    let axis = matches!(key.tail, Tail::AxisReduce(_));
     let segmented = !key.spans.is_empty();
     let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
     // A product reads its operands at their own element indices: nothing is relative to a segment.
-    let based = generates(key) && !segmented && !matmul;
-    let uniform = reduce || matmul || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
+    let based = generates(key) && !segmented && !matmul && !axis;
+    let uniform = reduce || matmul || axis || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
     let mut src = String::new();
 
     if uniform {
@@ -419,6 +420,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         }
         if matmul {
             src.push_str("m: u32, n: u32, k: u32, kc: u32, ");
+        }
+        if axis {
+            src.push_str(crate::scan::AXIS_PARAMS);
         }
         if segmented {
             src.push_str("base: u32, total: u32, ");
@@ -445,6 +449,15 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
         // The roots are the operands, read by `luma_lhs` / `luma_rhs`; the output is `c`.
         Tail::Matmul { .. } => Vec::new(),
+        // The roots are the cells of the pass, read by `luma_eval`; the outputs are its own.
+        Tail::AxisReduce(_) => Vec::new(),
+    };
+    let axis_outputs = match key.tail {
+        Tail::AxisReduce(pass) => {
+            src.push_str(&pass.output_bindings(out_ty(key.instrs.len().saturating_sub(1))));
+            pass.outputs()
+        }
+        _ => 0,
     };
     if matmul {
         src.push_str("@group(1) @binding(0) var<storage, read_write> c: array<f32>;\n");
@@ -454,7 +467,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         let name = if reduce { "out".to_owned() } else { format!("out{j}") };
         let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{}>;", out_ty(at));
     }
-    let mut binding = outputs.len() + usize::from(matmul);
+    let mut binding = outputs.len() + usize::from(matmul) + axis_outputs;
     for (k, ty) in key.input_tys.iter().enumerate() {
         if key.in_place.iter().any(|&(paired, _)| paired == k as u32) {
             continue;
@@ -623,6 +636,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
             let names = Names { views: &views, in_place: &[] };
             src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
             src.push_str(&reduce_main(elem, ops, false, "luma_eval", tuning));
+        }
+        Tail::AxisReduce(pass) => {
+            let names = Names { views: &views, in_place: &[] };
+            let last = key.instrs.len().saturating_sub(1);
+            src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
+            src.push_str(&crate::scan::reduce_body(pass, out_ty(last), "luma_eval", wg));
         }
         Tail::Matmul { tile, aligned, split, lhs, rhs } => {
             let names = Names { views: &views, in_place: &[] };

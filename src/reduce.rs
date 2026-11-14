@@ -284,7 +284,7 @@ pub enum Reduction {
 }
 
 impl Reduction {
-    fn op(self) -> ReduceOp {
+    pub(crate) fn op(self) -> ReduceOp {
         match self {
             Reduction::Sum => ReduceOp::Sum,
             Reduction::Min => ReduceOp::Min,

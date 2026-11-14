@@ -13,6 +13,14 @@ All notable changes to Luma are listed here. The format follows
   writes, reductions and scans, records, loops, precision, integer and bit operations, custom
   kernels, a performance guide and worked examples (heat equation, Euler solver, ML-KEM, Keccak,
   CPA). Its code blocks are tested as doctests.
+- `Array::reduce_axis` (up to four of sum, min, max and sum of squares along an axis in one pass
+  over the data) and, for `f32`, `mean_axis`, `var_axis` (population variance, two-pass) and
+  `std_axis`.
+
+### Changed
+
+- `sum_axis`, `min_axis` and `max_axis` no longer evaluate a pending operand first: its expression
+  is computed inside the first pass of the reduction (scans still evaluate it).
 
 ### Removed
 

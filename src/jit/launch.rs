@@ -480,7 +480,7 @@ fn out_elems(key: &FusedKey) -> Vec<u64> {
     match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.iter().map(|&at| bytes(at)).collect(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
-        Tail::Reduce(_) => vec![key.instrs.len().checked_sub(1).map_or(4, |at| bytes(at as u32))],
+        Tail::Reduce(_) | Tail::AxisReduce(_) => vec![key.instrs.len().checked_sub(1).map_or(4, |at| bytes(at as u32))],
     }
 }
 
@@ -615,7 +615,7 @@ fn spans(
 
     let outputs = match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.len(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } | Tail::Reduce(_) => 1,
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } | Tail::Reduce(_) | Tail::AxisReduce(_) => 1,
     };
     let direct = (0..input_count)
         .filter(|&k| !key.in_place.iter().any(|&(paired, _)| paired as usize == k) && direct(&key.instrs, k as u32))
@@ -1223,4 +1223,41 @@ pub(crate) fn matmul(
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, groups, size, &raw)?;
     Ok(())
+}
+
+/// Runs the reducing pass `pass` over the cells of the expression behind `node`, computed
+/// inside the kernel (the program becomes the load `luma_eval(q)`, see `scan::reduce_body`):
+/// `geometry` are the first fields of the uniform (the scalars of the expression follow),
+/// `outs` the buffers it writes. Returns `false`, having launched nothing, when the expression
+/// cannot be fused (see [`fusable`]); the caller then reduces its evaluated buffer.
+pub(crate) fn axis_reduce(
+    ctx: &crate::context::Context,
+    node: &Arc<Node>,
+    pass: crate::scan::AxisPass,
+    geometry: [u32; 5],
+    workgroups: [u32; 3],
+    size: [u32; 3],
+    outs: &[RawArg<'_>],
+) -> Result<bool, Failure> {
+    let Some(args) = node.operands() else { return Ok(false) };
+    let (fused, args) = flatten_bounded(node, args, Tail::AxisReduce(pass))?;
+    drop(args);
+    if !fusable(ctx, &fused, outs.len()) {
+        return Ok(false);
+    }
+    fused.mark_fused();
+    let Fused { mut key, inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
+    drop((fused_nodes, instr_nodes, sub_roots));
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+    let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
+    let mut uniform = Vec::with_capacity(geometry.len() + scalars.len());
+    uniform.extend_from_slice(&geometry);
+    uniform.extend_from_slice(&scalars);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + 1);
+    raw.extend_from_slice(outs);
+    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
+    ctx.launch(&core, workgroups, size, &raw)?;
+    ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
 }

@@ -349,6 +349,85 @@ fn sanity_axis(b: &mut Bench) {
     });
 }
 
+/// `axis/sum_sq` and `axis/var` on `[64, 2^22]` against the hand-written strided-axis kernels,
+/// both sides verified against host f64 reductions first.
+fn bench_axis(b: &mut Bench) {
+    b.guarded("axis/", |b| {
+        let ctx = b.ctx.clone();
+        let cols = 64usize;
+        let rows = if b.quick { 1usize << 16 } else { 1 << 22 };
+        let size = format!("[{cols},{rows}]");
+        let hx = values(cols * rows, 50, 2.0, 4.0);
+        let hw = values(cols, 51, 0.5, 1.5);
+        let x = Array::from_slice_on(&ctx, &hx, [cols, rows]).unwrap();
+        let w = Array::from_slice_on(&ctx, &hw, [cols, 1]).unwrap();
+        let (mut s, mut q, mut m, mut v) = (vec![0.0f64; cols], vec![0.0f64; cols], vec![0.0f64; cols], vec![0.0f64; cols]);
+        for r in 0..rows {
+            for c in 0..cols {
+                let y = (hx[c + cols * r] * hw[c]) as f64;
+                s[c] += y;
+                q[c] += y * y;
+                m[c] += hx[c + cols * r] as f64;
+            }
+        }
+        m.iter_mut().for_each(|t| *t /= rows as f64);
+        for r in 0..rows {
+            for c in 0..cols {
+                v[c] += (hx[c + cols * r] as f64 - m[c]).powi(2);
+            }
+        }
+        let want_s: Vec<f32> = s.iter().map(|&t| t as f32).collect();
+        let want_q: Vec<f32> = q.iter().map(|&t| t as f32).collect();
+        let want_sq: Vec<f32> = want_s.iter().chain(&want_q).copied().collect();
+        let want_var: Vec<f32> = v.iter().map(|&t| (t / rows as f64) as f32).collect();
+
+        let hand_sumsq = hand::HandAxisSumSq::new(&ctx).unwrap();
+        let mut out2 = Array::<f32>::zeros_on(&ctx, 2 * cols).unwrap();
+        let luma_sumsq = || {
+            let [sum, squares] = (&x * &w).reduce_axis(1, [Reduction::Sum, Reduction::SumOfSquares]);
+            sum.eval().unwrap();
+            squares.eval().unwrap();
+            (sum, squares)
+        };
+        let (sum, squares) = luma_sumsq();
+        check("axis/sum_sq luma sum", &sum.to_vec().unwrap(), &want_s, 1e-4, 1e-4);
+        check("axis/sum_sq luma squares", &squares.to_vec().unwrap(), &want_q, 1e-4, 1e-4);
+        hand_sumsq.run(&x, &w, &mut out2, cols, rows);
+        check("axis/sum_sq hand", &out2.to_vec().unwrap(), &want_sq, 1e-4, 1e-4);
+        b.compare(
+            "axis/sum_sq",
+            &size,
+            Work::Bytes(4.0 * (cols * rows) as f64),
+            Some(DEFAULT_GATE),
+            &mut || {
+                luma_sumsq();
+            },
+            &mut || hand_sumsq.run(&x, &w, &mut out2, cols, rows),
+        );
+
+        let hand_var = hand::HandAxisVar::new(&ctx).unwrap();
+        let mut out1 = Array::<f32>::zeros_on(&ctx, cols).unwrap();
+        let luma_var = || {
+            let var = x.var_axis(1);
+            var.eval().unwrap();
+            var
+        };
+        check("axis/var luma", &luma_var().to_vec().unwrap(), &want_var, 1e-4, 1e-6);
+        hand_var.run(&x, &mut out1, cols, rows);
+        check("axis/var hand", &out1.to_vec().unwrap(), &want_var, 1e-4, 1e-6);
+        b.compare(
+            "axis/var",
+            &size,
+            Work::Bytes(8.0 * (cols * rows) as f64),
+            Some(DEFAULT_GATE),
+            &mut || {
+                luma_var();
+            },
+            &mut || hand_var.run(&x, &mut out1, cols, rows),
+        );
+    });
+}
+
 /// Checks the privatised histogram (256 and 4096 bins) exactly against the host bucket function,
 /// inputs covering below `lo`, above `hi` and NaN, then times it over `2^26` values.
 fn sanity_hist(b: &mut Bench) {
@@ -518,6 +597,7 @@ fn main() {
     sanity_sgemm(&mut b);
     sanity_gram(&mut b);
     sanity_axis(&mut b);
+    bench_axis(&mut b);
     sanity_hist(&mut b);
     sanity_scatter(&mut b);
     sanity_group_sum(&mut b);
