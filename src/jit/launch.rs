@@ -479,7 +479,7 @@ fn out_elems(key: &FusedKey) -> Vec<u64> {
     let bytes = |at: u32| key.instrs.get(at as usize).map_or(4, |instr| instr.op.out_ty().bytes());
     match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.iter().map(|&at| bytes(at)).collect(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().checked_sub(1).map_or(4, |at| bytes(at as u32))],
     }
 }
@@ -615,7 +615,7 @@ fn spans(
 
     let outputs = match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.len(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } | Tail::Reduce(_) => 1,
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } | Tail::Reduce(_) => 1,
     };
     let direct = (0..input_count)
         .filter(|&k| !key.in_place.iter().any(|&(paired, _)| paired as usize == k) && direct(&key.instrs, k as u32))
@@ -919,7 +919,7 @@ pub(super) fn mapped_bindings(inputs: &[Arc<Storage>], bases: &[Arc<Storage>]) -
     bases.len() + inputs.iter().filter(|input| !bases.iter().any(|base| Arc::ptr_eq(base, input))).count()
 }
 
-/// Runs the program `fused` (tail [`Tail::StoreMapped`] or [`Tail::Scatter`]) over `n` elements,
+/// Runs the program `fused` (tail [`Tail::StoreMapped`], [`Tail::Scatter`] or [`Tail::ScatterAdd`]) over `n` elements,
 /// writing into the buffers of `bases` (output `j` is `bases[j]`): one launch, counted as an
 /// elementwise launch. An input that is one of the bases is read from that buffer, before the
 /// invocation overwrites it; every other input must fit one buffer. The caller has made sure no
@@ -957,7 +957,16 @@ pub(super) fn run_mapped(
     if !words.is_empty() {
         raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
     }
-    launch_1d(ctx, &core, n, &raw)?;
+    match key.tail {
+        // Few workgroups, each striding over the elements, so that merging the private copies is cheap.
+        // The merge of f32 (a compare-and-exchange loop) serialises on contended words: fewer groups.
+        Tail::ScatterAdd { len, private: true, .. } => {
+            let float = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).is_some_and(|instr| instr.op.out_ty() == ElemTy::F32);
+            let cap = if float { 256 } else { 1024 };
+            ctx.launch(&core, fold_workgroups(ctx, (n / (4 * len.max(1))).clamp(1, cap))?, [n, 1, 1], &raw)?
+        }
+        _ => launch_1d(ctx, &core, n, &raw)?,
+    }
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }

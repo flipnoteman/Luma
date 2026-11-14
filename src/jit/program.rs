@@ -73,6 +73,14 @@ impl std::hash::Hash for Instr {
     }
 }
 
+/// How [`Tail::ScatterAdd`] combines a value with the element it lands on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum AtomicOp {
+    Add,
+    Min,
+    Max,
+}
+
 /// What happens to the values the program computes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Tail {
@@ -90,6 +98,11 @@ pub(crate) enum Tail {
     /// buffer holds interleaved in blocks of `block` elements: element `i` of part `k` goes to
     /// `(i / block) * total * block + k * block + i % block` (see `jit::stack`).
     Stack { total: u32, first: u32, block: u32 },
+    /// [`Tail::Scatter`] that combines instead of overwriting: element `i` applies `op`
+    /// atomically to element `index` of the one bound buffer (`Array::put_add` and its kin). With
+    /// `private`, every workgroup first accumulates into workgroup memory (the target is small
+    /// next to the number of elements) and merges it into the buffer once.
+    ScatterAdd { len: u32, op: AtomicOp, private: bool },
     /// [`Tail::StoreMapped`] with the numbers of the view in the uniform (see `params`).
     ParamStoreMapped { id: u16, spec: ViewSpec },
     /// [`Tail::Scatter`] with `len` in uniform slot `len_slot`.
@@ -254,6 +267,7 @@ impl FusedKey {
             Tail::Store => format!("Fused({names}) {ty}"),
             Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => format!("FusedAssign({names}) {ty}"),
             Tail::Scatter { .. } | Tail::ParamScatter { .. } => format!("FusedPut({names}) {ty}"),
+            Tail::ScatterAdd { op, .. } => format!("FusedPut{op:?}({names}) {ty}"),
             Tail::Stack { .. } => format!("FusedStack({names}) {ty}"),
             Tail::Matmul { .. } => format!("FusedMatmul({names}) {ty}"),
             Tail::Reduce(ops) => {
@@ -1939,7 +1953,7 @@ pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<
     if let Some(&at) = key.outputs.iter().find(|&&at| at as usize >= key.instrs.len()) {
         return Err(format!("output {at} of {} instructions", key.instrs.len()));
     }
-    if matches!(key.tail, Tail::Scatter { .. }) && key.outputs.len() != 2 {
+    if matches!(key.tail, Tail::Scatter { .. } | Tail::ScatterAdd { .. }) && key.outputs.len() != 2 {
         return Err(format!("a scatter has {} outputs, not 2", key.outputs.len()));
     }
     if let Tail::Stack { total, first, block } = key.tail

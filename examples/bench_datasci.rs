@@ -29,7 +29,6 @@ use std::time::Instant;
 static PANIC: Mutex<String> = Mutex::new(String::new());
 
 /// Default `--gate` threshold on `luma GPU time / hand GPU time`.
-#[allow(dead_code)]
 const DEFAULT_GATE: f64 = 1.05;
 /// Warm-up runs before timing.
 const WARMUPS: usize = 2;
@@ -187,7 +186,6 @@ fn check(name: &str, got: &[f32], want: &[f32], rel: f32, abs: f32) {
     }
 }
 
-#[allow(dead_code)]
 fn check_exact<T: PartialEq + Debug>(name: &str, got: &[T], want: &[T]) {
     assert_eq!(got.len(), want.len(), "{name}: length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -207,7 +205,6 @@ fn values(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
 }
 
 /// `n` pseudo-random codes in `0..modulo`.
-#[allow(dead_code)]
 fn codes(n: usize, seed: u64, modulo: u32) -> Vec<u32> {
     let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     (0..n)
@@ -349,20 +346,20 @@ fn sanity_axis(b: &mut Bench) {
     });
 }
 
-/// Checks the privatised histogram (256 and 4096 bins) exactly against the host bucket function,
-/// inputs covering below `lo`, above `hi` and NaN, then times it over `2^26` values.
-fn sanity_hist(b: &mut Bench) {
-    b.guarded("hand/hist", |b| {
-        let ctx = b.ctx.clone();
-        let n = if b.quick { 1usize << 20 } else { 1 << 26 };
-        let (lo, hi) = (0.0f32, 1.0f32);
-        let mut hx = values(n, 50, -0.25, 1.25);
-        for i in (0..n).step_by(100_003) {
-            hx[i] = f32::NAN;
-        }
-        let x = Array::from_slice_on(&ctx, &hx, n).unwrap();
-        let zero = hand::HandZero::new(&ctx).unwrap();
-        for bins in [256usize, 4096] {
+/// `x.histogram(bins, lo, hi)` against the privatised workgroup-atomic hand histogram over `2^26`
+/// values (below `lo`, above `hi` and NaN included). Both sides are verified exactly against the
+/// host bucket function first.
+fn case_hist(b: &mut Bench) {
+    for bins in [256usize, 4096] {
+        b.guarded(&format!("hist/{bins}"), |b| {
+            let ctx = b.ctx.clone();
+            let n = if b.quick { 1usize << 20 } else { 1 << 26 };
+            let (lo, hi) = (0.0f32, 1.0f32);
+            let mut hx = values(n, 50, -0.25, 1.25);
+            for i in (0..n).step_by(100_003) {
+                hx[i] = f32::NAN;
+            }
+            let x = Array::from_slice_on(&ctx, &hx, n).unwrap();
             let scale = bins as f32 / (hi - lo);
             let mut want = vec![0u32; bins];
             for &v in &hx {
@@ -370,17 +367,29 @@ fn sanity_hist(b: &mut Bench) {
                 let u = if t.is_nan() { 0 } else { t.clamp(0.0, 4294967040.0) as u32 };
                 want[u.min(bins as u32 - 1) as usize] += 1;
             }
+            let zero = hand::HandZero::new(&ctx).unwrap();
             let hist = hand::HandHist::new(&ctx, bins).unwrap();
             let mut out = Array::<u32>::zeros_on(&ctx, bins).unwrap();
+
+            let h = x.histogram(bins, lo, hi);
+            h.eval().unwrap();
+            check_exact(&format!("hist/{bins} luma"), &h.to_vec().unwrap(), &want);
             hist.run(&x, &mut out, n, lo, scale);
-            check_exact(&format!("hand/hist{bins}"), &out.to_vec().unwrap(), &want);
-            report_hand(b, &format!("hand/hist{bins} n={n}"), 4.0 * n as f64, &mut || {
-                zero.run(&mut out, bins);
-                hist.run(&x, &mut out, n, lo, scale);
-            });
-        }
-        println!("hand hist ok");
-    });
+            check_exact(&format!("hist/{bins} hand"), &out.to_vec().unwrap(), &want);
+
+            b.compare(
+                &format!("hist/{bins}"),
+                &n.to_string(),
+                Work::Bytes(4.0 * n as f64),
+                Some(DEFAULT_GATE),
+                &mut || x.histogram(bins, lo, hi).eval().unwrap(),
+                &mut || {
+                    zero.run(&mut out, bins);
+                    hist.run(&x, &mut out, n, lo, scale);
+                },
+            );
+        });
+    }
 }
 
 /// Host f64 scatter-add of `val` by `idx` (indices `>= len` skipped) and the per-bin `sum |v|`.
@@ -404,10 +413,10 @@ fn check_sums(name: &str, got: &[f32], sum: &[f64], mag: &[f64]) {
     }
 }
 
-/// Checks the hand-written CAS scatter-add (with out-of-range indices) against host f64 sums and
-/// times it for `2^24` pairs into `2^20` bins.
-fn sanity_scatter(b: &mut Bench) {
-    b.guarded("hand/scatter_add", |b| {
+/// `put_add` of `2^24` `f32` values into `2^20` bins (a few indices out of range) against the hand
+/// global CAS-loop kernel. Both sides are verified against host f64 sums first.
+fn case_scatter_add(b: &mut Bench) {
+    b.guarded("scatter_add/f32", |b| {
         let ctx = b.ctx.clone();
         let n = if b.quick { 1usize << 18 } else { 1 << 24 };
         let len = if b.quick { 1usize << 14 } else { 1 << 20 };
@@ -419,13 +428,29 @@ fn sanity_scatter(b: &mut Bench) {
         let zero = hand::HandZero::new(&ctx).unwrap();
         let hand = hand::HandScatterAddF32::new(&ctx).unwrap();
         let mut out = Array::<f32>::zeros_on(&ctx, len).unwrap();
+
+        let mut t = Array::<f32>::zeros_on(&ctx, len).unwrap();
+        t.put_add(&idx, &val).unwrap();
+        t.eval().unwrap();
+        check_sums("scatter_add/f32 luma", &t.to_vec().unwrap(), &sum, &mag);
         hand.run(&idx, &val, &mut out, n, len);
-        check_sums("hand/scatter_add", &out.to_vec().unwrap(), &sum, &mag);
-        println!("hand scatter_add ok");
-        report_hand(b, &format!("hand/scatter_add n={n} len={len}"), 8.0 * n as f64, &mut || {
-            zero.run(&mut out, len);
-            hand.run(&idx, &val, &mut out, n, len);
-        });
+        check_sums("scatter_add/f32 hand", &out.to_vec().unwrap(), &sum, &mag);
+
+        b.compare(
+            "scatter_add/f32",
+            &format!("{n}->{len}"),
+            Work::Bytes(8.0 * n as f64),
+            Some(DEFAULT_GATE),
+            &mut || {
+                let mut t = Array::<f32>::zeros_on(&ctx, len).unwrap();
+                t.put_add(&idx, &val).unwrap();
+                t.eval().unwrap();
+            },
+            &mut || {
+                zero.run(&mut out, len);
+                hand.run(&idx, &val, &mut out, n, len);
+            },
+        );
     });
 }
 
@@ -645,8 +670,8 @@ fn main() {
     sanity_sgemm(&mut b);
     sanity_gram(&mut b);
     sanity_axis(&mut b);
-    sanity_hist(&mut b);
-    sanity_scatter(&mut b);
+    case_hist(&mut b);
+    case_scatter_add(&mut b);
     sanity_group_sum(&mut b);
     cmp_matmul(&mut b);
     cmp_gram(&mut b);
