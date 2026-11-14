@@ -132,7 +132,7 @@ completely. To keep the extra bits, reduce a `Df32` array yourself: `x.to_df32()
 
 ## Non-finite values
 
-`f32`, `f64` and `Df32` arrays have lazy `u32` masks `is_finite()`, `is_nan()` and `is_inf()`.
+`f32`, `f64` and `Df32` arrays have lazy `Mask` arrays `is_finite()`, `is_nan()` and `is_inf()`.
 They test the bits of the exponent, so they do not depend on how the device compares NaN (a shader
 compiler may assume NaN does not exist and fold `x != x`). They fuse like any elementwise
 operation:
@@ -141,9 +141,9 @@ operation:
 use luma::*;
 
 let x = Array::from_slice(&[1.0f32, f32::INFINITY, f32::NAN, -2.0], 4)?;
-assert_eq!(x.is_finite().to_vec()?, vec![1, 0, 0, 1]);
-assert_eq!(x.is_nan().to_vec()?, vec![0, 0, 1, 0]);
-assert_eq!(x.is_inf().to_vec()?, vec![0, 1, 0, 0]);
+assert_eq!(x.is_finite().to_u32().to_vec()?, vec![1, 0, 0, 1]);
+assert_eq!(x.is_nan().to_u32().to_vec()?, vec![0, 0, 1, 0]);
+assert_eq!(x.is_inf().to_u32().to_vec()?, vec![0, 1, 0, 0]);
 
 // Sanitise in one fused kernel.
 let clean = select(&x.is_finite(), &x, 0.0);

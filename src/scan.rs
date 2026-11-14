@@ -568,10 +568,15 @@ impl<T: ScalarType> Array<T> {
         axis: usize,
         op: &ScanOp<'_, T>,
         reduce: bool,
+        mask_ok: bool,
         name: &'static str,
         location: &'static Location<'static>,
     ) -> Array<T> {
-        let result = self.run_lines(axis, op, reduce);
+        let result = if !mask_ok && ElemTy::try_of::<T>() == Some(ElemTy::Mask) {
+            Err(mask_sum_error(name))
+        } else {
+            self.run_lines(axis, op, reduce)
+        };
         let mut shape = self.shape().dims();
         if reduce && axis < 4 {
             shape[axis] = 1;
@@ -595,32 +600,37 @@ impl<T: ScalarType> Array<T> {
     /// recompile.
     #[track_caller]
     pub fn scan(&self, axis: usize, op: impl Fn(&Array<T>, &Array<T>) -> Array<T>) -> Array<T> {
-        self.lines(axis, &op, false, "scan", Location::caller())
+        self.lines(axis, &op, false, false, "scan", Location::caller())
     }
 
     /// The running sum along `axis` (a [`scan`](Array::scan) with `+`).
     #[track_caller]
     pub fn cumsum(&self, axis: usize) -> Array<T> {
-        self.lines(axis, &add, false, "cumsum", Location::caller())
+        self.lines(axis, &add, false, false, "cumsum", Location::caller())
     }
 
     /// The sum along `axis`; the result has extent 1 along it.
     #[track_caller]
     pub fn sum_axis(&self, axis: usize) -> Array<T> {
-        self.lines(axis, &add, true, "sum_axis", Location::caller())
+        self.lines(axis, &add, true, false, "sum_axis", Location::caller())
     }
 
     /// The minimum along `axis`; the result has extent 1 along it.
     #[track_caller]
     pub fn min_axis(&self, axis: usize) -> Array<T> {
-        self.lines(axis, &|x: &Array<T>, y: &Array<T>| x.binary(Rhs::Array(y), BinOp::Min, false, "minimum"), true, "min_axis", Location::caller())
+        self.lines(axis, &|x: &Array<T>, y: &Array<T>| x.binary(Rhs::Array(y), BinOp::Min, false, "minimum"), true, true, "min_axis", Location::caller())
     }
 
     /// The maximum along `axis`; the result has extent 1 along it.
     #[track_caller]
     pub fn max_axis(&self, axis: usize) -> Array<T> {
-        self.lines(axis, &|x: &Array<T>, y: &Array<T>| x.binary(Rhs::Array(y), BinOp::Max, false, "maximum"), true, "max_axis", Location::caller())
+        self.lines(axis, &|x: &Array<T>, y: &Array<T>| x.binary(Rhs::Array(y), BinOp::Max, false, "maximum"), true, true, "max_axis", Location::caller())
     }
+}
+
+/// The failure of an operation that would leave the values 0 and 1 on a [`crate::Mask`] array.
+pub(crate) fn mask_sum_error(name: &str) -> Failure {
+    LumaError::Unsupported(format!("{name} on Mask arrays; use count/any/all or to_u32")).into()
 }
 
 fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {

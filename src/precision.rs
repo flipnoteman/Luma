@@ -11,7 +11,7 @@
 use std::panic::Location;
 
 use crate::array::Array;
-use crate::gpu_type::{Df32, ScalarType};
+use crate::gpu_type::{Df32, Mask, ScalarType};
 use crate::jit::{ElemTy, Op, OpKind, Src};
 use crate::ops::{lazy, Outcome};
 
@@ -66,6 +66,13 @@ casts! { i32 =>
     to_f32 -> f32;
     /// The elements as `u32`: a two's-complement reinterpretation of the bits.
     to_u32 -> u32;
+}
+
+casts! { Mask =>
+    /// The elements as `u32`: 1 where true, 0 where false.
+    to_u32 -> u32;
+    /// The elements as `f32`: 1.0 where true, 0.0 where false.
+    to_f32 -> f32;
 }
 
 casts! { f64 =>

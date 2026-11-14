@@ -30,7 +30,7 @@ fn const_bits(ty: ElemTy, value: f64) -> u64 {
     match ty {
         ElemTy::F32 | ElemTy::Df32 => u64::from((value as f32).to_bits()),
         ElemTy::F64 => value.to_bits(),
-        ElemTy::U32 => u64::from(value as u32),
+        ElemTy::U32 | ElemTy::Mask => u64::from(value as u32),
         ElemTy::I32 => u64::from(value as i32 as u32),
     }
 }
@@ -109,6 +109,8 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
             let (sa, sb) = (scalar(a), scalar(b));
             let float = is_float(ty);
             let u32s = matches!(ty, ElemTy::U32 | ElemTy::I32);
+            // All bits set: `-1` for `i32` (a larger constant saturates to `i32::MAX`).
+            let all_ones = if ty == ElemTy::I32 { -1.0 } else { f64::from(u32::MAX) };
             match bin {
                 BinOp::Mul => {
                     if is_value(sb, ty, 1.0) {
@@ -143,8 +145,8 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
                 BinOp::BitXor if same(a, b) => constant(op, 0.0),
                 BinOp::BitOr | BinOp::BitAnd if same(a, b) => identity(op, a),
                 BinOp::BitAnd if is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0) => constant(op, 0.0),
-                BinOp::BitAnd if is_value(sb, ty, f64::from(u32::MAX)) => identity(op, a),
-                BinOp::BitAnd if is_value(sa, ty, f64::from(u32::MAX)) => identity(op, b),
+                BinOp::BitAnd if is_value(sb, ty, all_ones) => identity(op, a),
+                BinOp::BitAnd if is_value(sa, ty, all_ones) => identity(op, b),
                 // The amount is taken modulo 32: a multiple of 32 moves nothing.
                 BinOp::Shl | BinOp::Shr | BinOp::Rotl if sb.is_some_and(|s| s.ty == ty && s.bits & 31 == 0) => identity(op, a),
                 _ => None,
@@ -330,6 +332,10 @@ mod tests {
         array.to_vec().unwrap()
     }
 
+    fn compared(array: &Array<crate::Mask>) -> Vec<u32> {
+        array.to_u32().to_vec().unwrap()
+    }
+
     /// Evaluates `case` on `x` and `y` (pending `* 2` of the data, which keeps `-0.0`); returns
     /// the result bits and the length of the program of the last kernel.
     fn run(ctx: &Context, simplify: bool, data: (&[f32], &[f32]), case: FloatCase) -> (Vec<u32>, usize) {
@@ -364,8 +370,8 @@ mod tests {
                 let m = c.lt(0.5);
                 host(&select(&m, b, b))
             }),
-            ("lt same", true, |b, _| mask(&b.lt(b))),
-            ("gt same", true, |b, _| mask(&b.gt(b))),
+            ("lt same", true, |b, _| compared(&b.lt(b))),
+            ("gt same", true, |b, _| compared(&b.gt(b))),
             ("through df32", true, |b, _| host(&b.to_df32().to_f32())),
         ]
     }
@@ -508,8 +514,8 @@ mod tests {
             ("mul zero", true, |b, _| host(&(b * 0.0)), |b, _| host(&(b - b))),
             ("sub same", true, |b, _| host(&(b - b)), |b, _| host(&(b * 0.0 + 0.0))),
             ("div same", true, |b, _| host(&(b / b)), |b, _| host(&(b * 0.0 + 1.0))),
-            ("le same", true, |b, _| mask(&b.le(b)), |b, _| mask(&b.ge(b))),
-            ("ne same", true, |b, _| mask(&b.ne(b)), |b, _| mask(&b.lt(b))),
+            ("le same", true, |b, _| compared(&b.le(b)), |b, _| compared(&b.ge(b))),
+            ("ne same", true, |b, _| compared(&b.ne(b)), |b, _| compared(&b.lt(b))),
             ("mul chain", true, |b, _| host(&(&(b * 3.0) * 0.5)), |b, _| host(&(b * 1.5))),
             ("add chain", true, |b, _| host(&(&(b + 1.0) + 2.0)), |b, _| host(&(b + 3.0))),
             ("sub then add", true, |b, _| host(&(&(b - 1.0) + 3.0)), |b, _| host(&(b + 2.0))),

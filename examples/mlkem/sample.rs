@@ -36,7 +36,7 @@ pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
         let v = if shift > 20 { low | (&w[a + 1] << (32 - shift as u32)) } else { low };
         v & 0xFFFu32
     };
-    let accepted: Vec<Array<u32>> = (0..PER_GROUP).map(|c| field(c).lt(Q)).collect();
+    let accepted: Vec<Array<u32>> = (0..PER_GROUP).map(|c| field(c).lt(Q).to_u32()).collect();
     // The accepted candidates before candidate `c` of the group, three bits each for c = 1..8.
     let mut before = accepted[0].clone();
     let mut packed_before: Option<Array<u32>> = None;
@@ -77,9 +77,9 @@ pub fn sample_ntt(words: &Array<u32>) -> (Array<u32>, Array<u32>) {
     let value = (low | select(&shift.gt(20u32), &high, 0u32)) & 0xFFFu32;
     let packed = info.take(&(&row + &g * rows as u32));
     let before_in_group = (packed.clone() >> (&c * 3u32 + 6u32)) & 7u32;
-    let slot = (&packed & 0x1FFu32) + before_in_group * c.gt(0u32);
+    let slot = (&packed & 0x1FFu32) + before_in_group * c.gt(0u32).to_u32();
     // Rejected candidates and the ones past slot 255 go beyond the array.
-    let valid = value.lt(Q) * slot.lt(256u32);
+    let valid = value.lt(Q) & slot.lt(256u32);
     let index = select(&valid, &(&slot + &row * 256u32), rows as u32 * 256);
     let mut polynomials = Array::<u32>::zeros_on(ctx, [256, rows]).expect("polynomials");
     polynomials.put(&index, &value).expect("scatter");

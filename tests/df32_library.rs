@@ -131,11 +131,11 @@ fn ordering_and_absolute_values_follow_the_value_not_the_words() {
     let y = Array::from_slice_on(&ctx, &[data[1], data[0], data[2], data[3], data[5], data[4], data[7], data[6]], data.len()).unwrap();
     let value = |d: Df32| d.to_f64();
     let want = |f: fn(f64, f64) -> bool| -> Vec<u32> { (0..data.len()).map(|i| u32::from(f(value(data[i]), value([data[1], data[0], data[2], data[3], data[5], data[4], data[7], data[6]][i])))).collect() };
-    assert_eq!(x.lt(&y).to_vec().unwrap(), want(|a, b| a < b));
-    assert_eq!(x.le(&y).to_vec().unwrap(), want(|a, b| a <= b));
-    assert_eq!(x.gt(&y).to_vec().unwrap(), want(|a, b| a > b));
-    assert_eq!(x.ge(&y).to_vec().unwrap(), want(|a, b| a >= b));
-    assert_eq!(x.eq(&y).to_vec().unwrap(), want(|a, b| a == b));
+    assert_eq!(x.lt(&y).to_u32().to_vec().unwrap(), want(|a, b| a < b));
+    assert_eq!(x.le(&y).to_u32().to_vec().unwrap(), want(|a, b| a <= b));
+    assert_eq!(x.gt(&y).to_u32().to_vec().unwrap(), want(|a, b| a > b));
+    assert_eq!(x.ge(&y).to_u32().to_vec().unwrap(), want(|a, b| a >= b));
+    assert_eq!(x.eq(&y).to_u32().to_vec().unwrap(), want(|a, b| a == b));
     let low = x.minimum(&y).to_vec().unwrap();
     let high = x.maximum(&y).to_vec().unwrap();
     let abs = x.abs().to_vec().unwrap();
