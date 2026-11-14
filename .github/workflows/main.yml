@@ -38,8 +38,6 @@ jobs:
         id: auth
 
       - name: Publish
-        run: |
-          cargo publish --locked -p luma-derive
-          cargo publish --locked -p luma
+        run: cargo publish --locked -p luma
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

@@ -11,20 +11,22 @@ const GAMMA: f32 = 1.4;
 const NI: usize = 16;
 const NJ: usize = 12;
 
-#[derive(Fields)]
-struct Cons {
-    rho: Array<f32>,
-    mu: Array<f32>,
-    mv: Array<f32>,
-    e: Array<f32>,
+luma::fields! {
+    struct Cons {
+        rho: Array<f32>,
+        mu: Array<f32>,
+        mv: Array<f32>,
+        e: Array<f32>,
+    }
 }
 
-#[derive(Fields)]
-struct Prim {
-    rho: Array<f32>,
-    u: Array<f32>,
-    v: Array<f32>,
-    p: Array<f32>,
+luma::fields! {
+    struct Prim {
+        rho: Array<f32>,
+        u: Array<f32>,
+        v: Array<f32>,
+        p: Array<f32>,
+    }
 }
 
 fn prim(q: &Cons) -> Prim {

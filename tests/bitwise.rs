@@ -153,16 +153,19 @@ fn bitwise_operations_are_fused_into_one_kernel() {
 
 // -- u32 records and loops --
 
-#[derive(Fields)]
-struct State {
-    lanes: [Array<u32>; 4],
-    carry: Array<u32>,
+luma::fields! {
+    #[elem = u32]
+    struct State {
+        lanes: [Array<u32>; 4],
+        carry: Array<u32>,
+    }
 }
 
-#[derive(Fields)]
-struct Pair {
-    a: Array<u32>,
-    b: Array<u32>,
+luma::fields! {
+    struct Pair {
+        a: Array<u32>,
+        b: Array<u32>,
+    }
 }
 
 #[test]

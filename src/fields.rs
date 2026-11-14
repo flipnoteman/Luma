@@ -1,6 +1,6 @@
 //! Records of arrays: a struct of arrays of one element type (the conserved state of a flow
 //! solver, a gradient) that is sliced, padded, assigned and combined with arithmetic as one
-//! value. Implement it with `#[derive(luma::Fields)]` on a struct whose fields are `Array<T>`
+//! value. Declare one with [`fields!`](crate::fields!) for a struct whose fields are `Array<T>`
 //! of one element type `T` or other records of that type.
 
 use std::borrow::Borrow;
@@ -18,7 +18,7 @@ use crate::ops::{eval_all, select_at, Rhs};
 use crate::shape::{Offsets, Shape};
 use crate::view::{finish, PadMode, ViewMut};
 
-/// The operator of a record operation (an implementation detail of `#[derive(Fields)]`).
+/// The operator of a record operation (an implementation detail of `fields!`).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub enum FieldOp {
@@ -43,18 +43,19 @@ impl FieldOp {
 /// of a flow solver, a gradient, ...
 ///
 /// Implemented by `Array<T>` (one field), `[F; N]` and tuples of up to six records, and by
-/// every struct with `#[derive(Fields)]` (`luma::Fields` also names the derive macro). All
+/// every struct declared with [`fields!`](crate::fields!). All
 /// the arrays of a record have the same element type [`Fields::Elem`]: `f32` for the usual
 /// state, [`Df32`](crate::Df32) or `f64` for one that needs more precision, `u32` for integer
 /// state (the lanes of a hash function: a record of `u32` arrays is the state of
 /// [`iterate_all`](crate::iterate_all), and has no unary `-`).
 ///
 /// ```ignore
-/// #[derive(luma::Fields)]
-/// struct Cons { rho: Array<f32>, mu: Array<f32>, mv: Array<f32>, e: Array<f32> }
+/// luma::fields! {
+///     struct Cons { rho: Array<f32>, mu: Array<f32>, mv: Array<f32>, e: Array<f32> }
+/// }
 /// ```
 ///
-/// The derive infers the element type from the fields (which must agree) and also provides
+/// The macro infers the element type from the first field (the others must agree; see [`fields!`](crate::fields!)) and also provides
 /// `+ - * /` between records, with an element value (`f32` here) and with an `Array<Elem>`
 /// (applied to every field), `+= -= *= /=` and unary `-`. Every method applies the array
 /// operation of the same name to each field and keeps its laziness; failures poison the fields

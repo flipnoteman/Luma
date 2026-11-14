@@ -23,7 +23,7 @@ All notable changes to Luma are listed here. The format follows
   (lazy when the base is pending) and compound assignment (`+=`, `-=`, ...), `put` (scatter),
   `luma::view` for strided custom-kernel reads, `LumaError::ReadOnly`, and `pub use encase`. Read
   views reject mutating operations instead of detaching.
-- Records: `Fields` trait and `#[derive(Fields)]` (crate `luma-derive`) for structs of arrays,
+- Records: `Fields` trait and the `luma::fields!` macro for structs of arrays,
   with arithmetic, `dot`, `copy`, `broadcast_to`, views and `ViewMut` (`assign`, `+=`) in one
   kernel for all fields.
 - Bitwise operations on `u32` arrays, fused like the rest: `& | ^ !`, `<< >>` (and `+=`-style
@@ -117,7 +117,7 @@ All notable changes to Luma are listed here. The format follows
   process with `_exit` if one stays busy (`LUMA_EXIT_WAIT=0` skips the wait).
 - Cyclic-reduction index wrap above $2^{23}$ cells, pager self-deadlock when spilling during a
   traced `iterate*` step, `ReadOnly` alias checks on `+=`/`write`/mutable kernel args, `NaN`
-  residuals falsely converging `iterate_until*`, `#[derive(Fields)]` `+=` mutating shared buffers in
+  residuals falsely converging `iterate_until*`, `luma::fields!` record `+=` mutating shared buffers in
   place, `hypot` overflow and Metal `tanh` saturation above `|x| >= 44`, tiled `conv1d` out-of-window
   `Inf` contamination, and Linux `musl` builds.
 
