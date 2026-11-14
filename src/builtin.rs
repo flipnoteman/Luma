@@ -549,23 +549,9 @@ pub(crate) enum Builtin {
     /// `out[i] = 1` where word `i` of `a` is a NaN or an infinity (as `f32` bits), else 0;
     /// arguments: out, a. Element type `"u32"`. See `jit::check_finite`.
     NonFinite,
-    /// The counting kernel of a radix sort pass on bits `shift..shift + 8`: digit histogram of every
-    /// tile of keys into `counts[digit * tiles + tile]`; see [`crate::sort`]. Element type
-    /// `"u32"`. `first` passes read the user's keys through `transform` (and `descending`).
-    RadixCount { shift: u8, first: bool, transform: crate::sort::KeyTransform, descending: bool },
-    /// The scatter kernel of a radix sort pass: ranks the keys of a tile stably by the digit and
-    /// writes keys and payload to their global positions; see [`crate::sort`]. Element type
-    /// `"u32"`. `last` passes store keys through the inverse of `transform`; `store_keys == false`
-    /// stores the payload only.
-    RadixScatter {
-        shift: u8,
-        first: bool,
-        last: bool,
-        store_keys: bool,
-        payload: crate::sort::PayloadKind,
-        transform: crate::sort::KeyTransform,
-        descending: bool,
-    },
+    /// A kernel of a radix sort pass reading its keys from a buffer; see [`crate::sort`].
+    /// Element type `"u32"`. `first` passes read the user's keys.
+    Radix { pass: crate::sort::RadixPass, first: bool },
     /// Tiled matrix product of the operands (buffers) `a` and `b`; see [`crate::matmul`].
     /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
     /// dimension and writes every slice's partial product after the previous one.
@@ -1340,10 +1326,7 @@ impl Builtin {
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
                 crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows).into()
             }
-            Builtin::RadixCount { shift, first, transform, descending } => crate::sort::count_source(shift, first, transform, descending).into(),
-            Builtin::RadixScatter { shift, first, last, store_keys, payload, transform, descending } => {
-                crate::sort::scatter_source(shift, first, last, store_keys, payload, transform, descending).into()
-            }
+            Builtin::Radix { pass, first } => crate::sort::source(pass, first).into(),
             Builtin::Matmul { tile, aligned, split } => crate::matmul::builtin_source(tile, aligned, split).into(),
             Builtin::MatmulSum => crate::matmul::sum_source(wg).into(),
             Builtin::NonFinite => format!(

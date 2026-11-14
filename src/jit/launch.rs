@@ -11,6 +11,7 @@ use crate::builtin::{Builtin, Finish, ReduceList, ReduceOp};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::matmul::{MatmulOperand, MatmulTile};
+use crate::sort::RadixPass;
 use crate::ops::{fold_workgroups, launch_1d, len_u32};
 
 use super::codegen::direct;
@@ -478,7 +479,7 @@ fn plan_shifts(
 fn out_elems(key: &FusedKey) -> Vec<u64> {
     let bytes = |at: u32| key.instrs.get(at as usize).map_or(4, |instr| instr.op.out_ty().bytes());
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.iter().map(|&at| bytes(at)).collect(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } | Tail::Radix(_) => key.outputs.iter().map(|&at| bytes(at)).collect(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().checked_sub(1).map_or(4, |at| bytes(at as u32))],
     }
@@ -615,6 +616,8 @@ fn spans(
 
     let outputs = match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.len(),
+        // The buffers of the sort itself: the counts, or two to write and two to read.
+        Tail::Radix(_) => 4,
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } | Tail::Reduce(_) => 1,
     };
     let direct = (0..input_count)
@@ -1232,4 +1235,46 @@ pub(crate) fn matmul(
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, groups, size, &raw)?;
     Ok(())
+}
+
+/// Records one kernel of the first radix sort pass over the expression behind `node`, computing
+/// the keys in the kernel instead of reading a buffer: the kernel of `pass` (counting or
+/// scattering) launched on `groups` workgroups with the uniform `words` (see `sort::PARAMS`)
+/// followed by the expression's scalars. Binds `writes`, the buffers of the expression, then
+/// `reads`. Returns `false`, having recorded nothing, if the node has been evaluated already or
+/// the expression cannot be fused (see [`fusable`]): the caller evaluates it and runs the kernel
+/// over its buffer.
+pub(crate) fn radix_pass(
+    ctx: &crate::context::Context,
+    node: &Arc<Node>,
+    pass: RadixPass,
+    words: [u32; 3],
+    groups: [u32; 3],
+    writes: &[RawArg<'_>],
+    reads: &[RawArg<'_>],
+) -> Result<bool, Failure> {
+    if !node.is_pending() {
+        return Ok(false);
+    }
+    let Some(args) = node.operands() else { return Ok(false) };
+    let (fused, args) = flatten_bounded(node, args, Tail::Radix(pass))?;
+    drop(args);
+    if !fusable(ctx, &fused, writes.len() + reads.len()) {
+        return Ok(false);
+    }
+    fused.mark_fused();
+    let Fused { mut key, inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
+    drop((fused_nodes, instr_nodes, sub_roots));
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+    let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
+    let mut uniform = Vec::with_capacity(words.len() + scalars.len());
+    uniform.extend_from_slice(&words);
+    uniform.extend_from_slice(&scalars);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + writes.len() + reads.len() + 1);
+    raw.extend_from_slice(writes);
+    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend_from_slice(reads);
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
+    ctx.launch(&core, groups, [words[0], 1, 1], &raw)?;
+    Ok(true)
 }

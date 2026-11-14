@@ -10,6 +10,7 @@ use crate::builtin::{BinOp, ReduceList, UnOp};
 use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
 use crate::matmul::{MatmulOperand, MatmulTile};
+use crate::sort::RadixPass;
 use crate::profile::SplitReason;
 
 use super::codegen::Tile;
@@ -112,13 +113,17 @@ pub(crate) enum Tail {
     /// is the buffer `a` / `b`. The program becomes `luma_lhs(i)` / `luma_rhs(i)`, the loads of
     /// the GEMM kernel of `matmul::body` (see `launch::matmul`).
     Matmul { tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand },
+    /// A first-pass kernel of a radix sort over the one root, the keys: the program becomes
+    /// `luma_key(i)`, the key loads of the kernel of `sort::fused_body`, whose own buffers come
+    /// before and after the inputs (see `launch::radix_pass`).
+    Radix(RadixPass),
 }
 
 impl Tail {
     /// Whether the roots of a program with this tail are read by it and never stored, so that
     /// they count as computed inside it (their nodes are fused, not evaluated).
     pub(super) fn consumes_roots(self) -> bool {
-        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. })
+        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. } | Tail::Radix(_))
     }
 }
 
@@ -270,6 +275,7 @@ impl FusedKey {
             Tail::ScatterAdd { op, .. } => format!("FusedPut{op:?}({names}) {ty}"),
             Tail::Stack { .. } => format!("FusedStack({names}) {ty}"),
             Tail::Matmul { .. } => format!("FusedMatmul({names}) {ty}"),
+            Tail::Radix(_) => format!("FusedRadix({names}) {ty}"),
             Tail::Reduce(ops) => {
                 let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
                 format!("FusedReduce({}: {names}) {ty}", ops.join("+"))
