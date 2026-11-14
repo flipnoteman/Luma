@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,7 +182,229 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="loops"><a class="header" href="#loops">Loops</a></h1>
-<p>This chapter is not written yet. <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate"><code>Array::iterate</code></a> runs multi-step stencils, <a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a> runs elementwise loops over several arrays as one kernel that keeps the state in registers, and <a href="https://docs.rs/luma/latest/luma/fn.iterate_until_all.html"><code>iterate_until_all</code></a> stops on a device-side condition. The step function is traced once and its kernels are replayed; a loop called again from the same place reuses the earlier program. A per-step <code>eval</code> loop is recognised too; see <a href="lazy.html#when-kernels-run">Lazy evaluation and fusion</a>.</p>
+<p>Time stepping, iterative solvers and per-element recurrences all repeat one step many times.
+Written as a Rust loop, each iteration builds a graph and the host talks to the GPU once per step.
+Luma has loop primitives that take the step <em>as a closure</em>, trace it once, and run all the steps
+on the GPU:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Primitive</th><th>Use</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate"><code>Array::iterate</code></a></td><td><code>steps</code> applications of a step on one <code>f32</code> array; stencils run time-blocked</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a></td><td><code>steps</code> applications of a step on several arrays of one element type; elementwise <code>f32</code> and <code>u32</code> steps keep the state in registers</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate_until"><code>Array::iterate_until</code></a></td><td>a step until the largest change is below a tolerance</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_until_all.html"><code>iterate_until_all</code></a></td><td>a step on any <a href="records.html">record</a> until a rule over recorded scalars holds</td></tr>
+</tbody>
+</table>
+</div>
+<p>The two <code>_until</code> loops evaluate their stop rule on the GPU; <code>iterate</code> and <code>iterate_all</code> run a
+fixed number of steps. None of them needs you to manage the second buffer a step needs: the previous state and the next are swapped for you.</p>
+<h2 id="stencils-iterate"><a class="header" href="#stencils-iterate">Stencils: <code>iterate</code></a></h2>
+<pre><code class="language-rust">use luma::*;
+
+// A 1-D heat equation: a spike diffuses.
+let mut data = vec![0.0f32; 9];
+data[4] = 1.0;
+let u0 = Array::from_slice(&amp;data, 9)?;
+
+let alpha = 0.25;
+let u = u0.iterate(4, |u| {
+    let lap = u.shift(1) + u.shift(-1) - u * 2.0;   // circular shifts
+    u + lap * alpha
+});
+
+// The same on the host.
+let mut want = data.clone();
+for _ in 0..4 {
+    let old = want.clone();
+    for i in 0..9 {
+        want[i] = old[i] + alpha * (old[(i + 8) % 9] + old[(i + 1) % 9] - 2.0 * old[i]);
+    }
+}
+for (g, w) in u.to_vec()?.iter().zip(&amp;want) {
+    assert!((g - w).abs() &lt; 1e-6);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>When the step is a stencil (one elementwise expression of the argument, circular shifts of it by
+a few elements, scalars and other fixed arrays of the same shape), each launch loads a tile into
+workgroup memory and runs several steps on it, so the data passes through memory once per several
+steps rather than once per step. Any other step (shifts of a computed expression, <code>cache()</code>,
+<code>assign</code>, reductions) is traced and replayed step by step: each step is still the fused kernels
+of the step, and the loop costs no host time per step.</p>
+<p>A step that is a stencil of 2-D data looks the same: <code>u.shift([1, 0]) + u.shift([-1, 0]) + u.shift([0, 1]) + u.shift([0, -1]) - u * 4.0</code>.</p>
+<h2 id="elementwise-loops-iterate_all"><a class="header" href="#elementwise-loops-iterate_all">Elementwise loops: <code>iterate_all</code></a></h2>
+<p><code>iterate_all(init, steps, step)</code> runs the step on <code>N</code> arrays at once; <code>step</code> gets <code>&amp;[Array&lt;T&gt;; N]</code>
+and returns the next <code>[Array&lt;T&gt;; N]</code>. When every result is an elementwise expression of the
+states, of other arrays of the same length, and of scalars, <strong>the whole loop is a kernel that
+keeps the states in registers and writes them once per launch</strong>, whatever the step count. That is the shape
+of a Mandelbrot iteration, a Monte Carlo walk, or a round of a hash function.</p>
+<pre><code class="language-rust">use luma::*;
+
+// z -&gt; z^2 + c on the real line, counting steps until z leaves [-2, 2].
+let c = Array::from_slice(&amp;[0.1f32, -0.5, 2.0, 1.0], 4)?;
+let zero = Array::&lt;f32&gt;::zeros(4)?;
+let [z, count] = iterate_all([&amp;zero, &amp;zero], 64, |[z, count]| {
+    let inside = z.le(2.0);
+    [select(&amp;inside, &amp;(z * z + &amp;c), z), count + select(&amp;inside, 1.0, 0.0)]
+});
+assert_eq!(count.to_vec()?, vec![64.0, 64.0, 2.0, 3.0]);
+<span class="boring">z.eval()?;
+</span><span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The states may be <code>u32</code> as well, which makes register loops of integer recurrences, hash rounds
+and counters (see <a href="integers.html">Integer and bit operations</a>):</p>
+<pre><code class="language-rust">use luma::*;
+
+// A linear congruential generator, 5 steps per element, 32-bit wrap-around arithmetic.
+let seed = Array::from_slice(&amp;[1u32, 2, 3], 3)?;
+let [x] = iterate_all([&amp;seed], 5, |[x]| [x * 1664525u32 + 1013904223u32]);
+
+let want: Vec&lt;u32&gt; = [1u32, 2, 3]
+    .iter()
+    .map(|&amp;s| (0..5).fold(s, |x, _| x.wrapping_mul(1664525).wrapping_add(1013904223)))
+    .collect();
+assert_eq!(x.to_vec()?, want);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A step that is <em>not</em> elementwise (shifts, <code>cache()</code>, <code>assign</code>), or states of another element type
+(<code>Df32</code>, <code>f64</code>), is traced once and its recorded kernels are replayed step by step. The results
+are the same; only the one-kernel register loop is lost.</p>
+<h3 id="launch-sizing"><a class="header" href="#launch-sizing">Launch sizing</a></h3>
+<p>A long register loop is not one kernel launch for ever. The cost model
+(<a href="performance.html#the-cost-model">Performance</a>) sizes its launches to about 40 ms of GPU time (at least one step per launch), which keeps them far
+below a driver watchdog (2 s on Windows) unless a single step is itself that long. The host only
+records the launches.</p>
+<h3 id="calling-it-again"><a class="header" href="#calling-it-again">Calling it again</a></h3>
+<p>A register loop called again from the <em>same place in the source</em>, whose step builds the same graph
+(the same operations and scalar values) over other arrays, is not flattened again. After two calls
+in a row did that, the GPU starts the loop before <code>step</code> is even traced, on the guess that it will
+build the same graph again (a wrong guess only wastes GPU time). <code>step</code> is still called once per
+call, and a captured array is read when the loop runs. A function that runs the same loop per
+batch (the permutation of a hash, one Mandelbrot tile) therefore skips the flattening from its
+second call on.</p>
+<h2 id="the-step-runs-once"><a class="header" href="#the-step-runs-once">The step runs once</a></h2>
+<p><code>step</code> is called <strong>once</strong> to trace it, with placeholder arrays (<code>iterate_until_all</code> passes the state itself only
+when it spans several buffers); the recorded launches are replayed for every step. So:</p>
+<ul>
+<li>compute the next state from the arguments and <em>captured arrays only</em>, in the closure;</li>
+<li>do not keep the argument or read values back inside the step (<code>item</code>, <code>to_vec</code>): an
+<code>iterate_until_all</code> step that reads back cannot be replayed and runs as a host loop instead
+(still correct, not fast);</li>
+<li>anything that depends on the iteration number must be an array, not a Rust variable. The step
+of <code>iterate_until_all</code> gets the 0-based index of the step as a one-element <code>f32</code> array for this
+purpose; <code>iterate_all</code> loops over rounds (a Keccak round constant) carry a counter in a state;</li>
+<li>the state arrays are read-only inside a step: <code>assign</code> on the argument fails with
+<code>LumaError::ReadOnly</code>, and <code>+=</code> poisons the array with it. Compute a new array instead.</li>
+</ul>
+<p><code>init</code> of <code>iterate</code> and <code>iterate_all</code> is not modified; the result is a new array.</p>
+<h2 id="stop-conditions-iterate_until_all"><a class="header" href="#stop-conditions-iterate_until_all">Stop conditions: <code>iterate_until_all</code></a></h2>
+<p><code>iterate_until_all(init, until, step)</code> runs <code>step</code> at most <code>max_steps</code> times and stops at the first
+step after which a condition on <em>recorded scalars</em> holds. The condition is evaluated on the GPU by
+a small kernel between steps, so the host waits only once per block of steps, not per step.</p>
+<pre><code class="language-rust">use luma::*;
+
+let u = Array::from_slice(&amp;[4.0f32, 2.0, 1.0, 0.5], 4)?;
+let run = iterate_until_all(
+    (u,),                                        // the state: a record (here a tuple)
+    Until::new(500)                              // at most 500 steps
+        .record("max", |s: &amp;(Array&lt;f32&gt;,)| s.0.max())     // a scalar per step
+        .stop_when(|h| (h["max"].first() / h["max"].last()).ge(1e6)),
+    |s, _step| (&amp;s.0 * 0.5,),
+)?;
+assert_eq!(run.steps, 21);                       // the ratio after s steps is 2^(s-1): 2^19 &lt; 1e6 &lt;= 2^20
+assert_eq!(run.reason, StopReason::Predicate(0));
+assert_eq!(run.history("max").unwrap().len(), 21);
+assert_eq!(run.state.0.to_vec()?[0], 4.0 / 2f32.powi(21));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The pieces:</p>
+<ul>
+<li><strong><a href="https://docs.rs/luma/latest/luma/struct.Until.html"><code>Until</code></a></strong> is built with <code>Until::new(max_steps)</code>.
+<code>.record(name, f)</code> computes a one-element <code>f32</code> array from the state after every step (always
+<code>f32</code>, even for a <code>Df32</code> state: record <code>s.u.max().to_f32()</code>). <code>.stop_when(f)</code> adds a
+condition; <code>.check_every(n)</code> fixes the block between waits (default: the first block is 16
+steps and every block that ends without a stop doubles the next, up to 128; steps, reason,
+histories and state never depend on this).</li>
+<li><strong><a href="https://docs.rs/luma/latest/luma/struct.History.html"><code>History</code></a></strong> is what a stop rule
+receives. <code>h["name"]</code> is a <a href="https://docs.rs/luma/latest/luma/struct.Series.html"><code>Series</code></a>;
+<code>h.step()</code> is the number of steps done. The rule is called once, before the loop starts, and
+builds a condition.</li>
+<li><strong><a href="https://docs.rs/luma/latest/luma/struct.Series.html"><code>Series</code></a></strong> turns the recorded values
+into a <a href="https://docs.rs/luma/latest/luma/struct.Stat.html"><code>Stat</code></a>: <code>last()</code>, <code>first()</code>,
+<code>peak()</code> (largest so far), <code>trough()</code>, <code>window_max(k)</code>, <code>window_min(k)</code>.</li>
+<li><strong><code>Stat</code></strong> combines with <code>+ - * /</code> (with other stats and <code>f32</code>) and <code>abs()</code>, and compares with
+<code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code> into a <a href="https://docs.rs/luma/latest/luma/struct.Cond.html"><code>Cond</code></a>;
+conditions combine with <code>and</code>, <code>or</code>, <code>not</code>. A comparison with a NaN never holds.</li>
+<li><strong><a href="https://docs.rs/luma/latest/luma/struct.Run.html"><code>Run</code></a></strong> is the result: <code>state</code>, <code>steps</code>,
+<code>reason</code>, and <code>history(name)</code> with the value recorded after every step.</li>
+<li><strong><a href="https://docs.rs/luma/latest/luma/enum.StopReason.html"><code>StopReason</code></a></strong> is <code>MaxSteps</code> or
+<code>Predicate(i)</code>, the index of the first <code>stop_when</code> that held.</li>
+</ul>
+<p>Several rules and the step counter:</p>
+<pre><code class="language-rust">use luma::*;
+use std::cell::Cell;
+
+let calls = Cell::new(0);
+let x = Array::from_slice(&amp;[4.0f32, 3.0], 2)?;
+let run = iterate_until_all(
+    (x,),
+    Until::new(100)
+        .record("max", |s: &amp;(Array&lt;f32&gt;,)| s.0.max())
+        .stop_when(|h| h["max"].last().le(1e-3))          // Predicate(0)
+        .stop_when(|h| h.step().ge(5.0))                  // Predicate(1)
+        .check_every(8),
+    |s, _| {
+        calls.set(calls.get() + 1);
+        (&amp;s.0 * 0.5,)
+    },
+)?;
+assert_eq!(run.steps, 5);
+assert_eq!(run.reason, StopReason::Predicate(1));
+assert_eq!(calls.get(), 1);                                // traced once, replayed
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A step that reads results back or uses states larger than one buffer runs on the host, with the
+same stop rule evaluated there; both evaluations agree.</p>
+<h3 id="convergence-on-one-array-iterate_until"><a class="header" href="#convergence-on-one-array-iterate_until">Convergence on one array: <code>iterate_until</code></a></h3>
+<p>For the common case of one <code>f32</code> array stopped when the largest change <code>|next - prev|</code> is at most
+<code>tol</code>, <code>u.iterate_until(max_steps, tol, step)</code> needs no records:</p>
+<pre><code class="language-rust">use luma::*;
+
+let u0 = Array::from_slice(&amp;[0.0f32, 0.0, 1.0, 0.0, 0.0], 5)?;
+let u = u0.iterate_until(10_000, 1e-6, |u| {
+    (u.shift(1) + u.shift(-1)) * 0.5            // averaging: converges to the mean 0.2
+});
+for v in u.to_vec()? {
+    assert!((v - 0.2).abs() &lt; 1e-3);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="loops-with-eval"><a class="header" href="#loops-with-eval">Loops with <code>eval</code></a></h2>
+<p>A loop that you write yourself, with <code>eval</code> each iteration, is also fast:</p>
+<pre><code class="language-rust">use luma::*;
+
+let mut u = Array::&lt;f32&gt;::full(1 &lt;&lt; 16, 1.0)?;
+for _ in 0..1000 {
+    u = (&amp;u * 0.99 + 0.01).sqrt();
+    u.eval()?;                  // records and hands over; does not wait
+}
+assert!((u.to_vec()?[0] - 1.0).abs() &lt; 1e-3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>eval</code> does not wait for the GPU and may postpone the computation while the GPU is busy
+(<a href="lazy.html#when-kernels-run">Lazy evaluation</a>). A loop of <code>x = step(&amp;x); x.eval()</code> over <code>f32</code>
+arrays is <em>recognised</em> while evaluation is postponed: the steps are not chained into an ever
+longer expression, but run together when a result is needed, as one register loop or
+a time-blocked stencil. The graph that is pending stays one step deep however long the loop runs.
+A step that reads slices or pads of lazy expressions is evaluated step by step; each step still
+fuses.</p>
+<p>Compared with the loop primitives, an <code>eval</code> loop calls your step every iteration (host work per
+step) but may use anything inside it, including readbacks. Use the primitive when the step fits
+and the host time matters.</p>
+<h3 id="readbacks-in-a-loop"><a class="header" href="#readbacks-in-a-loop">Readbacks in a loop</a></h3>
+<p><code>step</code> followed by <code>.max().item()?</code> every iteration waits once per step. When the same step has
+been seen repeating, Luma computes the next few steps and their residuals during a readback and
+answers the following readbacks from memory (<em>speculation</em>): the round trip is paid once per
+several steps. Values are those of the program as written; a miss only costs the wasted GPU
+work. <code>LUMA_SPECULATE=off</code> disables it (<a href="environment.html">Environment variables</a>). If the loop
+only needs a convergence test, <code>iterate_until</code> and <code>iterate_until_all</code> wait once per block of
+steps instead of once per step.</p>
 
                     </main>
 

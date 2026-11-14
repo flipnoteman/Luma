@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -219,7 +219,7 @@ assert_eq!(x.to_vec()?, vec![2.0, 3.0]);
 <tbody>
 <tr><td><code>to_vec</code>, <code>read_into</code>, <code>item</code>, <code>to_array</code></td><td>compute what the array needs, submit, wait, copy back</td></tr>
 <tr><td><code>a.eval()</code> / <code>eval_all(&amp;[&amp;a, &amp;b])</code></td><td>compute these arrays and hand the batch to the GPU <strong>without waiting</strong></td></tr>
-<tr><td><code>ctx.flush()</code> / <code>luma::flush()</code></td><td>compute <strong>every</strong> pending array and hand the batch to the GPU without waiting</td></tr>
+<tr><td><code>ctx.flush()</code> / <code>luma::flush()</code></td><td>compute every lazy array this thread still holds and hand the batch to the GPU without waiting</td></tr>
 <tr><td><code>ctx.sync()</code></td><td>submit and wait until the GPU is idle</td></tr>
 <tr><td>a custom <a href="custom-kernels.html"><code>Kernel</code></a> reads or writes the array</td><td>the array is computed first</td></tr>
 </tbody>
@@ -248,12 +248,13 @@ generators (<code>range</code>, <code>linspace</code>, <code>uniform</code>), <a
 <code>transpose</code>, <code>shift</code>, <code>take</code>, <code>concat</code>), compound assignment, and the elementwise prologue and
 epilogue of a <a href="reductions.html">reduction</a>. A view of a lazy expression is recomputed at the
 reader’s index, staged in workgroup memory, or evaluated first, whichever the
-<a href="performance.html#the-cost-model">cost model</a> estimates is cheapest.</p>
+<a href="performance.html#the-cost-model">cost model</a> estimates is cheapest (within the caps below: a kernel
+that would exceed <code>LUMA_FUSION_MAX_INLINED</code> is cut whatever the model says).</p>
 <p>Not fused, because they need whole-array structure: <code>scan</code>, <code>sum_axis</code>, tridiagonal solves, FFT
 convolution, and your own kernels. They read the arrays they are given, which are computed first.</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
 <code>LUMA_FUSION_MAX_LIVE</code>, <code>LUMA_FUSION_MAX_INLINED</code>) or when evaluating a shared piece first is
-cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html"><code>Profile::splits</code></a> tells you where
+cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits"><code>Profile::splits</code></a> tells you where
 and why.</p>
 <h2 id="cache"><a class="header" href="#cache"><code>cache()</code></a></h2>
 <p><code>x.cache()</code> marks an expression as shared: it is evaluated once into a buffer and later readers

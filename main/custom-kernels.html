@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,7 +182,264 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="custom-kernels"><a class="header" href="#custom-kernels">Custom kernels</a></h1>
-<p>This chapter is not written yet. <a href="https://docs.rs/luma/latest/luma/struct.Context.html#method.kernel"><code>Context::kernel</code></a> builds a WGSL kernel from source; arrays bind as storage buffers, <a href="https://docs.rs/luma/latest/luma/fn.uniform.html"><code>uniform</code></a> passes parameters, and <code>luma.size</code> gives the launch size. A kernel runs in the same batch as the built-in operations; ping-pong buffers are swapped with <code>std::mem::swap</code>. See <a href="https://docs.rs/luma/latest/luma/struct.Kernel.html"><code>Kernel</code></a> and <a href="https://github.com/flipnoteman/Luma/blob/main/examples/custom_kernel.rs"><code>examples/custom_kernel.rs</code></a>.</p>
+<p>When an algorithm does not fit array operations (a scatter with atomics, a tuned stencil, an
+existing shader), write the kernel in WGSL and run it on Luma arrays. A custom kernel joins the same
+ordered batch as the built-in operations, reads and writes <code>Array</code>s directly and needs no buffer
+management.</p>
+<h2 id="a-first-kernel"><a class="header" href="#a-first-kernel">A first kernel</a></h2>
+<pre><code class="language-rust">use luma::*;
+
+// The uniform struct: derive `encase::ShaderType` so the layout matches WGSL's rules.
+#[derive(luma::encase::ShaderType)]
+struct Saxpy {
+    alpha: f32,
+    n: u32,
+}
+
+const SAXPY: &amp;str = r#"
+struct Saxpy { alpha: f32, n: u32 }
+@group(1) @binding(0) var&lt;storage, read&gt; x: array&lt;f32&gt;;
+@group(1) @binding(1) var&lt;storage, read_write&gt; y: array&lt;f32&gt;;
+@group(1) @binding(2) var&lt;uniform&gt; p: Saxpy;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    if (gid.x &gt;= p.n) { return; }
+    y[gid.x] = p.alpha * x[gid.x] + y[gid.x];
+}
+"#;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let mut y = Array::from_slice(&amp;[10.0f32; 4], 4)?;
+
+let saxpy = Kernel::new(SAXPY)?;                       // on the default context, entry `main`
+saxpy.launch([4], args![&amp;x, &amp;mut y, uniform(&amp;Saxpy { alpha: 2.0, n: 4 })])?;
+
+// Operators and launches share one ordered batch; nothing has run yet.
+let y = y * 0.5;
+assert_eq!(y.to_vec()?, vec![6.0, 7.0, 8.0, 9.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The rules:</p>
+<ul>
+<li><strong>Bindings</strong> go in <code>@group(1)</code>, numbered from 0 in the order of the arguments to <code>launch</code>.
+<code>&amp;Array</code> binds <code>var&lt;storage, read&gt;</code>, <code>&amp;mut Array</code> binds <code>var&lt;storage, read_write&gt;</code>, and
+<code>uniform(&amp;value)</code> binds <code>var&lt;uniform&gt;</code>.</li>
+<li><strong><code>@group(0)</code> belongs to Luma.</strong> It holds <code>luma</code>, a uniform with <code>size: vec3&lt;u32&gt;</code> (the problem
+size you passed to <code>launch</code>). Luma appends two helpers to your source: <code>luma_idx2(i, j)</code> and
+<code>luma_idx3(i, j, k)</code> compute a flat index with the first dimension fastest.</li>
+<li><strong>Problem size.</strong> <code>launch([x])</code>, <code>launch([x, y])</code> or <code>launch([x, y, z])</code> runs at least that many
+invocations: <code>ceil(size / workgroup_size)</code> workgroups per dimension. Guard against
+<code>global_invocation_id &gt;= luma.size</code>. <code>launch_raw([wx, wy, wz], args)</code> runs exactly that many
+workgroups.</li>
+<li><strong>Uniform values</strong> are copied when you pass them. Any type
+<a href="https://docs.rs/encase">encase</a> can lay out works: a struct with <code>#[derive(ShaderType)]</code>,
+scalars, vectors, matrices, arrays. <code>luma::encase</code> is a re-export of the same version Luma uses.</li>
+<li><strong>Element sizes</strong> are checked: a binding <code>array&lt;f32&gt;</code> takes arrays of 4-byte elements,
+<code>array&lt;vec2&lt;f32&gt;&gt;</code> arrays of 8-byte ones (<code>[f32; 2]</code>, <code>Df32</code>, <code>f64</code>). Only the size is compared,
+not the type: an <code>Array&lt;u32&gt;</code> passes for <code>array&lt;f32&gt;</code>, so keep the types straight yourself.</li>
+</ul>
+<h2 id="several-entry-points-2-d-launches"><a class="header" href="#several-entry-points-2-d-launches">Several entry points, 2-D launches</a></h2>
+<p>One module can hold several entry points; each only sees the globals it uses, and those must be
+numbered contiguously from 0 <em>for that entry point</em>. Choose one with <code>.entry(name)</code>, and name it
+in profiles with <code>.label(name)</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+const GRID: &amp;str = r#"
+@group(1) @binding(0) var&lt;storage, read_write&gt; dst: array&lt;f32&gt;;
+@group(1) @binding(1) var&lt;storage, read&gt; src: array&lt;f32&gt;;
+
+// Each element's flat index, on a 2-D grid.
+@compute @workgroup_size(8, 8)
+fn fill_index(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    if (gid.x &gt;= luma.size.x || gid.y &gt;= luma.size.y) { return; }
+    let i = luma_idx2(gid.x, gid.y);
+    dst[i] = f32(i);
+}
+
+// dst (h x w) = transpose of src (w x h); luma.size is the shape of src.
+@compute @workgroup_size(8, 8)
+fn transpose(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    if (gid.x &gt;= luma.size.x || gid.y &gt;= luma.size.y) { return; }
+    dst[gid.y + gid.x * luma.size.y] = src[luma_idx2(gid.x, gid.y)];
+}
+"#;
+
+let ctx = default_context()?;
+let fill = ctx.kernel(GRID).entry("fill_index").build()?;
+let transpose = ctx.kernel(GRID).entry("transpose").label("my transpose").build()?;
+assert_eq!(fill.bindings().len(), 1);           // only `dst`
+assert_eq!(transpose.bindings().len(), 2);      // `dst` and `src`
+assert_eq!(transpose.workgroup(), [8, 8, 1]);
+
+let (w, h) = (4u32, 3u32);
+let mut a = Array::&lt;f32&gt;::zeros([w as usize, h as usize])?;
+let mut t = Array::&lt;f32&gt;::zeros([h as usize, w as usize])?;
+fill.launch([w, h], args![&amp;mut a])?;
+transpose.launch([w, h], args![&amp;mut t, &amp;a])?;
+
+assert_eq!(t.shape(), Shape::from([3, 4]));
+assert_eq!(t.sum().item()?, 66.0);              // built-in reductions work on the output
+assert_eq!(t.to_vec()?[1], 4.0);                // t(1, 0) = a(0, 1)
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>Kernel::new(src)</code> is <code>default_context()?.kernel(src).build()</code>. Building the same source, entry point,
+workgroup size and label twice on a context reuses the pipeline, and a <code>Kernel</code> is cheap to clone. The shader is parsed and validated
+when you build it: a mistake comes out as <code>LumaError::ShaderCompile</code> with the WGSL error and
+line numbers that match your source (Luma appends its prelude, so it never shifts them).</p>
+<h2 id="mixing-with-built-in-operations"><a class="header" href="#mixing-with-built-in-operations">Mixing with built-in operations</a></h2>
+<p>Launches are recorded in order with the lazy operations, in one batch:</p>
+<ul>
+<li>An array that is still a lazy expression is computed before a kernel reads or writes it.</li>
+<li>A kernel that writes an array first lets lazy expressions recorded earlier that read it finish
+with the old contents (the same rule as <code>write</code>: <a href="lazy.html">Lazy evaluation</a>).</li>
+<li>Lazy operations on a kernel’s output fuse as usual, and reductions and views work on it.</li>
+</ul>
+<pre><code class="language-rust">use luma::*;
+
+const SQUARE_PLUS: &amp;str = r#"
+@group(1) @binding(0) var&lt;storage, read&gt; src: array&lt;f32&gt;;
+@group(1) @binding(1) var&lt;storage, read_write&gt; dst: array&lt;f32&gt;;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    if (gid.x &gt;= luma.size.x) { return; }
+    dst[gid.x] = src[gid.x] * src[gid.x] + 1.0;
+}
+"#;
+
+let k = Kernel::new(SQUARE_PLUS)?;
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+let lazy = &amp;x * 2.0;                           // a lazy expression: computed when the kernel reads it
+let mut out = Array::&lt;f32&gt;::zeros(3)?;
+k.launch([3], args![&amp;lazy, &amp;mut out])?;        // [2, 4, 6]^2 + 1
+let total = (&amp;out + 1.0).sum();                // the kernel's output feeds a lazy reduction
+assert_eq!(total.item()?, (4.0 + 1.0) + (16.0 + 1.0) + (36.0 + 1.0) + 3.0);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="ping-pong-buffers"><a class="header" href="#ping-pong-buffers">Ping-pong buffers</a></h2>
+<p>A step that reads one array and writes another is the pattern of every explicit time stepper. Keep
+two arrays and swap them with <code>std::mem::swap</code>; each launch is recorded and nothing waits until
+the end.</p>
+<pre><code class="language-rust">use luma::*;
+
+#[derive(luma::encase::ShaderType)]
+struct Params {
+    alpha: f32,
+    n: u32,
+}
+
+const HEAT: &amp;str = r#"
+struct Params { alpha: f32, n: u32 }
+@group(1) @binding(0) var&lt;storage, read&gt; src: array&lt;f32&gt;;
+@group(1) @binding(1) var&lt;storage, read_write&gt; dst: array&lt;f32&gt;;
+@group(1) @binding(2) var&lt;uniform&gt; p: Params;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    let i = gid.x;
+    if (i &gt;= p.n) { return; }
+    let l = src[(i + p.n - 1u) % p.n];
+    let r = src[(i + 1u) % p.n];
+    dst[i] = src[i] + p.alpha * (l + r - 2.0 * src[i]);
+}
+"#;
+
+let n = 9usize;
+let mut data = vec![0.0f32; n];
+data[4] = 1.0;
+let mut a = Array::from_slice(&amp;data, n)?;
+let mut b = Array::&lt;f32&gt;::zeros(n)?;
+let kernel = Kernel::new(HEAT)?;
+let params = Params { alpha: 0.25, n: n as u32 };
+
+for _ in 0..10 {
+    kernel.launch([n as u32], args![&amp;a, &amp;mut b, uniform(&amp;params)])?;
+    std::mem::swap(&amp;mut a, &amp;mut b);              // `a` is the newest state again
+}
+
+let mut want = data.clone();
+for _ in 0..10 {
+    let old = want.clone();
+    for i in 0..n {
+        want[i] = old[i] + 0.25 * (old[(i + n - 1) % n] + old[(i + 1) % n] - 2.0 * old[i]);
+    }
+}
+for (g, w) in a.to_vec()?.iter().zip(&amp;want) {
+    assert!((g - w).abs() &lt; 1e-6);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>(For a stencil in a loop, also look at <a href="loops.html"><code>iterate</code></a>: it runs several steps per pass over
+the data.)</p>
+<h2 id="strided-views"><a class="header" href="#strided-views">Strided views</a></h2>
+<p><code>luma::view(&amp;array)</code> passes a <em>read view</em> (a slice, flip or transpose that has not been evaluated)
+without copying it. It takes two consecutive bindings: the buffer and a <code>LumaView</code> uniform that
+describes the strides. <code>LumaView</code> and the indexing functions <code>luma_view_idx2(v, i, j)</code>,
+<code>luma_view_idx3</code>, <code>luma_view_idx4(v, vec4&lt;u32&gt;)</code> and <code>luma_view_idx(v, flat_index)</code> are added to
+your source when it mentions <code>LumaView</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+const VIEW_COPY: &amp;str = r#"
+@group(1) @binding(0) var&lt;storage, read&gt; src: array&lt;f32&gt;;
+@group(1) @binding(1) var&lt;uniform&gt; src_view: LumaView;
+@group(1) @binding(2) var&lt;storage, read_write&gt; out: array&lt;f32&gt;;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    if (gid.x &gt;= luma.size.x || gid.y &gt;= luma.size.y) { return; }
+    out[luma_idx2(gid.x, gid.y)] = src[luma_view_idx2(src_view, gid.x, gid.y)];
+}
+"#;
+
+let a = Array::from_slice(&amp;(0..12).map(|i| i as f32).collect::&lt;Vec&lt;_&gt;&gt;(), [4, 3])?;
+let view = a.slice(0, 1..3).flip(1);           // a [2, 3] view: read in place, never copied
+let mut out = Array::&lt;f32&gt;::zeros([2, 3])?;
+Kernel::new(VIEW_COPY)?.launch([2, 3], args![luma::view(&amp;view), &amp;mut out])?;
+assert_eq!(out.to_vec()?, vec![9.0, 10.0, 5.0, 6.0, 1.0, 2.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A <a href="views.html#views-that-write"><code>ViewMut</code></a> passed as <code>&amp;mut view</code> binds the same way and the kernel
+writes the region in place. Any other array (not such a view) is passed as a contiguous array, evaluated first; so are pads and
+edge shifts. Slices, flips and transposes are read in place.</p>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p>Launches validate every argument against the shader’s reflected bindings and return errors, not
+panics:</p>
+<pre><code class="language-rust">use luma::*;
+
+const COPY: &amp;str = r#"
+@group(1) @binding(0) var&lt;storage, read&gt; src: array&lt;f32&gt;;
+@group(1) @binding(1) var&lt;storage, read_write&gt; dst: array&lt;f32&gt;;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    if (gid.x &gt;= luma.size.x) { return; }
+    dst[gid.x] = src[gid.x];
+}
+"#;
+
+let k = Kernel::new(COPY)?;
+let src = Array::&lt;f32&gt;::full(4, 1.0)?;
+let mut dst = Array::&lt;f32&gt;::zeros(4)?;
+
+// A read-only array where the shader writes:
+let err = k.launch([4], args![&amp;dst, &amp;src]).unwrap_err();
+assert!(matches!(err, LumaError::KernelArgAccess { .. }), "{err}");
+// The wrong number of arguments:
+let err = k.launch([4], args![&amp;src]).unwrap_err();
+assert!(matches!(err, LumaError::KernelArgCount { expected: 2, actual: 1 }), "{err}");
+// The wrong element size (8-byte elements for an `array&lt;f32&gt;`):
+let pairs = Array::from_slice(&amp;[[0.0f32; 2]; 4], 4)?;
+let err = k.launch([4], args![&amp;pairs, &amp;mut dst]).unwrap_err();
+assert!(matches!(err, LumaError::KernelArgElementSize { .. }), "{err}");
+// A shader that does not compile:
+assert!(matches!(Kernel::new("@compute fn main("), Err(LumaError::ShaderCompile(_))));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A poisoned array passed as an argument fails the launch with its own error. Other errors:
+<code>KernelArgKind</code> (an array where a uniform goes, or the reverse), <code>KernelArgUniformSize</code>,
+<code>KernelEntryPoint</code>, <code>KernelBinding</code> (bindings outside <code>@group(1)</code> or not numbered from 0),
+<code>KernelWorkgroup</code>, <code>KernelGridTooLarge</code>. See <a href="https://docs.rs/luma/latest/luma/enum.LumaError.html"><code>LumaError</code></a>.</p>
+<h2 id="limits"><a class="header" href="#limits">Limits</a></h2>
+<ul>
+<li>Kernel arguments must be arrays that fit one buffer; an array split over several buffers
+fails with <code>LumaError::Chunked</code>.</li>
+<li>You cannot pass a read-only view as <code>&amp;mut</code>, nor write the state of an <code>iterate</code> step.</li>
+<li>The shader features the device was opened with decide what WGSL compiles (<code>f64</code> needs
+<code>SHADER_F64</code>; check <code>ctx.features()</code>).</li>
+</ul>
 
                     </main>
 
