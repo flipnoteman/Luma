@@ -30,8 +30,12 @@ static PANIC: Mutex<String> = Mutex::new(String::new());
 
 /// Default `--gate` threshold on `luma GPU time / hand GPU time`.
 const DEFAULT_GATE: f64 = 1.05;
-/// Warm-up runs before timing.
+/// Warm-up runs before timing, at least.
 const WARMUPS: usize = 2;
+/// Warm-up time before timing, at least. A case verifies on the host first, during which the
+/// GPU idles and drops its clocks (an RTX 3090 measured 600 MHz core, 5 GHz memory after 1-2 s
+/// of host work); the warm-up keeps it busy until they are back up.
+const WARMUP_TIME: std::time::Duration = std::time::Duration::from_millis(300);
 /// Timed runs per measurement; the best is reported.
 const RUNS: usize = 7;
 
@@ -100,9 +104,12 @@ impl Bench {
     /// Best GPU and wall time of `f`, which must enqueue the whole computation.
     fn measure(&self, f: &mut dyn FnMut()) -> Times {
         let ctx = &self.ctx;
-        for _ in 0..WARMUPS {
+        let start = Instant::now();
+        let mut runs = 0;
+        while runs < WARMUPS || start.elapsed() < WARMUP_TIME {
             f();
             ctx.sync().unwrap();
+            runs += 1;
         }
         let mut wall = f64::INFINITY;
         for _ in 0..RUNS {
