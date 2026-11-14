@@ -107,8 +107,10 @@ operators.
 | writes | `slice_mut`, `flip_mut`, `transpose_mut` (a [`ViewMut`](views.md#views-that-write) of the record), `assign`, `put` |
 | helpers | `map(f)`, `zip(&other, f)`, `dot(&other)`, `Fields::select(&mask, &a, &b)`, `arrays()`, `eval()`, `cache()` |
 
-Every method applies the array operation of the same name to each field, keeps its laziness, and
-poisons the fields with the caller's source location on a failure.
+Every method applies the array operation of the same name to each field and poisons the fields
+with the caller's source location on a failure. All of them stay lazy except `cache`, `eval` and
+`put`, which run now (as `Array::cache`, `eval` and `put` do), and `assign`, a write like
+[`Array::assign`](views.md#views-that-write).
 
 ## Writes and ghost cells
 
@@ -175,7 +177,7 @@ assert_eq!(p.v.to_vec()?, vec![0.5, -0.5]);
 ## Records in loops
 
 [`iterate_until_all`](loops.md#stop-conditions-iterate_until_all) takes any record as the state
-and returns it, so the step reads like the maths:
+and returns a `Run` whose `state` is the record, so the step reads like the maths:
 
 ```rust
 use luma::*;
@@ -203,8 +205,8 @@ assert_eq!(run.state.e.to_vec()?, vec![3.0 / 2048.0, 4.0 / 2048.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-[`iterate_all`](loops.md#elementwise-loops-iterate_all) takes its states as `[&Array<T>; N]`;
-use `Fields::arrays()` or the fields directly.
+[`iterate_all`](loops.md#elementwise-loops-iterate_all) takes its states as an array of
+references `[&Array<T>; N]`: pass the fields, for example `[&q.rho, &q.e]`.
 
 ## When records help
 
@@ -219,4 +221,4 @@ use `Fields::arrays()` or the fields directly.
   element types, or operations that touch one field only. Mixed element types cannot be in one
   record (`Df32` and `f32`, say); keep two records.
 
-The Euler solver in the [worked examples](examples.md) is written entirely with records.
+The Euler solver in the [worked examples](examples.md) keeps its state in a record.

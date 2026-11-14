@@ -69,11 +69,13 @@ assert_eq!(x.index(0).to_vec()?, vec![0, 1, 2, 3]);
 
 `PadMode::Mirror` mirrors about the *boundary face*, not the boundary cell: `-1` reads `0`, `-2`
 reads `1`, `n` reads `n - 1`. That is the ghost cell of a finite-volume wall, and it is why the
-`Mirror` row above equals the `Edge` row for a pad of one. Circular `shift` is the one view that
-wraps; `shift_fill`, `shift_clamp` and `shift_mirror` are the shifts of a bounded domain.
+`Mirror` row above equals the `Edge` row for a pad of one. Circular `shift` and `PadMode::Wrap` are the
+views that wrap; `shift_fill`, `shift_clamp` and `shift_mirror` are the shifts of a bounded domain.
 
-A view is read-only. Writing to it (`assign`, `write`, `+=`, `put`) is an error that names
-`slice_mut` and friends, which are the views that write through ([below](#views-that-write)).
+A slice, flip or transpose is read-only: `assign`, `write`, `+=` and `put` on it fail with
+`InvalidShape`, naming `slice_mut`, `flip_mut` and `transpose_mut`, which are the views that write
+through ([below](#views-that-write)). A `shift`, `pad` or `take` result accepts writes, but they
+fill its own buffer and leave what it was computed from unchanged.
 
 ### Joining arrays
 
@@ -103,8 +105,9 @@ They differ in what they cost:
   fuses into whatever reads it; the parts may be lazy expressions (the ghost cells of a state,
   say), and only the part a cell needs is computed at that cell. Use it for a few pieces read
   by something else.
-- **`stack` is eager and one kernel.** The parts are fused into a single kernel that writes
-  them side by side, so each output element is computed once. The result is an evaluated array.
+- **`stack` is eager.** The parts are fused into kernels that write them side by side (one kernel
+  per group of about `LUMA_FUSION_MAX_LIVE / 4` parts, split further when a group would bind too
+  many buffers), so each output element is computed once. The result is an evaluated array.
   Use it to assemble many expressions into an array that is then read as a whole (the entries of
   a block matrix). Parts that live in several buffers (very large arrays) are joined lazily like
   `concat`.
@@ -234,18 +237,20 @@ uses `take` for table lookups, and the ML-KEM example uses `put` for rejection s
 ## What fuses
 
 - Every view of an array or expression is read inside the kernel that uses it. `a.slice(..) -
-  a.slice(..)` is one kernel reading `a` once.
+  a.slice(..)` is one kernel with no intermediate array.
 - A view of a *lazy* expression is computed at the index it is read. When one expression is read
   at several offsets (the flux of a face read by the two cells next to it), the
   [cost model](performance.md#the-cost-model) picks the cheapest plan: recompute it per read,
-  compute it once per cell of a workgroup tile in workgroup memory, or evaluate it first.
+  compute it once per cell of a workgroup tile in workgroup memory, or evaluate it first (a kernel
+  that would grow past the inline cap, `LUMA_FUSION_MAX_INLINED`, is cut whatever the model says).
   `x.cache()` evaluates on request.
 - `concat` fuses; `stack` is its own eager kernel; `reshape` of a view fuses.
 - An `assign` into a lazy array fuses; into an array with a buffer it is one kernel that
   writes the region. Expressions that do not read the cells being written fuse into that
   kernel.
-- Circular `shift` has its own rule: a small expression is recomputed at a few offsets or
-  staged; a larger one is evaluated first.
+- Circular `shift` has its own rule: an expression is recomputed at up to eight offsets while one
+  more computation costs less than storing it and reading it back, or staged; otherwise it is
+  evaluated first.
 
 What does not fuse: `scan` and axis reductions ([Reductions](reductions.md)), and custom kernels,
 which see the arrays computed.

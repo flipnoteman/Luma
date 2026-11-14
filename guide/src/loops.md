@@ -12,8 +12,8 @@ on the GPU:
 | [`Array::iterate_until`](https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate_until) | a step until the largest change is below a tolerance |
 | [`iterate_until_all`](https://docs.rs/luma/latest/luma/fn.iterate_until_all.html) | a step on any [record](records.md) until a rule over recorded scalars holds |
 
-All of them evaluate the stop rule or the step count on the GPU, and none of them needs you to
-manage the second buffer a step needs: the previous state and the next are swapped for you.
+The two `_until` loops evaluate their stop rule on the GPU; `iterate` and `iterate_all` run a
+fixed number of steps. None of them needs you to manage the second buffer a step needs: the previous state and the next are swapped for you.
 
 ## Stencils: `iterate`
 
@@ -59,8 +59,8 @@ u.shift([0, 1]) + u.shift([0, -1]) - u * 4.0`.
 
 `iterate_all(init, steps, step)` runs the step on `N` arrays at once; `step` gets `&[Array<T>; N]`
 and returns the next `[Array<T>; N]`. When every result is an elementwise expression of the
-states, of other arrays of the same length, and of scalars, **the whole loop is one kernel that
-keeps the states in registers and writes them once**, whatever the step count. That is the shape
+states, of other arrays of the same length, and of scalars, **the whole loop is a kernel that
+keeps the states in registers and writes them once per launch**, whatever the step count. That is the shape
 of a Mandelbrot iteration, a Monte Carlo walk, or a round of a hash function.
 
 ```rust
@@ -103,9 +103,9 @@ are the same; only the one-kernel register loop is lost.
 ### Launch sizing
 
 A long register loop is not one kernel launch for ever. The cost model
-([Performance](performance.md#the-cost-model)) cuts it into launches of about 40 ms of GPU time,
-so a loop of a million steps is a handful of launches and never trips a driver's watchdog on a
-display GPU. Because the host only records launches, the CPU is free while the GPU computes.
+([Performance](performance.md#the-cost-model)) sizes its launches to about 40 ms of GPU time (at least one step per launch), which keeps them far
+below a driver watchdog (2 s on Windows) unless a single step is itself that long. The host only
+records the launches.
 
 ### Calling it again
 
@@ -113,22 +113,24 @@ A register loop called again from the *same place in the source*, whose step bui
 (the same operations and scalar values) over other arrays, is not flattened again. After two calls
 in a row did that, the GPU starts the loop before `step` is even traced, on the guess that it will
 build the same graph again (a wrong guess only wastes GPU time). `step` is still called once per
-call, and a captured array is read when the loop runs. A function that runs a fixed kernel per
-batch (the permutation of a hash, one Mandelbrot tile) is therefore cheap from its second call on.
+call, and a captured array is read when the loop runs. A function that runs the same loop per
+batch (the permutation of a hash, one Mandelbrot tile) therefore skips the flattening from its
+second call on.
 
 ## The step runs once
 
-`step` is called **once** to trace it, with placeholder arrays (`iterate` and `iterate_all`) or the
-state (`iterate_until_all`); the recorded launches are replayed for every step. So:
+`step` is called **once** to trace it, with placeholder arrays (`iterate_until_all` passes the state itself only
+when it spans several buffers); the recorded launches are replayed for every step. So:
 
 - compute the next state from the arguments and *captured arrays only*, in the closure;
-- do not keep the argument or read values back inside the step (`item`, `to_vec`): a step that
-  reads back cannot be replayed and runs as a host loop instead (still correct, not fast);
+- do not keep the argument or read values back inside the step (`item`, `to_vec`): an
+  `iterate_until_all` step that reads back cannot be replayed and runs as a host loop instead
+  (still correct, not fast);
 - anything that depends on the iteration number must be an array, not a Rust variable. The step
   of `iterate_until_all` gets the 0-based index of the step as a one-element `f32` array for this
   purpose; `iterate_all` loops over rounds (a Keccak round constant) carry a counter in a state;
-- the state arrays are read-only inside a step: `assign` or `+=` on the argument fails with
-  `LumaError::ReadOnly`. Compute a new array instead.
+- the state arrays are read-only inside a step: `assign` on the argument fails with
+  `LumaError::ReadOnly`, and `+=` poisons the array with it. Compute a new array instead.
 
 `init` of `iterate` and `iterate_all` is not modified; the result is a new array.
 
@@ -149,7 +151,7 @@ let run = iterate_until_all(
         .stop_when(|h| (h["max"].first() / h["max"].last()).ge(1e6)),
     |s, _step| (&s.0 * 0.5,),
 )?;
-assert_eq!(run.steps, 21);                       // 2^20 < 1e6 <= 2^21 / 2
+assert_eq!(run.steps, 21);                       // the ratio after s steps is 2^(s-1): 2^19 < 1e6 <= 2^20
 assert_eq!(run.reason, StopReason::Predicate(0));
 assert_eq!(run.history("max").unwrap().len(), 21);
 assert_eq!(run.state.0.to_vec()?[0], 4.0 / 2f32.powi(21));
@@ -261,5 +263,5 @@ been seen repeating, Luma computes the next few steps and their residuals during
 answers the following readbacks from memory (*speculation*): the round trip is paid once per
 several steps. Values are those of the program as written; a miss only costs the wasted GPU
 work. `LUMA_SPECULATE=off` disables it ([Environment variables](environment.md)). If the loop
-only needs a convergence test, `iterate_until` and `iterate_until_all` skip the readbacks
-entirely.
+only needs a convergence test, `iterate_until` and `iterate_until_all` wait once per block of
+steps instead of once per step.

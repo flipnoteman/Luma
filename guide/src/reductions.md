@@ -1,9 +1,10 @@
 # Reductions and scans
 
-A reduction turns an array into fewer numbers: a sum, a minimum, a norm. In Luma a reduction is
-a lazy operation like any other. It returns a one-element array, the expression behind it is
-fused into the reduction's first pass, and nothing waits for the GPU until the host asks for
-the value.
+A reduction turns an array into fewer numbers: a sum, a minimum, a norm. In Luma a reduction
+returns a one-element array and the expression behind it is fused into the reduction's first
+pass. Over an `f32` array, or over any lazy expression, nothing runs until the result is needed;
+over an already computed `u32`, `f64` or `Df32` array the passes are recorded at once (still
+without waiting). Nothing waits for the GPU until the host asks for the value.
 
 ## Lazy one-element results
 
@@ -65,13 +66,13 @@ if ctx.profiling_supported() {
 
 A large array takes two launches: a first pass in which every workgroup reduces a slice of the
 expression to a partial result, and a second that combines the partials. An array small enough
-for one workgroup takes one. Float sums combine in trees and over at most a few hundred
-sequential steps per invocation, so the error stays far below that of a sequential sum.
+for one workgroup takes one. Float sums combine in trees (see the `Array::sum` documentation), so the
+error stays far below that of a sequential sum.
 
 ### Epilogues
 
-Elementwise operations *with scalars* on a reduction's result extend the reduction instead of
-creating an expression: the last pass applies them. `norm()` is `SumOfSquares` followed by a
+For `f32` reductions, elementwise operations *with scalars* on the result extend the reduction
+instead of creating an expression: the last pass applies them. `norm()` is `SumOfSquares` followed by a
 square root in the last pass, and `mean()` is a sum followed by a division. You can chain up to
 four such steps yourself without an extra launch:
 
@@ -172,16 +173,16 @@ assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec()?, vec![3.0, 3.0, 4.0, 4.0, 5.
 elementwise expression of its two arguments and scalars (scalars it captures are uniforms:
 changing them does not recompile); anything else poisons the result. Non-associative operators
 give unspecified results, because the kernels regroup operands. Scans and axis reductions do not
-fuse into the expression behind them: the arrays are evaluated first. Their kernels run long
-lines in workgroup memory in blocks, so they stay fast on lines of millions of elements.
+fuse into the expression behind them: the arrays are evaluated first. They are available for
+`f32` and `u32` arrays only (`f64` and `Df32` fail with `Unsupported`).
 
 ## Precision
 
 Float reductions run in the element type of the array. For more accuracy, reduce in a wider
 type:
 
-- `sum_compensated()` and `norm_compensated()` accumulate in `Df32` (about twice the precision
-  of `f32`) and round to `f32` at the end. Use them for residual norms and regression tests.
+- `sum_compensated()` and `norm_compensated()` accumulate in `Df32` (about 48 bits of
+  mantissa against 24) and round to `f32` at the end. Use them for residual norms and regression tests.
 - `to_df32().sum()` returns the `Df32` result itself, `to_f64().sum()` an `f64` on devices that
   have it.
 

@@ -123,9 +123,10 @@ What to look at:
   region (`w.slice_mut(0, ..1).assign(mirror(..))`, [Views](views.md#ghost-cells)); the repository
   versions do that for a reflecting wall.
 - The fluxes are read at two different **offsets** by the two cells next to a face: slices of the
-  padded state through the flux expression. Luma computes each flux once per face (staging in
-  workgroup memory) or recomputes it, whichever the [cost model](performance.md#the-cost-model)
-  estimates is cheaper. `ctx.profile` shows which.
+  padded state through the flux expression. Luma either computes each flux once per face (staging in
+  workgroup memory, or evaluating it first) or recomputes it per read, whichever the
+  [cost model](performance.md#the-cost-model) estimates is cheaper. `ctx.profile` shows how many
+  kernels that took.
 - `q.eval()` hands the step over without waiting; the loop is a per-step `eval` loop
   ([Loops](loops.md#loops-with-eval)).
 - The 2-D version has the same structure with `[(1, 1), (1, 1)]` pads and slices along both axes
@@ -189,12 +190,14 @@ What to look at:
 - `keccak_round_with`: theta, rho-pi, chi and iota as array expressions; the constants of rotations
   are host numbers, so the shifts compile with constant amounts.
 - The two rows of the table: **one permutation per `eval`** and **`iterate_all` over many
-  permutations**. The second keeps 1600 bits per instance in registers across all rounds (one
-  kernel when the device binds enough buffers for the 50 state words, a few kernels otherwise). The
-  `host ms` column is only the tracing of the step: later calls run from the program of the first.
+  permutations**. The second traces the permutation once and runs it as a register loop where the
+  step is elementwise and fits (the `launches/perm` column and the profile after the table show
+  how many kernels it took). The `host ms` column is only the tracing of the step: later calls
+  run from the program of the first (the header of the file explains).
 - The profile after the table: kernels per permutation and the reasons for the cuts.
 - The known-answer tests in `tests/keccak.rs`, and the test that a chain of eight permutations
-  (30 000 operations) is a few kernels, not one per operation.
+  (about 80 000 operations) is cut into at most 60 kernels (it is skipped on CPU and Apple
+  profiles and without timestamp queries).
 
 ## CPA hypothesis matrix
 
@@ -210,8 +213,9 @@ What to look at:
   an array along axis 0, so `&pt ^ &guesses` broadcasts to the whole matrix;
 - `take` does both table lookups, and `sum_axis(0)` of centred products gives the covariance
   columns, all broadcasting: the program never writes a loop over guesses or traces;
-- the matrix is never stored in full: the gathers and products fuse into the reductions.
-  Wrap the analysis in `ctx.profile(..)` and count `launches()` to see.
+- the gathers and the elementwise products fuse; `sum_axis` does not fuse its operand, so the
+  centred and multiplied `[traces, 256]` arrays are computed before it. Wrap the analysis in
+  `ctx.profile(..)` and count `launches()` to see.
 
 Replace the stand-in S-box with your cipher's table and the synthetic leakage with a measured
 sample per trace to use it on real data.

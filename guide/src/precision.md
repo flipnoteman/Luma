@@ -7,12 +7,12 @@ types and compensated reductions:
 | Type | Bits | Where it runs | Cost |
 | --- | --- | --- | --- |
 | `f32` | 24 of mantissa | everywhere | 1 |
-| `Df32` | about 48 | everywhere (computed with `f32` arithmetic) | tens of `f32` operations per add or multiply |
+| `Df32` | about 48 | everywhere (computed with `f32` arithmetic) | about 27 to 44 `f32` operations per add or multiply on the GPUs measured, about 2 on llvmpipe |
 | `f64` | 53 | devices with `SHADER_F64` | 11 to 41 `f32` operations on the GPUs measured |
 
 Both wide types take 8 bytes per element. Pick the narrowest that gives the accuracy you need,
-and use wide types only where it matters: the cost model weighs `Df32` arithmetic correctly, so a
-mixed program does not slow the `f32` parts.
+and use wide types only where it matters: the cost model weighs `Df32` and `f64` arithmetic by
+the factors it measured ([Performance](performance.md#the-cost-model)).
 
 ## `f64`
 
@@ -47,8 +47,8 @@ cast down to `f32` for the function.
 ## `Df32`
 
 A `Df32` is the unevaluated sum `hi + lo` of two `f32`, with `|lo|` at most half an ulp of `hi`.
-Together they carry about 48 bits of mantissa (a relative error near `2^-46`; `sqrt` is accurate
-to about 44 bits), and the arithmetic uses `f32` operations only, so it runs on every device.
+Together they carry about 48 bits of mantissa (a relative error near `2^-46`; division and `sqrt`
+are accurate to about `2^-45`), and the arithmetic uses `f32` operations only, so it runs on every device.
 
 ```rust
 use luma::*;
@@ -72,16 +72,17 @@ trigonometry: cast to `f32` and back around such a call. Scalars may be `Df32` v
 a Rust `f32` literal in a `Df32` expression is not converted for you (write `Df32::from(1.0f32)`
 or build the array with `to_df32()`).
 
-**Cost.** One `Df32` add or multiply is tens of `f32` operations. On a discrete GPU the arithmetic
-is cheap enough that a stencil on `Df32` is still memory-bound, on a CPU rasteriser it is cheaper
-still; the [`CostModel`](https://docs.rs/luma/latest/luma/struct.CostModel.html) of the device
-records the measured factor (`df32_factor`, about 27 on an RTX 3090) and the fusion decisions use
-it. This is why a `Df32` expression read at several offsets is more likely to be staged in
-workgroup memory than recomputed ([Performance](performance.md#the-cost-model)).
+**Cost.** One `Df32` add or multiply costs `df32_factor` `f32` operations: 27 on the RTX 3090
+and 44 on the integrated GPU the model was measured on, 2.3 on llvmpipe. The
+[`CostModel`](https://docs.rs/luma/latest/luma/struct.CostModel.html) of the device records the
+measured factor and the fusion decisions use it. A higher factor makes recomputing a `Df32` expression at several offsets more expensive in the
+model's estimate, which weighs it against staging and materialising it
+([Performance](performance.md#the-cost-model)).
 
 **Fused multiply-add.** The product of two `Df32` takes the rounding error of the `f32` product from
 `fma`. Where the device's `fma` is a real fused multiply-add (checked by a small kernel when a
-device first opens) this is several times cheaper than splitting both factors (Dekker). `LUMA_DF_FMA`
+device first opens) this is cheaper than splitting both factors (Dekker splitting takes about ten times as many
+operations for the error of the product). `LUMA_DF_FMA`
 and `ContextOptions::df_fma` force either way; the results are the same, only the speed differs.
 
 ## Casts
@@ -125,8 +126,7 @@ assert!((f64::from(norm) - (exact * f64::from(0.1f32)).sqrt()).abs() < 1e-3);
 # Ok::<(), luma::LumaError>(())
 ```
 
-They read the array once and cost several times the plain sum's arithmetic, which is still
-memory-bound for large arrays. The order of the reduction tree can change the bits below `f32`
+They read the array once and cost several times the plain sum's arithmetic. The order of the reduction tree can change the bits below `f32`
 precision, so the result is the correctly rounded sum except where the terms cancel almost
 completely. To keep the extra bits, reduce a `Df32` array yourself: `x.to_df32().sum()`.
 
@@ -152,7 +152,8 @@ assert_eq!(clean.to_vec()?, vec![1.0, 0.0, 0.0, -2.0]);
 ```
 
 To find where a NaN starts, open the context in debug mode with `check_finite`: every evaluated
-array is checked and the first operation whose result holds a NaN or Inf fails with
+`f32` and `Df32` array is checked (`f64` is not) and the first operation whose result holds a NaN
+or Inf fails with
 `LumaError::NonFinite`, naming its source line. It waits for the GPU after every array; for
 debugging only.
 
@@ -180,8 +181,8 @@ By default Luma rewrites expressions only where the result is bit-identical (`x 
 | `x * 0` becomes `0`, `x - x` becomes `0` | wrong for NaN and infinity |
 | `x / x` becomes `1` | wrong for 0, NaN and infinity |
 | `x <= x`, `x >= x`, `x == x` become true; `x != x` false | wrong for NaN |
-| `(x * a) * b` and `(x + a) + b` combine their constants | different rounding |
-| `x / a` for a constant `a` becomes `x * (1 / a)` | different rounding |
+| `(x * a) * b` and `(x + a) + b` combine their constants (`f32` and `f64` only) | different rounding |
+| `x / a` for a constant `a` becomes `x * (1 / a)` (`f32` and `f64` only) | different rounding |
 | `powf(x, e)` with `e` of 1, 2 or 0.5 becomes `x`, `x * x`, `sqrt(x)` | different rounding |
 | `Df32` adds and subtracts use the cheaper algorithm | the relative error grows with the cancellation (below `2^-47` of the larger operand, instead of `2^-46` of the result); reductions are excepted |
 

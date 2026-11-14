@@ -109,8 +109,8 @@ assert_eq!(t.to_vec()?[1], 4.0);                // t(1, 0) = a(0, 1)
 # Ok::<(), luma::LumaError>(())
 ```
 
-`Kernel::new(src)` is `default_context()?.kernel(src).build()`. Building the same source twice on
-a context reuses the pipeline, and a `Kernel` is cheap to clone. The shader is parsed and validated
+`Kernel::new(src)` is `default_context()?.kernel(src).build()`. Building the same source, entry point,
+workgroup size and label twice on a context reuses the pipeline, and a `Kernel` is cheap to clone. The shader is parsed and validated
 when you build it: a mistake comes out as `LumaError::ShaderCompile` with the WGSL error and
 line numbers that match your source (Luma appends its prelude, so it never shifts them).
 
@@ -203,8 +203,8 @@ for (g, w) in a.to_vec()?.iter().zip(&want) {
 # Ok::<(), luma::LumaError>(())
 ```
 
-(For a stencil in a loop, [`iterate`](loops.md) usually beats a hand-written kernel: it runs several
-steps per pass over the data.)
+(For a stencil in a loop, also look at [`iterate`](loops.md): it runs several steps per pass over
+the data.)
 
 ## Strided views
 
@@ -238,8 +238,8 @@ assert_eq!(out.to_vec()?, vec![9.0, 10.0, 5.0, 6.0, 1.0, 2.0]);
 ```
 
 A [`ViewMut`](views.md#views-that-write) passed as `&mut view` binds the same way and the kernel
-writes the region in place. Any other array (not a view) is passed as a contiguous array. Views
-that are not plain translations and flips are evaluated first.
+writes the region in place. Any other array (not such a view) is passed as a contiguous array, evaluated first; so are pads and
+edge shifts. Slices, flips and transposes are read in place.
 
 ## Errors
 

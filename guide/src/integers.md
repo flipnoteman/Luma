@@ -118,11 +118,11 @@ for r in [1u32, 28, 32, 45] {
 # Ok::<(), luma::LumaError>(())
 ```
 
-Keccak-f[1600] is 25 such lanes, 24 rounds of `^ & | !` and rotations on 50 arrays. The example
-writes the permutation as a Rust function on `[Array<u32>; 50]`, runs one round per
-[`iterate_all`](loops.md) step with the round constant carried in a state word, and the 1600
-state bits of a million sponges stay in registers across all 24 rounds. [Worked examples](examples.md#keccak)
-shows how to run it and what to look at.
+Keccak-f[1600] is 25 such lanes, 24 rounds of `^ & | !` and rotations on 50 arrays.
+`examples/keccak.rs` writes the permutation as a Rust function on `[Array<u32>; 50]` and runs a whole
+permutation per [`iterate_all`](loops.md) step; `examples/mlkem` (`keccak_f_loop`) runs one round
+per step, with the round constant from an LFSR carried as a 51st state word.
+[Worked examples](examples.md#keccak) shows how to run them and what to look at.
 
 ## Lookup tables with `take`
 
@@ -174,20 +174,20 @@ assert!(corr[best] > 0.999);
 # Ok::<(), luma::LumaError>(())
 ```
 
-The whole analysis is a handful of kernels over a `[traces, 256]` matrix that is mostly never
-stored: the gathers and the products fuse into the reductions (look at `ctx.profile` to see
-how many).
+The gathers and the elementwise arithmetic fuse, but `sum_axis` does not fuse its operand
+([Reductions](reductions.md#scans)): the arrays it reduces (`hc * tc`, ...) are computed into
+`[traces, 256]` buffers first. Wrap the analysis in `ctx.profile(..)` to see the kernels.
 
 ## States in `iterate_all`
 
-A record of `u32` arrays is a valid state for [`iterate_all`](loops.md#elementwise-loops-iterate_all).
-An integer step that is elementwise, such as a hash round or a random-number generator, runs as one
-kernel that keeps the state in registers for any number of steps:
+`u32` arrays are a valid state for [`iterate_all`](loops.md#elementwise-loops-iterate_all). An
+integer step that is elementwise, such as a hash round or a random-number generator, runs as a
+kernel that keeps the state in registers, in launches of about 40 ms of GPU time:
 
 ```rust
 use luma::*;
 
-// xorshift32, 1000 steps per element in one kernel.
+// xorshift32, 1000 steps per element.
 let seed = Array::from_slice(&[1u32, 2, 3], 3)?;
 let [x] = iterate_all([&seed], 1000, |[x]| {
     let a = x ^ (x << 13u32);

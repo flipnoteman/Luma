@@ -44,7 +44,7 @@ A kernel runs when one of these happens:
 | --- | --- |
 | `to_vec`, `read_into`, `item`, `to_array` | compute what the array needs, submit, wait, copy back |
 | `a.eval()` / `eval_all(&[&a, &b])` | compute these arrays and hand the batch to the GPU **without waiting** |
-| `ctx.flush()` / `luma::flush()` | compute **every** pending array and hand the batch to the GPU without waiting |
+| `ctx.flush()` / `luma::flush()` | compute every lazy array this thread still holds and hand the batch to the GPU without waiting |
 | `ctx.sync()` | submit and wait until the GPU is idle |
 | a custom [`Kernel`](custom-kernels.md) reads or writes the array | the array is computed first |
 
@@ -77,14 +77,15 @@ generators (`range`, `linspace`, `uniform`), [views](views.md) (`slice`, `pad`, 
 `transpose`, `shift`, `take`, `concat`), compound assignment, and the elementwise prologue and
 epilogue of a [reduction](reductions.md). A view of a lazy expression is recomputed at the
 reader's index, staged in workgroup memory, or evaluated first, whichever the
-[cost model](performance.md#the-cost-model) estimates is cheapest.
+[cost model](performance.md#the-cost-model) estimates is cheapest (within the caps below: a kernel
+that would exceed `LUMA_FUSION_MAX_INLINED` is cut whatever the model says).
 
 Not fused, because they need whole-array structure: `scan`, `sum_axis`, tridiagonal solves, FFT
 convolution, and your own kernels. They read the arrays they are given, which are computed first.
 
 An expression is cut into several kernels when it would grow past a limit (`LUMA_FUSION_MAX_NODES`,
 `LUMA_FUSION_MAX_LIVE`, `LUMA_FUSION_MAX_INLINED`) or when evaluating a shared piece first is
-cheaper. [`Profile::splits`](https://docs.rs/luma/latest/luma/struct.Profile.html) tells you where
+cheaper. [`Profile::splits`](https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits) tells you where
 and why.
 
 ## `cache()`
