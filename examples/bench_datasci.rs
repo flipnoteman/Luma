@@ -454,30 +454,41 @@ fn case_scatter_add(b: &mut Bench) {
     });
 }
 
-/// Checks the hand-written group sum (privatised for 16 and 1024 groups, global for `2^20`)
-/// against host f64 sums and times it over `2^24` rows.
-fn sanity_group_sum(b: &mut Bench) {
-    b.guarded("hand/group_sum", |b| {
+/// `vals.group_sum(&codes, groups)` over `2^24` rows (a few codes past `groups`) against the hand
+/// kernel (privatised for 16 and 1024 groups, global for `2^20`), both zero-filled each run.
+/// Both sides are verified against host f64 sums first.
+fn case_group_sum(b: &mut Bench) {
+    b.guarded("group_sum/f32", |b| {
         let ctx = b.ctx.clone();
         let n = if b.quick { 1usize << 18 } else { 1 << 24 };
         let hv = values(n, 71, -1.0, 2.0);
         let val = Array::from_slice_on(&ctx, &hv, n).unwrap();
         let zero = hand::HandZero::new(&ctx).unwrap();
         for groups in [16usize, 1024, if b.quick { 1 << 14 } else { 1 << 20 }] {
-            // A few codes past `groups` exercise the skip.
             let hc = codes(n, 70 + groups as u64, (groups + groups / 16 + 1) as u32);
             let (sum, mag) = host_scatter(&hc, &hv, groups);
             let c = Array::from_slice_on(&ctx, &hc, n).unwrap();
             let hand = hand::HandGroupSum::new(&ctx, groups).unwrap();
             let mut out = Array::<f32>::zeros_on(&ctx, groups).unwrap();
+
+            let g = val.group_sum(&c, groups);
+            g.eval().unwrap();
+            check_sums(&format!("group_sum/{groups} luma"), &g.to_vec().unwrap(), &sum, &mag);
             hand.run(&c, &val, &mut out, n);
-            check_sums(&format!("hand/group_sum{groups}"), &out.to_vec().unwrap(), &sum, &mag);
-            report_hand(b, &format!("hand/group_sum{groups} n={n}"), 8.0 * n as f64, &mut || {
-                zero.run(&mut out, groups);
-                hand.run(&c, &val, &mut out, n);
-            });
+            check_sums(&format!("group_sum/{groups} hand"), &out.to_vec().unwrap(), &sum, &mag);
+
+            b.compare(
+                &format!("group_sum/f32/{groups}"),
+                &format!("{n}->{groups}"),
+                Work::Bytes(8.0 * n as f64),
+                Some(DEFAULT_GATE),
+                &mut || val.group_sum(&c, groups).eval().unwrap(),
+                &mut || {
+                    zero.run(&mut out, groups);
+                    hand.run(&c, &val, &mut out, n);
+                },
+            );
         }
-        println!("hand group_sum ok");
     });
 }
 
@@ -714,7 +725,7 @@ fn main() {
     sanity_axis(&mut b);
     case_hist(&mut b);
     case_scatter_add(&mut b);
-    sanity_group_sum(&mut b);
+    case_group_sum(&mut b);
     case_sort(&mut b);
     cmp_matmul(&mut b);
     cmp_gram(&mut b);

@@ -11,11 +11,27 @@ use crate::ops::Operand;
 
 /// Element types the combining scatters ([`Array::put_add`], [`Array::put_min`],
 /// [`Array::put_max`]) are defined for: `u32`, `i32` and `f32`.
-pub trait AtomicElem: ScalarType {}
+pub trait AtomicElem: ScalarType {
+    /// The value no element is greater than: where a minimum starts.
+    #[doc(hidden)]
+    const MIN_IDENTITY: Self;
+    /// The value no element is less than: where a maximum starts.
+    #[doc(hidden)]
+    const MAX_IDENTITY: Self;
+}
 
-impl AtomicElem for u32 {}
-impl AtomicElem for i32 {}
-impl AtomicElem for f32 {}
+impl AtomicElem for u32 {
+    const MIN_IDENTITY: u32 = u32::MAX;
+    const MAX_IDENTITY: u32 = 0;
+}
+impl AtomicElem for i32 {
+    const MIN_IDENTITY: i32 = i32::MAX;
+    const MAX_IDENTITY: i32 = i32::MIN;
+}
+impl AtomicElem for f32 {
+    const MIN_IDENTITY: f32 = f32::INFINITY;
+    const MAX_IDENTITY: f32 = f32::NEG_INFINITY;
+}
 
 impl<T: AtomicElem> Array<T> {
     /// Scatters with addition: `self[indices[i]] += values[i]` for every `i`, in place, so equal

@@ -199,6 +199,35 @@ assert_eq!(&lines[3..], &[-1.0, 0.5, 2.0]);
 Floats sort in the total order of their bits: `-inf < .. < -0.0 < +0.0 < .. < +inf < NaN`, so NaNs
 come last (first when descending) and `-0.0` sorts before `+0.0`.
 
+## Groups, unique values and quantiles
+
+`group_sum`, `group_min`, `group_max`, `group_mean` and `group_count` reduce the elements that
+share a code (a groupby over dense codes `0..groups`); codes of `groups` or more are skipped. The
+values and codes fuse into one scatter kernel. `factorize` finds the sorted distinct values and
+the code of every element (one host sync), `quantile` and `median` interpolate linearly in the
+sorted array like NumPy.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let codes = Array::from_slice(&[0u32, 1, 0, 1], 4)?;
+assert_eq!(x.group_sum(&codes, 2).to_vec()?, [4.0, 6.0]);
+assert_eq!(x.group_mean(&codes, 2).to_vec()?, [2.0, 3.0]);
+
+let (uniques, ids) = Array::from_slice(&[5u32, 3, 5, 9], 4)?.factorize();
+assert_eq!(uniques.to_vec()?, [3, 5, 9]);
+assert_eq!(ids.to_vec()?, [1, 0, 1, 2]);
+
+assert_eq!(x.median().item()?, 2.5);
+assert_eq!(x.quantile(0.25).item()?, 1.75);
+# Ok::<(), luma::LumaError>(())
+```
+
+Empty groups give 0 for sums and counts, NaN for means and the identity (`+inf` / `-inf`, the
+integer maximum / minimum) for `group_min` / `group_max`. NaNs sort last, so they only affect the
+high quantiles.
+
 ## Precision
 
 Float reductions run in the element type of the array. For more accuracy, reduce in a wider

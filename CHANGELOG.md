@@ -28,6 +28,13 @@ All notable changes to Luma are listed here. The format follows
   `From<bool>`, `From<Mask> for bool`): `& | ^ !`, `count()` (a `u32` array), `any()` and `all()`
   (mask arrays), `to_u32()` and `to_f32()`, `min` / `max`, views, `select` and loops.
 - The fuzzer covers `i32`, masks and the new casts.
+- Group reductions `group_sum`, `group_min`, `group_max` (`u32`, `i32`, `f32`), `group_count`
+  and `group_mean` (`f32`): scatter-based, the values and codes fuse into one kernel; codes past
+  `groups` are skipped.
+- `factorize` (sorted distinct values and dense codes) and `unique` for `u32`, `i32` and `f32`;
+  all NaNs form one value, `-0.0` and `0.0` one value.
+- `quantile`, `median`, `quantile_axis` and `median_axis` for `f32` (NumPy's linear method, on
+  the sorted array).
 - A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
   version per release (`/vX.Y.Z/`) and `/main/`: arrays, lazy evaluation and fusion, views and
   writes, reductions and scans, records, loops, precision, integer and bit operations, custom
