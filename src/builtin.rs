@@ -549,6 +549,14 @@ pub(crate) enum Builtin {
     /// `out[i] = 1` where word `i` of `a` is a NaN or an infinity (as `f32` bits), else 0;
     /// arguments: out, a. Element type `"u32"`. See `jit::check_finite`.
     NonFinite,
+    /// Tiled matrix product of the operands (buffers) `a` and `b`; see [`crate::matmul`].
+    /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
+    /// dimension and writes every slice's partial product after the previous one.
+    Matmul { tile: crate::matmul::MatmulTile, aligned: bool, split: bool },
+    /// `out[i] = Σ_z part[z * size + i]` for `p.s` slices `z`: the sum of the partial products of
+    /// a split [`Builtin::Matmul`]. Arguments: out, part, uniform `{s}`; `luma.size.x` is the
+    /// elements of `out`.
+    MatmulSum,
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -1315,6 +1323,8 @@ impl Builtin {
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
                 crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows).into()
             }
+            Builtin::Matmul { tile, aligned, split } => crate::matmul::builtin_source(tile, aligned, split).into(),
+            Builtin::MatmulSum => crate::matmul::sum_source(wg).into(),
             Builtin::NonFinite => format!(
                 "@group(1) @binding(0) var<storage, read_write> out: array<u32>;
 @group(1) @binding(1) var<storage, read> a: array<u32>;
