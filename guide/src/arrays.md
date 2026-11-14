@@ -12,8 +12,8 @@ let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?;
 assert_eq!(a.shape(), Shape::from([3, 2]));
 assert_eq!(a.len(), 6);
 
-// Constants and generators. Generators are computed inside the kernel that reads them,
-// they are not stored.
+// Constants and generators. `zeros` and `full` are buffers filled at once; the generators
+// (`linspace`, `range`, `uniform`) are computed inside the kernel that reads them, not stored.
 let zeros = Array::<f32>::zeros([3, 2])?;
 let twos = Array::<f32>::full([3, 2], 2.0)?;
 let ramp = Array::linspace(0.0, 1.0, 5)?;
@@ -116,6 +116,6 @@ let a = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
 let b = Array::from_slice(&[1.0f32, 2.0], 2)?;
 let c = (&a + &b) * 2.0;                 // no panic here
 assert!(c.check().is_err());             // `check` asks without waiting for the GPU
-assert!(c.to_vec().is_err());            // the error names the failed `+` and its source line
+assert!(c.to_vec().is_err());            // the error says `add` failed, with its source line
 # Ok::<(), luma::LumaError>(())
 ```

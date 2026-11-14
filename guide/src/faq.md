@@ -22,7 +22,7 @@ assert_eq!((&x + &x).to_vec()?, vec![2.0, 4.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-**Opening a context returns "No suitable adapter".** There is no Vulkan, Metal or DX12 driver
+**Opening a context returns `LumaError::NoAdapter` ("Found no adapters").** There is no Vulkan, Metal or DX12 driver
 Luma can use. On Linux install `mesa-vulkan-drivers` (lavapipe) for the CPU fallback, or your GPU
 vendor's Vulkan driver. CI runners need the former.
 
@@ -39,9 +39,9 @@ contexts is an error. The `_on(&ctx, ..)` constructors take a context explicitly
 
 **The process hangs or aborts when it exits.** NVIDIA's Linux driver can crash or hang in its own
 shader-compiler threads during `exit`. Luma waits at exit for the GPU (up to 2 s) and for busy
-driver compiler threads (up to 2 s), then ends the process with `_exit`. That makes the problem
+Vulkan driver threads (up to 2 s), and calls `_exit` only if they are still busy after that. That makes the problem
 rare, not impossible (driver 615.x was seen to still do it). `LUMA_EXIT_WAIT=0` skips the wait,
-which saves about 50 ms of exit time and risks the hang. A normal `main` return goes through
+which saves about 60 ms of exit time and risks the hang. A normal `main` return goes through
 this path; calling `std::process::exit` yourself does too.
 
 **Opening a second device stalls.** On NVIDIA, creating a device (`Context::new`) blocks
@@ -53,10 +53,11 @@ or use one context (the default one is shared by threads).
 
 Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (`scan`, `cumsum`,
 axis reductions), workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
-cyclic solver is chosen automatically only on NVIDIA; elsewhere (and with
-`LUMA_TRIDIAGONAL=thomas`) the solver does not use it. If you see wrong results on such a GPU:
+cyclic solver is chosen automatically only on the NVIDIA tuning profile (a GPU detected as NVIDIA,
+or `LUMA_TUNING=nvidia`); elsewhere (and with `LUMA_TRIDIAGONAL=thomas`) the solver does not use it. If you see wrong results on such a GPU:
 
-- `LUMA_STAGING=off` keeps expressions out of workgroup memory (the kernel recomputes them),
+- `LUMA_STAGING=off` keeps expressions read through views out of workgroup memory (the cost model
+  then recomputes them or evaluates them first),
 - `LUMA_TRIDIAGONAL=thomas` pins the solver that does not use workgroup memory,
 - scans and axis reductions have no switch: run on another device (`LUMA_DEVICE=cpu`, or a
   different GPU through `VK_ICD_FILENAMES`).
@@ -68,8 +69,8 @@ array and the error comes out at `to_vec`, `item`, `eval` or `check()`. Call `ch
 array to find the first failure early. The error carries the source location of the operation.
 
 **I get `NaN` or `Inf` and do not know where it starts.** Set `LUMA_CHECK_FINITE=1` (or
-`ContextOptions::check_finite`): every evaluated array is checked and the first operation whose
-result holds a non-finite value fails with `LumaError::NonFinite`. It waits for the GPU after every
+`ContextOptions::check_finite`): every evaluated `f32` and `Df32` array is checked (`f64` is not) and
+the first operation whose result holds a non-finite value fails with `LumaError::NonFinite`. It waits for the GPU after every
 array, so use it for debugging only. For `f32`, `f64` and `Df32` arrays,
 `is_finite()` / `is_nan()` / `is_inf()` give lazy `u32` masks you can use in expressions.
 

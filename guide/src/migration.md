@@ -1,6 +1,6 @@
 # Migration from 0.2
 
-0.3 changes two things your 0.2 code can trip over. Everything else in 0.3 is added.
+0.3 changes two things your 0.2 code can trip over. Almost everything else in 0.3 is added; the few behaviour changes (a lazy `reshape` of a view, fusion decided by a cost model, a larger buffer pool) are listed under *Changed* in the changelog.
 
 ## Reductions are lazy arrays
 

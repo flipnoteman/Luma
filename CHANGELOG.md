@@ -9,7 +9,10 @@ All notable changes to Luma are listed here. The format follows
 ### Added
 
 - A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
-  version per release (`/vX.Y.Z/`) and `/main/`; its code blocks are tested as doctests.
+  version per release (`/vX.Y.Z/`) and `/main/`: arrays, lazy evaluation and fusion, views and
+  writes, reductions and scans, records, loops, precision, integer and bit operations, custom
+  kernels, a performance guide and worked examples (heat equation, Euler solver, ML-KEM, Keccak,
+  CPA). Its code blocks are tested as doctests.
 
 ### Removed
 
