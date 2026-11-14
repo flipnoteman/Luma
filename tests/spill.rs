@@ -114,17 +114,20 @@ fn readbacks_in_a_loop_under_a_budget_do_not_deadlock() {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let ctx = small_budget();
-        let len = 1 << 18;
-        // Several arrays of the budget's size: every step has to evict while it speculates.
+        let len = 1 << 17;
+        // Arrays of half the budget each: every step has to evict while it speculates.
         let held: Vec<Array<f32>> = (0..6).map(|k| Array::from_slice_on(&ctx, &values(len, k), len).unwrap()).collect();
         let mut x = Array::from_slice_on(&ctx, &values(len, 9), len).unwrap();
         let mut total = 0.0f64;
-        for step in 0..200 {
+        // Enough steps for the loop to be recognised and its readbacks speculated, which is when
+        // the eviction path re-entered the speculation lock.
+        for step in 0..24 {
             x = &x * 0.5 + &held[step % held.len()];
             total += f64::from(x.sum().item().unwrap());
         }
         let _ = done.send(total);
     });
-    let total = finished.recv_timeout(std::time::Duration::from_secs(60)).expect("deadlock in a readback under a memory budget");
+    // Generous: a debug build on a small CI runner's software device is slow; a deadlock never ends.
+    let total = finished.recv_timeout(std::time::Duration::from_secs(240)).expect("deadlock in a readback under a memory budget");
     assert!(total > 0.0);
 }
