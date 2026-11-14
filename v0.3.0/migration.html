@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,7 +182,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="migration-from-02"><a class="header" href="#migration-from-02">Migration from 0.2</a></h1>
-<p>0.3 changes two things your 0.2 code can trip over. Everything else in 0.3 is added.</p>
+<p>0.3 changes two things your 0.2 code can trip over. Almost everything else in 0.3 is added; the few behaviour changes (a lazy <code>reshape</code> of a view, fusion decided by a cost model, a larger buffer pool) are listed under <em>Changed</em> in the changelog.</p>
 <h2 id="reductions-are-lazy-arrays"><a class="header" href="#reductions-are-lazy-arrays">Reductions are lazy arrays</a></h2>
 <p>In 0.2, <code>sum</code>, <code>min</code>, <code>max</code>, <code>mean</code>, <code>norm</code> and <code>reduce</code> returned host values. In 0.3 they return a
 one-element <code>Array</code> that fuses with what follows, so <code>&amp;x / &amp;x.sum()</code> stays on the GPU. Read the

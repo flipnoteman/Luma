@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,7 +182,182 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="precision"><a class="header" href="#precision">Precision</a></h1>
-<p>This chapter is not written yet. <code>f32</code> is the default; <a href="https://docs.rs/luma/latest/luma/struct.Df32.html"><code>Df32</code></a> is a double-float of about 48 mantissa bits that runs on every device, <code>Array&lt;f64&gt;</code> needs <code>SHADER_F64</code>, and <code>to_f64</code> / <code>to_df32</code> / <code>to_f32</code> convert between them. <code>sum_compensated</code> and <code>norm_compensated</code> accumulate in double-float, <code>is_finite</code> / <code>is_nan</code> / <code>is_inf</code> give lazy masks, and <a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions::fast_math</code></a> allows value-changing rewrites (see <a href="environment.html">Environment variables</a>).</p>
+<p><code>f32</code> is the default and what GPUs are built for. When a result needs more digits (a residual
+that falls below <code>1e-7</code>, a long time integration, a sum of a billion terms), Luma has two wider
+types and compensated reductions:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>Bits</th><th>Where it runs</th><th>Cost</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f32</code></td><td>24 of mantissa</td><td>everywhere</td><td>1</td></tr>
+<tr><td><code>Df32</code></td><td>about 48</td><td>everywhere (computed with <code>f32</code> arithmetic)</td><td>about 27 to 44 <code>f32</code> operations per add or multiply on the GPUs measured, about 2 on llvmpipe</td></tr>
+<tr><td><code>f64</code></td><td>53</td><td>devices with <code>SHADER_F64</code></td><td>11 to 41 <code>f32</code> operations on the GPUs measured</td></tr>
+</tbody>
+</table>
+</div>
+<p>Both wide types take 8 bytes per element. Pick the narrowest that gives the accuracy you need,
+and use wide types only where it matters: the cost model weighs <code>Df32</code> and <code>f64</code> arithmetic by
+the factors it measured (<a href="performance.html#the-cost-model">Performance</a>).</p>
+<h2 id="f64"><a class="header" href="#f64"><code>f64</code></a></h2>
+<p><code>Array&lt;f64&gt;</code> exists on every context, but only works on devices that have 64-bit shader floats
+(<code>wgpu::Features::SHADER_F64</code>, in practice Vulkan GPUs). Without it every <code>f64</code> operation is
+poisoned with <a href="https://docs.rs/luma/latest/luma/enum.LumaError.html"><code>LumaError::Unsupported</code></a>.
+Check first:</p>
+<pre><code class="language-rust">use luma::*;
+
+let ctx = Context::new()?;
+let x = Array::from_slice_on(&amp;ctx, &amp;[2.0f32, 3.0], 2)?;
+
+if ctx.features().contains(luma::wgpu::Features::SHADER_F64) {
+    let r = x.to_f64().sqrt();
+    let got = r.to_vec()?;
+    assert!((got[0] - 2.0f64.sqrt()).abs() &lt; 1e-15);
+} else {
+    // Every f64 operation is refused, with a clear error.
+    let err = x.to_f64().to_vec().unwrap_err();
+    assert!(matches!(err.root(), LumaError::Unsupported(_)));
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>f64</code> arrays have <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>minimum</code>, <code>maximum</code>,
+comparisons, <code>select</code>, views and reductions. Anything else (<code>exp</code>, trigonometry, generators such
+as <code>range</code>) is refused when recorded. Use <code>Df32</code> when you need a wide type on every device, or
+cast down to <code>f32</code> for the function.</p>
+<h2 id="df32"><a class="header" href="#df32"><code>Df32</code></a></h2>
+<p>A <code>Df32</code> is the unevaluated sum <code>hi + lo</code> of two <code>f32</code>, with <code>|lo|</code> at most half an ulp of <code>hi</code>.
+Together they carry about 48 bits of mantissa (a relative error near <code>2^-46</code>; division and <code>sqrt</code>
+are accurate to about <code>2^-45</code>), and the arithmetic uses <code>f32</code> operations only, so it runs on every device.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Plain f32 loses the 1.0 in (1e8 + 1) - 1e8; a double-float keeps it.
+let a = Array::&lt;f32&gt;::full(8, 1.0e8)?.to_df32();
+let one = Array::&lt;f32&gt;::full(8, 1.0)?.to_df32();
+let kept = ((&amp;a + &amp;one) - &amp;a).to_f32();
+assert!(kept.to_vec()?.iter().all(|&amp;v| v == 1.0));
+
+// Df32 values are built from f64 on the host; `hi` and `lo` hold the 48 bits.
+let x = Array::from_slice(&amp;[Df32::from(1.0 + 1e-12)], 1)?;
+let tiny = (&amp;x - Df32::from(1.0f32)).to_f32().item()?;
+assert!((f64::from(tiny) - ((1.0 + 1e-12) - 1.0)).abs() &lt; 1e-18);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>Array&lt;Df32&gt;</code> has <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, comparisons, <code>minimum</code>, <code>maximum</code>, <code>select</code>, views,
+<code>assign</code>, and reductions (<code>sum</code>, <code>min</code>, <code>max</code>; <code>item()</code> gives a <code>Df32</code>). It has no <code>exp</code> or
+trigonometry: cast to <code>f32</code> and back around such a call. Scalars may be <code>Df32</code> values;
+a Rust <code>f32</code> literal in a <code>Df32</code> expression is not converted for you (write <code>Df32::from(1.0f32)</code>
+or build the array with <code>to_df32()</code>).</p>
+<p><strong>Cost.</strong> One <code>Df32</code> add or multiply costs <code>df32_factor</code> <code>f32</code> operations: 27 on the RTX 3090
+and 44 on the integrated GPU the model was measured on, 2.3 on llvmpipe. The
+<a href="https://docs.rs/luma/latest/luma/struct.CostModel.html"><code>CostModel</code></a> of the device records the
+measured factor and the fusion decisions use it. A higher factor makes recomputing a <code>Df32</code> expression at several offsets more expensive in the
+model’s estimate, which weighs it against staging and materialising it
+(<a href="performance.html#the-cost-model">Performance</a>).</p>
+<p><strong>Fused multiply-add.</strong> The product of two <code>Df32</code> takes the rounding error of the <code>f32</code> product from
+<code>fma</code>. Where the device’s <code>fma</code> is a real fused multiply-add (checked by a small kernel when a
+device first opens) this is cheaper than splitting both factors (Dekker splitting takes about ten times as many
+operations for the error of the product). <code>LUMA_DF_FMA</code>
+and <code>ContextOptions::df_fma</code> force either way; the results are the same, only the speed differs.</p>
+<h2 id="casts"><a class="header" href="#casts">Casts</a></h2>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[0.1f32, 0.2], 2)?;
+let d = x.to_df32();               // exact, `lo` is zero
+let back = d.to_f32();             // rounds
+assert_eq!(back.to_vec()?, vec![0.1, 0.2]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>From</th><th>To</th><th>Methods</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f32</code></td><td><code>f64</code>, <code>Df32</code></td><td><code>to_f64()</code> (needs <code>SHADER_F64</code>), <code>to_df32()</code></td></tr>
+<tr><td><code>f64</code></td><td><code>f32</code>, <code>Df32</code></td><td><code>to_f32()</code>, <code>to_df32()</code></td></tr>
+<tr><td><code>Df32</code></td><td><code>f32</code>, <code>f64</code></td><td><code>to_f32()</code>, <code>to_f64()</code> (needs <code>SHADER_F64</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Casts are lazy and fuse; they are exact where the target type holds the value. Constants and
+generators are <code>f32</code>: <code>Array::&lt;f32&gt;::linspace(..).to_df32()</code> has only <code>f32</code> precision, so for a
+wide initial condition build the host data in <code>f64</code> and upload with <code>Df32::from(f64)</code>.</p>
+<h2 id="compensated-sums"><a class="header" href="#compensated-sums">Compensated sums</a></h2>
+<p>A plain <code>f32</code> sum, even with Luma’s tree order, has an error that grows with the length. For
+residual norms and regression tests use the compensated forms, which accumulate in <code>Df32</code> and round
+to <code>f32</code> at the end:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::&lt;f32&gt;::full(1 &lt;&lt; 20, 0.1)?;
+let exact = f64::from(0.1f32) * (1 &lt;&lt; 20) as f64;
+let sum = x.sum_compensated().item()?;      // the exact sum rounded to f32
+assert!((f64::from(sum) - exact).abs() &lt; 0.01);
+
+let norm = x.norm_compensated().item()?;    // squares accumulated in Df32, too
+assert!((f64::from(norm) - (exact * f64::from(0.1f32)).sqrt()).abs() &lt; 1e-3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>They read the array once and cost several times the plain sum’s arithmetic. The order of the reduction tree can change the bits below <code>f32</code>
+precision, so the result is the correctly rounded sum except where the terms cancel almost
+completely. To keep the extra bits, reduce a <code>Df32</code> array yourself: <code>x.to_df32().sum()</code>.</p>
+<h2 id="non-finite-values"><a class="header" href="#non-finite-values">Non-finite values</a></h2>
+<p><code>f32</code>, <code>f64</code> and <code>Df32</code> arrays have lazy <code>u32</code> masks <code>is_finite()</code>, <code>is_nan()</code> and <code>is_inf()</code>.
+They test the bits of the exponent, so they do not depend on how the device compares NaN (a shader
+compiler may assume NaN does not exist and fold <code>x != x</code>). They fuse like any elementwise
+operation:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, f32::INFINITY, f32::NAN, -2.0], 4)?;
+assert_eq!(x.is_finite().to_vec()?, vec![1, 0, 0, 1]);
+assert_eq!(x.is_nan().to_vec()?, vec![0, 0, 1, 0]);
+assert_eq!(x.is_inf().to_vec()?, vec![0, 1, 0, 0]);
+
+// Sanitise in one fused kernel.
+let clean = select(&amp;x.is_finite(), &amp;x, 0.0);
+assert_eq!(clean.to_vec()?, vec![1.0, 0.0, 0.0, -2.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>To find where a NaN starts, open the context in debug mode with <code>check_finite</code>: every evaluated
+<code>f32</code> and <code>Df32</code> array is checked (<code>f64</code> is not) and the first operation whose result holds a NaN
+or Inf fails with
+<code>LumaError::NonFinite</code>, naming its source line. It waits for the GPU after every array; for
+debugging only.</p>
+<pre><code class="language-rust">use luma::*;
+
+let ctx = Context::with_options(ContextOptions::default().check_finite(true))?;
+let x = Array::from_slice_on(&amp;ctx, &amp;[1.0f32, 2.0], 2)?;
+let y = &amp;x / 0.0;
+let err = y.to_vec().unwrap_err();
+assert!(matches!(err.root(), LumaError::NonFinite));   // the message names this line
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="fast-math"><a class="header" href="#fast-math">Fast math</a></h2>
+<p>By default Luma rewrites expressions only where the result is bit-identical (<code>x * 1</code>, <code>-(-x)</code>,
+<code>min(x, x)</code>, <code>abs(abs(x))</code>, <code>select</code> with two equal branches, <code>x * 0</code> on integers, …). <code>fast_math</code> (a
+<a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions</code></a> field,
+<code>LUMA_FAST_MATH=1</code>) also allows rewrites that change values, which can make a kernel shorter:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rewrite</th><th>Changes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>x + 0</code> becomes <code>x</code></td><td><code>-0.0 + 0.0</code> is <code>0.0</code>, the rewrite keeps <code>-0.0</code></td></tr>
+<tr><td><code>x * 0</code> becomes <code>0</code>, <code>x - x</code> becomes <code>0</code></td><td>wrong for NaN and infinity</td></tr>
+<tr><td><code>x / x</code> becomes <code>1</code></td><td>wrong for 0, NaN and infinity</td></tr>
+<tr><td><code>x &lt;= x</code>, <code>x &gt;= x</code>, <code>x == x</code> become true; <code>x != x</code> false</td><td>wrong for NaN</td></tr>
+<tr><td><code>(x * a) * b</code> and <code>(x + a) + b</code> combine their constants (<code>f32</code> and <code>f64</code> only)</td><td>different rounding</td></tr>
+<tr><td><code>x / a</code> for a constant <code>a</code> becomes <code>x * (1 / a)</code> (<code>f32</code> and <code>f64</code> only)</td><td>different rounding</td></tr>
+<tr><td><code>powf(x, e)</code> with <code>e</code> of 1, 2 or 0.5 becomes <code>x</code>, <code>x * x</code>, <code>sqrt(x)</code></td><td>different rounding</td></tr>
+<tr><td><code>Df32</code> adds and subtracts use the cheaper algorithm</td><td>the relative error grows with the cancellation (below <code>2^-47</code> of the larger operand, instead of <code>2^-46</code> of the result); reductions are excepted</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-rust">use luma::*;
+
+let ctx = Context::with_options(ContextOptions::default().fast_math(true))?;
+let x = Array::from_slice_on(&amp;ctx, &amp;[0.0f32, f32::INFINITY, 3.0], 3)?;
+assert_eq!((&amp;x / &amp;x).to_vec()?, vec![1.0, 1.0, 1.0]);   // x / x is 1, NaNs ignored
+assert_eq!((&amp;x * 0.0).to_vec()?, vec![0.0, 0.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Do not turn it on if you rely on NaN or infinity propagating, or on the exact bits of a
+reassociated expression. With it off (the default), a rewrite that would change any bit is not
+applied.</p>
 
                     </main>
 

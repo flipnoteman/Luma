@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,7 +182,203 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="worked-examples"><a class="header" href="#worked-examples">Worked examples</a></h1>
-<p>This chapter is not written yet. The repository has the programs: heat equation and other workloads in <a href="https://github.com/flipnoteman/Luma/blob/main/benches/real_world.rs"><code>benches/real_world.rs</code></a>, the Euler solver in <a href="https://github.com/flipnoteman/Luma/blob/main/tests/euler_residual.rs"><code>tests/euler_residual.rs</code></a> and <a href="https://github.com/flipnoteman/Luma/blob/main/examples/bench_pde.rs"><code>examples/bench_pde.rs</code></a>, ML-KEM (FIPS 203) in <a href="https://github.com/flipnoteman/Luma/blob/main/examples/mlkem.rs"><code>examples/mlkem.rs</code></a>, and Keccak in <a href="https://github.com/flipnoteman/Luma/blob/main/examples/keccak.rs"><code>examples/keccak.rs</code></a>.</p>
+<p>Five tours of programs in the repository. The first two have the full code here, runnable; for the
+others the chapter points to the code and says what to look at. Run the repository examples
+with <code>cargo run --release --example &lt;name&gt;</code> from a checkout of
+<a href="https://github.com/flipnoteman/Luma">the repository</a>.</p>
+<h2 id="heat-equation"><a class="header" href="#heat-equation">Heat equation</a></h2>
+<p>The diffusion of heat on a periodic grid is the smallest program that uses stencils and loops. One
+step is an elementwise expression of the grid and four shifted copies of it:</p>
+<pre><code class="language-rust">use luma::*;
+
+fn heat(u: &amp;Array&lt;f32&gt;) -&gt; Array&lt;f32&gt; {
+    let lap = u.shift([1, 0]) + u.shift([-1, 0]) + u.shift([0, 1]) + u.shift([0, -1]) - u * 4.0;
+    u + lap * 0.2
+}
+
+let n = 16;
+let mut data = vec![0.0f32; n * n];
+data[n / 2 + n * (n / 2)] = 1.0;                    // a spike in the middle
+let u0 = Array::from_slice(&amp;data, [n, n])?;
+
+// A fixed number of steps. `heat` is a stencil, so Luma runs several steps per pass over memory.
+let u = u0.iterate(100, heat);
+assert!((u.sum().item()? - 1.0).abs() &lt; 1e-4);      // periodic: the total heat is conserved
+assert!(u.max().item()? &lt; 0.05);                    // the spike has spread
+
+// Until the field stops changing, with the test on the GPU.
+let steady = u0.iterate_until(10_000, 1e-6, heat);
+for v in steady.to_vec()? {
+    assert!((v - 1.0 / (n * n) as f32).abs() &lt; 1e-4);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>What to look at:</p>
+<ul>
+<li><code>heat</code> is written once, with ordinary arithmetic, and used by <code>iterate</code> and <code>iterate_until</code>
+unchanged (<a href="loops.html">Loops</a>). Nothing in it knows about buffers.</li>
+<li><code>examples/bench_pde.rs</code> has the same step in four convergence loops
+(<code>converge/readback_loop</code>, <code>converge/iterate_until</code>, <code>converge/until_all</code>, <code>converge/iterate</code>):
+<code>cargo run --release --example bench_pde -- --only converge</code>. The readback loop pays a GPU round
+trip per step; the others do not, and the table shows the difference in cell updates per second.</li>
+<li><code>Profile</code> of a few steps shows a single time-blocked kernel for <code>iterate</code>
+(<a href="performance.html">Performance</a>).</li>
+</ul>
+<h2 id="euler-and-muscl-solvers-with-records"><a class="header" href="#euler-and-muscl-solvers-with-records">Euler and MUSCL solvers with records</a></h2>
+<p>A finite-volume solver for the Euler equations is the example Luma’s views, records and writes were
+designed for: a state of several fields per cell, ghost cells from a boundary rule, face states as
+slices of the padded state, a flux per face, and a difference of fluxes per cell. A 1-D version, in
+about thirty lines:</p>
+<pre><code class="language-rust">use luma::*;
+
+const GAMMA: f32 = 1.4;
+
+luma::fields! {
+    /// Density, momentum, total energy per cell.
+    struct Cons {
+        rho: Array&lt;f32&gt;,
+        mu: Array&lt;f32&gt;,
+        e: Array&lt;f32&gt;,
+    }
+}
+
+fn pressure(q: &amp;Cons) -&gt; Array&lt;f32&gt; {
+    (GAMMA - 1.0) * (&amp;q.e - 0.5 * &amp;q.mu * &amp;q.mu / &amp;q.rho)
+}
+
+/// The physical flux of a state.
+fn flux(q: &amp;Cons) -&gt; Cons {
+    let u = &amp;q.mu / &amp;q.rho;
+    let p = pressure(q);
+    Cons { rho: &amp;q.mu * 1.0, mu: &amp;q.mu * &amp;u + &amp;p, e: (&amp;q.e + &amp;p) * &amp;u }
+}
+
+/// The Rusanov (local Lax-Friedrichs) flux between a left and a right state.
+fn rusanov(l: &amp;Cons, r: &amp;Cons) -&gt; Cons {
+    let speed = |q: &amp;Cons| (&amp;q.mu / &amp;q.rho).abs() + (GAMMA * pressure(q) / &amp;q.rho).sqrt();
+    let smax = speed(l).maximum(speed(r));
+    0.5 * (flux(l) + flux(r)) - 0.5 * &amp;smax * (r - l)
+}
+
+/// One first-order step: ghost cells, face fluxes, update.
+fn step(q: &amp;Cons, dt_dx: f32) -&gt; Cons {
+    let n = q.rho.len();
+    let w = q.pad([(1, 1)], PadMode::Edge);                        // one ghost cell per side
+    let f = rusanov(&amp;w.slice(0, 0..n + 1), &amp;w.slice(0, 1..n + 2)); // n + 1 faces
+    q - dt_dx * (f.slice(0, 1..n + 1) - f.slice(0, 0..n))
+}
+
+// Sod's shock tube: high pressure on the left half, low on the right.
+let n = 100;
+let half = |left: f32, right: f32| -&gt; Vec&lt;f32&gt; { (0..n).map(|i| if i &lt; n / 2 { left } else { right }).collect() };
+let (rho, p) = (half(1.0, 0.125), half(1.0, 0.1));
+let mut q = Cons {
+    e: Array::from_slice(&amp;p.iter().map(|p| p / (GAMMA - 1.0)).collect::&lt;Vec&lt;_&gt;&gt;(), n)?,
+    rho: Array::from_slice(&amp;rho, n)?,
+    mu: Array::&lt;f32&gt;::zeros(n)?,
+};
+
+let mass = q.rho.sum().item()?;
+for _ in 0..50 {
+    q = step(&amp;q, 0.1);
+    q.eval()?;                                    // record the step; do not wait
+}
+assert!((q.rho.sum().item()? - mass).abs() &lt; 1e-3);          // the waves have not reached the walls
+assert!(q.rho.min().item()? &gt; 0.1);                          // and the density stays positive
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>What to look at:</p>
+<ul>
+<li>A <strong>record</strong> (<code>Cons</code>) is three arrays that move together. <code>q.pad</code>, <code>w.slice</code>, <code>0.5 * (..) - ..</code>
+and <code>q - dt_dx * (..)</code> each apply to all three fields. The code is the maths of the scheme;
+the fields are never listed (<a href="records.html">Records</a>).</li>
+<li>The <strong>ghost cells</strong> are a pad. A real boundary condition is an assignment into the pad’s ghost
+region (<code>w.slice_mut(0, ..1).assign(mirror(..))</code>, <a href="views.html#ghost-cells">Views</a>); the repository
+versions do that for a reflecting wall.</li>
+<li>The fluxes are read at two different <strong>offsets</strong> by the two cells next to a face: slices of the
+padded state through the flux expression. Luma either computes each flux once per face (staging in
+workgroup memory, or evaluating it first) or recomputes it per read, whichever the
+<a href="performance.html#the-cost-model">cost model</a> estimates is cheaper. <code>ctx.profile</code> shows how many
+kernels that took.</li>
+<li><code>q.eval()</code> hands the step over without waiting; the loop is a per-step <code>eval</code> loop
+(<a href="loops.html#loops-with-eval">Loops</a>).</li>
+<li>The 2-D version has the same structure with <code>[(1, 1), (1, 1)]</code> pads and slices along both axes
+(the <code>muscl_faces</code> of the benchmark adds minmod-limited slopes and two ghost cells).</li>
+</ul>
+<p>In the repository:</p>
+<ul>
+<li><a href="https://github.com/flipnoteman/Luma/blob/main/tests/euler_residual.rs"><code>tests/euler_residual.rs</code></a>:
+a 2-D first-order residual with a mirror-wall ghost assignment, compared with an <code>f64</code> host
+implementation. <code>cargo test --release --test euler_residual</code>.</li>
+<li><a href="https://github.com/flipnoteman/Luma/blob/main/examples/bench_pde.rs"><code>examples/bench_pde.rs</code></a>: the
+Euler (<code>euler/*</code>) and MUSCL (<code>muscl/*</code>) solvers in a handful of variants: a step per <code>eval</code>,
+<code>cache()</code> of the padded state, <code>iterate_all</code>, <code>iterate_until_all</code>, and a hand-written
+custom WGSL kernel for comparison. <code>cargo run --release --example bench_pde -- --quick --only euler</code> prints cell updates per second per variant, with kernel counts and where the expressions
+were cut.</li>
+</ul>
+<h2 id="ml-kem"><a class="header" href="#ml-kem">ML-KEM</a></h2>
+<p><a href="https://github.com/flipnoteman/Luma/blob/main/examples/mlkem.rs"><code>examples/mlkem.rs</code></a> is ML-KEM
+(FIPS 203) KeyGen, Encaps and Decaps for ML-KEM-512, -768 and -1024 over a batch of independent
+instances, written only with array operations: no custom kernel, no WGSL. It is the largest
+program in the repository and the best look at the integer side of Luma.</p>
+<pre><code class="language-sh">cargo run --release --example mlkem -- --set 768 --op keygen --n 4096
+cargo test --release --test mlkem          # known answers and NIST ACVP vectors
+</code></pre>
+<p>What to look at (the header of the file explains each):</p>
+<ul>
+<li><strong>Keccak</strong> as <code>iterate_all</code> of one round, 24 times, with the round constants coming from the
+LFSR carried as a state word; hash inputs are views of byte-string arrays.</li>
+<li><strong>Data layout</strong>: a batch of byte strings is a <code>[words, n]</code> array of <code>u32</code>; a batch of polynomials
+is <code>[256, rows]</code>. Uploads and readbacks need no reshuffle.</li>
+<li><strong>NTT</strong> as two kernels of register butterflies, each followed by a join of its outputs
+(<code>concat</code>/<code>stack</code>).</li>
+<li><strong>Rejection sampling</strong> with a scan over groups of candidates and one scatter (<code>put</code>) per
+matrix; <code>take</code> for ByteEncode/ByteDecode and Compress/Decompress; Montgomery reduction for
+modular products in <code>u32</code> (<a href="integers.html">Integers</a>).</li>
+<li>The results are checked <strong>byte for byte</strong> against the RustCrypto <code>ml-kem</code> crate (a tampered
+ciphertext per instance included) and against ACVP vectors; the table reports operations per
+second with data on the device and with transfers, GPU time, host time and launches per batch.
+<code>MLKEM_PROFILE=1</code> lists the kernels of every row.</li>
+</ul>
+<h2 id="keccak"><a class="header" href="#keccak">Keccak</a></h2>
+<p><a href="https://github.com/flipnoteman/Luma/blob/main/examples/keccak.rs"><code>examples/keccak.rs</code></a> is
+Keccak-f[1600], SHA3-256 and SHAKE128 over a batch of inputs, lazy operations only. A 64-bit lane is
+a pair <code>(lo, hi)</code> of <code>u32</code> arrays with one element per instance; the permutation is a Rust function
+of 24 rounds of <code>^ &amp; | ! &lt;&lt; &gt;&gt;</code> on those arrays (<a href="integers.html#64-bit-lanes-as-pairs-of-u32">the lane rotation</a>
+is the whole of the machinery).</p>
+<pre><code class="language-sh">cargo run --release --example keccak -- --quick
+cargo test --release --test keccak
+</code></pre>
+<p>What to look at:</p>
+<ul>
+<li><code>keccak_round_with</code>: theta, rho-pi, chi and iota as array expressions; the constants of rotations
+are host numbers, so the shifts compile with constant amounts.</li>
+<li>The two rows of the table: <strong>one permutation per <code>eval</code></strong> and <strong><code>iterate_all</code> over many
+permutations</strong>. The second traces the permutation once and runs it as a register loop where the
+step is elementwise and fits (the <code>launches/perm</code> column and the profile after the table show
+how many kernels it took). The <code>host ms</code> column is only the tracing of the step: later calls
+run from the program of the first (the header of the file explains).</li>
+<li>The profile after the table: kernels per permutation and the reasons for the cuts.</li>
+<li>The known-answer tests in <code>tests/keccak.rs</code>, and the test that a chain of eight permutations
+(about 80 000 operations) is cut into at most 60 kernels (it is skipped on CPU and Apple
+profiles and without timestamp queries).</li>
+</ul>
+<h2 id="cpa-hypothesis-matrix"><a class="header" href="#cpa-hypothesis-matrix">CPA hypothesis matrix</a></h2>
+<p>A correlation power analysis of a block cipher guesses a key byte <code>k</code> and correlates the measured
+power with a model of the intermediate value <code>HW[SBOX[pt ^ k]]</code> for every trace’s plaintext byte
+<code>pt</code>. All 256 guesses over thousands of traces are a <code>[traces, 256]</code> matrix: a gather from the S-box
+table, a gather from the Hamming-weight table, and a Pearson correlation along the trace axis.</p>
+<p>The complete, runnable program is in <a href="integers.html#lookup-tables-with-take">Integer and bit operations</a>.
+What to look at:</p>
+<ul>
+<li>the key guesses are an array along axis 1 (<code>Array::&lt;u32&gt;::range([1, 256], 1)</code>) and the plaintexts
+an array along axis 0, so <code>&amp;pt ^ &amp;guesses</code> broadcasts to the whole matrix;</li>
+<li><code>take</code> does both table lookups, and <code>sum_axis(0)</code> of centred products gives the covariance
+columns, all broadcasting: the program never writes a loop over guesses or traces;</li>
+<li>the gathers and the elementwise products fuse; <code>sum_axis</code> does not fuse its operand, so the
+centred and multiplied <code>[traces, 256]</code> arrays are computed before it. Wrap the analysis in
+<code>ctx.profile(..)</code> and count <code>launches()</code> to see.</li>
+</ul>
+<p>Replace the stand-in S-box with your cipher’s table and the synthetic leakage with a measured
+sample per trace to use it on real data.</p>
 
                     </main>
 

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,7 +182,186 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="integer-and-bit-operations"><a class="header" href="#integer-and-bit-operations">Integer and bit operations</a></h1>
-<p>This chapter is not written yet. <code>u32</code> arrays support <code>+ - * / %</code>, <code>&amp; | ^ !</code>, <code>&lt;&lt; &gt;&gt;</code> (amounts modulo 32), <code>rotate_left</code> and <code>rotate_right</code>, all fused like float operations, and <code>take</code> for table lookups such as an S-box. The <code>keccak</code> example (<a href="https://github.com/flipnoteman/Luma/blob/main/examples/keccak.rs"><code>examples/keccak.rs</code></a>) computes Keccak-f[1600], SHA3-256 and SHAKE128 from lazy array operations only. See <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.take"><code>Array::take</code></a> and <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.rotate_left"><code>Array::rotate_left</code></a>.</p>
+<p><code>Array&lt;u32&gt;</code> is the integer type: indices, masks, counters, and the lanes of bit-sliced
+cryptography. A <code>u32</code> array fuses, views, reduces, scans and loops like an <code>f32</code> one, and has the
+bit operations of a hash function. There is no signed integer type; <code>u32</code> arithmetic wraps.</p>
+<h2 id="arithmetic"><a class="header" href="#arithmetic">Arithmetic</a></h2>
+<p><code>+ - * / %</code> work on <code>u32</code> arrays and <code>u32</code> scalars, and wrap modulo <code>2^32</code> where a Rust
+<code>wrapping_*</code> would. Division and remainder by an element that is zero follow WGSL: <code>x / 0</code> is <code>x</code>
+(the dividend), so check divisors where a zero is possible.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[7u32, u32::MAX, 0, 100], 4)?;
+assert_eq!((&amp;x + 1u32).to_vec()?, vec![8, 0, 1, 101]);              // wraps
+assert_eq!((&amp;x - 1u32).to_vec()?, vec![6, u32::MAX - 1, u32::MAX, 99]);
+assert_eq!((&amp;x * 3u32).to_vec()?, vec![21, u32::MAX - 2, 0, 300]);
+assert_eq!((&amp;x % 10u32).to_vec()?, vec![7, 5, 0, 0]);
+assert_eq!((&amp;x / 0u32).to_vec()?, vec![7, u32::MAX, 0, 100]);       // WGSL: x / 0 == x
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="bit-operations"><a class="header" href="#bit-operations">Bit operations</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&amp;</code>, <code>|</code>, <code>^</code>, <code>!</code></td><td>bitwise and, or, xor, complement (<code>!&amp;x</code>)</td></tr>
+<tr><td><code>&lt;&lt;</code>, <code>&gt;&gt;</code> / <code>shl</code>, <code>shr</code></td><td>logical shifts; the amount is taken <strong>modulo 32</strong>: a shift by 32 is no shift</td></tr>
+<tr><td><code>rotate_left</code>, <code>rotate_right</code></td><td>rotation of the 32 bits, amount modulo 32</td></tr>
+<tr><td><code>&amp;=</code>, <code>|=</code>, <code>^=</code>, <code>&lt;&lt;=</code>, <code>&gt;&gt;=</code></td><td>compound forms, in place</td></tr>
+</tbody>
+</table>
+</div>
+<p>The right-hand side of every binary operation is an array of the same shape (with the usual
+<a href="arrays.html#shapes-and-broadcasting">broadcasting</a>) or a <code>u32</code> scalar. The shifts and rotations also
+take an array of per-element amounts.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[0x8000_0001u32, 0x1234_5678], 2)?;
+assert_eq!((&amp;x &amp; 0xFFu32).to_vec()?,       vec![0x01, 0x78]);
+assert_eq!((&amp;x ^ &amp;x).to_vec()?,            vec![0, 0]);
+assert_eq!((!&amp;x).to_vec()?,                vec![0x7FFF_FFFE, 0xEDCB_A987]);
+assert_eq!((&amp;x &lt;&lt; 4u32).to_vec()?,         vec![0x0000_0010, 0x2345_6780]);
+assert_eq!((&amp;x &gt;&gt; 4u32).to_vec()?,         vec![0x0800_0000, 0x0123_4567]);
+assert_eq!(x.rotate_left(4u32).to_vec()?,  vec![0x0000_0018, 0x2345_6781]);
+assert_eq!(x.shl(33u32).to_vec()?,         (&amp;x &lt;&lt; 1u32).to_vec()?);  // 33 mod 32 == 1
+
+// Per-element amounts:
+let amounts = Array::from_slice(&amp;[4u32, 8], 2)?;
+assert_eq!(x.rotate_right(&amp;amounts).to_vec()?, vec![0x1800_0000, 0x7812_3456]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong>Constant amounts are cheaper.</strong> When the amount is a host scalar (<code>x &lt;&lt; 13u32</code>,
+<code>x.rotate_left(7u32)</code>) the amount is compiled into the kernel as a constant: no masking, and one
+instruction. Hash functions are written with constant amounts, so this is the path they use. An
+array of amounts costs a mask and a variable shift per element.</p>
+<h2 id="comparisons-masks-and-select"><a class="header" href="#comparisons-masks-and-select">Comparisons, masks and <code>select</code></a></h2>
+<p>Comparisons (<code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code>) of any element type return <code>Array&lt;u32&gt;</code> masks of
+<code>0</code> or <code>1</code>. Masks combine with <code>&amp;</code>, <code>|</code> and <code>^</code>. Negate a mask with <code>^ 1u32</code>: <code>!</code> flips all 32 bits, and
+<code>!1</code> is not <code>0</code>. <code>select(&amp;mask, a, b)</code> takes <code>a</code> where the mask is non-zero and <code>b</code>
+elsewhere, for any element type; <code>a</code> and <code>b</code> are arrays or scalars.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3u32, 9, 12, 5], 4)?;
+let in_range = x.ge(4u32) &amp; x.lt(10u32);               // 1 where 4 &lt;= x &lt; 10
+assert_eq!(in_range.to_vec()?, vec![0, 1, 0, 1]);
+assert_eq!((&amp;in_range ^ 1u32).to_vec()?, vec![1, 0, 1, 0]);
+
+// Clamp to 10, keep the rest.
+let clamped = select(&amp;x.gt(10u32), 10u32, &amp;x);
+assert_eq!(clamped.to_vec()?, vec![3, 9, 10, 5]);
+
+// Counting is summing a mask; `sum_where` sums values under a mask.
+assert_eq!(in_range.sum().item()?, 2);
+assert_eq!(x.sum_where(&amp;in_range).item()?, 14);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>u32</code> has no unary minus and no implicit conversion to <code>f32</code>; to use a mask in float arithmetic
+write <code>select(&amp;mask, 1.0, 0.0)</code>, which fuses.</p>
+<h2 id="64-bit-lanes-as-pairs-of-u32"><a class="header" href="#64-bit-lanes-as-pairs-of-u32">64-bit lanes as pairs of <code>u32</code></a></h2>
+<p>A 64-bit lane is a pair <code>(lo, hi)</code> of <code>u32</code> arrays, one element per independent instance. A
+rotation by a constant swaps the halves from 32 and then funnels bits across them. This is the
+<code>rotl64</code> of <a href="https://github.com/flipnoteman/Luma/blob/main/examples/keccak.rs"><code>examples/keccak.rs</code></a>:</p>
+<pre><code class="language-rust">use luma::*;
+
+/// `(lo, hi)` rotated left by `r` bits, `r` a constant.
+fn rotl64(lo: &amp;Array&lt;u32&gt;, hi: &amp;Array&lt;u32&gt;, r: u32) -&gt; (Array&lt;u32&gt;, Array&lt;u32&gt;) {
+    let (lo, hi, k) = if r % 64 &gt;= 32 { (hi, lo, r % 64 - 32) } else { (lo, hi, r % 64) };
+    if k == 0 {
+        return (lo.clone(), hi.clone());
+    }
+    ((lo &lt;&lt; k) | (hi &gt;&gt; (32 - k)), (hi &lt;&lt; k) | (lo &gt;&gt; (32 - k)))
+}
+
+let lanes = [0x0123_4567_89AB_CDEFu64, 0x8000_0000_0000_0001];
+let lo = Array::from_slice(&amp;lanes.map(|l| l as u32), 2)?;
+let hi = Array::from_slice(&amp;lanes.map(|l| (l &gt;&gt; 32) as u32), 2)?;
+
+for r in [1u32, 28, 32, 45] {
+    let (rl, rh) = rotl64(&amp;lo, &amp;hi, r);
+    let (rl, rh) = (rl.to_vec()?, rh.to_vec()?);
+    for (i, lane) in lanes.iter().enumerate() {
+        assert_eq!(u64::from(rl[i]) | u64::from(rh[i]) &lt;&lt; 32, lane.rotate_left(r));
+    }
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Keccak-f[1600] is 25 such lanes, 24 rounds of <code>^ &amp; | !</code> and rotations on 50 arrays.
+<code>examples/keccak.rs</code> writes the permutation as a Rust function on <code>[Array&lt;u32&gt;; 50]</code> and runs a whole
+permutation per <a href="loops.html"><code>iterate_all</code></a> step; <code>examples/mlkem</code> (<code>keccak_f_loop</code>) runs one round
+per step, with the round constant from an LFSR carried as a 51st state word.
+<a href="examples.html#keccak">Worked examples</a> shows how to run them and what to look at.</p>
+<h2 id="lookup-tables-with-take"><a class="header" href="#lookup-tables-with-take">Lookup tables with <code>take</code></a></h2>
+<p><code>table.take(&amp;indices)</code> gathers: element <code>i</code> of the result is <code>table[indices[i]]</code>, with the result
+shaped like <code>indices</code>. A table is just an array, and <code>indices</code> may be a lazy expression with
+broadcasting, so a lookup is a fused gather. An index past the end is clamped to the last element.</p>
+<p>The hypothesis matrix of a correlation power analysis (CPA) of a block cipher is exactly that: for
+every trace’s plaintext byte <code>pt</code> and every key guess <code>k</code>, the Hamming weight of the S-box output
+<code>HW[SBOX[pt ^ k]]</code>. A <code>[traces, 1]</code> array of plaintexts xored with a <code>[1, 256]</code> array of key guesses
+is a <code>[traces, 256]</code> array of indices; two gathers give the hypotheses; a few reductions turn them
+into 256 Pearson correlations against the measured traces.</p>
+<pre><code class="language-rust">use luma::*;
+
+// A stand-in S-box (any permutation of 0..256; use the AES table for the real thing)
+// and the table of Hamming weights, as f32 so the lookup gives a float directly.
+let sbox: Vec&lt;u32&gt; = (0..256u32).map(|i| (i * 167 + 13) &amp; 255).collect();
+let weights: Vec&lt;f32&gt; = (0..256u32).map(|i| i.count_ones() as f32).collect();
+let sbox_t = Array::from_slice(&amp;sbox, 256)?;
+let hw_t = Array::from_slice(&amp;weights, 256)?;
+
+// 200 traces: plaintext bytes, and a synthetic leakage of the secret key byte 0x2b.
+let n = 200usize;
+let pts: Vec&lt;u32&gt; = (0..n as u32).map(|i| (i * 37 + 11) &amp; 255).collect();
+let secret = 0x2bu32;
+let leak: Vec&lt;f32&gt; = pts.iter().map(|&amp;p| weights[sbox[(p ^ secret) as usize] as usize]).collect();
+
+let pt = Array::from_slice(&amp;pts, [n, 1])?;           // [traces, 1]
+let t = Array::from_slice(&amp;leak, [n, 1])?;           // measured samples
+let guesses = Array::&lt;u32&gt;::range([1, 256], 1)?;     // [1, 256]: the key guess along axis 1
+
+// Hypotheses for every (trace, guess): HW[SBOX[pt ^ k]], a [200, 256] f32 array.
+let h = hw_t.take(&amp;sbox_t.take(&amp;(&amp;pt ^ &amp;guesses)));
+assert_eq!(h.shape(), Shape::from([n, 256]));
+
+// Pearson correlation of every column with the trace, along the trace axis.
+let nf = n as f32;
+let hc = &amp;h - &amp;(h.sum_axis(0) / nf);                 // centre each column: [200, 256] - [1, 256]
+let tc = &amp;t - &amp;(t.sum_axis(0) / nf);                 // [200, 1] - [1, 1]
+let num = (&amp;hc * &amp;tc).sum_axis(0);                   // [1, 256]
+let den = ((&amp;hc * &amp;hc).sum_axis(0) * (&amp;tc * &amp;tc).sum_axis(0)).sqrt();
+let corr = (num / den).to_vec()?;
+
+let best = (0..256).max_by(|&amp;a, &amp;b| corr[a].total_cmp(&amp;corr[b])).unwrap();
+assert_eq!(best, 0x2b);
+assert!(corr[best] &gt; 0.999);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The gathers and the elementwise arithmetic fuse, but <code>sum_axis</code> does not fuse its operand
+(<a href="reductions.html#scans">Reductions</a>): the arrays it reduces (<code>hc * tc</code>, …) are computed into
+<code>[traces, 256]</code> buffers first. Wrap the analysis in <code>ctx.profile(..)</code> to see the kernels.</p>
+<h2 id="states-in-iterate_all"><a class="header" href="#states-in-iterate_all">States in <code>iterate_all</code></a></h2>
+<p><code>u32</code> arrays are a valid state for <a href="loops.html#elementwise-loops-iterate_all"><code>iterate_all</code></a>. An
+integer step that is elementwise, such as a hash round or a random-number generator, runs as a
+kernel that keeps the state in registers, in launches of about 40 ms of GPU time:</p>
+<pre><code class="language-rust">use luma::*;
+
+// xorshift32, 1000 steps per element.
+let seed = Array::from_slice(&amp;[1u32, 2, 3], 3)?;
+let [x] = iterate_all([&amp;seed], 1000, |[x]| {
+    let a = x ^ (x &lt;&lt; 13u32);
+    let b = &amp;a ^ (&amp;a &gt;&gt; 17u32);
+    [&amp;b ^ (&amp;b &lt;&lt; 5u32)]
+});
+
+let host = |mut s: u32| {
+    for _ in 0..1000 {
+        s ^= s &lt;&lt; 13;
+        s ^= s &gt;&gt; 17;
+        s ^= s &lt;&lt; 5;
+    }
+    s
+};
+assert_eq!(x.to_vec()?, vec![host(1), host(2), host(3)]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>For a stream of random numbers, <code>Array::uniform(shape, seed)</code> and <code>Array::normal</code> are counter-based
+generators that fuse into the kernel that reads them; use your own recurrence when you need exact
+integer sequences.</p>
 
                     </main>
 

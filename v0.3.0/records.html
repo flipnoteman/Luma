@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,7 +182,207 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="records"><a class="header" href="#records">Records</a></h1>
-<p>This chapter is not written yet. A record is a struct of arrays declared with <a href="https://docs.rs/luma/latest/luma/macro.fields.html"><code>luma::fields!</code></a>: arithmetic, <code>select</code>, views, <code>assign</code> and <code>+=</code> act on every field in one kernel, and a record can be the state of a loop. See the <a href="https://docs.rs/luma/latest/luma/trait.Fields.html"><code>Fields</code></a> trait and <a href="https://github.com/flipnoteman/Luma/blob/main/tests/records.rs"><code>tests/records.rs</code></a>.</p>
+<p>A flow solver has four fields per cell, a Monte Carlo step has a position and a velocity, a hash
+has fifty words of state. You can keep them in separate variables, but then every view, padding,
+ghost-cell write and loop is repeated per field. A <em>record</em> is a group of arrays that you treat as
+one value: <code>q.slice(0, 1..)</code>, <code>&amp;q * 2.0</code>, <code>q.pad(..)</code> apply to every array in it.</p>
+<p>Records are only a way to write less code. Fusion is the same as for separate arrays: the
+arithmetic is on arrays, and the engine sees the same graph.</p>
+<h2 id="what-is-a-record"><a class="header" href="#what-is-a-record">What is a record</a></h2>
+<p>Anything that implements the <a href="https://docs.rs/luma/latest/luma/trait.Fields.html"><code>Fields</code></a>
+trait:</p>
+<ul>
+<li>an <code>Array&lt;T&gt;</code> (a record of one field),</li>
+<li>an array <code>[F; N]</code> of records,</li>
+<li>a tuple of up to six records <code>(A, B, ..)</code>,</li>
+<li>a struct declared with <code>luma::fields!</code>.</li>
+</ul>
+<p>All the arrays of a record have the same element type (<code>f32</code>, <code>Df32</code>, <code>f64</code> or <code>u32</code>) and the same
+shape. <code>Fields::Elem</code> is that type.</p>
+<pre><code class="language-rust">use luma::*;
+
+// A tuple and an array are records already.
+let pair = (Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?, Array::from_slice(&amp;[4.0f32, 5.0, 6.0], 3)?);
+let tail = pair.slice(0, 1..);                     // a slice of every array
+assert_eq!(tail.1.to_vec()?, vec![5.0, 6.0]);
+
+let padded = pair.pad([(1, 0)], PadMode::Zero);    // a pad of every array
+assert_eq!(padded.0.to_vec()?, vec![0.0, 1.0, 2.0, 3.0]);
+
+let sum = pair.dot(&amp;pair);                         // sum over the fields of products: a.a + b.b
+assert_eq!(sum.to_vec()?, vec![17.0, 29.0, 45.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Tuples and arrays get the <em>methods</em> of the trait. For named fields and arithmetic operators
+declare a struct with <code>luma::fields!</code>.</p>
+<h2 id="lumafields"><a class="header" href="#lumafields"><code>luma::fields!</code></a></h2>
+<pre><code class="language-rust">use luma::*;
+
+luma::fields! {
+    /// The conserved state of a flow: density and energy.
+    #[derive(Clone, Debug)]
+    pub struct Cons {
+        pub rho: Array&lt;f32&gt;,
+        pub e: Array&lt;f32&gt;,
+    }
+}
+
+let q = Cons {
+    rho: Array::from_slice(&amp;[1.0, 2.0], 2)?,
+    e: Array::from_slice(&amp;[3.0, 4.0], 2)?,
+};
+
+// Arithmetic between records, with a value, and with an array (applied to every field).
+let r = &amp;q * 2.0 + &amp;q;
+assert_eq!(r.rho.to_vec()?, vec![3.0, 6.0]);
+assert_eq!(r.e.to_vec()?, vec![9.0, 12.0]);
+
+let weights = Array::from_slice(&amp;[1.0f32, 10.0], 2)?;
+assert_eq!((&amp;q * &amp;weights).e.to_vec()?, vec![3.0, 40.0]);
+assert_eq!(Cons::COUNT, 2);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The macro takes one struct with named fields and writes the struct, <code>impl Fields</code>, and the
+operators.</p>
+<ul>
+<li>
+<p><strong>Element type.</strong> It is read from the first field when that is written <code>Array&lt;T&gt;</code>. For any other
+first field (a nested record, <code>[Array&lt;T&gt;; N]</code>, a tuple, <code>luma::Array&lt;T&gt;</code>) put <code>#[elem = T]</code>
+before the other attributes:</p>
+<pre><code class="language-rust">use luma::*;
+
+luma::fields! {
+    #[elem = f32]
+    struct Both {
+        q: (Array&lt;f32&gt;, Array&lt;f32&gt;),
+        t: [Array&lt;f32&gt;; 2],
+    }
+}
+assert_eq!(Both::COUNT, 4);</code></pre>
+</li>
+<li>
+<p><strong>Attributes and visibility</strong> (<code>#[derive(..)]</code>, doc comments, <code>pub</code>, <code>pub(crate)</code>) are passed
+through; a trailing comma is optional.</p>
+</li>
+<li>
+<p><strong>Field types</strong> are <code>Array&lt;T&gt;</code>, arrays and tuples of records, and other records. A mismatched
+element type is a compile error. Nested records count every array (<code>COUNT</code> is the total).</p>
+</li>
+<li>
+<p><strong>Not supported:</strong> generic structs, tuple structs, attributes on fields, and an empty record.</p>
+</li>
+<li>
+<p><strong><code>u32</code> records</strong> work and have no unary minus: <code>luma::fields! { struct Lanes { lo: Array&lt;u32&gt;, hi: Array&lt;u32&gt; } }</code>.</p>
+</li>
+</ul>
+<h3 id="what-a-record-gets"><a class="header" href="#what-a-record-gets">What a record gets</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td>operators</td><td><code>+ - * /</code> between records, with an element value (<code>f32</code> for an <code>f32</code> record) and with an <code>Array&lt;Elem&gt;</code>, any reference/owned combination, the scalar or array on either side; <code>+= -= *= /=</code> with <code>&amp;Record</code>, a value and <code>&amp;Array</code>; unary <code>-</code> on <code>&amp;Record</code> and <code>Record</code> (not <code>u32</code>)</td></tr>
+<tr><td>views</td><td><code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>shift</code>, <code>shift_fill</code>, <code>shift_clamp</code>, <code>shift_mirror</code>, <code>take</code>, <code>broadcast_to</code>, <code>copy</code></td></tr>
+<tr><td>writes</td><td><code>slice_mut</code>, <code>flip_mut</code>, <code>transpose_mut</code> (a <a href="views.html#views-that-write"><code>ViewMut</code></a> of the record), <code>assign</code>, <code>put</code></td></tr>
+<tr><td>helpers</td><td><code>map(f)</code>, <code>zip(&amp;other, f)</code>, <code>dot(&amp;other)</code>, <code>Fields::select(&amp;mask, &amp;a, &amp;b)</code>, <code>arrays()</code>, <code>eval()</code>, <code>cache()</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Every method applies the array operation of the same name to each field and poisons the fields
+with the caller’s source location on a failure. All of them stay lazy except <code>cache</code>, <code>eval</code> and
+<code>put</code>, which run now (as <code>Array::cache</code>, <code>eval</code> and <code>put</code> do), and <code>assign</code>, a write like
+<a href="views.html#views-that-write"><code>Array::assign</code></a>.</p>
+<h2 id="writes-and-ghost-cells"><a class="header" href="#writes-and-ghost-cells">Writes and ghost cells</a></h2>
+<p>A record assigned through a region is written field by field, in one kernel when the fields have
+buffers; fields that are still lazy expressions are not written at all (the record denotes the
+new values from then on). Here is the wall boundary of a flow solver on a whole state:</p>
+<pre><code class="language-rust">use luma::*;
+
+luma::fields! {
+    struct Cons {
+        rho: Array&lt;f32&gt;,
+        e: Array&lt;f32&gt;,
+    }
+}
+
+let q = Cons {
+    rho: Array::from_slice(&amp;[1.0, 2.0], 2)?,
+    e: Array::from_slice(&amp;[3.0, 4.0], 2)?,
+};
+
+// One ghost cell on each side, copied from the edge; then the left one gets
+// the interior neighbour's density and the opposite energy (a reflecting wall).
+let mut w = q.pad([(1, 1)], PadMode::Edge);
+let wall = w.slice(0, 1..2);
+let ghost = Cons { rho: wall.rho, e: -&amp;wall.e };
+w.slice_mut(0, ..1).assign(ghost)?;
+
+assert_eq!(w.rho.to_vec()?, vec![1.0, 1.0, 2.0, 2.0]);
+assert_eq!(w.e.to_vec()?, vec![-3.0, 3.0, 4.0, 4.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Passing the right-hand side by value (<code>assign(ghost)</code>) lets its expressions fuse into the write;
+by reference (<code>assign(&amp;ghost)</code>) keeps <code>ghost</code> usable afterwards.</p>
+<h2 id="updating-one-field"><a class="header" href="#updating-one-field">Updating one field</a></h2>
+<p>A record’s fields are ordinary public arrays. Update one and the others stay as they are:</p>
+<pre><code class="language-rust">use luma::*;
+
+luma::fields! {
+    struct Particles {
+        x: Array&lt;f32&gt;,
+        v: Array&lt;f32&gt;,
+    }
+}
+
+let mut p = Particles {
+    x: Array::from_slice(&amp;[0.0, 1.0], 2)?,
+    v: Array::from_slice(&amp;[1.0, -1.0], 2)?,
+};
+let dt = 0.5;
+p.x += &amp;(&amp;p.v * dt);          // only `x` changes (compound assignment on the field)
+p.v = &amp;p.v * 0.5;             // or replace the field by a new expression
+assert_eq!(p.x.to_vec()?, vec![0.5, 0.5]);
+assert_eq!(p.v.to_vec()?, vec![0.5, -0.5]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="records-in-loops"><a class="header" href="#records-in-loops">Records in loops</a></h2>
+<p><a href="loops.html#stop-conditions-iterate_until_all"><code>iterate_until_all</code></a> takes any record as the state
+and returns a <code>Run</code> whose <code>state</code> is the record, so the step reads like the maths:</p>
+<pre><code class="language-rust">use luma::*;
+
+luma::fields! {
+    struct Cons {
+        rho: Array&lt;f32&gt;,
+        e: Array&lt;f32&gt;,
+    }
+}
+
+let q = Cons {
+    rho: Array::from_slice(&amp;[1.0, 2.0], 2)?,
+    e: Array::from_slice(&amp;[3.0, 4.0], 2)?,
+};
+let run = iterate_until_all(
+    q,
+    Until::new(100)
+        .record("max", |s: &amp;Cons| s.rho.max())
+        .stop_when(|h| h["max"].last().le(1e-3)),
+    |s, _| s * 0.5,                      // the step is one record expression
+)?;
+assert_eq!(run.steps, 11);               // 2 / 2^11 &lt; 1e-3
+assert_eq!(run.state.e.to_vec()?, vec![3.0 / 2048.0, 4.0 / 2048.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><a href="loops.html#elementwise-loops-iterate_all"><code>iterate_all</code></a> takes its states as an array of
+references <code>[&amp;Array&lt;T&gt;; N]</code>: pass the fields, for example <code>[&amp;q.rho, &amp;q.e]</code>.</p>
+<h2 id="when-records-help"><a class="header" href="#when-records-help">When records help</a></h2>
+<ul>
+<li><strong>Records shorten code.</strong> A Rusanov flux over a four-field state is <code>0.5 * (&amp;fl + &amp;fr) - 0.5 * &amp;smax * (&amp;ur - &amp;ul)</code>, written once, instead of four near-identical lines per face.
+Views (<code>w.slice(0, 1..)</code>), ghost cells and <code>cache()</code> become one call.</li>
+<li><strong>Fusion does not care.</strong> A record of four arrays is four arrays: the same nodes, the same
+kernels, the same cost-model decisions. A record op on four fields is not one big operation;
+it is four operations that the engine fuses and evaluates together. <code>cache()</code> and <code>eval()</code> on
+a record evaluate all its fields in one batch, so fields that share work compute it once.</li>
+<li><strong>Use separate arrays</strong> when the fields are not treated alike: different shapes, different
+element types, or operations that touch one field only. Mixed element types cannot be in one
+record (<code>Df32</code> and <code>f32</code>, say); keep two records.</li>
+</ul>
+<p>The Euler solver in the <a href="examples.html">worked examples</a> keeps its state in a record.</p>
 
                     </main>
 

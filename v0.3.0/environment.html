@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -211,23 +211,23 @@ builder methods override them:</p>
 </thead>
 <tbody>
 <tr><td><code>LUMA_DEVICE</code></td><td><code>gpu</code> or <code>cpu</code>: restrict the device kind (default: GPU, CPU as fallback)</td></tr>
-<tr><td><code>LUMA_MEMORY_BUDGET</code></td><td>Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it)</td></tr>
-<tr><td><code>LUMA_CHUNK_BYTES</code></td><td>Largest buffer an array is split into, in bytes (power of two)</td></tr>
+<tr><td><code>LUMA_MEMORY_BUDGET</code></td><td>Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it). Default: 80% of the device’s memory where the backend reports it, never on CPU devices, otherwise unlimited</td></tr>
+<tr><td><code>LUMA_CHUNK_BYTES</code></td><td>Largest buffer an array is split into, in bytes: a power of two from 1024 up to the largest bindable size, otherwise opening the context fails with <code>InvalidShape</code>; a value that is not a number is ignored</td></tr>
 <tr><td><code>LUMA_TUNING</code></td><td><code>apple</code>, <code>nvidia</code>, <code>generic</code> or <code>cpu</code>: override the kernel tuning profile</td></tr>
 <tr><td><code>LUMA_SUBGROUPS</code></td><td><code>off</code> keeps the built-in kernels off subgroup operations</td></tr>
-<tr><td><code>LUMA_FUSION_MAX_NODES</code></td><td>Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels</td></tr>
+<tr><td><code>LUMA_FUSION_MAX_NODES</code></td><td>Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_INLINED</code></td><td>Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; <code>16..=16384</code>)</td></tr>
-<tr><td><code>LUMA_STAGING</code></td><td><code>off</code> keeps expressions read through slices and pads at several offsets (fluxes, stencils of an expression) out of workgroup memory: the kernel recomputes them per read instead of computing each once per cell of a workgroup tile (the cost model picks between them)</td></tr>
-<tr><td><code>LUMA_TRIDIAGONAL</code></td><td><code>thomas</code> or <code>cyclic</code>: force the algorithm of <code>solve_tridiagonal</code> / <code>solve_block_tridiagonal</code> (one invocation per line, or one workgroup per line by cyclic reduction); the default picks cyclic reduction for few lines</td></tr>
+<tr><td><code>LUMA_STAGING</code></td><td><code>off</code> turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first</td></tr>
+<tr><td><code>LUMA_TRIDIAGONAL</code></td><td><code>thomas</code>, <code>cyclic</code> or <code>auto</code>: the algorithm of <code>solve_tridiagonal</code> / <code>solve_block_tridiagonal</code> (one invocation per line, or one workgroup per line by cyclic reduction); the default (<code>auto</code>) picks cyclic reduction for few, long lines on the NVIDIA tuning profile only</td></tr>
 <tr><td><code>LUMA_SPECULATE</code></td><td><code>off</code> stops readbacks in a loop (<code>step</code> then <code>.max().item()?</code> every iteration) from computing the next steps ahead</td></tr>
-<tr><td><code>LUMA_FAST_MATH</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: allow rewrites that change values (<code>x + 0</code>, <code>x * 0</code>, <code>x - x</code>, <code>x / x</code>, constant reassociation, <code>x / c</code> as <code>x * (1 / c)</code>, <code>powf</code> with exponent 1, 2 or 0.5) and the cheaper <code>Df32</code> addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (<code>x * 1</code>, <code>-(-x)</code>) always run</td></tr>
-<tr><td><code>LUMA_DF_FMA</code></td><td><code>off</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>on</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
-<tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: fail any operation whose result holds a NaN or Inf (debug mode, waits for the GPU after every evaluated array)</td></tr>
+<tr><td><code>LUMA_FAST_MATH</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: allow rewrites that change values (<code>x + 0</code>, <code>x * 0</code>, <code>x - x</code>, <code>x / x</code>, constant reassociation and <code>x / c</code> as <code>x * (1 / c)</code> (both <code>f32</code> and <code>f64</code> only), <code>powf</code> with exponent 1, 2 or 0.5) and the cheaper <code>Df32</code> addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (<code>x * 1</code>, <code>-(-x)</code>) always run</td></tr>
+<tr><td><code>LUMA_DF_FMA</code></td><td><code>0</code>, <code>off</code> or <code>false</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>1</code>, <code>on</code> or <code>true</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
+<tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: fail any operation whose <code>f32</code> or <code>Df32</code> result holds a NaN or Inf (<code>f64</code> is not checked; debug mode, waits for the GPU after every evaluated array)</td></tr>
 <tr><td><code>LUMA_CALIBRATE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: skip measuring the device’s throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see <code>LUMA_CACHE</code>; a measurement that looks contended by other processes is dropped) and use the tuning profile’s fixed cost model</td></tr>
 <tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan) and the measured cost model per adapter and driver, so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
-<tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code>, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored</td></tr>
-<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for NVIDIA’s driver threads on Linux (saves about 50 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads and then ends the process with <code>_exit</code></td></tr>
+<tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored</td></tr>
+<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads on Linux (saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy Vulkan driver threads, and calls <code>_exit</code> only if they are still busy after that</td></tr>
 </tbody>
 </table>
 </div>
@@ -241,7 +241,7 @@ builder methods override them:</p>
 <tbody>
 <tr><td><code>LUMA_FUZZ_CASES</code></td><td>Number of random programs per fuzz test (default 256, 24 in debug builds)</td></tr>
 <tr><td><code>LUMA_FUZZ_SEED</code></td><td>Fixed seed (default: random; failing cases are also kept in <code>tests/proptest-regressions/</code>)</td></tr>
-<tr><td><code>LUMA_FUZZ_VERBOSE</code></td><td>Set to anything: print every generated program</td></tr>
+<tr><td><code>LUMA_FUZZ_VERBOSE</code></td><td>Set to anything: print a line for each program that ends early on a documented limit</td></tr>
 </tbody>
 </table>
 </div>

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -205,7 +205,7 @@ assert!(cpu.is_cpu());
 let x = Array::from_slice_on(&amp;cpu, &amp;[1.0f32, 2.0], 2)?;
 assert_eq!((&amp;x + &amp;x).to_vec()?, vec![2.0, 4.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><strong>Opening a context returns “No suitable adapter”.</strong> There is no Vulkan, Metal or DX12 driver
+<p><strong>Opening a context returns <code>LumaError::NoAdapter</code> (“Found no adapters”).</strong> There is no Vulkan, Metal or DX12 driver
 Luma can use. On Linux install <code>mesa-vulkan-drivers</code> (lavapipe) for the CPU fallback, or your GPU
 vendor’s Vulkan driver. CI runners need the former.</p>
 <p><strong>I have two GPUs and want the other one.</strong> Luma asks for the high-performance adapter and has no
@@ -218,9 +218,9 @@ contexts is an error. The <code>_on(&amp;ctx, ..)</code> constructors take a con
 <h2 id="nvidia"><a class="header" href="#nvidia">NVIDIA</a></h2>
 <p><strong>The process hangs or aborts when it exits.</strong> NVIDIA’s Linux driver can crash or hang in its own
 shader-compiler threads during <code>exit</code>. Luma waits at exit for the GPU (up to 2 s) and for busy
-driver compiler threads (up to 2 s), then ends the process with <code>_exit</code>. That makes the problem
+Vulkan driver threads (up to 2 s), and calls <code>_exit</code> only if they are still busy after that. That makes the problem
 rare, not impossible (driver 615.x was seen to still do it). <code>LUMA_EXIT_WAIT=0</code> skips the wait,
-which saves about 50 ms of exit time and risks the hang. A normal <code>main</code> return goes through
+which saves about 60 ms of exit time and risks the hang. A normal <code>main</code> return goes through
 this path; calling <code>std::process::exit</code> yourself does too.</p>
 <p><strong>Opening a second device stalls.</strong> On NVIDIA, creating a device (<code>Context::new</code>) blocks
 submissions of <em>other</em> devices in the process until their in-flight GPU work finishes. This
@@ -229,10 +229,11 @@ or use one context (the default one is shared by threads).</p>
 <h2 id="radv-integrated-gpus-give-wrong-results"><a class="header" href="#radv-integrated-gpus-give-wrong-results">RADV integrated GPUs give wrong results</a></h2>
 <p>Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (<code>scan</code>, <code>cumsum</code>,
 axis reductions), workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
-cyclic solver is chosen automatically only on NVIDIA; elsewhere (and with
-<code>LUMA_TRIDIAGONAL=thomas</code>) the solver does not use it. If you see wrong results on such a GPU:</p>
+cyclic solver is chosen automatically only on the NVIDIA tuning profile (a GPU detected as NVIDIA,
+or <code>LUMA_TUNING=nvidia</code>); elsewhere (and with <code>LUMA_TRIDIAGONAL=thomas</code>) the solver does not use it. If you see wrong results on such a GPU:</p>
 <ul>
-<li><code>LUMA_STAGING=off</code> keeps expressions out of workgroup memory (the kernel recomputes them),</li>
+<li><code>LUMA_STAGING=off</code> keeps expressions read through views out of workgroup memory (the cost model
+then recomputes them or evaluates them first),</li>
 <li><code>LUMA_TRIDIAGONAL=thomas</code> pins the solver that does not use workgroup memory,</li>
 <li>scans and axis reductions have no switch: run on another device (<code>LUMA_DEVICE=cpu</code>, or a
 different GPU through <code>VK_ICD_FILENAMES</code>).</li>
@@ -242,8 +243,8 @@ different GPU through <code>VK_ICD_FILENAMES</code>).</li>
 array and the error comes out at <code>to_vec</code>, <code>item</code>, <code>eval</code> or <code>check()</code>. Call <code>check()</code> on an
 array to find the first failure early. The error carries the source location of the operation.</p>
 <p><strong>I get <code>NaN</code> or <code>Inf</code> and do not know where it starts.</strong> Set <code>LUMA_CHECK_FINITE=1</code> (or
-<code>ContextOptions::check_finite</code>): every evaluated array is checked and the first operation whose
-result holds a non-finite value fails with <code>LumaError::NonFinite</code>. It waits for the GPU after every
+<code>ContextOptions::check_finite</code>): every evaluated <code>f32</code> and <code>Df32</code> array is checked (<code>f64</code> is not) and
+the first operation whose result holds a non-finite value fails with <code>LumaError::NonFinite</code>. It waits for the GPU after every
 array, so use it for debugging only. For <code>f32</code>, <code>f64</code> and <code>Df32</code> arrays,
 <code>is_finite()</code> / <code>is_nan()</code> / <code>is_inf()</code> give lazy <code>u32</code> masks you can use in expressions.</p>
 <p><strong><code>Array&lt;f64&gt;</code> fails with <code>Unsupported</code>.</strong> The device has no 64-bit shader floats. Check

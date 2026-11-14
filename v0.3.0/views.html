@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,7 +182,222 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="views-and-writes"><a class="header" href="#views-and-writes">Views and writes</a></h1>
-<p>This chapter is not written yet. Views (<code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>shift</code>, <code>take</code>, <code>concat</code>, <code>stack</code>, <code>broadcast_to</code>) read the array they are made from inside the kernel that uses them, so they cost no copy; writes go through mutable views (<code>slice_mut</code>, <code>flip_mut</code>, <code>transpose_mut</code>) with <code>assign</code>, compound assignment and <code>put</code>. See <a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.slice"><code>Array::slice</code></a>, <a href="https://docs.rs/luma/latest/luma/enum.PadMode.html"><code>PadMode</code></a>, <a href="https://docs.rs/luma/latest/luma/struct.ViewMut.html"><code>ViewMut</code></a>, <a href="https://docs.rs/luma/latest/luma/fn.concat.html"><code>concat</code></a> and <a href="https://docs.rs/luma/latest/luma/fn.stack.html"><code>stack</code></a>. Runnable material: <a href="https://github.com/flipnoteman/Luma/blob/main/tests/views.rs"><code>tests/views.rs</code></a> and <a href="https://github.com/flipnoteman/Luma/blob/main/tests/assign.rs"><code>tests/assign.rs</code></a>.</p>
+<p>A <em>view</em> is an array that reads another array through an index map: a slice, a padded copy, a
+reversed copy, a transpose. Views move no data. They are lazy operations like any other, so they
+fuse into the kernel that reads them, and a view of a lazy expression is computed inside that
+kernel at the index it is read. This chapter covers the views Luma has, the arrays that write
+through to what they view, and scattering with <code>put</code>.</p>
+<h2 id="reading-through-views"><a class="header" href="#reading-through-views">Reading through views</a></h2>
+<pre><code class="language-rust">use luma::*;
+
+// A [4, 3] array; the first dimension varies fastest.
+let a = Array::from_slice(&amp;(0..12).map(|i| i as f32).collect::&lt;Vec&lt;_&gt;&gt;(), [4, 3])?;
+
+// `slice(axis, range)`: the part `range` of the extent along `axis`.
+assert_eq!(a.slice(0, 1..3).shape(), Shape::from([2, 3]));
+assert_eq!(a.slice(1, ..1).to_vec()?, vec![0.0, 1.0, 2.0, 3.0]);
+
+// `flip(axis)` reverses, `transpose()` swaps the first two axes.
+assert_eq!(a.slice(1, ..1).flip(0).to_vec()?, vec![3.0, 2.0, 1.0, 0.0]);
+assert_eq!(a.transpose().shape(), Shape::from([3, 4]));
+assert_eq!(a.transpose().slice(1, ..1).to_vec()?, vec![0.0, 4.0, 8.0]);
+
+// A difference of two slices reads `a` once, in one kernel.
+let d = a.slice(0, 1..) - a.slice(0, ..3);
+assert_eq!(d.to_vec()?, vec![1.0; 9]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>View</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.slice"><code>slice(axis, range)</code></a></td><td>the range along one axis; an empty or out-of-range range poisons the result</td></tr>
+<tr><td><code>flip(axis)</code></td><td>reversed along the axis</td></tr>
+<tr><td><code>transpose()</code></td><td>the first two axes swapped</td></tr>
+<tr><td><code>broadcast_to(shape)</code></td><td>extents of 1 repeated to <code>shape</code> (see <a href="arrays.html#shapes-and-broadcasting">Arrays</a>)</td></tr>
+<tr><td><code>shift(offsets)</code></td><td>circular shift: element <code>i</code> moves to <code>i + offset</code>, wrapping</td></tr>
+<tr><td><code>shift_fill(offsets, value)</code></td><td>the same, the cells nothing moves into read <code>value</code></td></tr>
+<tr><td><code>shift_clamp(offsets)</code></td><td>the same, the cells read the nearest element</td></tr>
+<tr><td><code>shift_mirror(offsets)</code></td><td>the same, the cells read the array mirrored at its boundary</td></tr>
+<tr><td><code>pad(widths, mode)</code></td><td>extra cells on both sides of each axis, filled as the <a href="https://docs.rs/luma/latest/luma/enum.PadMode.html"><code>PadMode</code></a> says</td></tr>
+<tr><td><code>take(&amp;indices)</code></td><td>gather: element <code>i</code> is <code>self[indices[i]]</code> (flat index, clamped to the last element)</td></tr>
+<tr><td><code>index(axis)</code></td><td>each element’s coordinate along <code>axis</code>, as <code>u32</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Offsets are <code>isize</code> or arrays of up to four of them (<code>shift(1)</code>, <code>shift([1, -1])</code>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+assert_eq!(x.shift(1).to_vec()?,              vec![4.0, 1.0, 2.0, 3.0]);
+assert_eq!(x.shift_fill(1, 9.0).to_vec()?,    vec![9.0, 1.0, 2.0, 3.0]);
+assert_eq!(x.shift_clamp(-1).to_vec()?,       vec![2.0, 3.0, 4.0, 4.0]);
+assert_eq!(x.shift_mirror(2).to_vec()?,       vec![2.0, 1.0, 1.0, 2.0]);
+
+// `pad([(before, after), ..], mode)` pads the first axes; the others are left alone.
+assert_eq!(x.pad([(2, 1)], PadMode::Zero).to_vec()?,   vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0]);
+assert_eq!(x.pad([(1, 1)], PadMode::Edge).to_vec()?,   vec![1.0, 1.0, 2.0, 3.0, 4.0, 4.0]);
+assert_eq!(x.pad([(1, 1)], PadMode::Mirror).to_vec()?, vec![1.0, 1.0, 2.0, 3.0, 4.0, 4.0]);
+assert_eq!(x.pad([(1, 1)], PadMode::Wrap).to_vec()?,   vec![4.0, 1.0, 2.0, 3.0, 4.0, 1.0]);
+
+// `take` gathers by flat index, `index` generates coordinates.
+let picks = Array::from_slice(&amp;[3u32, 0, 0, 9], 4)?;
+assert_eq!(x.take(&amp;picks).to_vec()?, vec![4.0, 1.0, 1.0, 4.0]); // 9 is clamped to 3
+assert_eq!(x.index(0).to_vec()?, vec![0, 1, 2, 3]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>PadMode::Mirror</code> mirrors about the <em>boundary face</em>, not the boundary cell: <code>-1</code> reads <code>0</code>, <code>-2</code>
+reads <code>1</code>, <code>n</code> reads <code>n - 1</code>. That is the ghost cell of a finite-volume wall, and it is why the
+<code>Mirror</code> row above equals the <code>Edge</code> row for a pad of one. Circular <code>shift</code> and <code>PadMode::Wrap</code> are the
+views that wrap; <code>shift_fill</code>, <code>shift_clamp</code> and <code>shift_mirror</code> are the shifts of a bounded domain.</p>
+<p>A slice, flip or transpose is read-only: <code>assign</code>, <code>write</code>, <code>+=</code> and <code>put</code> on it fail with
+<code>InvalidShape</code>, naming <code>slice_mut</code>, <code>flip_mut</code> and <code>transpose_mut</code>, which are the views that write
+through (<a href="#views-that-write">below</a>). A <code>shift</code>, <code>pad</code> or <code>take</code> result accepts writes, but they
+fill its own buffer and leave what it was computed from unchanged.</p>
+<h3 id="joining-arrays"><a class="header" href="#joining-arrays">Joining arrays</a></h3>
+<p><code>concat(axis, [&amp;a, &amp;b, ..])</code> and <code>concat_slice(axis, &amp;[a, b, ..])</code> join arrays along an existing
+axis; <code>stack(axis, [..])</code> and <code>stack_slice</code> join equal-shaped arrays along a new axis.</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+let b = Array::from_slice(&amp;[3.0f32, 4.0, 5.0], 3)?;
+assert_eq!(concat(0, [&amp;a, &amp;b]).to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+
+// Stack equal shapes: a new axis of extent `parts` at position `axis`.
+let c = Array::from_slice(&amp;[10.0f32, 20.0], 2)?;
+let s = stack(1, [&amp;a, &amp;c]);             // two columns of two: shape [2, 2]
+assert_eq!(s.shape(), Shape::from([2, 2]));
+assert_eq!(s.to_vec()?, vec![1.0, 2.0, 10.0, 20.0]);
+let rows = stack(0, [&amp;a, &amp;c]);          // [2 parts, 2]: element (k, i) is parts[k][i]
+assert_eq!(rows.to_vec()?, vec![1.0, 10.0, 2.0, 20.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>They differ in what they cost:</p>
+<ul>
+<li><strong><code>concat</code> is lazy.</strong> Every part is read through a view and the result picks by coordinate. It
+fuses into whatever reads it; the parts may be lazy expressions (the ghost cells of a state,
+say), and only the part a cell needs is computed at that cell. Use it for a few pieces read
+by something else.</li>
+<li><strong><code>stack</code> is eager.</strong> The parts are fused into kernels that write them side by side (one kernel
+per group of about <code>LUMA_FUSION_MAX_LIVE / 4</code> parts, split further when a group would bind too
+many buffers), so each output element is computed once. The result is an evaluated array.
+Use it to assemble many expressions into an array that is then read as a whole (the entries of
+a block matrix). Parts that live in several buffers (very large arrays) are joined lazily like
+<code>concat</code>.</li>
+</ul>
+<h3 id="reshape"><a class="header" href="#reshape">Reshape</a></h3>
+<p><code>reshape(shape)</code> keeps the element count and shares the buffer. The reshape of a <em>lazy view</em>
+(a slice, flip, transpose, pad or non-circular shift that has not run) stays lazy: it is another
+handle on the pending view, and fuses into what reads it. <code>x.slice(0, k..k + 1).reshape([ni, nj])</code>
+of an <code>[n, ni, nj]</code> array reads <code>x</code> inside the kernel that uses it. Any <em>other</em> pending
+expression is evaluated first, because the data it shares must exist. The reshape of a view
+does not write through to the array the view came from.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;(0..12).map(|i| i as f32).collect::&lt;Vec&lt;_&gt;&gt;(), [2, 3, 2])?;
+let plane = x.slice(2, 1..2).reshape([2, 3]);   // [2, 3, 1] -&gt; [2, 3], still lazy
+assert_eq!(plane.to_vec()?, vec![6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="views-that-write"><a class="header" href="#views-that-write">Views that write</a></h2>
+<p><code>slice</code>, <code>flip</code> and <code>transpose</code> have <code>_mut</code> forms that borrow the array mutably and return a
+<a href="https://docs.rs/luma/latest/luma/struct.ViewMut.html"><code>ViewMut</code></a>: a region that writes through
+to the array it was taken from. Only views that keep every element distinct can write through; a
+<code>shift</code>, <code>pad</code> or <code>take</code> cannot (several cells would read one element), and writing to one just
+fills its own buffer without touching what it was computed from.</p>
+<pre><code class="language-rust">use luma::*;
+
+let mut w = Array::&lt;f32&gt;::zeros([4, 3])?;
+
+// `assign` writes an expression (or a single value) into the region.
+w.slice_mut(1, ..1).assign(7.0)?;                  // the first row
+w.slice_mut(0, 2..).slice(1, 1..2).assign(5.0)?;   // refine a view: row 1, columns 2 and 3
+
+// Compound assignment works on the view too: `region op= rhs`.
+let mut v = w.slice_mut(0, 0..2);
+v += 1.0;
+
+// `flip_mut` writes the region in reversed order, `transpose_mut` in transposed order.
+let r = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+w.slice_mut(1, 2..3).flip(0).assign(&amp;r)?;          // row 2, last element first
+
+assert_eq!(
+    w.to_vec()?,
+    vec![8.0, 8.0, 7.0, 7.0,   1.0, 1.0, 5.0, 5.0,   4.0, 3.0, 2.0, 1.0],
+);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Writes are lazy like everything else: nothing waits for the GPU, and lazy arrays recorded
+<em>before</em> the write keep the values they were recorded against (the same rule as <code>write</code> and <code>+=</code>,
+see <a href="lazy.html">Lazy evaluation</a>). The right-hand side may read the array being written. When it
+reads the cells it overwrites, Luma computes what it needs first; the result is always the one a
+host loop over the old contents would give.</p>
+<pre><code class="language-rust">use luma::*;
+
+let mut u = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], 6)?;
+let before = &amp;u * 1.0;
+// Overlapping read and write: the right-hand side sees the old contents.
+let rhs = u.slice(0, 2..4).flip(0) * -1.0;
+u.slice_mut(0, ..2).assign(rhs)?;
+assert_eq!(u.to_vec()?, vec![-4.0, -3.0, 3.0, 4.0, 5.0, 6.0]);
+assert_eq!(before.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>assign</code> fails with <code>LumaError::ReadOnly</code> on the state passed to an <code>iterate</code> step and with
+<code>LumaError::Chunked</code> on arrays split over several buffers (see the
+<a href="faq.html#results-and-errors">FAQ</a>). Custom kernels take <code>&amp;mut view</code> arguments as well
+(<a href="custom-kernels.html">Custom kernels</a>).</p>
+<h3 id="ghost-cells"><a class="header" href="#ghost-cells">Ghost cells</a></h3>
+<p>The pattern behind the finite-volume solvers of the <a href="examples.html">worked examples</a>: pad the state
+with ghost cells, then assign a boundary condition into the ghost region.</p>
+<pre><code class="language-rust">use luma::*;
+
+let n = 6;
+let q = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], n)?;
+
+// Two ghost cells on the left, copied from the edge...
+let mut w = q.pad([(2, 2)], PadMode::Edge);
+// ...then overwritten with the interior mirrored and negated (a reflecting wall).
+let wall = w.slice(0, 2..4).flip(0) * -1.0;
+w.slice_mut(0, ..2).assign(wall)?;
+
+assert_eq!(w.to_vec()?, vec![-2.0, -1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 6.0, 6.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Here <code>w</code> was a lazy pad when the assignment ran, so nothing was written and nothing launched:
+from then on <code>w</code> <em>is</em> the expression “the pad with this region replaced” and fuses into whatever
+reads it (a flux, a stencil). The values are the same as when <code>w</code> has a buffer. When the
+boundary expression is costly, the ghost cells compute it and the interior cells do not: Luma
+writes the replacement as an <code>if</code>/<code>else</code> on the coordinate.</p>
+<h2 id="scatter-put"><a class="header" href="#scatter-put">Scatter: <code>put</code></a></h2>
+<p><code>a.put(&amp;indices, values)</code> writes <code>a[indices[i]] = values[i]</code> in place. <code>values</code> is an array of
+the shape of <code>indices</code> or a single value. Indices of <code>len</code> or more are skipped; of several equal
+indices one (unspecified) wins. Call it on the array itself, not on a view.</p>
+<pre><code class="language-rust">use luma::*;
+
+let mut a = Array::&lt;f32&gt;::zeros(6)?;
+let idx = Array::from_slice(&amp;[4u32, 0, 99], 3)?;
+a.put(&amp;idx, &amp;Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?)?;   // 99 is skipped
+assert_eq!(a.to_vec()?, vec![2.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+a.put(&amp;idx, 9.0)?;
+assert_eq!(a.to_vec()?, vec![9.0, 0.0, 0.0, 0.0, 9.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>take</code> and <code>put</code> are the gather and scatter pair; the <a href="integers.html#lookup-tables-with-take">integer chapter</a>
+uses <code>take</code> for table lookups, and the ML-KEM example uses <code>put</code> for rejection sampling.</p>
+<h2 id="what-fuses"><a class="header" href="#what-fuses">What fuses</a></h2>
+<ul>
+<li>Every view of an array or expression is read inside the kernel that uses it. <code>a.slice(..) - a.slice(..)</code> is one kernel with no intermediate array.</li>
+<li>A view of a <em>lazy</em> expression is computed at the index it is read. When one expression is read
+at several offsets (the flux of a face read by the two cells next to it), the
+<a href="performance.html#the-cost-model">cost model</a> picks the cheapest plan: recompute it per read,
+compute it once per cell of a workgroup tile in workgroup memory, or evaluate it first (a kernel
+that would grow past the inline cap, <code>LUMA_FUSION_MAX_INLINED</code>, is cut whatever the model says).
+<code>x.cache()</code> evaluates on request.</li>
+<li><code>concat</code> fuses; <code>stack</code> is its own eager kernel; <code>reshape</code> of a view fuses.</li>
+<li>An <code>assign</code> into a lazy array fuses; into an array with a buffer it is one kernel that
+writes the region. Expressions that do not read the cells being written fuse into that
+kernel.</li>
+<li>Circular <code>shift</code> has its own rule: an expression is recomputed at up to eight offsets while one
+more computation costs less than storing it and reading it back, or staged; otherwise it is
+evaluated first.</li>
+</ul>
+<p>What does not fuse: <code>scan</code> and axis reductions (<a href="reductions.html">Reductions</a>), and custom kernels,
+which see the arrays computed.</p>
 
                     </main>
 

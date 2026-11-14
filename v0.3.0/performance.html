@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b1bbf8b.js";
+            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61a8d153.js"></script>
@@ -182,9 +182,209 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="performance-guide"><a class="header" href="#performance-guide">Performance guide</a></h1>
-<p>Tools: <a href="lazy.html#looking-at-what-ran-profile"><code>Context::profile</code></a> times each kernel and lists where an expression was split (<code>Profile::splits</code>, <a href="https://docs.rs/luma/latest/luma/enum.SplitReason.html"><code>SplitReason</code></a>). When an expression can be recomputed, staged in workgroup memory or evaluated first, a cost model measured per device decides: see <a href="https://docs.rs/luma/latest/luma/struct.CostModel.html"><code>CostModel</code></a> and <code>Context::cost_model</code>. The rest of this chapter is not written yet; the settings that shape fusion are in <a href="environment.html">Environment variables</a> (<code>LUMA_FUSION_*</code>, <code>LUMA_STAGING</code>, <code>LUMA_CALIBRATE</code>, <code>LUMA_CACHE</code>).</p>
+<p>Luma is fast when expressions fuse, the host does not wait on the GPU, and transfers are rare. This
+chapter shows how to see what Luma did, how it decides between plans, what cuts a kernel, what is
+cached, and a checklist for slow programs.</p>
+<h2 id="see-what-happened-profile"><a class="header" href="#see-what-happened-profile">See what happened: <code>Profile</code></a></h2>
+<p><a href="https://docs.rs/luma/latest/luma/struct.Context.html#method.profile"><code>Context::profile</code></a> runs a
+closure and returns the GPU time of every kernel launched in it, by label, and the places where an
+expression was cut into several kernels. It needs timestamp queries on the adapter
+(<code>ctx.profiling_supported()</code>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let ctx = Context::new()?;
+let x = Array::&lt;f32&gt;::full_on(&amp;ctx, 1 &lt;&lt; 20, 2.0)?;
+
+if ctx.profiling_supported() {
+    let (values, profile) = ctx.profile(|| ((&amp;x * 3.0 + 1.0).sqrt()).to_vec())?;
+    assert_eq!(values?.len(), 1 &lt;&lt; 20);
+    assert_eq!(profile.launches(), 1);                  // the chain is one fused kernel
+    println!("{profile}");                              // kernel, launches, total/mean/min/max us
+    let fused = &amp;profile.kernels[0];                    // labelled by the operations it holds
+    assert!(fused.label.starts_with("Fused"));
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A <a href="https://docs.rs/luma/latest/luma/struct.Profile.html"><code>Profile</code></a> has <code>kernels</code> (one
+<a href="https://docs.rs/luma/latest/luma/struct.KernelTiming.html"><code>KernelTiming</code></a> per label, the most
+expensive first: label, launches, total, min, max, and a <code>mean()</code> method), <code>splits</code>, <code>launches()</code> and <code>total()</code>.
+Fused kernels are labelled by what they hold (<code>Fused(Mul, Add, Sqrt) f32</code>, <code>FusedReduce(Sum: Mul) f32</code>); your own kernels by <code>.label(..)</code> or their entry point.</p>
+<p>While profiling, every launch gets a compute pass of its own so that it can be timed. Use it to find
+where the GPU time goes, not to measure throughput. For the host’s time, time the calls themselves.</p>
+<h3 id="why-was-it-cut-splits"><a class="header" href="#why-was-it-cut-splits">Why was it cut: <code>splits</code></a></h3>
+<p>Each <a href="https://docs.rs/luma/latest/luma/struct.FusionSplit.html"><code>FusionSplit</code></a> names the operation
+and source line where an expression was cut, and the
+<a href="https://docs.rs/luma/latest/luma/enum.SplitReason.html"><code>SplitReason</code></a>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Reason</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Nodes</code></td><td>more operations than the fusion limit allows in one kernel</td></tr>
+<tr><td><code>Depth</code></td><td>nested deeper than the engine walks in one kernel</td></tr>
+<tr><td><code>Inputs</code></td><td>more distinct buffers than a kernel can bind</td></tr>
+<tr><td><code>Live</code></td><td>too many values live at once (register pressure)</td></tr>
+<tr><td><code>Scalars</code></td><td>the scalar operands do not fit one uniform buffer</td></tr>
+<tr><td><code>Inlined</code></td><td>views of lazy expressions unfolded into more instructions than the device’s cap</td></tr>
+<tr><td><code>Materialised</code></td><td>the <a href="#the-cost-model">cost model</a> estimates that storing an expression once is cheaper than recomputing it at each read</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-rust">use luma::*;
+
+let ctx = Context::new()?;
+let x = Array::&lt;f32&gt;::full_on(&amp;ctx, 1024, 1.0)?;
+
+if ctx.profiling_supported() {
+    let (r, profile) = ctx.profile(|| {
+        // `fusion_limit` caps the operations per kernel for the expressions written inside.
+        let y = fusion_limit(2, || (((&amp;x + 1.0) * 2.0 - 3.0) / 4.0).sqrt());
+        y.to_vec()
+    })?;
+    r?;
+    assert!(profile.launches() &gt; 1);
+    for split in &amp;profile.splits {
+        println!("{split}");                            // split at file:line:col (`op`): N operations &gt; 2
+    }
+    assert!(profile.splits.iter().any(|s| matches!(s.reason, SplitReason::Nodes { .. })));
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Counting <code>profile.launches()</code> before and after a change is the quickest check that something
+still fuses; the repository’s tests do exactly that.</p>
 <h2 id="the-cost-model"><a class="header" href="#the-cost-model">The cost model</a></h2>
-<p><code>Context::cost_model()</code> returns the throughputs Luma uses to compare plans (launch cost, memory bandwidth, <code>f32</code> rate, the cost of <code>Df32</code> and <code>f64</code> arithmetic relative to <code>f32</code>).</p>
+<p>Some choices are not a matter of limits but of cost. A view of a lazy expression read at three
+offsets could be:</p>
+<ol>
+<li><strong>recomputed</strong> at each read: no extra memory traffic, three times the arithmetic;</li>
+<li><strong>staged</strong>: computed once per cell of a workgroup tile into workgroup memory, and read from
+there (available for expressions read through plain translations, such as slices and the
+slices of a padded array: the flux that two neighbouring cells read);</li>
+<li><strong>materialised</strong>: written to a buffer by one kernel and read back by another.</li>
+</ol>
+<p>Luma picks by estimated time. <a href="https://docs.rs/luma/latest/luma/struct.CostModel.html"><code>CostModel</code></a>
+holds the device’s throughputs: the cost of a launch (<code>launch_us</code>), memory bandwidth
+(<code>bandwidth_gbs</code>), simple <code>f32</code> operations per nanosecond (<code>f32_ops_per_ns</code>), and the cost of a
+<code>Df32</code> or <code>f64</code> add or multiply in units of an <code>f32</code> one (<code>df32_factor</code>, <code>f64_factor</code>). Every
+operation has a weight (a divide counts 4, an <code>exp</code> 8, a view read 6, a <code>Df32</code> multiply
+<code>df32_factor</code> times the <code>f32</code> one). A kernel’s estimated time is a launch plus the larger of its
+memory time and its arithmetic time. The model chooses the cheapest of the three plans when it
+estimates a clear gain (staging must beat recomputing by 10%, materialising by 25%), and the
+caps below still bound everything.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Measured when the context opens (about 150 ms on a GPU, once per machine: the result is cached).
+let ctx = Context::new()?;
+let model = ctx.cost_model();
+assert!(model.bandwidth_gbs &gt; 0.0 &amp;&amp; model.f32_ops_per_ns &gt; 0.0 &amp;&amp; model.launch_us &gt; 0.0);
+
+// Or fixed numbers for the kind of GPU, with no measurement:
+let fixed = Context::with_options(ContextOptions::default().calibrate(false))?;
+assert_eq!(fixed.cost_model(), CostModel::fallback(fixed.tuning_profile()));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>LUMA_CALIBRATE=0</code> (or <code>.calibrate(false)</code>) skips the measurement. A clean result is kept in the
+cache directory, a measurement that looks disturbed by other processes is dropped, and then the fixed
+numbers are used. <code>LUMA_STAGING=off</code> turns staging off; <code>Context::cost_model</code> lets you see what the
+decisions are based on. The model is not a tuning knob you can set: if a decision is wrong on your
+hardware, <code>x.cache()</code> forces a materialisation, and <code>LUMA_STAGING=off</code> removes the staged plan (the
+model still chooses between recomputing and materialising).</p>
+<p>The model also sizes loops: <a href="loops.html#launch-sizing"><code>iterate_all</code></a> cuts long register loops into
+launches of about 40 ms of GPU time by it, and it decides when a circular <code>shift</code> of an expression
+is recomputed, staged, or evaluated first.</p>
+<h2 id="what-fuses-and-what-cuts"><a class="header" href="#what-fuses-and-what-cuts">What fuses, and what cuts</a></h2>
+<p>Fused: elementwise operations, comparisons, <code>select</code>, casts, generators, views, compound
+assignment, the input and the epilogue of a reduction (<a href="lazy.html#what-fuses">Lazy evaluation</a>).</p>
+<p>An expression is cut when it passes a limit. They are generous, and a cut costs a launch and a trip
+through memory, not correctness:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Limit</th><th>Default</th><th>Setting</th></tr>
+</thead>
+<tbody>
+<tr><td>operations per kernel</td><td>16384</td><td><code>LUMA_FUSION_MAX_NODES</code>, or <a href="https://docs.rs/luma/latest/luma/fn.fusion_limit.html"><code>fusion_limit</code></a> for expressions written in a scope</td></tr>
+<tr><td>nesting depth</td><td>512 (256 with debug assertions)</td><td>fixed (the walk is recursive)</td></tr>
+<tr><td>values live at once</td><td>by GPU profile</td><td><code>LUMA_FUSION_MAX_LIVE</code></td></tr>
+<tr><td>instructions after views of lazy expressions are unfolded</td><td>1536 on NVIDIA, 1024 on other GPUs, 192 on CPU</td><td><code>LUMA_FUSION_MAX_INLINED</code></td></tr>
+<tr><td>input buffers per kernel</td><td>the device’s storage-buffer limit minus 3, at most 256</td><td>fixed</td></tr>
+<tr><td>scalar operands</td><td>one uniform buffer</td><td>fixed</td></tr>
+</tbody>
+</table>
+</div>
+<p>When a limit is hit, the biggest operand is evaluated first (together with the live arrays that
+share work with it), and the rest is flattened again. A kernel that reads many different arrays
+(the 50 words of a Keccak state) is the one that meets the input limit; keep such loops in
+<code>iterate_all</code>, or split them in the source.</p>
+<p>Never fused, because they need whole-array structure: <code>scan</code>, axis reductions, tridiagonal solves,
+FFT convolution, and custom kernels. They read computed arrays.</p>
+<h2 id="caches"><a class="header" href="#caches">Caches</a></h2>
+<ul>
+<li><strong>Kernels</strong> are cached per context by the <em>structure</em> of the expression: operations, types, how
+values are wired. Scalar values are uniforms, so <code>&amp;x * 2.0</code> and <code>&amp;x * 3.0</code> share one pipeline,
+and an expression with the same shape built again costs the host only the flattening. Identical
+operations on the same operands are one node (hash-consing).</li>
+<li><strong>Compiled pipelines</strong> are cached on disk (wgpu’s <code>PipelineCache</code>, Vulkan) per adapter and
+driver, so a second process skips the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
+<code>LUMA_CACHE=off</code> disables both; <code>LUMA_CACHE_DIR</code> moves them. A damaged file is ignored.</li>
+<li><strong>Loops</strong>: an <code>iterate_all</code> called again from the same place with the same step graph reuses the
+earlier program, and after two such calls the GPU starts before the step is traced
+(<a href="loops.html#calling-it-again">Loops</a>).</li>
+<li><strong>Buffers</strong>: freed arrays go to a pool of idle buffers (up to half of the memory budget), so a
+program that cycles through gigabytes of temporaries reuses them instead of allocating again.</li>
+</ul>
+<h2 id="loops"><a class="header" href="#loops">Loops</a></h2>
+<p>How you write the loop decides how much host time each step costs.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Loop</th><th>Host per step</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>iterate_all</code> of an elementwise step</td><td>none</td><td>one kernel, state in registers, launches of about 40 ms</td></tr>
+<tr><td><code>iterate</code> of a stencil</td><td>none</td><td>time-blocked: several steps per pass over memory</td></tr>
+<tr><td><code>iterate_until</code>, <code>iterate_until_all</code></td><td>none</td><td>the stop rule runs on the GPU; one wait per block of steps</td></tr>
+<tr><td><code>eval</code> every step</td><td>building the step</td><td>recognised as a loop for <code>f32</code> steps; never waits</td></tr>
+<tr><td>readback every step (<code>max().item()?</code>)</td><td>a GPU round trip</td><td>speculation hides it when the step repeats</td></tr>
+</tbody>
+</table>
+</div>
+<p>Prefer the primitives when the step fits them (<a href="loops.html">Loops</a>). Otherwise <code>eval</code> each step
+instead of reading, and <code>sync</code> once at the end. A readback in the loop (a convergence test) is the
+most expensive way: replace it with <code>iterate_until_all</code>, or test every k steps.</p>
+<h2 id="transfers"><a class="header" href="#transfers">Transfers</a></h2>
+<p>The GPU is fast, the way to it is not. Data crosses it at <code>Array::from_slice</code> (upload),
+<code>to_vec</code> / <code>read_into</code> / <code>item</code> (readback, which also waits), and <code>write</code>.</p>
+<ul>
+<li>Keep data on the device: chain operations, and read back the final result and small scalars.
+<code>item()</code> of a reduction moves 4 bytes; <code>to_vec()</code> of the field moves all of it.</li>
+<li>Use <code>read_into(&amp;mut buf)</code> for repeated readbacks into a buffer you own.</li>
+<li>Upload once. A uniform scalar changes without recompiling anything, a new array costs an upload.</li>
+<li>On unified memory, <code>from_slice</code> uploads into mappable buffers that are reused (zero-copy).</li>
+<li>Arrays beyond the memory budget move to host memory and back on demand (once-only warning). Set
+<code>LUMA_MEMORY_BUDGET</code> to something your machine can keep on the device. Arrays split over several
+buffers are never staged and cannot be passed to custom kernels.</li>
+</ul>
+<h2 id="a-checklist-for-a-slow-program"><a class="header" href="#a-checklist-for-a-slow-program">A checklist for a slow program</a></h2>
+<ol>
+<li><strong>Profile it.</strong> <code>ctx.profile(|| ..)</code> with the slow section: how many launches? Which kernel
+dominates? Is the time in kernels at all, or in the host (then it is <code>eval</code>, readbacks, or
+array construction)?</li>
+<li><strong>Count launches</strong> per step. A step that should be one fused kernel and is ten means a cut:
+print <code>profile.splits</code> and read the reason.</li>
+<li><strong>Look for readbacks</strong> inside loops: <code>item()</code>, <code>to_vec()</code>, <code>max().item()?</code> per iteration. Move
+them out of the loop or use <code>iterate_until_all</code>.</li>
+<li><strong>Use the loop primitives</strong> where the step fits; check that the step is elementwise (register
+loop) or a stencil (time-blocked).</li>
+<li><strong>Check the precision.</strong> <code>Df32</code> arithmetic costs 27 to 44 <code>f32</code> operations on the GPUs measured; a <code>Df32</code> field that
+is only read in a residual can be <code>f32</code>.</li>
+<li><strong>Check views of expensive expressions.</strong> An expression read through slices at several offsets
+is recomputed, staged or materialised by the cost model; if you know better, <code>x.cache()</code>
+materialises, <code>LUMA_STAGING=off</code> turns staging off.</li>
+<li><strong>Reuse arrays.</strong> Allocate outside the loop; ping-pong with two arrays in custom kernels.</li>
+<li><strong>Cold start.</strong> The first run compiles kernels (seconds for big <code>Df32</code> ones); the second reads
+the disk cache. Measure the second run.</li>
+<li><strong>Device.</strong> <code>LUMA_DEVICE=cpu</code> is for testing; a software device is far slower. On a laptop
+check which GPU opened (<a href="faq.html#choosing-a-device">FAQ</a>).</li>
+</ol>
 
                     </main>
 
