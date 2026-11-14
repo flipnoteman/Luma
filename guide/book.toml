@@ -1,0 +1,20 @@
+[book]
+title = "The Luma Guide"
+authors = ["flipnoteman"]
+description = "User guide for Luma, lazy GPU arrays for Rust on wgpu"
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/flipnoteman/Luma"
+edit-url-template = "https://github.com/flipnoteman/Luma/edit/main/guide/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-js = ["theme/versions.js"]
+additional-css = ["theme/versions.css"]
+
+[output.html.playground]
+runnable = false

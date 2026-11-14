@@ -1,0 +1,3 @@
+# Reductions and scans
+
+This chapter is not written yet. `sum`, `min`, `max`, `mean` and `norm` return lazy one-element arrays (read them with `item()`, see [Arrays](arrays.md#broadcasting)); `sum_axis`, `min_axis` and `max_axis` reduce along one dimension; `scan` and `cumsum` are prefix operations; `solve_tridiagonal` solves many tridiagonal systems at once. See [`Array::sum`](https://docs.rs/luma/latest/luma/struct.Array.html#method.sum), [`Array::reduce`](https://docs.rs/luma/latest/luma/struct.Array.html#method.reduce), [`Reduction`](https://docs.rs/luma/latest/luma/enum.Reduction.html) and [`solve_tridiagonal`](https://docs.rs/luma/latest/luma/fn.solve_tridiagonal.html).

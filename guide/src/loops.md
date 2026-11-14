@@ -1,0 +1,3 @@
+# Loops
+
+This chapter is not written yet. [`Array::iterate`](https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate) runs multi-step stencils, [`iterate_all`](https://docs.rs/luma/latest/luma/fn.iterate_all.html) runs elementwise loops over several arrays as one kernel that keeps the state in registers, and [`iterate_until_all`](https://docs.rs/luma/latest/luma/fn.iterate_until_all.html) stops on a device-side condition. The step function is traced once and its kernels are replayed; a loop called again from the same place reuses the earlier program. A per-step `eval` loop is recognised too; see [Lazy evaluation and fusion](lazy.md#when-kernels-run).

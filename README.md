@@ -26,6 +26,8 @@ Execution of operations is deferred until the host requires the result. Chains o
 into a single kernel, and all intermediate work is batched on submission so the GPU doesn't waste time on many small, 
 I/O dependent, operations. 
 
+The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (lazy evaluation and fusion, views, loops, precision) with runnable examples; the API reference is on [docs.rs](https://docs.rs/luma).
+
 ## Features
 
 - Arrays of `f32`, `u32`, `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)

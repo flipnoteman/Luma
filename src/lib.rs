@@ -39,6 +39,41 @@
 // `recursion_depth_exceeding_limit`).
 #![recursion_limit = "256"]
 
+/// Compiles and runs the code blocks of the user guide (`guide/src/*.md`) as doctests.
+#[cfg(doctest)]
+mod guide {
+    #[doc = include_str!("../guide/src/introduction.md")]
+    pub mod introduction {}
+    #[doc = include_str!("../guide/src/arrays.md")]
+    pub mod arrays {}
+    #[doc = include_str!("../guide/src/lazy.md")]
+    pub mod lazy {}
+    #[doc = include_str!("../guide/src/views.md")]
+    pub mod views {}
+    #[doc = include_str!("../guide/src/reductions.md")]
+    pub mod reductions {}
+    #[doc = include_str!("../guide/src/records.md")]
+    pub mod records {}
+    #[doc = include_str!("../guide/src/loops.md")]
+    pub mod loops {}
+    #[doc = include_str!("../guide/src/precision.md")]
+    pub mod precision {}
+    #[doc = include_str!("../guide/src/integers.md")]
+    pub mod integers {}
+    #[doc = include_str!("../guide/src/custom-kernels.md")]
+    pub mod custom_kernels {}
+    #[doc = include_str!("../guide/src/performance.md")]
+    pub mod performance {}
+    #[doc = include_str!("../guide/src/examples.md")]
+    pub mod examples {}
+    #[doc = include_str!("../guide/src/environment.md")]
+    pub mod environment {}
+    #[doc = include_str!("../guide/src/faq.md")]
+    pub mod faq {}
+    #[doc = include_str!("../guide/src/migration.md")]
+    pub mod migration {}
+}
+
 // The derive emits `::luma::` paths, also inside this crate.
 extern crate self as luma;
 

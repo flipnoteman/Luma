@@ -1,0 +1,3 @@
+# Worked examples
+
+This chapter is not written yet. The repository has the programs: heat equation and other workloads in [`benches/real_world.rs`](https://github.com/flipnoteman/Luma/blob/main/benches/real_world.rs), the Euler solver in [`tests/euler_residual.rs`](https://github.com/flipnoteman/Luma/blob/main/tests/euler_residual.rs) and [`examples/bench_pde.rs`](https://github.com/flipnoteman/Luma/blob/main/examples/bench_pde.rs), ML-KEM (FIPS 203) in [`examples/mlkem.rs`](https://github.com/flipnoteman/Luma/blob/main/examples/mlkem.rs), and Keccak in [`examples/keccak.rs`](https://github.com/flipnoteman/Luma/blob/main/examples/keccak.rs).
