@@ -89,7 +89,7 @@ fn check_all<T: Host>(ctx: &Context, host: &[T]) {
 #[test]
 fn sorts_match_the_host_for_every_type_and_size() {
     let ctx = Context::new().unwrap();
-    for n in [1usize, 2, 255, 256, 2047, 2048, 2049, 5000, 1 << 22] {
+    for n in [1usize, 2, 255, 256, 2047, 2048, 2049, 4095, 4096, 4097, 5000, 1 << 22] {
         check_all::<u32>(&ctx, &data(n, 1));
         check_all::<i32>(&ctx, &data(n, 2));
         check_all::<f32>(&ctx, &data(n, 3));

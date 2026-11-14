@@ -66,6 +66,11 @@ pub(crate) struct Tuning {
     pub(crate) reduce_max_groups: u32,
     /// Whether reductions combine within subgroups (the device has `Features::SUBGROUP`).
     pub(crate) subgroups: bool,
+    /// Whether every subgroup has exactly 32 invocations (the radix sort ranks keys with ballots
+    /// then; implies `subgroups`).
+    pub(crate) subgroup32: bool,
+    /// Bytes of workgroup memory a kernel may declare (the device's limit).
+    pub(crate) workgroup_storage: u32,
     /// Most operations of a lazy expression a shift recomputes at the shifted element instead of evaluating it first.
     pub(crate) max_recomputed: usize,
     /// Most values a fused kernel keeps live at once before it is split in two (register pressure).
@@ -110,6 +115,8 @@ impl Tuning {
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
         subgroups: false,
+        subgroup32: false,
+        workgroup_storage: 16384,
         max_recomputed: 24,
         max_live: 64,
         max_inlined: 1024,
@@ -133,6 +140,8 @@ impl Tuning {
         reduce_per_thread: 8,
         reduce_max_groups: 2048,
         subgroups: false,
+        subgroup32: false,
+        workgroup_storage: 16384,
         max_recomputed: 32,
         max_live: 96,
         max_inlined: 1536,
@@ -156,6 +165,8 @@ impl Tuning {
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
         subgroups: false,
+        subgroup32: false,
+        workgroup_storage: 16384,
         max_recomputed: 24,
         max_live: 96,
         max_inlined: 1024,
@@ -199,6 +210,8 @@ impl Tuning {
             tuning.max_inlined = inlined.clamp(16, 16384);
         }
         tuning.subgroups = features.contains(wgpu::Features::SUBGROUP) && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
+        tuning.workgroup_storage = limits.max_compute_workgroup_storage_size;
+        tuning.subgroup32 = tuning.subgroups && info.subgroup_min_size == 32 && info.subgroup_max_size == 32;
         tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
         tuning.line_solver = match std::env::var(LINE_SOLVER_ENV).as_deref().map(str::trim) {
             Ok("thomas") => LineSolver::Thomas,

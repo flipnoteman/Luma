@@ -3,32 +3,45 @@
 //! An LSD radix sort on 8-bit digits, one pass per digit, every pass in three steps (reduce, scan,
 //! scatter; no decoupled look-back, which needs forward-progress guarantees WGSL does not give):
 //!
-//! 1. *Count*: a workgroup counts the digits of [`COUNT_TILES`] tiles of [`TILE`] keys in workgroup
-//!    memory and writes them to `counts[digit * cstride + tile]`, four tiles at a time as one
-//!    aligned `vec4`.
+//! 1. *Count*: a workgroup counts the digits of [`COUNT_TILES`] tiles in workgroup memory (every
+//!    invocation loads all its keys of a tile before counting them, so the loads overlap) and
+//!    writes them to `counts[digit * cstride + tile]`, four tiles at a time as one aligned `vec4`.
 //! 2. *Scan*: the inclusive scan of `counts` (see `scan.rs`); with the digit-major layout the
 //!    exclusive prefix of `(digit, tile)` is the global position of the first key of that digit
 //!    in that tile.
-//! 3. *Scatter*: a workgroup ranks its tile stably by the digit (four rounds of a stable split by
-//!    two bits, each a workgroup scan of per-invocation bucket counts), then writes the keys,
-//!    digit run by digit run, to their global positions.
+//! 3. *Scatter*: a workgroup ranks its tile stably by the digit, then writes the keys, digit run
+//!    by digit run, to their global positions.
+//!
+//! The ranking has two forms. On devices whose subgroups all have 32 invocations (and enough
+//! workgroup memory, see `ballot_bytes`) it is a warp-level multisplit: every subgroup finds, per
+//! key, the lanes with the same digit by ballots of the 8 digit bits, and a workgroup scan of the
+//! per-(digit, subgroup) counters places the keys (see `ballot_scatter_body`); tiles are
+//! [`BALLOT_PER_THREAD`] `* 256` keys. Elsewhere (no subgroups, other sizes: lavapipe, or
+//! `LUMA_SUBGROUPS=off`) a tile of [`TILE`] keys is ranked by four rounds of a stable split by two
+//! bits, each a workgroup scan of per-invocation bucket counts.
 //!
 //! Keys are sorted as `u32` words after an order-preserving transform ([`KeyTransform`]) applied
 //! when the first pass loads them and inverted when the last pass stores them, so the passes in
 //! between move plain words. A lazy key array is not evaluated first: the two kernels of the first
 //! pass (count, and scatter) compute the keys from the expression, flattened into them like the
 //! operand of a reduction (`jit::program::Tail::Radix`); the kernel text is the same as for a
-//! buffer of keys except for how `load_key` reads. Descending order sorts the complemented key. An invocation owns 8
-//! consecutive keys of a tile and every step keeps their order, so the sort is stable.
+//! buffer of keys except for how `load_key` reads. Descending order sorts the complemented key. Every
+//! step keeps the input order of equal digits, so the sort is stable.
 //!
 //! Measured on an RTX 3090 (2^24 random `u32` keys, `bench_datasci --only sort`; the clocks of the
-//! card vary by about 10% between runs): about 2.0 ms, 40% of it in the scatter passes (0.35 ms
-//! per pass; a pass that only reads and writes in the same pattern takes 0.17 ms, the ranking
-//! 0.1 ms and the scattered stores 0.08 ms), 0.11 ms per pass for the counts (the keys are read
-//! once more; 0.08 ms is the bandwidth) and 0.04 ms per pass for the scan. Writing the counts as
-//! one word per tile (digit-major) cost 0.06 ms per pass more than as `vec4`s of four tiles;
-//! one-bit rounds 0.1 ms more; a radix-8 or subgroup scan, 128 invocations of 16 keys, and
-//! prefetching the offsets changed less than the run-to-run noise.
+//! card vary by about 10% between runs), best of 7: 1.17 ms with ballots (`f32` the same, with a
+//! payload 1.70 ms), 0.086 ms per count pass (4 bytes per key, at the bandwidth of the
+//! card), 0.18 ms per scatter pass (8 bytes per key at the bandwidth of the card) and 0.022 ms
+//! per pass for the scan; with the split ranking 2.08 ms (scatter 0.37 ms per pass).
+//!
+//! What mattered: the write of the scattered keys. A scatter kernel that ranks 2048 keys and
+//! writes them in digit runs of 8 keys takes 0.37 ms whichever way it ranks (ballots took the
+//! ranking from 0.1 ms to almost nothing and left the time unchanged), the same kernel
+//! writing consecutive addresses takes 0.18 ms, and with 4096 keys per tile (runs of 16 keys, 64
+//! bytes) the scattered writes are as fast as sequential ones. Loading all the keys of a tile
+//! before counting them took the count kernel from 0.105 to 0.086 ms. Writing the counts as one
+//! word per tile (digit-major) cost 0.06 ms per pass more than as `vec4`s of four tiles; a
+//! radix-8 or subgroup scan and prefetching the offsets changed less than the run-to-run noise.
 
 use std::fmt::Write;
 use std::panic::Location;
@@ -45,13 +58,16 @@ use crate::jit::{self, Node};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::scan::{add_operator, Bound, Lines};
 use crate::shape::Shape;
+use crate::tuning::Tuning;
 
 /// Invocations of a workgroup of the sort kernels.
 const WORKGROUP: u32 = 256;
-/// Keys an invocation owns in a tile.
+/// Keys an invocation owns in a tile of the split ranking.
 const PER_THREAD: u32 = 8;
-/// Keys a workgroup handles per pass.
+/// Keys a workgroup handles per pass with the split ranking.
 const TILE: u32 = WORKGROUP * PER_THREAD;
+/// Keys an invocation owns in a tile of the ballot kernels.
+const BALLOT_PER_THREAD: u32 = 16;
 /// Tiles whose counts a counting workgroup writes together.
 const COUNT_TILES: u32 = 4;
 /// Bits of the digit of a pass.
@@ -128,11 +144,11 @@ impl SortKey for f32 {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum RadixKind {
     /// Counts the digits of every tile of keys (see the module documentation).
-    Count,
+    Count { ballot: bool },
     /// Ranks every tile by the digit and writes keys and payload to their global positions.
     /// `last` passes store keys through the inverse of the transform; `store_keys == false`
     /// stores the payload only.
-    Scatter { last: bool, store_keys: bool, payload: PayloadKind },
+    Scatter { last: bool, store_keys: bool, payload: PayloadKind, ballot: bool },
 }
 
 /// One kernel of a radix sort pass on the bits `shift..shift + 8`. The transform and the
@@ -171,7 +187,7 @@ impl RadixPass {
     /// keys (unless `!store_keys`) and the payload (unless there is none).
     pub(crate) fn declare_writes(self, src: &mut String, binding: &mut usize) {
         match self.kind {
-            RadixKind::Count => declare(src, binding, "read_write", "counts", "vec4<u32>"),
+            RadixKind::Count { .. } => declare(src, binding, "read_write", "counts", "vec4<u32>"),
             RadixKind::Scatter { store_keys, payload, .. } => {
                 if store_keys {
                     declare(src, binding, "read_write", "out_keys", "u32");
@@ -244,8 +260,9 @@ pub(crate) fn fused_body(pass: RadixPass, ty: &str) -> String {
 
 fn body(pass: RadixPass) -> String {
     match pass.kind {
-        RadixKind::Count => count_body(pass.shift),
-        RadixKind::Scatter { last, store_keys, payload } => scatter_body(pass.shift, last, store_keys, payload),
+        RadixKind::Count { ballot } => count_body(pass.shift, ballot),
+        RadixKind::Scatter { last, store_keys, payload, ballot: false } => scatter_body(pass.shift, last, store_keys, payload),
+        RadixKind::Scatter { last, store_keys, payload, ballot: true } => ballot_scatter_body(pass.shift, last, store_keys, payload),
     }
 }
 
@@ -253,8 +270,16 @@ fn body(pass: RadixPass) -> String {
 /// digits of [`COUNT_TILES`] consecutive tiles, so that every invocation writes the counts of its
 /// digit for those tiles as one aligned `vec4` (a count per tile written on its own is a 4-byte
 /// write to a sector of its own, which cost as much as reading the keys).
-fn count_body(shift: u8) -> String {
+fn count_body(shift: u8, ballot: bool) -> String {
+    let per_thread = if ballot { BALLOT_PER_THREAD } else { PER_THREAD };
+    let tile = WORKGROUP * per_thread;
     let mut src = String::new();
+    let mut loads = String::new();
+    let mut adds = String::new();
+    for m in 0..per_thread {
+        let _ = writeln!(loads, "        var k{m} = 0xffffffffu;\n        if (base + {}u < p.n) {{ k{m} = load_key(base + {}u); }}", m * WORKGROUP, m * WORKGROUP);
+        let _ = writeln!(adds, "        if (base + {}u < p.n) {{ atomicAdd(&hist[j * {DIGITS}u + ((k{m} >> {shift}u) & {}u)], 1u); }}", m * WORKGROUP, DIGITS - 1);
+    }
     let _ = writeln!(src, "var<workgroup> hist: array<atomic<u32>, {}>;", COUNT_TILES * DIGITS);
     let _ = write!(
         src,
@@ -266,17 +291,12 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
     for (var j = 0u; j < {COUNT_TILES}u; j++) {{ atomicStore(&hist[j * {DIGITS}u + t], 0u); }}
     workgroupBarrier();
     for (var j = 0u; j < {COUNT_TILES}u; j++) {{
-        let base = (first_tile + j) * {TILE}u;
-        for (var m = 0u; m < {PER_THREAD}u; m++) {{
-            let i = base + m * {WORKGROUP}u + t;
-            if (i < p.n) {{ atomicAdd(&hist[j * {DIGITS}u + ((load_key(i) >> {shift}u) & {mask}u)], 1u); }}
-        }}
-    }}
+        let base = (first_tile + j) * {tile}u + t;
+{loads}{adds}    }}
     workgroupBarrier();
     counts[t * (p.cstride / {COUNT_TILES}u) + group] = vec4<u32>(atomicLoad(&hist[t]), atomicLoad(&hist[{DIGITS}u + t]), atomicLoad(&hist[{d2}u + t]), atomicLoad(&hist[{d3}u + t]));
 }}
 ",
-        mask = DIGITS - 1,
         d2 = 2 * DIGITS,
         d3 = 3 * DIGITS,
     );
@@ -416,6 +436,159 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
     src
 }
 
+/// Invocations of a subgroup the ballot kernels assume (see `Tuning::subgroup32`).
+const SUBGROUP: u32 = 32;
+
+/// The scatter kernel of a pass on a device with 32-wide subgroups (see [`RadixKind::Scatter`]):
+/// the stable ranking is a warp-level multisplit. A subgroup takes a run of `8 * 32` keys of the
+/// tile, 32 at a time (keys `i` of a round are consecutive, so the reads are coalesced); for
+/// each key the lanes holding the same digit are found by ANDing, over the 8 bits of the digit,
+/// the ballot of the bit or of its complement (the lane's *peers*). The lowest peer adds the
+/// number of peers to the subgroup's counter of the digit and hands the old value to the others,
+/// so the rank of a key within (digit, subgroup) is that value plus the peers below the lane.
+/// One workgroup scan of the counters, digit-major (every invocation owns a digit and its
+/// subgroups' counters), gives each (digit, subgroup) its first slot in the sorted tile. Order
+/// within a digit is (subgroup, round, lane) = input order, so the ranking is stable. The ranked
+/// tile is staged in workgroup memory and written out in slot order, so that the invocations
+/// of a subgroup write consecutive addresses of a digit's run.
+fn ballot_scatter_body(shift: u8, last: bool, store_keys: bool, payload: PayloadKind) -> String {
+    let warps = WORKGROUP / SUBGROUP;
+    // Counters of a digit are `warps + 1` words apart: no bank conflicts in the scan.
+    let stride = warps + 1;
+    let has_pay = payload != PayloadKind::None;
+    let tile = WORKGROUP * BALLOT_PER_THREAD;
+    let mut src = String::new();
+    let _ = writeln!(src, "var<workgroup> wc: array<atomic<u32>, {}>;", DIGITS * stride);
+    let _ = writeln!(src, "var<workgroup> wsum: array<u32, {warps}>;");
+    let _ = writeln!(src, "var<workgroup> gbase: array<u32, {DIGITS}>;");
+    let _ = writeln!(src, "var<workgroup> sk: array<u32, {tile}>;");
+    if has_pay {
+        let _ = writeln!(src, "var<workgroup> sp: array<u32, {tile}>;");
+    }
+    let _ = writeln!(src, "fn digit(w: u32) -> u32 {{ return (w >> {shift}u) & {}u; }}", DIGITS - 1);
+    let _ = write!(
+        src,
+        "@compute @workgroup_size({WORKGROUP})
+fn main(
+    @builtin(local_invocation_index) t: u32,
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(subgroup_invocation_id) lane: u32,
+) {{
+    let tile = wg.x + wg.y * nwg.x;
+    if (tile >= p.tiles) {{ return; }}
+    let base = tile * {tile}u;
+    let sg = t / {SUBGROUP}u;
+    let first_slot = sg * {run}u + lane;
+",
+        run = BALLOT_PER_THREAD * SUBGROUP,
+    );
+    // The keys past the end get the largest key, so they rank after the real ones and are never
+    // written.
+    for j in 0..BALLOT_PER_THREAD {
+        let _ = writeln!(src, "    let i{j} = base + first_slot + {}u;", j * SUBGROUP);
+        let _ = writeln!(src, "    var w{j} = 0xffffffffu;\n    if (i{j} < p.n) {{ w{j} = load_key(i{j}); }}");
+        match payload {
+            PayloadKind::None => {}
+            PayloadKind::Index => {
+                let _ = writeln!(src, "    let y{j} = i{j};");
+            }
+            PayloadKind::Buffer => {
+                let _ = writeln!(src, "    var y{j} = 0u;\n    if (i{j} < p.n) {{ y{j} = pay[i{j}]; }}");
+            }
+        }
+    }
+    let _ = write!(
+        src,
+        "    for (var k = 0u; k < {stride}u; k++) {{ atomicStore(&wc[k * {DIGITS}u + t], 0u); }}
+    workgroupBarrier();
+    let below = (1u << lane) - 1u;
+"
+    );
+    for j in 0..BALLOT_PER_THREAD {
+        let _ = writeln!(src, "    var r{j} = 0u;\n    {{\n        let d = digit(w{j});\n        var peers = 0xffffffffu;");
+        for bit in 0..DIGIT_BITS {
+            let _ = writeln!(src, "        {{ let on = ((d >> {bit}u) & 1u) == 1u; let m = subgroupBallot(on).x; peers &= select(~m, m, on); }}");
+        }
+        let _ = writeln!(src, "        let leader = firstTrailingBit(peers);\n        var before = 0u;");
+        let _ = writeln!(src, "        if (lane == leader) {{ before = atomicAdd(&wc[d * {stride}u + sg], countOneBits(peers)); }}");
+        let _ = writeln!(src, "        r{j} = subgroupShuffle(before, leader) + countOneBits(peers & below);\n    }}");
+    }
+    // The invocation of digit `t`: the counters of its subgroups to prefix sums, the digits'
+    // first slots by a workgroup scan of their totals.
+    src.push_str("    workgroupBarrier();\n");
+    for k in 0..warps {
+        let _ = writeln!(src, "    let c{k} = atomicLoad(&wc[t * {stride}u + {k}u]);");
+    }
+    for k in 1..warps {
+        let sum = (0..k).map(|i| format!("c{i}")).collect::<Vec<_>>().join(" + ");
+        let _ = writeln!(src, "    let e{k} = {sum};");
+    }
+    let total = (0..warps).map(|i| format!("c{i}")).collect::<Vec<_>>().join(" + ");
+    let _ = write!(
+        src,
+        "    let total = {total};
+    let before_in_group = subgroupExclusiveAdd(total);
+    let group_total = subgroupAdd(total);
+    if (lane == 0u) {{ wsum[sg] = group_total; }}
+    workgroupBarrier();
+    var groups_before = 0u;
+    for (var s = 0u; s < {warps}u; s++) {{ groups_before += select(0u, wsum[s], s < sg); }}
+    let start = groups_before + before_in_group;
+    {{
+        let q = t * p.cstride + tile;
+        var o = 0u;
+        if (q > 0u) {{ o = offs[q - 1u]; }}
+        gbase[t] = o - start;
+    }}
+    atomicStore(&wc[t * {stride}u], start);
+"
+    );
+    for k in 1..warps {
+        let _ = writeln!(src, "    atomicStore(&wc[t * {stride}u + {k}u], start + e{k});");
+    }
+    src.push_str("    workgroupBarrier();\n");
+    for j in 0..BALLOT_PER_THREAD {
+        let _ = writeln!(src, "    {{\n        let pos = atomicLoad(&wc[digit(w{j}) * {stride}u + sg]) + r{j};\n        sk[pos] = w{j};");
+        if has_pay {
+            let _ = writeln!(src, "        sp[pos] = y{j};");
+        }
+        src.push_str("    }\n");
+    }
+    let _ = write!(
+        src,
+        "    workgroupBarrier();
+    let valid = min({tile}u, p.n - base);
+    for (var m = 0u; m < {BALLOT_PER_THREAD}u; m++) {{
+        let q = m * {WORKGROUP}u + t;
+        if (q < valid) {{
+            let w = sk[q];
+            let pos = gbase[digit(w)] + q;
+"
+    );
+    if store_keys {
+        let _ = writeln!(src, "            out_keys[pos] = {};", if last { "key_out(w)" } else { "w" });
+    }
+    if has_pay {
+        src.push_str("            out_pay[pos] = sp[q];\n");
+    }
+    src.push_str("        }\n    }\n}\n");
+    src
+}
+
+/// Bytes of workgroup memory the ballot scatter kernel declares: the counters (a word per digit and
+/// subgroup, padded), the digit bases, the subgroup totals, and the staged keys and payload.
+fn ballot_bytes(payload: bool) -> u32 {
+    let words = DIGITS * (WORKGROUP / SUBGROUP + 1) + DIGITS + WORKGROUP / SUBGROUP + WORKGROUP * BALLOT_PER_THREAD * (1 + u32::from(payload));
+    words * 4
+}
+
+/// Whether a sort (carrying a payload or not) ranks with ballots: subgroups of 32 invocations and
+/// room for the ballot kernel's workgroup memory.
+fn use_ballots(tuning: &Tuning, payload: bool) -> bool {
+    tuning.subgroup32 && ballot_bytes(payload) <= tuning.workgroup_storage
+}
+
 /// What a sort computes.
 #[derive(Clone, Copy)]
 pub(crate) struct Spec {
@@ -470,7 +643,8 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
     let n = keys.len();
     let too_large = || LumaError::DimensionTooLarge { shape: [n, 1, 1, 1] };
     let n32 = u32::try_from(n).map_err(|_| too_large())?;
-    let tiles = n32.div_ceil(TILE);
+    let ballot = use_ballots(ctx.tuning(), !matches!(payload, Payload::None));
+    let tiles = n32.div_ceil(if ballot { WORKGROUP * BALLOT_PER_THREAD } else { TILE });
     let passes = spec.key_bits.clamp(1, 32).div_ceil(DIGIT_BITS);
     let bytes = n as u64 * 4;
     // The counts of a digit are `cstride` words, a whole number of the `vec4`s a counting
@@ -534,7 +708,7 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
         // The transform and the direction only matter where keys are read from or written to
         // the user's side.
         let (transform, descending) = if first || last { (spec.transform, spec.descending) } else { (KeyTransform::Identity, false) };
-        let count_pass = RadixPass { kind: RadixKind::Count, shift, transform, descending };
+        let count_pass = RadixPass { kind: RadixKind::Count { ballot }, shift, transform, descending };
 
         let count_args = [RawArg::write(&counts, count_bytes)];
         if let (true, Keys::Pending(node)) = (first, keys) {
@@ -552,7 +726,7 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
             .scan(Bound { buffer: &counts, bytes: count_bytes }, count_words as u32, 1, 1, Bound { buffer: &scanned, bytes: count_bytes })?;
 
         let store_keys = dst_keys.is_some();
-        let scatter_pass = RadixPass { kind: RadixKind::Scatter { last, store_keys, payload: kind }, shift, transform, descending };
+        let scatter_pass = RadixPass { kind: RadixKind::Scatter { last, store_keys, payload: kind, ballot }, shift, transform, descending };
         let mut writes = Vec::with_capacity(2);
         if let Some(buffer) = dst_keys {
             writes.push(RawArg::write(buffer, bytes));
