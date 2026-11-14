@@ -174,7 +174,7 @@ impl HandGram {
     pub fn run(&self, x: &Array<f32>, c: &Array<f32>, s: &Array<f32>, out: &mut Array<f32>, f: u32, k: u32) {
         assert!(f % 32 == 0 && k > 0, "HandGram needs F a multiple of 32 and K > 0");
         let tiles = (f / 32) * (f / 32);
-        let split = (256u32.div_ceil(tiles)).min(k / 1024).max(1);
+        let split = (1024u32.div_ceil(tiles)).min(k / 1024).max(1);
         let kc = k.div_ceil(split).next_multiple_of(16);
         let slices = k.div_ceil(kc);
         let need = (slices * f * f) as usize;
