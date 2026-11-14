@@ -40,9 +40,17 @@ All notable changes to Luma are listed here. The format follows
   writes, reductions and scans, records, loops, precision, integer and bit operations, custom
   kernels, a performance guide and worked examples (heat equation, Euler solver, ML-KEM, Keccak,
   CPA). Its code blocks are tested as doctests.
+- `Array::reduce_axis` (up to four of sum, min, max and sum of squares along an axis in one pass
+  over the data) and, for `f32`, `mean_axis`, `var_axis` (population variance, two-pass) and
+  `std_axis`.
 - `sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis` for `u32`, `i32` and
   `f32` arrays (`SortKey`): a stable radix sort on the GPU, about 2 ms for 2^24 keys on an RTX 3090.
   Floats sort in total order, NaNs last.
+
+### Changed
+
+- `sum_axis`, `min_axis` and `max_axis` no longer evaluate a pending operand first: its expression
+  is computed inside the first pass of the reduction (scans still evaluate it).
 
 ### Removed
 

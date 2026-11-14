@@ -621,7 +621,7 @@ impl<'a> ReduceElem<'a> {
     }
 
     /// The expression combining accumulators `u` and `v`.
-    fn combine(self, op: ReduceOp) -> &'static str {
+    pub(crate) fn combine(self, op: ReduceOp) -> &'static str {
         match (self, op) {
             (ReduceElem::Plain(_), ReduceOp::Sum | ReduceOp::SumSquares) => "u + v",
             (ReduceElem::Plain(_), ReduceOp::Min) => "min(u, v)",
@@ -633,7 +633,7 @@ impl<'a> ReduceElem<'a> {
     }
 
     /// The square of the expression `e`.
-    fn square(self, e: &str) -> String {
+    pub(crate) fn square(self, e: &str) -> String {
         match self {
             ReduceElem::Plain(_) => format!("{e} * {e}"),
             ReduceElem::Df32 { .. } => format!("df_mul({e}, {e})"),
