@@ -17,6 +17,11 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
+  version per release (`/vX.Y.Z/`) and `/main/`: arrays, lazy evaluation and fusion, views and
+  writes, reductions and scans, records, loops, precision, integer and bit operations, custom
+  kernels, a performance guide and worked examples (heat equation, Euler solver, ML-KEM, Keccak,
+  CPA). Its code blocks are tested as doctests.
 - `Array<i32>`: `+ - * / %` (wrapping; `x / 0` is `x`, `i32::MIN / -1` is `i32::MIN`, `x % 0` is
   0), unary minus, `abs`, `sign`, `& | ^ !`, arithmetic `<< >>`, `minimum` / `maximum`,
   comparisons, `select`, views, reductions, scans and loops; `i32` scalars and `luma::Scalar<i32>`.
@@ -28,6 +33,19 @@ All notable changes to Luma are listed here. The format follows
   `From<bool>`, `From<Mask> for bool`): `& | ^ !`, `count()` (a `u32` array), `any()` and `all()`
   (mask arrays), `to_u32()` and `to_f32()`, `min` / `max`, views, `select` and loops.
 - The fuzzer covers `i32`, masks and the new casts.
+- `matmul` (`a.matmul(&b)`, `luma::matmul`) for `f32`: tiled kernels (128x128 and 32x32 output
+  tiles, K split over workgroups when the output has few tiles); pending operands, transposes
+  included, are computed inside the kernel's loads instead of being stored first.
+- `Array::reduce_axis` (up to four of sum, min, max and sum of squares along an axis in one pass
+  over the data) and, for `f32`, `mean_axis`, `var_axis` (population variance, two-pass) and
+  `std_axis`.
+- `put_add`, `put_min` and `put_max` for `u32`, `i32` and `f32` arrays (`AtomicElem`): scatters
+  with atomic accumulation, accumulated per workgroup first for targets of up to 4096 elements;
+  `f32` sums are not bitwise reproducible. `bincount` and `Array<f32>::histogram`, whose bucket
+  expression fuses into the scatter.
+- `sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis` for `u32`, `i32` and
+  `f32` arrays (`SortKey`): a stable radix sort on the GPU, about 2 ms for 2^24 keys on an RTX 3090.
+  Floats sort in total order, NaNs last.
 - Group reductions `group_sum`, `group_min`, `group_max` (`u32`, `i32`, `f32`), `group_count`
   and `group_mean` (`f32`): scatter-based, the values and codes fuse into one kernel; codes past
   `groups` are skipped.
@@ -35,17 +53,8 @@ All notable changes to Luma are listed here. The format follows
   all NaNs form one value, `-0.0` and `0.0` one value.
 - `quantile`, `median`, `quantile_axis` and `median_axis` for `f32` (NumPy's linear method, on
   the sorted array).
-- A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
-  version per release (`/vX.Y.Z/`) and `/main/`: arrays, lazy evaluation and fusion, views and
-  writes, reductions and scans, records, loops, precision, integer and bit operations, custom
-  kernels, a performance guide and worked examples (heat equation, Euler solver, ML-KEM, Keccak,
-  CPA). Its code blocks are tested as doctests.
-- `Array::reduce_axis` (up to four of sum, min, max and sum of squares along an axis in one pass
-  over the data) and, for `f32`, `mean_axis`, `var_axis` (population variance, two-pass) and
-  `std_axis`.
-- `sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis` for `u32`, `i32` and
-  `f32` arrays (`SortKey`): a stable radix sort on the GPU, about 2 ms for 2^24 keys on an RTX 3090.
-  Floats sort in total order, NaNs last.
+- `examples/bench_datasci.rs`: every primitive above against a hand-written WGSL kernel of the
+  same algorithm (`--gate` fails on a GPU-time ratio above the case's threshold).
 
 ### Changed
 
