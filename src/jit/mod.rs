@@ -183,6 +183,7 @@ use crate::profile::{FusionSplit, SplitReason};
 use inline::{inline, Judgement, Lowered, Verdict};
 use looped::LoopPlan;
 use program::Instr;
+pub(crate) use program::AtomicOp;
 
 pub(crate) use launch::{check_finite, evaluate, evaluate_group, evaluate_into, force_group, reduce_first_pass, run_loop};
 pub(crate) use operator::{operator_source, Operator};

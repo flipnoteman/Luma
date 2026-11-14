@@ -509,7 +509,7 @@ fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
     let value = |at: u32| main.get(at as usize).copied();
     match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } => key.outputs.iter().filter_map(|&at| value(at)).collect(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
         Tail::Reduce(_) => main.last().copied().into_iter().collect(),
     }
 }
@@ -648,7 +648,7 @@ fn output_bytes(key: &FusedKey) -> f64 {
     let bytes = |index: &u32| key.instrs.get(*index as usize).map_or(0.0, |instr| instr.op.out_ty().bytes() as f64);
     match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } => key.outputs.iter().map(bytes).sum(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } => key.outputs.first().map_or(0.0, bytes),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => key.outputs.first().map_or(0.0, bytes),
         Tail::Reduce(_) => 0.0,
     }
 }

@@ -764,13 +764,24 @@ impl<T: ScalarType> Array<T> {
     /// view of another one. Lazy arrays recorded before the write keep their values.
     #[track_caller]
     pub fn put(&mut self, indices: &Array<u32>, values: impl Operand<T>) -> Result<()> {
-        let location = Location::caller();
+        self.put_with(indices, values, None, "put", Location::caller())
+    }
+
+    /// [`Array::put`], or with `atomic` the combining scatter of `put_add` and its kin.
+    pub(crate) fn put_with(
+        &mut self,
+        indices: &Array<u32>,
+        values: impl Operand<T>,
+        atomic: Option<jit::AtomicOp>,
+        name: &'static str,
+        location: &'static Location<'static>,
+    ) -> Result<()> {
         let prepared = self.scatter_args(indices, values.rhs());
         drop(values);
         let result = prepared.and_then(|(base, index, values)| {
-            jit::assign::scatter(self.context(), &base, index, values, ElemTy::of::<T>()?, indices.len(), "put", location)
+            jit::assign::scatter(self.context(), &base, index, values, ElemTy::of::<T>()?, indices.len(), name, location, atomic)
         });
-        finish(result, "put", location)
+        finish(result, name, location)
     }
 
     /// The target buffer, the index operand and the value operand of [`Array::put`].
