@@ -11,6 +11,7 @@ use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
 use crate::matmul::{MatmulOperand, MatmulTile};
 use crate::scan::AxisPass;
+use crate::sort::RadixPass;
 use crate::profile::SplitReason;
 
 use super::codegen::Tile;
@@ -116,13 +117,17 @@ pub(crate) enum Tail {
     /// The last instruction is the operand of a reducing pass along an axis (`scan::AxisPass`):
     /// the program becomes `luma_eval(q)`, the load of the pass (see `launch::axis_reduce`).
     AxisReduce(AxisPass),
+    /// A first-pass kernel of a radix sort over the one root, the keys: the program becomes
+    /// `luma_key(i)`, the key loads of the kernel of `sort::fused_body`, whose own buffers come
+    /// before and after the inputs (see `launch::radix_pass`).
+    Radix(RadixPass),
 }
 
 impl Tail {
     /// Whether the roots of a program with this tail are read by it and never stored, so that
     /// they count as computed inside it (their nodes are fused, not evaluated).
     pub(super) fn consumes_roots(self) -> bool {
-        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_))
+        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_) | Tail::Radix(_))
     }
 }
 
@@ -278,6 +283,7 @@ impl FusedKey {
                 let ops: Vec<String> = pass.ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
                 format!("FusedAxisReduce({}: {names}) {ty}", ops.join("+"))
             }
+            Tail::Radix(_) => format!("FusedRadix({names}) {ty}"),
             Tail::Reduce(ops) => {
                 let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
                 format!("FusedReduce({}: {names}) {ty}", ops.join("+"))

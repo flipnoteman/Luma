@@ -416,11 +416,15 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     let reduce = matches!(key.tail, Tail::Reduce(_));
     let matmul = matches!(key.tail, Tail::Matmul { .. });
     let axis = matches!(key.tail, Tail::AxisReduce(_));
+    let radix = match key.tail {
+        Tail::Radix(pass) => Some(pass),
+        _ => None,
+    };
     let segmented = !key.spans.is_empty();
     let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
     // A product reads its operands at their own element indices: nothing is relative to a segment.
-    let based = generates(key) && !segmented && !matmul && !axis;
-    let uniform = reduce || matmul || axis || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
+    let based = generates(key) && !segmented && !matmul && !axis && radix.is_none();
+    let uniform = reduce || matmul || axis || radix.is_some() || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
     let mut src = String::new();
 
     if uniform {
@@ -433,6 +437,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         }
         if axis {
             src.push_str(crate::scan::AXIS_PARAMS);
+        }
+        if radix.is_some() {
+            src.push_str(crate::sort::PARAMS);
         }
         if segmented {
             src.push_str("base: u32, total: u32, ");
@@ -458,7 +465,8 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
         // The roots are the operands, read by `luma_lhs` / `luma_rhs`; the output is `c`.
-        Tail::Matmul { .. } => Vec::new(),
+        // The roots of a sort are its keys, read by `luma_key`; its buffers are declared below.
+        Tail::Matmul { .. } | Tail::Radix(_) => Vec::new(),
         // The roots are the cells of the pass, read by `luma_eval`; the outputs are its own.
         Tail::AxisReduce(_) => Vec::new(),
     };
@@ -472,6 +480,11 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     if matmul {
         src.push_str("@group(1) @binding(0) var<storage, read_write> c: array<f32>;\n");
     }
+    let mut binding = outputs.len() + usize::from(matmul) + axis_outputs;
+    if let Some(pass) = radix {
+        // The roots are the keys, read by `luma_key`; the kernel's own buffers go around the inputs.
+        pass.declare_writes(&mut src, &mut binding);
+    }
     for (j, &at) in outputs.iter().enumerate() {
         // A reduction's single output is `out`, as `reduce_main` expects.
         let name = if reduce { "out".to_owned() } else { format!("out{j}") };
@@ -483,7 +496,6 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         };
         let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{elem}>;");
     }
-    let mut binding = outputs.len() + usize::from(matmul) + axis_outputs;
     for (k, ty) in key.input_tys.iter().enumerate() {
         if key.in_place.iter().any(|&(paired, _)| paired == k as u32) {
             continue;
@@ -505,6 +517,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                 binding += 1;
             }
         }
+    }
+    if let Some(pass) = radix {
+        pass.declare_reads(&mut src, &mut binding);
     }
     if uniform {
         let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
@@ -714,6 +729,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
                 }
             }
             src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs));
+        }
+        Tail::Radix(pass) => {
+            let names = Names { views: &views, in_place: &[] };
+            let root = key.outputs.first().map_or(0, |&at| at as usize);
+            src.push_str(&load_function("luma_key", key, root, inlined, &names, index, segmented));
+            src.push_str(&crate::sort::fused_body(pass, out_ty(root)));
         }
     }
     src

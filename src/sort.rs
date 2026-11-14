@@ -15,7 +15,10 @@
 //!
 //! Keys are sorted as `u32` words after an order-preserving transform ([`KeyTransform`]) applied
 //! when the first pass loads them and inverted when the last pass stores them, so the passes in
-//! between move plain words. Descending order sorts the complemented key. An invocation owns 8
+//! between move plain words. A lazy key array is not evaluated first: the two kernels of the first
+//! pass (count, and scatter) compute the keys from the expression, flattened into them like the
+//! operand of a reduction (`jit::program::Tail::Radix`); the kernel text is the same as for a
+//! buffer of keys except for how `load_key` reads. Descending order sorts the complemented key. An invocation owns 8
 //! consecutive keys of a tile and every step keeps their order, so the sort is stable.
 //!
 //! Measured on an RTX 3090 (2^24 random `u32` keys, `bench_datasci --only sort`; the clocks of the
@@ -36,8 +39,9 @@ use wgpu::Buffer;
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
-use crate::error::{LumaError, Result};
+use crate::error::LumaError;
 use crate::gpu_type::ScalarType;
+use crate::jit::{self, Node};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::scan::{add_operator, Bound, Lines};
 use crate::shape::Shape;
@@ -120,33 +124,137 @@ impl SortKey for f32 {
     const TRANSFORM: KeyTransform = KeyTransform::Float;
 }
 
-/// The `Params` struct and the key functions every sort kernel starts with. `load_key(i)` is the
-/// key of element `i` as the passes order it: the first pass reads the user's array through the
-/// transform (the one place a fused load of a pending key replaces), later passes the words the
-/// previous pass wrote.
-fn key_functions(first: bool, transform: KeyTransform, descending: bool) -> String {
-    let mut src = String::from("struct Params { n: u32, tiles: u32, cstride: u32 }\n");
-    let complement = if descending { "~" } else { "" };
-    let _ = writeln!(src, "fn key_in(b: u32) -> u32 {{\n    {}\n}}", transform.forward());
-    let _ = writeln!(src, "fn key_out(w: u32) -> u32 {{\n    let k = {complement}w;\n    {}\n}}", transform.inverse());
-    if first {
-        let _ = writeln!(src, "fn load_key(i: u32) -> u32 {{ return {complement}key_in(keys[i]); }}");
-    } else {
-        src.push_str("fn load_key(i: u32) -> u32 { return keys[i]; }\n");
+/// What a radix kernel does.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum RadixKind {
+    /// Counts the digits of every tile of keys (see the module documentation).
+    Count,
+    /// Ranks every tile by the digit and writes keys and payload to their global positions.
+    /// `last` passes store keys through the inverse of the transform; `store_keys == false`
+    /// stores the payload only.
+    Scatter { last: bool, store_keys: bool, payload: PayloadKind },
+}
+
+/// One kernel of a radix sort pass on the bits `shift..shift + 8`. The transform and the
+/// direction only matter where keys are read from or written to the user's side (the first and
+/// the last pass).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct RadixPass {
+    pub(crate) kind: RadixKind,
+    pub(crate) shift: u8,
+    pub(crate) transform: KeyTransform,
+    pub(crate) descending: bool,
+}
+
+/// The fields every radix kernel's `Params` starts with: the keys, the tiles and the words
+/// between the counts of two digits (see [`Spec`]); a fused kernel's scalars follow.
+pub(crate) const PARAMS: &str = "n: u32, tiles: u32, cstride: u32, ";
+
+/// How a radix kernel reads the key of an element.
+#[derive(Clone, Copy)]
+pub(crate) enum KeyLoad<'a> {
+    /// From the buffer `keys`: the user's array (transformed) in the first pass, else the words
+    /// the previous pass wrote.
+    Buffer { first: bool },
+    /// From the function `luma_key(i)` of the element type `ty` (the first pass over a lazy
+    /// expression, see `jit::program::Tail::Radix`).
+    Fused { ty: &'a str },
+}
+
+fn declare(src: &mut String, binding: &mut usize, access: &str, name: &str, elem: &str) {
+    let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {name}: array<{elem}>;");
+    *binding += 1;
+}
+
+impl RadixPass {
+    /// Declares the buffers the kernel writes, from binding `*binding` on: the counts, or the
+    /// keys (unless `!store_keys`) and the payload (unless there is none).
+    pub(crate) fn declare_writes(self, src: &mut String, binding: &mut usize) {
+        match self.kind {
+            RadixKind::Count => declare(src, binding, "read_write", "counts", "vec4<u32>"),
+            RadixKind::Scatter { store_keys, payload, .. } => {
+                if store_keys {
+                    declare(src, binding, "read_write", "out_keys", "u32");
+                }
+                if payload != PayloadKind::None {
+                    declare(src, binding, "read_write", "out_pay", "u32");
+                }
+            }
+        }
+    }
+
+    /// Declares the buffers the kernel reads besides the keys: the payload (`PayloadKind::Buffer`)
+    /// and the inclusive scan of the counts.
+    pub(crate) fn declare_reads(self, src: &mut String, binding: &mut usize) {
+        if let RadixKind::Scatter { payload, .. } = self.kind {
+            if payload == PayloadKind::Buffer {
+                declare(src, binding, "read", "pay", "u32");
+            }
+            declare(src, binding, "read", "offs", "u32");
+        }
+    }
+}
+
+/// The key functions every sort kernel has. `load_key(i)` is the key of element `i` as the passes
+/// order it: the first pass reads the user's array through the transform, later passes the words
+/// the previous pass wrote. `key_out(w)` is the user's key of the word `w`.
+fn key_functions(pass: RadixPass, load: KeyLoad<'_>) -> String {
+    let complement = if pass.descending { "~" } else { "" };
+    let mut src = String::new();
+    let _ = writeln!(src, "fn key_in(b: u32) -> u32 {{\n    {}\n}}", pass.transform.forward());
+    let _ = writeln!(src, "fn key_out(w: u32) -> u32 {{\n    let k = {complement}w;\n    {}\n}}", pass.transform.inverse());
+    match load {
+        KeyLoad::Buffer { first: true } => {
+            let _ = writeln!(src, "fn load_key(i: u32) -> u32 {{ return {complement}key_in(keys[i]); }}");
+        }
+        KeyLoad::Buffer { first: false } => src.push_str("fn load_key(i: u32) -> u32 { return keys[i]; }\n"),
+        KeyLoad::Fused { ty: "u32" } => {
+            let _ = writeln!(src, "fn load_key(i: u32) -> u32 {{ return {complement}key_in(luma_key(i)); }}");
+        }
+        KeyLoad::Fused { ty } => {
+            let _ = writeln!(src, "fn load_key(i: u32) -> u32 {{ return {complement}key_in(bitcast<u32>(luma_key(i))); }}");
+            debug_assert!(ty == "i32" || ty == "f32");
+        }
     }
     src
 }
 
-/// WGSL of the counting kernel of the pass that sorts by bits `shift..shift + 8`: a workgroup
-/// counts the digits of [`COUNT_TILES`] consecutive tiles, so that every invocation writes the
-/// counts of its digit for those tiles as one aligned `vec4` (a count per tile written on its own
-/// is a 4-byte write to a sector of its own, which cost as much as reading the keys). Arguments:
-/// counts (write), keys, uniform [`Params`].
-pub(crate) fn count_source(shift: u8, first: bool, transform: KeyTransform, descending: bool) -> String {
-    let mut src = key_functions(first, transform, descending);
-    src.push_str("@group(1) @binding(0) var<storage, read_write> counts: array<vec4<u32>>;\n");
-    src.push_str("@group(1) @binding(1) var<storage, read> keys: array<u32>;\n");
-    src.push_str("@group(1) @binding(2) var<uniform> p: Params;\n");
+/// The WGSL of a kernel that reads the keys from the buffer `keys` (`first`: the user's array).
+/// Arguments, in order: what the pass writes, keys, what it reads (see
+/// [`RadixPass::declare_writes`] and [`RadixPass::declare_reads`]), uniform `Params`.
+pub(crate) fn source(pass: RadixPass, first: bool) -> String {
+    let mut src = format!("struct Params {{ {PARAMS}}}\n");
+    let mut binding = 0;
+    pass.declare_writes(&mut src, &mut binding);
+    declare(&mut src, &mut binding, "read", "keys", "u32");
+    pass.declare_reads(&mut src, &mut binding);
+    let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
+    src.push_str(&key_functions(pass, KeyLoad::Buffer { first }));
+    src.push_str(&body(pass));
+    src
+}
+
+/// The WGSL of a first-pass kernel after its declarations, reading the keys through
+/// `luma_key(i)`, which returns the element type `ty` (`"u32"`, `"i32"` or `"f32"`).
+pub(crate) fn fused_body(pass: RadixPass, ty: &str) -> String {
+    let mut src = key_functions(pass, KeyLoad::Fused { ty });
+    src.push_str(&body(pass));
+    src
+}
+
+fn body(pass: RadixPass) -> String {
+    match pass.kind {
+        RadixKind::Count => count_body(pass.shift),
+        RadixKind::Scatter { last, store_keys, payload } => scatter_body(pass.shift, last, store_keys, payload),
+    }
+}
+
+/// The counting kernel of the pass that sorts by bits `shift..shift + 8`: a workgroup counts the
+/// digits of [`COUNT_TILES`] consecutive tiles, so that every invocation writes the counts of its
+/// digit for those tiles as one aligned `vec4` (a count per tile written on its own is a 4-byte
+/// write to a sector of its own, which cost as much as reading the keys).
+fn count_body(shift: u8) -> String {
+    let mut src = String::new();
     let _ = writeln!(src, "var<workgroup> hist: array<atomic<u32>, {}>;", COUNT_TILES * DIGITS);
     let _ = write!(
         src,
@@ -180,38 +288,9 @@ fn each_key(mut f: impl FnMut(u32) -> String) -> String {
     (0..PER_THREAD).map(&mut f).collect()
 }
 
-/// WGSL of the scatter kernel of a pass. Arguments, in order: the keys written (unless
-/// `!store_keys`), the payload written (unless `payload == None`), keys, the payload read
-/// (`payload == Buffer`), the inclusive scan of the counts, uniform [`Params`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn scatter_source(
-    shift: u8,
-    first: bool,
-    last: bool,
-    store_keys: bool,
-    payload: PayloadKind,
-    transform: KeyTransform,
-    descending: bool,
-) -> String {
-    let mut src = key_functions(first, transform, descending);
-    let mut binding = 0;
-    let mut declare = |src: &mut String, access: &str, name: &str| {
-        let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {name}: array<u32>;");
-        binding += 1;
-    };
-    if store_keys {
-        declare(&mut src, "read_write", "out_keys");
-    }
-    if payload != PayloadKind::None {
-        declare(&mut src, "read_write", "out_pay");
-    }
-    declare(&mut src, "read", "keys");
-    if payload == PayloadKind::Buffer {
-        declare(&mut src, "read", "pay");
-    }
-    declare(&mut src, "read", "offs");
-    let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
-
+/// The scatter kernel of a pass (see [`RadixKind::Scatter`]).
+fn scatter_body(shift: u8, last: bool, store_keys: bool, payload: PayloadKind) -> String {
+    let mut src = String::new();
     // Without a payload the keys themselves travel through the workgroup memory, so nothing has to
     // be fetched again at the end. With one, a word holds the digit and the position of the key
     // in the tile (11 bits), which the kernel fetches key and payload by afterwards (no room in
@@ -363,9 +442,31 @@ pub(crate) struct Sorted {
     pub(crate) payload: Option<Arc<Storage>>,
 }
 
+/// The keys of a sort.
+#[derive(Clone, Copy)]
+pub(crate) enum Keys<'a> {
+    /// The words of this storage.
+    Ready(&'a Storage),
+    /// The lazy expression behind this node, `u32`, `i32` or `f32`: the first pass computes the
+    /// keys itself instead of reading them from a buffer (twice, by the counting and the
+    /// scattering kernel; evaluating them into a buffer first costs a write and a read, more than
+    /// recomputing an elementwise expression). Evaluated first if it cannot be fused: see
+    /// `jit::radix_pass`.
+    Pending(&'a Arc<Node>),
+}
+
+impl Keys<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Keys::Ready(storage) => storage.len(),
+            Keys::Pending(node) => node.len(),
+        }
+    }
+}
+
 /// Records the stable LSD radix sort of the `u32` words of `keys` (see [`Spec`]), carrying
 /// `payload`. `keys` is read as is by the first pass, through `spec.transform`.
-pub(crate) fn radix_sort(ctx: &Context, keys: &Storage, payload: Payload<'_>, spec: Spec) -> Result<Sorted> {
+pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, spec: Spec) -> Outcome<Sorted> {
     let n = keys.len();
     let too_large = || LumaError::DimensionTooLarge { shape: [n, 1, 1, 1] };
     let n32 = u32::try_from(n).map_err(|_| too_large())?;
@@ -379,7 +480,17 @@ pub(crate) fn radix_sort(ctx: &Context, keys: &Storage, payload: Payload<'_>, sp
     let count_words = u64::from(DIGITS) * u64::from(cstride);
     let count_bytes = count_words * 4;
 
-    let key_pin = keys.pin_single()?;
+    // The buffer the first pass reads: unless the keys are fused into it, as soon as the count
+    // kernel finds they cannot be.
+    let mut key_pin = match keys {
+        Keys::Ready(storage) => Some(storage.pin_single()?),
+        Keys::Pending(_) => {
+            if bytes > ctx.segment_bytes() {
+                return Err(LumaError::Chunked("a sort of an array split over several buffers").into());
+            }
+            None
+        }
+    };
     let input_pay = match payload {
         Payload::Buffer(storage) => Some(storage.pin_single()?),
         _ => None,
@@ -394,28 +505,28 @@ pub(crate) fn radix_sort(ctx: &Context, keys: &Storage, payload: Payload<'_>, sp
     let out_keys_pin = out_keys.as_ref().map(|storage| storage.pin_single()).transpose()?;
     let out_pay_pin = out_pay.as_ref().map(|storage| storage.pin_single()).transpose()?;
 
-    let operator = add_operator(ctx).map_err(failure_error)?;
+    let operator = add_operator(ctx)?;
     let mut lines = Lines::words(ctx, &operator);
     let mut scratch = Scratch::new(ctx);
     let counts = scratch.take(count_bytes)?;
     let scanned = scratch.take(count_bytes)?;
     // The results of the passes before the last alternate between two buffers.
     let mids = passes.saturating_sub(1).min(2) as usize;
-    let mid_keys = (0..mids).map(|_| scratch.take(bytes)).collect::<Result<Vec<Buffer>>>()?;
+    let mid_keys = (0..mids).map(|_| scratch.take(bytes)).collect::<std::result::Result<Vec<Buffer>, LumaError>>()?;
     let mid_pay = if first_kind == PayloadKind::None {
         Vec::new()
     } else {
-        (0..mids).map(|_| scratch.take(bytes)).collect::<Result<Vec<Buffer>>>()?
+        (0..mids).map(|_| scratch.take(bytes)).collect::<std::result::Result<Vec<Buffer>, LumaError>>()?
     };
     let params = [n32, tiles, cstride];
-    let uniform = || RawArg::Uniform(bytemuck::bytes_of(&params));
     let groups = fold_workgroups(ctx, tiles)?;
     let count_grid = fold_workgroups(ctx, count_groups)?;
+    // Whether the first pass computes the keys (set by its count kernel).
+    let mut fused = false;
 
     for pass in 0..passes {
         let (first, last) = (pass == 0, pass + 1 == passes);
         let shift = (pass * DIGIT_BITS) as u8;
-        let src_keys = if first { key_pin.buffer() } else { &mid_keys[(pass as usize - 1) % 2] };
         let src_pay = if first { input_pay.as_ref().map(|pin| pin.buffer()) } else { mid_pay.get((pass as usize - 1) % 2) };
         let dst_keys = if last { out_keys_pin.as_ref().map(|pin| pin.buffer()) } else { Some(&mid_keys[pass as usize % 2]) };
         let dst_pay = if last { out_pay_pin.as_ref().map(|pin| pin.buffer()) } else { mid_pay.get(pass as usize % 2) };
@@ -423,51 +534,61 @@ pub(crate) fn radix_sort(ctx: &Context, keys: &Storage, payload: Payload<'_>, sp
         // The transform and the direction only matter where keys are read from or written to
         // the user's side.
         let (transform, descending) = if first || last { (spec.transform, spec.descending) } else { (KeyTransform::Identity, false) };
+        let count_pass = RadixPass { kind: RadixKind::Count, shift, transform, descending };
 
-        let count = ctx.builtin(Builtin::RadixCount { shift, first, transform, descending }, "u32")?;
-        ctx.launch(
-            &count,
-            count_grid,
-            [n32, 1, 1],
-            &[RawArg::write(&counts, count_bytes), RawArg::read(src_keys, bytes), uniform()],
-        )?;
+        let count_args = [RawArg::write(&counts, count_bytes)];
+        if let (true, Keys::Pending(node)) = (first, keys) {
+            fused = jit::radix_pass(ctx, node, count_pass, params, count_grid, &count_args, &[])?;
+            if !fused {
+                key_pin = Some(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?.pin_single()?);
+            }
+        }
+        if !(first && fused) {
+            let src_keys = if first { key_pin.as_ref().expect("the first pass has keys").buffer() } else { &mid_keys[(pass as usize - 1) % 2] };
+            let count = ctx.builtin(Builtin::Radix { pass: count_pass, first }, "u32")?;
+            ctx.launch(&count, count_grid, [n32, 1, 1], &[count_args[0], RawArg::read(src_keys, bytes), RawArg::Uniform(bytemuck::bytes_of(&params))])?;
+        }
         lines
             .scan(Bound { buffer: &counts, bytes: count_bytes }, count_words as u32, 1, 1, Bound { buffer: &scanned, bytes: count_bytes })?;
 
         let store_keys = dst_keys.is_some();
-        let scatter = ctx.builtin(Builtin::RadixScatter { shift, first, last, store_keys, payload: kind, transform, descending }, "u32")?;
-        let mut args = Vec::with_capacity(6);
+        let scatter_pass = RadixPass { kind: RadixKind::Scatter { last, store_keys, payload: kind }, shift, transform, descending };
+        let mut writes = Vec::with_capacity(2);
         if let Some(buffer) = dst_keys {
-            args.push(RawArg::write(buffer, bytes));
+            writes.push(RawArg::write(buffer, bytes));
         }
         if kind != PayloadKind::None {
-            args.push(RawArg::write(dst_pay.expect("a payload sort has payload buffers"), bytes));
+            writes.push(RawArg::write(dst_pay.expect("a payload sort has payload buffers"), bytes));
         }
-        args.push(RawArg::read(src_keys, bytes));
+        let mut reads = Vec::with_capacity(2);
         if kind == PayloadKind::Buffer {
-            args.push(RawArg::read(src_pay.expect("a payload sort has payload buffers"), bytes));
+            reads.push(RawArg::read(src_pay.expect("a payload sort has payload buffers"), bytes));
         }
-        args.push(RawArg::read(&scanned, count_bytes));
-        args.push(uniform());
+        reads.push(RawArg::read(&scanned, count_bytes));
+        if let (true, Keys::Pending(node), true) = (first, keys, fused) {
+            if !jit::radix_pass(ctx, node, scatter_pass, params, groups, &writes, &reads)? {
+                return Err(LumaError::Gpu("a sort's keys fused into the counting kernel but not into the scattering one".into()).into());
+            }
+            continue;
+        }
+        let src_keys = if first { key_pin.as_ref().expect("the first pass has keys").buffer() } else { &mid_keys[(pass as usize - 1) % 2] };
+        let mut args = writes;
+        args.push(RawArg::read(src_keys, bytes));
+        args.extend(reads);
+        args.push(RawArg::Uniform(bytemuck::bytes_of(&params)));
+        let scatter = ctx.builtin(Builtin::Radix { pass: scatter_pass, first }, "u32")?;
         ctx.launch(&scatter, groups, [n32, 1, 1], &args)?;
     }
     drop((lines, scratch));
     Ok(Sorted { keys: out_keys, payload: out_pay })
 }
 
-/// The error of a failed operation that has no operation to blame.
-fn failure_error(failure: Failure) -> LumaError {
-    match failure {
-        Failure::New(error) => error,
-        Failure::Inherited(error) => LumaError::clone(&error),
-    }
-}
-
 impl<T: SortKey> Array<T> {
     /// The elements in ascending order, with the shape of this array (flat order; for one
     /// dimension per axis see [`Array::sort_axis`]). The sort is stable and runs as a radix sort
-    /// over the bits of the key, a few kernels per 8 bits: the array is evaluated first (a pending
-    /// expression is computed into a buffer), the result is recorded, not waited for.
+    /// over the bits of the key, a few kernels per 8 bits. A pending expression is not evaluated
+    /// first: the kernels of the first pass compute the keys themselves (unless it reads
+    /// circular shifts of other expressions). The result is recorded, not waited for.
     ///
     /// Floats order as their bits do after the usual total-order transform: `-inf < .. < -0.0 <
     /// +0.0 < .. < +inf < NaN`, so NaNs come last, and the sign of a NaN is not kept. Arrays
@@ -523,24 +644,35 @@ impl<T: SortKey> Array<T> {
 
     fn run_sort(&self, descending: bool) -> Outcome<Array<T>> {
         let ctx = self.context();
-        let storage = self.storage()?;
         if self.len() <= 1 {
+            self.storage()?;
             return Ok(self.clone());
         }
         let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: true };
-        let sorted = radix_sort(ctx, storage, Payload::None, spec)?;
+        let sorted = self.radix(Payload::None, spec)?;
         Ok(Array::from_storage(ctx, self.shape(), sorted.keys.expect("keys were asked for")))
+    }
+
+    /// Sorts the elements as `u32` words by `spec`, carrying `payload`: a lazy array is not
+    /// evaluated first, its first pass computes the keys (see [`Keys::Pending`]).
+    fn radix(&self, payload: Payload<'_>, spec: Spec) -> Outcome<Sorted> {
+        let ctx = self.context();
+        let sorted = match self.pending() {
+            Some(node) => radix_sort(ctx, Keys::Pending(node), payload, spec)?,
+            None => radix_sort(ctx, Keys::Ready(self.storage()?), payload, spec)?,
+        };
+        Ok(sorted)
     }
 
     /// The storage of the flat indices of the sorted elements.
     fn run_argsort(&self, descending: bool) -> Outcome<Arc<Storage>> {
         let ctx = self.context();
-        let storage = self.storage()?;
         if self.len() <= 1 {
+            self.storage()?;
             return Ok(Array::<u32>::zeros_on(ctx, self.len())?.storage()?.clone());
         }
         let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: false };
-        let sorted = radix_sort(ctx, storage, Payload::Index, spec)?;
+        let sorted = self.radix(Payload::Index, spec)?;
         Ok(sorted.payload.expect("the payload was asked for"))
     }
 
@@ -567,10 +699,9 @@ impl<T: SortKey> Array<T> {
         let (stride, n, lines32) = (stride as u32, n as u32, lines as u32);
         // The line of every element in the order of the argsort.
         let line = (&perm % stride) + (&perm / (stride * n)) * stride;
-        let line_storage = line.storage()?;
         let bits = u32::BITS - (lines32 - 1).leading_zeros();
         let spec = Spec { transform: KeyTransform::Identity, descending: false, key_bits: bits, want_keys: false };
-        let by_line = radix_sort(ctx, line_storage, Payload::Buffer(perm.storage()?), spec)?;
+        let by_line = line.radix(Payload::Buffer(perm.storage()?), spec)?;
         let order = Array::<u32>::from_storage(ctx, Shape::from(len), by_line.payload.expect("the payload was asked for"));
         // Entry `k` of line `l` is element `l * n + k` of `order`; it goes to its place in the line.
         let at = Array::<u32>::range_on(ctx, Shape::from(len), 0)?;

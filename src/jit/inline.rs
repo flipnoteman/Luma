@@ -508,7 +508,7 @@ impl Lowering<'_> {
 fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
     let value = |at: u32| main.get(at as usize).copied();
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } | Tail::Matmul { .. } => key.outputs.iter().filter_map(|&at| value(at)).collect(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } | Tail::Matmul { .. } | Tail::Radix(_) => key.outputs.iter().filter_map(|&at| value(at)).collect(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
         Tail::Reduce(_) | Tail::AxisReduce(_) => main.last().copied().into_iter().collect(),
     }
@@ -649,7 +649,7 @@ fn output_bytes(key: &FusedKey) -> f64 {
     match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } => key.outputs.iter().map(bytes).sum(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => key.outputs.first().map_or(0.0, bytes),
-        Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_) => 0.0,
+        Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_) | Tail::Radix(_) => 0.0,
     }
 }
 
