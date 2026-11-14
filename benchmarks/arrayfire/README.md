@@ -1,6 +1,6 @@
 # Luma vs ArrayFire
 
-Benchmarks of five workloads written twice: once with Luma (wgpu, Vulkan on Linux) and once with ArrayFire 3.x
+Benchmarks of seven workloads written twice: once with Luma (wgpu, Vulkan on Linux) and once with ArrayFire 3.x
 (CUDA and OpenCL backends) through the [`arrayfire`](https://crates.io/crates/arrayfire) crate 3.8. Every case is
 checked against a multithreaded CPU reference before it is timed.
 

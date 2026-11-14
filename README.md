@@ -24,14 +24,14 @@ fn main() -> Result<()> {
 Similar to [ArrayFire](https://arrayfire.com), code is written with the familiarity of the ```Array``` interface. 
 Execution of operations is deferred until the host requires the result. Chains of elementwise operations are fused
 into a single kernel, and all intermediate work is batched on submission so the GPU doesn't waste time on many small, 
-I/O dependant, operations. 
+I/O dependent, operations. 
 
 ## Features
 
-- Arrays of `f32`, `u32`, `f64` and `Df32` (double-float, about 48-bit) with up to 4 dimensions; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
+- Arrays of `f32`, `u32`, `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
 - `vec2`/`vec4` element types and `#[derive(Fields)]` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
-- Views: slicing, mutable slices (`ViewMut`), `broadcast_to`
+- Views: `slice` (`ViewMut` for writes), `pad`, `flip`, `transpose`, `take`, `put`, `concat`, `stack`, `broadcast_to`
 - Reductions: sum, min, max, mean, norm, along axes; `scan` / `cumsum`; `solve_tridiagonal`
 - Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
@@ -116,6 +116,8 @@ cargo run --release --example bench_batching           # sync after every op vs 
 cargo run --release --example bench_launch             # host cost per kernel launch
 cargo run --release --example bench_fusion             # one kernel per op vs fused chains
 cargo run --release --example bench_threads            # threads on one context vs a context each
+cargo run --release --example bench_build              # host cost of building and flattening expressions
+cargo run --release --example bench_pde                # views, assign/put, records, loops, scans, tridiagonal, Df32/f64
 cargo run --release --example keccak                   # Keccak-f, SHA3-256 and SHAKE128 in lazy array operations
 cargo run --release --example mlkem                    # ML-KEM (FIPS 203) KeyGen / Encaps / Decaps over batches, checked against RustCrypto and NIST vectors
 ```
@@ -132,7 +134,7 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench monte_carlo   # option pric
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imaging       # blurs, 2D convolution, bilateral filter, histogram
 ```
 
-[`benchmarks/arrayfire`](benchmarks/arrayfire) compares Luma with ArrayFire (CUDA and OpenCL) on five workloads. It is a
+[`benchmarks/arrayfire`](benchmarks/arrayfire) compares Luma with ArrayFire (CUDA and OpenCL) on seven workloads. It is a
 separate Cargo workspace and needs an ArrayFire install:
 
 ```sh
