@@ -943,7 +943,7 @@ pub fn stack_slice<T: ScalarType>(axis: usize, parts: &[Array<T>]) -> Array<T> {
     stack_of(axis, &refs, location)
 }
 
-fn stack_of<T: ScalarType>(axis: usize, parts: &[&Array<T>], location: &'static Location<'static>) -> Array<T> {
+pub(crate) fn stack_of<T: ScalarType>(axis: usize, parts: &[&Array<T>], location: &'static Location<'static>) -> Array<T> {
     let Some(&first) = parts.first() else {
         let error = LumaError::InvalidShape("stack of no arrays".into());
         let error = LumaError::Op { op: "stack", location, source: Arc::new(error) };

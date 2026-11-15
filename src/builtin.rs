@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::jit::ElemTy;
+use crate::solve::Io;
 use crate::tuning::{Tuning, TuningProfile};
 
 /// Workgroup size of the reduction kernels.
@@ -549,6 +550,9 @@ pub(crate) enum Builtin {
     /// that are a multiple of `1 << shift` live in workgroup memory (`shared_rows` of them), the
     /// others in a scratch buffer.
     CyclicTridiagonal { block: u8, starts: bool, workgroup: u16, shift: u8, shared_rows: u32 },
+    /// Line solves on parts that are all buffers (the fused ones are kernels of
+    /// `jit::program::Tail::Solve`); see [`crate::solve`].
+    SolveParts(crate::solve::SolveSpec),
     /// `out[i] = 1` where word `i` of `a` is a NaN or an infinity (as `f32` bits), else 0;
     /// arguments: out, a. Element type `"u32"`. See `jit::check_finite`.
     NonFinite,
@@ -1126,26 +1130,26 @@ pub(crate) fn tridiagonal_workgroup(tuning: &Tuning, lines: u32) -> u8 {
     }
 }
 
-/// The part of the tridiagonal kernels before the entry point: parameters, bindings and the line
-/// addressing. `out` holds the forward-swept right-hand sides and then the solution, `cp` the
-/// swept upper blocks. Cell `q` of the grid holds block `lo/diag/up[q * B * B + row * B + col]`
-/// and `rhs[q * B + row]`; the line `l` has `p.n` cells `line_base(l) + s * p.stride`.
-fn tridiagonal_header(starts: bool) -> String {
+/// The bindings of the Thomas kernel and the line addressing. `out` holds the forward-swept
+/// right-hand sides and then the solution, `cp` the swept upper blocks. Cell `q` of the grid holds
+/// block `lo/diag/up[q * B * B + row * B + col]` and `rhs[q * B + row]` (see [`Io::buffers`]); the
+/// line `l` has `p.n` cells `line_base(l) + s * p.stride`.
+fn tridiagonal_header(starts: bool, io: &Io) -> String {
     let (starts_binding, starts_decl) = if starts {
         ("@group(1) @binding(6) var<storage, read> starts: array<u32>;\n", 7)
     } else {
         ("", 6)
     };
+    let (coef, rhs) = (io.coef_type(), io.rhs_type());
     format!(
         "struct Params {{ n: u32, stride: u32, lines: u32 }}
-@group(1) @binding(0) var<storage, read_write> out: array<f32>;
+@group(1) @binding(0) var<storage, read_write> out: array<{rhs}>;
 @group(1) @binding(1) var<storage, read_write> cp: array<f32>;
-@group(1) @binding(2) var<storage, read> lo: array<f32>;
-@group(1) @binding(3) var<storage, read> diag: array<f32>;
-@group(1) @binding(4) var<storage, read> up: array<f32>;
-@group(1) @binding(5) var<storage, read> rhs: array<f32>;
+@group(1) @binding(2) var<storage, read> lo: array<{coef}>;
+@group(1) @binding(3) var<storage, read> diag: array<{coef}>;
+@group(1) @binding(4) var<storage, read> up: array<{coef}>;
+@group(1) @binding(5) var<storage, read> rhs: array<{rhs}>;
 {starts_binding}@group(1) @binding({starts_decl}) var<uniform> p: Params;
-fn line_base(l: u32) -> u32 {{ return (l % p.stride) + (l / p.stride) * p.stride * p.n; }}
 "
     )
 }
@@ -1167,7 +1171,7 @@ fn tridiagonal(block: u32, starts: bool, wg: u32) -> String {
 }
 
 /// The largest block size the solve is unrolled for.
-const UNROLLED_BLOCK: u32 = 5;
+pub(crate) const UNROLLED_BLOCK: u32 = 5;
 
 /// The straight-line solve of `b`-blocks. Per cell the forward sweep holds the diagonal block
 /// `m`, the right-hand side `r = [up | rhs]` (all `b x (b + 1)` entries as scalars) and the
@@ -1176,25 +1180,40 @@ const UNROLLED_BLOCK: u32 = 5;
 /// and writes the swept values for the backward sweep, which carries the solution of the next
 /// cell in registers. For `b == 1` this is the plain Thomas algorithm.
 fn tridiagonal_unrolled(b: usize, starts: bool, wg: u32) -> String {
+    let mut src = tridiagonal_header(starts, &Io::buffers(b));
+    src.push_str(&tridiagonal_body(b, starts, wg, 1, &Io::buffers(b)));
+    src
+}
+
+/// The entry point of the straight-line Thomas solve of `systems` systems of `b`-blocks, reading
+/// and writing through `io`, after the bindings and `Params` (see [`tridiagonal_header`]; the
+/// scratch `cp` holds `b * b` floats per cell and system).
+pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io: &Io) -> String {
     let w = b + 1;
     let bb = b * b;
     let s0 = if starts { "min(starts[l], p.n)" } else { "0u" };
-    let mut src = tridiagonal_header(starts);
+    let (guard, sys, line, scratch) = if systems > 1 {
+        (format!("p.lines * {systems}u"), "    let sys = lg / p.lines;\n", "lg % p.lines", format!("sys * (p.lines * p.n * {bb}u)"))
+    } else {
+        ("p.lines".to_owned(), "    let sys = 0u;\n", "lg", "0u".to_owned())
+    };
+    let mut src = String::from("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
     let _ = write!(
         src,
         "@compute @workgroup_size({wg})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let l = gid.x + gid.y * nwg.x * {wg}u;
-    if (l >= p.lines) {{ return; }}
+    let lg = gid.x + gid.y * nwg.x * {wg}u;
+    if (lg >= {guard}) {{ return; }}
+{sys}    let l = {line};
+    let so = {scratch};
     let base = line_base(l);
     let s0 = {s0};
     for (var s = 0u; s < s0; s++) {{
-        let oq = (base + s * p.stride) * {b}u;
+        let q = base + s * p.stride;
 "
     );
-    for c in 0..b {
-        let _ = writeln!(src, "        out[oq + {c}u] = 0.0;");
-    }
+    let zeros: Vec<String> = vec!["0.0".to_owned(); b];
+    src.push_str(&io.store("        ", "q", &zeros));
     src.push_str("    }\n    if (s0 >= p.n) { return; }\n");
     for i in 0..b {
         for j in 0..b {
@@ -1202,27 +1221,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
         let _ = writeln!(src, "    var pd{i} = 0.0;");
     }
-    src.push_str(
-        "    for (var s = s0; s < p.n; s++) {
-        let q = base + s * p.stride;
-        let o = q * __BB__u;
-        let oq = q * __B__u;
-"
-        .replace("__BB__", &bb.to_string())
-        .replace("__B__", &b.to_string())
-        .as_str(),
-    );
+    src.push_str("    for (var s = s0; s < p.n; s++) {\n        let q = base + s * p.stride;\n");
+    src.push_str(&io.load("        ", "q"));
     for i in 0..b {
         for j in 0..b {
-            let _ = writeln!(src, "        var m{i}{j} = diag[o + {}u];", i * b + j);
-            let _ = writeln!(src, "        var r{i}{j} = up[o + {}u];", i * b + j);
+            let _ = writeln!(src, "        var m{i}{j} = {};", io.diag("q", i * b + j));
+            let _ = writeln!(src, "        var r{i}{j} = {};", io.up("q", i * b + j));
         }
-        let _ = writeln!(src, "        var r{i}{b} = rhs[oq + {i}u];");
+        let _ = writeln!(src, "        var r{i}{b} = {};", io.rhs("q", i));
     }
     src.push_str("        if (s > s0) {\n");
+    src.push_str(&io.load_lo("            ", "q"));
     for i in 0..b {
         for k in 0..b {
-            let _ = writeln!(src, "            let l{i}{k} = lo[o + {}u];", i * b + k);
+            let _ = writeln!(src, "            let l{i}{k} = {};", io.lo("q", i * b + k));
         }
     }
     for i in 0..b {
@@ -1279,29 +1291,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     }
     for i in 0..b {
         for j in 0..b {
-            let _ = writeln!(src, "        cp[o + {}u] = r{i}{j};\n        pc{i}{j} = r{i}{j};", i * b + j);
+            let _ = writeln!(src, "        cp[so + q * {bb}u + {}u] = r{i}{j};\n        pc{i}{j} = r{i}{j};", i * b + j);
         }
-        let _ = writeln!(src, "        out[oq + {i}u] = r{i}{b};\n        pd{i} = r{i}{b};");
+        let _ = writeln!(src, "        pd{i} = r{i}{b};");
     }
+    let swept: Vec<String> = (0..b).map(|i| format!("r{i}{b}")).collect();
+    src.push_str(&io.store("        ", "q", &swept));
     src.push_str("    }\n");
     // The solution of the last cell is its swept right-hand side, still in `pd`.
     for i in 0..b {
         let _ = writeln!(src, "    var x{i} = pd{i};");
     }
-    let _ = write!(
-        src,
-        "    for (var j = 2u; j <= p.n - s0; j++) {{
-        let q = base + (p.n - j) * p.stride;
-        let o = q * {bb}u;
-        let oq = q * {b}u;
-"
-    );
+    src.push_str("    for (var j = 2u; j <= p.n - s0; j++) {\n        let q = base + (p.n - j) * p.stride;\n");
+    src.push_str(&io.load_out("        ", "q", "yo"));
     for i in 0..b {
-        let sum = (0..b).map(|k| format!("cp[o + {}u] * x{k}", i * b + k)).collect::<Vec<_>>().join(" + ");
-        let _ = writeln!(src, "        let y{i} = out[oq + {i}u] - ({sum});");
+        let sum = (0..b).map(|k| format!("cp[so + q * {bb}u + {}u] * x{k}", i * b + k)).collect::<Vec<_>>().join(" + ");
+        let _ = writeln!(src, "        let y{i} = yo{i} - ({sum});");
     }
+    let solved: Vec<String> = (0..b).map(|i| format!("y{i}")).collect();
+    src.push_str(&io.store("        ", "q", &solved));
     for i in 0..b {
-        let _ = writeln!(src, "        out[oq + {i}u] = y{i};\n        x{i} = y{i};");
+        let _ = writeln!(src, "        x{i} = y{i};");
     }
     src.push_str("    }\n}\n");
     src
@@ -1450,6 +1460,7 @@ impl Builtin {
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
                 crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows).into()
             }
+            Builtin::SolveParts(spec) => spec.source().into(),
             Builtin::Radix { pass, first } => crate::sort::source(pass, first).into(),
             Builtin::Matmul { tile, aligned, split } => crate::matmul::builtin_source(tile, aligned, split).into(),
             Builtin::MatmulSum => crate::matmul::sum_source(wg).into(),

@@ -297,7 +297,7 @@ assert_eq!(&y[4..6], &[0.0, 0.0]);
 ```
 
 `solve_block_tridiagonal(block, axis, &lo, &diag, &up, &rhs)` is the same with `block x block`
-blocks (`1 <= block <= 8`, partial pivoting), for coupled unknowns per cell. `rhs` has shape `[block, g0, g1, g2]`; `lo`, `diag` and `up` have
+blocks (`1 <= block <= 8`), for coupled unknowns per cell. `rhs` has shape `[block, g0, g1, g2]`; `lo`, `diag` and `up` have
 `[block * block, g0, g1, g2]`, entry `(row, col)` of a block at `row * block + col`; `axis` is
 `1..=3`. `solve_block_tridiagonal_from` takes a `start` array like the scalar form.
 
@@ -310,6 +310,66 @@ let diag = Array::from_slice(&[2.0f32, 0.0, 0.0, 2.0].repeat(3), [4, 3])?;
 let rhs = Array::from_slice(&[2.0f32, 4.0, 6.0, 8.0, 10.0, 12.0], [2, 3])?;
 let x = solve_block_tridiagonal(2, 1, &zero, &diag, &zero, &rhs);
 assert_eq!(x.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+### Solving on parts, and several systems at once
+
+The blocks of a cell often come as sixteen (or four, or nine) arrays of their own, the entries
+of a Jacobian, each an expression of the state; stacking them into the `[block * block, ..]`
+arrays above is a kernel per stack, and reading the solution's components back is a gather.
+`solve_block_tridiagonal_parts(axis, lo, diag, up, rhs)` takes the entries as arrays of the grid's
+shape instead (`lo`, `diag` and `up` as `[&Array<f32>; block * block]`, entry `(row, col)` at
+`row * block + col`, `rhs` as `[&Array<f32>; block]`) and returns the components of the solution
+as `[Array<f32>; block]`. `axis` is an axis of the grid, as for `solve_tridiagonal`. A part that
+is a lazy expression is not evaluated: the solver kernel computes it where it reads the
+coefficients of a cell, so a step from the state to the solution can be one launch. Parts that are
+evaluated arrays are bound as buffers. If the expressions need more buffers or scalars than a
+kernel can bind, the parts are stacked and the stacked solve runs; the result is the same.
+`solve_block_tridiagonal_parts_from` takes a `start` array.
+
+```rust
+use luma::*;
+
+// Block 2 on a [5, 3] grid along axis 0: the diagonal blocks are diag(d, 4) with `d` an expression
+// (never evaluated alone), no coupling between cells: x = rhs / diag.
+let zero = Array::<f32>::zeros([5, 3])?;
+let two = Array::<f32>::full([5, 3], 2.0)?;
+let (r0, r1) = (Array::<f32>::full([5, 3], 3.0)?, Array::<f32>::full([5, 3], 8.0)?);
+let d0 = &two + 0.0;
+let d1 = &two * 2.0;
+let [x0, x1] = solve_block_tridiagonal_parts(0, [&zero; 4], [&d0, &zero, &zero, &d1], [&zero; 4], [&r0, &r1]);
+assert_eq!(x0.to_vec()?, vec![1.5; 15]);
+assert_eq!(x1.to_vec()?, vec![2.0; 15]);
+# Ok::<(), luma::LumaError>(())
+```
+
+Independent scalar systems on one grid (the two equations of a turbulence model, say) solve in
+one launch with `solve_tridiagonal_parts(axis, [(&lo_k, &diag_k, &up_k, &rhs_k), (&lo_w, ..)])`,
+which returns one solution per system (`_from` with a `start` array likewise; up to 64 systems):
+the lines of all systems fill the device together, and the lazy parts are computed in the kernel as
+above. An extra axis of a single array batches systems as well: `solve_tridiagonal` on `[2, ni, nj]`
+arrays along axis 1 or 2 solves two systems per line, whichever algorithm runs.
+
+```rust
+use luma::*;
+
+// Two systems on a [6, 2] grid along axis 0: x[s] - 0.25 (x[s-1] + x[s+1]) = rhs[s], with
+// right-hand sides 1 and 2, so the second solution is twice the first.
+let lo = Array::<f32>::full([6, 2], -0.25)?;
+let up = Array::<f32>::full([6, 2], -0.25)?;
+let diag = Array::<f32>::full([6, 2], 1.0)?;
+let rhs = Array::<f32>::full([6, 2], 1.0)?;
+let rhs2 = &rhs * 2.0;
+let [x, y] = solve_tridiagonal_parts(0, [(&lo, &diag, &up, &rhs), (&lo, &diag, &up, &rhs2)]);
+let (x, y) = (x.to_vec()?, y.to_vec()?);
+assert!(x.iter().zip(&y).all(|(a, b)| (2.0 * a - b).abs() < 1e-5));
+
+// A batch axis: [2, 6, 2] along axis 1 is the two systems above, stacked.
+let stack = |a: &Array<f32>| stack_slice(0, &[a.clone(), a.clone()]);
+let batched = solve_tridiagonal(1, &stack(&lo), &stack(&diag), &stack(&up), &stack_slice(0, &[rhs.clone(), rhs2.clone()]));
+let z = batched.to_vec()?;
+assert!((z[0] - x[0]).abs() < 1e-5 && (z[1] - y[0]).abs() < 1e-5);
 # Ok::<(), luma::LumaError>(())
 ```
 

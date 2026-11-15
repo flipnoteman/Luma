@@ -84,6 +84,7 @@ mod builtin;
 mod context;
 mod conv;
 mod cyclic;
+mod solve;
 mod error;
 mod fields;
 mod fields_macro;
@@ -122,7 +123,10 @@ pub use gpu_type::{Df32, GpuType, Mask, ScalarType};
 pub use kernel::{uniform, view, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
 pub use until::{iterate_until_all, Cond, History, Run, Series, Stat, StopReason, Until};
-pub use linalg::{solve_block_tridiagonal, solve_block_tridiagonal_from, solve_tridiagonal, solve_tridiagonal_from};
+pub use linalg::{
+    solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from, solve_tridiagonal, solve_tridiagonal_from,
+    solve_tridiagonal_parts, solve_tridiagonal_parts_from,
+};
 pub use matmul::matmul;
 pub use jit::cost::CostModel;
 pub use jit::fusion_limit;

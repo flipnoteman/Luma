@@ -11,6 +11,7 @@ use crate::builtin::{Builtin, Finish, ReduceList, ReduceOp};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::matmul::{MatmulOperand, MatmulTile};
+use crate::solve::SolveSpec;
 use crate::sort::RadixPass;
 use crate::ops::{fold_workgroups, launch_1d, len_u32};
 
@@ -520,7 +521,7 @@ fn plan_shifts(
 fn out_elems(key: &FusedKey) -> Vec<u64> {
     let bytes = |at: u32| key.instrs.get(at as usize).map_or(4, |instr| instr.op.out_ty().bytes());
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } | Tail::Radix(_) => key.outputs.iter().map(|&at| bytes(at)).collect(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } | Tail::Radix(_) | Tail::Solve(_) => key.outputs.iter().map(|&at| bytes(at)).collect(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
         Tail::Reduce(_) | Tail::AxisReduce(_) => vec![key.instrs.len().checked_sub(1).map_or(4, |at| bytes(at as u32))],
     }
@@ -656,7 +657,7 @@ fn spans(
     }
 
     let outputs = match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } => key.outputs.len(),
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } | Tail::Solve(_) => key.outputs.len(),
         // The buffers of the sort itself: the counts, or two to write and two to read.
         Tail::Radix(_) => 4,
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } | Tail::Reduce(_) | Tail::AxisReduce(_) => 1,
@@ -1357,5 +1358,80 @@ pub(crate) fn radix_pass(
     raw.extend_from_slice(reads);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, groups, [words[0], 1, 1], &raw)?;
+    Ok(true)
+}
+
+/// One part of a line solve (see `solve::SolveSpec`).
+pub(crate) enum PartSide {
+    /// An evaluated array: a pin on its buffer and the bytes of it the array holds.
+    Ready(Pin, u64),
+    /// A lazy expression, fused into the kernel unless it cannot be (see [`fusable`]).
+    Pending(Arc<Node>),
+}
+
+/// Records the line solve of `spec` over `parts` (in the order of its parts): one launch of
+/// `groups` workgroups, with `writes` (its outputs and scratch) bound first, then the buffers of
+/// the parts, `starts` (if the spec has them) and the uniform `words` (`n, stride, lines`)
+/// followed by the scalars of the fused parts. Parts that are lazy expressions are computed in the
+/// kernel, one program for all of them. Returns `false`, having launched nothing, when they
+/// cannot be (see [`fusable`], or a part that has been evaluated meanwhile): the caller then
+/// solves their evaluated buffers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve(
+    ctx: &crate::context::Context,
+    parts: Vec<PartSide>,
+    mut spec: SolveSpec,
+    words: [u32; 3],
+    groups: [u32; 3],
+    size: [u32; 3],
+    writes: &[RawArg<'_>],
+    starts: Option<RawArg<'_>>,
+) -> Result<bool, Failure> {
+    let mut roots = Vec::new();
+    let mut ready: Vec<(Pin, u64)> = Vec::new();
+    for (part, side) in parts.into_iter().enumerate() {
+        match side {
+            PartSide::Ready(pin, bytes) => ready.push((pin, bytes)),
+            PartSide::Pending(node) => {
+                let Some(args) = node.operands() else { return Ok(false) };
+                spec.fuse(part);
+                roots.push((node, args));
+            }
+        }
+    }
+    let buffers = writes.len() + ready.len() + usize::from(starts.is_some());
+    if roots.is_empty() {
+        if buffers > ctx.jit().max_inputs() {
+            return Ok(false);
+        }
+        let core = ctx.builtin(Builtin::SolveParts(spec), "f32")?;
+        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(writes.len() + ready.len() + 2);
+        raw.extend_from_slice(writes);
+        raw.extend(ready.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        raw.extend(starts);
+        raw.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
+        ctx.launch(&core, groups, size, &raw)?;
+        return Ok(true);
+    }
+    let fused = flatten(&roots, Tail::Solve(spec))?;
+    drop(roots);
+    if !fusable(ctx, &fused, buffers) {
+        return Ok(false);
+    }
+    fused.mark_fused();
+    let Fused { mut key, inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
+    drop((fused_nodes, instr_nodes, sub_roots));
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+    let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
+    let mut uniform = Vec::with_capacity(words.len() + scalars.len());
+    uniform.extend_from_slice(&words);
+    uniform.extend_from_slice(&scalars);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(writes.len() + pins.len() + ready.len() + 2);
+    raw.extend_from_slice(writes);
+    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(ready.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend(starts);
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
+    ctx.launch(&core, groups, size, &raw)?;
     Ok(true)
 }
