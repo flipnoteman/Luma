@@ -321,3 +321,57 @@ fn aborting_a_recording_concerns_only_its_thread() {
     assert!(ctx.begin_recording(Vec::new()));
     assert!(ctx.end_recording().is_some());
 }
+
+/// A kernel of luma's own whose module declares a uniform its entry point never reads: the
+/// pipeline layout has no binding for it, so the launch binds the arguments the shader uses and
+/// skips the rest, whichever of them it is.
+#[test]
+fn a_launch_binds_exactly_the_bindings_the_shader_reads() {
+    let ctx = ctx();
+    let build = |source: &str| kernel::build_core(&ctx, &KernelKey::new(source.to_owned(), "main", None), Some("probe"), true).unwrap();
+    // The uniform at the end is unread.
+    let tail = build(
+        "struct Params { s0: u32, }
+         @group(1) @binding(0) var<storage, read_write> out0: array<u32>;
+         @group(1) @binding(1) var<storage, read> in0: array<u32>;
+         @group(1) @binding(2) var<uniform> p: Params;
+         @compute @workgroup_size(64)
+         fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+             if (gid.x >= luma.size.x) { return; }
+             out0[gid.x] = in0[gid.x] + 1u;
+         }",
+    );
+    // The input in the middle is unread.
+    let middle = build(
+        "struct Params { s0: u32, }
+         @group(1) @binding(0) var<storage, read_write> out0: array<u32>;
+         @group(1) @binding(1) var<storage, read> in0: array<u32>;
+         @group(1) @binding(2) var<uniform> p: Params;
+         @compute @workgroup_size(64)
+         fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+             if (gid.x >= luma.size.x) { return; }
+             out0[gid.x] = p.s0;
+         }",
+    );
+    let input = ctx.alloc_buffer(256, STORAGE_USAGE).unwrap();
+    ctx.upload(&input, bytemuck::cast_slice(&[41u32; 64])).unwrap();
+    let uniform = 7u32.to_le_bytes();
+    let outputs: Vec<Buffer> = (0..4).map(|_| ctx.alloc_buffer(256, STORAGE_USAGE).unwrap()).collect();
+    fn args<'a>(out: &'a Buffer, input: &'a Buffer, uniform: &'a [u8]) -> [RawArg<'a>; 3] {
+        [RawArg::write(out, 256), RawArg::read(input, 256), RawArg::Uniform(uniform)]
+    }
+
+    // Good launches around bad ones, all in one batch: the bad ones are errors of their own, and
+    // the work recorded before and after them still runs.
+    ctx.launch(&tail, [1, 1, 1], [64, 1, 1], &args(&outputs[0], &input, &uniform)).unwrap();
+    let short = [RawArg::write(&outputs[1], 256), RawArg::read(&input, 256)];
+    assert!(matches!(ctx.launch(&tail, [1, 1, 1], [64, 1, 1], &short), Err(LumaError::KernelArgCount { expected: 3, actual: 2 })));
+    let wrong = [RawArg::write(&outputs[1], 256), RawArg::Uniform(&uniform), RawArg::Uniform(&uniform)];
+    assert!(matches!(ctx.launch(&tail, [1, 1, 1], [64, 1, 1], &wrong), Err(LumaError::KernelBinding(_))));
+    ctx.launch(&middle, [1, 1, 1], [64, 1, 1], &args(&outputs[2], &input, &uniform)).unwrap();
+    ctx.launch(&tail, [1, 1, 1], [64, 1, 1], &args(&outputs[3], &input, &uniform)).unwrap();
+
+    assert_eq!(ctx.read::<u32>(&outputs[0], 256).unwrap(), vec![42; 64]);
+    assert_eq!(ctx.read::<u32>(&outputs[2], 256).unwrap(), vec![7; 64]);
+    assert_eq!(ctx.read::<u32>(&outputs[3], 256).unwrap(), vec![42; 64]);
+}

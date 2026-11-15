@@ -206,6 +206,18 @@ impl Builder {
         }
     }
 
+    /// The op of a lowered instruction. Its view is the context's (`child`), which the generated
+    /// code indexes through, except for the test whether a [`Edge::Fill`] read lies inside the
+    /// source; any other view an instruction names is not read, and when the context is the
+    /// composition of views (or none) it is not even the view the code applies. It gets no slots
+    /// then, and the key no numbers: a uniform no code reads has no binding.
+    fn flat_op(&mut self, op: Op) -> Option<Op> {
+        match op.kind {
+            OpKind::Shift(ShiftKind::View { edge, .. }) if edge != Edge::Fill => Some(Op::new(OpKind::Shift(ShiftKind::Linear), op.ty)),
+            _ => self.op(op),
+        }
+    }
+
     fn program(&mut self, instrs: &[Instr]) -> Option<Vec<Instr>> {
         instrs.iter().map(|instr| Some(Instr { op: self.op(instr.op)?, args: instr.args })).collect()
     }
@@ -231,7 +243,7 @@ impl Builder {
         let instrs = inlined
             .instrs
             .iter()
-            .map(|flat| Some(Flat { op: self.op(flat.op)?, args: flat.args, at: flat.at, child: flat.child }))
+            .map(|flat| Some(Flat { op: self.flat_op(flat.op)?, args: flat.args, at: flat.at, child: flat.child }))
             .collect::<Option<Vec<_>>>()?;
         Some(Inlined {
             ctxs,

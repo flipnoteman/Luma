@@ -107,8 +107,58 @@ pub(crate) struct KernelCore {
     pub(crate) label: Arc<str>,
     pub(crate) pipeline: wgpu::ComputePipeline,
     pub(crate) args_layout: wgpu::BindGroupLayout,
+    /// The bindings the entry point uses, by binding number.
     bindings: Vec<BindingInfo>,
+    /// The arguments a launch passes: one per `@group(1)` variable the module declares. For a
+    /// kernel of the user's it is `bindings.len()`.
+    declared: usize,
+    /// Which of the `declared` arguments the entry point reads, `None` when all of them. A
+    /// variable no code reads has no binding in the pipeline layout (wgpu derives the layout from
+    /// what the shader uses), so a launch must not bind it. Only luma's own kernels can leave one
+    /// unread; the reflection of the built pipeline, not the decision that generated the source,
+    /// says which.
+    used: Option<Box<[bool]>>,
     pub(crate) workgroup: [u32; 3],
+}
+
+impl KernelCore {
+    /// The arguments of a launch that the kernel binds, with their binding numbers.
+    pub(crate) fn bound<'a, T>(&'a self, args: &'a [T]) -> impl Iterator<Item = (u32, &'a T)> + 'a {
+        args.iter()
+            .enumerate()
+            .filter(|&(position, _)| self.used.as_ref().is_none_or(|used| used[position]))
+            .map(|(position, arg)| (position as u32, arg))
+    }
+
+    /// Checks that a launch passes as many arguments as the module declares. A mismatch is an
+    /// error of that launch; left to the device it would be a validation failure that
+    /// invalidates the work of every thread sharing the batch.
+    pub(crate) fn check_count(&self, passed: usize) -> Result<()> {
+        if passed != self.declared {
+            return Err(LumaError::KernelArgCount { expected: self.declared, actual: passed });
+        }
+        Ok(())
+    }
+
+    /// Checks that each argument the kernel binds is of the kind of its binding, for the same
+    /// reason as [`check_count`](Self::check_count).
+    pub(crate) fn check_kinds(&self, args: &[RawArg<'_>]) -> Result<()> {
+        for ((position, arg), info) in self.bound(args).zip(&self.bindings) {
+            // Whether a storage buffer is passed for reading or writing does not matter to the
+            // layout; a uniform where a storage buffer is expected (or the reverse) does.
+            let (passed, fits) = match arg {
+                RawArg::Uniform(_) => ("uniform", info.kind == BindingKind::Uniform),
+                RawArg::Storage { .. } => ("storage buffer", info.kind != BindingKind::Uniform),
+            };
+            if !fits {
+                return Err(LumaError::KernelBinding(format!(
+                    "kernel `{}` argument {position} (`{}`) is a {}, but the launch passes a {passed}",
+                    self.label, info.name, info.kind
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(0);
@@ -244,8 +294,14 @@ pub(crate) fn build_core(
     // functions it calls), so one module can hold several entry points with different bindings.
     let used = info.get_entry_point(entry_index);
     let mut user: Vec<(u32, BindingInfo)> = Vec::new();
+    // The @group(1) variables the module declares, used or not (only luma's own modules have
+    // just one entry point, whose arguments they are).
+    let mut declared: Vec<u32> = Vec::new();
     for (handle, var) in module.global_variables.iter() {
         let Some(rb) = var.binding else { continue };
+        if trusted && rb.group == 1 {
+            declared.push(rb.binding);
+        }
         if used[handle].is_empty() {
             continue;
         }
@@ -284,16 +340,36 @@ pub(crate) fn build_core(
         user.push((rb.binding, BindingInfo { name, kind, element_stride, min_size }));
     }
     user.sort_by_key(|(binding, _)| *binding);
-    for (expected, (binding, info)) in user.iter().enumerate() {
-        if *binding != expected as u32 {
-            return Err(LumaError::KernelBinding(format!(
-                "the @group(1) bindings used by entry point `{}` must be numbered 0..n in \
-                 argument order, but `{}` is @binding({binding}) where @binding({expected}) \
-                 was expected",
-                key.entry, info.name
-            )));
+    let (declared, used_mask) = if trusted {
+        // Luma's launches pass one argument per variable the source declares, numbered 0..n; the
+        // pipeline binds those the entry point reads.
+        declared.sort_unstable();
+        for (expected, binding) in declared.iter().enumerate() {
+            if *binding != expected as u32 {
+                return Err(LumaError::KernelBinding(format!(
+                    "the @group(1) variables of `{}` must be numbered 0..n, but @binding({binding}) \
+                     is where @binding({expected}) was expected",
+                    key.entry
+                )));
+            }
         }
-    }
+        let mask: Box<[bool]> = (0..declared.len() as u32).map(|binding| user.iter().any(|(used, _)| *used == binding)).collect();
+        let all = mask.iter().all(|&bound| bound);
+        (declared.len(), (!all).then_some(mask))
+    } else {
+        for (expected, (binding, info)) in user.iter().enumerate() {
+            if *binding != expected as u32 {
+                return Err(LumaError::KernelBinding(format!(
+                    "the @group(1) bindings used by entry point `{}` must be numbered 0..n in \
+                     argument order, but `{}` is @binding({binding}) where @binding({expected}) \
+                     was expected",
+                    key.entry, info.name
+                )));
+            }
+        }
+        (user.len(), None)
+    };
+    let numbers: Vec<u32> = user.iter().map(|(binding, _)| *binding).collect();
     let bindings: Vec<BindingInfo> = user.into_iter().map(|(_, info)| info).collect();
 
     if entry.workgroup_size_overrides.is_some() {
@@ -343,9 +419,9 @@ pub(crate) fn build_core(
     let device = ctx.device();
     let arg_entries: Vec<_> = bindings
         .iter()
-        .enumerate()
-        .map(|(i, info)| wgpu::BindGroupLayoutEntry {
-            binding: i as u32,
+        .zip(&numbers)
+        .map(|(info, &binding)| wgpu::BindGroupLayoutEntry {
+            binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: match info.kind {
@@ -410,6 +486,8 @@ pub(crate) fn build_core(
         pipeline,
         args_layout,
         bindings,
+        declared,
+        used: used_mask,
         workgroup,
     })
 }

@@ -832,14 +832,14 @@ fn iterate_all_over_a_chunked_state_does_not_return_its_placeholder() {
     });
 }
 
-/// Finding 19 (found by `fuzz::threads`; OPEN): a kernel that fuses a slice with `trunc` binds
-/// the view's parameter uniform, but its shader does not read it, so `create_bind_group` fails
-/// with "Number of bindings (3) does not match ... (2)". Like finding 7f7fa18 (a `bool` to `Df32`
-/// cast) it is fatal for every program that shares the context: the error invalidates the batch
-/// command buffer, the other threads' kernels in it never run and their arrays hold whatever the
-/// pooled buffers held (the CI failures of 0.4.0 were that bug with the cast).
+/// Finding 19 (found by `fuzz::threads`): a kernel that fuses a slice with `trunc` got a slot of
+/// the parameter uniform for a view its lowering never applies (the slice of a one-element array
+/// is the identity), so the shader declared the uniform without reading it and the launch bound
+/// it anyway: `create_bind_group` failed with "Number of bindings (3) does not match ... (2)".
+/// Like finding 7f7fa18 (a `bool` to `Df32` cast) it was fatal for every program that shares the
+/// context: the error invalidated the batch command buffer, and the other threads' kernels in it
+/// never ran. The launch now binds what the built pipeline reads (see `KernelCore`).
 #[test]
-#[ignore = "open: fused slice + trunc binds an unread uniform"]
 fn slice_of_a_difference_then_trunc_then_assign_binds_an_unread_uniform() {
     check(Program {
         config: Config::default_engine(),

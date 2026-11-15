@@ -77,10 +77,10 @@ struct CachedGroup {
 }
 
 impl CachedGroup {
-    fn matches<'a>(&self, kernel: u64, entries: impl ExactSizeIterator<Item = (&'a Buffer, u64)>) -> bool {
+    fn matches<'a>(&self, kernel: u64, mut entries: impl Iterator<Item = (&'a Buffer, u64)>) -> bool {
         self.kernel == kernel
-            && self.entries.len() == entries.len()
-            && self.entries.iter().zip(entries).all(|((a, a_bytes), (b, b_bytes))| a == b && *a_bytes == b_bytes)
+            && self.entries.iter().all(|(a, a_bytes)| entries.next().is_some_and(|(b, b_bytes)| a == b && *a_bytes == b_bytes))
+            && entries.next().is_none()
     }
 }
 
@@ -370,6 +370,7 @@ impl Context {
         args: &[RawArg<'_>],
     ) -> Result<()> {
         check_aliasing(args)?;
+        kernel.check_count(args.len())?;
         if self.capture(kernel, workgroups, size, args) {
             return Ok(());
         }
@@ -419,11 +420,15 @@ impl Context {
         let Batch { encoder, prefix, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler, .. } =
             batch;
 
+        // Before anything is allocated or recorded: a launch that does not fit the kernel is an
+        // error of its caller, not of the batch.
+        kernel.check_count(args.len())?;
+
         // Uniform values go into fresh arena slots, all of this launch's in one chunk. The grid
         // uniform shares the slot of an earlier launch of the same size.
-        let uniform_bytes: u64 = args
-            .iter()
-            .map(|arg| match arg {
+        let uniform_bytes: u64 = kernel
+            .bound(args)
+            .map(|(_, arg)| match arg {
                 RawArg::Uniform(data) => slot_size(align, data.len()),
                 RawArg::Storage { .. } => 0,
             })
@@ -451,7 +456,7 @@ impl Context {
             }
         };
         offsets.clear();
-        for arg in args {
+        for (_, arg) in kernel.bound(args) {
             if let RawArg::Uniform(data) = arg {
                 offsets.push(dynamic_offset(arena.push(align, data))?);
             }
@@ -475,7 +480,7 @@ impl Context {
             })
         });
 
-        let bindings = || args.iter().map(|arg| arg.binding(uniforms));
+        let bindings = || kernel.bound(args).map(|(_, arg)| arg.binding(uniforms));
         let mut hasher = FxHasher::default();
         kernel.id.hash(&mut hasher);
         for (buffer, bytes) in bindings() {
@@ -487,15 +492,19 @@ impl Context {
         let index = match bucket.iter().position(|cached| cached.matches(kernel.id, bindings())) {
             Some(index) => index,
             None => {
-                let group_entries: Vec<BindGroupEntry<'_>> = bindings()
-                    .enumerate()
-                    .map(|(binding, (buffer, bytes))| BindGroupEntry {
-                        binding: binding as u32,
-                        resource: BindingResource::Buffer(BufferBinding {
-                            buffer,
-                            offset: 0,
-                            size: std::num::NonZeroU64::new(bytes),
-                        }),
+                kernel.check_kinds(args)?;
+                let group_entries: Vec<BindGroupEntry<'_>> = kernel
+                    .bound(args)
+                    .map(|(binding, arg)| {
+                        let (buffer, bytes) = arg.binding(uniforms);
+                        BindGroupEntry {
+                            binding,
+                            resource: BindingResource::Buffer(BufferBinding {
+                                buffer,
+                                offset: 0,
+                                size: std::num::NonZeroU64::new(bytes),
+                            }),
+                        }
                     })
                     .collect();
                 let group = device.create_bind_group(&wgpu::BindGroupDescriptor {

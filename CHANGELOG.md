@@ -40,6 +40,16 @@ All notable changes to Luma are listed here. The format follows
 
 ### Fixed
 
+- A kernel that declares a binding its entry point never reads can no longer fail the launch with
+  `create_bind_group: Number of bindings ... does not match ...` and, because threads share one
+  batch command encoder, turn the work of every other thread in that batch into garbage (the
+  third time: a fused `slice` and `trunc` allocated uniform slots for a view the lowering never
+  applies, found by `fuzz::threads`). wgpu derives the pipeline layout from what the shader
+  reads; a launch of one of luma's own kernels now binds exactly the arguments the built
+  pipeline uses (reflected once, when it is built), skipping the declared-but-unread ones, and
+  checks the argument count and kinds before it records anything, so a mismatch is an error of
+  that array only. The lowering no longer allocates uniform slots for the views its instructions
+  name but do not apply.
 - A kernel that converts a `bool` array to `Df32` and runs no other arithmetic of a `Df32` failed
   with `create_bind_group: Number of bindings in bind group descriptor (3) does not match ... (2)`
   (found by the fuzzer, mostly on `LUMA_DEVICE=cpu`): the program counted the cast as a reader of
