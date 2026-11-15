@@ -270,3 +270,15 @@ fn the_math_functions_fuse_with_the_arithmetic_around_them() {
         assert!(relative(*g, want) < BITS_43, "{a}: {} vs {want}", g.to_f64());
     }
 }
+
+#[test]
+fn a_reduction_of_df32_math_compiles_the_math_functions() {
+    for (form, options) in forms() {
+        let ctx = context(options);
+        let xs = inputs(11, -3.0, 3.0);
+        let x = Array::from_slice_on(&ctx, &xs, xs.len()).unwrap();
+        let got = x.exp().max().item().unwrap();
+        let want = xs.iter().map(|v| v.to_f64().exp()).fold(f64::MIN, f64::max);
+        assert!(relative(got, want) < 1e-13, "{form}: max of exp is {}, want {want}", got.to_f64());
+    }
+}

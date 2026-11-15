@@ -567,10 +567,13 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     };
     // The lowered instruction holding the value of main-program instruction `at`.
     let value = |at: usize| inlined.and_then(|inlined| inlined.main.get(at)).map_or(at, |&lowered| lowered as usize);
-    // A reduction of `Df32` brings the library itself (see `reduce_main`).
+    // A reduction of `Df32` brings the library itself (see `reduce_main`), but not its math
+    // functions: those come with the program that calls them.
     let reduces_df = reduce && out_ty(outputs[0]) == "vec2<f32>";
     if !reduces_df {
         src.push_str(&library_for(key, tuning));
+    } else if key.instrs.iter().chain(key.subs.iter().flatten()).any(calls_df_math) {
+        src.push_str(DF_MATH_LIBRARY);
     }
     src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
     src.push_str(&view_helpers(&views));
