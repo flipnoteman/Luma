@@ -82,6 +82,9 @@ pub enum Stmt {
     Binary { lhs: Opd, rhs: Opd, op: BinOp },
     Compare { lhs: usize, rhs: Opd, op: CmpOp },
     Select { mask: usize, a: Opd, b: Opd, ty: Ty },
+    /// `mask op other` (`other op mask` unless `mask_left`) for `op` one of `Add`, `Sub` and `Mul`:
+    /// the NumPy-style promotion of a `bool` array to the type `ty` of `other`.
+    Promote { mask: usize, other: Opd, ty: Ty, op: BinOp, mask_left: bool },
     View { src: usize, view: ViewOp },
     Reduce { src: usize, op: RedOp },
     SumWhere { src: usize, mask: usize },
@@ -214,7 +217,7 @@ pub fn values(seed: u64, ty: Ty, n: usize, math: bool) -> Vec<f32> {
                     2 => 0.0,
                     _ => ((r >> 8) % 41) as f32 - 20.0,
                 },
-                Ty::Mask => (r & 1) as f32,
+                Ty::Bool => (r & 1) as f32,
                 _ if math => 0.5 + (r % 1500) as f32 / 1000.0,
                 _ => ((r % 65) as f32 - 32.0) / 8.0,
             }
@@ -362,7 +365,7 @@ fn limit(ty: Ty) -> i32 {
     match ty {
         Ty::F32 => 22,
         Ty::Df32 => 44,
-        Ty::U32 | Ty::I32 | Ty::Mask => i32::MAX,
+        Ty::U32 | Ty::I32 | Ty::Bool => i32::MAX,
     }
 }
 
@@ -385,7 +388,7 @@ fn const_info(ty: Ty, c: f32) -> Info {
     match ty {
         Ty::U32 => point(f64::from(c as u32)),
         Ty::I32 => point(f64::from(c as i32)),
-        Ty::Mask => point(f64::from(u8::from(c != 0.0))),
+        Ty::Bool => point(f64::from(u8::from(c != 0.0))),
         _ => Info::of_const(c),
     }
 }
@@ -403,7 +406,7 @@ fn int_info(ty: Ty, info: Info) -> Info {
 
 /// Whether bitwise operations exist for `ty`.
 fn bitwise_ty(ty: Ty) -> bool {
-    is_int(ty) || ty == Ty::Mask
+    is_int(ty) || ty == Ty::Bool
 }
 
 /// Whether the binary operation `op` exists for elements of type `ty`.
@@ -413,7 +416,7 @@ fn bin_valid(ty: Ty, op: BinOp) -> bool {
         Ty::Df32 => matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Minimum | BinOp::Maximum),
         Ty::U32 => !matches!(op, BinOp::Atan2 | BinOp::Hypot | BinOp::Copysign),
         Ty::I32 => !matches!(op, BinOp::Atan2 | BinOp::Hypot | BinOp::Copysign | BinOp::Rotl),
-        Ty::Mask => matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Minimum | BinOp::Maximum),
+        Ty::Bool => matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Minimum | BinOp::Maximum),
     }
 }
 
@@ -424,7 +427,7 @@ fn un_valid(ty: Ty, op: UnOp) -> bool {
         Ty::Df32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Exp | UnOp::Ln | UnOp::Tanh | UnOp::Powf(_) | UnOp::ToF32),
         Ty::U32 => matches!(op, UnOp::Not | UnOp::ToF32 | UnOp::ToI32),
         Ty::I32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Not | UnOp::ToF32 | UnOp::ToU32),
-        Ty::Mask => matches!(op, UnOp::Not | UnOp::ToU32 | UnOp::ToF32),
+        Ty::Bool => matches!(op, UnOp::Not | UnOp::ToU32 | UnOp::ToF32),
     }
 }
 
@@ -433,7 +436,7 @@ fn rounding(ty: Ty) -> f64 {
     match ty {
         Ty::F32 => 2f64.powi(-22),
         Ty::Df32 => 2f64.powi(-40),
-        Ty::U32 | Ty::I32 | Ty::Mask => 0.0,
+        Ty::U32 | Ty::I32 | Ty::Bool => 0.0,
     }
 }
 
@@ -451,7 +454,7 @@ fn finish(ty: Ty, math: bool, mut info: Info) -> Option<Info> {
     if is_int(ty) {
         return Some(int_info(ty, info));
     }
-    if ty == Ty::Mask {
+    if ty == Ty::Bool {
         return Some(Info::mask());
     }
     if !(info.lo.is_finite() && info.hi.is_finite() && info.err.is_finite()) {
@@ -519,7 +522,7 @@ fn bin_err(ty: Ty, op: BinOp, a: Info, b: Info, r: &Info) -> Option<f64> {
 
 /// The bounds of `a op b` for `ty` (before `finish`); `b_const` is the right operand if it is one.
 fn bin_info(ty: Ty, math: bool, op: BinOp, a: Info, b: Info, b_const: Option<f32>) -> Option<Info> {
-    if ty == Ty::Mask {
+    if ty == Ty::Bool {
         return Some(Info::mask());
     }
     if is_int(ty) {
@@ -619,7 +622,7 @@ fn un_err(ty: Ty, op: UnOp, a: Info, r: &Info) -> Option<f64> {
 
 /// The bounds of `op(a)` for `ty`.
 fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
-    if ty == Ty::Mask {
+    if ty == Ty::Bool {
         return match op {
             UnOp::Not => Some(Info::mask()),
             // The cast of a mask has a mask's values.
@@ -686,7 +689,7 @@ fn input_info(ty: Ty, math: bool, vals: &[f32]) -> Option<Info> {
     let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
     let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     match ty {
-        Ty::U32 | Ty::I32 | Ty::Mask => finish(ty, math, Info { lsb: 0, lo: f64::from(lo), hi: f64::from(hi), exact: true, err: 0.0 }),
+        Ty::U32 | Ty::I32 | Ty::Bool => finish(ty, math, Info { lsb: 0, lo: f64::from(lo), hi: f64::from(hi), exact: true, err: 0.0 }),
         _ => finish(ty, math, Info { lsb: if math { -23 } else { -3 }, lo: f64::from(lo), hi: f64::from(hi), exact: !math, err: 0.0 }),
     }
 }
@@ -864,11 +867,11 @@ impl Scope {
                 if len_of(dims) > 4096 {
                     return None;
                 }
-                e.new.push(Scope::fresh(Ty::Mask, dims, Info::mask()));
+                e.new.push(Scope::fresh(Ty::Bool, dims, Info::mask()));
             }
             Stmt::Select { mask, a, b, ty } => {
                 let m = self.var(*mask)?;
-                if m.ty != Ty::Mask {
+                if m.ty != Ty::Bool {
                     return None;
                 }
                 let (ad, ai, _) = self.opd(a, *ty)?;
@@ -880,6 +883,20 @@ impl Scope {
                 }
                 let info = finish(*ty, math, Info::join(ai, bi))?;
                 e.new.push(Scope::fresh(*ty, m.dims, info));
+            }
+            Stmt::Promote { mask, other, ty, op, mask_left } => {
+                let m = self.var(*mask)?;
+                if m.ty != Ty::Bool || *ty == Ty::Bool || !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                    return None;
+                }
+                let (od, oi, _) = self.opd(other, *ty)?;
+                let dims = bcast(Some(m.dims), od)?;
+                if len_of(dims) > 4096 {
+                    return None;
+                }
+                let (li, ri) = if *mask_left { (Info::mask(), oi) } else { (oi, Info::mask()) };
+                let info = bin_info(*ty, math, *op, li, ri, None)?;
+                e.new.push(Scope::fresh(*ty, dims, info));
             }
             Stmt::View { src, view } => {
                 let v = self.var(*src)?;
@@ -969,7 +986,7 @@ impl Scope {
             Stmt::Reduce { src, op } => {
                 let v = self.var(*src)?;
                 // A sum of masks is not defined (`count` is).
-                if v.ty == Ty::Mask && *op == RedOp::Sum {
+                if v.ty == Ty::Bool && *op == RedOp::Sum {
                     return None;
                 }
                 let info = self.info(v);
@@ -979,7 +996,7 @@ impl Scope {
             Stmt::SumWhere { src, mask } => {
                 let v = self.var(*src)?;
                 let m = self.var(*mask)?;
-                if m.ty != Ty::Mask || v.ty == Ty::Mask || m.dims != v.dims {
+                if m.ty != Ty::Bool || v.ty == Ty::Bool || m.dims != v.dims {
                     return None;
                 }
                 let info = Info::join(self.info(v), Info::of_const(0.0)).summed(len_of(v.dims));
@@ -987,14 +1004,14 @@ impl Scope {
             }
             Stmt::Count { src } => {
                 let v = self.var(*src)?;
-                if v.ty != Ty::Mask {
+                if v.ty != Ty::Bool {
                     return None;
                 }
                 e.new.push(Scope::fresh(Ty::U32, [1, 1, 1, 1], Info { lsb: 0, lo: 0.0, hi: len_of(v.dims) as f64, exact: true, err: 0.0 }));
             }
             Stmt::Scan { src, axis, op } => {
                 let v = self.var(*src)?;
-                if *axis >= 4 || v.ty == Ty::Mask {
+                if *axis >= 4 || v.ty == Ty::Bool {
                     return None;
                 }
                 let info = self.info(v);
@@ -1003,7 +1020,7 @@ impl Scope {
             }
             Stmt::AxisReduce { src, axis, op } => {
                 let v = self.var(*src)?;
-                if *axis >= 4 || (v.ty == Ty::Mask && *op == RedOp::Sum) {
+                if *axis >= 4 || (v.ty == Ty::Bool && *op == RedOp::Sum) {
                     return None;
                 }
                 let info = self.info(v);
@@ -1106,7 +1123,7 @@ impl Scope {
                 if !matches!(v.ty, Ty::F32 | Ty::Df32) || !self.info(v).exact {
                     return None;
                 }
-                e.new.push(Scope::fresh(Ty::Mask, v.dims, Info::mask()));
+                e.new.push(Scope::fresh(Ty::Bool, v.dims, Info::mask()));
             }
             Stmt::EvalVars { vars } => {
                 for v in vars {
@@ -1210,7 +1227,7 @@ impl Builder {
             0..=1 => Ty::Df32,
             2..=5 => Ty::U32,
             6..=8 => Ty::I32,
-            9..=11 => Ty::Mask,
+            9..=11 => Ty::Bool,
             _ => Ty::F32,
         }
     }
@@ -1219,7 +1236,7 @@ impl Builder {
         match ty {
             Ty::U32 => self.tape.pick(&INT_CONSTS),
             Ty::I32 => self.tape.pick(&I32_CONSTS),
-            Ty::Mask => self.tape.pick(&[0.0, 1.0]),
+            Ty::Bool => self.tape.pick(&[0.0, 1.0]),
             _ if self.math => self.tape.pick(&MATH_CONSTS),
             _ => self.tape.pick(&EXACT_CONSTS),
         }
@@ -1300,10 +1317,11 @@ impl Builder {
             86..=87 => self.g_put(),
             88..=90 => self.g_compound(),
             91 if ctx != Ctx::Traced => self.g_write(),
-            92 => match self.tape.below(5) {
+            92 => match self.tape.below(6) {
                 0 => self.g_cache(),
                 1 => self.g_reshape(),
                 2 | 3 => self.g_count(),
+                4 => self.g_promote(),
                 _ => self.g_classify(),
             },
             93..=94 if host => self.g_eval(),
@@ -1349,7 +1367,7 @@ impl Builder {
             self.tape.pick(&[UnOp::Not, UnOp::ToF32, UnOp::ToI32])
         } else if ty == Ty::I32 {
             self.tape.pick(&[UnOp::Neg, UnOp::Abs, UnOp::Sign, UnOp::Not, UnOp::ToF32, UnOp::ToU32])
-        } else if ty == Ty::Mask {
+        } else if ty == Ty::Bool {
             self.tape.pick(&[UnOp::Not, UnOp::ToU32, UnOp::ToF32])
         } else if ty == Ty::Df32 {
             match self.tape.below(if self.math { 9 } else { 5 }) {
@@ -1432,7 +1450,7 @@ impl Builder {
                 BinOp::Shl,
                 BinOp::Shr,
             ],
-            (Ty::Mask, _) => &[BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Minimum, BinOp::Maximum],
+            (Ty::Bool, _) => &[BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Minimum, BinOp::Maximum],
             (Ty::Df32, false) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Minimum, BinOp::Maximum],
             (Ty::Df32, true) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Minimum, BinOp::Maximum],
             (Ty::F32, false) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Minimum, BinOp::Maximum, BinOp::Div],
@@ -1449,7 +1467,7 @@ impl Builder {
             ],
         };
         let op = self.tape.pick(ops);
-        let lhs_const = ((matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && ty != Ty::Mask) || op.bitwise()) && self.tape.chance(1, 8);
+        let lhs_const = ((matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && ty != Ty::Bool) || op.bitwise()) && self.tape.chance(1, 8);
         let lhs = if lhs_const {
             Opd::Const(self.constant(ty))
         } else {
@@ -1487,12 +1505,25 @@ impl Builder {
     }
 
     fn g_select(&mut self) -> Option<Stmt> {
-        let mask = self.pick_ty(Ty::Mask)?;
+        let mask = self.pick_ty(Ty::Bool)?;
         let dims = self.scope.var(mask)?.dims;
         let ty = self.any_ty();
         let a = self.operand(ty, |d| fits(d, dims), (1, 4));
         let b = self.operand(ty, |d| fits(d, dims), (1, 3));
         Some(Stmt::Select { mask, a, b, ty })
+    }
+
+    fn g_promote(&mut self) -> Option<Stmt> {
+        let mask = self.pick_ty(Ty::Bool)?;
+        let dims = self.scope.var(mask)?.dims;
+        let ty = match self.any_ty() {
+            Ty::Bool => Ty::F32,
+            ty => ty,
+        };
+        let other = self.operand(ty, |d| Self::combines(Some(dims), d), (1, 3));
+        let op = self.tape.pick(&[BinOp::Add, BinOp::Sub, BinOp::Mul]);
+        let mask_left = self.tape.chance(1, 2);
+        Some(Stmt::Promote { mask, other, ty, op, mask_left })
     }
 
     fn g_view(&mut self) -> Option<Stmt> {
@@ -1552,7 +1583,7 @@ impl Builder {
 
     fn g_reduce(&mut self) -> Option<Stmt> {
         let src = self.pick(|_| true)?;
-        let op = if self.scope.var(src)?.ty == Ty::Mask {
+        let op = if self.scope.var(src)?.ty == Ty::Bool {
             self.tape.pick(&[RedOp::Min, RedOp::Max])
         } else {
             self.tape.pick(&[RedOp::Sum, RedOp::Sum, RedOp::Min, RedOp::Max])
@@ -1561,18 +1592,18 @@ impl Builder {
     }
 
     fn g_sum_where(&mut self) -> Option<Stmt> {
-        let mask = self.pick_ty(Ty::Mask)?;
+        let mask = self.pick_ty(Ty::Bool)?;
         let dims = self.scope.var(mask)?.dims;
-        let src = self.pick(|v| v.dims == dims && v.ty != Ty::Mask)?;
+        let src = self.pick(|v| v.dims == dims && v.ty != Ty::Bool)?;
         Some(Stmt::SumWhere { src, mask })
     }
 
     fn g_count(&mut self) -> Option<Stmt> {
-        Some(Stmt::Count { src: self.pick_ty(Ty::Mask)? })
+        Some(Stmt::Count { src: self.pick_ty(Ty::Bool)? })
     }
 
     fn g_scan(&mut self) -> Option<Stmt> {
-        let src = self.pick(|v| v.ty != Ty::Mask)?;
+        let src = self.pick(|v| v.ty != Ty::Bool)?;
         let axis = self.tape.below(Self::ndim(self.scope.var(src)?.dims));
         let op = self.tape.pick(&[ScanOp::CumSum, ScanOp::CumSum, ScanOp::ScanMax, ScanOp::ScanMin]);
         Some(Stmt::Scan { src, axis, op })
@@ -1581,7 +1612,7 @@ impl Builder {
     fn g_axis_reduce(&mut self) -> Option<Stmt> {
         let src = self.pick(|_| true)?;
         let axis = self.tape.below(Self::ndim(self.scope.var(src)?.dims));
-        let op = if self.scope.var(src)?.ty == Ty::Mask { self.tape.pick(&[RedOp::Min, RedOp::Max]) } else { self.tape.pick(&[RedOp::Sum, RedOp::Min, RedOp::Max]) };
+        let op = if self.scope.var(src)?.ty == Ty::Bool { self.tape.pick(&[RedOp::Min, RedOp::Max]) } else { self.tape.pick(&[RedOp::Sum, RedOp::Min, RedOp::Max]) };
         Some(Stmt::AxisReduce { src, axis, op })
     }
 
@@ -1651,7 +1682,7 @@ impl Builder {
         let target = self.pick(|v| !v.read_only && v.cell >= local_from)?;
         let t = self.scope.var(target)?.clone();
         let op = match t.ty {
-            Ty::Mask => self.tape.pick(&[BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor]),
+            Ty::Bool => self.tape.pick(&[BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor]),
             Ty::I32 => self.tape.pick(&[
                 BinOp::Add,
                 BinOp::Sub,
@@ -1790,7 +1821,7 @@ impl Builder {
                 })
             }
             4 => {
-                let mask = self.pick_ty(Ty::Mask)?;
+                let mask = self.pick_ty(Ty::Bool)?;
                 let dims = self.scope.var(mask)?.dims;
                 let ty = self.any_ty();
                 let b = self.pick(|v| v.ty == ty && !fits(v.dims, dims))?;
@@ -1978,6 +2009,7 @@ impl Stmt {
             Stmt::Binary { lhs, rhs, op } => Stmt::Binary { lhs: lhs.remap(f)?, rhs: rhs.remap(f)?, op: *op },
             Stmt::Compare { lhs, rhs, op } => Stmt::Compare { lhs: f(*lhs)?, rhs: rhs.remap(f)?, op: *op },
             Stmt::Select { mask, a, b, ty } => Stmt::Select { mask: f(*mask)?, a: a.remap(f)?, b: b.remap(f)?, ty: *ty },
+            Stmt::Promote { mask, other, ty, op, mask_left } => Stmt::Promote { mask: f(*mask)?, other: other.remap(f)?, ty: *ty, op: *op, mask_left: *mask_left },
             Stmt::View { src, view } => {
                 let view = match view {
                     ViewOp::Take { idx } => ViewOp::Take { idx: f(*idx)? },

@@ -32,9 +32,9 @@ use proptest::test_runner::{TestError, TestRunner};
 use proptest::test_runner::{FileFailurePersistence, RngSeed};
 
 use crate::builtin::BinOp as LBin;
-use crate::ops::{Operand, Rhs};
+use crate::ops::{Operand, Promote, Rhs};
 use crate::{
-    concat, eval_all, stack, stack_slice, iterate_all, iterate_until_all, select, Array, Context, ContextOptions, CostModel, Df32, LumaError, Mask, ScalarType, Shape,
+    concat, eval_all, stack, stack_slice, iterate_all, iterate_until_all, select, Array, Context, ContextOptions, CostModel, Df32, LumaError, Numeric, ScalarType, Shape,
     Until,
 };
 use generator::{CostChoice, Config, InjView, LoopKind, Opd, Program, Stmt, ViewOp};
@@ -105,19 +105,19 @@ impl Num for i32 {
     }
 }
 
-impl Num for Mask {
-    const TY: Ty = Ty::Mask;
-    fn from_f32(v: f32) -> Mask {
-        Mask::from(v != 0.0)
+impl Num for bool {
+    const TY: Ty = Ty::Bool;
+    fn from_f32(v: f32) -> bool {
+        v != 0.0
     }
     fn to_f64(self) -> f64 {
-        f64::from(u8::from(bool::from(self)))
+        f64::from(u8::from(self))
     }
-    fn get(a: &Arr) -> Option<&Array<Mask>> {
-        if let Arr::M(x) = a { Some(x) } else { None }
+    fn get(a: &Arr) -> Option<&Array<bool>> {
+        if let Arr::B(x) = a { Some(x) } else { None }
     }
-    fn wrap(a: Array<Mask>) -> Arr {
-        Arr::M(a)
+    fn wrap(a: Array<bool>) -> Arr {
+        Arr::B(a)
     }
 }
 
@@ -143,7 +143,7 @@ enum Arr {
     F(Array<f32>),
     U(Array<u32>),
     I(Array<i32>),
-    M(Array<Mask>),
+    B(Array<bool>),
     D(Array<Df32>),
 }
 
@@ -154,7 +154,7 @@ macro_rules! with_arr {
             Arr::F($a) => $body,
             Arr::U($a) => $body,
             Arr::I($a) => $body,
-            Arr::M($a) => $body,
+            Arr::B($a) => $body,
             Arr::D($a) => $body,
         }
     };
@@ -176,14 +176,40 @@ macro_rules! by_ty {
                 type $t = i32;
                 $body
             }
-            Ty::Mask => {
-                type $t = Mask;
+            Ty::Bool => {
+                type $t = bool;
                 $body
             }
             Ty::Df32 => {
                 type $t = Df32;
                 $body
             }
+        }
+    };
+}
+
+/// [`by_ty`] for the numeric types: `bool` has no sums, scans or `sum_where` (the generator never
+/// asks for them).
+macro_rules! by_numeric_ty {
+    ($ty:expr, $t:ident => $body:expr) => {
+        match $ty {
+            Ty::F32 => {
+                type $t = f32;
+                $body
+            }
+            Ty::U32 => {
+                type $t = u32;
+                $body
+            }
+            Ty::I32 => {
+                type $t = i32;
+                $body
+            }
+            Ty::Df32 => {
+                type $t = Df32;
+                $body
+            }
+            Ty::Bool => unreachable!("not generated for bool"),
         }
     };
 }
@@ -196,7 +222,7 @@ impl Arr {
                 Arr::F(_) => Ty::F32,
                 Arr::U(_) => Ty::U32,
                 Arr::I(_) => Ty::I32,
-                Arr::M(_) => Ty::Mask,
+                Arr::B(_) => Ty::Bool,
                 Arr::D(_) => Ty::Df32,
             }
         })
@@ -350,9 +376,9 @@ fn unary(a: &Arr, op: UnOp) -> Arr {
         (Arr::I(x), UnOp::Not) => Arr::I(!x),
         (Arr::I(x), UnOp::ToF32) => Arr::F(x.to_f32()),
         (Arr::I(x), UnOp::ToU32) => Arr::U(x.to_u32()),
-        (Arr::M(x), UnOp::Not) => Arr::M(!x),
-        (Arr::M(x), UnOp::ToU32) => Arr::U(x.to_u32()),
-        (Arr::M(x), UnOp::ToF32) => Arr::F(x.to_f32()),
+        (Arr::B(x), UnOp::Not) => Arr::B(!x),
+        (Arr::B(x), UnOp::ToU32) => Arr::U(x.to_u32()),
+        (Arr::B(x), UnOp::ToF32) => Arr::F(x.to_f32()),
         (Arr::F(x), UnOp::ToU32) => Arr::U(x.to_u32()),
         (Arr::F(x), UnOp::ToI32) => Arr::I(x.to_i32()),
         (Arr::D(x), UnOp::Neg) => Arr::D(-x),
@@ -376,7 +402,24 @@ fn binary<T: Num>(env: &Env, lhs: &Opd, rhs: &Opd, op: BinOp) -> Array<T> {
     }
 }
 
-fn compare<T: Num>(env: &Env, lhs: usize, rhs: &Opd, op: CmpOp) -> Array<Mask> {
+/// `mask op other` through the promotion operators, or `other op mask` unless `mask_left`.
+fn promote<T: Num>(env: &Env, mask: usize, other: &Opd, op: BinOp, mask_left: bool) -> Array<T> {
+    let m = get::<bool>(env, mask);
+    let location = std::panic::Location::caller();
+    let rhs = match other {
+        Opd::Var(i) => Rhs::Array(get::<T>(env, *i)),
+        Opd::Const(c) => Rhs::Scalar(T::from_f32(*c)),
+    };
+    let op = match op {
+        BinOp::Add => Promote::Add,
+        BinOp::Sub => Promote::Sub,
+        BinOp::Mul => Promote::Mul,
+        _ => panic!("{op:?} is not a promotion"),
+    };
+    m.promote(rhs, mask_left, op, location)
+}
+
+fn compare<T: Num>(env: &Env, lhs: usize, rhs: &Opd, op: CmpOp) -> Array<bool> {
     let (a, r) = (get::<T>(env, lhs), operand::<T>(env, rhs));
     match op {
         CmpOp::Lt => a.lt(r),
@@ -439,7 +482,7 @@ fn view<T: Num>(env: &Env, a: &Array<T>, view: &ViewOp) -> Array<T> {
     }
 }
 
-fn reduce<T: Num>(a: &Array<T>, op: RedOp) -> Array<T> {
+fn reduce<T: Num + Numeric>(a: &Array<T>, op: RedOp) -> Array<T> {
     match op {
         RedOp::Sum => a.sum(),
         RedOp::Min => a.min(),
@@ -447,7 +490,7 @@ fn reduce<T: Num>(a: &Array<T>, op: RedOp) -> Array<T> {
     }
 }
 
-fn scan<T: Num>(a: &Array<T>, axis: usize, op: ScanOp) -> Array<T> {
+fn scan<T: Num + Numeric>(a: &Array<T>, axis: usize, op: ScanOp) -> Array<T> {
     match op {
         ScanOp::CumSum => a.cumsum(axis),
         ScanOp::ScanMax => a.scan(axis, |x, y| x.maximum(y)),
@@ -455,7 +498,7 @@ fn scan<T: Num>(a: &Array<T>, axis: usize, op: ScanOp) -> Array<T> {
     }
 }
 
-fn axis_reduce<T: Num>(a: &Array<T>, axis: usize, op: RedOp) -> Array<T> {
+fn axis_reduce<T: Num + Numeric>(a: &Array<T>, axis: usize, op: RedOp) -> Array<T> {
     match op {
         RedOp::Sum => a.sum_axis(axis),
         RedOp::Min => a.min_axis(axis),
@@ -493,42 +536,55 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
         }),
         Stmt::Compare { lhs, rhs, op } => by_ty!(ty_of(env, *lhs), T => {
             let out = compare::<T>(env, *lhs, rhs, *op);
-            push(env, Arr::M(out))
+            push(env, Arr::B(out))
         }),
         Stmt::Select { mask, a, b, ty } => by_ty!(*ty, T => {
-            let out = select::<T>(get::<Mask>(env, *mask), operand::<T>(env, a), operand::<T>(env, b));
+            let out = select::<T>(get::<bool>(env, *mask), operand::<T>(env, a), operand::<T>(env, b));
+            push(env, T::wrap(out))
+        }),
+        Stmt::Promote { mask, other, ty, op, mask_left } => by_numeric_ty!(*ty, T => {
+            let out = promote::<T>(env, *mask, other, *op, *mask_left);
             push(env, T::wrap(out))
         }),
         Stmt::View { src, view: v } => by_ty!(ty_of(env, *src), T => {
             let out = view::<T>(env, get::<T>(env, *src), v);
             push(env, T::wrap(out))
         }),
-        Stmt::Reduce { src, op } if ty_of(env, *src) == Ty::Mask => {
-            let mask = get::<Mask>(env, *src);
+        Stmt::Reduce { src, op } if ty_of(env, *src) == Ty::Bool => {
+            let mask = get::<bool>(env, *src);
             let out = match op {
                 RedOp::Max => mask.any(),
                 RedOp::Min => mask.all(),
                 RedOp::Sum => unreachable!("sums of masks are not generated"),
             };
-            push(env, Arr::M(out))
+            push(env, Arr::B(out))
         }
-        Stmt::Reduce { src, op } => by_ty!(ty_of(env, *src), T => {
+        Stmt::Reduce { src, op } => by_numeric_ty!(ty_of(env, *src), T => {
             let out = reduce::<T>(get::<T>(env, *src), *op);
             push(env, T::wrap(out))
         }),
         Stmt::Count { src } => {
-            let out = get::<Mask>(env, *src).count();
+            let out = get::<bool>(env, *src).count();
             push(env, Arr::U(out))
         }
-        Stmt::SumWhere { src, mask } => by_ty!(ty_of(env, *src), T => {
-            let out = get::<T>(env, *src).sum_where(get::<Mask>(env, *mask));
+        Stmt::SumWhere { src, mask } => by_numeric_ty!(ty_of(env, *src), T => {
+            let out = get::<T>(env, *src).sum_where(get::<bool>(env, *mask));
             push(env, T::wrap(out))
         }),
-        Stmt::Scan { src, axis, op } => by_ty!(ty_of(env, *src), T => {
+        Stmt::Scan { src, axis, op } => by_numeric_ty!(ty_of(env, *src), T => {
             let out = scan::<T>(get::<T>(env, *src), *axis, *op);
             push(env, T::wrap(out))
         }),
-        Stmt::AxisReduce { src, axis, op } => by_ty!(ty_of(env, *src), T => {
+        Stmt::AxisReduce { src, axis, op } if ty_of(env, *src) == Ty::Bool => {
+            let flags = get::<bool>(env, *src);
+            let out = match op {
+                RedOp::Max => flags.max_axis(*axis),
+                RedOp::Min => flags.min_axis(*axis),
+                RedOp::Sum => unreachable!("sums of bools are not generated"),
+            };
+            push(env, Arr::B(out))
+        }
+        Stmt::AxisReduce { src, axis, op } => by_numeric_ty!(ty_of(env, *src), T => {
             let out = axis_reduce::<T>(get::<T>(env, *src), *axis, *op);
             push(env, T::wrap(out))
         }),
@@ -611,15 +667,15 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
                 (Arr::D(x), Class::Finite) => x.is_finite(),
                 (Arr::D(x), Class::Nan) => x.is_nan(),
                 (Arr::D(x), Class::Inf) => x.is_inf(),
-                (Arr::U(_) | Arr::I(_) | Arr::M(_), _) => unreachable!("classes of integers are not generated"),
+                (Arr::U(_) | Arr::I(_) | Arr::B(_), _) => unreachable!("classes of integers are not generated"),
             };
-            push(env, Arr::M(out))
+            push(env, Arr::B(out))
         }
         Stmt::EvalVars { vars } => {
             eval_group::<f32>(env, vars)?;
             eval_group::<u32>(env, vars)?;
             eval_group::<i32>(env, vars)?;
-            eval_group::<Mask>(env, vars)?;
+            eval_group::<bool>(env, vars)?;
             eval_group::<Df32>(env, vars)
         }
         Stmt::Release { var } => {
@@ -726,7 +782,7 @@ fn host_rhs<'a>(env: &'a HostEnv, o: &Opd, ty: Ty) -> HRhs<'a> {
         Opd::Const(c) => HRhs::Val(match ty {
             Ty::U32 => f64::from(*c as u32),
             Ty::I32 => f64::from(*c as i32),
-            Ty::Mask => f64::from(u8::from(*c != 0.0)),
+            Ty::Bool => f64::from(u8::from(*c != 0.0)),
             _ => f64::from(*c),
         }),
     }
@@ -782,6 +838,19 @@ fn host_stmt(env: &mut HostEnv, stmt: &Stmt, math: bool) -> Result<(), ErrKind> 
             Some(a.compare(*op, host_rhs(env, rhs, a.ty))?)
         }
         Stmt::Select { mask, a, b, ty } => Some(host_get(env, *mask).select(host_rhs(env, a, *ty), host_rhs(env, b, *ty), *ty)?),
+        Stmt::Promote { mask, other, ty, op, mask_left } => {
+            // The booleans as the 0 and 1 of `ty`.
+            let m = host_get(env, *mask);
+            let numbers = HostArray::new(m.dims, *ty, m.data());
+            Some(if *mask_left {
+                numbers.binary(*op, host_rhs(env, other, *ty), false)?
+            } else {
+                match other {
+                    Opd::Var(i) => host_get(env, *i).binary(*op, HRhs::Array(&numbers), false)?,
+                    Opd::Const(_) => numbers.binary(*op, host_rhs(env, other, *ty), true)?,
+                }
+            })
+        }
         Stmt::View { src, view } => Some(host_view(env, host_get(env, *src), view)?),
         Stmt::Reduce { src, op } => Some(host_get(env, *src).reduce(*op)),
         Stmt::SumWhere { src, mask } => Some(host_get(env, *src).sum_where(host_get(env, *mask))?),
@@ -1071,7 +1140,7 @@ impl Machine {
             let evaluated = eval_group::<f32>(&self.luma, &vars)
                 .and_then(|()| eval_group::<u32>(&self.luma, &vars))
                 .and_then(|()| eval_group::<i32>(&self.luma, &vars))
-                .and_then(|()| eval_group::<Mask>(&self.luma, &vars))
+                .and_then(|()| eval_group::<bool>(&self.luma, &vars))
                 .and_then(|()| eval_group::<Df32>(&self.luma, &vars));
             evaluated.map_err(|e| limit_or_fail(&e, &format!("{at}: eval (step {t})")))?;
         }
@@ -1095,8 +1164,8 @@ impl Machine {
                 (false, Ty::U32, 2) => luma_iterate_all::<u32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (false, Ty::I32, 1) => luma_iterate_all::<i32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (false, Ty::I32, 2) => luma_iterate_all::<i32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
-                (false, Ty::Mask, 1) => luma_iterate_all::<Mask, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
-                (false, Ty::Mask, 2) => luma_iterate_all::<Mask, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::Bool, 1) => luma_iterate_all::<bool, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::Bool, 2) => luma_iterate_all::<bool, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (false, Ty::Df32, 1) => luma_iterate_all::<Df32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (false, Ty::Df32, 2) => luma_iterate_all::<Df32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (true, Ty::F32, 1) => luma_iterate_until::<1>(cx, env, steps, states, body, next).map(|(r, s)| (r, Some(s))),

@@ -53,7 +53,7 @@ use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
-use crate::gpu_type::ScalarType;
+use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::jit::{self, Node};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::scan::{add_operator, Bound, Lines};
@@ -674,8 +674,8 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
         Payload::Index => PayloadKind::Index,
         Payload::Buffer(_) => PayloadKind::Buffer,
     };
-    let out_keys = spec.want_keys.then(|| Arc::new(Storage::new(ctx, n, 4)));
-    let out_pay = (first_kind != PayloadKind::None).then(|| Arc::new(Storage::new(ctx, n, 4)));
+    let out_keys = spec.want_keys.then(|| Arc::new(Storage::new(ctx, n, ElemLayout::plain(4))));
+    let out_pay = (first_kind != PayloadKind::None).then(|| Arc::new(Storage::new(ctx, n, ElemLayout::plain(4))));
     let out_keys_pin = out_keys.as_ref().map(|storage| storage.pin_single()).transpose()?;
     let out_pay_pin = out_pay.as_ref().map(|storage| storage.pin_single()).transpose()?;
 

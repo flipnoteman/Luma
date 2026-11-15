@@ -1,6 +1,6 @@
 //! The CPU oracle of the fuzzer: every operation computes eagerly on a `Vec<f64>` with plain
 //! loops, in the arithmetic of the array's type (`f32` operations are done in `f32`, `u32` and
-//! `i32` ones wrap, [`Ty::Mask`] values are 0 or 1, [`Ty::Df32`] values are exact `f64`s). It is the reference, so it is kept simple.
+//! `i32` ones wrap, [`Ty::Bool`] values are 0 or 1, [`Ty::Df32`] values are exact `f64`s). It is the reference, so it is kept simple.
 //!
 //! Sharing follows luma's documented rules (`tests/clone.rs`, `tests/assign.rs`):
 //!
@@ -28,8 +28,8 @@ pub enum Ty {
     F32,
     U32,
     I32,
-    /// A boolean: 0 or 1.
-    Mask,
+    /// A `bool`: 0 or 1.
+    Bool,
     Df32,
 }
 
@@ -272,7 +272,7 @@ pub fn store(ty: Ty, v: f64) -> f64 {
         Ty::F32 => f64::from(v as f32),
         Ty::U32 => f64::from(v as i64 as u32),
         Ty::I32 => f64::from(v as i32),
-        Ty::Mask => f64::from(u8::from(v != 0.0)),
+        Ty::Bool => f64::from(u8::from(v != 0.0)),
         Ty::Df32 => v,
     }
 }
@@ -355,7 +355,7 @@ pub fn apply_bin(ty: Ty, op: BinOp, a: f64, b: f64) -> f64 {
                 _ => unreachable!("{op:?} on i32"),
             })
         }
-        Ty::Mask => {
+        Ty::Bool => {
             let (a, b) = (a as u32, b as u32);
             f64::from(match op {
                 BinOp::BitAnd => a & b,
@@ -387,7 +387,7 @@ pub fn apply_un(ty: Ty, op: UnOp, a: f64) -> f64 {
         (Ty::F32, UnOp::ToI32) => f64::from((a as f32 as i32).min(2_147_483_520)),
         (Ty::I32, UnOp::ToU32) => f64::from(a as i32 as u32),
         (Ty::U32, UnOp::ToI32) => f64::from(a as u32 as i32),
-        (Ty::Mask, UnOp::ToU32) => a,
+        (Ty::Bool, UnOp::ToU32) => a,
         (Ty::F32, op) => {
             let x = a as f32;
             f64::from(match op {
@@ -420,7 +420,7 @@ pub fn apply_un(ty: Ty, op: UnOp, a: f64) -> f64 {
         (Ty::I32, UnOp::Neg) => f64::from((a as i32).wrapping_neg()),
         (Ty::I32, UnOp::Abs) => f64::from((a as i32).wrapping_abs()),
         (Ty::I32, UnOp::Sign) => f64::from((a as i32).signum()),
-        (Ty::Mask, UnOp::Not) => f64::from(a as u32 ^ 1),
+        (Ty::Bool, UnOp::Not) => f64::from(a as u32 ^ 1),
         (ty, op) => unreachable!("{op:?} on {ty:?}"),
     }
 }
@@ -527,7 +527,7 @@ impl HostArray {
     pub fn compare(&self, op: CmpOp, rhs: Rhs<'_>) -> Res<HostArray> {
         let (dims, a, b) = self.operands(rhs)?;
         let data = a.into_iter().zip(b).map(|(a, b)| apply_cmp(op, a, b)).collect();
-        Ok(HostArray::new(dims, Ty::Mask, data))
+        Ok(HostArray::new(dims, Ty::Bool, data))
     }
 
     /// `mask != 0 ? a : b` with the shape of the mask; a branch is a value or an array whose
@@ -729,7 +729,7 @@ impl HostArray {
             Class::Nan => v.is_nan(),
             Class::Inf => v.is_infinite(),
         }))).collect();
-        HostArray::new(self.dims, Ty::Mask, data)
+        HostArray::new(self.dims, Ty::Bool, data)
     }
 
     pub fn concat(axis: usize, parts: &[&HostArray]) -> Res<HostArray> {

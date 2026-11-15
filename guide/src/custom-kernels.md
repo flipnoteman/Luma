@@ -60,6 +60,41 @@ The rules:
 - **Element sizes** are checked: a binding `array<f32>` takes arrays of 4-byte elements,
   `array<vec2<f32>>` arrays of 8-byte ones (`[f32; 2]`, `Df32`, `f64`). Only the size is compared,
   not the type: an `Array<u32>` passes for `array<f32>`, so keep the types straight yourself.
+- **`Array<bool>`** binds as `array<u32>` of *bit-packed words*: an array of `n` booleans is
+  `ceil(n / 32)` words, and element `i` is bit `i % 32` of word `i / 32`, so
+  `(a[i >> 5u] >> (i & 31u)) & 1u` reads it (the launch size is the number of elements, not of
+  words, if you read bits). The bits past the end of the array, in the last word, must stay 0:
+  the library's `count`, `any`, `all` and `!` rely on it, so a kernel that writes a boolean
+  array writes whole words with those bits cleared (or sets and clears single bits with
+  `atomicOr` / `atomicAnd` on an `array<atomic<u32>>` binding, which is what Luma's own kernels
+  do when they write part of a word; neighbouring bits of a word belong to different
+  invocations). A strided view of a boolean array (`luma::view(&m)`) gives the *element* index
+  of a bit through `luma_view_idx`, to be split as above.
+
+  ```rust
+  use luma::*;
+
+  // dst[i] = 1 where element i of the boolean array is true, 0 where it is false.
+  const UNPACK: &str = r#"
+  @group(1) @binding(0) var<storage, read> mask: array<u32>;
+  @group(1) @binding(1) var<storage, read_write> dst: array<u32>;
+
+  @compute @workgroup_size(64)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      let i = gid.x;
+      if (i >= luma.size.x) { return; }
+      dst[i] = (mask[i >> 5u] >> (i & 31u)) & 1u;
+  }
+  "#;
+
+  let x = Array::from_slice(&[1.0f32, -2.0, 3.0, 0.5, -1.0], 5)?;
+  let mask = x.gt(0.0);
+  let mut dst = Array::<u32>::zeros(5)?;
+  let kernel = Kernel::new(UNPACK)?;
+  kernel.launch([5], args![&mask, &mut dst])?;
+  assert_eq!(dst.to_vec()?, vec![1, 0, 1, 1, 0]);
+  # Ok::<(), luma::LumaError>(())
+  ```
 
 ## Several entry points, 2-D launches
 

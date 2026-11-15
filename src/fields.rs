@@ -11,10 +11,10 @@ use std::sync::Arc;
 use crate::array::Array;
 use crate::builtin::BinOp;
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{Mask, ScalarType};
+use crate::gpu_type::ScalarType;
 use crate::jit::assign::{self, Region};
 use crate::jit;
-use crate::ops::{eval_all, select_at, Rhs};
+use crate::ops::{eval_all, select_at, Condition, Rhs};
 use crate::shape::{Offsets, Shape};
 use crate::view::{finish, PadMode, ViewMut};
 
@@ -213,13 +213,14 @@ pub trait Fields: Sized {
         self.map(|a| a.take_at(indices, location))
     }
 
-    /// Per field, `a` where `mask` is true and `b` elsewhere (see [`select`](crate::select)).
+    /// Per field, `a` where `cond` is true and `b` elsewhere (see [`select`](crate::select); `cond`
+    /// is an `Array<bool>` or an `Array<u32>`).
     #[track_caller]
-    fn select(mask: &Array<Mask>, a: &Self, b: &Self) -> Self {
+    fn select(cond: &impl Condition, a: &Self, b: &Self) -> Self {
         let location = Location::caller();
         let theirs = b.arrays();
         let mut out = Vec::with_capacity(Self::COUNT);
-        a.each(&mut |x| out.push(select_at(mask, x, theirs[out.len()], location)));
+        a.each(&mut |x| out.push(select_at(cond, x, theirs[out.len()], location)));
         from_vec(out)
     }
 

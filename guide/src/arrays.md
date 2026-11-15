@@ -37,7 +37,7 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 | `f32` | the default float; every operation |
 | `u32` | indices, counters, [bit operations](integers.md) |
 | `i32` | signed integers, [casts](integers.md#signed-integers-and-casts) |
-| `Mask` | the result of comparisons: a boolean per element ([masks](integers.md#comparisons-masks-and-select)) |
+| `bool` | the result of comparisons: a boolean per element ([booleans](integers.md#comparisons-booleans-and-select)) |
 | `Df32` | double-float, about 48 bits of mantissa, runs on every device ([Precision](precision.md)) |
 | `f64` | 64-bit float, only on devices with `SHADER_F64` |
 
@@ -45,24 +45,34 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `Df32` and `f64`
 (the *scalar* types); what each type supports is listed in the chapters named in the table.
 
-### Masks
+### Booleans
 
-A `Mask` is a boolean. Comparisons and `is_nan` / `is_finite` / `is_inf` produce `Array<Mask>`;
-you can also upload one from `Mask::TRUE` / `Mask::FALSE` (or `Mask::from(bool)`). On the host a
-mask reads back as `Mask`, and `bool::from` converts it. `item()` of a one-element mask (the
-result of `any()` and `all()`) reads one value. Masks have no arithmetic and no generators
-(`range`, `uniform`): they combine with `& | ^ !`, count with `count()`, steer `select`, and convert
-with `to_u32()` / `to_f32()` ([Comparisons, masks and `select`](integers.md#comparisons-masks-and-select)).
+`bool` is an element type: comparisons and `is_nan` / `is_finite` / `is_inf` produce `Array<bool>`,
+and `from_slice`, `to_vec`, `item`, `full(true)` and `write` use plain `bool`s. On the GPU a
+`bool` takes one bit: an array of `n` booleans is `ceil(n / 32)` `u32` words on the GPU, which
+is what a [custom kernel](custom-kernels.md) sees (`array<u32>`, [how to read a bit](custom-kernels.md)),
+so a comparison written to memory is 32 times smaller than a `u32` array, and `count()`, `any()`
+and `all()` of an evaluated array read a word per 32 elements. Whole-array results
+(comparisons, `&`, `|`, `!`, `select` of booleans) are packed by the workgroup and cost no more
+than a `u32` store, and so does `assign` into a slice of a boolean array whose rows are runs of
+64 or more consecutive elements (the words inside a run are written as they are, and only the
+two words at the ends of a run, which it may share with elements the write leaves alone, change
+by atomic operations). Writes that cannot be built from runs (`put`, `stack`, a transposed slice,
+short rows) set and clear one bit at a time with atomic operations, which is slower than for the
+other types. Booleans have no generators (`range`, `uniform`): they combine with `& | ^ !`
+(also with a single `bool`), count with `count()`, steer `select`, promote to numbers in `+`, `-`
+and `*` as in NumPy (`mask * &x` is `x` where true, 0 elsewhere), and convert with `to_u32()` /
+`to_i32()` / `to_f32()` ([Comparisons, booleans and `select`](integers.md#comparisons-booleans-and-select)).
+`sum()` of a boolean array is the count, a `u32` array.
 
 ```rust
 use luma::*;
 
-let m = Array::from_slice(&[Mask::TRUE, Mask::FALSE, Mask::from(true)], 3)?;
-assert_eq!(m.to_vec()?, vec![Mask::TRUE, Mask::FALSE, Mask::TRUE]);
-assert!(bool::from(m.to_vec()?[0]));
+let m = Array::from_slice(&[true, false, true], 3)?;
+assert_eq!(m.to_vec()?, vec![true, false, true]);
 assert_eq!(m.count().item()?, 2);                       // a `u32`
-assert_eq!(bool::from(m.any().item()?), true);
-assert_eq!(bool::from(m.all().item()?), false);
+assert!(m.any().item()?);
+assert!(!m.all().item()?);
 assert_eq!(m.to_f32().to_vec()?, vec![1.0, 0.0, 1.0]);
 # Ok::<(), luma::LumaError>(())
 ```
@@ -77,11 +87,11 @@ operation.
 | `f32` | `to_u32`, `to_i32` | truncates toward zero, saturates, NaN becomes 0 ([values](integers.md#signed-integers-and-casts)) |
 | `u32` | `to_f32`, `to_i32` | `to_f32` rounds above 2^24; `to_i32` reinterprets the bits |
 | `i32` | `to_f32`, `to_u32` | `to_f32` rounds above 2^24; `to_u32` reinterprets the bits |
-| `Mask` | `to_u32`, `to_f32` | 1 where true, 0 where false |
+| `bool` | `to_u32`, `to_i32`, `to_f32`, `to_f64`, `to_df32` | 1 where true, 0 where false |
 | `f32` | `to_f64`, `to_df32` | exact (`to_f64` needs `SHADER_F64`) |
 | `f64`, `Df32` | `to_f32`, `to_df32` / `to_f64` | rounds to `f32`; `f64` to `Df32` is exact to 48 bits |
 
-There is no cast to `Mask`: write a comparison (`x.ne(0u32)`). A cast pair not in the table does
+There is no cast to `bool`: write a comparison (`x.ne(0u32)`). A cast pair not in the table does
 not exist, so a type mix-up is a compile error rather than a silent conversion.
 
 ```rust
@@ -110,7 +120,7 @@ lazy and fuse:
 | `Df32` | `sqrt`, `abs`, `sign`, `floor`, `ceil` ([Precision](precision.md)) |
 | `i32` | `abs`, `sign`, `shl`, `shr` ([Signed integers](integers.md#signed-integers-and-casts)) |
 | `u32` | bit operations, `shl`, `shr`, `rotate_left`, `rotate_right` ([Integers](integers.md)) |
-| every scalar type | `minimum(rhs)`, `maximum(rhs)`, `lt` `le` `gt` `ge` `eq` `ne` (masks), `select(&mask, a, b)` |
+| every scalar type | `minimum(rhs)`, `maximum(rhs)`, `lt` `le` `gt` `ge` `eq` `ne` (booleans), `select(&cond, a, b)` |
 
 `atan2(x)` is `atan2(self, x)` with `self` the `y`. The right-hand side of `minimum`, the comparisons and the
 `try_` methods is an `Operand`: an array or reference to one (equal shapes, or extents of 1 that

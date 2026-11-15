@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::array::{Failure, Storage};
+use crate::gpu_type::ElemLayout;
 use crate::gpu::pager::Pin;
 use crate::builtin::{Builtin, Finish, ReduceList, ReduceOp};
 use crate::context::{RawArg, Scratch};
@@ -48,7 +49,7 @@ pub(super) fn prepare_loop(
         || outs.iter().enumerate().any(|(j, out)| outs[..j].iter().any(|other| Arc::ptr_eq(other, out)))
         || probes.iter().any(|probe| probe.was_materialized())
         || probes.iter().chain(inits).any(|storage| storage.segments() != 1)
-        || inits.iter().any(|init| init.elem() != 4 || init.len() != len)
+        || inits.iter().any(|init| init.layout() != ElemLayout::plain(4) || init.len() != len)
     {
         return None;
     }
@@ -172,7 +173,7 @@ fn launch_loop(
 ) -> Result<Vec<Storage>, Failure> {
     let n = len_u32(len)?;
     let bytes = u64::from(n) * 4;
-    let outputs: Vec<Storage> = inits.iter().map(|_| Storage::new(ctx, len, 4)).collect();
+    let outputs: Vec<Storage> = inits.iter().map(|_| Storage::new(ctx, len, ElemLayout::plain(4))).collect();
     let out_pins = outputs.iter().map(|out| out.pin(0)).collect::<Result<Vec<_>, _>>()?;
     let init_pins = inits.iter().map(|init| init.pin(0)).collect::<Result<Vec<_>, _>>()?;
     let in_pins = fixed.iter().map(|input| input.pin(0).map(|pin| (pin, input.byte_len()))).collect::<Result<Vec<_>, _>>()?;
@@ -494,8 +495,8 @@ fn plan_shifts(
     let c = (ctx.segment_bytes() / layout) as usize;
     // Arrays of different element sizes do not share a segmentation: they only run unsplit.
     let outs = if matches!(key.tail, Tail::Reduce(_)) { Vec::new() } else { out_elems(key) };
-    let widest = inputs.iter().map(|input| input.elem() as u64).chain(outs.iter().copied()).max().map_or(layout, |w| w.max(layout));
-    let mixed = inputs.iter().any(|input| input.elem() as u64 != layout) || outs.iter().any(|&bytes| bytes != layout);
+    let widest = inputs.iter().map(|input| input.layout().stride() as u64).chain(outs.iter().copied()).max().map_or(layout, |w| w.max(layout));
+    let mixed = inputs.iter().any(|input| input.layout().stride() as u64 != layout) || outs.iter().any(|&bytes| bytes != layout);
     if mixed && (len as u64 * widest > ctx.segment_bytes() || inputs.iter().any(|input| input.segments() > 1)) {
         return Err(LumaError::Chunked("mixed element sizes on arrays split over several buffers"));
     }
@@ -516,10 +517,10 @@ fn plan_shifts(
     Ok(Some(Shifted { len, ids }))
 }
 
-/// Bytes per element of every output of `key`: one per stored value, or the one value a
-/// reduction folds.
+/// `ElemLayout::stride` of every output of `key`: one per stored value, or the one value a
+/// reduction folds (a `bool` is a word of partial results there, as it is for the segmentation).
 fn out_elems(key: &FusedKey) -> Vec<u64> {
-    let bytes = |at: u32| key.instrs.get(at as usize).map_or(4, |instr| instr.op.out_ty().bytes());
+    let bytes = |at: u32| key.instrs.get(at as usize).map_or(4, |instr| instr.op.out_ty().stride());
     match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Matmul { .. } | Tail::Radix(_) | Tail::Solve(_) => key.outputs.iter().map(|&at| bytes(at)).collect(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| bytes(at)).collect(),
@@ -533,7 +534,7 @@ fn out_elems(key: &FusedKey) -> Vec<u64> {
 fn layout_elem(key: &FusedKey, inputs: &[Arc<Storage>], len: usize) -> u64 {
     let outs = out_elems(key);
     match key.tail {
-        Tail::Reduce(_) => inputs.iter().find(|input| input.len() == len).map_or_else(|| outs.first().copied().unwrap_or(4), |input| input.elem() as u64),
+        Tail::Reduce(_) => inputs.iter().find(|input| input.len() == len).map_or_else(|| outs.first().copied().unwrap_or(4), |input| input.layout().stride() as u64),
         _ => outs.first().copied().unwrap_or(4),
     }
 }
@@ -720,7 +721,7 @@ pub(super) fn pin_inputs(
     j: usize,
     n: u32,
 ) -> Result<Vec<(Pin, u64)>, LumaError> {
-    let bytes = |input: &Storage| u64::from(n) * input.elem() as u64;
+    let bytes = |input: &Storage| input.layout().bytes(n as usize);
     let mut pins = Vec::with_capacity(inputs.len());
     let mut stored = inputs.iter();
     for k in 0..key.input_tys.len() {
@@ -734,7 +735,7 @@ pub(super) fn pin_inputs(
             // An input of the length of the output is bound by segment; a single buffer of
             // another length (the source of a view) is bound whole.
             pins.push(if input.segments() > 1 {
-                (input.pin(j)?, input.range(j).len() as u64 * input.elem() as u64)
+                (input.pin(j)?, input.segment_byte_len(j))
             } else {
                 (input.pin(0)?, input.byte_len())
             });
@@ -745,7 +746,7 @@ pub(super) fn pin_inputs(
         }
         for &id in ids.get(k).map_or(&[][..], Vec::as_slice) {
             let id = id as usize;
-            pins.push((input.pin(id)?, input.range(id).len() as u64 * input.elem() as u64));
+            pins.push((input.pin(id)?, input.segment_byte_len(id)));
         }
     }
     Ok(pins)
@@ -760,10 +761,11 @@ pub(super) fn params<'a>(
     n: Option<u32>,
     base: usize,
     len: usize,
+    runs: Option<&Runs>,
     scalars: &'a [u32],
 ) -> Result<Cow<'a, [u32]>, LumaError> {
     let based = ids.is_none() && super::codegen::generates(key);
-    if ids.is_none() && n.is_none() && !based {
+    if ids.is_none() && n.is_none() && !based && runs.is_none() {
         // A kernel that bakes the scalars in has no binding for the uniform (see `reads_scalars`).
         return Ok(Cow::Borrowed(if super::codegen::reads_scalars(key) { scalars } else { &[] }));
     }
@@ -775,6 +777,9 @@ pub(super) fn params<'a>(
         words.extend(ids.iter().flatten());
     } else if based {
         words.push(len_u32(base)?);
+    }
+    if let Some(runs) = runs {
+        words.extend([runs.len, runs.words]);
     }
     words.extend_from_slice(scalars);
     Ok(Cow::Owned(words))
@@ -818,10 +823,10 @@ pub(super) fn store_args<'a>(
     let ids = segment_ids(shifted, j)?;
     let outs = outputs
         .iter()
-        .map(|out| out.pin(j).map(|pin| (pin, range.len() as u64 * out.elem() as u64)))
+        .map(|out| out.pin(j).map(|pin| (pin, out.segment_byte_len(j))))
         .collect::<Result<Vec<_>, _>>()?;
     let ins = pin_inputs(key, inputs, ids, j, n)?;
-    let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), scalars)?;
+    let words = params(key, ids, None, range.start, shifted.map_or(0, |shifted| shifted.len), None, scalars)?;
     Ok(StoreArgs { n, outs, ins, words })
 }
 
@@ -908,8 +913,9 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
         Some(storage) => vec![storage],
         None => {
             let mut outputs = Vec::with_capacity(count);
-            for bytes in out_elems(&key) {
-                outputs.push(Storage::new(ctx, len, bytes as usize));
+            for &at in &key.outputs {
+                let ty = key.instrs.get(at as usize).map_or(ElemTy::F32, |instr| instr.op.out_ty());
+                outputs.push(Storage::new(ctx, len, ty.layout()));
             }
             outputs
         }
@@ -992,10 +998,16 @@ pub(super) fn run_mapped(
         return Err(LumaError::Chunked("assigning into an array split over several buffers").into());
     }
     let n = len_u32(n)?;
+    // A region write of bits that are made of long runs of consecutive elements builds whole words.
+    let runs = match key.tail {
+        Tail::StoreMapped(map) if key.outputs.iter().any(|&at| key.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::Bool)) => Runs::plan(&map),
+        _ => None,
+    };
+    key.runs = runs.is_some();
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     let outs = bases.iter().map(|base| base.pin(0)).collect::<Result<Vec<_>, _>>()?;
     let ins = pin_inputs(&key, &inputs, None, 0, n)?;
-    let words = params(&key, None, None, 0, n as usize, &scalars)?;
+    let words = params(&key, None, None, 0, n as usize, runs.as_ref(), &scalars)?;
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + ins.len() + 1);
     raw.extend(outs.iter().zip(bases).map(|(pin, base)| RawArg::write(pin.buffer(), base.byte_len())));
     raw.extend(ins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
@@ -1010,10 +1022,74 @@ pub(super) fn run_mapped(
             let cap = if float { 256 } else { 1024 };
             ctx.launch(&core, fold_workgroups(ctx, (n / (4 * len.max(1))).clamp(1, cap))?, [n, 1, 1], &raw)?
         }
-        _ => launch_1d(ctx, &core, n, &raw)?,
+        _ => launch_1d(ctx, &core, runs.as_ref().map_or(n, |runs| runs.invocations), &raw)?,
     }
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// The runs of consecutive base elements a region write is made of (see `codegen::runs_main`).
+pub(super) struct Runs {
+    /// Elements of a run.
+    len: u32,
+    /// Words of the base a run spans, at most: the invocations of a run are the 32 bits of that many words.
+    words: u32,
+    /// The invocations of the launch: 32 for every word of every run.
+    invocations: u32,
+}
+
+impl Runs {
+    /// Runs shorter than this are written bit by bit: most of their words would be shared.
+    const MIN_LEN: u64 = 64;
+    /// Most runs whose alignment is looked at to size their words; with more the worst case is taken.
+    const EXACT_RUNS: u64 = 4096;
+
+    /// The runs of the region `map` writes, if they are long enough: along the output's first
+    /// axis the region is the base's first axis at step 1, and so is the next axis whenever the
+    /// first is whole, which makes a run of both (and so on).
+    fn plan(map: &ViewMap) -> Option<Runs> {
+        let axis = map.axes[0];
+        if axis.from != 0 || axis.step != 1 {
+            return None;
+        }
+        let mut len = u64::from(map.out[0]);
+        for d in 0..3 {
+            let whole = map.out[d] == map.src[d] && map.axes[d].start == 0;
+            let next = map.axes[d + 1].from as usize == d + 1 && map.axes[d + 1].step == 1;
+            if !(whole && next) {
+                break;
+            }
+            len *= u64::from(map.out[d + 1]);
+        }
+        if len < Self::MIN_LEN {
+            return None;
+        }
+        let count = map.out_len() as u64 / len;
+        let words = if count <= Self::EXACT_RUNS {
+            (0..count).map(|run| (Self::start(map, run * len) % 32 + len).div_ceil(32)).max()?
+        } else {
+            (31 + len).div_ceil(32)
+        };
+        let invocations = u32::try_from(count * words * 32).ok()?;
+        Some(Runs { len: u32::try_from(len).ok()?, words: u32::try_from(words).ok()?, invocations })
+    }
+
+    /// The element of the base that element `o` of the region goes to.
+    fn start(map: &ViewMap, o: u64) -> u64 {
+        let (mut out_stride, mut src_stride) = ([1u64; 4], [1u64; 4]);
+        for d in 1..4 {
+            out_stride[d] = out_stride[d - 1] * u64::from(map.out[d - 1]);
+            src_stride[d] = src_stride[d - 1] * u64::from(map.src[d - 1]);
+        }
+        (0..4)
+            .map(|a| {
+                let axis = map.axes[a];
+                let from = axis.from as usize;
+                let coord = (o / out_stride[from] % u64::from(map.out[from])) as i64 * i64::from(axis.step) + i64::from(axis.start);
+                coord.max(0) as u64 * src_stride[a]
+            })
+            .sum()
+    }
 }
 
 /// Runs the first pass of the reductions `ops` directly over the expression behind `node`,
@@ -1062,7 +1138,7 @@ pub(super) fn reduce_fused(
     let Fused { mut key, inputs, mut scalars, .. } = fused;
     // The segments are those an array of this length has: the inputs may be of other lengths.
     let layout = layout_elem(&key, &inputs, len);
-    let first = Storage::new(ctx, len, layout as usize);
+    let first = Storage::new(ctx, len, ElemLayout::plain(layout as usize));
     let segments = first.segments();
     // One segment and one group: this pass leaves the final values, so the epilogue goes in it.
     let last = !finish.epilogue.is_empty() && segments == 1 && ctx.tuning().reduce_groups(len_u32(first.range(0).len())?) == 1;
@@ -1083,7 +1159,7 @@ pub(super) fn reduce_fused(
             _ => scratch.take(out_bytes)?,
         };
         let ids = segment_ids(shifted.as_ref(), j)?;
-        let mut params = params(&key, ids, Some(n), range.start, len, &scalars)?;
+        let mut params = params(&key, ids, Some(n), range.start, len, None, &scalars)?;
         if last {
             params.to_mut().extend(finish.uniform_words());
         }
@@ -1111,7 +1187,7 @@ pub(crate) fn check_finite(ctx: &crate::context::Context, storage: &Storage, ty:
     let max = ReduceList::new(&[ReduceOp::Max]);
     let mut scratch = Scratch::new(ctx);
     for j in 0..storage.segments() {
-        let bytes = storage.range(j).len() as u64 * storage.elem() as u64;
+        let bytes = storage.segment_byte_len(j);
         let words = len_u32((bytes / 4) as usize)?;
         let pin = storage.pin(j)?;
         let flags = scratch.take(u64::from(words) * 4)?;

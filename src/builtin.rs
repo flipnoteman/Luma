@@ -162,7 +162,7 @@ impl UnOp {
                 UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => Some(self.expr()),
                 _ => None,
             },
-            ElemTy::Mask => match self {
+            ElemTy::Bool => match self {
                 UnOp::Id => Some("x"),
                 UnOp::BitNot => Some("(x ^ 1u)"),
                 _ => None,
@@ -252,7 +252,7 @@ impl BinOp {
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
             ElemTy::U32 => Some(self.expr()),
-            ElemTy::Mask => match self {
+            ElemTy::Bool => match self {
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Min | BinOp::Max => Some(self.expr()),
                 _ => None,
             },
@@ -291,7 +291,7 @@ pub(crate) enum CmpOp {
 }
 
 impl CmpOp {
-    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1 (a mask).
+    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1 (a `bool`).
     pub(crate) fn expr(self) -> &'static str {
         match self {
             CmpOp::Lt => "select(0u, 1u, x < y)",
@@ -342,7 +342,7 @@ impl Class {
         }
     }
 
-    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1 (a mask): the bits of `x`
+    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1 (a `bool`): the bits of `x`
     /// below the sign are compared with those of infinity. They come through `luma_bits` of the
     /// double-float library, which ORs them with the guard uniform (always 0): a compiler that
     /// assumes no `NaN` or infinity arises in the arithmetic of the kernel (a device's fast
@@ -526,6 +526,15 @@ impl ReduceList {
 pub(crate) enum Builtin {
     /// `out[i] = s`; arguments: out, uniform scalar.
     Fill,
+    /// Fills the words of a bit-packed `bool` array (see `ElemLayout::PACKED`): every word is
+    /// all ones if `s` is 1, else 0, but for the unused bits of the last word, which stay 0;
+    /// arguments: out, uniform `{s, len}` (`len` elements, `luma.size.x` the words).
+    FillBits,
+    /// The first pass of a reduction of a bit-packed `bool` array over its words (see
+    /// [`reduce_bits`]); arguments: out, the words, uniform `{n, len}` (`n` words holding `len`
+    /// elements). Element type `"u32"`; the one op of the list is the count of true elements
+    /// (`Sum`), whether any (`Max`) or all (`Min`) are.
+    ReduceBits(ReduceList),
     /// One reduction pass for each op of the list (segmented: over the partial results of an
     /// earlier pass); see [`reduce`]. Arguments: out, a, uniform `{n}`.
     Reduce(ReduceList, bool),
@@ -592,6 +601,30 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String
 fn load_at(i: u32) -> {ty} {{ return a[i]; }}
 {}",
         reduce_main(elem, ops, segmented, "load_at", tuning)
+    )
+}
+
+/// The first pass of a reduction of a bit-packed `bool` array over its words, so a pass reads
+/// 32 times fewer bytes than one over the elements: every word is replaced by what it says (for
+/// `Sum`, the number of its true elements, `countOneBits`; for `Max` whether any is; for `Min`
+/// whether all are, `p.len` being the elements, so that the last word is compared with the
+/// bits it holds), and the values are reduced as ordinary `u32`s.
+fn reduce_bits(ops: ReduceList, tuning: &Tuning) -> String {
+    let op = ops.as_slice().first().copied().unwrap_or(ReduceOp::Sum);
+    let value = match op {
+        ReduceOp::Sum | ReduceOp::SumSquares => "countOneBits(w)",
+        ReduceOp::Max => "select(0u, 1u, w != 0u)",
+        ReduceOp::Min => "select(0u, 1u, w == select(0xFFFFFFFFu, (1u << (p.len & 31u)) - 1u, i == p.n - 1u && (p.len & 31u) != 0u))",
+    };
+    format!(
+        "struct Params {{ n: u32, len: u32 }}
+@group(1) @binding(0) var<storage, read_write> out: array<u32>;
+@group(1) @binding(1) var<storage, read> a: array<u32>;
+@group(1) @binding(2) var<uniform> p: Params;
+
+fn load_at(i: u32) -> u32 {{ let w = a[i]; return {value}; }}
+{}",
+        reduce_main(ReduceElem::Plain("u32"), ops, false, "load_at", tuning)
     )
 }
 
@@ -1100,6 +1133,23 @@ pub(crate) fn conv_tile(stride: u32, per_thread: u32, wg: u32) -> u32 {
     wg * (per_thread / stride)
 }
 
+/// [`Builtin::FillBits`].
+fn fill_bits_kernel(wg: u32) -> String {
+    format!(
+        "struct Params {{ s: u32, len: u32 }}
+@group(1) @binding(0) var<storage, read_write> out: array<u32>;
+@group(1) @binding(1) var<uniform> p: Params;
+@compute @workgroup_size({wg})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let i = gid.x + gid.y * nwg.x * {wg}u;
+    if (i >= luma.size.x) {{ return; }}
+    let tail = select(0xFFFFFFFFu, (1u << (p.len & 31u)) - 1u, i == luma.size.x - 1u && (p.len & 31u) != 0u);
+    out[i] = select(0u, tail, p.s != 0u);
+}}
+"
+    )
+}
+
 fn fill_kernel(ty: &str, wg: u32) -> String {
     format!(
         "struct Params {{ s: {ty} }}
@@ -1451,6 +1501,8 @@ impl Builtin {
         let wg = tuning.elementwise_workgroup;
         match self {
             Builtin::Fill => fill_kernel(ty, wg).into(),
+            Builtin::FillBits => fill_bits_kernel(wg).into(),
+            Builtin::ReduceBits(ops) => reduce_bits(ops, tuning).into(),
             Builtin::Reduce(ops, segmented) => reduce(ty, ops, segmented, tuning).into(),
             Builtin::Conv1d => include_str!("conv1d.wgsl").into(),
             Builtin::Conv1dTiled(stride, per_thread) => conv1d_tiled(stride, per_thread, tuning.conv_workgroup).into(),

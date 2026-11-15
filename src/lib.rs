@@ -119,7 +119,7 @@ pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceKind};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
-pub use gpu_type::{Df32, GpuType, Mask, ScalarType};
+pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
 pub use kernel::{uniform, view, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
 pub use until::{iterate_until_all, Cond, History, Run, Series, Stat, StopReason, Until};
@@ -130,7 +130,7 @@ pub use linalg::{
 pub use matmul::matmul;
 pub use jit::cost::CostModel;
 pub use jit::fusion_limit;
-pub use ops::{eval_all, select, Operand};
+pub use ops::{eval_all, select, Condition, Operand};
 pub use reduce::Reduction;
 pub use scalar::Scalar;
 pub use scatter::{bincount, AtomicElem};

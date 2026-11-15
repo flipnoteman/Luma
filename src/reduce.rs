@@ -8,9 +8,9 @@ use crate::array::{Array, Failure, Storage};
 use crate::builtin::{Builtin, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_EPILOGUE, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{GpuType, Mask, ScalarType};
+use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
 use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
-use crate::ops::{fold_workgroups, len_u32, run_select, Rhs};
+use crate::ops::{fold_workgroups, len_u32, run_select, Condition, Rhs};
 use crate::shape::Shape;
 
 /// A reduction of a pending expression that has not been recorded yet: the operand is kept as an
@@ -27,8 +27,10 @@ pub(crate) struct Reduced {
     operand: Arc<Node>,
     ops: ReduceList,
     wgsl: &'static str,
-    /// Bytes of one element.
+    /// Bytes of one element of the partial results (a `bool` reduces as a `u32` word).
     elem: u64,
+    /// How the results are stored: the layout of the element type.
+    layout: ElemLayout,
     /// Whether the operand only reads a buffer (the reduction of an array that is already
     /// evaluated), which no speculation of readbacks concerns.
     buffer: bool,
@@ -102,11 +104,11 @@ impl Reduced {
 
     fn record(&self, ctx: &Context) -> Result<Arc<Storage>> {
         let count = self.ops.as_slice().len();
-        let storage = Arc::new(Storage::new(ctx, count, self.elem as usize));
+        let storage = Arc::new(Storage::new(ctx, count, self.layout));
         let pin = storage.pin(0)?;
         let array = Array::<u32>::from_node(ctx, Shape::from(self.operand.len()), Arc::clone(&self.operand));
         let mut scratch = Scratch::new(ctx);
-        reduce_into(&array, self.elem, self.wgsl, self.ops, &mut scratch, Some(pin.buffer()), self.finish)?;
+        reduce_into(&array, self.ty == ElemTy::Bool, self.elem, self.wgsl, self.ops, &mut scratch, Some(pin.buffer()), self.finish)?;
         Ok(storage)
     }
 
@@ -117,7 +119,7 @@ impl Reduced {
     }
 }
 
-impl<T: ScalarType> Array<T> {
+impl<T: Numeric> Array<T> {
     /// The sum of all elements, as a lazy one-element array: [`Array::item`] reads the value on
     /// the host, and using the array in an expression with `self` (`&x / &x.sum()`) keeps it on
     /// the GPU. Float sums combine in trees and over at most a few hundred sequential steps per
@@ -148,17 +150,82 @@ impl<T: ScalarType> Array<T> {
         self.reduce_at(ops, "reduce", Location::caller())
     }
 
-    /// The sum of the elements where `mask` is true: `select(mask, self, 0).sum()` in one
-    /// pass. Lazy like [`Array::sum`].
+    /// The sum of the elements where `cond` is true (an `Array<bool>`, or an `Array<u32>` of
+    /// non-zero elements): `select(cond, self, 0).sum()` in one pass. Lazy like [`Array::sum`].
     #[track_caller]
-    pub fn sum_where(&self, mask: &Array<Mask>) -> Array<T> {
+    pub fn sum_where(&self, cond: &impl Condition) -> Array<T> {
         let location = Location::caller();
-        let selected = run_select(mask, Rhs::Array(self), Rhs::Scalar(T::zeroed()), location);
-        let selected = Array::resolve(mask.context(), mask.shape(), selected, "sum_where", location);
+        let cond = cond.condition();
+        let selected = run_select(cond, Rhs::Array(self), Rhs::Scalar(T::zeroed()), location);
+        let selected = Array::resolve(self.context(), cond.shape(), selected, "sum_where", location);
         selected.reduce_at([Reduction::Sum], "sum_where", location)
     }
+}
 
-    fn reduce_at<const N: usize>(&self, ops: [Reduction; N], name: &'static str, location: &'static Location<'static>) -> Array<T> {
+impl Array<bool> {
+    /// The number of true elements, as a lazy one-element `u32` array (NumPy's `sum` of a
+    /// boolean array is an integer too; see [`Array::sum`]). An array that has been evaluated
+    /// is counted a word of 32 elements at a time.
+    #[track_caller]
+    pub fn sum(&self) -> Array<u32> {
+        self.count_at("sum", Location::caller())
+    }
+
+    /// The number of true elements: the same as [`Array<bool>::sum`](Array::sum).
+    #[track_caller]
+    pub fn count(&self) -> Array<u32> {
+        self.count_at("count", Location::caller())
+    }
+
+    fn count_at(&self, name: &'static str, location: &'static Location<'static>) -> Array<u32> {
+        if self.pending().is_some() {
+            return self.cast_at::<u32>(location).reduce_at([Reduction::Sum], name, location);
+        }
+        let result = self.run_words(ReduceOp::Sum);
+        Array::resolve(self.context(), Shape::from(1usize), result, name, location)
+    }
+
+    /// The one-element reduction `op` of the words of this evaluated array, as an array of `R`
+    /// (`u32` for the count, `bool` otherwise): recorded at once.
+    fn run_words<R: GpuType>(&self, op: ReduceOp) -> std::result::Result<Array<R>, Failure> {
+        let ctx = self.context();
+        self.src()?;
+        let storage = Arc::new(Storage::new(ctx, 1, R::LAYOUT));
+        let pin = storage.pin(0)?;
+        let mut scratch = Scratch::new(ctx);
+        reduce_into(self, true, R::LAYOUT.stride() as u64, "u32", ReduceList::new(&[op]), &mut scratch, Some(pin.buffer()), Finish::default())?;
+        Ok(Array::from_storage(ctx, Shape::from(1usize), storage))
+    }
+
+    /// The smallest element (whether all are true), as a lazy one-element `bool` array.
+    #[track_caller]
+    pub fn min(&self) -> Array<bool> {
+        self.reduce_at([Reduction::Min], "min", Location::caller())
+    }
+
+    /// The largest element (whether any is true), as a lazy one-element `bool` array.
+    #[track_caller]
+    pub fn max(&self) -> Array<bool> {
+        self.reduce_at([Reduction::Max], "max", Location::caller())
+    }
+
+    /// Whether any element is true, as a lazy one-element `bool` array. Read it with
+    /// [`Array::item`].
+    #[track_caller]
+    pub fn any(&self) -> Array<bool> {
+        self.reduce_at([Reduction::Max], "any", Location::caller())
+    }
+
+    /// Whether every element is true, as a lazy one-element `bool` array. Read it with
+    /// [`Array::item`].
+    #[track_caller]
+    pub fn all(&self) -> Array<bool> {
+        self.reduce_at([Reduction::Min], "all", Location::caller())
+    }
+}
+
+impl<T: ScalarType> Array<T> {
+    pub(crate) fn reduce_at<const N: usize>(&self, ops: [Reduction; N], name: &'static str, location: &'static Location<'static>) -> Array<T> {
         const { assert!(N >= 1 && N <= MAX_REDUCTIONS, "Array::reduce takes one to four reductions") };
         let result = self.run_reduce(ReduceList::new(&ops.map(Reduction::op)), name, location);
         Array::resolve(self.context(), Shape::from(N), result, name, location)
@@ -167,10 +234,7 @@ impl<T: ScalarType> Array<T> {
     fn run_reduce(&self, ops: ReduceList, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
         let shape = Shape::from(ops.as_slice().len());
-        if ElemTy::try_of::<T>() == Some(ElemTy::Mask) && ops.as_slice().iter().any(|op| matches!(op, ReduceOp::Sum | ReduceOp::SumSquares)) {
-            return Err(crate::scan::mask_sum_error(name));
-        }
-        let elem = std::mem::size_of::<T>() as u64;
+        let elem = T::LAYOUT.stride() as u64;
         let wgsl = T::reduce_type();
         // Poisoned operands pass their error on.
         let src = self.src()?;
@@ -188,14 +252,14 @@ impl<T: ScalarType> Array<T> {
             // write. The reader is a copy of the operand that the reduction's first pass fuses.
             let args = [operand, Src::unused(), Src::unused()];
             let reader = jit::create(ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
-            let reduced = Reduced { operand: reader, ops, wgsl, elem, buffer, finish: Finish::default(), result: OnceLock::new(), ty: ElemTy::of::<T>()?, name, location, leaves: Default::default() };
+            let reduced = Reduced { operand: reader, ops, wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), result: OnceLock::new(), ty: ElemTy::of::<T>()?, name, location, leaves: Default::default() };
             return Ok(Array::from_reduced(ctx, shape, Arc::new(reduced)));
         }
         // Nothing is left to fuse: record the passes now.
-        let storage = Arc::new(Storage::new(ctx, shape.len(), elem as usize));
+        let storage = Arc::new(Storage::new(ctx, shape.len(), T::LAYOUT));
         let pin = storage.pin(0)?;
         let mut scratch = Scratch::new(ctx);
-        reduce_into(self, elem, wgsl, ops, &mut scratch, Some(pin.buffer()), Finish::default())?;
+        reduce_into(self, T::LAYOUT.is_packed(), elem, wgsl, ops, &mut scratch, Some(pin.buffer()), Finish::default())?;
         Ok(Array::from_storage(ctx, shape, storage))
     }
 
@@ -221,6 +285,7 @@ impl<T: ScalarType> Array<T> {
             ops: reduced.ops,
             wgsl: reduced.wgsl,
             elem: reduced.elem,
+            layout: reduced.layout,
             buffer: reduced.buffer,
             finish,
             result: OnceLock::new(),
@@ -317,19 +382,22 @@ fn reduce_n<T: GpuType, const N: usize>(array: &Array<T>, wgsl: &'static str, op
 /// of [`crate::jit`] if `speculate`. Synchronizes.
 fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, finish: Finish, speculate: bool) -> Result<Vec<T>> {
     let ctx = array.context();
-    let elem = std::mem::size_of::<T>() as u64;
+    let elem = T::LAYOUT.stride() as u64;
+    let bits = T::LAYOUT.is_packed();
     let count = ops.as_slice().len() as u64;
+    // The results of a bit-packed type are the words of a one-element array (see `Reduced`).
+    debug_assert!(!bits || count == 1);
     if let Some(node) = array.pending()
         && speculate
         && finish.epilogue.is_empty()
         && matches!(wgsl, "f32" | "u32")
-        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, elem, wgsl, ops, scratch, None, finish))
+        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, bits, elem, wgsl, ops, scratch, None, finish))
     {
-        return Ok(bytemuck::cast_slice(&words?).to_vec());
+        return Ok(T::from_repr(bytemuck::cast_slice(&words?).to_vec(), count as usize));
     }
     let mut scratch = Scratch::new(ctx);
-    let current = reduce_into(array, elem, wgsl, ops, &mut scratch, None, finish)?;
-    let values = ctx.read::<T>(&current, elem * count)?;
+    let current = reduce_into(array, bits, elem, wgsl, ops, &mut scratch, None, finish)?;
+    let values = T::from_repr(ctx.read::<T::Repr>(&current, elem * count)?, count as usize);
     if values.len() as u64 != count {
         return Err(LumaError::Gpu("reduction results are missing".into()));
     }
@@ -397,8 +465,12 @@ pub(crate) fn finish_passes(
 /// The reduction of `array` as a buffer holding one element per op; see [`reduce_array`]. `elem`
 /// is the size of an element in bytes. The values end up in `target` when it is given (a buffer
 /// of at least `elem` bytes per op), without any copy. `finish` is applied by the last pass.
+/// With `bits` the array holds bit-packed `bool`s: an evaluated one is reduced a word at a time
+/// (see [`Builtin::ReduceBits`]) by the one op of `ops`.
+#[allow(clippy::too_many_arguments)]
 fn reduce_into<T: GpuType>(
     array: &Array<T>,
+    bits: bool,
     elem: u64,
     wgsl: &'static str,
     ops: ReduceList,
@@ -437,7 +509,12 @@ fn reduce_into<T: GpuType>(
                 // Wgpu buffers are reference counted; the pin keeps it resident while it is bound.
                 let pin = storage.pin(j)?;
                 let rest = if single { finish } else { Finish::default() };
-                results.push(run_passes(scratch, pin.buffer().clone(), n, false, target, rest)?);
+                if bits {
+                    let (words, groups) = bits_first_pass(ctx, scratch, ops, pin.buffer(), n, target)?;
+                    results.push(run_passes(scratch, words, groups, true, target, rest)?);
+                } else {
+                    results.push(run_passes(scratch, pin.buffer().clone(), n, false, target, rest)?);
+                }
             }
         }
     }
@@ -453,6 +530,38 @@ fn reduce_into<T: GpuType>(
         }
     }
     run_passes(scratch, collect, len_u32(results.len())?, true, target, finish)
+}
+
+/// The first pass of the reduction `ops` (one op) of the `n` bit-packed elements in `words`: the
+/// buffer holding the partial results and how many there are. With one group they are the final
+/// value, which is written into `target` if it is given.
+fn bits_first_pass(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    ops: ReduceList,
+    words: &wgpu::Buffer,
+    n: u32,
+    target: Option<&wgpu::Buffer>,
+) -> Result<(wgpu::Buffer, u32)> {
+    let count = n.div_ceil(32);
+    let groups = ctx.tuning().reduce_groups(count);
+    let out = match target {
+        Some(target) if groups == 1 => target.clone(),
+        _ => scratch.take(u64::from(groups) * 4)?,
+    };
+    let core = ctx.builtin(Builtin::ReduceBits(ops), "u32")?;
+    ctx.jit().note_reduce_pass();
+    ctx.launch(
+        &core,
+        fold_workgroups(ctx, groups)?,
+        [count, 1, 1],
+        &[
+            RawArg::write(&out, u64::from(groups) * 4),
+            RawArg::read(words, u64::from(count) * 4),
+            RawArg::Uniform(bytemuck::cast_slice(&[count, n])),
+        ],
+    )?;
+    Ok((out, groups))
 }
 
 /// Per-component reductions of `f32` vector arrays: the same tree reduction as the scalar

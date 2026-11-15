@@ -3,7 +3,7 @@
 `Array<u32>` is the unsigned integer type: indices, counters, and the lanes of bit-sliced
 cryptography. A `u32` array fuses, views, reduces, scans and loops like an `f32` one, and has the
 bit operations of a hash function; `u32` arithmetic wraps. `Array<i32>` is the signed one
-([below](#signed-integers-and-casts)), and `Array<Mask>` the result of comparisons.
+([below](#signed-integers-and-casts)), and `Array<bool>` the result of comparisons.
 
 ## Arithmetic
 
@@ -59,38 +59,44 @@ assert_eq!(x.rotate_right(&amounts).to_vec()?, vec![0x1800_0000, 0x7812_3456]);
 instruction. Hash functions are written with constant amounts, so this is the path they use. An
 array of amounts costs a mask and a variable shift per element.
 
-## Comparisons, masks and `select`
+## Comparisons, booleans and `select`
 
-Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) of any element type return `Array<Mask>`: a boolean
-per element, stored as a `u32` that is 0 or 1 ([how to make and read one](arrays.md#masks)).
-Masks combine with `&`, `|` and `^` (and the compound forms `&=`, `|=`, `^=`), and `!` negates
-them. `select(&mask, a, b)` takes `a` where the mask is true and `b` elsewhere, for any element
-type; `a` and `b` are arrays or scalars. `count()` is the number of true elements (a `u32`
-array), `any()` and `all()` are one-element masks; read a mask value with `item()` and
-`bool::from`. Masks have no arithmetic: `to_u32()` and `to_f32()` convert them.
+Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) of any element type return `Array<bool>`: a boolean
+per element, stored as one bit ([how to make and read one](arrays.md#booleans)).
+Booleans combine with `&`, `|` and `^` (and the compound forms `&=`, `|=`, `^=`, also with a single
+`bool`), and `!` negates them; `*` of two boolean arrays is the logical and. `select(&cond, a, b)`
+takes `a` where the condition is true and `b` elsewhere, for any element type; `a` and `b` are
+arrays or scalars, and the condition is an `Array<bool>` or an `Array<u32>` (non-zero is true).
+`count()` is the number of true elements (a `u32` array, and `sum()` is the same), `any()` and
+`all()` are one-element `bool` arrays; read one with `item()`. A boolean array times a number
+promotes as in NumPy: `mask * &x` is `x` where true and 0 elsewhere (a `select`, so it fuses as
+cheaply as one), and `mask + &x` / `mask - &x` use the 0 and 1 of `x`'s type. `to_u32()`, `to_i32()`
+and `to_f32()` convert explicitly.
 
 ```rust
 use luma::*;
 
 let x = Array::from_slice(&[3u32, 9, 12, 5], 4)?;
-let in_range = x.ge(4u32) & x.lt(10u32);               // 1 where 4 <= x < 10
-assert_eq!(in_range.to_u32().to_vec()?, vec![0, 1, 0, 1]);
+let in_range = x.ge(4u32) & x.lt(10u32);               // true for 4 <= x < 10
+assert_eq!(in_range.to_vec()?, vec![false, true, false, true]);
 assert_eq!((!&in_range).to_u32().to_vec()?, vec![1, 0, 1, 0]);
 
 // Clamp to 10, keep the rest.
 let clamped = select(&x.gt(10u32), 10u32, &x);
 assert_eq!(clamped.to_vec()?, vec![3, 9, 10, 5]);
 
-// `count` counts the true elements; `sum_where` sums values under a mask.
+// `count` counts the true elements; `sum_where` sums values under a condition.
 assert_eq!(in_range.count().item()?, 2);
 assert_eq!(x.sum_where(&in_range).item()?, 14);
+// A boolean times a number keeps the number where true.
+assert_eq!((&in_range * &x).to_vec()?, vec![0, 9, 0, 5]);
 
-// `any` and `all` are one-element masks; `bool::from` reads them. `&=`, `|=`, `^=` work in place.
-assert!(bool::from(in_range.any().item()?));
-assert!(!bool::from(in_range.all().item()?));
+// `any` and `all` are one-element `bool` arrays. `&=`, `|=`, `^=` work in place.
+assert!(in_range.any().item()?);
+assert!(!in_range.all().item()?);
 let mut flags = x.ge(4u32);
 flags &= &x.lt(10u32);
-assert_eq!(flags.to_u32().to_vec()?, vec![0, 1, 0, 1]);
+assert_eq!(flags.to_vec()?, vec![false, true, false, true]);
 # Ok::<(), luma::LumaError>(())
 ```
 
@@ -98,8 +104,8 @@ Comparisons with a NaN are the GPU's: `lt`, `le`, `gt`, `ge` and `eq` are false 
 and `ne` was false too on every device the tests ran on (NVIDIA, llvmpipe), so `x.ne(&x)` is **not** a NaN test. Use
 `is_nan()` ([Precision](precision.md)).
 
-`u32` has no unary minus. To use a mask in float arithmetic write `mask.to_f32()` or
-`select(&mask, 1.0, 0.0)`; both fuse.
+`u32` has no unary minus. To use a boolean array in float arithmetic write `mask * &x`,
+`mask.to_f32()` or `select(&mask, 1.0, 0.0)`; all fuse.
 
 ## Signed integers and casts
 

@@ -30,7 +30,7 @@ fn const_bits(ty: ElemTy, value: f64) -> u64 {
     match ty {
         ElemTy::F32 | ElemTy::Df32 => u64::from((value as f32).to_bits()),
         ElemTy::F64 => value.to_bits(),
-        ElemTy::U32 | ElemTy::Mask => u64::from(value as u32),
+        ElemTy::U32 | ElemTy::Bool => u64::from(value as u32),
         ElemTy::I32 => u64::from(value as i32 as u32),
     }
 }
@@ -38,7 +38,7 @@ fn const_bits(ty: ElemTy, value: f64) -> u64 {
 /// Whether `s` is the constant `value` of type `ty`, by bit pattern (so `-0.0` is not `0.0`).
 fn is_value(s: Option<Scalar>, ty: ElemTy, value: f64) -> bool {
     s.is_some_and(|s| {
-        let bits = if s.ty.bytes() == 4 { s.bits & 0xffff_ffff } else { s.bits };
+        let bits = if s.ty.slots() == 1 { s.bits & 0xffff_ffff } else { s.bits };
         s.ty == ty && bits == const_bits(ty, value)
     })
 }
@@ -332,7 +332,7 @@ mod tests {
         array.to_vec().unwrap()
     }
 
-    fn compared(array: &Array<crate::Mask>) -> Vec<u32> {
+    fn compared(array: &Array<bool>) -> Vec<u32> {
         array.to_u32().to_vec().unwrap()
     }
 

@@ -402,10 +402,9 @@ impl Context {
     /// Copies the data of `storage` into `dst` (exactly `storage.byte_len()` bytes), after
     /// everything recorded so far; on success every byte of `dst` is written.
     pub(crate) fn read_storage_into(&self, storage: &Storage, dst: &mut [std::mem::MaybeUninit<u8>]) -> Result<()> {
-        let elem = storage.elem();
         let mut rest = dst;
         for j in 0..storage.segments() {
-            let (piece, tail) = rest.split_at_mut(storage.range(j).len() * elem);
+            let (piece, tail) = rest.split_at_mut(storage.segment_byte_len(j) as usize);
             storage.segment(j).read_into(piece)?;
             rest = tail;
         }

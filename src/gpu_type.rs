@@ -4,7 +4,7 @@ pub(crate) mod sealed {
 
 impl sealed::Sealed for u32 {}
 impl sealed::Sealed for i32 {}
-impl sealed::Sealed for Mask {}
+impl sealed::Sealed for bool {}
 impl sealed::Sealed for f32 {}
 impl sealed::Sealed for f64 {}
 impl sealed::Sealed for Df32 {}
@@ -24,7 +24,88 @@ use bytemuck::{Pod, Zeroable};
 ///
 /// The built-in math only exists for [`ScalarType`]s; `[f32; 2]` and `[f32; 4]` arrays also have
 /// per-component reductions (`sum`, `min`, `max`, `norm`).
-pub trait GpuType: Pod + std::fmt::Debug + sealed::Sealed {}
+///
+/// Host values and GPU words are related through the hidden associated type `Repr`: every
+/// host-to-GPU and GPU-to-host copy goes through `to_repr` / `from_repr` (borrowed, no copy, for
+/// every type but `bool`), and the size of a buffer comes from `LAYOUT`.
+///
+/// A `bool` takes one bit: an array of `n` bools is `ceil(n / 32)` `u32` words, element `i` is
+/// bit `i % 32` of word `i / 32`, and the bits past `n` in the last word are 0 (a custom kernel
+/// sees an `array<u32>` of those words, see [`Kernel`](crate::Kernel)).
+pub trait GpuType: Zeroable + Copy + Send + Sync + std::fmt::Debug + sealed::Sealed + 'static {
+    /// The plain-old-data form of the elements that is uploaded to and read back from the GPU:
+    /// one `Repr` per element, except for the bit-packed `bool` (32 elements to a `u32`).
+    #[doc(hidden)]
+    type Repr: Pod;
+
+    /// How the elements sit in a buffer.
+    #[doc(hidden)]
+    const LAYOUT: ElemLayout = ElemLayout::plain(std::mem::size_of::<Self::Repr>());
+
+    /// The GPU words of `host`: borrowed when the representation is the type itself.
+    #[doc(hidden)]
+    fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]>;
+
+    /// The `len` host values of GPU words read back.
+    #[doc(hidden)]
+    fn from_repr(repr: Vec<Self::Repr>, len: usize) -> Vec<Self>;
+
+    /// `host` viewed as GPU words, if the representation is the type itself (no conversion
+    /// needed to read into it); `None` otherwise.
+    #[doc(hidden)]
+    fn repr_mut(host: &mut [Self]) -> Option<&mut [Self::Repr]>;
+
+    /// The GPU word of a one-element array holding this value.
+    #[doc(hidden)]
+    fn into_repr(self) -> Self::Repr;
+}
+
+/// How the elements of a type sit in a device buffer.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ElemLayout {
+    stride: usize,
+    packed: bool,
+}
+
+impl ElemLayout {
+    /// Elements of `bytes` bytes each, one after the other.
+    pub const fn plain(bytes: usize) -> Self {
+        ElemLayout { stride: bytes, packed: false }
+    }
+
+    /// One bit per element: 32 to a `u32` word, element `i` at bit `i % 32` of word `i / 32`.
+    /// Arrays split over several buffers split like arrays of 4-byte elements (see
+    /// [`ElemLayout::stride`]), so every buffer starts on a word.
+    pub const PACKED: ElemLayout = ElemLayout { stride: 4, packed: true };
+
+    /// The bytes that set the elements a segment of an array holds, `segment_bytes / stride`:
+    /// the element size, or 4 for packed elements (arrays of `bool` and `f32` are split alike).
+    pub const fn stride(self) -> usize {
+        self.stride
+    }
+
+    /// Whether elements are bits of words.
+    pub const fn is_packed(self) -> bool {
+        self.packed
+    }
+
+    /// The bytes of a buffer holding `len` elements. Never compute `len * stride` for a packed
+    /// layout.
+    pub const fn bytes(self, len: usize) -> u64 {
+        if self.packed {
+            len.div_ceil(32) as u64 * 4
+        } else {
+            len as u64 * self.stride as u64
+        }
+    }
+
+    /// The `Repr` words holding the elements `range` (which starts on a multiple of 32 if the
+    /// layout is packed).
+    pub const fn words(self, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        if self.packed { range.start / 32..range.end.div_ceil(32) } else { range }
+    }
+}
 
 /// Element types the built-in operators, math functions and reductions are implemented for.
 pub trait ScalarType: GpuType {
@@ -40,15 +121,75 @@ pub trait ScalarType: GpuType {
     }
 }
 
-impl GpuType for u32 {}
-impl GpuType for i32 {}
-impl GpuType for Mask {}
-impl GpuType for f32 {}
-impl GpuType for f64 {}
-impl GpuType for [f32; 2] {}
-impl GpuType for [f32; 4] {}
-impl GpuType for [u32; 2] {}
-impl GpuType for [u32; 4] {}
+/// `GpuType` for types that are their own GPU representation.
+macro_rules! plain_gpu_type {
+    ($($ty:ty),*) => {$(
+        impl GpuType for $ty {
+            type Repr = $ty;
+
+            fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
+                std::borrow::Cow::Borrowed(host)
+            }
+
+            fn from_repr(repr: Vec<Self::Repr>, _len: usize) -> Vec<Self> {
+                repr
+            }
+
+            fn repr_mut(host: &mut [Self]) -> Option<&mut [Self::Repr]> {
+                Some(host)
+            }
+
+            fn into_repr(self) -> Self::Repr {
+                self
+            }
+        }
+    )*};
+}
+
+plain_gpu_type!(u32, i32, f32, f64, Df32, [f32; 2], [f32; 4], [u32; 2], [u32; 4]);
+
+impl GpuType for bool {
+    type Repr = u32;
+
+    const LAYOUT: ElemLayout = ElemLayout::PACKED;
+
+    fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
+        std::borrow::Cow::Owned(
+            host.chunks(32).map(|chunk| chunk.iter().enumerate().fold(0u32, |word, (bit, &b)| word | u32::from(b) << bit)).collect(),
+        )
+    }
+
+    fn from_repr(repr: Vec<Self::Repr>, len: usize) -> Vec<Self> {
+        let mut out = Vec::with_capacity(len);
+        let whole = len / 32;
+        for &word in &repr[..whole] {
+            out.extend((0..32).map(|bit| word >> bit & 1 != 0));
+        }
+        if !len.is_multiple_of(32) {
+            out.extend((0..len % 32).map(|bit| repr[whole] >> bit & 1 != 0));
+        }
+        out
+    }
+
+    fn repr_mut(_host: &mut [Self]) -> Option<&mut [Self::Repr]> {
+        None
+    }
+
+    fn into_repr(self) -> Self::Repr {
+        u32::from(self)
+    }
+}
+
+/// The element types of arithmetic: `u32`, `i32`, `f32`, `f64` and [`Df32`]. Sums, running sums,
+/// products and the generic reductions exist for these; `bool` has its own counting versions
+/// (see [`Array<bool>`](crate::Array#impl-Array%3Cbool%3E)) because NumPy's sum of booleans is an integer.
+pub trait Numeric: ScalarType {}
+
+impl Numeric for u32 {}
+impl Numeric for i32 {}
+impl Numeric for f32 {}
+impl Numeric for f64 {}
+impl Numeric for Df32 {}
 
 impl ScalarType for u32 {
     fn wgsl_type() -> &'static str {
@@ -62,7 +203,11 @@ impl ScalarType for i32 {
     }
 }
 
-impl ScalarType for Mask {
+// The WGSL type of a `bool` in registers and of the words of its buffers (32 bools to a `u32`,
+// `GpuType::LAYOUT`). The fused kernels read and write the bits through the accessors
+// `codegen::storage_ty`, `codegen::load` and `codegen::store`; the built-in kernels that touch
+// bool buffers (fill, the reductions of words) know the layout themselves.
+impl ScalarType for bool {
     fn wgsl_type() -> &'static str {
         "u32"
     }
@@ -77,47 +222,6 @@ impl ScalarType for f32 {
 impl ScalarType for f64 {
     fn wgsl_type() -> &'static str {
         "f64"
-    }
-}
-
-/// A boolean per element: the result of comparisons and classifications, and the first operand of
-/// [`select`](crate::select). It is stored as a `u32` that is 0 (false) or 1 (true); the field is
-/// private, so masks read back from the GPU or built with [`Mask::from`] only ever hold 0 or 1.
-/// The library relies on that: `!`, [`count`](crate::Array::count), [`any`](crate::Array::any)
-/// and [`all`](crate::Array::all) give unspecified results for a mask holding another word,
-/// which only a reinterpretation of raw bits through `bytemuck` (`Mask` is `Pod`) can build.
-/// Generators (`range` and the like) do not exist for masks.
-/// Arrays of masks have `&`, `|`, `^` and `!`, [`count`](crate::Array::count),
-/// [`any`](crate::Array::any), [`all`](crate::Array::all), `min`/`max` and the casts
-/// [`to_u32`](crate::Array::to_u32) and [`to_f32`](crate::Array::to_f32); arithmetic and sums
-/// are not defined (convert with `to_u32` first).
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Mask(u32);
-
-// SAFETY: `#[repr(transparent)]` over `u32`: no padding, and the all-zero pattern is valid.
-unsafe impl Zeroable for Mask {}
-// SAFETY: see above. Bit patterns other than 0 and 1 are never produced by the library, but
-// they are not undefined behaviour either (every operation reads the word as an integer); the
-// results of the mask operations for them are unspecified (see the type's documentation).
-unsafe impl Pod for Mask {}
-
-impl Mask {
-    /// The true mask.
-    pub const TRUE: Mask = Mask(1);
-    /// The false mask.
-    pub const FALSE: Mask = Mask(0);
-}
-
-impl From<bool> for Mask {
-    fn from(value: bool) -> Self {
-        Mask(u32::from(value))
-    }
-}
-
-impl From<Mask> for bool {
-    fn from(value: Mask) -> Self {
-        value.0 != 0
     }
 }
 
@@ -158,8 +262,6 @@ impl Df32 {
         f64::from(self.hi) + f64::from(self.lo)
     }
 }
-
-impl GpuType for Df32 {}
 
 impl ScalarType for Df32 {
     fn wgsl_type() -> &'static str {
