@@ -139,6 +139,47 @@ assert!((y.var_axis(0).item()? - 1.25).abs() < 1e-3);
 # Ok::<(), luma::LumaError>(())
 ```
 
+## Argmax and argmin
+
+`argmax` and `argmin` give the **flat index** of the largest or smallest element as a
+one-element `u32` array, recorded without waiting like `sum` and usable on the GPU at once. A
+pending operand is computed inside the first pass, never stored. `argmax_axis(axis)` and
+`argmin_axis(axis)` give, for every line along `axis`, the index *along the axis* (extent 1
+there in the result). The first of equal elements wins, and an `f32` NaN is returned before every number, by
+`argmin` as well as by `argmax` (the first NaN, as in NumPy). They work on `f32`, `u32` and `i32`
+(`f64` and `Df32` arrays poison the result with `Unsupported`, like the other reductions along
+an axis).
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[3.0f32, 9.0, 1.0, 9.0, 7.0, 2.0, 8.0, 0.5], [4, 2])?;
+assert_eq!(x.argmax().item()?, 1); // the first of the two 9s
+assert_eq!(x.argmin().item()?, 7);
+
+// Along axis 0 (a column of four per result): the row of the extreme of each column.
+assert_eq!(x.argmax_axis(0).to_vec()?, vec![1, 2]);
+assert_eq!(x.argmin_axis(0).to_vec()?, vec![2, 3]);
+
+// Along axis 1: which of the two columns is larger, for each row.
+assert_eq!(x.argmax_axis(1).to_vec()?, vec![1, 0, 1, 0]);
+
+// An expression is not stored: the index of the sample nearest to 7.5.
+let nearest = (&x - 7.5).abs().argmin();
+assert_eq!(nearest.item()?, 4);
+
+// A NaN is found first, whichever extreme is asked for.
+let y = Array::from_slice(&[1.0f32, f32::NAN, 5.0, f32::NAN], 4)?;
+assert_eq!((y.argmax().item()?, y.argmin().item()?), (1, 1));
+# Ok::<(), luma::LumaError>(())
+```
+
+A flat index `i` of a `[w, h]` array is the element at `(i % w, i / w)`. The passes are those of
+`sum_axis` (a workgroup per chunk of a contiguous line, blocks that an invocation walks for a
+strided one) carrying a (value, index) pair, so an `argmax_axis` reads the data once and costs
+the time of `max_axis`. Reading the result of `argmax()` back with `item()` is a host
+synchronization (about 100 µs); use it on the GPU (`x.take(&x.argmax())`) to avoid it.
+
 ## Accumulating scatters
 
 [`put`](views.md) overwrites: of several equal indices one (unspecified) wins. `put_add`,

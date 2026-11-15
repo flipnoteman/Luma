@@ -79,6 +79,7 @@ mod guide {
 // The derive emits `::luma::` paths, also inside this crate.
 extern crate self as luma;
 
+mod arg;
 mod array;
 mod builtin;
 mod context;

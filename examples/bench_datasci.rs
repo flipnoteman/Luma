@@ -779,6 +779,73 @@ fn case_sort(b: &mut Bench) {
     });
 }
 
+/// The index of the first largest element of `line` (NaN-free data).
+fn host_argmax(line: impl Iterator<Item = f32>) -> u32 {
+    let mut best = (f32::NEG_INFINITY, 0u32);
+    for (i, v) in line.enumerate() {
+        if v > best.0 || i == 0 {
+            best = (v, i as u32);
+        }
+    }
+    best.1
+}
+
+/// `argmax/flat` (a whole `2^26` `f32` array) and `argmax/axis` (`argmax_axis(1)` of `[64, 2^22]`)
+/// against hand-written pair reductions, both sides verified against the host first. Data have a
+/// few exact ties at the maximum (a column's maximum is planted twice).
+fn case_argmax(b: &mut Bench) {
+    b.guarded("argmax/flat", |b| {
+        let ctx = b.ctx.clone();
+        let n = if b.quick { 1usize << 20 } else { 1 << 26 };
+        let mut hx = values(n, 60, -1.0, 1.0);
+        let top = hx.iter().copied().fold(f32::MIN, f32::max);
+        hx[n / 3] = top;
+        hx[n - 5] = top;
+        let want = host_argmax(hx.iter().copied());
+        let x = Array::from_slice_on(&ctx, &hx, n).unwrap();
+        let mut hand = hand::HandArgmax::new(&ctx).unwrap();
+        let mut out = Array::<u32>::zeros_on(&ctx, 1).unwrap();
+        let idx = x.argmax();
+        idx.eval().unwrap();
+        check_exact("argmax/flat luma", &idx.to_vec().unwrap(), &[want]);
+        hand.run(&x, &mut out, n);
+        check_exact("argmax/flat hand", &out.to_vec().unwrap(), &[want]);
+        b.compare("argmax/flat", &n.to_string(), Work::Bytes(4.0 * n as f64), Some(DEFAULT_GATE), &mut || x.argmax().eval().unwrap(), &mut || {
+            hand.run(&x, &mut out, n)
+        });
+    });
+    b.guarded("argmax/axis", |b| {
+        let ctx = b.ctx.clone();
+        let cols = 64usize;
+        let rows = if b.quick { 1usize << 16 } else { 1 << 22 };
+        let mut hx = values(cols * rows, 61, -1.0, 1.0);
+        let want: Vec<u32> = (0..cols)
+            .map(|c| {
+                let top = (0..rows).map(|r| hx[c + cols * r]).fold(f32::MIN, f32::max);
+                hx[c + cols * (rows / 7)] = top;
+                hx[c + cols * (rows - 3)] = top;
+                host_argmax((0..rows).map(|r| hx[c + cols * r]))
+            })
+            .collect();
+        let x = Array::from_slice_on(&ctx, &hx, [cols, rows]).unwrap();
+        let hand = hand::HandArgmaxAxis::new(&ctx).unwrap();
+        let mut out = Array::<u32>::zeros_on(&ctx, cols).unwrap();
+        let idx = x.argmax_axis(1);
+        idx.eval().unwrap();
+        check_exact("argmax/axis luma", &idx.to_vec().unwrap(), &want);
+        hand.run(&x, &mut out, cols, rows);
+        check_exact("argmax/axis hand", &out.to_vec().unwrap(), &want);
+        b.compare(
+            "argmax/axis",
+            &format!("[{cols},{rows}]"),
+            Work::Bytes(4.0 * (cols * rows) as f64),
+            Some(DEFAULT_GATE),
+            &mut || x.argmax_axis(1).eval().unwrap(),
+            &mut || hand.run(&x, &mut out, cols, rows),
+        );
+    });
+}
+
 fn main() {
     let mut quick = false;
     let mut gate = false;
@@ -814,6 +881,7 @@ fn main() {
     case_scatter_add(&mut b);
     case_group_sum(&mut b);
     case_sort(&mut b);
+    case_argmax(&mut b);
     cmp_matmul(&mut b);
     cmp_gram(&mut b);
     smoke_axpy(&mut b);

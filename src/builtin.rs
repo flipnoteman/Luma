@@ -375,6 +375,12 @@ pub(crate) enum ReduceOp {
     Max,
     /// Sum of squares of the input; the later passes over its partial results are sums.
     SumSquares,
+    /// The index of the first largest element of a line (a NaN is the largest); the partial results
+    /// of a pass are (value, index) pairs. Only the axis passes of [`crate::arg`] run it, alone in
+    /// its [`ReduceList`].
+    ArgMax,
+    /// The index of the first smallest element of a line (a NaN is the smallest), as `ArgMax`.
+    ArgMin,
 }
 
 impl ReduceOp {
@@ -384,6 +390,11 @@ impl ReduceOp {
             ReduceOp::SumSquares => ReduceOp::Sum,
             op => op,
         }
+    }
+
+    /// Whether the op carries an index with its value (see [`ReduceOp::ArgMax`]).
+    pub(crate) fn is_arg(self) -> bool {
+        matches!(self, ReduceOp::ArgMax | ReduceOp::ArgMin)
     }
 }
 
@@ -502,6 +513,12 @@ impl ReduceList {
         &self.ops[..usize::from(self.len)]
     }
 
+    /// The words of every partial result cell: one per op, two (value and index) for an arg
+    /// reduction.
+    pub(crate) fn cell_words(&self) -> usize {
+        if self.as_slice().first().is_some_and(|op| op.is_arg()) { 2 } else { self.as_slice().len() }
+    }
+
     /// The ops of the passes after the first.
     pub(crate) fn rest(self) -> Self {
         let mut list = self;
@@ -613,6 +630,7 @@ fn reduce_bits(ops: ReduceList, tuning: &Tuning) -> String {
     let op = ops.as_slice().first().copied().unwrap_or(ReduceOp::Sum);
     let value = match op {
         ReduceOp::Sum | ReduceOp::SumSquares => "countOneBits(w)",
+        ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("boolean words have no arg reductions"),
         ReduceOp::Max => "select(0u, 1u, w != 0u)",
         ReduceOp::Min => "select(0u, 1u, w == select(0xFFFFFFFFu, (1u << (p.len & 31u)) - 1u, i == p.n - 1u && (p.len & 31u) != 0u))",
     };
@@ -655,6 +673,7 @@ impl<'a> ReduceElem<'a> {
             (ReduceElem::Df32 { .. }, ReduceOp::Sum | ReduceOp::SumSquares) => "df_add(u, v)",
             (ReduceElem::Df32 { .. }, ReduceOp::Min) => "df_min(u, v)",
             (ReduceElem::Df32 { .. }, ReduceOp::Max) => "df_max(u, v)",
+            (_, ReduceOp::ArgMax | ReduceOp::ArgMin) => unreachable!("arg reductions have their own passes (`crate::arg`)"),
         }
     }
 
@@ -915,6 +934,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         inits += &match op {
             ReduceOp::Sum | ReduceOp::SumSquares => format!("    var acc{j} = zero;\n"),
             ReduceOp::Min | ReduceOp::Max => format!("    var acc{j} = {load}({segment}min(group * {block}u + lid, p.n - 1u));\n"),
+            ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
         };
         for s in 0..per_thread {
             if segmented {
@@ -926,6 +946,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
                 ReduceOp::Sum => format!("select(zero, {e}, base + {wg}u * {s}u < p.n)"),
                 ReduceOp::SumSquares => format!("select(zero, {}, base + {wg}u * {s}u < p.n)", elem.square(&e)),
                 ReduceOp::Min | ReduceOp::Max => e,
+                ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
             };
             loop_body += &format!("        let v{j}_{s} = {value};\n");
         }
@@ -943,6 +964,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
                 ReduceOp::Sum | ReduceOp::SumSquares => ("subgroupAdd", "zero".to_owned()),
                 ReduceOp::Min => ("subgroupMin", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
                 ReduceOp::Max => ("subgroupMax", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
+                ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
             };
             lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
             let (lets, fin) = ops.epilogue().statements(&format!("f{j}"), &format!("g{j}_"));
