@@ -35,11 +35,11 @@ fn reference<const N: usize>(data: &[[f32; N]]) -> Reference<N> {
         norm: [0.0; N],
     };
     for v in data {
-        for c in 0..N {
-            r.sum[c] += f64::from(v[c]);
-            r.norm[c] += f64::from(v[c]) * f64::from(v[c]);
-            r.min[c] = r.min[c].min(v[c]);
-            r.max[c] = r.max[c].max(v[c]);
+        for (c, &x) in v.iter().enumerate() {
+            r.sum[c] += f64::from(x);
+            r.norm[c] += f64::from(x) * f64::from(x);
+            r.min[c] = r.min[c].min(x);
+            r.max[c] = r.max[c].max(x);
         }
     }
     r.norm = r.norm.map(f64::sqrt);

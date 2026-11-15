@@ -172,7 +172,7 @@ impl HandGram {
 
     /// Records `out = Zᵀ Z` (`out` holds `f * f` elements, row-major).
     pub fn run(&self, x: &Array<f32>, c: &Array<f32>, s: &Array<f32>, out: &mut Array<f32>, f: u32, k: u32) {
-        assert!(f % 32 == 0 && k > 0, "HandGram needs F a multiple of 32 and K > 0");
+        assert!(f.is_multiple_of(32) && k > 0, "HandGram needs F a multiple of 32 and K > 0");
         let tiles = (f / 32) * (f / 32);
         let split = (1024u32.div_ceil(tiles)).min(k / 1024).max(1);
         let kc = k.div_ceil(split).next_multiple_of(16);
@@ -321,7 +321,7 @@ impl Scratch {
 }
 
 fn axis_geometry(cols: usize, rows: usize, inv: f32) -> (AxisParams, u32, usize) {
-    assert!(cols % 8 == 0 && rows > 0, "axis references need cols a multiple of 8 and rows > 0");
+    assert!(cols.is_multiple_of(8) && rows > 0, "axis references need cols a multiple of 8 and rows > 0");
     let rb = axis_rows_per_block(cols, rows);
     let blocks = rows.div_ceil(rb);
     let groups = (cols * blocks).div_ceil(256) as u32;

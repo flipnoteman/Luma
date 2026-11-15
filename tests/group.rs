@@ -15,7 +15,7 @@ const N: usize = 1 << 20;
 
 fn codes(rng: &mut Rng, groups: usize) -> Vec<u32> {
     // One in 16 codes is out of range and must be skipped.
-    (0..N).map(|_| if rng.next() % 16 == 0 { (groups as u32).wrapping_add(rng.next() % 100) } else { rng.next() % groups as u32 }).collect()
+    (0..N).map(|_| if rng.next().is_multiple_of(16) { (groups as u32).wrapping_add(rng.next() % 100) } else { rng.next() % groups as u32 }).collect()
 }
 
 fn group_lists<T: Copy>(codes: &[u32], vals: &[T], groups: usize) -> Vec<Vec<T>> {

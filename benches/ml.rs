@@ -314,12 +314,13 @@ type Soa = [[[f32; 8]; KM_K / 8]; 4];
 fn nearest(p: [f32; 4], cx: &Soa) -> usize {
     let mut best = [f32::INFINITY; 8];
     let mut index = [0u32; 8];
-    for block in 0..KM_K / 8 {
+    let blocks = cx[0].iter().zip(&cx[1]).zip(&cx[2]).zip(&cx[3]);
+    for (block, (((x, y), z), w)) in blocks.enumerate() {
         for l in 0..8 {
-            let dx = p[0] - cx[0][block][l];
-            let dy = p[1] - cx[1][block][l];
-            let dz = p[2] - cx[2][block][l];
-            let dw = p[3] - cx[3][block][l];
+            let dx = p[0] - x[l];
+            let dy = p[1] - y[l];
+            let dz = p[2] - z[l];
+            let dw = p[3] - w[l];
             let dist = dx * dx + dy * dy + dz * dz + dw * dw;
             if dist < best[l] {
                 best[l] = dist;

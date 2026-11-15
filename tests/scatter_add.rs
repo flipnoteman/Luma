@@ -17,7 +17,7 @@ impl Rng {
 
 fn codes(rng: &mut Rng, n: usize, bins: usize, stray: bool) -> Vec<u32> {
     // With `stray`, one in 16 codes is out of range (and must be skipped).
-    (0..n).map(|_| if stray && rng.next() % 16 == 0 { (bins as u32).wrapping_add(rng.next() % 1000) } else { rng.next() % bins as u32 }).collect()
+    (0..n).map(|_| if stray && rng.next().is_multiple_of(16) { (bins as u32).wrapping_add(rng.next() % 1000) } else { rng.next() % bins as u32 }).collect()
 }
 
 fn host_count(codes: &[u32], bins: usize) -> Vec<u32> {

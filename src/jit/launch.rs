@@ -325,8 +325,8 @@ fn live_split(fused: &Fused, max_inputs: usize, max_live: usize) -> Option<(Vec<
     // Values computed up to the cut that something after it reads.
     let last = last_uses(key);
     let mut outs = Vec::new();
-    for j in 0..=cut {
-        if last[j] > cut {
+    for (j, &used) in last.iter().enumerate().take(cut + 1) {
+        if used > cut {
             outs.push(Arc::clone(fused.instr_nodes[j].as_ref()?));
         }
     }
@@ -689,10 +689,10 @@ fn view_reach(map: &ViewMap, edge: Edge, a: usize, b: usize) -> (usize, usize) {
     region[top] = ((a / stride) as u32, ((b - 1) / stride) as u32);
     let boxed = map.src_box_in(edge, region);
     let (mut lo, mut hi, mut step) = (0usize, 0usize, 1usize);
-    for axis in 0..4 {
-        lo += boxed[axis].0 as usize * step;
-        hi += boxed[axis].1 as usize * step;
-        step *= map.src[axis] as usize;
+    for (&(first, last), &extent) in boxed.iter().zip(&map.src) {
+        lo += first as usize * step;
+        hi += last as usize * step;
+        step *= extent as usize;
     }
     (lo, hi)
 }
