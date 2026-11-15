@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -214,20 +214,119 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 </thead>
 <tbody>
 <tr><td><code>f32</code></td><td>the default float; every operation</td></tr>
-<tr><td><code>u32</code></td><td>indices, masks, <a href="integers.html">bit operations</a> (comparisons return <code>Array&lt;u32&gt;</code>, <code>0</code> or <code>1</code>)</td></tr>
+<tr><td><code>u32</code></td><td>indices, counters, <a href="integers.html">bit operations</a></td></tr>
+<tr><td><code>i32</code></td><td>signed integers, <a href="integers.html#signed-integers-and-casts">casts</a></td></tr>
+<tr><td><code>bool</code></td><td>the result of comparisons: a boolean per element (<a href="integers.html#comparisons-booleans-and-select">booleans</a>)</td></tr>
 <tr><td><code>Df32</code></td><td>double-float, about 48 bits of mantissa, runs on every device (<a href="precision.html">Precision</a>)</td></tr>
 <tr><td><code>f64</code></td><td>64-bit float, only on devices with <code>SHADER_F64</code></td></tr>
 </tbody>
 </table>
 </div>
 <p><code>vec2</code> / <code>vec4</code> element types exist for custom kernels, and <a href="records.html">records</a> group several
-arrays behind one struct. Convert between float types with <code>to_f64</code>, <code>to_df32</code> and <code>to_f32</code>:</p>
+arrays behind one struct. The built-in operations exist for <code>f32</code>, <code>u32</code>, <code>i32</code>, <code>Df32</code> and <code>f64</code>
+(the <em>scalar</em> types); what each type supports is listed in the chapters named in the table.</p>
+<h3 id="booleans"><a class="header" href="#booleans">Booleans</a></h3>
+<p><code>bool</code> is an element type: comparisons and <code>is_nan</code> / <code>is_finite</code> / <code>is_inf</code> produce <code>Array&lt;bool&gt;</code>,
+and <code>from_slice</code>, <code>to_vec</code>, <code>item</code>, <code>full(true)</code> and <code>write</code> use plain <code>bool</code>s. On the GPU a
+<code>bool</code> takes one bit: an array of <code>n</code> booleans is <code>ceil(n / 32)</code> <code>u32</code> words on the GPU, which
+is what a <a href="custom-kernels.html">custom kernel</a> sees (<code>array&lt;u32&gt;</code>, <a href="custom-kernels.html">how to read a bit</a>),
+so a comparison written to memory is 32 times smaller than a <code>u32</code> array, and <code>count()</code>, <code>any()</code>
+and <code>all()</code> of an evaluated array read a word per 32 elements. Whole-array results
+(comparisons, <code>&amp;</code>, <code>|</code>, <code>!</code>, <code>select</code> of booleans) are packed by the workgroup and cost no more
+than a <code>u32</code> store, and so does <code>assign</code> into a slice of a boolean array whose rows are runs of
+64 or more consecutive elements (the words inside a run are written as they are, and only the
+two words at the ends of a run, which it may share with elements the write leaves alone, change
+by atomic operations). Writes that cannot be built from runs (<code>put</code>, <code>stack</code>, a transposed slice,
+short rows) set and clear one bit at a time with atomic operations, about three times slower than
+the same write into a <code>u32</code> array. A flag array that a loop updates mostly by <code>put</code> is better kept
+as an <code>Array&lt;u32&gt;</code> (<code>.to_u32()</code> once, <code>put</code> 0s and 1s into it): <code>select</code> and <code>sum_where</code> accept
+<code>u32</code> conditions (non-zero is true), so nothing else changes. Booleans have no generators
+(<code>range</code>, <code>uniform</code>): they combine with <code>&amp; | ^ !</code>
+(also with a single <code>bool</code>), count with <code>count()</code>, steer <code>select</code>, promote to numbers in <code>+</code>, <code>-</code>
+and <code>*</code> as in NumPy (<code>mask * &amp;x</code> is <code>x</code> where true, 0 elsewhere), and convert with <code>to_u32()</code> /
+<code>to_i32()</code> / <code>to_f32()</code> (<a href="integers.html#comparisons-booleans-and-select">Comparisons, booleans and <code>select</code></a>).
+<code>sum()</code> of a boolean array is the count, a <code>u32</code> array.</p>
+<pre><code class="language-rust">use luma::*;
+
+let m = Array::from_slice(&amp;[true, false, true], 3)?;
+assert_eq!(m.to_vec()?, vec![true, false, true]);
+assert_eq!(m.count().item()?, 2);                       // a `u32`
+assert!(m.any().item()?);
+assert!(!m.all().item()?);
+assert_eq!(m.to_f32().to_vec()?, vec![1.0, 0.0, 1.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="casts"><a class="header" href="#casts">Casts</a></h3>
+<p>Casts are methods named for the type they produce. They are lazy and fuse like any elementwise
+operation.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>From</th><th>Methods</th><th>Rule</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f32</code></td><td><code>to_u32</code>, <code>to_i32</code></td><td>truncates toward zero, saturates, NaN becomes 0 (<a href="integers.html#signed-integers-and-casts">values</a>)</td></tr>
+<tr><td><code>u32</code></td><td><code>to_f32</code>, <code>to_i32</code></td><td><code>to_f32</code> rounds above 2^24; <code>to_i32</code> reinterprets the bits</td></tr>
+<tr><td><code>i32</code></td><td><code>to_f32</code>, <code>to_u32</code></td><td><code>to_f32</code> rounds above 2^24; <code>to_u32</code> reinterprets the bits</td></tr>
+<tr><td><code>bool</code></td><td><code>to_u32</code>, <code>to_i32</code>, <code>to_f32</code>, <code>to_f64</code>, <code>to_df32</code></td><td>1 where true, 0 where false</td></tr>
+<tr><td><code>f32</code></td><td><code>to_f64</code>, <code>to_df32</code></td><td>exact (<code>to_f64</code> needs <code>SHADER_F64</code>)</td></tr>
+<tr><td><code>f64</code>, <code>Df32</code></td><td><code>to_f32</code>, <code>to_df32</code> / <code>to_f64</code></td><td>rounds to <code>f32</code>; <code>f64</code> to <code>Df32</code> is exact to 48 bits</td></tr>
+</tbody>
+</table>
+</div>
+<p>There is no cast to <code>bool</code>: write a comparison (<code>x.ne(0u32)</code>). A cast pair not in the table does
+not exist, so a type mix-up is a compile error rather than a silent conversion.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
 let d = x.to_df32();                  // exact, `lo` is zero
 let back = (&amp;d / &amp;d).to_f32();
 assert_eq!(back.to_vec()?, vec![1.0, 1.0, 1.0]);
+
+let k = Array::from_slice(&amp;[0u32, 1, 2], 3)?;
+assert_eq!((&amp;x * k.to_f32()).to_vec()?, vec![0.0, 2.0, 6.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="elementwise-operations"><a class="header" href="#elementwise-operations">Elementwise operations</a></h2>
+<p>Operators <code>+ - * /</code> (and <code>%</code> on integers, unary <code>-</code> on floats and <code>i32</code>) take references or
+values, arrays or scalars, and exist in compound forms (<code>+=</code>). Methods cover the rest; they are all
+lazy and fuse:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>Methods</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>abs</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>; <code>powf(exponent)</code>, <code>clamp(lo, hi)</code> (host scalars); <code>atan2(x)</code>, <code>hypot(other)</code>, <code>copysign(sign)</code> (array or scalar)</td></tr>
+<tr><td><code>f64</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code></td></tr>
+<tr><td><code>Df32</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code> (<a href="precision.html">Precision</a>)</td></tr>
+<tr><td><code>i32</code></td><td><code>abs</code>, <code>sign</code>, <code>shl</code>, <code>shr</code> (<a href="integers.html#signed-integers-and-casts">Signed integers</a>)</td></tr>
+<tr><td><code>u32</code></td><td>bit operations, <code>shl</code>, <code>shr</code>, <code>rotate_left</code>, <code>rotate_right</code> (<a href="integers.html">Integers</a>)</td></tr>
+<tr><td>every scalar type</td><td><code>minimum(rhs)</code>, <code>maximum(rhs)</code>, <code>lt</code> <code>le</code> <code>gt</code> <code>ge</code> <code>eq</code> <code>ne</code> (booleans), <code>select(&amp;cond, a, b)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>atan2(x)</code> is <code>atan2(self, x)</code> with <code>self</code> the <code>y</code>. The right-hand side of <code>minimum</code>, the comparisons and the
+<code>try_</code> methods is an <code>Operand</code>: an array or reference to one (equal shapes, or extents of 1 that
+broadcast), a host value, or a <a href="lazy.html#scalars-that-change"><code>Scalar</code></a> handle.</p>
+<pre><code class="language-rust">use luma::*;
+
+let y = Array::from_slice(&amp;[1.0f32, -1.0, 0.0], 3)?;
+assert_eq!(y.abs().sqrt().to_vec()?, vec![1.0, 1.0, 0.0]);
+assert_eq!(y.clamp(-0.5, 0.5).to_vec()?, vec![0.5, -0.5, 0.0]);
+assert_eq!(y.maximum(0.25).to_vec()?, vec![1.0, 0.25, 0.25]);
+assert_eq!(y.hypot(0.0).to_vec()?, vec![1.0, 1.0, 0.0]);
+assert_eq!(Array::from_slice(&amp;[3.0f32], 1)?.copysign(&amp;y.slice(0, 1..2)).to_vec()?, vec![-3.0]);
+assert!(y.powf(2.0).to_vec()?[1].is_nan());                  // a negative base has no real power
+assert!(y.sin().to_vec()?[0] &gt; 0.84 &amp;&amp; (y.atan2(1.0).to_vec()?[0] - std::f32::consts::FRAC_PI_4).abs() &lt; 1e-5);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Operators do not return <code>Result</code>s, so a mistake shows up late. <code>try_add</code>, <code>try_sub</code>, <code>try_mul</code> and
+<code>try_div</code> check at once: they return <code>Err</code> for a shape or context mismatch instead of a poisoned
+array (<a href="#errors">Errors</a>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+let b = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+assert_eq!(a.try_add(&amp;a)?.to_vec()?, vec![2.0, 4.0, 6.0]);
+assert!(a.try_add(&amp;b).is_err());
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="shapes-and-broadcasting"><a class="header" href="#shapes-and-broadcasting">Shapes and broadcasting</a></h2>
 <p>Operators need equal shapes, with two exceptions: a scalar broadcasts, and an extent of 1
@@ -275,6 +374,26 @@ let mut out = [0.0f32; 3];
 before.read_into(&amp;mut out)?;
 assert_eq!(out, [10.0, 20.0, 30.0]);
 assert_eq!(x.to_vec()?, vec![7.0, 8.0, 9.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="convolution"><a class="header" href="#convolution">Convolution</a></h2>
+<p><code>x.conv1d(&amp;kernel, stride, padding)</code> is a 1-D cross-correlation of an <code>f32</code> array with a kernel
+(the kernel is not flipped), with zero padding on both sides; the output has
+<code>(len - kernel_len + 2 * padding) / stride + 1</code> elements. <code>x.conv1d_fft(&amp;kernel)</code> is the full
+<em>linear convolution</em> (the kernel is flipped), <code>len + kernel_len - 1</code> elements, computed with FFTs:
+use it for long kernels, where it is faster than the direct loop, and expect <code>f32</code> rounding error in
+its result. Both evaluate their operands and fail (poisoned array) for a bad geometry such as a
+kernel longer than the padded input or a zero stride.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0], 5)?;
+let k = Array::from_slice(&amp;[1.0f32, 0.0, -1.0], 3)?;
+assert_eq!(x.conv1d(&amp;k, 1, 0).to_vec()?, vec![-2.0, -2.0, -2.0]);       // x[i] - x[i + 2]
+assert_eq!(x.conv1d(&amp;k, 2, 0).to_vec()?, vec![-2.0, -2.0]);
+assert_eq!(x.conv1d(&amp;k, 1, 1).to_vec()?, vec![-2.0, -2.0, -2.0, -2.0, 4.0]);
+
+let full = x.conv1d_fft(&amp;k).to_vec()?;                                  // k is flipped
+let want = [1.0f32, 2.0, 2.0, 2.0, 2.0, -4.0, -5.0];
+assert!(full.iter().zip(want).all(|(a, b)| (a - b).abs() &lt; 1e-4));
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
 <p>Operators return arrays, not <code>Result</code>s, so expressions stay readable. A failing operation (a shape

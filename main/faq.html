@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -228,14 +228,15 @@ happens once per device creation. Create your contexts up front, before starting
 or use one context (the default one is shared by threads).</p>
 <h2 id="radv-integrated-gpus-give-wrong-results"><a class="header" href="#radv-integrated-gpus-give-wrong-results">RADV integrated GPUs give wrong results</a></h2>
 <p>Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (<code>scan</code>, <code>cumsum</code>,
-axis reductions), workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
+axis reductions), <code>matmul</code>, sorts (and what builds on them), scatters into targets of up to 4096
+elements, workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
 cyclic solver is chosen automatically only on the NVIDIA tuning profile (a GPU detected as NVIDIA,
 or <code>LUMA_TUNING=nvidia</code>); elsewhere (and with <code>LUMA_TRIDIAGONAL=thomas</code>) the solver does not use it. If you see wrong results on such a GPU:</p>
 <ul>
 <li><code>LUMA_STAGING=off</code> keeps expressions read through views out of workgroup memory (the cost model
 then recomputes them or evaluates them first),</li>
 <li><code>LUMA_TRIDIAGONAL=thomas</code> pins the solver that does not use workgroup memory,</li>
-<li>scans and axis reductions have no switch: run on another device (<code>LUMA_DEVICE=cpu</code>, or a
+<li>scans, axis reductions, <code>matmul</code>, sorts and scatters have no switch: run on another device (<code>LUMA_DEVICE=cpu</code>, or a
 different GPU through <code>VK_ICD_FILENAMES</code>).</li>
 </ul>
 <h2 id="results-and-errors"><a class="header" href="#results-and-errors">Results and errors</a></h2>
@@ -246,13 +247,56 @@ array to find the first failure early. The error carries the source location of 
 <code>ContextOptions::check_finite</code>): every evaluated <code>f32</code> and <code>Df32</code> array is checked (<code>f64</code> is not) and
 the first operation whose result holds a non-finite value fails with <code>LumaError::NonFinite</code>. It waits for the GPU after every
 array, so use it for debugging only. For <code>f32</code>, <code>f64</code> and <code>Df32</code> arrays,
-<code>is_finite()</code> / <code>is_nan()</code> / <code>is_inf()</code> give lazy <code>u32</code> masks you can use in expressions.</p>
+<code>is_finite()</code> / <code>is_nan()</code> / <code>is_inf()</code> give lazy <code>bool</code> arrays you can use in expressions.</p>
 <p><strong><code>Array&lt;f64&gt;</code> fails with <code>Unsupported</code>.</strong> The device has no 64-bit shader floats. Check
 <code>ctx.features().contains(luma::wgpu::Features::SHADER_F64)</code>, or use <code>Df32</code>
 (<a href="precision.html">Precision</a>), which runs everywhere.</p>
 <p><strong>Out of memory.</strong> Array data beyond the memory budget (80% of device memory on Vulkan GPUs)
 moves to host memory and back on demand, with a one-time warning. <code>LUMA_MEMORY_BUDGET</code> sets the
 budget. Custom kernels need arrays that fit one buffer (<code>LumaError::Chunked</code> otherwise).</p>
+<h2 id="numbers"><a class="header" href="#numbers">Numbers</a></h2>
+<p><strong><code>put_add</code>, <code>group_sum</code> or <code>histogram</code> of <code>f32</code> gives slightly different sums on every run.</strong>
+Equal indices are accumulated with atomics in no fixed order, and float addition is not
+associative, so the last bits of an <code>f32</code> sum differ between runs (and devices). Integer sums
+(<code>u32</code>, <code>i32</code>, <code>bincount</code>, <code>group_count</code>) are exact, and <code>put_min</code> / <code>put_max</code> do not depend on the
+order. If you need a reproducible float sum, scatter into integers (fixed point) or sort first and
+reduce (<a href="data.html#accumulating-scatters">Accumulating scatters</a>).</p>
+<p><strong>Where do NaNs go in a sort or a quantile?</strong> <code>sort</code>, <code>argsort</code> and <code>sort_axis</code> order floats as
+<code>-inf &lt; .. &lt; -0.0 &lt; +0.0 &lt; .. &lt; +inf &lt; NaN</code>: NaNs are last (first in the descending forms), and
+<code>-0.0</code> sorts before <code>+0.0</code>. A quantile is read from the sorted array, so a NaN in the data makes the
+high quantiles NaN and leaves the low ones alone; NumPy returns NaN for every quantile in that case.
+<code>factorize</code> and <code>unique</code> treat all NaNs as one value (the last) and <code>-0.0</code> and <code>0.0</code> as one. In
+<code>histogram</code> a NaN goes to bin 0.</p>
+<p><strong><code>x.ne(&amp;x)</code> does not find the NaNs.</strong> Comparisons with a NaN are the GPU’s. <code>lt</code>, <code>le</code>, <code>gt</code>,
+<code>ge</code> and <code>eq</code> give false for a NaN operand, and <code>ne</code> gave false as well on NVIDIA and on
+llvmpipe (the tests that ran), where IEEE says true. Use <code>x.is_nan()</code>, and <code>select(&amp;x.is_nan(), a, b)</code>
+to replace them. <code>LUMA_FAST_MATH</code> additionally folds a comparison of an array with itself.</p>
+<p><strong>What does a float-to-integer cast give out of range?</strong> <code>to_u32</code> and <code>to_i32</code> truncate toward
+zero and saturate at the largest <code>f32</code> inside the range, and NaN becomes 0:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Cast</th><th>Value</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td><code>to_u32</code></td><td>negative, <code>-0.5</code>, NaN</td><td>0</td></tr>
+<tr><td><code>to_u32</code></td><td><code>1e20</code>, <code>+inf</code></td><td><code>4294967040</code></td></tr>
+<tr><td><code>to_i32</code></td><td><code>-1e20</code>, <code>-inf</code></td><td><code>-2147483648</code></td></tr>
+<tr><td><code>to_i32</code></td><td><code>1e20</code>, <code>+inf</code></td><td><code>2147483520</code></td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[-1.5f32, f32::NAN, 1e20, -1e20, f32::INFINITY], 5)?;
+assert_eq!(x.to_u32().to_vec()?, vec![0, 0, 4_294_967_040, 0, 4_294_967_040]);
+assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_520]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong>Integer division by zero</strong> gives the dividend (<code>x / 0 == x</code>) and nothing fails; for <code>i32</code>,
+<code>x % 0</code> is 0 and <code>i32::MIN / -1</code> is <code>i32::MIN</code> (<a href="integers.html#signed-integers-and-casts">Integers</a>).</p>
+<p><strong>Which matrix shape is <code>matmul</code>’s?</strong> Axis 0 varies fastest, so the shapes are NumPy’s
+<code>a @ b</code> reversed: <code>lhs</code> <code>[K, M]</code>, <code>rhs</code> <code>[N, K]</code>, result <code>[N, M]</code>
+(<a href="data.html#matrix-products">Matrix products</a>).</p>
 <h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
 <p><strong>The first run is slow, later ones are fast.</strong> Large kernels (especially <code>Df32</code>) take seconds
 to compile on some drivers. Luma keeps the driver’s compiled pipelines and the measured cost

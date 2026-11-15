@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -214,7 +214,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 <tr><td><code>sum()</code>, <code>min()</code>, <code>max()</code></td><td>any element type; <code>u32</code> sums wrap around</td></tr>
 <tr><td><code>mean()</code>, <code>norm()</code></td><td><code>f32</code>; the norm is the Euclidean (L2) norm</td></tr>
 <tr><td><code>reduce([Reduction; N])</code></td><td><code>N</code> of <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>SumOfSquares</code> (one to four) in one pass, as an <code>N</code>-element array</td></tr>
-<tr><td><code>sum_where(&amp;mask)</code></td><td>the sum of the elements where a <code>u32</code> mask is non-zero, in one pass</td></tr>
+<tr><td><code>sum_where(&amp;cond)</code></td><td>the sum of the elements where a <code>bool</code> (or non-zero <code>u32</code>) condition is true, in one pass</td></tr>
 <tr><td><code>item()</code></td><td>the value of a one-element array</td></tr>
 <tr><td><code>to_array::&lt;N&gt;()</code></td><td>the values of an <code>N</code>-element array</td></tr>
 </tbody>
@@ -273,15 +273,19 @@ assert!((softmax.sum().item()? - 1.0).abs() &lt; 1e-6);
 <p>A reduction needs every element before any output exists, so the kernel that divides by the sum
 runs after the kernel that computes it: the example above is a few launches, not one. The values
 are the ones a host loop would give.</p>
-<h3 id="masks"><a class="header" href="#masks">Masks</a></h3>
-<p><code>sum_where(&amp;mask)</code> sums where a <code>u32</code> mask is non-zero (comparisons return such masks), the
-count of a condition is the sum of the mask itself:</p>
+<h3 id="booleans"><a class="header" href="#booleans">Booleans</a></h3>
+<p><code>sum_where(&amp;cond)</code> sums where a condition (an <code>Array&lt;bool&gt;</code>, such as a comparison, or a <code>u32</code> array of
+non-zero elements) is true; the <code>sum()</code> of a boolean array is the number of true elements, as a <code>u32</code>
+array (also <code>count()</code>, as in NumPy). <code>any()</code> and <code>all()</code> are one-element <code>bool</code> arrays, and <code>bool</code>
+arrays have <code>min</code> / <code>max</code> but no <code>mean</code>, <code>norm</code> or <code>reduce</code>:</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, -4.0], 4)?;
 let positive = x.gt(0.0);
 assert_eq!(x.sum_where(&amp;positive).item()?, 4.0);
+assert_eq!(positive.count().item()?, 2);
 assert_eq!(positive.sum().item()?, 2);
+assert!(positive.any().item()?);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h3 id="vector-elements"><a class="header" href="#vector-elements">Vector elements</a></h3>
 <p>Arrays of <code>[f32; 2]</code> and <code>[f32; 4]</code> reduce per component, and these reductions return host
@@ -294,7 +298,11 @@ assert_eq!(v.max()?, [3.0, 30.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="along-an-axis"><a class="header" href="#along-an-axis">Along an axis</a></h2>
 <p><code>sum_axis</code>, <code>min_axis</code> and <code>max_axis</code> reduce along one axis and leave extent 1 there. The result
-broadcasts back against the array:</p>
+broadcasts back against the array. They are available for <code>f32</code>, <code>u32</code> and <code>i32</code> arrays. A
+pending operand is not evaluated first: its expression is computed inside the first pass of the
+reduction, so <code>(&amp;x * &amp;y).sum_axis(1)</code> never stores the product. <code>reduce_axis</code>, <code>mean_axis</code>,
+<code>var_axis</code> and <code>std_axis</code> are in <a href="data.html#statistics-along-an-axis">Matrices, statistics and
+grouping</a>.</p>
 <pre><code class="language-rust">use luma::*;
 
 // Two columns of three (the first dimension varies fastest).
@@ -317,9 +325,15 @@ assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec()?, vec![3.0, 3.0, 4.0, 4.0, 5.
 <p><code>op</code> is called once with placeholders and compiled into the scan kernels, so it must be an
 elementwise expression of its two arguments and scalars (scalars it captures are uniforms:
 changing them does not recompile); anything else poisons the result. Non-associative operators
-give unspecified results, because the kernels regroup operands. Scans and axis reductions do not
-fuse into the expression behind them: the arrays are evaluated first. They are available for
-<code>f32</code> and <code>u32</code> arrays only (<code>f64</code> and <code>Df32</code> fail with <code>Unsupported</code>).</p>
+give unspecified results, because the kernels regroup operands. Scans do not fuse into the
+expression behind them: the array is evaluated first (it is read twice). Scans and axis
+reductions are available for <code>f32</code>, <code>u32</code> and <code>i32</code> arrays (<code>f64</code> and <code>Df32</code> fail with
+<code>Unsupported</code>); <code>bool</code> arrays have <code>sum_axis</code> and <code>cumsum</code> that count (<code>u32</code> results) and
+<code>min_axis</code> / <code>max_axis</code>, but no <code>scan</code> or <code>reduce_axis</code>.</p>
+<h2 id="sorting-groups-unique-values-and-quantiles"><a class="header" href="#sorting-groups-unique-values-and-quantiles">Sorting, groups, unique values and quantiles</a></h2>
+<p><code>sort</code>, <code>argsort</code>, <code>group_sum</code> and the other group reductions, <code>factorize</code> / <code>unique</code>, <code>histogram</code>
+and <code>quantile</code> / <code>median</code> have their own chapter: <a href="data.html">Matrices, statistics and
+grouping</a>.</p>
 <h2 id="precision"><a class="header" href="#precision">Precision</a></h2>
 <p>Float reductions run in the element type of the array. For more accuracy, reduce in a wider
 type:</p>
@@ -346,7 +360,7 @@ assert!((x.to_df32().sum().item()?.to_f64() - exact).abs() &lt; 1e-6);
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="records.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="data.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -360,7 +374,7 @@ assert!((x.to_df32().sum().item()?.to_f64() - exact).abs() &lt; 1e-6);
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="records.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="data.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

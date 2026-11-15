@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -187,7 +187,8 @@ Luma records it, fuses chains of elementwise operations into a single kernel, an
 on whatever hardware you have (Vulkan, Metal or DX12, through <a href="https://wgpu.rs">wgpu</a>). If no GPU
 opens it falls back to Mesa’s llvmpipe software driver.</p>
 <p>It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
-solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels. You do not write
+solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
+products, group-bys, sorts and statistics of data-analysis tools. You do not write
 shaders, manage buffers or schedule submissions. When you need something Luma does not have, a
 <a href="custom-kernels.html">custom WGSL kernel</a> runs in the same batch as the built-in operations.</p>
 <p>This guide explains how to use the library and why it behaves as it does. The
@@ -196,7 +197,7 @@ shaders, manage buffers or schedule submissions. When you need something Luma do
 <p>You need a recent stable Rust toolchain and a GPU with Vulkan, Metal or DX12 drivers. Add Luma
 to a project:</p>
 <pre><code class="language-toml">[dependencies]
-luma = "0.3"
+luma = "0.4"
 </code></pre>
 <p>Without a GPU, install a software Vulkan driver (<code>mesa-vulkan-drivers</code> on most Linux
 distributions). Luma picks it up automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces
@@ -232,8 +233,9 @@ location of the operation that failed.</li>
 </ul>
 <h2 id="where-to-go-next"><a class="header" href="#where-to-go-next">Where to go next</a></h2>
 <ul>
-<li><a href="arrays.html">Arrays</a>: creation, element types, shapes, broadcasting, reading back.</li>
+<li><a href="arrays.html">Arrays</a>: creation, element types, casts, elementwise math, shapes, broadcasting, reading back.</li>
 <li><a href="lazy.html">Lazy evaluation and fusion</a>: when kernels run, <code>eval</code>, <code>flush</code>, <code>sync</code>, <code>cache</code>.</li>
+<li><a href="data.html">Matrices, statistics and grouping</a>: <code>matmul</code>, axis statistics, scatter-add, histograms, sort, group-by, quantiles.</li>
 <li><a href="examples.html">Worked examples</a>: heat equation, Euler solver, ML-KEM, CPA.</li>
 <li><a href="environment.html">Environment variables</a> and the <a href="faq.html">FAQ</a> when something does not behave.</li>
 </ul>

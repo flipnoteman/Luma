@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -377,6 +377,10 @@ assert_eq!(a.to_vec()?, vec![2.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
 a.put(&amp;idx, 9.0)?;
 assert_eq!(a.to_vec()?, vec![9.0, 0.0, 0.0, 0.0, 9.0, 0.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>put</code> overwrites: with equal indices one write wins. To accumulate instead, <code>put_add</code>, <code>put_min</code>
+and <code>put_max</code> (<code>u32</code>, <code>i32</code> and <code>f32</code> arrays) combine every value that lands on a cell, with the
+same index rules (<a href="data.html#accumulating-scatters">Accumulating scatters</a>); <code>bincount</code> and the <code>group_*</code>
+methods are built on them.</p>
 <p><code>take</code> and <code>put</code> are the gather and scatter pair; the <a href="integers.html#lookup-tables-with-take">integer chapter</a>
 uses <code>take</code> for table lookups, and the ML-KEM example uses <code>put</code> for rejection sampling.</p>
 <h2 id="what-fuses"><a class="header" href="#what-fuses">What fuses</a></h2>
@@ -396,8 +400,10 @@ kernel.</li>
 more computation costs less than storing it and reading it back, or staged; otherwise it is
 evaluated first.</li>
 </ul>
-<p>What does not fuse: <code>scan</code> and axis reductions (<a href="reductions.html">Reductions</a>), and custom kernels,
-which see the arrays computed.</p>
+<p>What does not fuse: <code>scan</code> (it reads its operand twice, so the operand is computed first) and custom
+kernels, which see the arrays computed. The operands of <code>matmul</code>, of axis reductions and of
+<code>put_add</code> / <code>put_min</code> / <code>put_max</code> are read inside their own kernels
+(<a href="performance.html#what-fuses-and-what-cuts">Performance guide</a>).</p>
 
                     </main>
 

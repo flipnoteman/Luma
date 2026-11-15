@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -185,7 +185,8 @@ Luma records it, fuses chains of elementwise operations into a single kernel, an
 on whatever hardware you have (Vulkan, Metal or DX12, through <a href="https://wgpu.rs">wgpu</a>). If no GPU
 opens it falls back to Mesa’s llvmpipe software driver.</p>
 <p>It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
-solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels. You do not write
+solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
+products, group-bys, sorts and statistics of data-analysis tools. You do not write
 shaders, manage buffers or schedule submissions. When you need something Luma does not have, a
 <a href="#custom-kernels">custom WGSL kernel</a> runs in the same batch as the built-in operations.</p>
 <p>This guide explains how to use the library and why it behaves as it does. The
@@ -194,7 +195,7 @@ shaders, manage buffers or schedule submissions. When you need something Luma do
 <p>You need a recent stable Rust toolchain and a GPU with Vulkan, Metal or DX12 drivers. Add Luma
 to a project:</p>
 <pre><code class="language-toml">[dependencies]
-luma = "0.3"
+luma = "0.4"
 </code></pre>
 <p>Without a GPU, install a software Vulkan driver (<code>mesa-vulkan-drivers</code> on most Linux
 distributions). Luma picks it up automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces
@@ -230,8 +231,9 @@ location of the operation that failed.</li>
 </ul>
 <h2 id="where-to-go-next"><a class="header" href="#where-to-go-next">Where to go next</a></h2>
 <ul>
-<li><a href="#arrays">Arrays</a>: creation, element types, shapes, broadcasting, reading back.</li>
+<li><a href="#arrays">Arrays</a>: creation, element types, casts, elementwise math, shapes, broadcasting, reading back.</li>
 <li><a href="#lazy-evaluation-and-fusion">Lazy evaluation and fusion</a>: when kernels run, <code>eval</code>, <code>flush</code>, <code>sync</code>, <code>cache</code>.</li>
+<li><a href="#matrices-statistics-and-grouping">Matrices, statistics and grouping</a>: <code>matmul</code>, axis statistics, scatter-add, histograms, sort, group-by, quantiles.</li>
 <li><a href="#worked-examples">Worked examples</a>: heat equation, Euler solver, ML-KEM, CPA.</li>
 <li><a href="#environment-variables">Environment variables</a> and the <a href="#faq-and-troubleshooting">FAQ</a> when something does not behave.</li>
 </ul>
@@ -273,20 +275,119 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 </thead>
 <tbody>
 <tr><td><code>f32</code></td><td>the default float; every operation</td></tr>
-<tr><td><code>u32</code></td><td>indices, masks, <a href="#integer-and-bit-operations">bit operations</a> (comparisons return <code>Array&lt;u32&gt;</code>, <code>0</code> or <code>1</code>)</td></tr>
+<tr><td><code>u32</code></td><td>indices, counters, <a href="#integer-and-bit-operations">bit operations</a></td></tr>
+<tr><td><code>i32</code></td><td>signed integers, <a href="#signed-integers-and-casts">casts</a></td></tr>
+<tr><td><code>bool</code></td><td>the result of comparisons: a boolean per element (<a href="#comparisons-booleans-and-select">booleans</a>)</td></tr>
 <tr><td><code>Df32</code></td><td>double-float, about 48 bits of mantissa, runs on every device (<a href="#precision-1">Precision</a>)</td></tr>
 <tr><td><code>f64</code></td><td>64-bit float, only on devices with <code>SHADER_F64</code></td></tr>
 </tbody>
 </table>
 </div>
 <p><code>vec2</code> / <code>vec4</code> element types exist for custom kernels, and <a href="#records">records</a> group several
-arrays behind one struct. Convert between float types with <code>to_f64</code>, <code>to_df32</code> and <code>to_f32</code>:</p>
+arrays behind one struct. The built-in operations exist for <code>f32</code>, <code>u32</code>, <code>i32</code>, <code>Df32</code> and <code>f64</code>
+(the <em>scalar</em> types); what each type supports is listed in the chapters named in the table.</p>
+<h3 id="booleans"><a class="header" href="#booleans">Booleans</a></h3>
+<p><code>bool</code> is an element type: comparisons and <code>is_nan</code> / <code>is_finite</code> / <code>is_inf</code> produce <code>Array&lt;bool&gt;</code>,
+and <code>from_slice</code>, <code>to_vec</code>, <code>item</code>, <code>full(true)</code> and <code>write</code> use plain <code>bool</code>s. On the GPU a
+<code>bool</code> takes one bit: an array of <code>n</code> booleans is <code>ceil(n / 32)</code> <code>u32</code> words on the GPU, which
+is what a <a href="#custom-kernels">custom kernel</a> sees (<code>array&lt;u32&gt;</code>, <a href="#custom-kernels">how to read a bit</a>),
+so a comparison written to memory is 32 times smaller than a <code>u32</code> array, and <code>count()</code>, <code>any()</code>
+and <code>all()</code> of an evaluated array read a word per 32 elements. Whole-array results
+(comparisons, <code>&amp;</code>, <code>|</code>, <code>!</code>, <code>select</code> of booleans) are packed by the workgroup and cost no more
+than a <code>u32</code> store, and so does <code>assign</code> into a slice of a boolean array whose rows are runs of
+64 or more consecutive elements (the words inside a run are written as they are, and only the
+two words at the ends of a run, which it may share with elements the write leaves alone, change
+by atomic operations). Writes that cannot be built from runs (<code>put</code>, <code>stack</code>, a transposed slice,
+short rows) set and clear one bit at a time with atomic operations, about three times slower than
+the same write into a <code>u32</code> array. A flag array that a loop updates mostly by <code>put</code> is better kept
+as an <code>Array&lt;u32&gt;</code> (<code>.to_u32()</code> once, <code>put</code> 0s and 1s into it): <code>select</code> and <code>sum_where</code> accept
+<code>u32</code> conditions (non-zero is true), so nothing else changes. Booleans have no generators
+(<code>range</code>, <code>uniform</code>): they combine with <code>&amp; | ^ !</code>
+(also with a single <code>bool</code>), count with <code>count()</code>, steer <code>select</code>, promote to numbers in <code>+</code>, <code>-</code>
+and <code>*</code> as in NumPy (<code>mask * &amp;x</code> is <code>x</code> where true, 0 elsewhere), and convert with <code>to_u32()</code> /
+<code>to_i32()</code> / <code>to_f32()</code> (<a href="#comparisons-booleans-and-select">Comparisons, booleans and <code>select</code></a>).
+<code>sum()</code> of a boolean array is the count, a <code>u32</code> array.</p>
+<pre><code class="language-rust">use luma::*;
+
+let m = Array::from_slice(&amp;[true, false, true], 3)?;
+assert_eq!(m.to_vec()?, vec![true, false, true]);
+assert_eq!(m.count().item()?, 2);                       // a `u32`
+assert!(m.any().item()?);
+assert!(!m.all().item()?);
+assert_eq!(m.to_f32().to_vec()?, vec![1.0, 0.0, 1.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="casts"><a class="header" href="#casts">Casts</a></h3>
+<p>Casts are methods named for the type they produce. They are lazy and fuse like any elementwise
+operation.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>From</th><th>Methods</th><th>Rule</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f32</code></td><td><code>to_u32</code>, <code>to_i32</code></td><td>truncates toward zero, saturates, NaN becomes 0 (<a href="#signed-integers-and-casts">values</a>)</td></tr>
+<tr><td><code>u32</code></td><td><code>to_f32</code>, <code>to_i32</code></td><td><code>to_f32</code> rounds above 2^24; <code>to_i32</code> reinterprets the bits</td></tr>
+<tr><td><code>i32</code></td><td><code>to_f32</code>, <code>to_u32</code></td><td><code>to_f32</code> rounds above 2^24; <code>to_u32</code> reinterprets the bits</td></tr>
+<tr><td><code>bool</code></td><td><code>to_u32</code>, <code>to_i32</code>, <code>to_f32</code>, <code>to_f64</code>, <code>to_df32</code></td><td>1 where true, 0 where false</td></tr>
+<tr><td><code>f32</code></td><td><code>to_f64</code>, <code>to_df32</code></td><td>exact (<code>to_f64</code> needs <code>SHADER_F64</code>)</td></tr>
+<tr><td><code>f64</code>, <code>Df32</code></td><td><code>to_f32</code>, <code>to_df32</code> / <code>to_f64</code></td><td>rounds to <code>f32</code>; <code>f64</code> to <code>Df32</code> is exact to 48 bits</td></tr>
+</tbody>
+</table>
+</div>
+<p>There is no cast to <code>bool</code>: write a comparison (<code>x.ne(0u32)</code>). A cast pair not in the table does
+not exist, so a type mix-up is a compile error rather than a silent conversion.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
 let d = x.to_df32();                  // exact, `lo` is zero
 let back = (&amp;d / &amp;d).to_f32();
 assert_eq!(back.to_vec()?, vec![1.0, 1.0, 1.0]);
+
+let k = Array::from_slice(&amp;[0u32, 1, 2], 3)?;
+assert_eq!((&amp;x * k.to_f32()).to_vec()?, vec![0.0, 2.0, 6.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="elementwise-operations"><a class="header" href="#elementwise-operations">Elementwise operations</a></h2>
+<p>Operators <code>+ - * /</code> (and <code>%</code> on integers, unary <code>-</code> on floats and <code>i32</code>) take references or
+values, arrays or scalars, and exist in compound forms (<code>+=</code>). Methods cover the rest; they are all
+lazy and fuse:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>Methods</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>abs</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>; <code>powf(exponent)</code>, <code>clamp(lo, hi)</code> (host scalars); <code>atan2(x)</code>, <code>hypot(other)</code>, <code>copysign(sign)</code> (array or scalar)</td></tr>
+<tr><td><code>f64</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code></td></tr>
+<tr><td><code>Df32</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code> (<a href="#precision-1">Precision</a>)</td></tr>
+<tr><td><code>i32</code></td><td><code>abs</code>, <code>sign</code>, <code>shl</code>, <code>shr</code> (<a href="#signed-integers-and-casts">Signed integers</a>)</td></tr>
+<tr><td><code>u32</code></td><td>bit operations, <code>shl</code>, <code>shr</code>, <code>rotate_left</code>, <code>rotate_right</code> (<a href="#integer-and-bit-operations">Integers</a>)</td></tr>
+<tr><td>every scalar type</td><td><code>minimum(rhs)</code>, <code>maximum(rhs)</code>, <code>lt</code> <code>le</code> <code>gt</code> <code>ge</code> <code>eq</code> <code>ne</code> (booleans), <code>select(&amp;cond, a, b)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>atan2(x)</code> is <code>atan2(self, x)</code> with <code>self</code> the <code>y</code>. The right-hand side of <code>minimum</code>, the comparisons and the
+<code>try_</code> methods is an <code>Operand</code>: an array or reference to one (equal shapes, or extents of 1 that
+broadcast), a host value, or a <a href="#scalars-that-change"><code>Scalar</code></a> handle.</p>
+<pre><code class="language-rust">use luma::*;
+
+let y = Array::from_slice(&amp;[1.0f32, -1.0, 0.0], 3)?;
+assert_eq!(y.abs().sqrt().to_vec()?, vec![1.0, 1.0, 0.0]);
+assert_eq!(y.clamp(-0.5, 0.5).to_vec()?, vec![0.5, -0.5, 0.0]);
+assert_eq!(y.maximum(0.25).to_vec()?, vec![1.0, 0.25, 0.25]);
+assert_eq!(y.hypot(0.0).to_vec()?, vec![1.0, 1.0, 0.0]);
+assert_eq!(Array::from_slice(&amp;[3.0f32], 1)?.copysign(&amp;y.slice(0, 1..2)).to_vec()?, vec![-3.0]);
+assert!(y.powf(2.0).to_vec()?[1].is_nan());                  // a negative base has no real power
+assert!(y.sin().to_vec()?[0] &gt; 0.84 &amp;&amp; (y.atan2(1.0).to_vec()?[0] - std::f32::consts::FRAC_PI_4).abs() &lt; 1e-5);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Operators do not return <code>Result</code>s, so a mistake shows up late. <code>try_add</code>, <code>try_sub</code>, <code>try_mul</code> and
+<code>try_div</code> check at once: they return <code>Err</code> for a shape or context mismatch instead of a poisoned
+array (<a href="#errors">Errors</a>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+let b = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+assert_eq!(a.try_add(&amp;a)?.to_vec()?, vec![2.0, 4.0, 6.0]);
+assert!(a.try_add(&amp;b).is_err());
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="shapes-and-broadcasting"><a class="header" href="#shapes-and-broadcasting">Shapes and broadcasting</a></h2>
 <p>Operators need equal shapes, with two exceptions: a scalar broadcasts, and an extent of 1
@@ -335,6 +436,26 @@ before.read_into(&amp;mut out)?;
 assert_eq!(out, [10.0, 20.0, 30.0]);
 assert_eq!(x.to_vec()?, vec![7.0, 8.0, 9.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="convolution"><a class="header" href="#convolution">Convolution</a></h2>
+<p><code>x.conv1d(&amp;kernel, stride, padding)</code> is a 1-D cross-correlation of an <code>f32</code> array with a kernel
+(the kernel is not flipped), with zero padding on both sides; the output has
+<code>(len - kernel_len + 2 * padding) / stride + 1</code> elements. <code>x.conv1d_fft(&amp;kernel)</code> is the full
+<em>linear convolution</em> (the kernel is flipped), <code>len + kernel_len - 1</code> elements, computed with FFTs:
+use it for long kernels, where it is faster than the direct loop, and expect <code>f32</code> rounding error in
+its result. Both evaluate their operands and fail (poisoned array) for a bad geometry such as a
+kernel longer than the padded input or a zero stride.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0], 5)?;
+let k = Array::from_slice(&amp;[1.0f32, 0.0, -1.0], 3)?;
+assert_eq!(x.conv1d(&amp;k, 1, 0).to_vec()?, vec![-2.0, -2.0, -2.0]);       // x[i] - x[i + 2]
+assert_eq!(x.conv1d(&amp;k, 2, 0).to_vec()?, vec![-2.0, -2.0]);
+assert_eq!(x.conv1d(&amp;k, 1, 1).to_vec()?, vec![-2.0, -2.0, -2.0, -2.0, 4.0]);
+
+let full = x.conv1d_fft(&amp;k).to_vec()?;                                  // k is flipped
+let want = [1.0f32, 2.0, 2.0, 2.0, 2.0, -4.0, -5.0];
+assert!(full.iter().zip(want).all(|(a, b)| (a - b).abs() &lt; 1e-4));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
 <p>Operators return arrays, not <code>Result</code>s, so expressions stay readable. A failing operation (a shape
 mismatch, a slice out of range) returns a poisoned array; everything built from it is poisoned
@@ -376,6 +497,25 @@ x += 1.0;            // in-place, fused too; y is computed first, so it keeps th
 assert_eq!(y.to_vec()?, vec![10.0, 20.0]);
 assert_eq!(x.to_vec()?, vec![2.0, 3.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="scalars-that-change"><a class="header" href="#scalars-that-change">Scalars that change</a></h2>
+<p>A number in an expression is a uniform of the kernel, not part of it, so <code>&amp;x * 2.0</code> and
+<code>&amp;x * 3.0</code> share one compiled kernel. A <a href="https://docs.rs/luma/latest/luma/struct.Scalar.html"><code>Scalar</code></a>
+is a number you can change between operations: <code>Scalar::new(v)</code>, <code>set(v)</code>, <code>get()</code>. It holds an
+<code>f32</code>, <code>u32</code> or <code>i32</code> and works wherever a plain number does. The value is read when the operation
+is <strong>recorded</strong>: operations recorded before a <code>set</code> keep the old value, also if they run later.
+Clones share the value.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+let s = Scalar::new(2.0f32);
+let a = &amp;x * &amp;s;                 // doubles
+s.set(3.0);
+let b = &amp;x * &amp;s;                 // triples; `a` still doubles
+assert_eq!(a.to_vec()?, vec![2.0, 4.0]);
+assert_eq!(b.to_vec()?, vec![3.0, 6.0]);
+assert_eq!(s.get(), 3.0);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>This is how a loop varies a parameter (a time step, a coefficient) without recompiling.</p>
 <h2 id="when-kernels-run"><a class="header" href="#when-kernels-run">When kernels run</a></h2>
 <p>A kernel runs when one of these happens:</p>
 <div class="table-wrapper">
@@ -417,8 +557,13 @@ epilogue of a <a href="#reductions-and-scans">reduction</a>. A view of a lazy ex
 reader’s index, staged in workgroup memory, or evaluated first, whichever the
 <a href="#the-cost-model">cost model</a> estimates is cheapest (within the caps below: a kernel
 that would exceed <code>LUMA_FUSION_MAX_INLINED</code> is cut whatever the model says).</p>
-<p>Not fused, because they need whole-array structure: <code>scan</code>, <code>sum_axis</code>, tridiagonal solves, FFT
-convolution, and your own kernels. They read the arrays they are given, which are computed first.</p>
+<p>Not fused, because they need whole-array structure: <code>scan</code>, tridiagonal solves, FFT convolution,
+and your own kernels. They read the arrays they are given, which are computed first.
+<code>matmul</code>, the axis reductions (<code>sum_axis</code>, <code>reduce_axis</code>, …), the scatters (<code>put_add</code>, …) and
+the sorts are kernels of their own too, but they compute a pending operand <em>inside</em> their loads
+instead of storing it, and <code>matmul</code>, the axis reductions and the sorts are eager: the result is
+evaluated when the call returns, so what reads it is another kernel
+(<a href="#primitives-that-read-an-expression">Performance guide</a>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
 <code>LUMA_FUSION_MAX_LIVE</code>, <code>LUMA_FUSION_MAX_INLINED</code>) or when evaluating a shared piece first is
 cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits"><code>Profile::splits</code></a> tells you where
@@ -650,6 +795,10 @@ assert_eq!(a.to_vec()?, vec![2.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
 a.put(&amp;idx, 9.0)?;
 assert_eq!(a.to_vec()?, vec![9.0, 0.0, 0.0, 0.0, 9.0, 0.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>put</code> overwrites: with equal indices one write wins. To accumulate instead, <code>put_add</code>, <code>put_min</code>
+and <code>put_max</code> (<code>u32</code>, <code>i32</code> and <code>f32</code> arrays) combine every value that lands on a cell, with the
+same index rules (<a href="#accumulating-scatters">Accumulating scatters</a>); <code>bincount</code> and the <code>group_*</code>
+methods are built on them.</p>
 <p><code>take</code> and <code>put</code> are the gather and scatter pair; the <a href="#lookup-tables-with-take">integer chapter</a>
 uses <code>take</code> for table lookups, and the ML-KEM example uses <code>put</code> for rejection sampling.</p>
 <h2 id="what-fuses-1"><a class="header" href="#what-fuses-1">What fuses</a></h2>
@@ -669,8 +818,10 @@ kernel.</li>
 more computation costs less than storing it and reading it back, or staged; otherwise it is
 evaluated first.</li>
 </ul>
-<p>What does not fuse: <code>scan</code> and axis reductions (<a href="#reductions-and-scans">Reductions</a>), and custom kernels,
-which see the arrays computed.</p>
+<p>What does not fuse: <code>scan</code> (it reads its operand twice, so the operand is computed first) and custom
+kernels, which see the arrays computed. The operands of <code>matmul</code>, of axis reductions and of
+<code>put_add</code> / <code>put_min</code> / <code>put_max</code> are read inside their own kernels
+(<a href="#what-fuses-and-what-cuts">Performance guide</a>).</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="reductions-and-scans"><a class="header" href="#reductions-and-scans">Reductions and scans</a></h1>
 <p>A reduction turns an array into fewer numbers: a sum, a minimum, a norm. In Luma a reduction
@@ -705,7 +856,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 <tr><td><code>sum()</code>, <code>min()</code>, <code>max()</code></td><td>any element type; <code>u32</code> sums wrap around</td></tr>
 <tr><td><code>mean()</code>, <code>norm()</code></td><td><code>f32</code>; the norm is the Euclidean (L2) norm</td></tr>
 <tr><td><code>reduce([Reduction; N])</code></td><td><code>N</code> of <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>SumOfSquares</code> (one to four) in one pass, as an <code>N</code>-element array</td></tr>
-<tr><td><code>sum_where(&amp;mask)</code></td><td>the sum of the elements where a <code>u32</code> mask is non-zero, in one pass</td></tr>
+<tr><td><code>sum_where(&amp;cond)</code></td><td>the sum of the elements where a <code>bool</code> (or non-zero <code>u32</code>) condition is true, in one pass</td></tr>
 <tr><td><code>item()</code></td><td>the value of a one-element array</td></tr>
 <tr><td><code>to_array::&lt;N&gt;()</code></td><td>the values of an <code>N</code>-element array</td></tr>
 </tbody>
@@ -764,15 +915,19 @@ assert!((softmax.sum().item()? - 1.0).abs() &lt; 1e-6);
 <p>A reduction needs every element before any output exists, so the kernel that divides by the sum
 runs after the kernel that computes it: the example above is a few launches, not one. The values
 are the ones a host loop would give.</p>
-<h3 id="masks"><a class="header" href="#masks">Masks</a></h3>
-<p><code>sum_where(&amp;mask)</code> sums where a <code>u32</code> mask is non-zero (comparisons return such masks), the
-count of a condition is the sum of the mask itself:</p>
+<h3 id="booleans-1"><a class="header" href="#booleans-1">Booleans</a></h3>
+<p><code>sum_where(&amp;cond)</code> sums where a condition (an <code>Array&lt;bool&gt;</code>, such as a comparison, or a <code>u32</code> array of
+non-zero elements) is true; the <code>sum()</code> of a boolean array is the number of true elements, as a <code>u32</code>
+array (also <code>count()</code>, as in NumPy). <code>any()</code> and <code>all()</code> are one-element <code>bool</code> arrays, and <code>bool</code>
+arrays have <code>min</code> / <code>max</code> but no <code>mean</code>, <code>norm</code> or <code>reduce</code>:</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, -4.0], 4)?;
 let positive = x.gt(0.0);
 assert_eq!(x.sum_where(&amp;positive).item()?, 4.0);
+assert_eq!(positive.count().item()?, 2);
 assert_eq!(positive.sum().item()?, 2);
+assert!(positive.any().item()?);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h3 id="vector-elements"><a class="header" href="#vector-elements">Vector elements</a></h3>
 <p>Arrays of <code>[f32; 2]</code> and <code>[f32; 4]</code> reduce per component, and these reductions return host
@@ -785,7 +940,11 @@ assert_eq!(v.max()?, [3.0, 30.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="along-an-axis"><a class="header" href="#along-an-axis">Along an axis</a></h2>
 <p><code>sum_axis</code>, <code>min_axis</code> and <code>max_axis</code> reduce along one axis and leave extent 1 there. The result
-broadcasts back against the array:</p>
+broadcasts back against the array. They are available for <code>f32</code>, <code>u32</code> and <code>i32</code> arrays. A
+pending operand is not evaluated first: its expression is computed inside the first pass of the
+reduction, so <code>(&amp;x * &amp;y).sum_axis(1)</code> never stores the product. <code>reduce_axis</code>, <code>mean_axis</code>,
+<code>var_axis</code> and <code>std_axis</code> are in <a href="#statistics-along-an-axis">Matrices, statistics and
+grouping</a>.</p>
 <pre><code class="language-rust">use luma::*;
 
 // Two columns of three (the first dimension varies fastest).
@@ -808,9 +967,15 @@ assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec()?, vec![3.0, 3.0, 4.0, 4.0, 5.
 <p><code>op</code> is called once with placeholders and compiled into the scan kernels, so it must be an
 elementwise expression of its two arguments and scalars (scalars it captures are uniforms:
 changing them does not recompile); anything else poisons the result. Non-associative operators
-give unspecified results, because the kernels regroup operands. Scans and axis reductions do not
-fuse into the expression behind them: the arrays are evaluated first. They are available for
-<code>f32</code> and <code>u32</code> arrays only (<code>f64</code> and <code>Df32</code> fail with <code>Unsupported</code>).</p>
+give unspecified results, because the kernels regroup operands. Scans do not fuse into the
+expression behind them: the array is evaluated first (it is read twice). Scans and axis
+reductions are available for <code>f32</code>, <code>u32</code> and <code>i32</code> arrays (<code>f64</code> and <code>Df32</code> fail with
+<code>Unsupported</code>); <code>bool</code> arrays have <code>sum_axis</code> and <code>cumsum</code> that count (<code>u32</code> results) and
+<code>min_axis</code> / <code>max_axis</code>, but no <code>scan</code> or <code>reduce_axis</code>.</p>
+<h2 id="sorting-groups-unique-values-and-quantiles"><a class="header" href="#sorting-groups-unique-values-and-quantiles">Sorting, groups, unique values and quantiles</a></h2>
+<p><code>sort</code>, <code>argsort</code>, <code>group_sum</code> and the other group reductions, <code>factorize</code> / <code>unique</code>, <code>histogram</code>
+and <code>quantile</code> / <code>median</code> have their own chapter: <a href="#matrices-statistics-and-grouping">Matrices, statistics and
+grouping</a>.</p>
 <h2 id="precision"><a class="header" href="#precision">Precision</a></h2>
 <p>Float reductions run in the element type of the array. For more accuracy, reduce in a wider
 type:</p>
@@ -829,6 +994,254 @@ assert!((x.to_df32().sum().item()?.to_f64() - exact).abs() &lt; 1e-6);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>The <a href="#precision-1">Precision</a> chapter has the details of <code>Df32</code> and <code>f64</code>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="matrices-statistics-and-grouping"><a class="header" href="#matrices-statistics-and-grouping">Matrices, statistics and grouping</a></h1>
+<p>The operations of this chapter are what table and matrix workloads are made of: products,
+statistics along an axis, counting and grouping, sorting, unique values and quantiles. They
+compose with everything in the earlier chapters: operands that are lazy expressions are computed
+inside the kernels instead of being stored first, wherever the section says so.</p>
+<p>Remember the shape convention: <strong>axis 0 varies fastest</strong>. A <code>[rows, columns]</code> array in the
+NumPy sense is a luma array of shape <code>[columns, rows]</code>, and a table with one <em>column per
+feature</em> is naturally <code>[samples, features]</code>, so that each feature is contiguous and reductions
+over the samples are <code>axis</code> 0.</p>
+<h2 id="matrix-products"><a class="header" href="#matrix-products">Matrix products</a></h2>
+<p><code>a.matmul(&amp;b)</code> (or <code>matmul(&amp;a, &amp;b)</code>) multiplies two <code>f32</code> matrices. NumPy’s <code>a @ b</code> with <code>a</code> of
+shape <code>(M, K)</code> and <code>b</code> of shape <code>(K, N)</code> becomes, with the axes reversed:</p>
+<ul>
+<li><code>a</code> has shape <code>[K, M]</code>,</li>
+<li><code>b</code> has shape <code>[N, K]</code>,</li>
+<li>the result has shape <code>[N, M]</code>, element <code>(n, m)</code> being <code>Σ_k a[k, m] * b[n, k]</code>.</li>
+</ul>
+<p>Written out as flat data, each matrix is listed row by row, which is exactly what row-major
+NumPy data looks like:</p>
+<pre><code class="language-rust">use luma::*;
+
+// [[1, 2, 3],      [[1, 0],        [[4,  5],
+//  [4, 5, 6]]  @    [0, 1],    =    [10, 11]]
+//                   [1, 1]]
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?; // K = 3, M = 2
+let b = Array::from_slice(&amp;[1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0], [2, 3])?; // N = 2, K = 3
+let c = a.matmul(&amp;b);
+assert_eq!(c.shape(), Shape::from([2, 2]));
+assert_eq!(c.to_vec()?, vec![4.0, 5.0, 10.0, 11.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>One-dimensional operands count as having extent 1 on axis 1; extents beyond axis 1 must be 1.
+<code>transpose()</code> is a view that the kernel reads in place, so products with transposed operands cost
+no copy:</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?;
+// `a` is [[1, 2, 3], [4, 5, 6]]; a @ a.T is 2 x 2, a.T @ a is 3 x 3.
+let rows = a.matmul(&amp;a.transpose());
+assert_eq!(rows.to_vec()?, vec![14.0, 32.0, 32.0, 77.0]);
+let cols = a.transpose().matmul(&amp;a);
+assert_eq!(cols.shape(), Shape::from([3, 3]));
+assert_eq!(cols.to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 45.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>An operand that is a pending expression is not stored first: its expression is evaluated inside
+the product’s loads, once per use. A standardised Gram (correlation-style) matrix of a table with
+one column per feature (<code>[samples, features]</code>) is one launch plus the statistics:</p>
+<pre><code class="language-rust">use luma::*;
+
+let samples = 8;
+let x = Array::from_slice(
+    &amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, // feature 0
+      2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, // feature 1 = 2 * feature 0
+      8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0], // feature 2 = 9 - feature 0
+    [samples, 3],
+)?;
+let z = (&amp;x - &amp;x.mean_axis(0)) / x.std_axis(0); // pending: standardised columns
+// features x samples times samples x features: the Gram matrix of the columns.
+let corr = z.matmul(&amp;z.transpose()) / (samples as f32);
+let corr = corr.to_vec()?;
+let expected = [1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0];
+for (got, want) in corr.iter().zip(expected) {
+    assert!((got - want).abs() &lt; 1e-4);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The product itself is <em>eager</em>: it is recorded when <code>matmul</code> is called and the result is an
+evaluated array, so whatever consumes the result (here the division) runs as its own kernel.
+Operands whose expressions read circular shifts are evaluated first; everything else fuses.</p>
+<p>Errors poison the result like everywhere else: <code>ShapeMismatch</code> if <code>a.shape()[0] != b.shape()[1]</code> or an operand has more than two axes above 1, <code>ContextMismatch</code> for operands of
+different contexts, and <code>Chunked</code> for operands or results that need more than one buffer.
+Only <code>f32</code> has a product.</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::&lt;f32&gt;::zeros([3, 2])?;
+let b = Array::&lt;f32&gt;::zeros([3, 2])?; // needs shape [N, 3]
+assert!(matches!(a.matmul(&amp;b).to_vec(), Err(LumaError::Op { .. })));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="statistics-along-an-axis"><a class="header" href="#statistics-along-an-axis">Statistics along an axis</a></h2>
+<p><code>reduce_axis(axis, [ops])</code> computes one to four reductions (<code>Reduction::Sum</code>, <code>Min</code>, <code>Max</code>,
+<code>SumOfSquares</code>) along an axis in <strong>one pass</strong>: every element is read once for all of them. It
+returns an array of results, one per op, each with extent 1 along <code>axis</code>. A pending operand is
+computed inside the pass and never stored.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two columns of four; reduce along axis 0.
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 10.0, 20.0], [4, 2])?;
+let [sum, sum_sq, max] = x.reduce_axis(0, [Reduction::Sum, Reduction::SumOfSquares, Reduction::Max]);
+assert_eq!(sum.to_vec()?, vec![10.0, 60.0]);
+assert_eq!(sum_sq.to_vec()?, vec![30.0, 1000.0]);
+assert_eq!(max.to_vec()?, vec![4.0, 20.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The results are evaluated when the call returns. Another number of ops poisons the results.
+<code>sum_axis</code>, <code>min_axis</code> and <code>max_axis</code> are the single-op cases. They (and <code>reduce_axis</code>) work on
+<code>f32</code>, <code>u32</code> and <code>i32</code> (<code>SumOfSquares</code> of integers wraps); <code>bool</code> arrays have <code>sum_axis</code> (a
+count, <code>u32</code>), <code>min_axis</code> and <code>max_axis</code> only.</p>
+<p>For <code>f32</code>, <code>mean_axis</code>, <code>var_axis</code> and <code>std_axis</code> give the mean, the <strong>population</strong> variance
+(divisor <code>n</code>, NumPy’s <code>ddof = 0</code>) and its square root. They are lazy expressions on top of the
+reductions, so they broadcast back against the array. <code>var_axis</code> is two-pass (the mean, then the
+mean of squared deviations), which keeps it accurate for data far from zero:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 10.0, 20.0], [4, 2])?;
+assert_eq!(x.mean_axis(0).to_vec()?, vec![2.5, 15.0]);
+assert_eq!(x.var_axis(0).to_vec()?, vec![1.25, 25.0]);
+assert_eq!(x.std_axis(0).to_vec()?[1], 5.0);
+
+// Far from zero the two-pass variance is still right.
+let y = Array::from_slice(&amp;[1.0e4f32 + 1.0, 1.0e4 + 2.0, 1.0e4 + 3.0, 1.0e4 + 4.0], 4)?;
+assert!((y.var_axis(0).item()? - 1.25).abs() &lt; 1e-3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="accumulating-scatters"><a class="header" href="#accumulating-scatters">Accumulating scatters</a></h2>
+<p><a href="#views-and-writes"><code>put</code></a> overwrites: of several equal indices one (unspecified) wins. <code>put_add</code>,
+<code>put_min</code> and <code>put_max</code> <em>combine</em> instead: every <code>i</code> does <code>self[indices[i]] += values[i]</code> (or
+<code>min</code>, <code>max</code>), duplicates included. They exist for <code>u32</code>, <code>i32</code> and <code>f32</code> arrays, work in place
+on top of the contents the array already has, skip indices of <code>len</code> or more, and must be called
+on the array itself, not on a view. <code>values</code> is an array of the shape of <code>indices</code> or one value;
+both are computed inside the kernel, not stored first.</p>
+<pre><code class="language-rust">use luma::*;
+
+let mut totals = Array::&lt;u32&gt;::full(4, 100)?;
+let indices = Array::from_slice(&amp;[0u32, 2, 2, 7, 2], 5)?; // 7 is out of range: skipped
+totals.put_add(&amp;indices, &amp;Array::from_slice(&amp;[1u32, 10, 20, 5, 30], 5)?)?;
+assert_eq!(totals.to_vec()?, vec![101, 100, 160, 100]);
+
+let mut lo = Array::&lt;f32&gt;::full(3, f32::INFINITY)?;
+lo.put_min(&amp;Array::from_slice(&amp;[1u32, 1, 2], 3)?, &amp;Array::from_slice(&amp;[4.0f32, 2.0, 9.0], 3)?)?;
+assert_eq!(lo.to_vec()?, vec![f32::INFINITY, 2.0, 9.0]);
+
+let mut hi = Array::&lt;i32&gt;::full(2, i32::MIN)?;
+hi.put_max(&amp;Array::from_slice(&amp;[0u32, 0, 1], 3)?, -3)?;
+assert_eq!(hi.to_vec()?, vec![-3, -3]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Integer sums wrap and are exact. <code>f32</code> sums are accumulated atomically in no fixed order, so
+their last bits can differ between runs (and from a host loop); <code>min</code> and <code>max</code> do not depend
+on the order. The scatters are atomic, so a million values into a few cells is fine.</p>
+<h2 id="counting-and-histograms"><a class="header" href="#counting-and-histograms">Counting and histograms</a></h2>
+<p><code>bincount(&amp;indices, bins)</code> is the number of occurrences of each value in <code>0..bins</code>, as a <code>u32</code>
+array; values of <code>bins</code> or more are not counted. <code>histogram(bins, lo, hi)</code> counts the elements
+of an <code>f32</code> array in <code>bins</code> equal-width bins over <code>[lo, hi)</code>. Values below <code>lo</code> and NaN go to
+bin 0, values of <code>hi</code> or more to the last bin. The bin computation runs inside the scatter
+kernel, so a pending array is not stored. <code>bins == 0</code> or <code>hi &lt;= lo</code> (or NaN bounds) poison the
+result with <code>InvalidShape</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+let codes = Array::from_slice(&amp;[2u32, 0, 2, 2, 5, 9], 6)?;
+assert_eq!(bincount(&amp;codes, 4).to_vec()?, vec![1, 0, 3, 0]); // 5 and 9 are not counted
+
+let x = Array::from_slice(&amp;[-5.0f32, 0.5, 1.5, 1.6, 3.9, 4.0, 100.0, f32::NAN], 8)?;
+assert_eq!(x.histogram(4, 0.0, 4.0).to_vec()?, vec![3, 2, 0, 3]);
+assert!(x.histogram(0, 0.0, 4.0).to_vec().is_err());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="sorting"><a class="header" href="#sorting">Sorting</a></h2>
+<p><code>sort</code>, <code>sort_descending</code>, <code>argsort</code>, <code>argsort_descending</code> and <code>sort_axis(axis)</code> order <code>u32</code>,
+<code>i32</code> and <code>f32</code> arrays with a stable radix sort on the GPU (<code>f64</code> and <code>Df32</code> fail with
+<code>Unsupported</code>; arrays over several buffers with <code>Chunked</code>). <code>sort</code> and <code>argsort</code> work on the flat
+array and keep its shape. <code>argsort</code> returns the flat indices that sort the array, and since the
+sort is stable, equal elements keep their input order. The results are recorded like any other
+operation, and a pending input is not evaluated first: the keys are computed inside the first
+pass of the sort.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3.0f32, -1.0, f32::NAN, 2.0, -1.0, 0.5], [3, 2])?;
+assert_eq!(x.argsort().to_vec()?, vec![1, 4, 5, 3, 0, 2]);
+// Sorts every line along axis 0 (the first dimension varies fastest).
+let lines = x.sort_axis(0).to_vec()?;
+assert_eq!(&amp;lines[..2], &amp;[-1.0, 3.0]);
+assert!(lines[2].is_nan());
+assert_eq!(&amp;lines[3..], &amp;[-1.0, 0.5, 2.0]);
+
+let n = Array::from_slice(&amp;[2u32, 7, 2, 9], 4)?;
+assert_eq!(n.sort().to_vec()?, vec![2, 2, 7, 9]);
+assert_eq!(n.sort_descending().to_vec()?, vec![9, 7, 2, 2]);
+// Descending is the exact reverse by key: the tied 2s still keep their input order.
+assert_eq!(n.argsort_descending().to_vec()?, vec![3, 1, 0, 2]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Floats sort in the total order of their bits: <code>-inf &lt; .. &lt; -0.0 &lt; +0.0 &lt; .. &lt; +inf &lt; NaN</code>, so
+NaNs come last (first when descending) and <code>-0.0</code> sorts before <code>+0.0</code> (and <code>+0.0</code> before
+<code>-0.0</code> when descending, by input order for ties). The sign of a NaN is not kept.
+<code>sort_axis(axis)</code> sorts every line along <code>axis</code> independently, stably, and keeps the shape.</p>
+<h2 id="groups"><a class="header" href="#groups">Groups</a></h2>
+<p><code>group_sum</code>, <code>group_min</code>, <code>group_max</code>, <code>group_mean</code> and <code>group_count</code> reduce the elements that
+share a code, a groupby over dense codes <code>0..groups</code>: result element <code>g</code> combines the elements
+<code>i</code> with <code>codes[i] == g</code>. <code>codes</code> is a <code>u32</code> array of the shape of the values (else
+<code>ShapeMismatch</code>), and codes of <code>groups</code> or more are skipped. The values (<code>u32</code>, <code>i32</code> or <code>f32</code>;
+<code>group_mean</code> is <code>f32</code> only) and the codes fuse into one scatter kernel; <code>f32</code> sums are not
+bitwise reproducible (see above).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0], 5)?;
+let codes = Array::from_slice(&amp;[0u32, 1, 0, 1, 3], 5)?; // group 2 is empty
+assert_eq!(x.group_sum(&amp;codes, 4).to_vec()?, vec![4.0, 6.0, 0.0, 5.0]);
+assert_eq!(x.group_count(&amp;codes, 4).to_vec()?, vec![2, 2, 0, 1]);
+assert_eq!(x.group_min(&amp;codes, 4).to_vec()?, vec![1.0, 2.0, f32::INFINITY, 5.0]);
+assert_eq!(x.group_max(&amp;codes, 4).to_vec()?, vec![3.0, 4.0, f32::NEG_INFINITY, 5.0]);
+let mean = x.group_mean(&amp;codes, 4).to_vec()?;
+assert_eq!(&amp;mean[..2], &amp;[2.0, 3.0]);
+assert!(mean[2].is_nan());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Empty groups give 0 for sums and counts, NaN for means and the identity of the operation for
+<code>group_min</code> / <code>group_max</code>: <code>+inf</code> / <code>-inf</code> for <code>f32</code>, the integer maximum / minimum for <code>u32</code>
+and <code>i32</code> (<code>u32::MAX</code> / <code>0</code>, <code>i32::MAX</code> / <code>i32::MIN</code>).</p>
+<p>Where the groups are labels rather than <code>0..groups</code>, <code>factorize</code> (next section) makes the codes.</p>
+<h2 id="unique-values"><a class="header" href="#unique-values">Unique values</a></h2>
+<p><code>factorize()</code> returns the sorted distinct values of an array (flat, one dimension) and, shaped
+like the array, the index of each element’s value in them: <code>uniques.take(&amp;codes)</code> is the array
+again. <code>unique()</code> is the first result alone. Both evaluate the array and read back the number of
+distinct values, which synchronises once. For floats all NaNs are one value (the last) and <code>-0.0</code>
+and <code>+0.0</code> are one value, returned as <code>-0.0</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+let labels = Array::from_slice(&amp;[50u32, 30, 50, 90, 30], 5)?;
+let (uniques, codes) = labels.factorize();
+assert_eq!(uniques.to_vec()?, vec![30, 50, 90]);
+assert_eq!(codes.to_vec()?, vec![1, 0, 1, 2, 0]);
+assert_eq!(uniques.take(&amp;codes).to_vec()?, vec![50, 30, 50, 90, 30]);
+// The codes feed the group reductions.
+let amount = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0], 5)?;
+assert_eq!(amount.group_sum(&amp;codes, uniques.len()).to_vec()?, vec![7.0, 4.0, 4.0]);
+
+let f = Array::from_slice(&amp;[0.0f32, -0.0, f32::NAN, 1.0, f32::NAN], 5)?;
+let u = f.unique().to_vec()?;
+assert_eq!(u.len(), 3);
+assert!(u[0] == 0.0 &amp;&amp; u[0].is_sign_negative());
+assert_eq!(u[1], 1.0);
+assert!(u[2].is_nan());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="quantiles"><a class="header" href="#quantiles">Quantiles</a></h2>
+<p><code>quantile(q)</code> and <code>median()</code> of an <code>f32</code> array give a one-element array, interpolating linearly
+between the sorted neighbours as NumPy’s default does: with <code>h = q * (len - 1)</code> the value at
+<code>floor(h)</code> plus <code>h - floor(h)</code> times the step to the value at <code>ceil(h)</code>. <code>quantile_axis(axis, q)</code>
+and <code>median_axis(axis)</code> do it for every line along an axis (extent 1 there in the result). <code>q</code>
+outside <code>[0, 1]</code> (NaN included) poisons the result with <code>InvalidShape</code>. The sort is evaluated,
+the interpolation is lazy.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[4.0f32, 1.0, 3.0, 2.0], 4)?;
+assert_eq!(x.median().item()?, 2.5);
+assert_eq!(x.quantile(0.0).item()?, 1.0);
+assert_eq!(x.quantile(0.25).item()?, 1.75);
+assert_eq!(x.quantile(1.0).item()?, 4.0);
+assert!(x.quantile(1.5).item().is_err());
+
+// Two columns of four: the median of each.
+let t = Array::from_slice(&amp;[4.0f32, 1.0, 3.0, 2.0, 10.0, 50.0, 30.0, 20.0], [4, 2])?;
+assert_eq!(t.median_axis(0).to_vec()?, vec![2.5, 25.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>NaNs sort last, so they only affect the high quantiles; NumPy returns NaN for every quantile of
+an array with a NaN, this does not.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="records"><a class="header" href="#records">Records</a></h1>
 <p>A flow solver has four fields per cell, a Monte Carlo step has a position and a velocity, a hash
 has fifty words of state. You can keep them in separate variables, but then every view, padding,
@@ -845,7 +1258,7 @@ trait:</p>
 <li>a tuple of up to six records <code>(A, B, ..)</code>,</li>
 <li>a struct declared with <code>luma::fields!</code>.</li>
 </ul>
-<p>All the arrays of a record have the same element type (<code>f32</code>, <code>Df32</code>, <code>f64</code> or <code>u32</code>) and the same
+<p>All the arrays of a record have the same element type (<code>f32</code>, <code>Df32</code>, <code>f64</code>, <code>u32</code> or <code>i32</code>) and the same
 shape. <code>Fields::Elem</code> is that type.</p>
 <pre><code class="language-rust">use luma::*;
 
@@ -931,7 +1344,7 @@ element type is a compile error. Nested records count every array (<code>COUNT</
 <tr><td>operators</td><td><code>+ - * /</code> between records, with an element value (<code>f32</code> for an <code>f32</code> record) and with an <code>Array&lt;Elem&gt;</code>, any reference/owned combination, the scalar or array on either side; <code>+= -= *= /=</code> with <code>&amp;Record</code>, a value and <code>&amp;Array</code>; unary <code>-</code> on <code>&amp;Record</code> and <code>Record</code> (not <code>u32</code>)</td></tr>
 <tr><td>views</td><td><code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>shift</code>, <code>shift_fill</code>, <code>shift_clamp</code>, <code>shift_mirror</code>, <code>take</code>, <code>broadcast_to</code>, <code>copy</code></td></tr>
 <tr><td>writes</td><td><code>slice_mut</code>, <code>flip_mut</code>, <code>transpose_mut</code> (a <a href="#views-that-write"><code>ViewMut</code></a> of the record), <code>assign</code>, <code>put</code></td></tr>
-<tr><td>helpers</td><td><code>map(f)</code>, <code>zip(&amp;other, f)</code>, <code>dot(&amp;other)</code>, <code>Fields::select(&amp;mask, &amp;a, &amp;b)</code>, <code>arrays()</code>, <code>eval()</code>, <code>cache()</code></td></tr>
+<tr><td>helpers</td><td><code>map(f)</code>, <code>zip(&amp;other, f)</code>, <code>dot(&amp;other)</code>, <code>Fields::select(&amp;cond, &amp;a, &amp;b)</code>, <code>arrays()</code>, <code>eval()</code>, <code>cache()</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -1044,7 +1457,7 @@ on the GPU:</p>
 </thead>
 <tbody>
 <tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate"><code>Array::iterate</code></a></td><td><code>steps</code> applications of a step on one <code>f32</code> array; stencils run time-blocked</td></tr>
-<tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a></td><td><code>steps</code> applications of a step on several arrays of one element type; elementwise <code>f32</code> and <code>u32</code> steps keep the state in registers</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a></td><td><code>steps</code> applications of a step on several arrays of one element type; elementwise <code>f32</code>, <code>u32</code> and <code>i32</code> steps keep the state in registers</td></tr>
 <tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate_until"><code>Array::iterate_until</code></a></td><td>a step until the largest change is below a tolerance</td></tr>
 <tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_until_all.html"><code>iterate_until_all</code></a></td><td>a step on any <a href="#records">record</a> until a rule over recorded scalars holds</td></tr>
 </tbody>
@@ -1103,7 +1516,7 @@ let [z, count] = iterate_all([&amp;zero, &amp;zero], 64, |[z, count]| {
 assert_eq!(count.to_vec()?, vec![64.0, 64.0, 2.0, 3.0]);
 <span class="boring">z.eval()?;
 </span><span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>The states may be <code>u32</code> as well, which makes register loops of integer recurrences, hash rounds
+<p>The states may be <code>u32</code> or <code>i32</code> as well, which makes register loops of integer recurrences, hash rounds
 and counters (see <a href="#integer-and-bit-operations">Integer and bit operations</a>):</p>
 <pre><code class="language-rust">use luma::*;
 
@@ -1256,6 +1669,101 @@ several steps. Values are those of the program as written; a miss only costs the
 work. <code>LUMA_SPECULATE=off</code> disables it (<a href="#environment-variables">Environment variables</a>). If the loop
 only needs a convergence test, <code>iterate_until</code> and <code>iterate_until_all</code> wait once per block of
 steps instead of once per step.</p>
+<h2 id="line-solvers-solve_tridiagonal"><a class="header" href="#line-solvers-solve_tridiagonal">Line solvers: <code>solve_tridiagonal</code></a></h2>
+<p>An implicit time step (diffusion, a pressure correction) solves one tridiagonal system per grid
+line. <code>solve_tridiagonal(axis, &amp;lo, &amp;diag, &amp;up, &amp;rhs)</code> solves
+<code>lo[s] x[s-1] + diag[s] x[s] + up[s] x[s+1] = rhs[s]</code> along <code>axis</code> for every line of four
+<code>f32</code> arrays of one shape (<code>lo</code> at the first and <code>up</code> at the last cell of a line are ignored); the
+result has the shape of <code>rhs</code>. It evaluates the operands and does not wait for the GPU. A zero
+pivot gives <code>Inf</code> / <code>NaN</code> in that line; Luma does not check. A shape or context mismatch poisons
+the result.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two lines of four cells along axis 0 (shape [4, 2]): the matrix tridiag(-1, 2, -1).
+let lo = Array::from_slice(&amp;[0.0f32, -1.0, -1.0, -1.0, 0.0, -1.0, -1.0, -1.0], [4, 2])?;
+let diag = Array::full([4, 2], 2.0f32)?;
+let up = Array::from_slice(&amp;[-1.0f32, -1.0, -1.0, 0.0, -1.0, -1.0, -1.0, 0.0], [4, 2])?;
+let rhs = Array::from_slice(&amp;[1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 5.0], [4, 2])?;
+
+let x = solve_tridiagonal(0, &amp;lo, &amp;diag, &amp;up, &amp;rhs).to_vec()?;
+let want = [1.0f32, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0];
+assert!(x.iter().zip(want).all(|(a, b)| (a - b).abs() &lt; 1e-5));
+
+// `_from`: line `l` starts at cell `start[l]`; the cells before it are 0.
+let start = Array::from_slice(&amp;[0u32, 2], 2)?;
+let y = solve_tridiagonal_from(0, &amp;lo, &amp;diag, &amp;up, &amp;rhs, &amp;start).to_vec()?;
+assert_eq!(&amp;y[4..6], &amp;[0.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>solve_block_tridiagonal(block, axis, &amp;lo, &amp;diag, &amp;up, &amp;rhs)</code> is the same with <code>block x block</code>
+blocks (<code>1 &lt;= block &lt;= 8</code>), for coupled unknowns per cell. <code>rhs</code> has shape <code>[block, g0, g1, g2]</code>; <code>lo</code>, <code>diag</code> and <code>up</code> have
+<code>[block * block, g0, g1, g2]</code>, entry <code>(row, col)</code> of a block at <code>row * block + col</code>; <code>axis</code> is
+<code>1..=3</code>. <code>solve_block_tridiagonal_from</code> takes a <code>start</code> array like the scalar form.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Block 2, three cells along axis 1, diagonal blocks 2 * identity, no coupling: x = rhs / 2.
+let zero = Array::&lt;f32&gt;::zeros([4, 3])?;
+let diag = Array::from_slice(&amp;[2.0f32, 0.0, 0.0, 2.0].repeat(3), [4, 3])?;
+let rhs = Array::from_slice(&amp;[2.0f32, 4.0, 6.0, 8.0, 10.0, 12.0], [2, 3])?;
+let x = solve_block_tridiagonal(2, 1, &amp;zero, &amp;diag, &amp;zero, &amp;rhs);
+assert_eq!(x.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="solving-on-parts-and-several-systems-at-once"><a class="header" href="#solving-on-parts-and-several-systems-at-once">Solving on parts, and several systems at once</a></h3>
+<p>The blocks of a cell often come as sixteen (or four, or nine) arrays of their own, the entries
+of a Jacobian, each an expression of the state; stacking them into the <code>[block * block, ..]</code>
+arrays above is a kernel per stack, and reading the solution’s components back is a gather.
+<code>solve_block_tridiagonal_parts(axis, lo, diag, up, rhs)</code> takes the entries as arrays of the grid’s
+shape instead (<code>lo</code>, <code>diag</code> and <code>up</code> as <code>[&amp;Array&lt;f32&gt;; block * block]</code>, entry <code>(row, col)</code> at
+<code>row * block + col</code>, <code>rhs</code> as <code>[&amp;Array&lt;f32&gt;; block]</code>) and returns the components of the solution
+as <code>[Array&lt;f32&gt;; block]</code>. <code>axis</code> is an axis of the grid, as for <code>solve_tridiagonal</code>. A part that
+is a lazy expression is not evaluated: the solver kernel computes it where it reads the
+coefficients of a cell, so a step from the state to the solution can be one launch. Parts that are
+evaluated arrays are bound as buffers. If the expressions need more buffers or scalars than a
+kernel can bind, or cannot be read by the kernel, or the blocks are 6 to 8 wide, or the Thomas
+solve is chosen (<code>LUMA_TRIDIAGONAL=thomas</code>) and its scratch exceeds a buffer, the parts are
+stacked and the stacked solve runs; the result is the same.
+<code>solve_block_tridiagonal_parts_from</code> takes a <code>start</code> array.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Block 2 on a [5, 3] grid along axis 0: the diagonal blocks are diag(d, 4) with `d` an expression
+// (never evaluated alone), no coupling between cells: x = rhs / diag.
+let zero = Array::&lt;f32&gt;::zeros([5, 3])?;
+let two = Array::&lt;f32&gt;::full([5, 3], 2.0)?;
+let (r0, r1) = (Array::&lt;f32&gt;::full([5, 3], 3.0)?, Array::&lt;f32&gt;::full([5, 3], 8.0)?);
+let d0 = &amp;two + 0.0;
+let d1 = &amp;two * 2.0;
+let [x0, x1] = solve_block_tridiagonal_parts(0, [&amp;zero; 4], [&amp;d0, &amp;zero, &amp;zero, &amp;d1], [&amp;zero; 4], [&amp;r0, &amp;r1]);
+assert_eq!(x0.to_vec()?, vec![1.5; 15]);
+assert_eq!(x1.to_vec()?, vec![2.0; 15]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Independent scalar systems on one grid (the two equations of a turbulence model, say) solve in
+one launch with <code>solve_tridiagonal_parts(axis, [(&amp;lo_k, &amp;diag_k, &amp;up_k, &amp;rhs_k), (&amp;lo_w, ..)])</code>,
+which returns one solution per system (<code>_from</code> with a <code>start</code> array likewise; up to 64 systems):
+the lines of all systems fill the device together, and the lazy parts are computed in the kernel as
+above. An extra axis of a single array batches systems as well: <code>solve_tridiagonal</code> on <code>[2, ni, nj]</code>
+arrays along axis 1 or 2 solves two systems per line, whichever algorithm runs.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two systems on a [6, 2] grid along axis 0: x[s] - 0.25 (x[s-1] + x[s+1]) = rhs[s], with
+// right-hand sides 1 and 2, so the second solution is twice the first.
+let lo = Array::&lt;f32&gt;::full([6, 2], -0.25)?;
+let up = Array::&lt;f32&gt;::full([6, 2], -0.25)?;
+let diag = Array::&lt;f32&gt;::full([6, 2], 1.0)?;
+let rhs = Array::&lt;f32&gt;::full([6, 2], 1.0)?;
+let rhs2 = &amp;rhs * 2.0;
+let [x, y] = solve_tridiagonal_parts(0, [(&amp;lo, &amp;diag, &amp;up, &amp;rhs), (&amp;lo, &amp;diag, &amp;up, &amp;rhs2)]);
+let (x, y) = (x.to_vec()?, y.to_vec()?);
+assert!(x.iter().zip(&amp;y).all(|(a, b)| (2.0 * a - b).abs() &lt; 1e-5));
+
+// A batch axis: [2, 6, 2] along axis 1 is the two systems above, stacked.
+let stack = |a: &amp;Array&lt;f32&gt;| stack_slice(0, &amp;[a.clone(), a.clone()]);
+let batched = solve_tridiagonal(1, &amp;stack(&amp;lo), &amp;stack(&amp;diag), &amp;stack(&amp;up), &amp;stack_slice(0, &amp;[rhs.clone(), rhs2.clone()]));
+let z = batched.to_vec()?;
+assert!((z[0] - x[0]).abs() &lt; 1e-5 &amp;&amp; (z[1] - y[0]).abs() &lt; 1e-5);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Which algorithm runs (one invocation per line, or one workgroup per line by cyclic reduction)
+is chosen automatically; <code>LUMA_TRIDIAGONAL</code> forces one
+(<a href="#environment-variables">Environment variables</a>). The cyclic one uses workgroup memory
+(<a href="#radv-integrated-gpus-give-wrong-results">FAQ</a>).</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="precision-1"><a class="header" href="#precision-1">Precision</a></h1>
 <p><code>f32</code> is the default and what GPUs are built for. When a result needs more digits (a residual
@@ -1318,10 +1826,32 @@ let tiny = (&amp;x - Df32::from(1.0f32)).to_f32().item()?;
 assert!((f64::from(tiny) - ((1.0 + 1e-12) - 1.0)).abs() &lt; 1e-18);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><code>Array&lt;Df32&gt;</code> has <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, comparisons, <code>minimum</code>, <code>maximum</code>, <code>select</code>, views,
-<code>assign</code>, and reductions (<code>sum</code>, <code>min</code>, <code>max</code>; <code>item()</code> gives a <code>Df32</code>). It has no <code>exp</code> or
-trigonometry: cast to <code>f32</code> and back around such a call. Scalars may be <code>Df32</code> values;
-a Rust <code>f32</code> literal in a <code>Df32</code> expression is not converted for you (write <code>Df32::from(1.0f32)</code>
-or build the array with <code>to_df32()</code>).</p>
+<code>assign</code>, and reductions (<code>sum</code>, <code>min</code>, <code>max</code>; <code>item()</code> gives a <code>Df32</code>). It also has <code>exp</code>, <code>ln</code>,
+<code>tanh</code> and <code>powf</code> (below). It has no trigonometry: cast to <code>f32</code> and back around such a call.
+Scalars may be <code>Df32</code> values; a Rust <code>f32</code> literal in a <code>Df32</code> expression is not converted for you
+(write <code>Df32::from(1.0f32)</code> or build the array with <code>to_df32()</code>).</p>
+<p><strong>Functions.</strong> <code>exp</code>, <code>ln</code>, <code>tanh</code> and <code>powf(Df32)</code> are built from <code>Df32</code> arithmetic and fuse like
+it. Their relative error is below <code>2^-43</code> (<code>1e-13</code>; at most <code>4.3e-14</code> measured against <code>f64</code> on the
+RTX 3090 and on llvmpipe): <code>exp</code> on <code>[-55, 80]</code>, <code>ln</code> from <code>1e-24</code> to <code>1e30</code> (and near 1, where the
+error is relative to the result), <code>tanh</code> on <code>[-30, 30]</code> (also near 0), and <code>x^1.5</code> or <code>x^0.7</code> for
+<code>x</code> in <code>[1, 3000]</code>. <code>powf</code> splits the exponent of <code>x</code> exactly, so its error does not grow with
+<code>y ln x</code>. Where a <code>Df32</code> is below about <code>1e-25</code> its low word is under the smallest normal <code>f32</code>
+and loses bits, which limits every function there: <code>exp</code> of an argument under <code>-55</code> has an absolute
+error of about <code>1e-38</code> (a relative error of that over the result), and a result below <code>2^-126</code> is <code>0</code>. Out of range <code>exp</code> is
+infinity above <code>88.72</code> and <code>0</code> below <code>-87.33</code>, <code>tanh</code> is <code>+-1</code> from <code>|x| &gt; 20</code>, and <code>ln</code> and <code>powf</code>
+follow <code>f32</code> (<code>ln(0)</code> is <code>-inf</code>, <code>ln</code> and <code>powf</code> of a negative base are <code>NaN</code>, <code>x^0</code> is <code>1</code>, zero
+and infinite bases give the <code>pow</code> results). <code>f64</code> arrays have none of these functions.</p>
+<pre><code class="language-rust">use luma::*;
+
+let t = Array::from_slice(&amp;[Df32::from(300.0), Df32::from(2000.0)], 2)?;
+// Sutherland-type T^1.5 and an SST blending function, kept in Df32.
+let power = t.powf(Df32::from(1.5)).to_vec()?;
+assert!((power[0].to_f64() / 300f64.powf(1.5) - 1.0).abs() &lt; 1e-13);
+let blend = (&amp;t * Df32::from(0.001)).tanh().to_vec()?;
+assert!((blend[1].to_f64() / 2f64.tanh() - 1.0).abs() &lt; 1e-13);
+let back = (t.ln()).exp().to_vec()?;
+assert!((back[1].to_f64() / 2000.0 - 1.0).abs() &lt; 1e-13);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><strong>Cost.</strong> One <code>Df32</code> add or multiply costs <code>df32_factor</code> <code>f32</code> operations: 27 on the RTX 3090
 and 44 on the integrated GPU the model was measured on, 2.3 on llvmpipe. The
 <a href="https://docs.rs/luma/latest/luma/struct.CostModel.html"><code>CostModel</code></a> of the device records the
@@ -1333,7 +1863,7 @@ model’s estimate, which weighs it against staging and materialising it
 device first opens) this is cheaper than splitting both factors (Dekker splitting takes about ten times as many
 operations for the error of the product). <code>LUMA_DF_FMA</code>
 and <code>ContextOptions::df_fma</code> force either way; the results are the same, only the speed differs.</p>
-<h2 id="casts"><a class="header" href="#casts">Casts</a></h2>
+<h2 id="casts-1"><a class="header" href="#casts-1">Casts</a></h2>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[0.1f32, 0.2], 2)?;
@@ -1374,16 +1904,16 @@ assert!((f64::from(norm) - (exact * f64::from(0.1f32)).sqrt()).abs() &lt; 1e-3);
 precision, so the result is the correctly rounded sum except where the terms cancel almost
 completely. To keep the extra bits, reduce a <code>Df32</code> array yourself: <code>x.to_df32().sum()</code>.</p>
 <h2 id="non-finite-values"><a class="header" href="#non-finite-values">Non-finite values</a></h2>
-<p><code>f32</code>, <code>f64</code> and <code>Df32</code> arrays have lazy <code>u32</code> masks <code>is_finite()</code>, <code>is_nan()</code> and <code>is_inf()</code>.
+<p><code>f32</code>, <code>f64</code> and <code>Df32</code> arrays have lazy <code>bool</code> arrays <code>is_finite()</code>, <code>is_nan()</code> and <code>is_inf()</code>.
 They test the bits of the exponent, so they do not depend on how the device compares NaN (a shader
 compiler may assume NaN does not exist and fold <code>x != x</code>). They fuse like any elementwise
 operation:</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, f32::INFINITY, f32::NAN, -2.0], 4)?;
-assert_eq!(x.is_finite().to_vec()?, vec![1, 0, 0, 1]);
-assert_eq!(x.is_nan().to_vec()?, vec![0, 0, 1, 0]);
-assert_eq!(x.is_inf().to_vec()?, vec![0, 1, 0, 0]);
+assert_eq!(x.is_finite().to_u32().to_vec()?, vec![1, 0, 0, 1]);
+assert_eq!(x.is_nan().to_u32().to_vec()?, vec![0, 0, 1, 0]);
+assert_eq!(x.is_inf().to_u32().to_vec()?, vec![0, 1, 0, 0]);
 
 // Sanitise in one fused kernel.
 let clean = select(&amp;x.is_finite(), &amp;x, 0.0);
@@ -1436,9 +1966,10 @@ reassociated expression. With it off (the default), a rewrite that would change 
 applied.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="integer-and-bit-operations"><a class="header" href="#integer-and-bit-operations">Integer and bit operations</a></h1>
-<p><code>Array&lt;u32&gt;</code> is the integer type: indices, masks, counters, and the lanes of bit-sliced
+<p><code>Array&lt;u32&gt;</code> is the unsigned integer type: indices, counters, and the lanes of bit-sliced
 cryptography. A <code>u32</code> array fuses, views, reduces, scans and loops like an <code>f32</code> one, and has the
-bit operations of a hash function. There is no signed integer type; <code>u32</code> arithmetic wraps.</p>
+bit operations of a hash function; <code>u32</code> arithmetic wraps. <code>Array&lt;i32&gt;</code> is the signed one
+(<a href="#signed-integers-and-casts">below</a>), and <code>Array&lt;bool&gt;</code> the result of comparisons.</p>
 <h2 id="arithmetic"><a class="header" href="#arithmetic">Arithmetic</a></h2>
 <p><code>+ - * / %</code> work on <code>u32</code> arrays and <code>u32</code> scalars, and wrap modulo <code>2^32</code> where a Rust
 <code>wrapping_*</code> would. Division and remainder by an element that is zero follow WGSL: <code>x / 0</code> is <code>x</code>
@@ -1488,28 +2019,67 @@ assert_eq!(x.rotate_right(&amp;amounts).to_vec()?, vec![0x1800_0000, 0x7812_3456
 <code>x.rotate_left(7u32)</code>) the amount is compiled into the kernel as a constant: no masking, and one
 instruction. Hash functions are written with constant amounts, so this is the path they use. An
 array of amounts costs a mask and a variable shift per element.</p>
-<h2 id="comparisons-masks-and-select"><a class="header" href="#comparisons-masks-and-select">Comparisons, masks and <code>select</code></a></h2>
-<p>Comparisons (<code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code>) of any element type return <code>Array&lt;u32&gt;</code> masks of
-<code>0</code> or <code>1</code>. Masks combine with <code>&amp;</code>, <code>|</code> and <code>^</code>. Negate a mask with <code>^ 1u32</code>: <code>!</code> flips all 32 bits, and
-<code>!1</code> is not <code>0</code>. <code>select(&amp;mask, a, b)</code> takes <code>a</code> where the mask is non-zero and <code>b</code>
-elsewhere, for any element type; <code>a</code> and <code>b</code> are arrays or scalars.</p>
+<h2 id="comparisons-booleans-and-select"><a class="header" href="#comparisons-booleans-and-select">Comparisons, booleans and <code>select</code></a></h2>
+<p>Comparisons (<code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code>) of any element type return <code>Array&lt;bool&gt;</code>: a boolean
+per element, stored as one bit (<a href="#booleans">how to make and read one</a>).
+Booleans combine with <code>&amp;</code>, <code>|</code> and <code>^</code> (and the compound forms <code>&amp;=</code>, <code>|=</code>, <code>^=</code>, also with a single
+<code>bool</code>), and <code>!</code> negates them; <code>*</code> of two boolean arrays is the logical and. <code>select(&amp;cond, a, b)</code>
+takes <code>a</code> where the condition is true and <code>b</code> elsewhere, for any element type; <code>a</code> and <code>b</code> are
+arrays or scalars, and the condition is an <code>Array&lt;bool&gt;</code> or an <code>Array&lt;u32&gt;</code> (non-zero is true).
+<code>count()</code> is the number of true elements (a <code>u32</code> array, and <code>sum()</code> is the same), <code>any()</code> and
+<code>all()</code> are one-element <code>bool</code> arrays; read one with <code>item()</code>. A boolean array times a number
+promotes as in NumPy: <code>mask * &amp;x</code> is <code>x</code> where true and 0 elsewhere (a <code>select</code>, so it fuses as
+cheaply as one), and <code>mask + &amp;x</code> / <code>mask - &amp;x</code> use the 0 and 1 of <code>x</code>’s type. <code>to_u32()</code>, <code>to_i32()</code>
+and <code>to_f32()</code> convert explicitly.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[3u32, 9, 12, 5], 4)?;
-let in_range = x.ge(4u32) &amp; x.lt(10u32);               // 1 where 4 &lt;= x &lt; 10
-assert_eq!(in_range.to_vec()?, vec![0, 1, 0, 1]);
-assert_eq!((&amp;in_range ^ 1u32).to_vec()?, vec![1, 0, 1, 0]);
+let in_range = x.ge(4u32) &amp; x.lt(10u32);               // true for 4 &lt;= x &lt; 10
+assert_eq!(in_range.to_vec()?, vec![false, true, false, true]);
+assert_eq!((!&amp;in_range).to_u32().to_vec()?, vec![1, 0, 1, 0]);
 
 // Clamp to 10, keep the rest.
 let clamped = select(&amp;x.gt(10u32), 10u32, &amp;x);
 assert_eq!(clamped.to_vec()?, vec![3, 9, 10, 5]);
 
-// Counting is summing a mask; `sum_where` sums values under a mask.
-assert_eq!(in_range.sum().item()?, 2);
+// `count` counts the true elements; `sum_where` sums values under a condition.
+assert_eq!(in_range.count().item()?, 2);
 assert_eq!(x.sum_where(&amp;in_range).item()?, 14);
+// A boolean times a number keeps the number where true.
+assert_eq!((&amp;in_range * &amp;x).to_vec()?, vec![0, 9, 0, 5]);
+
+// `any` and `all` are one-element `bool` arrays. `&amp;=`, `|=`, `^=` work in place.
+assert!(in_range.any().item()?);
+assert!(!in_range.all().item()?);
+let mut flags = x.ge(4u32);
+flags &amp;= &amp;x.lt(10u32);
+assert_eq!(flags.to_vec()?, vec![false, true, false, true]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><code>u32</code> has no unary minus and no implicit conversion to <code>f32</code>; to use a mask in float arithmetic
-write <code>select(&amp;mask, 1.0, 0.0)</code>, which fuses.</p>
+<p>Comparisons with a NaN are the GPU’s: <code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code> and <code>eq</code> are false for a NaN operand,
+and <code>ne</code> was false too on every device the tests ran on (NVIDIA, llvmpipe), so <code>x.ne(&amp;x)</code> is <strong>not</strong> a NaN test. Use
+<code>is_nan()</code> (<a href="#precision-1">Precision</a>).</p>
+<p><code>u32</code> has no unary minus. To use a boolean array in float arithmetic write <code>mask * &amp;x</code>,
+<code>mask.to_f32()</code> or <code>select(&amp;mask, 1.0, 0.0)</code>; all fuse.</p>
+<h2 id="signed-integers-and-casts"><a class="header" href="#signed-integers-and-casts">Signed integers and casts</a></h2>
+<p><code>Array&lt;i32&gt;</code> has the arithmetic of <code>u32</code> plus unary minus, <code>abs</code> and <code>sign</code>, and <code>&gt;&gt;</code> is
+arithmetic (the sign bit comes in from the left). <code>+ - *</code> wrap; division and remainder follow
+WGSL: <code>x / 0</code> is <code>x</code>, <code>i32::MIN / -1</code> is <code>i32::MIN</code>, <code>x % 0</code> and <code>i32::MIN % -1</code> are 0, and
+<code>abs(i32::MIN)</code> stays <code>i32::MIN</code>. There are no rotations and no float math.</p>
+<p>Casts between <code>f32</code>, <code>u32</code> and <code>i32</code> are methods. Float to integer truncates toward zero and
+saturates (<code>u32</code> at <code>4294967040</code>, <code>i32</code> at <code>-2147483648..=2147483520</code>), and NaN becomes 0.
+<code>u32</code> and <code>i32</code> reinterpret the bits (two’s complement).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[-1.5f32, 2.7, f32::NAN, 1e20, -1e20], 5)?;
+assert_eq!(x.to_i32().to_vec()?, vec![-1, 2, 0, 2_147_483_520, i32::MIN]);
+assert_eq!(x.to_u32().to_vec()?, vec![0, 2, 0, 4_294_967_040, 0]);
+
+let n = Array::from_slice(&amp;[7i32, -7, i32::MIN], 3)?;
+assert_eq!((&amp;n / 2).to_vec()?, vec![3, -3, -1_073_741_824]);
+assert_eq!(n.abs().to_vec()?, vec![7, 7, i32::MIN]);
+assert_eq!((-&amp;n).to_f32().to_vec()?[..2], [-7.0, 7.0]);
+assert_eq!(n.to_u32().to_vec()?, vec![7, u32::MAX - 6, 1 &lt;&lt; 31]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="64-bit-lanes-as-pairs-of-u32"><a class="header" href="#64-bit-lanes-as-pairs-of-u32">64-bit lanes as pairs of <code>u32</code></a></h2>
 <p>A 64-bit lane is a pair <code>(lo, hi)</code> of <code>u32</code> arrays, one element per independent instance. A
 rotation by a constant swaps the halves from 32 and then funnels bits across them. This is the
@@ -1586,9 +2156,11 @@ let best = (0..256).max_by(|&amp;a, &amp;b| corr[a].total_cmp(&amp;corr[b])).unw
 assert_eq!(best, 0x2b);
 assert!(corr[best] &gt; 0.999);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>The gathers and the elementwise arithmetic fuse, but <code>sum_axis</code> does not fuse its operand
-(<a href="#scans">Reductions</a>): the arrays it reduces (<code>hc * tc</code>, …) are computed into
-<code>[traces, 256]</code> buffers first. Wrap the analysis in <code>ctx.profile(..)</code> to see the kernels.</p>
+<p>The gathers and the elementwise arithmetic fuse, and <code>sum_axis</code> computes its operand inside its
+first pass (<a href="#what-fuses-and-what-cuts">What fuses</a>): <code>hc * tc</code> is never stored.
+<code>h</code> and the centred columns are read by several reductions, so the
+<a href="#the-cost-model">cost model</a> may still evaluate them into <code>[traces, 256]</code>
+buffers. Wrap the analysis in <code>ctx.profile(..)</code> to see the kernels.</p>
 <h2 id="states-in-iterate_all"><a class="header" href="#states-in-iterate_all">States in <code>iterate_all</code></a></h2>
 <p><code>u32</code> arrays are a valid state for <a href="#elementwise-loops-iterate_all"><code>iterate_all</code></a>. An
 integer step that is elementwise, such as a hash round or a random-number generator, runs as a
@@ -1657,22 +2229,66 @@ assert_eq!(y.to_vec()?, vec![6.0, 7.0, 8.0, 9.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>The rules:</p>
 <ul>
-<li><strong>Bindings</strong> go in <code>@group(1)</code>, numbered from 0 in the order of the arguments to <code>launch</code>.
+<li>
+<p><strong>Bindings</strong> go in <code>@group(1)</code>, numbered from 0 in the order of the arguments to <code>launch</code>.
 <code>&amp;Array</code> binds <code>var&lt;storage, read&gt;</code>, <code>&amp;mut Array</code> binds <code>var&lt;storage, read_write&gt;</code>, and
-<code>uniform(&amp;value)</code> binds <code>var&lt;uniform&gt;</code>.</li>
-<li><strong><code>@group(0)</code> belongs to Luma.</strong> It holds <code>luma</code>, a uniform with <code>size: vec3&lt;u32&gt;</code> (the problem
+<code>uniform(&amp;value)</code> binds <code>var&lt;uniform&gt;</code>.</p>
+</li>
+<li>
+<p><strong><code>@group(0)</code> belongs to Luma.</strong> It holds <code>luma</code>, a uniform with <code>size: vec3&lt;u32&gt;</code> (the problem
 size you passed to <code>launch</code>). Luma appends two helpers to your source: <code>luma_idx2(i, j)</code> and
-<code>luma_idx3(i, j, k)</code> compute a flat index with the first dimension fastest.</li>
-<li><strong>Problem size.</strong> <code>launch([x])</code>, <code>launch([x, y])</code> or <code>launch([x, y, z])</code> runs at least that many
+<code>luma_idx3(i, j, k)</code> compute a flat index with the first dimension fastest.</p>
+</li>
+<li>
+<p><strong>Problem size.</strong> <code>launch([x])</code>, <code>launch([x, y])</code> or <code>launch([x, y, z])</code> runs at least that many
 invocations: <code>ceil(size / workgroup_size)</code> workgroups per dimension. Guard against
 <code>global_invocation_id &gt;= luma.size</code>. <code>launch_raw([wx, wy, wz], args)</code> runs exactly that many
-workgroups.</li>
-<li><strong>Uniform values</strong> are copied when you pass them. Any type
+workgroups.</p>
+</li>
+<li>
+<p><strong>Uniform values</strong> are copied when you pass them. Any type
 <a href="https://docs.rs/encase">encase</a> can lay out works: a struct with <code>#[derive(ShaderType)]</code>,
-scalars, vectors, matrices, arrays. <code>luma::encase</code> is a re-export of the same version Luma uses.</li>
-<li><strong>Element sizes</strong> are checked: a binding <code>array&lt;f32&gt;</code> takes arrays of 4-byte elements,
+scalars, vectors, matrices, arrays. <code>luma::encase</code> is a re-export of the same version Luma uses.</p>
+</li>
+<li>
+<p><strong>Element sizes</strong> are checked: a binding <code>array&lt;f32&gt;</code> takes arrays of 4-byte elements,
 <code>array&lt;vec2&lt;f32&gt;&gt;</code> arrays of 8-byte ones (<code>[f32; 2]</code>, <code>Df32</code>, <code>f64</code>). Only the size is compared,
-not the type: an <code>Array&lt;u32&gt;</code> passes for <code>array&lt;f32&gt;</code>, so keep the types straight yourself.</li>
+not the type: an <code>Array&lt;u32&gt;</code> passes for <code>array&lt;f32&gt;</code>, so keep the types straight yourself.</p>
+</li>
+<li>
+<p><strong><code>Array&lt;bool&gt;</code></strong> binds as <code>array&lt;u32&gt;</code> of <em>bit-packed words</em>: an array of <code>n</code> booleans is
+<code>ceil(n / 32)</code> words, and element <code>i</code> is bit <code>i % 32</code> of word <code>i / 32</code>, so
+<code>(a[i &gt;&gt; 5u] &gt;&gt; (i &amp; 31u)) &amp; 1u</code> reads it (the launch size is the number of elements, not of
+words, if you read bits). The bits past the end of the array, in the last word, must stay 0:
+the library’s <code>count</code>, <code>any</code>, <code>all</code> and <code>!</code> rely on it, so a kernel that writes a boolean
+array writes whole words with those bits cleared (or sets and clears single bits with
+<code>atomicOr</code> / <code>atomicAnd</code> on an <code>array&lt;atomic&lt;u32&gt;&gt;</code> binding, which is what Luma’s own kernels
+do when they write part of a word; neighbouring bits of a word belong to different
+invocations). A strided view of a boolean array (<code>luma::view(&amp;m)</code>) gives the <em>element</em> index
+of a bit through <code>luma_view_idx</code>, to be split as above.</p>
+<pre><code class="language-rust">use luma::*;
+
+// dst[i] = 1 where element i of the boolean array is true, 0 where it is false.
+const UNPACK: &amp;str = r#"
+@group(1) @binding(0) var&lt;storage, read&gt; mask: array&lt;u32&gt;;
+@group(1) @binding(1) var&lt;storage, read_write&gt; dst: array&lt;u32&gt;;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3&lt;u32&gt;) {
+    let i = gid.x;
+    if (i &gt;= luma.size.x) { return; }
+    dst[i] = (mask[i &gt;&gt; 5u] &gt;&gt; (i &amp; 31u)) &amp; 1u;
+}
+"#;
+
+let x = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, 0.5, -1.0], 5)?;
+let mask = x.gt(0.0);
+let mut dst = Array::&lt;u32&gt;::zeros(5)?;
+let kernel = Kernel::new(UNPACK)?;
+kernel.launch([5], args![&amp;mask, &amp;mut dst])?;
+assert_eq!(dst.to_vec()?, vec![1, 0, 1, 1, 0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+</li>
 </ul>
 <h2 id="several-entry-points-2-d-launches"><a class="header" href="#several-entry-points-2-d-launches">Several entry points, 2-D launches</a></h2>
 <p>One module can hold several entry points; each only sees the globals it uses, and those must be
@@ -1923,6 +2539,7 @@ and source line where an expression was cut, and the
 <tr><td><code>Scalars</code></td><td>the scalar operands do not fit one uniform buffer</td></tr>
 <tr><td><code>Inlined</code></td><td>views of lazy expressions unfolded into more instructions than the device’s cap</td></tr>
 <tr><td><code>Materialised</code></td><td>the <a href="#the-cost-model">cost model</a> estimates that storing an expression once is cheaper than recomputing it at each read</td></tr>
+<tr><td><code>Shared</code></td><td>an expression that other pending operations outside the kernel read too is stored once instead of recomputed in each</td></tr>
 </tbody>
 </table>
 </div>
@@ -1988,7 +2605,29 @@ launches of about 40 ms of GPU time by it, and it decides when a circular <code>
 is recomputed, staged, or evaluated first.</p>
 <h2 id="what-fuses-and-what-cuts"><a class="header" href="#what-fuses-and-what-cuts">What fuses, and what cuts</a></h2>
 <p>Fused: elementwise operations, comparisons, <code>select</code>, casts, generators, views, compound
-assignment, the input and the epilogue of a reduction (<a href="#what-fuses">Lazy evaluation</a>).</p>
+assignment, the input and the epilogue of a reduction (<a href="#what-fuses">Lazy evaluation</a>),
+and, in the primitives below, the expressions they read.</p>
+<h3 id="primitives-that-read-an-expression"><a class="header" href="#primitives-that-read-an-expression">Primitives that read an expression</a></h3>
+<p>These need a kernel of their own, but a pending operand is not stored first: its expression
+becomes the load of that kernel.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Primitive</th><th>Computed inside the kernel</th><th>When it runs</th></tr>
+</thead>
+<tbody>
+<tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
+<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code></td><td>the operand, in the first pass over the data</td><td>eager: the result is evaluated when the call returns</td></tr>
+<tr><td><code>put_add</code>, <code>put_min</code>, <code>put_max</code>, <code>bincount</code>, <code>histogram</code>, <code>group_*</code></td><td>the value and the index (or code, or bucket) expressions of the scatter</td><td>an in-place write, like <code>put</code></td></tr>
+<tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
+</tbody>
+</table>
+</div>
+<p>An operand that reads circular <code>shift</code>s of other expressions, or lives in several buffers, is
+evaluated first instead. <code>scan</code> and <code>cumsum</code> always evaluate their operand (they read it twice).
+Because these results are evaluated at the call, a loop that calls them every step builds one
+kernel per call rather than one fused chain: count launches with <code>ctx.profile(..)</code>. Usage is in
+<a href="#matrices-statistics-and-grouping">Matrices, statistics and grouping</a>: <a href="#matrix-products"><code>matmul</code></a>, <a href="#statistics-along-an-axis">axis statistics</a>, <a href="#accumulating-scatters">scatters</a>, <a href="#sorting">sorting</a>.</p>
 <p>An expression is cut when it passes a limit. They are generous, and a cut costs a launch and a trip
 through memory, not correctness:</p>
 <div class="table-wrapper">
@@ -2010,8 +2649,8 @@ through memory, not correctness:</p>
 share work with it), and the rest is flattened again. A kernel that reads many different arrays
 (the 50 words of a Keccak state) is the one that meets the input limit; keep such loops in
 <code>iterate_all</code>, or split them in the source.</p>
-<p>Never fused, because they need whole-array structure: <code>scan</code>, axis reductions, tridiagonal solves,
-FFT convolution, and custom kernels. They read computed arrays.</p>
+<p>Never fused, because they need whole-array structure: <code>scan</code>, tridiagonal solves, FFT
+convolution, and custom kernels. They read computed arrays.</p>
 <h2 id="caches"><a class="header" href="#caches">Caches</a></h2>
 <ul>
 <li><strong>Kernels</strong> are cached per context by the <em>structure</em> of the expression: operations, types, how
@@ -2274,12 +2913,57 @@ What to look at:</p>
 an array along axis 0, so <code>&amp;pt ^ &amp;guesses</code> broadcasts to the whole matrix;</li>
 <li><code>take</code> does both table lookups, and <code>sum_axis(0)</code> of centred products gives the covariance
 columns, all broadcasting: the program never writes a loop over guesses or traces;</li>
-<li>the gathers and the elementwise products fuse; <code>sum_axis</code> does not fuse its operand, so the
-centred and multiplied <code>[traces, 256]</code> arrays are computed before it. Wrap the analysis in
-<code>ctx.profile(..)</code> and count <code>launches()</code> to see.</li>
+<li>the gathers and the elementwise products fuse, and so does <code>sum_axis</code> into its operand: the
+centred and multiplied <code>[traces, 256]</code> arrays are computed inside the reduction, not stored.
+Wrap the analysis in <code>ctx.profile(..)</code> and count <code>launches()</code> to see.</li>
 </ul>
 <p>Replace the stand-in S-box with your cipher’s table and the synthetic leakage with a measured
 sample per trace to use it on real data.</p>
+<h2 id="a-small-data-science-pipeline"><a class="header" href="#a-small-data-science-pipeline">A small data-science pipeline</a></h2>
+<p>A table of three features and a category per row, reduced to the usual first look: standardise,
+correlate, summarise per category, histogram, quartiles and the top rows. The table is stored
+with one column per feature, <code>[rows, features]</code>, so each feature is contiguous and the statistics
+run along axis 0. See <a href="#matrices-statistics-and-grouping">Matrices, statistics and grouping</a> for each operation.</p>
+<pre><code class="language-rust">use luma::*;
+
+let rows = 8;
+// Feature 0 counts up, feature 1 is twice feature 0, feature 2 counts down.
+let table = Array::from_slice(
+    &amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+      2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0,
+      8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+    [rows, 3],
+)?;
+// A category (dense code) for every row.
+let category = Array::from_slice(&amp;[0u32, 1, 0, 1, 0, 1, 2, 2], rows)?;
+
+// Standardise the columns. `z` is a lazy expression, computed where it is used.
+let z = (&amp;table - &amp;table.mean_axis(0)) / table.std_axis(0);
+
+// Correlation matrix: the Gram matrix of `z`, fused into the product's loads.
+let corr = (z.matmul(&amp;z.transpose()) / (rows as f32)).to_vec()?;
+let expected = [1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0];
+assert!(corr.iter().zip(expected).all(|(got, want)| (got - want).abs() &lt; 1e-4));
+
+// Per-category mean of feature 0 (the first `rows` elements of the table).
+let feature0 = table.slice(1, 0..1).reshape(rows);
+assert_eq!(feature0.group_mean(&amp;category, 3).to_vec()?, vec![3.0, 4.0, 7.5]);
+
+// Histogram of feature 0 in four bins of width 2 over [0, 8): 1 | 2 3 | 4 5 | 6 7 8
+// (8.0 is not below `hi`, so it lands in the last bin).
+assert_eq!(feature0.histogram(4, 0.0, 8.0).to_vec()?, vec![1, 2, 2, 3]);
+
+// Median and quartiles.
+assert_eq!(feature0.median().item()?, 4.5);
+assert_eq!(feature0.quantile(0.25).item()?, 2.75);
+assert_eq!(feature0.quantile(0.75).item()?, 6.25);
+
+// The three rows with the largest value of feature 2, and their feature 0.
+let feature2 = table.slice(1, 2..3).reshape(rows);
+let top = feature2.argsort_descending().slice(0, 0..3);
+assert_eq!(top.to_vec()?, vec![0, 1, 2]);
+assert_eq!(feature0.take(&amp;top).to_vec()?, vec![1.0, 2.0, 3.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h1>
 <p>Luma reads these when a context opens. <code>ContextOptions::from_env()</code> collects the ones that have
@@ -2393,14 +3077,15 @@ happens once per device creation. Create your contexts up front, before starting
 or use one context (the default one is shared by threads).</p>
 <h2 id="radv-integrated-gpus-give-wrong-results"><a class="header" href="#radv-integrated-gpus-give-wrong-results">RADV integrated GPUs give wrong results</a></h2>
 <p>Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (<code>scan</code>, <code>cumsum</code>,
-axis reductions), workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
+axis reductions), <code>matmul</code>, sorts (and what builds on them), scatters into targets of up to 4096
+elements, workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
 cyclic solver is chosen automatically only on the NVIDIA tuning profile (a GPU detected as NVIDIA,
 or <code>LUMA_TUNING=nvidia</code>); elsewhere (and with <code>LUMA_TRIDIAGONAL=thomas</code>) the solver does not use it. If you see wrong results on such a GPU:</p>
 <ul>
 <li><code>LUMA_STAGING=off</code> keeps expressions read through views out of workgroup memory (the cost model
 then recomputes them or evaluates them first),</li>
 <li><code>LUMA_TRIDIAGONAL=thomas</code> pins the solver that does not use workgroup memory,</li>
-<li>scans and axis reductions have no switch: run on another device (<code>LUMA_DEVICE=cpu</code>, or a
+<li>scans, axis reductions, <code>matmul</code>, sorts and scatters have no switch: run on another device (<code>LUMA_DEVICE=cpu</code>, or a
 different GPU through <code>VK_ICD_FILENAMES</code>).</li>
 </ul>
 <h2 id="results-and-errors"><a class="header" href="#results-and-errors">Results and errors</a></h2>
@@ -2411,13 +3096,56 @@ array to find the first failure early. The error carries the source location of 
 <code>ContextOptions::check_finite</code>): every evaluated <code>f32</code> and <code>Df32</code> array is checked (<code>f64</code> is not) and
 the first operation whose result holds a non-finite value fails with <code>LumaError::NonFinite</code>. It waits for the GPU after every
 array, so use it for debugging only. For <code>f32</code>, <code>f64</code> and <code>Df32</code> arrays,
-<code>is_finite()</code> / <code>is_nan()</code> / <code>is_inf()</code> give lazy <code>u32</code> masks you can use in expressions.</p>
+<code>is_finite()</code> / <code>is_nan()</code> / <code>is_inf()</code> give lazy <code>bool</code> arrays you can use in expressions.</p>
 <p><strong><code>Array&lt;f64&gt;</code> fails with <code>Unsupported</code>.</strong> The device has no 64-bit shader floats. Check
 <code>ctx.features().contains(luma::wgpu::Features::SHADER_F64)</code>, or use <code>Df32</code>
 (<a href="#precision-1">Precision</a>), which runs everywhere.</p>
 <p><strong>Out of memory.</strong> Array data beyond the memory budget (80% of device memory on Vulkan GPUs)
 moves to host memory and back on demand, with a one-time warning. <code>LUMA_MEMORY_BUDGET</code> sets the
 budget. Custom kernels need arrays that fit one buffer (<code>LumaError::Chunked</code> otherwise).</p>
+<h2 id="numbers"><a class="header" href="#numbers">Numbers</a></h2>
+<p><strong><code>put_add</code>, <code>group_sum</code> or <code>histogram</code> of <code>f32</code> gives slightly different sums on every run.</strong>
+Equal indices are accumulated with atomics in no fixed order, and float addition is not
+associative, so the last bits of an <code>f32</code> sum differ between runs (and devices). Integer sums
+(<code>u32</code>, <code>i32</code>, <code>bincount</code>, <code>group_count</code>) are exact, and <code>put_min</code> / <code>put_max</code> do not depend on the
+order. If you need a reproducible float sum, scatter into integers (fixed point) or sort first and
+reduce (<a href="#accumulating-scatters">Accumulating scatters</a>).</p>
+<p><strong>Where do NaNs go in a sort or a quantile?</strong> <code>sort</code>, <code>argsort</code> and <code>sort_axis</code> order floats as
+<code>-inf &lt; .. &lt; -0.0 &lt; +0.0 &lt; .. &lt; +inf &lt; NaN</code>: NaNs are last (first in the descending forms), and
+<code>-0.0</code> sorts before <code>+0.0</code>. A quantile is read from the sorted array, so a NaN in the data makes the
+high quantiles NaN and leaves the low ones alone; NumPy returns NaN for every quantile in that case.
+<code>factorize</code> and <code>unique</code> treat all NaNs as one value (the last) and <code>-0.0</code> and <code>0.0</code> as one. In
+<code>histogram</code> a NaN goes to bin 0.</p>
+<p><strong><code>x.ne(&amp;x)</code> does not find the NaNs.</strong> Comparisons with a NaN are the GPU’s. <code>lt</code>, <code>le</code>, <code>gt</code>,
+<code>ge</code> and <code>eq</code> give false for a NaN operand, and <code>ne</code> gave false as well on NVIDIA and on
+llvmpipe (the tests that ran), where IEEE says true. Use <code>x.is_nan()</code>, and <code>select(&amp;x.is_nan(), a, b)</code>
+to replace them. <code>LUMA_FAST_MATH</code> additionally folds a comparison of an array with itself.</p>
+<p><strong>What does a float-to-integer cast give out of range?</strong> <code>to_u32</code> and <code>to_i32</code> truncate toward
+zero and saturate at the largest <code>f32</code> inside the range, and NaN becomes 0:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Cast</th><th>Value</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td><code>to_u32</code></td><td>negative, <code>-0.5</code>, NaN</td><td>0</td></tr>
+<tr><td><code>to_u32</code></td><td><code>1e20</code>, <code>+inf</code></td><td><code>4294967040</code></td></tr>
+<tr><td><code>to_i32</code></td><td><code>-1e20</code>, <code>-inf</code></td><td><code>-2147483648</code></td></tr>
+<tr><td><code>to_i32</code></td><td><code>1e20</code>, <code>+inf</code></td><td><code>2147483520</code></td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[-1.5f32, f32::NAN, 1e20, -1e20, f32::INFINITY], 5)?;
+assert_eq!(x.to_u32().to_vec()?, vec![0, 0, 4_294_967_040, 0, 4_294_967_040]);
+assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_520]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong>Integer division by zero</strong> gives the dividend (<code>x / 0 == x</code>) and nothing fails; for <code>i32</code>,
+<code>x % 0</code> is 0 and <code>i32::MIN / -1</code> is <code>i32::MIN</code> (<a href="#signed-integers-and-casts">Integers</a>).</p>
+<p><strong>Which matrix shape is <code>matmul</code>’s?</strong> Axis 0 varies fastest, so the shapes are NumPy’s
+<code>a @ b</code> reversed: <code>lhs</code> <code>[K, M]</code>, <code>rhs</code> <code>[N, K]</code>, result <code>[N, M]</code>
+(<a href="#matrix-products">Matrix products</a>).</p>
 <h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
 <p><strong>The first run is slow, later ones are fast.</strong> Large kernels (especially <code>Df32</code>) take seconds
 to compile on some drivers. Luma keeps the driver’s compiled pipelines and the measured cost
@@ -2429,6 +3157,79 @@ result is cached). <code>LUMA_CALIBRATE=0</code> skips it and uses fixed numbers
 <code>iterate</code>/<code>iterate_all</code> where they apply, <code>eval</code> each step instead of reading, and look at
 <code>ctx.profile(..)</code> for kernel counts and split reasons.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="migration-from-03"><a class="header" href="#migration-from-03">Migration from 0.3</a></h1>
+<p>0.4 changes the type of comparisons: they return boolean arrays (<code>Array&lt;bool&gt;</code>) instead of
+<code>Array&lt;u32&gt;</code>. Most 0.3 code compiles as it is, because booleans promote to numbers the way they do
+in NumPy (below). Everything else in 0.4 is added (<a href="#new-in-04-that-you-may-want">the list below</a>).</p>
+<h2 id="comparisons-return-arraybool"><a class="header" href="#comparisons-return-arraybool">Comparisons return <code>Array&lt;bool&gt;</code></a></h2>
+<p><code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code> and <code>is_finite</code> / <code>is_nan</code> / <code>is_inf</code> return <code>Array&lt;bool&gt;</code>. On the
+GPU a <code>bool</code> is one bit (<code>n</code> booleans are <code>ceil(n / 32)</code> <code>u32</code> words: a
+<a href="#custom-kernels">custom kernel</a> that took a comparison as one <code>u32</code> per element reads
+<code>(a[i &gt;&gt; 5u] &gt;&gt; (i &amp; 31u)) &amp; 1u</code> now); on the host <code>from_slice</code>, <code>to_vec</code> and <code>item</code> use plain <code>bool</code>s.</p>
+<p>What compiles unchanged:</p>
+<ul>
+<li><code>select(&amp;cond, a, b)</code>, <code>sum_where(&amp;cond)</code> and <code>Fields::select</code> take an <code>Array&lt;bool&gt;</code>, and still
+take an <code>Array&lt;u32&gt;</code> (non-zero is true), so code that builds its own <code>u32</code> conditions is as
+before.</li>
+<li><code>bool * bool</code> is the logical and: <code>a.gt(0.0) * b.gt(0.0)</code>.</li>
+<li>A boolean array times a number is the number where the boolean is true and 0 elsewhere, in
+either order and with a scalar: <code>mask * &amp;x</code>, <code>&amp;x * mask</code>, <code>mask * 0.5</code>. <code>+</code> and <code>-</code> convert the
+booleans to the 0 and 1 of the other operand’s type first. These work for <code>f32</code>, <code>u32</code>, <code>i32</code>,
+<code>f64</code> and <code>Df32</code> arrays, and the product fuses as a <code>select</code>, not a cast and a multiply.</li>
+<li><code>sum()</code> of booleans counts the true elements and returns an <code>Array&lt;u32&gt;</code> (as in NumPy), also
+<code>count()</code>, <code>sum_axis</code> and <code>cumsum</code>.</li>
+</ul>
+<p>What does not:</p>
+<pre><code class="language-text">// 0.3
+let m: Array&lt;u32&gt; = x.gt(0.0);              // the type of a comparison was named
+let both = &amp;x.gt(0.0) + &amp;y.gt(0.0);         // 0, 1 or 2
+let idx = x.gt(0.0).cumsum(0) - 1u32;       // running count, minus one
+let hit = x.gt(0.0);  let miss = &amp;hit ^ 1u32;
+// 0.4
+let m: Array&lt;bool&gt; = x.gt(0.0);
+let both = x.gt(0.0).to_u32() + y.gt(0.0).to_u32();    // or `|` / `&amp;` for a logical result
+let idx = x.gt(0.0).cumsum(0) - 1u32;                  // cumsum of booleans is a u32 array: unchanged
+let miss = !&amp;hit;
+</code></pre>
+<p>Also changed: a comparison is no longer an index (<code>take</code>, <code>put</code>: convert with <code>to_u32()</code>), has no
+<code>/</code>, <code>%</code> or shifts (convert first), and reads back as <code>Vec&lt;bool&gt;</code>. An
+integer literal next to a boolean array needs a suffix (<code>mask * 2u32</code>), since <code>u32</code> and <code>i32</code>
+arrays are both valid results.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.5f32, -2.0, 3.0, -4.0], 4)?;
+let above: Array&lt;bool&gt; = x.gt(0.0);
+let both = &amp;above &amp; &amp;x.lt(2.0);                    // booleans combine with &amp; | ^ !
+assert_eq!(above.count().item()?, 2);
+assert_eq!(both.to_vec()?, vec![true, false, false, false]);
+assert_eq!(above.to_f32().to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
+assert!(above.any().item()?);
+assert!(!above.all().item()?);
+assert_eq!(select(&amp;above, 1.0f32, 0.0).to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
+
+// Promotion, as in NumPy: the number where true, 0 elsewhere.
+assert_eq!((&amp;above * &amp;x).to_vec()?, vec![1.5, 0.0, 3.0, 0.0]);
+assert_eq!((&amp;above * 0.5).to_vec()?, vec![0.5, 0.0, 0.5, 0.0]);
+assert_eq!((&amp;x + &amp;above).to_vec()?, vec![2.5, -2.0, 4.0, -4.0]);
+// A `u32` condition still works.
+let words = Array::from_slice(&amp;[1u32, 0, 7, 0], 4)?;
+assert_eq!(select(&amp;words, &amp;x, 0.0).to_vec()?, vec![1.5, 0.0, 3.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The numeric reductions (<code>reduce_axis</code>, <code>scan</code>, <code>mean</code>, <code>norm</code>) are not defined for <code>bool</code>: convert
+with <code>to_u32()</code> or <code>to_f32()</code>. A masked-out <code>NaN</code> or infinity in <code>mask * &amp;x</code> gives 0, where a
+multiplication would give <code>NaN</code>.</p>
+<h2 id="new-in-04-that-you-may-want"><a class="header" href="#new-in-04-that-you-may-want">New in 0.4 that you may want</a></h2>
+<ul>
+<li><a href="#element-types"><code>i32</code> arrays, casts and <code>bool</code></a> (<code>to_u32</code>, <code>to_i32</code>, <code>to_f32</code>; <code>count</code>,
+<code>any</code>, <code>all</code>).</li>
+<li><a href="#matrices-statistics-and-grouping"><code>matmul</code>, axis statistics (<code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>), accumulating
+scatters (<code>put_add</code>, <code>bincount</code>, <code>histogram</code>), sorting, group-by, <code>unique</code> and quantiles</a>.
+Axis reductions no longer evaluate a pending operand first
+(<a href="#primitives-that-read-an-expression">What fuses</a>).</li>
+<li>Guide pages for <a href="#scalars-that-change"><code>Scalar</code></a>, <a href="#elementwise-operations">elementwise math</a>,
+<a href="#convolution">convolution</a> and the <a href="#line-solvers-solve_tridiagonal">tridiagonal solvers</a>,
+which earlier releases already had.</li>
+</ul>
 <h1 id="migration-from-02"><a class="header" href="#migration-from-02">Migration from 0.2</a></h1>
 <p>0.3 changes two things your 0.2 code can trip over. Almost everything else in 0.3 is added; the few behaviour changes (a lazy <code>reshape</code> of a view, fusion decided by a cost model, a larger buffer pool) are listed under <em>Changed</em> in the changelog.</p>
 <h2 id="reductions-are-lazy-arrays"><a class="header" href="#reductions-are-lazy-arrays">Reductions are lazy arrays</a></h2>

@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -209,6 +209,25 @@ x += 1.0;            // in-place, fused too; y is computed first, so it keeps th
 assert_eq!(y.to_vec()?, vec![10.0, 20.0]);
 assert_eq!(x.to_vec()?, vec![2.0, 3.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="scalars-that-change"><a class="header" href="#scalars-that-change">Scalars that change</a></h2>
+<p>A number in an expression is a uniform of the kernel, not part of it, so <code>&amp;x * 2.0</code> and
+<code>&amp;x * 3.0</code> share one compiled kernel. A <a href="https://docs.rs/luma/latest/luma/struct.Scalar.html"><code>Scalar</code></a>
+is a number you can change between operations: <code>Scalar::new(v)</code>, <code>set(v)</code>, <code>get()</code>. It holds an
+<code>f32</code>, <code>u32</code> or <code>i32</code> and works wherever a plain number does. The value is read when the operation
+is <strong>recorded</strong>: operations recorded before a <code>set</code> keep the old value, also if they run later.
+Clones share the value.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+let s = Scalar::new(2.0f32);
+let a = &amp;x * &amp;s;                 // doubles
+s.set(3.0);
+let b = &amp;x * &amp;s;                 // triples; `a` still doubles
+assert_eq!(a.to_vec()?, vec![2.0, 4.0]);
+assert_eq!(b.to_vec()?, vec![3.0, 6.0]);
+assert_eq!(s.get(), 3.0);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>This is how a loop varies a parameter (a time step, a coefficient) without recompiling.</p>
 <h2 id="when-kernels-run"><a class="header" href="#when-kernels-run">When kernels run</a></h2>
 <p>A kernel runs when one of these happens:</p>
 <div class="table-wrapper">
@@ -250,8 +269,13 @@ epilogue of a <a href="reductions.html">reduction</a>. A view of a lazy expressi
 reader’s index, staged in workgroup memory, or evaluated first, whichever the
 <a href="performance.html#the-cost-model">cost model</a> estimates is cheapest (within the caps below: a kernel
 that would exceed <code>LUMA_FUSION_MAX_INLINED</code> is cut whatever the model says).</p>
-<p>Not fused, because they need whole-array structure: <code>scan</code>, <code>sum_axis</code>, tridiagonal solves, FFT
-convolution, and your own kernels. They read the arrays they are given, which are computed first.</p>
+<p>Not fused, because they need whole-array structure: <code>scan</code>, tridiagonal solves, FFT convolution,
+and your own kernels. They read the arrays they are given, which are computed first.
+<code>matmul</code>, the axis reductions (<code>sum_axis</code>, <code>reduce_axis</code>, …), the scatters (<code>put_add</code>, …) and
+the sorts are kernels of their own too, but they compute a pending operand <em>inside</em> their loads
+instead of storing it, and <code>matmul</code>, the axis reductions and the sorts are eager: the result is
+evaluated when the call returns, so what reads it is another kernel
+(<a href="performance.html#primitives-that-read-an-expression">Performance guide</a>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
 <code>LUMA_FUSION_MAX_LIVE</code>, <code>LUMA_FUSION_MAX_INLINED</code>) or when evaluating a shared piece first is
 cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits"><code>Profile::splits</code></a> tells you where

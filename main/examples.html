@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -373,12 +373,57 @@ What to look at:</p>
 an array along axis 0, so <code>&amp;pt ^ &amp;guesses</code> broadcasts to the whole matrix;</li>
 <li><code>take</code> does both table lookups, and <code>sum_axis(0)</code> of centred products gives the covariance
 columns, all broadcasting: the program never writes a loop over guesses or traces;</li>
-<li>the gathers and the elementwise products fuse; <code>sum_axis</code> does not fuse its operand, so the
-centred and multiplied <code>[traces, 256]</code> arrays are computed before it. Wrap the analysis in
-<code>ctx.profile(..)</code> and count <code>launches()</code> to see.</li>
+<li>the gathers and the elementwise products fuse, and so does <code>sum_axis</code> into its operand: the
+centred and multiplied <code>[traces, 256]</code> arrays are computed inside the reduction, not stored.
+Wrap the analysis in <code>ctx.profile(..)</code> and count <code>launches()</code> to see.</li>
 </ul>
 <p>Replace the stand-in S-box with your cipher’s table and the synthetic leakage with a measured
 sample per trace to use it on real data.</p>
+<h2 id="a-small-data-science-pipeline"><a class="header" href="#a-small-data-science-pipeline">A small data-science pipeline</a></h2>
+<p>A table of three features and a category per row, reduced to the usual first look: standardise,
+correlate, summarise per category, histogram, quartiles and the top rows. The table is stored
+with one column per feature, <code>[rows, features]</code>, so each feature is contiguous and the statistics
+run along axis 0. See <a href="data.html">Matrices, statistics and grouping</a> for each operation.</p>
+<pre><code class="language-rust">use luma::*;
+
+let rows = 8;
+// Feature 0 counts up, feature 1 is twice feature 0, feature 2 counts down.
+let table = Array::from_slice(
+    &amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+      2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0,
+      8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+    [rows, 3],
+)?;
+// A category (dense code) for every row.
+let category = Array::from_slice(&amp;[0u32, 1, 0, 1, 0, 1, 2, 2], rows)?;
+
+// Standardise the columns. `z` is a lazy expression, computed where it is used.
+let z = (&amp;table - &amp;table.mean_axis(0)) / table.std_axis(0);
+
+// Correlation matrix: the Gram matrix of `z`, fused into the product's loads.
+let corr = (z.matmul(&amp;z.transpose()) / (rows as f32)).to_vec()?;
+let expected = [1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0];
+assert!(corr.iter().zip(expected).all(|(got, want)| (got - want).abs() &lt; 1e-4));
+
+// Per-category mean of feature 0 (the first `rows` elements of the table).
+let feature0 = table.slice(1, 0..1).reshape(rows);
+assert_eq!(feature0.group_mean(&amp;category, 3).to_vec()?, vec![3.0, 4.0, 7.5]);
+
+// Histogram of feature 0 in four bins of width 2 over [0, 8): 1 | 2 3 | 4 5 | 6 7 8
+// (8.0 is not below `hi`, so it lands in the last bin).
+assert_eq!(feature0.histogram(4, 0.0, 8.0).to_vec()?, vec![1, 2, 2, 3]);
+
+// Median and quartiles.
+assert_eq!(feature0.median().item()?, 4.5);
+assert_eq!(feature0.quantile(0.25).item()?, 2.75);
+assert_eq!(feature0.quantile(0.75).item()?, 6.25);
+
+// The three rows with the largest value of feature 2, and their feature 0.
+let feature2 = table.slice(1, 2..3).reshape(rows);
+let top = feature2.argsort_descending().slice(0, 0..3);
+assert_eq!(top.to_vec()?, vec![0, 1, 2]);
+assert_eq!(feature0.take(&amp;top).to_vec()?, vec![1.0, 2.0, 3.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 
                     </main>
 

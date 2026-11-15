@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,9 +182,10 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="integer-and-bit-operations"><a class="header" href="#integer-and-bit-operations">Integer and bit operations</a></h1>
-<p><code>Array&lt;u32&gt;</code> is the integer type: indices, masks, counters, and the lanes of bit-sliced
+<p><code>Array&lt;u32&gt;</code> is the unsigned integer type: indices, counters, and the lanes of bit-sliced
 cryptography. A <code>u32</code> array fuses, views, reduces, scans and loops like an <code>f32</code> one, and has the
-bit operations of a hash function. There is no signed integer type; <code>u32</code> arithmetic wraps.</p>
+bit operations of a hash function; <code>u32</code> arithmetic wraps. <code>Array&lt;i32&gt;</code> is the signed one
+(<a href="#signed-integers-and-casts">below</a>), and <code>Array&lt;bool&gt;</code> the result of comparisons.</p>
 <h2 id="arithmetic"><a class="header" href="#arithmetic">Arithmetic</a></h2>
 <p><code>+ - * / %</code> work on <code>u32</code> arrays and <code>u32</code> scalars, and wrap modulo <code>2^32</code> where a Rust
 <code>wrapping_*</code> would. Division and remainder by an element that is zero follow WGSL: <code>x / 0</code> is <code>x</code>
@@ -234,28 +235,67 @@ assert_eq!(x.rotate_right(&amp;amounts).to_vec()?, vec![0x1800_0000, 0x7812_3456
 <code>x.rotate_left(7u32)</code>) the amount is compiled into the kernel as a constant: no masking, and one
 instruction. Hash functions are written with constant amounts, so this is the path they use. An
 array of amounts costs a mask and a variable shift per element.</p>
-<h2 id="comparisons-masks-and-select"><a class="header" href="#comparisons-masks-and-select">Comparisons, masks and <code>select</code></a></h2>
-<p>Comparisons (<code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code>) of any element type return <code>Array&lt;u32&gt;</code> masks of
-<code>0</code> or <code>1</code>. Masks combine with <code>&amp;</code>, <code>|</code> and <code>^</code>. Negate a mask with <code>^ 1u32</code>: <code>!</code> flips all 32 bits, and
-<code>!1</code> is not <code>0</code>. <code>select(&amp;mask, a, b)</code> takes <code>a</code> where the mask is non-zero and <code>b</code>
-elsewhere, for any element type; <code>a</code> and <code>b</code> are arrays or scalars.</p>
+<h2 id="comparisons-booleans-and-select"><a class="header" href="#comparisons-booleans-and-select">Comparisons, booleans and <code>select</code></a></h2>
+<p>Comparisons (<code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code>) of any element type return <code>Array&lt;bool&gt;</code>: a boolean
+per element, stored as one bit (<a href="arrays.html#booleans">how to make and read one</a>).
+Booleans combine with <code>&amp;</code>, <code>|</code> and <code>^</code> (and the compound forms <code>&amp;=</code>, <code>|=</code>, <code>^=</code>, also with a single
+<code>bool</code>), and <code>!</code> negates them; <code>*</code> of two boolean arrays is the logical and. <code>select(&amp;cond, a, b)</code>
+takes <code>a</code> where the condition is true and <code>b</code> elsewhere, for any element type; <code>a</code> and <code>b</code> are
+arrays or scalars, and the condition is an <code>Array&lt;bool&gt;</code> or an <code>Array&lt;u32&gt;</code> (non-zero is true).
+<code>count()</code> is the number of true elements (a <code>u32</code> array, and <code>sum()</code> is the same), <code>any()</code> and
+<code>all()</code> are one-element <code>bool</code> arrays; read one with <code>item()</code>. A boolean array times a number
+promotes as in NumPy: <code>mask * &amp;x</code> is <code>x</code> where true and 0 elsewhere (a <code>select</code>, so it fuses as
+cheaply as one), and <code>mask + &amp;x</code> / <code>mask - &amp;x</code> use the 0 and 1 of <code>x</code>’s type. <code>to_u32()</code>, <code>to_i32()</code>
+and <code>to_f32()</code> convert explicitly.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[3u32, 9, 12, 5], 4)?;
-let in_range = x.ge(4u32) &amp; x.lt(10u32);               // 1 where 4 &lt;= x &lt; 10
-assert_eq!(in_range.to_vec()?, vec![0, 1, 0, 1]);
-assert_eq!((&amp;in_range ^ 1u32).to_vec()?, vec![1, 0, 1, 0]);
+let in_range = x.ge(4u32) &amp; x.lt(10u32);               // true for 4 &lt;= x &lt; 10
+assert_eq!(in_range.to_vec()?, vec![false, true, false, true]);
+assert_eq!((!&amp;in_range).to_u32().to_vec()?, vec![1, 0, 1, 0]);
 
 // Clamp to 10, keep the rest.
 let clamped = select(&amp;x.gt(10u32), 10u32, &amp;x);
 assert_eq!(clamped.to_vec()?, vec![3, 9, 10, 5]);
 
-// Counting is summing a mask; `sum_where` sums values under a mask.
-assert_eq!(in_range.sum().item()?, 2);
+// `count` counts the true elements; `sum_where` sums values under a condition.
+assert_eq!(in_range.count().item()?, 2);
 assert_eq!(x.sum_where(&amp;in_range).item()?, 14);
+// A boolean times a number keeps the number where true.
+assert_eq!((&amp;in_range * &amp;x).to_vec()?, vec![0, 9, 0, 5]);
+
+// `any` and `all` are one-element `bool` arrays. `&amp;=`, `|=`, `^=` work in place.
+assert!(in_range.any().item()?);
+assert!(!in_range.all().item()?);
+let mut flags = x.ge(4u32);
+flags &amp;= &amp;x.lt(10u32);
+assert_eq!(flags.to_vec()?, vec![false, true, false, true]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><code>u32</code> has no unary minus and no implicit conversion to <code>f32</code>; to use a mask in float arithmetic
-write <code>select(&amp;mask, 1.0, 0.0)</code>, which fuses.</p>
+<p>Comparisons with a NaN are the GPU’s: <code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code> and <code>eq</code> are false for a NaN operand,
+and <code>ne</code> was false too on every device the tests ran on (NVIDIA, llvmpipe), so <code>x.ne(&amp;x)</code> is <strong>not</strong> a NaN test. Use
+<code>is_nan()</code> (<a href="precision.html">Precision</a>).</p>
+<p><code>u32</code> has no unary minus. To use a boolean array in float arithmetic write <code>mask * &amp;x</code>,
+<code>mask.to_f32()</code> or <code>select(&amp;mask, 1.0, 0.0)</code>; all fuse.</p>
+<h2 id="signed-integers-and-casts"><a class="header" href="#signed-integers-and-casts">Signed integers and casts</a></h2>
+<p><code>Array&lt;i32&gt;</code> has the arithmetic of <code>u32</code> plus unary minus, <code>abs</code> and <code>sign</code>, and <code>&gt;&gt;</code> is
+arithmetic (the sign bit comes in from the left). <code>+ - *</code> wrap; division and remainder follow
+WGSL: <code>x / 0</code> is <code>x</code>, <code>i32::MIN / -1</code> is <code>i32::MIN</code>, <code>x % 0</code> and <code>i32::MIN % -1</code> are 0, and
+<code>abs(i32::MIN)</code> stays <code>i32::MIN</code>. There are no rotations and no float math.</p>
+<p>Casts between <code>f32</code>, <code>u32</code> and <code>i32</code> are methods. Float to integer truncates toward zero and
+saturates (<code>u32</code> at <code>4294967040</code>, <code>i32</code> at <code>-2147483648..=2147483520</code>), and NaN becomes 0.
+<code>u32</code> and <code>i32</code> reinterpret the bits (two’s complement).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[-1.5f32, 2.7, f32::NAN, 1e20, -1e20], 5)?;
+assert_eq!(x.to_i32().to_vec()?, vec![-1, 2, 0, 2_147_483_520, i32::MIN]);
+assert_eq!(x.to_u32().to_vec()?, vec![0, 2, 0, 4_294_967_040, 0]);
+
+let n = Array::from_slice(&amp;[7i32, -7, i32::MIN], 3)?;
+assert_eq!((&amp;n / 2).to_vec()?, vec![3, -3, -1_073_741_824]);
+assert_eq!(n.abs().to_vec()?, vec![7, 7, i32::MIN]);
+assert_eq!((-&amp;n).to_f32().to_vec()?[..2], [-7.0, 7.0]);
+assert_eq!(n.to_u32().to_vec()?, vec![7, u32::MAX - 6, 1 &lt;&lt; 31]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="64-bit-lanes-as-pairs-of-u32"><a class="header" href="#64-bit-lanes-as-pairs-of-u32">64-bit lanes as pairs of <code>u32</code></a></h2>
 <p>A 64-bit lane is a pair <code>(lo, hi)</code> of <code>u32</code> arrays, one element per independent instance. A
 rotation by a constant swaps the halves from 32 and then funnels bits across them. This is the
@@ -332,9 +372,11 @@ let best = (0..256).max_by(|&amp;a, &amp;b| corr[a].total_cmp(&amp;corr[b])).unw
 assert_eq!(best, 0x2b);
 assert!(corr[best] &gt; 0.999);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>The gathers and the elementwise arithmetic fuse, but <code>sum_axis</code> does not fuse its operand
-(<a href="reductions.html#scans">Reductions</a>): the arrays it reduces (<code>hc * tc</code>, …) are computed into
-<code>[traces, 256]</code> buffers first. Wrap the analysis in <code>ctx.profile(..)</code> to see the kernels.</p>
+<p>The gathers and the elementwise arithmetic fuse, and <code>sum_axis</code> computes its operand inside its
+first pass (<a href="performance.html#what-fuses-and-what-cuts">What fuses</a>): <code>hc * tc</code> is never stored.
+<code>h</code> and the centred columns are read by several reductions, so the
+<a href="performance.html#the-cost-model">cost model</a> may still evaluate them into <code>[traces, 256]</code>
+buffers. Wrap the analysis in <code>ctx.profile(..)</code> to see the kernels.</p>
 <h2 id="states-in-iterate_all"><a class="header" href="#states-in-iterate_all">States in <code>iterate_all</code></a></h2>
 <p><code>u32</code> arrays are a valid state for <a href="loops.html#elementwise-loops-iterate_all"><code>iterate_all</code></a>. An
 integer step that is elementwise, such as a hash round or a random-number generator, runs as a

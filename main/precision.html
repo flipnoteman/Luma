@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -242,10 +242,32 @@ let tiny = (&amp;x - Df32::from(1.0f32)).to_f32().item()?;
 assert!((f64::from(tiny) - ((1.0 + 1e-12) - 1.0)).abs() &lt; 1e-18);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><code>Array&lt;Df32&gt;</code> has <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, comparisons, <code>minimum</code>, <code>maximum</code>, <code>select</code>, views,
-<code>assign</code>, and reductions (<code>sum</code>, <code>min</code>, <code>max</code>; <code>item()</code> gives a <code>Df32</code>). It has no <code>exp</code> or
-trigonometry: cast to <code>f32</code> and back around such a call. Scalars may be <code>Df32</code> values;
-a Rust <code>f32</code> literal in a <code>Df32</code> expression is not converted for you (write <code>Df32::from(1.0f32)</code>
-or build the array with <code>to_df32()</code>).</p>
+<code>assign</code>, and reductions (<code>sum</code>, <code>min</code>, <code>max</code>; <code>item()</code> gives a <code>Df32</code>). It also has <code>exp</code>, <code>ln</code>,
+<code>tanh</code> and <code>powf</code> (below). It has no trigonometry: cast to <code>f32</code> and back around such a call.
+Scalars may be <code>Df32</code> values; a Rust <code>f32</code> literal in a <code>Df32</code> expression is not converted for you
+(write <code>Df32::from(1.0f32)</code> or build the array with <code>to_df32()</code>).</p>
+<p><strong>Functions.</strong> <code>exp</code>, <code>ln</code>, <code>tanh</code> and <code>powf(Df32)</code> are built from <code>Df32</code> arithmetic and fuse like
+it. Their relative error is below <code>2^-43</code> (<code>1e-13</code>; at most <code>4.3e-14</code> measured against <code>f64</code> on the
+RTX 3090 and on llvmpipe): <code>exp</code> on <code>[-55, 80]</code>, <code>ln</code> from <code>1e-24</code> to <code>1e30</code> (and near 1, where the
+error is relative to the result), <code>tanh</code> on <code>[-30, 30]</code> (also near 0), and <code>x^1.5</code> or <code>x^0.7</code> for
+<code>x</code> in <code>[1, 3000]</code>. <code>powf</code> splits the exponent of <code>x</code> exactly, so its error does not grow with
+<code>y ln x</code>. Where a <code>Df32</code> is below about <code>1e-25</code> its low word is under the smallest normal <code>f32</code>
+and loses bits, which limits every function there: <code>exp</code> of an argument under <code>-55</code> has an absolute
+error of about <code>1e-38</code> (a relative error of that over the result), and a result below <code>2^-126</code> is <code>0</code>. Out of range <code>exp</code> is
+infinity above <code>88.72</code> and <code>0</code> below <code>-87.33</code>, <code>tanh</code> is <code>+-1</code> from <code>|x| &gt; 20</code>, and <code>ln</code> and <code>powf</code>
+follow <code>f32</code> (<code>ln(0)</code> is <code>-inf</code>, <code>ln</code> and <code>powf</code> of a negative base are <code>NaN</code>, <code>x^0</code> is <code>1</code>, zero
+and infinite bases give the <code>pow</code> results). <code>f64</code> arrays have none of these functions.</p>
+<pre><code class="language-rust">use luma::*;
+
+let t = Array::from_slice(&amp;[Df32::from(300.0), Df32::from(2000.0)], 2)?;
+// Sutherland-type T^1.5 and an SST blending function, kept in Df32.
+let power = t.powf(Df32::from(1.5)).to_vec()?;
+assert!((power[0].to_f64() / 300f64.powf(1.5) - 1.0).abs() &lt; 1e-13);
+let blend = (&amp;t * Df32::from(0.001)).tanh().to_vec()?;
+assert!((blend[1].to_f64() / 2f64.tanh() - 1.0).abs() &lt; 1e-13);
+let back = (t.ln()).exp().to_vec()?;
+assert!((back[1].to_f64() / 2000.0 - 1.0).abs() &lt; 1e-13);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><strong>Cost.</strong> One <code>Df32</code> add or multiply costs <code>df32_factor</code> <code>f32</code> operations: 27 on the RTX 3090
 and 44 on the integrated GPU the model was measured on, 2.3 on llvmpipe. The
 <a href="https://docs.rs/luma/latest/luma/struct.CostModel.html"><code>CostModel</code></a> of the device records the
@@ -298,16 +320,16 @@ assert!((f64::from(norm) - (exact * f64::from(0.1f32)).sqrt()).abs() &lt; 1e-3);
 precision, so the result is the correctly rounded sum except where the terms cancel almost
 completely. To keep the extra bits, reduce a <code>Df32</code> array yourself: <code>x.to_df32().sum()</code>.</p>
 <h2 id="non-finite-values"><a class="header" href="#non-finite-values">Non-finite values</a></h2>
-<p><code>f32</code>, <code>f64</code> and <code>Df32</code> arrays have lazy <code>u32</code> masks <code>is_finite()</code>, <code>is_nan()</code> and <code>is_inf()</code>.
+<p><code>f32</code>, <code>f64</code> and <code>Df32</code> arrays have lazy <code>bool</code> arrays <code>is_finite()</code>, <code>is_nan()</code> and <code>is_inf()</code>.
 They test the bits of the exponent, so they do not depend on how the device compares NaN (a shader
 compiler may assume NaN does not exist and fold <code>x != x</code>). They fuse like any elementwise
 operation:</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, f32::INFINITY, f32::NAN, -2.0], 4)?;
-assert_eq!(x.is_finite().to_vec()?, vec![1, 0, 0, 1]);
-assert_eq!(x.is_nan().to_vec()?, vec![0, 0, 1, 0]);
-assert_eq!(x.is_inf().to_vec()?, vec![0, 1, 0, 0]);
+assert_eq!(x.is_finite().to_u32().to_vec()?, vec![1, 0, 0, 1]);
+assert_eq!(x.is_nan().to_u32().to_vec()?, vec![0, 0, 1, 0]);
+assert_eq!(x.is_inf().to_u32().to_vec()?, vec![0, 1, 0, 0]);
 
 // Sanitise in one fused kernel.
 let clean = select(&amp;x.is_finite(), &amp;x, 0.0);

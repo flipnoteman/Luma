@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -193,7 +193,7 @@ on the GPU:</p>
 </thead>
 <tbody>
 <tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate"><code>Array::iterate</code></a></td><td><code>steps</code> applications of a step on one <code>f32</code> array; stencils run time-blocked</td></tr>
-<tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a></td><td><code>steps</code> applications of a step on several arrays of one element type; elementwise <code>f32</code> and <code>u32</code> steps keep the state in registers</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a></td><td><code>steps</code> applications of a step on several arrays of one element type; elementwise <code>f32</code>, <code>u32</code> and <code>i32</code> steps keep the state in registers</td></tr>
 <tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate_until"><code>Array::iterate_until</code></a></td><td>a step until the largest change is below a tolerance</td></tr>
 <tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_until_all.html"><code>iterate_until_all</code></a></td><td>a step on any <a href="records.html">record</a> until a rule over recorded scalars holds</td></tr>
 </tbody>
@@ -252,7 +252,7 @@ let [z, count] = iterate_all([&amp;zero, &amp;zero], 64, |[z, count]| {
 assert_eq!(count.to_vec()?, vec![64.0, 64.0, 2.0, 3.0]);
 <span class="boring">z.eval()?;
 </span><span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>The states may be <code>u32</code> as well, which makes register loops of integer recurrences, hash rounds
+<p>The states may be <code>u32</code> or <code>i32</code> as well, which makes register loops of integer recurrences, hash rounds
 and counters (see <a href="integers.html">Integer and bit operations</a>):</p>
 <pre><code class="language-rust">use luma::*;
 
@@ -405,6 +405,101 @@ several steps. Values are those of the program as written; a miss only costs the
 work. <code>LUMA_SPECULATE=off</code> disables it (<a href="environment.html">Environment variables</a>). If the loop
 only needs a convergence test, <code>iterate_until</code> and <code>iterate_until_all</code> wait once per block of
 steps instead of once per step.</p>
+<h2 id="line-solvers-solve_tridiagonal"><a class="header" href="#line-solvers-solve_tridiagonal">Line solvers: <code>solve_tridiagonal</code></a></h2>
+<p>An implicit time step (diffusion, a pressure correction) solves one tridiagonal system per grid
+line. <code>solve_tridiagonal(axis, &amp;lo, &amp;diag, &amp;up, &amp;rhs)</code> solves
+<code>lo[s] x[s-1] + diag[s] x[s] + up[s] x[s+1] = rhs[s]</code> along <code>axis</code> for every line of four
+<code>f32</code> arrays of one shape (<code>lo</code> at the first and <code>up</code> at the last cell of a line are ignored); the
+result has the shape of <code>rhs</code>. It evaluates the operands and does not wait for the GPU. A zero
+pivot gives <code>Inf</code> / <code>NaN</code> in that line; Luma does not check. A shape or context mismatch poisons
+the result.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two lines of four cells along axis 0 (shape [4, 2]): the matrix tridiag(-1, 2, -1).
+let lo = Array::from_slice(&amp;[0.0f32, -1.0, -1.0, -1.0, 0.0, -1.0, -1.0, -1.0], [4, 2])?;
+let diag = Array::full([4, 2], 2.0f32)?;
+let up = Array::from_slice(&amp;[-1.0f32, -1.0, -1.0, 0.0, -1.0, -1.0, -1.0, 0.0], [4, 2])?;
+let rhs = Array::from_slice(&amp;[1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 5.0], [4, 2])?;
+
+let x = solve_tridiagonal(0, &amp;lo, &amp;diag, &amp;up, &amp;rhs).to_vec()?;
+let want = [1.0f32, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0];
+assert!(x.iter().zip(want).all(|(a, b)| (a - b).abs() &lt; 1e-5));
+
+// `_from`: line `l` starts at cell `start[l]`; the cells before it are 0.
+let start = Array::from_slice(&amp;[0u32, 2], 2)?;
+let y = solve_tridiagonal_from(0, &amp;lo, &amp;diag, &amp;up, &amp;rhs, &amp;start).to_vec()?;
+assert_eq!(&amp;y[4..6], &amp;[0.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>solve_block_tridiagonal(block, axis, &amp;lo, &amp;diag, &amp;up, &amp;rhs)</code> is the same with <code>block x block</code>
+blocks (<code>1 &lt;= block &lt;= 8</code>), for coupled unknowns per cell. <code>rhs</code> has shape <code>[block, g0, g1, g2]</code>; <code>lo</code>, <code>diag</code> and <code>up</code> have
+<code>[block * block, g0, g1, g2]</code>, entry <code>(row, col)</code> of a block at <code>row * block + col</code>; <code>axis</code> is
+<code>1..=3</code>. <code>solve_block_tridiagonal_from</code> takes a <code>start</code> array like the scalar form.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Block 2, three cells along axis 1, diagonal blocks 2 * identity, no coupling: x = rhs / 2.
+let zero = Array::&lt;f32&gt;::zeros([4, 3])?;
+let diag = Array::from_slice(&amp;[2.0f32, 0.0, 0.0, 2.0].repeat(3), [4, 3])?;
+let rhs = Array::from_slice(&amp;[2.0f32, 4.0, 6.0, 8.0, 10.0, 12.0], [2, 3])?;
+let x = solve_block_tridiagonal(2, 1, &amp;zero, &amp;diag, &amp;zero, &amp;rhs);
+assert_eq!(x.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="solving-on-parts-and-several-systems-at-once"><a class="header" href="#solving-on-parts-and-several-systems-at-once">Solving on parts, and several systems at once</a></h3>
+<p>The blocks of a cell often come as sixteen (or four, or nine) arrays of their own, the entries
+of a Jacobian, each an expression of the state; stacking them into the <code>[block * block, ..]</code>
+arrays above is a kernel per stack, and reading the solution’s components back is a gather.
+<code>solve_block_tridiagonal_parts(axis, lo, diag, up, rhs)</code> takes the entries as arrays of the grid’s
+shape instead (<code>lo</code>, <code>diag</code> and <code>up</code> as <code>[&amp;Array&lt;f32&gt;; block * block]</code>, entry <code>(row, col)</code> at
+<code>row * block + col</code>, <code>rhs</code> as <code>[&amp;Array&lt;f32&gt;; block]</code>) and returns the components of the solution
+as <code>[Array&lt;f32&gt;; block]</code>. <code>axis</code> is an axis of the grid, as for <code>solve_tridiagonal</code>. A part that
+is a lazy expression is not evaluated: the solver kernel computes it where it reads the
+coefficients of a cell, so a step from the state to the solution can be one launch. Parts that are
+evaluated arrays are bound as buffers. If the expressions need more buffers or scalars than a
+kernel can bind, or cannot be read by the kernel, or the blocks are 6 to 8 wide, or the Thomas
+solve is chosen (<code>LUMA_TRIDIAGONAL=thomas</code>) and its scratch exceeds a buffer, the parts are
+stacked and the stacked solve runs; the result is the same.
+<code>solve_block_tridiagonal_parts_from</code> takes a <code>start</code> array.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Block 2 on a [5, 3] grid along axis 0: the diagonal blocks are diag(d, 4) with `d` an expression
+// (never evaluated alone), no coupling between cells: x = rhs / diag.
+let zero = Array::&lt;f32&gt;::zeros([5, 3])?;
+let two = Array::&lt;f32&gt;::full([5, 3], 2.0)?;
+let (r0, r1) = (Array::&lt;f32&gt;::full([5, 3], 3.0)?, Array::&lt;f32&gt;::full([5, 3], 8.0)?);
+let d0 = &amp;two + 0.0;
+let d1 = &amp;two * 2.0;
+let [x0, x1] = solve_block_tridiagonal_parts(0, [&amp;zero; 4], [&amp;d0, &amp;zero, &amp;zero, &amp;d1], [&amp;zero; 4], [&amp;r0, &amp;r1]);
+assert_eq!(x0.to_vec()?, vec![1.5; 15]);
+assert_eq!(x1.to_vec()?, vec![2.0; 15]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Independent scalar systems on one grid (the two equations of a turbulence model, say) solve in
+one launch with <code>solve_tridiagonal_parts(axis, [(&amp;lo_k, &amp;diag_k, &amp;up_k, &amp;rhs_k), (&amp;lo_w, ..)])</code>,
+which returns one solution per system (<code>_from</code> with a <code>start</code> array likewise; up to 64 systems):
+the lines of all systems fill the device together, and the lazy parts are computed in the kernel as
+above. An extra axis of a single array batches systems as well: <code>solve_tridiagonal</code> on <code>[2, ni, nj]</code>
+arrays along axis 1 or 2 solves two systems per line, whichever algorithm runs.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two systems on a [6, 2] grid along axis 0: x[s] - 0.25 (x[s-1] + x[s+1]) = rhs[s], with
+// right-hand sides 1 and 2, so the second solution is twice the first.
+let lo = Array::&lt;f32&gt;::full([6, 2], -0.25)?;
+let up = Array::&lt;f32&gt;::full([6, 2], -0.25)?;
+let diag = Array::&lt;f32&gt;::full([6, 2], 1.0)?;
+let rhs = Array::&lt;f32&gt;::full([6, 2], 1.0)?;
+let rhs2 = &amp;rhs * 2.0;
+let [x, y] = solve_tridiagonal_parts(0, [(&amp;lo, &amp;diag, &amp;up, &amp;rhs), (&amp;lo, &amp;diag, &amp;up, &amp;rhs2)]);
+let (x, y) = (x.to_vec()?, y.to_vec()?);
+assert!(x.iter().zip(&amp;y).all(|(a, b)| (2.0 * a - b).abs() &lt; 1e-5));
+
+// A batch axis: [2, 6, 2] along axis 1 is the two systems above, stacked.
+let stack = |a: &amp;Array&lt;f32&gt;| stack_slice(0, &amp;[a.clone(), a.clone()]);
+let batched = solve_tridiagonal(1, &amp;stack(&amp;lo), &amp;stack(&amp;diag), &amp;stack(&amp;up), &amp;stack_slice(0, &amp;[rhs.clone(), rhs2.clone()]));
+let z = batched.to_vec()?;
+assert!((z[0] - x[0]).abs() &lt; 1e-5 &amp;&amp; (z[1] - y[0]).abs() &lt; 1e-5);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Which algorithm runs (one invocation per line, or one workgroup per line by cyclic reduction)
+is chosen automatically; <code>LUMA_TRIDIAGONAL</code> forces one
+(<a href="environment.html">Environment variables</a>). The cyclic one uses workgroup memory
+(<a href="faq.html#radv-integrated-gpus-give-wrong-results">FAQ</a>).</p>
 
                     </main>
 

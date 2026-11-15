@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -227,6 +227,7 @@ and source line where an expression was cut, and the
 <tr><td><code>Scalars</code></td><td>the scalar operands do not fit one uniform buffer</td></tr>
 <tr><td><code>Inlined</code></td><td>views of lazy expressions unfolded into more instructions than the device’s cap</td></tr>
 <tr><td><code>Materialised</code></td><td>the <a href="#the-cost-model">cost model</a> estimates that storing an expression once is cheaper than recomputing it at each read</td></tr>
+<tr><td><code>Shared</code></td><td>an expression that other pending operations outside the kernel read too is stored once instead of recomputed in each</td></tr>
 </tbody>
 </table>
 </div>
@@ -292,7 +293,29 @@ launches of about 40 ms of GPU time by it, and it decides when a circular <code>
 is recomputed, staged, or evaluated first.</p>
 <h2 id="what-fuses-and-what-cuts"><a class="header" href="#what-fuses-and-what-cuts">What fuses, and what cuts</a></h2>
 <p>Fused: elementwise operations, comparisons, <code>select</code>, casts, generators, views, compound
-assignment, the input and the epilogue of a reduction (<a href="lazy.html#what-fuses">Lazy evaluation</a>).</p>
+assignment, the input and the epilogue of a reduction (<a href="lazy.html#what-fuses">Lazy evaluation</a>),
+and, in the primitives below, the expressions they read.</p>
+<h3 id="primitives-that-read-an-expression"><a class="header" href="#primitives-that-read-an-expression">Primitives that read an expression</a></h3>
+<p>These need a kernel of their own, but a pending operand is not stored first: its expression
+becomes the load of that kernel.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Primitive</th><th>Computed inside the kernel</th><th>When it runs</th></tr>
+</thead>
+<tbody>
+<tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
+<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code></td><td>the operand, in the first pass over the data</td><td>eager: the result is evaluated when the call returns</td></tr>
+<tr><td><code>put_add</code>, <code>put_min</code>, <code>put_max</code>, <code>bincount</code>, <code>histogram</code>, <code>group_*</code></td><td>the value and the index (or code, or bucket) expressions of the scatter</td><td>an in-place write, like <code>put</code></td></tr>
+<tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
+</tbody>
+</table>
+</div>
+<p>An operand that reads circular <code>shift</code>s of other expressions, or lives in several buffers, is
+evaluated first instead. <code>scan</code> and <code>cumsum</code> always evaluate their operand (they read it twice).
+Because these results are evaluated at the call, a loop that calls them every step builds one
+kernel per call rather than one fused chain: count launches with <code>ctx.profile(..)</code>. Usage is in
+<a href="data.html">Matrices, statistics and grouping</a>: <a href="data.html#matrix-products"><code>matmul</code></a>, <a href="data.html#statistics-along-an-axis">axis statistics</a>, <a href="data.html#accumulating-scatters">scatters</a>, <a href="data.html#sorting">sorting</a>.</p>
 <p>An expression is cut when it passes a limit. They are generous, and a cut costs a launch and a trip
 through memory, not correctness:</p>
 <div class="table-wrapper">
@@ -314,8 +337,8 @@ through memory, not correctness:</p>
 share work with it), and the rest is flattened again. A kernel that reads many different arrays
 (the 50 words of a Keccak state) is the one that meets the input limit; keep such loops in
 <code>iterate_all</code>, or split them in the source.</p>
-<p>Never fused, because they need whole-array structure: <code>scan</code>, axis reductions, tridiagonal solves,
-FFT convolution, and custom kernels. They read computed arrays.</p>
+<p>Never fused, because they need whole-array structure: <code>scan</code>, tridiagonal solves, FFT
+convolution, and custom kernels. They read computed arrays.</p>
 <h2 id="caches"><a class="header" href="#caches">Caches</a></h2>
 <ul>
 <li><strong>Kernels</strong> are cached per context by the <em>structure</em> of the expression: operations, types, how

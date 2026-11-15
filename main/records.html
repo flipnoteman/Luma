@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -197,7 +197,7 @@ trait:</p>
 <li>a tuple of up to six records <code>(A, B, ..)</code>,</li>
 <li>a struct declared with <code>luma::fields!</code>.</li>
 </ul>
-<p>All the arrays of a record have the same element type (<code>f32</code>, <code>Df32</code>, <code>f64</code> or <code>u32</code>) and the same
+<p>All the arrays of a record have the same element type (<code>f32</code>, <code>Df32</code>, <code>f64</code>, <code>u32</code> or <code>i32</code>) and the same
 shape. <code>Fields::Elem</code> is that type.</p>
 <pre><code class="language-rust">use luma::*;
 
@@ -283,7 +283,7 @@ element type is a compile error. Nested records count every array (<code>COUNT</
 <tr><td>operators</td><td><code>+ - * /</code> between records, with an element value (<code>f32</code> for an <code>f32</code> record) and with an <code>Array&lt;Elem&gt;</code>, any reference/owned combination, the scalar or array on either side; <code>+= -= *= /=</code> with <code>&amp;Record</code>, a value and <code>&amp;Array</code>; unary <code>-</code> on <code>&amp;Record</code> and <code>Record</code> (not <code>u32</code>)</td></tr>
 <tr><td>views</td><td><code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>shift</code>, <code>shift_fill</code>, <code>shift_clamp</code>, <code>shift_mirror</code>, <code>take</code>, <code>broadcast_to</code>, <code>copy</code></td></tr>
 <tr><td>writes</td><td><code>slice_mut</code>, <code>flip_mut</code>, <code>transpose_mut</code> (a <a href="views.html#views-that-write"><code>ViewMut</code></a> of the record), <code>assign</code>, <code>put</code></td></tr>
-<tr><td>helpers</td><td><code>map(f)</code>, <code>zip(&amp;other, f)</code>, <code>dot(&amp;other)</code>, <code>Fields::select(&amp;mask, &amp;a, &amp;b)</code>, <code>arrays()</code>, <code>eval()</code>, <code>cache()</code></td></tr>
+<tr><td>helpers</td><td><code>map(f)</code>, <code>zip(&amp;other, f)</code>, <code>dot(&amp;other)</code>, <code>Fields::select(&amp;cond, &amp;a, &amp;b)</code>, <code>arrays()</code>, <code>eval()</code>, <code>cache()</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -388,7 +388,7 @@ record (<code>Df32</code> and <code>f32</code>, say); keep two records.</li>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="reductions.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="data.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -402,7 +402,7 @@ record (<code>Df32</code> and <code>f32</code>, say); keep two records.</li>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="reductions.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="data.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

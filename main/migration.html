@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Migration from 0.2 - The Luma Guide</title>
+        <title>Migration from 0.3 and 0.2 - The Luma Guide</title>
 
 
         <!-- Custom HTML head -->
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae2c04f8.js";
+            window.path_to_searchindex_js = "searchindex-87ce9916.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61a8d153.js"></script>
+        <script src="toc-e12c34ce.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,7 +181,80 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="migration-from-02"><a class="header" href="#migration-from-02">Migration from 0.2</a></h1>
+                        <h1 id="migration-from-03"><a class="header" href="#migration-from-03">Migration from 0.3</a></h1>
+<p>0.4 changes the type of comparisons: they return boolean arrays (<code>Array&lt;bool&gt;</code>) instead of
+<code>Array&lt;u32&gt;</code>. Most 0.3 code compiles as it is, because booleans promote to numbers the way they do
+in NumPy (below). Everything else in 0.4 is added (<a href="#new-in-04-that-you-may-want">the list below</a>).</p>
+<h2 id="comparisons-return-arraybool"><a class="header" href="#comparisons-return-arraybool">Comparisons return <code>Array&lt;bool&gt;</code></a></h2>
+<p><code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code> and <code>is_finite</code> / <code>is_nan</code> / <code>is_inf</code> return <code>Array&lt;bool&gt;</code>. On the
+GPU a <code>bool</code> is one bit (<code>n</code> booleans are <code>ceil(n / 32)</code> <code>u32</code> words: a
+<a href="custom-kernels.html">custom kernel</a> that took a comparison as one <code>u32</code> per element reads
+<code>(a[i &gt;&gt; 5u] &gt;&gt; (i &amp; 31u)) &amp; 1u</code> now); on the host <code>from_slice</code>, <code>to_vec</code> and <code>item</code> use plain <code>bool</code>s.</p>
+<p>What compiles unchanged:</p>
+<ul>
+<li><code>select(&amp;cond, a, b)</code>, <code>sum_where(&amp;cond)</code> and <code>Fields::select</code> take an <code>Array&lt;bool&gt;</code>, and still
+take an <code>Array&lt;u32&gt;</code> (non-zero is true), so code that builds its own <code>u32</code> conditions is as
+before.</li>
+<li><code>bool * bool</code> is the logical and: <code>a.gt(0.0) * b.gt(0.0)</code>.</li>
+<li>A boolean array times a number is the number where the boolean is true and 0 elsewhere, in
+either order and with a scalar: <code>mask * &amp;x</code>, <code>&amp;x * mask</code>, <code>mask * 0.5</code>. <code>+</code> and <code>-</code> convert the
+booleans to the 0 and 1 of the other operand’s type first. These work for <code>f32</code>, <code>u32</code>, <code>i32</code>,
+<code>f64</code> and <code>Df32</code> arrays, and the product fuses as a <code>select</code>, not a cast and a multiply.</li>
+<li><code>sum()</code> of booleans counts the true elements and returns an <code>Array&lt;u32&gt;</code> (as in NumPy), also
+<code>count()</code>, <code>sum_axis</code> and <code>cumsum</code>.</li>
+</ul>
+<p>What does not:</p>
+<pre><code class="language-text">// 0.3
+let m: Array&lt;u32&gt; = x.gt(0.0);              // the type of a comparison was named
+let both = &amp;x.gt(0.0) + &amp;y.gt(0.0);         // 0, 1 or 2
+let idx = x.gt(0.0).cumsum(0) - 1u32;       // running count, minus one
+let hit = x.gt(0.0);  let miss = &amp;hit ^ 1u32;
+// 0.4
+let m: Array&lt;bool&gt; = x.gt(0.0);
+let both = x.gt(0.0).to_u32() + y.gt(0.0).to_u32();    // or `|` / `&amp;` for a logical result
+let idx = x.gt(0.0).cumsum(0) - 1u32;                  // cumsum of booleans is a u32 array: unchanged
+let miss = !&amp;hit;
+</code></pre>
+<p>Also changed: a comparison is no longer an index (<code>take</code>, <code>put</code>: convert with <code>to_u32()</code>), has no
+<code>/</code>, <code>%</code> or shifts (convert first), and reads back as <code>Vec&lt;bool&gt;</code>. An
+integer literal next to a boolean array needs a suffix (<code>mask * 2u32</code>), since <code>u32</code> and <code>i32</code>
+arrays are both valid results.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.5f32, -2.0, 3.0, -4.0], 4)?;
+let above: Array&lt;bool&gt; = x.gt(0.0);
+let both = &amp;above &amp; &amp;x.lt(2.0);                    // booleans combine with &amp; | ^ !
+assert_eq!(above.count().item()?, 2);
+assert_eq!(both.to_vec()?, vec![true, false, false, false]);
+assert_eq!(above.to_f32().to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
+assert!(above.any().item()?);
+assert!(!above.all().item()?);
+assert_eq!(select(&amp;above, 1.0f32, 0.0).to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
+
+// Promotion, as in NumPy: the number where true, 0 elsewhere.
+assert_eq!((&amp;above * &amp;x).to_vec()?, vec![1.5, 0.0, 3.0, 0.0]);
+assert_eq!((&amp;above * 0.5).to_vec()?, vec![0.5, 0.0, 0.5, 0.0]);
+assert_eq!((&amp;x + &amp;above).to_vec()?, vec![2.5, -2.0, 4.0, -4.0]);
+// A `u32` condition still works.
+let words = Array::from_slice(&amp;[1u32, 0, 7, 0], 4)?;
+assert_eq!(select(&amp;words, &amp;x, 0.0).to_vec()?, vec![1.5, 0.0, 3.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The numeric reductions (<code>reduce_axis</code>, <code>scan</code>, <code>mean</code>, <code>norm</code>) are not defined for <code>bool</code>: convert
+with <code>to_u32()</code> or <code>to_f32()</code>. A masked-out <code>NaN</code> or infinity in <code>mask * &amp;x</code> gives 0, where a
+multiplication would give <code>NaN</code>.</p>
+<h2 id="new-in-04-that-you-may-want"><a class="header" href="#new-in-04-that-you-may-want">New in 0.4 that you may want</a></h2>
+<ul>
+<li><a href="arrays.html#element-types"><code>i32</code> arrays, casts and <code>bool</code></a> (<code>to_u32</code>, <code>to_i32</code>, <code>to_f32</code>; <code>count</code>,
+<code>any</code>, <code>all</code>).</li>
+<li><a href="data.html"><code>matmul</code>, axis statistics (<code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>), accumulating
+scatters (<code>put_add</code>, <code>bincount</code>, <code>histogram</code>), sorting, group-by, <code>unique</code> and quantiles</a>.
+Axis reductions no longer evaluate a pending operand first
+(<a href="performance.html#primitives-that-read-an-expression">What fuses</a>).</li>
+<li>Guide pages for <a href="lazy.html#scalars-that-change"><code>Scalar</code></a>, <a href="arrays.html#elementwise-operations">elementwise math</a>,
+<a href="arrays.html#convolution">convolution</a> and the <a href="loops.html#line-solvers-solve_tridiagonal">tridiagonal solvers</a>,
+which earlier releases already had.</li>
+</ul>
+<h1 id="migration-from-02"><a class="header" href="#migration-from-02">Migration from 0.2</a></h1>
 <p>0.3 changes two things your 0.2 code can trip over. Almost everything else in 0.3 is added; the few behaviour changes (a lazy <code>reshape</code> of a view, fusion decided by a cost model, a larger buffer pool) are listed under <em>Changed</em> in the changelog.</p>
 <h2 id="reductions-are-lazy-arrays"><a class="header" href="#reductions-are-lazy-arrays">Reductions are lazy arrays</a></h2>
 <p>In 0.2, <code>sum</code>, <code>min</code>, <code>max</code>, <code>mean</code>, <code>norm</code> and <code>reduce</code> returned host values. In 0.3 they return a
