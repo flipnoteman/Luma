@@ -58,8 +58,11 @@ than a `u32` store, and so does `assign` into a slice of a boolean array whose r
 64 or more consecutive elements (the words inside a run are written as they are, and only the
 two words at the ends of a run, which it may share with elements the write leaves alone, change
 by atomic operations). Writes that cannot be built from runs (`put`, `stack`, a transposed slice,
-short rows) set and clear one bit at a time with atomic operations, which is slower than for the
-other types. Booleans have no generators (`range`, `uniform`): they combine with `& | ^ !`
+short rows) set and clear one bit at a time with atomic operations, about three times slower than
+the same write into a `u32` array. A flag array that a loop updates mostly by `put` is better kept
+as an `Array<u32>` (`.to_u32()` once, `put` 0s and 1s into it): `select` and `sum_where` accept
+`u32` conditions (non-zero is true), so nothing else changes. Booleans have no generators
+(`range`, `uniform`): they combine with `& | ^ !`
 (also with a single `bool`), count with `count()`, steer `select`, promote to numbers in `+`, `-`
 and `*` as in NumPy (`mask * &x` is `x` where true, 0 elsewhere), and convert with `to_u32()` /
 `to_i32()` / `to_f32()` ([Comparisons, booleans and `select`](integers.md#comparisons-booleans-and-select)).

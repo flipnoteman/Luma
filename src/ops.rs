@@ -1349,6 +1349,16 @@ impl Array<bool> {
 
     /// `self op= other`: the booleans as the 0 and 1 of the target's type.
     fn promote_assign<N: ScalarType>(target: &mut Array<N>, other: &Array<bool>, op: Promote, location: &'static Location<'static>) {
+        if let Promote::Mul = op {
+            // `x *= &mask` is `x = select(mask, x, 0)`, like `&x * &mask`.
+            let product = other.promote(Rhs::Array(&*target), true, op, location);
+            if product.shape() == target.shape() {
+                *target = product;
+            } else {
+                target.poison(Arc::new(LumaError::ShapeMismatch { lhs: target.shape().dims(), rhs: other.shape().dims() }));
+            }
+            return;
+        }
         let number = other.cast_at::<N>(location);
         target.assign_op_at(Rhs::Array(&number), op.op(), op.assign_name(), location);
     }

@@ -21,7 +21,7 @@ to a project:
 
 ```toml
 [dependencies]
-luma = "0.3"
+luma = "0.4"
 ```
 
 Without a GPU, install a software Vulkan driver (`mesa-vulkan-drivers` on most Linux

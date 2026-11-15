@@ -73,6 +73,12 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu> {
     // copied from a template of valid counts or zeroed (see `jit::until`), so wgpu's check of
     // them, an extra validation dispatch in front of every indirect one, protects nothing.
     instance_desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+    // No `VK_EXT_debug_utils` object names (on by default in debug builds). The Vulkan loader
+    // (1.4.341) finds the device of `vkSetDebugUtilsObjectNameEXT` by walking the device lists of
+    // all instances, while `vkCreateDevice` links a new device into such a list without the
+    // loader's lock: naming an object while another thread opens a device segfaults the process.
+    // Validation layers still report errors, through their own default output.
+    instance_desc.flags.remove(wgpu::InstanceFlags::DEBUG);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let validated = instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION);
     let instance = wgpu::Instance::new(instance_desc);

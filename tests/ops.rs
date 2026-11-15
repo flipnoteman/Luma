@@ -210,7 +210,7 @@ fn select_picks_per_element() {
     let want: Vec<f32> = xs.iter().map(|v| v.max(0.0)).collect();
     assert_eq!(relu.to_vec().unwrap(), want);
 
-    // Mask arithmetic: x.lt(0) as u32 mask selects between two arrays.
+    // A comparison selects between two u32 arrays.
     let a = Array::full(n, 7u32).unwrap();
     let b = Array::full(n, 9u32).unwrap();
     let picked = select(&x.lt(0.0), &a, &b).to_vec().unwrap();

@@ -333,8 +333,8 @@ fn main(
                 let mut raw = Vec::with_capacity(fixed.len() + 3);
                 raw.push(RawArg::write(dst.buffer(), bytes));
                 raw.push(RawArg::read(src.buffer(), bytes));
-                for pin in &fixed_pins {
-                    raw.push(RawArg::read(pin.buffer(), u64::from(w) * u64::from(h) * 4));
+                for (pin, input) in fixed_pins.iter().zip(&fixed) {
+                    raw.push(RawArg::read(pin.buffer(), input.byte_len()));
                 }
                 raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
                 ctx.launch(&core, groups, [w, h, 1], &raw)?;

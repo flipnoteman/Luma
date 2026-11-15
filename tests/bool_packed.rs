@@ -733,3 +733,45 @@ fn kernels_with_boolean_and_number_outputs() {
         assert_eq!(y.to_vec().unwrap(), x.iter().map(|v| v * 2.0).collect::<Vec<_>>());
     }
 }
+
+/// A stencil with a packed boolean fixed input binds the input's real (packed) byte length.
+#[test]
+fn stencil_with_packed_mask_input() {
+    let ctx = Context::new().unwrap();
+    let n = 64usize;
+    let init: Vec<f32> = (0..n * n).map(|i| ((i * 37) % 101) as f32).collect();
+    let inner: Vec<bool> = (0..n * n).map(|i| (1..n - 1).contains(&(i % n)) && (1..n - 1).contains(&(i / n))).collect();
+    let u = Array::from_slice_on(&ctx, &init, [n, n]).unwrap();
+    let m = Array::from_slice_on(&ctx, &inner, [n, n]).unwrap();
+    m.to_vec().unwrap();
+    let got = u
+        .iterate(10, |u| select(&m, (u.shift([1, 0]) + u.shift([-1, 0]) + u.shift([0, 1]) + u.shift([0, -1])) * 0.25, u))
+        .to_vec()
+        .unwrap();
+    let mut want = init;
+    for _ in 0..10 {
+        let prev = want.clone();
+        for y in 1..n - 1 {
+            for x in 1..n - 1 {
+                want[y * n + x] = (prev[y * n + x + 1] + prev[y * n + x - 1] + prev[(y + 1) * n + x] + prev[(y - 1) * n + x]) * 0.25;
+            }
+        }
+    }
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!((g - w).abs() <= 1e-3 * w.abs().max(1.0), "element {i}: {g} vs {w}");
+    }
+}
+
+/// `x *= &mask` is `select(mask, x, 0)`: a masked-out NaN becomes +0.0, as in `&x * &mask`.
+#[test]
+fn mul_assign_mask_selects() {
+    let ctx = Context::new().unwrap();
+    let mut x = Array::from_slice_on(&ctx, &[f32::NAN, -1.0, 2.0], 3).unwrap();
+    let m = Array::from_slice_on(&ctx, &[false, false, true], 3).unwrap();
+    let product = (&x * &m).to_vec().unwrap();
+    x *= &m;
+    let got = x.to_vec().unwrap();
+    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&got), bits(&[0.0, 0.0, 2.0]));
+    assert_eq!(bits(&got), bits(&product));
+}

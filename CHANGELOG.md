@@ -6,6 +6,8 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-14
+
 ### Breaking
 
 - Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) and `is_finite` / `is_nan` / `is_inf` return
@@ -65,7 +67,7 @@ All notable changes to Luma are listed here. The format follows
   `cumsum`, `min_axis` / `max_axis`, views, `take`, `put`, `select` and loops.
 - NumPy-style promotions: `bool_array * &number_array` (either order, with a number too:
   `mask * 2.0`), `+` and `-` for `f32`, `u32`, `i32`, `f64` and `Df32` arrays; a product is
-  `select(mask, x, 0)` (a masked-out `NaN` or infinity gives 0), a sum or difference converts the
+  `select(mask, x, 0)` (a masked-out `NaN` or infinity gives 0; `x *= &mask` likewise), a sum or difference converts the
   mask to the number's type first. `bool * bool` is the logical and. There is no `f64` scalar
   promotion, so that `mask * 2.0` is an `f32` array.
 - `select`, `sum_where` and `Fields::select` also accept `Array<u32>` conditions (`Condition`).
@@ -105,7 +107,6 @@ All notable changes to Luma are listed here. The format follows
 - `examples/bench_solve.rs`: the block line solves against a hand-written cyclic reduction kernel
   (parallel cyclic reduction with a closed-form 4x4 inverse), and the solves on parts against the
   stacked forms.
-
 - `SplitReason::Shared`: profiles list the cuts where a pending expression that other pending
   operations read too is stored instead of recomputed.
 
@@ -135,6 +136,21 @@ All notable changes to Luma are listed here. The format follows
 ### Removed
 
 - The ArrayFire comparison benchmarks (`benchmarks/arrayfire`, the `luma-bench` crate).
+
+### Fixed
+
+- Debug builds could segfault in the Vulkan loader (`vkSetDebugUtilsObjectNameEXT`) when one
+  thread opened a `Context` while another built kernels: the loader links a new device into a
+  list it walks to name objects without holding its lock. Devices are opened without
+  `VK_EXT_debug_utils` object names now; validation layers still report through their own output.
+
+### Known limitations
+
+- The kernels new in this release that use workgroup memory (`matmul`, sorts, the per-workgroup
+  scatters, packed boolean stores without 32-wide subgroups) have not been run on RADV, whose
+  results for workgroup-memory kernels are already known to be wrong (see 0.3.0).
+- `bench_datasci --gate` compares wall-clock times when the device has no timestamp queries; that
+  path has not been exercised (lavapipe has them).
 
 ## [0.3.0] - 2026-11-13
 
@@ -425,6 +441,7 @@ All notable changes to Luma are listed here. The format follows
 - A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
 - A library layout, with the shader loaded from a hard-coded relative path.
 
-[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/flipnoteman/Luma/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/flipnoteman/Luma/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/flipnoteman/Luma/releases/tag/v0.2.0

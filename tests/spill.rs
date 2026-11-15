@@ -125,6 +125,9 @@ fn readbacks_in_a_loop_under_a_budget_do_not_deadlock() {
             x = &x * 0.5 + &held[step % held.len()];
             total += f64::from(x.sum().item().unwrap());
         }
+        // Destroy the device's objects before reporting: a context still being dropped by this
+        // thread when the test process exits races the exit-time teardown of the Vulkan driver.
+        drop((held, x, ctx));
         let _ = done.send(total);
     });
     // Generous: a debug build on a small CI runner's software device is slow; a deadlock never ends.

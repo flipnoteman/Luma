@@ -40,7 +40,7 @@ let miss = !&hit;
 ```
 
 Also changed: a comparison is no longer an index (`take`, `put`: convert with `to_u32()`), has no
-`/`, `%`, shifts, `minimum` or `maximum` (convert first), and reads back as `Vec<bool>`. An
+`/`, `%` or shifts (convert first), and reads back as `Vec<bool>`. An
 integer literal next to a boolean array needs a suffix (`mask * 2u32`), since `u32` and `i32`
 arrays are both valid results.
 
