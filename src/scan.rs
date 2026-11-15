@@ -36,20 +36,20 @@ use crate::shape::Shape;
 // invocation per 1024 cells, 1.55 ms for the strided axis). `sum_axis` takes 0.33 ms (was 1.7).
 
 /// Invocations of a workgroup of the contiguous-line kernels.
-const WORKGROUP: u32 = 128;
+pub(crate) const WORKGROUP: u32 = 128;
 /// Contiguous cells every invocation of a chunk scan folds (a chunk is `WORKGROUP * PER_THREAD`).
 const PER_THREAD: u32 = 8;
 /// Cells of a contiguous line one workgroup scans.
 const SCAN_CHUNK: u32 = WORKGROUP * PER_THREAD;
 /// Cells of a contiguous line one workgroup reduces (its invocations stride over them).
-const REDUCE_CHUNK: u32 = 16384;
+pub(crate) const REDUCE_CHUNK: u32 = 16384;
 /// Contiguous lines up to this many cells are handled a group of lines per workgroup. One
 /// workgroup per line (128 invocations for 33 cells) was 6 ms for 2^26 cells, a group of lines
 /// 0.4 ms; from 256 cells on a workgroup per line is as fast.
 const SHORT_LINE: u32 = 255;
 /// Cells of workgroup memory a group of short lines is staged in (16 KiB, the smallest limit
 /// WebGPU guarantees).
-const ROWS_TILE: u32 = 4096;
+pub(crate) const ROWS_TILE: u32 = 4096;
 /// Strided lines up to this many cells are walked by one invocation each.
 const SHORT_STRIDED: u32 = 256;
 /// A strided pass with this many lines or more has enough invocations without blocks.
@@ -141,9 +141,13 @@ pub(crate) const AXIS_PARAMS: &str = "n: u32, stride: u32, lines: u32, nb: u32, 
 impl AxisPass {
     /// The profile label of the kernel.
     pub(crate) fn label(self) -> &'static str {
-        match self.pass {
-            Pass::Fold => "ReduceFold",
-            pass => pass.label(),
+        let arg = self.ops.as_slice().first().is_some_and(|op| op.is_arg());
+        match (self.pass, arg) {
+            (Pass::Fold, false) => "ReduceFold",
+            (Pass::Fold, true) => "ArgFold",
+            (Pass::Rows { .. }, true) => "ArgRows",
+            (Pass::ChunkReduce, true) => "ArgChunk",
+            (pass, _) => pass.label(),
         }
     }
 
@@ -152,8 +156,10 @@ impl AxisPass {
         if self.split { self.ops.as_slice().len() } else { 1 }
     }
 
-    /// The declarations of the output buffers, of elements of `ty`.
+    /// The declarations of the output buffers, of elements of `ty` (`u32`, the indices and the
+    /// bits of the values, for an arg reduction).
     pub(crate) fn output_bindings(self, ty: &str) -> String {
+        let ty = if self.ops.as_slice().first().is_some_and(|op| op.is_arg()) { "u32" } else { ty };
         let mut src = String::new();
         for j in 0..self.outputs() {
             let name = if self.split { format!("out{j}") } else { "out".to_owned() };
@@ -165,6 +171,9 @@ impl AxisPass {
 
 /// The kernel of `pass` over a buffer `a`.
 fn reduce_source(pass: AxisPass, ty: &str, workgroup: u32) -> String {
+    if pass.ops.as_slice().first().is_some_and(|op| op.is_arg()) {
+        return crate::arg::source(pass, ty, workgroup);
+    }
     let outputs = pass.outputs();
     let mut src = format!("struct Params {{ {AXIS_PARAMS}}}\n{}", pass.output_bindings(ty));
     let _ = writeln!(src, "@group(1) @binding({outputs}) var<storage, read> a: array<{ty}>;");
@@ -180,6 +189,9 @@ fn reduce_source(pass: AxisPass, ty: &str, workgroup: u32) -> String {
 /// array reductions (`ReduceElem::combine`), so a NaN is handled as `Array::min` and `max` do;
 /// `SumSquares` squares the cells it reads.
 pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) -> String {
+    if pass.ops.as_slice().first().is_some_and(|op| op.is_arg()) {
+        return crate::arg::body(pass, ty, load, workgroup);
+    }
     let elem = ReduceElem::Plain(ty);
     let ops = pass.ops.as_slice();
     let mut src = String::from("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
@@ -749,7 +761,7 @@ impl<'a> Lines<'a> {
         if nb == 1 {
             return self.launch_reduce(pass, ops, partial, geometry, outs, input);
         }
-        let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb) * ops.as_slice().len() as u64)?;
+        let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb) * ops.cell_words() as u64)?;
         let totals = Bound { buffer: &totals, bytes };
         self.launch_reduce(pass, ops, partial, geometry, &[totals], input)?;
         // The partial results of contiguous lines (and line-major ones) are lines of `nb` cells,
@@ -855,6 +867,53 @@ impl<T: ScalarType> Array<T> {
         Ok(outs)
     }
 
+    /// Runs the arg reduction `op` over the lines `cells` of this array into an array of `out_dims`.
+    /// A pending operand is computed inside the first pass unless it cannot be (see
+    /// [`jit::axis_reduce`]).
+    fn run_arg_reduce(&self, cells: Cells, out_dims: [usize; 4], op: ReduceOp, name: &str) -> Outcome<Array<u32>> {
+        let ctx = self.context();
+        let ty = ElemTy::of::<T>()?;
+        if ty.layout() != ElemLayout::plain(4) {
+            return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", ty.display())).into());
+        }
+        let out = Array::<u32>::alloc(ctx, Shape::from(out_dims))?;
+        let storage = Arc::clone(out.storage()?);
+        let pin = storage.pin_single()?;
+        let ready;
+        let input = match self.pending() {
+            Some(node) => Input::Pending(node),
+            None => {
+                let (pin, bytes) = self.ready()?;
+                ready = pin;
+                Input::Buffer(Bound { buffer: ready.buffer(), bytes })
+            }
+        };
+        let target = Bound { buffer: pin.buffer(), bytes: out.byte_len() };
+        let operator = Operator { source: String::new(), scalar_tys: Vec::new(), scalars: Vec::new() };
+        let mut run = Lines::new(ctx, &operator, T::wgsl_type());
+        run.reduce(input, cells, ReduceList::new(&[op]), false, &[target])?;
+        Ok(out)
+    }
+
+    /// The arg reduction `op` along `axis` (`None`: of the whole array in flat order).
+    fn arg_lines(&self, axis: Option<usize>, op: ReduceOp, name: &'static str, location: &'static Location<'static>) -> Array<u32> {
+        let mut dims = self.shape().dims();
+        let result = match axis {
+            Some(axis) if axis >= 4 => Err(LumaError::InvalidShape(format!("axis {axis} of shape {}", self.shape())).into()),
+            Some(axis) => {
+                dims[axis] = 1;
+                self.line_geometry(axis).and_then(|(n, stride, lines)| self.run_arg_reduce(Cells { n, stride, lines }, dims, op, name))
+            }
+            None => {
+                dims = [1; 4];
+                u32::try_from(self.len())
+                    .map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: self.shape().dims() }))
+                    .and_then(|n| self.run_arg_reduce(Cells { n, stride: 1, lines: 1 }, dims, op, name))
+            }
+        };
+        Array::resolve(self.context(), Shape::from(dims), result, name, location)
+    }
+
     #[track_caller]
     fn scan_axis(&self, axis: usize, op: &ScanOp<'_, T>, name: &'static str, location: &'static Location<'static>) -> Array<T> {
         let result = self.run_scan(axis, op);
@@ -954,6 +1013,48 @@ impl<T: Numeric> Array<T> {
     #[track_caller]
     pub fn reduce_axis<const N: usize>(&self, axis: usize, ops: [Reduction; N]) -> [Array<T>; N] {
         self.reduce_lines(axis, ops, "reduce_axis", Location::caller())
+    }
+
+    /// The flat index of the largest element, as a one-element `u32` array (NumPy's `argmax` of
+    /// the flattened array: the first of equal elements, the first NaN if there is one). A pending
+    /// operand is computed inside the first pass, never stored. The passes are recorded when the
+    /// call returns and nothing is read back, so the index can feed other expressions on the GPU
+    /// (`x.take(&x.argmax())`); [`Array::item`] reads it on the host (a synchronization, about
+    /// 100 µs). For a position in several dimensions, divide and take the remainder by the
+    /// extents (axis 0 varies fastest).
+    ///
+    /// Available for `u32`, `i32` and `f32` arrays; the arrays of other types (`f64`, `Df32`)
+    /// poison the result with [`LumaError::Unsupported`]. Arrays split over several buffers fail
+    /// with [`LumaError::Chunked`]. See [`argmax_axis`](Array::argmax_axis) for the passes.
+    #[track_caller]
+    pub fn argmax(&self) -> Array<u32> {
+        self.arg_lines(None, ReduceOp::ArgMax, "argmax", Location::caller())
+    }
+
+    /// The flat index of the smallest element, as a one-element `u32` array: the first of equal
+    /// elements, the first NaN if there is one (as NumPy). Computed like
+    /// [`argmax`](Array::argmax).
+    #[track_caller]
+    pub fn argmin(&self) -> Array<u32> {
+        self.arg_lines(None, ReduceOp::ArgMin, "argmin", Location::caller())
+    }
+
+    /// The index along `axis` of the largest element of every line (the first of equal elements,
+    /// the first NaN if there is one, as NumPy); the result has extent 1 along `axis`. Like
+    /// [`reduce_axis`](Array::reduce_axis), a pending operand is computed inside the first pass,
+    /// and the arrays are evaluated when the call returns. The passes of [`sum_axis`](Array::sum_axis)
+    /// carrying the pair (value, index), so an `argmax_axis` reads the data once and takes the time
+    /// of a `max_axis`. Available for `u32`, `i32` and `f32` (see [`argmax`](Array::argmax)).
+    #[track_caller]
+    pub fn argmax_axis(&self, axis: usize) -> Array<u32> {
+        self.arg_lines(Some(axis), ReduceOp::ArgMax, "argmax_axis", Location::caller())
+    }
+
+    /// The index along `axis` of the smallest element of every line, as
+    /// [`argmax_axis`](Array::argmax_axis).
+    #[track_caller]
+    pub fn argmin_axis(&self, axis: usize) -> Array<u32> {
+        self.arg_lines(Some(axis), ReduceOp::ArgMin, "argmin_axis", Location::caller())
     }
 }
 

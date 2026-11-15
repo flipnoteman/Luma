@@ -17,6 +17,12 @@ All notable changes to Luma are listed here. The format follows
   array (kept elements, then `fill`) and the count as a one-element array.
 - `topk(k)` and `bottomk(k)` for `u32`, `i32` and `f32`: the `k` largest (smallest) values and
   their flat indices, by a full radix sort.
+- `Array::argmax`, `argmin` (flat index, a one-element `u32` array recorded without waiting, like `sum`) and
+  `argmax_axis`, `argmin_axis` (the index along an axis) for
+  `f32`, `u32` and `i32`: the first of equal elements wins and an `f32` NaN is the first one found
+  by both (NumPy). Reducing passes carrying a (value, index) pair, a pending operand computed
+  inside the first pass; `argmax` of `2^26` `f32` and `argmax_axis(1)` of `[64, 2^22]` run at about
+  860 GB/s on an RTX 3090 (`bench_datasci --only argmax`).
 
 ## [0.4.0] - 2026-11-14
 

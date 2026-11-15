@@ -754,3 +754,218 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         self.scatter.launch_raw(grid, args![out, x, mask, &*counts, uniform(&p)]).unwrap();
     }
 }
+
+/// The order-preserving `u32` key of an `f32` for the arg-reduction references: larger floats get
+/// larger keys, `-0.0` and `0.0` share one, and every NaN is the largest key (an `argmax` returns
+/// the first NaN, as NumPy does). Ties are broken by the smaller index by the callers.
+const ARG_KEY: &str = r#"
+fn key(x: f32) -> u32 {
+    let b = select(bitcast<u32>(x), 0u, x == 0.0);
+    if ((b & 0x7fffffffu) > 0x7f800000u) { return 0xffffffffu; }
+    return select(b | 0x80000000u, ~b, (b & 0x80000000u) != 0u);
+}
+"#;
+
+#[derive(encase::ShaderType)]
+struct ArgmaxParams {
+    n: u32,
+}
+
+/// Workgroups of [`HandArgmax`]'s first kernel (the best of 256..8192 measured on an RTX 3090).
+const ARGMAX_GROUPS: u32 = 4096;
+
+/// `argmax` of a whole `f32` array: a grid-stride loop per invocation keeping the best (key,
+/// index), a shared-memory tree per workgroup, then one workgroup combining the `ARGMAX_GROUPS`
+/// partial pairs. `out` receives the index of the first largest element (the first NaN if any).
+pub struct HandArgmax {
+    pass: Kernel,
+    combine: Kernel,
+    partial: Array<u32>,
+}
+
+impl HandArgmax {
+    pub fn new(ctx: &Context) -> Result<HandArgmax> {
+        let groups = ARGMAX_GROUPS;
+        let pass = format!(
+            r#"{ARG_KEY}
+struct P {{ n: u32 }}
+@group(1) @binding(0) var<storage, read> x: array<f32>;
+@group(1) @binding(1) var<storage, read_write> partial: array<u32>;
+@group(1) @binding(2) var<uniform> p: P;
+
+var<workgroup> shk: array<u32, 256>;
+var<workgroup> shi: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(num_workgroups) nw: vec3<u32>) {{
+    let stride = nw.x * 256u;
+    var bk = 0u;
+    var bi = 0u;
+    for (var i = wg.x * 256u + tid; i < p.n; i += stride) {{
+        let k = key(x[i]);
+        if (k > bk) {{ bk = k; bi = i; }}
+    }}
+    shk[tid] = bk;
+    shi[tid] = bi;
+    workgroupBarrier();
+    for (var h = 128u; h > 0u; h >>= 1u) {{
+        if (tid < h) {{
+            let k = shk[tid + h];
+            let i = shi[tid + h];
+            if (k > shk[tid] || (k == shk[tid] && i < shi[tid])) {{ shk[tid] = k; shi[tid] = i; }}
+        }}
+        workgroupBarrier();
+    }}
+    if (tid == 0u) {{
+        partial[wg.x] = shk[0];
+        partial[nw.x + wg.x] = shi[0];
+    }}
+}}
+"#
+        );
+        let combine = format!(
+            r#"struct P {{ n: u32 }}
+@group(1) @binding(0) var<storage, read> partial: array<u32>;
+@group(1) @binding(1) var<storage, read_write> out: array<u32>;
+@group(1) @binding(2) var<uniform> p: P;
+
+var<workgroup> shk: array<u32, 256>;
+var<workgroup> shi: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) tid: u32) {{
+    var bk = 0u;
+    var bi = 0u;
+    for (var g = tid; g < {groups}u; g += 256u) {{
+        let k = partial[g];
+        let i = partial[{groups}u + g];
+        if (k > bk || (k == bk && i < bi)) {{ bk = k; bi = i; }}
+    }}
+    shk[tid] = bk;
+    shi[tid] = bi;
+    workgroupBarrier();
+    for (var h = 128u; h > 0u; h >>= 1u) {{
+        if (tid < h) {{
+            let k = shk[tid + h];
+            let i = shi[tid + h];
+            if (k > shk[tid] || (k == shk[tid] && i < shi[tid])) {{ shk[tid] = k; shi[tid] = i; }}
+        }}
+        workgroupBarrier();
+    }}
+    if (tid == 0u && p.n != 0u) {{ out[0] = shi[0]; }}
+}}
+"#
+        );
+        Ok(HandArgmax {
+            pass: ctx.kernel(&pass).label("hand_argmax").build()?,
+            combine: ctx.kernel(&combine).label("hand_argmax_combine").build()?,
+            partial: Array::<u32>::zeros_on(ctx, 2 * groups as usize).unwrap(),
+        })
+    }
+
+    /// Records `out[0] = argmax(x[..n])`.
+    pub fn run(&mut self, x: &Array<f32>, out: &mut Array<u32>, n: usize) {
+        let p = ArgmaxParams { n: n as u32 };
+        self.pass.launch_raw([ARGMAX_GROUPS, 1, 1], args![x, &mut self.partial, uniform(&p)]).unwrap();
+        self.combine.launch_raw([1, 1, 1], args![&self.partial, out, uniform(&p)]).unwrap();
+    }
+}
+
+/// Combine kernel of [`HandArgmaxAxis`]: `out[c]` is the index of the best (key, index) pair of
+/// the column's `blocks` partial pairs, which are contiguous (`[cols][blocks]`); one workgroup
+/// per column, its 256 invocations stride the blocks, then a tree.
+const ARG_AXIS_COMBINE: &str = r#"
+struct P { cols: u32, rows: u32, rb: u32, blocks: u32, inv: f32 }
+@group(1) @binding(0) var<storage, read> pk: array<u32>;
+@group(1) @binding(1) var<storage, read> pi: array<u32>;
+@group(1) @binding(2) var<storage, read_write> out: array<u32>;
+@group(1) @binding(3) var<uniform> p: P;
+
+var<workgroup> shk: array<u32, 256>;
+var<workgroup> shi: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let c = wg.x;
+    var bk = 0u;
+    var bi = 0u;
+    for (var b = tid; b < p.blocks; b += 256u) {
+        let k = pk[c * p.blocks + b];
+        let i = pi[c * p.blocks + b];
+        if (k > bk || (k == bk && i < bi)) { bk = k; bi = i; }
+    }
+    shk[tid] = bk;
+    shi[tid] = bi;
+    workgroupBarrier();
+    for (var h = 128u; h > 0u; h >>= 1u) {
+        if (tid < h) {
+            let k = shk[tid + h];
+            let i = shi[tid + h];
+            if (k > shk[tid] || (k == shk[tid] && i < shi[tid])) { shk[tid] = k; shi[tid] = i; }
+        }
+        workgroupBarrier();
+    }
+    if (tid == 0u) { out[c] = shi[0]; }
+}
+"#;
+
+/// Per column `c` of `X` (luma shape `[cols, rows]`), the row of the first largest element (the
+/// first NaN if any): the strided-axis decomposition of [`HandAxisSumSq`] (an invocation per
+/// column and block of rows, neighbours on neighbouring columns) keeping the best (key, row) in
+/// registers, partial pairs written column-major (`[cols][blocks]`), and a combine kernel.
+pub struct HandArgmaxAxis {
+    pass: Kernel,
+    combine: Kernel,
+    keys: ScratchU32,
+    rows: ScratchU32,
+}
+
+/// [`Scratch`] of `u32`s.
+struct ScratchU32 {
+    ctx: Context,
+    buf: std::cell::RefCell<Option<(usize, Array<u32>)>>,
+}
+
+impl ScratchU32 {
+    fn new(ctx: &Context) -> ScratchU32 {
+        ScratchU32 { ctx: ctx.clone(), buf: Default::default() }
+    }
+
+    fn get(&self, len: usize) -> std::cell::RefMut<'_, Array<u32>> {
+        let mut cache = self.buf.borrow_mut();
+        if cache.as_ref().is_none_or(|(n, _)| *n != len) {
+            *cache = Some((len, Array::<u32>::zeros_on(&self.ctx, len).unwrap()));
+        }
+        std::cell::RefMut::map(cache, |c| &mut c.as_mut().unwrap().1)
+    }
+}
+
+impl HandArgmaxAxis {
+    pub fn new(ctx: &Context) -> Result<HandArgmaxAxis> {
+        let pass = axis_pass(
+            &format!(
+                "@group(1) @binding(1) var<storage, read_write> pk: array<u32>;
+@group(1) @binding(2) var<storage, read_write> pi: array<u32>;
+@group(1) @binding(3) var<uniform> p: P;{ARG_KEY}"
+            ),
+            "var bk = 0u; var bi = r0;",
+            "let k = key(v); if (k > bk) { bk = k; bi = r; }",
+            "pk[c * p.blocks + blk] = bk; pi[c * p.blocks + blk] = bi;",
+        );
+        Ok(HandArgmaxAxis {
+            pass: ctx.kernel(&pass).label("hand_argmax_axis").build()?,
+            combine: ctx.kernel(ARG_AXIS_COMBINE).label("hand_argmax_axis_combine").build()?,
+            keys: ScratchU32::new(ctx),
+            rows: ScratchU32::new(ctx),
+        })
+    }
+
+    /// Records `out[c] = argmax_r X[c, r]`; `out` holds `cols` elements.
+    pub fn run(&self, x: &Array<f32>, out: &mut Array<u32>, cols: usize, rows: usize) {
+        let (p, groups, blocks) = axis_geometry(cols, rows, 1.0);
+        let (mut pk, mut pi) = (self.keys.get(blocks * cols), self.rows.get(blocks * cols));
+        self.pass.launch_raw([groups, 1, 1], args![x, &mut *pk, &mut *pi, uniform(&p)]).unwrap();
+        self.combine.launch_raw([cols as u32, 1, 1], args![&*pk, &*pi, out, uniform(&p)]).unwrap();
+    }
+}
