@@ -56,8 +56,17 @@ All notable changes to Luma are listed here. The format follows
 - `examples/bench_datasci.rs`: every primitive above against a hand-written WGSL kernel of the
   same algorithm (`--gate` fails on a GPU-time ratio above the case's threshold).
 
+- `SplitReason::Shared`: profiles list the cuts where a pending expression that other pending
+  operations read too is stored instead of recomputed.
+
 ### Changed
 
+- Fields that read each other at the element itself (`-a` next to `a`, a function of a field
+  next to the field) are evaluated in one multi-output kernel by `Fields::cache`, `eval_all`
+  and the other multi-array evaluations, also when their expressions read shifted ones. Only a
+  field another reads through a view (slice, shift, gather) is still computed first. A record of
+  stage data (several cached fields that depend on each other) took one kernel per dependency
+  level before.
 - `sum_axis`, `min_axis` and `max_axis` no longer evaluate a pending operand first: its expression
   is computed inside the first pass of the reduction (scans still evaluate it).
 

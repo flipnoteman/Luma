@@ -346,11 +346,13 @@ pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
         .collect();
     // A root that another root reads through views would be recomputed at every index it is read
     // at, and the chain of such steps grows past what a kernel takes: it goes first, alone.
-    let reads_a_root = |node: &Arc<Node>| {
-        node.shift_depth() > 0 && roots.iter().any(|(other, _)| !Arc::ptr_eq(node, other) && node.below_contains(other.id))
-    };
-    if roots.iter().any(|(node, _)| reads_a_root(node)) {
-        let (later, first): (Vec<_>, Vec<_>) = roots.iter().map(|(node, _)| Arc::clone(node)).partition(reads_a_root);
+    // (A root read at the element itself is computed once, as an output beside its reader.)
+    let reads_a_root = reads_roots_through_views(&roots);
+    if reads_a_root.contains(&true) {
+        let (mut later, mut first) = (Vec::new(), Vec::new());
+        for ((node, _), &reads) in roots.iter().zip(&reads_a_root) {
+            if reads { later.push(Arc::clone(node)) } else { first.push(Arc::clone(node)) }
+        }
         evaluate_group(&first);
         evaluate_group(&later);
         return;
@@ -381,6 +383,45 @@ pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
             let _ = node.force();
         }
     }
+}
+
+/// For every root of `roots`, whether its expression reads another of the roots through a shift,
+/// view or gather (as the operand being shifted, not as the indices of a gather).
+fn reads_roots_through_views(roots: &[(Arc<Node>, Args)]) -> Vec<bool> {
+    roots
+        .iter()
+        .map(|(root, args)| {
+            let others: Vec<&Arc<Node>> =
+                roots.iter().map(|(other, _)| other).filter(|other| !Arc::ptr_eq(root, other) && root.below_contains(other.id)).collect();
+            root.shift_depth() > 0 && !others.is_empty() && reaches_through_view(root, args, &others)
+        })
+        .collect()
+}
+
+/// Whether the expression of `root` (with operands `args`) reaches one of `targets` through a
+/// shift, view or gather. Only the paths that lead to a target are followed.
+fn reaches_through_view(root: &Arc<Node>, args: &Args, targets: &[&Arc<Node>]) -> bool {
+    let leads_to_target = |node: &Arc<Node>| targets.iter().any(|target| Arc::ptr_eq(target, node) || node.below_contains(target.id));
+    let mut seen: std::collections::HashSet<(u64, bool)> = std::collections::HashSet::new();
+    let mut stack = vec![(Arc::clone(root), false)];
+    while let Some((node, shifted)) = stack.pop() {
+        let Some(operands) = (if Arc::ptr_eq(&node, root) { Some(args.clone()) } else { node.operands() }) else { continue };
+        let kind = node.op().kind;
+        for (i, src) in operands.iter().take(kind.arity()).enumerate() {
+            let Src::Node(kid) = src else { continue };
+            if !kid.is_pending() {
+                continue;
+            }
+            let shifted = shifted || (i == 0 && matches!(kind, OpKind::Shift(_)));
+            if shifted && targets.iter().any(|target| Arc::ptr_eq(target, kid)) {
+                return true;
+            }
+            if leads_to_target(kid) && seen.insert((kid.id, shifted)) {
+                stack.push((Arc::clone(kid), shifted));
+            }
+        }
+    }
+    false
 }
 
 /// Evaluates the pending ones of `nodes` like [`evaluate_group`], those of one length in a
