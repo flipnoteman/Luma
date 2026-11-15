@@ -22,9 +22,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo install cargo-nextest --locked
-      - run: cargo nextest run --locked
       - run: cargo nextest run --release --locked
-      - run: cargo test --doc --locked
+      - run: cargo test --doc --release --locked
       - name: Differential fuzzer
         run: "cargo test --release --locked fuzz::"
         env:
