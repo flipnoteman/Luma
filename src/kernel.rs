@@ -1,4 +1,5 @@
-//! Custom compute kernels: user WGSL run against [`Array`]s and uniforms.
+//! Custom compute kernels: user WGSL run against [`Array`]s and uniforms. An `Array<bool>` binds as
+//! `array<u32>`: one word per element, 0 for false and 1 for true.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -522,7 +523,7 @@ fn storage_arg<'a, T: GpuType>(array: &'a Array<T>, writable: bool) -> KernelArg
             ctx: array.context(),
             pin,
             bytes,
-            element_size: std::mem::size_of::<T>() as u32,
+            element_size: T::BYTES as u32,
             writable,
         },
         Err(Failure::Inherited(error)) => ArgRepr::Poisoned(error),
@@ -559,13 +560,13 @@ impl<'a, T: GpuType> From<&'a mut Array<T>> for KernelArg<'a> {
 
 impl<'a, 'b, T: ScalarType> From<&'a crate::view::ViewMut<'b, Array<T>>> for KernelArg<'a> {
     fn from(view: &'a crate::view::ViewMut<'b, Array<T>>) -> Self {
-        view_arg(view.context(), std::mem::size_of::<T>() as u32, false, view.ready_view(false))
+        view_arg(view.context(), T::BYTES as u32, false, view.ready_view(false))
     }
 }
 
 impl<'a, 'b, T: ScalarType> From<&'a mut crate::view::ViewMut<'b, Array<T>>> for KernelArg<'a> {
     fn from(view: &'a mut crate::view::ViewMut<'b, Array<T>>) -> Self {
-        view_arg(view.context(), std::mem::size_of::<T>() as u32, true, view.ready_view(true))
+        view_arg(view.context(), T::BYTES as u32, true, view.ready_view(true))
     }
 }
 
@@ -574,7 +575,7 @@ impl<'a, 'b, T: ScalarType> From<&'a mut crate::view::ViewMut<'b, Array<T>>> for
 /// (`var<storage, read> a: array<T>`) and a `var<uniform> a_view: LumaView`, indexed with
 /// `luma_view_idx{,2,3,4}`.
 pub fn view<'a, T: GpuType>(array: &'a Array<T>) -> KernelArg<'a> {
-    view_arg(array.context(), std::mem::size_of::<T>() as u32, false, array.ready_view())
+    view_arg(array.context(), T::BYTES as u32, false, array.ready_view())
 }
 
 /// A value [`uniform`] can pass: any type encase can lay out as a WGSL uniform

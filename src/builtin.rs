@@ -162,7 +162,7 @@ impl UnOp {
                 UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => Some(self.expr()),
                 _ => None,
             },
-            ElemTy::Mask => match self {
+            ElemTy::Bool => match self {
                 UnOp::Id => Some("x"),
                 UnOp::BitNot => Some("(x ^ 1u)"),
                 _ => None,
@@ -252,7 +252,7 @@ impl BinOp {
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
             ElemTy::U32 => Some(self.expr()),
-            ElemTy::Mask => match self {
+            ElemTy::Bool => match self {
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Min | BinOp::Max => Some(self.expr()),
                 _ => None,
             },
@@ -291,7 +291,7 @@ pub(crate) enum CmpOp {
 }
 
 impl CmpOp {
-    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1 (a mask).
+    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1 (a `bool`).
     pub(crate) fn expr(self) -> &'static str {
         match self {
             CmpOp::Lt => "select(0u, 1u, x < y)",
@@ -342,7 +342,7 @@ impl Class {
         }
     }
 
-    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1 (a mask): the bits of `x`
+    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1 (a `bool`): the bits of `x`
     /// below the sign are compared with those of infinity. They come through `luma_bits` of the
     /// double-float library, which ORs them with the guard uniform (always 0): a compiler that
     /// assumes no `NaN` or infinity arises in the arithmetic of the kernel (a device's fast

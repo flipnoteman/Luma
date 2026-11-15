@@ -19,7 +19,7 @@ use crate::context::Context;
 use crate::error::{LumaError, Result};
 use crate::fields::{FieldOp, Fields};
 use crate::gpu::pager::Pin;
-use crate::gpu_type::{Df32, GpuType, Mask, ScalarType};
+use crate::gpu_type::{Df32, GpuType, ScalarType};
 use crate::jit::assign::Region;
 use crate::jit::{self, AxisMap, Edge, ElemTy, Held, Op, OpKind, Scalar, ShiftKind, Src, ViewMap};
 use crate::ops::{run_select, Operand, Outcome, Rhs};
@@ -688,7 +688,7 @@ impl<T: ScalarType> Array<T> {
 
         // The cells of the base the region covers: a box, as a mask over the base.
         let base_shape = Shape::new(map.src.map(|d| d as usize));
-        let mut mask: Option<Array<Mask>> = None;
+        let mut mask: Option<Array<bool>> = None;
         for a in 0..4 {
             let (first, last) = map.ends(a);
             let (lo, hi) = (first.min(last), first.max(last));
@@ -909,7 +909,7 @@ fn select_parts<T: ScalarType>(
     let mut acc = views.last().ok_or_else(|| LumaError::InvalidShape("join of no arrays".into()))?.clone();
     for j in (0..views.len() - 1).rev() {
         let below = coord.lt(offsets[j + 1] as u32);
-        acc = run_select(&below, Rhs::Array(&views[j]), Rhs::Array(&acc), location)?;
+        acc = run_select(crate::ops::Cond::Bool(&below), Rhs::Array(&views[j]), Rhs::Array(&acc), location)?;
     }
     Ok(acc)
 }
@@ -1279,7 +1279,7 @@ macro_rules! assign_rhs_host {
 assign_rhs_value!(f32);
 assign_rhs_value!(u32);
 assign_rhs_value!(i32);
-assign_rhs_value!(Mask);
+assign_rhs_value!(bool);
 assign_rhs_value!(Df32);
 assign_rhs_host!(f32);
 assign_rhs_host!(u32);

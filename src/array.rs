@@ -292,7 +292,7 @@ impl<T: GpuType> Array<T> {
     /// Allocates a valid array of `shape` whose contents are unspecified.
     pub(crate) fn alloc(ctx: &Context, shape: Shape) -> Result<Self> {
         let len = shape.validate()?;
-        Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(Storage::new(ctx, len, std::mem::size_of::<T>())))))
+        Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(Storage::new(ctx, len, T::BYTES)))))
     }
 
     fn new(ctx: &Context, shape: Shape, repr: Repr) -> Self {
@@ -366,7 +366,8 @@ impl<T: GpuType> Array<T> {
             return Err(LumaError::LengthMismatch { expected: len, actual: data.len() });
         }
         if ctx.zero_copy() {
-            let elem = std::mem::size_of::<T>();
+            let elem = T::BYTES;
+            let words = T::to_repr(data);
             let c = segment_len(ctx, elem);
             // Registered as they are filled, so dropping them on failure recycles them and
             // making room for the next one sees them.
@@ -375,7 +376,7 @@ impl<T: GpuType> Array<T> {
                 let end = len.min(start + c);
                 let bytes = ((end - start) * elem) as u64;
                 ctx.make_room(bytes)?;
-                let buffer = ctx.alloc_filled(bytemuck::cast_slice(&data[start..end]))?;
+                let buffer = ctx.alloc_filled(bytemuck::cast_slice(&words[start..end]))?;
                 segments.push(Segment::filled(ctx, bytes, buffer));
             }
             let storage = Storage::with_segments(ctx, len, elem, segments.into_boxed_slice(), None);
@@ -383,9 +384,10 @@ impl<T: GpuType> Array<T> {
         }
         let array = Self::alloc(ctx, shape)?;
         let storage = array.storage().map_err(Failure::into_error)?;
+        let words = T::to_repr(data);
         for j in 0..storage.segments() {
             let pin = storage.pin(j)?;
-            ctx.upload(pin.buffer(), bytemuck::cast_slice(&data[storage.range(j)]))?;
+            ctx.upload(pin.buffer(), bytemuck::cast_slice(&words[storage.range(j)]))?;
         }
         Ok(array)
     }
@@ -592,7 +594,7 @@ impl<T: GpuType> Array<T> {
 
     /// Size of the array's data in bytes (not the size of the possibly larger buffer).
     pub(crate) fn byte_len(&self) -> u64 {
-        self.shape.len() as u64 * std::mem::size_of::<T>() as u64
+        self.shape.len() as u64 * T::BYTES as u64
     }
 
     #[cfg(test)]
@@ -612,7 +614,7 @@ impl<T: GpuType> Array<T> {
             return reduced.read::<T>(&self.ctx);
         }
         let storage = self.storage().map_err(Failure::into_error)?;
-        self.ctx.read_storage(storage)
+        Ok(T::from_repr(self.ctx.read_storage::<T::Repr>(storage)?))
     }
 
     /// Like [`Array::to_vec`], but copies into `out`, which must have exactly [`Array::len`]
@@ -633,9 +635,16 @@ impl<T: GpuType> Array<T> {
         if out.len() != self.len() {
             return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
         }
-        let bytes: &mut [u8] = bytemuck::cast_slice_mut(out);
+        let Some(words) = T::repr_mut(out) else {
+            // A representation of its own (`bool`): read the words, then convert them.
+            for (slot, word) in out.iter_mut().zip(self.ctx.read_storage::<T::Repr>(storage)?) {
+                *slot = T::one_from_repr(word);
+            }
+            return Ok(());
+        };
+        let bytes: &mut [u8] = bytemuck::cast_slice_mut(words);
         // SAFETY: initialized bytes viewed as `MaybeUninit<u8>`; only initialized bytes are
-        // written through the view, so `out` stays valid (`T: Pod`).
+        // written through the view, so `words` stays valid (`T::Repr: Pod`).
         let dst = unsafe {
             std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(), bytes.len())
         };
@@ -693,9 +702,10 @@ impl<T: GpuType> Array<T> {
         }
         // Lazy operations recorded earlier still read the old contents.
         self.flush_readers();
+        let words = T::to_repr(data);
         for j in 0..storage.segments() {
             let pin = storage.pin(j)?;
-            self.ctx.upload(pin.buffer(), bytemuck::cast_slice(&data[storage.range(j)]))?;
+            self.ctx.upload(pin.buffer(), bytemuck::cast_slice(&words[storage.range(j)]))?;
         }
         Ok(())
     }

@@ -117,8 +117,8 @@ assert_eq!(max.to_vec()?, vec![4.0, 20.0]);
 
 The results are evaluated when the call returns. Another number of ops poisons the results.
 `sum_axis`, `min_axis` and `max_axis` are the single-op cases. They (and `reduce_axis`) work on
-`f32`, `u32` and `i32` (`SumOfSquares` of integers wraps); on `Mask` arrays only `Min` and `Max`
-exist and `Sum`/`SumOfSquares` fail with `Unsupported`.
+`f32`, `u32` and `i32` (`SumOfSquares` of integers wraps); `bool` arrays have `sum_axis` (a
+count, `u32`), `min_axis` and `max_axis` only.
 
 For `f32`, `mean_axis`, `var_axis` and `std_axis` give the mean, the **population** variance
 (divisor `n`, NumPy's `ddof = 0`) and its square root. They are lazy expressions on top of the

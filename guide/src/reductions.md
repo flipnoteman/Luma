@@ -33,7 +33,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 | `sum()`, `min()`, `max()` | any element type; `u32` sums wrap around |
 | `mean()`, `norm()` | `f32`; the norm is the Euclidean (L2) norm |
 | `reduce([Reduction; N])` | `N` of `Sum`, `Min`, `Max`, `SumOfSquares` (one to four) in one pass, as an `N`-element array |
-| `sum_where(&mask)` | the sum of the elements where a `Mask` is true, in one pass |
+| `sum_where(&cond)` | the sum of the elements where a `bool` (or non-zero `u32`) condition is true, in one pass |
 | `item()` | the value of a one-element array |
 | `to_array::<N>()` | the values of an `N`-element array |
 
@@ -108,10 +108,12 @@ A reduction needs every element before any output exists, so the kernel that div
 runs after the kernel that computes it: the example above is a few launches, not one. The values
 are the ones a host loop would give.
 
-### Masks
+### Booleans
 
-`sum_where(&mask)` sums where a `Mask` is true (comparisons return masks); `count()` of a mask is
-the number of true elements, as a `u32` array:
+`sum_where(&cond)` sums where a condition (an `Array<bool>`, such as a comparison, or a `u32` array of
+non-zero elements) is true; the `sum()` of a boolean array is the number of true elements, as a `u32`
+array (also `count()`, as in NumPy). `any()` and `all()` are one-element `bool` arrays, and `bool`
+arrays have `min` / `max` but no `mean`, `norm` or `reduce`:
 
 ```rust
 use luma::*;
@@ -120,6 +122,8 @@ let x = Array::from_slice(&[1.0f32, -2.0, 3.0, -4.0], 4)?;
 let positive = x.gt(0.0);
 assert_eq!(x.sum_where(&positive).item()?, 4.0);
 assert_eq!(positive.count().item()?, 2);
+assert_eq!(positive.sum().item()?, 2);
+assert!(positive.any().item()?);
 # Ok::<(), luma::LumaError>(())
 ```
 
@@ -179,8 +183,8 @@ changing them does not recompile); anything else poisons the result. Non-associa
 give unspecified results, because the kernels regroup operands. Scans do not fuse into the
 expression behind them: the array is evaluated first (it is read twice). Scans and axis
 reductions are available for `f32`, `u32` and `i32` arrays (`f64` and `Df32` fail with
-`Unsupported`); on `Mask` arrays `cumsum` and the sums along an axis fail with `Unsupported` (use
-`to_u32()`), `min_axis` and `max_axis` work.
+`Unsupported`); `bool` arrays have `sum_axis` and `cumsum` that count (`u32` results) and
+`min_axis` / `max_axis`, but no `scan` or `reduce_axis`.
 
 ## Sorting, groups, unique values and quantiles
 

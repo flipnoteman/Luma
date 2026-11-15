@@ -158,7 +158,7 @@ completely. To keep the extra bits, reduce a `Df32` array yourself: `x.to_df32()
 
 ## Non-finite values
 
-`f32`, `f64` and `Df32` arrays have lazy `Mask` arrays `is_finite()`, `is_nan()` and `is_inf()`.
+`f32`, `f64` and `Df32` arrays have lazy `bool` arrays `is_finite()`, `is_nan()` and `is_inf()`.
 They test the bits of the exponent, so they do not depend on how the device compares NaN (a shader
 compiler may assume NaN does not exist and fold `x != x`). They fuse like any elementwise
 operation:

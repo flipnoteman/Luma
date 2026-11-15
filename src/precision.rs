@@ -11,7 +11,7 @@
 use std::panic::Location;
 
 use crate::array::Array;
-use crate::gpu_type::{Df32, Mask, ScalarType};
+use crate::gpu_type::{Df32, ScalarType};
 use crate::jit::{ElemTy, Op, OpKind, Src};
 use crate::ops::{lazy, Outcome};
 
@@ -21,6 +21,12 @@ impl<T: ScalarType> Array<T> {
         let operand = self.src()?;
         let op = Op::new(OpKind::Cast(ElemTy::of::<U>()?), ElemTy::of::<T>()?);
         lazy(self.context(), self.shape(), op, [operand, Src::unused(), Src::unused()], "cast", location)
+    }
+
+    /// The elements converted to `U`, failures reported at `location`.
+    pub(crate) fn cast_at<U: ScalarType>(&self, location: &'static Location<'static>) -> Array<U> {
+        let result = self.run_cast::<U>(location);
+        Array::resolve(self.context(), self.shape(), result, "cast", location)
     }
 }
 
@@ -68,11 +74,18 @@ casts! { i32 =>
     to_u32 -> u32;
 }
 
-casts! { Mask =>
+casts! { bool =>
     /// The elements as `u32`: 1 where true, 0 where false.
     to_u32 -> u32;
+    /// The elements as `i32`: 1 where true, 0 where false.
+    to_i32 -> i32;
     /// The elements as `f32`: 1.0 where true, 0.0 where false.
     to_f32 -> f32;
+    /// The elements as `f64`: 1.0 where true, 0.0 where false. Needs a device with 64-bit shader
+    /// floats; otherwise the result is poisoned with [`LumaError::Unsupported`](crate::LumaError).
+    to_f64 -> f64;
+    /// The elements as double-floats: 1 where true, 0 where false.
+    to_df32 -> Df32;
 }
 
 casts! { f64 =>

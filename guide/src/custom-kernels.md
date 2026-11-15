@@ -60,6 +60,8 @@ The rules:
 - **Element sizes** are checked: a binding `array<f32>` takes arrays of 4-byte elements,
   `array<vec2<f32>>` arrays of 8-byte ones (`[f32; 2]`, `Df32`, `f64`). Only the size is compared,
   not the type: an `Array<u32>` passes for `array<f32>`, so keep the types straight yourself.
+- **`Array<bool>`** binds as `array<u32>`: one word per element, 0 for false and 1 for true. Write
+  only 0 or 1 into one; the library's `!`, `count`, `any` and `all` rely on it.
 
 ## Several entry points, 2-D launches
 

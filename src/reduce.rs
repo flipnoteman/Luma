@@ -8,9 +8,9 @@ use crate::array::{Array, Failure, Storage};
 use crate::builtin::{Builtin, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_EPILOGUE, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{GpuType, Mask, ScalarType};
+use crate::gpu_type::{GpuType, Numeric, ScalarType};
 use crate::jit::{self, ElemTy, Node, Op, OpKind, Src};
-use crate::ops::{fold_workgroups, len_u32, run_select, Rhs};
+use crate::ops::{fold_workgroups, len_u32, run_select, Condition, Rhs};
 use crate::shape::Shape;
 
 /// A reduction of a pending expression that has not been recorded yet: the operand is kept as an
@@ -117,7 +117,7 @@ impl Reduced {
     }
 }
 
-impl<T: ScalarType> Array<T> {
+impl<T: Numeric> Array<T> {
     /// The sum of all elements, as a lazy one-element array: [`Array::item`] reads the value on
     /// the host, and using the array in an expression with `self` (`&x / &x.sum()`) keeps it on
     /// the GPU. Float sums combine in trees and over at most a few hundred sequential steps per
@@ -148,17 +148,61 @@ impl<T: ScalarType> Array<T> {
         self.reduce_at(ops, "reduce", Location::caller())
     }
 
-    /// The sum of the elements where `mask` is true: `select(mask, self, 0).sum()` in one
-    /// pass. Lazy like [`Array::sum`].
+    /// The sum of the elements where `cond` is true (an `Array<bool>`, or an `Array<u32>` of
+    /// non-zero elements): `select(cond, self, 0).sum()` in one pass. Lazy like [`Array::sum`].
     #[track_caller]
-    pub fn sum_where(&self, mask: &Array<Mask>) -> Array<T> {
+    pub fn sum_where(&self, cond: &impl Condition) -> Array<T> {
         let location = Location::caller();
-        let selected = run_select(mask, Rhs::Array(self), Rhs::Scalar(T::zeroed()), location);
-        let selected = Array::resolve(mask.context(), mask.shape(), selected, "sum_where", location);
+        let cond = cond.condition();
+        let selected = run_select(cond, Rhs::Array(self), Rhs::Scalar(T::zeroed()), location);
+        let selected = Array::resolve(self.context(), cond.shape(), selected, "sum_where", location);
         selected.reduce_at([Reduction::Sum], "sum_where", location)
     }
+}
 
-    fn reduce_at<const N: usize>(&self, ops: [Reduction; N], name: &'static str, location: &'static Location<'static>) -> Array<T> {
+impl Array<bool> {
+    /// The number of true elements, as a lazy one-element `u32` array (NumPy's `sum` of a
+    /// boolean array is an integer too; see [`Array::sum`]).
+    #[track_caller]
+    pub fn sum(&self) -> Array<u32> {
+        self.cast_at::<u32>(Location::caller()).reduce_at([Reduction::Sum], "sum", Location::caller())
+    }
+
+    /// The number of true elements: the same as [`Array<bool>::sum`](Array::sum).
+    #[track_caller]
+    pub fn count(&self) -> Array<u32> {
+        self.cast_at::<u32>(Location::caller()).reduce_at([Reduction::Sum], "count", Location::caller())
+    }
+
+    /// The smallest element (whether all are true), as a lazy one-element `bool` array.
+    #[track_caller]
+    pub fn min(&self) -> Array<bool> {
+        self.reduce_at([Reduction::Min], "min", Location::caller())
+    }
+
+    /// The largest element (whether any is true), as a lazy one-element `bool` array.
+    #[track_caller]
+    pub fn max(&self) -> Array<bool> {
+        self.reduce_at([Reduction::Max], "max", Location::caller())
+    }
+
+    /// Whether any element is true, as a lazy one-element `bool` array. Read it with
+    /// [`Array::item`].
+    #[track_caller]
+    pub fn any(&self) -> Array<bool> {
+        self.reduce_at([Reduction::Max], "any", Location::caller())
+    }
+
+    /// Whether every element is true, as a lazy one-element `bool` array. Read it with
+    /// [`Array::item`].
+    #[track_caller]
+    pub fn all(&self) -> Array<bool> {
+        self.reduce_at([Reduction::Min], "all", Location::caller())
+    }
+}
+
+impl<T: ScalarType> Array<T> {
+    pub(crate) fn reduce_at<const N: usize>(&self, ops: [Reduction; N], name: &'static str, location: &'static Location<'static>) -> Array<T> {
         const { assert!(N >= 1 && N <= MAX_REDUCTIONS, "Array::reduce takes one to four reductions") };
         let result = self.run_reduce(ReduceList::new(&ops.map(Reduction::op)), name, location);
         Array::resolve(self.context(), Shape::from(N), result, name, location)
@@ -167,10 +211,7 @@ impl<T: ScalarType> Array<T> {
     fn run_reduce(&self, ops: ReduceList, name: &'static str, location: &'static Location<'static>) -> std::result::Result<Array<T>, Failure> {
         let ctx = self.context();
         let shape = Shape::from(ops.as_slice().len());
-        if ElemTy::try_of::<T>() == Some(ElemTy::Mask) && ops.as_slice().iter().any(|op| matches!(op, ReduceOp::Sum | ReduceOp::SumSquares)) {
-            return Err(crate::scan::mask_sum_error(name));
-        }
-        let elem = std::mem::size_of::<T>() as u64;
+        let elem = T::BYTES as u64;
         let wgsl = T::reduce_type();
         // Poisoned operands pass their error on.
         let src = self.src()?;
@@ -317,7 +358,7 @@ fn reduce_n<T: GpuType, const N: usize>(array: &Array<T>, wgsl: &'static str, op
 /// of [`crate::jit`] if `speculate`. Synchronizes.
 fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, finish: Finish, speculate: bool) -> Result<Vec<T>> {
     let ctx = array.context();
-    let elem = std::mem::size_of::<T>() as u64;
+    let elem = T::BYTES as u64;
     let count = ops.as_slice().len() as u64;
     if let Some(node) = array.pending()
         && speculate
@@ -325,11 +366,11 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
         && matches!(wgsl, "f32" | "u32")
         && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, elem, wgsl, ops, scratch, None, finish))
     {
-        return Ok(bytemuck::cast_slice(&words?).to_vec());
+        return Ok(T::from_repr(bytemuck::cast_slice(&words?).to_vec()));
     }
     let mut scratch = Scratch::new(ctx);
     let current = reduce_into(array, elem, wgsl, ops, &mut scratch, None, finish)?;
-    let values = ctx.read::<T>(&current, elem * count)?;
+    let values = T::from_repr(ctx.read::<T::Repr>(&current, elem * count)?);
     if values.len() as u64 != count {
         return Err(LumaError::Gpu("reduction results are missing".into()));
     }

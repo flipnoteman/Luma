@@ -105,7 +105,7 @@ operators.
 | operators | `+ - * /` between records, with an element value (`f32` for an `f32` record) and with an `Array<Elem>`, any reference/owned combination, the scalar or array on either side; `+= -= *= /=` with `&Record`, a value and `&Array`; unary `-` on `&Record` and `Record` (not `u32`) |
 | views | `slice`, `pad`, `flip`, `transpose`, `shift`, `shift_fill`, `shift_clamp`, `shift_mirror`, `take`, `broadcast_to`, `copy` |
 | writes | `slice_mut`, `flip_mut`, `transpose_mut` (a [`ViewMut`](views.md#views-that-write) of the record), `assign`, `put` |
-| helpers | `map(f)`, `zip(&other, f)`, `dot(&other)`, `Fields::select(&mask, &a, &b)`, `arrays()`, `eval()`, `cache()` |
+| helpers | `map(f)`, `zip(&other, f)`, `dot(&other)`, `Fields::select(&cond, &a, &b)`, `arrays()`, `eval()`, `cache()` |
 
 Every method applies the array operation of the same name to each field and poisons the fields
 with the caller's source location on a failure. All of them stay lazy except `cache`, `eval` and

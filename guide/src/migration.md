@@ -1,49 +1,78 @@
 # Migration from 0.3
 
-0.4 changes the type of comparisons: they return masks (`Array<Mask>`) instead of `Array<u32>`.
-Everything else in 0.4 is added ([the list below](#new-in-04-that-you-may-want)).
+0.4 changes the type of comparisons: they return boolean arrays (`Array<bool>`) instead of
+`Array<u32>`. Most 0.3 code compiles as it is, because booleans promote to numbers the way they do
+in NumPy (below). Everything else in 0.4 is added ([the list below](#new-in-04-that-you-may-want)).
 
-## Comparisons return `Array<Mask>`
+## Comparisons return `Array<bool>`
 
-`lt`, `le`, `gt`, `ge`, `eq`, `ne` and `is_finite` / `is_nan` / `is_inf` return `Array<Mask>`;
-`select`, `sum_where` and `Fields::select` take `&Array<Mask>`. A mask is a boolean per element,
-stored as a `u32` that is 0 or 1. Code that passes a comparison to `select` or `sum_where` compiles
-as it is. Code that used the `0` / `1` as a number converts it:
+`lt`, `le`, `gt`, `ge`, `eq`, `ne` and `is_finite` / `is_nan` / `is_inf` return `Array<bool>`. On the
+GPU a `bool` is one `u32` word that is 0 or 1 (a [custom kernel](custom-kernels.md) sees
+`array<u32>`); on the host `from_slice`, `to_vec` and `item` use plain `bool`s.
+
+What compiles unchanged:
+
+- `select(&cond, a, b)`, `sum_where(&cond)` and `Fields::select` take an `Array<bool>`, and still
+  take an `Array<u32>` (non-zero is true), so code that builds its own `u32` conditions is as
+  before.
+- `bool * bool` is the logical and: `a.gt(0.0) * b.gt(0.0)`.
+- A boolean array times a number is the number where the boolean is true and 0 elsewhere, in
+  either order and with a scalar: `mask * &x`, `&x * mask`, `mask * 0.5`. `+` and `-` convert the
+  booleans to the 0 and 1 of the other operand's type first. These work for `f32`, `u32`, `i32`,
+  `f64` and `Df32` arrays, and the product fuses as a `select`, not a cast and a multiply.
+- `sum()` of booleans counts the true elements and returns an `Array<u32>` (as in NumPy), also
+  `count()`, `sum_axis` and `cumsum`.
+
+What does not:
 
 ```text
 // 0.3
-let above = x.gt(0.0);
-let count = above.sum().item()?;          // Array<u32>
-let weight = &above * 0.5f32;             // does not exist: u32 * f32
-let negated = &above ^ 1u32;
+let m: Array<u32> = x.gt(0.0);              // the type of a comparison was named
+let both = &x.gt(0.0) + &y.gt(0.0);         // 0, 1 or 2
+let idx = x.gt(0.0).cumsum(0) - 1u32;       // running count, minus one
+let hit = x.gt(0.0);  let miss = &hit ^ 1u32;
 // 0.4
-let above = x.gt(0.0);
-let count = above.count().item()?;
-let weight = above.to_f32() * 0.5;
-let negated = !&above;
+let m: Array<bool> = x.gt(0.0);
+let both = x.gt(0.0).to_u32() + y.gt(0.0).to_u32();    // or `|` / `&` for a logical result
+let idx = x.gt(0.0).cumsum(0) - 1u32;                  // cumsum of booleans is a u32 array: unchanged
+let miss = !&hit;
 ```
+
+Also changed: a comparison is no longer an index (`take`, `put`: convert with `to_u32()`), has no
+`/`, `%`, shifts, `minimum` or `maximum` (convert first), and reads back as `Vec<bool>`. An
+integer literal next to a boolean array needs a suffix (`mask * 2u32`), since `u32` and `i32`
+arrays are both valid results.
 
 ```rust
 use luma::*;
 
 let x = Array::from_slice(&[1.5f32, -2.0, 3.0, -4.0], 4)?;
-let above: Array<Mask> = x.gt(0.0);
-let both = &above & &x.lt(2.0);                    // masks combine with & | ^ !
+let above: Array<bool> = x.gt(0.0);
+let both = &above & &x.lt(2.0);                    // booleans combine with & | ^ !
 assert_eq!(above.count().item()?, 2);
-assert_eq!(both.to_u32().to_vec()?, vec![1, 0, 0, 0]);
+assert_eq!(both.to_vec()?, vec![true, false, false, false]);
 assert_eq!(above.to_f32().to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
-assert!(bool::from(above.any().item()?));
-assert!(!bool::from(above.all().item()?));
+assert!(above.any().item()?);
+assert!(!above.all().item()?);
 assert_eq!(select(&above, 1.0f32, 0.0).to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
+
+// Promotion, as in NumPy: the number where true, 0 elsewhere.
+assert_eq!((&above * &x).to_vec()?, vec![1.5, 0.0, 3.0, 0.0]);
+assert_eq!((&above * 0.5).to_vec()?, vec![0.5, 0.0, 0.5, 0.0]);
+assert_eq!((&x + &above).to_vec()?, vec![2.5, -2.0, 4.0, -4.0]);
+// A `u32` condition still works.
+let words = Array::from_slice(&[1u32, 0, 7, 0], 4)?;
+assert_eq!(select(&words, &x, 0.0).to_vec()?, vec![1.5, 0.0, 3.0, 0.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-Sums of masks (`sum`, `cumsum`, `sum_axis`, `mean`) are not defined, since the result would no
-longer be a mask; `count()` is the sum of the true elements, `min` and `max` are `all` and `any`.
+The numeric reductions (`reduce_axis`, `scan`, `mean`, `norm`) are not defined for `bool`: convert
+with `to_u32()` or `to_f32()`. A masked-out `NaN` or infinity in `mask * &x` gives 0, where a
+multiplication would give `NaN`.
 
 ## New in 0.4 that you may want
 
-- [`i32` arrays, casts and `Mask`](arrays.md#element-types) (`to_u32`, `to_i32`, `to_f32`; `count`,
+- [`i32` arrays, casts and `bool`](arrays.md#element-types) (`to_u32`, `to_i32`, `to_f32`; `count`,
   `any`, `all`).
 - [`matmul`, axis statistics (`reduce_axis`, `mean_axis`, `var_axis`, `std_axis`), accumulating
   scatters (`put_add`, `bincount`, `histogram`), sorting, group-by, `unique` and quantiles](data.md).

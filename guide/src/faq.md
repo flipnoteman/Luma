@@ -73,7 +73,7 @@ array to find the first failure early. The error carries the source location of 
 `ContextOptions::check_finite`): every evaluated `f32` and `Df32` array is checked (`f64` is not) and
 the first operation whose result holds a non-finite value fails with `LumaError::NonFinite`. It waits for the GPU after every
 array, so use it for debugging only. For `f32`, `f64` and `Df32` arrays,
-`is_finite()` / `is_nan()` / `is_inf()` give lazy `Mask` arrays you can use in expressions.
+`is_finite()` / `is_nan()` / `is_inf()` give lazy `bool` arrays you can use in expressions.
 
 **`Array<f64>` fails with `Unsupported`.** The device has no 64-bit shader floats. Check
 `ctx.features().contains(luma::wgpu::Features::SHADER_F64)`, or use `Df32`

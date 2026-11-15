@@ -38,10 +38,40 @@ fn name(reference: Ref, ty: ElemTy) -> String {
         Ref::Scalar(k) => match ty {
             ElemTy::F64 => format!("(f64(p.s{k}) + f64(p.s{}) + f64(p.s{}))", k + 1, k + 2),
             ElemTy::Df32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => format!("p.s{k}"),
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => format!("p.s{k}"),
         },
         Ref::Tmp(k) => format!("t{k}"),
         Ref::Sub(k) => format!("sub{k}"),
+    }
+}
+
+/// The WGSL element type of a storage buffer holding elements of `ty`.
+///
+/// With [`load`] and [`store`] this is the one place in the code generator that knows how
+/// elements are laid out in memory: a `bool` is one `u32` word holding 0 or 1 (the
+/// `GpuType::Repr` of `bool`), every other type is stored as itself. Registers hold `ty.wgsl()`.
+pub(super) fn storage_ty(ty: ElemTy) -> &'static str {
+    match ty {
+        ElemTy::Bool => "u32",
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => ty.wgsl(),
+    }
+}
+
+/// The WGSL expression of the element `index` of the buffer `buffer`, as a register value of
+/// type `ty` (see [`storage_ty`]).
+pub(super) fn load(ty: ElemTy, buffer: &str, index: &str) -> String {
+    match ty {
+        ElemTy::Bool => format!("{buffer}[{index}]"),
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => format!("{buffer}[{index}]"),
+    }
+}
+
+/// The WGSL statement storing the register value `value` of type `ty` as the element `index` of
+/// the buffer `buffer` (see [`storage_ty`]).
+pub(super) fn store(ty: ElemTy, buffer: &str, index: &str, value: &str) -> String {
+    match ty {
+        ElemTy::Bool => format!("{buffer}[{index}] = {value};"),
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => format!("{buffer}[{index}] = {value};"),
     }
 }
 
@@ -101,8 +131,8 @@ pub(super) fn expression(instr: &Instr, index: &str, segmented: bool, names: &Na
     let read = match instr.args[0] {
         Ref::Input(k) if segmented => format!("ld{k}({at})"),
         Ref::Input(k) => match names.in_place.iter().find(|&&(input, _)| input == k) {
-            Some(&(_, j)) => format!("out{j}[{at}]"),
-            None => format!("in{k}[{at}]"),
+            Some(&(_, j)) => load(instr.op.ty, &format!("out{j}"), &at),
+            None => load(instr.op.ty, &format!("in{k}"), &at),
         },
         Ref::Sub(k) => format!("sub{k}({at})"),
         // A shift only reads an input buffer or a sub-program; anything else is not
@@ -227,12 +257,15 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
         (ElemTy::Df32, ElemTy::F32) => format!("luma_o({value}.x + {value}.y)"),
         (ElemTy::F64, ElemTy::Df32) => format!("vec2<f32>(luma_o(f32({value})), f32({value} - f64(luma_o(f32({value})))))"),
         (ElemTy::Df32, ElemTy::F64) => format!("(f64(luma_o({value}.x)) + f64({value}.y))"),
-        (ElemTy::U32, ElemTy::F32) | (ElemTy::I32, ElemTy::F32) | (ElemTy::Mask, ElemTy::F32) => format!("f32({value})"),
+        (ElemTy::U32, ElemTy::F32) | (ElemTy::I32, ElemTy::F32) | (ElemTy::Bool, ElemTy::F32) => format!("f32({value})"),
         (ElemTy::F32, ElemTy::U32) => format!("select(0u, u32(clamp({value}, 0.0, 4294967040.0)), {value} == {value})"),
         (ElemTy::F32, ElemTy::I32) => format!("select(0i, i32(clamp({value}, -2147483648.0, 2147483520.0)), {value} == {value})"),
         (ElemTy::U32, ElemTy::I32) => format!("bitcast<i32>({value})"),
         (ElemTy::I32, ElemTy::U32) => format!("bitcast<u32>({value})"),
-        (ElemTy::Mask, ElemTy::U32) => value.to_owned(),
+        (ElemTy::Bool, ElemTy::U32) => value.to_owned(),
+        (ElemTy::Bool, ElemTy::I32) => format!("bitcast<i32>({value})"),
+        (ElemTy::Bool, ElemTy::F64) => format!("f64({value})"),
+        (ElemTy::Bool, ElemTy::Df32) => format!("vec2<f32>(f32({value}), 0.0)"),
         _ if from == to => value.to_owned(),
         _ => unreachable!("cast {from:?} -> {to:?}"),
     }
@@ -259,13 +292,13 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Normal => format!("luma_normal(luma_threefry({index}, {a}, {b}))"),
         Gen::Index => match ty {
             ElemTy::U32 => index.to_owned(),
-            ElemTy::Mask => unreachable!("masks have no generators"),
+            ElemTy::Bool => unreachable!("bool has no generators"),
             ElemTy::I32 => format!("bitcast<i32>({index})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
             ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
-            ElemTy::Mask => unreachable!("masks have no generators"),
+            ElemTy::Bool => unreachable!("bool has no generators"),
             ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
         },
@@ -273,7 +306,7 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             let coord = if stride == 1 { format!("({index} % {size}u)") } else { format!("(({index} / {stride}u) % {size}u)") };
             match ty {
                 ElemTy::U32 => coord,
-                ElemTy::Mask => unreachable!("masks have no generators"),
+                ElemTy::Bool => unreachable!("bool has no generators"),
                 ElemTy::I32 => format!("bitcast<i32>({coord})"),
                 ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({coord})"),
             }
@@ -472,7 +505,8 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         }
         src.push_str("}\n");
     }
-    let out_ty = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
+    let out_elem = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty());
+    let out_ty = |at: usize| out_elem(at).wgsl();
     let outputs: Vec<usize> = match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => key.outputs.iter().map(|&at| at as usize).collect(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
@@ -509,7 +543,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         let elem = match (key.tail, out_ty(at)) {
             (Tail::ScatterAdd { .. }, "i32") => "atomic<i32>",
             (Tail::ScatterAdd { .. }, _) => "atomic<u32>",
-            (_, ty) => ty,
+            _ => storage_ty(out_elem(at)),
         };
         let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{elem}>;");
     }
@@ -518,11 +552,11 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
             continue;
         }
         if !segmented || direct(&key.instrs, k as u32) {
-            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", ty.wgsl());
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", storage_ty(*ty));
             binding += 1;
         }
         for s in 0..slots(k) {
-            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}_{s}: array<{}>;", ty.wgsl());
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}_{s}: array<{}>;", storage_ty(*ty));
             binding += 1;
         }
     }
@@ -555,9 +589,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
             let (log, mask) = (per.trailing_zeros(), per.wrapping_sub(1));
             let _ = writeln!(src, "fn ld{k}(g: u32) -> {} {{\n    let c = g >> {log}u; let o = g & {mask}u;", ty.wgsl());
             for s in 0..m - 1 {
-                let _ = writeln!(src, "    if (c == p.c{k}_{s}) {{ return in{k}_{s}[o]; }}");
+                let _ = writeln!(src, "    if (c == p.c{k}_{s}) {{ return {}; }}", load(*ty, &format!("in{k}_{s}"), "o"));
             }
-            let _ = writeln!(src, "    return in{k}_{}[o];\n}}", m - 1);
+            let _ = writeln!(src, "    return {};\n}}", load(*ty, &format!("in{k}_{}", m - 1), "o"));
         }
     }
     let views = match lowered {
@@ -595,10 +629,10 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
             let stores: String = match key.tail {
                 Tail::StoreMapped(map) => {
                     let n = views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0);
-                    outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[view{n}(i)] = t{};\n", value(at))).collect()
+                    outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), &format!("view{n}(i)"), &format!("t{}", value(at))))).collect()
                 }
                 Tail::ParamStoreMapped { id, .. } => {
-                    outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[pview{id}(i)] = t{};\n", value(at))).collect()
+                    outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), &format!("pview{id}(i)"), &format!("t{}", value(at))))).collect()
                 }
                 Tail::Scatter { .. } | Tail::ParamScatter { .. } => {
                     let len = match key.tail {
@@ -607,7 +641,8 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                         _ => unreachable!(),
                     };
                     let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
-                    format!("    let j = t{};\n    if (j < {len}) {{ out0[j] = t{}; }}\n", value(index as usize), value(stored as usize))
+                    let write = store(out_elem(outputs[0]), "out0", "j", &format!("t{}", value(stored as usize)));
+                    format!("    let j = t{};\n    if (j < {len}) {{ {write} }}\n", value(index as usize))
                 }
                 Tail::ScatterAdd { len, op, private: false, len_slot } => {
                     let len = len_slot.map_or_else(|| format!("{len}u"), |slot| format!("p.s{slot}"));
@@ -630,11 +665,12 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                         format!("    let q = i / {block}u;\n    let o = q * {}u + (i - q * {block}u) + {}u;\n", u64::from(total) * u64::from(block), u64::from(first) * u64::from(block))
                     };
                     for (j, &at) in key.outputs.iter().enumerate() {
-                        let _ = writeln!(stores, "    out0[o + {}u] = t{};", j as u64 * u64::from(block), value(at as usize));
+                        let write = store(out_elem(outputs[0]), "out0", &format!("o + {}u", j as u64 * u64::from(block)), &format!("t{}", value(at as usize)));
+                        let _ = writeln!(stores, "    {write}");
                     }
                     stores
                 }
-                _ => outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[i] = t{};\n", value(at))).collect(),
+                _ => outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), "i", &format!("t{}", value(at))))).collect(),
             };
             if let Tail::ScatterAdd { len, op, private: true, .. } = key.tail {
                 let (stored, slot) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
@@ -906,7 +942,8 @@ pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
     let wg = tuning.elementwise_workgroup;
     let count = key.outputs.len();
     // The type of the states (`run_loop_fused` checked that they agree).
-    let state_ty = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map_or("f32", |instr| instr.op.out_ty().wgsl());
+    let state_elem = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map_or(ElemTy::F32, |instr| instr.op.out_ty());
+    let state_ty = state_elem.wgsl();
     let mut src = String::from("struct Params { steps: u32, ");
     for (k, ty) in key.scalar_tys.iter().enumerate() {
         let _ = write!(src, "s{k}: {}, ", ty.wgsl());
@@ -915,13 +952,13 @@ pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
     let mut binding = 0;
     for (role, access) in [("out", "read_write"), ("init", "read")] {
         for j in 0..count {
-            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<{state_ty}>;");
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<{}>;", storage_ty(state_elem));
             binding += 1;
         }
     }
     for (k, ty) in key.input_tys.iter().enumerate() {
         if states.get(k).copied().flatten().is_none() {
-            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", ty.wgsl());
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", storage_ty(*ty));
             binding += 1;
         }
     }
@@ -939,11 +976,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "
     );
     for j in 0..count {
-        let _ = writeln!(src, "    var s{j}: {state_ty} = init{j}[i];");
+        let _ = writeln!(src, "    var s{j}: {state_ty} = {};", load(state_elem, &format!("init{j}"), "i"));
     }
     for (k, ty) in key.input_tys.iter().enumerate() {
         if states.get(k).copied().flatten().is_none() && direct(&key.instrs, k as u32) {
-            let _ = writeln!(src, "    let a{k}: {} = in{k}[i];", ty.wgsl());
+            let _ = writeln!(src, "    let a{k}: {} = {};", ty.wgsl(), load(*ty, &format!("in{k}"), "i"));
         }
     }
     src.push_str("    for (var step = 0u; step < p.steps; step = step + 1u) {\n");
@@ -960,7 +997,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     }
     src.push_str("    }\n");
     for j in 0..count {
-        let _ = writeln!(src, "    out{j}[i] = s{j};");
+        let _ = writeln!(src, "    {}", store(state_elem, &format!("out{j}"), "i", &format!("s{j}")));
     }
     src.push_str("}\n");
     src
@@ -993,7 +1030,7 @@ fn body_with(
                 Some(&(_, j)) => format!("out{j}"),
                 None => format!("in{k}"),
             };
-            let _ = writeln!(src, "    let a{k}: {} = {buffer}[i];", ty.wgsl());
+            let _ = writeln!(src, "    let a{k}: {} = {};", ty.wgsl(), load(*ty, &buffer, "i"));
         }
     }
     for (k, instr) in instrs.iter().enumerate().filter(|&(k, _)| kept(k)) {
@@ -1078,12 +1115,12 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
             }
             self.loaded.push((k, c));
             self.define(c);
-            let ty = self.key.input_tys.get(k as usize).map_or("f32", |ty| ty.wgsl());
+            let ty = self.key.input_tys.get(k as usize).copied().unwrap_or(ElemTy::F32);
             let buffer = self.buffer(k);
             if c == 0 {
-                let _ = writeln!(self.src, "    let a{k}: {ty} = {buffer}[i];");
+                let _ = writeln!(self.src, "    let a{k}: {} = {};", ty.wgsl(), load(ty, &buffer, "i"));
             } else {
-                let _ = writeln!(self.src, "    let a{k}_{c}: {ty} = {buffer}[i{c}];");
+                let _ = writeln!(self.src, "    let a{k}_{c}: {} = {};", ty.wgsl(), load(ty, &buffer, &format!("i{c}")));
             }
         }
 

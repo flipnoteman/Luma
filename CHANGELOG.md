@@ -9,11 +9,23 @@ All notable changes to Luma are listed here. The format follows
 ### Breaking
 
 - Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) and `is_finite` / `is_nan` / `is_inf` return
-  `Array<Mask>` instead of `Array<u32>`; `select`, `sum_where` and `Fields::select` take
-  `&Array<Mask>`. Where a mask was used as a number, convert it with `.to_u32()` or `.to_f32()`
-  (`x.gt(0.0).to_f32()`). Masks passed to `select` or `sum_where` need no change. `sum`, `cumsum`,
-  `scan` and `sum_axis` of a mask array fail with `LumaError::Unsupported`: use `count()`,
-  `any()`, `all()` or convert first. See the migration chapter of the guide.
+  `Array<bool>` instead of `Array<u32>`; `select`, `sum_where` and `Fields::select` take an
+  `Array<bool>` or, as before, an `Array<u32>` (non-zero is true: the `Condition` trait). What
+  still compiles unchanged: `select(&x.gt(0.0), a, b)`, `sum_where`, `bool * bool` (logical and),
+  `mask * &x` / `&x * mask` / `mask * 2.0` and `+` / `-` with a number (the booleans become the 0
+  and 1 of the number's type), and `.count()`. What breaks: code that names `Array<u32>` as the
+  type of a comparison (`let m: Array<u32> = x.gt(0.0)`), passes one to a `u32` parameter, adds or
+  multiplies two comparisons expecting a `u32` result (`a.gt(0.0) + b.gt(0.0)` has no `Add`;
+  write `a.gt(0.0).to_u32() + b.gt(0.0).to_u32()`, or `|` for a logical or), divides, shifts or
+  `minimum`s them, uses them as an index (`take`, `put`), or reads them back as `Vec<u32>`
+  (`to_vec` gives `Vec<bool>`). `sum`, `cumsum` and `sum_axis` of a `bool` array count and return
+  `u32` arrays; `reduce_axis`, `scan`, `mean` and the other numeric reductions are not defined for
+  `bool`. An integer literal next to a `bool` array needs a suffix (`mask * 2u32`): `u32` and
+  `i32` are both promoted to. See the migration chapter of the guide.
+- The element-type trait `GpuType` no longer requires `bytemuck::Pod` (`bool` is not `Pod`): it
+  has an associated `Repr` (the `Pod` form uploaded to the GPU) and conversions, which the
+  library routes every host/GPU copy through. `luma::Numeric` (sealed: `u32`, `i32`, `f32`, `f64`,
+  `Df32`) bounds the sums, scans and generic reductions that `bool` does not have.
 
 ### Added
 
@@ -33,10 +45,19 @@ All notable changes to Luma are listed here. The format follows
   `i32`), `to_i32` (from `f32`, `u32`). Float to integer truncates toward zero and saturates
   (`u32` at `4294967040`, `i32` at `-2147483648..=2147483520`); NaN becomes 0. `u32` and `i32`
   convert by reinterpreting the bits.
-- `luma::Mask`, the element type of comparisons and classifications (`Mask::TRUE`, `Mask::FALSE`,
-  `From<bool>`, `From<Mask> for bool`): `& | ^ !`, `count()` (a `u32` array), `any()` and `all()`
-  (mask arrays), `to_u32()` and `to_f32()`, `min` / `max`, views, `select` and loops.
-- The fuzzer covers `i32`, masks and the new casts.
+- `Array<bool>`, the element type of comparisons and classifications (stored on the GPU as one
+  `u32` word of 0 or 1; a custom kernel sees `array<u32>`): `from_slice` / `to_vec` / `item` with
+  plain `bool`s, `full(true)`, `& | ^ !` between arrays and with `bool`s, `count()` (a `u32`
+  array), `sum()` (the same count, as NumPy), `any()` and `all()` (one-element `bool` arrays),
+  `to_u32()`, `to_i32()`, `to_f32()`, `to_f64()`, `to_df32()`, `min` / `max`, `sum_axis`,
+  `cumsum`, `min_axis` / `max_axis`, views, `take`, `put`, `select` and loops.
+- NumPy-style promotions: `bool_array * &number_array` (either order, with a number too:
+  `mask * 2.0`), `+` and `-` for `f32`, `u32`, `i32`, `f64` and `Df32` arrays; a product is
+  `select(mask, x, 0)` (a masked-out `NaN` or infinity gives 0), a sum or difference converts the
+  mask to the number's type first. `bool * bool` is the logical and. There is no `f64` scalar
+  promotion, so that `mask * 2.0` is an `f32` array.
+- `select`, `sum_where` and `Fields::select` also accept `Array<u32>` conditions (`Condition`).
+- The fuzzer covers `i32`, `bool` and the new casts.
 - `matmul` (`a.matmul(&b)`, `luma::matmul`) for `f32`: tiled kernels (128x128 and 32x32 output
   tiles, K split over workgroups when the output has few tiles); pending operands, transposes
   included, are computed inside the kernel's loads instead of being stored first.

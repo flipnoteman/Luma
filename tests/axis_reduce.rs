@@ -263,17 +263,12 @@ fn bad_arguments_poison_the_results() {
 }
 
 #[test]
-fn mask_arrays_reduce_by_min_and_max_only() {
+fn bool_arrays_count_by_sum_and_reduce_by_min_and_max() {
     let ctx = Context::new().unwrap();
     let x = Array::from_slice_on(&ctx, &[1.0f32, -1.0, 2.0, 3.0, -4.0, -5.0], [3, 2]).unwrap();
     let m = x.gt(0.0);
-    for result in m.reduce_axis(0, [Reduction::Sum]).iter().chain(m.reduce_axis(0, [Reduction::Min, Reduction::SumOfSquares]).iter()) {
-        assert!(matches!(result.error().map(LumaError::root), Some(LumaError::Unsupported(_))), "{:?}", result.error());
-    }
-    assert!(matches!(m.sum_axis(0).error().map(LumaError::root), Some(LumaError::Unsupported(_))));
-    assert!(matches!(m.cumsum(0).error().map(LumaError::root), Some(LumaError::Unsupported(_))));
-    let max = m.max_axis(0).to_vec().unwrap();
-    assert_eq!(max, vec![luma::Mask::TRUE, luma::Mask::TRUE]);
-    let min = m.min_axis(0).to_vec().unwrap();
-    assert_eq!(min, vec![luma::Mask::FALSE, luma::Mask::FALSE]);
+    assert_eq!(m.sum_axis(0).to_vec().unwrap(), vec![2u32, 1]);
+    assert_eq!(m.cumsum(0).to_vec().unwrap(), vec![1u32, 1, 2, 1, 1, 1]);
+    assert_eq!(m.max_axis(0).to_vec().unwrap(), vec![true, true]);
+    assert_eq!(m.min_axis(0).to_vec().unwrap(), vec![false, false]);
 }

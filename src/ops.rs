@@ -13,7 +13,7 @@ use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, Builtin, Class, CmpOp, EpilogueStep, UnOp};
 use crate::context::{Context, RawArg};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{Df32, GpuType, Mask, ScalarType};
+use crate::gpu_type::{Df32, GpuType, ScalarType};
 use crate::jit::{self, ElemTy, Op, OpKind, Scalar, ShiftKind, Src};
 use crate::kernel::KernelCore;
 use crate::shape::{Offsets, Shape};
@@ -82,7 +82,7 @@ impl<T: ScalarType> Operand<T> for Array<T> {
 impl_value_operand!(f32);
 impl_value_operand!(u32);
 impl_value_operand!(i32);
-impl_value_operand!(Mask);
+impl_value_operand!(bool);
 impl_value_operand!(Df32);
 // There is deliberately no `Operand<f64> for f64`: a second float type among the scalar
 // operands would make `select(&mask, 1.0, 0.0)` and every other call that only has float
@@ -91,6 +91,65 @@ impl_value_operand!(Df32);
 impl_scalar_operand!(f32);
 impl_scalar_operand!(u32);
 impl_scalar_operand!(i32);
+
+/// Seals [`Condition`].
+pub(crate) mod condition_sealed {
+    pub trait Sealed {}
+}
+
+/// What [`select`], [`Array::sum_where`] and [`Fields::select`](crate::Fields::select) test: an
+/// `Array<bool>`, or an `Array<u32>` whose non-zero elements are true (code written when
+/// comparisons returned `u32` keeps working). Views are arrays, so they are conditions too.
+pub trait Condition: condition_sealed::Sealed {
+    #[doc(hidden)]
+    fn condition(&self) -> Cond<'_>;
+}
+
+/// The condition of a [`select`]: the array of words it tests against 0.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum Cond<'a> {
+    Bool(&'a Array<bool>),
+    Word(&'a Array<u32>),
+}
+
+impl Cond<'_> {
+    pub(crate) fn context(&self) -> &Context {
+        match self {
+            Cond::Bool(array) => array.context(),
+            Cond::Word(array) => array.context(),
+        }
+    }
+
+    pub(crate) fn shape(&self) -> Shape {
+        match self {
+            Cond::Bool(array) => array.shape(),
+            Cond::Word(array) => array.shape(),
+        }
+    }
+
+    pub(crate) fn src(&self) -> Outcome<Src> {
+        match self {
+            Cond::Bool(array) => array.src(),
+            Cond::Word(array) => array.src(),
+        }
+    }
+}
+
+impl condition_sealed::Sealed for Array<bool> {}
+impl condition_sealed::Sealed for Array<u32> {}
+
+impl Condition for Array<bool> {
+    fn condition(&self) -> Cond<'_> {
+        Cond::Bool(self)
+    }
+}
+
+impl Condition for Array<u32> {
+    fn condition(&self) -> Cond<'_> {
+        Cond::Word(self)
+    }
+}
 
 /// Splits `count` workgroups into a 2D grid within the per-dimension limit; shaders recombine
 /// them as `x + y * num_workgroups.x`.
@@ -188,8 +247,8 @@ impl<T: ScalarType> Array<T> {
         )
     }
 
-    /// The test `class` of every element, as a mask (see [`Class`]).
-    fn classify(&self, class: Class, location: &'static Location<'static>) -> Array<Mask> {
+    /// The test `class` of every element, as an `Array<bool>` (see [`Class`]).
+    fn classify(&self, class: Class, location: &'static Location<'static>) -> Array<bool> {
         let result = self.src().and_then(|operand| {
             let op = Op::new(OpKind::Classify(class), ElemTy::of::<T>()?);
             lazy(self.context(), self.shape(), op, [operand, Src::unused(), Src::unused()], class.name(), location)
@@ -335,7 +394,7 @@ impl<T: ScalarType> Array<T> {
     }
 
     #[track_caller]
-    fn compare(&self, rhs: Rhs<'_, T>, op: CmpOp, name: &'static str) -> Array<Mask> {
+    fn compare(&self, rhs: Rhs<'_, T>, op: CmpOp, name: &'static str) -> Array<bool> {
         self.compare_at(rhs, op, name, Location::caller())
     }
 
@@ -346,7 +405,7 @@ impl<T: ScalarType> Array<T> {
         op: CmpOp,
         name: &'static str,
         location: &'static Location<'static>,
-    ) -> Array<Mask> {
+    ) -> Array<bool> {
         let result = self.run_binary(rhs, false, OpKind::Compare(op), name, location);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
@@ -446,41 +505,41 @@ impl<T: ScalarType> Array<T> {
         self.binary(rhs.rhs(), BinOp::Max, false, "maximum")
     }
 
-    // -- Comparisons: masks --
+    // -- Comparisons --
 
-    /// `self < rhs` as a [`Mask`].
+    /// `self < rhs` as an `Array<bool>`.
     #[track_caller]
-    pub fn lt(&self, rhs: impl Operand<T>) -> Array<Mask> {
+    pub fn lt(&self, rhs: impl Operand<T>) -> Array<bool> {
         self.compare(rhs.rhs(), CmpOp::Lt, "lt")
     }
 
-    /// `self <= rhs` as a [`Mask`].
+    /// `self <= rhs` as an `Array<bool>`.
     #[track_caller]
-    pub fn le(&self, rhs: impl Operand<T>) -> Array<Mask> {
+    pub fn le(&self, rhs: impl Operand<T>) -> Array<bool> {
         self.compare(rhs.rhs(), CmpOp::Le, "le")
     }
 
-    /// `self > rhs` as a [`Mask`].
+    /// `self > rhs` as an `Array<bool>`.
     #[track_caller]
-    pub fn gt(&self, rhs: impl Operand<T>) -> Array<Mask> {
+    pub fn gt(&self, rhs: impl Operand<T>) -> Array<bool> {
         self.compare(rhs.rhs(), CmpOp::Gt, "gt")
     }
 
-    /// `self >= rhs` as a [`Mask`].
+    /// `self >= rhs` as an `Array<bool>`.
     #[track_caller]
-    pub fn ge(&self, rhs: impl Operand<T>) -> Array<Mask> {
+    pub fn ge(&self, rhs: impl Operand<T>) -> Array<bool> {
         self.compare(rhs.rhs(), CmpOp::Ge, "ge")
     }
 
-    /// `self == rhs` as a [`Mask`].
+    /// `self == rhs` as an `Array<bool>`.
     #[track_caller]
-    pub fn eq(&self, rhs: impl Operand<T>) -> Array<Mask> {
+    pub fn eq(&self, rhs: impl Operand<T>) -> Array<bool> {
         self.compare(rhs.rhs(), CmpOp::Eq, "eq")
     }
 
-    /// `self != rhs` as a [`Mask`].
+    /// `self != rhs` as an `Array<bool>`.
     #[track_caller]
-    pub fn ne(&self, rhs: impl Operand<T>) -> Array<Mask> {
+    pub fn ne(&self, rhs: impl Operand<T>) -> Array<bool> {
         self.compare(rhs.rhs(), CmpOp::Ne, "ne")
     }
 
@@ -510,8 +569,8 @@ impl<T: ScalarType> Array<T> {
                 &core,
                 len_u32(n)?,
                 &[
-                    RawArg::write(pin.buffer(), n as u64 * std::mem::size_of::<T>() as u64),
-                    RawArg::Uniform(bytemuck::bytes_of(&value)),
+                    RawArg::write(pin.buffer(), n as u64 * T::BYTES as u64),
+                    RawArg::Uniform(bytemuck::bytes_of(&value.into_repr())),
                 ],
             )?;
         }
@@ -617,65 +676,61 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     arrays.iter().try_for_each(|array| array.check())
 }
 
-/// Picks `a[i]` where `mask[i]` is true and `b[i]` elsewhere. Either branch is an `&Array<T>` or a
-/// single `T` applied to every element; a scalar is a uniform of the fused kernel, so no constant
-/// array is materialized or read from memory:
+/// Picks `a[i]` where `cond[i]` is true and `b[i]` elsewhere. The condition is an `Array<bool>`
+/// (or an `Array<u32>`, non-zero meaning true: see [`Condition`]). Either branch is an
+/// `&Array<T>` or a single `T` applied to every element; a scalar is a uniform of the fused
+/// kernel, so no constant array is materialized or read from memory:
 ///
 /// ```ignore
 /// let ones = select(&x.gt(0.0), 1.0, 0.0);
 /// let clipped = select(&x.gt(0.0), &x, 0.0);
 /// ```
 ///
-/// The result takes the mask's shape and context. An array branch has the mask's shape or
-/// extent 1 on the axes where it differs (a `[n, 1]` branch under an `[n, m]` mask is read at
-/// every column, see [`Array::broadcast_to`]). A mismatch poisons the result with
-/// `ShapeMismatch` (reported as `lhs` = the mask's shape, `rhs` = the branch's) or
-/// `ContextMismatch`.
+/// The result takes the condition's shape and context. An array branch has the condition's
+/// shape or extent 1 on the axes where it differs (a `[n, 1]` branch under an `[n, m]`
+/// condition is read at every column, see [`Array::broadcast_to`]). A mismatch poisons the
+/// result with `ShapeMismatch` (reported as `lhs` = the condition's shape, `rhs` = the branch's)
+/// or `ContextMismatch`.
 #[track_caller]
-pub fn select<T: ScalarType>(mask: &Array<Mask>, a: impl Operand<T>, b: impl Operand<T>) -> Array<T> {
-    select_at(mask, a, b, Location::caller())
+pub fn select<T: ScalarType>(cond: &impl Condition, a: impl Operand<T>, b: impl Operand<T>) -> Array<T> {
+    select_at(cond, a, b, Location::caller())
 }
 
 /// [`select`] reporting failures at `location`.
 pub(crate) fn select_at<T: ScalarType>(
-    mask: &Array<Mask>,
+    cond: &impl Condition,
     a: impl Operand<T>,
     b: impl Operand<T>,
     location: &'static Location<'static>,
 ) -> Array<T> {
-    let result = run_select(mask, a.rhs(), b.rhs(), location);
-    Array::resolve(mask.context(), mask.shape(), result, "select", location)
+    let cond = cond.condition();
+    let result = run_select(cond, a.rhs(), b.rhs(), location);
+    Array::resolve(cond.context(), cond.shape(), result, "select", location)
 }
 
 pub(crate) fn run_select<T: ScalarType>(
-    mask: &Array<Mask>,
+    cond: Cond<'_>,
     a: Rhs<'_, T>,
     b: Rhs<'_, T>,
     location: &'static Location<'static>,
 ) -> Outcome<Array<T>> {
-    let ctx = mask.context();
-    let mask_src = mask.src()?;
+    let ctx = cond.context();
+    let shape = cond.shape();
+    let cond_src = cond.src()?;
     let branch = |rhs: Rhs<'_, T>| -> Outcome<Src> {
         match rhs {
             Rhs::Array(other) => {
                 if !ctx.same_as(other.context()) {
                     return Err(LumaError::ContextMismatch.into());
                 }
-                other.broadcast_operand(mask.shape(), location)
+                other.broadcast_operand(shape, location)
             }
             Rhs::Scalar(value) => Ok(Src::Scalar(Scalar::of(value)?)),
         }
     };
     let a_src = branch(a)?;
     let b_src = branch(b)?;
-    lazy(
-        ctx,
-        mask.shape(),
-        Op::new(OpKind::Select, ElemTy::of::<T>()?),
-        [mask_src, a_src, b_src],
-        "select",
-        location,
-    )
+    lazy(ctx, shape, Op::new(OpKind::Select, ElemTy::of::<T>()?), [cond_src, a_src, b_src], "select", location)
 }
 
 // -- Math functions on f32 arrays --
@@ -726,25 +781,25 @@ macro_rules! impl_float_classes {
     ($($ty:ty),*) => {$(
         impl Array<$ty> {
             /// Elementwise: `1` where the element is neither infinite nor `NaN`, else `0`; a
-            /// lazy [`Mask`] array that fuses like any elementwise operation. The test reads the
+            /// lazy `bool` array that fuses like any elementwise operation. The test reads the
             /// bits of the exponent, so it does not depend on how the device compares `NaN`
             /// (a compiler may assume no `NaN` exists and fold `x != x`). For [`Df32`] it is the
             /// high word that counts.
             #[track_caller]
-            pub fn is_finite(&self) -> Array<Mask> {
+            pub fn is_finite(&self) -> Array<bool> {
                 self.classify(Class::Finite, Location::caller())
             }
 
             /// Elementwise: `1` where the element is `NaN`, else `0` (see [`Array::is_finite`]).
             #[track_caller]
-            pub fn is_nan(&self) -> Array<Mask> {
+            pub fn is_nan(&self) -> Array<bool> {
                 self.classify(Class::Nan, Location::caller())
             }
 
             /// Elementwise: `1` where the element is positive or negative infinity, else `0`
             /// (see [`Array::is_finite`]).
             #[track_caller]
-            pub fn is_inf(&self) -> Array<Mask> {
+            pub fn is_inf(&self) -> Array<bool> {
                 self.classify(Class::Inf, Location::caller())
             }
         }
@@ -1171,95 +1226,266 @@ impl Not for Array<i32> {
     }
 }
 
-macro_rules! impl_mask_operator {
-    ($Trait:ident, $method:ident, $AssignTrait:ident, $assign_method:ident, $op:expr, $name:literal, $assign_name:literal) => {
-        impl $Trait<&Array<Mask>> for &Array<Mask> {
-            type Output = Array<Mask>;
-            #[track_caller]
-            fn $method(self, rhs: &Array<Mask>) -> Array<Mask> {
-                self.binary(Rhs::Array(rhs), $op, false, $name)
-            }
-        }
+impl_binary_operator!(bool, BitAnd, bitand, BinOp::BitAnd, "bitand");
+impl_binary_operator!(bool, BitOr, bitor, BinOp::BitOr, "bitor");
+impl_binary_operator!(bool, BitXor, bitxor, BinOp::BitXor, "bitxor");
+impl_assign_operator!(bool, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand_assign");
+impl_assign_operator!(bool, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor_assign");
+impl_assign_operator!(bool, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor_assign");
+// `bool * bool` is the logical and, so that products of comparisons keep their meaning.
+impl_binary_operator!(bool, Mul, mul, BinOp::BitAnd, "mul");
 
-        impl $Trait<Array<Mask>> for Array<Mask> {
-            type Output = Array<Mask>;
-            #[track_caller]
-            fn $method(self, rhs: Array<Mask>) -> Array<Mask> {
-                self.binary(Rhs::Array(&rhs), $op, false, $name)
-            }
-        }
-
-        impl $Trait<Array<Mask>> for &Array<Mask> {
-            type Output = Array<Mask>;
-            #[track_caller]
-            fn $method(self, rhs: Array<Mask>) -> Array<Mask> {
-                self.binary(Rhs::Array(&rhs), $op, false, $name)
-            }
-        }
-
-        impl $Trait<&Array<Mask>> for Array<Mask> {
-            type Output = Array<Mask>;
-            #[track_caller]
-            fn $method(self, rhs: &Array<Mask>) -> Array<Mask> {
-                self.binary(Rhs::Array(rhs), $op, false, $name)
-            }
-        }
-
-        impl $AssignTrait<&Array<Mask>> for Array<Mask> {
-            #[track_caller]
-            fn $assign_method(&mut self, rhs: &Array<Mask>) {
-                self.assign_op(Rhs::Array(rhs), $op, $assign_name)
-            }
-        }
-    };
-}
-
-impl_mask_operator!(BitAnd, bitand, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand", "bitand_assign");
-impl_mask_operator!(BitOr, bitor, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor", "bitor_assign");
-impl_mask_operator!(BitXor, bitxor, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor", "bitxor_assign");
-
-impl Not for &Array<Mask> {
-    type Output = Array<Mask>;
+impl Not for &Array<bool> {
+    type Output = Array<bool>;
 
     /// Elementwise logical negation.
     #[track_caller]
-    fn not(self) -> Array<Mask> {
+    fn not(self) -> Array<bool> {
         let location = Location::caller();
         let result = self.run_unary(UnOp::BitNot, location);
         Array::resolve(self.context(), self.shape(), result, "not", location)
     }
 }
 
-impl Not for Array<Mask> {
-    type Output = Array<Mask>;
+impl Not for Array<bool> {
+    type Output = Array<bool>;
 
     #[track_caller]
-    fn not(self) -> Array<Mask> {
+    fn not(self) -> Array<bool> {
         !&self
     }
 }
 
-impl Array<Mask> {
-    /// The number of true elements, as a lazy one-element `u32` array (see [`Array::sum`]).
-    #[track_caller]
-    pub fn count(&self) -> Array<u32> {
-        self.to_u32().sum()
+// -- NumPy-style promotion of `bool` arrays --
+
+/// The arithmetic operators between a `bool` array and a number.
+#[derive(Clone, Copy)]
+pub(crate) enum Promote {
+    Mul,
+    Add,
+    Sub,
+}
+
+impl Promote {
+    fn name(self) -> &'static str {
+        match self {
+            Promote::Mul => "mul",
+            Promote::Add => "add",
+            Promote::Sub => "sub",
+        }
     }
 
-    /// Whether any element is true, as a lazy one-element mask (the maximum). Read it with
-    /// `.item()` and `bool::from`.
-    #[track_caller]
-    pub fn any(&self) -> Array<Mask> {
-        self.max()
+    fn assign_name(self) -> &'static str {
+        match self {
+            Promote::Mul => "mul_assign",
+            Promote::Add => "add_assign",
+            Promote::Sub => "sub_assign",
+        }
     }
 
-    /// Whether every element is true, as a lazy one-element mask (the minimum). Read it with
-    /// `.item()` and `bool::from`.
-    #[track_caller]
-    pub fn all(&self) -> Array<Mask> {
-        self.min()
+    fn op(self) -> BinOp {
+        match self {
+            Promote::Mul => BinOp::Mul,
+            Promote::Add => BinOp::Add,
+            Promote::Sub => BinOp::Sub,
+        }
     }
 }
+
+impl Array<bool> {
+    /// `self op other` (`other op self` unless `bool_left`) with the booleans as the 0 and 1 of
+    /// `other`'s type. A product is `select(self, other, 0)`; a sum or difference converts first.
+    pub(crate) fn promote<N: ScalarType>(&self, other: Rhs<'_, N>, bool_left: bool, op: Promote, location: &'static Location<'static>) -> Array<N> {
+        if let Promote::Mul = op {
+            let result = self.run_masked(other, location);
+            return Array::resolve(self.context(), self.shape(), result, op.name(), location);
+        }
+        let number = self.cast_at::<N>(location);
+        match (bool_left, other) {
+            (true, other) => number.binary_at(other, op.op(), false, op.name(), location),
+            (false, Rhs::Scalar(value)) => number.binary_at(Rhs::Scalar(value), op.op(), true, op.name(), location),
+            (false, Rhs::Array(array)) => array.binary_at(Rhs::Array(&number), op.op(), false, op.name(), location),
+        }
+    }
+
+    /// `select(self, other, 0)`, broadcasting the shapes like a binary operation.
+    fn run_masked<N: ScalarType>(&self, other: Rhs<'_, N>, location: &'static Location<'static>) -> Outcome<Array<N>> {
+        let ctx = self.context();
+        let mask = self.src()?;
+        let (mask, value, shape) = match other {
+            Rhs::Array(array) => {
+                let value = array.src()?;
+                if !ctx.same_as(array.context()) {
+                    return Err(LumaError::ContextMismatch.into());
+                }
+                if self.shape() == array.shape() {
+                    (mask, value, self.shape())
+                } else {
+                    let mismatch = || LumaError::ShapeMismatch { lhs: self.shape().dims(), rhs: array.shape().dims() };
+                    let out = broadcast_shape(self.shape(), array.shape()).ok_or_else(mismatch)?;
+                    let mask = if self.shape() == out { mask } else { self.broadcast_axis(out, location)? };
+                    let value = if array.shape() == out { value } else { array.broadcast_axis(out, location)? };
+                    (mask, value, out)
+                }
+            }
+            Rhs::Scalar(value) => (mask, Src::Scalar(Scalar::of(value)?), self.shape()),
+        };
+        let zero = Src::Scalar(Scalar::of(N::zeroed())?);
+        lazy(ctx, shape, Op::new(OpKind::Select, ElemTy::of::<N>()?), [mask, value, zero], "mul", location)
+    }
+
+    /// `self op= other`: the booleans as the 0 and 1 of the target's type.
+    fn promote_assign<N: ScalarType>(target: &mut Array<N>, other: &Array<bool>, op: Promote, location: &'static Location<'static>) {
+        let number = other.cast_at::<N>(location);
+        target.assign_op_at(Rhs::Array(&number), op.op(), op.assign_name(), location);
+    }
+}
+
+macro_rules! impl_promotion {
+    ($Trait:ident, $method:ident, $op:expr, $n:ty) => {
+        impl $Trait<&Array<$n>> for &Array<bool> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<$n>) -> Array<$n> {
+                self.promote(Rhs::Array(rhs), true, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<Array<$n>> for &Array<bool> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: Array<$n>) -> Array<$n> {
+                self.promote(Rhs::Array(&rhs), true, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<&Array<$n>> for Array<bool> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<$n>) -> Array<$n> {
+                self.promote(Rhs::Array(rhs), true, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<Array<$n>> for Array<bool> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: Array<$n>) -> Array<$n> {
+                self.promote(Rhs::Array(&rhs), true, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<&Array<bool>> for &Array<$n> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<bool>) -> Array<$n> {
+                rhs.promote(Rhs::Array(self), false, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<Array<bool>> for &Array<$n> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: Array<bool>) -> Array<$n> {
+                rhs.promote(Rhs::Array(self), false, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<&Array<bool>> for Array<$n> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<bool>) -> Array<$n> {
+                rhs.promote(Rhs::Array(&self), false, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<Array<bool>> for Array<$n> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: Array<bool>) -> Array<$n> {
+                rhs.promote(Rhs::Array(&self), false, $op, Location::caller())
+            }
+        }
+    };
+}
+
+/// The same with a number: `bool_array * 2.0`, `1.0 - bool_array`.
+macro_rules! impl_promotion_scalar {
+    ($Trait:ident, $method:ident, $op:expr, $n:ty) => {
+        impl $Trait<$n> for &Array<bool> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: $n) -> Array<$n> {
+                self.promote(Rhs::Scalar(rhs), true, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<$n> for Array<bool> {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: $n) -> Array<$n> {
+                self.promote(Rhs::Scalar(rhs), true, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<&Array<bool>> for $n {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<bool>) -> Array<$n> {
+                rhs.promote(Rhs::Scalar(self), false, $op, Location::caller())
+            }
+        }
+
+        impl $Trait<Array<bool>> for $n {
+            type Output = Array<$n>;
+            #[track_caller]
+            fn $method(self, rhs: Array<bool>) -> Array<$n> {
+                rhs.promote(Rhs::Scalar(self), false, $op, Location::caller())
+            }
+        }
+    };
+}
+
+macro_rules! impl_promotion_assign {
+    ($Trait:ident, $method:ident, $op:expr, $n:ty) => {
+        impl $Trait<&Array<bool>> for Array<$n> {
+            #[track_caller]
+            fn $method(&mut self, rhs: &Array<bool>) {
+                Array::<bool>::promote_assign(self, rhs, $op, Location::caller())
+            }
+        }
+    };
+}
+
+macro_rules! impl_promotions {
+    ($n:ty) => {
+        impl_promotion!(Mul, mul, Promote::Mul, $n);
+        impl_promotion!(Add, add, Promote::Add, $n);
+        impl_promotion!(Sub, sub, Promote::Sub, $n);
+        impl_promotion_assign!(MulAssign, mul_assign, Promote::Mul, $n);
+        impl_promotion_assign!(AddAssign, add_assign, Promote::Add, $n);
+        impl_promotion_assign!(SubAssign, sub_assign, Promote::Sub, $n);
+    };
+}
+
+macro_rules! impl_promotions_scalar {
+    ($n:ty) => {
+        impl_promotion_scalar!(Mul, mul, Promote::Mul, $n);
+        impl_promotion_scalar!(Add, add, Promote::Add, $n);
+        impl_promotion_scalar!(Sub, sub, Promote::Sub, $n);
+    };
+}
+
+impl_promotions!(f32);
+impl_promotions!(u32);
+impl_promotions!(i32);
+impl_promotions!(f64);
+impl_promotions!(Df32);
+// No `f64` scalar: with two float types among the scalars, `bool_array * 2.0` would infer `f64`.
+impl_promotions_scalar!(f32);
+impl_promotions_scalar!(u32);
+impl_promotions_scalar!(i32);
+impl_promotions_scalar!(Df32);
 
 impl Array<i32> {
     /// Elementwise `self << amount`, with an array of the same shape or a single `i32` as the

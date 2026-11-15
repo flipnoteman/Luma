@@ -16,7 +16,7 @@ use crate::error::LumaError;
 use crate::ops::fold_workgroups;
 use crate::shape::Shape;
 
-use super::codegen::{expression, NO_NAMES};
+use super::codegen::{expression, load, storage_ty, NO_NAMES};
 use super::program::{flatten_stencil, Fused, Instr, Ref};
 use super::{ElemTy, OpKind, ShiftKind};
 use crate::tuning::{stencil_bytes, Tuning, STENCIL_RADIUS as MAX_RADIUS};
@@ -201,7 +201,7 @@ impl Stencil {
                 src,
                 "@group(1) @binding({}) var<storage, read> in{i}: array<{}>;",
                 b + 2,
-                self.inputs[i].1.wgsl()
+                storage_ty(self.inputs[i].1)
             );
         }
         let _ = writeln!(
@@ -262,7 +262,7 @@ fn main(
                 let load = if Some(i as u32) == self.u {
                     format!("{from}[c]")
                 } else {
-                    format!("in{i}[gi]")
+                    load(*ty, &format!("in{i}"), "gi")
                 };
                 let _ = writeln!(src, "        let a{i}: {} = {load};", ty.wgsl());
             }

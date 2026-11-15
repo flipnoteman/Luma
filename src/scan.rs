@@ -22,7 +22,7 @@ use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::ScalarType;
+use crate::gpu_type::{Numeric, ScalarType};
 use crate::jit::{self, operator_source, ElemTy, Node, Operator};
 use crate::kernel::KernelCore;
 use crate::ops::{fold_workgroups, Outcome, Rhs};
@@ -857,7 +857,7 @@ impl<T: ScalarType> Array<T> {
 
     #[track_caller]
     fn scan_axis(&self, axis: usize, op: &ScanOp<'_, T>, name: &'static str, location: &'static Location<'static>) -> Array<T> {
-        let result = if ElemTy::try_of::<T>() == Some(ElemTy::Mask) { Err(mask_sum_error(name)) } else { self.run_scan(axis, op) };
+        let result = self.run_scan(axis, op);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
 
@@ -868,10 +868,7 @@ impl<T: ScalarType> Array<T> {
             dims[axis] = 1;
         }
         let shape = Shape::from(dims);
-        let sums_mask = ElemTy::try_of::<T>() == Some(ElemTy::Mask) && ops.iter().any(|r| matches!(r, Reduction::Sum | Reduction::SumOfSquares));
-        let result = if sums_mask {
-            Err(mask_sum_error(name))
-        } else if (1..=MAX_REDUCTIONS).contains(&N) {
+        let result = if (1..=MAX_REDUCTIONS).contains(&N) {
             self.run_axis_reduce(axis, ReduceList::new(&ops.map(Reduction::op)))
         } else {
             Err(LumaError::InvalidShape(format!("{N} reductions along an axis: one to {MAX_REDUCTIONS} are computed together")).into())
@@ -891,7 +888,9 @@ impl<T: ScalarType> Array<T> {
             Array::resolve(self.context(), shape, result, name, location)
         })
     }
+}
 
+impl<T: Numeric> Array<T> {
     /// The inclusive scan of `op` along `axis`: element `s` of every line is
     /// `op(.. op(op(x[0], x[1]), x[2]) .., x[s])`. `op` must be associative (the kernels regroup
     /// the operands, keeping their order, so a non-associative operator gives unspecified
@@ -950,11 +949,42 @@ impl<T: ScalarType> Array<T> {
     /// [`Reduction::SumOfSquares`] of integers wraps, as [`Array::reduce`] does. Contiguous lines
     /// (`axis` 0) are reduced by a workgroup per chunk of a line, short ones a group of lines per
     /// workgroup, strided lines by blocks that an invocation walks (see [`scan`](Array::scan)).
-    /// On [`Mask`](crate::Mask) arrays only `Min` and `Max` are available; `Sum` and
-    /// `SumOfSquares` poison every result with [`LumaError::Unsupported`].
+    /// `bool` arrays have no `reduce_axis`: their sums are counts (see
+    /// [`Array<bool>::sum_axis`](Array::sum_axis)) and their extrema `min_axis`/`max_axis`.
     #[track_caller]
     pub fn reduce_axis<const N: usize>(&self, axis: usize, ops: [Reduction; N]) -> [Array<T>; N] {
         self.reduce_lines(axis, ops, "reduce_axis", Location::caller())
+    }
+}
+
+impl Array<bool> {
+    /// The number of true elements along `axis`, as `u32`; the result has extent 1 along it
+    /// (the sum of booleans is an integer, as in NumPy). Fused like [`Array::sum_axis`].
+    #[track_caller]
+    pub fn sum_axis(&self, axis: usize) -> Array<u32> {
+        self.cast_at::<u32>(Location::caller()).sum_axis(axis)
+    }
+
+    /// The running count of true elements along `axis`, as `u32`.
+    #[track_caller]
+    pub fn cumsum(&self, axis: usize) -> Array<u32> {
+        self.cast_at::<u32>(Location::caller()).cumsum(axis)
+    }
+
+    /// Whether every element along `axis` is true (the minimum); the result has extent 1 along
+    /// it. Fused like [`Array::sum_axis`].
+    #[track_caller]
+    pub fn min_axis(&self, axis: usize) -> Array<bool> {
+        let [min] = self.reduce_lines(axis, [Reduction::Min], "min_axis", Location::caller());
+        min
+    }
+
+    /// Whether any element along `axis` is true (the maximum); the result has extent 1 along it.
+    /// Fused like [`Array::sum_axis`].
+    #[track_caller]
+    pub fn max_axis(&self, axis: usize) -> Array<bool> {
+        let [max] = self.reduce_lines(axis, [Reduction::Max], "max_axis", Location::caller());
+        max
     }
 }
 
@@ -983,11 +1013,6 @@ impl Array<f32> {
     pub fn std_axis(&self, axis: usize) -> Array<f32> {
         self.var_axis(axis).sqrt()
     }
-}
-
-/// The failure of an operation that would leave the values 0 and 1 on a [`crate::Mask`] array.
-pub(crate) fn mask_sum_error(name: &str) -> Failure {
-    LumaError::Unsupported(format!("{name} on Mask arrays; use count/any/all or to_u32")).into()
 }
 
 fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {

@@ -694,9 +694,9 @@ fn i32_division_and_shift_edges() {
     });
 }
 
-/// Casts among `f32`, `u32`, `i32` and masks, and the mask operators, `count`, `any` and `all`.
+/// Casts among `f32`, `u32`, `i32` and `bool`, and the `bool` operators, `count`, `any` and `all`.
 #[test]
-fn casts_and_mask_operations() {
+fn casts_and_bool_operations() {
     check(Program {
         config: Config::default_engine(),
         math: false,
@@ -719,6 +719,27 @@ fn casts_and_mask_operations() {
             Unary { src: 9, op: ToF32 },
             Select { mask: 9, a: Var(2), b: Const(-5.0), ty: I32 },
             SumWhere { src: 2, mask: 9 },
+        ],
+    });
+}
+
+/// The promotions of a `bool` array: `select` for a product, a cast and the operation for sums and
+/// differences, with the boolean on either side, an array or a constant, and broadcasting.
+#[test]
+fn bool_promotions() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 7 },
+            Input { dims: [12, 4, 1, 1], ty: I32, seed: 9 },
+            Input { dims: [12, 1, 1, 1], ty: U32, seed: 11 },
+            Compare { lhs: 0, rhs: Const(0.5), op: Gt },
+            Promote { mask: 3, other: Var(0), ty: F32, op: Mul, mask_left: true },
+            Promote { mask: 3, other: Var(1), ty: I32, op: Sub, mask_left: false },
+            Promote { mask: 3, other: Var(2), ty: U32, op: Add, mask_left: true },
+            Promote { mask: 3, other: Const(2.0), ty: F32, op: Mul, mask_left: false },
+            Promote { mask: 3, other: Const(3.0), ty: U32, op: Sub, mask_left: false },
         ],
     });
 }

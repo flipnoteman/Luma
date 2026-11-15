@@ -4,7 +4,7 @@ pub(crate) mod sealed {
 
 impl sealed::Sealed for u32 {}
 impl sealed::Sealed for i32 {}
-impl sealed::Sealed for Mask {}
+impl sealed::Sealed for bool {}
 impl sealed::Sealed for f32 {}
 impl sealed::Sealed for f64 {}
 impl sealed::Sealed for Df32 {}
@@ -24,7 +24,42 @@ use bytemuck::{Pod, Zeroable};
 ///
 /// The built-in math only exists for [`ScalarType`]s; `[f32; 2]` and `[f32; 4]` arrays also have
 /// per-component reductions (`sum`, `min`, `max`, `norm`).
-pub trait GpuType: Pod + std::fmt::Debug + sealed::Sealed {}
+///
+/// Host values and GPU words are related through the hidden associated type `Repr`: every
+/// host-to-GPU and GPU-to-host copy goes through `to_repr` / `from_repr` (borrowed, no copy, for
+/// every type but `bool`), and element sizes come from `BYTES`.
+///
+/// A `bool` is stored as one `u32` word holding 0 or 1 (a custom kernel sees an `array<u32>`).
+pub trait GpuType: Zeroable + Copy + Send + Sync + std::fmt::Debug + sealed::Sealed + 'static {
+    /// The plain-old-data form of the element that is uploaded to and read back from the GPU.
+    #[doc(hidden)]
+    type Repr: Pod;
+
+    /// The bytes one element takes on the GPU.
+    #[doc(hidden)]
+    const BYTES: usize = std::mem::size_of::<Self::Repr>();
+
+    /// The GPU words of `host`: borrowed when the representation is the type itself.
+    #[doc(hidden)]
+    fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]>;
+
+    /// The host values of GPU words read back.
+    #[doc(hidden)]
+    fn from_repr(repr: Vec<Self::Repr>) -> Vec<Self>;
+
+    /// `host` viewed as GPU words, if the representation is the type itself (no conversion
+    /// needed to read into it); `None` otherwise.
+    #[doc(hidden)]
+    fn repr_mut(host: &mut [Self]) -> Option<&mut [Self::Repr]>;
+
+    /// The GPU word of one value.
+    #[doc(hidden)]
+    fn into_repr(self) -> Self::Repr;
+
+    /// The value of one GPU word.
+    #[doc(hidden)]
+    fn one_from_repr(word: Self::Repr) -> Self;
+}
 
 /// Element types the built-in operators, math functions and reductions are implemented for.
 pub trait ScalarType: GpuType {
@@ -40,15 +75,71 @@ pub trait ScalarType: GpuType {
     }
 }
 
-impl GpuType for u32 {}
-impl GpuType for i32 {}
-impl GpuType for Mask {}
-impl GpuType for f32 {}
-impl GpuType for f64 {}
-impl GpuType for [f32; 2] {}
-impl GpuType for [f32; 4] {}
-impl GpuType for [u32; 2] {}
-impl GpuType for [u32; 4] {}
+/// `GpuType` for types that are their own GPU representation.
+macro_rules! plain_gpu_type {
+    ($($ty:ty),*) => {$(
+        impl GpuType for $ty {
+            type Repr = $ty;
+
+            fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
+                std::borrow::Cow::Borrowed(host)
+            }
+
+            fn from_repr(repr: Vec<Self::Repr>) -> Vec<Self> {
+                repr
+            }
+
+            fn repr_mut(host: &mut [Self]) -> Option<&mut [Self::Repr]> {
+                Some(host)
+            }
+
+            fn into_repr(self) -> Self::Repr {
+                self
+            }
+
+            fn one_from_repr(word: Self::Repr) -> Self {
+                word
+            }
+        }
+    )*};
+}
+
+plain_gpu_type!(u32, i32, f32, f64, Df32, [f32; 2], [f32; 4], [u32; 2], [u32; 4]);
+
+impl GpuType for bool {
+    type Repr = u32;
+
+    fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
+        std::borrow::Cow::Owned(host.iter().map(|&b| u32::from(b)).collect())
+    }
+
+    fn from_repr(repr: Vec<Self::Repr>) -> Vec<Self> {
+        repr.into_iter().map(|w| w != 0).collect()
+    }
+
+    fn repr_mut(_host: &mut [Self]) -> Option<&mut [Self::Repr]> {
+        None
+    }
+
+    fn into_repr(self) -> Self::Repr {
+        u32::from(self)
+    }
+
+    fn one_from_repr(word: Self::Repr) -> Self {
+        word != 0
+    }
+}
+
+/// The element types of arithmetic: `u32`, `i32`, `f32`, `f64` and [`Df32`]. Sums, running sums,
+/// products and the generic reductions exist for these; `bool` has its own counting versions
+/// (see [`Array<bool>`](crate::Array#impl-Array%3Cbool%3E)) because NumPy's sum of booleans is an integer.
+pub trait Numeric: ScalarType {}
+
+impl Numeric for u32 {}
+impl Numeric for i32 {}
+impl Numeric for f32 {}
+impl Numeric for f64 {}
+impl Numeric for Df32 {}
 
 impl ScalarType for u32 {
     fn wgsl_type() -> &'static str {
@@ -62,7 +153,11 @@ impl ScalarType for i32 {
     }
 }
 
-impl ScalarType for Mask {
+// The WGSL type of the words a `bool` array is stored in (`GpuType::Repr` is `u32`). The built-in
+// kernels that move elements without computing on them (copy, take, put, fill, stack, concat)
+// and the reductions use it as the storage type; the fused kernels go through the accessors
+// `codegen::storage_ty`, `codegen::load` and `codegen::store`.
+impl ScalarType for bool {
     fn wgsl_type() -> &'static str {
         "u32"
     }
@@ -77,47 +172,6 @@ impl ScalarType for f32 {
 impl ScalarType for f64 {
     fn wgsl_type() -> &'static str {
         "f64"
-    }
-}
-
-/// A boolean per element: the result of comparisons and classifications, and the first operand of
-/// [`select`](crate::select). It is stored as a `u32` that is 0 (false) or 1 (true); the field is
-/// private, so masks read back from the GPU or built with [`Mask::from`] only ever hold 0 or 1.
-/// The library relies on that: `!`, [`count`](crate::Array::count), [`any`](crate::Array::any)
-/// and [`all`](crate::Array::all) give unspecified results for a mask holding another word,
-/// which only a reinterpretation of raw bits through `bytemuck` (`Mask` is `Pod`) can build.
-/// Generators (`range` and the like) do not exist for masks.
-/// Arrays of masks have `&`, `|`, `^` and `!`, [`count`](crate::Array::count),
-/// [`any`](crate::Array::any), [`all`](crate::Array::all), `min`/`max` and the casts
-/// [`to_u32`](crate::Array::to_u32) and [`to_f32`](crate::Array::to_f32); arithmetic and sums
-/// are not defined (convert with `to_u32` first).
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Mask(u32);
-
-// SAFETY: `#[repr(transparent)]` over `u32`: no padding, and the all-zero pattern is valid.
-unsafe impl Zeroable for Mask {}
-// SAFETY: see above. Bit patterns other than 0 and 1 are never produced by the library, but
-// they are not undefined behaviour either (every operation reads the word as an integer); the
-// results of the mask operations for them are unspecified (see the type's documentation).
-unsafe impl Pod for Mask {}
-
-impl Mask {
-    /// The true mask.
-    pub const TRUE: Mask = Mask(1);
-    /// The false mask.
-    pub const FALSE: Mask = Mask(0);
-}
-
-impl From<bool> for Mask {
-    fn from(value: bool) -> Self {
-        Mask(u32::from(value))
-    }
-}
-
-impl From<Mask> for bool {
-    fn from(value: Mask) -> Self {
-        value.0 != 0
     }
 }
 
@@ -158,8 +212,6 @@ impl Df32 {
         f64::from(self.hi) + f64::from(self.lo)
     }
 }
-
-impl GpuType for Df32 {}
 
 impl ScalarType for Df32 {
     fn wgsl_type() -> &'static str {

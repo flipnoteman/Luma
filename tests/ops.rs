@@ -182,7 +182,7 @@ fn comparisons_produce_masks() {
     let a = f32s(&xs);
     let b = f32s(&[5.0, 2.0, 1.0, 4.0, 0.0, 3.0]);
 
-    let mask = |m: Array<Mask>| m.to_u32().to_vec().unwrap();
+    let mask = |m: Array<bool>| m.to_u32().to_vec().unwrap();
     assert_eq!(mask(a.lt(&b)), vec![1, 0, 0, 0, 0, 0]);
     assert_eq!(mask(a.le(&b)), vec![1, 1, 0, 1, 0, 1]);
     assert_eq!(mask(a.gt(&b)), vec![0, 0, 1, 0, 1, 0]);
