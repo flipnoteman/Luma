@@ -1445,8 +1445,11 @@ fn flatten_once(
             break (graph, root_at, passes, None);
         }
         let candidates = passes.members.iter().chain(&sub_members).filter(|&&at| !is_root(at)).map(|&at| &graph.items[at as usize].node);
+        // Requested nodes are cut too, but only the ones that pending operations outside the
+        // kernel read are shared.
         if let Some((root, _)) = roots.first() {
-            note_shared(root, &shared);
+            let read_outside: Vec<Arc<Node>> = shared.iter().filter(|node| node.has_consumer_outside(inside)).cloned().collect();
+            note_shared(root, &read_outside);
         }
         let forced = with_siblings(shared, candidates);
         force_group(&forced)?;

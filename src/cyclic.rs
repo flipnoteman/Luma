@@ -450,6 +450,9 @@ fn solve(src: &mut String, ind: &str, b: usize, w: usize, closed: bool) -> &'sta
         eliminate(src, ind, b, w);
         return "r";
     }
+    if b > 1 {
+        equilibrate(src, ind, b);
+    }
     inverse(src, ind, b);
     for i in 0..b {
         for j in 0..w {
@@ -460,10 +463,33 @@ fn solve(src: &mut String, ind: &str, b: usize, w: usize, closed: bool) -> &'sta
     "x"
 }
 
+/// Scales the block `m` by `bt = 1 / max |m{i}_{j}|` (not a block of zeros), which keeps the
+/// cofactors and the determinant of [`inverse`] in range for blocks of any uniform magnitude (a
+/// 4x4 block of entries of `1e10` has a determinant of `1e40`); `inverse` folds `bt` back into the
+/// inverse of the scaled block. A block of zeros stays so and singular. Rows of magnitudes that
+/// differ by more than the range of `f32` over `b` still overflow, as the pivoted solves do not.
+fn equilibrate(src: &mut String, ind: &str, b: usize) {
+    let mut max = "abs(m0_0)".to_owned();
+    for i in 0..b {
+        for j in 0..b {
+            if i + j > 0 {
+                max = format!("max({max}, abs(m{i}_{j}))");
+            }
+        }
+    }
+    let _ = writeln!(src, "{ind}let bm = {max};\n{ind}let bt = select(1.0, 1.0 / bm, bm > 0.0);");
+    for i in 0..b {
+        for j in 0..b {
+            let _ = writeln!(src, "{ind}m{i}_{j} *= bt;");
+        }
+    }
+}
+
 /// Declares `iv{i}_{j}`, the inverse of the `b x b` matrix `m{i}_{j}` (`b <= 4`), from its
 /// cofactors (the 2x2 minors of the row pairs for `b = 4`). Nothing is pivoted, but no pivot is
 /// divided by either: a matrix with a zero diagonal and a determinant that is not zero inverts
 /// as well as any (the error grows with its condition number); a singular one gives `Inf`/`NaN`.
+/// `m` must have been scaled by `bt` (see [`equilibrate`]; `b >= 2`), which `inverse` undoes.
 /// About half the operations of the elimination of [`eliminate`], without its selects, and a
 /// shorter chain of dependent ones.
 fn inverse(src: &mut String, ind: &str, b: usize) {
@@ -473,7 +499,7 @@ fn inverse(src: &mut String, ind: &str, b: usize) {
     match b {
         1 => line("let iv0_0 = 1.0 / m0_0;".to_owned()),
         2 => {
-            line("let kid = 1.0 / (m0_0 * m1_1 - m0_1 * m1_0);".to_owned());
+            line("let kid = bt / (m0_0 * m1_1 - m0_1 * m1_0);".to_owned());
             for text in ["let iv0_0 = m1_1 * kid;", "let iv0_1 = -m0_1 * kid;", "let iv1_0 = -m1_0 * kid;", "let iv1_1 = m0_0 * kid;"] {
                 line(text.to_owned());
             }
@@ -482,7 +508,7 @@ fn inverse(src: &mut String, ind: &str, b: usize) {
             for text in ["let ka0 = m1_1 * m2_2 - m1_2 * m2_1;", "let ka1 = m1_2 * m2_0 - m1_0 * m2_2;", "let ka2 = m1_0 * m2_1 - m1_1 * m2_0;"] {
                 line(text.to_owned());
             }
-            line("let kid = 1.0 / (m0_0 * ka0 + m0_1 * ka1 + m0_2 * ka2);".to_owned());
+            line("let kid = bt / (m0_0 * ka0 + m0_1 * ka1 + m0_2 * ka2);".to_owned());
             for (i, row) in [
                 ["ka0", "(m0_2 * m2_1 - m0_1 * m2_2)", "(m0_1 * m1_2 - m0_2 * m1_1)"],
                 ["ka1", "(m0_0 * m2_2 - m0_2 * m2_0)", "(m0_2 * m1_0 - m0_0 * m1_2)"],
@@ -504,7 +530,7 @@ fn inverse(src: &mut String, ind: &str, b: usize) {
             for (name, (j, k)) in [("kc5", (2, 3)), ("kc4", (1, 3)), ("kc3", (1, 2)), ("kc2", (0, 3)), ("kc1", (0, 2)), ("kc0", (0, 1))] {
                 line(format!("let {name} = m2_{j} * m3_{k} - m3_{j} * m2_{k};"));
             }
-            line("let kid = 1.0 / (ks0 * kc5 - ks1 * kc4 + ks2 * kc3 + ks3 * kc2 - ks4 * kc1 + ks5 * kc0);".to_owned());
+            line("let kid = bt / (ks0 * kc5 - ks1 * kc4 + ks2 * kc3 + ks3 * kc2 - ks4 * kc1 + ks5 * kc0);".to_owned());
             let rows = [
                 ["m1_1 * kc5 - m1_2 * kc4 + m1_3 * kc3", "-m0_1 * kc5 + m0_2 * kc4 - m0_3 * kc3", "m3_1 * ks5 - m3_2 * ks4 + m3_3 * ks3", "-m2_1 * ks5 + m2_2 * ks4 - m2_3 * ks3"],
                 ["-m1_0 * kc5 + m1_2 * kc2 - m1_3 * kc1", "m0_0 * kc5 - m0_2 * kc2 + m0_3 * kc1", "-m3_0 * ks5 + m3_2 * ks2 - m3_3 * ks1", "m2_0 * ks5 - m2_2 * ks2 + m2_3 * ks1"],

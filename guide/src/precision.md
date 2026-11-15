@@ -78,8 +78,8 @@ RTX 3090 and on llvmpipe): `exp` on `[-55, 80]`, `ln` from `1e-24` to `1e30` (an
 error is relative to the result), `tanh` on `[-30, 30]` (also near 0), and `x^1.5` or `x^0.7` for
 `x` in `[1, 3000]`. `powf` splits the exponent of `x` exactly, so its error does not grow with
 `y ln x`. Where a `Df32` is below about `1e-25` its low word is under the smallest normal `f32`
-and loses bits, which limits every function there: `exp` of an argument under `-55` has a relative
-error of about `1e-38` over the result, and a result below `2^-126` is `0`. Out of range `exp` is
+and loses bits, which limits every function there: `exp` of an argument under `-55` has an absolute
+error of about `1e-38` (a relative error of that over the result), and a result below `2^-126` is `0`. Out of range `exp` is
 infinity above `88.72` and `0` below `-87.33`, `tanh` is `+-1` from `|x| > 20`, and `ln` and `powf`
 follow `f32` (`ln(0)` is `-inf`, `ln` and `powf` of a negative base are `NaN`, `x^0` is `1`, zero
 and infinite bases give the `pow` results). `f64` arrays have none of these functions.

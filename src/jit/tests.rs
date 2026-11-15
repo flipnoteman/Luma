@@ -1784,6 +1784,28 @@ fn fields_that_read_each_other_at_the_element_are_one_kernel() {
     assert_close(&d2.to_vec().unwrap(), &ref_a[..n - 2].iter().map(|v| v * 0.5).collect::<Vec<_>>(), 1e-5, 1e-6);
 }
 
+/// A node that `eval` asked for and a shifted read inside the kernel recomputes is stored, but no
+/// pending operation outside the kernel reads it: not a `Shared` cut.
+#[test]
+fn a_requested_node_read_only_inside_the_kernel_is_not_noted_as_shared() {
+    use crate::profile::SplitReason;
+    let ctx = ctx();
+    let n = 4000;
+    let xs = values(n, 103, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    ctx.set_cost_model(costly_arithmetic());
+    ctx.jit().record_splits();
+    let requested = &x * 3.0 + 1.0;
+    ctx.jit().request(requested.pending().unwrap());
+    let out = requested.shift(1) + 2.0;
+    let got = out.to_vec().unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let splits = ctx.jit().take_splits();
+    assert!(splits.iter().all(|split| !matches!(split.reason, SplitReason::Shared { .. })), "{splits:?}");
+    let want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 3.0 + 1.0 + 2.0).collect();
+    assert_close(&got, &want, 1e-5, 1e-5);
+}
+
 #[test]
 fn a_node_stored_for_the_pending_operations_that_read_it_is_noted_as_a_cut() {
     use crate::profile::SplitReason;

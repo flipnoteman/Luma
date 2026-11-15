@@ -325,7 +325,9 @@ as `[Array<f32>; block]`. `axis` is an axis of the grid, as for `solve_tridiagon
 is a lazy expression is not evaluated: the solver kernel computes it where it reads the
 coefficients of a cell, so a step from the state to the solution can be one launch. Parts that are
 evaluated arrays are bound as buffers. If the expressions need more buffers or scalars than a
-kernel can bind, the parts are stacked and the stacked solve runs; the result is the same.
+kernel can bind, or cannot be read by the kernel, or the blocks are 6 to 8 wide, or the Thomas
+solve is chosen (`LUMA_TRIDIAGONAL=thomas`) and its scratch exceeds a buffer, the parts are
+stacked and the stacked solve runs; the result is the same.
 `solve_block_tridiagonal_parts_from` takes a `start` array.
 
 ```rust

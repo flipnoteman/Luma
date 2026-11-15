@@ -81,7 +81,11 @@ pub fn solve_tridiagonal_from(
 /// The blocks are eliminated with partial pivoting by the solve that runs an invocation per line;
 /// the solve that runs a workgroup per line inverts blocks of up to 4 from their cofactors (no
 /// pivot is divided by, so a block with a zero diagonal is fine) and eliminates bigger ones with
-/// partial pivoting. A singular block gives `Inf`/`NaN` in that line. To solve on the entries of
+/// partial pivoting. Both are insensitive to the magnitude of the entries: the first pivots by
+/// magnitude, the second scales every block by its largest entry before it inverts or
+/// eliminates, so blocks of uniformly huge or tiny entries (`1e10`, `1e-10`) solve as well as unit
+/// ones; the error of either grows with the condition number of the block. A singular block (a
+/// zero row, or a determinant that is zero) gives `Inf`/`NaN` in that line. To solve on the entries of
 /// the blocks held as arrays of their own, without stacking them, see
 /// [`solve_block_tridiagonal_parts`].
 #[track_caller]
@@ -166,8 +170,9 @@ pub fn solve_block_tridiagonal_from(
 ///
 /// # Errors
 ///
-/// Every result is poisoned if the arrays differ in context or shape, or `axis >= 4`, or the grid
-/// has four dimensions.
+/// Every result is poisoned if the arrays differ in context or shape, or `axis >= 4`, or
+/// `B > 1` and the fourth dimension of the grid is not 1 (a scalar system, `B == 1`, may use all
+/// four).
 #[track_caller]
 pub fn solve_block_tridiagonal_parts<const B2: usize, const B: usize>(
     axis: usize,
@@ -450,9 +455,11 @@ fn run_parts(
     let b32 = block as u32;
     let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, ctx.max_buffer_bytes()) {
         Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
-    } else if block <= UNROLLED_BLOCK as usize {
+    } else if block <= UNROLLED_BLOCK as usize
+        && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, ctx.max_buffer_bytes())
+    {
         let workgroup = tridiagonal_workgroup(ctx.tuning(), total);
-        Some((Algo::Thomas { workgroup }, parts[0].len() as u64 * (block * block) as u64 * 4 * systems as u64))
+        Some((Algo::Thomas { workgroup }, bytes))
     } else {
         None
     };
@@ -463,6 +470,14 @@ fn run_parts(
         }
     }
     solve_stacked(tuning, block, systems, axis, parts, start, location)
+}
+
+/// The scratch bytes of the Thomas solve of `systems` systems of `block x block` blocks over
+/// `len` cells (the modified upper blocks of every system), or `None` if they exceed `max_buffer`
+/// (the solve then falls back to the stacked one, whose scratch is one system's).
+fn thomas_parts_scratch(len: usize, block: usize, systems: usize, max_buffer: u64) -> Option<u64> {
+    let bytes = (len as u64).checked_mul((block * block * 4 * systems) as u64)?;
+    (bytes <= max_buffer).then_some(bytes)
 }
 
 /// Launches the solve of `spec` over `sides` into new arrays of `shape` and returns them (the
@@ -536,7 +551,7 @@ fn solve_stacked(
 mod tests {
     use std::panic::Location;
 
-    use super::{run, run_parts};
+    use super::{run, run_parts, thomas_parts_scratch};
     use crate::array::Array;
     use crate::context::Context;
     use crate::tuning::{LineSolver, Tuning};
@@ -622,6 +637,14 @@ mod tests {
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     #[track_caller]
     fn check(ctx: &Context, tuning: Tuning, b: usize, n: usize, lines: usize, axis: usize, starts: bool, seed: u64) {
+        check_scaled(ctx, tuning, b, n, lines, axis, starts, seed, 1.0);
+    }
+
+    /// [`check`] of the system with every coefficient and right-hand side entry multiplied by
+    /// `scale` (the solution is the same).
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    #[track_caller]
+    fn check_scaled(ctx: &Context, tuning: Tuning, b: usize, n: usize, lines: usize, axis: usize, starts: bool, seed: u64, scale: f32) {
         let bs = b.max(1);
         let grid = if axis == 0 { [n, lines] } else { [lines, n] };
         let cells = n * lines;
@@ -634,6 +657,8 @@ mod tests {
         let diag: Vec<f32> = (0..cells * bs * bs)
             .map(|k| rng.next() + if (k % (bs * bs)) / bs == k % bs { 2.0 * bs as f32 } else { 0.0 })
             .collect();
+        let scaled = |data: Vec<f32>| -> Vec<f32> { data.into_iter().map(|v| v * scale).collect() };
+        let (lo, up, rhs, diag) = (scaled(lo), scaled(up), scaled(rhs), scaled(diag));
         let start: Vec<u32> = (0..lines).map(|l| [0, 1, (n / 2) as u32, n as u32, (n + 3) as u32, 0][(l + seed as usize) % 6]).collect();
 
         let make = |data: &[f32], per_cell: usize| -> Array<f32> {
@@ -778,6 +803,22 @@ mod tests {
         }
     }
 
+    /// Blocks of uniformly huge or tiny entries (the cofactors of a 4x4 block of `1e10` are `1e30`
+    /// and its determinant `1e40`; of `1e-10`, `1e-30` and `1e-40`) solve on both algorithms.
+    #[test]
+    fn block_systems_of_any_magnitude_by_both_solvers() {
+        let ctx = Context::new().unwrap();
+        for b in 1..=4 {
+            for scale in [1e10f32, 1e-10, 1e-18, 1e18] {
+                for tuning in [thomas(), cyclic(16 * 1024)] {
+                    for axis in 0..2 {
+                        check_scaled(&ctx, tuning, b, 40, 3, axis, false, (b * 10 + axis) as u64, scale);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn block_systems_by_both_solvers() {
         let ctx = Context::new().unwrap();
@@ -908,6 +949,14 @@ mod tests {
         if binds(&ctx, 2, 1) {
             assert_eq!(ok, 1);
         }
+    }
+
+    #[test]
+    fn thomas_parts_scratch_must_fit_a_buffer() {
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, 1 << 20), Some(1000 * 4 * 4 * 3));
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, 1000 * 4 * 4 * 3), Some(1000 * 4 * 4 * 3));
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, 1000 * 4 * 4 * 3 - 1), None);
+        assert_eq!(thomas_parts_scratch(usize::MAX, 8, 8, u64::MAX), None);
     }
 
     #[test]
