@@ -111,7 +111,7 @@ fn comparison_into_select_stays_in_one_kernel() {
     let x = f32s(&ctx, &xs);
 
     let before = ctx.jit().stats();
-    // f32 inputs, a u32 mask in the middle, f32 out.
+    // f32 inputs, a mask in the middle, f32 out.
     let mask = x.gt(0.25);
     let out = select(&mask, &(&x * 3.0), &(&x - 1.0)) + 1.0;
     let got = out.to_vec().unwrap();
@@ -126,7 +126,7 @@ fn comparison_into_select_stays_in_one_kernel() {
     let ints: Vec<u32> = (0..1000).collect();
     let u = Array::from_slice_on(&ctx, &ints, 1000).unwrap();
     let flags = (&u + 3u32).ge(500u32);
-    let got = (&flags * 7u32 + 1u32).to_vec().unwrap();
+    let got = (&flags.to_u32() * 7u32 + 1u32).to_vec().unwrap();
     let want: Vec<u32> = ints.iter().map(|&v| u32::from(v + 3 >= 500) * 7 + 1).collect();
     assert_eq!(got, want);
 }
@@ -196,7 +196,7 @@ fn reductions_fuse_their_input_expression() {
     assert!((f64::from(mean) - want_mean).abs() < 1e-4, "{mean} vs {want_mean}");
 
     // u32: counting a mask.
-    let count = a.gt(0.0).sum().item().unwrap();
+    let count = a.gt(0.0).count().item().unwrap();
     assert_eq!(count as usize, xs.iter().filter(|&&x| x > 0.0).count());
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
 
@@ -850,7 +850,7 @@ fn arrays_evaluated_together_share_one_kernel() {
     ctx.sync().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
     assert_close(&scaled.to_vec().unwrap(), &xs.iter().map(|v| v * 4.0).collect::<Vec<_>>(), 1e-6, 1e-6);
-    assert_eq!(mask.to_vec().unwrap(), xs.iter().map(|&v| u32::from(v > 1.0)).collect::<Vec<_>>());
+    assert_eq!(mask.to_u32().to_vec().unwrap(), xs.iter().map(|&v| u32::from(v > 1.0)).collect::<Vec<_>>());
     assert_eq!(other_len.to_vec().unwrap(), vec![2.0, 4.0]);
 }
 
@@ -1750,6 +1750,83 @@ fn held_nodes_are_not_shared_but_their_temporaries_are() {
     let want: Vec<f32> = xs.iter().map(|v| (v * 2.0 + 1.0).sqrt()).collect();
     assert_close(&u.to_vec().unwrap(), &want, 1e-5, 1e-6);
     assert_close(&v.to_vec().unwrap(), &want, 1e-5, 1e-6);
+}
+
+/// A record whose fields read each other at the element itself (a negated entry of a matrix next
+/// to the entry it negates) is one multi-output kernel, also when the expressions read shifted
+/// ones; a field that another reads through a view is computed first, as before.
+#[test]
+fn fields_that_read_each_other_at_the_element_are_one_kernel() {
+    use crate::fields::Fields;
+    let ctx = ctx();
+    let n = 300;
+    let xs = values(n, 101, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let base = &x * 3.0;
+    let a = base.slice(0, 1..n) * 2.0 + 1.0;
+    let ref_a: Vec<f32> = xs[1..].iter().map(|v| v * 6.0 + 1.0).collect();
+
+    // Neighbours of one stage, `a`, `-a` and a function of `-a` read at the element: one kernel.
+    let before = ctx.jit().stats();
+    let [a1, b1, c1] = [a.clone(), -&a, (-&a).abs().sqrt()].cache();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    assert_close(&a1.to_vec().unwrap(), &ref_a, 1e-5, 1e-6);
+    assert_close(&b1.to_vec().unwrap(), &ref_a.iter().map(|v| -v).collect::<Vec<_>>(), 1e-5, 1e-6);
+    assert_close(&c1.to_vec().unwrap(), &ref_a.iter().map(|v| v.abs().sqrt()).collect::<Vec<_>>(), 1e-5, 1e-6);
+
+    // A field read through a view is evaluated first: two kernels.
+    let a = base.slice(0, 1..n) * 2.0 + 1.0;
+    let (a2, d2) = (a.clone(), a.slice(0, 0..n - 2) * 0.5);
+    let before = ctx.jit().stats();
+    let [a2, d2] = [a2, d2].cache();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    assert_close(&a2.to_vec().unwrap(), &ref_a, 1e-5, 1e-6);
+    assert_close(&d2.to_vec().unwrap(), &ref_a[..n - 2].iter().map(|v| v * 0.5).collect::<Vec<_>>(), 1e-5, 1e-6);
+}
+
+/// A node that `eval` asked for and a shifted read inside the kernel recomputes is stored, but no
+/// pending operation outside the kernel reads it: not a `Shared` cut.
+#[test]
+fn a_requested_node_read_only_inside_the_kernel_is_not_noted_as_shared() {
+    use crate::profile::SplitReason;
+    let ctx = ctx();
+    let n = 4000;
+    let xs = values(n, 103, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    ctx.set_cost_model(costly_arithmetic());
+    ctx.jit().record_splits();
+    let requested = &x * 3.0 + 1.0;
+    ctx.jit().request(requested.pending().unwrap());
+    let out = requested.shift(1) + 2.0;
+    let got = out.to_vec().unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let splits = ctx.jit().take_splits();
+    assert!(splits.iter().all(|split| !matches!(split.reason, SplitReason::Shared { .. })), "{splits:?}");
+    let want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 3.0 + 1.0 + 2.0).collect();
+    assert_close(&got, &want, 1e-5, 1e-5);
+}
+
+#[test]
+fn a_node_stored_for_the_pending_operations_that_read_it_is_noted_as_a_cut() {
+    use crate::profile::SplitReason;
+    let ctx = ctx();
+    let n = 4000;
+    let xs = values(n, 102, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    ctx.set_cost_model(costly_arithmetic());
+    ctx.jit().record_splits();
+    let shared = &x * 3.0 + 1.0;
+    let shifted = shared.shift(1);
+    let other = &shared - 2.0;
+    let got_shifted = shifted.to_vec().unwrap();
+    let got_other = other.to_vec().unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let splits = ctx.jit().take_splits();
+    assert!(splits.iter().any(|split| matches!(split.reason, SplitReason::Shared { .. })), "{splits:?}");
+    assert!(splits.iter().all(|split| split.location.file().ends_with("tests.rs")), "{splits:?}");
+    let want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 3.0 + 1.0).collect();
+    assert_close(&got_shifted, &want, 1e-5, 1e-5);
+    assert_close(&got_other, &xs.iter().map(|&v| v * 3.0 - 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
 }
 
 #[test]
@@ -3779,6 +3856,17 @@ fn dynamic_views_ranges_gathers_and_scatters_reuse_one_pipeline() {
     }
     assert_eq!(delta(before, ctx.jit().stats()).built, 1);
 
+    // Atomic scatters into targets of different lengths (the global path: few elements per bin).
+    let before = ctx.jit().stats();
+    for n in [10_000usize, 20_000] {
+        let mut target = Array::<u32>::from_slice_on(&ctx, &vec![0; n], n).unwrap();
+        let idx = Array::<u32>::from_slice_on(&ctx, &[1, 2, 2, n as u32], 4).unwrap();
+        target.put_add(&idx, Array::<u32>::from_slice_on(&ctx, &[1, 1, 1, 1], 4).unwrap()).unwrap();
+        let got = target.to_vec().unwrap();
+        assert_eq!((got.len(), got[1], got[2], got.iter().sum::<u32>()), (n, 1, 2, 3));
+    }
+    assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+
     // Region writes at every offset.
     let mut w = f32s(&ctx, &xs);
     let before = ctx.jit().stats();
@@ -3788,4 +3876,26 @@ fn dynamic_views_ranges_gathers_and_scatters_reuse_one_pipeline() {
         assert_eq!(&got[k..k + 2], &[1.5, 1.5]);
     }
     assert_eq!(delta(before, ctx.jit().stats()).built, 1);
+}
+
+/// An expression with more inputs than the scattering kernel of a sort's first pass may bind
+/// beside its buffers, but that the counting kernel can: both kernels decide together.
+#[test]
+fn a_sort_of_an_expression_at_the_input_limit_fuses_into_both_first_pass_kernels_or_neither() {
+    let n = 5000;
+    let host: Vec<Vec<u32>> = (0..4).map(|k| (0..n).map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(k * 977)) >> 7).collect()).collect();
+    let sums: Vec<u32> = (0..n).map(|i| host.iter().fold(0u32, |sum, column| sum.wrapping_add(column[i]))).collect();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by_key(|&i| sums[i as usize]);
+    let mut sorted = sums.clone();
+    sorted.sort_unstable();
+    for limit in [5, 6, 7, 8] {
+        let ctx = ctx();
+        ctx.jit().set_max_inputs(limit);
+        let a: Vec<Array<u32>> = host.iter().map(|column| Array::from_slice_on(&ctx, column, n).unwrap()).collect();
+        let keys = || &a[0] + &a[1] + &a[2] + &a[3];
+        assert_eq!(keys().sort().to_vec().unwrap(), sorted, "sort, limit {limit}");
+        assert_eq!(keys().argsort().to_vec().unwrap(), order, "argsort, limit {limit}");
+        assert_eq!(keys().sort_descending().to_vec().unwrap(), sorted.iter().rev().copied().collect::<Vec<_>>(), "descending, limit {limit}");
+    }
 }

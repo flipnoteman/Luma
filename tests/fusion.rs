@@ -128,7 +128,7 @@ fn comparison_into_select_in_chains() {
         xs.iter().zip(&ys).map(|(a, b)| u32::from(a != b)).collect(),
     ];
     for (mask, want) in masks.iter().zip(&want_masks) {
-        assert_eq!(&mask.to_vec().unwrap(), want);
+        assert_eq!(&mask.to_u32().to_vec().unwrap(), want);
     }
 }
 
@@ -167,7 +167,7 @@ fn reductions_of_lazy_expressions() {
     let want: Vec<f32> = xs.iter().zip(&ys).map(|(&a, &b)| a * 2.0 + b).collect();
     assert_close(&lazy.to_vec().unwrap(), &want, 1e-6, 1e-6);
 
-    let positives = x.gt(0.0).sum().item().unwrap();
+    let positives = x.gt(0.0).count().item().unwrap();
     assert_eq!(positives as usize, xs.iter().filter(|&&v| v > 0.0).count());
 }
 

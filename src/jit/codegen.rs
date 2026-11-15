@@ -18,13 +18,13 @@
 
 use std::fmt::Write;
 
-use crate::builtin::{class_operand, df_library, reduce_main, substitute, ReduceElem};
+use crate::builtin::{class_operand, df_library, reduce_main, substitute, ReduceElem, DF_MATH_LIBRARY};
 use crate::gpu::hash::FxMap;
 use crate::tuning::{Tuning, STENCIL_RADIUS};
 
 use super::inline::{Inlined, Lowered, Region, StagedPrograms};
 use super::params;
-use super::program::{calls_df_library, FusedKey, Instr, Ref, Tail};
+use super::program::{calls_df_library, calls_df_math, AtomicOp, FusedKey, Instr, Ref, Tail};
 use super::staging::Staging;
 use super::stencil::{signed, wrap_source, WORKGROUP};
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -38,7 +38,7 @@ fn name(reference: Ref, ty: ElemTy) -> String {
         Ref::Scalar(k) => match ty {
             ElemTy::F64 => format!("(f64(p.s{k}) + f64(p.s{}) + f64(p.s{}))", k + 1, k + 2),
             ElemTy::Df32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
-            ElemTy::F32 | ElemTy::U32 => format!("p.s{k}"),
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => format!("p.s{k}"),
         },
         Ref::Tmp(k) => format!("t{k}"),
         Ref::Sub(k) => format!("sub{k}"),
@@ -65,6 +65,7 @@ fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
         OpKind::Binary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b),
         OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
         OpKind::Classify(class) => substitute(class.expr(), &class_operand(ty, a), ""),
+        OpKind::Powf if ty == ElemTy::Df32 => format!("df_pow({a}, {b})"),
         OpKind::Powf => format!("pow({a}, {b})"),
         OpKind::Clamp if ty == ElemTy::Df32 => format!("df_min(df_max({a}, {b}), {c})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
@@ -226,7 +227,14 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
         (ElemTy::Df32, ElemTy::F32) => format!("luma_o({value}.x + {value}.y)"),
         (ElemTy::F64, ElemTy::Df32) => format!("vec2<f32>(luma_o(f32({value})), f32({value} - f64(luma_o(f32({value})))))"),
         (ElemTy::Df32, ElemTy::F64) => format!("(f64(luma_o({value}.x)) + f64({value}.y))"),
-        _ => value.to_owned(),
+        (ElemTy::U32, ElemTy::F32) | (ElemTy::I32, ElemTy::F32) | (ElemTy::Mask, ElemTy::F32) => format!("f32({value})"),
+        (ElemTy::F32, ElemTy::U32) => format!("select(0u, u32(clamp({value}, 0.0, 4294967040.0)), {value} == {value})"),
+        (ElemTy::F32, ElemTy::I32) => format!("select(0i, i32(clamp({value}, -2147483648.0, 2147483520.0)), {value} == {value})"),
+        (ElemTy::U32, ElemTy::I32) => format!("bitcast<i32>({value})"),
+        (ElemTy::I32, ElemTy::U32) => format!("bitcast<u32>({value})"),
+        (ElemTy::Mask, ElemTy::U32) => value.to_owned(),
+        _ if from == to => value.to_owned(),
+        _ => unreachable!("cast {from:?} -> {to:?}"),
     }
 }
 
@@ -235,9 +243,11 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
 /// guard, for the functions that never read it (ordering, minimum, maximum, absolute value).
 pub(super) fn library_for(key: &FusedKey, tuning: &Tuning) -> String {
     let library = |guard: &str| df_library(guard, tuning.df_fma, tuning.df_sloppy_add);
+    let instrs = || key.instrs.iter().chain(key.subs.iter().flatten());
+    let math = if instrs().any(calls_df_math) { DF_MATH_LIBRARY } else { "" };
     match key.guard {
-        Some(guard) => library(&format!("p.s{guard}")),
-        None if key.instrs.iter().chain(key.subs.iter().flatten()).any(calls_df_library) => library("0u"),
+        Some(guard) => library(&format!("p.s{guard}")) + math,
+        None if instrs().any(calls_df_library) => library("0u") + math,
         None => String::new(),
     }
 }
@@ -249,16 +259,22 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Normal => format!("luma_normal(luma_threefry({index}, {a}, {b}))"),
         Gen::Index => match ty {
             ElemTy::U32 => index.to_owned(),
+            ElemTy::Mask => unreachable!("masks have no generators"),
+            ElemTy::I32 => format!("bitcast<i32>({index})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
             ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
+            ElemTy::Mask => unreachable!("masks have no generators"),
+            ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
         },
         Gen::RangeConst { stride, size } => {
             let coord = if stride == 1 { format!("({index} % {size}u)") } else { format!("(({index} / {stride}u) % {size}u)") };
             match ty {
                 ElemTy::U32 => coord,
+                ElemTy::Mask => unreachable!("masks have no generators"),
+                ElemTy::I32 => format!("bitcast<i32>({coord})"),
                 ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({coord})"),
             }
         }
@@ -348,10 +364,13 @@ fn shift_index(kind: ShiftKind, s: &str, i: &str, total: &str) -> String {
 /// Whether input `k` is loaded at the element being computed (as opposed to only through
 /// shifts), so the kernel declares its buffer as `in{k}`. The launch code binds by the same rule.
 pub(super) fn direct(instrs: &[Instr], k: u32) -> bool {
-    instrs.iter().any(|instr| {
-        let skip = usize::from(matches!(instr.op.kind, OpKind::Shift(_)));
-        instr.args.iter().skip(skip).any(|arg| *arg == Ref::Input(k))
-    })
+    instrs.iter().any(|instr| reads_directly(instr, k))
+}
+
+/// Whether `instr` loads input `k` at the element being computed.
+fn reads_directly(instr: &Instr, k: u32) -> bool {
+    let skip = usize::from(matches!(instr.op.kind, OpKind::Shift(_)));
+    instr.args.iter().skip(skip).any(|arg| *arg == Ref::Input(k))
 }
 
 /// Whether the kernel for `key` reads a scalar from the uniform `p`. A tiled kernel (see
@@ -401,16 +420,39 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     };
     let wg = tuning.elementwise_workgroup;
     let reduce = matches!(key.tail, Tail::Reduce(_));
+    let matmul = matches!(key.tail, Tail::Matmul { .. });
+    let axis = matches!(key.tail, Tail::AxisReduce(_));
+    let radix = match key.tail {
+        Tail::Radix(pass) => Some(pass),
+        _ => None,
+    };
+    let solve = match key.tail {
+        Tail::Solve(spec) => Some(spec),
+        _ => None,
+    };
     let segmented = !key.spans.is_empty();
     let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
-    let based = generates(key) && !segmented;
-    let uniform = reduce || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
+    // A product reads its operands at their own element indices: nothing is relative to a segment.
+    let based = generates(key) && !segmented && !matmul && !axis && radix.is_none() && solve.is_none();
+    let uniform = reduce || matmul || axis || radix.is_some() || solve.is_some() || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
     let mut src = String::new();
 
     if uniform {
         src.push_str("struct Params { ");
         if reduce {
             src.push_str("n: u32, ");
+        }
+        if matmul {
+            src.push_str("m: u32, n: u32, k: u32, kc: u32, ");
+        }
+        if axis {
+            src.push_str(crate::scan::AXIS_PARAMS);
+        }
+        if radix.is_some() {
+            src.push_str(crate::sort::PARAMS);
+        }
+        if solve.is_some() {
+            src.push_str("n: u32, stride: u32, lines: u32, ");
         }
         if segmented {
             src.push_str("base: u32, total: u32, ");
@@ -433,15 +475,44 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     let out_ty = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     let outputs: Vec<usize> = match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => key.outputs.iter().map(|&at| at as usize).collect(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
         Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
+        // The roots are the operands, read by `luma_lhs` / `luma_rhs`; the output is `c`.
+        // The roots of a sort are its keys, read by `luma_key`; its buffers are declared below.
+        // The roots of a line solve are its parts, read by `luma_cell`; its buffers are declared below.
+        Tail::Matmul { .. } | Tail::Radix(_) | Tail::Solve(_) => Vec::new(),
+        // The roots are the cells of the pass, read by `luma_eval`; the outputs are its own.
+        Tail::AxisReduce(_) => Vec::new(),
     };
+    let axis_outputs = match key.tail {
+        Tail::AxisReduce(pass) => {
+            src.push_str(&pass.output_bindings(out_ty(key.instrs.len().saturating_sub(1))));
+            pass.outputs()
+        }
+        _ => 0,
+    };
+    if matmul {
+        src.push_str("@group(1) @binding(0) var<storage, read_write> c: array<f32>;\n");
+    }
+    let mut binding = outputs.len() + usize::from(matmul) + axis_outputs;
+    if let Some(pass) = radix {
+        // The roots are the keys, read by `luma_key`; the kernel's own buffers go around the inputs.
+        pass.declare_writes(&mut src, &mut binding);
+    }
+    if let Some(spec) = solve {
+        spec.declare_writes(&mut src, &mut binding);
+    }
     for (j, &at) in outputs.iter().enumerate() {
         // A reduction's single output is `out`, as `reduce_main` expects.
         let name = if reduce { "out".to_owned() } else { format!("out{j}") };
-        let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{}>;", out_ty(at));
+        // An atomic scatter binds its target as atomics (floats as their bits).
+        let elem = match (key.tail, out_ty(at)) {
+            (Tail::ScatterAdd { .. }, "i32") => "atomic<i32>",
+            (Tail::ScatterAdd { .. }, _) => "atomic<u32>",
+            (_, ty) => ty,
+        };
+        let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{elem}>;");
     }
-    let mut binding = outputs.len();
     for (k, ty) in key.input_tys.iter().enumerate() {
         if key.in_place.iter().any(|&(paired, _)| paired == k as u32) {
             continue;
@@ -454,6 +525,21 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
             let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}_{s}: array<{}>;", ty.wgsl());
             binding += 1;
         }
+    }
+    if let Tail::Matmul { lhs, rhs, .. } = key.tail {
+        // The operands that are buffers, after the inputs of the others.
+        for (operand, name) in [(lhs, "a"), (rhs, "b")] {
+            if !operand.fused() {
+                let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> {name}: array<f32>;");
+                binding += 1;
+            }
+        }
+    }
+    if let Some(pass) = radix {
+        pass.declare_reads(&mut src, &mut binding);
+    }
+    if let Some(spec) = solve {
+        spec.declare_reads(&mut src, &mut binding);
     }
     if uniform {
         let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
@@ -481,10 +567,13 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     };
     // The lowered instruction holding the value of main-program instruction `at`.
     let value = |at: usize| inlined.and_then(|inlined| inlined.main.get(at)).map_or(at, |&lowered| lowered as usize);
-    // A reduction of `Df32` brings the library itself (see `reduce_main`).
+    // A reduction of `Df32` brings the library itself (see `reduce_main`), but not its math
+    // functions: those come with the program that calls them.
     let reduces_df = reduce && out_ty(outputs[0]) == "vec2<f32>";
     if !reduces_df {
         src.push_str(&library_for(key, tuning));
+    } else if key.instrs.iter().chain(key.subs.iter().flatten()).any(calls_df_math) {
+        src.push_str(DF_MATH_LIBRARY);
     }
     src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
     src.push_str(&view_helpers(&views));
@@ -502,7 +591,7 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     };
     let global = if segmented || based { "    let gi = p.base + i;\n" } else { "" };
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::Stack { .. } => {
+        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } | Tail::Stack { .. } => {
             let stores: String = match key.tail {
                 Tail::StoreMapped(map) => {
                     let n = views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0);
@@ -520,6 +609,13 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                     let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
                     format!("    let j = t{};\n    if (j < {len}) {{ out0[j] = t{}; }}\n", value(index as usize), value(stored as usize))
                 }
+                Tail::ScatterAdd { len, op, private: false, len_slot } => {
+                    let len = len_slot.map_or_else(|| format!("{len}u"), |slot| format!("p.s{slot}"));
+                    let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
+                    let apply = atomic_apply(out_ty(outputs[0]), op, "out0[j]", &format!("t{}", value(stored as usize)), "    ");
+                    format!("    let j = t{};\n    if (j < {len}) {{\n{apply}    }}\n", value(index as usize))
+                }
+                Tail::ScatterAdd { private: true, .. } => String::new(),
                 Tail::Stack { total, .. } if stack_stages(key, wg, out_ty(outputs[0])) => {
                     let mut stores = String::new();
                     for (j, &at) in key.outputs.iter().enumerate() {
@@ -540,6 +636,46 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
                 }
                 _ => outputs.iter().enumerate().map(|(j, &at)| format!("    out{j}[i] = t{};\n", value(at))).collect(),
             };
+            if let Tail::ScatterAdd { len, op, private: true, .. } = key.tail {
+                let (stored, slot) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
+                let ty = out_ty(outputs[0]);
+                let bins = (len as usize).next_multiple_of(wg as usize);
+                let atom = if ty == "i32" { "i32" } else { "u32" };
+                let seed = atomic_seed(ty, op);
+                let apply = atomic_apply(ty, op, "acc[j]", &format!("t{}", value(stored as usize)), "            ");
+                let merge = atomic_apply(ty, op, "out0[b]", &if ty == "f32" { "bitcast<f32>(a)".to_owned() } else { "a".to_owned() }, "            ");
+                let _ = write!(
+                    src,
+                    "
+var<workgroup> acc: array<atomic<{atom}>, {bins}>;
+@compute @workgroup_size({wg})
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let group = wid.x + wid.y * nwg.x;
+    for (var b = lid.x; b < {bins}u; b = b + {wg}u) {{
+        atomicStore(&acc[b], {seed});
+    }}
+    workgroupBarrier();
+    for (var i = group * {wg}u + lid.x; i < luma.size.x; i = i + nwg.x * nwg.y * {wg}u) {{
+{global}{}        let j = t{};
+        if (j < {len}u) {{
+{apply}        }}
+    }}
+    workgroupBarrier();
+    for (var b = lid.x; b < {len}u; b = b + {wg}u) {{
+        let a = atomicLoad(&acc[b]);
+        if (a != {seed}) {{
+{merge}        }}
+    }}
+}}
+",
+                    match inlined {
+                        Some(inlined) => lowered_body(key, inlined, &names, index, None, None),
+                        None => body(&key.instrs, &key.input_tys, &names, index, segmented),
+                    },
+                    value(slot as usize)
+                );
+                return src;
+            }
             if let Some(tile) = &key.tile {
                 src.push_str(&tiled_main(key, tile, based, &stores, &names));
                 return src;
@@ -573,7 +709,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
                     out_ty(outputs[0]),
                     wg * total,
                     match inlined {
-                        Some(inlined) => lowered_body(key, inlined, &names, index, None),
+                        Some(inlined) => lowered_body(key, inlined, &names, index, None, None),
                         None => body(&key.instrs, &key.input_tys, &names, index, segmented),
                     }
                 );
@@ -589,7 +725,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 {global}{}{stores}}}
 ",
                 match inlined {
-                    Some(inlined) => lowered_body(key, inlined, &names, index, None),
+                    Some(inlined) => lowered_body(key, inlined, &names, index, None, None),
                     None => body(&key.instrs, &key.input_tys, &names, index, segmented),
                 }
             );
@@ -598,23 +734,169 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
             let (ty, last) = (out_ty(outputs[0]), outputs[0]);
             let guard = format!("p.s{}", key.guard.unwrap_or(0));
             let elem = if reduces_df { ReduceElem::Df32 { guard: &guard, fma: tuning.df_fma } } else { ReduceElem::Plain(ty) };
-            let _ = write!(
-                src,
-                "
-fn luma_eval(i: u32) -> {ty} {{
-{global}{}    return t{};
-}}
-{}",
-                match inlined {
-                    Some(inlined) => lowered_body(key, inlined, &Names { views: &views, in_place: &[] }, index, None),
-                    None => body(&key.instrs, &key.input_tys, &Names { views: &views, in_place: &[] }, index, segmented),
-                },
-                value(last),
-                reduce_main(elem, ops, false, "luma_eval", tuning)
-            );
+            let names = Names { views: &views, in_place: &[] };
+            src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
+            src.push_str(&reduce_main(elem, ops, false, "luma_eval", tuning));
+        }
+        Tail::AxisReduce(pass) => {
+            let names = Names { views: &views, in_place: &[] };
+            let last = key.instrs.len().saturating_sub(1);
+            src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
+            src.push_str(&crate::scan::reduce_body(pass, out_ty(last), "luma_eval", wg));
+        }
+        Tail::Matmul { tile, aligned, split, lhs, rhs } => {
+            let names = Names { views: &views, in_place: &[] };
+            let mut roots = key.outputs.iter().map(|&at| at as usize);
+            for (operand, function) in [(lhs, "luma_lhs"), (rhs, "luma_rhs")] {
+                if operand.fused() && let Some(root) = roots.next() {
+                    src.push_str(&load_function(function, key, root, inlined, &names, index, segmented));
+                }
+            }
+            src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs));
+        }
+        Tail::Solve(spec) => {
+            let names = Names { views: &views, in_place: &[] };
+            let per = crate::solve::Io::parts_per_system(usize::from(spec.block));
+            let mut roots = key.outputs.iter().map(|&at| at as usize);
+            for s in 0..usize::from(spec.systems) {
+                let parts: Vec<Part> = (0..per)
+                    .map(|k| if spec.is_fused(s * per + k) { Part::Root(roots.next().unwrap_or(0)) } else { Part::Buffer(s * per + k) })
+                    .collect();
+                src.push_str(&load_cell(&format!("luma_cell{s}"), key, &parts, inlined, &names, index, segmented));
+            }
+            src.push_str(&spec.cell_dispatch());
+            src.push_str(&spec.body());
+        }
+        Tail::Radix(pass) => {
+            let names = Names { views: &views, in_place: &[] };
+            let root = key.outputs.first().map_or(0, |&at| at as usize);
+            src.push_str(&load_function("luma_key", key, root, inlined, &names, index, segmented));
+            src.push_str(&crate::sort::fused_body(pass, out_ty(root)));
         }
     }
     src
+}
+
+/// `fn {name}(i: u32) -> T { ...; return t{out}; }`: the value of instruction `out` of the main
+/// program of `key` at element `i`, computed by the instructions it needs
+/// (those of the lowered program `inlined` for a lowered key). The program's loads, views and library are the kernel's
+/// ([`source`] declares them before this); `index` and `segmented` are those of the kernel's
+/// other uses of [`body`] (the index `gi` is the element's place in the whole array: the
+/// function first computes it). A kernel that reads
+/// an expression elsewhere than at the element it computes (a reduction's operand, a GEMM's
+/// loads, a sort's keys) calls it as `{name}(index)`.
+pub(super) fn load_function(
+    name: &str,
+    key: &FusedKey,
+    out: usize,
+    inlined: Option<&Inlined>,
+    names: &Names,
+    index: &str,
+    segmented: bool,
+) -> String {
+    let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
+    let ty = key.instrs.get(out).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
+    let (computed, values) = computed_values(key, &[out], inlined, names, index, segmented);
+    format!("\nfn {name}(i: u32) -> {ty} {{\n{global}{computed}    return t{};\n}}\n", values[0])
+}
+
+/// One value a line solve reads at a cell: the root `at` of the program, or the buffer `pr{k}`.
+pub(super) enum Part {
+    Root(usize),
+    Buffer(usize),
+}
+
+/// `fn {name}(i: u32) -> array<f32, N> { ...; return array(...); }`: the `f32` values of `parts`
+/// at element `i`, in order, the roots computed together by the instructions they need (see
+/// [`load_function`]).
+pub(super) fn load_cell(
+    name: &str,
+    key: &FusedKey,
+    parts: &[Part],
+    inlined: Option<&Inlined>,
+    names: &Names,
+    index: &str,
+    segmented: bool,
+) -> String {
+    let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
+    let roots: Vec<usize> = parts.iter().filter_map(|part| if let Part::Root(at) = part { Some(*at) } else { None }).collect();
+    let (computed, values) = computed_values(key, &roots, inlined, names, index, segmented);
+    let mut values = values.into_iter();
+    let returned: Vec<String> = parts
+        .iter()
+        .map(|part| match part {
+            Part::Root(_) => format!("t{}", values.next().unwrap_or(0)),
+            Part::Buffer(k) => format!("pr{k}[i]"),
+        })
+        .collect();
+    format!("\nfn {name}(i: u32) -> array<f32, {n}> {{\n{global}{computed}    return array<f32, {n}>({});\n}}\n", returned.join(", "), n = parts.len())
+}
+
+/// The statements computing the instructions that the roots `outs` of the main program of `key`
+/// need (those of the lowered program `inlined` for a lowered key), and the instruction
+/// each root's value is in afterwards.
+fn computed_values(
+    key: &FusedKey,
+    outs: &[usize],
+    inlined: Option<&Inlined>,
+    names: &Names,
+    index: &str,
+    segmented: bool,
+) -> (String, Vec<usize>) {
+    let values: Vec<usize> = outs.iter().map(|&out| inlined.and_then(|inlined| inlined.main.get(out)).map_or(out, |&lowered| lowered as usize)).collect();
+    let computed = match inlined {
+        Some(inlined) => lowered_body(key, inlined, names, index, None, Some(&needed_lowered(inlined, &values))),
+        None => body_with(&key.instrs, &key.input_tys, names, index, segmented, Some(&needed(&key.instrs, outs)), &|_, _| None),
+    };
+    (computed, values)
+}
+
+/// Which instructions of the lowered program `inlined` the lowered instructions `roots` need,
+/// themselves included: their operands, and those of the shifts that define the indices of the
+/// contexts they are computed at and read at.
+fn needed_lowered(inlined: &Inlined, roots: &[usize]) -> Vec<bool> {
+    let tmp = |arg: &Ref| if let Ref::Tmp(t) = arg { Some(*t as usize) } else { None };
+    let mut keep = vec![false; inlined.instrs.len()];
+    let mut work = roots.to_vec();
+    while let Some(n) = work.pop() {
+        let Some(slot) = keep.get_mut(n) else { continue };
+        if std::mem::replace(slot, true) {
+            continue;
+        }
+        let flat = &inlined.instrs[n];
+        work.extend(flat.args.iter().filter_map(tmp));
+        for mut c in [flat.at, flat.child] {
+            while c != 0 {
+                let Some(ctx) = inlined.ctxs.get(c as usize) else { break };
+                work.extend(ctx.args.iter().filter_map(tmp));
+                c = ctx.parent;
+            }
+        }
+    }
+    keep
+}
+
+/// Which instructions of `instrs` the instructions `outs` need, themselves included.
+fn needed(instrs: &[Instr], outs: &[usize]) -> Vec<bool> {
+    let mut keep = vec![false; instrs.len()];
+    for &out in outs {
+        if let Some(root) = keep.get_mut(out) {
+            *root = true;
+        }
+    }
+    let last = outs.iter().copied().max().unwrap_or(0);
+    for at in (0..=last.min(instrs.len().saturating_sub(1))).rev() {
+        if keep[at] {
+            for arg in instrs[at].args {
+                if let Ref::Tmp(t) = arg
+                    && let Some(needed) = keep.get_mut(t as usize)
+                {
+                    *needed = true;
+                }
+            }
+        }
+    }
+    keep
 }
 
 /// A kernel running `p.steps` iterations of the store program `key` per element, with the
@@ -688,22 +970,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// `names.in_place` lists are read from the output buffers, before they are overwritten.
 /// `index` and `segmented` are those of [`expression`].
 fn body(instrs: &[Instr], input_tys: &[ElemTy], names: &Names, index: &str, segmented: bool) -> String {
-    body_with(instrs, input_tys, names, index, segmented, &|_, _| None)
+    body_with(instrs, input_tys, names, index, segmented, None, &|_, _| None)
 }
 
-/// [`body`], where `staged(k, instr)` may replace the expression of instruction `k`.
+/// [`body`], where `staged(k, instr)` may replace the expression of instruction `k`, and only the
+/// instructions `keep` marks (all, if `None`) are written, with the inputs they load.
 fn body_with(
     instrs: &[Instr],
     input_tys: &[ElemTy],
     names: &Names,
     index: &str,
     segmented: bool,
+    keep: Option<&[bool]>,
     staged: &dyn Fn(usize, &Instr) -> Option<String>,
 ) -> String {
+    let kept = |k: usize| keep.is_none_or(|keep| keep.get(k).copied().unwrap_or(false));
     let mut src = String::new();
     // Inputs read only through shifts are not loaded at `i`.
     for (k, ty) in input_tys.iter().enumerate() {
-        if direct(instrs, k as u32) {
+        if instrs.iter().enumerate().any(|(at, instr)| kept(at) && reads_directly(instr, k as u32)) {
             let buffer = match names.in_place.iter().find(|&&(input, _)| input == k as u32) {
                 Some(&(_, j)) => format!("out{j}"),
                 None => format!("in{k}"),
@@ -711,7 +996,7 @@ fn body_with(
             let _ = writeln!(src, "    let a{k}: {} = {buffer}[i];", ty.wgsl());
         }
     }
-    for (k, instr) in instrs.iter().enumerate() {
+    for (k, instr) in instrs.iter().enumerate().filter(|&(k, _)| kept(k)) {
         let value = staged(k, instr).unwrap_or_else(|| expression(instr, index, segmented, names));
         let _ = writeln!(src, "    let t{k}: {} = {value};", instr.op.out_ty().wgsl());
     }
@@ -731,7 +1016,7 @@ fn flat_name(reference: Ref, ty: ElemTy, at: u32) -> String {
 /// them, then the instructions, each defined (`t{n}`) after everything it reads. A `Select` the
 /// lowering marks as a branch is an `if`/`else` that computes the instructions only its own
 /// operand needs. `names` and `index` are those of [`expression`].
-fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, staging: Option<&Staging>) -> String {
+fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, staging: Option<&Staging>, keep: Option<&[bool]>) -> String {
     struct Emit<'a> {
         key: &'a FusedKey,
         inlined: &'a Inlined,
@@ -911,7 +1196,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
     }
 
     let mut members: FxMap<Region, Vec<u32>> = FxMap::default();
-    for (n, &region) in inlined.region.iter().enumerate() {
+    for (n, &region) in inlined.region.iter().enumerate().filter(|&(n, _)| keep.is_none_or(|keep| keep.get(n).copied().unwrap_or(false))) {
         members.entry(region).or_default().push(n as u32);
     }
     let mut emit = Emit {
@@ -1094,7 +1379,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
     workgroupBarrier();
 ",
             lw * lh,
-            body_with(instrs, &key.input_tys, &Names { views: names.views, in_place: &[] }, index, false, &staged(k + 1)),
+            body_with(instrs, &key.input_tys, &Names { views: names.views, in_place: &[] }, index, false, None, &staged(k + 1)),
         );
     }
     let _ = write!(
@@ -1111,7 +1396,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
 }}
 ",
         tx * ty,
-        body_with(&key.instrs, &key.input_tys, names, index, false, &staged(0)),
+        body_with(&key.instrs, &key.input_tys, names, index, false, None, &staged(0)),
     );
     src
 }
@@ -1167,7 +1452,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
                 entry.cells(),
                 entry.lo[0],
                 entry.lo[1],
-                lowered_body(key, &group.body, &sub_names, index, Some(staging)),
+                lowered_body(key, &group.body, &sub_names, index, Some(staging), None),
                 rw = entry.width(),
             );
         }
@@ -1187,7 +1472,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
 }}
 ",
         tx * ty,
-        lowered_body(key, &programs.main, names, index, Some(staging)),
+        lowered_body(key, &programs.main, names, index, Some(staging), None),
     );
     src
 }
@@ -1206,4 +1491,47 @@ fn subs(key: &FusedKey, views: &[(ViewMap, Edge)], in_place: &[(u32, u32)]) -> S
         );
     }
     src
+}
+
+/// The statements applying `op` with `value` (of WGSL type `ty`) to the atomic `target`: floats
+/// are held as their bits, so `f32` retries a compare-and-exchange until it lands (or, for a
+/// min or max, until it would not change the element).
+fn atomic_apply(ty: &str, op: AtomicOp, target: &str, value: &str, pad: &str) -> String {
+    if ty != "f32" {
+        let call = match op {
+            AtomicOp::Add => "atomicAdd",
+            AtomicOp::Min => "atomicMin",
+            AtomicOp::Max => "atomicMax",
+        };
+        return format!("{pad}_ = {call}(&{target}, {value});\n");
+    }
+    let (combine, stable) = match op {
+        AtomicOp::Add => ("bitcast<f32>(old) + v", ""),
+        AtomicOp::Min => ("min(bitcast<f32>(old), v)", "if (nv == old) { break; }\n"),
+        AtomicOp::Max => ("max(bitcast<f32>(old), v)", "if (nv == old) { break; }\n"),
+    };
+    let mut out = format!("{pad}{{\n{pad}    let v = {value};\n{pad}    var old = atomicLoad(&{target});\n{pad}    loop {{\n");
+    let _ = writeln!(out, "{pad}        let nv = bitcast<u32>({combine});");
+    if !stable.is_empty() {
+        let _ = write!(out, "{pad}        {stable}");
+    }
+    let _ = write!(
+        out,
+        "{pad}        let r = atomicCompareExchangeWeak(&{target}, old, nv);\n{pad}        if (r.exchanged) {{ break; }}\n{pad}        old = r.old_value;\n{pad}    }}\n{pad}}}\n"
+    );
+    out
+}
+
+/// What a private accumulator starts as for `op` on elements of type `ty`, as a WGSL value (the
+/// merge skips the elements still holding it).
+fn atomic_seed(ty: &str, op: AtomicOp) -> &'static str {
+    match (ty, op) {
+        ("f32", AtomicOp::Add) | ("u32", AtomicOp::Add | AtomicOp::Max) => "0u",
+        ("f32", AtomicOp::Min) => "0x7F800000u",
+        ("f32", AtomicOp::Max) => "0xFF800000u",
+        ("i32", AtomicOp::Add) => "0i",
+        ("i32", AtomicOp::Min) => "2147483647i",
+        ("i32", AtomicOp::Max) => "bitcast<i32>(0x80000000u)",
+        _ => "0xFFFFFFFFu",
+    }
 }

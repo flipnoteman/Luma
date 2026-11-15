@@ -52,6 +52,8 @@ mod guide {
     pub mod views {}
     #[doc = include_str!("../guide/src/reductions.md")]
     pub mod reductions {}
+    #[doc = include_str!("../guide/src/data.md")]
+    pub mod data {}
     #[doc = include_str!("../guide/src/records.md")]
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
@@ -82,26 +84,33 @@ mod builtin;
 mod context;
 mod conv;
 mod cyclic;
+mod solve;
 mod error;
 mod fields;
 mod fields_macro;
 #[cfg(test)]
 mod fuzz;
 mod fft;
+mod factorize;
 mod generate;
 mod gpu;
 mod gpu_type;
+mod group;
 mod iterate;
 mod jit;
 mod kernel;
 mod linalg;
+mod matmul;
 mod ops;
 mod precision;
 mod profile;
+mod quantile;
 mod reduce;
 mod scan;
+mod scatter;
 mod scalar;
 mod shape;
+mod sort;
 mod tuning;
 mod until;
 mod view;
@@ -110,18 +119,24 @@ pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceKind};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
-pub use gpu_type::{Df32, GpuType, ScalarType};
+pub use gpu_type::{Df32, GpuType, Mask, ScalarType};
 pub use kernel::{uniform, view, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
 pub use until::{iterate_until_all, Cond, History, Run, Series, Stat, StopReason, Until};
-pub use linalg::{solve_block_tridiagonal, solve_block_tridiagonal_from, solve_tridiagonal, solve_tridiagonal_from};
+pub use linalg::{
+    solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from, solve_tridiagonal, solve_tridiagonal_from,
+    solve_tridiagonal_parts, solve_tridiagonal_parts_from,
+};
+pub use matmul::matmul;
 pub use jit::cost::CostModel;
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Operand};
 pub use reduce::Reduction;
 pub use scalar::Scalar;
+pub use scatter::{bincount, AtomicElem};
 pub use profile::{FusionSplit, KernelTiming, Profile, SplitReason};
 pub use shape::{Offsets, Shape};
+pub use sort::SortKey;
 pub use tuning::TuningProfile;
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 

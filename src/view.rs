@@ -19,7 +19,7 @@ use crate::context::Context;
 use crate::error::{LumaError, Result};
 use crate::fields::{FieldOp, Fields};
 use crate::gpu::pager::Pin;
-use crate::gpu_type::{Df32, GpuType, ScalarType};
+use crate::gpu_type::{Df32, GpuType, Mask, ScalarType};
 use crate::jit::assign::Region;
 use crate::jit::{self, AxisMap, Edge, ElemTy, Held, Op, OpKind, Scalar, ShiftKind, Src, ViewMap};
 use crate::ops::{run_select, Operand, Outcome, Rhs};
@@ -93,7 +93,10 @@ impl<T: ScalarType> Array<T> {
         self.src()?;
         if writable && self.is_read_view() {
             return Err(LumaError::InvalidShape(
-                "cannot take a mutable view of a read-only view; use slice_mut, flip_mut or transpose_mut on the array".into(),
+                "cannot take a mutable view of a read-only view: this array is a read-only view of another array; \
+                 use slice_mut, flip_mut or transpose_mut on the array that owns the data (a slice of a slice \
+                 is `owner.slice_mut(axis, range)` with the combined range)"
+                    .into(),
             )
             .into());
         }
@@ -241,7 +244,9 @@ impl<T: ScalarType> Array<T> {
     /// [`ViewMut`], which [`ViewMut::assign`] and the compound operators (`+=`, ...) write into
     /// this array. `w.slice_mut(1, ..1).assign(0.0)` zeros the first row of `w` for every array
     /// sharing its buffer. An invalid range, or a read-only array, poisons the view: its writes
-    /// fail.
+    /// fail. An array made by [`Array::slice`], [`Array::flip`] or [`Array::transpose`] is
+    /// read-only, so the view of a slice of `w` is taken on `w` with the combined range
+    /// (`w.slice_mut(0, 3..5)` for `w.slice(0, 2..).slice_mut(0, 1..3)`).
     #[track_caller]
     pub fn slice_mut(&mut self, axis: usize, range: impl RangeBounds<usize>) -> ViewMut<'_, Array<T>> {
         let inner = self.slice_at(axis, range, true, Location::caller());
@@ -683,7 +688,7 @@ impl<T: ScalarType> Array<T> {
 
         // The cells of the base the region covers: a box, as a mask over the base.
         let base_shape = Shape::new(map.src.map(|d| d as usize));
-        let mut mask: Option<Array<u32>> = None;
+        let mut mask: Option<Array<Mask>> = None;
         for a in 0..4 {
             let (first, last) = map.ends(a);
             let (lo, hi) = (first.min(last), first.max(last));
@@ -695,12 +700,12 @@ impl<T: ScalarType> Array<T> {
             let below = (lo > 0).then(|| at.compare_at(Rhs::Scalar(lo as u32), CmpOp::Ge, "ge", location));
             let above = (hi < i64::from(map.src[a]) - 1).then(|| at.compare_at(Rhs::Scalar(hi as u32), CmpOp::Le, "le", location));
             let inside = match (below, above) {
-                (Some(below), Some(above)) => below.binary_at(Rhs::Array(&above), BinOp::Mul, false, "mul", location),
+                (Some(below), Some(above)) => below.binary_at(Rhs::Array(&above), BinOp::BitAnd, false, "bitand", location),
                 (Some(side), None) | (None, Some(side)) => side,
                 (None, None) => continue,
             };
             mask = Some(match mask {
-                Some(rest) => rest.binary_at(Rhs::Array(&inside), BinOp::Mul, false, "mul", location),
+                Some(rest) => rest.binary_at(Rhs::Array(&inside), BinOp::BitAnd, false, "bitand", location),
                 None => inside,
             });
         }
@@ -764,13 +769,24 @@ impl<T: ScalarType> Array<T> {
     /// view of another one. Lazy arrays recorded before the write keep their values.
     #[track_caller]
     pub fn put(&mut self, indices: &Array<u32>, values: impl Operand<T>) -> Result<()> {
-        let location = Location::caller();
+        self.put_with(indices, values, None, "put", Location::caller())
+    }
+
+    /// [`Array::put`], or with `atomic` the combining scatter of `put_add` and its kin.
+    pub(crate) fn put_with(
+        &mut self,
+        indices: &Array<u32>,
+        values: impl Operand<T>,
+        atomic: Option<jit::AtomicOp>,
+        name: &'static str,
+        location: &'static Location<'static>,
+    ) -> Result<()> {
         let prepared = self.scatter_args(indices, values.rhs());
         drop(values);
         let result = prepared.and_then(|(base, index, values)| {
-            jit::assign::scatter(self.context(), &base, index, values, ElemTy::of::<T>()?, indices.len(), "put", location)
+            jit::assign::scatter(self.context(), &base, index, values, ElemTy::of::<T>()?, indices.len(), name, location, atomic)
         });
-        finish(result, "put", location)
+        finish(result, name, location)
     }
 
     /// The target buffer, the index operand and the value operand of [`Array::put`].
@@ -927,7 +943,7 @@ pub fn stack_slice<T: ScalarType>(axis: usize, parts: &[Array<T>]) -> Array<T> {
     stack_of(axis, &refs, location)
 }
 
-fn stack_of<T: ScalarType>(axis: usize, parts: &[&Array<T>], location: &'static Location<'static>) -> Array<T> {
+pub(crate) fn stack_of<T: ScalarType>(axis: usize, parts: &[&Array<T>], location: &'static Location<'static>) -> Array<T> {
     let Some(&first) = parts.first() else {
         let error = LumaError::InvalidShape("stack of no arrays".into());
         let error = LumaError::Op { op: "stack", location, source: Arc::new(error) };
@@ -1262,9 +1278,12 @@ macro_rules! assign_rhs_host {
 
 assign_rhs_value!(f32);
 assign_rhs_value!(u32);
+assign_rhs_value!(i32);
+assign_rhs_value!(Mask);
 assign_rhs_value!(Df32);
 assign_rhs_host!(f32);
 assign_rhs_host!(u32);
+assign_rhs_host!(i32);
 
 macro_rules! view_fields_assign {
     ($Trait:ident, $method:ident, $op:expr) => {

@@ -3,6 +3,8 @@ pub(crate) mod sealed {
 }
 
 impl sealed::Sealed for u32 {}
+impl sealed::Sealed for i32 {}
+impl sealed::Sealed for Mask {}
 impl sealed::Sealed for f32 {}
 impl sealed::Sealed for f64 {}
 impl sealed::Sealed for Df32 {}
@@ -39,6 +41,8 @@ pub trait ScalarType: GpuType {
 }
 
 impl GpuType for u32 {}
+impl GpuType for i32 {}
+impl GpuType for Mask {}
 impl GpuType for f32 {}
 impl GpuType for f64 {}
 impl GpuType for [f32; 2] {}
@@ -47,6 +51,18 @@ impl GpuType for [u32; 2] {}
 impl GpuType for [u32; 4] {}
 
 impl ScalarType for u32 {
+    fn wgsl_type() -> &'static str {
+        "u32"
+    }
+}
+
+impl ScalarType for i32 {
+    fn wgsl_type() -> &'static str {
+        "i32"
+    }
+}
+
+impl ScalarType for Mask {
     fn wgsl_type() -> &'static str {
         "u32"
     }
@@ -61,6 +77,47 @@ impl ScalarType for f32 {
 impl ScalarType for f64 {
     fn wgsl_type() -> &'static str {
         "f64"
+    }
+}
+
+/// A boolean per element: the result of comparisons and classifications, and the first operand of
+/// [`select`](crate::select). It is stored as a `u32` that is 0 (false) or 1 (true); the field is
+/// private, so masks read back from the GPU or built with [`Mask::from`] only ever hold 0 or 1.
+/// The library relies on that: `!`, [`count`](crate::Array::count), [`any`](crate::Array::any)
+/// and [`all`](crate::Array::all) give unspecified results for a mask holding another word,
+/// which only a reinterpretation of raw bits through `bytemuck` (`Mask` is `Pod`) can build.
+/// Generators (`range` and the like) do not exist for masks.
+/// Arrays of masks have `&`, `|`, `^` and `!`, [`count`](crate::Array::count),
+/// [`any`](crate::Array::any), [`all`](crate::Array::all), `min`/`max` and the casts
+/// [`to_u32`](crate::Array::to_u32) and [`to_f32`](crate::Array::to_f32); arithmetic and sums
+/// are not defined (convert with `to_u32` first).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Mask(u32);
+
+// SAFETY: `#[repr(transparent)]` over `u32`: no padding, and the all-zero pattern is valid.
+unsafe impl Zeroable for Mask {}
+// SAFETY: see above. Bit patterns other than 0 and 1 are never produced by the library, but
+// they are not undefined behaviour either (every operation reads the word as an integer); the
+// results of the mask operations for them are unspecified (see the type's documentation).
+unsafe impl Pod for Mask {}
+
+impl Mask {
+    /// The true mask.
+    pub const TRUE: Mask = Mask(1);
+    /// The false mask.
+    pub const FALSE: Mask = Mask(0);
+}
+
+impl From<bool> for Mask {
+    fn from(value: bool) -> Self {
+        Mask(u32::from(value))
+    }
+}
+
+impl From<Mask> for bool {
+    fn from(value: Mask) -> Self {
+        value.0 != 0
     }
 }
 

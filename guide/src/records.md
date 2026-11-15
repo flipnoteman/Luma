@@ -18,7 +18,7 @@ trait:
 - a tuple of up to six records `(A, B, ..)`,
 - a struct declared with `luma::fields!`.
 
-All the arrays of a record have the same element type (`f32`, `Df32`, `f64` or `u32`) and the same
+All the arrays of a record have the same element type (`f32`, `Df32`, `f64`, `u32` or `i32`) and the same
 shape. `Fields::Elem` is that type.
 
 ```rust

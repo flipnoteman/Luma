@@ -1,3 +1,58 @@
+# Migration from 0.3
+
+0.4 changes the type of comparisons: they return masks (`Array<Mask>`) instead of `Array<u32>`.
+Everything else in 0.4 is added ([the list below](#new-in-04-that-you-may-want)).
+
+## Comparisons return `Array<Mask>`
+
+`lt`, `le`, `gt`, `ge`, `eq`, `ne` and `is_finite` / `is_nan` / `is_inf` return `Array<Mask>`;
+`select`, `sum_where` and `Fields::select` take `&Array<Mask>`. A mask is a boolean per element,
+stored as a `u32` that is 0 or 1. Code that passes a comparison to `select` or `sum_where` compiles
+as it is. Code that used the `0` / `1` as a number converts it:
+
+```text
+// 0.3
+let above = x.gt(0.0);
+let count = above.sum().item()?;          // Array<u32>
+let weight = &above * 0.5f32;             // does not exist: u32 * f32
+let negated = &above ^ 1u32;
+// 0.4
+let above = x.gt(0.0);
+let count = above.count().item()?;
+let weight = above.to_f32() * 0.5;
+let negated = !&above;
+```
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.5f32, -2.0, 3.0, -4.0], 4)?;
+let above: Array<Mask> = x.gt(0.0);
+let both = &above & &x.lt(2.0);                    // masks combine with & | ^ !
+assert_eq!(above.count().item()?, 2);
+assert_eq!(both.to_u32().to_vec()?, vec![1, 0, 0, 0]);
+assert_eq!(above.to_f32().to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
+assert!(bool::from(above.any().item()?));
+assert!(!bool::from(above.all().item()?));
+assert_eq!(select(&above, 1.0f32, 0.0).to_vec()?, vec![1.0, 0.0, 1.0, 0.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+Sums of masks (`sum`, `cumsum`, `sum_axis`, `mean`) are not defined, since the result would no
+longer be a mask; `count()` is the sum of the true elements, `min` and `max` are `all` and `any`.
+
+## New in 0.4 that you may want
+
+- [`i32` arrays, casts and `Mask`](arrays.md#element-types) (`to_u32`, `to_i32`, `to_f32`; `count`,
+  `any`, `all`).
+- [`matmul`, axis statistics (`reduce_axis`, `mean_axis`, `var_axis`, `std_axis`), accumulating
+  scatters (`put_add`, `bincount`, `histogram`), sorting, group-by, `unique` and quantiles](data.md).
+  Axis reductions no longer evaluate a pending operand first
+  ([What fuses](performance.md#primitives-that-read-an-expression)).
+- Guide pages for [`Scalar`](lazy.md#scalars-that-change), [elementwise math](arrays.md#elementwise-operations),
+  [convolution](arrays.md#convolution) and the [tridiagonal solvers](loops.md#line-solvers-solve_tridiagonal),
+  which earlier releases already had.
+
 # Migration from 0.2
 
 0.3 changes two things your 0.2 code can trip over. Almost everything else in 0.3 is added; the few behaviour changes (a lazy `reshape` of a view, fusion decided by a cost model, a larger buffer pool) are listed under *Changed* in the changelog.

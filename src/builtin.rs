@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::jit::ElemTy;
+use crate::solve::Io;
 use crate::tuning::{Tuning, TuningProfile};
 
 /// Workgroup size of the reduction kernels.
@@ -161,6 +162,15 @@ impl UnOp {
                 UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => Some(self.expr()),
                 _ => None,
             },
+            ElemTy::Mask => match self {
+                UnOp::Id => Some("x"),
+                UnOp::BitNot => Some("(x ^ 1u)"),
+                _ => None,
+            },
+            ElemTy::I32 => match self {
+                UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
+                _ => None,
+            },
             ElemTy::F32 if self.is_bitwise() => None,
             ElemTy::F32 => Some(self.expr()),
             ElemTy::F64 => match self {
@@ -171,6 +181,9 @@ impl UnOp {
                 UnOp::Neg => Some("-x"),
                 UnOp::Abs => Some("df_abs(x)"),
                 UnOp::Sqrt => Some("df_sqrt(x)"),
+                UnOp::Exp => Some("df_exp(x)"),
+                UnOp::Ln => Some("df_ln(x)"),
+                UnOp::Tanh => Some("df_tanh(x)"),
                 UnOp::Id => Some("x"),
                 _ => None,
             },
@@ -239,6 +252,16 @@ impl BinOp {
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
             ElemTy::U32 => Some(self.expr()),
+            ElemTy::Mask => match self {
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Min | BinOp::Max => Some(self.expr()),
+                _ => None,
+            },
+            ElemTy::I32 => match self {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Min | BinOp::Max | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Some(self.expr()),
+                BinOp::Shl => Some("x << (bitcast<u32>(y) & 31u)"),
+                BinOp::Shr => Some("x >> (bitcast<u32>(y) & 31u)"),
+                _ => None,
+            },
             ElemTy::F32 => (!self.is_bitwise()).then(|| self.expr()),
             ElemTy::F64 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max => Some(self.expr()),
@@ -268,7 +291,7 @@ pub(crate) enum CmpOp {
 }
 
 impl CmpOp {
-    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1.
+    /// The comparison as a WGSL expression of `x` and `y`, a `u32` holding 0 or 1 (a mask).
     pub(crate) fn expr(self) -> &'static str {
         match self {
             CmpOp::Lt => "select(0u, 1u, x < y)",
@@ -319,7 +342,7 @@ impl Class {
         }
     }
 
-    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1: the bits of `x`
+    /// The test as a WGSL expression of the `f32` `x`, a `u32` holding 0 or 1 (a mask): the bits of `x`
     /// below the sign are compared with those of infinity. They come through `luma_bits` of the
     /// double-float library, which ORs them with the guard uniform (always 0): a compiler that
     /// assumes no `NaN` or infinity arises in the arithmetic of the kernel (a device's fast
@@ -527,9 +550,23 @@ pub(crate) enum Builtin {
     /// that are a multiple of `1 << shift` live in workgroup memory (`shared_rows` of them), the
     /// others in a scratch buffer.
     CyclicTridiagonal { block: u8, starts: bool, workgroup: u16, shift: u8, shared_rows: u32 },
+    /// Line solves on parts that are all buffers (the fused ones are kernels of
+    /// `jit::program::Tail::Solve`); see [`crate::solve`].
+    SolveParts(crate::solve::SolveSpec),
     /// `out[i] = 1` where word `i` of `a` is a NaN or an infinity (as `f32` bits), else 0;
     /// arguments: out, a. Element type `"u32"`. See `jit::check_finite`.
     NonFinite,
+    /// A kernel of a radix sort pass reading its keys from a buffer; see [`crate::sort`].
+    /// Element type `"u32"`. `first` passes read the user's keys.
+    Radix { pass: crate::sort::RadixPass, first: bool },
+    /// Tiled matrix product of the operands (buffers) `a` and `b`; see [`crate::matmul`].
+    /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
+    /// dimension and writes every slice's partial product after the previous one.
+    Matmul { tile: crate::matmul::MatmulTile, aligned: bool, split: bool },
+    /// `out[i] = Σ_z part[z * size + i]` for `p.s` slices `z`: the sum of the partial products of
+    /// a split [`Builtin::Matmul`]. Arguments: out, part, uniform `{s}`; `luma.size.x` is the
+    /// elements of `out`.
+    MatmulSum,
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -577,7 +614,7 @@ impl<'a> ReduceElem<'a> {
     }
 
     /// The expression combining accumulators `u` and `v`.
-    fn combine(self, op: ReduceOp) -> &'static str {
+    pub(crate) fn combine(self, op: ReduceOp) -> &'static str {
         match (self, op) {
             (ReduceElem::Plain(_), ReduceOp::Sum | ReduceOp::SumSquares) => "u + v",
             (ReduceElem::Plain(_), ReduceOp::Min) => "min(u, v)",
@@ -589,7 +626,7 @@ impl<'a> ReduceElem<'a> {
     }
 
     /// The square of the expression `e`.
-    fn square(self, e: &str) -> String {
+    pub(crate) fn square(self, e: &str) -> String {
         match self {
             ReduceElem::Plain(_) => format!("{e} * {e}"),
             ReduceElem::Df32 { .. } => format!("df_mul({e}, {e})"),
@@ -598,7 +635,7 @@ impl<'a> ReduceElem<'a> {
 
     /// Whether the workgroup built-ins (`subgroupAdd`, ...) work on the type.
     fn subgroups(self) -> bool {
-        matches!(self, ReduceElem::Plain("f32" | "u32" | "vec2<f32>" | "vec4<f32>"))
+        matches!(self, ReduceElem::Plain("f32" | "u32" | "i32" | "vec2<f32>" | "vec4<f32>"))
     }
 
     fn library(self) -> String {
@@ -683,6 +720,127 @@ fn df_two_prod(a: f32, b: f32) -> vec2<f32> {
     )
     .replace("{G}", guard)
 }
+
+/// `exp`, `ln`, `tanh` and `pow` on `vec2<f32>` double-floats, on top of [`df_library`] (a kernel
+/// that calls them defines both; see `codegen::library_for`).
+///
+/// Every function is accurate to a relative 2^-43 (`tests/df32_library.rs` measures 4.3e-14 at
+/// most) for results of about `1e-25` and up. Below that the low word of a `Df32` is under the
+/// smallest normal `f32` and loses bits whatever the function; a result below `2^-126` is 0 and
+/// one above `f32::MAX` is infinity.
+///
+/// - `exp`: `x = k ln 2 + r`, `|r| <= ln 2 / 2`, with `ln 2` in three words (the first two of 16
+///   bits, so that `k` times them is exact). `e^r - 1` is a Taylor series of `r / 16` (the terms
+///   from the fourth power on in `f32`) squared four times as `(1 + p)^2 - 1 = 2p + p^2`, which
+///   keeps the relative accuracy of the small values; the result is scaled by `2^k`.
+/// - `ln`: `x = 2^e m`, `m` in `[1/sqrt 2, sqrt 2)`, and `ln m = 2 atanh((m - 1) / (m + 1))`, a
+///   series in `z^2`, `|z| <= 0.172`: the relative accuracy holds near `x = 1`.
+/// - `tanh`: `(e^{2|x|} - 1) / (e^{2|x|} + 1)` from the same `e^r - 1`, so small arguments keep
+///   their relative accuracy; `1` from `|x| > 20`.
+/// - `pow(x, y)` is `2^(y e) * exp(y ln m)` for `x = 2^e m` with `y e` split exactly into an
+///   integer and a fraction, so that the error does not grow with `y ln x` (it is that of an
+///   `exp` and an `ln` and a product of at most `y ln m`, `|ln m| <= 0.35`). `NaN` for a negative
+///   base, `x^0 = 1`, and the infinite and zero cases of IEEE `pow` for a base of 0 or infinity.
+pub(crate) const DF_MATH_LIBRARY: &str = "struct DfLog { e: f32, l: vec2<f32> }
+fn df_isnan(a: f32) -> bool { return (bitcast<u32>(a) & 0x7fffffffu) > 0x7f800000u; }
+fn df_inf() -> f32 { return bitcast<f32>(0x7f800000u); }
+fn df_scale(a: vec2<f32>, k: i32) -> vec2<f32> {
+    let k1 = k >> 1u; let k2 = k - k1;
+    let s1 = bitcast<f32>(u32(k1 + 127) << 23u); let s2 = bitcast<f32>(u32(k2 + 127) << 23u);
+    let t = vec2<f32>(luma_o(a.x * s1), luma_o(a.y * s1));
+    return vec2<f32>(luma_o(t.x * s2), luma_o(t.y * s2));
+}
+fn df_expm1_small(r: vec2<f32>) -> vec2<f32> {
+    let u = r * 0.0625;
+    let s = df_mul(u, u);
+    let h = u.x;
+    let c = 0.041666668 + h * (0.008333334 + h * (0.0013888889 + h * (0.00019841270 + h * 0.000024801587)));
+    let v = df_add(vec2<f32>(0.16666667, -4.9670539e-9), vec2<f32>(h * c, 0.0));
+    let w = df_add(vec2<f32>(0.5, 0.0), df_mul(u, v));
+    var p = df_add(u, df_mul(s, w));
+    for (var i = 0; i < 4; i++) { p = df_add(p * 2.0, df_mul(p, p)); }
+    return p;
+}
+fn df_exp_reduce(x: vec2<f32>, k: f32) -> vec2<f32> {
+    let a = df_two_sum(x.x - k * 0.693145752, x.y);
+    return df_add(a, df_two_sum(-(k * 1.42861973e-6), -(k * -1.29053200e-11)));
+}
+fn df_exp_scaled(x: vec2<f32>, extra: f32) -> vec2<f32> {
+    let k = round(x.x * 1.44269502);
+    let e = df_add(vec2<f32>(1.0, 0.0), df_expm1_small(df_exp_reduce(x, k)));
+    let v = df_scale(e, i32(clamp(k + extra, -250.0, 250.0)));
+    if (v.x < 1.17549435e-38) { return vec2<f32>(0.0, 0.0); }
+    if (v.x > 3.40282347e38) { return vec2<f32>(df_inf(), 0.0); }
+    return v;
+}
+fn df_exp(x: vec2<f32>) -> vec2<f32> {
+    if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
+    if (x.x > 88.722) { return vec2<f32>(df_inf(), 0.0); }
+    if (x.x < -87.33) { return vec2<f32>(0.0, 0.0); }
+    return df_exp_scaled(x, 0.0);
+}
+fn df_log_split(a: vec2<f32>) -> DfLog {
+    let small = a.x < 1.17549435e-38;
+    let x = select(a, a * 1.84467441e19, small);
+    let bits = bitcast<u32>(x.x);
+    let big = bitcast<f32>((bits & 0x007fffffu) | 0x3f800000u) > 1.41421354;
+    let e = i32(bits >> 23u) - 127 + select(0, 1, big);
+    let m = df_scale(x, -e);
+    let z = df_div(df_add(m, vec2<f32>(-1.0, 0.0)), df_add(m, vec2<f32>(1.0, 0.0)));
+    let w = df_mul(z, z);
+    let h = w.x;
+    let c = 0.11111111 + h * (0.09090909 + h * (0.07692308 + h * (0.06666667 + h * (0.05882353 + h * 0.05263158))));
+    let q7 = df_add(vec2<f32>(0.14285715, -6.3862120e-9), vec2<f32>(h * c, 0.0));
+    let q5 = df_add(vec2<f32>(0.2, -2.9802323e-9), df_mul(w, q7));
+    let q3 = df_add(vec2<f32>(0.33333334, -9.9341078e-9), df_mul(w, q5));
+    let q1 = df_add(vec2<f32>(1.0, 0.0), df_mul(w, q3));
+    return DfLog(f32(e - select(0, 64, small)), df_mul(z, q1) * 2.0);
+}
+fn df_ln(x: vec2<f32>) -> vec2<f32> {
+    if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
+    if (x.x < 0.0) { return vec2<f32>(bitcast<f32>(0x7fc00000u), 0.0); }
+    if (x.x == 0.0) { return vec2<f32>(-df_inf(), 0.0); }
+    if (x.x > 3.40282347e38) { return vec2<f32>(x.x, 0.0); }
+    let s = df_log_split(x);
+    return df_add(df_mul(vec2<f32>(s.e, 0.0), vec2<f32>(0.693147182, -1.90465421e-9)), s.l);
+}
+fn df_tanh(x: vec2<f32>) -> vec2<f32> {
+    if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
+    let neg = (bitcast<u32>(x.x) >> 31u) != 0u;
+    let a = select(x, -x, neg);
+    if (a.x > 20.0) { return select(vec2<f32>(1.0, 0.0), vec2<f32>(-1.0, 0.0), neg); }
+    let z = a * 2.0;
+    let k = round(z.x * 1.44269502);
+    let p = df_expm1_small(df_exp_reduce(z, k));
+    var t = p;
+    if (k != 0.0) { t = df_add(df_scale(df_add(vec2<f32>(1.0, 0.0), p), i32(k)), vec2<f32>(-1.0, 0.0)); }
+    let th = df_div(t, df_add(t, vec2<f32>(2.0, 0.0)));
+    return select(th, -th, neg);
+}
+fn df_pow(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> {
+    let nan = vec2<f32>(bitcast<f32>(0x7fc00000u), 0.0);
+    if (y.x == 0.0) { return vec2<f32>(1.0, 0.0); }
+    if (df_isnan(x.x) | df_isnan(y.x) | (x.x < 0.0)) { return nan; }
+    let zero = vec2<f32>(0.0, 0.0);
+    let inf = vec2<f32>(df_inf(), 0.0);
+    if (abs(y.x) > 1.0e30) {
+        if ((x.x == 1.0) & (x.y == 0.0)) { return vec2<f32>(1.0, 0.0); }
+        let grows = (x.x > 1.0) | ((x.x == 1.0) & (x.y > 0.0));
+        return select(zero, inf, grows == (y.x > 0.0));
+    }
+    if (x.x == 0.0) { return select(inf, zero, y.x > 0.0); }
+    if (x.x > 3.40282347e38) { return select(zero, inf, y.x > 0.0); }
+    let s = df_log_split(x);
+    let a = df_two_prod(y.x, s.e);
+    let b = df_two_prod(y.y, s.e);
+    if (abs(a.x) > 400.0) { return select(zero, inf, a.x > 0.0); }
+    let n = round(a.x);
+    let f = df_add(df_two_sum(a.x - n, b.x), df_two_sum(a.y, b.y));
+    let arg = df_add(df_mul(f, vec2<f32>(0.693147182, -1.90465421e-9)), df_mul(y, s.l));
+    if (abs(arg.x) > 100.0) { return select(zero, inf, n * 0.693147182 + arg.x > 0.0); }
+    return df_exp_scaled(arg, n);
+}
+";
 
 /// `c(..)` over `values`, combined pairwise so float sums keep their accuracy.
 fn pairwise(c: &str, values: &[String]) -> String {
@@ -972,26 +1130,26 @@ pub(crate) fn tridiagonal_workgroup(tuning: &Tuning, lines: u32) -> u8 {
     }
 }
 
-/// The part of the tridiagonal kernels before the entry point: parameters, bindings and the line
-/// addressing. `out` holds the forward-swept right-hand sides and then the solution, `cp` the
-/// swept upper blocks. Cell `q` of the grid holds block `lo/diag/up[q * B * B + row * B + col]`
-/// and `rhs[q * B + row]`; the line `l` has `p.n` cells `line_base(l) + s * p.stride`.
-fn tridiagonal_header(starts: bool) -> String {
+/// The bindings of the Thomas kernel and the line addressing. `out` holds the forward-swept
+/// right-hand sides and then the solution, `cp` the swept upper blocks. Cell `q` of the grid holds
+/// block `lo/diag/up[q * B * B + row * B + col]` and `rhs[q * B + row]` (see [`Io::buffers`]); the
+/// line `l` has `p.n` cells `line_base(l) + s * p.stride`.
+fn tridiagonal_header(starts: bool, io: &Io) -> String {
     let (starts_binding, starts_decl) = if starts {
         ("@group(1) @binding(6) var<storage, read> starts: array<u32>;\n", 7)
     } else {
         ("", 6)
     };
+    let (coef, rhs) = (io.coef_type(), io.rhs_type());
     format!(
         "struct Params {{ n: u32, stride: u32, lines: u32 }}
-@group(1) @binding(0) var<storage, read_write> out: array<f32>;
+@group(1) @binding(0) var<storage, read_write> out: array<{rhs}>;
 @group(1) @binding(1) var<storage, read_write> cp: array<f32>;
-@group(1) @binding(2) var<storage, read> lo: array<f32>;
-@group(1) @binding(3) var<storage, read> diag: array<f32>;
-@group(1) @binding(4) var<storage, read> up: array<f32>;
-@group(1) @binding(5) var<storage, read> rhs: array<f32>;
+@group(1) @binding(2) var<storage, read> lo: array<{coef}>;
+@group(1) @binding(3) var<storage, read> diag: array<{coef}>;
+@group(1) @binding(4) var<storage, read> up: array<{coef}>;
+@group(1) @binding(5) var<storage, read> rhs: array<{rhs}>;
 {starts_binding}@group(1) @binding({starts_decl}) var<uniform> p: Params;
-fn line_base(l: u32) -> u32 {{ return (l % p.stride) + (l / p.stride) * p.stride * p.n; }}
 "
     )
 }
@@ -1013,7 +1171,7 @@ fn tridiagonal(block: u32, starts: bool, wg: u32) -> String {
 }
 
 /// The largest block size the solve is unrolled for.
-const UNROLLED_BLOCK: u32 = 5;
+pub(crate) const UNROLLED_BLOCK: u32 = 5;
 
 /// The straight-line solve of `b`-blocks. Per cell the forward sweep holds the diagonal block
 /// `m`, the right-hand side `r = [up | rhs]` (all `b x (b + 1)` entries as scalars) and the
@@ -1022,25 +1180,40 @@ const UNROLLED_BLOCK: u32 = 5;
 /// and writes the swept values for the backward sweep, which carries the solution of the next
 /// cell in registers. For `b == 1` this is the plain Thomas algorithm.
 fn tridiagonal_unrolled(b: usize, starts: bool, wg: u32) -> String {
+    let mut src = tridiagonal_header(starts, &Io::buffers(b));
+    src.push_str(&tridiagonal_body(b, starts, wg, 1, &Io::buffers(b)));
+    src
+}
+
+/// The entry point of the straight-line Thomas solve of `systems` systems of `b`-blocks, reading
+/// and writing through `io`, after the bindings and `Params` (see [`tridiagonal_header`]; the
+/// scratch `cp` holds `b * b` floats per cell and system).
+pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io: &Io) -> String {
     let w = b + 1;
     let bb = b * b;
     let s0 = if starts { "min(starts[l], p.n)" } else { "0u" };
-    let mut src = tridiagonal_header(starts);
+    let (guard, sys, line, scratch) = if systems > 1 {
+        (format!("p.lines * {systems}u"), "    let sys = lg / p.lines;\n", "lg % p.lines", format!("sys * (p.lines * p.n * {bb}u)"))
+    } else {
+        ("p.lines".to_owned(), "    let sys = 0u;\n", "lg", "0u".to_owned())
+    };
+    let mut src = String::from("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
     let _ = write!(
         src,
         "@compute @workgroup_size({wg})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let l = gid.x + gid.y * nwg.x * {wg}u;
-    if (l >= p.lines) {{ return; }}
+    let lg = gid.x + gid.y * nwg.x * {wg}u;
+    if (lg >= {guard}) {{ return; }}
+{sys}    let l = {line};
+    let so = {scratch};
     let base = line_base(l);
     let s0 = {s0};
     for (var s = 0u; s < s0; s++) {{
-        let oq = (base + s * p.stride) * {b}u;
+        let q = base + s * p.stride;
 "
     );
-    for c in 0..b {
-        let _ = writeln!(src, "        out[oq + {c}u] = 0.0;");
-    }
+    let zeros: Vec<String> = vec!["0.0".to_owned(); b];
+    src.push_str(&io.store("        ", "q", &zeros));
     src.push_str("    }\n    if (s0 >= p.n) { return; }\n");
     for i in 0..b {
         for j in 0..b {
@@ -1048,27 +1221,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
         let _ = writeln!(src, "    var pd{i} = 0.0;");
     }
-    src.push_str(
-        "    for (var s = s0; s < p.n; s++) {
-        let q = base + s * p.stride;
-        let o = q * __BB__u;
-        let oq = q * __B__u;
-"
-        .replace("__BB__", &bb.to_string())
-        .replace("__B__", &b.to_string())
-        .as_str(),
-    );
+    src.push_str("    for (var s = s0; s < p.n; s++) {\n        let q = base + s * p.stride;\n");
+    src.push_str(&io.load("        ", "q"));
     for i in 0..b {
         for j in 0..b {
-            let _ = writeln!(src, "        var m{i}{j} = diag[o + {}u];", i * b + j);
-            let _ = writeln!(src, "        var r{i}{j} = up[o + {}u];", i * b + j);
+            let _ = writeln!(src, "        var m{i}{j} = {};", io.diag("q", i * b + j));
+            let _ = writeln!(src, "        var r{i}{j} = {};", io.up("q", i * b + j));
         }
-        let _ = writeln!(src, "        var r{i}{b} = rhs[oq + {i}u];");
+        let _ = writeln!(src, "        var r{i}{b} = {};", io.rhs("q", i));
     }
     src.push_str("        if (s > s0) {\n");
+    src.push_str(&io.load_lo("            ", "q"));
     for i in 0..b {
         for k in 0..b {
-            let _ = writeln!(src, "            let l{i}{k} = lo[o + {}u];", i * b + k);
+            let _ = writeln!(src, "            let l{i}{k} = {};", io.lo("q", i * b + k));
         }
     }
     for i in 0..b {
@@ -1125,29 +1291,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     }
     for i in 0..b {
         for j in 0..b {
-            let _ = writeln!(src, "        cp[o + {}u] = r{i}{j};\n        pc{i}{j} = r{i}{j};", i * b + j);
+            let _ = writeln!(src, "        cp[so + q * {bb}u + {}u] = r{i}{j};\n        pc{i}{j} = r{i}{j};", i * b + j);
         }
-        let _ = writeln!(src, "        out[oq + {i}u] = r{i}{b};\n        pd{i} = r{i}{b};");
+        let _ = writeln!(src, "        pd{i} = r{i}{b};");
     }
+    let swept: Vec<String> = (0..b).map(|i| format!("r{i}{b}")).collect();
+    src.push_str(&io.store("        ", "q", &swept));
     src.push_str("    }\n");
     // The solution of the last cell is its swept right-hand side, still in `pd`.
     for i in 0..b {
         let _ = writeln!(src, "    var x{i} = pd{i};");
     }
-    let _ = write!(
-        src,
-        "    for (var j = 2u; j <= p.n - s0; j++) {{
-        let q = base + (p.n - j) * p.stride;
-        let o = q * {bb}u;
-        let oq = q * {b}u;
-"
-    );
+    src.push_str("    for (var j = 2u; j <= p.n - s0; j++) {\n        let q = base + (p.n - j) * p.stride;\n");
+    src.push_str(&io.load_out("        ", "q", "yo"));
     for i in 0..b {
-        let sum = (0..b).map(|k| format!("cp[o + {}u] * x{k}", i * b + k)).collect::<Vec<_>>().join(" + ");
-        let _ = writeln!(src, "        let y{i} = out[oq + {i}u] - ({sum});");
+        let sum = (0..b).map(|k| format!("cp[so + q * {bb}u + {}u] * x{k}", i * b + k)).collect::<Vec<_>>().join(" + ");
+        let _ = writeln!(src, "        let y{i} = yo{i} - ({sum});");
     }
+    let solved: Vec<String> = (0..b).map(|i| format!("y{i}")).collect();
+    src.push_str(&io.store("        ", "q", &solved));
     for i in 0..b {
-        let _ = writeln!(src, "        out[oq + {i}u] = y{i};\n        x{i} = y{i};");
+        let _ = writeln!(src, "        x{i} = y{i};");
     }
     src.push_str("    }\n}\n");
     src
@@ -1296,6 +1460,10 @@ impl Builtin {
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
                 crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows).into()
             }
+            Builtin::SolveParts(spec) => spec.source().into(),
+            Builtin::Radix { pass, first } => crate::sort::source(pass, first).into(),
+            Builtin::Matmul { tile, aligned, split } => crate::matmul::builtin_source(tile, aligned, split).into(),
+            Builtin::MatmulSum => crate::matmul::sum_source(wg).into(),
             Builtin::NonFinite => format!(
                 "@group(1) @binding(0) var<storage, read_write> out: array<u32>;
 @group(1) @binding(1) var<storage, read> a: array<u32>;
@@ -1336,5 +1504,12 @@ mod tests {
         assert_eq!(UnOp::by_constant(BinOp::Shr, 33), Some(UnOp::Shr(1)));
         // There is no negation of an unsigned integer.
         assert!(UnOp::Neg.expr_for(ElemTy::U32).is_none());
+        // `i32` has the integer operations only: no float math, no rotations.
+        for op in [UnOp::Sqrt, UnOp::Exp, UnOp::Floor, UnOp::Rotl(3)] {
+            assert!(op.expr_for(ElemTy::I32).is_none(), "{op:?}");
+        }
+        assert!(BinOp::Rotl.expr_for(ElemTy::I32).is_none());
+        assert!(BinOp::Atan2.expr_for(ElemTy::I32).is_none());
+        assert!(UnOp::Neg.expr_for(ElemTy::I32).is_some());
     }
 }

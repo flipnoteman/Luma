@@ -33,7 +33,7 @@ assert_eq!((lo, hi), (1.0, 4.0));
 | `sum()`, `min()`, `max()` | any element type; `u32` sums wrap around |
 | `mean()`, `norm()` | `f32`; the norm is the Euclidean (L2) norm |
 | `reduce([Reduction; N])` | `N` of `Sum`, `Min`, `Max`, `SumOfSquares` (one to four) in one pass, as an `N`-element array |
-| `sum_where(&mask)` | the sum of the elements where a `u32` mask is non-zero, in one pass |
+| `sum_where(&mask)` | the sum of the elements where a `Mask` is true, in one pass |
 | `item()` | the value of a one-element array |
 | `to_array::<N>()` | the values of an `N`-element array |
 
@@ -110,8 +110,8 @@ are the ones a host loop would give.
 
 ### Masks
 
-`sum_where(&mask)` sums where a `u32` mask is non-zero (comparisons return such masks), the
-count of a condition is the sum of the mask itself:
+`sum_where(&mask)` sums where a `Mask` is true (comparisons return masks); `count()` of a mask is
+the number of true elements, as a `u32` array:
 
 ```rust
 use luma::*;
@@ -119,7 +119,7 @@ use luma::*;
 let x = Array::from_slice(&[1.0f32, -2.0, 3.0, -4.0], 4)?;
 let positive = x.gt(0.0);
 assert_eq!(x.sum_where(&positive).item()?, 4.0);
-assert_eq!(positive.sum().item()?, 2);
+assert_eq!(positive.count().item()?, 2);
 # Ok::<(), luma::LumaError>(())
 ```
 
@@ -140,7 +140,11 @@ assert_eq!(v.max()?, [3.0, 30.0]);
 ## Along an axis
 
 `sum_axis`, `min_axis` and `max_axis` reduce along one axis and leave extent 1 there. The result
-broadcasts back against the array:
+broadcasts back against the array. They are available for `f32`, `u32` and `i32` arrays. A
+pending operand is not evaluated first: its expression is computed inside the first pass of the
+reduction, so `(&x * &y).sum_axis(1)` never stores the product. `reduce_axis`, `mean_axis`,
+`var_axis` and `std_axis` are in [Matrices, statistics and
+grouping](data.md#statistics-along-an-axis).
 
 ```rust
 use luma::*;
@@ -172,9 +176,17 @@ assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec()?, vec![3.0, 3.0, 4.0, 4.0, 5.
 `op` is called once with placeholders and compiled into the scan kernels, so it must be an
 elementwise expression of its two arguments and scalars (scalars it captures are uniforms:
 changing them does not recompile); anything else poisons the result. Non-associative operators
-give unspecified results, because the kernels regroup operands. Scans and axis reductions do not
-fuse into the expression behind them: the arrays are evaluated first. They are available for
-`f32` and `u32` arrays only (`f64` and `Df32` fail with `Unsupported`).
+give unspecified results, because the kernels regroup operands. Scans do not fuse into the
+expression behind them: the array is evaluated first (it is read twice). Scans and axis
+reductions are available for `f32`, `u32` and `i32` arrays (`f64` and `Df32` fail with
+`Unsupported`); on `Mask` arrays `cumsum` and the sums along an axis fail with `Unsupported` (use
+`to_u32()`), `min_axis` and `max_axis` work.
+
+## Sorting, groups, unique values and quantiles
+
+`sort`, `argsort`, `group_sum` and the other group reductions, `factorize` / `unique`, `histogram`
+and `quantile` / `median` have their own chapter: [Matrices, statistics and
+grouping](data.md).
 
 ## Precision
 

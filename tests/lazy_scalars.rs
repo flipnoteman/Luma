@@ -110,7 +110,7 @@ fn sum_where_adds_the_masked_elements() {
     assert!((got - want).abs() < 1e-3, "{got} vs {want}");
     let counted = Array::from_slice_on(&ctx, &[1u32; 10], 10).unwrap();
     let mask = Array::from_slice_on(&ctx, &[1u32, 0, 1, 0, 1, 0, 1, 0, 1, 0], 10).unwrap();
-    assert_eq!(counted.sum_where(&mask).item().unwrap(), 5);
+    assert_eq!(counted.sum_where(&mask.ne(0u32)).item().unwrap(), 5);
 }
 
 #[test]

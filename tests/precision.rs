@@ -125,9 +125,9 @@ fn df32_ordering_kernels_without_arithmetic_bind_no_guard() {
     let abs = a.abs().to_vec().unwrap();
     let min = a.minimum(&b).to_vec().unwrap();
     let max = a.maximum(&b).to_vec().unwrap();
-    let lt = a.lt(&b).to_vec().unwrap();
-    let le = a.le(&b).to_vec().unwrap();
-    let eq = a.eq(&a).to_vec().unwrap();
+    let lt = a.lt(&b).to_u32().to_vec().unwrap();
+    let le = a.le(&b).to_u32().to_vec().unwrap();
+    let eq = a.eq(&a).to_u32().to_vec().unwrap();
     for i in 0..da.len() {
         assert_eq!(abs[i].to_f64(), fa[i].abs(), "abs {i}");
         assert_eq!(min[i].to_f64(), fa[i].min(fb[i]), "min {i}");

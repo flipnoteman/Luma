@@ -9,6 +9,10 @@ use crate::array::{Failure, Storage};
 use crate::builtin::{BinOp, ReduceList, UnOp};
 use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
+use crate::matmul::{MatmulOperand, MatmulTile};
+use crate::solve::SolveSpec;
+use crate::scan::AxisPass;
+use crate::sort::RadixPass;
 use crate::profile::SplitReason;
 
 use super::codegen::Tile;
@@ -72,6 +76,14 @@ impl std::hash::Hash for Instr {
     }
 }
 
+/// How [`Tail::ScatterAdd`] combines a value with the element it lands on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum AtomicOp {
+    Add,
+    Min,
+    Max,
+}
+
 /// What happens to the values the program computes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Tail {
@@ -89,10 +101,41 @@ pub(crate) enum Tail {
     /// buffer holds interleaved in blocks of `block` elements: element `i` of part `k` goes to
     /// `(i / block) * total * block + k * block + i % block` (see `jit::stack`).
     Stack { total: u32, first: u32, block: u32 },
+    /// [`Tail::Scatter`] that combines instead of overwriting: element `i` applies `op`
+    /// atomically to element `index` of the one bound buffer (`Array::put_add` and its kin). With
+    /// `private`, every workgroup first accumulates into workgroup memory (the target is small
+    /// next to the number of elements) and merges it into the buffer once. Without, `len` may
+    /// move to uniform slot `len_slot` (see `params`), so that targets of any size share a kernel.
+    ScatterAdd { len: u32, op: AtomicOp, private: bool, len_slot: Option<u32> },
     /// [`Tail::StoreMapped`] with the numbers of the view in the uniform (see `params`).
     ParamStoreMapped { id: u16, spec: ViewSpec },
     /// [`Tail::Scatter`] with `len` in uniform slot `len_slot`.
     ParamScatter { len_slot: u32 },
+    /// The matrix product of the roots, which are the operands that are expressions: output 0
+    /// the left one if `lhs` is fused, then the right one if `rhs` is; an operand that is not one
+    /// is the buffer `a` / `b`. The program becomes `luma_lhs(i)` / `luma_rhs(i)`, the loads of
+    /// the GEMM kernel of `matmul::body` (see `launch::matmul`).
+    Matmul { tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand },
+    /// The last instruction is the operand of a reducing pass along an axis (`scan::AxisPass`):
+    /// the program becomes `luma_eval(q)`, the load of the pass (see `launch::axis_reduce`).
+    AxisReduce(AxisPass),
+    /// A first-pass kernel of a radix sort over the one root, the keys: the program becomes
+    /// `luma_key(i)`, the key loads of the kernel of `sort::fused_body`, whose own buffers come
+    /// before and after the inputs (see `launch::radix_pass`).
+    Radix(RadixPass),
+    /// The parts of a line solve (`solve::SolveSpec`): the roots are those of its parts that are
+    /// fused, in order. The program becomes `luma_cell(sys, i)`, which the kernel of
+    /// `solve::SolveSpec::body` reads the coefficients of every cell through (see
+    /// `launch::solve`).
+    Solve(SolveSpec),
+}
+
+impl Tail {
+    /// Whether the roots of a program with this tail are read by it and never stored, so that
+    /// they count as computed inside it (their nodes are fused, not evaluated).
+    pub(super) fn consumes_roots(self) -> bool {
+        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_) | Tail::Radix(_) | Tail::Solve(_))
+    }
 }
 
 /// Everything the source of a fused kernel depends on, and nothing it does not (buffers and
@@ -147,11 +190,17 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
     match instr.op.kind {
         OpKind::Unary(op) => df && op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains("df_")),
         OpKind::Binary(op) => df && op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains("df_")),
-        OpKind::Compare(_) | OpKind::Clamp => df,
+        OpKind::Compare(_) | OpKind::Clamp | OpKind::Powf => df,
         OpKind::Cast(to) => df || to == ElemTy::Df32,
         OpKind::Classify(_) => true,
         _ => false,
     }
+}
+
+/// Whether the WGSL of `instr` calls a function of the double-float math library
+/// (`builtin::DF_MATH_LIBRARY`): `exp`, `ln`, `tanh` and `powf` of a `Df32`.
+pub(super) fn calls_df_math(instr: &Instr) -> bool {
+    instr.op.ty == ElemTy::Df32 && matches!(instr.op.kind, OpKind::Unary(UnOp::Exp | UnOp::Ln | UnOp::Tanh) | OpKind::Powf)
 }
 
 /// Whether `instr` reads the guard uniform: the arithmetic and the casts, whose error-free
@@ -240,7 +289,15 @@ impl FusedKey {
             Tail::Store => format!("Fused({names}) {ty}"),
             Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => format!("FusedAssign({names}) {ty}"),
             Tail::Scatter { .. } | Tail::ParamScatter { .. } => format!("FusedPut({names}) {ty}"),
+            Tail::ScatterAdd { op, .. } => format!("FusedPut{op:?}({names}) {ty}"),
             Tail::Stack { .. } => format!("FusedStack({names}) {ty}"),
+            Tail::Matmul { .. } => format!("FusedMatmul({names}) {ty}"),
+            Tail::AxisReduce(pass) => {
+                let ops: Vec<String> = pass.ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
+                format!("FusedAxisReduce({}: {names}) {ty}", ops.join("+"))
+            }
+            Tail::Radix(_) => format!("FusedRadix({names}) {ty}"),
+            Tail::Solve(_) => format!("FusedSolve({names}) {ty}"),
             Tail::Reduce(ops) => {
                 let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
                 format!("FusedReduce({}: {names}) {ty}", ops.join("+"))
@@ -1045,6 +1102,15 @@ impl Plain {
     }
 }
 
+/// Notes the cut of each of `shared`, nodes evaluated before the expression of `root` because
+/// pending operations outside it read them too.
+fn note_shared(root: &Arc<Node>, shared: &[Arc<Node>]) {
+    let jit = root.context().jit();
+    for node in shared {
+        jit.note_split(node.name, node.location, SplitReason::Shared { weight: node.weight() as usize });
+    }
+}
+
 /// The nodes of `shared` that no other of them reads. Evaluating those first leaves the others
 /// without a reader outside the expression (what made them shared) once the readers that made
 /// them shared are evaluated: they are then computed inside those kernels, once, instead of in
@@ -1121,13 +1187,14 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
             .map(|(member, _)| Arc::clone(member))
             .collect();
         if !shared.is_empty() && !is_alone(root) && evaluation_fits(std::iter::once((root, args)), &shared) {
+            note_shared(root, &shared);
             force_group(&shared)?;
             continue;
         }
         let outputs = vec![u32::try_from(flat.instrs.len() - 1).unwrap_or(u32::MAX)];
         flat.instr_nodes = members.iter().map(|member| Some(Arc::clone(member))).chain(Some(Some(Arc::clone(root)))).collect();
         flat.fused_nodes = members;
-        if matches!(tail, Tail::Reduce(_)) {
+        if tail.consumes_roots() {
             flat.fused_nodes.push(Arc::clone(root));
         }
         return Ok(Some(flat.finish(tail, outputs)));
@@ -1378,6 +1445,12 @@ fn flatten_once(
             break (graph, root_at, passes, None);
         }
         let candidates = passes.members.iter().chain(&sub_members).filter(|&&at| !is_root(at)).map(|&at| &graph.items[at as usize].node);
+        // Requested nodes are cut too, but only the ones that pending operations outside the
+        // kernel read are shared.
+        if let Some((root, _)) = roots.first() {
+            let read_outside: Vec<Arc<Node>> = shared.iter().filter(|node| node.has_consumer_outside(inside)).cloned().collect();
+            note_shared(root, &read_outside);
+        }
         let forced = with_siblings(shared, candidates);
         force_group(&forced)?;
     };
@@ -1495,7 +1568,7 @@ fn emit_program(
     }
     let mut fused_items = std::mem::take(&mut flattener.fused_items);
     for &at in members {
-        if !root_at.contains(&at) || matches!(tail, Tail::Reduce(_)) {
+        if !root_at.contains(&at) || tail.consumes_roots() {
             fused_items.push(at);
         }
     }
@@ -1924,7 +1997,7 @@ pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<
     if let Some(&at) = key.outputs.iter().find(|&&at| at as usize >= key.instrs.len()) {
         return Err(format!("output {at} of {} instructions", key.instrs.len()));
     }
-    if matches!(key.tail, Tail::Scatter { .. }) && key.outputs.len() != 2 {
+    if matches!(key.tail, Tail::Scatter { .. } | Tail::ScatterAdd { .. }) && key.outputs.len() != 2 {
         return Err(format!("a scatter has {} outputs, not 2", key.outputs.len()));
     }
     if let Tail::Stack { total, first, block } = key.tail

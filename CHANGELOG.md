@@ -6,6 +6,15 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Breaking
+
+- Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) and `is_finite` / `is_nan` / `is_inf` return
+  `Array<Mask>` instead of `Array<u32>`; `select`, `sum_where` and `Fields::select` take
+  `&Array<Mask>`. Where a mask was used as a number, convert it with `.to_u32()` or `.to_f32()`
+  (`x.gt(0.0).to_f32()`). Masks passed to `select` or `sum_where` need no change. `sum`, `cumsum`,
+  `scan` and `sum_axis` of a mask array fail with `LumaError::Unsupported`: use `count()`,
+  `any()`, `all()` or convert first. See the migration chapter of the guide.
+
 ### Added
 
 - A user guide (`guide/`, an mdBook) published at <https://flipnoteman.github.io/Luma/> with a
@@ -13,6 +22,82 @@ All notable changes to Luma are listed here. The format follows
   writes, reductions and scans, records, loops, precision, integer and bit operations, custom
   kernels, a performance guide and worked examples (heat equation, Euler solver, ML-KEM, Keccak,
   CPA). Its code blocks are tested as doctests.
+- `Array<i32>`: `+ - * / %` (wrapping; `x / 0` is `x`, `i32::MIN / -1` is `i32::MIN`, `x % 0` is
+  0), unary minus, `abs`, `sign`, `& | ^ !`, arithmetic `<< >>`, `minimum` / `maximum`,
+  comparisons, `select`, views, reductions, scans and loops; `i32` scalars and `luma::Scalar<i32>`.
+- `Array<Df32>::exp`, `ln`, `tanh` and `powf(Df32)`: lazy, fused like the other `Df32` operations,
+  relative error below `1e-13` (at most `4.3e-14` measured) for `exp` on `[-55, 80]`, `ln` from
+  `1e-24` to `1e30` and near 1, `tanh` on `[-30, 30]` and `powf` of `x` in `[1, 3000]` or
+  `[1e-6, 1e6]` with exponents `-0.5..3`. `f64` arrays still have none of them.
+- Casts between `f32`, `u32` and `i32`: `to_f32` (from `u32`, `i32`), `to_u32` (from `f32`,
+  `i32`), `to_i32` (from `f32`, `u32`). Float to integer truncates toward zero and saturates
+  (`u32` at `4294967040`, `i32` at `-2147483648..=2147483520`); NaN becomes 0. `u32` and `i32`
+  convert by reinterpreting the bits.
+- `luma::Mask`, the element type of comparisons and classifications (`Mask::TRUE`, `Mask::FALSE`,
+  `From<bool>`, `From<Mask> for bool`): `& | ^ !`, `count()` (a `u32` array), `any()` and `all()`
+  (mask arrays), `to_u32()` and `to_f32()`, `min` / `max`, views, `select` and loops.
+- The fuzzer covers `i32`, masks and the new casts.
+- `matmul` (`a.matmul(&b)`, `luma::matmul`) for `f32`: tiled kernels (128x128 and 32x32 output
+  tiles, K split over workgroups when the output has few tiles); pending operands, transposes
+  included, are computed inside the kernel's loads instead of being stored first.
+- `Array::reduce_axis` (up to four of sum, min, max and sum of squares along an axis in one pass
+  over the data) and, for `f32`, `mean_axis`, `var_axis` (population variance, two-pass) and
+  `std_axis`.
+- `put_add`, `put_min` and `put_max` for `u32`, `i32` and `f32` arrays (`AtomicElem`): scatters
+  with atomic accumulation, accumulated per workgroup first for targets of up to 4096 elements;
+  `f32` sums are not bitwise reproducible. `bincount` and `Array<f32>::histogram`, whose bucket
+  expression fuses into the scatter.
+- `sort`, `sort_descending`, `argsort`, `argsort_descending` and `sort_axis` for `u32`, `i32` and
+  `f32` arrays (`SortKey`): a stable radix sort on the GPU, about 2 ms for 2^24 keys on an RTX 3090.
+  Floats sort in total order, NaNs last.
+- Group reductions `group_sum`, `group_min`, `group_max` (`u32`, `i32`, `f32`), `group_count`
+  and `group_mean` (`f32`): scatter-based, the values and codes fuse into one kernel; codes past
+  `groups` are skipped.
+- `factorize` (sorted distinct values and dense codes) and `unique` for `u32`, `i32` and `f32`;
+  all NaNs form one value, `-0.0` and `0.0` one value.
+- `quantile`, `median`, `quantile_axis` and `median_axis` for `f32` (NumPy's linear method, on
+  the sorted array).
+- `examples/bench_datasci.rs`: every primitive above against a hand-written WGSL kernel of the
+  same algorithm (`--gate` fails on a GPU-time ratio above the case's threshold).
+- `solve_block_tridiagonal_parts` and `_from`: the block-tridiagonal solve on parts, the entries
+  of the blocks and the components of the right-hand side as arrays of their own (the result is
+  `[Array<f32>; B]`). Lazy parts are computed inside the solver kernel, so no stack, no unstack and
+  no evaluation of the parts: a step from the expressions to the solution is one launch. Falls back
+  to the stacked solve when the expressions need more buffers than a kernel binds, for blocks of 6
+  to 8, when the Thomas solve is chosen and its scratch exceeds a buffer, and when a part
+  cannot be fused.
+- `solve_tridiagonal_parts` and `_from`: up to 64 independent scalar systems on one grid in one
+  launch, with lazy parts fused likewise. `solve_tridiagonal` already batched systems along an
+  extra axis (`[2, ni, nj]` along axis 1 or 2); this is now documented.
+- `examples/bench_solve.rs`: the block line solves against a hand-written cyclic reduction kernel
+  (parallel cyclic reduction with a closed-form 4x4 inverse), and the solves on parts against the
+  stacked forms.
+
+- `SplitReason::Shared`: profiles list the cuts where a pending expression that other pending
+  operations read too is stored instead of recomputed.
+
+### Changed
+
+- Fields that read each other at the element itself (`-a` next to `a`, a function of a field
+  next to the field) are evaluated in one multi-output kernel by `Fields::cache`, `eval_all`
+  and the other multi-array evaluations, also when their expressions read shifted ones. Only a
+  field another reads through a view (slice, shift, gather) is still computed first. A record of
+  stage data (several cached fields that depend on each other) took one kernel per dependency
+  level before.
+- `sum_axis`, `min_axis` and `max_axis` no longer evaluate a pending operand first: its expression
+  is computed inside the first pass of the reduction (scans still evaluate it).
+- The error of `slice_mut`, `flip_mut` or `transpose_mut` on a read-only view (an array made by
+  `slice`, `flip` or `transpose`) says that the array is a view of another one and that the
+  mutable view is taken on the array that owns the data, with the combined range.
+- The cyclic-reduction line solve (one workgroup per line, chosen for few, long lines) is up to
+  1.7x faster on blocks of 2 to 4: rows are held as `vec4`s in workgroup memory, the blocks of
+  2 to 4 are inverted from their cofactors instead of by elimination (a zero diagonal needs no
+  pivot; the block is scaled by its largest entry first, so any uniform magnitude solves), the `vec4`
+  coefficient buffers are read whole, and a workgroup has one invocation per row (rounded up to a
+  warp, capped at 256, or at 128 for blocks of 3 and 4 along a strided axis) instead of one per
+  eight (blocks of 2: one per two rows). 4x4 blocks, 70 lines of 144 rows on an
+  RTX 3090: 21 us to 13 us (a hand-written parallel cyclic reduction kernel takes 15 us). The
+  scratch of a line that does not fit workgroup memory holds `vec4` rows.
 
 ### Removed
 

@@ -21,6 +21,27 @@ fn main() -> Result<()> {
 }
 ```
 
+A table of data goes through the same API. Axis 0 varies fastest, so `[3, 4]` below is four rows of three
+features:
+
+```rs
+use luma::*;
+
+fn main() -> Result<()> {
+    let x = Array::from_slice(&[1.0f32, 2.0, 0.0, 2.0, 1.0, 1.0, 0.0, 0.0, 3.0, 4.0, 2.0, 1.0], [3, 4])?;
+    let gram = x.transpose().matmul(&x);              // XᵀX, [3, 3]; the transpose is read inside the kernel
+    let variance = x.var_axis(0);                      // per row, in two passes
+
+    let codes = Array::from_slice(&[0u32, 1, 0, 1], 4)?;
+    let price = Array::from_slice(&[10.0f32, 20.0, 30.0, 50.0], 4)?;
+    println!("{:?}", price.group_mean(&codes, 2).to_vec()?);   // [20.0, 35.0]
+    println!("{}", price.median().item()?);                    // 25
+    println!("{:?}", price.sort_descending().to_vec()?);       // [50.0, 30.0, 20.0, 10.0]
+    println!("{:?} {:?}", gram.shape(), variance.len());
+    Ok(())
+}
+```
+
 Similar to [ArrayFire](https://arrayfire.com), code is written with the familiarity of the ```Array``` interface. 
 Execution of operations is deferred until the host requires the result. Chains of elementwise operations are fused
 into a single kernel, and all intermediate work is batched on submission so the GPU doesn't waste time on many small, 
@@ -30,11 +51,12 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 
 ## Features
 
-- Arrays of `f32`, `u32`, `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
+- Arrays of `f32`, `u32`, `i32`, `Mask` (the boolean result of comparisons), `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; casts between `f32`, `u32` and `i32`; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
 - `vec2`/`vec4` element types and `luma::fields!` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Views: `slice` (`ViewMut` for writes), `pad`, `flip`, `transpose`, `take`, `put`, `concat`, `stack`, `broadcast_to`
-- Reductions: sum, min, max, mean, norm, along axes; `scan` / `cumsum`; `solve_tridiagonal`
+- Reductions: sum, min, max, mean, norm, along axes (`reduce_axis` computes several in one pass, with `mean_axis`, `var_axis`, `std_axis`); `scan` / `cumsum`; `solve_tridiagonal`
+- Data-science primitives: `matmul`; atomic scatters `put_add` / `put_min` / `put_max`, `bincount` and `histogram`; radix `sort`, `argsort`, `sort_axis`; `group_sum` / `group_mean` / `group_min` / `group_max` / `group_count`, `factorize` / `unique`; `quantile` and `median`. Pending operands are computed inside their kernels instead of being stored first
 - Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
@@ -121,6 +143,7 @@ cargo run --release --example bench_threads            # threads on one context 
 cargo run --release --example bench_build              # host cost of building and flattening expressions
 cargo run --release --example bench_pde                # views, assign/put, records, loops, scans, tridiagonal, Df32/f64
 cargo run --release --example keccak                   # Keccak-f, SHA3-256 and SHAKE128 in lazy array operations
+cargo run --release --example bench_datasci            # matmul, axis reductions, scatter, sort and group-by against hand-written WGSL kernels (--gate fails on a slower ratio)
 cargo run --release --example mlkem                    # ML-KEM (FIPS 203) KeyGen / Encaps / Decaps over batches, checked against RustCrypto and NIST vectors
 ```
 

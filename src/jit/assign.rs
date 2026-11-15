@@ -26,7 +26,7 @@ use crate::builtin::UnOp;
 use crate::context::Context;
 use crate::error::LumaError;
 
-use super::program::{flatten, Tail};
+use super::program::{flatten, AtomicOp, Tail};
 use super::{launch, lock, Args, Edge, ElemTy, Held, Node, Op, OpKind, ShiftKind, Src, ViewMap};
 
 /// One region of an array that `assign` overwrites.
@@ -485,8 +485,16 @@ pub(crate) fn assign(
     Ok(())
 }
 
+/// Targets of at most this many elements are accumulated in workgroup memory by an atomic scatter
+/// with enough elements (see [`PRIVATE_RATIO`]).
+const PRIVATE_BINS: usize = 4096;
+/// An atomic scatter accumulates privately when it has at least this many elements per target element.
+const PRIVATE_RATIO: usize = 16;
+
 /// `base[indices[i]] = values[i]` for `count` elements, skipping indices outside `base`, in one
-/// kernel. Duplicate indices: one of them wins.
+/// kernel. Duplicate indices: one of them wins. With `atomic`, the value is instead combined
+/// with the element by that op (atomically, so duplicates all count); `ty` is then `u32`, `i32`
+/// or `f32`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scatter(
     ctx: &Context,
@@ -497,6 +505,7 @@ pub(crate) fn scatter(
     count: usize,
     name: &'static str,
     location: &'static Location<'static>,
+    atomic: Option<AtomicOp>,
 ) -> Result<(), Failure> {
     if base.segments() != 1 {
         return Err(LumaError::Chunked("assigning into an array split over several buffers").into());
@@ -521,7 +530,11 @@ pub(crate) fn scatter(
     for store in &stores {
         store.fused.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let tail = Tail::Scatter { len: u32::try_from(base.len()).map_err(|_| LumaError::DimensionTooLarge { shape: [base.len(), 1, 1, 1] })? };
+    let len = u32::try_from(base.len()).map_err(|_| LumaError::DimensionTooLarge { shape: [base.len(), 1, 1, 1] })?;
+    let tail = match atomic {
+        None => Tail::Scatter { len },
+        Some(op) => Tail::ScatterAdd { len, op, private: base.len() <= PRIVATE_BINS && count / PRIVATE_RATIO >= base.len(), len_slot: None },
+    };
     let bases = [Arc::clone(base)];
 
     let run = || -> Result<(), Failure> {
@@ -535,6 +548,17 @@ pub(crate) fn scatter(
                 roots.push((Arc::clone(store), args));
             }
             let fused = flatten(&roots, tail)?;
+            // The target is bound as atomics, which a program cannot also read plainly.
+            if atomic.is_some() && fused.inputs.iter().any(|input| Arc::ptr_eq(input, base)) {
+                if forced {
+                    return Err(LumaError::Chunked("a scatter that reads its own target").into());
+                }
+                forced = true;
+                for store in &stores {
+                    evaluate_rhs(store)?;
+                }
+                continue;
+            }
             if launch::mapped_bindings(&fused.inputs, &bases) <= ctx.jit().max_inputs() + 1 {
                 return launch::run_mapped(ctx, fused, &bases, count);
             }

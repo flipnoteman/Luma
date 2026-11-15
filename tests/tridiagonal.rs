@@ -4,8 +4,8 @@ mod common;
 
 use common::{assert_close, values};
 use luma::{
-    solve_block_tridiagonal, solve_block_tridiagonal_from, solve_tridiagonal, solve_tridiagonal_from, Array, Context,
-    LumaError,
+    solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from,
+    solve_tridiagonal, solve_tridiagonal_from, solve_tridiagonal_parts, solve_tridiagonal_parts_from, Array, Context, LumaError,
 };
 
 /// Solves `m x = r` (`n x n`, row-major, `k` right-hand sides in `r`) by Gaussian elimination with
@@ -332,4 +332,162 @@ fn long_lines_of_every_parity_satisfy_their_equations() {
         }
         assert!(worst < 1e-4, "n {n}: residual {worst}");
     }
+}
+
+/// The entries of the blocks of `lo`, `diag`, `up` and the components of `rhs` (the host
+/// layout of the stacked API) as the parts of the parts API, as arrays of `grid`; every other part
+/// is an expression (`2 * half`).
+fn parts_of(ctx: &Context, grid: [usize; 2], b: usize, host: &[Vec<f32>; 4], lazy_every_other: bool) -> Vec<Array<f32>> {
+    let cells = grid[0] * grid[1];
+    let bb = b * b;
+    let mut parts = Vec::new();
+    for (which, width) in [(0, bb), (1, bb), (2, bb), (3, b)] {
+        for e in 0..width {
+            let lazy = lazy_every_other && (which * 7 + e) % 2 == 1;
+            let entry: Vec<f32> = (0..cells).map(|q| host[which][q * width + e] * if lazy { 0.5 } else { 1.0 }).collect();
+            let array = Array::from_slice_on(ctx, &entry, grid).unwrap();
+            parts.push(if lazy { &array * 2.0 } else { array });
+        }
+    }
+    parts
+}
+
+fn block_system(b: usize, cells: usize, seed: u64) -> [Vec<f32>; 4] {
+    let bb = b * b;
+    let mut diag = values(cells * bb, seed, -1.0, 1.0);
+    for q in 0..cells {
+        for i in 0..b {
+            diag[q * bb + i * b + i] += 8.0;
+        }
+    }
+    [values(cells * bb, seed + 1, -1.0, 1.0), diag, values(cells * bb, seed + 2, -1.0, 1.0), values(cells * b, seed + 3, -1.0, 1.0)]
+}
+
+#[test]
+fn block_parts_equal_the_stacked_solve() {
+    let ctx = Context::new().unwrap();
+    let grid = [30usize, 5];
+    for b in 1..=4usize {
+        let host = block_system(b, 150, 100 + b as u64);
+        for lazy in [false, true] {
+            let parts = parts_of(&ctx, grid, b, &host, lazy);
+            let refs: Vec<&Array<f32>> = parts.iter().collect();
+            let bb = b * b;
+            let stacked = |h: &Vec<f32>, width: usize| Array::from_slice_on(&ctx, h, [width, grid[0], grid[1]]).unwrap();
+            for axis in 0..2 {
+                let want = solve_block_tridiagonal(b, axis + 1, &stacked(&host[0], bb), &stacked(&host[1], bb), &stacked(&host[2], bb), &stacked(&host[3], b)).to_vec().unwrap();
+                let got = match b {
+                    1 => solve_block_tridiagonal_parts(axis, [refs[0]], [refs[1]], [refs[2]], [refs[3]]).map(|x| x.to_vec().unwrap()).to_vec(),
+                    2 => solve_block_tridiagonal_parts(axis, std::array::from_fn::<_, 4, _>(|k| refs[k]), std::array::from_fn::<_, 4, _>(|k| refs[4 + k]), std::array::from_fn::<_, 4, _>(|k| refs[8 + k]), [refs[12], refs[13]])
+                        .map(|x| x.to_vec().unwrap())
+                        .to_vec(),
+                    3 => solve_block_tridiagonal_parts(axis, std::array::from_fn::<_, 9, _>(|k| refs[k]), std::array::from_fn::<_, 9, _>(|k| refs[9 + k]), std::array::from_fn::<_, 9, _>(|k| refs[18 + k]), [refs[27], refs[28], refs[29]])
+                        .map(|x| x.to_vec().unwrap())
+                        .to_vec(),
+                    _ => solve_block_tridiagonal_parts(axis, std::array::from_fn::<_, 16, _>(|k| refs[k]), std::array::from_fn::<_, 16, _>(|k| refs[16 + k]), std::array::from_fn::<_, 16, _>(|k| refs[32 + k]), std::array::from_fn::<_, 4, _>(|k| refs[48 + k]))
+                        .map(|x| x.to_vec().unwrap())
+                        .to_vec(),
+                };
+                assert_eq!(got.len(), b);
+                for (c, component) in got.iter().enumerate() {
+                    let expected: Vec<f32> = (0..150).map(|q| want[q * b + c]).collect();
+                    assert_close(component, &expected, 1e-4, 1e-5);
+                }
+                let (host_x, residual) = reference(b, [30, 5, 1, 1], axis, &host[0], &host[1], &host[2], &host[3], None);
+                assert!(residual < 1e-9);
+                for (c, component) in got.iter().enumerate() {
+                    let expected: Vec<f32> = (0..150).map(|q| host_x[q * b + c]).collect();
+                    assert_close(component, &expected, 1e-4, 1e-5);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn block_parts_from_a_start_cell() {
+    let ctx = Context::new().unwrap();
+    let (b, grid) = (2usize, [30usize, 5]);
+    let host = block_system(b, 150, 7);
+    let parts = parts_of(&ctx, grid, b, &host, true);
+    let r: Vec<&Array<f32>> = parts.iter().collect();
+    let start: Vec<u32> = (0..5).map(|l| (l * 7 % 31) as u32).collect();
+    let start_a = Array::from_slice_on(&ctx, &start, 5).unwrap();
+    let got = solve_block_tridiagonal_parts_from(
+        0,
+        std::array::from_fn::<_, 4, _>(|k| r[k]),
+        std::array::from_fn::<_, 4, _>(|k| r[4 + k]),
+        std::array::from_fn::<_, 4, _>(|k| r[8 + k]),
+        [r[12], r[13]],
+        &start_a,
+    );
+    let (want, _) = reference(b, [30, 5, 1, 1], 0, &host[0], &host[1], &host[2], &host[3], Some(&start));
+    for (c, component) in got.iter().enumerate() {
+        let expected: Vec<f32> = (0..150).map(|q| want[q * b + c]).collect();
+        assert_close(&component.to_vec().unwrap(), &expected, 1e-4, 1e-5);
+    }
+}
+
+#[test]
+fn tridiagonal_parts_equal_separate_solves() {
+    let ctx = Context::new().unwrap();
+    let dims = [40usize, 7];
+    let (k, w) = (scalar_system(280, 1), scalar_system(280, 50));
+    let arr = |d: &[f32]| Array::from_slice_on(&ctx, d, dims).unwrap();
+    let (klo, kdiag, kup, krhs) = (arr(&k.lo), arr(&k.diag), arr(&k.up), arr(&k.rhs));
+    let (wlo, wdiag, wup, wrhs) = (arr(&w.lo), arr(&w.diag), arr(&w.up), arr(&w.rhs));
+    for axis in 0..2 {
+        // Lazy parts: nothing is evaluated before the solve.
+        let [x, y] = solve_tridiagonal_parts(axis, [(&(&klo * 1.0), &(&kdiag + 0.0), &kup, &(&krhs * 2.0)), (&wlo, &wdiag, &(&wup * 1.0), &wrhs)]);
+        let want_k = solve_tridiagonal(axis, &klo, &kdiag, &kup, &(&krhs * 2.0)).to_vec().unwrap();
+        let want_w = solve_tridiagonal(axis, &wlo, &wdiag, &wup, &wrhs).to_vec().unwrap();
+        assert_close(&x.to_vec().unwrap(), &want_k, 1e-4, 1e-5);
+        assert_close(&y.to_vec().unwrap(), &want_w, 1e-4, 1e-5);
+    }
+    let start = Array::from_slice_on(&ctx, &[0u32, 3, 40, 5, 39, 1, 100], 7).unwrap();
+    let [x, y] = solve_tridiagonal_parts_from(0, [(&klo, &kdiag, &kup, &krhs), (&wlo, &wdiag, &wup, &wrhs)], &start);
+    let want_k = solve_tridiagonal_from(0, &klo, &kdiag, &kup, &krhs, &start).to_vec().unwrap();
+    let want_w = solve_tridiagonal_from(0, &wlo, &wdiag, &wup, &wrhs, &start).to_vec().unwrap();
+    assert_close(&x.to_vec().unwrap(), &want_k, 1e-4, 1e-5);
+    assert_close(&y.to_vec().unwrap(), &want_w, 1e-4, 1e-5);
+}
+
+/// A scalar solve of an array with a batch axis (`[2, ni, nj]` along axis 1 or 2) solves every
+/// batch element's lines on its own.
+#[test]
+fn scalar_solve_batches_over_a_leading_axis() {
+    let ctx = Context::new().unwrap();
+    let (ni, nj) = (30usize, 9usize);
+    let cells = 2 * ni * nj;
+    let sys = scalar_system(cells, 3);
+    let arr = |d: &[f32]| Array::from_slice_on(&ctx, d, [2, ni, nj]).unwrap();
+    let (lo, diag, up, rhs) = (arr(&sys.lo), arr(&sys.diag), arr(&sys.up), arr(&sys.rhs));
+    for axis in 1..=2usize {
+        let got = solve_tridiagonal(axis, &lo, &diag, &up, &rhs).to_vec().unwrap();
+        let (want, residual) = reference(1, [2, ni, nj, 1], axis, &sys.lo, &sys.diag, &sys.up, &sys.rhs, None);
+        assert!(residual < 1e-9);
+        assert_close(&got, &want, 1e-4, 1e-5);
+    }
+}
+
+#[test]
+fn parts_errors_poison_every_result() {
+    let ctx = Context::new().unwrap();
+    let a = Array::from_slice_on(&ctx, &values(40 * 7, 1, 1.0, 2.0), [40, 7]).unwrap();
+    let other = Array::from_slice_on(&ctx, &values(40 * 6, 1, 1.0, 2.0), [40, 6]).unwrap();
+    let [x, y] = solve_tridiagonal_parts(0, [(&a, &a, &a, &a), (&a, &other, &a, &a)]);
+    for r in [x, y] {
+        let err = r.to_vec().unwrap_err();
+        assert!(matches!(err.root(), LumaError::ShapeMismatch { .. }), "{err}");
+    }
+    let [x] = solve_tridiagonal_parts(4, [(&a, &a, &a, &a)]);
+    assert!(matches!(x.to_vec().unwrap_err().root(), LumaError::InvalidShape(_)));
+    // A poisoned part reports its own error.
+    let bad = solve_tridiagonal(0, &a, &other, &a, &a);
+    let [x] = solve_tridiagonal_parts(0, [(&a, &a, &a, &bad)]);
+    assert!(matches!(x.to_vec().unwrap_err().root(), LumaError::ShapeMismatch { .. }));
+    // Blocks: four dimensions.
+    let four = Array::from_slice_on(&ctx, &values(16, 1, 1.0, 2.0), [2, 2, 2, 2]).unwrap();
+    let [x, _] = solve_block_tridiagonal_parts(0, [&four; 4], [&four; 4], [&four; 4], [&four; 2]);
+    assert!(matches!(x.to_vec().unwrap_err().root(), LumaError::InvalidShape(_)));
 }

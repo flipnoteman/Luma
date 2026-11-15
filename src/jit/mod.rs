@@ -52,6 +52,9 @@
 //!   the program: the other fields of a record, see `program::with_siblings`), so that a residual
 //!   that a step update and a convergence norm both read is one multi-output kernel, not its
 //!   first field alone and then every shared intermediate of the others, level by level.
+//!   Arrays evaluated together (`eval_all`, `Fields::cache`) that read one another at the element
+//!   itself are one multi-output kernel too; one that another reads through a view is computed
+//!   first, since the reader would recompute it at every index it reads.
 //! * A view or gather (slice, pad, flip, transpose, `take`, broadcast) of a pending expression
 //!   that fits one buffer reads it lazily, as a sub-program computed at the read index, whatever
 //!   its size and however often it is read. The kernel computes every (expression, index) pair
@@ -183,8 +186,9 @@ use crate::profile::{FusionSplit, SplitReason};
 use inline::{inline, Judgement, Lowered, Verdict};
 use looped::LoopPlan;
 use program::Instr;
+pub(crate) use program::AtomicOp;
 
-pub(crate) use launch::{check_finite, evaluate, evaluate_group, evaluate_into, force_group, reduce_first_pass, run_loop};
+pub(crate) use launch::{axis_reduce, check_finite, evaluate, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, run_loop, solve, MatmulKernel, MatmulSide, PartSide};
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};
@@ -259,6 +263,9 @@ pub fn fusion_limit<R>(max_nodes: usize, f: impl FnOnce() -> R) -> R {
 pub(crate) enum ElemTy {
     F32,
     U32,
+    I32,
+    /// A boolean stored as a `u32` holding 0 or 1 ([`crate::Mask`]).
+    Mask,
     /// 64-bit float (needs `wgpu::Features::SHADER_F64`).
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
@@ -266,20 +273,37 @@ pub(crate) enum ElemTy {
 }
 
 impl ElemTy {
-    pub(crate) fn of<T: ScalarType>() -> std::result::Result<ElemTy, LumaError> {
-        match T::wgsl_type() {
-            "f32" => Ok(ElemTy::F32),
-            "u32" => Ok(ElemTy::U32),
-            "f64" => Ok(ElemTy::F64),
-            "vec2<f32>" => Ok(ElemTy::Df32),
-            other => Err(LumaError::InvalidShape(format!("Unsupported element type {other}"))),
+    /// The element type of the built-in arithmetic, if `T` is one. The one table that maps Rust
+    /// types to `ElemTy`.
+    pub(crate) fn try_of<T: 'static>() -> Option<ElemTy> {
+        use std::any::TypeId;
+        let id = TypeId::of::<T>();
+        if id == TypeId::of::<f32>() {
+            Some(ElemTy::F32)
+        } else if id == TypeId::of::<u32>() {
+            Some(ElemTy::U32)
+        } else if id == TypeId::of::<i32>() {
+            Some(ElemTy::I32)
+        } else if id == TypeId::of::<crate::gpu_type::Mask>() {
+            Some(ElemTy::Mask)
+        } else if id == TypeId::of::<f64>() {
+            Some(ElemTy::F64)
+        } else if id == TypeId::of::<crate::gpu_type::Df32>() {
+            Some(ElemTy::Df32)
+        } else {
+            None
         }
+    }
+
+    pub(crate) fn of<T: ScalarType>() -> std::result::Result<ElemTy, LumaError> {
+        Self::try_of::<T>().ok_or_else(|| LumaError::InvalidShape(format!("Unsupported element type {}", T::wgsl_type())))
     }
 
     pub(crate) fn wgsl(self) -> &'static str {
         match self {
             ElemTy::F32 => "f32",
-            ElemTy::U32 => "u32",
+            ElemTy::U32 | ElemTy::Mask => "u32",
+            ElemTy::I32 => "i32",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "vec2<f32>",
         }
@@ -288,7 +312,7 @@ impl ElemTy {
     /// Bytes per element.
     pub(crate) fn bytes(self) -> u64 {
         match self {
-            ElemTy::F32 | ElemTy::U32 => 4,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => 4,
             ElemTy::F64 | ElemTy::Df32 => 8,
         }
     }
@@ -296,7 +320,7 @@ impl ElemTy {
     /// How many `f32` uniform slots a scalar of this type takes (see `Flattener::operand`).
     pub(crate) fn slots(self) -> usize {
         match self {
-            ElemTy::F32 | ElemTy::U32 => 1,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => 1,
             ElemTy::Df32 => 2,
             ElemTy::F64 => 3,
         }
@@ -307,6 +331,8 @@ impl ElemTy {
         match self {
             ElemTy::F32 => "f32",
             ElemTy::U32 => "u32",
+            ElemTy::I32 => "i32",
+            ElemTy::Mask => "mask",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "Df32",
         }
@@ -318,9 +344,9 @@ impl ElemTy {
 pub(crate) enum OpKind {
     Unary(UnOp),
     Binary(BinOp),
-    /// Comparison; the result is a `u32` mask.
+    /// Comparison; the result is a [`ElemTy::Mask`].
     Compare(CmpOp),
-    /// Whether the floating-point operand is finite, infinite or `NaN`; the result is a `u32` mask.
+    /// Whether the floating-point operand is finite, infinite or `NaN`; the result is a [`ElemTy::Mask`].
     Classify(Class),
     /// `pow(x, exponent)`; operands: x, exponent (a scalar).
     Powf,
@@ -560,7 +586,7 @@ impl Op {
 
     pub(crate) fn out_ty(self) -> ElemTy {
         match self.kind {
-            OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::U32,
+            OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::Mask,
             OpKind::Cast(to) => to,
             _ => self.ty,
         }
@@ -570,7 +596,8 @@ impl Op {
     pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
         match (self.kind, index) {
             (OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. }), 1) => self.ty,
-            (OpKind::Select, 0) | (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
+            (OpKind::Select, 0) => ElemTy::Mask,
+            (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
             (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal | Gen::RangePow2), _) => ElemTy::U32,
             _ => self.ty,
         }
@@ -616,7 +643,7 @@ impl Scalar {
     /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32`.
     pub(crate) fn words(self) -> [u32; 3] {
         match self.ty {
-            ElemTy::F32 | ElemTy::U32 => [self.bits as u32, 0, 0],
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Mask => [self.bits as u32, 0, 0],
             ElemTy::Df32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
             ElemTy::F64 => {
                 let v = f64::from_bits(self.bits);
@@ -1521,17 +1548,20 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 }
 
 /// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
-/// no transcendental functions (and needs a device with 64-bit shader floats), `Df32` only the
-/// operations of its library, and neither has generators or `powf`; the bitwise operations only
-/// exist for `u32`, and `u32` has no negation.
+/// no transcendental functions or `powf` (and needs a device with 64-bit shader floats), `Df32`
+/// only the operations of its library, and neither has generators; the bitwise operations only
+/// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
+/// no float math. Masks have no generators (their values would not be 0 or 1).
 fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(), LumaError> {
     let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32);
     let exists = match op.kind {
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
         OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
-        OpKind::Classify(_) => op.ty != ElemTy::U32,
-        OpKind::Powf | OpKind::Generate(_) => !wide,
+        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Mask),
+        OpKind::Powf => op.ty != ElemTy::F64,
+        // A mask holds only 0 or 1, which no ramp or counter keeps.
+        OpKind::Generate(_) => !wide && op.ty != ElemTy::Mask,
     };
     if !exists {
         return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", op.ty.display())));

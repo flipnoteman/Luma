@@ -52,6 +52,7 @@ and source line where an expression was cut, and the
 | `Scalars` | the scalar operands do not fit one uniform buffer |
 | `Inlined` | views of lazy expressions unfolded into more instructions than the device's cap |
 | `Materialised` | the [cost model](#the-cost-model) estimates that storing an expression once is cheaper than recomputing it at each read |
+| `Shared` | an expression that other pending operations outside the kernel read too is stored once instead of recomputed in each |
 
 ```rust
 use luma::*;
@@ -127,7 +128,26 @@ is recomputed, staged, or evaluated first.
 ## What fuses, and what cuts
 
 Fused: elementwise operations, comparisons, `select`, casts, generators, views, compound
-assignment, the input and the epilogue of a reduction ([Lazy evaluation](lazy.md#what-fuses)).
+assignment, the input and the epilogue of a reduction ([Lazy evaluation](lazy.md#what-fuses)),
+and, in the primitives below, the expressions they read.
+
+### Primitives that read an expression
+
+These need a kernel of their own, but a pending operand is not stored first: its expression
+becomes the load of that kernel.
+
+| Primitive | Computed inside the kernel | When it runs |
+| --- | --- | --- |
+| `matmul` | each pending operand (a transpose included) is computed in the tile loads | eager: the product is recorded when called and returned evaluated, so what reads it is another kernel |
+| `sum_axis`, `min_axis`, `max_axis`, `reduce_axis`, `mean_axis`, `var_axis`, `std_axis` | the operand, in the first pass over the data | eager: the result is evaluated when the call returns |
+| `put_add`, `put_min`, `put_max`, `bincount`, `histogram`, `group_*` | the value and the index (or code, or bucket) expressions of the scatter | an in-place write, like `put` |
+| `sort`, `argsort`, `sort_axis` and what builds on them (`quantile`, `median`, `factorize`, `unique`) | the key expression, in the first pass of the radix sort | eager: the sorted array is evaluated; `factorize` and `unique` also read the number of distinct values back, one host wait |
+
+An operand that reads circular `shift`s of other expressions, or lives in several buffers, is
+evaluated first instead. `scan` and `cumsum` always evaluate their operand (they read it twice).
+Because these results are evaluated at the call, a loop that calls them every step builds one
+kernel per call rather than one fused chain: count launches with `ctx.profile(..)`. Usage is in
+[Matrices, statistics and grouping](data.md): [`matmul`](data.md#matrix-products), [axis statistics](data.md#statistics-along-an-axis), [scatters](data.md#accumulating-scatters), [sorting](data.md#sorting).
 
 An expression is cut when it passes a limit. They are generous, and a cut costs a launch and a trip
 through memory, not correctness:
@@ -146,8 +166,8 @@ share work with it), and the rest is flattened again. A kernel that reads many d
 (the 50 words of a Keccak state) is the one that meets the input limit; keep such loops in
 `iterate_all`, or split them in the source.
 
-Never fused, because they need whole-array structure: `scan`, axis reductions, tridiagonal solves,
-FFT convolution, and custom kernels. They read computed arrays.
+Never fused, because they need whole-array structure: `scan`, tridiagonal solves, FFT
+convolution, and custom kernels. They read computed arrays.
 
 ## Caches
 

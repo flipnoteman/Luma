@@ -19,13 +19,14 @@ use std::sync::Arc;
 use wgpu::Buffer;
 
 use crate::array::{Array, Failure};
-use crate::builtin::BinOp;
+use crate::builtin::{BinOp, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::ScalarType;
-use crate::jit::{operator_source, ElemTy, Operator};
+use crate::jit::{self, operator_source, ElemTy, Node, Operator};
 use crate::kernel::KernelCore;
-use crate::ops::{fold_workgroups, workgroups_1d, Outcome, Rhs};
+use crate::ops::{fold_workgroups, Outcome, Rhs};
+use crate::reduce::Reduction;
 use crate::shape::Shape;
 
 // Measured on an RTX 3090 (`bench_pde --only scan` and `reduce/sum_axis`, 2^26 `f32`): every
@@ -58,8 +59,9 @@ const TARGET_THREADS: u64 = 1 << 20;
 /// Fewest cells of a line one invocation of a blocked strided pass walks.
 const MIN_BLOCK: u32 = 16;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pass {
+/// One kernel of the scans and reductions along an axis.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Pass {
     /// Strided lines, one invocation per line: the inclusive scan of the whole line.
     Seq,
     /// Strided lines, one invocation per block (`block * lines + line`): the fold of the block
@@ -105,6 +107,227 @@ impl Pass {
     fn seeded(self) -> bool {
         matches!(self, Pass::Walk | Pass::ChunkScan { seeded: true })
     }
+}
+
+/// A reducing [`Pass`]: the kernels of `reduce_axis`, which the buffer path of this module and the
+/// fused kernels of `jit` (`Tail::AxisReduce`) both generate with [`reduce_body`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct AxisPass {
+    /// `Fold`, `Rows { fold: true, .. }` or `ChunkReduce`.
+    pub(crate) pass: Pass,
+    /// The reductions, computed together from one read of every cell.
+    pub(crate) ops: ReduceList,
+    /// The cells are the partial results of an earlier pass: op `j` reads its own `p.n * p.lines`
+    /// cells, which start at `j * p.n * p.lines`. Otherwise every op reads the same cells.
+    pub(crate) partial: bool,
+    /// Op `j` writes its own buffer `out{j}` (the last pass of several ops). Otherwise it writes
+    /// `out[j * count + i]` of the one buffer `out`, `count` being the results per op.
+    pub(crate) split: bool,
+    /// A `Fold` that leaves several partial results per line writes them line-major, `out[l * nb + b]`
+    /// instead of `out[b * lines + l]`, so that the next pass is a contiguous reduction of
+    /// lines of `nb` cells (see [`line_major`]).
+    pub(crate) line_major: bool,
+}
+
+/// Whether the `Fold` of `nb` blocks per line writes line-major partial results: when one
+/// workgroup of the contiguous pass reduces a whole line of them, that pass is the last.
+fn line_major(pass: Pass, nb: u32) -> bool {
+    pass == Pass::Fold && nb > 1 && nb <= REDUCE_CHUNK
+}
+
+/// The fields of the `Params` uniform of every reducing pass: the geometry of [`Lines`].
+pub(crate) const AXIS_PARAMS: &str = "n: u32, stride: u32, lines: u32, nb: u32, k: u32, ";
+
+impl AxisPass {
+    /// The profile label of the kernel.
+    pub(crate) fn label(self) -> &'static str {
+        match self.pass {
+            Pass::Fold => "ReduceFold",
+            pass => pass.label(),
+        }
+    }
+
+    /// How many buffers the pass writes (`@binding(0..)`).
+    pub(crate) fn outputs(self) -> usize {
+        if self.split { self.ops.as_slice().len() } else { 1 }
+    }
+
+    /// The declarations of the output buffers, of elements of `ty`.
+    pub(crate) fn output_bindings(self, ty: &str) -> String {
+        let mut src = String::new();
+        for j in 0..self.outputs() {
+            let name = if self.split { format!("out{j}") } else { "out".to_owned() };
+            let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{ty}>;");
+        }
+        src
+    }
+}
+
+/// The kernel of `pass` over a buffer `a`.
+fn reduce_source(pass: AxisPass, ty: &str, workgroup: u32) -> String {
+    let outputs = pass.outputs();
+    let mut src = format!("struct Params {{ {AXIS_PARAMS}}}\n{}", pass.output_bindings(ty));
+    let _ = writeln!(src, "@group(1) @binding({outputs}) var<storage, read> a: array<{ty}>;");
+    let _ = writeln!(src, "@group(1) @binding({}) var<uniform> p: Params;", outputs + 1);
+    let _ = writeln!(src, "fn ld(q: u32) -> {ty} {{ return a[q]; }}");
+    src.push_str(&reduce_body(pass, ty, "ld", workgroup));
+    src
+}
+
+/// `line_base`, the combine functions `c{j}` and the entry point of the reducing pass, with the
+/// cells of the operand from `{load}(q)`. Needs `Params` (see [`AXIS_PARAMS`]) as `p` and the
+/// output buffers of [`AxisPass::output_bindings`]. The combine of an op is that of the whole
+/// array reductions (`ReduceElem::combine`), so a NaN is handled as `Array::min` and `max` do;
+/// `SumSquares` squares the cells it reads.
+pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) -> String {
+    let elem = ReduceElem::Plain(ty);
+    let ops = pass.ops.as_slice();
+    let mut src = String::from("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
+    for (j, &op) in ops.iter().enumerate() {
+        let _ = writeln!(src, "fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {}; }}", elem.combine(op));
+    }
+    let cin = if pass.partial { "    let cin = p.n * p.lines;\n" } else { "" };
+    // The statement binding the cell at `q`: `{name}` for all ops, or `{name}{j}` for op `j`.
+    let read = |name: &str, q: &str| -> String {
+        if pass.partial {
+            (0..ops.len()).map(|j| format!("let {name}{j} = {load}({j}u * cin + {q});")).collect::<Vec<_>>().join(" ")
+        } else {
+            format!("let {name} = {load}({q});")
+        }
+    };
+    let cell = |name: &str, j: usize| if pass.partial { format!("{name}{j}") } else { name.to_owned() };
+    let mapped = |j: usize, cell: String| if ops[j] == ReduceOp::SumSquares { elem.square(&cell) } else { cell };
+    let store = |j: usize, at: &str, count: &str, value: String| {
+        if pass.split { format!("out{j}[{at}] = {value};") } else { format!("out[{j}u * {count} + {at}] = {value};") }
+    };
+    let w = WORKGROUP;
+    match pass.pass {
+        Pass::Fold => {
+            let _ = write!(
+                src,
+                "@compute @workgroup_size({workgroup})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let i = gid.x + gid.y * nwg.x * {workgroup}u;
+    if (i >= p.lines * p.nb) {{ return; }}
+    let l = i % p.lines;
+    let b = i / p.lines;
+    let base = line_base(l);
+    let s0 = b * p.k;
+    let s1 = min(p.n, s0 + p.k);
+{cin}    {}
+",
+                read("f", "base + s0 * p.stride")
+            );
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "    var acc{j} = {};", mapped(j, cell("f", j)));
+            }
+            let _ = writeln!(src, "    for (var s = s0 + 1u; s < s1; s++) {{\n        {}", read("e", "base + s * p.stride"));
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "        acc{j} = c{j}(acc{j}, {});", mapped(j, cell("e", j)));
+            }
+            src.push_str("    }\n");
+            for j in 0..ops.len() {
+                let at = if pass.line_major { "l * p.nb + b" } else { "i" };
+                let _ = writeln!(src, "    {}", store(j, at, "p.lines * p.nb", format!("acc{j}")));
+            }
+            src.push_str("}\n");
+        }
+        Pass::Rows { width, .. } => {
+            let _ = writeln!(src, "var<workgroup> tile: array<{ty}, {ROWS_TILE}>;");
+            let _ = write!(
+                src,
+                "@compute @workgroup_size({width})
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let first = (wg.x + wg.y * nwg.x) * p.nb;
+    if (first >= p.lines) {{ return; }}
+    let cnt = min(p.nb, p.lines - first);
+    let pitch = p.n | 1u;
+    let base = first * p.n;
+    let cells = cnt * p.n;
+{cin}"
+            );
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "    var acc{j}: {ty};");
+            }
+            // Staged cells are shared by all ops, but the partial results of every op are their
+            // own cells: those take a round each through the one tile.
+            let rounds: Vec<Vec<usize>> = if pass.partial { (0..ops.len()).map(|j| vec![j]).collect() } else { vec![(0..ops.len()).collect()] };
+            for (r, round) in rounds.iter().enumerate() {
+                let offset = if pass.partial { format!("{r}u * cin + ") } else { String::new() };
+                let _ = write!(
+                    src,
+                    "    for (var j = t; j < cells; j += {width}u) {{
+        let row = j / p.n;
+        tile[row * pitch + (j - row * p.n)] = {load}({offset}base + j);
+    }}
+    workgroupBarrier();
+    if (t < cnt) {{
+        let row = t * pitch;
+"
+                );
+                for &j in round {
+                    let _ = writeln!(src, "        acc{j} = {};", mapped(j, "tile[row]".to_owned()));
+                }
+                src.push_str("        for (var s = 1u; s < p.n; s++) {\n");
+                for &j in round {
+                    let _ = writeln!(src, "            acc{j} = c{j}(acc{j}, {});", mapped(j, "tile[row + s]".to_owned()));
+                }
+                src.push_str("        }\n    }\n");
+                if r + 1 < rounds.len() {
+                    src.push_str("    workgroupBarrier();\n");
+                }
+            }
+            src.push_str("    if (t < cnt) {\n");
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "        {}", store(j, "first + t", "p.lines", format!("acc{j}")));
+            }
+            src.push_str("    }\n}\n");
+        }
+        Pass::ChunkReduce => {
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "var<workgroup> part{j}: array<{ty}, {w}>;");
+            }
+            let _ = write!(
+                src,
+                "@compute @workgroup_size({w})
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let wid = wg.x + wg.y * nwg.x;
+    if (wid >= p.lines * p.nb) {{ return; }}
+    let l = wid / p.nb;
+    let c = wid - l * p.nb;
+    let base = line_base(l);
+{cin}    let s0 = c * {REDUCE_CHUNK}u;
+    let s1 = min(p.n, s0 + {REDUCE_CHUNK}u);
+"
+            );
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "    var acc{j}: {ty};");
+            }
+            let _ = writeln!(src, "    var s = s0 + t;\n    if (s < s1) {{\n        {}", read("f", "base + s"));
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "        acc{j} = {};", mapped(j, cell("f", j)));
+            }
+            let _ = writeln!(src, "        s += {w}u;\n        for (; s < s1; s += {w}u) {{\n            {}", read("e", "base + s"));
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "            acc{j} = c{j}(acc{j}, {});", mapped(j, cell("e", j)));
+            }
+            src.push_str("        }\n    }\n");
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "    part{j}[t] = acc{j};");
+            }
+            let _ = writeln!(src, "    let valid = min({w}u, s1 - s0);\n    for (var d = {w}u / 2u; d > 0u; d >>= 1u) {{\n        workgroupBarrier();\n        if (t < d && t + d < valid) {{");
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "            part{j}[t] = c{j}(part{j}[t], part{j}[t + d]);");
+            }
+            src.push_str("        }\n    }\n    if (t == 0u) {\n");
+            for j in 0..ops.len() {
+                let _ = writeln!(src, "        {}", store(j, "wid", "p.lines * p.nb", format!("part{j}[0]")));
+            }
+            src.push_str("    }\n}\n");
+        }
+        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } => unreachable!("scans are not reductions"),
+    }
+    src
 }
 
 fn source(pass: Pass, ty: &str, op: &Operator, workgroup: u32) -> String {
@@ -199,7 +422,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
     let c = wid - l * p.nb;
     let base = line_base(l);
 ";
-    if let Pass::Rows { fold, width } = pass {
+    if let Pass::Rows { width, .. } = pass {
         let (tile, r) = (ROWS_TILE, width);
         let _ = writeln!(src, "var<workgroup> tile: array<{ty}, {tile}>;");
         src.push_str(&format!(
@@ -222,51 +445,18 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
         acc = tile[row];
         for (var s = 1u; s < p.n; s++) {{
             acc = op(acc, tile[row + s]);
-            {store}
+            tile[row + s] = acc;
         }}
     }}
-",
-            store = if fold { "" } else { "tile[row + s] = acc;" }
-        ));
-        if fold {
-            src.push_str("    if (t < cnt) { out[first + t] = acc; }\n}\n");
-        } else {
-            src.push_str(&format!(
-                "    workgroupBarrier();
+    workgroupBarrier();
     for (var j = t; j < cells; j += {r}u) {{
         let r = j / p.n;
         out[base + j] = tile[r * ld + (j - r * p.n)];
     }}
 }}
 "
-            ));
-        }
-        return src;
-    }
-    if pass == Pass::ChunkReduce {
-        let _ = writeln!(src, "var<workgroup> part: array<{ty}, {w}>;");
-        src.push_str(head);
-        src.push_str(&format!(
-            "    let s0 = c * {REDUCE_CHUNK}u;
-    let s1 = min(p.n, s0 + {REDUCE_CHUNK}u);
-    var acc: {ty};
-    var s = s0 + t;
-    if (s < s1) {{
-        acc = a[base + s];
-        s += {w}u;
-        for (; s < s1; s += {w}u) {{ acc = op(acc, a[base + s]); }}
-    }}
-    part[t] = acc;
-    let valid = min({w}u, s1 - s0);
-    for (var d = {w}u / 2u; d > 0u; d >>= 1u) {{
-        workgroupBarrier();
-        if (t < d && t + d < valid) {{ part[t] = op(part[t], part[t + d]); }}
-    }}
-    if (t == 0u) {{ out[wid] = part[0]; }}
-}}
-"
         ));
-        return src.replace("__W__", &w.to_string());
+        return src;
     }
     let k = PER_THREAD;
     let tile = SCAN_CHUNK + SCAN_CHUNK / 32 + 1;
@@ -341,19 +531,37 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
 }
 
 /// The kernels of one operator and what they run on.
-struct Lines<'a> {
+pub(crate) struct Lines<'a> {
     ctx: &'a Context,
     op: &'a Operator,
     scratch: Scratch<'a>,
     cores: Vec<(Pass, Arc<KernelCore>)>,
+    reduce_cores: Vec<(AxisPass, Arc<KernelCore>)>,
     ty: &'static str,
 }
 
 /// A buffer and the bytes bound of it.
 #[derive(Clone, Copy)]
-struct Bound<'b> {
-    buffer: &'b Buffer,
-    bytes: u64,
+pub(crate) struct Bound<'b> {
+    pub(crate) buffer: &'b Buffer,
+    pub(crate) bytes: u64,
+}
+
+/// The lines a reduction runs over: `lines` lines of `n` cells, `stride` apart.
+#[derive(Clone, Copy)]
+struct Cells {
+    n: u32,
+    stride: u32,
+    lines: u32,
+}
+
+/// What the first pass of a reduction reads its cells from.
+#[derive(Clone, Copy)]
+enum Input<'b> {
+    Buffer(Bound<'b>),
+    /// A lazy expression: computed inside the pass when it can be (see [`jit::axis_reduce`]),
+    /// else evaluated into a buffer first.
+    Pending(&'b Arc<Node>),
 }
 
 /// The cells one invocation walks in a blocked pass over strided lines, or `None` when the lines
@@ -378,7 +586,21 @@ fn rows_per_group(n: u32) -> u32 {
     (ROWS_TILE / (n | 1)).min(rows_width(n))
 }
 
+/// The operator `+` on `u32`, for [`Lines::words`].
+pub(crate) fn add_operator(ctx: &Context) -> Outcome<Operator> {
+    Array::<u32>::alloc(ctx, Shape::from(1usize))?.trace_operator(&add)
+}
+
 impl<'a> Lines<'a> {
+    fn new(ctx: &'a Context, op: &'a Operator, ty: &'static str) -> Self {
+        Lines { ctx, op, scratch: Scratch::new(ctx), cores: Vec::new(), reduce_cores: Vec::new(), ty }
+    }
+
+    /// The scan kernels of `op`, which must be [`add_operator`] or another operator on `u32`.
+    pub(crate) fn words(ctx: &'a Context, op: &'a Operator) -> Self {
+        Lines::new(ctx, op, "u32")
+    }
+
     fn core(&mut self, pass: Pass) -> Result<Arc<KernelCore>> {
         if let Some((_, core)) = self.cores.iter().find(|(p, _)| *p == pass) {
             return Ok(Arc::clone(core));
@@ -387,6 +609,31 @@ impl<'a> Lines<'a> {
         let core = self.ctx.jit().stencil_kernel(self.ctx, source(pass, self.ty, self.op, workgroup), pass.label())?;
         self.cores.push((pass, Arc::clone(&core)));
         Ok(core)
+    }
+
+    fn reduce_core(&mut self, pass: AxisPass) -> Result<Arc<KernelCore>> {
+        if let Some((_, core)) = self.reduce_cores.iter().find(|(p, _)| *p == pass) {
+            return Ok(Arc::clone(core));
+        }
+        let workgroup = self.ctx.tuning().elementwise_workgroup;
+        let core = self.ctx.jit().stencil_kernel(self.ctx, reduce_source(pass, self.ty, workgroup), pass.label())?;
+        self.reduce_cores.push((pass, Arc::clone(&core)));
+        Ok(core)
+    }
+
+    /// The workgroups of `pass` over lines of the `geometry` and the `luma.size` of the launch.
+    fn grid(&self, pass: Pass, geometry: [u32; 5]) -> Result<([u32; 3], [u32; 3])> {
+        let (lines, nb) = (geometry[2], geometry[3]);
+        let groups = match pass {
+            Pass::Rows { .. } => lines.div_ceil(nb),
+            _ if pass.per_workgroup() => lines.checked_mul(nb).ok_or(LumaError::InvalidShape("too many chunks".into()))?,
+            _ => {
+                let count = if pass == Pass::Seq { lines } else { lines * nb };
+                let workgroups = fold_workgroups(self.ctx, count.div_ceil(self.ctx.tuning().elementwise_workgroup))?;
+                return Ok((workgroups, [count, 1, 1]));
+            }
+        };
+        Ok((fold_workgroups(self.ctx, groups)?, [groups, 1, 1]))
     }
 
     fn launch(
@@ -405,20 +652,42 @@ impl<'a> Lines<'a> {
             args.push(RawArg::read(pre.buffer, pre.bytes));
         }
         args.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
-        let (lines, nb) = (geometry[2], geometry[3]);
-        if let Pass::Rows { .. } = pass {
-            let groups = lines.div_ceil(nb);
-            return self.ctx.launch(&core, fold_workgroups(self.ctx, groups)?, [groups, 1, 1], &args);
-        }
-        if pass.per_workgroup() {
-            let groups = lines
-                .checked_mul(nb)
-                .ok_or(LumaError::InvalidShape("too many chunks".into()))?;
-            return self.ctx.launch(&core, fold_workgroups(self.ctx, groups)?, [groups, 1, 1], &args);
-        }
-        let count = if pass == Pass::Seq { lines } else { lines * nb };
-        let workgroups = workgroups_1d(self.ctx, &core, count)?;
-        self.ctx.launch(&core, workgroups, [count, 1, 1], &args)
+        let (workgroups, size) = self.grid(pass, geometry)?;
+        self.ctx.launch(&core, workgroups, size, &args)
+    }
+
+    /// One reducing pass of `ops` over `input` into `outs`: a buffer for every op if there are
+    /// several, else the one buffer that holds op `j` at `j * count` (see [`AxisPass::split`]).
+    fn launch_reduce(
+        &mut self,
+        pass: Pass,
+        ops: ReduceList,
+        partial: bool,
+        geometry: [u32; 5],
+        outs: &[Bound<'_>],
+        input: Input<'_>,
+    ) -> Outcome<()> {
+        let pass = AxisPass { pass, ops, partial, split: outs.len() > 1, line_major: line_major(pass, geometry[3]) };
+        let (workgroups, size) = self.grid(pass.pass, geometry)?;
+        let writes: Vec<RawArg<'_>> = outs.iter().map(|out| RawArg::write(out.buffer, out.bytes)).collect();
+        let evaluated;
+        let input = match input {
+            Input::Buffer(input) => input,
+            Input::Pending(node) => {
+                if jit::axis_reduce(self.ctx, node, pass, geometry, workgroups, size, &writes)? {
+                    return Ok(());
+                }
+                let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
+                evaluated = storage.pin_single()?;
+                Bound { buffer: evaluated.buffer(), bytes: storage.byte_len() }
+            }
+        };
+        let core = self.reduce_core(pass)?;
+        let mut args = writes;
+        args.push(RawArg::read(input.buffer, input.bytes));
+        args.push(RawArg::Uniform(bytemuck::cast_slice(&geometry)));
+        self.ctx.launch(&core, workgroups, size, &args)?;
+        Ok(())
     }
 
     fn temp(&mut self, elements: u64) -> Result<(Buffer, u64)> {
@@ -427,7 +696,7 @@ impl<'a> Lines<'a> {
     }
 
     /// The inclusive scan of every line of `input` into `out`.
-    fn scan(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
+    pub(crate) fn scan(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
         let seq = [n, stride, lines, 1, n];
         if stride == 1 {
             if n <= SHORT_LINE {
@@ -460,32 +729,37 @@ impl<'a> Lines<'a> {
         self.launch(Pass::Walk, geometry, out, input, Some(prefix))
     }
 
-    /// The fold of every line of `input` into `out[0..lines]`; `op` is commutative.
-    fn reduce(&mut self, input: Bound<'_>, n: u32, stride: u32, lines: u32, out: Bound<'_>) -> Result<()> {
+    /// The reductions `ops` of every line of `input` into `outs` (see [`Lines::launch_reduce`]);
+    /// `partial` if `input` holds the partial results of an earlier pass. The ops are commutative
+    /// as well as associative. The first pass reads the expression behind a pending input
+    /// directly; the passes over partial results read buffers.
+    fn reduce(&mut self, input: Input<'_>, cells: Cells, ops: ReduceList, partial: bool, outs: &[Bound<'_>]) -> Outcome<()> {
+        let Cells { n, stride, lines } = cells;
         if stride == 1 && n <= SHORT_LINE {
-            return self.launch(Pass::Rows { fold: true, width: rows_width(n) }, [n, 1, lines, rows_per_group(n), n], out, input, None);
+            return self.launch_reduce(Pass::Rows { fold: true, width: rows_width(n) }, ops, partial, [n, 1, lines, rows_per_group(n), n], outs, input);
         }
-        if stride == 1 {
+        let (pass, geometry, nb) = if stride == 1 {
             let nb = n.div_ceil(REDUCE_CHUNK);
-            let geometry = [n, 1, lines, nb, REDUCE_CHUNK];
-            if nb == 1 {
-                return self.launch(Pass::ChunkReduce, geometry, out, input, None);
-            }
-            let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
-            let totals = Bound { buffer: &totals, bytes };
-            self.launch(Pass::ChunkReduce, geometry, totals, input, None)?;
-            return self.reduce(totals, nb, 1, lines, out);
-        }
-        let k = strided_block(n, lines).unwrap_or(n);
-        let nb = n.div_ceil(k);
-        let geometry = [n, stride, lines, nb, k];
+            (Pass::ChunkReduce, [n, 1, lines, nb, REDUCE_CHUNK], nb)
+        } else {
+            let k = strided_block(n, lines).unwrap_or(n);
+            let nb = n.div_ceil(k);
+            (Pass::Fold, [n, stride, lines, nb, k], nb)
+        };
         if nb == 1 {
-            return self.launch(Pass::Fold, geometry, out, input, None);
+            return self.launch_reduce(pass, ops, partial, geometry, outs, input);
         }
-        let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb))?;
+        let (totals, bytes) = self.temp(u64::from(lines) * u64::from(nb) * ops.as_slice().len() as u64)?;
         let totals = Bound { buffer: &totals, bytes };
-        self.launch(Pass::Fold, geometry, totals, input, None)?;
-        self.reduce(totals, nb, lines, lines, out)
+        self.launch_reduce(pass, ops, partial, geometry, &[totals], input)?;
+        // The partial results of contiguous lines (and line-major ones) are lines of `nb` cells,
+        // those of strided ones `nb` rows of `lines` cells.
+        let next = if line_major(pass, nb) {
+            Cells { n: nb, stride: 1, lines }
+        } else {
+            Cells { n: nb, stride: if stride == 1 { 1 } else { lines }, lines }
+        };
+        self.reduce(Input::Buffer(totals), next, ops.rest(), true, outs)
     }
 }
 
@@ -510,73 +784,112 @@ impl<T: ScalarType> Array<T> {
         }
     }
 
-    /// Runs the scan (`reduce == false`, shape kept) or the reduction of `op` along `axis`.
-    fn run_lines(
-        &self,
-        axis: usize,
-        op: &ScanOp<'_, T>,
-        reduce: bool,
-    ) -> Outcome<Array<T>> {
+    /// Runs the scan of `op` along `axis`.
+    fn run_scan(&self, axis: usize, op: &ScanOp<'_, T>) -> Outcome<Array<T>> {
         let ctx = self.context();
         let (pin, bytes) = self.ready()?;
         if ElemTy::of::<T>()?.bytes() != 4 {
             return Err(LumaError::Unsupported(format!("scans and reductions along an axis are not available for {} arrays", ElemTy::of::<T>()?.display())).into());
         }
         let shape = self.shape();
-        let dims = shape.dims();
         if axis >= 4 {
             return Err(LumaError::InvalidShape(format!("axis {axis} of shape {shape}")).into());
         }
         let operator = self.trace_operator(op)?;
-        let out_shape = if reduce {
-            let mut d = dims;
-            d[axis] = 1;
-            Shape::from(d)
-        } else {
-            shape
-        };
-        let out = Array::<T>::alloc(ctx, out_shape)?;
+        let out = Array::<T>::alloc(ctx, shape)?;
         let out_storage = Arc::clone(out.storage()?);
         let out_pin = out_storage.pin_single()?;
-        let n = dims[axis];
-        let stride: usize = dims[..axis].iter().product();
-        let lines = self.len() / n;
-        let to_u32 = |v: usize| u32::try_from(v).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: dims }));
-        let (n, stride, lines) = (to_u32(n)?, to_u32(stride)?, to_u32(lines)?);
-        let mut run = Lines {
-            ctx,
-            op: &operator,
-            scratch: Scratch::new(ctx),
-            cores: Vec::new(),
-            ty: T::wgsl_type(),
-        };
+        let (n, stride, lines) = self.line_geometry(axis)?;
+        let mut run = Lines::new(ctx, &operator, T::wgsl_type());
         let input = Bound { buffer: pin.buffer(), bytes };
         let target = Bound { buffer: out_pin.buffer(), bytes: out.byte_len() };
-        if reduce {
-            run.reduce(input, n, stride, lines, target)?;
-        } else {
-            run.scan(input, n, stride, lines, target)?;
-        }
+        run.scan(input, n, stride, lines, target)?;
         drop(run);
         crate::jit::check_finite(ctx, &out_storage, ElemTy::of::<T>()?)?;
         Ok(out)
     }
 
-    #[track_caller]
-    fn lines(
-        &self,
-        axis: usize,
-        op: &ScanOp<'_, T>,
-        reduce: bool,
-        name: &'static str,
-        location: &'static Location<'static>,
-    ) -> Array<T> {
-        let result = self.run_lines(axis, op, reduce);
-        let mut shape = self.shape().dims();
-        if reduce && axis < 4 {
-            shape[axis] = 1;
+    /// The extent of `axis`, the distance of the cells of a line and the number of lines.
+    fn line_geometry(&self, axis: usize) -> Outcome<(u32, u32, u32)> {
+        let dims = self.shape().dims();
+        let to_u32 = |v: usize| u32::try_from(v).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: dims }));
+        let stride: usize = dims[..axis].iter().product();
+        Ok((to_u32(dims[axis])?, to_u32(stride)?, to_u32(self.len() / dims[axis])?))
+    }
+
+    /// Runs the reductions `ops` along `axis`: one array per op. A pending operand is computed
+    /// inside the first pass unless it cannot be (see [`jit::axis_reduce`]).
+    fn run_axis_reduce(&self, axis: usize, ops: ReduceList) -> Outcome<Vec<Array<T>>> {
+        let ctx = self.context();
+        let ty = ElemTy::of::<T>()?;
+        if ty.bytes() != 4 {
+            return Err(LumaError::Unsupported(format!("scans and reductions along an axis are not available for {} arrays", ty.display())).into());
         }
-        Array::resolve(self.context(), Shape::from(shape), result, name, location)
+        let shape = self.shape();
+        if axis >= 4 {
+            return Err(LumaError::InvalidShape(format!("axis {axis} of shape {shape}")).into());
+        }
+        let mut out_dims = shape.dims();
+        out_dims[axis] = 1;
+        let outs = ops.as_slice().iter().map(|_| Array::<T>::alloc(ctx, Shape::from(out_dims))).collect::<Result<Vec<_>>>()?;
+        let storages = outs.iter().map(|out| out.storage().map(Arc::clone)).collect::<std::result::Result<Vec<_>, _>>()?;
+        let pins = storages.iter().map(|storage| storage.pin_single()).collect::<Result<Vec<_>>>()?;
+        let (n, stride, lines) = self.line_geometry(axis)?;
+        let ready;
+        let input = match self.pending() {
+            Some(node) => Input::Pending(node),
+            None => {
+                let (pin, bytes) = self.ready()?;
+                ready = pin;
+                Input::Buffer(Bound { buffer: ready.buffer(), bytes })
+            }
+        };
+        let targets: Vec<Bound<'_>> = pins.iter().zip(&outs).map(|(pin, out)| Bound { buffer: pin.buffer(), bytes: out.byte_len() }).collect();
+        let operator = Operator { source: String::new(), scalar_tys: Vec::new(), scalars: Vec::new() };
+        let mut run = Lines::new(ctx, &operator, T::wgsl_type());
+        run.reduce(input, Cells { n, stride, lines }, ops, false, &targets)?;
+        drop(run);
+        for storage in &storages {
+            crate::jit::check_finite(ctx, storage, ty)?;
+        }
+        Ok(outs)
+    }
+
+    #[track_caller]
+    fn scan_axis(&self, axis: usize, op: &ScanOp<'_, T>, name: &'static str, location: &'static Location<'static>) -> Array<T> {
+        let result = if ElemTy::try_of::<T>() == Some(ElemTy::Mask) { Err(mask_sum_error(name)) } else { self.run_scan(axis, op) };
+        Array::resolve(self.context(), self.shape(), result, name, location)
+    }
+
+    /// `reduce_axis` for the caller `name` at `location`.
+    fn reduce_lines<const N: usize>(&self, axis: usize, ops: [Reduction; N], name: &'static str, location: &'static Location<'static>) -> [Array<T>; N] {
+        let mut dims = self.shape().dims();
+        if axis < 4 {
+            dims[axis] = 1;
+        }
+        let shape = Shape::from(dims);
+        let sums_mask = ElemTy::try_of::<T>() == Some(ElemTy::Mask) && ops.iter().any(|r| matches!(r, Reduction::Sum | Reduction::SumOfSquares));
+        let result = if sums_mask {
+            Err(mask_sum_error(name))
+        } else if (1..=MAX_REDUCTIONS).contains(&N) {
+            self.run_axis_reduce(axis, ReduceList::new(&ops.map(Reduction::op)))
+        } else {
+            Err(LumaError::InvalidShape(format!("{N} reductions along an axis: one to {MAX_REDUCTIONS} are computed together")).into())
+        };
+        let (done, failure) = match result {
+            Ok(done) => (done, None),
+            Err(failure) => (Vec::new(), Some(failure)),
+        };
+        let mut done = done.into_iter();
+        std::array::from_fn(|_| {
+            let result = match (done.next(), &failure) {
+                (Some(array), _) => Ok(array),
+                (None, Some(Failure::New(error))) => Err(Failure::New(error.clone())),
+                (None, Some(Failure::Inherited(error))) => Err(Failure::Inherited(Arc::clone(error))),
+                (None, None) => unreachable!("a reduction without an array or a failure"),
+            };
+            Array::resolve(self.context(), shape, result, name, location)
+        })
     }
 
     /// The inclusive scan of `op` along `axis`: element `s` of every line is
@@ -595,32 +908,86 @@ impl<T: ScalarType> Array<T> {
     /// recompile.
     #[track_caller]
     pub fn scan(&self, axis: usize, op: impl Fn(&Array<T>, &Array<T>) -> Array<T>) -> Array<T> {
-        self.lines(axis, &op, false, "scan", Location::caller())
+        self.scan_axis(axis, &op, "scan", Location::caller())
     }
 
     /// The running sum along `axis` (a [`scan`](Array::scan) with `+`).
     #[track_caller]
     pub fn cumsum(&self, axis: usize) -> Array<T> {
-        self.lines(axis, &add, false, "cumsum", Location::caller())
+        self.scan_axis(axis, &add, "cumsum", Location::caller())
     }
 
-    /// The sum along `axis`; the result has extent 1 along it.
+    /// The sum along `axis`; the result has extent 1 along it. A pending operand is not
+    /// evaluated first: its expression is computed inside the first pass of the reduction.
     #[track_caller]
     pub fn sum_axis(&self, axis: usize) -> Array<T> {
-        self.lines(axis, &add, true, "sum_axis", Location::caller())
+        let [sum] = self.reduce_lines(axis, [Reduction::Sum], "sum_axis", Location::caller());
+        sum
     }
 
-    /// The minimum along `axis`; the result has extent 1 along it.
+    /// The minimum along `axis`; the result has extent 1 along it. Fused like
+    /// [`sum_axis`](Array::sum_axis).
     #[track_caller]
     pub fn min_axis(&self, axis: usize) -> Array<T> {
-        self.lines(axis, &|x: &Array<T>, y: &Array<T>| x.binary(Rhs::Array(y), BinOp::Min, false, "minimum"), true, "min_axis", Location::caller())
+        let [min] = self.reduce_lines(axis, [Reduction::Min], "min_axis", Location::caller());
+        min
     }
 
-    /// The maximum along `axis`; the result has extent 1 along it.
+    /// The maximum along `axis`; the result has extent 1 along it. Fused like
+    /// [`sum_axis`](Array::sum_axis).
     #[track_caller]
     pub fn max_axis(&self, axis: usize) -> Array<T> {
-        self.lines(axis, &|x: &Array<T>, y: &Array<T>| x.binary(Rhs::Array(y), BinOp::Max, false, "maximum"), true, "max_axis", Location::caller())
+        let [max] = self.reduce_lines(axis, [Reduction::Max], "max_axis", Location::caller());
+        max
     }
+
+    /// Up to four reductions along `axis` in one pass over the data: result `j` is the
+    /// reduction `ops[j]`, with extent 1 along `axis`. Every cell is read once for all of them,
+    /// and a pending operand is computed inside that first pass, never stored. Like
+    /// [`sum_axis`](Array::sum_axis), the arrays are evaluated when the call returns; another
+    /// number of reductions poisons every result with [`LumaError::InvalidShape`].
+    ///
+    /// [`Reduction::SumOfSquares`] of integers wraps, as [`Array::reduce`] does. Contiguous lines
+    /// (`axis` 0) are reduced by a workgroup per chunk of a line, short ones a group of lines per
+    /// workgroup, strided lines by blocks that an invocation walks (see [`scan`](Array::scan)).
+    /// On [`Mask`](crate::Mask) arrays only `Min` and `Max` are available; `Sum` and
+    /// `SumOfSquares` poison every result with [`LumaError::Unsupported`].
+    #[track_caller]
+    pub fn reduce_axis<const N: usize>(&self, axis: usize, ops: [Reduction; N]) -> [Array<T>; N] {
+        self.reduce_lines(axis, ops, "reduce_axis", Location::caller())
+    }
+}
+
+impl Array<f32> {
+    /// The mean along `axis` (the sum divided by the extent, the division lazy); the result has
+    /// extent 1 along it.
+    #[track_caller]
+    pub fn mean_axis(&self, axis: usize) -> Array<f32> {
+        let n = self.shape().dims().get(axis).copied().unwrap_or(1);
+        &self.sum_axis(axis) / (n as f32)
+    }
+
+    /// The population variance along `axis` (divisor `n`, NumPy's `ddof = 0`); the result has
+    /// extent 1 along it. Two passes, so it is stable for data far from zero: the mean, then
+    /// the mean of the squared deviations, in which `self - mean` is computed inside the
+    /// reduction.
+    #[track_caller]
+    pub fn var_axis(&self, axis: usize) -> Array<f32> {
+        let deviation = self - &self.mean_axis(axis);
+        (&deviation * &deviation).mean_axis(axis)
+    }
+
+    /// The population standard deviation along `axis`: the square root of
+    /// [`var_axis`](Array::var_axis).
+    #[track_caller]
+    pub fn std_axis(&self, axis: usize) -> Array<f32> {
+        self.var_axis(axis).sqrt()
+    }
+}
+
+/// The failure of an operation that would leave the values 0 and 1 on a [`crate::Mask`] array.
+pub(crate) fn mask_sum_error(name: &str) -> Failure {
+    LumaError::Unsupported(format!("{name} on Mask arrays; use count/any/all or to_u32")).into()
 }
 
 fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {

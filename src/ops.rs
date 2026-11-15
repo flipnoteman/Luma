@@ -13,7 +13,7 @@ use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, Builtin, Class, CmpOp, EpilogueStep, UnOp};
 use crate::context::{Context, RawArg};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{Df32, GpuType, ScalarType};
+use crate::gpu_type::{Df32, GpuType, Mask, ScalarType};
 use crate::jit::{self, ElemTy, Op, OpKind, Scalar, ShiftKind, Src};
 use crate::kernel::KernelCore;
 use crate::shape::{Offsets, Shape};
@@ -81,6 +81,8 @@ impl<T: ScalarType> Operand<T> for Array<T> {
 
 impl_value_operand!(f32);
 impl_value_operand!(u32);
+impl_value_operand!(i32);
+impl_value_operand!(Mask);
 impl_value_operand!(Df32);
 // There is deliberately no `Operand<f64> for f64`: a second float type among the scalar
 // operands would make `select(&mask, 1.0, 0.0)` and every other call that only has float
@@ -88,6 +90,7 @@ impl_value_operand!(Df32);
 // scalars; comparisons, `minimum`/`maximum` and `select` take `f64` arrays.
 impl_scalar_operand!(f32);
 impl_scalar_operand!(u32);
+impl_scalar_operand!(i32);
 
 /// Splits `count` workgroups into a 2D grid within the per-dimension limit; shaders recombine
 /// them as `x + y * num_workgroups.x`.
@@ -104,7 +107,7 @@ pub(crate) fn fold_workgroups(ctx: &Context, count: u32) -> Result<[u32; 3]> {
 /// launch a nearly empty second row for 65536 groups with the usual limit of 65535, and the
 /// groups past the end that exit at once cost a measurable share of a bandwidth-bound kernel
 /// (about 35 us of 340 for 2^24 elements). Fewer than `y` groups at the end are idle.
-fn fold_grid(count: u32, max: u32) -> [u32; 3] {
+pub(crate) fn fold_grid(count: u32, max: u32) -> [u32; 3] {
     let groups = count.max(1);
     let y = groups.div_ceil(max.max(1));
     [groups.div_ceil(y), y, 1]
@@ -185,8 +188,8 @@ impl<T: ScalarType> Array<T> {
         )
     }
 
-    /// The test `class` of every element, as a `u32` mask (see [`Class`]).
-    fn classify(&self, class: Class, location: &'static Location<'static>) -> Array<u32> {
+    /// The test `class` of every element, as a mask (see [`Class`]).
+    fn classify(&self, class: Class, location: &'static Location<'static>) -> Array<Mask> {
         let result = self.src().and_then(|operand| {
             let op = Op::new(OpKind::Classify(class), ElemTy::of::<T>()?);
             lazy(self.context(), self.shape(), op, [operand, Src::unused(), Src::unused()], class.name(), location)
@@ -315,7 +318,7 @@ impl<T: ScalarType> Array<T> {
         if let Rhs::Scalar(value) = &rhs
             && !scalar_left
             && let Ok(scalar) = Scalar::of(*value)
-            && scalar.ty == ElemTy::U32
+            && matches!(scalar.ty, ElemTy::U32 | ElemTy::I32)
             && let Some(by) = UnOp::by_constant(op, scalar.bits as u32)
         {
             let result = self.run_unary(by, location);
@@ -332,7 +335,7 @@ impl<T: ScalarType> Array<T> {
     }
 
     #[track_caller]
-    fn compare(&self, rhs: Rhs<'_, T>, op: CmpOp, name: &'static str) -> Array<u32> {
+    fn compare(&self, rhs: Rhs<'_, T>, op: CmpOp, name: &'static str) -> Array<Mask> {
         self.compare_at(rhs, op, name, Location::caller())
     }
 
@@ -343,7 +346,7 @@ impl<T: ScalarType> Array<T> {
         op: CmpOp,
         name: &'static str,
         location: &'static Location<'static>,
-    ) -> Array<u32> {
+    ) -> Array<Mask> {
         let result = self.run_binary(rhs, false, OpKind::Compare(op), name, location);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
@@ -443,41 +446,41 @@ impl<T: ScalarType> Array<T> {
         self.binary(rhs.rhs(), BinOp::Max, false, "maximum")
     }
 
-    // -- Comparisons: masks of 1 (true) and 0 (false) --
+    // -- Comparisons: masks --
 
-    /// `self < rhs` as a mask of ones and zeros.
+    /// `self < rhs` as a [`Mask`].
     #[track_caller]
-    pub fn lt(&self, rhs: impl Operand<T>) -> Array<u32> {
+    pub fn lt(&self, rhs: impl Operand<T>) -> Array<Mask> {
         self.compare(rhs.rhs(), CmpOp::Lt, "lt")
     }
 
-    /// `self <= rhs` as a mask of ones and zeros.
+    /// `self <= rhs` as a [`Mask`].
     #[track_caller]
-    pub fn le(&self, rhs: impl Operand<T>) -> Array<u32> {
+    pub fn le(&self, rhs: impl Operand<T>) -> Array<Mask> {
         self.compare(rhs.rhs(), CmpOp::Le, "le")
     }
 
-    /// `self > rhs` as a mask of ones and zeros.
+    /// `self > rhs` as a [`Mask`].
     #[track_caller]
-    pub fn gt(&self, rhs: impl Operand<T>) -> Array<u32> {
+    pub fn gt(&self, rhs: impl Operand<T>) -> Array<Mask> {
         self.compare(rhs.rhs(), CmpOp::Gt, "gt")
     }
 
-    /// `self >= rhs` as a mask of ones and zeros.
+    /// `self >= rhs` as a [`Mask`].
     #[track_caller]
-    pub fn ge(&self, rhs: impl Operand<T>) -> Array<u32> {
+    pub fn ge(&self, rhs: impl Operand<T>) -> Array<Mask> {
         self.compare(rhs.rhs(), CmpOp::Ge, "ge")
     }
 
-    /// `self == rhs` as a mask of ones and zeros.
+    /// `self == rhs` as a [`Mask`].
     #[track_caller]
-    pub fn eq(&self, rhs: impl Operand<T>) -> Array<u32> {
+    pub fn eq(&self, rhs: impl Operand<T>) -> Array<Mask> {
         self.compare(rhs.rhs(), CmpOp::Eq, "eq")
     }
 
-    /// `self != rhs` as a mask of ones and zeros.
+    /// `self != rhs` as a [`Mask`].
     #[track_caller]
-    pub fn ne(&self, rhs: impl Operand<T>) -> Array<u32> {
+    pub fn ne(&self, rhs: impl Operand<T>) -> Array<Mask> {
         self.compare(rhs.rhs(), CmpOp::Ne, "ne")
     }
 
@@ -614,7 +617,7 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
     arrays.iter().try_for_each(|array| array.check())
 }
 
-/// Picks `a[i]` where `mask[i] != 0` and `b[i]` elsewhere. Either branch is an `&Array<T>` or a
+/// Picks `a[i]` where `mask[i]` is true and `b[i]` elsewhere. Either branch is an `&Array<T>` or a
 /// single `T` applied to every element; a scalar is a uniform of the fused kernel, so no constant
 /// array is materialized or read from memory:
 ///
@@ -629,13 +632,13 @@ pub fn eval_all<T: GpuType>(arrays: &[&Array<T>]) -> Result<()> {
 /// `ShapeMismatch` (reported as `lhs` = the mask's shape, `rhs` = the branch's) or
 /// `ContextMismatch`.
 #[track_caller]
-pub fn select<T: ScalarType>(mask: &Array<u32>, a: impl Operand<T>, b: impl Operand<T>) -> Array<T> {
+pub fn select<T: ScalarType>(mask: &Array<Mask>, a: impl Operand<T>, b: impl Operand<T>) -> Array<T> {
     select_at(mask, a, b, Location::caller())
 }
 
 /// [`select`] reporting failures at `location`.
 pub(crate) fn select_at<T: ScalarType>(
-    mask: &Array<u32>,
+    mask: &Array<Mask>,
     a: impl Operand<T>,
     b: impl Operand<T>,
     location: &'static Location<'static>,
@@ -645,7 +648,7 @@ pub(crate) fn select_at<T: ScalarType>(
 }
 
 pub(crate) fn run_select<T: ScalarType>(
-    mask: &Array<u32>,
+    mask: &Array<Mask>,
     a: Rhs<'_, T>,
     b: Rhs<'_, T>,
     location: &'static Location<'static>,
@@ -723,25 +726,25 @@ macro_rules! impl_float_classes {
     ($($ty:ty),*) => {$(
         impl Array<$ty> {
             /// Elementwise: `1` where the element is neither infinite nor `NaN`, else `0`; a
-            /// lazy `u32` array that fuses like any elementwise operation. The test reads the
+            /// lazy [`Mask`] array that fuses like any elementwise operation. The test reads the
             /// bits of the exponent, so it does not depend on how the device compares `NaN`
             /// (a compiler may assume no `NaN` exists and fold `x != x`). For [`Df32`] it is the
             /// high word that counts.
             #[track_caller]
-            pub fn is_finite(&self) -> Array<u32> {
+            pub fn is_finite(&self) -> Array<Mask> {
                 self.classify(Class::Finite, Location::caller())
             }
 
             /// Elementwise: `1` where the element is `NaN`, else `0` (see [`Array::is_finite`]).
             #[track_caller]
-            pub fn is_nan(&self) -> Array<u32> {
+            pub fn is_nan(&self) -> Array<Mask> {
                 self.classify(Class::Nan, Location::caller())
             }
 
             /// Elementwise: `1` where the element is positive or negative infinity, else `0`
             /// (see [`Array::is_finite`]).
             #[track_caller]
-            pub fn is_inf(&self) -> Array<u32> {
+            pub fn is_inf(&self) -> Array<Mask> {
                 self.classify(Class::Inf, Location::caller())
             }
         }
@@ -872,11 +875,48 @@ wide_unary_methods! { f64;
     ceil => UnOp::Ceil;
 }
 
+wide_unary_methods! { i32;
+    /// Elementwise absolute value (`i32::MIN` stays `i32::MIN`).
+    abs => UnOp::Abs;
+    /// Elementwise sign: `-1`, `0` or `1`.
+    sign => UnOp::Sign;
+}
+
 wide_unary_methods! { Df32;
     /// Elementwise square root (accurate to about 44 bits).
     sqrt => UnOp::Sqrt;
+    /// Elementwise `e^x`, accurate to about 44 bits; infinity above `88.72` and `0` below `-87.33`.
+    /// A result below `2^-126` (where the low word stops being a normal `f32`) is `0`.
+    exp => UnOp::Exp;
+    /// Elementwise natural logarithm, accurate to about 44 bits (relative to the result, also near
+    /// `1`); `-inf` at `0`, `NaN` below it.
+    ln => UnOp::Ln;
+    /// Elementwise hyperbolic tangent, accurate to about 44 bits (relative to the result, also
+    /// near `0`); `+-1` from `|x| > 20`.
+    tanh => UnOp::Tanh;
     /// Elementwise absolute value.
     abs => UnOp::Abs;
+}
+
+impl Array<Df32> {
+    /// Elementwise `x` raised to `exponent`, accurate to about 44 bits for results in the range of
+    /// `exp` and `|exponent * ln x|` up to a few hundred. `NaN` for a negative base, `1` for an
+    /// exponent of `0` (also of `NaN`), and as `pow` for a base of `0` or infinity.
+    #[track_caller]
+    pub fn powf(&self, exponent: Df32) -> Array<Df32> {
+        let location = Location::caller();
+        let result = self.src().and_then(|operand| {
+            lazy(
+                self.context(),
+                self.shape(),
+                Op::new(OpKind::Powf, ElemTy::Df32),
+                [operand, Src::Scalar(Scalar::of(exponent)?), Src::unused()],
+                "powf",
+                location,
+            )
+        });
+        Array::resolve(self.context(), self.shape(), result, "powf", location)
+    }
 }
 
 // -- Operators --
@@ -1043,31 +1083,44 @@ macro_rules! impl_scalar_operators {
 
 impl_operators!(f32);
 impl_operators!(u32);
+impl_operators!(i32);
 impl_operators!(f64);
 impl_operators!(Df32);
 impl_scalar_operators!(f32);
 impl_scalar_operators!(u32);
+impl_scalar_operators!(i32);
 impl_binary_operator!(u32, Rem, rem, BinOp::Rem, "rem");
 impl_binary_scalar!(u32, Rem, rem, BinOp::Rem, "rem");
 impl_assign_operator!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 impl_assign_scalar!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
+impl_binary_operator!(i32, Rem, rem, BinOp::Rem, "rem");
+impl_binary_scalar!(i32, Rem, rem, BinOp::Rem, "rem");
+impl_assign_operator!(i32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
+impl_assign_scalar!(i32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 
-// -- Bitwise operations on u32 arrays --
+// -- Bitwise operations on u32 and i32 arrays --
 
 macro_rules! impl_bitwise_operator {
-    ($Trait:ident, $method:ident, $AssignTrait:ident, $assign_method:ident, $op:expr, $name:literal, $assign_name:literal) => {
-        impl_binary_operator!(u32, $Trait, $method, $op, $name);
-        impl_binary_scalar!(u32, $Trait, $method, $op, $name);
-        impl_assign_operator!(u32, $AssignTrait, $assign_method, $op, $assign_name);
-        impl_assign_scalar!(u32, $AssignTrait, $assign_method, $op, $assign_name);
+    ($t:ty, $Trait:ident, $method:ident, $AssignTrait:ident, $assign_method:ident, $op:expr, $name:literal, $assign_name:literal) => {
+        impl_binary_operator!($t, $Trait, $method, $op, $name);
+        impl_binary_scalar!($t, $Trait, $method, $op, $name);
+        impl_assign_operator!($t, $AssignTrait, $assign_method, $op, $assign_name);
+        impl_assign_scalar!($t, $AssignTrait, $assign_method, $op, $assign_name);
     };
 }
 
-impl_bitwise_operator!(BitAnd, bitand, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand", "bitand_assign");
-impl_bitwise_operator!(BitOr, bitor, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor", "bitor_assign");
-impl_bitwise_operator!(BitXor, bitxor, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor", "bitxor_assign");
-impl_bitwise_operator!(Shl, shl, ShlAssign, shl_assign, BinOp::Shl, "shl", "shl_assign");
-impl_bitwise_operator!(Shr, shr, ShrAssign, shr_assign, BinOp::Shr, "shr", "shr_assign");
+macro_rules! impl_bitwise_operators {
+    ($t:ty) => {
+        impl_bitwise_operator!($t, BitAnd, bitand, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand", "bitand_assign");
+        impl_bitwise_operator!($t, BitOr, bitor, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor", "bitor_assign");
+        impl_bitwise_operator!($t, BitXor, bitxor, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor", "bitxor_assign");
+        impl_bitwise_operator!($t, Shl, shl, ShlAssign, shl_assign, BinOp::Shl, "shl", "shl_assign");
+        impl_bitwise_operator!($t, Shr, shr, ShrAssign, shr_assign, BinOp::Shr, "shr", "shr_assign");
+    };
+}
+
+impl_bitwise_operators!(u32);
+impl_bitwise_operators!(i32);
 
 impl Not for &Array<u32> {
     type Output = Array<u32>;
@@ -1094,6 +1147,135 @@ impl Not for Array<u32> {
     #[track_caller]
     fn not(self) -> Array<u32> {
         !&self
+    }
+}
+
+impl Not for &Array<i32> {
+    type Output = Array<i32>;
+
+    /// Elementwise bitwise complement (`-x - 1`).
+    #[track_caller]
+    fn not(self) -> Array<i32> {
+        let location = Location::caller();
+        let result = self.run_unary(UnOp::BitNot, location);
+        Array::resolve(self.context(), self.shape(), result, "not", location)
+    }
+}
+
+impl Not for Array<i32> {
+    type Output = Array<i32>;
+
+    #[track_caller]
+    fn not(self) -> Array<i32> {
+        !&self
+    }
+}
+
+macro_rules! impl_mask_operator {
+    ($Trait:ident, $method:ident, $AssignTrait:ident, $assign_method:ident, $op:expr, $name:literal, $assign_name:literal) => {
+        impl $Trait<&Array<Mask>> for &Array<Mask> {
+            type Output = Array<Mask>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<Mask>) -> Array<Mask> {
+                self.binary(Rhs::Array(rhs), $op, false, $name)
+            }
+        }
+
+        impl $Trait<Array<Mask>> for Array<Mask> {
+            type Output = Array<Mask>;
+            #[track_caller]
+            fn $method(self, rhs: Array<Mask>) -> Array<Mask> {
+                self.binary(Rhs::Array(&rhs), $op, false, $name)
+            }
+        }
+
+        impl $Trait<Array<Mask>> for &Array<Mask> {
+            type Output = Array<Mask>;
+            #[track_caller]
+            fn $method(self, rhs: Array<Mask>) -> Array<Mask> {
+                self.binary(Rhs::Array(&rhs), $op, false, $name)
+            }
+        }
+
+        impl $Trait<&Array<Mask>> for Array<Mask> {
+            type Output = Array<Mask>;
+            #[track_caller]
+            fn $method(self, rhs: &Array<Mask>) -> Array<Mask> {
+                self.binary(Rhs::Array(rhs), $op, false, $name)
+            }
+        }
+
+        impl $AssignTrait<&Array<Mask>> for Array<Mask> {
+            #[track_caller]
+            fn $assign_method(&mut self, rhs: &Array<Mask>) {
+                self.assign_op(Rhs::Array(rhs), $op, $assign_name)
+            }
+        }
+    };
+}
+
+impl_mask_operator!(BitAnd, bitand, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand", "bitand_assign");
+impl_mask_operator!(BitOr, bitor, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor", "bitor_assign");
+impl_mask_operator!(BitXor, bitxor, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor", "bitxor_assign");
+
+impl Not for &Array<Mask> {
+    type Output = Array<Mask>;
+
+    /// Elementwise logical negation.
+    #[track_caller]
+    fn not(self) -> Array<Mask> {
+        let location = Location::caller();
+        let result = self.run_unary(UnOp::BitNot, location);
+        Array::resolve(self.context(), self.shape(), result, "not", location)
+    }
+}
+
+impl Not for Array<Mask> {
+    type Output = Array<Mask>;
+
+    #[track_caller]
+    fn not(self) -> Array<Mask> {
+        !&self
+    }
+}
+
+impl Array<Mask> {
+    /// The number of true elements, as a lazy one-element `u32` array (see [`Array::sum`]).
+    #[track_caller]
+    pub fn count(&self) -> Array<u32> {
+        self.to_u32().sum()
+    }
+
+    /// Whether any element is true, as a lazy one-element mask (the maximum). Read it with
+    /// `.item()` and `bool::from`.
+    #[track_caller]
+    pub fn any(&self) -> Array<Mask> {
+        self.max()
+    }
+
+    /// Whether every element is true, as a lazy one-element mask (the minimum). Read it with
+    /// `.item()` and `bool::from`.
+    #[track_caller]
+    pub fn all(&self) -> Array<Mask> {
+        self.min()
+    }
+}
+
+impl Array<i32> {
+    /// Elementwise `self << amount`, with an array of the same shape or a single `i32` as the
+    /// amount; the amount's bits are taken modulo 32 and bits shifted out are lost. The operator
+    /// `&x << n` is the same.
+    #[track_caller]
+    pub fn shl(&self, amount: impl Operand<i32>) -> Array<i32> {
+        self.binary(amount.rhs(), BinOp::Shl, false, "shl")
+    }
+
+    /// Elementwise arithmetic `self >> amount` (the sign bit comes in from the left), with an
+    /// array of the same shape or a single `i32` as the amount, taken modulo 32. The operator
+    /// `&x >> n` is the same.
+    #[track_caller]
+    pub fn shr(&self, amount: impl Operand<i32>) -> Array<i32> {
+        self.binary(amount.rhs(), BinOp::Shr, false, "shr")
     }
 }
 

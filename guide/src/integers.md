@@ -1,8 +1,9 @@
 # Integer and bit operations
 
-`Array<u32>` is the integer type: indices, masks, counters, and the lanes of bit-sliced
+`Array<u32>` is the unsigned integer type: indices, counters, and the lanes of bit-sliced
 cryptography. A `u32` array fuses, views, reduces, scans and loops like an `f32` one, and has the
-bit operations of a hash function. There is no signed integer type; `u32` arithmetic wraps.
+bit operations of a hash function; `u32` arithmetic wraps. `Array<i32>` is the signed one
+([below](#signed-integers-and-casts)), and `Array<Mask>` the result of comparisons.
 
 ## Arithmetic
 
@@ -60,31 +61,71 @@ array of amounts costs a mask and a variable shift per element.
 
 ## Comparisons, masks and `select`
 
-Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) of any element type return `Array<u32>` masks of
-`0` or `1`. Masks combine with `&`, `|` and `^`. Negate a mask with `^ 1u32`: `!` flips all 32 bits, and
-`!1` is not `0`. `select(&mask, a, b)` takes `a` where the mask is non-zero and `b`
-elsewhere, for any element type; `a` and `b` are arrays or scalars.
+Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) of any element type return `Array<Mask>`: a boolean
+per element, stored as a `u32` that is 0 or 1 ([how to make and read one](arrays.md#masks)).
+Masks combine with `&`, `|` and `^` (and the compound forms `&=`, `|=`, `^=`), and `!` negates
+them. `select(&mask, a, b)` takes `a` where the mask is true and `b` elsewhere, for any element
+type; `a` and `b` are arrays or scalars. `count()` is the number of true elements (a `u32`
+array), `any()` and `all()` are one-element masks; read a mask value with `item()` and
+`bool::from`. Masks have no arithmetic: `to_u32()` and `to_f32()` convert them.
 
 ```rust
 use luma::*;
 
 let x = Array::from_slice(&[3u32, 9, 12, 5], 4)?;
 let in_range = x.ge(4u32) & x.lt(10u32);               // 1 where 4 <= x < 10
-assert_eq!(in_range.to_vec()?, vec![0, 1, 0, 1]);
-assert_eq!((&in_range ^ 1u32).to_vec()?, vec![1, 0, 1, 0]);
+assert_eq!(in_range.to_u32().to_vec()?, vec![0, 1, 0, 1]);
+assert_eq!((!&in_range).to_u32().to_vec()?, vec![1, 0, 1, 0]);
 
 // Clamp to 10, keep the rest.
 let clamped = select(&x.gt(10u32), 10u32, &x);
 assert_eq!(clamped.to_vec()?, vec![3, 9, 10, 5]);
 
-// Counting is summing a mask; `sum_where` sums values under a mask.
-assert_eq!(in_range.sum().item()?, 2);
+// `count` counts the true elements; `sum_where` sums values under a mask.
+assert_eq!(in_range.count().item()?, 2);
 assert_eq!(x.sum_where(&in_range).item()?, 14);
+
+// `any` and `all` are one-element masks; `bool::from` reads them. `&=`, `|=`, `^=` work in place.
+assert!(bool::from(in_range.any().item()?));
+assert!(!bool::from(in_range.all().item()?));
+let mut flags = x.ge(4u32);
+flags &= &x.lt(10u32);
+assert_eq!(flags.to_u32().to_vec()?, vec![0, 1, 0, 1]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-`u32` has no unary minus and no implicit conversion to `f32`; to use a mask in float arithmetic
-write `select(&mask, 1.0, 0.0)`, which fuses.
+Comparisons with a NaN are the GPU's: `lt`, `le`, `gt`, `ge` and `eq` are false for a NaN operand,
+and `ne` was false too on every device the tests ran on (NVIDIA, llvmpipe), so `x.ne(&x)` is **not** a NaN test. Use
+`is_nan()` ([Precision](precision.md)).
+
+`u32` has no unary minus. To use a mask in float arithmetic write `mask.to_f32()` or
+`select(&mask, 1.0, 0.0)`; both fuse.
+
+## Signed integers and casts
+
+`Array<i32>` has the arithmetic of `u32` plus unary minus, `abs` and `sign`, and `>>` is
+arithmetic (the sign bit comes in from the left). `+ - *` wrap; division and remainder follow
+WGSL: `x / 0` is `x`, `i32::MIN / -1` is `i32::MIN`, `x % 0` and `i32::MIN % -1` are 0, and
+`abs(i32::MIN)` stays `i32::MIN`. There are no rotations and no float math.
+
+Casts between `f32`, `u32` and `i32` are methods. Float to integer truncates toward zero and
+saturates (`u32` at `4294967040`, `i32` at `-2147483648..=2147483520`), and NaN becomes 0.
+`u32` and `i32` reinterpret the bits (two's complement).
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[-1.5f32, 2.7, f32::NAN, 1e20, -1e20], 5)?;
+assert_eq!(x.to_i32().to_vec()?, vec![-1, 2, 0, 2_147_483_520, i32::MIN]);
+assert_eq!(x.to_u32().to_vec()?, vec![0, 2, 0, 4_294_967_040, 0]);
+
+let n = Array::from_slice(&[7i32, -7, i32::MIN], 3)?;
+assert_eq!((&n / 2).to_vec()?, vec![3, -3, -1_073_741_824]);
+assert_eq!(n.abs().to_vec()?, vec![7, 7, i32::MIN]);
+assert_eq!((-&n).to_f32().to_vec()?[..2], [-7.0, 7.0]);
+assert_eq!(n.to_u32().to_vec()?, vec![7, u32::MAX - 6, 1 << 31]);
+# Ok::<(), luma::LumaError>(())
+```
 
 ## 64-bit lanes as pairs of `u32`
 
@@ -174,9 +215,11 @@ assert!(corr[best] > 0.999);
 # Ok::<(), luma::LumaError>(())
 ```
 
-The gathers and the elementwise arithmetic fuse, but `sum_axis` does not fuse its operand
-([Reductions](reductions.md#scans)): the arrays it reduces (`hc * tc`, ...) are computed into
-`[traces, 256]` buffers first. Wrap the analysis in `ctx.profile(..)` to see the kernels.
+The gathers and the elementwise arithmetic fuse, and `sum_axis` computes its operand inside its
+first pass ([What fuses](performance.md#what-fuses-and-what-cuts)): `hc * tc` is never stored.
+`h` and the centred columns are read by several reductions, so the
+[cost model](performance.md#the-cost-model) may still evaluate them into `[traces, 256]`
+buffers. Wrap the analysis in `ctx.profile(..)` to see the kernels.
 
 ## States in `iterate_all`
 

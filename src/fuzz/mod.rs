@@ -34,7 +34,7 @@ use proptest::test_runner::{FileFailurePersistence, RngSeed};
 use crate::builtin::BinOp as LBin;
 use crate::ops::{Operand, Rhs};
 use crate::{
-    concat, eval_all, stack, stack_slice, iterate_all, iterate_until_all, select, Array, Context, ContextOptions, CostModel, Df32, LumaError, ScalarType, Shape,
+    concat, eval_all, stack, stack_slice, iterate_all, iterate_until_all, select, Array, Context, ContextOptions, CostModel, Df32, LumaError, Mask, ScalarType, Shape,
     Until,
 };
 use generator::{CostChoice, Config, InjView, LoopKind, Opd, Program, Stmt, ViewOp};
@@ -49,7 +49,7 @@ static SKIPPED: AtomicUsize = AtomicUsize::new(0);
 // -- Element types --
 
 /// An element type of the fuzzer, with its conversions.
-trait Num: ScalarType + Operand<Self> {
+trait Num: ScalarType {
     const TY: Ty;
     fn from_f32(v: f32) -> Self;
     fn to_f64(self) -> f64;
@@ -89,6 +89,38 @@ impl Num for u32 {
     }
 }
 
+impl Num for i32 {
+    const TY: Ty = Ty::I32;
+    fn from_f32(v: f32) -> i32 {
+        v as i32
+    }
+    fn to_f64(self) -> f64 {
+        f64::from(self)
+    }
+    fn get(a: &Arr) -> Option<&Array<i32>> {
+        if let Arr::I(x) = a { Some(x) } else { None }
+    }
+    fn wrap(a: Array<i32>) -> Arr {
+        Arr::I(a)
+    }
+}
+
+impl Num for Mask {
+    const TY: Ty = Ty::Mask;
+    fn from_f32(v: f32) -> Mask {
+        Mask::from(v != 0.0)
+    }
+    fn to_f64(self) -> f64 {
+        f64::from(u8::from(bool::from(self)))
+    }
+    fn get(a: &Arr) -> Option<&Array<Mask>> {
+        if let Arr::M(x) = a { Some(x) } else { None }
+    }
+    fn wrap(a: Array<Mask>) -> Arr {
+        Arr::M(a)
+    }
+}
+
 impl Num for Df32 {
     const TY: Ty = Ty::Df32;
     fn from_f32(v: f32) -> Df32 {
@@ -110,6 +142,8 @@ impl Num for Df32 {
 enum Arr {
     F(Array<f32>),
     U(Array<u32>),
+    I(Array<i32>),
+    M(Array<Mask>),
     D(Array<Df32>),
 }
 
@@ -119,6 +153,8 @@ macro_rules! with_arr {
         match $arr {
             Arr::F($a) => $body,
             Arr::U($a) => $body,
+            Arr::I($a) => $body,
+            Arr::M($a) => $body,
             Arr::D($a) => $body,
         }
     };
@@ -136,6 +172,14 @@ macro_rules! by_ty {
                 type $t = u32;
                 $body
             }
+            Ty::I32 => {
+                type $t = i32;
+                $body
+            }
+            Ty::Mask => {
+                type $t = Mask;
+                $body
+            }
             Ty::Df32 => {
                 type $t = Df32;
                 $body
@@ -151,6 +195,8 @@ impl Arr {
             match self {
                 Arr::F(_) => Ty::F32,
                 Arr::U(_) => Ty::U32,
+                Arr::I(_) => Ty::I32,
+                Arr::M(_) => Ty::Mask,
                 Arr::D(_) => Ty::Df32,
             }
         })
@@ -296,9 +342,26 @@ fn unary(a: &Arr, op: UnOp) -> Arr {
         (Arr::F(x), UnOp::Powf(e)) => Arr::F(x.powf(e)),
         (Arr::F(x), UnOp::ToDf32) => Arr::D(x.to_df32()),
         (Arr::U(x), UnOp::Not) => Arr::U(!x),
+        (Arr::U(x), UnOp::ToF32) => Arr::F(x.to_f32()),
+        (Arr::U(x), UnOp::ToI32) => Arr::I(x.to_i32()),
+        (Arr::I(x), UnOp::Neg) => Arr::I(-x),
+        (Arr::I(x), UnOp::Abs) => Arr::I(x.abs()),
+        (Arr::I(x), UnOp::Sign) => Arr::I(x.sign()),
+        (Arr::I(x), UnOp::Not) => Arr::I(!x),
+        (Arr::I(x), UnOp::ToF32) => Arr::F(x.to_f32()),
+        (Arr::I(x), UnOp::ToU32) => Arr::U(x.to_u32()),
+        (Arr::M(x), UnOp::Not) => Arr::M(!x),
+        (Arr::M(x), UnOp::ToU32) => Arr::U(x.to_u32()),
+        (Arr::M(x), UnOp::ToF32) => Arr::F(x.to_f32()),
+        (Arr::F(x), UnOp::ToU32) => Arr::U(x.to_u32()),
+        (Arr::F(x), UnOp::ToI32) => Arr::I(x.to_i32()),
         (Arr::D(x), UnOp::Neg) => Arr::D(-x),
         (Arr::D(x), UnOp::Abs) => Arr::D(x.abs()),
         (Arr::D(x), UnOp::Sqrt) => Arr::D(x.sqrt()),
+        (Arr::D(x), UnOp::Exp) => Arr::D(x.exp()),
+        (Arr::D(x), UnOp::Ln) => Arr::D(x.ln()),
+        (Arr::D(x), UnOp::Tanh) => Arr::D(x.tanh()),
+        (Arr::D(x), UnOp::Powf(e)) => Arr::D(x.powf(Df32::from(e))),
         (Arr::D(x), UnOp::ToF32) => Arr::F(x.to_f32()),
         _ => panic!("{op:?} is not defined for {:?}", a.ty()),
     }
@@ -313,7 +376,7 @@ fn binary<T: Num>(env: &Env, lhs: &Opd, rhs: &Opd, op: BinOp) -> Array<T> {
     }
 }
 
-fn compare<T: Num>(env: &Env, lhs: usize, rhs: &Opd, op: CmpOp) -> Array<u32> {
+fn compare<T: Num>(env: &Env, lhs: usize, rhs: &Opd, op: CmpOp) -> Array<Mask> {
     let (a, r) = (get::<T>(env, lhs), operand::<T>(env, rhs));
     match op {
         CmpOp::Lt => a.lt(r),
@@ -430,22 +493,35 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
         }),
         Stmt::Compare { lhs, rhs, op } => by_ty!(ty_of(env, *lhs), T => {
             let out = compare::<T>(env, *lhs, rhs, *op);
-            push(env, Arr::U(out))
+            push(env, Arr::M(out))
         }),
         Stmt::Select { mask, a, b, ty } => by_ty!(*ty, T => {
-            let out = select::<T>(get::<u32>(env, *mask), operand::<T>(env, a), operand::<T>(env, b));
+            let out = select::<T>(get::<Mask>(env, *mask), operand::<T>(env, a), operand::<T>(env, b));
             push(env, T::wrap(out))
         }),
         Stmt::View { src, view: v } => by_ty!(ty_of(env, *src), T => {
             let out = view::<T>(env, get::<T>(env, *src), v);
             push(env, T::wrap(out))
         }),
+        Stmt::Reduce { src, op } if ty_of(env, *src) == Ty::Mask => {
+            let mask = get::<Mask>(env, *src);
+            let out = match op {
+                RedOp::Max => mask.any(),
+                RedOp::Min => mask.all(),
+                RedOp::Sum => unreachable!("sums of masks are not generated"),
+            };
+            push(env, Arr::M(out))
+        }
         Stmt::Reduce { src, op } => by_ty!(ty_of(env, *src), T => {
             let out = reduce::<T>(get::<T>(env, *src), *op);
             push(env, T::wrap(out))
         }),
+        Stmt::Count { src } => {
+            let out = get::<Mask>(env, *src).count();
+            push(env, Arr::U(out))
+        }
         Stmt::SumWhere { src, mask } => by_ty!(ty_of(env, *src), T => {
-            let out = get::<T>(env, *src).sum_where(get::<u32>(env, *mask));
+            let out = get::<T>(env, *src).sum_where(get::<Mask>(env, *mask));
             push(env, T::wrap(out))
         }),
         Stmt::Scan { src, axis, op } => by_ty!(ty_of(env, *src), T => {
@@ -535,13 +611,15 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
                 (Arr::D(x), Class::Finite) => x.is_finite(),
                 (Arr::D(x), Class::Nan) => x.is_nan(),
                 (Arr::D(x), Class::Inf) => x.is_inf(),
-                (Arr::U(_), _) => unreachable!("classes of integers are not generated"),
+                (Arr::U(_) | Arr::I(_) | Arr::M(_), _) => unreachable!("classes of integers are not generated"),
             };
-            push(env, Arr::U(out))
+            push(env, Arr::M(out))
         }
         Stmt::EvalVars { vars } => {
             eval_group::<f32>(env, vars)?;
             eval_group::<u32>(env, vars)?;
+            eval_group::<i32>(env, vars)?;
+            eval_group::<Mask>(env, vars)?;
             eval_group::<Df32>(env, vars)
         }
         Stmt::Release { var } => {
@@ -647,6 +725,8 @@ fn host_rhs<'a>(env: &'a HostEnv, o: &Opd, ty: Ty) -> HRhs<'a> {
         Opd::Var(i) => HRhs::Array(host_get(env, *i)),
         Opd::Const(c) => HRhs::Val(match ty {
             Ty::U32 => f64::from(*c as u32),
+            Ty::I32 => f64::from(*c as i32),
+            Ty::Mask => f64::from(u8::from(*c != 0.0)),
             _ => f64::from(*c),
         }),
     }
@@ -705,6 +785,7 @@ fn host_stmt(env: &mut HostEnv, stmt: &Stmt, math: bool) -> Result<(), ErrKind> 
         Stmt::View { src, view } => Some(host_view(env, host_get(env, *src), view)?),
         Stmt::Reduce { src, op } => Some(host_get(env, *src).reduce(*op)),
         Stmt::SumWhere { src, mask } => Some(host_get(env, *src).sum_where(host_get(env, *mask))?),
+        Stmt::Count { src } => Some(host_get(env, *src).count()),
         Stmt::Scan { src, axis, op } => Some(host_get(env, *src).scan(*axis, *op)),
         Stmt::AxisReduce { src, axis, op } => Some(host_get(env, *src).reduce_axis(*axis, *op)),
         Stmt::Assign { target, path, rhs } => {
@@ -835,7 +916,7 @@ fn first_difference(math: bool, ty: Ty, luma: &[f64], oracle: &[f64]) -> Option<
             l.is_nan() && h.is_nan()
         } else if l == h {
             true
-        } else if math || ty == Ty::Df32 {
+        } else if (math && matches!(ty, Ty::F32 | Ty::Df32)) || ty == Ty::Df32 {
             let (rel, abs) = if math { (2e-3, 1e-4) } else { (1e-12, 1e-12) };
             (l - h).abs() <= abs + rel * h.abs()
         } else {
@@ -989,6 +1070,8 @@ impl Machine {
             let vars: Vec<usize> = (base..base + n).collect();
             let evaluated = eval_group::<f32>(&self.luma, &vars)
                 .and_then(|()| eval_group::<u32>(&self.luma, &vars))
+                .and_then(|()| eval_group::<i32>(&self.luma, &vars))
+                .and_then(|()| eval_group::<Mask>(&self.luma, &vars))
                 .and_then(|()| eval_group::<Df32>(&self.luma, &vars));
             evaluated.map_err(|e| limit_or_fail(&e, &format!("{at}: eval (step {t})")))?;
         }
@@ -1010,6 +1093,10 @@ impl Machine {
                 (false, Ty::F32, 2) => luma_iterate_all::<f32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (false, Ty::U32, 1) => luma_iterate_all::<u32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (false, Ty::U32, 2) => luma_iterate_all::<u32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::I32, 1) => luma_iterate_all::<i32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::I32, 2) => luma_iterate_all::<i32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::Mask, 1) => luma_iterate_all::<Mask, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
+                (false, Ty::Mask, 2) => luma_iterate_all::<Mask, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (false, Ty::Df32, 1) => luma_iterate_all::<Df32, 1>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (false, Ty::Df32, 2) => luma_iterate_all::<Df32, 2>(cx, env, steps, states, body, next).map(|r| (r, None)),
                 (true, Ty::F32, 1) => luma_iterate_until::<1>(cx, env, steps, states, body, next).map(|(r, s)| (r, Some(s))),

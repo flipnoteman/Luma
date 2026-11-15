@@ -213,9 +213,59 @@ What to look at:
   an array along axis 0, so `&pt ^ &guesses` broadcasts to the whole matrix;
 - `take` does both table lookups, and `sum_axis(0)` of centred products gives the covariance
   columns, all broadcasting: the program never writes a loop over guesses or traces;
-- the gathers and the elementwise products fuse; `sum_axis` does not fuse its operand, so the
-  centred and multiplied `[traces, 256]` arrays are computed before it. Wrap the analysis in
-  `ctx.profile(..)` and count `launches()` to see.
+- the gathers and the elementwise products fuse, and so does `sum_axis` into its operand: the
+  centred and multiplied `[traces, 256]` arrays are computed inside the reduction, not stored.
+  Wrap the analysis in `ctx.profile(..)` and count `launches()` to see.
 
 Replace the stand-in S-box with your cipher's table and the synthetic leakage with a measured
 sample per trace to use it on real data.
+
+## A small data-science pipeline
+
+A table of three features and a category per row, reduced to the usual first look: standardise,
+correlate, summarise per category, histogram, quartiles and the top rows. The table is stored
+with one column per feature, `[rows, features]`, so each feature is contiguous and the statistics
+run along axis 0. See [Matrices, statistics and grouping](data.md) for each operation.
+
+```rust
+use luma::*;
+
+let rows = 8;
+// Feature 0 counts up, feature 1 is twice feature 0, feature 2 counts down.
+let table = Array::from_slice(
+    &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+      2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0,
+      8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+    [rows, 3],
+)?;
+// A category (dense code) for every row.
+let category = Array::from_slice(&[0u32, 1, 0, 1, 0, 1, 2, 2], rows)?;
+
+// Standardise the columns. `z` is a lazy expression, computed where it is used.
+let z = (&table - &table.mean_axis(0)) / table.std_axis(0);
+
+// Correlation matrix: the Gram matrix of `z`, fused into the product's loads.
+let corr = (z.matmul(&z.transpose()) / (rows as f32)).to_vec()?;
+let expected = [1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0];
+assert!(corr.iter().zip(expected).all(|(got, want)| (got - want).abs() < 1e-4));
+
+// Per-category mean of feature 0 (the first `rows` elements of the table).
+let feature0 = table.slice(1, 0..1).reshape(rows);
+assert_eq!(feature0.group_mean(&category, 3).to_vec()?, vec![3.0, 4.0, 7.5]);
+
+// Histogram of feature 0 in four bins of width 2 over [0, 8): 1 | 2 3 | 4 5 | 6 7 8
+// (8.0 is not below `hi`, so it lands in the last bin).
+assert_eq!(feature0.histogram(4, 0.0, 8.0).to_vec()?, vec![1, 2, 2, 3]);
+
+// Median and quartiles.
+assert_eq!(feature0.median().item()?, 4.5);
+assert_eq!(feature0.quantile(0.25).item()?, 2.75);
+assert_eq!(feature0.quantile(0.75).item()?, 6.25);
+
+// The three rows with the largest value of feature 2, and their feature 0.
+let feature2 = table.slice(1, 2..3).reshape(rows);
+let top = feature2.argsort_descending().slice(0, 0..3);
+assert_eq!(top.to_vec()?, vec![0, 1, 2]);
+assert_eq!(feature0.take(&top).to_vec()?, vec![1.0, 2.0, 3.0]);
+# Ok::<(), luma::LumaError>(())
+```

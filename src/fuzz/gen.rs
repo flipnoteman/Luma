@@ -85,6 +85,8 @@ pub enum Stmt {
     View { src: usize, view: ViewOp },
     Reduce { src: usize, op: RedOp },
     SumWhere { src: usize, mask: usize },
+    /// `count` of a mask: the number of true elements, a one-element `u32` array.
+    Count { src: usize },
     Scan { src: usize, axis: usize, op: ScanOp },
     AxisReduce { src: usize, axis: usize, op: RedOp },
     /// Writes `rhs` into the region of `target` that `path` selects (the array itself if empty);
@@ -193,7 +195,8 @@ impl std::fmt::Debug for Program {
     }
 }
 
-/// `n` values of `ty` from `seed`: integers below 21 for `u32`, otherwise values of the domain.
+/// `n` values of `ty` from `seed`: integers below 21 for `u32`, small integers and `i32::MIN` for
+/// `i32`, 0 or 1 for masks, otherwise values of the domain.
 pub fn values(seed: u64, ty: Ty, n: usize, math: bool) -> Vec<f32> {
     let mut s = seed | 1;
     (0..n)
@@ -204,6 +207,14 @@ pub fn values(seed: u64, ty: Ty, n: usize, math: bool) -> Vec<f32> {
             let r = (s >> 32) as u32;
             match ty {
                 Ty::U32 => (r % 21) as f32,
+                // Edge values among small ones.
+                Ty::I32 => match r % 13 {
+                    0 => -2_147_483_648.0,
+                    1 => -1.0,
+                    2 => 0.0,
+                    _ => ((r >> 8) % 41) as f32 - 20.0,
+                },
+                Ty::Mask => (r & 1) as f32,
                 _ if math => 0.5 + (r % 1500) as f32 / 1000.0,
                 _ => ((r % 65) as f32 - 32.0) / 8.0,
             }
@@ -282,9 +293,15 @@ impl Info {
         }
     }
 
-    /// Bounds of an integer array (wrapping arithmetic: nothing to track).
-    fn int() -> Info {
-        Info { lsb: 0, lo: 0.0, hi: 4e9, exact: true, err: 0.0 }
+    /// Every value of the integer type `ty` (a wrapped result: nothing is known).
+    fn full(ty: Ty) -> Info {
+        let (lo, hi) = int_range(ty);
+        Info { lsb: 0, lo, hi, exact: true, err: 0.0 }
+    }
+
+    /// The values of a mask.
+    fn mask() -> Info {
+        Info { lsb: 0, lo: 0.0, hi: 1.0, exact: true, err: 0.0 }
     }
 
     fn of_const(c: f32) -> Info {
@@ -345,7 +362,69 @@ fn limit(ty: Ty) -> i32 {
     match ty {
         Ty::F32 => 22,
         Ty::Df32 => 44,
-        Ty::U32 => i32::MAX,
+        Ty::U32 | Ty::I32 | Ty::Mask => i32::MAX,
+    }
+}
+
+/// Whether `ty` is an integer type (wrapping arithmetic).
+fn is_int(ty: Ty) -> bool {
+    matches!(ty, Ty::U32 | Ty::I32)
+}
+
+/// The range of the integer type `ty`.
+fn int_range(ty: Ty) -> (f64, f64) {
+    match ty {
+        Ty::I32 => (f64::from(i32::MIN), f64::from(i32::MAX)),
+        _ => (0.0, f64::from(u32::MAX)),
+    }
+}
+
+/// The bounds of the constant `c` as a scalar of `ty` (what `Num::from_f32` makes of it).
+fn const_info(ty: Ty, c: f32) -> Info {
+    let point = |v: f64| Info { lsb: 0, lo: v, hi: v, exact: true, err: 0.0 };
+    match ty {
+        Ty::U32 => point(f64::from(c as u32)),
+        Ty::I32 => point(f64::from(c as i32)),
+        Ty::Mask => point(f64::from(u8::from(c != 0.0))),
+        _ => Info::of_const(c),
+    }
+}
+
+/// The bounds of integer values known to lie in `info.lo..=info.hi` before wrapping: kept if
+/// the type holds them all, else every value of the type.
+fn int_info(ty: Ty, info: Info) -> Info {
+    let (lo, hi) = int_range(ty);
+    if info.lo >= lo && info.hi <= hi {
+        Info { lsb: 0, exact: true, err: 0.0, ..info }
+    } else {
+        Info::full(ty)
+    }
+}
+
+/// Whether bitwise operations exist for `ty`.
+fn bitwise_ty(ty: Ty) -> bool {
+    is_int(ty) || ty == Ty::Mask
+}
+
+/// Whether the binary operation `op` exists for elements of type `ty`.
+fn bin_valid(ty: Ty, op: BinOp) -> bool {
+    match ty {
+        Ty::F32 => !op.bitwise() && op != BinOp::Rem,
+        Ty::Df32 => matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Minimum | BinOp::Maximum),
+        Ty::U32 => !matches!(op, BinOp::Atan2 | BinOp::Hypot | BinOp::Copysign),
+        Ty::I32 => !matches!(op, BinOp::Atan2 | BinOp::Hypot | BinOp::Copysign | BinOp::Rotl),
+        Ty::Mask => matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Minimum | BinOp::Maximum),
+    }
+}
+
+/// Whether the unary operation `op` exists for elements of type `ty`.
+fn un_valid(ty: Ty, op: UnOp) -> bool {
+    match ty {
+        Ty::F32 => !matches!(op, UnOp::Not | UnOp::ToF32),
+        Ty::Df32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Exp | UnOp::Ln | UnOp::Tanh | UnOp::Powf(_) | UnOp::ToF32),
+        Ty::U32 => matches!(op, UnOp::Not | UnOp::ToF32 | UnOp::ToI32),
+        Ty::I32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Not | UnOp::ToF32 | UnOp::ToU32),
+        Ty::Mask => matches!(op, UnOp::Not | UnOp::ToU32 | UnOp::ToF32),
     }
 }
 
@@ -354,7 +433,7 @@ fn rounding(ty: Ty) -> f64 {
     match ty {
         Ty::F32 => 2f64.powi(-22),
         Ty::Df32 => 2f64.powi(-40),
-        Ty::U32 => 0.0,
+        Ty::U32 | Ty::I32 | Ty::Mask => 0.0,
     }
 }
 
@@ -369,8 +448,11 @@ const ATAN2_ERR: f64 = 1.0 / 65_536.0;
 /// Floats of `ty` bounded and exact enough, or `None` if the domain does not allow the value
 /// (including a math-domain discrepancy beyond what comparing the value accepts).
 fn finish(ty: Ty, math: bool, mut info: Info) -> Option<Info> {
-    if ty == Ty::U32 {
-        return Some(Info::int());
+    if is_int(ty) {
+        return Some(int_info(ty, info));
+    }
+    if ty == Ty::Mask {
+        return Some(Info::mask());
     }
     if !(info.lo.is_finite() && info.hi.is_finite() && info.err.is_finite()) {
         return None;
@@ -437,8 +519,19 @@ fn bin_err(ty: Ty, op: BinOp, a: Info, b: Info, r: &Info) -> Option<f64> {
 
 /// The bounds of `a op b` for `ty` (before `finish`); `b_const` is the right operand if it is one.
 fn bin_info(ty: Ty, math: bool, op: BinOp, a: Info, b: Info, b_const: Option<f32>) -> Option<Info> {
-    if ty == Ty::U32 {
-        return Some(Info::int());
+    if ty == Ty::Mask {
+        return Some(Info::mask());
+    }
+    if is_int(ty) {
+        let (lo, hi) = match op {
+            BinOp::Add => corners(a, b, |x, y| x + y),
+            BinOp::Sub => corners(a, b, |x, y| x - y),
+            BinOp::Mul => corners(a, b, |x, y| x * y),
+            BinOp::Minimum => (a.lo.min(b.lo), a.hi.min(b.hi)),
+            BinOp::Maximum => (a.lo.max(b.lo), a.hi.max(b.hi)),
+            _ => int_range(ty),
+        };
+        return Some(int_info(ty, Info { lo, hi, ..a }));
     }
     let both = a.exact && b.exact;
     let info = match op {
@@ -493,7 +586,7 @@ fn un_err(ty: Ty, op: UnOp, a: Info, r: &Info) -> Option<f64> {
     let e = a.err;
     Some(match op {
         UnOp::Neg | UnOp::Abs | UnOp::Clamp { .. } | UnOp::Floor | UnOp::Ceil | UnOp::Sign => e,
-        UnOp::ToDf32 => e,
+        UnOp::ToDf32 | UnOp::ToU32 | UnOp::ToI32 => e,
         UnOp::Not => return None,
         UnOp::ToF32 => e + rounding(Ty::F32) * r.mag(),
         UnOp::Sqrt => {
@@ -526,8 +619,28 @@ fn un_err(ty: Ty, op: UnOp, a: Info, r: &Info) -> Option<f64> {
 
 /// The bounds of `op(a)` for `ty`.
 fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
-    if ty == Ty::U32 {
-        return (op == UnOp::Not).then(Info::int);
+    if ty == Ty::Mask {
+        return match op {
+            UnOp::Not => Some(Info::mask()),
+            // The cast of a mask has a mask's values.
+            UnOp::ToU32 | UnOp::ToF32 => Some(a),
+            _ => None,
+        };
+    }
+    if is_int(ty) {
+        let (_, th) = int_range(ty);
+        let same = |lo: f64, hi: f64| Some(int_info(ty, Info { lo, hi, ..a }));
+        return match op {
+            UnOp::Neg => same(-a.hi, -a.lo),
+            UnOp::Abs => same(if a.lo <= 0.0 && a.hi >= 0.0 { 0.0 } else { a.lo.abs().min(a.hi.abs()) }, a.mag()),
+            UnOp::Sign => same(if a.lo < 0.0 { -1.0 } else { 0.0 }, if a.hi > 0.0 { 1.0 } else { 0.0 }),
+            UnOp::Not if ty == Ty::I32 => same(-a.hi - 1.0, -a.lo - 1.0),
+            UnOp::Not => same(th - a.hi, th - a.lo),
+            // Casts: the caller bounds the result by the target type (a value that the other type
+            // reads differently falls out of its range).
+            UnOp::ToF32 | UnOp::ToU32 | UnOp::ToI32 => Some(a),
+            _ => None,
+        };
     }
     let inexact = |lo: f64, hi: f64| Info { lsb: -60, lo, hi, exact: false, err: 0.0 };
     let info = match op {
@@ -546,13 +659,18 @@ fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
             Info { lsb: a.lsb.min(l.lsb).min(h.lsb), lo: a.lo.max(f64::from(lo)).min(f64::from(hi)), hi: a.hi.min(f64::from(hi)).max(f64::from(lo)), exact: a.exact, err: 0.0 }
         }
         UnOp::ToDf32 | UnOp::ToF32 => a,
+        // Truncation toward zero and saturation, of values that the engine computes exactly.
+        UnOp::ToU32 | UnOp::ToI32 if a.exact => {
+            let (lo, hi) = if op == UnOp::ToU32 { (0.0, 4_294_967_040.0) } else { (-2_147_483_648.0, 2_147_483_520.0) };
+            Info { lsb: 0, lo: a.lo.trunc().clamp(lo, hi), hi: a.hi.trunc().clamp(lo, hi), exact: true, err: 0.0 }
+        }
         UnOp::Sqrt if math && a.lo >= 0.0 => inexact(a.lo.sqrt(), a.hi.sqrt()),
-        UnOp::Exp if math && ty == Ty::F32 && a.hi <= 11.0 => inexact(a.lo.exp(), a.hi.exp()),
-        UnOp::Ln if math && ty == Ty::F32 && a.lo >= 0.05 => inexact(a.lo.ln(), a.hi.ln()),
+        UnOp::Exp if math && matches!(ty, Ty::F32 | Ty::Df32) && a.hi <= 11.0 => inexact(a.lo.exp(), a.hi.exp()),
+        UnOp::Ln if math && matches!(ty, Ty::F32 | Ty::Df32) && a.lo >= 0.05 => inexact(a.lo.ln(), a.hi.ln()),
         UnOp::Sin | UnOp::Cos if math && ty == Ty::F32 && a.mag() <= 100.0 => inexact(-1.0, 1.0),
         UnOp::Tan if math && ty == Ty::F32 && a.mag() <= 1.2 => inexact(a.lo.tan(), a.hi.tan()),
-        UnOp::Tanh if math && ty == Ty::F32 => inexact(a.lo.tanh(), a.hi.tanh()),
-        UnOp::Powf(e) if math && ty == Ty::F32 && a.lo >= 0.25 => {
+        UnOp::Tanh if math && matches!(ty, Ty::F32 | Ty::Df32) => inexact(a.lo.tanh(), a.hi.tanh()),
+        UnOp::Powf(e) if math && matches!(ty, Ty::F32 | Ty::Df32) && a.lo >= 0.25 => {
             let (x, y) = (a.lo.powf(f64::from(e)), a.hi.powf(f64::from(e)));
             inexact(x.min(y), x.max(y))
         }
@@ -560,6 +678,17 @@ fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
     };
     let err = if math { un_err(ty, op, a, &info)? } else { 0.0 };
     finish(ty, math, Info { err, ..info })
+}
+
+/// The bounds of the data `vals` of an input or a write: integers and masks are as they are,
+/// floats multiples of `2^-3` (`2^-23` in the math domain).
+fn input_info(ty: Ty, math: bool, vals: &[f32]) -> Option<Info> {
+    let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
+    let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    match ty {
+        Ty::U32 | Ty::I32 | Ty::Mask => finish(ty, math, Info { lsb: 0, lo: f64::from(lo), hi: f64::from(hi), exact: true, err: 0.0 }),
+        _ => finish(ty, math, Info { lsb: if math { -23 } else { -3 }, lo: f64::from(lo), hi: f64::from(hi), exact: !math, err: 0.0 }),
+    }
 }
 
 // -- Scope --
@@ -644,7 +773,7 @@ impl Scope {
                 let v = self.var(*i)?;
                 (v.ty == ty).then(|| (Some(v.dims), self.info(v), None))
             }
-            Opd::Const(c) => Some((None, if ty == Ty::U32 { Info::int() } else { Info::of_const(*c) }, Some(*c))),
+            Opd::Const(c) => Some((None, const_info(ty, *c), Some(*c))),
         }
     }
 
@@ -659,25 +788,15 @@ impl Scope {
         let mut e = Effect::default();
         match stmt {
             Stmt::Input { dims, ty, seed } => {
-                let info = match ty {
-                    Ty::U32 => Info::int(),
-                    _ => {
-                        let vals = values(*seed, *ty, len_of(*dims), math);
-                        let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
-                        let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        Info { lsb: if math { -23 } else { -3 }, lo: f64::from(lo), hi: f64::from(hi), exact: !math, err: 0.0 }
-                    }
-                };
+                let info = input_info(*ty, math, &values(*seed, *ty, len_of(*dims), math))?;
                 e.new.push(Scope::fresh(*ty, *dims, info));
             }
             Stmt::Full { dims, ty, value } => {
-                let info = if *ty == Ty::U32 { Info::int() } else { Info::of_const(*value) };
-                e.new.push(Scope::fresh(*ty, *dims, info));
+                e.new.push(Scope::fresh(*ty, *dims, const_info(*ty, *value)));
             }
             Stmt::Range { dims, axis, ty } => {
                 let hi = dims[*axis] as f64 - 1.0;
-                let info = if *ty == Ty::U32 { Info::int() } else { Info { lsb: 0, lo: 0.0, hi, exact: true, err: 0.0 } };
-                e.new.push(Scope::fresh(*ty, *dims, info));
+                e.new.push(Scope::fresh(*ty, *dims, Info { lsb: 0, lo: 0.0, hi, exact: true, err: 0.0 }));
             }
             Stmt::Linspace { start, end, n } => {
                 let (s, t) = (f64::from(*start), f64::from(*end));
@@ -694,18 +813,17 @@ impl Scope {
             }
             Stmt::Unary { src, op } => {
                 let v = self.var(*src)?;
-                if (*op == UnOp::Not) != (v.ty == Ty::U32) {
+                if !un_valid(v.ty, *op) {
                     return None;
                 }
                 let ty = match op {
                     UnOp::ToDf32 if v.ty == Ty::F32 => Ty::Df32,
-                    UnOp::ToF32 if v.ty == Ty::Df32 => Ty::F32,
-                    UnOp::ToDf32 | UnOp::ToF32 => return None,
+                    UnOp::ToF32 => Ty::F32,
+                    UnOp::ToU32 => Ty::U32,
+                    UnOp::ToI32 => Ty::I32,
+                    UnOp::ToDf32 => return None,
                     _ => v.ty,
                 };
-                if v.ty == Ty::Df32 && !matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::ToF32) {
-                    return None;
-                }
                 let info = un_info(v.ty, math, *op, self.info(v))?;
                 // A cast to `f32` rounds: exact only if the value fits.
                 let info = if ty == v.ty { info } else { finish(ty, math, info)? };
@@ -718,16 +836,14 @@ impl Scope {
                 };
                 let (ld, li, _) = self.opd(lhs, ty)?;
                 let (rd, ri, rc) = self.opd(rhs, ty)?;
-                if matches!(lhs, Opd::Const(_)) && !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && !(ty == Ty::U32 && op.bitwise()) {
+                if matches!(lhs, Opd::Const(_)) && !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && !(bitwise_ty(ty) && op.bitwise()) {
                     return None;
                 }
-                if ty != Ty::U32 && op.bitwise() {
+                if !bin_valid(ty, *op) {
                     return None;
                 }
+                // `u32` division by zero is not defined; `i32`'s is (see the oracle).
                 if matches!(op, BinOp::Rem | BinOp::Div) && ty == Ty::U32 && !matches!(rc, Some(c) if c >= 1.0) {
-                    return None;
-                }
-                if (ty != Ty::F32 && matches!(op, BinOp::Atan2 | BinOp::Hypot | BinOp::Copysign)) || (ty != Ty::U32 && *op == BinOp::Rem) {
                     return None;
                 }
                 let dims = bcast(ld, rd)?;
@@ -741,18 +857,18 @@ impl Scope {
                 let v = self.var(*lhs)?;
                 let (rd, ri, _) = self.opd(rhs, v.ty)?;
                 // Comparisons of rounded values would differ between the GPU and the oracle.
-                if v.ty != Ty::U32 && !(self.info(v).exact && ri.exact) {
+                if matches!(v.ty, Ty::F32 | Ty::Df32) && !(self.info(v).exact && ri.exact) {
                     return None;
                 }
                 let dims = bcast(Some(v.dims), rd)?;
                 if len_of(dims) > 4096 {
                     return None;
                 }
-                e.new.push(Scope::fresh(Ty::U32, dims, Info::int()));
+                e.new.push(Scope::fresh(Ty::Mask, dims, Info::mask()));
             }
             Stmt::Select { mask, a, b, ty } => {
                 let m = self.var(*mask)?;
-                if m.ty != Ty::U32 {
+                if m.ty != Ty::Mask {
                     return None;
                 }
                 let (ad, ai, _) = self.opd(a, *ty)?;
@@ -802,7 +918,7 @@ impl Scope {
                         e.new.push(Scope::fresh(v.ty, v.dims, info));
                     }
                     ViewOp::ShiftFill { value, .. } => {
-                        let info = if v.ty == Ty::U32 { info } else { Info::join(info, Info::of_const(*value)) };
+                        let info = Info::join(info, const_info(v.ty, *value));
                         e.new.push(Scope::fresh(v.ty, v.dims, finish(v.ty, math, info)?));
                     }
                     ViewOp::Take { idx } => {
@@ -852,6 +968,10 @@ impl Scope {
             }
             Stmt::Reduce { src, op } => {
                 let v = self.var(*src)?;
+                // A sum of masks is not defined (`count` is).
+                if v.ty == Ty::Mask && *op == RedOp::Sum {
+                    return None;
+                }
                 let info = self.info(v);
                 let info = if *op == RedOp::Sum { info.total(len_of(v.dims)) } else { info };
                 e.new.push(Scope::fresh(v.ty, [1, 1, 1, 1], finish(v.ty, math, info)?));
@@ -859,15 +979,22 @@ impl Scope {
             Stmt::SumWhere { src, mask } => {
                 let v = self.var(*src)?;
                 let m = self.var(*mask)?;
-                if m.ty != Ty::U32 || m.dims != v.dims {
+                if m.ty != Ty::Mask || v.ty == Ty::Mask || m.dims != v.dims {
                     return None;
                 }
                 let info = Info::join(self.info(v), Info::of_const(0.0)).summed(len_of(v.dims));
                 e.new.push(Scope::fresh(v.ty, [1, 1, 1, 1], finish(v.ty, math, info)?));
             }
+            Stmt::Count { src } => {
+                let v = self.var(*src)?;
+                if v.ty != Ty::Mask {
+                    return None;
+                }
+                e.new.push(Scope::fresh(Ty::U32, [1, 1, 1, 1], Info { lsb: 0, lo: 0.0, hi: len_of(v.dims) as f64, exact: true, err: 0.0 }));
+            }
             Stmt::Scan { src, axis, op } => {
                 let v = self.var(*src)?;
-                if *axis >= 4 {
+                if *axis >= 4 || v.ty == Ty::Mask {
                     return None;
                 }
                 let info = self.info(v);
@@ -876,7 +1003,7 @@ impl Scope {
             }
             Stmt::AxisReduce { src, axis, op } => {
                 let v = self.var(*src)?;
-                if *axis >= 4 {
+                if *axis >= 4 || (v.ty == Ty::Mask && *op == RedOp::Sum) {
                     return None;
                 }
                 let info = self.info(v);
@@ -941,7 +1068,7 @@ impl Scope {
                 if rd.is_some_and(|d| !fits(d, t.dims)) {
                     return None;
                 }
-                if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) && !op.bitwise() || (t.ty != Ty::U32 && (*op == BinOp::Rem || op.bitwise())) {
+                if !(matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) || op.bitwise()) || !bin_valid(t.ty, *op) {
                     return None;
                 }
                 if matches!(op, BinOp::Rem | BinOp::Div) && t.ty == Ty::U32 && !matches!(rc, Some(c) if c >= 1.0) {
@@ -955,14 +1082,7 @@ impl Scope {
                 if !self.writable(t) {
                     return None;
                 }
-                let info = if t.ty == Ty::U32 {
-                    Info::int()
-                } else {
-                    let vals = values(*seed, t.ty, len_of(t.dims), math);
-                    let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
-                    let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    finish(t.ty, math, Info { lsb: if math { -23 } else { -3 }, lo: f64::from(lo), hi: f64::from(hi), exact: !math, err: 0.0 })?
-                };
+                let info = input_info(t.ty, math, &values(*seed, t.ty, len_of(t.dims), math))?;
                 e.set.push((t.cell, info));
             }
             Stmt::Cache { src } => {
@@ -983,10 +1103,10 @@ impl Scope {
             Stmt::Classify { src, class: _ } => {
                 let v = self.var(*src)?;
                 // Values rounded differently by the GPU and the oracle could be infinite on one side.
-                if v.ty == Ty::U32 || !self.info(v).exact {
+                if !matches!(v.ty, Ty::F32 | Ty::Df32) || !self.info(v).exact {
                     return None;
                 }
-                e.new.push(Scope::fresh(Ty::U32, v.dims, Info::int()));
+                e.new.push(Scope::fresh(Ty::Mask, v.dims, Info::mask()));
             }
             Stmt::EvalVars { vars } => {
                 for v in vars {
@@ -1054,6 +1174,11 @@ const SHAPES: [Dims; 6] = [[12, 1, 1, 1], [7, 5, 1, 1], [9, 6, 1, 1], [8, 8, 1, 
 const EXACT_CONSTS: [f32; 8] = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 4.0];
 const MATH_CONSTS: [f32; 7] = [0.5, 1.0, 1.5, 2.0, 3.0, -1.0, 0.25];
 const INT_CONSTS: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 5.0, 7.0];
+/// Constants of `i32` operations: small ones of both signs, and the edges (`2^31` saturates to
+/// `i32::MAX`).
+const I32_CONSTS: [f32; 9] = [0.0, 1.0, -1.0, 2.0, -2.0, 7.0, -7.0, -2_147_483_648.0, 2_147_483_648.0];
+/// Divisors of `i32` operations: zero and `-1` are defined (`x / 0 = x`, `MIN / -1 = MIN`).
+const I32_DIVISORS: [f32; 7] = [0.0, 1.0, -1.0, 2.0, -3.0, 7.0, -2_147_483_648.0];
 /// Constants of the bitwise operations: edge shift amounts (modulo 32), and `2^32` (saturates
 /// to `u32::MAX`, all ones).
 const BIT_CONSTS: [f32; 8] = [0.0, 1.0, 5.0, 31.0, 32.0, 33.0, 12.0, 4_294_967_296.0];
@@ -1080,10 +1205,12 @@ impl Builder {
     }
 
     fn any_ty(&mut self) -> Ty {
-        // Mostly f32; U32 for indices and masks; some double-floats.
+        // Mostly f32; U32 for indices; I32 and masks; some double-floats.
         match self.tape.below(20) {
             0..=1 => Ty::Df32,
-            2..=6 => Ty::U32,
+            2..=5 => Ty::U32,
+            6..=8 => Ty::I32,
+            9..=11 => Ty::Mask,
             _ => Ty::F32,
         }
     }
@@ -1091,6 +1218,8 @@ impl Builder {
     fn constant(&mut self, ty: Ty) -> f32 {
         match ty {
             Ty::U32 => self.tape.pick(&INT_CONSTS),
+            Ty::I32 => self.tape.pick(&I32_CONSTS),
+            Ty::Mask => self.tape.pick(&[0.0, 1.0]),
             _ if self.math => self.tape.pick(&MATH_CONSTS),
             _ => self.tape.pick(&EXACT_CONSTS),
         }
@@ -1171,9 +1300,10 @@ impl Builder {
             86..=87 => self.g_put(),
             88..=90 => self.g_compound(),
             91 if ctx != Ctx::Traced => self.g_write(),
-            92 => match self.tape.below(3) {
+            92 => match self.tape.below(5) {
                 0 => self.g_cache(),
                 1 => self.g_reshape(),
+                2 | 3 => self.g_count(),
                 _ => self.g_classify(),
             },
             93..=94 if host => self.g_eval(),
@@ -1216,13 +1346,21 @@ impl Builder {
         let src = self.pick(|_| true)?;
         let ty = self.scope.var(src)?.ty;
         let op = if ty == Ty::U32 {
-            UnOp::Not
+            self.tape.pick(&[UnOp::Not, UnOp::ToF32, UnOp::ToI32])
+        } else if ty == Ty::I32 {
+            self.tape.pick(&[UnOp::Neg, UnOp::Abs, UnOp::Sign, UnOp::Not, UnOp::ToF32, UnOp::ToU32])
+        } else if ty == Ty::Mask {
+            self.tape.pick(&[UnOp::Not, UnOp::ToU32, UnOp::ToF32])
         } else if ty == Ty::Df32 {
-            match self.tape.below(5) {
+            match self.tape.below(if self.math { 9 } else { 5 }) {
                 0 => UnOp::Neg,
                 1 => UnOp::Abs,
                 2 if self.math => UnOp::Sqrt,
                 3 | 4 => UnOp::ToF32,
+                5 => UnOp::Exp,
+                6 => UnOp::Ln,
+                7 => UnOp::Tanh,
+                8 => UnOp::Powf(self.tape.pick(&[-1.5f32, -0.5, 0.5, 1.5, 2.5, 3.0])),
                 _ => UnOp::Neg,
             }
         } else if self.math {
@@ -1244,7 +1382,7 @@ impl Builder {
                 _ => UnOp::ToDf32,
             }
         } else {
-            match self.tape.below(10) {
+            match self.tape.below(12) {
                 0 | 1 => UnOp::Neg,
                 2 | 3 => UnOp::Abs,
                 4 => UnOp::Floor,
@@ -1254,6 +1392,8 @@ impl Builder {
                     let lo = self.tape.pick(&[-2.0f32, -1.0, -0.5, 0.0]);
                     UnOp::Clamp { lo, hi: self.tape.pick(&[0.5f32, 1.0, 2.0, 4.0]) }
                 }
+                8 => UnOp::ToU32,
+                9 => UnOp::ToI32,
                 _ => UnOp::ToDf32,
             }
         };
@@ -1278,6 +1418,21 @@ impl Builder {
                 BinOp::Shr,
                 BinOp::Rotl,
             ],
+            (Ty::I32, _) => &[
+                BinOp::Add,
+                BinOp::Sub,
+                BinOp::Mul,
+                BinOp::Div,
+                BinOp::Rem,
+                BinOp::Minimum,
+                BinOp::Maximum,
+                BinOp::BitAnd,
+                BinOp::BitOr,
+                BinOp::BitXor,
+                BinOp::Shl,
+                BinOp::Shr,
+            ],
+            (Ty::Mask, _) => &[BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Minimum, BinOp::Maximum],
             (Ty::Df32, false) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Minimum, BinOp::Maximum],
             (Ty::Df32, true) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Minimum, BinOp::Maximum],
             (Ty::F32, false) => &[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Minimum, BinOp::Maximum, BinOp::Div],
@@ -1294,7 +1449,7 @@ impl Builder {
             ],
         };
         let op = self.tape.pick(ops);
-        let lhs_const = (matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) || op.bitwise()) && self.tape.chance(1, 8);
+        let lhs_const = ((matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && ty != Ty::Mask) || op.bitwise()) && self.tape.chance(1, 8);
         let lhs = if lhs_const {
             Opd::Const(self.constant(ty))
         } else {
@@ -1306,6 +1461,10 @@ impl Builder {
         };
         let rhs = if lhs_const {
             Opd::Var(self.pick_ty(ty)?)
+        } else if matches!(op, BinOp::Div | BinOp::Rem) && ty == Ty::I32 && self.tape.chance(1, 2) {
+            Opd::Const(self.tape.pick(&I32_DIVISORS))
+        } else if matches!(op, BinOp::Div | BinOp::Rem) && ty == Ty::I32 {
+            self.operand(ty, |d| Self::combines(like, d), (1, 4))
         } else if (op == BinOp::Div && ty == Ty::U32) || (op == BinOp::Rem) {
             Opd::Const(self.tape.pick(&[1.0f32, 2.0, 3.0, 7.0]))
         } else if op.bitwise() && self.tape.chance(1, 2) {
@@ -1328,7 +1487,7 @@ impl Builder {
     }
 
     fn g_select(&mut self) -> Option<Stmt> {
-        let mask = self.pick_ty(Ty::U32)?;
+        let mask = self.pick_ty(Ty::Mask)?;
         let dims = self.scope.var(mask)?.dims;
         let ty = self.any_ty();
         let a = self.operand(ty, |d| fits(d, dims), (1, 4));
@@ -1393,19 +1552,27 @@ impl Builder {
 
     fn g_reduce(&mut self) -> Option<Stmt> {
         let src = self.pick(|_| true)?;
-        let op = self.tape.pick(&[RedOp::Sum, RedOp::Sum, RedOp::Min, RedOp::Max]);
+        let op = if self.scope.var(src)?.ty == Ty::Mask {
+            self.tape.pick(&[RedOp::Min, RedOp::Max])
+        } else {
+            self.tape.pick(&[RedOp::Sum, RedOp::Sum, RedOp::Min, RedOp::Max])
+        };
         Some(Stmt::Reduce { src, op })
     }
 
     fn g_sum_where(&mut self) -> Option<Stmt> {
-        let mask = self.pick_ty(Ty::U32)?;
+        let mask = self.pick_ty(Ty::Mask)?;
         let dims = self.scope.var(mask)?.dims;
-        let src = self.pick(|v| v.dims == dims)?;
+        let src = self.pick(|v| v.dims == dims && v.ty != Ty::Mask)?;
         Some(Stmt::SumWhere { src, mask })
     }
 
+    fn g_count(&mut self) -> Option<Stmt> {
+        Some(Stmt::Count { src: self.pick_ty(Ty::Mask)? })
+    }
+
     fn g_scan(&mut self) -> Option<Stmt> {
-        let src = self.pick(|_| true)?;
+        let src = self.pick(|v| v.ty != Ty::Mask)?;
         let axis = self.tape.below(Self::ndim(self.scope.var(src)?.dims));
         let op = self.tape.pick(&[ScanOp::CumSum, ScanOp::CumSum, ScanOp::ScanMax, ScanOp::ScanMin]);
         Some(Stmt::Scan { src, axis, op })
@@ -1414,7 +1581,7 @@ impl Builder {
     fn g_axis_reduce(&mut self) -> Option<Stmt> {
         let src = self.pick(|_| true)?;
         let axis = self.tape.below(Self::ndim(self.scope.var(src)?.dims));
-        let op = self.tape.pick(&[RedOp::Sum, RedOp::Min, RedOp::Max]);
+        let op = if self.scope.var(src)?.ty == Ty::Mask { self.tape.pick(&[RedOp::Min, RedOp::Max]) } else { self.tape.pick(&[RedOp::Sum, RedOp::Min, RedOp::Max]) };
         Some(Stmt::AxisReduce { src, axis, op })
     }
 
@@ -1484,6 +1651,19 @@ impl Builder {
         let target = self.pick(|v| !v.read_only && v.cell >= local_from)?;
         let t = self.scope.var(target)?.clone();
         let op = match t.ty {
+            Ty::Mask => self.tape.pick(&[BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor]),
+            Ty::I32 => self.tape.pick(&[
+                BinOp::Add,
+                BinOp::Sub,
+                BinOp::Mul,
+                BinOp::Div,
+                BinOp::Rem,
+                BinOp::BitAnd,
+                BinOp::BitOr,
+                BinOp::BitXor,
+                BinOp::Shl,
+                BinOp::Shr,
+            ]),
             Ty::U32 => self.tape.pick(&[
                 BinOp::Add,
                 BinOp::Sub,
@@ -1499,8 +1679,12 @@ impl Builder {
             ]),
             _ => self.tape.pick(&[BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div]),
         };
-        let rhs = if (t.ty == Ty::U32 && matches!(op, BinOp::Div | BinOp::Rem)) || (op == BinOp::Div && !self.math) {
-            let pool: &[f32] = if t.ty == Ty::U32 { &[1.0, 2.0, 3.0, 7.0] } else { &POW2_CONSTS };
+        let rhs = if (is_int(t.ty) && matches!(op, BinOp::Div | BinOp::Rem)) || (op == BinOp::Div && !self.math) {
+            let pool: &[f32] = match t.ty {
+                Ty::U32 => &[1.0, 2.0, 3.0, 7.0],
+                Ty::I32 => &I32_DIVISORS,
+                _ => &POW2_CONSTS,
+            };
             Opd::Const(self.tape.pick(pool))
         } else {
             // The right-hand side repeats along its extents of 1; the target never grows.
@@ -1606,7 +1790,7 @@ impl Builder {
                 })
             }
             4 => {
-                let mask = self.pick_ty(Ty::U32)?;
+                let mask = self.pick_ty(Ty::Mask)?;
                 let dims = self.scope.var(mask)?.dims;
                 let ty = self.any_ty();
                 let b = self.pick(|v| v.ty == ty && !fits(v.dims, dims))?;
@@ -1805,6 +1989,7 @@ impl Stmt {
             }
             Stmt::Reduce { src, op } => Stmt::Reduce { src: f(*src)?, op: *op },
             Stmt::SumWhere { src, mask } => Stmt::SumWhere { src: f(*src)?, mask: f(*mask)? },
+            Stmt::Count { src } => Stmt::Count { src: f(*src)? },
             Stmt::Scan { src, axis, op } => Stmt::Scan { src: f(*src)?, axis: *axis, op: *op },
             Stmt::AxisReduce { src, axis, op } => Stmt::AxisReduce { src: f(*src)?, axis: *axis, op: *op },
             Stmt::Assign { target, path, rhs } => Stmt::Assign { target: f(*target)?, path: path.clone(), rhs: rhs.remap(f)? },
@@ -1961,7 +2146,8 @@ mod tests {
             Stmt::AxisReduce { src: 0, axis: 0, op: RedOp::Max },
             Stmt::Binary { lhs: Opd::Var(1), rhs: Opd::Var(2), op: BinOp::Add },
             Stmt::Range { dims: [7, 5, 1, 1], axis: 0, ty: Ty::U32 },
-            Stmt::Select { mask: 4, a: Opd::Var(1), b: Opd::Var(2), ty: Ty::F32 },
+            Stmt::Compare { lhs: 4, rhs: Opd::Const(0.0), op: CmpOp::Gt },
+            Stmt::Select { mask: 5, a: Opd::Var(1), b: Opd::Var(2), ty: Ty::F32 },
             Stmt::Compound { target: 0, op: BinOp::Add, rhs: Opd::Var(2) },
         ];
         assert_eq!(first_refused(&program), None);

@@ -246,8 +246,8 @@ fn iterate_until_all_runs_a_u32_record() {
             want[3][i] = l[0][i] >> 1;
         }
     }
-    for k in 0..4 {
-        assert_eq!(run.state.lanes[k].to_vec().unwrap(), want[k], "lane {k}");
+    for (k, (lane, expect)) in run.state.lanes.iter().zip(&want).enumerate() {
+        assert_eq!(lane.to_vec().unwrap(), *expect, "lane {k}");
     }
     assert_eq!(run.state.carry.to_vec().unwrap(), vec![5; n]);
 }

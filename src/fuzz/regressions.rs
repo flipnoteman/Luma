@@ -301,7 +301,8 @@ fn view_of_a_view_recorded_before_a_transposed_write_keeps_the_old_data() {
             Assign { target: 0, path: vec![InjTranspose], rhs: Const(0.0) },
             View { src: 1, view: Slice { axis: 0, lo: 0, hi: 1 } },
             Range { dims: [12, 1, 1, 1], axis: 0, ty: U32 },
-            Select { mask: 3, a: Var(2), b: Const(-2.0), ty: F32 },
+            Compare { lhs: 3, rhs: Const(0.0), op: Gt },
+            Select { mask: 4, a: Var(2), b: Const(-2.0), ty: F32 },
         ],
     });
 }
@@ -317,9 +318,10 @@ fn sum_where_sees_a_later_write_to_the_equal_select() {
         stmts: vec![
             Input { dims: [9, 6, 1, 1], ty: F32, seed: 0 },
             Range { dims: [9, 6, 1, 1], axis: 1, ty: U32 },
-            SumWhere { src: 0, mask: 1 },
-            Select { mask: 1, a: Var(0), b: Const(0.0), ty: F32 },
-            Assign { target: 3, path: vec![InjFlip { axis: 1 }, InjTranspose], rhs: Const(-2.0) },
+            Compare { lhs: 1, rhs: Const(0.0), op: Gt },
+            SumWhere { src: 0, mask: 2 },
+            Select { mask: 2, a: Var(0), b: Const(0.0), ty: F32 },
+            Assign { target: 4, path: vec![InjFlip { axis: 1 }, InjTranspose], rhs: Const(-2.0) },
         ],
     });
 }
@@ -335,12 +337,13 @@ fn view_keeps_the_old_data_after_a_cache_evaluated_the_shared_base_node() {
         math: false,
         stmts: vec![
             Input { dims: [7, 5, 1, 1], ty: U32, seed: 0 },
-            Select { mask: 0, a: Const(-2.0), b: Const(-1.0), ty: F32 },
-            Unary { src: 1, op: ToDf32 },
-            Unary { src: 1, op: ToDf32 },
-            View { src: 3, view: Flip { axis: 0 } },
-            Cache { src: 2 },
-            Assign { target: 3, path: vec![InjFlip { axis: 0 }], rhs: Const(-2.0) },
+            Compare { lhs: 0, rhs: Const(0.0), op: Gt },
+            Select { mask: 1, a: Const(-2.0), b: Const(-1.0), ty: F32 },
+            Unary { src: 2, op: ToDf32 },
+            Unary { src: 2, op: ToDf32 },
+            View { src: 4, view: Flip { axis: 0 } },
+            Cache { src: 3 },
+            Assign { target: 4, path: vec![InjFlip { axis: 0 }], rhs: Const(-2.0) },
         ],
     });
 }
@@ -426,8 +429,9 @@ fn lazy_array_fused_into_the_loop_state_is_replayed_with_the_traced_step() {
             Input { dims: [12, 1, 1, 1], ty: U32, seed: 0 },
             View { src: 0, view: Concat { axis: 0, others: vec![0] } },
             Compound { target: 1, op: Div, rhs: Const(2.0) },
-            Select { mask: 1, a: Const(0.0), b: Const(2.0), ty: F32 },
-            Loop { kind: IterateAll, steps: 2, states: vec![2], body: vec![Unary { src: 3, op: Neg }, AxisReduce { src: 1, axis: 0, op: Max }], next: vec![4] },
+            Compare { lhs: 1, rhs: Const(0.0), op: Gt },
+            Select { mask: 2, a: Const(0.0), b: Const(2.0), ty: F32 },
+            Loop { kind: IterateAll, steps: 2, states: vec![3], body: vec![Unary { src: 4, op: Neg }, AxisReduce { src: 1, axis: 0, op: Max }], next: vec![5] },
         ],
     });
 }
@@ -460,10 +464,11 @@ fn clone_of_a_lazy_array_misses_a_compound_assignment_after_a_lazy_slice_write()
         stmts: vec![
             Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
             View { src: 0, view: Concat { axis: 1, others: vec![0, 0] } },
-            Select { mask: 1, a: Const(5.0), b: Var(1), ty: U32 },
-            Alias { src: 2 },
-            Assign { target: 2, path: vec![InjSlice { axis: 1, lo: 6, hi: 13 }], rhs: Const(3.0) },
-            Compound { target: 2, op: Rem, rhs: Const(3.0) },
+            Compare { lhs: 1, rhs: Const(0.0), op: Gt },
+            Select { mask: 2, a: Const(5.0), b: Var(1), ty: U32 },
+            Alias { src: 3 },
+            Assign { target: 3, path: vec![InjSlice { axis: 1, lo: 6, hi: 13 }], rhs: Const(3.0) },
+            Compound { target: 3, op: Rem, rhs: Const(3.0) },
         ],
     });
 }
@@ -588,8 +593,9 @@ fn stack_of_a_generated_range_defines_the_global_index() {
         stmts: vec![
             Input { dims: [9, 6, 1, 1], ty: F32, seed: 0 },
             Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
-            Select { mask: 1, a: Var(1), b: Const(2.0), ty: U32 },
-            View { src: 2, view: Stack { axis: 0, others: vec![1] } },
+            Compare { lhs: 1, rhs: Const(0.0), op: Gt },
+            Select { mask: 2, a: Var(1), b: Const(2.0), ty: U32 },
+            View { src: 3, view: Stack { axis: 0, others: vec![1] } },
         ],
     });
 }
@@ -623,7 +629,8 @@ fn extents_of_one_broadcast_along_each_axis() {
             AxisReduce { src: 0, axis: 0, op: Max },
             Binary { lhs: Var(1), rhs: Var(2), op: Add },
             Range { dims: [7, 5, 1, 1], axis: 0, ty: U32 },
-            Select { mask: 4, a: Var(1), b: Var(2), ty: F32 },
+            Compare { lhs: 4, rhs: Const(0.0), op: Gt },
+            Select { mask: 5, a: Var(1), b: Var(2), ty: F32 },
             Compound { target: 0, op: Add, rhs: Var(2) },
         ],
     });
@@ -646,6 +653,87 @@ fn writes_into_read_only_views_fail() {
             Reshape { src: 1, dims: [10, 1, 1, 1] },
             Assign { target: 2, path: vec![], rhs: Const(1.0) },
             Assign { target: 0, path: vec![InjSlice { axis: 0, lo: 1, hi: 3 }], rhs: Const(1.0) },
+        ],
+    });
+}
+
+/// An `i32` constant that rounds to `2^31` as an `f32` saturates to `i32::MAX` (it does not wrap
+/// to `i32::MIN`) on both sides.
+#[test]
+fn i32_constants_saturate() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![Full { dims: [12, 1, 1, 1], ty: I32, value: 2147483600.0 }],
+    });
+}
+
+/// The edges of `i32` division, remainder, absolute value and shifts, as measured on WGSL:
+/// `MIN / -1 = MIN`, `x / 0 = x`, `MIN % -1 = 0`, `x % 0 = 0`, `abs(MIN) = MIN`, arithmetic `>>`
+/// by an amount modulo 32.
+#[test]
+fn i32_division_and_shift_edges() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: I32, seed: 7 },
+            Full { dims: [12, 1, 1, 1], ty: I32, value: -2147483648.0 },
+            Binary { lhs: Var(1), rhs: Const(-1.0), op: Div },
+            Binary { lhs: Var(1), rhs: Const(-1.0), op: Rem },
+            Binary { lhs: Var(0), rhs: Const(0.0), op: Div },
+            Binary { lhs: Var(0), rhs: Const(0.0), op: Rem },
+            Binary { lhs: Var(0), rhs: Var(1), op: Div },
+            Unary { src: 1, op: Abs },
+            Unary { src: 0, op: Neg },
+            Unary { src: 0, op: Sign },
+            Binary { lhs: Var(0), rhs: Const(33.0), op: Shr },
+            Binary { lhs: Var(0), rhs: Const(31.0), op: Shl },
+            Binary { lhs: Var(0), rhs: Var(0), op: Mul },
+        ],
+    });
+}
+
+/// Casts among `f32`, `u32`, `i32` and masks, and the mask operators, `count`, `any` and `all`.
+#[test]
+fn casts_and_mask_operations() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 5 },
+            Unary { src: 0, op: ToU32 },
+            Unary { src: 0, op: ToI32 },
+            Unary { src: 1, op: ToI32 },
+            Unary { src: 2, op: ToU32 },
+            Unary { src: 2, op: ToF32 },
+            Compare { lhs: 0, rhs: Const(0.5), op: Gt },
+            Compare { lhs: 2, rhs: Const(-1.0), op: Lt },
+            Binary { lhs: Var(6), rhs: Var(7), op: BitXor },
+            Unary { src: 8, op: Not },
+            Binary { lhs: Var(6), rhs: Var(9), op: BitAnd },
+            Count { src: 10 },
+            Reduce { src: 8, op: Max },
+            Reduce { src: 9, op: Min },
+            Unary { src: 9, op: ToU32 },
+            Unary { src: 9, op: ToF32 },
+            Select { mask: 9, a: Var(2), b: Const(-5.0), ty: I32 },
+            SumWhere { src: 2, mask: 9 },
+        ],
+    });
+}
+
+/// `x & -1` is `x` but `x & i32::MAX` is not: an `i32` constant that saturates to `i32::MAX`
+/// (here `2^32`) was taken for all ones by the simplifier.
+#[test]
+fn i32_and_with_a_saturating_constant_is_not_the_identity() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [8, 8, 1, 1], ty: I32, seed: 18312717770150919551 },
+            Binary { lhs: Var(0), rhs: Const(4294967300.0), op: BitAnd },
+            Binary { lhs: Var(0), rhs: Const(-1.0), op: BitAnd },
         ],
     });
 }

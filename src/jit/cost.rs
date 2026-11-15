@@ -107,7 +107,16 @@ pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
         OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::Linspace) => 2.0,
         OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal) => 60.0,
     };
-    let arithmetic = matches!(op.kind, OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Clamp | OpKind::Compare(_))
+    // The double-float math library takes about this many double-float operations (see
+    // `builtin::DF_MATH_LIBRARY`).
+    let base = match (op.ty, op.kind) {
+        (ElemTy::Df32, OpKind::Unary(UnOp::Exp)) => 20.0,
+        (ElemTy::Df32, OpKind::Unary(UnOp::Ln)) => 16.0,
+        (ElemTy::Df32, OpKind::Unary(UnOp::Tanh)) => 24.0,
+        (ElemTy::Df32, OpKind::Powf) => 40.0,
+        _ => base,
+    };
+    let arithmetic = matches!(op.kind, OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Clamp | OpKind::Compare(_) | OpKind::Powf)
         && !matches!(op.kind, OpKind::Unary(UnOp::Id));
     match op.ty {
         ElemTy::Df32 if arithmetic => base * cost.df32_factor,
@@ -276,7 +285,11 @@ mod tests {
         assert_eq!(op_weight(mul(ElemTy::F64), &cost), 3.0);
         assert_eq!(op_weight(mul(ElemTy::F64), &CostModel { f64_factor: None, ..cost }), 32.0);
         assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Sqrt), ElemTy::F32), &cost), 4.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Tanh), ElemTy::Df32), &cost), 320.0);
+        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Tanh), ElemTy::Df32), &cost), 480.0);
+        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Exp), ElemTy::Df32), &cost), 400.0);
+        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Ln), ElemTy::Df32), &cost), 320.0);
+        assert_eq!(op_weight(Op::new(OpKind::Powf, ElemTy::Df32), &cost), 800.0);
+        assert_eq!(op_weight(Op::new(OpKind::Powf, ElemTy::F32), &cost), 16.0);
         assert_eq!(op_weight(Op::new(OpKind::Cast(ElemTy::Df32), ElemTy::F32), &cost), 4.0);
         assert_eq!(op_weight(Op::new(OpKind::Generate(Gen::Normal), ElemTy::F32), &cost), 60.0);
     }

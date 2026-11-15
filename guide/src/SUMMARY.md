@@ -6,6 +6,7 @@
 - [Lazy evaluation and fusion](lazy.md)
 - [Views and writes](views.md)
 - [Reductions and scans](reductions.md)
+- [Matrices, statistics and grouping](data.md)
 - [Records](records.md)
 - [Loops](loops.md)
 - [Precision](precision.md)
@@ -18,4 +19,4 @@
 
 - [Environment variables](environment.md)
 - [FAQ and troubleshooting](faq.md)
-- [Migration from 0.2](migration.md)
+- [Migration from 0.3 and 0.2](migration.md)
