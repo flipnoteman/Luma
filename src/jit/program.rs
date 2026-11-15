@@ -10,6 +10,7 @@ use crate::builtin::{BinOp, ReduceList, UnOp};
 use crate::error::LumaError;
 use crate::gpu::hash::FxMap;
 use crate::matmul::{MatmulOperand, MatmulTile};
+use crate::solve::SolveSpec;
 use crate::scan::AxisPass;
 use crate::sort::RadixPass;
 use crate::profile::SplitReason;
@@ -122,13 +123,18 @@ pub(crate) enum Tail {
     /// `luma_key(i)`, the key loads of the kernel of `sort::fused_body`, whose own buffers come
     /// before and after the inputs (see `launch::radix_pass`).
     Radix(RadixPass),
+    /// The parts of a line solve (`solve::SolveSpec`): the roots are those of its parts that are
+    /// fused, in order. The program becomes `luma_cell(sys, i)`, which the kernel of
+    /// `solve::SolveSpec::body` reads the coefficients of every cell through (see
+    /// `launch::solve`).
+    Solve(SolveSpec),
 }
 
 impl Tail {
     /// Whether the roots of a program with this tail are read by it and never stored, so that
     /// they count as computed inside it (their nodes are fused, not evaluated).
     pub(super) fn consumes_roots(self) -> bool {
-        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_) | Tail::Radix(_))
+        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_) | Tail::Radix(_) | Tail::Solve(_))
     }
 }
 
@@ -285,6 +291,7 @@ impl FusedKey {
                 format!("FusedAxisReduce({}: {names}) {ty}", ops.join("+"))
             }
             Tail::Radix(_) => format!("FusedRadix({names}) {ty}"),
+            Tail::Solve(_) => format!("FusedSolve({names}) {ty}"),
             Tail::Reduce(ops) => {
                 let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
                 format!("FusedReduce({}: {names}) {ty}", ops.join("+"))

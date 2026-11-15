@@ -423,11 +423,15 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         Tail::Radix(pass) => Some(pass),
         _ => None,
     };
+    let solve = match key.tail {
+        Tail::Solve(spec) => Some(spec),
+        _ => None,
+    };
     let segmented = !key.spans.is_empty();
     let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
     // A product reads its operands at their own element indices: nothing is relative to a segment.
-    let based = generates(key) && !segmented && !matmul && !axis && radix.is_none();
-    let uniform = reduce || matmul || axis || radix.is_some() || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
+    let based = generates(key) && !segmented && !matmul && !axis && radix.is_none() && solve.is_none();
+    let uniform = reduce || matmul || axis || radix.is_some() || solve.is_some() || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based;
     let mut src = String::new();
 
     if uniform {
@@ -443,6 +447,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         }
         if radix.is_some() {
             src.push_str(crate::sort::PARAMS);
+        }
+        if solve.is_some() {
+            src.push_str("n: u32, stride: u32, lines: u32, ");
         }
         if segmented {
             src.push_str("base: u32, total: u32, ");
@@ -469,7 +476,8 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
         Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
         // The roots are the operands, read by `luma_lhs` / `luma_rhs`; the output is `c`.
         // The roots of a sort are its keys, read by `luma_key`; its buffers are declared below.
-        Tail::Matmul { .. } | Tail::Radix(_) => Vec::new(),
+        // The roots of a line solve are its parts, read by `luma_cell`; its buffers are declared below.
+        Tail::Matmul { .. } | Tail::Radix(_) | Tail::Solve(_) => Vec::new(),
         // The roots are the cells of the pass, read by `luma_eval`; the outputs are its own.
         Tail::AxisReduce(_) => Vec::new(),
     };
@@ -487,6 +495,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     if let Some(pass) = radix {
         // The roots are the keys, read by `luma_key`; the kernel's own buffers go around the inputs.
         pass.declare_writes(&mut src, &mut binding);
+    }
+    if let Some(spec) = solve {
+        spec.declare_writes(&mut src, &mut binding);
     }
     for (j, &at) in outputs.iter().enumerate() {
         // A reduction's single output is `out`, as `reduce_main` expects.
@@ -523,6 +534,9 @@ pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered:
     }
     if let Some(pass) = radix {
         pass.declare_reads(&mut src, &mut binding);
+    }
+    if let Some(spec) = solve {
+        spec.declare_reads(&mut src, &mut binding);
     }
     if uniform {
         let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
@@ -734,6 +748,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
             }
             src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs));
         }
+        Tail::Solve(spec) => {
+            let names = Names { views: &views, in_place: &[] };
+            let per = crate::solve::Io::parts_per_system(usize::from(spec.block));
+            let mut roots = key.outputs.iter().map(|&at| at as usize);
+            for s in 0..usize::from(spec.systems) {
+                let parts: Vec<Part> = (0..per)
+                    .map(|k| if spec.is_fused(s * per + k) { Part::Root(roots.next().unwrap_or(0)) } else { Part::Buffer(s * per + k) })
+                    .collect();
+                src.push_str(&load_cell(&format!("luma_cell{s}"), key, &parts, inlined, &names, index, segmented));
+            }
+            src.push_str(&spec.cell_dispatch());
+            src.push_str(&spec.body());
+        }
         Tail::Radix(pass) => {
             let names = Names { views: &views, in_place: &[] };
             let root = key.outputs.first().map_or(0, |&at| at as usize);
@@ -763,21 +790,68 @@ pub(super) fn load_function(
 ) -> String {
     let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
     let ty = key.instrs.get(out).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
-    let value = inlined.and_then(|inlined| inlined.main.get(out)).map_or(out, |&lowered| lowered as usize);
-    let computed = match inlined {
-        Some(inlined) => lowered_body(key, inlined, names, index, None, Some(&needed_lowered(inlined, value))),
-        None => body_with(&key.instrs, &key.input_tys, names, index, segmented, Some(&needed(&key.instrs, out)), &|_, _| None),
-    };
-    format!("\nfn {name}(i: u32) -> {ty} {{\n{global}{computed}    return t{value};\n}}\n")
+    let (computed, values) = computed_values(key, &[out], inlined, names, index, segmented);
+    format!("\nfn {name}(i: u32) -> {ty} {{\n{global}{computed}    return t{};\n}}\n", values[0])
 }
 
-/// Which instructions of the lowered program `inlined` the lowered instruction `root` needs,
-/// itself included: its operands, and those of the shifts that define the indices of the
-/// contexts it is computed at and reads at.
-fn needed_lowered(inlined: &Inlined, root: usize) -> Vec<bool> {
+/// One value a line solve reads at a cell: the root `at` of the program, or the buffer `pr{k}`.
+pub(super) enum Part {
+    Root(usize),
+    Buffer(usize),
+}
+
+/// `fn {name}(i: u32) -> array<f32, N> { ...; return array(...); }`: the `f32` values of `parts`
+/// at element `i`, in order, the roots computed together by the instructions they need (see
+/// [`load_function`]).
+pub(super) fn load_cell(
+    name: &str,
+    key: &FusedKey,
+    parts: &[Part],
+    inlined: Option<&Inlined>,
+    names: &Names,
+    index: &str,
+    segmented: bool,
+) -> String {
+    let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
+    let roots: Vec<usize> = parts.iter().filter_map(|part| if let Part::Root(at) = part { Some(*at) } else { None }).collect();
+    let (computed, values) = computed_values(key, &roots, inlined, names, index, segmented);
+    let mut values = values.into_iter();
+    let returned: Vec<String> = parts
+        .iter()
+        .map(|part| match part {
+            Part::Root(_) => format!("t{}", values.next().unwrap_or(0)),
+            Part::Buffer(k) => format!("pr{k}[i]"),
+        })
+        .collect();
+    format!("\nfn {name}(i: u32) -> array<f32, {n}> {{\n{global}{computed}    return array<f32, {n}>({});\n}}\n", returned.join(", "), n = parts.len())
+}
+
+/// The statements computing the instructions that the roots `outs` of the main program of `key`
+/// need (those of the lowered program `inlined` for a lowered key), and the instruction
+/// each root's value is in afterwards.
+fn computed_values(
+    key: &FusedKey,
+    outs: &[usize],
+    inlined: Option<&Inlined>,
+    names: &Names,
+    index: &str,
+    segmented: bool,
+) -> (String, Vec<usize>) {
+    let values: Vec<usize> = outs.iter().map(|&out| inlined.and_then(|inlined| inlined.main.get(out)).map_or(out, |&lowered| lowered as usize)).collect();
+    let computed = match inlined {
+        Some(inlined) => lowered_body(key, inlined, names, index, None, Some(&needed_lowered(inlined, &values))),
+        None => body_with(&key.instrs, &key.input_tys, names, index, segmented, Some(&needed(&key.instrs, outs)), &|_, _| None),
+    };
+    (computed, values)
+}
+
+/// Which instructions of the lowered program `inlined` the lowered instructions `roots` need,
+/// themselves included: their operands, and those of the shifts that define the indices of the
+/// contexts they are computed at and read at.
+fn needed_lowered(inlined: &Inlined, roots: &[usize]) -> Vec<bool> {
     let tmp = |arg: &Ref| if let Ref::Tmp(t) = arg { Some(*t as usize) } else { None };
     let mut keep = vec![false; inlined.instrs.len()];
-    let mut work = vec![root];
+    let mut work = roots.to_vec();
     while let Some(n) = work.pop() {
         let Some(slot) = keep.get_mut(n) else { continue };
         if std::mem::replace(slot, true) {
@@ -796,13 +870,16 @@ fn needed_lowered(inlined: &Inlined, root: usize) -> Vec<bool> {
     keep
 }
 
-/// Which instructions of `instrs` instruction `out` needs, itself included.
-fn needed(instrs: &[Instr], out: usize) -> Vec<bool> {
+/// Which instructions of `instrs` the instructions `outs` need, themselves included.
+fn needed(instrs: &[Instr], outs: &[usize]) -> Vec<bool> {
     let mut keep = vec![false; instrs.len()];
-    if let Some(root) = keep.get_mut(out) {
-        *root = true;
+    for &out in outs {
+        if let Some(root) = keep.get_mut(out) {
+            *root = true;
+        }
     }
-    for at in (0..=out.min(instrs.len().saturating_sub(1))).rev() {
+    let last = outs.iter().copied().max().unwrap_or(0);
+    for at in (0..=last.min(instrs.len().saturating_sub(1))).rev() {
         if keep[at] {
             for arg in instrs[at].args {
                 if let Ref::Tmp(t) = arg

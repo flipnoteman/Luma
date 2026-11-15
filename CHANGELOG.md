@@ -55,11 +55,29 @@ All notable changes to Luma are listed here. The format follows
   the sorted array).
 - `examples/bench_datasci.rs`: every primitive above against a hand-written WGSL kernel of the
   same algorithm (`--gate` fails on a GPU-time ratio above the case's threshold).
+- `solve_block_tridiagonal_parts` and `_from`: the block-tridiagonal solve on parts, the entries
+  of the blocks and the components of the right-hand side as arrays of their own (the result is
+  `[Array<f32>; B]`). Lazy parts are computed inside the solver kernel, so no stack, no unstack and
+  no evaluation of the parts: a step from the expressions to the solution is one launch. Falls back
+  to the stacked solve when the expressions need more buffers than a kernel binds.
+- `solve_tridiagonal_parts` and `_from`: up to 64 independent scalar systems on one grid in one
+  launch, with lazy parts fused likewise. `solve_tridiagonal` already batched systems along an
+  extra axis (`[2, ni, nj]` along axis 1 or 2); this is now documented.
+- `examples/bench_solve.rs`: the block line solves against a hand-written cyclic reduction kernel
+  (parallel cyclic reduction with a closed-form 4x4 inverse), and the solves on parts against the
+  stacked forms.
 
 ### Changed
 
 - `sum_axis`, `min_axis` and `max_axis` no longer evaluate a pending operand first: its expression
   is computed inside the first pass of the reduction (scans still evaluate it).
+- The cyclic-reduction line solve (one workgroup per line, chosen for few, long lines) is up to
+  1.7x faster on blocks of 2 to 4: rows are held as `vec4`s in workgroup memory, the blocks of
+  2 to 4 are inverted from their cofactors instead of by elimination (a zero diagonal needs no
+  pivot), the `vec4` coefficient buffers are read whole, and a workgroup has one invocation per
+  row (rounded up to a warp) instead of one per eight. 4x4 blocks, 70 lines of 144 rows on an
+  RTX 3090: 21 us to 13 us (a hand-written parallel cyclic reduction kernel takes 15 us). The
+  scratch of a line that does not fit workgroup memory holds `vec4` rows.
 
 ### Removed
 
