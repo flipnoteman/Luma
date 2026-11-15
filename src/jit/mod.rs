@@ -52,6 +52,9 @@
 //!   the program: the other fields of a record, see `program::with_siblings`), so that a residual
 //!   that a step update and a convergence norm both read is one multi-output kernel, not its
 //!   first field alone and then every shared intermediate of the others, level by level.
+//!   Arrays evaluated together (`eval_all`, `Fields::cache`) that read one another at the element
+//!   itself are one multi-output kernel too; one that another reads through a view is computed
+//!   first, since the reader would recompute it at every index it reads.
 //! * A view or gather (slice, pad, flip, transpose, `take`, broadcast) of a pending expression
 //!   that fits one buffer reads it lazily, as a sub-program computed at the read index, whatever
 //!   its size and however often it is read. The kernel computes every (expression, index) pair

@@ -52,6 +52,7 @@ and source line where an expression was cut, and the
 | `Scalars` | the scalar operands do not fit one uniform buffer |
 | `Inlined` | views of lazy expressions unfolded into more instructions than the device's cap |
 | `Materialised` | the [cost model](#the-cost-model) estimates that storing an expression once is cheaper than recomputing it at each read |
+| `Shared` | an expression that other pending operations outside the kernel read too is stored once instead of recomputed in each |
 
 ```rust
 use luma::*;

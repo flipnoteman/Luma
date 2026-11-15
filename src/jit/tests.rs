@@ -1752,6 +1752,61 @@ fn held_nodes_are_not_shared_but_their_temporaries_are() {
     assert_close(&v.to_vec().unwrap(), &want, 1e-5, 1e-6);
 }
 
+/// A record whose fields read each other at the element itself (a negated entry of a matrix next
+/// to the entry it negates) is one multi-output kernel, also when the expressions read shifted
+/// ones; a field that another reads through a view is computed first, as before.
+#[test]
+fn fields_that_read_each_other_at_the_element_are_one_kernel() {
+    use crate::fields::Fields;
+    let ctx = ctx();
+    let n = 300;
+    let xs = values(n, 101, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let base = &x * 3.0;
+    let a = base.slice(0, 1..n) * 2.0 + 1.0;
+    let ref_a: Vec<f32> = xs[1..].iter().map(|v| v * 6.0 + 1.0).collect();
+
+    // Neighbours of one stage, `a`, `-a` and a function of `-a` read at the element: one kernel.
+    let before = ctx.jit().stats();
+    let [a1, b1, c1] = [a.clone(), -&a, (-&a).abs().sqrt()].cache();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    assert_close(&a1.to_vec().unwrap(), &ref_a, 1e-5, 1e-6);
+    assert_close(&b1.to_vec().unwrap(), &ref_a.iter().map(|v| -v).collect::<Vec<_>>(), 1e-5, 1e-6);
+    assert_close(&c1.to_vec().unwrap(), &ref_a.iter().map(|v| v.abs().sqrt()).collect::<Vec<_>>(), 1e-5, 1e-6);
+
+    // A field read through a view is evaluated first: two kernels.
+    let a = base.slice(0, 1..n) * 2.0 + 1.0;
+    let (a2, d2) = (a.clone(), a.slice(0, 0..n - 2) * 0.5);
+    let before = ctx.jit().stats();
+    let [a2, d2] = [a2, d2].cache();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
+    assert_close(&a2.to_vec().unwrap(), &ref_a, 1e-5, 1e-6);
+    assert_close(&d2.to_vec().unwrap(), &ref_a[..n - 2].iter().map(|v| v * 0.5).collect::<Vec<_>>(), 1e-5, 1e-6);
+}
+
+#[test]
+fn a_node_stored_for_the_pending_operations_that_read_it_is_noted_as_a_cut() {
+    use crate::profile::SplitReason;
+    let ctx = ctx();
+    let n = 4000;
+    let xs = values(n, 102, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    ctx.set_cost_model(costly_arithmetic());
+    ctx.jit().record_splits();
+    let shared = &x * 3.0 + 1.0;
+    let shifted = shared.shift(1);
+    let other = &shared - 2.0;
+    let got_shifted = shifted.to_vec().unwrap();
+    let got_other = other.to_vec().unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let splits = ctx.jit().take_splits();
+    assert!(splits.iter().any(|split| matches!(split.reason, SplitReason::Shared { .. })), "{splits:?}");
+    assert!(splits.iter().all(|split| split.location.file().ends_with("tests.rs")), "{splits:?}");
+    let want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 3.0 + 1.0).collect();
+    assert_close(&got_shifted, &want, 1e-5, 1e-5);
+    assert_close(&got_other, &xs.iter().map(|&v| v * 3.0 - 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+}
+
 #[test]
 fn cuts_of_an_expression_are_noted_with_their_reason_and_place() {
     use crate::profile::SplitReason;

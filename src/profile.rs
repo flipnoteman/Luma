@@ -99,6 +99,12 @@ pub enum SplitReason {
         /// Times the kernel would have computed the expression.
         instances: usize,
     },
+    /// An expression that other pending operations outside the kernel read too is stored once
+    /// and read back by both: computing it in each costs more than the write and the read.
+    Shared {
+        /// Operations of the expression, in f32 operations.
+        weight: usize,
+    },
 }
 
 /// A point where an expression was cut into several kernels, and why.
@@ -123,6 +129,7 @@ impl fmt::Display for FusionSplit {
             SplitReason::Scalars { words, limit } => write!(f, "{words} scalar words > {limit}"),
             SplitReason::Inlined { instructions, limit } => write!(f, "{instructions} inlined operations > {limit}"),
             SplitReason::Materialised { instances } => write!(f, "{instances} recomputations of an expression cost more than storing it"),
+            SplitReason::Shared { weight } => write!(f, "an expression of {weight} operations read by pending operations outside the kernel is stored, not recomputed in each"),
         }
     }
 }

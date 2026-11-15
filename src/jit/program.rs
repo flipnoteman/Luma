@@ -1095,6 +1095,15 @@ impl Plain {
     }
 }
 
+/// Notes the cut of each of `shared`, nodes evaluated before the expression of `root` because
+/// pending operations outside it read them too.
+fn note_shared(root: &Arc<Node>, shared: &[Arc<Node>]) {
+    let jit = root.context().jit();
+    for node in shared {
+        jit.note_split(node.name, node.location, SplitReason::Shared { weight: node.weight() as usize });
+    }
+}
+
 /// The nodes of `shared` that no other of them reads. Evaluating those first leaves the others
 /// without a reader outside the expression (what made them shared) once the readers that made
 /// them shared are evaluated: they are then computed inside those kernels, once, instead of in
@@ -1171,6 +1180,7 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
             .map(|(member, _)| Arc::clone(member))
             .collect();
         if !shared.is_empty() && !is_alone(root) && evaluation_fits(std::iter::once((root, args)), &shared) {
+            note_shared(root, &shared);
             force_group(&shared)?;
             continue;
         }
@@ -1428,6 +1438,9 @@ fn flatten_once(
             break (graph, root_at, passes, None);
         }
         let candidates = passes.members.iter().chain(&sub_members).filter(|&&at| !is_root(at)).map(|&at| &graph.items[at as usize].node);
+        if let Some((root, _)) = roots.first() {
+            note_shared(root, &shared);
+        }
         let forced = with_siblings(shared, candidates);
         force_group(&forced)?;
     };
