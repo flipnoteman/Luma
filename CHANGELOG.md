@@ -6,6 +6,18 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `Array::filter(&mask)` (the elements where an `Array<bool>` or non-zero `Array<u32>` mask holds, in
+  flat order) and `nonzero()` (their flat indices) for every `ScalarType` incl. `bool`, as a
+  count / scan / scatter compaction on the GPU: about as fast as a copy (0.15 ms for 2^24 `f32`
+  with half kept on an RTX 3090, equal to a hand-written kernel). They return `Result<Option<_>>`:
+  `None` when nothing is selected (luma has no empty arrays), and they synchronize once (~100 µs)
+  to read the count. `filter_padded(&mask, fill)` and `nonzero_padded(fill)` do not: a full-length
+  array (kept elements, then `fill`) and the count as a one-element array.
+- `topk(k)` and `bottomk(k)` for `u32`, `i32` and `f32`: the `k` largest (smallest) values and
+  their flat indices, by a full radix sort.
+
 ## [0.4.0] - 2026-11-14
 
 ### Breaking

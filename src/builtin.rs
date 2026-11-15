@@ -576,6 +576,13 @@ pub(crate) enum Builtin {
     /// a split [`Builtin::Matmul`]. Arguments: out, part, uniform `{s}`; `luma.size.x` is the
     /// elements of `out`.
     MatmulSum,
+    /// Counts the set bits of every tile of a bit-packed mask; see [`crate::filter`]. Arguments:
+    /// counts, mask, uniform `{len, nwords, tiles}`. Element type `"u32"`.
+    FilterCount,
+    /// Writes the selected elements (`words` `u32` per element) or, with `index`, their indices;
+    /// see [`crate::filter`]. Arguments: out, src (unless `index`), mask, scanned tile counts,
+    /// uniform `{len, nwords, tiles}`. Element type `"u32"`.
+    FilterScatter { words: u8, index: bool },
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -1516,6 +1523,8 @@ impl Builtin {
             Builtin::Radix { pass, first } => crate::sort::source(pass, first).into(),
             Builtin::Matmul { tile, aligned, split } => crate::matmul::builtin_source(tile, aligned, split).into(),
             Builtin::MatmulSum => crate::matmul::sum_source(wg).into(),
+            Builtin::FilterCount => crate::filter::count_source().into(),
+            Builtin::FilterScatter { words, index } => crate::filter::scatter_source(words, index).into(),
             Builtin::NonFinite => format!(
                 "@group(1) @binding(0) var<storage, read_write> out: array<u32>;
 @group(1) @binding(1) var<storage, read> a: array<u32>;

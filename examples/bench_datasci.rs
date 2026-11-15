@@ -578,6 +578,38 @@ fn case_group_sum(b: &mut Bench) {
     });
 }
 
+/// `x.filter(&mask)` of `2^24` `f32` with about half kept (mask evaluated, bit-packed) against the
+/// hand count / offsets / scatter kernels. Both sides are verified against the host selection
+/// first. The hand kernels are given the selected count (the library reads it back, which
+/// shows in the wall time but not in the GPU time).
+fn case_filter(b: &mut Bench) {
+    b.guarded("filter/f32", |b| {
+        let ctx = b.ctx.clone();
+        let n = if b.quick { 1usize << 20 } else { 1 << 24 };
+        let hx = values(n, 80, -1.0, 1.0);
+        let keep: Vec<bool> = codes(n, 81, 100).iter().map(|&c| c < 50).collect();
+        let want: Vec<f32> = hx.iter().zip(&keep).filter(|&(_, &k)| k).map(|(&v, _)| v).collect();
+        let x = Array::from_slice_on(&ctx, &hx, n).unwrap();
+        let mask = Array::from_slice_on(&ctx, &keep, n).unwrap();
+        let hand = hand::HandCompact::new(&ctx).unwrap();
+        let mut out = Array::<f32>::zeros_on(&ctx, want.len()).unwrap();
+
+        let got = x.filter(&mask).unwrap().unwrap();
+        check_exact("filter/f32 luma", &got.to_vec().unwrap(), &want);
+        hand.run(&ctx, &x, &mask, &mut out, n);
+        check_exact("filter/f32 hand", &out.to_vec().unwrap(), &want);
+
+        b.compare(
+            "filter/f32",
+            &format!("{n}->{}", want.len()),
+            Work::Bytes(4.0 * (n + want.len()) as f64),
+            Some(DEFAULT_GATE),
+            &mut || x.filter(&mask).unwrap().unwrap().eval().unwrap(),
+            &mut || hand.run(&ctx, &x, &mask, &mut out, n),
+        );
+    });
+}
+
 /// Entries `(row, column)` of an `m x n` result to verify: all of them if few, else a
 /// pseudo-random sample (a host GEMM at 4096^3 is too slow).
 fn sample_entries(m: usize, n: usize, seed: u64) -> Vec<(usize, usize)> {
@@ -814,6 +846,7 @@ fn main() {
     case_scatter_add(&mut b);
     case_group_sum(&mut b);
     case_sort(&mut b);
+    case_filter(&mut b);
     cmp_matmul(&mut b);
     cmp_gram(&mut b);
     smoke_axpy(&mut b);

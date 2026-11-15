@@ -92,6 +92,7 @@ mod fields_macro;
 mod fuzz;
 mod fft;
 mod factorize;
+mod filter;
 mod generate;
 mod gpu;
 mod gpu_type;

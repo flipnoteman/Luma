@@ -311,3 +311,56 @@ assert_eq!(t.median_axis(0).to_vec()?, vec![2.5, 25.0]);
 
 NaNs sort last, so they only affect the high quantiles; NumPy returns NaN for every quantile of
 an array with a NaN, this does not.
+
+## Selecting elements
+
+`x.filter(&mask)` returns the elements where a mask holds, in flat order, as a one-dimensional
+array; the mask is an `Array<bool>` (a comparison, for example) or an `Array<u32>` whose non-zero
+elements are selected, and has the shape of `x`. `mask.nonzero()` returns the flat indices of the
+selected elements (axis 0 varies fastest, so element `[i0, i1]` of a `[d0, d1]` array has index
+`i0 + d0 * i1`). Both are a count, a scan and a scatter on the GPU, about as fast as copying the
+array.
+
+The length of the result depends on the data, so both read the count back and synchronise once
+(about 100 µs on an RTX 3090), and return `Result<Option<Array<_>>>`: `None` means nothing was
+selected, because luma has no arrays without elements, and selecting nothing is a result rather
+than an error.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[5.0f32, -1.0, 7.0, -3.0, 2.0], 5)?;
+let positive = x.gt(0.0);
+assert_eq!(x.filter(&positive)?.unwrap().to_vec()?, vec![5.0, 7.0, 2.0]);
+assert_eq!(positive.nonzero()?.unwrap().to_vec()?, vec![0, 2, 4]);
+assert!(x.filter(&x.gt(10.0))?.is_none());
+# Ok::<(), luma::LumaError>(())
+```
+
+To stay on the device, `filter_padded(&mask, fill)` and `nonzero_padded(fill)` return an array of
+the full length (the selected elements first, then `fill`) and the number of selected elements as
+a lazy one-element array.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[5.0f32, -1.0, 7.0, -3.0, 2.0], 5)?;
+let (kept, count) = x.filter_padded(&x.gt(0.0), 0.0);
+assert_eq!(kept.to_vec()?, vec![5.0, 7.0, 2.0, 0.0, 0.0]);
+assert_eq!(count.item()?, 3);
+# Ok::<(), luma::LumaError>(())
+```
+
+`topk(k)` and `bottomk(k)` of a `u32`, `i32` or `f32` array return the `k` largest (smallest)
+values and their flat indices, largest (smallest) first, ties in input order, NaNs counting as
+the largest. They sort the whole array with `argsort`, so the cost does not depend on `k`.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[3.0f32, 9.0, 1.0, 7.0], 4)?;
+let (values, indices) = x.topk(2);
+assert_eq!(values.to_vec()?, vec![9.0, 7.0]);
+assert_eq!(indices.to_vec()?, vec![1, 3]);
+# Ok::<(), luma::LumaError>(())
+```

@@ -605,3 +605,152 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         self.kernel.launch_raw(grid, args![codes, vals, out, uniform(&p)]).unwrap();
     }
 }
+
+#[derive(encase::ShaderType)]
+struct CompactParams {
+    len: u32,
+    nwords: u32,
+    tiles: u32,
+}
+
+/// Stream compaction of an `f32` array by a bit-packed mask (`Array<bool>`): three kernels.
+/// Tiles of 8192 elements (a workgroup of 256 takes one mask word each): (1) per-tile popcounts,
+/// (2) one workgroup turns the `tiles <= 4096` counts into exclusive offsets, (3) each tile scans
+/// its 256 word counts in workgroup memory, then 256 invocations walk the tile 256 elements at a
+/// time so that loads and stores are consecutive, writing every selected element to
+/// `offset + rank`. The scratch for the counts is allocated on the first `run` and reused while
+/// the size is unchanged.
+pub struct HandCompact {
+    count: Kernel,
+    offsets: Kernel,
+    scatter: Kernel,
+    scratch: std::cell::RefCell<Option<(usize, Array<u32>)>>,
+}
+
+impl HandCompact {
+    pub fn new(ctx: &Context) -> Result<HandCompact> {
+        const COUNT: &str = r#"
+struct P { len: u32, nwords: u32, tiles: u32 }
+@group(1) @binding(0) var<storage, read_write> tile_count: array<u32>;
+@group(1) @binding(1) var<storage, read> bits: array<u32>;
+@group(1) @binding(2) var<uniform> p: P;
+var<workgroup> part: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(num_workgroups) nw: vec3<u32>) {
+    let tile = wg.x + wg.y * nw.x;
+    if (tile >= p.tiles) { return; }
+    let word = tile * 256u + tid;
+    part[tid] = select(0u, countOneBits(bits[word]), word < p.nwords);
+    workgroupBarrier();
+    var width = 128u;
+    loop {
+        if (tid < width) { part[tid] += part[tid + width]; }
+        workgroupBarrier();
+        if (width == 1u) { break; }
+        width = width >> 1u;
+    }
+    if (tid == 0u) { tile_count[tile] = part[0]; }
+}
+"#;
+        const OFFSETS: &str = r#"
+struct P { len: u32, nwords: u32, tiles: u32 }
+@group(1) @binding(0) var<storage, read_write> tile_count: array<u32>;
+@group(1) @binding(1) var<uniform> p: P;
+var<workgroup> sums: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) tid: u32) {
+    // 16 consecutive tiles per invocation.
+    var run = 0u;
+    for (var j = 0u; j < 16u; j++) {
+        let t = tid * 16u + j;
+        if (t < p.tiles) { run += tile_count[t]; }
+    }
+    sums[tid] = run;
+    workgroupBarrier();
+    for (var d = 1u; d < 256u; d = d << 1u) {
+        var v = sums[tid];
+        if (tid >= d) { v += sums[tid - d]; }
+        workgroupBarrier();
+        sums[tid] = v;
+        workgroupBarrier();
+    }
+    var base = sums[tid] - run;
+    for (var j = 0u; j < 16u; j++) {
+        let t = tid * 16u + j;
+        if (t < p.tiles) {
+            let c = tile_count[t];
+            tile_count[t] = base;
+            base += c;
+        }
+    }
+}
+"#;
+        const SCATTER: &str = r#"
+struct P { len: u32, nwords: u32, tiles: u32 }
+@group(1) @binding(0) var<storage, read_write> out: array<f32>;
+@group(1) @binding(1) var<storage, read> x: array<f32>;
+@group(1) @binding(2) var<storage, read> bits: array<u32>;
+@group(1) @binding(3) var<storage, read> offset: array<u32>;
+@group(1) @binding(4) var<uniform> p: P;
+var<workgroup> words: array<u32, 256>;
+var<workgroup> scan: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(num_workgroups) nw: vec3<u32>) {
+    let tile = wg.x + wg.y * nw.x;
+    if (tile >= p.tiles) { return; }
+    let word = tile * 256u + tid;
+    let w = select(0u, bits[word], word < p.nwords);
+    words[tid] = w;
+    let own = countOneBits(w);
+    scan[tid] = own;
+    workgroupBarrier();
+    for (var d = 1u; d < 256u; d = d << 1u) {
+        var v = scan[tid];
+        if (tid >= d) { v += scan[tid - d]; }
+        workgroupBarrier();
+        scan[tid] = v;
+        workgroupBarrier();
+    }
+    // Rank of the first element of word `k` of the tile: offset + scan[k] - count(k).
+    let origin = offset[tile];
+    let lane = tid & 31u;
+    let lower = (1u << lane) - 1u;
+    for (var step = 0u; step < 32u; step++) {
+        let k = step * 8u + (tid >> 5u);
+        let wk = words[k];
+        if (((wk >> lane) & 1u) != 0u) {
+            let before = scan[k] - countOneBits(wk);
+            out[origin + before + countOneBits(wk & lower)] = x[tile * 8192u + step * 256u + tid];
+        }
+    }
+}
+"#;
+        Ok(HandCompact {
+            count: ctx.kernel(COUNT).label("hand_compact_count").build()?,
+            offsets: ctx.kernel(OFFSETS).label("hand_compact_offsets").build()?,
+            scatter: ctx.kernel(SCATTER).label("hand_compact_scatter").build()?,
+            scratch: std::cell::RefCell::new(None),
+        })
+    }
+
+    /// Records `out[..count] = x[mask]`; `n <= 4096 * 8192` elements.
+    pub fn run(&self, ctx: &Context, x: &Array<f32>, mask: &Array<bool>, out: &mut Array<f32>, n: usize) {
+        let tiles = n.div_ceil(8192);
+        assert!(tiles <= 4096, "HandCompact: at most 4096 tiles");
+        let mut scratch = self.scratch.borrow_mut();
+        if scratch.as_ref().is_none_or(|(t, _)| *t != tiles) {
+            *scratch = Some((tiles, Array::<u32>::zeros_on(ctx, tiles).unwrap()));
+        }
+        let counts = &mut scratch.as_mut().unwrap().1;
+        let p = CompactParams { len: n as u32, nwords: n.div_ceil(32) as u32, tiles: tiles as u32 };
+        let grid = grid_2d(tiles);
+        self.count.launch_raw(grid, args![&mut *counts, mask, uniform(&p)]).unwrap();
+        self.offsets.launch_raw([1, 1, 1], args![&mut *counts, uniform(&p)]).unwrap();
+        self.scatter.launch_raw(grid, args![out, x, mask, &*counts, uniform(&p)]).unwrap();
+    }
+}
