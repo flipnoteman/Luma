@@ -57,6 +57,11 @@ impl std::fmt::Debug for Reduced {
 }
 
 impl Reduced {
+    /// The node whose values the reduction reduces.
+    pub(crate) fn operand(&self) -> &Arc<Node> {
+        &self.operand
+    }
+
     /// The error of the operand's evaluation or of the recorded passes, if any.
     pub(crate) fn failure(&self) -> Option<&Arc<LumaError>> {
         self.operand.failure().or_else(|| self.result.get().and_then(|result| result.as_ref().err()))

@@ -448,6 +448,42 @@ struct Graph {
     trace: bool,
     /// Pending nodes (by address) that stand for an input: leaves.
     boundary: Vec<*const Node>,
+    /// The ids of the placeholder buffers of a traced step (see [`flatten_inner`]); a pending leaf
+    /// that computes from one is not evaluated here.
+    probes: Vec<u64>,
+}
+
+/// Whether evaluating `leaf`, a pending node without operands (the output of a loop that has not run,
+/// or a reduction that has not been recorded), would read one of the buffers with the ids `probes`.
+/// A leaf that is not known to be independent of them counts as reading them.
+fn leaf_reads_probes(leaf: &Arc<Node>, probes: &[u64]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![Arc::clone(leaf)];
+    while let Some(node) = stack.pop() {
+        if node.result.get().is_some() || !seen.insert(Arc::as_ptr(&node)) {
+            continue;
+        }
+        match node.operands() {
+            Some(args) => {
+                for arg in args.iter().take(node.op.kind.arity()) {
+                    match arg {
+                        Src::Buffer(storage) if probes.contains(&storage.id()) => return true,
+                        Src::Node(operand) => stack.push(Arc::clone(operand)),
+                        _ => {}
+                    }
+                }
+            }
+            None => {
+                if node.looped.get().is_some() {
+                    return true;
+                }
+                if let Some(reduced) = node.deferred.get() {
+                    stack.push(Arc::clone(reduced.operand()));
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The item of a node, by the id of the node: an array over the ids that can be below the roots
@@ -496,9 +532,14 @@ impl Index {
 }
 
 impl Graph {
-    fn new<'a>(roots: impl Iterator<Item = &'a Arc<Node>> + Clone, trace: bool, boundary: Vec<*const Node>) -> Self {
+    fn new<'a>(
+        roots: impl Iterator<Item = &'a Arc<Node>> + Clone,
+        trace: bool,
+        boundary: Vec<*const Node>,
+        probes: &[u64],
+    ) -> Self {
         let expected: usize = roots.clone().map(|root| root.size()).sum();
-        Graph { items: Vec::with_capacity(expected), index: Index::new(roots, expected), trace, boundary }
+        Graph { items: Vec::with_capacity(expected), index: Index::new(roots, expected), trace, boundary, probes: probes.to_vec() }
     }
 
     /// The items by the address of their nodes.
@@ -573,6 +614,13 @@ impl Graph {
         let Some(args) = node.operands() else {
             if self.trace {
                 return Err(Failure::New(LumaError::Gpu("traced step reads a node under evaluation".into())));
+            }
+            // A leaf that computes from the placeholders of a traced step must not run here: this
+            // is not the recording, so it would read the placeholders as they are (unspecified
+            // data, or the first state) and every step would read that value. The traced step
+            // records it with the other launches instead.
+            if !self.probes.is_empty() && leaf_reads_probes(node, &self.probes) {
+                return Err(Failure::New(LumaError::Gpu("traced step reads a leaf computed from its state".into())));
             }
             // Another thread is evaluating it right now; wait for its buffer.
             return match node.force() {
@@ -1359,7 +1407,7 @@ fn flatten_once(
     let (graph, root_at, passes, signature) = loop {
         // Every pending node below the roots is read once, here: the walks below only follow
         // indices (see [`Graph`]).
-        let mut graph = Graph::new(roots.iter().map(|(root, _)| root), false, Vec::new());
+        let mut graph = Graph::new(roots.iter().map(|(root, _)| root), false, Vec::new(), probes);
         let added: Vec<(u32, bool)> = roots.iter().map(|(root, args)| graph.add_root(root, args.clone())).collect();
         for &(at, new) in &added {
             if new {
@@ -1891,7 +1939,7 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
         return None;
     }
 
-    let mut graph = Graph::new(roots.iter(), true, flat.boundary.iter().map(|&(ptr, _)| ptr).collect());
+    let mut graph = Graph::new(roots.iter(), true, flat.boundary.iter().map(|&(ptr, _)| ptr).collect(), &[]);
     let mut root_at = Vec::with_capacity(roots.len());
     for root in roots {
         if !root.is_pending() {

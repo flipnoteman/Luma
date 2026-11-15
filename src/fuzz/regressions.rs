@@ -794,3 +794,65 @@ fn bool_loop_state_promote_df32() {
         ],
     });
 }
+
+/// Finding 17 (found by `fuzz::threads`, only when programs ran at once; deterministic once
+/// minimized): `iterate_all` whose step is lazy and reads a reduction of the state (`sum` of a
+/// one-element state added to the max). Flattening the step for a register loop evaluated the
+/// reduction on the placeholder, which is not the recording and holds unspecified data (a pooled
+/// buffer: whatever other threads had in it), and the step then used that value at every step.
+#[test]
+fn iterate_all_step_reading_a_reduction_of_its_state_computes_it_at_every_step() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: U32, seed: 7274293018610354030 },
+            AxisReduce { src: 0, axis: 0, op: Max },
+            Unary { src: 1, op: ToF32 },
+            Loop { kind: IterateAll, steps: 6, states: vec![2], body: vec![Reduce { src: 3, op: Sum }, Binary { lhs: Var(4), rhs: Var(2), op: Minimum }, Range { dims: [8, 8, 1, 1], axis: 0, ty: F32 }], next: vec![5] },
+        ],
+    });
+}
+
+/// Finding 18 (fuzz seed `41ebf540`): `iterate_all` over a state of several buffers whose step
+/// returns the state unchanged (here `-(-(-(-x)))`) returned the placeholder, which borrows the
+/// state's buffers; `state *= result` then bound one buffer twice.
+#[test]
+fn iterate_all_over_a_chunked_state_does_not_return_its_placeholder() {
+    check(Program {
+        config: Config { chunk_bytes: Some(1024), ..Config::default_engine() },
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: F32, seed: 0 },
+            Input { dims: [300, 1, 1, 1], ty: Df32, seed: 0 },
+            Binary { lhs: Var(0), rhs: Const(-2.0), op: Minimum },
+            Loop { kind: IterateAll, steps: 4, states: vec![1], body: vec![Binary { lhs: Const(0.5), rhs: Var(2), op: Mul }, Range { dims: [300, 1, 1, 1], axis: 0, ty: F32 }, Compare { lhs: 4, rhs: Const(2.0), op: Le }, Unary { src: 3, op: Neg }, Binary { lhs: Var(4), rhs: Var(4), op: Minimum }], next: vec![7] },
+            Compound { target: 1, op: Mul, rhs: Var(3) },
+        ],
+    });
+}
+
+/// Finding 19 (found by `fuzz::threads`; OPEN): a kernel that fuses a slice with `trunc` binds
+/// the view's parameter uniform, but its shader does not read it, so `create_bind_group` fails
+/// with "Number of bindings (3) does not match ... (2)". Like finding 7f7fa18 (a `bool` to `Df32`
+/// cast) it is fatal for every program that shares the context: the error invalidates the batch
+/// command buffer, the other threads' kernels in it never run and their arrays hold whatever the
+/// pooled buffers held (the CI failures of 0.4.0 were that bug with the cast).
+#[test]
+#[ignore = "open: fused slice + trunc binds an unread uniform"]
+fn slice_of_a_difference_then_trunc_then_assign_binds_an_unread_uniform() {
+    check(Program {
+        config: Config::default_engine(),
+        math: false,
+        stmts: vec![
+            Input { dims: [8, 8, 1, 1], ty: F32, seed: 9481416801333318266 },
+            View { src: 0, view: Slice { axis: 0, lo: 6, hi: 7 } },
+            Loop { kind: PerStepEval, steps: 6, states: vec![1], body: vec![View { src: 1, view: ShiftMirror { offs: vec![1, 2] } }], next: vec![3] },
+            View { src: 2, view: Slice { axis: 0, lo: 0, hi: 1 } },
+            Binary { lhs: Var(2), rhs: Var(3), op: Sub },
+            View { src: 4, view: Slice { axis: 0, lo: 0, hi: 1 } },
+            Unary { src: 5, op: Trunc },
+            Assign { target: 6, path: vec![], rhs: Const(-2.0) },
+        ],
+    });
+}

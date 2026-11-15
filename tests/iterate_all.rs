@@ -264,3 +264,43 @@ fn iterate_replays_a_step_with_a_cache_and_an_assignment() {
     }
     assert_close(&got.to_vec().unwrap(), &want.to_vec().unwrap(), 1e-5, 1e-6);
 }
+
+/// The step reads a reduction of its state (`sum` of one element plus a captured array). The
+/// reduction must run at every step: flattening the step for a register loop used to evaluate it
+/// once on the placeholder, whose buffer holds unspecified data.
+#[test]
+fn a_step_reading_a_reduction_of_its_state_computes_it_at_every_step() {
+    let ctx = Context::new().unwrap();
+    let c = f32s_on(&ctx, &[20.0]);
+    for _ in 0..3 {
+        // Leave different data in the pool each time: the placeholder is a pooled buffer.
+        let junk = f32s_on(&ctx, &[-3.5]);
+        junk.to_vec().unwrap();
+        drop(junk);
+        let s = f32s_on(&ctx, &[20.0]);
+        let [r] = iterate_all([&s], 3, |s| [s[0].sum() + &c]);
+        assert_eq!(values_of(&r), [80.0]);
+    }
+    // The captured reduction does not depend on the state: still correct.
+    let x = f32s_on(&ctx, &[1.0, 2.0, 3.0]);
+    let s = f32s_on(&ctx, &[0.0]);
+    let [r] = iterate_all([&s], 4, |s| [s[0].clone() + x.sum()]);
+    assert_eq!(values_of(&r), [24.0]);
+}
+
+/// A step that returns its state unchanged returns an array of its own, not the placeholder that
+/// borrows the state's buffers (`state *= result` bound one buffer twice).
+#[test]
+fn an_identity_step_over_a_chunked_state_returns_an_independent_array() {
+    let ctx = Context::with_options(ContextOptions::from_env().chunk_bytes(1024)).unwrap();
+    let data: Vec<f32> = (0..300).map(|i| i as f32).collect();
+    let mut s = f32s_on(&ctx, &data);
+    let [r] = iterate_all([&s], 2, |p| [p[0].clone()]);
+    s *= &r;
+    let want: Vec<f32> = data.iter().map(|v| v * v).collect();
+    assert_eq!(values_of(&s), want);
+}
+
+fn values_of(array: &Array<f32>) -> Vec<f32> {
+    array.to_vec().unwrap()
+}

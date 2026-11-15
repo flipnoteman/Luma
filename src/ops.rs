@@ -273,6 +273,20 @@ impl<T: ScalarType> Array<T> {
         Array::resolve(self.context(), self.shape(), result, "copy", location)
     }
 
+    /// This array evaluated, and copied if it is (or became, `-(-x)`) a placeholder of an
+    /// iteration step: the placeholder borrows the buffers of the state it stands for, and an
+    /// array that is returned to the caller must not (a write into the state with it would bind
+    /// one buffer twice). A failure shows when the array is used.
+    #[track_caller]
+    pub(crate) fn detached(self) -> Array<T> {
+        if !self.storage().is_ok_and(|storage| storage.is_alias()) {
+            return self;
+        }
+        let copy = self.copied();
+        let _ = copy.storage();
+        copy
+    }
+
     /// `self op rhs` (or `rhs op self` if `scalar_left`, which only exists for scalars),
     /// producing elements of type `O`.
     fn run_binary<O: GpuType>(

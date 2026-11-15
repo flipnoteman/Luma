@@ -527,6 +527,33 @@ fn main() {
     s
 }
 
+/// What the words of the gate's state say: the steps that ran and why the loop stopped. The gate
+/// wrote them, so a stop at a step outside `1..=max_steps`, or by a condition that does not
+/// exist, can only be a device or driver that returned something else than it was given: that is
+/// an error, not an index into the host's arrays.
+fn gate_outcome(
+    done: u32,
+    count: u32,
+    reason: u32,
+    base: usize,
+    max_steps: usize,
+    conditions: usize,
+) -> Outcome<(usize, StopReason)> {
+    if done == 0 {
+        return Ok((base, StopReason::MaxSteps));
+    }
+    let steps = count as usize;
+    match (reason as usize).checked_sub(1) {
+        Some(condition) if condition < conditions && (1..=max_steps).contains(&steps) => {
+            Ok((steps, StopReason::Predicate(condition)))
+        }
+        _ => Err(Failure::New(LumaError::Gpu(format!(
+            "iterate_until_all read a state back that the GPU cannot have written: stopped={done} \
+             steps={count} condition={reason} (at most {max_steps} steps and {conditions} conditions)"
+        )))),
+    }
+}
+
 // -- The loop. --
 
 fn state_from<S: Fields>(arrays: Vec<Array<S::Elem>>) -> S {
@@ -800,9 +827,7 @@ fn gated_run<S: Fields>(
             base += in_block;
             block = crate::jit::next_block(in_block, until.check_every);
             if done != 0 || base >= max_steps {
-                let steps = if done != 0 { count as usize } else { base };
-                let reason =
-                    if done != 0 { StopReason::Predicate(reason as usize - 1) } else { StopReason::MaxSteps };
+                let (steps, reason) = gate_outcome(done, count, reason, base, max_steps, conds.len())?;
                 let all: Vec<f32> = ctx.read::<f32>(&hist, hist_bytes)?;
                 let histories = (0..records).map(|r| all[r * max_steps..r * max_steps + steps].to_vec()).collect();
                 return Ok((steps, reason, histories));
@@ -829,6 +854,21 @@ mod tests {
 
     fn hist() -> History {
         History::new(vec!["a".into(), "b".into()])
+    }
+
+    #[test]
+    fn the_gate_state_read_back_is_checked_before_it_indexes_host_arrays() {
+        // A loop that ran all its steps, and one a condition (the second of two) stopped at step 3.
+        assert_eq!(gate_outcome(0, 0, 0, 16, 16, 2).ok(), Some((16, StopReason::MaxSteps)));
+        assert_eq!(gate_outcome(1, 3, 2, 16, 16, 2).ok(), Some((3, StopReason::Predicate(1))));
+        assert_eq!(gate_outcome(1, 16, 1, 16, 16, 2).ok(), Some((16, StopReason::Predicate(0))));
+        // Words the gate cannot write: float bit patterns seen in the wild, a step past the maximum,
+        // step 0, a condition of 0 (the gate stores `index + 1`) or beyond the last one.
+        for (count, reason) in [(4_294_967_231, 1), (1_065_353_216, 1), (17, 1), (0, 1), (3, 0), (3, 3)] {
+            let Err(failure) = gate_outcome(1, count, reason, 16, 16, 2) else { panic!("a corrupt state is an error") };
+            let message = failure.into_error().to_string();
+            assert!(message.contains("cannot have written"), "{message}");
+        }
     }
 
     #[test]

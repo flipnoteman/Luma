@@ -202,7 +202,8 @@ fn iterate_all_aliased<T: ScalarType, const N: usize>(
     for state in &states {
         state.check()?;
     }
-    Ok(states)
+    // A step that returns its argument unchanged returns the placeholder.
+    Ok(states.map(Array::detached))
 }
 
 impl Array<f32> {
@@ -257,7 +258,7 @@ impl Array<f32> {
                     u = step(&u);
                 }
                 u.check()?;
-                Ok(u)
+                Ok(u.detached())
             }
         }
     }

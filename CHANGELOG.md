@@ -45,6 +45,20 @@ All notable changes to Luma are listed here. The format follows
   (found by the fuzzer, mostly on `LUMA_DEVICE=cpu`): the program counted the cast as a reader of
   the double-float guard uniform and bound it, but the cast reads nothing from it, so the shader
   compiler dropped the binding.
+- `iterate_all` (and `iterate`, `iterate_until`) whose step is a lazy expression that reads a
+  reduction of the state (`s.sum() + &c`, `s / s.sum()`) could compute that reduction once, on
+  the placeholder that stands for the state while the step is traced: not the recording, and a
+  pooled buffer holding unspecified data (what other threads had left in it, so the result
+  depended on what ran at the same time: found by the concurrent fuzzer, `fuzz::threads`).
+  Flattening the traced step for a register loop no longer evaluates a leaf that reads the
+  placeholders; such a step is recorded and replayed with the reduction in it.
+- `iterate_all` and `iterate` over an array of several buffers returned the placeholder of the
+  state when the step returned its argument unchanged (`-(-x)`), which shares the state's
+  buffers: `state *= result` failed with `Kernel arguments 0 and 1 share one buffer`. The
+  result is now an array of its own.
+- `iterate_until_all` indexed its host arrays with the step count and stop condition it read
+  back from the GPU, so a corrupt value (a driver or device fault) panicked with
+  `range end index ... out of range`; it now returns `LumaError::Gpu`.
 
 ## [0.4.0] - 2026-11-14
 
