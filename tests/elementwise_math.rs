@@ -43,9 +43,12 @@ fn trunc_and_round_follow_numpy_on_f32_and_f64() {
         let wide: Vec<f64> = data.iter().map(|&v| f64::from(v) * 1.0000000001).chain([0.5, 1.5, 2.5, -2.5, 4503599627370497.5]).collect();
         let x = Array::from_slice_on(&ctx, &wide, wide.len()).unwrap();
         let (round, trunc) = (x.round().to_vec().unwrap(), x.trunc().to_vec().unwrap());
+        let (floor, ceil) = (x.floor().to_vec().unwrap(), x.ceil().to_vec().unwrap());
         for (i, &v) in wide.iter().enumerate() {
             assert_eq!(round[i], v.round_ties_even(), "f64 round({v})");
             assert_eq!(trunc[i], v.trunc(), "f64 trunc({v})");
+            assert_eq!(floor[i], v.floor(), "f64 floor({v})");
+            assert_eq!(ceil[i], v.ceil(), "f64 ceil({v})");
         }
     }
 }
