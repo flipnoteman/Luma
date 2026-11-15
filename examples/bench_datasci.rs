@@ -779,6 +779,53 @@ fn case_sort(b: &mut Bench) {
     });
 }
 
+/// `edges.searchsorted(&x, side)` of `2^24` values (a few NaNs) in `2^16` sorted edges (NaNs
+/// last) against the hand-written loop binary search, both sides. Both verified against the
+/// host `partition_point` first.
+fn case_search(b: &mut Bench) {
+    for (side, name) in [(Side::Left, "left"), (Side::Right, "right")] {
+        b.guarded(&format!("searchsorted/{name}"), |b| {
+            let ctx = b.ctx.clone();
+            let (n, len) = if b.quick { (1usize << 18, 1usize << 12) } else { (1 << 24, 1 << 16) };
+            let mut hx = values(n, 90, -0.25, 1.25);
+            for i in (0..n).step_by(100_003) {
+                hx[i] = f32::NAN;
+            }
+            // Edges with repeats, so that the sides differ.
+            let mut he: Vec<f32> = values(len, 91, 0.0, 1.0).iter().map(|v| (v * 4096.0).round() / 4096.0).collect();
+            he[len - 3] = f32::NAN;
+            he[len - 1] = f32::NAN;
+            he.sort_by(f32::total_cmp);
+            let before = |e: f32, v: f32| match (e.is_nan(), v.is_nan()) {
+                (true, _) => false,
+                (false, true) => true,
+                (false, false) => if side == Side::Left { e < v } else { e <= v },
+            };
+            let nan_right = |e: f32, v: f32| side == Side::Right && v.is_nan() && e.is_nan();
+            let want: Vec<u32> = hx.iter().map(|&v| he.partition_point(|&e| before(e, v) || nan_right(e, v)) as u32).collect();
+            let x = Array::from_slice_on(&ctx, &hx, n).unwrap();
+            let edges = Array::from_slice_on(&ctx, &he, len).unwrap();
+            let hand = hand::HandSearchSorted::new(&ctx, side == Side::Right).unwrap();
+            let mut out = Array::<u32>::zeros_on(&ctx, n).unwrap();
+
+            let r = edges.searchsorted(&x, side);
+            r.eval().unwrap();
+            check_exact(&format!("searchsorted/{name} luma"), &r.to_vec().unwrap(), &want);
+            hand.run(&edges, &x, &mut out, n, len);
+            check_exact(&format!("searchsorted/{name} hand"), &out.to_vec().unwrap(), &want);
+
+            b.compare(
+                &format!("searchsorted/{name}"),
+                &format!("{n}->{len}"),
+                Work::Bytes(8.0 * n as f64),
+                Some(DEFAULT_GATE),
+                &mut || edges.searchsorted(&x, side).eval().unwrap(),
+                &mut || hand.run(&edges, &x, &mut out, n, len),
+            );
+        });
+    }
+}
+
 fn main() {
     let mut quick = false;
     let mut gate = false;
@@ -817,6 +864,7 @@ fn main() {
     cmp_matmul(&mut b);
     cmp_gram(&mut b);
     smoke_axpy(&mut b);
+    case_search(&mut b);
 
     if !b.skipped.is_empty() {
         println!("\n{} case(s) SKIPPED:", b.skipped.len());

@@ -57,6 +57,14 @@ pub(crate) enum UnOp {
     Sign,
     Floor,
     Ceil,
+    /// Rounds toward zero.
+    Trunc,
+    /// Rounds to the nearest integer, halves to the even one (as NumPy's `round`).
+    Round,
+    /// `ln(1 + x)`, accurate for small `x`.
+    Log1p,
+    /// `e^x - 1`, accurate for small `x`.
+    Expm1,
     /// The identity: a copy of the operand (internal).
     Id,
     /// Bitwise complement (`u32` only).
@@ -85,6 +93,38 @@ fn by_constant(kind: usize, amount: u8) -> &'static str {
     &tables[kind][usize::from(amount & 31)]
 }
 
+/// `x / (2 + x)` and its square: the argument of the series of [`log1p_expr`].
+const LOG1P_S: &str = "(x / (2.0 + x))";
+
+/// `ln(1 + x)` of `f32`: for `-0.5 < x < 1` the series `2 s (1 + s^2/3 + s^4/5 + ..)` of
+/// `2 atanh(s)` with `s = x / (2 + x)` (`|s| <= 1/3`, terms to `s^15`), which keeps the relative
+/// accuracy at small `x` where `log(1 + x)` has none; `log(1 + x)` elsewhere, where `1 + x` is
+/// exact below `-0.5` and loses at most a bit above 1. NaN fails both tests and stays NaN.
+fn log1p_expr() -> &'static str {
+    static EXPR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXPR.get_or_init(|| {
+        let (s, w) = (LOG1P_S, format!("({LOG1P_S} * {LOG1P_S})"));
+        let mut series = "0.13333334".to_owned();
+        for c in ["0.15384616", "0.18181819", "0.22222222", "0.2857143", "0.4", "0.6666667", "2.0"] {
+            series = format!("({c} + {w} * {series})");
+        }
+        format!("select(log(1.0 + x), {s} * {series}, (x > -0.5) & (x < 1.0))")
+    })
+}
+
+/// `e^x - 1` of `f32`: the Taylor series to `x^12 / 12!` for `|x| < 1`, `exp(x) - 1` elsewhere,
+/// where the subtraction loses at most 1.4 bits.
+fn expm1_expr() -> &'static str {
+    static EXPR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXPR.get_or_init(|| {
+        let mut series = "2.0876757e-9".to_owned();
+        for c in ["2.5052108e-8", "2.7557319e-7", "2.7557319e-6", "2.4801587e-5", "0.0001984127", "0.0013888889", "0.008333334", "0.041666668", "0.16666667", "0.5", "1.0"] {
+            series = format!("({c} + x * {series})");
+        }
+        format!("select(exp(x) - 1.0, x * {series}, abs(x) < 1.0)")
+    })
+}
+
 impl UnOp {
     /// The operation as a WGSL expression of the operand `x`.
     pub(crate) fn expr(self) -> &'static str {
@@ -103,6 +143,10 @@ impl UnOp {
             UnOp::Sign => "sign(x)",
             UnOp::Floor => "floor(x)",
             UnOp::Ceil => "ceil(x)",
+            UnOp::Trunc => "trunc(x)",
+            UnOp::Round => "round(x)",
+            UnOp::Log1p => log1p_expr(),
+            UnOp::Expm1 => expm1_expr(),
             UnOp::Id => "x",
             UnOp::BitNot => "~x",
             UnOp::Shl(k) => by_constant(0, k),
@@ -125,6 +169,10 @@ impl UnOp {
             UnOp::Sign => "sign",
             UnOp::Floor => "floor",
             UnOp::Ceil => "ceil",
+            UnOp::Trunc => "trunc",
+            UnOp::Round => "round",
+            UnOp::Log1p => "log1p",
+            UnOp::Expm1 => "expm1",
             UnOp::Id => "copy",
             UnOp::BitNot => "not",
             UnOp::Shl(_) => "shl",
@@ -174,7 +222,7 @@ impl UnOp {
             ElemTy::F32 if self.is_bitwise() => None,
             ElemTy::F32 => Some(self.expr()),
             ElemTy::F64 => match self {
-                UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id => Some(self.expr()),
+                UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id => Some(self.expr()),
                 _ => None,
             },
             ElemTy::Df32 => match self {
@@ -184,6 +232,8 @@ impl UnOp {
                 UnOp::Exp => Some("df_exp(x)"),
                 UnOp::Ln => Some("df_ln(x)"),
                 UnOp::Tanh => Some("df_tanh(x)"),
+                UnOp::Log1p => Some("df_log1p(x)"),
+                UnOp::Expm1 => Some("df_expm1(x)"),
                 UnOp::Id => Some("x"),
                 _ => None,
             },
@@ -754,7 +804,7 @@ fn df_two_prod(a: f32, b: f32) -> vec2<f32> {
     .replace("{G}", guard)
 }
 
-/// `exp`, `ln`, `tanh` and `pow` on `vec2<f32>` double-floats, on top of [`df_library`] (a kernel
+/// `exp`, `ln`, `tanh`, `log1p`, `expm1` and `pow` on `vec2<f32>` double-floats, on top of [`df_library`] (a kernel
 /// that calls them defines both; see `codegen::library_for`).
 ///
 /// Every function is accurate to a relative 2^-43 (`tests/df32_library.rs` measures 4.3e-14 at
@@ -770,6 +820,9 @@ fn df_two_prod(a: f32, b: f32) -> vec2<f32> {
 ///   series in `z^2`, `|z| <= 0.172`: the relative accuracy holds near `x = 1`.
 /// - `tanh`: `(e^{2|x|} - 1) / (e^{2|x|} + 1)` from the same `e^r - 1`, so small arguments keep
 ///   their relative accuracy; `1` from `|x| > 20`.
+/// - `log1p`: for `1 + x` in `[1/sqrt 2, sqrt 2)` the same series with `z = x / (2 + x)` taken
+///   from `x` itself (no cancellation), else `ln(1 + x)`.
+/// - `expm1`: the `e^r - 1` of the reduction of `exp`, plus `2^k` minus 1 where `k != 0`.
 /// - `pow(x, y)` is `2^(y e) * exp(y ln m)` for `x = 2^e m` with `y e` split exactly into an
 ///   integer and a fraction, so that the error does not grow with `y ln x` (it is that of an
 ///   `exp` and an `ln` and a product of at most `y ln m`, `|ln m| <= 0.35`). `NaN` for a negative
@@ -812,6 +865,16 @@ fn df_exp(x: vec2<f32>) -> vec2<f32> {
     if (x.x < -87.33) { return vec2<f32>(0.0, 0.0); }
     return df_exp_scaled(x, 0.0);
 }
+fn df_atanh2(z: vec2<f32>) -> vec2<f32> {
+    let w = df_mul(z, z);
+    let h = w.x;
+    let c = 0.11111111 + h * (0.09090909 + h * (0.07692308 + h * (0.06666667 + h * (0.05882353 + h * 0.05263158))));
+    let q7 = df_add(vec2<f32>(0.14285715, -6.3862120e-9), vec2<f32>(h * c, 0.0));
+    let q5 = df_add(vec2<f32>(0.2, -2.9802323e-9), df_mul(w, q7));
+    let q3 = df_add(vec2<f32>(0.33333334, -9.9341078e-9), df_mul(w, q5));
+    let q1 = df_add(vec2<f32>(1.0, 0.0), df_mul(w, q3));
+    return df_mul(z, q1) * 2.0;
+}
 fn df_log_split(a: vec2<f32>) -> DfLog {
     let small = a.x < 1.17549435e-38;
     let x = select(a, a * 1.84467441e19, small);
@@ -820,14 +883,7 @@ fn df_log_split(a: vec2<f32>) -> DfLog {
     let e = i32(bits >> 23u) - 127 + select(0, 1, big);
     let m = df_scale(x, -e);
     let z = df_div(df_add(m, vec2<f32>(-1.0, 0.0)), df_add(m, vec2<f32>(1.0, 0.0)));
-    let w = df_mul(z, z);
-    let h = w.x;
-    let c = 0.11111111 + h * (0.09090909 + h * (0.07692308 + h * (0.06666667 + h * (0.05882353 + h * 0.05263158))));
-    let q7 = df_add(vec2<f32>(0.14285715, -6.3862120e-9), vec2<f32>(h * c, 0.0));
-    let q5 = df_add(vec2<f32>(0.2, -2.9802323e-9), df_mul(w, q7));
-    let q3 = df_add(vec2<f32>(0.33333334, -9.9341078e-9), df_mul(w, q5));
-    let q1 = df_add(vec2<f32>(1.0, 0.0), df_mul(w, q3));
-    return DfLog(f32(e - select(0, 64, small)), df_mul(z, q1) * 2.0);
+    return DfLog(f32(e - select(0, 64, small)), df_atanh2(z));
 }
 fn df_ln(x: vec2<f32>) -> vec2<f32> {
     if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
@@ -836,6 +892,25 @@ fn df_ln(x: vec2<f32>) -> vec2<f32> {
     if (x.x > 3.40282347e38) { return vec2<f32>(x.x, 0.0); }
     let s = df_log_split(x);
     return df_add(df_mul(vec2<f32>(s.e, 0.0), vec2<f32>(0.693147182, -1.90465421e-9)), s.l);
+}
+fn df_log1p(x: vec2<f32>) -> vec2<f32> {
+    if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
+    if ((x.x < -1.0) | ((x.x == -1.0) & (x.y < 0.0))) { return vec2<f32>(bitcast<f32>(0x7fc00000u), 0.0); }
+    if ((x.x == -1.0) & (x.y == 0.0)) { return vec2<f32>(-df_inf(), 0.0); }
+    if (x.x > 3.40282347e38) { return vec2<f32>(x.x, 0.0); }
+    if ((x.x > -0.29) & (x.x < 0.41)) { return df_atanh2(df_div(x, df_add(x, vec2<f32>(2.0, 0.0)))); }
+    return df_ln(df_add(vec2<f32>(1.0, 0.0), x));
+}
+fn df_expm1(x: vec2<f32>) -> vec2<f32> {
+    if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }
+    if (x.x > 88.722) { return vec2<f32>(df_inf(), 0.0); }
+    if (x.x < -87.33) { return vec2<f32>(-1.0, 0.0); }
+    let k = round(x.x * 1.44269502);
+    let p = df_expm1_small(df_exp_reduce(x, k));
+    if (k == 0.0) { return p; }
+    let e = df_scale(df_add(vec2<f32>(1.0, 0.0), p), i32(k));
+    if (e.x > 3.40282347e38) { return vec2<f32>(df_inf(), 0.0); }
+    return df_add(e, vec2<f32>(-1.0, 0.0));
 }
 fn df_tanh(x: vec2<f32>) -> vec2<f32> {
     if (df_isnan(x.x)) { return vec2<f32>(x.x, 0.0); }

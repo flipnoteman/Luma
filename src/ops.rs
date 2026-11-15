@@ -788,6 +788,18 @@ unary_methods! {
     floor => UnOp::Floor;
     /// Elementwise smallest integer not below `x`.
     ceil => UnOp::Ceil;
+    /// Elementwise integer part: `x` rounded toward zero.
+    trunc => UnOp::Trunc;
+    /// Elementwise nearest integer, halves to the even one (`0.5` -> `0`, `1.5` -> `2`, `2.5` ->
+    /// `2`), which is what WGSL's `round` and NumPy's `round` both do.
+    round => UnOp::Round;
+    /// Elementwise `ln(1 + x)`, accurate for `x` near 0 where `(1.0 + x).ln()` loses the digits
+    /// of `x`: a series in `x / (2 + x)` for `-0.5 < x < 1`, `ln(1 + x)` elsewhere (about
+    /// `1e-6` relative error). `-inf` at `-1`, NaN below it.
+    log1p => UnOp::Log1p;
+    /// Elementwise `e^x - 1`, accurate for `x` near 0 where `x.exp() - 1.0` cancels: a Taylor
+    /// series for `|x| < 1`, `exp(x) - 1` elsewhere.
+    expm1 => UnOp::Expm1;
 }
 
 macro_rules! impl_float_classes {
@@ -941,6 +953,10 @@ wide_unary_methods! { f64;
     floor => UnOp::Floor;
     /// Elementwise smallest integer not below `x`.
     ceil => UnOp::Ceil;
+    /// Elementwise integer part: `x` rounded toward zero.
+    trunc => UnOp::Trunc;
+    /// Elementwise nearest integer, halves to the even one (as [`Array<f32>::round`](Array::round)).
+    round => UnOp::Round;
 }
 
 wide_unary_methods! { i32;
@@ -964,6 +980,12 @@ wide_unary_methods! { Df32;
     tanh => UnOp::Tanh;
     /// Elementwise absolute value.
     abs => UnOp::Abs;
+    /// Elementwise `ln(1 + x)`, accurate to about 44 bits relative to the result also for `x`
+    /// near 0 (see [`Array<f32>::log1p`](Array::log1p)); `-inf` at `-1`, `NaN` below it.
+    log1p => UnOp::Log1p;
+    /// Elementwise `e^x - 1`, accurate to about 44 bits relative to the result also for `x` near
+    /// 0; infinity above `88.72`, `-1` below `-87.33`.
+    expm1 => UnOp::Expm1;
 }
 
 impl Array<Df32> {

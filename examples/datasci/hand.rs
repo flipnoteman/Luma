@@ -605,3 +605,58 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         self.kernel.launch_raw(grid, args![codes, vals, out, uniform(&p)]).unwrap();
     }
 }
+
+/// `out[i] = |{e in edges : e < v[i]}|` (`Left`) or `|{e : e <= v[i]}|` (`Right`) for `f32`
+/// values `v` and sorted `f32` edges (NaN last, equal to each other, above everything else): a
+/// binary search per invocation, one value each, over power-of-two steps in a loop (measured
+/// 2% faster than the `lo`/`hi` form), with the NaN-aware order tested by the bits of the probe.
+pub struct HandSearchSorted(Kernel);
+
+#[derive(encase::ShaderType)]
+struct SearchParams {
+    n: u32,
+    len: u32,
+}
+
+impl HandSearchSorted {
+    pub fn new(ctx: &Context, right: bool) -> Result<HandSearchSorted> {
+        let before = if right { "vn || (!isnan(e) && e <= v)" } else { "!isnan(e) && (vn || e < v)" };
+        let src = format!(
+            r#"
+struct P {{ n: u32, len: u32 }}
+@group(1) @binding(0) var<storage, read> edges: array<f32>;
+@group(1) @binding(1) var<storage, read> vals: array<f32>;
+@group(1) @binding(2) var<storage, read_write> out: array<u32>;
+@group(1) @binding(3) var<uniform> p: P;
+
+fn isnan(x: f32) -> bool {{ return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {{
+    let i = gid.x + gid.y * nw.x * 256u;
+    if (i >= p.n) {{ return; }}
+    let v = vals[i];
+    let vn = isnan(v);
+    var lo = 0u;
+    var step = 1u << (31u - countLeadingZeros(p.len));
+    loop {{
+        let idx = lo + step - 1u;
+        if (idx < p.len) {{
+            let e = edges[idx];
+            if ({before}) {{ lo += step; }}
+        }}
+        if (step == 1u) {{ break; }}
+        step >>= 1u;
+    }}
+    out[i] = lo;
+}}
+"#
+        );
+        ctx.kernel(&src).label(if right { "hand_searchsorted_right" } else { "hand_searchsorted_left" }).build().map(HandSearchSorted)
+    }
+
+    pub fn run(&self, edges: &Array<f32>, vals: &Array<f32>, out: &mut Array<u32>, n: usize, len: usize) {
+        let p = SearchParams { n: n as u32, len: len as u32 };
+        self.0.launch_raw(grid_2d(n.div_ceil(256)), args![edges, vals, out, uniform(&p)]).unwrap();
+    }
+}

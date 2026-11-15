@@ -56,7 +56,7 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Views: `slice` (`ViewMut` for writes), `pad`, `flip`, `transpose`, `take`, `put`, `concat`, `stack`, `broadcast_to`
 - Reductions: sum, min, max, mean, norm, along axes (`reduce_axis` computes several in one pass, with `mean_axis`, `var_axis`, `std_axis`); `scan` / `cumsum`; `solve_tridiagonal`
-- Data-science primitives: `matmul`; atomic scatters `put_add` / `put_min` / `put_max`, `bincount` and `histogram`; radix `sort`, `argsort`, `sort_axis`; `group_sum` / `group_mean` / `group_min` / `group_max` / `group_count`, `factorize` / `unique`; `quantile` and `median`. Pending operands are computed inside their kernels instead of being stored first
+- Data-science primitives: `matmul`; atomic scatters `put_add` / `put_min` / `put_max`, `bincount` and `histogram`; radix `sort`, `argsort`, `sort_axis`; `group_sum` / `group_mean` / `group_min` / `group_max` / `group_count`, `factorize` / `unique`; `quantile` and `median`; `searchsorted` / `digitize` / `isin`; NaN-aware reductions (`nansum`, `nanmean`, `nanmin`, `nanmax`); `round`, `trunc`, `log1p`, `expm1`. Pending operands are computed inside their kernels instead of being stored first
 - Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
@@ -143,7 +143,7 @@ cargo run --release --example bench_threads            # threads on one context 
 cargo run --release --example bench_build              # host cost of building and flattening expressions
 cargo run --release --example bench_pde                # views, assign/put, records, loops, scans, tridiagonal, Df32/f64
 cargo run --release --example keccak                   # Keccak-f, SHA3-256 and SHAKE128 in lazy array operations
-cargo run --release --example bench_datasci            # matmul, axis reductions, scatter, sort and group-by against hand-written WGSL kernels (--gate fails on a slower ratio)
+cargo run --release --example bench_datasci            # matmul, axis reductions, scatter, sort, group-by and searchsorted against hand-written WGSL kernels (--gate fails on a slower ratio)
 cargo run --release --example mlkem                    # ML-KEM (FIPS 203) KeyGen / Encaps / Decaps over batches, checked against RustCrypto and NIST vectors
 ```
 
