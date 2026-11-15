@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-87ce9916.js";
+            window.path_to_searchindex_js = "searchindex-5d650490.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e12c34ce.js"></script>
@@ -220,7 +220,7 @@ if ctx.features().contains(luma::wgpu::Features::SHADER_F64) {
     assert!(matches!(err.root(), LumaError::Unsupported(_)));
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><code>f64</code> arrays have <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>minimum</code>, <code>maximum</code>,
+<p><code>f64</code> arrays have <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>minimum</code>, <code>maximum</code>,
 comparisons, <code>select</code>, views and reductions. Anything else (<code>exp</code>, trigonometry, generators such
 as <code>range</code>) is refused when recorded. Use <code>Df32</code> when you need a wide type on every device, or
 cast down to <code>f32</code> for the function.</p>
@@ -243,13 +243,14 @@ assert!((f64::from(tiny) - ((1.0 + 1e-12) - 1.0)).abs() &lt; 1e-18);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><code>Array&lt;Df32&gt;</code> has <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, comparisons, <code>minimum</code>, <code>maximum</code>, <code>select</code>, views,
 <code>assign</code>, and reductions (<code>sum</code>, <code>min</code>, <code>max</code>; <code>item()</code> gives a <code>Df32</code>). It also has <code>exp</code>, <code>ln</code>,
-<code>tanh</code> and <code>powf</code> (below). It has no trigonometry: cast to <code>f32</code> and back around such a call.
+<code>tanh</code>, <code>log1p</code>, <code>expm1</code> and <code>powf</code> (below). It has no trigonometry: cast to <code>f32</code> and back around such a call.
 Scalars may be <code>Df32</code> values; a Rust <code>f32</code> literal in a <code>Df32</code> expression is not converted for you
 (write <code>Df32::from(1.0f32)</code> or build the array with <code>to_df32()</code>).</p>
-<p><strong>Functions.</strong> <code>exp</code>, <code>ln</code>, <code>tanh</code> and <code>powf(Df32)</code> are built from <code>Df32</code> arithmetic and fuse like
+<p><strong>Functions.</strong> <code>exp</code>, <code>ln</code>, <code>tanh</code>, <code>log1p</code>, <code>expm1</code> and <code>powf(Df32)</code> are built from <code>Df32</code> arithmetic and fuse like
 it. Their relative error is below <code>2^-43</code> (<code>1e-13</code>; at most <code>4.3e-14</code> measured against <code>f64</code> on the
 RTX 3090 and on llvmpipe): <code>exp</code> on <code>[-55, 80]</code>, <code>ln</code> from <code>1e-24</code> to <code>1e30</code> (and near 1, where the
-error is relative to the result), <code>tanh</code> on <code>[-30, 30]</code> (also near 0), and <code>x^1.5</code> or <code>x^0.7</code> for
+error is relative to the result), <code>tanh</code> on <code>[-30, 30]</code> (also near 0), <code>log1p</code> and <code>expm1</code> (also near 0: a series in the argument
+rather than <code>ln(1 + x)</code>), and <code>x^1.5</code> or <code>x^0.7</code> for
 <code>x</code> in <code>[1, 3000]</code>. <code>powf</code> splits the exponent of <code>x</code> exactly, so its error does not grow with
 <code>y ln x</code>. Where a <code>Df32</code> is below about <code>1e-25</code> its low word is under the smallest normal <code>f32</code>
 and loses bits, which limits every function there: <code>exp</code> of an argument under <code>-55</code> has an absolute

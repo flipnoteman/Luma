@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-87ce9916.js";
+            window.path_to_searchindex_js = "searchindex-5d650490.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e12c34ce.js"></script>
@@ -356,9 +356,9 @@ lazy and fuse:</p>
 <tr><th>Type</th><th>Methods</th></tr>
 </thead>
 <tbody>
-<tr><td><code>f32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>abs</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>; <code>powf(exponent)</code>, <code>clamp(lo, hi)</code> (host scalars); <code>atan2(x)</code>, <code>hypot(other)</code>, <code>copysign(sign)</code> (array or scalar)</td></tr>
-<tr><td><code>f64</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code></td></tr>
-<tr><td><code>Df32</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code> (<a href="#precision-1">Precision</a>)</td></tr>
+<tr><td><code>f32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>abs</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>log1p</code>, <code>expm1</code>; <code>powf(exponent)</code>, <code>clamp(lo, hi)</code> (host scalars); <code>atan2(x)</code>, <code>hypot(other)</code>, <code>copysign(sign)</code> (array or scalar)</td></tr>
+<tr><td><code>f64</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code></td></tr>
+<tr><td><code>Df32</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>log1p</code>, <code>expm1</code> (<a href="#precision-1">Precision</a>)</td></tr>
 <tr><td><code>i32</code></td><td><code>abs</code>, <code>sign</code>, <code>shl</code>, <code>shr</code> (<a href="#signed-integers-and-casts">Signed integers</a>)</td></tr>
 <tr><td><code>u32</code></td><td>bit operations, <code>shl</code>, <code>shr</code>, <code>rotate_left</code>, <code>rotate_right</code> (<a href="#integer-and-bit-operations">Integers</a>)</td></tr>
 <tr><td>every scalar type</td><td><code>minimum(rhs)</code>, <code>maximum(rhs)</code>, <code>lt</code> <code>le</code> <code>gt</code> <code>ge</code> <code>eq</code> <code>ne</code> (booleans), <code>select(&amp;cond, a, b)</code></td></tr>
@@ -1103,6 +1103,41 @@ assert_eq!(x.std_axis(0).to_vec()?[1], 5.0);
 let y = Array::from_slice(&amp;[1.0e4f32 + 1.0, 1.0e4 + 2.0, 1.0e4 + 3.0, 1.0e4 + 4.0], 4)?;
 assert!((y.var_axis(0).item()? - 1.25).abs() &lt; 1e-3);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="argmax-and-argmin"><a class="header" href="#argmax-and-argmin">Argmax and argmin</a></h2>
+<p><code>argmax</code> and <code>argmin</code> give the <strong>flat index</strong> of the largest or smallest element as a
+one-element <code>u32</code> array, recorded without waiting like <code>sum</code> and usable on the GPU at once. A
+pending operand is computed inside the first pass, never stored. <code>argmax_axis(axis)</code> and
+<code>argmin_axis(axis)</code> give, for every line along <code>axis</code>, the index <em>along the axis</em> (extent 1
+there in the result). The first of equal elements wins, and an <code>f32</code> NaN is returned before every number, by
+<code>argmin</code> as well as by <code>argmax</code> (the first NaN, as in NumPy). They work on <code>f32</code>, <code>u32</code> and <code>i32</code>
+(<code>f64</code> and <code>Df32</code> arrays poison the result with <code>Unsupported</code>, like the other reductions along
+an axis).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3.0f32, 9.0, 1.0, 9.0, 7.0, 2.0, 8.0, 0.5], [4, 2])?;
+assert_eq!(x.argmax().item()?, 1); // the first of the two 9s
+assert_eq!(x.argmin().item()?, 7);
+
+// Along axis 0 (a column of four per result): the row of the extreme of each column.
+assert_eq!(x.argmax_axis(0).to_vec()?, vec![1, 2]);
+assert_eq!(x.argmin_axis(0).to_vec()?, vec![2, 3]);
+
+// Along axis 1: which of the two columns is larger, for each row.
+assert_eq!(x.argmax_axis(1).to_vec()?, vec![1, 0, 1, 0]);
+
+// An expression is not stored: the index of the sample nearest to 7.5.
+let nearest = (&amp;x - 7.5).abs().argmin();
+assert_eq!(nearest.item()?, 4);
+
+// A NaN is found first, whichever extreme is asked for.
+let y = Array::from_slice(&amp;[1.0f32, f32::NAN, 5.0, f32::NAN], 4)?;
+assert_eq!((y.argmax().item()?, y.argmin().item()?), (1, 1));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A flat index <code>i</code> of a <code>[w, h]</code> array is the element at <code>(i % w, i / w)</code>. The passes are those of
+<code>sum_axis</code> (a workgroup per chunk of a contiguous line, blocks that an invocation walks for a
+strided one) carrying a (value, index) pair, so an <code>argmax_axis</code> reads the data once and costs
+the time of <code>max_axis</code>. Reading the result of <code>argmax()</code> back with <code>item()</code> is a host
+synchronization (about 100 µs); use it on the GPU (<code>x.take(&amp;x.argmax())</code>) to avoid it.</p>
 <h2 id="accumulating-scatters"><a class="header" href="#accumulating-scatters">Accumulating scatters</a></h2>
 <p><a href="#views-and-writes"><code>put</code></a> overwrites: of several equal indices one (unspecified) wins. <code>put_add</code>,
 <code>put_min</code> and <code>put_max</code> <em>combine</em> instead: every <code>i</code> does <code>self[indices[i]] += values[i]</code> (or
@@ -1241,6 +1276,210 @@ assert_eq!(t.median_axis(0).to_vec()?, vec![2.5, 25.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>NaNs sort last, so they only affect the high quantiles; NumPy returns NaN for every quantile of
 an array with a NaN, this does not.</p>
+<h2 id="selecting-elements"><a class="header" href="#selecting-elements">Selecting elements</a></h2>
+<p><code>x.filter(&amp;mask)</code> returns the elements where a mask holds, in flat order, as a one-dimensional
+array; the mask is an <code>Array&lt;bool&gt;</code> (a comparison, for example) or an <code>Array&lt;u32&gt;</code> whose non-zero
+elements are selected, and has the shape of <code>x</code>. <code>mask.nonzero()</code> returns the flat indices of the
+selected elements (axis 0 varies fastest, so element <code>[i0, i1]</code> of a <code>[d0, d1]</code> array has index
+<code>i0 + d0 * i1</code>). Both are a count, a scan and a scatter on the GPU, about as fast as copying the
+array.</p>
+<p>The length of the result depends on the data, so both read the count back and synchronise once
+(about 100 µs on an RTX 3090), and return <code>Result&lt;Option&lt;Array&lt;_&gt;&gt;&gt;</code>: <code>None</code> means nothing was
+selected, because luma has no arrays without elements, and selecting nothing is a result rather
+than an error.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[5.0f32, -1.0, 7.0, -3.0, 2.0], 5)?;
+let positive = x.gt(0.0);
+assert_eq!(x.filter(&amp;positive)?.unwrap().to_vec()?, vec![5.0, 7.0, 2.0]);
+assert_eq!(positive.nonzero()?.unwrap().to_vec()?, vec![0, 2, 4]);
+assert!(x.filter(&amp;x.gt(10.0))?.is_none());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>To stay on the device, <code>filter_padded(&amp;mask, fill)</code> and <code>nonzero_padded(fill)</code> return an array of
+the full length (the selected elements first, then <code>fill</code>) and the number of selected elements as
+a lazy one-element array.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[5.0f32, -1.0, 7.0, -3.0, 2.0], 5)?;
+let (kept, count) = x.filter_padded(&amp;x.gt(0.0), 0.0);
+assert_eq!(kept.to_vec()?, vec![5.0, 7.0, 2.0, 0.0, 0.0]);
+assert_eq!(count.item()?, 3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>topk(k)</code> and <code>bottomk(k)</code> of a <code>u32</code>, <code>i32</code> or <code>f32</code> array return the <code>k</code> largest (smallest)
+values and their flat indices, largest (smallest) first, ties in input order, NaNs counting as
+the largest. They sort the whole array with <code>argsort</code>, so the cost does not depend on <code>k</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3.0f32, 9.0, 1.0, 7.0], 4)?;
+let (values, indices) = x.topk(2);
+assert_eq!(values.to_vec()?, vec![9.0, 7.0]);
+assert_eq!(indices.to_vec()?, vec![1, 3]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="searching-sorted-arrays"><a class="header" href="#searching-sorted-arrays">Searching sorted arrays</a></h2>
+<p><code>sorted.searchsorted(&amp;values, side)</code> is NumPy’s <code>searchsorted</code>: element <code>i</code> of the result is the
+position where <code>values[i]</code> would be inserted into <code>sorted</code> to keep it ordered, <code>Side::Left</code> before
+the elements equal to it (the number of elements below it) and <code>Side::Right</code> after them (below or
+equal). <code>sorted</code> is one-dimensional and ascending, as <code>sort()</code> makes it (floats: NaNs last, larger
+than everything, equal to each other; <code>-0.0</code> equals <code>+0.0</code>); it works for <code>u32</code>, <code>i32</code> and <code>f32</code>.
+The result has the shape of <code>values</code>.</p>
+<p><code>x.digitize(&amp;edges, right)</code> is <code>np.digitize</code> for increasing edges: the number of the bin of each
+element, <code>0</code> below the first edge and <code>edges.len()</code> above the last, with <code>right</code> choosing whether a
+value on an edge belongs to the bin below (<code>edges[i - 1] &lt; x &lt;= edges[i]</code>) or above it
+(<code>edges[i - 1] &lt;= x &lt; edges[i]</code>). Together with <code>bincount</code> it is a histogram with uneven bins.
+<code>x.isin(&amp;set)</code> is <code>np.isin</code>: a <code>bool</code> array of whether each element is in <code>set</code> (any shape; NaN is
+in no set).</p>
+<pre><code class="language-rust">use luma::*;
+
+let edges = Array::from_slice(&amp;[0.0f32, 1.0, 2.5, 5.0], 4)?;
+let x = Array::from_slice(&amp;[-1.0f32, 0.0, 1.0, 2.5, 4.9, 9.0], 6)?;
+assert_eq!(edges.searchsorted(&amp;x, Side::Left).to_vec()?, vec![0, 0, 1, 2, 3, 4]);
+assert_eq!(edges.searchsorted(&amp;x, Side::Right).to_vec()?, vec![0, 1, 2, 3, 3, 4]);
+
+// Bins: [.., 0), [0, 1), [1, 2.5), [2.5, 5), [5, ..)
+let bins = x.digitize(&amp;edges, false);
+assert_eq!(bins.to_vec()?, vec![0, 1, 2, 3, 3, 4]);
+assert_eq!(bincount(&amp;bins, 5).to_vec()?, vec![1, 1, 1, 2, 1]);
+assert_eq!(x.digitize(&amp;edges, true).to_vec()?, vec![0, 0, 1, 2, 3, 4]);
+
+let allowed = Array::from_slice(&amp;[3u32, 5, 8], 3)?;
+let ids = Array::from_slice(&amp;[1u32, 3, 5, 7, 8], 5)?;
+assert_eq!(ids.isin(&amp;allowed).to_vec()?, vec![false, true, true, false, true]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The search is <em>lazy</em> and elementwise over the values: a lookup is one binary search per value,
+<code>ceil(log2(n + 1))</code> steps of gathers from <code>sorted</code>, and when the values are a pending expression
+(<code>(x * scale + offset)</code>) they are computed inside the kernel instead of being stored first.
+<code>sorted</code> is read as a buffer (a pending one is evaluated first). Measured on an RTX 3090,
+<code>2^24</code> values into <code>2^16</code> edges take 0.89 ms, 10% less than a hand-written WGSL binary search
+(<code>cargo run --release --example bench_datasci -- --only searchsorted</code>). <code>isin</code> sorts the set when it
+is called (eager, no host synchronisation; duplicates in the set do not matter) and then looks the
+elements up like <code>searchsorted</code> does and compares the element found. A <code>sorted</code> that is not
+one-dimensional poisons the result with <code>InvalidShape</code>.</p>
+<h2 id="nan-aware-reductions"><a class="header" href="#nan-aware-reductions">NaN-aware reductions</a></h2>
+<p><code>nansum</code>, <code>nanmean</code>, <code>nanmin</code> and <code>nanmax</code> skip the NaNs, as NumPy’s functions of the same names. Like
+<code>sum</code> and <code>min</code> they are lazy one-element arrays; <code>nansum_axis</code>, <code>nanmean_axis</code>, <code>nanmin_axis</code> and
+<code>nanmax_axis</code> reduce along an axis (extent 1 there in the result). An array of NaNs only has
+sum <code>0</code>, and mean, minimum and maximum NaN. Infinities are values: <code>nanmax</code> of <code>[NaN, inf]</code> is <code>inf</code>.
+<code>nansum</code>, <code>nanmin</code> and <code>nanmax</code> exist for <code>f32</code>, <code>f64</code> and <code>Df32</code>, the others (mean and the axis forms,
+for which <code>f64</code> and <code>Df32</code> have no reductions) for <code>f32</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two columns of three: [1, NaN, 3] and [4, NaN, NaN].
+let x = Array::from_slice(&amp;[1.0f32, f32::NAN, 3.0, 4.0, f32::NAN, f32::NAN], [3, 2])?;
+assert_eq!(x.nansum().item()?, 8.0);
+assert_eq!(x.nanmin().item()?, 1.0);
+assert_eq!(x.nanmax().item()?, 4.0);
+assert_eq!(x.nansum_axis(0).to_vec()?, vec![4.0, 4.0]);
+assert_eq!(x.nanmean_axis(0).to_vec()?, vec![2.0, 4.0]);
+assert_eq!(x.nanmin_axis(0).to_vec()?, vec![1.0, 4.0]);
+assert_eq!(x.nanmax_axis(0).to_vec()?, vec![3.0, 4.0]);
+
+let nothing = Array::from_slice(&amp;[f32::NAN; 3], 3)?;
+assert_eq!(nothing.nansum().item()?, 0.0);
+assert!(nothing.nanmean().item()?.is_nan() &amp;&amp; nothing.nanmin().item()?.is_nan());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The masking (<code>select(!is_nan(x), x, 0)</code>) is part of the reduction’s first pass, so a pending operand
+is not stored. <code>nansum</code> reads the elements once; <code>nanmean</code> (sum and count) and <code>nanmin</code> / <code>nanmax</code>
+(the extremum, and whether any element is not NaN, which tells an array of NaNs from one whose
+minimum is <code>inf</code>) read them twice.</p>
+<h2 id="more-elementwise-functions"><a class="header" href="#more-elementwise-functions">More elementwise functions</a></h2>
+<p><code>round</code>, <code>trunc</code>, <code>log1p</code> and <code>expm1</code> are lazy <code>f32</code> functions (<code>round</code> and <code>trunc</code> also for <code>f64</code>,
+<code>log1p</code> and <code>expm1</code> also for <code>Df32</code>). <code>round</code> goes to the nearest integer and <em>halves to the even
+one</em> (<code>0.5</code> is <code>0</code>, <code>1.5</code> and <code>2.5</code> are <code>2</code>), what NumPy’s <code>round</code> and WGSL’s <code>round</code> do; <code>trunc</code>
+rounds toward zero. <code>log1p(x)</code> is <code>ln(1 + x)</code> and <code>expm1(x)</code> is <code>e^x - 1</code>, accurate where
+<code>(1.0 + x).ln()</code> and <code>x.exp() - 1.0</code> have lost the digits of a small <code>x</code>: for <code>|x|</code> below 1
+(<code>expm1</code>) or in <code>(-0.5, 1)</code> (<code>log1p</code>) they evaluate a series, elsewhere the plain formula (about <code>1e-6</code>
+relative error; <code>Df32</code>: 44 bits).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[0.5f32, 1.5, 2.5, -0.5, -2.7], 5)?;
+assert_eq!(x.round().to_vec()?, vec![0.0, 2.0, 2.0, 0.0, -3.0]);
+assert_eq!(x.trunc().to_vec()?, vec![0.0, 1.0, 2.0, 0.0, -2.0]);
+
+let tiny = Array::from_slice(&amp;[1.0e-9f32, -1.0e-9], 2)?;
+// `(1.0 + x).ln()` is 0 for both: 1 + 1e-9 rounds to 1.
+for (got, want) in tiny.log1p().to_vec()?.iter().zip([1.0e-9f32, -1.0e-9]) {
+    assert!(((got - want) / want).abs() &lt; 1e-6);
+}
+for (got, want) in tiny.expm1().to_vec()?.iter().zip([1.0e-9f32, -1.0e-9]) {
+    assert!(((got - want) / want).abs() &lt; 1e-6);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="recipes"><a class="header" href="#recipes">Recipes</a></h2>
+<p>Small statistics and array manipulations that are a line or two of the operations above, and that
+fuse like them. Axis 0 varies fastest, as everywhere.</p>
+<p><strong><code>diff</code></strong> (differences of neighbours along an axis): two slices, one subtraction, no copy:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 4.0, 9.0, 16.0], 4)?;
+let n = x.len();
+let diff = x.slice(0, 1..) - x.slice(0, ..n - 1);
+assert_eq!(diff.to_vec()?, vec![3.0, 5.0, 7.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>cumprod</code></strong>, a scan with <code>*</code> (a running sum is <code>cumsum</code>, any associative operator can be scanned):</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+assert_eq!(x.scan(0, |a, b| a * b).to_vec()?, vec![1.0, 2.0, 6.0, 24.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>softmax</code> and <code>logsumexp</code></strong> along an axis: subtract the maximum first, so that <code>exp</code> cannot
+overflow; the subtraction and <code>exp</code> are computed inside the sum:</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two rows of three logits (axis 0 is the row).
+let logits = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0], [3, 2])?;
+let max = logits.max_axis(0);
+let e = (&amp;logits - &amp;max).exp();
+let total = e.sum_axis(0);
+let softmax = (&amp;e / &amp;total).to_vec()?;
+let logsumexp = (&amp;max + &amp;total.ln()).to_vec()?;
+let third = 1.0f32 / 3.0;
+for (got, want) in softmax.iter().zip([0.09003057, 0.24472848, 0.66524094, third, third, third]) {
+    assert!((got - want).abs() &lt; 1e-6, "{got} {want}");
+}
+assert!((logsumexp[0] - 3.4076059).abs() &lt; 1e-5 &amp;&amp; (logsumexp[1] - 3.0f32.ln()).abs() &lt; 1e-5);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>one_hot</code></strong> of class labels, one column per label: compare the labels with the class index
+(<code>range</code>), which broadcasts without a copy:</p>
+<pre><code class="language-rust">use luma::*;
+
+let labels = Array::from_slice(&amp;[2u32, 0, 1, 2], 4)?;
+let classes = Array::&lt;u32&gt;::range([3, 4], 0)?; // element (c, i) is c
+let one_hot = classes.eq(&amp;labels.reshape([1, 4])).to_f32();
+assert_eq!(one_hot.to_vec()?, vec![0., 0., 1., 1., 0., 0., 0., 1., 0., 0., 0., 1.]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong>Shuffles and random permutations</strong>: sort random keys and take the order (<code>argsort</code> is stable, so a
+tie of two keys keeps the input order and the result is a permutation regardless):</p>
+<pre><code class="language-rust">use luma::*;
+
+let keys = Array::uniform(8, 42)?; // the seed picks the permutation
+let order = keys.argsort();
+let data = Array::from_slice(&amp;[10u32, 11, 12, 13, 14, 15, 16, 17], 8)?;
+let mut shuffled = data.take(&amp;order).to_vec()?;
+shuffled.sort();
+assert_eq!(shuffled, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>cov</code> and <code>corr</code></strong> of a table with one column per feature (<code>[samples, features]</code>): the product of
+the centred (or standardised) data with its transpose, the centring fused into the product’s loads:</p>
+<pre><code class="language-rust">use luma::*;
+
+let samples = 4;
+// Two features: the second is twice the first.
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0], [samples, 2])?;
+let centred = &amp;x - &amp;x.mean_axis(0);
+let cov = (centred.matmul(&amp;centred.transpose()) / (samples as f32 - 1.0)).to_vec()?;
+for (got, want) in cov.iter().zip([5.0 / 3.0, 10.0 / 3.0, 10.0 / 3.0, 20.0 / 3.0]) {
+    assert!((got - want).abs() &lt; 1e-5, "{got} {want}");
+}
+let z = &amp;centred / &amp;x.std_axis(0);
+let corr = (z.matmul(&amp;z.transpose()) / (samples as f32)).to_vec()?;
+assert!(corr.iter().all(|c| (c - 1.0).abs() &lt; 1e-5));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>clip</code></strong> is <code>clamp</code>, with the bounds as plain numbers:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[-2.0f32, 0.5, 3.0], 3)?;
+assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="records"><a class="header" href="#records">Records</a></h1>
 <p>A flow solver has four fields per cell, a Monte Carlo step has a position and a velocity, a hash
@@ -1804,7 +2043,7 @@ if ctx.features().contains(luma::wgpu::Features::SHADER_F64) {
     assert!(matches!(err.root(), LumaError::Unsupported(_)));
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><code>f64</code> arrays have <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>minimum</code>, <code>maximum</code>,
+<p><code>f64</code> arrays have <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>minimum</code>, <code>maximum</code>,
 comparisons, <code>select</code>, views and reductions. Anything else (<code>exp</code>, trigonometry, generators such
 as <code>range</code>) is refused when recorded. Use <code>Df32</code> when you need a wide type on every device, or
 cast down to <code>f32</code> for the function.</p>
@@ -1827,13 +2066,14 @@ assert!((f64::from(tiny) - ((1.0 + 1e-12) - 1.0)).abs() &lt; 1e-18);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><code>Array&lt;Df32&gt;</code> has <code>+ - * /</code>, <code>sqrt</code>, <code>abs</code>, comparisons, <code>minimum</code>, <code>maximum</code>, <code>select</code>, views,
 <code>assign</code>, and reductions (<code>sum</code>, <code>min</code>, <code>max</code>; <code>item()</code> gives a <code>Df32</code>). It also has <code>exp</code>, <code>ln</code>,
-<code>tanh</code> and <code>powf</code> (below). It has no trigonometry: cast to <code>f32</code> and back around such a call.
+<code>tanh</code>, <code>log1p</code>, <code>expm1</code> and <code>powf</code> (below). It has no trigonometry: cast to <code>f32</code> and back around such a call.
 Scalars may be <code>Df32</code> values; a Rust <code>f32</code> literal in a <code>Df32</code> expression is not converted for you
 (write <code>Df32::from(1.0f32)</code> or build the array with <code>to_df32()</code>).</p>
-<p><strong>Functions.</strong> <code>exp</code>, <code>ln</code>, <code>tanh</code> and <code>powf(Df32)</code> are built from <code>Df32</code> arithmetic and fuse like
+<p><strong>Functions.</strong> <code>exp</code>, <code>ln</code>, <code>tanh</code>, <code>log1p</code>, <code>expm1</code> and <code>powf(Df32)</code> are built from <code>Df32</code> arithmetic and fuse like
 it. Their relative error is below <code>2^-43</code> (<code>1e-13</code>; at most <code>4.3e-14</code> measured against <code>f64</code> on the
 RTX 3090 and on llvmpipe): <code>exp</code> on <code>[-55, 80]</code>, <code>ln</code> from <code>1e-24</code> to <code>1e30</code> (and near 1, where the
-error is relative to the result), <code>tanh</code> on <code>[-30, 30]</code> (also near 0), and <code>x^1.5</code> or <code>x^0.7</code> for
+error is relative to the result), <code>tanh</code> on <code>[-30, 30]</code> (also near 0), <code>log1p</code> and <code>expm1</code> (also near 0: a series in the argument
+rather than <code>ln(1 + x)</code>), and <code>x^1.5</code> or <code>x^0.7</code> for
 <code>x</code> in <code>[1, 3000]</code>. <code>powf</code> splits the exponent of <code>x</code> exactly, so its error does not grow with
 <code>y ln x</code>. Where a <code>Df32</code> is below about <code>1e-25</code> its low word is under the smallest normal <code>f32</code>
 and loses bits, which limits every function there: <code>exp</code> of an argument under <code>-55</code> has an absolute
