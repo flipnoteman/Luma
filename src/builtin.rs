@@ -222,7 +222,16 @@ impl UnOp {
             ElemTy::F32 if self.is_bitwise() => None,
             ElemTy::F32 => Some(self.expr()),
             ElemTy::F64 => match self {
-                UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id => Some(self.expr()),
+                UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id => Some(self.expr()),
+                // The drivers' `f64` `round` and `trunc` are not exact everywhere (Mesa's lavapipe
+                // rounds -2.50000000025 to -2), so both are built from `floor` of `|x|` and exact
+                // `f64` arithmetic on its remainder; a zero keeps its sign, a NaN stays NaN.
+                UnOp::Round => Some(
+                    "select(x, select((floor(abs(x)) + select(f64(0.0), f64(1.0), (abs(x) - floor(abs(x))) > f64(0.5) || ((abs(x) - floor(abs(x))) == f64(0.5) && floor(abs(x)) - f64(2.0) * floor(floor(abs(x)) * f64(0.5)) == f64(1.0)))), -(floor(abs(x)) + select(f64(0.0), f64(1.0), (abs(x) - floor(abs(x))) > f64(0.5) || ((abs(x) - floor(abs(x))) == f64(0.5) && floor(abs(x)) - f64(2.0) * floor(floor(abs(x)) * f64(0.5)) == f64(1.0)))), x < f64(0.0)), x != f64(0.0))",
+                ),
+                UnOp::Trunc => Some(
+                    "select(x, select(floor(abs(x)), -floor(abs(x)), x < f64(0.0)), x != f64(0.0))",
+                ),
                 _ => None,
             },
             ElemTy::Df32 => match self {
