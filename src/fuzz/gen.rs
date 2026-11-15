@@ -424,7 +424,7 @@ fn bin_valid(ty: Ty, op: BinOp) -> bool {
 fn un_valid(ty: Ty, op: UnOp) -> bool {
     match ty {
         Ty::F32 => !matches!(op, UnOp::Not | UnOp::ToF32),
-        Ty::Df32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Exp | UnOp::Ln | UnOp::Tanh | UnOp::Powf(_) | UnOp::ToF32),
+        Ty::Df32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Exp | UnOp::Ln | UnOp::Tanh | UnOp::Log1p | UnOp::Expm1 | UnOp::Powf(_) | UnOp::ToF32),
         Ty::U32 => matches!(op, UnOp::Not | UnOp::ToF32 | UnOp::ToI32),
         Ty::I32 => matches!(op, UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Not | UnOp::ToF32 | UnOp::ToU32),
         Ty::Bool => matches!(op, UnOp::Not | UnOp::ToU32 | UnOp::ToF32),
@@ -588,7 +588,7 @@ fn un_err(ty: Ty, op: UnOp, a: Info, r: &Info) -> Option<f64> {
     let function = FUNCTION_ERR * (1.0 + r.mag());
     let e = a.err;
     Some(match op {
-        UnOp::Neg | UnOp::Abs | UnOp::Clamp { .. } | UnOp::Floor | UnOp::Ceil | UnOp::Sign => e,
+        UnOp::Neg | UnOp::Abs | UnOp::Clamp { .. } | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign => e,
         UnOp::ToDf32 | UnOp::ToU32 | UnOp::ToI32 => e,
         UnOp::Not => return None,
         UnOp::ToF32 => e + rounding(Ty::F32) * r.mag(),
@@ -609,6 +609,13 @@ fn un_err(ty: Ty, op: UnOp, a: Info, r: &Info) -> Option<f64> {
             e / at.cos().powi(2) + function
         }
         UnOp::Tanh => e + function,
+        UnOp::Expm1 => (r.hi + 1.0) * (e.exp() - 1.0) + function,
+        UnOp::Log1p => {
+            if 2.0 * e > 1.0 + a.lo {
+                return None;
+            }
+            2.0 * e / (1.0 + a.lo) + function
+        }
         UnOp::Powf(p) => {
             let p = f64::from(p);
             if 2.0 * e > a.lo {
@@ -652,9 +659,14 @@ fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
             let lo = if a.lo <= 0.0 && a.hi >= 0.0 { 0.0 } else { a.lo.abs().min(a.hi.abs()) };
             Info { lo, hi: a.mag(), ..a }
         }
-        UnOp::Floor | UnOp::Ceil if a.exact => {
-            let (lo, hi) = if op == UnOp::Floor { (a.lo.floor(), a.hi.floor()) } else { (a.lo.ceil(), a.hi.ceil()) };
-            Info { lsb: a.lsb.max(0), lo, hi, exact: true, err: 0.0 }
+        UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round if a.exact => {
+            let f = match op {
+                UnOp::Floor => f64::floor,
+                UnOp::Ceil => f64::ceil,
+                UnOp::Trunc => f64::trunc,
+                _ => f64::round_ties_even,
+            };
+            Info { lsb: a.lsb.max(0), lo: f(a.lo), hi: f(a.hi), exact: true, err: 0.0 }
         }
         UnOp::Sign if a.exact => Info { lsb: 0, lo: if a.lo < 0.0 { -1.0 } else { 0.0 }, hi: if a.hi > 0.0 { 1.0 } else { 0.0 }, exact: true, err: 0.0 },
         UnOp::Clamp { lo, hi } => {
@@ -673,6 +685,8 @@ fn un_info(ty: Ty, math: bool, op: UnOp, a: Info) -> Option<Info> {
         UnOp::Sin | UnOp::Cos if math && ty == Ty::F32 && a.mag() <= 100.0 => inexact(-1.0, 1.0),
         UnOp::Tan if math && ty == Ty::F32 && a.mag() <= 1.2 => inexact(a.lo.tan(), a.hi.tan()),
         UnOp::Tanh if math && matches!(ty, Ty::F32 | Ty::Df32) => inexact(a.lo.tanh(), a.hi.tanh()),
+        UnOp::Expm1 if math && matches!(ty, Ty::F32 | Ty::Df32) && a.hi <= 11.0 => inexact(a.lo.exp_m1(), a.hi.exp_m1()),
+        UnOp::Log1p if math && matches!(ty, Ty::F32 | Ty::Df32) && a.lo >= -0.9 => inexact(a.lo.ln_1p(), a.hi.ln_1p()),
         UnOp::Powf(e) if math && matches!(ty, Ty::F32 | Ty::Df32) && a.lo >= 0.25 => {
             let (x, y) = (a.lo.powf(f64::from(e)), a.hi.powf(f64::from(e)));
             inexact(x.min(y), x.max(y))
@@ -1370,7 +1384,7 @@ impl Builder {
         } else if ty == Ty::Bool {
             self.tape.pick(&[UnOp::Not, UnOp::ToU32, UnOp::ToF32])
         } else if ty == Ty::Df32 {
-            match self.tape.below(if self.math { 9 } else { 5 }) {
+            match self.tape.below(if self.math { 11 } else { 5 }) {
                 0 => UnOp::Neg,
                 1 => UnOp::Abs,
                 2 if self.math => UnOp::Sqrt,
@@ -1379,10 +1393,12 @@ impl Builder {
                 6 => UnOp::Ln,
                 7 => UnOp::Tanh,
                 8 => UnOp::Powf(self.tape.pick(&[-1.5f32, -0.5, 0.5, 1.5, 2.5, 3.0])),
+                9 => UnOp::Log1p,
+                10 => UnOp::Expm1,
                 _ => UnOp::Neg,
             }
         } else if self.math {
-            match self.tape.below(16) {
+            match self.tape.below(18) {
                 0 => UnOp::Neg,
                 1 => UnOp::Abs,
                 2 => UnOp::Sqrt,
@@ -1397,10 +1413,12 @@ impl Builder {
                 11 => UnOp::Floor,
                 12 => UnOp::Ceil,
                 13 => UnOp::Sign,
+                16 => UnOp::Log1p,
+                17 => UnOp::Expm1,
                 _ => UnOp::ToDf32,
             }
         } else {
-            match self.tape.below(12) {
+            match self.tape.below(14) {
                 0 | 1 => UnOp::Neg,
                 2 | 3 => UnOp::Abs,
                 4 => UnOp::Floor,
@@ -1412,6 +1430,8 @@ impl Builder {
                 }
                 8 => UnOp::ToU32,
                 9 => UnOp::ToI32,
+                12 => UnOp::Trunc,
+                13 => UnOp::Round,
                 _ => UnOp::ToDf32,
             }
         };

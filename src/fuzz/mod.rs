@@ -356,6 +356,10 @@ fn unary(a: &Arr, op: UnOp) -> Arr {
         (Arr::F(x), UnOp::Abs) => Arr::F(x.abs()),
         (Arr::F(x), UnOp::Floor) => Arr::F(x.floor()),
         (Arr::F(x), UnOp::Ceil) => Arr::F(x.ceil()),
+        (Arr::F(x), UnOp::Trunc) => Arr::F(x.trunc()),
+        (Arr::F(x), UnOp::Round) => Arr::F(x.round()),
+        (Arr::F(x), UnOp::Log1p) => Arr::F(x.log1p()),
+        (Arr::F(x), UnOp::Expm1) => Arr::F(x.expm1()),
         (Arr::F(x), UnOp::Sign) => Arr::F(x.sign()),
         (Arr::F(x), UnOp::Sqrt) => Arr::F(x.sqrt()),
         (Arr::F(x), UnOp::Exp) => Arr::F(x.exp()),
@@ -387,6 +391,8 @@ fn unary(a: &Arr, op: UnOp) -> Arr {
         (Arr::D(x), UnOp::Exp) => Arr::D(x.exp()),
         (Arr::D(x), UnOp::Ln) => Arr::D(x.ln()),
         (Arr::D(x), UnOp::Tanh) => Arr::D(x.tanh()),
+        (Arr::D(x), UnOp::Log1p) => Arr::D(x.log1p()),
+        (Arr::D(x), UnOp::Expm1) => Arr::D(x.expm1()),
         (Arr::D(x), UnOp::Powf(e)) => Arr::D(x.powf(Df32::from(e))),
         (Arr::D(x), UnOp::ToF32) => Arr::F(x.to_f32()),
         _ => panic!("{op:?} is not defined for {:?}", a.ty()),
@@ -1519,6 +1525,8 @@ fn generator_covers_the_statements() {
             match stmt {
                 Stmt::Binary { op, .. } | Stmt::Compound { op, .. } if op.bitwise() => *out.entry("Bitwise".to_owned()).or_default() += 1,
                 Stmt::Unary { op: UnOp::Not, .. } => *out.entry("Not".to_owned()).or_default() += 1,
+                Stmt::Unary { op: UnOp::Trunc | UnOp::Round, .. } => *out.entry("Rounding".to_owned()).or_default() += 1,
+                Stmt::Unary { op: UnOp::Log1p | UnOp::Expm1, .. } => *out.entry("Log1p".to_owned()).or_default() += 1,
                 _ => {}
             }
             if let Stmt::View { view, .. } = stmt {
@@ -1545,7 +1553,7 @@ fn generator_covers_the_statements() {
         "Input", "Full", "Range", "Linspace", "Unary", "Binary", "Compare", "Select", "View", "Reduce", "SumWhere", "Scan", "AxisReduce",
         "Assign", "Put", "Compound", "Write", "Cache", "EvalVars", "Alias", "Release", "Fetch", "Loop/PerStepEval", "Loop/IterateAll",
         "Loop/IterateUntilAll", "View/Slice", "View/Pad", "View/Flip", "View/Transpose", "View/ShiftCirc", "View/ShiftFill",
-        "View/ShiftClamp", "View/ShiftMirror", "View/Take", "View/Concat", "View/Stack", "Reshape", "Classify", "Bitwise", "Not",
+        "View/ShiftClamp", "View/ShiftMirror", "View/Take", "View/Concat", "View/Stack", "Reshape", "Classify", "Bitwise", "Not", "Rounding", "Log1p",
     ] {
         assert!(counts.get(kind).copied().unwrap_or(0) >= 5, "{kind} is rare: {counts:?}");
     }

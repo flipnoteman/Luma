@@ -23,6 +23,20 @@ All notable changes to Luma are listed here. The format follows
   by both (NumPy). Reducing passes carrying a (value, index) pair, a pending operand computed
   inside the first pass; `argmax` of `2^26` `f32` and `argmax_axis(1)` of `[64, 2^22]` run at about
   860 GB/s on an RTX 3090 (`bench_datasci --only argmax`).
+- `Array::searchsorted(&values, Side)`, `Array::digitize(&edges, right)` and `Array::isin(&set)`
+  for `u32`, `i32` and `f32` (NumPy semantics; NaNs sort last): lazy binary searches, one per
+  value, fused with the expression that makes the values (a lookup of `2^24` values in `2^16`
+  edges takes 0.89 ms, 10% less than a hand-written WGSL search). `luma::Side`.
+- NaN-aware reductions: `nansum`, `nanmin`, `nanmax` (`f32`, `f64`, `Df32`) and `nanmean`
+  (`f32`), lazy one-element arrays, and `nansum_axis`, `nanmean_axis`, `nanmin_axis`,
+  `nanmax_axis` for `f32`, with the masking fused into the reduction's first pass (NumPy's
+  results: all-NaN gives 0 for the sum and NaN for the others).
+- `round` (halves to even, as NumPy), `trunc`, `log1p` and `expm1` for `f32` (`round` and
+  `trunc` also `f64`, `log1p` and `expm1` also `Df32`, accurate to 44 bits): lazy and fused;
+  `log1p` and `expm1` keep their accuracy for `x` near 0. The fuzzer covers all four.
+- Guide: searching sorted arrays, NaN-aware reductions, the new elementwise functions and a
+  section of recipes (`diff`, `cumprod`, `softmax` / `logsumexp`, `one_hot`, shuffles, `cov` /
+  `corr`, `clip`) in the data chapter.
 
 ## [0.4.0] - 2026-11-14
 

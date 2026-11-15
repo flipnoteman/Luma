@@ -202,9 +202,9 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
 }
 
 /// Whether the WGSL of `instr` calls a function of the double-float math library
-/// (`builtin::DF_MATH_LIBRARY`): `exp`, `ln`, `tanh` and `powf` of a `Df32`.
+/// (`builtin::DF_MATH_LIBRARY`): `exp`, `ln`, `tanh`, `log1p`, `expm1` and `powf` of a `Df32`.
 pub(super) fn calls_df_math(instr: &Instr) -> bool {
-    instr.op.ty == ElemTy::Df32 && matches!(instr.op.kind, OpKind::Unary(UnOp::Exp | UnOp::Ln | UnOp::Tanh) | OpKind::Powf)
+    instr.op.ty == ElemTy::Df32 && matches!(instr.op.kind, OpKind::Unary(UnOp::Exp | UnOp::Ln | UnOp::Tanh | UnOp::Log1p | UnOp::Expm1) | OpKind::Powf)
 }
 
 /// Whether `instr` reads the guard uniform: the arithmetic and the casts, whose error-free

@@ -75,10 +75,11 @@ impl CostModel {
 pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
     let base = match op.kind {
         OpKind::Unary(u) => match u {
-            UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
+            UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
             UnOp::Sqrt => 4.0,
             UnOp::Exp | UnOp::Ln | UnOp::Sin | UnOp::Cos => 8.0,
             UnOp::Tan | UnOp::Tanh => 16.0,
+            UnOp::Log1p | UnOp::Expm1 => 20.0,
         },
         OpKind::Binary(b) => match b {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Min | BinOp::Max | BinOp::Copysign => 1.0,
@@ -114,6 +115,7 @@ pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
         (ElemTy::Df32, OpKind::Unary(UnOp::Exp)) => 20.0,
         (ElemTy::Df32, OpKind::Unary(UnOp::Ln)) => 16.0,
         (ElemTy::Df32, OpKind::Unary(UnOp::Tanh)) => 24.0,
+        (ElemTy::Df32, OpKind::Unary(UnOp::Log1p | UnOp::Expm1)) => 24.0,
         (ElemTy::Df32, OpKind::Powf) => 40.0,
         _ => base,
     };

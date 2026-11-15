@@ -118,9 +118,9 @@ lazy and fuse:
 
 | Type | Methods |
 | --- | --- |
-| `f32` | `sqrt`, `exp`, `ln`, `abs`, `sin`, `cos`, `tan`, `tanh`, `sign`, `floor`, `ceil`; `powf(exponent)`, `clamp(lo, hi)` (host scalars); `atan2(x)`, `hypot(other)`, `copysign(sign)` (array or scalar) |
-| `f64` | `sqrt`, `abs`, `sign`, `floor`, `ceil` |
-| `Df32` | `sqrt`, `abs`, `sign`, `floor`, `ceil` ([Precision](precision.md)) |
+| `f32` | `sqrt`, `exp`, `ln`, `abs`, `sin`, `cos`, `tan`, `tanh`, `sign`, `floor`, `ceil`, `trunc`, `round`, `log1p`, `expm1`; `powf(exponent)`, `clamp(lo, hi)` (host scalars); `atan2(x)`, `hypot(other)`, `copysign(sign)` (array or scalar) |
+| `f64` | `sqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round` |
+| `Df32` | `sqrt`, `abs`, `sign`, `floor`, `ceil`, `log1p`, `expm1` ([Precision](precision.md)) |
 | `i32` | `abs`, `sign`, `shl`, `shr` ([Signed integers](integers.md#signed-integers-and-casts)) |
 | `u32` | bit operations, `shl`, `shr`, `rotate_left`, `rotate_right` ([Integers](integers.md)) |
 | every scalar type | `minimum(rhs)`, `maximum(rhs)`, `lt` `le` `gt` `ge` `eq` `ne` (booleans), `select(&cond, a, b)` |

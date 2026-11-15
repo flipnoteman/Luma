@@ -39,7 +39,7 @@ if ctx.features().contains(luma::wgpu::Features::SHADER_F64) {
 # Ok::<(), luma::LumaError>(())
 ```
 
-`f64` arrays have `+ - * /`, `sqrt`, `abs`, `sign`, `floor`, `ceil`, `minimum`, `maximum`,
+`f64` arrays have `+ - * /`, `sqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `minimum`, `maximum`,
 comparisons, `select`, views and reductions. Anything else (`exp`, trigonometry, generators such
 as `range`) is refused when recorded. Use `Df32` when you need a wide type on every device, or
 cast down to `f32` for the function.
@@ -68,14 +68,15 @@ assert!((f64::from(tiny) - ((1.0 + 1e-12) - 1.0)).abs() < 1e-18);
 
 `Array<Df32>` has `+ - * /`, `sqrt`, `abs`, comparisons, `minimum`, `maximum`, `select`, views,
 `assign`, and reductions (`sum`, `min`, `max`; `item()` gives a `Df32`). It also has `exp`, `ln`,
-`tanh` and `powf` (below). It has no trigonometry: cast to `f32` and back around such a call.
+`tanh`, `log1p`, `expm1` and `powf` (below). It has no trigonometry: cast to `f32` and back around such a call.
 Scalars may be `Df32` values; a Rust `f32` literal in a `Df32` expression is not converted for you
 (write `Df32::from(1.0f32)` or build the array with `to_df32()`).
 
-**Functions.** `exp`, `ln`, `tanh` and `powf(Df32)` are built from `Df32` arithmetic and fuse like
+**Functions.** `exp`, `ln`, `tanh`, `log1p`, `expm1` and `powf(Df32)` are built from `Df32` arithmetic and fuse like
 it. Their relative error is below `2^-43` (`1e-13`; at most `4.3e-14` measured against `f64` on the
 RTX 3090 and on llvmpipe): `exp` on `[-55, 80]`, `ln` from `1e-24` to `1e30` (and near 1, where the
-error is relative to the result), `tanh` on `[-30, 30]` (also near 0), and `x^1.5` or `x^0.7` for
+error is relative to the result), `tanh` on `[-30, 30]` (also near 0), `log1p` and `expm1` (also near 0: a series in the argument
+rather than `ln(1 + x)`), and `x^1.5` or `x^0.7` for
 `x` in `[1, 3000]`. `powf` splits the exponent of `x` exactly, so its error does not grow with
 `y ln x`. Where a `Df32` is below about `1e-25` its low word is under the smallest normal `f32`
 and loses bits, which limits every function there: `exp` of an argument under `-55` has an absolute

@@ -405,3 +405,216 @@ assert_eq!(values.to_vec()?, vec![9.0, 7.0]);
 assert_eq!(indices.to_vec()?, vec![1, 3]);
 # Ok::<(), luma::LumaError>(())
 ```
+
+## Searching sorted arrays
+
+`sorted.searchsorted(&values, side)` is NumPy's `searchsorted`: element `i` of the result is the
+position where `values[i]` would be inserted into `sorted` to keep it ordered, `Side::Left` before
+the elements equal to it (the number of elements below it) and `Side::Right` after them (below or
+equal). `sorted` is one-dimensional and ascending, as `sort()` makes it (floats: NaNs last, larger
+than everything, equal to each other; `-0.0` equals `+0.0`); it works for `u32`, `i32` and `f32`.
+The result has the shape of `values`.
+
+`x.digitize(&edges, right)` is `np.digitize` for increasing edges: the number of the bin of each
+element, `0` below the first edge and `edges.len()` above the last, with `right` choosing whether a
+value on an edge belongs to the bin below (`edges[i - 1] < x <= edges[i]`) or above it
+(`edges[i - 1] <= x < edges[i]`). Together with `bincount` it is a histogram with uneven bins.
+`x.isin(&set)` is `np.isin`: a `bool` array of whether each element is in `set` (any shape; NaN is
+in no set).
+
+```rust
+use luma::*;
+
+let edges = Array::from_slice(&[0.0f32, 1.0, 2.5, 5.0], 4)?;
+let x = Array::from_slice(&[-1.0f32, 0.0, 1.0, 2.5, 4.9, 9.0], 6)?;
+assert_eq!(edges.searchsorted(&x, Side::Left).to_vec()?, vec![0, 0, 1, 2, 3, 4]);
+assert_eq!(edges.searchsorted(&x, Side::Right).to_vec()?, vec![0, 1, 2, 3, 3, 4]);
+
+// Bins: [.., 0), [0, 1), [1, 2.5), [2.5, 5), [5, ..)
+let bins = x.digitize(&edges, false);
+assert_eq!(bins.to_vec()?, vec![0, 1, 2, 3, 3, 4]);
+assert_eq!(bincount(&bins, 5).to_vec()?, vec![1, 1, 1, 2, 1]);
+assert_eq!(x.digitize(&edges, true).to_vec()?, vec![0, 0, 1, 2, 3, 4]);
+
+let allowed = Array::from_slice(&[3u32, 5, 8], 3)?;
+let ids = Array::from_slice(&[1u32, 3, 5, 7, 8], 5)?;
+assert_eq!(ids.isin(&allowed).to_vec()?, vec![false, true, true, false, true]);
+# Ok::<(), luma::LumaError>(())
+```
+
+The search is *lazy* and elementwise over the values: a lookup is one binary search per value,
+`ceil(log2(n + 1))` steps of gathers from `sorted`, and when the values are a pending expression
+(`(x * scale + offset)`) they are computed inside the kernel instead of being stored first.
+`sorted` is read as a buffer (a pending one is evaluated first). Measured on an RTX 3090,
+`2^24` values into `2^16` edges take 0.89 ms, 10% less than a hand-written WGSL binary search
+(`cargo run --release --example bench_datasci -- --only searchsorted`). `isin` sorts the set when it
+is called (eager, no host synchronisation; duplicates in the set do not matter) and then looks the
+elements up like `searchsorted` does and compares the element found. A `sorted` that is not
+one-dimensional poisons the result with `InvalidShape`.
+
+## NaN-aware reductions
+
+`nansum`, `nanmean`, `nanmin` and `nanmax` skip the NaNs, as NumPy's functions of the same names. Like
+`sum` and `min` they are lazy one-element arrays; `nansum_axis`, `nanmean_axis`, `nanmin_axis` and
+`nanmax_axis` reduce along an axis (extent 1 there in the result). An array of NaNs only has
+sum `0`, and mean, minimum and maximum NaN. Infinities are values: `nanmax` of `[NaN, inf]` is `inf`.
+`nansum`, `nanmin` and `nanmax` exist for `f32`, `f64` and `Df32`, the others (mean and the axis forms,
+for which `f64` and `Df32` have no reductions) for `f32`.
+
+```rust
+use luma::*;
+
+// Two columns of three: [1, NaN, 3] and [4, NaN, NaN].
+let x = Array::from_slice(&[1.0f32, f32::NAN, 3.0, 4.0, f32::NAN, f32::NAN], [3, 2])?;
+assert_eq!(x.nansum().item()?, 8.0);
+assert_eq!(x.nanmin().item()?, 1.0);
+assert_eq!(x.nanmax().item()?, 4.0);
+assert_eq!(x.nansum_axis(0).to_vec()?, vec![4.0, 4.0]);
+assert_eq!(x.nanmean_axis(0).to_vec()?, vec![2.0, 4.0]);
+assert_eq!(x.nanmin_axis(0).to_vec()?, vec![1.0, 4.0]);
+assert_eq!(x.nanmax_axis(0).to_vec()?, vec![3.0, 4.0]);
+
+let nothing = Array::from_slice(&[f32::NAN; 3], 3)?;
+assert_eq!(nothing.nansum().item()?, 0.0);
+assert!(nothing.nanmean().item()?.is_nan() && nothing.nanmin().item()?.is_nan());
+# Ok::<(), luma::LumaError>(())
+```
+
+The masking (`select(!is_nan(x), x, 0)`) is part of the reduction's first pass, so a pending operand
+is not stored. `nansum` reads the elements once; `nanmean` (sum and count) and `nanmin` / `nanmax`
+(the extremum, and whether any element is not NaN, which tells an array of NaNs from one whose
+minimum is `inf`) read them twice.
+
+## More elementwise functions
+
+`round`, `trunc`, `log1p` and `expm1` are lazy `f32` functions (`round` and `trunc` also for `f64`,
+`log1p` and `expm1` also for `Df32`). `round` goes to the nearest integer and *halves to the even
+one* (`0.5` is `0`, `1.5` and `2.5` are `2`), what NumPy's `round` and WGSL's `round` do; `trunc`
+rounds toward zero. `log1p(x)` is `ln(1 + x)` and `expm1(x)` is `e^x - 1`, accurate where
+`(1.0 + x).ln()` and `x.exp() - 1.0` have lost the digits of a small `x`: for `|x|` below 1
+(`expm1`) or in `(-0.5, 1)` (`log1p`) they evaluate a series, elsewhere the plain formula (about `1e-6`
+relative error; `Df32`: 44 bits).
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[0.5f32, 1.5, 2.5, -0.5, -2.7], 5)?;
+assert_eq!(x.round().to_vec()?, vec![0.0, 2.0, 2.0, 0.0, -3.0]);
+assert_eq!(x.trunc().to_vec()?, vec![0.0, 1.0, 2.0, 0.0, -2.0]);
+
+let tiny = Array::from_slice(&[1.0e-9f32, -1.0e-9], 2)?;
+// `(1.0 + x).ln()` is 0 for both: 1 + 1e-9 rounds to 1.
+for (got, want) in tiny.log1p().to_vec()?.iter().zip([1.0e-9f32, -1.0e-9]) {
+    assert!(((got - want) / want).abs() < 1e-6);
+}
+for (got, want) in tiny.expm1().to_vec()?.iter().zip([1.0e-9f32, -1.0e-9]) {
+    assert!(((got - want) / want).abs() < 1e-6);
+}
+# Ok::<(), luma::LumaError>(())
+```
+
+## Recipes
+
+Small statistics and array manipulations that are a line or two of the operations above, and that
+fuse like them. Axis 0 varies fastest, as everywhere.
+
+**`diff`** (differences of neighbours along an axis): two slices, one subtraction, no copy:
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, 4.0, 9.0, 16.0], 4)?;
+let n = x.len();
+let diff = x.slice(0, 1..) - x.slice(0, ..n - 1);
+assert_eq!(diff.to_vec()?, vec![3.0, 5.0, 7.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+**`cumprod`**, a scan with `*` (a running sum is `cumsum`, any associative operator can be scanned):
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], 4)?;
+assert_eq!(x.scan(0, |a, b| a * b).to_vec()?, vec![1.0, 2.0, 6.0, 24.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+**`softmax` and `logsumexp`** along an axis: subtract the maximum first, so that `exp` cannot
+overflow; the subtraction and `exp` are computed inside the sum:
+
+```rust
+use luma::*;
+
+// Two rows of three logits (axis 0 is the row).
+let logits = Array::from_slice(&[1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0], [3, 2])?;
+let max = logits.max_axis(0);
+let e = (&logits - &max).exp();
+let total = e.sum_axis(0);
+let softmax = (&e / &total).to_vec()?;
+let logsumexp = (&max + &total.ln()).to_vec()?;
+let third = 1.0f32 / 3.0;
+for (got, want) in softmax.iter().zip([0.09003057, 0.24472848, 0.66524094, third, third, third]) {
+    assert!((got - want).abs() < 1e-6, "{got} {want}");
+}
+assert!((logsumexp[0] - 3.4076059).abs() < 1e-5 && (logsumexp[1] - 3.0f32.ln()).abs() < 1e-5);
+# Ok::<(), luma::LumaError>(())
+```
+
+**`one_hot`** of class labels, one column per label: compare the labels with the class index
+(`range`), which broadcasts without a copy:
+
+```rust
+use luma::*;
+
+let labels = Array::from_slice(&[2u32, 0, 1, 2], 4)?;
+let classes = Array::<u32>::range([3, 4], 0)?; // element (c, i) is c
+let one_hot = classes.eq(&labels.reshape([1, 4])).to_f32();
+assert_eq!(one_hot.to_vec()?, vec![0., 0., 1., 1., 0., 0., 0., 1., 0., 0., 0., 1.]);
+# Ok::<(), luma::LumaError>(())
+```
+
+**Shuffles and random permutations**: sort random keys and take the order (`argsort` is stable, so a
+tie of two keys keeps the input order and the result is a permutation regardless):
+
+```rust
+use luma::*;
+
+let keys = Array::uniform(8, 42)?; // the seed picks the permutation
+let order = keys.argsort();
+let data = Array::from_slice(&[10u32, 11, 12, 13, 14, 15, 16, 17], 8)?;
+let mut shuffled = data.take(&order).to_vec()?;
+shuffled.sort();
+assert_eq!(shuffled, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+# Ok::<(), luma::LumaError>(())
+```
+
+**`cov` and `corr`** of a table with one column per feature (`[samples, features]`): the product of
+the centred (or standardised) data with its transpose, the centring fused into the product's loads:
+
+```rust
+use luma::*;
+
+let samples = 4;
+// Two features: the second is twice the first.
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0], [samples, 2])?;
+let centred = &x - &x.mean_axis(0);
+let cov = (centred.matmul(&centred.transpose()) / (samples as f32 - 1.0)).to_vec()?;
+for (got, want) in cov.iter().zip([5.0 / 3.0, 10.0 / 3.0, 10.0 / 3.0, 20.0 / 3.0]) {
+    assert!((got - want).abs() < 1e-5, "{got} {want}");
+}
+let z = &centred / &x.std_axis(0);
+let corr = (z.matmul(&z.transpose()) / (samples as f32)).to_vec()?;
+assert!(corr.iter().all(|c| (c - 1.0).abs() < 1e-5));
+# Ok::<(), luma::LumaError>(())
+```
+
+**`clip`** is `clamp`, with the bounds as plain numbers:
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[-2.0f32, 0.5, 3.0], 3)?;
+assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
+# Ok::<(), luma::LumaError>(())
+```
