@@ -22,6 +22,16 @@ All notable changes to Luma are listed here. The format follows
   `u32` arrays; `reduce_axis`, `scan`, `mean` and the other numeric reductions are not defined for
   `bool`. An integer literal next to a `bool` array needs a suffix (`mask * 2u32`): `u32` and
   `i32` are both promoted to. See the migration chapter of the guide.
+- A boolean array takes one bit per element on the GPU (a comparison written to memory is 32
+  times smaller than the `u32` array of 0.3), so a custom kernel that reads or writes one sees
+  bit-packed words (see the custom kernels chapter of the guide). Writes that cover whole arrays
+  (comparisons, `& | ^ !`, `select`, `full`) are packed by the workgroup, and so is `assign` into
+  a slice whose rows are runs of 64 or more consecutive elements (whole words inside a run, atomic
+  operations only for the words at the ends of a run, which it shares with elements the write
+  leaves alone); `put`, `stack`, transposed regions and short rows set and clear single bits with
+  atomic operations, which is slower than the same write of another type. `count()`, `any()`
+  and `all()` of an evaluated boolean array reduce its words (`countOneBits`), 32 times fewer
+  elements than reading the bits one by one.
 - The element-type trait `GpuType` no longer requires `bytemuck::Pod` (`bool` is not `Pod`): it
   has an associated `Repr` (the `Pod` form uploaded to the GPU) and conversions, which the
   library routes every host/GPU copy through. `luma::Numeric` (sealed: `u32`, `i32`, `f32`, `f64`,
@@ -45,8 +55,10 @@ All notable changes to Luma are listed here. The format follows
   `i32`), `to_i32` (from `f32`, `u32`). Float to integer truncates toward zero and saturates
   (`u32` at `4294967040`, `i32` at `-2147483648..=2147483520`); NaN becomes 0. `u32` and `i32`
   convert by reinterpreting the bits.
-- `Array<bool>`, the element type of comparisons and classifications (stored on the GPU as one
-  `u32` word of 0 or 1; a custom kernel sees `array<u32>`): `from_slice` / `to_vec` / `item` with
+- `Array<bool>`, the element type of comparisons and classifications (stored on the GPU as one bit
+  per element: `n` booleans are `ceil(n / 32)` `u32` words, element `i` is bit `i % 32` of word
+  `i / 32` and the unused bits of the last word are 0; a custom kernel sees `array<u32>` of the
+  words and reads a bit as `(a[i >> 5u] >> (i & 31u)) & 1u`): `from_slice` / `to_vec` / `item` with
   plain `bool`s, `full(true)`, `& | ^ !` between arrays and with `bool`s, `count()` (a `u32`
   array), `sum()` (the same count, as NumPy), `any()` and `all()` (one-element `bool` arrays),
   `to_u32()`, `to_i32()`, `to_f32()`, `to_f64()`, `to_df32()`, `min` / `max`, `sum_axis`,

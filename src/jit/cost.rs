@@ -6,6 +6,7 @@
 use std::time::Instant;
 
 use crate::array::Storage;
+use crate::gpu_type::ElemLayout;
 use crate::builtin::{df_library, BinOp, CmpOp, UnOp};
 use crate::context::{Context, RawArg};
 use crate::error::Result;
@@ -178,8 +179,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// one warm-up measurement, then the best of [`BEST_OF`], each `reps` launches and one `sync`.
 fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps: u32) -> Result<f64> {
     let core = build_core(ctx, &KernelKey::new(source, "main", None), Some(label), true)?;
-    let input = Storage::new(ctx, n as usize, 4);
-    let output = Storage::new(ctx, n as usize, 4);
+    let input = Storage::new(ctx, n as usize, ElemLayout::plain(4));
+    let output = Storage::new(ctx, n as usize, ElemLayout::plain(4));
     let (in_pin, out_pin) = (input.pin(0)?, output.pin(0)?);
     let bytes = u64::from(n) * 4;
     let words = [k, 0u32];

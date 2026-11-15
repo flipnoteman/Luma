@@ -22,7 +22,7 @@ use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::{Numeric, ScalarType};
+use crate::gpu_type::{ElemLayout, Numeric, ScalarType};
 use crate::jit::{self, operator_source, ElemTy, Node, Operator};
 use crate::kernel::KernelCore;
 use crate::ops::{fold_workgroups, Outcome, Rhs};
@@ -788,7 +788,7 @@ impl<T: ScalarType> Array<T> {
     fn run_scan(&self, axis: usize, op: &ScanOp<'_, T>) -> Outcome<Array<T>> {
         let ctx = self.context();
         let (pin, bytes) = self.ready()?;
-        if ElemTy::of::<T>()?.bytes() != 4 {
+        if ElemTy::of::<T>()?.layout() != ElemLayout::plain(4) {
             return Err(LumaError::Unsupported(format!("scans and reductions along an axis are not available for {} arrays", ElemTy::of::<T>()?.display())).into());
         }
         let shape = self.shape();
@@ -822,7 +822,7 @@ impl<T: ScalarType> Array<T> {
     fn run_axis_reduce(&self, axis: usize, ops: ReduceList) -> Outcome<Vec<Array<T>>> {
         let ctx = self.context();
         let ty = ElemTy::of::<T>()?;
-        if ty.bytes() != 4 {
+        if ty.layout() != ElemLayout::plain(4) {
             return Err(LumaError::Unsupported(format!("scans and reductions along an axis are not available for {} arrays", ty.display())).into());
         }
         let shape = self.shape();
@@ -972,19 +972,18 @@ impl Array<bool> {
     }
 
     /// Whether every element along `axis` is true (the minimum); the result has extent 1 along
-    /// it. Fused like [`Array::sum_axis`].
+    /// it. The reduction runs on the elements as `u32`s, fused like [`Array::sum_axis`], and the
+    /// result is a lazy comparison of it.
     #[track_caller]
     pub fn min_axis(&self, axis: usize) -> Array<bool> {
-        let [min] = self.reduce_lines(axis, [Reduction::Min], "min_axis", Location::caller());
-        min
+        self.cast_at::<u32>(Location::caller()).min_axis(axis).ne(0u32)
     }
 
     /// Whether any element along `axis` is true (the maximum); the result has extent 1 along it.
-    /// Fused like [`Array::sum_axis`].
+    /// Computed like [`Array<bool>::min_axis`](Array::min_axis).
     #[track_caller]
     pub fn max_axis(&self, axis: usize) -> Array<bool> {
-        let [max] = self.reduce_lines(axis, [Reduction::Max], "max_axis", Location::caller());
-        max
+        self.cast_at::<u32>(Location::caller()).max_axis(axis).ne(0u32)
     }
 }
 

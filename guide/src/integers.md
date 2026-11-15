@@ -62,7 +62,7 @@ array of amounts costs a mask and a variable shift per element.
 ## Comparisons, booleans and `select`
 
 Comparisons (`lt`, `le`, `gt`, `ge`, `eq`, `ne`) of any element type return `Array<bool>`: a boolean
-per element, stored as a `u32` that is 0 or 1 ([how to make and read one](arrays.md#booleans)).
+per element, stored as one bit ([how to make and read one](arrays.md#booleans)).
 Booleans combine with `&`, `|` and `^` (and the compound forms `&=`, `|=`, `^=`, also with a single
 `bool`), and `!` negates them; `*` of two boolean arrays is the logical and. `select(&cond, a, b)`
 takes `a` where the condition is true and `b` elsewhere, for any element type; `a` and `b` are

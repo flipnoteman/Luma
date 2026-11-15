@@ -49,8 +49,17 @@ arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`,
 
 `bool` is an element type: comparisons and `is_nan` / `is_finite` / `is_inf` produce `Array<bool>`,
 and `from_slice`, `to_vec`, `item`, `full(true)` and `write` use plain `bool`s. On the GPU a
-`bool` is one `u32` word holding 0 or 1, which is what a [custom kernel](custom-kernels.md) sees
-(`array<u32>`). Booleans have no generators (`range`, `uniform`): they combine with `& | ^ !`
+`bool` takes one bit: an array of `n` booleans is `ceil(n / 32)` `u32` words on the GPU, which
+is what a [custom kernel](custom-kernels.md) sees (`array<u32>`, [how to read a bit](custom-kernels.md)),
+so a comparison written to memory is 32 times smaller than a `u32` array, and `count()`, `any()`
+and `all()` of an evaluated array read a word per 32 elements. Whole-array results
+(comparisons, `&`, `|`, `!`, `select` of booleans) are packed by the workgroup and cost no more
+than a `u32` store, and so does `assign` into a slice of a boolean array whose rows are runs of
+64 or more consecutive elements (the words inside a run are written as they are, and only the
+two words at the ends of a run, which it may share with elements the write leaves alone, change
+by atomic operations). Writes that cannot be built from runs (`put`, `stack`, a transposed slice,
+short rows) set and clear one bit at a time with atomic operations, which is slower than for the
+other types. Booleans have no generators (`range`, `uniform`): they combine with `& | ^ !`
 (also with a single `bool`), count with `count()`, steer `select`, promote to numbers in `+`, `-`
 and `*` as in NumPy (`mask * &x` is `x` where true, 0 elsewhere), and convert with `to_u32()` /
 `to_i32()` / `to_f32()` ([Comparisons, booleans and `select`](integers.md#comparisons-booleans-and-select)).

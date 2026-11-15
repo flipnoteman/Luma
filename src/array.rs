@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::context::{default_context, Context};
 use crate::gpu::pager::{Pin, Segment};
 use crate::error::{LumaError, Result};
-use crate::gpu_type::GpuType;
+use crate::gpu_type::{ElemLayout, GpuType};
 use crate::builtin::UnOp;
 use crate::jit::{ElemTy, Held, Node, Op, OpKind, Readers, Src};
 use crate::reduce::Reduced;
@@ -44,15 +44,16 @@ impl Failure {
 ///
 /// Segment `j` holds elements `j * C .. min(len, (j + 1) * C)` where `C` is
 /// [`Storage::segment_len`]; every storage of the same length and element size on a context has
-/// the same segmentation.
+/// the same segmentation (a bit-packed `bool` counts as a 4-byte element, and `C` is a multiple
+/// of 32, so a segment starts on a word).
 #[derive(Debug)]
 pub(crate) struct Storage {
     id: u64,
     ctx: Context,
     /// Number of elements.
     len: usize,
-    /// Bytes per element.
-    elem: usize,
+    /// How the elements sit in the segments' buffers.
+    layout: ElemLayout,
     segments: Box<[Arc<Segment>]>,
     /// Kept alive when this storage aliases another one's segments (see [`Array::probe`]).
     owner: Option<Arc<Storage>>,
@@ -68,20 +69,22 @@ pub(crate) struct Storage {
 
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Elements per full segment of arrays of `elem`-byte elements on `ctx`.
-fn segment_len(ctx: &Context, elem: usize) -> usize {
-    (usize::try_from(ctx.segment_bytes()).unwrap_or(usize::MAX) / elem).max(1)
+/// Elements per full segment of arrays of `layout` on `ctx`.
+fn segment_len(ctx: &Context, layout: ElemLayout) -> usize {
+    (usize::try_from(ctx.segment_bytes()).unwrap_or(usize::MAX) / layout.stride()).max(1)
 }
 
 impl Storage {
-    /// A storage of `len` elements of `elem` bytes whose segments have no buffers yet; they are
+    /// A storage of `len` elements of `layout` whose segments have no buffers yet; they are
     /// allocated when first pinned, so this cannot fail.
-    pub(crate) fn new(ctx: &Context, len: usize, elem: usize) -> Self {
-        let c = segment_len(ctx, elem);
+    pub(crate) fn new(ctx: &Context, len: usize, layout: ElemLayout) -> Self {
+        let c = segment_len(ctx, layout);
+        // Packed segments start on a word: the chunk size is a power of two of at least 1024 bytes.
+        debug_assert!(!layout.is_packed() || c.is_multiple_of(32));
         let segments = (0..len.div_ceil(c))
-            .map(|j| Segment::empty(ctx, ((len.min((j + 1) * c) - j * c) * elem) as u64))
+            .map(|j| Segment::empty(ctx, layout.bytes(len.min((j + 1) * c) - j * c)))
             .collect();
-        Self::with_segments(ctx, len, elem, segments, None)
+        Self::with_segments(ctx, len, layout, segments, None)
     }
 
     /// A distinct storage identity backed by `owner`'s segments without recycling them
@@ -90,7 +93,7 @@ impl Storage {
         Self::with_segments(
             &owner.ctx,
             owner.len,
-            owner.elem,
+            owner.layout,
             owner.segments.clone(),
             Some(Arc::clone(owner)),
         )
@@ -99,7 +102,7 @@ impl Storage {
     fn with_segments(
         ctx: &Context,
         len: usize,
-        elem: usize,
+        layout: ElemLayout,
         segments: Box<[Arc<Segment>]>,
         owner: Option<Arc<Storage>>,
     ) -> Self {
@@ -107,7 +110,7 @@ impl Storage {
             id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             len,
-            elem,
+            layout,
             segments,
             owner,
             materialized: AtomicBool::new(false),
@@ -139,25 +142,35 @@ impl Storage {
         self.len
     }
 
-    /// Bytes per element.
-    pub(crate) fn elem(&self) -> usize {
-        self.elem
+    /// How the elements sit in the buffers.
+    pub(crate) fn layout(&self) -> ElemLayout {
+        self.layout
     }
 
     /// Bytes of data in the whole storage.
     pub(crate) fn byte_len(&self) -> u64 {
-        (self.len * self.elem) as u64
+        self.layout.bytes(self.len)
+    }
+
+    /// Bytes of data in segment `j`.
+    pub(crate) fn segment_byte_len(&self, j: usize) -> u64 {
+        self.layout.bytes(self.range(j).len())
     }
 
     /// Elements of a full segment, `C`.
     pub(crate) fn segment_len(&self) -> usize {
-        segment_len(&self.ctx, self.elem)
+        segment_len(&self.ctx, self.layout)
     }
 
     /// The elements segment `j` holds.
     pub(crate) fn range(&self, j: usize) -> std::ops::Range<usize> {
         let c = self.segment_len();
         j * c..self.len.min((j + 1) * c)
+    }
+
+    /// The words (`GpuType::Repr`) of a host copy of the whole array that segment `j` holds.
+    pub(crate) fn words(&self, j: usize) -> std::ops::Range<usize> {
+        self.layout.words(self.range(j))
     }
 
     /// Segment `j` for an eager command or readback; marks the storage as materialized.
@@ -292,7 +305,7 @@ impl<T: GpuType> Array<T> {
     /// Allocates a valid array of `shape` whose contents are unspecified.
     pub(crate) fn alloc(ctx: &Context, shape: Shape) -> Result<Self> {
         let len = shape.validate()?;
-        Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(Storage::new(ctx, len, T::BYTES)))))
+        Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(Storage::new(ctx, len, T::LAYOUT)))))
     }
 
     fn new(ctx: &Context, shape: Shape, repr: Repr) -> Self {
@@ -366,20 +379,20 @@ impl<T: GpuType> Array<T> {
             return Err(LumaError::LengthMismatch { expected: len, actual: data.len() });
         }
         if ctx.zero_copy() {
-            let elem = T::BYTES;
+            let layout = T::LAYOUT;
             let words = T::to_repr(data);
-            let c = segment_len(ctx, elem);
+            let c = segment_len(ctx, layout);
             // Registered as they are filled, so dropping them on failure recycles them and
             // making room for the next one sees them.
             let mut segments = Vec::with_capacity(len.div_ceil(c));
             for start in (0..len).step_by(c) {
                 let end = len.min(start + c);
-                let bytes = ((end - start) * elem) as u64;
+                let bytes = layout.bytes(end - start);
                 ctx.make_room(bytes)?;
-                let buffer = ctx.alloc_filled(bytemuck::cast_slice(&words[start..end]))?;
+                let buffer = ctx.alloc_filled(bytemuck::cast_slice(&words[layout.words(start..end)]))?;
                 segments.push(Segment::filled(ctx, bytes, buffer));
             }
-            let storage = Storage::with_segments(ctx, len, elem, segments.into_boxed_slice(), None);
+            let storage = Storage::with_segments(ctx, len, layout, segments.into_boxed_slice(), None);
             return Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(storage))));
         }
         let array = Self::alloc(ctx, shape)?;
@@ -387,7 +400,7 @@ impl<T: GpuType> Array<T> {
         let words = T::to_repr(data);
         for j in 0..storage.segments() {
             let pin = storage.pin(j)?;
-            ctx.upload(pin.buffer(), bytemuck::cast_slice(&words[storage.range(j)]))?;
+            ctx.upload(pin.buffer(), bytemuck::cast_slice(&words[storage.words(j)]))?;
         }
         Ok(array)
     }
@@ -404,7 +417,7 @@ impl<T: GpuType> Array<T> {
         for j in 0..storage.segments() {
             let pin = storage.pin(j)?;
             // Pooled buffers hold stale data, so zeroing is required.
-            ctx.clear(pin.buffer(), (storage.range(j).len() * storage.elem()) as u64)?;
+            ctx.clear(pin.buffer(), storage.segment_byte_len(j))?;
         }
         Ok(array)
     }
@@ -594,7 +607,7 @@ impl<T: GpuType> Array<T> {
 
     /// Size of the array's data in bytes (not the size of the possibly larger buffer).
     pub(crate) fn byte_len(&self) -> u64 {
-        self.shape.len() as u64 * T::BYTES as u64
+        T::LAYOUT.bytes(self.shape.len())
     }
 
     #[cfg(test)]
@@ -614,7 +627,7 @@ impl<T: GpuType> Array<T> {
             return reduced.read::<T>(&self.ctx);
         }
         let storage = self.storage().map_err(Failure::into_error)?;
-        Ok(T::from_repr(self.ctx.read_storage::<T::Repr>(storage)?))
+        Ok(T::from_repr(self.ctx.read_storage::<T::Repr>(storage)?, self.len()))
     }
 
     /// Like [`Array::to_vec`], but copies into `out`, which must have exactly [`Array::len`]
@@ -637,9 +650,7 @@ impl<T: GpuType> Array<T> {
         }
         let Some(words) = T::repr_mut(out) else {
             // A representation of its own (`bool`): read the words, then convert them.
-            for (slot, word) in out.iter_mut().zip(self.ctx.read_storage::<T::Repr>(storage)?) {
-                *slot = T::one_from_repr(word);
-            }
+            out.copy_from_slice(&T::from_repr(self.ctx.read_storage::<T::Repr>(storage)?, out.len()));
             return Ok(());
         };
         let bytes: &mut [u8] = bytemuck::cast_slice_mut(words);
@@ -705,7 +716,7 @@ impl<T: GpuType> Array<T> {
         let words = T::to_repr(data);
         for j in 0..storage.segments() {
             let pin = storage.pin(j)?;
-            self.ctx.upload(pin.buffer(), bytemuck::cast_slice(&words[storage.range(j)]))?;
+            self.ctx.upload(pin.buffer(), bytemuck::cast_slice(&words[storage.words(j)]))?;
         }
         Ok(())
     }
@@ -739,8 +750,7 @@ impl<T: GpuType> Array<T> {
         let to = out.storage()?;
         for j in 0..from.segments() {
             let (source, target) = (from.pin(j)?, to.pin(j)?);
-            let bytes = (from.range(j).len() * from.elem()) as u64;
-            self.ctx.copy(source.buffer(), 0, target.buffer(), 0, bytes)?;
+            self.ctx.copy(source.buffer(), 0, target.buffer(), 0, from.segment_byte_len(j))?;
         }
         Ok(out)
     }

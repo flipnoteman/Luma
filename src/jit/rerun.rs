@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::array::{Failure, Storage};
+use crate::gpu_type::ElemLayout;
 use crate::context::Context;
 use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
@@ -461,7 +462,7 @@ impl Attempt {
             rerun.fixed.iter().map(|&at| print.buffers.get(at as usize)?.upgrade()).collect::<Option<_>>()?;
         if probes.iter().any(|probe| probe.was_materialized())
             || fixed.iter().any(|input| input.segments() != 1)
-            || inits.iter().any(|init| init.elem() != 4 || init.len() != len || init.segments() != 1)
+            || inits.iter().any(|init| init.layout() != ElemLayout::plain(4) || init.len() != len || init.segments() != 1)
         {
             return None;
         }
@@ -510,7 +511,7 @@ fn speculate(ctx: &Context, site: &Site, inits: &[Arc<Storage>], steps: u32) -> 
     let len = inits.first()?.len();
     if rerun.states.iter().flatten().any(|&j| j >= inits.len())
         || fixed.iter().any(|input| input.segments() != 1)
-        || inits.iter().any(|init| init.elem() != 4 || init.len() != len || init.segments() != 1)
+        || inits.iter().any(|init| init.layout() != ElemLayout::plain(4) || init.len() != len || init.segments() != 1)
     {
         return None;
     }

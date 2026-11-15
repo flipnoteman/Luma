@@ -128,10 +128,12 @@ impl Cond<'_> {
         }
     }
 
-    pub(crate) fn src(&self) -> Outcome<Src> {
+    /// The condition as an operand: a word array is compared with 0 first (lazily, inside the
+    /// kernel that selects), because the operand of a select is a `bool`, which is a bit.
+    pub(crate) fn src(&self, location: &'static Location<'static>) -> Outcome<Src> {
         match self {
             Cond::Bool(array) => array.src(),
-            Cond::Word(array) => array.src(),
+            Cond::Word(array) => array.compare_at(Rhs::Scalar(0u32), CmpOp::Ne, "select", location).src(),
         }
     }
 }
@@ -560,6 +562,17 @@ impl<T: ScalarType> Array<T> {
         }
         let out = Array::<T>::alloc(ctx, shape)?;
         let storage = out.storage().map_err(Failure::into_error)?;
+        if T::LAYOUT.is_packed() {
+            // The words of the bits: the kernel runs over words, and knows the elements.
+            let core = ctx.builtin(Builtin::FillBits, "u32")?;
+            for j in 0..storage.segments() {
+                let (n, bytes) = (storage.range(j).len(), storage.segment_byte_len(j));
+                let pin = storage.pin(j)?;
+                let words = [bytemuck::cast::<_, u32>(value.into_repr()), len_u32(n)?];
+                launch_1d(ctx, &core, len_u32((bytes / 4) as usize)?, &[RawArg::write(pin.buffer(), bytes), RawArg::Uniform(bytemuck::cast_slice(&words))])?;
+            }
+            return Ok(out);
+        }
         let core = ctx.builtin(Builtin::Fill, T::wgsl_type())?;
         for j in 0..storage.segments() {
             let n = storage.range(j).len();
@@ -569,7 +582,7 @@ impl<T: ScalarType> Array<T> {
                 &core,
                 len_u32(n)?,
                 &[
-                    RawArg::write(pin.buffer(), n as u64 * T::BYTES as u64),
+                    RawArg::write(pin.buffer(), storage.segment_byte_len(j)),
                     RawArg::Uniform(bytemuck::bytes_of(&value.into_repr())),
                 ],
             )?;
@@ -716,7 +729,7 @@ pub(crate) fn run_select<T: ScalarType>(
 ) -> Outcome<Array<T>> {
     let ctx = cond.context();
     let shape = cond.shape();
-    let cond_src = cond.src()?;
+    let cond_src = cond.src(location)?;
     let branch = |rhs: Rhs<'_, T>| -> Outcome<Src> {
         match rhs {
             Rhs::Array(other) => {

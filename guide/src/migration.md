@@ -7,8 +7,9 @@ in NumPy (below). Everything else in 0.4 is added ([the list below](#new-in-04-t
 ## Comparisons return `Array<bool>`
 
 `lt`, `le`, `gt`, `ge`, `eq`, `ne` and `is_finite` / `is_nan` / `is_inf` return `Array<bool>`. On the
-GPU a `bool` is one `u32` word that is 0 or 1 (a [custom kernel](custom-kernels.md) sees
-`array<u32>`); on the host `from_slice`, `to_vec` and `item` use plain `bool`s.
+GPU a `bool` is one bit (`n` booleans are `ceil(n / 32)` `u32` words: a
+[custom kernel](custom-kernels.md) that took a comparison as one `u32` per element reads
+`(a[i >> 5u] >> (i & 31u)) & 1u` now); on the host `from_slice`, `to_vec` and `item` use plain `bool`s.
 
 What compiles unchanged:
 

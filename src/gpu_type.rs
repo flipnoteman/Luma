@@ -27,38 +27,84 @@ use bytemuck::{Pod, Zeroable};
 ///
 /// Host values and GPU words are related through the hidden associated type `Repr`: every
 /// host-to-GPU and GPU-to-host copy goes through `to_repr` / `from_repr` (borrowed, no copy, for
-/// every type but `bool`), and element sizes come from `BYTES`.
+/// every type but `bool`), and the size of a buffer comes from `LAYOUT`.
 ///
-/// A `bool` is stored as one `u32` word holding 0 or 1 (a custom kernel sees an `array<u32>`).
+/// A `bool` takes one bit: an array of `n` bools is `ceil(n / 32)` `u32` words, element `i` is
+/// bit `i % 32` of word `i / 32`, and the bits past `n` in the last word are 0 (a custom kernel
+/// sees an `array<u32>` of those words, see [`Kernel`](crate::Kernel)).
 pub trait GpuType: Zeroable + Copy + Send + Sync + std::fmt::Debug + sealed::Sealed + 'static {
-    /// The plain-old-data form of the element that is uploaded to and read back from the GPU.
+    /// The plain-old-data form of the elements that is uploaded to and read back from the GPU:
+    /// one `Repr` per element, except for the bit-packed `bool` (32 elements to a `u32`).
     #[doc(hidden)]
     type Repr: Pod;
 
-    /// The bytes one element takes on the GPU.
+    /// How the elements sit in a buffer.
     #[doc(hidden)]
-    const BYTES: usize = std::mem::size_of::<Self::Repr>();
+    const LAYOUT: ElemLayout = ElemLayout::plain(std::mem::size_of::<Self::Repr>());
 
     /// The GPU words of `host`: borrowed when the representation is the type itself.
     #[doc(hidden)]
     fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]>;
 
-    /// The host values of GPU words read back.
+    /// The `len` host values of GPU words read back.
     #[doc(hidden)]
-    fn from_repr(repr: Vec<Self::Repr>) -> Vec<Self>;
+    fn from_repr(repr: Vec<Self::Repr>, len: usize) -> Vec<Self>;
 
     /// `host` viewed as GPU words, if the representation is the type itself (no conversion
     /// needed to read into it); `None` otherwise.
     #[doc(hidden)]
     fn repr_mut(host: &mut [Self]) -> Option<&mut [Self::Repr]>;
 
-    /// The GPU word of one value.
+    /// The GPU word of a one-element array holding this value.
     #[doc(hidden)]
     fn into_repr(self) -> Self::Repr;
+}
 
-    /// The value of one GPU word.
-    #[doc(hidden)]
-    fn one_from_repr(word: Self::Repr) -> Self;
+/// How the elements of a type sit in a device buffer.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ElemLayout {
+    stride: usize,
+    packed: bool,
+}
+
+impl ElemLayout {
+    /// Elements of `bytes` bytes each, one after the other.
+    pub const fn plain(bytes: usize) -> Self {
+        ElemLayout { stride: bytes, packed: false }
+    }
+
+    /// One bit per element: 32 to a `u32` word, element `i` at bit `i % 32` of word `i / 32`.
+    /// Arrays split over several buffers split like arrays of 4-byte elements (see
+    /// [`ElemLayout::stride`]), so every buffer starts on a word.
+    pub const PACKED: ElemLayout = ElemLayout { stride: 4, packed: true };
+
+    /// The bytes that set the elements a segment of an array holds, `segment_bytes / stride`:
+    /// the element size, or 4 for packed elements (arrays of `bool` and `f32` are split alike).
+    pub const fn stride(self) -> usize {
+        self.stride
+    }
+
+    /// Whether elements are bits of words.
+    pub const fn is_packed(self) -> bool {
+        self.packed
+    }
+
+    /// The bytes of a buffer holding `len` elements. Never compute `len * stride` for a packed
+    /// layout.
+    pub const fn bytes(self, len: usize) -> u64 {
+        if self.packed {
+            len.div_ceil(32) as u64 * 4
+        } else {
+            len as u64 * self.stride as u64
+        }
+    }
+
+    /// The `Repr` words holding the elements `range` (which starts on a multiple of 32 if the
+    /// layout is packed).
+    pub const fn words(self, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        if self.packed { range.start / 32..range.end.div_ceil(32) } else { range }
+    }
 }
 
 /// Element types the built-in operators, math functions and reductions are implemented for.
@@ -85,7 +131,7 @@ macro_rules! plain_gpu_type {
                 std::borrow::Cow::Borrowed(host)
             }
 
-            fn from_repr(repr: Vec<Self::Repr>) -> Vec<Self> {
+            fn from_repr(repr: Vec<Self::Repr>, _len: usize) -> Vec<Self> {
                 repr
             }
 
@@ -96,10 +142,6 @@ macro_rules! plain_gpu_type {
             fn into_repr(self) -> Self::Repr {
                 self
             }
-
-            fn one_from_repr(word: Self::Repr) -> Self {
-                word
-            }
         }
     )*};
 }
@@ -109,12 +151,24 @@ plain_gpu_type!(u32, i32, f32, f64, Df32, [f32; 2], [f32; 4], [u32; 2], [u32; 4]
 impl GpuType for bool {
     type Repr = u32;
 
+    const LAYOUT: ElemLayout = ElemLayout::PACKED;
+
     fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
-        std::borrow::Cow::Owned(host.iter().map(|&b| u32::from(b)).collect())
+        std::borrow::Cow::Owned(
+            host.chunks(32).map(|chunk| chunk.iter().enumerate().fold(0u32, |word, (bit, &b)| word | u32::from(b) << bit)).collect(),
+        )
     }
 
-    fn from_repr(repr: Vec<Self::Repr>) -> Vec<Self> {
-        repr.into_iter().map(|w| w != 0).collect()
+    fn from_repr(repr: Vec<Self::Repr>, len: usize) -> Vec<Self> {
+        let mut out = Vec::with_capacity(len);
+        let whole = len / 32;
+        for &word in &repr[..whole] {
+            out.extend((0..32).map(|bit| word >> bit & 1 != 0));
+        }
+        if !len.is_multiple_of(32) {
+            out.extend((0..len % 32).map(|bit| repr[whole] >> bit & 1 != 0));
+        }
+        out
     }
 
     fn repr_mut(_host: &mut [Self]) -> Option<&mut [Self::Repr]> {
@@ -123,10 +177,6 @@ impl GpuType for bool {
 
     fn into_repr(self) -> Self::Repr {
         u32::from(self)
-    }
-
-    fn one_from_repr(word: Self::Repr) -> Self {
-        word != 0
     }
 }
 
@@ -153,10 +203,10 @@ impl ScalarType for i32 {
     }
 }
 
-// The WGSL type of the words a `bool` array is stored in (`GpuType::Repr` is `u32`). The built-in
-// kernels that move elements without computing on them (copy, take, put, fill, stack, concat)
-// and the reductions use it as the storage type; the fused kernels go through the accessors
-// `codegen::storage_ty`, `codegen::load` and `codegen::store`.
+// The WGSL type of a `bool` in registers and of the words of its buffers (32 bools to a `u32`,
+// `GpuType::LAYOUT`). The fused kernels read and write the bits through the accessors
+// `codegen::storage_ty`, `codegen::load` and `codegen::store`; the built-in kernels that touch
+// bool buffers (fill, the reductions of words) know the layout themselves.
 impl ScalarType for bool {
     fn wgsl_type() -> &'static str {
         "u32"

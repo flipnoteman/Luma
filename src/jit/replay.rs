@@ -117,7 +117,7 @@ impl Stepper {
             [init, probe, out].iter().all(|storage| storage.segments() == 1)
                 && init.byte_len() == probe.byte_len()
                 && init.byte_len() == out.byte_len()
-                && init.elem() == out.elem()
+                && init.layout() == out.layout()
         });
         if !shaped {
             return Err(plan);
@@ -147,7 +147,7 @@ impl Stepper {
             return Err(plan);
         }
         let pong: Vec<Arc<Storage>> =
-            outs.iter().map(|out| Arc::new(Storage::new(ctx, out.len(), out.elem()))).collect();
+            outs.iter().map(|out| Arc::new(Storage::new(ctx, out.len(), out.layout()))).collect();
         let Some(pong_buffers) = buffers(&pong) else { return Err(plan) };
         Ok(Stepper {
             plan,

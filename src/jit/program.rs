@@ -163,6 +163,10 @@ pub(crate) struct FusedKey {
     /// output `j`, read at element `i` before being overwritten (see `launch::in_place_eligible`
     /// and `launch::run_mapped`).
     pub(crate) in_place: Vec<(u32, u32)>,
+    /// Set by `launch::run_mapped` like `in_place`: the region write with `bool` outputs runs
+    /// as the kernel of `codegen::runs_main`, which builds the words of the runs of consecutive
+    /// elements the region is made of (the uniform has their length and the words they span).
+    pub(crate) runs: bool,
     /// Per input, how many segments of it the program reads through shifts (0 = never): the
     /// program is the segmented variant of the generated kernel, run once per segment of arrays
     /// spanning several buffers. Empty when the program runs unsegmented or has no shift.
@@ -222,6 +226,7 @@ impl std::hash::Hash for FusedKey {
         self.outputs.hash(state);
         self.tail.hash(state);
         self.in_place.hash(state);
+        self.runs.hash(state);
         self.spans.hash(state);
         self.tile.hash(state);
         self.staging.hash(state);
@@ -243,8 +248,15 @@ impl FusedKey {
     /// Whether every value the program reads, computes or writes is 4 bytes wide: the register
     /// loops, stencils and speculation only handle those.
     pub(crate) fn narrow(&self) -> bool {
-        self.input_tys.iter().all(|ty| ty.bytes() == 4)
-            && self.instrs.iter().chain(self.subs.iter().flatten()).all(|instr| instr.op.ty.bytes() == 4 && instr.op.out_ty().bytes() == 4)
+        self.input_tys.iter().all(|ty| ty.slots() == 1)
+            && self.instrs.iter().chain(self.subs.iter().flatten()).all(|instr| instr.op.ty.slots() == 1 && instr.op.out_ty().slots() == 1)
+    }
+
+    /// Whether the program is a store with a `bool` output: the workgroup packs the bits it
+    /// computes into whole words (see `codegen::packed_main`), so the kernel is not tiled or staged.
+    pub(crate) fn writes_bits(&self) -> bool {
+        self.tail == Tail::Store
+            && self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::Bool))
     }
 
     /// Whether some instruction reads a sub-program through a view or a gather: the kernel is
@@ -832,7 +844,7 @@ impl Flattener {
     fn scalar(&mut self, scalar: &Scalar) -> Ref {
         let at = u32::try_from(self.scalars.len()).unwrap_or(u32::MAX);
         // The uniform has `f32` fields: a wide scalar takes several (see `Scalar::words`).
-        let slot_ty = if scalar.ty.bytes() == 4 { scalar.ty } else { ElemTy::F32 };
+        let slot_ty = if scalar.ty.slots() == 1 { scalar.ty } else { ElemTy::F32 };
         for &word in scalar.words().iter().take(scalar.ty.slots()) {
             self.scalar_tys.push(slot_ty);
             self.scalars.push(word);
@@ -930,6 +942,7 @@ impl Flattener {
                 outputs,
                 tail,
                 in_place: Vec::new(),
+                runs: false,
                 spans: Vec::new(),
                 tile: None,
                 staging: None,
@@ -1273,7 +1286,7 @@ pub(super) fn flatten_inner(
         let ctx = first.context();
         let jit = ctx.jit();
         // Arrays split over several buffers: the sub-programs cannot run in a kernel over them.
-        let splits = roots.iter().any(|(root, _)| root.len() as u64 * root.op().out_ty().bytes() > ctx.segment_bytes())
+        let splits = roots.iter().any(|(root, _)| root.len() as u64 * root.op().out_ty().stride() > ctx.segment_bytes())
             || fused.key.instrs.iter().chain(fused.key.subs.iter().flatten()).any(|instr| {
                 matches!(instr.op.kind, OpKind::Shift(_))
                     && matches!(instr.args[0], Ref::Input(k) if fused.inputs.get(k as usize).is_some_and(|input| input.segments() > 1))
@@ -1746,6 +1759,7 @@ impl Recipe {
                 outputs: self.outputs.clone(),
                 tail,
                 in_place: Vec::new(),
+                runs: false,
                 spans: Vec::new(),
                 tile: None,
                 staging: None,
@@ -1856,7 +1870,7 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
                 Some(Ok(storage)) => (Arc::clone(storage), Some(node)),
                 Some(Err(_)) => return None,
                 // Nothing is allocated for it unless something pins it.
-                None => (Arc::new(Storage::new(ctx, node.len(), ElemTy::F32.bytes() as usize)), Some(node)),
+                None => (Arc::new(Storage::new(ctx, node.len(), ElemTy::F32.layout())), Some(node)),
             },
         };
         let at = flat.input(&storage, ElemTy::F32);
@@ -2057,6 +2071,7 @@ mod validate_tests {
             subs: Arc::new(subs),
             tail: Tail::Store,
             in_place: Vec::new(),
+            runs: false,
             spans: Vec::new(),
             tile: None,
             staging: None,

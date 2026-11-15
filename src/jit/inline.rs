@@ -636,7 +636,7 @@ fn input_bytes(key: &FusedKey, refs: impl Iterator<Item = Ref>) -> f64 {
             && !*slot
         {
             *slot = true;
-            bytes += key.input_tys[k as usize].bytes() as f64;
+            bytes += key.input_tys[k as usize].traffic();
         }
     }
     bytes
@@ -645,7 +645,7 @@ fn input_bytes(key: &FusedKey, refs: impl Iterator<Item = Ref>) -> f64 {
 /// Bytes per element the program writes: every output of a store, the value of a scatter,
 /// nothing for a reduction (its partial sums are negligible).
 fn output_bytes(key: &FusedKey) -> f64 {
-    let bytes = |index: &u32| key.instrs.get(*index as usize).map_or(0.0, |instr| instr.op.out_ty().bytes() as f64);
+    let bytes = |index: &u32| key.instrs.get(*index as usize).map_or(0.0, |instr| instr.op.out_ty().traffic());
     match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } => key.outputs.iter().map(bytes).sum(),
         Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => key.outputs.first().map_or(0.0, bytes),
@@ -676,7 +676,8 @@ fn sub_len(key: &FusedKey, s: u32, len: usize) -> f64 {
 /// instructions per program.
 fn stage(key: &FusedKey, cap: usize, cost: &CostModel, tuning: &Tuning) -> Option<(Staging, StagedPrograms)> {
     let found = staging::candidates(key)?;
-    let bytes = |s: u32| key.subs.get(s as usize).and_then(|program| program.last()).map_or(4, |instr| instr.op.out_ty().bytes());
+    // A staged value is a register value, one word of workgroup memory for a `bool` too.
+    let bytes = |s: u32| key.subs.get(s as usize).and_then(|program| program.last()).map_or(4, |instr| instr.op.out_ty().stride());
     let staging = staging::plan(&found, tuning, bytes)?;
     let programs = lower_staged(key, &staging, cap, cost)?;
     Some((staging, programs))
@@ -881,6 +882,7 @@ fn rebuilt(key: &FusedKey, main: Vec<Instr>, subs: Vec<Vec<Instr>>, outputs: Vec
         subs: Arc::new(subs),
         tail,
         in_place: Vec::new(),
+        runs: false,
         spans: Vec::new(),
         tile: None,
         staging: None,
@@ -1182,6 +1184,7 @@ mod tests {
             subs: std::sync::Arc::new(subs),
             tail: Tail::Store,
             in_place: Vec::new(),
+            runs: false,
             spans: Vec::new(),
             tile: None,
             staging: None,

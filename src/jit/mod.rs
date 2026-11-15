@@ -179,7 +179,7 @@ use crate::error::{LumaError, Result};
 use crate::gpu::built::BuildCache;
 use crate::gpu::hash::{FxHasher, FxMap};
 use crate::gpu::lock;
-use crate::gpu_type::ScalarType;
+use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::kernel::{self, KernelCore, KernelKey};
 use crate::profile::{FusionSplit, SplitReason};
 
@@ -264,8 +264,9 @@ pub(crate) enum ElemTy {
     F32,
     U32,
     I32,
-    /// A `bool`, stored as a `u32` holding 0 or 1. The word layout is `bool`'s `GpuType::Repr`
-    /// together with the codegen accessors `codegen::load` / `codegen::store`.
+    /// A `bool`: a `u32` holding 0 or 1 in registers, one bit of a `u32` word in buffers (see
+    /// `ElemLayout::PACKED`); the codegen accessors `codegen::load` / `codegen::store` and the
+    /// packed store of `codegen::source` are where the layout is known.
     Bool,
     /// 64-bit float (needs `wgpu::Features::SHADER_F64`).
     F64,
@@ -310,11 +311,26 @@ impl ElemTy {
         }
     }
 
-    /// Bytes per element.
-    pub(crate) fn bytes(self) -> u64 {
+    /// How elements of this type sit in a buffer; it sets the elements per segment of an array
+    /// (see `ElemLayout::stride`) and the bytes of a buffer (`ElemLayout::bytes`).
+    pub(crate) fn layout(self) -> ElemLayout {
         match self {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => 4,
-            ElemTy::F64 | ElemTy::Df32 => 8,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => ElemLayout::plain(4),
+            ElemTy::Bool => ElemLayout::PACKED,
+            ElemTy::F64 | ElemTy::Df32 => ElemLayout::plain(8),
+        }
+    }
+
+    /// `layout().stride()`: the bytes that set the elements per segment.
+    pub(crate) fn stride(self) -> u64 {
+        self.layout().stride() as u64
+    }
+
+    /// Bytes of memory traffic per element, for the cost model: 1/8 for a bit.
+    pub(crate) fn traffic(self) -> f64 {
+        match self {
+            ElemTy::Bool => 0.125,
+            other => other.layout().stride() as f64,
         }
     }
 
@@ -633,8 +649,8 @@ impl Scalar {
 
     pub(crate) fn of<T: ScalarType>(value: T) -> std::result::Result<Self, LumaError> {
         let ty = ElemTy::of::<T>()?;
-        let bits = match ty.bytes() {
-            4 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()))),
+        let bits = match ty.slots() {
+            1 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()))),
             _ => bytemuck::pod_read_unaligned::<u64>(bytemuck::bytes_of(&value.into_repr())),
         };
         Ok(Scalar { ty, bits })
@@ -1963,7 +1979,7 @@ const MAX_STAGES: u8 = 3;
 pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 4]) -> bool {
     // A lazy operand runs inside kernels of segmented programs only if it fits one segment, so
     // segmented programs have no sub-programs.
-    if node.len() as u64 * node.op().out_ty().bytes() > node.context().segment_bytes() {
+    if node.len() as u64 * node.op().out_ty().stride() > node.context().segment_bytes() {
         return false;
     }
     let small = |axis: usize| {
@@ -1999,7 +2015,7 @@ fn claim_recompute(node: &Node) -> bool {
     let cost = node.context().cost_model();
     let len = node.len() as f64;
     let one_more = node.weight() * len / cost.f32_ops_per_ns;
-    if one_more > cost::kernel_ns(&cost, len * node.op().out_ty().bytes() as f64 * 2.0, 0.0) {
+    if one_more > cost::kernel_ns(&cost, len * node.op().out_ty().traffic() * 2.0, 0.0) {
         return false;
     }
     let mut reads = node.shifted_reads.load(Ordering::Relaxed);
@@ -2033,7 +2049,7 @@ pub(crate) fn worth_storing(node: &Node) -> bool {
     }
     let cost = node.context().cost_model();
     let len = node.len() as f64;
-    node.weight() * len / cost.f32_ops_per_ns > cost::kernel_ns(&cost, len * node.op().out_ty().bytes() as f64 * 2.0, 0.0)
+    node.weight() * len / cost.f32_ops_per_ns > cost::kernel_ns(&cost, len * node.op().out_ty().traffic() * 2.0, 0.0)
 }
 
 /// Whether a view or gather of the pending `node` reads its expression lazily (as a sub-program
@@ -2043,7 +2059,7 @@ pub(crate) fn worth_storing(node: &Node) -> bool {
 /// reads it, once per distinct index (see [`inline`]); the node limit of [`create`] and the
 /// size check of `program::flatten_inner` bound the kernel.
 pub(crate) fn recompute_viewed(node: &Node) -> bool {
-    node.len() as u64 * node.op().out_ty().bytes() <= node.context().segment_bytes() && !node.requested.load(Ordering::Relaxed)
+    node.len() as u64 * node.op().out_ty().stride() <= node.context().segment_bytes() && !node.requested.load(Ordering::Relaxed)
 }
 
 /// The compiled kernels of one loop program, with the state layout each one was built for.

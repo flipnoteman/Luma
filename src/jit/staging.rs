@@ -135,7 +135,7 @@ struct Scan {
 /// The reads of `key` if it is a store kernel without segments or circular-shift tiling that
 /// reads sub-programs through views, and the main program's views all have the same output dims.
 fn scan(key: &FusedKey) -> Option<Scan> {
-    if key.tail != Tail::Store || !key.spans.is_empty() || key.tile.is_some() || !key.inlines() {
+    if key.tail != Tail::Store || !key.spans.is_empty() || key.tile.is_some() || !key.inlines() || key.writes_bits() {
         return None;
     }
     let n = key.subs.len();
@@ -425,6 +425,7 @@ mod tests {
             subs: std::sync::Arc::new(subs),
             tail: Tail::Store,
             in_place: Vec::new(),
+            runs: false,
             spans: Vec::new(),
             tile: None,
             staging: None,

@@ -39,11 +39,15 @@ pub(crate) fn run(
     let (Some(out_len), Ok(block32)) = (total.checked_mul(len), u32::try_from(block)) else { return Ok(None) };
     let fits = u32::try_from(out_len).is_ok()
         && u32::try_from(total).is_ok()
-        && (out_len as u64).saturating_mul(ty.bytes()) <= ctx.segment_bytes();
+        && (out_len as u64).saturating_mul(ty.stride()) <= ctx.segment_bytes();
     if !fits || block == 0 || len == 0 {
         return Ok(None);
     }
-    let base = Arc::new(Storage::new(ctx, out_len, ty.bytes() as usize));
+    let base = Arc::new(Storage::new(ctx, out_len, ty.layout()));
+    // The stores write one bit at a time (`codegen::store`) and leave the others as they were.
+    if ty == ElemTy::Bool {
+        ctx.clear(&base.pin(0)?.buffer().clone(), base.byte_len())?;
+    }
     let jit = ctx.jit();
     let group = (jit.max_live(ctx.tuning()) / 4).max(1);
     let mut work: Vec<Range<usize>> = (0..total).step_by(group).map(|first| first..(first + group).min(total)).rev().collect();

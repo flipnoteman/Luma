@@ -10,6 +10,7 @@ use std::sync::Arc;
 use wgpu::BufferUsages;
 
 use crate::array::{Failure, Storage};
+use crate::gpu_type::ElemLayout;
 use crate::builtin::{Builtin, ReduceList, ReduceOp};
 use crate::context::{Context, RawArg, Scratch, STORAGE_USAGE};
 use crate::error::LumaError;
@@ -145,7 +146,7 @@ fn run(
         ctx.upload(&tmpl, bytemuck::cast_slice(&template))?;
         let state = take(2 * WORD, STORAGE_USAGE)?;
         let mut steps: Vec<wgpu::Buffer> = Vec::new();
-        let ping = [Arc::new(Storage::new(ctx, len, ELEMENT_BYTES as usize)), Arc::new(Storage::new(ctx, len, ELEMENT_BYTES as usize))];
+        let ping = [Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize))), Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize)))];
         let body_state = body.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
         let check_state = check.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
 
@@ -176,7 +177,7 @@ fn run(
                     inputs[at] = Arc::clone(current);
                 }
                 let pins = pin_inputs(&check_key, &inputs, None, 0, n)?;
-                let uniform = params(&check_key, None, Some(n), 0, len, &check_scalars)?;
+                let uniform = params(&check_key, None, Some(n), 0, len, None, &check_scalars)?;
                 let (first_out, first_bytes) = &partials[0];
                 let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
                 raw.push(RawArg::write(first_out, *first_bytes));
