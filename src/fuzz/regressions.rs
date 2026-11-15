@@ -758,3 +758,39 @@ fn i32_and_with_a_saturating_constant_is_not_the_identity() {
         ],
     });
 }
+
+/// A kernel whose bindings the shader does not all read: the launch bound all of them, and
+/// `create_bind_group` failed with "Number of bindings ... does not match" (repro 1).
+#[test]
+fn bool_xor_reduce_promote_df32() {
+    check(Program {
+        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, cost: Test },
+        math: false,
+        stmts: vec![
+            Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
+            Input { dims: [12, 1, 1, 1], ty: Bool, seed: 0 },
+            Binary { lhs: Var(1), rhs: Const(31.0), op: BitXor },
+            Reduce { src: 2, op: Max },
+            Promote { mask: 3, other: Var(0), ty: Df32, op: Add, mask_left: false },
+        ],
+    });
+}
+
+/// The same class of failure through a per-step evaluated loop with a `bool` state (repro 2).
+#[test]
+fn bool_loop_state_promote_df32() {
+    check(Program {
+        config: Config { max_nodes: 2, max_inlined: None, max_live: None, max_inputs: None, assume_busy: false, speculate: true, simplify: true, staging: false, fast_math: false, df_split: false, chunk_bytes: None, memory_budget: None, cost: Test },
+        math: false,
+        stmts: vec![
+            Input { dims: [300, 1, 1, 1], ty: Bool, seed: 0 },
+            Input { dims: [12, 1, 1, 1], ty: I32, seed: 0 },
+            Input { dims: [12, 1, 1, 1], ty: Df32, seed: 0 },
+            Compare { lhs: 2, rhs: Var(2), op: Equal },
+            Input { dims: [7, 5, 1, 1], ty: U32, seed: 766574886846494210 },
+            Unary { src: 2, op: Neg },
+            Binary { lhs: Var(4), rhs: Const(5.0), op: Minimum },
+            Loop { kind: PerStepEval, steps: 11, states: vec![4], body: vec![Unary { src: 1, op: Abs }, Unary { src: 6, op: Not }, Promote { mask: 3, other: Var(5), ty: Df32, op: Sub, mask_left: true }], next: vec![9] },
+        ],
+    });
+}

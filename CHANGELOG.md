@@ -38,6 +38,14 @@ All notable changes to Luma are listed here. The format follows
   section of recipes (`diff`, `cumprod`, `softmax` / `logsumexp`, `one_hot`, shuffles, `cov` /
   `corr`, `clip`) in the data chapter.
 
+### Fixed
+
+- A kernel that converts a `bool` array to `Df32` and runs no other arithmetic of a `Df32` failed
+  with `create_bind_group: Number of bindings in bind group descriptor (3) does not match ... (2)`
+  (found by the fuzzer, mostly on `LUMA_DEVICE=cpu`): the program counted the cast as a reader of
+  the double-float guard uniform and bound it, but the cast reads nothing from it, so the shader
+  compiler dropped the binding.
+
 ## [0.4.0] - 2026-11-14
 
 ### Breaking

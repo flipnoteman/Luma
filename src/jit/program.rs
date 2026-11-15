@@ -208,14 +208,18 @@ pub(super) fn calls_df_math(instr: &Instr) -> bool {
 }
 
 /// Whether `instr` reads the guard uniform: the arithmetic and the casts, whose error-free
-/// transformations go through `luma_o`, and the tests of the class of a value. Ordering, minimum, maximum and absolute value never
-/// call it: nothing there can be reassociated away.
+/// transformations go through `luma_o`, and the tests of the class of a value. Ordering, minimum,
+/// maximum and absolute value never call it: nothing there can be reassociated away. Nor does the
+/// conversion of a `bool` to a `Df32` (see `codegen::cast`): the value is exact, there is nothing
+/// to hide. The kernel binds the guard exactly when a function it calls reads it (a uniform no
+/// code reads has no binding), so this must agree with the generated WGSL.
 pub(super) fn reads_guard(instr: &Instr) -> bool {
     calls_df_library(instr)
         && !matches!(
             instr.op.kind,
             OpKind::Unary(UnOp::Abs) | OpKind::Binary(BinOp::Min | BinOp::Max) | OpKind::Compare(_) | OpKind::Clamp
         )
+        && !(instr.op.ty == ElemTy::Bool && matches!(instr.op.kind, OpKind::Cast(ElemTy::Df32)))
 }
 
 impl std::hash::Hash for FusedKey {
