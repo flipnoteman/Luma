@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5d650490.js";
+            window.path_to_searchindex_js = "searchindex-396042b6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e12c34ce.js"></script>
@@ -216,6 +216,7 @@ builder methods override them:</p>
 <tr><td><code>LUMA_TUNING</code></td><td><code>apple</code>, <code>nvidia</code>, <code>generic</code> or <code>cpu</code>: override the kernel tuning profile</td></tr>
 <tr><td><code>LUMA_SUBGROUPS</code></td><td><code>off</code> keeps the built-in kernels off subgroup operations</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_NODES</code></td><td>Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions)</td></tr>
+<tr><td><code>LUMA_FUSION_MAX_INPUTS</code></td><td>Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer (<a href="performance.html#many-arrays-in-one-kernel">Performance</a>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_INLINED</code></td><td>Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; <code>16..=16384</code>)</td></tr>
 <tr><td><code>LUMA_STAGING</code></td><td><code>off</code> turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first</td></tr>

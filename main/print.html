@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5d650490.js";
+            window.path_to_searchindex_js = "searchindex-396042b6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e12c34ce.js"></script>
@@ -2880,15 +2880,30 @@ through memory, not correctness:</p>
 <tr><td>nesting depth</td><td>512 (256 with debug assertions)</td><td>fixed (the walk is recursive)</td></tr>
 <tr><td>values live at once</td><td>by GPU profile</td><td><code>LUMA_FUSION_MAX_LIVE</code></td></tr>
 <tr><td>instructions after views of lazy expressions are unfolded</td><td>1536 on NVIDIA, 1024 on other GPUs, 192 on CPU</td><td><code>LUMA_FUSION_MAX_INLINED</code></td></tr>
-<tr><td>input buffers per kernel</td><td>the device’s storage-buffer limit minus 3, at most 256</td><td>fixed</td></tr>
+<tr><td>input buffers per kernel</td><td>the device’s storage-buffer limit minus 3, at most 256</td><td><code>LUMA_FUSION_MAX_INPUTS</code> lowers it (to test a device with fewer)</td></tr>
 <tr><td>scalar operands</td><td>one uniform buffer</td><td>fixed</td></tr>
 </tbody>
 </table>
 </div>
 <p>When a limit is hit, the biggest operand is evaluated first (together with the live arrays that
-share work with it), and the rest is flattened again. A kernel that reads many different arrays
-(the 50 words of a Keccak state) is the one that meets the input limit; keep such loops in
-<code>iterate_all</code>, or split them in the source.</p>
+share work with it), and the rest is flattened again.</p>
+<h3 id="many-arrays-in-one-kernel"><a class="header" href="#many-arrays-in-one-kernel">Many arrays in one kernel</a></h3>
+<p>A kernel that reads many different arrays (the 50 words of a Keccak state) meets the device’s
+binding limit: 16 on llvmpipe and many integrated GPUs, 29 on Metal, 256 or more on discrete GPUs.
+Cutting such an expression on the limit alone would evaluate it a few operations at a time, because
+every round reads every array. Luma instead puts the arrays into one buffer. When a kernel would bind
+more arrays than the device allows, the evaluated arrays of one length and type it reads are copied
+into one buffer (a few small kernels) and become windows of it, and a kernel with more outputs than
+bindings writes them into one buffer and returns them as windows. A kernel reads all the windows of
+one buffer through one binding. The arrays are the same arrays afterwards: a write or a custom kernel
+that takes one gives it a buffer of its own (a copy of its range), and expressions recorded before the
+write still see the old contents. Three permutations of the lazy Keccak (<code>examples/keccak.rs</code>)
+take 7120 kernels with 16 bindings without this, 39 with it, and 9 on a device with many bindings.</p>
+<p>Packing costs one copy of the arrays it moves, so it only happens when the binding limit would force
+a cut, and an array of a window is kept alive by the buffer it shares while any other window of it
+lives. Arrays read through a view or a circular <code>shift</code> are not read through the shared binding
+(they get a buffer of their own when the view is made). <code>ctx.profile(..)</code> shows the copies as
+<code>FusedStack(Id, ...)</code> kernels; <code>LUMA_FUSION_MAX_INPUTS=13</code> reproduces a 16-binding device on any GPU.</p>
 <p>Never fused, because they need whole-array structure: <code>scan</code>, tridiagonal solves, FFT
 convolution, and custom kernels. They read computed arrays.</p>
 <h2 id="caches"><a class="header" href="#caches">Caches</a></h2>
@@ -3240,6 +3255,7 @@ builder methods override them:</p>
 <tr><td><code>LUMA_TUNING</code></td><td><code>apple</code>, <code>nvidia</code>, <code>generic</code> or <code>cpu</code>: override the kernel tuning profile</td></tr>
 <tr><td><code>LUMA_SUBGROUPS</code></td><td><code>off</code> keeps the built-in kernels off subgroup operations</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_NODES</code></td><td>Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions)</td></tr>
+<tr><td><code>LUMA_FUSION_MAX_INPUTS</code></td><td>Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer (<a href="#many-arrays-in-one-kernel">Performance</a>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_INLINED</code></td><td>Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; <code>16..=16384</code>)</td></tr>
 <tr><td><code>LUMA_STAGING</code></td><td><code>off</code> turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first</td></tr>
