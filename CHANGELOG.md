@@ -59,6 +59,11 @@ All notable changes to Luma are listed here. The format follows
 
 ### Fixed
 
+- A device whose calibration always looks contended (CI's lavapipe on a shared 4-vCPU runner) was
+  measured again, twice, by every process and every device it opened, about a second each, and
+  the result thrown away: a test opening many contexts spent most of its time calibrating (100 s
+  for one test on CI, 7 s without calibration). A contended calibration is now noted in the cache
+  directory, and processes use the profile's numbers for a day before measuring again.
 - A kernel that declares a binding its entry point never reads can no longer fail the launch with
   `create_bind_group: Number of bindings ... does not match ...` and, because threads share one
   batch command encoder, turn the work of every other thread in that batch into garbage (the

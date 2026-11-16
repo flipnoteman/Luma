@@ -461,16 +461,24 @@ impl Context {
             *ctx.inner.gpu.0.cost.get_or_init(|| {
                 // Measured once per machine: a stored result for this device and driver wins,
                 // and only a measurement that does not look contended is stored (see
-                // `cost::contended`); otherwise this process runs on the profile's numbers.
+                // `cost::contended`); otherwise this process runs on the profile's numbers, and so
+                // do the processes of the next day (see `DiskCache::recently_contended`).
                 let disk = ctx.disk_cache();
                 let fallback = CostModel::fallback(profile);
                 disk.load_cost().filter(|stored| !cost::contended(stored, &fallback)).unwrap_or_else(|| {
+                    if disk.recently_contended() {
+                        return fallback;
+                    }
                     match cost::calibrate_clean(&ctx, &fallback) {
                         Ok(Some(measured)) => {
                             disk.store_cost(&measured);
                             measured
                         }
-                        _ => fallback,
+                        Ok(None) => {
+                            disk.note_contended();
+                            fallback
+                        }
+                        Err(_) => fallback,
                     }
                 })
             })

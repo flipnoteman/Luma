@@ -30,6 +30,13 @@ const PIPELINES: [u8; 8] = *b"LUMAPIPE";
 const COST: [u8; 8] = *b"LUMACOS2";
 /// Magic of the file with the result of the `fma` test.
 const FMA: [u8; 8] = *b"LUMAFMA ";
+/// Magic of the file noting that a calibration looked contended (see `cost::contended`).
+const CONTENDED: [u8; 8] = *b"LUMACONT";
+/// How long a contended calibration stops other processes from measuring again. On a machine
+/// whose measurements always look contended (a CI runner with a slow software device) every
+/// process measured twice, about a second each, on every device it opened, and threw the result
+/// away; one try a day keeps a machine that was only busy from staying on the profile's numbers.
+const CONTENDED_RETRY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 /// The largest pipeline cache that is kept, in bytes. NVIDIA's driver (615.71.09) works through a
 /// loaded cache on compiler threads of its own, and with a cache of 116 MB (the kernels of many
 /// programs and versions) those threads were still busy when the process ended and corrupted the
@@ -262,6 +269,24 @@ impl DiskCache {
         }
     }
 
+    /// Whether a calibration of this device and driver looked contended less than
+    /// [`CONTENDED_RETRY`] ago, so that it is not measured again yet.
+    pub(crate) fn recently_contended(&self) -> bool {
+        let Some(dir) = &self.dir else { return false };
+        let path = dir.join(format!("contended-{}.bin", self.key));
+        read_blob(&path, CONTENDED).is_some()
+            && std::fs::metadata(&path).and_then(|meta| meta.modified()).ok().and_then(|at| at.elapsed().ok()).is_some_and(|age| age < CONTENDED_RETRY)
+    }
+
+    /// Notes that a calibration of this device and driver looked contended (see
+    /// [`recently_contended`](Self::recently_contended)).
+    pub(crate) fn note_contended(&self) {
+        let Some(dir) = &self.dir else { return };
+        if let Err(error) = write_blob(&dir.join(format!("contended-{}.bin", self.key)), CONTENDED, &[]) {
+            debug!("luma: writing the contended-calibration note failed: {error}");
+        }
+    }
+
     /// Whether this device and driver were found to have a fused `fma` (see `gpu::fma`), if
     /// that was stored.
     pub(crate) fn load_fma(&self) -> Option<bool> {
@@ -374,6 +399,24 @@ mod tests {
             }
         });
         assert!(read_blob(&path, PIPELINES).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_contended_calibration_is_not_measured_again_for_a_day() {
+        let ctx = crate::Context::new().unwrap();
+        let (device, info) = (ctx.device(), ctx.adapter_info());
+        let dir = scratch("contended");
+        let disk = DiskCache::open(Some(dir.clone()), device, info);
+        assert!(!disk.recently_contended());
+        disk.note_contended();
+        assert!(disk.recently_contended());
+        assert!(DiskCache::open(Some(dir.clone()), device, info).recently_contended(), "another process sees it");
+        let file = dir.join(format!("contended-{}.bin", adapter_key(info)));
+        let old = std::time::SystemTime::now() - CONTENDED_RETRY - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(old).unwrap();
+        assert!(!disk.recently_contended(), "a day later it is measured again");
+        assert!(!DiskCache::open(None, device, info).recently_contended(), "no directory, no note");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
