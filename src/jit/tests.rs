@@ -17,10 +17,14 @@ fn ctx() -> Context {
 }
 
 fn values(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
-    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (0..n)
         .map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let unit = ((state >> 40) as f32) / (1u64 << 24) as f32;
             lo + unit * (hi - lo)
         })
@@ -31,7 +35,10 @@ fn assert_close(got: &[f32], want: &[f32], rel: f32, abs: f32) {
     assert_eq!(got.len(), want.len(), "length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
         let tolerance = abs.max(rel * w.abs());
-        assert!((g - w).abs() <= tolerance, "index {i}: got {g}, want {w} (tolerance {tolerance})");
+        assert!(
+            (g - w).abs() <= tolerance,
+            "index {i}: got {g}, want {w} (tolerance {tolerance})"
+        );
     }
 }
 
@@ -118,8 +125,10 @@ fn comparison_into_select_stays_in_one_kernel() {
     let d = delta(before, ctx.jit().stats());
     assert_eq!(d.elementwise_launches, 1);
 
-    let want: Vec<f32> =
-        xs.iter().map(|&x| if x > 0.25 { x * 3.0 } else { x - 1.0 } + 1.0).collect();
+    let want: Vec<f32> = xs
+        .iter()
+        .map(|&x| if x > 0.25 { x * 3.0 } else { x - 1.0 } + 1.0)
+        .collect();
     assert_close(&got, &want, 1e-6, 1e-6);
 
     // A u32 chain through a comparison: counts elements above a threshold per mask.
@@ -127,7 +136,10 @@ fn comparison_into_select_stays_in_one_kernel() {
     let u = Array::from_slice_on(&ctx, &ints, 1000).unwrap();
     let flags = (&u + 3u32).ge(500u32);
     let got = (&flags.to_u32() * 7u32 + 1u32).to_vec().unwrap();
-    let want: Vec<u32> = ints.iter().map(|&v| u32::from(v + 3 >= 500) * 7 + 1).collect();
+    let want: Vec<u32> = ints
+        .iter()
+        .map(|&v| u32::from(v + 3 >= 500) * 7 + 1)
+        .collect();
     assert_eq!(got, want);
 }
 
@@ -167,9 +179,16 @@ fn reductions_fuse_their_input_expression() {
     let before = ctx.jit().stats();
     let sum = (&a * &b).sum().item().unwrap();
     let d = delta(before, ctx.jit().stats());
-    assert_eq!(d.elementwise_launches, 0, "the product is never materialized");
+    assert_eq!(
+        d.elementwise_launches, 0,
+        "the product is never materialized"
+    );
     assert_eq!(d.reduce_launches, 1);
-    let want: f64 = xs.iter().zip(&ys).map(|(&x, &y)| f64::from(x) * f64::from(y)).sum();
+    let want: f64 = xs
+        .iter()
+        .zip(&ys)
+        .map(|(&x, &y)| f64::from(x) * f64::from(y))
+        .sum();
     assert!((f64::from(sum) - want).abs() < 1e-2, "{sum} vs {want}");
 
     let before = ctx.jit().stats();
@@ -187,13 +206,30 @@ fn reductions_fuse_their_input_expression() {
         .map(|(&x, &y)| f64::from(x - y) * f64::from(x - y))
         .sum::<f64>()
         .sqrt();
-    assert!((f64::from(norm) - want_norm).abs() < 1e-3 * want_norm, "{norm} vs {want_norm}");
-    let want_min = xs.iter().map(|&x| x * 2.0 - 1.0).fold(f32::INFINITY, f32::min);
-    let want_max = xs.iter().map(|&x| x * 2.0 - 1.0).fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        (f64::from(norm) - want_norm).abs() < 1e-3 * want_norm,
+        "{norm} vs {want_norm}"
+    );
+    let want_min = xs
+        .iter()
+        .map(|&x| x * 2.0 - 1.0)
+        .fold(f32::INFINITY, f32::min);
+    let want_max = xs
+        .iter()
+        .map(|&x| x * 2.0 - 1.0)
+        .fold(f32::NEG_INFINITY, f32::max);
     assert_eq!(min, want_min);
     assert_eq!(max, want_max);
-    let want_mean = xs.iter().zip(&ys).map(|(&x, &y)| f64::from(x + y)).sum::<f64>() / n as f64;
-    assert!((f64::from(mean) - want_mean).abs() < 1e-4, "{mean} vs {want_mean}");
+    let want_mean = xs
+        .iter()
+        .zip(&ys)
+        .map(|(&x, &y)| f64::from(x + y))
+        .sum::<f64>()
+        / n as f64;
+    assert!(
+        (f64::from(mean) - want_mean).abs() < 1e-4,
+        "{mean} vs {want_mean}"
+    );
 
     // u32: counting a mask.
     let count = a.gt(0.0).count().item().unwrap();
@@ -201,14 +237,30 @@ fn reductions_fuse_their_input_expression() {
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
 
     // Sizes around the block boundaries, one-element arrays included.
-    for len in [1usize, 2, 255, 1023, 1024, 1025, 4096, 4097, 1024 * 1024 + 3] {
+    for len in [
+        1usize,
+        2,
+        255,
+        1023,
+        1024,
+        1025,
+        4096,
+        4097,
+        1024 * 1024 + 3,
+    ] {
         let data = values(len, len as u64, 0.0, 1.0);
         let x = f32s(&ctx, &data);
         let got = (&x * 2.0).sum().item().unwrap();
         let want: f64 = data.iter().map(|&v| f64::from(v) * 2.0).sum();
-        assert!((f64::from(got) - want).abs() <= 1e-4 * want.abs().max(1.0), "{len}: {got} vs {want}");
+        assert!(
+            (f64::from(got) - want).abs() <= 1e-4 * want.abs().max(1.0),
+            "{len}: {got} vs {want}"
+        );
         let got_max = (&x + 1.0).max().item().unwrap();
-        let want_max = data.iter().map(|&v| v + 1.0).fold(f32::NEG_INFINITY, f32::max);
+        let want_max = data
+            .iter()
+            .map(|&v| v + 1.0)
+            .fold(f32::NEG_INFINITY, f32::max);
         assert_eq!(got_max, want_max, "{len}");
     }
 }
@@ -286,7 +338,9 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
     let ctx = ctx();
     let max_inputs = ctx.jit().max_inputs();
     let count = max_inputs * 2 + 3;
-    let data: Vec<Vec<f32>> = (0..count).map(|i| values(300, 100 + i as u64, -1.0, 1.0)).collect();
+    let data: Vec<Vec<f32>> = (0..count)
+        .map(|i| values(300, 100 + i as u64, -1.0, 1.0))
+        .collect();
     let arrays: Vec<Array<f32>> = data.iter().map(|d| f32s(&ctx, d)).collect();
 
     let before = ctx.jit().stats();
@@ -298,7 +352,10 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
     let want: Vec<f32> = (0..300).map(|j| data.iter().map(|d| d[j]).sum()).collect();
     assert_close(&got, &want, 1e-4, 1e-4);
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
-    assert!(launches >= 3, "{count} buffers with at most {max_inputs} inputs per kernel: {launches}");
+    assert!(
+        launches >= 3,
+        "{count} buffers with at most {max_inputs} inputs per kernel: {launches}"
+    );
 
     // The same input many times is one binding: 81 operations, one kernel.
     ctx.jit().set_max_nodes(128);
@@ -308,14 +365,22 @@ fn expressions_over_many_buffers_are_split_by_the_binding_limit() {
         acc = &acc + &arrays[0] * 0.5;
     }
     let got = acc.to_vec().unwrap();
-    assert_close(&got, &data[0].iter().map(|v| v * 21.0).collect::<Vec<_>>(), 1e-4, 1e-4);
+    assert_close(
+        &got,
+        &data[0].iter().map(|v| v * 21.0).collect::<Vec<_>>(),
+        1e-4,
+        1e-4,
+    );
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
 }
 
 /// Where arithmetic costs more than a launch and a pass over the buffers, so that every pending
 /// node that two expressions read is worth evaluating first (see `worth_storing`).
 fn costly_arithmetic() -> CostModel {
-    CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }
+    CostModel {
+        f32_ops_per_ns: 1e-6,
+        ..CostModel::TEST
+    }
 }
 
 #[test]
@@ -333,10 +398,24 @@ fn a_cheap_node_with_two_consumers_is_computed_by_each() {
     let v = &t * 2.0;
     let got_u = u.to_vec().unwrap();
     let got_v = v.to_vec().unwrap();
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2, "u and v compute t each");
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        2,
+        "u and v compute t each"
+    );
     let t_ref: Vec<f32> = xs.iter().zip(&ys).map(|(&a, &b)| (a * b).sqrt()).collect();
-    assert_close(&got_u, &t_ref.iter().map(|v| v + 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
-    assert_close(&got_v, &t_ref.iter().map(|v| v * 2.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+    assert_close(
+        &got_u,
+        &t_ref.iter().map(|v| v + 1.0).collect::<Vec<_>>(),
+        1e-5,
+        1e-5,
+    );
+    assert_close(
+        &got_v,
+        &t_ref.iter().map(|v| v * 2.0).collect::<Vec<_>>(),
+        1e-5,
+        1e-5,
+    );
 }
 
 #[test]
@@ -358,8 +437,18 @@ fn a_node_with_two_consumers_is_computed_once() {
     assert_eq!(d.elementwise_launches, 3, "t once, u once, v once");
 
     let t_ref: Vec<f32> = xs.iter().zip(&ys).map(|(&a, &b)| (a * b).sqrt()).collect();
-    assert_close(&got_u, &t_ref.iter().map(|v| v + 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
-    assert_close(&got_v, &t_ref.iter().map(|v| v * 2.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+    assert_close(
+        &got_u,
+        &t_ref.iter().map(|v| v + 1.0).collect::<Vec<_>>(),
+        1e-5,
+        1e-5,
+    );
+    assert_close(
+        &got_v,
+        &t_ref.iter().map(|v| v * 2.0).collect::<Vec<_>>(),
+        1e-5,
+        1e-5,
+    );
     assert_close(&t.to_vec().unwrap(), &t_ref, 1e-5, 1e-5);
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 3);
 
@@ -371,7 +460,12 @@ fn a_node_with_two_consumers_is_computed_once() {
     drop(v);
     let got_u = u.to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    assert_close(&got_u, &t_ref.iter().map(|v| v + 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+    assert_close(
+        &got_u,
+        &t_ref.iter().map(|v| v + 1.0).collect::<Vec<_>>(),
+        1e-5,
+        1e-5,
+    );
 }
 
 #[test]
@@ -522,7 +616,12 @@ fn nothing_runs_for_arrays_that_are_dropped_and_sync_runs_the_live_ones() {
     // `sync` evaluated it (one kernel for the whole expression) ...
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     // ... so reading it back launches nothing more.
-    assert_close(&kept.to_vec().unwrap(), &[2.0f32, 4.0, 6.0, 8.0].map(f32::sqrt), 1e-6, 1e-6);
+    assert_close(
+        &kept.to_vec().unwrap(),
+        &[2.0f32, 4.0, 6.0, 8.0].map(f32::sqrt),
+        1e-6,
+        1e-6,
+    );
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
 }
 
@@ -553,7 +652,11 @@ fn many_pending_readers_of_one_buffer_are_pruned() {
     }
     let kept = &x * 3.0;
     assert_eq!(kept.to_vec().unwrap(), vec![3.0; 64]);
-    let readers = x.storage().ok().map(|s| s.readers.len()).unwrap_or(usize::MAX);
+    let readers = x
+        .storage()
+        .ok()
+        .map(|s| s.readers.len())
+        .unwrap_or(usize::MAX);
     assert!(readers < 200, "{readers}");
 }
 
@@ -587,8 +690,9 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
     // `u` is small: recomputed at the shifted elements, so the whole step is one kernel.
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     let f = |j: usize| xs[j % n] * 2.0;
-    let want: Vec<f32> =
-        (0..n).map(|i| f(i) + (f(i + n - 1) + f(i + 1) - f(i) * 2.0) * 0.1).collect();
+    let want: Vec<f32> = (0..n)
+        .map(|i| f(i) + (f(i + n - 1) + f(i + 1) - f(i) * 2.0) * 0.1)
+        .collect();
     assert_close(&got, &want, 1e-5, 1e-5);
 
     // An expression beyond the staging limit is evaluated once for its shifts instead.
@@ -605,9 +709,10 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
 
     // Shifts of shifted expressions nest.
     let nested = ((&x * 2.0).shift(1) + 1.0).shift(1).to_vec().unwrap();
-    let want: Vec<f32> = (0..n).map(|i| xs[(i + 2 * n - 2) % n] * 2.0 + 1.0).collect();
+    let want: Vec<f32> = (0..n)
+        .map(|i| xs[(i + 2 * n - 2) % n] * 2.0 + 1.0)
+        .collect();
     assert_close(&nested, &want, 1e-6, 1e-6);
-
 
     // A shifted expression shared with an outside consumer is evaluated once instead of being
     // recomputed inside the shift's kernel (where computing it costs more than a launch).
@@ -634,7 +739,9 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
     // Multi-dimensional shifts of two arrays in one kernel.
     let (nx, ny) = (7usize, 5usize);
     let a = Array::from_slice_on(&ctx, &xs[..nx * ny], [nx, ny]).unwrap();
-    let got = (a.shift([1isize, -2]) - a.shift([-3isize, 0])).to_vec().unwrap();
+    let got = (a.shift([1isize, -2]) - a.shift([-3isize, 0]))
+        .to_vec()
+        .unwrap();
     let at = |cx: isize, cy: isize| {
         xs[cx.rem_euclid(nx as isize) as usize + nx * cy.rem_euclid(ny as isize) as usize]
     };
@@ -651,7 +758,10 @@ fn shifts_fuse_into_the_expression_that_reads_them() {
 fn a_life_step_recomputes_through_its_shifts() {
     let ctx = ctx();
     let (w, h) = (64usize, 64usize);
-    let cells: Vec<f32> = values(w * h, 7, 0.0, 1.0).into_iter().map(|v| if v > 0.5 { 1.0 } else { 0.0 }).collect();
+    let cells: Vec<f32> = values(w * h, 7, 0.0, 1.0)
+        .into_iter()
+        .map(|v| if v > 0.5 { 1.0 } else { 0.0 })
+        .collect();
     let step = |u: &Array<f32>| {
         let mut n = u.shift([1isize, 1]) + u.shift([1isize, 0]) + u.shift([1isize, -1]);
         n = n + u.shift([0isize, 1]) + u.shift([0isize, -1]);
@@ -672,12 +782,17 @@ fn a_life_step_recomputes_through_its_shifts() {
                 for dy in -1isize..=1 {
                     for dx in -1isize..=1 {
                         if (dx, dy) != (0, 0) {
-                            let j = (x + dx).rem_euclid(w as isize) as usize + w * (y + dy).rem_euclid(h as isize) as usize;
+                            let j = (x + dx).rem_euclid(w as isize) as usize
+                                + w * (y + dy).rem_euclid(h as isize) as usize;
                             n += g[j];
                         }
                     }
                 }
-                if n == 3.0 || (n == 2.0 && g[i] == 1.0) { 1.0 } else { 0.0 }
+                if n == 3.0 || (n == 2.0 && g[i] == 1.0) {
+                    1.0
+                } else {
+                    0.0
+                }
             })
             .collect()
     };
@@ -700,11 +815,16 @@ fn life_cpu(g: &[f32], w: usize, h: usize) -> Vec<f32> {
             for dy in -1isize..=1 {
                 for dx in -1isize..=1 {
                     if (dx, dy) != (0, 0) {
-                        n += g[(x + dx).rem_euclid(w as isize) as usize + w * (y + dy).rem_euclid(h as isize) as usize];
+                        n += g[(x + dx).rem_euclid(w as isize) as usize
+                            + w * (y + dy).rem_euclid(h as isize) as usize];
                     }
                 }
             }
-            if n == 3.0 || (n == 2.0 && g[i] == 1.0) { 1.0 } else { 0.0 }
+            if n == 3.0 || (n == 2.0 && g[i] == 1.0) {
+                1.0
+            } else {
+                0.0
+            }
         })
         .collect()
 }
@@ -713,7 +833,10 @@ fn life_cpu(g: &[f32], w: usize, h: usize) -> Vec<f32> {
 fn a_lazy_chain_of_life_steps_is_staged_in_workgroup_memory() {
     let ctx = ctx();
     for (w, h) in [(64usize, 64usize), (37, 29)] {
-        let cells: Vec<f32> = values(w * h, 9, 0.0, 1.0).into_iter().map(|v| if v > 0.5 { 1.0 } else { 0.0 }).collect();
+        let cells: Vec<f32> = values(w * h, 9, 0.0, 1.0)
+            .into_iter()
+            .map(|v| if v > 0.5 { 1.0 } else { 0.0 })
+            .collect();
         let mut want = cells.clone();
         for steps in 1..=6 {
             want = life_cpu(&want, w, h);
@@ -724,7 +847,11 @@ fn a_lazy_chain_of_life_steps_is_staged_in_workgroup_memory() {
             }
             let got = u.to_vec().unwrap();
             if steps == 3 {
-                assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{w}x{h}: three levels in one kernel");
+                assert_eq!(
+                    delta(before, ctx.jit().stats()).elementwise_launches,
+                    1,
+                    "{w}x{h}: three levels in one kernel"
+                );
             }
             assert_close(&got, &want, 0.0, 0.0);
         }
@@ -739,7 +866,10 @@ fn a_shifted_expression_also_read_directly_is_computed_once() {
     // The life step reads `u` through eight shifts and once at the cell itself.
     let two = life_step(&life_step(&u));
     let node = two.pending().unwrap();
-    let fused = super::program::flatten(&[(std::sync::Arc::clone(node), node.operands().unwrap())], super::program::Tail::Store);
+    let fused = super::program::flatten(
+        &[(std::sync::Arc::clone(node), node.operands().unwrap())],
+        super::program::Tail::Store,
+    );
     let fused = fused.ok().unwrap();
     assert_eq!(fused.key.subs.len(), 1);
     // The outer step plus one read of the inner step's staged value, not a second inner step.
@@ -756,7 +886,12 @@ fn a_lazy_chain_of_heat_steps_matches_iterate() {
         for _ in 0..steps {
             u = heat_step(&u);
         }
-        assert_close(&u.to_vec().unwrap(), &g.iterate(steps, heat_step).to_vec().unwrap(), 1e-5, 1e-5);
+        assert_close(
+            &u.to_vec().unwrap(),
+            &g.iterate(steps, heat_step).to_vec().unwrap(),
+            1e-5,
+            1e-5,
+        );
     }
 
     let n = 1000;
@@ -764,7 +899,9 @@ fn a_lazy_chain_of_heat_steps_matches_iterate() {
     let step = |x: &Array<f32>| x + (x.shift(1) + x.shift(-1) - x * 2.0) * 0.25;
     let mut want = xs.clone();
     for steps in 1..=8 {
-        want = (0..n).map(|i| want[i] + (want[(i + n - 1) % n] + want[(i + 1) % n] - want[i] * 2.0) * 0.25).collect();
+        want = (0..n)
+            .map(|i| want[i] + (want[(i + n - 1) % n] + want[(i + 1) % n] - want[i] * 2.0) * 0.25)
+            .collect();
         let mut u = f32s(&ctx, &xs);
         let before = ctx.jit().stats();
         for _ in 0..steps {
@@ -784,13 +921,19 @@ fn a_shift_wider_than_the_staging_limit_still_gives_the_right_values() {
     let n = 1000;
     let xs = values(n, 31, 0.0, 1.0);
     let x = f32s(&ctx, &xs);
-    let got = ((&x * 2.0 + 1.0).shift(3) * 0.5 + (&x * 3.0).shift(-1)).to_vec().unwrap();
-    let want: Vec<f32> = (0..n).map(|i| (xs[(i + n - 3) % n] * 2.0 + 1.0) * 0.5 + xs[(i + 1) % n] * 3.0).collect();
+    let got = ((&x * 2.0 + 1.0).shift(3) * 0.5 + (&x * 3.0).shift(-1))
+        .to_vec()
+        .unwrap();
+    let want: Vec<f32> = (0..n)
+        .map(|i| (xs[(i + n - 3) % n] * 2.0 + 1.0) * 0.5 + xs[(i + 1) % n] * 3.0)
+        .collect();
     assert_close(&got, &want, 1e-6, 1e-6);
 
     let (nx, ny, nz) = (4usize, 3usize, 5usize);
     let cube = Array::from_slice_on(&ctx, &xs[..nx * ny * nz], [nx, ny, nz]).unwrap();
-    let got = ((&cube * 2.0).shift([1isize, 0, -1]) + 1.0).to_vec().unwrap();
+    let got = ((&cube * 2.0).shift([1isize, 0, -1]) + 1.0)
+        .to_vec()
+        .unwrap();
     let want: Vec<f32> = (0..nx * ny * nz)
         .map(|i| {
             let (cx, cy, cz) = (i % nx, (i / nx) % ny, i / (nx * ny));
@@ -808,15 +951,30 @@ fn mixed_types_and_scalars_in_a_staged_expression() {
     let x = Array::from_slice_on(&ctx, &xs, [w, h]).unwrap();
     let scale = 1.5f32;
     let mask = x.gt(1.0);
-    let got = (select(&mask.shift([1isize, 0]), (&x * scale).shift([0isize, 1]), &x) + select(&mask.shift([-1isize, 1]), 1.0, 0.0))
-        .to_vec()
-        .unwrap();
-    let at = |cx: isize, cy: isize| (cx.rem_euclid(w as isize) as usize) + w * cy.rem_euclid(h as isize) as usize;
+    let got = (select(
+        &mask.shift([1isize, 0]),
+        (&x * scale).shift([0isize, 1]),
+        &x,
+    ) + select(&mask.shift([-1isize, 1]), 1.0, 0.0))
+    .to_vec()
+    .unwrap();
+    let at = |cx: isize, cy: isize| {
+        (cx.rem_euclid(w as isize) as usize) + w * cy.rem_euclid(h as isize) as usize
+    };
     let want: Vec<f32> = (0..w * h)
         .map(|i| {
             let (cx, cy) = ((i % w) as isize, (i / w) as isize);
-            let first = if xs[at(cx - 1, cy)] > 1.0 { xs[at(cx, cy - 1)] * scale } else { xs[i] };
-            first + if xs[at(cx + 1, cy - 1)] > 1.0 { 1.0 } else { 0.0 }
+            let first = if xs[at(cx - 1, cy)] > 1.0 {
+                xs[at(cx, cy - 1)] * scale
+            } else {
+                xs[i]
+            };
+            first
+                + if xs[at(cx + 1, cy - 1)] > 1.0 {
+                    1.0
+                } else {
+                    0.0
+                }
         })
         .collect();
     assert_close(&got, &want, 1e-6, 1e-6);
@@ -836,8 +994,16 @@ fn arrays_evaluated_together_share_one_kernel() {
     // `ratio` is used by both: computed once, inside the same kernel.
     crate::ops::eval_all(&[&call, &put]).unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    let want_call: Vec<f32> = xs.iter().zip(&ys).map(|(x, y)| (x / y).ln() * 2.0 + x).collect();
-    let want_put: Vec<f32> = xs.iter().zip(&ys).map(|(x, y)| (x / y).ln() * 3.0 - y).collect();
+    let want_call: Vec<f32> = xs
+        .iter()
+        .zip(&ys)
+        .map(|(x, y)| (x / y).ln() * 2.0 + x)
+        .collect();
+    let want_put: Vec<f32> = xs
+        .iter()
+        .zip(&ys)
+        .map(|(x, y)| (x / y).ln() * 3.0 - y)
+        .collect();
     assert_close(&call.to_vec().unwrap(), &want_call, 1e-5, 1e-5);
     assert_close(&put.to_vec().unwrap(), &want_put, 1e-5, 1e-5);
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
@@ -849,8 +1015,16 @@ fn arrays_evaluated_together_share_one_kernel() {
     let other_len = f32s(&ctx, &[1.0, 2.0]) * 2.0;
     ctx.sync().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
-    assert_close(&scaled.to_vec().unwrap(), &xs.iter().map(|v| v * 4.0).collect::<Vec<_>>(), 1e-6, 1e-6);
-    assert_eq!(mask.to_u32().to_vec().unwrap(), xs.iter().map(|&v| u32::from(v > 1.0)).collect::<Vec<_>>());
+    assert_close(
+        &scaled.to_vec().unwrap(),
+        &xs.iter().map(|v| v * 4.0).collect::<Vec<_>>(),
+        1e-6,
+        1e-6,
+    );
+    assert_eq!(
+        mask.to_u32().to_vec().unwrap(),
+        xs.iter().map(|&v| u32::from(v > 1.0)).collect::<Vec<_>>()
+    );
     assert_eq!(other_len.to_vec().unwrap(), vec![2.0, 4.0]);
 }
 
@@ -863,20 +1037,36 @@ fn several_reductions_share_one_pass() {
     let x = f32s(&ctx, &xs);
     let lazy = &x * 2.0;
     let before = ctx.jit().stats();
-    let [sum, lo, hi, squares] =
-        lazy.reduce([Reduction::Sum, Reduction::Min, Reduction::Max, Reduction::SumOfSquares]).to_array().unwrap();
+    let [sum, lo, hi, squares] = lazy
+        .reduce([
+            Reduction::Sum,
+            Reduction::Min,
+            Reduction::Max,
+            Reduction::SumOfSquares,
+        ])
+        .to_array()
+        .unwrap();
     let d = delta(before, ctx.jit().stats());
     assert_eq!((d.reduce_launches, d.elementwise_launches), (1, 0));
     let doubled: Vec<f64> = xs.iter().map(|&v| f64::from(v) * 2.0).collect();
     let want_sum: f64 = doubled.iter().sum();
     let want_squares: f64 = doubled.iter().map(|v| v * v).sum();
-    assert!((f64::from(sum) - want_sum).abs() < 1e-3 * want_squares.sqrt(), "{sum} vs {want_sum}");
-    assert!((f64::from(squares) - want_squares).abs() < 1e-4 * want_squares, "{squares} vs {want_squares}");
+    assert!(
+        (f64::from(sum) - want_sum).abs() < 1e-3 * want_squares.sqrt(),
+        "{sum} vs {want_sum}"
+    );
+    assert!(
+        (f64::from(squares) - want_squares).abs() < 1e-4 * want_squares,
+        "{squares} vs {want_squares}"
+    );
     assert_eq!(lo, xs.iter().fold(f32::MAX, |m, &v| m.min(v * 2.0)));
     assert_eq!(hi, xs.iter().fold(f32::MIN, |m, &v| m.max(v * 2.0)));
 
     // On a materialized array, and an op repeated.
-    let [a, b] = x.reduce([Reduction::Max, Reduction::Max]).to_array().unwrap();
+    let [a, b] = x
+        .reduce([Reduction::Max, Reduction::Max])
+        .to_array()
+        .unwrap();
     assert_eq!((a, b), (hi / 2.0, hi / 2.0));
 }
 
@@ -903,14 +1093,25 @@ fn the_epilogue_of_a_reduction_runs_in_its_last_pass() {
         // On the host.
         let before = ctx.jit().stats();
         let norm = x.norm().item().unwrap();
-        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "norm of {n} elements");
-        assert!((f64::from(norm) - want).abs() <= 1e-4 * want, "{norm} vs {want}");
+        assert_eq!(
+            launches(delta(before, ctx.jit().stats())),
+            passes,
+            "norm of {n} elements"
+        );
+        assert!(
+            (f64::from(norm) - want).abs() <= 1e-4 * want,
+            "{norm} vs {want}"
+        );
 
         // As a buffer on the GPU.
         let before = ctx.jit().stats();
         let rms_gpu = (&(&x * &x).sum() / (n as f32)).sqrt();
         rms_gpu.eval().unwrap();
-        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "rms of {n} elements");
+        assert_eq!(
+            launches(delta(before, ctx.jit().stats())),
+            passes,
+            "rms of {n} elements"
+        );
         let got = f64::from(rms_gpu.item().unwrap());
         assert!((got - rms).abs() <= 1e-4 * rms, "{got} vs {rms}");
 
@@ -919,11 +1120,18 @@ fn the_epilogue_of_a_reduction_runs_in_its_last_pass() {
         let scaled = (x.sum() / (n as f32)).sqrt();
         let y = &x * &scaled;
         let ys = y.to_vec().unwrap();
-        let mean_abs = (xs.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64).abs().sqrt();
-        assert_eq!(launches(delta(before, ctx.jit().stats())), passes + 1, "x * sqrt(mean) of {n} elements");
+        let mean_abs = (xs.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64)
+            .abs()
+            .sqrt();
+        assert_eq!(
+            launches(delta(before, ctx.jit().stats())),
+            passes + 1,
+            "x * sqrt(mean) of {n} elements"
+        );
         for (got, want) in ys.iter().zip(&xs) {
             assert!(
-                (f64::from(*got) - f64::from(*want) * mean_abs).abs() <= 1e-3 * f64::from(want.abs()).max(1e-3),
+                (f64::from(*got) - f64::from(*want) * mean_abs).abs()
+                    <= 1e-3 * f64::from(want.abs()).max(1e-3),
                 "{got} vs {want} * {mean_abs}"
             );
         }
@@ -945,9 +1153,14 @@ fn steps_on_a_reduction_beyond_the_limit_run_as_an_expression() {
     assert_eq!(launches(delta(before, ctx.jit().stats())), 3);
 
     // The scalar on the left, and several reductions with the same steps.
-    let [lo, hi] = x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max]).to_array().unwrap();
+    let [lo, hi] = x
+        .reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max])
+        .to_array()
+        .unwrap();
     let before = ctx.jit().stats();
-    let [a, b] = (2.0 - x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max])).to_array().unwrap();
+    let [a, b] = (2.0 - x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max]))
+        .to_array()
+        .unwrap();
     assert_eq!(launches(delta(before, ctx.jit().stats())), 2);
     assert_eq!((a, b), (2.0 - lo, 2.0 - hi));
 }
@@ -967,9 +1180,15 @@ fn a_reduction_that_ran_is_not_run_again_by_a_step_on_it() {
     let mean = (&total / n).item().unwrap();
     let d = delta(before, ctx.jit().stats());
     // The division of the sum's buffer, not the reduction again.
-    assert_eq!((d.reduce_launches + d.reduce_passes, d.elementwise_launches), (0, 1));
+    assert_eq!(
+        (d.reduce_launches + d.reduce_passes, d.elementwise_launches),
+        (0, 1)
+    );
     assert!((f64::from(total.item().unwrap()) - sum).abs() <= 1e-3);
-    assert!((f64::from(mean) - sum / f64::from(n)).abs() <= 1e-6, "{mean}");
+    assert!(
+        (f64::from(mean) - sum / f64::from(n)).abs() <= 1e-6,
+        "{mean}"
+    );
 }
 
 #[test]
@@ -982,8 +1201,15 @@ fn the_temporaries_of_one_expression_do_not_keep_the_steps_out_of_the_pass() {
         let before = ctx.jit().stats();
         // `x * x` and the sum and the quotient are alive while the root is taken.
         let got = (&(&x * &x).sum() / (n as f32)).sqrt().item().unwrap();
-        assert_eq!(launches(delta(before, ctx.jit().stats())), passes, "{n} elements");
-        assert!((f64::from(got) - want).abs() <= 1e-4 * want, "{got} vs {want}");
+        assert_eq!(
+            launches(delta(before, ctx.jit().stats())),
+            passes,
+            "{n} elements"
+        );
+        assert!(
+            (f64::from(got) - want).abs() <= 1e-4 * want,
+            "{got} vs {want}"
+        );
     }
 }
 
@@ -1030,7 +1256,11 @@ fn arrays_advancing_together_are_split_into_multi_output_kernels() {
         zy = select(&inside, &nzy, &zy);
         cnt = &cnt + select(&inside, &one, &zero);
     }
-    let got = [zx.to_vec().unwrap(), zy.to_vec().unwrap(), cnt.to_vec().unwrap()];
+    let got = [
+        zx.to_vec().unwrap(),
+        zy.to_vec().unwrap(),
+        cnt.to_vec().unwrap(),
+    ];
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
 
     let (mut wx, mut wy, mut wc) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
@@ -1080,7 +1310,11 @@ fn arrays_advancing_together_for_many_iterations_split_into_few_kernels() {
         cnt = &cnt + select(&inside, &one, &zero);
     }
     ctx.flush().unwrap();
-    let got = [zx.to_vec().unwrap(), zy.to_vec().unwrap(), cnt.to_vec().unwrap()];
+    let got = [
+        zx.to_vec().unwrap(),
+        zy.to_vec().unwrap(),
+        cnt.to_vec().unwrap(),
+    ];
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
 
     let (mut wx, mut wy, mut wc) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
@@ -1228,7 +1462,8 @@ fn eval_loops_of_threads_that_alternate_are_both_compressed() {
             .map(|n| {
                 let (ctx, barrier) = (&ctx, &barrier);
                 scope.spawn(move || {
-                    let g = Array::from_slice_on(ctx, &values(n * n, 62, 0.0, 1.0), [n, n]).unwrap();
+                    let g =
+                        Array::from_slice_on(ctx, &values(n * n, 62, 0.0, 1.0), [n, n]).unwrap();
                     let mut u = &g * 1.0;
                     for _ in 0..steps {
                         u = heat_step(&u);
@@ -1236,11 +1471,17 @@ fn eval_loops_of_threads_that_alternate_are_both_compressed() {
                         u.eval().unwrap();
                     }
                     ctx.sync().unwrap();
-                    (g.iterate(steps, heat_step).to_vec().unwrap(), u.to_vec().unwrap())
+                    (
+                        g.iterate(steps, heat_step).to_vec().unwrap(),
+                        u.to_vec().unwrap(),
+                    )
                 })
             })
             .collect();
-        threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect()
     });
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
     assert!(launches < 40, "{launches} kernels for 2 x {steps} steps");
@@ -1250,7 +1491,9 @@ fn eval_loops_of_threads_that_alternate_are_both_compressed() {
 }
 
 fn heat_step(u: &Array<f32>) -> Array<f32> {
-    let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - u * 4.0;
+    let lap =
+        u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1])
+            - u * 4.0;
     u + lap * 0.2
 }
 
@@ -1310,7 +1553,11 @@ fn writing_a_fixed_input_after_a_compressed_loop_does_not_change_it() {
     }
     c.write(&vec![1.0; 512]).unwrap();
 
-    let want: Vec<f32> = xs.iter().zip(&cs).map(|(&x, &c)| (0..30).fold(x, |x, _| x * 0.5 + c)).collect();
+    let want: Vec<f32> = xs
+        .iter()
+        .zip(&cs)
+        .map(|(&x, &c)| (0..30).fold(x, |x, _| x * 0.5 + c))
+        .collect();
     assert_close(&x.to_vec().unwrap(), &want, 1e-5, 1e-5);
     assert_eq!(c.to_vec().unwrap(), vec![1.0; 512]);
 }
@@ -1373,7 +1620,11 @@ fn kernels_built_stay_bounded_for_long_eval_loops() {
         })
         .collect();
     let mismatched = got.iter().zip(&want).filter(|(g, w)| g != w).count();
-    assert!((mismatched as f32) < want.len() as f32 * 0.01, "{mismatched} of {} pixels differ", want.len());
+    assert!(
+        (mismatched as f32) < want.len() as f32 * 0.01,
+        "{mismatched} of {} pixels differ",
+        want.len()
+    );
 }
 
 #[test]
@@ -1469,9 +1720,18 @@ fn an_eval_loop_of_a_step_too_big_to_recompute_still_runs_as_one_loop() {
 /// Runs `next = step(&u); err = (&next - &u).abs().max().item()?; u = next` on a 32×32 torus with a
 /// fixed source `c`, `alpha(k)` as the diffusion of step `k`, and `c` overwritten before step
 /// `rewrite_at`, and checks every `err` and the final state against a CPU loop.
-fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32, rewrite_at: Option<usize>) {
+fn check_readback_loop(
+    ctx: &Context,
+    steps: usize,
+    alpha: impl Fn(usize) -> f32,
+    rewrite_at: Option<usize>,
+) {
     const W: usize = 32;
-    let (u0, c0, c1) = (values(W * W, 80, 0.0, 1.0), values(W * W, 81, 0.0, 1.0), values(W * W, 82, 0.0, 1.0));
+    let (u0, c0, c1) = (
+        values(W * W, 80, 0.0, 1.0),
+        values(W * W, 81, 0.0, 1.0),
+        values(W * W, 82, 0.0, 1.0),
+    );
     let mut c = Array::from_slice_on(ctx, &c0, [W, W]).unwrap();
     let mut u = &Array::from_slice_on(ctx, &u0, [W, W]).unwrap() * 1.0;
     let (mut cpu, mut source) = (u0, c0);
@@ -1481,7 +1741,11 @@ fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32
             source = c1.clone();
         }
         let a = alpha(k);
-        let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - &u * 4.0;
+        let lap = u.shift([1isize, 0])
+            + u.shift([-1isize, 0])
+            + u.shift([0isize, 1])
+            + u.shift([0isize, -1])
+            - &u * 4.0;
         let next = &u + lap * a + &c * 0.01;
         let err = (&next - &u).abs().max().item().unwrap();
         u = next;
@@ -1490,12 +1754,20 @@ fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32
         let mut new = vec![0.0f32; W * W];
         for i in 0..W {
             for j in 0..W {
-                let lap = at(i + 1, j) + at(i + W - 1, j) + at(i, j + 1) + at(i, j + W - 1) - at(i, j) * 4.0;
+                let lap = at(i + 1, j) + at(i + W - 1, j) + at(i, j + 1) + at(i, j + W - 1)
+                    - at(i, j) * 4.0;
                 new[i * W + j] = at(i, j) + lap * a + source[i * W + j] * 0.01;
             }
         }
-        let want = new.iter().zip(&cpu).map(|(n, o)| (n - o).abs()).fold(0.0, f32::max);
-        assert!((err - want).abs() <= 1e-4 * want + 1e-6, "step {k}: err {err}, want {want}");
+        let want = new
+            .iter()
+            .zip(&cpu)
+            .map(|(n, o)| (n - o).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            (err - want).abs() <= 1e-4 * want + 1e-6,
+            "step {k}: err {err}, want {want}"
+        );
         cpu = new;
     }
     assert_close(&u.to_vec().unwrap(), &cpu, 1e-4, 1e-5);
@@ -1505,7 +1777,10 @@ fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32
 fn a_readback_loop_gives_the_same_values_with_speculation() {
     let ctx = ctx();
     check_readback_loop(&ctx, 60, |_| 0.2, None);
-    assert!(ctx.jit().speculation_hits() > 0, "no readback was answered ahead of time");
+    assert!(
+        ctx.jit().speculation_hits() > 0,
+        "no readback was answered ahead of time"
+    );
 }
 
 #[test]
@@ -1545,7 +1820,9 @@ fn a_difference_of_slices_is_one_kernel() {
     let before = ctx.jit().stats();
     let e = &f * 2.0 + 1.0;
     let got = (e.slice(0, 1..) - e.slice(0, ..8)).to_vec().unwrap();
-    let want: Vec<f32> = (0..8).map(|i| (data[i + 1] * 2.0 + 1.0) - (data[i] * 2.0 + 1.0)).collect();
+    let want: Vec<f32> = (0..8)
+        .map(|i| (data[i + 1] * 2.0 + 1.0) - (data[i] * 2.0 + 1.0))
+        .collect();
     assert_close(&got, &want, 1e-5, 1e-6);
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
 }
@@ -1555,12 +1832,17 @@ fn a_boundary_assignment_reading_the_target_is_one_kernel() {
     let ctx = ctx();
     let (ni, nj) = (8usize, 6usize);
     let data = values(ni * nj, 40, -1.0, 1.0);
-    let want_ghost: Vec<f32> = (0..nj).flat_map(|j| [-data[3 + ni * j], -data[2 + ni * j]]).collect();
+    let want_ghost: Vec<f32> = (0..nj)
+        .flat_map(|j| [-data[3 + ni * j], -data[2 + ni * j]])
+        .collect();
     let check = |w: &Array<f32>| {
         let got = w.to_vec().unwrap();
         for j in 0..nj {
             assert_eq!(&got[ni * j..ni * j + 2], &want_ghost[2 * j..2 * j + 2]);
-            assert_eq!(&got[ni * j + 2..ni * (j + 1)], &data[ni * j + 2..ni * (j + 1)]);
+            assert_eq!(
+                &got[ni * j + 2..ni * (j + 1)],
+                &data[ni * j + 2..ni * (j + 1)]
+            );
         }
     };
 
@@ -1579,7 +1861,9 @@ fn a_boundary_assignment_reading_the_target_is_one_kernel() {
     w.slice_mut(0, ..2).assign(&g).unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     check(&w);
-    let want_g: Vec<f32> = (0..nj).flat_map(|j| [-data[3 + ni * j], -data[2 + ni * j]]).collect();
+    let want_g: Vec<f32> = (0..nj)
+        .flat_map(|j| [-data[3 + ni * j], -data[2 + ni * j]])
+        .collect();
     assert_eq!(g.to_vec().unwrap(), want_g);
 }
 
@@ -1591,7 +1875,10 @@ fn assigning_an_expression_of_the_whole_target_is_one_in_place_kernel() {
     let before = ctx.jit().stats();
     w.assign((&w * 2.0 + 1.0) * 0.5 - &w * 0.25).unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    let want: Vec<f32> = data.iter().map(|v| (v * 2.0 + 1.0) * 0.5 - v * 0.25).collect();
+    let want: Vec<f32> = data
+        .iter()
+        .map(|v| (v * 2.0 + 1.0) * 0.5 - v * 0.25)
+        .collect();
     assert_close(&w.to_vec().unwrap(), &want, 1e-5, 1e-6);
 }
 
@@ -1609,7 +1896,8 @@ fn a_record_ghost_assignment_is_one_kernel() {
         .map(|k| {
             (0..nj)
                 .flat_map(|j| {
-                    let inner = |x: usize| data[k][x + ni * j] * 2.0 + data[(k + 1) % 4][x + ni * j];
+                    let inner =
+                        |x: usize| data[k][x + ni * j] * 2.0 + data[(k + 1) % 4][x + ni * j];
                     [inner(3), inner(2)]
                 })
                 .collect()
@@ -1619,8 +1907,15 @@ fn a_record_ghost_assignment_is_one_kernel() {
         for k in 0..4 {
             let got = w[k].to_vec().unwrap();
             for j in 0..nj {
-                assert_eq!(&got[ni * j..ni * j + 2], &want[k][2 * j..2 * j + 2], "field {k} row {j}");
-                assert_eq!(&got[ni * j + 2..ni * (j + 1)], &data[k][ni * j + 2..ni * (j + 1)]);
+                assert_eq!(
+                    &got[ni * j..ni * j + 2],
+                    &want[k][2 * j..2 * j + 2],
+                    "field {k} row {j}"
+                );
+                assert_eq!(
+                    &got[ni * j + 2..ni * (j + 1)],
+                    &data[k][ni * j + 2..ni * (j + 1)]
+                );
             }
         }
     };
@@ -1646,7 +1941,11 @@ fn a_record_ghost_assignment_is_one_kernel() {
 fn a_wide_expression_of_hundreds_of_operations_is_one_kernel() {
     let ctx = ctx();
     let n = 777;
-    let (xs, ys, zs) = (values(n, 90, 0.5, 1.5), values(n, 91, 0.5, 1.5), values(n, 92, 0.5, 1.5));
+    let (xs, ys, zs) = (
+        values(n, 90, 0.5, 1.5),
+        values(n, 91, 0.5, 1.5),
+        values(n, 92, 0.5, 1.5),
+    );
     let (x, y, z) = (f32s(&ctx, &xs), f32s(&ctx, &ys), f32s(&ctx, &zs));
     let terms = 150;
 
@@ -1702,7 +2001,11 @@ fn a_very_deep_chain_is_cut_and_evaluates_on_a_small_stack() {
     let handle = std::thread::Builder::new()
         // The walk is bounded by `MAX_DEPTH`; unoptimized frames are several times larger, so a debug
         // build gets the default stack of a test thread for the same depth.
-        .stack_size(if cfg!(debug_assertions) { 2 << 20 } else { 256 * 1024 })
+        .stack_size(if cfg!(debug_assertions) {
+            2 << 20
+        } else {
+            256 * 1024
+        })
         .spawn(|| {
             let ctx = ctx();
             let x = f32s(&ctx, &[1.0, 2.0, 3.0]);
@@ -1746,7 +2049,11 @@ fn held_nodes_are_not_shared_but_their_temporaries_are() {
     let v = f(&x);
     crate::ops::eval_all(&[&u, &v]).unwrap();
     // Multiply and add are shared; the two held square roots are not.
-    assert!(ctx.jit().last_program_len() <= 5, "{}", ctx.jit().last_program_len());
+    assert!(
+        ctx.jit().last_program_len() <= 5,
+        "{}",
+        ctx.jit().last_program_len()
+    );
     let want: Vec<f32> = xs.iter().map(|v| (v * 2.0 + 1.0).sqrt()).collect();
     assert_close(&u.to_vec().unwrap(), &want, 1e-5, 1e-6);
     assert_close(&v.to_vec().unwrap(), &want, 1e-5, 1e-6);
@@ -1771,8 +2078,18 @@ fn fields_that_read_each_other_at_the_element_are_one_kernel() {
     let [a1, b1, c1] = [a.clone(), -&a, (-&a).abs().sqrt()].cache();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     assert_close(&a1.to_vec().unwrap(), &ref_a, 1e-5, 1e-6);
-    assert_close(&b1.to_vec().unwrap(), &ref_a.iter().map(|v| -v).collect::<Vec<_>>(), 1e-5, 1e-6);
-    assert_close(&c1.to_vec().unwrap(), &ref_a.iter().map(|v| v.abs().sqrt()).collect::<Vec<_>>(), 1e-5, 1e-6);
+    assert_close(
+        &b1.to_vec().unwrap(),
+        &ref_a.iter().map(|v| -v).collect::<Vec<_>>(),
+        1e-5,
+        1e-6,
+    );
+    assert_close(
+        &c1.to_vec().unwrap(),
+        &ref_a.iter().map(|v| v.abs().sqrt()).collect::<Vec<_>>(),
+        1e-5,
+        1e-6,
+    );
 
     // A field read through a view is evaluated first: two kernels.
     let a = base.slice(0, 1..n) * 2.0 + 1.0;
@@ -1781,7 +2098,12 @@ fn fields_that_read_each_other_at_the_element_are_one_kernel() {
     let [a2, d2] = [a2, d2].cache();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
     assert_close(&a2.to_vec().unwrap(), &ref_a, 1e-5, 1e-6);
-    assert_close(&d2.to_vec().unwrap(), &ref_a[..n - 2].iter().map(|v| v * 0.5).collect::<Vec<_>>(), 1e-5, 1e-6);
+    assert_close(
+        &d2.to_vec().unwrap(),
+        &ref_a[..n - 2].iter().map(|v| v * 0.5).collect::<Vec<_>>(),
+        1e-5,
+        1e-6,
+    );
 }
 
 /// The entry of a block matrix: every entry of every matrix of a scheme is made by one of these
@@ -1806,46 +2128,97 @@ fn entries_that_share_a_large_expression_are_stored_together() {
     let ctx = ctx();
     // Arithmetic that costs about as much per element as a launch plus a pass over the bytes
     // does for an expression of a hundred operations.
-    ctx.set_cost_model(CostModel { f32_ops_per_ns: 40.0, ..CostModel::TEST });
+    ctx.set_cost_model(CostModel {
+        f32_ops_per_ns: 40.0,
+        ..CostModel::TEST
+    });
     let n = 4000;
     let count = 8;
     let xs = values(n, 111, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
-    let large = |a: &Array<f32>| (0..24).fold(a.clone(), |acc, k| (&acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5);
+    let large = |a: &Array<f32>| {
+        (0..24).fold(a.clone(), |acc, k| {
+            (&acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5
+        })
+    };
     let state = large(&x);
-    let dis: Vec<Array<f32>> = (0..count).map(|k| entry_add(&(&state * (k + 1) as f32), &(&state * 0.5))).collect();
-    let f: Vec<Array<f32>> = (0..count).map(|k| entry_add(&(&state * k as f32), &dis[k])).collect();
-    let g: Vec<Array<f32>> = (0..count).map(|k| entry_sub(&(&state * (2 * k) as f32), &dis[k])).collect();
+    let dis: Vec<Array<f32>> = (0..count)
+        .map(|k| entry_add(&(&state * (k + 1) as f32), &(&state * 0.5)))
+        .collect();
+    let f: Vec<Array<f32>> = (0..count)
+        .map(|k| entry_add(&(&state * k as f32), &dis[k]))
+        .collect();
+    let g: Vec<Array<f32>> = (0..count)
+        .map(|k| entry_sub(&(&state * (2 * k) as f32), &dis[k]))
+        .collect();
     let l: Vec<Array<f32>> = f.iter().map(|f| f * 0.25).collect();
     // Made by the same helper and reading `state` like the entries, but only `p` reads them.
-    let h: Vec<Array<f32>> = (0..count).map(|k| entry_add(&(&state * (k + 2) as f32), &state)).collect();
+    let h: Vec<Array<f32>> = (0..count)
+        .map(|k| entry_add(&(&state * (k + 2) as f32), &state))
+        .collect();
     let sum = |terms: Vec<Array<f32>>| terms.into_iter().reduce(|acc, t| acc + t).unwrap();
-    let p = sum((0..count).map(|k| l[k].slice(0, 1..n) + g[k].slice(0, 0..n - 1) + h[k].slice(0, 0..n - 1) * 0.1).collect());
+    let p = sum((0..count)
+        .map(|k| l[k].slice(0, 1..n) + g[k].slice(0, 0..n - 1) + h[k].slice(0, 0..n - 1) * 0.1)
+        .collect());
     let q = sum((0..count).map(|k| (&l[k] + &g[k]) * 2.0).collect());
     let r = sum(f.iter().map(|f| f * 3.0).collect());
     drop((f, g, l));
 
     ctx.jit().record_splits();
     let before = ctx.jit().stats();
-    let got = [p.to_vec().unwrap(), q.to_vec().unwrap(), r.to_vec().unwrap()];
+    let got = [
+        p.to_vec().unwrap(),
+        q.to_vec().unwrap(),
+        r.to_vec().unwrap(),
+    ];
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
     let splits = ctx.jit().take_splits();
-    assert_eq!(launches, 4, "one kernel storing the entries, one per consumer: {splits:?}");
+    assert_eq!(
+        launches, 4,
+        "one kernel storing the entries, one per consumer: {splits:?}"
+    );
     // `dis` and `h` are made by the same helper as `f` and read what `f` reads, but nothing outside
     // the kernel that stores them reads them: they are not outputs of it.
-    assert!(dis.iter().chain(&h).all(|d| d.pending().is_some_and(|node| node.is_pending())), "entries that only the kernel that stores `f` and `g` or `p` reads were stored");
+    assert!(
+        dis.iter()
+            .chain(&h)
+            .all(|d| d.pending().is_some_and(|node| node.is_pending())),
+        "entries that only the kernel that stores `f` and `g` or `p` reads were stored"
+    );
 
-    let large = |a: f32| (0..24).fold(a, |acc, k| (acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5);
+    let large = |a: f32| {
+        (0..24).fold(a, |acc, k| {
+            (acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5
+        })
+    };
     // `(l, g, h)` of element `i`.
     let host = |i: usize| {
         let s = large(xs[i]);
         (0..count)
-            .map(|k| ((s * k as f32 + (s * (k + 1) as f32 + s * 0.5)) * 0.25, s * (2 * k) as f32 - (s * (k + 1) as f32 + s * 0.5), s * (k + 2) as f32 + s))
+            .map(|k| {
+                (
+                    (s * k as f32 + (s * (k + 1) as f32 + s * 0.5)) * 0.25,
+                    s * (2 * k) as f32 - (s * (k + 1) as f32 + s * 0.5),
+                    s * (k + 2) as f32 + s,
+                )
+            })
             .collect::<Vec<_>>()
     };
-    let want_p: Vec<f32> = (0..n - 1).map(|i| host(i + 1).iter().zip(host(i)).map(|(l, g)| l.0 + g.1 + g.2 * 0.1).sum()).collect();
-    let want_q: Vec<f32> = (0..n).map(|i| host(i).iter().map(|(l, g, _)| (l + g) * 2.0).sum()).collect();
-    let want_r: Vec<f32> = (0..n).map(|i| host(i).iter().map(|(l, _, _)| l * 4.0 * 3.0).sum()).collect();
+    let want_p: Vec<f32> = (0..n - 1)
+        .map(|i| {
+            host(i + 1)
+                .iter()
+                .zip(host(i))
+                .map(|(l, g)| l.0 + g.1 + g.2 * 0.1)
+                .sum()
+        })
+        .collect();
+    let want_q: Vec<f32> = (0..n)
+        .map(|i| host(i).iter().map(|(l, g, _)| (l + g) * 2.0).sum())
+        .collect();
+    let want_r: Vec<f32> = (0..n)
+        .map(|i| host(i).iter().map(|(l, _, _)| l * 4.0 * 3.0).sum())
+        .collect();
     assert_close(&got[0], &want_p, 1e-3, 1e-2);
     assert_close(&got[1], &want_q, 1e-3, 1e-2);
     assert_close(&got[2], &want_r, 1e-3, 1e-2);
@@ -1858,33 +2231,63 @@ fn entries_that_share_a_large_expression_are_stored_together() {
 #[test]
 fn what_a_stored_group_reads_below_it_and_others_read_too_is_stored_with_it() {
     let ctx = ctx();
-    ctx.set_cost_model(CostModel { f32_ops_per_ns: 40.0, ..CostModel::TEST });
+    ctx.set_cost_model(CostModel {
+        f32_ops_per_ns: 40.0,
+        ..CostModel::TEST
+    });
     let n = 4000;
     let count = 8;
     let xs = values(n, 112, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
-    let large = |a: &Array<f32>| (0..24).fold(a.clone(), |acc, k| (&acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5);
+    let large = |a: &Array<f32>| {
+        (0..24).fold(a.clone(), |acc, k| {
+            (&acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5
+        })
+    };
     let state = large(&x);
-    let entries: Vec<Array<f32>> = (0..count).map(|k| entry_add(&(&state * (k + 1) as f32), &state)).collect();
+    let entries: Vec<Array<f32>> = (0..count)
+        .map(|k| entry_add(&(&state * (k + 1) as f32), &state))
+        .collect();
     let g: Vec<Array<f32>> = entries.iter().map(|e| e * 2.0 + &state).collect();
     let sum = |terms: Vec<Array<f32>>| terms.into_iter().reduce(|acc, t| acc + t).unwrap();
-    let p = sum((0..count).map(|k| g[k].slice(0, 1..n) + entries[k].slice(0, 0..n - 1)).collect());
+    let p = sum((0..count)
+        .map(|k| g[k].slice(0, 1..n) + entries[k].slice(0, 0..n - 1))
+        .collect());
     let q = sum(g.iter().map(|g| g * 0.5).collect());
     drop((entries, g));
 
     let before = ctx.jit().stats();
     let got = [p.to_vec().unwrap(), q.to_vec().unwrap()];
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
-    assert_eq!(launches, 3, "one kernel storing `g` and `x`, one per consumer");
+    assert_eq!(
+        launches, 3,
+        "one kernel storing `g` and `x`, one per consumer"
+    );
 
-    let large = |a: f32| (0..24).fold(a, |acc, k| (acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5);
+    let large = |a: f32| {
+        (0..24).fold(a, |acc, k| {
+            (acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5
+        })
+    };
     // `(x, g)` of element `i`.
     let host = |i: usize| {
         let s = large(xs[i]);
-        (0..count).map(|k| ((s * (k + 1) as f32 + s), (s * (k + 1) as f32 + s) * 2.0 + s)).collect::<Vec<_>>()
+        (0..count)
+            .map(|k| ((s * (k + 1) as f32 + s), (s * (k + 1) as f32 + s) * 2.0 + s))
+            .collect::<Vec<_>>()
     };
-    let want_p: Vec<f32> = (0..n - 1).map(|i| host(i + 1).iter().zip(host(i)).map(|(g, x)| g.1 + x.0).sum()).collect();
-    let want_q: Vec<f32> = (0..n).map(|i| host(i).iter().map(|e| e.1 * 0.5).sum()).collect();
+    let want_p: Vec<f32> = (0..n - 1)
+        .map(|i| {
+            host(i + 1)
+                .iter()
+                .zip(host(i))
+                .map(|(g, x)| g.1 + x.0)
+                .sum()
+        })
+        .collect();
+    let want_q: Vec<f32> = (0..n)
+        .map(|i| host(i).iter().map(|e| e.1 * 0.5).sum())
+        .collect();
     assert_close(&got[0], &want_p, 1e-3, 1e-2);
     assert_close(&got[1], &want_q, 1e-3, 1e-2);
 }
@@ -1906,8 +2309,15 @@ fn a_requested_node_read_only_inside_the_kernel_is_not_noted_as_shared() {
     let got = out.to_vec().unwrap();
     ctx.set_cost_model(CostModel::TEST);
     let splits = ctx.jit().take_splits();
-    assert!(splits.iter().all(|split| !matches!(split.reason, SplitReason::Shared { .. })), "{splits:?}");
-    let want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 3.0 + 1.0 + 2.0).collect();
+    assert!(
+        splits
+            .iter()
+            .all(|split| !matches!(split.reason, SplitReason::Shared { .. })),
+        "{splits:?}"
+    );
+    let want: Vec<f32> = (0..n)
+        .map(|i| xs[(i + n - 1) % n] * 3.0 + 1.0 + 2.0)
+        .collect();
     assert_close(&got, &want, 1e-5, 1e-5);
 }
 
@@ -1927,11 +2337,26 @@ fn a_node_stored_for_the_pending_operations_that_read_it_is_noted_as_a_cut() {
     let got_other = other.to_vec().unwrap();
     ctx.set_cost_model(CostModel::TEST);
     let splits = ctx.jit().take_splits();
-    assert!(splits.iter().any(|split| matches!(split.reason, SplitReason::Shared { .. })), "{splits:?}");
-    assert!(splits.iter().all(|split| split.location.file().ends_with("tests.rs")), "{splits:?}");
+    assert!(
+        splits
+            .iter()
+            .any(|split| matches!(split.reason, SplitReason::Shared { .. })),
+        "{splits:?}"
+    );
+    assert!(
+        splits
+            .iter()
+            .all(|split| split.location.file().ends_with("tests.rs")),
+        "{splits:?}"
+    );
     let want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 3.0 + 1.0).collect();
     assert_close(&got_shifted, &want, 1e-5, 1e-5);
-    assert_close(&got_other, &xs.iter().map(|&v| v * 3.0 - 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+    assert_close(
+        &got_other,
+        &xs.iter().map(|&v| v * 3.0 - 1.0).collect::<Vec<_>>(),
+        1e-5,
+        1e-5,
+    );
 }
 
 #[test]
@@ -1948,8 +2373,15 @@ fn cuts_of_an_expression_are_noted_with_their_reason_and_place() {
     acc.eval().unwrap();
     let splits = ctx.jit().take_splits();
     let first = splits.first().expect("the chain exceeds the limit");
-    assert!(matches!(first.reason, SplitReason::Nodes { limit: 16, .. }), "{first:?}");
-    assert!(first.location.file().ends_with("tests.rs"), "{}", first.location);
+    assert!(
+        matches!(first.reason, SplitReason::Nodes { limit: 16, .. }),
+        "{first:?}"
+    );
+    assert!(
+        first.location.file().ends_with("tests.rs"),
+        "{}",
+        first.location
+    );
     assert!(first.to_string().contains("operations > 16"), "{first}");
 }
 
@@ -1968,9 +2400,22 @@ fn a_program_with_many_live_values_is_split_in_the_middle() {
     drop(x);
     let got = total.to_vec().unwrap();
     let splits = ctx.jit().take_splits();
-    assert!(splits.iter().any(|split| matches!(split.reason, SplitReason::Live { limit: 4, .. })), "{splits:?}");
+    assert!(
+        splits
+            .iter()
+            .any(|split| matches!(split.reason, SplitReason::Live { limit: 4, .. })),
+        "{splits:?}"
+    );
 
-    let want: Vec<f32> = xs.iter().map(|v| (1..=count).map(|k| (v * k as f32).sqrt()).rev().fold(0.0, |acc, t| t + acc)).collect();
+    let want: Vec<f32> = xs
+        .iter()
+        .map(|v| {
+            (1..=count)
+                .map(|k| (v * k as f32).sqrt())
+                .rev()
+                .fold(0.0, |acc, t| t + acc)
+        })
+        .collect();
     assert_close(&got, &want, 1e-4, 1e-5);
 }
 
@@ -1995,9 +2440,13 @@ fn a_third_view_reader_recomputes_the_expression_inside_the_one_kernel() {
     let e = (&x * 2.5 + 1.0).sqrt();
     let host: Vec<f32> = xs.iter().map(|v| (v * 2.5 + 1.0).sqrt()).collect();
     let before = ctx.jit().stats();
-    let got = (e.slice(0, 2..) - e.slice(0, 1..n - 1) + e.slice(0, ..n - 2)).to_vec().unwrap();
+    let got = (e.slice(0, 2..) - e.slice(0, 1..n - 1) + e.slice(0, ..n - 2))
+        .to_vec()
+        .unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    let want: Vec<f32> = (0..n - 2).map(|i| host[i + 2] - host[i + 1] + host[i]).collect();
+    let want: Vec<f32> = (0..n - 2)
+        .map(|i| host[i + 2] - host[i + 1] + host[i])
+        .collect();
     assert_close(&got, &want, 1e-5, 1e-6);
 }
 
@@ -2017,7 +2466,11 @@ fn graphs_of_one_shape_over_other_buffers_and_scalars_reuse_the_program() {
         let want: Vec<f32> = (0..n - 1).map(|i| host[i + 1] - host[i]).collect();
         assert_close(&got, &want, 1e-5, 1e-6);
     }
-    assert!(ctx.jit().recipe_hits() >= 3, "recipe hits: {}", ctx.jit().recipe_hits());
+    assert!(
+        ctx.jit().recipe_hits() >= 3,
+        "recipe hits: {}",
+        ctx.jit().recipe_hits()
+    );
 }
 
 /// A 40-operation expression of `x` and its host values.
@@ -2036,24 +2489,34 @@ fn long_expression(x: &Array<f32>, xs: &[f32]) -> (Array<f32>, Vec<f32>) {
 #[test]
 fn prohibitive_launches_keep_a_view_read_at_three_offsets_in_one_kernel() {
     let ctx = ctx();
-    ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+    ctx.set_cost_model(CostModel {
+        launch_us: 1e6,
+        ..CostModel::TEST
+    });
     let n = 1 << 16;
     let xs = values(n, 101, 0.5, 2.0);
     let x = f32s(&ctx, &xs);
     let (e, host) = long_expression(&x, &xs);
 
     let before = ctx.jit().stats();
-    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n)).to_vec().unwrap();
+    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n))
+        .to_vec()
+        .unwrap();
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
     assert_eq!(launches, 1, "{:?}", ctx.jit().last_judgement());
-    let want: Vec<f32> = (0..n - 2).map(|i| host[i] + host[i + 1] + host[i + 2]).collect();
+    let want: Vec<f32> = (0..n - 2)
+        .map(|i| host[i] + host[i + 1] + host[i + 2])
+        .collect();
     assert_close(&got, &want, 1e-4, 1e-5);
 }
 
 #[test]
 fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
     let ctx = ctx();
-    ctx.set_cost_model(CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST });
+    ctx.set_cost_model(CostModel {
+        f32_ops_per_ns: 1e-6,
+        ..CostModel::TEST
+    });
     // Staging the expression once per cell would win on this model too; this is about the
     // choice between recomputing and storing.
     ctx.jit().set_staging(false);
@@ -2064,12 +2527,16 @@ fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
     let (e, host) = long_expression(&x, &xs);
 
     let before = ctx.jit().stats();
-    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n)).to_vec().unwrap();
+    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n))
+        .to_vec()
+        .unwrap();
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
     assert_eq!(launches, 2, "{:?}", ctx.jit().last_judgement());
     let splits = ctx.jit().take_splits();
     assert!(splits.iter().any(|split| split.reason == crate::profile::SplitReason::Materialised { instances: 3 }), "{splits:?}");
-    let want: Vec<f32> = (0..n - 2).map(|i| host[i] + host[i + 1] + host[i + 2]).collect();
+    let want: Vec<f32> = (0..n - 2)
+        .map(|i| host[i] + host[i + 1] + host[i + 2])
+        .collect();
     assert_close(&got, &want, 1e-4, 1e-5);
 }
 
@@ -2077,7 +2544,10 @@ fn prohibitive_arithmetic_stores_a_view_read_at_three_offsets() {
 /// twice: devices with small tiles, like the CPU's, would otherwise evaluate the padded
 /// expression first instead of staging it.
 fn halo_bound() -> CostModel {
-    CostModel { launch_us: 1000.0, ..arithmetic_bound() }
+    CostModel {
+        launch_us: 1000.0,
+        ..arithmetic_bound()
+    }
 }
 
 /// A cost model on which arithmetic is slow enough for computing an expression once per cell to
@@ -2086,7 +2556,10 @@ fn halo_bound() -> CostModel {
 /// computes its region in whole rounds of the workgroup, which on a few tiles costs about as
 /// much as the recomputation (the estimate is right; a 1000-element array is at the margin).
 fn arithmetic_bound() -> CostModel {
-    CostModel { f32_ops_per_ns: 10.0, ..CostModel::TEST }
+    CostModel {
+        f32_ops_per_ns: 10.0,
+        ..CostModel::TEST
+    }
 }
 
 /// `e` read through an edge pad at the five offsets of the five-point stencil of an
@@ -2100,7 +2573,9 @@ fn five_point(e: &Array<f32>, nx: usize, ny: usize) -> Array<f32> {
 
 /// The host values of [`five_point`] of `e`.
 fn five_point_host(e: &[f32], nx: usize, ny: usize) -> Vec<f32> {
-    let at = |x: isize, y: isize| e[x.clamp(0, nx as isize - 1) as usize + nx * y.clamp(0, ny as isize - 1) as usize];
+    let at = |x: isize, y: isize| {
+        e[x.clamp(0, nx as isize - 1) as usize + nx * y.clamp(0, ny as isize - 1) as usize]
+    };
     let mut out = Vec::with_capacity(nx * ny);
     for y in 0..ny as isize {
         for x in 0..nx as isize {
@@ -2135,11 +2610,18 @@ fn stencil5_staged(nx: usize, ny: usize, seed: u64) {
     let got = five_point(&e, nx, ny).to_vec().unwrap();
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
     assert_eq!(launches, 1, "{:?}", ctx.jit().last_judgement());
-    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    let staging = ctx
+        .jit()
+        .last_staging()
+        .unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
     // `e` read through the clamping pad is recomputed per cell of the padded expression's region.
     assert_eq!(staging.subs.len(), 1, "{staging:?}");
     let [tx, ty] = staging.tile;
-    assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([0, 0], [tx as i32 + 1, ty as i32 + 1]), "{staging:?}");
+    assert_eq!(
+        (staging.subs[0].lo, staging.subs[0].hi),
+        ([0, 0], [tx as i32 + 1, ty as i32 + 1]),
+        "{staging:?}"
+    );
     assert_eq!(staging.subs[0].dims, [nx as u32 + 2, ny as u32 + 2]);
     assert_close(&got, &five_point_host(&host, nx, ny), 1e-4, 1e-4);
 }
@@ -2155,6 +2637,27 @@ fn staging_covers_tiles_that_do_not_divide_the_array() {
 }
 
 #[test]
+fn a_staged_kernel_is_reused_on_another_grid_shape() {
+    let ctx = ctx();
+    ctx.set_cost_model(halo_bound());
+    let mut built = Vec::new();
+    for (nx, ny, seed) in [(96, 60, 207), (120, 76, 208)] {
+        let (e, host) = expression_2d(&ctx, nx, ny, seed);
+        let before = ctx.jit().stats();
+        let got = five_point(&e, nx, ny).to_vec().unwrap();
+        built.push(delta(before, ctx.jit().stats()).built);
+        let staging = ctx
+            .jit()
+            .last_staging()
+            .unwrap_or_else(|| panic!("{nx}x{ny} not staged: {:?}", ctx.jit().last_judgement()));
+        assert_eq!(staging.dims, [nx as u32, ny as u32]);
+        assert_close(&got, &five_point_host(&host, nx, ny), 1e-4, 1e-4);
+    }
+    assert!(built[0] >= 1, "the first shape compiles: {built:?}");
+    assert_eq!(built[1], 0, "the second shape reuses the kernel: {built:?}");
+}
+
+#[test]
 fn the_stencil_without_staging_is_one_launch_with_the_same_values() {
     let ctx = ctx();
     ctx.jit().set_staging(false);
@@ -2165,7 +2668,12 @@ fn the_stencil_without_staging_is_one_launch_with_the_same_values() {
     let host: Vec<f32> = xs.iter().map(|v| (v * 1.5 + 0.25).sqrt()).collect();
     let before = ctx.jit().stats();
     let got = five_point(&e, nx, ny).to_vec().unwrap();
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "{:?}",
+        ctx.jit().last_judgement()
+    );
     assert_eq!(ctx.jit().last_staging(), None);
     assert_close(&got, &five_point_host(&host, nx, ny), 1e-4, 1e-4);
 }
@@ -2179,20 +2687,35 @@ fn a_1d_expression_read_at_three_offsets_is_staged() {
     let x = f32s(&ctx, &xs);
     let (e, host) = long_expression(&x, &xs);
     let before = ctx.jit().stats();
-    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n)).to_vec().unwrap();
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
-    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    let got = (e.slice(0, 0..n - 2) + e.slice(0, 1..n - 1) + e.slice(0, 2..n))
+        .to_vec()
+        .unwrap();
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "{:?}",
+        ctx.jit().last_judgement()
+    );
+    let staging = ctx
+        .jit()
+        .last_staging()
+        .unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
     assert_eq!(staging.dims, [n as u32 - 2, 1]);
     assert_eq!(staging.subs.len(), 1);
-    assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([0, 0], [staging.tile[0] as i32 + 1, 0]));
-    let want: Vec<f32> = (0..n - 2).map(|i| host[i] + host[i + 1] + host[i + 2]).collect();
+    assert_eq!(
+        (staging.subs[0].lo, staging.subs[0].hi),
+        ([0, 0], [staging.tile[0] as i32 + 1, 0])
+    );
+    let want: Vec<f32> = (0..n - 2)
+        .map(|i| host[i] + host[i + 1] + host[i + 2])
+        .collect();
     assert_close(&got, &want, 1e-4, 1e-5);
 }
 
 #[test]
 fn a_df32_expression_read_at_five_offsets_is_staged() {
-    use crate::view::PadMode;
     use crate::Df32;
+    use crate::view::PadMode;
     let ctx = ctx();
     ctx.set_cost_model(halo_bound());
     let (nx, ny) = (64, 48);
@@ -2210,15 +2733,31 @@ fn a_df32_expression_read_at_five_offsets_is_staged() {
     let r = at(0, 1) + at(2, 1) + at(1, 0) + at(1, 2) - at(1, 1) * Df32::from(4.0);
     let before = ctx.jit().stats();
     let got: Vec<f64> = r.to_vec().unwrap().into_iter().map(Df32::to_f64).collect();
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
-    assert_eq!(ctx.jit().last_staging().map(|staging| staging.subs.len()), Some(1), "{:?}", ctx.jit().last_judgement());
-    let hat = |x: isize, y: isize| host[x.clamp(0, nx as isize - 1) as usize + nx * y.clamp(0, ny as isize - 1) as usize];
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "{:?}",
+        ctx.jit().last_judgement()
+    );
+    assert_eq!(
+        ctx.jit().last_staging().map(|staging| staging.subs.len()),
+        Some(1),
+        "{:?}",
+        ctx.jit().last_judgement()
+    );
+    let hat = |x: isize, y: isize| {
+        host[x.clamp(0, nx as isize - 1) as usize + nx * y.clamp(0, ny as isize - 1) as usize]
+    };
     for y in 0..ny {
         for x in 0..nx {
             let (xi, yi) = (x as isize, y as isize);
-            let want = hat(xi - 1, yi) + hat(xi + 1, yi) + hat(xi, yi - 1) + hat(xi, yi + 1) - 4.0 * hat(xi, yi);
+            let want = hat(xi - 1, yi) + hat(xi + 1, yi) + hat(xi, yi - 1) + hat(xi, yi + 1)
+                - 4.0 * hat(xi, yi);
             let g = got[x + nx * y];
-            assert!((g - want).abs() <= 1e-6, "cell ({x}, {y}): got {g}, want {want}");
+            assert!(
+                (g - want).abs() <= 1e-6,
+                "cell ({x}, {y}): got {g}, want {want}"
+            );
         }
     }
 }
@@ -2238,8 +2777,16 @@ fn a_staged_expression_read_by_another_staged_expression_is_computed_a_level_ear
     let r = f.slice(0, 0..m - 1) + f.slice(0, 1..m);
     let before = ctx.jit().stats();
     let got = r.to_vec().unwrap();
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
-    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "{:?}",
+        ctx.jit().last_judgement()
+    );
+    let staging = ctx
+        .jit()
+        .last_staging()
+        .unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
     assert_eq!(staging.subs.len(), 2, "{staging:?}");
     assert_eq!(staging.levels, vec![0, 1, 2], "{staging:?}");
     let gh = |a: f32| a * a * 0.5 + a;
@@ -2259,10 +2806,14 @@ fn cache_evaluates_an_expression_once_for_every_later_read() {
     let before = ctx.jit().stats();
     let f = (&x * 2.0 + 1.0).sqrt().cache();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    let got = (f.slice(0, 1..) - f.slice(0, ..n - 1) + f.slice(0, 1..)).to_vec().unwrap();
+    let got = (f.slice(0, 1..) - f.slice(0, ..n - 1) + f.slice(0, 1..))
+        .to_vec()
+        .unwrap();
     // The expression ran once; the readers of `f` are one more kernel.
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
-    let want: Vec<f32> = (0..n - 1).map(|i| host[i + 1] - host[i] + host[i + 1]).collect();
+    let want: Vec<f32> = (0..n - 1)
+        .map(|i| host[i + 1] - host[i] + host[i + 1])
+        .collect();
     assert_close(&got, &want, 1e-5, 1e-6);
 }
 
@@ -2316,7 +2867,11 @@ fn a_cached_step_is_traced_once_and_builds_no_kernels_per_step() {
     let [long] = crate::iterate_all([&x], 50, step);
     long.eval().unwrap();
     assert_eq!(calls.get(), 2, "one trace per call");
-    assert_eq!(delta(before, ctx.jit().stats()).built, 0, "the replayed kernels are reused");
+    assert_eq!(
+        delta(before, ctx.jit().stats()).built,
+        0,
+        "the replayed kernels are reused"
+    );
     // Same values as a host loop.
     let mut want = &x * 1.0;
     for _ in 0..50 {
@@ -2375,11 +2930,23 @@ fn a_kernel_over_the_inlining_cap_is_cut_by_evaluating_a_sub_program() {
     let got = c.to_vec().unwrap();
     assert!(delta(before, ctx.jit().stats()).elementwise_launches > 1);
 
-    let eh: Vec<f32> = xs.iter().map(|v| (((v * 1.5 + 0.5).sqrt() * 2.0) - 0.25).abs()).collect();
-    let stencil = |a: &[f32]| -> Vec<f32> { (0..a.len() - 2).map(|i| a[i] + a[i + 1] + a[i + 2]).collect() };
+    let eh: Vec<f32> = xs
+        .iter()
+        .map(|v| (((v * 1.5 + 0.5).sqrt() * 2.0) - 0.25).abs())
+        .collect();
+    let stencil = |a: &[f32]| -> Vec<f32> {
+        (0..a.len() - 2)
+            .map(|i| a[i] + a[i + 1] + a[i + 2])
+            .collect()
+    };
     assert_close(&got, &stencil(&stencil(&stencil(&eh))), 1e-4, 1e-5);
     let splits = ctx.jit().take_splits();
-    assert!(splits.iter().any(|split| matches!(split.reason, SplitReason::Inlined { limit: 16, .. })), "{splits:?}");
+    assert!(
+        splits
+            .iter()
+            .any(|split| matches!(split.reason, SplitReason::Inlined { limit: 16, .. })),
+        "{splits:?}"
+    );
 }
 
 #[test]
@@ -2391,7 +2958,15 @@ fn views_with_every_edge_of_a_lazy_expression_nest() {
     let x = f32s(&ctx, &xs);
     let e = &x * 2.0 + 1.0;
     let eh: Vec<f32> = xs.iter().map(|v| v * 2.0 + 1.0).collect();
-    let (ni, mirror) = (n as isize, |c: isize| if c < 0 { -c - 1 } else if c >= n as isize { 2 * n as isize - 1 - c } else { c });
+    let (ni, mirror) = (n as isize, |c: isize| {
+        if c < 0 {
+            -c - 1
+        } else if c >= n as isize {
+            2 * n as isize - 1 - c
+        } else {
+            c
+        }
+    });
     let a_val = |j: usize| eh[(j as isize - 1).clamp(0, ni - 1) as usize];
     let b_val = |j: usize| eh[mirror(j as isize - 2) as usize];
 
@@ -2403,7 +2978,9 @@ fn views_with_every_edge_of_a_lazy_expression_nest() {
     let before = ctx.jit().stats();
     let got = r.to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    let want: Vec<f32> = (0..n - 1).map(|m| if m >= 2 { a_val(m) + b_val(m) } else { 9.0 }).collect();
+    let want: Vec<f32> = (0..n - 1)
+        .map(|m| if m >= 2 { a_val(m) + b_val(m) } else { 9.0 })
+        .collect();
     assert_close(&got, &want, 1e-5, 1e-6);
 }
 
@@ -2421,7 +2998,10 @@ fn a_gather_of_a_lazy_expression_of_a_lazy_slice() {
     let before = ctx.jit().stats();
     let got = t.to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    let want: Vec<f32> = idx_host.iter().map(|&i| xs[2 + (i as usize).min(n - 3)] * 3.0 + 1.0).collect();
+    let want: Vec<f32> = idx_host
+        .iter()
+        .map(|&i| xs[2 + (i as usize).min(n - 3)] * 3.0 + 1.0)
+        .collect();
     assert_close(&got, &want, 1e-5, 1e-6);
 }
 
@@ -2441,7 +3021,9 @@ fn a_reduction_over_nested_lazy_views_is_one_pass_and_no_store_kernel() {
     assert_eq!((after.reduce_launches, after.elementwise_launches), (1, 0));
     let fh: Vec<f32> = xs.iter().map(|v| v * 2.0 + 1.0).collect();
     let gh: Vec<f32> = (0..n - 1).map(|i| fh[i + 1] - fh[i]).collect();
-    let want = (0..n - 2).map(|i| (gh[i + 1] - gh[i]).abs()).fold(0.0f32, f32::max);
+    let want = (0..n - 2)
+        .map(|i| (gh[i + 1] - gh[i]).abs())
+        .fold(0.0f32, f32::max);
     assert!((got - want).abs() <= 1e-4, "{got} vs {want}");
 }
 
@@ -2451,8 +3033,11 @@ fn a_padded_record_assigned_through_launches_nothing_until_it_is_read() {
     use crate::view::PadMode;
     let ctx = ctx();
     let (ni, nj) = (8usize, 5usize);
-    let data: Vec<Vec<f32>> = (0..4).map(|k| values(ni * nj, 110 + k, -1.0, 1.0)).collect();
-    let q: [Array<f32>; 4] = std::array::from_fn(|k| Array::from_slice_on(&ctx, &data[k], [ni, nj]).unwrap());
+    let data: Vec<Vec<f32>> = (0..4)
+        .map(|k| values(ni * nj, 110 + k, -1.0, 1.0))
+        .collect();
+    let q: [Array<f32>; 4] =
+        std::array::from_fn(|k| Array::from_slice_on(&ctx, &data[k], [ni, nj]).unwrap());
     let p: [Array<f32>; 4] = q.map(|a| &a * 2.0 + 1.0);
     let mut w = p.pad([(2, 0)], PadMode::Edge);
     let ghost: [Array<f32>; 4] = std::array::from_fn(|k| w[k].slice(0, 2..4).flip(0) * -1.0);
@@ -2471,7 +3056,10 @@ fn a_padded_record_assigned_through_launches_nothing_until_it_is_read() {
                     1 => -p_at(2, y),
                     _ => p_at(x, y),
                 };
-                assert!((got[x + (ni + 2) * y] - want).abs() <= 1e-5, "field {k} ({x}, {y})");
+                assert!(
+                    (got[x + (ni + 2) * y] - want).abs() <= 1e-5,
+                    "field {k} ({x}, {y})"
+                );
             }
         }
     }
@@ -2528,7 +3116,11 @@ fn concat_of_lazy_parts_is_one_kernel() {
         let before = ctx.jit().stats();
         let joined = crate::concat(0, [&long_chain(&x, depth), &(long_chain(&y, depth) * 2.0)]);
         let got = joined.to_vec().unwrap();
-        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "depth {depth}");
+        assert_eq!(
+            delta(before, ctx.jit().stats()).elementwise_launches,
+            1,
+            "depth {depth}"
+        );
         let mut want = long_chain_host(&xs, depth);
         want.extend(long_chain_host(&ys, depth).iter().map(|v| v * 2.0));
         assert_close(&got, &want, 1e-5, 1e-5);
@@ -2541,7 +3133,9 @@ fn concat_of_lazy_parts_is_one_kernel() {
     let got = joined.to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     let n = xs.len();
-    let mut want: Vec<f32> = (0..n).map(|i| xs[(i + n - 1) % n] * 2.0 + xs[(i + 1) % n] * 2.0).collect();
+    let mut want: Vec<f32> = (0..n)
+        .map(|i| xs[(i + n - 1) % n] * 2.0 + xs[(i + 1) % n] * 2.0)
+        .collect();
     want.extend(ys.iter().map(|v| v + 1.0));
     assert_close(&got, &want, 1e-5, 1e-5);
 
@@ -2549,7 +3143,11 @@ fn concat_of_lazy_parts_is_one_kernel() {
     // read through a shift of its own.
     let a = Array::from_slice_on(&ctx, &values(12, 303, -1.0, 1.0), [4, 3]).unwrap();
     let before = ctx.jit().stats();
-    let (p, q, r) = (&a * 2.0 + 1.0, a.slice(1, ..2).flip(0) * -1.0, a.transpose().slice(0, ..2).transpose() + 0.5);
+    let (p, q, r) = (
+        &a * 2.0 + 1.0,
+        a.slice(1, ..2).flip(0) * -1.0,
+        a.transpose().slice(0, ..2).transpose() + 0.5,
+    );
     let joined = crate::concat(1, [&p, &q, &r]);
     let out = joined.slice(1, 1..7) * 3.0;
     out.eval().unwrap();
@@ -2569,7 +3167,11 @@ fn a_clone_of_a_lazy_array_shares_its_evaluation() {
     let before = ctx.jit().stats();
     assert_close(&c.to_vec().unwrap(), &want, 1e-6, 1e-6);
     assert_close(&e.to_vec().unwrap(), &want, 1e-6, 1e-6);
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "evaluated once, by whichever clone came first");
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "evaluated once, by whichever clone came first"
+    );
 
     // Both clones in one expression are one operand: still one kernel, computing the node once.
     let e = (&x * 3.0).abs().sqrt();
@@ -2648,7 +3250,14 @@ fn cached_arrays_do_not_count_the_buffers_below_them() {
     ctx.jit().set_max_inputs(16);
     let n = 2000usize;
     let w: Vec<F> = (0..4)
-        .map(|k| f32s(&ctx, &(0..n + 4).map(|i| 1.0 + 0.1 * ((i + k) as f32 * 0.37).sin()).collect::<Vec<_>>()))
+        .map(|k| {
+            f32s(
+                &ctx,
+                &(0..n + 4)
+                    .map(|i| 1.0 + 0.1 * ((i + k) as f32 * 0.37).sin())
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect();
     let (nx, nr) = (f32s(&ctx, &vec![0.5f32; n]), f32s(&ctx, &vec![0.7f32; n]));
     for cache_s in [false, true] {
@@ -2659,7 +3268,15 @@ fn cached_arrays_do_not_count_the_buffers_below_them() {
             let l: Vec<F> = (0..4).map(|k| mix(&views, k, 12).cache()).collect();
             let r: Vec<F> = (0..4).map(|k| mix(&views, k + 4, 12).cache()).collect();
             let lr: Vec<&F> = l.iter().chain(r.iter()).chain([&nx, &nr]).collect();
-            let s: Vec<F> = (0..3).map(|k| if cache_s { mix(&lr, k, 16).cache() } else { mix(&lr, k, 16) }).collect();
+            let s: Vec<F> = (0..3)
+                .map(|k| {
+                    if cache_s {
+                        mix(&lr, k, 16).cache()
+                    } else {
+                        mix(&lr, k, 16)
+                    }
+                })
+                .collect();
             let lrs: Vec<&F> = lr.iter().copied().chain(s.iter()).collect();
             let f: Vec<F> = (0..4).map(|k| mix(&lrs, k, 24)).collect();
             let t = (&p0[3] - &m1[3]).abs() / m1[3].minimum(&p0[3]);
@@ -2676,7 +3293,12 @@ fn cached_arrays_do_not_count_the_buffers_below_them() {
         // 4 l, 4 r and the 4 f; the 3 s as well when they are cached.
         let want = if cache_s { 15 } else { 12 };
         assert_eq!(launches, want, "s cached: {cache_s}, splits: {splits:?}");
-        assert!(splits.iter().all(|split| !matches!(split.reason, crate::profile::SplitReason::Inputs { .. })), "{splits:?}");
+        assert!(
+            splits
+                .iter()
+                .all(|split| !matches!(split.reason, crate::profile::SplitReason::Inputs { .. })),
+            "{splits:?}"
+        );
         drop(out);
     }
 }
@@ -2689,9 +3311,16 @@ fn buffers_below_an_evaluated_part_of_an_expression_are_not_counted() {
     let ctx = ctx();
     ctx.jit().set_max_inputs(16);
     let n = 1000usize;
-    let data: Vec<Vec<f32>> = (0..20).map(|i| values(n, 500 + i as u64, 0.5, 1.5)).collect();
+    let data: Vec<Vec<f32>> = (0..20)
+        .map(|i| values(n, 500 + i as u64, 0.5, 1.5))
+        .collect();
     let b: Vec<Array<f32>> = data.iter().map(|d| f32s(&ctx, d)).collect();
-    let sum = |arrays: &[Array<f32>]| arrays.iter().skip(1).fold(&arrays[0] * 1.0, |acc, a| acc + a);
+    let sum = |arrays: &[Array<f32>]| {
+        arrays
+            .iter()
+            .skip(1)
+            .fold(&arrays[0] * 1.0, |acc, a| acc + a)
+    };
 
     let x = sum(&b[..12]);
     let p = &x * 2.0;
@@ -2703,7 +3332,10 @@ fn buffers_below_an_evaluated_part_of_an_expression_are_not_counted() {
     // `x` once, then `p + other` in one kernel.
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2);
     let want: Vec<f32> = (0..n)
-        .map(|i| 2.0 * (0..12).map(|k| data[k][i]).sum::<f32>() + (12..20).map(|k| data[k][i]).sum::<f32>())
+        .map(|i| {
+            2.0 * (0..12).map(|k| data[k][i]).sum::<f32>()
+                + (12..20).map(|k| data[k][i]).sum::<f32>()
+        })
         .collect();
     assert_close(&got, &want, 1e-5, 1e-5);
 }
@@ -2731,7 +3363,11 @@ fn sweeps_over_every_lazy_array_leave_the_arrays_of_other_threads_alone() {
             assert!(mine.pending().is_none());
         });
     });
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "only the thread's own array");
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "only the thread's own array"
+    );
     assert!(lazy.pending().is_some());
     assert!(requested.pending().is_some());
 
@@ -2739,8 +3375,18 @@ fn sweeps_over_every_lazy_array_leave_the_arrays_of_other_threads_alone() {
     ctx.flush().unwrap();
     assert!(lazy.pending().is_none());
     assert!(requested.pending().is_none());
-    assert_close(&lazy.to_vec().unwrap(), &xs.iter().map(|v| v * 2.0 + 1.0).collect::<Vec<_>>(), 1e-6, 1e-6);
-    assert_close(&requested.to_vec().unwrap(), &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+    assert_close(
+        &lazy.to_vec().unwrap(),
+        &xs.iter().map(|v| v * 2.0 + 1.0).collect::<Vec<_>>(),
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        &requested.to_vec().unwrap(),
+        &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(),
+        1e-6,
+        1e-6,
+    );
 }
 
 #[test]
@@ -2767,7 +3413,10 @@ fn a_ghost_assignment_into_a_pending_array_launches_nothing() {
         1 => -p(2, y),
         _ => p(x, y),
     };
-    let want: Vec<f32> = (0..nj).flat_map(|y| (0..n - 1).map(move |x| (x, y))).map(|(x, y)| cell(x + 1, y) - cell(x, y)).collect();
+    let want: Vec<f32> = (0..nj)
+        .flat_map(|y| (0..n - 1).map(move |x| (x, y)))
+        .map(|(x, y)| cell(x + 1, y) - cell(x, y))
+        .collect();
     assert_close(&got, &want, 1e-5, 1e-5);
 }
 
@@ -2793,17 +3442,32 @@ mod euler {
         let u = &q.b / &q.a;
         let v = &q.c / &q.a;
         let p = 0.4 * (&q.d - 0.5 * &q.a * (&u * &u + &v * &v));
-        R { a: &q.a * 1.0, b: u, c: v, d: p }
+        R {
+            a: &q.a * 1.0,
+            b: u,
+            c: v,
+            d: p,
+        }
     }
 
     fn cons(w: &R) -> R {
         let ke = 0.5 * &w.a * (&w.b * &w.b + &w.c * &w.c);
-        R { a: &w.a * 1.0, b: &w.a * &w.b, c: &w.a * &w.c, d: &w.d / 0.4 + ke }
+        R {
+            a: &w.a * 1.0,
+            b: &w.a * &w.b,
+            c: &w.a * &w.c,
+            d: &w.d / 0.4 + ke,
+        }
     }
 
     fn flux(w: &R) -> R {
         let q = cons(w);
-        R { a: &q.b * 1.0, b: &q.b * &w.b + &w.d, c: &q.c * &w.b, d: (&q.d + &w.d) * &w.b }
+        R {
+            a: &q.b * 1.0,
+            b: &q.b * &w.b + &w.d,
+            c: &q.c * &w.b,
+            d: (&q.d + &w.d) * &w.b,
+        }
     }
 
     fn rusanov(l: &R, r: &R) -> R {
@@ -2825,7 +3489,12 @@ mod euler {
         let padded = prim(q).pad([(1, 1), (1, 1)], PadMode::Edge);
         let mut w = if cache_before { padded.cache() } else { padded };
         let g = w.slice(0, 1..2);
-        let g = R { a: &g.a * 1.0, b: -&g.b, c: &g.c * 1.0, d: &g.d * 1.0 };
+        let g = R {
+            a: &g.a * 1.0,
+            b: -&g.b,
+            c: &g.c * 1.0,
+            d: &g.d * 1.0,
+        };
         w.slice_mut(0, ..1).assign(g).unwrap();
         let w = if cache_after { w.cache() } else { w };
         let wi = w.slice(1, 1..nj + 1);
@@ -2833,12 +3502,24 @@ mod euler {
         let wj = w.slice(0, 1..ni + 1);
         let fj = rusanov(&wj.slice(1, 0..nj + 1), &wj.slice(1, 1..nj + 2));
         let r = -(fi.slice(0, 1..) - fi.slice(0, ..ni)) - (fj.slice(1, 1..) - fj.slice(1, ..nj));
-        R { a: &q.a + 0.01 * &r.a, b: &q.b + 0.01 * &r.b, c: &q.c + 0.01 * &r.c, d: &q.d + 0.01 * &r.d }
+        R {
+            a: &q.a + 0.01 * &r.a,
+            b: &q.b + 0.01 * &r.b,
+            c: &q.c + 0.01 * &r.c,
+            d: &q.d + 0.01 * &r.d,
+        }
     }
 
     fn state(ctx: &Context, ni: usize, nj: usize) -> R {
-        let up = |k: u64, lo: f32, hi: f32| Array::from_slice_on(ctx, &values(ni * nj, 130 + k, lo, hi), [ni, nj]).unwrap();
-        R { a: up(0, 0.8, 1.2), b: up(1, -0.3, 0.3), c: up(2, -0.3, 0.3), d: up(3, 2.0, 3.0) }
+        let up = |k: u64, lo: f32, hi: f32| {
+            Array::from_slice_on(ctx, &values(ni * nj, 130 + k, lo, hi), [ni, nj]).unwrap()
+        };
+        R {
+            a: up(0, 0.8, 1.2),
+            b: up(1, -0.3, 0.3),
+            c: up(2, -0.3, 0.3),
+            d: up(3, 2.0, 3.0),
+        }
     }
 
     #[test]
@@ -2879,7 +3560,11 @@ mod euler {
                 q.eval().unwrap();
             }
             ctx.sync().unwrap();
-            assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, per_step * steps as u64, "cache {cache}");
+            assert_eq!(
+                delta(before, ctx.jit().stats()).elementwise_launches,
+                per_step * steps as u64,
+                "cache {cache}"
+            );
         }
 
         // The same with the evaluation of every step postponed until the last is requested.
@@ -2893,7 +3578,11 @@ mod euler {
         }
         ctx.jit().evaluate_requested();
         ctx.sync().unwrap();
-        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 2 * steps as u64, "postponed");
+        assert_eq!(
+            delta(before, ctx.jit().stats()).elementwise_launches,
+            2 * steps as u64,
+            "postponed"
+        );
     }
 
     #[test]
@@ -2924,7 +3613,12 @@ mod euler {
         ctx.sync().unwrap();
         assert!(!ctx.jit().requested_stencil_chain());
         let want = step(&step(&state(&ctx, ni, nj), ni, nj, true), ni, nj, true);
-        assert_close(&second.a.to_vec().unwrap(), &want.a.to_vec().unwrap(), 1e-4, 1e-4);
+        assert_close(
+            &second.a.to_vec().unwrap(),
+            &want.a.to_vec().unwrap(),
+            1e-4,
+            1e-4,
+        );
 
         // An elementwise chain is not one that must be cut.
         let x = f32s(&ctx, &values(64, 140, 0.5, 1.5));
@@ -2948,10 +3642,21 @@ fn another_threads_pending_node_is_not_shared_by_hash_consing() {
     let user = &here + 1u32;
     drop(here);
     let again = Array::<u32>::range_on(&ctx, 100, 0).unwrap();
-    assert!(std::sync::Arc::ptr_eq(&node, again.pending().unwrap()), "within a thread it is one node");
+    assert!(
+        std::sync::Arc::ptr_eq(&node, again.pending().unwrap()),
+        "within a thread it is one node"
+    );
     drop(again);
-    let there = std::thread::scope(|scope| scope.spawn(|| Array::<u32>::range_on(&ctx, 100, 0).unwrap()).join().unwrap());
-    assert!(!std::sync::Arc::ptr_eq(&node, there.pending().unwrap()), "another thread's is its own");
+    let there = std::thread::scope(|scope| {
+        scope
+            .spawn(|| Array::<u32>::range_on(&ctx, 100, 0).unwrap())
+            .join()
+            .unwrap()
+    });
+    assert!(
+        !std::sync::Arc::ptr_eq(&node, there.pending().unwrap()),
+        "another thread's is its own"
+    );
     assert_eq!(user.to_vec().unwrap()[..3], [1, 2, 3]);
 }
 
@@ -3000,7 +3705,12 @@ fn a_flushed_array_fused_into_another_is_evaluated_before_a_traced_loop() {
     let host = |f: &dyn Fn(f32) -> f32| xs.iter().map(|&v| f(v)).collect::<Vec<_>>();
     assert_eq!(t.to_vec().unwrap(), host(&|v| v * 2.0));
     assert_eq!(u.to_vec().unwrap(), host(&|v| v * 2.0 + 1.0));
-    assert_close(&r.to_vec().unwrap(), &host(&|v| v + 3.0 * (v * 2.0)), 1e-4, 1e-5);
+    assert_close(
+        &r.to_vec().unwrap(),
+        &host(&|v| v + 3.0 * (v * 2.0)),
+        1e-4,
+        1e-5,
+    );
 }
 
 /// An array that was only computed inside the kernel of another array (here `n`, inside the
@@ -3020,18 +3730,39 @@ fn an_array_computed_inside_another_arrays_kernel_is_evaluated_before_a_traced_l
     let s = Array::<f32>::from_slice_on(&ctx, &xs, 12).unwrap();
     let [r] = crate::iterate_all([&s], 3, |s| [s[0].cumsum(0) + n.cumsum(0)]);
 
-    let host_n: Vec<f32> = xs.iter().map(|&v| (v * 2.0).max(1.0)).map(|m| m * m + 1.0).collect();
-    let cumsum = |v: &[f32]| -> Vec<f32> { v.iter().scan(0.0f32, |acc, &e| { *acc += e; Some(*acc) }).collect() };
+    let host_n: Vec<f32> = xs
+        .iter()
+        .map(|&v| (v * 2.0).max(1.0))
+        .map(|m| m * m + 1.0)
+        .collect();
+    let cumsum = |v: &[f32]| -> Vec<f32> {
+        v.iter()
+            .scan(0.0f32, |acc, &e| {
+                *acc += e;
+                Some(*acc)
+            })
+            .collect()
+    };
     let mut host_r = xs.clone();
     for _ in 0..3 {
-        host_r = cumsum(&host_r).iter().zip(cumsum(&host_n)).map(|(a, b)| a + b).collect();
+        host_r = cumsum(&host_r)
+            .iter()
+            .zip(cumsum(&host_n))
+            .map(|(a, b)| a + b)
+            .collect();
     }
     let close = |got: Vec<f32>, want: &[f32]| {
         for (g, w) in got.iter().zip(want) {
-            assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "{got:?} != {want:?}");
+            assert!(
+                (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                "{got:?} != {want:?}"
+            );
         }
     };
-    close(held.to_vec().unwrap(), &host_n.iter().map(|v| v + 1.0).collect::<Vec<_>>());
+    close(
+        held.to_vec().unwrap(),
+        &host_n.iter().map(|v| v + 1.0).collect::<Vec<_>>(),
+    );
     close(n.to_vec().unwrap(), &host_n);
     close(r.to_vec().unwrap(), &host_r);
 }
@@ -3047,13 +3778,20 @@ fn clone_assign_step(u: &Array<f32>) -> Array<f32> {
     let (mut left, mut right) = (w.clone(), w.clone());
     left.slice_mut(0, ..1).assign(0.5).unwrap();
     right.slice_mut(0, n + 1..).assign(0.25).unwrap();
-    (w.slice(0, 1..n + 1) * 0.5 + left.slice(0, ..n) * 0.25 + right.slice(0, 2..n + 2) * 0.25) * 0.99 + 0.001
+    (w.slice(0, 1..n + 1) * 0.5 + left.slice(0, ..n) * 0.25 + right.slice(0, 2..n + 2) * 0.25)
+        * 0.99
+        + 0.001
 }
 
 fn clone_assign_host(u: &[f32]) -> Vec<f32> {
     let n = u.len();
-    let w: Vec<f32> = std::iter::once(0.5).chain(u.iter().copied()).chain(std::iter::once(0.25)).collect();
-    (0..n).map(|i| (0.5 * w[i + 1] + 0.25 * w[i] + 0.25 * w[i + 2]) * 0.99 + 0.001).collect()
+    let w: Vec<f32> = std::iter::once(0.5)
+        .chain(u.iter().copied())
+        .chain(std::iter::once(0.25))
+        .collect();
+    (0..n)
+        .map(|i| (0.5 * w[i + 1] + 0.25 * w[i] + 0.25 * w[i + 2]) * 0.99 + 0.001)
+        .collect()
 }
 
 /// Clones of a lazy padded state, assigned through slices inside a per-step `eval` loop (with the
@@ -3095,8 +3833,12 @@ fn chain_step(u: &Array<f32>, v: &Array<f32>) -> (Array<f32>, Array<f32>) {
 
 fn chain_host(u: &[f32], v: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let n = u.len();
-    let nu: Vec<f32> = (0..n).map(|i| (u[(i + 1) % n] + u[(i + n - 1) % n]) * 0.25 + u[i] * 0.5 + v[i] * 0.01).collect();
-    let nv = (0..n).map(|i| v[i] * 0.9 + nu[(i + 1).min(n - 1)] * 0.1).collect();
+    let nu: Vec<f32> = (0..n)
+        .map(|i| (u[(i + 1) % n] + u[(i + n - 1) % n]) * 0.25 + u[i] * 0.5 + v[i] * 0.01)
+        .collect();
+    let nv = (0..n)
+        .map(|i| v[i] * 0.9 + nu[(i + 1).min(n - 1)] * 0.1)
+        .collect();
     (nu, nv)
 }
 
@@ -3182,7 +3924,11 @@ fn check_readback_loop_with_writes(ctx: &Context, steps: usize, events: &[(usize
                 }
             }
         }
-        let lap = u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) + u.shift([0isize, -1]) - &u * 4.0;
+        let lap = u.shift([1isize, 0])
+            + u.shift([-1isize, 0])
+            + u.shift([0isize, 1])
+            + u.shift([0isize, -1])
+            - &u * 4.0;
         let next = &u + lap * 0.2 + &c * 0.01;
         let err = (&next - &u).abs().max().item().unwrap();
         u = next;
@@ -3191,12 +3937,20 @@ fn check_readback_loop_with_writes(ctx: &Context, steps: usize, events: &[(usize
         let mut new = vec![0.0f32; W * W];
         for i in 0..W {
             for j in 0..W {
-                let lap = at(i + 1, j) + at(i + W - 1, j) + at(i, j + 1) + at(i, j + W - 1) - at(i, j) * 4.0;
+                let lap = at(i + 1, j) + at(i + W - 1, j) + at(i, j + 1) + at(i, j + W - 1)
+                    - at(i, j) * 4.0;
                 new[i * W + j] = at(i, j) + lap * 0.2 + source[i * W + j] * 0.01;
             }
         }
-        let want = new.iter().zip(&cpu).map(|(n, o)| (n - o).abs()).fold(0.0, f32::max);
-        assert!((err - want).abs() <= 1e-4 * want + 1e-6, "step {k} ({events:?}): err {err}, want {want}");
+        let want = new
+            .iter()
+            .zip(&cpu)
+            .map(|(n, o)| (n - o).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            (err - want).abs() <= 1e-4 * want + 1e-6,
+            "step {k} ({events:?}): err {err}, want {want}"
+        );
         cpu = new;
     }
     assert_close(&u.to_vec().unwrap(), &cpu, 1e-4, 1e-5);
@@ -3210,13 +3964,29 @@ fn writes_between_speculated_readbacks_are_seen_by_the_next_readback() {
     for events in [
         &[(20, Rewrite::AssignSlice)][..],
         &[(20, Rewrite::AssignScalar)],
-        &[(15, Rewrite::Write), (16, Rewrite::AssignSlice), (30, Rewrite::AssignScalar)],
-        &[(12, Rewrite::AssignSlice), (13, Rewrite::AssignSlice), (14, Rewrite::Write), (15, Rewrite::Write)],
-        &[(10, Rewrite::Write), (20, Rewrite::Write), (30, Rewrite::Write)],
+        &[
+            (15, Rewrite::Write),
+            (16, Rewrite::AssignSlice),
+            (30, Rewrite::AssignScalar),
+        ],
+        &[
+            (12, Rewrite::AssignSlice),
+            (13, Rewrite::AssignSlice),
+            (14, Rewrite::Write),
+            (15, Rewrite::Write),
+        ],
+        &[
+            (10, Rewrite::Write),
+            (20, Rewrite::Write),
+            (30, Rewrite::Write),
+        ],
     ] {
         let ctx = ctx();
         check_readback_loop_with_writes(&ctx, 45, events);
-        assert!(ctx.jit().speculation_hits() > 0, "{events:?}: no readback was answered ahead of time");
+        assert!(
+            ctx.jit().speculation_hits() > 0,
+            "{events:?}: no readback was answered ahead of time"
+        );
     }
 }
 
@@ -3246,7 +4016,9 @@ fn ghost_regions_are_computed_only_where_they_are_assigned() {
     };
     // The padded array on the host: edge padding, the two ghost regions assigned over it.
     let (wn, wm) = (n + 4, m + 4);
-    let at = |x: usize, y: usize| data[x.saturating_sub(2).min(n - 1) + n * y.saturating_sub(2).min(m - 1)];
+    let at = |x: usize, y: usize| {
+        data[x.saturating_sub(2).min(n - 1) + n * y.saturating_sub(2).min(m - 1)]
+    };
     let mut padded = vec![0.0f32; wn * wm];
     for y in 0..wm {
         for x in 0..wn {
@@ -3263,32 +4035,52 @@ fn ghost_regions_are_computed_only_where_they_are_assigned() {
     let mut want = vec![0.0f32; n * m];
     for y in 0..m {
         for x in 0..n {
-            want[x + n * y] = read(x + 1, y + 2) + read(x + 3, y + 2) + read(x + 2, y + 1) + read(x + 2, y + 3) - read(x + 2, y + 2) * 4.0;
+            want[x + n * y] =
+                read(x + 1, y + 2) + read(x + 3, y + 2) + read(x + 2, y + 1) + read(x + 2, y + 3)
+                    - read(x + 2, y + 2) * 4.0;
         }
     }
 
     // Launches prohibitively expensive: the expression stays one kernel, which staging may lay out.
     for staging in [true, false] {
         let ctx = ctx();
-        ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+        ctx.set_cost_model(CostModel {
+            launch_us: 1e6,
+            ..CostModel::TEST
+        });
         ctx.jit().set_staging(staging);
         ctx.jit().set_max_inlined(1536);
         ctx.jit().record_splits();
         let u = Array::from_slice_on(&ctx, &data, [n, m]).unwrap();
         let mut w = u.pad([(2, 2), (2, 2)], PadMode::Edge);
         let left = u.pad([(2, 0)], PadMode::Edge).slice(0, 0..2);
-        w.slice_mut(0, ..2).slice(1, 2..m + 2).assign(ghost(&left)).unwrap();
+        w.slice_mut(0, ..2)
+            .slice(1, 2..m + 2)
+            .assign(ghost(&left))
+            .unwrap();
         let bottom = u.pad([(0, 0), (2, 0)], PadMode::Edge).slice(1, 0..2);
-        w.slice_mut(1, ..2).slice(0, 2..n + 2).assign(ghost(&bottom)).unwrap();
-        let r = w.slice(0, 1..n + 1).slice(1, 2..m + 2) + w.slice(0, 3..n + 3).slice(1, 2..m + 2) + w.slice(0, 2..n + 2).slice(1, 1..m + 1)
+        w.slice_mut(1, ..2)
+            .slice(0, 2..n + 2)
+            .assign(ghost(&bottom))
+            .unwrap();
+        let r = w.slice(0, 1..n + 1).slice(1, 2..m + 2)
+            + w.slice(0, 3..n + 3).slice(1, 2..m + 2)
+            + w.slice(0, 2..n + 2).slice(1, 1..m + 1)
             + w.slice(0, 2..n + 2).slice(1, 3..m + 3)
             - w.slice(0, 2..n + 2).slice(1, 2..m + 2) * 4.0;
         let before = ctx.jit().stats();
         let got = r.to_vec().unwrap();
         let judgement = ctx.jit().last_judgement();
         let splits = ctx.jit().take_splits();
-        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "staging {staging}: {judgement:?} {splits:?}");
-        assert!(ctx.jit().last_branches() > 0, "staging {staging}: no select was computed as a branch ({judgement:?})");
+        assert_eq!(
+            delta(before, ctx.jit().stats()).elementwise_launches,
+            1,
+            "staging {staging}: {judgement:?} {splits:?}"
+        );
+        assert!(
+            ctx.jit().last_branches() > 0,
+            "staging {staging}: no select was computed as a branch ({judgement:?})"
+        );
         assert_close(&got, &want, 1e-5, 1e-5);
     }
 }
@@ -3300,7 +4092,9 @@ fn ghost_regions_are_computed_only_where_they_are_assigned() {
 fn a_join_of_many_parts_loads_only_the_part_each_cell_takes() {
     let ctx = ctx();
     let (n, parts) = (24usize, 12usize);
-    let arrays: Vec<Array<u32>> = (0..parts).map(|p| Array::<u32>::range_on(&ctx, [n, 1], 0).unwrap() * 10 + p as u32).collect();
+    let arrays: Vec<Array<u32>> = (0..parts)
+        .map(|p| Array::<u32>::range_on(&ctx, [n, 1], 0).unwrap() * 10 + p as u32)
+        .collect();
     let refs: Vec<&Array<u32>> = arrays.iter().collect();
     crate::eval_all(&refs).unwrap();
     // A balanced tree of two-part joins along the second axis.
@@ -3322,7 +4116,12 @@ fn a_join_of_many_parts_loads_only_the_part_each_cell_takes() {
         }
     }
     // Eleven selects, all branches.
-    assert_eq!(ctx.jit().last_branches(), parts - 1, "{:?}", ctx.jit().last_judgement());
+    assert_eq!(
+        ctx.jit().last_branches(),
+        parts - 1,
+        "{:?}",
+        ctx.jit().last_judgement()
+    );
 }
 
 /// `r = g[1..]` with `g = e[..n - 2] + e[2..]` (an expression `e`): the main program reads `g`
@@ -3339,12 +4138,26 @@ fn a_sub_program_read_once_does_not_keep_what_it_reads_from_being_staged() {
     let r = g.slice(0, 1..n - 2) * 1.5 + 0.25;
     let before = ctx.jit().stats();
     let got = r.to_vec().unwrap();
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{:?}", ctx.jit().last_judgement());
-    let staging = ctx.jit().last_staging().unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "{:?}",
+        ctx.jit().last_judgement()
+    );
+    let staging = ctx
+        .jit()
+        .last_staging()
+        .unwrap_or_else(|| panic!("not staged: {:?}", ctx.jit().last_judgement()));
     assert_eq!(staging.subs.len(), 1, "{staging:?}");
     let tx = staging.tile[0] as i32;
-    assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([1, 0], [tx + 2, 0]), "{staging:?}");
-    let want: Vec<f32> = (0..n - 3).map(|i| (host[i + 1] + host[i + 2] + host[i + 3]) * 1.5 + 0.25).collect();
+    assert_eq!(
+        (staging.subs[0].lo, staging.subs[0].hi),
+        ([1, 0], [tx + 2, 0]),
+        "{staging:?}"
+    );
+    let want: Vec<f32> = (0..n - 3)
+        .map(|i| (host[i + 1] + host[i + 2] + host[i + 3]) * 1.5 + 0.25)
+        .collect();
     assert_close(&got, &want, 1e-4, 1e-4);
 }
 
@@ -3367,11 +4180,18 @@ fn a_reduction_requested_with_arrays_that_share_its_expression_waits_for_them() 
     // The residual once (it is shared and shifted), the update, the reduction's passes.
     assert!(launches.elementwise_launches <= 2, "{launches:?}");
     let n = xs.len();
-    let r = |i: usize| ((xs[(i + n - 1) % n] * xs[(i + n - 1) % n] + 1.0).sqrt() * 3.0) - (xs[i] * 2.0 + 0.5).sqrt();
+    let r = |i: usize| {
+        ((xs[(i + n - 1) % n] * xs[(i + n - 1) % n] + 1.0).sqrt() * 3.0)
+            - (xs[i] * 2.0 + 0.5).sqrt()
+    };
     let want: Vec<f32> = (0..n).map(|i| xs[i] + r(i) * 0.5).collect();
     assert_close(&got, &want, 1e-4, 1e-4);
     let sum: f32 = (0..n).map(|i| r(i) * r(i)).sum();
-    assert!((norm.item().unwrap() - sum).abs() <= 1e-3 * sum.abs(), "{} vs {sum}", norm.item().unwrap());
+    assert!(
+        (norm.item().unwrap() - sum).abs() <= 1e-3 * sum.abs(),
+        "{} vs {sum}",
+        norm.item().unwrap()
+    );
 }
 
 /// Scalars are the fields of one uniform buffer: an expression of more of them than it holds is
@@ -3384,15 +4204,29 @@ fn an_expression_with_more_scalars_than_a_uniform_holds_is_cut() {
     }
     let words = usize::try_from(ctx.max_uniform_bytes() / 4).unwrap();
     let terms = words / 3 + 200;
-    let x = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3).unwrap().to_f64();
+    let x = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0], 3)
+        .unwrap()
+        .to_f64();
     let mut sums: Vec<Array<f64>> = (0..terms).map(|k| &x * (k % 7) as f64 + 0.5).collect();
     while sums.len() > 1 {
-        sums = sums.chunks(2).map(|pair| if pair.len() == 2 { &pair[0] + &pair[1] } else { pair[0].clone() }).collect();
+        sums = sums
+            .chunks(2)
+            .map(|pair| {
+                if pair.len() == 2 {
+                    &pair[0] + &pair[1]
+                } else {
+                    pair[0].clone()
+                }
+            })
+            .collect();
     }
     let got = sums[0].to_vec().unwrap();
     let k_sum: f64 = (0..terms).map(|k| (k % 7) as f64).sum();
     for (g, v) in got.iter().zip([1.0f64, 2.0, 3.0]) {
-        assert!((g - (v * k_sum + 0.5 * terms as f64)).abs() < 1e-6 * k_sum * 3.0, "{g}");
+        assert!(
+            (g - (v * k_sum + 0.5 * terms as f64)).abs() < 1e-6 * k_sum * 3.0,
+            "{g}"
+        );
     }
 }
 
@@ -3404,7 +4238,13 @@ mod reruns {
 
     /// One call site: `steps` of `u = u * k + c * 0.5 + 1` (or `- 1`), with `c` captured.
     fn run(x: &Array<f32>, c: &Array<f32>, k: f32, plus: bool, steps: usize) -> Array<f32> {
-        let [r] = crate::iterate_all([x], steps, |[u]| [if plus { u * k + c * 0.5 + 1.0 } else { u * k + c * 0.5 - 1.0 }]);
+        let [r] = crate::iterate_all([x], steps, |[u]| {
+            [if plus {
+                u * k + c * 0.5 + 1.0
+            } else {
+                u * k + c * 0.5 - 1.0
+            }]
+        });
         r
     }
 
@@ -3431,12 +4271,20 @@ mod reruns {
         for call in 0..6u64 {
             let xs = values(300, 10 + call, -1.0, 1.0);
             let steps = [5, 5, 9, 9, 1, 40][call as usize];
-            let got = run(&f32s(&ctx, &xs), &c, 0.9, true, steps).to_vec().unwrap();
+            let got = run(&f32s(&ctx, &xs), &c, 0.9, true, steps)
+                .to_vec()
+                .unwrap();
             assert_close(&got, &host(&xs, &cs, 0.9, true, steps), 1e-4, 1e-5);
         }
         let d = delta(before, ctx.jit().stats());
-        assert_eq!(d.replays, 5, "every call after the first runs from the program of the first");
-        assert_eq!(d.speculated, 4, "from the third on the loop starts before the step is traced");
+        assert_eq!(
+            d.replays, 5,
+            "every call after the first runs from the program of the first"
+        );
+        assert_eq!(
+            d.speculated, 4,
+            "from the third on the loop starts before the step is traced"
+        );
     }
 
     #[test]
@@ -3480,7 +4328,11 @@ mod reruns {
         let got = run(&x, &c, 0.8, false, 4).to_vec().unwrap();
         assert_close(&got, &host(&xs, &cs, 0.8, false, 4), 1e-4, 1e-5);
         let d = delta(before, ctx.jit().stats());
-        assert_eq!((d.replays, d.speculated), (0, 0), "new scalar, new operation: new programs");
+        assert_eq!(
+            (d.replays, d.speculated),
+            (0, 0),
+            "new scalar, new operation: new programs"
+        );
         // Back to the first: its program is still known.
         let got = run(&x, &c, 0.9, true, 4).to_vec().unwrap();
         assert_close(&got, &host(&xs, &cs, 0.9, true, 4), 1e-4, 1e-5);
@@ -3494,10 +4346,16 @@ mod reruns {
             let [r] = crate::iterate_all([x], 3, |[u]| [u * 0.5 + a + b * 2.0]);
             r.to_vec().unwrap()
         };
-        let (xs, as_, bs) = (values(100, 30, -1.0, 1.0), values(100, 31, -1.0, 1.0), values(100, 32, -1.0, 1.0));
+        let (xs, as_, bs) = (
+            values(100, 30, -1.0, 1.0),
+            values(100, 31, -1.0, 1.0),
+            values(100, 32, -1.0, 1.0),
+        );
         let (x, a, b) = (f32s(&ctx, &xs), f32s(&ctx, &as_), f32s(&ctx, &bs));
         let host = |x: &[f32], a: &[f32], b: &[f32]| -> Vec<f32> {
-            (0..x.len()).map(|i| (0..3).fold(x[i], |u, _| u * 0.5 + a[i] + b[i] * 2.0)).collect()
+            (0..x.len())
+                .map(|i| (0..3).fold(x[i], |u, _| u * 0.5 + a[i] + b[i] * 2.0))
+                .collect()
         };
         for _ in 0..4 {
             // Two arrays, then one array twice, then x itself as a captured array.
@@ -3565,7 +4423,10 @@ mod reruns {
     #[test]
     fn the_steps_per_launch_follow_the_cost_model() {
         let ctx = ctx();
-        ctx.set_cost_model(CostModel { f32_ops_per_ns: 0.05, ..CostModel::TEST });
+        ctx.set_cost_model(CostModel {
+            f32_ops_per_ns: 0.05,
+            ..CostModel::TEST
+        });
         let n = 1000;
         let xs = values(n, 9, 0.0, 1.0);
         let x = f32s(&ctx, &xs);
@@ -3605,7 +4466,14 @@ fn a_cut_inside_the_evaluation_of_a_cut_evaluates_nothing_else() {
         let lap = fp(&p).slice(0, 0..n) + fp(&p).slice(0, 2..n + 2) - fp(&u) * 2.0;
         u = &u + lap * 0.1;
         stages.push(u.clone());
-        host = (0..n).map(|i| host[i] + 0.1 * (f(host[i.saturating_sub(1)]) + f(host[(i + 1).min(n - 1)]) - 2.0 * f(host[i]))).collect();
+        host = (0..n)
+            .map(|i| {
+                host[i]
+                    + 0.1
+                        * (f(host[i.saturating_sub(1)]) + f(host[(i + 1).min(n - 1)])
+                            - 2.0 * f(host[i]))
+            })
+            .collect();
     }
     let before = ctx.jit().stats();
     let got = u.to_vec().unwrap();
@@ -3625,18 +4493,37 @@ fn a_shared_expression_is_weighed_by_its_distinct_nodes() {
         t = &t * 0.5 + &t * 0.25;
     }
     let node = std::sync::Arc::clone(t.pending().unwrap());
-    assert!(node.weight() <= node.size() as f64 * 8.0, "weight {} of {} nodes", node.weight(), node.size());
+    assert!(
+        node.weight() <= node.size() as f64 * 8.0,
+        "weight {} of {} nodes",
+        node.weight(),
+        node.size()
+    );
     // It is cheap to compute again: two arrays that read it do not store it first.
     let u = &t + 1.0;
     let v = &t * 2.0;
     drop((t, node));
     let before = ctx.jit().stats();
     let got_u = u.to_vec().unwrap();
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "the shared expression is computed inside the kernel that reads it");
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "the shared expression is computed inside the kernel that reads it"
+    );
     let level = |a: f32| a * 0.5 + a * 0.25;
     let host = |seed: f32| (0..30).fold(seed + 1.0, |a, _| level(a));
-    assert_close(&got_u, &xs.iter().map(|&v| host(v) + 1.0).collect::<Vec<_>>(), 1e-4, 1e-5);
-    assert_close(&v.to_vec().unwrap(), &xs.iter().map(|&v| host(v) * 2.0).collect::<Vec<_>>(), 1e-4, 1e-5);
+    assert_close(
+        &got_u,
+        &xs.iter().map(|&v| host(v) + 1.0).collect::<Vec<_>>(),
+        1e-4,
+        1e-5,
+    );
+    assert_close(
+        &v.to_vec().unwrap(),
+        &xs.iter().map(|&v| host(v) * 2.0).collect::<Vec<_>>(),
+        1e-4,
+        1e-5,
+    );
 }
 
 /// Host value of element `(k, i)` of the stacked expressions of the stack tests: part `k` is
@@ -3646,7 +4533,10 @@ fn stack_part(x: &Array<f32>, y: &Array<f32>, k: usize) -> Array<f32> {
 }
 
 fn stack_host(xs: &[f32], ys: &[f32], k: usize) -> Vec<f32> {
-    xs.iter().zip(ys).map(|(&x, &y)| x * ((k + 1) as f32 * 0.25) + y.sqrt()).collect()
+    xs.iter()
+        .zip(ys)
+        .map(|(&x, &y)| x * ((k + 1) as f32 * 0.25) + y.sqrt())
+        .collect()
 }
 
 #[test]
@@ -3654,7 +4544,10 @@ fn stacked_lazy_parts_are_one_kernel_writing_the_stacked_layout() {
     let ctx = ctx();
     let (w, h) = (9, 7);
     let (xs, ys) = (values(w * h, 501, 0.2, 1.2), values(w * h, 502, 0.2, 1.2));
-    let (x, y) = (Array::from_slice_on(&ctx, &xs, [w, h]).unwrap(), Array::from_slice_on(&ctx, &ys, [w, h]).unwrap());
+    let (x, y) = (
+        Array::from_slice_on(&ctx, &xs, [w, h]).unwrap(),
+        Array::from_slice_on(&ctx, &ys, [w, h]).unwrap(),
+    );
     x.eval().unwrap();
     y.eval().unwrap();
     let hosts: Vec<Vec<f32>> = (0..16).map(|k| stack_host(&xs, &ys, k)).collect();
@@ -3667,12 +4560,18 @@ fn stacked_lazy_parts_are_one_kernel_writing_the_stacked_layout() {
     assert_eq!(stacked.shape().dims(), [16, w, h, 1]);
     let got = stacked.to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    let want: Vec<f32> = (0..w * h).flat_map(|i| (0..16).map(|k| hosts[k][i]).collect::<Vec<_>>()).collect();
+    let want: Vec<f32> = (0..w * h)
+        .flat_map(|i| (0..16).map(|k| hosts[k][i]).collect::<Vec<_>>())
+        .collect();
     assert_close(&got, &want, 1e-6, 1e-6);
 
     // The other positions of the new axis, and the array form.
     for axis in 1..=3 {
-        let parts = [stack_part(&x, &y, 0), stack_part(&x, &y, 1), stack_part(&x, &y, 2)];
+        let parts = [
+            stack_part(&x, &y, 0),
+            stack_part(&x, &y, 1),
+            stack_part(&x, &y, 2),
+        ];
         let before = ctx.jit().stats();
         let stacked = crate::stack(axis, [&parts[0], &parts[1], &parts[2]]);
         let mut dims = [w, h, 1, 1];
@@ -3680,7 +4579,11 @@ fn stacked_lazy_parts_are_one_kernel_writing_the_stacked_layout() {
         dims[axis] = 3;
         assert_eq!(stacked.shape().dims(), dims, "axis {axis}");
         let got = stacked.to_vec().unwrap();
-        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "axis {axis}");
+        assert_eq!(
+            delta(before, ctx.jit().stats()).elementwise_launches,
+            1,
+            "axis {axis}"
+        );
         // Blocks of `block` elements of every part in turn.
         let block: usize = [w, h, 1, 1][..axis].iter().product();
         let want: Vec<f32> = (0..w * h * 3)
@@ -3695,21 +4598,85 @@ fn stacked_lazy_parts_are_one_kernel_writing_the_stacked_layout() {
 }
 
 #[test]
+fn a_stack_in_blocks_is_one_kernel_for_every_block_length() {
+    let ctx = ctx();
+    let mut built = Vec::new();
+    // Blocks of 30 and 50 elements: neither is a power of two.
+    for (w, h, seed) in [(30, 10, 601), (50, 14, 603)] {
+        let (xs, ys) = (
+            values(w * h, seed, 0.2, 1.2),
+            values(w * h, seed + 1, 0.2, 1.2),
+        );
+        let (x, y) = (
+            Array::from_slice_on(&ctx, &xs, [w, h]).unwrap(),
+            Array::from_slice_on(&ctx, &ys, [w, h]).unwrap(),
+        );
+        x.eval().unwrap();
+        y.eval().unwrap();
+        let hosts: Vec<Vec<f32>> = (0..3).map(|k| stack_host(&xs, &ys, k)).collect();
+        let before = ctx.jit().stats();
+        let parts = [
+            stack_part(&x, &y, 0),
+            stack_part(&x, &y, 1),
+            stack_part(&x, &y, 2),
+        ];
+        let got = crate::stack(1, [&parts[0], &parts[1], &parts[2]])
+            .to_vec()
+            .unwrap();
+        built.push(delta(before, ctx.jit().stats()).built);
+        let want: Vec<f32> = (0..w * h * 3)
+            .map(|o| {
+                let (q, r) = (o / (3 * w), o % w);
+                hosts[(o / w) % 3][q * w + r]
+            })
+            .collect();
+        assert_close(&got, &want, 1e-6, 1e-6);
+    }
+    assert!(built[0] >= 1, "the first block length compiles: {built:?}");
+    assert_eq!(
+        built[1], 0,
+        "the second block length reuses the kernel: {built:?}"
+    );
+}
+
+#[test]
 fn a_stack_that_reads_too_many_buffers_or_is_too_large_still_stacks() {
     let (w, h) = (6, 5);
     let n = w * h;
-    let inputs: Vec<Vec<f32>> = (0..12).map(|k| values(n, 510 + k as u64, 0.2, 1.2)).collect();
-    let want = |f: &dyn Fn(usize, usize) -> f32| -> Vec<f32> { (0..n).flat_map(|i| (0..12).map(move |k| (i, k))).map(|(i, k)| f(i, k)).collect() };
+    let inputs: Vec<Vec<f32>> = (0..12)
+        .map(|k| values(n, 510 + k as u64, 0.2, 1.2))
+        .collect();
+    let want = |f: &dyn Fn(usize, usize) -> f32| -> Vec<f32> {
+        (0..n)
+            .flat_map(|i| (0..12).map(move |k| (i, k)))
+            .map(|(i, k)| f(i, k))
+            .collect()
+    };
 
     // More buffers than a kernel binds: the stack runs in pieces, and a part that alone reads
     // too many is computed first.
     let make = ctx;
     let ctx = make();
     ctx.jit().set_max_inputs(4);
-    let arrays: Vec<Array<f32>> = inputs.iter().map(|d| Array::from_slice_on(&ctx, d, [w, h]).unwrap()).collect();
-    let parts: Vec<Array<f32>> = (0..12).map(|k| &arrays[k] + &arrays[(k + 1) % 12] * 2.0 + &arrays[(k + 5) % 12] * &arrays[(k + 7) % 12] + &arrays[(k + 2) % 12]).collect();
+    let arrays: Vec<Array<f32>> = inputs
+        .iter()
+        .map(|d| Array::from_slice_on(&ctx, d, [w, h]).unwrap())
+        .collect();
+    let parts: Vec<Array<f32>> = (0..12)
+        .map(|k| {
+            &arrays[k]
+                + &arrays[(k + 1) % 12] * 2.0
+                + &arrays[(k + 5) % 12] * &arrays[(k + 7) % 12]
+                + &arrays[(k + 2) % 12]
+        })
+        .collect();
     let got = crate::stack_slice(0, &parts).to_vec().unwrap();
-    let f = |i: usize, k: usize| inputs[k][i] + inputs[(k + 1) % 12][i] * 2.0 + inputs[(k + 5) % 12][i] * inputs[(k + 7) % 12][i] + inputs[(k + 2) % 12][i];
+    let f = |i: usize, k: usize| {
+        inputs[k][i]
+            + inputs[(k + 1) % 12][i] * 2.0
+            + inputs[(k + 5) % 12][i] * inputs[(k + 7) % 12][i]
+            + inputs[(k + 2) % 12][i]
+    };
     assert_close(&got, &want(&f), 1e-5, 1e-6);
 
     // Few live values: groups of a part or two.
@@ -3738,8 +4705,15 @@ fn a_stack_that_reads_too_many_buffers_or_is_too_large_still_stacks() {
     let parts: Vec<Array<f32>> = (0..12).map(|k| stack_part(&x, &y, k)).collect();
     let stacked = crate::stack_slice(0, &parts);
     assert_eq!(stacked.shape().dims(), [12, w, h, 1]);
-    let hosts: Vec<Vec<f32>> = (0..12).map(|k| stack_host(&inputs[0], &inputs[1], k)).collect();
-    assert_close(&stacked.to_vec().unwrap(), &want(&|i, k| hosts[k][i]), 1e-6, 1e-6);
+    let hosts: Vec<Vec<f32>> = (0..12)
+        .map(|k| stack_host(&inputs[0], &inputs[1], k))
+        .collect();
+    assert_close(
+        &stacked.to_vec().unwrap(),
+        &want(&|i, k| hosts[k][i]),
+        1e-6,
+        1e-6,
+    );
 }
 
 #[test]
@@ -3757,7 +4731,9 @@ fn stacks_of_every_element_type_read_views_and_take_writes() {
     assert_close(&got, &want, 1e-6, 1e-6);
     let idx = Array::<u32>::range_on(&ctx, crate::Shape::new([w, h, 1, 1]), 0).unwrap();
     let ints = crate::stack(2, [&idx, &(&idx + 10u32)]);
-    let want: Vec<u32> = (0..2).flat_map(|k| (0..w * h).map(move |i| (i % w) as u32 + 10 * k)).collect();
+    let want: Vec<u32> = (0..2)
+        .flat_map(|k| (0..w * h).map(move |i| (i % w) as u32 + 10 * k))
+        .collect();
     assert_eq!(ints.to_vec().unwrap(), want);
 
     // The stack is an array like any other: read through views (a slice picks a part), and
@@ -3765,20 +4741,33 @@ fn stacks_of_every_element_type_read_views_and_take_writes() {
     let parts = [&x * 2.0, &x * 3.0, &x * 4.0];
     let mut stacked = crate::stack(0, [&parts[0], &parts[1], &parts[2]]);
     let middle = stacked.slice(0, 1..2);
-    assert_close(&middle.to_vec().unwrap(), &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+    assert_close(
+        &middle.to_vec().unwrap(),
+        &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(),
+        1e-6,
+        1e-6,
+    );
     stacked.slice_mut(0, 1..2).assign(0.0).unwrap();
     let got = stacked.to_vec().unwrap();
     let want: Vec<f32> = xs.iter().flat_map(|&v| [v * 2.0, 0.0, v * 4.0]).collect();
     assert_close(&got, &want, 1e-6, 1e-6);
     // The parts, still lazy and held, are unchanged.
-    assert_close(&parts[1].to_vec().unwrap(), &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+    assert_close(
+        &parts[1].to_vec().unwrap(),
+        &xs.iter().map(|v| v * 3.0).collect::<Vec<_>>(),
+        1e-6,
+        1e-6,
+    );
 
     // A part used twice, and the same part as another stack's.
     let p = &x + 1.0;
     let twice = crate::stack(1, [&p, &p]);
     assert_eq!(twice.shape().dims(), [w, 2, h, 1]);
     let got = twice.to_vec().unwrap();
-    let want: Vec<f32> = (0..h).flat_map(|j| (0..2).flat_map(move |_| (0..w).map(move |i| (i, j)))).map(|(i, j)| xs[i + w * j] + 1.0).collect();
+    let want: Vec<f32> = (0..h)
+        .flat_map(|j| (0..2).flat_map(move |_| (0..w).map(move |i| (i, j))))
+        .map(|(i, j)| xs[i + w * j] + 1.0)
+        .collect();
     assert_close(&got, &want, 1e-6, 1e-6);
 }
 
@@ -3789,19 +4778,46 @@ fn stack_reports_what_concat_reports() {
     let b = Array::from_slice_on(&ctx, &[1.0f32, 2.0, 3.0, 4.0], [2, 2]).unwrap();
     let other = Context::with_options(crate::ContextOptions::from_env().calibrate(false)).unwrap();
     let c = Array::from_slice_on(&other, &[1.0f32; 6], [3, 2]).unwrap();
-    let four = Array::from_slice_on(&ctx, &[1.0f32; 8], [2, 2, 2, 1]).unwrap().reshape([1, 2, 2, 2]);
+    let four = Array::from_slice_on(&ctx, &[1.0f32; 8], [2, 2, 2, 1])
+        .unwrap()
+        .reshape([1, 2, 2, 2]);
 
     let mismatch = crate::stack(0, [&a, &b]);
-    assert!(matches!(mismatch.check().unwrap_err().root(), crate::LumaError::ShapeMismatch { lhs: [3, 2, 1, 1], rhs: [2, 2, 1, 1] }));
-    assert!(matches!(crate::stack(0, [&a, &c]).check().unwrap_err().root(), crate::LumaError::ContextMismatch));
-    assert!(matches!(crate::stack(4, [&a, &a]).check().unwrap_err().root(), crate::LumaError::InvalidShape(_)));
+    assert!(matches!(
+        mismatch.check().unwrap_err().root(),
+        crate::LumaError::ShapeMismatch {
+            lhs: [3, 2, 1, 1],
+            rhs: [2, 2, 1, 1]
+        }
+    ));
+    assert!(matches!(
+        crate::stack(0, [&a, &c]).check().unwrap_err().root(),
+        crate::LumaError::ContextMismatch
+    ));
+    assert!(matches!(
+        crate::stack(4, [&a, &a]).check().unwrap_err().root(),
+        crate::LumaError::InvalidShape(_)
+    ));
     // Four dimensions leave no room for another.
-    assert!(matches!(crate::stack(0, [&four, &four]).check().unwrap_err().root(), crate::LumaError::InvalidShape(_)));
+    assert!(matches!(
+        crate::stack(0, [&four, &four]).check().unwrap_err().root(),
+        crate::LumaError::InvalidShape(_)
+    ));
     // A poisoned part poisons the stack with its error.
     let bad = a.reshape([7]);
     assert!(crate::stack(0, [&a, &bad]).check().is_err());
-    assert!(crate::stack_slice(0, &[a.clone(), a.clone()]).check().is_ok());
-    assert!(matches!(crate::stack_slice::<f32>(0, &[]).check().unwrap_err().root(), crate::LumaError::InvalidShape(_)));
+    assert!(
+        crate::stack_slice(0, &[a.clone(), a.clone()])
+            .check()
+            .is_ok()
+    );
+    assert!(matches!(
+        crate::stack_slice::<f32>(0, &[])
+            .check()
+            .unwrap_err()
+            .root(),
+        crate::LumaError::InvalidShape(_)
+    ));
 }
 
 #[test]
@@ -3811,7 +4827,8 @@ fn reshape_of_a_lazy_view_stays_lazy() {
     let xs = values(16 * ni * nj, 530, -1.0, 1.0);
     let x = Array::from_slice_on(&ctx, &xs, [16, ni, nj]).unwrap();
     x.eval().unwrap();
-    let want = |k: usize| -> Vec<f32> { (0..ni * nj).map(|i| xs[k + 16 * i] * 2.0 + 1.0).collect() };
+    let want =
+        |k: usize| -> Vec<f32> { (0..ni * nj).map(|i| xs[k + 16 * i] * 2.0 + 1.0).collect() };
 
     // A slice of the fastest axis reads every 16th element, a slice of the slowest one a stretch:
     // both are index maps, and the reshape keeps the order of the view's elements.
@@ -3819,9 +4836,17 @@ fn reshape_of_a_lazy_view_stays_lazy() {
     let part = x.slice(0, 3..4).reshape([ni, nj]);
     let r = &part * 2.0 + 1.0;
     assert_eq!(r.shape().dims(), [ni, nj, 1, 1]);
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0, "reshaping launched a kernel");
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        0,
+        "reshaping launched a kernel"
+    );
     assert_close(&r.to_vec().unwrap(), &want(3), 1e-6, 1e-6);
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "the slice, the reshape and the arithmetic are one kernel");
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "the slice, the reshape and the arithmetic are one kernel"
+    );
 
     let tail = Array::from_slice_on(&ctx, &xs, [ni, nj, 16]).unwrap();
     tail.eval().unwrap();
@@ -3830,10 +4855,15 @@ fn reshape_of_a_lazy_view_stays_lazy() {
     let r = plane.sqrt().abs() + 1.0;
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
     let got = r.to_vec().unwrap();
-    let want: Vec<f32> = (0..ni * nj).map(|i| xs[i + ni * nj * 5].sqrt().abs() + 1.0).collect();
+    let want: Vec<f32> = (0..ni * nj)
+        .map(|i| xs[i + ni * nj * 5].sqrt().abs() + 1.0)
+        .collect();
     assert_eq!(got.len(), want.len());
     for (g, w) in got.iter().zip(&want) {
-        assert!((g.is_nan() && w.is_nan()) || (g - w).abs() <= 1e-6, "{g} vs {w}");
+        assert!(
+            (g.is_nan() && w.is_nan()) || (g - w).abs() <= 1e-6,
+            "{g} vs {w}"
+        );
     }
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
 
@@ -3843,7 +4873,9 @@ fn reshape_of_a_lazy_view_stays_lazy() {
     let r = &flipped * 2.0;
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 0);
     let got = r.to_vec().unwrap();
-    let want: Vec<f32> = (0..ni * nj).map(|i| xs[3 + 16 * ((ni - 1 - i % ni) + ni * (i / ni))] * 2.0).collect();
+    let want: Vec<f32> = (0..ni * nj)
+        .map(|i| xs[3 + 16 * ((ni - 1 - i % ni) + ni * (i / ni))] * 2.0)
+        .collect();
     assert_close(&got, &want, 1e-6, 1e-6);
 
     // An expression that is not a view is evaluated by the reshape (what reads it through
@@ -3855,13 +4887,21 @@ fn reshape_of_a_lazy_view_stays_lazy() {
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
     flat += 1.0;
     let got = lazy.to_vec().unwrap();
-    assert_close(&got, &xs.iter().map(|v| v * 2.0 + 1.0).collect::<Vec<_>>(), 1e-6, 1e-6);
+    assert_close(
+        &got,
+        &xs.iter().map(|v| v * 2.0 + 1.0).collect::<Vec<_>>(),
+        1e-6,
+        1e-6,
+    );
 
     // A reshaped slice is a read-only view: writing needs a copy, which leaves `x` alone.
     let slice = x.slice(0, 2..3);
     let reshaped = slice.reshape([ni, nj]);
     let mut view = reshaped.clone();
-    assert!(matches!(view.assign(7.0).unwrap_err().root(), crate::LumaError::InvalidShape(_)));
+    assert!(matches!(
+        view.assign(7.0).unwrap_err().root(),
+        crate::LumaError::InvalidShape(_)
+    ));
     let mut copy = reshaped.copy();
     copy.assign(7.0).unwrap();
     assert_eq!(copy.to_vec().unwrap(), vec![7.0; ni * nj]);
@@ -3924,18 +4964,35 @@ fn dynamic_views_ranges_gathers_and_scatters_reuse_one_pipeline() {
     // Ranges over several shapes and axes.
     let before = ctx.jit().stats();
     for n in [6usize, 9, 7] {
-        let r = Array::<f32>::range_on(&ctx, n, 0).unwrap().to_vec().unwrap();
+        let r = Array::<f32>::range_on(&ctx, n, 0)
+            .unwrap()
+            .to_vec()
+            .unwrap();
         assert_eq!(r, (0..n).map(|i| i as f32).collect::<Vec<_>>());
     }
     assert_eq!(delta(before, ctx.jit().stats()).built, 1);
     let before = ctx.jit().stats();
     for ([w, h], dim) in [([4usize, 8usize], 0usize), ([4, 8], 1), ([16, 4], 1)] {
-        let r = Array::<f32>::range_on(&ctx, [w, h], dim).unwrap().to_vec().unwrap();
-        let want: Vec<f32> = (0..w * h).map(|i| if dim == 0 { (i % w) as f32 } else { (i / w) as f32 }).collect();
+        let r = Array::<f32>::range_on(&ctx, [w, h], dim)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        let want: Vec<f32> = (0..w * h)
+            .map(|i| {
+                if dim == 0 {
+                    (i % w) as f32
+                } else {
+                    (i / w) as f32
+                }
+            })
+            .collect();
         assert_eq!(r, want);
     }
     assert_eq!(delta(before, ctx.jit().stats()).built, 1);
-    let r = Array::<f32>::range_on(&ctx, [3, 4], 1).unwrap().to_vec().unwrap();
+    let r = Array::<f32>::range_on(&ctx, [3, 4], 1)
+        .unwrap()
+        .to_vec()
+        .unwrap();
     assert_eq!(r, (0..12).map(|i| (i / 3) as f32).collect::<Vec<_>>());
 
     // Gathers from sources of different lengths.
@@ -3966,9 +5023,17 @@ fn dynamic_views_ranges_gathers_and_scatters_reuse_one_pipeline() {
     for n in [10_000usize, 20_000] {
         let mut target = Array::<u32>::from_slice_on(&ctx, &vec![0; n], n).unwrap();
         let idx = Array::<u32>::from_slice_on(&ctx, &[1, 2, 2, n as u32], 4).unwrap();
-        target.put_add(&idx, Array::<u32>::from_slice_on(&ctx, &[1, 1, 1, 1], 4).unwrap()).unwrap();
+        target
+            .put_add(
+                &idx,
+                Array::<u32>::from_slice_on(&ctx, &[1, 1, 1, 1], 4).unwrap(),
+            )
+            .unwrap();
         let got = target.to_vec().unwrap();
-        assert_eq!((got.len(), got[1], got[2], got.iter().sum::<u32>()), (n, 1, 2, 3));
+        assert_eq!(
+            (got.len(), got[1], got[2], got.iter().sum::<u32>()),
+            (n, 1, 2, 3)
+        );
     }
     assert_eq!(delta(before, ctx.jit().stats()).built, 1);
 
@@ -3988,8 +5053,19 @@ fn dynamic_views_ranges_gathers_and_scatters_reuse_one_pipeline() {
 #[test]
 fn a_sort_of_an_expression_at_the_input_limit_fuses_into_both_first_pass_kernels_or_neither() {
     let n = 5000;
-    let host: Vec<Vec<u32>> = (0..4).map(|k| (0..n).map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(k * 977)) >> 7).collect()).collect();
-    let sums: Vec<u32> = (0..n).map(|i| host.iter().fold(0u32, |sum, column| sum.wrapping_add(column[i]))).collect();
+    let host: Vec<Vec<u32>> = (0..4)
+        .map(|k| {
+            (0..n)
+                .map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(k * 977)) >> 7)
+                .collect()
+        })
+        .collect();
+    let sums: Vec<u32> = (0..n)
+        .map(|i| {
+            host.iter()
+                .fold(0u32, |sum, column| sum.wrapping_add(column[i]))
+        })
+        .collect();
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| sums[i as usize]);
     let mut sorted = sums.clone();
@@ -3997,11 +5073,26 @@ fn a_sort_of_an_expression_at_the_input_limit_fuses_into_both_first_pass_kernels
     for limit in [5, 6, 7, 8] {
         let ctx = ctx();
         ctx.jit().set_max_inputs(limit);
-        let a: Vec<Array<u32>> = host.iter().map(|column| Array::from_slice_on(&ctx, column, n).unwrap()).collect();
+        let a: Vec<Array<u32>> = host
+            .iter()
+            .map(|column| Array::from_slice_on(&ctx, column, n).unwrap())
+            .collect();
         let keys = || &a[0] + &a[1] + &a[2] + &a[3];
-        assert_eq!(keys().sort().to_vec().unwrap(), sorted, "sort, limit {limit}");
-        assert_eq!(keys().argsort().to_vec().unwrap(), order, "argsort, limit {limit}");
-        assert_eq!(keys().sort_descending().to_vec().unwrap(), sorted.iter().rev().copied().collect::<Vec<_>>(), "descending, limit {limit}");
+        assert_eq!(
+            keys().sort().to_vec().unwrap(),
+            sorted,
+            "sort, limit {limit}"
+        );
+        assert_eq!(
+            keys().argsort().to_vec().unwrap(),
+            order,
+            "argsort, limit {limit}"
+        );
+        assert_eq!(
+            keys().sort_descending().to_vec().unwrap(),
+            sorted.iter().rev().copied().collect::<Vec<_>>(),
+            "descending, limit {limit}"
+        );
     }
 }
 
@@ -4012,8 +5103,17 @@ fn many_buffers_are_packed_and_read_through_one_binding() {
     let ctx = ctx();
     ctx.jit().set_max_inputs(4);
     let n = 300;
-    let data: Vec<Vec<u32>> = (0..20u32).map(|k| (0..n as u32).map(|i| (i * 7 + k * 1013) ^ (k << 3)).collect()).collect();
-    let arrays: Vec<Array<u32>> = data.iter().map(|d| Array::from_slice_on(&ctx, d, n).unwrap()).collect();
+    let data: Vec<Vec<u32>> = (0..20u32)
+        .map(|k| {
+            (0..n as u32)
+                .map(|i| (i * 7 + k * 1013) ^ (k << 3))
+                .collect()
+        })
+        .collect();
+    let arrays: Vec<Array<u32>> = data
+        .iter()
+        .map(|d| Array::from_slice_on(&ctx, d, n).unwrap())
+        .collect();
     let total = |weight: u32| {
         let mut acc = &arrays[0] * weight;
         for a in &arrays[1..] {
@@ -4022,7 +5122,13 @@ fn many_buffers_are_packed_and_read_through_one_binding() {
         acc
     };
     let host = |data: &[Vec<u32>], weight: u32| -> Vec<u32> {
-        (0..n).map(|i| data.iter().enumerate().fold(0u32, |sum, (k, d)| sum.wrapping_add(d[i].wrapping_mul(if k == 0 { weight } else { 1 })))).collect()
+        (0..n)
+            .map(|i| {
+                data.iter().enumerate().fold(0u32, |sum, (k, d)| {
+                    sum.wrapping_add(d[i].wrapping_mul(if k == 0 { weight } else { 1 }))
+                })
+            })
+            .collect()
     };
     assert_eq!(total(1).to_vec().unwrap(), host(&data, 1));
 
@@ -4048,12 +5154,20 @@ fn many_buffers_are_packed_and_read_through_one_binding() {
     // Compound assignment into a member, and a read through a shift or a view of another.
     let mut member = arrays[7].clone();
     member += &arrays[8];
-    data[7] = (0..n).map(|i| data[7][i].wrapping_add(data[8][i])).collect();
+    data[7] = (0..n)
+        .map(|i| data[7][i].wrapping_add(data[8][i]))
+        .collect();
     assert_eq!(arrays[7].to_vec().unwrap(), data[7]);
     assert_eq!(total(2).to_vec().unwrap(), host(&data, 2));
     let rolled = arrays[9].shift(1).to_vec().unwrap();
-    assert_eq!(rolled, (0..n).map(|i| data[9][(i + n - 1) % n]).collect::<Vec<_>>());
-    assert_eq!(arrays[10].slice(0, 5..50).to_vec().unwrap(), data[10][5..50].to_vec());
+    assert_eq!(
+        rolled,
+        (0..n).map(|i| data[9][(i + n - 1) % n]).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        arrays[10].slice(0, 5..50).to_vec().unwrap(),
+        data[10][5..50].to_vec()
+    );
     assert_eq!(total(1).to_vec().unwrap(), host(&data, 1));
 }
 
@@ -4072,7 +5186,11 @@ fn outputs_beyond_the_bindings_of_a_kernel_share_one_buffer() {
     let before = ctx.jit().stats();
     crate::eval_all(&refs).unwrap();
     ctx.sync().unwrap();
-    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "one kernel with one output buffer");
+    assert_eq!(
+        delta(before, ctx.jit().stats()).elementwise_launches,
+        1,
+        "one kernel with one output buffer"
+    );
 
     // One kernel reads all sixteen, through one binding.
     let before = ctx.jit().stats();
@@ -4082,10 +5200,18 @@ fn outputs_beyond_the_bindings_of_a_kernel_share_one_buffer() {
     }
     let got = sum.to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
-    let want: Vec<f32> = (0..n).map(|i| (0..16).map(|k| xs[i] * (k as f32 + 1.0) + ys[i] * ys[i]).sum()).collect();
+    let want: Vec<f32> = (0..n)
+        .map(|i| {
+            (0..16)
+                .map(|k| xs[i] * (k as f32 + 1.0) + ys[i] * ys[i])
+                .sum()
+        })
+        .collect();
     assert_close(&got, &want, 1e-4, 1e-4);
     for k in [0, 5, 15] {
-        let want: Vec<f32> = (0..n).map(|i| xs[i] * (k as f32 + 1.0) + ys[i] * ys[i]).collect();
+        let want: Vec<f32> = (0..n)
+            .map(|i| xs[i] * (k as f32 + 1.0) + ys[i] * ys[i])
+            .collect();
         assert_close(&outs[k].to_vec().unwrap(), &want, 1e-5, 1e-5);
     }
 }
@@ -4097,13 +5223,23 @@ fn a_wide_state_advances_in_a_few_kernels_whatever_the_binding_limit() {
     let n = 100;
     let width = 40usize;
     let rounds = 12;
-    let init: Vec<Vec<u32>> = (0..width as u32).map(|k| (0..n as u32).map(|i| i.wrapping_mul(2654435761).wrapping_add(k * 40503)).collect()).collect();
+    let init: Vec<Vec<u32>> = (0..width as u32)
+        .map(|k| {
+            (0..n as u32)
+                .map(|i| i.wrapping_mul(2654435761).wrapping_add(k * 40503))
+                .collect()
+        })
+        .collect();
     let mut want = init.clone();
     for _ in 0..rounds {
         let old = want.clone();
         for k in 0..width {
             for i in 0..n {
-                let (a, b, c) = (old[(k + 1) % width][i], old[(k + 7) % width][i], old[(k + 13) % width][i]);
+                let (a, b, c) = (
+                    old[(k + 1) % width][i],
+                    old[(k + 7) % width][i],
+                    old[(k + 13) % width][i],
+                );
                 want[k][i] = old[k][i] ^ a.rotate_left(1) ^ (b & !c);
             }
         }
@@ -4112,13 +5248,18 @@ fn a_wide_state_advances_in_a_few_kernels_whatever_the_binding_limit() {
         let ctx = ctx();
         ctx.jit().set_max_inputs(limit);
         ctx.jit().set_max_nodes(2048);
-        let mut state: Vec<Array<u32>> = init.iter().map(|d| Array::from_slice_on(&ctx, d, n).unwrap()).collect();
+        let mut state: Vec<Array<u32>> = init
+            .iter()
+            .map(|d| Array::from_slice_on(&ctx, d, n).unwrap())
+            .collect();
         let before = ctx.jit().stats();
         for _ in 0..rounds {
             state = (0..width)
                 .map(|k| {
                     let a = &state[(k + 1) % width];
-                    &state[k] ^ ((a << 1u32) | (a >> 31u32)) ^ (&state[(k + 7) % width] & !&state[(k + 13) % width])
+                    &state[k]
+                        ^ ((a << 1u32) | (a >> 31u32))
+                        ^ (&state[(k + 7) % width] & !&state[(k + 13) % width])
                 })
                 .collect();
         }
@@ -4141,21 +5282,44 @@ fn a_loop_over_more_states_than_a_kernel_binds_steps_with_its_results_in_buffers
     let n = 50;
     let width = 30usize;
     let steps = 6;
-    let init: Vec<Vec<u32>> = (0..width as u32).map(|k| (0..n as u32).map(|i| i.wrapping_mul(2654435761).wrapping_add(k * 40503)).collect()).collect();
+    let init: Vec<Vec<u32>> = (0..width as u32)
+        .map(|k| {
+            (0..n as u32)
+                .map(|i| i.wrapping_mul(2654435761).wrapping_add(k * 40503))
+                .collect()
+        })
+        .collect();
     for limit in [8, 20, 45] {
         let ctx = ctx();
         ctx.jit().set_max_inputs(limit);
-        let arrays: Vec<Array<u32>> = init.iter().map(|d| Array::from_slice_on(&ctx, d, n).unwrap()).collect();
+        let arrays: Vec<Array<u32>> = init
+            .iter()
+            .map(|d| Array::from_slice_on(&ctx, d, n).unwrap())
+            .collect();
         // The initial state is itself the result of a group with too many outputs.
-        let state: Vec<Array<u32>> = arrays.iter().enumerate().map(|(k, a)| a ^ &arrays[(k + 3) % width]).collect();
+        let state: Vec<Array<u32>> = arrays
+            .iter()
+            .enumerate()
+            .map(|(k, a)| a ^ &arrays[(k + 3) % width])
+            .collect();
         let refs: Vec<&Array<u32>> = state.iter().collect();
         crate::eval_all(&refs).unwrap();
-        let mut expected: Vec<Vec<u32>> = (0..width).map(|k| (0..n).map(|i| init[k][i] ^ init[(k + 3) % width][i]).collect()).collect();
+        let mut expected: Vec<Vec<u32>> = (0..width)
+            .map(|k| {
+                (0..n)
+                    .map(|i| init[k][i] ^ init[(k + 3) % width][i])
+                    .collect()
+            })
+            .collect();
         for _ in 0..steps {
             let old = expected.clone();
             for k in 0..width {
                 for i in 0..n {
-                    let (a, b, c) = (old[(k + 1) % width][i], old[(k + 7) % width][i], old[(k + 13) % width][i]);
+                    let (a, b, c) = (
+                        old[(k + 1) % width][i],
+                        old[(k + 7) % width][i],
+                        old[(k + 13) % width][i],
+                    );
                     expected[k][i] = old[k][i] ^ a.rotate_left(1) ^ (b & !c);
                 }
             }
@@ -4168,7 +5332,11 @@ fn a_loop_over_more_states_than_a_kernel_binds_steps_with_its_results_in_buffers
             })
         });
         for (k, array) in out.iter().enumerate() {
-            assert_eq!(array.to_vec().unwrap(), expected[k], "limit {limit}, state {k}");
+            assert_eq!(
+                array.to_vec().unwrap(),
+                expected[k],
+                "limit {limit}, state {k}"
+            );
         }
     }
 }
@@ -4196,7 +5364,8 @@ fn shape_program(ctx: &Context, shape: impl Into<crate::Shape>) {
     let across = Array::<f32>::range_on(ctx, shape, last).unwrap();
     let expr = x.shift(all) * 2.0 + x.shift(first) + along * 0.25 - across * 0.5;
     let at = |c: [usize; 4], by: [isize; 4]| -> f32 {
-        let from: [usize; 4] = std::array::from_fn(|a| (c[a] as isize - by[a]).rem_euclid(dims[a] as isize) as usize);
+        let from: [usize; 4] =
+            std::array::from_fn(|a| (c[a] as isize - by[a]).rem_euclid(dims[a] as isize) as usize);
         xs[from.iter().zip(&strides).map(|(c, s)| c * s).sum::<usize>()]
     };
     let want: Vec<f32> = (0..n)
@@ -4210,14 +5379,27 @@ fn shape_program(ctx: &Context, shape: impl Into<crate::Shape>) {
     // Views: a slice and a flipped slice of the first axis, and a pad of every edge kind.
     let lines = n / dims[0];
     let per_line = |width: usize, read: &dyn Fn(usize) -> Option<usize>| -> Vec<f32> {
-        (0..lines).flat_map(|l| (0..width).map(move |k| (l, k))).map(|(l, k)| read(k).map_or(0.0, |a| xs[l * dims[0] + a])).collect()
+        (0..lines)
+            .flat_map(|l| (0..width).map(move |k| (l, k)))
+            .map(|(l, k)| read(k).map_or(0.0, |a| xs[l * dims[0] + a]))
+            .collect()
     };
     let got = (x.slice(0, 1..dims[0] - 1) * 3.0 + 1.0).to_vec().unwrap();
     let want = per_line(dims[0] - 2, &|k| Some(k + 1));
-    assert_close(&got, &want.iter().map(|v| v * 3.0 + 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+    assert_close(
+        &got,
+        &want.iter().map(|v| v * 3.0 + 1.0).collect::<Vec<_>>(),
+        1e-5,
+        1e-5,
+    );
     let got = (x.flip(0).slice(0, 2..) - 0.5).to_vec().unwrap();
     let want = per_line(dims[0] - 2, &|k| Some(dims[0] - 1 - (k + 2)));
-    assert_close(&got, &want.iter().map(|v| v - 0.5).collect::<Vec<_>>(), 1e-5, 1e-5);
+    assert_close(
+        &got,
+        &want.iter().map(|v| v - 0.5).collect::<Vec<_>>(),
+        1e-5,
+        1e-5,
+    );
     let len = dims[0] as isize;
     for mode in [PadMode::Edge, PadMode::Mirror, PadMode::Wrap, PadMode::Zero] {
         let got = (x.pad([(1, 2)], mode) * 1.5).to_vec().unwrap();
@@ -4225,21 +5407,38 @@ fn shape_program(ctx: &Context, shape: impl Into<crate::Shape>) {
             let c = k as isize - 1;
             match mode {
                 PadMode::Edge => Some(c.clamp(0, len - 1) as usize),
-                PadMode::Mirror => Some((if c < 0 { -c - 1 } else if c >= len { 2 * len - 1 - c } else { c }).clamp(0, len - 1) as usize),
+                PadMode::Mirror => Some(
+                    (if c < 0 {
+                        -c - 1
+                    } else if c >= len {
+                        2 * len - 1 - c
+                    } else {
+                        c
+                    })
+                    .clamp(0, len - 1) as usize,
+                ),
                 PadMode::Wrap => Some(c.rem_euclid(len) as usize),
                 PadMode::Zero => (0..len).contains(&c).then_some(c as usize),
             }
         });
-        assert_close(&got, &want.iter().map(|v| v * 1.5).collect::<Vec<_>>(), 1e-5, 1e-5);
+        assert_close(
+            &got,
+            &want.iter().map(|v| v * 1.5).collect::<Vec<_>>(),
+            1e-5,
+            1e-5,
+        );
     }
     // A stencil of a lazy expression: its shifted reads come from a tile in workgroup memory
     // (circular shifts), whose extents are in the uniform.
     if dims[2] == 1 && dims[3] == 1 {
         let u = &x * 2.0 + 1.0;
-        let got = (u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) - &u * 3.0).to_vec().unwrap();
+        let got = (u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) - &u * 3.0)
+            .to_vec()
+            .unwrap();
         let hu: Vec<f32> = xs.iter().map(|v| v * 2.0 + 1.0).collect();
         let (w, h) = (dims[0] as isize, dims[1] as isize);
-        let read = |x: isize, y: isize| hu[x.rem_euclid(w) as usize + y.rem_euclid(h) as usize * dims[0]];
+        let read =
+            |x: isize, y: isize| hu[x.rem_euclid(w) as usize + y.rem_euclid(h) as usize * dims[0]];
         let want: Vec<f32> = (0..n)
             .map(|i| {
                 let (x, y) = ((i % dims[0]) as isize, (i / dims[0]) as isize);
@@ -4252,13 +5451,16 @@ fn shape_program(ctx: &Context, shape: impl Into<crate::Shape>) {
     // their composition, with the shift as one of the contexts of its lowering.
     if dims[2] == 1 && dims[3] == 1 {
         let u = &x * 3.0 - 1.0;
-        let got = (u.shift_clamp([1isize, -1]) + u.shift([0isize, 2]) * 0.5 + &u).to_vec().unwrap();
+        let got = (u.shift_clamp([1isize, -1]) + u.shift([0isize, 2]) * 0.5 + &u)
+            .to_vec()
+            .unwrap();
         let hu: Vec<f32> = xs.iter().map(|v| v * 3.0 - 1.0).collect();
         let (w, h) = (dims[0] as isize, dims[1] as isize);
         let want: Vec<f32> = (0..n)
             .map(|i| {
                 let (x, y) = ((i % dims[0]) as isize, (i / dims[0]) as isize);
-                let clamped = hu[(x - 1).clamp(0, w - 1) as usize + (y + 1).clamp(0, h - 1) as usize * dims[0]];
+                let clamped = hu
+                    [(x - 1).clamp(0, w - 1) as usize + (y + 1).clamp(0, h - 1) as usize * dims[0]];
                 let wrapped = hu[x as usize + (y - 2).rem_euclid(h) as usize * dims[0]];
                 clamped + wrapped * 0.5 + hu[i]
             })
@@ -4267,7 +5469,10 @@ fn shape_program(ctx: &Context, shape: impl Into<crate::Shape>) {
     }
     if dims[2] == 1 {
         let got = (x.transpose() + 1.0).to_vec().unwrap();
-        let want: Vec<f32> = (0..dims[0]).flat_map(|r| (0..dims[1]).map(move |c| (r, c))).map(|(r, c)| xs[r + c * dims[0]] + 1.0).collect();
+        let want: Vec<f32> = (0..dims[0])
+            .flat_map(|r| (0..dims[1]).map(move |c| (r, c)))
+            .map(|(r, c)| xs[r + c * dims[0]] + 1.0)
+            .collect();
         assert_close(&got, &want, 1e-5, 1e-5);
     }
 }
@@ -4282,7 +5487,11 @@ fn an_expression_on_another_shape_is_the_same_kernel() {
     assert!(first > 0);
     shape_program(&ctx, [100, 50]);
     shape_program(&ctx, [97, 1000]);
-    assert_eq!(ctx.jit().stats().built, first, "kernels built for two more 2-D shapes");
+    assert_eq!(
+        ctx.jit().stats().built,
+        first,
+        "kernels built for two more 2-D shapes"
+    );
     // A shape too small for a tile and its halo takes the tile's other form of wrapping, which
     // is the one kernel more; the results are right all the same.
     shape_program(&ctx, [7, 13]);
@@ -4290,13 +5499,21 @@ fn an_expression_on_another_shape_is_the_same_kernel() {
     let first = ctx.jit().stats().built;
     shape_program(&ctx, [210, 71, 24]);
     shape_program(&ctx, [7, 3, 11]);
-    assert_eq!(ctx.jit().stats().built, first, "kernels built for two more 3-D shapes");
+    assert_eq!(
+        ctx.jit().stats().built,
+        first,
+        "kernels built for two more 3-D shapes"
+    );
     // The same on a flat array.
     shape_program(&ctx, 5003);
     let flat = ctx.jit().stats().built;
     shape_program(&ctx, 4001);
     shape_program(&ctx, 9973);
-    assert_eq!(ctx.jit().stats().built, flat, "kernels built for two more 1-D shapes");
+    assert_eq!(
+        ctx.jit().stats().built,
+        flat,
+        "kernels built for two more 1-D shapes"
+    );
     shape_program(&ctx, 777);
 }
 
@@ -4311,16 +5528,22 @@ fn the_indices_of_a_wide_array_divide_exactly() {
     let rows = Array::<u32>::range_on(&ctx, [w, h], 1).unwrap();
     let cols = Array::<u32>::range_on(&ctx, [w, h], 0).unwrap();
     let got = (&rows * 7u32 + &cols).to_vec().unwrap();
-    let want: Vec<u32> = (0..w * h).map(|i| (i / w) as u32 * 7 + (i % w) as u32).collect();
+    let want: Vec<u32> = (0..w * h)
+        .map(|i| (i / w) as u32 * 7 + (i % w) as u32)
+        .collect();
     if let Some(i) = (0..w * h).find(|&i| got[i] != want[i]) {
         panic!("first mismatch at {i}: got {}, want {}", got[i], want[i]);
     }
 
     // A view whose output has more than 2^23 elements divides by a stride that is no power of two.
-    let flat = Array::<u32>::range_on(&ctx, w * h, 0).unwrap().reshape([w, h]);
+    let flat = Array::<u32>::range_on(&ctx, w * h, 0)
+        .unwrap()
+        .reshape([w, h]);
     let inner = flat.slice(0, 1..w - 1);
     assert!((w - 2) * h > 1 << 23);
     let got = (inner + 1u32).to_vec().unwrap();
-    let want: Vec<u32> = (0..(w - 2) * h).map(|i| ((i / (w - 2)) * w + i % (w - 2) + 1) as u32 + 1).collect();
+    let want: Vec<u32> = (0..(w - 2) * h)
+        .map(|i| ((i / (w - 2)) * w + i % (w - 2) + 1) as u32 + 1)
+        .collect();
     assert_eq!(got, want);
 }

@@ -57,9 +57,17 @@ impl Plan {
     /// Encodes every command with storage buffers replaced per `subst` (simultaneous, by `==`);
     /// dispatches come from `indirect` at byte offset `12 * l` for command `l` when given, else
     /// from the recorded workgroups.
-    pub(crate) fn replay(&self, subst: &[(Buffer, Buffer)], indirect: Option<&Buffer>) -> Result<()> {
+    pub(crate) fn replay(
+        &self,
+        subst: &[(Buffer, Buffer)],
+        indirect: Option<&Buffer>,
+    ) -> Result<()> {
         for (l, cmd) in self.cmds.iter().enumerate() {
-            cmd.encode(&self.ctx, subst, indirect.map(|buffer| (buffer, 12 * l as u64)))?;
+            cmd.encode(
+                &self.ctx,
+                subst,
+                indirect.map(|buffer| (buffer, 12 * l as u64)),
+            )?;
         }
         Ok(())
     }
@@ -94,6 +102,11 @@ pub(crate) struct Stepper {
     /// Keep every state buffer resident.
     #[allow(dead_code)]
     pins: Vec<Pin>,
+    #[allow(dead_code)]
+    pong_pins: Vec<Pin>,
+    /// Keep the initial state resident.
+    #[allow(dead_code)]
+    init_pins: Vec<Pin>,
     /// Keep the initial state alive.
     #[allow(dead_code)]
     inits: Vec<Arc<Storage>>,
@@ -113,17 +126,25 @@ impl Stepper {
         if plan.launches() == 0 || init.len() != probes.len() || init.len() != outs.len() {
             return Err(plan);
         }
-        let shaped = init.iter().zip(probes).zip(&outs).all(|((init, probe), out)| {
-            [init, probe, out].iter().all(|storage| storage.segments() == 1)
-                && init.byte_len() == probe.byte_len()
-                && init.byte_len() == out.byte_len()
-                && init.layout() == out.layout()
-        });
+        let shaped = init
+            .iter()
+            .zip(probes)
+            .zip(&outs)
+            .all(|((init, probe), out)| {
+                [init, probe, out]
+                    .iter()
+                    .all(|storage| storage.segments() == 1)
+                    && init.byte_len() == probe.byte_len()
+                    && init.byte_len() == out.byte_len()
+                    && init.layout() == out.layout()
+            });
         if !shaped {
             return Err(plan);
         }
-        let mut pins = Vec::with_capacity(4 * init.len());
-        let mut buffers = |storages: &[Arc<Storage>]| -> Option<Vec<Buffer>> {
+        let mut pins = Vec::with_capacity(2 * init.len());
+        let mut pong_pins = Vec::with_capacity(init.len());
+        let mut init_pins = Vec::with_capacity(init.len());
+        let buffers = |storages: &[Arc<Storage>], pins: &mut Vec<Pin>| -> Option<Vec<Buffer>> {
             storages
                 .iter()
                 .map(|storage| {
@@ -134,21 +155,31 @@ impl Stepper {
                 })
                 .collect()
         };
-        let (Some(init_buffers), Some(probe_buffers), Some(ping_buffers)) = (buffers(init), buffers(probes), buffers(&outs))
-        else {
+        let (Some(init_buffers), Some(probe_buffers), Some(ping_buffers)) = (
+            buffers(init, &mut init_pins),
+            buffers(probes, &mut pins),
+            buffers(&outs, &mut pins),
+        ) else {
             return Err(plan);
         };
         let distinct = ping_buffers.iter().enumerate().all(|(j, out)| {
             plan.writes(out)
                 && ping_buffers[..j].iter().all(|other| other != out)
-                && init_buffers.iter().chain(&probe_buffers).all(|other| other != out)
+                && init_buffers
+                    .iter()
+                    .chain(&probe_buffers)
+                    .all(|other| other != out)
         });
         if !distinct || probe_buffers.iter().any(|probe| plan.writes(probe)) {
             return Err(plan);
         }
-        let pong: Vec<Arc<Storage>> =
-            outs.iter().map(|out| Arc::new(Storage::new(ctx, out.len(), out.layout()))).collect();
-        let Some(pong_buffers) = buffers(&pong) else { return Err(plan) };
+        let pong: Vec<Arc<Storage>> = outs
+            .iter()
+            .map(|out| Arc::new(Storage::new(ctx, out.len(), out.layout())))
+            .collect();
+        let Some(pong_buffers) = buffers(&pong, &mut pong_pins) else {
+            return Err(plan);
+        };
         Ok(Stepper {
             plan,
             init: init_buffers,
@@ -158,8 +189,48 @@ impl Stepper {
             ping_buffers,
             pong_buffers,
             pins,
+            pong_pins,
+            init_pins,
             inits: init.to_vec(),
         })
+    }
+
+    /// Points the first step at a new initial state. `false` (nothing changed) unless `init`
+    /// matches the state this stepper was made for and shares no buffer with the buffers the
+    /// plan writes or reads as probes.
+    pub(crate) fn rebind(&mut self, init: &[Arc<Storage>]) -> bool {
+        if init.len() != self.probes.len() {
+            return false;
+        }
+        let shaped = init.iter().zip(&self.ping).all(|(init, ping)| {
+            init.segments() == 1
+                && init.byte_len() == ping.byte_len()
+                && init.layout() == ping.layout()
+        });
+        if !shaped {
+            return false;
+        }
+        let mut pins = Vec::with_capacity(init.len());
+        let mut buffers = Vec::with_capacity(init.len());
+        for storage in init {
+            let Ok(pin) = storage.pin_quiet(0) else {
+                return false;
+            };
+            buffers.push(pin.buffer().clone());
+            pins.push(pin);
+        }
+        let aliased = buffers.iter().any(|b| {
+            self.ping_buffers.contains(b)
+                || self.pong_buffers.contains(b)
+                || self.probes.contains(b)
+        });
+        if aliased {
+            return false;
+        }
+        self.init = buffers;
+        self.init_pins = pins;
+        self.inits = init.to_vec();
+        true
     }
 
     pub(crate) fn plan(&self) -> &Plan {
@@ -187,6 +258,36 @@ impl Stepper {
     pub(crate) fn state_after(&self, t: usize) -> &[Arc<Storage>] {
         if t % 2 == 1 { &self.ping } else { &self.pong }
     }
+
+    /// Detaches and returns the state after an even number of steps (`pong`) by replacing `pong`
+    /// with fresh pooled storages, avoiding any GPU copy kernel; `None` when `t` is odd (`ping`
+    /// is baked into the recorded plan).
+    pub(crate) fn detach_even(&mut self, ctx: &Context, t: usize) -> Option<Vec<Arc<Storage>>> {
+        if !t.is_multiple_of(2) {
+            return None;
+        }
+        let next: Vec<Arc<Storage>> = self
+            .ping
+            .iter()
+            .map(|out| Arc::new(Storage::new(ctx, out.len(), out.layout())))
+            .collect();
+        let mut pins = Vec::with_capacity(next.len());
+        let mut buffers = Vec::with_capacity(next.len());
+        for storage in &next {
+            let pin = storage.pin_quiet(0).ok()?;
+            buffers.push(pin.buffer().clone());
+            pins.push(pin);
+        }
+        if buffers
+            .iter()
+            .any(|b| self.ping_buffers.contains(b) || self.probes.contains(b))
+        {
+            return None;
+        }
+        self.pong_buffers = buffers;
+        self.pong_pins = pins;
+        Some(std::mem::replace(&mut self.pong, next))
+    }
 }
 
 /// The tracing of one step of a loop: probes standing for the initial state, and the recording
@@ -207,7 +308,9 @@ impl Trace {
     /// recorded, and replayed at every step, although it has to run once, and it may read buffers
     /// that the replayed step overwrites (`y = &x * 2.0; x += 1.0` in the step) or take over its
     /// operand's buffer.
-    pub(crate) fn start<T: GpuType>(init: &[&Array<T>]) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
+    pub(crate) fn start<T: GpuType>(
+        init: &[&Array<T>],
+    ) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
         let (mut trace, probes) = Trace::prepare(init)?;
         trace.begin()?;
         Ok((trace, probes))
@@ -215,7 +318,9 @@ impl Trace {
 
     /// [`Trace::start`] without starting the recording: the caller may launch for real first
     /// (see `jit::Attempt`) and then [`Trace::begin`] it.
-    pub(crate) fn prepare<T: GpuType>(init: &[&Array<T>]) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
+    pub(crate) fn prepare<T: GpuType>(
+        init: &[&Array<T>],
+    ) -> std::result::Result<(Trace, Vec<Array<T>>), Failure> {
         let ctx = init[0].context().clone();
         ctx.jit().evaluate_held();
         let mut storages = Vec::with_capacity(init.len());
@@ -227,11 +332,24 @@ impl Trace {
             probe_storages.push(Arc::clone(probe.storage()?));
             probes.push(probe);
         }
-        Ok((Trace { ctx, init: storages, probe_storages, recording: false }, probes))
+        Ok((
+            Trace {
+                ctx,
+                init: storages,
+                probe_storages,
+                recording: false,
+            },
+            probes,
+        ))
     }
 
     pub(crate) fn begin(&mut self) -> std::result::Result<(), Failure> {
-        let seed: Vec<_> = self.init.iter().cloned().zip(self.probe_storages.iter().cloned()).collect();
+        let seed: Vec<_> = self
+            .init
+            .iter()
+            .cloned()
+            .zip(self.probe_storages.iter().cloned())
+            .collect();
         self.recording = self.ctx.begin_recording(seed.clone());
         if !self.recording {
             for (from, to) in &seed {
@@ -250,7 +368,11 @@ impl Trace {
     /// Stops recording without a plan (nothing was launched).
     pub(crate) fn pause(&mut self) {
         if std::mem::take(&mut self.recording) {
-            drop(self.ctx.end_recording().map(|recording| Plan::new(&self.ctx, recording)));
+            drop(
+                self.ctx
+                    .end_recording()
+                    .map(|recording| Plan::new(&self.ctx, recording)),
+            );
         }
     }
 
@@ -268,7 +390,9 @@ impl Trace {
         stepable: bool,
     ) -> std::result::Result<Option<Stepper>, Failure> {
         let outs = force(results)?;
-        let Some(plan) = self.finish_plan() else { return Ok(None) };
+        let Some(plan) = self.finish_plan() else {
+            return Ok(None);
+        };
         let stepper = if stepable {
             Stepper::new(&self.ctx, plan, &self.init, &self.probe_storages, outs)
         } else {
@@ -287,7 +411,9 @@ impl Trace {
     /// by the caller (`None`: aborted, everything already ran).
     pub(crate) fn finish_plan(&mut self) -> Option<Plan> {
         if std::mem::take(&mut self.recording) {
-            self.ctx.end_recording().map(|recording| Plan::new(&self.ctx, recording))
+            self.ctx
+                .end_recording()
+                .map(|recording| Plan::new(&self.ctx, recording))
         } else {
             None
         }
@@ -301,7 +427,9 @@ impl Drop for Trace {
 }
 
 /// Evaluates `arrays` (pending ones of one length in one fused kernel) and returns their storages.
-pub(crate) fn force<T: GpuType>(arrays: &[&Array<T>]) -> std::result::Result<Vec<Arc<Storage>>, Failure> {
+pub(crate) fn force<T: GpuType>(
+    arrays: &[&Array<T>],
+) -> std::result::Result<Vec<Arc<Storage>>, Failure> {
     let mut groups: Vec<(usize, Vec<Arc<Node>>)> = Vec::new();
     for node in arrays.iter().filter_map(|array| array.pending()) {
         match groups.iter_mut().find(|(len, _)| *len == node.len()) {
@@ -312,5 +440,8 @@ pub(crate) fn force<T: GpuType>(arrays: &[&Array<T>]) -> std::result::Result<Vec
     for (_, nodes) in &groups {
         super::evaluate_group(nodes);
     }
-    arrays.iter().map(|array| array.storage().map(Arc::clone)).collect()
+    arrays
+        .iter()
+        .map(|array| array.storage().map(Arc::clone))
+        .collect()
 }

@@ -29,8 +29,8 @@ use crate::gpu::hash::FxMap;
 use crate::profile::SplitReason;
 use crate::tuning::Tuning;
 
-use super::cost::{kernel_ns_on, op_weight, CostModel};
-use super::program::{shape_of, FusedKey, Instr, Ref, Tail};
+use super::cost::{CostModel, kernel_ns_on, op_weight};
+use super::program::{FusedKey, Instr, Ref, Tail, shape_of};
 use super::staging::{self, Staging};
 use super::{Edge, Gen, Op, OpKind, ShiftKind, ViewMap};
 
@@ -85,12 +85,22 @@ pub(crate) struct Inlined {
     /// The operations of the lowered program in f32-operation units (see [`op_weight`]) per
     /// element, those of a branch weighted by the share of elements that compute it.
     pub(crate) ops: f64,
+    /// Per lowered instruction that reads a staged sub-program (see [`Staging`]), the offset
+    /// of the cell it reads from the cell of its program (the starts of the translation views
+    /// on the way, and of the read itself), which the source bakes in. Empty when the offsets
+    /// are still in the views (the key is not [parameterized](super::params::apply_staging)).
+    pub(crate) staged_reads: Vec<Option<[i32; 2]>>,
 }
 
 /// Lowered programs are equal when the code generated from them is: `ops` only weighs them.
 impl PartialEq for Inlined {
     fn eq(&self, other: &Self) -> bool {
-        self.ctxs == other.ctxs && self.instrs == other.instrs && self.main == other.main && self.region == other.region && self.branch == other.branch
+        self.ctxs == other.ctxs
+            && self.instrs == other.instrs
+            && self.main == other.main
+            && self.region == other.region
+            && self.branch == other.branch
+            && self.staged_reads == other.staged_reads
     }
 }
 
@@ -103,13 +113,14 @@ impl std::hash::Hash for Inlined {
         self.main.hash(state);
         self.region.hash(state);
         self.branch.hash(state);
+        self.staged_reads.hash(state);
     }
 }
 
 /// Staged sub-programs of one level over the same region, lowered together: they run in one loop
 /// and an instruction that several of them compute (the wave speeds the four fields of a flux
 /// share) is one instruction.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct StagedGroup {
     /// Indices into [`Staging::subs`] of the sub-programs of the group.
     pub(crate) members: Vec<usize>,
@@ -120,7 +131,7 @@ pub(crate) struct StagedGroup {
 
 /// A key lowered for a workgroup-staged kernel: the main program and the staged sub-programs
 /// in groups (in the order of [`Staging::subs`]), each lowered at its own cell.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct StagedPrograms {
     pub(crate) main: Inlined,
     pub(crate) groups: Vec<StagedGroup>,
@@ -133,8 +144,43 @@ impl StagedPrograms {
     }
 }
 
+impl Inlined {
+    /// How far the cell of context `c` is from the cell of the program: the starts of the
+    /// translation views on the way (what `staging` lets a staged read be through).
+    pub(crate) fn translation(&self, mut c: u32) -> [i32; 2] {
+        let mut offset = [0, 0];
+        while c != 0 {
+            let Some(ctx) = self.ctxs.get(c as usize) else {
+                break;
+            };
+            if let ShiftKind::View { map, .. } = ctx.kind {
+                offset[0] += map.axes[0].start;
+                offset[1] += map.axes[1].start;
+            }
+            c = ctx.parent;
+        }
+        offset
+    }
+
+    /// The [`Inlined::staged_reads`] of this program under `staging`, from its views.
+    pub(crate) fn staged_offsets(&self, staging: &Staging) -> Vec<Option<[i32; 2]>> {
+        self.instrs
+            .iter()
+            .map(|flat| match (flat.op.kind, flat.args[0]) {
+                (OpKind::Shift(ShiftKind::View { map, .. }), Ref::Sub(s))
+                    if staging.find(s).is_some() =>
+                {
+                    let base = self.translation(flat.at);
+                    Some([map.axes[0].start + base[0], map.axes[1].start + base[1]])
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// How a kernel's source is generated from its key.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Lowered {
     /// Sub-programs written out at every index they are read at.
     Plain(Inlined),
@@ -148,7 +194,10 @@ pub(crate) enum Verdict {
     Fits(Inlined),
     /// The lowered program has more instructions than allowed; evaluating sub-program `sub` first
     /// (reading its buffer instead of recomputing it) is what saves the most.
-    TooBig { sub: u32, instructions: usize },
+    TooBig {
+        sub: u32,
+        instructions: usize,
+    },
 }
 
 struct Lowering<'a> {
@@ -170,7 +219,14 @@ struct Lowering<'a> {
 
 impl<'a> Lowering<'a> {
     fn new(subs: &'a [Vec<Instr>], staged: &'a [bool], cap: usize) -> Lowering<'a> {
-        let placeholder = Ctx { parent: 0, kind: ShiftKind::Dims { dims: [1; 4], shifts: [0; 4] }, args: [Ref::Unused; 2] };
+        let placeholder = Ctx {
+            parent: 0,
+            kind: ShiftKind::Dims {
+                dims: [1; 4],
+                shifts: [0; 4],
+            },
+            args: [Ref::Unused; 2],
+        };
         Lowering {
             subs,
             staged,
@@ -198,6 +254,7 @@ impl<'a> Lowering<'a> {
             region: found.region,
             branch: found.branch,
             ops: found.ops,
+            staged_reads: Vec::new(),
         }
     }
 }
@@ -205,7 +262,11 @@ impl<'a> Lowering<'a> {
 /// The weight of a lowered instruction in f32-operation units; with `staged_reads`, a read of a
 /// sub-program (staged in workgroup memory) is an index and a workgroup load.
 fn flat_weight(flat: &Flat, cost: &CostModel, staged_reads: bool) -> f64 {
-    if staged_reads && matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(flat.op, cost) }
+    if staged_reads && matches!(flat.args[0], Ref::Sub(_)) {
+        2.0
+    } else {
+        op_weight(flat.op, cost)
+    }
 }
 
 /// What the least a branch must save, in f32-operation units per element that reaches the `Select`
@@ -228,9 +289,16 @@ fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> f64 {
     let cells = |dims: [u32; 4]| dims.iter().map(|&d| f64::from(d)).product::<f64>();
     if let Ref::Tmp(value) = select.args[1]
         && let Some(taken) = flats.get(value as usize)
-        && let Some(Ctx { kind: ShiftKind::View { map, .. }, .. }) = ctxs.get(taken.at as usize)
+        && let Some(Ctx {
+            kind: ShiftKind::View { map, .. },
+            ..
+        }) = ctxs.get(taken.at as usize)
     {
-        return if cells(map.out) == 0.0 { 1.0 } else { (cells(map.src) / cells(map.out)).clamp(1.0 / 4096.0, 1.0) };
+        return if cells(map.out) == 0.0 {
+            1.0
+        } else {
+            (cells(map.src) / cells(map.out)).clamp(1.0 / 4096.0, 1.0)
+        };
     }
     0.5
 }
@@ -246,9 +314,18 @@ fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> f64 {
 /// selects: each is judged by the elements that get to it, not by all of them). Those
 /// instructions are computed inside the branch. The weighted operation count of the program counts
 /// them by the share of elements that take it.
-fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, staged_reads: bool) -> Branches {
+fn branches(
+    flats: &[Flat],
+    ctxs: &[Ctx],
+    roots: &[u32],
+    cost: &CostModel,
+    staged_reads: bool,
+) -> Branches {
     let n = flats.len();
-    let weight: Vec<f64> = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).collect();
+    let weight: Vec<f64> = flats
+        .iter()
+        .map(|flat| flat_weight(flat, cost, staged_reads))
+        .collect();
     let mut users: Vec<Vec<(u32, usize)>> = vec![Vec::new(); n];
     let mut pinned = vec![false; n];
     for (at, flat) in flats.iter().enumerate() {
@@ -278,14 +355,24 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
     let mut coordinates = vec![false; n];
     for (at, flat) in flats.iter().enumerate() {
         coordinates[at] = match flat.op.kind {
-            OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::ParamRange { .. }) => true,
-            OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
-                flat.args.iter().take(flat.op.kind.arity()).all(|arg| match *arg {
+            OpKind::Generate(
+                Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::ParamRange { .. },
+            ) => true,
+            OpKind::Unary(_)
+            | OpKind::Binary(_)
+            | OpKind::Compare(_)
+            | OpKind::Classify(_)
+            | OpKind::Cast(_)
+            | OpKind::Clamp
+            | OpKind::Select => flat
+                .args
+                .iter()
+                .take(flat.op.kind.arity())
+                .all(|arg| match *arg {
                     Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
                     Ref::Scalar(_) | Ref::Unused => true,
                     _ => false,
-                })
-            }
+                }),
             _ => false,
         };
     }
@@ -297,7 +384,16 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
                 && (matches!(flat.args[1], Ref::Tmp(_)) || matches!(flat.args[2], Ref::Tmp(_)))
         })
         .collect();
-    let share: Vec<f64> = flats.iter().map(|flat| if matches!(flat.op.kind, OpKind::Select) { taken_share(flats, ctxs, flat) } else { 1.0 }).collect();
+    let share: Vec<f64> = flats
+        .iter()
+        .map(|flat| {
+            if matches!(flat.op.kind, OpKind::Select) {
+                taken_share(flats, ctxs, flat)
+            } else {
+                1.0
+            }
+        })
+        .collect();
 
     let mut branch = candidate.clone();
     loop {
@@ -375,10 +471,16 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
                 r = parent(&region, r);
             }
         }
-        let useless: Vec<usize> = (0..n).filter(|&s| branch[s] && saved[s] < BRANCH_GAIN * chance[s]).collect();
+        let useless: Vec<usize> = (0..n)
+            .filter(|&s| branch[s] && saved[s] < BRANCH_GAIN * chance[s])
+            .collect();
         if useless.is_empty() {
             let ops = (0..n).map(|x| weight[x] * chance[x]).sum();
-            return Branches { region, branch, ops };
+            return Branches {
+                region,
+                branch,
+                ops,
+            };
         }
         for s in useless {
             branch[s] = false;
@@ -405,9 +507,20 @@ impl Lowering<'_> {
     /// parent.
     fn context(&mut self, mut parent: u32, mut kind: ShiftKind, args: [Ref; 2]) -> u32 {
         match kind {
-            ShiftKind::View { mut map, edge: Edge::None } => {
+            ShiftKind::View {
+                mut map,
+                edge: Edge::None,
+            } => {
                 while parent != 0
-                    && let Some(&Ctx { parent: grand, kind: ShiftKind::View { map: outer, edge: Edge::None }, .. }) = self.ctxs.get(parent as usize)
+                    && let Some(&Ctx {
+                        parent: grand,
+                        kind:
+                            ShiftKind::View {
+                                map: outer,
+                                edge: Edge::None,
+                            },
+                        ..
+                    }) = self.ctxs.get(parent as usize)
                     && outer.src == map.out
                 {
                     let composed = map.then(&outer);
@@ -419,9 +532,15 @@ impl Lowering<'_> {
                 if map == ViewMap::identity(map.src) {
                     return parent;
                 }
-                kind = ShiftKind::View { map, edge: Edge::None };
+                kind = ShiftKind::View {
+                    map,
+                    edge: Edge::None,
+                };
             }
-            ShiftKind::Dims { shifts: [0, 0, 0, 0], .. } => return parent,
+            ShiftKind::Dims {
+                shifts: [0, 0, 0, 0],
+                ..
+            } => return parent,
             _ => {}
         }
         let key = (parent, kind, args);
@@ -440,7 +559,9 @@ impl Lowering<'_> {
             return found;
         }
         let subs = self.subs;
-        let Some(program) = subs.get(s as usize) else { return 0 };
+        let Some(program) = subs.get(s as usize) else {
+            return 0;
+        };
         if let Some(count) = self.count.get_mut(s as usize) {
             *count += 1;
         }
@@ -472,7 +593,12 @@ impl Lowering<'_> {
                         // Read from workgroup memory at the cell the context stands for (a
                         // translation of the cell of the program, see `staging`): equal reads
                         // are one instruction.
-                        let flat = Flat { op: instr.op, args: [source, b, Ref::Unused], at: ctx, child: 0 };
+                        let flat = Flat {
+                            op: instr.op,
+                            args: [source, b, Ref::Unused],
+                            at: ctx,
+                            child: 0,
+                        };
                         let value = self.push(flat);
                         local.push(value);
                         continue;
@@ -480,22 +606,46 @@ impl Lowering<'_> {
                     let context_args = match kind {
                         ShiftKind::Linear => [b, c],
                         ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } => [b, Ref::Unused],
-                        ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } => [Ref::Unused; 2],
+                        ShiftKind::View { .. }
+                        | ShiftKind::ParamView { .. }
+                        | ShiftKind::Dims { .. }
+                        | ShiftKind::ParamDims { .. } => [Ref::Unused; 2],
                     };
                     let child = self.context(ctx, kind, context_args);
                     match source {
                         Ref::Sub(s) => {
                             let value = self.instance(s, child);
-                            if matches!(kind, ShiftKind::View { edge: Edge::Fill, .. }) {
-                                self.push(Flat { op: instr.op, args: [Ref::Tmp(value), b, Ref::Unused], at: ctx, child })
+                            if matches!(
+                                kind,
+                                ShiftKind::View {
+                                    edge: Edge::Fill,
+                                    ..
+                                }
+                            ) {
+                                self.push(Flat {
+                                    op: instr.op,
+                                    args: [Ref::Tmp(value), b, Ref::Unused],
+                                    at: ctx,
+                                    child,
+                                })
                             } else {
                                 value
                             }
                         }
-                        other => self.push(Flat { op: instr.op, args: [rewrite(other, &local), b, c], at: ctx, child }),
+                        other => self.push(Flat {
+                            op: instr.op,
+                            args: [rewrite(other, &local), b, c],
+                            at: ctx,
+                            child,
+                        }),
                     }
                 }
-                _ => self.push(Flat { op: instr.op, args, at: ctx, child: 0 }),
+                _ => self.push(Flat {
+                    op: instr.op,
+                    args,
+                    at: ctx,
+                    child: 0,
+                }),
             };
             local.push(value);
         }
@@ -508,8 +658,20 @@ impl Lowering<'_> {
 fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
     let value = |at: u32| main.get(at as usize).copied();
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } | Tail::Matmul { .. } | Tail::Radix(_) | Tail::Solve(_) => key.outputs.iter().filter_map(|&at| value(at)).collect(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => key.outputs.iter().take(2).filter_map(|&at| value(at)).collect(),
+        Tail::Store
+        | Tail::StoreMapped(_)
+        | Tail::ParamStoreMapped { .. }
+        | Tail::Stack { .. }
+        | Tail::ParamStack { .. }
+        | Tail::Matmul { .. }
+        | Tail::Radix(_)
+        | Tail::Solve(_) => key.outputs.iter().filter_map(|&at| value(at)).collect(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => key
+            .outputs
+            .iter()
+            .take(2)
+            .filter_map(|&at| value(at))
+            .collect(),
         Tail::Reduce(_) | Tail::AxisReduce(_) => main.last().copied().into_iter().collect(),
     }
 }
@@ -524,10 +686,16 @@ pub(crate) fn inline(key: &FusedKey, cap: usize, cost: &CostModel) -> Verdict {
         let sub = (0..key.subs.len())
             .max_by_key(|&s| {
                 let length = key.subs[s].len() as u64;
-                (u64::from(lowering.count[s].saturating_sub(1)) * length, length)
+                (
+                    u64::from(lowering.count[s].saturating_sub(1)) * length,
+                    length,
+                )
             })
             .unwrap_or(0);
-        return Verdict::TooBig { sub: u32::try_from(sub).unwrap_or(u32::MAX), instructions: lowering.instrs.len() };
+        return Verdict::TooBig {
+            sub: u32::try_from(sub).unwrap_or(u32::MAX),
+            instructions: lowering.instrs.len(),
+        };
     }
     let roots = key_roots(key, &main);
     Verdict::Fits(lowering.finish(main, roots, cost))
@@ -555,7 +723,14 @@ fn lower_program(
 
 /// Lowers the sub-programs of `members` (entries of `staging`) together at their own cell, with the
 /// reads of staged sub-programs left for workgroup memory. `None` past `cap` instructions.
-fn lower_group(key: &FusedKey, staging: &Staging, staged: &[bool], members: &[usize], cap: usize, cost: &CostModel) -> Option<StagedGroup> {
+fn lower_group(
+    key: &FusedKey,
+    staging: &Staging,
+    staged: &[bool],
+    members: &[usize],
+    cap: usize,
+    cost: &CostModel,
+) -> Option<StagedGroup> {
     let mut lowering = Lowering::new(&key.subs, staged, cap);
     let mut values = Vec::with_capacity(members.len());
     for &member in members {
@@ -566,25 +741,40 @@ fn lower_group(key: &FusedKey, staging: &Staging, staged: &[bool], members: &[us
         return None;
     }
     let body = lowering.finish(Vec::new(), values.clone(), cost);
-    Some(StagedGroup { members: members.to_vec(), values, body })
+    Some(StagedGroup {
+        members: members.to_vec(),
+        values,
+        body,
+    })
 }
 
 /// Lowers the main program of `key` and every sub-program `staging` stages, each at its own
 /// cell, with the reads of staged sub-programs left for workgroup memory. The sub-programs of
 /// one level over the same region are lowered together (see [`StagedGroup`]), apart if together
 /// they have more than `cap` instructions. `None` if any program has more than `cap`.
-pub(crate) fn lower_staged(key: &FusedKey, staging: &Staging, cap: usize, cost: &CostModel) -> Option<StagedPrograms> {
+pub(crate) fn lower_staged(
+    key: &FusedKey,
+    staging: &Staging,
+    cap: usize,
+    cost: &CostModel,
+) -> Option<StagedPrograms> {
     let mut staged = vec![false; key.subs.len()];
     for entry in &staging.subs {
         *staged.get_mut(entry.sub as usize)? = true;
     }
-    let main = lower_program(&key.subs, &key.instrs, &staged, cap, cost, |main| key_roots(key, main))?;
+    let main = lower_program(&key.subs, &key.instrs, &staged, cap, cost, |main| {
+        key_roots(key, main)
+    })?;
     let mut groups = Vec::new();
     for level in staging.levels.windows(2) {
         let mut by_region: Vec<Vec<usize>> = Vec::new();
         for member in level[0] as usize..level[1] as usize {
             let own = staging.subs.get(member)?;
-            match by_region.iter_mut().find(|found| staging.subs.get(found[0]).is_some_and(|first| (first.dims, first.lo, first.hi) == (own.dims, own.lo, own.hi))) {
+            match by_region.iter_mut().find(|found| {
+                staging.subs.get(found[0]).is_some_and(|first| {
+                    (first.dims, first.lo, first.hi) == (own.dims, own.lo, own.hi)
+                })
+            }) {
                 Some(found) => found.push(member),
                 None => by_region.push(vec![member]),
             }
@@ -645,11 +835,25 @@ fn input_bytes(key: &FusedKey, refs: impl Iterator<Item = Ref>) -> f64 {
 /// Bytes per element the program writes: every output of a store, the value of a scatter,
 /// nothing for a reduction (its partial sums are negligible).
 fn output_bytes(key: &FusedKey) -> f64 {
-    let bytes = |index: &u32| key.instrs.get(*index as usize).map_or(0.0, |instr| instr.op.out_ty().traffic());
+    let bytes = |index: &u32| {
+        key.instrs
+            .get(*index as usize)
+            .map_or(0.0, |instr| instr.op.out_ty().traffic())
+    };
     match key.tail {
-        Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } | Tail::Stack { .. } => key.outputs.iter().map(bytes).sum(),
-        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => key.outputs.first().map_or(0.0, bytes),
-        Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_) | Tail::Radix(_) | Tail::Solve(_) => 0.0,
+        Tail::Store
+        | Tail::StoreMapped(_)
+        | Tail::ParamStoreMapped { .. }
+        | Tail::Stack { .. }
+        | Tail::ParamStack { .. } => key.outputs.iter().map(bytes).sum(),
+        Tail::Scatter { .. } | Tail::ParamScatter { .. } | Tail::ScatterAdd { .. } => {
+            key.outputs.first().map_or(0.0, bytes)
+        }
+        Tail::Reduce(_)
+        | Tail::Matmul { .. }
+        | Tail::AxisReduce(_)
+        | Tail::Radix(_)
+        | Tail::Solve(_) => 0.0,
     }
 }
 
@@ -663,7 +867,9 @@ fn sub_len(key: &FusedKey, s: u32, len: usize) -> f64 {
             return match kind {
                 ShiftKind::View { map, .. } => map.src.iter().map(|&d| f64::from(d)).product(),
                 ShiftKind::Take { len } => f64::from(len),
-                ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamDims { .. } => len as f64,
+                ShiftKind::ParamView { .. }
+                | ShiftKind::ParamTake { .. }
+                | ShiftKind::ParamDims { .. } => len as f64,
                 ShiftKind::Dims { dims, .. } => dims.iter().map(|&d| f64::from(d)).product(),
                 ShiftKind::Linear => len as f64,
             };
@@ -674,10 +880,20 @@ fn sub_len(key: &FusedKey, s: u32, len: usize) -> f64 {
 
 /// The workgroup staging of `key` and its lowered programs, if it has one within `cap`
 /// instructions per program.
-fn stage(key: &FusedKey, cap: usize, cost: &CostModel, tuning: &Tuning) -> Option<(Staging, StagedPrograms)> {
+fn stage(
+    key: &FusedKey,
+    cap: usize,
+    cost: &CostModel,
+    tuning: &Tuning,
+) -> Option<(Staging, StagedPrograms)> {
     let found = staging::candidates(key)?;
     // A staged value is a register value, one word of workgroup memory for a `bool` too.
-    let bytes = |s: u32| key.subs.get(s as usize).and_then(|program| program.last()).map_or(4, |instr| instr.op.out_ty().stride());
+    let bytes = |s: u32| {
+        key.subs
+            .get(s as usize)
+            .and_then(|program| program.last())
+            .map_or(4, |instr| instr.op.out_ty().stride())
+    };
     let staging = staging::plan(&found, tuning, bytes)?;
     let programs = lower_staged(key, &staging, cap, cost)?;
     Some((staging, programs))
@@ -687,9 +903,21 @@ fn stage(key: &FusedKey, cap: usize, cost: &CostModel, tuning: &Tuning) -> Optio
 /// `elements` output cells: the main program at every cell, a staged sub-program at every cell of
 /// its region rounded up to whole rounds of the workgroup (and a store and a load of the value,
 /// counted as 4 operations).
-fn staged_time(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, elements: f64, cost: &CostModel) -> f64 {
+fn staged_time(
+    key: &FusedKey,
+    staging: &Staging,
+    programs: &StagedPrograms,
+    elements: f64,
+    cost: &CostModel,
+) -> f64 {
     let all = programs.bodies();
-    let reads = all.flat_map(|lowered| lowered.instrs.iter().flat_map(|flat| flat.args).chain(lowered.ctxs.iter().flat_map(|ctx| ctx.args)));
+    let reads = all.flat_map(|lowered| {
+        lowered
+            .instrs
+            .iter()
+            .flat_map(|flat| flat.args)
+            .chain(lowered.ctxs.iter().flat_map(|ctx| ctx.args))
+    });
     let io_bytes = elements * (input_bytes(key, reads) + output_bytes(key));
     // The workgroup computes the region in rounds of one cell per invocation, and a round costs
     // the same however few invocations have a cell left in it: a region of 272 cells over 256
@@ -706,7 +934,12 @@ fn staged_time(key: &FusedKey, staging: &Staging, programs: &StagedPrograms, ele
         .sum();
     let staged_ops = f64::from(staging.tiles()) * per_tile;
     let invocations = f64::from(staging.tiles()) * f64::from(super::stencil::WORKGROUP);
-    kernel_ns_on(cost, io_bytes, programs.main.ops * elements + staged_ops, invocations)
+    kernel_ns_on(
+        cost,
+        io_bytes,
+        programs.main.ops * elements + staged_ops,
+        invocations,
+    )
 }
 
 /// How much cheaper a staged kernel must be estimated than the one it replaces to be chosen.
@@ -751,7 +984,11 @@ const UNFIT_NS: f64 = 1e15;
 /// program as one kernel (estimated `run`): [`MATERIALISE_MARGIN`] times cheaper, or cheaper
 /// at all if the program does not fit.
 fn pays(t: f64, run: f64) -> bool {
-    if run >= UNFIT_NS { t < run } else { t < MATERIALISE_MARGIN * run }
+    if run >= UNFIT_NS {
+        t < run
+    } else {
+        t < MATERIALISE_MARGIN * run
+    }
 }
 
 /// The estimated time of `key` over `len` elements if it were written out in full: its
@@ -771,7 +1008,13 @@ fn written_out_ns(key: &FusedKey, len: usize, cost: &CostModel) -> f64 {
             ops += alone.get(j as usize).copied().unwrap_or(0.0);
         }
     }
-    let bytes = input_bytes(key, key.instrs.iter().chain(key.subs.iter().flatten()).flat_map(|instr| instr.args)) + output_bytes(key);
+    let bytes = input_bytes(
+        key,
+        key.instrs
+            .iter()
+            .chain(key.subs.iter().flatten())
+            .flat_map(|instr| instr.args),
+    ) + output_bytes(key);
     kernel_ns_on(cost, len as f64 * bytes, ops * len as f64, len as f64)
 }
 
@@ -779,16 +1022,38 @@ impl Plans {
     /// Finds the plans of `key` over `len` elements.
     fn of(key: &FusedKey, len: usize, env: Env) -> Plans {
         let elements = len as f64;
-        let staged = if env.staging_on { stage(key, env.cap, env.cost, env.tuning) } else { None };
-        let staged_ns = staged.as_ref().map(|(staging, programs)| staged_time(key, staging, programs, elements, env.cost));
+        let staged = if env.staging_on {
+            stage(key, env.cap, env.cost, env.tuning)
+        } else {
+            None
+        };
+        let staged_ns = staged
+            .as_ref()
+            .map(|(staging, programs)| staged_time(key, staging, programs, elements, env.cost));
         match inline(key, env.cap, env.cost) {
             Verdict::Fits(inlined) => {
-                let reads = inlined.instrs.iter().flat_map(|flat| flat.args).chain(inlined.ctxs.iter().flat_map(|ctx| ctx.args));
+                let reads = inlined
+                    .instrs
+                    .iter()
+                    .flat_map(|flat| flat.args)
+                    .chain(inlined.ctxs.iter().flat_map(|ctx| ctx.args));
                 let io_bytes = elements * (input_bytes(key, reads) + output_bytes(key));
                 let inline_ns = kernel_ns_on(env.cost, io_bytes, inlined.ops * elements, elements);
-                Plans { inlined: Ok(inlined), inline_ns, staged, staged_ns, unfit_ns: 0.0 }
+                Plans {
+                    inlined: Ok(inlined),
+                    inline_ns,
+                    staged,
+                    staged_ns,
+                    unfit_ns: 0.0,
+                }
             }
-            Verdict::TooBig { sub, instructions } => Plans { inlined: Err((sub, instructions)), inline_ns: f64::INFINITY, staged, staged_ns, unfit_ns: UNFIT_NS + written_out_ns(key, len, env.cost) },
+            Verdict::TooBig { sub, instructions } => Plans {
+                inlined: Err((sub, instructions)),
+                inline_ns: f64::INFINITY,
+                staged,
+                staged_ns,
+                unfit_ns: UNFIT_NS + written_out_ns(key, len, env.cost),
+            },
         }
     }
 
@@ -822,7 +1087,11 @@ impl Plans {
 /// The sub-programs `main` reaches (those it reads through shifts, and those they read),
 /// renumbered in their order, and for each the number it had in `subs`; the reads of the
 /// sub-programs of `replaced` (pairs of sub-program and input) become reads of that input.
-fn reachable(main: &[Instr], subs: &[Vec<Instr>], replaced: &[(u32, u32)]) -> (Vec<Instr>, Vec<Vec<Instr>>, Vec<u32>) {
+fn reachable(
+    main: &[Instr],
+    subs: &[Vec<Instr>],
+    replaced: &[(u32, u32)],
+) -> (Vec<Instr>, Vec<Vec<Instr>>, Vec<u32>) {
     let kept = |reference: Ref| match reference {
         Ref::Sub(j) if !replaced.iter().any(|&(sub, _)| sub == j) => Some(j as usize),
         _ => None,
@@ -866,13 +1135,25 @@ fn reachable(main: &[Instr], subs: &[Vec<Instr>], replaced: &[(u32, u32)]) -> (V
             .collect()
     };
     let main = rewrite(main);
-    let subs = subs.iter().zip(&used).filter(|&(_, &used)| used).map(|(program, _)| rewrite(program)).collect();
+    let subs = subs
+        .iter()
+        .zip(&used)
+        .filter(|&(_, &used)| used)
+        .map(|(program, _)| rewrite(program))
+        .collect();
     (main, subs, originals)
 }
 
 /// `key` with the program replaced by `main` over `subs` (see [`reachable`]) and the tail,
 /// outputs and inputs given.
-fn rebuilt(key: &FusedKey, main: Vec<Instr>, subs: Vec<Vec<Instr>>, outputs: Vec<u32>, tail: Tail, input_tys: Vec<super::ElemTy>) -> FusedKey {
+fn rebuilt(
+    key: &FusedKey,
+    main: Vec<Instr>,
+    subs: Vec<Vec<Instr>>,
+    outputs: Vec<u32>,
+    tail: Tail,
+    input_tys: Vec<super::ElemTy>,
+) -> FusedKey {
     FusedKey {
         shape: shape_of(&main, &subs),
         instrs: Arc::new(main),
@@ -910,7 +1191,14 @@ fn group_key(key: &FusedKey, group: &[u32]) -> Option<FusedKey> {
         outputs.push(u32::try_from(main.len().checked_sub(1)?).ok()?);
     }
     let (main, subs, _) = reachable(&main, &key.subs, &[]);
-    Some(rebuilt(key, main, subs, outputs, Tail::Store, key.input_tys.clone()))
+    Some(rebuilt(
+        key,
+        main,
+        subs,
+        outputs,
+        Tail::Store,
+        key.input_tys.clone(),
+    ))
 }
 
 /// `key` once the sub-programs `group` are evaluated: its reads of them are reads of buffers.
@@ -924,7 +1212,10 @@ fn rest_key(key: &FusedKey, group: &[u32]) -> Option<(FusedKey, Vec<u32>)> {
         replaced.push((s, first + u32::try_from(k).ok()?));
     }
     let (main, subs, originals) = reachable(&key.instrs, &key.subs, &replaced);
-    Some((rebuilt(key, main, subs, key.outputs.clone(), key.tail, input_tys), originals))
+    Some((
+        rebuilt(key, main, subs, key.outputs.clone(), key.tail, input_tys),
+        originals,
+    ))
 }
 
 /// What the sub-programs of `key` cost when written out, by a count that ignores that equal
@@ -943,11 +1234,20 @@ fn recomputation(key: &FusedKey, cost: &CostModel) -> (Vec<f64>, Vec<f64>) {
         }
         found
     };
-    let weight = |program: &[Instr]| program.iter().map(|instr| op_weight(instr.op, cost)).sum::<f64>();
+    let weight = |program: &[Instr]| {
+        program
+            .iter()
+            .map(|instr| op_weight(instr.op, cost))
+            .sum::<f64>()
+    };
     let mut alone = vec![0.0f64; n];
     for s in 0..n {
         let own = &key.subs[s];
-        alone[s] = weight(own) + reads(own).iter().map(|&(j, _)| alone.get(j as usize).copied().unwrap_or(0.0)).sum::<f64>();
+        alone[s] = weight(own)
+            + reads(own)
+                .iter()
+                .map(|&(j, _)| alone.get(j as usize).copied().unwrap_or(0.0))
+                .sum::<f64>();
     }
     let mut times = vec![0.0f64; n];
     for (j, _) in reads(&key.instrs) {
@@ -971,7 +1271,10 @@ fn recomputation(key: &FusedKey, cost: &CostModel) -> (Vec<f64>, Vec<f64>) {
 /// first.
 fn worth_evaluating(key: &FusedKey, cost: &CostModel, limit: usize) -> Vec<u32> {
     let (times, alone) = recomputation(key, cost);
-    let mut found: Vec<(u32, f64)> = (0..key.subs.len()).filter(|&s| times[s] >= 2.0).map(|s| (s as u32, (times[s] - 1.0) * alone[s])).collect();
+    let mut found: Vec<(u32, f64)> = (0..key.subs.len())
+        .filter(|&s| times[s] >= 2.0)
+        .map(|s| (s as u32, (times[s] - 1.0) * alone[s]))
+        .collect();
     found.sort_by(|a, b| b.1.total_cmp(&a.1));
     found.truncate(limit);
     found.into_iter().map(|(s, _)| s).collect()
@@ -1008,13 +1311,27 @@ impl Search<'_> {
     fn group(&self, key: &FusedKey, seed: u32, len: usize) -> Vec<u32> {
         let wide = sub_len(key, seed, len);
         let (_, alone) = recomputation(key, self.env.cost);
-        let like = |s: u32| alone.get(s as usize).zip(alone.get(seed as usize)).is_some_and(|(&a, &b)| a >= b / SIBLING && a <= b * SIBLING);
+        let like = |s: u32| {
+            alone
+                .get(s as usize)
+                .zip(alone.get(seed as usize))
+                .is_some_and(|(&a, &b)| a >= b / SIBLING && a <= b * SIBLING)
+        };
         let mut group = vec![seed];
-        let Some((mut rest, mut originals)) = rest_key(key, &group) else { return group };
+        let Some((mut rest, mut originals)) = rest_key(key, &group) else {
+            return group;
+        };
         while group.len() < GROUP {
-            let Some(next) = worth_evaluating(&rest, self.env.cost, usize::MAX).into_iter().find(|&j| sub_len(&rest, j, len) == wide && like(originals[j as usize])) else { break };
+            let Some(next) = worth_evaluating(&rest, self.env.cost, usize::MAX)
+                .into_iter()
+                .find(|&j| sub_len(&rest, j, len) == wide && like(originals[j as usize]))
+            else {
+                break;
+            };
             group.push(originals[next as usize]);
-            let Some((smaller, kept)) = rest_key(&rest, &[next]) else { break };
+            let Some((smaller, kept)) = rest_key(&rest, &[next]) else {
+                break;
+            };
             originals = kept.iter().map(|&k| originals[k as usize]).collect();
             rest = smaller;
         }
@@ -1024,7 +1341,13 @@ impl Search<'_> {
     /// The best group of sub-programs of `key` to evaluate first (over `len` elements, `plans`
     /// being how it runs as one kernel), with the estimated time of both kernels, each run as
     /// it will be; `None` if no sub-program is worth it or the search is out of levels.
-    fn evaluate_first(&mut self, key: &FusedKey, len: usize, plans: &Plans, left: u32) -> Option<(Vec<u32>, f64)> {
+    fn evaluate_first(
+        &mut self,
+        key: &FusedKey,
+        len: usize,
+        plans: &Plans,
+        left: u32,
+    ) -> Option<(Vec<u32>, f64)> {
         let run = plans.run_ns();
         // Two launches alone cost more than the margin allows.
         if left == 0 || 2.0 * self.env.cost.launch_us * 1e3 >= MATERIALISE_MARGIN * run {
@@ -1036,25 +1359,34 @@ impl Search<'_> {
         // direction and the like are different groups, and the first of them alone would crowd
         // the others out.
         let mut lengths: Vec<f64> = Vec::new();
-        let seeds = worth_evaluating(key, self.env.cost, usize::MAX).into_iter().filter(|&s| {
-            let of = sub_len(key, s, len);
-            let new = !lengths.contains(&of);
-            if new {
-                lengths.push(of);
-            }
-            new
-        });
+        let seeds = worth_evaluating(key, self.env.cost, usize::MAX)
+            .into_iter()
+            .filter(|&s| {
+                let of = sub_len(key, s, len);
+                let new = !lengths.contains(&of);
+                if new {
+                    lengths.push(of);
+                }
+                new
+            });
         for seed in seeds.take(CANDIDATES).collect::<Vec<_>>() {
             let mut group = self.group(key, seed, len);
             group.sort_unstable();
             if tried.contains(&group) {
                 continue;
             }
-            let (Some(own), Some((rest, _))) = (group_key(key, &group), rest_key(key, &group)) else { continue };
+            let (Some(own), Some((rest, _))) = (group_key(key, &group), rest_key(key, &group))
+            else {
+                continue;
+            };
             let len_s = sub_len(key, group[0], len) as usize;
             // What is left may evaluate one more group first (the fluxes of the other direction),
             // which is as far as that is searched.
-            let t_rest = if left == SEARCH_DEPTH { self.best(&rest, len, 1) } else { Plans::of(&rest, len, self.env).run_ns() };
+            let t_rest = if left == SEARCH_DEPTH {
+                self.best(&rest, len, 1)
+            } else {
+                Plans::of(&rest, len, self.env).run_ns()
+            };
             let t = self.best(&own, len_s, left - 1) + t_rest;
             if t.is_finite() && best.as_ref().is_none_or(|&(_, t_best)| t < t_best) {
                 best = Some((group.clone(), t));
@@ -1093,30 +1425,68 @@ impl Search<'_> {
 /// [`STAGE_MARGIN`] times the time of one kernel, and evaluating sub-programs first below
 /// [`MATERIALISE_MARGIN`] times the time of the choice before it. Lowered programs over `cap`
 /// instructions are always cut, unless staging makes them fit.
-pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tuning: &Tuning, staging_on: bool) -> (Judgement, Estimates) {
-    let env = Env { cap, cost, tuning, staging_on };
+pub(crate) fn judge(
+    key: &FusedKey,
+    len: usize,
+    cap: usize,
+    cost: &CostModel,
+    tuning: &Tuning,
+    staging_on: bool,
+) -> (Judgement, Estimates) {
+    let env = Env {
+        cap,
+        cost,
+        tuning,
+        staging_on,
+    };
     let plans = Plans::of(key, len, env);
     let run = plans.run_ns();
-    let mut search = Search { env, memo: FxMap::default() };
+    let mut search = Search {
+        env,
+        memo: FxMap::default(),
+    };
     let first = search.evaluate_first(key, len, &plans, SEARCH_DEPTH);
-    let estimates = Estimates { inline_ns: plans.inline_ns, best_sub: first.as_ref().map(|(group, t)| (group[0], *t)), staged_ns: plans.staged_ns };
-    let instructions = plans.inlined.as_ref().err().map_or(cap.saturating_add(1), |&(_, instructions)| instructions);
-    let over_cap = SplitReason::Inlined { instructions, limit: cap };
+    let estimates = Estimates {
+        inline_ns: plans.inline_ns,
+        best_sub: first.as_ref().map(|(group, t)| (group[0], *t)),
+        staged_ns: plans.staged_ns,
+    };
+    let instructions = plans
+        .inlined
+        .as_ref()
+        .err()
+        .map_or(cap.saturating_add(1), |&(_, instructions)| instructions);
+    let over_cap = SplitReason::Inlined {
+        instructions,
+        limit: cap,
+    };
     match first {
         Some((subs, t)) if pays(t, run) => {
             let reason = if plans.fits() {
                 let (times, _) = recomputation(key, cost);
-                SplitReason::Materialised { instances: times[subs[0] as usize] as usize }
+                SplitReason::Materialised {
+                    instances: times[subs[0] as usize] as usize,
+                }
             } else {
                 over_cap
             };
             (Judgement::Materialise { subs, reason }, estimates)
         }
         _ if plans.fits() => {
-            let staging = if plans.stages() { plans.staged.map(|(staging, _)| staging) } else { None };
+            let staging = if plans.stages() {
+                plans.staged.map(|(staging, _)| staging)
+            } else {
+                None
+            };
             (Judgement::Run { staging }, estimates)
         }
-        _ => (Judgement::Materialise { subs: vec![plans.inlined.err().map_or(0, |(sub, _)| sub)], reason: over_cap }, estimates),
+        _ => (
+            Judgement::Materialise {
+                subs: vec![plans.inlined.err().map_or(0, |(sub, _)| sub)],
+                reason: over_cap,
+            },
+            estimates,
+        ),
     }
 }
 
@@ -1124,7 +1494,11 @@ pub(crate) fn judge(key: &FusedKey, len: usize, cap: usize, cost: &CostModel, tu
 /// with `inputs` inputs: contexts descend from lower ones, temporaries refer backwards, contexts
 /// exist, and sub-program reads appear only as shifts of staged lowerings.
 #[cfg(any(debug_assertions, test))]
-pub(super) fn validate_inlined(inlined: &Inlined, inputs: usize, staged: bool) -> Result<(), String> {
+pub(super) fn validate_inlined(
+    inlined: &Inlined,
+    inputs: usize,
+    staged: bool,
+) -> Result<(), String> {
     for (id, ctx) in inlined.ctxs.iter().enumerate().skip(1) {
         if ctx.parent as usize >= id {
             return Err(format!("context {id} has parent {}", ctx.parent));
@@ -1134,13 +1508,28 @@ pub(super) fn validate_inlined(inlined: &Inlined, inputs: usize, staged: bool) -
     for (at, flat) in inlined.instrs.iter().enumerate() {
         let here = format!("lowered instruction {at} ({:?})", flat.op.kind);
         if flat.at as usize >= inlined.ctxs.len() || flat.child as usize >= inlined.ctxs.len() {
-            return Err(format!("{here}: context {} / {} of {}", flat.at, flat.child, inlined.ctxs.len()));
+            return Err(format!(
+                "{here}: context {} / {} of {}",
+                flat.at,
+                flat.child,
+                inlined.ctxs.len()
+            ));
         }
         for (slot, &arg) in flat.args.iter().enumerate() {
             match arg {
-                Ref::Tmp(t) if t as usize >= at => return Err(format!("{here}: operand {slot} reads t{t}, not an earlier instruction")),
-                Ref::Input(k) if k as usize >= inputs => return Err(format!("{here}: operand {slot} reads input {k} of {inputs}")),
-                Ref::Sub(_) if !(staged && slot == 0 && matches!(flat.op.kind, OpKind::Shift(_))) => {
+                Ref::Tmp(t) if t as usize >= at => {
+                    return Err(format!(
+                        "{here}: operand {slot} reads t{t}, not an earlier instruction"
+                    ));
+                }
+                Ref::Input(k) if k as usize >= inputs => {
+                    return Err(format!(
+                        "{here}: operand {slot} reads input {k} of {inputs}"
+                    ));
+                }
+                Ref::Sub(_)
+                    if !(staged && slot == 0 && matches!(flat.op.kind, OpKind::Shift(_))) =>
+                {
                     return Err(format!("{here}: operand {slot} is a sub-program"));
                 }
                 _ => {}
@@ -1170,7 +1559,10 @@ mod tests {
     use crate::jit::{ElemTy, Gen};
 
     fn instr(kind: OpKind, args: [Ref; 3]) -> Instr {
-        Instr { op: Op::new(kind, ElemTy::F32), args }
+        Instr {
+            op: Op::new(kind, ElemTy::F32),
+            args,
+        }
     }
 
     fn key(instrs: Vec<Instr>, subs: Vec<Vec<Instr>>) -> FusedKey {
@@ -1198,39 +1590,71 @@ mod tests {
         let mut map = ViewMap::identity([n, 1, 1, 1]);
         map.out[0] = out;
         map.axes[0].start = start;
-        ShiftKind::View { map, edge: Edge::None }
+        ShiftKind::View {
+            map,
+            edge: Edge::None,
+        }
     }
 
     fn shift(kind: ShiftKind, sub: u32) -> Instr {
-        instr(OpKind::Shift(kind), [Ref::Sub(sub), Ref::Unused, Ref::Unused])
+        instr(
+            OpKind::Shift(kind),
+            [Ref::Sub(sub), Ref::Unused, Ref::Unused],
+        )
     }
 
     /// `e = sqrt(x * s0 + s1)`: three instructions.
     fn expression() -> Vec<Instr> {
         vec![
-            instr(OpKind::Binary(BinOp::Mul), [Ref::Input(0), Ref::Scalar(0), Ref::Unused]),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Scalar(1), Ref::Unused]),
-            instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(1), Ref::Unused, Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Mul),
+                [Ref::Input(0), Ref::Scalar(0), Ref::Unused],
+            ),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(0), Ref::Scalar(1), Ref::Unused],
+            ),
+            instr(
+                OpKind::Unary(UnOp::Sqrt),
+                [Ref::Tmp(1), Ref::Unused, Ref::Unused],
+            ),
         ]
     }
 
     fn fits(verdict: Verdict) -> Inlined {
         match verdict {
             Verdict::Fits(inlined) => inlined,
-            Verdict::TooBig { sub, instructions } => panic!("too big: sub {sub}, {instructions} instructions"),
+            Verdict::TooBig { sub, instructions } => {
+                panic!("too big: sub {sub}, {instructions} instructions")
+            }
         }
     }
 
     #[test]
     fn lowered_programs_pass_validation_and_broken_ones_do_not() {
-        let main = vec![shift(slice(9, 1, 8), 0), shift(slice(9, 0, 8), 0), instr(OpKind::Binary(BinOp::Sub), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused])];
+        let main = vec![
+            shift(slice(9, 1, 8), 0),
+            shift(slice(9, 0, 8), 0),
+            instr(
+                OpKind::Binary(BinOp::Sub),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
+        ];
         let k = key(main, vec![expression()]);
         assert_eq!(crate::jit::program::validate(&k, 1, 2), Ok(()));
         let mut inlined = fits(inline(&k, 1000, &CostModel::TEST));
         assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
-        assert!(validate_inlined(&inlined, 0, false).unwrap_err().contains("input 0"));
+        assert!(
+            validate_inlined(&inlined, 0, false)
+                .unwrap_err()
+                .contains("input 0")
+        );
         inlined.ctxs[1].parent = 1;
-        assert!(validate_inlined(&inlined, 1, false).unwrap_err().contains("parent"));
+        assert!(
+            validate_inlined(&inlined, 1, false)
+                .unwrap_err()
+                .contains("parent")
+        );
     }
 
     #[test]
@@ -1239,15 +1663,25 @@ mod tests {
         let main = vec![
             shift(slice(9, 1, 8), 0),
             shift(slice(9, 0, 8), 0),
-            instr(OpKind::Binary(BinOp::Sub), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Sub),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
         ];
-        let inlined = fits(inline(&key(main, vec![expression()]), 1000, &CostModel::TEST));
+        let inlined = fits(inline(
+            &key(main, vec![expression()]),
+            1000,
+            &CostModel::TEST,
+        ));
         // Two indices of `e` (three instructions each) and the difference; the shifts are aliases.
         assert_eq!(inlined.instrs.len(), 7);
         assert_eq!(inlined.ctxs.len(), 3);
         assert_eq!(inlined.main, vec![2, 5, 6]);
         let last = &inlined.instrs[6];
-        assert_eq!((last.at, last.args[0], last.args[1]), (0, Ref::Tmp(2), Ref::Tmp(5)));
+        assert_eq!(
+            (last.at, last.args[0], last.args[1]),
+            (0, Ref::Tmp(2), Ref::Tmp(5))
+        );
     }
 
     #[test]
@@ -1256,15 +1690,28 @@ mod tests {
         let f = vec![
             shift(slice(9, 1, 8), 0),
             shift(slice(9, 0, 8), 0),
-            instr(OpKind::Binary(BinOp::Sub), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Sub),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
         ];
         let g = vec![
             shift(slice(8, 1, 7), 1),
             shift(slice(8, 0, 7), 1),
-            instr(OpKind::Binary(BinOp::Mul), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(2), Ref::Tmp(0), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Mul),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(2), Ref::Tmp(0), Ref::Unused],
+            ),
         ];
-        let inlined = fits(inline(&key(g, vec![expression(), f]), 1000, &CostModel::TEST));
+        let inlined = fits(inline(
+            &key(g, vec![expression(), f]),
+            1000,
+            &CostModel::TEST,
+        ));
         // `e` at the starts 0, 1 and 2 (1 is reached twice): 3 x 3; `f` at two indices; `*` and `+`.
         assert_eq!(inlined.instrs.len(), 13);
         // Contexts: the two slices of `f`, and the three composed slices of `e`.
@@ -1283,9 +1730,22 @@ mod tests {
 
     #[test]
     fn a_view_of_everything_is_the_element_itself() {
-        let identity = ShiftKind::View { map: ViewMap::identity([9, 1, 1, 1]), edge: Edge::None };
-        let main = vec![shift(identity, 0), instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Input(0), Ref::Unused])];
-        let inlined = fits(inline(&key(main, vec![expression()]), 1000, &CostModel::TEST));
+        let identity = ShiftKind::View {
+            map: ViewMap::identity([9, 1, 1, 1]),
+            edge: Edge::None,
+        };
+        let main = vec![
+            shift(identity, 0),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(0), Ref::Input(0), Ref::Unused],
+            ),
+        ];
+        let inlined = fits(inline(
+            &key(main, vec![expression()]),
+            1000,
+            &CostModel::TEST,
+        ));
         assert_eq!(inlined.ctxs.len(), 1);
         assert!(inlined.instrs.iter().all(|flat| flat.at == 0));
     }
@@ -1295,10 +1755,26 @@ mod tests {
         let mut map = ViewMap::identity([9, 1, 1, 1]);
         map.axes[0].start = -1;
         let main = vec![
-            instr(OpKind::Shift(ShiftKind::View { map, edge: Edge::Fill }), [Ref::Sub(0), Ref::Scalar(0), Ref::Unused]),
-            shift(ShiftKind::View { map, edge: Edge::Clamp }, 0),
+            instr(
+                OpKind::Shift(ShiftKind::View {
+                    map,
+                    edge: Edge::Fill,
+                }),
+                [Ref::Sub(0), Ref::Scalar(0), Ref::Unused],
+            ),
+            shift(
+                ShiftKind::View {
+                    map,
+                    edge: Edge::Clamp,
+                },
+                0,
+            ),
         ];
-        let inlined = fits(inline(&key(main, vec![expression()]), 1000, &CostModel::TEST));
+        let inlined = fits(inline(
+            &key(main, vec![expression()]),
+            1000,
+            &CostModel::TEST,
+        ));
         // The fill is one instruction on top of the expression at its context; clamp is an alias
         // of the expression at another context.
         assert_eq!(inlined.instrs.len(), 3 + 1 + 3);
@@ -1308,12 +1784,29 @@ mod tests {
     #[test]
     fn equal_instructions_of_different_sub_programs_are_one() {
         // Two sub-programs that both contain `e` (the same instructions): read at one index.
-        let a = vec![expression()[0].clone(), expression()[1].clone(), instr(OpKind::Unary(UnOp::Abs), [Ref::Tmp(1), Ref::Unused, Ref::Unused])];
-        let b = vec![expression()[0].clone(), expression()[1].clone(), instr(OpKind::Unary(UnOp::Neg), [Ref::Tmp(1), Ref::Unused, Ref::Unused])];
+        let a = vec![
+            expression()[0].clone(),
+            expression()[1].clone(),
+            instr(
+                OpKind::Unary(UnOp::Abs),
+                [Ref::Tmp(1), Ref::Unused, Ref::Unused],
+            ),
+        ];
+        let b = vec![
+            expression()[0].clone(),
+            expression()[1].clone(),
+            instr(
+                OpKind::Unary(UnOp::Neg),
+                [Ref::Tmp(1), Ref::Unused, Ref::Unused],
+            ),
+        ];
         let main = vec![
             shift(slice(9, 1, 8), 0),
             shift(slice(9, 1, 8), 1),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
         ];
         let inlined = fits(inline(&key(main, vec![a, b]), 1000, &CostModel::TEST));
         // Mul, Add shared; Abs, Neg; the sum.
@@ -1332,12 +1825,22 @@ mod tests {
             shift(slice(9, 0, 7), 1),
             shift(slice(9, 3, 6), 0),
             shift(slice(9, 4, 5), 0),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
         ];
         let verdict = inline(&key(main.clone(), vec![long, short]), 8, &CostModel::TEST);
-        assert!(matches!(verdict, Verdict::TooBig { sub: 0, .. }), "{verdict:?}");
+        assert!(
+            matches!(verdict, Verdict::TooBig { sub: 0, .. }),
+            "{verdict:?}"
+        );
         // Within the cap it fits.
-        let again = inline(&key(main, vec![expression(), vec![expression()[0].clone()]]), 100, &CostModel::TEST);
+        let again = inline(
+            &key(main, vec![expression(), vec![expression()[0].clone()]]),
+            100,
+            &CostModel::TEST,
+        );
         assert!(matches!(again, Verdict::Fits(_)));
     }
 
@@ -1346,7 +1849,10 @@ mod tests {
         let main = vec![
             shift(slice(1 << 20, 1, (1 << 20) - 1), 0),
             shift(slice(1 << 20, 0, (1 << 20) - 1), 0),
-            instr(OpKind::Binary(BinOp::Sub), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Sub),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
         ];
         key(main, vec![expression()])
     }
@@ -1355,9 +1861,15 @@ mod tests {
     fn long_difference_key() -> FusedKey {
         let mut long = expression();
         for k in 2..19 {
-            long.push(instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(k), Ref::Unused, Ref::Unused]));
+            long.push(instr(
+                OpKind::Unary(UnOp::Sqrt),
+                [Ref::Tmp(k), Ref::Unused, Ref::Unused],
+            ));
         }
-        FusedKey { subs: std::sync::Arc::new(vec![long]), ..difference_key() }
+        FusedKey {
+            subs: std::sync::Arc::new(vec![long]),
+            ..difference_key()
+        }
     }
 
     #[test]
@@ -1365,33 +1877,131 @@ mod tests {
         let key = long_difference_key();
         let len = 1 << 20;
         let tuning = Tuning::for_tests();
-        let (cheap_launch, _) = judge(&key, len, 1000, &CostModel { launch_us: 1e6, ..CostModel::TEST }, &tuning, true);
-        assert!(matches!(cheap_launch, Judgement::Run { .. }), "{cheap_launch:?}");
-        let (cheap_memory, estimates) = judge(&key, len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, false);
-        let Judgement::Materialise { subs, reason: SplitReason::Materialised { instances: 2 } } = &cheap_memory else { panic!("{cheap_memory:?} {estimates:?}") };
+        let (cheap_launch, _) = judge(
+            &key,
+            len,
+            1000,
+            &CostModel {
+                launch_us: 1e6,
+                ..CostModel::TEST
+            },
+            &tuning,
+            true,
+        );
+        assert!(
+            matches!(cheap_launch, Judgement::Run { .. }),
+            "{cheap_launch:?}"
+        );
+        let (cheap_memory, estimates) = judge(
+            &key,
+            len,
+            1000,
+            &CostModel {
+                f32_ops_per_ns: 1e-6,
+                ..CostModel::TEST
+            },
+            &tuning,
+            false,
+        );
+        let Judgement::Materialise {
+            subs,
+            reason: SplitReason::Materialised { instances: 2 },
+        } = &cheap_memory
+        else {
+            panic!("{cheap_memory:?} {estimates:?}")
+        };
         assert_eq!(subs, &[0], "{cheap_memory:?}");
-        assert!(estimates.best_sub.is_some_and(|(_, t)| t < estimates.inline_ns), "{estimates:?}");
+        assert!(
+            estimates
+                .best_sub
+                .is_some_and(|(_, t)| t < estimates.inline_ns),
+            "{estimates:?}"
+        );
         // A short expression costs less to recompute than its two reads through views.
-        let (short, estimates) = judge(&difference_key(), len, 1000, &CostModel { f32_ops_per_ns: 1e-6, ..CostModel::TEST }, &tuning, false);
-        assert!(matches!(short, Judgement::Run { staging: None }), "{short:?} {estimates:?}");
+        let (short, estimates) = judge(
+            &difference_key(),
+            len,
+            1000,
+            &CostModel {
+                f32_ops_per_ns: 1e-6,
+                ..CostModel::TEST
+            },
+            &tuning,
+            false,
+        );
+        assert!(
+            matches!(short, Judgement::Run { staging: None }),
+            "{short:?} {estimates:?}"
+        );
     }
 
     #[test]
     fn a_program_over_the_cap_is_cut_whatever_the_model_says() {
-        let slow = CostModel { launch_us: 1e6, ..CostModel::TEST };
-        let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &slow, &Tuning::for_tests(), false);
-        assert!(matches!(judgement, Judgement::Materialise { reason: SplitReason::Inlined { limit: 4, .. }, .. }), "{judgement:?}");
+        let slow = CostModel {
+            launch_us: 1e6,
+            ..CostModel::TEST
+        };
+        let (judgement, estimates) = judge(
+            &difference_key(),
+            1 << 20,
+            4,
+            &slow,
+            &Tuning::for_tests(),
+            false,
+        );
+        assert!(
+            matches!(
+                judgement,
+                Judgement::Materialise {
+                    reason: SplitReason::Inlined { limit: 4, .. },
+                    ..
+                }
+            ),
+            "{judgement:?}"
+        );
         assert!(estimates.inline_ns.is_infinite());
     }
 
     #[test]
     fn a_program_over_the_cap_is_staged_when_staging_makes_it_fit() {
-        let slow = CostModel { launch_us: 1e6, ..CostModel::TEST };
-        let (judgement, estimates) = judge(&difference_key(), 1 << 20, 4, &slow, &Tuning::for_tests(), true);
-        assert!(matches!(judgement, Judgement::Run { staging: Some(_) }), "{judgement:?} {estimates:?}");
-        assert!(estimates.staged_ns.is_some() && estimates.inline_ns.is_infinite(), "{estimates:?}");
-        let (judgement, _) = judge(&difference_key(), 1 << 20, 2, &slow, &Tuning::for_tests(), true);
-        assert!(matches!(judgement, Judgement::Materialise { reason: SplitReason::Inlined { limit: 2, .. }, .. }), "{judgement:?}");
+        let slow = CostModel {
+            launch_us: 1e6,
+            ..CostModel::TEST
+        };
+        let (judgement, estimates) = judge(
+            &difference_key(),
+            1 << 20,
+            4,
+            &slow,
+            &Tuning::for_tests(),
+            true,
+        );
+        assert!(
+            matches!(judgement, Judgement::Run { staging: Some(_) }),
+            "{judgement:?} {estimates:?}"
+        );
+        assert!(
+            estimates.staged_ns.is_some() && estimates.inline_ns.is_infinite(),
+            "{estimates:?}"
+        );
+        let (judgement, _) = judge(
+            &difference_key(),
+            1 << 20,
+            2,
+            &slow,
+            &Tuning::for_tests(),
+            true,
+        );
+        assert!(
+            matches!(
+                judgement,
+                Judgement::Materialise {
+                    reason: SplitReason::Inlined { limit: 2, .. },
+                    ..
+                }
+            ),
+            "{judgement:?}"
+        );
     }
 
     /// `select(coordinate >= s0, e read through a clamped view of a 4-cell array, input)` over 64
@@ -1400,19 +2010,43 @@ mod tests {
     fn region_key(extra: u32, data_mask: bool) -> FusedKey {
         let mut long = expression();
         for k in 0..extra {
-            long.push(instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(2 + k), Ref::Unused, Ref::Unused]));
+            long.push(instr(
+                OpKind::Unary(UnOp::Sqrt),
+                [Ref::Tmp(2 + k), Ref::Unused, Ref::Unused],
+            ));
         }
         let mut map = ViewMap::identity([4, 1, 1, 1]);
         map.out[0] = 64;
         let (first, mask) = if data_mask {
-            (Instr { op: Op::new(OpKind::Binary(BinOp::Add), ElemTy::U32), args: [Ref::Input(1), Ref::Input(1), Ref::Unused] }, Ref::Tmp(0))
+            (
+                Instr {
+                    op: Op::new(OpKind::Binary(BinOp::Add), ElemTy::U32),
+                    args: [Ref::Input(1), Ref::Input(1), Ref::Unused],
+                },
+                Ref::Tmp(0),
+            )
         } else {
-            (Instr { op: Op::new(OpKind::Generate(Gen::RangePow2), ElemTy::U32), args: [Ref::Scalar(0), Ref::Scalar(0), Ref::Unused] }, Ref::Tmp(0))
+            (
+                Instr {
+                    op: Op::new(OpKind::Generate(Gen::RangePow2), ElemTy::U32),
+                    args: [Ref::Scalar(0), Ref::Scalar(0), Ref::Unused],
+                },
+                Ref::Tmp(0),
+            )
         };
         let main = vec![
             first,
-            Instr { op: Op::new(OpKind::Compare(CmpOp::Ge), ElemTy::U32), args: [mask, Ref::Scalar(0), Ref::Unused] },
-            instr(OpKind::Shift(ShiftKind::View { map, edge: Edge::Clamp }), [Ref::Sub(0), Ref::Unused, Ref::Unused]),
+            Instr {
+                op: Op::new(OpKind::Compare(CmpOp::Ge), ElemTy::U32),
+                args: [mask, Ref::Scalar(0), Ref::Unused],
+            },
+            instr(
+                OpKind::Shift(ShiftKind::View {
+                    map,
+                    edge: Edge::Clamp,
+                }),
+                [Ref::Sub(0), Ref::Unused, Ref::Unused],
+            ),
             instr(OpKind::Select, [Ref::Tmp(1), Ref::Tmp(2), Ref::Input(0)]),
         ];
         let mut key = key(main, vec![long]);
@@ -1428,12 +2062,38 @@ mod tests {
         let select = inlined.instrs.len() - 1;
         assert_eq!(select, 25);
         assert!(inlined.branch[select], "{:?}", inlined.region);
-        assert!(inlined.region[2..25].iter().all(|&region| region == Region::Taken(select as u32)), "{:?}", inlined.region);
-        assert!([0, 1, select].iter().all(|&n| inlined.region[n] == Region::Top), "{:?}", inlined.region);
+        assert!(
+            inlined.region[2..25]
+                .iter()
+                .all(|&region| region == Region::Taken(select as u32)),
+            "{:?}",
+            inlined.region
+        );
+        assert!(
+            [0, 1, select]
+                .iter()
+                .all(|&n| inlined.region[n] == Region::Top),
+            "{:?}",
+            inlined.region
+        );
         // 4 of the 64 cells take it: the operations are the program's four plus 1/16 of the expression's.
-        let all: f64 = inlined.instrs.iter().map(|flat| op_weight(flat.op, &cost)).sum();
-        let expression: f64 = inlined.instrs.iter().zip(&inlined.region).filter(|&(_, &region)| region != Region::Top).map(|(flat, _)| op_weight(flat.op, &cost)).sum();
-        assert!((inlined.ops - (all - expression + expression / 16.0)).abs() < 1e-9, "{} of {all}, expression {expression}", inlined.ops);
+        let all: f64 = inlined
+            .instrs
+            .iter()
+            .map(|flat| op_weight(flat.op, &cost))
+            .sum();
+        let expression: f64 = inlined
+            .instrs
+            .iter()
+            .zip(&inlined.region)
+            .filter(|&(_, &region)| region != Region::Top)
+            .map(|(flat, _)| op_weight(flat.op, &cost))
+            .sum();
+        assert!(
+            (inlined.ops - (all - expression + expression / 16.0)).abs() < 1e-9,
+            "{} of {all}, expression {expression}",
+            inlined.ops
+        );
         assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
     }
 
@@ -1441,7 +2101,11 @@ mod tests {
     fn a_cheap_branch_or_a_mask_that_reads_data_stays_a_select() {
         let cost = CostModel::TEST;
         let cheap = fits(inline(&region_key(0, false), 1000, &cost));
-        assert!(cheap.branch.iter().all(|&branch| !branch), "{:?}", cheap.region);
+        assert!(
+            cheap.branch.iter().all(|&branch| !branch),
+            "{:?}",
+            cheap.region
+        );
         assert!(cheap.region.iter().all(|&region| region == Region::Top));
         let data = fits(inline(&region_key(20, true), 1000, &cost));
         assert!(data.branch.iter().all(|&branch| !branch));
@@ -1453,19 +2117,46 @@ mod tests {
         // Two sub-programs over the same region that share their first two instructions (like the
         // fields of a flux), the main program reads each at two offsets.
         let first = expression();
-        let second = vec![first[0].clone(), first[1].clone(), instr(OpKind::Unary(UnOp::Abs), [Ref::Tmp(1), Ref::Unused, Ref::Unused])];
+        let second = vec![
+            first[0].clone(),
+            first[1].clone(),
+            instr(
+                OpKind::Unary(UnOp::Abs),
+                [Ref::Tmp(1), Ref::Unused, Ref::Unused],
+            ),
+        ];
         let main = vec![
             shift(slice(9, 1, 8), 0),
             shift(slice(9, 0, 8), 0),
             shift(slice(9, 1, 8), 1),
             shift(slice(9, 0, 8), 1),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(2), Ref::Tmp(3), Ref::Unused]),
-            instr(OpKind::Binary(BinOp::Mul), [Ref::Tmp(4), Ref::Tmp(5), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(2), Ref::Tmp(3), Ref::Unused],
+            ),
+            instr(
+                OpKind::Binary(BinOp::Mul),
+                [Ref::Tmp(4), Ref::Tmp(5), Ref::Unused],
+            ),
         ];
         let key = key(main, vec![first, second]);
-        let region = |sub| StagedSub { sub, dims: [9, 1], lo: [0, 0], hi: [16, 0] };
-        let staging = Staging { dims: [8, 1], tile: [16, 1], subs: vec![region(0), region(1)], levels: vec![0, 2] };
+        let region = |sub| StagedSub {
+            sub,
+            dims: [9, 1],
+            lo: [0, 0],
+            hi: [16, 0],
+        };
+        let staging = Staging {
+            dims: [8, 1],
+            slots: None,
+            tile: [16, 1],
+            subs: vec![region(0), region(1)],
+            levels: vec![0, 2],
+        };
         let programs = lower_staged(&key, &staging, 1000, &CostModel::TEST).expect("lowers");
         assert_eq!(programs.groups.len(), 1);
         let group = &programs.groups[0];
@@ -1478,11 +2169,20 @@ mod tests {
 
     /// `s0 = e(x)`, `s1 = sqrt(s0[..8])`, an unused `s2`, and a main program reading `s1` at two offsets.
     fn chain_key() -> FusedKey {
-        let reads_s0 = vec![shift(slice(9, 0, 8), 0), instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(0), Ref::Unused, Ref::Unused])];
+        let reads_s0 = vec![
+            shift(slice(9, 0, 8), 0),
+            instr(
+                OpKind::Unary(UnOp::Sqrt),
+                [Ref::Tmp(0), Ref::Unused, Ref::Unused],
+            ),
+        ];
         let main = vec![
             shift(slice(8, 1, 7), 1),
             shift(slice(8, 0, 7), 1),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
         ];
         key(main, vec![expression(), reads_s0, expression()])
     }
@@ -1494,7 +2194,13 @@ mod tests {
         let (rest, originals) = rest_key(&key, &[1]).expect("s1 has a value");
         assert!(rest.subs.is_empty() && originals.is_empty(), "{rest:?}");
         assert_eq!(rest.input_tys.len(), 2);
-        assert!(rest.instrs.iter().take(2).all(|instr| instr.args[0] == Ref::Input(1)), "{rest:?}");
+        assert!(
+            rest.instrs
+                .iter()
+                .take(2)
+                .all(|instr| instr.args[0] == Ref::Input(1)),
+            "{rest:?}"
+        );
         // `s0` evaluated: `s1` is left, reading it; the unused `s2` is gone and `s1` is renumbered.
         let (rest, originals) = rest_key(&key, &[0]).expect("s0 has a value");
         assert_eq!(originals, vec![1]);
@@ -1513,7 +2219,10 @@ mod tests {
         assert_eq!(together.subs.len(), 1);
         assert!(matches!(together.instrs[3].args[0], Ref::Sub(0)));
         let alone = group_key(&key, &[1]).expect("s1 has a value");
-        assert_eq!((alone.instrs.len(), alone.subs.len(), alone.outputs.clone()), (2, 1, vec![1]));
+        assert_eq!(
+            (alone.instrs.len(), alone.subs.len(), alone.outputs.clone()),
+            (2, 1, vec![1])
+        );
     }
 
     #[test]
@@ -1522,26 +2231,66 @@ mod tests {
         // leaves 11, both leave 7.
         let first = expression();
         let second = vec![
-            instr(OpKind::Binary(BinOp::Mul), [Ref::Input(0), Ref::Scalar(1), Ref::Unused]),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Scalar(0), Ref::Unused]),
-            instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(1), Ref::Unused, Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Mul),
+                [Ref::Input(0), Ref::Scalar(1), Ref::Unused],
+            ),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(0), Ref::Scalar(0), Ref::Unused],
+            ),
+            instr(
+                OpKind::Unary(UnOp::Sqrt),
+                [Ref::Tmp(1), Ref::Unused, Ref::Unused],
+            ),
         ];
         let main = vec![
             shift(slice(9, 1, 8), 0),
             shift(slice(9, 0, 8), 0),
             shift(slice(9, 1, 8), 1),
             shift(slice(9, 0, 8), 1),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused]),
-            instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(2), Ref::Tmp(3), Ref::Unused]),
-            instr(OpKind::Binary(BinOp::Mul), [Ref::Tmp(4), Ref::Tmp(5), Ref::Unused]),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(0), Ref::Tmp(1), Ref::Unused],
+            ),
+            instr(
+                OpKind::Binary(BinOp::Add),
+                [Ref::Tmp(2), Ref::Tmp(3), Ref::Unused],
+            ),
+            instr(
+                OpKind::Binary(BinOp::Mul),
+                [Ref::Tmp(4), Ref::Tmp(5), Ref::Unused],
+            ),
         ];
         let key = key(main, vec![first, second]);
-        let (judgement, estimates) = judge(&key, 1 << 20, 10, &CostModel::TEST, &Tuning::for_tests(), false);
-        let Judgement::Materialise { subs, reason: SplitReason::Inlined { limit: 10, .. } } = &judgement else { panic!("{judgement:?} {estimates:?}") };
+        let (judgement, estimates) = judge(
+            &key,
+            1 << 20,
+            10,
+            &CostModel::TEST,
+            &Tuning::for_tests(),
+            false,
+        );
+        let Judgement::Materialise {
+            subs,
+            reason: SplitReason::Inlined { limit: 10, .. },
+        } = &judgement
+        else {
+            panic!("{judgement:?} {estimates:?}")
+        };
         assert_eq!(subs, &[0, 1], "{estimates:?}");
         // With room for the whole program nothing is cut.
-        let (judgement, estimates) = judge(&key, 1 << 20, 100, &CostModel::TEST, &Tuning::for_tests(), false);
-        assert!(matches!(judgement, Judgement::Run { staging: None }), "{judgement:?} {estimates:?}");
+        let (judgement, estimates) = judge(
+            &key,
+            1 << 20,
+            100,
+            &CostModel::TEST,
+            &Tuning::for_tests(),
+            false,
+        );
+        assert!(
+            matches!(judgement, Judgement::Run { staging: None }),
+            "{judgement:?} {estimates:?}"
+        );
     }
 }
-

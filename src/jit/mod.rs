@@ -19,7 +19,7 @@
 //! `&x * 2.0` and `&x * 3.0` share one pipeline ([`program`]). The extents of the arrays are
 //! uniforms too (see [`params`]): the same expression on a grid of another shape is the same
 //! kernel, unless an extent is a power of two or the array has `2^23` elements or more, which
-//! change the index math, or the kernel stages sub-programs in workgroup memory.
+//! change the index math.
 //!
 //! # Where fusion stops
 //!
@@ -167,16 +167,16 @@ pub(crate) fn is_wide(len: usize) -> bool {
 }
 mod program;
 mod readers;
-mod rerun;
 mod replay;
+mod rerun;
 mod simplify;
 pub(crate) mod speculate;
 pub(crate) mod stack;
 mod staging;
 mod stencil;
-mod until;
 #[cfg(test)]
 mod tests;
+mod until;
 
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -193,18 +193,21 @@ use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::kernel::{self, KernelCore, KernelKey};
 use crate::profile::{FusionSplit, SplitReason};
 
-use inline::{inline, Judgement, Lowered, Verdict};
+use inline::{Judgement, Lowered, Verdict, inline};
 use looped::LoopPlan;
-use program::Instr;
 pub(crate) use program::AtomicOp;
+use program::Instr;
 
-pub(crate) use launch::{axis_reduce, check_finite, evaluate, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, run_loop, solve, MatmulKernel, MatmulSide, PartSide};
-pub(crate) use operator::{operator_source, Operator};
+pub(crate) use launch::{
+    MatmulKernel, MatmulSide, PartSide, axis_reduce, check_finite, evaluate, evaluate_group,
+    evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, run_loop, solve,
+};
+pub(crate) use operator::{Operator, operator_source};
 pub(crate) use readers::Readers;
+pub(crate) use replay::{Plan, Stepper, Trace, force};
 pub(crate) use rerun::{Attempt, Site};
-pub(crate) use replay::{force, Plan, Stepper, Trace};
 pub(crate) use stencil::plan as stencil_plan;
-pub(crate) use until::{next_block, run_until, FIRST_BLOCK};
+pub(crate) use until::{FIRST_BLOCK, next_block, run_until};
 
 /// Length of the requested list at which entries of dropped or computed nodes are pruned.
 const REQUESTED_PRUNE_AT: usize = 256;
@@ -311,7 +314,9 @@ impl ElemTy {
     }
 
     pub(crate) fn of<T: ScalarType>() -> std::result::Result<ElemTy, LumaError> {
-        Self::try_of::<T>().ok_or_else(|| LumaError::InvalidShape(format!("Unsupported element type {}", T::wgsl_type())))
+        Self::try_of::<T>().ok_or_else(|| {
+            LumaError::InvalidShape(format!("Unsupported element type {}", T::wgsl_type()))
+        })
     }
 
     pub(crate) fn wgsl(self) -> &'static str {
@@ -412,7 +417,12 @@ pub(crate) enum Gen {
     /// [`Gen::RangeConst`] with its numbers in the uniform: the [words of the
     /// divisors](params::divisor_words) of `stride` and `size` start at those slots (see
     /// `params::RangeKind` for the ones that are used).
-    ParamRange { kind: params::RangeKind, wide: bool, stride: u32, size: u32 },
+    ParamRange {
+        kind: params::RangeKind,
+        wide: bool,
+        stride: u32,
+        size: u32,
+    },
     /// `start + i * step`; operands: start, step.
     Linspace,
 }
@@ -476,11 +486,19 @@ pub(crate) enum Edge {
 impl ViewMap {
     /// The view that reads an array of `dims` as itself.
     pub(crate) fn identity(dims: [u32; 4]) -> ViewMap {
-        let mut axes = [AxisMap { from: 0, start: 0, step: 1 }; 4];
+        let mut axes = [AxisMap {
+            from: 0,
+            start: 0,
+            step: 1,
+        }; 4];
         for (a, axis) in axes.iter_mut().enumerate() {
             axis.from = a as u8;
         }
-        ViewMap { src: dims, out: dims, axes }
+        ViewMap {
+            src: dims,
+            out: dims,
+            axes,
+        }
     }
 
     /// Elements of the output.
@@ -530,7 +548,11 @@ impl ViewMap {
                 step: (step * i64::from(o.step)) as i32,
             };
         }
-        ViewMap { src: self.src, out: outer.out, axes }
+        ViewMap {
+            src: self.src,
+            out: outer.out,
+            axes,
+        }
     }
 
     /// Per source axis the inclusive range of coordinates read.
@@ -564,11 +586,17 @@ impl ViewMap {
     /// Whether every extent, offset and step fits the `i32` arithmetic of the generated index math.
     pub(crate) fn fits(&self) -> bool {
         let limit = i64::from(i32::MAX);
-        let dims_ok = self.src.iter().chain(&self.out).all(|&d| i64::from(d) <= limit);
+        let dims_ok = self
+            .src
+            .iter()
+            .chain(&self.out)
+            .all(|&d| i64::from(d) <= limit);
         dims_ok
             && self.axes.iter().all(|axis| {
                 let span = i64::from(axis.step) * i64::from(self.out[axis.from as usize]);
-                i64::from(axis.start).abs() <= limit && span.abs() <= limit && (i64::from(axis.start) + span).abs() <= limit
+                i64::from(axis.start).abs() <= limit
+                    && span.abs() <= limit
+                    && (i64::from(axis.start) + span).abs() <= limit
             })
     }
 }
@@ -576,12 +604,29 @@ impl ViewMap {
 impl OpKind {
     pub(crate) fn arity(self) -> usize {
         match self {
-            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
+            OpKind::Unary(_)
+            | OpKind::Cast(_)
+            | OpKind::Classify(_)
+            | OpKind::Shift(
+                ShiftKind::Dims { .. }
+                | ShiftKind::ParamDims { .. }
+                | ShiftKind::View {
+                    edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap,
+                    ..
+                },
+            ) => 1,
             OpKind::Shift(ShiftKind::ParamView { spec, .. }) if spec.edge != Edge::Fill => 1,
             OpKind::Binary(_)
             | OpKind::Compare(_)
             | OpKind::Powf
-            | OpKind::Shift(ShiftKind::View { edge: Edge::Fill, .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => 2,
+            | OpKind::Shift(
+                ShiftKind::View {
+                    edge: Edge::Fill, ..
+                }
+                | ShiftKind::ParamView { .. }
+                | ShiftKind::Take { .. }
+                | ShiftKind::ParamTake { .. },
+            ) => 2,
             OpKind::Shift(ShiftKind::Linear) | OpKind::Clamp | OpKind::Select => 3,
             OpKind::Generate(Gen::Index | Gen::RangeConst { .. } | Gen::ParamRange { .. }) => 0,
             OpKind::Generate(_) => 2,
@@ -620,7 +665,11 @@ impl Op {
         let mut hasher = FxHasher::default();
         kind.hash(&mut hasher);
         ty.hash(&mut hasher);
-        Op { kind, ty, fingerprint: hasher.finish() }
+        Op {
+            kind,
+            ty,
+            fingerprint: hasher.finish(),
+        }
     }
 
     pub(crate) fn out_ty(self) -> ElemTy {
@@ -637,7 +686,9 @@ impl Op {
             (OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. }), 1) => self.ty,
             (OpKind::Select, 0) => ElemTy::Bool,
             (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
-            (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal | Gen::RangePow2), _) => ElemTy::U32,
+            (OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal | Gen::RangePow2), _) => {
+                ElemTy::U32
+            }
             _ => self.ty,
         }
     }
@@ -662,17 +713,25 @@ pub(crate) struct Scalar {
 
 impl Scalar {
     pub(crate) fn f32(value: f32) -> Self {
-        Scalar { ty: ElemTy::F32, bits: u64::from(value.to_bits()) }
+        Scalar {
+            ty: ElemTy::F32,
+            bits: u64::from(value.to_bits()),
+        }
     }
 
     pub(crate) fn u32(value: u32) -> Self {
-        Scalar { ty: ElemTy::U32, bits: u64::from(value) }
+        Scalar {
+            ty: ElemTy::U32,
+            bits: u64::from(value),
+        }
     }
 
     pub(crate) fn of<T: ScalarType>(value: T) -> std::result::Result<Self, LumaError> {
         let ty = ElemTy::of::<T>()?;
         let bits = match ty.slots() {
-            1 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()))),
+            1 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(
+                &value.into_repr(),
+            ))),
             _ => bytemuck::pod_read_unaligned::<u64>(bytemuck::bytes_of(&value.into_repr())),
         };
         Ok(Scalar { ty, bits })
@@ -709,7 +768,10 @@ pub(crate) enum Src {
 impl Src {
     /// Filler for the operand slots an operation does not use.
     pub(crate) fn unused() -> Self {
-        Src::Scalar(Scalar { ty: ElemTy::U32, bits: 0 })
+        Src::Scalar(Scalar {
+            ty: ElemTy::U32,
+            bits: 0,
+        })
     }
 }
 
@@ -839,7 +901,10 @@ impl Held {
     /// Another claim on the same node (and on whatever replaces it).
     pub(crate) fn share(&self) -> Held {
         self.node.handles.fetch_add(1, Ordering::Relaxed);
-        Held { node: Arc::clone(&self.node), link: Arc::clone(&self.link) }
+        Held {
+            node: Arc::clone(&self.node),
+            link: Arc::clone(&self.link),
+        }
     }
 
     /// The claim on the node that holds the value of the arrays that were created holding this
@@ -913,7 +978,11 @@ impl Node {
 
     /// Distinct nodes in the expression below this one.
     fn below_len(&self) -> usize {
-        if self.looped.get().is_some() { 0 } else { self.below_len }
+        if self.looped.get().is_some() {
+            0
+        } else {
+            self.below_len
+        }
     }
 
     /// The part of `ids` that holds the nodes below this one.
@@ -928,9 +997,17 @@ impl Node {
     fn below_span(&self) -> Option<(u64, u64)> {
         let part = self.below_part();
         if self.below_sparse {
-            return Some((*part.first()? * 64, *part.get(part.len().checked_sub(2)?)? * 64 + 63));
+            return Some((
+                *part.first()? * 64,
+                *part.get(part.len().checked_sub(2)?)? * 64 + 63,
+            ));
         }
-        (!part.is_empty()).then(|| (self.below_base, self.below_base + 64 * part.len() as u64 - 1))
+        (!part.is_empty()).then(|| {
+            (
+                self.below_base,
+                self.below_base + 64 * part.len() as u64 - 1,
+            )
+        })
     }
 
     /// Whether node `id` is below this one.
@@ -940,10 +1017,15 @@ impl Node {
             let word = id >> 6;
             let pairs = part.as_chunks::<2>().0;
             let at = pairs.partition_point(|&[w, _]| w < word);
-            return pairs.get(at).is_some_and(|&[w, bits]| w == word && bits >> (id & 63) & 1 == 1);
+            return pairs
+                .get(at)
+                .is_some_and(|&[w, bits]| w == word && bits >> (id & 63) & 1 == 1);
         }
-        let Some(offset) = id.checked_sub(self.below_base) else { return false };
-        part.get((offset >> 6) as usize).is_some_and(|word| word >> (offset & 63) & 1 == 1)
+        let Some(offset) = id.checked_sub(self.below_base) else {
+            return false;
+        };
+        part.get((offset >> 6) as usize)
+            .is_some_and(|word| word >> (offset & 63) & 1 == 1)
     }
 
     /// Calls `f` with the ids of the distinct nodes below this one, ascending, until it says yes.
@@ -1033,20 +1115,32 @@ impl Node {
     /// Levels of shifted lazy expressions in the expression (see [`recompute_shifted`]). The plan
     /// of a loop leaf evaluates its inputs, so it has none.
     fn shift_depth(&self) -> u8 {
-        if self.looped.get().is_some() { 0 } else { self.shift_depth }
+        if self.looped.get().is_some() {
+            0
+        } else {
+            self.shift_depth
+        }
     }
 
     /// The operations of the expression in f32-operation units, an upper bound (see
     /// [`cost::op_weight`]) that counts a node an expression reads twice twice, up to
     /// [`MAX_AVERAGE_WEIGHT`] per distinct node. A loop leaf has none: its plan evaluates its inputs.
     fn weight(&self) -> f64 {
-        if self.looped.get().is_some() { 0.0 } else { self.weight }
+        if self.looped.get().is_some() {
+            0.0
+        } else {
+            self.weight
+        }
     }
 
     /// Levels of the expression below this node. The plan of a loop leaf evaluates its inputs,
     /// so it has none.
     fn depth(&self) -> u16 {
-        if self.looped.get().is_some() { 0 } else { self.depth }
+        if self.looped.get().is_some() {
+            0
+        } else {
+            self.depth
+        }
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -1091,14 +1185,23 @@ impl Node {
             Some(args) => evaluate(self, args).map(Arc::new),
             None => match (self.looped.get(), self.deferred.get()) {
                 (Some((plan, j)), _) => plan.output(&self.ctx, *j, self.name, self.location),
-                (None, Some(reduced)) => reduced.record_once(&self.ctx).clone().map_err(Failure::Inherited),
-                (None, None) => Err(Failure::New(LumaError::Gpu("lazy node evaluated recursively".into()))),
+                (None, Some(reduced)) => reduced
+                    .record_once(&self.ctx)
+                    .clone()
+                    .map_err(Failure::Inherited),
+                (None, None) => Err(Failure::New(LumaError::Gpu(
+                    "lazy node evaluated recursively".into(),
+                ))),
             },
         };
         match outcome {
             Ok(storage) => {
                 if let Err(error) = check_finite(&self.ctx, &storage, self.op.out_ty()) {
-                    return Err(Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) }));
+                    return Err(Arc::new(LumaError::Op {
+                        op: self.name,
+                        location: self.location,
+                        source: Arc::new(error),
+                    }));
                 }
                 storage.set_producer(self.id);
                 storage.readers.absorb(&self.readers);
@@ -1117,7 +1220,11 @@ impl Node {
     /// Records that the node's value, computed inside a kernel with several outputs, failed a
     /// check: the node's result is `error`, reported as an error of this operation.
     fn fail(&self, error: LumaError) {
-        let failed = Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) });
+        let failed = Arc::new(LumaError::Op {
+            op: self.name,
+            location: self.location,
+            source: Arc::new(error),
+        });
         if self.result.set(Err(failed)).is_ok() {
             lock(&self.args).take();
         }
@@ -1212,7 +1319,11 @@ impl IdSet {
     }
 
     fn word(&self, index: u64) -> u64 {
-        index.checked_sub(self.base).and_then(|offset| self.words.get(usize::try_from(offset).ok()?)).copied().unwrap_or(0)
+        index
+            .checked_sub(self.base)
+            .and_then(|offset| self.words.get(usize::try_from(offset).ok()?))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn contains(&self, id: u64) -> bool {
@@ -1231,7 +1342,11 @@ impl IdSet {
 
     /// Adds the nodes below `node`, and `node` itself if `with_self`.
     fn add(&mut self, node: &Node, with_self: bool) {
-        let span = node.below_span().map(|(first, last)| (first >> 6, last >> 6)).into_iter().chain(with_self.then_some((node.id >> 6, node.id >> 6)));
+        let span = node
+            .below_span()
+            .map(|(first, last)| (first >> 6, last >> 6))
+            .into_iter()
+            .chain(with_self.then_some((node.id >> 6, node.id >> 6)));
         let (mut lo, mut hi) = (u64::MAX, 0);
         for (first, last) in span {
             lo = lo.min(first);
@@ -1290,7 +1405,9 @@ fn overlap(a: &[u64], b: &[u64]) -> (usize, usize) {
 
 /// Merges the sorted `other` into the sorted `ids` (a set union), through `tmp`.
 fn union_into(ids: &mut Vec<u64>, tmp: &mut Vec<u64>, other: &[u64]) {
-    let (Some(&first), Some(&last)) = (other.first(), other.last()) else { return };
+    let (Some(&first), Some(&last)) = (other.first(), other.last()) else {
+        return;
+    };
     // Operands are mostly nested or disjoint: nothing to interleave.
     if ids.last().is_none_or(|&top| top < first) {
         ids.extend_from_slice(other);
@@ -1349,7 +1466,11 @@ fn mark(set: &mut [u64], base: u64, id: u64) {
 fn add_id(set: &mut Vec<u64>, id: u64) {
     let (word, bit) = (id >> 6, 1u64 << (id & 63));
     // Ids are made in ascending order: the newest usually goes last.
-    match set.len().checked_sub(2).and_then(|last| Some((last, *set.get(last)?))) {
+    match set
+        .len()
+        .checked_sub(2)
+        .and_then(|last| Some((last, *set.get(last)?)))
+    {
         None => return set.extend([word, bit]),
         Some((_, top)) if top < word => return set.extend([word, bit]),
         Some((last, top)) if top == word => {
@@ -1371,7 +1492,10 @@ fn add_id(set: &mut Vec<u64>, id: u64) {
 
 /// Merges the set `other` into `set` (both sorted `(word, bits)` pairs), through `tmp`.
 fn merge_sets(set: &mut Vec<u64>, tmp: &mut Vec<u64>, other: &[u64]) {
-    let (Some(&first), Some(&last)) = (other.first(), other.get(other.len().wrapping_sub(2))) else { return };
+    let (Some(&first), Some(&last)) = (other.first(), other.get(other.len().wrapping_sub(2)))
+    else {
+        return;
+    };
     // Operands are mostly nested or disjoint: nothing to interleave.
     match set.get(set.len().wrapping_sub(2)) {
         None => return set.extend_from_slice(other),
@@ -1494,7 +1618,13 @@ struct Measure {
 /// The distinct nodes below and distinct buffers read by an operation on `args`.
 fn measure(args: &[Src]) -> Measure {
     MEASURED.with_borrow_mut(|m| {
-        let Measured { inputs, below, decoded, tmp, dense } = m;
+        let Measured {
+            inputs,
+            below,
+            decoded,
+            tmp,
+            dense,
+        } = m;
         inputs.clear();
         let mut nodes: [Option<&Arc<Node>>; 3] = [None; 3];
         let mut count = 0;
@@ -1504,7 +1634,12 @@ fn measure(args: &[Src]) -> Measure {
                 Src::Buffer(storage) => insert_sorted(inputs, storage.binding_id()),
                 Src::Node(node) => {
                     // `x * x`: the second operand adds nothing.
-                    if nodes.iter().take(count).flatten().any(|first| Arc::ptr_eq(first, node)) {
+                    if nodes
+                        .iter()
+                        .take(count)
+                        .flatten()
+                        .any(|first| Arc::ptr_eq(first, node))
+                    {
                         continue;
                     }
                     if let Some(slot) = nodes.get_mut(count) {
@@ -1518,14 +1653,29 @@ fn measure(args: &[Src]) -> Measure {
         let operands = || nodes.iter().take(count).flatten();
         let (mut lo, mut hi, mut upper, mut used) = (u64::MAX, 0u64, 0usize, 0usize);
         for node in operands() {
-            (lo, hi, upper) = (lo.min(node.id), hi.max(node.id), upper + 1 + node.below_len());
-            used += 1 + if node.below_sparse { node.below_part().len() / 2 } else { node.below_part().len() };
+            (lo, hi, upper) = (
+                lo.min(node.id),
+                hi.max(node.id),
+                upper + 1 + node.below_len(),
+            );
+            used += 1 + if node.below_sparse {
+                node.below_part().len() / 2
+            } else {
+                node.below_part().len()
+            };
             if let Some((first, last)) = node.below_span() {
                 (lo, hi) = (lo.min(first), hi.max(last));
             }
         }
         if count == 0 {
-            return Measure { below: 0, inputs: inputs.len(), ids: concat_ids(&[], inputs), base: 0, words: 0, sparse: true };
+            return Measure {
+                below: 0,
+                inputs: inputs.len(),
+                ids: concat_ids(&[], inputs),
+                base: 0,
+                words: 0,
+                sparse: true,
+            };
         }
         // The ids of nodes made around the same time are close together: one bit each, which
         // merges with a handful of word operations. Sets with big gaps between their words are
@@ -1540,8 +1690,19 @@ fn measure(args: &[Src]) -> Measure {
                 node.mark_below(dense, base);
             }
             // One operand: its set plus itself, which is not in it.
-            let below = if count == 1 { upper } else { dense.iter().map(|word| word.count_ones() as usize).sum() };
-            return Measure { below, inputs: inputs.len(), ids: concat_ids(dense, inputs), base, words: width as u32, sparse: false };
+            let below = if count == 1 {
+                upper
+            } else {
+                dense.iter().map(|word| word.count_ones() as usize).sum()
+            };
+            return Measure {
+                below,
+                inputs: inputs.len(),
+                ids: concat_ids(dense, inputs),
+                base,
+                words: width as u32,
+                sparse: false,
+            };
         }
         below.clear();
         for node in operands() {
@@ -1560,8 +1721,20 @@ fn measure(args: &[Src]) -> Measure {
             }
             add_id(below, node.id);
         }
-        let distinct = below.as_chunks::<2>().0.iter().map(|&[_, bits]| bits.count_ones() as usize).sum();
-        Measure { below: distinct, inputs: inputs.len(), ids: concat_ids(below, inputs), base: 0, words: below.len() as u32, sparse: true }
+        let distinct = below
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[_, bits]| bits.count_ones() as usize)
+            .sum();
+        Measure {
+            below: distinct,
+            inputs: inputs.len(),
+            ids: concat_ids(below, inputs),
+            base: 0,
+            words: below.len() as u32,
+            sparse: true,
+        }
     })
 }
 
@@ -1608,7 +1781,9 @@ fn count_inputs(args: &[Src], stop: &[Arc<Node>]) -> Vec<u64> {
         } else if let Some(operands) = node.operands() {
             work.extend(operands.into_iter().take(node.op.kind.arity()));
         } else {
-            node.inputs().iter().for_each(|&id| insert_sorted(&mut ids, id));
+            node.inputs()
+                .iter()
+                .for_each(|&id| insert_sorted(&mut ids, id));
         }
     }
     ids
@@ -1620,7 +1795,16 @@ fn count_inputs(args: &[Src], stop: &[Arc<Node>]) -> Vec<u64> {
 fn count_pending(args: &[Src]) -> Vec<u64> {
     let mut ids = Vec::new();
     let mut seen: FxMap<u64, ()> = FxMap::default();
-    let mut work: Vec<Arc<Node>> = args.iter().filter_map(|arg| if let Src::Node(node) = arg { Some(Arc::clone(node)) } else { None }).collect();
+    let mut work: Vec<Arc<Node>> = args
+        .iter()
+        .filter_map(|arg| {
+            if let Src::Node(node) = arg {
+                Some(Arc::clone(node))
+            } else {
+                None
+            }
+        })
+        .collect();
     while let Some(node) = work.pop() {
         if seen.insert(node.id, ()).is_some() || node.evaluated().is_some() {
             continue;
@@ -1630,7 +1814,18 @@ fn count_pending(args: &[Src]) -> Vec<u64> {
             continue;
         }
         if let Some(operands) = node.operands() {
-            work.extend(operands.into_iter().take(node.op.kind.arity()).filter_map(|operand| if let Src::Node(inner) = operand { Some(inner) } else { None }));
+            work.extend(
+                operands
+                    .into_iter()
+                    .take(node.op.kind.arity())
+                    .filter_map(|operand| {
+                        if let Src::Node(inner) = operand {
+                            Some(inner)
+                        } else {
+                            None
+                        }
+                    }),
+            );
         }
     }
     ids.sort_unstable();
@@ -1641,13 +1836,27 @@ fn count_pending(args: &[Src]) -> Vec<u64> {
 /// what is still pending.
 fn pending_depth(args: &[Src]) -> Option<u16> {
     let mut memo: FxMap<u64, u16> = FxMap::default();
-    let roots: Vec<Arc<Node>> = args.iter().filter_map(|arg| if let Src::Node(node) = arg { Some(Arc::clone(node)) } else { None }).collect();
-    let mut stack: Vec<(Arc<Node>, bool)> = roots.iter().map(|node| (Arc::clone(node), false)).collect();
+    let roots: Vec<Arc<Node>> = args
+        .iter()
+        .filter_map(|arg| {
+            if let Src::Node(node) = arg {
+                Some(Arc::clone(node))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut stack: Vec<(Arc<Node>, bool)> =
+        roots.iter().map(|node| (Arc::clone(node), false)).collect();
     while let Some((node, expanded)) = stack.pop() {
         if memo.contains_key(&node.id) {
             continue;
         }
-        let operands = if node.evaluated().is_some() || node.looped.get().is_some() { None } else { node.operands() };
+        let operands = if node.evaluated().is_some() || node.looped.get().is_some() {
+            None
+        } else {
+            node.operands()
+        };
         let Some(operands) = operands else {
             memo.insert(node.id, node.depth());
             continue;
@@ -1662,13 +1871,26 @@ fn pending_depth(args: &[Src]) -> Option<u16> {
             .collect();
         if !expanded {
             stack.push((Arc::clone(&node), true));
-            stack.extend(inner.into_iter().filter(|operand| !memo.contains_key(&operand.id)).map(|operand| (operand, false)));
+            stack.extend(
+                inner
+                    .into_iter()
+                    .filter(|operand| !memo.contains_key(&operand.id))
+                    .map(|operand| (operand, false)),
+            );
             continue;
         }
-        let depth = inner.iter().filter_map(|operand| memo.get(&operand.id)).map(|d| d.saturating_add(1)).max().unwrap_or(0);
+        let depth = inner
+            .iter()
+            .filter_map(|operand| memo.get(&operand.id))
+            .map(|d| d.saturating_add(1))
+            .max()
+            .unwrap_or(0);
         memo.insert(node.id, depth);
     }
-    roots.iter().filter_map(|node| memo.get(&node.id).copied()).max()
+    roots
+        .iter()
+        .filter_map(|node| memo.get(&node.id).copied())
+        .max()
 }
 
 /// The [`Measure`] of `old` with the nodes below replaced by the sorted `pending` ids (as sorted
@@ -1684,7 +1906,14 @@ fn measure_pending(pending: &[u64], old: &Measure) -> Measure {
         }
     }
     let inputs = old.ids.get(old.words as usize..).unwrap_or(&[]);
-    Measure { below: pending.len(), inputs: old.inputs, ids: concat_ids(&pairs, inputs), base: 0, words: pairs.len() as u32, sparse: true }
+    Measure {
+        below: pending.len(),
+        inputs: old.inputs,
+        ids: concat_ids(&pairs, inputs),
+        base: 0,
+        words: pairs.len() as u32,
+        sparse: true,
+    }
 }
 
 /// Replaces `args[i]` and every operand that is the same node by its evaluated buffer.
@@ -1715,17 +1944,28 @@ fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(),
     let exists = match op.kind {
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
-        OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
+        OpKind::Compare(_)
+        | OpKind::Select
+        | OpKind::Clamp
+        | OpKind::Shift(_)
+        | OpKind::Cast(_) => true,
         OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool),
         OpKind::Powf => op.ty != ElemTy::F64,
         // A `bool` holds only 0 or 1, which no ramp or counter keeps.
         OpKind::Generate(_) => !wide && op.ty != ElemTy::Bool,
     };
     if !exists {
-        return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", op.ty.display())));
+        return Err(LumaError::Unsupported(format!(
+            "{name} is not available for {} arrays",
+            op.ty.display()
+        )));
     }
-    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(wgpu::Features::SHADER_F64) {
-        return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
+    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64)
+        && !ctx.features().contains(wgpu::Features::SHADER_F64)
+    {
+        return Err(LumaError::Unsupported(
+            "f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into(),
+        ));
     }
     Ok(())
 }
@@ -1801,7 +2041,10 @@ pub(crate) fn create(
         return Ok(found);
     }
 
-    let max_nodes = FUSION_LIMIT.with(std::cell::Cell::get).unwrap_or_else(|| jit.max_nodes()).clamp(1, MAX_NODES_LIMIT);
+    let max_nodes = FUSION_LIMIT
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| jit.max_nodes())
+        .clamp(1, MAX_NODES_LIMIT);
     let max_inputs = jit.max_inputs();
     // The first time the expression is over a limit, its biggest operand is evaluated together
     // with the live arrays that share pending work with it (see the module documentation)
@@ -1836,7 +2079,12 @@ pub(crate) fn create(
             // takes one binding (see `pack`); only if that cannot be done is the expression cut.
             if inputs > max_inputs && !packed {
                 packed = true;
-                if pack::repack(ctx, op, args.get(..arity).unwrap_or(&[]), inputs - max_inputs) {
+                if pack::repack(
+                    ctx,
+                    op,
+                    args.get(..arity).unwrap_or(&[]),
+                    inputs - max_inputs,
+                ) {
                     continue;
                 }
             }
@@ -1860,11 +2108,19 @@ pub(crate) fn create(
         if !noted {
             noted = true;
             let reason = if below >= max_nodes {
-                SplitReason::Nodes { nodes: below + 1, limit: max_nodes }
+                SplitReason::Nodes {
+                    nodes: below + 1,
+                    limit: max_nodes,
+                }
             } else if inputs > max_inputs {
-                SplitReason::Inputs { inputs, limit: max_inputs }
+                SplitReason::Inputs {
+                    inputs,
+                    limit: max_inputs,
+                }
             } else {
-                SplitReason::Depth { limit: usize::from(MAX_DEPTH) }
+                SplitReason::Depth {
+                    limit: usize::from(MAX_DEPTH),
+                }
             };
             jit.note_split(name, location, reason);
         }
@@ -1939,7 +2195,11 @@ pub(crate) fn create(
     let (mut shift_depth, mut deepest, mut operand_weight) = (0u8, None::<u16>, 0.0);
     for (i, arg) in args.iter().take(arity).enumerate() {
         if let Src::Node(operand) = arg {
-            shift_depth = shift_depth.max(operand.shift_depth().saturating_add(u8::from(i == 0 && is_shift)));
+            shift_depth = shift_depth.max(
+                operand
+                    .shift_depth()
+                    .saturating_add(u8::from(i == 0 && is_shift)),
+            );
             deepest = deepest.max(Some(operand.depth()));
             operand_weight += operand.weight();
         }
@@ -1948,8 +2208,11 @@ pub(crate) fn create(
     // a tree, which doubles with every level of a flux that two readers read, say): no operation
     // weighs more than `MAX_AVERAGE_WEIGHT` on average, so that is what an expression of that many
     // distinct nodes is bounded by.
-    let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight).min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
-    let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
+    let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight)
+        .min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
+    let depth = exact_depth
+        .unwrap_or(deepest)
+        .map_or(0, |deepest| deepest.saturating_add(1));
 
     let trace = rerun::created(op, len, &args, arity);
     let node = Arc::new(Node {
@@ -2013,7 +2276,14 @@ pub(crate) fn create(
 /// `Df32` sum) read this node, so that building them evaluates nothing; the reduction is
 /// recorded when something that needs the value is, after the arrays it shares work with. It has
 /// no operands: expressions that read it find it evaluated first, like a loop leaf.
-pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate::reduce::Reduced>, name: &'static str, location: &'static Location<'static>) -> Arc<Node> {
+pub(crate) fn deferred(
+    ctx: &Context,
+    len: usize,
+    ty: ElemTy,
+    reduced: Arc<crate::reduce::Reduced>,
+    name: &'static str,
+    location: &'static Location<'static>,
+) -> Arc<Node> {
     let measured = measure(&[]);
     let node = Arc::new(Node {
         trace: 0,
@@ -2100,12 +2370,15 @@ fn cons_hash(op: Op, len: usize, args: &Args) -> u64 {
 
 /// Whether `a` and `b` are the same operands of `op`: the same buffers and nodes, equal scalars.
 fn cons_same(op: Op, a: &Args, b: &Args) -> bool {
-    a.iter().zip(b).take(op.kind.arity()).all(|pair| match pair {
-        (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
-        (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
-        (Src::Scalar(a), Src::Scalar(b)) => a.ty == b.ty && a.bits == b.bits,
-        _ => false,
-    })
+    a.iter()
+        .zip(b)
+        .take(op.kind.arity())
+        .all(|pair| match pair {
+            (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
+            (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
+            (Src::Scalar(a), Src::Scalar(b)) => a.ty == b.ty && a.bits == b.bits,
+            _ => false,
+        })
 }
 
 /// Pending nodes by what they compute, so that writing the same operation on the same operands
@@ -2142,7 +2415,13 @@ pub(crate) fn recompute_shifted(node: &Node, dims: [usize; 4], offsets: [isize; 
     let small = |axis: usize| {
         let dim = dims[axis] as isize;
         let offset = offsets[axis].rem_euclid(dim.max(1));
-        (if offset > dim / 2 { offset - dim } else { offset }).abs() <= 2
+        (if offset > dim / 2 {
+            offset - dim
+        } else {
+            offset
+        })
+        .abs()
+            <= 2
     };
     let stageable = dims[2] == 1
         && dims[3] == 1
@@ -2180,7 +2459,12 @@ fn claim_recompute(node: &Node) -> bool {
         if reads >= MAX_LAZY_READS {
             return false;
         }
-        match node.shifted_reads.compare_exchange_weak(reads, reads + 1, Ordering::Relaxed, Ordering::Relaxed) {
+        match node.shifted_reads.compare_exchange_weak(
+            reads,
+            reads + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => return true,
             Err(now) => reads = now,
         }
@@ -2212,7 +2496,8 @@ pub(crate) fn worth_storing_at(node: &Node, weight: f64) -> bool {
     }
     let cost = node.context().cost_model();
     let len = node.len() as f64;
-    weight * len / cost.f32_ops_per_ns > cost::kernel_ns(&cost, len * node.op().out_ty().traffic() * 2.0, 0.0)
+    weight * len / cost.f32_ops_per_ns
+        > cost::kernel_ns(&cost, len * node.op().out_ty().traffic() * 2.0, 0.0)
 }
 
 /// Whether a view or gather of the pending `node` reads its expression lazily (as a sub-program
@@ -2222,7 +2507,8 @@ pub(crate) fn worth_storing_at(node: &Node, weight: f64) -> bool {
 /// reads it, once per distinct index (see [`inline`]); the node limit of [`create`] and the
 /// size check of `program::flatten_inner` bound the kernel.
 pub(crate) fn recompute_viewed(node: &Node) -> bool {
-    node.len() as u64 * node.op().out_ty().stride() <= node.context().segment_bytes() && !node.requested.load(Ordering::Relaxed)
+    node.len() as u64 * node.op().out_ty().stride() <= node.context().segment_bytes()
+        && !node.requested.load(Ordering::Relaxed)
 }
 
 /// The compiled kernels of one loop program, with the state layout each one was built for.
@@ -2252,6 +2538,8 @@ pub(crate) struct JitState {
     requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
     inputs_limit: AtomicUsize,
+    #[cfg(test)]
+    device_inputs: usize,
     /// Overrides [`Tuning::max_live`] when not 0 (tests).
     max_live: AtomicUsize,
     /// Overrides [`Tuning::max_inlined`] when not 0 (tests).
@@ -2349,13 +2637,13 @@ impl JitState {
             .clamp(1, MAX_NODES_LIMIT);
         // One storage binding is the output, plus luma's grid uniform and Params uniform (counted
         // against the same per-stage buffer table on Metal).
-        let max_inputs = (limits.max_storage_buffers_per_shader_stage as usize)
+        let device_inputs = (limits.max_storage_buffers_per_shader_stage as usize)
             .saturating_sub(3)
             .clamp(1, MAX_INPUTS);
         let max_inputs = std::env::var(MAX_INPUTS_ENV)
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .map_or(max_inputs, |limit| limit.clamp(1, max_inputs));
+            .map_or(device_inputs, |limit| limit.clamp(1, device_inputs));
         JitState {
             kernels: BuildCache::default(),
             fast_kernels: Mutex::new(FxMap::default()),
@@ -2365,6 +2653,8 @@ impl JitState {
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             inputs_limit: AtomicUsize::new(max_inputs),
+            #[cfg(test)]
+            device_inputs,
             max_live: AtomicUsize::new(0),
             max_inlined: AtomicUsize::new(0),
             #[cfg(test)]
@@ -2395,7 +2685,8 @@ impl JitState {
             stats: Stats::default(),
             id: NEXT_JIT_ID.fetch_add(1, Ordering::Relaxed),
             speculation: Mutex::new(speculate::Tracker::new(
-                !std::env::var(SPECULATE_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
+                !std::env::var(SPECULATE_ENV)
+                    .is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
             )),
             reruns: Mutex::new(rerun::Cache::default()),
         }
@@ -2438,7 +2729,8 @@ impl JitState {
         }
         let entries = structures.entry(key.shape).or_default();
         let same = |known: &(Arc<Vec<Instr>>, Arc<Vec<Vec<Instr>>>)| {
-            (Arc::ptr_eq(&known.0, &key.instrs) || known.0 == key.instrs) && (Arc::ptr_eq(&known.1, &key.subs) || known.1 == key.subs)
+            (Arc::ptr_eq(&known.0, &key.instrs) || known.0 == key.instrs)
+                && (Arc::ptr_eq(&known.1, &key.subs) || known.1 == key.subs)
         };
         match entries.iter().find(|known| same(known)) {
             Some((instrs, subs)) => {
@@ -2451,7 +2743,12 @@ impl JitState {
 
     /// How to run `key` (which [`inlines`](program::FusedKey::inlines)) over about `len`
     /// elements, found once per program structure and length class (see [`inline::judge`]).
-    pub(crate) fn judgement(&self, ctx: &Context, key: &program::FusedKey, len: usize) -> Arc<Judgement> {
+    pub(crate) fn judgement(
+        &self,
+        ctx: &Context,
+        key: &program::FusedKey,
+        len: usize,
+    ) -> Arc<Judgement> {
         use std::hash::{Hash, Hasher};
         let cap = self.max_inlined(ctx.tuning());
         let class = len.next_power_of_two();
@@ -2475,7 +2772,14 @@ impl JitState {
         let (judgement, _estimates) = match entries.iter().find(|entry| same(entry)) {
             Some(entry) => (Arc::clone(&entry.judgement), entry.estimates),
             None => {
-                let (judgement, estimates) = inline::judge(key, class, cap, &ctx.cost_model(), ctx.tuning(), ctx.tuning().staging && self.staging_enabled());
+                let (judgement, estimates) = inline::judge(
+                    key,
+                    class,
+                    cap,
+                    &ctx.cost_model(),
+                    ctx.tuning(),
+                    ctx.tuning().staging && self.staging_enabled(),
+                );
                 let judgement = Arc::new(judgement);
                 entries.push(JudgementEntry {
                     cap,
@@ -2562,9 +2866,18 @@ impl JitState {
     }
 
     /// Notes that an expression was cut into several kernels, if anyone listens.
-    pub(crate) fn note_split(&self, op: &'static str, location: &'static Location<'static>, reason: SplitReason) {
+    pub(crate) fn note_split(
+        &self,
+        op: &'static str,
+        location: &'static Location<'static>,
+        reason: SplitReason,
+    ) {
         if let Some(splits) = lock(&self.splits).as_mut() {
-            splits.push(FusionSplit { op, location, reason });
+            splits.push(FusionSplit {
+                op,
+                location,
+                reason,
+            });
         }
     }
 
@@ -2581,7 +2894,8 @@ impl JitState {
     /// Overrides the most input buffers of a kernel (tests, to behave like a device with fewer bindings).
     #[cfg(test)]
     pub(crate) fn set_max_inputs(&self, max_inputs: usize) {
-        self.inputs_limit.store(max_inputs, Ordering::Relaxed);
+        self.inputs_limit
+            .store(max_inputs.clamp(1, self.device_inputs), Ordering::Relaxed);
     }
 
     /// Most input buffers one fused kernel binds: what the device allows, capped by [`MAX_INPUTS`].
@@ -2694,7 +3008,8 @@ impl JitState {
 
     #[cfg(test)]
     pub(crate) fn set_max_nodes(&self, max_nodes: usize) {
-        self.max_nodes.store(max_nodes.clamp(1, MAX_NODES_LIMIT), Ordering::Relaxed);
+        self.max_nodes
+            .store(max_nodes.clamp(1, MAX_NODES_LIMIT), Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -2720,7 +3035,9 @@ impl JitState {
         }
         let mut requested = lock(&self.requested);
         if requested.nodes.len() >= requested.prune_at.max(REQUESTED_PRUNE_AT) {
-            requested.nodes.retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
+            requested
+                .nodes
+                .retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
             requested.prune_at = requested.nodes.len().saturating_mul(2);
         }
         requested.nodes.push(Arc::downgrade(node));
@@ -2735,9 +3052,20 @@ impl JitState {
         const NEWEST: usize = 8;
         let requested = lock(&self.requested);
         let pending = |weak: &Weak<Node>| weak.upgrade().filter(|node| node.is_pending());
-        requested.nodes.iter().rev().take(NEWEST).filter_map(pending).filter(|node| node.shift_depth() > 0).any(|node| {
-            requested.nodes.iter().filter_map(pending).any(|other| !Arc::ptr_eq(&node, &other) && node.below_contains(other.id))
-        })
+        requested
+            .nodes
+            .iter()
+            .rev()
+            .take(NEWEST)
+            .filter_map(pending)
+            .filter(|node| node.shift_depth() > 0)
+            .any(|node| {
+                requested
+                    .nodes
+                    .iter()
+                    .filter_map(pending)
+                    .any(|other| !Arc::ptr_eq(&node, &other) && node.below_contains(other.id))
+            })
     }
 
     /// Computes the requested nodes that are still alive and were created by this thread, those
@@ -2766,7 +3094,8 @@ impl JitState {
         }
         while let Some(first) = pending.first() {
             let len = first.len;
-            let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);
+            let (same, rest): (Vec<_>, Vec<_>) =
+                pending.into_iter().partition(|node| node.len == len);
             evaluate_group(&same);
             pending = rest;
         }
@@ -2791,10 +3120,15 @@ impl JitState {
     fn evaluate_swept(&self, held: bool) {
         let me = current_thread();
         let nodes = self.live.take_if(|node| node.thread == me);
-        let mut pending: Vec<Arc<Node>> = nodes.into_iter().rev().filter_map(|weak| weak.upgrade()).collect();
+        let mut pending: Vec<Arc<Node>> = nodes
+            .into_iter()
+            .rev()
+            .filter_map(|weak| weak.upgrade())
+            .collect();
         while let Some(first) = pending.first() {
             let len = first.len;
-            let (same, mut rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);
+            let (same, mut rest): (Vec<_>, Vec<_>) =
+                pending.into_iter().partition(|node| node.len == len);
             let mut group: Vec<Arc<Node>> = Vec::new();
             let (mut inputs, mut below) = (Vec::new(), IdSet::default());
             for node in same {
@@ -2816,9 +3150,14 @@ impl JitState {
                 }
                 let mut tmp = Vec::new();
                 let mut more_inputs = inputs.clone();
-                union_into(&mut more_inputs, &mut tmp, &self.inputs_within(&node, &inputs, self.max_inputs()));
+                union_into(
+                    &mut more_inputs,
+                    &mut tmp,
+                    &self.inputs_within(&node, &inputs, self.max_inputs()),
+                );
                 let (_, new_below) = below.overlap(&node);
-                let fits = more_inputs.len() + self.output_bindings(&group, &node) <= self.max_inputs() + 1
+                let fits = more_inputs.len() + self.output_bindings(&group, &node)
+                    <= self.max_inputs() + 1
                     && below.len() + new_below + group.len() < MAX_NODES_LIMIT;
                 if fits || group.is_empty() {
                     inputs = more_inputs;
@@ -2839,7 +3178,10 @@ impl JitState {
     /// may be fewer (or windows of one pack), so then they are counted again.
     fn inputs_within(&self, node: &Arc<Node>, have: &[u64], room: usize) -> Vec<u64> {
         let made = node.inputs();
-        let extra = made.iter().filter(|id| have.binary_search(id).is_err()).count();
+        let extra = made
+            .iter()
+            .filter(|id| have.binary_search(id).is_err())
+            .count();
         if have.len() + extra < room {
             return made.to_vec();
         }
@@ -2854,7 +3196,10 @@ impl JitState {
     fn output_bindings(&self, group: &[Arc<Node>], node: &Arc<Node>) -> usize {
         let count = group.len() + 1;
         let ty = node.op.out_ty();
-        let packed = group.iter().all(|member| member.op.out_ty() == ty && member.len == node.len) && launch::packable(&node.ctx, count, node.len, ty);
+        let packed = group
+            .iter()
+            .all(|member| member.op.out_ty() == ty && member.len == node.len)
+            && launch::packable(&node.ctx, count, node.len, ty);
         if packed { 1 } else { count }
     }
 
@@ -2893,7 +3238,10 @@ impl JitState {
             }
             let node_inputs = self.inputs_within(&node, &inputs, self.max_inputs());
             let (_, new_inputs) = overlap(&node_inputs, &inputs);
-            if inputs.len() + new_inputs + self.output_bindings(&group, &node) <= self.max_inputs() + 1 && below.len() + new_below + group.len() < MAX_NODES_LIMIT {
+            if inputs.len() + new_inputs + self.output_bindings(&group, &node)
+                <= self.max_inputs() + 1
+                && below.len() + new_below + group.len() < MAX_NODES_LIMIT
+            {
                 union_into(&mut inputs, &mut tmp, &node_inputs);
                 below.add(&node, true);
                 group.push(node);
@@ -2909,20 +3257,30 @@ impl JitState {
         }
     }
 
-    /// The kernel for `key`, generated and compiled on first use. Unless it stages values in
-    /// workgroup memory, `key` first gets the numbers of its views, gathers and scatter read from
-    /// the uniform (see [`params`]), which `scalars` then holds too: kernels that differ in
+    /// The kernel for `key`, generated and compiled on first use. `key` first gets the numbers
+    /// of its views, gathers and scatter read from the uniform (see [`params`]), and the extents
+    /// of its array if it stages values in workgroup memory ([`params::apply_tile`],
+    /// [`params::apply_staging`]), which `scalars` then holds too: kernels that differ in
     /// those only are one kernel. Compiling takes no lock of the cache: threads that need other
     /// kernels carry on meanwhile (see [`BuildCache`]).
-    pub(crate) fn kernel(&self, ctx: &Context, key: &mut program::FusedKey, scalars: &mut Vec<u32>) -> Result<Arc<KernelCore>> {
+    pub(crate) fn kernel(
+        &self,
+        ctx: &Context,
+        key: &mut program::FusedKey,
+        scalars: &mut Vec<u32>,
+    ) -> Result<Arc<KernelCore>> {
         #[cfg(test)]
         {
-            self.last_program_len.store(key.instrs.len(), Ordering::Relaxed);
+            self.last_program_len
+                .store(key.instrs.len(), Ordering::Relaxed);
             *lock(&self.last_staging) = key.staging.clone();
         }
         if key.staging.is_none() && key.tile.is_none() {
             let fast_hash = fast_key_hash(key);
-            if let Some(hit) = lock(&self.fast_kernels).get(&fast_hash).and_then(|list| list.iter().find(|entry| entry.matches(key))) {
+            if let Some(hit) = lock(&self.fast_kernels)
+                .get(&fast_hash)
+                .and_then(|list| list.iter().find(|entry| entry.matches(key)))
+            {
                 scalars.extend_from_slice(&hit.extra_words);
                 key.params = hit.params.clone();
                 #[cfg(test)]
@@ -2946,16 +3304,28 @@ impl JitState {
 
             self.parameterize(ctx, key, scalars);
             let key_ref = &*key;
-            let (core, built) = self.kernels.get_or_build(key_ref, || self.build_kernel(ctx, key_ref))?;
+            let (core, built) = self
+                .kernels
+                .get_or_build(key_ref, || self.build_kernel(ctx, key_ref))?;
             if !built {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
             }
             let extra_words: Box<[u32]> = scalars[base_words..].into();
-            let params_marker = key.params.as_ref().map(|p| Arc::new(params::Parameterized { inlined: None, slots: p.slots }));
-            #[cfg(test)]
-            let inlined_stats = key.params.as_ref().and_then(|p| p.inlined.as_ref()).map(|inl| {
-                (inl.instrs.len(), inl.branch.iter().filter(|&&b| b).count())
+            let params_marker = key.params.as_ref().map(|p| {
+                Arc::new(params::Parameterized {
+                    lowered: None,
+                    slots: p.slots,
+                })
             });
+            #[cfg(test)]
+            let inlined_stats = key
+                .params
+                .as_ref()
+                .and_then(|p| match &p.lowered {
+                    Some(Lowered::Plain(inl)) => Some(inl),
+                    _ => None,
+                })
+                .map(|inl| (inl.instrs.len(), inl.branch.iter().filter(|&&b| b).count()));
             let mut fast = lock(&self.fast_kernels);
             if fast.len() >= 4096 {
                 fast.clear();
@@ -2978,9 +3348,12 @@ impl JitState {
             });
             return Ok(core);
         }
+        params::apply_staging(ctx, key, scalars);
         params::apply_tile(key, scalars);
         let key = &*key;
-        let (core, built) = self.kernels.get_or_build(key, || self.build_kernel(ctx, key))?;
+        let (core, built) = self
+            .kernels
+            .get_or_build(key, || self.build_kernel(ctx, key))?;
         if !built {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
         }
@@ -3010,8 +3383,12 @@ impl JitState {
         }
         #[cfg(test)]
         if let Some(inlined) = &inlined {
-            self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed);
-            self.last_branches.store(inlined.branch.iter().filter(|&&branch| branch).count(), Ordering::Relaxed);
+            self.last_inlined_len
+                .store(inlined.instrs.len(), Ordering::Relaxed);
+            self.last_branches.store(
+                inlined.branch.iter().filter(|&&branch| branch).count(),
+                Ordering::Relaxed,
+            );
         }
         params::apply(key, inlined.as_ref(), scalars);
     }
@@ -3023,21 +3400,27 @@ impl JitState {
         // the ones the model wants cut, any other that got here is lowered in full.
         let cost = ctx.cost_model();
         let lowered = match (&key.params, &key.staging) {
-            (Some(params), _) => params.inlined.clone().map(Lowered::Plain),
+            (Some(params), _) => params.lowered.clone(),
             (None, Some(layout)) => Some(Lowered::Staged(
-                inline::lower_staged(key, layout, usize::MAX, &cost).expect("a staged program lowers without a cap"),
+                inline::lower_staged(key, layout, usize::MAX, &cost)
+                    .expect("a staged program lowers without a cap"),
             )),
-            (None, None) => key.inlines().then(|| match inline(key, usize::MAX, &cost) {
-                Verdict::Fits(inlined) => Some(Lowered::Plain(inlined)),
-                Verdict::TooBig { .. } => None,
-            }).flatten(),
+            (None, None) => key
+                .inlines()
+                .then(|| match inline(key, usize::MAX, &cost) {
+                    Verdict::Fits(inlined) => Some(Lowered::Plain(inlined)),
+                    Verdict::TooBig { .. } => None,
+                })
+                .flatten(),
         };
         #[cfg(debug_assertions)]
         if key.params.is_none() {
             let (inputs, scalars) = (key.input_tys.len(), key.scalar_tys.len());
             let checked = program::validate(key, inputs, scalars).and_then(|()| match &lowered {
                 Some(Lowered::Plain(inlined)) => inline::validate_inlined(inlined, inputs, false),
-                Some(Lowered::Staged(programs)) => programs.bodies().try_for_each(|inlined| inline::validate_inlined(inlined, inputs, true)),
+                Some(Lowered::Staged(programs)) => programs
+                    .bodies()
+                    .try_for_each(|inlined| inline::validate_inlined(inlined, inputs, true)),
                 None => Ok(()),
             });
             if let Err(message) = checked {
@@ -3045,13 +3428,22 @@ impl JitState {
             }
         }
         #[cfg(test)]
-        if key.params.is_none() {
+        if key
+            .params
+            .as_ref()
+            .is_none_or(|params| matches!(params.lowered, Some(Lowered::Staged(_))))
+        {
             match &lowered {
-                Some(Lowered::Plain(inlined)) => self.last_inlined_len.store(inlined.instrs.len(), Ordering::Relaxed),
-                Some(Lowered::Staged(programs)) => self.last_inlined_len.store(programs.main.instrs.len(), Ordering::Relaxed),
+                Some(Lowered::Plain(inlined)) => self
+                    .last_inlined_len
+                    .store(inlined.instrs.len(), Ordering::Relaxed),
+                Some(Lowered::Staged(programs)) => self
+                    .last_inlined_len
+                    .store(programs.main.instrs.len(), Ordering::Relaxed),
                 None => {}
             }
-            let count = |inlined: &inline::Inlined| inlined.branch.iter().filter(|&&branch| branch).count();
+            let count =
+                |inlined: &inline::Inlined| inlined.branch.iter().filter(|&&branch| branch).count();
             let branches = match &lowered {
                 Some(Lowered::Plain(inlined)) => count(inlined),
                 Some(Lowered::Staged(programs)) => programs.bodies().map(count).sum::<usize>(),
@@ -3070,7 +3462,10 @@ impl JitState {
             true,
         )?);
         if let Some(started) = started {
-            log::debug!("luma: compiled {label} ({bytes} bytes of WGSL) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+            log::debug!(
+                "luma: compiled {label} ({bytes} bytes of WGSL) in {:.1} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
         }
         self.stats.built.fetch_add(1, Ordering::Relaxed);
         Ok(core)
@@ -3078,25 +3473,45 @@ impl JitState {
 
     /// The kernel that runs the store program `key` for several steps with its states
     /// (`states[k]`: the state input `k` reads) in registers, generated and compiled on first use.
-    pub(crate) fn loop_kernel(&self, ctx: &Context, key: &program::FusedKey, states: &[Option<usize>]) -> Result<Arc<KernelCore>> {
-        if let Some(core) = lock(&self.loops).get(key).and_then(|known| known.iter().find(|(layout, _)| layout == states)) {
+    pub(crate) fn loop_kernel(
+        &self,
+        ctx: &Context,
+        key: &program::FusedKey,
+        states: &[Option<usize>],
+    ) -> Result<Arc<KernelCore>> {
+        if let Some(core) = lock(&self.loops)
+            .get(key)
+            .and_then(|known| known.iter().find(|(layout, _)| layout == states))
+        {
             return Ok(Arc::clone(&core.1));
         }
         let source = codegen::loop_source(key, states, ctx.tuning());
         let label = format!("Loop{}", key.label().trim_start_matches("Fused"));
         let core = self.stencil_kernel(ctx, source, &label)?;
-        lock(&self.loops).entry(key.clone()).or_default().push((states.to_vec(), Arc::clone(&core)));
+        lock(&self.loops)
+            .entry(key.clone())
+            .or_default()
+            .push((states.to_vec(), Arc::clone(&core)));
         Ok(core)
     }
 
     /// The stencil kernel with WGSL `source`, compiled on first use.
-    pub(crate) fn stencil_kernel(&self, ctx: &Context, source: String, label: &str) -> Result<Arc<KernelCore>> {
+    pub(crate) fn stencil_kernel(
+        &self,
+        ctx: &Context,
+        source: String,
+        label: &str,
+    ) -> Result<Arc<KernelCore>> {
         let (core, built) = self.stencils.get_or_build(&source, || {
             let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
             let key = KernelKey::new(source.clone(), "main", None);
             let core = kernel::build_core(ctx, &key, Some(label), true).map(Arc::new);
             if let Some(started) = started {
-                log::debug!("luma: compiled {label} ({} bytes of WGSL) in {:.1} ms", source.len(), started.elapsed().as_secs_f64() * 1e3);
+                log::debug!(
+                    "luma: compiled {label} ({} bytes of WGSL) in {:.1} ms",
+                    source.len(),
+                    started.elapsed().as_secs_f64() * 1e3
+                );
             }
             core
         })?;

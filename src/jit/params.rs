@@ -7,7 +7,7 @@
 //! compile again (about 2 s for the solver of a CFD program, with a cold driver cache). [`apply`]
 //! rewrites such a key (and its lowering, if it has one) to the variants that read the numbers
 //! from the uniform: of a view only what shapes the code stays in the key (see [`ViewSpec`]).
-//! [`apply_tile`] does the same for the extents of a tiled kernel.
+//! [`apply_tile`] and [`apply_staging`] do the same for the extents of a tiled or a staged kernel.
 //!
 //! Dividing an index by an extent (the coordinates of a flat index) is what the numbers cost at
 //! run time, against the multiplication by a constant of the compiler. An extent that is a power
@@ -19,16 +19,19 @@
 //! kernel (`euler/per_step`, 2000 x 2000 cells), the one with the quotient shared costs 3 to 5 %
 //! (see `codegen::DIV_HELPERS`).
 //!
-//! Workgroup-staged kernels (`FusedKey::staging`) bake their layout and views into the source
-//! and are not rewritten.
+//! Workgroup-staged kernels (`FusedKey::staging`) are rewritten by [`apply_staging`]: the extents
+//! of the array and of the staged sub-programs are words of the uniform, and the offsets the
+//! staged reads are made at, which the source bakes in, stay in the lowering.
 
 use std::fmt::Write;
 use std::sync::Arc;
 
-use super::codegen::{udiv, urem, TileSlots, EDGE_HELPERS};
-use super::inline::{Ctx, Flat, Inlined};
-use super::program::{shape_of, FusedKey, Instr, Tail};
+use super::codegen::{EDGE_HELPERS, TileSlots, udiv, urem};
+use super::inline::{self, Ctx, Flat, Inlined, Lowered, StagedGroup, StagedPrograms};
+use super::program::{FusedKey, Instr, Tail, shape_of};
+use super::staging::StagingSlots;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
+use crate::context::Context;
 
 /// How the step of a view axis enters the index.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -48,7 +51,9 @@ pub(crate) enum DivRemSpec {
     Pow2,
     /// `wide`: the index may be `2^23` or more (an array of that many elements), which the
     /// quick division of `luma_udiv` does not handle (see `codegen::DIV_HELPERS`).
-    Runtime { wide: bool },
+    Runtime {
+        wide: bool,
+    },
 }
 
 /// The arrays of this many elements or more divide indices that `luma_udiv` cannot handle.
@@ -84,13 +89,20 @@ fn reciprocal_up(d: u32) -> f32 {
     // number is exact in 128 bits.
     let reaches = |r: f32| {
         let bits = r.to_bits();
-        let (mantissa, exponent) = (u128::from(bits & 0x7F_FFFF | 0x80_0000), (bits >> 23) as i32 - 150);
+        let (mantissa, exponent) = (
+            u128::from(bits & 0x7F_FFFF | 0x80_0000),
+            (bits >> 23) as i32 - 150,
+        );
         // r = mantissa * 2^exponent, with exponent < 0 for every 1 / d, d >= 2.
         mantissa * u128::from(d) >= 1u128 << (-exponent)
     };
     // The nearest `f32` is within half an ulp of `1 / d`: if it reaches it, the one before it
     // does not.
-    if reaches(nearest) { nearest } else { f32::from_bits(nearest.to_bits() + 1) }
+    if reaches(nearest) {
+        nearest
+    } else {
+        f32::from_bits(nearest.to_bits() + 1)
+    }
 }
 
 /// What a [`Gen::ParamRange`] computes of the element index `i`.
@@ -171,7 +183,7 @@ pub(crate) struct ViewSpec {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Parameterized {
     /// The lowering of the key (written with the same variants), if it is lowered.
-    pub(crate) inlined: Option<Inlined>,
+    pub(crate) lowered: Option<Lowered>,
     /// Whether the uniform has slots the rewrite added.
     pub(crate) slots: bool,
 }
@@ -185,7 +197,14 @@ const UNUSED_AXIS: AxisSpec = AxisSpec {
     step: StepSpec::Zero,
     checked: false,
     wrap_mask: false,
-    slots: AxisSlots { div: 0, rem: 0, step: 0, start: 0, size: 0, stride: 0 },
+    slots: AxisSlots {
+        div: 0,
+        rem: 0,
+        step: 0,
+        start: 0,
+        size: 0,
+        stride: 0,
+    },
 };
 
 /// The slots added so far and the views and gathers they belong to.
@@ -203,7 +222,15 @@ struct Builder {
 
 impl Builder {
     fn new(tys: &[ElemTy], words: &[u32]) -> Builder {
-        Builder { tys: tys.to_vec(), words: words.to_vec(), views: Vec::new(), takes: Vec::new(), dims: Vec::new(), divisors: Vec::new(), shared: Vec::new() }
+        Builder {
+            tys: tys.to_vec(),
+            words: words.to_vec(),
+            views: Vec::new(),
+            takes: Vec::new(),
+            dims: Vec::new(),
+            divisors: Vec::new(),
+            shared: Vec::new(),
+        }
     }
 
     fn word(&mut self, value: u32) -> u32 {
@@ -239,7 +266,11 @@ impl Builder {
     }
 
     fn view(&mut self, map: ViewMap, edge: Edge) -> Option<(u16, ViewSpec)> {
-        if let Some(&(_, _, id, spec)) = self.views.iter().find(|&&(known, kind, ..)| known == map && kind == edge) {
+        if let Some(&(_, _, id, spec)) = self
+            .views
+            .iter()
+            .find(|&&(known, kind, ..)| known == map && kind == edge)
+        {
             return Some((id, spec));
         }
         let id = u16::try_from(self.views.len()).ok()?;
@@ -312,7 +343,11 @@ impl Builder {
             }
             slots.start = self.word(axis.start as u32);
             if spec.checked {
-                slots.size = self.word(if spec.wrap_mask { map.src[a] - 1 } else { map.src[a] });
+                slots.size = self.word(if spec.wrap_mask {
+                    map.src[a] - 1
+                } else {
+                    map.src[a]
+                });
             }
             if spec.active && !spec.src_fastest {
                 slots.stride = self.word(src_stride[a] as u32);
@@ -336,20 +371,44 @@ impl Builder {
     /// The shift of an array of `dims` by `shifts` circularly along every axis, its numbers in the
     /// uniform.
     fn dims(&mut self, dims: [u32; 4], shifts: [u32; 4]) -> ShiftKind {
-        if let Some(&(.., kind)) = self.dims.iter().find(|&&(known, by, _)| known == dims && by == shifts) {
+        if let Some(&(.., kind)) = self
+            .dims
+            .iter()
+            .find(|&&(known, by, _)| known == dims && by == shifts)
+        {
             return kind;
         }
-        let mut axes = [DimsAxis { used: false, stride: DivRemSpec::None, rem: DivRemSpec::None, shifted: false, slots: [0; 3] }; 4];
+        let mut axes = [DimsAxis {
+            used: false,
+            stride: DivRemSpec::None,
+            rem: DivRemSpec::None,
+            shifted: false,
+            slots: [0; 3],
+        }; 4];
         let mut stride = 1u32;
         let last = (0..4).rev().find(|&a| dims[a] > 1);
         let wide = is_wide(dims.iter().map(|&d| u64::from(d)).product());
-        let class = |d: u32| if d.is_power_of_two() { DivRemSpec::Pow2 } else { DivRemSpec::Runtime { wide } };
+        let class = |d: u32| {
+            if d.is_power_of_two() {
+                DivRemSpec::Pow2
+            } else {
+                DivRemSpec::Runtime { wide }
+            }
+        };
         for a in 0..4 {
             if dims[a] > 1 {
                 let mut axis = DimsAxis {
                     used: true,
-                    stride: if stride == 1 { DivRemSpec::None } else { class(stride) },
-                    rem: if last.is_some_and(|last| a < last) { class(dims[a]) } else { DivRemSpec::None },
+                    stride: if stride == 1 {
+                        DivRemSpec::None
+                    } else {
+                        class(stride)
+                    },
+                    rem: if last.is_some_and(|last| a < last) {
+                        class(dims[a])
+                    } else {
+                        DivRemSpec::None
+                    },
                     shifted: shifts[a] != 0,
                     slots: [0; 3],
                 };
@@ -383,7 +442,9 @@ impl Builder {
                 let (id, spec) = self.view(map, edge)?;
                 ShiftKind::ParamView { id, spec }
             }
-            ShiftKind::Take { len } => ShiftKind::ParamTake { max_slot: self.take(len) },
+            ShiftKind::Take { len } => ShiftKind::ParamTake {
+                max_slot: self.take(len),
+            },
             other => other,
         })
     }
@@ -391,11 +452,26 @@ impl Builder {
     /// The generator that reads its numbers from the uniform instead of keeping them in the key.
     fn range(&mut self, stride: u32, size: u32, wide: bool) -> Gen {
         match (stride, size) {
-            (_, 0 | 1) => Gen::ParamRange { kind: RangeKind::Zero, wide, stride: 0, size: 0 },
-            (0 | 1, _) => Gen::ParamRange { kind: RangeKind::Mod, wide, stride: 0, size: self.divisor(size) },
+            (_, 0 | 1) => Gen::ParamRange {
+                kind: RangeKind::Zero,
+                wide,
+                stride: 0,
+                size: 0,
+            },
+            (0 | 1, _) => Gen::ParamRange {
+                kind: RangeKind::Mod,
+                wide,
+                stride: 0,
+                size: self.divisor(size),
+            },
             _ => {
                 let stride = self.divisor(stride);
-                Gen::ParamRange { kind: RangeKind::DivMod, wide, stride, size: self.divisor(size) }
+                Gen::ParamRange {
+                    kind: RangeKind::DivMod,
+                    wide,
+                    stride,
+                    size: self.divisor(size),
+                }
             }
         }
     }
@@ -403,7 +479,10 @@ impl Builder {
     fn op(&mut self, op: Op) -> Option<Op> {
         match op.kind {
             OpKind::Shift(kind) => Some(Op::new(OpKind::Shift(self.kind(kind)?), op.ty)),
-            OpKind::Generate(Gen::RangeConst { stride, size, wide }) => Some(Op::new(OpKind::Generate(self.range(stride, size, wide)), op.ty)),
+            OpKind::Generate(Gen::RangeConst { stride, size, wide }) => Some(Op::new(
+                OpKind::Generate(self.range(stride, size, wide)),
+                op.ty,
+            )),
             _ => Some(op),
         }
     }
@@ -415,14 +494,26 @@ impl Builder {
     /// then, and the key no numbers: a uniform no code reads has no binding.
     fn flat_op(&mut self, op: Op) -> Option<Op> {
         match op.kind {
-            OpKind::Shift(ShiftKind::View { edge, .. }) if edge != Edge::Fill => Some(Op::new(OpKind::Shift(ShiftKind::Linear), op.ty)),
-            OpKind::Shift(ShiftKind::Dims { .. }) => Some(Op::new(OpKind::Shift(ShiftKind::Linear), op.ty)),
+            OpKind::Shift(ShiftKind::View { edge, .. }) if edge != Edge::Fill => {
+                Some(Op::new(OpKind::Shift(ShiftKind::Linear), op.ty))
+            }
+            OpKind::Shift(ShiftKind::Dims { .. }) => {
+                Some(Op::new(OpKind::Shift(ShiftKind::Linear), op.ty))
+            }
             _ => self.op(op),
         }
     }
 
     fn program(&mut self, instrs: &[Instr]) -> Option<Vec<Instr>> {
-        instrs.iter().map(|instr| Some(Instr { op: self.op(instr.op)?, args: instr.args })).collect()
+        instrs
+            .iter()
+            .map(|instr| {
+                Some(Instr {
+                    op: self.op(instr.op)?,
+                    args: instr.args,
+                })
+            })
+            .collect()
     }
 
     fn tail(&mut self, tail: Tail) -> Option<Tail> {
@@ -431,8 +522,44 @@ impl Builder {
                 let (id, spec) = self.view(map, Edge::None)?;
                 Tail::ParamStoreMapped { id, spec }
             }
-            Tail::Scatter { len } => Tail::ParamScatter { len_slot: self.word(len) },
-            Tail::ScatterAdd { len, op, private: false, .. } => Tail::ScatterAdd { len: 0, op, private: false, len_slot: Some(self.word(len)) },
+            Tail::Scatter { len } => Tail::ParamScatter {
+                len_slot: self.word(len),
+            },
+            Tail::Stack {
+                total,
+                first,
+                block,
+            } if block > 1 => {
+                let (div, div_slot, block_slot) = if block.is_power_of_two() {
+                    (
+                        DivRemSpec::Pow2,
+                        self.shared(block.trailing_zeros()),
+                        self.word(block),
+                    )
+                } else {
+                    // The first word of a divisor is the divisor itself; the index may be any `u32`.
+                    let slot = self.divisor(block);
+                    (DivRemSpec::Runtime { wide: true }, slot, slot)
+                };
+                Tail::ParamStack {
+                    total,
+                    first,
+                    block_slot,
+                    div,
+                    div_slot,
+                }
+            }
+            Tail::ScatterAdd {
+                len,
+                op,
+                private: false,
+                ..
+            } => Tail::ScatterAdd {
+                len: 0,
+                op,
+                private: false,
+                len_slot: Some(self.word(len)),
+            },
             other => other,
         })
     }
@@ -441,12 +568,25 @@ impl Builder {
         let ctxs = inlined
             .ctxs
             .iter()
-            .map(|ctx| Some(Ctx { parent: ctx.parent, kind: self.kind(ctx.kind)?, args: ctx.args }))
+            .map(|ctx| {
+                Some(Ctx {
+                    parent: ctx.parent,
+                    kind: self.kind(ctx.kind)?,
+                    args: ctx.args,
+                })
+            })
             .collect::<Option<Vec<_>>>()?;
         let instrs = inlined
             .instrs
             .iter()
-            .map(|flat| Some(Flat { op: self.flat_op(flat.op)?, args: flat.args, at: flat.at, child: flat.child }))
+            .map(|flat| {
+                Some(Flat {
+                    op: self.flat_op(flat.op)?,
+                    args: flat.args,
+                    at: flat.at,
+                    child: flat.child,
+                })
+            })
             .collect::<Option<Vec<_>>>()?;
         Some(Inlined {
             ctxs,
@@ -455,15 +595,30 @@ impl Builder {
             region: inlined.region.clone(),
             branch: inlined.branch.clone(),
             ops: inlined.ops,
+            staged_reads: inlined.staged_reads.clone(),
         })
     }
 }
 
 /// Whether `key` has a view, gather or scatter to move into the uniform.
 fn has_numbers(key: &FusedKey) -> bool {
-    matches!(key.tail, Tail::StoreMapped(_) | Tail::Scatter { .. } | Tail::ScatterAdd { private: false, .. })
-        || key.instrs.iter().chain(key.subs.iter().flatten()).any(|instr| {
-            matches!(instr.op.kind, OpKind::Shift(ShiftKind::View { .. } | ShiftKind::Take { .. } | ShiftKind::Dims { .. }) | OpKind::Generate(Gen::RangeConst { .. }))
+    matches!(
+        key.tail,
+        Tail::StoreMapped(_)
+            | Tail::Scatter { .. }
+            | Tail::ScatterAdd { private: false, .. }
+            | Tail::Stack { block: 2.., .. }
+    ) || key
+        .instrs
+        .iter()
+        .chain(key.subs.iter().flatten())
+        .any(|instr| {
+            matches!(
+                instr.op.kind,
+                OpKind::Shift(
+                    ShiftKind::View { .. } | ShiftKind::Take { .. } | ShiftKind::Dims { .. }
+                ) | OpKind::Generate(Gen::RangeConst { .. })
+            )
         })
 }
 
@@ -480,7 +635,11 @@ pub(super) fn apply(key: &mut FusedKey, lowered: Option<&Inlined>, scalars: &mut
         match lowered {
             None => {
                 instrs = builder.program(&key.instrs)?;
-                subs = key.subs.iter().map(|sub| builder.program(sub)).collect::<Option<Vec<_>>>()?;
+                subs = key
+                    .subs
+                    .iter()
+                    .map(|sub| builder.program(sub))
+                    .collect::<Option<Vec<_>>>()?;
                 inlined = None;
             }
             Some(lowered) => {
@@ -488,13 +647,19 @@ pub(super) fn apply(key: &mut FusedKey, lowered: Option<&Inlined>, scalars: &mut
                 // from get no slots, so that the key says nothing about their numbers.
                 let mut unused = Builder::new(&[], &[]);
                 instrs = unused.program(&key.instrs)?;
-                subs = key.subs.iter().map(|sub| unused.program(sub)).collect::<Option<Vec<_>>>()?;
+                subs = key
+                    .subs
+                    .iter()
+                    .map(|sub| unused.program(sub))
+                    .collect::<Option<Vec<_>>>()?;
                 inlined = Some(builder.inlined(lowered)?);
             }
         }
         Some((instrs, subs, tail, inlined))
     })();
-    let Some((instrs, subs, tail, inlined)) = rewritten else { return };
+    let Some((instrs, subs, tail, inlined)) = rewritten else {
+        return;
+    };
     let slots = builder.tys.len() > key.scalar_tys.len();
     key.shape = shape_of(&instrs, &subs);
     key.instrs = Arc::new(instrs);
@@ -502,7 +667,10 @@ pub(super) fn apply(key: &mut FusedKey, lowered: Option<&Inlined>, scalars: &mut
     key.tail = tail;
     key.scalar_tys = builder.tys;
     *scalars = builder.words;
-    key.params = Some(Arc::new(Parameterized { inlined, slots }));
+    key.params = Some(Arc::new(Parameterized {
+        lowered: inlined.map(Lowered::Plain),
+        slots,
+    }));
 }
 
 /// Rewrites the tiling of `key` (see [`Tile`]) to read the extents of its array from the uniform,
@@ -517,7 +685,11 @@ pub(super) fn apply_tile(key: &mut FusedKey, scalars: &mut Vec<u32>) {
     let base = builder.word(w);
     builder.word(h);
     builder.word(w.div_ceil(tile.tile.0));
-    tile.slots = Some(TileSlots { base, one_d: h == 1, small: tile.fits() });
+    tile.slots = Some(TileSlots {
+        base,
+        one_d: h == 1,
+        small: tile.fits(),
+    });
     // The shifts read through the tile are the offsets of the tile; the extents they carry are
     // not read.
     let canonical = |instrs: &[Instr], offsets: &[Option<(i32, i32)>]| -> Vec<Instr> {
@@ -525,23 +697,124 @@ pub(super) fn apply_tile(key: &mut FusedKey, scalars: &mut Vec<u32>) {
             .iter()
             .zip(offsets)
             .map(|(instr, offset)| match (instr.op.kind, offset) {
-                (OpKind::Shift(ShiftKind::Dims { .. }), Some(_)) => Instr { op: Op::new(OpKind::Shift(ShiftKind::Dims { dims: [1; 4], shifts: [0; 4] }), instr.op.ty), args: instr.args },
+                (OpKind::Shift(ShiftKind::Dims { .. }), Some(_)) => Instr {
+                    op: Op::new(
+                        OpKind::Shift(ShiftKind::Dims {
+                            dims: [1; 4],
+                            shifts: [0; 4],
+                        }),
+                        instr.op.ty,
+                    ),
+                    args: instr.args,
+                },
                 _ => instr.clone(),
             })
             .collect()
     };
     let instrs = canonical(&key.instrs, &tile.offsets[0]);
-    let subs: Vec<Vec<Instr>> = key.subs.iter().zip(&tile.offsets[1..]).map(|(sub, offsets)| canonical(sub, offsets)).collect();
+    let subs: Vec<Vec<Instr>> = key
+        .subs
+        .iter()
+        .zip(&tile.offsets[1..])
+        .map(|(sub, offsets)| canonical(sub, offsets))
+        .collect();
     key.shape = shape_of(&instrs, &subs);
     key.instrs = Arc::new(instrs);
     key.subs = Arc::new(subs);
     key.scalar_tys = builder.tys;
     *scalars = builder.words;
-    key.params = Some(Arc::new(Parameterized { inlined: None, slots: true }));
+    key.params = Some(Arc::new(Parameterized {
+        lowered: None,
+        slots: true,
+    }));
 }
 
-/// The distinct views a rewritten key's generated code calls, by id.
-pub(super) fn views_used(key: &FusedKey, inlined: Option<&Inlined>) -> Vec<(u16, ViewSpec)> {
+/// Rewrites the staging of `key` (see [`Staging`](super::staging::Staging)) to read the extents of
+/// its array and of its staged sub-programs from the uniform, appending them to the slots
+/// `scalars` fills, and its views as [`apply`] does. The key keeps the lowering of its programs
+/// (see [`Parameterized::lowered`]), whose staged reads carry the offsets they are made at. A key
+/// that cannot be lowered or has too many views stays as it is.
+pub(super) fn apply_staging(ctx: &Context, key: &mut FusedKey, scalars: &mut Vec<u32>) {
+    let Some(mut staging) = key.staging.clone() else {
+        return;
+    };
+    if staging.slots.is_some() {
+        return;
+    }
+    let Some(mut programs) = inline::lower_staged(key, &staging, usize::MAX, &ctx.cost_model())
+    else {
+        return;
+    };
+    #[cfg(debug_assertions)]
+    {
+        let inputs = key.input_tys.len();
+        let checked = super::program::validate(key, inputs, key.scalar_tys.len()).and_then(|()| {
+            programs
+                .bodies()
+                .try_for_each(|body| inline::validate_inlined(body, inputs, true))
+        });
+        if let Err(message) = checked {
+            panic!("invalid fused program: {message}\n{key:?}");
+        }
+    }
+    // The offsets of the staged reads are in the views, which are about to lose them.
+    programs.main.staged_reads = programs.main.staged_offsets(&staging);
+    for group in &mut programs.groups {
+        group.body.staged_reads = group.body.staged_offsets(&staging);
+    }
+    let mut builder = Builder::new(&key.scalar_tys, scalars);
+    let [w, h] = staging.dims;
+    let base = builder.word(w);
+    builder.word(h);
+    builder.word(w.div_ceil(staging.tile[0]));
+    for entry in &staging.subs {
+        builder.word(entry.dims[0]);
+        builder.word(entry.dims[1]);
+    }
+    let rewritten = (|| {
+        let main = builder.inlined(&programs.main)?;
+        let groups = programs
+            .groups
+            .iter()
+            .map(|group| {
+                Some(StagedGroup {
+                    members: group.members.clone(),
+                    values: group.values.clone(),
+                    body: builder.inlined(&group.body)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        // The generated code reads the lowering only: the views of the programs it came from get
+        // no slots, so that the key says nothing about their numbers.
+        let mut unused = Builder::new(&[], &[]);
+        let instrs = unused.program(&key.instrs)?;
+        let subs = key
+            .subs
+            .iter()
+            .map(|sub| unused.program(sub))
+            .collect::<Option<Vec<_>>>()?;
+        Some((StagedPrograms { main, groups }, instrs, subs))
+    })();
+    let Some((programs, instrs, subs)) = rewritten else {
+        return;
+    };
+    staging.slots = Some(StagingSlots { base });
+    key.shape = shape_of(&instrs, &subs);
+    key.instrs = Arc::new(instrs);
+    key.subs = Arc::new(subs);
+    key.staging = Some(staging);
+    key.scalar_tys = builder.tys;
+    *scalars = builder.words;
+    key.params = Some(Arc::new(Parameterized {
+        lowered: Some(Lowered::Staged(programs)),
+        slots: true,
+    }));
+}
+
+/// The distinct views a rewritten key's generated code calls, by id: those of the contexts and
+/// instructions of `lowered` (the programs of one kernel), or of the key's programs if there is
+/// none.
+pub(super) fn views_used(key: &FusedKey, lowered: &[&Inlined]) -> Vec<(u16, ViewSpec)> {
     let mut found: Vec<(u16, ViewSpec)> = Vec::new();
     let mut note = |kind: ShiftKind| {
         if let ShiftKind::ParamView { id, spec } = kind
@@ -550,22 +823,20 @@ pub(super) fn views_used(key: &FusedKey, inlined: Option<&Inlined>) -> Vec<(u16,
             found.push((id, spec));
         }
     };
-    match inlined {
-        Some(inlined) => {
-            inlined.ctxs.iter().for_each(|ctx| note(ctx.kind));
-            inlined.instrs.iter().for_each(|flat| {
-                if let OpKind::Shift(kind) = flat.op.kind {
-                    note(kind);
-                }
-            });
-        }
-        None => {
-            for instr in key.instrs.iter().chain(key.subs.iter().flatten()) {
-                if let OpKind::Shift(kind) = instr.op.kind {
-                    note(kind);
-                }
+    if lowered.is_empty() {
+        for instr in key.instrs.iter().chain(key.subs.iter().flatten()) {
+            if let OpKind::Shift(kind) = instr.op.kind {
+                note(kind);
             }
         }
+    }
+    for inlined in lowered {
+        inlined.ctxs.iter().for_each(|ctx| note(ctx.kind));
+        inlined.instrs.iter().for_each(|flat| {
+            if let OpKind::Shift(kind) = flat.op.kind {
+                note(kind);
+            }
+        });
     }
     if let Tail::ParamStoreMapped { id, spec } = key.tail {
         note(ShiftKind::ParamView { id, spec });
@@ -618,9 +889,13 @@ pub(super) fn view_helpers(views: &[(u16, ViewSpec)]) -> String {
             let stride = (axis.active && !axis.src_fastest).then(|| format!("p.s{}", slots.stride));
             if axis.active {
                 let coord = match (&size, spec.edge) {
-                    (Some(size), Edge::Clamp | Edge::Fill) => format!("luma_clamp_i({raw}, {size})"),
+                    (Some(size), Edge::Clamp | Edge::Fill) => {
+                        format!("luma_clamp_i({raw}, {size})")
+                    }
                     (Some(size), Edge::Mirror) => format!("luma_mirror_i({raw}, {size})"),
-                    (Some(size), Edge::Wrap) if axis.wrap_mask => format!("luma_wrap_mask({raw}, u32({size}))"),
+                    (Some(size), Edge::Wrap) if axis.wrap_mask => {
+                        format!("luma_wrap_mask({raw}, u32({size}))")
+                    }
                     (Some(size), Edge::Wrap) => format!("luma_wrap_i({raw}, {size})"),
                     _ => raw.clone(),
                 };
@@ -632,7 +907,11 @@ pub(super) fn view_helpers(views: &[(u16, ViewSpec)]) -> String {
             raws[a] = Some(raw);
             sizes[a] = size;
         }
-        let sum = if terms.is_empty() { "0u".to_owned() } else { terms.join(" + ") };
+        let sum = if terms.is_empty() {
+            "0u".to_owned()
+        } else {
+            terms.join(" + ")
+        };
         let _ = writeln!(src, "fn pview{id}(i: u32) -> u32 {{ return {sum}; }}");
         if spec.edge == Edge::Fill {
             let tests: Vec<String> = (0..4)
@@ -641,7 +920,11 @@ pub(super) fn view_helpers(views: &[(u16, ViewSpec)]) -> String {
                     _ => None,
                 })
                 .collect();
-            let all = if tests.is_empty() { "true".to_owned() } else { tests.join(" && ") };
+            let all = if tests.is_empty() {
+                "true".to_owned()
+            } else {
+                tests.join(" && ")
+            };
             let _ = writeln!(src, "fn pview{id}_in(i: u32) -> bool {{ return {all}; }}");
         }
     }
@@ -657,7 +940,10 @@ mod tests {
         let (a0, a1, b0, b1) = (a & 0xFFFF, a >> 16, b & 0xFFFF, b >> 16);
         let (m1, m2) = (a1.wrapping_mul(b0), a0.wrapping_mul(b1));
         let carry = ((a0.wrapping_mul(b0) >> 16) + (m1 & 0xFFFF) + (m2 & 0xFFFF)) >> 16;
-        a1.wrapping_mul(b1).wrapping_add(m1 >> 16).wrapping_add(m2 >> 16).wrapping_add(carry)
+        a1.wrapping_mul(b1)
+            .wrapping_add(m1 >> 16)
+            .wrapping_add(m2 >> 16)
+            .wrapping_add(carry)
     }
 
     /// `luma_udiv` of the generated kernels: for `n < 2^23`. `fused` is whether the compiler
@@ -665,7 +951,11 @@ mod tests {
     fn udiv_small(n: u32, [d, _, _, r]: [u32; 4], fused: bool) -> u32 {
         let f = f32::from_bits(n | 0x4B00_0000) - 8_388_608.0;
         let r = f32::from_bits(r);
-        let sum = if fused { f.mul_add(r, 8_388_608.0) } else { f * r + 8_388_608.0 };
+        let sum = if fused {
+            f.mul_add(r, 8_388_608.0)
+        } else {
+            f * r + 8_388_608.0
+        };
         let q = sum.to_bits() & 0x7F_FFFF;
         q - u32::from((n.wrapping_sub(q.wrapping_mul(d)) as i32) < 0)
     }
@@ -685,15 +975,32 @@ mod tests {
             state ^= state << 17;
             (state >> 16) as u32
         };
-        let edges = [0, 1, 0xFFFF, 0x1_0000, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, u32::MAX];
+        let edges = [
+            0,
+            1,
+            0xFFFF,
+            0x1_0000,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xFFFF_FFFE,
+            u32::MAX,
+        ];
         for &a in &edges {
             for &b in &edges {
-                assert_eq!(mulhi(a, b), ((u64::from(a) * u64::from(b)) >> 32) as u32, "{a} * {b}");
+                assert_eq!(
+                    mulhi(a, b),
+                    ((u64::from(a) * u64::from(b)) >> 32) as u32,
+                    "{a} * {b}"
+                );
             }
         }
         for _ in 0..200_000 {
             let (a, b) = (next(), next());
-            assert_eq!(mulhi(a, b), ((u64::from(a) * u64::from(b)) >> 32) as u32, "{a} * {b}");
+            assert_eq!(
+                mulhi(a, b),
+                ((u64::from(a) * u64::from(b)) >> 32) as u32,
+                "{a} * {b}"
+            );
         }
     }
 
@@ -711,14 +1018,28 @@ mod tests {
         // (where an error of one shows) and random ones.
         let mut divisors: Vec<u32> = (2..3000).collect();
         for bit in 1..32 {
-            divisors.extend([(1u32 << bit).saturating_sub(1).max(2), 1 << bit, (1u32 << bit).saturating_add(1)]);
+            divisors.extend([
+                (1u32 << bit).saturating_sub(1).max(2),
+                1 << bit,
+                (1u32 << bit).saturating_add(1),
+            ]);
         }
         divisors.extend((0..2000).map(|_| (next() >> (next() % 31)).max(2)));
         divisors.extend([u32::MAX, u32::MAX - 1, 0x8000_0001, 0x7FFF_FFFF]);
         for d in divisors {
             let words = divisor_words(d);
             let check = |n: u32| assert_eq!(udiv(n, words), n / d, "{n} / {d}");
-            for n in [0, 1, d - 1, d, d.saturating_add(1), u32::MAX, u32::MAX - 1, 0x8000_0000, 0x7FFF_FFFF] {
+            for n in [
+                0,
+                1,
+                d - 1,
+                d,
+                d.saturating_add(1),
+                u32::MAX,
+                u32::MAX - 1,
+                0x8000_0000,
+                0x7FFF_FFFF,
+            ] {
                 check(n);
             }
             for _ in 0..200 {
@@ -745,9 +1066,21 @@ mod tests {
             }
         }
         // The largest quotients are where the product is furthest above the quotient.
-        for d in (2..5000u32).chain([65_535, 65_536, 65_537, 1 << 20, (1 << 20) + 1, 0x7FF_FFFF, 0xFF_FFFF, 0x100_0000, 0x100_0001]) {
+        for d in (2..5000u32).chain([
+            65_535,
+            65_536,
+            65_537,
+            1 << 20,
+            (1 << 20) + 1,
+            0x7FF_FFFF,
+            0xFF_FFFF,
+            0x100_0000,
+            0x100_0001,
+        ]) {
             let words = divisor_words(d);
-            for n in (0x80_0000u32.saturating_sub(3 * d)..0x80_0000).chain(0..(3 * d).min(0x80_0000)) {
+            for n in
+                (0x80_0000u32.saturating_sub(3 * d)..0x80_0000).chain(0..(3 * d).min(0x80_0000))
+            {
                 assert_eq!(udiv_small(n, words, false), n / d, "{n} / {d}");
                 assert_eq!(udiv_small(n, words, true), n / d, "{n} / {d} fused");
             }

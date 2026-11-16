@@ -9,6 +9,7 @@
 //! host instead, with the same stop rule evaluated by `eval_host`; both evaluations agree.
 
 use std::fmt::Write as _;
+use std::marker::PhantomData;
 use std::ops::{Add, Div, Index, Mul, Neg, Sub};
 use std::panic::Location;
 use std::sync::Arc;
@@ -20,7 +21,8 @@ use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::fields::Fields;
 use crate::jit::{self, Plan, Stepper, Trace};
-use crate::ops::{launch_1d, Outcome};
+use crate::kernel::KernelCore;
+use crate::ops::{Outcome, launch_1d};
 use crate::shape::Shape;
 
 type Record<'a, S> = Box<dyn Fn(&S) -> Array<f32> + 'a>;
@@ -53,7 +55,12 @@ pub struct Until<'a, S> {
 impl<'a, S: Fields> Until<'a, S> {
     /// A loop of at most `max_steps` steps with no records and no stop rule.
     pub fn new(max_steps: usize) -> Self {
-        Until { max_steps, check_every: None, records: Vec::new(), stops: Vec::new() }
+        Until {
+            max_steps,
+            check_every: None,
+            records: Vec::new(),
+            stops: Vec::new(),
+        }
     }
 
     /// A scalar (an array of one element) computed from the state after every step, kept as
@@ -148,6 +155,17 @@ impl Series {
     pub fn window_min(&self, steps: usize) -> Stat {
         Stat::new(StatNode::WindowMin(self.index, steps.max(1)))
     }
+
+    /// The arithmetic mean over the last `steps` steps (fewer at the start); NaN if any of them is.
+    pub fn window_mean(&self, steps: usize) -> Stat {
+        Stat::new(StatNode::WindowMean(self.index, steps.max(1)))
+    }
+
+    /// Its value `steps_ago` steps before the latest one (the first step's value when the loop
+    /// has not run that long); `prev(0)` is [`Series::last`].
+    pub fn prev(&self, steps_ago: usize) -> Stat {
+        Stat::new(StatNode::Prev(self.index, steps_ago))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +193,8 @@ enum StatNode {
     Trough(usize),
     WindowMax(usize, usize),
     WindowMin(usize, usize),
+    WindowMean(usize, usize),
+    Prev(usize, usize),
     Step,
     Bin(Arith, Stat, Stat),
     Abs(Stat),
@@ -363,7 +383,10 @@ pub struct Run<S> {
 impl<S> Run<S> {
     /// The values recorded under `name`, one per step run.
     pub fn history(&self, name: &str) -> Option<&[f32]> {
-        self.history.iter().find(|(known, _)| known == name).map(|(_, values)| values.as_slice())
+        self.history
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, values)| values.as_slice())
     }
 }
 
@@ -371,12 +394,20 @@ impl<S> Run<S> {
 
 /// `f32::max` that propagates NaN, like the gate kernel.
 fn nan_max(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() { f32::NAN } else { a.max(b) }
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else {
+        a.max(b)
+    }
 }
 
 /// `f32::min` that propagates NaN, like the gate kernel.
 fn nan_min(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() { f32::NAN } else { a.min(b) }
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else {
+        a.min(b)
+    }
 }
 
 fn eval_stat(stat: &Stat, histories: &[Vec<f32>], done: usize) -> f32 {
@@ -385,10 +416,28 @@ fn eval_stat(stat: &Stat, histories: &[Vec<f32>], done: usize) -> f32 {
         StatNode::Const(c) => *c,
         StatNode::Last(r) => histories[*r][done - 1],
         StatNode::First(r) => histories[*r][0],
-        StatNode::Peak(r) => histories[*r][..done].iter().copied().fold(f32::NEG_INFINITY, nan_max),
-        StatNode::Trough(r) => histories[*r][..done].iter().copied().fold(f32::INFINITY, nan_min),
-        StatNode::WindowMax(r, k) => window(*r, *k).iter().copied().fold(f32::NEG_INFINITY, nan_max),
+        StatNode::Peak(r) => histories[*r][..done]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, nan_max),
+        StatNode::Trough(r) => histories[*r][..done]
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, nan_min),
+        StatNode::WindowMax(r, k) => window(*r, *k)
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, nan_max),
         StatNode::WindowMin(r, k) => window(*r, *k).iter().copied().fold(f32::INFINITY, nan_min),
+        StatNode::WindowMean(r, k) => {
+            let w = window(*r, *k);
+            if w.iter().any(|x| x.is_nan()) {
+                f32::NAN
+            } else {
+                w.iter().sum::<f32>() / w.len() as f32
+            }
+        }
+        StatNode::Prev(r, back) => histories[*r][(done - 1).saturating_sub(*back)],
         StatNode::Step => done as f32,
         StatNode::Bin(op, a, b) => {
             let (a, b) = (eval_stat(a, histories, done), eval_stat(b, histories, done));
@@ -408,7 +457,10 @@ fn eval_stat(stat: &Stat, histories: &[Vec<f32>], done: usize) -> f32 {
 fn eval_host(cond: &Cond, histories: &[Vec<f32>], steps_done: usize) -> bool {
     match &*cond.0 {
         CondNode::Cmp(op, a, b) => {
-            let (a, b) = (eval_stat(a, histories, steps_done), eval_stat(b, histories, steps_done));
+            let (a, b) = (
+                eval_stat(a, histories, steps_done),
+                eval_stat(b, histories, steps_done),
+            );
             match op {
                 Compare::Lt => a < b,
                 Compare::Le => a <= b,
@@ -416,8 +468,12 @@ fn eval_host(cond: &Cond, histories: &[Vec<f32>], steps_done: usize) -> bool {
                 Compare::Ge => a >= b,
             }
         }
-        CondNode::And(a, b) => eval_host(a, histories, steps_done) && eval_host(b, histories, steps_done),
-        CondNode::Or(a, b) => eval_host(a, histories, steps_done) || eval_host(b, histories, steps_done),
+        CondNode::And(a, b) => {
+            eval_host(a, histories, steps_done) && eval_host(b, histories, steps_done)
+        }
+        CondNode::Or(a, b) => {
+            eval_host(a, histories, steps_done) || eval_host(b, histories, steps_done)
+        }
         CondNode::Not(a) => !eval_host(a, histories, steps_done),
     }
 }
@@ -431,6 +487,8 @@ fn stat_source(stat: &Stat) -> String {
         StatNode::Trough(r) => format!("agg[{}u]", 2 * r + 1),
         StatNode::WindowMax(r, k) => format!("wmax(i, {r}u, {k}u)"),
         StatNode::WindowMin(r, k) => format!("wmin(i, {r}u, {k}u)"),
+        StatNode::WindowMean(r, k) => format!("wmean(i, {r}u, {k}u)"),
+        StatNode::Prev(r, back) => format!("hist[{r}u * p.max_steps + (i - min({back}u, i))]"),
         StatNode::Step => "f32(i + 1u)".to_string(),
         StatNode::Bin(op, a, b) => {
             let symbol = match op {
@@ -476,9 +534,17 @@ fn gate_source(records: usize, conds: &[Cond]) -> String {
     s.push_str("@group(1) @binding(4) var<storage, read_write> agg: array<f32>;\n");
     s.push_str("@group(1) @binding(5) var<storage, read_write> stepv: array<f32>;\n");
     for r in 0..records {
-        let _ = writeln!(s, "@group(1) @binding({}) var<storage, read> rec{r}: array<f32>;", 6 + r);
+        let _ = writeln!(
+            s,
+            "@group(1) @binding({}) var<storage, read> rec{r}: array<f32>;",
+            6 + r
+        );
     }
-    let _ = writeln!(s, "@group(1) @binding({}) var<uniform> p: Params;", 6 + records);
+    let _ = writeln!(
+        s,
+        "@group(1) @binding({}) var<uniform> p: Params;",
+        6 + records
+    );
     s.push_str(
         "fn isn(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
 fn fmax(a: f32, b: f32) -> f32 { return select(select(max(a, b), a, isn(a)), b, isn(b)); }
@@ -492,6 +558,17 @@ fn wmin(i: u32, r: u32, k: u32) -> f32 {
     var m = hist[r * p.max_steps + i];
     for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = fmin(m, hist[r * p.max_steps + j]); }
     return m;
+}
+fn wmean(i: u32, r: u32, k: u32) -> f32 {
+    let n = min(k, i + 1u);
+    var s = 0.0;
+    var bad = false;
+    for (var j = i + 1u - n; j <= i; j++) {
+        let v = hist[r * p.max_steps + j];
+        bad = bad || isn(v);
+        s += v;
+    }
+    return select(s / f32(n), bitcast<f32>(0x7fc00000u), bad);
 }
 @compute @workgroup_size(1)
 fn main() {
@@ -510,11 +587,21 @@ fn main() {
         let _ = writeln!(s, "    let v{r} = rec{r}[0];");
         let _ = writeln!(s, "    hist[{r}u * p.max_steps + i] = v{r};");
         let _ = writeln!(s, "    agg[{}u] = fmax(agg[{}u], v{r});", 2 * r, 2 * r);
-        let _ = writeln!(s, "    agg[{}u] = fmin(agg[{}u], v{r});", 2 * r + 1, 2 * r + 1);
+        let _ = writeln!(
+            s,
+            "    agg[{}u] = fmin(agg[{}u], v{r});",
+            2 * r + 1,
+            2 * r + 1
+        );
     }
     s.push_str("    var reason = 0u;\n");
     for (c, cond) in conds.iter().enumerate() {
-        let _ = writeln!(s, "    if (reason == 0u && {}) {{ reason = {}u; }}", cond_source(cond), c + 1);
+        let _ = writeln!(
+            s,
+            "    if (reason == 0u && {}) {{ reason = {}u; }}",
+            cond_source(cond),
+            c + 1
+        );
     }
     s.push_str(
         "    st[1] = i + 1u;
@@ -558,7 +645,11 @@ fn gate_outcome(
 
 fn state_from<S: Fields>(arrays: Vec<Array<S::Elem>>) -> S {
     let mut arrays = arrays.into_iter();
-    S::build(&mut || arrays.next().unwrap_or_else(|| unreachable!("a record builds exactly COUNT arrays")))
+    S::build(&mut || {
+        arrays
+            .next()
+            .unwrap_or_else(|| unreachable!("a record builds exactly COUNT arrays"))
+    })
 }
 
 /// Runs `step` on `init` at most `until.max_steps` times, recording scalars of the state after
@@ -598,11 +689,19 @@ pub fn iterate_until_all<S: Fields>(
     let location = Location::caller();
     run(init, &until, &step).map_err(|failure| match failure {
         Failure::Inherited(error) => LumaError::clone(&error),
-        Failure::New(error) => LumaError::Op { op: "iterate_until_all", location, source: Arc::new(error) },
+        Failure::New(error) => LumaError::Op {
+            op: "iterate_until_all",
+            location,
+            source: Arc::new(error),
+        },
     })
 }
 
-fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>) -> S) -> Outcome<Run<S>> {
+fn run<S: Fields>(
+    init: S,
+    until: &Until<'_, S>,
+    step: &impl Fn(&S, &Array<f32>) -> S,
+) -> Outcome<Run<S>> {
     let arrays = init.arrays();
     let ctx = arrays[0].context().clone();
     if arrays.iter().any(|array| !ctx.same_as(array.context())) {
@@ -619,7 +718,12 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
     let conds: Vec<Cond> = until.stops.iter().map(|stop| stop(&history)).collect();
     if until.max_steps == 0 {
         let history = names.into_iter().map(|name| (name, Vec::new())).collect();
-        return Ok(Run { state: init.copy(), steps: 0, reason: StopReason::MaxSteps, history });
+        return Ok(Run {
+            state: init.copy(),
+            steps: 0,
+            reason: StopReason::MaxSteps,
+            history,
+        });
     }
 
     // The step index: a one-element array that the gate advances.
@@ -629,22 +733,7 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
         single &= array.storage()?.segments() == 1;
     }
 
-    let apply_records = |next: &S| -> Outcome<Vec<Array<f32>>> {
-        let mut recs = Vec::with_capacity(until.records.len());
-        for (_, record) in &until.records {
-            let value = record(next);
-            if value.len() != 1 {
-                return Err(Failure::New(LumaError::InvalidShape("recorded values must have one element".into())));
-            }
-            recs.push(value);
-        }
-        for (a, shape) in next.arrays().into_iter().zip(&shapes) {
-            if a.shape() != *shape {
-                return Err(Failure::New(LumaError::ShapeMismatch { lhs: a.shape().dims(), rhs: shape.dims() }));
-            }
-        }
-        Ok(recs)
-    };
+    let apply_records = |next: &S| records_of(until, &shapes, next);
 
     // Trace one step.
     let mut trace = None;
@@ -687,8 +776,28 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
     };
 
     if let Some(stepper) = stepper {
-        let rec_storages = recs.iter().map(|rec| rec.storage().cloned()).collect::<std::result::Result<Vec<_>, _>>()?;
-        return gated_run(&ctx, &shapes, until, &conds, names, stepper, &stepv, &rec_storages);
+        let rec_storages = recs
+            .iter()
+            .map(|rec| rec.storage().cloned())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let gate =
+            ctx.jit()
+                .stencil_kernel(&ctx, gate_source(recs.len(), &conds), "UntilAllGate")?;
+        let (max_steps, check_every) = (until.max_steps, until.check_every);
+        let mut stepper = stepper;
+        return gated_run(
+            &ctx,
+            &shapes,
+            max_steps,
+            check_every,
+            &gate,
+            conds.len(),
+            names,
+            &mut stepper,
+            &stepv,
+            &rec_storages,
+            false,
+        );
     }
 
     // The host loop.
@@ -713,7 +822,10 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
         }
         state = next;
         steps = t + 1;
-        if let Some(c) = conds.iter().position(|cond| eval_host(cond, &histories, steps)) {
+        if let Some(c) = conds
+            .iter()
+            .position(|cond| eval_host(cond, &histories, steps))
+        {
             reason = StopReason::Predicate(c);
             break;
         }
@@ -721,7 +833,12 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
     for array in state.arrays() {
         array.check()?;
     }
-    Ok(Run { state, steps, reason, history: names.into_iter().zip(histories).collect() })
+    Ok(Run {
+        state,
+        steps,
+        reason,
+        history: names.into_iter().zip(histories).collect(),
+    })
 }
 
 /// Makes a stepper of the traced plan if the gate can drive it; `Err` gives the plan back (if
@@ -735,40 +852,81 @@ fn gated(
     max_steps: usize,
 ) -> std::result::Result<Stepper, Option<Plan>> {
     let records = recs.len();
-    let fits = recs.iter().all(|rec| rec.storage().is_ok_and(|storage| storage.segments() == 1))
+    let fits = recs
+        .iter()
+        .all(|rec| rec.storage().is_ok_and(|storage| storage.segments() == 1))
         && 6 + records <= ctx.jit().max_inputs() + 1
         && (records.max(1) * max_steps * 4) as u64 <= ctx.max_buffer_bytes();
     if !fits {
         return Err(Some(plan));
     }
-    let outs: std::result::Result<Vec<Arc<Storage>>, _> =
-        next.arrays().into_iter().map(|array| array.storage().cloned()).collect();
+    let outs: std::result::Result<Vec<Arc<Storage>>, _> = next
+        .arrays()
+        .into_iter()
+        .map(|array| array.storage().cloned())
+        .collect();
     match outs {
         Ok(outs) => Stepper::new(ctx, plan, &trace.init, &trace.probe_storages, outs).map_err(Some),
         Err(_) => Err(Some(plan)),
     }
 }
 
+/// The records of a step's result, each one element and the state the shapes it started with.
+fn records_of<S: Fields>(
+    until: &Until<'_, S>,
+    shapes: &[Shape],
+    next: &S,
+) -> Outcome<Vec<Array<f32>>> {
+    let mut recs = Vec::with_capacity(until.records.len());
+    for (_, record) in &until.records {
+        let value = record(next);
+        if value.len() != 1 {
+            return Err(Failure::New(LumaError::InvalidShape(
+                "recorded values must have one element".into(),
+            )));
+        }
+        recs.push(value);
+    }
+    for (a, shape) in next.arrays().into_iter().zip(shapes) {
+        if a.shape() != *shape {
+            return Err(Failure::New(LumaError::ShapeMismatch {
+                lhs: a.shape().dims(),
+                rhs: shape.dims(),
+            }));
+        }
+    }
+    Ok(recs)
+}
+
+/// Replays `stepper` for up to `max_steps` steps under `gate`. With `fresh` the returned state
+/// is a copy that shares no buffer with the stepper, so that it may be the next run's `init`.
 #[allow(clippy::too_many_arguments)]
 fn gated_run<S: Fields>(
     ctx: &Context,
     shapes: &[Shape],
-    until: &Until<'_, S>,
-    conds: &[Cond],
+    max_steps: usize,
+    check_every: Option<usize>,
+    gate: &KernelCore,
+    conditions: usize,
     names: Vec<String>,
-    stepper: Stepper,
+    stepper: &mut Stepper,
     stepv: &Array<f32>,
     recs: &[Arc<Storage>],
+    fresh: bool,
 ) -> Outcome<Run<S>> {
     let records = recs.len();
-    let max_steps = until.max_steps;
-    let gate = ctx.jit().stencil_kernel(ctx, gate_source(records, conds), "UntilAllGate")?;
     let template = stepper.plan().template();
-    let words = u32::try_from(template.len()).map_err(|_| LumaError::Gpu("too many recorded launches".into()))?;
+    let words = u32::try_from(template.len())
+        .map_err(|_| LumaError::Gpu("too many recorded launches".into()))?;
     let args_bytes = u64::from(words) * 4;
 
-    let rec_pins = recs.iter().map(|rec| rec.pin_quiet(0)).collect::<Result<Vec<_>>>()?;
+    let rec_pins = recs
+        .iter()
+        .map(|rec| rec.pin_quiet(0))
+        .collect::<Result<Vec<_>>>()?;
     let step_pin = stepv.storage()?.pin_quiet(0)?;
+    // The step index of a run starts at 0, whatever an earlier run left in it.
+    ctx.upload(step_pin.buffer(), bytemuck::cast_slice(&[0.0f32]))?;
 
     let mut owned = Vec::new();
     let mut take = |bytes: u64, usage: BufferUsages| -> Result<wgpu::Buffer> {
@@ -786,11 +944,13 @@ fn gated_run<S: Fields>(
         let hist = take(hist_bytes, STORAGE_USAGE)?;
         let agg_bytes = 2 * records.max(1) as u64 * 4;
         let agg = take(agg_bytes, STORAGE_USAGE)?;
-        let limits: Vec<f32> = (0..records.max(1)).flat_map(|_| [f32::NEG_INFINITY, f32::INFINITY]).collect();
+        let limits: Vec<f32> = (0..records.max(1))
+            .flat_map(|_| [f32::NEG_INFINITY, f32::INFINITY])
+            .collect();
         ctx.upload(&agg, bytemuck::cast_slice(&limits))?;
 
         let mut base = 0;
-        let mut block = until.check_every.unwrap_or(crate::jit::FIRST_BLOCK);
+        let mut block = check_every.unwrap_or(crate::jit::FIRST_BLOCK);
         loop {
             let in_block = block.min(max_steps - base);
             while args.len() <= in_block {
@@ -807,7 +967,10 @@ fn gated_run<S: Fields>(
                     .iter()
                     .map(|pin| {
                         let buffer = pin.buffer();
-                        swaps.iter().find(|(from, _)| from == buffer).map_or_else(|| buffer.clone(), |(_, to)| to.clone())
+                        swaps
+                            .iter()
+                            .find(|(from, _)| from == buffer)
+                            .map_or_else(|| buffer.clone(), |(_, to)| to.clone())
                     })
                     .collect();
                 let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(7 + records);
@@ -819,17 +982,22 @@ fn gated_run<S: Fields>(
                 raw.push(RawArg::write(step_pin.buffer(), 4));
                 raw.extend(resolved.iter().map(|buffer| RawArg::read(buffer, 4)));
                 raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
-                launch_1d(ctx, &gate, 1, &raw)?;
+                launch_1d(ctx, gate, 1, &raw)?;
             }
             let [done, count, reason, _] = ctx.read::<u32>(&st, 16)?[..] else {
-                return Err(Failure::New(LumaError::Gpu("iterate_until_all state is missing".into())));
+                return Err(Failure::New(LumaError::Gpu(
+                    "iterate_until_all state is missing".into(),
+                )));
             };
             base += in_block;
-            block = crate::jit::next_block(in_block, until.check_every);
+            block = crate::jit::next_block(in_block, check_every);
             if done != 0 || base >= max_steps {
-                let (steps, reason) = gate_outcome(done, count, reason, base, max_steps, conds.len())?;
+                let (steps, reason) =
+                    gate_outcome(done, count, reason, base, max_steps, conditions)?;
                 let all: Vec<f32> = ctx.read::<f32>(&hist, hist_bytes)?;
-                let histories = (0..records).map(|r| all[r * max_steps..r * max_steps + steps].to_vec()).collect();
+                let histories = (0..records)
+                    .map(|r| all[r * max_steps..r * max_steps + steps].to_vec())
+                    .collect();
                 return Ok((steps, reason, histories));
             }
         }
@@ -839,13 +1007,239 @@ fn gated_run<S: Fields>(
     }
     let (steps, reason, histories) = outcome?;
 
-    let arrays = stepper
-        .state_after(steps)
+    let detached = if fresh {
+        stepper.detach_even(ctx, steps)
+    } else {
+        None
+    };
+    let arrays: Vec<Array<S::Elem>> = match detached {
+        Some(storages) => storages
+            .into_iter()
+            .zip(shapes)
+            .map(|(storage, shape)| Array::from_storage(ctx, *shape, storage))
+            .collect(),
+        None => {
+            let refs: Vec<Array<S::Elem>> = stepper
+                .state_after(steps)
+                .iter()
+                .zip(shapes)
+                .map(|(storage, shape)| Array::from_storage(ctx, *shape, Arc::clone(storage)))
+                .collect();
+            if fresh {
+                let copies: Vec<Array<S::Elem>> = refs.iter().map(Array::copy).collect();
+                jit::force(&copies.iter().collect::<Vec<_>>())?;
+                copies
+            } else {
+                refs
+            }
+        }
+    };
+    Ok(Run {
+        state: state_from(arrays),
+        steps,
+        reason,
+        history: names.into_iter().zip(histories).collect(),
+    })
+}
+
+/// A loop traced once by [`compile_until_all`] and run any number of times on new initial states.
+///
+/// Running a loop in chunks with [`iterate_until_all`] traces the step again for every chunk; a
+/// `CompiledUntil` keeps the traced step, the stop rule's kernel and the buffers, so that a chunk
+/// costs only its launches. Every run is a run of the compiled loop: its step index and history
+/// start at 0 and its stop rule sees only the steps of that run.
+pub struct CompiledUntil<S: Fields> {
+    ctx: Context,
+    shapes: Vec<Shape>,
+    names: Vec<String>,
+    conditions: usize,
+    max_steps: usize,
+    check_every: Option<usize>,
+    stepper: Stepper,
+    stepv: Array<f32>,
+    rec_storages: Vec<Arc<Storage>>,
+    gate: Arc<KernelCore>,
+    state: PhantomData<fn() -> S>,
+}
+
+impl<S: Fields> CompiledUntil<S> {
+    /// Runs the compiled loop from `init` for at most the steps it was compiled with. `init` is
+    /// not modified; the state returned shares no buffer with the compiled loop and may be passed
+    /// straight to the next run.
+    #[track_caller]
+    pub fn run(&mut self, init: S) -> Result<Run<S>> {
+        self.run_steps(init, self.max_steps)
+    }
+
+    /// [`CompiledUntil::run`] for at most `max_steps.min(compiled steps)` steps: a shorter last
+    /// chunk needs no new compilation.
+    #[track_caller]
+    pub fn run_steps(&mut self, init: S, max_steps: usize) -> Result<Run<S>> {
+        let location = Location::caller();
+        self.run_inner(init, max_steps.min(self.max_steps))
+            .map_err(|failure| match failure {
+                Failure::Inherited(error) => LumaError::clone(&error),
+                Failure::New(error) => LumaError::Op {
+                    op: "CompiledUntil::run",
+                    location,
+                    source: Arc::new(error),
+                },
+            })
+    }
+
+    fn run_inner(&mut self, init: S, steps: usize) -> Outcome<Run<S>> {
+        let arrays = init.arrays();
+        if arrays.len() != self.shapes.len() {
+            return Err(Failure::New(LumaError::InvalidShape(
+                "the state is not the one compiled".into(),
+            )));
+        }
+        for (array, shape) in arrays.iter().zip(&self.shapes) {
+            if !self.ctx.same_as(array.context()) {
+                return Err(Failure::New(LumaError::ContextMismatch));
+            }
+            if let Some(error) = array.error() {
+                return Err(Failure::Inherited(Arc::new(error.clone())));
+            }
+            if array.shape() != *shape {
+                return Err(Failure::New(LumaError::ShapeMismatch {
+                    lhs: array.shape().dims(),
+                    rhs: shape.dims(),
+                }));
+            }
+        }
+        if steps == 0 {
+            let history = self
+                .names
+                .iter()
+                .map(|name| (name.clone(), Vec::new()))
+                .collect();
+            return Ok(Run {
+                state: init.copy(),
+                steps: 0,
+                reason: StopReason::MaxSteps,
+                history,
+            });
+        }
+        let storages = jit::force(&arrays)?;
+        if !self.stepper.rebind(&storages) {
+            // Buffers the loop writes (or a state spread over several buffers): run on a copy.
+            let copies: Vec<Array<S::Elem>> = arrays.iter().map(|array| (*array).copy()).collect();
+            let storages = jit::force(&copies.iter().collect::<Vec<_>>())?;
+            if !self.stepper.rebind(&storages) {
+                return Err(Failure::New(LumaError::Unsupported(
+                    "CompiledUntil needs states of single buffers, shaped like the compiled one"
+                        .into(),
+                )));
+            }
+        }
+        gated_run(
+            &self.ctx,
+            &self.shapes,
+            steps,
+            self.check_every,
+            &self.gate,
+            self.conditions,
+            self.names.clone(),
+            &mut self.stepper,
+            &self.stepv,
+            &self.rec_storages,
+            true,
+        )
+    }
+}
+
+/// Traces the loop of [`iterate_until_all`] once, for `init`'s shapes, and returns it ready to run
+/// on any number of states of those shapes: a solver that steps in chunks (to look at the state
+/// between chunks) pays for the trace once instead of once per chunk.
+///
+/// `step` is called once, here, and not kept, so it may borrow. Unlike [`iterate_until_all`] there
+/// is no host loop to fall back to: a step that reads back, or states larger than one buffer,
+/// give [`LumaError::Unsupported`]; so does `until` with 0 steps.
+#[track_caller]
+pub fn compile_until_all<S: Fields>(
+    init: &S,
+    until: Until<'_, S>,
+    step: impl Fn(&S, &Array<f32>) -> S,
+) -> Result<CompiledUntil<S>> {
+    let location = Location::caller();
+    compile(init, &until, &step).map_err(|failure| match failure {
+        Failure::Inherited(error) => LumaError::clone(&error),
+        Failure::New(error) => LumaError::Op {
+            op: "compile_until_all",
+            location,
+            source: Arc::new(error),
+        },
+    })
+}
+
+fn compile<S: Fields>(
+    init: &S,
+    until: &Until<'_, S>,
+    step: &impl Fn(&S, &Array<f32>) -> S,
+) -> Outcome<CompiledUntil<S>> {
+    let unsupported = || {
+        Failure::New(LumaError::Unsupported(
+            "compile_until_all requires single-buffer states without host readbacks in the step"
+                .into(),
+        ))
+    };
+    let arrays = init.arrays();
+    let ctx = arrays[0].context().clone();
+    if arrays.iter().any(|array| !ctx.same_as(array.context())) {
+        return Err(Failure::New(LumaError::ContextMismatch));
+    }
+    for array in &arrays {
+        if let Some(error) = array.error() {
+            return Err(Failure::Inherited(Arc::new(error.clone())));
+        }
+    }
+    if until.max_steps == 0 {
+        return Err(Failure::New(LumaError::Unsupported(
+            "compile_until_all needs at least one step".into(),
+        )));
+    }
+    for array in &arrays {
+        if array.storage()?.segments() != 1 {
+            return Err(unsupported());
+        }
+    }
+    let shapes: Vec<Shape> = arrays.iter().map(|array| array.shape()).collect();
+    let names: Vec<String> = until.records.iter().map(|(name, _)| name.clone()).collect();
+    let history = History::new(names.clone());
+    let conds: Vec<Cond> = until.stops.iter().map(|stop| stop(&history)).collect();
+
+    let stepv = Array::<f32>::from_slice_on(&ctx, &[0.0], 1)?;
+    let (mut trace, probes) = Trace::start(&arrays)?;
+    let probes: S = state_from(probes);
+    let next = step(&probes, &stepv);
+    jit::force(&next.arrays())?;
+    let recs = records_of(until, &shapes, &next)?;
+    jit::force(&next.arrays())?;
+    jit::force(&recs.iter().collect::<Vec<_>>())?;
+    let plan = trace.finish_plan().ok_or_else(unsupported)?;
+    let stepper =
+        gated(&ctx, plan, &trace, &next, &recs, until.max_steps).map_err(|_| unsupported())?;
+    let rec_storages = recs
         .iter()
-        .zip(shapes)
-        .map(|(storage, shape)| Array::from_storage(ctx, *shape, Arc::clone(storage)))
-        .collect();
-    Ok(Run { state: state_from(arrays), steps, reason, history: names.into_iter().zip(histories).collect() })
+        .map(|rec| rec.storage().cloned())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let gate = ctx
+        .jit()
+        .stencil_kernel(&ctx, gate_source(recs.len(), &conds), "UntilAllGate")?;
+    Ok(CompiledUntil {
+        ctx,
+        shapes,
+        names,
+        conditions: conds.len(),
+        max_steps: until.max_steps,
+        check_every: until.check_every,
+        stepper,
+        stepv,
+        rec_storages,
+        gate,
+        state: PhantomData,
+    })
 }
 
 #[cfg(test)]
@@ -859,13 +1253,31 @@ mod tests {
     #[test]
     fn the_gate_state_read_back_is_checked_before_it_indexes_host_arrays() {
         // A loop that ran all its steps, and one a condition (the second of two) stopped at step 3.
-        assert_eq!(gate_outcome(0, 0, 0, 16, 16, 2).ok(), Some((16, StopReason::MaxSteps)));
-        assert_eq!(gate_outcome(1, 3, 2, 16, 16, 2).ok(), Some((3, StopReason::Predicate(1))));
-        assert_eq!(gate_outcome(1, 16, 1, 16, 16, 2).ok(), Some((16, StopReason::Predicate(0))));
+        assert_eq!(
+            gate_outcome(0, 0, 0, 16, 16, 2).ok(),
+            Some((16, StopReason::MaxSteps))
+        );
+        assert_eq!(
+            gate_outcome(1, 3, 2, 16, 16, 2).ok(),
+            Some((3, StopReason::Predicate(1)))
+        );
+        assert_eq!(
+            gate_outcome(1, 16, 1, 16, 16, 2).ok(),
+            Some((16, StopReason::Predicate(0)))
+        );
         // Words the gate cannot write: float bit patterns seen in the wild, a step past the maximum,
         // step 0, a condition of 0 (the gate stores `index + 1`) or beyond the last one.
-        for (count, reason) in [(4_294_967_231, 1), (1_065_353_216, 1), (17, 1), (0, 1), (3, 0), (3, 3)] {
-            let Err(failure) = gate_outcome(1, count, reason, 16, 16, 2) else { panic!("a corrupt state is an error") };
+        for (count, reason) in [
+            (4_294_967_231, 1),
+            (1_065_353_216, 1),
+            (17, 1),
+            (0, 1),
+            (3, 0),
+            (3, 3),
+        ] {
+            let Err(failure) = gate_outcome(1, count, reason, 16, 16, 2) else {
+                panic!("a corrupt state is an error")
+            };
             let message = failure.into_error().to_string();
             assert!(message.contains("cannot have written"), "{message}");
         }
@@ -880,18 +1292,141 @@ mod tests {
         // Peak 4, last 3: ratio 1.33; the last two values are 2 and 3.
         assert!(eval_host(&cond, &histories, 4));
         assert!(!eval_host(&cond, &histories, 2));
-        assert!(eval_host(&(h["b"].trough() - h["b"].first()).lt(0.0), &histories, 4));
+        assert!(eval_host(
+            &(h["b"].trough() - h["b"].first()).lt(0.0),
+            &histories,
+            4
+        ));
         assert!(eval_host(&h.step().ge(4.0), &histories, 4));
-        assert!(eval_host(&a.first().gt(0.5).not().or(a.last().ge(3.0)), &histories, 4));
+        assert!(eval_host(
+            &a.first().gt(0.5).not().or(a.last().ge(3.0)),
+            &histories,
+            4
+        ));
     }
 
     #[test]
     fn the_gate_source_names_every_record_and_condition() {
         let h = hist();
-        let conds = [h["a"].window_min(3).lt(h["b"].last()), h["b"].peak().ge(2.0)];
+        let conds = [
+            h["a"].window_min(3).lt(h["b"].last()),
+            h["b"].peak().ge(2.0),
+        ];
         let source = gate_source(2, &conds);
         assert!(source.contains("rec1"));
         assert!(source.contains("wmin(i, 0u, 3u)"));
         assert!(source.contains("reason = 2u"));
+    }
+
+    #[test]
+    fn host_window_mean_and_prev() {
+        let h = hist();
+        let a = &h["a"];
+        let histories = vec![vec![1.0, 4.0, 2.0, 3.0], vec![1.0, f32::NAN, 3.0, 4.0]];
+        assert_eq!(eval_stat(&a.window_mean(2), &histories, 4), 2.5);
+        // Fewer values than the window: all of them.
+        assert_eq!(eval_stat(&a.window_mean(10), &histories, 2), 2.5);
+        assert_eq!(eval_stat(&a.window_mean(0), &histories, 4), 3.0);
+        assert_eq!(eval_stat(&a.prev(0), &histories, 4), 3.0);
+        assert_eq!(eval_stat(&a.prev(1), &histories, 4), 2.0);
+        assert_eq!(eval_stat(&a.prev(9), &histories, 4), 1.0);
+        let b = &h["b"];
+        assert!(eval_stat(&b.window_mean(2), &histories, 3).is_nan());
+        assert_eq!(eval_stat(&b.window_mean(2), &histories, 1), 1.0);
+        assert_eq!(eval_stat(&b.window_mean(2), &histories, 4), 3.5);
+        let source = gate_source(2, &[a.window_mean(3).lt(a.prev(2))]);
+        assert!(source.contains("wmean(i, 0u, 3u)"));
+        assert!(source.contains("(i - min(2u, i))"));
+    }
+
+    /// The first step after which `cond` holds on `history`, as the host evaluates it.
+    fn host_stop(cond: &Cond, history: &[f32]) -> Option<usize> {
+        let histories = vec![history.to_vec()];
+        (1..=history.len()).find(|&done| eval_host(cond, &histories, done))
+    }
+
+    #[test]
+    fn the_gpu_evaluates_window_mean_and_prev_like_the_host() {
+        let ctx = Context::new().unwrap();
+        let k = 4;
+        let make = || {
+            let rule = move |h: &History| {
+                let m = &h["max"];
+                m.window_mean(k)
+                    .lt(0.01)
+                    .and((m.prev(1) - m.last()).abs().le(1.0))
+            };
+            let stationary = move |h: &History| {
+                let m = &h["max"];
+                (m.window_mean(2 * k) - m.window_mean(k))
+                    .abs()
+                    .le(1e-6)
+                    .and(m.prev(1).ge(m.last()))
+            };
+            Until::new(60)
+                .record("max", |s: &(Array<f32>,)| s.0.max())
+                .stop_when(rule)
+                .stop_when(stationary)
+        };
+        let init = (Array::from_slice_on(&ctx, &[1.0f32; 16], 16).unwrap(),);
+        let run = iterate_until_all(init, make(), |s, _| (&s.0 * 0.5,)).unwrap();
+        let history = run.history("max").unwrap();
+        let h = History::new(vec!["max".into()]);
+        let conds: Vec<Cond> = make().stops.iter().map(|stop| stop(&h)).collect();
+        let first = conds.iter().map(|c| host_stop(c, history)).enumerate();
+        let (index, steps) = first
+            .filter_map(|(i, s)| s.map(|s| (i, s)))
+            .min_by_key(|&(i, s)| (s, i))
+            .unwrap();
+        assert_eq!(
+            (run.steps, run.reason),
+            (steps, StopReason::Predicate(index))
+        );
+
+        // A NaN in the window stops nothing, on either side.
+        let nan = (Array::from_slice_on(&ctx, &[f32::NAN; 4], 4).unwrap(),);
+        let run = iterate_until_all(
+            nan,
+            Until::new(5)
+                .record("max", |s: &(Array<f32>,)| s.0.max())
+                .stop_when(|h| h["max"].window_mean(2).ge(-1e30)),
+            |s, _| (&s.0 * 0.5,),
+        )
+        .unwrap();
+        assert_eq!((run.steps, run.reason), (5, StopReason::MaxSteps));
+    }
+
+    #[test]
+    fn a_compiled_loop_runs_chunks_like_iterate_until_all() {
+        type One = (Array<f32>,);
+        let ctx = Context::new().unwrap();
+        let scale = 1.0f32;
+        let step = |s: &One, k: &Array<f32>| (&(&s.0 + k) * scale,);
+        let until = |n: usize| Until::new(n).record("max", |s: &One| s.0.max());
+        let start = || (Array::from_slice_on(&ctx, &[0.0f32; 8], 8).unwrap(),);
+
+        let mut compiled = compile_until_all(&start(), until(8), step).unwrap();
+        let mut want = start();
+        let mut got = start();
+        for (n, shorter) in [(8, false), (8, false), (3, true)] {
+            let expected = iterate_until_all(want, until(n), step).unwrap();
+            // The state of a run goes straight into the next one.
+            let run = if shorter {
+                compiled.run_steps(got, 3)
+            } else {
+                compiled.run(got)
+            }
+            .unwrap();
+            assert_eq!((run.steps, run.reason), (expected.steps, expected.reason));
+            assert_eq!(run.history("max"), expected.history("max"));
+            assert_eq!(
+                run.state.0.to_vec().unwrap(),
+                expected.state.0.to_vec().unwrap()
+            );
+            want = expected.state;
+            got = run.state;
+        }
+        // 0 + 1 + .. + 7 twice, then 0 + 1 + 2.
+        assert_eq!(got.0.to_vec().unwrap(), vec![59.0; 8]);
     }
 }

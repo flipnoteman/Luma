@@ -128,10 +128,11 @@ impl Tuning {
         staging: true,
         df_fma: false,
         df_sloppy_add: false,
-        line_bytes: 16 * 1024,
-        // Not measured on Apple GPUs: Thomas unless forced.
-        line_cyclic_work: 0,
-        line_strided_from: 0,
+        line_bytes: 32 * 1024,
+        // Cyclic reduction wins on parts along the contiguous axis and on few lines.
+        line_cyclic_work: 8192,
+        // 32-wide SIMD groups, like NVIDIA warps: see `builtin::thomas_plan`.
+        line_strided_from: 16,
         line_solver: LineSolver::Auto,
     };
 
@@ -186,16 +187,26 @@ impl Tuning {
         line_bytes: 16 * 1024,
         // Not measured on other GPUs (a RADV iGPU was slower, 8.7 vs 3.0 ms for 200 lines of 4096): Thomas unless forced.
         line_cyclic_work: 0,
-        line_strided_from: 0,
+        line_strided_from: 16,
         line_solver: LineSolver::Auto,
     };
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
     /// that measured faster on llvmpipe.
-    const CPU: Tuning = Tuning { profile: TuningProfile::Cpu, elementwise_workgroup: 64, max_live: 256, max_inlined: 192, ..Tuning::GENERIC };
+    const CPU: Tuning = Tuning {
+        profile: TuningProfile::Cpu,
+        elementwise_workgroup: 64,
+        max_live: 256,
+        max_inlined: 192,
+        ..Tuning::GENERIC
+    };
 
     /// The parameters for the GPU `info` describes, unless the environment forces a profile.
-    pub(crate) fn for_adapter(info: &wgpu::AdapterInfo, limits: &wgpu::Limits, features: wgpu::Features) -> Tuning {
+    pub(crate) fn for_adapter(
+        info: &wgpu::AdapterInfo,
+        limits: &wgpu::Limits,
+        features: wgpu::Features,
+    ) -> Tuning {
         let forced = std::env::var(TUNING_ENV).ok();
         let profile = match forced.as_deref().map(str::trim) {
             Some("apple") => TuningProfile::Apple,
@@ -214,15 +225,23 @@ impl Tuning {
             TuningProfile::Cpu => Tuning::CPU,
         };
         let mut tuning = tuning.within(limits);
-        if let Some(live) = std::env::var(MAX_LIVE_ENV).ok().and_then(|value| value.trim().parse::<usize>().ok()) {
+        if let Some(live) = std::env::var(MAX_LIVE_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
             tuning.max_live = live.clamp(8, 4096);
         }
-        if let Some(inlined) = std::env::var(MAX_INLINED_ENV).ok().and_then(|value| value.trim().parse::<usize>().ok()) {
+        if let Some(inlined) = std::env::var(MAX_INLINED_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
             tuning.max_inlined = inlined.clamp(16, 16384);
         }
-        tuning.subgroups = features.contains(wgpu::Features::SUBGROUP) && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
+        tuning.subgroups = features.contains(wgpu::Features::SUBGROUP)
+            && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
         tuning.workgroup_storage = limits.max_compute_workgroup_storage_size;
-        tuning.subgroup32 = tuning.subgroups && info.subgroup_min_size == 32 && info.subgroup_max_size == 32;
+        tuning.subgroup32 =
+            tuning.subgroups && info.subgroup_min_size == 32 && info.subgroup_max_size == 32;
         tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
         tuning.line_solver = match std::env::var(LINE_SOLVER_ENV).as_deref().map(str::trim) {
             Ok("thomas") => LineSolver::Thomas,
@@ -240,20 +259,34 @@ impl Tuning {
 
     /// Shrinks what the device cannot run.
     fn within(mut self, limits: &wgpu::Limits) -> Tuning {
-        let invocations = limits.max_compute_invocations_per_workgroup.min(limits.max_compute_workgroup_size_x);
+        let invocations = limits
+            .max_compute_invocations_per_workgroup
+            .min(limits.max_compute_workgroup_size_x);
         self.elementwise_workgroup = self.elementwise_workgroup.min(invocations);
         self.conv_workgroup = self.conv_workgroup.min(invocations);
-        while self.conv_per_thread > 4 && conv_workgroup_bytes(self.conv_workgroup, self.conv_per_thread) > limits.max_compute_workgroup_storage_size {
+        while self.conv_per_thread > 4
+            && conv_workgroup_bytes(self.conv_workgroup, self.conv_per_thread)
+                > limits.max_compute_workgroup_storage_size
+        {
             self.conv_per_thread /= 2;
         }
-        self.stencil_tile_bytes = self.stencil_tile_bytes.min(limits.max_compute_workgroup_storage_size);
-        self.line_bytes = self.line_bytes.min(limits.max_compute_workgroup_storage_size);
+        self.stencil_tile_bytes = self
+            .stencil_tile_bytes
+            .min(limits.max_compute_workgroup_storage_size);
+        self.line_bytes = self
+            .line_bytes
+            .min(limits.max_compute_workgroup_storage_size);
         // `stencil::layout` always runs at least one step, whatever the budget.
-        while self.stencil_tile_1d > 32 && stencil_bytes((self.stencil_tile_1d, 1), (STENCIL_RADIUS, 0)) > self.stencil_tile_bytes {
+        while self.stencil_tile_1d > 32
+            && stencil_bytes((self.stencil_tile_1d, 1), (STENCIL_RADIUS, 0))
+                > self.stencil_tile_bytes
+        {
             self.stencil_tile_1d /= 2;
         }
         let radius = (STENCIL_RADIUS, STENCIL_RADIUS);
-        while self.stencil_tile_2d.0.max(self.stencil_tile_2d.1) > 4 && stencil_bytes(self.stencil_tile_2d, radius) > self.stencil_tile_bytes {
+        while self.stencil_tile_2d.0.max(self.stencil_tile_2d.1) > 4
+            && stencil_bytes(self.stencil_tile_2d, radius) > self.stencil_tile_bytes
+        {
             let (x, y) = &mut self.stencil_tile_2d;
             if *x >= *y { *x /= 2 } else { *y /= 2 }
         }
@@ -292,23 +325,35 @@ const APPLE_VENDOR: u32 = 0x106B;
 const NVIDIA_VENDOR: u32 = 0x10DE;
 
 fn is_apple(info: &wgpu::AdapterInfo) -> bool {
-    info.backend == wgpu::Backend::Metal && (info.vendor == APPLE_VENDOR || info.name.starts_with("Apple"))
+    info.backend == wgpu::Backend::Metal
+        && (info.vendor == APPLE_VENDOR || info.name.starts_with("Apple"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{conv_workgroup_bytes, stencil_bytes, Tuning, STENCIL_RADIUS};
+    use super::{STENCIL_RADIUS, Tuning, conv_workgroup_bytes, stencil_bytes};
 
     #[test]
     fn tunings_fit_the_smallest_webgpu_limits() {
         let limits = wgpu::Limits::downlevel_defaults();
         for tuning in [Tuning::APPLE, Tuning::NVIDIA, Tuning::GENERIC, Tuning::CPU] {
             let t = tuning.within(&limits);
-            assert!(conv_workgroup_bytes(t.conv_workgroup, t.conv_per_thread) <= limits.max_compute_workgroup_storage_size, "{t:?}");
+            assert!(
+                conv_workgroup_bytes(t.conv_workgroup, t.conv_per_thread)
+                    <= limits.max_compute_workgroup_storage_size,
+                "{t:?}"
+            );
             assert!(t.stencil_tile_bytes <= limits.max_compute_workgroup_storage_size);
             assert!(t.line_bytes <= limits.max_compute_workgroup_storage_size);
-            assert!(stencil_bytes((t.stencil_tile_1d, 1), (STENCIL_RADIUS, 0)) <= t.stencil_tile_bytes, "{t:?}");
-            assert!(stencil_bytes(t.stencil_tile_2d, (STENCIL_RADIUS, STENCIL_RADIUS)) <= t.stencil_tile_bytes, "{t:?}");
+            assert!(
+                stencil_bytes((t.stencil_tile_1d, 1), (STENCIL_RADIUS, 0)) <= t.stencil_tile_bytes,
+                "{t:?}"
+            );
+            assert!(
+                stencil_bytes(t.stencil_tile_2d, (STENCIL_RADIUS, STENCIL_RADIUS))
+                    <= t.stencil_tile_bytes,
+                "{t:?}"
+            );
             assert!(t.elementwise_workgroup <= limits.max_compute_invocations_per_workgroup);
         }
     }

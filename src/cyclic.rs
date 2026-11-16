@@ -36,17 +36,26 @@ pub(crate) struct Plan {
     /// Rows that are a multiple of `1 << shift` live in workgroup memory, the others in a global
     /// scratch buffer (`shift == 0`: no scratch).
     pub(crate) shift: u8,
-    /// Rows in workgroup memory: `ceil(n / (1 << shift))`.
+    /// Rows in workgroup memory: `ceil(n / (1 << shift))`, rounded up to a multiple of 32.
     pub(crate) shared_rows: u32,
 }
 
 impl Plan {
+    /// Rows of a line of `n` rows that are a multiple of `1 << shift`.
+    fn in_shared(&self, n: u32) -> u32 {
+        if n == 0 {
+            0
+        } else {
+            ((n - 1) >> self.shift) + 1
+        }
+    }
+
     /// Bytes of global scratch for `lines` lines of `n` rows of `block`-blocks; 0 without spill.
     pub(crate) fn scratch_bytes(&self, block: u32, n: u32, lines: u32) -> u64 {
         if self.shift == 0 {
             return 0;
         }
-        u64::from(lines) * u64::from(n - self.shared_rows) * row_bytes(block)
+        u64::from(lines) * u64::from(n - self.in_shared(n)) * row_bytes(block)
     }
 }
 
@@ -66,7 +75,11 @@ fn scalar_rows(block: u32) -> bool {
 /// of a level, `2h` rows apart, fall on different banks as far as they can: floats for a scalar
 /// line, else the `vec4`s of [`row_floats`].
 fn row_elems(block: u32) -> u32 {
-    if scalar_rows(block) { row_floats(block) | 1 } else { row_floats(block).div_ceil(4) | 1 }
+    if scalar_rows(block) {
+        row_floats(block) | 1
+    } else {
+        row_floats(block).div_ceil(4) | 1
+    }
 }
 
 /// Bytes of one row in workgroup memory.
@@ -76,25 +89,36 @@ fn row_bytes(block: u32) -> u64 {
 
 /// The WGSL type of the elements of [`row_elems`].
 pub(crate) fn row_type(block: u32) -> &'static str {
-    if scalar_rows(block) { "f32" } else { "vec4<f32>" }
+    if scalar_rows(block) {
+        "f32"
+    } else {
+        "vec4<f32>"
+    }
 }
 
 /// The shift (log2 of the row stride) of the shared rows for a line of `n` rows, and the number
-/// of shared rows. A line that fits the workgroup memory whole gets its rows rounded up to a
-/// multiple of 32 (as long as that fits too): the array size is a constant of the source, so
-/// lines of 106 and 122 rows share one kernel instead of compiling one each, at the price of at
-/// most 31 unused rows of workgroup memory. A spilled line keeps its exact count, which the
-/// scratch indexing bakes in.
+/// of shared rows. The rows are rounded up to a multiple of 32 (as long as that fits the
+/// workgroup memory): the array size is a constant of the source, so lines of 106 and 122 rows
+/// (or spilled lines of 300 and 312) share one kernel instead of compiling one each, at the price
+/// of at most 31 unused rows of workgroup memory. The scratch indexing derives from the runtime
+/// `n`, not from `shared_rows`.
 fn layout(tuning: &Tuning, block: u32, n: u32) -> (u8, u32) {
     let row = row_bytes(block);
     let budget = u64::from(tuning.line_bytes);
     let mut shift = 0u8;
-    while shift < 31 && u64::from(n.div_ceil(1 << shift)) * row > budget && n.div_ceil(1 << shift) > 1 {
+    while shift < 31
+        && u64::from(n.div_ceil(1 << shift)) * row > budget
+        && n.div_ceil(1 << shift) > 1
+    {
         shift += 1;
     }
     let rows = n.div_ceil(1 << shift);
     let padded = rows.next_multiple_of(32);
-    if shift == 0 && u64::from(padded) * row <= budget { (shift, padded) } else { (shift, rows) }
+    if u64::from(padded) * row <= budget {
+        (shift, padded)
+    } else {
+        (shift, rows)
+    }
 }
 
 /// Whether the line solve of `lines` lines of `n` cells of `block`-blocks, `stride` cells apart
@@ -142,18 +166,34 @@ fn layout(tuning: &Tuning, block: u32, n: u32) -> (u8, u32) {
 /// lines of 122 rows: 157 us to 130 us). One of 41 rows of `bench_solve --only sweep/` that
 /// changed got slower (8x8 blocks, 256 strided lines of 64 rows: 122 us to 136 us, 36 KiB per
 /// workgroup against 18 KiB with half the rows spilled).
-pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32, parts: bool, max_scratch: u64) -> Option<Plan> {
+pub(crate) fn plan(
+    tuning: &Tuning,
+    block: u32,
+    n: u32,
+    lines: u32,
+    stride: u32,
+    parts: bool,
+    max_scratch: u64,
+) -> Option<Plan> {
     if tuning.line_solver == LineSolver::Thomas || n == 0 || lines == 0 {
         return None;
     }
     let (shift, shared_rows) = layout(tuning, block, n);
     let workgroup = workgroup_size(tuning, block, n, stride > 1);
-    let plan = Plan { workgroup, shift, shared_rows };
+    let plan = Plan {
+        workgroup,
+        shift,
+        shared_rows,
+    };
     // A single row must fit the budget, and the scratch a buffer.
-    if u64::from(shared_rows) * row_bytes(block) > u64::from(tuning.line_bytes) || plan.scratch_bytes(block, n, lines) > max_scratch {
+    if u64::from(shared_rows) * row_bytes(block) > u64::from(tuning.line_bytes)
+        || plan.scratch_bytes(block, n, lines) > max_scratch
+    {
         return None;
     }
-    let scratch_elements = u64::from(lines) * u64::from(n.saturating_sub(shared_rows)) * u64::from(row_elems(block));
+    let scratch_elements = u64::from(lines)
+        * u64::from(n.saturating_sub(plan.in_shared(n)))
+        * u64::from(row_elems(block));
     if scratch_elements > u64::from(u32::MAX) {
         return None;
     }
@@ -213,7 +253,13 @@ pub(crate) struct Config {
 /// Bindings of the kernel of [`Io::buffers`], in order: `out`, the scratch `sm` (with spill),
 /// `lo`, `diag`, `up`, `rhs`, `starts` (with `starts`), the uniform parameters `{n, stride,
 /// lines}`.
-pub(crate) fn source(block: u32, starts: bool, workgroup: u32, shift: u32, shared_rows: u32) -> String {
+pub(crate) fn source(
+    block: u32,
+    starts: bool,
+    workgroup: u32,
+    shift: u32,
+    shared_rows: u32,
+) -> String {
     let io = Io::buffers(block as usize);
     let mut binding = 0;
     let mut next = || {
@@ -222,19 +268,57 @@ pub(crate) fn source(block: u32, starts: bool, workgroup: u32, shift: u32, share
     };
     let mut src = String::new();
     let _ = writeln!(src, "struct Params {{ n: u32, stride: u32, lines: u32 }}");
-    let _ = writeln!(src, "@group(1) @binding({}) var<storage, read_write> out: array<{}>;", next(), io.rhs_type());
+    let _ = writeln!(
+        src,
+        "@group(1) @binding({}) var<storage, read_write> out: array<{}>;",
+        next(),
+        io.rhs_type()
+    );
     if shift > 0 {
-        let _ = writeln!(src, "@group(1) @binding({}) var<storage, read_write> sm: array<{}>;", next(), row_type(block));
+        let _ = writeln!(
+            src,
+            "@group(1) @binding({}) var<storage, read_write> sm: array<{}>;",
+            next(),
+            row_type(block)
+        );
     }
     for name in ["lo", "diag", "up"] {
-        let _ = writeln!(src, "@group(1) @binding({}) var<storage, read> {name}: array<{}>;", next(), io.coef_type());
+        let _ = writeln!(
+            src,
+            "@group(1) @binding({}) var<storage, read> {name}: array<{}>;",
+            next(),
+            io.coef_type()
+        );
     }
-    let _ = writeln!(src, "@group(1) @binding({}) var<storage, read> rhs: array<{}>;", next(), io.rhs_type());
+    let _ = writeln!(
+        src,
+        "@group(1) @binding({}) var<storage, read> rhs: array<{}>;",
+        next(),
+        io.rhs_type()
+    );
     if starts {
-        let _ = writeln!(src, "@group(1) @binding({}) var<storage, read> starts: array<u32>;", next());
+        let _ = writeln!(
+            src,
+            "@group(1) @binding({}) var<storage, read> starts: array<u32>;",
+            next()
+        );
     }
-    let _ = writeln!(src, "@group(1) @binding({}) var<uniform> p: Params;", next());
-    src.push_str(&body(&Config { block, workgroup, shift, shared_rows, starts, systems: 1 }, &io));
+    let _ = writeln!(
+        src,
+        "@group(1) @binding({}) var<uniform> p: Params;",
+        next()
+    );
+    src.push_str(&body(
+        &Config {
+            block,
+            workgroup,
+            shift,
+            shared_rows,
+            starts,
+            systems: 1,
+        },
+        &io,
+    ));
     src
 }
 
@@ -261,7 +345,14 @@ fn fl(name: &str, k: usize) -> String {
 /// The kernel after its bindings (`out`, `sm` with a spill, whatever the coefficients are read
 /// from, `starts`, `p`): workgroup memory, the line addressing, and `main`.
 pub(crate) fn body(cfg: &Config, io: &Io) -> String {
-    let Config { block, workgroup, shift, shared_rows, starts, systems } = *cfg;
+    let Config {
+        block,
+        workgroup,
+        shift,
+        shared_rows,
+        starts,
+        systems,
+    } = *cfg;
     let b = block as usize;
     let (bb, w) = (b * b, 2 * b + 1);
     let floats = row_floats(block) as usize;
@@ -292,7 +383,10 @@ fn line_base(l: u32) -> u32 {{ return (l % p.stride) + (l / p.stride) * p.stride
         let _ = writeln!(src, "const KS: u32 = {ks}u;\nvar<private> sbase: u32;");
     }
     // `array[{at}(r) + e]`, in shared memory or the scratch.
-    let (in_shared, in_scratch) = (format!("(r >> {shift}u) * RV"), format!("sbase + (r - (r >> {shift}u) - 1u) * RV"));
+    let (in_shared, in_scratch) = (
+        format!("(r >> {shift}u) * RV"),
+        format!("sbase + (r - (r >> {shift}u) - 1u) * RV"),
+    );
     let mask = ks - 1;
     if scalar {
         if spill {
@@ -336,9 +430,17 @@ fn st4(r: u32, e: u32, v: vec4<f32>) {{
         src.push_str("fn ldf(r: u32, e: u32) -> vec4<f32> { return ld4(r, e); }\nfn stf(r: u32, e: u32, v: vec4<f32>) { st4(r, e, v); }\n");
     }
     let s0 = if starts { "min(starts[l], p.n)" } else { "0u" };
-    let sbase = if spill { format!("    sbase = lg * ((p.n - {shared_rows}u) * RV);\n") } else { String::new() };
+    let sbase = if spill {
+        format!("    sbase = lg * ((p.n - (((p.n - 1u) >> {shift}u) + 1u)) * RV);\n")
+    } else {
+        String::new()
+    };
     let (guard, sys, line) = if systems > 1 {
-        (format!("p.lines * {systems}u"), "    let sys = lg / p.lines;\n", "lg % p.lines")
+        (
+            format!("p.lines * {systems}u"),
+            "    let sys = lg / p.lines;\n",
+            "lg % p.lines",
+        )
     } else {
         ("p.lines".to_owned(), "    let sys = 0u;\n", "lg")
     };
@@ -379,14 +481,25 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     };
 
     // Normalise every row.
-    src.push_str("    for (var r = li; r < m; r += WG) {\n        let q = base + (s0 + r) * p.stride;\n");
+    src.push_str(
+        "    for (var r = li; r < m; r += WG) {\n        let q = base + (s0 + r) * p.stride;\n",
+    );
     src.push_str(&io.load("        ", "q"));
     src.push_str(&io.load_lo("        ", "q"));
     for i in 0..b {
         for j in 0..b {
             let _ = writeln!(src, "        var m{i}_{j} = {};", io.diag("q", i * b + j));
-            let _ = writeln!(src, "        var r{i}_{j} = select(0.0, {}, r > 0u);", io.lo("q", i * b + j));
-            let _ = writeln!(src, "        var r{i}_{} = select(0.0, {}, r + 1u < m);", b + j, io.up("q", i * b + j));
+            let _ = writeln!(
+                src,
+                "        var r{i}_{j} = select(0.0, {}, r > 0u);",
+                io.lo("q", i * b + j)
+            );
+            let _ = writeln!(
+                src,
+                "        var r{i}_{} = select(0.0, {}, r + 1u < m);",
+                b + j,
+                io.up("q", i * b + j)
+            );
         }
         let _ = writeln!(src, "        var r{i}_{} = {};", 2 * b, io.rhs("q", i));
     }
@@ -404,12 +517,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     }
     for i in 0..b {
         for j in 0..b {
-            let _ = writeln!(src, "{ind}var m{i}_{j} = {};", if i == j { "1.0" } else { "0.0" });
-            let _ = writeln!(src, "{ind}var r{i}_{j} = 0.0;\n{ind}var r{i}_{} = 0.0;", b + j);
+            let _ = writeln!(
+                src,
+                "{ind}var m{i}_{j} = {};",
+                if i == j { "1.0" } else { "0.0" }
+            );
+            let _ = writeln!(
+                src,
+                "{ind}var r{i}_{j} = 0.0;\n{ind}var r{i}_{} = 0.0;",
+                b + j
+            );
         }
         let _ = writeln!(src, "{ind}var r{i}_{} = {};", 2 * b, fl("o", 2 * bb + i));
     }
-    for (side, cond, neighbour, factor) in [("left", "r > 0u", "r - h", 0), ("right", "r + h < m", "r + h", bb)] {
+    for (side, cond, neighbour, factor) in [
+        ("left", "r > 0u", "r - h", 0),
+        ("right", "r + h < m", "r + h", bb),
+    ] {
         // `d -= factor * (opposite coupling of the neighbour)`, `(own side) = -factor * (same side of the neighbour)`.
         let (to_d, to_r_col) = if side == "left" { (bb, 0) } else { (0, b) };
         let same = if side == "left" { 0 } else { bb };
@@ -419,11 +543,36 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         }
         for i in 0..b {
             for j in 0..b {
-                let sum_d = (0..b).map(|k| format!("{} * {}", fl("o", factor + i * b + k), fl("n", to_d + k * b + j))).collect::<Vec<_>>().join(" + ");
-                let sum_r = (0..b).map(|k| format!("{} * {}", fl("o", factor + i * b + k), fl("n", same + k * b + j))).collect::<Vec<_>>().join(" + ");
-                let _ = writeln!(src, "{ind}    m{i}_{j} -= {sum_d};\n{ind}    r{i}_{} = -({sum_r});", to_r_col + j);
+                let sum_d = (0..b)
+                    .map(|k| {
+                        format!(
+                            "{} * {}",
+                            fl("o", factor + i * b + k),
+                            fl("n", to_d + k * b + j)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                let sum_r = (0..b)
+                    .map(|k| {
+                        format!(
+                            "{} * {}",
+                            fl("o", factor + i * b + k),
+                            fl("n", same + k * b + j)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                let _ = writeln!(
+                    src,
+                    "{ind}    m{i}_{j} -= {sum_d};\n{ind}    r{i}_{} = -({sum_r});",
+                    to_r_col + j
+                );
             }
-            let sum_f = (0..b).map(|k| format!("{} * {}", fl("o", factor + i * b + k), fl("n", 2 * bb + k))).collect::<Vec<_>>().join(" + ");
+            let sum_f = (0..b)
+                .map(|k| format!("{} * {}", fl("o", factor + i * b + k), fl("n", 2 * bb + k)))
+                .collect::<Vec<_>>()
+                .join(" + ");
             let _ = writeln!(src, "{ind}    r{i}_{} -= {sum_f};", 2 * b);
         }
         let _ = writeln!(src, "{ind}}}");
@@ -444,7 +593,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         let _ = writeln!(src, "{ind}let a{v} = ldf(r - h, {v}u);");
     }
     for i in 0..b {
-        let sum = (0..b).map(|k| format!("{} * {}", fl("o", i * b + k), fl("a", 2 * bb + k))).collect::<Vec<_>>().join(" + ");
+        let sum = (0..b)
+            .map(|k| format!("{} * {}", fl("o", i * b + k), fl("a", 2 * bb + k)))
+            .collect::<Vec<_>>()
+            .join(" + ");
         let _ = writeln!(src, "{ind}var x{i} = {} - ({sum});", fl("o", 2 * bb + i));
     }
     let _ = writeln!(src, "{ind}if (r + h < m) {{");
@@ -452,7 +604,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         let _ = writeln!(src, "{ind}    let c{v} = ldf(r + h, {v}u);");
     }
     for i in 0..b {
-        let sum = (0..b).map(|k| format!("{} * {}", fl("o", bb + i * b + k), fl("c", 2 * bb + k))).collect::<Vec<_>>().join(" + ");
+        let sum = (0..b)
+            .map(|k| format!("{} * {}", fl("o", bb + i * b + k), fl("c", 2 * bb + k)))
+            .collect::<Vec<_>>()
+            .join(" + ");
         let _ = writeln!(src, "{ind}    x{i} -= {sum};");
     }
     let _ = writeln!(src, "{ind}}}");
@@ -475,7 +630,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     src.push_str("    }\n");
 
     // The solution.
-    src.push_str("    for (var r = li; r < m; r += WG) {\n        let q = base + (s0 + r) * p.stride;\n");
+    src.push_str(
+        "    for (var r = li; r < m; r += WG) {\n        let q = base + (s0 + r) * p.stride;\n",
+    );
     for v in (2 * bb / 4)..floats.div_ceil(4) {
         let _ = writeln!(src, "        let e{v} = ldf(r, {v}u);");
     }
@@ -500,7 +657,10 @@ fn solve(src: &mut String, ind: &str, b: usize, w: usize, closed: bool) -> &'sta
     inverse(src, ind, b);
     for i in 0..b {
         for j in 0..w {
-            let sum = (0..b).map(|k| format!("iv{i}_{k} * r{k}_{j}")).collect::<Vec<_>>().join(" + ");
+            let sum = (0..b)
+                .map(|k| format!("iv{i}_{k} * r{k}_{j}"))
+                .collect::<Vec<_>>()
+                .join(" + ");
             let _ = writeln!(src, "{ind}let x{i}_{j} = {sum};");
         }
     }
@@ -521,7 +681,10 @@ fn equilibrate(src: &mut String, ind: &str, b: usize) {
             }
         }
     }
-    let _ = writeln!(src, "{ind}let bm = {max};\n{ind}let bt = select(1.0, 1.0 / bm, bm > 0.0);");
+    let _ = writeln!(
+        src,
+        "{ind}let bm = {max};\n{ind}let bt = select(1.0, 1.0 / bm, bm > 0.0);"
+    );
     for i in 0..b {
         for j in 0..b {
             let _ = writeln!(src, "{ind}m{i}_{j} *= bt;");
@@ -544,19 +707,40 @@ fn inverse(src: &mut String, ind: &str, b: usize) {
         1 => line("let iv0_0 = 1.0 / m0_0;".to_owned()),
         2 => {
             line("let kid = bt / (m0_0 * m1_1 - m0_1 * m1_0);".to_owned());
-            for text in ["let iv0_0 = m1_1 * kid;", "let iv0_1 = -m0_1 * kid;", "let iv1_0 = -m1_0 * kid;", "let iv1_1 = m0_0 * kid;"] {
+            for text in [
+                "let iv0_0 = m1_1 * kid;",
+                "let iv0_1 = -m0_1 * kid;",
+                "let iv1_0 = -m1_0 * kid;",
+                "let iv1_1 = m0_0 * kid;",
+            ] {
                 line(text.to_owned());
             }
         }
         3 => {
-            for text in ["let ka0 = m1_1 * m2_2 - m1_2 * m2_1;", "let ka1 = m1_2 * m2_0 - m1_0 * m2_2;", "let ka2 = m1_0 * m2_1 - m1_1 * m2_0;"] {
+            for text in [
+                "let ka0 = m1_1 * m2_2 - m1_2 * m2_1;",
+                "let ka1 = m1_2 * m2_0 - m1_0 * m2_2;",
+                "let ka2 = m1_0 * m2_1 - m1_1 * m2_0;",
+            ] {
                 line(text.to_owned());
             }
             line("let kid = bt / (m0_0 * ka0 + m0_1 * ka1 + m0_2 * ka2);".to_owned());
             for (i, row) in [
-                ["ka0", "(m0_2 * m2_1 - m0_1 * m2_2)", "(m0_1 * m1_2 - m0_2 * m1_1)"],
-                ["ka1", "(m0_0 * m2_2 - m0_2 * m2_0)", "(m0_2 * m1_0 - m0_0 * m1_2)"],
-                ["ka2", "(m0_1 * m2_0 - m0_0 * m2_1)", "(m0_0 * m1_1 - m0_1 * m1_0)"],
+                [
+                    "ka0",
+                    "(m0_2 * m2_1 - m0_1 * m2_2)",
+                    "(m0_1 * m1_2 - m0_2 * m1_1)",
+                ],
+                [
+                    "ka1",
+                    "(m0_0 * m2_2 - m0_2 * m2_0)",
+                    "(m0_2 * m1_0 - m0_0 * m1_2)",
+                ],
+                [
+                    "ka2",
+                    "(m0_1 * m2_0 - m0_0 * m2_1)",
+                    "(m0_0 * m1_1 - m0_1 * m1_0)",
+                ],
             ]
             .iter()
             .enumerate()
@@ -568,18 +752,52 @@ fn inverse(src: &mut String, ind: &str, b: usize) {
         }
         _ => {
             // Laplace expansion in the 2x2 minors of rows 0, 1 (`s`) and rows 2, 3 (`c`).
-            for (name, (j, k)) in [("ks0", (0, 1)), ("ks1", (0, 2)), ("ks2", (0, 3)), ("ks3", (1, 2)), ("ks4", (1, 3)), ("ks5", (2, 3))] {
+            for (name, (j, k)) in [
+                ("ks0", (0, 1)),
+                ("ks1", (0, 2)),
+                ("ks2", (0, 3)),
+                ("ks3", (1, 2)),
+                ("ks4", (1, 3)),
+                ("ks5", (2, 3)),
+            ] {
                 line(format!("let {name} = m0_{j} * m1_{k} - m1_{j} * m0_{k};"));
             }
-            for (name, (j, k)) in [("kc5", (2, 3)), ("kc4", (1, 3)), ("kc3", (1, 2)), ("kc2", (0, 3)), ("kc1", (0, 2)), ("kc0", (0, 1))] {
+            for (name, (j, k)) in [
+                ("kc5", (2, 3)),
+                ("kc4", (1, 3)),
+                ("kc3", (1, 2)),
+                ("kc2", (0, 3)),
+                ("kc1", (0, 2)),
+                ("kc0", (0, 1)),
+            ] {
                 line(format!("let {name} = m2_{j} * m3_{k} - m3_{j} * m2_{k};"));
             }
             line("let kid = bt / (ks0 * kc5 - ks1 * kc4 + ks2 * kc3 + ks3 * kc2 - ks4 * kc1 + ks5 * kc0);".to_owned());
             let rows = [
-                ["m1_1 * kc5 - m1_2 * kc4 + m1_3 * kc3", "-m0_1 * kc5 + m0_2 * kc4 - m0_3 * kc3", "m3_1 * ks5 - m3_2 * ks4 + m3_3 * ks3", "-m2_1 * ks5 + m2_2 * ks4 - m2_3 * ks3"],
-                ["-m1_0 * kc5 + m1_2 * kc2 - m1_3 * kc1", "m0_0 * kc5 - m0_2 * kc2 + m0_3 * kc1", "-m3_0 * ks5 + m3_2 * ks2 - m3_3 * ks1", "m2_0 * ks5 - m2_2 * ks2 + m2_3 * ks1"],
-                ["m1_0 * kc4 - m1_1 * kc2 + m1_3 * kc0", "-m0_0 * kc4 + m0_1 * kc2 - m0_3 * kc0", "m3_0 * ks4 - m3_1 * ks2 + m3_3 * ks0", "-m2_0 * ks4 + m2_1 * ks2 - m2_3 * ks0"],
-                ["-m1_0 * kc3 + m1_1 * kc1 - m1_2 * kc0", "m0_0 * kc3 - m0_1 * kc1 + m0_2 * kc0", "-m3_0 * ks3 + m3_1 * ks1 - m3_2 * ks0", "m2_0 * ks3 - m2_1 * ks1 + m2_2 * ks0"],
+                [
+                    "m1_1 * kc5 - m1_2 * kc4 + m1_3 * kc3",
+                    "-m0_1 * kc5 + m0_2 * kc4 - m0_3 * kc3",
+                    "m3_1 * ks5 - m3_2 * ks4 + m3_3 * ks3",
+                    "-m2_1 * ks5 + m2_2 * ks4 - m2_3 * ks3",
+                ],
+                [
+                    "-m1_0 * kc5 + m1_2 * kc2 - m1_3 * kc1",
+                    "m0_0 * kc5 - m0_2 * kc2 + m0_3 * kc1",
+                    "-m3_0 * ks5 + m3_2 * ks2 - m3_3 * ks1",
+                    "m2_0 * ks5 - m2_2 * ks2 + m2_3 * ks1",
+                ],
+                [
+                    "m1_0 * kc4 - m1_1 * kc2 + m1_3 * kc0",
+                    "-m0_0 * kc4 + m0_1 * kc2 - m0_3 * kc0",
+                    "m3_0 * ks4 - m3_1 * ks2 + m3_3 * ks0",
+                    "-m2_0 * ks4 + m2_1 * ks2 - m2_3 * ks0",
+                ],
+                [
+                    "-m1_0 * kc3 + m1_1 * kc1 - m1_2 * kc0",
+                    "m0_0 * kc3 - m0_1 * kc1 + m0_2 * kc0",
+                    "-m3_0 * ks3 + m3_1 * ks1 - m3_2 * ks0",
+                    "m2_0 * ks3 - m2_1 * ks1 + m2_2 * ks0",
+                ],
             ];
             for (i, row) in rows.iter().enumerate() {
                 for (j, entry) in row.iter().enumerate() {
@@ -597,7 +815,10 @@ fn inverse(src: &mut String, ind: &str, b: usize) {
 fn eliminate(src: &mut String, ind: &str, b: usize, w: usize) {
     for col in 0..b {
         if col + 1 < b {
-            let _ = writeln!(src, "{ind}var best{col} = abs(m{col}_{col});\n{ind}var pv{col} = {col}u;");
+            let _ = writeln!(
+                src,
+                "{ind}var best{col} = abs(m{col}_{col});\n{ind}var pv{col} = {col}u;"
+            );
             for i in col + 1..b {
                 let _ = writeln!(
                     src,
@@ -606,9 +827,14 @@ fn eliminate(src: &mut String, ind: &str, b: usize, w: usize) {
             }
             for i in col + 1..b {
                 let _ = writeln!(src, "{ind}let sw{col}_{i} = pv{col} == {i}u;");
-                let entries = (col..b).map(|j| format!("m{{}}_{j}")).chain((0..w).map(|j| format!("r{{}}_{j}")));
+                let entries = (col..b)
+                    .map(|j| format!("m{{}}_{j}"))
+                    .chain((0..w).map(|j| format!("r{{}}_{j}")));
                 for entry in entries {
-                    let (top, other) = (entry.replace("{}", &col.to_string()), entry.replace("{}", &i.to_string()));
+                    let (top, other) = (
+                        entry.replace("{}", &col.to_string()),
+                        entry.replace("{}", &i.to_string()),
+                    );
                     let _ = writeln!(
                         src,
                         "{ind}{{ let t = {top}; {top} = select({top}, {other}, sw{col}_{i}); {other} = select({other}, t, sw{col}_{i}); }}"
