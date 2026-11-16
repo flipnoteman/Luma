@@ -10,12 +10,12 @@ documentation = "https://docs.rs/luma"
 keywords = ["gpu", "wgpu", "array", "math", "compute"]
 categories = ["science", "mathematics", "concurrency"]
 rust-version.workspace = true
-exclude = [".github/"]
+exclude = [".github/", "Temp.md"]
 
 [workspace]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/flipnoteman/Luma"
