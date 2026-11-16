@@ -6,6 +6,14 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A pipeline cache that grew past the 32 MB kept on disk is dropped with an `info` log message
+  naming its size, instead of silently: every later process then compiles its kernels again
+  (about 9.5 s for bowshock's 3D solver). The cache stays one file per device: one cache per
+  pipeline, which would let old pipelines be evicted one at a time, takes about 1.77 MB per
+  pipeline on NVIDIA's driver (150 kernels: 266 MB).
+
 ## [0.4.1] - 2026-11-15
 
 ### Added

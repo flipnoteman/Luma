@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use log::debug;
+use log::{debug, info};
 
 use super::lock;
 use crate::jit::cost::CostModel;
@@ -41,7 +41,10 @@ const CONTENDED_RETRY: std::time::Duration = std::time::Duration::from_secs(24 *
 /// loaded cache on compiler threads of its own, and with a cache of 116 MB (the kernels of many
 /// programs and versions) those threads were still busy when the process ended and corrupted the
 /// heap or crashed in about one run in five; caches of a few MB never did. A larger cache is
-/// dropped (not loaded, not written) and starts again from empty.
+/// dropped (not loaded, not written) and starts again from empty. One cache per pipeline, which
+/// would let old pipelines be evicted one at a time, was tried: on that driver every cache's data
+/// is about 1.77 MB, of which two pipelines' differ in under a kilobyte, so 150 kernels took
+/// 266 MB instead of a few MB in one file.
 const MAX_PIPELINES: usize = 32 << 20;
 /// Magic, format, payload length, payload checksum.
 const HEADER: usize = 8 + 4 + 8 + 8;
@@ -234,6 +237,13 @@ impl DiskCache {
         let path = dir.join(format!("pipelines-{}.bin", self.key));
         if data.len() > MAX_PIPELINES {
             // Too big to load again (see `MAX_PIPELINES`): the next process starts from empty.
+            // Said at `info`, as it costs every later process its first compiles: a program
+            // whose arrays change shape between runs builds a set of kernels per shape.
+            info!(
+                "luma: the pipeline cache of {} MB is over the {} MB kept, and is dropped; the next process compiles its kernels again",
+                data.len() >> 20,
+                MAX_PIPELINES >> 20
+            );
             let _ = std::fs::remove_file(&path);
             return;
         }
