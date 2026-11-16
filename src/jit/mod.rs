@@ -2179,6 +2179,12 @@ const ALWAYS_STORED_NODES: usize = MAX_NODES_LIMIT / 4;
 /// [`claim_recompute`]): then it is evaluated before the expressions that share it, otherwise
 /// each computes it again and no kernel is spent on it.
 pub(crate) fn worth_storing(node: &Node) -> bool {
+    worth_storing_at(node, node.weight())
+}
+
+/// [`worth_storing`] for an expression of `weight` operations: the weight the node would have if
+/// the nodes below it that are stored too were read as buffers (see `Graph::to_store`).
+pub(crate) fn worth_storing_at(node: &Node, weight: f64) -> bool {
     if node.looped.get().is_some() {
         return true;
     }
@@ -2189,7 +2195,7 @@ pub(crate) fn worth_storing(node: &Node) -> bool {
     }
     let cost = node.context().cost_model();
     let len = node.len() as f64;
-    node.weight() * len / cost.f32_ops_per_ns > cost::kernel_ns(&cost, len * node.op().out_ty().traffic() * 2.0, 0.0)
+    weight * len / cost.f32_ops_per_ns > cost::kernel_ns(&cost, len * node.op().out_ty().traffic() * 2.0, 0.0)
 }
 
 /// Whether a view or gather of the pending `node` reads its expression lazily (as a sub-program
