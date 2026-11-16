@@ -57,6 +57,9 @@ pub(crate) struct Storage {
     segments: Box<[Arc<Segment>]>,
     /// Kept alive when this storage aliases another one's segments (see [`Array::probe`]).
     owner: Option<Arc<Storage>>,
+    /// Whether the one segment was made a window of another storage (see
+    /// [`Storage::window_of`]); it stops being one when something pins it.
+    windowed: AtomicBool,
     /// Set once a segment was handed out for an eager command or readback.
     materialized: AtomicBool,
     /// Lazy operations that still have to read this buffer; they are evaluated before anything
@@ -87,6 +90,73 @@ impl Storage {
         Self::with_segments(ctx, len, layout, segments, None)
     }
 
+    /// A storage of `len` elements that shows the elements `offset..offset + len` of `pack` (a
+    /// storage of one segment, not bit-packed) without a buffer of its own. Kernels that
+    /// build their program through [`crate::jit`] read the range through the pack's one
+    /// binding; whatever else needs the buffer (a readback, a write, a custom kernel) gets a
+    /// copy of the range first, which is the storage's buffer from then on.
+    pub(crate) fn window_of(pack: &Arc<Storage>, offset: usize, len: usize) -> Self {
+        debug_assert!(pack.segments.len() == 1 && !pack.layout.is_packed() && offset + len <= pack.len);
+        let layout = pack.layout;
+        let segment = Segment::windowed(&pack.ctx, layout.bytes(len), Arc::clone(pack), layout.bytes(offset));
+        let storage = Self::with_segments(&pack.ctx, len, layout, Box::new([segment]), None);
+        storage.windowed.store(true, Ordering::Relaxed);
+        storage
+    }
+
+    /// Whether [`Storage::adopt`] can make this storage a window: one segment of plain elements
+    /// that is a window or has a device buffer no command being recorded holds, and no other
+    /// storage's.
+    pub(crate) fn can_adopt(&self) -> bool {
+        self.segments.len() == 1 && !self.layout.is_packed() && self.owner.is_none() && self.segments[0].can_adopt()
+    }
+
+    /// Gives a window a buffer of its own, holding a copy of its range (see
+    /// [`Storage::window_of`]); nothing for any other storage.
+    pub(crate) fn detach(&self) -> Result<()> {
+        if self.is_window() {
+            self.pin_quiet(0)?;
+        }
+        Ok(())
+    }
+
+    /// Makes this storage the elements `offset..offset + len` of `pack`, which hold its data
+    /// (see [`Storage::window_of`]), and gives its buffer back. `false` if it cannot (see
+    /// [`Storage::can_adopt`]).
+    pub(crate) fn adopt(&self, pack: &Arc<Storage>, offset: usize) -> bool {
+        debug_assert!(pack.segments.len() == 1 && offset + self.len <= pack.len);
+        if !self.can_adopt() || !self.segments[0].adopt(Arc::clone(pack), pack.layout.bytes(offset)) {
+            return false;
+        }
+        self.windowed.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// The pack and the first element of this storage in it, if it still is a window (see
+    /// [`Storage::window_of`]).
+    pub(crate) fn window(&self) -> Option<(Arc<Storage>, usize)> {
+        if !self.windowed.load(Ordering::Relaxed) {
+            return None;
+        }
+        let (pack, offset) = self.segments.first()?.window()?;
+        let at = usize::try_from(offset / pack.layout.stride() as u64).ok()?;
+        Some((pack, at))
+    }
+
+    /// Whether the storage has not got a buffer of its own: it is a range of another one's.
+    pub(crate) fn is_window(&self) -> bool {
+        self.windowed.load(Ordering::Relaxed) && self.segments.first().is_some_and(|segment| segment.window().is_some())
+    }
+
+    /// The id of the buffer a kernel binds to read this storage: its own, or the pack's for a
+    /// window, which the arrays of one pack share.
+    pub(crate) fn binding_id(&self) -> u64 {
+        match self.window() {
+            Some((pack, _)) => pack.id,
+            None => self.id,
+        }
+    }
+
     /// A distinct storage identity backed by `owner`'s segments without recycling them
     /// separately.
     pub(crate) fn alias(owner: &Arc<Storage>) -> Self {
@@ -113,6 +183,7 @@ impl Storage {
             layout,
             segments,
             owner,
+            windowed: AtomicBool::new(false),
             materialized: AtomicBool::new(false),
             readers: Readers::default(),
             producer: AtomicU64::new(u64::MAX),
@@ -592,7 +663,7 @@ impl<T: GpuType> Array<T> {
             },
             _ => return false,
         };
-        Arc::strong_count(storage) == 1 && !storage.is_alias()
+        Arc::strong_count(storage) == 1 && !storage.is_alias() && !storage.is_window()
     }
 
     /// Evaluates every pending lazy operation that reads this array's buffer. Must run before

@@ -158,13 +158,31 @@ through memory, not correctness:
 | nesting depth | 512 (256 with debug assertions) | fixed (the walk is recursive) |
 | values live at once | by GPU profile | `LUMA_FUSION_MAX_LIVE` |
 | instructions after views of lazy expressions are unfolded | 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU | `LUMA_FUSION_MAX_INLINED` |
-| input buffers per kernel | the device's storage-buffer limit minus 3, at most 256 | fixed |
+| input buffers per kernel | the device's storage-buffer limit minus 3, at most 256 | `LUMA_FUSION_MAX_INPUTS` lowers it (to test a device with fewer) |
 | scalar operands | one uniform buffer | fixed |
 
 When a limit is hit, the biggest operand is evaluated first (together with the live arrays that
-share work with it), and the rest is flattened again. A kernel that reads many different arrays
-(the 50 words of a Keccak state) is the one that meets the input limit; keep such loops in
-`iterate_all`, or split them in the source.
+share work with it), and the rest is flattened again.
+
+### Many arrays in one kernel
+
+A kernel that reads many different arrays (the 50 words of a Keccak state) meets the device's
+binding limit: 16 on llvmpipe and many integrated GPUs, 29 on Metal, 256 or more on discrete GPUs.
+Cutting such an expression on the limit alone would evaluate it a few operations at a time, because
+every round reads every array. Luma instead puts the arrays into one buffer. When a kernel would bind
+more arrays than the device allows, the evaluated arrays of one length and type it reads are copied
+into one buffer (a few small kernels) and become windows of it, and a kernel with more outputs than
+bindings writes them into one buffer and returns them as windows. A kernel reads all the windows of
+one buffer through one binding. The arrays are the same arrays afterwards: a write or a custom kernel
+that takes one gives it a buffer of its own (a copy of its range), and expressions recorded before the
+write still see the old contents. Three permutations of the lazy Keccak (`examples/keccak.rs`)
+take 7120 kernels with 16 bindings without this, 39 with it, and 9 on a device with many bindings.
+
+Packing costs one copy of the arrays it moves, so it only happens when the binding limit would force
+a cut, and an array of a window is kept alive by the buffer it shares while any other window of it
+lives. Arrays read through a view or a circular `shift` are not read through the shared binding
+(they get a buffer of their own when the view is made). `ctx.profile(..)` shows the copies as
+`FusedStack(Id, ...)` kernels; `LUMA_FUSION_MAX_INPUTS=13` reproduces a 16-binding device on any GPU.
 
 Never fused, because they need whole-array structure: `scan`, tridiagonal solves, FFT
 convolution, and custom kernels. They read computed arrays.

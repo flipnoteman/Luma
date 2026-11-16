@@ -38,6 +38,25 @@ All notable changes to Luma are listed here. The format follows
   section of recipes (`diff`, `cumprod`, `softmax` / `logsumexp`, `one_hot`, shuffles, `cov` /
   `corr`, `clip`) in the data chapter.
 
+### Changed
+
+- Devices that bind few storage buffers to a kernel (llvmpipe and many integrated GPUs: 16, Metal:
+  29) no longer cut an expression that reads many arrays into a kernel per operation. The lazy
+  Keccak of `examples/keccak.rs` (a state of 50 arrays that every round reads) took 7120 kernels
+  for three permutations with 16 bindings; it takes 39, and its host time drops from 1.07 s to
+  0.18 s (lavapipe, warm; 24 s to 2.5 s the first time, which compiles every kernel). On
+  llvmpipe's own limit of 45 bindings 5933 kernels become 24 (3.2 s to 0.12 s). The cut lost
+  nothing but the arrays' separate buffers: arrays that a kernel would read beyond its bindings
+  (or that a multi-output kernel writes beyond them) now live in one buffer that they are windows
+  of, and kernels read the windows through one binding with an offset in the uniform. A write
+  (`write`, `+=`, `assign`, a custom kernel taking `&mut`) gives its array a buffer of its own, so
+  arrays behave as before; only the arrays used that way pay a copy. Devices with many bindings
+  (an RTX 3090 binds 256) never pack. `LUMA_FUSION_MAX_INPUTS=n` lowers the limit to test this on
+  any GPU.
+- Choosing the arrays a cut evaluates together (`evaluate_alongside`) counts the nodes a candidate
+  adds by merging two sorted lists instead of one binary search per node: building the
+  three-permutation Keccak on an RTX 3090 takes 54 ms instead of 139 ms.
+
 ### Fixed
 
 - A kernel that declares a binding its entry point never reads can no longer fail the launch with

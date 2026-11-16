@@ -3899,3 +3899,171 @@ fn a_sort_of_an_expression_at_the_input_limit_fuses_into_both_first_pass_kernels
         assert_eq!(keys().sort_descending().to_vec().unwrap(), sorted.iter().rev().copied().collect::<Vec<_>>(), "descending, limit {limit}");
     }
 }
+
+/// Arrays beyond the bindings of a kernel are copied into one buffer that they are windows of
+/// (see `pack`), which a kernel reads through one binding; what the arrays hold does not change.
+#[test]
+fn many_buffers_are_packed_and_read_through_one_binding() {
+    let ctx = ctx();
+    ctx.jit().set_max_inputs(4);
+    let n = 300;
+    let data: Vec<Vec<u32>> = (0..20u32).map(|k| (0..n as u32).map(|i| (i * 7 + k * 1013) ^ (k << 3)).collect()).collect();
+    let arrays: Vec<Array<u32>> = data.iter().map(|d| Array::from_slice_on(&ctx, d, n).unwrap()).collect();
+    let total = |weight: u32| {
+        let mut acc = &arrays[0] * weight;
+        for a in &arrays[1..] {
+            acc = &acc + a;
+        }
+        acc
+    };
+    let host = |data: &[Vec<u32>], weight: u32| -> Vec<u32> {
+        (0..n).map(|i| data.iter().enumerate().fold(0u32, |sum, (k, d)| sum.wrapping_add(d[i].wrapping_mul(if k == 0 { weight } else { 1 })))).collect()
+    };
+    assert_eq!(total(1).to_vec().unwrap(), host(&data, 1));
+
+    // Now all twenty are read through one binding: one kernel for another expression over them.
+    let before = ctx.jit().stats();
+    assert_eq!(total(3).to_vec().unwrap(), host(&data, 3));
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+
+    // A write gives its array a buffer of its own and leaves the others alone; an expression
+    // recorded before it still sees the old contents.
+    let mut data = data;
+    let recorded = total(1);
+    let old = host(&data, 1);
+    data[3] = (0..n as u32).map(|i| i * 31 + 5).collect();
+    let mut written = arrays[3].clone();
+    written.write(&data[3]).unwrap();
+    assert_eq!(recorded.to_vec().unwrap(), old);
+    assert_eq!(total(1).to_vec().unwrap(), host(&data, 1));
+    for k in [0, 2, 4, 19] {
+        assert_eq!(arrays[k].to_vec().unwrap(), data[k], "array {k}");
+    }
+
+    // Compound assignment into a member, and a read through a shift or a view of another.
+    let mut member = arrays[7].clone();
+    member += &arrays[8];
+    data[7] = (0..n).map(|i| data[7][i].wrapping_add(data[8][i])).collect();
+    assert_eq!(arrays[7].to_vec().unwrap(), data[7]);
+    assert_eq!(total(2).to_vec().unwrap(), host(&data, 2));
+    let rolled = arrays[9].shift(1).to_vec().unwrap();
+    assert_eq!(rolled, (0..n).map(|i| data[9][(i + n - 1) % n]).collect::<Vec<_>>());
+    assert_eq!(arrays[10].slice(0, 5..50).to_vec().unwrap(), data[10][5..50].to_vec());
+    assert_eq!(total(1).to_vec().unwrap(), host(&data, 1));
+}
+
+/// The outputs of a group that has more of them than a kernel binds are written into one buffer.
+#[test]
+fn outputs_beyond_the_bindings_of_a_kernel_share_one_buffer() {
+    let ctx = ctx();
+    ctx.jit().set_max_inputs(6);
+    let n = 257;
+    let xs = values(n, 71, -1.0, 1.0);
+    let ys = values(n, 72, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let y = f32s(&ctx, &ys);
+    let outs: Vec<Array<f32>> = (0..16).map(|k| &x * (k as f32 + 1.0) + &y * &y).collect();
+    let refs: Vec<&Array<f32>> = outs.iter().collect();
+    let before = ctx.jit().stats();
+    crate::eval_all(&refs).unwrap();
+    ctx.sync().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "one kernel with one output buffer");
+
+    // One kernel reads all sixteen, through one binding.
+    let before = ctx.jit().stats();
+    let mut sum = &outs[0] * 1.0;
+    for out in &outs[1..] {
+        sum = &sum + out;
+    }
+    let got = sum.to_vec().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1);
+    let want: Vec<f32> = (0..n).map(|i| (0..16).map(|k| xs[i] * (k as f32 + 1.0) + ys[i] * ys[i]).sum()).collect();
+    assert_close(&got, &want, 1e-4, 1e-4);
+    for k in [0, 5, 15] {
+        let want: Vec<f32> = (0..n).map(|i| xs[i] * (k as f32 + 1.0) + ys[i] * ys[i]).collect();
+        assert_close(&outs[k].to_vec().unwrap(), &want, 1e-5, 1e-5);
+    }
+}
+
+/// A state of far more arrays than a kernel binds, advanced by rounds that read all of them:
+/// a few kernels per round of cuts, not one per operation.
+#[test]
+fn a_wide_state_advances_in_a_few_kernels_whatever_the_binding_limit() {
+    let n = 100;
+    let width = 40usize;
+    let rounds = 12;
+    let init: Vec<Vec<u32>> = (0..width as u32).map(|k| (0..n as u32).map(|i| i.wrapping_mul(2654435761).wrapping_add(k * 40503)).collect()).collect();
+    let mut want = init.clone();
+    for _ in 0..rounds {
+        let old = want.clone();
+        for k in 0..width {
+            for i in 0..n {
+                let (a, b, c) = (old[(k + 1) % width][i], old[(k + 7) % width][i], old[(k + 13) % width][i]);
+                want[k][i] = old[k][i] ^ a.rotate_left(1) ^ (b & !c);
+            }
+        }
+    }
+    for limit in [13, 26, 4] {
+        let ctx = ctx();
+        ctx.jit().set_max_inputs(limit);
+        ctx.jit().set_max_nodes(2048);
+        let mut state: Vec<Array<u32>> = init.iter().map(|d| Array::from_slice_on(&ctx, d, n).unwrap()).collect();
+        let before = ctx.jit().stats();
+        for _ in 0..rounds {
+            state = (0..width)
+                .map(|k| {
+                    let a = &state[(k + 1) % width];
+                    &state[k] ^ ((a << 1u32) | (a >> 31u32)) ^ (&state[(k + 7) % width] & !&state[(k + 13) % width])
+                })
+                .collect();
+        }
+        for (k, array) in state.iter().enumerate() {
+            assert_eq!(array.to_vec().unwrap(), want[k], "limit {limit}, array {k}");
+        }
+        let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+        // The operations are 12 rounds of 40 lanes of 7 (3360 in all).
+        // 630 at a limit of 13 before the arrays were packed (every cut a kernel of its own).
+        let most = if limit >= 13 { 80 } else { 250 };
+        assert!(launches < most, "limit {limit}: {launches} kernels");
+    }
+}
+
+/// The results of a traced step are the buffers its recorded launches write: the arrays of a
+/// group that has more outputs than a kernel binds are not written into a pack there (windows of
+/// it would be copied out before the plan ran).
+#[test]
+fn a_loop_over_more_states_than_a_kernel_binds_steps_with_its_results_in_buffers() {
+    let n = 50;
+    let width = 30usize;
+    let steps = 6;
+    let init: Vec<Vec<u32>> = (0..width as u32).map(|k| (0..n as u32).map(|i| i.wrapping_mul(2654435761).wrapping_add(k * 40503)).collect()).collect();
+    for limit in [8, 20, 45] {
+        let ctx = ctx();
+        ctx.jit().set_max_inputs(limit);
+        let arrays: Vec<Array<u32>> = init.iter().map(|d| Array::from_slice_on(&ctx, d, n).unwrap()).collect();
+        // The initial state is itself the result of a group with too many outputs.
+        let state: Vec<Array<u32>> = arrays.iter().enumerate().map(|(k, a)| a ^ &arrays[(k + 3) % width]).collect();
+        let refs: Vec<&Array<u32>> = state.iter().collect();
+        crate::eval_all(&refs).unwrap();
+        let mut expected: Vec<Vec<u32>> = (0..width).map(|k| (0..n).map(|i| init[k][i] ^ init[(k + 3) % width][i]).collect()).collect();
+        for _ in 0..steps {
+            let old = expected.clone();
+            for k in 0..width {
+                for i in 0..n {
+                    let (a, b, c) = (old[(k + 1) % width][i], old[(k + 7) % width][i], old[(k + 13) % width][i]);
+                    expected[k][i] = old[k][i] ^ a.rotate_left(1) ^ (b & !c);
+                }
+            }
+        }
+        let init_refs: [&Array<u32>; 30] = std::array::from_fn(|k| &state[k]);
+        let out = crate::iterate_all(init_refs, steps, |s: &[Array<u32>; 30]| {
+            std::array::from_fn(|k| {
+                let a = &s[(k + 1) % 30];
+                &s[k] ^ ((a << 1u32) | (a >> 31u32)) ^ (&s[(k + 7) % 30] & !&s[(k + 13) % 30])
+            })
+        });
+        for (k, array) in out.iter().enumerate() {
+            assert_eq!(array.to_vec().unwrap(), expected[k], "limit {limit}, state {k}");
+        }
+    }
+}

@@ -27,6 +27,7 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_FUSION_*`, `LUMA_STAGING`, `L
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
 | `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions) |
+| `LUMA_FUSION_MAX_INPUTS` | Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer ([Performance](performance.md#many-arrays-in-one-kernel)) |
 | `LUMA_FUSION_MAX_LIVE` | Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, `8..=4096`) |
 | `LUMA_FUSION_MAX_INLINED` | Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; `16..=16384`) |
 | `LUMA_STAGING` | `off` turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first |

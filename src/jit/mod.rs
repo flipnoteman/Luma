@@ -24,7 +24,8 @@
 //!   [`DEFAULT_MAX_NODES`] = 16384, at most `MAX_NODES_LIMIT` = 16384; `LUMA_FUSION_MAX_NODES`
 //!   overrides the default and [`fusion_limit`] a scope), nests at most `MAX_DEPTH` = 512 levels (256 in builds with debug assertions)
 //!   (the flattening walk is recursive, so this bounds its stack) and reads as many distinct input
-//!   buffers as the device can bind. A new node that would exceed one of them evaluates its
+//!   buffers as the device can bind (the evaluated arrays beyond that are first copied into one
+//!   buffer that they are windows of, see `pack`, which a kernel binds once). A new node that would exceed one of them evaluates its
 //!   biggest (for the depth: its deepest) operand first, which splits long chains into several
 //!   kernels. Profiles list every such cut with its reason ([`FusionSplit`]).
 //!   The biggest operand is not evaluated alone if other live arrays *of the same length* share pending operations with
@@ -154,6 +155,7 @@ mod inline;
 mod launch;
 mod looped;
 mod operator;
+mod pack;
 mod params;
 mod program;
 mod readers;
@@ -224,6 +226,9 @@ const MAX_INPUTS: usize = 256;
 /// Environment variable overriding [`DEFAULT_MAX_NODES`] for new contexts. `1` makes every
 /// operation its own kernel.
 const MAX_NODES_ENV: &str = "LUMA_FUSION_MAX_NODES";
+/// Environment variable lowering the most input buffers of a kernel below what the device
+/// allows (to behave like a device with fewer bindings; it cannot raise the device's limit).
+const MAX_INPUTS_ENV: &str = "LUMA_FUSION_MAX_INPUTS";
 /// Set to `off` to disable speculation at readbacks (see [`speculate`]).
 const SPECULATE_ENV: &str = "LUMA_SPECULATE";
 
@@ -950,6 +955,25 @@ impl Node {
         false
     }
 
+    /// Calls `f` with every word of 64 ids (its index, id / 64, and its bits) that has a node
+    /// below this one, ascending.
+    fn for_each_below_word(&self, mut f: impl FnMut(u64, u64)) {
+        let part = self.below_part();
+        if self.below_sparse {
+            for &[word, bits] in part.as_chunks::<2>().0 {
+                if bits != 0 {
+                    f(word, bits);
+                }
+            }
+            return;
+        }
+        for (k, &bits) in part.iter().enumerate() {
+            if bits != 0 {
+                f((self.below_base >> 6) + k as u64, bits);
+            }
+        }
+    }
+
     /// The ids of the distinct nodes below this one, sorted.
     fn below_vec(&self) -> Vec<u64> {
         let mut ids = Vec::with_capacity(self.below_len());
@@ -1145,6 +1169,106 @@ fn insert_sorted(ids: &mut Vec<u64>, id: u64) {
     if let Err(at) = ids.binary_search(&id) {
         ids.insert(at, id);
     }
+}
+
+/// A set of node ids as a bit set over the words of 64 ids the nodes it holds fall in: what
+/// the nodes of a group of arrays below the node limit are counted in, and merged into, once per
+/// candidate (a candidate's own set has the same shape, see [`Node::for_each_below_word`]).
+#[derive(Default)]
+struct IdSet {
+    /// The index (id / 64) of `words[0]`.
+    base: u64,
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl IdSet {
+    /// The set of the nodes below `node`, and `node` itself if `with_self`.
+    fn of(node: &Node, with_self: bool) -> IdSet {
+        let mut set = IdSet::default();
+        set.add(node, with_self);
+        set
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn word(&self, index: u64) -> u64 {
+        index.checked_sub(self.base).and_then(|offset| self.words.get(usize::try_from(offset).ok()?)).copied().unwrap_or(0)
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.word(id >> 6) >> (id & 63) & 1 == 1
+    }
+
+    /// How many of the nodes below `node` are in the set, and how many are not.
+    fn overlap(&self, node: &Node) -> (usize, usize) {
+        let (mut shared, mut total) = (0usize, 0usize);
+        node.for_each_below_word(|index, bits| {
+            shared += (bits & self.word(index)).count_ones() as usize;
+            total += bits.count_ones() as usize;
+        });
+        (shared, total - shared)
+    }
+
+    /// Adds the nodes below `node`, and `node` itself if `with_self`.
+    fn add(&mut self, node: &Node, with_self: bool) {
+        let span = node.below_span().map(|(first, last)| (first >> 6, last >> 6)).into_iter().chain(with_self.then_some((node.id >> 6, node.id >> 6)));
+        let (mut lo, mut hi) = (u64::MAX, 0);
+        for (first, last) in span {
+            lo = lo.min(first);
+            hi = hi.max(last);
+        }
+        if lo > hi {
+            return;
+        }
+        if self.words.is_empty() {
+            self.base = lo;
+        } else if lo < self.base {
+            let front = (self.base - lo) as usize;
+            self.words.splice(0..0, std::iter::repeat_n(0, front));
+            self.base = lo;
+        }
+        let needed = (hi - self.base + 1) as usize;
+        if needed > self.words.len() {
+            self.words.resize(needed, 0);
+        }
+        let (base, mut added) = (self.base, 0usize);
+        let words = &mut self.words;
+        node.for_each_below_word(|index, bits| {
+            let slot = &mut words[(index - base) as usize];
+            added += (bits & !*slot).count_ones() as usize;
+            *slot |= bits;
+        });
+        if with_self && !self.contains(node.id) {
+            self.words[((node.id >> 6) - base) as usize] |= 1 << (node.id & 63);
+            added += 1;
+        }
+        self.len += added;
+    }
+}
+
+/// How many elements of the sorted set `a` are in the sorted set `b`, and how many are not.
+fn overlap(a: &[u64], b: &[u64]) -> (usize, usize) {
+    let found = if a.len().saturating_mul(16) < b.len() {
+        a.iter().filter(|id| b.binary_search(id).is_ok()).count()
+    } else {
+        // Two sorted lists of sizes alike: one pass over both.
+        let (mut found, mut j) = (0, 0);
+        for &id in a {
+            while b.get(j).is_some_and(|&other| other < id) {
+                j += 1;
+            }
+            match b.get(j) {
+                Some(&other) if other == id => found += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        found
+    };
+    (found, a.len() - found)
 }
 
 /// Merges the sorted `other` into the sorted `ids` (a set union), through `tmp`.
@@ -1360,7 +1484,7 @@ fn measure(args: &[Src]) -> Measure {
         for arg in args {
             match arg {
                 Src::Scalar(_) => {}
-                Src::Buffer(storage) => insert_sorted(inputs, storage.id()),
+                Src::Buffer(storage) => insert_sorted(inputs, storage.binding_id()),
                 Src::Node(node) => {
                     // `x * x`: the second operand adds nothing.
                     if nodes.iter().take(count).flatten().any(|first| Arc::ptr_eq(first, node)) {
@@ -1453,7 +1577,7 @@ fn count_inputs(args: &[Src], stop: &[Arc<Node>]) -> Vec<u64> {
     while let Some(src) = work.pop() {
         let Src::Node(node) = src else {
             if let Src::Buffer(storage) = src {
-                insert_sorted(&mut ids, storage.id());
+                insert_sorted(&mut ids, storage.binding_id());
             }
             continue;
         };
@@ -1461,7 +1585,7 @@ fn count_inputs(args: &[Src], stop: &[Arc<Node>]) -> Vec<u64> {
             continue;
         }
         if let Some(storage) = node.evaluated() {
-            insert_sorted(&mut ids, storage.id());
+            insert_sorted(&mut ids, storage.binding_id());
         } else if stop.iter().any(|stopped| Arc::ptr_eq(stopped, &node)) {
             insert_sorted(&mut ids, STOPPED | node.id);
         } else if let Some(operands) = node.operands() {
@@ -1643,6 +1767,13 @@ pub(crate) fn create(
         }
     }
     check_supported(ctx, op, name).map_err(Failure::New)?;
+    // A shift reads its source at other elements than the one it computes, which a window cannot
+    // (see `pack`): the source gets the buffer of its own.
+    if matches!(op.kind, OpKind::Shift(_))
+        && let Some(Src::Buffer(source)) = args.first()
+    {
+        source.detach().map_err(Failure::New)?;
+    }
 
     // Equal operations on identical operands are one node (see `ConsTable`).
     let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));
@@ -1659,6 +1790,7 @@ pub(crate) fn create(
     // with the live arrays that share pending work with it (see the module documentation)
     // instead of alone.
     let mut batched = false;
+    let mut packed = false;
     let mut cut = false;
     let mut noted = false;
     let mut exact_depth: Option<Option<u16>>;
@@ -1683,6 +1815,14 @@ pub(crate) fn create(
             let ids = count_inputs(args.get(..arity).unwrap_or(&[]), &[]);
             inputs = ids.len();
             measured.set_inputs(&ids);
+            // Many buffers of one kind are copied into one that they then are windows of, which
+            // takes one binding (see `pack`); only if that cannot be done is the expression cut.
+            if inputs > max_inputs && !packed {
+                packed = true;
+                if pack::repack(ctx, op, args.get(..arity).unwrap_or(&[]), inputs - max_inputs) {
+                    continue;
+                }
+            }
         }
         let deepest = args.iter().take(arity).filter_map(|arg| match arg {
             Src::Node(node) => Some(node.depth()),
@@ -2189,6 +2329,10 @@ impl JitState {
         let max_inputs = (limits.max_storage_buffers_per_shader_stage as usize)
             .saturating_sub(3)
             .clamp(1, MAX_INPUTS);
+        let max_inputs = std::env::var(MAX_INPUTS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(max_inputs, |limit| limit.clamp(1, max_inputs));
         JitState {
             kernels: BuildCache::default(),
             fast_kernels: Mutex::new(FxMap::default()),
@@ -2629,7 +2773,7 @@ impl JitState {
             let len = first.len;
             let (same, mut rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);
             let mut group: Vec<Arc<Node>> = Vec::new();
-            let (mut inputs, mut below) = (Vec::new(), Vec::new());
+            let (mut inputs, mut below) = (Vec::new(), IdSet::default());
             for node in same {
                 // Computed inside a kernel of an earlier group (the value of an array is wanted
                 // all the same when `held`).
@@ -2643,19 +2787,19 @@ impl JitState {
                 }
                 // Part of an expression of the group: it is computed inside that kernel and only
                 // evaluated on its own afterwards if it is still pending then.
-                if below.binary_search(&node.id).is_ok() {
+                if below.contains(node.id) {
                     rest.push(node);
                     continue;
                 }
                 let mut tmp = Vec::new();
                 let mut more_inputs = inputs.clone();
-                union_into(&mut more_inputs, &mut tmp, node.inputs());
-                let mut more_below = below.clone();
-                union_into(&mut more_below, &mut tmp, &node.below_vec());
-                let fits = more_inputs.len() + group.len() < self.max_inputs() + 1
-                    && more_below.len() + group.len() < MAX_NODES_LIMIT;
+                union_into(&mut more_inputs, &mut tmp, &self.inputs_within(&node, &inputs, self.max_inputs()));
+                let (_, new_below) = below.overlap(&node);
+                let fits = more_inputs.len() + self.output_bindings(&group, &node) <= self.max_inputs() + 1
+                    && below.len() + new_below + group.len() < MAX_NODES_LIMIT;
                 if fits || group.is_empty() {
-                    (inputs, below) = (more_inputs, more_below);
+                    inputs = more_inputs;
+                    below.add(&node, false);
                     group.push(node);
                 } else {
                     rest.push(node);
@@ -2666,15 +2810,39 @@ impl JitState {
         }
     }
 
+    /// The ids of the buffers the expression of `node` reads, sorted: those it was made with
+    /// (see [`Node::inputs`]), unless they would not fit next to the `have` ones in `room`
+    /// bindings. Evaluations since then have replaced what the expression read by buffers that
+    /// may be fewer (or windows of one pack), so then they are counted again.
+    fn inputs_within(&self, node: &Arc<Node>, have: &[u64], room: usize) -> Vec<u64> {
+        let made = node.inputs();
+        let extra = made.iter().filter(|id| have.binary_search(id).is_err()).count();
+        if have.len() + extra < room {
+            return made.to_vec();
+        }
+        match node.operands() {
+            Some(args) => count_inputs(args.get(..node.op.kind.arity()).unwrap_or(&[]), &[]),
+            None => made.to_vec(),
+        }
+    }
+
+    /// The buffers a kernel binds for the outputs of `group` and `node`: one each, or one for all
+    /// of them if they are written into a pack (see [`launch::run_packed`]).
+    fn output_bindings(&self, group: &[Arc<Node>], node: &Arc<Node>) -> usize {
+        let count = group.len() + 1;
+        let ty = node.op.out_ty();
+        let packed = group.iter().all(|member| member.op.out_ty() == ty && member.len == node.len) && launch::packable(&node.ctx, count, node.len, ty);
+        if packed { 1 } else { count }
+    }
+
     /// Evaluates `seed` (an operand of an expression that got too big) together with the live
     /// pending arrays of its length that read nodes of its expression, newest first, as many as
     /// one kernel takes: [`MAX_NODES_LIMIT`] operations (what [`Context::flush`] allows) and the
     /// bindings the device allows. Computing them together evaluates what they share once.
     pub(crate) fn evaluate_alongside(&self, seed: Arc<Node>) {
         let me = current_thread();
-        let mut inputs = seed.inputs().to_vec();
-        let mut below = seed.below_vec();
-        insert_sorted(&mut below, seed.id);
+        let mut inputs = self.inputs_within(&seed, &[], self.max_inputs());
+        let mut below = IdSet::of(&seed, true);
         let len = seed.len;
         let mut group = vec![seed];
         let flying = FLATTENING.with_borrow(Clone::clone);
@@ -2692,20 +2860,19 @@ impl JitState {
                 || node.fused.load(Ordering::Relaxed)
                 || flying.contains(&Arc::as_ptr(&node))
                 || computing.iter().any(|&id| node.below_contains(id))
-                || below.binary_search(&node.id).is_ok()
+                || below.contains(node.id)
             {
                 return;
             }
-            let node_below = node.below_vec();
-            if !node_below.iter().any(|id| below.binary_search(id).is_ok()) {
+            let (shared_below, new_below) = below.overlap(&node);
+            if shared_below == 0 {
                 return;
             }
-            let new_inputs = node.inputs().iter().filter(|id| inputs.binary_search(id).is_err()).count();
-            let new_below = node_below.iter().filter(|id| below.binary_search(id).is_err()).count();
-            if inputs.len() + new_inputs + group.len() < self.max_inputs() + 1 && below.len() + new_below + group.len() < MAX_NODES_LIMIT {
-                union_into(&mut inputs, &mut tmp, node.inputs());
-                union_into(&mut below, &mut tmp, &node_below);
-                insert_sorted(&mut below, node.id);
+            let node_inputs = self.inputs_within(&node, &inputs, self.max_inputs());
+            let (_, new_inputs) = overlap(&node_inputs, &inputs);
+            if inputs.len() + new_inputs + self.output_bindings(&group, &node) <= self.max_inputs() + 1 && below.len() + new_below + group.len() < MAX_NODES_LIMIT {
+                union_into(&mut inputs, &mut tmp, &node_inputs);
+                below.add(&node, true);
                 group.push(node);
             }
         });

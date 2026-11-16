@@ -30,8 +30,7 @@ fn sha3_256_and_shake128_match_the_reference() {
 #[test]
 fn a_chain_of_permutations_is_a_few_kernels() {
     let ctx = Context::new().unwrap();
-    // A device that binds few buffers (llvmpipe: 16, Metal: 29) cannot take the 50 words of the state in one kernel.
-    if !ctx.profiling_supported() || matches!(ctx.tuning_profile(), TuningProfile::Cpu | TuningProfile::Apple) {
+    if !ctx.profiling_supported() {
         return;
     }
     let (n, len) = (256, 1000);
@@ -42,5 +41,8 @@ fn a_chain_of_permutations_is_a_few_kernels() {
     for (i, message) in messages.iter().enumerate().step_by(37) {
         assert_eq!(instance_bytes(&got, i, 32), sponge_host(message, 136, 0x06, 32));
     }
+    // A device that binds few buffers (llvmpipe: 16, Metal: 29) cannot take the 50 words of the state
+    // in one kernel: they live in a few buffers that the kernels read through one binding each (see
+    // `tests/binding_limit.rs` for the same with 13).
     assert!(profile.launches() <= 60, "{} kernels for 8 permutations\n{profile}", profile.launches());
 }

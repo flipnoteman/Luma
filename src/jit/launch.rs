@@ -211,11 +211,19 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
     let max_inputs = jit.max_inputs();
     let max_live = jit.max_live(node.context().tuning());
     let mut rounds = 0;
+    let mut repacked = false;
     loop {
         let roots = [(Arc::clone(node), args)];
         let mut fused = flatten(&roots, tail)?;
         let [(_, returned)] = roots;
         args = returned;
+        // Buffers that a pack holds are read through one binding (see `pack`).
+        if fused.inputs.len() > max_inputs && !repacked {
+            repacked = true;
+            if super::pack::repack_inputs(node.context(), &fused, fused.inputs.len() - max_inputs) {
+                continue;
+            }
+        }
         if fused.inputs.len() > max_inputs
             && let Some(i) = (0..node.op().kind.arity()).find(|&i| matches!(args.get(i), Some(Src::Node(_))))
         {
@@ -361,8 +369,10 @@ pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
     }
     let grouped = roots.len() > 1
         && roots.iter().all(|(node, _)| node.len() == roots[0].0.len())
-        && match flatten(&roots, Tail::Store) {
-            Ok(fused) if fused.inputs.len() + roots.len() <= roots[0].0.context().jit().max_inputs() + 1 => {
+        && match flatten_packed(&roots) {
+            // Outputs that would make the kernel bind too many buffers share one (see `run_packed`).
+            Ok(fused) if fused.inputs.len() + roots.len() > roots[0].0.context().jit().max_inputs() + 1 => run_packed(&roots, fused),
+            Ok(fused) => {
                 let (first, _) = &roots[0];
                 match run_store(first.context(), first.len(), fused) {
                     Ok(outputs) => {
@@ -377,7 +387,7 @@ pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
                     Err(_) => false,
                 }
             }
-            _ => false,
+            Err(_) => false,
         };
     if !grouped {
         // One kernel each; this also reports every failure at its own node.
@@ -385,6 +395,67 @@ pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
             let _ = node.force();
         }
     }
+}
+
+/// [`flatten`] of `roots` as a store, after packing the buffers it reads if it binds more than a
+/// kernel does (see `pack::repack_inputs`).
+fn flatten_packed(roots: &[(Arc<Node>, Args)]) -> Result<Fused, Failure> {
+    let fused = flatten(roots, Tail::Store)?;
+    let ctx = roots[0].0.context();
+    let max_inputs = ctx.jit().max_inputs();
+    if fused.inputs.len() > max_inputs && super::pack::repack_inputs(ctx, &fused, fused.inputs.len() - max_inputs) {
+        drop(fused);
+        return flatten(roots, Tail::Store);
+    }
+    Ok(fused)
+}
+
+/// Whether `count` arrays of `len` elements of `ty` fit one pack (see [`run_packed`]): one buffer of
+/// elements that sit one after the other.
+pub(super) fn packable(ctx: &crate::context::Context, count: usize, len: usize, ty: ElemTy) -> bool {
+    ty != ElemTy::Bool
+        && count > 1
+        && len > 0
+        && count.checked_mul(len).is_some_and(|total| u32::try_from(total).is_ok() && (total as u64).saturating_mul(ty.stride()) <= ctx.segment_bytes())
+}
+
+/// Runs the multi-output program `fused` of `roots` as one kernel that writes every output into
+/// one new buffer, the pack, and makes the roots windows of it (see [`Storage::window_of`]): the
+/// kernel binds one buffer for its outputs instead of one each, and so do the kernels that read
+/// them. For a group whose outputs alone would exceed what a kernel binds. `false` if the
+/// program cannot run like that (the outputs differ in type, or it reads an array split over
+/// several buffers, or its inputs leave no binding for the pack, or a step is being recorded),
+/// and nothing was evaluated.
+fn run_packed(roots: &[(Arc<Node>, Args)], mut fused: Fused) -> bool {
+    let (first, _) = &roots[0];
+    let ctx = first.context();
+    let (len, ty) = (first.len(), first.op().out_ty());
+    // A recorded step (see `Trace`) is replayed with its results as buffers that its launches write:
+    // windows of a pack, which a copy would later detach from it, are not.
+    if ctx.recording_here() {
+        return false;
+    }
+    if roots.iter().any(|(node, _)| node.op().out_ty() != ty)
+        || !packable(ctx, roots.len(), len, ty)
+        || fused.inputs.iter().any(|input| input.segments() != 1)
+        || fused.inputs.len() + 1 > ctx.jit().max_inputs() + 1
+    {
+        return false;
+    }
+    let (Ok(total), Ok(block)) = (u32::try_from(roots.len()), u32::try_from(len)) else { return false };
+    fused.key.tail = Tail::Stack { total, first: 0, block };
+    let pack = Arc::new(Storage::new(ctx, roots.len() * len, ty.layout()));
+    if run_mapped(ctx, fused, std::slice::from_ref(&pack), len).is_err() {
+        return false;
+    }
+    let finite = check_finite(ctx, &pack, ty);
+    for (j, (node, _)) in roots.iter().enumerate() {
+        match &finite {
+            Ok(()) => node.finish_shared(Arc::new(Storage::window_of(&pack, j * len, len))),
+            Err(error) => node.fail(error.clone()),
+        }
+    }
+    true
 }
 
 /// For every root of `roots`, whether its expression reads another of the roots through a shift,
@@ -890,6 +961,7 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
             in_place_eligible(&key, k as u32)
                 && Arc::strong_count(input) == 1
                 && !input.is_alias()
+                && !input.is_window()
         });
         if let Some(k) = candidate {
             match Arc::try_unwrap(inputs.remove(k)) {

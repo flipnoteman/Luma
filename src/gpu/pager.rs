@@ -12,6 +12,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+use crate::array::Storage;
 use crate::context::{copy_parallel, Context, STORAGE_USAGE};
 use crate::error::Result;
 use crate::gpu::pool;
@@ -29,6 +30,16 @@ enum State {
     Device(wgpu::Buffer),
     /// Moved to host memory to make room; copied back at the next pin.
     Host(Vec<u8>),
+    /// A range of the buffer of another storage (see [`Segment::windowed`]); gets a buffer of its
+    /// own, a copy of the range, at the first pin.
+    Window(Window),
+}
+
+/// Where a windowed segment's data is: `bytes` bytes of the one buffer of `pack`, from `offset`.
+#[derive(Debug)]
+struct Window {
+    pack: Arc<Storage>,
+    offset: u64,
 }
 
 /// One device buffer holding a contiguous element range of an array.
@@ -160,8 +171,63 @@ impl Segment {
         segment
     }
 
+    /// A segment of `bytes` bytes that shows `bytes` bytes of `pack` (a storage of one segment)
+    /// from byte `offset`, without a buffer of its own: kernels that know windows read the
+    /// range through the pack (see `jit::pack`), anything else that pins the segment gets a
+    /// copy of it first (see [`Segment::pin`]), so the data stays valid whatever writes to it.
+    pub(crate) fn windowed(ctx: &Context, bytes: u64, pack: Arc<Storage>, offset: u64) -> Arc<Segment> {
+        Arc::new(Segment {
+            ctx: ctx.clone(),
+            bytes,
+            state: Mutex::new(State::Window(Window { pack, offset })),
+            pins: AtomicU32::new(0),
+            stamp: AtomicU64::new(0),
+        })
+    }
+
+    /// Whether the segment is a window or a device buffer no command being recorded holds.
+    pub(crate) fn can_adopt(&self) -> bool {
+        match &*lock(&self.state) {
+            State::Device(_) => self.pins.load(Ordering::Acquire) == 0,
+            State::Window(_) => true,
+            State::Empty | State::Host(_) => false,
+        }
+    }
+
+    /// Makes the segment a window of `pack` from byte `offset` (of another one, if it was
+    /// one): the buffer it had is given back to the pool (commands recorded so far that use it
+    /// still run first), and the segment shows the range of `pack` that holds the same data now.
+    /// `false` if the segment has no device buffer, or one that a recording holds.
+    pub(crate) fn adopt(self: &Arc<Self>, pack: Arc<Storage>, offset: u64) -> bool {
+        let mut state = lock(&self.state);
+        match &*state {
+            State::Window(_) => {
+                *state = State::Window(Window { pack, offset });
+                return true;
+            }
+            State::Device(_) if self.pins.load(Ordering::Acquire) == 0 => {}
+            _ => return false,
+        }
+        let State::Device(buffer) = std::mem::replace(&mut *state, State::Window(Window { pack, offset })) else { return false };
+        let pager = self.ctx.pager();
+        pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+        lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(self)));
+        drop(state);
+        self.ctx.recycle(buffer);
+        true
+    }
+
+    /// The pack and the byte offset in it if the segment still only shows a range of it.
+    pub(crate) fn window(&self) -> Option<(Arc<Storage>, u64)> {
+        match &*lock(&self.state) {
+            State::Window(window) => Some((Arc::clone(&window.pack), window.offset)),
+            _ => None,
+        }
+    }
+
     /// The segment's buffer, allocating it (and bringing its data back from host memory) on
-    /// first use. It stays on the device until the returned [`Pin`] is dropped.
+    /// first use; a window gets a buffer holding a copy of its range. It stays on the device
+    /// until the returned [`Pin`] is dropped.
     pub(crate) fn pin(self: &Arc<Self>) -> Result<Pin> {
         let pin = self.pin_unrecorded()?;
         self.ctx.keep_pin(&pin);
@@ -179,8 +245,20 @@ impl Segment {
             if matches!(&*lock(&self.state), State::Host(_)) {
                 self.ctx.abort_recording()?;
             }
+            let window = match &*lock(&self.state) {
+                State::Window(window) => Some((Arc::clone(&window.pack), window.offset)),
+                _ => None,
+            };
             self.ctx.make_room(self.bytes)?;
             let buffer = self.ctx.alloc_buffer(self.bytes, STORAGE_USAGE)?;
+            if let Some((pack, offset)) = window {
+                // The copy runs after the launch that wrote the pack and before any later one.
+                let source = pack.pin(0)?;
+                if let Err(e) = self.ctx.copy(source.buffer(), offset, &buffer, 0, self.bytes) {
+                    self.ctx.recycle(buffer);
+                    return Err(e);
+                }
+            }
             let mut state = lock(&self.state);
             match &*state {
                 State::Device(_) => {
@@ -197,7 +275,7 @@ impl Segment {
                     pager.register(self, buffer.size());
                     *state = State::Device(buffer);
                 }
-                State::Empty => {
+                State::Empty | State::Window(_) => {
                     pager.register(self, buffer.size());
                     *state = State::Device(buffer);
                 }

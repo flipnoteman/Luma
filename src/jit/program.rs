@@ -1326,6 +1326,22 @@ pub(super) fn flatten_inner(
     tail: Tail,
     probes: &[u64],
 ) -> Result<Fused, Failure> {
+    let mut fused = flatten_unpacked(roots, tail, probes)?;
+    // What the traces of loops and stencils flatten keeps the arrays it reads as they are.
+    if probes.is_empty()
+        && let Some((first, _)) = roots.first()
+    {
+        super::pack::read_packs(first.context().jit(), &mut fused);
+    }
+    Ok(fused)
+}
+
+/// [`flatten_inner`] before the windows of packs are read through their packs.
+fn flatten_unpacked(
+    roots: &[(Arc<Node>, Args)],
+    tail: Tail,
+    probes: &[u64],
+) -> Result<Fused, Failure> {
     let flattening = Flattening::enter(roots.iter().map(|(root, _)| Arc::as_ptr(root)));
     loop {
         let mut fused = flatten_once(roots, tail, probes)?;
