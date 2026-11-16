@@ -192,8 +192,9 @@ impl Io {
 /// How the lines of a system are solved.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Algo {
-    /// One invocation per line, `workgroup` per workgroup ([`Builtin::Tridiagonal`](crate::builtin::Builtin)).
-    Thomas { workgroup: u8 },
+    /// One invocation per line, `workgroup` per workgroup, the scratch `tiled` or not
+    /// ([`Builtin::Tridiagonal`](crate::builtin::Builtin), [`thomas_plan`](crate::builtin::thomas_plan)).
+    Thomas { workgroup: u8, tiled: bool },
     /// One workgroup per line ([`cyclic`]).
     Cyclic { workgroup: u16, shift: u8, shared_rows: u32 },
 }
@@ -284,7 +285,7 @@ impl SolveSpec {
                 &cyclic::Config { block: u32::from(self.block), workgroup: u32::from(workgroup), shift: u32::from(shift), shared_rows, starts: self.starts, systems },
                 &io,
             ),
-            Algo::Thomas { workgroup } => crate::builtin::tridiagonal_body(block, self.starts, u32::from(workgroup), systems, &io),
+            Algo::Thomas { workgroup, tiled } => crate::builtin::tridiagonal_body(block, self.starts, u32::from(workgroup), systems, &io, tiled),
         }
     }
 

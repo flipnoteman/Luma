@@ -8,7 +8,8 @@
 //! `vec4` rows, one workgroup per line, one thread per row up to 256). Both are verified against
 //! a host `f64` block Thomas solve, then timed interleaved: GPU time of the one solver launch
 //! (`ctx.profile`, best of 7 after a warm-up of at least 300 ms, as the GPU lowers its clocks when
-//! idle). `parts/...` rows time the block and scalar solves on parts against the stacked forms.
+//! idle). `parts/...` rows time the block and scalar solves on parts against the stacked forms;
+//! `parts3d/...` rows time them on the 3-D grid of an implicit step.
 //!
 //! One row per case: `case shape lines x rows luma_us hand_us ratio`.
 
@@ -607,6 +608,98 @@ fn parts(ctx: &Context, only: &Option<String>) {
     }
 }
 
+/// The solves on parts of a 3-D implicit step, along each axis of a grid of 187 x 70 x 24 cells
+/// (the lines of the i axis are contiguous, the others strided): luma only, GPU time of the one
+/// solver launch, best of [`RUNS`] after the warm-up, verified against a host `f64` solve. The
+/// parts are evaluated arrays or expressions of 50 face fields (every part a combination of two
+/// of them, as the Jacobians of a finite-volume step are of the face states). `operand MB` is
+/// what the solve has to read (the parts evaluated, the fields they use lazy) and write (the
+/// solution), and `GB/s` that over the time; the Thomas solve moves about as much again through
+/// its scratch.
+fn grid3d(ctx: &Context, only: &Option<String>) {
+    let grid = [187usize, 70, 24];
+    let cells: usize = grid.iter().product();
+    for b in [1usize, 2, 4, 5] {
+        for lazy in [false, true] {
+            let kind = if lazy { "lazy" } else { "evaluated" };
+            if only.as_deref().is_some_and(|f| !["i", "j", "k"].iter().any(|l| format!("parts3d/b{b}_{kind}_axis{l}").contains(f))) {
+                continue;
+            }
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let (bb, per) = (b * b, 3 * b * b + b);
+                let faces: Vec<Vec<f32>> = (0..50).map(|k| values(cells, 900 + k as u64, -0.5, 0.5)).collect();
+                // The value of part `k` (lo, diag, up, rhs entries in order) of cell `q`.
+                let shift = |k: usize| if (bb..2 * bb).contains(&k) && (k - bb) / b == (k - bb) % b { 2.0 * b as f32 + 1.0 } else { 0.0 };
+                let weight = |k: usize| 1.0 + k as f32 * 0.01;
+                let host_part = |k: usize| -> Vec<f32> { (0..cells).map(|q| faces[k % 50][q] * weight(k) + faces[(k * 7 + 3) % 50][q] * 0.5 + shift(k)).collect() };
+                let face_arrays: Vec<A> = faces.iter().map(|f| Array::from_slice_on(ctx, f, grid).unwrap()).collect();
+                let parts: Vec<A> = (0..per)
+                    .map(|k| {
+                        if lazy {
+                            &(&(&face_arrays[k % 50] * weight(k)) + &(&face_arrays[(k * 7 + 3) % 50] * 0.5)) + shift(k)
+                        } else {
+                            let a = Array::from_slice_on(ctx, &host_part(k), grid).unwrap();
+                            a.eval().unwrap();
+                            a
+                        }
+                    })
+                    .collect();
+                face_arrays.iter().for_each(|a| a.eval().unwrap());
+                let refs: Vec<&A> = parts.iter().collect();
+                for (axis, label) in ["i", "j", "k"].iter().enumerate() {
+                    let name = format!("parts3d/b{b}_{kind}_axis{label}");
+                    if only.as_deref().is_some_and(|f| !name.contains(f)) {
+                        continue;
+                    }
+                    macro_rules! solve {
+                        ($b2:literal, $b:literal) => {
+                            solve_block_tridiagonal_parts(
+                                axis,
+                                std::array::from_fn::<_, $b2, _>(|k| refs[k]),
+                                std::array::from_fn::<_, $b2, _>(|k| refs[$b2 + k]),
+                                std::array::from_fn::<_, $b2, _>(|k| refs[2 * $b2 + k]),
+                                std::array::from_fn::<_, $b, _>(|k| refs[3 * $b2 + k]),
+                            )
+                            .to_vec()
+                        };
+                    }
+                    let run = || -> Vec<A> {
+                        match b {
+                            1 => solve_tridiagonal_parts(axis, [(refs[0], refs[1], refs[2], refs[3])]).to_vec(),
+                            2 => solve!(4, 2),
+                            4 => solve!(16, 4),
+                            _ => solve!(25, 5),
+                        }
+                    };
+                    if std::env::var_os("BENCH_NOCHECK").is_none() {
+                        let interleave = |range: std::ops::Range<usize>| -> Vec<f32> {
+                            let host: Vec<Vec<f32>> = range.map(host_part).collect();
+                            (0..cells * host.len()).map(|i| host[i % host.len()][i / host.len()]).collect()
+                        };
+                        let want = host_tri(b, grid, axis, &interleave(0..bb), &interleave(bb..2 * bb), &interleave(2 * bb..3 * bb), &interleave(3 * bb..per));
+                        let comps: Vec<Vec<f32>> = run().iter().map(|c| c.to_vec().unwrap()).collect();
+                        let got: Vec<f32> = (0..cells * b).map(|i| comps[i % b][i / b]).collect();
+                        check(&name, &got, &want, 1e-3, 1e-3);
+                    }
+                    let mut f = || eval_all(&run().iter().collect::<Vec<_>>()).unwrap();
+                    let start = Instant::now();
+                    while start.elapsed() < WARMUP {
+                        f();
+                        ctx.sync().unwrap();
+                    }
+                    let us = (0..RUNS).map(|_| total_us(ctx, &mut f).0).fold(f64::INFINITY, f64::min);
+                    let read = if lazy { (0..per).flat_map(|k| [k % 50, (k * 7 + 3) % 50]).collect::<std::collections::BTreeSet<_>>().len() } else { per };
+                    let mb = (read + b) as f64 * cells as f64 * 4.0 / 1e6;
+                    println!("{name:<28} {:>6} lines of {:>3}   {us:>9.2} us   operand {mb:>6.1} MB {:>6.1} GB/s", cells / grid[axis], grid[axis], mb * 1e3 / us);
+                }
+            }));
+            if result.is_err() {
+                println!("SKIPPED: parts3d/b{b}_{kind}");
+            }
+        }
+    }
+}
+
 /// Luma only: the block sizes and grids of `bench_pde --only tri` (and a few more), to compare
 /// builds of the library: one row per case, best GPU time of the solver launch in microseconds.
 fn sweep(ctx: &Context, only: &Option<String>) {
@@ -668,6 +761,7 @@ fn main() {
     println!("{:<24} {:>7} {:>9} {:>9} {:>7}", "case", "grid", "luma us", "hand us", "ratio");
     block4(&ctx, &only);
     parts(&ctx, &only);
+    grid3d(&ctx, &only);
     if only.as_deref().is_some_and(|f| "sweep/".contains(f) || f.starts_with("sweep")) || only.is_none() {
         println!("\n{:<32} {:>9}", "sweep case", "luma us");
         sweep(&ctx, &only);

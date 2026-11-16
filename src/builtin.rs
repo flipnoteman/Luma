@@ -628,7 +628,7 @@ pub(crate) enum Builtin {
     UntilGate,
     /// Block Thomas solves, one invocation per line; see [`tridiagonal`]. `block` is the block
     /// size (1 = scalar), `starts` whether every line begins at its own cell, `workgroup` the
-    /// invocations per workgroup (see [`tridiagonal_workgroup`]).
+    /// invocations per workgroup (see [`thomas_plan`]).
     Tridiagonal { block: u8, starts: bool, workgroup: u8 },
     /// Cyclic-reduction solves, one workgroup per line; see [`crate::cyclic`]. `block` and
     /// `starts` as for [`Builtin::Tridiagonal`], `workgroup` the invocations per workgroup, rows
@@ -1278,19 +1278,70 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     )
 }
 
-/// Invocations per workgroup of the tridiagonal solve of `lines` lines. It runs one invocation
-/// per grid line, so there are often only a thousand or a few thousand of them. With the
-/// elementwise workgroup (256 on NVIDIA) they fill a handful of multiprocessors; small workgroups
-/// spread them over all of them (a workgroup runs on one multiprocessor) and the solve is
-/// latency bound, so lanes of a warp left idle cost nothing. Aiming for 512 workgroups, from 8
-/// invocations to a warp of 32 (RTX 3090; 4096 lines, `tri/solve_axis0`: 9.4 ms with 256, 3.9
-/// with 32, 2.6 with 8; 1024 block-4 lines: 9.5, 2.1 ms with 32, 8 after unrolling the kernel).
-/// Software rasterizers keep the elementwise size.
-pub(crate) fn tridiagonal_workgroup(tuning: &Tuning, lines: u32) -> u8 {
-    match tuning.profile {
-        TuningProfile::Cpu => tuning.elementwise_workgroup as u8,
-        _ => (lines / 512).max(1).next_power_of_two().clamp(8, 32).min(tuning.elementwise_workgroup) as u8,
+/// How the Thomas solve of lines of blocks runs: the invocations per workgroup and the layout of
+/// the scratch `cp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ThomasPlan {
+    pub(crate) workgroup: u8,
+    /// Whether `cp` is tiled (see [`thomas_plan`]) rather than one cell after the other.
+    pub(crate) tiled: bool,
+}
+
+/// Cells per tile of the tiled scratch: a warp.
+const CP_TILE: u32 = 32;
+
+/// The invocations per workgroup and the scratch layout of the Thomas solve of `lines` lines of
+/// `block`-blocks, `stride` cells apart in memory. It runs one invocation per line.
+///
+/// Lines along the contiguous axis (or nearly: stride below [`Tuning::line_strided_from`]) have
+/// their cells far apart for neighbouring invocations, so every access is a sector of its own
+/// whatever the layout and the solve is latency bound. A small workgroup spreads the lines over
+/// all multiprocessors (a workgroup runs on one) and lanes of a warp left idle cost nothing:
+/// aiming for 512 workgroups, from 8 invocations to a warp of 32 (RTX 3090; 4096 lines,
+/// `tri/solve_axis0`: 9.4 ms with 256, 3.9 with 32, 2.6 with 8; 1024 block-4 lines: 9.5, 2.1 ms
+/// with 32, 8 after unrolling the kernel). Software rasterizers keep the elementwise size.
+///
+/// Along a strided axis neighbouring invocations solve neighbouring lines and read neighbouring
+/// cells, so a warp's loads coalesce when the warp is full, and the solve is bound by memory
+/// (5x5 blocks, 4488 lines of 70 cells, parts of 50 fields: 200 us without the elimination, 225
+/// with it, 161 MB moved: 86 % of the RTX 3090's bandwidth) rather than by the dependent chain
+/// of a cell. The workgroup is then a warp or more (blocks of 5, 4488 lines of 70, evaluated
+/// parts, scratch in planes `k * cells + q`: 8 invocations 581 us, 16 380, 32 300, 64 295, 128
+/// 290; 4096 lines of 100 cells, blocks of 1 to 5, 8 to 128: 16 to 32 for scalars, 128 for 2x2
+/// blocks (106 us against 133 with 64), 64 for 3x3 to 5x5 (4x4: 206 against 228 with 32)), and
+/// the scratch is tiled: the `cp` entries of the 32 cells `32 t ..` that a warp's cells fall in
+/// are `block^2` runs of 32 floats one after the other, so each store and load of a cell's entry
+/// is one contiguous 128 byte run and the 25 runs of a tile are one contiguous piece of memory,
+/// where one cell after the other (`q * block^2 + k`) takes a sector per lane and entry (5x5
+/// blocks, 4488 lines of 70, parts of 50 fields: 297 us one cell after the other, 234 with the
+/// entries in planes `k * cells + q`, 220 tiled; 35904 lines: 2.1 ms, 2.3 ms, 2.0 ms). Below a
+/// stride of 16 a warp's cells are in runs of too few neighbours (strides 2, 4, 8: tiled 1.5x,
+/// 1.6x, 1.03x slower).
+///
+/// Stacked blocks (`parts` false) keep the narrow workgroups and the scratch of one cell after
+/// the other: their coefficients are read `block^2` floats apart per cell, so a warp's loads do
+/// not coalesce whatever the workgroup, and the wide tiled solve was 1.1x to 1.3x slower on
+/// `bench_solve --only sweep/` (blocks of 2 to 5, 100 to 1024 strided lines of 32 to 1024 cells).
+pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, parts: bool) -> ThomasPlan {
+    if tuning.profile == TuningProfile::Cpu {
+        return ThomasPlan { workgroup: tuning.elementwise_workgroup as u8, tiled: false };
     }
+    if parts && tuning.line_strided_from > 0 && stride >= tuning.line_strided_from && block <= UNROLLED_BLOCK {
+        let wanted = match block {
+            1 => 32,
+            2 => 128,
+            _ => 64,
+        };
+        return ThomasPlan { workgroup: wanted.min(tuning.elementwise_workgroup) as u8, tiled: block > 1 };
+    }
+    ThomasPlan { workgroup: (lines / 512).max(1).next_power_of_two().clamp(8, 32).min(tuning.elementwise_workgroup) as u8, tiled: false }
+}
+
+/// Floats of the scratch `cp` of one system of `cells` cells of `block`-blocks, in the layout
+/// [`thomas_plan`] chose: the tiled one rounds the cells up to whole tiles. `None` on overflow.
+pub(crate) fn thomas_scratch_floats(cells: u64, block: u32, tiled: bool) -> Option<u64> {
+    let cells = if tiled { cells.checked_next_multiple_of(u64::from(CP_TILE))? } else { cells };
+    cells.checked_mul(u64::from(block * block))
 }
 
 /// The bindings of the Thomas kernel and the line addressing. `out` holds the forward-swept
@@ -1344,23 +1395,28 @@ pub(crate) const UNROLLED_BLOCK: u32 = 5;
 /// cell in registers. For `b == 1` this is the plain Thomas algorithm.
 fn tridiagonal_unrolled(b: usize, starts: bool, wg: u32) -> String {
     let mut src = tridiagonal_header(starts, &Io::buffers(b));
-    src.push_str(&tridiagonal_body(b, starts, wg, 1, &Io::buffers(b)));
+    src.push_str(&tridiagonal_body(b, starts, wg, 1, &Io::buffers(b), false));
     src
 }
 
 /// The entry point of the straight-line Thomas solve of `systems` systems of `b`-blocks, reading
 /// and writing through `io`, after the bindings and `Params` (see [`tridiagonal_header`]; the
-/// scratch `cp` holds `b * b` floats per cell and system).
-pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io: &Io) -> String {
+/// scratch `cp` holds `b * b` floats per cell and system: entry `k` of cell `q` at `q * b * b + k`,
+/// or with `tiled` (see [`thomas_plan`]) at `(q / 32) * 32 * b * b + 32 * k + q % 32`, and the
+/// system `sys` starts at `thomas_scratch_floats(lines * n, b, tiled)`).
+pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io: &Io, tiled: bool) -> String {
     let w = b + 1;
     let bb = b * b;
     let s0 = if starts { "min(starts[l], p.n)" } else { "0u" };
     let (guard, sys, line, scratch) = if systems > 1 {
-        (format!("p.lines * {systems}u"), "    let sys = lg / p.lines;\n", "lg % p.lines", format!("sys * (p.lines * p.n * {bb}u)"))
+        (format!("p.lines * {systems}u"), "    let sys = lg / p.lines;\n", "lg % p.lines", if tiled { format!("sys * (((p.lines * p.n + 31u) & ~31u) * {bb}u)") } else { format!("sys * (p.lines * p.n * {bb}u)") })
     } else {
         ("p.lines".to_owned(), "    let sys = 0u;\n", "lg", "0u".to_owned())
     };
     let mut src = String::from("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
+    // The index of entry `k` of the scratch of cell `q`, from `cq` (see above).
+    let cp_at = |k: usize| if tiled { format!("cq + {}u", 32 * k) } else { format!("cq + {k}u") };
+    let cq_expr = if tiled { format!("so + (q >> 5u) * {}u + (q & 31u)", 32 * bb) } else { format!("so + q * {bb}u") };
     let _ = write!(
         src,
         "@compute @workgroup_size({wg})
@@ -1384,7 +1440,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
         let _ = writeln!(src, "    var pd{i} = 0.0;");
     }
-    src.push_str("    for (var s = s0; s < p.n; s++) {\n        let q = base + s * p.stride;\n");
+    let _ = write!(src, "    for (var s = s0; s < p.n; s++) {{\n        let q = base + s * p.stride;\n        let cq = {cq_expr};\n");
     src.push_str(&io.load("        ", "q"));
     for i in 0..b {
         for j in 0..b {
@@ -1454,7 +1510,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     }
     for i in 0..b {
         for j in 0..b {
-            let _ = writeln!(src, "        cp[so + q * {bb}u + {}u] = r{i}{j};\n        pc{i}{j} = r{i}{j};", i * b + j);
+            let _ = writeln!(src, "        cp[{}] = r{i}{j};\n        pc{i}{j} = r{i}{j};", cp_at(i * b + j));
         }
         let _ = writeln!(src, "        pd{i} = r{i}{b};");
     }
@@ -1465,10 +1521,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     for i in 0..b {
         let _ = writeln!(src, "    var x{i} = pd{i};");
     }
-    src.push_str("    for (var j = 2u; j <= p.n - s0; j++) {\n        let q = base + (p.n - j) * p.stride;\n");
+    let _ = write!(src, "    for (var j = 2u; j <= p.n - s0; j++) {{\n        let q = base + (p.n - j) * p.stride;\n        let cq = {cq_expr};\n");
     src.push_str(&io.load_out("        ", "q", "yo"));
     for i in 0..b {
-        let sum = (0..b).map(|k| format!("cp[so + q * {bb}u + {}u] * x{k}", i * b + k)).collect::<Vec<_>>().join(" + ");
+        let sum = (0..b).map(|k| format!("cp[{}] * x{k}", cp_at(i * b + k))).collect::<Vec<_>>().join(" + ");
         let _ = writeln!(src, "        let y{i} = yo{i} - ({sum});");
     }
     let solved: Vec<String> = (0..b).map(|i| format!("y{i}")).collect();
