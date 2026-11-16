@@ -85,14 +85,15 @@ mod builtin;
 mod context;
 mod conv;
 mod cyclic;
+mod solve;
 mod error;
-mod factorize;
-mod fft;
 mod fields;
 mod fields_macro;
-mod filter;
 #[cfg(test)]
 mod fuzz;
+mod fft;
+mod factorize;
+mod filter;
 mod generate;
 mod gpu;
 mod gpu_type;
@@ -108,49 +109,41 @@ mod precision;
 mod profile;
 mod quantile;
 mod reduce;
-mod scalar;
 mod scan;
 mod scatter;
 mod search;
+mod scalar;
 mod shape;
-mod solve;
 mod sort;
 mod tuning;
 mod until;
 mod view;
 
 pub use array::Array;
-pub use context::{Context, ContextOptions, DeviceKind, default_context, flush};
+pub use context::{default_context, flush, Context, ContextOptions, DeviceKind};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
+pub use kernel::{uniform, view, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
-pub use jit::cost::CostModel;
-pub use jit::fusion_limit;
-pub use kernel::{
-    BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue, uniform,
-    view,
-};
+pub use until::{compile_until_all, iterate_until_all, CompiledUntil, Cond, History, Run, Series, Stat, StopReason, Until};
 pub use linalg::{
-    solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts,
-    solve_block_tridiagonal_parts_from, solve_tridiagonal, solve_tridiagonal_from,
+    solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from, solve_tridiagonal, solve_tridiagonal_from,
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,
 };
 pub use matmul::matmul;
-pub use ops::{Condition, Operand, eval_all, select};
-pub use profile::{FusionSplit, KernelTiming, Profile, SplitReason};
+pub use jit::cost::CostModel;
+pub use jit::fusion_limit;
+pub use ops::{eval_all, select, Condition, Operand};
 pub use reduce::Reduction;
 pub use scalar::Scalar;
-pub use scatter::{AtomicElem, bincount};
+pub use scatter::{bincount, AtomicElem};
 pub use search::Side;
+pub use profile::{FusionSplit, KernelTiming, Profile, SplitReason};
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
 pub use tuning::TuningProfile;
-pub use until::{
-    CompiledUntil, Cond, History, Run, Series, Stat, StopReason, Until, compile_until_all,
-    iterate_until_all,
-};
-pub use view::{PadMode, ViewMut, concat, concat_slice, stack, stack_slice};
+pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 
 /// Plumbing of `fields!`; not part of the public API.
 #[doc(hidden)]

@@ -109,12 +109,7 @@ pub(crate) enum Tail {
     /// `private`, every workgroup first accumulates into workgroup memory (the target is small
     /// next to the number of elements) and merges it into the buffer once. Without, `len` may
     /// move to uniform slot `len_slot` (see `params`), so that targets of any size share a kernel.
-    ScatterAdd {
-        len: u32,
-        op: AtomicOp,
-        private: bool,
-        len_slot: Option<u32>,
-    },
+    ScatterAdd { len: u32, op: AtomicOp, private: bool, len_slot: Option<u32> },
     /// [`Tail::StoreMapped`] with the numbers of the view in the uniform (see `params`).
     ParamStoreMapped { id: u16, spec: ViewSpec },
     /// [`Tail::Scatter`] with `len` in uniform slot `len_slot`.
@@ -134,13 +129,7 @@ pub(crate) enum Tail {
     /// the left one if `lhs` is fused, then the right one if `rhs` is; an operand that is not one
     /// is the buffer `a` / `b`. The program becomes `luma_lhs(i)` / `luma_rhs(i)`, the loads of
     /// the GEMM kernel of `matmul::body` (see `launch::matmul`).
-    Matmul {
-        tile: MatmulTile,
-        aligned: bool,
-        split: bool,
-        lhs: MatmulOperand,
-        rhs: MatmulOperand,
-    },
+    Matmul { tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOperand, rhs: MatmulOperand },
     /// The last instruction is the operand of a reducing pass along an axis (`scan::AxisPass`):
     /// the program becomes `luma_eval(q)`, the load of the pass (see `launch::axis_reduce`).
     AxisReduce(AxisPass),
@@ -159,14 +148,7 @@ impl Tail {
     /// Whether the roots of a program with this tail are read by it and never stored, so that
     /// they count as computed inside it (their nodes are fused, not evaluated).
     pub(super) fn consumes_roots(self) -> bool {
-        matches!(
-            self,
-            Tail::Reduce(_)
-                | Tail::Matmul { .. }
-                | Tail::AxisReduce(_)
-                | Tail::Radix(_)
-                | Tail::Solve(_)
-        )
+        matches!(self, Tail::Reduce(_) | Tail::Matmul { .. } | Tail::AxisReduce(_) | Tail::Radix(_) | Tail::Solve(_))
     }
 }
 
@@ -224,16 +206,8 @@ pub(crate) struct FusedKey {
 pub(super) fn calls_df_library(instr: &Instr) -> bool {
     let df = instr.op.ty == ElemTy::Df32;
     match instr.op.kind {
-        OpKind::Unary(op) => {
-            df && op
-                .expr_for(instr.op.ty)
-                .is_some_and(|expr| expr.contains("df_"))
-        }
-        OpKind::Binary(op) => {
-            df && op
-                .expr_for(instr.op.ty)
-                .is_some_and(|expr| expr.contains("df_"))
-        }
+        OpKind::Unary(op) => df && op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains("df_")),
+        OpKind::Binary(op) => df && op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains("df_")),
         OpKind::Compare(_) | OpKind::Clamp | OpKind::Powf => df,
         OpKind::Cast(to) => df || to == ElemTy::Df32,
         OpKind::Classify(_) => true,
@@ -244,12 +218,7 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
 /// Whether the WGSL of `instr` calls a function of the double-float math library
 /// (`builtin::DF_MATH_LIBRARY`): `exp`, `ln`, `tanh`, `log1p`, `expm1` and `powf` of a `Df32`.
 pub(super) fn calls_df_math(instr: &Instr) -> bool {
-    instr.op.ty == ElemTy::Df32
-        && matches!(
-            instr.op.kind,
-            OpKind::Unary(UnOp::Exp | UnOp::Ln | UnOp::Tanh | UnOp::Log1p | UnOp::Expm1)
-                | OpKind::Powf
-        )
+    instr.op.ty == ElemTy::Df32 && matches!(instr.op.kind, OpKind::Unary(UnOp::Exp | UnOp::Ln | UnOp::Tanh | UnOp::Log1p | UnOp::Expm1) | OpKind::Powf)
 }
 
 /// Whether `instr` reads the guard uniform: the arithmetic and the casts, whose error-free
@@ -262,10 +231,7 @@ pub(super) fn reads_guard(instr: &Instr) -> bool {
     calls_df_library(instr)
         && !matches!(
             instr.op.kind,
-            OpKind::Unary(UnOp::Abs)
-                | OpKind::Binary(BinOp::Min | BinOp::Max)
-                | OpKind::Compare(_)
-                | OpKind::Clamp
+            OpKind::Unary(UnOp::Abs) | OpKind::Binary(BinOp::Min | BinOp::Max) | OpKind::Compare(_) | OpKind::Clamp
         )
         && !(instr.op.ty == ElemTy::Bool && matches!(instr.op.kind, OpKind::Cast(ElemTy::Df32)))
 }
@@ -301,22 +267,14 @@ impl FusedKey {
     /// loops, stencils and speculation only handle those.
     pub(crate) fn narrow(&self) -> bool {
         self.input_tys.iter().all(|ty| ty.slots() == 1)
-            && self
-                .instrs
-                .iter()
-                .chain(self.subs.iter().flatten())
-                .all(|instr| instr.op.ty.slots() == 1 && instr.op.out_ty().slots() == 1)
+            && self.instrs.iter().chain(self.subs.iter().flatten()).all(|instr| instr.op.ty.slots() == 1 && instr.op.out_ty().slots() == 1)
     }
 
     /// Whether the program is a store with a `bool` output: the workgroup packs the bits it
     /// computes into whole words (see `codegen::packed_main`), so the kernel is not tiled or staged.
     pub(crate) fn writes_bits(&self) -> bool {
         self.tail == Tail::Store
-            && self.outputs.iter().any(|&at| {
-                self.instrs
-                    .get(at as usize)
-                    .is_some_and(|instr| instr.op.out_ty() == ElemTy::Bool)
-            })
+            && self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::Bool))
     }
 
     /// Whether some instruction reads a sub-program through a view or a gather: the kernel is
@@ -324,20 +282,9 @@ impl FusedKey {
     /// functions. Keys whose sub-programs are read through circular shifts only keep the latter
     /// (and the workgroup-memory staging of `codegen::plan_tile`).
     pub(crate) fn inlines(&self) -> bool {
-        self.instrs
-            .iter()
-            .chain(self.subs.iter().flatten())
-            .any(|instr| {
-                matches!(
-                    instr.op.kind,
-                    OpKind::Shift(
-                        ShiftKind::View { .. }
-                            | ShiftKind::ParamView { .. }
-                            | ShiftKind::Take { .. }
-                            | ShiftKind::ParamTake { .. }
-                    )
-                ) && matches!(instr.args[0], Ref::Sub(_))
-            })
+        self.instrs.iter().chain(self.subs.iter().flatten()).any(|instr| {
+            matches!(instr.op.kind, OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. })) && matches!(instr.args[0], Ref::Sub(_))
+        })
     }
 
     /// A profile label naming the operations fused into the kernel, for example
@@ -365,30 +312,18 @@ impl FusedKey {
         if named.len() > SHOWN {
             names.push(format!("+{} more", named.len() - SHOWN));
         }
-        let ty = self
-            .instrs
-            .last()
-            .map_or("f32", |instr| instr.op.out_ty().wgsl());
+        let ty = self.instrs.last().map_or("f32", |instr| instr.op.out_ty().wgsl());
         let names = names.join(", ");
         match self.tail {
-            Tail::Store if self.outputs.len() > 1 => {
-                format!("Fused[{}]({names}) {ty}", self.outputs.len())
-            }
+            Tail::Store if self.outputs.len() > 1 => format!("Fused[{}]({names}) {ty}", self.outputs.len()),
             Tail::Store => format!("Fused({names}) {ty}"),
-            Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => {
-                format!("FusedAssign({names}) {ty}")
-            }
+            Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => format!("FusedAssign({names}) {ty}"),
             Tail::Scatter { .. } | Tail::ParamScatter { .. } => format!("FusedPut({names}) {ty}"),
             Tail::ScatterAdd { op, .. } => format!("FusedPut{op:?}({names}) {ty}"),
             Tail::Stack { .. } | Tail::ParamStack { .. } => format!("FusedStack({names}) {ty}"),
             Tail::Matmul { .. } => format!("FusedMatmul({names}) {ty}"),
             Tail::AxisReduce(pass) => {
-                let ops: Vec<String> = pass
-                    .ops
-                    .as_slice()
-                    .iter()
-                    .map(|op| format!("{op:?}"))
-                    .collect();
+                let ops: Vec<String> = pass.ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
                 format!("FusedAxisReduce({}: {names}) {ty}", ops.join("+"))
             }
             Tail::Radix(_) => format!("FusedRadix({names}) {ty}"),
@@ -439,20 +374,13 @@ pub(crate) struct Seen {
 
 impl Seen {
     pub(super) fn with_capacity(n: usize) -> Self {
-        Seen {
-            list: Vec::with_capacity(n),
-            index: None,
-        }
+        Seen { list: Vec::with_capacity(n), index: None }
     }
 
     pub(super) fn position(&self, ptr: *const Node) -> Option<u32> {
         match &self.index {
             Some(index) => index.get(&ptr).copied(),
-            None => self
-                .list
-                .iter()
-                .position(|&known| known == ptr)
-                .map(|at| at as u32),
+            None => self.list.iter().position(|&known| known == ptr).map(|at| at as u32),
         }
     }
 
@@ -468,8 +396,7 @@ impl Seen {
                 index.entry(ptr).or_insert(at);
             }
             None if self.list.len() > INDEXED_AT => {
-                let mut index =
-                    FxMap::with_capacity_and_hasher(self.list.capacity(), Default::default());
+                let mut index = FxMap::with_capacity_and_hasher(self.list.capacity(), Default::default());
                 for (at, &known) in self.list.iter().enumerate() {
                     index.entry(known).or_insert(at as u32);
                 }
@@ -591,21 +518,13 @@ impl Index {
         }
         // Ids are handed out as nodes are made, so those of an expression are close together; one
         // that holds the ids of old nodes too would take a lot of room.
-        let width = hi
-            .checked_sub(lo)
-            .and_then(|span| usize::try_from(span).ok())
-            .map_or(0, |span| span.saturating_add(1));
-        let (base, dense) =
-            if width != 0 && width <= expected.saturating_mul(64).saturating_add(1024) {
-                (lo, vec![NONE; width])
-            } else {
-                (0, Vec::new())
-            };
-        Index {
-            base,
-            dense,
-            spill: FxMap::default(),
-        }
+        let width = hi.checked_sub(lo).and_then(|span| usize::try_from(span).ok()).map_or(0, |span| span.saturating_add(1));
+        let (base, dense) = if width != 0 && width <= expected.saturating_mul(64).saturating_add(1024) {
+            (lo, vec![NONE; width])
+        } else {
+            (0, Vec::new())
+        };
+        Index { base, dense, spill: FxMap::default() }
     }
 
     fn get(&self, id: u64) -> u32 {
@@ -634,13 +553,7 @@ impl Graph {
         probes: &[u64],
     ) -> Self {
         let expected: usize = roots.clone().map(|root| root.size()).sum();
-        Graph {
-            items: Vec::with_capacity(expected),
-            index: Index::new(roots, expected),
-            trace,
-            boundary,
-            probes: probes.to_vec(),
-        }
+        Graph { items: Vec::with_capacity(expected), index: Index::new(roots, expected), trace, boundary, probes: probes.to_vec() }
     }
 
     /// The items by the address of their nodes.
@@ -672,10 +585,7 @@ impl Graph {
     fn link_root(&mut self, at: u32) -> Result<(), Failure> {
         let item = &mut self.items[at as usize];
         let node = Arc::clone(&item.node);
-        let args = std::mem::replace(
-            &mut item.args,
-            [Src::unused(), Src::unused(), Src::unused()],
-        );
+        let args = std::mem::replace(&mut item.args, [Src::unused(), Src::unused(), Src::unused()]);
         let kids = self.link(&node, &args, usize::from(self.items[at as usize].arity));
         let item = &mut self.items[at as usize];
         item.args = args;
@@ -701,9 +611,7 @@ impl Graph {
     /// evaluated node is a leaf; so is one another thread evaluates right now (waited for); with
     /// `trace` that is an error instead.
     fn kid(&mut self, src: &Src) -> Result<u32, Failure> {
-        let Src::Node(node) = src else {
-            return Ok(NONE);
-        };
+        let Src::Node(node) = src else { return Ok(NONE) };
         // Evaluated nodes are most of the operands: told from the node itself, not looked up.
         match node.result.get() {
             Some(Ok(_)) => return Ok(NONE),
@@ -719,18 +627,14 @@ impl Graph {
         }
         let Some(args) = node.operands() else {
             if self.trace {
-                return Err(Failure::New(LumaError::Gpu(
-                    "traced step reads a node under evaluation".into(),
-                )));
+                return Err(Failure::New(LumaError::Gpu("traced step reads a node under evaluation".into())));
             }
             // A leaf that computes from the placeholders of a traced step must not run here: this
             // is not the recording, so it would read the placeholders as they are (unspecified
             // data, or the first state) and every step would read that value. The traced step
             // records it with the other launches instead.
             if !self.probes.is_empty() && leaf_reads_probes(node, &self.probes) {
-                return Err(Failure::New(LumaError::Gpu(
-                    "traced step reads a leaf computed from its state".into(),
-                )));
+                return Err(Failure::New(LumaError::Gpu("traced step reads a leaf computed from its state".into())));
             }
             // Another thread is evaluating it right now; wait for its buffer.
             return match node.force() {
@@ -761,13 +665,7 @@ impl Graph {
     /// [`Graph::collect`] for the items below item `at` only. A shifted expression is a
     /// sub-program of its own (see [`Flattener::sub`]), so the walk of a program leaves the
     /// source of a shift out when `without_source`.
-    fn collect_kids(
-        &self,
-        at: u32,
-        without_source: bool,
-        members: &mut Vec<u32>,
-        seen: &mut [bool],
-    ) {
+    fn collect_kids(&self, at: u32, without_source: bool, members: &mut Vec<u32>, seen: &mut [bool]) {
         let item = &self.items[at as usize];
         for (index, &kid) in item.kids.iter().enumerate() {
             if kid != NONE && !(without_source && index == 0 && item.shift) {
@@ -779,12 +677,7 @@ impl Graph {
     /// The items of `members` that a shift among them also reads (`direct` tells the members),
     /// except `roots`, with the kind of that shift. Read directly, they take the value of their
     /// sub-program at offset zero instead of computing their expression a second time.
-    fn shifted_members(
-        &self,
-        members: &[u32],
-        direct: &[bool],
-        roots: &[u32],
-    ) -> Vec<(u32, ShiftKind)> {
+    fn shifted_members(&self, members: &[u32], direct: &[bool], roots: &[u32]) -> Vec<(u32, ShiftKind)> {
         let mut shifted: Vec<(u32, ShiftKind)> = Vec::new();
         for &at in members {
             let item = &self.items[at as usize];
@@ -809,22 +702,11 @@ impl Graph {
 /// A shift of the same kind as `kind` by nothing.
 fn zero_shift(kind: ShiftKind) -> ShiftKind {
     match kind {
-        ShiftKind::Dims { dims, .. } => ShiftKind::Dims {
-            dims,
-            shifts: [0; 4],
-        },
+        ShiftKind::Dims { dims, .. } => ShiftKind::Dims { dims, shifts: [0; 4] },
         ShiftKind::Linear => ShiftKind::Linear,
-        ShiftKind::View { map, .. } => ShiftKind::View {
-            map: ViewMap::identity(map.src),
-            edge: Edge::None,
-        },
-        ShiftKind::Take { len } => ShiftKind::View {
-            map: ViewMap::identity([len, 1, 1, 1]),
-            edge: Edge::None,
-        },
-        ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamDims { .. } => {
-            unreachable!("parameterized shifts only exist after flattening")
-        }
+        ShiftKind::View { map, .. } => ShiftKind::View { map: ViewMap::identity(map.src), edge: Edge::None },
+        ShiftKind::Take { len } => ShiftKind::View { map: ViewMap::identity([len, 1, 1, 1]), edge: Edge::None },
+        ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamDims { .. } => unreachable!("parameterized shifts only exist after flattening"),
     }
 }
 
@@ -919,12 +801,7 @@ impl Flattener {
     fn emit(&mut self, g: &Graph, at: u32) -> Result<Ref, Failure> {
         let item = &g.items[at as usize];
         let mut refs = [Ref::Unused; 3];
-        for (index, (slot, arg)) in refs
-            .iter_mut()
-            .zip(&item.args)
-            .enumerate()
-            .take(usize::from(item.arity))
-        {
+        for (index, (slot, arg)) in refs.iter_mut().zip(&item.args).enumerate().take(usize::from(item.arity)) {
             if let Some(record) = &mut self.record {
                 record.cursor = (at, index as u8);
             }
@@ -945,32 +822,20 @@ impl Flattener {
                 Src::Buffer(storage) => self.input(storage, item.tys[index]),
                 // A source evaluated since the members were collected (by another thread, say) is
                 // read as its buffer: `emitted` may hold the instruction that computes it.
-                Src::Node(node)
-                    if item.shift
-                        && index == 0
-                        && let Some(storage) = node.evaluated() =>
-                {
+                Src::Node(node) if item.shift && index == 0 && let Some(storage) = node.evaluated() => {
                     if item.kids[0] != NONE {
                         self.impure();
                     }
                     self.input(storage, item.tys[0])
                 }
-                Src::Node(node)
-                    if item.shift
-                        && index == 0
-                        && node.is_pending()
-                        && !self.is_boundary(Arc::as_ptr(node)) =>
-                {
+                Src::Node(node) if item.shift && index == 0 && node.is_pending() && !self.is_boundary(Arc::as_ptr(node)) => {
                     self.sub(g, item.kids[0], node)?
                 }
                 Src::Node(node) => self.node_operand(g, item.kids[index], node, item.tys[index])?,
             };
         }
         let value = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
-        self.instrs.push(Instr {
-            op: item.node.op,
-            args: refs,
-        });
+        self.instrs.push(Instr { op: item.node.op, args: refs });
         Ok(Ref::Tmp(value))
     }
 
@@ -979,9 +844,7 @@ impl Flattener {
     /// the program.
     fn sub(&mut self, g: &Graph, kid: u32, node: &Arc<Node>) -> Result<Ref, Failure> {
         if self.trace {
-            return Err(Failure::New(LumaError::Gpu(
-                "traced step shifts an unevaluated expression".into(),
-            )));
+            return Err(Failure::New(LumaError::Gpu("traced step shifts an unevaluated expression".into())));
         }
         if let Some(&done) = self.sub_of.get(kid as usize)
             && done != NONE
@@ -1020,8 +883,7 @@ impl Flattener {
                 }
             }
         }
-        let outer_instrs =
-            std::mem::replace(&mut self.instrs, Vec::with_capacity(members.len() + 1));
+        let outer_instrs = std::mem::replace(&mut self.instrs, Vec::with_capacity(members.len() + 1));
         let outer_emitted = std::mem::replace(&mut self.emitted, vec![Ref::Unused; n]);
         let result = (|| {
             for &at in &members {
@@ -1048,11 +910,7 @@ impl Flattener {
     fn scalar(&mut self, scalar: &Scalar) -> Ref {
         let at = u32::try_from(self.scalars.len()).unwrap_or(u32::MAX);
         // The uniform has `f32` fields: a wide scalar takes several (see `Scalar::words`).
-        let slot_ty = if scalar.ty.slots() == 1 {
-            scalar.ty
-        } else {
-            ElemTy::F32
-        };
+        let slot_ty = if scalar.ty.slots() == 1 { scalar.ty } else { ElemTy::F32 };
         for &word in scalar.words().iter().take(scalar.ty.slots()) {
             self.scalar_tys.push(slot_ty);
             self.scalars.push(word);
@@ -1070,13 +928,7 @@ impl Flattener {
 
     /// Where the pending node operand `node` (item `kid` if it was pending when the graph was
     /// read) of an instruction lives.
-    fn node_operand(
-        &mut self,
-        g: &Graph,
-        kid: u32,
-        node: &Arc<Node>,
-        ty: ElemTy,
-    ) -> Result<Ref, Failure> {
+    fn node_operand(&mut self, g: &Graph, kid: u32, node: &Arc<Node>, ty: ElemTy) -> Result<Ref, Failure> {
         if kid != NONE {
             if let Some(&found) = self.emitted.get(kid as usize)
                 && found != Ref::Unused
@@ -1091,17 +943,11 @@ impl Flattener {
                 return self.unshifted(g, kid, kind);
             }
             self.impure();
-        } else if let Some(&(_, found)) = self
-            .boundary
-            .iter()
-            .find(|&&(known, _)| known == Arc::as_ptr(node))
-        {
+        } else if let Some(&(_, found)) = self.boundary.iter().find(|&&(known, _)| known == Arc::as_ptr(node)) {
             return Ok(found);
         }
         if self.trace && node.is_pending() {
-            return Err(Failure::New(LumaError::Gpu(
-                "traced step reads an unevaluated node".into(),
-            )));
+            return Err(Failure::New(LumaError::Gpu("traced step reads an unevaluated node".into())));
         }
         if node.evaluated().is_none() {
             self.impure();
@@ -1117,32 +963,17 @@ impl Flattener {
         let node = &g.items[kid as usize].node;
         let sub = self.sub(g, kid, node)?;
         let (amount, total) = match kind {
-            ShiftKind::Linear => (
-                self.constant(Scalar::u32(0)),
-                self.constant(Scalar::u32(node.len() as u32)),
-            ),
-            ShiftKind::Dims { .. }
-            | ShiftKind::ParamDims { .. }
-            | ShiftKind::View { .. }
-            | ShiftKind::ParamView { .. }
-            | ShiftKind::Take { .. }
-            | ShiftKind::ParamTake { .. } => (Ref::Unused, Ref::Unused),
+            ShiftKind::Linear => (self.constant(Scalar::u32(0)), self.constant(Scalar::u32(node.len() as u32))),
+            ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } => (Ref::Unused, Ref::Unused),
         };
         let value = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
-        self.instrs.push(Instr {
-            op: Op::new(OpKind::Shift(kind), node.op().out_ty()),
-            args: [sub, amount, total],
-        });
+        self.instrs.push(Instr { op: Op::new(OpKind::Shift(kind), node.op().out_ty()), args: [sub, amount, total] });
         self.mark(kid, Ref::Tmp(value));
         Ok(Ref::Tmp(value))
     }
 
     fn input(&mut self, storage: &Arc<Storage>, ty: ElemTy) -> Ref {
-        let at = match self
-            .inputs
-            .iter()
-            .position(|known| Arc::ptr_eq(known, storage))
-        {
+        let at = match self.inputs.iter().position(|known| Arc::ptr_eq(known, storage)) {
             Some(at) => at,
             None => {
                 self.inputs.push(Arc::clone(storage));
@@ -1160,17 +991,8 @@ impl Flattener {
         // The guard is a uniform that only the arithmetic of the library reads (`luma_o`): only
         // programs that run it get one, because a kernel whose uniform no code reads would not
         // bind it (see `reads_guard`).
-        let reduces_df = matches!(tail, Tail::Reduce(_))
-            && self
-                .instrs
-                .last()
-                .is_some_and(|instr| instr.op.out_ty() == ElemTy::Df32);
-        let guard = (reduces_df
-            || self
-                .instrs
-                .iter()
-                .chain(self.subs.iter().flatten())
-                .any(reads_guard))
+        let reduces_df = matches!(tail, Tail::Reduce(_)) && self.instrs.last().is_some_and(|instr| instr.op.out_ty() == ElemTy::Df32);
+        let guard = (reduces_df || self.instrs.iter().chain(self.subs.iter().flatten()).any(reads_guard))
         .then(|| {
             self.scalar_tys.push(ElemTy::U32);
             self.scalars.push(0);
@@ -1279,12 +1101,7 @@ impl Plain {
     }
 
     fn buffer(&self, storage: &Arc<Storage>) -> Resolved {
-        match self
-            .flat
-            .inputs
-            .iter()
-            .position(|known| Arc::ptr_eq(known, storage))
-        {
+        match self.flat.inputs.iter().position(|known| Arc::ptr_eq(known, storage)) {
             Some(at) => Resolved::Input(at as u32),
             None => Resolved::Buffer(Arc::clone(storage)),
         }
@@ -1292,20 +1109,11 @@ impl Plain {
 
     /// What the operands of `node` are: those `given`, else its own. `None` if it has none (another
     /// thread is evaluating it). Looks under its lock and takes nothing but references out.
-    fn operands(
-        &self,
-        node: &Node,
-        given: Option<&Args>,
-    ) -> Result<Option<[Resolved; 3]>, Abandoned> {
+    fn operands(&self, node: &Node, given: Option<&Args>) -> Result<Option<[Resolved; 3]>, Abandoned> {
         let op = node.op();
         let resolve_all = |args: &Args| {
             let mut operands = [Resolved::Unused, Resolved::Unused, Resolved::Unused];
-            for (index, (slot, arg)) in operands
-                .iter_mut()
-                .zip(args)
-                .enumerate()
-                .take(op.kind.arity())
-            {
+            for (index, (slot, arg)) in operands.iter_mut().zip(args).enumerate().take(op.kind.arity()) {
                 *slot = self.resolve(arg, index == 0 && matches!(op.kind, OpKind::Shift(_)))?;
             }
             Ok(Some(operands))
@@ -1343,30 +1151,17 @@ impl Plain {
     }
 
     /// Appends the instruction of `node`, whose operands are all emitted (`member`: keep the node).
-    fn emit(
-        &mut self,
-        node: Arc<Node>,
-        operands: &[Resolved; 3],
-        member: bool,
-    ) -> Result<Resolved, Abandoned> {
+    fn emit(&mut self, node: Arc<Node>, operands: &[Resolved; 3], member: bool) -> Result<Resolved, Abandoned> {
         let op = node.op();
         let mut refs = [Ref::Unused; 3];
-        for (index, (slot, operand)) in refs
-            .iter_mut()
-            .zip(operands)
-            .enumerate()
-            .take(op.kind.arity())
-        {
+        for (index, (slot, operand)) in refs.iter_mut().zip(operands).enumerate().take(op.kind.arity()) {
             let ty = op.operand_ty(index);
             *slot = match operand {
                 Resolved::Scalar(scalar) => self.flat.scalar(scalar),
                 Resolved::Buffer(storage) => self.flat.input(storage, ty),
                 Resolved::Input(at) => Ref::Input(*at),
                 Resolved::Tmp(at) => {
-                    let repeated = operands
-                        .iter()
-                        .take(index)
-                        .any(|earlier| matches!(earlier, Resolved::Tmp(k) if k == at));
+                    let repeated = operands.iter().take(index).any(|earlier| matches!(earlier, Resolved::Tmp(k) if k == at));
                     if !repeated && let Some(count) = self.readers.get_mut(*at as usize) {
                         *count += 1;
                     }
@@ -1391,13 +1186,7 @@ impl Plain {
 fn note_shared(root: &Arc<Node>, shared: &[Arc<Node>]) {
     let jit = root.context().jit();
     for node in shared {
-        jit.note_split(
-            node.name,
-            node.location,
-            SplitReason::Shared {
-                weight: node.weight() as usize,
-            },
-        );
+        jit.note_split(node.name, node.location, SplitReason::Shared { weight: node.weight() as usize });
     }
 }
 
@@ -1406,19 +1195,8 @@ fn note_shared(root: &Arc<Node>, shared: &[Arc<Node>]) {
 /// them shared are evaluated: they are then computed inside those kernels, once, instead of in
 /// kernels of their own that nothing is left to read.
 fn outermost(shared: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
-    let outer: Vec<bool> = shared
-        .iter()
-        .map(|node| {
-            !shared
-                .iter()
-                .any(|other| !Arc::ptr_eq(other, node) && other.below_contains(node.id))
-        })
-        .collect();
-    shared
-        .into_iter()
-        .zip(outer)
-        .filter_map(|(node, outer)| outer.then_some(node))
-        .collect()
+    let outer: Vec<bool> = shared.iter().map(|node| !shared.iter().any(|other| !Arc::ptr_eq(other, node) && other.below_contains(node.id))).collect();
+    shared.into_iter().zip(outer).filter_map(|(node, outer)| outer.then_some(node)).collect()
 }
 
 /// `shared` and the pending nodes among `candidates` that are its siblings: of the same length,
@@ -1430,11 +1208,7 @@ fn outermost(shared: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
 /// node evaluated alone would leave everything its siblings share with it with readers outside
 /// its own expression, and each such node would be evaluated first on its own, level by level;
 /// evaluated together they are one kernel.
-fn with_siblings<'a>(
-    shared: Vec<Arc<Node>>,
-    candidates: impl Iterator<Item = &'a Arc<Node>> + Clone,
-    inside: impl Fn(*const Node) -> bool,
-) -> Vec<Arc<Node>> {
+fn with_siblings<'a>(shared: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'a Arc<Node>> + Clone, inside: impl Fn(*const Node) -> bool) -> Vec<Arc<Node>> {
     let mut forced = shared.clone();
     for node in &shared {
         let below = node.below_vec();
@@ -1464,26 +1238,17 @@ fn with_siblings<'a>(
 /// that kernel read too. Evaluated on their own first, each would be a kernel of its own before
 /// the group's, and what they read that others outside read too a kernel before it, level by
 /// level; as outputs of the group's kernel they cost one more store each.
-fn with_read_below<'a>(
-    group: Vec<Arc<Node>>,
-    candidates: impl Iterator<Item = &'a Arc<Node>>,
-) -> Vec<Arc<Node>> {
+fn with_read_below<'a>(group: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'a Arc<Node>>) -> Vec<Arc<Node>> {
     let mut forced = group.clone();
     for other in candidates {
         if other.is_pending()
             && !forced.iter().any(|known| Arc::ptr_eq(known, other))
-            && group
-                .iter()
-                .any(|node| node.len() == other.len() && node.below_contains(other.id))
+            && group.iter().any(|node| node.len() == other.len() && node.below_contains(other.id))
             && super::worth_storing(other)
             && other.consumers.load(Ordering::Relaxed) >= 2
             && !other.inputs().is_empty()
             && other.readers.any_pending(|weak| {
-                weak.upgrade().is_some_and(|reader| {
-                    !group
-                        .iter()
-                        .any(|node| node.id == reader.id || node.below_contains(reader.id))
-                })
+                weak.upgrade().is_some_and(|reader| !group.iter().any(|node| node.id == reader.id || node.below_contains(reader.id)))
             })
         {
             forced.push(Arc::clone(other));
@@ -1496,19 +1261,10 @@ fn with_read_below<'a>(
 /// the program over them reading more buffers than a kernel binds. Each evaluated node is a
 /// buffer it reads (besides those it reads below it when others read them too): past the limit
 /// the shared nodes are recomputed in the program instead, which is a result just as right.
-fn evaluation_fits<'a>(
-    roots: impl Iterator<Item = (&'a Arc<Node>, &'a Args)> + Clone,
-    shared: &[Arc<Node>],
-) -> bool {
-    let Some((first, _)) = roots.clone().next() else {
-        return true;
-    };
-    let operands: Vec<Src> = roots
-        .clone()
-        .flat_map(|(root, args)| args.iter().take(root.op().kind.arity()).cloned())
-        .collect();
-    super::count_inputs(&operands, shared).len() + roots.count()
-        <= first.context().jit().max_inputs() + 1
+fn evaluation_fits<'a>(roots: impl Iterator<Item = (&'a Arc<Node>, &'a Args)> + Clone, shared: &[Arc<Node>]) -> bool {
+    let Some((first, _)) = roots.clone().next() else { return true };
+    let operands: Vec<Src> = roots.clone().flat_map(|(root, args)| args.iter().take(root.op().kind.arity()).cloned()).collect();
+    super::count_inputs(&operands, shared).len() + roots.count() <= first.context().jit().max_inputs() + 1
 }
 
 /// [`flatten_inner`] for one root without shifted sub-expressions, in one walk (see [`Plain`]).
@@ -1519,20 +1275,11 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
         let outcome = plain.visit(Arc::clone(root), Some(args));
         match outcome {
             Ok(Resolved::Tmp(_)) => {}
-            Ok(_) => {
-                return Err(Failure::New(LumaError::Gpu(
-                    "fused root without an instruction".into(),
-                )));
-            }
+            Ok(_) => return Err(Failure::New(LumaError::Gpu("fused root without an instruction".into()))),
             Err(Abandoned::Failed(failure)) => return Err(failure),
             Err(Abandoned::Shift) => return Ok(None),
         }
-        let Plain {
-            mut flat,
-            seen,
-            members,
-            readers,
-        } = plain;
+        let Plain { mut flat, seen, members, readers } = plain;
         // A node that something outside also reads is evaluated first instead of being
         // recomputed by both. Most have all their readers inside, which is known without
         // looking at them.
@@ -1546,20 +1293,13 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
             })
             .map(|(member, _)| Arc::clone(member))
             .collect();
-        if !shared.is_empty()
-            && !is_alone(root)
-            && evaluation_fits(std::iter::once((root, args)), &shared)
-        {
+        if !shared.is_empty() && !is_alone(root) && evaluation_fits(std::iter::once((root, args)), &shared) {
             note_shared(root, &shared);
             force_group(&shared)?;
             continue;
         }
         let outputs = vec![u32::try_from(flat.instrs.len() - 1).unwrap_or(u32::MAX)];
-        flat.instr_nodes = members
-            .iter()
-            .map(|member| Some(Arc::clone(member)))
-            .chain(Some(Some(Arc::clone(root))))
-            .collect();
+        flat.instr_nodes = members.iter().map(|member| Some(Arc::clone(member))).chain(Some(Some(Arc::clone(root)))).collect();
         flat.fused_nodes = members;
         if tail.consumes_roots() {
             flat.fused_nodes.push(Arc::clone(root));
@@ -1650,10 +1390,7 @@ fn flatten_unpacked(
         if let Some((first, _)) = roots.first() {
             first.context().jit().intern(&mut fused.key);
         }
-        let Some((first, _)) = roots
-            .first()
-            .filter(|_| probes.is_empty() && !fused.key.subs.is_empty())
-        else {
+        let Some((first, _)) = roots.first().filter(|_| probes.is_empty() && !fused.key.subs.is_empty()) else {
             return Ok(fused);
         };
         let ctx = first.context();
@@ -1675,10 +1412,7 @@ fn flatten_unpacked(
             match &*judgement {
                 Judgement::Materialise { subs, reason } => {
                     jit.note_split(first.name, first.location, *reason);
-                    let nodes: Vec<Arc<Node>> = subs
-                        .iter()
-                        .filter_map(|&sub| fused.sub_roots.get(sub as usize).cloned())
-                        .collect();
+                    let nodes: Vec<Arc<Node>> = subs.iter().filter_map(|&sub| fused.sub_roots.get(sub as usize).cloned()).collect();
                     drop(fused);
                     // A cut forced by the instruction cap takes along the live arrays that
                     // share work with the expression; one the cost model chose is priced as
@@ -1688,8 +1422,7 @@ fn flatten_unpacked(
                     // work with it include everything built on top of the expression being
                     // evaluated, and evaluating those first evaluates the program in pieces,
                     // each of which is cut again.
-                    let forced =
-                        matches!(reason, SplitReason::Inlined { .. }) && !flattening.nested();
+                    let forced = matches!(reason, SplitReason::Inlined { .. }) && !flattening.nested();
                     match nodes.as_slice() {
                         [] => {}
                         [node] if !forced => force_alone(node)?,
@@ -1716,7 +1449,11 @@ fn flatten_unpacked(
 }
 
 /// Flattens `roots` once (see [`flatten`]).
-fn flatten_once(roots: &[(Arc<Node>, Args)], tail: Tail, probes: &[u64]) -> Result<Fused, Failure> {
+fn flatten_once(
+    roots: &[(Arc<Node>, Args)],
+    tail: Tail,
+    probes: &[u64],
+) -> Result<Fused, Failure> {
     if let [(root, args)] = roots
         && probes.is_empty()
         && root.shift_depth() == 0
@@ -1728,16 +1465,8 @@ fn flatten_once(roots: &[(Arc<Node>, Args)], tail: Tail, probes: &[u64]) -> Resu
     let (graph, root_at, passes, signature) = loop {
         // Every pending node below the roots is read once, here: the walks below only follow
         // indices (see [`Graph`]).
-        let mut graph = Graph::new(
-            roots.iter().map(|(root, _)| root),
-            false,
-            Vec::new(),
-            probes,
-        );
-        let added: Vec<(u32, bool)> = roots
-            .iter()
-            .map(|(root, args)| graph.add_root(root, args.clone()))
-            .collect();
+        let mut graph = Graph::new(roots.iter().map(|(root, _)| root), false, Vec::new(), probes);
+        let added: Vec<(u32, bool)> = roots.iter().map(|(root, args)| graph.add_root(root, args.clone())).collect();
         for &(at, new) in &added {
             if new {
                 graph.link_root(at)?;
@@ -1750,11 +1479,7 @@ fn flatten_once(roots: &[(Arc<Node>, Args)], tail: Tail, probes: &[u64]) -> Resu
         // readers there, which counting tells without looking at them; only if one may not, the
         // nodes of each program are told apart (below).
         let alone = matches!(roots, [(root, _)] if is_alone(root));
-        let root_count = root_at
-            .iter()
-            .copied()
-            .max()
-            .map_or(0, |last| last as usize + 1);
+        let root_count = root_at.iter().copied().max().map_or(0, |last| last as usize + 1);
         let mut readers = vec![0u32; n];
         for item in &graph.items {
             for (slot, &kid) in item.kids.iter().enumerate() {
@@ -1766,27 +1491,17 @@ fn flatten_once(roots: &[(Arc<Node>, Args)], tail: Tail, probes: &[u64]) -> Resu
         let by_address_map = std::cell::OnceCell::new();
         let by_address = || by_address_map.get_or_init(|| graph.by_address());
         let in_graph = |ptr: *const Node| by_address().contains_key(&ptr);
-        let may_share = graph
-            .items
-            .iter()
-            .enumerate()
-            .skip(root_count)
-            .any(|(at, item)| {
-                let node = &item.node;
-                (node.requested.load(Ordering::Relaxed) && node.is_pending())
-                    || (!alone
-                        && node.consumers.load(Ordering::Relaxed) > readers[at]
-                        && super::worth_storing(node)
-                        && node.has_consumer_outside(in_graph))
-            });
+        let may_share = graph.items.iter().enumerate().skip(root_count).any(|(at, item)| {
+            let node = &item.node;
+            (node.requested.load(Ordering::Relaxed) && node.is_pending())
+                || (!alone && node.consumers.load(Ordering::Relaxed) > readers[at] && super::worth_storing(node) && node.has_consumer_outside(in_graph))
+        });
         if !may_share {
             // The program of a graph of the same shape as one flattened before is that program
             // over the buffers and scalars of this one.
             let signature = jit.and_then(|_| graph.signature(&root_at, tail));
             if let (Some(jit), Some(signature)) = (jit, &signature)
-                && let Some(fused) = jit
-                    .recipe(signature)
-                    .and_then(|recipe| recipe.instantiate(&graph, tail))
+                && let Some(fused) = jit.recipe(signature).and_then(|recipe| recipe.instantiate(&graph, tail))
             {
                 #[cfg(any(test, debug_assertions))]
                 verify_recipe(&graph, &root_at, tail, &fused)?;
@@ -1824,11 +1539,7 @@ fn flatten_once(roots: &[(Arc<Node>, Args)], tail: Tail, probes: &[u64]) -> Resu
             }
         }
         let all_seen = with_subs.as_ref().unwrap_or(&passes.seen);
-        let inside = |ptr: *const Node| {
-            by_address()
-                .get(&ptr)
-                .is_some_and(|&at| all_seen[at as usize])
-        };
+        let inside = |ptr: *const Node| by_address().get(&ptr).is_some_and(|&at| all_seen[at as usize]);
         let is_root = |at: u32| root_at.contains(&at);
         // A node that `eval` asked for (and whose evaluation was postponed) is computed on its
         // own once anyway: read inside a sub-program, it would be recomputed at every instance.
@@ -1841,70 +1552,36 @@ fn flatten_once(roots: &[(Arc<Node>, Args)], tail: Tail, probes: &[u64]) -> Resu
             .iter()
             .chain(&sub_members)
             .copied()
-            .filter(|&at| {
-                !alone
-                    && !is_root(at)
-                    && super::worth_storing(&graph.items[at as usize].node)
-                    && graph.items[at as usize].node.has_consumer_outside(inside)
-            })
+            .filter(|&at| !alone && !is_root(at) && super::worth_storing(&graph.items[at as usize].node) && graph.items[at as usize].node.has_consumer_outside(inside))
             .collect();
         let shared: Vec<Arc<Node>> = graph
             .to_store(&read_outside)
             .into_iter()
-            .chain(
-                sub_members
-                    .iter()
-                    .copied()
-                    .filter(|&at| !is_root(at) && requested(at)),
-            )
+            .chain(sub_members.iter().copied().filter(|&at| !is_root(at) && requested(at)))
             .map(|at| Arc::clone(&graph.items[at as usize].node))
             .collect();
         if shared.is_empty() {
             break (graph, root_at, passes, None);
         }
         let shared = outermost(shared);
-        if shared
-            .iter()
-            .any(|node| probes.iter().any(|&id| node.depends_on(id)))
-        {
-            return Err(Failure::New(LumaError::Gpu(
-                "stencil probe shared outside step".into(),
-            )));
+        if shared.iter().any(|node| probes.iter().any(|&id| node.depends_on(id))) {
+            return Err(Failure::New(LumaError::Gpu("stencil probe shared outside step".into())));
         }
         if !evaluation_fits(roots.iter().map(|(root, args)| (root, args)), &shared) {
             break (graph, root_at, passes, None);
         }
-        let candidates = passes
-            .members
-            .iter()
-            .chain(&sub_members)
-            .filter(|&&at| !is_root(at))
-            .map(|&at| &graph.items[at as usize].node);
+        let candidates = passes.members.iter().chain(&sub_members).filter(|&&at| !is_root(at)).map(|&at| &graph.items[at as usize].node);
         // Requested nodes are cut too, but only the ones that pending operations outside the
         // kernel read are shared.
         if let Some((root, _)) = roots.first() {
-            let read_outside: Vec<Arc<Node>> = shared
-                .iter()
-                .filter(|node| node.has_consumer_outside(inside))
-                .cloned()
-                .collect();
+            let read_outside: Vec<Arc<Node>> = shared.iter().filter(|node| node.has_consumer_outside(inside)).cloned().collect();
             note_shared(root, &read_outside);
         }
-        let forced = with_read_below(
-            with_siblings(shared, candidates.clone(), inside),
-            candidates,
-        );
+        let forced = with_read_below(with_siblings(shared, candidates.clone(), inside), candidates);
         force_group(&forced)?;
     };
 
-    let (mut fused, recorded) = emit_program(
-        &graph,
-        &root_at,
-        &passes.members,
-        passes.shifted,
-        tail,
-        signature.is_some(),
-    )?;
+    let (mut fused, recorded) = emit_program(&graph, &root_at, &passes.members, passes.shifted, tail, signature.is_some())?;
     if let (Some(jit), Some(signature), Some(recorded)) = (jit, signature, recorded)
         && !recorded.record.impure
     {
@@ -1958,19 +1635,10 @@ impl Graph {
             for &(at, _) in &shifted {
                 is_target[at as usize] = true;
             }
-            targets = members
-                .iter()
-                .copied()
-                .filter(|&at| is_target[at as usize])
-                .collect();
+            targets = members.iter().copied().filter(|&at| is_target[at as usize]).collect();
             (members, seen) = gather(&shifted);
         }
-        Passes {
-            members,
-            seen,
-            shifted,
-            targets,
-        }
+        Passes { members, seen, shifted, targets }
     }
 }
 
@@ -1993,20 +1661,12 @@ impl Graph {
         // A node reads nodes of fewer nodes below them: ascending size is operands first.
         let mut order: Vec<u32> = (0..self.items.len() as u32).collect();
         order.sort_by_key(|&at| self.items[at as usize].node.size());
-        let cost = self.items[candidates[0] as usize]
-            .node
-            .context()
-            .cost_model();
+        let cost = self.items[candidates[0] as usize].node.context().cost_model();
         let mut weight = vec![0.0f64; self.items.len()];
         let mut stored = Vec::new();
         for &at in &order {
             let item = &self.items[at as usize];
-            let operands: f64 = item
-                .kids
-                .iter()
-                .filter(|&&kid| kid != NONE)
-                .map(|&kid| weight[kid as usize])
-                .sum();
+            let operands: f64 = item.kids.iter().filter(|&&kid| kid != NONE).map(|&kid| weight[kid as usize]).sum();
             let own = (cost::op_weight(item.node.op(), &cost) + operands).min(item.node.weight());
             weight[at as usize] = own;
             if is_candidate[at as usize] && super::worth_storing_at(&item.node, own) {
@@ -2015,11 +1675,7 @@ impl Graph {
             }
         }
         // The caller's order (operands before the nodes that read them) is kept.
-        candidates
-            .iter()
-            .copied()
-            .filter(|at| stored.contains(at))
-            .collect()
+        candidates.iter().copied().filter(|at| stored.contains(at)).collect()
     }
 }
 
@@ -2073,11 +1729,7 @@ fn emit_program(
     for &at in root_at {
         match flattener.emitted.get(at as usize) {
             Some(Ref::Tmp(value)) => outputs.push(*value),
-            _ => {
-                return Err(Failure::New(LumaError::Gpu(
-                    "fused root without an instruction".into(),
-                )));
-            }
+            _ => return Err(Failure::New(LumaError::Gpu("fused root without an instruction".into()))),
         }
     }
     let mut fused_items = std::mem::take(&mut flattener.fused_items);
@@ -2090,21 +1742,10 @@ fn emit_program(
     let node = |at: u32| Arc::clone(&graph.items[at as usize].node);
     flattener.fused_nodes = fused_items.iter().map(|&at| node(at)).collect();
     flattener.sub_roots = sub_root_items.iter().map(|&at| node(at)).collect();
-    flattener.instr_nodes = instr_items
-        .iter()
-        .map(|&at| (at != NONE).then(|| node(at)))
-        .collect();
+    flattener.instr_nodes = instr_items.iter().map(|&at| (at != NONE).then(|| node(at))).collect();
     let record = flattener.record.take();
     let fused = flattener.finish(tail, outputs);
-    Ok((
-        fused,
-        record.map(|record| Recorded {
-            record,
-            fused_items,
-            instr_items,
-            sub_root_items,
-        }),
-    ))
+    Ok((fused, record.map(|record| Recorded { record, fused_items, instr_items, sub_root_items })))
 }
 
 /// Where an operand of a graph stands in the program built from it, by what that program
@@ -2154,25 +1795,17 @@ impl Graph {
         let mut buffers: Vec<*const Storage> = Vec::new();
         let mut canon = |storage: &Arc<Storage>| -> u32 {
             let ptr = Arc::as_ptr(storage);
-            let at = buffers
-                .iter()
-                .position(|&known| known == ptr)
-                .unwrap_or_else(|| {
-                    buffers.push(ptr);
-                    buffers.len() - 1
-                });
+            let at = buffers.iter().position(|&known| known == ptr).unwrap_or_else(|| {
+                buffers.push(ptr);
+                buffers.len() - 1
+            });
             u32::try_from(at).unwrap_or(u32::MAX)
         };
         let mut hasher = crate::gpu::hash::FxHasher::default();
         let mut items = Vec::with_capacity(self.items.len());
         for item in &self.items {
             let mut args = [ArgSig::Unused; 3];
-            for (index, (slot, arg)) in args
-                .iter_mut()
-                .zip(&item.args)
-                .enumerate()
-                .take(usize::from(item.arity))
-            {
+            for (index, (slot, arg)) in args.iter_mut().zip(&item.args).enumerate().take(usize::from(item.arity)) {
                 *slot = match (arg, item.kids[index]) {
                     (Src::Scalar(scalar), _) => ArgSig::Scalar(scalar.ty),
                     (Src::Buffer(storage), _) => ArgSig::Input(canon(storage)),
@@ -2190,12 +1823,7 @@ impl Graph {
         }
         root_at.hash(&mut hasher);
         tail.hash(&mut hasher);
-        Some(Signature {
-            hash: hasher.finish(),
-            items,
-            roots: root_at.to_vec(),
-            tail,
-        })
+        Some(Signature { hash: hasher.finish(), items, roots: root_at.to_vec(), tail })
     }
 }
 
@@ -2221,12 +1849,7 @@ pub(super) struct Recipe {
 
 impl Recipe {
     fn new(sig: Signature, fused: &Fused, recorded: Recorded) -> Option<Recipe> {
-        let Recorded {
-            record,
-            fused_items,
-            instr_items,
-            sub_root_items,
-        } = recorded;
+        let Recorded { record, fused_items, instr_items, sub_root_items } = recorded;
         (record.inputs.len() == fused.inputs.len()).then(|| Recipe {
             sig,
             instrs: Arc::clone(&fused.key.instrs),
@@ -2248,12 +1871,7 @@ impl Recipe {
     /// signature. `None` if the graph does not have what the program reads (a node that is not
     /// evaluated any more).
     fn instantiate(&self, graph: &Graph, tail: Tail) -> Option<Fused> {
-        let operand = |item: u32, slot: u8| {
-            graph
-                .items
-                .get(item as usize)
-                .and_then(|item| item.args.get(usize::from(slot)))
-        };
+        let operand = |item: u32, slot: u8| graph.items.get(item as usize).and_then(|item| item.args.get(usize::from(slot)));
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for &(item, slot) in &self.inputs {
             inputs.push(match operand(item, slot)? {
@@ -2279,25 +1897,11 @@ impl Recipe {
         if scalars.len() != self.scalar_tys.len() {
             return None;
         }
-        let node = |at: u32| {
-            graph
-                .items
-                .get(at as usize)
-                .map(|item| Arc::clone(&item.node))
-        };
+        let node = |at: u32| graph.items.get(at as usize).map(|item| Arc::clone(&item.node));
         let fused_nodes: Option<Vec<Arc<Node>>> = self.fused.iter().map(|&at| node(at)).collect();
         let sub_roots: Option<Vec<Arc<Node>>> = self.sub_roots.iter().map(|&at| node(at)).collect();
-        let instr_nodes: Option<Vec<Option<Arc<Node>>>> = self
-            .instr_items
-            .iter()
-            .map(|&at| {
-                if at == NONE {
-                    Some(None)
-                } else {
-                    node(at).map(Some)
-                }
-            })
-            .collect();
+        let instr_nodes: Option<Vec<Option<Arc<Node>>>> =
+            self.instr_items.iter().map(|&at| if at == NONE { Some(None) } else { node(at).map(Some) }).collect();
         Some(Fused {
             key: FusedKey {
                 shape: self.shape,
@@ -2334,12 +1938,7 @@ pub(super) struct RecipeTable {
 
 impl std::fmt::Debug for RecipeTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "RecipeTable({} signatures, {} items)",
-            self.map.len(),
-            self.items
-        )
+        write!(f, "RecipeTable({} signatures, {} items)", self.map.len(), self.items)
     }
 }
 
@@ -2350,9 +1949,7 @@ impl JitState {
     /// The recipe whose signature is `signature`, if one was kept.
     fn recipe(&self, signature: &Signature) -> Option<Arc<Recipe>> {
         let candidates = lock(&self.recipes).map.get(&signature.hash)?.clone();
-        let found = candidates
-            .into_iter()
-            .find(|recipe| recipe.sig == *signature);
+        let found = candidates.into_iter().find(|recipe| recipe.sig == *signature);
         #[cfg(test)]
         if found.is_some() {
             self.recipe_hits.fetch_add(1, Ordering::Relaxed);
@@ -2367,11 +1964,7 @@ impl JitState {
             table.items = 0;
         }
         table.items += recipe.sig.items.len();
-        table
-            .map
-            .entry(recipe.sig.hash)
-            .or_default()
-            .push(Arc::new(recipe));
+        table.map.entry(recipe.sig.hash).or_default().push(Arc::new(recipe));
     }
 }
 
@@ -2380,25 +1973,14 @@ impl JitState {
 fn verify_recipe(graph: &Graph, root_at: &[u32], tail: Tail, fast: &Fused) -> Result<(), Failure> {
     let passes = graph.passes(root_at);
     let (slow, _) = emit_program(graph, root_at, &passes.members, passes.shifted, tail, false)?;
-    let same_nodes = |a: &[Arc<Node>], b: &[Arc<Node>]| {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y))
-    };
-    let same_inputs = fast.inputs.len() == slow.inputs.len()
-        && fast
-            .inputs
-            .iter()
-            .zip(&slow.inputs)
-            .all(|(x, y)| Arc::ptr_eq(x, y));
+    let same_nodes = |a: &[Arc<Node>], b: &[Arc<Node>]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y));
+    let same_inputs = fast.inputs.len() == slow.inputs.len() && fast.inputs.iter().zip(&slow.inputs).all(|(x, y)| Arc::ptr_eq(x, y));
     let same_instr_nodes = fast.instr_nodes.len() == slow.instr_nodes.len()
-        && fast
-            .instr_nodes
-            .iter()
-            .zip(&slow.instr_nodes)
-            .all(|(x, y)| match (x, y) {
-                (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-                (None, None) => true,
-                _ => false,
-            });
+        && fast.instr_nodes.iter().zip(&slow.instr_nodes).all(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+            (None, None) => true,
+            _ => false,
+        });
     assert!(
         fast.key == slow.key
             && fast.scalars == slow.scalars
@@ -2433,10 +2015,7 @@ pub(super) struct Traced {
 /// root twice or a root that is a state, or leave a state unread.
 pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail) -> Option<Traced> {
     let ctx = roots.first()?.context();
-    let mut flat = Flattener {
-        trace: true,
-        ..Flattener::default()
-    };
+    let mut flat = Flattener { trace: true, ..Flattener::default() };
     for (j, state) in states.iter().enumerate() {
         let (storage, node) = match state {
             StateRef::Buffer(storage) => (Arc::clone(storage), None),
@@ -2444,10 +2023,7 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
                 Some(Ok(storage)) => (Arc::clone(storage), Some(node)),
                 Some(Err(_)) => return None,
                 // Nothing is allocated for it unless something pins it.
-                None => (
-                    Arc::new(Storage::new(ctx, node.len(), ElemTy::F32.layout())),
-                    Some(node),
-                ),
+                None => (Arc::new(Storage::new(ctx, node.len(), ElemTy::F32.layout())), Some(node)),
             },
         };
         let at = flat.input(&storage, ElemTy::F32);
@@ -2459,18 +2035,12 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
         }
     }
     if roots.iter().enumerate().any(|(i, root)| {
-        flat.is_boundary(Arc::as_ptr(root))
-            || roots[..i].iter().any(|other| Arc::ptr_eq(other, root))
+        flat.is_boundary(Arc::as_ptr(root)) || roots[..i].iter().any(|other| Arc::ptr_eq(other, root))
     }) {
         return None;
     }
 
-    let mut graph = Graph::new(
-        roots.iter(),
-        true,
-        flat.boundary.iter().map(|&(ptr, _)| ptr).collect(),
-        &[],
-    );
+    let mut graph = Graph::new(roots.iter(), true, flat.boundary.iter().map(|&(ptr, _)| ptr).collect(), &[]);
     let mut root_at = Vec::with_capacity(roots.len());
     for root in roots {
         if !root.is_pending() {
@@ -2495,15 +2065,9 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
     }
     let by_address_map = std::cell::OnceCell::new();
     let inside = |ptr: *const Node| {
-        flat.is_boundary(ptr)
-            || by_address_map
-                .get_or_init(|| graph.by_address())
-                .get(&ptr)
-                .is_some_and(|&at| seen[at as usize])
+        flat.is_boundary(ptr) || by_address_map.get_or_init(|| graph.by_address()).get(&ptr).is_some_and(|&at| seen[at as usize])
     };
-    if members.iter().any(|&at| {
-        !root_at.contains(&at) && graph.items[at as usize].node.has_consumer_outside(inside)
-    }) {
+    if members.iter().any(|&at| !root_at.contains(&at) && graph.items[at as usize].node.has_consumer_outside(inside)) {
         return None;
     }
 
@@ -2522,20 +2086,13 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
             _ => return None,
         }
     }
-    let read = |j: usize| {
-        flat.instrs
-            .iter()
-            .any(|instr| instr.args.contains(&Ref::Input(j as u32)))
-    };
+    let read = |j: usize| flat.instrs.iter().any(|instr| instr.args.contains(&Ref::Input(j as u32)));
     if !(0..states.len()).all(read) {
         return None;
     }
     let fused = flat.finish(tail, outputs);
     // Traced steps are for the 4-byte machinery (loops, speculation, stencils).
-    fused.key.narrow().then_some(Traced {
-        fused,
-        members: nodes,
-    })
+    fused.key.narrow().then_some(Traced { fused, members: nodes })
 }
 
 /// Whether `a` and `b` are the same step: the same program with the same scalar values and the
@@ -2544,11 +2101,7 @@ pub(super) fn same_program(a: &Fused, b: &Fused, states: usize) -> bool {
     a.key == b.key
         && a.scalars == b.scalars
         && a.inputs.len() == b.inputs.len()
-        && a.inputs
-            .iter()
-            .zip(&b.inputs)
-            .skip(states)
-            .all(|(x, y)| Arc::ptr_eq(x, y))
+        && a.inputs.iter().zip(&b.inputs).skip(states).all(|(x, y)| Arc::ptr_eq(x, y))
 }
 
 /// Checks the invariants the code generator and the launcher rely on: references point at
@@ -2559,53 +2112,32 @@ pub(super) fn same_program(a: &Fused, b: &Fused, states: usize) -> bool {
 pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<(), String> {
     let programs = std::iter::once(&key.instrs[..]).chain(key.subs.iter().map(|sub| &sub[..]));
     for (p, program) in programs.enumerate() {
-        let name = if p == 0 {
-            "main program".to_string()
-        } else {
-            format!("sub-program {}", p - 1)
-        };
+        let name = if p == 0 { "main program".to_string() } else { format!("sub-program {}", p - 1) };
         for (at, instr) in program.iter().enumerate() {
             let here = format!("{name}, instruction {at} ({:?})", instr.op.kind);
             let arity = instr.op.kind.arity();
             for (slot, &arg) in instr.args.iter().enumerate() {
                 if (slot < arity) == (arg == Ref::Unused) {
-                    return Err(format!(
-                        "{here}: operand {slot} is {arg:?} but the arity is {arity}"
-                    ));
+                    return Err(format!("{here}: operand {slot} is {arg:?} but the arity is {arity}"));
                 }
                 match arg {
                     Ref::Unused => {}
-                    Ref::Tmp(t) if t as usize >= at => {
-                        return Err(format!(
-                            "{here}: operand {slot} reads t{t}, not an earlier instruction"
-                        ));
-                    }
+                    Ref::Tmp(t) if t as usize >= at => return Err(format!("{here}: operand {slot} reads t{t}, not an earlier instruction")),
                     Ref::Tmp(_) => {}
-                    Ref::Input(k) if k as usize >= inputs => {
-                        return Err(format!(
-                            "{here}: operand {slot} reads input {k} of {inputs}"
-                        ));
-                    }
+                    Ref::Input(k) if k as usize >= inputs => return Err(format!("{here}: operand {slot} reads input {k} of {inputs}")),
                     Ref::Input(_) => {}
                     Ref::Scalar(s) => {
                         let end = s as usize + instr.op.operand_ty(slot).slots();
                         if end > scalars {
-                            return Err(format!(
-                                "{here}: operand {slot} reads uniform slots up to {end} of {scalars}"
-                            ));
+                            return Err(format!("{here}: operand {slot} reads uniform slots up to {end} of {scalars}"));
                         }
                     }
                     Ref::Sub(j) => {
                         if slot != 0 || !matches!(instr.op.kind, OpKind::Shift(_)) {
-                            return Err(format!(
-                                "{here}: operand {slot} is a sub-program but not operand 0 of a shift"
-                            ));
+                            return Err(format!("{here}: operand {slot} is a sub-program but not operand 0 of a shift"));
                         }
                         if j as usize >= key.subs.len() {
-                            return Err(format!(
-                                "{here}: reads sub-program {j} of {}",
-                                key.subs.len()
-                            ));
+                            return Err(format!("{here}: reads sub-program {j} of {}", key.subs.len()));
                         }
                         if p != 0 && j as usize >= p - 1 {
                             return Err(format!("{here}: reads sub-program {j}, not a lower one"));
@@ -2615,9 +2147,7 @@ pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<
             }
             if let OpKind::Shift(ShiftKind::View { map, edge }) = instr.op.kind {
                 if !map.fits() {
-                    return Err(format!(
-                        "{here}: the view {map:?} does not fit the index arithmetic"
-                    ));
+                    return Err(format!("{here}: the view {map:?} does not fit the index arithmetic"));
                 }
                 if edge == Edge::None && !map.in_range() {
                     return Err(format!("{here}: the view {map:?} reads outside its source"));
@@ -2631,33 +2161,16 @@ pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<
     if key.subs.iter().any(|sub| sub.is_empty()) {
         return Err("an empty sub-program".into());
     }
-    if let Some(&at) = key
-        .outputs
-        .iter()
-        .find(|&&at| at as usize >= key.instrs.len())
-    {
+    if let Some(&at) = key.outputs.iter().find(|&&at| at as usize >= key.instrs.len()) {
         return Err(format!("output {at} of {} instructions", key.instrs.len()));
     }
-    if matches!(key.tail, Tail::Scatter { .. } | Tail::ScatterAdd { .. }) && key.outputs.len() != 2
-    {
-        return Err(format!(
-            "a scatter has {} outputs, not 2",
-            key.outputs.len()
-        ));
+    if matches!(key.tail, Tail::Scatter { .. } | Tail::ScatterAdd { .. }) && key.outputs.len() != 2 {
+        return Err(format!("a scatter has {} outputs, not 2", key.outputs.len()));
     }
-    if let Tail::Stack {
-        total,
-        first,
-        block,
-    } = key.tail
-        && (key.outputs.is_empty()
-            || block == 0
-            || u64::from(first) + key.outputs.len() as u64 > u64::from(total))
+    if let Tail::Stack { total, first, block } = key.tail
+        && (key.outputs.is_empty() || block == 0 || u64::from(first) + key.outputs.len() as u64 > u64::from(total))
     {
-        return Err(format!(
-            "a stack of parts {first}.. of {total} with {} outputs, block {block}",
-            key.outputs.len()
-        ));
+        return Err(format!("a stack of parts {first}.. of {total} with {} outputs, block {block}", key.outputs.len()));
     }
     for &(k, j) in &key.in_place {
         if k as usize >= inputs {
@@ -2666,43 +2179,27 @@ pub(super) fn validate(key: &FusedKey, inputs: usize, scalars: usize) -> Result<
         if j as usize >= key.outputs.len() {
             return Err(format!("in-place output {j} of {}", key.outputs.len()));
         }
-        let shifted = key.instrs.iter().any(|instr| {
-            matches!(instr.op.kind, OpKind::Shift(_)) && instr.args[0] == Ref::Input(k)
-        });
-        let in_sub = key
-            .subs
-            .iter()
-            .flatten()
-            .any(|instr| instr.args.contains(&Ref::Input(k)));
+        let shifted = key.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)) && instr.args[0] == Ref::Input(k));
+        let in_sub = key.subs.iter().flatten().any(|instr| instr.args.contains(&Ref::Input(k)));
         // Mapped and scatter kernels (`run_mapped`) may read their base through shifts: the
         // caller of `jit::assign` proved no element is read after another invocation wrote it.
         if key.tail == Tail::Store && (shifted || in_sub) {
-            return Err(format!(
-                "in-place input {k} is read through a shift or in a sub-program"
-            ));
+            return Err(format!("in-place input {k} is read through a shift or in a sub-program"));
         }
     }
     if let Some(tile) = &key.tile {
         if tile.offsets.len() != 1 + key.subs.len() {
-            return Err(format!(
-                "tile offsets for {} programs, {} exist",
-                tile.offsets.len(),
-                1 + key.subs.len()
-            ));
+            return Err(format!("tile offsets for {} programs, {} exist", tile.offsets.len(), 1 + key.subs.len()));
         }
         let lens = std::iter::once(key.instrs.len()).chain(key.subs.iter().map(Vec::len));
         for (p, (row, len)) in tile.offsets.iter().zip(lens).enumerate() {
             if row.len() != len {
-                return Err(format!(
-                    "tile offsets of program {p} have {} rows for {len} instructions",
-                    row.len()
-                ));
+                return Err(format!("tile offsets of program {p} have {} rows for {len} instructions", row.len()));
             }
         }
     }
     if let Some(layout) = &key.staging {
-        super::staging::check(layout, key)
-            .map_err(|message| format!("invalid staging: {message}"))?;
+        super::staging::check(layout, key).map_err(|message| format!("invalid staging: {message}"))?;
     }
     Ok(())
 }
@@ -2713,10 +2210,7 @@ mod validate_tests {
     use crate::builtin::BinOp;
 
     fn instr(kind: OpKind, args: [Ref; 3]) -> Instr {
-        Instr {
-            op: Op::new(kind, ElemTy::F32),
-            args,
-        }
+        Instr { op: Op::new(kind, ElemTy::F32), args }
     }
 
     fn key(instrs: Vec<Instr>, subs: Vec<Vec<Instr>>) -> FusedKey {
@@ -2751,13 +2245,7 @@ mod validate_tests {
         let mut map = ViewMap::identity([src, 1, 1, 1]);
         map.out[0] = out;
         map.axes[0].start = start;
-        instr(
-            OpKind::Shift(ShiftKind::View {
-                map,
-                edge: Edge::None,
-            }),
-            [Ref::Sub(0), Ref::Unused, Ref::Unused],
-        )
+        instr(OpKind::Shift(ShiftKind::View { map, edge: Edge::None }), [Ref::Sub(0), Ref::Unused, Ref::Unused])
     }
 
     #[test]
@@ -2769,28 +2257,14 @@ mod validate_tests {
 
     #[test]
     fn a_forward_temporary_is_rejected() {
-        let k = key(
-            vec![
-                add(Ref::Tmp(1), Ref::Input(0)),
-                add(Ref::Tmp(0), Ref::Input(0)),
-            ],
-            vec![],
-        );
+        let k = key(vec![add(Ref::Tmp(1), Ref::Input(0)), add(Ref::Tmp(0), Ref::Input(0))], vec![]);
         assert!(check(&k).unwrap_err().contains("earlier"));
     }
 
     #[test]
     fn an_input_or_scalar_out_of_range_is_rejected() {
-        assert!(
-            check(&key(vec![add(Ref::Input(1), Ref::Scalar(0))], vec![]))
-                .unwrap_err()
-                .contains("input 1")
-        );
-        assert!(
-            check(&key(vec![add(Ref::Input(0), Ref::Scalar(1))], vec![]))
-                .unwrap_err()
-                .contains("uniform")
-        );
+        assert!(check(&key(vec![add(Ref::Input(1), Ref::Scalar(0))], vec![])).unwrap_err().contains("input 1"));
+        assert!(check(&key(vec![add(Ref::Input(0), Ref::Scalar(1))], vec![])).unwrap_err().contains("uniform"));
     }
 
     #[test]
@@ -2798,16 +2272,8 @@ mod validate_tests {
         let first = vec![view(9, 1, 8)];
         let second = vec![add(Ref::Input(0), Ref::Scalar(0))];
         let main = vec![view(9, 0, 8)];
-        assert!(
-            check(&key(main.clone(), vec![first, second.clone()]))
-                .unwrap_err()
-                .contains("lower")
-        );
-        assert!(
-            check(&key(vec![view(9, 0, 8)], vec![]))
-                .unwrap_err()
-                .contains("sub-program")
-        );
+        assert!(check(&key(main.clone(), vec![first, second.clone()])).unwrap_err().contains("lower"));
+        assert!(check(&key(vec![view(9, 0, 8)], vec![])).unwrap_err().contains("sub-program"));
     }
 
     #[test]
@@ -2819,21 +2285,9 @@ mod validate_tests {
 
     #[test]
     fn a_wrong_arity_or_in_place_shift_read_is_rejected() {
-        let k = key(
-            vec![instr(
-                OpKind::Binary(BinOp::Add),
-                [Ref::Input(0), Ref::Unused, Ref::Unused],
-            )],
-            vec![],
-        );
+        let k = key(vec![instr(OpKind::Binary(BinOp::Add), [Ref::Input(0), Ref::Unused, Ref::Unused])], vec![]);
         assert!(check(&k).unwrap_err().contains("arity"));
-        let mut shifted = key(
-            vec![instr(
-                OpKind::Shift(ShiftKind::Linear),
-                [Ref::Input(0), Ref::Scalar(0), Ref::Scalar(0)],
-            )],
-            vec![],
-        );
+        let mut shifted = key(vec![instr(OpKind::Shift(ShiftKind::Linear), [Ref::Input(0), Ref::Scalar(0), Ref::Scalar(0)])], vec![]);
         shifted.in_place = vec![(0, 0)];
         assert!(check(&shifted).unwrap_err().contains("in-place"));
     }

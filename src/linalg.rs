@@ -18,12 +18,12 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{Builtin, UNROLLED_BLOCK, thomas_plan, thomas_scratch_floats};
-use crate::context::{RawArg, Scratch};
+use crate::builtin::{thomas_plan, thomas_scratch_floats, Builtin, UNROLLED_BLOCK};
 use crate::cyclic;
+use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::jit::PartSide;
-use crate::ops::{Outcome, fold_workgroups, workgroups_1d};
+use crate::ops::{fold_workgroups, workgroups_1d, Outcome};
 use crate::shape::Shape;
 use crate::solve::{Algo, Io, SolveSpec};
 use crate::tuning::Tuning;
@@ -53,13 +53,7 @@ pub fn solve_tridiagonal(
 ) -> Array<f32> {
     let location = Location::caller();
     let result = run(None, None, axis, [lo, diag, up, rhs], None, location);
-    Array::resolve(
-        rhs.context(),
-        rhs.shape(),
-        result,
-        "solve_tridiagonal",
-        location,
-    )
+    Array::resolve(rhs.context(), rhs.shape(), result, "solve_tridiagonal", location)
 }
 
 /// [`solve_tridiagonal`] where the system of line `l` begins at cell `start[l]` (clamped to the
@@ -76,13 +70,7 @@ pub fn solve_tridiagonal_from(
 ) -> Array<f32> {
     let location = Location::caller();
     let result = run(None, None, axis, [lo, diag, up, rhs], Some(start), location);
-    Array::resolve(
-        rhs.context(),
-        rhs.shape(),
-        result,
-        "solve_tridiagonal",
-        location,
-    )
+    Array::resolve(rhs.context(), rhs.shape(), result, "solve_tridiagonal", location)
 }
 
 /// Solves a block-tridiagonal system (`block` x `block` blocks, `1 <= block <= 8`) along `axis`
@@ -111,13 +99,7 @@ pub fn solve_block_tridiagonal(
 ) -> Array<f32> {
     let location = Location::caller();
     let result = run(None, Some(block), axis, [lo, diag, up, rhs], None, location);
-    Array::resolve(
-        rhs.context(),
-        rhs.shape(),
-        result,
-        "solve_block_tridiagonal",
-        location,
-    )
+    Array::resolve(rhs.context(), rhs.shape(), result, "solve_block_tridiagonal", location)
 }
 
 /// [`solve_block_tridiagonal`] where the system of line `l` begins at cell `start[l]`, like
@@ -133,21 +115,8 @@ pub fn solve_block_tridiagonal_from(
     start: &Array<u32>,
 ) -> Array<f32> {
     let location = Location::caller();
-    let result = run(
-        None,
-        Some(block),
-        axis,
-        [lo, diag, up, rhs],
-        Some(start),
-        location,
-    );
-    Array::resolve(
-        rhs.context(),
-        rhs.shape(),
-        result,
-        "solve_block_tridiagonal",
-        location,
-    )
+    let result = run(None, Some(block), axis, [lo, diag, up, rhs], Some(start), location);
+    Array::resolve(rhs.context(), rhs.shape(), result, "solve_block_tridiagonal", location)
 }
 
 /// Solves a block-tridiagonal system (`B` x `B` blocks, `1 <= B <= 8`) along `axis` on *parts*: every
@@ -212,12 +181,7 @@ pub fn solve_block_tridiagonal_parts<const B2: usize, const B: usize>(
     up: [&Array<f32>; B2],
     rhs: [&Array<f32>; B],
 ) -> [Array<f32>; B] {
-    const {
-        assert!(
-            B >= 1 && B <= 8 && B2 == B * B,
-            "block parts: 1 <= B <= 8 and B2 == B * B"
-        )
-    };
+    const { assert!(B >= 1 && B <= 8 && B2 == B * B, "block parts: 1 <= B <= 8 and B2 == B * B") };
     let location = Location::caller();
     let parts: Vec<&Array<f32>> = lo.into_iter().chain(diag).chain(up).chain(rhs).collect();
     let result = run_parts(None, B, 1, axis, &parts, None, location);
@@ -235,21 +199,11 @@ pub fn solve_block_tridiagonal_parts_from<const B2: usize, const B: usize>(
     rhs: [&Array<f32>; B],
     start: &Array<u32>,
 ) -> [Array<f32>; B] {
-    const {
-        assert!(
-            B >= 1 && B <= 8 && B2 == B * B,
-            "block parts: 1 <= B <= 8 and B2 == B * B"
-        )
-    };
+    const { assert!(B >= 1 && B <= 8 && B2 == B * B, "block parts: 1 <= B <= 8 and B2 == B * B") };
     let location = Location::caller();
     let parts: Vec<&Array<f32>> = lo.into_iter().chain(diag).chain(up).chain(rhs).collect();
     let result = run_parts(None, B, 1, axis, &parts, Some(start), location);
-    resolve_parts(
-        rhs[0],
-        result,
-        "solve_block_tridiagonal_parts_from",
-        location,
-    )
+    resolve_parts(rhs[0], result, "solve_block_tridiagonal_parts_from", location)
 }
 
 /// Solves `N` independent tridiagonal systems on the same grid in one launch: `systems[k]` is
@@ -284,10 +238,7 @@ pub fn solve_tridiagonal_parts<const N: usize>(
 ) -> [Array<f32>; N] {
     const { assert!(N >= 1 && N <= 64, "tridiagonal systems: 1 <= N <= 64") };
     let location = Location::caller();
-    let parts: Vec<&Array<f32>> = systems
-        .iter()
-        .flat_map(|&(lo, diag, up, rhs)| [lo, diag, up, rhs])
-        .collect();
+    let parts: Vec<&Array<f32>> = systems.iter().flat_map(|&(lo, diag, up, rhs)| [lo, diag, up, rhs]).collect();
     let result = run_parts(None, 1, N, axis, &parts, None, location);
     resolve_parts(systems[0].3, result, "solve_tridiagonal_parts", location)
 }
@@ -303,17 +254,9 @@ pub fn solve_tridiagonal_parts_from<const N: usize>(
 ) -> [Array<f32>; N] {
     const { assert!(N >= 1 && N <= 64, "tridiagonal systems: 1 <= N <= 64") };
     let location = Location::caller();
-    let parts: Vec<&Array<f32>> = systems
-        .iter()
-        .flat_map(|&(lo, diag, up, rhs)| [lo, diag, up, rhs])
-        .collect();
+    let parts: Vec<&Array<f32>> = systems.iter().flat_map(|&(lo, diag, up, rhs)| [lo, diag, up, rhs]).collect();
     let result = run_parts(None, 1, N, axis, &parts, Some(start), location);
-    resolve_parts(
-        systems[0].3,
-        result,
-        "solve_tridiagonal_parts_from",
-        location,
-    )
+    resolve_parts(systems[0].3, result, "solve_tridiagonal_parts_from", location)
 }
 
 /// The `N` arrays of `result`, or `N` arrays poisoned by its failure, of the shape of `like`.
@@ -324,27 +267,16 @@ fn resolve_parts<const N: usize>(
     location: &'static Location<'static>,
 ) -> [Array<f32>; N] {
     let outcome = result.and_then(|arrays| {
-        <[Array<f32>; N]>::try_from(arrays).map_err(|arrays| {
-            Failure::New(LumaError::Gpu(format!(
-                "{} solutions for {N} systems",
-                arrays.len()
-            )))
-        })
+        <[Array<f32>; N]>::try_from(arrays).map_err(|arrays| Failure::New(LumaError::Gpu(format!("{} solutions for {N} systems", arrays.len()))))
     });
     match outcome {
         Ok(arrays) => arrays,
         Err(failure) => {
             let error = match failure {
                 Failure::Inherited(error) => error,
-                Failure::New(error) => Arc::new(LumaError::Op {
-                    op,
-                    location,
-                    source: Arc::new(error),
-                }),
+                Failure::New(error) => Arc::new(LumaError::Op { op, location, source: Arc::new(error) }),
             };
-            std::array::from_fn(|_| {
-                Array::poisoned(like.context(), like.shape(), Arc::clone(&error))
-            })
+            std::array::from_fn(|_| Array::poisoned(like.context(), like.shape(), Arc::clone(&error)))
         }
     }
 }
@@ -382,9 +314,7 @@ fn run(
     let shape = rhs.shape();
     let dims = shape.dims();
     if axis >= 4 {
-        return Err(invalid(format!(
-            "tridiagonal solve along axis {axis} of shape {shape}"
-        )));
+        return Err(invalid(format!("tridiagonal solve along axis {axis} of shape {shape}")));
     }
     let b = block.unwrap_or(1);
     let coefficient = match block {
@@ -403,11 +333,7 @@ fn run(
     };
     for (array, expected) in [(lo, coefficient), (diag, coefficient), (up, coefficient)] {
         if array.shape() != expected {
-            return Err(LumaError::ShapeMismatch {
-                lhs: expected.dims(),
-                rhs: array.shape().dims(),
-            }
-            .into());
+            return Err(LumaError::ShapeMismatch { lhs: expected.dims(), rhs: array.shape().dims() }.into());
         }
     }
     let n = dims[axis];
@@ -417,14 +343,9 @@ fn run(
     if let Some(start) = start
         && start.len() != lines
     {
-        return Err(invalid(format!(
-            "{} start cells for {lines} lines",
-            start.len()
-        )));
+        return Err(invalid(format!("{} start cells for {lines} lines", start.len())));
     }
-    let to_u32 = |v: usize| {
-        u32::try_from(v).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: dims }))
-    };
+    let to_u32 = |v: usize| u32::try_from(v).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: dims }));
     let (n, stride, lines32) = (to_u32(n)?, to_u32(stride)?, to_u32(lines)?);
 
     let out = Array::<f32>::alloc(ctx, shape)?;
@@ -433,15 +354,7 @@ fn run(
     let mut scratch = Scratch::new(ctx);
     let params = [n, stride, lines32];
     let tuning = tuning.unwrap_or(*ctx.tuning());
-    let (core, groups, scratch_bytes) = if let Some(plan) = cyclic::plan(
-        &tuning,
-        b as u32,
-        n,
-        lines32,
-        stride,
-        false,
-        ctx.max_buffer_bytes(),
-    ) {
+    let (core, groups, scratch_bytes) = if let Some(plan) = cyclic::plan(&tuning, b as u32, n, lines32, stride, false, ctx.max_buffer_bytes()) {
         let core = ctx.builtin(
             Builtin::CyclicTridiagonal {
                 block: b as u8,
@@ -452,29 +365,14 @@ fn run(
             },
             "f32",
         )?;
-        (
-            core,
-            fold_workgroups(ctx, lines32)?,
-            plan.scratch_bytes(b as u32, n, lines32),
-        )
+        (core, fold_workgroups(ctx, lines32)?, plan.scratch_bytes(b as u32, n, lines32))
     } else {
         let workgroup = thomas_plan(&tuning, b as u32, lines32, stride, false).workgroup;
-        let core = ctx.builtin(
-            Builtin::Tridiagonal {
-                block: b as u8,
-                starts: start.is_some(),
-                workgroup,
-            },
-            "f32",
-        )?;
+        let core = ctx.builtin(Builtin::Tridiagonal { block: b as u8, starts: start.is_some(), workgroup }, "f32")?;
         let groups = workgroups_1d(ctx, &core, lines32)?;
         (core, groups, cells as u64 * (b * b) as u64 * 4)
     };
-    let scratch_buffer = if scratch_bytes > 0 {
-        Some(scratch.take(scratch_bytes)?)
-    } else {
-        None
-    };
+    let scratch_buffer = if scratch_bytes > 0 { Some(scratch.take(scratch_bytes)?) } else { None };
     let mut args = vec![RawArg::write(out_pin.buffer(), rhs_bytes)];
     if let Some(buffer) = &scratch_buffer {
         args.push(RawArg::write(buffer, scratch_bytes));
@@ -501,10 +399,7 @@ fn part_side(ctx: &crate::context::Context, array: &Array<f32>) -> Outcome<PartS
     match array.pending() {
         Some(node) => {
             if node.len() as u64 * 4 > ctx.segment_bytes() {
-                return Err(LumaError::Chunked(
-                    "a line solve of an array split over several buffers",
-                )
-                .into());
+                return Err(LumaError::Chunked("a line solve of an array split over several buffers").into());
             }
             Ok(PartSide::Pending(Arc::clone(node)))
         }
@@ -530,106 +425,47 @@ fn run_parts(
     let per = Io::parts_per_system(block);
     let ctx = parts[per - 1].context();
     // Operands first, so that a poisoned one reports its own error.
-    let sides = parts
-        .iter()
-        .map(|array| part_side(array.context(), array))
-        .collect::<Outcome<Vec<_>>>()?;
+    let sides = parts.iter().map(|array| part_side(array.context(), array)).collect::<Outcome<Vec<_>>>()?;
     let start_ready = start.map(|s| s.ready()).transpose()?;
-    if parts.iter().any(|array| !ctx.same_as(array.context()))
-        || start.is_some_and(|start| !ctx.same_as(start.context()))
-    {
+    if parts.iter().any(|array| !ctx.same_as(array.context())) || start.is_some_and(|start| !ctx.same_as(start.context())) {
         return Err(LumaError::ContextMismatch.into());
     }
     let shape = parts[per - 1].shape();
     let dims = shape.dims();
     if let Some(array) = parts.iter().find(|array| array.shape() != shape) {
-        return Err(LumaError::ShapeMismatch {
-            lhs: dims,
-            rhs: array.shape().dims(),
-        }
-        .into());
+        return Err(LumaError::ShapeMismatch { lhs: dims, rhs: array.shape().dims() }.into());
     }
     if axis >= 4 {
-        return Err(invalid(format!(
-            "tridiagonal solve along axis {axis} of shape {shape}"
-        )));
+        return Err(invalid(format!("tridiagonal solve along axis {axis} of shape {shape}")));
     }
     if block > 1 && dims[3] != 1 {
-        return Err(invalid(format!(
-            "block tridiagonal solve on parts of shape {shape}: at most three dimensions"
-        )));
+        return Err(invalid(format!("block tridiagonal solve on parts of shape {shape}: at most three dimensions")));
     }
     let (n, stride) = (dims[axis], dims[..axis].iter().product::<usize>());
     let lines = parts[0].len() / n;
     if let Some(start) = start
         && start.len() != lines
     {
-        return Err(invalid(format!(
-            "{} start cells for {lines} lines",
-            start.len()
-        )));
+        return Err(invalid(format!("{} start cells for {lines} lines", start.len())));
     }
-    let to_u32 = |v: usize| {
-        u32::try_from(v).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: dims }))
-    };
+    let to_u32 = |v: usize| u32::try_from(v).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: dims }));
     let (n32, stride32, lines32) = (to_u32(n)?, to_u32(stride)?, to_u32(lines)?);
     let total = to_u32(lines * systems)?;
     let tuning = tuning.unwrap_or(*ctx.tuning());
     let b32 = block as u32;
-    let algo = if let Some(plan) = cyclic::plan(
-        &tuning,
-        b32,
-        n32,
-        total,
-        stride32,
-        true,
-        ctx.max_buffer_bytes(),
-    ) {
-        Some((
-            Algo::Cyclic {
-                workgroup: plan.workgroup,
-                shift: plan.shift,
-                shared_rows: plan.shared_rows,
-            },
-            plan.scratch_bytes(b32, n32, total),
-        ))
+    let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, true, ctx.max_buffer_bytes()) {
+        Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
     } else if block <= UNROLLED_BLOCK as usize
         && let thomas = thomas_plan(&tuning, b32, total, stride32, true)
-        && let Some(bytes) = thomas_parts_scratch(
-            parts[0].len(),
-            block,
-            systems,
-            thomas.tiled,
-            ctx.max_buffer_bytes(),
-        )
+        && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, thomas.tiled, ctx.max_buffer_bytes())
     {
-        Some((
-            Algo::Thomas {
-                workgroup: thomas.workgroup,
-                tiled: thomas.tiled,
-            },
-            bytes,
-        ))
+        Some((Algo::Thomas { workgroup: thomas.workgroup, tiled: thomas.tiled }, bytes))
     } else {
         None
     };
     if let Some((algo, scratch_bytes)) = algo {
-        let spec = SolveSpec {
-            algo,
-            block: block as u8,
-            systems: systems as u8,
-            starts: start.is_some(),
-            fused: [0; 4],
-        };
-        if let Some(solved) = launch_parts(
-            ctx,
-            sides,
-            spec,
-            shape,
-            [n32, stride32, lines32],
-            scratch_bytes,
-            start_ready,
-        )? {
+        let spec = SolveSpec { algo, block: block as u8, systems: systems as u8, starts: start.is_some(), fused: [0; 4] };
+        if let Some(solved) = launch_parts(ctx, sides, spec, shape, [n32, stride32, lines32], scratch_bytes, start_ready)? {
             return Ok(solved);
         }
     }
@@ -640,15 +476,8 @@ fn run_parts(
 /// `len` cells (the modified upper blocks of every system, `tiled` as in
 /// [`thomas_plan`](crate::builtin::thomas_plan)), or `None` if they exceed `max_buffer` (the
 /// solve then falls back to the stacked one, whose scratch is one system's).
-fn thomas_parts_scratch(
-    len: usize,
-    block: usize,
-    systems: usize,
-    tiled: bool,
-    max_buffer: u64,
-) -> Option<u64> {
-    let bytes =
-        thomas_scratch_floats(len as u64, block as u32, tiled)?.checked_mul(4 * systems as u64)?;
+fn thomas_parts_scratch(len: usize, block: usize, systems: usize, tiled: bool, max_buffer: u64) -> Option<u64> {
+    let bytes = thomas_scratch_floats(len as u64, block as u32, tiled)?.checked_mul(4 * systems as u64)?;
     (bytes <= max_buffer).then_some(bytes)
 }
 
@@ -664,51 +493,22 @@ fn launch_parts(
     scratch_bytes: u64,
     start: Option<(crate::gpu::pager::Pin, u64)>,
 ) -> Outcome<Option<Vec<Array<f32>>>> {
-    let outs = (0..usize::from(spec.systems) * usize::from(spec.block))
-        .map(|_| Array::<f32>::alloc(ctx, shape))
-        .collect::<Result<Vec<_>, _>>()?;
-    let storages = outs
-        .iter()
-        .map(|out| out.storage().cloned())
-        .collect::<Result<Vec<_>, _>>()?;
-    let pins = storages
-        .iter()
-        .map(|storage| storage.pin_single())
-        .collect::<Result<Vec<_>, _>>()?;
+    let outs = (0..usize::from(spec.systems) * usize::from(spec.block)).map(|_| Array::<f32>::alloc(ctx, shape)).collect::<Result<Vec<_>, _>>()?;
+    let storages = outs.iter().map(|out| out.storage().cloned()).collect::<Result<Vec<_>, _>>()?;
+    let pins = storages.iter().map(|storage| storage.pin_single()).collect::<Result<Vec<_>, _>>()?;
     let mut scratch = Scratch::new(ctx);
-    let scratch_buffer = if scratch_bytes > 0 {
-        Some(scratch.take(scratch_bytes)?)
-    } else {
-        None
-    };
-    let mut writes: Vec<RawArg<'_>> = pins
-        .iter()
-        .zip(&storages)
-        .map(|(pin, storage)| RawArg::write(pin.buffer(), storage.byte_len()))
-        .collect();
+    let scratch_buffer = if scratch_bytes > 0 { Some(scratch.take(scratch_bytes)?) } else { None };
+    let mut writes: Vec<RawArg<'_>> = pins.iter().zip(&storages).map(|(pin, storage)| RawArg::write(pin.buffer(), storage.byte_len())).collect();
     if let Some(buffer) = &scratch_buffer {
         writes.push(RawArg::write(buffer, scratch_bytes));
     }
-    let starts = start
-        .as_ref()
-        .map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes));
+    let starts = start.as_ref().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes));
     let total = words[2] * u32::from(spec.systems);
     let groups = match spec.algo {
         Algo::Cyclic { .. } => fold_workgroups(ctx, total)?,
-        Algo::Thomas { workgroup, .. } => {
-            fold_workgroups(ctx, total.div_ceil(u32::from(workgroup)))?
-        }
+        Algo::Thomas { workgroup, .. } => fold_workgroups(ctx, total.div_ceil(u32::from(workgroup)))?,
     };
-    if !crate::jit::solve(
-        ctx,
-        sides,
-        spec,
-        words,
-        groups,
-        [total, 1, 1],
-        &writes,
-        starts,
-    )? {
+    if !crate::jit::solve(ctx, sides, spec, words, groups, [total, 1, 1], &writes, starts)? {
         return Ok(None);
     }
     drop(writes);
@@ -737,31 +537,12 @@ fn solve_stacked(
     let mut solutions = Vec::with_capacity(systems * block);
     for system in parts.chunks(per) {
         if block == 1 {
-            solutions.push(run(
-                Some(tuning),
-                None,
-                axis,
-                [system[0], system[1], system[2], system[3]],
-                start,
-                location,
-            )?);
+            solutions.push(run(Some(tuning), None, axis, [system[0], system[1], system[2], system[3]], start, location)?);
             continue;
         }
         let stack = |parts: &[&Array<f32>]| crate::view::stack_of(0, parts, location);
-        let (lo, diag, up, rhs) = (
-            stack(&system[..bb]),
-            stack(&system[bb..2 * bb]),
-            stack(&system[2 * bb..3 * bb]),
-            stack(&system[3 * bb..]),
-        );
-        let x = run(
-            Some(tuning),
-            Some(block),
-            axis + 1,
-            [&lo, &diag, &up, &rhs],
-            start,
-            location,
-        )?;
+        let (lo, diag, up, rhs) = (stack(&system[..bb]), stack(&system[bb..2 * bb]), stack(&system[2 * bb..3 * bb]), stack(&system[3 * bb..]));
+        let x = run(Some(tuning), Some(block), axis + 1, [&lo, &diag, &up, &rhs], start, location)?;
         solutions.extend((0..block).map(|c| x.slice(0, c..c + 1).reshape(shape)));
     }
     Ok(solutions)
@@ -773,7 +554,7 @@ mod tests {
 
     use super::{run, run_parts, thomas_parts_scratch};
     use crate::array::Array;
-    use crate::builtin::{ThomasPlan, thomas_plan};
+    use crate::builtin::{thomas_plan, ThomasPlan};
     use crate::context::Context;
     use crate::tuning::{LineSolver, Tuning, TuningProfile};
 
@@ -782,10 +563,7 @@ mod tests {
 
     impl Lcg {
         fn next(&mut self) -> f32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5
         }
     }
@@ -793,9 +571,7 @@ mod tests {
     /// Solves `m x = r` (`n x n`, row-major) in `f64` with partial pivoting.
     fn dense_solve(mut m: Vec<f64>, mut r: Vec<f64>, n: usize) -> Vec<f64> {
         for col in 0..n {
-            let pivot = (col..n)
-                .max_by(|&i, &j| m[i * n + col].abs().total_cmp(&m[j * n + col].abs()))
-                .unwrap();
+            let pivot = (col..n).max_by(|&i, &j| m[i * n + col].abs().total_cmp(&m[j * n + col].abs())).unwrap();
             for j in 0..n {
                 m.swap(col * n + j, pivot * n + j);
             }
@@ -821,12 +597,7 @@ mod tests {
     /// Block Thomas algorithm in `f64` for the cells `start..n` of one line; `cell(s)` gives the
     /// blocks `(lo, diag, up, rhs)` of cell `s`. Returns `x` of the cells `start..n`.
     #[allow(clippy::type_complexity)]
-    fn host_line(
-        b: usize,
-        start: usize,
-        n: usize,
-        cell: &dyn Fn(usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>),
-    ) -> Vec<Vec<f64>> {
+    fn host_line(b: usize, start: usize, n: usize, cell: &dyn Fn(usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)) -> Vec<Vec<f64>> {
         let mut c: Vec<Vec<f64>> = Vec::new();
         let mut d: Vec<Vec<f64>> = Vec::new();
         for s in start..n {
@@ -855,11 +626,7 @@ mod tests {
         let mut x = vec![vec![0.0; b]; n - start];
         for s in (0..n - start).rev() {
             for i in 0..b {
-                let next: f64 = if s + 1 < n - start {
-                    (0..b).map(|k| c[s][i * b + k] * x[s + 1][k]).sum()
-                } else {
-                    0.0
-                };
+                let next: f64 = if s + 1 < n - start { (0..b).map(|k| c[s][i * b + k] * x[s + 1][k]).sum() } else { 0.0 };
                 x[s][i] = d[s][i] - next;
             }
         }
@@ -871,16 +638,7 @@ mod tests {
     /// per-line starts if `starts`, and compares it with the host solve.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     #[track_caller]
-    fn check(
-        ctx: &Context,
-        tuning: Tuning,
-        b: usize,
-        n: usize,
-        lines: usize,
-        axis: usize,
-        starts: bool,
-        seed: u64,
-    ) {
+    fn check(ctx: &Context, tuning: Tuning, b: usize, n: usize, lines: usize, axis: usize, starts: bool, seed: u64) {
         check_scaled(ctx, tuning, b, n, lines, axis, starts, seed, 1.0);
     }
 
@@ -888,17 +646,7 @@ mod tests {
     /// `scale` (the solution is the same).
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     #[track_caller]
-    fn check_scaled(
-        ctx: &Context,
-        tuning: Tuning,
-        b: usize,
-        n: usize,
-        lines: usize,
-        axis: usize,
-        starts: bool,
-        seed: u64,
-        scale: f32,
-    ) {
+    fn check_scaled(ctx: &Context, tuning: Tuning, b: usize, n: usize, lines: usize, axis: usize, starts: bool, seed: u64, scale: f32) {
         let bs = b.max(1);
         let grid = if axis == 0 { [n, lines] } else { [lines, n] };
         let cells = n * lines;
@@ -909,20 +657,11 @@ mod tests {
         // Diagonally dominant blocks: the off-diagonal blocks and the rest of the diagonal block are
         // below 0.5 per entry, the block diagonal gets `2 * block`.
         let diag: Vec<f32> = (0..cells * bs * bs)
-            .map(|k| {
-                rng.next()
-                    + if (k % (bs * bs)) / bs == k % bs {
-                        2.0 * bs as f32
-                    } else {
-                        0.0
-                    }
-            })
+            .map(|k| rng.next() + if (k % (bs * bs)) / bs == k % bs { 2.0 * bs as f32 } else { 0.0 })
             .collect();
         let scaled = |data: Vec<f32>| -> Vec<f32> { data.into_iter().map(|v| v * scale).collect() };
         let (lo, up, rhs, diag) = (scaled(lo), scaled(up), scaled(rhs), scaled(diag));
-        let start: Vec<u32> = (0..lines)
-            .map(|l| [0, 1, (n / 2) as u32, n as u32, (n + 3) as u32, 0][(l + seed as usize) % 6])
-            .collect();
+        let start: Vec<u32> = (0..lines).map(|l| [0, 1, (n / 2) as u32, n as u32, (n + 3) as u32, 0][(l + seed as usize) % 6]).collect();
 
         let make = |data: &[f32], per_cell: usize| -> Array<f32> {
             match b {
@@ -930,12 +669,7 @@ mod tests {
                 _ => Array::from_slice_on(ctx, data, [per_cell, grid[0], grid[1]]).unwrap(),
             }
         };
-        let (lo_a, diag_a, up_a, rhs_a) = (
-            make(&lo, bs * bs),
-            make(&diag, bs * bs),
-            make(&up, bs * bs),
-            make(&rhs, bs),
-        );
+        let (lo_a, diag_a, up_a, rhs_a) = (make(&lo, bs * bs), make(&diag, bs * bs), make(&up, bs * bs), make(&rhs, bs));
         let start_a = Array::from_slice_on(ctx, &start, lines).unwrap();
         let location = Location::caller();
         let result = run(
@@ -946,44 +680,21 @@ mod tests {
             starts.then_some(&start_a),
             location,
         );
-        let got = Array::resolve(ctx, rhs_a.shape(), result, "solve", location)
-            .to_vec()
-            .unwrap();
+        let got = Array::resolve(ctx, rhs_a.shape(), result, "solve", location).to_vec().unwrap();
 
         let stride = if axis == 0 { 1 } else { lines };
-        let label = format!(
-            "b={b} n={n} lines={lines} axis={axis} starts={starts} line_bytes={}",
-            tuning.line_bytes
-        );
+        let label = format!("b={b} n={n} lines={lines} axis={axis} starts={starts} line_bytes={}", tuning.line_bytes);
         for l in 0..lines {
             let base = (l % stride) + (l / stride) * stride * n;
-            let s0 = if starts {
-                (start[l] as usize).min(n)
-            } else {
-                0
-            };
-            let slice = |a: &[f32], per: usize, s: usize| -> Vec<f64> {
-                (0..per)
-                    .map(|k| f64::from(a[(base + s * stride) * per + k]))
-                    .collect()
-            };
-            let want = host_line(bs, s0, n, &|s| {
-                (
-                    slice(&lo, bs * bs, s),
-                    slice(&diag, bs * bs, s),
-                    slice(&up, bs * bs, s),
-                    slice(&rhs, bs, s),
-                )
-            });
+            let s0 = if starts { (start[l] as usize).min(n) } else { 0 };
+            let slice = |a: &[f32], per: usize, s: usize| -> Vec<f64> { (0..per).map(|k| f64::from(a[(base + s * stride) * per + k])).collect() };
+            let want = host_line(bs, s0, n, &|s| (slice(&lo, bs * bs, s), slice(&diag, bs * bs, s), slice(&up, bs * bs, s), slice(&rhs, bs, s)));
             for s in 0..n {
                 for i in 0..bs {
                     let g = f64::from(got[(base + s * stride) * bs + i]);
                     let w = if s < s0 { 0.0 } else { want[s - s0][i] };
                     let err = (g - w).abs() / (1.0 + w.abs());
-                    assert!(
-                        err < 2e-4 && g.is_finite(),
-                        "{label}: line {l} cell {s} component {i}: got {g}, want {w}"
-                    );
+                    assert!(err < 2e-4 && g.is_finite(), "{label}: line {l} cell {s} component {i}: got {g}, want {w}");
                 }
             }
         }
@@ -1003,18 +714,7 @@ mod tests {
     /// compares every component with the host solve. Returns the launches of the solve.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     #[track_caller]
-    fn parts_check(
-        ctx: &Context,
-        tuning: Tuning,
-        b: usize,
-        systems: usize,
-        n: usize,
-        lines: usize,
-        axis: usize,
-        starts: bool,
-        kind: Kind,
-        seed: u64,
-    ) -> u32 {
+    fn parts_check(ctx: &Context, tuning: Tuning, b: usize, systems: usize, n: usize, lines: usize, axis: usize, starts: bool, kind: Kind, seed: u64) -> u32 {
         let (bb, per) = (b * b, 3 * b * b + b);
         let grid = if axis == 0 { [n, lines] } else { [lines, n] };
         let cells = n * lines;
@@ -1024,40 +724,18 @@ mod tests {
             let lo: Vec<f32> = (0..cells * bb).map(|_| rng.next()).collect();
             let up: Vec<f32> = (0..cells * bb).map(|_| rng.next()).collect();
             let rhs: Vec<f32> = (0..cells * b).map(|_| rng.next() * 4.0).collect();
-            let diag: Vec<f32> = (0..cells * bb)
-                .map(|k| {
-                    rng.next()
-                        + if (k % bb) / b == k % b {
-                            2.0 * b as f32
-                        } else {
-                            0.0
-                        }
-                })
-                .collect();
+            let diag: Vec<f32> = (0..cells * bb).map(|k| rng.next() + if (k % bb) / b == k % b { 2.0 * b as f32 } else { 0.0 }).collect();
             host.push([lo, diag, up, rhs]);
         }
-        let start: Vec<u32> = (0..lines)
-            .map(|l| [0, 1, (n / 2) as u32, n as u32, (n + 3) as u32, 0][(l + seed as usize) % 6])
-            .collect();
+        let start: Vec<u32> = (0..lines).map(|l| [0, 1, (n / 2) as u32, n as u32, (n + 3) as u32, 0][(l + seed as usize) % 6]).collect();
         let start_a = Array::from_slice_on(ctx, &start, lines).unwrap();
         // Part `k` of system `s`: entry `e` of every cell of the array `a` of kind `kind_of`.
         let mut arrays: Vec<Array<f32>> = Vec::new();
         for (s, sys) in host.iter().enumerate() {
             for k in 0..per {
-                let (source, width, e) = if k < bb {
-                    (&sys[0], bb, k)
-                } else if k < 2 * bb {
-                    (&sys[1], bb, k - bb)
-                } else if k < 3 * bb {
-                    (&sys[2], bb, k - 2 * bb)
-                } else {
-                    (&sys[3], b, k - 3 * bb)
-                };
-                let pending =
-                    kind == Kind::Pending || (kind == Kind::Mixed && (s * per + k) % 2 == 1);
-                let entry: Vec<f32> = (0..cells)
-                    .map(|q| source[q * width + e] * if pending { 0.5 } else { 1.0 })
-                    .collect();
+                let (source, width, e) = if k < bb { (&sys[0], bb, k) } else if k < 2 * bb { (&sys[1], bb, k - bb) } else if k < 3 * bb { (&sys[2], bb, k - 2 * bb) } else { (&sys[3], b, k - 3 * bb) };
+                let pending = kind == Kind::Pending || (kind == Kind::Mixed && (s * per + k) % 2 == 1);
+                let entry: Vec<f32> = (0..cells).map(|q| source[q * width + e] * if pending { 0.5 } else { 1.0 }).collect();
                 let array = Array::from_slice_on(ctx, &entry, grid).unwrap();
                 arrays.push(if pending { &array * 2.0 } else { array });
             }
@@ -1066,15 +744,7 @@ mod tests {
         let location = Location::caller();
         let (solved, profile) = ctx
             .profile(|| {
-                let solved = run_parts(
-                    Some(tuning),
-                    b,
-                    systems,
-                    axis,
-                    &refs,
-                    starts.then_some(&start_a),
-                    location,
-                );
+                let solved = run_parts(Some(tuning), b, systems, axis, &refs, starts.then_some(&start_a), location);
                 ctx.sync().unwrap();
                 solved
             })
@@ -1082,41 +752,20 @@ mod tests {
         let solved = solved.unwrap_or_else(|_| panic!("run_parts failed"));
         assert_eq!(solved.len(), systems * b);
         let stride = if axis == 0 { 1 } else { lines };
-        let label = format!(
-            "parts b={b} systems={systems} n={n} lines={lines} axis={axis} starts={starts} kind={}",
-            kind as u8
-        );
+        let label = format!("parts b={b} systems={systems} n={n} lines={lines} axis={axis} starts={starts} kind={}", kind as u8);
         let got: Vec<Vec<f32>> = solved.iter().map(|x| x.to_vec().unwrap()).collect();
         for (s, sys) in host.iter().enumerate() {
             for l in 0..lines {
                 let base = (l % stride) + (l / stride) * stride * n;
-                let s0 = if starts {
-                    (start[l] as usize).min(n)
-                } else {
-                    0
-                };
-                let slice = |a: &[f32], per: usize, c: usize| -> Vec<f64> {
-                    (0..per)
-                        .map(|k| f64::from(a[(base + c * stride) * per + k]))
-                        .collect()
-                };
-                let want = host_line(b, s0, n, &|c| {
-                    (
-                        slice(&sys[0], bb, c),
-                        slice(&sys[1], bb, c),
-                        slice(&sys[2], bb, c),
-                        slice(&sys[3], b, c),
-                    )
-                });
+                let s0 = if starts { (start[l] as usize).min(n) } else { 0 };
+                let slice = |a: &[f32], per: usize, c: usize| -> Vec<f64> { (0..per).map(|k| f64::from(a[(base + c * stride) * per + k])).collect() };
+                let want = host_line(b, s0, n, &|c| (slice(&sys[0], bb, c), slice(&sys[1], bb, c), slice(&sys[2], bb, c), slice(&sys[3], b, c)));
                 for c in 0..n {
                     for i in 0..b {
                         let g = f64::from(got[s * b + i][base + c * stride]);
                         let w = if c < s0 { 0.0 } else { want[c - s0][i] };
                         let err = (g - w).abs() / (1.0 + w.abs());
-                        assert!(
-                            err < 2e-4 && g.is_finite(),
-                            "{label}: line {l} cell {c} component {i}: got {g}, want {w}"
-                        );
+                        assert!(err < 2e-4 && g.is_finite(), "{label}: line {l} cell {c} component {i}: got {g}, want {w}");
                     }
                 }
             }
@@ -1131,28 +780,17 @@ mod tests {
     }
 
     fn cyclic(line_bytes: u32) -> Tuning {
-        Tuning {
-            line_solver: LineSolver::Cyclic,
-            line_bytes,
-            ..Tuning::for_tests()
-        }
+        Tuning { line_solver: LineSolver::Cyclic, line_bytes, ..Tuning::for_tests() }
     }
 
     fn thomas() -> Tuning {
-        Tuning {
-            line_solver: LineSolver::Thomas,
-            ..Tuning::for_tests()
-        }
+        Tuning { line_solver: LineSolver::Thomas, ..Tuning::for_tests() }
     }
 
     /// The Thomas solve as it runs along a strided axis of an NVIDIA GPU: the wider workgroups and
     /// the tiled scratch (see `builtin::thomas_plan`), whatever device the test runs on.
     fn thomas_strided() -> Tuning {
-        Tuning {
-            line_solver: LineSolver::Thomas,
-            line_strided_from: 16,
-            ..Tuning::for_tests()
-        }
+        Tuning { line_solver: LineSolver::Thomas, line_strided_from: 16, ..Tuning::for_tests() }
     }
 
     /// Lines at a stride of 16 and more, of every size the tiled scratch has a kernel for, on
@@ -1166,122 +804,35 @@ mod tests {
                 for starts in [false, true] {
                     let seed = (b * 77 + n) as u64;
                     for kind in [Kind::Evaluated, Kind::Pending] {
-                        parts_check(
-                            &ctx,
-                            thomas_strided(),
-                            b,
-                            1,
-                            n,
-                            lines,
-                            1,
-                            starts,
-                            kind,
-                            seed,
-                        );
+                        parts_check(&ctx, thomas_strided(), b, 1, n, lines, 1, starts, kind, seed);
                     }
                 }
             }
         }
         // Scalar systems batch (and never tile, see `thomas_plan`).
-        parts_check(
-            &ctx,
-            thomas_strided(),
-            1,
-            2,
-            40,
-            33,
-            1,
-            false,
-            Kind::Pending,
-            3,
-        );
+        parts_check(&ctx, thomas_strided(), 1, 2, 40, 33, 1, false, Kind::Pending, 3);
     }
 
     #[test]
     fn thomas_plan_widens_strided_lines() {
-        let nvidia = Tuning {
-            profile: TuningProfile::Nvidia,
-            line_strided_from: 16,
-            ..Tuning::for_tests()
-        };
+        let nvidia = Tuning { profile: TuningProfile::Nvidia, line_strided_from: 16, ..Tuning::for_tests() };
         // Strided lines of blocks of 2 to 5: a warp or more per workgroup and a tiled scratch.
-        assert_eq!(
-            thomas_plan(&nvidia, 5, 4488, 187, true),
-            ThomasPlan {
-                workgroup: 64,
-                tiled: true
-            }
-        );
-        assert_eq!(
-            thomas_plan(&nvidia, 2, 4096, 16, true),
-            ThomasPlan {
-                workgroup: 128,
-                tiled: true
-            }
-        );
+        assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, true), ThomasPlan { workgroup: 64, tiled: true });
+        assert_eq!(thomas_plan(&nvidia, 2, 4096, 16, true), ThomasPlan { workgroup: 128, tiled: true });
         // Scalars: no tile (it is the same layout), a warp.
-        assert_eq!(
-            thomas_plan(&nvidia, 1, 4096, 64, true),
-            ThomasPlan {
-                workgroup: 32,
-                tiled: false
-            }
-        );
+        assert_eq!(thomas_plan(&nvidia, 1, 4096, 64, true), ThomasPlan { workgroup: 32, tiled: false });
         // Contiguous lines, strides below 16 and blocks above 5: the narrow workgroups of one
         // invocation per line and the scratch one cell after the other.
-        assert_eq!(
-            thomas_plan(&nvidia, 5, 1680, 1, true),
-            ThomasPlan {
-                workgroup: 8,
-                tiled: false
-            }
-        );
-        assert_eq!(
-            thomas_plan(&nvidia, 5, 13090, 8, true),
-            ThomasPlan {
-                workgroup: 32,
-                tiled: false
-            }
-        );
-        assert_eq!(
-            thomas_plan(&nvidia, 6, 4488, 187, true),
-            ThomasPlan {
-                workgroup: 8,
-                tiled: false
-            }
-        );
+        assert_eq!(thomas_plan(&nvidia, 5, 1680, 1, true), ThomasPlan { workgroup: 8, tiled: false });
+        assert_eq!(thomas_plan(&nvidia, 5, 13090, 8, true), ThomasPlan { workgroup: 32, tiled: false });
+        assert_eq!(thomas_plan(&nvidia, 6, 4488, 187, true), ThomasPlan { workgroup: 8, tiled: false });
         // Stacked blocks too.
-        assert_eq!(
-            thomas_plan(&nvidia, 5, 4488, 187, false),
-            ThomasPlan {
-                workgroup: 8,
-                tiled: false
-            }
-        );
+        assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, false), ThomasPlan { workgroup: 8, tiled: false });
         // Other devices keep the old rule.
-        let other = Tuning {
-            line_strided_from: 0,
-            ..nvidia
-        };
-        assert_eq!(
-            thomas_plan(&other, 5, 4488, 187, true),
-            ThomasPlan {
-                workgroup: 8,
-                tiled: false
-            }
-        );
-        let cpu = Tuning {
-            profile: TuningProfile::Cpu,
-            elementwise_workgroup: 64,
-            ..nvidia
-        };
-        assert_eq!(
-            thomas_plan(&cpu, 5, 4488, 187, true),
-            ThomasPlan {
-                workgroup: 64,
-                tiled: false
-            }
-        );
+        let other = Tuning { line_strided_from: 0, ..nvidia };
+        assert_eq!(thomas_plan(&other, 5, 4488, 187, true), ThomasPlan { workgroup: 8, tiled: false });
+        let cpu = Tuning { profile: TuningProfile::Cpu, elementwise_workgroup: 64, ..nvidia };
+        assert_eq!(thomas_plan(&cpu, 5, 4488, 187, true), ThomasPlan { workgroup: 64, tiled: false });
     }
 
     #[test]
@@ -1289,20 +840,7 @@ mod tests {
         let ctx = Context::new().unwrap();
         // Sizes that are powers of two, one less and one more, tiny and long; the small byte budget
         // moves rows of the line to the global scratch.
-        for &(n, lines) in &[
-            (1, 3),
-            (2, 5),
-            (3, 4),
-            (7, 6),
-            (32, 3),
-            (33, 5),
-            (64, 2),
-            (100, 7),
-            (255, 3),
-            (256, 2),
-            (1000, 3),
-            (4097, 2),
-        ] {
+        for &(n, lines) in &[(1, 3), (2, 5), (3, 4), (7, 6), (32, 3), (33, 5), (64, 2), (100, 7), (255, 3), (256, 2), (1000, 3), (4097, 2)] {
             for axis in 0..2 {
                 for starts in [false, true] {
                     let seed = (n * 31 + lines) as u64;
@@ -1324,17 +862,7 @@ mod tests {
             for scale in [1e10f32, 1e-10, 1e-18, 1e18] {
                 for tuning in [thomas(), cyclic(16 * 1024)] {
                     for axis in 0..2 {
-                        check_scaled(
-                            &ctx,
-                            tuning,
-                            b,
-                            40,
-                            3,
-                            axis,
-                            false,
-                            (b * 10 + axis) as u64,
-                            scale,
-                        );
+                        check_scaled(&ctx, tuning, b, 40, 3, axis, false, (b * 10 + axis) as u64, scale);
                     }
                 }
             }
@@ -1346,11 +874,7 @@ mod tests {
         let ctx = Context::new().unwrap();
         for b in 1..=8 {
             // Big blocks compile slowly (on a software rasterizer most of all): fewer sizes.
-            let sizes: &[(usize, usize)] = if b <= 5 {
-                &[(1, 2), (2, 3), (33, 3), (130, 2)]
-            } else {
-                &[(5, 2), (66, 2)]
-            };
+            let sizes: &[(usize, usize)] = if b <= 5 { &[(1, 2), (2, 3), (33, 3), (130, 2)] } else { &[(5, 2), (66, 2)] };
             for &(n, lines) in sizes {
                 // One line count and axis per size keeps the number of kernels (one per block
                 // size, size, budget and `starts`) small.
@@ -1371,13 +895,7 @@ mod tests {
     #[test]
     fn line_relaxation_shapes() {
         let ctx = Context::new().unwrap();
-        for (b, n, lines) in [
-            (0, 400, 20),
-            (2, 400, 20),
-            (4, 300, 8),
-            (4, 100, 20),
-            (2, 100, 20),
-        ] {
+        for (b, n, lines) in [(0, 400, 20), (2, 400, 20), (4, 300, 8), (4, 100, 20), (2, 100, 20)] {
             for axis in 0..2 {
                 check(&ctx, thomas(), b, n, lines, axis, false, 7);
                 for bytes in [32 * 1024, 4096] {
@@ -1392,29 +910,13 @@ mod tests {
         let ctx = Context::new().unwrap();
         for b in 1..=6 {
             for &(n, lines) in &[(1usize, 2usize), (33, 3), (130, 2)] {
-                for (algo, tuning) in [
-                    ("thomas", thomas()),
-                    ("cyclic", cyclic(16 * 1024)),
-                    ("spill", cyclic(1024)),
-                ] {
+                for (algo, tuning) in [("thomas", thomas()), ("cyclic", cyclic(16 * 1024)), ("spill", cyclic(1024))] {
                     // Blocks above 5 have no Thomas kernel on parts: the stacked solve runs.
                     let axis = (n + b) % 2;
                     for kind in [Kind::Evaluated, Kind::Pending, Kind::Mixed] {
                         let starts = kind == Kind::Mixed;
-                        let launches = parts_check(
-                            &ctx,
-                            tuning,
-                            b,
-                            1,
-                            n,
-                            lines,
-                            axis,
-                            starts,
-                            kind,
-                            (b * 100 + n) as u64,
-                        );
-                        if kind != Kind::Mixed && !(algo == "thomas" && b > 5) && binds(&ctx, b, 1)
-                        {
+                        let launches = parts_check(&ctx, tuning, b, 1, n, lines, axis, starts, kind, (b * 100 + n) as u64);
+                        if kind != Kind::Mixed && !(algo == "thomas" && b > 5) && binds(&ctx, b, 1) {
                             // One launch: no stack, no unstack, and the pending parts are no kernels of their own.
                             assert_eq!(launches, 1, "{algo} b={b} n={n} kind={}", kind as u8);
                         }
@@ -1432,18 +934,7 @@ mod tests {
                 for tuning in [thomas(), cyclic(16 * 1024), cyclic(512)] {
                     for systems in [1usize, 2, 3] {
                         for kind in [Kind::Evaluated, Kind::Pending] {
-                            let launches = parts_check(
-                                &ctx,
-                                tuning,
-                                1,
-                                systems,
-                                n,
-                                lines,
-                                axis,
-                                systems == 2,
-                                kind,
-                                (n * 7 + systems) as u64,
-                            );
+                            let launches = parts_check(&ctx, tuning, 1, systems, n, lines, axis, systems == 2, kind, (n * 7 + systems) as u64);
                             if binds(&ctx, 1, systems) {
                                 assert_eq!(launches, 1, "n={n} axis={axis} systems={systems}");
                             }
@@ -1463,67 +954,27 @@ mod tests {
             for tuning in [thomas(), cyclic(16 * 1024), cyclic(256)] {
                 let mut rng = Lcg(n as u64);
                 for axis in [1usize, 2] {
-                    let grid = if axis == 1 {
-                        [2, n, lines]
-                    } else {
-                        [2, lines, n]
-                    };
+                    let grid = if axis == 1 { [2, n, lines] } else { [2, lines, n] };
                     let cells = 2 * n * lines;
                     let lo: Vec<f32> = (0..cells).map(|_| rng.next()).collect();
                     let up: Vec<f32> = (0..cells).map(|_| rng.next()).collect();
                     let rhs: Vec<f32> = (0..cells).map(|_| rng.next() * 4.0).collect();
                     let diag: Vec<f32> = (0..cells).map(|_| rng.next() + 2.0).collect();
                     let make = |d: &[f32]| Array::from_slice_on(&ctx, d, grid).unwrap();
-                    let (lo_a, diag_a, up_a, rhs_a) =
-                        (make(&lo), make(&diag), make(&up), make(&rhs));
+                    let (lo_a, diag_a, up_a, rhs_a) = (make(&lo), make(&diag), make(&up), make(&rhs));
                     let location = Location::caller();
-                    let got = Array::resolve(
-                        &ctx,
-                        rhs_a.shape(),
-                        run(
-                            Some(tuning),
-                            None,
-                            axis,
-                            [&lo_a, &diag_a, &up_a, &rhs_a],
-                            None,
-                            location,
-                        ),
-                        "solve",
-                        location,
-                    )
-                    .to_vec()
-                    .unwrap();
+                    let got = Array::resolve(&ctx, rhs_a.shape(), run(Some(tuning), None, axis, [&lo_a, &diag_a, &up_a, &rhs_a], None, location), "solve", location).to_vec().unwrap();
                     // Element `[j, ..]` of the batch is the solve of its own coefficients alone.
                     for j in 0..2 {
-                        let pick = |d: &[f32]| -> Vec<f32> {
-                            d.iter().skip(j).step_by(2).copied().collect()
-                        };
+                        let pick = |d: &[f32]| -> Vec<f32> { d.iter().skip(j).step_by(2).copied().collect() };
                         let sub = [n, lines];
                         let sub = if axis == 1 { sub } else { [lines, n] };
                         let alone = |d: &[f32]| Array::from_slice_on(&ctx, &pick(d), sub).unwrap();
                         let (a, b, c, d) = (alone(&lo), alone(&diag), alone(&up), alone(&rhs));
-                        let one = Array::resolve(
-                            &ctx,
-                            d.shape(),
-                            run(
-                                Some(tuning),
-                                None,
-                                axis - 1,
-                                [&a, &b, &c, &d],
-                                None,
-                                location,
-                            ),
-                            "solve",
-                            location,
-                        )
-                        .to_vec()
-                        .unwrap();
+                        let one = Array::resolve(&ctx, d.shape(), run(Some(tuning), None, axis - 1, [&a, &b, &c, &d], None, location), "solve", location).to_vec().unwrap();
                         for (k, want) in one.iter().enumerate() {
                             let have = got[2 * k + j];
-                            assert!(
-                                (have - want).abs() <= 2e-4 * (1.0 + want.abs()),
-                                "n={n} axis={axis} batch {j} cell {k}: {have} vs {want}"
-                            );
+                            assert!((have - want).abs() <= 2e-4 * (1.0 + want.abs()), "n={n} axis={axis} batch {j} cell {k}: {have} vs {want}");
                         }
                     }
                 }
@@ -1539,34 +990,12 @@ mod tests {
         ctx.jit().set_max_inputs(8);
         for (b, systems) in [(2usize, 1usize), (4, 1), (1, 3)] {
             for kind in [Kind::Evaluated, Kind::Pending] {
-                let launches = parts_check(
-                    &ctx,
-                    cyclic(16 * 1024),
-                    b,
-                    systems,
-                    40,
-                    3,
-                    0,
-                    false,
-                    kind,
-                    5,
-                );
+                let launches = parts_check(&ctx, cyclic(16 * 1024), b, systems, 40, 3, 0, false, kind, 5);
                 assert!(launches > 1, "b={b} systems={systems}: {launches} launches");
             }
         }
         ctx.jit().set_max_inputs(original);
-        let ok = parts_check(
-            &ctx,
-            cyclic(16 * 1024),
-            2,
-            1,
-            40,
-            3,
-            0,
-            false,
-            Kind::Pending,
-            5,
-        );
+        let ok = parts_check(&ctx, cyclic(16 * 1024), 2, 1, 40, 3, 0, false, Kind::Pending, 5);
         if binds(&ctx, 2, 1) {
             assert_eq!(ok, 1);
         }
@@ -1574,40 +1003,18 @@ mod tests {
 
     #[test]
     fn thomas_parts_scratch_must_fit_a_buffer() {
-        assert_eq!(
-            thomas_parts_scratch(1000, 2, 3, false, 1 << 20),
-            Some(1000 * 4 * 4 * 3)
-        );
-        assert_eq!(
-            thomas_parts_scratch(1000, 2, 3, false, 1000 * 4 * 4 * 3),
-            Some(1000 * 4 * 4 * 3)
-        );
-        assert_eq!(
-            thomas_parts_scratch(1000, 2, 3, false, 1000 * 4 * 4 * 3 - 1),
-            None
-        );
-        assert_eq!(
-            thomas_parts_scratch(usize::MAX, 8, 8, false, u64::MAX),
-            None
-        );
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, false, 1 << 20), Some(1000 * 4 * 4 * 3));
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, false, 1000 * 4 * 4 * 3), Some(1000 * 4 * 4 * 3));
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, false, 1000 * 4 * 4 * 3 - 1), None);
+        assert_eq!(thomas_parts_scratch(usize::MAX, 8, 8, false, u64::MAX), None);
         // Tiled: whole tiles of 32 cells per system.
-        assert_eq!(
-            thomas_parts_scratch(1000, 2, 3, true, 1 << 20),
-            Some(1024 * 4 * 4 * 3)
-        );
-        assert_eq!(
-            thomas_parts_scratch(1024, 2, 3, true, 1 << 20),
-            Some(1024 * 4 * 4 * 3)
-        );
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, true, 1 << 20), Some(1024 * 4 * 4 * 3));
+        assert_eq!(thomas_parts_scratch(1024, 2, 3, true, 1 << 20), Some(1024 * 4 * 4 * 3));
     }
 
     #[test]
     fn plan_follows_the_workgroup_memory_budget() {
-        let tuning = Tuning {
-            line_solver: LineSolver::Cyclic,
-            line_bytes: 16 * 1024,
-            ..Tuning::for_tests()
-        };
+        let tuning = Tuning { line_solver: LineSolver::Cyclic, line_bytes: 16 * 1024, ..Tuning::for_tests() };
         // 3 floats per row of a scalar line: 1024 rows fit, 4096 keep every fourth row (1024) in workgroup memory.
         let fits = crate::cyclic::plan(&tuning, 1, 1024, 10, 1, false, u64::MAX).unwrap();
         assert_eq!((fits.shift, fits.shared_rows), (0, 1024));
@@ -1642,18 +1049,11 @@ mod tests {
         assert_eq!(b.scratch_bytes(4, 312, 10), 10 * (312 - 78) * 9 * 16);
         // The scratch must fit a buffer, or Thomas runs.
         assert!(crate::cyclic::plan(&tuning, 4, 1024, 10, 1, false, 1000).is_none());
-        let thomas = Tuning {
-            line_solver: LineSolver::Thomas,
-            ..tuning
-        };
+        let thomas = Tuning { line_solver: LineSolver::Thomas, ..tuning };
         assert!(crate::cyclic::plan(&thomas, 1, 1024, 10, 1, false, u64::MAX).is_none());
         // The automatic choice: few lines yes, many lines no, strided lines sooner than contiguous
         // ones, bigger blocks sooner than small ones.
-        let auto = Tuning {
-            line_solver: LineSolver::Auto,
-            line_cyclic_work: 8192,
-            ..tuning
-        };
+        let auto = Tuning { line_solver: LineSolver::Auto, line_cyclic_work: 8192, ..tuning };
         assert!(crate::cyclic::plan(&auto, 1, 4096, 200, 1, false, u64::MAX).is_some());
         assert!(crate::cyclic::plan(&auto, 1, 4096, 8192, 1, false, u64::MAX).is_some());
         assert!(crate::cyclic::plan(&auto, 1, 4096, 8193, 1, false, u64::MAX).is_none());
@@ -1669,10 +1069,7 @@ mod tests {
         assert!(crate::cyclic::plan(&auto, 4, 70, 1025, 70, true, u64::MAX).is_none());
         assert!(crate::cyclic::plan(&auto, 4, 1024, 512, 1024, true, u64::MAX).is_some());
         assert!(crate::cyclic::plan(&auto, 4, 1024, 513, 1024, true, u64::MAX).is_none());
-        let never = Tuning {
-            line_cyclic_work: 0,
-            ..auto
-        };
+        let never = Tuning { line_cyclic_work: 0, ..auto };
         assert!(crate::cyclic::plan(&never, 1, 4096, 1, 1, false, u64::MAX).is_none());
         assert!(crate::cyclic::plan(&never, 5, 187, 1680, 1, true, u64::MAX).is_none());
     }

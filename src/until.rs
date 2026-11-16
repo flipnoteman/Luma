@@ -55,12 +55,7 @@ pub struct Until<'a, S> {
 impl<'a, S: Fields> Until<'a, S> {
     /// A loop of at most `max_steps` steps with no records and no stop rule.
     pub fn new(max_steps: usize) -> Self {
-        Until {
-            max_steps,
-            check_every: None,
-            records: Vec::new(),
-            stops: Vec::new(),
-        }
+        Until { max_steps, check_every: None, records: Vec::new(), stops: Vec::new() }
     }
 
     /// A scalar (an array of one element) computed from the state after every step, kept as
@@ -383,10 +378,7 @@ pub struct Run<S> {
 impl<S> Run<S> {
     /// The values recorded under `name`, one per step run.
     pub fn history(&self, name: &str) -> Option<&[f32]> {
-        self.history
-            .iter()
-            .find(|(known, _)| known == name)
-            .map(|(_, values)| values.as_slice())
+        self.history.iter().find(|(known, _)| known == name).map(|(_, values)| values.as_slice())
     }
 }
 
@@ -394,20 +386,12 @@ impl<S> Run<S> {
 
 /// `f32::max` that propagates NaN, like the gate kernel.
 fn nan_max(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() {
-        f32::NAN
-    } else {
-        a.max(b)
-    }
+    if a.is_nan() || b.is_nan() { f32::NAN } else { a.max(b) }
 }
 
 /// `f32::min` that propagates NaN, like the gate kernel.
 fn nan_min(a: f32, b: f32) -> f32 {
-    if a.is_nan() || b.is_nan() {
-        f32::NAN
-    } else {
-        a.min(b)
-    }
+    if a.is_nan() || b.is_nan() { f32::NAN } else { a.min(b) }
 }
 
 fn eval_stat(stat: &Stat, histories: &[Vec<f32>], done: usize) -> f32 {
@@ -416,18 +400,9 @@ fn eval_stat(stat: &Stat, histories: &[Vec<f32>], done: usize) -> f32 {
         StatNode::Const(c) => *c,
         StatNode::Last(r) => histories[*r][done - 1],
         StatNode::First(r) => histories[*r][0],
-        StatNode::Peak(r) => histories[*r][..done]
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, nan_max),
-        StatNode::Trough(r) => histories[*r][..done]
-            .iter()
-            .copied()
-            .fold(f32::INFINITY, nan_min),
-        StatNode::WindowMax(r, k) => window(*r, *k)
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, nan_max),
+        StatNode::Peak(r) => histories[*r][..done].iter().copied().fold(f32::NEG_INFINITY, nan_max),
+        StatNode::Trough(r) => histories[*r][..done].iter().copied().fold(f32::INFINITY, nan_min),
+        StatNode::WindowMax(r, k) => window(*r, *k).iter().copied().fold(f32::NEG_INFINITY, nan_max),
         StatNode::WindowMin(r, k) => window(*r, *k).iter().copied().fold(f32::INFINITY, nan_min),
         StatNode::WindowMean(r, k) => {
             let w = window(*r, *k);
@@ -457,10 +432,7 @@ fn eval_stat(stat: &Stat, histories: &[Vec<f32>], done: usize) -> f32 {
 fn eval_host(cond: &Cond, histories: &[Vec<f32>], steps_done: usize) -> bool {
     match &*cond.0 {
         CondNode::Cmp(op, a, b) => {
-            let (a, b) = (
-                eval_stat(a, histories, steps_done),
-                eval_stat(b, histories, steps_done),
-            );
+            let (a, b) = (eval_stat(a, histories, steps_done), eval_stat(b, histories, steps_done));
             match op {
                 Compare::Lt => a < b,
                 Compare::Le => a <= b,
@@ -468,12 +440,8 @@ fn eval_host(cond: &Cond, histories: &[Vec<f32>], steps_done: usize) -> bool {
                 Compare::Ge => a >= b,
             }
         }
-        CondNode::And(a, b) => {
-            eval_host(a, histories, steps_done) && eval_host(b, histories, steps_done)
-        }
-        CondNode::Or(a, b) => {
-            eval_host(a, histories, steps_done) || eval_host(b, histories, steps_done)
-        }
+        CondNode::And(a, b) => eval_host(a, histories, steps_done) && eval_host(b, histories, steps_done),
+        CondNode::Or(a, b) => eval_host(a, histories, steps_done) || eval_host(b, histories, steps_done),
         CondNode::Not(a) => !eval_host(a, histories, steps_done),
     }
 }
@@ -534,17 +502,9 @@ fn gate_source(records: usize, conds: &[Cond]) -> String {
     s.push_str("@group(1) @binding(4) var<storage, read_write> agg: array<f32>;\n");
     s.push_str("@group(1) @binding(5) var<storage, read_write> stepv: array<f32>;\n");
     for r in 0..records {
-        let _ = writeln!(
-            s,
-            "@group(1) @binding({}) var<storage, read> rec{r}: array<f32>;",
-            6 + r
-        );
+        let _ = writeln!(s, "@group(1) @binding({}) var<storage, read> rec{r}: array<f32>;", 6 + r);
     }
-    let _ = writeln!(
-        s,
-        "@group(1) @binding({}) var<uniform> p: Params;",
-        6 + records
-    );
+    let _ = writeln!(s, "@group(1) @binding({}) var<uniform> p: Params;", 6 + records);
     s.push_str(
         "fn isn(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
 fn fmax(a: f32, b: f32) -> f32 { return select(select(max(a, b), a, isn(a)), b, isn(b)); }
@@ -587,21 +547,11 @@ fn main() {
         let _ = writeln!(s, "    let v{r} = rec{r}[0];");
         let _ = writeln!(s, "    hist[{r}u * p.max_steps + i] = v{r};");
         let _ = writeln!(s, "    agg[{}u] = fmax(agg[{}u], v{r});", 2 * r, 2 * r);
-        let _ = writeln!(
-            s,
-            "    agg[{}u] = fmin(agg[{}u], v{r});",
-            2 * r + 1,
-            2 * r + 1
-        );
+        let _ = writeln!(s, "    agg[{}u] = fmin(agg[{}u], v{r});", 2 * r + 1, 2 * r + 1);
     }
     s.push_str("    var reason = 0u;\n");
     for (c, cond) in conds.iter().enumerate() {
-        let _ = writeln!(
-            s,
-            "    if (reason == 0u && {}) {{ reason = {}u; }}",
-            cond_source(cond),
-            c + 1
-        );
+        let _ = writeln!(s, "    if (reason == 0u && {}) {{ reason = {}u; }}", cond_source(cond), c + 1);
     }
     s.push_str(
         "    st[1] = i + 1u;
@@ -645,11 +595,7 @@ fn gate_outcome(
 
 fn state_from<S: Fields>(arrays: Vec<Array<S::Elem>>) -> S {
     let mut arrays = arrays.into_iter();
-    S::build(&mut || {
-        arrays
-            .next()
-            .unwrap_or_else(|| unreachable!("a record builds exactly COUNT arrays"))
-    })
+    S::build(&mut || arrays.next().unwrap_or_else(|| unreachable!("a record builds exactly COUNT arrays")))
 }
 
 /// Runs `step` on `init` at most `until.max_steps` times, recording scalars of the state after
@@ -689,19 +635,11 @@ pub fn iterate_until_all<S: Fields>(
     let location = Location::caller();
     run(init, &until, &step).map_err(|failure| match failure {
         Failure::Inherited(error) => LumaError::clone(&error),
-        Failure::New(error) => LumaError::Op {
-            op: "iterate_until_all",
-            location,
-            source: Arc::new(error),
-        },
+        Failure::New(error) => LumaError::Op { op: "iterate_until_all", location, source: Arc::new(error) },
     })
 }
 
-fn run<S: Fields>(
-    init: S,
-    until: &Until<'_, S>,
-    step: &impl Fn(&S, &Array<f32>) -> S,
-) -> Outcome<Run<S>> {
+fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>) -> S) -> Outcome<Run<S>> {
     let arrays = init.arrays();
     let ctx = arrays[0].context().clone();
     if arrays.iter().any(|array| !ctx.same_as(array.context())) {
@@ -718,12 +656,7 @@ fn run<S: Fields>(
     let conds: Vec<Cond> = until.stops.iter().map(|stop| stop(&history)).collect();
     if until.max_steps == 0 {
         let history = names.into_iter().map(|name| (name, Vec::new())).collect();
-        return Ok(Run {
-            state: init.copy(),
-            steps: 0,
-            reason: StopReason::MaxSteps,
-            history,
-        });
+        return Ok(Run { state: init.copy(), steps: 0, reason: StopReason::MaxSteps, history });
     }
 
     // The step index: a one-element array that the gate advances.
@@ -822,10 +755,7 @@ fn run<S: Fields>(
         }
         state = next;
         steps = t + 1;
-        if let Some(c) = conds
-            .iter()
-            .position(|cond| eval_host(cond, &histories, steps))
-        {
+        if let Some(c) = conds.iter().position(|cond| eval_host(cond, &histories, steps)) {
             reason = StopReason::Predicate(c);
             break;
         }
@@ -833,12 +763,7 @@ fn run<S: Fields>(
     for array in state.arrays() {
         array.check()?;
     }
-    Ok(Run {
-        state,
-        steps,
-        reason,
-        history: names.into_iter().zip(histories).collect(),
-    })
+    Ok(Run { state, steps, reason, history: names.into_iter().zip(histories).collect() })
 }
 
 /// Makes a stepper of the traced plan if the gate can drive it; `Err` gives the plan back (if
@@ -852,19 +777,14 @@ fn gated(
     max_steps: usize,
 ) -> std::result::Result<Stepper, Option<Plan>> {
     let records = recs.len();
-    let fits = recs
-        .iter()
-        .all(|rec| rec.storage().is_ok_and(|storage| storage.segments() == 1))
+    let fits = recs.iter().all(|rec| rec.storage().is_ok_and(|storage| storage.segments() == 1))
         && 6 + records <= ctx.jit().max_inputs() + 1
         && (records.max(1) * max_steps * 4) as u64 <= ctx.max_buffer_bytes();
     if !fits {
         return Err(Some(plan));
     }
-    let outs: std::result::Result<Vec<Arc<Storage>>, _> = next
-        .arrays()
-        .into_iter()
-        .map(|array| array.storage().cloned())
-        .collect();
+    let outs: std::result::Result<Vec<Arc<Storage>>, _> =
+        next.arrays().into_iter().map(|array| array.storage().cloned()).collect();
     match outs {
         Ok(outs) => Stepper::new(ctx, plan, &trace.init, &trace.probe_storages, outs).map_err(Some),
         Err(_) => Err(Some(plan)),
@@ -920,10 +840,7 @@ fn gated_run<S: Fields>(
         .map_err(|_| LumaError::Gpu("too many recorded launches".into()))?;
     let args_bytes = u64::from(words) * 4;
 
-    let rec_pins = recs
-        .iter()
-        .map(|rec| rec.pin_quiet(0))
-        .collect::<Result<Vec<_>>>()?;
+    let rec_pins = recs.iter().map(|rec| rec.pin_quiet(0)).collect::<Result<Vec<_>>>()?;
     let step_pin = stepv.storage()?.pin_quiet(0)?;
     // The step index of a run starts at 0, whatever an earlier run left in it.
     ctx.upload(step_pin.buffer(), bytemuck::cast_slice(&[0.0f32]))?;
@@ -944,9 +861,7 @@ fn gated_run<S: Fields>(
         let hist = take(hist_bytes, STORAGE_USAGE)?;
         let agg_bytes = 2 * records.max(1) as u64 * 4;
         let agg = take(agg_bytes, STORAGE_USAGE)?;
-        let limits: Vec<f32> = (0..records.max(1))
-            .flat_map(|_| [f32::NEG_INFINITY, f32::INFINITY])
-            .collect();
+        let limits: Vec<f32> = (0..records.max(1)).flat_map(|_| [f32::NEG_INFINITY, f32::INFINITY]).collect();
         ctx.upload(&agg, bytemuck::cast_slice(&limits))?;
 
         let mut base = 0;
@@ -967,10 +882,7 @@ fn gated_run<S: Fields>(
                     .iter()
                     .map(|pin| {
                         let buffer = pin.buffer();
-                        swaps
-                            .iter()
-                            .find(|(from, _)| from == buffer)
-                            .map_or_else(|| buffer.clone(), |(_, to)| to.clone())
+                        swaps.iter().find(|(from, _)| from == buffer).map_or_else(|| buffer.clone(), |(_, to)| to.clone())
                     })
                     .collect();
                 let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(7 + records);
@@ -985,9 +897,7 @@ fn gated_run<S: Fields>(
                 launch_1d(ctx, gate, 1, &raw)?;
             }
             let [done, count, reason, _] = ctx.read::<u32>(&st, 16)?[..] else {
-                return Err(Failure::New(LumaError::Gpu(
-                    "iterate_until_all state is missing".into(),
-                )));
+                return Err(Failure::New(LumaError::Gpu("iterate_until_all state is missing".into())));
             };
             base += in_block;
             block = crate::jit::next_block(in_block, check_every);
@@ -1253,31 +1163,13 @@ mod tests {
     #[test]
     fn the_gate_state_read_back_is_checked_before_it_indexes_host_arrays() {
         // A loop that ran all its steps, and one a condition (the second of two) stopped at step 3.
-        assert_eq!(
-            gate_outcome(0, 0, 0, 16, 16, 2).ok(),
-            Some((16, StopReason::MaxSteps))
-        );
-        assert_eq!(
-            gate_outcome(1, 3, 2, 16, 16, 2).ok(),
-            Some((3, StopReason::Predicate(1)))
-        );
-        assert_eq!(
-            gate_outcome(1, 16, 1, 16, 16, 2).ok(),
-            Some((16, StopReason::Predicate(0)))
-        );
+        assert_eq!(gate_outcome(0, 0, 0, 16, 16, 2).ok(), Some((16, StopReason::MaxSteps)));
+        assert_eq!(gate_outcome(1, 3, 2, 16, 16, 2).ok(), Some((3, StopReason::Predicate(1))));
+        assert_eq!(gate_outcome(1, 16, 1, 16, 16, 2).ok(), Some((16, StopReason::Predicate(0))));
         // Words the gate cannot write: float bit patterns seen in the wild, a step past the maximum,
         // step 0, a condition of 0 (the gate stores `index + 1`) or beyond the last one.
-        for (count, reason) in [
-            (4_294_967_231, 1),
-            (1_065_353_216, 1),
-            (17, 1),
-            (0, 1),
-            (3, 0),
-            (3, 3),
-        ] {
-            let Err(failure) = gate_outcome(1, count, reason, 16, 16, 2) else {
-                panic!("a corrupt state is an error")
-            };
+        for (count, reason) in [(4_294_967_231, 1), (1_065_353_216, 1), (17, 1), (0, 1), (3, 0), (3, 3)] {
+            let Err(failure) = gate_outcome(1, count, reason, 16, 16, 2) else { panic!("a corrupt state is an error") };
             let message = failure.into_error().to_string();
             assert!(message.contains("cannot have written"), "{message}");
         }
@@ -1292,26 +1184,15 @@ mod tests {
         // Peak 4, last 3: ratio 1.33; the last two values are 2 and 3.
         assert!(eval_host(&cond, &histories, 4));
         assert!(!eval_host(&cond, &histories, 2));
-        assert!(eval_host(
-            &(h["b"].trough() - h["b"].first()).lt(0.0),
-            &histories,
-            4
-        ));
+        assert!(eval_host(&(h["b"].trough() - h["b"].first()).lt(0.0), &histories, 4));
         assert!(eval_host(&h.step().ge(4.0), &histories, 4));
-        assert!(eval_host(
-            &a.first().gt(0.5).not().or(a.last().ge(3.0)),
-            &histories,
-            4
-        ));
+        assert!(eval_host(&a.first().gt(0.5).not().or(a.last().ge(3.0)), &histories, 4));
     }
 
     #[test]
     fn the_gate_source_names_every_record_and_condition() {
         let h = hist();
-        let conds = [
-            h["a"].window_min(3).lt(h["b"].last()),
-            h["b"].peak().ge(2.0),
-        ];
+        let conds = [h["a"].window_min(3).lt(h["b"].last()), h["b"].peak().ge(2.0)];
         let source = gate_source(2, &conds);
         assert!(source.contains("rec1"));
         assert!(source.contains("wmin(i, 0u, 3u)"));

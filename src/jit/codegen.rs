@@ -73,14 +73,7 @@ pub(super) fn out_storage_ty(ty: ElemTy) -> &'static str {
 
 /// `index` as an operand of a binary operator.
 fn operand(index: &str) -> String {
-    if index
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        index.to_owned()
-    } else {
-        format!("({index})")
-    }
+    if index.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { index.to_owned() } else { format!("({index})") }
 }
 
 /// The WGSL expression of the element `index` of the read-only buffer `buffer`, as a register
@@ -91,9 +84,7 @@ pub(super) fn load(ty: ElemTy, buffer: &str, index: &str) -> String {
             let j = operand(index);
             format!("(({buffer}[{j} >> 5u] >> ({j} & 31u)) & 1u)")
         }
-        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => {
-            format!("{buffer}[{index}]")
-        }
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => format!("{buffer}[{index}]"),
     }
 }
 
@@ -119,9 +110,7 @@ pub(super) fn store(ty: ElemTy, buffer: &str, index: &str, value: &str) -> Strin
         ElemTy::Bool => format!(
             "{{ let luma_j = {index}; let luma_m = 1u << (luma_j & 31u); if ({value} != 0u) {{ _ = atomicOr(&{buffer}[luma_j >> 5u], luma_m); }} else {{ _ = atomicAnd(&{buffer}[luma_j >> 5u], ~luma_m); }} }}"
         ),
-        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => {
-            format!("{buffer}[{index}] = {value};")
-        }
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => format!("{buffer}[{index}] = {value};"),
     }
 }
 
@@ -143,10 +132,7 @@ pub(super) struct Names<'a> {
 }
 
 /// [`Names`] of a program without views or in-place inputs.
-pub(super) const NO_NAMES: Names<'static> = Names {
-    views: &[],
-    in_place: &[],
-};
+pub(super) const NO_NAMES: Names<'static> = Names { views: &[], in_place: &[] };
 
 /// The WGSL expression of the operation `op` (anything but a shift) on the operands named `a`,
 /// `b` and `c`; `index` names the element it is computed at. `None` for a shift.
@@ -176,27 +162,18 @@ pub(super) fn expression(instr: &Instr, index: &str, segmented: bool, names: &Na
     if let Some(value) = operation(instr.op, &a, &b, &c, index) {
         return value;
     }
-    let OpKind::Shift(kind) = instr.op.kind else {
-        return String::new();
-    };
+    let OpKind::Shift(kind) = instr.op.kind else { return String::new() };
     let (at, view) = match kind {
         ShiftKind::View { map, edge } => {
             let n = names.views.iter().position(|&known| known == (map, edge));
             // A view missing from `names` is not valid shader code and surfaces as a
             // shader compile error.
             (
-                format!(
-                    "view{}({index})",
-                    n.map_or_else(|| "_missing".to_owned(), |n| n.to_string())
-                ),
-                n.filter(|_| edge == Edge::Fill)
-                    .map(|n| format!("view{n}_in({index})")),
+                format!("view{}({index})", n.map_or_else(|| "_missing".to_owned(), |n| n.to_string())),
+                n.filter(|_| edge == Edge::Fill).map(|n| format!("view{n}_in({index})")),
             )
         }
-        ShiftKind::ParamView { id, spec } => (
-            format!("pview{id}({index})"),
-            (spec.edge == Edge::Fill).then(|| format!("pview{id}_in({index})")),
-        ),
+        ShiftKind::ParamView { id, spec } => (format!("pview{id}({index})"), (spec.edge == Edge::Fill).then(|| format!("pview{id}_in({index})"))),
         _ => (shift_index(kind, &b, index, &c), None),
     };
     let read = match instr.args[0] {
@@ -300,11 +277,7 @@ pub(super) fn udiv(n: &str, slot: u32, wide: bool) -> String {
 /// `n % d`, see [`udiv`].
 pub(super) fn urem(n: &str, slot: u32, wide: bool) -> String {
     if wide {
-        format!(
-            "luma_urem_wide({n}, p.s{slot}, p.s{}, p.s{})",
-            slot + 1,
-            slot + 2
-        )
+        format!("luma_urem_wide({n}, p.s{slot}, p.s{}, p.s{})", slot + 1, slot + 2)
     } else {
         format!("luma_urem({n}, p.s{slot}, p.s{})", slot + 3)
     }
@@ -331,15 +304,8 @@ pub(super) fn view_helpers(views: &[(ViewMap, Edge)]) -> String {
             if map.out[from] == 1 {
                 return format!("{}", axis.start);
             }
-            let quotient = if out_stride[from] == 1 {
-                "i".to_owned()
-            } else {
-                format!("(i / {}u)", out_stride[from])
-            };
-            format!(
-                "(i32(({quotient}) % {}u) * ({}) + ({}))",
-                map.out[from], axis.step, axis.start
-            )
+            let quotient = if out_stride[from] == 1 { "i".to_owned() } else { format!("(i / {}u)", out_stride[from]) };
+            format!("(i32(({quotient}) % {}u) * ({}) + ({}))", map.out[from], axis.step, axis.start)
         };
         // Whether the unclipped coordinate of axis `a` is always inside the source.
         let inside = |a: usize| {
@@ -357,28 +323,16 @@ pub(super) fn view_helpers(views: &[(ViewMap, Edge)]) -> String {
                 Edge::Mirror => format!("luma_mirror_i({}, {size})", raw(a)),
                 Edge::Wrap => format!("luma_wrap_i({}, {size})", raw(a)),
             };
-            terms.push(if src_stride[a] == 1 {
-                format!("u32({coord})")
-            } else {
-                format!("u32({coord}) * {}u", src_stride[a])
-            });
+            terms.push(if src_stride[a] == 1 { format!("u32({coord})") } else { format!("u32({coord}) * {}u", src_stride[a]) });
         }
-        let sum = if terms.is_empty() {
-            "0u".to_owned()
-        } else {
-            terms.join(" + ")
-        };
+        let sum = if terms.is_empty() { "0u".to_owned() } else { terms.join(" + ") };
         let _ = writeln!(src, "fn view{n}(i: u32) -> u32 {{ return {sum}; }}");
         if edge == Edge::Fill {
             let tests: Vec<String> = (0..4)
                 .filter(|&a| !inside(a))
                 .map(|a| format!("{0} >= 0 && {0} < {1}", raw(a), map.src[a]))
                 .collect();
-            let all = if tests.is_empty() {
-                "true".to_owned()
-            } else {
-                tests.join(" && ")
-            };
+            let all = if tests.is_empty() { "true".to_owned() } else { tests.join(" && ") };
             let _ = writeln!(src, "fn view{n}_in(i: u32) -> bool {{ return {all}; }}");
         }
     }
@@ -394,19 +348,11 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
         (ElemTy::F64, ElemTy::F32) => format!("f32({value})"),
         (ElemTy::F32, ElemTy::Df32) => format!("vec2<f32>(luma_o({value}), 0.0)"),
         (ElemTy::Df32, ElemTy::F32) => format!("luma_o({value}.x + {value}.y)"),
-        (ElemTy::F64, ElemTy::Df32) => {
-            format!("vec2<f32>(luma_o(f32({value})), f32({value} - f64(luma_o(f32({value})))))")
-        }
+        (ElemTy::F64, ElemTy::Df32) => format!("vec2<f32>(luma_o(f32({value})), f32({value} - f64(luma_o(f32({value})))))"),
         (ElemTy::Df32, ElemTy::F64) => format!("(f64(luma_o({value}.x)) + f64({value}.y))"),
-        (ElemTy::U32, ElemTy::F32) | (ElemTy::I32, ElemTy::F32) | (ElemTy::Bool, ElemTy::F32) => {
-            format!("f32({value})")
-        }
-        (ElemTy::F32, ElemTy::U32) => {
-            format!("select(0u, u32(clamp({value}, 0.0, 4294967040.0)), {value} == {value})")
-        }
-        (ElemTy::F32, ElemTy::I32) => format!(
-            "select(0i, i32(clamp({value}, -2147483648.0, 2147483520.0)), {value} == {value})"
-        ),
+        (ElemTy::U32, ElemTy::F32) | (ElemTy::I32, ElemTy::F32) | (ElemTy::Bool, ElemTy::F32) => format!("f32({value})"),
+        (ElemTy::F32, ElemTy::U32) => format!("select(0u, u32(clamp({value}, 0.0, 4294967040.0)), {value} == {value})"),
+        (ElemTy::F32, ElemTy::I32) => format!("select(0i, i32(clamp({value}, -2147483648.0, 2147483520.0)), {value} == {value})"),
         (ElemTy::U32, ElemTy::I32) => format!("bitcast<i32>({value})"),
         (ElemTy::I32, ElemTy::U32) => format!("bitcast<u32>({value})"),
         (ElemTy::Bool, ElemTy::U32) => value.to_owned(),
@@ -424,11 +370,7 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
 pub(super) fn library_for(key: &FusedKey, tuning: &Tuning) -> String {
     let library = |guard: &str| df_library(guard, tuning.df_fma, tuning.df_sloppy_add);
     let instrs = || key.instrs.iter().chain(key.subs.iter().flatten());
-    let math = if instrs().any(calls_df_math) {
-        DF_MATH_LIBRARY
-    } else {
-        ""
-    };
+    let math = if instrs().any(calls_df_math) { DF_MATH_LIBRARY } else { "" };
     match key.guard {
         Some(guard) => library(&format!("p.s{guard}")) + math,
         None if instrs().any(calls_df_library) => library("0u") + math,
@@ -455,18 +397,9 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         },
         Gen::RangeConst { .. } | Gen::ParamRange { .. } => {
             let coord = match kind {
-                Gen::RangeConst {
-                    stride: 1, size, ..
-                } => format!("({index} % {size}u)"),
-                Gen::RangeConst { stride, size, .. } => {
-                    format!("(({index} / {stride}u) % {size}u)")
-                }
-                Gen::ParamRange {
-                    kind,
-                    wide,
-                    stride,
-                    size,
-                } => match kind {
+                Gen::RangeConst { stride: 1, size, .. } => format!("({index} % {size}u)"),
+                Gen::RangeConst { stride, size, .. } => format!("(({index} / {stride}u) % {size}u)"),
+                Gen::ParamRange { kind, wide, stride, size } => match kind {
                     params::RangeKind::Zero => "0u".to_owned(),
                     params::RangeKind::Mod => urem(index, size, wide),
                     params::RangeKind::DivMod => urem(&udiv(index, stride, wide), size, wide),
@@ -490,33 +423,20 @@ const THREEFRY_ROTATIONS: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
 /// The WGSL helpers of the random generators, if any instruction of `programs` uses them.
 pub(super) fn generator_helpers<'a>(programs: impl IntoIterator<Item = &'a [Instr]>) -> String {
     let random = programs.into_iter().flatten().any(|instr| {
-        matches!(
-            instr.op.kind,
-            OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal)
-        )
+        matches!(instr.op.kind, OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal))
     });
     if !random {
         return String::new();
     }
     let keys = ["k0", "k1", "k2"];
-    let mut src = String::from(
-        "fn luma_threefry(c: u32, k0: u32, k1: u32) -> vec2<u32> {\n    let k2 = 0x1BD11BDAu ^ k0 ^ k1;\n    var x0 = c + k0;\n    var x1 = k1;\n",
-    );
+    let mut src =
+        String::from("fn luma_threefry(c: u32, k0: u32, k1: u32) -> vec2<u32> {\n    let k2 = 0x1BD11BDAu ^ k0 ^ k1;\n    var x0 = c + k0;\n    var x1 = k1;\n");
     for round in 0..20 {
         let r = THREEFRY_ROTATIONS[round % 8];
-        let _ = writeln!(
-            src,
-            "    x0 = x0 + x1; x1 = ((x1 << {r}u) | (x1 >> {}u)) ^ x0;",
-            32 - r
-        );
+        let _ = writeln!(src, "    x0 = x0 + x1; x1 = ((x1 << {r}u) | (x1 >> {}u)) ^ x0;", 32 - r);
         if round % 4 == 3 {
             let s = round / 4 + 1;
-            let _ = writeln!(
-                src,
-                "    x0 = x0 + {}; x1 = x1 + {} + {s}u;",
-                keys[s % 3],
-                keys[(s + 1) % 3]
-            );
+            let _ = writeln!(src, "    x0 = x0 + {}; x1 = x1 + {} + {s}u;", keys[s % 3], keys[(s + 1) % 3]);
         }
     }
     src.push_str(
@@ -535,10 +455,7 @@ fn luma_normal(w: vec2<u32>) -> f32 {
 /// Whether a program uses the element's index in the whole array, so a kernel run per segment
 /// needs the segment's first index.
 pub(super) fn generates(key: &FusedKey) -> bool {
-    key.instrs
-        .iter()
-        .chain(key.subs.iter().flatten())
-        .any(|instr| matches!(instr.op.kind, OpKind::Generate(_)))
+    key.instrs.iter().chain(key.subs.iter().flatten()).any(|instr| matches!(instr.op.kind, OpKind::Generate(_)))
 }
 
 /// The index element `i` of a shift reads; `s` names the scalar shift of [`ShiftKind::Linear`],
@@ -546,9 +463,7 @@ pub(super) fn generates(key: &FusedKey) -> bool {
 fn shift_index(kind: ShiftKind, s: &str, i: &str, total: &str) -> String {
     match kind {
         ShiftKind::Linear => format!("select({i} - {s}, {i} + ({total} - {s}), {i} < {s})"),
-        ShiftKind::View { .. } | ShiftKind::ParamView { .. } => {
-            unreachable!("views are indexed by their own functions")
-        }
+        ShiftKind::View { .. } | ShiftKind::ParamView { .. } => unreachable!("views are indexed by their own functions"),
         ShiftKind::Take { len } => format!("min({s}, {}u)", len.saturating_sub(1)),
         ShiftKind::ParamTake { max_slot } => format!("min({s}, p.s{max_slot})"),
         ShiftKind::ParamDims { axes } => {
@@ -561,31 +476,18 @@ fn shift_index(kind: ShiftKind, s: &str, i: &str, total: &str) -> String {
                 // The stride the coordinate is scaled back by is a shift for a power of two.
                 let (quotient, scale) = match axis.stride {
                     params::DivRemSpec::None => (i.to_owned(), None),
-                    params::DivRemSpec::Pow2 => (
-                        format!("({i} >> p.s{stride_slot})"),
-                        Some(format!("<< p.s{stride_slot}")),
-                    ),
-                    params::DivRemSpec::Runtime { wide } => (
-                        udiv(i, stride_slot, wide),
-                        Some(format!("* p.s{stride_slot}")),
-                    ),
+                    params::DivRemSpec::Pow2 => (format!("({i} >> p.s{stride_slot})"), Some(format!("<< p.s{stride_slot}"))),
+                    params::DivRemSpec::Runtime { wide } => (udiv(i, stride_slot, wide), Some(format!("* p.s{stride_slot}"))),
                 };
                 let (coord, dim) = match (axis.rem, axis.shifted) {
                     (params::DivRemSpec::None, false) => (quotient, String::new()),
-                    (params::DivRemSpec::Pow2, _) => (
-                        format!("({quotient} & p.s{rem_slot})"),
-                        format!("(p.s{rem_slot} + 1u)"),
-                    ),
-                    (params::DivRemSpec::Runtime { wide }, _) => {
-                        (urem(&quotient, rem_slot, wide), format!("p.s{rem_slot}"))
-                    }
+                    (params::DivRemSpec::Pow2, _) => (format!("({quotient} & p.s{rem_slot})"), format!("(p.s{rem_slot} + 1u)")),
+                    (params::DivRemSpec::Runtime { wide }, _) => (urem(&quotient, rem_slot, wide), format!("p.s{rem_slot}")),
                     (params::DivRemSpec::None, true) => (quotient, format!("p.s{rem_slot}")),
                 };
                 let wrapped = if axis.shifted {
                     let shift = format!("p.s{shift_slot}");
-                    format!(
-                        "select({coord} - {shift}, {coord} + ({dim} - {shift}), {coord} < {shift})"
-                    )
+                    format!("select({coord} - {shift}, {coord} + ({dim} - {shift}), {coord} < {shift})")
                 } else {
                     coord
                 };
@@ -617,16 +519,9 @@ fn shift_index(kind: ShiftKind, s: &str, i: &str, total: &str) -> String {
                 let wrapped = if shift == 0 {
                     coord
                 } else {
-                    format!(
-                        "select({coord} - {shift}u, {coord} + {}u, {coord} < {shift}u)",
-                        dim - shift
-                    )
+                    format!("select({coord} - {shift}u, {coord} + {}u, {coord} < {shift}u)", dim - shift)
                 };
-                terms.push(if stride == 1 {
-                    wrapped
-                } else {
-                    format!("{wrapped} * {stride}u")
-                });
+                terms.push(if stride == 1 { wrapped } else { format!("{wrapped} * {stride}u") });
             }
             if terms.is_empty() {
                 "0u".to_owned()
@@ -646,11 +541,7 @@ pub(super) fn direct(instrs: &[Instr], k: u32) -> bool {
 /// Whether `instr` loads input `k` at the element being computed.
 fn reads_directly(instr: &Instr, k: u32) -> bool {
     let skip = usize::from(matches!(instr.op.kind, OpKind::Shift(_)));
-    instr
-        .args
-        .iter()
-        .skip(skip)
-        .any(|arg| *arg == Ref::Input(k))
+    instr.args.iter().skip(skip).any(|arg| *arg == Ref::Input(k))
 }
 
 /// Whether the kernel for `key` reads a scalar from the uniform `p`. A tiled kernel (see
@@ -665,12 +556,7 @@ pub(super) fn reads_scalars(key: &FusedKey) -> bool {
         || key.params.as_ref().is_some_and(|params| params.slots)
         || programs.enumerate().any(|(p, instrs)| {
             instrs.iter().enumerate().any(|(at, instr)| {
-                let baked = key.tile.as_ref().is_some_and(|tile| {
-                    tile.offsets
-                        .get(p)
-                        .and_then(|row| row.get(at))
-                        .is_some_and(Option::is_some)
-                });
+                let baked = key.tile.as_ref().is_some_and(|tile| tile.offsets.get(p).and_then(|row| row.get(at)).is_some_and(Option::is_some));
                 !baked && instr.args.iter().any(|arg| matches!(arg, Ref::Scalar(_)))
             })
         })
@@ -685,23 +571,14 @@ const STACK_STAGE_BYTES: u64 = 16384;
 /// by the invocations of the workgroup in order it is a coalesced store instead of one stride
 /// of `total` elements per invocation. Needs the stretch (`wg * total` elements of `ty`) to fit.
 fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
-    let Tail::Stack {
-        total,
-        first: 0,
-        block: 1,
-    } = key.tail
-    else {
-        return false;
-    };
+    let Tail::Stack { total, first: 0, block: 1 } = key.tail else { return false };
     // The bits of a `bool` result are written one at a time, not as the words they are in.
     let bytes = match ty {
         ElemTy::Bool => return false,
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => 4,
         ElemTy::F64 | ElemTy::Df32 => 8,
     };
-    key.outputs.len() == total as usize
-        && total > 1
-        && u64::from(wg) * u64::from(total) * bytes <= STACK_STAGE_BYTES
+    key.outputs.len() == total as usize && total > 1 && u64::from(wg) * u64::from(total) * bytes <= STACK_STAGE_BYTES
 }
 
 /// The WGSL source of the kernel for `key`, with the workgroup shapes `tuning` gives.
@@ -711,12 +588,7 @@ fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
 /// sub-program at the indices it is read at, and no `sub{k}` functions exist; for a
 /// [`Lowered::Staged`] key (`key.staging` set) the staged sub-programs are computed into
 /// workgroup memory instead.
-pub(crate) fn source(
-    key: &FusedKey,
-    tuning: &Tuning,
-    segment_len: u32,
-    lowered: Option<&Lowered>,
-) -> String {
+pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lowered>) -> String {
     let mut src = kernel_source(key, tuning, segment_len, lowered);
     if src.contains("luma_udiv") || src.contains("luma_urem") {
         src.push_str(DIV_HELPERS);
@@ -724,12 +596,7 @@ pub(crate) fn source(
     src
 }
 
-fn kernel_source(
-    key: &FusedKey,
-    tuning: &Tuning,
-    segment_len: u32,
-    lowered: Option<&Lowered>,
-) -> String {
+fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lowered>) -> String {
     let inlined = match lowered {
         Some(Lowered::Plain(inlined)) => Some(inlined),
         Some(Lowered::Staged(programs)) => Some(&programs.main),
@@ -750,17 +617,8 @@ fn kernel_source(
     let segmented = !key.spans.is_empty();
     let slots = |k: usize| key.spans.get(k).copied().unwrap_or(0);
     // A product reads its operands at their own element indices: nothing is relative to a segment.
-    let based =
-        generates(key) && !segmented && !matmul && !axis && radix.is_none() && solve.is_none();
-    let uniform = reduce
-        || matmul
-        || axis
-        || radix.is_some()
-        || solve.is_some()
-        || (!key.scalar_tys.is_empty() && reads_scalars(key))
-        || segmented
-        || based
-        || key.runs;
+    let based = generates(key) && !segmented && !matmul && !axis && radix.is_none() && solve.is_none();
+    let uniform = reduce || matmul || axis || radix.is_some() || solve.is_some() || (!key.scalar_tys.is_empty() && reads_scalars(key)) || segmented || based || key.runs;
     let mut src = String::new();
 
     if uniform {
@@ -801,11 +659,7 @@ fn kernel_source(
         }
         src.push_str("}\n");
     }
-    let out_elem = |at: usize| {
-        key.instrs
-            .get(at)
-            .map_or(ElemTy::F32, |instr| instr.op.out_ty())
-    };
+    let out_elem = |at: usize| key.instrs.get(at).map_or(ElemTy::F32, |instr| instr.op.out_ty());
     let out_ty = |at: usize| out_elem(at).wgsl();
     let outputs: Vec<usize> = match key.tail {
         Tail::Store | Tail::StoreMapped(_) | Tail::ParamStoreMapped { .. } => {
@@ -844,11 +698,7 @@ fn kernel_source(
     }
     for (j, &at) in outputs.iter().enumerate() {
         // A reduction's single output is `out`, as `reduce_main` expects.
-        let name = if reduce {
-            "out".to_owned()
-        } else {
-            format!("out{j}")
-        };
+        let name = if reduce { "out".to_owned() } else { format!("out{j}") };
         // An atomic scatter binds its target as atomics (floats as their bits). A reduction
         // writes the values it folds, whatever their buffer layout.
         let elem = match (key.tail, out_ty(at)) {
@@ -857,29 +707,18 @@ fn kernel_source(
             (Tail::Reduce(_), ty) => ty,
             _ => out_storage_ty(out_elem(at)),
         };
-        let _ = writeln!(
-            src,
-            "@group(1) @binding({j}) var<storage, read_write> {name}: array<{elem}>;"
-        );
+        let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{elem}>;");
     }
     for (k, ty) in key.input_tys.iter().enumerate() {
         if key.in_place.iter().any(|&(paired, _)| paired == k as u32) {
             continue;
         }
         if !segmented || direct(&key.instrs, k as u32) {
-            let _ = writeln!(
-                src,
-                "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;",
-                storage_ty(*ty)
-            );
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", storage_ty(*ty));
             binding += 1;
         }
         for s in 0..slots(k) {
-            let _ = writeln!(
-                src,
-                "@group(1) @binding({binding}) var<storage, read> in{k}_{s}: array<{}>;",
-                storage_ty(*ty)
-            );
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}_{s}: array<{}>;", storage_ty(*ty));
             binding += 1;
         }
     }
@@ -887,10 +726,7 @@ fn kernel_source(
         // The operands that are buffers, after the inputs of the others.
         for (operand, name) in [(lhs, "a"), (rhs, "b")] {
             if !operand.fused() {
-                let _ = writeln!(
-                    src,
-                    "@group(1) @binding({binding}) var<storage, read> {name}: array<f32>;"
-                );
+                let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> {name}: array<f32>;");
                 binding += 1;
             }
         }
@@ -913,54 +749,29 @@ fn kernel_source(
             // `segment_len` counts 4-byte words: an 8-byte element halves it.
             let per = segment_len / (ty.stride() as u32 / 4).max(1);
             let (log, mask) = (per.trailing_zeros(), per.wrapping_sub(1));
-            let _ = writeln!(
-                src,
-                "fn ld{k}(g: u32) -> {} {{\n    let c = g >> {log}u; let o = g & {mask}u;",
-                ty.wgsl()
-            );
+            let _ = writeln!(src, "fn ld{k}(g: u32) -> {} {{\n    let c = g >> {log}u; let o = g & {mask}u;", ty.wgsl());
             for s in 0..m - 1 {
-                let _ = writeln!(
-                    src,
-                    "    if (c == p.c{k}_{s}) {{ return {}; }}",
-                    load(*ty, &format!("in{k}_{s}"), "o")
-                );
+                let _ = writeln!(src, "    if (c == p.c{k}_{s}) {{ return {}; }}", load(*ty, &format!("in{k}_{s}"), "o"));
             }
-            let _ = writeln!(
-                src,
-                "    return {};\n}}",
-                load(*ty, &format!("in{k}_{}", m - 1), "o")
-            );
+            let _ = writeln!(src, "    return {};\n}}", load(*ty, &format!("in{k}_{}", m - 1), "o"));
         }
     }
     let views = match lowered {
         Some(Lowered::Plain(inlined)) => views_of_inlined(key, &[inlined]),
-        Some(Lowered::Staged(programs)) => {
-            views_of_inlined(key, &programs.bodies().collect::<Vec<_>>())
-        }
+        Some(Lowered::Staged(programs)) => views_of_inlined(key, &programs.bodies().collect::<Vec<_>>()),
         None => views_of(key),
     };
     // The lowered instruction holding the value of main-program instruction `at`.
-    let value = |at: usize| {
-        inlined
-            .and_then(|inlined| inlined.main.get(at))
-            .map_or(at, |&lowered| lowered as usize)
-    };
+    let value = |at: usize| inlined.and_then(|inlined| inlined.main.get(at)).map_or(at, |&lowered| lowered as usize);
     // A reduction of `Df32` brings the library itself (see `reduce_main`), but not its math
     // functions: those come with the program that calls them.
     let reduces_df = reduce && out_ty(outputs[0]) == "vec2<f32>";
     if !reduces_df {
         src.push_str(&library_for(key, tuning));
-    } else if key
-        .instrs
-        .iter()
-        .chain(key.subs.iter().flatten())
-        .any(calls_df_math)
-    {
+    } else if key.instrs.iter().chain(key.subs.iter().flatten()).any(calls_df_math) {
         src.push_str(DF_MATH_LIBRARY);
     }
-    src.push_str(&generator_helpers(
-        std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)),
-    ));
+    src.push_str(&generator_helpers(std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice))));
     src.push_str(&view_helpers(&views));
     if key.params.is_some() {
         let bodies: Vec<&Inlined> = match lowered {
@@ -970,10 +781,7 @@ fn kernel_source(
         };
         src.push_str(&params::view_helpers(&params::views_used(key, &bodies)));
     }
-    let names = Names {
-        views: &views,
-        in_place: &key.in_place,
-    };
+    let names = Names { views: &views, in_place: &key.in_place };
     if key.tile.is_none() && lowered.is_none() {
         src.push_str(&subs(key, &views, &key.in_place));
     }
@@ -998,111 +806,41 @@ fn kernel_source(
         | Tail::ParamStack { .. } => {
             let stores: String = match key.tail {
                 Tail::StoreMapped(map) => {
-                    let n = views
-                        .iter()
-                        .position(|&known| known == (map, Edge::None))
-                        .unwrap_or(0);
-                    outputs
-                        .iter()
-                        .enumerate()
-                        .map(|(j, &at)| {
-                            format!(
-                                "    {}\n",
-                                store(
-                                    out_elem(at),
-                                    &format!("out{j}"),
-                                    &format!("view{n}(i)"),
-                                    &format!("t{}", value(at))
-                                )
-                            )
-                        })
-                        .collect()
+                    let n = views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0);
+                    outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), &format!("view{n}(i)"), &format!("t{}", value(at))))).collect()
                 }
-                Tail::ParamStoreMapped { id, .. } => outputs
-                    .iter()
-                    .enumerate()
-                    .map(|(j, &at)| {
-                        format!(
-                            "    {}\n",
-                            store(
-                                out_elem(at),
-                                &format!("out{j}"),
-                                &format!("pview{id}(i)"),
-                                &format!("t{}", value(at))
-                            )
-                        )
-                    })
-                    .collect(),
+                Tail::ParamStoreMapped { id, .. } => {
+                    outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), &format!("pview{id}(i)"), &format!("t{}", value(at))))).collect()
+                }
                 Tail::Scatter { .. } | Tail::ParamScatter { .. } => {
                     let len = match key.tail {
                         Tail::ParamScatter { len_slot } => format!("p.s{len_slot}"),
                         Tail::Scatter { len } => format!("{len}u"),
                         _ => unreachable!(),
                     };
-                    let (stored, index) = (
-                        key.outputs.first().copied().unwrap_or(0),
-                        key.outputs.get(1).copied().unwrap_or(0),
-                    );
-                    let write = store(
-                        out_elem(outputs[0]),
-                        "out0",
-                        "j",
-                        &format!("t{}", value(stored as usize)),
-                    );
-                    format!(
-                        "    let j = t{};\n    if (j < {len}) {{ {write} }}\n",
-                        value(index as usize)
-                    )
+                    let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
+                    let write = store(out_elem(outputs[0]), "out0", "j", &format!("t{}", value(stored as usize)));
+                    format!("    let j = t{};\n    if (j < {len}) {{ {write} }}\n", value(index as usize))
                 }
-                Tail::ScatterAdd {
-                    len,
-                    op,
-                    private: false,
-                    len_slot,
-                } => {
-                    let len =
-                        len_slot.map_or_else(|| format!("{len}u"), |slot| format!("p.s{slot}"));
-                    let (stored, index) = (
-                        key.outputs.first().copied().unwrap_or(0),
-                        key.outputs.get(1).copied().unwrap_or(0),
-                    );
-                    let apply = atomic_apply(
-                        out_ty(outputs[0]),
-                        op,
-                        "out0[j]",
-                        &format!("t{}", value(stored as usize)),
-                        "    ",
-                    );
-                    format!(
-                        "    let j = t{};\n    if (j < {len}) {{\n{apply}    }}\n",
-                        value(index as usize)
-                    )
+                Tail::ScatterAdd { len, op, private: false, len_slot } => {
+                    let len = len_slot.map_or_else(|| format!("{len}u"), |slot| format!("p.s{slot}"));
+                    let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
+                    let apply = atomic_apply(out_ty(outputs[0]), op, "out0[j]", &format!("t{}", value(stored as usize)), "    ");
+                    format!("    let j = t{};\n    if (j < {len}) {{\n{apply}    }}\n", value(index as usize))
                 }
                 Tail::ScatterAdd { private: true, .. } => String::new(),
                 Tail::Stack { total, .. } if stack_stages(key, wg, out_elem(outputs[0])) => {
                     let mut stores = String::new();
                     for (j, &at) in key.outputs.iter().enumerate() {
-                        let _ = writeln!(
-                            stores,
-                            "        luma_stage[lid.x * {total}u + {j}u] = t{};",
-                            value(at as usize)
-                        );
+                        let _ = writeln!(stores, "        luma_stage[lid.x * {total}u + {j}u] = t{};", value(at as usize));
                     }
                     stores
                 }
-                Tail::Stack {
-                    total,
-                    first,
-                    block,
-                } => {
+                Tail::Stack { total, first, block } => {
                     let mut stores = if block == 1 {
                         format!("    let o = i * {total}u + {first}u;\n")
                     } else {
-                        format!(
-                            "    let q = i / {block}u;\n    let o = q * {}u + (i - q * {block}u) + {}u;\n",
-                            u64::from(total) * u64::from(block),
-                            u64::from(first) * u64::from(block)
-                        )
+                        format!("    let q = i / {block}u;\n    let o = q * {}u + (i - q * {block}u) + {}u;\n", u64::from(total) * u64::from(block), u64::from(first) * u64::from(block))
                     };
                     for (j, &at) in key.outputs.iter().enumerate() {
                         let write = store(
@@ -1141,55 +879,16 @@ fn kernel_source(
                     }
                     stores
                 }
-                _ => outputs
-                    .iter()
-                    .enumerate()
-                    .map(|(j, &at)| {
-                        format!(
-                            "    {}\n",
-                            store(
-                                out_elem(at),
-                                &format!("out{j}"),
-                                "i",
-                                &format!("t{}", value(at))
-                            )
-                        )
-                    })
-                    .collect(),
+                _ => outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), "i", &format!("t{}", value(at))))).collect(),
             };
-            if let Tail::ScatterAdd {
-                len,
-                op,
-                private: true,
-                ..
-            } = key.tail
-            {
-                let (stored, slot) = (
-                    key.outputs.first().copied().unwrap_or(0),
-                    key.outputs.get(1).copied().unwrap_or(0),
-                );
+            if let Tail::ScatterAdd { len, op, private: true, .. } = key.tail {
+                let (stored, slot) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
                 let ty = out_ty(outputs[0]);
                 let bins = (len as usize).next_multiple_of(wg as usize);
                 let atom = if ty == "i32" { "i32" } else { "u32" };
                 let seed = atomic_seed(ty, op);
-                let apply = atomic_apply(
-                    ty,
-                    op,
-                    "acc[j]",
-                    &format!("t{}", value(stored as usize)),
-                    "            ",
-                );
-                let merge = atomic_apply(
-                    ty,
-                    op,
-                    "out0[b]",
-                    &if ty == "f32" {
-                        "bitcast<f32>(a)".to_owned()
-                    } else {
-                        "a".to_owned()
-                    },
-                    "            ",
-                );
+                let apply = atomic_apply(ty, op, "acc[j]", &format!("t{}", value(stored as usize)), "            ");
+                let merge = atomic_apply(ty, op, "out0[b]", &if ty == "f32" { "bitcast<f32>(a)".to_owned() } else { "a".to_owned() }, "            ");
                 let _ = write!(
                     src,
                     "
@@ -1268,13 +967,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
             if key.runs {
                 // A region write: the bits of the `bool` outputs go to the words of runs (see `runs_main`).
                 let view = match key.tail {
-                    Tail::StoreMapped(map) => format!(
-                        "view{}",
-                        views
-                            .iter()
-                            .position(|&known| known == (map, Edge::None))
-                            .unwrap_or(0)
-                    ),
+                    Tail::StoreMapped(map) => format!("view{}", views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0)),
                     Tail::ParamStoreMapped { id, .. } => format!("pview{id}"),
                     _ => unreachable!("runs are for region writes"),
                 };
@@ -1284,25 +977,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
                         let _ = writeln!(assigns, "        b{j} = t{};", value(at));
                         bits.push(j);
                     } else {
-                        let _ = writeln!(
-                            plain,
-                            "        {}",
-                            store(
-                                out_elem(at),
-                                &format!("out{j}"),
-                                &format!("{view}(i)"),
-                                &format!("t{}", value(at))
-                            )
-                        );
+                        let _ = writeln!(plain, "        {}", store(out_elem(at), &format!("out{j}"), &format!("{view}(i)"), &format!("t{}", value(at))));
                     }
                 }
-                src.push_str(&runs_main(
-                    wg,
-                    tuning.subgroup32,
-                    &view,
-                    &bits,
-                    &format!("{global}{program}{plain}{assigns}"),
-                ));
+                src.push_str(&runs_main(wg, tuning.subgroup32, &view, &bits, &format!("{global}{program}{plain}{assigns}")));
                 return src;
             }
             if key.tail == Tail::Store && key.writes_bits() {
@@ -1313,24 +991,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
                         let _ = writeln!(assigns, "        b{j} = t{};", value(at));
                         bits.push(j);
                     } else {
-                        let _ = writeln!(
-                            plain,
-                            "        {}",
-                            store(
-                                out_elem(at),
-                                &format!("out{j}"),
-                                "i",
-                                &format!("t{}", value(at))
-                            )
-                        );
+                        let _ = writeln!(plain, "        {}", store(out_elem(at), &format!("out{j}"), "i", &format!("t{}", value(at))));
                     }
                 }
-                src.push_str(&packed_main(
-                    wg,
-                    tuning.subgroup32,
-                    &bits,
-                    &format!("{global}{program}{plain}{assigns}"),
-                ));
+                src.push_str(&packed_main(wg, tuning.subgroup32, &bits, &format!("{global}{program}{plain}{assigns}")));
                 return src;
             }
             let _ = write!(
@@ -1347,113 +1011,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         Tail::Reduce(ops) => {
             let (ty, last) = (out_ty(outputs[0]), outputs[0]);
             let guard = format!("p.s{}", key.guard.unwrap_or(0));
-            let elem = if reduces_df {
-                ReduceElem::Df32 {
-                    guard: &guard,
-                    fma: tuning.df_fma,
-                }
-            } else {
-                ReduceElem::Plain(ty)
-            };
-            let names = Names {
-                views: &views,
-                in_place: &[],
-            };
-            src.push_str(&load_function(
-                "luma_eval",
-                key,
-                last,
-                inlined,
-                &names,
-                index,
-                segmented,
-            ));
+            let elem = if reduces_df { ReduceElem::Df32 { guard: &guard, fma: tuning.df_fma } } else { ReduceElem::Plain(ty) };
+            let names = Names { views: &views, in_place: &[] };
+            src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
             src.push_str(&reduce_main(elem, ops, false, "luma_eval", tuning));
         }
         Tail::AxisReduce(pass) => {
-            let names = Names {
-                views: &views,
-                in_place: &[],
-            };
+            let names = Names { views: &views, in_place: &[] };
             let last = key.instrs.len().saturating_sub(1);
-            src.push_str(&load_function(
-                "luma_eval",
-                key,
-                last,
-                inlined,
-                &names,
-                index,
-                segmented,
-            ));
-            src.push_str(&crate::scan::reduce_body(
-                pass,
-                out_ty(last),
-                "luma_eval",
-                wg,
-            ));
+            src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
+            src.push_str(&crate::scan::reduce_body(pass, out_ty(last), "luma_eval", wg));
         }
-        Tail::Matmul {
-            tile,
-            aligned,
-            split,
-            lhs,
-            rhs,
-        } => {
-            let names = Names {
-                views: &views,
-                in_place: &[],
-            };
+        Tail::Matmul { tile, aligned, split, lhs, rhs } => {
+            let names = Names { views: &views, in_place: &[] };
             let mut roots = key.outputs.iter().map(|&at| at as usize);
             for (operand, function) in [(lhs, "luma_lhs"), (rhs, "luma_rhs")] {
-                if operand.fused()
-                    && let Some(root) = roots.next()
-                {
-                    src.push_str(&load_function(
-                        function, key, root, inlined, &names, index, segmented,
-                    ));
+                if operand.fused() && let Some(root) = roots.next() {
+                    src.push_str(&load_function(function, key, root, inlined, &names, index, segmented));
                 }
             }
             src.push_str(&crate::matmul::body(tile, aligned, split, lhs, rhs));
         }
         Tail::Solve(spec) => {
-            let names = Names {
-                views: &views,
-                in_place: &[],
-            };
+            let names = Names { views: &views, in_place: &[] };
             let per = crate::solve::Io::parts_per_system(usize::from(spec.block));
             let mut roots = key.outputs.iter().map(|&at| at as usize);
             for s in 0..usize::from(spec.systems) {
                 let parts: Vec<Part> = (0..per)
-                    .map(|k| {
-                        if spec.is_fused(s * per + k) {
-                            Part::Root(roots.next().unwrap_or(0))
-                        } else {
-                            Part::Buffer(s * per + k)
-                        }
-                    })
+                    .map(|k| if spec.is_fused(s * per + k) { Part::Root(roots.next().unwrap_or(0)) } else { Part::Buffer(s * per + k) })
                     .collect();
-                src.push_str(&load_cell(
-                    &format!("luma_cell{s}"),
-                    key,
-                    &parts,
-                    inlined,
-                    &names,
-                    index,
-                    segmented,
-                ));
+                src.push_str(&load_cell(&format!("luma_cell{s}"), key, &parts, inlined, &names, index, segmented));
             }
             src.push_str(&spec.cell_dispatch());
             src.push_str(&spec.body());
         }
         Tail::Radix(pass) => {
-            let names = Names {
-                views: &views,
-                in_place: &[],
-            };
+            let names = Names { views: &views, in_place: &[] };
             let root = key.outputs.first().map_or(0, |&at| at as usize);
-            src.push_str(&load_function(
-                "luma_key", key, root, inlined, &names, index, segmented,
-            ));
+            src.push_str(&load_function("luma_key", key, root, inlined, &names, index, segmented));
             src.push_str(&crate::sort::fused_body(pass, out_ty(root)));
         }
     }
@@ -1473,49 +1068,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 fn packed_main(wg: u32, ballot: bool, bits: &[usize], computed: &str) -> String {
     debug_assert!(wg.is_multiple_of(32));
     let words = wg / 32;
-    let (mut decls, mut zero, mut vars, mut set, mut write) = (
-        String::new(),
-        String::new(),
-        String::new(),
-        String::new(),
-        String::new(),
-    );
+    let (mut decls, mut zero, mut vars, mut set, mut write) = (String::new(), String::new(), String::new(), String::new(), String::new());
     for &j in bits {
         let _ = writeln!(vars, "    var b{j}: u32 = 0u;");
         if ballot {
-            let _ = writeln!(
-                write,
-                "    {{\n        let m = subgroupBallot(b{j} != 0u).x;\n        if (lane == 0u && i < luma.size.x) {{ atomicStore(&out{j}[i >> 5u], m); }}\n    }}"
-            );
+            let _ = writeln!(write, "    {{\n        let m = subgroupBallot(b{j} != 0u).x;\n        if (lane == 0u && i < luma.size.x) {{ atomicStore(&out{j}[i >> 5u], m); }}\n    }}");
         } else {
-            let _ = writeln!(
-                decls,
-                "var<workgroup> luma_bits{j}: array<atomic<u32>, {words}>;"
-            );
-            let _ = writeln!(
-                zero,
-                "    if (lid.x < {words}u) {{ atomicStore(&luma_bits{j}[lid.x], 0u); }}"
-            );
-            let _ = writeln!(
-                set,
-                "    atomicOr(&luma_bits{j}[lid.x >> 5u], b{j} << (lid.x & 31u));"
-            );
+            let _ = writeln!(decls, "var<workgroup> luma_bits{j}: array<atomic<u32>, {words}>;");
+            let _ = writeln!(zero, "    if (lid.x < {words}u) {{ atomicStore(&luma_bits{j}[lid.x], 0u); }}");
+            let _ = writeln!(set, "    atomicOr(&luma_bits{j}[lid.x >> 5u], b{j} << (lid.x & 31u));");
             let _ = writeln!(
                 write,
                 "    if (lid.x < {words}u && base + lid.x * 32u < luma.size.x) {{ atomicStore(&out{j}[(base >> 5u) + lid.x], atomicLoad(&luma_bits{j}[lid.x])); }}"
             );
         }
     }
-    let lane = if ballot {
-        ",\n    @builtin(subgroup_invocation_id) lane: u32"
-    } else {
-        ""
-    };
-    let barrier = if ballot {
-        ""
-    } else {
-        "    workgroupBarrier();\n"
-    };
+    let lane = if ballot { ",\n    @builtin(subgroup_invocation_id) lane: u32" } else { "" };
+    let barrier = if ballot { "" } else { "    workgroupBarrier();\n" };
     format!(
         "
 {decls}@compute @workgroup_size({wg})
@@ -1544,13 +1113,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 fn runs_main(wg: u32, ballot: bool, view: &str, bits: &[usize], computed: &str) -> String {
     debug_assert!(wg.is_multiple_of(32));
     let words = wg / 32;
-    let (mut decls, mut zero, mut vars, mut set, mut write) = (
-        String::new(),
-        String::new(),
-        String::new(),
-        String::new(),
-        String::new(),
-    );
+    let (mut decls, mut zero, mut vars, mut set, mut write) = (String::new(), String::new(), String::new(), String::new(), String::new());
     // Stores the word `v` of the output `j` into the base word `wd`, `m` being the bits of the run.
     let store_word = |j: usize, v: &str, wd: &str, pad: &str| {
         format!(
@@ -1560,29 +1123,12 @@ fn runs_main(wg: u32, ballot: bool, view: &str, bits: &[usize], computed: &str) 
     for &j in bits {
         let _ = writeln!(vars, "    var b{j}: u32 = 0u;");
         if ballot {
-            let _ = write!(
-                write,
-                "    let v{j} = subgroupBallot(b{j} != 0u).x;\n    if (lane == 0u && m != 0u) {{\n{}    }}\n",
-                store_word(j, &format!("v{j}"), "wd", "        ")
-            );
+            let _ = write!(write, "    let v{j} = subgroupBallot(b{j} != 0u).x;\n    if (lane == 0u && m != 0u) {{\n{}    }}\n", store_word(j, &format!("v{j}"), "wd", "        "));
         } else {
-            let _ = writeln!(
-                decls,
-                "var<workgroup> luma_bits{j}: array<atomic<u32>, {words}>;"
-            );
-            let _ = writeln!(
-                zero,
-                "    if (lid.x < {words}u) {{ atomicStore(&luma_bits{j}[lid.x], 0u); }}"
-            );
-            let _ = writeln!(
-                set,
-                "    atomicOr(&luma_bits{j}[lid.x >> 5u], b{j} << bit);"
-            );
-            let _ = write!(
-                write,
-                "        {{\n            let v = atomicLoad(&luma_bits{j}[lid.x]);\n{}        }}\n",
-                store_word(j, "v", "wd", "            ")
-            );
+            let _ = writeln!(decls, "var<workgroup> luma_bits{j}: array<atomic<u32>, {words}>;");
+            let _ = writeln!(zero, "    if (lid.x < {words}u) {{ atomicStore(&luma_bits{j}[lid.x], 0u); }}");
+            let _ = writeln!(set, "    atomicOr(&luma_bits{j}[lid.x >> 5u], b{j} << bit);");
+            let _ = write!(write, "        {{\n            let v = atomicLoad(&luma_bits{j}[lid.x]);\n{}        }}\n", store_word(j, "v", "wd", "            "));
         }
     }
     let at = "    let slot = g >> 5u;\n    let bit = g & 31u;\n    let run = slot / p.words;\n";
@@ -1596,9 +1142,7 @@ fn runs_main(wg: u32, ballot: bool, view: &str, bits: &[usize], computed: &str) 
     } else {
         (
             "",
-            format!(
-                "    if (lid.x < {words}u) {{ atomicStore(&luma_valid[lid.x], 0u); }}\n{zero}    workgroupBarrier();\n"
-            ),
+            format!("    if (lid.x < {words}u) {{ atomicStore(&luma_valid[lid.x], 0u); }}\n{zero}    workgroupBarrier();\n"),
             format!(
                 "{set}    atomicOr(&luma_valid[lid.x >> 5u], select(0u, 1u << bit, ok));
     workgroupBarrier();
@@ -1614,11 +1158,7 @@ fn runs_main(wg: u32, ballot: bool, view: &str, bits: &[usize], computed: &str) 
             ),
         )
     };
-    let valid_decl = if ballot {
-        String::new()
-    } else {
-        format!("var<workgroup> luma_valid: array<atomic<u32>, {words}>;\n{decls}")
-    };
+    let valid_decl = if ballot { String::new() } else { format!("var<workgroup> luma_valid: array<atomic<u32>, {words}>;\n{decls}") };
     format!(
         "
 {valid_decl}@compute @workgroup_size({wg})
@@ -1653,21 +1193,10 @@ pub(super) fn load_function(
     index: &str,
     segmented: bool,
 ) -> String {
-    let global = if index == "gi" {
-        "    let gi = p.base + i;\n"
-    } else {
-        ""
-    };
-    let ty = key
-        .instrs
-        .get(out)
-        .map_or(ElemTy::F32, |instr| instr.op.out_ty())
-        .wgsl();
+    let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
+    let ty = key.instrs.get(out).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
     let (computed, values) = computed_values(key, &[out], inlined, names, index, segmented);
-    format!(
-        "\nfn {name}(i: u32) -> {ty} {{\n{global}{computed}    return t{};\n}}\n",
-        values[0]
-    )
+    format!("\nfn {name}(i: u32) -> {ty} {{\n{global}{computed}    return t{};\n}}\n", values[0])
 }
 
 /// One value a line solve reads at a cell: the root `at` of the program, or the buffer `pr{k}`.
@@ -1688,21 +1217,8 @@ pub(super) fn load_cell(
     index: &str,
     segmented: bool,
 ) -> String {
-    let global = if index == "gi" {
-        "    let gi = p.base + i;\n"
-    } else {
-        ""
-    };
-    let roots: Vec<usize> = parts
-        .iter()
-        .filter_map(|part| {
-            if let Part::Root(at) = part {
-                Some(*at)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
+    let roots: Vec<usize> = parts.iter().filter_map(|part| if let Part::Root(at) = part { Some(*at) } else { None }).collect();
     let (computed, values) = computed_values(key, &roots, inlined, names, index, segmented);
     let mut values = values.into_iter();
     let returned: Vec<String> = parts
@@ -1712,11 +1228,7 @@ pub(super) fn load_cell(
             Part::Buffer(k) => format!("pr{k}[i]"),
         })
         .collect();
-    format!(
-        "\nfn {name}(i: u32) -> array<f32, {n}> {{\n{global}{computed}    return array<f32, {n}>({});\n}}\n",
-        returned.join(", "),
-        n = parts.len()
-    )
+    format!("\nfn {name}(i: u32) -> array<f32, {n}> {{\n{global}{computed}    return array<f32, {n}>({});\n}}\n", returned.join(", "), n = parts.len())
 }
 
 /// The statements computing the instructions that the roots `outs` of the main program of `key`
@@ -1730,32 +1242,10 @@ fn computed_values(
     index: &str,
     segmented: bool,
 ) -> (String, Vec<usize>) {
-    let values: Vec<usize> = outs
-        .iter()
-        .map(|&out| {
-            inlined
-                .and_then(|inlined| inlined.main.get(out))
-                .map_or(out, |&lowered| lowered as usize)
-        })
-        .collect();
+    let values: Vec<usize> = outs.iter().map(|&out| inlined.and_then(|inlined| inlined.main.get(out)).map_or(out, |&lowered| lowered as usize)).collect();
     let computed = match inlined {
-        Some(inlined) => lowered_body(
-            key,
-            inlined,
-            names,
-            index,
-            None,
-            Some(&needed_lowered(inlined, &values)),
-        ),
-        None => body_with(
-            &key.instrs,
-            &key.input_tys,
-            names,
-            index,
-            segmented,
-            Some(&needed(&key.instrs, outs)),
-            &|_, _| None,
-        ),
+        Some(inlined) => lowered_body(key, inlined, names, index, None, Some(&needed_lowered(inlined, &values))),
+        None => body_with(&key.instrs, &key.input_tys, names, index, segmented, Some(&needed(&key.instrs, outs)), &|_, _| None),
     };
     (computed, values)
 }
@@ -1764,19 +1254,11 @@ fn computed_values(
 /// themselves included: their operands, and those of the shifts that define the indices of the
 /// contexts they are computed at and read at.
 fn needed_lowered(inlined: &Inlined, roots: &[usize]) -> Vec<bool> {
-    let tmp = |arg: &Ref| {
-        if let Ref::Tmp(t) = arg {
-            Some(*t as usize)
-        } else {
-            None
-        }
-    };
+    let tmp = |arg: &Ref| if let Ref::Tmp(t) = arg { Some(*t as usize) } else { None };
     let mut keep = vec![false; inlined.instrs.len()];
     let mut work = roots.to_vec();
     while let Some(n) = work.pop() {
-        let Some(slot) = keep.get_mut(n) else {
-            continue;
-        };
+        let Some(slot) = keep.get_mut(n) else { continue };
         if std::mem::replace(slot, true) {
             continue;
         }
@@ -1784,9 +1266,7 @@ fn needed_lowered(inlined: &Inlined, roots: &[usize]) -> Vec<bool> {
         work.extend(flat.args.iter().filter_map(tmp));
         for mut c in [flat.at, flat.child] {
             while c != 0 {
-                let Some(ctx) = inlined.ctxs.get(c as usize) else {
-                    break;
-                };
+                let Some(ctx) = inlined.ctxs.get(c as usize) else { break };
                 work.extend(ctx.args.iter().filter_map(tmp));
                 c = ctx.parent;
             }
@@ -1825,11 +1305,7 @@ pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
     let wg = tuning.elementwise_workgroup;
     let count = key.outputs.len();
     // The type of the states (`run_loop_fused` checked that they agree).
-    let state_elem = key
-        .outputs
-        .first()
-        .and_then(|&at| key.instrs.get(at as usize))
-        .map_or(ElemTy::F32, |instr| instr.op.out_ty());
+    let state_elem = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map_or(ElemTy::F32, |instr| instr.op.out_ty());
     let state_ty = state_elem.wgsl();
     let mut src = String::from("struct Params { steps: u32, ");
     for (k, ty) in key.scalar_tys.iter().enumerate() {
@@ -1839,21 +1315,13 @@ pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
     let mut binding = 0;
     for (role, access) in [("out", "read_write"), ("init", "read")] {
         for j in 0..count {
-            let _ = writeln!(
-                src,
-                "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<{}>;",
-                storage_ty(state_elem)
-            );
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<{}>;", storage_ty(state_elem));
             binding += 1;
         }
     }
     for (k, ty) in key.input_tys.iter().enumerate() {
         if states.get(k).copied().flatten().is_none() {
-            let _ = writeln!(
-                src,
-                "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;",
-                storage_ty(*ty)
-            );
+            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", storage_ty(*ty));
             binding += 1;
         }
     }
@@ -1871,20 +1339,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "
     );
     for j in 0..count {
-        let _ = writeln!(
-            src,
-            "    var s{j}: {state_ty} = {};",
-            load(state_elem, &format!("init{j}"), "i")
-        );
+        let _ = writeln!(src, "    var s{j}: {state_ty} = {};", load(state_elem, &format!("init{j}"), "i"));
     }
     for (k, ty) in key.input_tys.iter().enumerate() {
         if states.get(k).copied().flatten().is_none() && direct(&key.instrs, k as u32) {
-            let _ = writeln!(
-                src,
-                "    let a{k}: {} = {};",
-                ty.wgsl(),
-                load(*ty, &format!("in{k}"), "i")
-            );
+            let _ = writeln!(src, "    let a{k}: {} = {};", ty.wgsl(), load(*ty, &format!("in{k}"), "i"));
         }
     }
     src.push_str("    for (var step = 0u; step < p.steps; step = step + 1u) {\n");
@@ -1894,23 +1353,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
     }
     for (k, instr) in key.instrs.iter().enumerate() {
-        let _ = writeln!(
-            src,
-            "        let t{k}: {} = {};",
-            instr.op.out_ty().wgsl(),
-            expression(instr, "i", false, &NO_NAMES)
-        );
+        let _ = writeln!(src, "        let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr, "i", false, &NO_NAMES));
     }
     for (j, at) in key.outputs.iter().enumerate() {
         let _ = writeln!(src, "        s{j} = t{at};");
     }
     src.push_str("    }\n");
     for j in 0..count {
-        let _ = writeln!(
-            src,
-            "    {}",
-            store(state_elem, &format!("out{j}"), "i", &format!("s{j}"))
-        );
+        let _ = writeln!(src, "    {}", store(state_elem, &format!("out{j}"), "i", &format!("s{j}")));
     }
     src.push_str("}\n");
     src
@@ -1919,16 +1369,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// The loads of the inputs at element `i` and the instructions, as `let` bindings. The inputs
 /// `names.in_place` lists are read from the output buffers, before they are overwritten.
 /// `index` and `segmented` are those of [`expression`].
-fn body(
-    instrs: &[Instr],
-    input_tys: &[ElemTy],
-    names: &Names,
-    index: &str,
-    segmented: bool,
-) -> String {
-    body_with(instrs, input_tys, names, index, segmented, None, &|_, _| {
-        None
-    })
+fn body(instrs: &[Instr], input_tys: &[ElemTy], names: &Names, index: &str, segmented: bool) -> String {
+    body_with(instrs, input_tys, names, index, segmented, None, &|_, _| None)
 }
 
 /// [`body`], where `staged(k, instr)` may replace the expression of instruction `k`, and only the
@@ -1946,17 +1388,8 @@ fn body_with(
     let mut src = String::new();
     // Inputs read only through shifts are not loaded at `i`.
     for (k, ty) in input_tys.iter().enumerate() {
-        if instrs
-            .iter()
-            .enumerate()
-            .any(|(at, instr)| kept(at) && reads_directly(instr, k as u32))
-        {
-            let _ = writeln!(
-                src,
-                "    let a{k}: {} = {};",
-                ty.wgsl(),
-                input_load(names, *ty, k as u32, "i")
-            );
+        if instrs.iter().enumerate().any(|(at, instr)| kept(at) && reads_directly(instr, k as u32)) {
+            let _ = writeln!(src, "    let a{k}: {} = {};", ty.wgsl(), input_load(names, *ty, k as u32, "i"));
         }
     }
     for (k, instr) in instrs.iter().enumerate().filter(|&(k, _)| kept(k)) {
@@ -1979,14 +1412,7 @@ fn flat_name(reference: Ref, ty: ElemTy, at: u32) -> String {
 /// them, then the instructions, each defined (`t{n}`) after everything it reads. A `Select` the
 /// lowering marks as a branch is an `if`/`else` that computes the instructions only its own
 /// operand needs. `names` and `index` are those of [`expression`].
-fn lowered_body(
-    key: &FusedKey,
-    inlined: &Inlined,
-    names: &Names,
-    index: &str,
-    staging: Option<&Staging>,
-    keep: Option<&[bool]>,
-) -> String {
+fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, staging: Option<&Staging>, keep: Option<&[bool]>) -> String {
     struct Emit<'a> {
         key: &'a FusedKey,
         inlined: &'a Inlined,
@@ -2004,18 +1430,12 @@ fn lowered_body(
     impl Emit<'_> {
         /// The index of context `c`.
         fn index_of(&self, c: u32) -> String {
-            if c == 0 {
-                self.index.to_owned()
-            } else {
-                format!("i{c}")
-            }
+            if c == 0 { self.index.to_owned() } else { format!("i{c}") }
         }
 
         /// Declares the index of context `c`, after its parents'.
         fn define(&mut self, c: u32) {
-            let Some(ctx) = self.inlined.ctxs.get(c as usize) else {
-                return;
-            };
+            let Some(ctx) = self.inlined.ctxs.get(c as usize) else { return };
             if c == 0 || self.defined[c as usize] {
                 return;
             }
@@ -2024,24 +1444,15 @@ fn lowered_body(
             let from = self.index_of(ctx.parent);
             let expr = match ctx.kind {
                 ShiftKind::View { map, edge } => {
-                    let n = self
-                        .names
-                        .views
-                        .iter()
-                        .position(|&known| known == (map, edge));
-                    format!(
-                        "view{}({from})",
-                        n.map_or_else(|| "_missing".to_owned(), |n| n.to_string())
-                    )
+                    let n = self.names.views.iter().position(|&known| known == (map, edge));
+                    format!("view{}({from})", n.map_or_else(|| "_missing".to_owned(), |n| n.to_string()))
                 }
                 ShiftKind::ParamView { id, .. } => format!("pview{id}({from})"),
                 kind => {
                     if let Ref::Input(k) = ctx.args[0] {
                         self.load(k, ctx.parent);
                     }
-                    let [s, total] = ctx
-                        .args
-                        .map(|reference| flat_name(reference, ElemTy::U32, ctx.parent));
+                    let [s, total] = ctx.args.map(|reference| flat_name(reference, ElemTy::U32, ctx.parent));
                     shift_index(kind, &s, &from, &total)
                 }
             };
@@ -2055,26 +1466,11 @@ fn lowered_body(
             }
             self.loaded.push((k, c));
             self.define(c);
-            let ty = self
-                .key
-                .input_tys
-                .get(k as usize)
-                .copied()
-                .unwrap_or(ElemTy::F32);
+            let ty = self.key.input_tys.get(k as usize).copied().unwrap_or(ElemTy::F32);
             if c == 0 {
-                let _ = writeln!(
-                    self.src,
-                    "    let a{k}: {} = {};",
-                    ty.wgsl(),
-                    input_load(self.names, ty, k, "i")
-                );
+                let _ = writeln!(self.src, "    let a{k}: {} = {};", ty.wgsl(), input_load(self.names, ty, k, "i"));
             } else {
-                let _ = writeln!(
-                    self.src,
-                    "    let a{k}_{c}: {} = {};",
-                    ty.wgsl(),
-                    input_load(self.names, ty, k, &format!("i{c}"))
-                );
+                let _ = writeln!(self.src, "    let a{k}_{c}: {} = {};", ty.wgsl(), input_load(self.names, ty, k, &format!("i{c}")));
             }
         }
 
@@ -2102,14 +1498,10 @@ fn lowered_body(
         /// Writes instruction `n`.
         fn instruction(&mut self, n: usize) {
             let inlined = self.inlined;
-            let Some(flat) = inlined.instrs.get(n) else {
-                return;
-            };
+            let Some(flat) = inlined.instrs.get(n) else { return };
             // A read from workgroup memory needs no index: the cell is `(lx, ly)` plus offsets.
             let staged_read = match (flat.op.kind, flat.args[0]) {
-                (OpKind::Shift(_), Ref::Sub(s)) => {
-                    self.staging.is_some_and(|layout| layout.find(s).is_some())
-                }
+                (OpKind::Shift(_), Ref::Sub(s)) => self.staging.is_some_and(|layout| layout.find(s).is_some()),
                 _ => false,
             };
             if !staged_read {
@@ -2147,29 +1539,15 @@ fn lowered_body(
                         other => format!("{}[{at}]", name(other, ElemTy::U32)),
                     };
                     match kind {
-                        ShiftKind::View {
-                            map,
-                            edge: Edge::Fill,
-                        } => {
+                        ShiftKind::View { map, edge: Edge::Fill } => {
                             let fill = flat_name(flat.args[1], op.operand_ty(1), flat.at);
-                            let view = self
-                                .names
-                                .views
-                                .iter()
-                                .position(|&known| known == (map, Edge::Fill));
-                            let inside = format!(
-                                "view{}_in({})",
-                                view.map_or_else(|| "_missing".to_owned(), |n| n.to_string()),
-                                self.index_of(flat.at)
-                            );
+                            let view = self.names.views.iter().position(|&known| known == (map, Edge::Fill));
+                            let inside = format!("view{}_in({})", view.map_or_else(|| "_missing".to_owned(), |n| n.to_string()), self.index_of(flat.at));
                             format!("select({fill}, {read}, {inside})")
                         }
                         ShiftKind::ParamView { id, spec } if spec.edge == Edge::Fill => {
                             let fill = flat_name(flat.args[1], op.operand_ty(1), flat.at);
-                            format!(
-                                "select({fill}, {read}, pview{id}_in({}))",
-                                self.index_of(flat.at)
-                            )
+                            format!("select({fill}, {read}, pview{id}_in({}))", self.index_of(flat.at))
                         }
                         _ => read,
                     }
@@ -2180,8 +1558,7 @@ fn lowered_body(
                             self.load(k, flat.at);
                         }
                     }
-                    let [a, b, c] =
-                        [0, 1, 2].map(|i| flat_name(flat.args[i], op.operand_ty(i), flat.at));
+                    let [a, b, c] = [0, 1, 2].map(|i| flat_name(flat.args[i], op.operand_ty(i), flat.at));
                     operation(op, &a, &b, &c, &self.index_of(flat.at)).unwrap_or_default()
                 }
             };
@@ -2192,15 +1569,9 @@ fn lowered_body(
         /// before it takes its operand.
         fn branch(&mut self, n: usize) {
             let inlined = self.inlined;
-            let Some(flat) = inlined.instrs.get(n) else {
-                return;
-            };
+            let Some(flat) = inlined.instrs.get(n) else { return };
             let mask = flat_name(flat.args[0], ElemTy::U32, flat.at);
-            let _ = writeln!(
-                self.src,
-                "    var t{n}: {};\n    if ({mask} != 0u) {{",
-                flat.op.out_ty().wgsl()
-            );
+            let _ = writeln!(self.src, "    var t{n}: {};\n    if ({mask} != 0u) {{", flat.op.out_ty().wgsl());
             for (side, slot) in [(Region::Taken(n as u32), 1), (Region::Skipped(n as u32), 2)] {
                 if slot == 2 {
                     self.src.push_str("    } else {\n");
@@ -2219,12 +1590,7 @@ fn lowered_body(
     }
 
     let mut members: FxMap<Region, Vec<u32>> = FxMap::default();
-    for (n, &region) in inlined
-        .region
-        .iter()
-        .enumerate()
-        .filter(|&(n, _)| keep.is_none_or(|keep| keep.get(n).copied().unwrap_or(false)))
-    {
+    for (n, &region) in inlined.region.iter().enumerate().filter(|&(n, _)| keep.is_none_or(|keep| keep.get(n).copied().unwrap_or(false))) {
         members.entry(region).or_default().push(n as u32);
     }
     let mut emit = Emit {
@@ -2308,9 +1674,7 @@ impl Tile {
 
     /// The halo of the widest region along each axis.
     pub(crate) fn halo(&self) -> (u32, u32) {
-        self.need
-            .iter()
-            .fold((0, 0), |(x, y), &(nx, ny)| (x.max(nx), y.max(ny)))
+        self.need.iter().fold((0, 0), |(x, y), &(nx, ny)| (x.max(nx), y.max(ny)))
     }
 
     /// Whether a tile and its halo fit in the array along every axis.
@@ -2323,24 +1687,12 @@ impl Tile {
 /// The staging of `key` on arrays of `len` elements, if its sub-programs are read through
 /// small shifts only and their regions fit in workgroup memory. `None` keeps the sub-programs
 /// as functions called per shift.
-pub(super) fn plan_tile(
-    key: &FusedKey,
-    scalars: &[u32],
-    len: usize,
-    tuning: &Tuning,
-) -> Option<Tile> {
+pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tuning) -> Option<Tile> {
     // Staged values are 4 bytes wide; programs of the 8-byte types call their sub-programs.
-    if key.tail != Tail::Store
-        || key.subs.is_empty()
-        || !key.spans.is_empty()
-        || !key.narrow()
-        || key.writes_bits()
-    {
+    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || !key.narrow() || key.writes_bits() {
         return None;
     }
-    let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice())
-        .chain(key.subs.iter().map(Vec::as_slice))
-        .collect();
+    let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)).collect();
     let mut dims = None;
     for instr in programs.iter().copied().flatten() {
         if let OpKind::Shift(ShiftKind::Dims { dims: d, .. }) = instr.op.kind {
@@ -2360,35 +1712,18 @@ pub(super) fn plan_tile(
         let mut row = Vec::with_capacity(instrs.len());
         for instr in *instrs {
             let skip = usize::from(matches!(instr.op.kind, OpKind::Shift(_)));
-            if instr
-                .args
-                .iter()
-                .skip(skip)
-                .any(|arg| matches!(arg, Ref::Sub(_)))
-            {
+            if instr.args.iter().skip(skip).any(|arg| matches!(arg, Ref::Sub(_))) {
                 return None;
             }
             let at = match (instr.op.kind, instr.args[0]) {
                 // Sub-programs come before the programs reading them.
-                (OpKind::Shift(_), Ref::Sub(j))
-                    if p > 0 && j as usize + 1 >= p || j as usize >= key.subs.len() =>
-                {
-                    return None;
-                }
+                (OpKind::Shift(_), Ref::Sub(j)) if p > 0 && j as usize + 1 >= p || j as usize >= key.subs.len() => return None,
                 (OpKind::Shift(kind), Ref::Sub(_)) => {
                     let (dx, dy) = match kind {
-                        ShiftKind::View { .. }
-                        | ShiftKind::Take { .. }
-                        | ShiftKind::ParamView { .. }
-                        | ShiftKind::ParamTake { .. }
-                        | ShiftKind::ParamDims { .. } => return None,
-                        ShiftKind::Dims { shifts, .. } => {
-                            (signed(shifts[0], w), signed(shifts[1], h))
-                        }
+                        ShiftKind::View { .. } | ShiftKind::Take { .. } | ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamDims { .. } => return None,
+                        ShiftKind::Dims { shifts, .. } => (signed(shifts[0], w), signed(shifts[1], h)),
                         ShiftKind::Linear => {
-                            let Ref::Scalar(s) = instr.args[1] else {
-                                return None;
-                            };
+                            let Ref::Scalar(s) = instr.args[1] else { return None };
                             let amount = *scalars.get(s as usize)?;
                             if h == 1 {
                                 (signed(amount, w), 0)
@@ -2420,24 +1755,13 @@ pub(super) fn plan_tile(
         for (instr, at) in programs[p].iter().zip(&offsets[p]) {
             if let (Some((ox, oy)), Ref::Sub(j)) = (at, instr.args[0]) {
                 let slot = &mut need[j as usize];
-                *slot = (
-                    slot.0.max(own.0 + ox.unsigned_abs()),
-                    slot.1.max(own.1 + oy.unsigned_abs()),
-                );
+                *slot = (slot.0.max(own.0 + ox.unsigned_abs()), slot.1.max(own.1 + oy.unsigned_abs()));
             }
         }
     }
 
-    let (mut tx, mut ty) = if h == 1 {
-        (tuning.stencil_tile_1d, 1)
-    } else {
-        tuning.stencil_tile_2d
-    };
-    let bytes = |tx: u32, ty: u32| {
-        need.iter()
-            .map(|&(nx, ny)| (tx + 2 * nx) * (ty + 2 * ny) * 4)
-            .sum::<u32>()
-    };
+    let (mut tx, mut ty) = if h == 1 { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
+    let bytes = |tx: u32, ty: u32| need.iter().map(|&(nx, ny)| (tx + 2 * nx) * (ty + 2 * ny) * 4).sum::<u32>();
     while bytes(tx, ty) > tuning.stencil_tile_bytes {
         if h == 1 || tx >= ty {
             tx /= 2;
@@ -2448,13 +1772,7 @@ pub(super) fn plan_tile(
             return None;
         }
     }
-    Some(Tile {
-        dims: (w, h),
-        slots: None,
-        tile: (tx, ty),
-        need,
-        offsets,
-    })
+    Some(Tile { dims: (w, h), slots: None, tile: (tx, ty), need, offsets })
 }
 
 /// The kernel of `key` with its sub-programs staged as `tile` says, running one workgroup per
@@ -2464,26 +1782,10 @@ fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str, names: &Na
     let region = |j: usize| (tx + 2 * tile.need[j].0, ty + 2 * tile.need[j].1);
     // The extents are literals, or words of the uniform.
     let (one_d, small, w, h, tiles_x) = match tile.slots {
-        Some(slots) => (
-            slots.one_d,
-            slots.small,
-            format!("p.s{}", slots.base),
-            format!("p.s{}", slots.base + 1),
-            format!("p.s{}", slots.base + 2),
-        ),
-        None => (
-            tile.dims.1 == 1,
-            tile.fits(),
-            format!("{}u", tile.dims.0),
-            format!("{}u", tile.dims.1),
-            format!("{}u", tile.dims.0.div_ceil(tx)),
-        ),
+        Some(slots) => (slots.one_d, slots.small, format!("p.s{}", slots.base), format!("p.s{}", slots.base + 1), format!("p.s{}", slots.base + 2)),
+        None => (tile.dims.1 == 1, tile.fits(), format!("{}u", tile.dims.0), format!("{}u", tile.dims.1), format!("{}u", tile.dims.0.div_ceil(tx))),
     };
-    let (index, global) = if based {
-        ("gi", "        let gi = p.base + i;\n")
-    } else {
-        ("i", "")
-    };
+    let (index, global) = if based { ("gi", "        let gi = p.base + i;\n") } else { ("i", "") };
     // Cell (lx, ly) relative to the tile origin, as a global element.
     let element = if one_d {
         format!("wrap(i32(tile_x) + lx, {w})")
@@ -2493,16 +1795,10 @@ fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str, names: &Na
     let staged = |p: usize| {
         move |at: usize, instr: &Instr| -> Option<String> {
             let (ox, oy) = tile.offsets[p][at]?;
-            let Ref::Sub(j) = instr.args[0] else {
-                return None;
-            };
+            let Ref::Sub(j) = instr.args[0] else { return None };
             let j = j as usize;
             let ((nx, ny), (lw, _)) = (tile.need[j], region(j));
-            let row = if one_d {
-                String::new()
-            } else {
-                format!(" + u32(ly + ({})) * {lw}u", oy + ny as i32)
-            };
+            let row = if one_d { String::new() } else { format!(" + u32(ly + ({})) * {lw}u", oy + ny as i32) };
             Some(format!("w{j}[u32(lx + ({})){row}]", ox + nx as i32))
         }
     };
@@ -2510,10 +1806,7 @@ fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str, names: &Na
     let mut src = String::new();
     for (k, instrs) in key.subs.iter().enumerate() {
         let (lw, lh) = region(k);
-        let ty = instrs
-            .last()
-            .map_or(ElemTy::F32, |instr| instr.op.out_ty())
-            .wgsl();
+        let ty = instrs.last().map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
         let _ = writeln!(src, "var<workgroup> w{k}: array<{ty}, {}>;", lw * lh);
     }
     let _ = write!(
@@ -2542,18 +1835,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
     workgroupBarrier();
 ",
             lw * lh,
-            body_with(
-                instrs,
-                &key.input_tys,
-                &Names {
-                    views: names.views,
-                    in_place: &[]
-                },
-                index,
-                false,
-                None,
-                &staged(k + 1)
-            ),
+            body_with(instrs, &key.input_tys, &Names { views: names.views, in_place: &[] }, index, false, None, &staged(k + 1)),
         );
     }
     let _ = write!(
@@ -2570,15 +1852,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
 }}
 ",
         tx * ty,
-        body_with(
-            &key.instrs,
-            &key.input_tys,
-            names,
-            index,
-            false,
-            None,
-            &staged(0)
-        ),
+        body_with(&key.instrs, &key.input_tys, names, index, false, None, &staged(0)),
     );
     src
 }
@@ -2621,18 +1895,8 @@ fn staged_main(
     };
     let mut src = String::new();
     for entry in &staging.subs {
-        let ty = key
-            .subs
-            .get(entry.sub as usize)
-            .and_then(|program| program.last())
-            .map_or(ElemTy::F32, |instr| instr.op.out_ty())
-            .wgsl();
-        let _ = writeln!(
-            src,
-            "var<workgroup> w{}: array<{ty}, {}>;",
-            entry.sub,
-            entry.cells()
-        );
+        let ty = key.subs.get(entry.sub as usize).and_then(|program| program.last()).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
+        let _ = writeln!(src, "var<workgroup> w{}: array<{ty}, {}>;", entry.sub, entry.cells());
     }
     let _ = write!(
         src,
@@ -2676,12 +1940,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
                 .members
                 .iter()
                 .zip(&group.values)
-                .filter_map(|(&member, last)| {
-                    Some(format!(
-                        "            w{}[e] = t{last};\n",
-                        staging.subs.get(member)?.sub
-                    ))
-                })
+                .filter_map(|(&member, last)| Some(format!("            w{}[e] = t{last};\n", staging.subs.get(member)?.sub)))
                 .collect();
             let _ = write!(
                 src,
@@ -2728,21 +1987,12 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
 fn subs(key: &FusedKey, views: &[(ViewMap, Edge)], in_place: &[(u32, u32)]) -> String {
     let mut src = String::new();
     for (k, instrs) in key.subs.iter().enumerate() {
-        let ty = instrs
-            .last()
-            .map_or(ElemTy::F32, |instr| instr.op.out_ty())
-            .wgsl();
+        let ty = instrs.last().map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
         let last = instrs.len().saturating_sub(1);
         let _ = write!(
             src,
             "\nfn sub{k}(i: u32) -> {ty} {{\n{}    return t{last};\n}}\n",
-            body(
-                instrs,
-                &key.input_tys,
-                &Names { views, in_place },
-                "i",
-                false
-            )
+            body(instrs, &key.input_tys, &Names { views, in_place }, "i", false)
         );
     }
     src
@@ -2765,9 +2015,7 @@ fn atomic_apply(ty: &str, op: AtomicOp, target: &str, value: &str, pad: &str) ->
         AtomicOp::Min => ("min(bitcast<f32>(old), v)", "if (nv == old) { break; }\n"),
         AtomicOp::Max => ("max(bitcast<f32>(old), v)", "if (nv == old) { break; }\n"),
     };
-    let mut out = format!(
-        "{pad}{{\n{pad}    let v = {value};\n{pad}    var old = atomicLoad(&{target});\n{pad}    loop {{\n"
-    );
+    let mut out = format!("{pad}{{\n{pad}    let v = {value};\n{pad}    var old = atomicLoad(&{target});\n{pad}    loop {{\n");
     let _ = writeln!(out, "{pad}        let nv = bitcast<u32>({combine});");
     if !stable.is_empty() {
         let _ = write!(out, "{pad}        {stable}");

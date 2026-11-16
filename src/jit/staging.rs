@@ -166,13 +166,7 @@ struct Translation {
 /// The read `kind` is a translation of a 2-D array: x and y map to themselves with unit step,
 /// no edge handling, nothing in the other two axes.
 fn translation(kind: ShiftKind) -> Option<Translation> {
-    let ShiftKind::View {
-        map,
-        edge: Edge::None,
-    } = kind
-    else {
-        return None;
-    };
+    let ShiftKind::View { map, edge: Edge::None } = kind else { return None };
     let [x, y, ..] = map.axes;
     let plain = x.from == 0 && x.step == 1 && y.from == 1 && y.step == 1;
     let flat = map.src[2] == 1 && map.src[3] == 1 && map.out[2] == 1 && map.out[3] == 1;
@@ -197,29 +191,18 @@ struct Scan {
 /// The reads of `key` if it is a store kernel without segments or circular-shift tiling that
 /// reads sub-programs through views, and the main program's views all have the same output dims.
 fn scan(key: &FusedKey) -> Option<Scan> {
-    if key.tail != Tail::Store
-        || !key.spans.is_empty()
-        || key.tile.is_some()
-        || !key.inlines()
-        || key.writes_bits()
-    {
+    if key.tail != Tail::Store || !key.spans.is_empty() || key.tile.is_some() || !key.inlines() || key.writes_bits() {
         return None;
     }
     let n = key.subs.len();
     let mut bad = vec![false; n];
     let mut dims: Vec<Option<[u32; 2]>> = vec![None; n];
     let mut main_out: Option<[u32; 2]> = None;
-    let programs = std::iter::once((Reader::Main, key.instrs.as_slice())).chain(
-        key.subs
-            .iter()
-            .enumerate()
-            .map(|(t, program)| (Reader::Sub(t as u32), program.as_slice())),
-    );
+    let programs = std::iter::once((Reader::Main, key.instrs.as_slice()))
+        .chain(key.subs.iter().enumerate().map(|(t, program)| (Reader::Sub(t as u32), program.as_slice())));
     for (reader, program) in programs {
         for instr in program {
-            let OpKind::Shift(kind) = instr.op.kind else {
-                continue;
-            };
+            let OpKind::Shift(kind) = instr.op.kind else { continue };
             let Ref::Sub(s) = instr.args[0] else { continue };
             let s = s as usize;
             if s >= n || reader == Reader::Sub(s as u32) {
@@ -229,16 +212,13 @@ fn scan(key: &FusedKey) -> Option<Scan> {
                 && let ShiftKind::View { map, .. } = kind
             {
                 let out = [map.out[0], map.out[1]];
-                if map.out[2] != 1 || map.out[3] != 1 || main_out.is_some_and(|known| known != out)
-                {
+                if map.out[2] != 1 || map.out[3] != 1 || main_out.is_some_and(|known| known != out) {
                     return None;
                 }
                 main_out = Some(out);
             }
             match translation(kind) {
-                Some(read) if dims[s].is_none_or(|known| known == read.src) => {
-                    dims[s] = Some(read.src)
-                }
+                Some(read) if dims[s].is_none_or(|known| known == read.src) => dims[s] = Some(read.src),
                 _ => bad[s] = true,
             }
         }
@@ -252,11 +232,7 @@ fn scan(key: &FusedKey) -> Option<Scan> {
         }
     }
     let [w, h] = main_out.filter(|&[w, h]| w > 0 && h > 0)?;
-    Some(Scan {
-        main: [w, h],
-        dims,
-        bad,
-    })
+    Some(Scan { main: [w, h], dims, bad })
 }
 
 /// The reads of the staged sub-programs (`staged`) that the main program and every staged
@@ -276,35 +252,18 @@ fn collect(key: &FusedKey, staged: &[bool], scan: &Scan) -> (Vec<Read>, Vec<bool
     impl Walk<'_> {
         /// Walks `program` (computing cells of `extent`) standing at `offset` cells from the
         /// cell of `frame`, the program the code is generated in.
-        fn walk(
-            &mut self,
-            frame: Reader,
-            program: &[Instr],
-            extent: Option<[u32; 2]>,
-            offset: Option<[i32; 2]>,
-        ) {
+        fn walk(&mut self, frame: Reader, program: &[Instr], extent: Option<[u32; 2]>, offset: Option<[i32; 2]>) {
             let key = self.key;
             for instr in program {
-                let OpKind::Shift(kind) = instr.op.kind else {
-                    continue;
-                };
+                let OpKind::Shift(kind) = instr.op.kind else { continue };
                 let Ref::Sub(s) = instr.args[0] else { continue };
                 let s = s as usize;
-                let Some(&dims) = self.dims.get(s) else {
-                    continue;
-                };
-                let hop = translation(kind)
-                    .filter(|hop| Some(hop.out) == extent && Some(hop.src) == dims);
-                let at = offset
-                    .zip(hop)
-                    .map(|(from, hop)| [from[0] + hop.offset[0], from[1] + hop.offset[1]]);
+                let Some(&dims) = self.dims.get(s) else { continue };
+                let hop = translation(kind).filter(|hop| Some(hop.out) == extent && Some(hop.src) == dims);
+                let at = offset.zip(hop).map(|(from, hop)| [from[0] + hop.offset[0], from[1] + hop.offset[1]]);
                 if self.staged[s] {
                     match at {
-                        Some(offset) => self.reads.push(Read {
-                            reader: frame,
-                            sub: s as u32,
-                            offset,
-                        }),
+                        Some(offset) => self.reads.push(Read { reader: frame, sub: s as u32, offset }),
                         None => self.broken[s] = true,
                     }
                 } else if !self.done.contains(&(s as u32, at))
@@ -317,22 +276,13 @@ fn collect(key: &FusedKey, staged: &[bool], scan: &Scan) -> (Vec<Read>, Vec<bool
         }
     }
     let n = key.subs.len();
-    let mut walk = Walk {
-        key,
-        staged,
-        dims: &scan.dims,
-        reads: Vec::new(),
-        broken: vec![false; n],
-        done: Vec::new(),
-    };
+    let mut walk = Walk { key, staged, dims: &scan.dims, reads: Vec::new(), broken: vec![false; n], done: Vec::new() };
     walk.walk(Reader::Main, &key.instrs, Some(scan.main), Some([0, 0]));
     for (s, program) in key.subs.iter().enumerate().filter(|&(s, _)| staged[s]) {
         walk.done.clear();
         walk.walk(Reader::Sub(s as u32), program, scan.dims[s], Some([0, 0]));
     }
-    let Walk {
-        mut reads, broken, ..
-    } = walk;
+    let Walk { mut reads, broken, .. } = walk;
     reads.sort();
     reads.dedup();
     (reads, broken)
@@ -347,9 +297,7 @@ fn collect(key: &FusedKey, staged: &[bool], scan: &Scan) -> (Vec<Read>, Vec<bool
 pub(crate) fn candidates(key: &FusedKey) -> Option<Candidates> {
     let scan = scan(key)?;
     let n = key.subs.len();
-    let mut staged: Vec<bool> = (0..n)
-        .map(|s| !scan.bad[s] && scan.dims[s].is_some())
-        .collect();
+    let mut staged: Vec<bool> = (0..n).map(|s| !scan.bad[s] && scan.dims[s].is_some()).collect();
     // Dropping a candidate turns it into a program its readers compute: what it reads is then
     // read from where they are, so the reads are collected again.
     let reads = loop {
@@ -361,10 +309,7 @@ pub(crate) fn candidates(key: &FusedKey) -> Option<Candidates> {
             }
             let mut mine = reads.iter().filter(|read| read.sub as usize == s);
             let first = mine.next();
-            let shares = first.is_some_and(|first| {
-                first.reader != Reader::Main
-                    || mine.any(|read| read.reader != Reader::Main || read.offset != first.offset)
-            });
+            let shares = first.is_some_and(|first| first.reader != Reader::Main || mine.any(|read| read.reader != Reader::Main || read.offset != first.offset));
             if broken[s] || !shares {
                 staged[s] = false;
                 changed = true;
@@ -378,11 +323,7 @@ pub(crate) fn candidates(key: &FusedKey) -> Option<Candidates> {
         return None;
     }
     let sub_dims = (0..n).map(|s| scan.dims[s].filter(|_| staged[s])).collect();
-    Some(Candidates {
-        dims: scan.main,
-        sub_dims,
-        reads,
-    })
+    Some(Candidates { dims: scan.main, sub_dims, reads })
 }
 
 /// Inclusive corners (low, high) of a rectangle of cells.
@@ -397,10 +338,7 @@ fn regions(c: &Candidates, tile: [u32; 2]) -> Vec<Option<Region>> {
         let slot = &mut region[read.sub as usize];
         *slot = Some(match *slot {
             None => (lo, hi),
-            Some((l, h)) => (
-                [l[0].min(lo[0]), l[1].min(lo[1])],
-                [h[0].max(hi[0]), h[1].max(hi[1])],
-            ),
+            Some((l, h)) => ([l[0].min(lo[0]), l[1].min(lo[1])], [h[0].max(hi[0]), h[1].max(hi[1])]),
         });
     }
     let n = c.sub_dims.len();
@@ -412,11 +350,7 @@ fn regions(c: &Candidates, tile: [u32; 2]) -> Vec<Option<Region>> {
     // Sub-programs only read lower-numbered ones: a reader's region is final before it is used.
     for t in (0..n).rev() {
         if let Some(own) = region[t] {
-            for read in c
-                .reads
-                .iter()
-                .filter(|read| read.reader == Reader::Sub(t as u32))
-            {
+            for read in c.reads.iter().filter(|read| read.reader == Reader::Sub(t as u32)) {
                 reach(&mut region, own, read);
             }
         }
@@ -427,28 +361,16 @@ fn regions(c: &Candidates, tile: [u32; 2]) -> Vec<Option<Region>> {
 /// Lays out the staging of every candidate of `c`: the tile (the tuning's stencil tile, halved
 /// until the regions fit its workgroup-memory budget; `None` below 8 cells a side), the regions
 /// and the levels. `elem_bytes(s)` is the size of one value of sub-program `s`.
-pub(crate) fn plan(
-    c: &Candidates,
-    tuning: &Tuning,
-    elem_bytes: impl Fn(u32) -> u64,
-) -> Option<Staging> {
+pub(crate) fn plan(c: &Candidates, tuning: &Tuning, elem_bytes: impl Fn(u32) -> u64) -> Option<Staging> {
     let n = c.sub_dims.len();
     let one_d = c.dims[1] == 1;
-    let (mut tx, mut ty) = if one_d {
-        (tuning.stencil_tile_1d, 1)
-    } else {
-        tuning.stencil_tile_2d
-    };
+    let (mut tx, mut ty) = if one_d { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
     let region = loop {
         let region = regions(c, [tx, ty]);
         let bytes: u64 = region
             .iter()
             .enumerate()
-            .filter_map(|(s, r)| {
-                r.map(|(lo, hi)| {
-                    (hi[0] - lo[0] + 1) as u64 * (hi[1] - lo[1] + 1) as u64 * elem_bytes(s as u32)
-                })
-            })
+            .filter_map(|(s, r)| r.map(|(lo, hi)| (hi[0] - lo[0] + 1) as u64 * (hi[1] - lo[1] + 1) as u64 * elem_bytes(s as u32)))
             .sum();
         if bytes <= u64::from(tuning.stencil_tile_bytes) {
             break region;
@@ -466,13 +388,7 @@ pub(crate) fn plan(
     let mut level = vec![0u32; n];
     for s in 0..n {
         if region[s].is_some() {
-            level[s] = c
-                .reads
-                .iter()
-                .filter(|read| read.reader == Reader::Sub(s as u32))
-                .map(|read| level[read.sub as usize] + 1)
-                .max()
-                .unwrap_or(0);
+            level[s] = c.reads.iter().filter(|read| read.reader == Reader::Sub(s as u32)).map(|read| level[read.sub as usize] + 1).max().unwrap_or(0);
         }
     }
     let mut order: Vec<usize> = (0..n).filter(|&s| region[s].is_some()).collect();
@@ -486,12 +402,7 @@ pub(crate) fn plan(
         .iter()
         .filter_map(|&s| {
             let (lo, hi) = region[s]?;
-            Some(StagedSub {
-                sub: s as u32,
-                dims: c.sub_dims[s]?,
-                lo,
-                hi,
-            })
+            Some(StagedSub { sub: s as u32, dims: c.sub_dims[s]?, lo, hi })
         })
         .collect();
     Some(Staging {
@@ -511,50 +422,28 @@ pub(crate) fn plan(
 pub(crate) fn check(staging: &Staging, key: &FusedKey) -> Result<(), String> {
     let level_of = |sub: u32| {
         let at = staging.subs.iter().position(|staged| staged.sub == sub)?;
-        staging
-            .levels
-            .iter()
-            .skip(1)
-            .position(|&end| at < end as usize)
+        staging.levels.iter().skip(1).position(|&end| at < end as usize)
     };
     let found = scan(key).ok_or("not a store kernel that reads sub-programs through views")?;
     let mut staged = vec![false; key.subs.len()];
     for entry in &staging.subs {
-        let Some(flag) = staged.get_mut(entry.sub as usize) else {
-            return Err(format!("sub-program {} does not exist", entry.sub));
-        };
+        let Some(flag) = staged.get_mut(entry.sub as usize) else { return Err(format!("sub-program {} does not exist", entry.sub)) };
         *flag = true;
         if found.dims[entry.sub as usize] != Some(entry.dims) {
-            return Err(format!(
-                "sub-program {} has dims {:?}, staged as {:?}",
-                entry.sub, found.dims[entry.sub as usize], entry.dims
-            ));
+            return Err(format!("sub-program {} has dims {:?}, staged as {:?}", entry.sub, found.dims[entry.sub as usize], entry.dims));
         }
     }
     if found.main != staging.dims {
-        return Err(format!(
-            "the kernel has dims {:?}, staged as {:?}",
-            found.main, staging.dims
-        ));
+        return Err(format!("the kernel has dims {:?}, staged as {:?}", found.main, staging.dims));
     }
     let (reads, broken) = collect(key, &staged, &found);
     if let Some(s) = (0..staged.len()).find(|&s| staged[s] && broken[s]) {
-        return Err(format!(
-            "staged sub-program {s} is read at a cell that is not a translation of its reader's"
-        ));
+        return Err(format!("staged sub-program {s} is read at a cell that is not a translation of its reader's"));
     }
-    let main = (
-        [0i32, 0],
-        [staging.tile[0] as i32 - 1, staging.tile[1] as i32 - 1],
-    );
+    let main = ([0i32, 0], [staging.tile[0] as i32 - 1, staging.tile[1] as i32 - 1]);
     for read in reads {
-        let here = format!(
-            "{:?} reads staged sub-program {} at {:?}",
-            read.reader, read.sub, read.offset
-        );
-        let Some(staged) = staging.find(read.sub) else {
-            return Err(format!("{here}: not staged"));
-        };
+        let here = format!("{:?} reads staged sub-program {} at {:?}", read.reader, read.sub, read.offset);
+        let Some(staged) = staging.find(read.sub) else { return Err(format!("{here}: not staged")) };
         let ((lo, hi), level) = match read.reader {
             Reader::Main => (main, None),
             Reader::Sub(t) => match staging.find(t) {
@@ -562,20 +451,13 @@ pub(crate) fn check(staging: &Staging, key: &FusedKey) -> Result<(), String> {
                 None => return Err(format!("{here} from a program that is not staged")),
             },
         };
-        if read.reader != Reader::Main
-            && level
-                .zip(level_of(read.sub))
-                .is_none_or(|(reader_level, level)| level >= reader_level)
-        {
+        if read.reader != Reader::Main && level.zip(level_of(read.sub)).is_none_or(|(reader_level, level)| level >= reader_level) {
             return Err(format!("{here} in a level that is not after it"));
         }
         for axis in 0..2 {
             let (need_lo, need_hi) = (lo[axis] + read.offset[axis], hi[axis] + read.offset[axis]);
             if need_lo < staged.lo[axis] || need_hi > staged.hi[axis] {
-                return Err(format!(
-                    "{here} outside its region on axis {axis}: needs {need_lo}..={need_hi}, has {}..={}",
-                    staged.lo[axis], staged.hi[axis]
-                ));
+                return Err(format!("{here} outside its region on axis {axis}: needs {need_lo}..={need_hi}, has {}..={}", staged.lo[axis], staged.hi[axis]));
             }
         }
     }
@@ -591,10 +473,7 @@ mod tests {
     use crate::tuning::Tuning;
 
     fn instr(kind: OpKind, args: [Ref; 3]) -> Instr {
-        Instr {
-            op: Op::new(kind, ElemTy::F32),
-            args,
-        }
+        Instr { op: Op::new(kind, ElemTy::F32), args }
     }
 
     fn key(instrs: Vec<Instr>, subs: Vec<Vec<Instr>>) -> FusedKey {
@@ -628,34 +507,20 @@ mod tests {
     }
 
     fn read(kind: ShiftKind, sub: u32) -> Instr {
-        instr(
-            OpKind::Shift(kind),
-            [Ref::Sub(sub), Ref::Unused, Ref::Unused],
-        )
+        instr(OpKind::Shift(kind), [Ref::Sub(sub), Ref::Unused, Ref::Unused])
     }
 
     fn add(a: u32, b: u32) -> Instr {
-        instr(
-            OpKind::Binary(BinOp::Add),
-            [Ref::Tmp(a), Ref::Tmp(b), Ref::Unused],
-        )
+        instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(a), Ref::Tmp(b), Ref::Unused])
     }
 
     /// `e = x * s0`.
     fn expression() -> Vec<Instr> {
-        vec![instr(
-            OpKind::Binary(BinOp::Mul),
-            [Ref::Input(0), Ref::Scalar(0), Ref::Unused],
-        )]
+        vec![instr(OpKind::Binary(BinOp::Mul), [Ref::Input(0), Ref::Scalar(0), Ref::Unused])]
     }
 
     fn tuning(bytes: u32) -> Tuning {
-        Tuning {
-            stencil_tile_bytes: bytes,
-            stencil_tile_2d: (32, 16),
-            stencil_tile_1d: 512,
-            ..Tuning::for_tests()
-        }
+        Tuning { stencil_tile_bytes: bytes, stencil_tile_2d: (32, 16), stencil_tile_1d: 512, ..Tuning::for_tests() }
     }
 
     #[test]
@@ -673,15 +538,7 @@ mod tests {
         assert_eq!(found.dims, [out, 1]);
         let staging = plan(&found, &tuning(32 * 1024), |_| 4).expect("plan");
         assert_eq!(staging.tile, [512, 1]);
-        assert_eq!(
-            staging.subs,
-            vec![StagedSub {
-                sub: 0,
-                dims: [n, 1],
-                lo: [0, 0],
-                hi: [513, 0]
-            }]
-        );
+        assert_eq!(staging.subs, vec![StagedSub { sub: 0, dims: [n, 1], lo: [0, 0], hi: [513, 0] }]);
         assert_eq!(staging.levels, vec![0, 1]);
         assert_eq!(check(&staging, &key), Ok(()));
     }
@@ -701,12 +558,7 @@ mod tests {
             add(7, 4),
         ];
         let key = key(main, vec![expression()]);
-        let staging = plan(
-            &candidates(&key).expect("candidate"),
-            &tuning(32 * 1024),
-            |_| 4,
-        )
-        .expect("plan");
+        let staging = plan(&candidates(&key).expect("candidate"), &tuning(32 * 1024), |_| 4).expect("plan");
         assert_eq!(staging.tile, [32, 16]);
         assert_eq!(staging.subs.len(), 1);
         assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([0, 0], [33, 17]));
@@ -721,36 +573,14 @@ mod tests {
             read(view([40, 1], [39, 1], [1, 0], Edge::None), 0),
             add(0, 1),
         ];
-        let main = vec![
-            read(view([39, 1], [38, 1], [0, 0], Edge::None), 1),
-            read(view([39, 1], [38, 1], [1, 0], Edge::None), 1),
-            add(0, 1),
-        ];
+        let main = vec![read(view([39, 1], [38, 1], [0, 0], Edge::None), 1), read(view([39, 1], [38, 1], [1, 0], Edge::None), 1), add(0, 1)];
         let key = key(main, vec![expression(), f]);
-        let staging = plan(
-            &candidates(&key).expect("candidate"),
-            &tuning(32 * 1024),
-            |_| 4,
-        )
-        .expect("plan");
-        assert_eq!(
-            staging
-                .subs
-                .iter()
-                .map(|staged| staged.sub)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
+        let staging = plan(&candidates(&key).expect("candidate"), &tuning(32 * 1024), |_| 4).expect("plan");
+        assert_eq!(staging.subs.iter().map(|staged| staged.sub).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(staging.levels, vec![0, 1, 2]);
         // `f` covers the tile and one cell, `e` that and one more.
-        assert_eq!(
-            (staging.subs[1].lo, staging.subs[1].hi),
-            ([0, 0], [staging.tile[0] as i32, 0])
-        );
-        assert_eq!(
-            (staging.subs[0].lo, staging.subs[0].hi),
-            ([0, 0], [staging.tile[0] as i32 + 1, 0])
-        );
+        assert_eq!((staging.subs[1].lo, staging.subs[1].hi), ([0, 0], [staging.tile[0] as i32, 0]));
+        assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([0, 0], [staging.tile[0] as i32 + 1, 0]));
         assert_eq!(check(&staging, &key), Ok(()));
     }
 
@@ -766,22 +596,14 @@ mod tests {
 
     #[test]
     fn a_sub_program_read_once_by_the_main_program_is_dropped() {
-        let main = vec![
-            read(view([100, 1], [98, 1], [1, 0], Edge::None), 0),
-            read(view([100, 1], [98, 1], [1, 0], Edge::None), 0),
-            add(0, 1),
-        ];
+        let main = vec![read(view([100, 1], [98, 1], [1, 0], Edge::None), 0), read(view([100, 1], [98, 1], [1, 0], Edge::None), 0), add(0, 1)];
         assert!(candidates(&key(main, vec![expression()])).is_none());
     }
 
     #[test]
     fn the_tile_shrinks_to_fit_the_workgroup_memory() {
         let (src, out) = ([34, 18], [32, 16]);
-        let main = vec![
-            read(view(src, out, [0, 1], Edge::None), 0),
-            read(view(src, out, [2, 1], Edge::None), 0),
-            add(0, 1),
-        ];
+        let main = vec![read(view(src, out, [0, 1], Edge::None), 0), read(view(src, out, [2, 1], Edge::None), 0), add(0, 1)];
         let key = key(main, vec![expression()]);
         let found = candidates(&key).expect("candidate");
         // 34 x 16 cells of 4 bytes do not fit 2 KiB; 18 x 16 (a 16 x 16 tile) do.
@@ -794,47 +616,22 @@ mod tests {
     #[test]
     fn what_a_sub_program_read_once_reads_is_read_from_the_cell_it_is_computed_at() {
         // f = e[0..] + e[1..] (sub 1, over e = sub 0); the main program reads f once, from 1.
-        let f = vec![
-            read(view([40, 1], [39, 1], [0, 0], Edge::None), 0),
-            read(view([40, 1], [39, 1], [1, 0], Edge::None), 0),
-            add(0, 1),
-        ];
+        let f = vec![read(view([40, 1], [39, 1], [0, 0], Edge::None), 0), read(view([40, 1], [39, 1], [1, 0], Edge::None), 0), add(0, 1)];
         let main = vec![read(view([39, 1], [38, 1], [1, 0], Edge::None), 1)];
         let key = key(main, vec![expression(), f]);
         let found = candidates(&key).expect("candidate");
         // `f` is computed inside the main program, so the main program reads `e` at 1 and 2.
         assert_eq!(found.sub_dims, vec![Some([40, 1]), None]);
-        assert_eq!(
-            found.reads,
-            vec![
-                Read {
-                    reader: Reader::Main,
-                    sub: 0,
-                    offset: [1, 0]
-                },
-                Read {
-                    reader: Reader::Main,
-                    sub: 0,
-                    offset: [2, 0]
-                }
-            ]
-        );
+        assert_eq!(found.reads, vec![Read { reader: Reader::Main, sub: 0, offset: [1, 0] }, Read { reader: Reader::Main, sub: 0, offset: [2, 0] }]);
         let staging = plan(&found, &tuning(32 * 1024), |_| 4).expect("plan");
         assert_eq!(staging.subs.len(), 1);
-        assert_eq!(
-            (staging.subs[0].lo, staging.subs[0].hi),
-            ([1, 0], [staging.tile[0] as i32 + 1, 0])
-        );
+        assert_eq!((staging.subs[0].lo, staging.subs[0].hi), ([1, 0], [staging.tile[0] as i32 + 1, 0]));
         assert_eq!(check(&staging, &key), Ok(()));
     }
 
     #[test]
     fn a_sub_program_computed_through_an_edge_cannot_serve_what_it_reads_from_workgroup_memory() {
-        let f = vec![
-            read(view([40, 1], [39, 1], [0, 0], Edge::None), 0),
-            read(view([40, 1], [39, 1], [1, 0], Edge::None), 0),
-            add(0, 1),
-        ];
+        let f = vec![read(view([40, 1], [39, 1], [0, 0], Edge::None), 0), read(view([40, 1], [39, 1], [1, 0], Edge::None), 0), add(0, 1)];
         let main = vec![read(view([39, 1], [38, 1], [1, 0], Edge::Clamp), 1)];
         assert!(candidates(&key(main, vec![expression(), f])).is_none());
     }
@@ -853,14 +650,7 @@ mod tests {
         let key = key(main, vec![expression(), v]);
         let found = candidates(&key).expect("candidate");
         assert_eq!(found.sub_dims, vec![Some([42, 1]), None]);
-        assert_eq!(
-            found
-                .reads
-                .iter()
-                .map(|read| read.offset[0])
-                .collect::<Vec<_>>(),
-            vec![2, 3, 4]
-        );
+        assert_eq!(found.reads.iter().map(|read| read.offset[0]).collect::<Vec<_>>(), vec![2, 3, 4]);
         let staging = plan(&found, &tuning(32 * 1024), |_| 4).expect("plan");
         assert_eq!(staging.subs.len(), 1);
         assert_eq!(check(&staging, &key), Ok(()));
