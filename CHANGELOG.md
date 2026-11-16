@@ -6,6 +6,26 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Pending expressions that several pending operations read are stored in fewer, smaller kernels. A
+  3D implicit CFD step (block-tridiagonal line solves over 50 lazy face-matrix entries per
+  direction, each a large expression of the face states and the dissipation, read by the solves and
+  by a flux-difference operator) took 4.86 ms of GPU time in 42 launches and 220 fusion cuts without
+  a hand-placed `.cache()` on the entries, against 3.14 ms in 27 launches with it. Three causes: the
+  products that scale a stored entry (`lo = entry * s`) weighed as much as the whole expression they
+  read, so they were stored too, in full; the entries were evaluated together with every pending
+  node of the same operation made at the same place, and a helper such as `E::add` makes all of a
+  scheme's matrix entries there, so a group held 146 outputs where 50 were read (the group's kernel
+  wrote 96 matrices that nothing else read); and what the group shared with the rest, once the group
+  was a kernel of its own, was stored level by level, a kernel each. Now a node read from outside
+  the kernel is stored only if it is still worth storing with the nodes below it that are stored as
+  buffers (`Shared` cuts); the entries evaluated with a node are only the ones that pending
+  operations outside the kernel read; and a node of the same length that the group's kernel computes
+  anyway and others read too is one more output of it. The step takes 3.28 ms in 29 launches
+  uncached (3.45 ms per iteration, 3.25 with `.cache()`), and in `Df32` 4.09 ms against 5.68
+  (`.cache()`: 3.98). RTX 3090.
+
 ## [0.4.1] - 2026-11-15
 
 ### Added

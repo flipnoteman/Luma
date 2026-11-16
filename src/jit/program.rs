@@ -16,6 +16,7 @@ use crate::sort::RadixPass;
 use crate::profile::SplitReason;
 
 use super::codegen::Tile;
+use super::cost;
 use super::inline::Judgement;
 use super::params::{Parameterized, ViewSpec};
 use super::launch::force_group;
@@ -1188,10 +1189,13 @@ fn outermost(shared: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
 /// `shared` and the pending nodes among `candidates` that are its siblings: of the same length,
 /// created by the same operation at the same place in the program (the other fields of a record
 /// that a loop builds), reading nodes the shared node reads, and not related to it by reading it
-/// or being read by it. A shared node evaluated alone would leave everything its siblings
-/// share with it with readers outside its own expression, and each such node would be evaluated
-/// first on its own, level by level; evaluated together they are one kernel.
-fn with_siblings<'a>(shared: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'a Arc<Node>> + Clone) -> Vec<Arc<Node>> {
+/// or being read by it, and read by pending operations outside the program (`inside` tells the
+/// nodes of it): a sibling that only the kernels computing it read would be written for nothing,
+/// and a scheme whose matrix entries are all made by one helper has hundreds of them. A shared
+/// node evaluated alone would leave everything its siblings share with it with readers outside
+/// its own expression, and each such node would be evaluated first on its own, level by level;
+/// evaluated together they are one kernel.
+fn with_siblings<'a>(shared: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'a Arc<Node>> + Clone, inside: impl Fn(*const Node) -> bool) -> Vec<Arc<Node>> {
     let mut forced = shared.clone();
     for node in &shared {
         let below = node.below_vec();
@@ -1200,6 +1204,7 @@ fn with_siblings<'a>(shared: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'
                 && other.name == node.name
                 && std::ptr::eq(other.location, node.location)
                 && other.is_pending()
+                && other.has_consumer_outside(&inside)
                 && !forced.iter().any(|known| Arc::ptr_eq(known, other))
                 && !node.below_contains(other.id)
                 && !other.below_contains(node.id)
@@ -1210,6 +1215,30 @@ fn with_siblings<'a>(shared: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'
             {
                 forced.push(Arc::clone(other));
             }
+        }
+    }
+    forced
+}
+
+/// `group` and the pending nodes among `candidates` that the kernel computing `group` evaluates
+/// anyway (they are read below a member of the same length) and that pending operations outside
+/// that kernel read too. Evaluated on their own first, each would be a kernel of its own before
+/// the group's, and what they read that others outside read too a kernel before it, level by
+/// level; as outputs of the group's kernel they cost one more store each.
+fn with_read_below<'a>(group: Vec<Arc<Node>>, candidates: impl Iterator<Item = &'a Arc<Node>>) -> Vec<Arc<Node>> {
+    let mut forced = group.clone();
+    for other in candidates {
+        if other.is_pending()
+            && !forced.iter().any(|known| Arc::ptr_eq(known, other))
+            && group.iter().any(|node| node.len() == other.len() && node.below_contains(other.id))
+            && super::worth_storing(other)
+            && other.consumers.load(Ordering::Relaxed) >= 2
+            && !other.inputs().is_empty()
+            && other.readers.any_pending(|weak| {
+                weak.upgrade().is_some_and(|reader| !group.iter().any(|node| node.id == reader.id || node.below_contains(reader.id)))
+            })
+        {
+            forced.push(Arc::clone(other));
         }
     }
     forced
@@ -1505,15 +1534,18 @@ fn flatten_once(
             let node = &graph.items[at as usize].node;
             node.requested.load(Ordering::Relaxed) && node.is_pending()
         };
-        let shared: Vec<Arc<Node>> = passes
+        let read_outside: Vec<u32> = passes
             .members
             .iter()
             .chain(&sub_members)
-            .filter(|&&at| {
-                !alone && !is_root(at) && super::worth_storing(&graph.items[at as usize].node) && graph.items[at as usize].node.has_consumer_outside(inside)
-            })
-            .chain(sub_members.iter().filter(|&&at| !is_root(at) && requested(at)))
-            .map(|&at| Arc::clone(&graph.items[at as usize].node))
+            .copied()
+            .filter(|&at| !alone && !is_root(at) && super::worth_storing(&graph.items[at as usize].node) && graph.items[at as usize].node.has_consumer_outside(inside))
+            .collect();
+        let shared: Vec<Arc<Node>> = graph
+            .to_store(&read_outside)
+            .into_iter()
+            .chain(sub_members.iter().copied().filter(|&at| !is_root(at) && requested(at)))
+            .map(|at| Arc::clone(&graph.items[at as usize].node))
             .collect();
         if shared.is_empty() {
             break (graph, root_at, passes, None);
@@ -1532,7 +1564,7 @@ fn flatten_once(
             let read_outside: Vec<Arc<Node>> = shared.iter().filter(|node| node.has_consumer_outside(inside)).cloned().collect();
             note_shared(root, &read_outside);
         }
-        let forced = with_siblings(shared, candidates);
+        let forced = with_read_below(with_siblings(shared, candidates.clone(), inside), candidates);
         force_group(&forced)?;
     };
 
@@ -1596,6 +1628,46 @@ impl Graph {
         Passes { members, seen, shifted, targets }
     }
 }
+
+impl Graph {
+    /// The items of `candidates` (nodes read from outside the program that cost more to compute
+    /// again than to store, see [`super::worth_storing`]) that still are once the candidates below
+    /// them are stored: a candidate that reads one is a cheap step on top of a buffer, which each
+    /// of its readers recomputes. Without this, the entries of a stored matrix and every product
+    /// that scales them would all be stored too, each product weighing as much as the whole
+    /// expression it reads. The candidates are judged from the innermost out, so that one that is
+    /// not stored counts with its expression in those above it.
+    fn to_store(&self, candidates: &[u32]) -> Vec<u32> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let mut is_candidate = vec![false; self.items.len()];
+        for &at in candidates {
+            is_candidate[at as usize] = true;
+        }
+        // A node reads nodes of fewer nodes below them: ascending size is operands first.
+        let mut order: Vec<u32> = (0..self.items.len() as u32).collect();
+        order.sort_by_key(|&at| self.items[at as usize].node.size());
+        let cost = self.items[candidates[0] as usize].node.context().cost_model();
+        let mut weight = vec![0.0f64; self.items.len()];
+        let mut stored = Vec::new();
+        for &at in &order {
+            let item = &self.items[at as usize];
+            let operands: f64 = item.kids.iter().filter(|&&kid| kid != NONE).map(|&kid| weight[kid as usize]).sum();
+            let own = (cost::op_weight(item.node.op(), &cost) + operands).min(item.node.weight());
+            weight[at as usize] = own;
+            if is_candidate[at as usize] && super::worth_storing_at(&item.node, own) {
+                stored.push(at);
+                weight[at as usize] = STORED_READ_WEIGHT;
+            }
+        }
+        // The caller's order (operands before the nodes that read them) is kept.
+        candidates.iter().copied().filter(|at| stored.contains(at)).collect()
+    }
+}
+
+/// What reading a stored node costs the expression above it, in the units of [`op_weight`](cost::op_weight).
+const STORED_READ_WEIGHT: f64 = 1.0;
 
 /// What [`emit_program`] noted besides the program.
 struct Recorded {

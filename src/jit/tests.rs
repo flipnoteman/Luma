@@ -1784,6 +1784,111 @@ fn fields_that_read_each_other_at_the_element_are_one_kernel() {
     assert_close(&d2.to_vec().unwrap(), &ref_a[..n - 2].iter().map(|v| v * 0.5).collect::<Vec<_>>(), 1e-5, 1e-6);
 }
 
+/// The entry of a block matrix: every entry of every matrix of a scheme is made by one of these
+/// helpers, so that entries that have nothing to do with each other share a creation place.
+fn entry_add(a: &Array<f32>, b: &Array<f32>) -> Array<f32> {
+    a + b
+}
+
+fn entry_sub(a: &Array<f32>, b: &Array<f32>) -> Array<f32> {
+    a - b
+}
+
+/// Entries (`f`, `g`) that read one large common expression (`dis`, the dissipation of the faces
+/// of a flux scheme) and three pending consumers: `p` reads `l`, a cheap product on `f`, and `g`
+/// through views, `q` reads `l` and `g` at the element, `r` reads `f` at the element. The entries
+/// are what is worth storing, in one kernel (the common expression is computed once inside it),
+/// then one kernel per consumer. Not also `l` (each of its readers multiplies the stored `f` once
+/// more), not a kernel per level of what the entries share, and not entries made by the same
+/// helper as `f` that only the kernels that compute them read (`dis`, `h`).
+#[test]
+fn entries_that_share_a_large_expression_are_stored_together() {
+    let ctx = ctx();
+    // Arithmetic that costs about as much per element as a launch plus a pass over the bytes
+    // does for an expression of a hundred operations.
+    ctx.set_cost_model(CostModel { f32_ops_per_ns: 40.0, ..CostModel::TEST });
+    let n = 4000;
+    let count = 8;
+    let xs = values(n, 111, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let large = |a: &Array<f32>| (0..24).fold(a.clone(), |acc, k| (&acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5);
+    let state = large(&x);
+    let dis: Vec<Array<f32>> = (0..count).map(|k| entry_add(&(&state * (k + 1) as f32), &(&state * 0.5))).collect();
+    let f: Vec<Array<f32>> = (0..count).map(|k| entry_add(&(&state * k as f32), &dis[k])).collect();
+    let g: Vec<Array<f32>> = (0..count).map(|k| entry_sub(&(&state * (2 * k) as f32), &dis[k])).collect();
+    let l: Vec<Array<f32>> = f.iter().map(|f| f * 0.25).collect();
+    // Made by the same helper and reading `state` like the entries, but only `p` reads them.
+    let h: Vec<Array<f32>> = (0..count).map(|k| entry_add(&(&state * (k + 2) as f32), &state)).collect();
+    let sum = |terms: Vec<Array<f32>>| terms.into_iter().reduce(|acc, t| acc + t).unwrap();
+    let p = sum((0..count).map(|k| l[k].slice(0, 1..n) + g[k].slice(0, 0..n - 1) + h[k].slice(0, 0..n - 1) * 0.1).collect());
+    let q = sum((0..count).map(|k| (&l[k] + &g[k]) * 2.0).collect());
+    let r = sum(f.iter().map(|f| f * 3.0).collect());
+    drop((f, g, l));
+
+    ctx.jit().record_splits();
+    let before = ctx.jit().stats();
+    let got = [p.to_vec().unwrap(), q.to_vec().unwrap(), r.to_vec().unwrap()];
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    let splits = ctx.jit().take_splits();
+    assert_eq!(launches, 4, "one kernel storing the entries, one per consumer: {splits:?}");
+    // `dis` and `h` are made by the same helper as `f` and read what `f` reads, but nothing outside
+    // the kernel that stores them reads them: they are not outputs of it.
+    assert!(dis.iter().chain(&h).all(|d| d.pending().is_some_and(|node| node.is_pending())), "entries that only the kernel that stores `f` and `g` or `p` reads were stored");
+
+    let large = |a: f32| (0..24).fold(a, |acc, k| (acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5);
+    // `(l, g, h)` of element `i`.
+    let host = |i: usize| {
+        let s = large(xs[i]);
+        (0..count)
+            .map(|k| ((s * k as f32 + (s * (k + 1) as f32 + s * 0.5)) * 0.25, s * (2 * k) as f32 - (s * (k + 1) as f32 + s * 0.5), s * (k + 2) as f32 + s))
+            .collect::<Vec<_>>()
+    };
+    let want_p: Vec<f32> = (0..n - 1).map(|i| host(i + 1).iter().zip(host(i)).map(|(l, g)| l.0 + g.1 + g.2 * 0.1).sum()).collect();
+    let want_q: Vec<f32> = (0..n).map(|i| host(i).iter().map(|(l, g, _)| (l + g) * 2.0).sum()).collect();
+    let want_r: Vec<f32> = (0..n).map(|i| host(i).iter().map(|(l, _, _)| l * 4.0 * 3.0).sum()).collect();
+    assert_close(&got[0], &want_p, 1e-3, 1e-2);
+    assert_close(&got[1], &want_q, 1e-3, 1e-2);
+    assert_close(&got[2], &want_r, 1e-3, 1e-2);
+}
+
+/// Entries `g` that two consumers read (`p` through views, `q` at the element) are stored; the
+/// entries `x` they are made of are read by `p` through views too. Evaluated before the kernel that
+/// stores `g`, `x` would be a kernel of its own, one level below; the kernel that stores `g`
+/// computes `x` anyway and writes it as well.
+#[test]
+fn what_a_stored_group_reads_below_it_and_others_read_too_is_stored_with_it() {
+    let ctx = ctx();
+    ctx.set_cost_model(CostModel { f32_ops_per_ns: 40.0, ..CostModel::TEST });
+    let n = 4000;
+    let count = 8;
+    let xs = values(n, 112, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    let large = |a: &Array<f32>| (0..24).fold(a.clone(), |acc, k| (&acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5);
+    let state = large(&x);
+    let entries: Vec<Array<f32>> = (0..count).map(|k| entry_add(&(&state * (k + 1) as f32), &state)).collect();
+    let g: Vec<Array<f32>> = entries.iter().map(|e| e * 2.0 + &state).collect();
+    let sum = |terms: Vec<Array<f32>>| terms.into_iter().reduce(|acc, t| acc + t).unwrap();
+    let p = sum((0..count).map(|k| g[k].slice(0, 1..n) + entries[k].slice(0, 0..n - 1)).collect());
+    let q = sum(g.iter().map(|g| g * 0.5).collect());
+    drop((entries, g));
+
+    let before = ctx.jit().stats();
+    let got = [p.to_vec().unwrap(), q.to_vec().unwrap()];
+    let launches = delta(before, ctx.jit().stats()).elementwise_launches;
+    assert_eq!(launches, 3, "one kernel storing `g` and `x`, one per consumer");
+
+    let large = |a: f32| (0..24).fold(a, |acc, k| (acc * 1.01 + 0.1 * (k + 1) as f32).sqrt() + a * 0.5);
+    // `(x, g)` of element `i`.
+    let host = |i: usize| {
+        let s = large(xs[i]);
+        (0..count).map(|k| ((s * (k + 1) as f32 + s), (s * (k + 1) as f32 + s) * 2.0 + s)).collect::<Vec<_>>()
+    };
+    let want_p: Vec<f32> = (0..n - 1).map(|i| host(i + 1).iter().zip(host(i)).map(|(g, x)| g.1 + x.0).sum()).collect();
+    let want_q: Vec<f32> = (0..n).map(|i| host(i).iter().map(|e| e.1 * 0.5).sum()).collect();
+    assert_close(&got[0], &want_p, 1e-3, 1e-2);
+    assert_close(&got[1], &want_q, 1e-3, 1e-2);
+}
+
 /// A node that `eval` asked for and a shifted read inside the kernel recomputes is stored, but no
 /// pending operation outside the kernel reads it: not a `Shared` cut.
 #[test]
