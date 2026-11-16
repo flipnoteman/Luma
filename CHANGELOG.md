@@ -6,6 +6,35 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The Thomas solve on parts along a strided axis (`solve_block_tridiagonal_parts` of blocks up to
+  5x5 and `solve_tridiagonal_parts`, lines at least 16 cells apart) is up to 1.5x faster on an
+  RTX 3090. A workgroup is a warp or more (64 invocations for blocks of 3 to 5, 128 for 2x2
+  blocks, 32 for scalars; it was 8 to 32, which left each warp mostly idle and each load a lone
+  sector), and the scratch of the swept upper blocks is tiled: entry `k` of the 32 cells that a
+  warp's lines fall in lie in one contiguous 128 byte run, so every store and load of the scratch
+  coalesces. Grid of 187 x 70 x 24, 5x5 blocks, parts of 50 face fields (GPU time of the solve,
+  best of 7): j lines (4488 of 70 cells) 272 us to 214 us, k lines (13090 of 24) 238 us to 180
+  us; with 80 evaluated parts: j 406 us to 273 us, k 249 us to 222 us; j lines of 4x4 blocks
+  213 us to 166 us (evaluated 228 us to 184 us), of 3x3 155 us to 119 us (evaluated), of 2x2
+  109 us to 85 us (evaluated). What is left is the memory traffic of the solve (161 MB for the
+  5x5 j lines, 86 % of the card's bandwidth in 200 us: a variant without the elimination takes
+  200 us). Stacked blocks (`solve_block_tridiagonal`), strides below 16 and blocks above 5 keep
+  their kernels: the wide tiled solve measured 1.1x to 1.3x slower on them
+  (`bench_solve --only sweep/`).
+- On NVIDIA GPUs the cyclic-reduction line solve keeps a whole line in workgroup memory up to
+  48 KiB (it was 32 KiB) instead of spilling rows to a scratch buffer. 5x5 blocks, 1680
+  contiguous lines of 187 cells on parts: 313 us to 251 us (parts of 50 face fields: 274 us to
+  231 us); 300 cells of 4x4 or 3x3 blocks, 480 lines: 343 us to 246 us and 215 us to 131 us;
+  stacked 5x5 blocks, 400 strided lines of 200 cells: 370 us to 158 us; 8x8 blocks, 156 lines
+  of 122 cells: 157 us to 130 us. Two rows of `bench_solve --only sweep/` got slower, by 12 %
+  and 13 % (3x3 blocks, 200 lines of 400 cells: 36 us to 40 us; 8x8 blocks, 256 strided lines
+  of 64 cells: 122 us to 138 us), where the half-spilled line left room for more workgroups per
+  multiprocessor.
+- `bench_solve` has `parts3d/...` rows: the parts solves of a 187 x 70 x 24 grid along each axis,
+  evaluated and from 50 face fields, with scalar, 2x2, 4x4 and 5x5 blocks.
+
 ## [0.4.1] - 2026-11-15
 
 ### Added

@@ -119,6 +119,23 @@ fn layout(tuning: &Tuning, block: u32, n: u32) -> (u8, u32) {
 /// that when the line does not fit the workgroup memory (4x4 blocks, 1024 lines of 512: 2.5 ms
 /// vs 1.0 ms), so the rule is `lines * 2 * max(block, 2) <= 8192`, the weight doubled for a line
 /// that spills.
+///
+/// The strided Thomas solve on parts got faster afterwards (wider workgroups and a tiled scratch,
+/// see `builtin::thomas_plan`); measured again (parts, strided, evaluated, lines of 70 and of 187
+/// cells, 256 to 4096 lines, Thomas / cyclic): the crossover is at about 1024 lines of 5x5 blocks
+/// (70 cells: 136 / 136 us; 187: 361 / 405 us), 1024 to 1500 of 4x4 (106 / 94; 266 / 204), 2048
+/// of 3x3 (83 / 82; 222 / 220), 4096 of 2x2 (81 / 74; 208 / 200) and 2048 to 4096 scalars (70
+/// cells: 17 / 17 us at 2048; 187: 93 / 65 at 4096), where the rule keeps cyclic reduction up to
+/// 819, 1024, 1365, 2048 and 2048 lines: at or below the crossover for blocks of 3 and more, a
+/// tie for the 2x2 blocks and scalars between the rule and the crossover. The rule stays.
+///
+/// The workgroup memory budget is 48 KiB on the RTX 3090 (it was 32 KiB): a line whose rows fit
+/// needs no global scratch (parts along the contiguous axis, 1680 lines of 187 rows of 5x5
+/// blocks: 325 us to 283 us; 300 rows of 4x4 or 3x3 blocks, 480 lines: 343 us to 246 us and
+/// 215 us to 131 us; stacked 5x5 blocks, 400 lines of 200 rows: 350 us to 157 us; 8x8 blocks, 156
+/// lines of 122 rows: 157 us to 130 us). One of 41 rows of `bench_solve --only sweep/` that
+/// changed got slower (8x8 blocks, 256 strided lines of 64 rows: 122 us to 136 us, 36 KiB per
+/// workgroup against 18 KiB with half the rows spilled).
 pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32, parts: bool, max_scratch: u64) -> Option<Plan> {
     if tuning.line_solver == LineSolver::Thomas || n == 0 || lines == 0 {
         return None;

@@ -18,7 +18,7 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{tridiagonal_workgroup, Builtin, UNROLLED_BLOCK};
+use crate::builtin::{thomas_plan, thomas_scratch_floats, Builtin, UNROLLED_BLOCK};
 use crate::cyclic;
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
@@ -367,7 +367,7 @@ fn run(
         )?;
         (core, fold_workgroups(ctx, lines32)?, plan.scratch_bytes(b as u32, n, lines32))
     } else {
-        let workgroup = tridiagonal_workgroup(ctx.tuning(), lines32);
+        let workgroup = thomas_plan(&tuning, b as u32, lines32, stride, false).workgroup;
         let core = ctx.builtin(Builtin::Tridiagonal { block: b as u8, starts: start.is_some(), workgroup }, "f32")?;
         let groups = workgroups_1d(ctx, &core, lines32)?;
         (core, groups, cells as u64 * (b * b) as u64 * 4)
@@ -456,10 +456,10 @@ fn run_parts(
     let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, true, ctx.max_buffer_bytes()) {
         Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
     } else if block <= UNROLLED_BLOCK as usize
-        && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, ctx.max_buffer_bytes())
+        && let thomas = thomas_plan(&tuning, b32, total, stride32, true)
+        && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, thomas.tiled, ctx.max_buffer_bytes())
     {
-        let workgroup = tridiagonal_workgroup(ctx.tuning(), total);
-        Some((Algo::Thomas { workgroup }, bytes))
+        Some((Algo::Thomas { workgroup: thomas.workgroup, tiled: thomas.tiled }, bytes))
     } else {
         None
     };
@@ -473,10 +473,11 @@ fn run_parts(
 }
 
 /// The scratch bytes of the Thomas solve of `systems` systems of `block x block` blocks over
-/// `len` cells (the modified upper blocks of every system), or `None` if they exceed `max_buffer`
-/// (the solve then falls back to the stacked one, whose scratch is one system's).
-fn thomas_parts_scratch(len: usize, block: usize, systems: usize, max_buffer: u64) -> Option<u64> {
-    let bytes = (len as u64).checked_mul((block * block * 4 * systems) as u64)?;
+/// `len` cells (the modified upper blocks of every system, `tiled` as in
+/// [`thomas_plan`](crate::builtin::thomas_plan)), or `None` if they exceed `max_buffer` (the
+/// solve then falls back to the stacked one, whose scratch is one system's).
+fn thomas_parts_scratch(len: usize, block: usize, systems: usize, tiled: bool, max_buffer: u64) -> Option<u64> {
+    let bytes = thomas_scratch_floats(len as u64, block as u32, tiled)?.checked_mul(4 * systems as u64)?;
     (bytes <= max_buffer).then_some(bytes)
 }
 
@@ -505,7 +506,7 @@ fn launch_parts(
     let total = words[2] * u32::from(spec.systems);
     let groups = match spec.algo {
         Algo::Cyclic { .. } => fold_workgroups(ctx, total)?,
-        Algo::Thomas { workgroup } => fold_workgroups(ctx, total.div_ceil(u32::from(workgroup)))?,
+        Algo::Thomas { workgroup, .. } => fold_workgroups(ctx, total.div_ceil(u32::from(workgroup)))?,
     };
     if !crate::jit::solve(ctx, sides, spec, words, groups, [total, 1, 1], &writes, starts)? {
         return Ok(None);
@@ -553,8 +554,9 @@ mod tests {
 
     use super::{run, run_parts, thomas_parts_scratch};
     use crate::array::Array;
+    use crate::builtin::{thomas_plan, ThomasPlan};
     use crate::context::Context;
-    use crate::tuning::{LineSolver, Tuning};
+    use crate::tuning::{LineSolver, Tuning, TuningProfile};
 
     /// Deterministic values in `[-0.5, 0.5)`.
     struct Lcg(u64);
@@ -785,6 +787,54 @@ mod tests {
         Tuning { line_solver: LineSolver::Thomas, ..Tuning::for_tests() }
     }
 
+    /// The Thomas solve as it runs along a strided axis of an NVIDIA GPU: the wider workgroups and
+    /// the tiled scratch (see `builtin::thomas_plan`), whatever device the test runs on.
+    fn thomas_strided() -> Tuning {
+        Tuning { line_solver: LineSolver::Thomas, line_strided_from: 16, ..Tuning::for_tests() }
+    }
+
+    /// Lines at a stride of 16 and more, of every size the tiled scratch has a kernel for, on
+    /// parts agree with the host: cells in one tile, in several, a last tile that is not full,
+    /// lines that start part-way.
+    #[test]
+    fn strided_thomas_solves_with_a_tiled_scratch() {
+        let ctx = Context::new().unwrap();
+        for b in 1..=5 {
+            for &(n, lines) in &[(1usize, 16usize), (7, 33), (40, 70)] {
+                for starts in [false, true] {
+                    let seed = (b * 77 + n) as u64;
+                    for kind in [Kind::Evaluated, Kind::Pending] {
+                        parts_check(&ctx, thomas_strided(), b, 1, n, lines, 1, starts, kind, seed);
+                    }
+                }
+            }
+        }
+        // Scalar systems batch (and never tile, see `thomas_plan`).
+        parts_check(&ctx, thomas_strided(), 1, 2, 40, 33, 1, false, Kind::Pending, 3);
+    }
+
+    #[test]
+    fn thomas_plan_widens_strided_lines() {
+        let nvidia = Tuning { profile: TuningProfile::Nvidia, line_strided_from: 16, ..Tuning::for_tests() };
+        // Strided lines of blocks of 2 to 5: a warp or more per workgroup and a tiled scratch.
+        assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, true), ThomasPlan { workgroup: 64, tiled: true });
+        assert_eq!(thomas_plan(&nvidia, 2, 4096, 16, true), ThomasPlan { workgroup: 128, tiled: true });
+        // Scalars: no tile (it is the same layout), a warp.
+        assert_eq!(thomas_plan(&nvidia, 1, 4096, 64, true), ThomasPlan { workgroup: 32, tiled: false });
+        // Contiguous lines, strides below 16 and blocks above 5: the narrow workgroups of one
+        // invocation per line and the scratch one cell after the other.
+        assert_eq!(thomas_plan(&nvidia, 5, 1680, 1, true), ThomasPlan { workgroup: 8, tiled: false });
+        assert_eq!(thomas_plan(&nvidia, 5, 13090, 8, true), ThomasPlan { workgroup: 32, tiled: false });
+        assert_eq!(thomas_plan(&nvidia, 6, 4488, 187, true), ThomasPlan { workgroup: 8, tiled: false });
+        // Stacked blocks too.
+        assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, false), ThomasPlan { workgroup: 8, tiled: false });
+        // Other devices keep the old rule.
+        let other = Tuning { line_strided_from: 0, ..nvidia };
+        assert_eq!(thomas_plan(&other, 5, 4488, 187, true), ThomasPlan { workgroup: 8, tiled: false });
+        let cpu = Tuning { profile: TuningProfile::Cpu, elementwise_workgroup: 64, ..nvidia };
+        assert_eq!(thomas_plan(&cpu, 5, 4488, 187, true), ThomasPlan { workgroup: 64, tiled: false });
+    }
+
     #[test]
     fn scalar_systems_by_both_solvers() {
         let ctx = Context::new().unwrap();
@@ -953,10 +1003,13 @@ mod tests {
 
     #[test]
     fn thomas_parts_scratch_must_fit_a_buffer() {
-        assert_eq!(thomas_parts_scratch(1000, 2, 3, 1 << 20), Some(1000 * 4 * 4 * 3));
-        assert_eq!(thomas_parts_scratch(1000, 2, 3, 1000 * 4 * 4 * 3), Some(1000 * 4 * 4 * 3));
-        assert_eq!(thomas_parts_scratch(1000, 2, 3, 1000 * 4 * 4 * 3 - 1), None);
-        assert_eq!(thomas_parts_scratch(usize::MAX, 8, 8, u64::MAX), None);
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, false, 1 << 20), Some(1000 * 4 * 4 * 3));
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, false, 1000 * 4 * 4 * 3), Some(1000 * 4 * 4 * 3));
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, false, 1000 * 4 * 4 * 3 - 1), None);
+        assert_eq!(thomas_parts_scratch(usize::MAX, 8, 8, false, u64::MAX), None);
+        // Tiled: whole tiles of 32 cells per system.
+        assert_eq!(thomas_parts_scratch(1000, 2, 3, true, 1 << 20), Some(1024 * 4 * 4 * 3));
+        assert_eq!(thomas_parts_scratch(1024, 2, 3, true, 1 << 20), Some(1024 * 4 * 4 * 3));
     }
 
     #[test]

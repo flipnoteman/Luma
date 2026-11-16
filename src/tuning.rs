@@ -98,6 +98,11 @@ pub(crate) struct Tuning {
     /// one-invocation-per-line Thomas solve fills the device and is faster (see `cyclic::plan`);
     /// 0 never chooses cyclic reduction on its own.
     pub(crate) line_cyclic_work: u32,
+    /// The smallest stride (cells between neighbouring cells of a line) from which the Thomas
+    /// solve of lines of blocks of 1 to 5 takes the wider workgroups and the tiled scratch of
+    /// `builtin::thomas_plan`: neighbouring lines are then neighbouring cells and a warp's
+    /// accesses coalesce. 0 keeps the narrow workgroups and the per-cell scratch.
+    pub(crate) line_strided_from: u32,
     /// Which tridiagonal solver runs; `LUMA_TRIDIAGONAL` overrides.
     pub(crate) line_solver: LineSolver,
 }
@@ -126,6 +131,7 @@ impl Tuning {
         line_bytes: 16 * 1024,
         // Not measured on Apple GPUs: Thomas unless forced.
         line_cyclic_work: 0,
+        line_strided_from: 0,
         line_solver: LineSolver::Auto,
     };
 
@@ -148,9 +154,13 @@ impl Tuning {
         staging: true,
         df_fma: false,
         df_sloppy_add: false,
-        line_bytes: 32 * 1024,
+        // All of the 48 KiB a workgroup may have: the rows of a line that fit it need no global
+        // scratch (see `cyclic::plan`).
+        line_bytes: 48 * 1024,
         // RTX 3090, see `cyclic::plan`.
         line_cyclic_work: 8192,
+        // RTX 3090, see `builtin::thomas_plan`.
+        line_strided_from: 16,
         line_solver: LineSolver::Auto,
     };
 
@@ -176,6 +186,7 @@ impl Tuning {
         line_bytes: 16 * 1024,
         // Not measured on other GPUs (a RADV iGPU was slower, 8.7 vs 3.0 ms for 200 lines of 4096): Thomas unless forced.
         line_cyclic_work: 0,
+        line_strided_from: 0,
         line_solver: LineSolver::Auto,
     };
 
