@@ -637,7 +637,7 @@ fn spans(
         };
         let reach = match kind {
             ShiftKind::View { map, edge } => Reach::View(map, edge),
-            ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamView { .. } => Reach::All,
+            ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamView { .. } | ShiftKind::ParamDims { .. } => Reach::All,
             ShiftKind::Linear => {
                 let amount = match instr.args[1] {
                     Ref::Scalar(q) => scalars.get(q as usize).copied(),
@@ -914,7 +914,7 @@ fn launch_store(
 ) -> Result<(), LumaError> {
     let Some(first) = outputs.first() else { return Ok(()) };
     let tiles = match (&key.tile, &key.staging) {
-        (Some(tile), _) => Some(tile.dims.0.div_ceil(tile.tile.0) * tile.dims.1.div_ceil(tile.tile.1)),
+        (Some(tile), _) => Some(tile.tiles()),
         (None, Some(staging)) => Some(staging.tiles()),
         (None, None) => None,
     };

@@ -230,8 +230,56 @@ fn views_of_inlined(key: &FusedKey, lowered: &[&Inlined]) -> Vec<(ViewMap, Edge)
 /// The WGSL functions that fold a coordinate back into `0..n`.
 pub(super) const EDGE_HELPERS: &str = "fn luma_clamp_i(c: i32, n: i32) -> i32 { return clamp(c, 0, n - 1); }
 fn luma_mirror_i(c: i32, n: i32) -> i32 { let a = select(c, -c - 1, c < 0); let b = select(a, 2 * n - 1 - a, a >= n); return clamp(b, 0, n - 1); }
-fn luma_wrap_i(c: i32, n: i32) -> i32 { return ((c % n) + n) % n; }
+fn luma_wrap_i(c: i32, n: i32) -> i32 { let r = c % n; return select(r, r + n, r < 0); }
+fn luma_wrap_mask(c: i32, mask: u32) -> i32 { return i32(u32(c) & mask); }
 ";
+
+/// The WGSL functions of the division by a divisor that is only known when the kernel runs, from
+/// the numbers of [`params::divisor_words`]. `luma_udiv` is for a dividend below `2^23` (an index
+/// into an array of fewer elements): one `f32` product and a correction of one, with the
+/// conversions between integer and `f32` made by adding `2^23`, which the shader compiler shares
+/// between reads of several views as it does the multiplication by a constant.
+/// A branch between this and the exact division for any dividend, or the division instruction
+/// of a variable divisor (a software routine), costs 20 to 60 % of an arithmetic-bound kernel
+/// (`euler/per_step` on 2000 x 2000 cells, RTX 3090) because the compiler no longer shares them;
+/// so the kernel is made for one or the other: `luma_udiv_wide` is exact for any dividend. No
+/// WGSL integer operation gives the high word of a product, so it is made of 16-bit halves
+/// (about 20 operations in all, about 3 times `luma_udiv`).
+const DIV_HELPERS: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
+    let f = bitcast<f32>(n | 0x4B000000u) - 8388608.0;
+    let q = bitcast<u32>(f * bitcast<f32>(r) + 8388608.0) & 0x7FFFFFu;
+    return q - select(0u, 1u, i32(n - q * d) < 0);
+}
+fn luma_urem(n: u32, d: u32, r: u32) -> u32 { return n - luma_udiv(n, d, r) * d; }
+fn luma_mulhi(a: u32, b: u32) -> u32 {
+    let a0 = a & 0xFFFFu; let a1 = a >> 16u;
+    let b0 = b & 0xFFFFu; let b1 = b >> 16u;
+    let m1 = a1 * b0; let m2 = a0 * b1;
+    let carry = (((a0 * b0) >> 16u) + (m1 & 0xFFFFu) + (m2 & 0xFFFFu)) >> 16u;
+    return a1 * b1 + (m1 >> 16u) + (m2 >> 16u) + carry;
+}
+fn luma_udiv_wide(n: u32, m: u32, s: u32) -> u32 { let t = luma_mulhi(n, m); return (t + ((n - t) >> 1u)) >> s; }
+fn luma_urem_wide(n: u32, d: u32, m: u32, s: u32) -> u32 { return n - luma_udiv_wide(n, m, s) * d; }
+";
+
+/// `n / d` for the divisor whose words start at uniform slot `slot`; `wide` for any `n`, else
+/// `n < 2^23`.
+pub(super) fn udiv(n: &str, slot: u32, wide: bool) -> String {
+    if wide {
+        format!("luma_udiv_wide({n}, p.s{}, p.s{})", slot + 1, slot + 2)
+    } else {
+        format!("luma_udiv({n}, p.s{slot}, p.s{})", slot + 3)
+    }
+}
+
+/// `n % d`, see [`udiv`].
+pub(super) fn urem(n: &str, slot: u32, wide: bool) -> String {
+    if wide {
+        format!("luma_urem_wide({n}, p.s{slot}, p.s{}, p.s{})", slot + 1, slot + 2)
+    } else {
+        format!("luma_urem({n}, p.s{slot}, p.s{})", slot + 3)
+    }
+}
 
 /// The WGSL functions of `views`: `view{n}(i)` is the flat source index view `n` reads for
 /// output element `i` and, for [`Edge::Fill`], `view{n}_in(i)` whether it lies inside the source.
@@ -345,8 +393,17 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
         },
-        Gen::RangeConst { stride, size } => {
-            let coord = if stride == 1 { format!("({index} % {size}u)") } else { format!("(({index} / {stride}u) % {size}u)") };
+        Gen::RangeConst { .. } | Gen::ParamRange { .. } => {
+            let coord = match kind {
+                Gen::RangeConst { stride: 1, size, .. } => format!("({index} % {size}u)"),
+                Gen::RangeConst { stride, size, .. } => format!("(({index} / {stride}u) % {size}u)"),
+                Gen::ParamRange { kind, wide, stride, size } => match kind {
+                    params::RangeKind::Zero => "0u".to_owned(),
+                    params::RangeKind::Mod => urem(index, size, wide),
+                    params::RangeKind::DivMod => urem(&udiv(index, stride, wide), size, wide),
+                },
+                _ => unreachable!(),
+            };
             match ty {
                 ElemTy::U32 => coord,
                 ElemTy::Bool => unreachable!("bool has no generators"),
@@ -407,6 +464,42 @@ fn shift_index(kind: ShiftKind, s: &str, i: &str, total: &str) -> String {
         ShiftKind::View { .. } | ShiftKind::ParamView { .. } => unreachable!("views are indexed by their own functions"),
         ShiftKind::Take { len } => format!("min({s}, {}u)", len.saturating_sub(1)),
         ShiftKind::ParamTake { max_slot } => format!("min({s}, p.s{max_slot})"),
+        ShiftKind::ParamDims { axes } => {
+            let mut terms = Vec::new();
+            for axis in axes {
+                if !axis.used {
+                    continue;
+                }
+                let [stride_slot, rem_slot, shift_slot] = axis.slots;
+                // The stride the coordinate is scaled back by is a shift for a power of two.
+                let (quotient, scale) = match axis.stride {
+                    params::DivRemSpec::None => (i.to_owned(), None),
+                    params::DivRemSpec::Pow2 => (format!("({i} >> p.s{stride_slot})"), Some(format!("<< p.s{stride_slot}"))),
+                    params::DivRemSpec::Runtime { wide } => (udiv(i, stride_slot, wide), Some(format!("* p.s{stride_slot}"))),
+                };
+                let (coord, dim) = match (axis.rem, axis.shifted) {
+                    (params::DivRemSpec::None, false) => (quotient, String::new()),
+                    (params::DivRemSpec::Pow2, _) => (format!("({quotient} & p.s{rem_slot})"), format!("(p.s{rem_slot} + 1u)")),
+                    (params::DivRemSpec::Runtime { wide }, _) => (urem(&quotient, rem_slot, wide), format!("p.s{rem_slot}")),
+                    (params::DivRemSpec::None, true) => (quotient, format!("p.s{rem_slot}")),
+                };
+                let wrapped = if axis.shifted {
+                    let shift = format!("p.s{shift_slot}");
+                    format!("select({coord} - {shift}, {coord} + ({dim} - {shift}), {coord} < {shift})")
+                } else {
+                    coord
+                };
+                terms.push(match scale {
+                    Some(scale) => format!("({wrapped} {scale})"),
+                    None => wrapped,
+                });
+            }
+            if terms.is_empty() {
+                "0u".to_owned()
+            } else {
+                terms.join(" + ")
+            }
+        }
         ShiftKind::Dims { dims, shifts } => {
             let [d0, d1, d2, _] = dims;
             let strides = [1, d0, d0 * d1, d0 * d1 * d2];
@@ -494,6 +587,14 @@ fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
 /// [`Lowered::Staged`] key (`key.staging` set) the staged sub-programs are computed into
 /// workgroup memory instead.
 pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lowered>) -> String {
+    let mut src = kernel_source(key, tuning, segment_len, lowered);
+    if src.contains("luma_udiv") || src.contains("luma_urem") {
+        src.push_str(DIV_HELPERS);
+    }
+    src
+}
+
+fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lowered>) -> String {
     let inlined = match lowered {
         Some(Lowered::Plain(inlined)) => Some(inlined),
         Some(Lowered::Staged(programs)) => Some(&programs.main),
@@ -1449,10 +1550,15 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
 /// per cell of its region (the tile plus a halo) and the shifts read it there. Part of the
 /// [`FusedKey`] because the generated source bakes in the offsets, which for a
 /// [`ShiftKind::Linear`] shift come from a scalar value.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Tile {
-    /// Width and height of the array (`h == 1` for 1D).
+    /// Width and height of the array (`h == 1` for 1D). Part of the key unless `slots` is set:
+    /// then the source reads them from the uniform and they only tell the launch how many
+    /// workgroups to run.
     pub(crate) dims: (u32, u32),
+    /// Where the uniform has the width, the height and the tiles per row, once the key has been
+    /// rewritten by [`params::apply_tile`] (see [`TileSlots`]).
+    pub(crate) slots: Option<TileSlots>,
     /// Output cells per workgroup.
     pub(crate) tile: (u32, u32),
     /// Per sub-program, the halo (cells per side and axis) its region extends beyond the tile.
@@ -1460,6 +1566,60 @@ pub(crate) struct Tile {
     /// Per program (0 = main, `1 + k` = `subs[k]`) and instruction, the cell offset (x, y) a
     /// shift of a sub-program reads; `None` for every other instruction.
     pub(crate) offsets: Vec<Vec<Option<(i32, i32)>>>,
+}
+
+/// What the source of a tiled kernel whose array extents are in the uniform depends on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct TileSlots {
+    /// The slot of the width; the height and the tiles per row follow.
+    pub(crate) base: u32,
+    /// The array is 1-dimensional.
+    pub(crate) one_d: bool,
+    /// A tile and its halo fit in the array along every axis, so that a halo cell is at most
+    /// one period away (see [`wrap_source`]).
+    pub(crate) small: bool,
+}
+
+impl PartialEq for Tile {
+    fn eq(&self, other: &Tile) -> bool {
+        self.slots == other.slots
+            && (self.slots.is_some() || self.dims == other.dims)
+            && self.tile == other.tile
+            && self.need == other.need
+            && self.offsets == other.offsets
+    }
+}
+
+impl Eq for Tile {}
+
+impl std::hash::Hash for Tile {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.slots.hash(state);
+        if self.slots.is_none() {
+            self.dims.hash(state);
+        }
+        self.tile.hash(state);
+        self.need.hash(state);
+        self.offsets.hash(state);
+    }
+}
+
+impl Tile {
+    /// Workgroups of a launch.
+    pub(crate) fn tiles(&self) -> u32 {
+        self.dims.0.div_ceil(self.tile.0) * self.dims.1.div_ceil(self.tile.1)
+    }
+
+    /// The halo of the widest region along each axis.
+    pub(crate) fn halo(&self) -> (u32, u32) {
+        self.need.iter().fold((0, 0), |(x, y), &(nx, ny)| (x.max(nx), y.max(ny)))
+    }
+
+    /// Whether a tile and its halo fit in the array along every axis.
+    pub(crate) fn fits(&self) -> bool {
+        let ((w, h), (tx, ty), (halo_x, halo_y)) = (self.dims, self.tile, self.halo());
+        w >= tx + 2 * halo_x && (h == 1 || h >= ty + 2 * halo_y)
+    }
 }
 
 /// The staging of `key` on arrays of `len` elements, if its sub-programs are read through
@@ -1498,7 +1658,7 @@ pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tu
                 (OpKind::Shift(_), Ref::Sub(j)) if p > 0 && j as usize + 1 >= p || j as usize >= key.subs.len() => return None,
                 (OpKind::Shift(kind), Ref::Sub(_)) => {
                     let (dx, dy) = match kind {
-                        ShiftKind::View { .. } | ShiftKind::Take { .. } | ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => return None,
+                        ShiftKind::View { .. } | ShiftKind::Take { .. } | ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamDims { .. } => return None,
                         ShiftKind::Dims { shifts, .. } => (signed(shifts[0], w), signed(shifts[1], h)),
                         ShiftKind::Linear => {
                             let Ref::Scalar(s) = instr.args[1] else { return None };
@@ -1550,21 +1710,25 @@ pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tu
             return None;
         }
     }
-    Some(Tile { dims: (w, h), tile: (tx, ty), need, offsets })
+    Some(Tile { dims: (w, h), slots: None, tile: (tx, ty), need, offsets })
 }
 
 /// The kernel of `key` with its sub-programs staged as `tile` says, running one workgroup per
 /// tile of the array. `based` and `stores` are those of the plain store kernel.
 fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str, names: &Names) -> String {
-    let ((w, h), (tx, ty)) = (tile.dims, tile.tile);
+    let (tx, ty) = tile.tile;
     let region = |j: usize| (tx + 2 * tile.need[j].0, ty + 2 * tile.need[j].1);
-    let (halo_x, halo_y) = tile.need.iter().fold((0, 0), |(x, y), &(nx, ny)| (x.max(nx), y.max(ny)));
+    // The extents are literals, or words of the uniform.
+    let (one_d, small, w, h, tiles_x) = match tile.slots {
+        Some(slots) => (slots.one_d, slots.small, format!("p.s{}", slots.base), format!("p.s{}", slots.base + 1), format!("p.s{}", slots.base + 2)),
+        None => (tile.dims.1 == 1, tile.fits(), format!("{}u", tile.dims.0), format!("{}u", tile.dims.1), format!("{}u", tile.dims.0.div_ceil(tx))),
+    };
     let (index, global) = if based { ("gi", "        let gi = p.base + i;\n") } else { ("i", "") };
     // Cell (lx, ly) relative to the tile origin, as a global element.
-    let element = if h == 1 {
-        format!("wrap(i32(tile_x) + lx, {w}u)")
+    let element = if one_d {
+        format!("wrap(i32(tile_x) + lx, {w})")
     } else {
-        format!("wrap(i32(tile_x) + lx, {w}u) + wrap(i32(tile_y) + ly, {h}u) * {w}u")
+        format!("wrap(i32(tile_x) + lx, {w}) + wrap(i32(tile_y) + ly, {h}) * {w}")
     };
     let staged = |p: usize| {
         move |at: usize, instr: &Instr| -> Option<String> {
@@ -1572,7 +1736,7 @@ fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str, names: &Na
             let Ref::Sub(j) = instr.args[0] else { return None };
             let j = j as usize;
             let ((nx, ny), (lw, _)) = (tile.need[j], region(j));
-            let row = if h == 1 { String::new() } else { format!(" + u32(ly + ({})) * {lw}u", oy + ny as i32) };
+            let row = if one_d { String::new() } else { format!(" + u32(ly + ({})) * {lw}u", oy + ny as i32) };
             Some(format!("w{j}[u32(lx + ({})){row}]", ox + nx as i32))
         }
     };
@@ -1590,11 +1754,10 @@ fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str, names: &Na
 @compute @workgroup_size({WORKGROUP})
 fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
     let g = wid.x + wid.y * nwg.x;
-    let tile_x = (g % {tiles_x}u) * {tx}u;
-    let tile_y = (g / {tiles_x}u) * {ty}u;
+    let tile_x = (g % {tiles_x}) * {tx}u;
+    let tile_y = (g / {tiles_x}) * {ty}u;
 ",
-        wrap_source(w >= tx + 2 * halo_x && (h == 1 || h >= ty + 2 * halo_y)),
-        tiles_x = w.div_ceil(tx),
+        wrap_source(small),
     );
     for (k, instrs) in key.subs.iter().enumerate() {
         let ((nx, ny), (lw, lh)) = (tile.need[k], region(k));
@@ -1620,8 +1783,8 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
         let ly = i32(e / {tx}u);
         let x = tile_x + u32(lx);
         let y = tile_y + u32(ly);
-        if (x < {w}u && y < {h}u) {{
-            let i = x + y * {w}u;
+        if (x < {w} && y < {h}) {{
+            let i = x + y * {w};
 {global}{}{stores}        }}
     }}
 }}

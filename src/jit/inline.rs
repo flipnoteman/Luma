@@ -278,7 +278,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
     let mut coordinates = vec![false; n];
     for (at, flat) in flats.iter().enumerate() {
         coordinates[at] = match flat.op.kind {
-            OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. }) => true,
+            OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::ParamRange { .. }) => true,
             OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
                 flat.args.iter().take(flat.op.kind.arity()).all(|arg| match *arg {
                     Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
@@ -480,7 +480,7 @@ impl Lowering<'_> {
                     let context_args = match kind {
                         ShiftKind::Linear => [b, c],
                         ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } => [b, Ref::Unused],
-                        ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Dims { .. } => [Ref::Unused; 2],
+                        ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } => [Ref::Unused; 2],
                     };
                     let child = self.context(ctx, kind, context_args);
                     match source {
@@ -663,7 +663,7 @@ fn sub_len(key: &FusedKey, s: u32, len: usize) -> f64 {
             return match kind {
                 ShiftKind::View { map, .. } => map.src.iter().map(|&d| f64::from(d)).product(),
                 ShiftKind::Take { len } => f64::from(len),
-                ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => len as f64,
+                ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamDims { .. } => len as f64,
                 ShiftKind::Dims { dims, .. } => dims.iter().map(|&d| f64::from(d)).product(),
                 ShiftKind::Linear => len as f64,
             };

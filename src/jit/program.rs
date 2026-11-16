@@ -692,7 +692,7 @@ fn zero_shift(kind: ShiftKind) -> ShiftKind {
         ShiftKind::Linear => ShiftKind::Linear,
         ShiftKind::View { map, .. } => ShiftKind::View { map: ViewMap::identity(map.src), edge: Edge::None },
         ShiftKind::Take { len } => ShiftKind::View { map: ViewMap::identity([len, 1, 1, 1]), edge: Edge::None },
-        ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } => unreachable!("parameterized shifts only exist after flattening"),
+        ShiftKind::ParamView { .. } | ShiftKind::ParamTake { .. } | ShiftKind::ParamDims { .. } => unreachable!("parameterized shifts only exist after flattening"),
     }
 }
 
@@ -950,7 +950,7 @@ impl Flattener {
         let sub = self.sub(g, kid, node)?;
         let (amount, total) = match kind {
             ShiftKind::Linear => (self.constant(Scalar::u32(0)), self.constant(Scalar::u32(node.len() as u32))),
-            ShiftKind::Dims { .. } | ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } => (Ref::Unused, Ref::Unused),
+            ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. } => (Ref::Unused, Ref::Unused),
         };
         let value = u32::try_from(self.instrs.len()).unwrap_or(u32::MAX);
         self.instrs.push(Instr { op: Op::new(OpKind::Shift(kind), node.op().out_ty()), args: [sub, amount, total] });
