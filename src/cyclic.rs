@@ -80,7 +80,11 @@ pub(crate) fn row_type(block: u32) -> &'static str {
 }
 
 /// The shift (log2 of the row stride) of the shared rows for a line of `n` rows, and the number
-/// of shared rows.
+/// of shared rows. A line that fits the workgroup memory whole gets its rows rounded up to a
+/// multiple of 32 (as long as that fits too): the array size is a constant of the source, so
+/// lines of 106 and 122 rows share one kernel instead of compiling one each, at the price of at
+/// most 31 unused rows of workgroup memory. A spilled line keeps its exact count, which the
+/// scratch indexing bakes in.
 fn layout(tuning: &Tuning, block: u32, n: u32) -> (u8, u32) {
     let row = row_bytes(block);
     let budget = u64::from(tuning.line_bytes);
@@ -88,7 +92,9 @@ fn layout(tuning: &Tuning, block: u32, n: u32) -> (u8, u32) {
     while shift < 31 && u64::from(n.div_ceil(1 << shift)) * row > budget && n.div_ceil(1 << shift) > 1 {
         shift += 1;
     }
-    (shift, n.div_ceil(1 << shift))
+    let rows = n.div_ceil(1 << shift);
+    let padded = rows.next_multiple_of(32);
+    if shift == 0 && u64::from(padded) * row <= budget { (shift, padded) } else { (shift, rows) }
 }
 
 /// Whether the line solve of `lines` lines of `n` cells of `block`-blocks, `stride` cells apart
@@ -147,7 +153,7 @@ pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32,
     if u64::from(shared_rows) * row_bytes(block) > u64::from(tuning.line_bytes) || plan.scratch_bytes(block, n, lines) > max_scratch {
         return None;
     }
-    let scratch_elements = u64::from(lines) * u64::from(n - shared_rows) * u64::from(row_elems(block));
+    let scratch_elements = u64::from(lines) * u64::from(n.saturating_sub(shared_rows)) * u64::from(row_elems(block));
     if scratch_elements > u64::from(u32::MAX) {
         return None;
     }

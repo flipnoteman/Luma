@@ -16,7 +16,10 @@
 //!
 //! Kernels are cached per context by the *structure* of the expression (operations, types,
 //! how values are wired); scalar values are uniforms and not part of the key, so
-//! `&x * 2.0` and `&x * 3.0` share one pipeline ([`program`]).
+//! `&x * 2.0` and `&x * 3.0` share one pipeline ([`program`]). The extents of the arrays are
+//! uniforms too (see [`params`]): the same expression on a grid of another shape is the same
+//! kernel, unless an extent is a power of two or the array has `2^23` elements or more, which
+//! change the index math, or the kernel stages sub-programs in workgroup memory.
 //!
 //! # Where fusion stops
 //!
@@ -157,6 +160,11 @@ mod looped;
 mod operator;
 mod pack;
 mod params;
+
+/// Whether an array of `len` elements has indices that need the exact division (see `params::DivRemSpec`).
+pub(crate) fn is_wide(len: usize) -> bool {
+    params::is_wide(len as u64)
+}
 mod program;
 mod readers;
 mod rerun;
@@ -397,8 +405,14 @@ pub(crate) enum Gen {
     Index,
     /// `(i >> shift) & mask` for power-of-two `stride` and `size`; operands: shift, mask.
     RangePow2,
-    /// `(i / stride) % size` with non-power-of-two constants baked into the shader.
-    RangeConst { stride: u32, size: u32 },
+    /// `(i / stride) % size` for other strides and sizes. The numbers are in the key, so a
+    /// kernel that keeps this kind (a staged one, see `params`) works on constants. `wide`: the
+    /// array has `2^23` elements or more (see `params::DivRemSpec`).
+    RangeConst { stride: u32, size: u32, wide: bool },
+    /// [`Gen::RangeConst`] with its numbers in the uniform: the [words of the
+    /// divisors](params::divisor_words) of `stride` and `size` start at those slots (see
+    /// `params::RangeKind` for the ones that are used).
+    ParamRange { kind: params::RangeKind, wide: bool, stride: u32, size: u32 },
     /// `start + i * step`; operands: start, step.
     Linspace,
 }
@@ -410,7 +424,8 @@ pub(crate) enum ShiftKind {
     /// array length) the scalar operand 2.
     Linear,
     /// Every dimension of an array of `dims` shifted circularly by `shifts` (each in
-    /// `0..dim`). Part of the kernel's key, so the index math works on constants.
+    /// `0..dim`). The numbers are in the key, so a kernel that keeps this kind (a staged one, see
+    /// `params`) works on constants.
     Dims { dims: [u32; 4], shifts: [u32; 4] },
     /// A [`ViewMap`] of the source with `edge` handling coordinates outside it. Operand 1 is
     /// the fill value of [`Edge::Fill`].
@@ -423,6 +438,8 @@ pub(crate) enum ShiftKind {
     ParamView { id: u16, spec: params::ViewSpec },
     /// [`ShiftKind::Take`] with `len - 1` in uniform slot `max_slot`.
     ParamTake { max_slot: u32 },
+    /// [`ShiftKind::Dims`] with its numbers in the uniform (see `params::DimsAxis`).
+    ParamDims { axes: [params::DimsAxis; 4] },
 }
 
 /// One source axis of a view: source coordinate `start + step * o`, `o` = output coordinate along `from`.
@@ -559,14 +576,14 @@ impl ViewMap {
 impl OpKind {
     pub(crate) fn arity(self) -> usize {
         match self {
-            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
+            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
             OpKind::Shift(ShiftKind::ParamView { spec, .. }) if spec.edge != Edge::Fill => 1,
             OpKind::Binary(_)
             | OpKind::Compare(_)
             | OpKind::Powf
             | OpKind::Shift(ShiftKind::View { edge: Edge::Fill, .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => 2,
             OpKind::Shift(ShiftKind::Linear) | OpKind::Clamp | OpKind::Select => 3,
-            OpKind::Generate(Gen::Index | Gen::RangeConst { .. }) => 0,
+            OpKind::Generate(Gen::Index | Gen::RangeConst { .. } | Gen::ParamRange { .. }) => 0,
             OpKind::Generate(_) => 2,
         }
     }
@@ -2961,6 +2978,7 @@ impl JitState {
             });
             return Ok(core);
         }
+        params::apply_tile(key, scalars);
         let key = &*key;
         let (core, built) = self.kernels.get_or_build(key, || self.build_kernel(ctx, key))?;
         if !built {
@@ -3043,12 +3061,17 @@ impl JitState {
         }
         let source = codegen::source(key, ctx.tuning(), segment_len, lowered.as_ref());
         let label = key.label();
+        let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
+        let bytes = source.len();
         let core = Arc::new(kernel::build_core(
             ctx,
             &KernelKey::new(source, "main", None),
             Some(&label),
             true,
         )?);
+        if let Some(started) = started {
+            log::debug!("luma: compiled {label} ({bytes} bytes of WGSL) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        }
         self.stats.built.fetch_add(1, Ordering::Relaxed);
         Ok(core)
     }
@@ -3069,8 +3092,13 @@ impl JitState {
     /// The stencil kernel with WGSL `source`, compiled on first use.
     pub(crate) fn stencil_kernel(&self, ctx: &Context, source: String, label: &str) -> Result<Arc<KernelCore>> {
         let (core, built) = self.stencils.get_or_build(&source, || {
+            let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
             let key = KernelKey::new(source.clone(), "main", None);
-            kernel::build_core(ctx, &key, Some(label), true).map(Arc::new)
+            let core = kernel::build_core(ctx, &key, Some(label), true).map(Arc::new);
+            if let Some(started) = started {
+                log::debug!("luma: compiled {label} ({} bytes of WGSL) in {:.1} ms", source.len(), started.elapsed().as_secs_f64() * 1e3);
+            }
+            core
         })?;
         if built {
             self.stats.built.fetch_add(1, Ordering::Relaxed);

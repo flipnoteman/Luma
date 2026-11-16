@@ -63,6 +63,26 @@ All notable changes to Luma are listed here. The format follows
   multiprocessor.
 - `bench_solve` has `parts3d/...` rows: the parts solves of a 187 x 70 x 24 grid along each axis,
   evaluated and from 50 face fields, with scalar, 2x2, 4x4 and 5x5 blocks.
+- Generated kernels no longer bake the extents of their arrays into the WGSL: the same expression
+  on a grid of another shape is the same kernel instead of one more driver compile. Moved into the
+  uniform: the dims, strides and shifts of circular shifts (`ShiftKind::Dims`), the output
+  divisors and wrap extents of views, the strides and sizes of `Array::range`, the extents of
+  the circular-shift tiling of kernels that read a lazy expression through shifts, and the
+  workgroup-memory rows of cyclic-reduction line solves (rounded up to a multiple of 32). A divisor
+  that is a power of two stays a shift or a mask (its own kernel); any other is read as words (`d`,
+  a 32-bit magic number, a shift, an `f32` reciprocal): below 2^23 elements an `f32` product and a
+  correction of one, above it the exact high-word division. Views of a kernel that divide by the
+  same number share the words so that the shader compiler computes the quotient once. Measured
+  on the table of 10 Mach points of a CFD solver (each on its own grid of 16 536 to 21 840 cells,
+  luma and driver disk caches off, RTX 3090): kernels built 172 -> 50, the first chunk of each
+  point after the first 1.4-1.9 s -> 0.05 s (0.2-0.55 s for three points whose grids fall in
+  another class of powers of two), first chunks in all 16.5 s -> 4.3 s, table 53 s -> 31 s.
+  `euler/per_step` on 2000 x 2000 (arithmetic-bound, every view divides by a runtime extent) is
+  3-5 % slower, power-of-two shapes and the other `bench_pde` / `bench_datasci --quick` rows are
+  unchanged within noise. Not yet shape-independent: kernels that stage sub-programs through views
+  in workgroup memory (`FusedKey::staging`, about 19 ms of compile per new shape), `Tail::Stack`
+  and private scatter-adds.
+- `log::debug!` lines name every kernel compiled, with its WGSL size and compile time.
 
 ## [0.4.1] - 2026-11-15
 

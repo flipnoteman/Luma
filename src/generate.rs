@@ -103,7 +103,7 @@ impl<T: ScalarType> Array<T> {
         let Some(&size) = dims.get(dim) else {
             return Err(LumaError::InvalidShape(format!("range along dimension {dim} of a 4-dimensional shape")));
         };
-        shape.validate()?;
+        let len = shape.validate()?;
         let stride: usize = dims[..dim].iter().product();
         let fits = |v: usize| u32::try_from(v).map_err(|_| LumaError::InvalidShape(format!("{v} exceeds u32")));
         let (stride32, size32) = (fits(stride)?, fits(size)?);
@@ -116,7 +116,7 @@ impl<T: ScalarType> Array<T> {
                 [Src::Scalar(Scalar::u32(stride32.trailing_zeros())), Src::Scalar(Scalar::u32(size32 - 1)), Src::unused()],
             )
         } else {
-            (Gen::RangeConst { stride: stride32, size: size32 }, [Src::unused(), Src::unused(), Src::unused()])
+            (Gen::RangeConst { stride: stride32, size: size32, wide: crate::jit::is_wide(len) }, [Src::unused(), Src::unused(), Src::unused()])
         };
         generated(ctx, shape, kind, args, "range", Location::caller())
     }

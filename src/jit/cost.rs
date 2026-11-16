@@ -102,11 +102,11 @@ pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
                 1.0
             }
         }
-        OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::Linear) => 4.0,
+        OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::Linear) => 4.0,
         OpKind::Shift(ShiftKind::View { edge, .. }) => 6.0 + if edge != Edge::None { 2.0 } else { 0.0 },
         OpKind::Shift(ShiftKind::ParamView { spec, .. }) => 6.0 + if spec.edge != Edge::None { 2.0 } else { 0.0 },
         OpKind::Shift(ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => 2.0,
-        OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::Linspace) => 2.0,
+        OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::ParamRange { .. } | Gen::Linspace) => 2.0,
         OpKind::Generate(Gen::Bits | Gen::Uniform | Gen::Normal) => 60.0,
     };
     // The double-float math library takes about this many double-float operations (see

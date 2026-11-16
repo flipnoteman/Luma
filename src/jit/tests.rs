@@ -4172,3 +4172,155 @@ fn a_loop_over_more_states_than_a_kernel_binds_steps_with_its_results_in_buffers
         }
     }
 }
+
+/// A program of every kind of index math that depends on the extents of its arrays: circular
+/// shifts over several axes (`ShiftKind::Dims`), coordinate generators (`Gen::RangeMod` and
+/// `RangeDivMod`) and views of every edge handling (slice, flip, pad, transpose). Checked
+/// against a host computation written from the definition of each operation.
+fn shape_program(ctx: &Context, shape: impl Into<crate::Shape>) {
+    use crate::PadMode;
+    let shape: crate::Shape = shape.into();
+    let dims = shape.dims();
+    let n: usize = dims.iter().product();
+    let xs = values(n, n as u64, -1.0, 1.0);
+    let x = Array::from_slice_on(ctx, &xs, shape).unwrap();
+    let strides = [1, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]];
+    let coords = |i: usize| -> [usize; 4] { std::array::from_fn(|a| (i / strides[a]) % dims[a]) };
+    let last = (0..4).rev().find(|&a| dims[a] > 1).unwrap();
+
+    // Circular shifts along every axis at once, and along the first axis only, plus the
+    // coordinates along the first and the last axis.
+    let all = [1isize, 2, 3, 4];
+    let first = [-1isize, 0, 0, 0];
+    let along = Array::<f32>::range_on(ctx, shape, 0).unwrap();
+    let across = Array::<f32>::range_on(ctx, shape, last).unwrap();
+    let expr = x.shift(all) * 2.0 + x.shift(first) + along * 0.25 - across * 0.5;
+    let at = |c: [usize; 4], by: [isize; 4]| -> f32 {
+        let from: [usize; 4] = std::array::from_fn(|a| (c[a] as isize - by[a]).rem_euclid(dims[a] as isize) as usize);
+        xs[from.iter().zip(&strides).map(|(c, s)| c * s).sum::<usize>()]
+    };
+    let want: Vec<f32> = (0..n)
+        .map(|i| {
+            let c = coords(i);
+            at(c, all) * 2.0 + at(c, first) + c[0] as f32 * 0.25 - c[last] as f32 * 0.5
+        })
+        .collect();
+    assert_close(&expr.to_vec().unwrap(), &want, 1e-5, 1e-5);
+
+    // Views: a slice and a flipped slice of the first axis, and a pad of every edge kind.
+    let lines = n / dims[0];
+    let per_line = |width: usize, read: &dyn Fn(usize) -> Option<usize>| -> Vec<f32> {
+        (0..lines).flat_map(|l| (0..width).map(move |k| (l, k))).map(|(l, k)| read(k).map_or(0.0, |a| xs[l * dims[0] + a])).collect()
+    };
+    let got = (x.slice(0, 1..dims[0] - 1) * 3.0 + 1.0).to_vec().unwrap();
+    let want = per_line(dims[0] - 2, &|k| Some(k + 1));
+    assert_close(&got, &want.iter().map(|v| v * 3.0 + 1.0).collect::<Vec<_>>(), 1e-5, 1e-5);
+    let got = (x.flip(0).slice(0, 2..) - 0.5).to_vec().unwrap();
+    let want = per_line(dims[0] - 2, &|k| Some(dims[0] - 1 - (k + 2)));
+    assert_close(&got, &want.iter().map(|v| v - 0.5).collect::<Vec<_>>(), 1e-5, 1e-5);
+    let len = dims[0] as isize;
+    for mode in [PadMode::Edge, PadMode::Mirror, PadMode::Wrap, PadMode::Zero] {
+        let got = (x.pad([(1, 2)], mode) * 1.5).to_vec().unwrap();
+        let want = per_line(dims[0] + 3, &|k| {
+            let c = k as isize - 1;
+            match mode {
+                PadMode::Edge => Some(c.clamp(0, len - 1) as usize),
+                PadMode::Mirror => Some((if c < 0 { -c - 1 } else if c >= len { 2 * len - 1 - c } else { c }).clamp(0, len - 1) as usize),
+                PadMode::Wrap => Some(c.rem_euclid(len) as usize),
+                PadMode::Zero => (0..len).contains(&c).then_some(c as usize),
+            }
+        });
+        assert_close(&got, &want.iter().map(|v| v * 1.5).collect::<Vec<_>>(), 1e-5, 1e-5);
+    }
+    // A stencil of a lazy expression: its shifted reads come from a tile in workgroup memory
+    // (circular shifts), whose extents are in the uniform.
+    if dims[2] == 1 && dims[3] == 1 {
+        let u = &x * 2.0 + 1.0;
+        let got = (u.shift([1isize, 0]) + u.shift([-1isize, 0]) + u.shift([0isize, 1]) - &u * 3.0).to_vec().unwrap();
+        let hu: Vec<f32> = xs.iter().map(|v| v * 2.0 + 1.0).collect();
+        let (w, h) = (dims[0] as isize, dims[1] as isize);
+        let read = |x: isize, y: isize| hu[x.rem_euclid(w) as usize + y.rem_euclid(h) as usize * dims[0]];
+        let want: Vec<f32> = (0..n)
+            .map(|i| {
+                let (x, y) = ((i % dims[0]) as isize, (i / dims[0]) as isize);
+                read(x - 1, y) + read(x + 1, y) + read(x, y - 1) - read(x, y) * 3.0
+            })
+            .collect();
+        assert_close(&got, &want, 1e-5, 1e-5);
+    }
+    // A lazy expression read through a view and through a circular shift: the kernel runs
+    // their composition, with the shift as one of the contexts of its lowering.
+    if dims[2] == 1 && dims[3] == 1 {
+        let u = &x * 3.0 - 1.0;
+        let got = (u.shift_clamp([1isize, -1]) + u.shift([0isize, 2]) * 0.5 + &u).to_vec().unwrap();
+        let hu: Vec<f32> = xs.iter().map(|v| v * 3.0 - 1.0).collect();
+        let (w, h) = (dims[0] as isize, dims[1] as isize);
+        let want: Vec<f32> = (0..n)
+            .map(|i| {
+                let (x, y) = ((i % dims[0]) as isize, (i / dims[0]) as isize);
+                let clamped = hu[(x - 1).clamp(0, w - 1) as usize + (y + 1).clamp(0, h - 1) as usize * dims[0]];
+                let wrapped = hu[x as usize + (y - 2).rem_euclid(h) as usize * dims[0]];
+                clamped + wrapped * 0.5 + hu[i]
+            })
+            .collect();
+        assert_close(&got, &want, 1e-5, 1e-5);
+    }
+    if dims[2] == 1 {
+        let got = (x.transpose() + 1.0).to_vec().unwrap();
+        let want: Vec<f32> = (0..dims[0]).flat_map(|r| (0..dims[1]).map(move |c| (r, c))).map(|(r, c)| xs[r + c * dims[0]] + 1.0).collect();
+        assert_close(&got, &want, 1e-5, 1e-5);
+    }
+}
+
+#[test]
+fn an_expression_on_another_shape_is_the_same_kernel() {
+    // The extents and strides are not powers of two (a power of two is another structure: its
+    // index math is shifts and masks), so no shape falls into a class of its own.
+    let ctx = ctx();
+    shape_program(&ctx, [210, 71]);
+    let first = ctx.jit().stats().built;
+    assert!(first > 0);
+    shape_program(&ctx, [100, 50]);
+    shape_program(&ctx, [97, 1000]);
+    assert_eq!(ctx.jit().stats().built, first, "kernels built for two more 2-D shapes");
+    // A shape too small for a tile and its halo takes the tile's other form of wrapping, which
+    // is the one kernel more; the results are right all the same.
+    shape_program(&ctx, [7, 13]);
+    shape_program(&ctx, [19, 3, 5]);
+    let first = ctx.jit().stats().built;
+    shape_program(&ctx, [210, 71, 24]);
+    shape_program(&ctx, [7, 3, 11]);
+    assert_eq!(ctx.jit().stats().built, first, "kernels built for two more 3-D shapes");
+    // The same on a flat array.
+    shape_program(&ctx, 5003);
+    let flat = ctx.jit().stats().built;
+    shape_program(&ctx, 4001);
+    shape_program(&ctx, 9973);
+    assert_eq!(ctx.jit().stats().built, flat, "kernels built for two more 1-D shapes");
+    shape_program(&ctx, 777);
+}
+
+#[test]
+fn the_indices_of_a_wide_array_divide_exactly() {
+    // From 2^23 elements the generated index math takes the exact division of any dividend
+    // instead of the quick one of `luma_udiv`, which is exact below that. The elements past
+    // 2^23 are where the two differ.
+    let ctx = ctx();
+    let (w, h) = (2999usize, 2800usize);
+    assert!(w * h > 1 << 23);
+    let rows = Array::<u32>::range_on(&ctx, [w, h], 1).unwrap();
+    let cols = Array::<u32>::range_on(&ctx, [w, h], 0).unwrap();
+    let got = (&rows * 7u32 + &cols).to_vec().unwrap();
+    let want: Vec<u32> = (0..w * h).map(|i| (i / w) as u32 * 7 + (i % w) as u32).collect();
+    if let Some(i) = (0..w * h).find(|&i| got[i] != want[i]) {
+        panic!("first mismatch at {i}: got {}, want {}", got[i], want[i]);
+    }
+
+    // A view whose output has more than 2^23 elements divides by a stride that is no power of two.
+    let flat = Array::<u32>::range_on(&ctx, w * h, 0).unwrap().reshape([w, h]);
+    let inner = flat.slice(0, 1..w - 1);
+    assert!((w - 2) * h > 1 << 23);
+    let got = (inner + 1u32).to_vec().unwrap();
+    let want: Vec<u32> = (0..(w - 2) * h).map(|i| ((i / (w - 2)) * w + i % (w - 2) + 1) as u32 + 1).collect();
+    assert_eq!(got, want);
+}
