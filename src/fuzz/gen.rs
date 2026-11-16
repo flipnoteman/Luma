@@ -39,6 +39,8 @@ pub enum ViewOp {
     Pad { widths: Vec<(usize, usize)>, mode: PadMode },
     Flip { axis: usize },
     Transpose,
+    /// Axis `k` of the result is axis `perm[k]` of the source.
+    Permute { perm: [u8; 4] },
     ShiftCirc { offs: Vec<isize> },
     ShiftFill { offs: Vec<isize>, value: f32 },
     ShiftClamp { offs: Vec<isize> },
@@ -57,6 +59,7 @@ pub enum InjView {
     InjSlice { axis: usize, lo: usize, hi: usize },
     InjFlip { axis: usize },
     InjTranspose,
+    InjPermute { perm: [u8; 4] },
 }
 
 /// How a loop runs.
@@ -934,6 +937,10 @@ impl Scope {
                         let d = v.dims;
                         e.new.push(New { read_only: true, ..Scope::fresh(v.ty, [d[1], d[0], d[2], d[3]], info) });
                     }
+                    ViewOp::Permute { perm } => {
+                        let d = v.dims;
+                        e.new.push(New { read_only: true, ..Scope::fresh(v.ty, perm.map(|p| d[p as usize]), info) });
+                    }
                     ViewOp::Pad { widths, mode } => {
                         let mut dims = v.dims;
                         for (k, (b, a)) in widths.iter().enumerate() {
@@ -1064,6 +1071,7 @@ impl Scope {
                             }
                         }
                         InjView::InjTranspose => dims = [dims[1], dims[0], dims[2], dims[3]],
+                        InjView::InjPermute { perm } => dims = perm.map(|p| dims[p as usize]),
                     }
                 }
                 let (rd, ri, _) = self.opd(rhs, t.ty)?;
@@ -1294,6 +1302,15 @@ impl Builder {
         Some(stmt)
     }
 
+    /// A random permutation of the four axes (Fisher-Yates).
+    fn permutation(&mut self) -> [u8; 4] {
+        let mut perm = [0u8, 1, 2, 3];
+        for k in (1..4).rev() {
+            perm.swap(k, self.tape.below(k + 1));
+        }
+        perm
+    }
+
     fn offsets(&mut self, dims: Dims, ndim: usize) -> Vec<isize> {
         (0..ndim)
             .map(|a| {
@@ -1331,11 +1348,12 @@ impl Builder {
             86..=87 => self.g_put(),
             88..=90 => self.g_compound(),
             91 if ctx != Ctx::Traced => self.g_write(),
-            92 => match self.tape.below(6) {
+            92 => match self.tape.below(7) {
                 0 => self.g_cache(),
                 1 => self.g_reshape(),
                 2 | 3 => self.g_count(),
                 4 => self.g_promote(),
+                5 => self.g_classify(),
                 _ => self.g_classify(),
             },
             93..=94 if host => self.g_eval(),
@@ -1550,7 +1568,7 @@ impl Builder {
         let src = self.pick(|_| true)?;
         let v = self.scope.var(src)?.clone();
         let nd = Self::ndim(v.dims);
-        let view = match self.tape.below(15) {
+        let view = match self.tape.below(16) {
             0..=2 => {
                 let axis = self.tape.below(nd);
                 let n = v.dims[axis];
@@ -1575,6 +1593,7 @@ impl Builder {
             9 => ViewOp::ShiftClamp { offs: self.offsets(v.dims, nd) },
             10 => ViewOp::ShiftMirror { offs: self.offsets(v.dims, nd) },
             11 | 12 => ViewOp::Take { idx: self.pick_ty(Ty::U32)? },
+            15 => ViewOp::Permute { perm: self.permutation() },
             14 => {
                 let axis = self.tape.below(4);
                 let dims = v.dims;
@@ -1644,7 +1663,7 @@ impl Builder {
         let mut path = Vec::new();
         for _ in 0..self.tape.below(3) {
             let nd = Self::ndim(dims);
-            match self.tape.below(4) {
+            match self.tape.below(5) {
                 0 | 1 => {
                     let axis = self.tape.below(nd);
                     let lo = self.tape.below(dims[axis]);
@@ -1653,9 +1672,14 @@ impl Builder {
                     path.push(InjView::InjSlice { axis, lo, hi });
                 }
                 2 => path.push(InjView::InjFlip { axis: self.tape.below(nd) }),
-                _ => {
+                3 => {
                     dims = [dims[1], dims[0], dims[2], dims[3]];
                     path.push(InjView::InjTranspose);
+                }
+                _ => {
+                    let perm = self.permutation();
+                    dims = perm.map(|p| dims[p as usize]);
+                    path.push(InjView::InjPermute { perm });
                 }
             }
         }

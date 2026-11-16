@@ -23,6 +23,12 @@ assert_eq!(a.slice(1, ..1).flip(0).to_vec()?, vec![3.0, 2.0, 1.0, 0.0]);
 assert_eq!(a.transpose().shape(), Shape::from([3, 4]));
 assert_eq!(a.transpose().slice(1, ..1).to_vec()?, vec![0.0, 4.0, 8.0]);
 
+// `swap_axes(a, b)` and `permute_axes(perm)` reorder any of the four axes; axis `k` of the
+// result is axis `perm[k]` of the source.
+let v = Array::from_slice(&(0..24).map(|i| i as f32).collect::<Vec<_>>(), [2, 3, 4])?;
+assert_eq!(v.swap_axes(1, 2).shape(), Shape::from([2, 4, 3]));
+assert_eq!(v.permute_axes([2, 0, 1, 3]).shape(), Shape::from([4, 2, 3]));
+
 // A difference of two slices reads `a` once, in one kernel.
 let d = a.slice(0, 1..) - a.slice(0, ..3);
 assert_eq!(d.to_vec()?, vec![1.0; 9]);
@@ -34,6 +40,7 @@ assert_eq!(d.to_vec()?, vec![1.0; 9]);
 | [`slice(axis, range)`](https://docs.rs/luma/latest/luma/struct.Array.html#method.slice) | the range along one axis; an empty or out-of-range range poisons the result |
 | `flip(axis)` | reversed along the axis |
 | `transpose()` | the first two axes swapped |
+| `swap_axes(a, b)`, `permute_axes(perm)` | any two axes swapped, or all four reordered (axis `k` of the result is axis `perm[k]`) |
 | `broadcast_to(shape)` | extents of 1 repeated to `shape` (see [Arrays](arrays.md#shapes-and-broadcasting)) |
 | `shift(offsets)` | circular shift: element `i` moves to `i + offset`, wrapping |
 | `shift_fill(offsets, value)` | the same, the cells nothing moves into read `value` |

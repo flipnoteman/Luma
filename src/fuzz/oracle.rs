@@ -633,12 +633,14 @@ impl HostArray {
         Ok(map)
     }
 
-    fn transpose_map(&self) -> ViewMap {
+    /// Axis `k` of the result is axis `perm[k]` of the source.
+    fn permute_map(&self, perm: [usize; 4]) -> ViewMap {
         let d = self.dims;
         let mut map = ViewMap::identity(d);
-        map.out = [d[1], d[0], d[2], d[3]];
-        map.axes[0].from = 1;
-        map.axes[1].from = 0;
+        map.out = std::array::from_fn(|k| d[perm[k]]);
+        for (k, &p) in perm.iter().enumerate() {
+            map.axes[p].from = k;
+        }
         map
     }
 
@@ -651,7 +653,11 @@ impl HostArray {
     }
 
     pub fn transpose(&self) -> HostArray {
-        self.read_through(self.transpose_map(), Edge::None)
+        self.permute([1, 0, 2, 3])
+    }
+
+    pub fn permute(&self, perm: [usize; 4]) -> HostArray {
+        self.read_through(self.permute_map(perm), Edge::None)
     }
 
     /// `slice` that writes through (`slice_mut`, or `slice` of a writable region).
@@ -666,7 +672,12 @@ impl HostArray {
 
     /// `transpose` that writes through.
     pub fn transpose_mut(&self) -> Res<HostArray> {
-        self.write_through(self.transpose_map())
+        self.permute_mut([1, 0, 2, 3])
+    }
+
+    /// `permute` that writes through.
+    pub fn permute_mut(&self, perm: [usize; 4]) -> Res<HostArray> {
+        self.write_through(self.permute_map(perm))
     }
 
     /// `widths[k]` cells before and after along axis `k`.

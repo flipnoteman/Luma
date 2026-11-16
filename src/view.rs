@@ -52,6 +52,18 @@ pub(crate) struct ViewOf {
 }
 
 /// The dimensions of `shape` as `u32`.
+/// The permutation that swaps axes `a` and `b`; an axis of 4 or more maps to itself out of range,
+/// which `permute_at` rejects.
+pub(crate) fn swapped(a: usize, b: usize) -> [usize; 4] {
+    let mut perm = [0, 1, 2, 3];
+    if a < 4 && b < 4 {
+        perm.swap(a, b);
+    } else {
+        perm[0] = 4;
+    }
+    perm
+}
+
 fn dims32(shape: Shape) -> Result<[u32; 4], LumaError> {
     let dims = shape.dims();
     let mut out = [1u32; 4];
@@ -480,33 +492,101 @@ impl<T: ScalarType> Array<T> {
     /// ([`Array::transpose_mut`] writes through).
     #[track_caller]
     pub fn transpose(&self) -> Array<T> {
-        self.transpose_at(false, Location::caller())
+        self.permute_at([1, 0, 2, 3], false, "transpose", Location::caller())
     }
 
     /// [`Array::transpose`] that writes through, as a [`ViewMut`] (see [`Array::slice_mut`]).
     #[track_caller]
     pub fn transpose_mut(&mut self) -> ViewMut<'_, Array<T>> {
-        let inner = self.transpose_at(true, Location::caller());
+        let inner = self.permute_at([1, 0, 2, 3], true, "transpose", Location::caller());
         ViewMut { inner, owner: self }
     }
 
-    /// [`Array::transpose`] (or the view of [`Array::transpose_mut`] if `writable`) reporting
-    /// failures at `location`.
-    pub(crate) fn transpose_at(&self, writable: bool, location: &'static Location<'static>) -> Array<T> {
-        let [d0, d1, d2, d3] = self.shape().dims();
-        let shape = Shape::new([d1, d0, d2, d3]);
-        let result = self.run_transpose(shape, writable, location);
-        Array::resolve(self.context(), shape, result, "transpose", location)
+    /// The array with its axes permuted: axis `k` of the result is axis `perm[k]` of the source,
+    /// so `perm = [0, 2, 1, 3]` swaps the second and third axes of a `[ni, nj, nk]` array and
+    /// `[1, 0, 2, 3]` is [`Array::transpose`]. Lazy like a slice, and read-only like one
+    /// ([`Array::permute_axes_mut`] writes through); it fuses into the kernels that read it, so a
+    /// reduction along a different axis needs no copy first.
+    ///
+    /// Fails (poisoned array, [`LumaError::InvalidShape`]) if `perm` is not a permutation of
+    /// `0..4`.
+    #[track_caller]
+    pub fn permute_axes(&self, perm: [usize; 4]) -> Array<T> {
+        self.permute_at(perm, false, "permute_axes", Location::caller())
     }
 
-    fn run_transpose(&self, shape: Shape, writable: bool, location: &'static Location<'static>) -> Outcome<Array<T>> {
+    /// [`Array::permute_axes`] that writes through, as a [`ViewMut`] (see [`Array::slice_mut`]).
+    #[track_caller]
+    pub fn permute_axes_mut(&mut self, perm: [usize; 4]) -> ViewMut<'_, Array<T>> {
+        let inner = self.permute_at(perm, true, "permute_axes", Location::caller());
+        ViewMut { inner, owner: self }
+    }
+
+    /// The array with axes `a` and `b` swapped (`transpose` is `swap_axes(0, 1)`): a
+    /// [`permute_axes`](Array::permute_axes) that leaves the others in place.
+    ///
+    /// ```
+    /// # use luma::*;
+    /// # let ctx = Context::new()?;
+    /// // A [2, 3, 2] array: element (i, j, k) is i + 2 j + 6 k.
+    /// let x = Array::from_slice(&(0..12).map(|i| i as f32).collect::<Vec<_>>(), [2, 3, 2])?;
+    /// let y = x.swap_axes(1, 2);
+    /// assert_eq!(y.shape(), Shape::from([2, 2, 3]));
+    /// assert_eq!(y.to_vec()?, vec![0.0, 1.0, 6.0, 7.0, 2.0, 3.0, 8.0, 9.0, 4.0, 5.0, 10.0, 11.0]);
+    /// # Ok::<(), luma::LumaError>(())
+    /// ```
+    ///
+    /// Fails (poisoned array, [`LumaError::InvalidShape`]) if `a` or `b` is 4 or more.
+    #[track_caller]
+    pub fn swap_axes(&self, a: usize, b: usize) -> Array<T> {
+        self.permute_at(swapped(a, b), false, "swap_axes", Location::caller())
+    }
+
+    /// [`Array::swap_axes`] that writes through, as a [`ViewMut`] (see [`Array::slice_mut`]).
+    #[track_caller]
+    pub fn swap_axes_mut(&mut self, a: usize, b: usize) -> ViewMut<'_, Array<T>> {
+        let inner = self.permute_at(swapped(a, b), true, "swap_axes", Location::caller());
+        ViewMut { inner, owner: self }
+    }
+
+    /// [`Array::permute_axes`] (or the view of [`Array::permute_axes_mut`] if `writable`) reporting
+    /// failures at `location` under the name `op`.
+    pub(crate) fn permute_at(
+        &self,
+        perm: [usize; 4],
+        writable: bool,
+        op: &'static str,
+        location: &'static Location<'static>,
+    ) -> Array<T> {
+        let d = self.shape().dims();
+        let shape = Shape::new(std::array::from_fn(|k| d[perm[k] % 4]));
+        let result = self.run_permute(perm, shape, writable, op, location);
+        Array::resolve(self.context(), shape, result, op, location)
+    }
+
+    fn run_permute(
+        &self,
+        perm: [usize; 4],
+        shape: Shape,
+        writable: bool,
+        op: &'static str,
+        location: &'static Location<'static>,
+    ) -> Outcome<Array<T>> {
         self.src()?;
+        let mut inv = [4u8; 4];
+        for (k, &p) in perm.iter().enumerate() {
+            if p >= 4 || inv[p] != 4 {
+                return Err(LumaError::InvalidShape(format!("{op} {perm:?} is not a permutation of the 4 axes")).into());
+            }
+            inv[p] = k as u8;
+        }
         let src = dims32(self.shape())?;
         let mut map = ViewMap::identity(src);
-        map.out = [src[1], src[0], src[2], src[3]];
-        map.axes[0].from = 1;
-        map.axes[1].from = 0;
-        self.run_view_with(map, Edge::None, None, shape, writable, "transpose", location)
+        map.out = std::array::from_fn(|k| src[perm[k]]);
+        for (axis, from) in inv.into_iter().enumerate() {
+            map.axes[axis].from = from;
+        }
+        self.run_view_with(map, Edge::None, None, shape, writable, op, location)
     }
 
     /// Each element's index along `axis` (see [`Array::range`]) for this array's shape.
@@ -1146,7 +1226,23 @@ impl<'a, F: Fields> ViewMut<'a, F> {
     #[track_caller]
     pub fn transpose(self) -> Self {
         let location = Location::caller();
-        let inner = self.inner.map(|a| a.transpose_at(true, location));
+        let inner = self.inner.map(|a| a.permute_at([1, 0, 2, 3], true, "transpose", location));
+        ViewMut { inner, owner: self.owner }
+    }
+
+    /// The region with its axes permuted (see [`Array::permute_axes_mut`]).
+    #[track_caller]
+    pub fn permute_axes(self, perm: [usize; 4]) -> Self {
+        let location = Location::caller();
+        let inner = self.inner.map(|a| a.permute_at(perm, true, "permute_axes", location));
+        ViewMut { inner, owner: self.owner }
+    }
+
+    /// The region with axes `a` and `b` swapped (see [`Array::swap_axes_mut`]).
+    #[track_caller]
+    pub fn swap_axes(self, a: usize, b: usize) -> Self {
+        let location = Location::caller();
+        let inner = self.inner.map(|x| x.permute_at(swapped(a, b), true, "swap_axes", location));
         ViewMut { inner, owner: self.owner }
     }
 

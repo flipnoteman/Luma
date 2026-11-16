@@ -438,3 +438,98 @@ fn a_mutable_view_array_reshaped_then_sliced_reads_the_reshaped_elements() {
     assert_eq!(r.slice(0, 2..4).to_vec().unwrap(), flat[2..4]);
     assert_eq!(r.flip(0).slice(0, 0..2).to_vec().unwrap(), [flat[7], flat[6]]);
 }
+
+/// The host permutation: axis `k` of the result is axis `perm[k]` of the source (extents `d`).
+fn host_permute(data: &[f32], d: [usize; 4], perm: [usize; 4]) -> (Vec<f32>, [usize; 4]) {
+    let od: [usize; 4] = std::array::from_fn(|k| d[perm[k]]);
+    let mut out = Vec::with_capacity(data.len());
+    for i3 in 0..od[3] {
+        for i2 in 0..od[2] {
+            for i1 in 0..od[1] {
+                for i0 in 0..od[0] {
+                    let o = [i0, i1, i2, i3];
+                    let mut s = [0; 4];
+                    for k in 0..4 {
+                        s[perm[k]] = o[k];
+                    }
+                    out.push(data[s[0] + d[0] * (s[1] + d[1] * (s[2] + d[2] * s[3]))]);
+                }
+            }
+        }
+    }
+    (out, od)
+}
+
+#[test]
+fn permute_and_swap_axes_match_the_host() {
+    let ctx = Context::new().unwrap();
+    for dims in [[3usize, 4, 5, 1], [2, 3, 4, 5]] {
+        let n: usize = dims.iter().product();
+        let a = values(n, 5, -1.0, 1.0);
+        let x = Array::from_slice_on(&ctx, &a, dims).unwrap();
+        for perm in [[0, 2, 1, 3], [2, 0, 1, 3], [1, 2, 0, 3], [3, 2, 1, 0], [1, 3, 0, 2], [0, 1, 2, 3]] {
+            let (want, od) = host_permute(&a, dims, perm);
+            let y = x.permute_axes(perm);
+            assert_eq!(y.shape().dims(), od);
+            assert_eq!(y.to_vec().unwrap(), want, "{dims:?} {perm:?}");
+        }
+        let (want, _) = host_permute(&a, dims, [0, 2, 1, 3]);
+        assert_eq!(x.swap_axes(1, 2).to_vec().unwrap(), want);
+        assert_eq!(x.swap_axes(2, 1).to_vec().unwrap(), want);
+        assert_eq!(x.swap_axes(0, 1).to_vec().unwrap(), x.transpose().to_vec().unwrap());
+
+        // A pending operand, and composition with a flip and a slice.
+        let pending = (&x * 2.0).swap_axes(1, 2).to_vec().unwrap();
+        assert_eq!(pending, want.iter().map(|v| v * 2.0).collect::<Vec<_>>());
+        let (flipped, fd) = host_permute(&a, dims, [0, 2, 1, 3]);
+        let got = x.swap_axes(1, 2).flip(0).slice(1, 1..).to_vec().unwrap();
+        let od = [fd[0], fd[1] - 1, fd[2], fd[3]];
+        let mut ordered = Vec::new();
+        for i3 in 0..od[3] {
+            for i2 in 0..od[2] {
+                for i1 in 0..od[1] {
+                    for i0 in 0..od[0] {
+                        ordered.push(flipped[(fd[0] - 1 - i0) + fd[0] * (i1 + 1 + fd[1] * (i2 + fd[2] * i3))]);
+                    }
+                }
+            }
+        }
+        assert_eq!(got, ordered, "{dims:?}");
+    }
+}
+
+#[test]
+fn swap_axes_mut_writes_through() {
+    let ctx = Context::new().unwrap();
+    let dims = [3usize, 4, 5, 1];
+    let n = 60;
+    let a = values(n, 6, -1.0, 1.0);
+    let b = values(n, 7, -1.0, 1.0);
+    let mut x = Array::from_slice_on(&ctx, &a, dims).unwrap();
+    let src = Array::from_slice_on(&ctx, &b, [3, 5, 4]).unwrap();
+    x.swap_axes_mut(1, 2).assign(&src).unwrap();
+    // Element (i, j, k) of `x` is element (i, k, j) of `src`.
+    let mut want = a.clone();
+    for k in 0..5 {
+        for j in 0..4 {
+            for i in 0..3 {
+                want[i + 3 * (j + 4 * k)] = b[i + 3 * (k + 5 * j)];
+            }
+        }
+    }
+    assert_eq!(x.to_vec().unwrap(), want);
+
+    let mut y = Array::from_slice_on(&ctx, &a, dims).unwrap();
+    y.permute_axes_mut([2, 0, 1, 3]).swap_axes(0, 1).assign(0.0).unwrap();
+    assert!(y.to_vec().unwrap().iter().all(|v| *v == 0.0));
+}
+
+#[test]
+fn invalid_permutations_poison_the_result() {
+    let ctx = Context::new().unwrap();
+    let x = Array::from_slice_on(&ctx, &values(24, 8, 0.0, 1.0), [2, 3, 4]).unwrap();
+    for bad in [x.permute_axes([0, 0, 1, 2]), x.permute_axes([0, 1, 2, 4]), x.swap_axes(0, 4), x.swap_axes(5, 1)] {
+        let err = bad.to_vec().unwrap_err();
+        assert!(matches!(err.root(), LumaError::InvalidShape(_)), "{err}");
+    }
+}

@@ -447,6 +447,7 @@ fn view<T: Num>(env: &Env, a: &Array<T>, view: &ViewOp) -> Array<T> {
         },
         ViewOp::Flip { axis } => a.flip(*axis),
         ViewOp::Transpose => a.transpose(),
+        ViewOp::Permute { perm } => a.permute_axes(perm.map(usize::from)),
         ViewOp::ShiftCirc { offs } => match offs[..] {
             [o0] => a.shift([o0]),
             [o0, o1] => a.shift([o0, o1]),
@@ -606,12 +607,14 @@ fn luma_stmt(cx: &Cx, env: &mut Env, stmt: &Stmt) -> Result<(), LumaError> {
                         InjView::InjSlice { axis, lo, hi } => t.slice_mut(*axis, *lo..*hi),
                         InjView::InjFlip { axis } => t.flip_mut(*axis),
                         InjView::InjTranspose => t.transpose_mut(),
+                        InjView::InjPermute { perm } => t.permute_axes_mut(perm.map(usize::from)),
                     };
                     for step in rest {
                         region = match step {
                             InjView::InjSlice { axis, lo, hi } => region.slice(*axis, *lo..*hi),
                             InjView::InjFlip { axis } => region.flip(*axis),
                             InjView::InjTranspose => region.transpose(),
+                            InjView::InjPermute { perm } => region.permute_axes(perm.map(usize::from)),
                         };
                     }
                     match r {
@@ -800,6 +803,7 @@ fn host_view(env: &HostEnv, a: &HostArray, view: &ViewOp) -> Result<HostArray, E
         ViewOp::Pad { widths, mode } => a.pad(widths, *mode),
         ViewOp::Flip { axis } => a.flip(*axis)?,
         ViewOp::Transpose => a.transpose(),
+        ViewOp::Permute { perm } => a.permute(perm.map(usize::from)),
         ViewOp::ShiftCirc { offs } => a.shift(offs, Edge::Wrap),
         ViewOp::ShiftFill { offs, value } => a.shift(offs, Edge::Fill(oracle::store(a.ty, f64::from(*value)))),
         ViewOp::ShiftClamp { offs } => a.shift(offs, Edge::Clamp),
@@ -871,6 +875,7 @@ fn host_stmt(env: &mut HostEnv, stmt: &Stmt, math: bool) -> Result<(), ErrKind> 
                     InjView::InjSlice { axis, lo, hi } => region.slice_mut(*axis, *lo, *hi)?,
                     InjView::InjFlip { axis } => region.flip_mut(*axis)?,
                     InjView::InjTranspose => region.transpose_mut()?,
+                    InjView::InjPermute { perm } => region.permute_mut(perm.map(usize::from))?,
                 };
             }
             region.assign(host_rhs(env, rhs, t.ty))?;
@@ -1552,7 +1557,7 @@ fn generator_covers_the_statements() {
     for kind in [
         "Input", "Full", "Range", "Linspace", "Unary", "Binary", "Compare", "Select", "View", "Reduce", "SumWhere", "Scan", "AxisReduce",
         "Assign", "Put", "Compound", "Write", "Cache", "EvalVars", "Alias", "Release", "Fetch", "Loop/PerStepEval", "Loop/IterateAll",
-        "Loop/IterateUntilAll", "View/Slice", "View/Pad", "View/Flip", "View/Transpose", "View/ShiftCirc", "View/ShiftFill",
+        "Loop/IterateUntilAll", "View/Slice", "View/Pad", "View/Flip", "View/Transpose", "View/Permute", "View/ShiftCirc", "View/ShiftFill",
         "View/ShiftClamp", "View/ShiftMirror", "View/Take", "View/Concat", "View/Stack", "Reshape", "Classify", "Bitwise", "Not", "Rounding", "Log1p",
     ] {
         assert!(counts.get(kind).copied().unwrap_or(0) >= 5, "{kind} is rare: {counts:?}");

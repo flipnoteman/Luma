@@ -6,6 +6,13 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `Array::permute_axes([usize; 4])` and `swap_axes(a, b)` (lazy views like `transpose`, which is
+  `swap_axes(0, 1)`), their writing forms `permute_axes_mut` / `swap_axes_mut`, and the same on
+  `ViewMut` and `Fields`. Swapping axes 1 and 2 of a `[ni, nj, nk]` array gives the reduction
+  or stencil along `j` unit-stride reads without a copy.
+
 ## [0.4.1] - 2026-11-15
 
 ### Added

@@ -153,14 +153,44 @@ pub trait Fields: Sized {
     #[track_caller]
     fn transpose(&self) -> Self {
         let location = Location::caller();
-        self.map(|a| a.transpose_at(false, location))
+        self.map(|a| a.permute_at([1, 0, 2, 3], false, "transpose", location))
     }
 
     /// [`Array::transpose_mut`] of every field.
     #[track_caller]
     fn transpose_mut(&mut self) -> ViewMut<'_, Self> {
         let location = Location::caller();
-        let inner = self.map(|a| a.transpose_at(true, location));
+        let inner = self.map(|a| a.permute_at([1, 0, 2, 3], true, "transpose", location));
+        ViewMut { inner, owner: self }
+    }
+
+    /// [`Array::permute_axes`] of every field.
+    #[track_caller]
+    fn permute_axes(&self, perm: [usize; 4]) -> Self {
+        let location = Location::caller();
+        self.map(|a| a.permute_at(perm, false, "permute_axes", location))
+    }
+
+    /// [`Array::permute_axes_mut`] of every field.
+    #[track_caller]
+    fn permute_axes_mut(&mut self, perm: [usize; 4]) -> ViewMut<'_, Self> {
+        let location = Location::caller();
+        let inner = self.map(|a| a.permute_at(perm, true, "permute_axes", location));
+        ViewMut { inner, owner: self }
+    }
+
+    /// [`Array::swap_axes`] of every field.
+    #[track_caller]
+    fn swap_axes(&self, a: usize, b: usize) -> Self {
+        let location = Location::caller();
+        self.map(|x| x.permute_at(crate::view::swapped(a, b), false, "swap_axes", location))
+    }
+
+    /// [`Array::swap_axes_mut`] of every field.
+    #[track_caller]
+    fn swap_axes_mut(&mut self, a: usize, b: usize) -> ViewMut<'_, Self> {
+        let location = Location::caller();
+        let inner = self.map(|x| x.permute_at(crate::view::swapped(a, b), true, "swap_axes", location));
         ViewMut { inner, owner: self }
     }
 
