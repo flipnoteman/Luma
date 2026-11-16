@@ -95,18 +95,31 @@ fn layout(tuning: &Tuning, block: u32, n: u32) -> (u8, u32) {
 /// in memory, runs by cyclic reduction, and how. `None` means Thomas. Forced
 /// (`LUMA_TRIDIAGONAL=cyclic`) it is taken whenever the device can run it; automatically only for
 /// few lines (see [`Tuning::line_cyclic_work`]), where the one invocation per line of the Thomas
-/// solve leaves the device idle. `max_scratch` is the largest buffer the spill may take.
+/// solve leaves the device idle. `parts` is the solve on parts (every block entry an array of its
+/// own, see `linalg::run_parts`), whose memory access differs from stacked blocks. `max_scratch`
+/// is the largest buffer the spill may take.
 ///
-/// Measured on an RTX 3090 (block 1, 2, 4, 8, `n` 32 to 4096, 4 to 16384 lines, both axes): the
-/// workgroup per line beats Thomas by 2x to 50x up to a few hundred lines for every block size
-/// and length, and keeps winning with more lines when the blocks are small (scalar lines along
-/// the contiguous axis to 16384 lines), and loses (1.2x to 7x slower) once there are thousands of
-/// lines of strided scalars or 1024 lines of 4x4 blocks, where one thread per line already fills
-/// the device and its coalesced loads across lines beat a workgroup's strided ones. The rule
-/// `lines * block^2 <= 8192` for contiguous lines and `lines * 4 * block <= 8192` for strided
-/// ones keeps to the clear wins of both regimes (scalar 2048 / 4096 lines, 4x4 blocks 512 / 512
-/// lines, 8x8 blocks 128 / 256 lines).
-pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32, max_scratch: u64) -> Option<Plan> {
+/// Stacked blocks, measured on an RTX 3090 (block 1, 2, 4, 8, `n` 32 to 4096, 4 to 16384 lines,
+/// both axes): the workgroup per line beats Thomas by 2x to 50x up to a few hundred lines for
+/// every block size and length, and keeps winning with more lines when the blocks are small
+/// (scalar lines along the contiguous axis to 16384 lines), and loses (1.2x to 7x slower) once
+/// there are thousands of lines of strided scalars or 1024 lines of 4x4 blocks, where one thread
+/// per line already fills the device and its coalesced loads across lines beat a workgroup's
+/// strided ones. The rule `lines * block^2 <= 8192` for contiguous lines and
+/// `lines * 4 * block <= 8192` for strided ones keeps to the clear wins of both regimes (scalar
+/// 2048 / 4096 lines, 4x4 blocks 512 / 512 lines, 8x8 blocks 128 / 256 lines).
+///
+/// Parts, measured on an RTX 3090 (block 1, 2, 4, 5, `n` 24 to 512, 256 to 16384 lines): along
+/// the contiguous axis the Thomas threads read every part `n` cells apart, a sector per element,
+/// and cyclic reduction wins at every size for blocks of 2 and up (5x5 blocks, 1680 lines of 187:
+/// 330 us vs 3200 us; 4x4 blocks, 8192 lines of 187: 0.9 ms vs 15 ms) and for scalars of 70 cells
+/// and up (16384 lines of 187: 110 us vs 760 us; 24 cells: within 15 %), so it is always taken.
+/// Along a strided axis the Thomas loads coalesce across lines and the workgroup's do not: cyclic
+/// wins to about 2048 lines of scalars or 2x2 blocks, 1024 of 4x4 and fewer of 5x5, and half
+/// that when the line does not fit the workgroup memory (4x4 blocks, 1024 lines of 512: 2.5 ms
+/// vs 1.0 ms), so the rule is `lines * 2 * max(block, 2) <= 8192`, the weight doubled for a line
+/// that spills.
+pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32, parts: bool, max_scratch: u64) -> Option<Plan> {
     if tuning.line_solver == LineSolver::Thomas || n == 0 || lines == 0 {
         return None;
     }
@@ -122,7 +135,15 @@ pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32,
         return None;
     }
     if tuning.line_solver == LineSolver::Auto {
-        let weight = if stride == 1 { block * block } else { 4 * block };
+        if tuning.line_cyclic_work == 0 {
+            return None;
+        }
+        let weight = match (parts, stride == 1) {
+            (true, true) => return Some(plan),
+            (true, false) => 2 * block.max(2) * if shift > 0 { 2 } else { 1 },
+            (false, true) => block * block,
+            (false, false) => 4 * block,
+        };
         if u64::from(lines) * u64::from(weight) > u64::from(tuning.line_cyclic_work) {
             return None;
         }

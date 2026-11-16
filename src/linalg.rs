@@ -354,7 +354,7 @@ fn run(
     let mut scratch = Scratch::new(ctx);
     let params = [n, stride, lines32];
     let tuning = tuning.unwrap_or(*ctx.tuning());
-    let (core, groups, scratch_bytes) = if let Some(plan) = cyclic::plan(&tuning, b as u32, n, lines32, stride, ctx.max_buffer_bytes()) {
+    let (core, groups, scratch_bytes) = if let Some(plan) = cyclic::plan(&tuning, b as u32, n, lines32, stride, false, ctx.max_buffer_bytes()) {
         let core = ctx.builtin(
             Builtin::CyclicTridiagonal {
                 block: b as u8,
@@ -453,7 +453,7 @@ fn run_parts(
     let total = to_u32(lines * systems)?;
     let tuning = tuning.unwrap_or(*ctx.tuning());
     let b32 = block as u32;
-    let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, ctx.max_buffer_bytes()) {
+    let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, true, ctx.max_buffer_bytes()) {
         Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
     } else if block <= UNROLLED_BLOCK as usize
         && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, ctx.max_buffer_bytes())
@@ -963,29 +963,38 @@ mod tests {
     fn plan_follows_the_workgroup_memory_budget() {
         let tuning = Tuning { line_solver: LineSolver::Cyclic, line_bytes: 16 * 1024, ..Tuning::for_tests() };
         // 3 floats per row of a scalar line: 1024 rows fit, 4096 keep every fourth row (1024) in workgroup memory.
-        let fits = crate::cyclic::plan(&tuning, 1, 1024, 10, 1, u64::MAX).unwrap();
+        let fits = crate::cyclic::plan(&tuning, 1, 1024, 10, 1, false, u64::MAX).unwrap();
         assert_eq!((fits.shift, fits.shared_rows), (0, 1024));
-        let spills = crate::cyclic::plan(&tuning, 1, 4096, 10, 1, u64::MAX).unwrap();
+        let spills = crate::cyclic::plan(&tuning, 1, 4096, 10, 1, false, u64::MAX).unwrap();
         assert_eq!((spills.shift, spills.shared_rows), (2, 1024));
         assert_eq!(spills.scratch_bytes(1, 4096, 10), 10 * 3072 * 3 * 4);
         // Blocks of 4: nine vec4s per row.
-        let block = crate::cyclic::plan(&tuning, 4, 1024, 10, 1, u64::MAX).unwrap();
+        let block = crate::cyclic::plan(&tuning, 4, 1024, 10, 1, false, u64::MAX).unwrap();
         assert!(u64::from(block.shared_rows) * 9 * 16 <= 16 * 1024 && block.shift > 0);
         // The scratch must fit a buffer, or Thomas runs.
-        assert!(crate::cyclic::plan(&tuning, 4, 1024, 10, 1, 1000).is_none());
+        assert!(crate::cyclic::plan(&tuning, 4, 1024, 10, 1, false, 1000).is_none());
         let thomas = Tuning { line_solver: LineSolver::Thomas, ..tuning };
-        assert!(crate::cyclic::plan(&thomas, 1, 1024, 10, 1, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&thomas, 1, 1024, 10, 1, false, u64::MAX).is_none());
         // The automatic choice: few lines yes, many lines no, strided lines sooner than contiguous
         // ones, bigger blocks sooner than small ones.
         let auto = Tuning { line_solver: LineSolver::Auto, line_cyclic_work: 8192, ..tuning };
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 200, 1, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 8192, 1, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 8193, 1, u64::MAX).is_none());
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 4096, 4096, u64::MAX).is_none());
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 1024, 1024, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 4, 1024, 100, 1, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 4, 1024, 1024, 1, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 200, 1, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 8192, 1, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 8193, 1, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 4096, 4096, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 1024, 1024, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 1024, 100, 1, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 1024, 1024, 1, false, u64::MAX).is_none());
+        // Parts: contiguous lines always (5x5 blocks, 1680 lines of 187 were 9x faster than
+        // Thomas); strided ones up to `8192 / (2 max(block, 2))` lines, half that for a line that
+        // spills.
+        assert!(crate::cyclic::plan(&auto, 5, 187, 1680, 1, true, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 70, 1024, 70, true, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 70, 1025, 70, true, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 4, 1024, 512, 1024, true, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 1024, 513, 1024, true, u64::MAX).is_none());
         let never = Tuning { line_cyclic_work: 0, ..auto };
-        assert!(crate::cyclic::plan(&never, 1, 4096, 1, 1, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&never, 1, 4096, 1, 1, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&never, 5, 187, 1680, 1, true, u64::MAX).is_none());
     }
 }

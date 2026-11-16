@@ -56,6 +56,16 @@ All notable changes to Luma are listed here. The format follows
 - Choosing the arrays a cut evaluates together (`evaluate_alongside`) counts the nodes a candidate
   adds by merging two sorted lists instead of one binary search per node: building the
   three-permutation Keccak on an RTX 3090 takes 54 ms instead of 139 ms.
+- The block and scalar tridiagonal solves on parts (`solve_block_tridiagonal_parts`,
+  `solve_tridiagonal_parts` and their `_from` forms) choose between cyclic reduction and Thomas
+  with a rule of their own: the rule of the stacked solves chose Thomas for thousands of lines
+  along the contiguous axis, where its threads read each part a sector per element. Lines along
+  the contiguous axis now always take cyclic reduction (RTX 3090: 5x5 blocks, 1680 lines of 187
+  cells, 3.2 ms to 0.33 ms; 4x4 blocks, 8192 lines of 187, 15 ms to 0.9 ms), and strided lines
+  take it up to `8192 / (2 max(B, 2))` lines (half that when a line spills out of workgroup
+  memory) instead of `8192 / 4B`. Over a sweep of blocks 1-5, 24-512 cells and 256-16384 lines
+  along both axes the automatic choice now takes 66 ms in total, where always the faster of the
+  two would take 68 ms (clock noise) and the old rule took 332 ms.
 
 ### Fixed
 
