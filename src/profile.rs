@@ -2,10 +2,12 @@
 //!
 //! While profiling is enabled (see [`Context::profile`](crate::Context::profile)) every launch
 //! runs in a compute pass of its own whose start and end the GPU timestamps, each launch into
-//! timestamps of its own (no query is written twice). They are resolved only in
-//! [`Context::finish_profiling`](crate::Context::finish_profiling), after all profiled work has
-//! completed: Metal writes counter samples late enough that a resolve in the same command
-//! buffer reads zeros or the samples of a later batch.
+//! timestamps of its own (no query is written twice). They are resolved only after all profiled
+//! work that wrote them has completed (Metal writes counter samples late enough that a resolve in
+//! the same command buffer reads zeros or the samples of a later batch): in
+//! [`Context::finish_profiling`](crate::Context::finish_profiling), and before that whenever
+//! recording a launch would put more than `LIVE_SETS` query sets live at once, which some
+//! drivers lose the device over. The durations are aggregated per kernel as they are read.
 
 use std::fmt;
 use std::panic::Location;
@@ -16,6 +18,11 @@ use wgpu::{Buffer, BufferUsages};
 
 /// Timestamps (a begin and an end per launch) of one query set; more launches get more sets.
 const QUERIES: u32 = 512;
+
+/// Most query sets alive at once; recording a launch that would need another first drains them
+/// (`Context::drain_timestamps`). Apple's Metal driver loses the device creating the 33rd set of
+/// 512 queries.
+const LIVE_SETS: usize = 16;
 
 /// Bytes of one resolved timestamp.
 const TIMESTAMP_BYTES: u64 = 8;
@@ -165,17 +172,18 @@ impl Profile {
         self.kernels.iter().map(|k| k.launches).sum()
     }
 
-    pub(crate) fn from_samples(samples: impl IntoIterator<Item = (Arc<str>, Duration)>) -> Self {
-        let mut kernels: Vec<KernelTiming> = Vec::new();
+    /// Adds the measured launches to the per-kernel totals (merging into the kernels already
+    /// there) and sorts the kernels by total time.
+    pub(crate) fn add_samples(&mut self, samples: impl IntoIterator<Item = (Arc<str>, Duration)>) {
         for (label, duration) in samples {
-            match kernels.iter_mut().find(|k| k.label == *label) {
+            match self.kernels.iter_mut().find(|k| k.label == *label) {
                 Some(k) => {
                     k.launches += 1;
                     k.total += duration;
                     k.min = k.min.min(duration);
                     k.max = k.max.max(duration);
                 }
-                None => kernels.push(KernelTiming {
+                None => self.kernels.push(KernelTiming {
                     label: label.to_string(),
                     launches: 1,
                     total: duration,
@@ -184,8 +192,7 @@ impl Profile {
                 }),
             }
         }
-        kernels.sort_by_key(|k| std::cmp::Reverse(k.total));
-        Profile { kernels, splits: Vec::new() }
+        self.kernels.sort_by_key(|k| std::cmp::Reverse(k.total));
     }
 }
 
@@ -231,11 +238,13 @@ pub(crate) struct Profiler {
     sets: Vec<(wgpu::QuerySet, Vec<Arc<str>>)>,
     /// The set the next launch is recorded into; moved to `sets` when full.
     current: Option<(wgpu::QuerySet, Vec<Arc<str>>)>,
+    /// The launches of the sets already resolved and released.
+    timings: Profile,
 }
 
 impl Profiler {
     pub(crate) fn new() -> Self {
-        Profiler { sets: Vec::new(), current: None }
+        Profiler { sets: Vec::new(), current: None, timings: Profile::default() }
     }
 
     /// Reserves the timestamps of a launch labelled `label` and returns the descriptor that makes
@@ -265,14 +274,35 @@ impl Profiler {
         }
     }
 
-    /// Records the copy of every timestamp into one readback buffer; returns it with the labels
-    /// of the launches, in timestamp order.
+    /// Whether the next launch would open a query set while `LIVE_SETS` are already alive.
+    pub(crate) fn at_capacity(&self) -> bool {
+        let opens = self.current.as_ref().is_none_or(|(_, labels)| labels.len() * 2 >= QUERIES as usize);
+        opens && self.sets.len() + usize::from(self.current.is_some()) >= LIVE_SETS
+    }
+
+    /// Adds the durations of resolved launches to the profile that [`Profiler::into_profile`]
+    /// returns.
+    pub(crate) fn add_samples(&mut self, samples: impl IntoIterator<Item = (Arc<str>, Duration)>) {
+        self.timings.add_samples(samples);
+    }
+
+    /// The durations added so far.
+    pub(crate) fn into_profile(self) -> Profile {
+        self.timings
+    }
+
+    /// Records the copy of every timestamp of the query sets alive into one readback buffer and
+    /// releases the sets; returns it with the labels of the launches, in timestamp order. `None`
+    /// if no launch was timed.
     pub(crate) fn resolve(
-        self,
+        &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> (Buffer, Vec<Arc<str>>) {
-        let sets: Vec<_> = self.sets.into_iter().chain(self.current).collect();
+    ) -> Option<(Buffer, Vec<Arc<str>>)> {
+        let sets: Vec<_> = self.sets.drain(..).chain(self.current.take()).collect();
+        if sets.is_empty() {
+            return None;
+        }
         let total: u64 = sets.iter().map(|(_, labels)| labels.len() as u64 * 2).sum();
         let bytes = (total * TIMESTAMP_BYTES).max(TIMESTAMP_BYTES);
         let resolved = device.create_buffer(&wgpu::BufferDescriptor {
@@ -296,6 +326,6 @@ impl Profiler {
             all.extend(labels);
         }
         encoder.copy_buffer_to_buffer(&resolved, 0, &staging, 0, bytes);
-        (staging, all)
+        Some((staging, all))
     }
 }

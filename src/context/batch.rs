@@ -403,6 +403,19 @@ impl Context {
         Ok(())
     }
 
+    /// Submits the pending batch, waits for the GPU to finish it and resolves the timestamps of
+    /// the profiler's query sets into its profile, releasing the sets. Called with the batch
+    /// locked, so it waits on the device directly instead of through [`Context::sync`].
+    fn drain_timestamps(&self, batch: &mut Batch) -> Result<()> {
+        self.flush_locked(batch);
+        self.device().poll(wgpu::PollType::wait_indefinitely()).map_err(|e| LumaError::Poll(Arc::new(e)))?;
+        self.take_gpu_error()?;
+        match batch.profiler.as_mut() {
+            Some(profiler) => self.read_timestamps(profiler),
+            None => Ok(()),
+        }
+    }
+
     /// The body of [`Context::launch`]: allocates the arena slots, finds or creates the bind
     /// group, and records the dispatch. After the first launch of a kernel with a given set of
     /// buffers this allocates nothing.
@@ -414,6 +427,10 @@ impl Context {
         size: [u32; 3],
         args: &[RawArg<'_>],
     ) -> Result<()> {
+        // Before the launch may open a query set past the profiler's limit of live sets.
+        if batch.profiler.as_ref().is_some_and(Profiler::at_capacity) {
+            self.drain_timestamps(batch)?;
+        }
         let inner = &*self.inner;
         let device = self.device();
         let align = inner.uniform_align;

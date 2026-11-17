@@ -14,6 +14,7 @@ use crate::array::Storage;
 use crate::gpu::pool;
 
 use super::{lock, Context, MAPPABLE_STORAGE_USAGE};
+use crate::profile::Profiler;
 
 /// Usage of readback buffers.
 pub(super) const STAGING_USAGE: BufferUsages = BufferUsages::MAP_READ.union(BufferUsages::COPY_DST);
@@ -524,16 +525,32 @@ impl Context {
         })
     }
 
-    /// Waits for the GPU and returns the first `bytes` bytes of `staging`, a `MAP_READ` buffer
-    /// whose contents were copied in by a submitted batch.
-    pub(super) fn map_read<T: Pod>(&self, staging: &Buffer, bytes: u64) -> Result<Vec<T>> {
-        self.abort_recording()?;
-        let slice = staging.slice(..bytes);
-        let waited = self.wait_map(None, &map_for_read(slice))?;
-        self.inner.waits.record(waited);
-        let result = slice.get_mapped_range().map(|view| bytemuck::pod_collect_to_vec(&view));
+    /// Resolves the timestamps of every query set `profiler` holds into its profile and releases
+    /// the sets. The work that wrote them must have completed already (Metal writes the samples
+    /// late). Never takes the lock of the batch (or waits for the batch to be flushed), so it
+    /// may run while the caller holds it.
+    pub(super) fn read_timestamps(&self, profiler: &mut Profiler) -> Result<()> {
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma timestamps") });
+        let Some((staging, labels)) = profiler.resolve(self.device(), &mut encoder) else {
+            return Ok(());
+        };
+        let submission = self.queue().submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let mapped = map_for_read(slice);
+        let read = self.wait_map(Some(submission), &mapped).and_then(|_| {
+            let view = slice.get_mapped_range().map_err(LumaError::MapRange)?;
+            let stamps: Vec<u64> = bytemuck::pod_collect_to_vec(&view);
+            let period = f64::from(self.queue().get_timestamp_period());
+            profiler.add_samples(labels.iter().zip(stamps.as_chunks::<2>().0).map(|(label, &[begin, end])| {
+                let nanos = end.saturating_sub(begin) as f64 * period;
+                (Arc::clone(label), Duration::from_secs_f64(nanos * 1e-9))
+            }));
+            Ok(())
+        });
         staging.unmap();
-        result.map_err(LumaError::MapRange)
+        read
     }
 
     /// Waits until `submission` (the latest one if `None`) has run and the mapping `mapped`

@@ -15,6 +15,8 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- Timestamp profiling drains completed query sets periodically instead of retaining every set until the profile ends. This avoids Metal device loss after 32 live query sets while preserving every launch's timing and per-kernel totals.
+
 - A pipeline cache that grew past the 32 MB kept on disk is dropped with an `info` log message
   naming its size, instead of silently: every later process then compiles its kernels again
   (about 9.5 s for bowshock's 3D solver). The cache stays one file per device: one cache per

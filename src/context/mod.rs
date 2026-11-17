@@ -1,6 +1,6 @@
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use wgpu::{Buffer, BufferUsages};
 
@@ -818,7 +818,7 @@ impl Context {
         // Lazy arrays still alive were computed inside the profiled region; record their fused
         // kernels while the profiler is still on.
         self.jit().evaluate_live();
-        let profiler = {
+        let mut profiler = {
             let mut batch = self.batch()?;
             let Some(profiler) = batch.profiler.take() else {
                 return Err(LumaError::Profiling("profiling is not enabled".into()));
@@ -830,20 +830,8 @@ impl Context {
         self.sync()?;
 
         // Everything profiled has completed; only now are its timestamps reliably written.
-        let mut encoder = self
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma timestamps") });
-        let (staging, labels) = profiler.resolve(self.device(), &mut encoder);
-        self.queue().submit(Some(encoder.finish()));
-        let stamps: Vec<u64> = self.map_read(&staging, staging.size())?;
-
-        let period = f64::from(self.queue().get_timestamp_period());
-        let mut samples = Vec::new();
-        for (label, &[begin, end]) in labels.iter().zip(stamps.as_chunks::<2>().0) {
-            let nanos = end.saturating_sub(begin) as f64 * period;
-            samples.push((Arc::clone(label), Duration::from_secs_f64(nanos * 1e-9)));
-        }
-        let mut profile = Profile::from_samples(samples);
+        self.read_timestamps(&mut profiler)?;
+        let mut profile = profiler.into_profile();
         profile.splits = splits;
         Ok(profile)
     }
