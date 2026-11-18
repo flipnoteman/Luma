@@ -698,8 +698,10 @@ pub enum Dispatch<'a> {
 pub struct GraphLaunch<'a> {
     /// The kernel.
     pub kernel: &'a CompiledKernel,
-    /// Workgroup counts.
-    pub workgroups: [u32; 3],
+    /// How many workgroups run: counts known now, or counts read from a buffer when the graph
+    /// is replayed (the buffer is kept alive by the graph and may be rewritten between and
+    /// during replays, by earlier launches of the same graph too).
+    pub dispatch: Dispatch<'a>,
     /// The logical grid size in invocations.
     pub size: [u32; 3],
     /// Arguments of the launch.

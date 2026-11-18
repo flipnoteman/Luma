@@ -204,7 +204,7 @@ pub(crate) use launch::{axis_reduce, check_finite, evaluate, evaluate_group, eva
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};
-pub(crate) use replay::{force, Plan, Stepper, Trace};
+pub(crate) use replay::{force, GraphBuilder, GraphCache, Plan, Stepper, Trace};
 pub(crate) use stencil::plan as stencil_plan;
 pub(crate) use until::{next_block, run_until, FIRST_BLOCK};
 
