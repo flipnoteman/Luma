@@ -155,6 +155,7 @@ pub(crate) mod assign;
 mod codegen;
 pub(crate) mod cost;
 mod inline;
+mod kirgen;
 mod launch;
 mod looped;
 mod operator;
@@ -192,6 +193,7 @@ use crate::gpu::lock;
 use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::kernel::{self, KernelCore, KernelKey};
 use crate::profile::{FusionSplit, SplitReason};
+use luma_core::kir::KernelModule;
 
 use inline::{inline, Judgement, Lowered, Verdict};
 use looped::LoopPlan;
@@ -278,10 +280,10 @@ pub(crate) enum ElemTy {
     U32,
     I32,
     /// A `bool`: a `u32` holding 0 or 1 in registers, one bit of a `u32` word in buffers (see
-    /// `ElemLayout::PACKED`); the codegen accessors `codegen::load` / `codegen::store` and the
-    /// packed store of `codegen::source` are where the layout is known.
+    /// `ElemLayout::PACKED`); the accessors `kirgen::Lower::load_in` / `kirgen::Lower::store` and the
+    /// packed store of `kirgen::Build::packed` are where the layout is known.
     Bool,
-    /// 64-bit float (needs `wgpu::Features::SHADER_F64`).
+    /// 64-bit float (needs `luma_core::Features::SHADER_F64`).
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
     Df32,
@@ -1724,7 +1726,7 @@ fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(),
     if !exists {
         return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", op.ty.display())));
     }
-    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(wgpu::Features::SHADER_F64) {
+    if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(luma_core::Features::SHADER_F64) {
         return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
     }
     Ok(())
@@ -2242,6 +2244,9 @@ pub(crate) struct JitState {
     fast_kernels: Mutex<FxMap<u64, Vec<FastKernel>>>,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
     stencils: BuildCache<String, Arc<KernelCore>>,
+    /// Kernels built as Kernel IR that are not keyed by a program of fused instructions
+    /// (register loops, stencils; see [`JitState::module_kernel`]).
+    modules: BuildCache<String, Arc<KernelCore>>,
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
     /// that a loop run again does not generate and hash its source again.
     loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
@@ -2343,7 +2348,7 @@ pub(crate) struct StatsSnapshot {
 }
 
 impl JitState {
-    pub(crate) fn new(limits: &wgpu::Limits) -> Self {
+    pub(crate) fn new(limits: &luma_core::DeviceLimits) -> Self {
         let max_nodes = std::env::var(MAX_NODES_ENV)
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
@@ -2351,7 +2356,7 @@ impl JitState {
             .clamp(1, MAX_NODES_LIMIT);
         // One storage binding is the output, plus luma's grid uniform and Params uniform (counted
         // against the same per-stage buffer table on Metal).
-        let device_inputs = (limits.max_storage_buffers_per_shader_stage as usize)
+        let device_inputs = (limits.max_storage_buffers as usize)
             .saturating_sub(3)
             .clamp(1, MAX_INPUTS);
         let max_inputs = std::env::var(MAX_INPUTS_ENV)
@@ -2362,6 +2367,7 @@ impl JitState {
             kernels: BuildCache::default(),
             fast_kernels: Mutex::new(FxMap::default()),
             stencils: BuildCache::default(),
+            modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             live: Readers::default(),
             requested: Mutex::new(RequestList::default()),
@@ -2821,7 +2827,7 @@ impl JitState {
                 }
                 let mut tmp = Vec::new();
                 let mut more_inputs = inputs.clone();
-                union_into(&mut more_inputs, &mut tmp, &self.inputs_within(&node, &inputs, self.max_inputs()));
+                union_into(&mut more_inputs, &mut tmp, &self.inputs_within(&node, &inputs, false, self.max_inputs()));
                 let (_, new_below) = below.overlap(&node);
                 let fits = more_inputs.len() + self.output_bindings(&group, &node) <= self.max_inputs() + 1
                     && below.len() + new_below + group.len() < MAX_NODES_LIMIT;
@@ -2842,11 +2848,13 @@ impl JitState {
     /// (see [`Node::inputs`]), unless they would not fit next to the `have` ones in `room`
     /// bindings. Evaluations since then have replaced what the expression read by buffers that
     /// may be fewer (or windows of one pack), so then they are counted again.
-    fn inputs_within(&self, node: &Arc<Node>, have: &[u64], room: usize) -> Vec<u64> {
+    fn inputs_within(&self, node: &Arc<Node>, have: &[u64], recounted: bool, room: usize) -> Vec<u64> {
         let made = node.inputs();
-        let extra = made.iter().filter(|id| have.binary_search(id).is_err()).count();
-        if have.len() + extra < room {
-            return made.to_vec();
+        if !recounted {
+            let extra = made.iter().filter(|id| have.binary_search(id).is_err()).count();
+            if have.len() + extra < room {
+                return made.to_vec();
+            }
         }
         match node.operands() {
             Some(args) => count_inputs(args.get(..node.op.kind.arity()).unwrap_or(&[]), &[]),
@@ -2869,18 +2877,27 @@ impl JitState {
     /// bindings the device allows. Computing them together evaluates what they share once.
     pub(crate) fn evaluate_alongside(&self, seed: Arc<Node>) {
         let me = current_thread();
-        let mut inputs = self.inputs_within(&seed, &[], self.max_inputs());
+        let max_inputs = self.max_inputs();
+        let mut recounted = false;
+        let mut packed = false;
+        let mut inputs = self.inputs_within(&seed, &[], false, max_inputs);
         let mut below = IdSet::of(&seed, true);
         let len = seed.len;
+        let plain_seed = seed.shift_depth() == 0;
         let mut group = vec![seed];
         let flying = FLATTENING.with_borrow(Clone::clone);
         // A node that reads a node this thread is computing right now cannot be computed before
         // that one is: it would wait for it forever.
         let computing = COMPUTING.with_borrow(Clone::clone);
-        let mut tmp = Vec::new();
+        let held_in_below = |node: &Node| {
+            plain_seed
+                && node.shift_depth() == 0
+                && node.handles.load(Ordering::Relaxed) > 0
+                && node.shifted_reads.load(Ordering::Relaxed) == 0
+                && !node.is_pending_view()
+        };
+        let mut candidates = Vec::new();
         self.live.for_each_newest(|weak| {
-            // Upgraded one at a time and dropped unless taken: a strong reference keeps operands
-            // alive, and with them the buffers that a single-output kernel could overwrite.
             let Some(node) = weak.upgrade() else { return };
             if node.len != len
                 || node.thread != me
@@ -2888,22 +2905,49 @@ impl JitState {
                 || node.fused.load(Ordering::Relaxed)
                 || flying.contains(&Arc::as_ptr(&node))
                 || computing.iter().any(|&id| node.below_contains(id))
-                || below.contains(node.id)
+                || group.iter().any(|m| m.id == node.id)
+                || (below.contains(node.id) && !held_in_below(&node))
             {
                 return;
             }
-            let (shared_below, new_below) = below.overlap(&node);
-            if shared_below == 0 {
-                return;
-            }
-            let node_inputs = self.inputs_within(&node, &inputs, self.max_inputs());
-            let (_, new_inputs) = overlap(&node_inputs, &inputs);
-            if inputs.len() + new_inputs + self.output_bindings(&group, &node) <= self.max_inputs() + 1 && below.len() + new_below + group.len() < MAX_NODES_LIMIT {
-                union_into(&mut inputs, &mut tmp, &node_inputs);
-                below.add(&node, true);
-                group.push(node);
-            }
+            candidates.push(node);
         });
+        let mut tmp = Vec::new();
+        for (idx, node) in candidates.iter().enumerate() {
+            if group.iter().any(|m| m.id == node.id) || (below.contains(node.id) && !held_in_below(node)) {
+                continue;
+            }
+            let (shared_below, new_below) = if below.contains(node.id) { (1, 0) } else { below.overlap(node) };
+            if shared_below == 0 || below.len() + new_below + group.len() >= MAX_NODES_LIMIT + 1024 {
+                continue;
+            }
+            let mut node_inputs = self.inputs_within(node, &inputs, recounted, max_inputs);
+            let (_, mut new_inputs) = overlap(&node_inputs, &inputs);
+            let out_bindings = self.output_bindings(&group, node);
+            if inputs.len() + new_inputs + out_bindings > max_inputs + 1 && !recounted {
+                recounted = true;
+                let srcs: Vec<Src> = group.iter().map(|m| Src::Node(Arc::clone(m))).collect();
+                inputs = count_inputs(&srcs, &[]);
+                node_inputs = self.inputs_within(node, &inputs, true, max_inputs);
+                (_, new_inputs) = overlap(&node_inputs, &inputs);
+            }
+            if inputs.len() + new_inputs + out_bindings > max_inputs + 1 && !packed {
+                packed = true;
+                let all: Vec<Arc<Node>> = group.iter().chain(&candidates[idx..]).cloned().collect();
+                if pack::repack_nodes(&group[0].ctx, &all, usize::MAX) {
+                    let srcs: Vec<Src> = group.iter().map(|m| Src::Node(Arc::clone(m))).collect();
+                    inputs = count_inputs(&srcs, &[]);
+                    node_inputs = self.inputs_within(node, &inputs, true, max_inputs);
+                    (_, new_inputs) = overlap(&node_inputs, &inputs);
+                }
+            }
+            if inputs.len() + new_inputs + out_bindings <= max_inputs + 1 {
+                union_into(&mut inputs, &mut tmp, &node_inputs);
+                below.add(node, true);
+                group.push(Arc::clone(node));
+            }
+        }
+        drop(candidates);
         match group.as_slice() {
             // On its own, nothing but the node holds its operands, which lets its kernel
             // overwrite a dying operand's buffer.
@@ -3080,18 +3124,22 @@ impl JitState {
             };
             self.last_branches.store(branches, Ordering::Relaxed);
         }
-        let source = codegen::source(key, ctx.tuning(), segment_len, lowered.as_ref());
+        let built = codegen::build(key, ctx.tuning(), segment_len, lowered.as_ref())?;
         let label = key.label();
         let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
-        let bytes = source.len();
-        let core = Arc::new(kernel::build_core(
-            ctx,
-            &KernelKey::new(source, "main", None),
-            Some(&label),
-            true,
-        )?);
+        let (core, size) = match built {
+            codegen::Built::Module(module) => {
+                let statements = format!("{} statements of Kernel IR", module.entry_body.len());
+                (kernel::build_module(ctx, module, Some(&label), true)?, statements)
+            }
+            codegen::Built::Wgsl(source) => {
+                let bytes = format!("{} bytes of WGSL", source.len());
+                (kernel::build_core(ctx, &KernelKey::new(source, "main", None), Some(&label), true)?, bytes)
+            }
+        };
+        let core = Arc::new(core);
         if let Some(started) = started {
-            log::debug!("luma: compiled {label} ({bytes} bytes of WGSL) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+            log::debug!("luma: compiled {label} ({size}) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
         }
         self.stats.built.fetch_add(1, Ordering::Relaxed);
         Ok(core)
@@ -3103,9 +3151,8 @@ impl JitState {
         if let Some(core) = lock(&self.loops).get(key).and_then(|known| known.iter().find(|(layout, _)| layout == states)) {
             return Ok(Arc::clone(&core.1));
         }
-        let source = codegen::loop_source(key, states, ctx.tuning());
         let label = format!("Loop{}", key.label().trim_start_matches("Fused"));
-        let core = self.stencil_kernel(ctx, source, &label)?;
+        let core = self.module_kernel(ctx, format!("loop {key:?} {states:?}"), &label, || kirgen::loop_module(key, states, ctx.tuning()))?;
         lock(&self.loops).entry(key.clone()).or_default().push((states.to_vec(), Arc::clone(&core)));
         Ok(core)
     }
@@ -3118,6 +3165,31 @@ impl JitState {
             let core = kernel::build_core(ctx, &key, Some(label), true).map(Arc::new);
             if let Some(started) = started {
                 log::debug!("luma: compiled {label} ({} bytes of WGSL) in {:.1} ms", source.len(), started.elapsed().as_secs_f64() * 1e3);
+            }
+            core
+        })?;
+        if built {
+            self.stats.built.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(core)
+    }
+
+    /// The kernel built as Kernel IR by `build`, compiled on first use; `key` names what the
+    /// module depends on, so that distinct modules have distinct keys.
+    pub(crate) fn module_kernel(
+        &self,
+        ctx: &Context,
+        key: String,
+        label: &str,
+        build: impl FnOnce() -> Result<KernelModule>,
+    ) -> Result<Arc<KernelCore>> {
+        let (core, built) = self.modules.get_or_build(&key, || {
+            let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
+            let module = build()?;
+            let statements = module.entry_body.len();
+            let core = kernel::build_module(ctx, module, Some(label), true).map(Arc::new);
+            if let Some(started) = started {
+                log::debug!("luma: compiled {label} ({statements} statements of Kernel IR) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
             }
             core
         })?;

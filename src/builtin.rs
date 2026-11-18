@@ -1,15 +1,19 @@
-//! The built-in operations, expressed as WGSL kernels that run on the same engine as custom
-//! kernels.
+//! The built-in operations, expressed as kernels that run on the same engine as custom kernels:
+//! the simple ones (fills, the non-finite test, the spatial convolution, the gate of
+//! `iterate_until`) are built directly as Kernel IR modules, the others are generated WGSL.
 //!
 //! Elementwise operations on arrays are not kernels of their own: they are recorded lazily and
 //! fused into generated kernels, see [`crate::jit`]. What is left here are the
 //! fills, the reduction passes over partial results, and the convolution and FFT
-//! passes (generated here, in [`crate::fft`] and `conv1d.wgsl`). Every kernel declares its arguments in `@group(1)` and
-//! uses the `luma` grid uniform of the prelude.
+//! passes (generated here and in [`crate::fft`]). Every kernel declares its arguments as the
+//! bindings of its module (`@group(1)` in WGSL text) and uses the `luma` grid of the prelude.
 
 use std::borrow::Cow;
 use std::fmt::Write;
 
+use luma_core::kir::{BuiltinVar, FnBuilder, KernelModule, KirType, ModuleBuilder, ScalarTy, Val};
+
+use crate::gpu::lower::finish;
 use crate::jit::ElemTy;
 use crate::solve::Io;
 use crate::tuning::{Tuning, TuningProfile};
@@ -1190,12 +1194,13 @@ var<workgroup> weights: array<{weights_ty}, {weights_len}>;
 fn slot(i: u32) -> u32 {{ return i + (i >> 5u); }}
 
 fn weight(c: u32, taps: u32, i: u32) -> f32 {{
-    return select(0.0, kernel[min(c + i, params.kernel_len - 1u)], i < taps);
+    if (i < taps) {{ return kernel[c + i]; }}
+    return 0.0;
 }}
 
 fn load(g: i32) -> f32 {{
-    let inside = g >= 0 && u32(g) < params.input_len;
-    return select(0.0, input_data[u32(max(g, 0))], inside);
+    if (g >= 0 && u32(g) < params.input_len) {{ return input_data[u32(g)]; }}
+    return 0.0;
 }}
 
 @compute @workgroup_size({wg})
@@ -1244,38 +1249,6 @@ fn main(
 /// Outputs one workgroup of the tiled convolution computes (see [`conv1d_tiled`]).
 pub(crate) fn conv_tile(stride: u32, per_thread: u32, wg: u32) -> u32 {
     wg * (per_thread / stride)
-}
-
-/// [`Builtin::FillBits`].
-fn fill_bits_kernel(wg: u32) -> String {
-    format!(
-        "struct Params {{ s: u32, len: u32 }}
-@group(1) @binding(0) var<storage, read_write> out: array<u32>;
-@group(1) @binding(1) var<uniform> p: Params;
-@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {wg}u;
-    if (i >= luma.size.x) {{ return; }}
-    let tail = select(0xFFFFFFFFu, (1u << (p.len & 31u)) - 1u, i == luma.size.x - 1u && (p.len & 31u) != 0u);
-    out[i] = select(0u, tail, p.s != 0u);
-}}
-"
-    )
-}
-
-fn fill_kernel(ty: &str, wg: u32) -> String {
-    format!(
-        "struct Params {{ s: {ty} }}
-@group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
-@group(1) @binding(1) var<uniform> p: Params;
-@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {wg}u;
-    if (i >= luma.size.x) {{ return; }}
-    out[i] = p.s;
-}}
-"
-    )
 }
 
 /// How the Thomas solve of lines of blocks runs: the invocations per workgroup and the layout of
@@ -1640,65 +1613,229 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     )
 }
 
+/// The kernel a [`Builtin`] runs: built directly as a Kernel IR module, or as WGSL text.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum BuiltinKernel {
+    Module(KernelModule),
+    Wgsl(Cow<'static, str>),
+}
+
+/// `gid.x + gid.y * nwg.x * wg`: the element of the invocation of a launch folded over x and y.
+fn element_index(f: &mut FnBuilder<'_>, wg: u32) -> Val {
+    let gid = f.builtin(BuiltinVar::GlobalInvocationId);
+    let nwg = f.builtin(BuiltinVar::NumWorkgroups);
+    let (gx, gy, nx) = (f.field(gid, 0, KirType::U32), f.field(gid, 1, KirType::U32), f.field(nwg, 0, KirType::U32));
+    let width = f.lit_u32(wg);
+    let index = gx + gy * nx * width;
+    f.let_val("i", index)
+}
+
+/// `if (i >= luma.size.x) { return; }`
+fn guard_size(f: &mut FnBuilder<'_>, i: Val) {
+    let size = f.grid_size(0);
+    let outside = f.ge(i, size);
+    f.if_then(outside, |f| f.ret(None));
+}
+
+/// The scalar or vector type named by the WGSL `ty` of an element.
+fn element_type(ty: &str) -> KirType {
+    match ty {
+        "f32" => KirType::F32,
+        "u32" => KirType::U32,
+        "i32" => KirType::I32,
+        "f64" => KirType::Scalar(ScalarTy::F64),
+        "vec2<f32>" => KirType::vec(ScalarTy::F32, 2),
+        other => unreachable!("no fill for elements of type {other}"),
+    }
+}
+
+/// [`Builtin::Fill`]: `out[i] = p.s`.
+fn fill_module(ty: &str, wg: u32) -> KernelModule {
+    let ty = element_type(ty);
+    let mut mb = ModuleBuilder::new("fill", "main", [wg, 1, 1]);
+    let params = mb.add_struct_layout("Params", &[("s", ty.clone())]);
+    let out = mb.add_storage_read_write("out", ty.clone());
+    let p = mb.add_uniform("p", KirType::Struct(params));
+    let mut f = mb.entry_builder();
+    let i = element_index(&mut f, wg);
+    guard_size(&mut f, i);
+    let value = f.uniform_field(p, 0, ty);
+    f.store(out, i, value);
+    f.finish();
+    finish(mb, None)
+}
+
+/// [`Builtin::FillBits`]: the words of a bool array filled with `p.s`, the bits past `p.len` zero.
+fn fill_bits_module(wg: u32) -> KernelModule {
+    let mut mb = ModuleBuilder::new("fill_bits", "main", [wg, 1, 1]);
+    let params = mb.add_uniform_u32_struct("Params", &["s", "len"]);
+    let out = mb.add_storage_read_write("out", KirType::U32);
+    let p = mb.add_uniform("p", KirType::Struct(params));
+    let mut f = mb.entry_builder();
+    let i = element_index(&mut f, wg);
+    guard_size(&mut f, i);
+    let (s, len) = (f.uniform_field(p, 0, KirType::U32), f.uniform_field(p, 1, KirType::U32));
+    let (zero, one, mask) = (f.lit_u32(0), f.lit_u32(1), f.lit_u32(31));
+    let low = f.let_val("low", len & mask);
+    let last = f.grid_size(0) - one;
+    let partial = f.and(f.eq(i, last), f.ne(low, zero));
+    let bits = f.shl(one, low) - one;
+    let full = f.lit_u32(0xFFFF_FFFF);
+    let tail = f.select(partial, bits, full);
+    let word = f.select(f.ne(s, zero), tail, zero);
+    f.store(out, i, word);
+    f.finish();
+    finish(mb, None)
+}
+
+/// [`Builtin::NonFinite`]: `out[i] = 1` where the bits of `a[i]` are those of an `Inf` or a `NaN`.
+fn non_finite_module(wg: u32) -> KernelModule {
+    let mut mb = ModuleBuilder::new("non_finite", "main", [wg, 1, 1]);
+    let out = mb.add_storage_read_write("out", KirType::U32);
+    let a = mb.add_storage_read("a", KirType::U32);
+    let mut f = mb.entry_builder();
+    let i = element_index(&mut f, wg);
+    guard_size(&mut f, i);
+    let exponent = f.lit_u32(0x7f80_0000);
+    let special = f.eq(f.load(a, i) & exponent, exponent);
+    let (zero, one) = (f.lit_u32(0), f.lit_u32(1));
+    let flag = f.select(special, one, zero);
+    f.store(out, i, flag);
+    f.finish();
+    finish(mb, None)
+}
+
+/// [`Builtin::Conv1d`]: spatial 1D convolution (cross-correlation). Launched with one invocation
+/// per output element, folded over x and y workgroups. Buffers may be larger than the arrays they
+/// hold, so lengths come from the parameters, never from the length of a binding.
+fn conv1d_module() -> KernelModule {
+    const WG: u32 = 64;
+    let mut mb = ModuleBuilder::new("conv1d", "main", [WG, 1, 1]);
+    let params = mb.add_uniform_u32_struct("Params", &["kernel_len", "stride", "padding", "input_len", "output_len"]);
+    let output = mb.add_storage_read_write("output", KirType::F32);
+    let input = mb.add_storage_read("input_data", KirType::F32);
+    let kernel = mb.add_storage_read("kernel", KirType::F32);
+    let p = mb.add_uniform("params", KirType::Struct(params));
+    let mut f = mb.entry_builder();
+    let i = element_index(&mut f, WG);
+    let field = |f: &FnBuilder<'_>, at: u32| f.uniform_field(p, at, KirType::U32);
+    let (kernel_len, stride, padding, input_len, output_len) =
+        (field(&f, 0), field(&f, 1), field(&f, 2), field(&f, 3), field(&f, 4));
+    let outside = f.ge(i, output_len);
+    f.if_then(outside, |f| f.ret(None));
+    let first = f.convert(i * stride, KirType::I32) - f.convert(padding, KirType::I32);
+    let in_start = f.let_val("in_start", first);
+    let zero = f.lit_f32(0.0);
+    let sum = f.var_decl("sum", KirType::F32, Some(zero));
+    let (start, step) = (f.lit_u32(0), f.lit_u32(1));
+    f.for_range("k", start, kernel_len, step, |f, k| {
+        let at = f.let_val("in_idx", in_start + f.convert(k, KirType::I32));
+        let inside = f.and(f.ge(at, f.lit_i32(0)), f.lt(f.convert(at, KirType::U32), input_len));
+        f.if_then(inside, |f| {
+            let term = f.load(input, f.convert(at, KirType::U32)) * f.load(kernel, k);
+            let next = f.read_var(sum) + term;
+            f.assign_var(sum, next);
+        });
+    });
+    let total = f.read_var(sum);
+    f.store(output, i, total);
+    f.finish();
+    finish(mb, None)
+}
+
 /// Writes the indirect arguments of the next step of `iterate_until`: the template, or zeros
 /// once the residual is within the tolerance (a NaN residual never is) so that the steps after
 /// convergence dispatch no workgroups.
-const UNTIL_GATE: &str = "struct Params { tol: f32, step: u32, words: u32 }
-@group(1) @binding(0) var<storage, read> res: array<f32>;
-@group(1) @binding(1) var<storage, read_write> st: array<u32>;
-@group(1) @binding(2) var<storage, read_write> args: array<u32>;
-@group(1) @binding(3) var<storage, read> tmpl: array<u32>;
-@group(1) @binding(4) var<uniform> p: Params;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+fn until_gate_module() -> KernelModule {
+    let mut mb = ModuleBuilder::new("until_gate", "main", [64, 1, 1]);
+    let params = mb.add_struct_layout("Params", &[("tol", KirType::F32), ("step", KirType::U32), ("words", KirType::U32)]);
+    let res = mb.add_storage_read("res", KirType::F32);
+    let st = mb.add_storage_read_write("st", KirType::U32);
+    let args = mb.add_storage_read_write("args", KirType::U32);
+    let tmpl = mb.add_storage_read("tmpl", KirType::U32);
+    let p = mb.add_uniform("p", KirType::Struct(params));
+    let mut f = mb.entry_builder();
+    let gid = f.builtin(BuiltinVar::GlobalInvocationId);
+    let g = f.field(gid, 0, KirType::U32);
+    let g = f.let_val("g", g);
+    let (zero, one) = (f.lit_u32(0), f.lit_u32(1));
+    let residual = f.load(res, zero);
+    let residual = f.let_val("residual", residual);
     // Fast math may not honour NaN comparisons, so the bits are tested too.
-    let bits = bitcast<u32>(res[0]);
-    let hit = (bits & 0x7fffffffu) <= 0x7f800000u && res[0] <= p.tol;
-    let done = st[0] != 0u || hit;
-    if (g.x == 0u && st[0] == 0u) {
-        if (hit) { st[0] = 1u; }
-        st[1] = p.step + 1u;
-    }
-    if (g.x < p.words) { args[g.x] = select(tmpl[g.x], 0u, done); }
+    let bits = f.bitcast(residual, KirType::U32);
+    let finite = f.le(bits & f.lit_u32(0x7fff_ffff), f.lit_u32(0x7f80_0000));
+    let tol = f.uniform_field(p, 0, KirType::F32);
+    let reached = f.and(finite, f.le(residual, tol));
+    let hit = f.let_val("hit", reached);
+    let stopped = f.ne(f.load(st, zero), zero);
+    let done = f.let_val("done", f.or(stopped, hit));
+    let first = f.and(f.eq(g, zero), f.eq(f.load(st, zero), zero));
+    f.if_then(first, |f| {
+        f.if_then(hit, |f| f.store(st, zero, one));
+        let step = f.uniform_field(p, 1, KirType::U32);
+        f.store(st, one, step + one);
+    });
+    let words = f.uniform_field(p, 2, KirType::U32);
+    let within = f.lt(g, words);
+    f.if_then(within, |f| {
+        let value = f.select(done, zero, f.load(tmpl, g));
+        f.store(args, g, value);
+    });
+    f.finish();
+    finish(mb, None)
 }
-";
+
+/// [`Builtin::MatmulSum`]: sums the partial products of a split product.
+fn matmul_sum_module(wg: u32) -> KernelModule {
+    let mut mb = ModuleBuilder::new("matmul_sum", "main", [wg, 1, 1]);
+    let params = mb.add_uniform_u32_struct("Params", &["s"]);
+    let out = mb.add_storage_read_write("out", KirType::F32);
+    let part = mb.add_storage_read("part", KirType::F32);
+    let p = mb.add_uniform("p", KirType::Struct(params));
+    let mut f = mb.entry_builder();
+    let i = element_index(&mut f, wg);
+    guard_size(&mut f, i);
+    let slices = f.uniform_field(p, 0, KirType::U32);
+    let zero = f.lit_f32(0.0);
+    let acc = f.var_decl("acc", KirType::F32, Some(zero));
+    let (start, step) = (f.lit_u32(0), f.lit_u32(1));
+    f.for_range("z", start, slices, step, |f, z| {
+        let term = f.load(part, z * f.grid_size(0) + i);
+        let next = f.read_var(acc) + term;
+        f.assign_var(acc, next);
+    });
+    let total = f.read_var(acc);
+    f.store(out, i, total);
+    f.finish();
+    finish(mb, None)
+}
 
 impl Builtin {
-    /// The WGSL source of this kernel for elements of type `ty` (`"f32"` or `"u32"`), with the
-    /// parameters `tuning` gives for the GPU.
-    pub(crate) fn source(self, ty: &str, tuning: &Tuning) -> Cow<'static, str> {
+    /// This kernel for elements of type `ty` (`"f32"` or `"u32"`), with the parameters `tuning`
+    /// gives for the GPU.
+    pub(crate) fn kernel(self, ty: &str, tuning: &Tuning) -> BuiltinKernel {
         let wg = tuning.elementwise_workgroup;
+        let wgsl = |source: String| BuiltinKernel::Wgsl(source.into());
         match self {
-            Builtin::Fill => fill_kernel(ty, wg).into(),
-            Builtin::FillBits => fill_bits_kernel(wg).into(),
-            Builtin::ReduceBits(ops) => reduce_bits(ops, tuning).into(),
-            Builtin::Reduce(ops, segmented) => reduce(ty, ops, segmented, tuning).into(),
-            Builtin::Conv1d => include_str!("conv1d.wgsl").into(),
-            Builtin::Conv1dTiled(stride, per_thread) => conv1d_tiled(stride, per_thread, tuning.conv_workgroup).into(),
-            Builtin::Fft(pass) => crate::fft::source(pass).into(),
-            Builtin::UntilGate => UNTIL_GATE.into(),
-            Builtin::Tridiagonal { block, starts, workgroup } => tridiagonal(block as u32, starts, u32::from(workgroup)).into(),
+            Builtin::Fill => BuiltinKernel::Module(fill_module(ty, wg)),
+            Builtin::FillBits => BuiltinKernel::Module(fill_bits_module(wg)),
+            Builtin::ReduceBits(ops) => wgsl(reduce_bits(ops, tuning)),
+            Builtin::Reduce(ops, segmented) => wgsl(reduce(ty, ops, segmented, tuning)),
+            Builtin::Conv1d => BuiltinKernel::Module(conv1d_module()),
+            Builtin::Conv1dTiled(stride, per_thread) => wgsl(conv1d_tiled(stride, per_thread, tuning.conv_workgroup)),
+            Builtin::Fft(pass) => wgsl(crate::fft::source(pass)),
+            Builtin::UntilGate => BuiltinKernel::Module(until_gate_module()),
+            Builtin::Tridiagonal { block, starts, workgroup } => wgsl(tridiagonal(block as u32, starts, u32::from(workgroup))),
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
-                crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows).into()
+                wgsl(crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows))
             }
-            Builtin::SolveParts(spec) => spec.source().into(),
-            Builtin::Radix { pass, first } => crate::sort::source(pass, first).into(),
-            Builtin::Matmul { tile, aligned, split } => crate::matmul::builtin_source(tile, aligned, split).into(),
-            Builtin::MatmulSum => crate::matmul::sum_source(wg).into(),
-            Builtin::FilterCount => crate::filter::count_source().into(),
-            Builtin::FilterScatter { words, index } => crate::filter::scatter_source(words, index).into(),
-            Builtin::NonFinite => format!(
-                "@group(1) @binding(0) var<storage, read_write> out: array<u32>;
-@group(1) @binding(1) var<storage, read> a: array<u32>;
-@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {wg}u;
-    if (i >= luma.size.x) {{ return; }}
-    out[i] = select(0u, 1u, (a[i] & 0x7f800000u) == 0x7f800000u);
-}}
-"
-            )
-            .into(),
+            Builtin::SolveParts(spec) => wgsl(spec.source()),
+            Builtin::Radix { pass, first } => wgsl(crate::sort::source(pass, first)),
+            Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split)),
+            Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module(wg)),
+            Builtin::FilterCount => wgsl(crate::filter::count_source()),
+            Builtin::FilterScatter { words, index } => wgsl(crate::filter::scatter_source(words, index)),
+            Builtin::NonFinite => BuiltinKernel::Module(non_finite_module(wg)),
         }
     }
 }

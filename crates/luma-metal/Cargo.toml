@@ -1,0 +1,18 @@
+[package]
+name = "luma-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+luma-core.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+block2.workspace = true

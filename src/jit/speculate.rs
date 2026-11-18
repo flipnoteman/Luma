@@ -8,6 +8,7 @@
 //! of their next states take the precomputed buffers. Anything else is a miss and runs as
 //! usual, so values are those of the program that was written. `LUMA_SPECULATE=off` disables it.
 
+use luma_core::Buffer;
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -150,7 +151,7 @@ impl Tracker {
         &mut self,
         ctx: &Context,
         count: usize,
-        reduce: impl FnOnce(&mut Scratch<'_>) -> Result<wgpu::Buffer>,
+        reduce: impl FnOnce(&mut Scratch<'_>) -> Result<Buffer>,
     ) -> Result<Vec<u32>> {
         let start = Instant::now();
         let mut scratch = Scratch::new(ctx);
@@ -169,7 +170,7 @@ impl Tracker {
         node: &Arc<Node>,
         ops: ReduceList,
         traced: Traced,
-        reduce: impl FnOnce(&mut Scratch<'_>) -> Result<wgpu::Buffer>,
+        reduce: impl FnOnce(&mut Scratch<'_>) -> Result<Buffer>,
     ) -> Result<Vec<u32>> {
         let count = ops.as_slice().len();
         let snapshot = self.template.as_ref().zip(self.outs.as_ref());
@@ -245,7 +246,7 @@ impl Tracker {
 }
 
 /// The `count` words at the start of `buffer`.
-fn read_words(ctx: &Context, buffer: &wgpu::Buffer, count: usize) -> Result<Vec<u32>> {
+fn read_words(ctx: &Context, buffer: &Buffer, count: usize) -> Result<Vec<u32>> {
     let words = ctx.read::<u32>(buffer, (count * 4) as u64)?;
     if words.len() != count {
         return Err(LumaError::Gpu("reduction results are missing".into()));
@@ -279,7 +280,7 @@ fn compute_ahead(
     ops: ReduceList,
     wgsl: &'static str,
     from: &[Arc<Storage>],
-) -> Result<(Vec<Arc<Storage>>, wgpu::Buffer)> {
+) -> Result<(Vec<Arc<Storage>>, Buffer)> {
     debug_assert_eq!(from.len(), states);
     let partials = launch::reduce_fused(ctx, len, with_states(template, from, None), ops, scratch, None, Finish::default()).map_err(Failure::into_error)?;
     let [(partial, groups)] = <[_; 1]>::try_from(partials).map_err(|_| LumaError::Gpu("speculated reduction spans segments".into()))?;
@@ -359,7 +360,7 @@ impl Walk<'_> {
 pub(crate) fn readback(
     node: &Arc<Node>,
     ops: ReduceList,
-    reduce: impl FnOnce(&mut Scratch<'_>) -> Result<wgpu::Buffer>,
+    reduce: impl FnOnce(&mut Scratch<'_>) -> Result<Buffer>,
 ) -> Option<Result<Vec<u32>>> {
     let ctx = node.context();
     let mut guard = ctx.jit().speculation.try_lock().ok()?;

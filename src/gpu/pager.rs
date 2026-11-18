@@ -12,8 +12,11 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+use luma_core::hal::copy_parallel;
+use luma_core::Buffer;
+
 use crate::array::Storage;
-use crate::context::{copy_parallel, Context, STORAGE_USAGE};
+use crate::context::{Context, STORAGE_USAGE};
 use crate::error::Result;
 use crate::gpu::pool;
 use crate::gpu::lock;
@@ -27,7 +30,7 @@ enum State {
     /// No buffer yet; the contents are unspecified, as those of a pooled buffer are.
     Empty,
     /// In a device buffer (possibly larger than the data it holds).
-    Device(wgpu::Buffer),
+    Device(Buffer),
     /// Moved to host memory to make room; copied back at the next pin.
     Host(Vec<u8>),
     /// A range of the buffer of another storage (see [`Segment::windowed`]); gets a buffer of its
@@ -62,7 +65,7 @@ pub(crate) struct Segment {
 #[derive(Debug)]
 pub(crate) struct Pin {
     segment: Arc<Segment>,
-    buffer: wgpu::Buffer,
+    buffer: Buffer,
 }
 
 impl Pin {
@@ -73,7 +76,7 @@ impl Pin {
     }
 
     /// The segment's device buffer.
-    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+    pub(crate) fn buffer(&self) -> &Buffer {
         &self.buffer
     }
 }
@@ -158,7 +161,7 @@ impl Segment {
 
     /// A segment of `bytes` bytes that already lives in `buffer` (from [`Context::alloc_buffer`]
     /// or [`Context::alloc_filled`]); the segment recycles it when dropped.
-    pub(crate) fn filled(ctx: &Context, bytes: u64, buffer: wgpu::Buffer) -> Arc<Segment> {
+    pub(crate) fn filled(ctx: &Context, bytes: u64, buffer: Buffer) -> Arc<Segment> {
         let size = buffer.size();
         let segment = Arc::new(Segment {
             ctx: ctx.clone(),

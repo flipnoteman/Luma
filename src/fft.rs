@@ -521,14 +521,14 @@ fn main(
 /// The buffers of one convolution: real input and kernel, real output, each with the bytes
 /// bound and the number of elements.
 pub(crate) struct Operands<'a> {
-    pub(crate) input: (&'a wgpu::Buffer, u64, u32),
-    pub(crate) kernel: (&'a wgpu::Buffer, u64, u32),
-    pub(crate) output: (&'a wgpu::Buffer, u64, u32),
+    pub(crate) input: (&'a luma_core::Buffer, u64, u32),
+    pub(crate) kernel: (&'a luma_core::Buffer, u64, u32),
+    pub(crate) output: (&'a luma_core::Buffer, u64, u32),
 }
 
 /// The tile size of the device: as large as its workgroup memory allows.
 fn tile_log(ctx: &Context) -> u32 {
-    let bytes = ctx.device().limits().max_compute_workgroup_storage_size;
+    let bytes = ctx.info().limits.max_workgroup_storage_bytes;
     if bytes >= 8 << TILE_LOG {
         TILE_LOG
     } else {
@@ -564,11 +564,11 @@ struct Batch<'a> {
     tile_log: u32,
     /// Complex values in the work buffer (blocks times block size).
     total: u32,
-    work: &'a wgpu::Buffer,
-    spectrum: &'a wgpu::Buffer,
-    src: (&'a wgpu::Buffer, u64),
+    work: &'a luma_core::Buffer,
+    spectrum: &'a luma_core::Buffer,
+    src: (&'a luma_core::Buffer, u64),
     input: Io,
-    dst: Option<((&'a wgpu::Buffer, u64), Io)>,
+    dst: Option<((&'a luma_core::Buffer, u64), Io)>,
     params: Params,
 }
 

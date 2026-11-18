@@ -1191,7 +1191,7 @@ fn scalars(b: &mut Bench) {
 
     b.scalar("reduce/sum_compensated", one, small, false, 1.0, 1e-6, &|d| f64::from(d.a.sum_compensated().item().unwrap()), &hsum);
     b.scalar("reduce/df32_sum", one, small, false, 1.0, 1e-8, &|d| d.a.to_df32().sum().item().unwrap().to_f64(), &hsum);
-    if b.ctx.features().contains(wgpu::Features::SHADER_F64) {
+    if b.ctx.features().contains(luma::Features::SHADER_F64) {
         b.scalar("reduce/f64_sum", one, small, false, 1.0, 1e-9, &|d| d.a.to_f64().sum().item().unwrap(), &hsum);
     } else {
         b.skip("reduce/f64_sum", "the device has no SHADER_F64");

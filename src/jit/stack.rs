@@ -44,7 +44,7 @@ pub(crate) fn run(
         return Ok(None);
     }
     let base = Arc::new(Storage::new(ctx, out_len, ty.layout()));
-    // The stores write one bit at a time (`codegen::store`) and leave the others as they were.
+    // The stores write one bit at a time (`kirgen::Lower::store`) and leave the others as they were.
     if ty == ElemTy::Bool {
         ctx.clear(&base.pin(0)?.buffer().clone(), base.byte_len())?;
     }

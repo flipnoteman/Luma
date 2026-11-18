@@ -179,7 +179,7 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
             }
         }
         OpKind::Compare(CmpOp::Lt | CmpOp::Gt) if same(a, b) => constant(op, 0.0),
-        OpKind::Cast(ElemTy::F32) if matches!(ty, ElemTy::F64 | ElemTy::Df32) => {
+        OpKind::Cast(ElemTy::F32) if ty == ElemTy::F64 => {
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Cast(_)))?;
             match iop.kind {
                 OpKind::Cast(through) if through == ty && iop.ty == ElemTy::F32 => {
@@ -372,7 +372,6 @@ mod tests {
             }),
             ("lt same", true, |b, _| compared(&b.lt(b))),
             ("gt same", true, |b, _| compared(&b.gt(b))),
-            ("through df32", true, |b, _| host(&b.to_df32().to_f32())),
         ]
     }
 
@@ -390,6 +389,17 @@ mod tests {
                     assert!(len <= plain_len, "{name}: program of {len} instructions, {plain_len} unsimplified");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn df32_round_trip_matches_the_unevaluated_sum() {
+        let ctx = context(false);
+        let data = [-0.0f32, 0.0, -2.0, 3.0];
+        let expected = data.map(|x| ((x * 2.0) + 0.0).to_bits());
+        for simplify in [false, true] {
+            let (got, _) = run(&ctx, simplify, (&data, &data), |b, _| host(&b.to_df32().to_f32()));
+            assert_eq!(got, expected);
         }
     }
 
@@ -493,7 +503,7 @@ mod tests {
     #[test]
     fn simplify_cast_through_f64() {
         let ctx = context(false);
-        if !ctx.features().contains(wgpu::Features::SHADER_F64) {
+        if !ctx.features().contains(luma_core::Features::SHADER_F64) {
             return;
         }
         for simplify in [false, true] {

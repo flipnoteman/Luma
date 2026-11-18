@@ -14,13 +14,13 @@ pub type Result<T, E = LumaError> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum LumaError {
     /// No suitable GPU adapter was found.
-    NoAdapter(wgpu::RequestAdapterError),
+    NoAdapter(String),
     /// The requested kind of device is not available.
     NoDevice(&'static str),
     /// The operation cannot run over an array that is split into several buffers.
     Chunked(&'static str),
     /// The adapter refused to create a device.
-    RequestDevice(wgpu::RequestDeviceError),
+    RequestDevice(String),
     /// The operands of a binary operation have different shapes.
     ShapeMismatch {
         /// Shape of the left operand.
@@ -154,11 +154,11 @@ pub enum LumaError {
         source: Arc<LumaError>,
     },
     /// Waiting for the GPU to finish failed.
-    Poll(Arc<wgpu::PollError>),
+    Poll(String),
     /// Mapping the readback buffer failed.
-    Map(wgpu::BufferAsyncError),
+    Map(String),
     /// Accessing the mapped readback buffer failed.
-    MapRange(wgpu::MapRangeError),
+    MapRange(String),
 }
 
 impl fmt::Display for LumaError {
@@ -247,13 +247,31 @@ impl fmt::Display for LumaError {
 impl Error for LumaError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            LumaError::NoAdapter(e) => Some(e),
-            LumaError::RequestDevice(e) => Some(e),
-            LumaError::Poll(e) => Some(&**e),
             LumaError::Op { source, .. } => Some(&**source),
-            LumaError::Map(e) => Some(e),
-            LumaError::MapRange(e) => Some(e),
             _ => None,
+        }
+    }
+}
+
+impl From<luma_core::BackendError> for LumaError {
+    fn from(error: luma_core::BackendError) -> Self {
+        use luma_core::BackendError as B;
+        match error {
+            B::NoAdapter(e) => LumaError::NoAdapter(e),
+            B::NoDevice(e) => LumaError::NoDevice(e),
+            B::RequestDevice(e) => LumaError::RequestDevice(e),
+            B::ShaderCompile(e) => LumaError::ShaderCompile(e),
+            B::KernelBinding(e) => LumaError::KernelBinding(e),
+            B::KernelEntryPoint(e) => LumaError::KernelEntryPoint(e),
+            B::KernelWorkgroup(e) => LumaError::KernelWorkgroup(e),
+            B::KernelArgCount { expected, actual } => LumaError::KernelArgCount { expected, actual },
+            B::Poll(e) => LumaError::Poll(e),
+            B::Map(e) => LumaError::Map(e),
+            B::MapRange(e) => LumaError::MapRange(e),
+            B::OutOfMemory { requested } => LumaError::OutOfMemory { requested },
+            B::Profiling(e) => LumaError::Profiling(e),
+            B::Gpu(e) => LumaError::Gpu(e),
+            B::Unsupported(e) => LumaError::Unsupported(e),
         }
     }
 }

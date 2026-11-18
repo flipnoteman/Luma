@@ -2,36 +2,63 @@
 name = "luma"
 version.workspace = true
 edition.workspace = true
-description = "Lazy GPU arrays for Rust on wgpu (Vulkan, Metal, DX12): fused elementwise kernels, reductions, FFT convolution, custom WGSL kernels"
+description = "Backend-agnostic lazy GPU arrays for Rust (CUDA, Metal, wgpu): fused elementwise kernels, reductions, FFT convolution, custom WGSL kernels"
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
 documentation = "https://docs.rs/luma"
-keywords = ["gpu", "wgpu", "array", "math", "compute"]
+keywords = ["gpu", "cuda", "metal", "array", "compute"]
 categories = ["science", "mathematics", "concurrency"]
 rust-version.workspace = true
 exclude = [".github/", "Temp.md"]
 
 [workspace]
+members = [
+    "crates/luma-core",
+    "crates/luma-wgpu",
+    "crates/luma-metal",
+    "crates/luma-cuda",
+]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/flipnoteman/Luma"
 rust-version = "1.99"
 
-[dependencies]
-wgpu = { version = "30", features = ["naga-ir"] }
-bytemuck = "1.21.0"
+[workspace.dependencies]
+luma-core = { path = "crates/luma-core", version = "0.5.0" }
+luma-wgpu = { path = "crates/luma-wgpu", version = "0.5.0" }
+luma-metal = { path = "crates/luma-metal", version = "0.5.0" }
+luma-cuda = { path = "crates/luma-cuda", version = "0.5.0" }
+bytemuck = { version = "1.21.0", features = ["derive"] }
 log = "0.4.25"
-pollster = "1.0.1"
 naga = { version = "30.0.1", features = ["wgsl-in"] }
 encase = "0.13.0"
-
-[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "30", features = ["naga-ir"] }
+pollster = "1.0.1"
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12000"] }
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+block2 = "0.6.2"
 libc = "0.2"
 
+[features]
+default = ["wgpu", "metal", "cuda"]
+wgpu = ["dep:luma-wgpu"]
+metal = ["dep:luma-metal"]
+cuda = ["dep:luma-cuda"]
+
+[dependencies]
+luma-core.workspace = true
+luma-wgpu = { workspace = true, optional = true }
+luma-metal = { workspace = true, optional = true }
+luma-cuda = { workspace = true, optional = true }
+bytemuck.workspace = true
+log.workspace = true
+encase.workspace = true
 [dev-dependencies]
 criterion = "0.8"
 ml-kem = "0.3.4"

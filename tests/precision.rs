@@ -6,7 +6,7 @@ use common::values;
 use luma::{Array, Context, Df32, LumaError};
 
 fn has_f64(ctx: &Context) -> bool {
-    ctx.features().contains(luma::wgpu::Features::SHADER_F64)
+    ctx.features().contains(luma::Features::SHADER_F64)
 }
 
 /// The next float above `x` (positive, finite) for ulp comparisons.

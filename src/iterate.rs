@@ -146,9 +146,7 @@ fn replayed_all<T: ScalarType, const N: usize>(
         }
         return Ok(states);
     };
-    for t in 1..=steps {
-        stepper.plan().replay(&stepper.subst(t), None)?;
-    }
+    stepper.run_steps(steps)?;
     let mut finals = stepper.state_after(steps).iter();
     Ok(init.map(|array| match finals.next() {
         Some(storage) => Array::from_storage(ctx, array.shape(), Arc::clone(storage)),
@@ -284,9 +282,7 @@ impl Array<f32> {
             u.check()?;
             return Ok(u);
         };
-        for t in 1..=steps {
-            stepper.plan().replay(&stepper.subst(t), None)?;
-        }
+        stepper.run_steps(steps)?;
         match stepper.state_after(steps).first() {
             Some(storage) => Ok(Array::from_storage(self.context(), self.shape(), Arc::clone(storage))),
             None => unreachable!(),

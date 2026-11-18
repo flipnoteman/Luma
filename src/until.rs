@@ -14,7 +14,7 @@ use std::ops::{Add, Div, Index, Mul, Neg, Sub};
 use std::panic::Location;
 use std::sync::Arc;
 
-use wgpu::BufferUsages;
+use luma_core::{Buffer, BufferUsage};
 
 use crate::array::{Array, Failure, Storage};
 use crate::context::{Context, RawArg, STORAGE_USAGE};
@@ -846,7 +846,7 @@ fn gated_run<S: Fields>(
     ctx.upload(step_pin.buffer(), bytemuck::cast_slice(&[0.0f32]))?;
 
     let mut owned = Vec::new();
-    let mut take = |bytes: u64, usage: BufferUsages| -> Result<wgpu::Buffer> {
+    let mut take = |bytes: u64, usage: BufferUsage| -> Result<Buffer> {
         let buffer = ctx.alloc_buffer(bytes, usage)?;
         owned.push(buffer.clone());
         Ok(buffer)
@@ -855,8 +855,8 @@ fn gated_run<S: Fields>(
         let tmpl = take(args_bytes, STORAGE_USAGE)?;
         ctx.upload(&tmpl, bytemuck::cast_slice(&template))?;
         let st = take(16, STORAGE_USAGE)?;
-        let indirect = STORAGE_USAGE | BufferUsages::INDIRECT;
-        let mut args: Vec<wgpu::Buffer> = Vec::new();
+        let indirect = STORAGE_USAGE | BufferUsage::INDIRECT;
+        let mut args: Vec<Buffer> = Vec::new();
         let hist_bytes = (records.max(1) * max_steps) as u64 * 4;
         let hist = take(hist_bytes, STORAGE_USAGE)?;
         let agg_bytes = 2 * records.max(1) as u64 * 4;
@@ -878,7 +878,7 @@ fn gated_run<S: Fields>(
                 let swaps = stepper.subst(i + 1);
                 stepper.plan().replay(&swaps, Some(&args[k]))?;
                 let uniform = [i as u32, words, max_steps as u32, 0];
-                let resolved: Vec<wgpu::Buffer> = rec_pins
+                let resolved: Vec<Buffer> = rec_pins
                     .iter()
                     .map(|pin| {
                         let buffer = pin.buffer();

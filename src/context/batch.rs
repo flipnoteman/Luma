@@ -1,17 +1,12 @@
-//! The batch of commands recorded since the last submission, and how it is submitted.
+//! The batch of commands recorded since the last submission, and how it is submitted. The commands
+//! themselves are the backend's: it keeps the open pass, the bind state and the uniform slots.
 
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, MutexGuard};
-
-use wgpu::{BindGroupEntry, BindingResource, Buffer, BufferBinding};
+use luma_core::{Buffer, Dispatch, ExecGraph};
 
 use crate::error::{LumaError, Result};
-use crate::gpu::hash::{FxHasher, FxMap};
 use crate::kernel::KernelCore;
-use crate::profile::Profiler;
 
-use super::uniforms::{slot_size, Arena, Chunk, UNIFORM_PREFIX};
-use super::{lock, Context};
+use super::{lock, Context, RawArg};
 
 /// Number of pending dispatches up to which [`Context::submit`] holds the batch back while the
 /// GPU is busy. Each `queue.submit` costs the host 20-35 us and leaves a gap of 20-27 us on the
@@ -30,132 +25,9 @@ pub(super) fn postpone(busy: bool, dispatches: u32, pressure: bool) -> bool {
 /// point. Bounds how much work piles up in one command buffer.
 pub(super) const BATCH_LIMIT: u32 = 256;
 
-/// Bind groups cached per context before the cache is emptied (at the next flush).
-const MAX_CACHED_BIND_GROUPS: usize = 2048;
-
-/// Problem sizes whose grid uniform slot is remembered within a batch, so that launches with a
-/// size seen before share its slot (and its bind group) instead of writing a new one.
-const MAX_GRID_SLOTS: usize = 16;
-
-/// One argument of a kernel launch, already validated: what to bind at `@group(1)` in order.
-#[derive(Clone, Copy)]
-pub(crate) enum RawArg<'a> {
-    /// The first `bytes` bytes of a storage buffer.
-    Storage { buffer: &'a Buffer, bytes: u64, writable: bool },
-    /// A uniform value, copied at launch time.
-    Uniform(&'a [u8]),
-}
-
-impl<'a> RawArg<'a> {
-    pub(crate) fn read(buffer: &'a Buffer, bytes: u64) -> Self {
-        RawArg::Storage { buffer, bytes, writable: false }
-    }
-
-    pub(crate) fn write(buffer: &'a Buffer, bytes: u64) -> Self {
-        RawArg::Storage { buffer, bytes, writable: true }
-    }
-
-    /// What is bound: a buffer and how many of its bytes. Uniforms live in `uniforms`, the arena
-    /// chunk this launch's uniform slots were allocated from.
-    fn binding(&self, uniforms: &'a Buffer) -> (&'a Buffer, u64) {
-        match *self {
-            RawArg::Storage { buffer, bytes, .. } => (buffer, bytes),
-            RawArg::Uniform(data) => (uniforms, data.len() as u64),
-        }
-    }
-}
-
-/// A bind group of `@group(1)` and what it was created for.
-#[derive(Debug)]
-struct CachedGroup {
-    kernel: u64,
-    /// What is bound, in binding order. Uniforms are identified by their arena chunk (the slot
-    /// is a dynamic offset). Holding the buffers keeps them alive as long as the group is cached,
-    /// so a buffer's identity cannot be reused by another one.
-    entries: Box<[(Buffer, u64)]>,
-    group: wgpu::BindGroup,
-}
-
-impl CachedGroup {
-    fn matches<'a>(&self, kernel: u64, mut entries: impl Iterator<Item = (&'a Buffer, u64)>) -> bool {
-        self.kernel == kernel
-            && self.entries.iter().all(|(a, a_bytes)| entries.next().is_some_and(|(b, b_bytes)| a == b && *a_bytes == b_bytes))
-            && entries.next().is_none()
-    }
-}
-
-/// Bind groups of `@group(1)` by (kernel, bound buffers). Looked up with a hash computed from
-/// borrowed handles, so a hit allocates and clones nothing.
-#[derive(Debug, Default)]
-pub(super) struct BindGroupCache {
-    buckets: FxMap<u64, Vec<CachedGroup>>,
-    len: usize,
-}
-
-impl BindGroupCache {
-    /// Drops the groups binding any of `buffers`, so that the cache does not keep them alive.
-    /// Invalidates indices into buckets: only call it while nothing is bound.
-    pub(super) fn forget(&mut self, buffers: &[Buffer]) {
-        self.buckets.retain(|_, bucket| {
-            bucket.retain(|group| !group.entries.iter().any(|(b, _)| buffers.contains(b)));
-            !bucket.is_empty()
-        });
-        self.len = self.buckets.values().map(Vec::len).sum();
-    }
-}
-
-/// What the open compute pass has bound; launches skip what is already in place.
-#[derive(Debug, Default, Clone, Copy)]
-pub(super) struct Bound {
-    /// The kernel whose pipeline is set.
-    kernel: Option<u64>,
-    /// The grid uniform at `@group(0)`: arena chunk epoch and slot offset.
-    grid: Option<(u64, u32)>,
-    /// The bind group at `@group(1)`: bucket hash and index in it.
-    args: Option<(u64, usize)>,
-}
-
-/// The staging buffer the first [`UNIFORM_PREFIX`] bytes of a chunk are copied out of ahead of
-/// the batch's first dispatch, and the chunk's arena epoch.
-#[derive(Debug)]
-pub(super) struct Prefix {
-    pub(super) staging: Buffer,
-    pub(super) epoch: u64,
-}
-
-/// The commands recorded since the last submission.
-#[derive(Debug)]
-pub(super) struct Batch {
-    /// The compute pass consecutive launches are recorded into (one pass per batch instead of
-    /// one per launch). Commands that need the encoder itself end it first. Declared before the
-    /// encoder so that it is dropped (ended) first.
-    pub(super) pass: Option<wgpu::ComputePass<'static>>,
-    pub(super) encoder: Option<wgpu::CommandEncoder>,
-    /// Present once the batch has a dispatch and a staging buffer was available for [`Prefix`].
-    pub(super) prefix: Option<Prefix>,
-    pub(super) bound: Bound,
-    pub(super) dispatches: u32,
-    pub(super) arena: Arena,
-    /// Slots of the grid uniform written to `arena.current` in this batch, by problem size.
-    pub(super) grid_slots: Vec<([u32; 3], u32)>,
-    pub(super) bind_groups: BindGroupCache,
-    /// Dynamic offsets of the launch being recorded (kept to reuse its allocation).
-    pub(super) offsets: Vec<u32>,
-    /// Upload staging buffers copied from in this batch; mapped again once it is submitted.
-    pub(super) uploads: Vec<Buffer>,
-    /// Present while profiling is enabled.
-    pub(super) profiler: Option<Profiler>,
-}
-
-/// Size of the `luma` grid uniform in bytes (`LumaGrid`).
-const GRID_BYTES: u64 = 16;
-
-fn dynamic_offset(offset: u64) -> Result<u32> {
-    u32::try_from(offset).map_err(|_| LumaError::Gpu("uniform arena offset exceeds u32".into()))
-}
-
-/// A buffer bound twice to one launch, with at least one writable binding, is a wgpu validation
-/// error (usage conflict). Arrays sharing a buffer through `reshape` make that reachable.
+/// A buffer bound twice to one launch, with at least one writable binding, is a validation
+/// error on some backends (usage conflict) and a data race on the others. Arrays sharing a
+/// buffer through `reshape` make that reachable.
 fn check_aliasing(args: &[RawArg<'_>]) -> Result<()> {
     for (second, arg) in args.iter().enumerate() {
         let RawArg::Storage { buffer, writable, .. } = arg else { continue };
@@ -171,12 +43,6 @@ fn check_aliasing(args: &[RawArg<'_>]) -> Result<()> {
     Ok(())
 }
 
-/// How a launch gets its workgroup counts: given, or read from a buffer when the dispatch runs.
-enum Dispatch<'a> {
-    Direct([u32; 3]),
-    Indirect(&'a Buffer, u64),
-}
-
 impl Context {
     /// `true` while earlier submissions are still running on the GPU. A failed poll counts as
     /// idle, so that the submission goes ahead and the waiting paths report the error.
@@ -185,7 +51,7 @@ impl Context {
         if self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) {
             return true;
         }
-        matches!(self.device().poll(wgpu::PollType::Poll), Ok(status) if !status.is_queue_empty())
+        self.hal().gpu_busy()
     }
 
     /// Makes [`Context::submit`] and [`Context::submit_requested`] behave as if earlier
@@ -206,27 +72,17 @@ impl Context {
     /// two kernels. The held-back dispatches go out with the next call that submits,
     /// [`Context::flush`], anything that waits, or the batch limit.
     pub(crate) fn submit(&self) -> Result<()> {
-        // Looked at without the lock of the batch: a thread that holds back does not wait for the
+        // Looked at without anything held: a thread that holds back does not wait for the
         // ones that record or submit. One that submits in between only makes this flush a small batch.
-        if self.dispatches_pending() < SUBMIT_HOLD && self.gpu_busy() {
+        if self.hal().pending_dispatches() < SUBMIT_HOLD && self.gpu_busy() {
             return Ok(());
         }
-        let mut batch = self.batch()?;
-        self.flush_locked(&mut batch);
-        Ok(())
-    }
-
-    /// Dispatches recorded but not yet submitted, read without taking the lock of the batch (it
-    /// may be a moment out of date).
-    fn dispatches_pending(&self) -> u32 {
-        self.inner.dispatches_pending.load(std::sync::atomic::Ordering::Relaxed)
+        self.flush_batch()
     }
 
     /// Submits the pending batch now, busy GPU or not.
     pub(crate) fn submit_now(&self) -> Result<()> {
-        let mut batch = self.batch()?;
-        self.flush_locked(&mut batch);
-        Ok(())
+        self.flush_batch()
     }
 
     /// Like [`Context::submit`], but first computes what `eval` requested. While the GPU is busy
@@ -234,128 +90,55 @@ impl Context {
     /// computed and the steps between two submissions fuse. Postponing stops once resident data
     /// reaches three quarters of the memory budget.
     pub(crate) fn submit_requested(&self) -> Result<()> {
-        if postpone(self.gpu_busy(), self.dispatches_pending(), self.pager().under_pressure())
+        if postpone(self.gpu_busy(), self.hal().pending_dispatches(), self.pager().under_pressure())
             && !self.jit().requested_stencil_chain()
         {
             return Ok(());
         }
         self.jit().evaluate_requested();
-        let mut batch = self.batch()?;
-        self.flush_locked(&mut batch);
-        Ok(())
+        self.flush_batch()
     }
 
     /// Number of dispatches recorded but not yet submitted.
     #[cfg(test)]
     pub(crate) fn pending_dispatches(&self) -> u32 {
-        self.batch().map(|b| b.dispatches).unwrap_or(0)
+        self.hal().pending_dispatches()
     }
 
-    pub(super) fn take_gpu_error(&self) -> Result<()> {
-        match lock(&self.inner.gpu_error).take() {
-            Some(message) => Err(LumaError::Gpu(message)),
-            None => Ok(()),
+    /// Tells the backend which buffers the pool let go of, so that it drops what it caches for
+    /// them (the bind groups pinning them) with the next submission.
+    pub(super) fn notify_released(&self) {
+        let released = std::mem::take(&mut *lock(&self.inner.released));
+        if !released.is_empty() {
+            self.hal().notify_released(&released);
         }
-    }
-
-    pub(super) fn batch(&self) -> Result<MutexGuard<'_, Batch>> {
-        self.inner.batch.lock().map_err(|_| LumaError::LockPoisoned)
+        // Dropped only now: the buffers are freed once the backend let go of them.
+        drop(released);
     }
 
     /// Submits the pending batch (if there is one) and prepares the next. Never waits.
-    pub(super) fn flush_locked(&self, batch: &mut Batch) -> Option<wgpu::SubmissionIndex> {
-        // The open pass has to end before the encoder can be finished.
-        batch.pass = None;
-        batch.bound = Bound::default();
-        batch.dispatches = 0;
-        self.inner.dispatches_pending.store(0, std::sync::atomic::Ordering::Relaxed);
-        // The slots of the arena are reused by the next batch.
-        batch.grid_slots.clear();
-        let mut released = std::mem::take(&mut *lock(&self.inner.released));
-        let prefix = batch.prefix.take();
-        let uniforms = batch.arena.upload(self, prefix, &mut batch.uploads, &mut released);
-        if batch.bind_groups.len > MAX_CACHED_BIND_GROUPS {
-            // In-flight work keeps what it uses alive; this only drops our references.
-            batch.bind_groups = BindGroupCache::default();
-        } else if !released.is_empty() {
-            batch.bind_groups.forget(&released);
+    pub(super) fn flush_batch(&self) -> Result<()> {
+        let released = std::mem::take(&mut *lock(&self.inner.released));
+        if !released.is_empty() {
+            self.hal().notify_released(&released);
         }
-        // Everything recorded that uses these buffers is in the batch submitted below.
-        let unmapped = std::mem::take(&mut *lock(&self.inner.unmapped));
-        // The uniform copies go first: the batch's dispatches read what they write.
-        let commands = batch.encoder.take().map(|encoder| encoder.finish());
-        let submission = (uniforms.is_some() || commands.is_some())
-            .then(|| self.queue().submit(uniforms.into_iter().chain(commands)));
-        for staging in batch.uploads.drain(..) {
-            let free = Arc::clone(&self.inner.uploads);
-            let buffer = staging.clone();
-            staging.slice(..).map_async(wgpu::MapMode::Write, move |result| {
-                let mut free = lock(&free);
-                free.in_flight = free.in_flight.saturating_sub(buffer.size());
-                if result.is_ok() {
-                    free.put(buffer);
-                }
-            });
-        }
-        for storage in unmapped {
-            let free = Arc::clone(&self.inner.mappable);
-            let released = Arc::clone(&self.inner.released);
-            let buffer = storage.clone();
-            storage.slice(..).map_async(wgpu::MapMode::Write, move |result| {
-                let dropped = {
-                    let mut free = lock(&free);
-                    free.in_flight = free.in_flight.saturating_sub(buffer.size());
-                    if result.is_ok() { free.put(buffer) } else { None }
-                };
-                if let Some(dropped) = dropped {
-                    lock(&released).push(dropped);
-                }
-            });
-        }
-        submission
-    }
-
-    fn new_encoder(&self) -> wgpu::CommandEncoder {
-        self.device().create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma batch") })
-    }
-
-    /// Records copying the first [`UNIFORM_PREFIX`] bytes of the uniform chunk `chunk` (started in
-    /// arena epoch `epoch`) out of a staging buffer that [`Arena::upload`] fills when the batch is
-    /// submitted, so that the slots of a small batch need no command buffer of their own. Must
-    /// be recorded before the batch's first dispatch. Without a staging buffer (the device is
-    /// out of memory) everything goes through that separate buffer.
-    fn copy_prefix(&self, encoder: &mut wgpu::CommandEncoder, prefix: &mut Option<Prefix>, chunk: &Buffer, epoch: u64) {
-        if let Some(staging) = self.mapped_staging(UNIFORM_PREFIX) {
-            lock(&self.inner.uploads).in_flight += staging.size();
-            encoder.copy_buffer_to_buffer(&staging, 0, chunk, 0, UNIFORM_PREFIX);
-            *prefix = Some(Prefix { staging, epoch });
-        }
+        let flushed = self.hal().flush_batch();
+        // Everything recorded that uses these buffers is in the batch submitted above.
+        drop(released);
+        Ok(flushed?)
     }
 
     /// Records zeroing the first `bytes` bytes of `buffer`.
     pub(crate) fn clear(&self, buffer: &Buffer, bytes: u64) -> Result<()> {
         self.abort_recording()?;
-        let mut guard = self.batch()?;
-        self.encoder(&mut guard).clear_buffer(buffer, 0, Some(bytes));
-        Ok(())
+        Ok(self.hal().record_clear(buffer, bytes)?)
     }
 
     /// Records copying `bytes` bytes from `src` at `src_offset` to `dst` at `dst_offset`, for
     /// gathering the partial results of several segments into one buffer.
     pub(crate) fn copy(&self, src: &Buffer, src_offset: u64, dst: &Buffer, dst_offset: u64, bytes: u64) -> Result<()> {
         self.abort_recording()?;
-        let mut guard = self.batch()?;
-        self.encoder(&mut guard).copy_buffer_to_buffer(src, src_offset, dst, dst_offset, bytes);
-        Ok(())
-    }
-
-    /// The batch's command encoder, for commands that are not dispatches. The open compute pass
-    /// (which borrows the encoder) ends first, so the commands recorded here run after the
-    /// launches recorded before and before those recorded after.
-    pub(super) fn encoder<'a>(&self, batch: &'a mut Batch) -> &'a mut wgpu::CommandEncoder {
-        batch.pass = None;
-        batch.bound = Bound::default();
-        batch.encoder.get_or_insert_with(|| self.new_encoder())
+        Ok(self.hal().record_copy(src, src_offset, dst, dst_offset, bytes)?)
     }
 
     /// Records a dispatch of `kernel` and returns without waiting for it.
@@ -371,219 +154,56 @@ impl Context {
     ) -> Result<()> {
         check_aliasing(args)?;
         kernel.check_count(args.len())?;
+        kernel.check_kinds(args)?;
         if self.capture(kernel, workgroups, size, args) {
             return Ok(());
         }
-        let mut guard = self.batch()?;
-        self.record_launch(&mut guard, kernel, Dispatch::Direct(workgroups), size, args)?;
-        if guard.dispatches >= BATCH_LIMIT {
-            self.flush_locked(&mut guard);
+        let pending = self.hal().record_launch(kernel, Dispatch::Direct(workgroups), size, args)?;
+        if pending >= BATCH_LIMIT {
+            self.flush_batch()?;
         }
         Ok(())
     }
 
     /// Like [`Context::launch`], but the workgroup counts are the three words of `args` at byte
-    /// `offset`, read when the dispatch runs; `args` needs `BufferUsages::INDIRECT`.
+    /// `offset`, read when the dispatch runs; `args` needs `BufferUsage::INDIRECT`.
+    /// `max_workgroups` bounds those counts (for backends that size the grid up front).
     pub(crate) fn launch_indirect(
         &self,
         kernel: &KernelCore,
         args: &Buffer,
         offset: u64,
         size: [u32; 3],
+        max_workgroups: [u32; 3],
         raw: &[RawArg<'_>],
     ) -> Result<()> {
         check_aliasing(raw)?;
         self.abort_recording()?;
+        kernel.check_count(raw.len())?;
+        kernel.check_kinds(raw)?;
 
-        let mut guard = self.batch()?;
-        self.record_launch(&mut guard, kernel, Dispatch::Indirect(args, offset), size, raw)?;
-        if guard.dispatches >= BATCH_LIMIT {
-            self.flush_locked(&mut guard);
+        let dispatch = Dispatch::Indirect { buffer: args, offset, max_workgroups };
+        let pending = self.hal().record_launch(kernel, dispatch, size, raw)?;
+        if pending >= BATCH_LIMIT {
+            self.flush_batch()?;
         }
         Ok(())
     }
+}
 
-    /// Submits the pending batch, waits for the GPU to finish it and resolves the timestamps of
-    /// the profiler's query sets into its profile, releasing the sets. Called with the batch
-    /// locked, so it waits on the device directly instead of through [`Context::sync`].
-    fn drain_timestamps(&self, batch: &mut Batch) -> Result<()> {
-        self.flush_locked(batch);
-        self.device().poll(wgpu::PollType::wait_indefinitely()).map_err(|e| LumaError::Poll(Arc::new(e)))?;
-        self.take_gpu_error()?;
-        match batch.profiler.as_mut() {
-            Some(profiler) => self.read_timestamps(profiler),
-            None => Ok(()),
-        }
+impl Context {
+    /// Whether GPU timing is enabled; profiled launches must run one by one, not as a graph.
+    pub(crate) fn is_profiling(&self) -> bool {
+        self.hal().is_profiling().unwrap_or(false)
     }
 
-    /// The body of [`Context::launch`]: allocates the arena slots, finds or creates the bind
-    /// group, and records the dispatch. After the first launch of a kernel with a given set of
-    /// buffers this allocates nothing.
-    fn record_launch(
-        &self,
-        batch: &mut Batch,
-        kernel: &KernelCore,
-        dispatch: Dispatch<'_>,
-        size: [u32; 3],
-        args: &[RawArg<'_>],
-    ) -> Result<()> {
-        // Before the launch may open a query set past the profiler's limit of live sets.
-        if batch.profiler.as_ref().is_some_and(Profiler::at_capacity) {
-            self.drain_timestamps(batch)?;
+    /// Records a replay of a captured `graph` counting as `dispatches` dispatches.
+    pub(crate) fn launch_graph(&self, graph: &dyn ExecGraph, dispatches: u32) -> Result<()> {
+        self.abort_recording()?;
+        let pending = self.hal().record_graph(graph, dispatches)?;
+        if pending >= BATCH_LIMIT {
+            self.flush_batch()?;
         }
-        let inner = &*self.inner;
-        let device = self.device();
-        let align = inner.uniform_align;
-        let Batch { encoder, prefix, pass, bound, dispatches, arena, grid_slots, bind_groups, offsets, profiler, .. } =
-            batch;
-
-        // Before anything is allocated or recorded: a launch that does not fit the kernel is an
-        // error of its caller, not of the batch.
-        kernel.check_count(args.len())?;
-
-        // Uniform values go into fresh arena slots, all of this launch's in one chunk. The grid
-        // uniform shares the slot of an earlier launch of the same size.
-        let uniform_bytes: u64 = kernel
-            .bound(args)
-            .map(|(_, arg)| match arg {
-                RawArg::Uniform(data) => slot_size(align, data.len()),
-                RawArg::Storage { .. } => 0,
-            })
-            .sum();
-        let grid_bytes = slot_size(align, GRID_BYTES as usize);
-        let mut grid_offset =
-            grid_slots.iter().find(|(known, _)| *known == size).map(|&(_, offset)| offset);
-        let needed = uniform_bytes + if grid_offset.is_some() { 0 } else { grid_bytes };
-        if !arena.has_room(needed) {
-            arena.roll(device, uniform_bytes + grid_bytes);
-            // The remembered slots belong to the chunk that was left.
-            grid_slots.clear();
-            grid_offset = None;
-        }
-        let grid_offset = match grid_offset {
-            Some(offset) => offset,
-            None => {
-                let offset = dynamic_offset(
-                    arena.push(align, bytemuck::bytes_of(&[size[0], size[1], size[2], 0u32])),
-                )?;
-                if grid_slots.len() < MAX_GRID_SLOTS {
-                    grid_slots.push((size, offset));
-                }
-                offset
-            }
-        };
-        offsets.clear();
-        for (_, arg) in kernel.bound(args) {
-            if let RawArg::Uniform(data) = arg {
-                offsets.push(dynamic_offset(arena.push(align, data))?);
-            }
-        }
-
-        // Bind groups: the grid's per chunk, the arguments' per (kernel, buffers).
-        let Chunk { buffer: uniforms, grid_group, .. } = &mut arena.current;
-        let uniforms: &Buffer = uniforms;
-        let grid_group = &*grid_group.get_or_insert_with(|| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &inner.grid_layout,
-                entries: &[BindGroupEntry {
-                    binding: 0,
-                    resource: BindingResource::Buffer(BufferBinding {
-                        buffer: uniforms,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(GRID_BYTES),
-                    }),
-                }],
-            })
-        });
-
-        let bindings = || kernel.bound(args).map(|(_, arg)| arg.binding(uniforms));
-        let mut hasher = FxHasher::default();
-        kernel.id.hash(&mut hasher);
-        for (buffer, bytes) in bindings() {
-            buffer.hash(&mut hasher);
-            bytes.hash(&mut hasher);
-        }
-        let key = hasher.finish();
-        let bucket = bind_groups.buckets.entry(key).or_default();
-        let index = match bucket.iter().position(|cached| cached.matches(kernel.id, bindings())) {
-            Some(index) => index,
-            None => {
-                kernel.check_kinds(args)?;
-                let group_entries: Vec<BindGroupEntry<'_>> = kernel
-                    .bound(args)
-                    .map(|(binding, arg)| {
-                        let (buffer, bytes) = arg.binding(uniforms);
-                        BindGroupEntry {
-                            binding,
-                            resource: BindingResource::Buffer(BufferBinding {
-                                buffer,
-                                offset: 0,
-                                size: std::num::NonZeroU64::new(bytes),
-                            }),
-                        }
-                    })
-                    .collect();
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &kernel.args_layout,
-                    entries: &group_entries,
-                });
-                bucket.push(CachedGroup {
-                    kernel: kernel.id,
-                    entries: bindings().map(|(buffer, bytes)| (buffer.clone(), bytes)).collect(),
-                    group,
-                });
-                bind_groups.len += 1;
-                bucket.len().saturating_sub(1)
-            }
-        };
-        let Some(args_group) = bucket.get(index).map(|cached| &cached.group) else {
-            return Err(LumaError::Gpu("bind group cache entry vanished".into()));
-        };
-
-        // Record. Launches share one compute pass; a profiled launch gets a pass of its own that
-        // carries the timestamp writes.
-        let profiled = profiler.is_some();
-        if profiled {
-            *pass = None;
-        }
-        let encoder = encoder.get_or_insert_with(|| self.new_encoder());
-        if *dispatches == 0 && prefix.is_none() {
-            self.copy_prefix(encoder, prefix, uniforms, arena.epoch);
-        }
-        let pass_slot = pass;
-        let pass = pass_slot.get_or_insert_with(|| {
-            *bound = Bound::default();
-            let timestamp_writes = profiler.as_mut().map(|p| p.writes(device, &kernel.label));
-            encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes })
-                .forget_lifetime()
-        });
-        if bound.kernel != Some(kernel.id) {
-            pass.set_pipeline(&kernel.pipeline);
-            bound.kernel = Some(kernel.id);
-            bound.args = None;
-        }
-        let grid = Some((arena.epoch, grid_offset));
-        if bound.grid != grid {
-            pass.set_bind_group(0, grid_group, &[grid_offset]);
-            bound.grid = grid;
-        }
-        // A group with uniforms is bound at new dynamic offsets by every launch.
-        if !offsets.is_empty() || bound.args != Some((key, index)) {
-            pass.set_bind_group(1, args_group, offsets.as_slice());
-            bound.args = Some((key, index));
-        }
-        match dispatch {
-            Dispatch::Direct([x, y, z]) => pass.dispatch_workgroups(x, y, z),
-            Dispatch::Indirect(buffer, offset) => pass.dispatch_workgroups_indirect(buffer, offset),
-        }
-        if profiled {
-            *pass_slot = None;
-        }
-        *dispatches += 1;
-        inner.dispatches_pending.store(*dispatches, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }

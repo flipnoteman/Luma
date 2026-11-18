@@ -178,7 +178,7 @@ pub(crate) struct FusedKey {
     /// and `launch::run_mapped`).
     pub(crate) in_place: Vec<(u32, u32)>,
     /// Set by `launch::run_mapped` like `in_place`: the region write with `bool` outputs runs
-    /// as the kernel of `codegen::runs_main`, which builds the words of the runs of consecutive
+    /// as the kernel of `kirgen::Build::runs`, which builds the words of the runs of consecutive
     /// elements the region is made of (the uniform has their length and the words they span).
     pub(crate) runs: bool,
     /// Per input, how many segments of it the program reads through shifts (0 = never): the
@@ -224,7 +224,7 @@ pub(super) fn calls_df_math(instr: &Instr) -> bool {
 /// Whether `instr` reads the guard uniform: the arithmetic and the casts, whose error-free
 /// transformations go through `luma_o`, and the tests of the class of a value. Ordering, minimum,
 /// maximum and absolute value never call it: nothing there can be reassociated away. Nor does the
-/// conversion of a `bool` to a `Df32` (see `codegen::cast`): the value is exact, there is nothing
+/// conversion of a `bool` to a `Df32` (see `kirgen::Lower::cast`): the value is exact, there is nothing
 /// to hide. The kernel binds the guard exactly when a function it calls reads it (a uniform no
 /// code reads has no binding), so this must agree with the generated WGSL.
 pub(super) fn reads_guard(instr: &Instr) -> bool {
@@ -271,7 +271,7 @@ impl FusedKey {
     }
 
     /// Whether the program is a store with a `bool` output: the workgroup packs the bits it
-    /// computes into whole words (see `codegen::packed_main`), so the kernel is not tiled or staged.
+    /// computes into whole words (see `kirgen::Build::packed`), so the kernel is not tiled or staged.
     pub(crate) fn writes_bits(&self) -> bool {
         self.tail == Tail::Store
             && self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::Bool))

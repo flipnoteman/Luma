@@ -221,25 +221,6 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
     Ok(out)
 }
 
-/// The kernel summing the partial products of a split product (see [`Builtin::MatmulSum`]).
-pub(crate) fn sum_source(workgroup: u32) -> String {
-    format!(
-        "struct Params {{ s: u32 }}
-@group(1) @binding(0) var<storage, read_write> out: array<f32>;
-@group(1) @binding(1) var<storage, read> part: array<f32>;
-@group(1) @binding(2) var<uniform> p: Params;
-@compute @workgroup_size({workgroup})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {workgroup}u;
-    if (i >= luma.size.x) {{ return; }}
-    var acc = 0.0;
-    for (var z = 0u; z < p.s; z = z + 1u) {{ acc = acc + part[z * luma.size.x + i]; }}
-    out[i] = acc;
-}}
-"
-    )
-}
-
 /// The kernel of [`Builtin::Matmul`]: the operands are the buffers `a` and `b`.
 pub(crate) fn builtin_source(tile: MatmulTile, aligned: bool, split: bool) -> String {
     format!(

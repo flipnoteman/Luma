@@ -150,7 +150,7 @@ pub enum CoopKind {
 
 impl CoopKind {
     pub fn for_context(ctx: &luma::Context) -> Option<CoopKind> {
-        if !ctx.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        if !ctx.features().contains(luma::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             return None;
         }
         match ctx.tuning_profile() {

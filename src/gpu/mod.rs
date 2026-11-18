@@ -1,16 +1,7 @@
 pub(crate) mod built;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub(crate) mod exit;
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub(crate) mod exit {
-    pub(crate) fn driver_call<R>(call: impl FnOnce() -> R) -> R {
-        call()
-    }
-}
-pub(crate) mod cache;
-pub(crate) mod handle;
-mod fma;
+pub(crate) mod fma;
 pub(crate) mod hash;
+pub(crate) mod lower;
 pub(crate) mod pager;
 pub(crate) mod pool;
 

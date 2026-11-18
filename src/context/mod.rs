@@ -1,47 +1,34 @@
-use std::hash::Hash;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
-use wgpu::{Buffer, BufferUsages};
+use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, Profile};
 
-use crate::builtin::Builtin;
+use crate::builtin::{Builtin, BuiltinKernel};
 use crate::error::{LumaError, Result};
-use crate::jit::cost::{self, CostModel};
+use crate::jit::cost;
 use crate::jit::JitState;
 use crate::gpu::pager::Pager;
-use crate::gpu::handle;
 use crate::gpu::built::BuildCache;
+use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
 use crate::gpu::pool::{self, BufferPool};
 use crate::kernel::{self, KernelBuilder, KernelCore, KernelKey};
-use crate::profile::{Profile, Profiler};
 use crate::tuning::{Tuning, TuningProfile};
 
 mod batch;
 mod record;
 mod transfer;
-mod uniforms;
 #[cfg(test)]
 mod tests;
 
-use batch::{Batch, BindGroupCache, Bound};
 pub(crate) use record::{Cmd, CmdArg, Recording};
-pub(crate) use batch::RawArg;
-use transfer::{FreeUploads, WaitHistory};
-use uniforms::Arena;
-pub(crate) use transfer::copy_parallel;
+pub(crate) use luma_core::RawArg;
+use transfer::WaitHistory;
 
 /// Usage of every array storage buffer (and the scratch buffers of multi-pass operations, so they
 /// share a pool class).
-pub(crate) const STORAGE_USAGE: BufferUsages = BufferUsages::STORAGE
-    .union(BufferUsages::COPY_DST)
-    .union(BufferUsages::COPY_SRC);
-
-/// Usage of the buffers uniform values are written into.
-const UNIFORM_USAGE: BufferUsages = BufferUsages::UNIFORM.union(BufferUsages::COPY_DST);
-
-/// Usage of storage buffers the host writes directly (zero-copy uploads).
-const MAPPABLE_STORAGE_USAGE: BufferUsages = STORAGE_USAGE.union(BufferUsages::MAP_WRITE);
+pub(crate) const STORAGE_USAGE: BufferUsage = BufferUsage::STORAGE
+    .union(BufferUsage::COPY_DST)
+    .union(BufferUsage::COPY_SRC);
 
 #[derive(Debug)]
 struct Inner {
@@ -52,13 +39,9 @@ struct Inner {
     /// Custom kernels, built on first use of their (source, entry, workgroup).
     kernels: BuildCache<KernelKey, Arc<KernelCore>>,
     pool: Mutex<BufferPool>,
-    /// Buffers the pool released; the cached bind groups still holding them are dropped at the
+    /// Buffers the pool released; the backend drops what it caches for them (bind groups) at the
     /// next submission, which frees them.
-    released: Arc<Mutex<Vec<Buffer>>>,
-    /// Mapped upload staging buffers, refilled by the map callbacks of submitted ones.
-    uploads: Arc<Mutex<FreeUploads>>,
-    /// Recycled mappable storage buffers (unified memory), mapped again for zero-copy uploads.
-    mappable: Arc<Mutex<FreeUploads>>,
+    released: Mutex<Vec<Buffer>>,
     /// Bytes of a full segment of an array, see [`Storage`](crate::array::Storage).
     segment_bytes: u64,
     /// Whether results are checked for NaN and Inf (see [`ContextOptions::check_finite`]).
@@ -67,52 +50,29 @@ struct Inner {
     fast_math: bool,
     /// Which segments of arrays hold a device buffer.
     pager: Pager,
-    /// Recycled mappable storage buffers waiting for the next submission before they are mapped.
-    unmapped: Mutex<Vec<Buffer>>,
     /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
     zero_copy: bool,
     /// Kernel parameters for this GPU.
     tuning: Tuning,
     /// What launches, memory traffic and arithmetic cost on this GPU, set once the context exists.
     cost: OnceLock<CostModel>,
-    batch: Mutex<Batch>,
-    /// `Batch::dispatches`, kept where threads that only decide whether to submit can read it
-    /// without the lock of the batch.
-    dispatches_pending: std::sync::atomic::AtomicU32,
     /// Tells this context from the others of the process (the recordings of a thread are kept by it, see [`record`]).
     id: u64,
     /// How long recent waits took, which sets how long the next one polls before it blocks.
     waits: WaitHistory,
-    /// The first error the GPU reported outside of a call that could return it.
-    gpu_error: Arc<Mutex<Option<String>>>,
     /// Tests: report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
     #[cfg(test)]
     assume_busy: std::sync::atomic::AtomicBool,
-    /// Layout of `@group(0)`: the grid uniform, at a dynamic offset into the arena.
-    grid_layout: wgpu::BindGroupLayout,
     /// Largest buffer that can be allocated *and* bound as a storage buffer.
     max_buffer_bytes: u64,
     max_uniform_bytes: u64,
-    uniform_align: u64,
     max_workgroups_per_dimension: u32,
-    max_dynamic_uniforms: u32,
     /// Whether the device was opened with timestamp queries (see [`Context::profile`]).
     timestamps: bool,
-    /// The leased GPU device. Must stay the last field: fields drop in declaration order, and the
-    /// lease hands the device to the next context, which must only happen once everything of
-    /// this one (open pass and encoder, buffer pools, bind groups, kernels) is gone.
-    gpu: Lease,
-}
-
-/// A [`Gpu`](handle::Gpu) borrowed from the process-wide pool; returned to it when dropped.
-/// The device is never destroyed, see [`handle`].
-#[derive(Debug)]
-struct Lease(handle::Gpu);
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        handle::release(self.0.clone());
-    }
+    /// The device. Must stay the last field: fields drop in declaration order, and the backend
+    /// hands its device to the next context, which must only happen once everything of this one
+    /// (buffer pools, kernels) is gone.
+    backend: Box<dyn Backend>,
 }
 
 /// Handle to a GPU device and everything needed to run work on it: compiled kernels, a pool of
@@ -125,6 +85,9 @@ impl Drop for Lease {
 /// combined with arrays of the same
 /// context. Most programs never create one: [`default_context`] opens the GPU on first use and
 /// the constructors without an `_on` suffix use it.
+///
+/// A context runs on one backend: NVIDIA CUDA, Apple Metal or WebGPU through wgpu (see
+/// [`BackendKind`]; [`Context::backend`] says which).
 ///
 /// # Batching
 ///
@@ -176,23 +139,13 @@ pub fn flush() -> Result<()> {
     default_context()?.flush()
 }
 
-/// Which kind of device a [`Context`] runs on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum DeviceKind {
-    /// A GPU if one opens, otherwise the CPU through a software driver. Resolved once per process.
-    #[default]
-    Auto,
-    /// A hardware GPU only; [`LumaError::NoDevice`] if only a software adapter exists.
-    Gpu,
-    /// A software (CPU) adapter such as Mesa llvmpipe.
-    Cpu,
-}
-
 /// How a [`Context`] is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContextOptions {
+    /// The backend to open: CUDA, Metal or wgpu; `Auto` tries them in that order and takes the
+    /// first that has a device.
+    pub backend: BackendKind,
     /// The kind of device to open.
     pub device: DeviceKind,
     /// Bytes of array data kept on the device. `None`: 80% of the device's memory where the
@@ -236,6 +189,7 @@ pub struct ContextOptions {
 impl Default for ContextOptions {
     fn default() -> Self {
         ContextOptions {
+            backend: BackendKind::default(),
             device: DeviceKind::default(),
             memory_budget: None,
             chunk_bytes: None,
@@ -258,6 +212,12 @@ impl ContextOptions {
     /// (`false`) instead of what the device's test says (see [`ContextOptions::df_fma`]).
     pub fn df_fma(mut self, fused: bool) -> Self {
         self.df_fma = Some(fused);
+        self
+    }
+
+    /// Sets the backend to open.
+    pub fn backend(mut self, kind: BackendKind) -> Self {
+        self.backend = kind;
         self
     }
 
@@ -292,19 +252,35 @@ impl ContextOptions {
         self
     }
 
-    /// Options from the environment: `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`),
+    /// Options from the environment: `LUMA_BACKEND` = `cuda` | `metal` | `wgpu` | `auto`;
+    /// `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`), which also takes a backend name
+    /// (`cuda` | `metal` | `wgpu`) when `LUMA_BACKEND` is not set;
     /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
     /// `1` | `on` | `true` for the finite check, `LUMA_FAST_MATH` likewise for
     /// [`ContextOptions::fast_math`], `LUMA_CALIBRATE` = `0` | `off` | `false` to skip
     /// calibration.
     pub fn from_env() -> ContextOptions {
-        let device = match std::env::var("LUMA_DEVICE").ok().as_deref().map(str::trim) {
+        let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_ascii_lowercase());
+        let backend_named = |name: &str| match name {
+            "cuda" => Some(BackendKind::Cuda),
+            "metal" => Some(BackendKind::Metal),
+            "wgpu" => Some(BackendKind::Wgpu),
+            _ => None,
+        };
+        let device_var = var("LUMA_DEVICE");
+        let device = match device_var.as_deref() {
             Some("gpu") => DeviceKind::Gpu,
             Some("cpu") => DeviceKind::Cpu,
             _ => DeviceKind::Auto,
         };
+        let backend = match var("LUMA_BACKEND").as_deref() {
+            Some("auto") => BackendKind::Auto,
+            Some(name) => backend_named(name).unwrap_or_default(),
+            None => device_var.as_deref().and_then(backend_named).unwrap_or_default(),
+        };
         let bytes = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         ContextOptions {
+            backend,
             device,
             memory_budget: bytes("LUMA_MEMORY_BUDGET"),
             chunk_bytes: bytes("LUMA_CHUNK_BYTES"),
@@ -329,17 +305,136 @@ fn pow2_floor(x: u64) -> u64 {
     1 << (63 - x.max(1).leading_zeros())
 }
 
+/// The error of a backend this build has no code for.
+#[allow(dead_code)]
+fn not_built(feature: &str) -> LumaError {
+    LumaError::NoDevice(match feature {
+        "cuda" => "luma was built without the `cuda` feature",
+        "metal" => "luma was built without the `metal` feature",
+        _ => "luma was built without the `wgpu` feature",
+    })
+}
+
+/// Why a CPU device cannot be had from a backend other than wgpu.
+#[cfg(any(feature = "cuda", feature = "metal", not(feature = "wgpu")))]
+const CPU_NEEDS_WGPU: &str = "CPU fallback requires the wgpu backend";
+
+#[cfg(feature = "cuda")]
+fn open_cuda(device: DeviceKind) -> Result<Box<dyn Backend>> {
+    if device == DeviceKind::Cpu {
+        return Err(LumaError::NoDevice(CPU_NEEDS_WGPU));
+    }
+    Ok(luma_cuda::open()?)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn open_cuda(_: DeviceKind) -> Result<Box<dyn Backend>> {
+    Err(not_built("cuda"))
+}
+
+#[cfg(feature = "metal")]
+fn open_metal(device: DeviceKind) -> Result<Box<dyn Backend>> {
+    if device == DeviceKind::Cpu {
+        return Err(LumaError::NoDevice(CPU_NEEDS_WGPU));
+    }
+    Ok(luma_metal::open()?)
+}
+
+#[cfg(not(feature = "metal"))]
+fn open_metal(_: DeviceKind) -> Result<Box<dyn Backend>> {
+    Err(not_built("metal"))
+}
+
+#[cfg(feature = "wgpu")]
+fn open_wgpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
+    Ok(luma_wgpu::open(device)?)
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn open_wgpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
+    if device == DeviceKind::Cpu {
+        return Err(LumaError::NoDevice(CPU_NEEDS_WGPU));
+    }
+    Err(not_built("wgpu"))
+}
+
+/// Opens the backend `backend` names. `Auto` tries CUDA, then Metal, then wgpu and takes the first
+/// that opens (a CPU device only exists through wgpu).
+fn open_backend(backend: BackendKind, device: DeviceKind) -> Result<Box<dyn Backend>> {
+    match backend {
+        BackendKind::Cuda => open_cuda(device),
+        BackendKind::Metal => open_metal(device),
+        BackendKind::Wgpu => open_wgpu(device),
+        BackendKind::Auto => {
+            if device == DeviceKind::Cpu {
+                return open_wgpu(device);
+            }
+            type Open = fn(DeviceKind) -> Result<Box<dyn Backend>>;
+            for (name, open) in [("cuda", open_cuda as Open), ("metal", open_metal as Open)] {
+                match open(device) {
+                    Ok(backend) => return Ok(backend),
+                    Err(error) => log::debug!("luma: the {name} backend is not available: {error}"),
+                }
+            }
+            open_wgpu(device)
+        }
+        _ => Err(LumaError::Unsupported("unknown backend kind".into())),
+    }
+}
+
+/// Whether the `fma` of `backend`'s device is fused: the answer of an earlier process from the
+/// disk cache, else the result of the test kernel (kept for later processes). A test that could
+/// not run says `false` and is not kept. Known once per device and process.
+fn device_fma(backend: &dyn Backend) -> bool {
+    static KNOWN: Mutex<Option<FxMap<String, bool>>> = Mutex::new(None);
+    let disk = backend.disk_cache();
+    if let Some(&known) = lock(&KNOWN).as_ref().and_then(|known| known.get(disk.key())) {
+        return known;
+    }
+    let found = disk.load_fma().or_else(|| {
+        let fused = crate::gpu::fma::probe(backend)?;
+        disk.store_fma(fused);
+        Some(fused)
+    });
+    if let Some(fused) = found {
+        lock(&KNOWN).get_or_insert_with(FxMap::default).insert(disk.key().to_owned(), fused);
+    }
+    found.unwrap_or(false)
+}
+
 impl Context {
-    /// Opens the device chosen by `LUMA_DEVICE` (`gpu` | `cpu`; by default the high-performance
-    /// GPU, or the CPU through a software driver such as Mesa llvmpipe when no GPU exists).
-    /// Blocks until the device is ready.
+    /// Opens the device chosen by `LUMA_BACKEND` (`cuda` | `metal` | `wgpu` | `auto`) and
+    /// `LUMA_DEVICE` (`gpu` | `cpu`; by default the first available of CUDA, Metal and the
+    /// high-performance wgpu GPU, or the CPU through a software driver such as Mesa llvmpipe when
+    /// no GPU exists). Blocks until the device is ready.
     pub fn new() -> Result<Context> {
         Context::with_options(ContextOptions::from_env())
     }
 
-    /// Opens a software (CPU) device, for example Mesa llvmpipe, whatever GPUs exist.
+    /// Opens a software (CPU) device, for example Mesa llvmpipe, whatever GPUs exist. Only the
+    /// wgpu backend has one.
     pub fn cpu() -> Result<Context> {
-        Context::with_options(ContextOptions { device: DeviceKind::Cpu, ..ContextOptions::from_env() })
+        Context::with_options(ContextOptions { backend: BackendKind::Wgpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() })
+    }
+
+    /// Opens a device of the CUDA backend (NVIDIA GPUs).
+    pub fn cuda() -> Result<Context> {
+        Context::with_options(ContextOptions { backend: BackendKind::Cuda, ..ContextOptions::from_env() })
+    }
+
+    /// Opens a device of the Metal backend (Apple GPUs).
+    pub fn metal() -> Result<Context> {
+        Context::with_options(ContextOptions { backend: BackendKind::Metal, ..ContextOptions::from_env() })
+    }
+
+    /// Opens a device of the wgpu backend (Vulkan, Metal, DX12 through WebGPU).
+    pub fn wgpu() -> Result<Context> {
+        Context::with_options(ContextOptions { backend: BackendKind::Wgpu, ..ContextOptions::from_env() })
+    }
+
+    /// The backend this context runs on.
+    pub fn backend(&self) -> BackendKind {
+        self.inner.backend.info().backend
     }
 
     /// Whether value-changing algebraic rewrites are allowed.
@@ -349,22 +444,19 @@ impl Context {
 
     /// Whether this context runs on a software (CPU) device.
     pub fn is_cpu(&self) -> bool {
-        self.inner.gpu.0.cpu
+        self.inner.backend.info().cpu
     }
 
     /// Opens a device as `options` say, without looking at the environment. Blocks until the
     /// device is ready.
     pub fn with_options(options: ContextOptions) -> Result<Context> {
-        // Leased at once: an early `Err` below must return the device to the pool, not destroy it.
-        let gpu = Lease(handle::acquire(options.device)?);
-        let device = gpu.0.device.clone();
-        let limits = device.limits();
-        let max_buffer_bytes = limits
-            .max_buffer_size
-            .min(limits.max_storage_buffer_binding_size);
+        let backend = open_backend(options.backend, options.device)?;
+        let info = backend.info();
+        let limits = info.limits;
+        let max_buffer_bytes = limits.max_buffer_bytes;
         let limit = pow2_floor(max_buffer_bytes & !3); // largest power of two <= the bindable size
         // 80% of the device's memory, except on CPU devices, whose "device memory" is host RAM.
-        let budget = options.memory_budget.or(if gpu.0.cpu { None } else { gpu.0.memory.map(|m| m / 5 * 4) });
+        let budget = options.memory_budget.or(if info.cpu { None } else { info.memory_bytes.map(|m| m / 5 * 4) });
         let segment_bytes = match options.chunk_bytes {
             Some(b) if b.is_power_of_two() && (1024..=limit).contains(&b) => b,
             Some(b) => {
@@ -380,85 +472,46 @@ impl Context {
         // allocating them again, which costs about as much as writing them ten times over.
         let cap = budget.map_or(1 << 30, |b| b / 2);
 
-        // wgpu panics on errors nobody handles. Record the first one instead and report it as an
-        // `Err` at the next synchronization point.
-        let gpu_error = Arc::new(Mutex::new(None));
-        let sink = Arc::clone(&gpu_error);
-        // Registered for every context: it replaces the previous owner's handler, so a reused device reports errors to its current context only.
-        device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
-            lock(&sink).get_or_insert_with(|| error.to_string());
-        }));
-
-        let grid_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("luma grid"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
-        let batch = Batch {
-            pass: None,
-            encoder: None,
-            prefix: None,
-            bound: Bound::default(),
-            dispatches: 0,
-            arena: Arena::new(&device),
-            grid_slots: Vec::new(),
-            bind_groups: BindGroupCache::default(),
-            offsets: Vec::new(),
-            uploads: Vec::new(),
-            profiler: None,
+        // The test of the device's `fma` runs only where the backend does not know the answer
+        // and no earlier process stored it.
+        let mut tuning = Tuning::for_device(info);
+        tuning.df_fma = match options.df_fma {
+            Some(fused) => fused,
+            None => match info.hardware_fma {
+                Some(fused) => fused,
+                None => device_fma(&*backend),
+            },
         };
+        tuning.df_sloppy_add = options.fast_math;
 
         let ctx = Context {
             inner: Arc::new(Inner {
-                max_uniform_bytes: limits.max_uniform_buffer_binding_size,
-                uniform_align: u64::from(limits.min_uniform_buffer_offset_alignment).max(4),
-                max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
-                max_dynamic_uniforms: limits.max_dynamic_uniform_buffers_per_pipeline_layout,
-                timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
-                zero_copy: device.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
-                tuning: {
-                    let mut tuning = Tuning::for_adapter(&gpu.0.adapter, &limits, device.features());
-                    tuning.df_fma = options.df_fma.unwrap_or(gpu.0.df_fma);
-                    tuning.df_sloppy_add = options.fast_math;
-                    tuning
-                },
+                max_uniform_bytes: limits.max_uniform_bytes,
+                max_workgroups_per_dimension: limits.max_workgroups_per_dim,
+                timestamps: info.features.contains(Features::TIMESTAMP_QUERY),
+                zero_copy: info.zero_copy,
+                tuning,
                 cost: OnceLock::new(),
-                gpu,
                 builtins: BuildCache::default(),
                 jit: JitState::new(&limits),
                 kernels: BuildCache::default(),
                 pool: Mutex::new(BufferPool::new(cap)),
-                released: Arc::new(Mutex::new(Vec::new())),
-                uploads: Arc::new(Mutex::new(FreeUploads::new(cap))),
-                mappable: Arc::new(Mutex::new(FreeUploads::new(cap))),
+                released: Mutex::new(Vec::new()),
                 segment_bytes,
                 check_finite: options.check_finite,
                 fast_math: options.fast_math,
                 pager: Pager::new(budget),
-                unmapped: Mutex::new(Vec::new()),
-                batch: Mutex::new(batch),
-                dispatches_pending: std::sync::atomic::AtomicU32::new(0),
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),
-                gpu_error,
                 #[cfg(test)]
                 assume_busy: std::sync::atomic::AtomicBool::new(false),
-                grid_layout,
                 max_buffer_bytes,
+                backend,
             }),
         };
         let profile = ctx.inner.tuning.profile;
         let model = if options.calibrate {
-            *ctx.inner.gpu.0.cost.get_or_init(|| {
+            *ctx.inner.backend.device_cost().get_or_init(|| {
                 // Measured once per machine: a stored result for this device and driver wins,
                 // and only a measurement that does not look contended is stored (see
                 // `cost::contended`); otherwise this process runs on the profile's numbers, and so
@@ -508,7 +561,7 @@ impl Context {
     /// The cost model cell of the device, shared by every context on it (tests).
     #[cfg(test)]
     pub(crate) fn device_cost(&self) -> Arc<OnceLock<CostModel>> {
-        Arc::clone(&self.inner.gpu.0.cost)
+        Arc::clone(self.inner.backend.device_cost())
     }
 
     /// Starts building a custom compute kernel from WGSL source.
@@ -524,33 +577,9 @@ impl Context {
     pub fn sync(&self) -> Result<()> {
         self.abort_recording()?;
         self.flush()?;
-        let start = Instant::now();
-        if !self.spin_until_idle() {
-            self.device()
-                .poll(wgpu::PollType::wait_indefinitely())
-                .map_err(|e| LumaError::Poll(Arc::new(e)))?;
-        }
-        self.inner.waits.record(start.elapsed());
-        self.take_gpu_error()
-    }
-
-    /// Polls without blocking for up to the spin budget ([`WaitHistory`]); `true` once the queue
-    /// is empty. A thread that notices the end of a short kernel while running returns sooner
-    /// than one that was blocked in `poll` and has to be woken up.
-    fn spin_until_idle(&self) -> bool {
-        let deadline = Instant::now() + self.inner.waits.budget();
-        loop {
-            match self.device().poll(wgpu::PollType::Poll) {
-                Ok(status) if status.is_queue_empty() => return true,
-                Ok(_) => {}
-                // The blocking wait reports it.
-                Err(_) => return false,
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::hint::spin_loop();
-        }
+        let waited = self.hal().sync(self.inner.waits.budget())?;
+        self.inner.waits.record(waited);
+        Ok(())
     }
 
     pub(crate) fn jit(&self) -> &JitState {
@@ -590,28 +619,22 @@ impl Context {
     pub fn flush(&self) -> Result<()> {
         self.jit().evaluate_requested();
         self.jit().evaluate_live();
-        let mut batch = self.batch()?;
-        self.flush_locked(&mut batch);
-        Ok(())
+        self.flush_batch()
     }
 
-    pub(crate) fn device(&self) -> &wgpu::Device {
-        &self.inner.gpu.0.device
+    /// The backend the context runs on.
+    pub(crate) fn hal(&self) -> &dyn Backend {
+        &*self.inner.backend
     }
 
-    /// The on-disk cache of the device (pipelines, calibration).
-    pub(crate) fn disk_cache(&self) -> &crate::gpu::cache::DiskCache {
-        &self.inner.gpu.0.disk
+    /// What the backend knows about the device: limits, features, name.
+    pub(crate) fn info(&self) -> &DeviceInfo {
+        self.inner.backend.info()
     }
 
-    /// The adapter the context runs on.
-    #[cfg(test)]
-    pub(crate) fn adapter_info(&self) -> &wgpu::AdapterInfo {
-        &self.inner.gpu.0.adapter
-    }
-
-    pub(crate) fn queue(&self) -> &wgpu::Queue {
-        &self.inner.gpu.0.queue
+    /// The on-disk cache of the device (compiled kernels, calibration).
+    pub(crate) fn disk_cache(&self) -> &luma_core::DiskCache {
+        self.inner.backend.disk_cache()
     }
 
     /// Bytes of a full segment of an array: the largest buffer an array is split into.
@@ -642,14 +665,6 @@ impl Context {
         self.inner.max_uniform_bytes
     }
 
-    pub(crate) fn max_dynamic_uniforms(&self) -> u32 {
-        self.inner.max_dynamic_uniforms
-    }
-
-    pub(crate) fn grid_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.inner.grid_layout
-    }
-
     /// `true` if both handles refer to the same device.
     pub(crate) fn same_as(&self, other: &Context) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -665,9 +680,14 @@ impl Context {
         self.inner
             .builtins
             .get_or_build(&(op, ty), || {
-                let key = KernelKey::new(op.source(ty, &self.inner.tuning).into_owned(), "main", None);
                 let label = format!("{op:?} {ty}");
-                kernel::build_core(self, &key, Some(&label), true).map(Arc::new)
+                match op.kernel(ty, &self.inner.tuning) {
+                    BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), true),
+                    BuiltinKernel::Wgsl(source) => {
+                        kernel::build_core(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), true)
+                    }
+                }
+                .map(Arc::new)
             })
             .map(|(core, _)| core)
     }
@@ -675,7 +695,7 @@ impl Context {
     /// Takes a buffer of at least `bytes` bytes with exactly `usage` from the pool, creating one
     /// if none is idle. The buffer's size is rounded up to a power of two and its contents are
     /// unspecified. Give it back with [`Context::recycle`].
-    pub(crate) fn alloc_buffer(&self, bytes: u64, usage: BufferUsages) -> Result<Buffer> {
+    pub(crate) fn alloc_buffer(&self, bytes: u64, usage: BufferUsage) -> Result<Buffer> {
         let max = self.inner.max_buffer_bytes;
         let class = pool::size_class(bytes, max)
             .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
@@ -686,58 +706,42 @@ impl Context {
         self.new_buffer(class, usage, false)
     }
 
-    /// A new buffer; when the device is out of memory, gives back every idle buffer and the bind
-    /// groups pinning them, then tries once more.
-    fn new_buffer(&self, size: u64, usage: BufferUsages, mapped: bool) -> Result<Buffer> {
-        if let Some(buffer) = self.create_buffer(size, usage, mapped) {
-            return Ok(buffer);
+    /// Runs `attempt` (`None`: the device is out of memory) and, when the device is full, gives
+    /// back every idle buffer and the caches pinning them, then tries again; when it is still
+    /// full, moves array data to host memory, one segment at a time, until it fits.
+    pub(crate) fn relieving<T>(&self, requested: u64, mut attempt: impl FnMut() -> Result<Option<T>>) -> Result<T> {
+        if let Some(done) = attempt()? {
+            return Ok(done);
         }
         self.reclaim_idle_buffers()?;
-        if let Some(buffer) = self.create_buffer(size, usage, mapped) {
-            return Ok(buffer);
+        if let Some(done) = attempt()? {
+            return Ok(done);
         }
-        // Still full: move array data to host memory, one segment at a time, until it fits.
         while self.evict_one()? {
             self.reclaim_idle_buffers()?;
-            if let Some(buffer) = self.create_buffer(size, usage, mapped) {
-                return Ok(buffer);
+            if let Some(done) = attempt()? {
+                return Ok(done);
             }
         }
-        Err(LumaError::OutOfMemory { requested: size })
+        Err(LumaError::OutOfMemory { requested })
     }
 
-    /// Gives back every idle buffer: queues them for release, submits, waits for the device, then
-    /// drops the bind groups that pinned the mapped ones.
+    /// A new buffer; when the device is out of memory, gives back every idle buffer and the bind
+    /// groups pinning them, then tries once more.
+    fn new_buffer(&self, size: u64, usage: BufferUsage, mapped: bool) -> Result<Buffer> {
+        self.relieving(size, || Ok(self.hal().create_buffer(size, usage, mapped)))
+    }
+
+    /// Gives back every idle buffer: queues them for release, has the backend submit and wait
+    /// for the device and drop what it caches for them (and its own idle buffers).
     fn reclaim_idle_buffers(&self) -> Result<()> {
-        let mut idle = lock(&self.inner.pool).drain();
-        idle.extend(lock(&self.inner.mappable).drain());
-        idle.extend(lock(&self.inner.uploads).drain());
+        let idle = lock(&self.inner.pool).drain();
         lock(&self.inner.released).extend(idle);
-        self.flush_locked(&mut *self.batch()?);
-        self.device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| LumaError::Poll(Arc::new(e)))?;
-        let mut late = lock(&self.inner.mappable).drain();
-        late.extend(lock(&self.inner.uploads).drain());
-        if !late.is_empty() {
-            let mut batch = self.batch()?;
-            batch.pass = None;
-            batch.bound = Bound::default();
-            batch.bind_groups.forget(&late);
-        }
-        Ok(())
-    }
-
-    /// A new buffer, or `None` if the device is out of memory.
-    fn create_buffer(&self, size: u64, usage: BufferUsages, mapped: bool) -> Option<Buffer> {
-        let scope = self.device().push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let buffer = self.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("luma buffer"),
-            size,
-            usage,
-            mapped_at_creation: mapped,
-        });
-        pollster::block_on(scope.pop()).is_none().then_some(buffer)
+        let released = std::mem::take(&mut *lock(&self.inner.released));
+        self.hal().notify_released(&released);
+        let reclaimed = self.hal().reclaim_idle();
+        drop(released);
+        Ok(reclaimed?)
     }
 
     /// Returns a buffer from [`Context::alloc_buffer`] to the pool.
@@ -745,16 +749,14 @@ impl Context {
     /// This is safe while recorded or submitted GPU work still uses the buffer. All of it is
     /// part of the one ordered command stream, and whoever takes the buffer next (to upload into
     /// it, to run a kernel on it) records that after everything recorded so far. Nothing writes
-    /// to pooled buffers outside the stream (`Queue::write_buffer` is only used for uniform
-    /// slots, which are never pooled).
+    /// to pooled buffers outside the stream.
     pub(crate) fn recycle(&self, buffer: Buffer) {
         let Some(buffer) = self.retire(buffer) else { return };
-        if buffer.usage().contains(BufferUsages::MAP_WRITE) {
-            // May still be used by the unsubmitted batch, which mapping would invalidate; it is
-            // mapped after the next submission. This must not take the batch lock: it can be
-            // held by the caller.
-            lock(&self.inner.mappable).in_flight += buffer.size();
-            lock(&self.inner.unmapped).push(buffer);
+        if buffer.usage().contains(BufferUsage::MAP_WRITE) {
+            // May still be used by the unsubmitted batch, which mapping would invalidate: the
+            // backend makes it writable again after the next submission. This must not take
+            // anything the caller may hold.
+            self.hal().recycle_mappable(buffer);
             return;
         }
         let released = lock(&self.inner.pool).put(buffer);
@@ -775,8 +777,8 @@ impl Context {
     /// The features the device was opened with. Custom kernels may use the shader features
     /// among them (`SUBGROUP`, `SHADER_F16`, `SHADER_F64`, `EXPERIMENTAL_COOPERATIVE_MATRIX`) when
     /// present. `SHADER_F64` is also what `f64` arrays need.
-    pub fn features(&self) -> wgpu::Features {
-        self.device().features()
+    pub fn features(&self) -> Features {
+        self.info().features
     }
 
     // -- Profiling --
@@ -789,17 +791,16 @@ impl Context {
     /// Measures the GPU time of every kernel launch recorded from now on, until
     /// [`Context::finish_profiling`]. Does nothing if profiling is already enabled.
     ///
-    /// Fails with [`LumaError::Profiling`] if the adapter has no timestamp queries (see
+    /// Fails with [`LumaError::Profiling`] if the device has no timestamp queries (see
     /// [`Context::profiling_supported`]).
     pub fn enable_profiling(&self) -> Result<()> {
         if !self.inner.timestamps {
             return Err(LumaError::Profiling(
-                "the GPU does not support timestamp queries (wgpu feature TIMESTAMP_QUERY)".into(),
+                "the GPU does not support timestamp queries (feature TIMESTAMP_QUERY)".into(),
             ));
         }
-        let mut batch = self.batch()?;
-        if batch.profiler.is_none() {
-            batch.profiler = Some(Profiler::new());
+        if !self.hal().is_profiling()? {
+            self.hal().enable_profiling()?;
             self.jit().start_splits();
         }
         Ok(())
@@ -812,28 +813,15 @@ impl Context {
     /// Fails with [`LumaError::Profiling`] if profiling is not enabled.
     pub fn finish_profiling(&self) -> Result<Profile> {
         self.abort_recording()?;
-        if self.batch()?.profiler.is_none() {
+        if !self.hal().is_profiling()? {
             return Err(LumaError::Profiling("profiling is not enabled".into()));
         }
         // Lazy arrays still alive were computed inside the profiled region; record their fused
         // kernels while the profiler is still on.
         self.jit().evaluate_live();
-        let mut profiler = {
-            let mut batch = self.batch()?;
-            let Some(profiler) = batch.profiler.take() else {
-                return Err(LumaError::Profiling("profiling is not enabled".into()));
-            };
-            self.flush_locked(&mut batch);
-            profiler
-        };
         let splits = self.jit().take_split_notes();
-        self.sync()?;
-
-        // Everything profiled has completed; only now are its timestamps reliably written.
-        self.read_timestamps(&mut profiler)?;
-        let mut profile = profiler.into_profile();
-        profile.splits = splits;
-        Ok(profile)
+        self.notify_released();
+        Ok(self.hal().finish_profiling(splits)?)
     }
 
     /// Runs `f` and measures the GPU time of every kernel launch recorded during it (and, since

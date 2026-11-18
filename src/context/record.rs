@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use wgpu::Buffer;
+use luma_core::Buffer;
 
 use crate::array::Storage;
 use crate::error::Result;
@@ -57,7 +57,7 @@ impl Cmd {
             })
             .collect();
         match indirect {
-            Some((buffer, offset)) => ctx.launch_indirect(&self.kernel, buffer, offset, self.size, &args),
+            Some((buffer, offset)) => ctx.launch_indirect(&self.kernel, buffer, offset, self.size, self.workgroups, &args),
             None => ctx.launch(&self.kernel, self.workgroups, self.size, &args),
         }
     }

@@ -682,7 +682,7 @@ impl<T: GpuType> Array<T> {
     }
 
     #[cfg(test)]
-    pub(crate) fn buffer(&self) -> Option<wgpu::Buffer> {
+    pub(crate) fn buffer(&self) -> Option<luma_core::Buffer> {
         self.ready().ok().map(|(pin, _)| pin.buffer().clone())
     }
 

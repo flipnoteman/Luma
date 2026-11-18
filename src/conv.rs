@@ -155,9 +155,9 @@ fn to_i64(value: usize) -> Result<i64, LumaError> {
 fn launch_conv(
     ctx: &Context,
     params: [u32; 5],
-    out: (&wgpu::Buffer, u64),
-    input: (&wgpu::Buffer, u64),
-    kernel: (&wgpu::Buffer, u64),
+    out: (&luma_core::Buffer, u64),
+    input: (&luma_core::Buffer, u64),
+    kernel: (&luma_core::Buffer, u64),
 ) -> Result<(), LumaError> {
     let args = [
         RawArg::write(out.0, out.1),
@@ -179,7 +179,7 @@ fn launch_conv(
 
 /// Records a copy of elements `start..start + len` of `storage` into the start of `dst`, walking
 /// the segments that range overlaps. Needed because a chunked array has no single buffer to read.
-fn gather(ctx: &Context, storage: &Storage, start: usize, len: usize, dst: &wgpu::Buffer) -> Result<(), LumaError> {
+fn gather(ctx: &Context, storage: &Storage, start: usize, len: usize, dst: &luma_core::Buffer) -> Result<(), LumaError> {
     let end = start + len;
     for j in segment_span(storage, start, len) {
         let range = storage.range(j);
@@ -200,7 +200,7 @@ fn gather(ctx: &Context, storage: &Storage, start: usize, len: usize, dst: &wgpu
 /// `start..` of `storage`, walking the segments that range overlaps. The inverse of [`gather`].
 fn scatter(
     ctx: &Context,
-    src: &wgpu::Buffer,
+    src: &luma_core::Buffer,
     src_start: usize,
     storage: &Storage,
     start: usize,

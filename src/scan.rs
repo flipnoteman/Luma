@@ -16,7 +16,7 @@ use std::fmt::Write;
 use std::panic::Location;
 use std::sync::Arc;
 
-use wgpu::Buffer;
+use luma_core::Buffer;
 
 use crate::array::{Array, Failure};
 use crate::builtin::{BinOp, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};

@@ -47,7 +47,7 @@ use std::fmt::Write;
 use std::panic::Location;
 use std::sync::Arc;
 
-use wgpu::Buffer;
+use luma_core::Buffer;
 
 use crate::array::{Array, Failure, Storage};
 use crate::builtin::Builtin;
@@ -397,7 +397,9 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
         "    for (var m = 0u; m < {PER_THREAD}u; m++) {{
         let q = m * {WORKGROUP}u + t;
         let d = digit(sd[ix(q)]);
-        if (q == 0u || digit(sd[ix(q - 1u)]) != d) {{ start[d] = q; }}
+        var run_start = q == 0u;
+        if (!run_start) {{ run_start = digit(sd[ix(q - 1u)]) != d; }}
+        if (run_start) {{ start[d] = q; }}
     }}
     {{
         let q = t * p.cstride + tile;

@@ -43,6 +43,7 @@ fn a_chain_of_permutations_is_a_few_kernels() {
     }
     // A device that binds few buffers (llvmpipe: 16, Metal: 29) cannot take the 50 words of the state
     // in one kernel: they live in a few buffers that the kernels read through one binding each (see
-    // `tests/binding_limit.rs` for the same with 13).
-    assert!(profile.launches() <= 60, "{} kernels for 8 permutations\n{profile}", profile.launches());
+    // `tests/binding_limit.rs` for the same with 13). Debug builds halve `MAX_DEPTH` to 256.
+    let cap = if cfg!(debug_assertions) { 120 } else { 60 };
+    assert!(profile.launches() <= cap, "{} kernels for 8 permutations\n{profile}", profile.launches());
 }

@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use luma_core::Buffer;
 use crate::array::{Failure, Storage};
 use crate::gpu_type::ElemLayout;
 use crate::gpu::pager::Pin;
@@ -1124,7 +1125,7 @@ pub(super) fn run_mapped(
     Ok(())
 }
 
-/// The runs of consecutive base elements a region write is made of (see `codegen::runs_main`).
+/// The runs of consecutive base elements a region write is made of (see `kirgen::Build::runs`).
 pub(super) struct Runs {
     /// Elements of a run.
     len: u32,
@@ -1200,9 +1201,9 @@ pub(crate) fn reduce_first_pass(
     node: &Arc<Node>,
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
-    target: Option<&wgpu::Buffer>,
+    target: Option<&Buffer>,
     finish: Finish,
-) -> Result<Option<Vec<(wgpu::Buffer, u32)>>, Failure> {
+) -> Result<Option<Vec<(Buffer, u32)>>, Failure> {
     if !node.is_pending() {
         return Ok(None);
     }
@@ -1227,9 +1228,9 @@ pub(super) fn reduce_fused(
     fused: Fused,
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
-    target: Option<&wgpu::Buffer>,
+    target: Option<&Buffer>,
     finish: Finish,
-) -> Result<Vec<(wgpu::Buffer, u32)>, Failure> {
+) -> Result<Vec<(Buffer, u32)>, Failure> {
     fused.mark_fused();
     let Fused { mut key, inputs, mut scalars, .. } = fused;
     // The segments are those an array of this length has: the inputs may be of other lengths.

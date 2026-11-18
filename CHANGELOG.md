@@ -8,6 +8,8 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- Five-crate workspace: `luma-core` (kernel IR and backend interface), `luma-wgpu`, `luma-metal` and `luma-cuda` (each a backend with its own code generator), and the root `luma` crate. Cargo features `wgpu`, `metal` and `cuda` (all default) each enable one backend.
+- Native Metal and CUDA backends next to wgpu. `ContextOptions::backend`, `Context::{cuda, metal, wgpu, backend}` and `LUMA_BACKEND` choose one; `Auto` tries CUDA, then Metal, then wgpu. `LUMA_DEVICE` also accepts a backend name. The CUDA driver and NVRTC are loaded at run time. Custom WGSL kernels run on the native backends through the kernel IR; cooperative matrix stays wgpu-only. CUDA replays traced fixed-iteration steps from a cached graph.
 - `Array::permute_axes([usize; 4])` and `swap_axes(a, b)` (lazy views like `transpose`, which is
   `swap_axes(0, 1)`), their writing forms `permute_axes_mut` / `swap_axes_mut`, and the same on
   `ViewMut` and `Fields`. Swapping axes 1 and 2 of a `[ni, nj, nk]` array gives the reduction
@@ -15,6 +17,8 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- `Df32` round trips evaluate `hi + lo` consistently, including signed zero: the simplifier no longer treats a conversion from `f32` through `Df32` as an identity, and the low word is guarded against compiler folding.
+- Breaking: adapter, device and readback errors in `LumaError` carry backend-neutral strings instead of wgpu types. `Features` and profiling types are re-exported from `luma_core`; `luma::wgpu` is re-exported only with the `wgpu` feature.
 - Timestamp profiling drains completed query sets periodically instead of retaining every set until the profile ends. This avoids Metal device loss after 32 live query sets while preserving every launch's timing and per-kernel totals.
 
 - A pipeline cache that grew past the 32 MB kept on disk is dropped with an `info` log message

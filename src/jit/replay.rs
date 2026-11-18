@@ -2,12 +2,12 @@
 //! placeholders (probes) while the context records its launches; the recorded launches are then
 //! replayed with the probes' buffers swapped for the real state, step after step.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use wgpu::Buffer;
+use luma_core::{Buffer, ExecGraph, GraphLaunch};
 
 use crate::array::{Array, Failure, Storage};
-use crate::context::{Cmd, CmdArg, Context, Recording};
+use crate::context::{Cmd, CmdArg, Context, RawArg, Recording};
 use crate::error::Result;
 use crate::gpu::pager::Pin;
 use crate::gpu_type::GpuType;
@@ -64,6 +64,34 @@ impl Plan {
         Ok(())
     }
 
+    /// Captures the launches of the plan under each of `substs` in turn (see
+    /// [`Plan::replay`]) as one graph the backend can replay; `None` if it cannot.
+    pub(crate) fn build_graph(&self, substs: &[Vec<(Buffer, Buffer)>]) -> Option<Arc<dyn ExecGraph>> {
+        let args: Vec<Vec<RawArg<'_>>> = substs
+            .iter()
+            .flat_map(|subst| {
+                self.cmds.iter().map(move |cmd| {
+                    cmd.args
+                        .iter()
+                        .map(|arg| match arg {
+                            CmdArg::Storage { buffer, bytes, writable } => {
+                                let buffer = subst.iter().find(|(from, _)| from == buffer).map_or(buffer, |(_, to)| to);
+                                RawArg::Storage { buffer, bytes: *bytes, writable: *writable }
+                            }
+                            CmdArg::Uniform(data) => RawArg::Uniform(data),
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        let launches: Vec<GraphLaunch<'_>> = args
+            .iter()
+            .zip(substs.iter().flat_map(|_| self.cmds.iter()))
+            .map(|(args, cmd)| GraphLaunch { kernel: &cmd.kernel, workgroups: cmd.workgroups, size: cmd.size, args })
+            .collect();
+        self.ctx.hal().capture_graph(&launches)
+    }
+
     /// Makes the traced results real: copies the seeds, then runs the commands once as recorded.
     pub(crate) fn run_once(&self) -> Result<()> {
         for (from, to) in &self.seed {
@@ -102,6 +130,11 @@ pub(crate) struct Stepper {
     /// Keep the initial state alive.
     #[allow(dead_code)]
     inits: Vec<Arc<Storage>>,
+    /// Steps 2 and 3 as one replayable graph, `None` inside when the backend has none. Reset
+    /// when `pong` is replaced.
+    pair_graph: OnceLock<Option<Arc<dyn ExecGraph>>>,
+    /// Step 2 alone, for the last step of an odd count after the first.
+    even_graph: OnceLock<Option<Arc<dyn ExecGraph>>>,
 }
 
 impl Stepper {
@@ -175,6 +208,8 @@ impl Stepper {
             pong_pins,
             init_pins,
             inits: init.to_vec(),
+            pair_graph: OnceLock::new(),
+            even_graph: OnceLock::new(),
         })
     }
 
@@ -218,6 +253,51 @@ impl Stepper {
 
     pub(crate) fn plan(&self) -> &Plan {
         &self.plan
+    }
+
+    /// Runs steps `1..=steps`. The first replays on its own (it reads `init`, which `rebind`
+    /// changes); the rest cycle through two address-invariant steps (2 and 3), so a backend
+    /// that can capture graphs replays them as one. While profiling or recording, and on
+    /// backends without graphs, every step is replayed on its own.
+    pub(crate) fn run_steps(&self, steps: usize) -> Result<()> {
+        if steps == 0 {
+            return Ok(());
+        }
+        self.plan.replay(&self.subst(1), None)?;
+        let rest = steps - 1;
+        if rest == 0 {
+            return Ok(());
+        }
+        let plain = |from: usize| -> Result<()> {
+            for t in from..=steps {
+                self.plan.replay(&self.subst(t), None)?;
+            }
+            Ok(())
+        };
+        let ctx = &self.plan.ctx;
+        if ctx.recording_here() || ctx.is_profiling() {
+            return plain(2);
+        }
+        let launches = self.plan.launches() as u32;
+        let mut next = 2;
+        if rest >= 2 {
+            let pair = self.pair_graph.get_or_init(|| self.plan.build_graph(&[self.subst(2), self.subst(3)]));
+            let Some(pair) = pair else {
+                return plain(2);
+            };
+            for _ in 0..rest / 2 {
+                ctx.launch_graph(&**pair, 2 * launches)?;
+            }
+            next += 2 * (rest / 2);
+        }
+        if next <= steps {
+            let even = self.even_graph.get_or_init(|| self.plan.build_graph(&[self.subst(2)]));
+            match even {
+                Some(even) => ctx.launch_graph(&**even, launches)?,
+                None => plain(next)?,
+            }
+        }
+        Ok(())
     }
 
     /// The buffer swaps that make the plan compute step `t` (1-based).
@@ -269,6 +349,8 @@ impl Stepper {
         }
         self.pong_buffers = buffers;
         self.pong_pins = pins;
+        self.pair_graph = OnceLock::new();
+        self.even_graph = OnceLock::new();
         Some(std::mem::replace(&mut self.pong, next))
     }
 }

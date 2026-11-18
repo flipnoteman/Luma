@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use super::batch::{BATCH_LIMIT, SUBMIT_HOLD};
-use super::transfer::{STAGING_USAGE, SYNC_SPIN_MIN, WAIT_SAMPLES};
+use super::transfer::{SYNC_SPIN_MIN, WAIT_SAMPLES};
 use super::*;
 use crate::array::Array;
 
@@ -55,7 +55,7 @@ fn recycled_buffers_are_reused_per_size_class_and_usage() {
 
     // Different usage or different class: a new buffer.
     ctx.recycle(b.clone());
-    assert_ne!(ctx.alloc_buffer(4000, STAGING_USAGE).unwrap(), a);
+    assert_ne!(ctx.alloc_buffer(4000, BufferUsage::MAP_READ | BufferUsage::COPY_DST).unwrap(), a);
     assert_ne!(ctx.alloc_buffer(4100, STORAGE_USAGE).unwrap(), a);
     // ... while the recycled one is still waiting in the pool.
     assert_eq!(ctx.alloc_buffer(4000, STORAGE_USAGE).unwrap(), a);

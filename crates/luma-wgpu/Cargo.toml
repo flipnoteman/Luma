@@ -1,0 +1,18 @@
+[package]
+name = "luma-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+luma-core.workspace = true
+wgpu.workspace = true
+naga.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

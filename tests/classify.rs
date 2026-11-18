@@ -4,7 +4,7 @@
 use luma::{Array, Context, Df32};
 
 fn has_f64(ctx: &Context) -> bool {
-    ctx.features().contains(luma::wgpu::Features::SHADER_F64)
+    ctx.features().contains(luma::Features::SHADER_F64)
 }
 
 /// The special values of `f32`: both infinities, `NaN` (also with a sign and a payload), the

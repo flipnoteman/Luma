@@ -3,23 +3,41 @@
 //! once. Some compilers and software rasterizers lower `fma` to a multiplication and an
 //! addition; there the library must split the factors instead.
 
-use wgpu::util::DeviceExt;
+use std::mem::MaybeUninit;
+use std::sync::Arc;
+use std::time::Duration;
+
+use luma_core::kir::{used_bindings, KernelModule, KirType, ModuleBuilder};
+use luma_core::{Backend, BufferUsage, CompiledKernel, Dispatch, RawArg};
 
 /// `out[i] = fma(a[i], b[i], -p)` with `p` the rounded product made opaque to the compiler by the
 /// bits of `zero[i]` (all zero): a fused `fma` returns the rounding error of the product, a
 /// multiplication and an addition return 0.
-const SHADER: &str = "
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read> zero: array<u32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-    let i = g.x;
-    let p = bitcast<f32>(bitcast<u32>(a[i] * b[i]) | zero[i]);
-    out[i] = fma(a[i], b[i], -p);
+fn module() -> KernelModule {
+    let mut mb = ModuleBuilder::new("luma fma", "main", [1, 1, 1]);
+    // The error-free transformation needs the arithmetic exactly as written.
+    mb.set_uses_exact_f32(true);
+    let a = mb.add_storage_read("a", KirType::F32);
+    let b = mb.add_storage_read("b", KirType::F32);
+    let zero = mb.add_storage_read("zero", KirType::U32);
+    let out = mb.add_storage_read_write("out", KirType::F32);
+    let mut f = mb.entry_builder();
+    let g = f.builtin(luma_core::kir::BuiltinVar::GlobalInvocationId);
+    let i = f.field(g, 0, KirType::U32);
+    let i = f.let_val("i", i);
+    let (av, bv) = (f.load(a, i), f.load(b, i));
+    let (av, bv) = (f.let_val("av", av), f.let_val("bv", bv));
+    let prod = f.mul(av, bv);
+    let bits = f.bitcast(prod, KirType::U32);
+    let masked = f.bit_or(bits, f.load(zero, i));
+    let p = f.bitcast(masked, KirType::F32);
+    let p = f.let_val("p", p);
+    let neg = f.neg(p);
+    let r = f.fma(av, bv, neg);
+    f.store(out, i, r);
+    f.finish();
+    mb.finish()
 }
-";
 
 /// Factor pairs of 24 significant bits each, whose products need more than 24 (so that the
 /// rounding error of the product is not zero): a fixed pseudo-random sequence.
@@ -33,70 +51,58 @@ fn pairs() -> Vec<(f32, f32)> {
     (0..64).map(|_| (next(), next())).collect()
 }
 
-/// Runs the exactness test on `device`: `Some(true)` when every `fma(a, b, -p)` returned exactly
-/// the rounding error of `a * b`. `None` when the test could not run (buffer, poll or readback
-/// failure), so the caller does not keep a transient failure.
-pub(crate) fn fused(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<bool> {
+/// Runs the exactness test on `backend`: `Some(true)` when every `fma(a, b, -p)` returned exactly
+/// the rounding error of `a * b`. `None` when the test could not run (buffer, compile, launch or
+/// readback failure), so the caller does not keep a transient failure.
+pub(crate) fn probe(backend: &dyn Backend) -> Option<bool> {
     let pairs = pairs();
     let expected: Vec<f32> = pairs.iter().map(|&(a, b)| (f64::from(a) * f64::from(b) - f64::from(a * b)) as f32).collect();
     if expected.iter().all(|&e| e == 0.0) {
         return Some(false);
     }
     let bytes = (pairs.len() * 4) as u64;
+    let max_buffer_bytes = backend.info().limits.max_buffer_bytes;
     let a: Vec<f32> = pairs.iter().map(|p| p.0).collect();
     let b: Vec<f32> = pairs.iter().map(|p| p.1).collect();
     let zero = vec![0u32; pairs.len()];
-    let upload = |data: &[u8]| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("luma fma"), contents: data, usage: wgpu::BufferUsages::STORAGE });
-    let (buf_a, buf_b, buf_zero) = (upload(bytemuck::cast_slice(&a)), upload(bytemuck::cast_slice(&b)), upload(bytemuck::cast_slice(&zero)));
-    let out = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("luma fma out"),
-        size: bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let read = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("luma fma read"),
-        size: bytes,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("luma fma"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("luma fma"),
-        layout: None,
-        module: &module,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-        wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() }
-    }
-    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("luma fma"),
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &[entry(0, &buf_a), entry(1, &buf_b), entry(2, &buf_zero), entry(3, &out)],
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma fma") });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("luma fma"), timestamp_writes: None });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &group, &[]);
-        pass.dispatch_workgroups(pairs.len() as u32, 1, 1);
-    }
-    encoder.copy_buffer_to_buffer(&out, 0, &read, 0, bytes);
-    queue.submit([encoder.finish()]);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    read.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    if device.poll(wgpu::PollType::wait_indefinitely()).is_err() || !matches!(receiver.recv(), Ok(Ok(()))) {
-        return None;
-    }
-    let Ok(view) = read.slice(..).get_mapped_range() else { return None };
-    let got: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
-    drop(view);
-    read.unmap();
+    let upload = |data: &[u8]| {
+        if backend.info().zero_copy {
+            return backend.alloc_filled(data, max_buffer_bytes).ok();
+        }
+        let buffer = backend.create_buffer(data.len() as u64, BufferUsage::STORAGE | BufferUsage::COPY_DST, false)?;
+        backend.record_upload(&buffer, data, max_buffer_bytes).ok()?;
+        Some(buffer)
+    };
+    let (buf_a, buf_b, buf_zero) = (upload(bytemuck::cast_slice(&a))?, upload(bytemuck::cast_slice(&b))?, upload(bytemuck::cast_slice(&zero))?);
+    let out = backend.create_buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST, false)?;
+
+    let module = module();
+    let (declared, used) = used_bindings(&module);
+    let bindings = module
+        .bindings
+        .iter()
+        .enumerate()
+        .filter(|&(at, _)| used.as_ref().is_none_or(|used| used[at]))
+        .map(|(_, binding)| binding.info())
+        .collect();
+    let raw = backend.compile_kernel(&module, used.as_deref(), "luma fma", true).ok()?;
+    let kernel = CompiledKernel::new(Arc::from("luma fma"), raw, bindings, declared, used, module.workgroup_size);
+
+    let count = pairs.len() as u32;
+    backend
+        .record_launch(
+            &kernel,
+            Dispatch::Direct([count, 1, 1]),
+            [count, 1, 1],
+            &[RawArg::read(&buf_a, bytes), RawArg::read(&buf_b, bytes), RawArg::read(&buf_zero, bytes), RawArg::write(&out, bytes)],
+        )
+        .ok()?;
+    backend.flush_batch().ok()?;
+    let mut got = vec![MaybeUninit::<u8>::uninit(); bytes as usize];
+    backend.read_into(&out, &mut got, false, Duration::from_micros(500)).ok()?;
+    // SAFETY: `read_into` returned Ok, so every byte of `got` was written.
+    let got: Vec<u8> = got.into_iter().map(|byte| unsafe { byte.assume_init() }).collect();
+    let got: Vec<f32> = got.as_chunks::<4>().0.iter().map(|&word| f32::from_ne_bytes(word)).collect();
     Some(got.iter().zip(&expected).all(|(g, e)| g.to_bits() == e.to_bits()))
 }
 
@@ -107,8 +113,8 @@ mod tests {
     #[test]
     fn the_test_is_repeatable_and_the_context_uses_its_answer() {
         let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
-        let first = super::fused(ctx.device(), ctx.queue());
-        assert_eq!(first, super::fused(ctx.device(), ctx.queue()));
+        let first = super::probe(ctx.hal());
+        assert_eq!(first, super::probe(ctx.hal()));
         if std::env::var_os("LUMA_DF_FMA").is_none() {
             // The stored answer of an earlier process may be used instead of a new test, but both are one device.
             assert_eq!(Some(ctx.tuning().df_fma), first);

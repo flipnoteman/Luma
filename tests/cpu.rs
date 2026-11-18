@@ -8,7 +8,7 @@ use luma::{Array, Context, LumaError, TuningProfile};
 fn cpu() -> Option<Context> {
     match Context::cpu() {
         Ok(ctx) => Some(ctx),
-        Err(LumaError::NoAdapter(_)) => None,
+        Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) => None,
         Err(e) => panic!("opening the CPU device failed: {e}"),
     }
 }

@@ -12,64 +12,10 @@ use crate::context::{Context, RawArg};
 use crate::error::Result;
 use crate::kernel::{build_core, KernelKey};
 use crate::ops::launch_1d;
-use crate::tuning::TuningProfile;
+
+pub(crate) use luma_core::CostModel;
 
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind};
-
-/// Throughputs of a device, measured when a context opens (see
-/// [`ContextOptions::calibrate`](crate::ContextOptions::calibrate)) or taken from a profile.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CostModel {
-    /// Host + GPU time of one dispatch of a tiny kernel, microseconds.
-    pub launch_us: f64,
-    /// Device memory bandwidth, GB/s (read + write bytes per second / 1e9).
-    pub bandwidth_gbs: f64,
-    /// Simple f32 operations (add or mul) per nanosecond.
-    pub f32_ops_per_ns: f64,
-    /// Cost of one `Df32` add or mul in f32-operation units.
-    pub df32_factor: f64,
-    /// Cost of one `f64` add or mul in f32-operation units; `None` without `SHADER_F64`.
-    pub f64_factor: Option<f64>,
-}
-
-impl CostModel {
-    /// RTX 3090 (Vulkan), measured by [`calibrate`] (best of [`BEST_OF`] runs).
-    pub(crate) const NVIDIA: CostModel = CostModel {
-        launch_us: 2.9,
-        bandwidth_gbs: 740.0,
-        f32_ops_per_ns: 16000.0,
-        df32_factor: 27.0,
-        f64_factor: Some(41.0),
-    };
-    /// Every other GPU, measured on a RADV Raphael iGPU (best of 5 runs).
-    pub(crate) const GENERIC: CostModel = CostModel {
-        launch_us: 2.0,
-        bandwidth_gbs: 62.0,
-        f32_ops_per_ns: 370.0,
-        df32_factor: 44.0,
-        f64_factor: Some(11.0),
-    };
-    /// Mesa llvmpipe on a Ryzen 9 7950X (best of 5 runs).
-    pub(crate) const CPU: CostModel = CostModel {
-        launch_us: 32.0,
-        bandwidth_gbs: 31.0,
-        f32_ops_per_ns: 30.0,
-        df32_factor: 2.3,
-        f64_factor: Some(1.1),
-    };
-    /// The numbers tests pin so that kernel counts do not depend on the machine.
-    #[cfg(test)]
-    pub(crate) const TEST: CostModel = CostModel { launch_us: 2.9, bandwidth_gbs: 740.0, f32_ops_per_ns: 16000.0, df32_factor: 36.0, f64_factor: Some(41.0) };
-
-    /// The fixed numbers of a tuning profile, used when calibration is off or fails.
-    pub fn fallback(profile: TuningProfile) -> CostModel {
-        match profile {
-            TuningProfile::Nvidia => CostModel::NVIDIA,
-            TuningProfile::Cpu => CostModel::CPU,
-            _ => CostModel::GENERIC,
-        }
-    }
-}
 
 /// The cost of `op` per element in f32-operation units.
 pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
@@ -233,7 +179,7 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
     let t_df = time_kernel(ctx, df, "CostDf32", n_alu, k_df, REPS)?;
     let df32_factor = t_df / (2.0 * f64::from(k_df) * f64::from(n_alu)) / per_op_f32;
 
-    let f64_factor = if ctx.features().contains(wgpu::Features::SHADER_F64) {
+    let f64_factor = if ctx.features().contains(luma_core::Features::SHADER_F64) {
         let wide = kernel_source("", "f64", "f64(in0[i])", "x = x * f64(1.0001) + f64(0.5);", "f32(x)");
         let t_f64 = time_kernel(ctx, wide, "CostF64", n_alu, k_f64, REPS)?;
         Some(t_f64 / (2.0 * f64::from(k_f64) * f64::from(n_alu)) / per_op_f32)

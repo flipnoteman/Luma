@@ -155,6 +155,16 @@ pub(super) fn repack(ctx: &Context, op: Op, args: &[Src], excess: usize) -> bool
     pack_leaves(ctx, leaf_buffers(op, args), excess)
 }
 
+/// [`repack`] for the expressions of several pending `nodes` that are about to be evaluated
+/// together (see `JitState::evaluate_alongside`).
+pub(super) fn repack_nodes(ctx: &Context, nodes: &[Arc<super::Node>], excess: usize) -> bool {
+    let roots: Vec<(Src, ElemTy, bool)> = nodes
+        .iter()
+        .map(|node| (Src::Node(Arc::clone(node)), node.op().out_ty(), false))
+        .collect();
+    pack_leaves(ctx, leaf_buffers_from(roots), excess)
+}
+
 /// [`repack`] for the inputs of a program that binds too many: the buffers it reads (except the
 /// ones a shift reads) are known exactly, with the types they are read as.
 pub(super) fn repack_inputs(ctx: &Context, fused: &Fused, excess: usize) -> bool {
@@ -223,10 +233,15 @@ fn pack_leaves(ctx: &Context, leaves: Vec<(Arc<Storage>, ElemTy, bool)>, excess:
 /// it is read as and whether a shift reads it (or it is read as two types: then it is treated
 /// as shifted).
 fn leaf_buffers(op: Op, args: &[Src]) -> Vec<(Arc<Storage>, ElemTy, bool)> {
+    let shifts = |op: Op, i: usize| i == 0 && matches!(op.kind, OpKind::Shift(_));
+    let work = args.iter().enumerate().map(|(i, arg)| (arg.clone(), op.operand_ty(i), shifts(op, i))).collect();
+    leaf_buffers_from(work)
+}
+
+fn leaf_buffers_from(mut work: Vec<(Src, ElemTy, bool)>) -> Vec<(Arc<Storage>, ElemTy, bool)> {
     let mut found: Vec<(Arc<Storage>, ElemTy, bool)> = Vec::new();
     let mut seen: FxMap<u64, ()> = FxMap::default();
     let shifts = |op: Op, i: usize| i == 0 && matches!(op.kind, OpKind::Shift(_));
-    let mut work: Vec<(Src, ElemTy, bool)> = args.iter().enumerate().map(|(i, arg)| (arg.clone(), op.operand_ty(i), shifts(op, i))).collect();
     while let Some((src, ty, shifted)) = work.pop() {
         let storage = match &src {
             Src::Scalar(_) => continue,

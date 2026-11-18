@@ -2,9 +2,12 @@
 //! `array<u32>` of bit-packed words: element `i` is bit `i % 32` of word `i / 32`
 //! (`(a[i >> 5u] >> (i & 31u)) & 1u`), and the bits past the end of the array are 0.
 
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use luma_core::kir::{self, KernelModule};
+use luma_core::naga;
+use luma_core::{BackendError, CompiledKernel};
+pub use luma_core::{BindingInfo, BindingKind};
 
 use crate::array::{Array, Failure};
 use crate::context::{default_context, Context, RawArg};
@@ -12,75 +15,8 @@ use crate::gpu::pager::Pin;
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{GpuType, ScalarType};
 
-/// WGSL appended to every kernel. Declarations are order independent in WGSL, so appending (not
-/// prepending) keeps the line numbers of compile errors identical to the user's source and
-/// leaves `enable` directives first.
-const PRELUDE: &str = "
-struct LumaGrid { size: vec3<u32>, _pad: u32 }
-@group(0) @binding(0) var<uniform> luma: LumaGrid;
-fn luma_idx2(i: u32, j: u32) -> u32 { return i + j * luma.size.x; }
-fn luma_idx3(i: u32, j: u32, k: u32) -> u32 { return i + luma.size.x * (j + luma.size.y * k); }
-";
-
-const VIEW_PRELUDE: &str = "
-struct LumaView { offset: u32, len: u32, _pad: vec2<u32>, stride: vec4<i32>, dims: vec4<u32> }
-fn luma_view_idx2(v: LumaView, i: u32, j: u32) -> u32 {
-    return u32(i32(v.offset) + v.stride.x * i32(i) + v.stride.y * i32(j));
-}
-fn luma_view_idx3(v: LumaView, i: u32, j: u32, k: u32) -> u32 {
-    return u32(i32(v.offset) + v.stride.x * i32(i) + v.stride.y * i32(j) + v.stride.z * i32(k));
-}
-fn luma_view_idx4(v: LumaView, c: vec4<u32>) -> u32 {
-    let d = vec4<i32>(c) * v.stride;
-    return u32(i32(v.offset) + d.x + d.y + d.z + d.w);
-}
-fn luma_view_idx(v: LumaView, i: u32) -> u32 {
-    let c0 = i % v.dims.x;
-    let r0 = i / v.dims.x;
-    let c1 = r0 % v.dims.y;
-    let r1 = r0 / v.dims.y;
-    let c2 = r1 % v.dims.z;
-    let c3 = r1 / v.dims.z;
-    return luma_view_idx4(v, vec4<u32>(c0, c1, c2, c3));
-}
-";
-
 /// Arguments a launch validates into a stack array; more than this take one heap allocation.
 const INLINE_ARGS: usize = 16;
-
-/// What a kernel binding in `@group(1)` is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BindingKind {
-    /// `var<storage, read>`: bound from `&Array`.
-    StorageRead,
-    /// `var<storage, read_write>`: bound from `&mut Array`.
-    StorageReadWrite,
-    /// `var<uniform>`: bound from [`uniform`].
-    Uniform,
-}
-
-impl fmt::Display for BindingKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            BindingKind::StorageRead => "read-only storage buffer",
-            BindingKind::StorageReadWrite => "read_write storage buffer",
-            BindingKind::Uniform => "uniform",
-        })
-    }
-}
-
-/// One reflected `@group(1)` binding of a kernel; its index is the argument position.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BindingInfo {
-    /// The variable's name in the shader.
-    pub name: String,
-    /// Whether the binding is a read-only storage buffer, a read-write storage buffer or a uniform.
-    pub kind: BindingKind,
-    /// For storage bindings of `array<T>`: the byte stride of `T`. `None` when not an array.
-    pub element_stride: Option<u32>,
-    /// For uniforms: the byte size of the uniform's type. `None` for storage bindings.
-    pub min_size: Option<u32>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct KernelKey {
@@ -99,69 +35,7 @@ impl KernelKey {
 }
 
 /// Everything about a built kernel that does not depend on the caller; cached per context.
-#[derive(Debug, Clone)]
-pub(crate) struct KernelCore {
-    /// Unique per built kernel; identifies it in the bind group cache.
-    pub(crate) id: u64,
-    /// Names the kernel in a [`Profile`](crate::Profile).
-    pub(crate) label: Arc<str>,
-    pub(crate) pipeline: wgpu::ComputePipeline,
-    pub(crate) args_layout: wgpu::BindGroupLayout,
-    /// The bindings the entry point uses, by binding number.
-    bindings: Vec<BindingInfo>,
-    /// The arguments a launch passes: one per `@group(1)` variable the module declares. For a
-    /// kernel of the user's it is `bindings.len()`.
-    declared: usize,
-    /// Which of the `declared` arguments the entry point reads, `None` when all of them. A
-    /// variable no code reads has no binding in the pipeline layout (wgpu derives the layout from
-    /// what the shader uses), so a launch must not bind it. Only luma's own kernels can leave one
-    /// unread; the reflection of the built pipeline, not the decision that generated the source,
-    /// says which.
-    used: Option<Box<[bool]>>,
-    pub(crate) workgroup: [u32; 3],
-}
-
-impl KernelCore {
-    /// The arguments of a launch that the kernel binds, with their binding numbers.
-    pub(crate) fn bound<'a, T>(&'a self, args: &'a [T]) -> impl Iterator<Item = (u32, &'a T)> + 'a {
-        args.iter()
-            .enumerate()
-            .filter(|&(position, _)| self.used.as_ref().is_none_or(|used| used[position]))
-            .map(|(position, arg)| (position as u32, arg))
-    }
-
-    /// Checks that a launch passes as many arguments as the module declares. A mismatch is an
-    /// error of that launch; left to the device it would be a validation failure that
-    /// invalidates the work of every thread sharing the batch.
-    pub(crate) fn check_count(&self, passed: usize) -> Result<()> {
-        if passed != self.declared {
-            return Err(LumaError::KernelArgCount { expected: self.declared, actual: passed });
-        }
-        Ok(())
-    }
-
-    /// Checks that each argument the kernel binds is of the kind of its binding, for the same
-    /// reason as [`check_count`](Self::check_count).
-    pub(crate) fn check_kinds(&self, args: &[RawArg<'_>]) -> Result<()> {
-        for ((position, arg), info) in self.bound(args).zip(&self.bindings) {
-            // Whether a storage buffer is passed for reading or writing does not matter to the
-            // layout; a uniform where a storage buffer is expected (or the reverse) does.
-            let (passed, fits) = match arg {
-                RawArg::Uniform(_) => ("uniform", info.kind == BindingKind::Uniform),
-                RawArg::Storage { .. } => ("storage buffer", info.kind != BindingKind::Uniform),
-            };
-            if !fits {
-                return Err(LumaError::KernelBinding(format!(
-                    "kernel `{}` argument {position} (`{}`) is a {}, but the launch passes a {passed}",
-                    self.label, info.name, info.kind
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(0);
+pub(crate) type KernelCore = CompiledKernel;
 
 /// Builds a [`Kernel`]; created by [`Context::kernel`].
 #[derive(Debug)]
@@ -220,276 +94,67 @@ impl<'a> KernelBuilder<'a> {
     }
 }
 
-fn reflect_kind(space: naga::AddressSpace) -> Option<BindingKind> {
-    match space {
-        naga::AddressSpace::Uniform => Some(BindingKind::Uniform),
-        naga::AddressSpace::Storage { access } if access.contains(naga::StorageAccess::STORE) => {
-            Some(BindingKind::StorageReadWrite)
-        }
-        naga::AddressSpace::Storage { .. } => Some(BindingKind::StorageRead),
-        _ => None,
-    }
-}
-
-/// What naga may accept in a kernel: the shader features the device was opened with.
-fn shader_capabilities(features: wgpu::Features) -> naga::valid::Capabilities {
-    use naga::valid::Capabilities as Caps;
-    let mut caps = Caps::empty();
-    if features.contains(wgpu::Features::SUBGROUP) {
-        caps |= Caps::SUBGROUP | Caps::SUBGROUP_BARRIER;
-    }
-    if features.contains(wgpu::Features::SHADER_F16) {
-        caps |= Caps::SHADER_FLOAT16;
-    }
-    if features.contains(wgpu::Features::SHADER_F64) {
-        caps |= Caps::FLOAT64;
-    }
-    if features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
-        caps |= Caps::COOPERATIVE_MATRIX;
-    }
-    caps
-}
-
-/// Compiles `key` into a pipeline. `trusted` kernels are luma's own, whose every storage access
-/// is in bounds by construction; they are compiled without wgpu's per-access bounds checks.
+/// Compiles `key` into a kernel of the context's backend. `trusted` kernels are luma's own,
+/// whose every storage access is in bounds by construction; the backend compiles them without
+/// per-access bounds checks.
+///
+/// The WGSL is parsed, validated and lowered once (see [`kir::parse_wgsl`]); the backend that
+/// takes naga modules (wgpu) is handed the module it validated, any other the lowered
+/// [`KernelModule`].
 pub(crate) fn build_core(
     ctx: &Context,
     key: &KernelKey,
     label: Option<&str>,
     trusted: bool,
 ) -> Result<KernelCore> {
-    let combined = if !trusted && key.source.contains("LumaView") {
-        format!("{}\n{PRELUDE}{VIEW_PRELUDE}", key.source)
-    } else {
-        format!("{}\n{PRELUDE}", key.source)
+    let info = ctx.info();
+    let limits = &info.limits;
+    let (module, lowered, bindings, declared, used) = kir::parse_wgsl(
+        &key.source,
+        &key.entry,
+        key.workgroup,
+        info.features,
+        limits.max_workgroup_size,
+        limits.max_workgroup_invocations,
+        limits.max_dynamic_uniforms,
+        trusted,
+    )?;
+    let workgroup = lowered.workgroup_size;
+    let name = label.unwrap_or(&key.entry);
+    let backend = ctx.hal();
+    let raw = match backend.compile_naga(&module, &key.entry, &bindings, workgroup, name, trusted) {
+        Some(raw) => raw?,
+        None => {
+            // A cooperative matrix module is lowered to its bindings and no body: only a backend
+            // that takes the naga module can run it.
+            let cooperative = module.types.iter().any(|(_, t)| matches!(t.inner, naga::TypeInner::CooperativeMatrix { .. }));
+            if cooperative && lowered.entry_body.is_empty() {
+                return Err(BackendError::Unsupported("cooperative matrix requires the wgpu backend".into()).into());
+            }
+            backend.compile_kernel(&lowered, used.as_deref(), name, trusted)?
+        }
     };
-    let module = naga::front::wgsl::parse_str(&combined)
-        .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
+    Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, workgroup))
+}
 
-    let mut validator = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), shader_capabilities(ctx.device().features()));
-    let info = validator
-        .validate(&module)
-        .map_err(|e| LumaError::ShaderCompile(e.emit_to_string(&combined)))?;
-
-    let (entry_index, entry) = module
-        .entry_points
+/// Compiles a kernel luma built as a [`KernelModule`] (see `gpu::lower`), skipping the text.
+pub(crate) fn build_module(
+    ctx: &Context,
+    module: KernelModule,
+    label: Option<&str>,
+    trusted: bool,
+) -> Result<KernelCore> {
+    let (declared, used) = kir::used_bindings(&module);
+    let bindings = module
+        .bindings
         .iter()
         .enumerate()
-        .find(|(_, ep)| ep.name == key.entry && ep.stage == naga::ShaderStage::Compute)
-        .ok_or_else(|| {
-            let available: Vec<&str> = module
-                .entry_points
-                .iter()
-                .filter(|ep| ep.stage == naga::ShaderStage::Compute)
-                .map(|ep| ep.name.as_str())
-                .collect();
-            LumaError::KernelEntryPoint(format!(
-                "No @compute entry point `{}`; compute entry points: {available:?}",
-                key.entry
-            ))
-        })?;
-
-    // Bindings: group 0 belongs to luma, user resources must be in group 1 with binding
-    // numbers 0..n. Only the globals the entry point uses count (directly or through the
-    // functions it calls), so one module can hold several entry points with different bindings.
-    let used = info.get_entry_point(entry_index);
-    let mut user: Vec<(u32, BindingInfo)> = Vec::new();
-    // The @group(1) variables the module declares, used or not (only luma's own modules have
-    // just one entry point, whose arguments they are).
-    let mut declared: Vec<u32> = Vec::new();
-    for (handle, var) in module.global_variables.iter() {
-        let Some(rb) = var.binding else { continue };
-        if trusted && rb.group == 1 {
-            declared.push(rb.binding);
-        }
-        if used[handle].is_empty() {
-            continue;
-        }
-        let name = var.name.clone().unwrap_or_default();
-        if rb.group == 0 {
-            if name == "luma" && rb.binding == 0 {
-                continue;
-            }
-            return Err(LumaError::KernelBinding(format!(
-                "`{name}` is in @group(0), which luma reserves for the grid uniform; \
-                 declare kernel arguments in @group(1)"
-            )));
-        }
-        if rb.group != 1 {
-            return Err(LumaError::KernelBinding(format!(
-                "`{name}` is in @group({}); kernel arguments must be in @group(1)",
-                rb.group
-            )));
-        }
-        let kind = reflect_kind(var.space).ok_or_else(|| {
-            LumaError::KernelBinding(format!(
-                "`{name}` is neither a storage buffer nor a uniform"
-            ))
-        })?;
-        let inner = &module.types[var.ty].inner;
-        let (element_stride, min_size) = match kind {
-            BindingKind::Uniform => (None, inner.try_size(module.to_ctx())),
-            _ => (
-                match inner {
-                    naga::TypeInner::Array { stride, .. } => Some(*stride),
-                    _ => None,
-                },
-                None,
-            ),
-        };
-        user.push((rb.binding, BindingInfo { name, kind, element_stride, min_size }));
-    }
-    user.sort_by_key(|(binding, _)| *binding);
-    let (declared, used_mask) = if trusted {
-        // Luma's launches pass one argument per variable the source declares, numbered 0..n; the
-        // pipeline binds those the entry point reads.
-        declared.sort_unstable();
-        for (expected, binding) in declared.iter().enumerate() {
-            if *binding != expected as u32 {
-                return Err(LumaError::KernelBinding(format!(
-                    "the @group(1) variables of `{}` must be numbered 0..n, but @binding({binding}) \
-                     is where @binding({expected}) was expected",
-                    key.entry
-                )));
-            }
-        }
-        let mask: Box<[bool]> = (0..declared.len() as u32).map(|binding| user.iter().any(|(used, _)| *used == binding)).collect();
-        let all = mask.iter().all(|&bound| bound);
-        (declared.len(), (!all).then_some(mask))
-    } else {
-        for (expected, (binding, info)) in user.iter().enumerate() {
-            if *binding != expected as u32 {
-                return Err(LumaError::KernelBinding(format!(
-                    "the @group(1) bindings used by entry point `{}` must be numbered 0..n in \
-                     argument order, but `{}` is @binding({binding}) where @binding({expected}) \
-                     was expected",
-                    key.entry, info.name
-                )));
-            }
-        }
-        (user.len(), None)
-    };
-    let numbers: Vec<u32> = user.iter().map(|(binding, _)| *binding).collect();
-    let bindings: Vec<BindingInfo> = user.into_iter().map(|(_, info)| info).collect();
-
-    if entry.workgroup_size_overrides.is_some() {
-        return Err(LumaError::KernelWorkgroup(
-            "workgroup sizes that depend on `override` constants are not supported".into(),
-        ));
-    }
-    let workgroup = entry.workgroup_size;
-    if workgroup.contains(&0) {
-        return Err(LumaError::KernelWorkgroup(format!(
-            "@workgroup_size{workgroup:?} has a zero dimension"
-        )));
-    }
-    if let Some(requested) = key.workgroup
-        && requested != workgroup {
-            return Err(LumaError::KernelWorkgroup(format!(
-                "requested {requested:?} but the shader declares @workgroup_size{workgroup:?}"
-            )));
-        }
-    let limits = ctx.device().limits();
-    let per_dim = [
-        limits.max_compute_workgroup_size_x,
-        limits.max_compute_workgroup_size_y,
-        limits.max_compute_workgroup_size_z,
-    ];
-    let invocations = workgroup.iter().map(|&d| u64::from(d)).product::<u64>();
-    if workgroup.iter().zip(per_dim).any(|(&d, max)| d > max)
-        || invocations > u64::from(limits.max_compute_invocations_per_workgroup)
-    {
-        return Err(LumaError::KernelWorkgroup(format!(
-            "{workgroup:?} exceeds the device limits (per dimension {per_dim:?}, \
-             {} invocations in total)",
-            limits.max_compute_invocations_per_workgroup
-        )));
-    }
-
-    // The grid and every user uniform are bound at dynamic offsets into the uniform arena.
-    let uniforms = bindings.iter().filter(|b| b.kind == BindingKind::Uniform).count() as u32;
-    if uniforms + 1 > ctx.max_dynamic_uniforms() {
-        return Err(LumaError::KernelBinding(format!(
-            "{uniforms} uniform arguments exceed the device limit of {} dynamic uniform buffers \
-             per kernel (one is used by luma's grid)",
-            ctx.max_dynamic_uniforms().saturating_sub(1)
-        )));
-    }
-
-    let device = ctx.device();
-    let arg_entries: Vec<_> = bindings
-        .iter()
-        .zip(&numbers)
-        .map(|(info, &binding)| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: match info.kind {
-                    BindingKind::Uniform => wgpu::BufferBindingType::Uniform,
-                    BindingKind::StorageRead => wgpu::BufferBindingType::Storage { read_only: true },
-                    BindingKind::StorageReadWrite => {
-                        wgpu::BufferBindingType::Storage { read_only: false }
-                    }
-                },
-                has_dynamic_offset: info.kind == BindingKind::Uniform,
-                min_binding_size: None,
-            },
-            count: None,
-        })
+        .filter(|&(at, _)| used.as_ref().is_none_or(|used| used[at]))
+        .map(|(_, binding)| binding.info())
         .collect();
-    let args_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label,
-        entries: &arg_entries,
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label,
-        bind_group_layouts: &[Some(ctx.grid_layout()), Some(&args_layout)],
-        immediate_size: 0,
-    });
-    let shader_desc = wgpu::ShaderModuleDescriptor {
-        label,
-        // The module luma parsed and validated, not its text: wgpu would parse it a second time.
-        source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
-    };
-    let shader = if trusted {
-        // Integer division keeps its guards: WGSL defines `x / 0` and `x % 0`, and user data
-        // reaches luma's kernels.
-        let checks = wgpu::ShaderRuntimeChecks {
-            bounds_checks: false,
-            force_loop_bounding: false,
-            ..wgpu::ShaderRuntimeChecks::checked()
-        };
-        // SAFETY: luma's built-in and generated kernels index storage buffers only below the
-        // lengths they are launched with, which never exceed the bound ranges, and all of their
-        // loops are bounded.
-        unsafe { device.create_shader_module_trusted(shader_desc, checks) }
-    } else {
-        device.create_shader_module(shader_desc)
-    };
-    let pipeline = crate::gpu::exit::driver_call(|| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label,
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some(&key.entry),
-        // Trusted kernels write their workgroup memory before reading it.
-        compilation_options: wgpu::PipelineCompilationOptions {
-            zero_initialize_workgroup_memory: !trusted,
-            ..Default::default()
-        },
-        cache: ctx.disk_cache().pipelines(),
-    }));
-    ctx.disk_cache().built();
-
-    Ok(KernelCore {
-        id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed),
-        label: Arc::from(label.unwrap_or(&key.entry)),
-        pipeline,
-        args_layout,
-        bindings,
-        declared,
-        used: used_mask,
-        workgroup,
-    })
+    let name = label.unwrap_or(&module.entry);
+    let raw = ctx.hal().compile_kernel(&module, used.as_deref(), name, trusted)?;
+    Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, module.workgroup_size))
 }
 
 /// A problem size in invocations: `[x]`, `[x, y]` or `[x, y, z]` (missing dimensions are 1).

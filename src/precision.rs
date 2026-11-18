@@ -1,7 +1,7 @@
 //! Extended precision: casts between `f32`, `f64` and [`Df32`] arrays and the compensated
 //! reductions built on them.
 //!
-//! `f64` arrays need a device with 64-bit shader floats (`wgpu::Features::SHADER_F64`, in
+//! `f64` arrays need a device with 64-bit shader floats (`luma_core::Features::SHADER_F64`, in
 //! practice Vulkan) and have the operations `+ - * /`, `sqrt`, `abs`, `sign`, `floor`, `ceil`,
 //! `minimum`, `maximum`, comparisons, `select`, views and reductions; anything else (`exp`,
 //! trigonometry, ...) poisons the result with [`LumaError::Unsupported`](crate::LumaError).

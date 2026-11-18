@@ -15,10 +15,17 @@ to a software Vulkan driver (Mesa llvmpipe). `LUMA_DEVICE` or `ContextOptions::d
 ```rust
 use luma::*;
 
-let cpu = Context::cpu()?;
-assert!(cpu.is_cpu());
-let x = Array::from_slice_on(&cpu, &[1.0f32, 2.0], 2)?;
-assert_eq!((&x + &x).to_vec()?, vec![2.0, 4.0]);
+match Context::cpu() {
+    Ok(cpu) => {
+        assert!(cpu.is_cpu());
+        let x = Array::from_slice_on(&cpu, &[1.0f32, 2.0], 2)?;
+        assert_eq!((&x + &x).to_vec()?, vec![2.0, 4.0]);
+    }
+    Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) => {
+        eprintln!("No software GPU driver is available");
+    }
+    Err(error) => return Err(error),
+}
 # Ok::<(), luma::LumaError>(())
 ```
 
@@ -76,7 +83,7 @@ array, so use it for debugging only. For `f32`, `f64` and `Df32` arrays,
 `is_finite()` / `is_nan()` / `is_inf()` give lazy `bool` arrays you can use in expressions.
 
 **`Array<f64>` fails with `Unsupported`.** The device has no 64-bit shader floats. Check
-`ctx.features().contains(luma::wgpu::Features::SHADER_F64)`, or use `Df32`
+`ctx.features().contains(luma::Features::SHADER_F64)`, or use `Df32`
 ([Precision](precision.md)), which runs everywhere.
 
 **Out of memory.** Array data beyond the memory budget (80% of device memory on Vulkan GPUs)

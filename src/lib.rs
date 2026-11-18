@@ -120,11 +120,12 @@ mod until;
 mod view;
 
 pub use array::Array;
-pub use context::{default_context, flush, Context, ContextOptions, DeviceKind};
+pub use context::{default_context, flush, Context, ContextOptions};
+pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, DeviceKind, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
-pub use kernel::{uniform, view, BindingInfo, BindingKind, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
+pub use kernel::{uniform, view, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
 pub use until::{compile_until_all, iterate_until_all, CompiledUntil, Cond, History, Run, Series, Stat, StopReason, Until};
 pub use linalg::{
@@ -132,17 +133,14 @@ pub use linalg::{
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,
 };
 pub use matmul::matmul;
-pub use jit::cost::CostModel;
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Condition, Operand};
 pub use reduce::Reduction;
 pub use scalar::Scalar;
 pub use scatter::{bincount, AtomicElem};
 pub use search::Side;
-pub use profile::{FusionSplit, KernelTiming, Profile, SplitReason};
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
-pub use tuning::TuningProfile;
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 
 /// Plumbing of `fields!`; not part of the public API.
@@ -152,10 +150,10 @@ pub mod __private {
     pub use crate::ops::Rhs;
 }
 
-/// The `wgpu` crate luma is built on. wgpu types appear in the public API ([`LumaError`]
-/// variants, [`Context::features`]); naming them through this re-export guarantees the same
-/// version.
-pub use wgpu;
+/// The `wgpu` crate luma's wgpu backend is built on (with the `wgpu` feature); naming it through
+/// this re-export guarantees the same version.
+#[cfg(feature = "wgpu")]
+pub use luma_wgpu::wgpu;
 
 /// The `encase` crate [`uniform`] values are written with; deriving `encase::ShaderType` on a
 /// struct makes it a [`UniformValue`]. Naming it through this re-export guarantees the same

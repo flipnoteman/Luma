@@ -4,7 +4,7 @@
 use luma::{Array, Context, ContextOptions, Df32};
 
 fn has_f64(ctx: &Context) -> bool {
-    ctx.features().contains(luma::wgpu::Features::SHADER_F64)
+    ctx.features().contains(luma::Features::SHADER_F64)
 }
 
 /// A tiny deterministic generator (xorshift) of values in `[0, 1)`.

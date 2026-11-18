@@ -138,7 +138,7 @@ assert_eq!(y.clamp(-0.5, 0.5).to_vec()?, vec![0.5, -0.5, 0.0]);
 assert_eq!(y.maximum(0.25).to_vec()?, vec![1.0, 0.25, 0.25]);
 assert_eq!(y.hypot(0.0).to_vec()?, vec![1.0, 1.0, 0.0]);
 assert_eq!(Array::from_slice(&[3.0f32], 1)?.copysign(&y.slice(0, 1..2)).to_vec()?, vec![-3.0]);
-assert!(y.powf(2.0).to_vec()?[1].is_nan());                  // a negative base has no real power
+assert_eq!(y.abs().powf(2.0).to_vec()?, vec![1.0, 1.0, 0.0]); // powf is portable for nonnegative bases
 assert!(y.sin().to_vec()?[0] > 0.84 && (y.atan2(1.0).to_vec()?[0] - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
 # Ok::<(), luma::LumaError>(())
 ```

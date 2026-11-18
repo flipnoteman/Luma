@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use wgpu::{Buffer, BufferUsages};
+use luma_core::{Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT};
 
 /// Smallest buffer the pool hands out.
 const MIN_BUFFER_SIZE: u64 = 16;
@@ -12,7 +12,7 @@ const MIN_BUFFER_SIZE: u64 = 16;
 /// size themselves and never rely on `Buffer::size()` / WGSL `arrayLength`.
 pub(crate) fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
     // Keep copy sizes aligned even when the limit is not.
-    let max_size = max_size & !(wgpu::COPY_BUFFER_ALIGNMENT - 1);
+    let max_size = max_size & !(COPY_BUFFER_ALIGNMENT - 1);
     if bytes > max_size {
         return None;
     }
@@ -23,7 +23,7 @@ pub(crate) fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
 /// Free lists of idle buffers keyed by (size class, usage flags), each oldest first.
 #[derive(Debug)]
 pub(crate) struct BufferPool {
-    free: HashMap<(u64, BufferUsages), VecDeque<(u64, Buffer)>>,
+    free: HashMap<(u64, BufferUsage), VecDeque<(u64, Buffer)>>,
     pooled_bytes: u64,
     /// Stamps buffers in the order they were returned.
     clock: u64,
@@ -41,7 +41,7 @@ impl BufferPool {
 
     /// Takes the most recently returned idle buffer of exactly `class` bytes with exactly
     /// `usage`, if one exists.
-    pub(crate) fn take(&mut self, class: u64, usage: BufferUsages) -> Option<Buffer> {
+    pub(crate) fn take(&mut self, class: u64, usage: BufferUsage) -> Option<Buffer> {
         let (_, buffer) = self.free.get_mut(&(class, usage))?.pop_back()?;
         self.pooled_bytes -= class;
         Some(buffer)

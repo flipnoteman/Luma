@@ -17,7 +17,7 @@ the factors it measured ([Performance](performance.md#the-cost-model)).
 ## `f64`
 
 `Array<f64>` exists on every context, but only works on devices that have 64-bit shader floats
-(`wgpu::Features::SHADER_F64`, in practice Vulkan GPUs). Without it every `f64` operation is
+(`luma::Features::SHADER_F64`, in practice CUDA and some Vulkan GPUs). Without it every `f64` operation is
 poisoned with [`LumaError::Unsupported`](https://docs.rs/luma/latest/luma/enum.LumaError.html).
 Check first:
 
@@ -27,7 +27,7 @@ use luma::*;
 let ctx = Context::new()?;
 let x = Array::from_slice_on(&ctx, &[2.0f32, 3.0], 2)?;
 
-if ctx.features().contains(luma::wgpu::Features::SHADER_F64) {
+if ctx.features().contains(luma::Features::SHADER_F64) {
     let r = x.to_f64().sqrt();
     let got = r.to_vec()?;
     assert!((got[0] - 2.0f64.sqrt()).abs() < 1e-15);

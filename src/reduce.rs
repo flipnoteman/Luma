@@ -418,12 +418,12 @@ pub(crate) fn finish_passes(
     ops: ReduceList,
     wgsl: &'static str,
     elem: u64,
-    mut current: wgpu::Buffer,
+    mut current: luma_core::Buffer,
     mut n: u32,
     mut per_op: bool,
-    target: Option<&wgpu::Buffer>,
+    target: Option<&luma_core::Buffer>,
     finish: Finish,
-) -> Result<wgpu::Buffer> {
+) -> Result<luma_core::Buffer> {
     let count = ops.as_slice().len() as u64;
     while !per_op || n > 1 {
         let groups = ctx.tuning().reduce_groups(n);
@@ -480,12 +480,12 @@ fn reduce_into<T: GpuType>(
     wgsl: &'static str,
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
-    target: Option<&wgpu::Buffer>,
+    target: Option<&luma_core::Buffer>,
     finish: Finish,
-) -> Result<wgpu::Buffer> {
+) -> Result<luma_core::Buffer> {
     let ctx = array.context();
     let count = ops.as_slice().len() as u64;
-    let run_passes = |scratch: &mut Scratch<'_>, current: wgpu::Buffer, n: u32, per_op: bool, target: Option<&wgpu::Buffer>, finish: Finish| {
+    let run_passes = |scratch: &mut Scratch<'_>, current: luma_core::Buffer, n: u32, per_op: bool, target: Option<&luma_core::Buffer>, finish: Finish| {
         finish_passes(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish)
     };
 
@@ -544,10 +544,10 @@ fn bits_first_pass(
     ctx: &Context,
     scratch: &mut Scratch<'_>,
     ops: ReduceList,
-    words: &wgpu::Buffer,
+    words: &luma_core::Buffer,
     n: u32,
-    target: Option<&wgpu::Buffer>,
-) -> Result<(wgpu::Buffer, u32)> {
+    target: Option<&luma_core::Buffer>,
+) -> Result<(luma_core::Buffer, u32)> {
     let count = n.div_ceil(32);
     let groups = ctx.tuning().reduce_groups(count);
     let out = match target {

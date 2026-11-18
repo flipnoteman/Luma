@@ -1,7 +1,7 @@
 # Luma
 
 Async GPU compute library for Rust. Write code with ordinary arithmetic operations and methods, and Luma handles execution 
-with whatever hardware you have (Vulkan, Metal or DX12, through [wgpu](https://wgpu.rs)).
+with whatever hardware you have, through a native CUDA backend, a native Metal backend or [wgpu](https://wgpu.rs) (Vulkan, Metal, DX12).
 
 ```rs
 use luma::*;
@@ -73,13 +73,21 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 
 ## Getting started
 
-You need a recent stable Rust toolchain and a GPU with Vulkan, Metal or DX12 drivers.
+You need a recent stable Rust toolchain and a GPU with a CUDA, Metal, Vulkan or DX12 driver.
 
 Add Luma to a project:
 
 ```toml
 [dependencies]
-luma = "0.4"
+luma = "0.5"
+```
+
+All three backends are enabled by default. To build with one only:
+
+```sh
+cargo build --no-default-features --features metal
+cargo build --no-default-features --features cuda
+cargo build --no-default-features --features wgpu
 ```
 
 Or build it from source:
@@ -91,9 +99,17 @@ cargo build --release
 cargo test
 ```
 
+### Backends
+
+Luma is a Cargo workspace of five crates: `luma-core` (the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-wgpu`, `luma-metal` and `luma-cuda` (each holds one backend and its own code generator for WGSL, MSL or CUDA C++), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal` and `cuda` each enable one backend crate.
+
+With `BackendKind::Auto` (the default) a context opens the first backend that works, in the order CUDA, Metal, wgpu. Choose one with `ContextOptions::backend(BackendKind::..)`, with `Context::cuda()`, `Context::metal()` or `Context::wgpu()`, or with `LUMA_BACKEND`; `Context::backend()` tells which one a context uses. The CUDA driver and NVRTC are loaded at run time: without an NVIDIA driver the CUDA backend reports an error (and `Auto` moves on) instead of failing to start the program.
+
+Custom WGSL kernels (`Context::kernel`) run on every backend: native backends translate them through the kernel IR. `enable wgpu_cooperative_matrix;` works on the wgpu backend only. The native backends bind more buffers per kernel than WebGPU's limits allow (Metal through an argument buffer, CUDA through plain pointer arguments), and on Apple silicon uploads and readbacks use the unified memory the CPU and GPU share. On CUDA, fixed iteration counts that Luma has traced are replayed from a cached CUDA graph.
+
 ### No GPU
 
-Without a GPU, Luma runs through Mesa's llvmpipe, a software Vulkan driver. It is not built into Luma: the driver has to be
+Without a GPU, Luma runs through the wgpu backend and Mesa's llvmpipe, a software Vulkan driver (the CPU fallback needs the `wgpu` feature). It is not built into Luma: the driver has to be
 installed on the machine (`mesa-vulkan-drivers` on most Linux distributions), otherwise opening a context returns an error.
 It is picked automatically when no GPU opens. `LUMA_DEVICE=cpu` or `Context::cpu()` force it, and `LUMA_DEVICE=gpu` refuses
 the fallback and returns an error instead.
@@ -108,7 +124,8 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 
 | Variable | Effect |
 | --- | --- |
-| `LUMA_DEVICE` | `gpu` or `cpu`: restrict the device kind (default: GPU, CPU as fallback) |
+| `LUMA_BACKEND` | `cuda`, `metal`, `wgpu` or `auto`: the backend (default `auto`: CUDA, then Metal, then wgpu) |
+| `LUMA_DEVICE` | `gpu` or `cpu`: restrict the device kind (default: GPU, CPU as fallback); also accepts a backend name (`cuda`, `metal`, `wgpu`) when `LUMA_BACKEND` is not set |
 | `LUMA_MEMORY_BUDGET` | Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it) |
 | `LUMA_CHUNK_BYTES` | Largest buffer an array is split into, in bytes (power of two) |
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
@@ -123,7 +140,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 | `LUMA_DF_FMA` | `off` makes `Df32` products split their factors (Dekker) instead of taking the error of a product from `fma`; `on` trusts that the device's `fma` is fused. Default: a one-time test kernel decides per device (stored with the calibration, see `LUMA_CACHE`); the results are the same either way |
 | `LUMA_CHECK_FINITE` | `1`, `on` or `true`: fail any operation whose result holds a NaN or Inf (debug mode, waits for the GPU after every evaluated array) |
 | `LUMA_CALIBRATE` | `0`, `off` or `false`: skip measuring the device's throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see `LUMA_CACHE`; a measurement that looks contended by other processes is dropped) and use the tuning profile's fixed cost model |
-| `LUMA_CACHE` | `0`, `off` or `false`: do not keep anything between processes. By default luma stores the driver's compiled pipelines (wgpu `PipelineCache`, Vulkan) and the measured cost model per adapter and driver, so a second run skips the multi-second compile of large (`Df32`) kernels and the calibration |
+| `LUMA_CACHE` | `0`, `off` or `false`: do not keep anything between processes. By default luma stores the driver's compiled pipelines (wgpu `PipelineCache`, Vulkan), the PTX that the native CUDA backend compiles with NVRTC (keyed by compiler version and device architecture) and the measured cost model per adapter and driver (the native Metal backend keeps no compiled pipelines between processes), so a second run skips the multi-second compile of large (`Df32`) kernels and the calibration |
 | `LUMA_CACHE_DIR` | Directory of that cache (default `$XDG_CACHE_HOME/luma`, else `~/.cache/luma`); files are written atomically, so processes may share it, and a damaged file is ignored |
 | `LUMA_EXIT_WAIT` | `0` skips waiting at exit for NVIDIA's driver threads on Linux (saves about 50 ms; risks the driver's exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads and then ends the process with `_exit` |
 

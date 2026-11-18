@@ -7,7 +7,7 @@
 //! halo) into workgroup memory and let the reads come from there. This module decides which
 //! sub-programs can be staged ([`candidates`]) and lays the staging out ([`plan`]): the tile,
 //! the region of every staged sub-program relative to the tile origin, and the order in which
-//! sub-programs that read each other are computed. `codegen::staged_main` writes the kernel,
+//! sub-programs that read each other are computed. `kirgen::Build::staged` writes the kernel,
 //! `inline::lower_staged` lowers the programs it runs and `inline::judge` weighs it against the
 //! other ways of running the program. [`check`] validates a layout against its key.
 //!

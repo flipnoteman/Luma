@@ -33,7 +33,7 @@ const N: usize = 24;
 const SHAPE: [usize; 2] = [6, 4];
 
 fn has_f64(ctx: &Context) -> bool {
-    ctx.features().contains(luma::wgpu::Features::SHADER_F64)
+    ctx.features().contains(luma::Features::SHADER_F64)
 }
 
 /// `f64` data in `[0.5, 2]` that is not representable in `f32`.

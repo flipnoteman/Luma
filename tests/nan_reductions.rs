@@ -131,7 +131,7 @@ fn axis_reductions_skip_nans_along_each_axis() {
 #[test]
 fn f64_and_df32_have_nansum_nanmin_and_nanmax() {
     let ctx = Context::new().unwrap();
-    if !ctx.features().contains(luma::wgpu::Features::SHADER_F64) {
+    if !ctx.features().contains(luma::Features::SHADER_F64) {
         return;
     }
     let data = [1.5f64, f64::NAN, -2.25, 8.0, f64::NAN, 0.125];

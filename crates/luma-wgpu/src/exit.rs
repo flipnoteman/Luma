@@ -2,7 +2,7 @@
 //! its worker threads: the `[vk..]` ones and the compiler workers it starts while a device or a
 //! pipeline is created (they keep the name of the thread that started them). This handler,
 //! registered later and so run first, waits until the GPU and those workers are idle; it
-//! destroys nothing (see `IDLE` in `handle.rs`). The compiler workers keep going after the
+//! destroys nothing (see `IDLE` in `device.rs`). The compiler workers keep going after the
 //! pipelines they were started for were created (a backlog of recompiles of cached pipelines);
 //! when one is still busy after [`DRIVER_WAIT`] the driver's handler would hang (it waits for a
 //! lock the worker holds) or free memory the worker uses, so the process ends with `_exit`, with
@@ -10,13 +10,17 @@
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
+
+use crate::device::PipelineStore;
 
 /// The devices to wait for at exit. Devices of instances with validation on (debug builds) are
 /// left out: with two or more devices in the process, the Khronos validation layer no longer
 /// finds the later ones during `exit` and aborts in `vkWaitSemaphores`.
 static DEVICES: Mutex<Vec<wgpu::Device>> = Mutex::new(Vec::new());
+/// The pipeline caches the exit handler writes.
+static STORES: Mutex<Vec<Arc<PipelineStore>>> = Mutex::new(Vec::new());
 static REGISTER: Once = Once::new();
 
 const GPU_WAIT: Duration = Duration::from_secs(2);
@@ -73,6 +77,27 @@ pub(crate) fn track(device: &wgpu::Device, validated: bool) {
     });
 }
 
+/// Has the exit handler write the pipeline cache of `store` too. Not for devices of instances
+/// with validation layers (see [`track`]): at exit the layer no longer finds them and aborts on
+/// the first call.
+pub(crate) fn flush_at_exit(store: &Arc<PipelineStore>) {
+    if store.is_active()
+        && let Ok(mut stores) = STORES.lock()
+    {
+        stores.push(Arc::clone(store));
+    }
+}
+
+/// Writes every cache registered with [`flush_at_exit`] that has unwritten pipelines.
+fn flush_all() {
+    // `try_lock`: this runs at exit, when a thread still running may hold the list.
+    if let Ok(stores) = STORES.try_lock() {
+        for store in stores.iter() {
+            store.flush();
+        }
+    }
+}
+
 /// `0` skips the wait, for short-lived programs that accept the driver's exit race.
 const OPT_OUT_ENV: &str = "LUMA_EXIT_WAIT";
 
@@ -87,7 +112,7 @@ extern "C" fn at_exit(status: std::ffi::c_int, _arg: *mut std::ffi::c_void) {
                 let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(GPU_WAIT) });
             }
         }
-        super::cache::flush_all();
+        flush_all();
         if !wait_for_driver_workers() {
             // SAFETY: the GPU is idle and the pipeline cache is written. What is left to run is
             // the driver's own handler, which would hang on a lock the busy worker holds or free

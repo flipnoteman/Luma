@@ -7,7 +7,6 @@
 //! shrinks the valid part of the tile by the stencil radius) and writes the tile back once.
 //! Shifts are circular, so halo loads wrap around the array like the shifts do.
 
-use std::fmt::Write;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure, Storage};
@@ -16,7 +15,11 @@ use crate::error::LumaError;
 use crate::ops::fold_workgroups;
 use crate::shape::Shape;
 
-use super::codegen::{expression, load, storage_ty, NO_NAMES};
+use luma_core::kir::{BarrierScope, BuiltinVar, KernelModule, KirType, ModuleBuilder};
+
+use crate::gpu::lower::finish;
+
+use super::kirgen::{Frame, Lower, Uni, helper_library, li, lu, reg};
 use super::program::{flatten_stencil, Fused, Instr, Ref};
 use super::{ElemTy, OpKind, ShiftKind};
 use crate::tuning::{stencil_bytes, Tuning, STENCIL_RADIUS as MAX_RADIUS};
@@ -46,16 +49,6 @@ pub(super) fn signed(s: u32, dim: u32) -> i32 {
         s as i32 - dim as i32
     } else {
         s as i32
-    }
-}
-
-/// WGSL of `wrap`, the index into a circular dimension. `small` (a tile and its halo fit in the
-/// dimension, so indices stay within one period) allows two selects instead of two divisions.
-pub(super) fn wrap_source(small: bool) -> &'static str {
-    if small {
-        "fn wrap(v: i32, n: u32) -> u32 { let m = i32(n); return u32(select(select(v, v + m, v < 0), v - m, v >= m)); }"
-    } else {
-        "fn wrap(v: i32, n: u32) -> u32 { let m = i32(n); return u32(((v % m) + m) % m); }"
     }
 }
 
@@ -181,120 +174,147 @@ fn layout(tuning: &Tuning, radius: (u32, u32), one_d: bool, steps: usize) -> ((u
 }
 
 impl Stencil {
-    /// WGSL running `k` steps on tiles of `tile` outputs.
-    fn source(&self, tile: (u32, u32), k: u32) -> String {
+    /// What the module of `k` steps on tiles of `tile` outputs depends on, to cache its kernel by.
+    fn cache_key(&self, tile: (u32, u32), k: u32) -> String {
+        let (lw, lh) = (tile.0 + 2 * k * self.radius.0, tile.1 + 2 * k * self.radius.1);
+        let tys: Vec<ElemTy> = self.inputs.iter().map(|(_, ty)| *ty).collect();
+        format!(
+            "stencil {:?} {tys:?} {:?} {:?} {:?} {} {:?} {tile:?} {k} {} {}",
+            self.instrs,
+            self.u,
+            self.scalar_tys,
+            self.offsets,
+            self.out,
+            self.radius.0,
+            self.radius.1,
+            self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh),
+        )
+    }
+
+    /// Kernel IR running `k` steps on tiles of `tile` outputs.
+    fn module(&self, tile: (u32, u32), k: u32, tuning: &Tuning) -> Result<KernelModule, LumaError> {
         let (tx, ty) = tile;
         let (hx, hy) = (k * self.radius.0, k * self.radius.1);
         let (lw, lh) = (tx + 2 * hx, ty + 2 * hy);
+        let cells = lw * lh;
+        // A tile and its halo fit in the dimension, so that indices stay within one period.
+        let small = self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh);
         let fixed: Vec<usize> = (0..self.inputs.len())
             .filter(|&i| Some(i as u32) != self.u)
             .collect();
-        let mut src = String::from("struct Params { w: u32, h: u32, tiles_x: u32, ");
-        for (k, ty) in self.scalar_tys.iter().enumerate() {
-            let _ = write!(src, "s{k}: {}, ", ty.wgsl());
+        let lib = helper_library(&[self.instrs.as_slice()], tuning, false, false)?;
+        let mut mb = ModuleBuilder::new(format!("Stencil({k} steps) f32"), "main", [WORKGROUP, 1, 1]);
+        let mut env = Lower::new(lib.clone(), &[]);
+        let out = mb.add_storage_read_write("out", KirType::F32);
+        let u = mb.add_storage_read("u", KirType::F32);
+        env.ins = vec![None; self.inputs.len()];
+        for &i in &fixed {
+            env.ins[i] = Some(mb.add_storage_read(&format!("in{i}"), reg(self.inputs[i].1)));
         }
-        src.push_str("}\n");
-        src.push_str("@group(1) @binding(0) var<storage, read_write> out: array<f32>;\n");
-        src.push_str("@group(1) @binding(1) var<storage, read> u: array<f32>;\n");
-        for (b, &i) in fixed.iter().enumerate() {
-            let _ = writeln!(
-                src,
-                "@group(1) @binding({}) var<storage, read> in{i}: array<{}>;",
-                b + 2,
-                storage_ty(self.inputs[i].1)
-            );
+        let mut fields: Vec<(String, KirType)> = vec![
+            ("w".to_owned(), KirType::U32),
+            ("h".to_owned(), KirType::U32),
+            ("tiles_x".to_owned(), KirType::U32),
+        ];
+        for (s, &ty) in self.scalar_tys.iter().enumerate() {
+            fields.push((format!("s{s}"), reg(ty)));
         }
-        let _ = writeln!(
-            src,
-            "@group(1) @binding({}) var<uniform> p: Params;",
-            fixed.len() + 2
-        );
-        let _ = write!(
-            src,
-            "var<workgroup> b0: array<f32, {cells}>;
-var<workgroup> b1: array<f32, {cells}>;
-
-{wrap}
-
-@compute @workgroup_size({WORKGROUP})
-fn main(
-    @builtin(local_invocation_index) lid: u32,
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-) {{
-    let g = wid.x + wid.y * nwg.x;
-    let tile_x = (g % p.tiles_x) * {tx}u;
-    let tile_y = (g / p.tiles_x) * {ty}u;
-    let ox = i32(tile_x) - {hx};
-    let oy = i32(tile_y) - {hy};
-    for (var e = lid; e < {cells}u; e = e + {WORKGROUP}u) {{
-        b0[e] = u[wrap(ox + i32(e % {lw}u), p.w) + wrap(oy + i32(e / {lw}u), p.h) * p.w];
-    }}
-    workgroupBarrier();
-",
-            cells = lw * lh,
-            wrap = wrap_source(self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh)),
-        );
-        let out = self.out;
-        for step in 1..=k {
-            let (from, to) = if step % 2 == 1 {
-                ("b0", "b1")
-            } else {
-                ("b1", "b0")
-            };
-            let (x0, y0) = (step * self.radius.0, step * self.radius.1);
-            let (rw, rh) = (lw - 2 * x0, lh - 2 * y0);
-            let _ = write!(
-                src,
-                "    for (var e = lid; e < {cells}u; e = e + {WORKGROUP}u) {{
-        let lx = {x0}u + e % {rw}u;
-        let ly = {y0}u + e / {rw}u;
-        let c = lx + ly * {lw}u;
-",
-                cells = rw * rh
-            );
-            if !fixed.is_empty() {
-                src.push_str(
-                    "        let gi = wrap(ox + i32(lx), p.w) + wrap(oy + i32(ly), p.h) * p.w;\n",
-                );
+        let uni = Uni::declare(&mut mb, fields);
+        env.set_uniform(uni);
+        let b0 = mb.add_shared("b0", KirType::F32, cells);
+        let b1 = mb.add_shared("b1", KirType::F32, cells);
+        env.declare_wrap(&mut mb, small);
+        {
+            let mut fb = mb.entry_builder();
+            let lid = fb.builtin(BuiltinVar::LocalInvocationIndex);
+            let wid = fb.builtin(BuiltinVar::WorkgroupId);
+            let nwg = fb.builtin(BuiltinVar::NumWorkgroups);
+            let (wx, wy, nx) = (fb.field(wid, 0, KirType::U32), fb.field(wid, 1, KirType::U32), fb.field(nwg, 0, KirType::U32));
+            let (pw, ph, ptiles) = (env.named(&fb, "w"), env.named(&fb, "h"), env.named(&fb, "tiles_x"));
+            let g = fb.let_val("g", wx + wy * nx);
+            let tile_x = fb.let_val("tile_x", (g % ptiles) * lu(&fb, tx));
+            let tile_y = fb.let_val("tile_y", (g / ptiles) * lu(&fb, ty));
+            let ox = fb.let_val("ox", fb.convert(tile_x, KirType::I32) - li(&fb, hx as i32));
+            let oy = fb.let_val("oy", fb.convert(tile_y, KirType::I32) - li(&fb, hy as i32));
+            let env = &env;
+            fb.for_range("e", lid, lu(&fb, cells), lu(&fb, WORKGROUP), |b, e| {
+                let xs = ox + b.convert(e % lu(b, lw), KirType::I32);
+                let ys = oy + b.convert(e / lu(b, lw), KirType::I32);
+                let at = env.wrap(b, xs, pw) + env.wrap(b, ys, ph) * pw;
+                let value = b.load(u, at);
+                b.shared_store(b0, e, value);
+            });
+            fb.barrier(BarrierScope::Workgroup);
+            for step in 1..=k {
+                let (from, to) = if step % 2 == 1 { (b0, b1) } else { (b1, b0) };
+                let (x0, y0) = (step * self.radius.0, step * self.radius.1);
+                let (rw, rh) = (lw - 2 * x0, lh - 2 * y0);
+                let fixed = &fixed;
+                fb.for_range("e", lid, lu(&fb, rw * rh), lu(&fb, WORKGROUP), |b, e| {
+                    let lx = b.let_val("lx", lu(b, x0) + e % lu(b, rw));
+                    let ly = b.let_val("ly", lu(b, y0) + e / lu(b, rw));
+                    let c = b.let_val("c", lx + ly * lu(b, lw));
+                    let gi = if fixed.is_empty() {
+                        lu(b, 0)
+                    } else {
+                        let xs = ox + b.convert(lx, KirType::I32);
+                        let ys = oy + b.convert(ly, KirType::I32);
+                        let at = env.wrap(b, xs, pw) + env.wrap(b, ys, ph) * pw;
+                        b.let_val("gi", at)
+                    };
+                    let mut frame = Frame::with_len(self.instrs.len());
+                    for (i, (_, ty)) in self.inputs.iter().enumerate() {
+                        let value = if Some(i as u32) == self.u {
+                            b.shared_load(from, c)
+                        } else {
+                            env.load_in(b, *ty, env.ins[i].unwrap_or(0), gi)
+                        };
+                        let value = b.let_val(&format!("a{i}"), value);
+                        frame.a.insert((i as u32, 0), value);
+                    }
+                    for (t, instr) in self.instrs.iter().enumerate() {
+                        let value = match self.offsets[t] {
+                            Some((dx, dy)) => {
+                                let centre = b.bitcast(c, KirType::I32);
+                                let at = b.bitcast(centre + li(b, dx + dy * lw as i32), KirType::U32);
+                                b.shared_load(from, at)
+                            }
+                            None => {
+                                let index = lu(b, 0);
+                                env.expression(b, &frame, instr, index, false, false)
+                            }
+                        };
+                        let value = b.let_val(&format!("t{t}"), value);
+                        frame.t[t] = Some(value);
+                    }
+                    match frame.t(self.out as usize) {
+                        Some(value) => b.shared_store(to, c, value),
+                        None => {
+                            env.fail(b, "the stencil has no output instruction");
+                        }
+                    }
+                });
+                fb.barrier(BarrierScope::Workgroup);
             }
-            for (i, (_, ty)) in self.inputs.iter().enumerate() {
-                let load = if Some(i as u32) == self.u {
-                    format!("{from}[c]")
-                } else {
-                    load(*ty, &format!("in{i}"), "gi")
-                };
-                let _ = writeln!(src, "        let a{i}: {} = {load};", ty.wgsl());
-            }
-            for (t, instr) in self.instrs.iter().enumerate() {
-                let value = match self.offsets[t] {
-                    Some((dx, dy)) => format!("{from}[u32(i32(c) + {})]", dx + dy * lw as i32),
-                    None => expression(instr, "i", false, &NO_NAMES),
-                };
-                let _ = writeln!(
-                    src,
-                    "        let t{t}: {} = {value};",
-                    instr.op.out_ty().wgsl()
-                );
-            }
-            let _ = write!(
-                src,
-                "        {to}[c] = t{out};\n    }}\n    workgroupBarrier();\n"
-            );
+            let last = if k % 2 == 1 { b1 } else { b0 };
+            fb.for_range("e", lid, lu(&fb, tx * ty), lu(&fb, WORKGROUP), |b, e| {
+                let lx = e % lu(b, tx);
+                let ly = e / lu(b, tx);
+                let x = b.let_val("x", tile_x + lx);
+                let y = b.let_val("y", tile_y + ly);
+                let inside = b.and(b.lt(x, pw), b.lt(y, ph));
+                b.if_then(inside, |b| {
+                    let cell = (lu(b, hx) + lx) + (lu(b, hy) + ly) * lu(b, lw);
+                    let value = b.shared_load(last, cell);
+                    b.store(out, x + y * pw, value);
+                });
+            });
+            fb.finish();
         }
-        let last = if k % 2 == 1 { "b1" } else { "b0" };
-        let _ = write!(
-            src,
-            "    for (var e = lid; e < {cells}u; e = e + {WORKGROUP}u) {{
-        let x = tile_x + e % {tx}u;
-        let y = tile_y + e / {tx}u;
-        if (x < p.w && y < p.h) {{ out[x + y * p.w] = {last}[({hx}u + e % {tx}u) + ({hy}u + e / {tx}u) * {lw}u]; }}
-    }}
-}}
-",
-            cells = tx * ty,
-        );
-        src
+        if let Some(message) = env.error() {
+            return Err(LumaError::Gpu(format!("stencil kernel: {message}")));
+        }
+        Ok(finish(mb, lib.as_deref()))
     }
 
     /// Runs `steps` steps starting from `start`, as many per launch as the tile allows.
@@ -319,11 +339,9 @@ fn main(
         let mut done = 0;
         while done < steps {
             let k = per_launch.min((steps - done) as u32);
-            let core = jit.stencil_kernel(
-                ctx,
-                self.source(tile, k),
-                &format!("Stencil({k} steps) f32"),
-            )?;
+            let core = jit.module_kernel(ctx, self.cache_key(tile, k), &format!("Stencil({k} steps) f32"), || {
+                self.module(tile, k, ctx.tuning())
+            })?;
             let next = Array::<f32>::alloc(ctx, start.shape())?;
             {
                 let from = current.as_ref().unwrap_or(start);

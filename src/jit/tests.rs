@@ -3400,7 +3400,7 @@ fn a_reduction_requested_with_arrays_that_share_its_expression_waits_for_them() 
 #[test]
 fn an_expression_with_more_scalars_than_a_uniform_holds_is_cut() {
     let ctx = ctx();
-    if !ctx.features().contains(wgpu::Features::SHADER_F64) {
+    if !ctx.features().contains(luma_core::Features::SHADER_F64) {
         return;
     }
     let words = usize::try_from(ctx.max_uniform_bytes() / 4).unwrap();

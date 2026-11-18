@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use wgpu::BufferUsages;
+use luma_core::{Buffer, BufferUsage};
 
 use crate::array::{Failure, Storage};
 use crate::gpu_type::ElemLayout;
@@ -134,9 +134,9 @@ fn run(
     let template: Vec<u32> = dispatches.iter().flatten().copied().collect();
     let words = len_u32(template.len())?;
     let args_bytes = u64::from(words) * WORD;
-    let indirect = STORAGE_USAGE | BufferUsages::INDIRECT;
+    let indirect = STORAGE_USAGE | BufferUsage::INDIRECT;
     let mut owned = Vec::new();
-    let mut take = |bytes: u64, usage: BufferUsages| -> Result<wgpu::Buffer, LumaError> {
+    let mut take = |bytes: u64, usage: BufferUsage| -> Result<Buffer, LumaError> {
         let buffer = ctx.alloc_buffer(bytes, usage)?;
         owned.push(buffer.clone());
         Ok(buffer)
@@ -145,7 +145,7 @@ fn run(
         let tmpl = take(args_bytes, STORAGE_USAGE)?;
         ctx.upload(&tmpl, bytemuck::cast_slice(&template))?;
         let state = take(2 * WORD, STORAGE_USAGE)?;
-        let mut steps: Vec<wgpu::Buffer> = Vec::new();
+        let mut steps: Vec<Buffer> = Vec::new();
         let ping = [Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize))), Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize)))];
         let body_state = body.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
         let check_state = check.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
@@ -170,7 +170,7 @@ fn run(
                 }
                 let args = store_args(&body_key, &[&**next], &inputs, &body_scalars, None, 0)?;
                 ctx.jit().stats.elementwise_launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                ctx.launch_indirect(&body_core, &steps[k], 0, [n, 1, 1], &args.raw())?;
+                ctx.launch_indirect(&body_core, &steps[k], 0, [n, 1, 1], dispatches[0], &args.raw())?;
 
                 let mut inputs = check.inputs.clone();
                 if let Some(at) = check_state {
@@ -184,7 +184,7 @@ fn run(
                 raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
                 raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
                 ctx.jit().stats.reduce_launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                ctx.launch_indirect(&check_core, &steps[k], WORD * 3, [n, 1, 1], &raw)?;
+                ctx.launch_indirect(&check_core, &steps[k], WORD * 3, [n, 1, 1], dispatches[1], &raw)?;
                 drop(raw);
 
                 for (pass, &(count, _)) in folds.iter().enumerate() {
@@ -195,6 +195,7 @@ fn run(
                         &steps[k],
                         WORD * 3 * (2 + pass as u64),
                         [count, 1, 1],
+                        dispatches[2 + pass],
                         &[
                             RawArg::write(output, *output_bytes),
                             RawArg::read(input, *input_bytes),

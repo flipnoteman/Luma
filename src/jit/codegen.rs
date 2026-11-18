@@ -24,11 +24,16 @@ use crate::builtin::{
 use crate::gpu::hash::FxMap;
 use crate::tuning::{STENCIL_RADIUS, Tuning};
 
-use super::inline::{Inlined, Lowered, Region, StagedPrograms};
-use super::params::{self, DivRemSpec};
-use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_df_library, calls_df_math};
+use luma_core::kir::KernelModule;
+
+use crate::error::Result;
+
+use super::inline::{Inlined, Lowered, Region};
+use super::kirgen;
+use super::params;
+use super::program::{FusedKey, Instr, Ref, Tail, calls_df_library, calls_df_math};
 use super::staging::Staging;
-use super::stencil::{WORKGROUP, signed, wrap_source};
+use super::stencil::signed;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
 
 /// The WGSL name of an operand of type `ty`. The scalars of an `f64` or `Df32` operand are
@@ -97,20 +102,6 @@ pub(super) fn load_out(ty: ElemTy, buffer: &str, index: &str) -> String {
             format!("((atomicLoad(&{buffer}[{j} >> 5u]) >> ({j} & 31u)) & 1u)")
         }
         _ => load(ty, buffer, index),
-    }
-}
-
-/// The WGSL statement storing the register value `value` of type `ty` as the element `index` of
-/// the read-write buffer `buffer` (see [`out_storage_ty`]). A bool sets or clears its own bit
-/// atomically and leaves the others of the word alone: the buffer must hold zeros past the end of
-/// the array, and the kernels that write every element at once (a store of whole words) do it
-/// themselves (see `source`).
-pub(super) fn store(ty: ElemTy, buffer: &str, index: &str, value: &str) -> String {
-    match ty {
-        ElemTy::Bool => format!(
-            "{{ let luma_j = {index}; let luma_m = 1u << (luma_j & 31u); if ({value} != 0u) {{ _ = atomicOr(&{buffer}[luma_j >> 5u], luma_m); }} else {{ _ = atomicAnd(&{buffer}[luma_j >> 5u], ~luma_m); }} }}"
-        ),
-        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => format!("{buffer}[{index}] = {value};"),
     }
 }
 
@@ -212,7 +203,7 @@ pub(super) fn views_of(key: &FusedKey) -> Vec<(ViewMap, Edge)> {
 /// [`views_of`] for a lowered key: the distinct views of the contexts of `lowered` (the programs
 /// of one kernel; they include the compositions no instruction of the key names), in order of
 /// creation.
-fn views_of_inlined(key: &FusedKey, lowered: &[&Inlined]) -> Vec<(ViewMap, Edge)> {
+pub(super) fn views_of_inlined(key: &FusedKey, lowered: &[&Inlined]) -> Vec<(ViewMap, Edge)> {
     let mut views = Vec::new();
     for ctx in lowered.iter().flat_map(|inlined| &inlined.ctxs) {
         if let ShiftKind::View { map, edge } = ctx.kind
@@ -570,7 +561,7 @@ const STACK_STAGE_BYTES: u64 = 16384;
 /// neighbours in the result and the workgroup's cells are one contiguous stretch of it; written
 /// by the invocations of the workgroup in order it is a coalesced store instead of one stride
 /// of `total` elements per invocation. Needs the stretch (`wg * total` elements of `ty`) to fit.
-fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
+pub(super) fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
     let Tail::Stack { total, first: 0, block: 1 } = key.tail else { return false };
     // The bits of a `bool` result are written one at a time, not as the words they are in.
     let bytes = match ty {
@@ -581,14 +572,40 @@ fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
     key.outputs.len() == total as usize && total > 1 && u64::from(wg) * u64::from(total) * bytes <= STACK_STAGE_BYTES
 }
 
-/// The WGSL source of the kernel for `key`, with the workgroup shapes `tuning` gives.
+/// What a kernel of a key is built as: the pure tails (a store, a region write, a scatter, an
+/// atomic scatter, a stack) as Kernel IR, built directly (see [`super::kirgen`]); the composite
+/// ones, which reduce, multiply, sort or solve, as the WGSL source of the kernel.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Built {
+    Module(KernelModule),
+    Wgsl(String),
+}
+
+/// The kernel for `key`, with the workgroup shapes `tuning` gives.
 /// `segment_len` (a power of two) is the elements per segment of the arrays the segmented
 /// variant (`key.spans` not empty) runs on. `lowered` is the lowering of `key` (see
 /// `jit::inline`) if it [`inlines`](FusedKey::inlines): the body then computes every
 /// sub-program at the indices it is read at, and no `sub{k}` functions exist; for a
 /// [`Lowered::Staged`] key (`key.staging` set) the staged sub-programs are computed into
 /// workgroup memory instead.
-pub(crate) fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lowered>) -> String {
+pub(crate) fn build(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lowered>) -> Result<Built> {
+    match key.tail {
+        Tail::Store
+        | Tail::StoreMapped(_)
+        | Tail::ParamStoreMapped { .. }
+        | Tail::Scatter { .. }
+        | Tail::ParamScatter { .. }
+        | Tail::ScatterAdd { .. }
+        | Tail::Stack { .. }
+        | Tail::ParamStack { .. } => Ok(Built::Module(kirgen::store_module(key, tuning, segment_len, lowered)?)),
+        Tail::Reduce(_) | Tail::AxisReduce(_) | Tail::Matmul { .. } | Tail::Solve(_) | Tail::Radix(_) => {
+            Ok(Built::Wgsl(source(key, tuning, segment_len, lowered)))
+        }
+    }
+}
+
+/// The WGSL source of the kernel of a composite tail (see [`build`]).
+fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lowered>) -> String {
     let mut src = kernel_source(key, tuning, segment_len, lowered);
     if src.contains("luma_udiv") || src.contains("luma_urem") {
         src.push_str(DIV_HELPERS);
@@ -761,8 +778,6 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         Some(Lowered::Staged(programs)) => views_of_inlined(key, &programs.bodies().collect::<Vec<_>>()),
         None => views_of(key),
     };
-    // The lowered instruction holding the value of main-program instruction `at`.
-    let value = |at: usize| inlined.and_then(|inlined| inlined.main.get(at)).map_or(at, |&lowered| lowered as usize);
     // A reduction of `Df32` brings the library itself (see `reduce_main`), but not its math
     // functions: those come with the program that calls them.
     let reduces_df = reduce && out_ty(outputs[0]) == "vec2<f32>";
@@ -781,7 +796,6 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         };
         src.push_str(&params::view_helpers(&params::views_used(key, &bodies)));
     }
-    let names = Names { views: &views, in_place: &key.in_place };
     if key.tile.is_none() && lowered.is_none() {
         src.push_str(&subs(key, &views, &key.in_place));
     }
@@ -789,11 +803,6 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
     let index = match (segmented, based) {
         (true, _) | (false, true) => "gi",
         (false, false) => "i",
-    };
-    let global = if segmented || based {
-        "    let gi = p.base + i;\n"
-    } else {
-        ""
     };
     match key.tail {
         Tail::Store
@@ -803,211 +812,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         | Tail::ParamScatter { .. }
         | Tail::ScatterAdd { .. }
         | Tail::Stack { .. }
-        | Tail::ParamStack { .. } => {
-            let stores: String = match key.tail {
-                Tail::StoreMapped(map) => {
-                    let n = views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0);
-                    outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), &format!("view{n}(i)"), &format!("t{}", value(at))))).collect()
-                }
-                Tail::ParamStoreMapped { id, .. } => {
-                    outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), &format!("pview{id}(i)"), &format!("t{}", value(at))))).collect()
-                }
-                Tail::Scatter { .. } | Tail::ParamScatter { .. } => {
-                    let len = match key.tail {
-                        Tail::ParamScatter { len_slot } => format!("p.s{len_slot}"),
-                        Tail::Scatter { len } => format!("{len}u"),
-                        _ => unreachable!(),
-                    };
-                    let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
-                    let write = store(out_elem(outputs[0]), "out0", "j", &format!("t{}", value(stored as usize)));
-                    format!("    let j = t{};\n    if (j < {len}) {{ {write} }}\n", value(index as usize))
-                }
-                Tail::ScatterAdd { len, op, private: false, len_slot } => {
-                    let len = len_slot.map_or_else(|| format!("{len}u"), |slot| format!("p.s{slot}"));
-                    let (stored, index) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
-                    let apply = atomic_apply(out_ty(outputs[0]), op, "out0[j]", &format!("t{}", value(stored as usize)), "    ");
-                    format!("    let j = t{};\n    if (j < {len}) {{\n{apply}    }}\n", value(index as usize))
-                }
-                Tail::ScatterAdd { private: true, .. } => String::new(),
-                Tail::Stack { total, .. } if stack_stages(key, wg, out_elem(outputs[0])) => {
-                    let mut stores = String::new();
-                    for (j, &at) in key.outputs.iter().enumerate() {
-                        let _ = writeln!(stores, "        luma_stage[lid.x * {total}u + {j}u] = t{};", value(at as usize));
-                    }
-                    stores
-                }
-                Tail::Stack { total, first, block } => {
-                    let mut stores = if block == 1 {
-                        format!("    let o = i * {total}u + {first}u;\n")
-                    } else {
-                        format!("    let q = i / {block}u;\n    let o = q * {}u + (i - q * {block}u) + {}u;\n", u64::from(total) * u64::from(block), u64::from(first) * u64::from(block))
-                    };
-                    for (j, &at) in key.outputs.iter().enumerate() {
-                        let write = store(
-                            out_elem(outputs[0]),
-                            "out0",
-                            &format!("o + {}u", j as u64 * u64::from(block)),
-                            &format!("t{}", value(at as usize)),
-                        );
-                        let _ = writeln!(stores, "    {write}");
-                    }
-                    stores
-                }
-                Tail::ParamStack {
-                    total,
-                    first,
-                    block_slot,
-                    div,
-                    div_slot,
-                } => {
-                    let quotient = match div {
-                        DivRemSpec::None => "i".to_owned(),
-                        DivRemSpec::Pow2 => format!("(i >> p.s{div_slot})"),
-                        DivRemSpec::Runtime { wide } => udiv("i", div_slot, wide),
-                    };
-                    let mut stores = format!(
-                        "    let b = p.s{block_slot};\n    let q = {quotient};\n    let o = q * ({total}u * b) + (i - q * b) + ({first}u * b);\n"
-                    );
-                    for (j, &at) in key.outputs.iter().enumerate() {
-                        let write = store(
-                            out_elem(outputs[0]),
-                            "out0",
-                            &format!("o + {j}u * b"),
-                            &format!("t{}", value(at as usize)),
-                        );
-                        let _ = writeln!(stores, "    {write}");
-                    }
-                    stores
-                }
-                _ => outputs.iter().enumerate().map(|(j, &at)| format!("    {}\n", store(out_elem(at), &format!("out{j}"), "i", &format!("t{}", value(at))))).collect(),
-            };
-            if let Tail::ScatterAdd { len, op, private: true, .. } = key.tail {
-                let (stored, slot) = (key.outputs.first().copied().unwrap_or(0), key.outputs.get(1).copied().unwrap_or(0));
-                let ty = out_ty(outputs[0]);
-                let bins = (len as usize).next_multiple_of(wg as usize);
-                let atom = if ty == "i32" { "i32" } else { "u32" };
-                let seed = atomic_seed(ty, op);
-                let apply = atomic_apply(ty, op, "acc[j]", &format!("t{}", value(stored as usize)), "            ");
-                let merge = atomic_apply(ty, op, "out0[b]", &if ty == "f32" { "bitcast<f32>(a)".to_owned() } else { "a".to_owned() }, "            ");
-                let _ = write!(
-                    src,
-                    "
-var<workgroup> acc: array<atomic<{atom}>, {bins}>;
-@compute @workgroup_size({wg})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let group = wid.x + wid.y * nwg.x;
-    for (var b = lid.x; b < {bins}u; b = b + {wg}u) {{
-        atomicStore(&acc[b], {seed});
-    }}
-    workgroupBarrier();
-    for (var i = group * {wg}u + lid.x; i < luma.size.x; i = i + nwg.x * nwg.y * {wg}u) {{
-{global}{}        let j = t{};
-        if (j < {len}u) {{
-{apply}        }}
-    }}
-    workgroupBarrier();
-    for (var b = lid.x; b < {len}u; b = b + {wg}u) {{
-        let a = atomicLoad(&acc[b]);
-        if (a != {seed}) {{
-{merge}        }}
-    }}
-}}
-",
-                    match inlined {
-                        Some(inlined) => lowered_body(key, inlined, &names, index, None, None),
-                        None => body(&key.instrs, &key.input_tys, &names, index, segmented),
-                    },
-                    value(slot as usize)
-                );
-                return src;
-            }
-            if let Some(tile) = &key.tile {
-                src.push_str(&tiled_main(key, tile, based, &stores, &names));
-                return src;
-            }
-            if let (Some(Lowered::Staged(programs)), Some(staging)) = (lowered, &key.staging) {
-                src.push_str(&staged_main(key, staging, programs, based, &stores, &names));
-                return src;
-            }
-            if let Tail::Stack { total, .. } = key.tail
-                && stack_stages(key, wg, out_elem(outputs[0]))
-            {
-                // Each invocation computes its cell's `total` values into workgroup memory, then
-                // the workgroup writes its contiguous stretch of the result, coalesced.
-                let _ = write!(
-                    src,
-                    "
-var<workgroup> luma_stage: array<{}, {}>;
-@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let base = gid.x - lid.x + gid.y * nwg.x * {wg}u;
-    let i = base + lid.x;
-    if (i < luma.size.x) {{
-{global}{}{stores}    }}
-    workgroupBarrier();
-    let cells = min({wg}u, luma.size.x - base);
-    for (var e = lid.x; e < cells * {total}u; e = e + {wg}u) {{
-        out0[base * {total}u + e] = luma_stage[e];
-    }}
-}}
-",
-                    out_ty(outputs[0]),
-                    wg * total,
-                    match inlined {
-                        Some(inlined) => lowered_body(key, inlined, &names, index, None, None),
-                        None => body(&key.instrs, &key.input_tys, &names, index, segmented),
-                    }
-                );
-                return src;
-            }
-            let program = match inlined {
-                Some(inlined) => lowered_body(key, inlined, &names, index, None, None),
-                None => body(&key.instrs, &key.input_tys, &names, index, segmented),
-            };
-            if key.runs {
-                // A region write: the bits of the `bool` outputs go to the words of runs (see `runs_main`).
-                let view = match key.tail {
-                    Tail::StoreMapped(map) => format!("view{}", views.iter().position(|&known| known == (map, Edge::None)).unwrap_or(0)),
-                    Tail::ParamStoreMapped { id, .. } => format!("pview{id}"),
-                    _ => unreachable!("runs are for region writes"),
-                };
-                let (mut plain, mut assigns, mut bits) = (String::new(), String::new(), Vec::new());
-                for (j, &at) in outputs.iter().enumerate() {
-                    if out_elem(at) == ElemTy::Bool {
-                        let _ = writeln!(assigns, "        b{j} = t{};", value(at));
-                        bits.push(j);
-                    } else {
-                        let _ = writeln!(plain, "        {}", store(out_elem(at), &format!("out{j}"), &format!("{view}(i)"), &format!("t{}", value(at))));
-                    }
-                }
-                src.push_str(&runs_main(wg, tuning.subgroup32, &view, &bits, &format!("{global}{program}{plain}{assigns}")));
-                return src;
-            }
-            if key.tail == Tail::Store && key.writes_bits() {
-                // The bits of the `bool` outputs are packed by the workgroup (see `packed_main`).
-                let (mut plain, mut assigns, mut bits) = (String::new(), String::new(), Vec::new());
-                for (j, &at) in outputs.iter().enumerate() {
-                    if out_elem(at) == ElemTy::Bool {
-                        let _ = writeln!(assigns, "        b{j} = t{};", value(at));
-                        bits.push(j);
-                    } else {
-                        let _ = writeln!(plain, "        {}", store(out_elem(at), &format!("out{j}"), "i", &format!("t{}", value(at))));
-                    }
-                }
-                src.push_str(&packed_main(wg, tuning.subgroup32, &bits, &format!("{global}{program}{plain}{assigns}")));
-                return src;
-            }
-            let _ = write!(
-                src,
-                "
-@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {wg}u;
-    if (i >= luma.size.x) {{ return; }}
-{global}{program}{stores}}}
-"
-            );
-        }
+        | Tail::ParamStack { .. } => unreachable!("the store tails are built as Kernel IR (see `kirgen::store_module`)"),
         Tail::Reduce(ops) => {
             let (ty, last) = (out_ty(outputs[0]), outputs[0]);
             let guard = format!("p.s{}", key.guard.unwrap_or(0));
@@ -1053,127 +858,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
     }
     src
-}
-
-/// The store kernel of a program with `bool` outputs, which are `bits` (the numbers of the
-/// outputs): a workgroup of `wg` invocations (a multiple of 32) owns `wg` consecutive elements,
-/// which are `wg / 32` whole words of every bool output, so it packs the bits it computes and
-/// writes the words itself. `computed` is what an invocation that has an element runs: the
-/// program, the stores of the other outputs and `b{j} = ...;` for the bool outputs. The
-/// invocations past the end take part (the packing is a barrier, or a ballot) and contribute
-/// false, so the unused bits of the last word are 0. With `ballot` (the subgroups have exactly
-/// 32 invocations, which are consecutive in the workgroup) one ballot gives a word and its first
-/// invocation writes it; otherwise the invocations OR their bits into workgroup memory and the
-/// first `wg / 32` of them write the words after a barrier.
-fn packed_main(wg: u32, ballot: bool, bits: &[usize], computed: &str) -> String {
-    debug_assert!(wg.is_multiple_of(32));
-    let words = wg / 32;
-    let (mut decls, mut zero, mut vars, mut set, mut write) = (String::new(), String::new(), String::new(), String::new(), String::new());
-    for &j in bits {
-        let _ = writeln!(vars, "    var b{j}: u32 = 0u;");
-        if ballot {
-            let _ = writeln!(write, "    {{\n        let m = subgroupBallot(b{j} != 0u).x;\n        if (lane == 0u && i < luma.size.x) {{ atomicStore(&out{j}[i >> 5u], m); }}\n    }}");
-        } else {
-            let _ = writeln!(decls, "var<workgroup> luma_bits{j}: array<atomic<u32>, {words}>;");
-            let _ = writeln!(zero, "    if (lid.x < {words}u) {{ atomicStore(&luma_bits{j}[lid.x], 0u); }}");
-            let _ = writeln!(set, "    atomicOr(&luma_bits{j}[lid.x >> 5u], b{j} << (lid.x & 31u));");
-            let _ = writeln!(
-                write,
-                "    if (lid.x < {words}u && base + lid.x * 32u < luma.size.x) {{ atomicStore(&out{j}[(base >> 5u) + lid.x], atomicLoad(&luma_bits{j}[lid.x])); }}"
-            );
-        }
-    }
-    let lane = if ballot { ",\n    @builtin(subgroup_invocation_id) lane: u32" } else { "" };
-    let barrier = if ballot { "" } else { "    workgroupBarrier();\n" };
-    format!(
-        "
-{decls}@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>{lane}) {{
-    let base = gid.x - lid.x + gid.y * nwg.x * {wg}u;
-    let i = base + lid.x;
-{zero}{barrier}{vars}    if (i < luma.size.x) {{
-{computed}    }}
-{set}{barrier}{write}}}
-"
-    )
-}
-
-/// The kernel of a region write ([`Tail::StoreMapped`]) with `bool` outputs, which are `bits`,
-/// when the region is made of runs of consecutive elements of the base (`p.run` elements; the
-/// first element of run `r` is `view(r * p.run)`; a run spans at most `p.words` words of the
-/// base). The invocations are the 32 bits of every word a run spans, 32 neighbours to a word:
-/// the bit of base element `at` computes the element `i` of the region that goes there (if the
-/// run holds `at`: otherwise the invocation only takes part in packing, as a bit nobody writes),
-/// so the 32 neighbours build the whole word in registers (a ballot, or an OR in workgroup
-/// memory), as [`packed_main`] does, and the word is stored as it is if all 32 bits belong to the
-/// run. The words at the ends of a run, shared with elements that the write leaves alone (and
-/// with the neighbouring runs), only change the bits of the run: an atomic AND clears the bits
-/// the run writes and an atomic OR sets those that are true. `computed` is what an invocation
-/// whose bit is in a run runs (the program, the other outputs' stores and `b{j} = ...;`).
-fn runs_main(wg: u32, ballot: bool, view: &str, bits: &[usize], computed: &str) -> String {
-    debug_assert!(wg.is_multiple_of(32));
-    let words = wg / 32;
-    let (mut decls, mut zero, mut vars, mut set, mut write) = (String::new(), String::new(), String::new(), String::new(), String::new());
-    // Stores the word `v` of the output `j` into the base word `wd`, `m` being the bits of the run.
-    let store_word = |j: usize, v: &str, wd: &str, pad: &str| {
-        format!(
-            "{pad}if (m == 0xFFFFFFFFu) {{ atomicStore(&out{j}[{wd}], {v}); }} else {{ _ = atomicAnd(&out{j}[{wd}], ~m); if ({v} != 0u) {{ _ = atomicOr(&out{j}[{wd}], {v}); }} }}\n"
-        )
-    };
-    for &j in bits {
-        let _ = writeln!(vars, "    var b{j}: u32 = 0u;");
-        if ballot {
-            let _ = write!(write, "    let v{j} = subgroupBallot(b{j} != 0u).x;\n    if (lane == 0u && m != 0u) {{\n{}    }}\n", store_word(j, &format!("v{j}"), "wd", "        "));
-        } else {
-            let _ = writeln!(decls, "var<workgroup> luma_bits{j}: array<atomic<u32>, {words}>;");
-            let _ = writeln!(zero, "    if (lid.x < {words}u) {{ atomicStore(&luma_bits{j}[lid.x], 0u); }}");
-            let _ = writeln!(set, "    atomicOr(&luma_bits{j}[lid.x >> 5u], b{j} << bit);");
-            let _ = write!(write, "        {{\n            let v = atomicLoad(&luma_bits{j}[lid.x]);\n{}        }}\n", store_word(j, "v", "wd", "            "));
-        }
-    }
-    let at = "    let slot = g >> 5u;\n    let bit = g & 31u;\n    let run = slot / p.words;\n";
-    let start = format!("{view}(run * p.run)");
-    let (lane, head, tail) = if ballot {
-        (
-            ",\n    @builtin(subgroup_invocation_id) lane: u32",
-            String::new(),
-            format!("    let m = subgroupBallot(ok).x;\n{write}"),
-        )
-    } else {
-        (
-            "",
-            format!("    if (lid.x < {words}u) {{ atomicStore(&luma_valid[lid.x], 0u); }}\n{zero}    workgroupBarrier();\n"),
-            format!(
-                "{set}    atomicOr(&luma_valid[lid.x >> 5u], select(0u, 1u << bit, ok));
-    workgroupBarrier();
-    if (lid.x < {words}u) {{
-        let m = atomicLoad(&luma_valid[lid.x]);
-        if (m != 0u) {{
-            let s = ((g - lid.x) >> 5u) + lid.x;
-            let r = s / p.words;
-            let wd = ({view}(r * p.run) >> 5u) + (s - r * p.words);
-{write}        }}
-    }}
-"
-            ),
-        )
-    };
-    let valid_decl = if ballot { String::new() } else { format!("var<workgroup> luma_valid: array<atomic<u32>, {words}>;\n{decls}") };
-    format!(
-        "
-{valid_decl}@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>{lane}) {{
-    let g = gid.x + gid.y * nwg.x * {wg}u;
-{at}    let rb = {start};
-    let wd = (rb >> 5u) + (slot - run * p.words);
-    let element = (wd << 5u) + bit;
-    let ok = g < luma.size.x && element >= rb && element - rb < p.run;
-    let i = run * p.run + (element - rb);
-{head}{vars}    if (ok) {{
-{computed}    }}
-{tail}}}
-"
-    )
 }
 
 /// `fn {name}(i: u32) -> T { ...; return t{out}; }`: the value of instruction `out` of the main
@@ -1296,74 +980,6 @@ fn needed(instrs: &[Instr], outs: &[usize]) -> Vec<bool> {
         }
     }
     keep
-}
-
-/// A kernel running `p.steps` iterations of the store program `key` per element, with the
-/// state in registers. `states[k]` is the state that input `k` reads (`None`: a loop-invariant
-/// input). Bindings: one output and one initial value per state, the invariant inputs, `p`.
-pub(super) fn loop_source(key: &FusedKey, states: &[Option<usize>], tuning: &Tuning) -> String {
-    let wg = tuning.elementwise_workgroup;
-    let count = key.outputs.len();
-    // The type of the states (`run_loop_fused` checked that they agree).
-    let state_elem = key.outputs.first().and_then(|&at| key.instrs.get(at as usize)).map_or(ElemTy::F32, |instr| instr.op.out_ty());
-    let state_ty = state_elem.wgsl();
-    let mut src = String::from("struct Params { steps: u32, ");
-    for (k, ty) in key.scalar_tys.iter().enumerate() {
-        let _ = write!(src, "s{k}: {}, ", ty.wgsl());
-    }
-    src.push_str("}\n");
-    let mut binding = 0;
-    for (role, access) in [("out", "read_write"), ("init", "read")] {
-        for j in 0..count {
-            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, {access}> {role}{j}: array<{}>;", storage_ty(state_elem));
-            binding += 1;
-        }
-    }
-    for (k, ty) in key.input_tys.iter().enumerate() {
-        if states.get(k).copied().flatten().is_none() {
-            let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> in{k}: array<{}>;", storage_ty(*ty));
-            binding += 1;
-        }
-    }
-    let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
-    // The tests of the class of a value (`luma_bits`) come with the library of the guard.
-    src.push_str(&library_for(key, tuning));
-    src.push_str(&generator_helpers([key.instrs.as_slice()]));
-    let _ = write!(
-        src,
-        "
-@compute @workgroup_size({wg})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let i = gid.x + gid.y * nwg.x * {wg}u;
-    if (i >= luma.size.x) {{ return; }}
-"
-    );
-    for j in 0..count {
-        let _ = writeln!(src, "    var s{j}: {state_ty} = {};", load(state_elem, &format!("init{j}"), "i"));
-    }
-    for (k, ty) in key.input_tys.iter().enumerate() {
-        if states.get(k).copied().flatten().is_none() && direct(&key.instrs, k as u32) {
-            let _ = writeln!(src, "    let a{k}: {} = {};", ty.wgsl(), load(*ty, &format!("in{k}"), "i"));
-        }
-    }
-    src.push_str("    for (var step = 0u; step < p.steps; step = step + 1u) {\n");
-    for (k, state) in states.iter().enumerate() {
-        if let Some(j) = state {
-            let _ = writeln!(src, "        let a{k}: {state_ty} = s{j};");
-        }
-    }
-    for (k, instr) in key.instrs.iter().enumerate() {
-        let _ = writeln!(src, "        let t{k}: {} = {};", instr.op.out_ty().wgsl(), expression(instr, "i", false, &NO_NAMES));
-    }
-    for (j, at) in key.outputs.iter().enumerate() {
-        let _ = writeln!(src, "        s{j} = t{at};");
-    }
-    src.push_str("    }\n");
-    for j in 0..count {
-        let _ = writeln!(src, "    {}", store(state_elem, &format!("out{j}"), "i", &format!("s{j}")));
-    }
-    src.push_str("}\n");
-    src
 }
 
 /// The loads of the inputs at element `i` and the instructions, as `let` bindings. The inputs
@@ -1638,7 +1254,7 @@ pub(crate) struct TileSlots {
     /// The array is 1-dimensional.
     pub(crate) one_d: bool,
     /// A tile and its halo fit in the array along every axis, so that a halo cell is at most
-    /// one period away (see [`wrap_source`]).
+    /// one period away (see `Lower::declare_wrap`).
     pub(crate) small: bool,
 }
 
@@ -1775,213 +1391,6 @@ pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tu
     Some(Tile { dims: (w, h), slots: None, tile: (tx, ty), need, offsets })
 }
 
-/// The kernel of `key` with its sub-programs staged as `tile` says, running one workgroup per
-/// tile of the array. `based` and `stores` are those of the plain store kernel.
-fn tiled_main(key: &FusedKey, tile: &Tile, based: bool, stores: &str, names: &Names) -> String {
-    let (tx, ty) = tile.tile;
-    let region = |j: usize| (tx + 2 * tile.need[j].0, ty + 2 * tile.need[j].1);
-    // The extents are literals, or words of the uniform.
-    let (one_d, small, w, h, tiles_x) = match tile.slots {
-        Some(slots) => (slots.one_d, slots.small, format!("p.s{}", slots.base), format!("p.s{}", slots.base + 1), format!("p.s{}", slots.base + 2)),
-        None => (tile.dims.1 == 1, tile.fits(), format!("{}u", tile.dims.0), format!("{}u", tile.dims.1), format!("{}u", tile.dims.0.div_ceil(tx))),
-    };
-    let (index, global) = if based { ("gi", "        let gi = p.base + i;\n") } else { ("i", "") };
-    // Cell (lx, ly) relative to the tile origin, as a global element.
-    let element = if one_d {
-        format!("wrap(i32(tile_x) + lx, {w})")
-    } else {
-        format!("wrap(i32(tile_x) + lx, {w}) + wrap(i32(tile_y) + ly, {h}) * {w}")
-    };
-    let staged = |p: usize| {
-        move |at: usize, instr: &Instr| -> Option<String> {
-            let (ox, oy) = tile.offsets[p][at]?;
-            let Ref::Sub(j) = instr.args[0] else { return None };
-            let j = j as usize;
-            let ((nx, ny), (lw, _)) = (tile.need[j], region(j));
-            let row = if one_d { String::new() } else { format!(" + u32(ly + ({})) * {lw}u", oy + ny as i32) };
-            Some(format!("w{j}[u32(lx + ({})){row}]", ox + nx as i32))
-        }
-    };
-
-    let mut src = String::new();
-    for (k, instrs) in key.subs.iter().enumerate() {
-        let (lw, lh) = region(k);
-        let ty = instrs.last().map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
-        let _ = writeln!(src, "var<workgroup> w{k}: array<{ty}, {}>;", lw * lh);
-    }
-    let _ = write!(
-        src,
-        "
-{}
-@compute @workgroup_size({WORKGROUP})
-fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let g = wid.x + wid.y * nwg.x;
-    let tile_x = (g % {tiles_x}) * {tx}u;
-    let tile_y = (g / {tiles_x}) * {ty}u;
-",
-        wrap_source(small),
-    );
-    for (k, instrs) in key.subs.iter().enumerate() {
-        let ((nx, ny), (lw, lh)) = (tile.need[k], region(k));
-        let last = instrs.len().saturating_sub(1);
-        let _ = write!(
-            src,
-            "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
-        let lx = i32(e % {lw}u) - {nx};
-        let ly = i32(e / {lw}u) - {ny};
-        let i = {element};
-{global}{}        w{k}[e] = t{last};
-    }}
-    workgroupBarrier();
-",
-            lw * lh,
-            body_with(instrs, &key.input_tys, &Names { views: names.views, in_place: &[] }, index, false, None, &staged(k + 1)),
-        );
-    }
-    let _ = write!(
-        src,
-        "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
-        let lx = i32(e % {tx}u);
-        let ly = i32(e / {tx}u);
-        let x = tile_x + u32(lx);
-        let y = tile_y + u32(ly);
-        if (x < {w} && y < {h}) {{
-            let i = x + y * {w};
-{global}{}{stores}        }}
-    }}
-}}
-",
-        tx * ty,
-        body_with(&key.instrs, &key.input_tys, names, index, false, None, &staged(0)),
-    );
-    src
-}
-
-/// The kernel of `key` with its sub-programs staged as `staging` says: one workgroup per tile of
-/// output cells. Every level of staged sub-programs fills its workgroup-memory arrays `w{s}`
-/// (each cell of its region, strided over the invocations; `programs.groups` are the lowered
-/// bodies) before a barrier, then the main program reads them. `based` and `stores` are those
-/// of the plain store kernel.
-fn staged_main(
-    key: &FusedKey,
-    staging: &Staging,
-    programs: &StagedPrograms,
-    based: bool,
-    stores: &str,
-    names: &Names,
-) -> String {
-    let [tx, ty] = staging.tile;
-    // The extents are literals, or words of the uniform.
-    let (w, h, tiles_x) = match staging.slots {
-        Some(slots) => (
-            format!("p.s{}", slots.base),
-            format!("p.s{}", slots.base + 1),
-            format!("p.s{}", slots.base + 2),
-        ),
-        None => (
-            format!("{}u", staging.dims[0]),
-            format!("{}u", staging.dims[1]),
-            format!("{}u", staging.dims[0].div_ceil(tx)),
-        ),
-    };
-    let (index, global) = if based {
-        ("gi", "            let gi = p.base + i;\n")
-    } else {
-        ("i", "")
-    };
-    let sub_names = Names {
-        views: names.views,
-        in_place: &[],
-    };
-    let mut src = String::new();
-    for entry in &staging.subs {
-        let ty = key.subs.get(entry.sub as usize).and_then(|program| program.last()).map_or(ElemTy::F32, |instr| instr.op.out_ty()).wgsl();
-        let _ = writeln!(src, "var<workgroup> w{}: array<{ty}, {}>;", entry.sub, entry.cells());
-    }
-    let _ = write!(
-        src,
-        "
-@compute @workgroup_size({WORKGROUP})
-fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let g = wid.x + wid.y * nwg.x;
-    let tile_x = (g % {tiles_x}) * {tx}u;
-    let tile_y = (g / {tiles_x}) * {ty}u;
-",
-    );
-    for level in staging.levels.windows(2) {
-        for group in programs.groups.iter().filter(|group| {
-            group
-                .members
-                .first()
-                .is_some_and(|&first| (level[0] as usize..level[1] as usize).contains(&first))
-        }) {
-            let Some(&first) = group.members.first() else {
-                continue;
-            };
-            let Some(entry) = staging.subs.get(first) else {
-                continue;
-            };
-            let (dw_i, dh_i, dw_u) = match staging.slots {
-                Some(slots) => {
-                    let at = slots.sub(first);
-                    (
-                        format!("i32(p.s{at})"),
-                        format!("i32(p.s{})", at + 1),
-                        format!("p.s{at}"),
-                    )
-                }
-                None => (
-                    entry.dims[0].to_string(),
-                    entry.dims[1].to_string(),
-                    format!("{}u", entry.dims[0]),
-                ),
-            };
-            let stores: String = group
-                .members
-                .iter()
-                .zip(&group.values)
-                .filter_map(|(&member, last)| Some(format!("            w{}[e] = t{last};\n", staging.subs.get(member)?.sub)))
-                .collect();
-            let _ = write!(
-                src,
-                "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
-        let lx = i32(e % {rw}u) + ({});
-        let ly = i32(e / {rw}u) + ({});
-        let x = i32(tile_x) + lx;
-        let y = i32(tile_y) + ly;
-        if (x >= 0 && x < {dw_i} && y >= 0 && y < {dh_i}) {{
-            let i = u32(x) + u32(y) * {dw_u};
-{global}{}{stores}        }}
-    }}
-",
-                entry.cells(),
-                entry.lo[0],
-                entry.lo[1],
-                lowered_body(key, &group.body, &sub_names, index, Some(staging), None),
-                rw = entry.width(),
-            );
-        }
-        src.push_str("    workgroupBarrier();\n");
-    }
-    let _ = write!(
-        src,
-        "    for (var e = lid; e < {}u; e = e + {WORKGROUP}u) {{
-        let lx = i32(e % {tx}u);
-        let ly = i32(e / {tx}u);
-        let x = tile_x + u32(lx);
-        let y = tile_y + u32(ly);
-        if (x < {w} && y < {h}) {{
-            let i = x + y * {w};
-{global}{}{stores}        }}
-    }}
-}}
-",
-        tx * ty,
-        lowered_body(key, &programs.main, names, index, Some(staging), None),
-    );
-    src
-}
-
 /// One function `sub{k}(i)` per sub-program: the value of a shifted expression at element `i`.
 /// Programs with sub-programs never run segmented.
 fn subs(key: &FusedKey, views: &[(ViewMap, Edge)], in_place: &[(u32, u32)]) -> String {
@@ -1996,47 +1405,4 @@ fn subs(key: &FusedKey, views: &[(ViewMap, Edge)], in_place: &[(u32, u32)]) -> S
         );
     }
     src
-}
-
-/// The statements applying `op` with `value` (of WGSL type `ty`) to the atomic `target`: floats
-/// are held as their bits, so `f32` retries a compare-and-exchange until it lands (or, for a
-/// min or max, until it would not change the element).
-fn atomic_apply(ty: &str, op: AtomicOp, target: &str, value: &str, pad: &str) -> String {
-    if ty != "f32" {
-        let call = match op {
-            AtomicOp::Add => "atomicAdd",
-            AtomicOp::Min => "atomicMin",
-            AtomicOp::Max => "atomicMax",
-        };
-        return format!("{pad}_ = {call}(&{target}, {value});\n");
-    }
-    let (combine, stable) = match op {
-        AtomicOp::Add => ("bitcast<f32>(old) + v", ""),
-        AtomicOp::Min => ("min(bitcast<f32>(old), v)", "if (nv == old) { break; }\n"),
-        AtomicOp::Max => ("max(bitcast<f32>(old), v)", "if (nv == old) { break; }\n"),
-    };
-    let mut out = format!("{pad}{{\n{pad}    let v = {value};\n{pad}    var old = atomicLoad(&{target});\n{pad}    loop {{\n");
-    let _ = writeln!(out, "{pad}        let nv = bitcast<u32>({combine});");
-    if !stable.is_empty() {
-        let _ = write!(out, "{pad}        {stable}");
-    }
-    let _ = write!(
-        out,
-        "{pad}        let r = atomicCompareExchangeWeak(&{target}, old, nv);\n{pad}        if (r.exchanged) {{ break; }}\n{pad}        old = r.old_value;\n{pad}    }}\n{pad}}}\n"
-    );
-    out
-}
-
-/// What a private accumulator starts as for `op` on elements of type `ty`, as a WGSL value (the
-/// merge skips the elements still holding it).
-fn atomic_seed(ty: &str, op: AtomicOp) -> &'static str {
-    match (ty, op) {
-        ("f32", AtomicOp::Add) | ("u32", AtomicOp::Add | AtomicOp::Max) => "0u",
-        ("f32", AtomicOp::Min) => "0x7F800000u",
-        ("f32", AtomicOp::Max) => "0xFF800000u",
-        ("i32", AtomicOp::Add) => "0i",
-        ("i32", AtomicOp::Min) => "2147483647i",
-        ("i32", AtomicOp::Max) => "bitcast<i32>(0x80000000u)",
-        _ => "0xFFFFFFFFu",
-    }
 }

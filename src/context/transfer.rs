@@ -1,68 +1,17 @@
 //! Uploads, readbacks and the waits for them.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytemuck::Pod;
+use luma_core::hal::advise_huge_pages;
+use luma_core::{BackendError, Buffer};
 
-use wgpu::{Buffer, BufferUsages};
-
-use crate::error::{LumaError, Result};
 use crate::array::Storage;
+use crate::error::{LumaError, Result};
 use crate::gpu::pool;
 
-use super::{lock, Context, MAPPABLE_STORAGE_USAGE};
-use crate::profile::Profiler;
-
-/// Usage of readback buffers.
-pub(super) const STAGING_USAGE: BufferUsages = BufferUsages::MAP_READ.union(BufferUsages::COPY_DST);
-
-/// Usage of upload staging buffers.
-const UPLOAD_USAGE: BufferUsages = BufferUsages::MAP_WRITE.union(BufferUsages::COPY_SRC);
-
-/// Readbacks larger than twice this go in pieces of this size, see [`Context::read`].
-const READ_CHUNK: u64 = 32 << 20;
-
-/// Reusable mapped `MAP_WRITE` buffers, ready to be written: upload staging or mappable storage.
-#[derive(Debug)]
-pub(super) struct FreeUploads {
-    buffers: Vec<Buffer>,
-    bytes: u64,
-    /// Bytes of buffers in the unsubmitted batch or waiting for a `map_async` callback.
-    pub(super) in_flight: u64,
-    /// Most bytes of idle buffers kept for reuse; scales with the memory budget.
-    cap: u64,
-}
-
-impl FreeUploads {
-    pub(super) fn new(cap: u64) -> Self {
-        FreeUploads { buffers: Vec::new(), bytes: 0, in_flight: 0, cap }
-    }
-
-    fn take(&mut self, size: u64) -> Option<Buffer> {
-        let at = self.buffers.iter().position(|buffer| buffer.size() == size)?;
-        self.bytes -= size;
-        Some(self.buffers.swap_remove(at))
-    }
-
-    /// Keeps `buffer` unless that would exceed the cap; returns it otherwise.
-    pub(super) fn put(&mut self, buffer: Buffer) -> Option<Buffer> {
-        if self.bytes + buffer.size() <= self.cap {
-            self.bytes += buffer.size();
-            self.buffers.push(buffer);
-            None
-        } else {
-            Some(buffer)
-        }
-    }
-
-    pub(super) fn drain(&mut self) -> Vec<Buffer> {
-        self.bytes = 0;
-        std::mem::take(&mut self.buffers)
-    }
-}
+use super::Context;
 
 /// Fewest time a wait polls before it blocks in the driver, whatever the recent waits were. A
 /// thread blocked in the driver is woken late: 20-40 us on a desktop RTX 3090, 65 us on a laptop
@@ -141,146 +90,23 @@ impl WaitHistory {
     }
 }
 
-/// Copies below this size stay on the calling thread.
-const PARALLEL_COPY_MIN: usize = 8 << 20;
-
-/// `dst.copy_from_slice(src)` split over several threads for large copies: one core cannot
-/// saturate unified memory, and the page faults of a fresh destination spread out too. The
-/// threads store past the cache (see [`copy_streaming`]).
-pub(crate) fn copy_parallel(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
-    if src.len() < PARALLEL_COPY_MIN || threads == 1 {
-        dst.write_copy_of_slice(src);
-        return;
-    }
-    let chunk = src.len().div_ceil(threads).next_multiple_of(4096);
-    std::thread::scope(|scope| {
-        for (s, d) in src.chunks(chunk).zip(dst.chunks_mut(chunk)) {
-            scope.spawn(move || copy_streaming(s, d));
-        }
-    });
-}
-
-/// `dst.copy_from_slice(src)` with non-temporal stores: the destination lines are not read into
-/// the cache before being overwritten, which a large readback (bound by host memory bandwidth
-/// while the GPU's transfer writes the next chunk) would pay for with a third of its traffic.
-#[cfg(target_arch = "x86_64")]
-fn copy_streaming(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
-    use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
-    const LINE: usize = 64;
-    assert_eq!(src.len(), dst.len(), "source and destination lengths differ");
-    let head = dst.as_ptr().align_offset(LINE).min(dst.len());
-    let (dst_head, dst_body) = dst.split_at_mut(head);
-    let (src_head, src_body) = src.split_at(head);
-    dst_head.write_copy_of_slice(src_head);
-    let (src_lines, src_tail) = src_body.as_chunks::<LINE>();
-    let (dst_lines, dst_tail) = dst_body.as_chunks_mut::<LINE>();
-    for (s, d) in src_lines.iter().zip(dst_lines) {
-        for part in (0..LINE).step_by(16) {
-            // SAFETY: `part + 16 <= LINE`, so both pointers stay inside their 64-byte chunks;
-            // the load is unaligned, and `d` is 64-byte aligned (`head`), as the store requires.
-            // SSE2 is part of the x86_64 baseline.
-            unsafe {
-                let value = _mm_loadu_si128(s.as_ptr().add(part).cast::<__m128i>());
-                _mm_stream_si128(d.as_mut_ptr().add(part).cast::<__m128i>(), value);
-            }
-        }
-    }
-    // SAFETY: SSE is part of the x86_64 baseline. Orders the streaming stores before whatever
-    // reads the destination next, on any thread.
-    unsafe { _mm_sfence() };
-    dst_tail.write_copy_of_slice(src_tail);
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn copy_streaming(src: &[u8], dst: &mut [std::mem::MaybeUninit<u8>]) {
-    dst.write_copy_of_slice(src);
-}
-
-/// The outcome of a `map_async` request, see [`map_for_read`].
-type MapReceiver = mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>;
-
-/// Requests a read mapping of `slice`; [`Context::wait_map`] waits for it.
-fn map_for_read(slice: wgpu::BufferSlice<'_>) -> MapReceiver {
-    let (sender, receiver) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    receiver
-}
-
-/// Backs a large readback destination with transparent huge pages: faulting in, and later
-/// freeing, its 4 KiB pages one by one costs about as much as the copy itself.
-#[cfg(target_os = "linux")]
-fn advise_huge_pages(dst: &mut [std::mem::MaybeUninit<u8>]) {
-    const PAGE: usize = 4096;
-    if dst.len() < PARALLEL_COPY_MIN {
-        return;
-    }
-    let start = (dst.as_mut_ptr() as usize).next_multiple_of(PAGE);
-    let end = (dst.as_mut_ptr() as usize + dst.len()) & !(PAGE - 1);
-    // SAFETY: the page-aligned range lies within `dst`; `madvise` only changes how the kernel
-    // backs it, never its contents, and failure is harmless.
-    unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE) };
-}
-
-#[cfg(not(target_os = "linux"))]
-fn advise_huge_pages(_: &mut [std::mem::MaybeUninit<u8>]) {}
-
-/// [`copy_parallel`] into write-only mapped memory.
-fn write_parallel(src: &[u8], mut dst: wgpu::WriteOnly<'_, [u8]>) {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
-    if src.len() < PARALLEL_COPY_MIN || threads == 1 {
-        dst.copy_from_slice(src);
-        return;
-    }
-    /// A disjoint part of the mapping, handed to one thread.
-    struct Part(std::ptr::NonNull<[u8]>);
-    // SAFETY: parts are disjoint and outlive the scope the threads run in.
-    unsafe impl Send for Part {}
-
-    assert_eq!(src.len(), dst.len(), "source and destination lengths differ");
-    let base = dst.as_raw_ptr().cast::<u8>();
-    let chunk = src.len().div_ceil(threads).next_multiple_of(4096);
-    std::thread::scope(|scope| {
-        for (i, s) in src.chunks(chunk).enumerate() {
-            // SAFETY: `i * chunk + s.len() <= dst.len()`, so the part lies inside the mapping.
-            let part = Part(std::ptr::NonNull::slice_from_raw_parts(unsafe { base.add(i * chunk) }, s.len()));
-            scope.spawn(move || {
-                let part = part;
-                // SAFETY: the part is mapped for writing and no other thread touches it.
-                unsafe { wgpu::WriteOnly::new(part.0) }.copy_from_slice(s);
-            });
-        }
-    });
-}
-
 impl Context {
     /// Records a copy of `data` into the start of `dst`, ordered after everything recorded so
     /// far. `data.len()` must be a multiple of 4.
     ///
-    /// The bytes go through a mappable staging buffer. Those are reused: once the batch that
-    /// copies out of one is submitted it is mapped again, and the next upload of its size class
-    /// writes straight into it.
+    /// The bytes go through a mappable staging buffer of the backend. Those are reused: once the
+    /// batch that copies out of one is submitted it is mapped again, and the next upload of its
+    /// size class writes straight into it.
     pub(crate) fn upload(&self, dst: &Buffer, data: &[u8]) -> Result<()> {
         self.abort_recording()?;
         let bytes = data.len() as u64;
-        let max = self.inner.max_buffer_bytes;
-        let class = pool::size_class(bytes, max)
-            .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
-        let staging = self.take_upload_buffer(&self.inner.uploads, class, UPLOAD_USAGE)?;
-        {
-            let mut view = staging.get_mapped_range_mut(..bytes).map_err(LumaError::MapRange)?;
-            write_parallel(data, view.slice(..));
-        }
-        staging.unmap();
-
-        let mut guard = self.batch()?;
-        let encoder = self.encoder(&mut guard);
-        encoder.copy_buffer_to_buffer(&staging, 0, dst, 0, bytes);
-        lock(&self.inner.uploads).in_flight += staging.size();
-        guard.uploads.push(staging);
-        Ok(())
+        let max = self.max_buffer_bytes();
+        pool::size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        self.relieving(bytes, || match self.hal().record_upload(dst, data, max) {
+            Ok(()) => Ok(Some(())),
+            Err(BackendError::OutOfMemory { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        })
     }
 
     /// Whether `from_slice` writes straight into mappable storage buffers (unified memory)
@@ -294,100 +120,13 @@ impl Context {
     /// must be a multiple of 4.
     pub(crate) fn alloc_filled(&self, data: &[u8]) -> Result<Buffer> {
         let bytes = data.len() as u64;
-        let max = self.inner.max_buffer_bytes;
-        let class = pool::size_class(bytes, max)
-            .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
-        let buffer = self.take_upload_buffer(&self.inner.mappable, class, MAPPABLE_STORAGE_USAGE)?;
-        {
-            let mut view = buffer.get_mapped_range_mut(..bytes).map_err(LumaError::MapRange)?;
-            write_parallel(data, view.slice(..));
-        }
-        buffer.unmap();
-        Ok(buffer)
-    }
-
-    /// Takes a mapped `MAP_WRITE` buffer of `class` bytes from `pool`, polling completed
-    /// submissions (and waiting if more bytes than the idle cap are in flight) before
-    /// allocating a fresh one.
-    fn take_upload_buffer(
-        &self,
-        pool: &Mutex<FreeUploads>,
-        class: u64,
-        usage: BufferUsages,
-    ) -> Result<Buffer> {
-        if let Some(buffer) = self.take_idle(pool, class) {
-            return Ok(buffer);
-        }
-        let (in_flight, cap) = {
-            let uploads = lock(pool);
-            (uploads.in_flight, uploads.cap)
-        };
-        if in_flight > cap {
-            self.flush_locked(&mut *self.batch()?);
-            self.device()
-                .poll(wgpu::PollType::wait_indefinitely())
-                .map_err(|e| LumaError::Poll(Arc::new(e)))?;
-            if let Some(buffer) = lock(pool).take(class) {
-                return Ok(buffer);
-            }
-        }
-        self.new_buffer(class, usage, true)
-    }
-
-    /// An idle mapped buffer of `class` bytes from `pool`. Polls completed submissions first,
-    /// which hands back the buffers whose `map_async` callback is due. Never submits or waits.
-    fn take_idle(&self, pool: &Mutex<FreeUploads>, class: u64) -> Option<Buffer> {
-        if let Some(buffer) = lock(pool).take(class) {
-            return Some(buffer);
-        }
-        let _ = self.device().poll(wgpu::PollType::Poll);
-        lock(pool).take(class)
-    }
-
-    /// A staging buffer holding `data` at its start, unmapped and ready to be copied out of, for
-    /// the uniform slots of [`Arena::upload`](super::uniforms::Arena::upload). It counts as in flight: give it to
-    /// [`Batch::uploads`](super::batch::Batch::uploads), which maps it again once the batch that copies out of it is
-    /// submitted. `None` if no staging buffer can be had (the device is out of memory).
-    ///
-    /// This runs while the batch is being submitted, with the batch locked, so unlike
-    /// [`Context::take_upload_buffer`] it must not flush or wait: it reuses an idle buffer or
-    /// creates a mapped one.
-    pub(super) fn stage(&self, data: &[u8]) -> Option<Buffer> {
-        let bytes = data.len() as u64;
-        let staging = self.mapped_staging(bytes)?;
-        {
-            // A plain copy: the slots of one chunk are kilobytes, and `write_parallel` asks the
-            // OS for the thread count first, which costs more than copying them.
-            let mut view = staging.get_mapped_range_mut(..bytes).ok()?;
-            view.slice(..).copy_from_slice(data);
-        }
-        staging.unmap();
-        lock(&self.inner.uploads).in_flight += staging.size();
-        Some(staging)
-    }
-
-    /// An upload staging buffer for `bytes` bytes, still mapped: an idle one, or a new one.
-    pub(super) fn mapped_staging(&self, bytes: u64) -> Option<Buffer> {
-        let class = pool::size_class(bytes, self.inner.max_buffer_bytes)?;
-        match self.take_idle(&self.inner.uploads, class) {
-            Some(buffer) => Some(buffer),
-            None => self.create_buffer(class, UPLOAD_USAGE, true),
-        }
-    }
-
-    /// Writes `data` at the start of the mapped staging buffer `staging` and unmaps it, so that
-    /// the commands recorded to copy out of it can be submitted. Only [`Arena::upload`](super::uniforms::Arena::upload) calls
-    /// this, for the buffer of a [`Prefix`](super::batch::Prefix), which is mapped for as long as it is not filled.
-    pub(super) fn fill(&self, staging: &Buffer, data: &[u8]) {
-        if !data.is_empty() {
-            match staging.get_mapped_range_mut(..data.len() as u64) {
-                Ok(mut view) => view.slice(..).copy_from_slice(data),
-                Err(error) => {
-                    lock(&self.inner.gpu_error).get_or_insert_with(|| format!("uniform staging buffer: {error}"));
-                }
-            }
-        }
-        staging.unmap();
+        let max = self.max_buffer_bytes();
+        let class = pool::size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        self.relieving(class, || match self.hal().alloc_filled(data, max) {
+            Ok(buffer) => Ok(Some(buffer)),
+            Err(BackendError::OutOfMemory { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        })
     }
 
     /// Copies the first `bytes` bytes of `buffer` into a new vector, see [`Context::read_into`].
@@ -437,164 +176,26 @@ impl Context {
     }
 
     /// Copies the first `dst.len()` bytes of `buffer` into `dst`, after everything recorded so
-    /// far; on success every byte of `dst` is written. Large reads go in [`READ_CHUNK`] pieces,
+    /// far; on success every byte of `dst` is written. The backend reads large buffers in pieces,
     /// each its own submission, so copying one piece out of its staging buffer overlaps the
     /// transfer of the next.
     pub(crate) fn read_into(&self, buffer: &Buffer, dst: &mut [std::mem::MaybeUninit<u8>]) -> Result<()> {
         self.abort_recording()?;
-        let bytes = dst.len() as u64;
-        let chunk = if bytes > 2 * READ_CHUNK { READ_CHUNK } else { bytes.max(1) };
-        let mut staged = Vec::new();
-        for offset in (0..bytes).step_by(chunk as usize) {
-            let size = chunk.min(bytes - offset);
-            match self.alloc_buffer(size, STAGING_USAGE) {
-                Ok(staging) => staged.push((offset, size, staging)),
-                Err(err) => {
-                    for (_, _, s) in staged {
-                        self.recycle(s);
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        let mut maps = Vec::with_capacity(staged.len());
-        match self.batch() {
-            Ok(mut guard) => {
-                for (offset, size, staging) in &staged {
-                    self.encoder(&mut guard).copy_buffer_to_buffer(buffer, *offset, staging, 0, *size);
-                    let submission = self.flush_locked(&mut guard);
-                    maps.push((submission, map_for_read(staging.slice(..*size))));
-                }
-            }
-            Err(err) => {
-                for (_, _, s) in staged {
-                    self.recycle(s);
-                }
-                return Err(err);
-            }
-        }
-
-        let mut longest = Duration::ZERO;
-        let mut staged_iter = staged.into_iter().zip(maps);
-        while let Some(((offset, size, staging), (submission, mapped))) = staged_iter.next() {
-            let step = self.wait_map(submission, &mapped).and_then(|waited| {
-                longest = longest.max(waited);
-                let view = staging.slice(..size).get_mapped_range().map_err(LumaError::MapRange)?;
-                copy_parallel(&view, &mut dst[offset as usize..(offset + size) as usize]);
-                Ok(())
-            });
-            staging.unmap();
-            if let Err(err) = step {
-                for ((_, _, rest), _) in staged_iter {
-                    rest.unmap();
-                }
-                return Err(err);
-            }
-            self.recycle(staging);
-        }
-        self.inner.waits.record(longest);
+        self.notify_released();
+        let waited = self.hal().read_into(buffer, dst, false, self.inner.waits.budget())?;
+        self.inner.waits.record(waited);
         Ok(())
     }
 
     /// Reads the first `bytes` bytes of `buffer` like [`Context::read`], but through one staging
-    /// buffer of at most [`READ_CHUNK`] bytes and without noting the waits in [`WaitHistory`].
+    /// buffer of a bounded size and without noting the waits in [`WaitHistory`].
     /// For readbacks made while the device is full.
     pub(crate) fn read_spill(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<u8>> {
         self.abort_recording()?;
         self.read_vec(bytes, |dst| {
-            let chunk = READ_CHUNK.min(bytes).max(1);
-            let staging = self.alloc_buffer(chunk, STAGING_USAGE)?;
-            for offset in (0..bytes).step_by(chunk as usize) {
-                let size = chunk.min(bytes - offset);
-                let submission = {
-                    let mut guard = self.batch()?;
-                    self.encoder(&mut guard).copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
-                    self.flush_locked(&mut guard)
-                };
-                let mapped = map_for_read(staging.slice(..size));
-                let step = self.wait_map(submission, &mapped).and_then(|_| {
-                    let view = staging.slice(..size).get_mapped_range().map_err(LumaError::MapRange)?;
-                    copy_parallel(&view, &mut dst[offset as usize..(offset + size) as usize]);
-                    Ok(())
-                });
-                staging.unmap();
-                step?;
-            }
-            self.recycle(staging);
+            self.notify_released();
+            self.hal().read_into(buffer, dst, true, self.inner.waits.budget())?;
             Ok(())
         })
-    }
-
-    /// Resolves the timestamps of every query set `profiler` holds into its profile and releases
-    /// the sets. The work that wrote them must have completed already (Metal writes the samples
-    /// late). Never takes the lock of the batch (or waits for the batch to be flushed), so it
-    /// may run while the caller holds it.
-    pub(super) fn read_timestamps(&self, profiler: &mut Profiler) -> Result<()> {
-        let mut encoder = self
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("luma timestamps") });
-        let Some((staging, labels)) = profiler.resolve(self.device(), &mut encoder) else {
-            return Ok(());
-        };
-        let submission = self.queue().submit(Some(encoder.finish()));
-        let slice = staging.slice(..);
-        let mapped = map_for_read(slice);
-        let read = self.wait_map(Some(submission), &mapped).and_then(|_| {
-            let view = slice.get_mapped_range().map_err(LumaError::MapRange)?;
-            let stamps: Vec<u64> = bytemuck::pod_collect_to_vec(&view);
-            let period = f64::from(self.queue().get_timestamp_period());
-            profiler.add_samples(labels.iter().zip(stamps.as_chunks::<2>().0).map(|(label, &[begin, end])| {
-                let nanos = end.saturating_sub(begin) as f64 * period;
-                (Arc::clone(label), Duration::from_secs_f64(nanos * 1e-9))
-            }));
-            Ok(())
-        });
-        staging.unmap();
-        read
-    }
-
-    /// Waits until `submission` (the latest one if `None`) has run and the mapping `mapped`
-    /// reports on is done, and returns how long that took. Polls for it first, like
-    /// [`Context::sync`].
-    fn wait_map(&self, submission: Option<wgpu::SubmissionIndex>, mapped: &MapReceiver) -> Result<Duration> {
-        let start = Instant::now();
-        let mapped = match self.spin_for_map(mapped) {
-            Some(received) => received,
-            None => {
-                self.device()
-                    .poll(wgpu::PollType::Wait { submission_index: submission, timeout: None })
-                    .map_err(|e| LumaError::Poll(Arc::new(e)))?;
-                // The callback runs on whichever thread polls the device first, so it may still
-                // be in flight on another thread after our poll returns; wait for it.
-                mapped.recv()
-            }
-        };
-        let waited = start.elapsed();
-        let mapped = mapped.map_err(|_| LumaError::Map(wgpu::BufferAsyncError))?.map_err(LumaError::Map);
-        // An error the GPU raised while running the batch explains a failed map better.
-        self.take_gpu_error()?;
-        mapped.map(|()| waited)
-    }
-
-    /// Polls without blocking for up to the spin budget ([`WaitHistory`]) until the mapping
-    /// `mapped` reports on is done. `None` if it is not (or a poll failed, which the blocking
-    /// wait reports).
-    fn spin_for_map(
-        &self,
-        mapped: &MapReceiver,
-    ) -> Option<std::result::Result<std::result::Result<(), wgpu::BufferAsyncError>, mpsc::RecvError>> {
-        let deadline = Instant::now() + self.inner.waits.budget();
-        loop {
-            self.device().poll(wgpu::PollType::Poll).ok()?;
-            match mapped.try_recv() {
-                Ok(result) => return Some(Ok(result)),
-                Err(mpsc::TryRecvError::Disconnected) => return Some(Err(mpsc::RecvError)),
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::hint::spin_loop();
-        }
     }
 }
