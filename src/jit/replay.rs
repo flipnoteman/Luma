@@ -9,7 +9,7 @@ use luma_core::{Buffer, ExecGraph, GraphLaunch};
 use crate::array::{Array, Failure, Storage};
 use crate::context::{Cmd, CmdArg, Context, RawArg, Recording};
 use crate::error::Result;
-use crate::gpu::pager::Pin;
+use crate::gpu::pager::{Accounted, Pin};
 use crate::gpu_type::GpuType;
 
 use super::Node;
@@ -28,6 +28,9 @@ pub(crate) struct Plan {
     /// The buffers of `retired` that the plan made up for its intermediates and shares between
     /// them (see `Recording::share_transients`); no state, probe or result is one.
     transient: Vec<Buffer>,
+    /// Counts the bytes of `transient` against the memory budget while the plan lives.
+    #[allow(dead_code)]
+    resident: Option<Accounted>,
 }
 
 impl Plan {
@@ -39,6 +42,7 @@ impl Plan {
             pins: recording.pins,
             retired: recording.retired,
             transient: recording.transient,
+            resident: recording.resident,
         }
     }
 

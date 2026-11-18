@@ -4454,3 +4454,33 @@ fn an_intermediate_read_late_keeps_its_buffer() {
         assert_close(&got, &staged_reference(&x, stages, true, steps), 1e-5, 1e-6);
     }
 }
+
+/// The buffers a plan keeps for its shared intermediates stay counted against the memory budget
+/// from the end of the recording until the plan is dropped, and not a byte longer.
+#[test]
+fn the_shared_buffers_of_a_plan_stay_in_the_memory_accounting() {
+    let ctx = ctx();
+    let x = f32s(&ctx, &values(1000, 33, 0.0, 1.0));
+    let resident = || ctx.pager().resident_bytes();
+    // Every buffer here is of the one size class of 1000 floats.
+    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let before = resident();
+    let (mut trace, mut probes) = crate::jit::Trace::start(&[&x]).ok().unwrap();
+    let probe = probes.pop().unwrap();
+    let next = staged_step(&probe, 8, false);
+    next.eval().unwrap();
+    let recording = resident();
+    let plan = trace.finish_plan().expect("nothing aborted the recording");
+    let held = plan.held_buffers() as u64;
+    let after = resident();
+    assert!(held <= 4, "{held} buffers");
+    // The probe and the result are owned by arrays; the rest of the plan's buffers (the shared
+    // intermediates) are counted for the plan.
+    assert_eq!(after - before, held * class, "plan holds {held} buffers of {class} bytes");
+    assert!(after < recording, "the intermediates that merged left the count: {recording} -> {after}");
+    drop(plan);
+    assert_eq!(resident() - before, 2 * class, "only the probe and the result remain counted");
+    drop((next, probe));
+    drop(trace);
+    assert_eq!(resident(), before);
+}

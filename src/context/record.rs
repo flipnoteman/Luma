@@ -25,7 +25,7 @@ use luma_core::{Buffer, BufferUsage};
 use crate::array::Storage;
 use crate::error::Result;
 use crate::gpu::hash::{FxMap, FxSet};
-use crate::gpu::pager::{take_dead_buffers, Pin};
+use crate::gpu::pager::{take_dead_buffers, Accounted, Pin};
 use crate::kernel::KernelCore;
 
 use super::{Context, RawArg};
@@ -87,6 +87,9 @@ pub(crate) struct Recording {
     /// allocated and released inside the recording. They belong to the plan alone (nothing
     /// outside holds them, and no buffer swap of a stepper may involve one).
     pub transient: Vec<Buffer>,
+    /// Keeps the bytes of `transient` counted as resident (the segments that owned them are gone)
+    /// until the plan, or the recording if it is dropped instead, is.
+    pub resident: Option<Accounted>,
     kernels: FxMap<u64, Arc<KernelCore>>,
 }
 
@@ -148,6 +151,7 @@ impl Context {
                         retired: Vec::new(),
                         fresh: FxSet::default(),
                         transient: Vec::new(),
+                        resident: None,
                         kernels: FxMap::default(),
                     }),
                 ));
@@ -191,6 +195,10 @@ impl Context {
                 // The entry is gone, so `recycle` gives these straight to the pool.
                 for buffer in recording.share_transients() {
                     self.recycle(buffer);
+                }
+                let kept: u64 = recording.transient.iter().map(Buffer::size).sum();
+                if kept > 0 {
+                    recording.resident = Some(Accounted::new(self, kept));
                 }
                 Some(recording)
             }

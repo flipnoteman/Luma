@@ -88,9 +88,32 @@ impl Drop for Pin {
     }
 }
 
+/// Bytes of device buffers that no segment owns but a recorded plan holds, counted in the
+/// pager's `resident_bytes` (so the memory budget sees them) until this is dropped.
+#[derive(Debug)]
+pub(crate) struct Accounted {
+    ctx: Context,
+    bytes: u64,
+}
+
+impl Accounted {
+    /// Counts `bytes` more as resident.
+    pub(crate) fn new(ctx: &Context, bytes: u64) -> Accounted {
+        ctx.pager().resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Accounted { ctx: ctx.clone(), bytes }
+    }
+}
+
+impl Drop for Accounted {
+    fn drop(&mut self) {
+        self.ctx.pager().resident_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 /// Ends the pins in `pins` of every segment that nothing but those pins holds and whose buffer
 /// is in `fresh` (by id), and returns those buffers: they no longer belong to any segment (the
-/// segments are dropped without giving them to the pool) and the caller owns them.
+/// segments are dropped without giving them to the pool) and the caller owns them. Their bytes
+/// leave `resident_bytes`; whoever keeps a buffer counts it again (see [`Accounted`]).
 ///
 /// A segment is held by the storage that owns it, by windows of it through that storage, and by
 /// pins. When every strong reference is one of `pins`, no array reads or writes the segment any
@@ -155,6 +178,12 @@ pub(crate) struct Pager {
 }
 
 impl Pager {
+    /// Bytes counted against the memory budget.
+    #[cfg(test)]
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.resident_bytes.load(Ordering::Relaxed)
+    }
+
     /// Whether resident array data has reached three quarters of the memory budget.
     pub(crate) fn under_pressure(&self) -> bool {
         self.budget.is_some_and(|budget| self.resident_bytes.load(Ordering::Relaxed) >= budget / 4 * 3)
