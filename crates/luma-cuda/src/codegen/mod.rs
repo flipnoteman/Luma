@@ -247,20 +247,6 @@ fn pick(ops: &[Op], k: usize) -> &Op {
     if ops.len() == 1 { &ops[0] } else { &ops[k] }
 }
 
-/// Whether evaluating `e` can fault: it loads through a binding or shared memory, whose index the
-/// emitter does not clamp everywhere, or calls a function that may. Arrays, vectors, locals and
-/// uniforms are clamped or fixed, and integer division is guarded.
-fn may_fault(e: &Expr) -> bool {
-    let mut found = false;
-    e.walk(&mut |x| {
-        found |= matches!(
-            x,
-            Expr::Load { .. } | Expr::StorageRead { .. } | Expr::SharedLoad { .. } | Expr::SharedRead { .. } | Expr::AtomicLoad { .. } | Expr::Call { .. }
-        );
-    });
-    found
-}
-
 fn scalar_val(elem: ScalarTy, op: Op) -> Val {
     Val::Lanes { elem, ops: vec![op] }
 }
@@ -786,12 +772,12 @@ impl<'a> Em<'a> {
                 }
                 Val::Lanes { elem: rt, ops: out }
             }
-            Expr::Ternary { op: IrTernaryOp::Select, a, b, c, .. } if self.expr_ty(a, cx).lanes() == 1 && (may_fault(b) || may_fault(c)) => {
-                // A scalar condition guarding an operand that may fault (a load through a binding
-                // or shared memory, a call) only evaluates the chosen operand, as the C++ `?:` did:
-                // KIR guards out-of-range binding loads this way. The result is a `phi`. Not a stack
-                // slot: NVVM (driver 615) miscompiled slot round-trips here. Every other select is
-                // eager and branch-free, as WGSL's `select` is.
+            Expr::Ternary { op: IrTernaryOp::Select, a, b, c, .. } if self.expr_ty(a, cx).lanes() == 1 => {
+                // A scalar condition only evaluates the chosen operand, as the C++ `?:` did: KIR
+                // guards out-of-range binding loads this way, and the operands of a solver's
+                // selects are often whole expressions (an eager select measured 6-9 % slower on
+                // bowshock's steps). The result is a `phi`, which LLVM if-converts when both sides
+                // are cheap. Not a stack slot: NVVM (driver 615) miscompiled slot round-trips here.
                 let cond = one(&self.expr(fb, a, cx)).1;
                 let (then_l, else_l, end_l) = (fb.label(), fb.label(), fb.label());
                 fb.cond_br(&cond, &then_l, &else_l);

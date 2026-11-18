@@ -865,6 +865,9 @@ struct GateLoop {
     owned: Vec<Buffer>,
     /// Captured spans of steps, by (steps, whether the first is an even step).
     graphs: GraphCache<(usize, bool)>,
+    /// A compiled loop is run again and again: its spans are captured on first use. A one-shot
+    /// loop's are captured the second time a span runs (its first spans run once).
+    compiled: bool,
 }
 
 impl GateLoop {
@@ -921,6 +924,7 @@ impl GateLoop {
             args: Vec::new(),
             owned,
             graphs: GraphCache::new(),
+            compiled: false,
         })
     }
 
@@ -990,13 +994,14 @@ impl GateLoop {
         Ok(())
     }
 
-    /// Steps `i0..i0 + len` (`i0 > 0`) as one graph, captured the second time such a span runs (a
-    /// compiled loop runs its spans again and again, a one-shot loop's first spans run once);
-    /// `None` to launch them one by one.
+    /// Steps `i0..i0 + len` (`i0 > 0`) as one graph: captured on first use in a compiled loop,
+    /// which runs its spans again and again, else the second time such a span runs (a one-shot
+    /// loop's first spans run once); `None` to launch them one by one.
     fn graph(&self, i0: usize, len: usize) -> Result<Option<Arc<dyn ExecGraph>>> {
         let grid = workgroups_1d(&self.ctx, &self.gate, 1)?;
         let key = (len, (i0 + 1).is_multiple_of(2));
-        Ok(self.graphs.get_or_build(key, 1, || {
+        let replays = if self.compiled { jit::PAYING_REPLAYS } else { 1 };
+        Ok(self.graphs.get_or_build(key, replays, || {
             let swaps: Vec<Vec<(Buffer, Buffer)>> = (0..len).map(|k| self.stepper.subst(i0 + k + 1)).collect();
             let resolved: Vec<Vec<Buffer>> = swaps.iter().map(|swaps| self.resolved(swaps)).collect();
             let mut builder = GraphBuilder::new();
@@ -1303,7 +1308,8 @@ fn compile<S: Fields>(
     let gate = ctx
         .jit()
         .stencil_kernel(&ctx, gate_source(recs.len(), &conds), "UntilAllGate")?;
-    let gate_loop = GateLoop::new(&ctx, stepper, gate, conds.len(), stepv, rec_storages, until.max_steps)?;
+    let mut gate_loop = GateLoop::new(&ctx, stepper, gate, conds.len(), stepv, rec_storages, until.max_steps)?;
+    gate_loop.compiled = true;
     Ok(CompiledUntil {
         ctx,
         shapes,
