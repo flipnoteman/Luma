@@ -185,3 +185,8 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 Luma by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.
+
+The `luma-cuda` crate embeds NVIDIA's libdevice math library
+(`crates/luma-cuda/vendor/libdevice.10.bc`), which is not covered by the licences above: it is
+redistributed under the NVIDIA CUDA Toolkit EULA
+([`NVIDIA-CUDA-EULA.txt`](crates/luma-cuda/vendor/NVIDIA-CUDA-EULA.txt)).
