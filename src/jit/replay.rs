@@ -141,26 +141,51 @@ impl<'a> GraphBuilder<'a> {
     }
 }
 
+/// Replays of a graph within one call that pay for capturing and instantiating it (about a
+/// millisecond for a step of a few dozen launches, against about a microsecond saved per launch).
+pub(crate) const PAYING_REPLAYS: usize = 8;
+
 /// Captured graphs by what they replay, `None` for what the backend could not capture (asked
 /// only once). A graph names the buffers it was captured with: the owner of a cache clears it
 /// when one of them is replaced.
+///
+/// A graph is captured when it pays: when the caller is about to replay it often enough
+/// ([`PAYING_REPLAYS`]), or the second time it is asked for (an owner kept across runs replays it
+/// again). Until then the caller replays the launches one by one.
 pub(crate) struct GraphCache<K> {
     graphs: Mutex<FxMap<K, Option<Arc<dyn ExecGraph>>>>,
+    asked: Mutex<FxMap<K, u32>>,
 }
 
-impl<K: Hash + Eq> GraphCache<K> {
+impl<K: Hash + Eq + Copy> GraphCache<K> {
     pub(crate) fn new() -> Self {
-        GraphCache { graphs: Mutex::new(FxMap::default()) }
+        GraphCache { graphs: Mutex::new(FxMap::default()), asked: Mutex::new(FxMap::default()) }
     }
 
-    /// The graph under `key`, captured by `build` on first use.
-    pub(crate) fn get_or_build(&self, key: K, build: impl FnOnce() -> Option<Arc<dyn ExecGraph>>) -> Option<Arc<dyn ExecGraph>> {
-        lock(&self.graphs).entry(key).or_insert_with(build).clone()
+    /// The graph under `key` for `replays` replays now: the cached one, or one captured by
+    /// `build` if that pays; `None` to replay the launches one by one.
+    pub(crate) fn get_or_build(&self, key: K, replays: usize, build: impl FnOnce() -> Option<Arc<dyn ExecGraph>>) -> Option<Arc<dyn ExecGraph>> {
+        if let Some(graph) = lock(&self.graphs).get(&key) {
+            return graph.clone();
+        }
+        let asked = {
+            let mut asked = lock(&self.asked);
+            let n = asked.entry(key).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if replays < PAYING_REPLAYS && asked < 2 {
+            return None;
+        }
+        let graph = build();
+        lock(&self.graphs).insert(key, graph.clone());
+        graph
     }
 
-    /// Forgets every graph.
+    /// Forgets every graph (and how often each was asked for).
     pub(crate) fn clear(&self) {
         lock(&self.graphs).clear();
+        lock(&self.asked).clear();
     }
 
     /// Whether some graph was captured (not only asked for).
@@ -358,7 +383,7 @@ impl Stepper {
         let launches = self.plan.launches() as u32;
         let mut next = 2;
         if rest >= 2 {
-            let pair = self.graphs.get_or_build(StepGraph::Pair, || self.capture_steps(2, 2));
+            let pair = self.graphs.get_or_build(StepGraph::Pair, rest / 2, || self.capture_steps(2, 2));
             let Some(pair) = pair else {
                 return plain(2);
             };
@@ -368,7 +393,7 @@ impl Stepper {
             next += 2 * (rest / 2);
         }
         if next <= steps {
-            match self.graphs.get_or_build(StepGraph::Even, || self.capture_steps(2, 1)) {
+            match self.graphs.get_or_build(StepGraph::Even, 1, || self.capture_steps(2, 1)) {
                 Some(even) => ctx.launch_graph(&*even, launches)?,
                 None => plain(next)?,
             }

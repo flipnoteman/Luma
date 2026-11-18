@@ -990,12 +990,13 @@ impl GateLoop {
         Ok(())
     }
 
-    /// Steps `i0..i0 + len` (`i0 > 0`) as one graph, captured on first use; `None` when the
-    /// backend has no graphs.
+    /// Steps `i0..i0 + len` (`i0 > 0`) as one graph, captured the second time such a span runs (a
+    /// compiled loop runs its spans again and again, a one-shot loop's first spans run once);
+    /// `None` to launch them one by one.
     fn graph(&self, i0: usize, len: usize) -> Result<Option<Arc<dyn ExecGraph>>> {
         let grid = workgroups_1d(&self.ctx, &self.gate, 1)?;
         let key = (len, (i0 + 1).is_multiple_of(2));
-        Ok(self.graphs.get_or_build(key, || {
+        Ok(self.graphs.get_or_build(key, 1, || {
             let swaps: Vec<Vec<(Buffer, Buffer)>> = (0..len).map(|k| self.stepper.subst(i0 + k + 1)).collect();
             let resolved: Vec<Vec<Buffer>> = swaps.iter().map(|swaps| self.resolved(swaps)).collect();
             let mut builder = GraphBuilder::new();
