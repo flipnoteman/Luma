@@ -16,7 +16,7 @@
 //! Every name in the output is numeric-prefixed (`b3`, `l7`, `f0`, `S2`, `m1`, ...) so no WGSL name
 //! can collide with an MSL or C++ keyword.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 use luma_core::BindingKind;
@@ -113,7 +113,43 @@ fn has_continue(body: &[Stmt]) -> bool {
     })
 }
 
+#[derive(Default, Clone)]
+struct Res {
+    grid: bool,
+    binds: BTreeSet<u32>,
+    lens: bool,
+    shared: BTreeSet<u32>,
+    privs: bool,
+    calls: BTreeSet<u32>,
+}
+
+fn lvalue_res(l: &LValue, r: &mut Res) {
+    match l {
+        LValue::Local(_) => {}
+        LValue::Private(_) => r.privs = true,
+        LValue::Storage { binding, .. } => {
+            r.binds.insert(*binding);
+        }
+        LValue::Shared { shared, .. } => {
+            r.shared.insert(*shared);
+        }
+        LValue::Index { base, .. } | LValue::Field { base, .. } => lvalue_res(base, r),
+    }
+}
+
+fn atomic_res(t: &AtomicTarget, r: &mut Res) {
+    match t {
+        AtomicTarget::Storage { binding, .. } => {
+            r.binds.insert(*binding);
+        }
+        AtomicTarget::Shared { shared, .. } => {
+            r.shared.insert(*shared);
+        }
+    }
+}
+
 struct Em<'a> {
+    res: Vec<Res>,
     m: &'a KernelModule,
     /// Position among the active bindings, per binding number.
     rank: Vec<Option<usize>>,
@@ -123,7 +159,6 @@ struct Em<'a> {
     locals: Vec<(String, KirType, bool)>,
     params: Vec<(String, KirType)>,
     hoisted: HashSet<u32>,
-    loops: Vec<Option<String>>,
     labels: u32,
 }
 
@@ -261,7 +296,7 @@ impl<'a> Em<'a> {
                 params.push(format!("{t} v{j}"));
                 let _ = write!(body, " r.m{j} = v{j};");
             }
-            let text = format!("static S{i} {name}({}) {{ S{i} r{{}};{body} return r; }}\n", params.join(", "));
+            let text = format!("static inline __attribute__((always_inline)) S{i} {name}({}) {{ S{i} r{{}};{body} return r; }}\n", params.join(", "));
             self.helpers.insert(key, text);
         }
         name
@@ -440,7 +475,7 @@ impl<'a> Em<'a> {
                 _ => "fmax(cur, v)",
             };
             format!(
-                "static float {fname}({space} atomic_uint* p, float v) {{\n    uint old = atomic_load_explicit(p, memory_order_relaxed);\n    for (;;) {{\n        float cur = as_type<float>(old);\n        if (atomic_compare_exchange_weak_explicit(p, &old, as_type<uint>({combine}), memory_order_relaxed, memory_order_relaxed)) {{ break; }}\n    }}\n    return as_type<float>(old);\n}}\n"
+                "static inline __attribute__((always_inline)) float {fname}({space} atomic_uint* p, float v) {{\n    uint old = atomic_load_explicit(p, memory_order_relaxed);\n    for (;;) {{\n        float cur = as_type<float>(old);\n        if (atomic_compare_exchange_weak_explicit(p, &old, as_type<uint>({combine}), memory_order_relaxed, memory_order_relaxed)) {{ break; }}\n    }}\n    return as_type<float>(old);\n}}\n"
             )
         });
         fname
@@ -497,7 +532,7 @@ impl<'a> Em<'a> {
                         format!("{fname}({})", args.join(", "))
                     })
                     .collect();
-                format!("static {r} {fname}({}) {{ return {r}({}); }}\n", params.join(", "), comps.join(", "))
+                format!("static inline __attribute__((always_inline)) {r} {fname}({}) {{ return {r}({}); }}\n", params.join(", "), comps.join(", "))
             });
         }
     }
@@ -513,7 +548,7 @@ impl<'a> Em<'a> {
             } else {
                 "(b == 0u ? 1u : b)".to_owned()
             };
-            format!("static {t} {fname}({t} a, {t} b) {{ return a {op} {safe}; }}\n")
+            format!("static inline __attribute__((always_inline)) {t} {fname}({t} a, {t} b) {{ return a {op} {safe}; }}\n")
         });
         fname.to_owned()
     }
@@ -522,9 +557,9 @@ impl<'a> Em<'a> {
         let (fname, family) = if dst == ScalarTy::I32 { ("_luma_f2i", "f2i") } else { ("_luma_f2u", "f2u") };
         self.lanes_helper(family, fname, ScalarTy::F32, dst, 1, lanes, |_, r| {
             if dst == ScalarTy::I32 {
-                format!("static {r} {fname}(float x) {{ return (as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u ? 0 : (x <= -2147483648.0f ? {MIN_I32} : (x >= 2147483648.0f ? 2147483647 : int(x))); }}\n")
+                format!("static inline __attribute__((always_inline)) {r} {fname}(float x) {{ return (as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u ? 0 : (x <= -2147483648.0f ? {MIN_I32} : (x >= 2147483648.0f ? 2147483647 : int(x))); }}\n")
             } else {
-                format!("static {r} {fname}(float x) {{ return (as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u ? 0u : (x <= 0.0f ? 0u : (x >= 4294967296.0f ? 0xffffffffu : uint(x))); }}\n")
+                format!("static inline __attribute__((always_inline)) {r} {fname}(float x) {{ return (as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u ? 0u : (x <= 0.0f ? 0u : (x >= 4294967296.0f ? 0xffffffffu : uint(x))); }}\n")
             }
         });
         fname.to_owned()
@@ -532,7 +567,7 @@ impl<'a> Em<'a> {
 
     fn tanh_fn(&mut self, lanes: u8) -> String {
         self.lanes_helper("tanh", "_luma_tanh", ScalarTy::F32, ScalarTy::F32, 1, lanes, |_, _| {
-            "static float _luma_tanh(float x) { return select(tanh(x), select(-1.0f, 1.0f, x > 0.0f), fabs(x) > 15.0f); }\n".to_owned()
+            "static inline __attribute__((always_inline)) float _luma_tanh(float x) { return select(tanh(x), select(-1.0f, 1.0f, x > 0.0f), fabs(x) > 15.0f); }\n".to_owned()
         });
         "_luma_tanh".into()
     }
@@ -649,7 +684,7 @@ impl<'a> Em<'a> {
                 }
             }
             Expr::Call { func, args, .. } => {
-                let mut a = self.ctx_args();
+                let mut a = self.ctx_args(func.0 as usize);
                 for x in args {
                     a.push(self.expr(x));
                 }
@@ -929,33 +964,55 @@ impl<'a> Em<'a> {
             }
             Stmt::Loop { body, continuing, break_if } => {
                 let hoist = !continuing.is_empty() || break_if.is_some();
-                let label = (hoist && has_continue(body)).then(|| {
+                if hoist && has_continue(body) {
                     self.labels += 1;
-                    format!("_cont{}", self.labels)
-                });
-                pad(out, ind);
-                out.push_str("for (;;) {\n");
-                if hoist {
+                    let first = format!("_first{}", self.labels);
+                    pad(out, ind);
+                    out.push_str("{\n");
                     for id in top_decls(body) {
                         self.undeclared(id, out, ind + 1);
                         self.hoisted.insert(id.0);
                     }
-                }
-                self.loops.push(label.clone());
-                self.block(body, out, ind + 1);
-                self.loops.pop();
-                if let Some(l) = &label {
-                    pad(out, ind);
-                    let _ = writeln!(out, "{l}:;");
-                }
-                self.block(continuing, out, ind + 1);
-                if let Some(c) = break_if {
-                    let c = self.expr(c);
                     pad(out, ind + 1);
-                    let _ = writeln!(out, "if ({c}) {{ break; }}");
+                    let _ = writeln!(out, "bool {first} = true;");
+                    pad(out, ind + 1);
+                    out.push_str("for (;;) {\n");
+                    pad(out, ind + 2);
+                    let _ = writeln!(out, "if (!{first}) {{");
+                    self.block(continuing, out, ind + 3);
+                    if let Some(c) = break_if {
+                        let c = self.expr(c);
+                        pad(out, ind + 3);
+                        let _ = writeln!(out, "if ({c}) {{ break; }}");
+                    }
+                    pad(out, ind + 2);
+                    out.push_str("}\n");
+                    pad(out, ind + 2);
+                    let _ = writeln!(out, "{first} = false;");
+                    self.block(body, out, ind + 2);
+                    pad(out, ind + 1);
+                    out.push_str("}\n");
+                    pad(out, ind);
+                    out.push_str("}\n");
+                } else {
+                    pad(out, ind);
+                    out.push_str("for (;;) {\n");
+                    if hoist {
+                        for id in top_decls(body) {
+                            self.undeclared(id, out, ind + 1);
+                            self.hoisted.insert(id.0);
+                        }
+                    }
+                    self.block(body, out, ind + 1);
+                    self.block(continuing, out, ind + 1);
+                    if let Some(c) = break_if {
+                        let c = self.expr(c);
+                        pad(out, ind + 1);
+                        let _ = writeln!(out, "if ({c}) {{ break; }}");
+                    }
+                    pad(out, ind);
+                    out.push_str("}\n");
                 }
-                pad(out, ind);
-                out.push_str("}\n");
             }
             Stmt::Switch { selector, cases, default } => {
                 let sel = self.expr(selector);
@@ -995,12 +1052,7 @@ impl<'a> Em<'a> {
             }
             Stmt::Continue => {
                 pad(out, ind);
-                match self.loops.last() {
-                    Some(Some(l)) => {
-                        let _ = writeln!(out, "goto {l};");
-                    }
-                    _ => out.push_str("continue;\n"),
-                }
+                out.push_str("continue;\n");
             }
             Stmt::Return(v) => {
                 pad(out, ind);
@@ -1094,8 +1146,13 @@ impl<'a> Em<'a> {
     fn binding_param(&mut self, b: u32) -> String {
         let space = self.binding_space(b);
         let e = self.binding_elem(b);
-        let unsized_ = self.m.bindings[b as usize].is_unsized_array;
-        if unsized_ { format!("{space} {e}* b{b}") } else { format!("{space} {e}& b{b}") }
+        let d = &self.m.bindings[b as usize];
+        if d.is_unsized_array {
+            let restrict = if matches!(d.elem_ty, KirType::Atomic(_)) { "" } else { " __restrict" };
+            format!("{space} {e}*{restrict} b{b}")
+        } else {
+            format!("{space} {e}& b{b}")
+        }
     }
 
     fn active(&self) -> Vec<u32> {
@@ -1109,33 +1166,49 @@ impl<'a> Em<'a> {
         if len.is_some() { format!("threadgroup {t}* s{s}") } else { format!("threadgroup {t}& s{s}") }
     }
 
-    fn ctx_params(&mut self) -> Vec<String> {
-        let mut v = vec!["constant LumaGrid& luma".to_owned()];
-        for b in self.active() {
-            v.push(self.binding_param(b));
+    fn ctx_params(&mut self, fn_idx: usize) -> Vec<String> {
+        let r = self.res[fn_idx].clone();
+        let mut v = Vec::new();
+        if r.grid {
+            v.push("constant LumaGrid& luma".to_owned());
         }
-        if !self.lens.is_empty() {
+        for b in self.active() {
+            if r.binds.contains(&b) {
+                v.push(self.binding_param(b));
+            }
+        }
+        if r.lens && !self.lens.is_empty() {
             v.push("constant uint* _ll".to_owned());
         }
-        for s in 0..self.m.shared.len() as u32 {
+        for &s in &r.shared {
             v.push(self.shared_param(s));
         }
-        v.push("thread _LumaPriv& _pv".to_owned());
+        if r.privs && !self.m.privates.is_empty() {
+            v.push("thread _LumaPriv& _pv".to_owned());
+        }
         v
     }
 
-    fn ctx_args(&self) -> Vec<String> {
-        let mut v = vec!["luma".to_owned()];
-        for b in self.active() {
-            v.push(format!("b{b}"));
+    fn ctx_args(&self, fn_idx: usize) -> Vec<String> {
+        let r = &self.res[fn_idx];
+        let mut v = Vec::new();
+        if r.grid {
+            v.push("luma".to_owned());
         }
-        if !self.lens.is_empty() {
+        for b in self.active() {
+            if r.binds.contains(&b) {
+                v.push(format!("b{b}"));
+            }
+        }
+        if r.lens && !self.lens.is_empty() {
             v.push("_ll".to_owned());
         }
-        for s in 0..self.m.shared.len() {
+        for s in &r.shared {
             v.push(format!("s{s}"));
         }
-        v.push("_pv".to_owned());
+        if r.privs && !self.m.privates.is_empty() {
+            v.push("_pv".to_owned());
+        }
         v
     }
 }
@@ -1200,7 +1273,68 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
     let slots = 1 + active_count + usize::from(!lens.is_empty());
     let abi = if slots <= 31 { MslAbi::Direct } else { MslAbi::ArgBuffer };
 
+    let mut res: Vec<Res> = vec![Res::default(); m.functions.len()];
+    for (f, r) in m.functions.iter().zip(res.iter_mut()) {
+        walk_stmts(&f.body, &mut |s| {
+            match s {
+                Stmt::Store { binding, .. } => {
+                    r.binds.insert(*binding);
+                }
+                Stmt::SharedStore { shared, .. } => {
+                    r.shared.insert(*shared);
+                }
+                Stmt::Assign { dst, .. } => lvalue_res(dst, r),
+                Stmt::AtomicStore { target, .. }
+                | Stmt::AtomicRmw { target, .. }
+                | Stmt::AtomicCompareExchange { target, .. } => atomic_res(target, r),
+                _ => {}
+            }
+            s.for_each_expr(&mut |e| {
+                e.walk(&mut |x| match x {
+                    Expr::UniformRead { binding, .. } | Expr::Load { binding, .. } | Expr::StorageRead { binding, .. } => {
+                        r.binds.insert(*binding);
+                    }
+                    Expr::SharedLoad { shared, .. } | Expr::SharedRead { shared, .. } => {
+                        r.shared.insert(*shared);
+                    }
+                    Expr::Private(_) => r.privs = true,
+                    Expr::GridSize(_) => r.grid = true,
+                    Expr::ArrayLength { binding } => {
+                        if rank.get(*binding as usize).is_some_and(|x| x.is_some()) {
+                            r.lens = true;
+                        }
+                    }
+                    Expr::AtomicLoad { target, .. } => atomic_res(target, r),
+                    Expr::Call { func, .. } => {
+                        r.calls.insert(func.0);
+                    }
+                    _ => {}
+                })
+            });
+        });
+    }
+    loop {
+        let mut changed = false;
+        for i in 0..res.len() {
+            for c in res[i].calls.clone() {
+                let callee = res[c as usize].clone();
+                let r = &mut res[i];
+                let before = (r.grid, r.lens, r.privs, r.binds.len(), r.shared.len());
+                r.grid |= callee.grid;
+                r.lens |= callee.lens;
+                r.privs |= callee.privs;
+                r.binds.extend(callee.binds);
+                r.shared.extend(callee.shared);
+                changed |= before != (r.grid, r.lens, r.privs, r.binds.len(), r.shared.len());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let mut em = Em {
+        res,
         m,
         rank,
         lens,
@@ -1209,7 +1343,6 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
         locals: Vec::new(),
         params: Vec::new(),
         hoisted: HashSet::new(),
-        loops: Vec::new(),
         labels: 0,
     };
 
@@ -1243,12 +1376,15 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
     }
 
     // Privates.
-    let mut privs = String::from("struct _LumaPriv {\n    uint _d;\n");
-    for (i, p) in m.privates.iter().enumerate() {
-        let t = em.ty(&p.ty, false);
-        let _ = writeln!(privs, "    {t} p{i};");
+    let mut privs = String::new();
+    if !m.privates.is_empty() {
+        privs.push_str("struct _LumaPriv {\n    uint _d;\n");
+        for (i, p) in m.privates.iter().enumerate() {
+            let t = em.ty(&p.ty, false);
+            let _ = writeln!(privs, "    {t} p{i};");
+        }
+        privs.push_str("};\n");
     }
-    privs.push_str("};\n");
 
     // Helper functions.
     let mut funcs = String::new();
@@ -1260,7 +1396,7 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
         em.locals = f.locals.clone();
         em.params = f.params.clone();
         em.hoisted.clear();
-        let mut ps = em.ctx_params();
+        let mut ps = em.ctx_params(i);
         for (j, (_, t)) in f.params.iter().enumerate() {
             let t = em.ty(t, false);
             ps.push(format!("{t} a{j}"));
@@ -1269,7 +1405,7 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
             Some(t) => em.ty(t, false),
             None => "void".to_owned(),
         };
-        let signature = format!("static {ret} f{i}({})", ps.join(", "));
+        let signature = format!("static inline {ret} f{i}({})", ps.join(", "));
         let _ = writeln!(prototypes, "{signature};");
         let _ = writeln!(funcs, "{signature} {{");
         em.block(&f.body, &mut funcs, 1);
@@ -1302,9 +1438,10 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
                 let space = em.binding_space(*b);
                 let e = em.binding_elem(*b);
                 let _ = writeln!(args_struct, "    {space} {e}* b{b};");
-                let unsized_ = m.bindings[*b as usize].is_unsized_array;
-                if unsized_ {
-                    let _ = writeln!(prologue, "    {space} {e}* b{b} = _luma_args.b{b};");
+                let d = &m.bindings[*b as usize];
+                if d.is_unsized_array {
+                    let restrict = if matches!(d.elem_ty, KirType::Atomic(_)) { "" } else { " __restrict" };
+                    let _ = writeln!(prologue, "    {space} {e}*{restrict} b{b} = _luma_args.b{b};");
                 } else {
                     let _ = writeln!(prologue, "    {space} {e}& b{b} = *_luma_args.b{b};");
                 }
@@ -1372,7 +1509,9 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
         }
         body.push_str("    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
     }
-    body.push_str("    _LumaPriv _pv{};\n");
+    if !m.privates.is_empty() {
+        body.push_str("    _LumaPriv _pv{};\n");
+    }
     for (i, p) in m.privates.iter().enumerate() {
         if let Some(init) = &p.init {
             let e = em.expr(init);
@@ -1480,7 +1619,7 @@ mod tests {
         assert!(t.source.contains("float m2;"));
         assert!(t.source.contains("static_assert(sizeof(S0) == 32"));
         assert!(t.source.contains("constant S0& b0 [[buffer(1)]]"));
-        assert!(t.source.contains("device float* b1 [[buffer(2)]]"));
+        assert!(t.source.contains("device float* __restrict b1 [[buffer(2)]]"));
     }
 
     #[test]
@@ -1553,7 +1692,7 @@ mod tests {
         assert!(t.source.contains("struct LumaArgs"));
         assert!(t.source.contains("device float* b79;"));
         assert!(t.source.contains("constant LumaArgs& _luma_args [[buffer(1)]]"));
-        assert!(t.source.contains("device float* b79 = _luma_args.b79;"));
+        assert!(t.source.contains("device float* __restrict b79 = _luma_args.b79;"));
         // 30 active bindings fit directly (31 slots); 31 do not.
         let used30: Vec<bool> = (0..80).map(|i| i < 30).collect();
         assert_eq!(emit(&m, Some(&used30)).abi, MslAbi::Direct);
@@ -1569,7 +1708,7 @@ mod tests {
         }
         m.entry_body.push(store(2, lit(1.0)));
         let t = emit(&m, Some(&[false, false, true]));
-        assert!(t.source.contains("device float* b2 [[buffer(1)]]"));
+        assert!(t.source.contains("device float* __restrict b2 [[buffer(1)]]"));
         assert!(!t.source.contains("b0"));
     }
 
@@ -1621,8 +1760,9 @@ mod tests {
         assert!(src.contains("for (;;) {"));
         assert!(src.contains("uint l1;"));
         assert!(src.contains("l1 = l0;"));
-        assert!(src.contains("goto _cont1;"));
-        assert!(src.contains("_cont1:;"));
+        assert!(src.contains("bool _first1 = true;"));
+        assert!(src.contains("if (!_first1) {"));
+        assert!(!src.contains("goto"));
         assert!(src.contains("l0 = (l1 + 1u);"));
         assert!(src.contains("if ((l0 >= 8u)) { break; }"));
     }

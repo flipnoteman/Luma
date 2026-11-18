@@ -415,7 +415,7 @@ fn blocks_replayed_as_graphs_match_the_host_loop_and_the_launches_replayed_one_b
     assert_eq!(want[3].0, 25);
     assert_eq!((want[4].0, want[4].1), (100, StopReason::MaxSteps));
     let mut ran = 0;
-    for kind in [BackendKind::Cuda, BackendKind::Cpu, BackendKind::Wgpu] {
+    for kind in [BackendKind::Cuda, BackendKind::Metal, BackendKind::Cpu, BackendKind::Wgpu] {
         let ctx = match Context::with_options(ContextOptions::default().backend(kind).calibrate(false)) {
             Ok(ctx) => ctx,
             Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) => {

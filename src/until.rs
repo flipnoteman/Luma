@@ -761,6 +761,7 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
 
 /// Makes a stepper of the traced plan if the gate can drive it; `Err` gives the plan back (if
 /// any) to be run once.
+#[allow(clippy::result_large_err)]
 fn gated(
     ctx: &Context,
     plan: Plan,
@@ -984,11 +985,21 @@ impl GateLoop {
     /// Steps `i0..i0 + len` launched one by one, the dispatch arguments cycling through
     /// `args[..len]`.
     fn replay_span(&self, i0: usize, len: usize) -> Outcome<()> {
+        let parities = [self.stepper.subst(2), self.stepper.subst(3)];
+        let resolved_parities = [self.resolved(&parities[0]), self.resolved(&parities[1])];
         for k in 0..len {
-            let swaps = self.stepper.subst(i0 + k + 1);
-            self.stepper.plan().replay(&swaps, Some(&self.args[k]))?;
-            let resolved = self.resolved(&swaps);
-            let raw = self.gate_args(&self.args[(k + 1) % len], &resolved);
+            let t = i0 + k + 1;
+            let first = (t == 1).then(|| {
+                let swaps = self.stepper.subst(1);
+                let resolved = self.resolved(&swaps);
+                (swaps, resolved)
+            });
+            let (swaps, resolved) = match &first {
+                Some((s, r)) => (s.as_slice(), r.as_slice()),
+                None => (&parities[t & 1][..], &resolved_parities[t & 1][..]),
+            };
+            self.stepper.plan().replay(swaps, Some(&self.args[k]))?;
+            let raw = self.gate_args(&self.args[(k + 1) % len], resolved);
             launch_1d(&self.ctx, &self.gate, 1, &raw)?;
         }
         Ok(())
@@ -1002,12 +1013,13 @@ impl GateLoop {
         let key = (len, (i0 + 1).is_multiple_of(2));
         let replays = if self.compiled { jit::PAYING_REPLAYS } else { 1 };
         Ok(self.graphs.get_or_build(key, replays, || {
-            let swaps: Vec<Vec<(Buffer, Buffer)>> = (0..len).map(|k| self.stepper.subst(i0 + k + 1)).collect();
-            let resolved: Vec<Vec<Buffer>> = swaps.iter().map(|swaps| self.resolved(swaps)).collect();
+            let swaps = [self.stepper.subst(2), self.stepper.subst(3)];
+            let resolved = [self.resolved(&swaps[0]), self.resolved(&swaps[1])];
             let mut builder = GraphBuilder::new();
             for k in 0..len {
-                builder.plan(self.stepper.plan(), &swaps[k], Some(&self.args[k]));
-                let raw = self.gate_args(&self.args[(k + 1) % len], &resolved[k]);
+                let p = (i0 + k + 1) & 1;
+                builder.plan(self.stepper.plan(), &swaps[p], Some(&self.args[k]));
+                let raw = self.gate_args(&self.args[(k + 1) % len], &resolved[p]);
                 builder.launch(&self.gate, Dispatch::Direct(grid), [1, 1, 1], raw);
             }
             builder.capture(&self.ctx)

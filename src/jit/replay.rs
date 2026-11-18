@@ -233,6 +233,7 @@ impl Stepper {
     /// `Err(plan)` (to be made real with [`Plan::run_once`]) unless the plan can be stepped:
     /// single-buffer states of equal size, results in buffers of their own that the plan writes,
     /// probes that it only reads.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn new(
         ctx: &Context,
         plan: Plan,

@@ -149,6 +149,34 @@ fn run(
         let ping = [Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize))), Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize)))];
         let body_state = body.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
         let check_state = check.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
+        let states = [(from, &ping[0]), (&ping[0], &ping[1]), (&ping[1], &ping[0])];
+        let mut body_args = Vec::with_capacity(3);
+        let mut check_pins = Vec::with_capacity(3);
+        for &(current, next) in &states {
+            let mut inputs = body.inputs.clone();
+            if let Some(at) = body_state {
+                inputs[at] = Arc::clone(current);
+            }
+            body_args.push(store_args(&body_key, &[&**next], &inputs, &body_scalars, None, 0)?);
+
+            let mut inputs = check.inputs.clone();
+            if let Some(at) = check_state {
+                inputs[at] = Arc::clone(current);
+            }
+            check_pins.push(pin_inputs(&check_key, &inputs, None, 0, n)?);
+        }
+        let body_raws: [Vec<RawArg<'_>>; 3] = std::array::from_fn(|s| body_args[s].raw());
+        let check_uniform = params(&check_key, None, Some(n), 0, len, None, &check_scalars)?;
+        let (first_out, first_bytes) = &partials[0];
+        let check_raws: [Vec<RawArg<'_>>; 3] = std::array::from_fn(|s| {
+            let pins = &check_pins[s];
+            let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
+            raw.push(RawArg::write(first_out, *first_bytes));
+            raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+            raw.push(RawArg::Uniform(bytemuck::cast_slice(&check_uniform)));
+            raw
+        });
+        let fold_counts: Vec<[u32; 1]> = folds.iter().map(|&(count, _)| [count]).collect();
 
         let mut base = 0;
         let mut block = FIRST_BLOCK;
@@ -159,51 +187,31 @@ fn run(
             }
             ctx.upload(&state, bytemuck::cast_slice(&[0u32, 0]))?;
             ctx.upload(&steps[0], bytemuck::cast_slice(&template))?;
+            ctx.jit().stats.elementwise_launches.fetch_add(in_block as u64, std::sync::atomic::Ordering::Relaxed);
+            ctx.jit().stats.reduce_launches.fetch_add(in_block as u64, std::sync::atomic::Ordering::Relaxed);
             for k in 0..in_block {
                 let i = base + k;
-                let current = if i == 0 { from } else { &ping[(i - 1) % 2] };
-                let next = &ping[i % 2];
+                let s = if i == 0 { 0 } else if i % 2 == 1 { 1 } else { 2 };
 
-                let mut inputs = body.inputs.clone();
-                if let Some(at) = body_state {
-                    inputs[at] = Arc::clone(current);
-                }
-                let args = store_args(&body_key, &[&**next], &inputs, &body_scalars, None, 0)?;
-                ctx.jit().stats.elementwise_launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                ctx.launch_indirect(&body_core, &steps[k], 0, [n, 1, 1], dispatches[0], &args.raw())?;
+                ctx.launch_indirect(&body_core, &steps[k], 0, [n, 1, 1], dispatches[0], &body_raws[s])?;
+                ctx.launch_indirect(&check_core, &steps[k], WORD * 3, [n, 1, 1], dispatches[1], &check_raws[s])?;
 
-                let mut inputs = check.inputs.clone();
-                if let Some(at) = check_state {
-                    inputs[at] = Arc::clone(current);
-                }
-                let pins = pin_inputs(&check_key, &inputs, None, 0, n)?;
-                let uniform = params(&check_key, None, Some(n), 0, len, None, &check_scalars)?;
-                let (first_out, first_bytes) = &partials[0];
-                let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
-                raw.push(RawArg::write(first_out, *first_bytes));
-                raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
-                raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
-                ctx.jit().stats.reduce_launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                ctx.launch_indirect(&check_core, &steps[k], WORD * 3, [n, 1, 1], dispatches[1], &raw)?;
-                drop(raw);
-
-                for (pass, &(count, _)) in folds.iter().enumerate() {
+                for (pass, count) in fold_counts.iter().enumerate() {
                     let (input, input_bytes) = &partials[pass];
                     let (output, output_bytes) = &partials[pass + 1];
                     ctx.launch_indirect(
                         &finish_core,
                         &steps[k],
                         WORD * 3 * (2 + pass as u64),
-                        [count, 1, 1],
+                        [count[0], 1, 1],
                         dispatches[2 + pass],
                         &[
                             RawArg::write(output, *output_bytes),
                             RawArg::read(input, *input_bytes),
-                            RawArg::Uniform(bytemuck::bytes_of(&[count])),
+                            RawArg::Uniform(bytemuck::bytes_of(count)),
                         ],
                     )?;
                 }
-
                 let gate = [tol.to_bits(), len_u32(i)?, words];
                 launch_1d(
                     ctx,

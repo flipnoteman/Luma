@@ -51,6 +51,7 @@ mod imp {
     type MtlCommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
     type MtlCompute = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
     type MtlBlit = Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>;
+    type MtlPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
     /// Usage of storage buffers.
     const STORAGE_USAGE: BufferUsage = BufferUsage::STORAGE.union(BufferUsage::COPY_DST).union(BufferUsage::COPY_SRC);
@@ -100,7 +101,24 @@ mod imp {
 
     /// A Metal buffer held by a [`Buffer`].
     #[derive(Debug)]
-    struct MetalBuffer(MtlBuffer);
+    struct MetalBuffer {
+        raw: MtlBuffer,
+        /// Unique per buffer, keys the encoder binding cache.
+        id: u64,
+        /// `gpuAddress` of `raw`, read once.
+        gpu_addr: u64,
+        /// Sequence number of the last command buffer (maybe still pending) that touches it.
+        last_used: AtomicU64,
+    }
+
+    static NEXT_RAW_ID: AtomicU64 = AtomicU64::new(1);
+
+    impl MetalBuffer {
+        fn new(raw: MtlBuffer) -> Self {
+            let gpu_addr = raw.gpuAddress();
+            MetalBuffer { raw, id: NEXT_RAW_ID.fetch_add(1, Ordering::Relaxed), gpu_addr, last_used: AtomicU64::new(0) }
+        }
+    }
 
     // SAFETY: Metal buffers may be used from any thread. Creation, binding, `gpuAddress` and
     // `contents` need no external locking; the host writes through `contents` are ordered against
@@ -160,6 +178,9 @@ mod imp {
             }
             let mut guard = lock(&self.state);
             let state = &mut *guard;
+            if seq <= state.next {
+                return;
+            }
             state.pending.insert(seq);
             while state.pending.remove(&(state.next + 1)) {
                 state.next += 1;
@@ -186,7 +207,7 @@ mod imp {
     /// A shared-memory chunk uniform values larger than `setBytes` takes are written into.
     #[derive(Debug)]
     struct Chunk {
-        buf: MetalBuffer,
+        buf: Arc<MetalBuffer>,
         size: u64,
         used: u64,
     }
@@ -208,13 +229,31 @@ mod imp {
 
     // -- Recording state --
 
+    /// Longest `setBytes` value remembered per slot.
+    const INLINE_CACHE_MAX: usize = 64;
+
+    /// What a buffer slot of the open compute encoder holds.
+    #[derive(Clone, Copy, Default)]
+    enum SlotState {
+        #[default]
+        Empty,
+        Buffer {
+            id: u64,
+            offset: usize,
+        },
+        Inline {
+            len: u8,
+            bytes: [u8; INLINE_CACHE_MAX],
+        },
+    }
+
     /// What the open compute encoder has bound that a launch may skip rebinding.
     #[derive(Default)]
     struct Bound {
         /// `RawKernel::id` of the pipeline set, 0 for none.
         pipeline: u64,
-        /// The `LumaGrid` at `buffer(0)`.
-        grid: Option<[u32; 4]>,
+        /// The buffer slots `0..31`; slot 0 holds the `LumaGrid`.
+        slots: [SlotState; 31],
     }
 
     struct Batch {
@@ -250,14 +289,12 @@ mod imp {
         cost: Arc<OnceLock<CostModel>>,
         /// Most bytes of idle buffers a backend keeps for reuse.
         cap: u64,
+        /// Compiled pipelines by `(MSL source, fast math)`, shared by every backend on the device.
+        pipelines: Mutex<HashMap<(String, bool), MtlPipeline>>,
     }
 
-    /// Idle devices of finished backends.
-    static IDLE: Mutex<Vec<Arc<MetalSharedDevice>>> = Mutex::new(Vec::new());
-
-    /// Serializes [`acquire`], so that a burst of threads opening backends reuses the devices that
-    /// finished ones return in the meantime.
-    static OPENING: Mutex<()> = Mutex::new(());
+    /// The process-wide device, opened on first use.
+    static SHARED: Mutex<Option<Arc<MetalSharedDevice>>> = Mutex::new(None);
 
     fn open_shared() -> Result<MetalSharedDevice, BackendError> {
         autoreleasepool(|_| {
@@ -295,28 +332,19 @@ mod imp {
             let key = format!("metal-{:016x}", cache::fnv1a(identity.as_bytes()));
             let disk = DiskCache::open(cache::directory(), key);
             let cap = memory_bytes.map_or(1 << 30, |memory| memory / 5 * 4 / 2);
-            Ok(MetalSharedDevice { device, info, disk, cost: Arc::new(OnceLock::new()), cap })
+            Ok(MetalSharedDevice { device, info, disk, cost: Arc::new(OnceLock::new()), cap, pipelines: Mutex::new(HashMap::new()) })
         })
     }
 
-    /// An idle pooled device, or a newly opened one.
+    /// The process-wide device, opened if no backend has yet.
     fn acquire() -> Result<Arc<MetalSharedDevice>, BackendError> {
-        let _opening = lock(&OPENING);
-        if let Some(shared) = lock(&IDLE).pop() {
-            return Ok(shared);
+        let mut shared = lock(&SHARED);
+        if let Some(shared) = &*shared {
+            return Ok(Arc::clone(shared));
         }
-        open_shared().map(Arc::new)
-    }
-
-    /// Returns the device to the pool when the backend is gone.
-    struct Lease(Option<Arc<MetalSharedDevice>>);
-
-    impl Drop for Lease {
-        fn drop(&mut self) {
-            if let Some(shared) = self.0.take() {
-                lock(&IDLE).push(shared);
-            }
-        }
+        let opened = Arc::new(open_shared()?);
+        *shared = Some(Arc::clone(&opened));
+        Ok(opened)
     }
 
     /// The Metal backend.
@@ -340,9 +368,8 @@ mod imp {
         free_chunks: Mutex<Vec<Chunk>>,
         max_buffer_bytes: u64,
         batch: Mutex<Batch>,
-        /// Must stay the last field: the device goes back to the pool only once everything of
-        /// this backend is gone.
-        lease: Lease,
+        /// The process-wide device. Must stay the last field: it outlives everything of this backend.
+        shared: Arc<MetalSharedDevice>,
     }
 
     impl fmt::Debug for MetalBackend {
@@ -368,33 +395,54 @@ mod imp {
         if data.is_empty() {
             return;
         }
-        let dst = buffer.0.contents().as_ptr().cast::<MaybeUninit<u8>>();
+        let dst = buffer.raw.contents().as_ptr().cast::<MaybeUninit<u8>>();
         // SAFETY: callers pass buffers of at least `data.len()` bytes (a size class of it) that no
-        // GPU work reads or writes: pooled ones are retired until completion, fresh ones unused.
+        // GPU work reads or writes: pooled ones are retired until completion, fresh ones unused,
+        // and others only once their last command buffer has completed.
         let dst = unsafe { std::slice::from_raw_parts_mut(dst, data.len()) };
         copy_parallel(data, dst);
     }
 
-    fn set_bytes(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, bytes: &[u8], index: usize) {
+    /// Binds `buf` at `offset` to `slot`, unless the slot already holds exactly that.
+    fn set_buffer(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, bound: &mut Bound, buf: &MetalBuffer, offset: usize, slot: usize) {
+        if matches!(bound.slots[slot], SlotState::Buffer { id, offset: cur } if id == buf.id && cur == offset) {
+            return;
+        }
+        // SAFETY: the offset is inside the buffer and the slot below 31, which the code generator
+        // guarantees; the command buffer retains the buffer until it completes.
+        unsafe { encoder.setBuffer_offset_atIndex(Some(&*buf.raw), offset, slot) };
+        bound.slots[slot] = SlotState::Buffer { id: buf.id, offset };
+    }
+
+    /// Binds `bytes` to `slot`, unless the slot already holds exactly that.
+    fn set_bytes(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, bound: &mut Bound, bytes: &[u8], slot: usize) {
         let bytes = if bytes.is_empty() { &ZEROS[..] } else { bytes };
+        if bytes.len() <= INLINE_CACHE_MAX {
+            if let SlotState::Inline { len, bytes: ref cur } = bound.slots[slot]
+                && usize::from(len) == bytes.len()
+                && &cur[..bytes.len()] == bytes
+            {
+                return;
+            }
+            let mut arr = [0u8; INLINE_CACHE_MAX];
+            arr[..bytes.len()].copy_from_slice(bytes);
+            bound.slots[slot] = SlotState::Inline { len: bytes.len() as u8, bytes: arr };
+        } else {
+            bound.slots[slot] = SlotState::Empty;
+        }
         // SAFETY: the pointer is valid for `bytes.len()` bytes and Metal copies them at once; the
         // binding index is below 31, which the code generator guarantees.
-        unsafe { encoder.setBytes_length_atIndex(NonNull::from(bytes).cast::<c_void>(), bytes.len(), index) };
+        unsafe { encoder.setBytes_length_atIndex(NonNull::from(bytes).cast::<c_void>(), bytes.len(), slot) };
     }
 
     /// Makes `buf` resident in the open encoder for kernels that reach it through an argument
     /// buffer, and returns its GPU address.
-    fn use_resource(
-        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-        resident: &mut HashMap<u64, bool>,
-        buf: &ProtocolObject<dyn MTLBuffer>,
-        write: bool,
-    ) -> u64 {
-        let address = buf.gpuAddress();
+    fn use_resource(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, resident: &mut HashMap<u64, bool>, buf: &MetalBuffer, write: bool) -> u64 {
+        let address = buf.gpu_addr;
         let have = resident.get(&address).copied();
         if have.is_none() || (write && have == Some(false)) {
             let usage = if write { MTLResourceUsage::Read | MTLResourceUsage::Write } else { MTLResourceUsage::Read };
-            encoder.useResource_usage(ProtocolObject::from_ref(buf), usage);
+            encoder.useResource_usage(ProtocolObject::from_ref(&*buf.raw), usage);
             resident.insert(address, write || have == Some(true));
         }
         address
@@ -411,14 +459,109 @@ mod imp {
         }
     }
 
+    // -- Captured graphs --
+
+    /// A `Buffer` and a direct pointer to its [`MetalBuffer`] payload (kept alive by `_keep`).
+    #[derive(Debug)]
+    struct ResolvedBuffer {
+        _keep: Buffer,
+        ptr: NonNull<MetalBuffer>,
+    }
+
+    impl ResolvedBuffer {
+        fn new(buffer: &Buffer) -> Option<Self> {
+            let native = raw(buffer).ok()?;
+            Some(ResolvedBuffer { _keep: buffer.clone(), ptr: NonNull::from(native) })
+        }
+
+        #[inline]
+        fn get(&self) -> &MetalBuffer {
+            // SAFETY: `_keep` holds the `Arc` owning this `MetalBuffer` for `self`'s lifetime.
+            unsafe { self.ptr.as_ref() }
+        }
+    }
+
+    // SAFETY: `MetalBuffer` is `Send + Sync` and `_keep` owns it.
+    unsafe impl Send for ResolvedBuffer {}
+    // SAFETY: see above.
+    unsafe impl Sync for ResolvedBuffer {}
+
+    /// Byte slice `(offset, len)` inside [`MetalExecGraph::bytes`].
+    type ByteSlice = (u32, u32);
+
+    /// One argument of a captured launch of a [`MslAbi::Direct`] kernel.
+    #[derive(Debug)]
+    enum GraphDirectArg {
+        Storage(ResolvedBuffer),
+        /// A uniform `setBytes` takes, stored in `MetalExecGraph::bytes`.
+        InlineUniform(ByteSlice),
+        /// A uniform copied into a uniform chunk at every replay, stored in `MetalExecGraph::bytes`.
+        LargeUniform(ByteSlice),
+    }
+
+    /// One argument of a captured launch of a [`MslAbi::ArgBuffer`] kernel.
+    #[derive(Debug)]
+    enum GraphArgEntry {
+        Storage { buffer: ResolvedBuffer, writable: bool },
+        Uniform(ByteSlice),
+    }
+
+    #[derive(Debug)]
+    enum GraphAbi {
+        Direct {
+            /// Range `start..end` in `MetalExecGraph::direct_args`.
+            args: (u32, u32),
+            /// The packed element counts in `MetalExecGraph::bytes`, if the kernel reads any.
+            lengths: Option<ByteSlice>,
+        },
+        ArgBuffer {
+            entries: Vec<GraphArgEntry>,
+            lengths: ByteSlice,
+            /// The whole argument buffer in `MetalExecGraph::bytes`, when no entry is a uniform.
+            packed: Option<ByteSlice>,
+        },
+    }
+
+    #[derive(Debug)]
+    enum GraphDispatch {
+        Direct([u32; 3]),
+        Indirect { buffer: ResolvedBuffer, offset: usize },
+    }
+
+    /// A launch resolved at capture time.
+    #[derive(Debug)]
+    struct GraphCmd {
+        label: Arc<str>,
+        pipeline_id: u64,
+        pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        group: MTLSize,
+        grid: [u32; 4],
+        dispatch: GraphDispatch,
+        abi: GraphAbi,
+    }
+
+    /// Launches validated and resolved once, encoded in a tight loop at every replay. Holds its
+    /// buffers and uniform bytes in flat arenas.
+    #[derive(Debug)]
+    struct MetalExecGraph {
+        cmds: Vec<GraphCmd>,
+        direct_args: Vec<GraphDirectArg>,
+        bytes: Vec<u8>,
+    }
+
+    impl MetalExecGraph {
+        #[inline]
+        fn slice(&self, (off, len): ByteSlice) -> &[u8] {
+            &self.bytes[off as usize..(off + len) as usize]
+        }
+    }
+
+    impl ExecGraph for MetalExecGraph {}
+
     impl MetalBackend {
-        /// Opens the default Metal device, from the process-wide pool when one is idle.
+        /// Opens the default Metal device, shared process-wide.
         pub fn new() -> Result<MetalBackend, BackendError> {
-            // Leased at once: an early `Err` below must return the device to the pool.
-            let lease = Lease(Some(acquire()?));
-            let Some(shared) = lease.0.clone() else {
-                return Err(BackendError::NoAdapter("no Metal GPU device available".into()));
-            };
+            let shared = acquire()?;
             let queue = autoreleasepool(|_| shared.device.newCommandQueue())
                 .ok_or_else(|| BackendError::RequestDevice("the Metal device refused to create a command queue".into()))?;
             let batch = Batch {
@@ -449,16 +592,12 @@ mod imp {
                 free_chunks: Mutex::new(Vec::new()),
                 max_buffer_bytes: shared.info.limits.max_buffer_bytes,
                 batch: Mutex::new(batch),
-                lease,
+                shared,
             })
         }
 
         fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
-            match &self.lease.0 {
-                Some(shared) => &shared.device,
-                // Only `Lease::drop` empties it, after the backend is gone.
-                None => unreachable!("the lease of a live backend is held"),
-            }
+            &self.shared.device
         }
 
         fn batch(&self) -> Result<MutexGuard<'_, Batch>, BackendError> {
@@ -476,7 +615,7 @@ mod imp {
 
         fn make_raw_buffer(&self, size: u64) -> Option<MetalBuffer> {
             let length = usize::try_from(size.max(MIN_BUFFER_SIZE)).ok()?;
-            autoreleasepool(|_| self.device().newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)).map(MetalBuffer)
+            autoreleasepool(|_| self.device().newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)).map(MetalBuffer::new)
         }
 
         /// A new buffer, or `None` if the device is out of memory.
@@ -499,7 +638,7 @@ mod imp {
 
         /// Moves retired buffers whose command buffer completed to their pools.
         fn reap(&self) {
-            let done = self.done.contiguous.load(Ordering::Acquire);
+            let done = self.poll_done();
             let ready = {
                 let mut retired = lock(&self.retired);
                 if retired.iter().all(|r| r.ready_after > done) {
@@ -567,13 +706,13 @@ mod imp {
                 }
             }
             let size = need.max(CHUNK_BYTES);
-            let buf = self.make_raw_buffer(size).ok_or(BackendError::OutOfMemory { requested: size })?;
+            let buf = Arc::new(self.make_raw_buffer(size).ok_or(BackendError::OutOfMemory { requested: size })?);
             Ok(Chunk { buf, size, used: 0 })
         }
 
         /// Writes `bytes` into the batch's uniform chunks and returns the chunk's buffer and the
         /// byte offset of the value.
-        fn uniform_slot(&self, batch: &mut Batch, bytes: &[u8]) -> Result<(MtlBuffer, u64), BackendError> {
+        fn uniform_slot(&self, batch: &mut Batch, bytes: &[u8]) -> Result<(Arc<MetalBuffer>, u64), BackendError> {
             let need = (bytes.len() as u64).max(1).next_multiple_of(CHUNK_ALIGN);
             let mut chunk = match batch.chunk.take() {
                 Some(chunk) if chunk.used + need <= chunk.size => chunk,
@@ -585,26 +724,26 @@ mod imp {
                 }
             };
             let offset = chunk.used;
-            let dst = chunk.buf.0.contents().as_ptr().cast::<u8>();
+            let dst = chunk.buf.raw.contents().as_ptr().cast::<u8>();
             // SAFETY: `offset + need <= size` and `bytes.len() <= need`, so the copy stays inside
             // the chunk; the GPU does not read a chunk slot before the command that uses it.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(offset as usize), bytes.len()) };
             chunk.used += need;
-            let buf = chunk.buf.0.clone();
+            let buf = Arc::clone(&chunk.buf);
             batch.chunk = Some(chunk);
             Ok((buf, offset))
         }
 
         // -- Encoding --
 
-        fn command_buffer(&self, batch: &mut Batch) -> Result<MtlCommandBuffer, BackendError> {
-            if let Some(cb) = &batch.cb {
-                return Ok(cb.clone());
+        fn command_buffer<'a>(&self, batch: &'a mut Batch) -> Result<&'a ProtocolObject<dyn MTLCommandBuffer>, BackendError> {
+            if batch.cb.is_none() {
+                let cb = autoreleasepool(|_| self.queue.commandBuffer())
+                    .ok_or_else(|| BackendError::Gpu("could not create a Metal command buffer".into()))?;
+                batch.cb = Some(cb);
+                self.open_work.store(true, Ordering::Release);
             }
-            let cb = autoreleasepool(|_| self.queue.commandBuffer()).ok_or_else(|| BackendError::Gpu("could not create a Metal command buffer".into()))?;
-            batch.cb = Some(cb.clone());
-            self.open_work.store(true, Ordering::Release);
-            Ok(cb)
+            Ok(batch.cb.as_deref().expect("initialized above"))
         }
 
         fn end_blit(batch: &mut Batch) {
@@ -622,28 +761,30 @@ mod imp {
         }
 
         /// The open compute encoder; a blit encoder in the way ends first.
-        fn compute_encoder(&self, batch: &mut Batch) -> Result<MtlCompute, BackendError> {
+        fn compute_encoder(&self, batch: &mut Batch) -> Result<NonNull<ProtocolObject<dyn MTLComputeCommandEncoder>>, BackendError> {
             if let Some(compute) = &batch.compute {
-                return Ok(compute.clone());
+                return Ok(NonNull::from(&**compute));
             }
             Self::end_blit(batch);
             let cb = self.command_buffer(batch)?;
-            let compute = autoreleasepool(|_| cb.computeCommandEncoder()).ok_or_else(|| BackendError::Gpu("could not create a Metal compute encoder".into()))?;
-            batch.compute = Some(compute.clone());
-            Ok(compute)
+            let compute = autoreleasepool(|_| cb.computeCommandEncoder())
+                .ok_or_else(|| BackendError::Gpu("could not create a Metal compute encoder".into()))?;
+            let ptr = NonNull::from(&*compute);
+            batch.compute = Some(compute);
+            Ok(ptr)
         }
 
         /// The open blit encoder; a compute encoder in the way ends first, so that what is
         /// recorded here runs after the launches recorded before and before those recorded after.
-        fn blit_encoder(&self, batch: &mut Batch) -> Result<MtlBlit, BackendError> {
-            if let Some(blit) = &batch.blit {
-                return Ok(blit.clone());
+        fn blit_encoder<'a>(&self, batch: &'a mut Batch) -> Result<&'a ProtocolObject<dyn MTLBlitCommandEncoder>, BackendError> {
+            if batch.blit.is_none() {
+                Self::end_compute(batch);
+                let cb = self.command_buffer(batch)?;
+                let blit = autoreleasepool(|_| cb.blitCommandEncoder())
+                    .ok_or_else(|| BackendError::Gpu("could not create a Metal blit encoder".into()))?;
+                batch.blit = Some(blit);
             }
-            Self::end_compute(batch);
-            let cb = self.command_buffer(batch)?;
-            let blit = autoreleasepool(|_| cb.blitCommandEncoder()).ok_or_else(|| BackendError::Gpu("could not create a Metal blit encoder".into()))?;
-            batch.blit = Some(blit.clone());
-            Ok(blit)
+            Ok(batch.blit.as_deref().expect("initialized above"))
         }
 
         /// Commits the pending command buffer, if there is one, and retires what it reads.
@@ -682,6 +823,29 @@ mod imp {
             Some(cb)
         }
 
+        /// Records that the command buffer `seq` touches `buf`; called under the batch lock.
+        #[inline]
+        fn mark_used(&self, buf: &MetalBuffer, seq: u64) {
+            buf.last_used.store(seq, Ordering::Relaxed);
+        }
+
+        /// The highest sequence number known to have completed.
+        #[inline]
+        fn poll_done(&self) -> u64 {
+            self.done.contiguous.load(Ordering::Acquire)
+        }
+
+        /// Binds the argument buffer `packed` at slot 1.
+        fn bind_packed(&self, batch: &mut Batch, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, packed: &[u8]) -> Result<(), BackendError> {
+            if packed.len() <= SET_BYTES_MAX {
+                set_bytes(encoder, &mut batch.bound, packed, 1);
+            } else {
+                let (buf, offset) = self.uniform_slot(batch, packed)?;
+                set_buffer(encoder, &mut batch.bound, &buf, offset as usize, 1);
+            }
+            Ok(())
+        }
+
         #[allow(clippy::too_many_arguments)]
         fn encode_launch(
             &self,
@@ -693,16 +857,14 @@ mod imp {
             size: [u32; 3],
             args: &[RawArg<'_>],
         ) -> Result<(), BackendError> {
+            let next_seq = self.submitted.load(Ordering::Relaxed) + 1;
             let id = kernel.raw.id();
             if batch.bound.pipeline != id {
                 encoder.setComputePipelineState(&native.pipeline);
                 batch.bound.pipeline = id;
             }
             let grid = [size[0], size[1], size[2], 0];
-            if batch.bound.grid != Some(grid) {
-                set_bytes(encoder, bytemuck::bytes_of(&grid), 0);
-                batch.bound.grid = Some(grid);
-            }
+            set_bytes(encoder, &mut batch.bound, bytemuck::bytes_of(&grid), 0);
 
             match native.abi {
                 MslAbi::Direct => {
@@ -710,16 +872,14 @@ mod imp {
                     for (_, arg) in kernel.bound(args) {
                         match arg {
                             RawArg::Storage { buffer, .. } => {
-                                let native = raw(buffer)?;
-                                // SAFETY: the offset 0 and the index below 31 are in range; the
-                                // command buffer retains the buffer until it completes.
-                                unsafe { encoder.setBuffer_offset_atIndex(Some(&*native.0), 0, slot) };
+                                let buf = raw(buffer)?;
+                                self.mark_used(buf, next_seq);
+                                set_buffer(encoder, &mut batch.bound, buf, 0, slot);
                             }
-                            RawArg::Uniform(bytes) if bytes.len() <= SET_BYTES_MAX => set_bytes(encoder, bytes, slot),
+                            RawArg::Uniform(bytes) if bytes.len() <= SET_BYTES_MAX => set_bytes(encoder, &mut batch.bound, bytes, slot),
                             RawArg::Uniform(bytes) => {
                                 let (buf, offset) = self.uniform_slot(batch, bytes)?;
-                                // SAFETY: `offset` is inside the chunk, 256-byte aligned.
-                                unsafe { encoder.setBuffer_offset_atIndex(Some(&*buf), offset as usize, slot) };
+                                set_buffer(encoder, &mut batch.bound, &buf, offset as usize, slot);
                             }
                         }
                         slot += 1;
@@ -728,7 +888,7 @@ mod imp {
                         let mut lengths = std::mem::take(&mut batch.scratch);
                         lengths.clear();
                         push_lengths(native, args, &mut lengths);
-                        set_bytes(encoder, &lengths, slot);
+                        set_bytes(encoder, &mut batch.bound, &lengths, slot);
                         batch.scratch = lengths;
                     }
                 }
@@ -737,7 +897,11 @@ mod imp {
                     packed.clear();
                     for (_, arg) in kernel.bound(args) {
                         let address = match arg {
-                            RawArg::Storage { buffer, writable, .. } => use_resource(encoder, &mut batch.resident, &raw(buffer)?.0, *writable),
+                            RawArg::Storage { buffer, writable, .. } => {
+                                let buf = raw(buffer)?;
+                                self.mark_used(buf, next_seq);
+                                use_resource(encoder, &mut batch.resident, buf, *writable)
+                            }
                             RawArg::Uniform(bytes) => {
                                 let (buf, offset) = self.uniform_slot(batch, bytes)?;
                                 use_resource(encoder, &mut batch.resident, &buf, false) + offset
@@ -748,13 +912,7 @@ mod imp {
                     push_lengths(native, args, &mut packed);
                     // `LumaArgs` is 8-byte aligned.
                     packed.resize(packed.len().next_multiple_of(8), 0);
-                    if packed.len() <= SET_BYTES_MAX {
-                        set_bytes(encoder, &packed, 1);
-                    } else {
-                        let (buf, offset) = self.uniform_slot(batch, &packed)?;
-                        // SAFETY: `offset` is inside the chunk, 256-byte aligned.
-                        unsafe { encoder.setBuffer_offset_atIndex(Some(&*buf), offset as usize, 1) };
-                    }
+                    self.bind_packed(batch, encoder, &packed)?;
                     batch.scratch = packed;
                 }
             }
@@ -766,8 +924,92 @@ mod imp {
                 }
                 Dispatch::Indirect { buffer, offset, .. } => {
                     let counts = raw(buffer)?;
+                    self.mark_used(counts, next_seq);
                     // SAFETY: the gate kernels of the crate keep three `u32`s at `offset`.
-                    unsafe { encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(&counts.0, offset as usize, group) };
+                    unsafe { encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(&counts.raw, offset as usize, group) };
+                }
+            }
+            Ok(())
+        }
+
+        /// Encodes one captured launch into the open compute encoder; `seq` is the sequence
+        /// number of the command buffer being recorded.
+        fn encode_graph_cmd(
+            &self,
+            batch: &mut Batch,
+            encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+            graph: &MetalExecGraph,
+            cmd: &GraphCmd,
+            seq: u64,
+        ) -> Result<(), BackendError> {
+            if batch.bound.pipeline != cmd.pipeline_id {
+                encoder.setComputePipelineState(&cmd.pipeline);
+                batch.bound.pipeline = cmd.pipeline_id;
+            }
+            set_bytes(encoder, &mut batch.bound, bytemuck::bytes_of(&cmd.grid), 0);
+
+            match &cmd.abi {
+                GraphAbi::Direct { args: (start, end), lengths } => {
+                    let mut slot = 1;
+                    for arg in &graph.direct_args[*start as usize..*end as usize] {
+                        match arg {
+                            GraphDirectArg::Storage(buffer) => {
+                                let buf = buffer.get();
+                                self.mark_used(buf, seq);
+                                set_buffer(encoder, &mut batch.bound, buf, 0, slot);
+                            }
+                            GraphDirectArg::InlineUniform(range) => set_bytes(encoder, &mut batch.bound, graph.slice(*range), slot),
+                            GraphDirectArg::LargeUniform(range) => {
+                                let (buf, offset) = self.uniform_slot(batch, graph.slice(*range))?;
+                                set_buffer(encoder, &mut batch.bound, &buf, offset as usize, slot);
+                            }
+                        }
+                        slot += 1;
+                    }
+                    if let Some(lengths) = lengths {
+                        set_bytes(encoder, &mut batch.bound, graph.slice(*lengths), slot);
+                    }
+                }
+                GraphAbi::ArgBuffer { entries, lengths, packed } => {
+                    for entry in entries {
+                        if let GraphArgEntry::Storage { buffer, writable } = entry {
+                            let buf = buffer.get();
+                            self.mark_used(buf, seq);
+                            use_resource(encoder, &mut batch.resident, buf, *writable);
+                        }
+                    }
+                    if let Some(packed) = packed {
+                        self.bind_packed(batch, encoder, graph.slice(*packed))?;
+                    } else {
+                        let mut packed = std::mem::take(&mut batch.scratch);
+                        packed.clear();
+                        for entry in entries {
+                            let address = match entry {
+                                GraphArgEntry::Storage { buffer, .. } => buffer.get().gpu_addr,
+                                GraphArgEntry::Uniform(range) => {
+                                    let (buf, offset) = self.uniform_slot(batch, graph.slice(*range))?;
+                                    use_resource(encoder, &mut batch.resident, &buf, false) + offset
+                                }
+                            };
+                            packed.extend_from_slice(&address.to_ne_bytes());
+                        }
+                        packed.extend_from_slice(graph.slice(*lengths));
+                        packed.resize(packed.len().next_multiple_of(8), 0);
+                        self.bind_packed(batch, encoder, &packed)?;
+                        batch.scratch = packed;
+                    }
+                }
+            }
+
+            match &cmd.dispatch {
+                GraphDispatch::Direct([x, y, z]) => {
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: *x as usize, height: *y as usize, depth: *z as usize }, cmd.group);
+                }
+                GraphDispatch::Indirect { buffer, offset } => {
+                    let counts = buffer.get();
+                    self.mark_used(counts, seq);
+                    // SAFETY: the gate kernels of the crate keep three `u32`s at `offset`.
+                    unsafe { encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(&counts.raw, *offset, cmd.group) };
                 }
             }
             Ok(())
@@ -845,19 +1087,29 @@ mod imp {
                 .collect();
 
             let fail = |what: &str, message: String| BackendError::ShaderCompile(format!("kernel `{label}`: {what}: {message}"));
-            let pipeline = autoreleasepool(|_| {
-                let options = MTLCompileOptions::new();
-                #[allow(deprecated)]
-                options.setFastMathEnabled(!optimized.uses_exact_f32);
-                let source = NSString::from_str(&msl.source);
-                let library = self
-                    .device()
-                    .newLibraryWithSource_options_error(&source, Some(&options))
-                    .map_err(|e| fail("Metal library", e.localizedDescription().to_string()))?;
-                let name = NSString::from_str(&msl.entry_name);
-                let function = library.newFunctionWithName(&name).ok_or_else(|| fail("entry point", format!("`{}` is missing", msl.entry_name)))?;
-                self.device().newComputePipelineStateWithFunction_error(&function).map_err(|e| fail("pipeline", e.localizedDescription().to_string()))
-            })?;
+            let fast_math = !optimized.uses_exact_f32;
+            let key = (msl.source.clone(), fast_math);
+            let cached = lock(&self.shared.pipelines).get(&key).cloned();
+            let pipeline = match cached {
+                Some(pipeline) => pipeline,
+                None => {
+                    let pipeline = autoreleasepool(|_| {
+                        let options = MTLCompileOptions::new();
+                        #[allow(deprecated)]
+                        options.setFastMathEnabled(fast_math);
+                        let source = NSString::from_str(&msl.source);
+                        let library = self
+                            .device()
+                            .newLibraryWithSource_options_error(&source, Some(&options))
+                            .map_err(|e| fail("Metal library", e.localizedDescription().to_string()))?;
+                        let name = NSString::from_str(&msl.entry_name);
+                        let function = library.newFunctionWithName(&name).ok_or_else(|| fail("entry point", format!("`{}` is missing", msl.entry_name)))?;
+                        self.device().newComputePipelineStateWithFunction_error(&function).map_err(|e| fail("pipeline", e.localizedDescription().to_string()))
+                    })?;
+                    lock(&self.shared.pipelines).insert(key, pipeline.clone());
+                    pipeline
+                }
+            };
 
             let invocations: u64 = optimized.workgroup_size.iter().map(|&x| u64::from(x.max(1))).product();
             let limit = pipeline.maxTotalThreadsPerThreadgroup() as u64;
@@ -897,7 +1149,8 @@ mod imp {
                 self.commit_locked(batch);
             }
             let encoder = self.compute_encoder(batch)?;
-            self.encode_launch(batch, &encoder, kernel, native, dispatch, size, args)?;
+            // SAFETY: `encoder` lives in `batch.compute` for the duration of `encode_launch`.
+            self.encode_launch(batch, unsafe { encoder.as_ref() }, kernel, native, dispatch, size, args)?;
             if profiled {
                 let cb = self.commit_locked(batch);
                 if let Some(samples) = &mut batch.profiler {
@@ -917,8 +1170,16 @@ mod imp {
                 return Ok(());
             }
             let mut guard = self.batch()?;
+            if bytes <= CHUNK_BYTES / 4 && native.last_used.load(Ordering::Relaxed) <= self.poll_done() {
+                // SAFETY: the buffer holds at least `bytes` bytes and no command buffer that
+                // touches it is pending or running.
+                unsafe { std::ptr::write_bytes(native.raw.contents().as_ptr().cast::<u8>(), 0, bytes as usize) };
+                return Ok(());
+            }
+            let next_seq = self.submitted.load(Ordering::Relaxed) + 1;
             let blit = self.blit_encoder(&mut guard)?;
-            blit.fillBuffer_range_value(&native.0, NSRange::new(0, bytes as usize), 0);
+            blit.fillBuffer_range_value(&native.raw, NSRange::new(0, bytes as usize), 0);
+            self.mark_used(native, next_seq);
             Ok(())
         }
 
@@ -928,9 +1189,12 @@ mod imp {
                 return Ok(());
             }
             let mut guard = self.batch()?;
+            let next_seq = self.submitted.load(Ordering::Relaxed) + 1;
             let blit = self.blit_encoder(&mut guard)?;
             // SAFETY: the callers keep the ranges inside both buffers.
-            unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&src.0, src_offset as usize, &dst.0, dst_offset as usize, bytes as usize) };
+            unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&src.raw, src_offset as usize, &dst.raw, dst_offset as usize, bytes as usize) };
+            self.mark_used(src, next_seq);
+            self.mark_used(dst, next_seq);
             Ok(())
         }
 
@@ -943,22 +1207,81 @@ mod imp {
             if bytes == 0 {
                 return Ok(());
             }
+            let mut guard = self.batch()?;
+            if target.last_used.load(Ordering::Relaxed) <= self.poll_done() {
+                // No command buffer that touches `dst` is pending or running: write it directly,
+                // which keeps an open compute encoder open.
+                host_write(target, data);
+                return Ok(());
+            }
+            if bytes <= CHUNK_BYTES / 4 {
+                let next_seq = self.submitted.load(Ordering::Relaxed) + 1;
+                let (buf, offset) = self.uniform_slot(&mut guard, data)?;
+                let blit = self.blit_encoder(&mut guard)?;
+                // SAFETY: the chunk slot holds `bytes` bytes and the caller sized `dst` for them.
+                unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&buf.raw, offset as usize, &target.raw, 0, bytes as usize) };
+                self.mark_used(target, next_seq);
+                return Ok(());
+            }
+            // Taking a staging buffer may wait for the GPU, which needs the batch lock.
+            drop(guard);
             let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
             let staging = self.take_upload_buffer(&self.uploads, class, UPLOAD_USAGE)?;
             let source = raw(&staging)?;
             host_write(source, data);
 
             let mut guard = self.batch()?;
+            let next_seq = self.submitted.load(Ordering::Relaxed) + 1;
             let blit = self.blit_encoder(&mut guard)?;
             // SAFETY: the staging buffer holds `bytes` bytes and the caller sized `dst` for them.
-            unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&source.0, 0, &target.0, 0, bytes as usize) };
+            unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&source.raw, 0, &target.raw, 0, bytes as usize) };
+            self.mark_used(target, next_seq);
             lock(&self.uploads).in_flight += staging.size();
             guard.uploads.push(staging);
             Ok(())
         }
 
-        fn record_graph(&self, _graph: &dyn ExecGraph, _dispatches: u32) -> Result<u32, BackendError> {
-            Err(BackendError::Unsupported("graph replay requires the CUDA backend".into()))
+        fn record_graph(&self, graph: &dyn ExecGraph, dispatches: u32) -> Result<u32, BackendError> {
+            let graph = graph.downcast_ref::<MetalExecGraph>().ok_or_else(|| BackendError::Unsupported("the graph was captured by another backend".into()))?;
+            let mut guard = self.batch()?;
+            let batch = &mut *guard;
+            if batch.profiler.is_some() {
+                for cmd in &graph.cmds {
+                    if matches!(cmd.dispatch, GraphDispatch::Direct(groups) if groups.contains(&0)) {
+                        if let Some(samples) = &mut batch.profiler {
+                            samples.push((Arc::clone(&cmd.label), None));
+                        }
+                        continue;
+                    }
+                    // Each launch gets a command buffer of its own, so that its GPU time is its own.
+                    self.commit_locked(batch);
+                    let encoder = self.compute_encoder(batch)?;
+                    let seq = self.submitted.load(Ordering::Relaxed) + 1;
+                    // SAFETY: `encoder` lives in `batch.compute` for the duration of `encode_graph_cmd`.
+                    self.encode_graph_cmd(batch, unsafe { encoder.as_ref() }, graph, cmd, seq)?;
+                    let cb = self.commit_locked(batch);
+                    if let Some(samples) = &mut batch.profiler {
+                        samples.push((Arc::clone(&cmd.label), cb));
+                    }
+                }
+                return Ok(0);
+            }
+            if graph.cmds.is_empty() {
+                return Ok(batch.dispatches);
+            }
+            let encoder = self.compute_encoder(batch)?;
+            // SAFETY: `encoder` lives in `batch.compute` for the duration of the loop.
+            let encoder = unsafe { encoder.as_ref() };
+            let seq = self.submitted.load(Ordering::Relaxed) + 1;
+            for cmd in &graph.cmds {
+                if matches!(cmd.dispatch, GraphDispatch::Direct(groups) if groups.contains(&0)) {
+                    continue;
+                }
+                self.encode_graph_cmd(batch, encoder, graph, cmd, seq)?;
+            }
+            batch.dispatches += dispatches;
+            self.dispatches_pending.store(batch.dispatches, Ordering::Relaxed);
+            Ok(batch.dispatches)
         }
 
         fn pending_dispatches(&self) -> u32 {
@@ -974,6 +1297,9 @@ mod imp {
         }
 
         fn flush_batch(&self) -> Result<(), BackendError> {
+            if !self.open_work.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let mut batch = self.batch()?;
             self.commit_locked(&mut batch);
             Ok(())
@@ -981,8 +1307,12 @@ mod imp {
 
         fn sync(&self, spin_budget: Duration) -> Result<Duration, BackendError> {
             self.flush_batch()?;
-            let start = Instant::now();
             let target = self.submitted.load(Ordering::Acquire);
+            if self.done.reached(target) {
+                self.take_error()?;
+                return Ok(Duration::ZERO);
+            }
+            let start = Instant::now();
             if !self.spin_until(target, spin_budget) {
                 self.done.wait(target);
             }
@@ -1003,7 +1333,7 @@ mod imp {
             let waited = self.sync(spin_budget)?;
             if bytes > 0 {
                 // SAFETY: the buffer holds at least `bytes` bytes and the GPU finished with it.
-                let view = unsafe { std::slice::from_raw_parts(native.0.contents().as_ptr().cast::<u8>(), bytes) };
+                let view = unsafe { std::slice::from_raw_parts(native.raw.contents().as_ptr().cast::<u8>(), bytes) };
                 copy_parallel(view, dst);
             }
             Ok(waited)
@@ -1063,8 +1393,85 @@ mod imp {
             Ok(self.batch()?.profiler.is_some())
         }
 
-        fn capture_graph(&self, _launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>> {
-            None
+        fn capture_graph(&self, launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>> {
+            let mut cmds = Vec::with_capacity(launches.len());
+            let mut direct_args = Vec::with_capacity(launches.len() * 4);
+            let mut bytes = Vec::with_capacity(launches.len() * 16);
+            let push_bytes = |bytes: &mut Vec<u8>, data: &[u8]| -> Option<ByteSlice> {
+                let off = u32::try_from(bytes.len()).ok()?;
+                let len = u32::try_from(data.len()).ok()?;
+                bytes.extend_from_slice(data);
+                Some((off, len))
+            };
+            for launch in launches {
+                let kernel = launch.kernel;
+                kernel.check_count(launch.args.len()).ok()?;
+                kernel.check_kinds(launch.args).ok()?;
+                let native = kernel.raw.downcast_ref::<MetalKernel>()?;
+                let len_start = u32::try_from(bytes.len()).ok()?;
+                push_lengths(native, launch.args, &mut bytes);
+                let len_slice = (len_start, u32::try_from(bytes.len()).ok()? - len_start);
+                let abi = match native.abi {
+                    MslAbi::Direct => {
+                        let arg_start = u32::try_from(direct_args.len()).ok()?;
+                        for (_, arg) in kernel.bound(launch.args) {
+                            let entry = match arg {
+                                RawArg::Storage { buffer, .. } => GraphDirectArg::Storage(ResolvedBuffer::new(buffer)?),
+                                RawArg::Uniform(data) if data.len() <= SET_BYTES_MAX => GraphDirectArg::InlineUniform(push_bytes(&mut bytes, data)?),
+                                RawArg::Uniform(data) => GraphDirectArg::LargeUniform(push_bytes(&mut bytes, data)?),
+                            };
+                            direct_args.push(entry);
+                        }
+                        let arg_end = u32::try_from(direct_args.len()).ok()?;
+                        GraphAbi::Direct { args: (arg_start, arg_end), lengths: (len_slice.1 > 0).then_some(len_slice) }
+                    }
+                    MslAbi::ArgBuffer => {
+                        let mut entries = Vec::new();
+                        for (_, arg) in kernel.bound(launch.args) {
+                            entries.push(match arg {
+                                RawArg::Storage { buffer, writable, .. } => {
+                                    GraphArgEntry::Storage { buffer: ResolvedBuffer::new(buffer)?, writable: *writable }
+                                }
+                                RawArg::Uniform(data) => GraphArgEntry::Uniform(push_bytes(&mut bytes, data)?),
+                            });
+                        }
+                        // Without uniforms every address is fixed: pack the argument buffer once.
+                        let packed = if entries.iter().all(|entry| matches!(entry, GraphArgEntry::Storage { .. })) {
+                            let pack_start = u32::try_from(bytes.len()).ok()?;
+                            for entry in &entries {
+                                if let GraphArgEntry::Storage { buffer, .. } = entry {
+                                    bytes.extend_from_slice(&buffer.get().gpu_addr.to_ne_bytes());
+                                }
+                            }
+                            let (lo, ll) = len_slice;
+                            bytes.extend_from_within(lo as usize..(lo + ll) as usize);
+                            let pad = (bytes.len() - pack_start as usize).next_multiple_of(8);
+                            bytes.resize(pack_start as usize + pad, 0);
+                            let pack_len = u32::try_from(bytes.len()).ok()? - pack_start;
+                            Some((pack_start, pack_len))
+                        } else {
+                            None
+                        };
+                        GraphAbi::ArgBuffer { entries, lengths: len_slice, packed }
+                    }
+                };
+                let dispatch = match launch.dispatch {
+                    Dispatch::Direct(groups) => GraphDispatch::Direct(groups),
+                    Dispatch::Indirect { buffer, offset, .. } => {
+                        GraphDispatch::Indirect { buffer: ResolvedBuffer::new(buffer)?, offset: offset as usize }
+                    }
+                };
+                cmds.push(GraphCmd {
+                    label: Arc::clone(&kernel.label),
+                    pipeline_id: kernel.raw.id(),
+                    pipeline: native.pipeline.clone(),
+                    group: MTLSize { width: kernel.workgroup[0] as usize, height: kernel.workgroup[1] as usize, depth: kernel.workgroup[2] as usize },
+                    grid: [launch.size[0], launch.size[1], launch.size[2], 0],
+                    dispatch,
+                    abi,
+                });
+            }
+            Some(Arc::new(MetalExecGraph { cmds, direct_args, bytes }))
         }
     }
 
@@ -1084,14 +1491,16 @@ mod imp {
         #[test]
         fn completions_advance_only_over_a_contiguous_prefix() {
             let done = Done::default();
+            let reached = |seq: u64| done.contiguous.load(Ordering::Acquire) >= seq;
             done.complete(2, None);
-            assert!(!done.reached(1));
+            assert!(!reached(1));
             done.complete(1, None);
-            assert!(done.reached(2));
-            assert!(!done.reached(3));
+            assert!(reached(2));
+            assert!(!reached(3));
             done.complete(3, Some("boom".into()));
-            assert!(done.reached(3));
+            assert!(reached(3));
             assert_eq!(lock(&done.error).as_deref(), Some("boom"));
         }
+
     }
 }
