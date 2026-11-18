@@ -148,12 +148,12 @@ fn constructors_open_their_backend_or_report_it_unavailable() {
 }
 
 #[test]
-fn a_cpu_device_opens_on_cpu_or_wgpu_and_refuses_gpu_only_backends() {
-    for kind in [BackendKind::Metal, BackendKind::Cuda] {
+fn a_cpu_device_is_the_cpu_backend_and_gpu_backends_refuse_it() {
+    for kind in [BackendKind::Metal, BackendKind::Cuda, BackendKind::Wgpu] {
         let options = ContextOptions::default().backend(kind).device(DeviceKind::Cpu).calibrate(false);
         match Context::with_options(options) {
             Err(LumaError::NoDevice(message)) => {
-                assert!(message.contains("wgpu") || message.contains("cpu") || message.contains("built without"), "{}: {message}", label(kind));
+                assert!(message.contains("cpu") || message.contains("built without"), "{}: {message}", label(kind));
             }
             other => panic!("{} on a CPU device must be refused with NoDevice, got {other:?}", label(kind)),
         }
@@ -164,6 +164,7 @@ fn a_cpu_device_opens_on_cpu_or_wgpu_and_refuses_gpu_only_backends() {
     }
     for ctx in [
         Context::with_options(ContextOptions::default().backend(BackendKind::Cpu).device(DeviceKind::Cpu).calibrate(false)),
+        Context::with_options(ContextOptions::default().backend(BackendKind::Auto).device(DeviceKind::Cpu).calibrate(false)),
         Context::cpu(),
     ] {
         match ctx {
@@ -178,16 +179,26 @@ fn a_cpu_device_opens_on_cpu_or_wgpu_and_refuses_gpu_only_backends() {
             Err(error) => panic!("opening the native CPU device failed: {error}"),
         }
     }
-    match Context::with_options(ContextOptions::default().backend(BackendKind::Wgpu).device(DeviceKind::Cpu).calibrate(false)) {
-        Ok(ctx) => {
-            assert!(ctx.is_cpu());
-            assert_eq!(ctx.backend(), BackendKind::Wgpu);
-            let sum = on(&ctx, &[1.0f32, 2.0, 3.0, 4.0]).sum().item().unwrap();
-            assert_eq!(sum, 10.0);
-            println!("[backends] wgpu CPU device: available");
-        }
-        Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) => println!("[backends] wgpu CPU device: SKIPPED, no software adapter on this host"),
-        Err(error) => panic!("opening the wgpu CPU device failed: {error}"),
+}
+
+#[test]
+fn the_device_summary_names_the_device() {
+    if let Ok(ctx) = Context::cpu() {
+        let device = ctx.device();
+        assert!(device.software);
+        assert_eq!(device.backend, BackendKind::Cpu);
+        assert!(!device.name.is_empty());
+        assert_eq!(ctx.device_name(), device.name);
+    }
+    // A GPU host: the default device is not a software one.
+    let gpu = ContextOptions::default().device(DeviceKind::Gpu).calibrate(false);
+    if let Ok(ctx) = Context::with_options(gpu) {
+        let device = ctx.device();
+        assert!(!device.software, "{device:?}");
+        assert_ne!(device.backend, BackendKind::Cpu);
+        assert!(!device.name.is_empty());
+        assert_eq!(ctx.device_name(), device.name);
+        assert_eq!(device.backend, ctx.backend());
     }
 }
 
@@ -211,7 +222,6 @@ const CHILD: &str = "environment_child_probe";
 fn environment_child_probe() {
     let expect = std::env::var("LUMA_BACKENDS_EXPECT").expect("LUMA_BACKENDS_EXPECT is set by the parent test");
     match (Context::new(), expect.as_str()) {
-        (Ok(ctx), "wgpu-cpu") => assert!(ctx.is_cpu() && ctx.backend() == BackendKind::Wgpu, "{:?} cpu={}", ctx.backend(), ctx.is_cpu()),
         (Ok(ctx), name) => assert_eq!(label(ctx.backend()), name),
         (Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)), "unavailable") => {}
         (other, name) => panic!("expected {name}, got {other:?}"),
@@ -223,7 +233,6 @@ fn environment_child_probe() {
 fn the_environment_selects_the_backend() {
     let named = |kind: BackendKind| if open(kind).is_some() { label(kind) } else { "unavailable" };
     let auto = [BackendKind::Cuda, BackendKind::Metal, BackendKind::Wgpu, BackendKind::Cpu].into_iter().find(|&kind| open(kind).is_some()).map_or("unavailable", label);
-    let wgpu_cpu = Context::with_options(ContextOptions::default().backend(BackendKind::Wgpu).device(DeviceKind::Cpu).calibrate(false)).is_ok();
     let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
         (vec![("LUMA_BACKEND", "wgpu")], named(BackendKind::Wgpu)),
         (vec![("LUMA_BACKEND", "metal")], named(BackendKind::Metal)),
@@ -236,9 +245,9 @@ fn the_environment_selects_the_backend() {
         (vec![("LUMA_DEVICE", "metal")], named(BackendKind::Metal)),
         // ... and LUMA_BACKEND wins when both are.
         (vec![("LUMA_BACKEND", "metal"), ("LUMA_DEVICE", "wgpu")], named(BackendKind::Metal)),
-        // A CPU device exists through the cpu backend or wgpu, never metal or cuda.
+        // A CPU device is the cpu backend only: no GPU backend provides one.
         (vec![("LUMA_BACKEND", "metal"), ("LUMA_DEVICE", "cpu")], "unavailable"),
-        (vec![("LUMA_BACKEND", "wgpu"), ("LUMA_DEVICE", "cpu")], if wgpu_cpu { "wgpu-cpu" } else { "unavailable" }),
+        (vec![("LUMA_BACKEND", "wgpu"), ("LUMA_DEVICE", "cpu")], "unavailable"),
     ];
     let exe = std::env::current_exe().expect("the path of this test binary");
     for (vars, expect) in cases {

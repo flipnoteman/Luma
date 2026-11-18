@@ -68,7 +68,7 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 - Kernel tuning per GPU vendor (Apple and NVIDIA measured, generic defaults elsewhere)
 - Useful error handling
 - Per-kernel GPU timing with `ctx.profile(..)`
-- CPU fallback through Mesa llvmpipe when no GPU is present
+- Native SIMD CPU backend, used when no GPU is present
 - Arrays larger than one device buffer or than device memory
 
 ## Getting started
@@ -103,16 +103,13 @@ cargo test
 
 Luma is a Cargo workspace of five crates: `luma-core` (the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-wgpu`, `luma-metal` and `luma-cuda` (each holds one backend and its own code generator for WGSL, MSL or CUDA C++), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal` and `cuda` each enable one backend crate.
 
-With `BackendKind::Auto` (the default) a context opens the first backend that works, in the order CUDA, Metal, wgpu. Choose one with `ContextOptions::backend(BackendKind::..)`, with `Context::cuda()`, `Context::metal()` or `Context::wgpu()`, or with `LUMA_BACKEND`; `Context::backend()` tells which one a context uses. The CUDA backend needs only the NVIDIA driver, loaded at run time (kernels are compiled to PTX by the driver's own NVVM library; no CUDA toolkit or NVRTC): without an NVIDIA driver the CUDA backend reports an error (and `Auto` moves on) instead of failing to start the program.
+With `BackendKind::Auto` (the default) a context opens the first backend that works, in the order CUDA, Metal, wgpu. Choose one with `ContextOptions::backend(BackendKind::..)`, with `Context::cuda()`, `Context::metal()` or `Context::wgpu()`, or with `LUMA_BACKEND`; `Context::backend()` tells which one a context uses, and `Context::device()` (a `DeviceSummary`) or `Context::device_name()` the device: its backend, name and whether it is the host CPU. The CUDA backend needs only the NVIDIA driver, loaded at run time (kernels are compiled to PTX by the driver's own NVVM library; no CUDA toolkit or NVRTC): without an NVIDIA driver the CUDA backend reports an error (and `Auto` moves on) instead of failing to start the program.
 
 Custom WGSL kernels (`Context::kernel`) run on every backend: native backends translate them through the kernel IR. `enable wgpu_cooperative_matrix;` works on the wgpu backend only. The native backends bind more buffers per kernel than WebGPU's limits allow (Metal through an argument buffer, CUDA through plain pointer arguments), and on Apple silicon uploads and readbacks use the unified memory the CPU and GPU share. On CUDA, fixed iteration counts that Luma has traced are replayed from a cached CUDA graph.
 
 ### No GPU
 
-Without a GPU, Luma runs through the wgpu backend and Mesa's llvmpipe, a software Vulkan driver (the CPU fallback needs the `wgpu` feature). It is not built into Luma: the driver has to be
-installed on the machine (`mesa-vulkan-drivers` on most Linux distributions), otherwise opening a context returns an error.
-It is picked automatically when no GPU opens. `LUMA_DEVICE=cpu` or `Context::cpu()` force it, and `LUMA_DEVICE=gpu` refuses
-the fallback and returns an error instead.
+Without a GPU, Luma runs on the native `cpu` backend (SIMD code on the host's threads; the `cpu` feature). It is picked automatically when no GPU opens. `LUMA_DEVICE=cpu` or `Context::cpu()` force it, and `LUMA_DEVICE=gpu` refuses it and returns an error instead. Software Vulkan adapters (Mesa llvmpipe, SwiftShader, WARP) are never used.
 
 ### Large arrays
 

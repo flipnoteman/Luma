@@ -48,12 +48,12 @@ impl fmt::Display for BackendKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DeviceKind {
-    /// A GPU if there is one, otherwise a software device.
+    /// A GPU if there is one, otherwise the native CPU backend.
     #[default]
     Auto,
     /// A GPU only.
     Gpu,
-    /// A software (CPU) device only.
+    /// The native CPU backend only (software GPU adapters such as llvmpipe are never used).
     Cpu,
 }
 

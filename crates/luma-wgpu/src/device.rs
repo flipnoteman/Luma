@@ -83,8 +83,6 @@ pub(crate) struct Gpu {
     pub(crate) adapter: wgpu::AdapterInfo,
     /// Set by the device-lost callback; a lost device is never pooled again.
     lost: Arc<AtomicBool>,
-    /// Whether the adapter is a software (CPU) rasterizer such as Mesa llvmpipe.
-    pub(crate) cpu: bool,
     /// Total bytes of the adapter's device-local memory heaps, if the backend can tell (Vulkan
     /// only): the basis of the default memory budget.
     pub(crate) memory: Option<u64>,
@@ -125,7 +123,7 @@ fn device_local_bytes(_adapter: &wgpu::Adapter) -> Option<u64> {
 
 /// Picks an adapter of the wanted kind and opens a [Device] / [Queue] pair on it. Only
 /// [`acquire`] calls this.
-async fn request_device(kind: DeviceKind) -> Result<Gpu, BackendError> {
+async fn request_device() -> Result<Gpu, BackendError> {
     let mut instance_desc = InstanceDescriptor::new_without_display_handle();
     // Buffer creation reports out-of-memory once usage would pass 90% of the driver's live
     // budget (Vulkan with VK_EXT_memory_budget, DX12) instead of failing later in a command.
@@ -148,14 +146,14 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu, BackendError> {
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: PowerPreference::HighPerformance,
-            force_fallback_adapter: kind == DeviceKind::Cpu,
             ..Default::default()
         })
         .await
         .map_err(|e| BackendError::NoAdapter(e.to_string()))?;
-    let cpu = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
-    if kind == DeviceKind::Gpu && cpu {
-        return Err(BackendError::NoDevice("only a software (CPU) adapter is available"));
+    // Software rasterizers (llvmpipe, SwiftShader, WARP) are never used: the cpu backend runs
+    // on the CPU natively and faster.
+    if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+        return Err(BackendError::NoAdapter(format!("only a software adapter ({}) is available; luma does not use software adapters", adapter.get_info().name)));
     }
     debug!("Adapter(s) = {:?}", adapter.get_info());
 
@@ -205,7 +203,7 @@ async fn request_device(kind: DeviceKind) -> Result<Gpu, BackendError> {
     if !validated {
         crate::exit::flush_at_exit(&store);
     }
-    Ok(Gpu { device, queue, adapter: info, lost, cpu, memory, cost: Arc::new(OnceLock::new()), disk, store })
+    Ok(Gpu { device, queue, adapter: info, lost, memory, cost: Arc::new(OnceLock::new()), disk, store })
 }
 
 /// Process-wide pool of opened GPU devices.
@@ -223,36 +221,19 @@ static IDLE: Mutex<Vec<Gpu>> = Mutex::new(Vec::new());
 /// devices can be alive at once (around 60 on NVIDIA; `RequestDevice(Device(Lost))` beyond).
 static OPENING: Mutex<()> = Mutex::new(());
 
-/// What [`DeviceKind::Auto`] resolved to the first time: `true` when it ended up on a CPU
-/// device. Fixed for the process so that every `Auto` backend uses the same kind of device.
-static AUTO_IS_CPU: OnceLock<bool> = OnceLock::new();
-
 /// Hands out an idle pooled device of the wanted kind, or opens a new one when none is idle.
 ///
 /// Holds `OPENING` for the whole call so that concurrent callers queue up and reuse the devices
 /// that [`release`] returns in the meantime instead of all creating their own.
 pub(crate) fn acquire(kind: DeviceKind) -> Result<Gpu, BackendError> {
+    if kind == DeviceKind::Cpu {
+        return Err(BackendError::NoDevice("software adapters are not used; the cpu backend runs on the CPU"));
+    }
     let _opening = lock(&OPENING);
-    let mut want = match kind {
-        DeviceKind::Cpu => Some(true),
-        DeviceKind::Auto => AUTO_IS_CPU.get().copied(),
-        _ => Some(false),
-    };
-    if want.is_none() && lock(&IDLE).iter().any(|gpu| !gpu.cpu) {
-        want = Some(false);
-        let _ = AUTO_IS_CPU.set(false);
+    if let Some(gpu) = lock(&IDLE).pop() {
+        return Ok(gpu);
     }
-    if let Some(cpu) = want {
-        let mut idle = lock(&IDLE);
-        if let Some(at) = idle.iter().rposition(|gpu| gpu.cpu == cpu) {
-            return Ok(idle.remove(at));
-        }
-    }
-    let gpu = crate::exit::driver_call(|| pollster::block_on(request_device(kind)))?;
-    if kind == DeviceKind::Auto && *AUTO_IS_CPU.get_or_init(|| gpu.cpu) {
-        log::info!("luma: no GPU found, running on the CPU through {}", gpu.adapter.name);
-    }
-    Ok(gpu)
+    crate::exit::driver_call(|| pollster::block_on(request_device()))
 }
 
 /// Returns the device of a finished backend to the pool.

@@ -2,15 +2,16 @@
 
 ## Choosing a device
 
-**Which device does Luma use?** `Context::new()` and the default context ask wgpu for the
-high-performance adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls back
-to a software Vulkan driver (Mesa llvmpipe). `LUMA_DEVICE` or `ContextOptions::device` narrow this:
+**Which device does Luma use?** `Context::new()` and the default context open CUDA, then Metal, then
+the high-performance wgpu adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls
+back to the native `cpu` backend. Software Vulkan drivers (Mesa llvmpipe) are never used.
+`LUMA_DEVICE` or `ContextOptions::device` narrow this, and `Context::device()` says what opened:
 
 | Setting | Effect |
 | --- | --- |
-| `LUMA_DEVICE=gpu` / `DeviceKind::Gpu` | a hardware GPU only; `LumaError::NoDevice` if only a software adapter exists |
-| `LUMA_DEVICE=cpu` / `DeviceKind::Cpu` / `Context::cpu()` | the software adapter, whatever GPUs exist |
-| unset / `DeviceKind::Auto` | GPU, CPU as fallback |
+| `LUMA_DEVICE=gpu` / `DeviceKind::Gpu` | a hardware GPU only; `LumaError::NoDevice` or `NoAdapter` if none exists |
+| `LUMA_DEVICE=cpu` / `DeviceKind::Cpu` / `Context::cpu()` | the native `cpu` backend, whatever GPUs exist |
+| unset / `DeviceKind::Auto` | GPU, the `cpu` backend as fallback |
 
 ```rust
 use luma::*;
@@ -22,7 +23,7 @@ match Context::cpu() {
         assert_eq!((&x + &x).to_vec()?, vec![2.0, 4.0]);
     }
     Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) => {
-        eprintln!("No software GPU driver is available");
+        eprintln!("The cpu backend is not built");
     }
     Err(error) => return Err(error),
 }

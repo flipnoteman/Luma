@@ -18,8 +18,9 @@
 //! * **Default device**: arrays and kernels are created on a lazily opened global
 //!   [`default_context`]; every constructor has an `_on(&ctx, ..)` form for an explicit
 //!   [`Context`].
-//! * **CPU fallback**: without a GPU the context opens a software Vulkan driver (Mesa
-//!   llvmpipe) instead; `LUMA_DEVICE=cpu` or [`Context::cpu`] force it. See [`DeviceKind`].
+//! * **CPU fallback**: without a GPU the context opens the native `cpu` backend (SIMD code on
+//!   the host's threads); `LUMA_DEVICE=cpu` or [`Context::cpu`] force it. Software Vulkan
+//!   adapters such as llvmpipe are never used. [`Context::device`] says which device runs. See [`DeviceKind`].
 //! * **Arrays larger than a buffer**: an array that exceeds the device's buffer limit is split
 //!   over several buffers and the built-in operations run over them in pieces. Array data
 //!   beyond the device's memory budget moves to host memory and back on demand
@@ -120,7 +121,7 @@ mod until;
 mod view;
 
 pub use array::Array;
-pub use context::{default_context, flush, Context, ContextOptions};
+pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
 pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, DeviceKind, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
