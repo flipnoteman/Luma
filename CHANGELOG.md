@@ -9,7 +9,7 @@ All notable changes to Luma are listed here. The format follows
 ### Added
 
 - Five-crate workspace: `luma-core` (kernel IR and backend interface), `luma-wgpu`, `luma-metal` and `luma-cuda` (each a backend with its own code generator), and the root `luma` crate. Cargo features `wgpu`, `metal` and `cuda` (all default) each enable one backend.
-- Native Metal and CUDA backends next to wgpu. `ContextOptions::backend`, `Context::{cuda, metal, wgpu, backend}` and `LUMA_BACKEND` choose one; `Auto` tries CUDA, then Metal, then wgpu. `LUMA_DEVICE` also accepts a backend name. The CUDA driver and NVRTC are loaded at run time. Custom WGSL kernels run on the native backends through the kernel IR; cooperative matrix stays wgpu-only. CUDA replays traced fixed-iteration steps from a cached graph.
+- Native Metal and CUDA backends next to wgpu. `ContextOptions::backend`, `Context::{cuda, metal, wgpu, backend}` and `LUMA_BACKEND` choose one; `Auto` tries CUDA, then Metal, then wgpu. `LUMA_DEVICE` also accepts a backend name. The CUDA backend needs only the NVIDIA driver: kernels are emitted as NVVM IR and compiled to PTX by the driver's own NVVM library (`libnvidia-nvvm`), linking NVIDIA's `libdevice` (embedded) for math; no CUDA toolkit or NVRTC is needed. Custom WGSL kernels run on the native backends through the kernel IR; cooperative matrix stays wgpu-only. CUDA replays traced fixed-iteration steps from a cached graph.
 - `Array::permute_axes([usize; 4])` and `swap_axes(a, b)` (lazy views like `transpose`, which is
   `swap_axes(0, 1)`), their writing forms `permute_axes_mut` / `swap_axes_mut`, and the same on
   `ViewMut` and `Fields`. Swapping axes 1 and 2 of a `[ni, nj, nk]` array gives the reduction

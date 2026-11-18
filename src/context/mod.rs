@@ -441,11 +441,9 @@ impl Context {
         Context::with_options(ContextOptions::from_env())
     }
 
-    /// Opens a software (CPU) device (the native SIMD `cpu` backend, or a wgpu software adapter
-    /// such as Mesa llvmpipe), whatever GPUs exist.
+    /// Opens the native CPU backend (`cpu`), whatever GPUs exist and whatever `LUMA_BACKEND` says.
     pub fn cpu() -> Result<Context> {
-        let env = ContextOptions::from_env();
-        Context::with_options(ContextOptions { device: DeviceKind::Cpu, ..env })
+        Context::with_options(ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() })
     }
 
     /// Opens a device of the CUDA backend (NVIDIA GPUs).

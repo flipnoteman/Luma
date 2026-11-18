@@ -1,4 +1,5 @@
-//! The CUDA runtime: a device pool, buffers, NVRTC compilation with a PTX disk cache, one ordered
+//! The CUDA runtime: a device pool, buffers, NVVM compilation (the driver's own NVVM library) with
+//! a PTX disk cache, one ordered
 //! stream per backend and CUDA graph capture and replay.
 //!
 //! Work goes onto the stream as soon as it is recorded; a "batch" is only the set of resources the
@@ -16,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, DriverError, result, sys};
-use cudarc::nvrtc::{self, CompileError, CompileOptions, Ptx};
+use cudarc::nvrtc::Ptx;
 use luma_core::hal::cache::{self, PTX_MAGIC};
 use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
@@ -325,7 +326,7 @@ struct CudaShared {
     disk: Arc<DiskCache>,
     cost: Arc<OnceLock<CostModel>>,
     cc: (i32, i32),
-    nvrtc: (i32, i32),
+    nvvm: crate::nvvm::Nvvm,
 }
 
 static POOL: Mutex<Option<Arc<CudaShared>>> = Mutex::new(None);
@@ -344,9 +345,9 @@ impl CudaShared {
     fn open() -> Result<CudaShared, BackendError> {
         // SAFETY: only looks for the libraries; without this check the first driver call panics
         // when they are missing.
-        let present = unsafe { sys::is_culib_present() && nvrtc::sys::is_culib_present() };
+        let present = unsafe { sys::is_culib_present() };
         if !present {
-            return Err(BackendError::NoAdapter("NVIDIA CUDA driver or NVRTC library is not installed".into()));
+            return Err(BackendError::NoAdapter("NVIDIA CUDA driver is not installed".into()));
         }
         let count = CudaContext::device_count().map_err(|e| BackendError::NoAdapter(format!("CUDA initialization failed: {e}")))?;
         if count == 0 {
@@ -376,9 +377,7 @@ impl CudaShared {
         let mut driver = 0;
         // SAFETY: writes one int.
         unsafe { sys::cuDriverGetVersion(&mut driver) }.result().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
-        let (mut nvrtc_major, mut nvrtc_minor) = (0, 0);
-        // SAFETY: writes two ints; the library was found above.
-        unsafe { nvrtc::sys::nvrtcVersion(&mut nvrtc_major, &mut nvrtc_minor) }.result().map_err(|e| BackendError::NoAdapter(format!("NVRTC is unusable: {e}")))?;
+        let nvvm = crate::nvvm::Nvvm::open(major, minor).map_err(|e| BackendError::NoAdapter(format!("the NVIDIA driver's NVVM compiler is unusable: {e}")))?;
 
         let identity = format!("{name}\n{major}.{minor}\n{driver}");
         let key = format!("cuda-sm{major}{minor}-{:016x}", cache::fnv1a(identity.as_bytes()));
@@ -407,7 +406,7 @@ impl CudaShared {
                 max_workgroup_storage_bytes: shared_bytes as u32,
             },
         };
-        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvrtc: (nvrtc_major, nvrtc_minor) })
+        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm })
     }
 }
 
@@ -703,24 +702,27 @@ impl CudaBackend {
         Ok(())
     }
 
-    fn compile_ptx(&self, source: &str, label: &str) -> Result<(Ptx, Option<String>), BackendError> {
+    /// The kernel compiled from NVVM IR `source`, through the disk cache.
+    fn build_function(&self, source: &str, label: &str) -> Result<CudaFunction, BackendError> {
         let (major, minor) = self.shared.cc;
-        let meta = [major as u8, minor as u8, self.shared.nvrtc.0 as u8, self.shared.nvrtc.1 as u8];
+        // Last byte: emitter revision; bump whenever the emitted IR changes.
+        let meta = [major as u8, minor as u8, self.shared.nvvm.version.0 as u8, self.shared.nvvm.version.1 as u8, 3];
         let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let stem = format!("ptx-{hash:016x}");
+        let load = |text: String| self.shared.ctx.load_module(Ptx::from_src(text)).and_then(|m| m.load_function(ENTRY));
         if let Some(text) = self.shared.disk.load_blob(&stem, PTX_MAGIC).and_then(|bytes| String::from_utf8(bytes).ok())
             && !text.contains('\0')
         {
-            return Ok((Ptx::from_src(text), Some(stem)));
+            match load(text) {
+                Ok(func) => return Ok(func),
+                // A stale cache entry: rebuild it.
+                Err(_) => self.shared.disk.remove_blob(&stem),
+            }
         }
-        let options = CompileOptions { fmad: Some(true), options: vec![format!("--gpu-architecture=compute_{major}{minor}"), "--std=c++17".into()], ..Default::default() };
-        let ptx = nvrtc::compile_ptx_with_opts(source, options).map_err(|e| match e {
-            CompileError::CompileError { log, .. } => BackendError::ShaderCompile(format!("kernel `{label}`:\n{}", log.to_string_lossy())),
-            other => BackendError::ShaderCompile(format!("kernel `{label}`: {other:?}")),
-        })?;
-        let text = ptx.to_src();
+        let text = self.shared.nvvm.compile(source, major, minor).map_err(|e| BackendError::ShaderCompile(format!("kernel `{label}`:\n{e}")))?;
+        let func = load(text.clone()).map_err(gpu)?;
         self.shared.disk.store_blob(&stem, PTX_MAGIC, text.as_bytes());
-        Ok((Ptx::from_src(text), None))
+        Ok(func)
     }
 
     fn try_capture(&self, launches: &[GraphLaunch<'_>]) -> Result<Arc<dyn ExecGraph>, BackendError> {
@@ -865,17 +867,7 @@ impl Backend for CudaBackend {
         let strides: Vec<u32> = translated.array_lengths.iter().map(|&b| optimized.bindings.get(b as usize).and_then(|d| d.element_stride).unwrap_or(1)).collect();
 
         self.bind()?;
-        let (ptx, cached) = self.compile_ptx(&translated.source, label)?;
-        let func = match self.shared.ctx.load_module(ptx).and_then(|m| m.load_function(ENTRY)) {
-            Ok(func) => func,
-            Err(error) => {
-                let Some(stem) = cached else { return Err(gpu(error)) };
-                // A stale cache entry: rebuild it.
-                self.shared.disk.remove_blob(&stem);
-                let (ptx, _) = self.compile_ptx(&translated.source, label)?;
-                self.shared.ctx.load_module(ptx).and_then(|m| m.load_function(ENTRY)).map_err(gpu)?
-            }
-        };
+        let func = self.build_function(&translated.source, label)?;
         Ok(RawKernel::new(CudaKernel { func, workgroup: optimized.workgroup_size, param_abis: translated.param_abis, array_lengths: translated.array_lengths, strides }))
     }
 
@@ -1166,7 +1158,7 @@ mod tests {
     #[test]
     fn a_missing_driver_is_no_adapter() {
         // SAFETY: only looks for the libraries.
-        let present = unsafe { sys::is_culib_present() && nvrtc::sys::is_culib_present() };
+        let present = unsafe { sys::is_culib_present() };
         match open_backend() {
             Ok(_) => assert!(present),
             Err(error) => {
