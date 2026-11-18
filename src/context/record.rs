@@ -10,17 +10,22 @@
 //! every thread has its own (traces of several threads run side by side, none waits for or
 //! disturbs another's), and the launch path of a thread that is not recording looks at nothing
 //! but its own thread-local list.
+//!
+//! Buffers released while recording stay out of the pool, because captured commands still name
+//! them, so a step that makes many intermediates would hold one buffer for each. When the
+//! recording ends, the intermediates that were allocated and released inside it share buffers
+//! whenever the commands that use them do not overlap (see [`Recording::share_transients`]).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use luma_core::{Buffer, Dispatch};
+use luma_core::{Buffer, BufferUsage, Dispatch};
 
 use crate::array::Storage;
 use crate::error::Result;
-use crate::gpu::hash::FxMap;
-use crate::gpu::pager::Pin;
+use crate::gpu::hash::{FxMap, FxSet};
+use crate::gpu::pager::{take_dead_buffers, Accounted, Pin};
 use crate::kernel::KernelCore;
 
 use super::{Context, RawArg};
@@ -85,8 +90,19 @@ pub(crate) struct Recording {
     /// Keeps every segment pinned during the recording resident (and alive).
     pub pins: Vec<Pin>,
     /// Buffers released during the recording; they stay out of the pool while captured commands
-    /// still refer to them.
+    /// still refer to them. Ending the recording merges the transient ones (see `transient`).
     pub retired: Vec<Buffer>,
+    /// The buffers (by id) that `alloc_buffer` handed out during the recording. Their contents
+    /// were arbitrary when the recording began, so nothing the plan computes can depend on them
+    /// before a captured command writes them.
+    fresh: FxSet<u64>,
+    /// The transient buffers the commands name after the merge: those of `retired` that were
+    /// allocated and released inside the recording. They belong to the plan alone (nothing
+    /// outside holds them, and no buffer swap of a stepper may involve one).
+    pub transient: Vec<Buffer>,
+    /// Keeps the bytes of `transient` counted as resident (the segments that owned them are gone)
+    /// until the plan, or the recording if it is dropped instead, is.
+    pub resident: Option<Accounted>,
     kernels: FxMap<u64, Arc<KernelCore>>,
 }
 
@@ -146,6 +162,9 @@ impl Context {
                         cmds: Vec::new(),
                         pins: Vec::new(),
                         retired: Vec::new(),
+                        fresh: FxSet::default(),
+                        transient: Vec::new(),
+                        resident: None,
                         kernels: FxMap::default(),
                     }),
                 ));
@@ -185,9 +204,27 @@ impl Context {
             .ok()
             .flatten();
         match state {
-            Some(RecState::Active(recording)) => Some(recording),
+            Some(RecState::Active(mut recording)) => {
+                // The entry is gone, so `recycle` gives these straight to the pool.
+                for buffer in recording.share_transients() {
+                    self.recycle(buffer);
+                }
+                let kept: u64 = recording.transient.iter().map(Buffer::size).sum();
+                if kept > 0 {
+                    recording.resident = Some(Accounted::new(self, kept));
+                }
+                Some(recording)
+            }
             _ => None,
         }
+    }
+
+    /// Notes that `buffer`, just taken from [`Context::alloc_buffer`], is fresh in this
+    /// thread's recording (if it has one).
+    pub(super) fn note_fresh(&self, buffer: &Buffer) {
+        self.with_recording(|recording| {
+            recording.fresh.insert(buffer.id());
+        });
     }
 
     /// Captures a launch if this thread is recording.
@@ -258,7 +295,129 @@ impl Context {
     }
 }
 
+/// The first and last command of a live interval (both inclusive).
+type Interval = (usize, usize);
+
+/// Assigns each interval `[start, end]` (both ends inclusive) a slot so that intervals sharing
+/// a slot never overlap: an interval takes the first slot whose last interval ended strictly
+/// before its start, or a new one. Visiting the intervals by start gives the fewest slots (the
+/// greatest number of intervals that are live at once). Returns the slot of every interval;
+/// slots are numbered in the order they are opened.
+pub(super) fn pack_intervals(intervals: &[Interval]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..intervals.len()).collect();
+    order.sort_by_key(|&i| (intervals[i].0, i));
+    let mut slot_end: Vec<usize> = Vec::new();
+    let mut slots = vec![0; intervals.len()];
+    for i in order {
+        let (start, end) = intervals[i];
+        match slot_end.iter().position(|&last| last < start) {
+            Some(slot) => {
+                slot_end[slot] = end;
+                slots[i] = slot;
+            }
+            None => {
+                slots[i] = slot_end.len();
+                slot_end.push(end);
+            }
+        }
+    }
+    slots
+}
+
 impl Recording {
+    /// Lets the transient buffers of the recording share memory, and returns the ones the
+    /// commands no longer name, for the caller to give back to the pool.
+    ///
+    /// A buffer is *transient* if it is fresh (allocated during the recording, so it held
+    /// nothing that mattered when the recording began) and nothing outside the plan holds it any
+    /// more: it was released during the recording (`retired`), or it belongs to a segment that
+    /// only this recording's pins still hold (an array of the traced step that was dropped, see
+    /// [`take_dead_buffers`]; the pins keep a segment alive, so this is where the intermediates
+    /// of a step are). State, probes, seeds, results, buffers that existed before the recording
+    /// and buffers still owned at its end keep their identity.
+    ///
+    /// The live interval of a transient buffer runs from the first captured command that binds
+    /// it to the last one, whatever the binding. A replay runs the commands in recorded order on
+    /// one queue, so two transient buffers of the same size and usage whose intervals do not
+    /// overlap can be one buffer: the second is only written after the last use of the first, as
+    /// when the pool hands out a released buffer again. The commands are rewritten to name that
+    /// one buffer (the logical `bytes` they bind stay), so graph capture and every replay see
+    /// the same aliasing. Intervals that touch at one command stay apart: a command may read one
+    /// buffer while it writes another.
+    fn share_transients(&mut self) -> Vec<Buffer> {
+        let mut transient: Vec<Buffer> = Vec::new();
+        let mut kept = Vec::with_capacity(self.retired.len());
+        for buffer in std::mem::take(&mut self.retired) {
+            match self.fresh.contains(&buffer.id()) {
+                true => transient.push(buffer),
+                false => kept.push(buffer),
+            }
+        }
+        self.retired = kept;
+        transient.extend(take_dead_buffers(&mut self.pins, &self.fresh));
+        if transient.is_empty() {
+            return Vec::new();
+        }
+
+        // Live interval (first and last command that binds it) of each; `None`: never bound.
+        let mut intervals: FxMap<u64, Option<Interval>> = transient.iter().map(|buffer| (buffer.id(), None)).collect();
+        for (at, cmd) in self.cmds.iter().enumerate() {
+            for arg in &cmd.args {
+                if let CmdArg::Storage { buffer, .. } = arg
+                    && let Some(interval) = intervals.get_mut(&buffer.id())
+                {
+                    let (first, _) = interval.unwrap_or((at, at));
+                    *interval = Some((first, at));
+                }
+            }
+        }
+
+        // Group by what the pool keys on.
+        let mut groups: FxMap<(u64, BufferUsage), Vec<(usize, Interval)>> = FxMap::default();
+        for (n, buffer) in transient.iter().enumerate() {
+            if let Some(Some(interval)) = intervals.get(&buffer.id()) {
+                groups.entry((buffer.size(), buffer.usage())).or_default().push((n, *interval));
+            }
+        }
+        // The buffer each one becomes (itself, for the first of its slot); `None`: no command names it.
+        let mut becomes: Vec<Option<usize>> = vec![None; transient.len()];
+        for members in groups.values() {
+            let slots = pack_intervals(&members.iter().map(|&(_, interval)| interval).collect::<Vec<_>>());
+            let mut owner: Vec<Option<usize>> = vec![None; slots.iter().max().map_or(0, |last| last + 1)];
+            for (&(n, _), &slot) in members.iter().zip(&slots) {
+                becomes[n] = Some(*owner[slot].get_or_insert(n));
+            }
+        }
+        let merged: FxMap<u64, Buffer> = becomes
+            .iter()
+            .enumerate()
+            .filter_map(|(n, to)| to.filter(|&to| to != n).map(|to| (transient[n].id(), transient[to].clone())))
+            .collect();
+        if !merged.is_empty() {
+            for cmd in &mut self.cmds {
+                for arg in &mut cmd.args {
+                    if let CmdArg::Storage { buffer, .. } = arg
+                        && let Some(to) = merged.get(&buffer.id())
+                    {
+                        *buffer = to.clone();
+                    }
+                }
+            }
+        }
+
+        // The plan keeps the buffers that are named; the rest is free.
+        let mut freed = Vec::new();
+        for (n, buffer) in transient.into_iter().enumerate() {
+            if becomes[n] == Some(n) {
+                self.transient.push(buffer.clone());
+                self.retired.push(buffer);
+            } else {
+                freed.push(buffer);
+            }
+        }
+        freed
+    }
+
     fn retire_buffer(&mut self, buffer: &mut Option<Buffer>) {
         if let Some(buffer) = buffer.take() {
             self.retired.push(buffer);

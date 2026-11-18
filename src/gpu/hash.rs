@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// A fast, non-cryptographic hasher (the multiply-rotate scheme of rustc's `FxHasher`) for the
@@ -59,3 +59,4 @@ impl Hasher for FxHasher {
 pub(crate) type FxBuild = BuildHasherDefault<FxHasher>;
 
 pub(crate) type FxMap<K, V> = HashMap<K, V, FxBuild>;
+pub(crate) type FxSet<K> = HashSet<K, FxBuild>;
