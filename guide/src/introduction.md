@@ -2,8 +2,8 @@
 
 Luma is an array library for Rust that runs on the GPU. You write ordinary arithmetic on `Array`s;
 Luma records it, fuses chains of elementwise operations into a single kernel, and runs the result
-on whatever hardware you have (Vulkan, Metal or DX12, through [wgpu](https://wgpu.rs)). If no GPU
-opens it falls back to Mesa's llvmpipe software driver.
+on whatever hardware you have (CUDA, Metal, or Vulkan and DX12 through [wgpu](https://wgpu.rs)). If
+no GPU opens it falls back to a native SIMD CPU backend.
 
 It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
 solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
@@ -24,9 +24,8 @@ to a project:
 luma = "0.4"
 ```
 
-Without a GPU, install a software Vulkan driver (`mesa-vulkan-drivers` on most Linux
-distributions). Luma picks it up automatically when no GPU opens, and `LUMA_DEVICE=cpu` forces
-it. See the [FAQ](faq.md#choosing-a-device).
+Without a GPU Luma runs on its native `cpu` backend (nothing to install). It is picked
+automatically when no GPU opens, and `LUMA_DEVICE=cpu` forces it. See the [FAQ](faq.md#choosing-a-device).
 
 ## A first program
 

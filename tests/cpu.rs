@@ -1,10 +1,9 @@
-//! The software (CPU) device: the native SIMD `luma-cpu` backend, or Mesa llvmpipe through
-//! wgpu when `luma-cpu` is not built. Tests return early when no software device exists.
+//! The CPU device: the native SIMD `luma-cpu` backend. Tests return early when it is not built.
 
 use luma::{Array, Context, LumaError, TuningProfile};
 
-/// A CPU context, or `None` when the machine has no software driver (the test then has nothing
-/// to check).
+/// A CPU context, or `None` when the `cpu` backend is not built (the test then has nothing to
+/// check).
 fn cpu() -> Option<Context> {
     match Context::cpu() {
         Ok(ctx) => Some(ctx),

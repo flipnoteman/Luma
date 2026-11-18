@@ -573,7 +573,7 @@ impl WgpuBackend {
         // Idle buffer caches scale with the memory the device holds (half of the 80% data
         // budget): they are given back when the device runs out of memory, so they cannot crowd
         // out array data.
-        let cap = if gpu.0.cpu { 1 << 30 } else { gpu.0.memory.map_or(1 << 30, |memory| memory / 5 * 4 / 2) };
+        let cap = gpu.0.memory.map_or(1 << 30, |memory| memory / 5 * 4 / 2);
 
         // wgpu panics on errors nobody handles. Record the first one instead and report it as an
         // `Err` at the next synchronization point.
@@ -600,7 +600,7 @@ impl WgpuBackend {
         let info = DeviceInfo {
             backend: BackendKind::Wgpu,
             name: adapter.name.clone(),
-            cpu: gpu.0.cpu,
+            cpu: false,
             zero_copy: features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
             profile: tuning_profile(adapter),
             features: luma_features(features),

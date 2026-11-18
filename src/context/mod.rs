@@ -304,6 +304,17 @@ impl ContextOptions {
     }
 }
 
+/// Which device a [`Context`] runs on, from [`Context::device`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceSummary {
+    /// The backend the context runs on.
+    pub backend: BackendKind,
+    /// The device's name.
+    pub name: String,
+    /// Whether the device is the host CPU (the `cpu` backend) rather than a GPU.
+    pub software: bool,
+}
+
 /// The largest power of two not above `x` (1 for `x` of 0 or 1): the segment size that fits a
 /// buffer limit or a fraction of the memory budget.
 fn pow2_floor(x: u64) -> u64 {
@@ -321,14 +332,13 @@ fn not_built(feature: &str) -> LumaError {
     })
 }
 
-/// Why a CPU device cannot be had from a backend other than wgpu.
-#[cfg(any(feature = "cuda", feature = "metal", not(feature = "wgpu")))]
-const CPU_NEEDS_WGPU: &str = "CPU fallback requires the wgpu backend";
+/// Why a CPU device cannot be had from a GPU backend.
+const CPU_NEEDS_CPU_BACKEND: &str = "a CPU device needs the `cpu` backend (the `cpu` feature); GPU backends never run on software adapters";
 
 #[cfg(feature = "cuda")]
 fn open_cuda(device: DeviceKind) -> Result<Box<dyn Backend>> {
     if device == DeviceKind::Cpu {
-        return Err(LumaError::NoDevice(CPU_NEEDS_WGPU));
+        return Err(LumaError::NoDevice(CPU_NEEDS_CPU_BACKEND));
     }
     Ok(luma_cuda::open()?)
 }
@@ -341,7 +351,7 @@ fn open_cuda(_: DeviceKind) -> Result<Box<dyn Backend>> {
 #[cfg(feature = "metal")]
 fn open_metal(device: DeviceKind) -> Result<Box<dyn Backend>> {
     if device == DeviceKind::Cpu {
-        return Err(LumaError::NoDevice(CPU_NEEDS_WGPU));
+        return Err(LumaError::NoDevice(CPU_NEEDS_CPU_BACKEND));
     }
     Ok(luma_metal::open()?)
 }
@@ -353,13 +363,16 @@ fn open_metal(_: DeviceKind) -> Result<Box<dyn Backend>> {
 
 #[cfg(feature = "wgpu")]
 fn open_wgpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
+    if device == DeviceKind::Cpu {
+        return Err(LumaError::NoDevice(CPU_NEEDS_CPU_BACKEND));
+    }
     Ok(luma_wgpu::open(device)?)
 }
 
 #[cfg(not(feature = "wgpu"))]
 fn open_wgpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
     if device == DeviceKind::Cpu {
-        return Err(LumaError::NoDevice(CPU_NEEDS_WGPU));
+        return Err(LumaError::NoDevice(CPU_NEEDS_CPU_BACKEND));
     }
     Err(not_built("wgpu"))
 }
@@ -378,7 +391,7 @@ fn open_cpu(_: DeviceKind) -> Result<Box<dyn Backend>> {
 }
 
 /// Opens the backend `backend` names. `Auto` tries CUDA, then Metal, then wgpu for GPU devices
-/// and falls back to the native CPU backend (or wgpu software adapter) when needed.
+/// and falls back to the native CPU backend when needed. A CPU device is the native CPU backend only.
 fn open_backend(backend: BackendKind, device: DeviceKind) -> Result<Box<dyn Backend>> {
     match backend {
         BackendKind::Cuda => open_cuda(device),
@@ -387,10 +400,7 @@ fn open_backend(backend: BackendKind, device: DeviceKind) -> Result<Box<dyn Back
         BackendKind::Cpu => open_cpu(device),
         BackendKind::Auto => {
             if device == DeviceKind::Cpu {
-                if let Ok(backend) = open_cpu(DeviceKind::Cpu) {
-                    return Ok(backend);
-                }
-                return open_wgpu(DeviceKind::Cpu);
+                return open_cpu(DeviceKind::Cpu);
             }
             type Open = fn(DeviceKind) -> Result<Box<dyn Backend>>;
             for (name, open) in [("cuda", open_cuda as Open), ("metal", open_metal as Open), ("wgpu", open_wgpu as Open)] {
@@ -401,10 +411,7 @@ fn open_backend(backend: BackendKind, device: DeviceKind) -> Result<Box<dyn Back
                 }
             }
             if device == DeviceKind::Auto {
-                if let Ok(backend) = open_cpu(DeviceKind::Cpu) {
-                    return Ok(backend);
-                }
-                return open_wgpu(DeviceKind::Auto);
+                return open_cpu(DeviceKind::Cpu);
             }
             open_wgpu(device)
         }
@@ -464,6 +471,17 @@ impl Context {
     /// The backend this context runs on.
     pub fn backend(&self) -> BackendKind {
         self.inner.backend.info().backend
+    }
+
+    /// Which device this context runs on: its backend, name and whether it is a software (CPU) device.
+    pub fn device(&self) -> DeviceSummary {
+        let info = self.inner.backend.info();
+        DeviceSummary { backend: info.backend, name: info.name.clone(), software: info.cpu }
+    }
+
+    /// The device's name (the GPU's marketing name, or a description of the CPU for the `cpu` backend).
+    pub fn device_name(&self) -> &str {
+        &self.inner.backend.info().name
     }
 
     /// Whether value-changing algebraic rewrites are allowed.
