@@ -213,6 +213,16 @@ fn device_ptr(buffer: &Buffer) -> Result<sys::CUdeviceptr, BackendError> {
     buffer.downcast_ref::<CudaBuffer>().map(|b| b.dptr).ok_or_else(|| BackendError::KernelBinding("a buffer of another backend was passed to a CUDA kernel".into()))
 }
 
+/// The grid a dispatch launches (an indirect one launches its upper bound; the kernel itself
+/// retires the workgroups beyond the counts), the device address of its counts (0 when direct)
+/// and the buffer holding them.
+fn resolve_dispatch<'a>(dispatch: Dispatch<'a>) -> Result<([u32; 3], u64, Option<&'a Buffer>), BackendError> {
+    match dispatch {
+        Dispatch::Direct(workgroups) => Ok((workgroups, 0, None)),
+        Dispatch::Indirect { buffer, offset, max_workgroups } => Ok((max_workgroups, device_ptr(buffer)? + offset, Some(buffer))),
+    }
+}
+
 impl Params {
     /// Fills the parameter array of `luma_main` for a launch; `uniform` gives the device address
     /// of the copy of a uniform passed by pointer.
@@ -733,13 +743,14 @@ impl CudaBackend {
             .iter()
             .map(|l| l.kernel.raw.downcast_ref::<CudaKernel>().ok_or_else(|| BackendError::Unsupported("kernel was compiled by another backend".into())))
             .collect::<Result<_, _>>()?;
+        let dispatches: Vec<([u32; 3], u64, Option<&Buffer>)> = launches.iter().map(|l| resolve_dispatch(l.dispatch)).collect::<Result<_, _>>()?;
 
         // The uniforms passed by pointer are fixed for the life of the graph: one device copy.
         let mut staging: Vec<u8> = Vec::new();
-        for (launch, native) in launches.iter().zip(&natives) {
+        for ((launch, native), (grid, ..)) in launches.iter().zip(&natives).zip(&dispatches) {
             for ((_, arg), abi) in launch.kernel.bound(launch.args).zip(&native.param_abis) {
                 if let (CudaArgAbi::UniformPtr, RawArg::Uniform(bytes)) = (abi, arg)
-                    && !launch.workgroups.contains(&0)
+                    && !grid.contains(&0)
                 {
                     staging.extend_from_slice(bytes);
                     staging.resize(staging.len().next_multiple_of(UNIFORM_ALIGN), 0);
@@ -772,12 +783,12 @@ impl CudaBackend {
         let mut offset = 0usize;
         let mut res = GraphRes { buffers: Vec::new(), kernels: Vec::new(), scratch };
         let recorded = (|| {
-            for (launch, native) in launches.iter().zip(&natives) {
-                let grid = launch.workgroups;
+            for ((launch, native), &(grid, indirect, indirect_buffer)) in launches.iter().zip(&natives).zip(&dispatches) {
+                // A launch of no workgroups (an indirect one: of a bound of none) never runs.
                 if grid.contains(&0) {
                     continue;
                 }
-                params.build(native, launch.kernel, [launch.size[0], launch.size[1], launch.size[2], 0], 0, launch.args, &mut |bytes| {
+                params.build(native, launch.kernel, [launch.size[0], launch.size[1], launch.size[2], 0], indirect, launch.args, &mut |bytes| {
                     let address = base + offset as u64;
                     offset += bytes.len().next_multiple_of(UNIFORM_ALIGN);
                     Ok(address)
@@ -799,6 +810,8 @@ impl CudaBackend {
                         res.buffers.push((*buffer).clone());
                     }
                 }
+                // The graph reads the counts when it runs: the buffer must outlive it.
+                res.buffers.extend(indirect_buffer.cloned());
                 res.kernels.push(launch.kernel.raw.clone());
             }
             Ok::<(), BackendError>(())
@@ -875,10 +888,7 @@ impl Backend for CudaBackend {
         kernel.check_count(args.len())?;
         kernel.check_kinds(args)?;
         let native = kernel.raw.downcast_ref::<CudaKernel>().ok_or_else(|| BackendError::Unsupported("kernel was compiled by another backend".into()))?;
-        let (grid, indirect_buffer) = match dispatch {
-            Dispatch::Direct(workgroups) => (workgroups, None),
-            Dispatch::Indirect { buffer, offset, max_workgroups } => (max_workgroups, Some((buffer, offset))),
-        };
+        let (grid, indirect, indirect_buffer) = resolve_dispatch(dispatch)?;
         let mut st = lock(&self.state);
         if grid.contains(&0) {
             if let Some(samples) = st.profiler.as_mut() {
@@ -886,13 +896,9 @@ impl Backend for CudaBackend {
             }
             return Ok(st.dispatches);
         }
-        let indirect = match indirect_buffer {
-            Some((buffer, offset)) => device_ptr(buffer)? + offset,
-            None => 0,
-        };
         self.bind()?;
         let mut params = std::mem::take(&mut st.params);
-        let launched = self.launch_locked(&mut st, native, kernel, grid, size, indirect, indirect_buffer.map(|(buffer, _)| buffer), args, &mut params);
+        let launched = self.launch_locked(&mut st, native, kernel, grid, size, indirect, indirect_buffer, args, &mut params);
         st.params = params;
         // The chunks a rollover gave up lived until the launch that named them was queued.
         let retired = std::mem::take(&mut st.uniform_retired);

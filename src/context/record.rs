@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use luma_core::Buffer;
+use luma_core::{Buffer, Dispatch};
 
 use crate::array::Storage;
 use crate::error::Result;
@@ -42,11 +42,9 @@ pub(crate) enum CmdArg {
 }
 
 impl Cmd {
-    /// Encodes the launch with storage buffers replaced per `subst` (simultaneous, by `==`).
-    /// The workgroup counts come from `indirect` (buffer, byte offset) when given.
-    pub(crate) fn encode(&self, ctx: &Context, subst: &[(Buffer, Buffer)], indirect: Option<(&Buffer, u64)>) -> Result<()> {
-        let args: Vec<RawArg<'_>> = self
-            .args
+    /// The arguments of the launch with storage buffers replaced per `subst` (simultaneous, by `==`).
+    pub(crate) fn raw_args<'a>(&'a self, subst: &'a [(Buffer, Buffer)]) -> Vec<RawArg<'a>> {
+        self.args
             .iter()
             .map(|arg| match arg {
                 CmdArg::Storage { buffer, bytes, writable } => {
@@ -55,7 +53,22 @@ impl Cmd {
                 }
                 CmdArg::Uniform(data) => RawArg::Uniform(data),
             })
-            .collect();
+            .collect()
+    }
+
+    /// The workgroups of the launch: the recorded counts, or the ones read from `indirect`
+    /// (buffer, byte offset) with the recorded counts as their bound.
+    pub(crate) fn dispatch<'a>(&self, indirect: Option<(&'a Buffer, u64)>) -> Dispatch<'a> {
+        match indirect {
+            Some((buffer, offset)) => Dispatch::Indirect { buffer, offset, max_workgroups: self.workgroups },
+            None => Dispatch::Direct(self.workgroups),
+        }
+    }
+
+    /// Encodes the launch with storage buffers replaced per `subst` (simultaneous, by `==`).
+    /// The workgroup counts come from `indirect` (buffer, byte offset) when given.
+    pub(crate) fn encode(&self, ctx: &Context, subst: &[(Buffer, Buffer)], indirect: Option<(&Buffer, u64)>) -> Result<()> {
+        let args = self.raw_args(subst);
         match indirect {
             Some((buffer, offset)) => ctx.launch_indirect(&self.kernel, buffer, offset, self.size, self.workgroups, &args),
             None => ctx.launch(&self.kernel, self.workgroups, self.size, &args),

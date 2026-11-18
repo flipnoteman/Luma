@@ -306,3 +306,133 @@ fn zero_steps_return_a_copy_that_does_not_alias_the_input() {
     assert_eq!(run.state.0.to_vec().unwrap(), vec![2.0; 4]);
     assert_eq!(x.to_vec().unwrap(), vec![1.0; 4]);
 }
+
+/// Where a run of the counting loop starts.
+#[derive(Clone, Copy)]
+enum Start {
+    Value(f32),
+    /// The state the run before returned.
+    Previous,
+}
+
+/// What a run of the counting loop gives: steps, reason, the history of `v` and the state.
+type Outcome = (usize, StopReason, Vec<f32>, f32);
+
+/// The runs below, each with the most steps it may take (`None`: all the loop was compiled for).
+const COUNTING_RUNS: [(Start, Option<usize>); 7] = [
+    // Stops at step 20, in the third block of 7 steps.
+    (Start::Value(0.0), None),
+    // Stops at step 14, on the last step of a block of 7.
+    (Start::Value(100.0), None),
+    // Ends at 23 steps, a block that is cut short.
+    (Start::Value(-100.0), Some(23)),
+    // Stops at step 25: the blocks of steps 1, 15 and then 9 of 32 on the default schedule.
+    (Start::Value(-100.0), None),
+    // Never stops: 100 steps.
+    (Start::Value(-10000.0), None),
+    // Continues from the state of the run before (an even number of steps).
+    (Start::Previous, None),
+    (Start::Previous, Some(3)),
+];
+
+/// The counting loop on the host: step `k` adds `k`, so every number is an integer well inside
+/// what `f32` holds exactly, and the loop stops once the state reaches 190.
+fn counting_on_the_host(runs: &[(Start, Option<usize>)], compiled_steps: usize) -> Vec<Outcome> {
+    let mut previous = 0.0f32;
+    runs.iter()
+        .map(|&(start, limit)| {
+            let mut x = match start {
+                Start::Value(v) => v,
+                Start::Previous => previous,
+            };
+            let mut history = Vec::new();
+            let mut stopped = None;
+            for k in 0..limit.unwrap_or(compiled_steps).min(compiled_steps) {
+                x += k as f32;
+                history.push(x);
+                if x >= 190.0 {
+                    stopped = Some(k + 1);
+                    break;
+                }
+            }
+            previous = x;
+            match stopped {
+                Some(steps) => (steps, StopReason::Predicate(0), history, x),
+                None => (history.len(), StopReason::MaxSteps, history, x),
+            }
+        })
+        .collect()
+}
+
+/// The runs on a loop compiled once for 100 steps, checking the state every `every` steps; with
+/// `profiled` they run inside a profiling scope, which replays every launch one by one.
+fn counting_compiled(ctx: &Context, every: Option<usize>, profiled: bool) -> Vec<Outcome> {
+    let mut until = Until::new(100)
+        .record("v", |s: &One| s.0.max())
+        .stop_when(|h| h["v"].last().ge(190.0))
+        .stop_when(|h| h["v"].peak().ge(1e9));
+    if let Some(n) = every {
+        until = until.check_every(n);
+    }
+    let state = |v: f32| (Array::from_slice_on(ctx, &[v; 8], 8).unwrap(),);
+    let mut compiled = compile_until_all(&state(0.0), until, |s: &One, k| (&s.0 + k,)).unwrap();
+    let mut previous = state(0.0);
+    COUNTING_RUNS
+        .iter()
+        .map(|&(start, limit)| {
+            let init = match start {
+                Start::Value(v) => state(v),
+                Start::Previous => previous.clone(),
+            };
+            let run = |compiled: &mut CompiledUntil<One>| match limit {
+                Some(n) => compiled.run_steps(init, n),
+                None => compiled.run(init),
+            };
+            let run = if profiled {
+                ctx.profile(|| run(&mut compiled)).unwrap().0
+            } else {
+                run(&mut compiled)
+            }
+            .unwrap();
+            let values = run.state.0.to_vec().unwrap();
+            assert!(values.iter().all(|&v| v == values[0]), "the elements of the state differ: {values:?}");
+            previous = run.state.clone();
+            (run.steps, run.reason, run.history("v").unwrap().to_vec(), values[0])
+        })
+        .collect()
+}
+
+/// Blocks of different lengths, a stop in the middle of one and a run cut short, on every backend
+/// that is here: where the backend replays a block as one graph the result is that of the host loop,
+/// that of the launches replayed one by one under a profiling scope, and the same for runs of a
+/// compiled loop that follow one another and pass their states on.
+#[test]
+fn blocks_replayed_as_graphs_match_the_host_loop_and_the_launches_replayed_one_by_one() {
+    let want = counting_on_the_host(&COUNTING_RUNS, 100);
+    assert_eq!(want[0].0, 20);
+    assert_eq!(want[1].0, 14);
+    assert_eq!((want[2].0, want[2].1), (23, StopReason::MaxSteps));
+    assert_eq!(want[3].0, 25);
+    assert_eq!((want[4].0, want[4].1), (100, StopReason::MaxSteps));
+    let mut ran = 0;
+    for kind in [BackendKind::Cuda, BackendKind::Cpu, BackendKind::Wgpu] {
+        let ctx = match Context::with_options(ContextOptions::default().backend(kind).calibrate(false)) {
+            Ok(ctx) => ctx,
+            Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) => {
+                println!("[iterate_until_all] {kind:?}: not available on this host");
+                continue;
+            }
+            Err(error) => panic!("opening {kind:?}: {error}"),
+        };
+        ran += 1;
+        for every in [None, Some(7), Some(1)] {
+            let graphs = counting_compiled(&ctx, every, false);
+            assert_eq!(graphs, want, "{kind:?}, every {every:?}");
+            if ctx.profiling_supported() {
+                let one_by_one = counting_compiled(&ctx, every, true);
+                assert_eq!(one_by_one, want, "{kind:?}, every {every:?}, profiled");
+            }
+        }
+    }
+    assert!(ran > 0, "no backend to run on");
+}

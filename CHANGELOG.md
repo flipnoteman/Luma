@@ -22,6 +22,7 @@ All notable changes to Luma are listed here. The format follows
 - `Df32` round trips evaluate `hi + lo` consistently, including signed zero: the simplifier no longer treats a conversion from `f32` through `Df32` as an identity, and the low word is guarded against compiler folding.
 - Breaking: adapter, device and readback errors in `LumaError` carry backend-neutral strings instead of wgpu types. `Features` and profiling types are re-exported from `luma_core`; `luma::wgpu` is re-exported only with the `wgpu` feature.
 - Timestamp profiling drains completed query sets periodically instead of retaining every set until the profile ends. This avoids Metal device loss after 32 live query sets while preserving every launch's timing and per-kernel totals.
+- `iterate_until_all` and `compile_until_all` loops replay a block of steps as one graph on backends that capture them (CUDA, CPU): the stop rule's gate kernel counts the steps itself and passes the dispatch arguments from step to step on the device, so nothing in a block depends on the host, and a block costs one launch instead of two per recorded kernel. A `CompiledUntil` keeps its buffers and captured graphs from run to run. The graph interface, `GraphLaunch`, takes a `Dispatch` (direct or indirect) instead of workgroup counts.
 
 - A pipeline cache that grew past the 32 MB kept on disk is dropped with an `info` log message
   naming its size, instead of silently: every later process then compiles its kernels again

@@ -2,15 +2,19 @@
 //! placeholders (probes) while the context records its launches; the recorded launches are then
 //! replayed with the probes' buffers swapped for the real state, step after step.
 
-use std::sync::{Arc, OnceLock};
+use std::hash::Hash;
+use std::sync::{Arc, Mutex};
 
-use luma_core::{Buffer, ExecGraph, GraphLaunch};
+use luma_core::{Buffer, Dispatch, ExecGraph, GraphLaunch};
 
 use crate::array::{Array, Failure, Storage};
 use crate::context::{Cmd, CmdArg, Context, RawArg, Recording};
 use crate::error::Result;
+use crate::gpu::hash::FxMap;
+use crate::gpu::lock;
 use crate::gpu::pager::Pin;
 use crate::gpu_type::GpuType;
+use crate::kernel::KernelCore;
 
 use super::Node;
 
@@ -64,34 +68,6 @@ impl Plan {
         Ok(())
     }
 
-    /// Captures the launches of the plan under each of `substs` in turn (see
-    /// [`Plan::replay`]) as one graph the backend can replay; `None` if it cannot.
-    pub(crate) fn build_graph(&self, substs: &[Vec<(Buffer, Buffer)>]) -> Option<Arc<dyn ExecGraph>> {
-        let args: Vec<Vec<RawArg<'_>>> = substs
-            .iter()
-            .flat_map(|subst| {
-                self.cmds.iter().map(move |cmd| {
-                    cmd.args
-                        .iter()
-                        .map(|arg| match arg {
-                            CmdArg::Storage { buffer, bytes, writable } => {
-                                let buffer = subst.iter().find(|(from, _)| from == buffer).map_or(buffer, |(_, to)| to);
-                                RawArg::Storage { buffer, bytes: *bytes, writable: *writable }
-                            }
-                            CmdArg::Uniform(data) => RawArg::Uniform(data),
-                        })
-                        .collect()
-                })
-            })
-            .collect();
-        let launches: Vec<GraphLaunch<'_>> = args
-            .iter()
-            .zip(substs.iter().flat_map(|_| self.cmds.iter()))
-            .map(|(args, cmd)| GraphLaunch { kernel: &cmd.kernel, workgroups: cmd.workgroups, size: cmd.size, args })
-            .collect();
-        self.ctx.hal().capture_graph(&launches)
-    }
-
     /// Makes the traced results real: copies the seeds, then runs the commands once as recorded.
     pub(crate) fn run_once(&self) -> Result<()> {
         for (from, to) in &self.seed {
@@ -107,6 +83,74 @@ impl Drop for Plan {
             self.ctx.recycle(buffer);
         }
     }
+}
+
+/// The launches of a graph being put together: steps of a plan, and whatever else runs between
+/// them. Nothing is captured before [`GraphBuilder::capture`].
+pub(crate) struct GraphBuilder<'a> {
+    launches: Vec<(&'a KernelCore, Dispatch<'a>, [u32; 3], Vec<RawArg<'a>>)>,
+}
+
+impl<'a> GraphBuilder<'a> {
+    pub(crate) fn new() -> Self {
+        GraphBuilder { launches: Vec::new() }
+    }
+
+    /// Appends the launches of `plan` with storage buffers replaced per `subst` (see
+    /// [`Plan::replay`]), dispatched from `indirect` when given.
+    pub(crate) fn plan(&mut self, plan: &'a Plan, subst: &'a [(Buffer, Buffer)], indirect: Option<&'a Buffer>) {
+        for (l, cmd) in plan.cmds.iter().enumerate() {
+            let dispatch = cmd.dispatch(indirect.map(|buffer| (buffer, 12 * l as u64)));
+            self.launches.push((&*cmd.kernel, dispatch, cmd.size, cmd.raw_args(subst)));
+        }
+    }
+
+    /// Appends one launch.
+    pub(crate) fn launch(&mut self, kernel: &'a KernelCore, dispatch: Dispatch<'a>, size: [u32; 3], args: Vec<RawArg<'a>>) {
+        self.launches.push((kernel, dispatch, size, args));
+    }
+
+    /// The launches as one graph the backend can replay; `None` if it cannot.
+    pub(crate) fn capture(&self, ctx: &Context) -> Option<Arc<dyn ExecGraph>> {
+        let launches: Vec<GraphLaunch<'_>> = self
+            .launches
+            .iter()
+            .map(|(kernel, dispatch, size, args)| GraphLaunch { kernel, dispatch: *dispatch, size: *size, args })
+            .collect();
+        ctx.hal().capture_graph(&launches)
+    }
+}
+
+/// Captured graphs by what they replay, `None` for what the backend could not capture (asked
+/// only once). A graph names the buffers it was captured with: the owner of a cache clears it
+/// when one of them is replaced.
+pub(crate) struct GraphCache<K> {
+    graphs: Mutex<FxMap<K, Option<Arc<dyn ExecGraph>>>>,
+}
+
+impl<K: Hash + Eq> GraphCache<K> {
+    pub(crate) fn new() -> Self {
+        GraphCache { graphs: Mutex::new(FxMap::default()) }
+    }
+
+    /// The graph under `key`, captured by `build` on first use.
+    pub(crate) fn get_or_build(&self, key: K, build: impl FnOnce() -> Option<Arc<dyn ExecGraph>>) -> Option<Arc<dyn ExecGraph>> {
+        lock(&self.graphs).entry(key).or_insert_with(build).clone()
+    }
+
+    /// Forgets every graph.
+    pub(crate) fn clear(&self) {
+        lock(&self.graphs).clear();
+    }
+}
+
+/// The graphs a [`Stepper`] replays by itself.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum StepGraph {
+    /// Steps 2 and 3.
+    Pair,
+    /// Step 2 alone, for the last step of an odd count after the first.
+    Even,
 }
 
 /// Steps a plan traced on `probes` (standing for `init`) whose results are `outs`, ping-ponging
@@ -130,11 +174,9 @@ pub(crate) struct Stepper {
     /// Keep the initial state alive.
     #[allow(dead_code)]
     inits: Vec<Arc<Storage>>,
-    /// Steps 2 and 3 as one replayable graph, `None` inside when the backend has none. Reset
-    /// when `pong` is replaced.
-    pair_graph: OnceLock<Option<Arc<dyn ExecGraph>>>,
-    /// Step 2 alone, for the last step of an odd count after the first.
-    even_graph: OnceLock<Option<Arc<dyn ExecGraph>>>,
+    /// Steps 2 and 3 as one replayable graph and step 2 alone, as far as the backend has graphs.
+    /// Cleared when `pong` is replaced.
+    graphs: GraphCache<StepGraph>,
 }
 
 impl Stepper {
@@ -208,8 +250,7 @@ impl Stepper {
             pong_pins,
             init_pins,
             inits: init.to_vec(),
-            pair_graph: OnceLock::new(),
-            even_graph: OnceLock::new(),
+            graphs: GraphCache::new(),
         })
     }
 
@@ -281,23 +322,32 @@ impl Stepper {
         let launches = self.plan.launches() as u32;
         let mut next = 2;
         if rest >= 2 {
-            let pair = self.pair_graph.get_or_init(|| self.plan.build_graph(&[self.subst(2), self.subst(3)]));
+            let pair = self.graphs.get_or_build(StepGraph::Pair, || self.capture_steps(2, 2));
             let Some(pair) = pair else {
                 return plain(2);
             };
             for _ in 0..rest / 2 {
-                ctx.launch_graph(&**pair, 2 * launches)?;
+                ctx.launch_graph(&*pair, 2 * launches)?;
             }
             next += 2 * (rest / 2);
         }
         if next <= steps {
-            let even = self.even_graph.get_or_init(|| self.plan.build_graph(&[self.subst(2)]));
-            match even {
-                Some(even) => ctx.launch_graph(&**even, launches)?,
+            match self.graphs.get_or_build(StepGraph::Even, || self.capture_steps(2, 1)) {
+                Some(even) => ctx.launch_graph(&*even, launches)?,
                 None => plain(next)?,
             }
         }
         Ok(())
+    }
+
+    /// Steps `first..first + count` of the plan as one graph, dispatched directly.
+    fn capture_steps(&self, first: usize, count: usize) -> Option<Arc<dyn ExecGraph>> {
+        let substs: Vec<Vec<(Buffer, Buffer)>> = (first..first + count).map(|t| self.subst(t)).collect();
+        let mut builder = GraphBuilder::new();
+        for subst in &substs {
+            builder.plan(&self.plan, subst, None);
+        }
+        builder.capture(&self.plan.ctx)
     }
 
     /// The buffer swaps that make the plan compute step `t` (1-based).
@@ -349,8 +399,7 @@ impl Stepper {
         }
         self.pong_buffers = buffers;
         self.pong_pins = pins;
-        self.pair_graph = OnceLock::new();
-        self.even_graph = OnceLock::new();
+        self.graphs.clear();
         Some(std::mem::replace(&mut self.pong, next))
     }
 }

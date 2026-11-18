@@ -152,10 +152,38 @@ enum GraphArg {
     Uniform(Box<[u8]>),
 }
 
+/// The workgroups of a captured launch; an indirect one reads its counts when the graph runs.
+#[derive(Debug)]
+enum CapturedDispatch {
+    Direct([u32; 3]),
+    Indirect {
+        buffer: Buffer,
+        offset: u64,
+        max_workgroups: [u32; 3],
+    },
+}
+
+impl CapturedDispatch {
+    fn dispatch(&self) -> Dispatch<'_> {
+        match self {
+            CapturedDispatch::Direct(workgroups) => Dispatch::Direct(*workgroups),
+            CapturedDispatch::Indirect {
+                buffer,
+                offset,
+                max_workgroups,
+            } => Dispatch::Indirect {
+                buffer,
+                offset: *offset,
+                max_workgroups: *max_workgroups,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CapturedCpuLaunch {
     kernel: CompiledKernel,
-    workgroups: [u32; 3],
+    dispatch: CapturedDispatch,
     size: [u32; 3],
     args: Vec<GraphArg>,
 }
@@ -176,6 +204,27 @@ fn native(kernel: &CompiledKernel) -> Result<&CompiledCpuKernel, BackendError> {
 
 fn invalid(what: &str) -> BackendError {
     BackendError::Unsupported(what.into())
+}
+
+/// The workgroup counts of a dispatch, read from its buffer when indirect.
+fn workgroups_of(dispatch: Dispatch<'_>) -> Result<[u32; 3], BackendError> {
+    match dispatch {
+        Dispatch::Direct(workgroups) => Ok(workgroups),
+        Dispatch::Indirect { buffer, offset, .. } => {
+            let end = offset
+                .checked_add(12)
+                .filter(|&end| end <= buffer.size())
+                .ok_or_else(|| invalid("indirect dispatch arguments lie outside their buffer"))?;
+            let buf = raw(buffer)?;
+            // SAFETY: `end <= buffer.size() <= buf.len()`; execution is synchronous so nothing writes concurrently.
+            let bytes = unsafe { buf.as_slice(end as usize) };
+            let word = |i: usize| {
+                let at = offset as usize + 4 * i;
+                u32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+            };
+            Ok([word(0), word(1), word(2)])
+        }
+    }
 }
 
 impl CpuBackend {
@@ -378,25 +427,7 @@ impl Backend for CpuBackend {
         size: [u32; 3],
         args: &[RawArg<'_>],
     ) -> Result<u32, BackendError> {
-        let workgroups = match dispatch {
-            Dispatch::Direct(wg) => wg,
-            Dispatch::Indirect { buffer, offset, .. } => {
-                let end = offset
-                    .checked_add(12)
-                    .filter(|&end| end <= buffer.size())
-                    .ok_or_else(|| {
-                        invalid("indirect dispatch arguments lie outside their buffer")
-                    })?;
-                let buf = raw(buffer)?;
-                // SAFETY: `end <= buffer.size() <= buf.len()`; execution is synchronous so nothing writes concurrently.
-                let bytes = unsafe { buf.as_slice(end as usize) };
-                let word = |i: usize| {
-                    let at = offset as usize + 4 * i;
-                    u32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-                };
-                [word(0), word(1), word(2)]
-            }
-        };
+        let workgroups = workgroups_of(dispatch)?;
         let elapsed = self.run(kernel, workgroups, size, args)?;
         if workgroups.contains(&0) {
             if let Some(samples) = lock(&self.profiler).as_mut() {
@@ -489,7 +520,8 @@ impl Backend for CpuBackend {
                     GraphArg::Uniform(data) => RawArg::Uniform(data),
                 })
                 .collect();
-            let elapsed = self.run(&launch.kernel, launch.workgroups, launch.size, &args)?;
+            let workgroups = workgroups_of(launch.dispatch.dispatch())?;
+            let elapsed = self.run(&launch.kernel, workgroups, launch.size, &args)?;
             self.sample(&launch.kernel, elapsed);
         }
         if lock(&self.profiler).is_some() {
@@ -566,7 +598,18 @@ impl Backend for CpuBackend {
             .iter()
             .map(|l| CapturedCpuLaunch {
                 kernel: l.kernel.clone(),
-                workgroups: l.workgroups,
+                dispatch: match l.dispatch {
+                    Dispatch::Direct(workgroups) => CapturedDispatch::Direct(workgroups),
+                    Dispatch::Indirect {
+                        buffer,
+                        offset,
+                        max_workgroups,
+                    } => CapturedDispatch::Indirect {
+                        buffer: buffer.clone(),
+                        offset,
+                        max_workgroups,
+                    },
+                },
                 size: l.size,
                 args: l
                     .args
