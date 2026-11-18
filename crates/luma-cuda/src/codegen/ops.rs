@@ -242,6 +242,13 @@ pub(crate) fn binary(fb: &mut Fb, op: IrBinOp, l: ScalarTy, r: ScalarTy, a: &Op,
             };
             (l, fb.def(&format!("{n} {t} {a}, {b}")))
         }
+        // f32: `div.approx` (a reciprocal and a product, 2 ulp for divisors of magnitude in
+        // [2^-126, 2^126]): the precision WGSL specifies and what the Vulkan driver emits for
+        // `/`. `div.full` adds about five instructions of range scaling per division.
+        Div if l == F32 => {
+            fb.declare("declare float @llvm.nvvm.div.approx.f(float, float)");
+            (l, fb.def(&format!("call float @llvm.nvvm.div.approx.f(float {a}, float {b})")))
+        }
         Div if flt => (l, fb.def(&format!("fdiv {t} {a}, {b}"))),
         Div if int => {
             let d = guarded_divisor(fb, l, a, b);
