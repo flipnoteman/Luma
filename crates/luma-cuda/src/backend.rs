@@ -306,120 +306,6 @@ struct Sample {
     events: Option<(CudaEvent, CudaEvent)>,
 }
 
-/// Launches a profiling gate lets queue before it opens: well under the driver's queue of pending
-/// launches, which would block the host while the gate keeps the GPU waiting for it.
-const GATE_LAUNCHES: u32 = 256;
-
-/// Holds the stream while profiling, so that launches queue up and then run back to back: the
-/// events around a short kernel then time the kernel, not the host's next launch, as the
-/// timestamps of a recorded batch do on the other backends. The stream runs a kernel that waits
-/// for a word of pinned, device-mapped host memory to reach `next`; writing it opens the gate.
-struct Gate {
-    host: *mut u32,
-    device: sys::CUdeviceptr,
-    next: u32,
-    /// Launches queued behind the closed gate; `None` while it is open.
-    queued: Option<u32>,
-    func: CudaFunction,
-}
-
-// SAFETY: `host` is pinned memory owned by the gate and only touched under the backend's state lock.
-unsafe impl Send for Gate {}
-
-/// The kernel a gate holds the stream with: one thread spinning until the word reaches `want`
-/// (compared cyclically) or [`GATE_TIMEOUT_NS`] have passed. A kernel, not a stream wait: event
-/// records are ordered behind kernels, while a stream memory wait let the next event be
-/// timestamped before it completed. The timeout keeps anything that synchronizes the device
-/// implicitly (freeing memory, loading a module) from waiting on a gate only the host can open:
-/// the gate then gives up, and the launches behind it are timed as they come.
-const GATE_KERNEL: &str = r#"target triple = "nvptx64-nvidia-cuda"
-target datalayout = "e-p:64:64:64-p3:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64"
-define void @luma_main(i32* %word, i32 %want, i64 %timeout) nounwind {
-entry:
-  %t0 = call i64 asm sideeffect "mov.u64 $0, %globaltimer;", "=l"()
-  br label %spin
-spin:
-  %v = load volatile i32, i32* %word, align 4
-  %d = sub i32 %v, %want
-  %open = icmp sge i32 %d, 0
-  %t = call i64 asm sideeffect "mov.u64 $0, %globaltimer;", "=l"()
-  %el = sub i64 %t, %t0
-  %late = icmp uge i64 %el, %timeout
-  %stop = or i1 %open, %late
-  br i1 %stop, label %done, label %spin
-done:
-  ret void
-}
-!nvvm.annotations = !{!0}
-!0 = !{void (i32*, i32, i64)* @luma_main, !"kernel", i32 1}
-!nvvmir.version = !{!1}
-!1 = !{i32 2, i32 0}
-"#;
-
-/// The longest a profiling gate holds the stream.
-const GATE_TIMEOUT_NS: u64 = 5_000_000;
-
-impl Gate {
-    /// A gate, `None` if its word or kernel cannot be had (profiling then times launches as
-    /// they come).
-    fn new(shared: &CudaShared) -> Option<Gate> {
-        let (major, minor) = shared.cc;
-        let ptx = shared.nvvm.compile(GATE_KERNEL, major, minor).ok()?;
-        let func = shared.ctx.load_module(Ptx::from_src(ptx)).and_then(|m| m.load_function(ENTRY)).ok()?;
-        let mut host = std::ptr::null_mut();
-        let mut device = 0;
-        // SAFETY: allocates and maps 4 bytes; freed in `Drop`.
-        unsafe {
-            sys::cuMemHostAlloc(&mut host, 4, sys::CU_MEMHOSTALLOC_DEVICEMAP).result().ok()?;
-            host.cast::<u32>().write_volatile(0);
-            if sys::cuMemHostGetDevicePointer_v2(&mut device, host, 0).result().is_err() {
-                sys::cuMemFreeHost(host);
-                return None;
-            }
-        }
-        Some(Gate { host: host.cast(), device, next: 1, queued: None, func })
-    }
-
-    /// Closes the gate in front of the next launch if it is open.
-    fn hold(&mut self, stream: &CudaStream) -> Result<(), BackendError> {
-        if self.queued.is_none() {
-            let (mut word, mut want, mut timeout) = (self.device, self.next, GATE_TIMEOUT_NS);
-            let mut params: [*mut c_void; 3] = [(&mut word as *mut u64).cast(), (&mut want as *mut u32).cast(), (&mut timeout as *mut u64).cast()];
-            // SAFETY: the gate kernel takes a device pointer, a u32 and a u64; the driver copies them.
-            unsafe { result::launch_kernel(self.func.cu_function(), (1, 1, 1), (1, 1, 1), 0, stream.cu_stream(), &mut params[..]) }.map_err(gpu)?;
-            self.queued = Some(0);
-        }
-        Ok(())
-    }
-
-    /// Counts a launch queued behind the gate; opens it once enough are.
-    fn queued_one(&mut self) {
-        if let Some(n) = self.queued.as_mut() {
-            *n += 1;
-            if *n >= GATE_LAUNCHES {
-                self.open();
-            }
-        }
-    }
-
-    /// Lets the stream run on.
-    fn open(&mut self) {
-        if self.queued.take().is_some() {
-            // SAFETY: pinned memory owned by the gate.
-            unsafe { self.host.write_volatile(self.next) };
-            self.next = self.next.wrapping_add(1);
-        }
-    }
-}
-
-impl Drop for Gate {
-    fn drop(&mut self) {
-        self.open();
-        // SAFETY: allocated by `cuMemHostAlloc` in `new`; the owner synchronizes the stream first.
-        unsafe { sys::cuMemFreeHost(self.host.cast()) };
-    }
-}
-
 /// A chunk of device memory uniforms are copied into, and the pinned chunk they come from.
 struct UniformChunk<T> {
     block: T,
@@ -445,8 +331,6 @@ struct State {
     uniform_retired: Vec<CudaBuffer>,
     params: Params,
     profiler: Option<Vec<Sample>>,
-    /// While profiling, on devices with stream memory operations: see [`Gate`].
-    gate: Option<Gate>,
 }
 
 /// The device and what is known about it, shared by every backend of the process.
@@ -558,11 +442,7 @@ impl fmt::Debug for CudaBackend {
 
 impl Drop for CudaBackend {
     fn drop(&mut self) {
-        // Everything the state holds is released only after the stream has run dry, which it
-        // cannot behind a closed profiling gate.
-        if let Some(gate) = lock(&self.state).gate.as_mut() {
-            gate.open();
-        }
+        // Everything the state holds is released only after the stream has run dry.
         let _ = self.stream.synchronize();
     }
 }
@@ -587,7 +467,6 @@ impl CudaBackend {
             uniform_retired: Vec::new(),
             params: Params::default(),
             profiler: None,
-            gate: None,
         };
         Ok(CudaBackend { shared, stream, capture: Mutex::new(None), pending: AtomicU32::new(0), state: Mutex::new(state) })
     }
@@ -609,10 +488,6 @@ impl CudaBackend {
     /// Records an event after the work so far, taking the batch's resources with it. `None` when
     /// nothing was recorded since the last flush.
     fn flush_locked(&self, st: &mut State) -> Result<Option<Arc<CudaEvent>>, BackendError> {
-        // Whatever waits for the work flushes first, so the gate never outlives a flush.
-        if let Some(gate) = st.gate.as_mut() {
-            gate.open();
-        }
         st.dispatches = 0;
         self.pending.store(0, Ordering::Relaxed);
         if !st.dirty {
@@ -810,9 +685,6 @@ impl CudaBackend {
         let timing = if st.profiler.is_some() {
             let start = self.shared.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(gpu)?;
             let end = self.shared.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(gpu)?;
-            if let Some(gate) = st.gate.as_mut() {
-                gate.hold(&self.stream)?;
-            }
             start.record(&self.stream).map_err(gpu)?;
             st.dirty = true;
             Some((start, end))
@@ -839,9 +711,6 @@ impl CudaBackend {
         enqueued.map_err(gpu)?;
         if let Some((start, end)) = timing {
             end.record(&self.stream).map_err(gpu)?;
-            if let Some(gate) = st.gate.as_mut() {
-                gate.queued_one();
-            }
             if let Some(samples) = st.profiler.as_mut() {
                 samples.push(Sample { label: Arc::clone(&kernel.label), events: Some((start, end)) });
             }
@@ -1239,9 +1108,6 @@ impl Backend for CudaBackend {
         })();
         if let Err(error) = outcome {
             // The staging memory must not be freed under a copy still running.
-            if let Some(gate) = lock(&self.state).gate.as_mut() {
-                gate.open();
-            }
             let _ = self.stream.synchronize();
             return Err(error);
         }
@@ -1260,9 +1126,6 @@ impl Backend for CudaBackend {
         let mut st = lock(&self.state);
         if st.profiler.is_none() {
             st.profiler = Some(Vec::new());
-            if st.gate.is_none() {
-                st.gate = Gate::new(&self.shared);
-            }
         }
         Ok(())
     }
@@ -1274,8 +1137,6 @@ impl Backend for CudaBackend {
                 return Err(BackendError::Profiling("profiling is not enabled".into()));
             };
             self.sync_locked(&mut st)?;
-            // The stream ran dry with the gate open: its word can be freed.
-            st.gate = None;
             samples
         };
         let mut timings = Vec::with_capacity(samples.len());
