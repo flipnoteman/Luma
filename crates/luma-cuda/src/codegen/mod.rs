@@ -221,10 +221,6 @@ struct Em<'a> {
     decls: BTreeSet<String>,
     helpers: BTreeMap<String, String>,
     jumps: Vec<Jump>,
-    /// While an operand of a select is evaluated eagerly: its condition, and whether the operand
-    /// is the one chosen when it holds. Every index evaluated meanwhile is redirected to element 0
-    /// when the operand is not chosen, so that its loads cannot fault (see [`Em::index`]).
-    guards: Vec<(Op, bool)>,
 }
 
 // ----- small value helpers ---------------------------------------------------------------
@@ -249,23 +245,6 @@ fn one(v: &Val) -> (ScalarTy, Op) {
 
 fn pick(ops: &[Op], k: usize) -> &Op {
     if ops.len() == 1 { &ops[0] } else { &ops[k] }
-}
-
-/// Expression nodes of the two operands of a select up to which both are evaluated (with their
-/// loads made safe, see `Em::index`) instead of branching: a guarded load and its index, not a
-/// flux. Larger operands branch, as evaluating both measured slower on bowshock's solver steps.
-const SPECULATED_NODES: usize = 24;
-
-/// The size of `e` in expression nodes, `None` if it cannot be evaluated speculatively (it calls
-/// a function, whose loads the guards do not reach, or reads an atomic).
-fn speculation_cost(e: &Expr) -> Option<usize> {
-    let mut nodes = 0;
-    let mut ok = true;
-    e.walk(&mut |x| {
-        nodes += 1;
-        ok &= !matches!(x, Expr::Call { .. } | Expr::AtomicLoad { .. } | Expr::Subgroup { .. });
-    });
-    ok.then_some(nodes)
 }
 
 fn scalar_val(elem: ScalarTy, op: Op) -> Val {
@@ -494,19 +473,9 @@ impl<'a> Em<'a> {
         }
     }
 
-    /// An index (a scalar `i32`), redirected to 0 under every active speculation guard whose
-    /// operand is not chosen: a load an eager select does not use reads element 0, which every
-    /// buffer, shared array and local has.
+    /// An index, a scalar `i32`.
     fn index(&mut self, fb: &mut Fb, e: &Expr, cx: &FnCx) -> Op {
-        let mut idx = one(&self.expr(fb, e, cx)).1;
-        for (cond, chosen_when) in self.guards.clone() {
-            idx = if chosen_when {
-                fb.def(&format!("select i1 {cond}, i32 {idx}, i32 0"))
-            } else {
-                fb.def(&format!("select i1 {cond}, i32 0, i32 {idx}"))
-            };
-        }
-        idx
+        one(&self.expr(fb, e, cx)).1
     }
 
     /// Applies an access path to the place `ptr: ty`.
@@ -804,28 +773,6 @@ impl<'a> Em<'a> {
                     out.push(r);
                 }
                 Val::Lanes { elem: rt, ops: out }
-            }
-            Expr::Ternary { op: IrTernaryOp::Select, a, b, c, .. }
-                if self.expr_ty(a, cx).lanes() == 1
-                    && !matches!(self.expr_ty(b, cx), KirType::Array { .. } | KirType::Struct(_))
-                    && speculation_cost(b).zip(speculation_cost(c)).is_some_and(|(x, y)| x + y <= SPECULATED_NODES) =>
-            {
-                // Small operands (a guarded load, a few operations) are both evaluated, branch-free
-                // as WGSL's `select` is, so that equal loads and index arithmetic of neighbouring
-                // selects are shared: a load of the operand not chosen reads element 0 instead.
-                let cond = one(&self.expr(fb, a, cx)).1;
-                self.guards.push((cond.clone(), true));
-                let bv = self.expr(fb, b, cx);
-                self.guards.pop();
-                self.guards.push((cond.clone(), false));
-                let cv = self.expr(fb, c, cx);
-                self.guards.pop();
-                let (elem, bo) = lanes_of(&bv);
-                let (_, co) = lanes_of(&cv);
-                let t = llty(elem);
-                let n = bo.len().max(co.len());
-                let ops = (0..n).map(|k| fb.def(&format!("select i1 {cond}, {t} {}, {t} {}", pick(bo, k), pick(co, k)))).collect();
-                Val::Lanes { elem, ops }
             }
             Expr::Ternary { op: IrTernaryOp::Select, a, b, c, .. } if self.expr_ty(a, cx).lanes() == 1 => {
                 // A scalar condition only evaluates the chosen operand, as the C++ `?:` did: KIR
@@ -1659,7 +1606,6 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
         decls: BTreeSet::new(),
         helpers: BTreeMap::new(),
         jumps: Vec::new(),
-        guards: Vec::new(),
     }
     .run()
 }
