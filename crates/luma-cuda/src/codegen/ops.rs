@@ -138,7 +138,12 @@ pub(crate) fn unary(fb: &mut Fb, op: IrUnOp, s: ScalarTy, a: &Op) -> (ScalarTy, 
                 Atan => "atan",
                 _ => "rint",
             };
-            (s, math1(fb, base, s, a))
+            // f32 `exp`, `log`, `log2` and the trigonometric functions use the hardware
+            // approximations, within WGSL's precision rules, as the wgpu and Metal backends'
+            // compilers do; f64 and the other functions keep libdevice's full precision.
+            let fast = s == F32 && matches!(op, Exp | Ln | Log2 | Sin | Cos | Tan);
+            let name = if fast { format!("__nv_fast_{base}f") } else { lib(base, s) };
+            (s, call(fb, &name, t, &[(t, a)]))
         }
         (Sign, F32 | F64) => {
             let z = zero(s);
@@ -270,6 +275,7 @@ pub(crate) fn binary(fb: &mut Fb, op: IrBinOp, l: ScalarTy, r: ScalarTy, a: &Op,
             let c = fb.def(&format!("icmp {p} i32 {a}, {b}"));
             (l, sel(fb, &c, "i32", a, b))
         }
+        Pow if flt && l == F32 => (l, call(fb, "__nv_fast_powf", "float", &[("float", a), ("float", b)])),
         Pow if flt => (l, math2(fb, "pow", l, a, b)),
         Atan2 if flt => (l, math2(fb, "atan2", l, a, b)),
         Copysign if flt => (l, math2(fb, "copysign", l, a, b)),
