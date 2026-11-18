@@ -729,10 +729,13 @@ impl Context {
         let class = pool::size_class(bytes, max)
             .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
 
-        if let Some(buffer) = lock(&self.inner.pool).take(class, usage) {
-            return Ok(buffer);
-        }
-        self.new_buffer(class, usage, false)
+        let pooled = lock(&self.inner.pool).take(class, usage);
+        let buffer = match pooled {
+            Some(buffer) => buffer,
+            None => self.new_buffer(class, usage, false)?,
+        };
+        self.note_fresh(&buffer);
+        Ok(buffer)
     }
 
     /// Runs `attempt` (`None`: the device is out of memory) and, when the device is full, gives

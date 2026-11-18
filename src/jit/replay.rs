@@ -19,11 +19,15 @@ pub(crate) struct Plan {
     ctx: Context,
     seed: Vec<(Arc<Storage>, Arc<Storage>)>,
     cmds: Vec<Cmd>,
-    /// Keep the segments the commands use resident and alive.
+    /// Keep the segments the commands use resident and alive (not those of dead transient
+    /// arrays: see `Recording::share_transients`).
     #[allow(dead_code)]
     pins: Vec<Pin>,
     /// Buffers released while recording; given back to the pool when the plan is dropped.
     retired: Vec<Buffer>,
+    /// The buffers of `retired` that the plan made up for its intermediates and shares between
+    /// them (see `Recording::share_transients`); no state, probe or result is one.
+    transient: Vec<Buffer>,
 }
 
 impl Plan {
@@ -34,7 +38,19 @@ impl Plan {
             cmds: recording.cmds,
             pins: recording.pins,
             retired: recording.retired,
+            transient: recording.transient,
         }
+    }
+
+    /// The distinct buffers the plan keeps: those its commands name and those it holds.
+    #[cfg(test)]
+    pub(crate) fn held_buffers(&self) -> usize {
+        let named = self.cmds.iter().flat_map(|cmd| &cmd.args).filter_map(|arg| match arg {
+            CmdArg::Storage { buffer, .. } => Some(buffer.id()),
+            CmdArg::Uniform(_) => None,
+        });
+        let held = self.retired.iter().map(Buffer::id).chain(self.pins.iter().map(|pin| pin.buffer().id()));
+        named.chain(held).collect::<std::collections::HashSet<u64>>().len()
     }
 
     /// Number of recorded launches.
@@ -189,6 +205,13 @@ impl Stepper {
         if !distinct || probe_buffers.iter().any(|probe| plan.writes(probe)) {
             return Err(plan);
         }
+        // Intermediates share buffers only among themselves: a swap of `subst` (state, probes,
+        // initial state, ping and pong) never names one, so the sharing cannot be undone or
+        // crossed by a replay.
+        debug_assert!(
+            init_buffers.iter().chain(&probe_buffers).chain(&ping_buffers).all(|b| !plan.transient.contains(b)),
+            "a state buffer of a stepper is a transient buffer of its plan"
+        );
         let pong: Vec<Arc<Storage>> = outs
             .iter()
             .map(|out| Arc::new(Storage::new(ctx, out.len(), out.layout())))
@@ -196,6 +219,10 @@ impl Stepper {
         let Some(pong_buffers) = buffers(&pong, &mut pong_pins) else {
             return Err(plan);
         };
+        debug_assert!(
+            pong_buffers.iter().all(|b| !plan.transient.contains(b)),
+            "a state buffer of a stepper is a transient buffer of its plan"
+        );
         Ok(Stepper {
             plan,
             init: init_buffers,

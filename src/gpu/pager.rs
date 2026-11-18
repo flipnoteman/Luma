@@ -18,6 +18,7 @@ use luma_core::Buffer;
 use crate::array::Storage;
 use crate::context::{Context, STORAGE_USAGE};
 use crate::error::Result;
+use crate::gpu::hash::{FxMap, FxSet};
 use crate::gpu::pool;
 use crate::gpu::lock;
 
@@ -85,6 +86,44 @@ impl Drop for Pin {
     fn drop(&mut self) {
         self.segment.pins.fetch_sub(1, Ordering::Release);
     }
+}
+
+/// Ends the pins in `pins` of every segment that nothing but those pins holds and whose buffer
+/// is in `fresh` (by id), and returns those buffers: they no longer belong to any segment (the
+/// segments are dropped without giving them to the pool) and the caller owns them.
+///
+/// A segment is held by the storage that owns it, by windows of it through that storage, and by
+/// pins. When every strong reference is one of `pins`, no array reads or writes the segment any
+/// more, and nothing can reach it again (a `Weak` of the pager's list cannot pick a victim that
+/// is pinned). The pins are taken out last, so the segment stays pinned throughout.
+pub(crate) fn take_dead_buffers(pins: &mut Vec<Pin>, fresh: &FxSet<u64>) -> Vec<Buffer> {
+    let mut held: FxMap<*const Segment, usize> = FxMap::default();
+    for pin in pins.iter() {
+        *held.entry(Arc::as_ptr(&pin.segment)).or_insert(0) += 1;
+    }
+    let mut taken = Vec::new();
+    let mut dead: FxSet<*const Segment> = FxSet::default();
+    for pin in pins.iter() {
+        let segment = &pin.segment;
+        let key = Arc::as_ptr(segment);
+        if dead.contains(&key) || Arc::strong_count(segment) != held[&key] {
+            continue;
+        }
+        let mut state = lock(&segment.state);
+        let State::Device(buffer) = &*state else { continue };
+        if !fresh.contains(&buffer.id()) {
+            continue;
+        }
+        let State::Device(buffer) = std::mem::replace(&mut *state, State::Empty) else { continue };
+        let pager = segment.ctx.pager();
+        pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
+        lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), key));
+        drop(state);
+        dead.insert(key);
+        taken.push(buffer);
+    }
+    pins.retain(|pin| !dead.contains(&Arc::as_ptr(&pin.segment)));
+    taken
 }
 
 /// The segments that hold a device buffer, newest registrations last.
