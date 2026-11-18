@@ -768,19 +768,19 @@ fn gated(
     next: &impl Fields,
     recs: &[Array<f32>],
     max_steps: usize,
-) -> std::result::Result<Stepper, Option<Plan>> {
+) -> std::result::Result<Stepper, Option<Box<Plan>>> {
     let records = recs.len();
     let fits = recs.iter().all(|rec| rec.storage().is_ok_and(|storage| storage.segments() == 1))
         && 6 + records <= ctx.jit().max_inputs() + 1
         && (records.max(1) * max_steps * 4) as u64 <= ctx.max_buffer_bytes();
     if !fits {
-        return Err(Some(plan));
+        return Err(Some(Box::new(plan)));
     }
     let outs: std::result::Result<Vec<Arc<Storage>>, _> =
         next.arrays().into_iter().map(|array| array.storage().cloned()).collect();
     match outs {
         Ok(outs) => Stepper::new(ctx, plan, &trace.init, &trace.probe_storages, outs).map_err(Some),
-        Err(_) => Err(Some(plan)),
+        Err(_) => Err(Some(Box::new(plan))),
     }
 }
 

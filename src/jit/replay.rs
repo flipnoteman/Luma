@@ -239,9 +239,9 @@ impl Stepper {
         init: &[Arc<Storage>],
         probes: &[Arc<Storage>],
         outs: Vec<Arc<Storage>>,
-    ) -> std::result::Result<Stepper, Plan> {
+    ) -> std::result::Result<Stepper, Box<Plan>> {
         if plan.launches() == 0 || init.len() != probes.len() || init.len() != outs.len() {
-            return Err(plan);
+            return Err(Box::new(plan));
         }
         let shaped = init.iter().zip(probes).zip(&outs).all(|((init, probe), out)| {
             [init, probe, out].iter().all(|storage| storage.segments() == 1)
@@ -250,7 +250,7 @@ impl Stepper {
                 && init.layout() == out.layout()
         });
         if !shaped {
-            return Err(plan);
+            return Err(Box::new(plan));
         }
         let mut pins = Vec::with_capacity(2 * init.len());
         let mut pong_pins = Vec::with_capacity(init.len());
@@ -271,7 +271,7 @@ impl Stepper {
             buffers(probes, &mut pins),
             buffers(&outs, &mut pins),
         ) else {
-            return Err(plan);
+            return Err(Box::new(plan));
         };
         let distinct = ping_buffers.iter().enumerate().all(|(j, out)| {
             plan.writes(out)
@@ -279,7 +279,7 @@ impl Stepper {
                 && init_buffers.iter().chain(&probe_buffers).all(|other| other != out)
         });
         if !distinct || probe_buffers.iter().any(|probe| plan.writes(probe)) {
-            return Err(plan);
+            return Err(Box::new(plan));
         }
         // Intermediates share buffers only among themselves: a swap of `subst` (state, probes,
         // initial state, ping and pong) never names one, so the sharing cannot be undone or
@@ -293,7 +293,7 @@ impl Stepper {
             .map(|out| Arc::new(Storage::new(ctx, out.len(), out.layout())))
             .collect();
         let Some(pong_buffers) = buffers(&pong, &mut pong_pins) else {
-            return Err(plan);
+            return Err(Box::new(plan));
         };
         debug_assert!(
             pong_buffers.iter().all(|b| !plan.transient.contains(b)),
@@ -548,7 +548,7 @@ impl Trace {
         let stepper = if stepable {
             Stepper::new(&self.ctx, plan, &self.init, &self.probe_storages, outs)
         } else {
-            Err(plan)
+            Err(Box::new(plan))
         };
         match stepper {
             Ok(stepper) => Ok(Some(stepper)),
