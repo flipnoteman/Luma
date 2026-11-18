@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, DriverError, result, sys};
@@ -48,6 +48,10 @@ const UNIFORM_CHUNK: usize = 1 << 20;
 
 /// Alignment of a uniform slot in device memory.
 const UNIFORM_ALIGN: usize = 256;
+
+/// `LUMA_CUDA_DUMP`: a directory that receives the NVVM IR (`.ll`), the PTX (`.ptx`) and the label
+/// (`.label`) of every kernel the backend builds or loads from the cache, named like the cache entry.
+static DUMP_DIR: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| std::env::var_os("LUMA_CUDA_DUMP").filter(|v| !v.is_empty()).map(Into::into));
 
 /// Smallest device allocation.
 const MIN_BUFFER: u64 = 16;
@@ -676,11 +680,14 @@ impl CudaBackend {
         if let Some(buffer) = indirect_buffer {
             st.held.buffers.push(buffer.clone());
         }
+        // Both events exist before the launch, so that the end is recorded right after it: creating
+        // it in between would add host time to a short kernel's measurement.
         let timing = if st.profiler.is_some() {
             let start = self.shared.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(gpu)?;
+            let end = self.shared.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(gpu)?;
             start.record(&self.stream).map_err(gpu)?;
             st.dirty = true;
-            Some(start)
+            Some((start, end))
         } else {
             None
         };
@@ -702,8 +709,7 @@ impl CudaBackend {
             st.dispatches += 1;
         }
         enqueued.map_err(gpu)?;
-        if let Some(start) = timing {
-            let end = self.shared.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(gpu)?;
+        if let Some((start, end)) = timing {
             end.record(&self.stream).map_err(gpu)?;
             if let Some(samples) = st.profiler.as_mut() {
                 samples.push(Sample { label: Arc::clone(&kernel.label), events: Some((start, end)) });
@@ -720,9 +726,19 @@ impl CudaBackend {
         let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let stem = format!("ptx-{hash:016x}");
         let load = |text: String| self.shared.ctx.load_module(Ptx::from_src(text)).and_then(|m| m.load_function(ENTRY));
+        let dump = |ptx: &str| {
+            if let Some(dir) = DUMP_DIR.as_deref() {
+                // Best effort: a debugging aid must not fail a compile.
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(dir.join(format!("{stem}.ll")), source);
+                let _ = std::fs::write(dir.join(format!("{stem}.ptx")), ptx);
+                let _ = std::fs::write(dir.join(format!("{stem}.label")), label);
+            }
+        };
         if let Some(text) = self.shared.disk.load_blob(&stem, PTX_MAGIC).and_then(|bytes| String::from_utf8(bytes).ok())
             && !text.contains('\0')
         {
+            dump(&text);
             match load(text) {
                 Ok(func) => return Ok(func),
                 // A stale cache entry: rebuild it.
@@ -730,6 +746,7 @@ impl CudaBackend {
             }
         }
         let text = self.shared.nvvm.compile(source, major, minor).map_err(|e| BackendError::ShaderCompile(format!("kernel `{label}`:\n{e}")))?;
+        dump(&text);
         let func = load(text.clone()).map_err(gpu)?;
         self.shared.disk.store_blob(&stem, PTX_MAGIC, text.as_bytes());
         Ok(func)

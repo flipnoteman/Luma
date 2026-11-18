@@ -162,6 +162,11 @@ impl<K: Hash + Eq> GraphCache<K> {
     pub(crate) fn clear(&self) {
         lock(&self.graphs).clear();
     }
+
+    /// Whether some graph was captured (not only asked for).
+    pub(crate) fn holds_graphs(&self) -> bool {
+        lock(&self.graphs).values().any(Option::is_some)
+    }
 }
 
 /// The graphs a [`Stepper`] replays by itself.

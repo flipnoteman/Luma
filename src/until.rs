@@ -1085,11 +1085,10 @@ impl GateLoop {
         let ctx = self.ctx.clone();
         let (steps, reason, histories) = self.drive(steps, check_every)?;
 
-        let detached = if fresh { self.stepper.detach_even(&ctx, steps) } else { None };
-        if detached.is_some() {
-            // The graphs name the buffers of the even steps, which are the caller's now.
-            self.graphs.clear();
-        }
+        // Detaching the even state gives its buffers away, which a captured graph names: the
+        // graphs would have to be captured again on the next run, which costs far more (a block is
+        // thousands of launches) than the copy the odd case makes anyway.
+        let detached = if fresh && !self.graphs.holds_graphs() { self.stepper.detach_even(&ctx, steps) } else { None };
         let arrays: Vec<Array<S::Elem>> = match detached {
             Some(storages) => storages
                 .into_iter()
