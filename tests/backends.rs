@@ -1336,3 +1336,551 @@ fn dynamic_out_of_bounds_loads_stores_and_atomics_stay_inside_the_buffers() {
         }
     }
 }
+
+// -- Line solvers on parts --
+
+/// Solves the block-tridiagonal system of one line in f64 by dense Gaussian elimination with
+/// partial pivoting: `lo[s] x[s-1] + diag[s] x[s] + up[s] x[s+1] = rhs[s]` for `n` blocks of `b` x
+/// `b`. Entry `(r, c)` of block `s` is at `[s][r * b + c]`; the result is `x[s][r]`.
+fn dense_block_solve(b: usize, lo: &[Vec<f64>], diag: &[Vec<f64>], up: &[Vec<f64>], rhs: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let n = diag.len();
+    let m = n * b;
+    let mut a = vec![vec![0.0f64; m + 1]; m];
+    for s in 0..n {
+        for r in 0..b {
+            for c in 0..b {
+                a[s * b + r][s * b + c] = diag[s][r * b + c];
+                if s > 0 {
+                    a[s * b + r][(s - 1) * b + c] = lo[s][r * b + c];
+                }
+                if s + 1 < n {
+                    a[s * b + r][(s + 1) * b + c] = up[s][r * b + c];
+                }
+            }
+            a[s * b + r][m] = rhs[s][r];
+        }
+    }
+    for col in 0..m {
+        let pivot = (col..m).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs())).unwrap();
+        a.swap(col, pivot);
+        for row in col + 1..m {
+            let f = a[row][col] / a[col][col];
+            if f != 0.0 {
+                for k in col..=m {
+                    a[row][k] -= f * a[col][k];
+                }
+            }
+        }
+    }
+    let mut x = vec![0.0f64; m];
+    for row in (0..m).rev() {
+        let tail: f64 = (row + 1..m).map(|k| a[row][k] * x[k]).sum();
+        x[row] = (a[row][m] - tail) / a[row][row];
+    }
+    x.chunks(b).map(<[f64]>::to_vec).collect()
+}
+
+/// Flat index of cell `s` of line `line` along `axis` of a `[d0, d1]` grid (axis 0 varies fastest).
+fn cell(dims: [usize; 2], axis: usize, line: usize, s: usize) -> usize {
+    if axis == 0 { s + dims[0] * line } else { line + dims[0] * s }
+}
+
+/// Which arrays hold a part: plain `f32` ones, or `Df32` pairs whose sum, rounded to `f32` inside
+/// the solver kernel, is the part (a lazy expression, as the solvers compute them in place).
+#[derive(Clone, Copy, Debug)]
+enum PartKind {
+    F32,
+    Df32,
+}
+
+/// The values of `count` parts over a grid: `value(part, cell)`, deterministic. Parts `0..count`
+/// hold two `f32` vectors (`x`, `y`) of which the part is `x` (F32) or `x + y` (Df32) with `y` of
+/// the size of the low word of a double-float.
+struct PartData {
+    x: Vec<Vec<f32>>,
+    y: Vec<Vec<f32>>,
+}
+
+impl PartData {
+    fn new(count: usize, cells: usize, seed: u64, kind: PartKind, range: impl Fn(usize) -> (f32, f32)) -> PartData {
+        let x: Vec<Vec<f32>> = (0..count)
+            .map(|p| {
+                let (lo, hi) = range(p);
+                values(cells, seed + p as u64, lo, hi)
+            })
+            .collect();
+        let y = match kind {
+            // The second summand is zero for the plain parts; it is never bound.
+            PartKind::F32 => Vec::new(),
+            PartKind::Df32 => (0..count).map(|p| values(cells, seed + 1000 + p as u64, -1e-8, 1e-8)).collect(),
+        };
+        PartData { x, y }
+    }
+
+    /// The value the solver sees, as an `f64` (the `f32` rounding of an `x + y` part is left to
+    /// the tolerance of the comparison).
+    fn host(&self, p: usize, c: usize) -> f64 {
+        f64::from(self.x[p][c]) + self.y.get(p).map_or(0.0, |y| f64::from(y[c]))
+    }
+
+    /// The part as an array of `ctx`: evaluated for F32, lazy `(x + y).to_f32()` for Df32.
+    fn array(&self, ctx: &Context, p: usize, dims: [usize; 2]) -> Array<f32> {
+        let make = |data: &[f32]| Array::from_slice_on(ctx, data, dims).unwrap();
+        match self.y.get(p) {
+            None => make(&self.x[p]),
+            Some(y) => {
+                let df = |v: &[f32]| Array::from_slice_on(ctx, &v.iter().map(|&v| Df32::from(v)).collect::<Vec<_>>(), dims).unwrap();
+                // `y` enters as the low word: 1e-8 is below the f32 resolution of x (~1e-7).
+                (df(&self.x[p]) + df(y)).to_f32()
+            }
+        }
+    }
+}
+
+/// `solve_block_tridiagonal_parts` with 5 x 5 blocks agrees with a dense f64 solve on every
+/// backend, along a strided axis (stride 32) and a contiguous one, from `f32` parts and from lazy
+/// parts of `Df32` arithmetic.
+///
+/// Tolerance: the blocks are strictly diagonally dominant (diagonal entries 4 +- 0.2, every other
+/// entry within +-0.2, so a row's off-diagonal mass is at most 2.2 of the 3.8 on the diagonal)
+/// and the solution has the size of the right-hand side (|x| below about 1), so the condition
+/// number is a small constant and an `f32` elimination of 24 blocks stays within a few `1e-6`
+/// absolute; the check allows `1e-4` relative or `2e-5` absolute. The Df32 parts round to `f32`
+/// inside the kernel, which moves an entry by half an ulp (6e-8 relative): far inside that.
+#[test]
+fn solve_block_tridiagonal_parts_with_5x5_blocks_matches_a_dense_solve_on_every_backend() {
+    const B: usize = 5;
+    let n = 24;
+    for (axis, dims) in [(0usize, [n, 9usize]), (1, [32, n])] {
+        let other = dims[1 - axis];
+        let cells = dims[0] * dims[1];
+        for kind in [PartKind::F32, PartKind::Df32] {
+            let off = |_: usize| (-0.2, 0.2);
+            let dg = |p: usize| if p.is_multiple_of(B + 1) { (3.8, 4.2) } else { (-0.2, 0.2) };
+            let lo = PartData::new(25, cells, 100, kind, off);
+            let di = PartData::new(25, cells, 200, kind, dg);
+            let up = PartData::new(25, cells, 300, kind, off);
+            let rhs = PartData::new(B, cells, 400, kind, |_| (-1.0, 1.0));
+            // Host solution of every line, `want[component][cell]`.
+            let mut want = vec![vec![0.0f32; cells]; B];
+            for line in 0..other {
+                let gather = |d: &PartData, parts: usize| -> Vec<Vec<f64>> {
+                    (0..n).map(|s| (0..parts).map(|p| d.host(p, cell(dims, axis, line, s))).collect()).collect()
+                };
+                let x = dense_block_solve(B, &gather(&lo, 25), &gather(&di, 25), &gather(&up, 25), &gather(&rhs, B));
+                for s in 0..n {
+                    for (r, comp) in want.iter_mut().enumerate() {
+                        comp[cell(dims, axis, line, s)] = x[s][r] as f32;
+                    }
+                }
+            }
+            let mut results = Vec::new();
+            for (backend, ctx) in backends() {
+                let who = format!("{} axis {axis} {kind:?}", label(backend));
+                let make = |d: &PartData, count: usize| -> Vec<Array<f32>> { (0..count).map(|p| d.array(&ctx, p, dims)).collect() };
+                let (l, d, u, r) = (make(&lo, 25), make(&di, 25), make(&up, 25), make(&rhs, B));
+                let solved = solve_block_tridiagonal_parts::<25, B>(
+                    axis,
+                    std::array::from_fn(|k| &l[k]),
+                    std::array::from_fn(|k| &d[k]),
+                    std::array::from_fn(|k| &u[k]),
+                    std::array::from_fn(|k| &r[k]),
+                );
+                let got: Vec<Vec<f32>> = solved.iter().map(|a| a.to_vec().unwrap()).collect();
+                for c in 0..B {
+                    must(&who, &format!("component {c}"), first_far(&got[c], &want[c], 1e-4, 2e-5));
+                }
+                results.push((backend, got));
+            }
+            agree(&format!("block solve axis {axis} {kind:?}"), &results, |a, b| {
+                for c in 0..B {
+                    first_far(&b[c], &a[c], 2e-4, 4e-5).map_err(|e| format!("component {c}: {e}"))?;
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+/// `solve_tridiagonal_parts` (three systems in one launch) agrees with a host Thomas solve in f64
+/// on every backend, along a strided and a contiguous axis; one system's diagonal is a lazy
+/// expression.
+///
+/// Tolerance: diagonal 3.8..4.2 against |lo| + |up| <= 0.8 (dominance ratio about 5) keeps the
+/// error of an `f32` sweep around `1e-7`; the check allows `1e-4` relative or `2e-5` absolute.
+#[test]
+fn solve_tridiagonal_parts_matches_a_host_solve_on_every_backend() {
+    const SYSTEMS: usize = 3;
+    let n = 40;
+    for (axis, dims) in [(0usize, [n, 11usize]), (1, [24, n])] {
+        let other = dims[1 - axis];
+        let cells = dims[0] * dims[1];
+        // data[system][lo, diag, up, rhs][cell]; the lazy diagonal of system 2 is `a + b`.
+        let data: Vec<Vec<Vec<f32>>> = (0..SYSTEMS)
+            .map(|k| {
+                [(-0.4, 0.4), (1.9, 2.1), (-0.4, 0.4), (-1.0, 1.0)]
+                    .iter()
+                    .enumerate()
+                    .map(|(p, &(lo, hi))| values(cells, 500 + (k * 4 + p) as u64, lo, hi))
+                    .collect()
+            })
+            .collect();
+        let diag_b = values(cells, 777, 1.9, 2.1);
+        let diag_of = |k: usize, c: usize| f64::from(data[k][1][c]) + if k == 2 { f64::from(diag_b[c]) } else { 0.0 };
+        let mut want = vec![vec![0.0f32; cells]; SYSTEMS];
+        for (k, out) in want.iter_mut().enumerate() {
+            for line in 0..other {
+                let mut cp = vec![0.0f64; n];
+                let mut dp = vec![0.0f64; n];
+                for s in 0..n {
+                    let c = cell(dims, axis, line, s);
+                    let (l, d, r) = (f64::from(data[k][0][c]), diag_of(k, c), f64::from(data[k][3][c]));
+                    let u = f64::from(data[k][2][c]);
+                    if s == 0 {
+                        cp[0] = u / d;
+                        dp[0] = r / d;
+                    } else {
+                        let m = d - l * cp[s - 1];
+                        cp[s] = u / m;
+                        dp[s] = (r - l * dp[s - 1]) / m;
+                    }
+                }
+                let mut x = 0.0f64;
+                for s in (0..n).rev() {
+                    x = if s == n - 1 { dp[s] } else { dp[s] - cp[s] * x };
+                    out[cell(dims, axis, line, s)] = x as f32;
+                }
+            }
+        }
+        let mut results = Vec::new();
+        for (backend, ctx) in backends() {
+            let who = format!("{} axis {axis}", label(backend));
+            let arr = |v: &[f32]| Array::from_slice_on(&ctx, v, dims).unwrap();
+            let arrays: Vec<Vec<Array<f32>>> = data.iter().map(|sys| sys.iter().map(|v| arr(v)).collect()).collect();
+            let lazy_diag = &arrays[2][1] + arr(&diag_b);
+            let part = |k: usize, p: usize| if k == 2 && p == 1 { &lazy_diag } else { &arrays[k][p] };
+            let solved = solve_tridiagonal_parts(axis, std::array::from_fn::<_, SYSTEMS, _>(|k| (part(k, 0), part(k, 1), part(k, 2), part(k, 3))));
+            let got: Vec<Vec<f32>> = solved.iter().map(|a| a.to_vec().unwrap()).collect();
+            for k in 0..SYSTEMS {
+                must(&who, &format!("system {k}"), first_far(&got[k], &want[k], 1e-4, 2e-5));
+            }
+            results.push((backend, got));
+        }
+        agree(&format!("tridiagonal parts axis {axis}"), &results, |a, b| {
+            for k in 0..SYSTEMS {
+                first_far(&b[k], &a[k], 2e-4, 4e-5).map_err(|e| format!("system {k}: {e}"))?;
+            }
+            Ok(())
+        });
+    }
+}
+
+// -- compile_until_all --
+
+type Pair = (Array<f32>, Array<f32>);
+
+/// One step of the pair loop on the host, in f64: `u <- 0.9 u + 0.05 (u[-1] + u[+1])` (wrapping)
+/// and `v <- 0.98 v + 0.01 u`.
+fn host_pair_step(u: &[f64], v: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let n = u.len();
+    let nu: Vec<f64> = (0..n).map(|i| 0.9 * u[i] + 0.05 * (u[(i + n - 1) % n] + u[(i + 1) % n])).collect();
+    let nv: Vec<f64> = (0..n).map(|i| 0.98 * v[i] + 0.01 * u[i]).collect();
+    (nu, nv)
+}
+
+/// `compile_until_all` with two recorded values, a stop that fires mid-block (step 21: the first
+/// default block is 16 steps, `check_every(7)` blocks end at 21 and 28) and a stop that never
+/// fires, agrees on steps, reason, histories and final state on every backend, and a second run
+/// from other data and a `run_steps` cut also agree.
+///
+/// Tolerance: the loop is a contraction (0.9 + 2 * 0.05 = 1 on the sum, the maximum falls), so
+/// `f32` rounding does not grow: after 21 steps the error is a few ulps; the check allows
+/// `1e-4` relative with `1e-6` absolute. The threshold sits between the host's step-21 and
+/// step-20 maxima (the history is monotone), by a margin of 1 % of the step, far above that error.
+#[test]
+fn compile_until_all_records_stops_mid_block_and_checks_every_n_steps_alike_on_every_backend() {
+    let n = 64;
+    let u0 = values(n, 900, 0.5, 1.5);
+    let v0 = values(n, 901, 0.0, 2.0);
+    let host = |u0: &[f32], steps: usize| -> Vec<(Vec<f64>, Vec<f64>)> {
+        let mut state = (u0.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(), v0.iter().map(|&x| f64::from(x)).collect::<Vec<_>>());
+        (0..steps)
+            .map(|_| {
+                state = host_pair_step(&state.0, &state.1);
+                state.clone()
+            })
+            .collect()
+    };
+    let max = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max);
+    let total = |v: &[f64]| v.iter().sum::<f64>();
+    let states = host(&u0, 60);
+    let maxes: Vec<f64> = states.iter().map(|s| max(&s.0)).collect();
+    // The stop fires after step 21 (index 20) and not before.
+    let threshold = ((maxes[19] + maxes[20]) / 2.0) as f32;
+    assert!(maxes[19] - maxes[20] > 1e-3, "the threshold needs a gap between consecutive maxima");
+    let want_steps = 21usize;
+    let want_max: Vec<f64> = maxes[..want_steps].to_vec();
+    let want_tot: Vec<f64> = states[..want_steps].iter().map(|s| total(&s.1)).collect();
+
+    let mut results = Vec::new();
+    for (kind, ctx) in backends() {
+        let who = label(kind);
+        let until = |every: Option<usize>| {
+            let u = Until::new(60)
+                .record("max", |s: &Pair| s.0.max())
+                .record("tot", |s: &Pair| s.1.sum())
+                .stop_when(move |h| h["max"].last().le(threshold))
+                .stop_when(|h| h["tot"].last().ge(1e9));
+            match every {
+                Some(k) => u.check_every(k),
+                None => u,
+            }
+        };
+        let step = |s: &Pair, _: &Array<f32>| -> Pair {
+            let nu = &s.0 * 0.9 + (s.0.shift(1) + s.0.shift(-1)) * 0.05;
+            let nv = &s.1 * 0.98 + &s.0 * 0.01;
+            (nu, nv)
+        };
+        let init = || -> Pair { (on(&ctx, &u0), on(&ctx, &v0)) };
+        let mut per_schedule = Vec::new();
+        for every in [None, Some(7), Some(1), Some(64)] {
+            let mut compiled = compile_until_all(&init(), until(every), step).unwrap();
+            let run = compiled.run(init()).unwrap();
+            let what = format!("{who} check_every {every:?}");
+            assert_eq!((run.steps, run.reason), (want_steps, StopReason::Predicate(0)), "{what}");
+            let (hmax, htot) = (run.history("max").unwrap(), run.history("tot").unwrap());
+            let f = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<f32>>();
+            must(&what, "history max", first_far(hmax, &f(&want_max), 1e-4, 1e-6));
+            must(&what, "history tot", first_far(htot, &f(&want_tot), 1e-4, 1e-6));
+            let (wu, wv) = &states[want_steps - 1];
+            must(&what, "state u", first_far(&run.state.0.to_vec().unwrap(), &f(wu), 1e-4, 1e-6));
+            must(&what, "state v", first_far(&run.state.1.to_vec().unwrap(), &f(wv), 1e-4, 1e-6));
+            per_schedule.push((run.steps, run.reason, hmax.to_vec(), htot.to_vec(), run.state.0.to_vec().unwrap()));
+            // A cut run: 10 steps (a block boundary of none of the schedules but 1) is MaxSteps.
+            let cut = compiled.run_steps(init(), 10).unwrap();
+            assert_eq!((cut.steps, cut.reason), (10, StopReason::MaxSteps), "{what}: run_steps");
+            must(&what, "cut history", first_far(cut.history("max").unwrap(), &f(&maxes[..10]), 1e-4, 1e-6));
+            must(&what, "cut state", first_far(&cut.state.0.to_vec().unwrap(), &f(&states[9].0), 1e-4, 1e-6));
+        }
+        // The schedule never changes the result (the same backend, so the same arithmetic).
+        for r in &per_schedule[1..] {
+            assert_eq!(per_schedule[0].0, r.0, "{who}: steps depend on check_every");
+            assert_eq!(per_schedule[0].1, r.1, "{who}: reason depends on check_every");
+            must(who, "history across schedules", first_diff(&per_schedule[0].2, &r.2));
+            must(who, "state across schedules", first_diff(&per_schedule[0].4, &r.4));
+        }
+        results.push((kind, per_schedule.swap_remove(0)));
+    }
+    agree("compile_until_all", &results, |a, b| {
+        if (a.0, a.1) != (b.0, b.1) {
+            return Err(format!("{:?} vs {:?}", (a.0, a.1), (b.0, b.1)));
+        }
+        first_far(&b.2, &a.2, 1e-4, 1e-6).map_err(|e| format!("max history: {e}"))?;
+        first_far(&b.3, &a.3, 1e-4, 1e-6).map_err(|e| format!("tot history: {e}"))?;
+        first_far(&b.4, &a.4, 1e-4, 1e-6).map_err(|e| format!("state: {e}"))
+    });
+}
+
+/// `compile_until_all` over a `Df32` state records `to_f32()` of its maximum and stops at the same
+/// step on every backend. The state halves every step, exactly, so the stop step is exact; the
+/// low words (1e-9 of the first element) must survive into the final state.
+#[test]
+fn compile_until_all_over_a_df32_state_stops_alike_on_every_backend() {
+    let n = 32;
+    let init: Vec<Df32> = (0..n).map(|i| Df32::from(1.0 + f64::from(i as u32) * 1e-9)).collect();
+    let mut results = Vec::new();
+    for (kind, ctx) in backends() {
+        let who = label(kind);
+        let until = Until::new(100).record("max", |s: &(Array<Df32>,)| s.0.max().to_f32()).stop_when(|h| h["max"].last().le(1e-3)).check_every(4);
+        let mut compiled = compile_until_all(&(on(&ctx, &init),), until, |s, _| (&s.0 * Df32::from(0.5f32),)).unwrap();
+        let run = compiled.run((on(&ctx, &init),)).unwrap();
+        // 2^-10 * (1 + 31e-9) <= 1e-3 first at step 10.
+        assert_eq!((run.steps, run.reason), (10, StopReason::Predicate(0)), "{who}");
+        let state = run.state.0.to_vec().unwrap();
+        for (i, d) in state.iter().enumerate() {
+            let want = (1.0 + i as f64 * 1e-9) / 1024.0;
+            // Halving is exact in a double-float; the input 1 + i e-9 is held to about 2^-48.
+            if (d.to_f64() - want).abs() > 1e-14 * want {
+                panic!("{who}: element {i}: {:?} vs {want:e}", d);
+            }
+        }
+        results.push((kind, (run.steps, run.reason, run.history("max").unwrap().to_vec())));
+    }
+    agree("df32 compile_until_all", &results, |a, b| if a == b { Ok(()) } else { Err(format!("{a:?} vs {b:?}")) });
+}
+
+// -- take and select as gather/scatter --
+
+/// 100 cells, 40 of them written: `positions[k]` (distinct, `k < 40`) is where value `k` goes.
+fn scatter_plan() -> (Vec<u32>, Vec<u32>) {
+    let positions: Vec<u32> = (0..40u32).map(|k| (k * 37 + 5) % 100).collect();
+    // The inverse: for every cell, which `k` writes it, or 40 (an index past the 40 values).
+    let mut inverse = vec![40u32; 100];
+    for (k, &p) in positions.iter().enumerate() {
+        inverse[p as usize] = k as u32;
+    }
+    (positions, inverse)
+}
+
+/// `take` and `select` as the gather form of a scatter (`out = select(hit, vals.take(inverse),
+/// 0)` where `zeros` + `put(positions, vals)` would be), eager, inside an `iterate_all` step and
+/// inside a `compile_until_all` step, give the host's scatter on every backend. The indices of the
+/// traced forms are computed in the step from `index(0)` (a lazy `u32` expression); a bijective
+/// permutation gathers the state.
+///
+/// Tolerance: the step does one multiply-add per element (`0.5 x + 1`, `0.9 x`) for 6 steps;
+/// FMA contraction changes the result by an ulp or two per step, so `1e-5` relative.
+#[test]
+fn take_and_select_scatter_and_gather_alike_on_every_backend_eagerly_and_in_traced_steps() {
+    let (positions, inverse) = scatter_plan();
+    let n = 100usize;
+    let vals = values(40, 1100, -2.0, 2.0);
+    let state0 = values(n, 1101, -1.0, 1.0);
+    // Host scatter: zeros, then put.
+    let mut scattered = vec![0.0f32; n];
+    for (k, &p) in positions.iter().enumerate() {
+        scattered[p as usize] = vals[k];
+    }
+    // The step: cells the plan writes take `0.5 * x[perm] + 1`, the others `0.9 x`; the permutation
+    // `perm(i) = (i * 37 + 5) % 100` is the computed form of the indices, `i * 37 + 5` being
+    // coprime-stride (37 and 100 share no factor) and so bijective.
+    let perm = |i: usize| (i * 37 + 5) % 100;
+    let hit = |i: usize| inverse[i] < 40;
+    let host_step = |x: &[f32]| -> Vec<f32> { (0..n).map(|i| if hit(i) { 0.5 * x[perm(i)] + 1.0 } else { 0.9 * x[i] }).collect() };
+    let mut host_states = vec![state0.clone()];
+    for _ in 0..6 {
+        host_states.push(host_step(host_states.last().unwrap()));
+    }
+    let mut results = Vec::new();
+    for (kind, ctx) in backends() {
+        let who = label(kind);
+        // Eager: the scatter as a gather, with indices from a host array.
+        let (inv, v) = (on(&ctx, &inverse), on(&ctx, &vals));
+        let hit_a = inv.lt(40u32);
+        let eager = select(&hit_a, v.take(&inv), 0.0).to_vec().unwrap();
+        must(who, "gather form of put", first_diff(&eager, &scattered));
+        // The same with the inverse computed on the device: cell i is written by k where
+        // positions[k] == i, i.e. k = (i - 5) * 37^-1 mod 100; 37 * 73 = 2701 = 1 mod 100.
+        let cells = Array::<u32>::range_on(&ctx, n, 0).unwrap();
+        let k = ((&cells + 95u32) % 100u32 * 73u32) % 100u32;
+        let lazy = select(&k.lt(40u32), v.take(&k), 0.0).to_vec().unwrap();
+        must(who, "lazy-index gather form of put", first_diff(&lazy, &scattered));
+        // Scatter by `put` itself, for the comparison on this backend.
+        let mut put = Array::<f32>::zeros_on(&ctx, n).unwrap();
+        put.put(&on(&ctx, &positions), &v).unwrap();
+        must(who, "put", first_diff(&put.to_vec().unwrap(), &scattered));
+
+        let step = |x: &Array<f32>| -> Array<f32> {
+            let ids = Array::<u32>::range_on(&ctx, n, 0).unwrap();
+            let src = (&ids * 37u32 + 5u32) % 100u32;
+            let hit = ((&ids + 95u32) % 100u32 * 73u32 % 100u32).lt(40u32);
+            select(&hit, &(x.take(&src) * 0.5 + 1.0), &(x * 0.9))
+        };
+        let x0 = on(&ctx, &state0);
+        let [iterated] = iterate_all([&x0], 6, |[x]| [step(x)]);
+        must(who, "iterate_all", first_far(&iterated.to_vec().unwrap(), &host_states[6], 1e-5, 1e-6));
+        let until = Until::new(6).record("max", |s: &(Array<f32>,)| s.0.max());
+        let mut compiled = compile_until_all(&(on(&ctx, &state0),), until, |s, _| (step(&s.0),)).unwrap();
+        let run = compiled.run((on(&ctx, &state0),)).unwrap();
+        assert_eq!((run.steps, run.reason), (6, StopReason::MaxSteps), "{who}");
+        must(who, "compile_until_all state", first_far(&run.state.0.to_vec().unwrap(), &host_states[6], 1e-5, 1e-6));
+        let want_max: Vec<f32> = host_states[1..].iter().map(|s| s.iter().copied().fold(f32::MIN, f32::max)).collect();
+        must(who, "compile_until_all history", first_far(run.history("max").unwrap(), &want_max, 1e-5, 1e-6));
+        results.push((kind, (eager, iterated.to_vec().unwrap(), run.state.0.to_vec().unwrap())));
+    }
+    agree("gather/scatter", &results, |a, b| {
+        first_diff(&a.0, &b.0)?;
+        first_far(&b.1, &a.1, 1e-5, 1e-6).map_err(|e| format!("iterate_all: {e}"))?;
+        first_far(&b.2, &a.2, 1e-5, 1e-6).map_err(|e| format!("compile_until_all: {e}"))
+    });
+}
+
+// -- One-pass reductions of Df32 --
+
+/// `reduce_axis` is an `f32` operation (a `Df32` array poisons it with `Unsupported`, as the guide
+/// says), so a `Df32` sum along an axis is made of the one-pass sums of its two words: the high
+/// word `x.to_f32()` and the low word `(x - x.to_f32().to_df32()).to_f32()`, both lazy operands
+/// computed inside the reduction's first pass. With sum, minimum, maximum and sum of squares in
+/// one pass, along every axis of a 3-D array and along the long axis of a 2-D one (several
+/// workgroups per line), every backend agrees with f64 sums of the words, and refuses the `Df32`
+/// array itself the same way.
+///
+/// Tolerance: an `f32` tree or sequential sum of up to 3000 terms errs by well under `n * 2^-24`
+/// of the sum of the absolute terms (1.8e-4 for 3000, far less for tree sums); the check uses
+/// `2e-5` of that scale for sums and sums of squares, which a wrong line, axis or word misses by
+/// orders of magnitude, and exact equality for the extrema. The low words (1e-9 and below) are
+/// reduced at their own scale.
+#[test]
+fn reduce_axis_of_the_words_of_df32_in_one_pass_matches_f64_sums_on_every_backend() {
+    for (dims, axes) in [([300usize, 17, 5], vec![0usize, 1, 2]), ([3000, 3, 1], vec![0, 1])] {
+        let len = dims[0] * dims[1] * dims[2];
+        let xs = df_values(len, 1200, -3.0, 3.0);
+        for axis in axes {
+            let stride: usize = dims[..axis].iter().product();
+            let extent = dims[axis];
+            let mut out_dims = dims;
+            out_dims[axis] = 1;
+            let out_len = out_dims.iter().product::<usize>();
+            // Host: reductions of both words of every line; `want[word][op][o]`, `scale[word][k][o]`.
+            let word = |w: usize, c: usize| f64::from(if w == 0 { xs[c].hi } else { xs[c].lo });
+            let mut want = vec![vec![vec![0.0f64; out_len]; 4]; 2];
+            let mut scale = vec![vec![vec![0.0f64; out_len]; 2]; 2];
+            for w in 0..2 {
+                for o in 0..out_len {
+                    let (low, high) = (o % stride, o / stride);
+                    let base = low + high * stride * extent;
+                    let terms: Vec<f64> = (0..extent).map(|s| word(w, base + s * stride)).collect();
+                    want[w][0][o] = terms.iter().sum();
+                    want[w][1][o] = terms.iter().copied().fold(f64::MAX, f64::min);
+                    want[w][2][o] = terms.iter().copied().fold(f64::MIN, f64::max);
+                    want[w][3][o] = terms.iter().map(|t| t * t).sum();
+                    scale[w][0][o] = terms.iter().map(|t| t.abs()).sum();
+                    scale[w][1][o] = terms.iter().map(|t| t * t).sum();
+                }
+            }
+            let mut results = Vec::new();
+            for (kind, ctx) in backends() {
+                let who = format!("{} dims {dims:?} axis {axis}", label(kind));
+                let x = Array::from_slice_on(&ctx, &xs, dims).unwrap();
+                let refused = x.reduce_axis(axis, [Reduction::Sum]);
+                assert!(matches!(refused[0].to_vec(), Err(LumaError::Op { .. })), "{who}: a Df32 reduce_axis must fail");
+                let hi = x.to_f32();
+                let lo = (&x - x.to_f32().to_df32()).to_f32();
+                let mut got = Vec::new();
+                for (w, array) in [hi, lo].iter().enumerate() {
+                    let ops = [Reduction::Sum, Reduction::Min, Reduction::Max, Reduction::SumOfSquares];
+                    let reduced: Vec<Vec<f32>> = array.reduce_axis(axis, ops).iter().map(|a| a.to_vec().unwrap()).collect();
+                    for (r, name) in ["sum", "min", "max", "sum of squares"].iter().enumerate() {
+                        assert_eq!(reduced[r].len(), out_len, "{who}: {name} length");
+                        for o in 0..out_len {
+                            let tol = match r {
+                                0 => 2e-5 * scale[w][0][o],
+                                3 => 2e-5 * scale[w][1][o],
+                                _ => 0.0,
+                            };
+                            let d = (f64::from(reduced[r][o]) - want[w][r][o]).abs();
+                            assert!(d <= tol, "{who}: word {w} {name} at {o}: got {}, want {:e} (tolerance {tol:e})", reduced[r][o], want[w][r][o]);
+                        }
+                    }
+                    got.push(reduced);
+                }
+                results.push((kind, got));
+            }
+            agree(&format!("df32 words reduce_axis dims {dims:?} axis {axis}"), &results, |a, b| {
+                for w in 0..2 {
+                    for r in 0..4 {
+                        for o in 0..out_len {
+                            let s = if r == 3 { scale[w][1][o] } else { scale[w][0][o] };
+                            let tol = if r == 1 || r == 2 { 0.0 } else { 4e-5 * s };
+                            let (u, v) = (f64::from(a[w][r][o]), f64::from(b[w][r][o]));
+                            if (u - v).abs() > tol {
+                                return Err(format!("word {w} result {r} at {o}: {u:e} vs {v:e}"));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+}
