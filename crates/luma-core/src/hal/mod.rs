@@ -28,6 +28,8 @@ pub enum BackendKind {
     Metal,
     /// WebGPU through wgpu.
     Wgpu,
+    /// Native CPU (Cranelift SIMD).
+    Cpu,
 }
 
 impl fmt::Display for BackendKind {
@@ -37,6 +39,7 @@ impl fmt::Display for BackendKind {
             BackendKind::Cuda => "cuda",
             BackendKind::Metal => "metal",
             BackendKind::Wgpu => "wgpu",
+            BackendKind::Cpu => "cpu",
         })
     }
 }

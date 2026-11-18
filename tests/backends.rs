@@ -19,18 +19,19 @@ use luma::*;
 // -- Opening backends --
 
 /// Wgpu first: it is the baseline the native backends are compared with.
-const ALL: [BackendKind; 3] = [BackendKind::Wgpu, BackendKind::Metal, BackendKind::Cuda];
+const ALL: [BackendKind; 4] = [BackendKind::Wgpu, BackendKind::Metal, BackendKind::Cuda, BackendKind::Cpu];
 
 fn label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Wgpu => "wgpu",
         BackendKind::Metal => "metal",
         BackendKind::Cuda => "cuda",
+        BackendKind::Cpu => "cpu",
         _ => "auto",
     }
 }
 
-static ANNOUNCED: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+static ANNOUNCED: [AtomicBool; 4] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
 
 /// A context of `kind`, or `None` (announced, once per process) if the host has no such device.
 fn open(kind: BackendKind) -> Option<Context> {
@@ -126,7 +127,12 @@ fn a_gpu_backend_is_available() {
 #[test]
 fn constructors_open_their_backend_or_report_it_unavailable() {
     type Open = fn() -> Result<Context>;
-    for (kind, make) in [(BackendKind::Wgpu, Context::wgpu as Open), (BackendKind::Metal, Context::metal as Open), (BackendKind::Cuda, Context::cuda as Open)] {
+    for (kind, make) in [
+        (BackendKind::Wgpu, Context::wgpu as Open),
+        (BackendKind::Metal, Context::metal as Open),
+        (BackendKind::Cuda, Context::cuda as Open),
+        (BackendKind::Cpu, Context::cpu as Open),
+    ] {
         let from_options = Context::with_options(ContextOptions::from_env().backend(kind).calibrate(false));
         match make() {
             Ok(ctx) => {
@@ -142,14 +148,34 @@ fn constructors_open_their_backend_or_report_it_unavailable() {
 }
 
 #[test]
-fn a_cpu_device_exists_only_through_wgpu() {
+fn a_cpu_device_opens_on_cpu_or_wgpu_and_refuses_gpu_only_backends() {
     for kind in [BackendKind::Metal, BackendKind::Cuda] {
         let options = ContextOptions::default().backend(kind).device(DeviceKind::Cpu).calibrate(false);
         match Context::with_options(options) {
             Err(LumaError::NoDevice(message)) => {
-                assert!(message.contains("wgpu") || message.contains("built without"), "{}: {message}", label(kind));
+                assert!(message.contains("wgpu") || message.contains("cpu") || message.contains("built without"), "{}: {message}", label(kind));
             }
             other => panic!("{} on a CPU device must be refused with NoDevice, got {other:?}", label(kind)),
+        }
+    }
+    match Context::with_options(ContextOptions::default().backend(BackendKind::Cpu).device(DeviceKind::Gpu).calibrate(false)) {
+        Err(LumaError::NoDevice(_)) => {}
+        other => panic!("the cpu backend on a GPU device must be refused with NoDevice, got {other:?}"),
+    }
+    for ctx in [
+        Context::with_options(ContextOptions::default().backend(BackendKind::Cpu).device(DeviceKind::Cpu).calibrate(false)),
+        Context::cpu(),
+    ] {
+        match ctx {
+            Ok(ctx) => {
+                assert!(ctx.is_cpu());
+                assert_eq!(ctx.backend(), BackendKind::Cpu);
+                let sum = on(&ctx, &[1.0f32, 2.0, 3.0, 4.0]).sum().item().unwrap();
+                assert_eq!(sum, 10.0);
+                println!("[backends] native CPU device: available");
+            }
+            Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) => println!("[backends] native CPU device: SKIPPED, not built"),
+            Err(error) => panic!("opening the native CPU device failed: {error}"),
         }
     }
     match Context::with_options(ContextOptions::default().backend(BackendKind::Wgpu).device(DeviceKind::Cpu).calibrate(false)) {
@@ -167,7 +193,7 @@ fn a_cpu_device_exists_only_through_wgpu() {
 
 #[test]
 fn auto_takes_the_first_available_of_cuda_metal_wgpu() {
-    let expected = [BackendKind::Cuda, BackendKind::Metal, BackendKind::Wgpu].into_iter().find(|&kind| open(kind).is_some());
+    let expected = [BackendKind::Cuda, BackendKind::Metal, BackendKind::Wgpu, BackendKind::Cpu].into_iter().find(|&kind| open(kind).is_some());
     let result = Context::with_options(ContextOptions::default().backend(BackendKind::Auto).calibrate(false));
     match (result, expected) {
         (Ok(ctx), Some(kind)) => assert_eq!(ctx.backend(), kind, "auto must prefer cuda, then metal, then wgpu"),
@@ -196,19 +222,21 @@ fn environment_child_probe() {
 #[test]
 fn the_environment_selects_the_backend() {
     let named = |kind: BackendKind| if open(kind).is_some() { label(kind) } else { "unavailable" };
-    let auto = [BackendKind::Cuda, BackendKind::Metal, BackendKind::Wgpu].into_iter().find(|&kind| open(kind).is_some()).map_or("unavailable", label);
+    let auto = [BackendKind::Cuda, BackendKind::Metal, BackendKind::Wgpu, BackendKind::Cpu].into_iter().find(|&kind| open(kind).is_some()).map_or("unavailable", label);
     let wgpu_cpu = Context::with_options(ContextOptions::default().backend(BackendKind::Wgpu).device(DeviceKind::Cpu).calibrate(false)).is_ok();
     let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
         (vec![("LUMA_BACKEND", "wgpu")], named(BackendKind::Wgpu)),
         (vec![("LUMA_BACKEND", "metal")], named(BackendKind::Metal)),
         (vec![("LUMA_BACKEND", "cuda")], named(BackendKind::Cuda)),
+        (vec![("LUMA_BACKEND", "cpu")], named(BackendKind::Cpu)),
+        (vec![("LUMA_DEVICE", "cpu")], named(BackendKind::Cpu)),
         (vec![("LUMA_BACKEND", "auto")], auto),
         // LUMA_DEVICE names a backend when LUMA_BACKEND is not set ...
         (vec![("LUMA_DEVICE", "wgpu")], named(BackendKind::Wgpu)),
         (vec![("LUMA_DEVICE", "metal")], named(BackendKind::Metal)),
         // ... and LUMA_BACKEND wins when both are.
         (vec![("LUMA_BACKEND", "metal"), ("LUMA_DEVICE", "wgpu")], named(BackendKind::Metal)),
-        // A CPU device only exists through wgpu.
+        // A CPU device exists through the cpu backend or wgpu, never metal or cuda.
         (vec![("LUMA_BACKEND", "metal"), ("LUMA_DEVICE", "cpu")], "unavailable"),
         (vec![("LUMA_BACKEND", "wgpu"), ("LUMA_DEVICE", "cpu")], if wgpu_cpu { "wgpu-cpu" } else { "unavailable" }),
     ];

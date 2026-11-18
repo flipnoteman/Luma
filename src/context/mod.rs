@@ -252,7 +252,7 @@ impl ContextOptions {
         self
     }
 
-    /// Options from the environment: `LUMA_BACKEND` = `cuda` | `metal` | `wgpu` | `auto`;
+    /// Options from the environment: `LUMA_BACKEND` = `cuda` | `metal` | `wgpu` | `cpu` | `auto`;
     /// `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`), which also takes a backend name
     /// (`cuda` | `metal` | `wgpu`) when `LUMA_BACKEND` is not set;
     /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
@@ -265,6 +265,7 @@ impl ContextOptions {
             "cuda" => Some(BackendKind::Cuda),
             "metal" => Some(BackendKind::Metal),
             "wgpu" => Some(BackendKind::Wgpu),
+            "cpu" => Some(BackendKind::Cpu),
             _ => None,
         };
         let device_var = var("LUMA_DEVICE");
@@ -276,7 +277,11 @@ impl ContextOptions {
         let backend = match var("LUMA_BACKEND").as_deref() {
             Some("auto") => BackendKind::Auto,
             Some(name) => backend_named(name).unwrap_or_default(),
-            None => device_var.as_deref().and_then(backend_named).unwrap_or_default(),
+            None => match device_var.as_deref() {
+                Some("cpu") => BackendKind::Auto,
+                Some(name) => backend_named(name).unwrap_or_default(),
+                None => BackendKind::Auto,
+            },
         };
         let bytes = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         ContextOptions {
@@ -311,6 +316,7 @@ fn not_built(feature: &str) -> LumaError {
     LumaError::NoDevice(match feature {
         "cuda" => "luma was built without the `cuda` feature",
         "metal" => "luma was built without the `metal` feature",
+        "cpu" => "luma was built without the `cpu` feature",
         _ => "luma was built without the `wgpu` feature",
     })
 }
@@ -358,23 +364,47 @@ fn open_wgpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
     Err(not_built("wgpu"))
 }
 
-/// Opens the backend `backend` names. `Auto` tries CUDA, then Metal, then wgpu and takes the first
-/// that opens (a CPU device only exists through wgpu).
+#[cfg(feature = "cpu")]
+fn open_cpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
+    if device == DeviceKind::Gpu {
+        return Err(LumaError::NoDevice("the cpu backend only provides a software (CPU) device"));
+    }
+    Ok(luma_cpu::open()?)
+}
+
+#[cfg(not(feature = "cpu"))]
+fn open_cpu(_: DeviceKind) -> Result<Box<dyn Backend>> {
+    Err(not_built("cpu"))
+}
+
+/// Opens the backend `backend` names. `Auto` tries CUDA, then Metal, then wgpu for GPU devices
+/// and falls back to the native CPU backend (or wgpu software adapter) when needed.
 fn open_backend(backend: BackendKind, device: DeviceKind) -> Result<Box<dyn Backend>> {
     match backend {
         BackendKind::Cuda => open_cuda(device),
         BackendKind::Metal => open_metal(device),
         BackendKind::Wgpu => open_wgpu(device),
+        BackendKind::Cpu => open_cpu(device),
         BackendKind::Auto => {
             if device == DeviceKind::Cpu {
-                return open_wgpu(device);
+                if let Ok(backend) = open_cpu(DeviceKind::Cpu) {
+                    return Ok(backend);
+                }
+                return open_wgpu(DeviceKind::Cpu);
             }
             type Open = fn(DeviceKind) -> Result<Box<dyn Backend>>;
-            for (name, open) in [("cuda", open_cuda as Open), ("metal", open_metal as Open)] {
-                match open(device) {
+            for (name, open) in [("cuda", open_cuda as Open), ("metal", open_metal as Open), ("wgpu", open_wgpu as Open)] {
+                let req = if name == "wgpu" && device == DeviceKind::Auto { DeviceKind::Gpu } else { device };
+                match open(req) {
                     Ok(backend) => return Ok(backend),
                     Err(error) => log::debug!("luma: the {name} backend is not available: {error}"),
                 }
+            }
+            if device == DeviceKind::Auto {
+                if let Ok(backend) = open_cpu(DeviceKind::Cpu) {
+                    return Ok(backend);
+                }
+                return open_wgpu(DeviceKind::Auto);
             }
             open_wgpu(device)
         }
@@ -403,18 +433,19 @@ fn device_fma(backend: &dyn Backend) -> bool {
 }
 
 impl Context {
-    /// Opens the device chosen by `LUMA_BACKEND` (`cuda` | `metal` | `wgpu` | `auto`) and
+    /// Opens the device chosen by `LUMA_BACKEND` (`cuda` | `metal` | `wgpu` | `cpu` | `auto`) and
     /// `LUMA_DEVICE` (`gpu` | `cpu`; by default the first available of CUDA, Metal and the
-    /// high-performance wgpu GPU, or the CPU through a software driver such as Mesa llvmpipe when
-    /// no GPU exists). Blocks until the device is ready.
+    /// high-performance wgpu GPU, or the native CPU backend when no GPU exists). Blocks until the
+    /// device is ready.
     pub fn new() -> Result<Context> {
         Context::with_options(ContextOptions::from_env())
     }
 
-    /// Opens a software (CPU) device, for example Mesa llvmpipe, whatever GPUs exist. Only the
-    /// wgpu backend has one.
+    /// Opens a software (CPU) device (the native SIMD `cpu` backend, or a wgpu software adapter
+    /// such as Mesa llvmpipe), whatever GPUs exist.
     pub fn cpu() -> Result<Context> {
-        Context::with_options(ContextOptions { backend: BackendKind::Wgpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() })
+        let env = ContextOptions::from_env();
+        Context::with_options(ContextOptions { device: DeviceKind::Cpu, ..env })
     }
 
     /// Opens a device of the CUDA backend (NVIDIA GPUs).

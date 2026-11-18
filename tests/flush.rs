@@ -26,6 +26,9 @@ fn flush_returns_while_the_gpu_is_still_running() {
     }
 
     let ctx = Context::new().unwrap();
+    if ctx.backend() == BackendKind::Cpu {
+        return;
+    }
     let spin = ctx.kernel(SPIN).build().unwrap();
     let n = 1u32 << 16;
     let mut a = Array::<f32>::zeros_on(&ctx, n as usize).unwrap();

@@ -1,5 +1,5 @@
-//! The software (CPU) device: Mesa llvmpipe through Vulkan. Tests return early when no software
-//! driver is installed.
+//! The software (CPU) device: the native SIMD `luma-cpu` backend, or Mesa llvmpipe through
+//! wgpu when `luma-cpu` is not built. Tests return early when no software device exists.
 
 use luma::{Array, Context, LumaError, TuningProfile};
 

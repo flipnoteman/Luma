@@ -1,0 +1,18 @@
+[package]
+name = "luma-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+luma-core.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-native.workspace = true
+target-lexicon.workspace = true
+log.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -182,7 +182,14 @@ impl Tuning {
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
     /// that measured faster on llvmpipe.
-    const CPU: Tuning = Tuning { profile: TuningProfile::Cpu, elementwise_workgroup: 64, max_live: 256, max_inlined: 192, ..Tuning::GENERIC };
+    const CPU: Tuning = Tuning {
+        profile: TuningProfile::Cpu,
+        elementwise_workgroup: 64,
+        max_live: 256,
+        max_inlined: 1024,
+        line_cyclic_work: 0,
+        ..Tuning::GENERIC
+    };
 
     /// The parameters for the device `info` describes, unless the environment forces a profile.
     pub(crate) fn for_device(info: &DeviceInfo) -> Tuning {

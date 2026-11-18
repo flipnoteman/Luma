@@ -25,6 +25,8 @@ const FORMAT: u32 = 1;
 pub const PIPELINES_MAGIC: [u8; 8] = *b"LUMAPIPE";
 /// Magic of compiled PTX blobs.
 pub const PTX_MAGIC: [u8; 8] = *b"LUMAPTX1";
+/// Magic of compiled CPU machine-code blobs.
+pub const CPU_MAGIC: [u8; 8] = *b"LUMACPU1";
 /// Magic of the calibration file (2: measured with the faster `Df32` library, so older files
 /// are not read).
 const COST: [u8; 8] = *b"LUMACOS2";
