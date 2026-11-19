@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "wgpu (Vulkan, Metal, DX12) backend of the Luma GPU array library"
+documentation = "https://docs.rs/luma-wgpu"
+keywords = ["gpu", "cuda", "metal", "array", "compute"]
+categories = ["science", "mathematics", "concurrency"]
 
 [dependencies]
 luma-core.workspace = true
