@@ -61,6 +61,12 @@ impl Plan {
         named.chain(held).collect::<std::collections::HashSet<u64>>().len()
     }
 
+    /// Bytes of the buffers the plan made up for its intermediates.
+    #[cfg(test)]
+    pub(crate) fn transient_bytes(&self) -> u64 {
+        self.transient.iter().map(Buffer::size).sum()
+    }
+
     /// Number of recorded launches.
     pub(crate) fn launches(&self) -> usize {
         self.cmds.len()
@@ -94,6 +100,24 @@ impl Plan {
             self.ctx.copy_storage(from, to)?;
         }
         self.replay(&[], None)
+    }
+
+    /// Makes the commands bind `to[j]` wherever they bind `from[j]`, and lets go of what kept
+    /// `from` alive here: their pins and the seeds (used only by [`Plan::run_once`], which a plan
+    /// that is replayed with swaps never needs). For a stepper's probes, which every replay swaps
+    /// for the real state: placeholders take their names and their memory can go.
+    fn forget_probes(&mut self, from: &[Buffer], to: &[Buffer]) {
+        for cmd in &mut self.cmds {
+            for arg in &mut cmd.args {
+                if let CmdArg::Storage { buffer, .. } = arg
+                    && let Some(j) = from.iter().position(|probe| probe == buffer)
+                {
+                    *buffer = to[j].clone();
+                }
+            }
+        }
+        self.pins.retain(|pin| !from.contains(pin.buffer()));
+        self.seed.clear();
     }
 }
 
@@ -300,6 +324,18 @@ impl Stepper {
             pong_buffers.iter().all(|b| !plan.transient.contains(b)),
             "a state buffer of a stepper is a transient buffer of its plan"
         );
+        // The probes only name the state in the commands: small placeholders take their names,
+        // and the probes' memory goes when the arrays holding them do.
+        let placeholders: Option<Vec<Buffer>> = probe_buffers.iter().map(|probe| ctx.alloc_buffer(16, probe.usage()).ok()).collect();
+        let mut plan = plan;
+        let probe_buffers = match placeholders {
+            Some(placeholders) => {
+                plan.forget_probes(&probe_buffers, &placeholders);
+                pins.retain(|pin| !probe_buffers.contains(pin.buffer()));
+                placeholders
+            }
+            None => probe_buffers,
+        };
         Ok(Stepper {
             plan,
             init: init_buffers,

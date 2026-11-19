@@ -4460,6 +4460,24 @@ fn recording_a_chain_of_intermediates_creates_few_buffers() {
     }
 }
 
+/// A stepper keeps the state it ping-pongs between and its plan's intermediates resident, not
+/// the probes the step was traced on: once the probe arrays are dropped, their memory is gone.
+#[test]
+fn a_stepper_does_not_keep_its_probes() {
+    let ctx = ctx();
+    let x = f32s(&ctx, &values(1000, 36, 0.0, 1.0));
+    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let before = ctx.pager().resident_bytes();
+    let (stepper, _) = trace_staged(&x, 8, false);
+    let held = ctx.pager().resident_bytes() - before;
+    assert_eq!(held, 2 * class + stepper.plan().transient_bytes(), "ping, pong and the shared intermediates only");
+    for steps in [1, 2, 5] {
+        stepper.run_steps(steps).unwrap();
+        let got = Array::<f32>::from_storage(&ctx, x.shape(), std::sync::Arc::clone(&stepper.state_after(steps)[0])).to_vec().unwrap();
+        assert_close(&got, &staged_reference(&x, 8, false, steps), 1e-5, 1e-6);
+    }
+}
+
 /// Intermediates of a traced step that are not live together share buffers: eight stages hold a
 /// handful of buffers, not one each, and the replayed steps give what untraced code gives.
 #[test]
