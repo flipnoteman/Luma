@@ -1,6 +1,8 @@
 //! The CUDA runtime: a device pool, buffers, NVVM compilation (the driver's own NVVM library) with
 //! a PTX disk cache, one ordered
-//! stream per backend and CUDA graph capture and replay.
+//! stream per backend and CUDA graph capture and replay. Device memory comes from a dedicated
+//! stream-ordered memory pool (`cuMemAllocFromPoolAsync` / `cuMemFreeAsync`) so that freeing a
+//! buffer never synchronizes the device; devices without pools use `cuMemAlloc` / `cuMemFree`.
 //!
 //! Work goes onto the stream as soon as it is recorded; a "batch" is only the set of resources the
 //! work since the last [`Backend::flush_batch`] uses. Flushing records an event after it, and
@@ -85,11 +87,71 @@ fn is_out_of_memory(error: &DriverError) -> bool {
     error.0 == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY
 }
 
+/// A dedicated stream-ordered memory pool (the device's default pool is left alone: other
+/// libraries of the process may use it). Its release threshold is unlimited, so memory freed
+/// by buffers stays reserved for reuse instead of going back to the driver at every
+/// synchronization.
+#[derive(Debug)]
+struct DevicePool {
+    pool: sys::CUmemoryPool,
+    ctx: Arc<CudaContext>,
+}
+
+// SAFETY: a pool handle is an opaque driver handle usable from any thread.
+unsafe impl Send for DevicePool {}
+unsafe impl Sync for DevicePool {}
+
+impl DevicePool {
+    /// Creates the pool on `ctx`'s device; `None` when the driver refuses, in which case the
+    /// backend allocates with `cuMemAlloc`.
+    fn create(ctx: &Arc<CudaContext>) -> Option<Arc<DevicePool>> {
+        // SAFETY: an all-zero properties struct is valid (null pointers, zero enums, reserved
+        // bytes); the fields that matter are set below.
+        let mut props: sys::CUmemPoolProps = unsafe { std::mem::zeroed() };
+        props.allocType = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        props.handleTypes = sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_NONE;
+        props.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        props.location.id = ctx.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        // SAFETY: `props` is fully initialized and `pool` receives the handle.
+        unsafe { sys::cuMemPoolCreate(&mut pool, &props) }.result().ok()?;
+        let pool = DevicePool { pool, ctx: Arc::clone(ctx) };
+        let mut threshold = u64::MAX;
+        // SAFETY: the release threshold attribute takes one `cuuint64_t`.
+        unsafe { sys::cuMemPoolSetAttribute(pool.pool, sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, (&raw mut threshold).cast()) }.result().ok()?;
+        Some(Arc::new(pool))
+    }
+}
+
+impl Drop for DevicePool {
+    fn drop(&mut self) {
+        if bind_raw(&self.ctx).is_ok() {
+            // SAFETY: waits for queued frees, then destroys the pool once; the handle is not
+            // used afterwards.
+            unsafe {
+                let _ = sys::cuCtxSynchronize();
+                let _ = sys::cuMemPoolDestroy(self.pool);
+            }
+        }
+    }
+}
+
+/// What a pool-allocated block needs to be freed in stream order.
+#[derive(Debug)]
+struct Ordered {
+    stream: Arc<CudaStream>,
+    /// Keeps the pool alive until the block is freed.
+    _pool: Arc<DevicePool>,
+}
+
 /// A device allocation, freed when dropped.
 #[derive(Debug)]
 struct CudaBuffer {
     dptr: sys::CUdeviceptr,
     ctx: Arc<CudaContext>,
+    /// The stream the block was allocated on (and is freed on) when it comes from the pool;
+    /// `None` for a `cuMemAlloc` block.
+    ordered: Option<Ordered>,
 }
 
 impl NativeBuffer for CudaBuffer {}
@@ -97,9 +159,15 @@ impl NativeBuffer for CudaBuffer {}
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
         if bind_raw(&self.ctx).is_ok() {
-            // SAFETY: allocated by `cuMemAlloc` and freed once; the driver orders the free after
-            // work still using it, and unfinished work is anyway kept alive by its batch.
-            let _ = unsafe { result::free_sync(self.dptr) };
+            // Luma drops a buffer only once no recorded work needs it, so ordering the free
+            // after the stream's pending work is enough and the host never waits for it.
+            let _ = match &self.ordered {
+                // SAFETY: allocated from the pool on this stream and freed once.
+                Some(ordered) => unsafe { sys::cuMemFreeAsync(self.dptr, ordered.stream.cu_stream()) }.result(),
+                // SAFETY: allocated by `cuMemAlloc` and freed once; the driver orders the free
+                // after work still using it, and unfinished work is anyway kept alive by its batch.
+                None => unsafe { result::free_sync(self.dptr) },
+            };
         }
     }
 }
@@ -124,6 +192,21 @@ impl Drop for Pinned {
             let _ = unsafe { result::free_host(self.ptr.cast()) };
         }
     }
+}
+
+/// Returns a pinned block to the idle pool. When it would push the pool over [`PINNED_IDLE_CAP`],
+/// idle blocks larger than it are freed (largest first) to make room, and if it still does not
+/// fit it is dropped: small blocks stay pooled, and big ones can still serve small requests.
+fn keep_pinned(st: &mut State, pinned: Pinned) {
+    while st.pinned_idle + pinned.cap > PINNED_IDLE_CAP {
+        let Some(at) = st.pinned_free.iter().enumerate().filter(|(_, p)| p.cap > pinned.cap).max_by_key(|(_, p)| p.cap).map(|(at, _)| at) else {
+            return;
+        };
+        let larger = st.pinned_free.swap_remove(at);
+        st.pinned_idle -= larger.cap;
+    }
+    st.pinned_idle += pinned.cap;
+    st.pinned_free.push(pinned);
 }
 
 /// A compiled kernel.
@@ -341,6 +424,8 @@ struct CudaShared {
     cost: Arc<OnceLock<CostModel>>,
     cc: (i32, i32),
     nvvm: crate::nvvm::Nvvm,
+    /// A dedicated stream-ordered memory pool, when the device supports them.
+    pool: Option<Arc<DevicePool>>,
 }
 
 static POOL: Mutex<Option<Arc<CudaShared>>> = Mutex::new(None);
@@ -420,7 +505,8 @@ impl CudaShared {
                 max_workgroup_storage_bytes: shared_bytes as u32,
             },
         };
-        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm })
+        let pool = if attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)? != 0 { DevicePool::create(&ctx) } else { None };
+        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm, pool })
     }
 }
 
@@ -475,11 +561,30 @@ impl CudaBackend {
         self.shared.ctx.bind_to_thread().map_err(gpu)
     }
 
+    /// A device block of at least `bytes` bytes. With a pool it is allocated in the stream's
+    /// order (no implicit device synchronization on either allocation or free), so it must only
+    /// be touched by work recorded on that stream.
     fn alloc_block(&self, bytes: u64) -> Result<CudaBuffer, BackendError> {
+        let Some(pool) = self.shared.pool.as_ref() else { return self.alloc_block_sync(bytes) };
+        self.bind()?;
+        let mut dptr = 0;
+        // SAFETY: the pool and stream are live and belong to the current context; the block
+        // frees itself on the same stream.
+        let allocated = unsafe { sys::cuMemAllocFromPoolAsync(&mut dptr, bytes.max(MIN_BUFFER) as usize, pool.pool, self.stream.cu_stream()) }.result();
+        match allocated {
+            Ok(()) => Ok(CudaBuffer { dptr, ctx: Arc::clone(&self.shared.ctx), ordered: Some(Ordered { stream: Arc::clone(&self.stream), _pool: Arc::clone(pool) }) }),
+            Err(e) if is_out_of_memory(&e) => Err(BackendError::OutOfMemory { requested: bytes }),
+            Err(e) => Err(gpu(e)),
+        }
+    }
+
+    /// A device block from `cuMemAlloc`: usable outside the stream's order (host-synchronous
+    /// copies, graph capture) and freed synchronously.
+    fn alloc_block_sync(&self, bytes: u64) -> Result<CudaBuffer, BackendError> {
         self.bind()?;
         // SAFETY: plain allocation; the block frees itself.
         match unsafe { result::malloc_sync(bytes.max(MIN_BUFFER) as usize) } {
-            Ok(dptr) => Ok(CudaBuffer { dptr, ctx: Arc::clone(&self.shared.ctx) }),
+            Ok(dptr) => Ok(CudaBuffer { dptr, ctx: Arc::clone(&self.shared.ctx), ordered: None }),
             Err(e) if is_out_of_memory(&e) => Err(BackendError::OutOfMemory { requested: bytes }),
             Err(e) => Err(gpu(e)),
         }
@@ -529,10 +634,7 @@ impl CudaBackend {
     fn release(st: &mut State, held: Held) {
         for pinned in held.pinned {
             st.pinned_busy -= pinned.cap;
-            if st.pinned_idle + pinned.cap <= PINNED_IDLE_CAP {
-                st.pinned_idle += pinned.cap;
-                st.pinned_free.push(pinned);
-            }
+            keep_pinned(st, pinned);
         }
     }
 
@@ -565,10 +667,13 @@ impl CudaBackend {
     /// Pinned memory of at least `bytes` bytes, from the idle pool when there is some.
     fn take_pinned(&self, st: &mut State, bytes: usize) -> Result<Pinned, BackendError> {
         let class = bytes.max(PINNED_MIN).next_power_of_two();
+        // The smallest idle block that is large enough: a pool full of big blocks serves small
+        // requests without allocating.
         let find = |st: &mut State| {
-            let at = st.pinned_free.iter().position(|p| p.cap == class)?;
-            st.pinned_idle -= class;
-            Some(st.pinned_free.swap_remove(at))
+            let at = st.pinned_free.iter().enumerate().filter(|(_, p)| p.cap >= class).min_by_key(|(_, p)| p.cap).map(|(at, _)| at)?;
+            let pinned = st.pinned_free.swap_remove(at);
+            st.pinned_idle -= pinned.cap;
+            Some(pinned)
         };
         if let Some(pinned) = find(st) {
             return Ok(pinned);
@@ -647,7 +752,17 @@ impl CudaBackend {
         self.sync_locked(st)?;
         st.pinned_free.clear();
         st.pinned_idle = 0;
-        Ok(())
+        self.trim_pool()
+    }
+
+    /// Gives the memory the stream-ordered pool holds back to the driver. The stream is
+    /// synchronized first so that the frees still queued on it have taken effect.
+    fn trim_pool(&self) -> Result<(), BackendError> {
+        let Some(pool) = self.shared.pool.as_ref() else { return Ok(()) };
+        self.stream.synchronize().map_err(poll)?;
+        self.bind()?;
+        // SAFETY: `pool` is the live pool of this device; no allocation of it is in flight.
+        unsafe { sys::cuMemPoolTrimTo(pool.pool, 0) }.result().map_err(gpu)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -777,7 +892,8 @@ impl CudaBackend {
         let scratch = if staging.is_empty() {
             None
         } else {
-            let block = self.alloc_block(staging.len() as u64)?;
+            // Synchronous allocation: the copy below is not ordered on the stream.
+            let block = self.alloc_block_sync(staging.len() as u64)?;
             // SAFETY: synchronous copy into the block just allocated.
             unsafe { result::memcpy_htod_sync(block.dptr, &staging[..]) }.map_err(gpu)?;
             Some(block)
@@ -1097,11 +1213,7 @@ impl Backend for CudaBackend {
                 copy_parallel(staged, &mut dst[at..at + size]);
                 done += size;
                 if let Some((_, _, pinned, _)) = queued.pop_front() {
-                    let mut st = lock(&self.state);
-                    if st.pinned_idle + pinned.cap <= PINNED_IDLE_CAP {
-                        st.pinned_idle += pinned.cap;
-                        st.pinned_free.push(pinned);
-                    }
+                    keep_pinned(&mut lock(&self.state), pinned);
                 }
             }
             Ok::<(), BackendError>(())
@@ -1116,10 +1228,12 @@ impl Backend for CudaBackend {
 
     fn reclaim_idle(&self) -> Result<(), BackendError> {
         let mut st = lock(&self.state);
-        self.relieve(&mut st)?;
+        // The uniform chunks go only once the work copying out of them has completed, and
+        // before the trim, so that it returns the device chunk too.
+        self.sync_locked(&mut st)?;
         st.uniform_device = None;
         st.uniform_host = None;
-        Ok(())
+        self.relieve(&mut st)
     }
 
     fn enable_profiling(&self) -> Result<(), BackendError> {
