@@ -113,7 +113,7 @@ pub(crate) struct Recording {
 /// The state of this thread's recording on a context; a thread without an entry has none.
 #[derive(Debug)]
 enum RecState {
-    Active(Recording),
+    Active(Box<Recording>),
     /// The recording was aborted; `end_recording` removes it.
     Aborted,
 }
@@ -161,7 +161,7 @@ impl Context {
                 }
                 all.push((
                     id,
-                    RecState::Active(Recording {
+                    RecState::Active(Box::new(Recording {
                         seed,
                         cmds: Vec::new(),
                         pins: Vec::new(),
@@ -171,7 +171,7 @@ impl Context {
                         resident: None,
                         kernels: FxMap::default(),
                         generations: FxMap::default(),
-                    }),
+                    })),
                 ));
                 true
             })
@@ -218,7 +218,7 @@ impl Context {
                         Ok(to) => recording.split(from, before, to),
                         Err(_) => {
                             // The commands still run, as an aborted recording's do.
-                            self.encode_recording(recording).ok();
+                            self.encode_recording(*recording).ok();
                             return None;
                         }
                     }
@@ -231,7 +231,7 @@ impl Context {
                 if kept > 0 {
                     recording.resident = Some(Accounted::new(self, kept));
                 }
-                Some(recording)
+                Some(*recording)
             }
             _ => None,
         }
@@ -295,7 +295,7 @@ impl Context {
         .flatten() else {
             return Ok(());
         };
-        self.encode_recording(recording)
+        self.encode_recording(*recording)
     }
 
     /// Copies the seeds of `recording` and encodes its commands, in order, then gives its held
