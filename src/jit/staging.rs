@@ -358,6 +358,34 @@ fn regions(c: &Candidates, tile: [u32; 2]) -> Vec<Option<Region>> {
     region
 }
 
+/// Greedily assigns items `(ty, cells, produced_level, last_use_level)`, in production order, to
+/// shared buffers; an item reuses a buffer of the same type whose previous occupant's last use
+/// is before the item's production level. Returns `(buffers, assignment)`.
+pub(crate) fn color_buffers<T: Copy + PartialEq>(items: &[(T, u32, u32, u32)]) -> (Vec<(T, u32)>, Vec<usize>) {
+    let mut buffers: Vec<(T, u32)> = Vec::new();
+    let mut free_after: Vec<u32> = Vec::new();
+    let mut assignment = Vec::with_capacity(items.len());
+    for &(ty, cells, prod, last_use) in items {
+        let slot = (0..buffers.len())
+            .filter(|&i| buffers[i].0 == ty && free_after[i] < prod)
+            .min_by_key(|&i| cells.saturating_sub(buffers[i].1));
+        let i = match slot {
+            Some(i) => {
+                buffers[i].1 = buffers[i].1.max(cells);
+                i
+            }
+            None => {
+                buffers.push((ty, cells));
+                free_after.push(0);
+                buffers.len() - 1
+            }
+        };
+        free_after[i] = last_use;
+        assignment.push(i);
+    }
+    (buffers, assignment)
+}
+
 /// Lays out the staging of every candidate of `c`: the tile (the tuning's stencil tile, halved
 /// until the regions fit its workgroup-memory budget; `None` below 8 cells a side), the regions
 /// and the levels. `elem_bytes(s)` is the size of one value of sub-program `s`.
@@ -365,15 +393,43 @@ pub(crate) fn plan(c: &Candidates, tuning: &Tuning, elem_bytes: impl Fn(u32) -> 
     let n = c.sub_dims.len();
     let one_d = c.dims[1] == 1;
     let (mut tx, mut ty) = if one_d { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
-    let region = loop {
+    let (region, level, order) = loop {
         let region = regions(c, [tx, ty]);
-        let bytes: u64 = region
+        // A sub-program is computed one level after the staged sub-programs it reads.
+        let mut level = vec![0u32; n];
+        for s in 0..n {
+            if region[s].is_some() {
+                level[s] = c.reads.iter().filter(|read| read.reader == Reader::Sub(s as u32)).map(|read| level[read.sub as usize] + 1).max().unwrap_or(0);
+            }
+        }
+        let mut order: Vec<usize> = (0..n).filter(|&s| region[s].is_some()).collect();
+        order.sort_by_key(|&s| (level[s], s));
+        let last = order.last().map_or(0, |&s| level[s]);
+        let mut last_use = vec![0u32; n];
+        for &s in &order {
+            last_use[s] = c
+                .reads
+                .iter()
+                .filter(|read| read.sub as usize == s)
+                .map(|read| match read.reader {
+                    Reader::Main => last + 1,
+                    Reader::Sub(t) => level[t as usize],
+                })
+                .max()
+                .unwrap_or(level[s]);
+        }
+        let items: Vec<(u64, u32, u32, u32)> = order
             .iter()
-            .enumerate()
-            .filter_map(|(s, r)| r.map(|(lo, hi)| (hi[0] - lo[0] + 1) as u64 * (hi[1] - lo[1] + 1) as u64 * elem_bytes(s as u32)))
-            .sum();
+            .filter_map(|&s| {
+                let (lo, hi) = region[s]?;
+                let cells = ((hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1)) as u32;
+                Some((elem_bytes(s as u32), cells, level[s], last_use[s]))
+            })
+            .collect();
+        let (buffers, _) = color_buffers(&items);
+        let bytes: u64 = buffers.iter().map(|&(b, cells)| b * u64::from(cells)).sum();
         if bytes <= u64::from(tuning.stencil_tile_bytes) {
-            break region;
+            break (region, level, order);
         }
         if one_d || tx >= ty {
             tx /= 2;
@@ -384,15 +440,7 @@ pub(crate) fn plan(c: &Candidates, tuning: &Tuning, elem_bytes: impl Fn(u32) -> 
             return None;
         }
     };
-    // A sub-program is computed one level after the staged sub-programs it reads.
-    let mut level = vec![0u32; n];
-    for s in 0..n {
-        if region[s].is_some() {
-            level[s] = c.reads.iter().filter(|read| read.reader == Reader::Sub(s as u32)).map(|read| level[read.sub as usize] + 1).max().unwrap_or(0);
-        }
-    }
-    let mut order: Vec<usize> = (0..n).filter(|&s| region[s].is_some()).collect();
-    order.sort_by_key(|&s| (level[s], s));
+    // Levels are fixed above; reuse of shared buffers is decided by `color_buffers`.
     let last = order.last().map_or(0, |&s| level[s]);
     let mut levels = vec![0u32];
     for l in 0..=last {

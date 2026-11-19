@@ -165,15 +165,21 @@ impl Uni {
 pub(super) struct Frame {
     pub(super) a: FxMap<(u32, u32), Val>,
     pub(super) t: Vec<Option<Val>>,
+    /// Per instruction that is a test (a comparison, a class test, a logic of those), its `bool` value.
+    pub(super) b: Vec<Option<Val>>,
 }
 
 impl Frame {
     pub(super) fn with_len(len: usize) -> Frame {
-        Frame { a: FxMap::default(), t: vec![None; len] }
+        Frame { a: FxMap::default(), t: vec![None; len], b: vec![None; len] }
     }
 
     pub(super) fn t(&self, n: usize) -> Option<Val> {
         self.t.get(n).copied().flatten()
+    }
+
+    pub(super) fn b(&self, n: usize) -> Option<Val> {
+        self.b.get(n).copied().flatten()
     }
 }
 
@@ -427,9 +433,8 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The comparison as a `u32` of 0 or 1.
-    fn compare(&self, fb: &mut FnBuilder<'_>, op: CmpOp, ty: ElemTy, x: Val, y: Val) -> Val {
-        let (one, zero) = (lu(fb, 1), lu(fb, 0));
+    /// The comparison as a `bool`.
+    fn compare_cond(&self, fb: &mut FnBuilder<'_>, op: CmpOp, ty: ElemTy, x: Val, y: Val) -> Val {
         if ty == ElemTy::Df32 {
             let cond = match op {
                 CmpOp::Lt => self.call(fb, "df_lt", &[x, y]),
@@ -438,17 +443,22 @@ impl<'a> Lower<'a> {
                 CmpOp::Ge => self.call(fb, "df_le", &[y, x]),
                 CmpOp::Eq | CmpOp::Ne => self.call(fb, "df_eq", &[x, y]),
             };
-            return if op == CmpOp::Ne { fb.select(cond, zero, one) } else { fb.select(cond, one, zero) };
+            return if op == CmpOp::Ne { fb.unary(IrUnOp::Not, cond) } else { cond };
         }
-        let cond = match op {
+        match op {
             CmpOp::Lt => fb.lt(x, y),
             CmpOp::Le => fb.le(x, y),
             CmpOp::Gt => fb.gt(x, y),
             CmpOp::Ge => fb.ge(x, y),
             CmpOp::Eq => fb.eq(x, y),
             CmpOp::Ne => fb.ne(x, y),
-        };
-        fb.select(cond, one, zero)
+        }
+    }
+
+    /// The comparison as a `u32` of 0 or 1.
+    fn compare(&self, fb: &mut FnBuilder<'_>, op: CmpOp, ty: ElemTy, x: Val, y: Val) -> Val {
+        let cond = self.compare_cond(fb, op, ty, x, y);
+        fb.select(cond, lu(fb, 1), lu(fb, 0))
     }
 
     /// A test of what kind of value `x` is, from the bits of its exponent. They come through an
@@ -457,7 +467,7 @@ impl<'a> Lower<'a> {
     /// value to its finite answer. The operand is an `f32` with the class of the value (see
     /// `builtin::class_operand`): the high word of a `Df32`; an `f64` scaled into the range of
     /// `f32`.
-    fn classify(&self, fb: &mut FnBuilder<'_>, class: Class, ty: ElemTy, x: Val) -> Val {
+    fn classify_cond(&self, fb: &mut FnBuilder<'_>, class: Class, ty: ElemTy, x: Val) -> Val {
         let operand = match ty {
             ElemTy::Df32 => fb.field(x, 0, KirType::F32),
             ElemTy::F64 => {
@@ -470,13 +480,26 @@ impl<'a> Lower<'a> {
         let bits = fb.bitcast(guarded, KirType::U32);
         let magnitude = bits & lu(fb, 0x7fff_ffff);
         let infinity = lu(fb, 0x7f80_0000);
-        let cond = match class {
+        match class {
             Class::Finite => fb.lt(magnitude, infinity),
             Class::Nan => fb.gt(magnitude, infinity),
             Class::Inf => fb.eq(magnitude, infinity),
-        };
-        let (one, zero) = (lu(fb, 1), lu(fb, 0));
-        fb.select(cond, one, zero)
+        }
+    }
+
+    /// [`Lower::classify_cond`] as a `u32` of 0 or 1.
+    fn classify(&self, fb: &mut FnBuilder<'_>, class: Class, ty: ElemTy, x: Val) -> Val {
+        let cond = self.classify_cond(fb, class, ty, x);
+        fb.select(cond, lu(fb, 1), lu(fb, 0))
+    }
+
+    /// The `bool` of a comparison or class test `op` on `x` and `y` (`None` for any other operation).
+    pub(super) fn bool_condition(&self, fb: &mut FnBuilder<'_>, op: Op, x: Val, y: Val) -> Option<Val> {
+        match op.kind {
+            OpKind::Compare(cmp) => Some(self.compare_cond(fb, cmp, op.ty, x, y)),
+            OpKind::Classify(class) => Some(self.classify_cond(fb, class, op.ty, x)),
+            _ => None,
+        }
     }
 
     /// `x` of type `from` converted to `to`. Every conversion that has a `Df32` end passes the
@@ -856,7 +879,7 @@ impl<'a> Lower<'a> {
     /// The terms of the flat source index of the parameterized view `spec` for element `i`, and
     /// per axis the unclipped coordinate and the source extent, where the view checks it.
     #[allow(clippy::type_complexity)]
-    fn pview_axes(&self, fb: &mut FnBuilder<'_>, spec: ViewSpec, i: Val) -> (Vec<Val>, [Option<Val>; 4], [Option<Val>; 4]) {
+    fn pview_axes(&self, fb: &mut FnBuilder<'_>, cache: &mut PviewCache, spec: ViewSpec, parent: u32, i: Val) -> (Vec<Val>, [Option<Val>; 4], [Option<Val>; 4]) {
         let mut raws: [Option<Val>; 4] = [None; 4];
         let mut sizes: [Option<Val>; 4] = [None; 4];
         let mut terms = Vec::new();
@@ -868,15 +891,18 @@ impl<'a> Lower<'a> {
             let slots = axis.slots;
             let mut scaled = None;
             if !axis.out_unit && axis.step != StepSpec::Zero {
-                let quotient = match axis.out_div {
-                    DivRemSpec::None => i,
-                    DivRemSpec::Pow2 => i >> self.scalar(fb, slots.div),
-                    DivRemSpec::Runtime { wide } => self.udiv(fb, i, slots.div, wide),
-                };
-                let along = match axis.out_rem {
-                    DivRemSpec::None => quotient,
-                    DivRemSpec::Pow2 => quotient & self.scalar(fb, slots.rem),
-                    DivRemSpec::Runtime { wide } => self.urem(fb, quotient, slots.rem, wide),
+                let along = match (axis.out_div, axis.out_rem) {
+                    (DivRemSpec::None, DivRemSpec::None) => i,
+                    (DivRemSpec::None, rem) => self.pview_rem(fb, cache, parent, i, slots.rem, rem),
+                    (div, DivRemSpec::None) => self.pview_div(fb, cache, parent, i, slots.div, div),
+                    (div, rem) => {
+                        let quotient = self.pview_div(fb, cache, parent, i, slots.div, div);
+                        match rem {
+                            DivRemSpec::Pow2 => quotient & self.scalar(fb, slots.rem),
+                            DivRemSpec::Runtime { wide } => self.urem(fb, quotient, slots.rem, wide),
+                            DivRemSpec::None => quotient,
+                        }
+                    }
                 };
                 let along = fb.convert(along, KirType::I32);
                 scaled = Some(match axis.step {
@@ -915,14 +941,45 @@ impl<'a> Lower<'a> {
         (terms, raws, sizes)
     }
 
-    /// The body of `pview{id}(i)`, or, with `inside_test`, of `pview{id}_in(i)`.
-    fn pview_body(&self, fb: &mut FnBuilder<'_>, spec: ViewSpec, inside_test: bool) {
-        let i = fb.param(0);
-        let (terms, raws, sizes) = self.pview_axes(fb, spec, i);
+    /// `i / d` of the view axis divisor at `slot` (a shift for `Pow2`), once per context `parent` and divisor.
+    fn pview_div(&self, fb: &mut FnBuilder<'_>, cache: &mut PviewCache, parent: u32, i: Val, slot: u32, kind: DivRemSpec) -> Val {
+        let pow2 = matches!(kind, DivRemSpec::Pow2);
+        if let Some(&(.., q)) = cache.divs.iter().find(|&&(p, s, w, _)| p == parent && s == slot && w == pow2) {
+            return q;
+        }
+        let q = match kind {
+            DivRemSpec::Pow2 => i >> self.scalar(fb, slot),
+            DivRemSpec::Runtime { wide } => self.udiv(fb, i, slot, wide),
+            DivRemSpec::None => i,
+        };
+        let q = fb.let_val(&format!("q_{slot}"), q);
+        cache.divs.push((parent, slot, pow2, q));
+        q
+    }
+
+    /// `i % d` of the view axis modulus at `slot` (a mask for `Pow2`), once per context `parent` and modulus.
+    fn pview_rem(&self, fb: &mut FnBuilder<'_>, cache: &mut PviewCache, parent: u32, i: Val, slot: u32, kind: DivRemSpec) -> Val {
+        let pow2 = matches!(kind, DivRemSpec::Pow2);
+        if let Some(&(.., r)) = cache.rems.iter().find(|&&(p, s, w, _)| p == parent && s == slot && w == pow2) {
+            return r;
+        }
+        let r = match kind {
+            DivRemSpec::Pow2 => i & self.scalar(fb, slot),
+            DivRemSpec::Runtime { .. } => {
+                let q = self.pview_div(fb, cache, parent, i, slot, kind);
+                i - q * self.scalar(fb, slot)
+            }
+            DivRemSpec::None => i,
+        };
+        let r = fb.let_val(&format!("r_{slot}"), r);
+        cache.rems.push((parent, slot, pow2, r));
+        r
+    }
+
+    /// The flat source index of the view (or, with `inside_test`, whether it lies inside the source) from the result of [`Lower::pview_axes`].
+    fn pview_result(&self, fb: &mut FnBuilder<'_>, terms: Vec<Val>, raws: [Option<Val>; 4], sizes: [Option<Val>; 4], inside_test: bool) -> Val {
         if !inside_test {
-            let total = sum(fb, terms);
-            fb.ret(Some(total));
-            return;
+            return sum(fb, terms);
         }
         let mut all: Option<Val> = None;
         for a in 0..4 {
@@ -934,8 +991,15 @@ impl<'a> Lower<'a> {
                 });
             }
         }
-        let all = all.unwrap_or_else(|| fb.lit_bool(true));
-        fb.ret(Some(all));
+        all.unwrap_or_else(|| fb.lit_bool(true))
+    }
+
+    /// The body of `pview{id}(i)`, or, with `inside_test`, of `pview{id}_in(i)`.
+    fn pview_body(&self, fb: &mut FnBuilder<'_>, spec: ViewSpec, inside_test: bool) {
+        let i = fb.param(0);
+        let (terms, raws, sizes) = self.pview_axes(fb, &mut PviewCache::default(), spec, 0, i);
+        let result = self.pview_result(fb, terms, raws, sizes, inside_test);
+        fb.ret(Some(result));
     }
 
     /// Declares the functions of `views`, of the parameterized views `pviews`, the segment
@@ -1051,6 +1115,12 @@ impl<'a> Lower<'a> {
             if shift && n == 0 { lu(fb, 0) } else { self.operand(fb, f, instr.args[n], op.operand_ty(n), 0) }
         };
         let (x, y, z) = (operand(fb, 0), operand(fb, 1), operand(fb, 2));
+        if matches!(op.kind, OpKind::Select)
+            && let Ref::Tmp(m) = instr.args[0]
+            && let Some(cond) = f.b(m as usize)
+        {
+            return fb.select(cond, y, z);
+        }
         if let Some(value) = self.operation(fb, op, x, y, z, index) {
             return value;
         }
@@ -1088,6 +1158,35 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The `bool` of `instr` if it is a comparison or class test.
+    fn condition(&self, fb: &mut FnBuilder<'_>, f: &Frame, instr: &Instr) -> Option<Val> {
+        let op = instr.op;
+        if !matches!(op.kind, OpKind::Compare(_) | OpKind::Classify(_)) {
+            return None;
+        }
+        let operand = |fb: &FnBuilder<'_>, n: usize| self.operand(fb, f, instr.args[n], op.operand_ty(n), 0);
+        let (x, y) = (operand(fb, 0), operand(fb, 1));
+        self.bool_condition(fb, op, x, y)
+    }
+
+    /// Binds instruction `k` of a plain program in `frame`, with the `bool` of a test where it has one.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bind_instr(&self, fb: &mut FnBuilder<'_>, frame: &mut Frame, k: usize, instr: &Instr, index: Val, segmented: bool, inplace: bool, staged: Option<Val>) {
+        let value = match staged {
+            Some(value) => value,
+            None => match self.condition(fb, frame, instr) {
+                Some(cond) => {
+                    let cond = fb.let_val(&format!("b{k}"), cond);
+                    frame.b[k] = Some(cond);
+                    fb.select(cond, lu(fb, 1), lu(fb, 0))
+                }
+                None => self.expression(fb, frame, instr, index, segmented, inplace),
+            },
+        };
+        let value = fb.let_val(&format!("t{k}"), value);
+        frame.t[k] = Some(value);
+    }
+
     /// The loads of the inputs at element `i` and the instructions, as `let` bindings. `index`,
     /// `segmented` and `inplace` are those of [`Lower::expression`]; `staged(k, instr)` may
     /// replace the value of instruction `k`, and only the instructions `keep` marks (all, if
@@ -1116,12 +1215,8 @@ impl<'a> Lower<'a> {
             }
         }
         for (k, instr) in instrs.iter().enumerate().filter(|&(k, _)| kept(k)) {
-            let value = match staged(k, instr, fb) {
-                Some(value) => value,
-                None => self.expression(fb, &frame, instr, index, segmented, inplace),
-            };
-            let value = fb.let_val(&format!("t{k}"), value);
-            frame.t[k] = Some(value);
+            let replaced = staged(k, instr, fb);
+            self.bind_instr(fb, &mut frame, k, instr, index, segmented, inplace, replaced);
         }
         frame
     }
@@ -1142,11 +1237,13 @@ impl<'a> Lower<'a> {
         inplace: bool,
         cell: Option<&StagedCell<'_>>,
         keep: Option<&[bool]>,
+        held: &[u32],
     ) -> Frame {
         let mut members: FxMap<Region, Vec<u32>> = FxMap::default();
         for (n, &region) in inlined.region.iter().enumerate().filter(|&(n, _)| keep.is_none_or(|keep| keep.get(n).copied().unwrap_or(false))) {
             members.entry(region).or_default().push(n as u32);
         }
+        let (has_b, bool_only) = bool_masks(key, inlined, held);
         let mut emit = Emit {
             env: self,
             key,
@@ -1158,11 +1255,67 @@ impl<'a> Lower<'a> {
             frame: Frame::with_len(inlined.instrs.len()),
             defined: vec![None; inlined.ctxs.len()],
             staged_base: Vec::new(),
+            pview: PviewCache::default(),
+            has_b,
+            bool_only,
             members,
         };
         emit.region(fb, Region::Top);
         emit.frame
     }
+}
+
+/// Per lowered instruction, whether its value is a `bool` built in place (a comparison, a class
+/// test, or `!`, `&`, `|` of those), and whether that is all that reads it (a `Select` condition or
+/// such a logic), so that its `u32` is never made. `held` are instructions read from outside.
+fn bool_masks(key: &FusedKey, inlined: &Inlined, held: &[u32]) -> (Vec<bool>, Vec<bool>) {
+    let count = inlined.instrs.len();
+    let mut has_b = vec![false; count];
+    for (n, flat) in inlined.instrs.iter().enumerate() {
+        let tmp = |reference: Ref| matches!(reference, Ref::Tmp(m) if (m as usize) < n && has_b[m as usize]);
+        let op = flat.op;
+        let value = match op.kind {
+            OpKind::Compare(_) | OpKind::Classify(_) => true,
+            OpKind::Unary(UnOp::BitNot) if op.ty == ElemTy::Bool => tmp(flat.args[0]),
+            OpKind::Binary(BinOp::BitAnd | BinOp::BitOr) if op.ty == ElemTy::Bool => tmp(flat.args[0]) && tmp(flat.args[1]),
+            _ => false,
+        };
+        has_b[n] = value;
+    }
+    let mut read = vec![false; count];
+    let mut mark = |n: u32| {
+        if let Some(slot) = read.get_mut(n as usize) {
+            *slot = true;
+        }
+    };
+    for &at in &key.outputs {
+        if let Some(&lowered) = inlined.main.get(at as usize) {
+            mark(lowered);
+        }
+    }
+    held.iter().for_each(|&n| mark(n));
+    for ctx in &inlined.ctxs {
+        for reference in ctx.args {
+            if let Ref::Tmp(n) = reference {
+                mark(n);
+            }
+        }
+    }
+    for (u, flat) in inlined.instrs.iter().enumerate() {
+        for (j, &reference) in flat.args.iter().enumerate() {
+            let Ref::Tmp(n) = reference else { continue };
+            let tolerated = match flat.op.kind {
+                OpKind::Select => j == 0,
+                OpKind::Unary(UnOp::BitNot) | OpKind::Binary(BinOp::BitAnd | BinOp::BitOr) if flat.op.ty == ElemTy::Bool => has_b[u],
+                _ => false,
+            };
+            if !tolerated {
+                mark(n);
+            }
+        }
+    }
+    let bool_only = (0..count).map(|n| has_b[n] && !read[n]).collect();
+    (has_b, bool_only)
 }
 
 /// `x % d` for a literal `d`, a mask when it is a power of two.
@@ -1193,6 +1346,14 @@ fn reads_directly(instr: &Instr, k: u32) -> bool {
     instr.args.iter().skip(skip).any(|arg| *arg == Ref::Input(k))
 }
 
+/// What the parameterized views of a lowered program have divided so far, per context and divisor
+/// (the flag is whether it is a power of two), so that views of one context share their quotients.
+#[derive(Clone, Default)]
+struct PviewCache {
+    divs: Vec<(u32, u32, bool, Val)>,
+    rems: Vec<(u32, u32, bool, Val)>,
+}
+
 /// The state of writing a lowered program (see [`Lower::lowered_body`]).
 struct Emit<'e, 'k> {
     env: &'e Lower<'e>,
@@ -1208,6 +1369,11 @@ struct Emit<'e, 'k> {
     defined: Vec<Option<Val>>,
     /// The base `lx + ly * width` of the staged reads of each region width, in the block being written.
     staged_base: Vec<(u32, Val)>,
+    /// The quotients and remainders of the views of the block being written.
+    pview: PviewCache,
+    /// Per instruction, whether it has a `bool` value (see [`bool_masks`]), and whether only that is read.
+    has_b: Vec<bool>,
+    bool_only: Vec<bool>,
     /// The instructions of every region not written yet, in order.
     members: FxMap<Region, Vec<u32>>,
 }
@@ -1238,7 +1404,7 @@ impl Emit<'_, '_> {
                 let n = env.views.iter().position(|&known| known == (map, edge));
                 env.view_index(fb, n, from)
             }
-            ShiftKind::ParamView { id, .. } => env.pview_index(fb, id, from),
+            ShiftKind::ParamView { spec, .. } => self.inline_pview(fb, ctx.parent, from, spec, false),
             kind => {
                 if let Ref::Input(k) = ctx.args[0] {
                     self.load(fb, k, ctx.parent);
@@ -1249,6 +1415,14 @@ impl Emit<'_, '_> {
         };
         let value = fb.let_val(&format!("i{c}"), value);
         self.defined[c as usize] = Some(value);
+    }
+
+    /// The flat source index of the parameterized view `spec` of the index `from` of context `parent`
+    /// or, with `inside_test`, whether it lies inside the source, sharing the divisions of `from`.
+    fn inline_pview(&mut self, fb: &mut FnBuilder<'_>, parent: u32, from: Val, spec: ViewSpec, inside_test: bool) -> Val {
+        let env = self.env;
+        let (terms, raws, sizes) = env.pview_axes(fb, &mut self.pview, spec, parent, from);
+        env.pview_result(fb, terms, raws, sizes, inside_test)
     }
 
     /// Declares input `k` read at the index of context `c`.
@@ -1302,6 +1476,41 @@ impl Emit<'_, '_> {
             return self.branch(fb, n);
         }
         let op = flat.op;
+        if self.has_b.get(n).copied().unwrap_or(false) {
+            for reference in flat.args.iter().take(op.kind.arity()) {
+                if let Ref::Input(k) = *reference {
+                    self.load(fb, k, flat.at);
+                }
+            }
+            let flag = |this: &Self, j: usize| match flat.args[j] {
+                Ref::Tmp(m) => this.frame.b(m as usize),
+                _ => None,
+            };
+            let cond = match op.kind {
+                OpKind::Compare(_) | OpKind::Classify(_) => {
+                    let [x, y, _] = [0, 1, 2].map(|j| self.operand(fb, flat.args[j], op.operand_ty(j), flat.at));
+                    env.bool_condition(fb, op, x, y)
+                }
+                OpKind::Unary(_) => flag(self, 0).map(|b0| fb.unary(IrUnOp::Not, b0)),
+                OpKind::Binary(BinOp::BitAnd) => flag(self, 0).zip(flag(self, 1)).map(|(b0, b1)| fb.and(b0, b1)),
+                OpKind::Binary(BinOp::BitOr) => flag(self, 0).zip(flag(self, 1)).map(|(b0, b1)| fb.or(b0, b1)),
+                _ => None,
+            };
+            let Some(cond) = cond else {
+                env.fail(fb, format!("the test t{n} is read before it is computed"));
+                return;
+            };
+            let b = fb.let_val(&format!("b{n}"), cond);
+            self.frame.b[n] = Some(b);
+            let t = if self.bool_only[n] {
+                lu(fb, 0)
+            } else {
+                let word = fb.select(b, lu(fb, 1), lu(fb, 0));
+                fb.let_val(&format!("t{n}"), word)
+            };
+            self.frame.t[n] = Some(t);
+            return;
+        }
         let value = match op.kind {
             OpKind::Shift(kind) => {
                 if !staged_read {
@@ -1350,9 +1559,12 @@ impl Emit<'_, '_> {
                         let inside = env.view_inside(fb, view, self.index_of(flat.at));
                         fb.select(inside, read, fill)
                     }
-                    ShiftKind::ParamView { id, spec } if spec.edge == Edge::Fill => {
+                    ShiftKind::ParamView { spec, .. } if spec.edge == Edge::Fill => {
                         let fill = self.operand(fb, flat.args[1], op.operand_ty(1), flat.at);
-                        let inside = env.pview_inside(fb, id, self.index_of(flat.at));
+                        // An undefined context's index is the element's: no sharing with it.
+                        let parent = if staged_read { u32::MAX } else { flat.at };
+                        let from = self.index_of(flat.at);
+                        let inside = self.inline_pview(fb, parent, from, spec, true);
                         fb.select(inside, read, fill)
                     }
                     _ => read,
@@ -1365,9 +1577,16 @@ impl Emit<'_, '_> {
                     }
                 }
                 let [x, y, z] = [0, 1, 2].map(|j| self.operand(fb, flat.args[j], op.operand_ty(j), flat.at));
-                match env.operation(fb, op, x, y, z, self.index_of(flat.at)) {
-                    Some(value) => value,
-                    None => env.fail(fb, "an operation without a lowering"),
+                let condition = match flat.args[0] {
+                    Ref::Tmp(m) if matches!(op.kind, OpKind::Select) => self.frame.b(m as usize),
+                    _ => None,
+                };
+                match condition {
+                    Some(cond) => fb.select(cond, y, z),
+                    None => match env.operation(fb, op, x, y, z, self.index_of(flat.at)) {
+                        Some(value) => value,
+                        None => env.fail(fb, "an operation without a lowering"),
+                    },
                 }
             }
         };
@@ -1383,8 +1602,12 @@ impl Emit<'_, '_> {
         let mask = self.operand(fb, flat.args[0], ElemTy::U32, flat.at);
         let local = fb.var_decl(&format!("t{n}"), reg(flat.op.out_ty()), None);
         let zero = lu(fb, 0);
-        let taken = fb.ne(mask, zero);
-        let outer = (self.defined.clone(), self.frame.a.clone(), self.staged_base.clone());
+        let taken = match flat.args[0] {
+            Ref::Tmp(m) => self.frame.b(m as usize),
+            _ => None,
+        }
+        .unwrap_or_else(|| fb.ne(mask, zero));
+        let outer = (self.defined.clone(), self.frame.a.clone(), self.staged_base.clone(), self.pview.clone());
         let me = RefCell::new(&mut *self);
         let arm = |b: &mut FnBuilder<'_>, side: Region, slot: usize| {
             let mut guard = me.borrow_mut();
@@ -1395,7 +1618,7 @@ impl Emit<'_, '_> {
             }
             let value = this.operand(b, flat.args[slot], flat.op.operand_ty(slot), flat.at);
             b.assign_var(local, value);
-            (this.defined, this.frame.a, this.staged_base) = outer.clone();
+            (this.defined, this.frame.a, this.staged_base, this.pview) = outer.clone();
         };
         fb.if_else(taken, |b| arm(b, Region::Taken(n as u32), 1), |b| arm(b, Region::Skipped(n as u32), 2));
         self.frame.t[n] = Some(fb.read_var(local));
@@ -1546,7 +1769,7 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
         Some(Lowered::Staged(programs)) => views_of_inlined(key, &programs.bodies().collect::<Vec<_>>()),
         None => views_of(key),
     };
-    let pviews = if key.params.is_some() {
+    let mut pviews = if key.params.is_some() {
         let bodies: Vec<&Inlined> = match lowered {
             Some(Lowered::Plain(inlined)) => vec![inlined],
             Some(Lowered::Staged(programs)) => programs.bodies().collect(),
@@ -1558,6 +1781,10 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
     };
     let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)).collect();
     let lib = helper_library(&programs, tuning, !views.is_empty() || !pviews.is_empty(), key.params.is_some())?;
+    // The views of a lowered program are written in place, but for the one a region write goes through.
+    if lowered.is_some() {
+        pviews.retain(|&(id, _)| matches!(key.tail, Tail::ParamStoreMapped { id: store, .. } if store == id));
+    }
 
     let mut build = Build {
         key,
@@ -1701,13 +1928,43 @@ impl<'a> Build<'a> {
                 }
             }
             Variant::Staged => {
-                let Some(staging) = &key.staging else { return };
+                let (Some(Lowered::Staged(programs)), Some(staging)) = (self.lowered, &key.staging) else { return };
                 self.shared_w = vec![None; key.subs.len()];
-                for entry in &staging.subs {
-                    let ty = key.subs.get(entry.sub as usize).and_then(|program| program.last()).map_or(ElemTy::F32, |instr| instr.op.out_ty());
-                    let id = mb.add_shared(&format!("w{}", entry.sub), reg(ty), entry.cells());
+                let level_of = |idx: usize| {
+                    staging.levels.windows(2).position(|w| (w[0] as usize..w[1] as usize).contains(&idx)).unwrap_or(0) as u32
+                };
+                let main_level = staging.levels.len().saturating_sub(1) as u32;
+                let items: Vec<(ElemTy, u32, u32, u32)> = staging
+                    .subs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, entry)| {
+                        let ty = key.subs.get(entry.sub as usize).and_then(|program| program.last()).map_or(ElemTy::F32, |instr| instr.op.out_ty());
+                        let prod = level_of(idx);
+                        let mut last_use = prod;
+                        if programs.main.instrs.iter().any(|flat| flat.args[0] == Ref::Sub(entry.sub)) {
+                            last_use = main_level;
+                        } else {
+                            for group in &programs.groups {
+                                if let Some(&first) = group.members.first()
+                                    && group.body.instrs.iter().any(|flat| flat.args[0] == Ref::Sub(entry.sub))
+                                {
+                                    last_use = last_use.max(level_of(first));
+                                }
+                            }
+                        }
+                        (ty, entry.cells(), prod, last_use)
+                    })
+                    .collect();
+                let (buffers, assignment) = super::staging::color_buffers(&items);
+                let ids: Vec<u32> = buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(ty, cells))| mb.add_shared(&format!("w{i}"), reg(ty), cells))
+                    .collect();
+                for (entry, &buf) in staging.subs.iter().zip(&assignment) {
                     if let Some(slot) = self.shared_w.get_mut(entry.sub as usize) {
-                        *slot = Some(id);
+                        *slot = Some(ids[buf]);
                     }
                 }
             }
@@ -1754,7 +2011,7 @@ impl<'a> Build<'a> {
     /// The program of the kernel at element `i`.
     fn program(&self, fb: &mut FnBuilder<'_>, i: Val, index: Val) -> Prog<'a> {
         match self.inlined {
-            Some(inlined) => Prog { frame: self.env.lowered_body(fb, self.key, inlined, i, index, true, None, None), map: Some(inlined) },
+            Some(inlined) => Prog { frame: self.env.lowered_body(fb, self.key, inlined, i, index, true, None, None, &[]), map: Some(inlined) },
             None => Prog {
                 frame: self.env.body_with(fb, &self.key.instrs, &self.key.input_tys, i, index, self.segmented, true, None, &|_, _, _| None),
                 map: None,
@@ -2260,7 +2517,7 @@ impl<'a> Build<'a> {
                         let i = b.let_val("i", b.bitcast(x, KirType::U32) + b.bitcast(y, KirType::U32) * dw_u);
                         let index = self.global(b, i);
                         let cell = StagedCell { staging, lx, ly, shared: &self.shared_w };
-                        let frame = env.lowered_body(b, key, &group.body, i, index, false, Some(&cell), None);
+                        let frame = env.lowered_body(b, key, &group.body, i, index, false, Some(&cell), None, &group.values);
                         for (&member, &last) in group.members.iter().zip(&group.values) {
                             let Some(sub) = staging.subs.get(member) else { continue };
                             let Some(shared) = self.shared_w.get(sub.sub as usize).copied().flatten() else { continue };
@@ -2287,7 +2544,7 @@ impl<'a> Build<'a> {
                 let i = b.let_val("i", x + y * w);
                 let index = self.global(b, i);
                 let cell = StagedCell { staging, lx, ly, shared: &self.shared_w };
-                let frame = env.lowered_body(b, key, &programs.main, i, index, true, Some(&cell), None);
+                let frame = env.lowered_body(b, key, &programs.main, i, index, true, Some(&cell), None, &[]);
                 self.emit_stores(b, &Prog { frame, map: Some(&programs.main) }, i);
             });
         });
@@ -2360,9 +2617,7 @@ pub(super) fn loop_module(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
                 }
             }
             for (k, instr) in key.instrs.iter().enumerate() {
-                let value = env_ref.expression(b, &frame, instr, i, false, true);
-                let value = b.let_val(&format!("t{k}"), value);
-                frame.t[k] = Some(value);
+                env_ref.bind_instr(b, &mut frame, k, instr, i, false, true, None);
             }
             for (j, &at) in key.outputs.iter().enumerate() {
                 if let Some(value) = frame.t(at as usize) {

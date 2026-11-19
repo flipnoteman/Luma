@@ -726,6 +726,24 @@ pub(super) fn view_helpers(views: &[(u16, ViewSpec)]) -> String {
         let mut raws: [Option<String>; 4] = [None, None, None, None];
         let mut sizes: [Option<String>; 4] = [None, None, None, None];
         let mut terms = Vec::new();
+        // The distinct divisions of `i` the axes share (an axis's remainder is `i - q * d` when it has no divisor of its own).
+        let mut divs: Vec<(u32, bool)> = Vec::new();
+        for axis in spec.axes {
+            if !(axis.active || (spec.edge == Edge::Fill && axis.checked)) || axis.out_unit || axis.step == StepSpec::Zero {
+                continue;
+            }
+            let found = match (axis.out_div, axis.out_rem) {
+                (DivRemSpec::Runtime { wide }, _) => Some((axis.slots.div, wide)),
+                (DivRemSpec::None, DivRemSpec::Runtime { wide }) => Some((axis.slots.rem, wide)),
+                _ => None,
+            };
+            if let Some(found) = found
+                && !divs.contains(&found)
+            {
+                divs.push(found);
+            }
+        }
+        let lets: String = divs.iter().map(|&(slot, wide)| format!("let q_{slot} = {}; ", udiv("i", slot, wide))).collect();
         for a in 0..4 {
             let axis = spec.axes[a];
             if !(axis.active || (spec.edge == Edge::Fill && axis.checked)) {
@@ -737,12 +755,13 @@ pub(super) fn view_helpers(views: &[(u16, ViewSpec)]) -> String {
                 let quotient = match axis.out_div {
                     DivRemSpec::None => "i".to_owned(),
                     DivRemSpec::Pow2 => format!("(i >> p.s{})", slots.div),
-                    DivRemSpec::Runtime { wide } => udiv("i", slots.div, wide),
+                    DivRemSpec::Runtime { .. } => format!("q_{}", slots.div),
                 };
-                let index_along = match axis.out_rem {
-                    DivRemSpec::None => quotient,
-                    DivRemSpec::Pow2 => format!("({quotient} & p.s{})", slots.rem),
-                    DivRemSpec::Runtime { wide } => urem(&quotient, slots.rem, wide),
+                let index_along = match (axis.out_rem, axis.out_div) {
+                    (DivRemSpec::None, _) => quotient,
+                    (DivRemSpec::Pow2, _) => format!("({quotient} & p.s{})", slots.rem),
+                    (DivRemSpec::Runtime { .. }, DivRemSpec::None) => format!("(i - q_{} * p.s{})", slots.rem, slots.rem),
+                    (DivRemSpec::Runtime { wide }, _) => urem(&quotient, slots.rem, wide),
                 };
                 let scaled = match axis.step {
                     StepSpec::PosOne => format!("i32({index_along})"),
@@ -775,7 +794,7 @@ pub(super) fn view_helpers(views: &[(u16, ViewSpec)]) -> String {
             sizes[a] = size;
         }
         let sum = if terms.is_empty() { "0u".to_owned() } else { terms.join(" + ") };
-        let _ = writeln!(src, "fn pview{id}(i: u32) -> u32 {{ return {sum}; }}");
+        let _ = writeln!(src, "fn pview{id}(i: u32) -> u32 {{ {lets}return {sum}; }}");
         if spec.edge == Edge::Fill {
             let tests: Vec<String> = (0..4)
                 .filter_map(|a| match (&raws[a], &sizes[a]) {
@@ -784,7 +803,7 @@ pub(super) fn view_helpers(views: &[(u16, ViewSpec)]) -> String {
                 })
                 .collect();
             let all = if tests.is_empty() { "true".to_owned() } else { tests.join(" && ") };
-            let _ = writeln!(src, "fn pview{id}_in(i: u32) -> bool {{ return {all}; }}");
+            let _ = writeln!(src, "fn pview{id}_in(i: u32) -> bool {{ {lets}return {all}; }}");
         }
     }
     src
