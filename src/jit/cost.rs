@@ -5,10 +5,8 @@
 
 use std::time::Instant;
 
-use crate::array::Storage;
-use crate::gpu_type::ElemLayout;
 use crate::builtin::{df_library, BinOp, CmpOp, UnOp};
-use crate::context::{Context, RawArg};
+use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::Result;
 use crate::kernel::{build_core, KernelKey};
 use crate::ops::launch_1d;
@@ -125,31 +123,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 
 /// Best wall-clock nanoseconds per launch of a kernel over `n` elements with uniform `{k, 0}`:
 /// one warm-up measurement, then the best of [`BEST_OF`], each `reps` launches and one `sync`.
+/// The input and output are whole device buffers of `n` elements, not array storage, so the
+/// measurement does not depend on the context's chunk size.
 fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps: u32) -> Result<f64> {
     let core = build_core(ctx, &KernelKey::new(source, "main", None), Some(label), true)?;
-    let input = Storage::new(ctx, n as usize, ElemLayout::plain(4));
-    let output = Storage::new(ctx, n as usize, ElemLayout::plain(4));
-    let (in_pin, out_pin) = (input.pin(0)?, output.pin(0)?);
     let bytes = u64::from(n) * 4;
+    let input = ctx.alloc_buffer(bytes, STORAGE_USAGE)?;
+    let output = match ctx.alloc_buffer(bytes, STORAGE_USAGE) {
+        Ok(output) => output,
+        Err(err) => {
+            ctx.recycle(input);
+            return Err(err);
+        }
+    };
     let words = [k, 0u32];
-    let raw = [
-        RawArg::read(in_pin.buffer(), bytes),
-        RawArg::write(out_pin.buffer(), bytes),
-        RawArg::Uniform(bytemuck::cast_slice(&words)),
-    ];
-    let mut best = f64::INFINITY;
-    for round in 0..=BEST_OF {
-        let start = Instant::now();
-        for _ in 0..reps {
-            launch_1d(ctx, &core, n, &raw)?;
+    let measured = || -> Result<f64> {
+        let raw = [RawArg::read(&input, bytes), RawArg::write(&output, bytes), RawArg::Uniform(bytemuck::cast_slice(&words))];
+        let mut best = f64::INFINITY;
+        for round in 0..=BEST_OF {
+            let start = Instant::now();
+            for _ in 0..reps {
+                launch_1d(ctx, &core, n, &raw)?;
+            }
+            ctx.sync()?;
+            let ns = start.elapsed().as_secs_f64() * 1e9 / f64::from(reps);
+            if round > 0 {
+                best = best.min(ns);
+            }
         }
-        ctx.sync()?;
-        let ns = start.elapsed().as_secs_f64() * 1e9 / f64::from(reps);
-        if round > 0 {
-            best = best.min(ns);
-        }
-    }
-    Ok(best)
+        Ok(best)
+    };
+    let best = measured();
+    ctx.recycle(input);
+    ctx.recycle(output);
+    best
 }
 
 /// Measures the device: bandwidth, simple f32 throughput, the cost of `Df32` and `f64`
@@ -158,11 +165,13 @@ pub(crate) fn calibrate(ctx: &Context) -> Result<CostModel> {
     let cpu = ctx.is_cpu();
     let copy = || kernel_source("", "f32", "in0[i]", "", "x");
 
-    let n_copy: u32 = if cpu { 1 << 20 } else { 1 << 24 };
+    // One buffer must hold a whole calibration array: stay within what the device can bind.
+    let cap = u32::try_from(ctx.max_buffer_bytes() / 4).unwrap_or(u32::MAX);
+    let n_copy: u32 = if cpu { 1 << 20 } else { 1 << 24 }.min(cap);
     let t_copy = time_kernel(ctx, copy(), "CostCopy", n_copy, 0, REPS)?;
     let bandwidth_gbs = 8.0 * f64::from(n_copy) / t_copy;
 
-    let n_alu: u32 = if cpu { 1 << 16 } else { 1 << 20 };
+    let n_alu: u32 = if cpu { 1 << 16 } else { 1 << 20 }.min(cap);
     let (k_alu, k_df, k_f64) = (512u32, 64u32, 128u32);
     let alu = kernel_source("", "f32", "in0[i]", "x = x * 1.0001 + 0.5;", "x");
     let t_alu = time_kernel(ctx, alu, "CostAlu", n_alu, k_alu, REPS)?;
@@ -272,5 +281,20 @@ mod tests {
         // The spread HangHunt saw between processes sharing one GPU.
         let busy = CostModel { launch_us: 57.9, bandwidth_gbs: 139.0, f32_ops_per_ns: 1282.0, ..reference };
         assert!(contended(&busy, &reference));
+    }
+
+    #[test]
+    fn calibrating_a_context_with_small_chunks_leaves_it_usable() {
+        let options = crate::ContextOptions::default().calibrate(false).chunk_bytes(1024);
+        let ctx = Context::with_options(options).unwrap();
+        let cost = calibrate(&ctx).unwrap();
+        for number in [cost.launch_us, cost.bandwidth_gbs, cost.f32_ops_per_ns, cost.df32_factor] {
+            assert!(number.is_finite() && number > 0.0, "{cost:?}");
+        }
+        let xs: Vec<f32> = (0..1000).map(|i| i as f32 * 0.5).collect();
+        let x = crate::Array::from_slice_on(&ctx, &xs, xs.len()).unwrap();
+        let y = &x * 2.0 + 1.0;
+        let expected: Vec<f32> = xs.iter().map(|v| v * 2.0 + 1.0).collect();
+        assert_eq!(y.to_vec().unwrap(), expected);
     }
 }
