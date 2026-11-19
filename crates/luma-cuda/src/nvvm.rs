@@ -155,9 +155,11 @@ impl Nvvm {
             let arch = std::ffi::CString::new(format!("-arch=compute_{major}{minor}"))
                 .map_err(|e| e.to_string())?;
             // f32 `/` and `sqrt` as WGSL specifies them (2.5 ulp and the device's square root), as
-            // the other GPU backends compile them, instead of the slower IEEE-rounded sequences.
-            // add/sub/mul stay exact; f64 and the libdevice functions are unaffected.
-            let opts = [arch.as_ptr(), c"-prec-div=0".as_ptr(), c"-prec-sqrt=0".as_ptr()];
+            // the other GPU backends compile them, instead of the slower IEEE-rounded sequences;
+            // f32 subnormals flushed to zero, which WGSL allows and the Vulkan driver does, so the
+            // approximations need no range fix-ups. add/sub/mul stay correctly rounded; f64 is
+            // unaffected.
+            let opts = [arch.as_ptr(), c"-prec-div=0".as_ptr(), c"-prec-sqrt=0".as_ptr(), c"-ftz=1".as_ptr()];
             let r = (self.compile)(prog, opts.len() as c_int, opts.as_ptr());
             if r != 0 {
                 return fail(r);
