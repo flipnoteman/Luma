@@ -766,6 +766,15 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
     if let Some(spec) = solve {
         spec.declare_reads(&mut src, &mut binding);
     }
+    // A reduction that finishes itself (see `ReduceList::single_pass`) takes its counter and the
+    // buffer of the final values after the inputs.
+    let single_pass = match key.tail {
+        Tail::Reduce(ops) if ops.is_single_pass() => {
+            binding += 2;
+            Some(binding as u32 - 2)
+        }
+        _ => None,
+    };
     if uniform {
         let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
     }
@@ -842,7 +851,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
                 }
                 let _ = write!(src, "\nfn luma_eval(i: u32) -> {ty} {{\n{global}{computed}{stores}    return t{};\n}}\n", values[side_stores]);
             }
-            src.push_str(&reduce_main(elem, ops, false, "luma_eval", tuning));
+            src.push_str(&reduce_main(elem, ops, false, "luma_eval", tuning, single_pass));
         }
         Tail::AxisReduce(pass) => {
             let names = Names { views: &views, in_place: &[] };

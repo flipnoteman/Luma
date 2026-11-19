@@ -556,15 +556,17 @@ impl Finish {
 pub(crate) struct ReduceList {
     ops: [ReduceOp; MAX_REDUCTIONS],
     len: u8,
-    /// Applied to every value of the pass's output; only a pass that is the last (one group)
-    /// has one.
+    /// Applied to every value of the pass's output; only a pass that is the last (one group,
+    /// or the last workgroup of a [single-pass](ReduceList::single_pass) kernel) has one.
     epilogue: Epilogue,
+    /// Whether the kernel finishes the reduction itself (see [`ReduceList::single_pass`]).
+    single_pass: bool,
 }
 
 impl ReduceList {
     /// `ops` must hold between 1 and [`MAX_REDUCTIONS`] ops.
     pub(crate) fn new(ops: &[ReduceOp]) -> Self {
-        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0, epilogue: Epilogue::default() };
+        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0, epilogue: Epilogue::default(), single_pass: false };
         for (slot, &op) in list.ops.iter_mut().zip(ops) {
             *slot = op;
             list.len += 1;
@@ -590,9 +592,23 @@ impl ReduceList {
     }
 
     /// These reductions with `epilogue` applied to the results. The kernel must run as a single
-    /// group (the last pass): its output is the final value.
+    /// group (the last pass), or be [single-pass](ReduceList::single_pass): its output is the
+    /// final value.
     pub(crate) fn with_epilogue(self, epilogue: Epilogue) -> Self {
         ReduceList { epilogue, ..self }
+    }
+
+    /// The kernel of a first pass over the elements that also finishes the reduction: every
+    /// workgroup leaves its partial result, and the last one to do so (counted by a one-word
+    /// atomic counter that it resets, see [`reduce_main`]) combines them, applies the epilogue
+    /// and writes one value per op to a `result` buffer. For `groups > 1`; part of the kernel's
+    /// cache key.
+    pub(crate) fn single_pass(self) -> Self {
+        ReduceList { single_pass: true, ..self }
+    }
+
+    pub(crate) fn is_single_pass(&self) -> bool {
+        self.single_pass
     }
 
     pub(crate) fn epilogue(&self) -> Epilogue {
@@ -670,7 +686,8 @@ pub(crate) enum Builtin {
 /// elements into `out[j * groups + group]`, `groups` being [`Tuning::reduce_groups`]; a workgroup
 /// takes [`Tuning::reduce_block`] elements at a time, strided over the array. `segmented` passes
 /// reduce the partial results of an earlier pass, op `j` over `a[j * p.n ..]`; otherwise every op
-/// reads the same `p.n` elements.
+/// reads the same `p.n` elements. A [single-pass](ReduceList::single_pass) kernel binds the
+/// counter and the final values (`result`) after `a` (see [`reduce_main`]).
 fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String {
     // The double-float kernel takes the guard of its arithmetic (see `df_library`) as a uniform.
     let fields = ops.epilogue().fields();
@@ -680,15 +697,17 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String
         other => (ReduceElem::Plain(other), format!("struct Params {{ n: u32, {fields}}}")),
     };
     let ty = elem.storage_ty();
+    let single_pass = ops.is_single_pass().then_some(2);
+    let uniform = if single_pass.is_some() { 4 } else { 2 };
     format!(
         "{params}
 @group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
 @group(1) @binding(1) var<storage, read> a: array<{ty}>;
-@group(1) @binding(2) var<uniform> p: Params;
+@group(1) @binding({uniform}) var<uniform> p: Params;
 
 fn load_at(i: u32) -> {ty} {{ return a[i]; }}
 {}",
-        reduce_main(elem, ops, segmented, "load_at", tuning)
+        reduce_main(elem, ops, segmented, "load_at", tuning, single_pass)
     )
 }
 
@@ -713,7 +732,7 @@ fn reduce_bits(ops: ReduceList, tuning: &Tuning) -> String {
 
 fn load_at(i: u32) -> u32 {{ let w = a[i]; return {value}; }}
 {}",
-        reduce_main(ReduceElem::Plain("u32"), ops, false, "load_at", tuning)
+        reduce_main(ReduceElem::Plain("u32"), ops, false, "load_at", tuning, None)
     )
 }
 
@@ -1004,16 +1023,34 @@ fn pairwise(c: &str, values: &[String]) -> String {
 /// Most subgroups a reduction workgroup can have: the smallest subgroup size WebGPU allows is 4.
 const MAX_SUBGROUPS: u32 = REDUCE_WORKGROUP / 4;
 
-/// The entry point of a reduction pass computing every op of `ops` (see [`reduce`]). Element
-/// `i` comes from `{load}(i)`, and a `Params` uniform `p` with the element count `n` is bound.
-/// Every invocation accumulates its elements of the strided blocks, then the workgroup combines
-/// the accumulators: within subgroups with `subgroupAdd` and friends and across them through
-/// workgroup memory when the device has subgroups, by a shared-memory tree otherwise.
-pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool, load: &str, tuning: &Tuning) -> String {
-    let ty = elem.storage_ty();
+/// One stage of a reduction kernel (see [`reduce_phase`]): the `n` elements it reduces, which
+/// workgroup this is among the `groups` sharing them, and where the values go.
+struct Phase<'a> {
+    /// WGSL expressions: the element count, the workgroup's index and the number of workgroups.
+    n: &'a str,
+    group: &'a str,
+    groups: &'a str,
+    /// Whether op `j` reduces `load(j * segment + i)` (the partial results of an earlier pass)
+    /// instead of `load(i)`.
+    segmented: bool,
+    segment: &'a str,
+    load: &'a str,
+    /// The statement storing the WGSL expression (second argument) as the value of op `j`.
+    store: &'a dyn Fn(usize, &str) -> String,
+    /// Applied to the values before they are stored.
+    epilogue: Epilogue,
+}
+
+/// The statements of a stage of a reduction kernel computing every op of `ops`: every
+/// invocation accumulates its elements of the strided blocks, then the workgroup combines the
+/// accumulators, within subgroups with `subgroupAdd` and friends and across them through
+/// workgroup memory when `subgroups`, by a shared-memory tree otherwise, and one invocation
+/// stores the values. Expects `lid`, `zero`, the combining functions `c{j}` and, with
+/// `subgroups`, `lane`, `sg` and the workgroup array `sh` to exist.
+fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgroups: bool, tuning: &Tuning) -> String {
     let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
     let per_thread = tuning.reduce_per_thread;
-    let mut combines = String::new();
+    let Phase { n, group, groups, segmented, segment, load, store, epilogue } = phase;
     let mut inits = String::new();
     let mut loop_body = String::new();
     // Without segments every op reduces the same elements: load each once.
@@ -1021,37 +1058,35 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         loop_body += &format!("            let e0 = {load}(base);\n");
         for s in 1..per_thread {
             loop_body += &format!(
-                "            let in{s} = base + {wg}u * {s}u < p.n;\n            var e{s} = e0;\n            if (in{s}) {{ e{s} = {load}(base + {wg}u * {s}u); }}\n"
+                "            let in{s} = base + {wg}u * {s}u < {n};\n            var e{s} = e0;\n            if (in{s}) {{ e{s} = {load}(base + {wg}u * {s}u); }}\n"
             );
         }
     }
     for (j, &op) in ops.as_slice().iter().enumerate() {
-        let combine = elem.combine(op);
-        combines += &format!("fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}\n");
-        let segment = if segmented { format!("{j}u * p.n + ") } else { String::new() };
+        let segment = if *segmented { format!("{j}u * {segment} + ") } else { String::new() };
         if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
             unreachable!("arg reductions have their own passes (`crate::arg`)");
         }
         inits += &format!("    var acc{j} = zero;\n");
         for s in 0..per_thread {
-            if segmented {
+            if *segmented {
                 if s == 0 {
                     loop_body += &format!("            let e{j}_0 = {load}({segment}base);\n");
                 } else {
                     loop_body += &format!(
-                        "            let in{j}_{s} = base + {wg}u * {s}u < p.n;\n            var e{j}_{s} = e{j}_0;\n            if (in{j}_{s}) {{ e{j}_{s} = {load}({segment}(base + {wg}u * {s}u)); }}\n"
+                        "            let in{j}_{s} = base + {wg}u * {s}u < {n};\n            var e{j}_{s} = e{j}_0;\n            if (in{j}_{s}) {{ e{j}_{s} = {load}({segment}(base + {wg}u * {s}u)); }}\n"
                     );
                 }
             }
-            let e = if segmented { format!("e{j}_{s}") } else { format!("e{s}") };
+            let e = if *segmented { format!("e{j}_{s}") } else { format!("e{s}") };
             // Out-of-range slots: sums take zero, min/max reuse the first (valid) element.
             let value = match op {
                 ReduceOp::Sum => {
-                    if s == 0 { e } else { format!("select(zero, {e}, base + {wg}u * {s}u < p.n)") }
+                    if s == 0 { e } else { format!("select(zero, {e}, base + {wg}u * {s}u < {n})") }
                 }
                 ReduceOp::SumSquares => {
                     let sq = elem.square(&e);
-                    if s == 0 { sq } else { format!("select(zero, {sq}, base + {wg}u * {s}u < p.n)") }
+                    if s == 0 { sq } else { format!("select(zero, {sq}, base + {wg}u * {s}u < {n})") }
                 }
                 ReduceOp::Min | ReduceOp::Max => e,
                 ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!(),
@@ -1062,15 +1097,14 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         let pw = pairwise(&format!("c{j}"), &values);
         loop_body += &match op {
             ReduceOp::Min | ReduceOp::Max => {
-                format!("            if (b == group * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
+                format!("            if (b == {group} * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
             }
             _ => format!("            acc{j} = c{j}(acc{j}, {pw});\n"),
         };
     }
 
     let mut finish = String::new();
-    let (shared, extra_args) = if tuning.subgroups && elem.subgroups() {
-        let n = ops.as_slice().len() as u32 * MAX_SUBGROUPS;
+    if subgroups {
         let mut lanes = String::new();
         let mut first = String::new();
         for (j, &op) in ops.as_slice().iter().enumerate() {
@@ -1081,15 +1115,16 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
                 ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
             };
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
-                lanes += &format!("    let first{j} = subgroupBroadcastFirst(acc{j});\n    if (group * {block}u + lid >= p.n) {{ acc{j} = first{j}; }}\n");
+                lanes += &format!("    let first{j} = subgroupBroadcastFirst(acc{j});\n    if ({group} * {block}u + lid >= {n}) {{ acc{j} = first{j}; }}\n");
             }
             lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
-            let (lets, fin) = ops.epilogue().statements(&format!("f{j}"), &format!("g{j}_"));
+            let (lets, fin) = epilogue.statements(&format!("f{j}"), &format!("g{j}_"));
+            let store = store(j, &fin);
             first += &format!(
                 "        var t{j} = {ident};
         for (var k = lane; k < nsg; k += sg) {{ t{j} = c{j}(t{j}, sh[{}u + k]); }}
         let f{j} = {group_op}(t{j});
-        if (lane == 0u) {{ {lets}out[{j}u * groups + group] = {fin}; }}
+        if (lane == 0u) {{ {lets}{store} }}
 ",
                 j as u32 * MAX_SUBGROUPS
             );
@@ -1098,35 +1133,128 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
             "    let sgid = lid / sg;
 {lanes}    workgroupBarrier();
     if (sgid == 0u) {{
-        let nsg = (min(p.n - group * {block}u, {wg}u) + sg - 1u) / sg;
+        let nsg = (min({n} - {group} * {block}u, {wg}u) + sg - 1u) / sg;
 {first}    }}
 "
         );
-        (
-            format!("var<workgroup> sh: array<{ty}, {n}>;"),
-            "\n    @builtin(subgroup_invocation_id) lane: u32,\n    @builtin(subgroup_size) sg: u32,",
-        )
     } else {
         for j in 0..ops.as_slice().len() {
-            let (lets, fin) = ops.epilogue().statements("sh[0]", &format!("g{j}_"));
+            let (lets, fin) = epilogue.statements("sh[0]", &format!("g{j}_"));
+            let store = store(j, &fin);
             finish += &format!(
                 "    sh[lid] = acc{j};
     workgroupBarrier();
     for (var s = {half}u; s > 0u; s = s >> 1u) {{
-        if (lid < s && group * {block}u + lid + s < p.n) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
+        if (lid < s && {group} * {block}u + lid + s < {n}) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
         workgroupBarrier();
     }}
-    if (lid == 0u) {{ {lets}out[{j}u * groups + group] = {fin}; }}
+    if (lid == 0u) {{ {lets}{store} }}
     workgroupBarrier();
 ",
                 half = wg / 2
             );
         }
+    }
+    format!(
+        "{inits}    for (var b = {group} * {block}u; b < {n}; b += {groups} * {block}u) {{
+        let base = b + lid;
+        if (base < {n}) {{
+{loop_body}        }}
+    }}
+{finish}"
+    )
+}
+
+/// The entry point of a reduction pass computing every op of `ops` (see [`reduce`]). Element
+/// `i` comes from `{load}(i)`, and a `Params` uniform `p` with the element count `n` is bound.
+/// Every invocation accumulates its elements of the strided blocks, then the workgroup combines
+/// the accumulators: within subgroups with `subgroupAdd` and friends and across them through
+/// workgroup memory when the device has subgroups, by a shared-memory tree otherwise. Workgroup
+/// `group` of `groups` leaves the partial result of op `j` in `out[j * groups + group]`.
+///
+/// With `single_pass` (the binding of a `luma_counter: array<atomic<u32>>` of one word that is
+/// zero; `luma_result: array<{ty}>` takes the next binding, see [`ReduceList::single_pass`])
+/// the kernel also finishes the reduction, as the classic last-block reduction does: once its
+/// partial results are written, a workgroup fences them (`storageBarrier`) and takes a ticket
+/// from the counter; the workgroup holding the last ticket (every workgroup that has anything
+/// to reduce takes one; those of the folded grid past `groups` leave at once, without) fences
+/// again, reduces `out[j * groups ..]` exactly as a pass over the partial results of a first one
+/// would (same accumulation order, so the values are the same bits), applies the epilogue of
+/// `ops`, writes `luma_result[j]` and resets the counter for the next launch. Only for a
+/// first pass (`!segmented`); the partial results then carry no epilogue.
+pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool, load: &str, tuning: &Tuning, single_pass: Option<u32>) -> String {
+    debug_assert!(single_pass.is_none() || !segmented, "only a first pass can finish the reduction itself");
+    let ty = elem.storage_ty();
+    let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
+    let mut combines = String::new();
+    for (j, &op) in ops.as_slice().iter().enumerate() {
+        let combine = elem.combine(op);
+        combines += &format!("fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}\n");
+    }
+
+    let subgroups = tuning.subgroups && elem.subgroups();
+    let (shared, extra_args) = if subgroups {
+        let n = ops.as_slice().len() as u32 * MAX_SUBGROUPS;
+        (
+            format!("var<workgroup> sh: array<{ty}, {n}>;"),
+            "\n    @builtin(subgroup_invocation_id) lane: u32,\n    @builtin(subgroup_size) sg: u32,",
+        )
+    } else {
         (format!("var<workgroup> sh: array<{ty}, {wg}>;"), "")
+    };
+    let partial = |j: usize, value: &str| format!("out[{j}u * groups + group] = {value};");
+    let body = reduce_phase(
+        elem,
+        ops,
+        &Phase {
+            n: "p.n",
+            group: "group",
+            groups: "groups",
+            segmented,
+            segment: "p.n",
+            load,
+            store: &partial,
+            // A partial result is not the final value when the last workgroup finishes it.
+            epilogue: if single_pass.is_some() { Epilogue::default() } else { ops.epilogue() },
+        },
+        subgroups,
+        tuning,
+    );
+    let (declare, last_block) = match single_pass {
+        None => (String::new(), String::new()),
+        Some(counter) => {
+            let result = counter + 1;
+            let value = |j: usize, value: &str| format!("luma_result[{j}u] = {value};");
+            let rest = reduce_phase(
+                elem,
+                ops.rest(),
+                &Phase { n: "groups", group: "0u", groups: "1u", segmented: true, segment: "groups", load: "luma_partial", store: &value, epilogue: ops.epilogue() },
+                subgroups,
+                tuning,
+            );
+            (
+                format!(
+                    "@group(1) @binding({counter}) var<storage, read_write> luma_counter: array<atomic<u32>>;
+@group(1) @binding({result}) var<storage, read_write> luma_result: array<{ty}>;
+var<workgroup> luma_ticket: u32;
+fn luma_partial(i: u32) -> {ty} {{ return out[i]; }}
+"
+                ),
+                format!(
+                    "    storageBarrier();
+    if (lid == 0u) {{ luma_ticket = atomicAdd(&luma_counter[0], 1u); }}
+    if (workgroupUniformLoad(&luma_ticket) == groups - 1u) {{
+        storageBarrier();
+{rest}        if (lid == 0u) {{ atomicStore(&luma_counter[0], 0u); }}
+    }}
+"
+                ),
+            )
+        }
     };
     format!(
         "{}{shared}
-
+{declare}
 {combines}
 @compute @workgroup_size({wg})
 fn main(
@@ -1138,12 +1266,7 @@ fn main(
     let groups = min((p.n + {block}u - 1u) / {block}u, {cap}u);
     if (group >= groups) {{ return; }}
     let zero = {ty}();
-{inits}    for (var b = group * {block}u; b < p.n; b += groups * {block}u) {{
-        let base = b + lid;
-        if (base < p.n) {{
-{loop_body}        }}
-    }}
-{finish}}}
+{body}{last_block}}}
 ",
         elem.library(),
         cap = tuning.reduce_max_groups
@@ -2035,5 +2158,37 @@ mod tests {
         assert!(BinOp::Rotl.expr_for(ElemTy::I32).is_none());
         assert!(BinOp::Atan2.expr_for(ElemTy::I32).is_none());
         assert!(UnOp::Neg.expr_for(ElemTy::I32).is_some());
+    }
+
+    /// Every reduction kernel (first, later and single-pass passes) is valid WGSL, with subgroup
+    /// operations and without.
+    #[test]
+    fn reduction_kernels_validate() {
+        let sqrt = Epilogue::default().then(EpilogueStep::Unary(UnOp::Sqrt)).unwrap();
+        let lists = [
+            ReduceList::new(&[ReduceOp::Sum]),
+            ReduceList::new(&[ReduceOp::Min]),
+            ReduceList::new(&[ReduceOp::Max]),
+            ReduceList::new(&[ReduceOp::SumSquares]).with_epilogue(sqrt),
+            ReduceList::new(&[ReduceOp::Sum, ReduceOp::Min, ReduceOp::Max, ReduceOp::SumSquares]),
+        ];
+        for subgroups in [false, true] {
+            let tuning = Tuning { subgroups, ..Tuning::for_tests() };
+            let features = if subgroups { luma_core::Features::SUBGROUP } else { luma_core::Features::empty() };
+            for ty in ["f32", "u32", "i32", "vec4<f32>", "df32"] {
+                for list in lists {
+                    let list = if ty == "f32" { list } else { list.with_epilogue(Epilogue::default()) };
+                    let kernels = [
+                        ("first", reduce(ty, list, false, &tuning)),
+                        ("single-pass", reduce(ty, list.single_pass(), false, &tuning)),
+                        ("later", reduce(ty, list.rest(), true, &tuning)),
+                    ];
+                    for (what, wgsl) in kernels {
+                        luma_core::kir::parse_wgsl(&wgsl, "main", None, features, [256; 3], 256, 64, true)
+                            .unwrap_or_else(|error| panic!("{what} {ty} {list:?} (subgroups {subgroups}): {error}\n{wgsl}"));
+                    }
+                }
+            }
+        }
     }
 }

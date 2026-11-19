@@ -38,6 +38,45 @@ const WORD: u64 = 4;
 /// Bytes of one element of the `f32` states this machinery handles.
 const ELEMENT_BYTES: u64 = 4;
 
+// Tests: run the body and the check as two kernels even where one program does both.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SEPARATE_KERNELS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What a step of the loop launches: the body and the residual's first pass as two kernels, or
+/// one program that stores the step and reduces its residual.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Separate { body: &'a Fused, check: &'a Fused },
+    Fused(&'a Fused),
+}
+
+/// One program computing `first` (stored as the next state) and the maximum of `residual`
+/// (which reads `first`, computed once), as [`launch::reduce_and_store_fused`](super::launch)
+/// runs for the speculation: `None` where that cannot run, or the values are not plain `f32`s
+/// of one buffer each.
+fn fuse(ctx: &Context, first: &Arc<Node>, residual: &Arc<Node>, probe: &Arc<Storage>, max_ops: ReduceList) -> Option<Fused> {
+    #[cfg(test)]
+    if SEPARATE_KERNELS.with(std::cell::Cell::get) {
+        return None;
+    }
+    let roots = [(Arc::clone(first), first.operands()?), (Arc::clone(residual), residual.operands()?)];
+    let fused = flatten_inner(&roots, Tail::Reduce(max_ops), &[probe.id()]).ok()?;
+    let key = &fused.key;
+    let [stored, reduced] = key.outputs[..] else { return None };
+    let f32_at = |at: u32| key.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::F32);
+    let fits = reduced as usize + 1 == key.instrs.len()
+        && stored != reduced
+        && f32_at(stored)
+        && f32_at(reduced)
+        && key.subs.is_empty()
+        && key.narrow()
+        && fused.inputs.iter().all(|input| input.segments() == 1)
+        && fused.inputs.len() + 1 < ctx.jit().max_inputs();
+    fits.then_some(fused)
+}
+
 /// Runs `first` (one step from `probe`, an alias of `from`) repeatedly, each time from the state
 /// the last step wrote, until the largest `|next - prev|` (`residual`, computed from `probe`
 /// too) is at most `tol` or `max_steps` steps ran. Returns the last state, or `None` if the step
@@ -64,6 +103,12 @@ pub(crate) fn run_until(
         return None;
     }
     let max_ops = ReduceList::new(&[ReduceOp::Max]);
+    if let Some(fused) = fuse(ctx, first, residual, probe, max_ops) {
+        if probe.was_materialized() {
+            return None;
+        }
+        return Some(run(ctx, from, probe, Step::Fused(&fused), len, max_steps, tol));
+    }
     let body = flatten_inner(&[(Arc::clone(first), first.operands()?)], Tail::Store, &[probe.id()]).ok()?;
     let check = flatten(&[(Arc::clone(residual), residual.operands()?)], Tail::Reduce(max_ops)).ok()?;
     let one_buffer = |fused: &Fused| {
@@ -89,7 +134,7 @@ pub(crate) fn run_until(
     {
         return None;
     }
-    Some(run(ctx, from, probe, &body, &check, len, max_steps, tol))
+    Some(run(ctx, from, probe, Step::Separate { body: &body, check: &check }, len, max_steps, tol))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -97,37 +142,59 @@ fn run(
     ctx: &Context,
     from: &Arc<Storage>,
     probe: &Arc<Storage>,
-    body: &Fused,
-    check: &Fused,
+    step: Step<'_>,
     len: usize,
     max_steps: usize,
     tol: f32,
 ) -> Result<Arc<Storage>, Failure> {
     let n = len_u32(len)?;
     let max_ops = ReduceList::new(&[ReduceOp::Max]);
-    let (mut body_key, mut body_scalars) = (body.key.clone(), body.scalars.clone());
+    let (body, check) = match step {
+        Step::Separate { body, check } => (Some(body), check),
+        Step::Fused(fused) => (None, fused),
+    };
+    // With `Tuning::single_pass_reduce` the check kernel also folds its partial results (the last
+    // workgroup to finish does): one launch per step, its value in `value`. A step after the
+    // gate has zeroed the dispatch arguments runs no workgroup, takes no ticket and leaves the
+    // counter at zero.
+    let single = ctx.tuning().single_pass_reduce && ctx.tuning().reduce_groups(n) > 1;
+    let mut body_parts = body.map(|body| (body.key.clone(), body.scalars.clone()));
     let (mut check_key, mut check_scalars) = (check.key.clone(), check.scalars.clone());
-    let body_core = ctx.jit().kernel(ctx, &mut body_key, &mut body_scalars)?;
+    if single {
+        check_key.tail = Tail::Reduce(max_ops.single_pass());
+    }
+    let body_core = match &mut body_parts {
+        Some((key, scalars)) => Some(ctx.jit().kernel(ctx, key, scalars)?),
+        None => None,
+    };
     let check_core = ctx.jit().kernel(ctx, &mut check_key, &mut check_scalars)?;
     let gate_core = ctx.builtin(Builtin::UntilGate, "u32")?;
-    let finish_core = ctx.builtin(Builtin::Reduce(max_ops.rest(), true), "f32")?;
 
-    // The dispatches of one step, in order: the body, the first pass of the residual, then the
-    // passes that fold its partial results into one value.
+    // The dispatches of one step, in order: the body (unless the check stores the step itself),
+    // the first pass of the residual, then the passes that fold its partial results into one
+    // value.
     let mut scratch = Scratch::new(ctx);
-    let mut dispatches = vec![workgroups_1d(ctx, &body_core, n)?];
+    let mut dispatches = Vec::new();
+    if let Some(body_core) = &body_core {
+        dispatches.push(workgroups_1d(ctx, body_core, n)?);
+    }
+    let check_at = dispatches.len();
     let mut groups = ctx.tuning().reduce_groups(n);
     dispatches.push(fold_workgroups(ctx, groups)?);
+    let first_fold = dispatches.len();
     let mut partials = vec![(scratch.take(u64::from(groups) * ELEMENT_BYTES)?, u64::from(groups) * ELEMENT_BYTES)];
     let mut folds = Vec::new();
-    while groups > 1 {
+    while groups > 1 && !single {
         let from_groups = groups;
         groups = ctx.tuning().reduce_groups(from_groups);
         dispatches.push(fold_workgroups(ctx, groups)?);
         partials.push((scratch.take(u64::from(groups) * ELEMENT_BYTES)?, u64::from(groups) * ELEMENT_BYTES));
         folds.push((from_groups, groups));
     }
-    let Some((value, _)) = partials.last() else {
+    let single_value = if single { Some(scratch.take(ELEMENT_BYTES)?) } else { None };
+    let finish_core = if folds.is_empty() { None } else { Some(ctx.builtin(Builtin::Reduce(max_ops.rest(), true), "f32")?) };
+    let counter = if single { Some(ctx.reduce_counter()?) } else { None };
+    let Some(value) = single_value.as_ref().or_else(|| partials.last().map(|(buffer, _)| buffer)) else {
         return Err(Failure::New(LumaError::Gpu("residual without a partial result".into())));
     };
 
@@ -147,17 +214,23 @@ fn run(
         let state = take(2 * WORD, STORAGE_USAGE)?;
         let mut steps: Vec<Buffer> = Vec::new();
         let ping = [Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize))), Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize)))];
-        let body_state = body.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
+        let body_state = body.and_then(|body| body.inputs.iter().position(|input| Arc::ptr_eq(input, probe)));
         let check_state = check.inputs.iter().position(|input| Arc::ptr_eq(input, probe));
         let states = [(from, &ping[0]), (&ping[0], &ping[1]), (&ping[1], &ping[0])];
         let mut body_args = Vec::with_capacity(3);
         let mut check_pins = Vec::with_capacity(3);
+        let mut next_pins = Vec::with_capacity(3);
         for &(current, next) in &states {
-            let mut inputs = body.inputs.clone();
-            if let Some(at) = body_state {
-                inputs[at] = Arc::clone(current);
+            if let (Some(body), Some((body_key, body_scalars))) = (body, &body_parts) {
+                let mut inputs = body.inputs.clone();
+                if let Some(at) = body_state {
+                    inputs[at] = Arc::clone(current);
+                }
+                body_args.push(store_args(body_key, &[&**next], &inputs, body_scalars, None, 0)?);
+            } else {
+                // The check stores the state itself.
+                next_pins.push(next.pin(0)?);
             }
-            body_args.push(store_args(&body_key, &[&**next], &inputs, &body_scalars, None, 0)?);
 
             let mut inputs = check.inputs.clone();
             if let Some(at) = check_state {
@@ -165,14 +238,21 @@ fn run(
             }
             check_pins.push(pin_inputs(&check_key, &inputs, None, 0, n)?);
         }
-        let body_raws: [Vec<RawArg<'_>>; 3] = std::array::from_fn(|s| body_args[s].raw());
+        let body_raws: [Vec<RawArg<'_>>; 3] = std::array::from_fn(|s| body_args.get(s).map_or_else(Vec::new, |args| args.raw()));
         let check_uniform = params(&check_key, None, Some(n), 0, len, None, &check_scalars)?;
         let (first_out, first_bytes) = &partials[0];
         let check_raws: [Vec<RawArg<'_>>; 3] = std::array::from_fn(|s| {
             let pins = &check_pins[s];
-            let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
+            let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 5);
             raw.push(RawArg::write(first_out, *first_bytes));
+            if let Some(next) = next_pins.get(s) {
+                raw.push(RawArg::write(next.buffer(), len as u64 * ELEMENT_BYTES));
+            }
             raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+            if let (Some(counter), Some(result)) = (counter, &single_value) {
+                raw.push(RawArg::write(counter, 4));
+                raw.push(RawArg::write(result, ELEMENT_BYTES));
+            }
             raw.push(RawArg::Uniform(bytemuck::cast_slice(&check_uniform)));
             raw
         });
@@ -187,24 +267,29 @@ fn run(
             }
             ctx.upload(&state, bytemuck::cast_slice(&[0u32, 0]))?;
             ctx.upload(&steps[0], bytemuck::cast_slice(&template))?;
-            ctx.jit().stats.elementwise_launches.fetch_add(in_block as u64, std::sync::atomic::Ordering::Relaxed);
+            if body.is_some() {
+                ctx.jit().stats.elementwise_launches.fetch_add(in_block as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             ctx.jit().stats.reduce_launches.fetch_add(in_block as u64, std::sync::atomic::Ordering::Relaxed);
             for k in 0..in_block {
                 let i = base + k;
                 let s = if i == 0 { 0 } else if i % 2 == 1 { 1 } else { 2 };
 
-                ctx.launch_indirect(&body_core, &steps[k], 0, [n, 1, 1], dispatches[0], &body_raws[s])?;
-                ctx.launch_indirect(&check_core, &steps[k], WORD * 3, [n, 1, 1], dispatches[1], &check_raws[s])?;
+                if let Some(body_core) = &body_core {
+                    ctx.launch_indirect(body_core, &steps[k], 0, [n, 1, 1], dispatches[0], &body_raws[s])?;
+                }
+                ctx.launch_indirect(&check_core, &steps[k], WORD * 3 * check_at as u64, [n, 1, 1], dispatches[check_at], &check_raws[s])?;
 
                 for (pass, count) in fold_counts.iter().enumerate() {
+                    let Some(finish_core) = &finish_core else { break };
                     let (input, input_bytes) = &partials[pass];
                     let (output, output_bytes) = &partials[pass + 1];
                     ctx.launch_indirect(
-                        &finish_core,
+                        finish_core,
                         &steps[k],
-                        WORD * 3 * (2 + pass as u64),
+                        WORD * 3 * (first_fold + pass) as u64,
                         [count[0], 1, 1],
-                        dispatches[2 + pass],
+                        dispatches[first_fold + pass],
                         &[
                             RawArg::write(output, *output_bytes),
                             RawArg::read(input, *input_bytes),

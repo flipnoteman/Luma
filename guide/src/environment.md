@@ -28,6 +28,7 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_FUSION_*`, `LUMA_STAGING`, `L
 | `LUMA_CHUNK_BYTES` | Largest buffer an array is split into, in bytes: a power of two from 1024 up to the largest bindable size, otherwise opening the context fails with `InvalidShape`; a value that is not a number is ignored |
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
+| `LUMA_SINGLE_PASS_REDUCE` | `off` makes reductions over several workgroups two launches on CUDA again (by default the last workgroup of the first pass finishes the reduction); `on` does the same single-pass reduction on the native CPU backend (other backends ignore it: WGSL does not order memory across workgroups) |
 | `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions) |
 | `LUMA_FUSION_MAX_INPUTS` | Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer ([Performance](performance.md#many-arrays-in-one-kernel)) |
 | `LUMA_FUSION_MAX_LIVE` | Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, `8..=4096`) |

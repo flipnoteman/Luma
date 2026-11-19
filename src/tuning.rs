@@ -19,6 +19,9 @@ const MAX_INLINED_ENV: &str = "LUMA_FUSION_MAX_INLINED";
 const STAGING_ENV: &str = "LUMA_STAGING";
 /// `LUMA_TRIDIAGONAL=thomas|cyclic|auto` picks the line solver of `solve_tridiagonal` (see [`LineSolver`]).
 const LINE_SOLVER_ENV: &str = "LUMA_TRIDIAGONAL";
+/// `LUMA_SINGLE_PASS_REDUCE=off|on` overrides [`Tuning::single_pass_reduce`] (`on` only takes
+/// effect on the CUDA and CPU backends, whose atomics and fences order memory across workgroups).
+const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
 
 /// The algorithm of the tridiagonal and block-tridiagonal line solves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,7 +36,7 @@ pub(crate) enum LineSolver {
 }
 
 pub(crate) use luma_core::TuningProfile;
-use luma_core::{DeviceInfo, DeviceLimits, Features};
+use luma_core::{BackendKind, DeviceInfo, DeviceLimits, Features};
 
 /// Kernel parameters of a context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -53,6 +56,11 @@ pub(crate) struct Tuning {
     pub(crate) reduce_per_thread: u32,
     /// Most workgroups of a reduction pass; they stride over arrays larger than that many blocks.
     pub(crate) reduce_max_groups: u32,
+    /// Whether a reduction with more than one workgroup finishes in its first launch: the last
+    /// workgroup to write its partial result combines them all (see `builtin::reduce_main`),
+    /// instead of a second launch doing it. Needs a memory model that orders the partial results
+    /// across workgroups, which WGSL does not give (wgpu, Metal): only the CUDA backend sets it.
+    pub(crate) single_pass_reduce: bool,
     /// Whether reductions combine within subgroups (the device has `Features::SUBGROUP`).
     pub(crate) subgroups: bool,
     /// Whether every subgroup has exactly 32 invocations (the radix sort ranks keys with ballots
@@ -108,6 +116,7 @@ impl Tuning {
         stencil_tile_1d: 512,
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
+        single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
         workgroup_storage: 16384,
@@ -135,6 +144,7 @@ impl Tuning {
         stencil_tile_1d: 2048,
         reduce_per_thread: 8,
         reduce_max_groups: 2048,
+        single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
         workgroup_storage: 16384,
@@ -164,6 +174,7 @@ impl Tuning {
         stencil_tile_1d: 1024,
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
+        single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
         workgroup_storage: 16384,
@@ -219,6 +230,11 @@ impl Tuning {
         tuning.subgroups = info.features.contains(Features::SUBGROUP) && std::env::var(SUBGROUPS_ENV).as_deref() != Ok("off");
         tuning.workgroup_storage = limits.max_workgroup_storage_bytes;
         tuning.subgroup32 = tuning.subgroups && info.subgroup_size == Some((32, 32));
+        tuning.single_pass_reduce = match std::env::var(SINGLE_PASS_ENV).as_deref().map(str::trim) {
+            Ok("off") => false,
+            Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
+            _ => info.backend == BackendKind::Cuda,
+        };
         tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
         tuning.line_solver = match std::env::var(LINE_SOLVER_ENV).as_deref().map(str::trim) {
             Ok("thomas") => LineSolver::Thomas,

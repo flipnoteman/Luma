@@ -56,6 +56,9 @@ struct Inner {
     tuning: Tuning,
     /// What launches, memory traffic and arithmetic cost on this GPU, set once the context exists.
     cost: OnceLock<CostModel>,
+    /// The one-word counter of the reductions that finish in their first launch (see
+    /// [`Tuning::single_pass_reduce`]), zero between launches; made on first use.
+    reduce_counter: OnceLock<Buffer>,
     /// Tells this context from the others of the process (the recordings of a thread are kept by it, see [`record`]).
     id: u64,
     /// How long recent waits took, which sets how long the next one polls before it blocks.
@@ -500,6 +503,17 @@ impl Context {
     /// Opens a device as `options` say, without looking at the environment. Blocks until the
     /// device is ready.
     pub fn with_options(options: ContextOptions) -> Result<Context> {
+        Context::open(options, |_| {})
+    }
+
+    /// [`Context::with_options`] with `tune` changing the kernel parameters of the device (tests
+    /// run kernels the device would not choose).
+    #[cfg(test)]
+    pub(crate) fn with_tuning(options: ContextOptions, tune: impl FnOnce(&mut Tuning)) -> Result<Context> {
+        Context::open(options, tune)
+    }
+
+    fn open(options: ContextOptions, tune: impl FnOnce(&mut Tuning)) -> Result<Context> {
         let backend = open_backend(options.backend, options.device)?;
         let info = backend.info();
         let limits = info.limits;
@@ -533,6 +547,7 @@ impl Context {
             },
         };
         tuning.df_sloppy_add = options.fast_math;
+        tune(&mut tuning);
 
         let ctx = Context {
             inner: Arc::new(Inner {
@@ -542,6 +557,7 @@ impl Context {
                 zero_copy: info.zero_copy,
                 tuning,
                 cost: OnceLock::new(),
+                reduce_counter: OnceLock::new(),
                 builtins: BuildCache::default(),
                 jit: JitState::new(&limits),
                 kernels: BuildCache::default(),
@@ -861,6 +877,20 @@ impl Context {
 
     pub(crate) fn tuning(&self) -> &Tuning {
         &self.inner.tuning
+    }
+
+    /// The counter of the reductions that finish in their first launch: a zeroed word that every
+    /// such launch leaves zero. One serves the context, as its launches run in order.
+    pub(crate) fn reduce_counter(&self) -> Result<&Buffer> {
+        if let Some(counter) = self.inner.reduce_counter.get() {
+            return Ok(counter);
+        }
+        let made = self.alloc_filled(&[0u8; 4])?;
+        if let Err(lost) = self.inner.reduce_counter.set(made) {
+            // Another thread made it first; this one is only recycled.
+            self.recycle(lost);
+        }
+        Ok(self.inner.reduce_counter.get().expect("the counter was set above or by the thread that won"))
     }
 
     /// The features the device was opened with. Custom kernels may use the shader features

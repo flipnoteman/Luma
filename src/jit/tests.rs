@@ -923,6 +923,14 @@ fn launches(d: StatsSnapshot) -> u64 {
     d.elementwise_launches + d.reduce_launches + d.reduce_passes
 }
 
+/// Launches of a reduction of `n` elements: one per pass, a second one over the partial results
+/// of several workgroups unless the first pass finishes the reduction itself (see
+/// `Tuning::single_pass_reduce`).
+fn reduction_launches(ctx: &Context, n: usize) -> u64 {
+    let tuning = ctx.tuning();
+    if tuning.reduce_groups(n as u32) > 1 && !tuning.single_pass_reduce { 2 } else { 1 }
+}
+
 fn sum_squares(xs: &[f32]) -> f64 {
     xs.iter().map(|&v| f64::from(v) * f64::from(v)).sum()
 }
@@ -930,8 +938,10 @@ fn sum_squares(xs: &[f32]) -> f64 {
 #[test]
 fn the_epilogue_of_a_reduction_runs_in_its_last_pass() {
     let ctx = ctx();
-    // Over a workgroup's block (a second pass over the partial results), and within one.
-    for (n, passes) in [(300_001usize, 2u64), (1000, 1)] {
+    // Over a workgroup's block (a second pass over the partial results, or the last workgroup
+    // doing that), and within one.
+    for n in [300_001usize, 1000] {
+        let passes = reduction_launches(&ctx, n);
         let xs = values(n, 60, -1.0, 1.0);
         let x = f32s(&ctx, &xs);
         let want = sum_squares(&xs).sqrt();
@@ -971,6 +981,7 @@ fn the_epilogue_of_a_reduction_runs_in_its_last_pass() {
 fn steps_on_a_reduction_beyond_the_limit_run_as_an_expression() {
     let ctx = ctx();
     let xs = values(4000, 61, 0.5, 1.5);
+    let passes = reduction_launches(&ctx, 4000);
     let x = f32s(&ctx, &xs);
     let sum: f64 = xs.iter().map(|&v| f64::from(v)).sum();
     let before = ctx.jit().stats();
@@ -979,13 +990,13 @@ fn steps_on_a_reduction_beyond_the_limit_run_as_an_expression() {
     let got = f64::from(r.item().unwrap());
     let want = (((sum * 0.5).sqrt() + 1.0) * 2.0).abs().ln();
     assert!((got - want).abs() <= 1e-4 * want, "{got} vs {want}");
-    assert_eq!(launches(delta(before, ctx.jit().stats())), 3);
+    assert_eq!(launches(delta(before, ctx.jit().stats())), passes + 1);
 
     // The scalar on the left, and several reductions with the same steps.
     let [lo, hi] = x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max]).to_array().unwrap();
     let before = ctx.jit().stats();
     let [a, b] = (2.0 - x.reduce([crate::reduce::Reduction::Min, crate::reduce::Reduction::Max])).to_array().unwrap();
-    assert_eq!(launches(delta(before, ctx.jit().stats())), 2);
+    assert_eq!(launches(delta(before, ctx.jit().stats())), passes);
     assert_eq!((a, b), (2.0 - lo, 2.0 - hi));
 }
 
@@ -999,7 +1010,7 @@ fn a_reduction_that_ran_is_not_run_again_by_a_step_on_it() {
     let total = x.sum();
     let before = ctx.jit().stats();
     total.eval().unwrap();
-    assert_eq!(launches(delta(before, ctx.jit().stats())), 2);
+    assert_eq!(launches(delta(before, ctx.jit().stats())), reduction_launches(&ctx, xs.len()));
     let before = ctx.jit().stats();
     let mean = (&total / n).item().unwrap();
     let d = delta(before, ctx.jit().stats());
@@ -1012,7 +1023,8 @@ fn a_reduction_that_ran_is_not_run_again_by_a_step_on_it() {
 #[test]
 fn the_temporaries_of_one_expression_do_not_keep_the_steps_out_of_the_pass() {
     let ctx = ctx();
-    for (n, passes) in [(300_001usize, 2u64), (700, 1)] {
+    for n in [300_001usize, 700] {
+        let passes = reduction_launches(&ctx, n);
         let xs = values(n, 64, -1.0, 1.0);
         let x = f32s(&ctx, &xs);
         let want = (sum_squares(&xs) / n as f64).sqrt();
@@ -1507,10 +1519,14 @@ fn an_eval_loop_of_a_step_too_big_to_recompute_still_runs_as_one_loop() {
 /// fixed source `c`, `alpha(k)` as the diffusion of step `k`, and `c` overwritten before step
 /// `rewrite_at`, and checks every `err` and the final state against a CPU loop.
 fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32, rewrite_at: Option<usize>) {
-    const W: usize = 32;
-    let (u0, c0, c1) = (values(W * W, 80, 0.0, 1.0), values(W * W, 81, 0.0, 1.0), values(W * W, 82, 0.0, 1.0));
-    let mut c = Array::from_slice_on(ctx, &c0, [W, W]).unwrap();
-    let mut u = &Array::from_slice_on(ctx, &u0, [W, W]).unwrap() * 1.0;
+    check_readback_loop_of(ctx, 32, steps, alpha, rewrite_at);
+}
+
+/// [`check_readback_loop`] on a `w`×`w` torus.
+fn check_readback_loop_of(ctx: &Context, w: usize, steps: usize, alpha: impl Fn(usize) -> f32, rewrite_at: Option<usize>) {
+    let (u0, c0, c1) = (values(w * w, 80, 0.0, 1.0), values(w * w, 81, 0.0, 1.0), values(w * w, 82, 0.0, 1.0));
+    let mut c = Array::from_slice_on(ctx, &c0, [w, w]).unwrap();
+    let mut u = &Array::from_slice_on(ctx, &u0, [w, w]).unwrap() * 1.0;
     let (mut cpu, mut source) = (u0, c0);
     for k in 0..steps {
         if rewrite_at == Some(k) {
@@ -1523,12 +1539,12 @@ fn check_readback_loop(ctx: &Context, steps: usize, alpha: impl Fn(usize) -> f32
         let err = (&next - &u).abs().max().item().unwrap();
         u = next;
 
-        let at = |i: usize, j: usize| cpu[i % W * W + j % W];
-        let mut new = vec![0.0f32; W * W];
-        for i in 0..W {
-            for j in 0..W {
-                let lap = at(i + 1, j) + at(i + W - 1, j) + at(i, j + 1) + at(i, j + W - 1) - at(i, j) * 4.0;
-                new[i * W + j] = at(i, j) + lap * a + source[i * W + j] * 0.01;
+        let at = |i: usize, j: usize| cpu[i % w * w + j % w];
+        let mut new = vec![0.0f32; w * w];
+        for i in 0..w {
+            for j in 0..w {
+                let lap = at(i + 1, j) + at(i + w - 1, j) + at(i, j + 1) + at(i, j + w - 1) - at(i, j) * 4.0;
+                new[i * w + j] = at(i, j) + lap * a + source[i * w + j] * 0.01;
             }
         }
         let want = new.iter().zip(&cpu).map(|(n, o)| (n - o).abs()).fold(0.0, f32::max);
@@ -1543,6 +1559,57 @@ fn a_readback_loop_gives_the_same_values_with_speculation() {
     let ctx = ctx();
     check_readback_loop(&ctx, 60, |_| 0.2, None);
     assert!(ctx.jit().speculation_hits() > 0, "no readback was answered ahead of time");
+}
+
+/// A CPU context whose reductions over several workgroups finish in their first launch or not.
+fn single_pass_ctx(single_pass: bool) -> Context {
+    use luma_core::{BackendKind, DeviceKind};
+    let options = ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() }.calibrate(false);
+    let ctx = Context::with_tuning(options, |tuning| tuning.single_pass_reduce = single_pass).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    ctx
+}
+
+#[test]
+fn a_readback_loop_of_single_pass_reductions_gives_the_same_values_with_speculation() {
+    // 64 x 64 elements: several workgroups per reduction.
+    let passes = |ctx: &Context| {
+        assert!(ctx.tuning().reduce_groups(64 * 64) > 1);
+        let before = ctx.jit().stats();
+        check_readback_loop_of(ctx, 64, 60, |_| 0.2, None);
+        assert!(ctx.jit().speculation_hits() > 0, "no readback was answered ahead of time");
+        let d = delta(before, ctx.jit().stats());
+        d.reduce_launches + d.reduce_passes
+    };
+    let (two, one) = (passes(&single_pass_ctx(false)), passes(&single_pass_ctx(true)));
+    assert!(one < two, "{one} launches of reductions with single-pass ones, {two} without");
+}
+
+#[test]
+fn iterate_until_stores_the_step_and_reduces_its_residual_in_one_kernel() {
+    let n = 4096;
+    let (data, source) = (values(n, 90, -1.0, 1.0), values(n, 91, -1.0, 1.0));
+    for single_pass in [false, true] {
+        let ctx = single_pass_ctx(single_pass);
+        let c = f32s(&ctx, &source);
+        let run = |separate: bool, tol: f32| {
+            super::until::SEPARATE_KERNELS.with(|flag| flag.set(separate));
+            let x = f32s(&ctx, &data);
+            let before = ctx.jit().stats();
+            let got = x.iterate_until(300, tol, |u| &(u * 0.9f32) + &c).to_vec().unwrap();
+            super::until::SEPARATE_KERNELS.with(|flag| flag.set(false));
+            (got, delta(before, ctx.jit().stats()))
+        };
+        // A tolerance reached after a few blocks, and one that never is (every step runs).
+        for tol in [1e-4f32, 0.0] {
+            let (fused, fused_stats) = run(false, tol);
+            let (separate, separate_stats) = run(true, tol);
+            assert_eq!(fused, separate, "tol = {tol}, single_pass = {single_pass}");
+            assert_eq!(fused_stats.elementwise_launches, 0, "the body is part of the check kernel");
+            assert_eq!(fused_stats.reduce_launches, separate_stats.reduce_launches);
+            assert!(launches(fused_stats) < launches(separate_stats), "{fused_stats:?} against {separate_stats:?}");
+        }
+    }
 }
 
 #[test]

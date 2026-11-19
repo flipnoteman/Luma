@@ -1187,7 +1187,9 @@ impl Runs {
 /// first (reduce its buffer instead). With one segment and one group per op the partials are
 /// the final values and are written into `target` when it is given; `finish` is applied to them
 /// then, inside the pass (the caller sees that this happened: one segment and one group), and
-/// not otherwise.
+/// not otherwise. With `Tuning::single_pass_reduce` a pass of one segment and several workgroups
+/// finishes the reduction itself (see `ReduceList::single_pass`): the one partial result per op
+/// is then the final value, with `finish` applied, in `target` when it is given.
 pub(crate) fn reduce_first_pass(
     node: &Arc<Node>,
     ops: ReduceList,
@@ -1212,7 +1214,9 @@ pub(crate) fn reduce_first_pass(
 }
 
 /// The first pass of [`reduce_first_pass`] for an already flattened expression of `len` elements,
-/// applying `finish` if the pass is the last.
+/// applying `finish` if the pass is the last. With [`Tuning::single_pass_reduce`], one segment
+/// and more than one group, the pass finishes the reduction itself (see
+/// [`ReduceList::single_pass`]) and the one partial result it returns is the final value.
 pub(super) fn reduce_fused(
     ctx: &crate::context::Context,
     len: usize,
@@ -1228,37 +1232,59 @@ pub(super) fn reduce_fused(
     let layout = layout_elem(&key, &inputs, len);
     let first = Storage::new(ctx, len, ElemLayout::plain(layout as usize));
     let segments = first.segments();
-    // One segment and one group: this pass leaves the final values, so the epilogue goes in it.
-    let last = !finish.epilogue.is_empty() && segments == 1 && ctx.tuning().reduce_groups(len_u32(first.range(0).len())?) == 1;
-    if last {
+    let only_groups = if segments == 1 { Some(ctx.tuning().reduce_groups(len_u32(first.range(0).len())?)) } else { None };
+    // One segment: a pass of one group, or one that finishes itself, leaves the final values, so
+    // the epilogue goes in it.
+    let single_pass = ctx.tuning().single_pass_reduce && only_groups.is_some_and(|groups| groups > 1);
+    let last = !finish.epilogue.is_empty() && only_groups == Some(1);
+    if single_pass {
+        key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue).single_pass());
+    } else if last {
         key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue));
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
 
+    let cell = out_elems(&key).first().copied().unwrap_or(4) * ops.as_slice().len() as u64;
     let mut partials = Vec::with_capacity(segments);
     for j in 0..segments {
         let range = first.range(j);
         let n = len_u32(range.len())?;
         let groups = ctx.tuning().reduce_groups(n);
-        let out_bytes = u64::from(groups) * out_elems(&key).first().copied().unwrap_or(4) * ops.as_slice().len() as u64;
+        let out_bytes = u64::from(groups) * cell;
         let out = match target {
             Some(target) if segments == 1 && groups == 1 => target.clone(),
             _ => scratch.take(out_bytes)?,
         };
+        // The partial results of a pass that finishes itself go to `out`, the final values here.
+        let values = if single_pass {
+            Some(match target {
+                Some(target) => target.clone(),
+                None => scratch.take(cell)?,
+            })
+        } else {
+            None
+        };
         let ids = segment_ids(shifted.as_ref(), j)?;
         let mut params = params(&key, ids, Some(n), range.start, len, None, &scalars)?;
-        if last {
+        if last || single_pass {
             params.to_mut().extend(finish.uniform_words());
         }
         let pins = pin_inputs(&key, &inputs, ids, j, n)?;
-        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 2);
+        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
         raw.push(RawArg::write(&out, out_bytes));
         raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+        if let Some(values) = &values {
+            raw.push(RawArg::write(ctx.reduce_counter()?, 4));
+            raw.push(RawArg::write(values, cell));
+        }
         raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
         ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
         drop(raw);
-        partials.push((out, groups));
+        partials.push(match values {
+            Some(values) => (values, 1),
+            None => (out, groups),
+        });
     }
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
     Ok(partials)
@@ -1266,7 +1292,8 @@ pub(super) fn reduce_fused(
 
 /// [`reduce_fused`] of one segment and one unsplit program that also stores the instructions
 /// `store_outs` in the same kernel, one new buffer each. Returns them, the buffer of partial
-/// results and how many there are.
+/// results and how many there are (with `Tuning::single_pass_reduce` and several workgroups the
+/// pass finishes the reduction itself: one value per op, the final one).
 pub(super) fn reduce_and_store_fused(
     ctx: &crate::context::Context,
     len: usize,
@@ -1287,6 +1314,12 @@ pub(super) fn reduce_and_store_fused(
     if first.segments() != 1 {
         return Err(LumaError::Chunked("a fused store and reduction on an array of several segments").into());
     }
+    let n = len_u32(first.range(0).len())?;
+    let groups = ctx.tuning().reduce_groups(n);
+    let single_pass = ctx.tuning().single_pass_reduce && groups > 1;
+    if single_pass {
+        key.tail = Tail::Reduce(ops.single_pass());
+    }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
     if shifted.is_some() {
         return Err(LumaError::Chunked("a fused store and reduction on shifts over several buffers").into());
@@ -1297,24 +1330,31 @@ pub(super) fn reduce_and_store_fused(
         return Err(LumaError::Chunked("a fused store and reduction on an array of several segments").into());
     }
 
-    let n = len_u32(first.range(0).len())?;
-    let groups = ctx.tuning().reduce_groups(n);
-    let out_bytes = u64::from(groups) * out_elems(&key).first().copied().unwrap_or(4) * ops.as_slice().len() as u64;
+    let cell = out_elems(&key).first().copied().unwrap_or(4) * ops.as_slice().len() as u64;
+    let out_bytes = u64::from(groups) * cell;
     let partial = scratch.take(out_bytes)?;
+    let values = if single_pass { Some(scratch.take(cell)?) } else { None };
     let params = params(&key, None, Some(n), first.range(0).start, len, None, &scalars)?;
     let pins = pin_inputs(&key, &inputs, None, 0, n)?;
     let store_pins = stored.iter().map(|out| out.pin(0).map(|pin| (pin, out.segment_byte_len(0)))).collect::<Result<Vec<_>, _>>()?;
-    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + store_pins.len() + 2);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + store_pins.len() + 4);
     raw.push(RawArg::write(&partial, out_bytes));
     raw.extend(store_pins.iter().map(|(pin, bytes)| RawArg::write(pin.buffer(), *bytes)));
     raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    if let Some(values) = &values {
+        raw.push(RawArg::write(ctx.reduce_counter()?, 4));
+        raw.push(RawArg::write(values, cell));
+    }
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
     ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
     drop(raw);
     let stats = &ctx.jit().stats;
     stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
     stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
-    Ok((stored, partial, groups))
+    Ok(match values {
+        Some(values) => (stored, values, 1),
+        None => (stored, partial, groups),
+    })
 }
 
 /// The finite check (see `ContextOptions::check_finite`): fails with [`LumaError::NonFinite`] if

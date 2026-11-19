@@ -410,7 +410,9 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
 }
 
 /// Runs passes over `current` (`n` elements, or `n` per op once `per_op`) until one element per
-/// op is left, and returns the buffer holding them. The last pass applies `finish`.
+/// op is left, and returns the buffer holding them. The last pass applies `finish`. A first pass
+/// over more than one workgroup's share is one launch that also finishes the reduction with
+/// [`Tuning::single_pass_reduce`] (see [`ReduceList::single_pass`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_passes(
     ctx: &Context,
@@ -428,13 +430,16 @@ pub(crate) fn finish_passes(
     while !per_op || n > 1 {
         let groups = ctx.tuning().reduce_groups(n);
         let list = if per_op { ops.rest() } else { ops };
-        // The pass with one group is the last: its output is the final value.
-        let last = groups == 1;
+        // The pass with one group is the last: its output is the final value; so is that of a
+        // first pass that finishes the reduction itself.
+        let single_pass = !per_op && groups > 1 && ctx.tuning().single_pass_reduce;
+        let last = groups == 1 || single_pass;
         let list = if last { list.with_epilogue(finish.epilogue) } else { list };
+        let list = if single_pass { list.single_pass() } else { list };
         let in_bytes = u64::from(n) * elem * if per_op { count } else { 1 };
         // The last pass leaves one element per op: into `target` if there is one.
         let out = match target {
-            Some(target) if last => target.clone(),
+            Some(target) if groups == 1 => target.clone(),
             _ => scratch.take(u64::from(groups) * elem * count)?,
         };
         let core = ctx.builtin(Builtin::Reduce(list, per_op), wgsl)?;
@@ -450,6 +455,26 @@ pub(crate) fn finish_passes(
             }
         }
         ctx.jit().note_reduce_pass();
+        if single_pass {
+            // The partial results go to `out`, the final values to `target` or a buffer of their own.
+            let values = match target {
+                Some(target) => target.clone(),
+                None => scratch.take(elem * count)?,
+            };
+            ctx.launch(
+                &core,
+                fold_workgroups(ctx, groups)?,
+                [n, 1, 1],
+                &[
+                    RawArg::write(&out, u64::from(groups) * elem * count),
+                    RawArg::read(&current, in_bytes),
+                    RawArg::write(ctx.reduce_counter()?, 4),
+                    RawArg::write(&values, elem * count),
+                    RawArg::Uniform(bytemuck::cast_slice(&words[..used])),
+                ],
+            )?;
+            return Ok(values);
+        }
         ctx.launch(
             &core,
             fold_workgroups(ctx, groups)?,
@@ -607,3 +632,202 @@ macro_rules! vector_reductions {
 
 vector_reductions!(2, "vec2<f32>");
 vector_reductions!(4, "vec4<f32>");
+
+#[cfg(test)]
+mod tests {
+    //! Reductions that finish in their first launch (see `ReduceList::single_pass`) against the
+    //! two-launch ones, on the CPU backend, whose atomics order memory across workgroups (the
+    //! flag is on by default only for CUDA).
+
+    use luma_core::{BackendKind, DeviceKind};
+
+    use super::*;
+    use crate::context::ContextOptions;
+    use crate::gpu_type::Df32;
+
+    /// A CPU context whose reductions finish in their first launch or not.
+    fn cpu(single_pass: bool) -> Context {
+        let options = ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() }.calibrate(false);
+        Context::with_tuning(options, |tuning| tuning.single_pass_reduce = single_pass).unwrap()
+    }
+
+    /// One workgroup, a few, the cap of workgroups with and without a strided second round.
+    const LENGTHS: [usize; 6] = [1, 2047, 2048, 2049, 1 << 20, (1 << 21) + 17];
+
+    fn words(n: usize, seed: u64) -> Vec<u32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 32) as u32
+            })
+            .collect()
+    }
+
+    fn floats(n: usize, seed: u64) -> Vec<f32> {
+        words(n, seed).into_iter().map(|w| (w >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0).collect()
+    }
+
+    /// Reductions of `data` of every kind, the whole set twice in a row (the counter must be zero
+    /// again after a launch), as bits.
+    fn float_reductions(ctx: &Context, data: &[f32]) -> Vec<u32> {
+        let x = Array::from_slice_on(ctx, data, data.len()).unwrap();
+        let lazy = || &x * 2.0f32 + 1.0f32;
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let mut keep = |value: f32| out.push(value.to_bits());
+            keep(x.sum().item().unwrap());
+            keep(x.min().item().unwrap());
+            keep(x.max().item().unwrap());
+            keep(x.norm().item().unwrap());
+            keep(x.mean().item().unwrap());
+            let all = x.reduce([Reduction::Sum, Reduction::Min, Reduction::Max, Reduction::SumOfSquares]).to_array::<4>().unwrap();
+            all.into_iter().for_each(&mut keep);
+            keep(lazy().sum().item().unwrap());
+            keep(lazy().max().item().unwrap());
+            keep(lazy().norm().item().unwrap());
+            keep(lazy().mean().item().unwrap());
+            // Launches recorded one after the other before anything is read.
+            let (sum, max) = (x.sum(), lazy().max());
+            keep((&sum + &max).item().unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn float_reductions_match_the_two_launch_ones_bit_for_bit() {
+        let (two, one) = (cpu(false), cpu(true));
+        for (k, &n) in LENGTHS.iter().enumerate() {
+            let data = floats(n, k as u64 + 1);
+            let (want, got) = (float_reductions(&two, &data), float_reductions(&one, &data));
+            assert_eq!(got, want, "n = {n}");
+            // Twice in a row: the second round saw a counter that was reset.
+            let (first, second) = got.split_at(got.len() / 2);
+            assert_eq!(first, second, "n = {n}, second round");
+
+            let as_f64: Vec<f64> = data.iter().map(|&v| f64::from(v)).collect();
+            let (sum, abs): (f64, f64) = (as_f64.iter().sum(), as_f64.iter().map(|v| v.abs()).sum());
+            let squares: f64 = as_f64.iter().map(|v| v * v).sum();
+            let value = |at: usize| f64::from(f32::from_bits(got[at]));
+            let tolerance = 1e-4 * abs + 1e-6;
+            assert!((value(0) - sum).abs() <= tolerance, "n = {n}: sum {} vs {sum}", value(0));
+            assert_eq!(value(1), as_f64.iter().copied().fold(f64::INFINITY, f64::min), "n = {n}: min");
+            assert_eq!(value(2), as_f64.iter().copied().fold(f64::NEG_INFINITY, f64::max), "n = {n}: max");
+            assert!((value(3) - squares.sqrt()).abs() <= 1e-4 * squares.sqrt() + 1e-6, "n = {n}: norm {} vs {}", value(3), squares.sqrt());
+            assert!((value(4) - sum / n as f64).abs() <= tolerance / n as f64 + 1e-6, "n = {n}: mean");
+            assert!((value(9) - (2.0 * sum + n as f64)).abs() <= 2.0 * tolerance + 1e-3, "n = {n}: lazy sum {} vs {}", value(9), 2.0 * sum + n as f64);
+        }
+    }
+
+    #[test]
+    fn integer_reductions_match_the_two_launch_ones() {
+        let (two, one) = (cpu(false), cpu(true));
+        for (k, &n) in LENGTHS.iter().enumerate() {
+            let data = words(n, k as u64 + 11);
+            let signed: Vec<i32> = data.iter().map(|&w| w as i32).collect();
+            for ctx in [&two, &one] {
+                for _ in 0..2 {
+                    let x = Array::from_slice_on(ctx, &data, n).unwrap();
+                    assert_eq!(x.sum().item().unwrap(), data.iter().fold(0u32, |acc, &w| acc.wrapping_add(w)), "u32 sum, n = {n}");
+                    assert_eq!(x.min().item().unwrap(), data.iter().copied().min().unwrap(), "u32 min, n = {n}");
+                    assert_eq!(x.max().item().unwrap(), data.iter().copied().max().unwrap(), "u32 max, n = {n}");
+                    let lazy = &x + 1u32;
+                    assert_eq!(lazy.max().item().unwrap(), data.iter().map(|w| w.wrapping_add(1)).max().unwrap(), "u32 lazy max, n = {n}");
+                    let y = Array::from_slice_on(ctx, &signed, n).unwrap();
+                    assert_eq!(y.sum().item().unwrap(), signed.iter().fold(0i32, |acc, &w| acc.wrapping_add(w)), "i32 sum, n = {n}");
+                    assert_eq!(y.min().item().unwrap(), signed.iter().copied().min().unwrap(), "i32 min, n = {n}");
+                    assert_eq!(y.max().item().unwrap(), signed.iter().copied().max().unwrap(), "i32 max, n = {n}");
+                    let [lo, hi] = y.reduce([Reduction::Min, Reduction::Max]).to_array::<2>().unwrap();
+                    assert_eq!((lo, hi), (signed.iter().copied().min().unwrap(), signed.iter().copied().max().unwrap()), "i32 min and max, n = {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn double_float_reductions_match_the_two_launch_ones() {
+        let (two, one) = (cpu(false), cpu(true));
+        for (k, &n) in LENGTHS.iter().take(5).enumerate() {
+            let data: Vec<Df32> = floats(n, k as u64 + 21).into_iter().map(|v| Df32 { hi: v, lo: v * 1e-8 }).collect();
+            let run = |ctx: &Context| {
+                let x = Array::from_slice_on(ctx, &data, n).unwrap();
+                let mut out = Vec::new();
+                for _ in 0..2 {
+                    out.push(x.sum().item().unwrap());
+                    out.push(x.min().item().unwrap());
+                    out.push(x.max().item().unwrap());
+                    out.push(x.minimum(Df32::from(0.5)).sum().item().unwrap());
+                }
+                out.into_iter().flat_map(|d| [d.hi.to_bits(), d.lo.to_bits()]).collect::<Vec<u32>>()
+            };
+            let (want, got) = (run(&two), run(&one));
+            assert_eq!(got, want, "n = {n}");
+            let lowest = data.iter().map(|d| d.hi).fold(f32::INFINITY, f32::min);
+            assert_eq!(f32::from_bits(got[2]), lowest, "n = {n}: min");
+        }
+    }
+
+    #[test]
+    fn vector_reductions_match_the_two_launch_ones() {
+        let (two, one) = (cpu(false), cpu(true));
+        let n = 1 << 20;
+        let data: Vec<[f32; 2]> = floats(2 * n, 31).chunks(2).map(|c| [c[0], c[1]]).collect();
+        let run = |ctx: &Context| {
+            let x = Array::from_slice_on(ctx, &data, n).unwrap();
+            let [sum, lo, hi] = x.reduce([Reduction::Sum, Reduction::Min, Reduction::Max]).unwrap();
+            [sum, lo, hi].into_iter().flatten().map(f32::to_bits).collect::<Vec<u32>>()
+        };
+        assert_eq!(run(&one), run(&two));
+    }
+
+    #[test]
+    fn a_reduction_over_many_workgroups_is_one_launch_with_the_flag() {
+        // (flag, launches of a reduction over several workgroups); one workgroup is one launch.
+        for (single_pass, many) in [(false, 2), (true, 1)] {
+            let ctx = cpu(single_pass);
+            let launches = |run: &dyn Fn()| {
+                let before = ctx.jit().stats();
+                run();
+                let after = ctx.jit().stats();
+                (after.reduce_launches - before.reduce_launches) + (after.reduce_passes - before.reduce_passes)
+            };
+            let big = Array::<u32>::from_slice_on(&ctx, &vec![1u32; 1 << 20], 1 << 20).unwrap();
+            let small = Array::<u32>::from_slice_on(&ctx, &vec![1u32; 1000], 1000).unwrap();
+            assert_eq!(launches(&|| assert_eq!(big.sum().item().unwrap(), 1 << 20)), many, "evaluated buffer, single_pass = {single_pass}");
+            assert_eq!(launches(&|| assert_eq!(small.sum().item().unwrap(), 1000)), 1, "one workgroup, single_pass = {single_pass}");
+            let floats = Array::<f32>::from_slice_on(&ctx, &vec![0.5f32; 1 << 20], 1 << 20).unwrap();
+            assert_eq!(launches(&|| assert_eq!((&floats * 2.0f32).sum().item().unwrap(), (1 << 20) as f32)), many, "lazy expression, single_pass = {single_pass}");
+        }
+    }
+
+    /// The gate loop of `iterate_until` folds the residual in the check kernel (one launch per
+    /// step); with the dispatch arguments zeroed after convergence the steps left in a block run
+    /// no workgroup, so no ticket is taken and the counter stays zero for the next run.
+    #[test]
+    fn iterate_until_stops_at_the_same_step_with_single_pass_residuals() {
+        let (two, one) = (cpu(false), cpu(true));
+        for n in [4096usize, 1 << 16] {
+            let data = floats(n, 41);
+            for (max_steps, tol) in [(300usize, 1e-3f32), (300, 1e-6), (300, 1e-16), (20, 0.0)] {
+                // Halving is exact: the state after `k` steps is `data * 0.5^k`, and the change of
+                // step `k` is its largest element's half.
+                let mut host = data.clone();
+                for _ in 0..max_steps {
+                    let change = host.iter().map(|&v| (v - v * 0.5).abs()).fold(0.0f32, f32::max);
+                    host.iter_mut().for_each(|v| *v *= 0.5);
+                    if change <= tol {
+                        break;
+                    }
+                }
+                for ctx in [&two, &one] {
+                    // Twice: the second run starts from the counter the first left.
+                    for _ in 0..2 {
+                        let x = Array::from_slice_on(ctx, &data, n).unwrap();
+                        let got = x.iterate_until(max_steps, tol, |u| u * 0.5f32).to_vec().unwrap();
+                        assert_eq!(got, host, "n = {n}, tol = {tol}, single_pass = {}", ctx.tuning().single_pass_reduce);
+                    }
+                }
+            }
+        }
+    }
+}
