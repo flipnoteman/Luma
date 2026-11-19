@@ -181,7 +181,9 @@ assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec()?, vec![3.0, 3.0, 4.0, 4.0, 5.
 elementwise expression of its two arguments and scalars (scalars it captures are uniforms:
 changing them does not recompile); anything else poisons the result. Non-associative operators
 give unspecified results, because the kernels regroup operands. Scans do not fuse into the
-expression behind them: the array is evaluated first (it is read twice). Scans and axis
+expression behind them: the array is evaluated first (it is read twice; on CUDA the scans of
+integers and `min` / `max` of long contiguous lines read it once, with the same results:
+[`LUMA_LOOKBACK_SCAN`](environment.md)). Scans and axis
 reductions are available for `f32`, `u32` and `i32` arrays (`f64` and `Df32` fail with
 `Unsupported`); `bool` arrays have `sum_axis` and `cumsum` that count (`u32` results) and
 `min_axis` / `max_axis`, but no `scan` or `reduce_axis`.

@@ -144,7 +144,7 @@ becomes the load of that kernel.
 | `sort`, `argsort`, `sort_axis` and what builds on them (`quantile`, `median`, `factorize`, `unique`) | the key expression, in the first pass of the radix sort | eager: the sorted array is evaluated; `factorize` and `unique` also read the number of distinct values back, one host wait |
 
 An operand that reads circular `shift`s of other expressions, or lives in several buffers, is
-evaluated first instead. `scan` and `cumsum` always evaluate their operand (they read it twice).
+evaluated first instead. `scan` and `cumsum` always evaluate their operand (they read it twice; on CUDA integer and `min` / `max` scans of long contiguous lines read it once).
 Because these results are evaluated at the call, a loop that calls them every step builds one
 kernel per call rather than one fused chain: count launches with `ctx.profile(..)`. Usage is in
 [Matrices, statistics and grouping](data.md): [`matmul`](data.md#matrix-products), [axis statistics](data.md#statistics-along-an-axis), [scatters](data.md#accumulating-scatters), [sorting](data.md#sorting).

@@ -22,6 +22,10 @@ const LINE_SOLVER_ENV: &str = "LUMA_TRIDIAGONAL";
 /// `LUMA_SINGLE_PASS_REDUCE=off|on` overrides [`Tuning::single_pass_reduce`] (`on` only takes
 /// effect on the CUDA and CPU backends, whose atomics and fences order memory across workgroups).
 const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
+/// `LUMA_LOOKBACK_SCAN=off|on` overrides [`Tuning::lookback_scan`] (`on` only takes effect on the
+/// CUDA and CPU backends, for the same reason as `LUMA_SINGLE_PASS_REDUCE`; floating-point sums
+/// keep two passes either way, to stay reproducible).
+const LOOKBACK_ENV: &str = "LUMA_LOOKBACK_SCAN";
 
 /// The algorithm of the tridiagonal and block-tridiagonal line solves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -102,6 +106,16 @@ pub(crate) struct Tuning {
     pub(crate) line_strided_from: u32,
     /// Which tridiagonal solver runs; `LUMA_TRIDIAGONAL` overrides.
     pub(crate) line_solver: LineSolver,
+    /// Whether a scan of long contiguous lines is one kernel that reads its input once, with a
+    /// decoupled look-back (each workgroup takes a chunk from an atomic counter, publishes the
+    /// chunk's aggregate and waits for the prefix of the chunks before it, see
+    /// `scan::Pass::ChunkLookback`), instead of chunk totals, a scan of the totals and a seeded
+    /// second pass. Only for scans whose result does not depend on how the look-back groups the
+    /// chunks before one (integers, `min`, `max`): the floating-point sums keep the two passes,
+    /// so that scans are reproducible. Needs forward progress and memory ordering across
+    /// workgroups, which WGSL does not give (wgpu, Metal): only the CUDA backend sets it.
+    /// `LUMA_LOOKBACK_SCAN` overrides.
+    pub(crate) lookback_scan: bool,
 }
 
 impl Tuning {
@@ -132,6 +146,7 @@ impl Tuning {
         // 32-wide SIMD groups, like NVIDIA warps: see `builtin::thomas_plan`.
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        lookback_scan: false,
     };
 
     const NVIDIA: Tuning = Tuning {
@@ -162,6 +177,7 @@ impl Tuning {
         // RTX 3090, see `builtin::thomas_plan`.
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        lookback_scan: false,
     };
 
     const GENERIC: Tuning = Tuning {
@@ -189,6 +205,7 @@ impl Tuning {
         line_cyclic_work: 0,
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        lookback_scan: false,
     };
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
@@ -231,6 +248,11 @@ impl Tuning {
         tuning.workgroup_storage = limits.max_workgroup_storage_bytes;
         tuning.subgroup32 = tuning.subgroups && info.subgroup_size == Some((32, 32));
         tuning.single_pass_reduce = match std::env::var(SINGLE_PASS_ENV).as_deref().map(str::trim) {
+            Ok("off") => false,
+            Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
+            _ => info.backend == BackendKind::Cuda,
+        };
+        tuning.lookback_scan = match std::env::var(LOOKBACK_ENV).as_deref().map(str::trim) {
             Ok("off") => false,
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
             _ => info.backend == BackendKind::Cuda,

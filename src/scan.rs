@@ -8,7 +8,11 @@
 //! - *Contiguous lines* (`stride == 1`): a workgroup owns a chunk of the line. It loads the chunk
 //!   cooperatively (coalesced) into workgroup memory, every invocation folds its own run of
 //!   [`PER_THREAD`] cells, the partial results are scanned in workgroup memory with a
-//!   Hillis-Steele ladder and every invocation rescans its run seeded with its prefix.
+//!   Hillis-Steele ladder and every invocation rescans its run seeded with its prefix. Where
+//!   the device orders memory across workgroups (`Tuning::lookback_scan`), a line of several
+//!   chunks is one kernel that reads the input once instead of twice when the result does not
+//!   depend on how the operands are grouped (integers, `min`, `max`): the chunks wait for each
+//!   other's prefix (decoupled look-back, see [`Pass::ChunkLookback`]).
 //! - *Strided lines*: invocations are numbered `block * lines + line`, so neighbours read
 //!   neighbouring cells of the same row; each walks one block of the line sequentially.
 
@@ -19,13 +23,13 @@ use std::sync::Arc;
 use luma_core::Buffer;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{BinOp, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};
+use crate::builtin::{BinOp, Builtin, ReduceElem, ReduceList, ReduceOp, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, Numeric, ScalarType};
 use crate::jit::{self, operator_source, ElemTy, Node, Operator};
 use crate::kernel::KernelCore;
-use crate::ops::{fold_workgroups, Outcome, Rhs};
+use crate::ops::{fold_workgroups, launch_1d, Outcome, Rhs};
 use crate::reduce::Reduction;
 use crate::shape::Shape;
 
@@ -41,6 +45,17 @@ pub(crate) const WORKGROUP: u32 = 128;
 const PER_THREAD: u32 = 8;
 /// Cells of a contiguous line one workgroup scans.
 const SCAN_CHUNK: u32 = WORKGROUP * PER_THREAD;
+/// Contiguous cells every invocation of a [`Pass::ChunkLookback`] chunk folds. A look-back walks
+/// over the chunks that started while it waited and have no inclusive prefix yet, a window of
+/// [`WORKGROUP`] chunks at a time, and takes longer the more of them there are. At the bandwidth
+/// of an RTX 3090 chunks of 1024 cells go by at 100 per microsecond, more than a window per
+/// microsecond; chunks of 4096 cells (16 KiB of workgroup memory, 18 KiB with the rest of the
+/// kernel) go by four times slower, which a window covers. Chosen, not measured. The loads of
+/// such a chunk are unrolled so that an invocation has all of them in flight (see
+/// [`chunk_source`]).
+const LOOKBACK_PER_THREAD: u32 = 32;
+/// Cells of a contiguous line one workgroup of [`Pass::ChunkLookback`] scans.
+const LOOKBACK_CHUNK: u32 = WORKGROUP * LOOKBACK_PER_THREAD;
 /// Cells of a contiguous line one workgroup reduces (its invocations stride over them).
 pub(crate) const REDUCE_CHUNK: u32 = 16384;
 /// Contiguous lines up to this many cells are handled a group of lines per workgroup. One
@@ -80,6 +95,18 @@ pub(crate) enum Pass {
     /// Contiguous lines, same workgroups: the scan of the chunk, seeded (when the line has
     /// several chunks) with the scan of the totals of the chunks before it.
     ChunkScan { seeded: bool },
+    /// Contiguous lines of more than [`LOOKBACK_CHUNK`] cells, one workgroup per chunk of that
+    /// size, the scan of the whole line in one kernel that reads the input once (decoupled
+    /// look-back, Merrill & Garland 2016). A workgroup takes its chunk from an atomic counter, so
+    /// the chunks it waits for have all started (forward progress needs no particular scheduling
+    /// order); it scans its chunk in workgroup memory, publishes the chunk's aggregate, looks
+    /// back over the chunks before it until one has published its inclusive prefix, publishes
+    /// its own and writes the scan of the chunk seeded with the prefix before it. The status of
+    /// the chunks lives in the buffer that [`chunk_source`] describes, which must be zero when
+    /// the kernel starts; `k` is the number of chunks it reads the status of at a time. Only for
+    /// scans whose result does not depend on the grouping of the operands ([`Lines::grouping_free`]):
+    /// the prefix of a chunk is the fold of the chunks the look-back found, not of a fixed set.
+    ChunkLookback,
     /// Contiguous lines, same workgroups: the fold of the chunk with the invocations striding
     /// over it, so the operator must be commutative as well as associative.
     ChunkReduce,
@@ -95,13 +122,14 @@ impl Pass {
             Pass::Walk => "ScanWalk",
             Pass::ChunkFold => "ScanChunkFold",
             Pass::ChunkScan { .. } => "ScanChunk",
+            Pass::ChunkLookback => "ScanLookback",
             Pass::ChunkReduce => "ReduceChunk",
         }
     }
 
     /// Whether the pass runs one workgroup (instead of one invocation) per unit of work.
     fn per_workgroup(self) -> bool {
-        matches!(self, Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkReduce)
+        matches!(self, Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce)
     }
 
     fn seeded(self) -> bool {
@@ -337,7 +365,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
             }
             src.push_str("    }\n}\n");
         }
-        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } => unreachable!("scans are not reductions"),
+        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback => unreachable!("scans are not reductions"),
     }
     src
 }
@@ -352,6 +380,9 @@ fn source(pass: Pass, ty: &str, op: &Operator, workgroup: u32) -> String {
     let _ = writeln!(src, "@group(1) @binding(1) var<storage, read> a: array<{ty}>;");
     let uniform = if pass.seeded() {
         let _ = writeln!(src, "@group(1) @binding(2) var<storage, read> pre: array<{ty}>;");
+        3
+    } else if pass == Pass::ChunkLookback {
+        let _ = writeln!(src, "@group(1) @binding(2) var<storage, read_write> st: array<atomic<u32>>;");
         3
     } else {
         2
@@ -415,7 +446,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "
         }
-        Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkReduce => unreachable!("workgroup passes return above"),
+        Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce => unreachable!("workgroup passes return above"),
     };
     src.push_str(&main.replace("__T__", ty));
     src
@@ -423,6 +454,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 
 /// The entry point of the passes that run a workgroup per chunk of a contiguous line. `acc` and
 /// `run` of invocations past the end of a short chunk are never read by invocations before them.
+///
+/// [`Pass::ChunkLookback`] binds `st: array<atomic<u32>>` of `1 + 3 * lines * nb` words, whose
+/// first `1 + lines * nb` are zero when the kernel starts (see [`Lines::lookback`]): word 0 counts
+/// the chunks taken so far (the ticket of a chunk is `line * nb + chunk`, so the chunks before it
+/// in its line have smaller tickets), word `1 + ticket` is the status of the chunk (0: nothing
+/// yet, 1: its aggregate is published, 2: its inclusive prefix is), and the aggregate and the
+/// inclusive prefix themselves (the bits of the element) are words `1 + lines * nb + ticket` and
+/// `1 + 2 * lines * nb + ticket`. A value is stored, fenced (`storageBarrier`) and only then the
+/// status; a reader loads the status, fences and only then the value.
 fn chunk_source(pass: Pass, ty: &str) -> String {
     let w = WORKGROUP;
     let mut src = String::new();
@@ -470,17 +510,41 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
         ));
         return src;
     }
-    let k = PER_THREAD;
-    let tile = SCAN_CHUNK + SCAN_CHUNK / 32 + 1;
+    let lookback = pass == Pass::ChunkLookback;
+    let (k, chunk) = if lookback { (LOOKBACK_PER_THREAD, LOOKBACK_CHUNK) } else { (PER_THREAD, SCAN_CHUNK) };
+    let tile = chunk + chunk / 32 + 1;
     let _ = writeln!(src, "var<workgroup> tile: array<{ty}, {tile}>;");
     let _ = writeln!(src, "var<workgroup> part: array<{ty}, {w}>;");
     src.push_str("fn ix(j: u32) -> u32 { return j + (j >> 5u); }\n");
-    src.push_str(head);
+    if lookback {
+        src.push_str(&lookback_declarations(ty));
+        src.push_str(
+            "@compute @workgroup_size(__W__)
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let total = p.lines * p.nb;
+    if (wg.x + wg.y * nwg.x >= total) { return; }
+    if (t == 0u) { ticket = atomicAdd(&st[0], 1u); }
+    let wid = workgroupUniformLoad(&ticket);
+    let l = wid / p.nb;
+    let c = wid - l * p.nb;
+    let base = line_base(l);
+",
+        );
+    } else {
+        src.push_str(head);
+    }
+    let _ = write!(src, "    let s0 = c * {chunk}u;\n    let len = min(p.n - s0, {chunk}u);\n");
+    if lookback {
+        // The loads of an invocation do not depend on one another: all of them are issued before
+        // the first is waited for.
+        for i in 0..k {
+            let _ = writeln!(src, "    {{ let j = {}u + t; if (j < len) {{ tile[ix(j)] = a[base + s0 + j]; }} }}", i * w);
+        }
+    } else {
+        let _ = writeln!(src, "    for (var j = t; j < len; j += {w}u) {{ tile[ix(j)] = a[base + s0 + j]; }}");
+    }
     src.push_str(&format!(
-        "    let s0 = c * {SCAN_CHUNK}u;
-    let len = min(p.n - s0, {SCAN_CHUNK}u);
-    for (var j = t; j < len; j += {w}u) {{ tile[ix(j)] = a[base + s0 + j]; }}
-    workgroupBarrier();
+        "    workgroupBarrier();
     let lo = t * {k}u;
     let hi = min(len, lo + {k}u);
     var acc: {ty};
@@ -512,7 +576,13 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
         part[t] = v;
     }}
     workgroupBarrier();
-    var run: {ty};
+"
+        ));
+        if lookback {
+            src.push_str(&lookback_block(ty));
+        }
+        src.push_str(&format!(
+            "    var run: {ty};
     var have = false;
     if (t > 0u) {{ run = part[t - 1u]; have = true; }}
 "
@@ -522,6 +592,15 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
                 "    if (c > 0u) {
         let seed = pre[wid - 1u];
         if (have) { run = op(seed, run); } else { run = seed; }
+        have = true;
+    }
+",
+            );
+        }
+        if lookback {
+            src.push_str(
+                "    if (c > 0u) {
+        if (have) { run = op(excl, run); } else { run = excl; }
         have = true;
     }
 ",
@@ -540,6 +619,97 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
         ));
     }
     src.replace("__W__", &w.to_string())
+}
+
+/// The workgroup variables and helpers of the look-back kernel: the status words hold the bits of
+/// an element, whatever its type.
+fn lookback_declarations(ty: &str) -> String {
+    let (to_bits, from_bits) = if ty == "u32" { ("v".to_owned(), "u".to_owned()) } else { ("bitcast<u32>(v)".to_owned(), format!("bitcast<{ty}>(u)")) };
+    let w = WORKGROUP;
+    format!(
+        "var<workgroup> lb_v: array<{ty}, {w}>;
+var<workgroup> lb_s: array<u32, {w}>;
+var<workgroup> ticket: u32;
+fn lb_bits(v: {ty}) -> u32 {{ return {to_bits}; }}
+fn lb_value(u: u32) -> {ty} {{ return {from_bits}; }}
+"
+    )
+}
+
+/// What a chunk of [`Pass::ChunkLookback`] does between the scan of its chunk in workgroup memory
+/// (`part[t]` is the inclusive scan of the runs of invocations up to `t`) and writing the result:
+/// publish the aggregate of the chunk, find the exclusive prefix `excl` of the chunk, publish the
+/// inclusive prefix.
+///
+/// The first chunk of a line publishes its aggregate as its inclusive prefix and has no `excl`.
+/// Any other chunk looks back over a window of `p.k` chunks (at most `WORKGROUP`) before it at a
+/// time, an invocation per chunk, nearest chunk last. Every invocation makes a leaf of the status it read
+/// (`lb_s`: bit 0 an inclusive prefix, bit 1 not ready, bit 2 no chunk) and the value (the
+/// inclusive prefix or the aggregate), and the workgroup folds the leaves in order, oldest first:
+/// a range that holds an inclusive prefix is the part of the window from its nearest one (what
+/// came before is in that prefix), a range with a chunk that is not ready (nearer than the
+/// nearest inclusive prefix) cannot be used yet, and the window is read again. Without an
+/// inclusive prefix in the window, the fold of the aggregates is kept (`carry`) and the window
+/// moves back. The first chunk of the line always has an inclusive prefix, so the walk ends.
+/// Every decision is uniform (read with `workgroupUniformLoad`), so the barriers are too.
+fn lookback_block(ty: &str) -> String {
+    const BLOCK: &str = "    let agg = part[(len + __K__u - 1u) / __K__u - 1u];
+    var excl: __T__;
+    if (c == 0u) {
+        if (t == 0u) { atomicStore(&st[2u * total + 1u + wid], lb_bits(agg)); }
+        storageBarrier();
+        if (t == 0u) { atomicStore(&st[1u + wid], 2u); }
+    } else {
+        if (t == 0u) { atomicStore(&st[total + 1u + wid], lb_bits(agg)); }
+        storageBarrier();
+        if (t == 0u) { atomicStore(&st[1u + wid], 1u); }
+        var back = 0u;
+        var carry: __T__;
+        loop {
+            let off = __W__u - 1u - t;
+            let dist = back + off;
+            var f = 3u;
+            if (off < p.k && dist < c) { f = atomicLoad(&st[wid - dist]); }
+            storageBarrier();
+            var s = 4u;
+            var v: __T__;
+            if (f == 0u) { s = 2u; }
+            if (f == 1u) { s = 0u; v = lb_value(atomicLoad(&st[total + wid - dist])); }
+            if (f == 2u) { s = 1u; v = lb_value(atomicLoad(&st[2u * total + wid - dist])); }
+            lb_s[t] = s;
+            lb_v[t] = v;
+            for (var d = 1u; d < __W__u; d <<= 1u) {
+                workgroupBarrier();
+                if (t % (2u * d) == 0u && t + d < __W__u) {
+                    let o = lb_s[t];
+                    let n = lb_s[t + d];
+                    if ((n & 4u) == 0u) {
+                        if ((o & 4u) != 0u || (n & 1u) != 0u) {
+                            lb_s[t] = n;
+                            lb_v[t] = lb_v[t + d];
+                        } else {
+                            lb_s[t] = o | (n & 2u);
+                            lb_v[t] = op(lb_v[t], lb_v[t + d]);
+                        }
+                    }
+                }
+            }
+            let state = workgroupUniformLoad(&lb_s[0]);
+            if ((state & 2u) == 0u) {
+                var got = lb_v[0];
+                if (back > 0u) { got = op(got, carry); }
+                if ((state & 1u) != 0u) { excl = got; break; }
+                carry = got;
+                back += p.k;
+            }
+        }
+        let incl = op(excl, agg);
+        if (t == 0u) { atomicStore(&st[2u * total + 1u + wid], lb_bits(incl)); }
+        storageBarrier();
+        if (t == 0u) { atomicStore(&st[1u + wid], 2u); }
+    }
+";
+    BLOCK.replace("__K__", &LOOKBACK_PER_THREAD.to_string()).replace("__W__", &WORKGROUP.to_string()).replace("__T__", ty)
 }
 
 /// The kernels of one operator and what they run on.
@@ -596,6 +766,17 @@ fn rows_width(n: u32) -> u32 {
 /// an odd length, so the invocations read different banks).
 fn rows_per_group(n: u32) -> u32 {
     (ROWS_TILE / (n | 1)).min(rows_width(n))
+}
+
+/// Chunks a workgroup of [`Pass::ChunkLookback`] reads the status of at a time, one per
+/// invocation. Tests narrow it: on a GPU hundreds of chunks are in flight and most look-backs walk
+/// several windows, which a CPU running a few workgroups at a time hardly ever does.
+fn lookback_window() -> u32 {
+    #[cfg(test)]
+    if let Some(window) = tests::WINDOW.get() {
+        return window;
+    }
+    WORKGROUP
 }
 
 /// The operator `+` on `u32`, for [`Lines::words`].
@@ -661,11 +842,38 @@ impl<'a> Lines<'a> {
         words.extend_from_slice(&self.op.scalars);
         let mut args = vec![RawArg::write(out.buffer, out.bytes), RawArg::read(input.buffer, input.bytes)];
         if let Some(pre) = pre {
-            args.push(RawArg::read(pre.buffer, pre.bytes));
+            // The statuses of a look-back are written by the chunks that wait for each other.
+            args.push(if pass == Pass::ChunkLookback { RawArg::write(pre.buffer, pre.bytes) } else { RawArg::read(pre.buffer, pre.bytes) });
         }
         args.push(RawArg::Uniform(bytemuck::cast_slice(&words)));
         let (workgroups, size) = self.grid(pass, geometry)?;
         self.ctx.launch(&core, workgroups, size, &args)
+    }
+
+    /// Whether a scan with this operator gives the same result however it groups its operands, so
+    /// that the chunks may take the prefix of whichever chunk before them is ready first (see
+    /// [`Pass::ChunkLookback`]) and a scan stays reproducible: the integer types wrap, so every
+    /// associative operator on them is exact, and `min` and `max` of floats pick one of their
+    /// operands. The sums and products of floats round differently in other groupings and keep
+    /// the fixed grouping of the two passes.
+    fn grouping_free(&self) -> bool {
+        matches!(self.ty, "u32" | "i32") || self.op.extremum
+    }
+
+    /// The inclusive scan of `lines` lines of `n` cells (more than one chunk of
+    /// [`Pass::ChunkLookback`]) in one pass over `input` (see there): a launch that zeroes the
+    /// counter and the statuses of the chunks, then the scan. Both are launches, so a recording
+    /// or a graph of the caller replays them together and every replay starts from zero.
+    fn lookback(&mut self, n: u32, lines: u32, out: Bound<'_>, input: Bound<'_>) -> Result<()> {
+        let nb = n.div_ceil(LOOKBACK_CHUNK);
+        // `k`, the chunk size of the other passes, is the window of the look-back here.
+        let geometry = [n, 1, lines, nb, lookback_window()];
+        let chunks = u64::from(geometry[2]) * u64::from(geometry[3]);
+        let (status, bytes) = self.temp(1 + 3 * chunks)?;
+        let zeroed = u32::try_from(1 + chunks).map_err(|_| LumaError::InvalidShape("too many chunks".into()))?;
+        let zero = self.ctx.builtin(Builtin::Fill, "u32")?;
+        launch_1d(self.ctx, &zero, zeroed, &[RawArg::write(&status, u64::from(zeroed) * 4), RawArg::Uniform(bytemuck::bytes_of(&0u32))])?;
+        self.launch(Pass::ChunkLookback, geometry, out, input, Some(Bound { buffer: &status, bytes }))
     }
 
     /// One reducing pass of `ops` over `input` into `outs`: a buffer for every op if there are
@@ -713,6 +921,9 @@ impl<'a> Lines<'a> {
         if stride == 1 {
             if n <= SHORT_LINE {
                 return self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n), n], out, input, None);
+            }
+            if self.ctx.tuning().lookback_scan && n > LOOKBACK_CHUNK && self.grouping_free() {
+                return self.lookback(n, lines, out, input);
             }
             let nb = n.div_ceil(SCAN_CHUNK);
             let geometry = [n, 1, lines, nb, SCAN_CHUNK];
@@ -857,7 +1068,7 @@ impl<T: ScalarType> Array<T> {
             }
         };
         let targets: Vec<Bound<'_>> = pins.iter().zip(&outs).map(|(pin, out)| Bound { buffer: pin.buffer(), bytes: out.byte_len() }).collect();
-        let operator = Operator { source: String::new(), scalar_tys: Vec::new(), scalars: Vec::new() };
+        let operator = Operator { source: String::new(), scalar_tys: Vec::new(), scalars: Vec::new(), extremum: false };
         let mut run = Lines::new(ctx, &operator, T::wgsl_type());
         run.reduce(input, Cells { n, stride, lines }, ops, false, &targets)?;
         drop(run);
@@ -889,7 +1100,7 @@ impl<T: ScalarType> Array<T> {
             }
         };
         let target = Bound { buffer: pin.buffer(), bytes: out.byte_len() };
-        let operator = Operator { source: String::new(), scalar_tys: Vec::new(), scalars: Vec::new() };
+        let operator = Operator { source: String::new(), scalar_tys: Vec::new(), scalars: Vec::new(), extremum: false };
         let mut run = Lines::new(ctx, &operator, T::wgsl_type());
         run.reduce(input, cells, ReduceList::new(&[op]), false, &[target])?;
         Ok(out)
@@ -958,12 +1169,14 @@ impl<T: Numeric> Array<T> {
     /// result with [`LumaError::InvalidShape`].
     ///
     /// Contiguous lines are cut in chunks that a workgroup scans in workgroup memory (chunk
-    /// totals, a scan of the totals, a second pass seeded with them), strided lines in blocks
-    /// that one invocation walks, with neighbouring invocations on neighbouring lines, so every
-    /// pass reads and writes memory in coalesced accesses; short lines are staged several to a
-    /// workgroup. The arrays are evaluated first; arrays split over several buffers fail with
-    /// [`LumaError::Chunked`]. Scalars captured by `op` are uniforms, so changing them does not
-    /// recompile.
+    /// totals, a scan of the totals, a second pass seeded with them; on CUDA integer scans and
+    /// `min` / `max` of long lines are one pass in which the chunks wait for each other's
+    /// prefix, which gives the same results as they do not depend on the grouping), strided
+    /// lines in blocks that one invocation walks, with neighbouring invocations on neighbouring
+    /// lines, so every pass reads and writes memory in coalesced accesses; short lines are
+    /// staged several to a workgroup. The arrays are evaluated first; arrays split over several
+    /// buffers fail with [`LumaError::Chunked`]. Scalars captured by `op` are uniforms, so
+    /// changing them does not recompile. The results of an associative `op` are the same on every run.
     #[track_caller]
     pub fn scan(&self, axis: usize, op: impl Fn(&Array<T>, &Array<T>) -> Array<T>) -> Array<T> {
         self.scan_axis(axis, &op, "scan", Location::caller())
@@ -1117,4 +1330,285 @@ impl Array<f32> {
 
 fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {
     x.binary(Rhs::Array(y), BinOp::Add, false, "add")
+}
+
+#[cfg(test)]
+mod tests {
+    //! The look-back scan (see [`Pass::ChunkLookback`]) on the CPU backend, whose atomics order
+    //! memory across workgroups (the flag is on by default only for CUDA), against the host and
+    //! against the two-pass scan.
+
+    use std::cell::Cell;
+    use std::fmt::Debug;
+
+    use luma_core::{BackendKind, DeviceKind};
+
+    use super::*;
+    use crate::context::ContextOptions;
+
+    thread_local! {
+        /// The window of [`lookback_window`] on this thread, if a test narrows it.
+        pub(super) static WINDOW: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// Narrows the look-back window of this thread until dropped.
+    struct Window;
+
+    impl Window {
+        fn of(window: u32) -> Window {
+            WINDOW.set(Some(window));
+            Window
+        }
+    }
+
+    impl Drop for Window {
+        fn drop(&mut self) {
+            WINDOW.set(None);
+        }
+    }
+
+    /// A CPU context whose scans of long contiguous lines look back or take two passes.
+    fn cpu(lookback: bool) -> Context {
+        let options = ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() }.calibrate(false);
+        Context::with_tuning(options, |tuning| tuning.lookback_scan = lookback).unwrap()
+    }
+
+    /// Cells of a chunk of the look-back kernel (the two-pass kernels take 1024).
+    const CHUNK: usize = LOOKBACK_CHUNK as usize;
+
+    /// The edges of a chunk of either kind (lines of up to a chunk are scanned by the two-pass
+    /// kernels), one short of one, one, one more, several, a line of many.
+    const LENGTHS: [usize; 18] =
+        [1, 2, 255, 256, 257, 1023, 1024, 1025, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK - 1, 2 * CHUNK, 2 * CHUNK + 1, 3 * CHUNK, 3 * CHUNK + 1, 1 << 20, (1 << 20) + 7];
+
+    fn words(n: usize, seed: u64) -> Vec<u32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 32) as u32
+            })
+            .collect()
+    }
+
+    fn floats(n: usize, seed: u64) -> Vec<f32> {
+        words(n, seed).into_iter().map(|w| (w >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0).collect()
+    }
+
+    /// The inclusive scan of every line of `n` cells.
+    fn host_scan<T: Copy>(data: &[T], n: usize, combine: impl Fn(T, T) -> T) -> Vec<T> {
+        let mut out = data.to_vec();
+        for line in out.chunks_mut(n) {
+            for i in 1..line.len() {
+                line[i] = combine(line[i - 1], line[i]);
+            }
+        }
+        out
+    }
+
+    fn first_difference<T: PartialEq>(got: &[T], want: &[T]) -> Option<usize> {
+        assert_eq!(got.len(), want.len(), "length");
+        got.iter().zip(want).position(|(g, w)| g != w)
+    }
+
+    /// Scans `data` as lines of `n` cells along axis 0 on both contexts, twice in a row (the
+    /// status words must be zero again for the next launch), and checks the results are `want`.
+    fn exact<T: Numeric + Copy + PartialEq + Debug>(
+        contexts: (&Context, &Context),
+        data: &[T],
+        n: usize,
+        op: &ScanOp<'_, T>,
+        host: impl Fn(T, T) -> T,
+        what: &str,
+    ) {
+        let want = host_scan(data, n, host);
+        let shape = [n, data.len() / n];
+        for (name, ctx) in [("look-back", contexts.0), ("two-pass", contexts.1)] {
+            let x = Array::from_slice_on(ctx, data, shape).unwrap();
+            for round in 0..2 {
+                let got = x.scan(0, op).to_vec().unwrap();
+                if let Some(at) = first_difference(&got, &want) {
+                    panic!("{what}, {name}, n = {n}, lines = {}, round {round}: element {at} is {:?}, want {:?}", shape[1], got[at], want[at]);
+                }
+            }
+        }
+    }
+
+    /// Associative but not commutative: the left operand wins (`y - y` is zero; it makes the
+    /// operator an expression of both of its arguments).
+    #[allow(clippy::eq_op)]
+    fn first(x: &Array<u32>, y: &Array<u32>) -> Array<u32> {
+        x + &(y - y)
+    }
+
+    /// Associative but not commutative: the right operand wins.
+    #[allow(clippy::eq_op)]
+    fn last(x: &Array<u32>, y: &Array<u32>) -> Array<u32> {
+        y + &(x - x)
+    }
+
+    /// Every operator on `u32` and `i32` data, along lines of every length.
+    fn every_operator(window: Option<u32>, lengths: &[usize], lines: usize) {
+        let _window = window.map(Window::of);
+        let (look, two) = (cpu(true), cpu(false));
+        for (k, &n) in lengths.iter().enumerate() {
+            let len = n * lines;
+            let seed = k as u64 + 1;
+            let unsigned = words(len, seed);
+            let signed: Vec<i32> = unsigned.iter().map(|&w| w as i32).collect();
+            let contexts = (&look, &two);
+            exact(contexts, &unsigned, n, &|x, y| x + y, u32::wrapping_add, "u32 sum");
+            exact(contexts, &unsigned, n, &|x, y| x.minimum(y), u32::min, "u32 min");
+            exact(contexts, &unsigned, n, &|x, y| x.maximum(y), u32::max, "u32 max");
+            exact(contexts, &signed, n, &|x, y| x + y, i32::wrapping_add, "i32 sum");
+            exact(contexts, &signed, n, &|x, y| x.minimum(y), i32::min, "i32 min");
+            exact(contexts, &signed, n, &|x, y| x.maximum(y), i32::max, "i32 max");
+            // Associative but not commutative: the first cell of the line wins, so a prefix that
+            // folds the chunks out of order is wrong.
+            exact(contexts, &unsigned, n, &first, |x, _| x, "u32 first");
+            // The last wins.
+            exact(contexts, &unsigned, n, &last, |_, y| y, "u32 last");
+        }
+    }
+
+    #[test]
+    fn integer_scans_of_a_line_look_back() {
+        every_operator(None, &LENGTHS, 1);
+    }
+
+    /// Windows that are not the workgroup: the walk over several of them, with the carry.
+    #[test]
+    fn narrow_windows_walk_back_over_several() {
+        let lengths = [CHUNK + 1, 3 * CHUNK + 1, 37 * CHUNK + 5, 1 << 20];
+        for window in [1, 3, 32] {
+            every_operator(Some(window), &lengths, 1);
+        }
+    }
+
+    /// Several lines along axis 0: the tickets run over lines and no chunk looks into the line before it.
+    #[test]
+    fn integer_scans_of_several_lines_look_back() {
+        every_operator(None, &[CHUNK + 1, 3 * CHUNK, 5000, 9 * CHUNK + 1], 5);
+        every_operator(Some(2), &[CHUNK + 1, 3 * CHUNK, 5000], 7);
+    }
+
+    /// Float sums keep the fixed grouping of the two passes whatever the flag says (a look-back
+    /// would group them by the timing of the chunks): bit for bit the same as without it, and
+    /// the same on every run.
+    #[test]
+    fn float_sums_are_bit_identical_with_and_without_the_look_back() {
+        let (look, two) = (cpu(true), cpu(false));
+        for (k, &n) in LENGTHS.iter().enumerate() {
+            let data = floats(n, k as u64 + 1);
+            let want = host_scan(&data.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(), n, |a, b| a + b);
+            let mut running = 0.0f64;
+            let magnitude: Vec<f64> = data
+                .iter()
+                .map(|&v| {
+                    running += f64::from(v).abs();
+                    running
+                })
+                .collect();
+            let bits = |ctx: &Context| -> Vec<Vec<u32>> {
+                let x = Array::from_slice_on(ctx, &data, n).unwrap();
+                let mut results = Vec::new();
+                for _ in 0..2 {
+                    results.push(x.cumsum(0).to_vec().unwrap());
+                    results.push(x.scan(0, |a, b| a + b).to_vec().unwrap());
+                }
+                results.into_iter().map(|got| got.into_iter().map(f32::to_bits).collect()).collect()
+            };
+            let (with, without) = (bits(&look), bits(&two));
+            for (round, (a, b)) in with.iter().zip(&without).enumerate() {
+                assert!(a == b, "n = {n}, result {round}: the sums differ from the two-pass ones at element {:?}", first_difference(a, b));
+            }
+            for (round, got) in without.iter().enumerate() {
+                assert!(got == &without[round % 2], "n = {n}, result {round}: the sums differ between runs");
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    let tolerance = 4e-6 * magnitude[i] + 1e-5;
+                    assert!((f64::from(f32::from_bits(g)) - w).abs() <= tolerance, "n = {n}: element {i} is {}, want {w} (tolerance {tolerance})", f32::from_bits(g));
+                }
+            }
+        }
+    }
+
+    /// The minima and maxima of floats look back (they pick one of their operands, so the result
+    /// does not depend on the grouping): exactly the host's and the two-pass ones, every run.
+    #[test]
+    fn float_extrema_look_back_exactly() {
+        let (look, two) = (cpu(true), cpu(false));
+        for (k, &n) in LENGTHS.iter().enumerate() {
+            let data = floats(n, k as u64 + 1);
+            let (min, max) = (host_scan(&data, n, f32::min), host_scan(&data, n, f32::max));
+            for (name, ctx) in [("look-back", &look), ("two-pass", &two)] {
+                let x = Array::from_slice_on(ctx, &data, n).unwrap();
+                for round in 0..2 {
+                    assert!(x.scan(0, |a, b| a.minimum(b)).to_vec().unwrap() == min, "{name}, n = {n}, round {round}: min");
+                    assert!(x.scan(0, |a, b| a.maximum(b)).to_vec().unwrap() == max, "{name}, n = {n}, round {round}: max");
+                }
+            }
+        }
+    }
+
+    /// The launches `scan` of `x` records, after everything before it went out.
+    fn launches<T: Numeric>(ctx: &Context, x: &Array<T>, op: &ScanOp<'_, T>) -> u32 {
+        ctx.flush().unwrap();
+        let before = ctx.pending_dispatches();
+        let y = x.scan(0, op);
+        let launches = ctx.pending_dispatches() - before;
+        y.to_vec().unwrap();
+        launches
+    }
+
+    /// The scan of a line of several chunks is two launches (the zeroing of the status, then the
+    /// scan) instead of the three of the two-pass scan, and no host work in between: for
+    /// integers and the minima and maxima of floats, not for float sums. A line of one chunk of
+    /// the look-back kernel (but several of the two-pass ones) is three either way.
+    #[test]
+    fn only_scans_independent_of_the_grouping_are_two_launches() {
+        let n = 3 * CHUNK;
+        let (look, two) = (cpu(true), cpu(false));
+        let (unsigned, signed, float) = (words(n, 7), words(n, 8).into_iter().map(|w| w as i32).collect::<Vec<_>>(), floats(n, 9));
+        for (ctx, sums, extrema) in [(&look, 2, 2), (&two, 3, 3)] {
+            let (u, i, f) = (
+                Array::from_slice_on(ctx, &unsigned, n).unwrap(),
+                Array::from_slice_on(ctx, &signed, n).unwrap(),
+                Array::from_slice_on(ctx, &float, n).unwrap(),
+            );
+            let lookback = ctx.tuning().lookback_scan;
+            assert_eq!(launches(ctx, &u, &|x, y| x + y), sums, "u32 sum, look-back: {lookback}");
+            assert_eq!(launches(ctx, &i, &|x, y| x + y), sums, "i32 sum, look-back: {lookback}");
+            assert_eq!(launches(ctx, &u, &|x, y| x.maximum(y)), extrema, "u32 max, look-back: {lookback}");
+            assert_eq!(launches(ctx, &f, &|x, y| x.minimum(y)), extrema, "f32 min, look-back: {lookback}");
+            assert_eq!(launches(ctx, &f, &|x, y| x.maximum(y)), extrema, "f32 max, look-back: {lookback}");
+            assert_eq!(launches(ctx, &f, &|x, y| x + y), 3, "f32 sum, look-back: {lookback}");
+            assert_eq!(launches(ctx, &f, &|x, y| x * y), 3, "f32 product, look-back: {lookback}");
+        }
+        let short = Array::<u32>::from_slice_on(&look, &words(CHUNK, 7), CHUNK).unwrap();
+        assert_eq!(launches(&look, &short, &|x, y| x + y), 3, "one chunk");
+    }
+
+    /// A step that scans, traced once and replayed (`Array::iterate`): the zeroing of the status
+    /// is among the replayed launches, so every step starts from zero.
+    #[test]
+    fn a_replayed_step_zeroes_the_status_every_time() {
+        let n = 3 * CHUNK + 5;
+        let data = floats(n, 9);
+        let steps = 9;
+        let mut want = data.clone();
+        for _ in 0..steps {
+            let before = want.clone();
+            let mut max = f32::NEG_INFINITY;
+            for (v, &u) in want.iter_mut().zip(&before) {
+                max = max.max(u);
+                *v = max * 0.5 + u * 0.25;
+            }
+        }
+        for lookback in [true, false] {
+            let ctx = cpu(lookback);
+            let x = Array::from_slice_on(&ctx, &data, n).unwrap();
+            let got = x.iterate(steps, |u| &(&u.scan(0, |a, b| a.maximum(b)) * 0.5f32) + &(u * 0.25f32)).to_vec().unwrap();
+            assert!(got == want, "look-back: {lookback}: element {:?} differs", first_difference(&got, &want));
+        }
+    }
 }

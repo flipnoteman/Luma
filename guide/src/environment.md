@@ -15,8 +15,8 @@ builder methods override them:
 | `LUMA_FAST_MATH` | `fast_math` / `.fast_math(on)` |
 | `LUMA_DF_FMA` | `df_fma` / `.df_fma(fused)` |
 
-The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_FUSION_*`, `LUMA_STAGING`, `LUMA_TRIDIAGONAL`,
-`LUMA_SPECULATE`, `LUMA_CACHE*`, `LUMA_EXIT_WAIT`) are read from the environment only.
+The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LOOKBACK_SCAN`, `LUMA_FUSION_*`,
+`LUMA_STAGING`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_CACHE*`, `LUMA_EXIT_WAIT`) are read from the environment only.
 
 ## All variables
 
@@ -29,6 +29,7 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_FUSION_*`, `LUMA_STAGING`, `L
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
 | `LUMA_SINGLE_PASS_REDUCE` | `off` makes reductions over several workgroups two launches on CUDA again (by default the last workgroup of the first pass finishes the reduction); `on` does the same single-pass reduction on the native CPU backend (other backends ignore it: WGSL does not order memory across workgroups) |
+| `LUMA_LOOKBACK_SCAN` | `off` makes the scans of integers (`u32`, `i32`) and the `min` / `max` scans of long contiguous lines two passes over their input on CUDA again (by default one kernel reads the input once and its workgroups wait for each other's prefix, a decoupled look-back, which gives the same results); `on` does the same single-pass scan on the native CPU backend (other backends ignore it: WGSL gives no forward progress or ordering of memory across workgroups). Sums and other floating-point scans keep two passes either way, so that they are reproducible run to run |
 | `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions) |
 | `LUMA_FUSION_MAX_INPUTS` | Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer ([Performance](performance.md#many-arrays-in-one-kernel)) |
 | `LUMA_FUSION_MAX_LIVE` | Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, `8..=4096`) |

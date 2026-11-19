@@ -264,7 +264,7 @@ uses `take` for table lookups, and the ML-KEM example uses `put` for rejection s
   more computation costs less than storing it and reading it back, or staged; otherwise it is
   evaluated first.
 
-What does not fuse: `scan` (it reads its operand twice, so the operand is computed first) and custom
+What does not fuse: `scan` (it reads its operand once or twice, so the operand is computed first) and custom
 kernels, which see the arrays computed. The operands of `matmul`, of axis reductions and of
 `put_add` / `put_min` / `put_max` are read inside their own kernels
 ([Performance guide](performance.md#what-fuses-and-what-cuts)).

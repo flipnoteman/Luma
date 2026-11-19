@@ -4,10 +4,11 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use crate::array::{Failure, Storage};
+use crate::builtin::BinOp;
 use crate::gpu::lock;
 
 use super::codegen::{expression, NO_NAMES};
-use super::program::{flatten, Tail};
+use super::program::{flatten, Ref, Tail};
 use super::{ElemTy, Node, OpKind};
 
 /// `fn op(x0: T, x1: T) -> T` and the scalars it reads.
@@ -17,6 +18,9 @@ pub(crate) struct Operator {
     pub scalar_tys: Vec<ElemTy>,
     /// The bit patterns of the scalars, in the order of `scalar_tys`.
     pub scalars: Vec<u32>,
+    /// The operator is `min` or `max` of its two arguments: it picks one of them, so a scan of it
+    /// gives the same result however it groups its operands (a sum of floats does not).
+    pub extremum: bool,
 }
 
 /// `node = op(a, b)` as the WGSL function `fn op(x0: T, x1: T) -> T`, its scalars being the uniform
@@ -57,5 +61,8 @@ pub(crate) fn operator_source(
         let _ = writeln!(source, "    let t{k}: {} = {value};", instr.op.out_ty().wgsl());
     }
     let _ = writeln!(source, "    return t{last};\n}}");
-    Ok(Some(Operator { source, scalar_tys: key.scalar_tys.clone(), scalars: fused.scalars.clone() }))
+    let extremum = key.instrs.len() == 1
+        && matches!(key.instrs[0].op.kind, OpKind::Binary(BinOp::Min | BinOp::Max))
+        && matches!(key.instrs[0].args[..2], [Ref::Input(_), Ref::Input(_)]);
+    Ok(Some(Operator { source, scalar_tys: key.scalar_tys.clone(), scalars: fused.scalars.clone(), extremum }))
 }
