@@ -877,12 +877,18 @@ impl<'a> Lower<'a> {
     }
 
     /// The terms of the flat source index of the parameterized view `spec` for element `i`, and
-    /// per axis the unclipped coordinate and the source extent, where the view checks it.
+    /// per axis the unclipped coordinate, the source extent where the view checks it, and the
+    /// source coordinate inside `0..extent` of every active axis. Where `cache` has the source
+    /// coordinates of context `parent` and that source has the dimensions of this view's output,
+    /// a coordinate along the output is taken from them (`AxisSpec::from`) instead of from
+    /// dividing `i`: `i` is their flat index.
     #[allow(clippy::type_complexity)]
-    fn pview_axes(&self, fb: &mut FnBuilder<'_>, cache: &mut PviewCache, spec: ViewSpec, parent: u32, i: Val) -> (Vec<Val>, [Option<Val>; 4], [Option<Val>; 4]) {
+    fn pview_axes(&self, fb: &mut FnBuilder<'_>, cache: &mut PviewCache, spec: ViewSpec, parent: u32, i: Val) -> (Vec<Val>, [Option<Val>; 4], [Option<Val>; 4], [Option<Val>; 4]) {
         let mut raws: [Option<Val>; 4] = [None; 4];
         let mut sizes: [Option<Val>; 4] = [None; 4];
+        let mut coords: [Option<Val>; 4] = [None; 4];
         let mut terms = Vec::new();
+        let known = cache.coords.iter().find(|&&(c, dims, _)| c == parent && dims == spec.out_dims).map(|&(.., coords)| coords);
         for a in 0..4 {
             let axis = spec.axes[a];
             if !(axis.active || (spec.edge == Edge::Fill && axis.checked)) {
@@ -891,20 +897,26 @@ impl<'a> Lower<'a> {
             let slots = axis.slots;
             let mut scaled = None;
             if !axis.out_unit && axis.step != StepSpec::Zero {
-                let along = match (axis.out_div, axis.out_rem) {
-                    (DivRemSpec::None, DivRemSpec::None) => i,
-                    (DivRemSpec::None, rem) => self.pview_rem(fb, cache, parent, i, slots.rem, rem),
-                    (div, DivRemSpec::None) => self.pview_div(fb, cache, parent, i, slots.div, div),
-                    (div, rem) => {
-                        let quotient = self.pview_div(fb, cache, parent, i, slots.div, div);
-                        match rem {
-                            DivRemSpec::Pow2 => quotient & self.scalar(fb, slots.rem),
-                            DivRemSpec::Runtime { wide } => self.urem(fb, quotient, slots.rem, wide),
-                            DivRemSpec::None => quotient,
-                        }
+                let along = match known {
+                    // An axis of the parent's source without a coordinate has one element.
+                    Some(known) => known[axis.from as usize].unwrap_or_else(|| li(fb, 0)),
+                    None => {
+                        let along = match (axis.out_div, axis.out_rem) {
+                            (DivRemSpec::None, DivRemSpec::None) => i,
+                            (DivRemSpec::None, rem) => self.pview_rem(fb, cache, parent, i, slots.rem, rem),
+                            (div, DivRemSpec::None) => self.pview_div(fb, cache, parent, i, slots.div, div),
+                            (div, rem) => {
+                                let quotient = self.pview_div(fb, cache, parent, i, slots.div, div);
+                                match rem {
+                                    DivRemSpec::Pow2 => quotient & self.scalar(fb, slots.rem),
+                                    DivRemSpec::Runtime { wide } => self.urem(fb, quotient, slots.rem, wide),
+                                    DivRemSpec::None => quotient,
+                                }
+                            }
+                        };
+                        fb.convert(along, KirType::I32)
                     }
                 };
-                let along = fb.convert(along, KirType::I32);
                 scaled = Some(match axis.step {
                     StepSpec::PosOne => along,
                     StepSpec::NegOne => fb.neg(along),
@@ -929,6 +941,8 @@ impl<'a> Lower<'a> {
                     (Some(size), Edge::Wrap) => self.call(fb, "luma_wrap_i", &[raw, size]),
                     _ => raw,
                 };
+                let coord = fb.let_val(&format!("x{a}"), coord);
+                coords[a] = Some(coord);
                 let word = fb.bitcast(coord, KirType::U32);
                 terms.push(match stride {
                     Some(stride) => word * stride,
@@ -938,7 +952,7 @@ impl<'a> Lower<'a> {
             raws[a] = Some(raw);
             sizes[a] = size;
         }
-        (terms, raws, sizes)
+        (terms, raws, sizes, coords)
     }
 
     /// `i / d` of the view axis divisor at `slot` (a shift for `Pow2`), once per context `parent` and divisor.
@@ -997,7 +1011,7 @@ impl<'a> Lower<'a> {
     /// The body of `pview{id}(i)`, or, with `inside_test`, of `pview{id}_in(i)`.
     fn pview_body(&self, fb: &mut FnBuilder<'_>, spec: ViewSpec, inside_test: bool) {
         let i = fb.param(0);
-        let (terms, raws, sizes) = self.pview_axes(fb, &mut PviewCache::default(), spec, 0, i);
+        let (terms, raws, sizes, _) = self.pview_axes(fb, &mut PviewCache::default(), spec, 0, i);
         let result = self.pview_result(fb, terms, raws, sizes, inside_test);
         fb.ret(Some(result));
     }
@@ -1347,11 +1361,15 @@ fn reads_directly(instr: &Instr, k: u32) -> bool {
 }
 
 /// What the parameterized views of a lowered program have divided so far, per context and divisor
-/// (the flag is whether it is a power of two), so that views of one context share their quotients.
+/// (the flag is whether it is a power of two), so that views of one context share their quotients,
+/// and the source coordinates of the contexts that are parameterized views, which their own
+/// views read instead of dividing the flat index.
 #[derive(Clone, Default)]
 struct PviewCache {
     divs: Vec<(u32, u32, bool, Val)>,
     rems: Vec<(u32, u32, bool, Val)>,
+    /// Per context: the number of its source dimensions (`ViewSpec::src_dims`) and its coordinates.
+    coords: Vec<(u32, u16, [Option<Val>; 4])>,
 }
 
 /// The state of writing a lowered program (see [`Lower::lowered_body`]).
@@ -1404,7 +1422,11 @@ impl Emit<'_, '_> {
                 let n = env.views.iter().position(|&known| known == (map, edge));
                 env.view_index(fb, n, from)
             }
-            ShiftKind::ParamView { spec, .. } => self.inline_pview(fb, ctx.parent, from, spec, false),
+            ShiftKind::ParamView { spec, .. } => {
+                let (index, coords) = self.inline_pview(fb, ctx.parent, from, spec, false);
+                self.pview.coords.push((c, spec.src_dims, coords));
+                index
+            }
             kind => {
                 if let Ref::Input(k) = ctx.args[0] {
                     self.load(fb, k, ctx.parent);
@@ -1418,11 +1440,12 @@ impl Emit<'_, '_> {
     }
 
     /// The flat source index of the parameterized view `spec` of the index `from` of context `parent`
-    /// or, with `inside_test`, whether it lies inside the source, sharing the divisions of `from`.
-    fn inline_pview(&mut self, fb: &mut FnBuilder<'_>, parent: u32, from: Val, spec: ViewSpec, inside_test: bool) -> Val {
+    /// or, with `inside_test`, whether it lies inside the source, sharing the divisions or the
+    /// coordinates of `from`; and the source coordinates.
+    fn inline_pview(&mut self, fb: &mut FnBuilder<'_>, parent: u32, from: Val, spec: ViewSpec, inside_test: bool) -> (Val, [Option<Val>; 4]) {
         let env = self.env;
-        let (terms, raws, sizes) = env.pview_axes(fb, &mut self.pview, spec, parent, from);
-        env.pview_result(fb, terms, raws, sizes, inside_test)
+        let (terms, raws, sizes, coords) = env.pview_axes(fb, &mut self.pview, spec, parent, from);
+        (env.pview_result(fb, terms, raws, sizes, inside_test), coords)
     }
 
     /// Declares input `k` read at the index of context `c`.
@@ -1564,7 +1587,7 @@ impl Emit<'_, '_> {
                         // An undefined context's index is the element's: no sharing with it.
                         let parent = if staged_read { u32::MAX } else { flat.at };
                         let from = self.index_of(flat.at);
-                        let inside = self.inline_pview(fb, parent, from, spec, true);
+                        let (inside, _) = self.inline_pview(fb, parent, from, spec, true);
                         fb.select(inside, read, fill)
                     }
                     _ => read,

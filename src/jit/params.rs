@@ -114,6 +114,10 @@ pub(crate) struct AxisSpec {
     pub(crate) active: bool,
     /// The output has one element along the axis the coordinate comes from: it is the start.
     pub(crate) out_unit: bool,
+    /// The output axis the coordinate comes from. The output of a view read in a context is the
+    /// source of the context's own view, so a lowering that has that view's source coordinates
+    /// takes this one's coordinate from them instead of dividing the context's flat index.
+    pub(crate) from: u8,
     pub(crate) out_div: DivRemSpec,
     pub(crate) out_rem: DivRemSpec,
     pub(crate) src_fastest: bool,
@@ -169,6 +173,11 @@ pub(crate) struct DimsAxis {
 pub(crate) struct ViewSpec {
     pub(crate) edge: Edge,
     pub(crate) axes: [AxisSpec; 4],
+    /// The dimensions of the output and of the source, numbered in the order the views of the key
+    /// meet them (equal dimensions, equal numbers): a view read in a context whose view's source
+    /// has the dimensions of this one's output takes its coordinates from that view's.
+    pub(crate) out_dims: u16,
+    pub(crate) src_dims: u16,
 }
 /// What a key rewritten by [`apply`] adds to what its other fields say.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -182,6 +191,7 @@ pub(crate) struct Parameterized {
 const UNUSED_AXIS: AxisSpec = AxisSpec {
     active: false,
     out_unit: true,
+    from: 0,
     out_div: DivRemSpec::None,
     out_rem: DivRemSpec::None,
     src_fastest: true,
@@ -196,6 +206,8 @@ struct Builder {
     tys: Vec<ElemTy>,
     words: Vec<u32>,
     views: Vec<(ViewMap, Edge, u16, ViewSpec)>,
+    /// The dimensions of the views' outputs and sources, numbered (see [`ViewSpec::out_dims`]).
+    view_dims: Vec<[u32; 4]>,
     takes: Vec<(u32, u32)>,
     dims: Vec<([u32; 4], [u32; 4], ShiftKind)>,
     /// The divisors whose words are in the uniform, and where.
@@ -206,7 +218,25 @@ struct Builder {
 
 impl Builder {
     fn new(tys: &[ElemTy], words: &[u32]) -> Builder {
-        Builder { tys: tys.to_vec(), words: words.to_vec(), views: Vec::new(), takes: Vec::new(), dims: Vec::new(), divisors: Vec::new(), shared: Vec::new() }
+        Builder {
+            tys: tys.to_vec(),
+            words: words.to_vec(),
+            views: Vec::new(),
+            view_dims: Vec::new(),
+            takes: Vec::new(),
+            dims: Vec::new(),
+            divisors: Vec::new(),
+            shared: Vec::new(),
+        }
+    }
+
+    /// The number of the view dimensions `dims` (see [`ViewSpec::out_dims`]).
+    fn view_dims(&mut self, dims: [u32; 4]) -> u16 {
+        let n = self.view_dims.iter().position(|&known| known == dims).unwrap_or_else(|| {
+            self.view_dims.push(dims);
+            self.view_dims.len() - 1
+        });
+        n as u16
     }
 
     fn word(&mut self, value: u32) -> u32 {
@@ -281,6 +311,7 @@ impl Builder {
             let spec = AxisSpec {
                 active: map.src[a] > 1,
                 out_unit: dim_out == 1,
+                from: axis.from,
                 out_div,
                 out_rem,
                 src_fastest: src_stride[a] == 1,
@@ -322,7 +353,8 @@ impl Builder {
             }
             axes[a] = AxisSpec { slots, ..spec };
         }
-        let spec = ViewSpec { edge, axes };
+        let (out_dims, src_dims) = (self.view_dims(map.out), self.view_dims(map.src));
+        let spec = ViewSpec { edge, axes, out_dims, src_dims };
         self.views.push((map, edge, id, spec));
         Some((id, spec))
     }

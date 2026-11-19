@@ -459,11 +459,13 @@ impl Lowering<'_> {
     }
 
     /// The context of a shift of kind `kind` (operands `args`) read at context `parent`. A view
-    /// of a view without edge handling is the one view of both, and a shift by nothing is its
-    /// parent.
+    /// read in a context that is a view without edge handling is one view of both, with the edge
+    /// handling of the later one: the context's coordinates are inside its source, so the later
+    /// view sees the same unclipped coordinates either way. Reads of one element through
+    /// different paths are then one context. A shift by nothing is its parent.
     fn context(&mut self, mut parent: u32, mut kind: ShiftKind, args: [Ref; 2]) -> u32 {
         match kind {
-            ShiftKind::View { mut map, edge: Edge::None } => {
+            ShiftKind::View { mut map, edge } => {
                 while parent != 0
                     && let Some(&Ctx { parent: grand, kind: ShiftKind::View { map: outer, edge: Edge::None }, .. }) = self.ctxs.get(parent as usize)
                     && outer.src == map.out
@@ -474,10 +476,10 @@ impl Lowering<'_> {
                     }
                     (map, parent) = (composed, grand);
                 }
-                if map == ViewMap::identity(map.src) {
+                if edge == Edge::None && map == ViewMap::identity(map.src) {
                     return parent;
                 }
-                kind = ShiftKind::View { map, edge: Edge::None };
+                kind = ShiftKind::View { map, edge };
             }
             ShiftKind::Dims { shifts: [0, 0, 0, 0], .. } => return parent,
             _ => {}
