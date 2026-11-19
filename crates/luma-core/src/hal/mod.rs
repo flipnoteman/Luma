@@ -824,6 +824,15 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
 }
 
 /// Reusable mapped `MAP_WRITE` buffers, ready to be written: upload staging or mappable storage.
+///
+/// Buffers come in size classes, and idle ones are taken back by size: [`FreeUploads::take`]
+/// wants an exact size (for pools whose buffers become storage that the caller sizes by class),
+/// [`FreeUploads::take_fit`] the smallest idle buffer that is large enough (for staging, where
+/// only a byte range of the buffer is used). A pool that served only exact classes filled up with
+/// the large buffers of a big transfer and then rejected every small buffer handed back while
+/// small requests never matched a large one: each small readback allocated and freed a staging
+/// buffer (about 1 ms per 4-byte readback on CUDA). [`FreeUploads::put`] therefore makes room for
+/// a small buffer by releasing larger idle ones.
 #[derive(Debug)]
 pub struct FreeUploads {
     buffers: Vec<Buffer>,
@@ -852,15 +861,36 @@ impl FreeUploads {
         Some(self.buffers.swap_remove(at))
     }
 
-    /// Keeps `buffer` unless that would exceed the cap; returns it otherwise.
+    /// The smallest idle buffer of at least `size` bytes. The caller must only use the first
+    /// `size` bytes (map, copy and read ranges of that length), never the buffer's own size.
+    pub fn take_fit(&mut self, size: u64) -> Option<Buffer> {
+        let at = self.buffers.iter().enumerate().filter(|(_, buffer)| buffer.size() >= size).min_by_key(|(_, buffer)| buffer.size()).map(|(at, _)| at)?;
+        let buffer = self.buffers.swap_remove(at);
+        self.bytes -= buffer.size();
+        Some(buffer)
+    }
+
+    /// Keeps `buffer` unless that would exceed the cap; returns the buffer the caller must
+    /// release, if any. When `buffer` does not fit, the largest idle buffer is released in its
+    /// place if that one is larger than `buffer` (a small buffer is the likelier next request, and
+    /// the large one it displaces is the costliest to hold); otherwise `buffer` itself is
+    /// returned. One eviction always makes room: the idle bytes never exceed the cap, and the
+    /// evicted buffer is larger than the incoming one.
     pub fn put(&mut self, buffer: Buffer) -> Option<Buffer> {
-        if self.bytes + buffer.size() <= self.cap {
-            self.bytes += buffer.size();
+        let size = buffer.size();
+        if self.bytes + size <= self.cap {
+            self.bytes += size;
             self.buffers.push(buffer);
-            None
-        } else {
-            Some(buffer)
+            return None;
         }
+        let largest = self.buffers.iter().enumerate().max_by_key(|(_, idle)| idle.size()).filter(|(_, idle)| idle.size() > size).map(|(at, _)| at);
+        let Some(at) = largest else {
+            return Some(buffer);
+        };
+        let evicted = self.buffers.swap_remove(at);
+        self.bytes = self.bytes - evicted.size() + size;
+        self.buffers.push(buffer);
+        Some(evicted)
     }
 
     /// Empties the pool.
@@ -932,15 +962,87 @@ mod tests {
         assert_eq!(p.total(), Duration::from_micros(4));
     }
 
+    fn staging(size: u64) -> Buffer {
+        Buffer::new(size, BufferUsage::MAP_WRITE, Fake(0))
+    }
+
+    /// Size of the buffer a `put` handed back for release.
+    fn released(put: Option<Buffer>) -> Option<u64> {
+        put.map(|buffer| buffer.size())
+    }
+
+    fn idle_sizes(pool: &mut FreeUploads) -> Vec<u64> {
+        let mut sizes: Vec<u64> = pool.drain().iter().map(Buffer::size).collect();
+        sizes.sort_unstable();
+        sizes
+    }
+
     #[test]
     fn free_uploads_respect_the_cap() {
         let mut pool = FreeUploads::new(16);
-        let a = Buffer::new(16, BufferUsage::MAP_WRITE, Fake(0));
-        let b = Buffer::new(8, BufferUsage::MAP_WRITE, Fake(0));
-        assert!(pool.put(a).is_none());
-        assert!(pool.put(b).is_some());
-        assert!(pool.take(8).is_none());
-        assert!(pool.take(16).is_some());
+        assert_eq!(released(pool.put(staging(8))), None);
+        // Over the cap and larger than everything idle: rejected, the idle one stays.
+        assert_eq!(released(pool.put(staging(16))), Some(16));
+        assert!(pool.take(16).is_none());
+        assert!(pool.take(8).is_some());
         assert!(pool.drain().is_empty());
+    }
+
+    #[test]
+    fn take_is_exact_and_take_fit_is_best_fit() {
+        let mut pool = FreeUploads::new(1 << 20);
+        for size in [4096, 64, 1024, 256] {
+            assert_eq!(released(pool.put(staging(size))), None);
+        }
+        assert!(pool.take(100).is_none());
+        assert_eq!(pool.take(256).map(|b| b.size()), Some(256));
+        // The smallest buffer that is large enough, not the first or the largest.
+        assert_eq!(pool.take_fit(100).map(|b| b.size()), Some(1024));
+        assert_eq!(pool.take_fit(64).map(|b| b.size()), Some(64));
+        assert!(pool.take_fit(8192).is_none());
+        assert_eq!(pool.take_fit(1).map(|b| b.size()), Some(4096));
+        assert!(pool.take_fit(1).is_none());
+        // Taking gave the bytes back to the budget.
+        assert_eq!(released(pool.put(staging(1 << 20))), None);
+    }
+
+    #[test]
+    fn put_releases_a_larger_idle_buffer_to_keep_a_small_one() {
+        let mut pool = FreeUploads::new(1000);
+        for size in [400, 300, 200, 100] {
+            assert_eq!(released(pool.put(staging(size))), None);
+        }
+        // Full: the incoming 50 is kept, the largest idle buffer goes.
+        assert_eq!(released(pool.put(staging(50))), Some(400));
+        assert!(pool.take(400).is_none());
+        assert_eq!(pool.take_fit(1).map(|b| b.size()), Some(50));
+        // 400 bytes of room again: 250 fits without releasing anything (900 idle).
+        assert_eq!(released(pool.put(staging(250))), None);
+        assert_eq!(released(pool.put(staging(250))), Some(300));
+        // Nothing idle is larger than 300: rejected.
+        assert_eq!(released(pool.put(staging(300))), Some(300));
+        // 800 bytes idle, room for 200 more.
+        assert_eq!(released(pool.put(staging(200))), None);
+        // A 250 is larger than the incoming 150: it goes to make room for it.
+        assert_eq!(released(pool.put(staging(150))), Some(250));
+        assert_eq!(idle_sizes(&mut pool), [100, 150, 200, 200, 250]);
+    }
+
+    #[test]
+    fn put_rejects_a_buffer_larger_than_everything_idle_when_over_the_cap() {
+        let mut pool = FreeUploads::new(300);
+        for size in [100, 100, 100] {
+            assert_eq!(released(pool.put(staging(size))), None);
+        }
+        assert_eq!(released(pool.put(staging(200))), Some(200));
+        assert_eq!(released(pool.put(staging(100))), Some(100));
+        assert_eq!(idle_sizes(&mut pool), [100, 100, 100]);
+        // Larger than the whole cap: rejected.
+        let mut pool = FreeUploads::new(100);
+        assert_eq!(released(pool.put(staging(101))), Some(101));
+        // The incoming buffer is larger than the idle one: rejected, the idle one stays.
+        assert_eq!(released(pool.put(staging(60))), None);
+        assert_eq!(released(pool.put(staging(100))), Some(100));
+        assert_eq!(idle_sizes(&mut pool), [60]);
     }
 }

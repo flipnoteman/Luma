@@ -171,6 +171,27 @@ fn size_class(bytes: u64, max_size: u64) -> Option<u64> {
     Some(class.min(max_size))
 }
 
+/// How an idle staging buffer is matched to a request.
+#[derive(Clone, Copy)]
+enum Reuse {
+    /// Only a buffer of exactly the requested size class: for buffers that outlive the transfer as
+    /// storage, whose users see [`Buffer::size`].
+    Exact,
+    /// The smallest idle buffer that is at least as large: for staging buffers, which every user
+    /// copies, maps and reads through an explicit byte range of the requested length, never
+    /// through the buffer's own size.
+    Fit,
+}
+
+impl Reuse {
+    fn take(self, pool: &mut FreeUploads, class: u64) -> Option<Buffer> {
+        match self {
+            Reuse::Exact => pool.take(class),
+            Reuse::Fit => pool.take_fit(class),
+        }
+    }
+}
+
 /// Readbacks larger than twice this go in pieces of this size, see [`WgpuBackend::read_into`].
 const READ_CHUNK: u64 = 32 << 20;
 
@@ -190,6 +211,9 @@ const MAX_GRID_SLOTS: usize = 16;
 /// Size of one uniform arena chunk. Uniform values of a batch are packed into it, one
 /// `min_uniform_buffer_offset_alignment` slot each.
 const ARENA_CHUNK: u64 = 256 * 1024;
+
+/// Idle uniform chunks kept for reuse (a few MiB at most); more are released, as Metal does.
+const MAX_FREE_CHUNKS: usize = 16;
 
 /// Bytes at the start of the batch's first uniform chunk that are copied by the batch's own
 /// command buffer, as its first command. The slots of a handful of launches fit: the batch then
@@ -297,12 +321,12 @@ impl Arena {
         self.current.data.len() as u64 + bytes <= self.current.buffer.size()
     }
 
-    /// Starts a new chunk with room for at least `bytes` bytes; the old one is kept until the
-    /// batch is submitted.
-    fn roll(&mut self, device: &wgpu::Device, bytes: u64) {
-        let fresh = new_chunk(device, bytes.max(ARENA_CHUNK), self.epoch + 1);
-        self.full.push(std::mem::replace(&mut self.current, fresh));
+    /// Starts the chunk `fresh` (a recycled one or a new one, see [`WgpuBackend::take_chunk`]);
+    /// the old one is kept until the batch is submitted.
+    fn roll(&mut self, mut fresh: Chunk) {
         self.epoch += 1;
+        fresh.epoch = self.epoch;
+        self.full.push(std::mem::replace(&mut self.current, fresh));
     }
 
     /// Reserves a fresh slot holding `data` in the current chunk and returns its offset; the
@@ -320,7 +344,9 @@ impl Arena {
     /// Copies the slots of every chunk to the GPU and empties the arena for the next batch,
     /// keeping the current chunk. Must run right before the batch is submitted: the returned
     /// commands (the copies out of the staging buffers) have to be submitted ahead of the
-    /// batch's own, and so run after everything submitted earlier.
+    /// batch's own, and so run after everything submitted earlier. The chunks that filled up
+    /// move to `retired`; they are recycled once the submission that reads them completed, see
+    /// [`WgpuBackend::retire_chunks`].
     ///
     /// The first [`UNIFORM_PREFIX`] bytes of the chunk the batch started in are not part of
     /// them: `prefix` is the staging buffer the batch's own commands copy them out of (see
@@ -331,7 +357,7 @@ impl Arena {
     /// create a staging buffer per call, which allocates and maps a fresh block of host-visible
     /// memory whenever nothing else lives in it, and frees it again at the next poll, on every
     /// submission.
-    fn upload(&mut self, be: &WgpuBackend, prefix: Option<Prefix>, staged: &mut Vec<Buffer>, released: &mut Vec<Buffer>) -> Option<wgpu::CommandBuffer> {
+    fn upload(&mut self, be: &WgpuBackend, prefix: Option<Prefix>, staged: &mut Vec<Buffer>, retired: &mut Vec<Chunk>) -> Option<wgpu::CommandBuffer> {
         let mut encoder: Option<wgpu::CommandEncoder> = None;
         // The staging buffer must be unmapped for the submission even if no slot went into it.
         let mut prefix = prefix.map(|prefix| (prefix, false));
@@ -367,7 +393,7 @@ impl Arena {
             }
             staged.push(prefix.staging);
         }
-        released.extend(self.full.drain(..).map(|chunk| chunk.buffer));
+        retired.append(&mut self.full);
         self.current.data.clear();
         encoder.map(wgpu::CommandEncoder::finish)
     }
@@ -534,6 +560,8 @@ pub struct WgpuBackend {
     /// Buffers their owners released; the cached bind groups still holding them are dropped at
     /// the next submission, which frees them.
     released: Arc<Mutex<Vec<Buffer>>>,
+    /// Uniform arena chunks whose last submission completed, ready for the next roll.
+    free_chunks: Arc<Mutex<Vec<Chunk>>>,
     /// Recycled mappable storage buffers waiting for the next submission before they are mapped.
     unmapped: Mutex<Vec<Buffer>>,
     /// The first error the GPU reported outside of a call that could return it.
@@ -642,6 +670,7 @@ impl WgpuBackend {
             mappable: Arc::new(Mutex::new(FreeUploads::new(cap))),
             readbacks: Mutex::new(FreeUploads::new(cap)),
             released: Arc::new(Mutex::new(Vec::new())),
+            free_chunks: Arc::new(Mutex::new(Vec::new())),
             unmapped: Mutex::new(Vec::new()),
             gpu_error,
             dispatches_pending: AtomicU32::new(0),
@@ -707,21 +736,22 @@ impl WgpuBackend {
         self.make_buffer(size, usage, mapped).ok_or(BackendError::OutOfMemory { requested: size })
     }
 
-    /// An idle mapped buffer of `class` bytes from `pool`. Polls completed submissions first,
-    /// which hands back the buffers whose `map_async` callback is due. Never submits or waits.
-    fn take_idle(&self, pool: &Mutex<FreeUploads>, class: u64) -> Option<Buffer> {
-        if let Some(buffer) = lock(pool).take(class) {
+    /// An idle mapped buffer from `pool` for `class` bytes, matched as `reuse` says. Polls
+    /// completed submissions first, which hands back the buffers whose `map_async` callback is
+    /// due. Never submits or waits.
+    fn take_idle(&self, pool: &Mutex<FreeUploads>, class: u64, reuse: Reuse) -> Option<Buffer> {
+        if let Some(buffer) = reuse.take(&mut lock(pool), class) {
             return Some(buffer);
         }
         let _ = self.device().poll(wgpu::PollType::Poll);
-        lock(pool).take(class)
+        reuse.take(&mut lock(pool), class)
     }
 
-    /// Takes a mapped `MAP_WRITE` buffer of `class` bytes from `pool`, polling completed
-    /// submissions (and waiting if more bytes than the idle cap are in flight) before
-    /// allocating a fresh one.
-    fn take_upload_buffer(&self, pool: &Mutex<FreeUploads>, class: u64, usage: BufferUsage) -> Result<Buffer, BackendError> {
-        if let Some(buffer) = self.take_idle(pool, class) {
+    /// Takes a mapped `MAP_WRITE` buffer for `class` bytes from `pool` (matched as `reuse` says),
+    /// polling completed submissions (and waiting if more bytes than the idle cap are in flight)
+    /// before allocating a fresh one.
+    fn take_upload_buffer(&self, pool: &Mutex<FreeUploads>, class: u64, usage: BufferUsage, reuse: Reuse) -> Result<Buffer, BackendError> {
+        if let Some(buffer) = self.take_idle(pool, class, reuse) {
             return Ok(buffer);
         }
         let (in_flight, cap) = {
@@ -731,17 +761,64 @@ impl WgpuBackend {
         if in_flight > cap {
             self.flush_locked(&mut *self.batch()?);
             self.device().poll(wgpu::PollType::wait_indefinitely()).map_err(|e| BackendError::Poll(e.to_string()))?;
-            if let Some(buffer) = lock(pool).take(class) {
+            if let Some(buffer) = reuse.take(&mut lock(pool), class) {
                 return Ok(buffer);
             }
         }
         self.new_buffer(class, usage, true)
     }
 
-    /// An upload staging buffer for `bytes` bytes, still mapped: an idle one, or a new one.
+    /// A uniform chunk for the arena: an idle one whose last submission completed (so it is no
+    /// longer read by the GPU, and its bind groups are still cached), or a new one. A chunk
+    /// needing more than [`ARENA_CHUNK`] bytes is always new and never recycled.
+    fn take_chunk(&self, bytes: u64) -> Chunk {
+        if bytes > ARENA_CHUNK {
+            return new_chunk(self.device(), bytes, 0);
+        }
+        // Completed submissions hand their chunks back from their callbacks, run by a poll.
+        let mut idle = lock(&self.free_chunks).pop();
+        if idle.is_none() {
+            let _ = self.device().poll(wgpu::PollType::Poll);
+            idle = lock(&self.free_chunks).pop();
+        }
+        idle.unwrap_or_else(|| new_chunk(self.device(), ARENA_CHUNK, 0))
+    }
+
+    /// Hands the arena chunks `chunks`, read by the submission just made, back for reuse once the
+    /// GPU completed it: up to [`MAX_FREE_CHUNKS`] are kept, the rest are released. Without this
+    /// every batch with more uniform data than one chunk holds created a buffer per extra chunk
+    /// and dropped it again at its submission.
+    ///
+    /// Reuse waits for completion, as the staging pools do (their `map_async` callbacks), rather
+    /// than relying on queue order alone: a chunk handed out while a pending submission still
+    /// reads it would only be safe through the ordering of the queue, which nothing here checks.
+    fn retire_chunks(&self, chunks: Vec<Chunk>) {
+        let free = Arc::clone(&self.free_chunks);
+        let released = Arc::clone(&self.released);
+        self.queue().on_submitted_work_done(move || {
+            let mut dropped = Vec::new();
+            {
+                let mut free = lock(&free);
+                for mut chunk in chunks {
+                    if chunk.buffer.size() == ARENA_CHUNK && free.len() < MAX_FREE_CHUNKS {
+                        chunk.data.clear();
+                        free.push(chunk);
+                    } else {
+                        dropped.push(chunk.buffer);
+                    }
+                }
+            }
+            if !dropped.is_empty() {
+                lock(&released).extend(dropped);
+            }
+        });
+    }
+
+    /// An upload staging buffer for `bytes` bytes, still mapped: the smallest idle one that is
+    /// large enough, or a new one of the size class. Only the first `bytes` bytes may be used.
     fn mapped_staging(&self, bytes: u64) -> Option<Buffer> {
         let class = size_class(bytes, self.max_buffer_bytes)?;
-        match self.take_idle(&self.uploads, class) {
+        match self.take_idle(&self.uploads, class, Reuse::Fit) {
             Some(buffer) => Some(buffer),
             None => self.make_buffer(class, UPLOAD_USAGE, true),
         }
@@ -797,10 +874,15 @@ impl WgpuBackend {
         }
     }
 
-    /// An idle readback buffer of `class` bytes, or a new one.
+    /// An idle readback buffer of at least `bytes` bytes (the smallest there is), or a new one of
+    /// the size class. Callers copy, map and read only the first `bytes` bytes, never the whole
+    /// buffer, so a larger buffer serves as well as one of the exact class: with exact classes
+    /// only, an idle pool full of the large buffers of an earlier transfer never matched a small
+    /// request, and each small readback created and freed a buffer (on CUDA about 1 ms per 4-byte
+    /// read).
     fn readback_buffer(&self, bytes: u64) -> Result<Buffer, BackendError> {
         let class = size_class(bytes, self.max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
-        if let Some(buffer) = lock(&self.readbacks).take(class) {
+        if let Some(buffer) = lock(&self.readbacks).take_fit(class) {
             return Ok(buffer);
         }
         self.new_buffer(class, STAGING_USAGE, false)
@@ -831,9 +913,10 @@ impl WgpuBackend {
         self.dispatches_pending.store(0, Ordering::Relaxed);
         // The slots of the arena are reused by the next batch.
         batch.grid_slots.clear();
-        let mut released = std::mem::take(&mut *lock(&self.released));
+        let released = std::mem::take(&mut *lock(&self.released));
         let prefix = batch.prefix.take();
-        let uniforms = batch.arena.upload(self, prefix, &mut batch.uploads, &mut released);
+        let mut retired = Vec::new();
+        let uniforms = batch.arena.upload(self, prefix, &mut batch.uploads, &mut retired);
         if batch.bind_groups.len > MAX_CACHED_BIND_GROUPS {
             // In-flight work keeps what it uses alive; this only drops our references.
             batch.bind_groups = BindGroupCache::default();
@@ -845,6 +928,9 @@ impl WgpuBackend {
         // The uniform copies go first: the batch's dispatches read what they write.
         let commands = batch.encoder.take().map(|encoder| encoder.finish());
         let submission = (uniforms.is_some() || commands.is_some()).then(|| self.queue().submit(uniforms.into_iter().chain(commands)));
+        if !retired.is_empty() {
+            self.retire_chunks(retired);
+        }
         for staging in batch.uploads.drain(..) {
             let free = Arc::clone(&self.uploads);
             let buffer = staging.clone();
@@ -1077,7 +1163,7 @@ impl Backend for WgpuBackend {
     fn alloc_filled(&self, data: &[u8], max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
         let bytes = data.len() as u64;
         let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
-        let buffer = self.take_upload_buffer(&self.mappable, class, MAPPABLE_STORAGE_USAGE)?;
+        let buffer = self.take_upload_buffer(&self.mappable, class, MAPPABLE_STORAGE_USAGE, Reuse::Exact)?;
         {
             let mut view = own(&buffer).get_mapped_range_mut(..bytes).map_err(|e| BackendError::MapRange(e.to_string()))?;
             write_parallel(data, view.slice(..));
@@ -1187,7 +1273,7 @@ impl Backend for WgpuBackend {
         let mut grid_offset = grid_slots.iter().find(|(known, _)| *known == size).map(|&(_, offset)| offset);
         let needed = uniform_bytes + if grid_offset.is_some() { 0 } else { grid_bytes };
         if !arena.has_room(needed) {
-            arena.roll(device, uniform_bytes + grid_bytes);
+            arena.roll(self.take_chunk(uniform_bytes + grid_bytes));
             // The remembered slots belong to the chunk that was left.
             grid_slots.clear();
             grid_offset = None;
@@ -1328,7 +1414,7 @@ impl Backend for WgpuBackend {
         let dst = raw(dst)?;
         let bytes = data.len() as u64;
         let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
-        let staging = self.take_upload_buffer(&self.uploads, class, UPLOAD_USAGE)?;
+        let staging = self.take_upload_buffer(&self.uploads, class, UPLOAD_USAGE, Reuse::Fit)?;
         {
             let mut view = own(&staging).get_mapped_range_mut(..bytes).map_err(|e| BackendError::MapRange(e.to_string()))?;
             write_parallel(data, view.slice(..));
@@ -1477,11 +1563,13 @@ impl Backend for WgpuBackend {
         let mut idle = lock(&self.mappable).drain();
         idle.extend(lock(&self.uploads).drain());
         idle.extend(lock(&self.readbacks).drain());
+        idle.extend(lock(&self.free_chunks).drain(..).map(|chunk| chunk.buffer));
         lock(&self.released).extend(idle);
         self.flush_locked(&mut *self.batch()?);
         self.device().poll(wgpu::PollType::wait_indefinitely()).map_err(|e| BackendError::Poll(e.to_string()))?;
         let mut late = lock(&self.mappable).drain();
         late.extend(lock(&self.uploads).drain());
+        late.extend(lock(&self.free_chunks).drain(..).map(|chunk| chunk.buffer));
         if !late.is_empty() {
             let mut batch = self.batch()?;
             batch.pass = None;
