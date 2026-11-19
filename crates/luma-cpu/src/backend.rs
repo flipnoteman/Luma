@@ -396,9 +396,10 @@ impl Backend for CpuBackend {
             )));
         }
         let identity = format!(
-            "{optimized:?}\n{used:?}\n{}\n{}",
+            "{optimized:?}\n{used:?}\n{}\n{}\n{}",
             !trusted,
-            crate::codegen::host_isa_key()
+            crate::codegen::host_isa_key(),
+            crate::codegen::REVISION
         );
         let stem = format!("cpu-{:016x}", cache::fnv1a(identity.as_bytes()));
         if let Some(bytes) = self.disk.load_blob(&stem, cache::CPU_MAGIC)

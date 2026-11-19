@@ -84,6 +84,10 @@ pub fn host_isa_key() -> String {
     ISA_KEY.clone()
 }
 
+/// Revision of the generated code, part of the disk-cache key: bump it whenever the code this
+/// module generates for the same kernel changes, so cached blobs from older builds are not reused.
+pub(crate) const REVISION: u32 = 1;
+
 // ---------------------------------------------------------------------------------------------
 // Memory flags
 // ---------------------------------------------------------------------------------------------
@@ -3671,10 +3675,17 @@ impl<'a, 'f> Lower<'a, 'f> {
         }
     }
 
+    /// One step of `subgroupMin`/`subgroupMax`; floats combine as the `min`/`max` builtins do
+    /// ([`Self::fminmax`]: a NaN operand yields the other), so the order lanes meet in is moot.
     fn sc_minmax(&mut self, s: ScalarTy, max: bool, a: Value, b: Value) -> Value {
         match (s.is_float(), s == ScalarTy::I32, max) {
-            (true, _, false) => self.b.ins().fmin(a, b),
-            (true, _, true) => self.b.ins().fmax(a, b),
+            (true, _, _) => {
+                let m = if max { self.b.ins().fmax(a, b) } else { self.b.ins().fmin(a, b) };
+                let na = self.b.ins().fcmp(FloatCC::Unordered, a, a);
+                let nb = self.b.ins().fcmp(FloatCC::Unordered, b, b);
+                let r = self.b.ins().select(nb, a, m);
+                self.b.ins().select(na, b, r)
+            }
             (false, true, false) => self.b.ins().smin(a, b),
             (false, true, true) => self.b.ins().smax(a, b),
             (false, false, false) => self.b.ins().umin(a, b),

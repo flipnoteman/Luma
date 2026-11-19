@@ -27,6 +27,7 @@ All notable changes to Luma are listed here. The format follows
 - CUDA: a `CompiledUntil` keeps its captured graphs from run to run (the even-step state is copied out instead of detached, which made every run capture its blocks again). Graphs are captured only where they pay: a compiled loop's spans on first use, a `Stepper`'s steps when about to be replayed eight or more times, a one-shot loop's spans the second time they run.
 - CUDA: f32 `/`, `sqrt`, `exp`, `log`, `log2`, `sin`, `cos`, `tan` and `pow` compile to the hardware approximations, within WGSL's precision rules, as the wgpu and Metal backends' compilers do (`div.approx`, `sqrt.approx`, libdevice's `__nv_fast_*`); f64 and the other functions keep libdevice's precision.
 - CUDA: a profiled launch's end event is created before the launch, so a short kernel is not charged for creating it. `LUMA_CUDA_DUMP=<dir>` writes every kernel's NVVM IR, PTX and label.
+- CPU: `subgroupMin`/`subgroupMax` on floats skip a NaN operand as `min`/`max` do (they propagated it), so `Array::min`/`max` and their axis forms agree on NaN again whatever order the lanes meet in. Compiled CPU kernels cached on disk carry a codegen revision, so blobs from older builds are compiled again.
 
 - A pipeline cache that grew past the 32 MB kept on disk is dropped with an `info` log message
   naming its size, instead of silently: every later process then compiles its kernels again
