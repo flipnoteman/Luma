@@ -430,8 +430,30 @@ fn interval_packing_never_overlaps_and_is_minimal() {
     }
 }
 
+/// The scratch of an operation counts as resident while the operation holds it, and the counter
+/// of the single-pass reductions (the context keeps it for life) counts once it exists.
+#[test]
+fn scratch_and_the_reduce_counter_are_counted_while_held() {
+    let ctx = ctx();
+    let resident = || ctx.pager().resident_bytes();
+    let before = resident();
+    let mut scratch = Scratch::new(&ctx);
+    let buffer = scratch.take(1000).unwrap();
+    assert_eq!(resident(), before + buffer.size());
+    let other = scratch.take(5000).unwrap();
+    assert_eq!(resident(), before + buffer.size() + other.size());
+    drop((buffer, other));
+    drop(scratch);
+    assert_eq!(resident(), before, "given back to the pool, which counts them as pooled");
+    assert!(ctx.pooled_bytes() > 0);
+
     // Only backends with single-pass reductions make the counter (the wgpu one cannot fill a
     // buffer at creation on a discrete device).
     if !ctx.tuning().single_pass_reduce {
         return;
     }
+    let counter = ctx.reduce_counter().unwrap().size();
+    assert_eq!(resident(), before + counter, "the counter stays for the life of the context");
+    ctx.reduce_counter().unwrap();
+    assert_eq!(resident(), before + counter, "made once");
+}

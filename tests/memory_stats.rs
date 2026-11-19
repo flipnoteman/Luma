@@ -30,3 +30,26 @@ fn trim_releases_idle_buffers_and_keeps_array_data() {
     assert_eq!(trimmed.resident_bytes, before.resident_bytes, "array data keeps its memory");
     assert_eq!(kept.to_vec().unwrap()[len / 2], 1.0);
 }
+
+/// A compiled loop keeps work buffers (the stop rule's history among them) for as long as it
+/// lives: they count as resident, and leave the count when the loop is dropped.
+#[test]
+fn a_compiled_loop_counts_the_buffers_it_keeps() {
+    use luma::{Until, compile_until_all};
+
+    type One = (Array<f32>,);
+    let ctx = Context::new().unwrap();
+    let state = (Array::from_slice_on(&ctx, &[0.0f32; 8], 8).unwrap(),);
+    state.0.eval().unwrap();
+    ctx.sync().unwrap();
+    let before = ctx.memory_stats().resident_bytes;
+
+    let steps = 100_000;
+    let until = Until::new(steps).record("v", |s: &One| s.0.max()).stop_when(|h| h["v"].last().ge(1e9));
+    let compiled = compile_until_all(&state, until, |s: &One, k| (&s.0 + k,)).unwrap();
+    let kept = ctx.memory_stats().resident_bytes - before;
+    assert!(kept >= 4 * steps as u64, "the history of {steps} steps is device memory: {kept} bytes counted");
+
+    drop(compiled);
+    assert!(ctx.memory_stats().resident_bytes <= before, "the loop's buffers leave the count with it");
+}
