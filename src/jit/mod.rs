@@ -772,10 +772,6 @@ pub(crate) struct Node {
     /// How many array handles ([`Held`]) are on this node. A held node is never handed out again
     /// by the hash-consing table: a write through one array must not show in another.
     handles: AtomicU32,
-    /// What the arrays holding this node share (see [`Link`]); weak, so that the graph does not
-    /// own what replaced the node: the node that took over may read this one. Dead when no array
-    /// holds the node (the next claim makes a new link).
-    link: Mutex<Weak<Link>>,
     /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
     readers: Readers,
     /// Whether the node is in [`JitState::requested`].
@@ -808,7 +804,7 @@ fn current_thread() -> std::thread::ThreadId {
 /// An array's claim on a node (see [`Node::handles`]).
 pub(crate) struct Held {
     node: Arc<Node>,
-    link: Arc<Link>,
+    link: OnceLock<Arc<Link>>,
 }
 
 /// What the claims on one node share: the node that replaced it as the value of the arrays
@@ -824,31 +820,26 @@ struct Link {
 impl Held {
     pub(crate) fn new(node: Arc<Node>) -> Self {
         node.handles.fetch_add(1, Ordering::Relaxed);
-        let link = {
-            let mut shared = lock(&node.link);
-            match shared.upgrade() {
-                Some(link) => link,
-                None => {
-                    let link = Arc::new(Link::default());
-                    *shared = Arc::downgrade(&link);
-                    link
-                }
-            }
-        };
-        Held { node, link }
+        Held { node, link: OnceLock::new() }
+    }
+
+    fn link(&self) -> &Arc<Link> {
+        self.link.get_or_init(|| Arc::new(Link::default()))
     }
 
     /// Another claim on the same node (and on whatever replaces it).
     pub(crate) fn share(&self) -> Held {
+        let _ = self.end().link();
+        let link = Arc::clone(self.link());
         self.node.handles.fetch_add(1, Ordering::Relaxed);
-        Held { node: Arc::clone(&self.node), link: Arc::clone(&self.link) }
+        Held { node: Arc::clone(&self.node), link: OnceLock::from(link) }
     }
 
     /// The claim on the node that holds the value of the arrays that were created holding this
     /// one: the end of the chain of [`supersede`]s (this claim if the node was never replaced).
     pub(crate) fn end(&self) -> &Held {
         let mut held = self;
-        while let Some(next) = held.link.next.get() {
+        while let Some(next) = held.link.get().and_then(|link| link.next.get()) {
             held = next;
         }
         held
@@ -869,7 +860,7 @@ impl Held {
             if held.node.handles.load(Ordering::Relaxed) > 1 {
                 return true;
             }
-            match held.link.next.get() {
+            match held.link.get().and_then(|link| link.next.get()) {
                 Some(next) => held = next,
                 None => return false,
             }
@@ -1981,7 +1972,6 @@ pub(crate) fn create(
         looped: OnceLock::new(),
         deferred: OnceLock::new(),
         handles: AtomicU32::new(0),
-        link: Mutex::new(Weak::new()),
     });
 
     let weak = Arc::downgrade(&node);
@@ -2044,7 +2034,6 @@ pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate
         looped: OnceLock::new(),
         deferred: OnceLock::new(),
         handles: AtomicU32::new(0),
-        link: Mutex::new(Weak::new()),
     });
     let _ = node.deferred.set(reduced);
     ctx.jit().live.add_weak(Arc::downgrade(&node));
@@ -2062,7 +2051,7 @@ pub(crate) fn can_supersede(node: &Arc<Node>) -> bool {
 /// [`Held::end`]) denote `new`. Expressions recorded earlier that read the node as an operand
 /// keep its value. `new` may read that node; the claims own `new`, not the node (see [`Link`]).
 pub(crate) fn supersede(old: &Held, new: Arc<Node>) {
-    let _ = old.end().link.next.set(Held::new(new));
+    let _ = old.end().link().next.set(Held::new(new));
 }
 
 /// A program structure with the judgement of it (see [`JitState::judgement`]).
@@ -2970,81 +2959,92 @@ impl JitState {
             self.last_program_len.store(key.instrs.len(), Ordering::Relaxed);
             *lock(&self.last_staging) = key.staging.clone();
         }
-        if key.staging.is_none() && key.tile.is_none() {
-            let fast_hash = fast_key_hash(key);
-            if let Some(hit) = lock(&self.fast_kernels).get(&fast_hash).and_then(|list| list.iter().find(|entry| entry.matches(key))) {
-                scalars.extend_from_slice(&hit.extra_words);
-                key.params = hit.params.clone();
-                #[cfg(test)]
-                if let Some((inlined_len, branches)) = hit.inlined_stats {
-                    self.last_inlined_len.store(inlined_len, Ordering::Relaxed);
-                    self.last_branches.store(branches, Ordering::Relaxed);
-                }
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(Arc::clone(&hit.core));
-            }
-            let orig_instrs = Arc::clone(&key.instrs);
-            let orig_subs = Arc::clone(&key.subs);
-            let orig_input_tys = key.input_tys.clone();
-            let orig_scalar_tys = key.scalar_tys.clone();
-            let orig_outputs = key.outputs.clone();
-            let orig_tail = key.tail;
-            let orig_in_place = key.in_place.clone();
-            let orig_spans = key.spans.clone();
-            let orig_guard = key.guard;
-            let base_words = scalars.len();
-
-            self.parameterize(ctx, key, scalars);
-            let key_ref = &*key;
-            let (core, built) = self.kernels.get_or_build(key_ref, || self.build_kernel(ctx, key_ref))?;
-            if !built {
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            }
-            let extra_words: Box<[u32]> = scalars[base_words..].into();
-            let params_marker = key.params.as_ref().map(|p| {
-                Arc::new(params::Parameterized {
-                    lowered: None,
-                    slots: p.slots,
-                })
-            });
+        let fast_hash = fast_key_hash(key);
+        if let Some(hit) = lock(&self.fast_kernels).get(&fast_hash).and_then(|list| list.iter().find(|entry| entry.matches(key))) {
+            scalars.extend_from_slice(&hit.extra_words);
+            key.params = hit.params.clone();
             #[cfg(test)]
-            let inlined_stats = key
-                .params
-                .as_ref()
-                .and_then(|p| match &p.lowered {
-                    Some(Lowered::Plain(inl)) => Some(inl),
-                    _ => None,
-                })
-                .map(|inl| (inl.instrs.len(), inl.branch.iter().filter(|&&b| b).count()));
-            let mut fast = lock(&self.fast_kernels);
-            if fast.len() >= 4096 {
-                fast.clear();
+            if let Some((inlined_len, branches)) = hit.inlined_stats {
+                self.last_inlined_len.store(inlined_len, Ordering::Relaxed);
+                self.last_branches.store(branches, Ordering::Relaxed);
             }
-            fast.entry(fast_hash).or_default().push(FastKernel {
-                instrs: orig_instrs,
-                subs: orig_subs,
-                input_tys: orig_input_tys,
-                scalar_tys: orig_scalar_tys,
-                outputs: orig_outputs,
-                tail: orig_tail,
-                in_place: orig_in_place,
-                spans: orig_spans,
-                guard: orig_guard,
-                extra_words,
-                params: params_marker,
-                core: Arc::clone(&core),
-                #[cfg(test)]
-                inlined_stats,
-            });
-            return Ok(core);
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::clone(&hit.core));
         }
-        params::apply_staging(ctx, key, scalars);
-        params::apply_tile(key, scalars);
-        let key = &*key;
-        let (core, built) = self.kernels.get_or_build(key, || self.build_kernel(ctx, key))?;
+        let orig_instrs = Arc::clone(&key.instrs);
+        let orig_subs = Arc::clone(&key.subs);
+        let orig_input_tys = key.input_tys.clone();
+        let orig_scalar_tys = key.scalar_tys.clone();
+        let orig_outputs = key.outputs.clone();
+        let orig_tail = key.tail;
+        let orig_in_place = key.in_place.clone();
+        let orig_runs = key.runs;
+        let orig_spans = key.spans.clone();
+        let orig_staging = key.staging.clone();
+        let orig_tile = key.tile.clone();
+        let orig_guard = key.guard;
+        let base_words = scalars.len();
+
+        if key.staging.is_none() && key.tile.is_none() {
+            self.parameterize(ctx, key, scalars);
+        } else {
+            params::apply_staging(ctx, key, scalars);
+            params::apply_tile(key, scalars);
+        }
+        let key_ref = &*key;
+        let (core, built) = self.kernels.get_or_build(key_ref, || self.build_kernel(ctx, key_ref))?;
         if !built {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
         }
+        let extra_words: Box<[u32]> = scalars[base_words..].into();
+        let params_marker = key.params.as_ref().map(|p| {
+            Arc::new(params::Parameterized {
+                lowered: None,
+                slots: p.slots,
+            })
+        });
+        #[cfg(test)]
+        let inlined_stats = key
+            .params
+            .as_ref()
+            .and_then(|p| match &p.lowered {
+                Some(Lowered::Plain(inl)) => {
+                    Some((inl.instrs.len(), inl.branch.iter().filter(|&&b| b).count()))
+                }
+                Some(Lowered::Staged(programs)) => Some((
+                    programs.main.instrs.len(),
+                    programs.bodies().map(|inl| inl.branch.iter().filter(|&&b| b).count()).sum(),
+                )),
+                None => None,
+            });
+        #[cfg(test)]
+        if let Some((inlined_len, branches)) = inlined_stats {
+            self.last_inlined_len.store(inlined_len, Ordering::Relaxed);
+            self.last_branches.store(branches, Ordering::Relaxed);
+        }
+        let mut fast = lock(&self.fast_kernels);
+        if fast.len() >= 4096 {
+            fast.clear();
+        }
+        fast.entry(fast_hash).or_default().push(FastKernel {
+            instrs: orig_instrs,
+            subs: orig_subs,
+            input_tys: orig_input_tys,
+            scalar_tys: orig_scalar_tys,
+            outputs: orig_outputs,
+            tail: orig_tail,
+            in_place: orig_in_place,
+            runs: orig_runs,
+            spans: orig_spans,
+            staging: orig_staging,
+            tile: orig_tile,
+            guard: orig_guard,
+            extra_words,
+            params: params_marker,
+            core: Arc::clone(&core),
+            #[cfg(test)]
+            inlined_stats,
+        });
         Ok(core)
     }
 
@@ -3210,7 +3210,10 @@ struct FastKernel {
     outputs: Vec<u32>,
     tail: program::Tail,
     in_place: Vec<(u32, u32)>,
+    runs: bool,
     spans: Vec<u8>,
+    staging: Option<staging::Staging>,
+    tile: Option<codegen::Tile>,
     guard: Option<u32>,
     extra_words: Box<[u32]>,
     params: Option<Arc<params::Parameterized>>,
@@ -3225,10 +3228,13 @@ impl FastKernel {
             && (Arc::ptr_eq(&self.subs, &key.subs) || self.subs == key.subs)
             && self.tail == key.tail
             && self.in_place == key.in_place
+            && self.runs == key.runs
             && self.input_tys == key.input_tys
             && self.scalar_tys == key.scalar_tys
             && self.outputs == key.outputs
             && self.spans == key.spans
+            && self.staging == key.staging
+            && self.tile == key.tile
             && self.guard == key.guard
     }
 }
@@ -3239,7 +3245,10 @@ fn fast_key_hash(key: &program::FusedKey) -> u64 {
     key.shape.hash(&mut hasher);
     key.tail.hash(&mut hasher);
     key.in_place.hash(&mut hasher);
+    key.runs.hash(&mut hasher);
     key.spans.hash(&mut hasher);
+    key.staging.hash(&mut hasher);
+    key.tile.hash(&mut hasher);
     key.guard.hash(&mut hasher);
     hasher.finish()
 }

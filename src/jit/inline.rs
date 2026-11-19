@@ -295,6 +295,37 @@ fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> f64 {
 /// them by the share of elements that take it.
 fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, staged_reads: bool) -> Branches {
     let n = flats.len();
+    if !flats.iter().any(|flat| matches!(flat.op.kind, OpKind::Select)) {
+        let ops = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).sum();
+        return Branches { region: vec![Region::Top; n], branch: vec![false; n], ops };
+    }
+    // Values that depend on the coordinates and scalars only.
+    let mut coordinates = vec![false; n];
+    for (at, flat) in flats.iter().enumerate() {
+        coordinates[at] = match flat.op.kind {
+            OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::ParamRange { .. }) => true,
+            OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
+                flat.args.iter().take(flat.op.kind.arity()).all(|arg| match *arg {
+                    Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
+                    Ref::Scalar(_) | Ref::Unused => true,
+                    _ => false,
+                })
+            }
+            _ => false,
+        };
+    }
+    let mut branch: Vec<bool> = flats
+        .iter()
+        .map(|flat| {
+            matches!(flat.op.kind, OpKind::Select)
+                && matches!(flat.args[0], Ref::Tmp(mask) if coordinates.get(mask as usize).copied().unwrap_or(false))
+                && (matches!(flat.args[1], Ref::Tmp(_)) || matches!(flat.args[2], Ref::Tmp(_)))
+        })
+        .collect();
+    if !branch.iter().any(|&b| b) {
+        let ops = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).sum();
+        return Branches { region: vec![Region::Top; n], branch, ops };
+    }
     let weight: Vec<f64> = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).collect();
     let mut users: Vec<Vec<(u32, usize)>> = vec![Vec::new(); n];
     let mut pinned = vec![false; n];
@@ -321,35 +352,13 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
             *flag = true;
         }
     }
-    // Values that depend on the coordinates and scalars only.
-    let mut coordinates = vec![false; n];
-    for (at, flat) in flats.iter().enumerate() {
-        coordinates[at] = match flat.op.kind {
-            OpKind::Generate(Gen::Index | Gen::RangePow2 | Gen::RangeConst { .. } | Gen::ParamRange { .. }) => true,
-            OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
-                flat.args.iter().take(flat.op.kind.arity()).all(|arg| match *arg {
-                    Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
-                    Ref::Scalar(_) | Ref::Unused => true,
-                    _ => false,
-                })
-            }
-            _ => false,
-        };
-    }
-    let candidate: Vec<bool> = flats
-        .iter()
-        .map(|flat| {
-            matches!(flat.op.kind, OpKind::Select)
-                && matches!(flat.args[0], Ref::Tmp(mask) if coordinates.get(mask as usize).copied().unwrap_or(false))
-                && (matches!(flat.args[1], Ref::Tmp(_)) || matches!(flat.args[2], Ref::Tmp(_)))
-        })
-        .collect();
     let share: Vec<f64> = flats.iter().map(|flat| if matches!(flat.op.kind, OpKind::Select) { taken_share(flats, ctxs, flat) } else { 1.0 }).collect();
-
-    let mut branch = candidate.clone();
+    let mut region = vec![Region::Top; n];
+    let mut chance = vec![1.0f64; n];
+    let mut saved = vec![0.0f64; n];
     loop {
         // The region of every instruction: the innermost one that holds all its uses.
-        let mut region = vec![Region::Top; n];
+        region.fill(Region::Top);
         let parent = |region: &[Region], r: Region| match r {
             Region::Top => Region::Top,
             Region::Taken(s) | Region::Skipped(s) => region[s as usize],
@@ -395,7 +404,6 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
             region[x] = joint.unwrap_or(Region::Top);
         }
         // The share of the elements that compute each region.
-        let mut chance = vec![1.0f64; n];
         let region_chance = |chance: &[f64], r: Region| match r {
             Region::Top => 1.0,
             Region::Taken(s) => chance[s as usize] * share[s as usize],
@@ -407,7 +415,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
         }
         // What each branch saves: the work of the instructions it computes, run by every
         // element that reaches the select instead of the share that takes the branch.
-        let mut saved = vec![0.0f64; n];
+        saved.fill(0.0);
         for x in 0..n {
             let mut r = region[x];
             while r != Region::Top {
@@ -422,13 +430,16 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
                 r = parent(&region, r);
             }
         }
-        let useless: Vec<usize> = (0..n).filter(|&s| branch[s] && saved[s] < BRANCH_GAIN * chance[s]).collect();
-        if useless.is_empty() {
+        let mut dropped = false;
+        for s in 0..n {
+            if branch[s] && saved[s] < BRANCH_GAIN * chance[s] {
+                branch[s] = false;
+                dropped = true;
+            }
+        }
+        if !dropped {
             let ops = (0..n).map(|x| weight[x] * chance[x]).sum();
             return Branches { region, branch, ops };
-        }
-        for s in useless {
-            branch[s] = false;
         }
     }
 }

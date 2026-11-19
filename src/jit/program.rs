@@ -1299,7 +1299,10 @@ fn flatten_plain(root: &Arc<Node>, args: &Args, tail: Tail) -> Result<Option<Fus
             continue;
         }
         let outputs = vec![u32::try_from(flat.instrs.len() - 1).unwrap_or(u32::MAX)];
-        flat.instr_nodes = members.iter().map(|member| Some(Arc::clone(member))).chain(Some(Some(Arc::clone(root)))).collect();
+        let ctx = root.context();
+        if flat.instrs.len() + flat.inputs.len() > ctx.jit().max_live(ctx.tuning()) {
+            flat.instr_nodes = members.iter().map(|member| Some(Arc::clone(member))).chain(Some(Some(Arc::clone(root)))).collect();
+        }
         flat.fused_nodes = members;
         if tail.consumes_roots() {
             flat.fused_nodes.push(Arc::clone(root));
@@ -1948,8 +1951,12 @@ const RECIPE_ITEMS: usize = 60_000;
 impl JitState {
     /// The recipe whose signature is `signature`, if one was kept.
     fn recipe(&self, signature: &Signature) -> Option<Arc<Recipe>> {
-        let candidates = lock(&self.recipes).map.get(&signature.hash)?.clone();
-        let found = candidates.into_iter().find(|recipe| recipe.sig == *signature);
+        let found = lock(&self.recipes)
+            .map
+            .get(&signature.hash)?
+            .iter()
+            .find(|recipe| recipe.sig == *signature)
+            .cloned();
         #[cfg(test)]
         if found.is_some() {
             self.recipe_hits.fetch_add(1, Ordering::Relaxed);

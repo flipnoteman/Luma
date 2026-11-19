@@ -117,9 +117,9 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
                         identity(op, a)
                     } else if is_value(sa, ty, 1.0) {
                         identity(op, b)
-                    } else if float && is_value(sb, ty, -1.0) {
+                    } else if (float || ty == ElemTy::I32) && is_value(sb, ty, -1.0) {
                         unary(UnOp::Neg, ty, a)
-                    } else if float && is_value(sa, ty, -1.0) {
+                    } else if (float || ty == ElemTy::I32) && is_value(sa, ty, -1.0) {
                         unary(UnOp::Neg, ty, b)
                     } else if u32s && (is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0)) {
                         constant(op, 0.0)
@@ -129,6 +129,7 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
                 }
                 BinOp::Div if is_value(sb, ty, 1.0) => identity(op, a),
                 BinOp::Sub if is_value(sb, ty, 0.0) => identity(op, a),
+                BinOp::Sub if u32s && same(a, b) => constant(op, 0.0),
                 BinOp::Add => {
                     if float && is_value(sb, ty, -0.0) || u32s && is_value(sb, ty, 0.0) {
                         identity(op, a)
@@ -178,7 +179,12 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
                 None
             }
         }
-        OpKind::Compare(CmpOp::Lt | CmpOp::Gt) if same(a, b) => constant(op, 0.0),
+        OpKind::Compare(cmp) if same(a, b) => match cmp {
+            CmpOp::Lt | CmpOp::Gt => constant(op, 0.0),
+            CmpOp::Le | CmpOp::Ge | CmpOp::Eq if !is_float(ty) => constant(op, 1.0),
+            CmpOp::Ne if !is_float(ty) => constant(op, 0.0),
+            _ => None,
+        },
         OpKind::Cast(ElemTy::F32) if ty == ElemTy::F64 => {
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Cast(_)))?;
             match iop.kind {
@@ -290,6 +296,7 @@ fn reassociate(op: Op, args: &Args) -> Option<(Op, Args)> {
         (BinOp::Add, BinOp::Add) => (BinOp::Add, k + c),
         (BinOp::Add, BinOp::Sub) => (BinOp::Add, c - k),
         (BinOp::Sub, BinOp::Add) => (BinOp::Add, k - c),
+        (BinOp::Sub, BinOp::Sub) => (BinOp::Sub, k + c),
         _ => return None,
     };
     // A constant that overflows or underflows in `ty` would turn finite results into infinities

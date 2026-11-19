@@ -290,13 +290,18 @@ fn last_uses(key: &FusedKey) -> Vec<usize> {
 /// For every instruction of the main program of `key`, the values live while it runs: those
 /// computed so far that a later instruction (or an output) still reads, plus the inputs loaded
 /// up front.
-fn live_profile(key: &FusedKey) -> Vec<u32> {
+fn live_split(fused: &Fused, max_inputs: usize, max_live: usize) -> Option<(Vec<Arc<Node>>, usize)> {
+    let key = &fused.key;
     let n = key.instrs.len();
+    if n + key.input_tys.len() <= max_live || fused.instr_nodes.len() != n {
+        return None;
+    }
     let last = last_uses(key);
     let loaded = (0..key.input_tys.len() as u32).filter(|&k| direct(&key.instrs, k)).count() as u32;
     let mut dying = vec![0u32; n];
     let mut live = Vec::with_capacity(n);
     let mut now = 0u32;
+    let mut peak = 0u32;
     for k in 0..n {
         now -= dying[k];
         if last[k] > k {
@@ -305,24 +310,11 @@ fn live_profile(key: &FusedKey) -> Vec<u32> {
                 *slot += 1;
             }
         }
-        live.push(now + loaded);
+        let here = now + loaded;
+        peak = peak.max(here);
+        live.push(here);
     }
-    live
-}
-
-/// If the main program of `fused` keeps more than `max_live` values live at once, the nodes to
-/// evaluate first so that the program splits where fewest values are live, and the peak. The cut
-/// is made in the middle half of the program; nothing is returned if no point there is better
-/// than the peak, the values crossing it are not all nodes, or there are more of them than one
-/// kernel can output.
-fn live_split(fused: &Fused, max_inputs: usize, max_live: usize) -> Option<(Vec<Arc<Node>>, usize)> {
-    let key = &fused.key;
-    let n = key.instrs.len();
-    if fused.instr_nodes.len() != n {
-        return None;
-    }
-    let live = live_profile(key);
-    let peak = live.iter().copied().max()? as usize;
+    let peak = peak as usize;
     if peak <= max_live {
         return None;
     }
@@ -333,7 +325,6 @@ fn live_split(fused: &Fused, max_inputs: usize, max_live: usize) -> Option<(Vec<
         return None;
     }
     // Values computed up to the cut that something after it reads.
-    let last = last_uses(key);
     let mut outs = Vec::new();
     for (j, &used) in last.iter().enumerate().take(cut + 1) {
         if used > cut {
@@ -983,10 +974,10 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
     if count == 1 {
         let candidate = (0..inputs.len()).find(|&k| {
             let input = &inputs[k];
-            in_place_eligible(&key, k as u32)
-                && Arc::strong_count(input) == 1
+            Arc::strong_count(input) == 1
                 && !input.is_alias()
                 && !input.is_window()
+                && in_place_eligible(&key, k as u32)
         });
         if let Some(k) = candidate {
             match Arc::try_unwrap(inputs.remove(k)) {

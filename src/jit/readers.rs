@@ -46,11 +46,16 @@ impl Weaks {
         if self.first.as_ref().is_some_and(|weak| !keep(weak)) {
             self.first = None;
         }
-        self.rest.retain(|weak| keep(weak));
-        // `first` leads the list: refill it so that a single reader never needs the vector.
-        if self.first.is_none() && !self.rest.is_empty() {
-            self.first = Some(self.rest.remove(0));
-        }
+        self.rest.retain_mut(|weak| {
+            if !keep(weak) {
+                return false;
+            }
+            if self.first.is_none() {
+                self.first = Some(std::mem::take(weak));
+                return false;
+            }
+            true
+        });
     }
 }
 
@@ -162,21 +167,26 @@ impl Readers {
     /// registered (and pending).
     pub(crate) fn flush_where(&self, keep: impl Fn(&Node) -> bool) {
         self.generation.fetch_add(1, Ordering::Relaxed);
-        let mut kept = Vec::new();
-        for weak in self.take() {
-            let Some(node) = weak.upgrade() else { continue };
-            if !node.is_pending() {
-                continue;
-            }
-            if keep(&node) {
-                kept.push(weak);
-            } else {
-                // A failure is stored in the node and reported when its array is used.
-                let _ = node.force();
-            }
+        let mut to_force = Vec::new();
+        {
+            let mut list = lock(&self.list);
+            list.nodes.retain(|weak| {
+                let Some(node) = weak.upgrade() else { return false };
+                if !node.is_pending() {
+                    return false;
+                }
+                if keep(&node) {
+                    true
+                } else {
+                    to_force.push(node);
+                    false
+                }
+            });
+            list.prune_at = list.nodes.len().saturating_mul(2);
         }
-        if !kept.is_empty() {
-            lock(&self.list).nodes.extend(kept);
+        for node in to_force {
+            // A failure is stored in the node and reported when its array is used.
+            let _ = node.force();
         }
     }
 }

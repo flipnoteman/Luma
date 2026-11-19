@@ -163,13 +163,7 @@ impl<T: ScalarType> Array<T> {
             if writable {
                 let (base, held, full) = match self.view() {
                     Some(view) => (view.base.clone(), view.held.as_ref().map(Held::share), view.map.then(&map)),
-                    None => {
-                        let held = match &operand {
-                            Src::Node(node) => Some(Held::new(Arc::clone(node))),
-                            _ => None,
-                        };
-                        (operand, held, map)
-                    }
+                    None => (operand, self.held().map(Held::share), map),
                 };
                 if full.is_injective() {
                     result = result.with_view(ViewOf { base, held, map: full });

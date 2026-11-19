@@ -542,15 +542,22 @@ fn reads_directly(instr: &Instr, k: u32) -> bool {
 /// ([`super::launch::params`]) both decide by this rule. The guard (read by the arithmetic
 /// library, see [`library_for`]) is a scalar that no instruction names.
 pub(super) fn reads_scalars(key: &FusedKey) -> bool {
+    if key.guard.is_some() || key.params.as_ref().is_some_and(|params| params.slots) {
+        return true;
+    }
+    if key.scalar_tys.is_empty() {
+        return false;
+    }
+    if key.tile.is_none() {
+        return true;
+    }
     let programs = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice));
-    key.guard.is_some()
-        || key.params.as_ref().is_some_and(|params| params.slots)
-        || programs.enumerate().any(|(p, instrs)| {
-            instrs.iter().enumerate().any(|(at, instr)| {
-                let baked = key.tile.as_ref().is_some_and(|tile| tile.offsets.get(p).and_then(|row| row.get(at)).is_some_and(Option::is_some));
-                !baked && instr.args.iter().any(|arg| matches!(arg, Ref::Scalar(_)))
-            })
+    programs.enumerate().any(|(p, instrs)| {
+        instrs.iter().enumerate().any(|(at, instr)| {
+            let baked = key.tile.as_ref().is_some_and(|tile| tile.offsets.get(p).and_then(|row| row.get(at)).is_some_and(Option::is_some));
+            !baked && instr.args.iter().any(|arg| matches!(arg, Ref::Scalar(_)))
         })
+    })
 }
 
 /// Workgroup memory a stack kernel may use to write its cells together.
@@ -1305,7 +1312,7 @@ impl Tile {
 /// as functions called per shift.
 pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tuning) -> Option<Tile> {
     // Staged values are 4 bytes wide; programs of the 8-byte types call their sub-programs.
-    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || !key.narrow() || key.writes_bits() {
+    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || key.inlines() || !key.narrow() || key.writes_bits() {
         return None;
     }
     let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)).collect();

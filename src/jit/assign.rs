@@ -17,14 +17,16 @@
 //! view steps by one cell, `Array::assign_lazy` replaces the expression instead and nothing is
 //! written or launched (see the module documentation of [`crate::jit`]).
 
-use std::collections::HashMap;
+use std::cell::OnceCell;
 use std::panic::Location;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::array::{Failure, Storage};
 use crate::builtin::UnOp;
 use crate::context::Context;
 use crate::error::LumaError;
+use crate::gpu::hash::FxMap;
 
 use super::program::{flatten, AtomicOp, Tail};
 use super::{launch, lock, Args, Edge, ElemTy, Held, Node, Op, OpKind, ShiftKind, Src, ViewMap};
@@ -113,13 +115,13 @@ struct Entry {
 /// The pending nodes below the stores through every operand slot (operand 0 of shifts included).
 struct Walk {
     entries: Vec<Entry>,
-    index: HashMap<*const Node, usize>,
+    index: FxMap<*const Node, usize>,
 }
 
 impl Walk {
-    fn new(stores: &[Arc<Node>]) -> Walk {
+    fn new(stores: &[Arc<Node>], current: Option<*const Node>) -> Walk {
         let mut entries: Vec<Entry> = Vec::new();
-        let mut index = HashMap::new();
+        let mut index = FxMap::default();
         let mut edges: Vec<(usize, usize, bool)> = Vec::new();
         let roots = stores.len();
         for (j, store) in stores.iter().enumerate() {
@@ -156,7 +158,8 @@ impl Walk {
         // The temporary clone above is gone: a node nobody else holds is referenced by the entry
         // and by the operand slots that were counted.
         for entry in entries.iter_mut().skip(roots) {
-            entry.private = Arc::strong_count(&entry.node) == entry.slots + 1;
+            let held = usize::from(Some(Arc::as_ptr(&entry.node)) == current);
+            entry.private = Arc::strong_count(&entry.node) == entry.slots + 1 + held;
         }
         loop {
             let mut changed = false;
@@ -198,7 +201,7 @@ impl Walk {
 struct Hazards<'a> {
     regions: &'a [Region],
     stores: &'a [Arc<Node>],
-    walk: &'a Walk,
+    walk: OnceCell<Walk>,
     /// Every region has the same map, so all stores run in one kernel.
     same: bool,
 }
@@ -208,6 +211,10 @@ impl Hazards<'_> {
     /// the module documentation). With `conservative`, also the ones that are only kept because
     /// they would be fused into a kernel with all the stores (they are evaluated before a store
     /// kernel for each region instead).
+    fn walk(&self, current: Option<*const Node>) -> &Walk {
+        self.walk.get_or_init(|| Walk::new(self.stores, current))
+    }
+
     fn flush(&self, conservative: bool) {
         for (j, region) in self.regions.iter().enumerate() {
             let write = region.map.src_box(Edge::None);
@@ -216,7 +223,7 @@ impl Hazards<'_> {
         // The receivers show the assigned data afterwards; what was recorded on top of them
         // before keeps the old values.
         for receiver in self.regions.iter().filter_map(|region| region.receiver.as_ref()) {
-            if self.walk.get(receiver).is_none() {
+            if receiver.consumers.load(Ordering::Relaxed) > 0 && self.walk(None).get(receiver).is_none() {
                 receiver.readers.flush();
             }
         }
@@ -231,9 +238,10 @@ impl Hazards<'_> {
         if self.stores.iter().any(|store| Arc::as_ptr(store) == ptr) {
             return true;
         }
-        let walked = self.walk.get(m);
+        let unconsumed = m.consumers.load(Ordering::Relaxed) == 0;
+        let is_receiver = self.regions.iter().any(|r| r.receiver.as_ref().is_some_and(|rcv| Arc::as_ptr(rcv) == ptr));
         // A receiver the right-hand side does not read.
-        if walked.is_none() && self.regions.iter().any(|r| r.receiver.as_ref().is_some_and(|rcv| Arc::as_ptr(rcv) == ptr)) {
+        if is_receiver && (unconsumed || self.walk(Some(ptr)).get(m).is_none()) {
             return true;
         }
         let Some(reads) = reads(m, &region.base) else { return false };
@@ -246,6 +254,10 @@ impl Hazards<'_> {
         {
             return true;
         }
+        if unconsumed {
+            return false;
+        }
+        let walked = self.walk(Some(ptr)).get(m);
         // A private view of exactly the region, read by the invocation that overwrites the cell
         // after computing its value: each invocation reads and writes its own cell only.
         if !conservative
@@ -464,8 +476,7 @@ pub(crate) fn assign(
 
     ctx.jit().note_write();
     let result = {
-        let walk = Walk::new(&stores);
-        let hazards = Hazards { regions: &regions, stores: &stores, walk: &walk, same };
+        let hazards = Hazards { regions: &regions, stores: &stores, walk: OnceCell::new(), same };
         hazards.flush(false);
         hazards.launch(ctx)
     };
