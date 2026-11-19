@@ -630,10 +630,11 @@ pub(crate) enum Builtin {
     /// state `[done, count]`, the indirect arguments of the next step, their template, uniform
     /// `{tol, step, words}`.
     UntilGate,
-    /// Block Thomas solves, one invocation per line; see [`tridiagonal`]. `block` is the block
-    /// size (1 = scalar), `starts` whether every line begins at its own cell, `workgroup` the
-    /// invocations per workgroup (see [`thomas_plan`]).
-    Tridiagonal { block: u8, starts: bool, workgroup: u8 },
+    /// Block Thomas solves; see [`tridiagonal`]. `block` is the block size (1 = scalar), `starts`
+    /// whether every line begins at its own cell, `workgroup` the invocations per workgroup,
+    /// `twisted` whether two invocations solve a line (see [`thomas_plan`], [`thomas_workgroups`];
+    /// only up to [`UNROLLED_BLOCK`]).
+    Tridiagonal { block: u8, starts: bool, workgroup: u8, twisted: bool },
     /// Cyclic-reduction solves, one workgroup per line; see [`crate::cyclic`]. `block` and
     /// `starts` as for [`Builtin::Tridiagonal`], `workgroup` the invocations per workgroup, rows
     /// that are a multiple of `1 << shift` live in workgroup memory (`shared_rows` of them), the
@@ -1274,20 +1275,41 @@ pub(crate) fn conv_tile(stride: u32, per_thread: u32, wg: u32) -> u32 {
     wg * (per_thread / stride)
 }
 
-/// How the Thomas solve of lines of blocks runs: the invocations per workgroup and the layout of
-/// the scratch `cp`.
+/// How the Thomas solve of lines of blocks runs: the invocations per workgroup, the layout of
+/// the scratch `cp` and whether two invocations solve a line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ThomasPlan {
     pub(crate) workgroup: u8,
     /// Whether `cp` is tiled (see [`thomas_plan`]) rather than one cell after the other.
     pub(crate) tiled: bool,
+    /// Whether two invocations solve a line, one sweeping from each end ([`tridiagonal_body`]),
+    /// rather than one (see [`thomas_plan`]).
+    pub(crate) twisted: bool,
 }
 
 /// Cells per tile of the tiled scratch: a warp.
 const CP_TILE: u32 = 32;
 
-/// The invocations per workgroup and the scratch layout of the Thomas solve of `lines` lines of
-/// `block`-blocks, `stride` cells apart in memory. It runs one invocation per line.
+/// The largest block size and the line count below which the twisted solve is chosen.
+const TWISTED_BLOCK: u32 = 4;
+const TWISTED_LINES: u32 = 8192;
+
+/// The invocations per workgroup, the scratch layout and the line split of the Thomas solve of
+/// `lines` lines of `block`-blocks, `stride` cells apart in memory.
+///
+/// With few lines the solve is latency bound: one invocation walks a long serial chain and the
+/// GPU is nearly idle (RTX 3090, 708k cells: a strided 5x5 solve of 5568 lines of 128 cells had
+/// 87 workgroups of 64 invocations, ~2 warps per multiprocessor, 771 us). A *twisted* solve runs
+/// two invocations per line, one sweeping from each end ([`tridiagonal_body`]), so the chain is
+/// halved and a workgroup of `workgroup` invocations covers `workgroup / 2` lines (`workgroup` is
+/// even). It is chosen for blocks up to [`TWISTED_BLOCK`] and fewer than [`TWISTED_LINES`] lines,
+/// where it measured faster on an RTX 3090 (stacked block-4, 1024 lines: 1516 -> 1100 us and
+/// 1183 -> 709; 1024 lines of 100 cells along axis 2: 113 -> 71; 2048 block-2 lines of 32 cells:
+/// 13.3 -> 10.4; 4096 scalar lines: 2.2 -> 2.0 ms; parts of 4488 lines of 70 cells, evaluated
+/// (lazy): block 1 25.6 -> 22.5 us, block 2 76.8 -> 55.2 (104.5 -> 85.0), block 4 253.9 -> 186.3
+/// (219 -> 182)). It lost with more lines or 5x5 blocks (parts, 13090 lines of 24 cells, block 4:
+/// 150.5 -> 163.1 us (147.1 -> 161.6); 4488 lines of 70, block 5: 280.6 -> 300.9 (216.1 -> 232.4))
+/// and was neutral on a fused 5x5 solve: there the plain solve, one invocation per line, stays.
 ///
 /// Lines along the contiguous axis (or nearly: stride below [`Tuning::line_strided_from`]) have
 /// their cells far apart for neighbouring invocations, so every access is a sector of its own
@@ -1320,17 +1342,27 @@ const CP_TILE: u32 = 32;
 /// `bench_solve --only sweep/` (blocks of 2 to 5, 100 to 1024 strided lines of 32 to 1024 cells).
 pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, parts: bool) -> ThomasPlan {
     if tuning.profile == TuningProfile::Cpu {
-        return ThomasPlan { workgroup: tuning.elementwise_workgroup as u8, tiled: false };
+        return ThomasPlan { workgroup: tuning.elementwise_workgroup as u8, tiled: false, twisted: false };
     }
+    // Few lines of small blocks: latency bound (see above), two invocations per line win.
+    let twisted = block <= TWISTED_BLOCK && lines < TWISTED_LINES;
     if parts && tuning.line_strided_from > 0 && stride >= tuning.line_strided_from && block <= UNROLLED_BLOCK {
         let wanted = match block {
             1 => 32,
             2 => 128,
             _ => 64,
         };
-        return ThomasPlan { workgroup: wanted.min(tuning.elementwise_workgroup) as u8, tiled: block > 1 };
+        return ThomasPlan { workgroup: wanted.min(tuning.elementwise_workgroup) as u8, tiled: block > 1, twisted };
     }
-    ThomasPlan { workgroup: (lines / 512).max(1).next_power_of_two().clamp(8, 32).min(tuning.elementwise_workgroup) as u8, tiled: false }
+    ThomasPlan { workgroup: (lines / 512).max(1).next_power_of_two().clamp(8, 32).min(tuning.elementwise_workgroup) as u8, tiled: false, twisted }
+}
+
+/// The workgroups of the Thomas solve of `lines` lines with `workgroup` invocations per
+/// workgroup: `workgroup / 2` lines each if `twisted` (see [`tridiagonal_body`]), else
+/// `workgroup`.
+pub(crate) fn thomas_workgroups(lines: u32, workgroup: u8, twisted: bool) -> u32 {
+    let per_group = if twisted { u32::from(workgroup) / 2 } else { u32::from(workgroup) };
+    lines.div_ceil(per_group)
 }
 
 /// Floats of the scratch `cp` of one system of `cells` cells of `block`-blocks, in the layout
@@ -1372,10 +1404,11 @@ fn tridiagonal_header(starts: bool, io: &Io) -> String {
 /// Blocks of up to [`UNROLLED_BLOCK`] are generated as straight-line code over scalar variables
 /// (function-local arrays indexed in loops live in per-thread memory, which is slow on every
 /// GPU); larger ones keep the loop form.
-fn tridiagonal(block: u32, starts: bool, wg: u32) -> String {
+fn tridiagonal(block: u32, starts: bool, wg: u32, twisted: bool) -> String {
     if block <= UNROLLED_BLOCK {
-        tridiagonal_unrolled(block as usize, starts, wg)
+        tridiagonal_unrolled(block as usize, starts, wg, twisted)
     } else {
+        assert!(!twisted, "no twisted solve of blocks above {UNROLLED_BLOCK}");
         tridiagonal_loops(block, starts, wg)
     }
 }
@@ -1383,16 +1416,65 @@ fn tridiagonal(block: u32, starts: bool, wg: u32) -> String {
 /// The largest block size the solve is unrolled for.
 pub(crate) const UNROLLED_BLOCK: u32 = 5;
 
-/// The straight-line solve of `b`-blocks. Per cell the forward sweep holds the diagonal block
-/// `m`, the right-hand side `r = [up | rhs]` (all `b x (b + 1)` entries as scalars) and the
-/// previous cell's swept values `pc`/`pd` in registers; it eliminates with partial pivoting
-/// (the pivot row is found with `select`s, rows are exchanged with `select`s, nothing branches)
-/// and writes the swept values for the backward sweep, which carries the solution of the next
-/// cell in registers. For `b == 1` this is the plain Thomas algorithm.
-fn tridiagonal_unrolled(b: usize, starts: bool, wg: u32) -> String {
+/// The straight-line solve of `b`-blocks (see [`tridiagonal_body`] for the algorithm). Per cell a
+/// sweep holds the diagonal block `m`, the right-hand side `r = [coupling block | rhs]` (all
+/// `b x (b + 1)` entries as scalars) and the previous cell's swept values `pc`/`pd` in registers;
+/// it eliminates with partial pivoting (the pivot row is found with `select`s, rows are exchanged
+/// with `select`s, nothing branches) and writes the swept values for the back substitution, which
+/// carries the solution of the next cell in registers. For `b == 1` this is the plain Thomas
+/// algorithm.
+fn tridiagonal_unrolled(b: usize, starts: bool, wg: u32, twisted: bool) -> String {
     let mut src = tridiagonal_header(starts, &Io::buffers(b));
-    src.push_str(&tridiagonal_body(b, starts, wg, 1, &Io::buffers(b), false));
+    src.push_str(&tridiagonal_body(b, starts, wg, 1, &Io::buffers(b), false, twisted));
     src
+}
+
+/// Gaussian elimination with partial pivoting (the first row of largest magnitude wins ties) of
+/// the `b x b` matrix in the scalars `m{i}{j}` with the `w` right-hand side columns `r{i}{j}`,
+/// then back substitution: the solution replaces `r`. Needs `ind` to be inside a block of its own
+/// (declares `best*`, `pv*`, `v*`, ...).
+fn eliminate(src: &mut String, ind: &str, b: usize, w: usize) {
+    for col in 0..b {
+        if col + 1 < b {
+            let _ = writeln!(src, "{ind}var best{col} = abs(m{col}{col});\n{ind}var pv{col} = {col}u;");
+            for i in col + 1..b {
+                let _ = writeln!(
+                    src,
+                    "{ind}let a{col}{i} = abs(m{i}{col});\n{ind}let gt{col}{i} = a{col}{i} > best{col};\n{ind}best{col} = select(best{col}, a{col}{i}, gt{col}{i});\n{ind}pv{col} = select(pv{col}, {i}u, gt{col}{i});"
+                );
+            }
+            for i in col + 1..b {
+                let _ = writeln!(src, "{ind}let sw{col}{i} = pv{col} == {i}u;");
+                let entries = (col..b).map(|j| format!("m{{}}{j}")).chain((0..w).map(|j| format!("r{{}}{j}")));
+                for entry in entries {
+                    let (top, other) = (entry.replace("{}", &col.to_string()), entry.replace("{}", &i.to_string()));
+                    let _ = writeln!(
+                        src,
+                        "{ind}{{ let t = {top}; {top} = select({top}, {other}, sw{col}{i}); {other} = select({other}, t, sw{col}{i}); }}"
+                    );
+                }
+            }
+        }
+        let _ = writeln!(src, "{ind}let v{col} = 1.0 / m{col}{col};");
+        for i in col + 1..b {
+            let _ = writeln!(src, "{ind}let f{col}{i} = m{i}{col} * v{col};");
+            for j in col + 1..b {
+                let _ = writeln!(src, "{ind}m{i}{j} -= f{col}{i} * m{col}{j};");
+            }
+            for j in 0..w {
+                let _ = writeln!(src, "{ind}r{i}{j} -= f{col}{i} * r{col}{j};");
+            }
+        }
+    }
+    for j in 0..w {
+        for i in (0..b).rev() {
+            let mut x = format!("r{i}{j}");
+            for k in i + 1..b {
+                let _ = write!(x, " - m{i}{k} * r{k}{j}");
+            }
+            let _ = writeln!(src, "{ind}r{i}{j} = ({x}) * v{i};");
+        }
+    }
 }
 
 /// The entry point of the straight-line Thomas solve of `systems` systems of `b`-blocks, reading
@@ -1400,9 +1482,29 @@ fn tridiagonal_unrolled(b: usize, starts: bool, wg: u32) -> String {
 /// scratch `cp` holds `b * b` floats per cell and system: entry `k` of cell `q` at `q * b * b + k`,
 /// or with `tiled` (see [`thomas_plan`]) at `(q / 32) * 32 * b * b + 32 * k + q % 32`, and the
 /// system `sys` starts at `thomas_scratch_floats(lines * n, b, tiled)`).
-pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io: &Io, tiled: bool) -> String {
+///
+/// With `twisted` two invocations solve a line (twisted factorisation), halving the serial chain
+/// (see [`thomas_plan`] for when it pays): of the rows `s0..n` of line `l`,
+/// invocation A sweeps the top half `s0..=mid` downwards (`mid = s0 + (n - s0 - 1) / 2`) exactly as
+/// the Thomas algorithm does, `x_r = f'_r - C'_r x_{r+1}`, and invocation B the bottom half
+/// `mid+1..n` upwards, `x_r = g_r - E_r x_{r-1}` (`M = D_r - U_r E_{r+1}`, `E_r = M^-1 L_r`,
+/// `g_r = M^-1 (f_r - U_r g_{r+1})`; `E`/`g` take the places of `C'`/`f'` in the scratch and
+/// `out`). The two swept values at the cut go through workgroup memory and both invocations
+/// solve `(I - C'_mid E_{mid+1}) x_mid = f'_mid - C'_mid g_{mid+1}`, then each back substitutes
+/// its half. A one row line is solved by A alone. A workgroup of `wg` invocations covers `wg / 2`
+/// lines: invocation `t` is side `t / (wg / 2)` of line `group * wg / 2 + t % (wg / 2)`, so a warp
+/// still touches neighbouring lines (coalescing and the tiled scratch work as for one
+/// invocation per line) and every cell's scratch is written and read by one invocation. All
+/// invocations reach the barrier (`busy` instead of an early return).
+///
+/// Without `twisted` one invocation sweeps the whole line (`mid = n - 1`, no exchange, no
+/// barrier), `wg` lines per workgroup.
+pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io: &Io, tiled: bool, twisted: bool) -> String {
+    assert!(!twisted || (wg >= 2 && wg.is_multiple_of(2)), "twisted Thomas workgroup of {wg} invocations: two per line need an even size");
     let w = b + 1;
     let bb = b * b;
+    // Invocations per line, lines per workgroup, floats a line exchanges.
+    let (hb, st) = (if twisted { wg / 2 } else { wg }, bb + b);
     let s0 = if starts { "min(starts[l], p.n)" } else { "0u" };
     let (guard, sys, line, scratch) = if systems > 1 {
         (format!("p.lines * {systems}u"), "    let sys = lg / p.lines;\n", "lg % p.lines", if tiled { format!("sys * (((p.lines * p.n + 31u) & ~31u) * {bb}u)") } else { format!("sys * (p.lines * p.n * {bb}u)") })
@@ -1413,45 +1515,84 @@ pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io
     // The index of entry `k` of the scratch of cell `q`, from `cq` (see above).
     let cp_at = |k: usize| if tiled { format!("cq + {}u", 32 * k) } else { format!("cq + {k}u") };
     let cq_expr = if tiled { format!("so + (q >> 5u) * {}u + (q & 31u)", 32 * bb) } else { format!("so + q * {bb}u") };
+    let (exchange, side, step) = if twisted { (format!("var<workgroup> xch: array<f32, {}>;\n", wg * st as u32), format!("tid / {hb}u"), 2) } else { (String::new(), "0u".to_owned(), 1) };
     let _ = write!(
         src,
-        "@compute @workgroup_size({wg})
+        "{exchange}@compute @workgroup_size({wg})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
-    let lg = gid.x + gid.y * nwg.x * {wg}u;
-    if (lg >= {guard}) {{ return; }}
+    let gi = gid.x + gid.y * nwg.x * {wg}u;
+    let tid = gi % {wg}u;
+    let side = {side};
+    let lt = tid % {hb}u;
+    let lg = (gi / {wg}u) * {hb}u + lt;
+    let live = lg < {guard};
 {sys}    let l = {line};
     let so = {scratch};
     let base = line_base(l);
-    let s0 = {s0};
-    for (var s = 0u; s < s0; s++) {{
-        let q = base + s * p.stride;
+    var s0 = p.n;
+    if (live) {{
+        s0 = {s0};
+        for (var s = side; s < s0; s += {step}u) {{
+            let q = base + s * p.stride;
 "
     );
     let zeros: Vec<String> = vec!["0.0".to_owned(); b];
-    src.push_str(&io.store("        ", "q", &zeros));
-    src.push_str("    }\n    if (s0 >= p.n) { return; }\n");
+    src.push_str(&io.store("            ", "q", &zeros));
+    src.push_str("        }\n    }\n    let busy = live && s0 < p.n;\n");
+    if twisted {
+        src.push_str(
+            "    let mid = s0 + (max(p.n - s0, 1u) - 1u) / 2u;
+    let hasb = mid + 1u < p.n;
+    var nrows = 0u;
+    if (busy) { nrows = select(mid + 1u - s0, p.n - 1u - mid, side == 1u); }
+",
+        );
+    } else {
+        src.push_str("    let mid = p.n - 1u;\n    var nrows = 0u;\n    if (busy) { nrows = p.n - s0; }\n");
+    }
     for i in 0..b {
         for j in 0..b {
             let _ = writeln!(src, "    var pc{i}{j} = 0.0;");
         }
         let _ = writeln!(src, "    var pd{i} = 0.0;");
     }
-    let _ = write!(src, "    for (var s = s0; s < p.n; s++) {{\n        let q = base + s * p.stride;\n        let cq = {cq_expr};\n");
-    src.push_str(&io.load("        ", "q"));
+    // The sweep of this invocation's half: A from `s0` down, B from `n - 1` up. The block that
+    // the row's right-hand block is taken from (A: `up`, B: `lo`) is read always, the one that
+    // couples to the previous row of the sweep (A: `lo`, B: `up`) from the second row on.
+    let _ = write!(src, "    for (var k = 0u; k < nrows; k++) {{\n        let s = select(s0 + k, p.n - 1u - k, side == 1u);\n        let q = base + s * p.stride;\n        let cq = {cq_expr};\n");
+    src.push_str(&io.load_core("        ", "q"));
     for i in 0..b {
         for j in 0..b {
-            let _ = writeln!(src, "        var m{i}{j} = {};", io.diag("q", i * b + j));
-            let _ = writeln!(src, "        var r{i}{j} = {};", io.up("q", i * b + j));
+            let _ = writeln!(src, "        var m{i}{j} = {};\n        var r{i}{j} = 0.0;\n        var l{i}{j} = 0.0;", io.diag("q", i * b + j));
         }
         let _ = writeln!(src, "        var r{i}{b} = {};", io.rhs("q", i));
     }
-    src.push_str("        if (s > s0) {\n");
-    src.push_str(&io.load_lo("            ", "q"));
-    for i in 0..b {
-        for k in 0..b {
-            let _ = writeln!(src, "            let l{i}{k} = {};", io.lo("q", i * b + k));
+    for (id, own, other) in [(0, "up", "lo"), (1, "lo", "up")].into_iter().take(if twisted { 2 } else { 1 }) {
+        let load = |name: &str, ind: &str| if name == "up" { io.load_up(ind, "q") } else { io.load_lo(ind, "q") };
+        let entry = |name: &str, k: usize| if name == "up" { io.up("q", k) } else { io.lo("q", k) };
+        let head = if !twisted { "        {" } else if id == 0 { "        if" } else { " else if" };
+        if twisted {
+            let _ = writeln!(src, "{head} (side == {id}u) {{");
+        } else {
+            let _ = writeln!(src, "{head}");
         }
+        src.push_str(&load(own, "            "));
+        for i in 0..b {
+            for j in 0..b {
+                let _ = writeln!(src, "            r{i}{j} = {};", entry(own, i * b + j));
+            }
+        }
+        src.push_str("            if (k > 0u) {\n");
+        src.push_str(&load(other, "                "));
+        for i in 0..b {
+            for j in 0..b {
+                let _ = writeln!(src, "                l{i}{j} = {};", entry(other, i * b + j));
+            }
+        }
+        src.push_str("            }\n        }");
     }
+    src.push('\n');
+    src.push_str("        if (k > 0u) {\n");
     for i in 0..b {
         for j in 0..b {
             let sum = (0..b).map(|k| format!("l{i}{k} * pc{k}{j}")).collect::<Vec<_>>().join(" + ");
@@ -1461,49 +1602,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         let _ = writeln!(src, "            r{i}{b} -= {sum};");
     }
     src.push_str("        }\n");
-    // Elimination with partial pivoting (the first row of largest magnitude wins ties).
-    for col in 0..b {
-        if col + 1 < b {
-            let _ = writeln!(src, "        var best{col} = abs(m{col}{col});\n        var pv{col} = {col}u;");
-            for i in col + 1..b {
-                let _ = writeln!(
-                    src,
-                    "        let a{col}{i} = abs(m{i}{col});\n        let gt{col}{i} = a{col}{i} > best{col};\n        best{col} = select(best{col}, a{col}{i}, gt{col}{i});\n        pv{col} = select(pv{col}, {i}u, gt{col}{i});"
-                );
-            }
-            for i in col + 1..b {
-                let _ = writeln!(src, "        let sw{col}{i} = pv{col} == {i}u;");
-                let entries = (col..b).map(|j| format!("m{{}}{j}")).chain((0..w).map(|j| format!("r{{}}{j}")));
-                for entry in entries {
-                    let (top, other) = (entry.replace("{}", &col.to_string()), entry.replace("{}", &i.to_string()));
-                    let _ = writeln!(
-                        src,
-                        "        {{ let t = {top}; {top} = select({top}, {other}, sw{col}{i}); {other} = select({other}, t, sw{col}{i}); }}"
-                    );
-                }
-            }
-        }
-        let _ = writeln!(src, "        let v{col} = 1.0 / m{col}{col};");
-        for i in col + 1..b {
-            let _ = writeln!(src, "        let f{col}{i} = m{i}{col} * v{col};");
-            for j in col + 1..b {
-                let _ = writeln!(src, "        m{i}{j} -= f{col}{i} * m{col}{j};");
-            }
-            for j in 0..w {
-                let _ = writeln!(src, "        r{i}{j} -= f{col}{i} * r{col}{j};");
-            }
-        }
-    }
-    // Back substitution of the eliminated system.
-    for j in 0..w {
-        for i in (0..b).rev() {
-            let mut x = format!("r{i}{j}");
-            for k in i + 1..b {
-                let _ = write!(x, " - m{i}{k} * r{k}{j}");
-            }
-            let _ = writeln!(src, "        r{i}{j} = ({x}) * v{i};");
-        }
-    }
+    eliminate(&mut src, "        ", b, w);
     for i in 0..b {
         for j in 0..b {
             let _ = writeln!(src, "        cp[{}] = r{i}{j};\n        pc{i}{j} = r{i}{j};", cp_at(i * b + j));
@@ -1513,11 +1612,53 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let swept: Vec<String> = (0..b).map(|i| format!("r{i}{b}")).collect();
     src.push_str(&io.store("        ", "q", &swept));
     src.push_str("    }\n");
-    // The solution of the last cell is its swept right-hand side, still in `pd`.
-    for i in 0..b {
-        let _ = writeln!(src, "    var x{i} = pd{i};");
+    // The solution of a one row line (or of the whole line's last row) is its swept right-hand
+    // side, still in `pd`.
+    let write_x = |src: &mut String| {
+        for i in 0..b {
+            let _ = writeln!(src, "    var x{i} = pd{i};");
+        }
+    };
+    if twisted {
+        // The swept values at the cut: C' and f' of A's last row, E and g of B's first row.
+        src.push_str("    if (busy) {\n");
+        for i in 0..b {
+            for j in 0..b {
+                let _ = writeln!(src, "        xch[tid * {st}u + {}u] = pc{i}{j};", i * b + j);
+            }
+            let _ = writeln!(src, "        xch[tid * {st}u + {}u] = pd{i};", bb + i);
+        }
+        src.push_str("    }\n    workgroupBarrier();\n");
+        write_x(&mut src);
+        src.push_str("    var back = 0u;\n    if (busy && hasb) {\n");
+        let _ = writeln!(src, "        let ca = lt * {st}u;\n        let cb = {}u + ca;", hb as usize * st);
+        for i in 0..b {
+            for j in 0..b {
+                let sum = (0..b).map(|k| format!("xch[ca + {}u] * xch[cb + {}u]", i * b + k, k * b + j)).collect::<Vec<_>>().join(" + ");
+                let _ = writeln!(src, "        var m{i}{j} = {}.0 - ({sum});", u8::from(i == j));
+            }
+            let sum = (0..b).map(|k| format!("xch[ca + {}u] * xch[cb + {}u]", i * b + k, bb + k)).collect::<Vec<_>>().join(" + ");
+            let _ = writeln!(src, "        var r{i}0 = xch[ca + {}u] - ({sum});", bb + i);
+        }
+        eliminate(&mut src, "        ", b, 1);
+        // `r` is x_mid; x_{mid+1} = g - E x_mid. Each side keeps its own row.
+        for i in 0..b {
+            let sum = (0..b).map(|k| format!("xch[cb + {}u] * r{k}0", i * b + k)).collect::<Vec<_>>().join(" + ");
+            let _ = writeln!(src, "        x{i} = select(r{i}0, xch[cb + {}u] - ({sum}), side == 1u);", bb + i);
+        }
+        src.push_str("        let q = base + (mid + side) * p.stride;\n");
+        let solved: Vec<String> = (0..b).map(|i| format!("x{i}")).collect();
+        src.push_str(&io.store("        ", "q", &solved));
+        src.push_str("        back = select(mid - s0, p.n - mid - 2u, side == 1u);\n    }\n");
+    } else {
+        write_x(&mut src);
+        src.push_str("    var back = 0u;\n    if (busy) { back = mid - s0; }\n");
     }
-    let _ = write!(src, "    for (var j = 2u; j <= p.n - s0; j++) {{\n        let q = base + (p.n - j) * p.stride;\n        let cq = {cq_expr};\n");
+    // Back substitution of the rest of the half: A from `mid - 1` down, B from `mid + 2` up.
+    let _ = write!(
+        src,
+        "    for (var k = 0u; k < back; k++) {{\n        let s = select(mid - 1u - k, mid + 2u + k, side == 1u);\n        let q = base + s * p.stride;\n        let cq = {cq_expr};\n"
+    );
     src.push_str(&io.load_out("        ", "q", "yo"));
     for i in 0..b {
         let sum = (0..b).map(|k| format!("cp[{}] * x{k}", cp_at(i * b + k))).collect::<Vec<_>>().join(" + ");
@@ -1848,7 +1989,7 @@ impl Builtin {
             Builtin::Conv1dTiled(stride, per_thread) => wgsl(conv1d_tiled(stride, per_thread, tuning.conv_workgroup)),
             Builtin::Fft(pass) => wgsl(crate::fft::source(pass)),
             Builtin::UntilGate => BuiltinKernel::Module(until_gate_module()),
-            Builtin::Tridiagonal { block, starts, workgroup } => wgsl(tridiagonal(block as u32, starts, u32::from(workgroup))),
+            Builtin::Tridiagonal { block, starts, workgroup, twisted } => wgsl(tridiagonal(block as u32, starts, u32::from(workgroup), twisted)),
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
                 wgsl(crate::cyclic::source(u32::from(block), starts, u32::from(workgroup), u32::from(shift), shared_rows))
             }

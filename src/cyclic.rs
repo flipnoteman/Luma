@@ -155,12 +155,21 @@ fn layout(tuning: &Tuning, block: u32, n: u32) -> (u8, u32) {
 /// lines of 122 rows: 157 us to 130 us). One of 41 rows of `bench_solve --only sweep/` that
 /// changed got slower (8x8 blocks, 256 strided lines of 64 rows: 122 us to 136 us, 36 KiB per
 /// workgroup against 18 KiB with half the rows spilled).
-pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32, parts: bool, max_scratch: u64) -> Option<Plan> {
+///
+/// Stacked blocks past `builtin::UNROLLED_BLOCK` (6x6, 8x8), measured on an RTX 3090 with
+/// `bench_solve --only sweep/` (`LUMA_TRIDIAGONAL=auto|cyclic|thomas`): Thomas, whose thread
+/// eliminates the blocks with dynamic indexing, is 10x to 25x slower than cyclic reduction in
+/// every row (6x6, 100 lines of 50: 756.7 us vs 27.6 us; 8x8, 200 lines of 100: 4167.6 vs 217.8;
+/// 256 lines of 64: 5284.9 vs 219.1), and the line-count rule above picked it for many lines
+/// (6x6, 400 lines of 200: 1743.9 us vs 217.1; 8x8: 8388.4 vs 789.2 and 4085.8 vs 709.4), so
+/// these always take cyclic reduction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32, parts: bool, fused: bool, max_scratch: u64) -> Option<Plan> {
     if tuning.line_solver == LineSolver::Thomas || n == 0 || lines == 0 {
         return None;
     }
     let (shift, shared_rows) = layout(tuning, block, n);
-    let workgroup = workgroup_size(tuning, block, n, stride > 1);
+    let workgroup = workgroup_size(tuning, block, n, stride > 1, fused);
     let plan = Plan { workgroup, shift, shared_rows };
     // A single row must fit the budget, and the scratch a buffer.
     if u64::from(shared_rows) * row_bytes(block) > u64::from(tuning.line_bytes) || plan.scratch_bytes(block, n, lines) > max_scratch {
@@ -175,6 +184,10 @@ pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32,
     if tuning.line_solver == LineSolver::Auto {
         if tuning.line_cyclic_work == 0 {
             return None;
+        }
+        // The Thomas kernel of blocks past the unrolled size is far slower at any line count.
+        if !parts && block > crate::builtin::UNROLLED_BLOCK {
+            return Some(plan);
         }
         let weight = match (parts, stride == 1) {
             (true, true) => return Some(plan),
@@ -198,15 +211,18 @@ pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32,
 /// 256 29 us); the cap is 256, or 128 for blocks of 3 and 4 along a strided axis, where the
 /// uncoalesced reads of more rows at once stop paying (200 rows of 3x3 blocks, 400 lines: 128 47
 /// us, 256 61 us). Blocks of 5, eliminated with many registers, take one per row up to 128 along
-/// the contiguous axis, else one per 8 rows (the old rule, up to 64: 100 rows, 200 lines: 32
-/// threads 42 us, 128 61 us). Bigger blocks take one per 8 rows up to 64.
-fn workgroup_size(tuning: &Tuning, block: u32, n: u32, strided: bool) -> u16 {
+/// the contiguous axis or when some part is computed inside the kernel (`fused`: each row's entries
+/// are an expensive expression; bowshock's 3D wedge, 156 strided lines of 140 rows, RTX 3090: f32
+/// 289.9 to 271.3 us per step, where evaluated strided lines slow down, 156x122 axis2 27.6 to 37.6
+/// us), else one per 8 rows (the old rule, up to 64: 100 rows, 200 lines: 32 threads 42 us, 128
+/// 61 us). Bigger blocks take one per 8 rows up to 64.
+fn workgroup_size(tuning: &Tuning, block: u32, n: u32, strided: bool, fused: bool) -> u16 {
     let rows = n.next_multiple_of(32);
     let wanted = match block {
         1 => n.div_ceil(2).next_power_of_two().clamp(32, 256),
         2 => rows.clamp(32, 256),
         3 | 4 => rows.clamp(32, if strided { 128 } else { 256 }),
-        5 if !strided => rows.clamp(32, 128),
+        5 if !strided || fused => rows.clamp(32, 128),
         _ => n.div_ceil(8).next_power_of_two().clamp(32, 64),
     };
     wanted.min(tuning.elementwise_workgroup.max(1)) as u16
@@ -658,5 +674,26 @@ fn eliminate(src: &mut String, ind: &str, b: usize, w: usize) {
             }
             let _ = writeln!(src, "{ind}r{i}_{j} = ({x}) * v{i};");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auto() -> Tuning {
+        Tuning { line_solver: LineSolver::Auto, line_cyclic_work: 8192, line_bytes: 48 * 1024, ..Tuning::for_tests() }
+    }
+
+    #[test]
+    fn auto_takes_cyclic_for_stacked_blocks_above_the_unrolled_size() {
+        let tuning = auto();
+        for stride in [1, 400] {
+            assert!(plan(&tuning, 8, 400, 200, stride, false, false, u64::MAX).is_some());
+            assert!(plan(&tuning, 6, 100, 50, stride, false, false, u64::MAX).is_some());
+            assert!(plan(&tuning, 5, 400, 4000, stride, false, false, u64::MAX).is_none());
+        }
+        let off = Tuning { line_cyclic_work: 0, ..auto() };
+        assert!(plan(&off, 8, 400, 200, 1, false, false, u64::MAX).is_none());
     }
 }

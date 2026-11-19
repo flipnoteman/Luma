@@ -65,15 +65,27 @@ impl Io {
         if self.parts {
             return format!("{ind}let cell = luma_cell(sys, {q});\n");
         }
-        let (b, bb) = (self.block, self.block * self.block);
-        let mut src = String::new();
-        if self.vec_coef() {
-            for (name, local) in [("diag", "bd"), ("up", "bu")] {
-                for v in 0..bb / 4 {
-                    let _ = writeln!(src, "{ind}let {local}{v} = {name}[{q} * {}u + {v}u];", bb / 4);
-                }
-            }
+        let mut src = self.load_vec(ind, q, "diag", "bd");
+        src.push_str(&self.load_vec(ind, q, "up", "bu"));
+        src.push_str(&self.load_rhs(ind, q));
+        src
+    }
+
+    /// Statements that make the diagonal block and the right-hand side of cell `q` available
+    /// (see [`Io::load`]); the parts come along with the others. With [`Io::load_lo`] and
+    /// [`Io::load_up`] for the off-diagonal blocks a sweep needs.
+    pub(crate) fn load_core(&self, ind: &str, q: &str) -> String {
+        if self.parts {
+            return format!("{ind}let cell = luma_cell(sys, {q});\n");
         }
+        let mut src = self.load_vec(ind, q, "diag", "bd");
+        src.push_str(&self.load_rhs(ind, q));
+        src
+    }
+
+    fn load_rhs(&self, ind: &str, q: &str) -> String {
+        let b = self.block;
+        let mut src = String::new();
         if self.vec_rhs() {
             for v in 0..b / 4 {
                 let _ = writeln!(src, "{ind}let br{v} = rhs[{q} * {}u + {v}u];", b / 4);
@@ -82,17 +94,27 @@ impl Io {
         src
     }
 
-    /// Statements that make the lower block of cell `q` available (see [`Io::load`]); the parts
-    /// come along with the others.
-    pub(crate) fn load_lo(&self, ind: &str, q: &str) -> String {
+    /// The `vec4` reads of the coefficient buffer `name` of cell `q` into the locals `local{v}`.
+    fn load_vec(&self, ind: &str, q: &str, name: &str, local: &str) -> String {
         let bb = self.block * self.block;
         let mut src = String::new();
         if self.vec_coef() {
             for v in 0..bb / 4 {
-                let _ = writeln!(src, "{ind}let bl{v} = lo[{q} * {}u + {v}u];", bb / 4);
+                let _ = writeln!(src, "{ind}let {local}{v} = {name}[{q} * {}u + {v}u];", bb / 4);
             }
         }
         src
+    }
+
+    /// Statements that make the lower block of cell `q` available (see [`Io::load`]); the parts
+    /// come along with the others.
+    pub(crate) fn load_lo(&self, ind: &str, q: &str) -> String {
+        self.load_vec(ind, q, "lo", "bl")
+    }
+
+    /// Statements that make the upper block of cell `q` available (see [`Io::load_lo`]).
+    pub(crate) fn load_up(&self, ind: &str, q: &str) -> String {
+        self.load_vec(ind, q, "up", "bu")
     }
 
     fn coef(&self, buffer: &str, local: &str, offset: usize, q: &str, k: usize) -> String {
@@ -192,9 +214,11 @@ impl Io {
 /// How the lines of a system are solved.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Algo {
-    /// One invocation per line, `workgroup` per workgroup, the scratch `tiled` or not
+    /// `workgroup` invocations per workgroup, the scratch `tiled` or not, and with `twisted` two
+    /// invocations per line (one sweeping from each end, meeting in the middle: half the serial
+    /// chain; `workgroup / 2` lines per workgroup), else one
     /// ([`Builtin::Tridiagonal`](crate::builtin::Builtin), [`thomas_plan`](crate::builtin::thomas_plan)).
-    Thomas { workgroup: u8, tiled: bool },
+    Thomas { workgroup: u8, tiled: bool, twisted: bool },
     /// One workgroup per line ([`cyclic`]).
     Cyclic { workgroup: u16, shift: u8, shared_rows: u32 },
 }
@@ -285,7 +309,7 @@ impl SolveSpec {
                 &cyclic::Config { block: u32::from(self.block), workgroup: u32::from(workgroup), shift: u32::from(shift), shared_rows, starts: self.starts, systems },
                 &io,
             ),
-            Algo::Thomas { workgroup, tiled } => crate::builtin::tridiagonal_body(block, self.starts, u32::from(workgroup), systems, &io, tiled),
+            Algo::Thomas { workgroup, tiled, twisted } => crate::builtin::tridiagonal_body(block, self.starts, u32::from(workgroup), systems, &io, tiled, twisted),
         }
     }
 

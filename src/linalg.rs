@@ -18,12 +18,12 @@ use std::panic::Location;
 use std::sync::Arc;
 
 use crate::array::{Array, Failure};
-use crate::builtin::{thomas_plan, thomas_scratch_floats, Builtin, UNROLLED_BLOCK};
+use crate::builtin::{thomas_plan, thomas_scratch_floats, thomas_workgroups, Builtin, UNROLLED_BLOCK};
 use crate::cyclic;
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::jit::PartSide;
-use crate::ops::{fold_workgroups, workgroups_1d, Outcome};
+use crate::ops::{fold_workgroups, Outcome};
 use crate::shape::Shape;
 use crate::solve::{Algo, Io, SolveSpec};
 use crate::tuning::Tuning;
@@ -354,7 +354,7 @@ fn run(
     let mut scratch = Scratch::new(ctx);
     let params = [n, stride, lines32];
     let tuning = tuning.unwrap_or(*ctx.tuning());
-    let (core, groups, scratch_bytes) = if let Some(plan) = cyclic::plan(&tuning, b as u32, n, lines32, stride, false, ctx.max_buffer_bytes()) {
+    let (core, groups, scratch_bytes) = if let Some(plan) = cyclic::plan(&tuning, b as u32, n, lines32, stride, false, false, ctx.max_buffer_bytes()) {
         let core = ctx.builtin(
             Builtin::CyclicTridiagonal {
                 block: b as u8,
@@ -367,9 +367,9 @@ fn run(
         )?;
         (core, fold_workgroups(ctx, lines32)?, plan.scratch_bytes(b as u32, n, lines32))
     } else {
-        let workgroup = thomas_plan(&tuning, b as u32, lines32, stride, false).workgroup;
-        let core = ctx.builtin(Builtin::Tridiagonal { block: b as u8, starts: start.is_some(), workgroup }, "f32")?;
-        let groups = workgroups_1d(ctx, &core, lines32)?;
+        let plan = thomas_plan(&tuning, b as u32, lines32, stride, false);
+        let core = ctx.builtin(Builtin::Tridiagonal { block: b as u8, starts: start.is_some(), workgroup: plan.workgroup, twisted: plan.twisted }, "f32")?;
+        let groups = fold_workgroups(ctx, thomas_workgroups(lines32, plan.workgroup, plan.twisted))?;
         (core, groups, cells as u64 * (b * b) as u64 * 4)
     };
     let scratch_buffer = if scratch_bytes > 0 { Some(scratch.take(scratch_bytes)?) } else { None };
@@ -453,13 +453,14 @@ fn run_parts(
     let total = to_u32(lines * systems)?;
     let tuning = tuning.unwrap_or(*ctx.tuning());
     let b32 = block as u32;
-    let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, true, ctx.max_buffer_bytes()) {
+    let fused = sides.iter().any(|s| matches!(s, PartSide::Pending(_)));
+    let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, true, fused, ctx.max_buffer_bytes()) {
         Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
     } else if block <= UNROLLED_BLOCK as usize
         && let thomas = thomas_plan(&tuning, b32, total, stride32, true)
         && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, thomas.tiled, ctx.max_buffer_bytes())
     {
-        Some((Algo::Thomas { workgroup: thomas.workgroup, tiled: thomas.tiled }, bytes))
+        Some((Algo::Thomas { workgroup: thomas.workgroup, tiled: thomas.tiled, twisted: thomas.twisted }, bytes))
     } else {
         None
     };
@@ -506,7 +507,7 @@ fn launch_parts(
     let total = words[2] * u32::from(spec.systems);
     let groups = match spec.algo {
         Algo::Cyclic { .. } => fold_workgroups(ctx, total)?,
-        Algo::Thomas { workgroup, .. } => fold_workgroups(ctx, total.div_ceil(u32::from(workgroup)))?,
+        Algo::Thomas { workgroup, twisted, .. } => fold_workgroups(ctx, thomas_workgroups(total, workgroup, twisted))?,
     };
     if !crate::jit::solve(ctx, sides, spec, words, groups, [total, 1, 1], &writes, starts)? {
         return Ok(None);
@@ -813,26 +814,74 @@ mod tests {
         parts_check(&ctx, thomas_strided(), 1, 2, 40, 33, 1, false, Kind::Pending, 3);
     }
 
+    /// The twisted solve (two invocations per line meeting in the middle) of lines of 1 to 4
+    /// cells, which have a top half only, halves of one or two cells, with starts up to and past
+    /// the end, stacked and on parts, in workgroups with lines left over.
+    #[test]
+    fn thomas_solves_short_lines() {
+        let ctx = Context::new().unwrap();
+        for n in 1..=4usize {
+            for starts in [false, true] {
+                for b in [0usize, 1, 2, 3, 5] {
+                    for axis in 0..2 {
+                        check(&ctx, thomas(), b, n, 13, axis, starts, (n * 5 + b) as u64);
+                    }
+                }
+                for b in 1..=5usize {
+                    for kind in [Kind::Evaluated, Kind::Pending] {
+                        parts_check(&ctx, thomas(), b, 1, n, 13, 0, starts, kind, (n * 9 + b) as u64);
+                        parts_check(&ctx, thomas_strided(), b, 1, n, 37, 1, starts, kind, (n * 11 + b) as u64);
+                    }
+                }
+                parts_check(&ctx, thomas(), 1, 2, n, 13, 0, starts, Kind::Pending, 5);
+            }
+        }
+    }
+
+    /// The one invocation per line solve of lines of small blocks (the plan picks it from 8192
+    /// lines on), the same lines as [`thomas_solves_short_lines`].
+    #[test]
+    fn plain_thomas_solves_short_lines() {
+        let ctx = Context::new().unwrap();
+        let lines = 8200;
+        for n in [1usize, 2, 3, 4] {
+            for starts in [false, true] {
+                for b in [0usize, 1, 2, 4] {
+                    check(&ctx, thomas(), b, n, lines, 0, starts, (n * 5 + b) as u64);
+                }
+                for b in [1usize, 2, 4] {
+                    parts_check(&ctx, thomas_strided(), b, 1, n, lines, 1, starts, Kind::Pending, (n * 11 + b) as u64);
+                }
+            }
+        }
+        assert!(!thomas_plan(&thomas(), 2, lines as u32, 1, false).twisted);
+        assert!(thomas_plan(&thomas(), 2, 8191, 1, false).twisted);
+    }
+
     #[test]
     fn thomas_plan_widens_strided_lines() {
         let nvidia = Tuning { profile: TuningProfile::Nvidia, line_strided_from: 16, ..Tuning::for_tests() };
+        let plan = |workgroup, tiled, twisted| ThomasPlan { workgroup, tiled, twisted };
         // Strided lines of blocks of 2 to 5: a warp or more per workgroup and a tiled scratch.
-        assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, true), ThomasPlan { workgroup: 64, tiled: true });
-        assert_eq!(thomas_plan(&nvidia, 2, 4096, 16, true), ThomasPlan { workgroup: 128, tiled: true });
+        assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, true), plan(64, true, false));
+        assert_eq!(thomas_plan(&nvidia, 2, 4096, 16, true), plan(128, true, true));
         // Scalars: no tile (it is the same layout), a warp.
-        assert_eq!(thomas_plan(&nvidia, 1, 4096, 64, true), ThomasPlan { workgroup: 32, tiled: false });
+        assert_eq!(thomas_plan(&nvidia, 1, 4096, 64, true), plan(32, false, true));
         // Contiguous lines, strides below 16 and blocks above 5: the narrow workgroups of one
         // invocation per line and the scratch one cell after the other.
-        assert_eq!(thomas_plan(&nvidia, 5, 1680, 1, true), ThomasPlan { workgroup: 8, tiled: false });
-        assert_eq!(thomas_plan(&nvidia, 5, 13090, 8, true), ThomasPlan { workgroup: 32, tiled: false });
-        assert_eq!(thomas_plan(&nvidia, 6, 4488, 187, true), ThomasPlan { workgroup: 8, tiled: false });
+        assert_eq!(thomas_plan(&nvidia, 5, 1680, 1, true), plan(8, false, false));
+        assert_eq!(thomas_plan(&nvidia, 5, 13090, 8, true), plan(32, false, false));
+        assert_eq!(thomas_plan(&nvidia, 6, 4488, 187, true), plan(8, false, false));
         // Stacked blocks too.
-        assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, false), ThomasPlan { workgroup: 8, tiled: false });
+        assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, false), plan(8, false, false));
+        assert_eq!(thomas_plan(&nvidia, 4, 1024, 187, false), plan(8, false, true));
+        // Many lines: the plain solve.
+        assert_eq!(thomas_plan(&nvidia, 4, 13090, 8, true), plan(32, false, false));
         // Other devices keep the old rule.
         let other = Tuning { line_strided_from: 0, ..nvidia };
-        assert_eq!(thomas_plan(&other, 5, 4488, 187, true), ThomasPlan { workgroup: 8, tiled: false });
+        assert_eq!(thomas_plan(&other, 5, 4488, 187, true), plan(8, false, false));
         let cpu = Tuning { profile: TuningProfile::Cpu, elementwise_workgroup: 64, ..nvidia };
-        assert_eq!(thomas_plan(&cpu, 5, 4488, 187, true), ThomasPlan { workgroup: 64, tiled: false });
+        assert_eq!(thomas_plan(&cpu, 4, 1024, 187, true), plan(64, false, false));
     }
 
     #[test]
@@ -1016,17 +1065,17 @@ mod tests {
     fn plan_follows_the_workgroup_memory_budget() {
         let tuning = Tuning { line_solver: LineSolver::Cyclic, line_bytes: 16 * 1024, ..Tuning::for_tests() };
         // 3 floats per row of a scalar line: 1024 rows fit, 4096 keep every fourth row (1024) in workgroup memory.
-        let fits = crate::cyclic::plan(&tuning, 1, 1024, 10, 1, false, u64::MAX).unwrap();
+        let fits = crate::cyclic::plan(&tuning, 1, 1024, 10, 1, false, false, u64::MAX).unwrap();
         assert_eq!((fits.shift, fits.shared_rows), (0, 1024));
-        let spills = crate::cyclic::plan(&tuning, 1, 4096, 10, 1, false, u64::MAX).unwrap();
+        let spills = crate::cyclic::plan(&tuning, 1, 4096, 10, 1, false, false, u64::MAX).unwrap();
         assert_eq!((spills.shift, spills.shared_rows), (2, 1024));
         assert_eq!(spills.scratch_bytes(1, 4096, 10), 10 * 3072 * 3 * 4);
         // Blocks of 4: nine vec4s per row.
-        let block = crate::cyclic::plan(&tuning, 4, 1024, 10, 1, false, u64::MAX).unwrap();
+        let block = crate::cyclic::plan(&tuning, 4, 1024, 10, 1, false, false, u64::MAX).unwrap();
         assert!(u64::from(block.shared_rows) * 9 * 16 <= 16 * 1024 && block.shift > 0);
         // Spilled lines in one 32-row bucket share the layout and the kernel; the scratch follows each exact length.
-        let a = crate::cyclic::plan(&tuning, 4, 300, 10, 1, false, u64::MAX).unwrap();
-        let b = crate::cyclic::plan(&tuning, 4, 312, 10, 1, false, u64::MAX).unwrap();
+        let a = crate::cyclic::plan(&tuning, 4, 300, 10, 1, false, false, u64::MAX).unwrap();
+        let b = crate::cyclic::plan(&tuning, 4, 312, 10, 1, false, false, u64::MAX).unwrap();
         assert_eq!((a.shift, a.shared_rows), (2, 96));
         assert_eq!((b.shift, b.shared_rows), (a.shift, a.shared_rows));
         assert_eq!(
@@ -1048,29 +1097,29 @@ mod tests {
         assert_eq!(a.scratch_bytes(4, 300, 10), 10 * (300 - 75) * 9 * 16);
         assert_eq!(b.scratch_bytes(4, 312, 10), 10 * (312 - 78) * 9 * 16);
         // The scratch must fit a buffer, or Thomas runs.
-        assert!(crate::cyclic::plan(&tuning, 4, 1024, 10, 1, false, 1000).is_none());
+        assert!(crate::cyclic::plan(&tuning, 4, 1024, 10, 1, false, false, 1000).is_none());
         let thomas = Tuning { line_solver: LineSolver::Thomas, ..tuning };
-        assert!(crate::cyclic::plan(&thomas, 1, 1024, 10, 1, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&thomas, 1, 1024, 10, 1, false, false, u64::MAX).is_none());
         // The automatic choice: few lines yes, many lines no, strided lines sooner than contiguous
         // ones, bigger blocks sooner than small ones.
         let auto = Tuning { line_solver: LineSolver::Auto, line_cyclic_work: 8192, ..tuning };
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 200, 1, false, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 8192, 1, false, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 8193, 1, false, u64::MAX).is_none());
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 4096, 4096, false, u64::MAX).is_none());
-        assert!(crate::cyclic::plan(&auto, 1, 4096, 1024, 1024, false, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 4, 1024, 100, 1, false, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 4, 1024, 1024, 1, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 200, 1, false, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 8192, 1, false, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 8193, 1, false, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 4096, 4096, false, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 1, 4096, 1024, 1024, false, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 1024, 100, 1, false, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 1024, 1024, 1, false, false, u64::MAX).is_none());
         // Parts: contiguous lines always (5x5 blocks, 1680 lines of 187 were 9x faster than
         // Thomas); strided ones up to `8192 / (2 max(block, 2))` lines, half that for a line that
         // spills.
-        assert!(crate::cyclic::plan(&auto, 5, 187, 1680, 1, true, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 4, 70, 1024, 70, true, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 4, 70, 1025, 70, true, u64::MAX).is_none());
-        assert!(crate::cyclic::plan(&auto, 4, 1024, 512, 1024, true, u64::MAX).is_some());
-        assert!(crate::cyclic::plan(&auto, 4, 1024, 513, 1024, true, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 5, 187, 1680, 1, true, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 70, 1024, 70, true, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 70, 1025, 70, true, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&auto, 4, 1024, 512, 1024, true, false, u64::MAX).is_some());
+        assert!(crate::cyclic::plan(&auto, 4, 1024, 513, 1024, true, false, u64::MAX).is_none());
         let never = Tuning { line_cyclic_work: 0, ..auto };
-        assert!(crate::cyclic::plan(&never, 1, 4096, 1, 1, false, u64::MAX).is_none());
-        assert!(crate::cyclic::plan(&never, 5, 187, 1680, 1, true, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&never, 1, 4096, 1, 1, false, false, u64::MAX).is_none());
+        assert!(crate::cyclic::plan(&never, 5, 187, 1680, 1, true, false, u64::MAX).is_none());
     }
 }
