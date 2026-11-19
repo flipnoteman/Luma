@@ -141,6 +141,11 @@ pub(crate) struct AxisSpec {
     /// [`Edge::Wrap`] over a power of two: the word of the extent is its mask (the coordinate
     /// is reduced by a bit-wise and).
     pub(crate) wrap_mask: bool,
+    /// The start is the word at `slots.start` plus this: the views of one kernel over sources of
+    /// equal dimensions whose starts along an axis are a few cells apart (the neighbours of a
+    /// stencil) share one start word, so that the shader compiler sees which reads are the same
+    /// cell and which are its neighbours.
+    pub(crate) start_delta: i8,
     /// Where the numbers of the axis are in the uniform.
     pub(crate) slots: AxisSlots,
 }
@@ -212,8 +217,23 @@ const UNUSED_AXIS: AxisSpec = AxisSpec {
     step: StepSpec::Zero,
     checked: false,
     wrap_mask: false,
+    start_delta: 0,
     slots: AxisSlots { div: 0, rem: 0, step: 0, start: 0, size: 0, stride: 0 },
 };
+
+/// The largest offset between the starts of two views that share a start word (see
+/// [`AxisSpec::start_delta`]): it is part of the key, so it covers stencil neighbours, not slices
+/// at arbitrary offsets.
+const MAX_START_DELTA: i64 = 4;
+
+/// The words one view axis shares with the others over sources of the same dimensions: the first
+/// start (slot, value), the extent (slot, per `wrap_mask`) and the stride.
+#[derive(Default)]
+struct ViewAxisWords {
+    start: Option<(u32, i32)>,
+    size: Vec<(bool, u32)>,
+    stride: Option<u32>,
+}
 
 /// The slots added so far and the views and gathers they belong to.
 struct Builder {
@@ -228,6 +248,11 @@ struct Builder {
     divisors: Vec<(u32, u32)>,
     /// The other words that expressions share, and where (see [`Builder::shared`]).
     shared: Vec<(u32, u32)>,
+    /// The extent, stride and start words of the view axes so far, by source dimensions (see
+    /// [`ViewSpec::src_dims`]) and axis: equal dimensions have equal extents and strides, so their
+    /// views share those words whatever the values; a start is shared with an offset when it is
+    /// at most [`MAX_START_DELTA`] from the first.
+    view_axis: Vec<(u16, u8, ViewAxisWords)>,
 }
 
 impl Builder {
@@ -241,6 +266,7 @@ impl Builder {
             dims: Vec::new(),
             divisors: Vec::new(),
             shared: Vec::new(),
+            view_axis: Vec::new(),
         }
     }
 
@@ -285,6 +311,18 @@ impl Builder {
         slot
     }
 
+    /// The shared words of axis `axis` of the views over sources numbered `src_dims`.
+    fn view_axis_words(&mut self, src_dims: u16, axis: u8) -> &mut ViewAxisWords {
+        let at = match self.view_axis.iter().position(|&(dims, a, _)| dims == src_dims && a == axis) {
+            Some(at) => at,
+            None => {
+                self.view_axis.push((src_dims, axis, ViewAxisWords::default()));
+                self.view_axis.len() - 1
+            }
+        };
+        &mut self.view_axis[at].2
+    }
+
     fn view(&mut self, map: ViewMap, edge: Edge) -> Option<(u16, ViewSpec)> {
         if let Some(&(_, _, id, spec)) = self.views.iter().find(|&&(known, kind, ..)| known == map && kind == edge) {
             return Some((id, spec));
@@ -297,6 +335,7 @@ impl Builder {
             src_stride[d] = src_stride[d - 1] * u64::from(map.src[d - 1]);
         }
         let mut axes = [UNUSED_AXIS; 4];
+        let src_dims = self.view_dims(map.src);
         let wide = is_wide(map.out.iter().map(|&d| u64::from(d)).product());
         for a in 0..4 {
             let axis = map.axes[a];
@@ -337,12 +376,14 @@ impl Builder {
                 },
                 checked,
                 wrap_mask: checked && edge == Edge::Wrap && map.src[a].is_power_of_two(),
+                start_delta: 0,
                 slots: AxisSlots::default(),
             };
             if !(spec.active || (edge == Edge::Fill && spec.checked)) {
                 continue;
             }
             let mut slots = AxisSlots::default();
+            let start_delta;
             if !spec.out_unit && spec.step != StepSpec::Zero {
                 slots.div = match spec.out_div {
                     DivRemSpec::None => 0,
@@ -358,16 +399,42 @@ impl Builder {
                     slots.step = self.word(axis.step as u32);
                 }
             }
-            slots.start = self.word(axis.start as u32);
+            let base = self.view_axis_words(src_dims, a as u8).start;
+            let delta = base.map(|(_, value)| i64::from(axis.start) - i64::from(value)).filter(|d| d.abs() <= MAX_START_DELTA);
+            (slots.start, start_delta) = match (base, delta) {
+                (Some((slot, _)), Some(delta)) => (slot, delta as i8),
+                _ => {
+                    let slot = self.word(axis.start as u32);
+                    if base.is_none() {
+                        self.view_axis_words(src_dims, a as u8).start = Some((slot, axis.start));
+                    }
+                    (slot, 0)
+                }
+            };
             if spec.checked {
-                slots.size = self.word(if spec.wrap_mask { map.src[a] - 1 } else { map.src[a] });
+                let value = if spec.wrap_mask { map.src[a] - 1 } else { map.src[a] };
+                slots.size = match self.view_axis_words(src_dims, a as u8).size.iter().find(|&&(mask, _)| mask == spec.wrap_mask) {
+                    Some(&(_, slot)) => slot,
+                    None => {
+                        let slot = self.word(value);
+                        self.view_axis_words(src_dims, a as u8).size.push((spec.wrap_mask, slot));
+                        slot
+                    }
+                };
             }
             if spec.active && !spec.src_fastest {
-                slots.stride = self.word(src_stride[a] as u32);
+                slots.stride = match self.view_axis_words(src_dims, a as u8).stride {
+                    Some(slot) => slot,
+                    None => {
+                        let slot = self.word(src_stride[a] as u32);
+                        self.view_axis_words(src_dims, a as u8).stride = Some(slot);
+                        slot
+                    }
+                };
             }
-            axes[a] = AxisSpec { slots, ..spec };
+            axes[a] = AxisSpec { slots, start_delta, ..spec };
         }
-        let (out_dims, src_dims) = (self.view_dims(map.out), self.view_dims(map.src));
+        let out_dims = self.view_dims(map.out);
         let spec = ViewSpec { edge, axes, out_dims, src_dims };
         self.views.push((map, edge, id, spec));
         Some((id, spec))
@@ -828,10 +895,11 @@ pub(super) fn view_helpers(views: &[(u16, ViewSpec)]) -> String {
                 coord_expr = Some(scaled);
             }
             let start = format!("i32(p.s{})", slots.start);
-            let raw = match coord_expr {
+            let base = match coord_expr {
                 None => start,
                 Some(scaled) => format!("({scaled} + {start})"),
             };
+            let raw = if axis.start_delta == 0 { base } else { format!("({base} + {})", axis.start_delta) };
             let size = axis.checked.then(|| format!("i32(p.s{})", slots.size));
             let stride = (axis.active && !axis.src_fastest).then(|| format!("p.s{}", slots.stride));
             if axis.active {

@@ -924,10 +924,13 @@ impl<'a> Lower<'a> {
                 });
             }
             let start = fb.bitcast(self.scalar(fb, slots.start), KirType::I32);
-            let raw = match scaled {
+            // The coordinate of the view the start word belongs to, then this view's offset from
+            // it: neighbour reads share everything but the last addition.
+            let base = match scaled {
                 None => start,
                 Some(scaled) => scaled + start,
             };
+            let raw = if axis.start_delta == 0 { base } else { base + li(fb, i32::from(axis.start_delta)) };
             let size = axis.checked.then(|| fb.bitcast(self.scalar(fb, slots.size), KirType::I32));
             let stride = (axis.active && !axis.src_fastest).then(|| self.scalar(fb, slots.stride));
             if axis.active {
