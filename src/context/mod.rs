@@ -848,6 +848,12 @@ impl Context {
             self.hal().recycle_mappable(buffer);
             return;
         }
+        if pool::size_class(buffer.size(), self.inner.max_buffer_bytes) != Some(buffer.size()) {
+            // Made at an exact size (a recorded plan's shared intermediates): no allocation takes
+            // that size from the pool, so it goes back to the device.
+            lock(&self.inner.released).push(buffer);
+            return;
+        }
         let released = lock(&self.inner.pool).put(buffer);
         if !released.is_empty() {
             lock(&self.inner.released).extend(released);

@@ -224,7 +224,7 @@ impl Context {
                     }
                 }
                 // The entry is gone, so `recycle` gives these straight to the pool.
-                for buffer in recording.share_transients() {
+                for buffer in recording.share_transients(self) {
                     self.recycle(buffer);
                 }
                 let kept: u64 = recording.transient.iter().map(Buffer::size).sum();
@@ -328,28 +328,28 @@ impl Context {
 /// The first and last command of a live interval (both inclusive).
 type Interval = (usize, usize);
 
-/// Assigns each interval `[start, end]` (both ends inclusive) a slot so that intervals sharing
-/// a slot never overlap: an interval takes the first slot whose last interval ended strictly
-/// before its start, or a new one. Visiting the intervals by start gives the fewest slots (the
-/// greatest number of intervals that are live at once). Returns the slot of every interval;
-/// slots are numbered in the order they are opened.
-pub(super) fn pack_intervals(intervals: &[Interval]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..intervals.len()).collect();
-    order.sort_by_key(|&i| (intervals[i].0, i));
-    let mut slot_end: Vec<usize> = Vec::new();
-    let mut slots = vec![0; intervals.len()];
+/// Assigns each item `(interval, bytes)` a slot so that items sharing a slot never overlap
+/// (intervals are `[start, end]`, both ends inclusive): visiting the items largest first, each
+/// takes the first slot none of whose intervals it overlaps, or a new one. A slot needs the
+/// bytes of its first (largest) item. Returns the slot of every item; slots are numbered in the
+/// order they are opened.
+pub(super) fn pack_sized(items: &[(Interval, u64)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| (std::cmp::Reverse(items[i].1), items[i].0, i));
+    let mut taken: Vec<Vec<Interval>> = Vec::new();
+    let mut slots = vec![0; items.len()];
     for i in order {
-        let (start, end) = intervals[i];
-        match slot_end.iter().position(|&last| last < start) {
-            Some(slot) => {
-                slot_end[slot] = end;
-                slots[i] = slot;
-            }
+        let interval = items[i].0;
+        let apart = |other: &Interval| other.1 < interval.0 || interval.1 < other.0;
+        let slot = match taken.iter().position(|intervals| intervals.iter().all(apart)) {
+            Some(slot) => slot,
             None => {
-                slots[i] = slot_end.len();
-                slot_end.push(end);
+                taken.push(Vec::new());
+                taken.len() - 1
             }
-        }
+        };
+        taken[slot].push(interval);
+        slots[i] = slot;
     }
     slots
 }
@@ -441,13 +441,19 @@ impl Recording {
     ///
     /// The live interval of a transient buffer runs from the first captured command that binds
     /// it to the last one, whatever the binding. A replay runs the commands in recorded order on
-    /// one queue, so two transient buffers of the same size and usage whose intervals do not
-    /// overlap can be one buffer: the second is only written after the last use of the first, as
-    /// when the pool hands out a released buffer again. The commands are rewritten to name that
-    /// one buffer (the logical `bytes` they bind stay), so graph capture and every replay see
-    /// the same aliasing. Intervals that touch at one command stay apart: a command may read one
-    /// buffer while it writes another.
-    fn share_transients(&mut self) -> Vec<Buffer> {
+    /// one queue, so transient buffers of the same usage whose intervals do not overlap can be
+    /// one buffer: the second is only written after the last use of the first, as when the pool
+    /// hands out a released buffer again. The commands are rewritten to name that one buffer
+    /// (the logical `bytes` they bind stay), so graph capture and every replay see the same
+    /// aliasing. Intervals that touch at one command stay apart: a command may read one buffer
+    /// while it writes another.
+    ///
+    /// Buffers of every size share: the intermediates are packed largest first, each into the
+    /// first shared buffer none of whose intervals it overlaps. A shared buffer is created at
+    /// the size its largest intermediate binds, not at a pool size class (unless one of its
+    /// buffers already has that size, or the device has no room for a new one): the plan keeps
+    /// it for its whole life, and the classes round sizes up by up to a factor of two.
+    fn share_transients(&mut self, ctx: &Context) -> Vec<Buffer> {
         let mut transient: Vec<Buffer> = Vec::new();
         let mut kept = Vec::with_capacity(self.retired.len());
         for buffer in std::mem::take(&mut self.retired) {
@@ -462,40 +468,62 @@ impl Recording {
             return Vec::new();
         }
 
-        // Live interval (first and last command that binds it) of each; `None`: never bound.
-        let mut intervals: FxMap<u64, Option<Interval>> = transient.iter().map(|buffer| (buffer.id(), None)).collect();
+        // Live interval (first and last command that binds it) and largest logical binding of
+        // each; absent: never bound.
+        let mut uses: FxMap<u64, (Interval, u64)> = FxMap::default();
+        let ids: FxSet<u64> = transient.iter().map(Buffer::id).collect();
         for (at, cmd) in self.cmds.iter().enumerate() {
             for arg in &cmd.args {
-                if let CmdArg::Storage { buffer, .. } = arg
-                    && let Some(interval) = intervals.get_mut(&buffer.id())
+                if let CmdArg::Storage { buffer, bytes, .. } = arg
+                    && ids.contains(&buffer.id())
                 {
-                    let (first, _) = interval.unwrap_or((at, at));
-                    *interval = Some((first, at));
+                    let entry = uses.entry(buffer.id()).or_insert(((at, at), 0));
+                    entry.0 .1 = at;
+                    entry.1 = entry.1.max(*bytes);
                 }
             }
         }
 
-        // Group by what the pool keys on.
-        let mut groups: FxMap<(u64, BufferUsage), Vec<(usize, Interval)>> = FxMap::default();
+        // Packed per usage: the members of every shared buffer, largest first.
+        let mut by_usage: FxMap<BufferUsage, Vec<usize>> = FxMap::default();
         for (n, buffer) in transient.iter().enumerate() {
-            if let Some(Some(interval)) = intervals.get(&buffer.id()) {
-                groups.entry((buffer.size(), buffer.usage())).or_default().push((n, *interval));
+            if uses.contains_key(&buffer.id()) {
+                by_usage.entry(buffer.usage()).or_default().push(n);
             }
         }
-        // The buffer each one becomes (itself, for the first of its slot); `None`: no command names it.
-        let mut becomes: Vec<Option<usize>> = vec![None; transient.len()];
-        for members in groups.values() {
-            let slots = pack_intervals(&members.iter().map(|&(_, interval)| interval).collect::<Vec<_>>());
-            let mut owner: Vec<Option<usize>> = vec![None; slots.iter().max().map_or(0, |last| last + 1)];
-            for (&(n, _), &slot) in members.iter().zip(&slots) {
-                becomes[n] = Some(*owner[slot].get_or_insert(n));
+        let mut slots: Vec<(BufferUsage, Vec<usize>)> = Vec::new();
+        for (usage, members) in by_usage {
+            let items: Vec<(Interval, u64)> = members.iter().map(|&n| uses[&transient[n].id()]).collect();
+            let slot_of = pack_sized(&items);
+            let first = slots.len();
+            slots.extend((0..slot_of.iter().max().map_or(0, |last| last + 1)).map(|_| (usage, Vec::new())));
+            for (&n, &slot) in members.iter().zip(&slot_of) {
+                slots[first + slot].1.push(n);
             }
         }
-        let merged: FxMap<u64, Buffer> = becomes
-            .iter()
-            .enumerate()
-            .filter_map(|(n, to)| to.filter(|&to| to != n).map(|to| (transient[n].id(), transient[to].clone())))
-            .collect();
+
+        // The buffer of every shared buffer, and what each transient buffer becomes.
+        let mut keep: FxSet<u64> = FxSet::default();
+        let mut merged: FxMap<u64, Buffer> = FxMap::default();
+        for (usage, members) in &mut slots {
+            members.sort_by_key(|&n| std::cmp::Reverse(uses[&transient[n].id()].1));
+            let exact = uses[&transient[members[0]].id()].1.max(16).next_multiple_of(4);
+            let existing = members.iter().map(|&n| &transient[n]).find(|buffer| buffer.size() == exact);
+            let buffer = match existing {
+                Some(buffer) => buffer.clone(),
+                // The largest member's buffer holds the largest binding: the fallback when the
+                // device has no room for one more buffer now.
+                None => ctx.new_buffer(exact, *usage, false).unwrap_or_else(|_| transient[members[0]].clone()),
+            };
+            for &n in members.iter() {
+                if transient[n].id() != buffer.id() {
+                    merged.insert(transient[n].id(), buffer.clone());
+                }
+            }
+            keep.insert(buffer.id());
+            self.transient.push(buffer.clone());
+            self.retired.push(buffer);
+        }
         if !merged.is_empty() {
             for cmd in &mut self.cmds {
                 for arg in &mut cmd.args {
@@ -508,17 +536,8 @@ impl Recording {
             }
         }
 
-        // The plan keeps the buffers that are named; the rest is free.
-        let mut freed = Vec::new();
-        for (n, buffer) in transient.into_iter().enumerate() {
-            if becomes[n] == Some(n) {
-                self.transient.push(buffer.clone());
-                self.retired.push(buffer);
-            } else {
-                freed.push(buffer);
-            }
-        }
-        freed
+        // The plan keeps the slots' buffers; the rest is free.
+        transient.into_iter().filter(|buffer| !keep.contains(&buffer.id())).collect()
     }
 
     fn retire_buffer(&mut self, buffer: &mut Option<Buffer>) {
