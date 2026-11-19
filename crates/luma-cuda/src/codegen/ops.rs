@@ -140,7 +140,14 @@ pub(crate) fn unary(fb: &mut Fb, op: IrUnOp, s: ScalarTy, a: &Op) -> (ScalarTy, 
             };
             // f32 `exp`, `log`, `log2` and the trigonometric functions use the hardware
             // approximations, within WGSL's precision rules, as the wgpu and Metal backends'
-            // compilers do; f64 and the other functions keep libdevice's full precision.
+            // compilers do; f64 and the other functions keep libdevice's full precision. f32
+            // `sqrt` and `inverseSqrt` are the approximations that flush subnormals (WGSL allows
+            // it, the Vulkan driver does it): the forms that keep them add range fix-ups.
+            if s == F32 && matches!(op, Sqrt | InverseSqrt) {
+                let name = if op == Sqrt { "llvm.nvvm.sqrt.approx.ftz.f" } else { "llvm.nvvm.rsqrt.approx.ftz.f" };
+                fb.declare(&format!("declare float @{name}(float)"));
+                return (s, fb.def(&format!("call float @{name}(float {a})")));
+            }
             let fast = s == F32 && matches!(op, Exp | Ln | Log2 | Sin | Cos | Tan);
             let name = if fast { format!("__nv_fast_{base}f") } else { lib(base, s) };
             (s, call(fb, &name, t, &[(t, a)]))
@@ -245,7 +252,7 @@ pub(crate) fn binary(fb: &mut Fb, op: IrBinOp, l: ScalarTy, r: ScalarTy, a: &Op,
         // f32: `div.approx.ftz` (a reciprocal and a product, 2 ulp for divisors of magnitude in
         // [2^-126, 2^126]): the precision WGSL specifies and what the Vulkan driver emits for
         // `/`. `div.full` adds about five instructions of range scaling per division, and the
-        // forms that keep subnormals two more (see the `-ftz=1` of `nvvm.rs`).
+        // form that keeps subnormals two more.
         Div if l == F32 => {
             fb.declare("declare float @llvm.nvvm.div.approx.ftz.f(float, float)");
             (l, fb.def(&format!("call float @llvm.nvvm.div.approx.ftz.f(float {a}, float {b})")))
