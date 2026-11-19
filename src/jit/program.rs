@@ -1886,8 +1886,9 @@ impl Recipe {
 
     /// The program over the buffers, scalars and nodes of `graph`, which has this recipe's
     /// signature. `None` if the graph does not have what the program reads (a node that is not
-    /// evaluated any more), or if scalars that were equal when it was recorded (one slot) are not
-    /// any more.
+    /// evaluated any more), if scalars that were equal when it was recorded (one slot) are not
+    /// any more, or if scalars recorded in different slots are equal now (the flattening would
+    /// share a slot).
     fn instantiate(&self, graph: &Graph, tail: Tail) -> Option<Fused> {
         let operand = |item: u32, slot: u8| graph.items.get(item as usize).and_then(|item| item.args.get(usize::from(slot)));
         let mut inputs = Vec::with_capacity(self.inputs.len());
@@ -1905,10 +1906,18 @@ impl Recipe {
                 _ => None,
             },
         };
-        let mut scalars = Vec::with_capacity(self.scalar_tys.len());
+        let mut scalars: Vec<u32> = Vec::with_capacity(self.scalar_tys.len());
+        // (type, start, end) of each slot's words in `scalars`, to spot scalars that now are equal.
+        let mut seen: Vec<(ElemTy, usize, usize)> = Vec::with_capacity(self.scalars.len());
         for &source in &self.scalars {
             let scalar = value(source)?;
-            scalars.extend(scalar.words().iter().take(scalar.ty.slots()));
+            let words = &scalar.words()[..scalar.ty.slots()];
+            if seen.iter().any(|&(ty, from, to)| ty == scalar.ty && scalars[from..to] == *words) {
+                return None;
+            }
+            let from = scalars.len();
+            scalars.extend_from_slice(words);
+            seen.push((scalar.ty, from, scalars.len()));
         }
         for &(at, source) in &self.aliases {
             let scalar = value(source)?;

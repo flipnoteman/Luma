@@ -175,6 +175,23 @@ fn scalars_equal_when_recorded_and_different_later_are_read_apart() {
     assert!(ctx.jit().recipe_hits() >= 2, "recipe hits: {}", ctx.jit().recipe_hits());
 }
 
+/// Scalars in separate slots when recorded and equal later: the flattening shares one slot, so the
+/// recipe's program must not be used.
+#[test]
+fn scalars_different_when_recorded_and_equal_later_share_a_slot() {
+    let ctx = ctx();
+    let n = 200;
+    let xs = values(n, 7, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    for (a, b, c) in [(1.5f32, 2.5f32, 3.5f32), (2.5, 2.5, 2.5), (1.25, 2.5, 3.5), (3.5, 3.5, 3.5)] {
+        let e = (&x * a + b) * c;
+        let want: Vec<f32> = xs.iter().map(|v| (v * a + b) * c).collect();
+        let got = (e.slice(0, 1..) - e.slice(0, ..n - 1)).to_vec().unwrap();
+        let host: Vec<f32> = (0..n - 1).map(|i| want[i + 1] - want[i]).collect();
+        assert_close(&got, &host, 1e-4, 1e-5);
+    }
+}
+
 #[test]
 fn reductions_fuse_their_input_expression() {
     let ctx = ctx();
