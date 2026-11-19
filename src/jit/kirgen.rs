@@ -117,6 +117,22 @@ fn sum(fb: &FnBuilder<'_>, terms: Vec<Val>) -> Val {
     }
 }
 
+/// Runs `body(b, e)` for each cell `e` assigned to invocation `lid` of a `WORKGROUP`-sized group.
+fn for_cells(fb: &mut FnBuilder<'_>, lid: Val, cells: u32, body: impl FnOnce(&mut FnBuilder<'_>, Val)) {
+    if cells == WORKGROUP {
+        let e = fb.let_val("e", lid);
+        body(fb, e);
+    } else if cells < WORKGROUP {
+        let ok = fb.lt(lid, lu(fb, cells));
+        fb.if_then(ok, |b| {
+            let e = b.let_val("e", lid);
+            body(b, e);
+        });
+    } else {
+        fb.for_range("e", lid, lu(fb, cells), lu(fb, WORKGROUP), body);
+    }
+}
+
 /// The uniform `p` of a kernel: a struct of words, by field name.
 pub(super) struct Uni {
     binding: u32,
@@ -1141,10 +1157,33 @@ impl<'a> Lower<'a> {
             cell,
             frame: Frame::with_len(inlined.instrs.len()),
             defined: vec![None; inlined.ctxs.len()],
+            staged_base: Vec::new(),
             members,
         };
         emit.region(fb, Region::Top);
         emit.frame
+    }
+}
+
+/// `x % d` for a literal `d`, a mask when it is a power of two.
+fn u_rem(b: &FnBuilder<'_>, x: Val, d: u32) -> Val {
+    if d == 1 {
+        lu(b, 0)
+    } else if d.is_power_of_two() {
+        x & lu(b, d - 1)
+    } else {
+        x % lu(b, d)
+    }
+}
+
+/// `x / d` for a literal `d`, a shift when it is a power of two.
+fn u_div(b: &FnBuilder<'_>, x: Val, d: u32) -> Val {
+    if d == 1 {
+        x
+    } else if d.is_power_of_two() {
+        x >> lu(b, d.trailing_zeros())
+    } else {
+        x / lu(b, d)
     }
 }
 
@@ -1167,6 +1206,8 @@ struct Emit<'e, 'k> {
     /// The index of every context declared, in the block being written (a block that ends
     /// forgets what it declared).
     defined: Vec<Option<Val>>,
+    /// The base `lx + ly * width` of the staged reads of each region width, in the block being written.
+    staged_base: Vec<(u32, Val)>,
     /// The instructions of every region not written yet, in order.
     members: FxMap<Region, Vec<u32>>,
 }
@@ -1279,9 +1320,22 @@ impl Emit<'_, '_> {
                         Some((cell, [ox, oy])) => match (cell.staging.find(s), cell.shared.get(s as usize).copied().flatten()) {
                             (Some(entry), Some(shared)) => {
                                 let (dx, dy) = (ox - entry.lo[0], oy - entry.lo[1]);
-                                let x = fb.bitcast(cell.lx + li(fb, dx), KirType::U32);
-                                let y = fb.bitcast(cell.ly + li(fb, dy), KirType::U32);
-                                fb.shared_load(shared, x + y * lu(fb, entry.width()))
+                                let index = if entry.lo[1] == 0 && entry.hi[1] == 0 {
+                                    fb.bitcast(if dx == 0 { cell.lx } else { cell.lx + li(fb, dx) }, KirType::U32)
+                                } else {
+                                    let rw = entry.width();
+                                    let base = match self.staged_base.iter().find(|(w, _)| *w == rw) {
+                                        Some(&(_, base)) => base,
+                                        None => {
+                                            let base = fb.let_val(&format!("sb_{rw}"), cell.lx + cell.ly * li(fb, rw as i32));
+                                            self.staged_base.push((rw, base));
+                                            base
+                                        }
+                                    };
+                                    let delta = dx + dy * (rw as i32);
+                                    fb.bitcast(if delta == 0 { base } else { base + li(fb, delta) }, KirType::U32)
+                                };
+                                fb.shared_load(shared, index)
                             }
                             _ => env.fail(fb, format!("sub-program {s} is not staged")),
                         },
@@ -1329,19 +1383,21 @@ impl Emit<'_, '_> {
         let mask = self.operand(fb, flat.args[0], ElemTy::U32, flat.at);
         let local = fb.var_decl(&format!("t{n}"), reg(flat.op.out_ty()), None);
         let zero = lu(fb, 0);
-        let (taken, skipped) = (fb.ne(mask, zero), fb.eq(mask, zero));
-        for (cond, side, slot) in [(taken, Region::Taken(n as u32), 1usize), (skipped, Region::Skipped(n as u32), 2)] {
-            let outer = (self.defined.clone(), self.frame.a.clone());
-            fb.if_then(cond, |b| {
-                self.region(b, side);
-                if let Ref::Input(k) = flat.args[slot] {
-                    self.load(b, k, flat.at);
-                }
-                let value = self.operand(b, flat.args[slot], flat.op.operand_ty(slot), flat.at);
-                b.assign_var(local, value);
-            });
-            (self.defined, self.frame.a) = outer;
-        }
+        let taken = fb.ne(mask, zero);
+        let outer = (self.defined.clone(), self.frame.a.clone(), self.staged_base.clone());
+        let me = RefCell::new(&mut *self);
+        let arm = |b: &mut FnBuilder<'_>, side: Region, slot: usize| {
+            let mut guard = me.borrow_mut();
+            let this: &mut Emit<'_, '_> = &mut guard;
+            this.region(b, side);
+            if let Ref::Input(k) = flat.args[slot] {
+                this.load(b, k, flat.at);
+            }
+            let value = this.operand(b, flat.args[slot], flat.op.operand_ty(slot), flat.at);
+            b.assign_var(local, value);
+            (this.defined, this.frame.a, this.staged_base) = outer.clone();
+        };
+        fb.if_else(taken, |b| arm(b, Region::Taken(n as u32), 1), |b| arm(b, Region::Skipped(n as u32), 2));
         self.frame.t[n] = Some(fb.read_var(local));
     }
 }
@@ -2105,9 +2161,9 @@ impl<'a> Build<'a> {
             let ((nx, ny), (lw, lh)) = (tile.need[k], region(k));
             let last = instrs.len().saturating_sub(1);
             let shared = self.shared[k];
-            fb.for_range("e", lid, lu(fb, lw * lh), lu(fb, WORKGROUP), |b, e| {
-                let lx = b.let_val("lx", b.convert(e % lu(b, lw), KirType::I32) - li(b, nx as i32));
-                let ly = b.let_val("ly", b.convert(e / lu(b, lw), KirType::I32) - li(b, ny as i32));
+            for_cells(fb, lid, lw * lh, |b, e| {
+                let lx = b.let_val("lx", b.convert(u_rem(b, e, lw), KirType::I32) - li(b, nx as i32));
+                let ly = b.let_val("ly", b.convert(u_div(b, e, lw), KirType::I32) - li(b, ny as i32));
                 // Cell (lx, ly) relative to the tile origin, as a global element.
                 let across = env.wrap(b, b.convert(tile_x, KirType::I32) + lx, w);
                 let element = if one_d { across } else { across + env.wrap(b, b.convert(tile_y, KirType::I32) + ly, h) * w };
@@ -2123,10 +2179,10 @@ impl<'a> Build<'a> {
             });
             fb.barrier(BarrierScope::Workgroup);
         }
-        fb.for_range("e", lid, lu(fb, tx * ty), lu(fb, WORKGROUP), |b, e| {
-            let lx_word = b.let_val("lx_word", e % lu(b, tx));
+        for_cells(fb, lid, tx * ty, |b, e| {
+            let lx_word = b.let_val("lx_word", u_rem(b, e, tx));
             let lx = b.let_val("lx", b.convert(lx_word, KirType::I32));
-            let ly_word = b.let_val("ly_word", e / lu(b, tx));
+            let ly_word = b.let_val("ly_word", u_div(b, e, tx));
             let ly = b.let_val("ly", b.convert(ly_word, KirType::I32));
             let x = b.let_val("x", tile_x + lx_word);
             let y = b.let_val("y", tile_y + ly_word);
@@ -2151,8 +2207,9 @@ impl<'a> Build<'a> {
         let j = j as usize;
         let (nx, ny) = tile.need[j];
         let lw = tile.tile.0 + 2 * nx;
-        let across = fb.bitcast(lx + li(fb, ox + nx as i32), KirType::U32);
-        let index = if one_d { across } else { across + fb.bitcast(ly + li(fb, oy + ny as i32), KirType::U32) * lu(fb, lw) };
+        let delta = (ox + nx as i32) + if one_d { 0 } else { (oy + ny as i32) * (lw as i32) };
+        let base = if one_d { lx } else { lx + ly * li(fb, lw as i32) };
+        let index = fb.bitcast(if delta == 0 { base } else { base + li(fb, delta) }, KirType::U32);
         Some(fb.shared_load(*self.shared.get(j)?, index))
     }
 
@@ -2192,9 +2249,9 @@ impl<'a> Build<'a> {
                     None => (li(fb, entry.dims[0] as i32), li(fb, entry.dims[1] as i32), lu(fb, entry.dims[0])),
                 };
                 let rw = entry.width();
-                fb.for_range("e", lid, lu(fb, entry.cells()), lu(fb, WORKGROUP), |b, e| {
-                    let lx = b.let_val("lx", b.convert(e % lu(b, rw), KirType::I32) + li(b, entry.lo[0]));
-                    let ly = b.let_val("ly", b.convert(e / lu(b, rw), KirType::I32) + li(b, entry.lo[1]));
+                for_cells(fb, lid, entry.cells(), |b, e| {
+                    let lx = b.let_val("lx", b.convert(u_rem(b, e, rw), KirType::I32) + li(b, entry.lo[0]));
+                    let ly = b.let_val("ly", b.convert(u_div(b, e, rw), KirType::I32) + li(b, entry.lo[1]));
                     let x = b.let_val("x", b.convert(tile_x, KirType::I32) + lx);
                     let y = b.let_val("y", b.convert(tile_y, KirType::I32) + ly);
                     let zero = li(b, 0);
@@ -2218,10 +2275,10 @@ impl<'a> Build<'a> {
             }
             fb.barrier(BarrierScope::Workgroup);
         }
-        fb.for_range("e", lid, lu(fb, tx * ty), lu(fb, WORKGROUP), |b, e| {
-            let lx_word = b.let_val("lx_word", e % lu(b, tx));
+        for_cells(fb, lid, tx * ty, |b, e| {
+            let lx_word = b.let_val("lx_word", u_rem(b, e, tx));
             let lx = b.let_val("lx", b.convert(lx_word, KirType::I32));
-            let ly_word = b.let_val("ly_word", e / lu(b, tx));
+            let ly_word = b.let_val("ly_word", u_div(b, e, tx));
             let ly = b.let_val("ly", b.convert(ly_word, KirType::I32));
             let x = b.let_val("x", tile_x + lx_word);
             let y = b.let_val("y", tile_y + ly_word);

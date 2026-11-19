@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use crate::array::{Array, Failure, Storage};
-use crate::context::RawArg;
+use crate::context::{Context, RawArg};
 use crate::error::LumaError;
 use crate::ops::fold_workgroups;
 use crate::shape::Shape;
@@ -30,16 +30,18 @@ pub(super) const WORKGROUP: u32 = 256;
 /// A step expression that can run time-blocked.
 pub(crate) struct Stencil {
     instrs: Vec<Instr>,
-    /// Inputs of the expression; `u` is the iterated one, the others stay fixed.
+    /// Inputs of the expression; the state inputs are iterated, the others stay fixed.
     inputs: Vec<(Arc<Storage>, ElemTy)>,
-    u: Option<u32>,
+    /// The state (of `state_count`) each input reads, `None` for a fixed input.
+    state_of: Vec<Option<usize>>,
+    state_count: usize,
     scalar_tys: Vec<ElemTy>,
     scalars: Vec<u32>,
-    /// Read offset (x, y) of every shift instruction, by instruction index.
-    offsets: Vec<Option<(i32, i32)>>,
+    /// State, read offset (x, y) of every shift instruction, by instruction index.
+    offsets: Vec<Option<(usize, i32, i32)>>,
     radius: (u32, u32),
-    /// The instruction computing the next value of `u`.
-    out: u32,
+    /// The instruction computing the next value of each state.
+    outs: Vec<u32>,
     dims: (u32, u32),
 }
 
@@ -76,17 +78,29 @@ pub(crate) fn plan(probe: &Array<f32>, next: &Array<f32>) -> Option<Stencil> {
     if probe.was_materialized() {
         return None;
     }
-    let u = fused
-        .inputs
-        .iter()
-        .position(|input| Arc::ptr_eq(input, &probe))
-        .map(|at| at as u32);
-    plan_fused(fused, u, shape)
+    let mut state_of = vec![None; fused.inputs.len()];
+    if let Some(at) = fused.inputs.iter().position(|input| Arc::ptr_eq(input, &probe)) {
+        state_of[at] = Some(0);
+    }
+    let outs = vec![*fused.key.outputs.first()?];
+    plan_inner(fused, state_of, 1, outs, shape)
 }
 
-/// The store program `fused` (one output) as a stencil on arrays of `shape`, if it is one. `u`
-/// is the input that is iterated; the others stay fixed.
-pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<Stencil> {
+/// The store program `fused` (one `f32` output per state) as a stencil on arrays of `shape`, if
+/// it is one. Inputs `0..state_count` are the states; the others stay fixed.
+pub(super) fn plan_multi(fused: Fused, state_count: usize, shape: Shape) -> Option<Stencil> {
+    if !(1..=4).contains(&state_count)
+        || fused.key.outputs.len() != state_count
+        || fused.key.input_tys.get(..state_count).is_none_or(|tys| tys.iter().any(|&ty| ty != ElemTy::F32))
+    {
+        return None;
+    }
+    let state_of = (0..fused.inputs.len()).map(|k| (k < state_count).then_some(k)).collect();
+    let outs = fused.key.outputs.to_vec();
+    plan_inner(fused, state_of, state_count, outs, shape)
+}
+
+fn plan_inner(fused: Fused, state_of: Vec<Option<usize>>, state_count: usize, outs: Vec<u32>, shape: Shape) -> Option<Stencil> {
     let dims = shape.dims();
     if dims[2] != 1 || dims[3] != 1 {
         return None;
@@ -95,8 +109,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
     if !fused.key.subs.is_empty() || !fused.key.narrow() || super::codegen::generates(&fused.key) {
         return None;
     }
-    let out = *fused.key.outputs.first()?;
-    if fused.key.instrs.get(out as usize)?.op.out_ty() != ElemTy::F32 {
+    if outs.iter().any(|&out| fused.key.instrs.get(out as usize).is_none_or(|instr| instr.op.out_ty() != ElemTy::F32)) {
         return None;
     }
     let mut offsets = Vec::with_capacity(fused.key.instrs.len());
@@ -106,10 +119,11 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
             offsets.push(None);
             continue;
         };
-        // Only shifts of `u` itself: a shifted fixed array would need halos of its own.
-        if instr.args[0] != Ref::Input(u?) {
+        // Only shifts of a state itself: a shifted fixed array would need halos of its own.
+        let Ref::Input(k) = instr.args[0] else {
             return None;
-        }
+        };
+        let s = (*state_of.get(k as usize)?)?;
         let (dx, dy) = match kind {
             ShiftKind::Dims { dims: s_dims, shifts } if s_dims == [w, h, 1, 1] => {
                 (signed(shifts[0], w), signed(shifts[1], h))
@@ -135,7 +149,7 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
             radius.0.max(ox.unsigned_abs()),
             radius.1.max(oy.unsigned_abs()),
         );
-        offsets.push(Some((ox, oy)));
+        offsets.push(Some((s, ox, oy)));
     }
     if radius.0 > MAX_RADIUS || radius.1 > MAX_RADIUS || (h == 1 && radius.1 > 0) {
         return None;
@@ -150,41 +164,63 @@ pub(super) fn plan_fused(fused: Fused, u: Option<u32>, shape: Shape) -> Option<S
     Some(Stencil {
         instrs: fused.key.instrs.to_vec(),
         inputs,
-        u,
+        state_of,
+        state_count,
         scalar_tys: fused.key.scalar_tys,
         scalars: fused.scalars,
         offsets,
         radius,
-        out,
+        outs,
         dims: (w, h),
     })
 }
 
-/// Output tile of a launch and the steps it runs, for `radius`: the most steps whose two tile
-/// buffers (outputs plus halo) fit in the tuning's workgroup memory budget.
-fn layout(tuning: &Tuning, radius: (u32, u32), one_d: bool, steps: usize) -> ((u32, u32), u32) {
-    let (tx, ty) = if one_d { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
-    let fits = |k: u32| stencil_bytes((tx, ty), (k * radius.0, k * radius.1)) <= tuning.stencil_tile_bytes;
+/// Output tile of a launch and the steps it runs, for `radius` and `state_count` states: the
+/// tile shrinks until one step fits the tuning's workgroup memory budget (the two buffers of
+/// every state, outputs plus halo), then as many steps as fit (at most 8) are blocked. `None`
+/// if not even the smallest tile fits.
+fn layout(tuning: &Tuning, radius: (u32, u32), one_d: bool, steps: usize, state_count: usize) -> Option<((u32, u32), u32)> {
+    let (mut tx, mut ty) = if one_d { (tuning.stencil_tile_1d, 1) } else { tuning.stencil_tile_2d };
+    let fits = |(tx, ty): (u32, u32), k: u32| state_count as u32 * stencil_bytes((tx, ty), (k * radius.0, k * radius.1)) <= tuning.stencil_tile_bytes;
+    while !fits((tx, ty), 1) {
+        if one_d || tx >= ty {
+            tx /= 2;
+        } else {
+            ty /= 2;
+        }
+        if tx < 4 || (!one_d && ty < 4) {
+            return None;
+        }
+    }
     // A pointwise step needs no halo; cap it anyway, the program is unrolled per step.
     let mut k = 1;
-    while k < 8 && fits(k + 1) {
+    while k < 8 && fits((tx, ty), k + 1) {
         k += 1;
     }
-    ((tx, ty), k.min(steps.max(1) as u32))
+    Some(((tx, ty), k.min(steps.max(1) as u32)))
 }
 
 impl Stencil {
+    /// Whether this stencil runs on `ctx`: its buffers fit the binding limit and a tile of one
+    /// step fits workgroup memory.
+    pub(super) fn supported(&self, ctx: &Context) -> bool {
+        let fixed = self.state_of.iter().filter(|state| state.is_none()).count();
+        2 * self.state_count + fixed <= ctx.jit().max_inputs() + 1
+            && layout(ctx.tuning(), self.radius, self.dims.1 == 1, 1, self.state_count).is_some()
+    }
+
     /// What the module of `k` steps on tiles of `tile` outputs depends on, to cache its kernel by.
     fn cache_key(&self, tile: (u32, u32), k: u32) -> String {
         let (lw, lh) = (tile.0 + 2 * k * self.radius.0, tile.1 + 2 * k * self.radius.1);
         let tys: Vec<ElemTy> = self.inputs.iter().map(|(_, ty)| *ty).collect();
         format!(
-            "stencil {:?} {tys:?} {:?} {:?} {:?} {} {:?} {tile:?} {k} {} {}",
+            "stencil {:?} {tys:?} {:?} {} {:?} {:?} {:?} {} {} {tile:?} {k} {}",
             self.instrs,
-            self.u,
+            self.state_of,
+            self.state_count,
             self.scalar_tys,
             self.offsets,
-            self.out,
+            self.outs,
             self.radius.0,
             self.radius.1,
             self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh),
@@ -194,19 +230,19 @@ impl Stencil {
     /// Kernel IR running `k` steps on tiles of `tile` outputs.
     fn module(&self, tile: (u32, u32), k: u32, tuning: &Tuning) -> Result<KernelModule, LumaError> {
         let (tx, ty) = tile;
+        let m = self.state_count;
         let (hx, hy) = (k * self.radius.0, k * self.radius.1);
         let (lw, lh) = (tx + 2 * hx, ty + 2 * hy);
         let cells = lw * lh;
         // A tile and its halo fit in the dimension, so that indices stay within one period.
         let small = self.dims.0 >= lw && (self.dims.1 == 1 || self.dims.1 >= lh);
-        let fixed: Vec<usize> = (0..self.inputs.len())
-            .filter(|&i| Some(i as u32) != self.u)
-            .collect();
+        let fixed: Vec<usize> = (0..self.inputs.len()).filter(|&i| self.state_of[i].is_none()).collect();
         let lib = helper_library(&[self.instrs.as_slice()], tuning, false, false)?;
-        let mut mb = ModuleBuilder::new(format!("Stencil({k} steps) f32"), "main", [WORKGROUP, 1, 1]);
+        let mut mb = ModuleBuilder::new(format!("Stencil({k} steps x {m} states) f32"), "main", [WORKGROUP, 1, 1]);
         let mut env = Lower::new(lib.clone(), &[]);
-        let out = mb.add_storage_read_write("out", KirType::F32);
-        let u = mb.add_storage_read("u", KirType::F32);
+        let name = |base: &str, s: usize| if m == 1 { base.to_owned() } else { format!("{base}{s}") };
+        let outs: Vec<_> = (0..m).map(|s| mb.add_storage_read_write(&name("out", s), KirType::F32)).collect();
+        let us: Vec<_> = (0..m).map(|s| mb.add_storage_read(&name("u", s), KirType::F32)).collect();
         env.ins = vec![None; self.inputs.len()];
         for &i in &fixed {
             env.ins[i] = Some(mb.add_storage_read(&format!("in{i}"), reg(self.inputs[i].1)));
@@ -221,8 +257,8 @@ impl Stencil {
         }
         let uni = Uni::declare(&mut mb, fields);
         env.set_uniform(uni);
-        let b0 = mb.add_shared("b0", KirType::F32, cells);
-        let b1 = mb.add_shared("b1", KirType::F32, cells);
+        let b0: Vec<_> = (0..m).map(|s| mb.add_shared(&format!("b0_{s}"), KirType::F32, cells)).collect();
+        let b1: Vec<_> = (0..m).map(|s| mb.add_shared(&format!("b1_{s}"), KirType::F32, cells)).collect();
         env.declare_wrap(&mut mb, small);
         {
             let mut fb = mb.entry_builder();
@@ -241,12 +277,14 @@ impl Stencil {
                 let xs = ox + b.convert(e % lu(b, lw), KirType::I32);
                 let ys = oy + b.convert(e / lu(b, lw), KirType::I32);
                 let at = env.wrap(b, xs, pw) + env.wrap(b, ys, ph) * pw;
-                let value = b.load(u, at);
-                b.shared_store(b0, e, value);
+                for s in 0..m {
+                    let value = b.load(us[s], at);
+                    b.shared_store(b0[s], e, value);
+                }
             });
             fb.barrier(BarrierScope::Workgroup);
             for step in 1..=k {
-                let (from, to) = if step % 2 == 1 { (b0, b1) } else { (b1, b0) };
+                let (from, to) = if step % 2 == 1 { (&b0, &b1) } else { (&b1, &b0) };
                 let (x0, y0) = (step * self.radius.0, step * self.radius.1);
                 let (rw, rh) = (lw - 2 * x0, lh - 2 * y0);
                 let fixed = &fixed;
@@ -264,20 +302,19 @@ impl Stencil {
                     };
                     let mut frame = Frame::with_len(self.instrs.len());
                     for (i, (_, ty)) in self.inputs.iter().enumerate() {
-                        let value = if Some(i as u32) == self.u {
-                            b.shared_load(from, c)
-                        } else {
-                            env.load_in(b, *ty, env.ins[i].unwrap_or(0), gi)
+                        let value = match self.state_of[i] {
+                            Some(s) => b.shared_load(from[s], c),
+                            None => env.load_in(b, *ty, env.ins[i].unwrap_or(0), gi),
                         };
                         let value = b.let_val(&format!("a{i}"), value);
                         frame.a.insert((i as u32, 0), value);
                     }
                     for (t, instr) in self.instrs.iter().enumerate() {
                         let value = match self.offsets[t] {
-                            Some((dx, dy)) => {
+                            Some((s, dx, dy)) => {
                                 let centre = b.bitcast(c, KirType::I32);
                                 let at = b.bitcast(centre + li(b, dx + dy * lw as i32), KirType::U32);
-                                b.shared_load(from, at)
+                                b.shared_load(from[s], at)
                             }
                             None => {
                                 let index = lu(b, 0);
@@ -287,16 +324,18 @@ impl Stencil {
                         let value = b.let_val(&format!("t{t}"), value);
                         frame.t[t] = Some(value);
                     }
-                    match frame.t(self.out as usize) {
-                        Some(value) => b.shared_store(to, c, value),
-                        None => {
-                            env.fail(b, "the stencil has no output instruction");
+                    for s in 0..m {
+                        match frame.t(self.outs[s] as usize) {
+                            Some(value) => b.shared_store(to[s], c, value),
+                            None => {
+                                env.fail(b, "the stencil has no output instruction");
+                            }
                         }
                     }
                 });
                 fb.barrier(BarrierScope::Workgroup);
             }
-            let last = if k % 2 == 1 { b1 } else { b0 };
+            let last = if k % 2 == 1 { &b1 } else { &b0 };
             fb.for_range("e", lid, lu(&fb, tx * ty), lu(&fb, WORKGROUP), |b, e| {
                 let lx = e % lu(b, tx);
                 let ly = e / lu(b, tx);
@@ -305,8 +344,10 @@ impl Stencil {
                 let inside = b.and(b.lt(x, pw), b.lt(y, ph));
                 b.if_then(inside, |b| {
                     let cell = (lu(b, hx) + lx) + (lu(b, hy) + ly) * lu(b, lw);
-                    let value = b.shared_load(last, cell);
-                    b.store(out, x + y * pw, value);
+                    for s in 0..m {
+                        let value = b.shared_load(last[s], cell);
+                        b.store(outs[s], x + y * pw, value);
+                    }
                 });
             });
             fb.finish();
@@ -319,10 +360,21 @@ impl Stencil {
 
     /// Runs `steps` steps starting from `start`, as many per launch as the tile allows.
     pub(crate) fn run(&self, start: &Array<f32>, steps: usize) -> Result<Array<f32>, Failure> {
-        let ctx = start.context();
+        let init = Arc::clone(start.storage()?);
+        let mut states = self.run_multi(start.context(), &[init], steps)?;
+        let state = states.pop().ok_or_else(|| Failure::New(LumaError::Gpu("stencil ran no steps".into())))?;
+        Ok(Array::from_storage(start.context(), start.shape(), state))
+    }
+
+    /// Runs `steps` steps of all states from `inits`, as many per launch as the tiles allow.
+    pub(super) fn run_multi(&self, ctx: &Context, inits: &[Arc<Storage>], steps: usize) -> Result<Vec<Arc<Storage>>, Failure> {
         let jit = ctx.jit();
         let (w, h) = self.dims;
-        let (tile, per_launch) = layout(ctx.tuning(), self.radius, h == 1, steps);
+        if inits.len() != self.state_count {
+            return Err(Failure::New(LumaError::Gpu("stencil states do not match its program".into())));
+        }
+        let (tile, per_launch) = layout(ctx.tuning(), self.radius, h == 1, steps, self.state_count)
+            .ok_or_else(|| Failure::New(LumaError::Gpu("stencil tile does not fit workgroup memory".into())))?;
         let tiles = [w.div_ceil(tile.0), h.div_ceil(tile.1)];
         let groups = fold_workgroups(ctx, tiles[0] * tiles[1])?;
         let mut params = vec![w, h, tiles[0]];
@@ -331,35 +383,44 @@ impl Stencil {
             .inputs
             .iter()
             .enumerate()
-            .filter(|(i, _)| Some(*i as u32) != self.u)
+            .filter(|(i, _)| self.state_of[*i].is_none())
             .map(|(_, (s, _))| s)
             .collect();
 
-        let mut current: Option<Array<f32>> = None;
+        let mut current: Vec<Arc<Storage>> = inits.to_vec();
         let mut done = 0;
         while done < steps {
             let k = per_launch.min((steps - done) as u32);
-            let core = jit.module_kernel(ctx, self.cache_key(tile, k), &format!("Stencil({k} steps) f32"), || {
+            let core = jit.module_kernel(ctx, self.cache_key(tile, k), &format!("Stencil({k} steps x {} states) f32", self.state_count), || {
                 self.module(tile, k, ctx.tuning())
             })?;
-            let next = Array::<f32>::alloc(ctx, start.shape())?;
+            let next: Vec<Arc<Storage>> = current
+                .iter()
+                .map(|state| Arc::new(Storage::new(ctx, state.len(), ElemTy::F32.layout())))
+                .collect();
             {
-                let from = current.as_ref().unwrap_or(start);
-                let (src, bytes) = from.ready()?;
-                let (dst, _) = next.ready()?;
+                let dst_pins = next.iter().map(|state| state.pin_single()).collect::<Result<Vec<_>, _>>()?;
+                let src_pins = current.iter().map(|state| state.pin_single()).collect::<Result<Vec<_>, _>>()?;
                 let fixed_pins = fixed.iter().map(|input| input.pin_single()).collect::<Result<Vec<_>, _>>()?;
-                let mut raw = Vec::with_capacity(fixed.len() + 3);
-                raw.push(RawArg::write(dst.buffer(), bytes));
-                raw.push(RawArg::read(src.buffer(), bytes));
+                let mut raw = Vec::with_capacity(2 * self.state_count + fixed.len() + 1);
+                for (pin, state) in dst_pins.iter().zip(&next) {
+                    raw.push(RawArg::write(pin.buffer(), state.byte_len()));
+                }
+                for (pin, state) in src_pins.iter().zip(&current) {
+                    raw.push(RawArg::read(pin.buffer(), state.byte_len()));
+                }
                 for (pin, input) in fixed_pins.iter().zip(&fixed) {
                     raw.push(RawArg::read(pin.buffer(), input.byte_len()));
                 }
                 raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
                 ctx.launch(&core, groups, [w, h, 1], &raw)?;
             }
-            current = Some(next);
+            current = next;
             done += k as usize;
         }
-        current.ok_or_else(|| Failure::New(LumaError::Gpu("stencil ran no steps".into())))
+        if done == 0 {
+            return Err(Failure::New(LumaError::Gpu("stencil ran no steps".into())));
+        }
+        Ok(current)
     }
 }

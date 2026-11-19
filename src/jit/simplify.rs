@@ -155,7 +155,10 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
         }
         OpKind::Unary(UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0)) => identity(op, a),
         OpKind::Unary(un) => {
-            if !matches!(un, UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Sign | UnOp::BitNot) {
+            if !matches!(
+                un,
+                UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_)
+            ) {
                 return None;
             }
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Unary(_)))?;
@@ -163,9 +166,12 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
             match (un, inner_un) {
                 (UnOp::Neg, UnOp::Neg) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
                 (UnOp::Abs, UnOp::Abs | UnOp::Neg) => unary(UnOp::Abs, ty, &iargs[0]),
-                (UnOp::Floor, UnOp::Floor | UnOp::Ceil) | (UnOp::Ceil, UnOp::Ceil | UnOp::Floor) => {
+                (UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round, UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round) => {
                     unary(inner_un, ty, &iargs[0])
                 }
+                (UnOp::Shl(x), UnOp::Shl(y)) if u32::from(x) + u32::from(y) < 32 => unary(UnOp::Shl(x + y), ty, &iargs[0]),
+                (UnOp::Shr(x), UnOp::Shr(y)) if u32::from(x) + u32::from(y) < 32 => unary(UnOp::Shr(x + y), ty, &iargs[0]),
+                (UnOp::Rotl(x), UnOp::Rotl(y)) => unary(UnOp::Rotl(((u32::from(x) + u32::from(y)) & 31) as u8), ty, &iargs[0]),
                 (UnOp::Sign, UnOp::Sign) => unary(UnOp::Sign, ty, &iargs[0]),
                 _ => None,
             }
@@ -173,6 +179,8 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
         OpKind::Select => {
             if let Some(m) = scalar(a) {
                 identity(op, if m.bits & 0xffff_ffff != 0 { b } else { c })
+            } else if let Some((_, iargs)) = inner(a, |inside| inside.ty == ElemTy::Bool && inside.kind == OpKind::Unary(UnOp::BitNot)) {
+                Some((op, args_of(iargs[0].clone(), c.clone(), b.clone())))
             } else if same(b, c) {
                 identity(op, b)
             } else {
@@ -231,6 +239,18 @@ fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
                 BinOp::Add if float && is_value(sa, ty, 0.0) => identity(op, b),
                 BinOp::Mul if float && (is_value(sa, ty, 0.0) || is_value(sb, ty, 0.0)) => constant(op, 0.0),
                 BinOp::Sub if float && same(a, b) => constant(op, 0.0),
+                BinOp::Add if float && inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg)).is_some() => {
+                    let (_, iargs) = inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
+                    binary(BinOp::Sub, ty, a, iargs[0].clone())
+                }
+                BinOp::Add if float && inner(a, |inside| inside.kind == OpKind::Unary(UnOp::Neg)).is_some() => {
+                    let (_, iargs) = inner(a, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
+                    binary(BinOp::Sub, ty, b, iargs[0].clone())
+                }
+                BinOp::Sub if float && inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg)).is_some() => {
+                    let (_, iargs) = inner(b, |inside| inside.kind == OpKind::Unary(UnOp::Neg))?;
+                    binary(BinOp::Add, ty, a, iargs[0].clone())
+                }
                 BinOp::Div if float && same(a, b) => constant(op, 1.0),
                 BinOp::Div if matches!(ty, ElemTy::F32 | ElemTy::F64) => {
                     let divisor = sb.and_then(value_of).filter(|v| *v != 0.0)?;
@@ -249,6 +269,8 @@ fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
             CmpOp::Lt | CmpOp::Gt => None,
         },
         OpKind::Powf => match scalar(b).and_then(value_of)? {
+            0.0 => constant(op, 1.0),
+            -1.0 => Some((Op::new(OpKind::Binary(BinOp::Div), ty), args_of(scalar_of(ty, 1.0), a.clone(), Src::unused()))),
             1.0 => identity(op, a),
             2.0 => Some((Op::new(OpKind::Binary(BinOp::Mul), ty), args_of(a.clone(), a.clone(), Src::unused()))),
             0.5 => unary(UnOp::Sqrt, ty, a),

@@ -1017,36 +1017,54 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
     let mut loop_body = String::new();
     // Without segments every op reduces the same elements: load each once.
     if !segmented {
-        for s in 0..per_thread {
-            loop_body += &format!("        let e{s} = {load}(min(base + {wg}u * {s}u, p.n - 1u));\n");
+        loop_body += &format!("            let e0 = {load}(base);\n");
+        for s in 1..per_thread {
+            loop_body += &format!(
+                "            let in{s} = base + {wg}u * {s}u < p.n;\n            var e{s} = e0;\n            if (in{s}) {{ e{s} = {load}(base + {wg}u * {s}u); }}\n"
+            );
         }
     }
     for (j, &op) in ops.as_slice().iter().enumerate() {
         let combine = elem.combine(op);
         combines += &format!("fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}\n");
         let segment = if segmented { format!("{j}u * p.n + ") } else { String::new() };
-        // Every group starts below `p.n`, so the first element is a real one for min and max.
-        inits += &match op {
-            ReduceOp::Sum | ReduceOp::SumSquares => format!("    var acc{j} = zero;\n"),
-            ReduceOp::Min | ReduceOp::Max => format!("    var acc{j} = {load}({segment}min(group * {block}u + lid, p.n - 1u));\n"),
-            ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
-        };
+        if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+            unreachable!("arg reductions have their own passes (`crate::arg`)");
+        }
+        inits += &format!("    var acc{j} = zero;\n");
         for s in 0..per_thread {
             if segmented {
-                loop_body += &format!("        let e{j}_{s} = {load}({segment}min(base + {wg}u * {s}u, p.n - 1u));\n");
+                if s == 0 {
+                    loop_body += &format!("            let e{j}_0 = {load}({segment}base);\n");
+                } else {
+                    loop_body += &format!(
+                        "            let in{j}_{s} = base + {wg}u * {s}u < p.n;\n            var e{j}_{s} = e{j}_0;\n            if (in{j}_{s}) {{ e{j}_{s} = {load}({segment}(base + {wg}u * {s}u)); }}\n"
+                    );
+                }
             }
             let e = if segmented { format!("e{j}_{s}") } else { format!("e{s}") };
-            // Out-of-range slots: sums take zero, min/max re-read the last element (harmless).
+            // Out-of-range slots: sums take zero, min/max reuse the first (valid) element.
             let value = match op {
-                ReduceOp::Sum => format!("select(zero, {e}, base + {wg}u * {s}u < p.n)"),
-                ReduceOp::SumSquares => format!("select(zero, {}, base + {wg}u * {s}u < p.n)", elem.square(&e)),
+                ReduceOp::Sum => {
+                    if s == 0 { e } else { format!("select(zero, {e}, base + {wg}u * {s}u < p.n)") }
+                }
+                ReduceOp::SumSquares => {
+                    let sq = elem.square(&e);
+                    if s == 0 { sq } else { format!("select(zero, {sq}, base + {wg}u * {s}u < p.n)") }
+                }
                 ReduceOp::Min | ReduceOp::Max => e,
-                ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
+                ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!(),
             };
-            loop_body += &format!("        let v{j}_{s} = {value};\n");
+            loop_body += &format!("            let v{j}_{s} = {value};\n");
         }
         let values: Vec<String> = (0..per_thread).map(|s| format!("v{j}_{s}")).collect();
-        loop_body += &format!("        acc{j} = c{j}(acc{j}, {});\n", pairwise(&format!("c{j}"), &values));
+        let pw = pairwise(&format!("c{j}"), &values);
+        loop_body += &match op {
+            ReduceOp::Min | ReduceOp::Max => {
+                format!("            if (b == group * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
+            }
+            _ => format!("            acc{j} = c{j}(acc{j}, {pw});\n"),
+        };
     }
 
     let mut finish = String::new();
@@ -1061,6 +1079,9 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
                 ReduceOp::Max => ("subgroupMax", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
                 ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
             };
+            if matches!(op, ReduceOp::Min | ReduceOp::Max) {
+                lanes += &format!("    let first{j} = subgroupBroadcastFirst(acc{j});\n    if (group * {block}u + lid >= p.n) {{ acc{j} = first{j}; }}\n");
+            }
             lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
             let (lets, fin) = ops.epilogue().statements(&format!("f{j}"), &format!("g{j}_"));
             first += &format!(
@@ -1076,7 +1097,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
             "    let sgid = lid / sg;
 {lanes}    workgroupBarrier();
     if (sgid == 0u) {{
-        let nsg = ({wg}u + sg - 1u) / sg;
+        let nsg = (min(p.n - group * {block}u, {wg}u) + sg - 1u) / sg;
 {first}    }}
 "
         );
@@ -1091,7 +1112,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
                 "    sh[lid] = acc{j};
     workgroupBarrier();
     for (var s = {half}u; s > 0u; s = s >> 1u) {{
-        if (lid < s) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
+        if (lid < s && group * {block}u + lid + s < p.n) {{ sh[lid] = c{j}(sh[lid], sh[lid + s]); }}
         workgroupBarrier();
     }}
     if (lid == 0u) {{ {lets}out[{j}u * groups + group] = {fin}; }}
@@ -1118,7 +1139,9 @@ fn main(
     let zero = {ty}();
 {inits}    for (var b = group * {block}u; b < p.n; b += groups * {block}u) {{
         let base = b + lid;
-{loop_body}    }}
+        if (base < p.n) {{
+{loop_body}        }}
+    }}
 {finish}}}
 ",
         elem.library(),

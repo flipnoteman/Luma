@@ -1264,6 +1264,59 @@ pub(super) fn reduce_fused(
     Ok(partials)
 }
 
+/// [`reduce_fused`] of one segment and one unsplit program that also stores the instructions
+/// `store_outs` in the same kernel, one new buffer each. Returns them, the buffer of partial
+/// results and how many there are.
+pub(super) fn reduce_and_store_fused(
+    ctx: &crate::context::Context,
+    len: usize,
+    mut fused: Fused,
+    store_outs: &[u32],
+    ops: ReduceList,
+    scratch: &mut Scratch<'_>,
+) -> Result<(Vec<Storage>, Buffer, u32), Failure> {
+    if store_outs.iter().any(|&at| fused.key.instrs.get(at as usize).is_none_or(|instr| instr.op.out_ty() == ElemTy::Bool)) {
+        return Err(LumaError::Chunked("a fused store and reduction on a packed bool output").into());
+    }
+    let last = fused.key.instrs.len() as u32 - 1;
+    fused.key.outputs = store_outs.iter().copied().chain(std::iter::once(last)).collect();
+    fused.mark_fused();
+    let Fused { mut key, inputs, mut scalars, .. } = fused;
+    let layout = layout_elem(&key, &inputs, len);
+    let first = Storage::new(ctx, len, ElemLayout::plain(layout as usize));
+    if first.segments() != 1 {
+        return Err(LumaError::Chunked("a fused store and reduction on an array of several segments").into());
+    }
+    let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
+    if shifted.is_some() {
+        return Err(LumaError::Chunked("a fused store and reduction on shifts over several buffers").into());
+    }
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+    let stored: Vec<Storage> = store_outs.iter().map(|&at| Storage::new(ctx, len, key.instrs[at as usize].op.out_ty().layout())).collect();
+    if stored.iter().any(|out| out.segments() != 1) {
+        return Err(LumaError::Chunked("a fused store and reduction on an array of several segments").into());
+    }
+
+    let n = len_u32(first.range(0).len())?;
+    let groups = ctx.tuning().reduce_groups(n);
+    let out_bytes = u64::from(groups) * out_elems(&key).first().copied().unwrap_or(4) * ops.as_slice().len() as u64;
+    let partial = scratch.take(out_bytes)?;
+    let params = params(&key, None, Some(n), first.range(0).start, len, None, &scalars)?;
+    let pins = pin_inputs(&key, &inputs, None, 0, n)?;
+    let store_pins = stored.iter().map(|out| out.pin(0).map(|pin| (pin, out.segment_byte_len(0)))).collect::<Result<Vec<_>, _>>()?;
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + store_pins.len() + 2);
+    raw.push(RawArg::write(&partial, out_bytes));
+    raw.extend(store_pins.iter().map(|(pin, bytes)| RawArg::write(pin.buffer(), *bytes)));
+    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
+    ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+    drop(raw);
+    let stats = &ctx.jit().stats;
+    stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
+    stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
+    Ok((stored, partial, groups))
+}
+
 /// The finite check (see `ContextOptions::check_finite`): fails with [`LumaError::NonFinite`] if
 /// `storage`, holding elements of type `ty`, contains a NaN or an infinity. Does nothing unless
 /// the option is on and the elements are `f32` or `Df32`. Waits for the GPU (once per segment).

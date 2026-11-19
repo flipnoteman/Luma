@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use crate::array::{Array, Failure, Storage};
+use crate::array::{Failure, Storage};
 use crate::context::Context;
 use crate::error::LumaError;
 use crate::shape::Shape;
@@ -179,13 +179,13 @@ impl LoopPlan {
             if let Some(result) = launch::run_loop_fused(ctx, &body, &state_of, &states, self.steps) {
                 return result;
             }
-        } else if let [state] = states.as_slice()
+        } else if (1..=4).contains(&states.len())
             // Tiles load circular halos from one buffer.
-            && state.segments() == 1
-            && let Some(stencil) = stencil::plan_fused(body.clone(), Some(0), self.shape)
+            && states.iter().all(|s| s.segments() == 1)
+            && let Some(stencil) = stencil::plan_multi(body.clone(), states.len(), self.shape)
+            && stencil.supported(ctx)
         {
-            let out = stencil.run(&Array::from_storage(ctx, self.shape, Arc::clone(state)), self.steps as usize)?;
-            return Ok(vec![Arc::clone(out.storage()?)]);
+            return stencil.run_multi(ctx, &states, self.steps as usize);
         }
 
         // Step by step; the states of later steps are ours alone, so a step may overwrite them.

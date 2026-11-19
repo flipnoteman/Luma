@@ -694,7 +694,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         | Tail::ScatterAdd { .. }
         | Tail::Stack { .. }
         | Tail::ParamStack { .. } => key.outputs.iter().take(1).map(|&at| at as usize).collect(),
-        Tail::Reduce(_) => vec![key.instrs.len().saturating_sub(1)],
+        Tail::Reduce(_) => vec![key.outputs.last().map_or(key.instrs.len().saturating_sub(1), |&at| at as usize)],
         // The roots are the operands, read by `luma_lhs` / `luma_rhs`; the output is `c`.
         // The roots of a sort are its keys, read by `luma_key`; its buffers are declared below.
         // The roots of a line solve are its parts, read by `luma_cell`; its buffers are declared below.
@@ -712,7 +712,8 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
     if matmul {
         src.push_str("@group(1) @binding(0) var<storage, read_write> c: array<f32>;\n");
     }
-    let mut binding = outputs.len() + usize::from(matmul) + axis_outputs;
+    let side_stores = if reduce { key.outputs.len().saturating_sub(1) } else { 0 };
+    let mut binding = outputs.len() + side_stores + usize::from(matmul) + axis_outputs;
     if let Some(pass) = radix {
         // The roots are the keys, read by `luma_key`; the kernel's own buffers go around the inputs.
         pass.declare_writes(&mut src, &mut binding);
@@ -732,6 +733,10 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             _ => out_storage_ty(out_elem(at)),
         };
         let _ = writeln!(src, "@group(1) @binding({j}) var<storage, read_write> {name}: array<{elem}>;");
+    }
+    for (j, &at) in key.outputs.iter().enumerate().take(side_stores) {
+        let elem = out_storage_ty(out_elem(at as usize));
+        let _ = writeln!(src, "@group(1) @binding({}) var<storage, read_write> out_s{j}: array<{elem}>;", j + 1);
     }
     for (k, ty) in key.input_tys.iter().enumerate() {
         if key.in_place.iter().any(|&(paired, _)| paired == k as u32) {
@@ -825,7 +830,18 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             let guard = format!("p.s{}", key.guard.unwrap_or(0));
             let elem = if reduces_df { ReduceElem::Df32 { guard: &guard, fma: tuning.df_fma } } else { ReduceElem::Plain(ty) };
             let names = Names { views: &views, in_place: &[] };
-            src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
+            if side_stores == 0 {
+                src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
+            } else {
+                let outs: Vec<usize> = key.outputs.iter().map(|&at| at as usize).collect();
+                let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
+                let (computed, values) = computed_values(key, &outs, inlined, &names, index, segmented);
+                let mut stores = String::new();
+                for (j, &val) in values.iter().enumerate().take(side_stores) {
+                    let _ = writeln!(stores, "    out_s{j}[i] = t{val};");
+                }
+                let _ = write!(src, "\nfn luma_eval(i: u32) -> {ty} {{\n{global}{computed}{stores}    return t{};\n}}\n", values[side_stores]);
+            }
             src.push_str(&reduce_main(elem, ops, false, "luma_eval", tuning));
         }
         Tail::AxisReduce(pass) => {
