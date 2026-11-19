@@ -81,6 +81,11 @@ impl BufferPool {
         self.pooled_bytes = 0;
         self.free.drain().flat_map(|(_, list)| list.into_iter().map(|(_, b)| b)).collect()
     }
+
+    /// Bytes of the idle buffers held.
+    pub(crate) fn pooled_bytes(&self) -> u64 {
+        self.pooled_bytes
+    }
 }
 
 #[cfg(test)]

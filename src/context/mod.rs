@@ -805,6 +805,22 @@ impl Context {
         self.inner.created_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Releases the idle buffers the context keeps for reuse (see [`MemoryStats::pooled_bytes`]),
+    /// after the work recorded so far, and has the backend drop what it caches for them. Array
+    /// data and recorded plans keep their memory. The pool fills again as arrays are dropped;
+    /// call this after a phase whose temporaries the next one cannot reuse (another grid
+    /// shape, say) to give the memory back to the device.
+    ///
+    /// [`MemoryStats::pooled_bytes`]: crate::MemoryStats::pooled_bytes
+    pub fn trim(&self) -> Result<()> {
+        self.reclaim_idle_buffers()
+    }
+
+    /// Bytes of the idle buffers in the pool.
+    pub(crate) fn pooled_bytes(&self) -> u64 {
+        lock(&self.inner.pool).pooled_bytes()
+    }
+
     /// Gives back every idle buffer: queues them for release, has the backend submit and wait
     /// for the device and drop what it caches for them (and its own idle buffers).
     fn reclaim_idle_buffers(&self) -> Result<()> {

@@ -471,6 +471,33 @@ impl Context {
     pub fn spilled_bytes(&self) -> u64 {
         self.pager().spilled_bytes.load(Ordering::Relaxed)
     }
+
+    /// What the context holds in device memory now (see [`MemoryStats`]).
+    pub fn memory_stats(&self) -> MemoryStats {
+        let pager = self.pager();
+        MemoryStats {
+            resident_bytes: pager.resident_bytes.load(Ordering::Relaxed),
+            pooled_bytes: self.pooled_bytes(),
+            spilled_bytes: pager.spilled_bytes.load(Ordering::Relaxed),
+            budget_bytes: pager.budget,
+        }
+    }
+}
+
+/// What a context holds in device memory, from [`Context::memory_stats`]. Sizes are those of the
+/// device buffers, which may be larger than the data they hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryStats {
+    /// Bytes of device buffers holding array data, and the intermediates kept by recorded plans:
+    /// what the memory budget counts.
+    pub resident_bytes: u64,
+    /// Bytes of idle buffers kept for reuse; [`Context::trim`] releases them.
+    pub pooled_bytes: u64,
+    /// Bytes of array data moved from the device to host memory so far.
+    pub spilled_bytes: u64,
+    /// Bytes of array data the context keeps on the device (`None`: no budget; data only moves
+    /// to host memory when the device reports that it is full).
+    pub budget_bytes: Option<u64>,
 }
 
 #[cfg(test)]
