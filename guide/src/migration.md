@@ -1,10 +1,65 @@
-# Migration from 0.3
+# Migration
+
+## From 0.4 to 0.5
+
+0.5 splits Luma into a workspace of five crates with one cargo feature per backend, adds native CUDA, Metal
+and CPU backends next to wgpu, and changes a few things that code written against 0.4 can trip over. Ordinary
+array code (`Array`, `iterate`, custom kernels) compiles as it is.
+
+### Software wgpu adapters are never used
+
+Mesa llvmpipe, SwiftShader and WARP are refused by the wgpu backend: it never requests a fallback adapter and
+refuses `DeviceKind::Cpu`. A CPU device (`LUMA_DEVICE=cpu`, `Context::cpu()`, or `Auto` without a GPU) is now the
+native `cpu` backend only, and it needs the `cpu` feature. If your program ran on a software Vulkan adapter
+before, it now runs on the native CPU backend (or returns an error when `LUMA_DEVICE=gpu` is set); build with the
+`cpu` feature to keep a CPU fallback ([Choosing a device](faq.md#choosing-a-device)).
+
+### `LumaError` carries strings, not wgpu types
+
+Adapter, device and readback errors in `LumaError` hold backend-neutral strings instead of wgpu types, so a
+`match` that destructured a wgpu error now reads the message. `luma::wgpu` is re-exported only with the `wgpu`
+feature: code that used it needs that feature, or its own `wgpu` dependency. `Features` and the profiling types
+are re-exported from `luma_core`.
+
+### Crates and features
+
+Luma is a workspace of five crates: `luma-core` (the kernel IR and the backend interface), `luma-wgpu`,
+`luma-metal` and `luma-cuda` (one backend each, with its own code generator), and the root `luma` crate. The
+features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend, and all are on by default. To build with
+one only:
+
+```sh
+cargo build --no-default-features --features cuda
+cargo build --no-default-features --features metal
+cargo build --no-default-features --features wgpu
+```
+
+In `Cargo.toml`: `luma = { version = "0.5", default-features = false, features = ["cuda"] }`.
+
+### `GraphLaunch` takes a `Dispatch`
+
+The graph interface of the backend trait, `GraphLaunch`, takes a `Dispatch` (direct or indirect) instead of
+workgroup counts. This matters only if you implement a backend; users of `Array` are not affected.
+
+### New in 0.5 that you may want
+
+- Choosing a backend: `ContextOptions::backend`, `Context::{cuda, metal, wgpu, backend}` and `LUMA_BACKEND`
+  ([Environment variables](environment.md), [FAQ](faq.md#choosing-a-device)). `Auto` tries CUDA, then Metal,
+  then wgpu. The CUDA backend needs only the NVIDIA driver, no CUDA toolkit.
+- `Context::device()` returns a `DeviceSummary { backend, name, software }`, and `Context::device_name()` the name.
+- `Array::permute_axes` and `swap_axes` (lazy views, like `transpose`), with `_mut` forms
+  ([Views and writes](views.md)).
+- `Context::memory_stats()` and `Context::trim()` ([Performance guide](performance.md)).
+- `iterate_until_all` and `compile_until_all` loops replay a block of steps as one graph on backends that
+  capture them (CUDA, CPU) ([Loops](loops.md#stop-conditions-iterate_until_all)).
+
+## From 0.3 to 0.4
 
 0.4 changes the type of comparisons: they return boolean arrays (`Array<bool>`) instead of
 `Array<u32>`. Most 0.3 code compiles as it is, because booleans promote to numbers the way they do
 in NumPy (below). Everything else in 0.4 is added ([the list below](#new-in-04-that-you-may-want)).
 
-## Comparisons return `Array<bool>`
+### Comparisons return `Array<bool>`
 
 `lt`, `le`, `gt`, `ge`, `eq`, `ne` and `is_finite` / `is_nan` / `is_inf` return `Array<bool>`. On the
 GPU a `bool` is one bit (`n` booleans are `ceil(n / 32)` `u32` words: a
@@ -71,7 +126,7 @@ The numeric reductions (`reduce_axis`, `scan`, `mean`, `norm`) are not defined f
 with `to_u32()` or `to_f32()`. A masked-out `NaN` or infinity in `mask * &x` gives 0, where a
 multiplication would give `NaN`.
 
-## New in 0.4 that you may want
+### New in 0.4 that you may want
 
 - [`i32` arrays, casts and `bool`](arrays.md#element-types) (`to_u32`, `to_i32`, `to_f32`; `count`,
   `any`, `all`).
@@ -83,11 +138,11 @@ multiplication would give `NaN`.
   [convolution](arrays.md#convolution) and the [tridiagonal solvers](loops.md#line-solvers-solve_tridiagonal),
   which earlier releases already had.
 
-# Migration from 0.2
+## From 0.2 to 0.3
 
 0.3 changes two things your 0.2 code can trip over. Almost everything else in 0.3 is added; the few behaviour changes (a lazy `reshape` of a view, fusion decided by a cost model, a larger buffer pool) are listed under *Changed* in the changelog.
 
-## Reductions are lazy arrays
+### Reductions are lazy arrays
 
 In 0.2, `sum`, `min`, `max`, `mean`, `norm` and `reduce` returned host values. In 0.3 they return a
 one-element `Array` that fuses with what follows, so `&x / &x.sum()` stays on the GPU. Read the
@@ -119,13 +174,13 @@ assert_eq!(mean_removed.to_vec()?, vec![-1.5, -0.5, 0.5, 1.5]);
 
 The `[f32; 2]` and `[f32; 4]` reductions (`vec2` / `vec4` element arrays) still return host values.
 
-## Broadcasting per axis
+### Broadcasting per axis
 
 An extent of 1 now broadcasts: `[N, 1] + [1, M]` is `[N, M]`, also for the branches of `select` and
 in compound assignment. Code that relied on a shape mismatch being an error between such shapes
 now gets a result. `broadcast_to(shape)` makes it explicit.
 
-## New in 0.3 that you may want
+### New in 0.3 that you may want
 
 - [Views](views.md) that fuse into the reading kernel (`slice`, `pad`, `flip`, `transpose`, `take`,
   `concat`, ...) and mutable views with `assign`.

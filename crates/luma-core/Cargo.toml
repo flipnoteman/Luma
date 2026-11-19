@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Kernel IR and backend interface of the Luma GPU array library"
 documentation = "https://docs.rs/luma-core"
-keywords = ["gpu", "cuda", "metal", "array", "compute"]
+keywords = ["gpu", "compute", "ir", "array", "kernel"]
 categories = ["science", "mathematics", "concurrency"]
 
 [dependencies]

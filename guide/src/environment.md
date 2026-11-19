@@ -6,6 +6,7 @@ builder methods override them:
 
 | Variable | `ContextOptions` |
 | --- | --- |
+| `LUMA_BACKEND` | `backend` / `.backend(kind)` |
 | `LUMA_DEVICE` | `device` / `.device(kind)` |
 | `LUMA_MEMORY_BUDGET` | `memory_budget` / `.memory_budget(bytes)` |
 | `LUMA_CHUNK_BYTES` | `chunk_bytes` / `.chunk_bytes(bytes)` |
@@ -21,7 +22,8 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_FUSION_*`, `LUMA_STAGING`, `L
 
 | Variable | Effect |
 | --- | --- |
-| `LUMA_DEVICE` | `gpu` or `cpu`: restrict the device kind (default: GPU, CPU as fallback) |
+| `LUMA_BACKEND` | `cuda`, `metal`, `wgpu` or `auto`: the backend (default `auto`: CUDA, then Metal, then wgpu) |
+| `LUMA_DEVICE` | `gpu` or `cpu`: restrict the device kind (default: GPU, CPU as fallback; `cpu` is the native `cpu` backend, software Vulkan adapters are never used); also accepts a backend name (`cuda`, `metal`, `wgpu`) when `LUMA_BACKEND` is not set |
 | `LUMA_MEMORY_BUDGET` | Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it). Default: 80% of the device's memory where the backend reports it, never on CPU devices, otherwise unlimited |
 | `LUMA_CHUNK_BYTES` | Largest buffer an array is split into, in bytes: a power of two from 1024 up to the largest bindable size, otherwise opening the context fails with `InvalidShape`; a value that is not a number is ignored |
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
@@ -37,9 +39,10 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_FUSION_*`, `LUMA_STAGING`, `L
 | `LUMA_DF_FMA` | `0`, `off` or `false` makes `Df32` products split their factors (Dekker) instead of taking the error of a product from `fma`; `1`, `on` or `true` trusts that the device's `fma` is fused. Default: a one-time test kernel decides per device (stored with the calibration, see `LUMA_CACHE`); the results are the same either way |
 | `LUMA_CHECK_FINITE` | `1`, `on` or `true`: fail any operation whose `f32` or `Df32` result holds a NaN or Inf (`f64` is not checked; debug mode, waits for the GPU after every evaluated array) |
 | `LUMA_CALIBRATE` | `0`, `off` or `false`: skip measuring the device's throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see `LUMA_CACHE`; a measurement that looks contended by other processes is dropped, and noted, so that processes use the profile's numbers for a day before measuring again) and use the tuning profile's fixed cost model |
-| `LUMA_CACHE` | `0`, `off` or `false`: do not keep anything between processes. By default luma stores the driver's compiled pipelines (wgpu `PipelineCache`, Vulkan) and the measured cost model per adapter and driver, so a second run skips the multi-second compile of large (`Df32`) kernels and the calibration |
+| `LUMA_CACHE` | `0`, `off` or `false`: do not keep anything between processes. By default luma stores the driver's compiled pipelines (wgpu `PipelineCache`, Vulkan), the PTX that the native CUDA backend compiles with the driver's NVVM (keyed by NVVM version and device architecture) and the measured cost model per adapter and driver (the native Metal backend keeps no compiled pipelines between processes), so a second run skips the multi-second compile of large (`Df32`) kernels and the calibration |
+| `LUMA_CUDA_DUMP` | a directory: the CUDA backend writes the NVVM IR (`.ll`), the PTX (`.ptx`) and the label (`.label`) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code |
 | `LUMA_CACHE_DIR` | Directory of that cache (default `$XDG_CACHE_HOME/luma` when that is an absolute path, else `~/.cache/luma`); files are written atomically, so processes may share it, and a damaged file is ignored |
-| `LUMA_EXIT_WAIT` | `0` skips waiting at exit for the driver's threads on Linux (saves about 60 ms; risks the driver's exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy Vulkan driver threads, and calls `_exit` only if they are still busy after that |
+| `LUMA_EXIT_WAIT` | `0` skips waiting at exit for the driver's threads on Linux (saves about 60 ms; risks the driver's exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA's, or Vulkan's) and then ends the process with `_exit` |
 
 ## Testing variables
 

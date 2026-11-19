@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Native SIMD CPU backend of the Luma GPU array library (Cranelift)"
 documentation = "https://docs.rs/luma-cpu"
-keywords = ["gpu", "cuda", "metal", "array", "compute"]
+keywords = ["simd", "cpu", "cranelift", "compute", "array"]
 categories = ["science", "mathematics", "concurrency"]
 
 [dependencies]

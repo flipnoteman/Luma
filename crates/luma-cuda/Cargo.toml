@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Native CUDA backend of the Luma GPU array library, compiled through the NVIDIA driver's NVVM"
 documentation = "https://docs.rs/luma-cuda"
-keywords = ["gpu", "cuda", "metal", "array", "compute"]
+keywords = ["gpu", "cuda", "nvidia", "compute", "array"]
 categories = ["science", "mathematics", "concurrency"]
 
 [dependencies]

@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Native Metal backend of the Luma GPU array library"
 documentation = "https://docs.rs/luma-metal"
-keywords = ["gpu", "cuda", "metal", "array", "compute"]
+keywords = ["gpu", "metal", "apple", "compute", "array"]
 categories = ["science", "mathematics", "concurrency"]
 
 [dependencies]

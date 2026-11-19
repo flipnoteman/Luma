@@ -1,7 +1,7 @@
 [book]
 title = "The Luma Guide"
 authors = ["flipnoteman"]
-description = "User guide for Luma, lazy GPU arrays for Rust on wgpu"
+description = "User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU"
 language = "en"
 src = "src"
 

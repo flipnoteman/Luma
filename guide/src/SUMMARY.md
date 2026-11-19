@@ -19,4 +19,4 @@
 
 - [Environment variables](environment.md)
 - [FAQ and troubleshooting](faq.md)
-- [Migration from 0.3 and 0.2](migration.md)
+- [Migration](migration.md)

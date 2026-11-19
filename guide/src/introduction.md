@@ -16,12 +16,13 @@ This guide explains how to use the library and why it behaves as it does. The
 
 ## Install
 
-You need a recent stable Rust toolchain and a GPU with Vulkan, Metal or DX12 drivers. Add Luma
+You need a recent stable Rust toolchain and, for a GPU, an NVIDIA driver (the native CUDA backend needs
+no CUDA toolkit), a Metal device, or a Vulkan, Metal or DX12 driver for the wgpu backend. Add Luma
 to a project:
 
 ```toml
 [dependencies]
-luma = "0.4"
+luma = "0.5"
 ```
 
 Without a GPU Luma runs on its native `cpu` backend (nothing to install). It is picked
