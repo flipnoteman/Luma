@@ -4439,6 +4439,27 @@ fn staged_reference(x: &Array<f32>, stages: usize, late: bool, steps: usize) -> 
     want.to_vec().unwrap()
 }
 
+/// Recording a step creates the memory its intermediates need at once, not one buffer for each:
+/// a buffer the recorded commands are done with is handed to the next intermediate. The result
+/// takes one of those buffers, and the replays still compute what untraced code computes.
+#[test]
+fn recording_a_chain_of_intermediates_creates_few_buffers() {
+    let ctx = ctx();
+    let x = f32s(&ctx, &values(1000, 34, 0.0, 1.0));
+    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let stages = 16;
+    let before = ctx.created_bytes();
+    let (stepper, held) = trace_staged(&x, stages, false);
+    let created = (ctx.created_bytes() - before) / class;
+    eprintln!("recording {stages} stages created {created} buffers; the plan holds {held}");
+    assert!(created <= 6, "{created} buffers created for {stages} intermediates");
+    for steps in [1, 2, 5] {
+        stepper.run_steps(steps).unwrap();
+        let got = Array::<f32>::from_storage(&ctx, x.shape(), std::sync::Arc::clone(&stepper.state_after(steps)[0])).to_vec().unwrap();
+        assert_close(&got, &staged_reference(&x, stages, false, steps), 1e-5, 1e-6);
+    }
+}
+
 /// Intermediates of a traced step that are not live together share buffers: eight stages hold a
 /// handful of buffers, not one each, and the replayed steps give what untraced code gives.
 #[test]
@@ -4497,7 +4518,7 @@ fn the_shared_buffers_of_a_plan_stay_in_the_memory_accounting() {
     // The probe and the result are owned by arrays; the rest of the plan's buffers (the shared
     // intermediates) are counted for the plan.
     assert_eq!(after - before, held * class, "plan holds {held} buffers of {class} bytes");
-    assert!(after < recording, "the intermediates that merged left the count: {recording} -> {after}");
+    assert_eq!(after, recording, "the recording reused its finished intermediates: it never held more than the plan keeps");
     drop(plan);
     assert_eq!(resident() - before, 2 * class, "only the probe and the result remain counted");
     drop((next, probe));

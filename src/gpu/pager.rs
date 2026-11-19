@@ -320,8 +320,13 @@ impl Segment {
                 State::Window(window) => Some((Arc::clone(&window.pack), window.offset)),
                 _ => None,
             };
-            self.ctx.make_room(self.bytes)?;
-            let buffer = self.ctx.alloc_buffer(self.bytes, STORAGE_USAGE)?;
+            let buffer = match self.ctx.take_recorded(self.bytes, STORAGE_USAGE) {
+                Some(buffer) => buffer,
+                None => {
+                    self.ctx.make_room(self.bytes)?;
+                    self.ctx.alloc_buffer(self.bytes, STORAGE_USAGE)?
+                }
+            };
             if let Some((pack, offset)) = window {
                 // The copy runs after the launch that wrote the pack and before any later one.
                 let source = pack.pin(0)?;

@@ -104,6 +104,10 @@ pub(crate) struct Recording {
     /// until the plan, or the recording if it is dropped instead, is.
     pub resident: Option<Accounted>,
     kernels: FxMap<u64, Arc<KernelCore>>,
+    /// The transient buffers that [`Recording::reuse`] handed out again, each with the number
+    /// of commands captured at every hand-out: the commands before a hand-out are those of the
+    /// earlier intermediates the buffer held.
+    generations: FxMap<u64, Vec<usize>>,
 }
 
 /// The state of this thread's recording on a context; a thread without an entry has none.
@@ -166,6 +170,7 @@ impl Context {
                         transient: Vec::new(),
                         resident: None,
                         kernels: FxMap::default(),
+                        generations: FxMap::default(),
                     }),
                 ));
                 true
@@ -205,6 +210,19 @@ impl Context {
             .flatten();
         match state {
             Some(RecState::Active(mut recording)) => {
+                // A buffer handed out again during the recording that a result, state or probe
+                // now owns keeps its identity, as every buffer outside the plan does (see
+                // `share_transients`): the intermediates it held before get a buffer of their own.
+                for (from, size, usage, before) in recording.reused_and_kept() {
+                    match self.alloc_buffer(size, usage) {
+                        Ok(to) => recording.split(from, before, to),
+                        Err(_) => {
+                            // The commands still run, as an aborted recording's do.
+                            self.encode_recording(recording).ok();
+                            return None;
+                        }
+                    }
+                }
                 // The entry is gone, so `recycle` gives these straight to the pool.
                 for buffer in recording.share_transients() {
                     self.recycle(buffer);
@@ -225,6 +243,12 @@ impl Context {
         self.with_recording(|recording| {
             recording.fresh.insert(buffer.id());
         });
+    }
+
+    /// A buffer of exactly `size` bytes and `usage` that this thread's recording has finished
+    /// with (see [`Recording::reuse`]), if it has one.
+    pub(super) fn reuse_recorded(&self, size: u64, usage: BufferUsage) -> Option<Buffer> {
+        self.with_recording(|recording| recording.reuse(size, usage)).flatten()
     }
 
     /// Captures a launch if this thread is recording.
@@ -271,6 +295,12 @@ impl Context {
         .flatten() else {
             return Ok(());
         };
+        self.encode_recording(recording)
+    }
+
+    /// Copies the seeds of `recording` and encodes its commands, in order, then gives its held
+    /// buffers back: what running the traced code without recording would have done.
+    fn encode_recording(&self, recording: Recording) -> Result<()> {
         let result = (|| {
             for (from, to) in &recording.seed {
                 self.copy_storage(from, to)?;
@@ -325,6 +355,79 @@ pub(super) fn pack_intervals(intervals: &[Interval]) -> Vec<usize> {
 }
 
 impl Recording {
+    /// A buffer of exactly `size` bytes and `usage` that the commands captured so far are done
+    /// with, taken out of the recording for a new allocation: a fresh one that was released
+    /// during the recording, or the buffer of a segment that only this recording's pins still
+    /// hold (see [`take_dead_buffers`]). Nothing can bind such a buffer again but its new owner,
+    /// whose first command comes after the last one of the old, so the buffer is shared as
+    /// [`Recording::share_transients`] would share it once the recording ended, but without
+    /// holding both until then: a step needs the memory its intermediates use at once, not their
+    /// sum. The hand-out is noted (see [`Recording::reused_and_kept`]).
+    fn reuse(&mut self, size: u64, usage: BufferUsage) -> Option<Buffer> {
+        let fresh = &self.fresh;
+        let fits = |buffer: &Buffer| buffer.size() == size && buffer.usage() == usage && fresh.contains(&buffer.id());
+        let at = match self.retired.iter().position(fits) {
+            Some(at) => at,
+            None => {
+                let dead = take_dead_buffers(&mut self.pins, &self.fresh);
+                if dead.is_empty() {
+                    return None;
+                }
+                self.retired.extend(dead);
+                let fresh = &self.fresh;
+                self.retired.iter().position(|buffer| buffer.size() == size && buffer.usage() == usage && fresh.contains(&buffer.id()))?
+            }
+        };
+        let buffer = self.retired.swap_remove(at);
+        self.generations.entry(buffer.id()).or_default().push(self.cmds.len());
+        Some(buffer)
+    }
+
+    /// The buffers handed out again by [`Recording::reuse`] that something outside the plan
+    /// still holds at the end of the recording (a result, state or probe: not transient), each
+    /// with its size, usage and the number of commands before its last hand-out.
+    fn reused_and_kept(&mut self) -> Vec<(u64, u64, BufferUsage, usize)> {
+        if self.generations.is_empty() {
+            return Vec::new();
+        }
+        let dead = take_dead_buffers(&mut self.pins, &self.fresh);
+        self.retired.extend(dead);
+        let released: FxSet<u64> = self.retired.iter().map(Buffer::id).collect();
+        let mut kept = Vec::new();
+        for (&id, handouts) in &self.generations {
+            if released.contains(&id) {
+                continue;
+            }
+            let last = handouts.last().copied().unwrap_or(0);
+            let buffer = self.cmds.iter().flat_map(|cmd| &cmd.args).find_map(|arg| match arg {
+                CmdArg::Storage { buffer, .. } if buffer.id() == id => Some(buffer),
+                _ => None,
+            });
+            if let Some(buffer) = buffer {
+                kept.push((id, buffer.size(), buffer.usage(), last));
+            }
+        }
+        kept
+    }
+
+    /// Makes the first `before` commands bind `to`, a fresh buffer, where they bind the buffer
+    /// `from`: the intermediates `from` held before its last hand-out move to `to`, which is
+    /// transient (released, so [`Recording::share_transients`] may share it).
+    fn split(&mut self, from: u64, before: usize, to: Buffer) {
+        for cmd in &mut self.cmds[..before] {
+            for arg in &mut cmd.args {
+                if let CmdArg::Storage { buffer, .. } = arg
+                    && buffer.id() == from
+                {
+                    *buffer = to.clone();
+                }
+            }
+        }
+        self.generations.remove(&from);
+        self.fresh.insert(to.id());
+        self.retired.push(to);
+    }
+
     /// Lets the transient buffers of the recording share memory, and returns the ones the
     /// commands no longer name, for the caller to give back to the pool.
     ///

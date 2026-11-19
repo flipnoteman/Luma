@@ -63,6 +63,9 @@ struct Inner {
     /// Tests: report the GPU as busy regardless of the queue (see `Context::set_assume_busy`).
     #[cfg(test)]
     assume_busy: std::sync::atomic::AtomicBool,
+    /// Tests: bytes of device buffers created so far (see [`Context::created_bytes`]).
+    #[cfg(test)]
+    created_bytes: std::sync::atomic::AtomicU64,
     /// Largest buffer that can be allocated *and* bound as a storage buffer.
     max_buffer_bytes: u64,
     max_uniform_bytes: u64,
@@ -552,6 +555,8 @@ impl Context {
                 waits: WaitHistory::new(),
                 #[cfg(test)]
                 assume_busy: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                created_bytes: std::sync::atomic::AtomicU64::new(0),
                 max_buffer_bytes,
                 backend,
             }),
@@ -743,6 +748,9 @@ impl Context {
     /// if none is idle. The buffer's size is rounded up to a power of two and its contents are
     /// unspecified. Give it back with [`Context::recycle`].
     pub(crate) fn alloc_buffer(&self, bytes: u64, usage: BufferUsage) -> Result<Buffer> {
+        if let Some(buffer) = self.take_recorded(bytes, usage) {
+            return Ok(buffer);
+        }
         let max = self.inner.max_buffer_bytes;
         let class = pool::size_class(bytes, max)
             .ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
@@ -754,6 +762,13 @@ impl Context {
         };
         self.note_fresh(&buffer);
         Ok(buffer)
+    }
+
+    /// A buffer for `bytes` bytes with `usage` that this thread's recording is done with (see
+    /// `Recording::reuse`), if it is recording and has one: no new memory is needed for it.
+    pub(crate) fn take_recorded(&self, bytes: u64, usage: BufferUsage) -> Option<Buffer> {
+        let class = pool::size_class(bytes, self.inner.max_buffer_bytes)?;
+        self.reuse_recorded(class, usage)
     }
 
     /// Runs `attempt` (`None`: the device is out of memory) and, when the device is full, gives
@@ -779,7 +794,15 @@ impl Context {
     /// A new buffer; when the device is out of memory, gives back every idle buffer and the bind
     /// groups pinning them, then tries once more.
     fn new_buffer(&self, size: u64, usage: BufferUsage, mapped: bool) -> Result<Buffer> {
+        #[cfg(test)]
+        self.inner.created_bytes.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
         self.relieving(size, || Ok(self.hal().create_buffer(size, usage, mapped)))
+    }
+
+    /// Tests: bytes of device buffers created so far.
+    #[cfg(test)]
+    pub(crate) fn created_bytes(&self) -> u64 {
+        self.inner.created_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Gives back every idle buffer: queues them for release, has the backend submit and wait
