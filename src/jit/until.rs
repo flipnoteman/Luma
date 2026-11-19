@@ -203,8 +203,11 @@ fn run(
     let args_bytes = u64::from(words) * WORD;
     let indirect = STORAGE_USAGE | BufferUsage::INDIRECT;
     let mut owned = Vec::new();
+    // Counted as resident while the run uses them.
+    let mut held = crate::gpu::pager::Accounted::new(ctx, 0);
     let mut take = |bytes: u64, usage: BufferUsage| -> Result<Buffer, LumaError> {
         let buffer = ctx.alloc_buffer(bytes, usage)?;
+        held.add(buffer.size());
         owned.push(buffer.clone());
         Ok(buffer)
     };

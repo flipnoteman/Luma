@@ -88,8 +88,8 @@ impl Drop for Pin {
     }
 }
 
-/// Bytes of device buffers that no segment owns but a recorded plan holds, counted in the
-/// pager's `resident_bytes` (so the memory budget sees them) until this is dropped.
+/// Bytes of device buffers that no segment owns but a recording, a plan or a loop holds, counted
+/// in the pager's `resident_bytes` (so the memory budget sees them) until this is dropped.
 #[derive(Debug)]
 pub(crate) struct Accounted {
     ctx: Context,
@@ -97,10 +97,35 @@ pub(crate) struct Accounted {
 }
 
 impl Accounted {
-    /// Counts `bytes` more as resident.
+    /// Counts `bytes` as resident.
     pub(crate) fn new(ctx: &Context, bytes: u64) -> Accounted {
         ctx.pager().resident_bytes.fetch_add(bytes, Ordering::Relaxed);
         Accounted { ctx: ctx.clone(), bytes }
+    }
+
+    /// Counts `bytes` more.
+    pub(crate) fn add(&mut self, bytes: u64) {
+        self.ctx.pager().resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.bytes += bytes;
+    }
+
+    /// Stops counting `bytes` of what was counted so far.
+    pub(crate) fn sub(&mut self, bytes: u64) {
+        debug_assert!(bytes <= self.bytes, "uncounting more than was counted");
+        self.ctx.pager().resident_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.bytes -= bytes;
+    }
+
+    /// Stops counting everything counted so far.
+    pub(crate) fn clear(&mut self) {
+        self.ctx.pager().resident_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.bytes = 0;
+    }
+
+    /// Bytes counted so far.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
     }
 }
 
@@ -182,6 +207,12 @@ impl Pager {
     #[cfg(test)]
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.resident_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Counts `bytes` of device buffers the context holds until it is dropped (nothing gives
+    /// them back, so there is nothing to uncount).
+    pub(crate) fn count_for_life(&self, bytes: u64) {
+        self.resident_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Whether resident array data has reached three quarters of the memory budget.
@@ -486,10 +517,20 @@ impl Context {
 
 /// What a context holds in device memory, from [`Context::memory_stats`]. Sizes are those of the
 /// device buffers, which may be larger than the data they hold.
+///
+/// The two byte counts cover the device buffers luma makes: `resident_bytes` those in use,
+/// `pooled_bytes` those idle. What the driver or the backend keeps besides them is in neither
+/// and shows in `nvidia-smi` or the like on top of them: the device context itself (a few
+/// hundred MiB on CUDA), compiled kernel code, the backend's own uniform and staging chunks,
+/// what a captured graph keeps internally (the device copy of its uniforms is counted), and,
+/// on CUDA, the driver's pool reserve of memory that was freed but not yet returned to the
+/// device ([`Context::trim`] returns it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryStats {
-    /// Bytes of device buffers holding array data, and the intermediates kept by recorded plans:
-    /// what the memory budget counts.
+    /// Bytes of device buffers in use: array data; what recordings, recorded plans and loops
+    /// keep (the intermediates of a plan, state placeholders, a loop's work buffers, a captured
+    /// graph's uniforms); the scratch an operation is using; the context's own counters. This
+    /// is what the memory budget counts.
     pub resident_bytes: u64,
     /// Bytes of idle buffers kept for reuse; [`Context::trim`] releases them.
     pub pooled_bytes: u64,

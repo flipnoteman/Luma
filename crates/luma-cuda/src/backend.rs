@@ -232,6 +232,8 @@ struct GraphRes {
     /// Device copy of the uniforms too large to pass by value.
     #[allow(dead_code)]
     scratch: Option<CudaBuffer>,
+    /// Size of `scratch`.
+    scratch_bytes: u64,
 }
 
 struct GraphCell(CudaGraph);
@@ -255,7 +257,11 @@ struct CudaExecGraph {
     ctx: Arc<CudaContext>,
 }
 
-impl ExecGraph for CudaExecGraph {}
+impl ExecGraph for CudaExecGraph {
+    fn device_bytes(&self) -> u64 {
+        self.res.scratch_bytes
+    }
+}
 
 impl Drop for CudaExecGraph {
     fn drop(&mut self) {
@@ -914,7 +920,8 @@ impl CudaBackend {
 
         let mut params = Params::default();
         let mut offset = 0usize;
-        let mut res = GraphRes { buffers: Vec::new(), kernels: Vec::new(), scratch };
+        let scratch_bytes = if scratch.is_some() { (staging.len() as u64).max(MIN_BUFFER) } else { 0 };
+        let mut res = GraphRes { buffers: Vec::new(), kernels: Vec::new(), scratch, scratch_bytes };
         let recorded = (|| {
             for ((launch, native), &(grid, indirect, indirect_buffer)) in launches.iter().zip(&natives).zip(&dispatches) {
                 // A launch of no workgroups (an indirect one: of a bound of none) never runs.

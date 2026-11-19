@@ -24,7 +24,7 @@ use crate::array::{Array, Failure, Storage};
 use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::fields::Fields;
-use crate::gpu::pager::Pin;
+use crate::gpu::pager::{Accounted, Pin};
 use crate::jit::{self, GraphBuilder, GraphCache, Plan, Stepper, Trace};
 use crate::kernel::KernelCore;
 use crate::ops::{Outcome, launch_1d, workgroups_1d};
@@ -812,9 +812,11 @@ fn records_of<S: Fields>(
     Ok(recs)
 }
 
-/// Allocates a buffer from `ctx`'s pool and notes it in `owned`, to be given back.
-fn take(ctx: &Context, owned: &mut Vec<Buffer>, bytes: u64, usage: BufferUsage) -> Result<Buffer> {
+/// Allocates a buffer from `ctx`'s pool and notes it in `owned`, to be given back, and in `held`,
+/// to be counted as resident meanwhile.
+fn take(ctx: &Context, owned: &mut Vec<Buffer>, held: &mut Accounted, bytes: u64, usage: BufferUsage) -> Result<Buffer> {
     let buffer = ctx.alloc_buffer(bytes, usage)?;
+    held.add(buffer.size());
     owned.push(buffer.clone());
     Ok(buffer)
 }
@@ -864,6 +866,9 @@ struct GateLoop {
     args: Vec<Buffer>,
     /// Everything taken from the pool, to be given back.
     owned: Vec<Buffer>,
+    /// Counts the bytes of `owned` while the loop lives.
+    #[allow(dead_code)]
+    held: Accounted,
     /// Captured spans of steps, by (steps, whether the first is an even step).
     graphs: GraphCache<(usize, bool)>,
     /// A compiled loop is run again and again: its spans are captured on first use. A one-shot
@@ -889,12 +894,13 @@ impl GateLoop {
         let step_pin = stepv.storage()?.pin_quiet(0)?;
         let records = recs.len().max(1);
         let mut owned = Vec::new();
+        let mut held = Accounted::new(ctx, 0);
         let made = (|| -> Result<[Buffer; 4]> {
-            let tmpl = take(ctx, &mut owned, u64::from(words) * 4, STORAGE_USAGE)?;
+            let tmpl = take(ctx, &mut owned, &mut held, u64::from(words) * 4, STORAGE_USAGE)?;
             ctx.upload(&tmpl, bytemuck::cast_slice(&template))?;
-            let st = take(ctx, &mut owned, 16, STORAGE_USAGE)?;
-            let hist = take(ctx, &mut owned, (records * capacity) as u64 * 4, STORAGE_USAGE)?;
-            let agg = take(ctx, &mut owned, 2 * records as u64 * 4, STORAGE_USAGE)?;
+            let st = take(ctx, &mut owned, &mut held, 16, STORAGE_USAGE)?;
+            let hist = take(ctx, &mut owned, &mut held, (records * capacity) as u64 * 4, STORAGE_USAGE)?;
+            let agg = take(ctx, &mut owned, &mut held, 2 * records as u64 * 4, STORAGE_USAGE)?;
             Ok([tmpl, st, hist, agg])
         })();
         let [tmpl, st, hist, agg] = match made {
@@ -924,7 +930,8 @@ impl GateLoop {
             agg,
             args: Vec::new(),
             owned,
-            graphs: GraphCache::new(),
+            held,
+            graphs: GraphCache::new(ctx),
             compiled: false,
         })
     }
@@ -951,7 +958,7 @@ impl GateLoop {
     fn ensure_args(&mut self, len: usize) -> Result<()> {
         let bytes = self.args_bytes();
         while self.args.len() < len {
-            let buffer = take(&self.ctx, &mut self.owned, bytes, STORAGE_USAGE | BufferUsage::INDIRECT)?;
+            let buffer = take(&self.ctx, &mut self.owned, &mut self.held, bytes, STORAGE_USAGE | BufferUsage::INDIRECT)?;
             self.args.push(buffer);
         }
         Ok(())

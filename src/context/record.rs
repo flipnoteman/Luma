@@ -91,6 +91,7 @@ pub(crate) struct Recording {
     pub pins: Vec<Pin>,
     /// Buffers released during the recording; they stay out of the pool while captured commands
     /// still refer to them. Ending the recording merges the transient ones (see `transient`).
+    /// Counted in `resident`.
     pub retired: Vec<Buffer>,
     /// The buffers (by id) that `alloc_buffer` handed out during the recording. Their contents
     /// were arbitrary when the recording began, so nothing the plan computes can depend on them
@@ -100,9 +101,9 @@ pub(crate) struct Recording {
     /// allocated and released inside the recording. They belong to the plan alone (nothing
     /// outside holds them, and no buffer swap of a stepper may involve one).
     pub transient: Vec<Buffer>,
-    /// Keeps the bytes of `transient` counted as resident (the segments that owned them are gone)
-    /// until the plan, or the recording if it is dropped instead, is.
-    pub resident: Option<Accounted>,
+    /// Counts the bytes of `retired` as resident (the segments that owned them are gone, and
+    /// they are not in the pool) until the plan, or the recording if it is dropped instead, is.
+    pub resident: Accounted,
     kernels: FxMap<u64, Arc<KernelCore>>,
     /// The transient buffers that [`Recording::reuse`] handed out again, each with the number
     /// of commands captured at every hand-out: the commands before a hand-out are those of the
@@ -168,7 +169,7 @@ impl Context {
                         retired: Vec::new(),
                         fresh: FxSet::default(),
                         transient: Vec::new(),
-                        resident: None,
+                        resident: Accounted::new(self, 0),
                         kernels: FxMap::default(),
                         generations: FxMap::default(),
                     })),
@@ -226,10 +227,6 @@ impl Context {
                 // The entry is gone, so `recycle` gives these straight to the pool.
                 for buffer in recording.share_transients() {
                     self.recycle(buffer);
-                }
-                let kept: u64 = recording.transient.iter().map(Buffer::size).sum();
-                if kept > 0 {
-                    recording.resident = Some(Accounted::new(self, kept));
                 }
                 Some(*recording)
             }
@@ -373,12 +370,15 @@ impl Recording {
                 if dead.is_empty() {
                     return None;
                 }
-                self.retired.extend(dead);
+                for buffer in dead {
+                    self.retain(buffer);
+                }
                 let fresh = &self.fresh;
                 self.retired.iter().position(|buffer| buffer.size() == size && buffer.usage() == usage && fresh.contains(&buffer.id()))?
             }
         };
         let buffer = self.retired.swap_remove(at);
+        self.resident.sub(buffer.size());
         self.generations.entry(buffer.id()).or_default().push(self.cmds.len());
         Some(buffer)
     }
@@ -391,7 +391,9 @@ impl Recording {
             return Vec::new();
         }
         let dead = take_dead_buffers(&mut self.pins, &self.fresh);
-        self.retired.extend(dead);
+        for buffer in dead {
+            self.retain(buffer);
+        }
         let released: FxSet<u64> = self.retired.iter().map(Buffer::id).collect();
         let mut kept = Vec::new();
         for (&id, handouts) in &self.generations {
@@ -425,7 +427,7 @@ impl Recording {
         }
         self.generations.remove(&from);
         self.fresh.insert(to.id());
-        self.retired.push(to);
+        self.retain(to);
     }
 
     /// Lets the transient buffers of the recording share memory, and returns the ones the
@@ -448,15 +450,15 @@ impl Recording {
     /// the same aliasing. Intervals that touch at one command stay apart: a command may read one
     /// buffer while it writes another.
     fn share_transients(&mut self) -> Vec<Buffer> {
+        // Counted again below, as far as the recording keeps them.
+        self.resident.clear();
         let mut transient: Vec<Buffer> = Vec::new();
-        let mut kept = Vec::with_capacity(self.retired.len());
         for buffer in std::mem::take(&mut self.retired) {
             match self.fresh.contains(&buffer.id()) {
                 true => transient.push(buffer),
-                false => kept.push(buffer),
+                false => self.retain(buffer),
             }
         }
-        self.retired = kept;
         transient.extend(take_dead_buffers(&mut self.pins, &self.fresh));
         if transient.is_empty() {
             return Vec::new();
@@ -513,7 +515,7 @@ impl Recording {
         for (n, buffer) in transient.into_iter().enumerate() {
             if becomes[n] == Some(n) {
                 self.transient.push(buffer.clone());
-                self.retired.push(buffer);
+                self.retain(buffer);
             } else {
                 freed.push(buffer);
             }
@@ -523,7 +525,14 @@ impl Recording {
 
     fn retire_buffer(&mut self, buffer: &mut Option<Buffer>) {
         if let Some(buffer) = buffer.take() {
-            self.retired.push(buffer);
+            self.retain(buffer);
         }
+    }
+
+    /// Holds `buffer` back from the pool, counted as resident while the recording or its plan
+    /// holds it.
+    fn retain(&mut self, buffer: Buffer) {
+        self.resident.add(buffer.size());
+        self.retired.push(buffer);
     }
 }

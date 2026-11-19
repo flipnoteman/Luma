@@ -32,9 +32,9 @@ pub(crate) struct Plan {
     /// The buffers of `retired` that the plan made up for its intermediates and shares between
     /// them (see `Recording::share_transients`); no state, probe or result is one.
     transient: Vec<Buffer>,
-    /// Counts the bytes of `transient` against the memory budget while the plan lives.
+    /// Counts the bytes of `retired` against the memory budget while the plan lives.
     #[allow(dead_code)]
-    resident: Option<Accounted>,
+    resident: Accounted,
 }
 
 impl Plan {
@@ -65,6 +65,13 @@ impl Plan {
     #[cfg(test)]
     pub(crate) fn transient_bytes(&self) -> u64 {
         self.transient.iter().map(Buffer::size).sum()
+    }
+
+    /// Bytes of the buffers the plan holds that no array owns (its `retired` ones), and the
+    /// bytes counted for them.
+    #[cfg(test)]
+    pub(crate) fn held_bytes(&self) -> (u64, u64) {
+        (self.retired.iter().map(Buffer::size).sum(), self.resident.bytes())
     }
 
     /// Number of recorded launches.
@@ -169,6 +176,9 @@ impl<'a> GraphBuilder<'a> {
 /// millisecond for a step of a few dozen launches, against about a microsecond saved per launch).
 pub(crate) const PAYING_REPLAYS: usize = 8;
 
+/// A captured graph with its device memory counted as resident.
+type Counted = (Arc<dyn ExecGraph>, Accounted);
+
 /// Captured graphs by what they replay, `None` for what the backend could not capture (asked
 /// only once). A graph names the buffers it was captured with: the owner of a cache clears it
 /// when one of them is replaced.
@@ -177,20 +187,23 @@ pub(crate) const PAYING_REPLAYS: usize = 8;
 /// ([`PAYING_REPLAYS`]), or the second time it is asked for (an owner kept across runs replays it
 /// again). Until then the caller replays the launches one by one.
 pub(crate) struct GraphCache<K> {
-    graphs: Mutex<FxMap<K, Option<Arc<dyn ExecGraph>>>>,
+    ctx: Context,
+    /// Each graph with its device memory (see [`ExecGraph::device_bytes`]) counted as resident
+    /// while the cache holds it.
+    graphs: Mutex<FxMap<K, Option<Counted>>>,
     asked: Mutex<FxMap<K, u32>>,
 }
 
 impl<K: Hash + Eq + Copy> GraphCache<K> {
-    pub(crate) fn new() -> Self {
-        GraphCache { graphs: Mutex::new(FxMap::default()), asked: Mutex::new(FxMap::default()) }
+    pub(crate) fn new(ctx: &Context) -> Self {
+        GraphCache { ctx: ctx.clone(), graphs: Mutex::new(FxMap::default()), asked: Mutex::new(FxMap::default()) }
     }
 
     /// The graph under `key` for `replays` replays now: the cached one, or one captured by
     /// `build` if that pays; `None` to replay the launches one by one.
     pub(crate) fn get_or_build(&self, key: K, replays: usize, build: impl FnOnce() -> Option<Arc<dyn ExecGraph>>) -> Option<Arc<dyn ExecGraph>> {
         if let Some(graph) = lock(&self.graphs).get(&key) {
-            return graph.clone();
+            return graph.as_ref().map(|(graph, _)| Arc::clone(graph));
         }
         let asked = {
             let mut asked = lock(&self.asked);
@@ -202,7 +215,8 @@ impl<K: Hash + Eq + Copy> GraphCache<K> {
             return None;
         }
         let graph = build();
-        lock(&self.graphs).insert(key, graph.clone());
+        let counted = graph.as_ref().map(|graph| (Arc::clone(graph), Accounted::new(&self.ctx, graph.device_bytes())));
+        lock(&self.graphs).insert(key, counted);
         graph
     }
 
@@ -251,6 +265,9 @@ pub(crate) struct Stepper {
     /// Steps 2 and 3 as one replayable graph and step 2 alone, as far as the backend has graphs.
     /// Cleared when `pong` is replaced.
     graphs: GraphCache<StepGraph>,
+    /// Counts the bytes of the placeholders standing for the probes in `probes`.
+    #[allow(dead_code)]
+    placeholders: Accounted,
 }
 
 impl Stepper {
@@ -328,10 +345,12 @@ impl Stepper {
         // and the probes' memory goes when the arrays holding them do.
         let placeholders: Option<Vec<Buffer>> = probe_buffers.iter().map(|probe| ctx.alloc_buffer(16, probe.usage()).ok()).collect();
         let mut plan = plan;
+        let mut counted = Accounted::new(ctx, 0);
         let probe_buffers = match placeholders {
             Some(placeholders) => {
                 plan.forget_probes(&probe_buffers, &placeholders);
                 pins.retain(|pin| !probe_buffers.contains(pin.buffer()));
+                counted.add(placeholders.iter().map(Buffer::size).sum());
                 placeholders
             }
             None => probe_buffers,
@@ -348,7 +367,8 @@ impl Stepper {
             pong_pins,
             init_pins,
             inits: init.to_vec(),
-            graphs: GraphCache::new(),
+            graphs: GraphCache::new(ctx),
+            placeholders: counted,
         })
     }
 
@@ -392,6 +412,12 @@ impl Stepper {
 
     pub(crate) fn plan(&self) -> &Plan {
         &self.plan
+    }
+
+    /// Bytes counted for the placeholders that stand for the probes.
+    #[cfg(test)]
+    pub(crate) fn placeholder_bytes(&self) -> u64 {
+        self.placeholders.bytes()
     }
 
     /// Runs steps `1..=steps`. The first replays on its own (it reads `init`, which `rebind`

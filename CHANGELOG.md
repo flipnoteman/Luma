@@ -118,6 +118,8 @@ All notable changes to Luma are listed here. The format follows
 ### Fixed
 
 - The calibration of the cost model (a context opened with `calibrate` on and no stored measurement for its device) bound whole calibration arrays on the first chunk of an array. With a `chunk_bytes` smaller than a calibration array (64 MiB on a GPU, 4 MiB on the CPU), or the default chunk of a GPU with less than about 640 MiB of memory, its kernels read and wrote far past a buffer: on wgpu a validation error that failed the context's later operations, on CUDA and the CPU backend out-of-bounds accesses (a crash on the CPU). Calibration now measures on whole device buffers.
+- `MemoryStats::resident_bytes` (and the memory budget) undercounted device memory that recordings, plans and loops hold: the buffers a traced step releases while it is recorded (counted from then on, not only when the recording ends) and keeps in its plan, the placeholders of a stepper, the work buffers of a compiled `iterate_until_all` loop (history, dispatch arguments), the scratch an operation is using, the reduction counter, and the device copy of a captured CUDA graph's uniforms. The doc of `MemoryStats` lists what stays outside both counts (the device context, kernel code, the backend's staging chunks, the driver's pool reserve).
+- `Context::trim` on CUDA did not return the memory of the buffers it released itself to the driver: they were freed after the stream-ordered pool had been trimmed and stayed reserved until the next trim. They are freed first now.
 
 ## [0.4.1] - 2026-11-15
 

@@ -4555,7 +4555,7 @@ fn a_stepper_does_not_keep_its_probes() {
     let before = ctx.pager().resident_bytes();
     let (stepper, _) = trace_staged(&x, 8, false);
     let held = ctx.pager().resident_bytes() - before;
-    assert_eq!(held, 2 * class + stepper.plan().transient_bytes(), "ping, pong and the shared intermediates only");
+    assert_eq!(held, 2 * class + stepper.plan().transient_bytes() + stepper.placeholder_bytes(), "ping, pong, the shared intermediates and the probes' placeholders only");
     for steps in [1, 2, 5] {
         stepper.run_steps(steps).unwrap();
         let got = Array::<f32>::from_storage(&ctx, x.shape(), std::sync::Arc::clone(&stepper.state_after(steps)[0])).to_vec().unwrap();
@@ -4627,4 +4627,48 @@ fn the_shared_buffers_of_a_plan_stay_in_the_memory_accounting() {
     drop((next, probe));
     drop(trace);
     assert_eq!(resident(), before);
+}
+
+/// A buffer that existed before the recording and that the traced step releases (an array it
+/// drops) stays with the plan, out of the pool: it is counted with the plan's intermediates for
+/// as long as the plan holds it, though no array owns it any more.
+#[test]
+fn the_buffers_a_step_released_stay_counted_while_the_plan_holds_them() {
+    let ctx = ctx();
+    let x = f32s(&ctx, &values(1000, 37, 0.0, 1.0));
+    let spare = f32s(&ctx, &values(1000, 38, 0.0, 1.0));
+    spare.eval().unwrap();
+    ctx.sync().unwrap();
+    let resident = || ctx.pager().resident_bytes();
+    let class = crate::gpu::pool::size_class(4000, u64::MAX).unwrap();
+    let before = resident();
+    let (mut trace, mut probes) = crate::jit::Trace::start(&[&x]).ok().unwrap();
+    let probe = probes.pop().unwrap();
+    let next = staged_step(&probe, 4, false);
+    drop(spare);
+    next.eval().unwrap();
+    let plan = trace.finish_plan().expect("nothing aborted the recording");
+    let (held, counted) = plan.held_bytes();
+    assert_eq!(held, counted, "every buffer the plan holds is counted");
+    assert_eq!(held, plan.transient_bytes() + class, "the intermediates and the released buffer");
+    // The released buffer left the arrays' count and entered the plan's; the probe and the result are new arrays.
+    assert_eq!(resident() - before, 2 * class + plan.transient_bytes(), "probe, result, the plan's intermediates and the buffer `spare` had");
+    drop(plan);
+    assert_eq!(resident() - before, 2 * class - class, "the plan gave its buffers back: the probe and the result remain");
+    drop((next, probe, trace));
+    assert_eq!(resident() + class, before);
+}
+
+/// Every device buffer the context made is either idle in the pool or counted as resident while
+/// a stepper (its plan, its placeholders, its graphs) and the context hold it: nothing in use
+/// escapes `resident_bytes`.
+#[test]
+fn a_stepper_leaves_no_device_buffer_uncounted() {
+    let ctx = ctx();
+    let x = f32s(&ctx, &values(1000, 39, 0.0, 1.0));
+    let (stepper, _) = trace_staged(&x, 8, true);
+    stepper.run_steps(3).unwrap();
+    ctx.sync().unwrap();
+    let stats = ctx.memory_stats();
+    assert_eq!(ctx.created_bytes(), stats.resident_bytes + stats.pooled_bytes, "{stats:?}");
 }

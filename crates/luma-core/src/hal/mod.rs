@@ -709,7 +709,14 @@ pub struct GraphLaunch<'a> {
 }
 
 /// A recorded sequence of launches a backend can replay cheaply.
-pub trait ExecGraph: Any + fmt::Debug + Send + Sync + 'static {}
+pub trait ExecGraph: Any + fmt::Debug + Send + Sync + 'static {
+    /// Bytes of device memory the graph holds itself (a copy of the uniforms it passes by
+    /// pointer, say), not counting the buffers its launches name nor what the driver keeps
+    /// inside the graph. Zero by default.
+    fn device_bytes(&self) -> u64 {
+        0
+    }
+}
 
 impl dyn ExecGraph {
     /// The backend's graph, if it is a `T`.

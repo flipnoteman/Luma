@@ -122,6 +122,8 @@ impl Context {
         let bytes = data.len() as u64;
         let max = self.max_buffer_bytes();
         let class = pool::size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        #[cfg(test)]
+        self.inner.created_bytes.fetch_add(class, std::sync::atomic::Ordering::Relaxed);
         self.relieving(class, || match self.hal().alloc_filled(data, max) {
             Ok(buffer) => Ok(Some(buffer)),
             Err(BackendError::OutOfMemory { .. }) => Ok(None),

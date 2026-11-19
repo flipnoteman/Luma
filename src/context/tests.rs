@@ -429,3 +429,9 @@ fn interval_packing_never_overlaps_and_is_minimal() {
         assert_eq!(slots.iter().max().map_or(0, |last| last + 1), live);
     }
 }
+
+    // Only backends with single-pass reductions make the counter (the wgpu one cannot fill a
+    // buffer at creation on a discrete device).
+    if !ctx.tuning().single_pass_reduce {
+        return;
+    }

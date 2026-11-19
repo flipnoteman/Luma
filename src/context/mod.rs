@@ -6,7 +6,7 @@ use crate::builtin::{Builtin, BuiltinKernel};
 use crate::error::{LumaError, Result};
 use crate::jit::cost;
 use crate::jit::JitState;
-use crate::gpu::pager::Pager;
+use crate::gpu::pager::{Accounted, Pager};
 use crate::gpu::built::BuildCache;
 use crate::gpu::hash::FxMap;
 use crate::gpu::lock;
@@ -844,9 +844,10 @@ impl Context {
         lock(&self.inner.released).extend(idle);
         let released = std::mem::take(&mut *lock(&self.inner.released));
         self.hal().notify_released(&released);
-        let reclaimed = self.hal().reclaim_idle();
+        // Dropped before the backend reclaims: the memory they free is part of what it gives
+        // back (the CUDA pool returns to the driver only what was freed by then).
         drop(released);
-        Ok(reclaimed?)
+        Ok(self.hal().reclaim_idle()?)
     }
 
     /// Returns a buffer from [`Context::alloc_buffer`] to the pool.
@@ -886,9 +887,12 @@ impl Context {
             return Ok(counter);
         }
         let made = self.alloc_filled(&[0u8; 4])?;
+        let bytes = made.size();
         if let Err(lost) = self.inner.reduce_counter.set(made) {
             // Another thread made it first; this one is only recycled.
             self.recycle(lost);
+        } else {
+            self.pager().count_for_life(bytes);
         }
         Ok(self.inner.reduce_counter.get().expect("the counter was set above or by the thread that won"))
     }
@@ -976,16 +980,20 @@ impl Context {
 pub(crate) struct Scratch<'a> {
     ctx: &'a Context,
     held: Vec<Buffer>,
+    /// Counts the bytes of `held` as resident until the buffers are given back (when `Scratch`
+    /// drops, after `Drop::drop` has recycled them: a recording then counts them itself).
+    counted: Accounted,
 }
 
 impl<'a> Scratch<'a> {
     pub(crate) fn new(ctx: &'a Context) -> Self {
-        Scratch { ctx, held: Vec::new() }
+        Scratch { ctx, held: Vec::new(), counted: Accounted::new(ctx, 0) }
     }
 
     /// A buffer of at least `bytes` bytes with unspecified contents.
     pub(crate) fn take(&mut self, bytes: u64) -> Result<Buffer> {
         let buffer = self.ctx.alloc_buffer(bytes, STORAGE_USAGE)?;
+        self.counted.add(buffer.size());
         self.held.push(buffer.clone());
         Ok(buffer)
     }
