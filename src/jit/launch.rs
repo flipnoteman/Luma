@@ -990,6 +990,9 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
             }
         }
     }
+    if let Some(plan) = super::transpose::plan(ctx, &key, &inputs, len) {
+        return Ok(vec![super::transpose::run(ctx, &plan, &inputs[0], len)?]);
+    }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
     settle_staging(&mut key, len);
     if shifted.is_none() && key.staging.is_none() {

@@ -680,6 +680,10 @@ pub(crate) enum Builtin {
     /// see [`crate::filter`]. Arguments: out, src (unless `index`), mask, scanned tile counts,
     /// uniform `{len, nwords, tiles}`. Element type `"u32"`.
     FilterScatter { words: u8, index: bool },
+    /// Moves 32 x 32 tiles of a materialized axis permutation of one array through workgroup
+    /// memory; see `jit::transpose`. Arguments: out, src, uniform `Params`. Element type `"u32"`
+    /// (any 4-byte element) or `"vec2<f32>"` (`Df32`).
+    Transpose,
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -2122,6 +2126,7 @@ impl Builtin {
             Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module(wg)),
             Builtin::FilterCount => wgsl(crate::filter::count_source()),
             Builtin::FilterScatter { words, index } => wgsl(crate::filter::scatter_source(words, index)),
+            Builtin::Transpose => wgsl(crate::jit::transpose::source(ty)),
             Builtin::NonFinite => BuiltinKernel::Module(non_finite_module(wg)),
         }
     }

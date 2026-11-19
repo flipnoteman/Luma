@@ -48,6 +48,7 @@ fn delta(before: StatsSnapshot, after: StatsSnapshot) -> StatsSnapshot {
         reduce_passes: after.reduce_passes - before.reduce_passes,
         replays: after.replays - before.replays,
         speculated: after.speculated - before.speculated,
+        transposes: after.transposes - before.transposes,
     }
 }
 

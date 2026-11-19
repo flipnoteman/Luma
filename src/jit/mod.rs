@@ -176,6 +176,7 @@ pub(crate) mod stack;
 mod staging;
 mod stencil;
 mod until;
+pub(crate) mod transpose;
 #[cfg(test)]
 mod tests;
 
@@ -2323,6 +2324,8 @@ struct Stats {
     replays: AtomicU64,
     /// Of those, the ones whose launches had started before the step ran.
     speculated: AtomicU64,
+    /// Of the elementwise launches, the tiled transposes (see [`transpose`]).
+    transposes: AtomicU64,
 }
 
 /// A snapshot of the counters of a context's [`JitState`].
@@ -2336,6 +2339,7 @@ pub(crate) struct StatsSnapshot {
     pub(crate) reduce_passes: u64,
     pub(crate) replays: u64,
     pub(crate) speculated: u64,
+    pub(crate) transposes: u64,
 }
 
 impl JitState {
@@ -2709,6 +2713,7 @@ impl JitState {
             reduce_passes: self.stats.reduce_passes.load(Ordering::Relaxed),
             replays: self.stats.replays.load(Ordering::Relaxed),
             speculated: self.stats.speculated.load(Ordering::Relaxed),
+            transposes: self.stats.transposes.load(Ordering::Relaxed),
         }
     }
 
