@@ -390,7 +390,7 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             let coord = match kind {
                 Gen::RangeConst { stride: 1, size, .. } => format!("({index} % {size}u)"),
                 Gen::RangeConst { stride, size, .. } => format!("(({index} / {stride}u) % {size}u)"),
-                Gen::ParamRange { kind, wide, stride, size } => match kind {
+                Gen::ParamRange { kind, wide, stride, size, .. } => match kind {
                     params::RangeKind::Zero => "0u".to_owned(),
                     params::RangeKind::Mod => urem(index, size, wide),
                     params::RangeKind::DivMod => urem(&udiv(index, stride, wide), size, wide),

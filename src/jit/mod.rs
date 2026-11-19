@@ -413,8 +413,10 @@ pub(crate) enum Gen {
     RangeConst { stride: u32, size: u32, wide: bool },
     /// [`Gen::RangeConst`] with its numbers in the uniform: the [words of the
     /// divisors](params::divisor_words) of `stride` and `size` start at those slots (see
-    /// `params::RangeKind` for the ones that are used).
-    ParamRange { kind: params::RangeKind, wide: bool, stride: u32, size: u32 },
+    /// `params::RangeKind` for the ones that are used). `axis`: in a lowered program, the axis of
+    /// the source of the view of the context the range is computed in that has this stride and
+    /// extent, so that the range is the context's coordinate along it.
+    ParamRange { kind: params::RangeKind, wide: bool, stride: u32, size: u32, axis: Option<u8> },
     /// `start + i * step`; operands: start, step.
     Linspace,
 }

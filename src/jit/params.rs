@@ -62,6 +62,20 @@ pub(super) fn is_wide(len: u64) -> bool {
     len >= WIDE
 }
 
+/// The axis `a` of an array of `dims` along which `(i / stride) % size` of a flat index `i` is the
+/// coordinate: the extent is `size` (more than one element) and the axes before `a` hold `stride`
+/// elements (`0` and `1` both mean one).
+fn range_axis(dims: [u32; 4], stride: u32, size: u32) -> Option<u8> {
+    let mut before = 1u64;
+    for (a, &extent) in dims.iter().enumerate() {
+        if extent == size && size > 1 && before == u64::from(stride.max(1)) {
+            return Some(a as u8);
+        }
+        before *= u64::from(extent);
+    }
+    None
+}
+
 /// The words `d`, `m`, `s` and `r` of the division by `d >= 2` (see `luma_udiv` in the kernels):
 ///
 /// - For `n >= 2^23`, `n / d` is `(t + ((n - t) >> 1)) >> s` with `t` the high 32 bits of
@@ -426,11 +440,11 @@ impl Builder {
     /// The generator that reads its numbers from the uniform instead of keeping them in the key.
     fn range(&mut self, stride: u32, size: u32, wide: bool) -> Gen {
         match (stride, size) {
-            (_, 0 | 1) => Gen::ParamRange { kind: RangeKind::Zero, wide, stride: 0, size: 0 },
-            (0 | 1, _) => Gen::ParamRange { kind: RangeKind::Mod, wide, stride: 0, size: self.divisor(size) },
+            (_, 0 | 1) => Gen::ParamRange { kind: RangeKind::Zero, wide, stride: 0, size: 0, axis: None },
+            (0 | 1, _) => Gen::ParamRange { kind: RangeKind::Mod, wide, stride: 0, size: self.divisor(size), axis: None },
             _ => {
                 let stride = self.divisor(stride);
-                Gen::ParamRange { kind: RangeKind::DivMod, wide, stride, size: self.divisor(size) }
+                Gen::ParamRange { kind: RangeKind::DivMod, wide, stride, size: self.divisor(size), axis: None }
             }
         }
     }
@@ -517,7 +531,18 @@ impl Builder {
         let instrs = inlined
             .instrs
             .iter()
-            .map(|flat| Some(Flat { op: self.flat_op(flat.op)?, args: flat.args, at: flat.at, child: flat.child }))
+            .map(|flat| {
+                let mut op = self.flat_op(flat.op)?;
+                // A range computed in a view context whose source has its stride and extent along
+                // an axis is that coordinate of the context's index, which the lowering has.
+                if let (OpKind::Generate(Gen::RangeConst { stride, size, .. }), OpKind::Generate(Gen::ParamRange { axis, .. })) = (flat.op.kind, &mut op.kind)
+                    && flat.at != 0
+                    && let Some(Ctx { kind: ShiftKind::View { map, .. }, .. }) = inlined.ctxs.get(flat.at as usize)
+                {
+                    *axis = range_axis(map.src, stride, size);
+                }
+                Some(Flat { op, args: flat.args, at: flat.at, child: flat.child })
+            })
             .collect::<Option<Vec<_>>>()?;
         Some(Inlined {
             ctxs,

@@ -583,7 +583,7 @@ impl<'a> Lower<'a> {
                 let coord = if stride == 1 { index % lu(fb, size) } else { (index / lu(fb, stride)) % lu(fb, size) };
                 self.shaped(fb, ty, coord)
             }
-            Gen::ParamRange { kind, wide, stride, size } => {
+            Gen::ParamRange { kind, wide, stride, size, .. } => {
                 let coord = match kind {
                     params::RangeKind::Zero => lu(fb, 0),
                     params::RangeKind::Mod => self.urem(fb, index, size, wide),
@@ -1592,6 +1592,13 @@ impl Emit<'_, '_> {
                     }
                     _ => read,
                 }
+            }
+            // A range that is a coordinate of the context (see `Gen::ParamRange`), read from the
+            // coordinates of the context's view where the lowering has them.
+            OpKind::Generate(Gen::ParamRange { axis: Some(a), .. })
+                if let Some(coord) = self.pview.coords.iter().find(|&&(c, ..)| c == flat.at).and_then(|&(.., coords)| coords[a as usize]) =>
+            {
+                env.shaped(fb, op.ty, fb.bitcast(coord, KirType::U32))
             }
             _ => {
                 for reference in flat.args.iter().take(op.kind.arity()) {
