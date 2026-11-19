@@ -1,0 +1,5 @@
+# The flush test measures wall-clock time on the GPU (tests/flush.rs): the kernels of tests in
+# other binaries share the device and stretch its calibration unpredictably, so it runs alone.
+[[profile.default.overrides]]
+filter = 'binary_id(luma::flush)'
+threads-required = 'num-test-threads'

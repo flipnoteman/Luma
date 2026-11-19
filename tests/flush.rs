@@ -3,7 +3,9 @@
 //! This test measures wall-clock time, so it must be the only test in its binary: on NVIDIA,
 //! creating a device (`Context::new` in a test running in parallel) blocks `vkQueueSubmit` on
 //! every other device of the process until the GPU work in flight finishes, which made this
-//! flush take as long as the kernel it submits. Do not add tests to this file.
+//! flush take as long as the kernel it submits. Do not add tests to this file. For the same
+//! reason `.config/nextest.toml` runs it alone: the kernels of tests in other binaries share the
+//! GPU and stretch the round count it calibrates.
 
 use luma::*;
 
