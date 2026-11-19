@@ -13,10 +13,13 @@ fn trim_releases_idle_buffers_and_keeps_array_data() {
     let before = ctx.memory_stats();
     assert!(before.resident_bytes >= 4 * len as u64, "{before:?}");
 
-    let temporaries: Vec<Array<f32>> = (0..4).map(|k| &kept * k as f32).collect();
+    // Multipliers other than 1 (`x * 1` is no operation and makes no buffer); the sync makes the
+    // evaluations happen even while the GPU is busy, when `eval` may postpone them.
+    let temporaries: Vec<Array<f32>> = (2..6).map(|k| &kept * k as f32).collect();
     for t in &temporaries {
         t.eval().unwrap();
     }
+    ctx.sync().unwrap();
     drop(temporaries);
     let idle = ctx.memory_stats();
     assert!(idle.pooled_bytes >= 4 * 4 * len as u64, "dropped arrays are pooled: {idle:?}");
