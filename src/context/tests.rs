@@ -378,54 +378,54 @@ fn a_launch_binds_exactly_the_bindings_the_shader_reads() {
     assert_eq!(ctx.read::<u32>(&outputs[3], 256).unwrap(), vec![42; 64]);
 }
 
-/// Shared buffers for the live intervals of transient buffers: items that overlap, even at one
-/// command, never share one; a chain of intermediates needs two; a shared buffer is sized by its
-/// largest member.
+/// Slots for the live intervals of transient buffers: intervals that overlap, even at one
+/// command, never share a slot, and as few slots are used as the greatest number of intervals
+/// live at once.
 #[test]
-fn interval_packing_never_overlaps() {
-    use super::record::pack_sized;
+fn interval_packing_never_overlaps_and_is_minimal() {
+    use super::record::pack_intervals;
 
     // A chain: each interval touches the next at one command.
-    let chain: Vec<((usize, usize), u64)> = (0..8).map(|i| ((i, i + 1), 100)).collect();
-    let slots = pack_sized(&chain);
+    let chain: Vec<(usize, usize)> = (0..8).map(|i| (i, i + 1)).collect();
+    let slots = pack_intervals(&chain);
     assert_eq!(slots.iter().max(), Some(&1), "{slots:?}");
 
     // The first one is live across all the others.
     let mut late = chain.clone();
-    late.push(((0, 9), 100));
-    let slots = pack_sized(&late);
+    late.push((0, 9));
+    let slots = pack_intervals(&late);
     let long = slots[8];
     assert!(slots[..8].iter().all(|&slot| slot != long), "{slots:?}");
     assert_eq!(slots.iter().max(), Some(&2), "{slots:?}");
 
     // Strictly before: ending at a command and starting at it overlap; one command apart do not.
-    assert_eq!(pack_sized(&[((0, 3), 8), ((3, 5), 8)]), [0, 1]);
-    assert_eq!(pack_sized(&[((0, 3), 8), ((4, 5), 8)]), [0, 0]);
-    assert!(pack_sized(&[]).is_empty());
-    // Sizes do not keep apart what does not overlap; the largest opens the shared buffer.
-    assert_eq!(pack_sized(&[((0, 3), 8), ((4, 5), 1000)]), [0, 0]);
+    assert_eq!(pack_intervals(&[(0, 3), (3, 5)]), [0, 1]);
+    assert_eq!(pack_intervals(&[(0, 3), (4, 5)]), [0, 0]);
+    assert_eq!(pack_intervals(&[(5, 5), (0, 1)]), [0, 0]);
+    assert!(pack_intervals(&[]).is_empty());
 
-    // Against brute force on pseudo-random intervals and sizes.
+    // Against brute force on pseudo-random intervals.
     let mut state = 12345u64;
     let mut next = |bound: u64| {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((state >> 33) % bound) as usize
     };
     for _ in 0..200 {
-        let items: Vec<((usize, usize), u64)> = (0..1 + next(30))
+        let intervals: Vec<(usize, usize)> = (0..1 + next(30))
             .map(|_| {
                 let start = next(40);
-                ((start, start + next(10)), 1 + next(1000) as u64)
+                (start, start + next(10))
             })
             .collect();
-        let slots = pack_sized(&items);
-        for (i, (a, _)) in items.iter().enumerate() {
-            for (j, (b, _)) in items.iter().enumerate().skip(i + 1) {
+        let slots = pack_intervals(&intervals);
+        for (i, a) in intervals.iter().enumerate() {
+            for (j, b) in intervals.iter().enumerate().skip(i + 1) {
                 if slots[i] == slots[j] {
                     assert!(a.1 < b.0 || b.1 < a.0, "{a:?} and {b:?} share slot {}", slots[i]);
                 }
             }
         }
-        assert!(slots.iter().max().map_or(0, |last| last + 1) <= items.len());
+        let live = (0..60).map(|at| intervals.iter().filter(|&&(s, e)| s <= at && at <= e).count()).max().unwrap();
+        assert_eq!(slots.iter().max().map_or(0, |last| last + 1), live);
     }
 }

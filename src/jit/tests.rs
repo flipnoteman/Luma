@@ -4515,10 +4515,10 @@ fn the_shared_buffers_of_a_plan_stay_in_the_memory_accounting() {
     let held = plan.held_buffers() as u64;
     let after = resident();
     assert!(held <= 4, "{held} buffers");
-    // The probe and the result are owned by arrays (a size class each); the plan's shared
-    // intermediates are counted for the plan, at the 4000 bytes they bind.
-    assert_eq!(after - before, 2 * class + (held - 2) * 4000, "plan holds {held} buffers");
-    assert!(after <= recording, "the recording reused its finished intermediates: {recording} -> {after}");
+    // The probe and the result are owned by arrays; the rest of the plan's buffers (the shared
+    // intermediates) are counted for the plan.
+    assert_eq!(after - before, held * class, "plan holds {held} buffers of {class} bytes");
+    assert_eq!(after, recording, "the recording reused its finished intermediates: it never held more than the plan keeps");
     drop(plan);
     assert_eq!(resident() - before, 2 * class, "only the probe and the result remain counted");
     drop((next, probe));
