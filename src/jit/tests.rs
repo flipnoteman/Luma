@@ -137,10 +137,12 @@ fn scalar_values_do_not_change_the_cache_key() {
     let xs = values(1000, 6, -2.0, 2.0);
     let x = f32s(&ctx, &xs);
 
+    // Values that never coincide: which scalars are equal is part of the key (equal ones share a
+    // uniform slot), the values are not.
     let before = ctx.jit().stats();
     for i in 0..8 {
         let a = 0.5 + i as f32;
-        let b = 3.0 - i as f32 * 0.25;
+        let b = 3.0 - i as f32 * 0.3;
         let got = (&x * a + b).clamp(-b, a).to_vec().unwrap();
         let want: Vec<f32> = xs.iter().map(|&v| (v * a + b).clamp(-b, a)).collect();
         assert_close(&got, &want, 1e-5, 1e-5);
@@ -153,6 +155,24 @@ fn scalar_values_do_not_change_the_cache_key() {
     // A different structure (another operation) is another kernel.
     let _ = (&x * 2.0 - 1.0).clamp(-1.0, 1.0).to_vec().unwrap();
     assert_eq!(delta(before, ctx.jit().stats()).built, 2);
+}
+
+/// Equal scalars share one uniform slot; a graph of the same shape whose program is made from the
+/// recipe recorded then must not reuse that slot once they differ.
+#[test]
+fn scalars_equal_when_recorded_and_different_later_are_read_apart() {
+    let ctx = ctx();
+    let n = 200;
+    let xs = values(n, 7, 0.5, 2.0);
+    let x = f32s(&ctx, &xs);
+    for (a, b) in [(2.5f32, 2.5f32), (2.5, 4.0), (3.0, 3.0), (1.0, 2.0), (2.0, 2.0)] {
+        let e = (&x * a + b).sqrt();
+        let host: Vec<f32> = xs.iter().map(|v| (v * a + b).sqrt()).collect();
+        let got = (e.slice(0, 1..) - e.slice(0, ..n - 1)).to_vec().unwrap();
+        let want: Vec<f32> = (0..n - 1).map(|i| host[i + 1] - host[i]).collect();
+        assert_close(&got, &want, 1e-5, 1e-6);
+    }
+    assert!(ctx.jit().recipe_hits() >= 2, "recipe hits: {}", ctx.jit().recipe_hits());
 }
 
 #[test]

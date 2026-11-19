@@ -722,6 +722,9 @@ struct Flattener {
     inputs: Vec<Arc<Storage>>,
     scalar_tys: Vec<ElemTy>,
     scalars: Vec<u32>,
+    /// The first slot of every distinct scalar emitted so far, by type and value: equal scalars
+    /// are one uniform field, so that the code computes what is derived from them once.
+    scalar_slots: Vec<(ElemTy, Vec<u32>, u32)>,
     /// Where the value of every item emitted so far in the program being built lives, by item
     /// (`Ref::Unused`: nowhere yet).
     emitted: Vec<Ref>,
@@ -761,8 +764,11 @@ struct Record {
     cursor: (u32, u8),
     /// Per input, the operand that made it one.
     inputs: Vec<(u32, u8)>,
-    /// Per scalar emitted, where it comes from.
+    /// Per scalar slot emitted, where it comes from.
     scalars: Vec<ScalarSrc>,
+    /// The scalars that share the slot of an equal one emitted before (slot, source): a replay
+    /// holds only while they still equal it.
+    aliases: Vec<(u32, ScalarSrc)>,
     /// Set when the program depends on something other than the graph: a node evaluated since the
     /// graph was read.
     impure: bool,
@@ -808,12 +814,9 @@ impl Flattener {
             *slot = match arg {
                 Src::Scalar(scalar) => match item.slots[index].get() {
                     NONE => {
-                        let value = self.scalar(scalar);
+                        let value = self.scalar(scalar, ScalarSrc::Operand(at, index as u8));
                         if let Ref::Scalar(first) = value {
                             item.slots[index].set(first);
-                        }
-                        if let Some(record) = &mut self.record {
-                            record.scalars.push(ScalarSrc::Operand(at, index as u8));
                         }
                         value
                     }
@@ -906,24 +909,33 @@ impl Flattener {
         Ok(Ref::Sub(done))
     }
 
-    /// The first uniform slot of `scalar`.
-    fn scalar(&mut self, scalar: &Scalar) -> Ref {
+    /// The first uniform slot of `scalar`, which comes from `source`: the slot of an equal scalar
+    /// emitted before, if any.
+    fn scalar(&mut self, scalar: &Scalar, source: ScalarSrc) -> Ref {
+        let words = &scalar.words()[..scalar.ty.slots()];
+        if let Some(&(.., at)) = self.scalar_slots.iter().find(|(ty, known, _)| *ty == scalar.ty && known[..] == *words) {
+            if let Some(record) = &mut self.record {
+                record.aliases.push((at, source));
+            }
+            return Ref::Scalar(at);
+        }
         let at = u32::try_from(self.scalars.len()).unwrap_or(u32::MAX);
         // The uniform has `f32` fields: a wide scalar takes several (see `Scalar::words`).
         let slot_ty = if scalar.ty.slots() == 1 { scalar.ty } else { ElemTy::F32 };
-        for &word in scalar.words().iter().take(scalar.ty.slots()) {
+        for &word in words {
             self.scalar_tys.push(slot_ty);
             self.scalars.push(word);
+        }
+        self.scalar_slots.push((scalar.ty, words.to_vec(), at));
+        if let Some(record) = &mut self.record {
+            record.scalars.push(source);
         }
         Ref::Scalar(at)
     }
 
     /// A scalar the flattening makes up.
     fn constant(&mut self, scalar: Scalar) -> Ref {
-        if let Some(record) = &mut self.record {
-            record.scalars.push(ScalarSrc::Const(scalar));
-        }
-        self.scalar(&scalar)
+        self.scalar(&scalar, ScalarSrc::Const(scalar))
     }
 
     /// Where the pending node operand `node` (item `kid` if it was pending when the graph was
@@ -1157,7 +1169,7 @@ impl Plain {
         for (index, (slot, operand)) in refs.iter_mut().zip(operands).enumerate().take(op.kind.arity()) {
             let ty = op.operand_ty(index);
             *slot = match operand {
-                Resolved::Scalar(scalar) => self.flat.scalar(scalar),
+                Resolved::Scalar(scalar) => self.flat.scalar(scalar, ScalarSrc::Const(*scalar)),
                 Resolved::Buffer(storage) => self.flat.input(storage, ty),
                 Resolved::Input(at) => Ref::Input(*at),
                 Resolved::Tmp(at) => {
@@ -1845,6 +1857,7 @@ pub(super) struct Recipe {
     shape: u64,
     inputs: Vec<(u32, u8)>,
     scalars: Vec<ScalarSrc>,
+    aliases: Vec<(u32, ScalarSrc)>,
     fused: Vec<u32>,
     instr_items: Vec<u32>,
     sub_roots: Vec<u32>,
@@ -1864,6 +1877,7 @@ impl Recipe {
             shape: fused.key.shape,
             inputs: record.inputs,
             scalars: record.scalars,
+            aliases: record.aliases,
             fused: fused_items,
             instr_items,
             sub_roots: sub_root_items,
@@ -1872,7 +1886,8 @@ impl Recipe {
 
     /// The program over the buffers, scalars and nodes of `graph`, which has this recipe's
     /// signature. `None` if the graph does not have what the program reads (a node that is not
-    /// evaluated any more).
+    /// evaluated any more), or if scalars that were equal when it was recorded (one slot) are not
+    /// any more.
     fn instantiate(&self, graph: &Graph, tail: Tail) -> Option<Fused> {
         let operand = |item: u32, slot: u8| graph.items.get(item as usize).and_then(|item| item.args.get(usize::from(slot)));
         let mut inputs = Vec::with_capacity(self.inputs.len());
@@ -1883,16 +1898,24 @@ impl Recipe {
                 Src::Scalar(_) => return None,
             });
         }
+        let value = |source: ScalarSrc| match source {
+            ScalarSrc::Const(scalar) => Some(scalar),
+            ScalarSrc::Operand(item, slot) => match operand(item, slot)? {
+                Src::Scalar(scalar) => Some(*scalar),
+                _ => None,
+            },
+        };
         let mut scalars = Vec::with_capacity(self.scalar_tys.len());
-        for source in &self.scalars {
-            let scalar = match *source {
-                ScalarSrc::Const(scalar) => scalar,
-                ScalarSrc::Operand(item, slot) => match operand(item, slot)? {
-                    Src::Scalar(scalar) => *scalar,
-                    _ => return None,
-                },
-            };
+        for &source in &self.scalars {
+            let scalar = value(source)?;
             scalars.extend(scalar.words().iter().take(scalar.ty.slots()));
+        }
+        for &(at, source) in &self.aliases {
+            let scalar = value(source)?;
+            let words = &scalar.words()[..scalar.ty.slots()];
+            if scalars.get(at as usize..at as usize + words.len()) != Some(words) {
+                return None;
+            }
         }
         if self.guard.is_some() {
             scalars.push(0);

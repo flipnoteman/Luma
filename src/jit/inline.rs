@@ -445,9 +445,13 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
 }
 
 impl Lowering<'_> {
-    /// Appends `flat`, or finds the equal instruction that exists already.
+    /// Appends `flat`, or finds the equal instruction that exists already. An operation on
+    /// computed values and scalars only (no input, no generator, no shift) has one value in every
+    /// context, so its equal is looked for in all of them: stencil faces sharing a cell (the right
+    /// side of one, the left of the next) share what they compute from it.
     fn push(&mut self, flat: Flat) -> u32 {
-        let key = (flat.op, flat.args, flat.at, flat.child);
+        let anywhere = !matches!(flat.op.kind, OpKind::Shift(_) | OpKind::Generate(_)) && !flat.args.iter().any(|arg| matches!(arg, Ref::Input(_) | Ref::Sub(_)));
+        let key = (flat.op, flat.args, if anywhere { u32::MAX } else { flat.at }, flat.child);
         if let Some(&found) = self.numbered.get(&key) {
             return found;
         }
