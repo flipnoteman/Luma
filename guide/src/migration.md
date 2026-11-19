@@ -2,7 +2,7 @@
 
 ## From 0.4 to 0.5
 
-0.5 splits Luma into a workspace of five crates with one cargo feature per backend, adds native CUDA, Metal
+0.5 splits Luma into a workspace of six crates with one cargo feature per backend, adds native CUDA, Metal
 and CPU backends next to wgpu, and changes a few things that code written against 0.4 can trip over. Ordinary
 array code (`Array`, `iterate`, custom kernels) compiles as it is.
 
@@ -23,10 +23,10 @@ are re-exported from `luma_core`.
 
 ### Crates and features
 
-Luma is a workspace of five crates: `luma-core` (the kernel IR and the backend interface), `luma-wgpu`,
-`luma-metal` and `luma-cuda` (one backend each, with its own code generator), and the root `luma` crate. The
-features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend, and all are on by default. To build with
-one only:
+Luma is a workspace of six crates: `luma-core` (the kernel IR and the backend interface), `luma-wgpu`,
+`luma-metal`, `luma-cuda` and `luma-cpu` (one backend each, with its own code generator), and the root `luma`
+crate. The features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend, and all are on by default. To
+build with one only:
 
 ```sh
 cargo build --no-default-features --features cuda

@@ -82,7 +82,7 @@ Add Luma to a project:
 luma = "0.5"
 ```
 
-All three backends are enabled by default. To build with one only:
+The three GPU backends and the native CPU fallback (`cpu`) are enabled by default. To build with one GPU backend only (add `cpu` to keep the CPU fallback):
 
 ```sh
 cargo build --no-default-features --features metal
@@ -101,7 +101,7 @@ cargo test
 
 ### Backends
 
-Luma is a Cargo workspace of five crates: `luma-core` (the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-wgpu`, `luma-metal` and `luma-cuda` (each holds one backend and its own code generator for WGSL, MSL or CUDA C++), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal` and `cuda` each enable one backend crate.
+Luma is a Cargo workspace of six crates: `luma-core` (the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-wgpu`, `luma-metal` and `luma-cuda` (each holds one backend and its own code generator for WGSL, MSL or NVVM IR), `luma-cpu` (the native SIMD backend, compiling the kernel IR with Cranelift), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend crate.
 
 With `BackendKind::Auto` (the default) a context opens the first backend that works, in the order CUDA, Metal, wgpu. Choose one with `ContextOptions::backend(BackendKind::..)`, with `Context::cuda()`, `Context::metal()` or `Context::wgpu()`, or with `LUMA_BACKEND`; `Context::backend()` tells which one a context uses, and `Context::device()` (a `DeviceSummary`) or `Context::device_name()` the device: its backend, name and whether it is the host CPU. The CUDA backend needs only the NVIDIA driver, loaded at run time (kernels are compiled to PTX by the driver's own NVVM library; no CUDA toolkit or NVRTC): without an NVIDIA driver the CUDA backend reports an error (and `Auto` moves on) instead of failing to start the program.
 
@@ -127,6 +127,8 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 | `LUMA_CHUNK_BYTES` | Largest buffer an array is split into, in bytes (power of two) |
 | `LUMA_TUNING` | `apple`, `nvidia`, `generic` or `cpu`: override the kernel tuning profile |
 | `LUMA_SUBGROUPS` | `off` keeps the built-in kernels off subgroup operations |
+| `LUMA_SINGLE_PASS_REDUCE` | `off` makes reductions over several workgroups two launches on CUDA again (by default the last workgroup of the first pass finishes the reduction) |
+| `LUMA_LOOKBACK_SCAN` | `off` makes the integer scans and the `min` / `max` scans of long contiguous lines two passes over their input on CUDA again (by default one kernel reads the input once, a decoupled look-back with the same results); floating-point sums keep two passes either way, so that they are reproducible |
 | `LUMA_FUSION_MAX_NODES` | Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels |
 | `LUMA_FUSION_MAX_LIVE` | Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, `8..=4096`) |
 | `LUMA_FUSION_MAX_INLINED` | Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; `16..=16384`) |
