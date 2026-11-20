@@ -1,15 +1,18 @@
 [package]
-name = "luma-core"
+name = "luma-hal-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Kernel IR and backend interface of the Luma GPU array library"
-documentation = "https://docs.rs/luma-core"
+documentation = "https://docs.rs/luma-hal-core"
 keywords = ["gpu", "compute", "ir", "array", "kernel"]
 categories = ["science", "mathematics", "concurrency"]
 
+
+[lib]
+name = "luma_core"
 [dependencies]
 log.workspace = true
 naga.workspace = true

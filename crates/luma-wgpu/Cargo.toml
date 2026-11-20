@@ -1,15 +1,18 @@
 [package]
-name = "luma-wgpu"
+name = "luma-hal-wgpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "wgpu (Vulkan, Metal, DX12) backend of the Luma GPU array library"
-documentation = "https://docs.rs/luma-wgpu"
+documentation = "https://docs.rs/luma-hal-wgpu"
 keywords = ["gpu", "wgpu", "vulkan", "compute", "array"]
 categories = ["science", "mathematics", "concurrency"]
 
+
+[lib]
+name = "luma_wgpu"
 [dependencies]
 luma-core.workspace = true
 wgpu.workspace = true

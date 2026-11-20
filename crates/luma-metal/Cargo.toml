@@ -1,15 +1,18 @@
 [package]
-name = "luma-metal"
+name = "luma-hal-metal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Native Metal backend of the Luma GPU array library"
-documentation = "https://docs.rs/luma-metal"
+documentation = "https://docs.rs/luma-hal-metal"
 keywords = ["gpu", "metal", "apple", "compute", "array"]
 categories = ["science", "mathematics", "concurrency"]
 
+
+[lib]
+name = "luma_metal"
 [dependencies]
 luma-core.workspace = true
 log.workspace = true

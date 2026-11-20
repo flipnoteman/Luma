@@ -1,15 +1,18 @@
 [package]
-name = "luma-cuda"
+name = "luma-hal-cuda"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Native CUDA backend of the Luma GPU array library, compiled through the NVIDIA driver's NVVM"
-documentation = "https://docs.rs/luma-cuda"
+documentation = "https://docs.rs/luma-hal-cuda"
 keywords = ["gpu", "cuda", "nvidia", "compute", "array"]
 categories = ["science", "mathematics", "concurrency"]
 
+
+[lib]
+name = "luma_cuda"
 [dependencies]
 luma-core.workspace = true
 cudarc.workspace = true

@@ -1,15 +1,18 @@
 [package]
-name = "luma-cpu"
+name = "luma-hal-cpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Native SIMD CPU backend of the Luma GPU array library (Cranelift)"
-documentation = "https://docs.rs/luma-cpu"
+documentation = "https://docs.rs/luma-hal-cpu"
 keywords = ["simd", "cpu", "cranelift", "compute", "array"]
 categories = ["science", "mathematics", "concurrency"]
 
+
+[lib]
+name = "luma_cpu"
 [dependencies]
 luma-core.workspace = true
 cranelift-codegen.workspace = true
