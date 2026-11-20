@@ -23,8 +23,8 @@ are re-exported from `luma_core`.
 
 ### Crates and features
 
-Luma is a workspace of six crates: `luma-core` (the kernel IR and the backend interface), `luma-wgpu`,
-`luma-metal`, `luma-cuda` and `luma-cpu` (one backend each, with its own code generator), and the root `luma`
+Luma is a workspace of six crates: `luma-hal-core` (the kernel IR and the backend interface), `luma-hal-wgpu`,
+`luma-hal-metal`, `luma-hal-cuda` and `luma-hal-cpu` (one backend each, with its own code generator), and the root `luma`
 crate. The features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend, and all are on by default. To
 build with one only:
 

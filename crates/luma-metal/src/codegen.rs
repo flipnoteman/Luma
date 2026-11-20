@@ -834,6 +834,21 @@ impl<'a> Em<'a> {
             IrBinOp::Div => {
                 if elem.is_float() {
                     sym("/")
+                } else if let (ScalarTy::U32, 1, Expr::LitU32(n)) = (elem, lanes, rhs)
+                    && *n != 0
+                {
+                    if *n == 1 {
+                        a
+                    } else if n.is_power_of_two() {
+                        format!("({a} >> {}u)", n.trailing_zeros())
+                    } else {
+                        sym("/")
+                    }
+                } else if let (ScalarTy::I32, 1, Expr::LitI32(n)) = (elem, lanes, rhs)
+                    && *n != 0
+                    && *n != -1
+                {
+                    sym("/")
                 } else {
                     let f = self.div_rem(false, elem, lanes);
                     format!("{f}({t}({a}), {t}({b}))")
@@ -842,6 +857,19 @@ impl<'a> Em<'a> {
             IrBinOp::Rem => {
                 if elem.is_float() {
                     format!("fmod({t}({a}), {t}({b}))")
+                } else if let (ScalarTy::U32, 1, Expr::LitU32(n)) = (elem, lanes, rhs)
+                    && *n != 0
+                {
+                    if n.is_power_of_two() {
+                        format!("({a} & {}u)", n - 1)
+                    } else {
+                        sym("%")
+                    }
+                } else if let (ScalarTy::I32, 1, Expr::LitI32(n)) = (elem, lanes, rhs)
+                    && *n != 0
+                    && *n != -1
+                {
+                    sym("%")
                 } else {
                     let f = self.div_rem(true, elem, lanes);
                     format!("{f}({t}({a}), {t}({b}))")
@@ -863,9 +891,21 @@ impl<'a> Em<'a> {
             IrBinOp::BitAnd => sym("&"),
             IrBinOp::BitOr => sym("|"),
             IrBinOp::BitXor => sym("^"),
-            IrBinOp::Shl => format!("{t}({u}({a}) << ({u}({b}) & {u}(31u)))"),
+            IrBinOp::Shl => {
+                if let (1, Expr::LitU32(n)) = (lanes, rhs)
+                    && *n < 32
+                {
+                    if signed_int { format!("{t}({u}({a}) << {n}u)") } else { format!("({a} << {n}u)") }
+                } else {
+                    format!("{t}({u}({a}) << ({u}({b}) & {u}(31u)))")
+                }
+            }
             IrBinOp::Shr => {
-                if signed_int {
+                if let (1, Expr::LitU32(n)) = (lanes, rhs)
+                    && *n < 32
+                {
+                    format!("({a} >> {n}u)")
+                } else if signed_int {
                     format!("({a} >> {t}({u}({b}) & {u}(31u)))")
                 } else {
                     format!("({a} >> ({u}({b}) & {u}(31u)))")
@@ -1405,7 +1445,7 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
             Some(t) => em.ty(t, false),
             None => "void".to_owned(),
         };
-        let signature = format!("static inline {ret} f{i}({})", ps.join(", "));
+        let signature = format!("static inline __attribute__((always_inline)) {ret} f{i}({})", ps.join(", "));
         let _ = writeln!(prototypes, "{signature};");
         let _ = writeln!(funcs, "{signature} {{");
         em.block(&f.body, &mut funcs, 1);

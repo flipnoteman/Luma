@@ -824,7 +824,13 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             Some(Lowered::Staged(programs)) => programs.bodies().collect(),
             None => Vec::new(),
         };
-        src.push_str(&params::view_helpers(&params::views_used(key, &bodies)));
+        let used = params::views_used(key, &bodies);
+        if lowered.is_none() {
+            src.push_str(&params::view_helpers(&used));
+        } else if used.iter().any(|&(_, spec)| spec.edge != Edge::None) && !src.contains(EDGE_HELPERS) {
+            // The views of a lowered program are written inline; only the edge functions are called.
+            src.push_str(EDGE_HELPERS);
+        }
     }
     if key.tile.is_none() && lowered.is_none() {
         src.push_str(&subs(key, &views, &key.in_place));
@@ -1065,6 +1071,19 @@ fn flat_name(reference: Ref, ty: ElemTy, at: u32) -> String {
     }
 }
 
+/// What the parameterized views of a lowered program have divided so far, per context and divisor
+/// (the flag is whether it is a power of two), so that views of one context share their quotients,
+/// and the source coordinates of the contexts that are parameterized views, which their own views
+/// read instead of dividing the flat index. `seq` numbers the coordinate locals.
+#[derive(Clone, Default)]
+struct PviewCache {
+    divs: Vec<(u32, u32, bool, String)>,
+    rems: Vec<(u32, u32, bool, String)>,
+    /// Per context: the number of its source dimensions (`ViewSpec::src_dims`) and its coordinates.
+    coords: Vec<(u32, u16, [Option<String>; 4])>,
+    seq: u32,
+}
+
 /// The body of a lowered key (see [`Inlined`]): the index of every context, the inputs loaded at
 /// them, then the instructions, each defined (`t{n}`) after everything it reads. A `Select` the
 /// lowering marks as a branch is an `if`/`else` that computes the instructions only its own
@@ -1086,6 +1105,138 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
         /// The selects computed as `if`/`else` that are kept, by group (see [`Inlined::group`]):
         /// written together, at the last of them.
         groups: FxMap<u32, Vec<u32>>,
+        /// What the parameterized views of the block being written have divided and the
+        /// coordinates of the contexts that are views.
+        pview: PviewCache,
+    }
+    impl Emit<'_> {
+        /// `i / d` of the view axis divisor at `slot` (a shift for `Pow2`), once per context `parent` and divisor.
+        fn pview_div(&mut self, parent: u32, i: &str, slot: u32, kind: params::DivRemSpec) -> String {
+            let pow2 = matches!(kind, params::DivRemSpec::Pow2);
+            if let Some((.., q)) = self.pview.divs.iter().find(|&&(p, s, w, _)| p == parent && s == slot && w == pow2) {
+                return q.clone();
+            }
+            let q = match kind {
+                params::DivRemSpec::Pow2 => format!("({i} >> p.s{slot})"),
+                params::DivRemSpec::Runtime { wide } => udiv(i, slot, wide),
+                params::DivRemSpec::None => return i.to_owned(),
+            };
+            let local = format!("q{parent}_{slot}");
+            let _ = writeln!(self.src, "    let {local}: u32 = {q};");
+            self.pview.divs.push((parent, slot, pow2, local.clone()));
+            local
+        }
+
+        /// `i % d` of the view axis modulus at `slot` (a mask for `Pow2`), once per context `parent` and modulus.
+        fn pview_rem(&mut self, parent: u32, i: &str, slot: u32, kind: params::DivRemSpec) -> String {
+            let pow2 = matches!(kind, params::DivRemSpec::Pow2);
+            if let Some((.., r)) = self.pview.rems.iter().find(|&&(p, s, w, _)| p == parent && s == slot && w == pow2) {
+                return r.clone();
+            }
+            let r = match kind {
+                params::DivRemSpec::Pow2 => format!("({i} & p.s{slot})"),
+                params::DivRemSpec::Runtime { .. } => {
+                    let q = self.pview_div(parent, i, slot, kind);
+                    format!("({i} - {q} * p.s{slot})")
+                }
+                params::DivRemSpec::None => return i.to_owned(),
+            };
+            let local = format!("r{parent}_{slot}");
+            let _ = writeln!(self.src, "    let {local}: u32 = {r};");
+            self.pview.rems.push((parent, slot, pow2, local.clone()));
+            local
+        }
+
+        /// The flat source index of the parameterized view `spec` of the index `from` of context
+        /// `parent` or, with `inside_test`, whether it lies inside the source, sharing the
+        /// divisions or the coordinates of `from`; and the source coordinates. Where the cache
+        /// has the source coordinates of `parent` and that source has the dimensions of this
+        /// view's output, a coordinate along the output is taken from them
+        /// (`AxisSpec::from`) instead of from dividing `from`.
+        fn inline_pview(&mut self, parent: u32, from: &str, spec: params::ViewSpec, inside_test: bool) -> (String, [Option<String>; 4]) {
+            let mut raws: [Option<String>; 4] = Default::default();
+            let mut sizes: [Option<String>; 4] = Default::default();
+            let mut coords: [Option<String>; 4] = Default::default();
+            let mut terms = Vec::new();
+            let known = self.pview.coords.iter().find(|&&(c, dims, _)| c == parent && dims == spec.out_dims).map(|(.., known)| known.clone());
+            let seq = self.pview.seq;
+            self.pview.seq += 1;
+            for a in 0..4 {
+                let axis = spec.axes[a];
+                if !(axis.active || (spec.edge == Edge::Fill && axis.checked)) {
+                    continue;
+                }
+                let slots = axis.slots;
+                let mut scaled = None;
+                if !axis.out_unit && axis.step != params::StepSpec::Zero {
+                    let along = match &known {
+                        // An axis of the parent's source without a coordinate has one element.
+                        Some(known) => known[axis.from as usize].clone().unwrap_or_else(|| "0".to_owned()),
+                        None => {
+                            let along = match (axis.out_div, axis.out_rem) {
+                                (params::DivRemSpec::None, params::DivRemSpec::None) => from.to_owned(),
+                                (params::DivRemSpec::None, rem) => self.pview_rem(parent, from, slots.rem, rem),
+                                (div, params::DivRemSpec::None) => self.pview_div(parent, from, slots.div, div),
+                                (div, rem) => {
+                                    let quotient = self.pview_div(parent, from, slots.div, div);
+                                    match rem {
+                                        params::DivRemSpec::Pow2 => format!("({quotient} & p.s{})", slots.rem),
+                                        params::DivRemSpec::Runtime { wide } => urem(&quotient, slots.rem, wide),
+                                        params::DivRemSpec::None => quotient,
+                                    }
+                                }
+                            };
+                            format!("i32({along})")
+                        }
+                    };
+                    scaled = Some(match axis.step {
+                        params::StepSpec::PosOne => along,
+                        params::StepSpec::NegOne => format!("(-{along})"),
+                        _ => format!("({along} * i32(p.s{}))", slots.step),
+                    });
+                }
+                let start = format!("i32(p.s{})", slots.start);
+                let base = match scaled {
+                    None => start,
+                    Some(scaled) => format!("({scaled} + {start})"),
+                };
+                let raw = if axis.start_delta == 0 { base } else { format!("({base} + {})", axis.start_delta) };
+                let size = axis.checked.then(|| format!("i32(p.s{})", slots.size));
+                let stride = (axis.active && !axis.src_fastest).then(|| format!("p.s{}", slots.stride));
+                if axis.active {
+                    let coord = match (&size, spec.edge) {
+                        (Some(size), Edge::Clamp | Edge::Fill) => format!("luma_clamp_i({raw}, {size})"),
+                        (Some(size), Edge::Mirror) => format!("luma_mirror_i({raw}, {size})"),
+                        (Some(size), Edge::Wrap) if axis.wrap_mask => format!("luma_wrap_mask({raw}, u32({size}))"),
+                        (Some(size), Edge::Wrap) => format!("luma_wrap_i({raw}, {size})"),
+                        _ => raw.clone(),
+                    };
+                    if !inside_test {
+                        let local = format!("x{seq}_{a}");
+                        let _ = writeln!(self.src, "    let {local}: i32 = {coord};");
+                        terms.push(match stride {
+                            Some(stride) => format!("u32({local}) * {stride}"),
+                            None => format!("u32({local})"),
+                        });
+                        coords[a] = Some(local);
+                    }
+                }
+                raws[a] = Some(raw);
+                sizes[a] = size;
+            }
+            if !inside_test {
+                let sum = if terms.is_empty() { "0u".to_owned() } else { terms.join(" + ") };
+                return (sum, coords);
+            }
+            let tests: Vec<String> = (0..4)
+                .filter_map(|a| match (&raws[a], &sizes[a]) {
+                    (Some(raw), Some(size)) => Some(format!("{raw} >= 0 && {raw} < {size}")),
+                    _ => None,
+                })
+                .collect();
+            let all = if tests.is_empty() { "true".to_owned() } else { format!("({})", tests.join(" && ")) };
+            (all, coords)
+        }
     }
     impl Emit<'_> {
         /// The index of context `c`.
@@ -1107,7 +1258,11 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                     let n = self.names.views.iter().position(|&known| known == (map, edge));
                     format!("view{}({from})", n.map_or_else(|| "_missing".to_owned(), |n| n.to_string()))
                 }
-                ShiftKind::ParamView { id, .. } => format!("pview{id}({from})"),
+                ShiftKind::ParamView { spec, .. } => {
+                    let (index, coords) = self.inline_pview(ctx.parent, &from, spec, false);
+                    self.pview.coords.push((c, spec.src_dims, coords));
+                    index
+                }
                 kind => {
                     if let Ref::Input(k) = ctx.args[0] {
                         self.load(k, ctx.parent);
@@ -1206,11 +1361,25 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                             let inside = format!("view{}_in({})", view.map_or_else(|| "_missing".to_owned(), |n| n.to_string()), self.index_of(flat.at));
                             format!("select({fill}, {read}, {inside})")
                         }
-                        ShiftKind::ParamView { id, spec } if spec.edge == Edge::Fill => {
+                        ShiftKind::ParamView { spec, .. } if spec.edge == Edge::Fill => {
                             let fill = flat_name(flat.args[1], op.operand_ty(1), flat.at);
-                            format!("select({fill}, {read}, pview{id}_in({}))", self.index_of(flat.at))
+                            // An undefined context's index is not shared with: a key of its own.
+                            let parent = if staged_read { u32::MAX - flat.at } else { flat.at };
+                            let from = self.index_of(flat.at);
+                            let inside = self.inline_pview(parent, &from, spec, true).0;
+                            format!("select({fill}, {read}, {inside})")
                         }
                         _ => read,
+                    }
+                }
+                OpKind::Generate(Gen::ParamRange { axis: Some(a), .. })
+                    if let Some(coord) = self.pview.coords.iter().find(|&&(c, ..)| c == flat.at).and_then(|(_, _, coords)| coords[a as usize].clone()) =>
+                {
+                    match op.ty {
+                        ElemTy::U32 => format!("u32({coord})"),
+                        ElemTy::I32 => coord,
+                        ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(u32({coord}))"),
+                        ElemTy::Bool => unreachable!("bool has no generators"),
                     }
                 }
                 _ => {
@@ -1247,7 +1416,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                 if slot == 2 {
                     self.src.push_str("    } else {\n");
                 }
-                let outer = (self.defined.clone(), self.loaded.clone());
+                let outer = (self.defined.clone(), self.loaded.clone(), self.pview.clone());
                 self.region(side);
                 for &m in &members {
                     let Some(flat) = inlined.instrs.get(m as usize) else { continue };
@@ -1257,7 +1426,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                     let value = flat_name(flat.args[slot], flat.op.operand_ty(slot), flat.at);
                     let _ = writeln!(self.src, "    t{m} = {value};");
                 }
-                (self.defined, self.loaded) = outer;
+                (self.defined, self.loaded, self.pview) = outer;
             }
             self.src.push_str("    }\n");
         }
@@ -1282,6 +1451,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
         loaded: Vec::new(),
         members,
         groups,
+        pview: PviewCache::default(),
     };
     emit.region(Region::Top);
     emit.src

@@ -143,6 +143,18 @@ impl Features {
     pub const fn bits(self) -> u32 {
         self.0
     }
+    /// Enabled features and their names.
+    pub fn iter_names(self) -> impl Iterator<Item = (&'static str, Self)> {
+        [
+            ("TIMESTAMP_QUERY", Self::TIMESTAMP_QUERY),
+            ("SUBGROUP", Self::SUBGROUP),
+            ("SHADER_F16", Self::SHADER_F16),
+            ("SHADER_F64", Self::SHADER_F64),
+            ("EXPERIMENTAL_COOPERATIVE_MATRIX", Self::EXPERIMENTAL_COOPERATIVE_MATRIX),
+        ]
+        .into_iter()
+        .filter(move |&(_, flag)| self.contains(flag))
+    }
 }
 
 macro_rules! bit_ops {

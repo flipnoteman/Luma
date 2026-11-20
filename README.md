@@ -103,7 +103,7 @@ cargo test
 
 ### Backends
 
-Luma is a Cargo workspace of six crates: `luma-core` (the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-wgpu`, `luma-metal` and `luma-cuda` (each holds one backend and its own code generator for WGSL, MSL or NVVM IR), `luma-cpu` (the native SIMD backend, compiling the kernel IR with Cranelift), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend crate.
+Luma is a Cargo workspace of six crates: `luma-hal-core` (library `luma_core`: the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-hal-wgpu`, `luma-hal-metal` and `luma-hal-cuda` (each holds one backend and its own code generator for WGSL, MSL or NVVM IR), `luma-hal-cpu` (the native SIMD backend, compiling the kernel IR with Cranelift), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend crate.
 
 With `BackendKind::Auto` (the default) a context opens the first backend that works, in the order CUDA, Metal, wgpu, and the native CPU backend when no GPU opens. Choose one with `ContextOptions::backend(BackendKind::..)`, with `Context::cuda()`, `Context::metal()`, `Context::wgpu()` or `Context::cpu()`, or with `LUMA_BACKEND`; `Context::backend()` tells which one a context uses, and `Context::device()` (a `DeviceSummary`) or `Context::device_name()` the device: its backend, name and whether it is the host CPU. The CUDA backend needs only the NVIDIA driver, loaded at run time (kernels are compiled to PTX by the driver's own NVVM library; no CUDA toolkit or NVRTC): without an NVIDIA driver the CUDA backend reports an error (and `Auto` moves on) instead of failing to start the program.
 
@@ -169,7 +169,7 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 Luma by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.
 
-The `luma-cuda` crate embeds NVIDIA's libdevice math library
+The `luma-hal-cuda` crate embeds NVIDIA's libdevice math library
 (`crates/luma-cuda/vendor/libdevice.10.bc`), which is not covered by the licences above: it is
 redistributed under the NVIDIA CUDA Toolkit EULA
 ([`NVIDIA-CUDA-EULA.txt`](crates/luma-cuda/vendor/NVIDIA-CUDA-EULA.txt)).
