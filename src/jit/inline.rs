@@ -1786,11 +1786,13 @@ mod tests {
             instr(OpKind::Shift(view(16)), [Ref::Sub(1), Ref::Unused, Ref::Unused]),
         ];
         let mut outputs = Vec::new();
-        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Max].into_iter().cycle().take(fields) {
-            main.push(instr(OpKind::Binary(op), [Ref::Tmp(3), Ref::Scalar(1), Ref::Unused]));
+        for (k, op) in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Max].into_iter().cycle().take(fields).enumerate() {
+            // Scalar 1 for the first fields, a scalar of its own beyond the cycle of operations.
+            let scalar = Ref::Scalar(if k < 5 { 1 } else { 2 + k as u32 });
+            main.push(instr(OpKind::Binary(op), [Ref::Tmp(3), scalar, Ref::Unused]));
             main.push(instr(OpKind::Select, [Ref::Tmp(1), Ref::Tmp(main.len() as u32 - 1), Ref::Input(0)]));
             let inner = main.len() as u32 - 1;
-            main.push(instr(OpKind::Binary(op), [Ref::Tmp(4), Ref::Scalar(1), Ref::Unused]));
+            main.push(instr(OpKind::Binary(op), [Ref::Tmp(4), scalar, Ref::Unused]));
             main.push(instr(OpKind::Select, [Ref::Tmp(2), Ref::Tmp(main.len() as u32 - 1), Ref::Tmp(inner)]));
             outputs.push(main.len() as u32 - 1);
         }
@@ -1822,6 +1824,20 @@ mod tests {
             assert_eq!(inlined.region[last], Region::Taken(outer_anchor), "{:?}", inlined.region);
             assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
         }
+    }
+
+    /// `branches` runs its region loop again after every group it splits or drops: a record of
+    /// hundreds of fields assigned over two regions (3000 selects) must stay far from quadratic.
+    #[test]
+    fn the_branches_of_a_program_with_thousands_of_selects_are_found_in_a_moment() {
+        let key = chained_record_key(1500);
+        let started = std::time::Instant::now();
+        let inlined = fits(inline(&key, 1_000_000, &CostModel::TEST));
+        let took = started.elapsed();
+        assert_eq!(selects(&inlined).len(), 3000);
+        let grouped = (0..inlined.instrs.len()).filter(|&n| inlined.branch[n] && inlined.group[n] != n as u32).count();
+        assert!(grouped >= 2900, "{grouped} of 3000 selects are in a group of others");
+        assert!(took < std::time::Duration::from_secs(5), "{took:?} for {} instructions", inlined.instrs.len());
     }
 
     /// `select(mask, value, old)` over 64 cells where the value is a thin region of 4 cells (an
