@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
+            window.path_to_searchindex_js = "searchindex-7698d9f6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -3513,8 +3513,8 @@ before, it now runs on the native CPU backend (or returns an error when <code>LU
 feature: code that used it needs that feature, or its own <code>wgpu</code> dependency. <code>Features</code> and the profiling types
 are re-exported from <code>luma_core</code>.</p>
 <h3 id="crates-and-features"><a class="header" href="#crates-and-features">Crates and features</a></h3>
-<p>Luma is a workspace of six crates: <code>luma-core</code> (the kernel IR and the backend interface), <code>luma-wgpu</code>,
-<code>luma-metal</code>, <code>luma-cuda</code> and <code>luma-cpu</code> (one backend each, with its own code generator), and the root <code>luma</code>
+<p>Luma is a workspace of six crates: <code>luma-hal-core</code> (the kernel IR and the backend interface), <code>luma-hal-wgpu</code>,
+<code>luma-hal-metal</code>, <code>luma-hal-cuda</code> and <code>luma-hal-cpu</code> (one backend each, with its own code generator), and the root <code>luma</code>
 crate. The features <code>wgpu</code>, <code>metal</code>, <code>cuda</code> and <code>cpu</code> each enable one backend, and all are on by default. To
 build with one only:</p>
 <pre><code class="language-sh">cargo build --no-default-features --features cuda
