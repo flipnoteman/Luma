@@ -176,12 +176,16 @@ impl<'a> GraphBuilder<'a> {
 /// millisecond for a step of a few dozen launches, against about a microsecond saved per launch).
 pub(crate) const PAYING_REPLAYS: usize = 8;
 
+/// Captures tried for a key before it is given up: a failed capture may be transient (the device ran
+/// out of memory, say), so it is tried again until this many have failed.
+const CAPTURE_ATTEMPTS: u32 = 3;
+
 /// A captured graph with its device memory counted as resident.
 type Counted = (Arc<dyn ExecGraph>, Accounted);
 
-/// Captured graphs by what they replay, `None` for what the backend could not capture (asked
-/// only once). A graph names the buffers it was captured with: the owner of a cache clears it
-/// when one of them is replaced.
+/// Captured graphs by what they replay, `None` for what the backend could not capture in
+/// [`CAPTURE_ATTEMPTS`] tries. A graph names the buffers it was captured with: the owner of a
+/// cache clears it when one of them is replaced.
 ///
 /// A graph is captured when it pays: when the caller is about to replay it often enough
 /// ([`PAYING_REPLAYS`]), or the second time it is asked for (an owner kept across runs replays it
@@ -191,12 +195,19 @@ pub(crate) struct GraphCache<K> {
     /// Each graph with its device memory (see [`ExecGraph::device_bytes`]) counted as resident
     /// while the cache holds it.
     graphs: Mutex<FxMap<K, Option<Counted>>>,
+    /// Failed captures by key (see [`CAPTURE_ATTEMPTS`]).
+    failed: Mutex<FxMap<K, u32>>,
     asked: Mutex<FxMap<K, u32>>,
 }
 
 impl<K: Hash + Eq + Copy> GraphCache<K> {
     pub(crate) fn new(ctx: &Context) -> Self {
-        GraphCache { ctx: ctx.clone(), graphs: Mutex::new(FxMap::default()), asked: Mutex::new(FxMap::default()) }
+        GraphCache {
+            ctx: ctx.clone(),
+            graphs: Mutex::new(FxMap::default()),
+            failed: Mutex::new(FxMap::default()),
+            asked: Mutex::new(FxMap::default()),
+        }
     }
 
     /// The graph under `key` for `replays` replays now: the cached one, or one captured by
@@ -215,14 +226,28 @@ impl<K: Hash + Eq + Copy> GraphCache<K> {
             return None;
         }
         let graph = build();
-        let counted = graph.as_ref().map(|graph| (Arc::clone(graph), Accounted::new(&self.ctx, graph.device_bytes())));
-        lock(&self.graphs).insert(key, counted);
-        graph
+        let Some(graph) = graph else {
+            // Asked again on the next call, until it has failed [`CAPTURE_ATTEMPTS`] times.
+            let failures = {
+                let mut failed = lock(&self.failed);
+                let n = failed.entry(key).or_insert(0);
+                *n += 1;
+                *n
+            };
+            if failures >= CAPTURE_ATTEMPTS {
+                lock(&self.graphs).insert(key, None);
+            }
+            return None;
+        };
+        let counted = (Arc::clone(&graph), Accounted::new(&self.ctx, graph.device_bytes()));
+        lock(&self.graphs).insert(key, Some(counted));
+        Some(graph)
     }
 
-    /// Forgets every graph (and how often each was asked for).
+    /// Forgets every graph (and how often each was asked for or failed).
     pub(crate) fn clear(&self) {
         lock(&self.graphs).clear();
+        lock(&self.failed).clear();
         lock(&self.asked).clear();
     }
 

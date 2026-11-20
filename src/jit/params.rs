@@ -617,6 +617,7 @@ impl Builder {
             main: inlined.main.clone(),
             region: inlined.region.clone(),
             branch: inlined.branch.clone(),
+            group: inlined.group.clone(),
             ops: inlined.ops,
             staged_reads: inlined.staged_reads.clone(),
         })

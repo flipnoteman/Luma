@@ -2,7 +2,7 @@
 //! launched (the counters of [`JitState`](super::JitState)). What the results of fused
 //! expressions must be is tested through the public API in `tests/fusion.rs`.
 
-use super::StatsSnapshot;
+use super::{GraphCache, PAYING_REPLAYS, StatsSnapshot};
 use crate::array::Array;
 use crate::context::{Context, ContextOptions};
 use crate::jit::cost::CostModel;
@@ -3419,6 +3419,133 @@ fn ghost_regions_are_computed_only_where_they_are_assigned() {
     }
 }
 
+/// The fields of a padded record whose ghost cells (half of the padded array) are assigned right-hand
+/// sides that share a chain of square roots (a boundary condition computing one thing for every
+/// field): each field is a select by the same mask, and the chain is computed only in the ghost cells,
+/// once, by the one `if` that assigns all the fields. Their own last operations (a product by a
+/// scalar) are worth little alone, so the selects only branch when the group's gain is summed.
+#[test]
+fn a_record_assigned_over_a_region_computes_what_its_fields_share_only_there() {
+    use crate::fields::Fields;
+    use crate::view::PadMode;
+    fn check<const N: usize>(staging: bool) {
+        let (ni, nj) = (8usize, 6usize);
+        let chain = |e: &Array<f32>| {
+            let mut a = e * 1.5 + 0.25;
+            for k in 0..6 {
+                a = (&a * 0.9 + 0.1).sqrt() + e * (0.01 * (k + 1) as f32);
+            }
+            a
+        };
+        let chain_host = |e: f32| {
+            let mut a = e * 1.5 + 0.25;
+            for k in 0..6 {
+                a = (a * 0.9 + 0.1).sqrt() + e * (0.01 * (k + 1) as f32);
+            }
+            a
+        };
+        let ctx = ctx();
+        ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+        ctx.jit().set_staging(staging);
+        ctx.jit().set_max_inlined(1536);
+        let data: Vec<Vec<f32>> = (0..N).map(|k| values(ni * nj, 120 + k as u64, 0.5, 1.5)).collect();
+        let q: [Array<f32>; N] = std::array::from_fn(|k| Array::from_slice_on(&ctx, &data[k], [ni, nj]).unwrap());
+        // `ni` ghost columns before the cells: the left half of the padded array is assigned.
+        let mut w = q.pad([(ni, 0)], PadMode::Edge);
+        let common = chain(&q[0]);
+        let ghost: [Array<f32>; N] = std::array::from_fn(|k| &common * (k as f32 + 1.0));
+        w.slice_mut(0, ..ni).assign(ghost).unwrap();
+
+        let refs: Vec<&Array<f32>> = w.iter().collect();
+        let before = ctx.jit().stats();
+        crate::eval_all(&refs).unwrap();
+        let judgement = ctx.jit().last_judgement();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{N} fields, staging {staging}: {judgement:?}");
+        assert_eq!(ctx.jit().last_branches(), N, "{N} fields, staging {staging}: every field's select is one branch ({judgement:?})");
+        for k in 0..N {
+            let got = w[k].to_vec().unwrap();
+            let want: Vec<f32> = (0..2 * ni * nj)
+                .map(|i| {
+                    let (x, y) = (i % (2 * ni), i / (2 * ni));
+                    if x < ni { chain_host(data[0][x + ni * y]) * (k as f32 + 1.0) } else { data[k][x - ni + ni * y] }
+                })
+                .collect();
+            assert_close(&got, &want, 1e-5, 1e-5);
+        }
+    }
+    for staging in [true, false] {
+        check::<2>(staging);
+        check::<5>(staging);
+    }
+}
+
+/// Two region assigns of a padded record in a row (the low and the high ghost cells, each computed
+/// from a chain the fields share): the selects of a field are nested, those of one assign are one
+/// group inside the next one's, so each chain is computed in its own ghost cells only.
+#[test]
+fn a_record_assigned_over_two_regions_in_a_row_branches_for_both() {
+    use crate::fields::Fields;
+    use crate::view::PadMode;
+    fn check<const N: usize>(staging: bool) {
+        let (ni, nj) = (8usize, 6usize);
+        let chain = |e: &Array<f32>, scale: f32| {
+            let mut a = e * scale + 0.25;
+            for k in 0..6 {
+                a = (&a * 0.9 + 0.1).sqrt() + e * (0.01 * (k + 1) as f32);
+            }
+            a
+        };
+        let chain_host = |e: f32, scale: f32| {
+            let mut a = e * scale + 0.25;
+            for k in 0..6 {
+                a = (a * 0.9 + 0.1).sqrt() + e * (0.01 * (k + 1) as f32);
+            }
+            a
+        };
+        let ctx = ctx();
+        ctx.set_cost_model(CostModel { launch_us: 1e6, ..CostModel::TEST });
+        ctx.jit().set_staging(staging);
+        ctx.jit().set_max_inlined(1536);
+        let data: Vec<Vec<f32>> = (0..N).map(|k| values(ni * nj, 130 + k as u64, 0.5, 1.5)).collect();
+        let q: [Array<f32>; N] = std::array::from_fn(|k| Array::from_slice_on(&ctx, &data[k], [ni, nj]).unwrap());
+        // `ni` ghost columns on both sides: a third of the padded array each.
+        let mut w = q.pad([(ni, ni)], PadMode::Edge);
+        let low = chain(&q[0], 1.5);
+        let high = chain(&q[1], 2.5);
+        let low_ghost: [Array<f32>; N] = std::array::from_fn(|k| &low * (k as f32 + 1.0));
+        let high_ghost: [Array<f32>; N] = std::array::from_fn(|k| &high - (k as f32 + 1.0));
+        w.slice_mut(0, ..ni).assign(low_ghost).unwrap();
+        w.slice_mut(0, 2 * ni..).assign(high_ghost).unwrap();
+
+        let refs: Vec<&Array<f32>> = w.iter().collect();
+        let before = ctx.jit().stats();
+        crate::eval_all(&refs).unwrap();
+        let judgement = ctx.jit().last_judgement();
+        assert_eq!(delta(before, ctx.jit().stats()).elementwise_launches, 1, "{N} fields, staging {staging}: {judgement:?}");
+        assert_eq!(ctx.jit().last_branches(), 2 * N, "{N} fields, staging {staging}: both assigns' selects are branches ({judgement:?})");
+        for k in 0..N {
+            let got = w[k].to_vec().unwrap();
+            let want: Vec<f32> = (0..3 * ni * nj)
+                .map(|i| {
+                    let (x, y) = (i % (3 * ni), i / (3 * ni));
+                    if x < ni {
+                        chain_host(data[0][x + ni * y], 1.5) * (k as f32 + 1.0)
+                    } else if x < 2 * ni {
+                        data[k][x - ni + ni * y]
+                    } else {
+                        chain_host(data[1][x - 2 * ni + ni * y], 2.5) - (k as f32 + 1.0)
+                    }
+                })
+                .collect();
+            assert_close(&got, &want, 1e-5, 1e-5);
+        }
+    }
+    for staging in [true, false] {
+        check::<2>(staging);
+        check::<5>(staging);
+    }
+}
+
 /// A join of many evaluated parts along a slow axis is a chain of selects on the coordinate; each
 /// one is computed as `if`/`else` (a nested one saves a load per cell that reaches it, however few
 /// do), so a cell loads the one part it takes and not every part.
@@ -4671,4 +4798,20 @@ fn a_stepper_leaves_no_device_buffer_uncounted() {
     ctx.sync().unwrap();
     let stats = ctx.memory_stats();
     assert_eq!(ctx.created_bytes(), stats.resident_bytes + stats.pooled_bytes, "{stats:?}");
+}
+
+/// A capture that fails is tried again on the next calls, and given up after three failures.
+#[test]
+fn a_failed_graph_capture_is_tried_again_until_three_have_failed() {
+    let ctx = ctx();
+    let cache: GraphCache<u32> = GraphCache::new(&ctx);
+    let mut tries = 0;
+    for _ in 0..10 {
+        let graph = cache.get_or_build(7, PAYING_REPLAYS, || {
+            tries += 1;
+            None
+        });
+        assert!(graph.is_none());
+    }
+    assert_eq!(tries, 3);
 }

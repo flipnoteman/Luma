@@ -9,7 +9,7 @@ use luma_core::Buffer;
 use crate::array::{Failure, Storage};
 use crate::gpu_type::ElemLayout;
 use crate::gpu::pager::Pin;
-use crate::builtin::{Builtin, Finish, ReduceList, ReduceOp};
+use crate::builtin::{Builtin, Finish, GateId, ReduceList, ReduceOp};
 use crate::context::{RawArg, Scratch};
 use crate::error::LumaError;
 use crate::matmul::{MatmulOperand, MatmulTile};
@@ -1296,7 +1296,12 @@ pub(super) fn reduce_fused(
 /// [`reduce_fused`] of one segment and one unsplit program that also stores the instructions
 /// `store_outs` in the same kernel, one new buffer each. Returns them, the buffer of partial
 /// results and how many there are (with `Tuning::single_pass_reduce` and several workgroups the
-/// pass finishes the reduction itself: one value per op, the final one).
+/// pass finishes the reduction itself: one value per op, the final one). `finish` is applied
+/// inside the pass when it leaves the final values (one group, or a single pass: one partial
+/// result is returned then), which go to `target` if it is given. With a `gate` (its id and the
+/// arguments of its buffers, see `ReduceList::with_gate`) the pass also runs the gate on the
+/// final value, and the pass must be one that leaves it: one group, or a single pass.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reduce_and_store_fused(
     ctx: &crate::context::Context,
     len: usize,
@@ -1304,6 +1309,9 @@ pub(super) fn reduce_and_store_fused(
     store_outs: &[u32],
     ops: ReduceList,
     scratch: &mut Scratch<'_>,
+    target: Option<&Buffer>,
+    finish: Finish,
+    gate: Option<(GateId, &[RawArg<'_>])>,
 ) -> Result<(Vec<Storage>, Buffer, u32), Failure> {
     if store_outs.iter().any(|&at| fused.key.instrs.get(at as usize).is_none_or(|instr| instr.op.out_ty() == ElemTy::Bool)) {
         return Err(LumaError::Chunked("a fused store and reduction on a packed bool output").into());
@@ -1320,8 +1328,17 @@ pub(super) fn reduce_and_store_fused(
     let n = len_u32(first.range(0).len())?;
     let groups = ctx.tuning().reduce_groups(n);
     let single_pass = ctx.tuning().single_pass_reduce && groups > 1;
+    let finished = !finish.epilogue.is_empty() && (single_pass || groups == 1);
+    if gate.is_some() && !single_pass && groups != 1 {
+        return Err(LumaError::Chunked("a gate on a reduction that does not finish in its first pass").into());
+    }
     if single_pass {
-        key.tail = Tail::Reduce(ops.single_pass());
+        key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue).single_pass());
+    } else if finished {
+        key.tail = Tail::Reduce(ops.with_epilogue(finish.epilogue));
+    }
+    if let (Some((id, _)), Tail::Reduce(list)) = (&gate, key.tail) {
+        key.tail = Tail::Reduce(list.with_gate(*id));
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
     if shifted.is_some() {
@@ -1335,9 +1352,22 @@ pub(super) fn reduce_and_store_fused(
 
     let cell = out_elems(&key).first().copied().unwrap_or(4) * ops.as_slice().len() as u64;
     let out_bytes = u64::from(groups) * cell;
-    let partial = scratch.take(out_bytes)?;
-    let values = if single_pass { Some(scratch.take(cell)?) } else { None };
-    let params = params(&key, None, Some(n), first.range(0).start, len, None, &scalars)?;
+    let partial = match target {
+        Some(target) if groups == 1 => target.clone(),
+        _ => scratch.take(out_bytes)?,
+    };
+    let values = if single_pass {
+        Some(match target {
+            Some(target) => target.clone(),
+            None => scratch.take(cell)?,
+        })
+    } else {
+        None
+    };
+    let mut params = params(&key, None, Some(n), first.range(0).start, len, None, &scalars)?;
+    if finished {
+        params.to_mut().extend(finish.uniform_words());
+    }
     let pins = pin_inputs(&key, &inputs, None, 0, n)?;
     let store_pins = stored.iter().map(|out| out.pin(0).map(|pin| (pin, out.segment_byte_len(0)))).collect::<Result<Vec<_>, _>>()?;
     let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + store_pins.len() + 4);
@@ -1347,6 +1377,10 @@ pub(super) fn reduce_and_store_fused(
     if let Some(values) = &values {
         raw.push(RawArg::write(ctx.reduce_counter()?, 4));
         raw.push(RawArg::write(values, cell));
+    }
+    if let Some((_, args)) = gate {
+        debug_assert_eq!(args.len(), crate::builtin::GATE_BINDINGS);
+        raw.extend_from_slice(args);
     }
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
     ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;

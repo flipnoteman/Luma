@@ -6,7 +6,7 @@
 //! offsets, and locals are `alloca [N x i8]` slots that LLVM promotes to registers.
 //!
 //! Kernel ABI of `luma_main` (the order `launch_kernel` must pass the parameters in):
-//! `%LumaGrid* byval align 4` (the grid), `i8* noalias` `luma_indirect` (null for direct
+//! `%LumaGrid* byval align 4` (the grid), `i8*` `luma_indirect` (not `noalias`: a gate folded into a launch rewrites the arguments it is dispatched from) (null for direct
 //! dispatches), one parameter per *active* binding in ascending original binding order (see
 //! [`CudaArgAbi`]), then one `i32` per entry of [`CudaTranslated::array_lengths`].
 
@@ -1327,7 +1327,7 @@ impl<'a> Em<'a> {
         let total = wx * wy * wz;
         let mut fb = Fb::new();
         let mut cx = FnCx::new(&m.entry_locals, &[]);
-        let mut kparams: Vec<String> = vec!["%LumaGrid* byval align 4 %luma".into(), "i8* noalias %luma_indirect".into()];
+        let mut kparams: Vec<String> = vec!["%LumaGrid* byval align 4 %luma".into(), "i8* %luma_indirect".into()];
         let mut ktypes: Vec<String> = vec!["%LumaGrid*".into(), "i8*".into()];
         cx.grid = Some(fb.def("bitcast %LumaGrid* %luma to i8*"));
         let ind: Op = "%luma_indirect".into();

@@ -3,20 +3,23 @@
 //! copies from a template or zeroes once the residual is within the tolerance, so the steps after
 //! convergence dispatch no workgroups and the host waits once per block instead of once per step.
 //! The first block is [`FIRST_BLOCK`] steps and every block that ends without a stop doubles the
-//! next one, up to [`MAX_BLOCK`]; the result does not depend on the schedule.
+//! next one, up to [`MAX_BLOCK`]; the result does not depend on the schedule. Where a reduction
+//! finishes in its first launch (CUDA and CPU) the residual's kernel runs the gate itself, in its last
+//! workgroup ([`UNTIL_GATE`]): a step is one launch.
 
 use std::sync::Arc;
 
 use luma_core::{Buffer, BufferUsage};
 
-use crate::array::{Failure, Storage};
-use crate::gpu_type::ElemLayout;
-use crate::builtin::{Builtin, ReduceList, ReduceOp};
+use crate::array::{Array, Failure, Storage};
+use crate::gpu_type::{ElemLayout, GpuType};
+use crate::builtin::{Builtin, Finish, GateId, ReduceList, ReduceOp, GATE_BINDINGS};
 use crate::context::{Context, RawArg, Scratch, STORAGE_USAGE};
 use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d, len_u32, workgroups_1d};
+use crate::reduce::finish_passes;
 
-use super::launch::{params, pin_inputs, store_args};
+use super::launch::{self, params, pin_inputs, store_args};
 use super::program::{flatten, flatten_inner, Fused, Tail};
 use super::{ElemTy, Node};
 
@@ -35,6 +38,26 @@ pub(crate) fn next_block(current: usize, fixed: Option<usize>) -> usize {
 /// Bytes of one word of the argument buffers.
 const WORD: u64 = 4;
 
+/// Bytes of the gate's state.
+const GATE_STATE_BYTES: u64 = 8 * WORD;
+
+/// The gate of `iterate_until` as the WGSL a reduction kernel runs on its final value (see
+/// `builtin::reduce_main`): what the `UntilGate` kernel does, over the state `st`
+/// (`[stopped, steps run, steps so far, words, own launch, 0, tolerance, 0]`) and
+/// the arguments `args` of the next step; the other buffers it is given are not used.
+const UNTIL_GATE: &str = "fn luma_gate(v: f32) {
+    let i = st[2u];
+    let hit = (bitcast<u32>(v) & 0x7fffffffu) <= 0x7f800000u && v <= bitcast<f32>(st[6u]);
+    st[1u] = i + 1u;
+    st[2u] = i + 1u;
+    if (hit) { st[0u] = 1u; }
+    for (var w = 0u; w < st[3u]; w++) { args[w] = select(tmpl[w], 0u, hit && w / 3u != st[4u]); }
+    hist[0u] = hist[0u];
+    agg[0u] = agg[0u];
+    stepv[0u] = stepv[0u];
+}
+";
+
 /// Bytes of one element of the `f32` states this machinery handles.
 const ELEMENT_BYTES: u64 = 4;
 
@@ -43,6 +66,110 @@ const ELEMENT_BYTES: u64 = 4;
 thread_local! {
     pub(crate) static SEPARATE_KERNELS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+// Tests: run the gate of `iterate_until` and `iterate_until_all` as a launch of its own.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SEPARATE_GATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Launches a step of the last `iterate_until` made.
+    pub(crate) static STEP_LAUNCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Tests: trace the record of `iterate_until_all` after its step, as two kernels, even where one program does both.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SEPARATE_RECORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A gate (see [`ReduceList::with_gate`]) that [`force_with_record`] may fold into its kernel.
+pub(crate) struct FoldGate<'a> {
+    pub(crate) id: GateId,
+    /// The arguments of the gate's buffers, `GATE_BINDINGS` of them.
+    pub(crate) args: &'a [RawArg<'a>],
+    /// The storage of the step index, which the gate writes: a kernel that reads it cannot.
+    pub(crate) stepv: u64,
+}
+
+/// What [`force_with_record`] did.
+pub(crate) struct Grouped {
+    /// The index in the recording of the launch that runs the gate, if it was folded in.
+    pub(crate) folded: Option<usize>,
+}
+
+/// Evaluates the arrays `next` (one step of a loop, traced) and the reduction `record` (of the
+/// state the step reads, as `iterate_until_all` records it) in one launch that stores the first
+/// and reduces the second into `value`, one `f32` buffer of one element: the record is what
+/// the next step computes from its input, shared in the program, so that the step's launch does
+/// both. `None` unless that is possible (the arrays are pending expressions of one length,
+/// the record is a reduction of `f32`s of that length, the program is one unsplit kernel); nothing
+/// has been launched then, though flattening the program may have evaluated sub-programs it
+/// cannot keep in it first (their launches are recorded like the step's own). With a `gate` the kernel also runs it once the value is
+/// final, where the reduction finishes in its first pass and the kernel does not read the
+/// gate's step index.
+pub(crate) fn force_with_record<T: GpuType>(
+    ctx: &Context,
+    next: &[&Array<T>],
+    record: &Array<f32>,
+    value: &Buffer,
+    gate: Option<FoldGate<'_>>,
+) -> Option<Result<Grouped, Failure>> {
+    #[cfg(test)]
+    if SEPARATE_RECORD.with(std::cell::Cell::get) {
+        return None;
+    }
+    let (operand, ops, finish) = record.reduced()?.fusable()?;
+    if ops.as_slice().len() != 1 || ctx.check_finite() || !operand.is_pending() {
+        return None;
+    }
+    let nodes: Vec<&Arc<Node>> = next.iter().map(|array| array.pending()).collect::<Option<_>>()?;
+    let len = operand.len();
+    let distinct = nodes.iter().enumerate().all(|(i, node)| !Arc::ptr_eq(node, operand) && nodes[..i].iter().all(|other| !Arc::ptr_eq(other, node)));
+    if nodes.is_empty() || !distinct || nodes.iter().any(|node| node.len() != len) {
+        return None;
+    }
+    let mut roots = Vec::with_capacity(nodes.len() + 1);
+    for node in nodes.iter().copied().chain(std::iter::once(operand)) {
+        roots.push((Arc::clone(node), node.operands()?));
+    }
+    let fused = flatten_inner(&roots, Tail::Reduce(ops), &[]).ok()?;
+    drop(roots);
+    let key = &fused.key;
+    let (&reduced, stored) = key.outputs.split_last()?;
+    let f32_at = |at: u32| key.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::F32);
+    let max_inputs = ctx.jit().max_inputs();
+    let fits = key.outputs.len() == nodes.len() + 1
+        && reduced as usize + 1 == key.instrs.len()
+        && f32_at(reduced)
+        && stored.iter().enumerate().all(|(i, &at)| at != reduced && !stored[..i].contains(&at))
+        // Sub-programs read through views are written out where they are read (see `inline`), which
+        // a reduction does; those staged in workgroup memory need a store kernel's tiles.
+        && (key.subs.is_empty() || (key.inlines() && key.staging.is_none()))
+        && key.narrow()
+        && fused.inputs.iter().all(|input| input.segments() == 1)
+        && fused.inputs.len() + stored.len() < max_inputs;
+    if !fits {
+        return None;
+    }
+    let gate = gate.filter(|gate| {
+        ctx.tuning().single_pass_reduce
+            && fused.inputs.iter().all(|input| input.id() != gate.stepv)
+            && fused.inputs.len() + stored.len() + GATE_BINDINGS + 1 < max_inputs
+    });
+    let stored = stored.to_vec();
+    let mut scratch = Scratch::new(ctx);
+    let own = ctx.recorded();
+    let (storages, partial, groups) = launch::reduce_and_store_fused(ctx, len, fused, &stored, ops, &mut scratch, Some(value), finish, gate.as_ref().map(|gate| (gate.id, gate.args))).ok()?;
+    // Past a first pass that did not finish (several groups, no single pass): the rest, ending in `value`.
+    let rest = if groups > 1 { finish } else { Finish::default() };
+    if let Err(error) = finish_passes(ctx, &mut scratch, ops, "f32", ELEMENT_BYTES, partial, groups, true, Some(value), rest) {
+        return Some(Err(Failure::New(error)));
+    }
+    for (node, storage) in nodes.iter().zip(storages) {
+        node.finish_shared(Arc::new(storage));
+    }
+    Some(Ok(Grouped { folded: gate.is_some().then_some(own) }))
+}
+
 
 /// What a step of the loop launches: the body and the residual's first pass as two kernels, or
 /// one program that stores the step and reduces its residual.
@@ -158,17 +285,34 @@ fn run(
     // gate has zeroed the dispatch arguments runs no workgroup, takes no ticket and leaves the
     // counter at zero.
     let single = ctx.tuning().single_pass_reduce && ctx.tuning().reduce_groups(n) > 1;
+    // On such a backend (and for a residual of one workgroup) the check kernel also runs the gate,
+    // so that a step is that one launch (see `UNTIL_GATE`): the workgroups of a step after the
+    // stop find the loop stopped and leave at once, the first of them zeroing the dispatch
+    // arguments of the next. The check kernel then is the step's last launch.
+    let fold = ctx.tuning().single_pass_reduce && check.inputs.len() + GATE_BINDINGS + 4 <= ctx.jit().max_inputs() && {
+        #[cfg(test)]
+        {
+            !SEPARATE_GATE.with(std::cell::Cell::get)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    };
     let mut body_parts = body.map(|body| (body.key.clone(), body.scalars.clone()));
     let (mut check_key, mut check_scalars) = (check.key.clone(), check.scalars.clone());
     if single {
         check_key.tail = Tail::Reduce(max_ops.single_pass());
+    }
+    if let (true, Tail::Reduce(list)) = (fold, check_key.tail) {
+        check_key.tail = Tail::Reduce(list.with_gate(GateId::register(UNTIL_GATE)));
     }
     let body_core = match &mut body_parts {
         Some((key, scalars)) => Some(ctx.jit().kernel(ctx, key, scalars)?),
         None => None,
     };
     let check_core = ctx.jit().kernel(ctx, &mut check_key, &mut check_scalars)?;
-    let gate_core = ctx.builtin(Builtin::UntilGate, "u32")?;
+    let gate_core = if fold { None } else { Some(ctx.builtin(Builtin::UntilGate, "u32")?) };
 
     // The dispatches of one step, in order: the body (unless the check stores the step itself),
     // the first pass of the residual, then the passes that fold its partial results into one
@@ -200,6 +344,8 @@ fn run(
 
     let template: Vec<u32> = dispatches.iter().flatten().copied().collect();
     let words = len_u32(template.len())?;
+    #[cfg(test)]
+    STEP_LAUNCHES.with(|launches| launches.set(dispatches.len() + usize::from(gate_core.is_some())));
     let args_bytes = u64::from(words) * WORD;
     let indirect = STORAGE_USAGE | BufferUsage::INDIRECT;
     let mut owned = Vec::new();
@@ -214,7 +360,9 @@ fn run(
     let outcome = (|| -> Result<Arc<Storage>, Failure> {
         let tmpl = take(args_bytes, STORAGE_USAGE)?;
         ctx.upload(&tmpl, bytemuck::cast_slice(&template))?;
-        let state = take(2 * WORD, STORAGE_USAGE)?;
+        // `[stopped, steps run, ..]`; a folded gate's state is that of `UNTIL_GATE`.
+        let state = take(GATE_STATE_BYTES, STORAGE_USAGE)?;
+        let gate_dummies = if fold { Some([take(16, STORAGE_USAGE)?, take(16, STORAGE_USAGE)?, take(16, STORAGE_USAGE)?]) } else { None };
         let mut steps: Vec<Buffer> = Vec::new();
         let ping = [Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize))), Arc::new(Storage::new(ctx, len, ElemLayout::plain(ELEMENT_BYTES as usize)))];
         let body_state = body.and_then(|body| body.inputs.iter().position(|input| Arc::ptr_eq(input, probe)));
@@ -268,7 +416,9 @@ fn run(
             while steps.len() <= in_block {
                 steps.push(take(args_bytes, indirect)?);
             }
-            ctx.upload(&state, bytemuck::cast_slice(&[0u32, 0]))?;
+            // `[stopped, steps run, steps before the block, words, the check kernel's launch, 0, tolerance, 0]`.
+            let words_of_state = [0u32, 0, len_u32(base)?, words, check_at as u32, 0, tol.to_bits(), 0];
+            ctx.upload(&state, bytemuck::cast_slice(&words_of_state))?;
             ctx.upload(&steps[0], bytemuck::cast_slice(&template))?;
             if body.is_some() {
                 ctx.jit().stats.elementwise_launches.fetch_add(in_block as u64, std::sync::atomic::Ordering::Relaxed);
@@ -281,7 +431,22 @@ fn run(
                 if let Some(body_core) = &body_core {
                     ctx.launch_indirect(body_core, &steps[k], 0, [n, 1, 1], dispatches[0], &body_raws[s])?;
                 }
-                ctx.launch_indirect(&check_core, &steps[k], WORD * 3 * check_at as u64, [n, 1, 1], dispatches[check_at], &check_raws[s])?;
+                if let Some([hist, agg, stepv]) = &gate_dummies {
+                    let mut raw = check_raws[s].clone();
+                    let uniform = raw.pop();
+                    raw.extend([
+                        RawArg::write(&state, GATE_STATE_BYTES),
+                        RawArg::write(&steps[k + 1], args_bytes),
+                        RawArg::read(&tmpl, args_bytes),
+                        RawArg::write(hist, 16),
+                        RawArg::write(agg, 16),
+                        RawArg::write(stepv, 16),
+                    ]);
+                    raw.extend(uniform);
+                    ctx.launch_indirect(&check_core, &steps[k], WORD * 3 * check_at as u64, [n, 1, 1], dispatches[check_at], &raw)?;
+                } else {
+                    ctx.launch_indirect(&check_core, &steps[k], WORD * 3 * check_at as u64, [n, 1, 1], dispatches[check_at], &check_raws[s])?;
+                }
 
                 for (pass, count) in fold_counts.iter().enumerate() {
                     let Some(finish_core) = &finish_core else { break };
@@ -300,19 +465,21 @@ fn run(
                         ],
                     )?;
                 }
-                let gate = [tol.to_bits(), len_u32(i)?, words];
-                launch_1d(
-                    ctx,
-                    &gate_core,
-                    words,
-                    &[
-                        RawArg::read(value, WORD),
-                        RawArg::write(&state, 2 * WORD),
-                        RawArg::write(&steps[k + 1], args_bytes),
-                        RawArg::read(&tmpl, args_bytes),
-                        RawArg::Uniform(bytemuck::cast_slice(&gate)),
-                    ],
-                )?;
+                if let Some(gate_core) = &gate_core {
+                    let gate = [tol.to_bits(), len_u32(i)?, words];
+                    launch_1d(
+                        ctx,
+                        gate_core,
+                        words,
+                        &[
+                            RawArg::read(value, WORD),
+                            RawArg::write(&state, 2 * WORD),
+                            RawArg::write(&steps[k + 1], args_bytes),
+                            RawArg::read(&tmpl, args_bytes),
+                            RawArg::Uniform(bytemuck::cast_slice(&gate)),
+                        ],
+                    )?;
+                }
             }
             let [done, count] = ctx.read::<u32>(&state, 2 * WORD)?[..] else {
                 return Err(Failure::New(LumaError::Gpu("iterate_until state is missing".into())));
@@ -329,4 +496,55 @@ fn run(
         ctx.recycle(buffer);
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ContextOptions;
+
+    fn single_pass_ctx() -> Context {
+        use luma_core::{BackendKind, DeviceKind};
+        let options = ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..ContextOptions::from_env() }.calibrate(false);
+        let ctx = Context::with_tuning(options, |tuning| tuning.single_pass_reduce = true).unwrap();
+        ctx.set_cost_model(crate::jit::cost::CostModel::TEST);
+        ctx
+    }
+
+    fn data(n: usize, seed: usize) -> Vec<f32> {
+        (0..n).map(|i| (((i + seed) * 7919) % 1009) as f32 / 1009.0 - 0.5).collect()
+    }
+
+    #[test]
+    fn the_gate_of_iterate_until_runs_in_the_residual_kernel_with_the_results_of_a_launch_of_its_own() {
+        for n in [100usize, 16384] {
+            let ctx = single_pass_ctx();
+            assert_eq!(ctx.tuning().reduce_groups(n as u32) > 1, n > 100);
+            let (init, source) = (data(n, 1), data(n, 2));
+            let c = Array::from_slice_on(&ctx, &source, n).unwrap();
+            let run = |separate_gate: bool, separate_kernels: bool, tol: f32, max: usize| {
+                SEPARATE_GATE.with(|flag| flag.set(separate_gate));
+                SEPARATE_KERNELS.with(|flag| flag.set(separate_kernels));
+                let x = Array::from_slice_on(&ctx, &init, n).unwrap();
+                let got = x.iterate_until(max, tol, |u| &(u * 0.9f32) + &c).to_vec().unwrap();
+                SEPARATE_GATE.with(|flag| flag.set(false));
+                SEPARATE_KERNELS.with(|flag| flag.set(false));
+                (got, STEP_LAUNCHES.with(std::cell::Cell::get))
+            };
+            // Converging after a few blocks, never, at the first step, at the last of few, and after one step only.
+            for (tol, max) in [(1e-4f32, 300), (0.0, 40), (1e9, 300), (1e-4, 3), (1e-4, 1)] {
+                let (folded, fold_launches) = run(false, false, tol, max);
+                let (separate, separate_launches) = run(true, false, tol, max);
+                assert_eq!(folded, separate, "n = {n}, tol = {tol}, max = {max}");
+                // The step and its residual are one launch, and the gate is no other.
+                assert_eq!((fold_launches, separate_launches), (1, 2), "n = {n}");
+                let (kernels, kernel_launches) = run(false, true, tol, max);
+                assert_eq!(kernels, separate, "n = {n}, tol = {tol}, max = {max}, the step as a kernel of its own");
+                assert_eq!(kernel_launches, 2, "n = {n}");
+            }
+            let (converged, _) = run(false, false, 1e-4, 300);
+            let (not_yet, _) = run(false, false, 1e-4, 3);
+            assert_ne!(converged, not_yet);
+        }
+    }
 }

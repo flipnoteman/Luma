@@ -11,6 +11,16 @@
 //! next (see `GateLoop`). A step that cannot be replayed (it reads back, spans several buffers,
 //! ...) runs on the host instead, with the same stop rule evaluated by `eval_host`; both
 //! evaluations agree.
+//!
+//! With one record that is a reduction of one array expression (a norm, a sum, a maximum), the
+//! record of the state a step reads is traced together with the step, so that the step's launch
+//! stores the next state and reduces the record in one program, which shares what the two
+//! compute (the record of step `j` is then the output of launch `j`, and the loop makes one launch
+//! more than it has steps, whose result nobody sees: see `GateLoop`). Where a reduction finishes
+//! in its first launch (CUDA and CPU, see `Tuning::single_pass_reduce`) and the step does not read
+//! its index, the last workgroup of that launch also runs the gate: a step is one launch. Several
+//! records, or records that are not one reduction, keep the records after the step and the gate as
+//! a launch of its own; the values are the same.
 
 use std::fmt::Write as _;
 use std::marker::PhantomData;
@@ -21,6 +31,8 @@ use std::sync::Arc;
 use luma_core::{Buffer, BufferUsage, Dispatch, ExecGraph};
 
 use crate::array::{Array, Failure, Storage};
+use crate::builtin::{GATE_BINDINGS, GATE_STOPPED, GateId};
+use crate::gpu_type::GpuType;
 use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::{LumaError, Result};
 use crate::fields::Fields;
@@ -451,17 +463,23 @@ fn eval_host(cond: &Cond, histories: &[Vec<f32>], steps_done: usize) -> bool {
     }
 }
 
-fn stat_source(stat: &Stat) -> String {
+/// The source of `stat` in the gate. Constants are not part of it: the `k`th one is read from the
+/// gate's state (`st[GATE_STATE_WORDS + k]`, see `GateLoop::drive`) and pushed to `constants`, so
+/// that a threshold that differs from one run to the next does not make another kernel.
+fn stat_source(stat: &Stat, constants: &mut Vec<f32>) -> String {
     match &*stat.0 {
-        StatNode::Const(c) => format!("bitcast<f32>({}u)", c.to_bits()),
+        StatNode::Const(c) => {
+            constants.push(*c);
+            format!("bitcast<f32>(st[{}u])", GATE_STATE_WORDS as usize + constants.len() - 1)
+        }
         StatNode::Last(r) => format!("v{r}"),
-        StatNode::First(r) => format!("hist[{r}u * p.max_steps]"),
+        StatNode::First(r) => format!("hist[{r}u * st[5u]]"),
         StatNode::Peak(r) => format!("agg[{}u]", 2 * r),
         StatNode::Trough(r) => format!("agg[{}u]", 2 * r + 1),
-        StatNode::WindowMax(r, k) => format!("wmax(i, {r}u, {k}u)"),
-        StatNode::WindowMin(r, k) => format!("wmin(i, {r}u, {k}u)"),
-        StatNode::WindowMean(r, k) => format!("wmean(i, {r}u, {k}u)"),
-        StatNode::Prev(r, back) => format!("hist[{r}u * p.max_steps + (i - min({back}u, i))]"),
+        StatNode::WindowMax(r, k) => format!("lg_wmax(i, {r}u, {k}u)"),
+        StatNode::WindowMin(r, k) => format!("lg_wmin(i, {r}u, {k}u)"),
+        StatNode::WindowMean(r, k) => format!("lg_wmean(i, {r}u, {k}u)"),
+        StatNode::Prev(r, back) => format!("hist[{r}u * st[5u] + (i - min({back}u, i))]"),
         StatNode::Step => "f32(i + 1u)".to_string(),
         StatNode::Bin(op, a, b) => {
             let symbol = match op {
@@ -470,13 +488,14 @@ fn stat_source(stat: &Stat) -> String {
                 Arith::Mul => "*",
                 Arith::Div => "/",
             };
-            format!("({} {symbol} {})", stat_source(a), stat_source(b))
+            let (a, b) = (stat_source(a, constants), stat_source(b, constants));
+            format!("({a} {symbol} {b})")
         }
-        StatNode::Abs(a) => format!("abs({})", stat_source(a)),
+        StatNode::Abs(a) => format!("abs({})", stat_source(a, constants)),
     }
 }
 
-fn cond_source(cond: &Cond) -> String {
+fn cond_source(cond: &Cond, constants: &mut Vec<f32>) -> String {
     match &*cond.0 {
         CondNode::Cmp(op, a, b) => {
             let symbol = match op {
@@ -486,21 +505,114 @@ fn cond_source(cond: &Cond) -> String {
                 Compare::Ge => ">=",
             };
             // A comparison with a NaN never holds, even where fast math ignores NaNs.
-            let (a, b) = (stat_source(a), stat_source(b));
-            format!("(!isn({a}) && !isn({b}) && ({a} {symbol} {b}))")
+            let (a, b) = (stat_source(a, constants), stat_source(b, constants));
+            format!("(!lg_isn({a}) && !lg_isn({b}) && ({a} {symbol} {b}))")
         }
-        CondNode::And(a, b) => format!("({} && {})", cond_source(a), cond_source(b)),
-        CondNode::Or(a, b) => format!("({} || {})", cond_source(a), cond_source(b)),
-        CondNode::Not(a) => format!("!{}", cond_source(a)),
+        CondNode::And(a, b) => {
+            let (a, b) = (cond_source(a, constants), cond_source(b, constants));
+            format!("({a} && {b})")
+        }
+        CondNode::Or(a, b) => {
+            let (a, b) = (cond_source(a, constants), cond_source(b, constants));
+            format!("({a} || {b})")
+        }
+        CondNode::Not(a) => format!("!{}", cond_source(a, constants)),
     }
 }
 
-/// The gate kernel run after every step: records the scalars, evaluates the conditions and
-/// either copies the dispatch arguments of the next step from the template or zeroes them. It
-/// counts the steps itself (`st[1]`), so that its launch is the same for every step.
-fn gate_source(records: usize, conds: &[Cond]) -> String {
+/// Words of the gate's state buffer `st` before the constants of the stop rule:
+/// `[stopped, steps, reason, words, own, max_steps, 0, 0]` (`words` those of the plan's dispatch
+/// arguments, `own` the launch that keeps its workgroups once the loop stopped, `max_steps` the
+/// stride of the history).
+const GATE_STATE_WORDS: u64 = 8;
+
+/// The WGSL of the gate, over the buffers `st`, `args` (the dispatch arguments of the next step,
+/// written), `tmpl` (their template), `hist`, `agg` and `stepv`: `luma_gate(v0, v1, ..)` takes
+/// the recorded scalars, stores them, evaluates the conditions and either copies the template to
+/// `args` or, once one holds, zeroes it (but for the launch `st[4]`); `luma_stopped()` is what a
+/// gate run after the loop stopped does. It counts the steps itself (`st[1]`), so that its launch
+/// is the same for every step. `shifted` for the records of the state a step *reads* (the
+/// launch `j` of the loop records step `j`, and the launch 0, which reads the initial state,
+/// records nothing: see [`GateLoop`]); else the launch `i` records step `i + 1`.
+fn gate_logic(records: usize, conds: &[Cond], shifted: bool) -> (String, Vec<f32>) {
+    let mut constants = Vec::new();
     let mut s = String::new();
-    s.push_str("struct Params { words: u32, max_steps: u32, _pad0: u32, _pad1: u32 }\n");
+    s.push_str(
+        "fn lg_isn(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
+fn lg_fmax(a: f32, b: f32) -> f32 { return select(select(max(a, b), a, lg_isn(a)), b, lg_isn(b)); }
+fn lg_fmin(a: f32, b: f32) -> f32 { return select(select(min(a, b), a, lg_isn(a)), b, lg_isn(b)); }
+fn lg_wmax(i: u32, r: u32, k: u32) -> f32 {
+    var m = hist[r * st[5u] + i];
+    for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = lg_fmax(m, hist[r * st[5u] + j]); }
+    return m;
+}
+fn lg_wmin(i: u32, r: u32, k: u32) -> f32 {
+    var m = hist[r * st[5u] + i];
+    for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = lg_fmin(m, hist[r * st[5u] + j]); }
+    return m;
+}
+fn lg_wmean(i: u32, r: u32, k: u32) -> f32 {
+    let n = min(k, i + 1u);
+    var s = 0.0;
+    var bad = false;
+    for (var j = i + 1u - n; j <= i; j++) {
+        let v = hist[r * st[5u] + j];
+        bad = bad || lg_isn(v);
+        s += v;
+    }
+    return select(s / f32(n), bitcast<f32>(0x7fc00000u), bad);
+}
+",
+    );
+    let params: Vec<String> = (0..records).map(|r| format!("v{r}: f32")).collect();
+    let _ = writeln!(s, "fn luma_gate({}) {{", params.join(", "));
+    if shifted {
+        // Launch 0 reads the initial state: nothing to record, only the next launch to set up.
+        s.push_str(
+            "    let j = st[1u];
+    if (j == 0u) {
+        st[1u] = 1u;
+        for (var w = 0u; w < st[3u]; w++) { args[w] = tmpl[w]; }
+        stepv[0u] = 1.0;
+        return;
+    }
+    let i = j - 1u;
+",
+        );
+    } else {
+        s.push_str("    let i = st[1u];\n");
+    }
+    if records == 0 {
+        // Every binding must be used for the argument numbering to be reflected.
+        s.push_str("    hist[0u] = hist[0u];\n    agg[0u] = agg[0u];\n");
+    }
+    for r in 0..records {
+        let _ = writeln!(s, "    hist[{r}u * st[5u] + i] = v{r};");
+        let _ = writeln!(s, "    agg[{}u] = lg_fmax(agg[{}u], v{r});", 2 * r, 2 * r);
+        let _ = writeln!(s, "    agg[{}u] = lg_fmin(agg[{}u], v{r});", 2 * r + 1, 2 * r + 1);
+    }
+    s.push_str("    var reason = 0u;\n");
+    for (c, cond) in conds.iter().enumerate() {
+        let _ = writeln!(s, "    if (reason == 0u && {}) {{ reason = {}u; }}", cond_source(cond, &mut constants), c + 1);
+    }
+    // The step count the next gate starts from: one past this step's, unless the loop stops here.
+    let (count, next_step) = if shifted { ("select(i + 2u, i + 1u, reason != 0u)", "f32(i + 2u)") } else { ("i + 1u", "f32(i + 1u)") };
+    let _ = write!(
+        s,
+        "    st[1u] = {count};
+    if (reason != 0u) {{ st[0u] = 1u; st[2u] = reason; }}
+    for (var w = 0u; w < st[3u]; w++) {{ args[w] = select(tmpl[w], 0u, reason != 0u && w / 3u != st[4u]); }}
+    stepv[0u] = {next_step};
+}}
+"
+    );
+    (s, constants)
+}
+
+/// The gate as a kernel of its own, run after the step: the bindings of `gate_logic`, then the
+/// recorded scalars `rec0..`, which it reads. Returns the constants of the stop rule too.
+fn gate_source(records: usize, conds: &[Cond], shifted: bool) -> (String, Vec<f32>) {
+    let mut s = String::new();
     s.push_str("@group(1) @binding(0) var<storage, read_write> st: array<u32>;\n");
     s.push_str("@group(1) @binding(1) var<storage, read_write> args: array<u32>;\n");
     s.push_str("@group(1) @binding(2) var<storage, read> tmpl: array<u32>;\n");
@@ -510,64 +622,24 @@ fn gate_source(records: usize, conds: &[Cond]) -> String {
     for r in 0..records {
         let _ = writeln!(s, "@group(1) @binding({}) var<storage, read> rec{r}: array<f32>;", 6 + r);
     }
-    let _ = writeln!(s, "@group(1) @binding({}) var<uniform> p: Params;", 6 + records);
-    s.push_str(
-        "fn isn(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
-fn fmax(a: f32, b: f32) -> f32 { return select(select(max(a, b), a, isn(a)), b, isn(b)); }
-fn fmin(a: f32, b: f32) -> f32 { return select(select(min(a, b), a, isn(a)), b, isn(b)); }
-fn wmax(i: u32, r: u32, k: u32) -> f32 {
-    var m = hist[r * p.max_steps + i];
-    for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = fmax(m, hist[r * p.max_steps + j]); }
-    return m;
-}
-fn wmin(i: u32, r: u32, k: u32) -> f32 {
-    var m = hist[r * p.max_steps + i];
-    for (var j = i + 1u - min(k, i + 1u); j < i; j++) { m = fmin(m, hist[r * p.max_steps + j]); }
-    return m;
-}
-fn wmean(i: u32, r: u32, k: u32) -> f32 {
-    let n = min(k, i + 1u);
-    var s = 0.0;
-    var bad = false;
-    for (var j = i + 1u - n; j <= i; j++) {
-        let v = hist[r * p.max_steps + j];
-        bad = bad || isn(v);
-        s += v;
-    }
-    return select(s / f32(n), bitcast<f32>(0x7fc00000u), bad);
-}
-@compute @workgroup_size(1)
-fn main() {
-    if (st[0] != 0u) {
-        for (var w = 0u; w < p.words; w++) { args[w] = 0u; }
+    let (logic, constants) = gate_logic(records, conds, shifted);
+    s.push_str(&logic);
+    s.push_str(GATE_STOPPED);
+    let values: Vec<String> = (0..records).map(|r| format!("rec{r}[0u]")).collect();
+    let _ = write!(
+        s,
+        "@compute @workgroup_size(1)
+fn main() {{
+    if (st[0u] != 0u) {{
+        luma_stopped();
         return;
-    }
-    let i = st[1];
+    }}
+    luma_gate({});
+}}
 ",
+        values.join(", ")
     );
-    if records == 0 {
-        // Every binding must be used for the argument numbering to be reflected.
-        s.push_str("    hist[0] = hist[0];\n    agg[0] = agg[0];\n");
-    }
-    for r in 0..records {
-        let _ = writeln!(s, "    let v{r} = rec{r}[0];");
-        let _ = writeln!(s, "    hist[{r}u * p.max_steps + i] = v{r};");
-        let _ = writeln!(s, "    agg[{}u] = fmax(agg[{}u], v{r});", 2 * r, 2 * r);
-        let _ = writeln!(s, "    agg[{}u] = fmin(agg[{}u], v{r});", 2 * r + 1, 2 * r + 1);
-    }
-    s.push_str("    var reason = 0u;\n");
-    for (c, cond) in conds.iter().enumerate() {
-        let _ = writeln!(s, "    if (reason == 0u && {}) {{ reason = {}u; }}", cond_source(cond), c + 1);
-    }
-    s.push_str(
-        "    st[1] = i + 1u;
-    if (reason != 0u) { st[0] = 1u; st[2] = reason; }
-    for (var w = 0u; w < p.words; w++) { args[w] = select(tmpl[w], 0u, reason != 0u); }
-    stepv[0] = f32(i + 1u);
-}
-",
-    );
-    s
+    (s, constants)
 }
 
 /// What the words of the gate's state say: the steps that ran and why the loop stopped. The gate
@@ -676,33 +748,33 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
 
     // Trace one step.
     let mut trace = None;
-    let (next, recs) = if single {
+    let constants = gate_logic(0, &conds, false).1;
+    let mut gate_buffers = if single { fold_buffers(&ctx, until, constants.len()) } else { None };
+    let (next, records) = if single {
         let (started, probes) = Trace::start(&arrays)?;
         trace = Some(started);
         let probes: S = state_from(probes);
         let next = step(&probes, &stepv);
-        // The records read the new state (a residual of it, through slices): evaluated first, they
-        // read its buffers instead of recomputing the step at every index they read.
-        jit::force(&next.arrays())?;
-        let recs = apply_records(&next)?;
-        (next, recs)
+        let records = trace_records(&ctx, until, &shapes, &probes, &next, &stepv, &conds, gate_buffers.as_ref())?;
+        (next, records)
     } else {
         let next = step(&init, &stepv);
         jit::force(&next.arrays())?;
         let recs = apply_records(&next)?;
-        (next, recs)
+        (next, Records::After(recs))
     };
     drop(arrays);
 
     let plan = {
         jit::force(&next.arrays())?;
-        jit::force(&recs.iter().collect::<Vec<_>>())?;
+        records.force()?;
         trace.as_mut().and_then(Trace::finish_plan)
     };
 
-    let stepper = match (plan, trace.as_ref()) {
-        (Some(plan), Some(trace)) => gated(&ctx, plan, trace, &next, &recs, until.max_steps),
-        _ => Err(None),
+    let rec_storages = records.storages();
+    let stepper = match (plan, trace.as_ref(), &rec_storages) {
+        (Some(plan), Some(trace), Some(storages)) => gated(&ctx, plan, trace, &next, storages, until.max_steps, records.fold()),
+        (plan, _, _) => Err(plan.map(Box::new)),
     };
     let stepper = match stepper {
         Ok(stepper) => Some(stepper),
@@ -714,22 +786,22 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
         }
     };
 
-    if let Some(stepper) = stepper {
-        let rec_storages = recs
-            .iter()
-            .map(|rec| rec.storage().cloned())
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let gate =
-            ctx.jit()
-                .stencil_kernel(&ctx, gate_source(recs.len(), &conds), "UntilAllGate")?;
-        let mut gate_loop = GateLoop::new(&ctx, stepper, gate, conds.len(), stepv, rec_storages, until.max_steps)?;
+    if let (Some(stepper), Some(rec_storages)) = (stepper, rec_storages) {
+        let gate = gate_kernel(&ctx, &conds, rec_storages.len(), &records)?;
+        let spec = Spec { conditions: conds.len(), capacity: until.max_steps, fused: records.fused(), fold: records.fold(), constants };
+        let mut gate_loop = GateLoop::new(&ctx, stepper, gate, stepv, rec_storages, spec, gate_buffers.take())?;
         return gate_loop.run(&shapes, names, until.max_steps, until.check_every, false);
     }
 
     // The host loop.
     let mut histories: Vec<Vec<f32>> = vec![Vec::new(); until.records.len()];
     let mut state = init;
-    let mut first = Some((next, recs));
+    let first_records = match records {
+        Records::After(recs) => recs,
+        // The step's launch reduced the record of the state it read: the new state's is not there.
+        Records::Fused { .. } => apply_records(&next)?,
+    };
+    let mut first = Some((next, first_records));
     let mut reason = StopReason::MaxSteps;
     let mut steps = 0;
     for t in 0..until.max_steps {
@@ -760,20 +832,24 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
 }
 
 /// Makes a stepper of the traced plan if the gate can drive it; `Err` gives the plan back (if
-/// any) to be run once.
+/// any) to be run once. `fold` is the launch of the plan that runs the gate, if it was folded in.
 #[allow(clippy::result_large_err)]
 fn gated(
     ctx: &Context,
     plan: Plan,
     trace: &Trace,
     next: &impl Fields,
-    recs: &[Array<f32>],
+    recs: &[Arc<Storage>],
     max_steps: usize,
+    fold: Option<usize>,
 ) -> std::result::Result<Stepper, Option<Box<Plan>>> {
     let records = recs.len();
-    let fits = recs.iter().all(|rec| rec.storage().is_ok_and(|storage| storage.segments() == 1))
+    let fits = recs.iter().all(|rec| rec.segments() == 1)
         && 6 + records <= ctx.jit().max_inputs() + 1
-        && (records.max(1) * max_steps * 4) as u64 <= ctx.max_buffer_bytes();
+        && (records.max(1) * max_steps * 4) as u64 <= ctx.max_buffer_bytes()
+        // The buffers a folded gate names were made for plans up to this many launches, and what
+        // it rewrites (the dispatch arguments of the next launch) is read by the launches after it.
+        && fold.is_none_or(|own| plan.launches() <= FOLD_LAUNCHES && own + 1 == plan.launches());
     if !fits {
         return Err(Some(Box::new(plan)));
     }
@@ -801,6 +877,12 @@ fn records_of<S: Fields>(
         }
         recs.push(value);
     }
+    check_shapes(next, shapes)?;
+    Ok(recs)
+}
+
+/// Whether the arrays of `next` have the shapes the state started with.
+fn check_shapes<S: Fields>(next: &S, shapes: &[Shape]) -> Outcome<()> {
     for (a, shape) in next.arrays().into_iter().zip(shapes) {
         if a.shape() != *shape {
             return Err(Failure::New(LumaError::ShapeMismatch {
@@ -809,7 +891,130 @@ fn records_of<S: Fields>(
             }));
         }
     }
-    Ok(recs)
+    Ok(())
+}
+
+// Tests: the launches of the last traced step (see `crate::jit::SEPARATE_GATE` and `SEPARATE_RECORD` for
+// running the gate as a launch of its own, and tracing the record after the step).
+#[cfg(test)]
+thread_local! {
+    /// Launches of the plan of the last loop that was traced, and the launch that runs its gate if folded.
+    pub(crate) static LAST_PLAN: std::cell::Cell<Option<(usize, Option<usize>)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Launches of a traced step that the buffers of a folded gate are made for (three words of
+/// dispatch arguments each).
+const FOLD_LAUNCHES: usize = 256;
+
+/// How the records of a traced step are computed.
+enum Records {
+    /// Reductions of the new state, evaluated after the step (the general case).
+    After(Vec<Array<f32>>),
+    /// The one record, of the state the step reads, reduced by a launch of the step itself into
+    /// `value`, so that the record of step `j` is the output of launch `j` (see [`GateLoop`]).
+    /// With `fold` that launch also runs the gate.
+    Fused { value: Arc<Storage>, fold: Option<usize> },
+}
+
+impl Records {
+    fn force(&self) -> Outcome<()> {
+        match self {
+            Records::After(recs) => jit::force(&recs.iter().collect::<Vec<_>>()).map(drop),
+            Records::Fused { .. } => Ok(()),
+        }
+    }
+
+    /// The buffers the records are in, `None` if some failed.
+    fn storages(&self) -> Option<Vec<Arc<Storage>>> {
+        match self {
+            Records::After(recs) => recs.iter().map(|rec| rec.storage().ok().cloned()).collect(),
+            Records::Fused { value, .. } => Some(vec![Arc::clone(value)]),
+        }
+    }
+
+    fn fused(&self) -> bool {
+        matches!(self, Records::Fused { .. })
+    }
+
+    fn fold(&self) -> Option<usize> {
+        match self {
+            Records::Fused { fold, .. } => *fold,
+            Records::After(_) => None,
+        }
+    }
+}
+
+/// Evaluates the step `next` (traced from the state `probes`) and its records: the one record
+/// of the state the step reads goes into the step's own launch where it can (and the gate with it,
+/// given `buffers`), else the records of the new state are evaluated after it. A step that writes
+/// an array it captured keeps its records after it: the launch of the step that finds the loop
+/// stopped runs in full, so the writes would be applied once more than the steps there are.
+#[allow(clippy::too_many_arguments)]
+fn trace_records<S: Fields>(
+    ctx: &Context,
+    until: &Until<'_, S>,
+    shapes: &[Shape],
+    probes: &S,
+    next: &S,
+    stepv: &Array<f32>,
+    conds: &[Cond],
+    buffers: Option<&GateBuffers>,
+) -> Outcome<Records> {
+    if until.records.len() == 1 && !ctx.recording_writes_outside() {
+        check_shapes(next, shapes)?;
+        if let Some(rec) = records_of(until, shapes, probes)?.pop() {
+            let value = Arc::new(Storage::new(ctx, 1, <f32 as GpuType>::LAYOUT));
+            let pin = value.pin(0)?;
+            let stepv_storage = stepv.storage()?;
+            let step_pin = stepv_storage.pin_quiet(0)?;
+            // A launch that is not recorded runs the gate for real, on the state of this run: only
+            // a recorded one is replayed (with that state set up, see `GateLoop::drive`).
+            let args = buffers.filter(|_| ctx.recording_here()).and_then(|buffers| buffers.fold_args(step_pin.buffer()));
+            let gate = args.as_ref().map(|args| jit::FoldGate { id: GateId::register(&gate_logic(1, conds, true).0), args, stepv: stepv_storage.id() });
+            if let Some(grouped) = jit::force_with_record(ctx, &next.arrays(), &rec, pin.buffer(), gate) {
+                return Ok(Records::Fused { value, fold: grouped?.folded });
+            }
+        }
+    }
+    // The records read the new state (a residual of it, through slices): evaluated first, they
+    // read its buffers instead of recomputing the step at every index they read.
+    jit::force(&next.arrays())?;
+    Ok(Records::After(records_of(until, shapes, next)?))
+}
+
+/// The buffers of a gate folded into the step's last launch, which the recorded commands name:
+/// made before the step is traced, for [`FOLD_LAUNCHES`] launches and the `constants` of the stop
+/// rule, with `None` if it cannot be.
+fn fold_buffers<S: Fields>(ctx: &Context, until: &Until<'_, S>, constants: usize) -> Option<GateBuffers> {
+    #[cfg(test)]
+    if crate::jit::SEPARATE_GATE.with(std::cell::Cell::get) {
+        return None;
+    }
+    if until.records.len() != 1 || !ctx.tuning().single_pass_reduce {
+        return None;
+    }
+    GateBuffers::new(ctx, 1, until.max_steps, 3 * FOLD_LAUNCHES, constants, true).ok()
+}
+
+/// The gate's kernel, unless the step's last launch runs the gate.
+fn gate_kernel(ctx: &Context, conds: &[Cond], records: usize, traced: &Records) -> Outcome<Option<Arc<KernelCore>>> {
+    if traced.fold().is_some() {
+        return Ok(None);
+    }
+    Ok(Some(ctx.jit().stencil_kernel(ctx, gate_source(records, conds, traced.fused()).0, "UntilAllGate")?))
+}
+
+/// What distinguishes the loops a [`GateLoop`] runs.
+struct Spec {
+    conditions: usize,
+    /// Steps the history has room for: its stride.
+    capacity: usize,
+    /// Whether the records are those of the states the launches read (see [`Records::Fused`]).
+    fused: bool,
+    /// The launch of the plan that runs the gate, if it does.
+    fold: Option<usize>,
+    /// The constants of the stop rule, in the order of its source (see [`stat_source`]).
+    constants: Vec<f32>,
 }
 
 /// Allocates a buffer from `ctx`'s pool and notes it in `owned`, to be given back, and in `held`,
@@ -821,25 +1026,133 @@ fn take(ctx: &Context, owned: &mut Vec<Buffer>, held: &mut Accounted, bytes: u64
     Ok(buffer)
 }
 
+/// The buffers the gate works in, taken from the pool and given back with the loop.
+struct GateBuffers {
+    ctx: Context,
+    /// The template of the dispatch arguments on the device, `words` of them at most.
+    tmpl: Buffer,
+    /// The gate's state, see [`GATE_STATE_WORDS`], then the constants of the stop rule.
+    st: Buffer,
+    /// The recorded scalars, `capacity` per record.
+    hist: Buffer,
+    /// The peak and trough of every record.
+    agg: Buffer,
+    /// Stands for the dispatch arguments of the next step in the commands of a plan whose last
+    /// launch runs the gate (see [`Spec::fold`]).
+    next_args: Option<Buffer>,
+    /// Words of the template and of every buffer of dispatch arguments.
+    words: usize,
+    /// Words of `st`.
+    state_words: usize,
+    records: usize,
+    capacity: usize,
+    /// Everything taken from the pool, to be given back.
+    owned: Vec<Buffer>,
+    /// Counts the bytes of `owned` while the loop lives.
+    #[allow(dead_code)]
+    held: Accounted,
+}
+
+impl GateBuffers {
+    /// Buffers for a loop of `records` scalars and at most `capacity` steps, whose plan has `words` words of
+    /// dispatch arguments and whose stop rule has `constants` constants; with `next_args` a placeholder
+    /// for the arguments the folded gate writes.
+    fn new(ctx: &Context, records: usize, capacity: usize, words: usize, constants: usize, next_args: bool) -> Result<GateBuffers> {
+        let records = records.max(1);
+        let state_words = GATE_STATE_WORDS as usize + constants;
+        let mut owned = Vec::new();
+        let mut held = Accounted::new(ctx, 0);
+        let made = (|| -> Result<(Buffer, Buffer, Buffer, Buffer, Option<Buffer>)> {
+            let tmpl = take(ctx, &mut owned, &mut held, words as u64 * 4, STORAGE_USAGE)?;
+            let st = take(ctx, &mut owned, &mut held, state_words as u64 * 4, STORAGE_USAGE)?;
+            let hist = take(ctx, &mut owned, &mut held, (records * capacity) as u64 * 4, STORAGE_USAGE)?;
+            let agg = take(ctx, &mut owned, &mut held, 2 * records as u64 * 4, STORAGE_USAGE)?;
+            let next = if next_args { Some(take(ctx, &mut owned, &mut held, words as u64 * 4, STORAGE_USAGE | BufferUsage::INDIRECT)?) } else { None };
+            Ok((tmpl, st, hist, agg, next))
+        })();
+        // A gate that runs in a launch that was not recorded finds nothing to do in a state of zeros.
+        let made = made.and_then(|(tmpl, st, hist, agg, next)| ctx.upload(&st, bytemuck::cast_slice(&vec![0u32; state_words])).map(|()| (tmpl, st, hist, agg, next)));
+        match made {
+            Ok((tmpl, st, hist, agg, next_args)) => Ok(GateBuffers { ctx: ctx.clone(), tmpl, st, hist, agg, next_args, words, state_words, records, capacity, owned, held }),
+            Err(error) => {
+                for buffer in owned {
+                    ctx.recycle(buffer);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn args_bytes(&self) -> u64 {
+        self.words as u64 * 4
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_words as u64 * 4
+    }
+
+    fn hist_bytes(&self) -> u64 {
+        (self.records * self.capacity) as u64 * 4
+    }
+
+    fn agg_bytes(&self) -> u64 {
+        2 * self.records as u64 * 4
+    }
+
+    /// The arguments a gate folded into a launch binds, in the order of its bindings (see
+    /// `builtin::reduce_main`): `None` without the placeholder of the next dispatch arguments.
+    fn fold_args<'a>(&'a self, stepv: &'a Buffer) -> Option<[RawArg<'a>; GATE_BINDINGS]> {
+        let next = self.next_args.as_ref()?;
+        Some([
+            RawArg::write(&self.st, self.state_bytes()),
+            RawArg::write(next, self.args_bytes()),
+            RawArg::read(&self.tmpl, self.args_bytes()),
+            RawArg::write(&self.hist, self.hist_bytes()),
+            RawArg::write(&self.agg, self.agg_bytes()),
+            RawArg::write(stepv, 4),
+        ])
+    }
+}
+
+impl Drop for GateBuffers {
+    fn drop(&mut self) {
+        for buffer in self.owned.drain(..) {
+            self.ctx.recycle(buffer);
+        }
+    }
+}
+
 /// The device side of a gated loop: the traced step, the gate kernel and the buffers the gate
 /// works in, and the graphs of blocks of steps captured from them.
 ///
-/// Step `i` (0-based) replays the plan with every command dispatched from `args[k]` (`k` counts
-/// from the start of the span of steps being run) at byte `12 * l` for command `l`, then runs
-/// the gate. The gate reads `i` from `st[1]`, records the step's scalars, evaluates the stop
-/// conditions and writes the dispatch arguments of the next step into `args[(k + 1) % len]`
-/// (the template, or zeros once the loop stopped), `len` being the steps of the span. Nothing
-/// in a step depends on the host, so a span of steps from the second on (the first reads the
-/// run's `init`) is the same work every time it runs: it is captured once, keyed by its length
-/// and the parity of its first step (which of the two state buffer sets it reads), and replayed
-/// as one graph. The last gate of a span writes `args[0]`, where the next span starts.
+/// Launch `i` (0-based) replays the plan with every command dispatched from `args[k]` (`k` counts
+/// from the start of the span of launches being run) at byte `12 * l` for command `l`, then runs
+/// the gate. The gate reads the launches it has seen from `st[1]`, records the step's scalars,
+/// evaluates the stop conditions and writes the dispatch arguments of the next launch into
+/// `args[(k + 1) % len]` (the template, or zeros once the loop stopped), `len` being the
+/// launches of the span. Nothing in a launch depends on the host, so a span of launches from the
+/// second on (the first reads the run's `init`) is the same work every time it runs: it is
+/// captured once, keyed by its length and the parity of its first launch (which of the two state
+/// buffer sets it reads), and replayed as one graph. The last gate of a span writes `args[0]`,
+/// where the next span starts.
+///
+/// Launch `i` is step `i + 1`, and the gate after it records step `i + 1`, unless the records
+/// are [fused](Records::Fused): then launch `j` reduces the record of the state it reads, which
+/// is that of step `j` (the state after `j` steps), so the loop makes one launch more than
+/// it has steps and the gate after launch `j` records step `j` and decides whether the loop
+/// stops with the state launch `j` read (the buffers the launch wrote hold a step ahead that no
+/// one sees); the gate after launch 0, which reads `init`, only sets the next launch up. With a
+/// gate [folded](Records::Fused) into the last launch of the plan there is no launch of the gate,
+/// and once the loop stopped that launch keeps its workgroups (which leave at once, workgroup 0
+/// after it wrote the zeros of the next dispatch arguments) so as to pass the stop on.
 ///
 /// The buffers outlive a run, so a [`CompiledUntil`] replays its graphs run after run; they are
 /// forgotten when a buffer they name is replaced.
 struct GateLoop {
     ctx: Context,
     stepper: Stepper,
-    gate: Arc<KernelCore>,
+    /// The gate as a launch of its own, unless it is folded into the plan.
+    gate: Option<Arc<KernelCore>>,
     conditions: usize,
     /// Steps the history has room for: its stride.
     capacity: usize,
@@ -852,24 +1165,16 @@ struct GateLoop {
     step_pin: Pin,
     /// The workgroup counts of every launch of the plan, three words each.
     template: Vec<u32>,
-    /// The gate's uniform: `[words, capacity, 0, 0]`.
-    uniform: [u32; 4],
-    /// The template on the device.
-    tmpl: Buffer,
-    /// `[stopped, steps run, reason, 0]`.
-    st: Buffer,
-    /// The recorded scalars, `capacity` per record.
-    hist: Buffer,
-    /// The peak and trough of every record.
-    agg: Buffer,
-    /// Dispatch arguments, as many as the longest span of steps run so far.
+    /// Whether the records are those of the states the launches read.
+    fused: bool,
+    /// The launch of the plan that runs the gate, if it does.
+    fold: Option<usize>,
+    /// The constants of the stop rule as the words of the gate's state.
+    constants: Vec<u32>,
+    buffers: GateBuffers,
+    /// Dispatch arguments, as many as the longest span of launches run so far.
     args: Vec<Buffer>,
-    /// Everything taken from the pool, to be given back.
-    owned: Vec<Buffer>,
-    /// Counts the bytes of `owned` while the loop lives.
-    #[allow(dead_code)]
-    held: Accounted,
-    /// Captured spans of steps, by (steps, whether the first is an even step).
+    /// Captured spans of launches, by (launches, whether the first is an even launch).
     graphs: GraphCache<(usize, bool)>,
     /// A compiled loop is run again and again: its spans are captured on first use. A one-shot
     /// loop's are captured the second time a span runs (its first spans run once).
@@ -877,60 +1182,45 @@ struct GateLoop {
 }
 
 impl GateLoop {
-    /// A loop of `stepper` under `gate` (made for `recs`) that runs at most `capacity` steps.
+    /// A loop of `stepper` under `gate` (made for `recs`, none if it is folded into the plan),
+    /// in the buffers the folded gate named if it was, else new ones.
     fn new(
         ctx: &Context,
         stepper: Stepper,
-        gate: Arc<KernelCore>,
-        conditions: usize,
+        gate: Option<Arc<KernelCore>>,
         stepv: Array<f32>,
         recs: Vec<Arc<Storage>>,
-        capacity: usize,
+        spec: Spec,
+        buffers: Option<GateBuffers>,
     ) -> Outcome<GateLoop> {
         let template = stepper.plan().template();
-        let words = u32::try_from(template.len())
-            .map_err(|_| LumaError::Gpu("too many recorded launches".into()))?;
+        u32::try_from(template.len()).map_err(|_| LumaError::Gpu("too many recorded launches".into()))?;
         let rec_pins = recs.iter().map(|rec| rec.pin_quiet(0)).collect::<Result<Vec<_>>>()?;
         let step_pin = stepv.storage()?.pin_quiet(0)?;
-        let records = recs.len().max(1);
-        let mut owned = Vec::new();
-        let mut held = Accounted::new(ctx, 0);
-        let made = (|| -> Result<[Buffer; 4]> {
-            let tmpl = take(ctx, &mut owned, &mut held, u64::from(words) * 4, STORAGE_USAGE)?;
-            ctx.upload(&tmpl, bytemuck::cast_slice(&template))?;
-            let st = take(ctx, &mut owned, &mut held, 16, STORAGE_USAGE)?;
-            let hist = take(ctx, &mut owned, &mut held, (records * capacity) as u64 * 4, STORAGE_USAGE)?;
-            let agg = take(ctx, &mut owned, &mut held, 2 * records as u64 * 4, STORAGE_USAGE)?;
-            Ok([tmpl, st, hist, agg])
-        })();
-        let [tmpl, st, hist, agg] = match made {
-            Ok(buffers) => buffers,
-            Err(error) => {
-                for buffer in owned {
-                    ctx.recycle(buffer);
-                }
-                return Err(error.into());
-            }
+        let buffers = match buffers {
+            Some(buffers) if buffers.words >= template.len() && buffers.state_words == GATE_STATE_WORDS as usize + spec.constants.len() => buffers,
+            // A folded gate's buffers are for plans of up to `FOLD_LAUNCHES` launches (see `gated`).
+            _ => GateBuffers::new(ctx, recs.len(), spec.capacity, template.len(), spec.constants.len(), false)?,
         };
+        ctx.upload(&buffers.tmpl, bytemuck::cast_slice(&template))?;
+        #[cfg(test)]
+        LAST_PLAN.with(|last| last.set(Some((stepper.plan().launches(), spec.fold))));
         Ok(GateLoop {
             ctx: ctx.clone(),
             stepper,
             gate,
-            conditions,
-            capacity,
+            conditions: spec.conditions,
+            capacity: spec.capacity,
             recs,
             rec_pins,
             stepv,
             step_pin,
             template,
-            uniform: [words, capacity as u32, 0, 0],
-            tmpl,
-            st,
-            hist,
-            agg,
+            fused: spec.fused,
+            fold: spec.fold,
+            constants: spec.constants.iter().map(|c| c.to_bits()).collect(),
+            buffers,
             args: Vec::new(),
-            owned,
-            held,
             graphs: GraphCache::new(ctx),
             compiled: false,
         })
@@ -942,23 +1232,17 @@ impl GateLoop {
         self.stepper.rebind(init)
     }
 
-    fn args_bytes(&self) -> u64 {
-        u64::from(self.uniform[0]) * 4
-    }
-
-    fn hist_bytes(&self) -> u64 {
-        (self.recs.len().max(1) * self.capacity) as u64 * 4
-    }
-
-    fn agg_bytes(&self) -> u64 {
-        2 * self.recs.len().max(1) as u64 * 4
+    /// Launches a run makes for `steps` steps.
+    fn launches(&self, steps: usize) -> usize {
+        steps + usize::from(self.fused)
     }
 
     /// Makes sure `len` dispatch argument buffers exist.
     fn ensure_args(&mut self, len: usize) -> Result<()> {
-        let bytes = self.args_bytes();
+        let bytes = self.buffers.args_bytes();
         while self.args.len() < len {
-            let buffer = take(&self.ctx, &mut self.owned, &mut self.held, bytes, STORAGE_USAGE | BufferUsage::INDIRECT)?;
+            let buffers = &mut self.buffers;
+            let buffer = take(&self.ctx, &mut buffers.owned, &mut buffers.held, bytes, STORAGE_USAGE | BufferUsage::INDIRECT)?;
             self.args.push(buffer);
         }
         Ok(())
@@ -977,20 +1261,29 @@ impl GateLoop {
 
     /// The arguments of the gate launch writing the dispatch arguments of the next step to `next`.
     fn gate_args<'a>(&'a self, next: &'a Buffer, resolved: &'a [Buffer]) -> Vec<RawArg<'a>> {
-        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(7 + resolved.len());
-        raw.push(RawArg::write(&self.st, 16));
-        raw.push(RawArg::write(next, self.args_bytes()));
-        raw.push(RawArg::read(&self.tmpl, self.args_bytes()));
-        raw.push(RawArg::write(&self.hist, self.hist_bytes()));
-        raw.push(RawArg::write(&self.agg, self.agg_bytes()));
+        let buffers = &self.buffers;
+        let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(6 + resolved.len());
+        raw.push(RawArg::write(&buffers.st, buffers.state_bytes()));
+        raw.push(RawArg::write(next, buffers.args_bytes()));
+        raw.push(RawArg::read(&buffers.tmpl, buffers.args_bytes()));
+        raw.push(RawArg::write(&buffers.hist, buffers.hist_bytes()));
+        raw.push(RawArg::write(&buffers.agg, buffers.agg_bytes()));
         raw.push(RawArg::write(self.step_pin.buffer(), 4));
         raw.extend(resolved.iter().map(|buffer| RawArg::read(buffer, 4)));
-        raw.push(RawArg::Uniform(bytemuck::cast_slice(&self.uniform)));
         raw
     }
 
-    /// Steps `i0..i0 + len` launched one by one, the dispatch arguments cycling through
-    /// `args[..len]`.
+    /// `swaps` with the placeholder of the next dispatch arguments (see [`GateBuffers::next_args`])
+    /// standing for `next`, if the gate is folded into the plan.
+    fn with_next(&self, swaps: &[(Buffer, Buffer)], next: &Buffer) -> Vec<(Buffer, Buffer)> {
+        let mut all = swaps.to_vec();
+        if let Some(placeholder) = self.fold.and(self.buffers.next_args.as_ref()) {
+            all.push((placeholder.clone(), next.clone()));
+        }
+        all
+    }
+
+    /// Launches `i0..i0 + len` one by one, the dispatch arguments cycling through `args[..len]`.
     fn replay_span(&self, i0: usize, len: usize) -> Outcome<()> {
         let parities = [self.stepper.subst(2), self.stepper.subst(3)];
         let resolved_parities = [self.resolved(&parities[0]), self.resolved(&parities[1])];
@@ -1005,36 +1298,51 @@ impl GateLoop {
                 Some((s, r)) => (s.as_slice(), r.as_slice()),
                 None => (&parities[t & 1][..], &resolved_parities[t & 1][..]),
             };
-            self.stepper.plan().replay(swaps, Some(&self.args[k]))?;
-            let raw = self.gate_args(&self.args[(k + 1) % len], resolved);
-            launch_1d(&self.ctx, &self.gate, 1, &raw)?;
+            let next = &self.args[(k + 1) % len];
+            match &self.gate {
+                Some(gate) => {
+                    self.stepper.plan().replay(swaps, Some(&self.args[k]))?;
+                    let raw = self.gate_args(next, resolved);
+                    launch_1d(&self.ctx, gate, 1, &raw)?;
+                }
+                None => self.stepper.plan().replay(&self.with_next(swaps, next), Some(&self.args[k]))?,
+            }
         }
         Ok(())
     }
 
-    /// Steps `i0..i0 + len` (`i0 > 0`) as one graph: captured on first use in a compiled loop,
+    /// Launches `i0..i0 + len` (`i0 > 0`) as one graph: captured on first use in a compiled loop,
     /// which runs its spans again and again, else the second time such a span runs (a one-shot
     /// loop's first spans run once); `None` to launch them one by one.
     fn graph(&self, i0: usize, len: usize) -> Result<Option<Arc<dyn ExecGraph>>> {
-        let grid = workgroups_1d(&self.ctx, &self.gate, 1)?;
+        let grid = match &self.gate {
+            Some(gate) => workgroups_1d(&self.ctx, gate, 1)?,
+            None => [1, 1, 1],
+        };
         let key = (len, (i0 + 1).is_multiple_of(2));
         let replays = if self.compiled { jit::PAYING_REPLAYS } else { 1 };
         Ok(self.graphs.get_or_build(key, replays, || {
             let swaps = [self.stepper.subst(2), self.stepper.subst(3)];
             let resolved = [self.resolved(&swaps[0]), self.resolved(&swaps[1])];
+            let steps: Vec<Vec<(Buffer, Buffer)>> = (0..len).map(|k| self.with_next(&swaps[(i0 + k + 1) & 1], &self.args[(k + 1) % len])).collect();
             let mut builder = GraphBuilder::new();
             for k in 0..len {
                 let p = (i0 + k + 1) & 1;
-                builder.plan(self.stepper.plan(), &swaps[p], Some(&self.args[k]));
-                let raw = self.gate_args(&self.args[(k + 1) % len], &resolved[p]);
-                builder.launch(&self.gate, Dispatch::Direct(grid), [1, 1, 1], raw);
+                match &self.gate {
+                    Some(gate) => {
+                        builder.plan(self.stepper.plan(), &swaps[p], Some(&self.args[k]));
+                        let raw = self.gate_args(&self.args[(k + 1) % len], &resolved[p]);
+                        builder.launch(gate, Dispatch::Direct(grid), [1, 1, 1], raw);
+                    }
+                    None => builder.plan(self.stepper.plan(), &steps[k], Some(&self.args[k])),
+                }
             }
             builder.capture(&self.ctx)
         }))
     }
 
-    /// Runs steps `i0..i0 + len` (the first reads `init` when `i0` is 0, and always runs on its own),
-    /// as a graph when the backend has them and nothing needs the launches one by one.
+    /// Runs launches `i0..i0 + len` (the first reads `init` when `i0` is 0, and always runs on its
+    /// own), as a graph when the backend has them and nothing needs the launches one by one.
     fn run_span(&mut self, i0: usize, len: usize) -> Outcome<()> {
         self.ensure_args(len)?;
         if i0 > 0
@@ -1042,34 +1350,38 @@ impl GateLoop {
             && !self.ctx.is_profiling()
             && let Some(graph) = self.graph(i0, len)?
         {
-            let launches = len * (self.stepper.plan().launches() + 1);
+            let launches = len * (self.stepper.plan().launches() + usize::from(self.gate.is_some()));
             self.ctx.launch_graph(&*graph, u32::try_from(launches).unwrap_or(u32::MAX))?;
             return Ok(());
         }
         self.replay_span(i0, len)
     }
 
-    /// Runs the steps of a run, one block of steps between two looks at the gate's state, and
-    /// returns the steps that ran, why the loop stopped and the history.
+    /// Runs the launches of a run of `steps` steps, one block of them between two looks at the
+    /// gate's state, and returns the steps that ran, why the loop stopped and the history.
     fn drive(&mut self, steps: usize, check_every: Option<usize>) -> Outcome<(usize, StopReason, Vec<Vec<f32>>)> {
         let ctx = self.ctx.clone();
         let records = self.recs.len();
+        let total = self.launches(steps);
         // A run starts at step 0 with nothing stopped or aggregated, whatever an earlier run left.
+        let own = self.fold.map_or(u32::MAX, |own| own as u32);
+        let mut state = vec![0, 0, 0, self.template.len() as u32, own, self.capacity as u32, 0, 0];
+        state.extend(&self.constants);
         ctx.upload(self.step_pin.buffer(), bytemuck::cast_slice(&[0.0f32]))?;
-        ctx.upload(&self.st, bytemuck::cast_slice(&[0u32; 4]))?;
+        ctx.upload(&self.buffers.st, bytemuck::cast_slice(&state))?;
         let limits: Vec<f32> = (0..records.max(1)).flat_map(|_| [f32::NEG_INFINITY, f32::INFINITY]).collect();
-        ctx.upload(&self.agg, bytemuck::cast_slice(&limits))?;
+        ctx.upload(&self.buffers.agg, bytemuck::cast_slice(&limits))?;
         self.ensure_args(1)?;
         ctx.upload(&self.args[0], bytemuck::cast_slice(&self.template))?;
 
         let mut base = 0;
         let mut block = check_every.unwrap_or(crate::jit::FIRST_BLOCK);
         loop {
-            let in_block = block.min(steps - base);
+            let in_block = block.min(total - base);
             let end = base + in_block;
             let mut at = base;
             if at == 0 {
-                // The first step reads `init`, which no graph does: a span of its own, whose gate
+                // The first launch reads `init`, which no graph does: a span of its own, whose gate
                 // writes `args[0]` for the rest.
                 self.run_span(0, 1)?;
                 at = 1;
@@ -1077,19 +1389,19 @@ impl GateLoop {
             if end > at {
                 self.run_span(at, end - at)?;
             }
-            let [done, count, reason, _] = ctx.read::<u32>(&self.st, 16)?[..] else {
+            let [done, count, reason, ..] = ctx.read::<u32>(&self.buffers.st, self.buffers.state_bytes())?[..] else {
                 return Err(Failure::New(LumaError::Gpu("iterate_until_all state is missing".into())));
             };
             base = end;
             block = crate::jit::next_block(in_block, check_every);
-            if done != 0 || base >= steps {
-                let (ran, reason) = gate_outcome(done, count, reason, base, steps, self.conditions)?;
+            if done != 0 || base >= total {
+                let (ran, reason) = gate_outcome(done, count, reason, base - usize::from(self.fused), steps, self.conditions)?;
                 let histories = if records == 0 {
                     Vec::new()
                 } else {
                     // Record `r` has its values at `r * capacity`: read up to the last one wanted.
                     let wanted = ((records - 1) * self.capacity + ran) as u64 * 4;
-                    let all = ctx.read::<f32>(&self.hist, wanted)?;
+                    let all = ctx.read::<f32>(&self.buffers.hist, wanted)?;
                     (0..records).map(|r| all[r * self.capacity..r * self.capacity + ran].to_vec()).collect()
                 };
                 return Ok((ran, reason, histories));
@@ -1148,11 +1460,8 @@ impl GateLoop {
 
 impl Drop for GateLoop {
     fn drop(&mut self) {
-        // The graphs name the buffers: they go first.
+        // The graphs name the buffers (given back when the fields go): they go first.
         self.graphs.clear();
-        for buffer in self.owned.drain(..) {
-            self.ctx.recycle(buffer);
-        }
     }
 }
 
@@ -1310,24 +1619,20 @@ fn compile<S: Fields>(
     let conds: Vec<Cond> = until.stops.iter().map(|stop| stop(&history)).collect();
 
     let stepv = Array::<f32>::from_slice_on(&ctx, &[0.0], 1)?;
+    let constants = gate_logic(0, &conds, false).1;
+    let mut gate_buffers = fold_buffers(&ctx, until, constants.len());
     let (mut trace, probes) = Trace::start(&arrays)?;
     let probes: S = state_from(probes);
     let next = step(&probes, &stepv);
+    let records = trace_records(&ctx, until, &shapes, &probes, &next, &stepv, &conds, gate_buffers.as_ref())?;
     jit::force(&next.arrays())?;
-    let recs = records_of(until, &shapes, &next)?;
-    jit::force(&next.arrays())?;
-    jit::force(&recs.iter().collect::<Vec<_>>())?;
+    records.force()?;
     let plan = trace.finish_plan().ok_or_else(unsupported)?;
-    let stepper =
-        gated(&ctx, plan, &trace, &next, &recs, until.max_steps).map_err(|_| unsupported())?;
-    let rec_storages = recs
-        .iter()
-        .map(|rec| rec.storage().cloned())
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let gate = ctx
-        .jit()
-        .stencil_kernel(&ctx, gate_source(recs.len(), &conds), "UntilAllGate")?;
-    let mut gate_loop = GateLoop::new(&ctx, stepper, gate, conds.len(), stepv, rec_storages, until.max_steps)?;
+    let rec_storages = records.storages().ok_or_else(unsupported)?;
+    let stepper = gated(&ctx, plan, &trace, &next, &rec_storages, until.max_steps, records.fold()).map_err(|_| unsupported())?;
+    let gate = gate_kernel(&ctx, &conds, rec_storages.len(), &records)?;
+    let spec = Spec { conditions: conds.len(), capacity: until.max_steps, fused: records.fused(), fold: records.fold(), constants };
+    let mut gate_loop = GateLoop::new(&ctx, stepper, gate, stepv, rec_storages, spec, gate_buffers.take())?;
     gate_loop.compiled = true;
     Ok(CompiledUntil {
         ctx,
@@ -1381,7 +1686,7 @@ mod tests {
     fn the_gate_source_names_every_record_and_condition() {
         let h = hist();
         let conds = [h["a"].window_min(3).lt(h["b"].last()), h["b"].peak().ge(2.0)];
-        let source = gate_source(2, &conds);
+        let source = gate_source(2, &conds, false).0;
         assert!(source.contains("rec1"));
         assert!(source.contains("wmin(i, 0u, 3u)"));
         assert!(source.contains("reason = 2u"));
@@ -1403,7 +1708,7 @@ mod tests {
         assert!(eval_stat(&b.window_mean(2), &histories, 3).is_nan());
         assert_eq!(eval_stat(&b.window_mean(2), &histories, 1), 1.0);
         assert_eq!(eval_stat(&b.window_mean(2), &histories, 4), 3.5);
-        let source = gate_source(2, &[a.window_mean(3).lt(a.prev(2))]);
+        let source = gate_source(2, &[a.window_mean(3).lt(a.prev(2))], true).0;
         assert!(source.contains("wmean(i, 0u, 3u)"));
         assert!(source.contains("(i - min(2u, i))"));
     }
@@ -1497,5 +1802,354 @@ mod tests {
         }
         // 0 + 1 + .. + 7 twice, then 0 + 1 + 2.
         assert_eq!(got.0.to_vec().unwrap(), vec![59.0; 8]);
+    }
+
+    /// A CPU context whose reductions over several workgroups finish in their first launch or not.
+    fn cpu_ctx(single_pass: bool) -> Context {
+        use luma_core::{BackendKind, DeviceKind};
+        let options = crate::context::ContextOptions { backend: BackendKind::Cpu, device: DeviceKind::Cpu, ..crate::context::ContextOptions::from_env() }.calibrate(false);
+        let ctx = Context::with_tuning(options, |tuning| tuning.single_pass_reduce = single_pass).unwrap();
+        ctx.set_cost_model(crate::jit::cost::CostModel::TEST);
+        ctx
+    }
+
+    fn spike(n: usize) -> Vec<f32> {
+        (0..n).map(|i| if i % 97 == 0 { 1.0 } else { ((i * 7919) % 101) as f32 / 101.0 }).collect()
+    }
+
+    type One = (Array<f32>,);
+    type Rule = Box<dyn Fn() -> Until<'static, One>>;
+
+    /// A step of the heat equation on a ring.
+    fn heat(s: &One, _: &Array<f32>) -> One {
+        let lap = &(&s.0.shift(1) + &s.0.shift(-1)) - &(&s.0 * 2.0f32);
+        (&s.0 + &(&lap * 0.25f32),)
+    }
+
+    /// How a loop was run: the steps, why, the history and the state, and what its step launched.
+    #[derive(Debug, PartialEq)]
+    struct Outcome1 {
+        steps: usize,
+        reason: StopReason,
+        norm: Vec<f32>,
+        state: Vec<f32>,
+    }
+
+    /// Launches of a step of the last loop run: its plan's, and one more for a gate of its own.
+    fn step_launches() -> (usize, bool) {
+        let (launches, fold) = LAST_PLAN.with(|last| last.get()).expect("the loop ran a traced step");
+        (launches + usize::from(fold.is_none()), fold.is_some())
+    }
+
+    /// Runs the heat loop with the record of the state traced after the step (`separate_record`),
+    /// the gate as a launch of its own (`separate_gate`), or as it comes.
+    fn run_heat(ctx: &Context, data: &[f32], until: Until<'_, One>, separate_record: bool, separate_gate: bool) -> (Outcome1, (usize, bool)) {
+        crate::jit::SEPARATE_RECORD.with(|flag| flag.set(separate_record));
+        crate::jit::SEPARATE_GATE.with(|flag| flag.set(separate_gate));
+        LAST_PLAN.with(|last| last.set(None));
+        let run = iterate_until_all((Array::from_slice_on(ctx, data, data.len()).unwrap(),), until, heat);
+        crate::jit::SEPARATE_RECORD.with(|flag| flag.set(false));
+        crate::jit::SEPARATE_GATE.with(|flag| flag.set(false));
+        let run = run.unwrap();
+        let launches = step_launches();
+        let norm = run.history("norm").unwrap().to_vec();
+        (Outcome1 { steps: run.steps, reason: run.reason, norm, state: run.state.0.to_vec().unwrap() }, launches)
+    }
+
+    fn norm_until<'a>(max: usize) -> Until<'a, One> {
+        Until::new(max).record("norm", |s: &One| s.0.norm())
+    }
+
+    #[test]
+    fn a_step_and_the_record_of_its_input_run_as_one_launch_with_the_results_of_two() {
+        // 16384 elements: several workgroups for a reduction, so that a single pass is one
+        // launch that finishes it; 100: one.
+        for single_pass in [false, true] {
+            let ctx = cpu_ctx(single_pass);
+            for n in [100usize, 16384] {
+                assert_eq!(ctx.tuning().reduce_groups(n as u32) > 1, n > 100);
+                let data = spike(n);
+                // The norm after the 7th step, which a rule stops at: the first step it is at most
+                // that is the 7th, as the norm only falls.
+                let (all, _) = run_heat(&ctx, &data, norm_until(12), true, true);
+                let at_7 = all.norm[6];
+                let stops: Vec<(&str, Rule)> = vec![
+                    ("norm at most the 7th", Box::new(move || norm_until(12).stop_when(move |h| h["norm"].last().le(at_7)))),
+                    ("after the first step", Box::new(|| norm_until(12).stop_when(|h| h.step().ge(1.0)))),
+                    ("after the second step", Box::new(|| norm_until(12).stop_when(|h| h.step().ge(2.0)))),
+                    ("at the last step", Box::new(|| norm_until(5).stop_when(|h| h.step().ge(5.0)))),
+                    ("never, one step", Box::new(|| norm_until(1))),
+                    ("never, five steps", Box::new(|| norm_until(5))),
+                    ("in the middle of a block", Box::new(|| norm_until(20).stop_when(|h| h.step().ge(3.0)).check_every(2))),
+                    ("by a window", Box::new(|| norm_until(30).stop_when(|h| (h["norm"].window_max(3) - h["norm"].window_min(3)).lt(0.2)).check_every(4))),
+                    ("by the second rule", Box::new(move || norm_until(12).stop_when(|h| h["norm"].last().lt(0.0)).stop_when(move |h| h["norm"].last().le(at_7)))),
+                ];
+                for (name, until) in &stops {
+                    let (old, old_launches) = run_heat(&ctx, &data, until(), true, true);
+                    let (fused, fused_launches) = run_heat(&ctx, &data, until(), false, true);
+                    let (folded, folded_launches) = run_heat(&ctx, &data, until(), false, false);
+                    let what = format!("{name}, {n} elements, single pass {single_pass}");
+                    assert_eq!(fused, old, "{what}: the record in the step's launch");
+                    assert_eq!(folded, old, "{what}: and the gate");
+                    assert!(old.steps >= 1, "{what}");
+                    // A launch for the step and one for its record (two with a pass to finish it), and the gate.
+                    let record_launches = if n > 100 && !single_pass { 2 } else { 1 };
+                    assert_eq!(old_launches, (1 + record_launches + 1, false), "{what}");
+                    assert_eq!(fused_launches, (record_launches + 1, false), "{what}");
+                    // The gate runs in the step's launch where the backend finishes a reduction in one.
+                    assert_eq!(folded_launches, if single_pass { (1, true) } else { fused_launches }, "{what}");
+                }
+                let (stopped, _) = run_heat(&ctx, &data, norm_until(12).stop_when(move |h| h["norm"].last().le(at_7)), false, false);
+                assert_eq!((stopped.steps, stopped.reason), (7, StopReason::Predicate(0)));
+                assert_eq!(stopped.norm, all.norm[..7]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_state_a_loop_returns_is_that_of_the_step_it_stopped_at_not_of_the_speculated_one() {
+        let ctx = cpu_ctx(true);
+        let data = spike(16384);
+        let mut state = Array::from_slice_on(&ctx, &data, data.len()).unwrap();
+        let mut norms = Vec::new();
+        for _ in 0..9 {
+            state = heat(&(state,), &Array::from_slice_on(&ctx, &[0.0], 1).unwrap()).0;
+            norms.push(state.norm().item().unwrap());
+        }
+        for steps in 1..=9usize {
+            let until = norm_until(12).stop_when(move |h| h.step().ge(steps as f32));
+            let (run, _) = run_heat(&ctx, &data, until, false, false);
+            assert_eq!(run.steps, steps);
+            assert_eq!(run.norm, norms[..steps]);
+            let mut want = Array::from_slice_on(&ctx, &data, data.len()).unwrap();
+            for _ in 0..steps {
+                want = heat(&(want,), &Array::from_slice_on(&ctx, &[0.0], 1).unwrap()).0;
+            }
+            assert_eq!(run.state, want.to_vec().unwrap(), "{steps} steps");
+        }
+    }
+
+    #[test]
+    fn a_step_that_reads_its_index_keeps_the_gate_in_a_launch_of_its_own() {
+        // The gate writes the index the step reads: not in one kernel.
+        let ctx = cpu_ctx(true);
+        let data = spike(16384);
+        let step = |s: &One, k: &Array<f32>| (&(&s.0 * 0.5f32) + k,);
+        let run = |separate_record: bool| {
+            crate::jit::SEPARATE_RECORD.with(|flag| flag.set(separate_record));
+            LAST_PLAN.with(|last| last.set(None));
+            let run = iterate_until_all(
+                (Array::from_slice_on(&ctx, &data, data.len()).unwrap(),),
+                Until::new(9).record("norm", |s: &One| s.0.norm()).stop_when(|h| h.step().ge(6.0)),
+                step,
+            );
+            crate::jit::SEPARATE_RECORD.with(|flag| flag.set(false));
+            let run = run.unwrap();
+            (run.steps, run.history("norm").unwrap().to_vec(), run.state.0.to_vec().unwrap(), step_launches())
+        };
+        let (old, fused) = (run(true), run(false));
+        assert_eq!(old.0, 6);
+        assert_eq!((fused.0, &fused.1, &fused.2), (old.0, &old.1, &old.2));
+        assert_eq!((old.3, fused.3), ((3, false), (2, false)));
+    }
+
+    #[test]
+    fn records_that_are_not_one_reduction_of_the_step_keep_the_gate_and_the_records_after_the_step() {
+        let ctx = cpu_ctx(true);
+        let data = spike(16384);
+        let until = || {
+            Until::new(8)
+                .record("norm", |s: &One| s.0.norm())
+                .record("max", |s: &One| s.0.max())
+                .stop_when(|h| h["max"].last().lt(0.9))
+        };
+        LAST_PLAN.with(|last| last.set(None));
+        let two = iterate_until_all((Array::from_slice_on(&ctx, &data, data.len()).unwrap(),), until(), heat).unwrap();
+        let (launches, fold) = LAST_PLAN.with(|last| last.get()).unwrap();
+        assert_eq!(fold, None);
+        // The step, the two records (the gate is a launch of its own).
+        assert_eq!(launches, 3);
+        let mut state = Array::from_slice_on(&ctx, &data, data.len()).unwrap();
+        for t in 0..two.steps {
+            state = heat(&(state,), &Array::from_slice_on(&ctx, &[0.0], 1).unwrap()).0;
+            assert_eq!(two.history("max").unwrap()[t], state.max().item().unwrap());
+            assert_eq!(two.history("norm").unwrap()[t], state.norm().item().unwrap());
+        }
+        assert_eq!(two.state.0.to_vec().unwrap(), state.to_vec().unwrap());
+        // A record that is a reduction of something else than the state's step (an arithmetic
+        // of two reductions) is not one reduction either.
+        let sum = iterate_until_all(
+            (Array::from_slice_on(&ctx, &data, data.len()).unwrap(),),
+            Until::new(4).record("spread", |s: &One| &s.0.max() - &s.0.min()),
+            heat,
+        )
+        .unwrap();
+        assert_eq!(sum.history("spread").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_step_that_reads_back_runs_on_the_host_with_the_records_of_the_states_it_made() {
+        // The readback aborts the recording of the step: nothing can be replayed, and the launch that
+        // reduced the record of the state the step read (and maybe ran a gate) ran for real.
+        let ctx = cpu_ctx(true);
+        let data = spike(16384);
+        let step = |s: &One, _: &Array<f32>| {
+            let total = s.0.sum().item().unwrap();
+            (&s.0 * (1.0 / (1.0 + total.abs())).max(0.5f32),)
+        };
+        let run = |separate_record: bool| {
+            crate::jit::SEPARATE_RECORD.with(|flag| flag.set(separate_record));
+            LAST_PLAN.with(|last| last.set(None));
+            let run = iterate_until_all(
+                (Array::from_slice_on(&ctx, &data, data.len()).unwrap(),),
+                Until::new(6).record("norm", |s: &One| s.0.norm()).stop_when(|h| h.step().ge(4.0)),
+                step,
+            );
+            crate::jit::SEPARATE_RECORD.with(|flag| flag.set(false));
+            let run = run.unwrap();
+            (run.steps, run.history("norm").unwrap().to_vec(), run.state.0.to_vec().unwrap())
+        };
+        let (old, fused) = (run(true), run(false));
+        assert_eq!(old.0, 4);
+        assert_eq!(fused, old);
+        assert_eq!(LAST_PLAN.with(|last| last.get()), None, "the step was replayed");
+    }
+
+    #[test]
+    fn a_state_of_several_arrays_is_stored_by_the_launch_that_reduces_the_record() {
+        type Two = (Array<f32>, Array<f32>);
+        let ctx = cpu_ctx(true);
+        let (a, b) = (spike(16384), spike(16384).into_iter().rev().collect::<Vec<_>>());
+        let start = || (Array::from_slice_on(&ctx, &a, a.len()).unwrap(), Array::from_slice_on(&ctx, &b, b.len()).unwrap());
+        let rotate = |s: &Two, _: &Array<f32>| (&s.0 + &(&s.1 * 0.1f32), &s.1 - &(&s.0 * 0.1f32));
+        // The second array passes through: not a step to store, the record follows the step.
+        let passes = |s: &Two, _: &Array<f32>| (&s.0 * 0.9f32, s.1.clone());
+        let until = || Until::new(10).record("norm", |s: &Two| s.0.norm()).stop_when(|h| h["norm"].last().gt(1.0e9));
+        type Step<'a> = &'a dyn Fn(&Two, &Array<f32>) -> Two;
+        let run = |step: Step<'_>, separate_record: bool| {
+            crate::jit::SEPARATE_RECORD.with(|flag| flag.set(separate_record));
+            LAST_PLAN.with(|last| last.set(None));
+            let run = iterate_until_all(start(), until(), step);
+            crate::jit::SEPARATE_RECORD.with(|flag| flag.set(false));
+            let run = run.unwrap();
+            let launches = LAST_PLAN.with(|last| last.get());
+            ((run.steps, run.reason, run.history("norm").unwrap().to_vec(), run.state.0.to_vec().unwrap(), run.state.1.to_vec().unwrap()), launches)
+        };
+        let (old, old_launches) = run(&rotate, true);
+        let (fused, fused_launches) = run(&rotate, false);
+        assert_eq!(fused, old);
+        assert_eq!(old.0, 10);
+        // Both arrays and the record in one launch; before, a launch to store both and one for the record.
+        assert_eq!((old_launches, fused_launches), (Some((2, None)), Some((1, Some(0)))));
+        let (old, old_launches) = run(&passes, true);
+        let (fused, fused_launches) = run(&passes, false);
+        assert_eq!(fused, old);
+        assert_eq!(fused_launches, old_launches);
+    }
+
+    #[test]
+    fn a_step_that_writes_a_captured_array_applies_its_writes_once_per_step() {
+        // The launch that finds the loop stopped (or the last one) runs the whole step, so a step
+        // with effects on arrays outside its state keeps its records after it.
+        let ctx = cpu_ctx(true);
+        let data = spike(16384);
+        let index = Array::<u32>::from_slice_on(&ctx, &[0], 1).unwrap();
+        for stop_at in [4.0f32, 100.0] {
+            for separate_record in [true, false] {
+                let counted = std::cell::RefCell::new(Array::from_slice_on(&ctx, &[0.0f32, 0.0], 2).unwrap());
+                let sliced = std::cell::RefCell::new(Array::from_slice_on(&ctx, &[1.0f32, 1.0, 1.0, 1.0], 4).unwrap());
+                let step = |s: &One, _: &Array<f32>| {
+                    counted.borrow_mut().put_add(&index, 1.0f32).unwrap();
+                    let current = sliced.borrow().slice(0, 2..4);
+                    sliced.borrow_mut().slice_mut(0, 2..4).assign(&current + 1.0f32).unwrap();
+                    (&s.0 * 0.5f32,)
+                };
+                crate::jit::SEPARATE_RECORD.with(|flag| flag.set(separate_record));
+                LAST_PLAN.with(|last| last.set(None));
+                let run = iterate_until_all(
+                    (Array::from_slice_on(&ctx, &data, data.len()).unwrap(),),
+                    Until::new(6).record("norm", |s: &One| s.0.norm()).stop_when(move |h| h.step().ge(stop_at)),
+                    step,
+                );
+                crate::jit::SEPARATE_RECORD.with(|flag| flag.set(false));
+                let run = run.unwrap();
+                let applied = counted.borrow().to_vec().unwrap()[0];
+                assert_eq!(applied, run.steps as f32, "stop at {stop_at}, record separate: {separate_record}");
+                assert_eq!(sliced.borrow().to_vec().unwrap(), vec![1.0, 1.0, 1.0 + run.steps as f32, 1.0 + run.steps as f32], "stop at {stop_at}, record separate: {separate_record}");
+                let launched = LAST_PLAN.with(|last| last.get());
+                assert!(launched.is_some_and(|(_, fold)| fold.is_none()), "{launched:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_step_that_reads_a_pending_expression_through_a_view_is_still_one_launch() {
+        // The expression is written out where the view reads it, in the program that reduces the record.
+        let ctx = cpu_ctx(true);
+        let data = spike(16384);
+        let step = |s: &One, _: &Array<f32>| {
+            let e = &(&s.0 * 0.5f32) + 0.25f32;
+            (&e.flip(0) + &e,)
+        };
+        let run = |separate_record: bool| {
+            crate::jit::SEPARATE_RECORD.with(|flag| flag.set(separate_record));
+            LAST_PLAN.with(|last| last.set(None));
+            let run = iterate_until_all(
+                (Array::from_slice_on(&ctx, &data, data.len()).unwrap(),),
+                Until::new(7).record("norm", |s: &One| s.0.norm()).stop_when(|h| h.step().ge(5.0)),
+                step,
+            );
+            crate::jit::SEPARATE_RECORD.with(|flag| flag.set(false));
+            let run = run.unwrap();
+            ((run.steps, run.history("norm").unwrap().to_vec(), run.state.0.to_vec().unwrap()), LAST_PLAN.with(|last| last.get()))
+        };
+        let (old, old_launches) = run(true);
+        let (fused, fused_launches) = run(false);
+        assert_eq!(fused, old);
+        assert_eq!(old.0, 5);
+        assert_eq!(fused_launches, Some((1, Some(0))), "{old_launches:?}");
+    }
+
+    #[test]
+    fn thresholds_of_a_stop_rule_are_state_of_the_gate_not_part_of_its_kernels() {
+        let ctx = cpu_ctx(true);
+        let data = spike(16384);
+        let (all, _) = run_heat(&ctx, &data, norm_until(12), true, true);
+        let rule = |at: f32, steps: f32| norm_until(12).stop_when(move |h| h["norm"].last().le(at).or(h.step().ge(steps)));
+        for separate_gate in [false, true] {
+            let built = |ctx: &Context| ctx.jit().stats().built;
+            let (first, _) = run_heat(&ctx, &data, rule(all.norm[6], 99.0), false, separate_gate);
+            let before = built(&ctx);
+            let (second, _) = run_heat(&ctx, &data, rule(all.norm[3], 99.0), false, separate_gate);
+            let (third, _) = run_heat(&ctx, &data, rule(0.0, 2.0), false, separate_gate);
+            assert_eq!(built(&ctx), before, "a kernel was built for other thresholds (gate of its own: {separate_gate})");
+            assert_eq!((first.steps, second.steps, third.steps), (7, 4, 2));
+            assert_eq!(second.norm, all.norm[..4]);
+        }
+    }
+
+    #[test]
+    fn a_compiled_loop_folds_its_gate_and_runs_chunks_like_iterate_until_all() {
+        let ctx = cpu_ctx(true);
+        let data = spike(16384);
+        // Stops in the middle of a block, so that the launches after the stop find the loop stopped.
+        let until = |n: usize| norm_until(n).stop_when(|h| h.step().ge(4.0));
+        let start = || (Array::from_slice_on(&ctx, &data, data.len()).unwrap(),);
+        LAST_PLAN.with(|last| last.set(None));
+        let mut compiled = compile_until_all(&start(), until(6), heat).unwrap();
+        assert_eq!(LAST_PLAN.with(|last| last.get()), Some((1, Some(0))));
+        let (mut want, mut got) = (start(), start());
+        // Runs of a span of steps again and again: it is captured as a graph, which runs the gate
+        // folded into the step's launch like any other.
+        for n in [6, 6, 6, 6, 5, 2, 6] {
+            let expected = iterate_until_all(want, until(n), heat).unwrap();
+            let run = compiled.run_steps(got, n).unwrap();
+            assert_eq!((run.steps, run.reason), (expected.steps, expected.reason));
+            assert_eq!(run.history("norm"), expected.history("norm"));
+            assert_eq!(run.state.0.to_vec().unwrap(), expected.state.0.to_vec().unwrap());
+            want = expected.state;
+            got = run.state;
+        }
+        assert!(compiled.gate_loop.graphs.holds_graphs(), "no span of launches was captured");
     }
 }

@@ -283,7 +283,7 @@ fn compute_ahead(
 ) -> Result<(Vec<Arc<Storage>>, Buffer)> {
     debug_assert_eq!(from.len(), states);
     if template.inputs.len() + outs.len() <= ctx.jit().max_inputs()
-        && let Ok((next, partial, groups)) = launch::reduce_and_store_fused(ctx, len, with_states(template, from, None), outs, ops, scratch)
+        && let Ok((next, partial, groups)) = launch::reduce_and_store_fused(ctx, len, with_states(template, from, None), outs, ops, scratch, None, Finish::default(), None)
     {
         let residual = finish_passes(ctx, scratch, ops, wgsl, ElemTy::F32.stride(), partial, groups, true, None, Finish::default())?;
         return Ok((next.into_iter().map(Arc::new).collect(), residual));

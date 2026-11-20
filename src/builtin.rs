@@ -550,6 +550,52 @@ impl Finish {
     }
 }
 
+/// A gate folded into a reduction kernel: WGSL text, registered once and named in a kernel's cache
+/// key by this handle (see [`ReduceList::with_gate`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct GateId(u32);
+
+/// The registered gates: their sources by handle, and the handles by source.
+#[derive(Default)]
+struct Gates {
+    sources: Vec<std::sync::Arc<str>>,
+    ids: crate::gpu::hash::FxMap<std::sync::Arc<str>, u32>,
+}
+
+static GATES: std::sync::LazyLock<std::sync::Mutex<Gates>> = std::sync::LazyLock::new(Default::default);
+
+/// Storage bindings a folded gate takes, after the reduction's own: `st`, `args`, `tmpl`, `hist`,
+/// `agg`, `stepv` (see [`reduce_main`]).
+pub(crate) const GATE_BINDINGS: usize = 6;
+
+/// What a gate does once the loop it belongs to has stopped, which is the same for every gate: it
+/// copies the template `tmpl` of the dispatch arguments to `args`, but for the launch `st[4]`
+/// (the one the gate runs in) it zeroes them, `st[3]` words of them. [`reduce_main`] defines it
+/// for a gate folded into a reduction, which calls it as `luma_stopped()`.
+pub(crate) const GATE_STOPPED: &str = "fn luma_stopped() {
+    for (var w = 0u; w < st[3u]; w++) { args[w] = select(0u, tmpl[w], w / 3u == st[4u]); }
+}
+";
+
+impl GateId {
+    /// The handle of `source`, the WGSL of a gate (see [`reduce_main`] for what it defines).
+    pub(crate) fn register(source: &str) -> GateId {
+        let mut gates = crate::gpu::lock(&GATES);
+        if let Some(&id) = gates.ids.get(source) {
+            return GateId(id);
+        }
+        let id = gates.sources.len() as u32;
+        let source: std::sync::Arc<str> = source.into();
+        gates.sources.push(std::sync::Arc::clone(&source));
+        gates.ids.insert(source, id);
+        GateId(id)
+    }
+
+    fn source(self) -> std::sync::Arc<str> {
+        std::sync::Arc::clone(&crate::gpu::lock(&GATES).sources[self.0 as usize])
+    }
+}
+
 /// Reductions computed together, in order (a kernel cache key, so a fixed-size value), and what
 /// is applied to their results.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -561,12 +607,14 @@ pub(crate) struct ReduceList {
     epilogue: Epilogue,
     /// Whether the kernel finishes the reduction itself (see [`ReduceList::single_pass`]).
     single_pass: bool,
+    /// The gate the workgroup that has the final values runs on them (see [`ReduceList::with_gate`]).
+    gate: Option<GateId>,
 }
 
 impl ReduceList {
     /// `ops` must hold between 1 and [`MAX_REDUCTIONS`] ops.
     pub(crate) fn new(ops: &[ReduceOp]) -> Self {
-        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0, epilogue: Epilogue::default(), single_pass: false };
+        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0, epilogue: Epilogue::default(), single_pass: false, gate: None };
         for (slot, &op) in list.ops.iter_mut().zip(ops) {
             *slot = op;
             list.len += 1;
@@ -609,6 +657,19 @@ impl ReduceList {
 
     pub(crate) fn is_single_pass(&self) -> bool {
         self.single_pass
+    }
+
+    /// These reductions of one op with `gate` run by the workgroup that ends up with the final
+    /// value (the last one of a [single-pass](ReduceList::single_pass) kernel, the only one of
+    /// a kernel of a single group): [`reduce_main`] says what the gate gets and may use. Part of
+    /// the kernel's cache key.
+    pub(crate) fn with_gate(self, gate: GateId) -> Self {
+        debug_assert_eq!(self.as_slice().len(), 1, "a gate takes one value");
+        ReduceList { gate: Some(gate), ..self }
+    }
+
+    pub(crate) fn gate(&self) -> Option<GateId> {
+        self.gate
     }
 
     pub(crate) fn epilogue(&self) -> Epilogue {
@@ -711,7 +772,7 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String
 
 fn load_at(i: u32) -> {ty} {{ return a[i]; }}
 {}",
-        reduce_main(elem, ops, segmented, "load_at", tuning, single_pass)
+        reduce_main(elem, ops, segmented, "load_at", tuning, single_pass, None)
     )
 }
 
@@ -736,7 +797,7 @@ fn reduce_bits(ops: ReduceList, tuning: &Tuning) -> String {
 
 fn load_at(i: u32) -> u32 {{ let w = a[i]; return {value}; }}
 {}",
-        reduce_main(ReduceElem::Plain("u32"), ops, false, "load_at", tuning, None)
+        reduce_main(ReduceElem::Plain("u32"), ops, false, "load_at", tuning, None, None)
     )
 }
 
@@ -1186,8 +1247,16 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
 /// would (same accumulation order, so the values are the same bits), applies the epilogue of
 /// `ops`, writes `luma_result[j]` and resets the counter for the next launch. Only for a
 /// first pass (`!segmented`); the partial results then carry no epilogue.
-pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool, load: &str, tuning: &Tuning, single_pass: Option<u32>) -> String {
+///
+/// A reduction with a [gate](ReduceList::with_gate) (one `f32` op, bindings `gate`.. `gate + GATE_BINDINGS`
+/// after `luma_result`: `st`, `args`, `tmpl`, `hist`, `agg`, `stepv`) runs the gate on the final value, in
+/// invocation 0 of the workgroup that has it (the last one of a single-pass kernel, the only one
+/// of a kernel of one group). The gate's text defines `luma_gate(v: f32)`; [`GATE_STOPPED`] is added to it. A
+/// workgroup that finds `st[0]` set (the loop stopped) leaves at once, workgroup 0 after
+/// `luma_stopped()`, so that nothing of the stopped steps is computed or stored.
+pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool, load: &str, tuning: &Tuning, single_pass: Option<u32>, gate: Option<u32>) -> String {
     debug_assert!(single_pass.is_none() || !segmented, "only a first pass can finish the reduction itself");
+    debug_assert!(gate.is_none() || (!segmented && ops.gate().is_some()), "a gate needs a first pass with a gate");
     let ty = elem.storage_ty();
     let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
     let mut combines = String::new();
@@ -1224,8 +1293,13 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         subgroups,
         tuning,
     );
+    let gate_call = |value: &str| if gate.is_some() { format!("        luma_gate({value});\n") } else { String::new() };
     let (declare, last_block) = match single_pass {
-        None => (String::new(), String::new()),
+        None => (String::new(), match gate {
+            // One group: its only workgroup has the final value in `out`.
+            Some(_) => format!("    if (lid == 0u) {{\n{}    }}\n", gate_call("out[0u]")),
+            None => String::new(),
+        }),
         Some(counter) => {
             let result = counter + 1;
             let value = |j: usize, value: &str| format!("luma_result[{j}u] = {value};");
@@ -1249,16 +1323,43 @@ fn luma_partial(i: u32) -> {ty} {{ return out[i]; }}
     if (lid == 0u) {{ luma_ticket = atomicAdd(&luma_counter[0], 1u); }}
     if (workgroupUniformLoad(&luma_ticket) == groups - 1u) {{
         storageBarrier();
-{rest}        if (lid == 0u) {{ atomicStore(&luma_counter[0], 0u); }}
+{rest}        if (lid == 0u) {{
+            atomicStore(&luma_counter[0], 0u);
+{}        }}
     }}
-"
+",
+                    gate_call("luma_result[0u]")
                 ),
             )
         }
     };
+    let (gate_declare, gate_entry) = match (gate, ops.gate()) {
+        (Some(first), Some(id)) => {
+            let ([st, args, tmpl, hist, agg, stepv], source) = (std::array::from_fn(|k| first + k as u32), id.source());
+            (
+                format!(
+                    "@group(1) @binding({st}) var<storage, read_write> st: array<u32>;
+@group(1) @binding({args}) var<storage, read_write> args: array<u32>;
+@group(1) @binding({tmpl}) var<storage, read> tmpl: array<u32>;
+@group(1) @binding({hist}) var<storage, read_write> hist: array<f32>;
+@group(1) @binding({agg}) var<storage, read_write> agg: array<f32>;
+@group(1) @binding({stepv}) var<storage, read_write> stepv: array<f32>;
+var<workgroup> luma_stop: u32;
+{GATE_STOPPED}{source}"
+                ),
+                "    if (lid == 0u) { luma_stop = st[0]; }
+    if (workgroupUniformLoad(&luma_stop) != 0u) {
+        if (group == 0u && lid == 0u) { luma_stopped(); }
+        return;
+    }
+",
+            )
+        }
+        _ => (String::new(), ""),
+    };
     format!(
         "{}{shared}
-{declare}
+{declare}{gate_declare}
 {combines}
 @compute @workgroup_size({wg})
 fn main(
@@ -1269,7 +1370,7 @@ fn main(
     let group = wid.x + wid.y * nwg.x;
     let groups = min((p.n + {block}u - 1u) / {block}u, {cap}u);
     if (group >= groups) {{ return; }}
-    let zero = {ty}();
+{gate_entry}    let zero = {ty}();
 {body}{last_block}}}
 ",
         elem.library(),

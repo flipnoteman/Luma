@@ -207,7 +207,9 @@ pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};
 pub(crate) use replay::{force, GraphBuilder, GraphCache, Plan, Stepper, Trace, PAYING_REPLAYS};
 pub(crate) use stencil::plan as stencil_plan;
-pub(crate) use until::{next_block, run_until, FIRST_BLOCK};
+pub(crate) use until::{force_with_record, next_block, run_until, FoldGate, FIRST_BLOCK};
+#[cfg(test)]
+pub(crate) use until::{SEPARATE_GATE, SEPARATE_RECORD};
 
 /// Length of the requested list at which entries of dropped or computed nodes are pruned.
 const REQUESTED_PRUNE_AT: usize = 256;

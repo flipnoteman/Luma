@@ -82,6 +82,13 @@ pub(crate) struct Inlined {
     /// Per lowered instruction, whether it is a `Select` computed as `if`/`else`: operand 1 only
     /// where the mask holds, operand 2 only where it does not.
     pub(crate) branch: Vec<bool>,
+    /// Per lowered instruction, for a `Select` computed as `if`/`else`, the last select of its
+    /// group: the selects of one mask in one enclosing region (the fields of a record assigned
+    /// over a region) are one `if` that assigns all their results, at the position of that last
+    /// one, so that what their branches share is computed once and inside it (see [`branches`]).
+    /// The instructions only the branches of the group use are in `Region::Taken(anchor)` and
+    /// `Region::Skipped(anchor)`. Every other instruction, and a lone branch, holds its own index.
+    pub(crate) group: Vec<u32>,
     /// The operations of the lowered program in f32-operation units (see [`op_weight`]) per
     /// element, those of a branch weighted by the share of elements that compute it.
     pub(crate) ops: f64,
@@ -100,6 +107,7 @@ impl PartialEq for Inlined {
             && self.main == other.main
             && self.region == other.region
             && self.branch == other.branch
+            && self.group == other.group
             && self.staged_reads == other.staged_reads
     }
 }
@@ -113,6 +121,7 @@ impl std::hash::Hash for Inlined {
         self.main.hash(state);
         self.region.hash(state);
         self.branch.hash(state);
+        self.group.hash(state);
         self.staged_reads.hash(state);
     }
 }
@@ -243,6 +252,7 @@ impl<'a> Lowering<'a> {
             main,
             region: found.region,
             branch: found.branch,
+            group: found.group,
             ops: found.ops,
             staged_reads: Vec::new(),
         }
@@ -264,22 +274,46 @@ const BRANCH_GAIN: f64 = 8.0;
 struct Branches {
     region: Vec<Region>,
     branch: Vec<bool>,
+    group: Vec<u32>,
     ops: f64,
 }
 
-/// The share of the elements of a program that a `Select` with the mask `mask` takes its
-/// operand 1 at, as far as the program shows: the part of the destination a clamped view of a
-/// smaller array covers (a region assigned into an array: the right-hand side read at the
-/// coordinates of the whole array), else a half.
-fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> f64 {
+/// The share of the elements that reach a `Select` whose mask is not shown to cover any
+/// particular part of the destination: nothing in the program says how much it is, so a half.
+const UNKNOWN_SHARE: f64 = 0.5;
+
+/// The share of the elements of a program that a `Select` takes its operand 1 at, as far as its
+/// operand shows: the part of the destination a clamped view of a smaller array covers (a region
+/// assigned into an array: the right-hand side read at the coordinates of the whole array).
+/// `None` when the operand shows nothing: a scalar (a constant assigned to a region), or no view
+/// between the select and the operand.
+///
+/// The view is the first one between the select's own context and the operand. An operand
+/// computed from a pending expression sits in it (`at`); an evaluated buffer is read through it
+/// by a shift, which sits in the select's context and reads at the view (`child`).
+fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> Option<f64> {
     let cells = |dims: [u32; 4]| dims.iter().map(|&d| f64::from(d)).product::<f64>();
-    if let Ref::Tmp(value) = select.args[1]
-        && let Some(taken) = flats.get(value as usize)
-        && let Some(Ctx { kind: ShiftKind::View { map, .. }, .. }) = ctxs.get(taken.at as usize)
+    let Ref::Tmp(value) = select.args[1] else { return None };
+    let taken = flats.get(value as usize)?;
+    let mut ancestors = vec![select.at];
+    while let Some(&last) = ancestors.last()
+        && last != 0
     {
-        return if cells(map.out) == 0.0 { 1.0 } else { (cells(map.src) / cells(map.out)).clamp(1.0 / 4096.0, 1.0) };
+        ancestors.push(ctxs.get(last as usize)?.parent);
     }
-    0.5
+    let mut at = if matches!(taken.op.kind, OpKind::Shift(_)) && ancestors.contains(&taken.at) { taken.child } else { taken.at };
+    let ctx = loop {
+        if ancestors.contains(&at) {
+            return None;
+        }
+        let ctx = ctxs.get(at as usize)?;
+        if ancestors.contains(&ctx.parent) {
+            break ctx;
+        }
+        at = ctx.parent;
+    };
+    let ShiftKind::View { map, .. } = ctx.kind else { return None };
+    Some(if cells(map.out) == 0.0 { 1.0 } else { (cells(map.src) / cells(map.out)).clamp(1.0 / 4096.0, 1.0) })
 }
 
 /// Finds the selects of a lowered program that are better computed as `if`/`else` than as a
@@ -293,11 +327,20 @@ fn taken_share(flats: &[Flat], ctxs: &[Ctx], select: &Flat) -> f64 {
 /// selects: each is judged by the elements that get to it, not by all of them). Those
 /// instructions are computed inside the branch. The weighted operation count of the program counts
 /// them by the share of elements that take it.
+///
+/// Selects of one mask in one enclosing region are one group (see [`Inlined::group`]): the
+/// fields of a record assigned over a region all select between their right-hand side and
+/// their old value by the same mask, and what the right-hand sides share is computed only where
+/// the mask holds, once. The group is one branch: the instructions only its selects' branches
+/// use are in its two regions and the gain is that of all of them together. A select is
+/// left out of a group when another instruction reads its result before the group's last select
+/// (the `if` assigns every result at the last one's position, so the branches could not read
+/// it), or when its region is another than that of the others.
 fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, staged_reads: bool) -> Branches {
     let n = flats.len();
     if !flats.iter().any(|flat| matches!(flat.op.kind, OpKind::Select)) {
         let ops = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).sum();
-        return Branches { region: vec![Region::Top; n], branch: vec![false; n], ops };
+        return Branches { region: vec![Region::Top; n], branch: vec![false; n], group: (0..n as u32).collect(), ops };
     }
     // Values that depend on the coordinates and scalars only.
     let mut coordinates = vec![false; n];
@@ -324,11 +367,14 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
         .collect();
     if !branch.iter().any(|&b| b) {
         let ops = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).sum();
-        return Branches { region: vec![Region::Top; n], branch, ops };
+        return Branches { region: vec![Region::Top; n], branch, group: (0..n as u32).collect(), ops };
     }
     let weight: Vec<f64> = flats.iter().map(|flat| flat_weight(flat, cost, staged_reads)).collect();
     let mut users: Vec<Vec<(u32, usize)>> = vec![Vec::new(); n];
     let mut pinned = vec![false; n];
+    // Results a context reads: its index is declared where it is first used, which for a result
+    // that is assigned at the end of a group may be before it.
+    let mut read_by_context = vec![false; n];
     for (at, flat) in flats.iter().enumerate() {
         for (slot, arg) in flat.args.iter().enumerate() {
             if let Ref::Tmp(t) = *arg
@@ -341,9 +387,10 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
     for ctx in ctxs {
         for arg in ctx.args {
             if let Ref::Tmp(t) = arg
-                && let Some(flag) = pinned.get_mut(t as usize)
+                && let (Some(flag), Some(read)) = (pinned.get_mut(t as usize), read_by_context.get_mut(t as usize))
             {
                 *flag = true;
+                *read = true;
             }
         }
     }
@@ -352,7 +399,39 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
             *flag = true;
         }
     }
-    let share: Vec<f64> = flats.iter().map(|flat| if matches!(flat.op.kind, OpKind::Select) { taken_share(flats, ctxs, flat) } else { 1.0 }).collect();
+    // The share each select takes its operand 1 at: that of its mask, so what any select of the
+    // mask shows (a record's fields over one region: some assign a scalar, some an array) is
+    // used for all of them.
+    let mask_of = |flat: &Flat| (flat.args[0], flat.at);
+    let shown: Vec<Option<f64>> = flats.iter().map(|flat| if matches!(flat.op.kind, OpKind::Select) { taken_share(flats, ctxs, flat) } else { None }).collect();
+    let mut shown_by_mask: FxMap<(Ref, u32), f64> = FxMap::default();
+    for (flat, &found) in flats.iter().zip(&shown) {
+        if let Some(found) = found {
+            shown_by_mask.entry(mask_of(flat)).or_insert(found);
+        }
+    }
+    let share: Vec<f64> = flats
+        .iter()
+        .zip(&shown)
+        .map(|(flat, &found)| {
+            if matches!(flat.op.kind, OpKind::Select) { found.or_else(|| shown_by_mask.get(&mask_of(flat)).copied()).unwrap_or(UNKNOWN_SHARE) } else { 1.0 }
+        })
+        .collect();
+    // The groups: the branching selects of one mask at one context, each led by (`group` holds)
+    // its last select; the ones another instruction reads before then stay alone.
+    let mut group: Vec<u32> = (0..n as u32).collect();
+    let mut by_mask: FxMap<(Ref, u32), Vec<usize>> = FxMap::default();
+    for (s, flat) in flats.iter().enumerate() {
+        if branch[s] && !read_by_context[s] {
+            by_mask.entry(mask_of(flat)).or_default().push(s);
+        }
+    }
+    for members in by_mask.values() {
+        let Some(&anchor) = members.last() else { continue };
+        for &m in members {
+            group[m] = anchor as u32;
+        }
+    }
     let mut region = vec![Region::Top; n];
     let mut chance = vec![1.0f64; n];
     let mut saved = vec![0.0f64; n];
@@ -379,8 +458,8 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
             for &(user, slot) in &users[x] {
                 let u = user as usize;
                 let used_in = match (branch[u], slot) {
-                    (true, 1) => Region::Taken(user),
-                    (true, 2) => Region::Skipped(user),
+                    (true, 1) => Region::Taken(group[u]),
+                    (true, 2) => Region::Skipped(group[u]),
                     _ => region[u],
                 };
                 joint = Some(match joint {
@@ -402,6 +481,64 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
                 });
             }
             region[x] = joint.unwrap_or(Region::Top);
+        }
+        // The selects of a group are one `if` in one enclosing region: those whose results are
+        // used in another leave it (each set that shares a region stays a group), and the
+        // regions are found again.
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for s in 0..n {
+            if branch[s] {
+                lists[group[s] as usize].push(s as u32);
+            }
+        }
+        // The `if` of a group assigns the results of its selects at its last one. A select
+        // leaves it when another instruction that is not after that reads its result: only a
+        // read in the arm of another select, whose region the select is in, comes after (the
+        // arm is assigned once the region is computed).
+        let mut split = false;
+        for members in lists.iter().filter(|members| members.len() > 1) {
+            let anchor = members.last().map_or(0, |&last| last as usize);
+            for &m in members.iter().take(members.len() - 1) {
+                let m = m as usize;
+                let read_after = users[m].iter().all(|&(user, slot)| {
+                    let u = user as usize;
+                    u > anchor
+                        || (branch[u]
+                            && match slot {
+                                1 => region[m] == Region::Taken(group[u]),
+                                2 => region[m] == Region::Skipped(group[u]),
+                                _ => false,
+                            })
+                });
+                if !read_after {
+                    group[m] = m as u32;
+                    split = true;
+                }
+            }
+        }
+        if split {
+            continue;
+        }
+        for members in lists.iter().filter(|members| members.len() > 1) {
+            let mut parts: Vec<(Region, Vec<u32>)> = Vec::new();
+            for &m in members {
+                match parts.iter_mut().find(|(r, _)| *r == region[m as usize]) {
+                    Some((_, part)) => part.push(m),
+                    None => parts.push((region[m as usize], vec![m])),
+                }
+            }
+            if parts.len() > 1 {
+                split = true;
+                for (_, part) in &parts {
+                    let anchor = part.last().copied().unwrap_or(0);
+                    for &m in part {
+                        group[m as usize] = anchor;
+                    }
+                }
+            }
+        }
+        if split {
+            continue;
         }
         // The share of the elements that compute each region.
         let region_chance = |chance: &[f64], r: Region| match r {
@@ -431,15 +568,18 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
             }
         }
         let mut dropped = false;
-        for s in 0..n {
-            if branch[s] && saved[s] < BRANCH_GAIN * chance[s] {
-                branch[s] = false;
+        for (anchor, members) in lists.iter().enumerate() {
+            if !members.is_empty() && saved[anchor] < BRANCH_GAIN * chance[anchor] {
+                for &m in members {
+                    branch[m as usize] = false;
+                    group[m as usize] = m;
+                }
                 dropped = true;
             }
         }
         if !dropped {
             let ops = (0..n).map(|x| weight[x] * chance[x]).sum();
-            return Branches { region, branch, ops };
+            return Branches { region, branch, group, ops };
         }
     }
 }
@@ -1538,6 +1678,218 @@ mod tests {
         assert!(cheap.region.iter().all(|&region| region == Region::Top));
         let data = fits(inline(&region_key(20, true), 1000, &cost));
         assert!(data.branch.iter().all(|&branch| !branch));
+    }
+
+    /// The fields of a record assigned over half of a 64-cell array: per field a select by one
+    /// mask between that field's operation on `e` (the expression and `extra` square roots, read
+    /// through a clamped view of a 32-cell array: a region assigned) and the field's old value.
+    /// `read_first`: another instruction reads the first field's result before the others are
+    /// selected.
+    fn record_key(fields: usize, extra: u32, read_first: bool) -> FusedKey {
+        let mut long = expression();
+        for k in 0..extra {
+            long.push(instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(2 + k), Ref::Unused, Ref::Unused]));
+        }
+        let mut map = ViewMap::identity([32, 1, 1, 1]);
+        map.out[0] = 64;
+        let mut main = vec![
+            Instr { op: Op::new(OpKind::Generate(Gen::RangePow2), ElemTy::U32), args: [Ref::Scalar(0), Ref::Scalar(0), Ref::Unused] },
+            Instr { op: Op::new(OpKind::Compare(CmpOp::Ge), ElemTy::U32), args: [Ref::Tmp(0), Ref::Scalar(0), Ref::Unused] },
+            instr(OpKind::Shift(ShiftKind::View { map, edge: Edge::Clamp }), [Ref::Sub(0), Ref::Unused, Ref::Unused]),
+        ];
+        let mut outputs = Vec::new();
+        for (k, op) in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Max].into_iter().cycle().take(fields).enumerate() {
+            main.push(instr(OpKind::Binary(op), [Ref::Tmp(2), Ref::Scalar(1), Ref::Unused]));
+            let arm = main.len() as u32 - 1;
+            main.push(instr(OpKind::Select, [Ref::Tmp(1), Ref::Tmp(arm), Ref::Input(0)]));
+            let select = main.len() as u32 - 1;
+            outputs.push(select);
+            if read_first && k == 0 {
+                main.push(instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(select), Ref::Scalar(1), Ref::Unused]));
+                outputs.push(main.len() as u32 - 1);
+            }
+        }
+        let mut key = key(main, vec![long]);
+        key.outputs = outputs;
+        key
+    }
+
+    fn selects(inlined: &Inlined) -> Vec<usize> {
+        (0..inlined.instrs.len()).filter(|&n| matches!(inlined.instrs[n].op.kind, OpKind::Select)).collect()
+    }
+
+    #[test]
+    fn the_fields_of_a_record_assigned_over_a_region_share_one_branch_and_the_work_of_their_arms() {
+        let cost = CostModel::TEST;
+        for fields in [2usize, 5] {
+            let inlined = fits(inline(&record_key(fields, 20, false), 1000, &cost));
+            let selects = selects(&inlined);
+            assert_eq!(selects.len(), fields);
+            let anchor = selects[fields - 1] as u32;
+            for &s in &selects {
+                assert!(inlined.branch[s], "{fields} fields: select {s}: {:?}", inlined.region);
+                assert_eq!(inlined.group[s], anchor, "{fields} fields: select {s}");
+                assert_eq!(inlined.region[s], Region::Top);
+            }
+            // The shared expression (23 instructions) and every field's operation are computed
+            // only where the mask holds, once: they are all in the region of the one group.
+            let inside = |n: usize| !selects.contains(&n) && n >= 2;
+            let count = (0..inlined.instrs.len()).filter(|&n| inside(n)).count();
+            assert_eq!(count, 23 + fields);
+            assert!((0..inlined.instrs.len()).filter(|&n| inside(n)).all(|n| inlined.region[n] == Region::Taken(anchor)), "{fields} fields: {:?}", inlined.region);
+            // Half the cells take it: the operations are the others' plus half of those inside.
+            let weight = |n: usize| op_weight(inlined.instrs[n].op, &cost);
+            let all: f64 = (0..inlined.instrs.len()).map(weight).sum();
+            let taken: f64 = (0..inlined.instrs.len()).filter(|&n| inside(n)).map(weight).sum();
+            assert!((inlined.ops - (all - taken / 2.0)).abs() < 1e-9, "{} of {all}, inside {taken}", inlined.ops);
+            assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_select_whose_result_is_read_before_the_last_of_its_mask_is_not_grouped() {
+        let inlined = fits(inline(&record_key(3, 20, true), 1000, &CostModel::TEST));
+        let selects = selects(&inlined);
+        assert_eq!(selects.len(), 3);
+        // The first one's result is read before the others are selected: the `if` of the others
+        // assigns theirs afterwards, so it is not one of them.
+        assert_eq!(inlined.group[selects[0]], selects[0] as u32, "{:?}", inlined.group);
+        assert_ne!(inlined.group[selects[0]], inlined.group[selects[2]], "{:?}", inlined.group);
+        assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
+    }
+
+    /// Two region assigns over a record one after the other, as a boundary condition does: field
+    /// `k` is `select(m2, arm2_k, select(m1, arm1_k, old_k))`, the arms read two expressions each
+    /// of the fields share. The program is written field by field, as the lowering meets it: field
+    /// 0's two selects, then field 1's, ...
+    fn chained_record_key(fields: usize) -> FusedKey {
+        let chain = |extra: u32, scale: bool| {
+            let mut long = expression();
+            if scale {
+                long[0] = instr(OpKind::Binary(BinOp::Mul), [Ref::Input(0), Ref::Scalar(1), Ref::Unused]);
+            }
+            for k in 0..extra {
+                long.push(instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(2 + k), Ref::Unused, Ref::Unused]));
+            }
+            long
+        };
+        let view = |src: u32| {
+            let mut map = ViewMap::identity([src, 1, 1, 1]);
+            map.out[0] = 64;
+            ShiftKind::View { map, edge: Edge::Clamp }
+        };
+        let mut main = vec![
+            Instr { op: Op::new(OpKind::Generate(Gen::RangePow2), ElemTy::U32), args: [Ref::Scalar(0), Ref::Scalar(0), Ref::Unused] },
+            Instr { op: Op::new(OpKind::Compare(CmpOp::Ge), ElemTy::U32), args: [Ref::Tmp(0), Ref::Scalar(0), Ref::Unused] },
+            Instr { op: Op::new(OpKind::Compare(CmpOp::Lt), ElemTy::U32), args: [Ref::Tmp(0), Ref::Scalar(1), Ref::Unused] },
+            instr(OpKind::Shift(view(32)), [Ref::Sub(0), Ref::Unused, Ref::Unused]),
+            instr(OpKind::Shift(view(16)), [Ref::Sub(1), Ref::Unused, Ref::Unused]),
+        ];
+        let mut outputs = Vec::new();
+        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Max].into_iter().cycle().take(fields) {
+            main.push(instr(OpKind::Binary(op), [Ref::Tmp(3), Ref::Scalar(1), Ref::Unused]));
+            main.push(instr(OpKind::Select, [Ref::Tmp(1), Ref::Tmp(main.len() as u32 - 1), Ref::Input(0)]));
+            let inner = main.len() as u32 - 1;
+            main.push(instr(OpKind::Binary(op), [Ref::Tmp(4), Ref::Scalar(1), Ref::Unused]));
+            main.push(instr(OpKind::Select, [Ref::Tmp(2), Ref::Tmp(main.len() as u32 - 1), Ref::Tmp(inner)]));
+            outputs.push(main.len() as u32 - 1);
+        }
+        let mut key = key(main, vec![chain(20, false), chain(20, true)]);
+        key.outputs = outputs;
+        key
+    }
+
+    #[test]
+    fn the_fields_of_a_record_assigned_over_two_regions_in_a_row_are_two_groups_one_in_the_other() {
+        for fields in [2usize, 5] {
+            let inlined = fits(inline(&chained_record_key(fields), 1000, &CostModel::TEST));
+            let selects = selects(&inlined);
+            assert_eq!(selects.len(), 2 * fields);
+            // The outer select of every field (the last of its mask): the stored values.
+            let (inner, outer): (Vec<usize>, Vec<usize>) = (0..fields).map(|k| (selects[2 * k], selects[2 * k + 1])).unzip();
+            let (inner_anchor, outer_anchor) = (inner[fields - 1] as u32, outer[fields - 1] as u32);
+            for k in 0..fields {
+                assert!(inlined.branch[inner[k]] && inlined.branch[outer[k]], "{fields} fields, field {k}: {:?}", inlined.region);
+                assert_eq!((inlined.group[inner[k]], inlined.group[outer[k]]), (inner_anchor, outer_anchor), "{fields} fields, field {k}: {:?}", inlined.group);
+                assert_eq!(inlined.region[outer[k]], Region::Top);
+                assert_eq!(inlined.region[inner[k]], Region::Skipped(outer_anchor), "{fields} fields, field {k}");
+            }
+            // The first expression and the arms using it are computed where the inner mask holds and
+            // the outer does not, the second expression where the outer mask holds.
+            let first = inlined.instrs.iter().position(|flat| matches!(flat.op.kind, OpKind::Unary(UnOp::Sqrt))).expect("a sqrt");
+            assert_eq!(inlined.region[first], Region::Taken(inner_anchor), "{:?}", inlined.region);
+            let last = inlined.instrs.iter().rposition(|flat| matches!(flat.op.kind, OpKind::Unary(UnOp::Sqrt))).expect("a sqrt");
+            assert_eq!(inlined.region[last], Region::Taken(outer_anchor), "{:?}", inlined.region);
+            assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
+        }
+    }
+
+    /// `select(mask, value, old)` over 64 cells where the value is a thin region of 4 cells (an
+    /// evaluated array read through a clamped view) or a scalar, and `old` is a long chain of
+    /// square roots of the input: nearly every cell takes the old value.
+    /// `with_sibling`: a second select by the same mask takes the thin view, and the first (the one
+    /// of the group that is last) a scalar.
+    fn thin_region_key(with_sibling: bool) -> FusedKey {
+        let mut map = ViewMap::identity([4, 1, 1, 1]);
+        map.out[0] = 64;
+        let mut main = vec![
+            Instr { op: Op::new(OpKind::Generate(Gen::RangePow2), ElemTy::U32), args: [Ref::Scalar(0), Ref::Scalar(0), Ref::Unused] },
+            Instr { op: Op::new(OpKind::Compare(CmpOp::Ge), ElemTy::U32), args: [Ref::Tmp(0), Ref::Scalar(0), Ref::Unused] },
+            instr(OpKind::Shift(ShiftKind::View { map, edge: Edge::Clamp }), [Ref::Input(1), Ref::Unused, Ref::Unused]),
+            instr(OpKind::Binary(BinOp::Mul), [Ref::Input(0), Ref::Scalar(0), Ref::Unused]),
+        ];
+        for _ in 0..20 {
+            main.push(instr(OpKind::Unary(UnOp::Sqrt), [Ref::Tmp(main.len() as u32 - 1), Ref::Unused, Ref::Unused]));
+        }
+        let old = main.len() as u32 - 1;
+        let mut outputs = Vec::new();
+        if with_sibling {
+            main.push(instr(OpKind::Binary(BinOp::Add), [Ref::Tmp(old), Ref::Scalar(1), Ref::Unused]));
+            let plus = main.len() as u32 - 1;
+            main.push(instr(OpKind::Select, [Ref::Tmp(1), Ref::Tmp(2), Ref::Tmp(plus)]));
+            outputs.push(main.len() as u32 - 1);
+            main.push(instr(OpKind::Select, [Ref::Tmp(1), Ref::Scalar(1), Ref::Tmp(old)]));
+        } else {
+            main.push(instr(OpKind::Select, [Ref::Tmp(1), Ref::Tmp(2), Ref::Tmp(old)]));
+        }
+        outputs.push(main.len() as u32 - 1);
+        let mut key = key(main, Vec::new());
+        key.input_tys = vec![ElemTy::F32, ElemTy::F32];
+        key.outputs = outputs;
+        key
+    }
+
+    /// The operations of `inlined` if 4 of 64 cells take every `Taken` region: those of the
+    /// others' at the share of the cells that compute them.
+    fn thin_ops(inlined: &Inlined, cost: &CostModel) -> f64 {
+        let chance = |region| match region {
+            Region::Top => 1.0,
+            Region::Taken(_) => 1.0 / 16.0,
+            Region::Skipped(_) => 15.0 / 16.0,
+        };
+        (0..inlined.instrs.len()).map(|n| op_weight(inlined.instrs[n].op, cost) * chance(inlined.region[n])).sum()
+    }
+
+    #[test]
+    fn a_thin_region_read_from_an_evaluated_array_counts_the_old_expression_at_nearly_every_cell() {
+        // 60 of the 64 cells take the old value: its 81 operations count at 15/16, the thin
+        // view's read at 1/16 (an evaluated array's view used to show no share, so that both
+        // counted at a half).
+        let cost = CostModel::TEST;
+        let inlined = fits(inline(&thin_region_key(false), 1000, &cost));
+        assert!(inlined.branch[inlined.instrs.len() - 1], "{:?}", inlined.region);
+        assert!((inlined.ops - thin_ops(&inlined, &cost)).abs() < 1e-9, "{} against {}", inlined.ops, thin_ops(&inlined, &cost));
+    }
+
+    #[test]
+    fn a_scalar_assigned_over_a_region_takes_the_share_another_field_of_the_mask_shows() {
+        // The scalar's select is the last of its mask and shows nothing; the other field's thin view does.
+        let cost = CostModel::TEST;
+        let inlined = fits(inline(&thin_region_key(true), 1000, &cost));
+        let selects = selects(&inlined);
+        assert_eq!(selects.len(), 2);
+        assert!(selects.iter().all(|&s| inlined.branch[s] && inlined.group[s] == selects[1] as u32), "{:?}", inlined.region);
+        assert!((inlined.ops - thin_ops(&inlined, &cost)).abs() < 1e-9, "{} against {}", inlined.ops, thin_ops(&inlined, &cost));
     }
 
     #[test]

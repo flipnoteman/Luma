@@ -775,6 +775,15 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         }
         _ => None,
     };
+    // So does a gate the reduction runs on its final value (see `ReduceList::with_gate`): the
+    // buffers it works in come after those.
+    let gate = match key.tail {
+        Tail::Reduce(ops) if ops.gate().is_some() => {
+            binding += crate::builtin::GATE_BINDINGS;
+            Some((binding - crate::builtin::GATE_BINDINGS) as u32)
+        }
+        _ => None,
+    };
     if uniform {
         let _ = writeln!(src, "@group(1) @binding({binding}) var<uniform> p: Params;");
     }
@@ -851,7 +860,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
                 }
                 let _ = write!(src, "\nfn luma_eval(i: u32) -> {ty} {{\n{global}{computed}{stores}    return t{};\n}}\n", values[side_stores]);
             }
-            src.push_str(&reduce_main(elem, ops, false, "luma_eval", tuning, single_pass));
+            src.push_str(&reduce_main(elem, ops, false, "luma_eval", tuning, single_pass, gate));
         }
         Tail::AxisReduce(pass) => {
             let names = Names { views: &views, in_place: &[] };
@@ -1074,6 +1083,9 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
         loaded: Vec<(u32, u32)>,
         /// The instructions of every region not written yet, in order.
         members: FxMap<Region, Vec<u32>>,
+        /// The selects computed as `if`/`else` that are kept, by group (see [`Inlined::group`]):
+        /// written together, at the last of them.
+        groups: FxMap<u32, Vec<u32>>,
     }
     impl Emit<'_> {
         /// The index of context `c`.
@@ -1156,7 +1168,8 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                 self.define(flat.at);
             }
             if inlined.branch.get(n).copied().unwrap_or(false) {
-                return self.branch(n);
+                let anchor = inlined.group.get(n).copied().unwrap_or(n as u32);
+                return self.branch(anchor, n);
             }
             let op = flat.op;
             let value = match op.kind {
@@ -1213,24 +1226,37 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
             let _ = writeln!(self.src, "    let t{n}: {} = {value};", op.out_ty().wgsl());
         }
 
-        /// Writes the `Select` `n` as `if`/`else`, each branch computing its own instructions
-        /// before it takes its operand.
-        fn branch(&mut self, n: usize) {
+        /// Writes the group `anchor` of `Select`s as one `if`/`else`, each branch computing the
+        /// instructions only its operands need before it takes them, if `n` is the last of its kept
+        /// members (the rest are written there).
+        fn branch(&mut self, anchor: u32, n: usize) {
             let inlined = self.inlined;
+            let Some(members) = self.groups.get(&anchor).cloned() else { return };
+            if members.last().is_none_or(|&last| last as usize != n) {
+                return;
+            }
             let Some(flat) = inlined.instrs.get(n) else { return };
             let mask = flat_name(flat.args[0], ElemTy::U32, flat.at);
-            let _ = writeln!(self.src, "    var t{n}: {};\n    if ({mask} != 0u) {{", flat.op.out_ty().wgsl());
-            for (side, slot) in [(Region::Taken(n as u32), 1), (Region::Skipped(n as u32), 2)] {
+            for &m in &members {
+                if let Some(member) = inlined.instrs.get(m as usize) {
+                    let _ = writeln!(self.src, "    var t{m}: {};", member.op.out_ty().wgsl());
+                }
+            }
+            let _ = writeln!(self.src, "    if ({mask} != 0u) {{");
+            for (side, slot) in [(Region::Taken(anchor), 1), (Region::Skipped(anchor), 2)] {
                 if slot == 2 {
                     self.src.push_str("    } else {\n");
                 }
                 let outer = (self.defined.clone(), self.loaded.clone());
                 self.region(side);
-                if let Ref::Input(k) = flat.args[slot] {
-                    self.load(k, flat.at);
+                for &m in &members {
+                    let Some(flat) = inlined.instrs.get(m as usize) else { continue };
+                    if let Ref::Input(k) = flat.args[slot] {
+                        self.load(k, flat.at);
+                    }
+                    let value = flat_name(flat.args[slot], flat.op.operand_ty(slot), flat.at);
+                    let _ = writeln!(self.src, "    t{m} = {value};");
                 }
-                let value = flat_name(flat.args[slot], flat.op.operand_ty(slot), flat.at);
-                let _ = writeln!(self.src, "    t{n} = {value};");
                 (self.defined, self.loaded) = outer;
             }
             self.src.push_str("    }\n");
@@ -1238,8 +1264,12 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
     }
 
     let mut members: FxMap<Region, Vec<u32>> = FxMap::default();
+    let mut groups: FxMap<u32, Vec<u32>> = FxMap::default();
     for (n, &region) in inlined.region.iter().enumerate().filter(|&(n, _)| keep.is_none_or(|keep| keep.get(n).copied().unwrap_or(false))) {
         members.entry(region).or_default().push(n as u32);
+        if inlined.branch.get(n).copied().unwrap_or(false) {
+            groups.entry(inlined.group.get(n).copied().unwrap_or(n as u32)).or_default().push(n as u32);
+        }
     }
     let mut emit = Emit {
         key,
@@ -1251,6 +1281,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
         defined: vec![false; inlined.ctxs.len()],
         loaded: Vec::new(),
         members,
+        groups,
     };
     emit.region(Region::Top);
     emit.src

@@ -62,6 +62,13 @@ impl Reduced {
         &self.operand
     }
 
+    /// What a kernel that reduces `operand` itself needs to run this reduction (see
+    /// `jit::until::force_with_record`): the operand, the ops, what is applied to their values.
+    /// `None` unless it is a reduction of `f32`s that has not been recorded, and has not failed.
+    pub(crate) fn fusable(&self) -> Option<(&Arc<Node>, ReduceList, Finish)> {
+        (self.wgsl == "f32" && self.ty == ElemTy::F32 && self.is_unforced() && self.failure().is_none()).then_some((&self.operand, self.ops, self.finish))
+    }
+
     /// The error of the operand's evaluation or of the recorded passes, if any.
     pub(crate) fn failure(&self) -> Option<&Arc<LumaError>> {
         self.operand.failure().or_else(|| self.result.get().and_then(|result| result.as_ref().err()))

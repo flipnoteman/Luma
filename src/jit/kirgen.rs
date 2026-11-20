@@ -1256,9 +1256,14 @@ impl<'a> Lower<'a> {
         keep: Option<&[bool]>,
         held: &[u32],
     ) -> Frame {
+        let kept = |n: usize| keep.is_none_or(|keep| keep.get(n).copied().unwrap_or(false));
         let mut members: FxMap<Region, Vec<u32>> = FxMap::default();
-        for (n, &region) in inlined.region.iter().enumerate().filter(|&(n, _)| keep.is_none_or(|keep| keep.get(n).copied().unwrap_or(false))) {
+        let mut groups: FxMap<u32, Vec<u32>> = FxMap::default();
+        for (n, &region) in inlined.region.iter().enumerate().filter(|&(n, _)| kept(n)) {
             members.entry(region).or_default().push(n as u32);
+            if inlined.branch.get(n).copied().unwrap_or(false) {
+                groups.entry(inlined.group.get(n).copied().unwrap_or(n as u32)).or_default().push(n as u32);
+            }
         }
         let (has_b, bool_only) = bool_masks(key, inlined, held);
         let mut emit = Emit {
@@ -1276,6 +1281,7 @@ impl<'a> Lower<'a> {
             has_b,
             bool_only,
             members,
+            groups,
         };
         emit.region(fb, Region::Top);
         emit.frame
@@ -1397,6 +1403,9 @@ struct Emit<'e, 'k> {
     bool_only: Vec<bool>,
     /// The instructions of every region not written yet, in order.
     members: FxMap<Region, Vec<u32>>,
+    /// The selects computed as `if`s that are kept, by group (see [`Inlined::group`]): written
+    /// together, at the last of them.
+    groups: FxMap<u32, Vec<u32>>,
 }
 
 impl Emit<'_, '_> {
@@ -1499,7 +1508,8 @@ impl Emit<'_, '_> {
             self.define(fb, flat.at);
         }
         if inlined.branch.get(n).copied().unwrap_or(false) {
-            return self.branch(fb, n);
+            let anchor = inlined.group.get(n).copied().unwrap_or(n as u32);
+            return self.branch(fb, anchor, n);
         }
         let op = flat.op;
         if self.has_b.get(n).copied().unwrap_or(false) {
@@ -1627,13 +1637,18 @@ impl Emit<'_, '_> {
         self.frame.t[n] = Some(value);
     }
 
-    /// Writes the `Select` `n` as `if`s, each branch computing its own instructions before it
-    /// takes its operand.
-    fn branch(&mut self, fb: &mut FnBuilder<'_>, n: usize) {
+    /// Writes the group `anchor` of `Select`s as one `if`, each branch computing the
+    /// instructions only its operands need before it takes them, if `n` is the last of its kept
+    /// members (the rest are written there).
+    fn branch(&mut self, fb: &mut FnBuilder<'_>, anchor: u32, n: usize) {
         let inlined = self.inlined;
+        let Some(members) = self.groups.get(&anchor).cloned() else { return };
+        if members.last().is_none_or(|&last| last as usize != n) {
+            return;
+        }
         let Some(flat) = inlined.instrs.get(n) else { return };
         let mask = self.operand(fb, flat.args[0], ElemTy::U32, flat.at);
-        let local = fb.var_decl(&format!("t{n}"), reg(flat.op.out_ty()), None);
+        let locals: Vec<(usize, _)> = members.iter().map(|&m| (m as usize, fb.var_decl(&format!("t{m}"), reg(inlined.instrs[m as usize].op.out_ty()), None))).collect();
         let zero = lu(fb, 0);
         let taken = match flat.args[0] {
             Ref::Tmp(m) => self.frame.b(m as usize),
@@ -1646,15 +1661,20 @@ impl Emit<'_, '_> {
             let mut guard = me.borrow_mut();
             let this: &mut Emit<'_, '_> = &mut guard;
             this.region(b, side);
-            if let Ref::Input(k) = flat.args[slot] {
-                this.load(b, k, flat.at);
+            for &(m, local) in &locals {
+                let flat = &inlined.instrs[m];
+                if let Ref::Input(k) = flat.args[slot] {
+                    this.load(b, k, flat.at);
+                }
+                let value = this.operand(b, flat.args[slot], flat.op.operand_ty(slot), flat.at);
+                b.assign_var(local, value);
             }
-            let value = this.operand(b, flat.args[slot], flat.op.operand_ty(slot), flat.at);
-            b.assign_var(local, value);
             (this.defined, this.frame.a, this.staged_base, this.pview) = outer.clone();
         };
-        fb.if_else(taken, |b| arm(b, Region::Taken(n as u32), 1), |b| arm(b, Region::Skipped(n as u32), 2));
-        self.frame.t[n] = Some(fb.read_var(local));
+        fb.if_else(taken, |b| arm(b, Region::Taken(anchor), 1), |b| arm(b, Region::Skipped(anchor), 2));
+        for (m, local) in locals {
+            self.frame.t[m] = Some(fb.read_var(local));
+        }
     }
 }
 

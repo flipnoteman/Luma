@@ -198,6 +198,20 @@ impl Context {
         self.with_recording(|recording| recording.cmds.len()).unwrap_or(0)
     }
 
+    /// Whether this thread's recording has captured a launch that writes a buffer that existed
+    /// before the recording (a captured array, say) other than the reduction counter, which every
+    /// launch of a reduction leaves as it found it. Replaying such a step more often than it has
+    /// steps would apply the writes more often.
+    pub(crate) fn recording_writes_outside(&self) -> bool {
+        let counter = self.inner.reduce_counter.get();
+        self.with_recording(|recording| {
+            recording.cmds.iter().flat_map(|cmd| &cmd.args).any(|arg| {
+                matches!(arg, CmdArg::Storage { buffer, writable: true, .. } if !recording.fresh.contains(&buffer.id()) && counter != Some(buffer))
+            })
+        })
+        .unwrap_or(false)
+    }
+
     /// Ends this thread's recording and returns it, or `None` if it was aborted (or there is none).
     pub(crate) fn end_recording(&self) -> Option<Recording> {
         let id = self.inner.id;
