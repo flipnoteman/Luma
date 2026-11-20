@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e6970edc.js";
+            window.path_to_searchindex_js = "searchindex-423e026e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -2898,7 +2898,7 @@ through memory, not correctness:</p>
 share work with it), and the rest is flattened again.</p>
 <h3 id="many-arrays-in-one-kernel"><a class="header" href="#many-arrays-in-one-kernel">Many arrays in one kernel</a></h3>
 <p>A kernel that reads many different arrays (the 50 words of a Keccak state) meets the device’s
-binding limit: 16 on llvmpipe and many integrated GPUs, 29 on Metal, 256 or more on discrete GPUs.
+binding limit: 16 on many integrated GPUs via WebGPU, 29 on wgpu Metal, 256 on native CUDA, native Metal (argument buffers) and discrete GPUs.
 Cutting such an expression on the limit alone would evaluate it a few operations at a time, because
 every round reads every array. Luma instead puts the arrays into one buffer. When a kernel would bind
 more arrays than the device allows, the evaluated arrays of one length and type it reads are copied
@@ -2921,8 +2921,8 @@ convolution, and custom kernels. They read computed arrays.</p>
 values are wired. Scalar values are uniforms, so <code>&amp;x * 2.0</code> and <code>&amp;x * 3.0</code> share one pipeline,
 and an expression with the same shape built again costs the host only the flattening. Identical
 operations on the same operands are one node (hash-consing).</li>
-<li><strong>Compiled pipelines</strong> are cached on disk (wgpu’s <code>PipelineCache</code>, Vulkan) per adapter and
-driver, so a second process skips the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
+<li><strong>Compiled pipelines</strong> are cached on disk (CUDA PTX, CPU Cranelift object files, and wgpu’s Vulkan <code>PipelineCache</code>) per adapter and
+driver, and in-process on Metal, so repeated runs skip the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
 <code>LUMA_CACHE=off</code> disables both; <code>LUMA_CACHE_DIR</code> moves them. A damaged file is ignored.</li>
 <li><strong>Loops</strong>: an <code>iterate_all</code> called again from the same place with the same step graph reuses the
 earlier program, and after two such calls the GPU starts before the step is traced
@@ -3332,9 +3332,7 @@ match Context::cpu() {
     Err(error) =&gt; return Err(error),
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><strong>Opening a context returns <code>LumaError::NoAdapter</code> (“Found no adapters”).</strong> There is no Vulkan, Metal or DX12 driver
-Luma can use. On Linux install <code>mesa-vulkan-drivers</code> (lavapipe) for the CPU fallback, or your GPU
-vendor’s Vulkan driver. CI runners need the former.</p>
+<p><strong>Opening a context returns <code>LumaError::NoAdapter</code> (“Found no adapters”).</strong> With <code>LUMA_DEVICE=gpu</code> (or when built without the <code>cpu</code> feature), no hardware GPU driver (CUDA, Metal, Vulkan or DX12) was found. Install your GPU vendor’s driver, or keep the default <code>cpu</code> feature enabled for the native SIMD CPU fallback.</p>
 <p><strong>I have two GPUs and want the other one.</strong> Luma asks for the high-performance adapter and has no
 adapter-by-name setting. On Linux the Vulkan loader decides which drivers wgpu sees, so pointing
 <code>VK_ICD_FILENAMES</code> at one driver’s <code>.json</code> file (for example
@@ -3474,7 +3472,7 @@ then wgpu. The CUDA backend needs only the NVIDIA driver, no CUDA toolkit.</li>
 (<a href="#views-and-writes">Views and writes</a>).</li>
 <li><code>Context::memory_stats()</code> and <code>Context::trim()</code> (<a href="#performance-guide">Performance guide</a>).</li>
 <li><code>iterate_until_all</code> and <code>compile_until_all</code> loops replay a block of steps as one graph on backends that
-capture them (CUDA, CPU) (<a href="#stop-conditions-iterate_until_all">Loops</a>).</li>
+capture them (CUDA, Metal, CPU) (<a href="#stop-conditions-iterate_until_all">Loops</a>).</li>
 </ul>
 <h2 id="from-03-to-04"><a class="header" href="#from-03-to-04">From 0.3 to 0.4</a></h2>
 <p>0.4 changes the type of comparisons: they return boolean arrays (<code>Array&lt;bool&gt;</code>) instead of

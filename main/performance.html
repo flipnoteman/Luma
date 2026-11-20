@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e6970edc.js";
+            window.path_to_searchindex_js = "searchindex-423e026e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -337,7 +337,7 @@ through memory, not correctness:</p>
 share work with it), and the rest is flattened again.</p>
 <h3 id="many-arrays-in-one-kernel"><a class="header" href="#many-arrays-in-one-kernel">Many arrays in one kernel</a></h3>
 <p>A kernel that reads many different arrays (the 50 words of a Keccak state) meets the device’s
-binding limit: 16 on llvmpipe and many integrated GPUs, 29 on Metal, 256 or more on discrete GPUs.
+binding limit: 16 on many integrated GPUs via WebGPU, 29 on wgpu Metal, 256 on native CUDA, native Metal (argument buffers) and discrete GPUs.
 Cutting such an expression on the limit alone would evaluate it a few operations at a time, because
 every round reads every array. Luma instead puts the arrays into one buffer. When a kernel would bind
 more arrays than the device allows, the evaluated arrays of one length and type it reads are copied
@@ -360,8 +360,8 @@ convolution, and custom kernels. They read computed arrays.</p>
 values are wired. Scalar values are uniforms, so <code>&amp;x * 2.0</code> and <code>&amp;x * 3.0</code> share one pipeline,
 and an expression with the same shape built again costs the host only the flattening. Identical
 operations on the same operands are one node (hash-consing).</li>
-<li><strong>Compiled pipelines</strong> are cached on disk (wgpu’s <code>PipelineCache</code>, Vulkan) per adapter and
-driver, so a second process skips the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
+<li><strong>Compiled pipelines</strong> are cached on disk (CUDA PTX, CPU Cranelift object files, and wgpu’s Vulkan <code>PipelineCache</code>) per adapter and
+driver, and in-process on Metal, so repeated runs skip the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
 <code>LUMA_CACHE=off</code> disables both; <code>LUMA_CACHE_DIR</code> moves them. A damaged file is ignored.</li>
 <li><strong>Loops</strong>: an <code>iterate_all</code> called again from the same place with the same step graph reuses the
 earlier program, and after two such calls the GPU starts before the step is traced
