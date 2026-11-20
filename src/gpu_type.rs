@@ -227,8 +227,9 @@ impl ScalarType for f64 {
 
 /// A double-float: the unevaluated sum `hi + lo` of two `f32`, about 48 bits of mantissa,
 /// computed with `f32` arithmetic only (so it needs no 64-bit float support). Arrays of `Df32`
-/// have `+ - * /`, `sqrt`, `abs`, comparisons, `minimum`/`maximum`, `select`, views, reductions
-/// and the casts [`crate::Array::to_f32`] / `to_f64`. See [`crate::Array::sum_compensated`].
+/// have `+ - * /`, `sqrt`, `exp`, `ln`, `tanh`, `abs`, `log1p`, `expm1`, `powf`, comparisons,
+/// `minimum`/`maximum`, `select`, views, reductions and the casts [`crate::Array::to_f32`] /
+/// `to_f64`. See [`crate::Array::sum_compensated`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Df32 {

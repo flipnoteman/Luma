@@ -1,12 +1,13 @@
 //! Extended precision: casts between `f32`, `f64` and [`Df32`] arrays and the compensated
 //! reductions built on them.
 //!
-//! `f64` arrays need a device with 64-bit shader floats (`luma_core::Features::SHADER_F64`, in
-//! practice Vulkan) and have the operations `+ - * /`, `sqrt`, `abs`, `sign`, `floor`, `ceil`,
-//! `minimum`, `maximum`, comparisons, `select`, views and reductions; anything else (`exp`,
-//! trigonometry, ...) poisons the result with [`LumaError::Unsupported`](crate::LumaError).
-//! [`Df32`] arrays (a pair of `f32`, about 48 bits of mantissa) run everywhere with `+ - * /`,
-//! `sqrt`, `abs`, comparisons, `minimum`, `maximum`, `select`, views and reductions.
+//! `f64` arrays need a device with 64-bit shader floats (`luma_core::Features::SHADER_F64`: CUDA,
+//! the native `cpu` backend, and some Vulkan GPUs) and have the operations `+ - * /`, `sqrt`,
+//! `abs`, `sign`, `floor`, `ceil`, `minimum`, `maximum`, comparisons, `select`, views and
+//! reductions; anything else (`exp`, trigonometry, ...) poisons the result with
+//! [`LumaError::Unsupported`](crate::LumaError). [`Df32`] arrays (a pair of `f32`, about 48 bits of
+//! mantissa) run everywhere with `+ - * /`, `sqrt`, `exp`, `ln`, `tanh`, `abs`, `log1p`, `expm1`,
+//! `powf`, comparisons, `minimum`, `maximum`, `select`, views and reductions.
 
 use std::panic::Location;
 

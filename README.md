@@ -56,7 +56,7 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 - Arrays of `f32`, `u32`, `i32`, `bool` (the result of comparisons, stored as one bit per element), `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; casts between `f32`, `u32` and `i32`; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
 - `vec2`/`vec4` element types and `luma::fields!` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
-- Views: `slice` (`ViewMut` for writes), `pad`, `flip`, `transpose`, `take`, `put`, `concat`, `stack`, `broadcast_to`
+- Views: `slice`, `pad`, `flip`, `transpose`, `swap_axes`, `permute_axes` (`ViewMut` `_mut` forms for writes), `take`, `put`, `concat`, `stack`, `broadcast_to`
 - Reductions: sum, min, max, mean, norm, along axes (`reduce_axis` computes several in one pass, with `mean_axis`, `var_axis`, `std_axis`); `scan` / `cumsum`; `solve_tridiagonal`
 - Data-science primitives: `matmul`; atomic scatters `put_add` / `put_min` / `put_max`, `bincount` and `histogram`; radix `sort`, `argsort`, `sort_axis`; `group_sum` / `group_mean` / `group_min` / `group_max` / `group_count`, `factorize` / `unique`; `quantile` and `median`; `searchsorted` / `digitize` / `isin`; NaN-aware reductions (`nansum`, `nanmean`, `nanmin`, `nanmax`); `round`, `trunc`, `log1p`, `expm1`. Pending operands are computed inside their kernels instead of being stored first
 - Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
@@ -64,13 +64,13 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 - Batched submission
 - Non-blocking `eval` / `eval_all`: the GPU runs while the host records the next steps; reads and `sync` wait
 - Readback into a new `Vec` (`to_vec`) or into host memory you already own (`read_into`)
-- Multi-step stencils with `iterate`; elementwise loops over several arrays with `iterate_all`, compiled into one kernel that keeps the state in registers; `iterate_until` / `iterate_until_all` stop on a device-side condition
+- Multi-step stencils with `iterate`; elementwise loops over several arrays with `iterate_all`, compiled into one kernel that keeps the state in registers; `iterate_until` / `iterate_until_all` stop on a device-side condition (`compile_until_all` traces that loop once for solvers that run it in chunks)
 - Ability to use custom WGSL kernels
-- Subgroups, `f16` and cooperative matrices (tensor cores) on GPUs that support them
+- Subgroups and `f16` on GPUs that support them; cooperative matrices (tensor cores) on the wgpu backend
 - Kernel tuning per GPU vendor (Apple and NVIDIA measured, generic defaults elsewhere)
 - Useful error handling
 - Per-kernel GPU timing with `ctx.profile(..)`
-- Native SIMD CPU backend, used when no GPU is present
+- Native SIMD CPU backend (Cranelift; `LUMA_CPU_THREADS` sets its thread count), used when no GPU is present
 - Arrays larger than one device buffer or than device memory
 
 ## Getting started
@@ -105,9 +105,9 @@ cargo test
 
 Luma is a Cargo workspace of six crates: `luma-core` (the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-wgpu`, `luma-metal` and `luma-cuda` (each holds one backend and its own code generator for WGSL, MSL or NVVM IR), `luma-cpu` (the native SIMD backend, compiling the kernel IR with Cranelift), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend crate.
 
-With `BackendKind::Auto` (the default) a context opens the first backend that works, in the order CUDA, Metal, wgpu. Choose one with `ContextOptions::backend(BackendKind::..)`, with `Context::cuda()`, `Context::metal()` or `Context::wgpu()`, or with `LUMA_BACKEND`; `Context::backend()` tells which one a context uses, and `Context::device()` (a `DeviceSummary`) or `Context::device_name()` the device: its backend, name and whether it is the host CPU. The CUDA backend needs only the NVIDIA driver, loaded at run time (kernels are compiled to PTX by the driver's own NVVM library; no CUDA toolkit or NVRTC): without an NVIDIA driver the CUDA backend reports an error (and `Auto` moves on) instead of failing to start the program.
+With `BackendKind::Auto` (the default) a context opens the first backend that works, in the order CUDA, Metal, wgpu, and the native CPU backend when no GPU opens. Choose one with `ContextOptions::backend(BackendKind::..)`, with `Context::cuda()`, `Context::metal()`, `Context::wgpu()` or `Context::cpu()`, or with `LUMA_BACKEND`; `Context::backend()` tells which one a context uses, and `Context::device()` (a `DeviceSummary`) or `Context::device_name()` the device: its backend, name and whether it is the host CPU. The CUDA backend needs only the NVIDIA driver, loaded at run time (kernels are compiled to PTX by the driver's own NVVM library; no CUDA toolkit or NVRTC): without an NVIDIA driver the CUDA backend reports an error (and `Auto` moves on) instead of failing to start the program.
 
-Custom WGSL kernels (`Context::kernel`) run on every backend: native backends translate them through the kernel IR. `enable wgpu_cooperative_matrix;` works on the wgpu backend only. The native backends bind more buffers per kernel than WebGPU's limits allow (Metal through an argument buffer, CUDA through plain pointer arguments), and on Apple silicon uploads and readbacks use the unified memory the CPU and GPU share. On CUDA, fixed iteration counts that Luma has traced are replayed from a cached CUDA graph.
+Custom WGSL kernels (`Context::kernel`) run on every backend: native backends translate them through the kernel IR. `enable wgpu_cooperative_matrix;` works on the wgpu backend only. The native backends bind more buffers per kernel than WebGPU's limits allow (Metal through an argument buffer on GPUs with tier-2 argument buffers, CUDA through plain pointer arguments), and on Apple silicon uploads and readbacks use the unified memory the CPU and GPU share. On CUDA, Metal and the CPU backend, fixed iteration counts and blocks of `iterate_until_all` steps that Luma has traced are replayed from a cached command graph; wgpu has none.
 
 ### No GPU
 
@@ -116,7 +116,7 @@ Without a GPU, Luma runs on the native `cpu` backend (SIMD code on the host's th
 ### Large arrays
 
 An array bigger than one device buffer is split over several buffers automatically, and the built-in operations run over them
-in pieces. Array data beyond the device memory budget (80% of device memory on Vulkan GPUs) moves to host memory and back
+in pieces. Array data beyond the device memory budget (80% of the device's memory where the backend reports it; none on the CPU backend) moves to host memory and back
 on demand, with a one-time warning. Custom kernels need arrays that fit one buffer.
 
 ### Environment variables
@@ -138,6 +138,7 @@ cargo run --release --example bench_fusion             # one kernel per op vs fu
 cargo run --release --example bench_threads            # threads on one context vs a context each
 cargo run --release --example bench_build              # host cost of building and flattening expressions
 cargo run --release --example bench_pde                # views, assign/put, records, loops, scans, tridiagonal, Df32/f64
+cargo run --release --example bench_solve              # tridiagonal and block-tridiagonal line solvers against a hand-written cyclic-reduction kernel
 cargo run --release --example keccak                   # Keccak-f, SHA3-256 and SHAKE128 in lazy array operations
 cargo run --release --example bench_datasci            # matmul, axis reductions, scatter, sort, group-by and searchsorted against hand-written WGSL kernels (--gate fails on a slower ratio)
 cargo run --release --example mlkem                    # ML-KEM (FIPS 203) KeyGen / Encaps / Decaps over batches, checked against RustCrypto and NIST vectors

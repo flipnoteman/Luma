@@ -5,11 +5,14 @@
 //! passes over memory, which suits many lines; for few, long lines one workgroup solves a line by
 //! cyclic reduction in workgroup memory (see [`crate::cyclic`]). The choice is automatic
 //! (`LUMA_TRIDIAGONAL=thomas|cyclic` forces one). [`solve_tridiagonal`] and
-//! [`solve_block_tridiagonal`] evaluate their operands first (arrays split over several buffers
-//! fail with [`LumaError::Chunked`]); the solve is recorded, not waited for. The `_parts`
-//! functions take every entry of the blocks as an array of its own and compute the ones that are
-//! lazy expressions inside the solver kernel (see [`crate::solve`]); `solve_tridiagonal_parts`
-//! solves several systems on one grid in one launch.
+//! [`solve_tridiagonal_from`] compute their pending operands (`lo`, `diag`, `up`, `rhs` that are
+//! lazy expressions) inside the solver kernel, like the `_parts` functions; an operand that is
+//! already a buffer is read as is. [`solve_block_tridiagonal`] evaluates its stacked operands
+//! first (arrays split over several buffers fail with [`LumaError::Chunked`]); use
+//! [`solve_block_tridiagonal_parts`] to fuse the entries of the blocks. The solve is recorded,
+//! not waited for. The `_parts` functions take every entry of the blocks as an array of its own
+//! and compute the ones that are lazy expressions inside the solver kernel (see
+//! [`crate::solve`]); `solve_tridiagonal_parts` solves several systems on one grid in one launch.
 //!
 //! The arrays may have any shape: the lines are the lines of `axis` of every other index, so an
 //! array `[2, ni, nj]` solved along axis 1 or 2 holds a batch of two systems per line.
@@ -40,6 +43,9 @@ use crate::tuning::Tuning;
 /// systems of one batch must share their grid; to solve independent systems without stacking
 /// them first, see [`solve_tridiagonal_parts`].
 ///
+/// Operands that are lazy expressions are computed inside the solver kernel (no launch of their
+/// own); evaluated ones are read as they are.
+///
 /// # Errors
 ///
 /// The result is poisoned if the arrays differ in context or shape or `axis >= 4`.
@@ -52,7 +58,12 @@ pub fn solve_tridiagonal(
     rhs: &Array<f32>,
 ) -> Array<f32> {
     let location = Location::caller();
-    let result = run(None, None, axis, [lo, diag, up, rhs], None, location);
+    let arrays = [lo, diag, up, rhs];
+    let result = if arrays.iter().any(|a| a.pending().is_some()) {
+        run_parts(None, 1, 1, axis, &arrays, None, location).map(|mut solved| solved.remove(0))
+    } else {
+        run(None, None, axis, arrays, None, location)
+    };
     Array::resolve(rhs.context(), rhs.shape(), result, "solve_tridiagonal", location)
 }
 
@@ -69,7 +80,12 @@ pub fn solve_tridiagonal_from(
     start: &Array<u32>,
 ) -> Array<f32> {
     let location = Location::caller();
-    let result = run(None, None, axis, [lo, diag, up, rhs], Some(start), location);
+    let arrays = [lo, diag, up, rhs];
+    let result = if arrays.iter().any(|a| a.pending().is_some()) {
+        run_parts(None, 1, 1, axis, &arrays, Some(start), location).map(|mut solved| solved.remove(0))
+    } else {
+        run(None, None, axis, arrays, Some(start), location)
+    };
     Array::resolve(rhs.context(), rhs.shape(), result, "solve_tridiagonal", location)
 }
 
@@ -971,6 +987,51 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// `solve_tridiagonal` and `solve_tridiagonal_from` compute their pending operands in the solver
+    /// kernel: the same result as on evaluated operands, in one launch.
+    #[test]
+    fn solve_tridiagonal_fuses_pending_operands() {
+        let ctx = Context::new().unwrap();
+        let (n, lines) = (40usize, 5usize);
+        let mut rng = Lcg(7);
+        let cells = n * lines;
+        let lo: Vec<f32> = (0..cells).map(|_| rng.next()).collect();
+        let up: Vec<f32> = (0..cells).map(|_| rng.next()).collect();
+        let diag: Vec<f32> = (0..cells).map(|_| rng.next() + 2.0).collect();
+        let rhs: Vec<f32> = (0..cells).map(|_| rng.next() * 4.0).collect();
+        let start: Vec<u32> = (0..lines as u32).map(|l| l * 3).collect();
+        let grid = [n, lines];
+        let (lo_a, diag_a, up_a, rhs_a) = (
+            Array::from_slice_on(&ctx, &lo, grid).unwrap(),
+            Array::from_slice_on(&ctx, &diag, grid).unwrap(),
+            Array::from_slice_on(&ctx, &up, grid).unwrap(),
+            Array::from_slice_on(&ctx, &rhs, grid).unwrap(),
+        );
+        let start_a = Array::from_slice_on(&ctx, &start, lines).unwrap();
+        let want = super::solve_tridiagonal(0, &lo_a, &diag_a, &up_a, &rhs_a).to_vec().unwrap();
+        let want_from = super::solve_tridiagonal_from(0, &lo_a, &diag_a, &up_a, &rhs_a, &start_a).to_vec().unwrap();
+        // Exact in f32: the right-hand side is halved, then doubled back.
+        let rhs_half = Array::from_slice_on(&ctx, &rhs.iter().map(|v| v * 0.5).collect::<Vec<_>>(), grid).unwrap();
+        for from in [false, true] {
+            let (got, profile) = ctx
+                .profile(|| {
+                    let (lo_p, diag_p, rhs_p) = (&lo_a * 1.0, &diag_a + 0.0, &rhs_half * 2.0);
+                    let x = if from {
+                        super::solve_tridiagonal_from(0, &lo_p, &diag_p, &up_a, &rhs_p, &start_a)
+                    } else {
+                        super::solve_tridiagonal(0, &lo_p, &diag_p, &up_a, &rhs_p)
+                    };
+                    ctx.sync().unwrap();
+                    x
+                })
+                .unwrap();
+            assert_eq!(&got.to_vec().unwrap(), if from { &want_from } else { &want }, "from = {from}");
+            if binds(&ctx, 1, 1) {
+                assert_eq!(profile.launches(), 1, "from = {from}");
             }
         }
     }

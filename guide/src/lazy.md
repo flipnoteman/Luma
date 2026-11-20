@@ -17,7 +17,7 @@ assert_eq!(r.to_vec()?[0], 7.0); // one kernel: out[i] = a[i] * b[i] + c[i]
 
 Each operator creates a node in a graph that remembers its inputs. `r` is the node for the add;
 nothing is allocated for the product. When the host needs the values, Luma flattens the graph
-below `r` into one program, generates a WGSL kernel for it, and launches it. The product never
+below `r` into one program, compiles a single kernel for the active backend (CUDA, Metal, Vulkan/DX12, or native SIMD CPU), and launches it. The product never
 exists in memory: the kernel reads `a`, `b` and `c` once and writes `r` once. A chain of 20
 elementwise operations is still one launch and one pass over memory.
 
@@ -105,11 +105,11 @@ reader's index, staged in workgroup memory, or evaluated first, whichever the
 [cost model](performance.md#the-cost-model) estimates is cheapest (within the caps below: a kernel
 that would exceed `LUMA_FUSION_MAX_INLINED` is cut whatever the model says).
 
-Not fused, because they need whole-array structure: `scan`, tridiagonal solves, FFT convolution,
+Not fused, because they need whole-array structure: `scan`, stacked `solve_block_tridiagonal`, `conv1d` / `conv1d_fft`,
 and your own kernels. They read the arrays they are given, which are computed first.
-`matmul`, the axis reductions (`sum_axis`, `reduce_axis`, ...), the scatters (`put_add`, ...) and
+`matmul`, `solve_tridiagonal` / `solve_tridiagonal_parts` / `solve_block_tridiagonal_parts`, the axis reductions (`sum_axis`, `reduce_axis`, `argmax_axis`, ...), the scatters (`put_add`, ...) and
 the sorts are kernels of their own too, but they compute a pending operand *inside* their loads
-instead of storing it, and `matmul`, the axis reductions and the sorts are eager: the result is
+instead of storing it, and `matmul`, the line solves, the axis reductions and the sorts are eager: the result is
 evaluated when the call returns, so what reads it is another kernel
 ([Performance guide](performance.md#primitives-that-read-an-expression)).
 
@@ -120,9 +120,10 @@ and why.
 
 ## `cache()`
 
-`x.cache()` marks an expression as shared: it is evaluated once into a buffer and later readers
-load it instead of recomputing it. Luma decides this itself for views, so you need `cache()` only
-when you know better: an expensive expression read at many unrelated places.
+`x.cache()` evaluates an expression now (it is recorded as a kernel, without waiting for the GPU)
+into a buffer, and later readers load it instead of recomputing it. Luma decides this itself for
+views, so you need `cache()` only when you know better: an expensive expression read at many
+unrelated places.
 
 ```rust
 use luma::*;
@@ -138,7 +139,7 @@ assert_eq!(r.len(), 1000);
 ## Looking at what ran: `Profile`
 
 `ctx.profile(|| ..)` runs a closure and returns the GPU time of every kernel launched during it,
-by label, and the places where expressions were split. It needs timestamp queries on the adapter
+by label, and the places where expressions were split. It needs timestamp queries on the device
 ([`Context::profiling_supported`](https://docs.rs/luma/latest/luma/struct.Context.html)).
 
 ```rust

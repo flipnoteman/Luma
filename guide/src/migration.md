@@ -43,15 +43,19 @@ workgroup counts. This matters only if you implement a backend; users of `Array`
 
 ### New in 0.5 that you may want
 
-- Choosing a backend: `ContextOptions::backend`, `Context::{cuda, metal, wgpu, backend}` and `LUMA_BACKEND`
+- Choosing a backend: `ContextOptions::backend`, `Context::{cuda, metal, wgpu, cpu, backend}` and `LUMA_BACKEND`
   ([Environment variables](environment.md), [FAQ](faq.md#choosing-a-device)). `Auto` tries CUDA, then Metal,
-  then wgpu. The CUDA backend needs only the NVIDIA driver, no CUDA toolkit.
+  then wgpu, then the native `cpu` backend. The CUDA backend needs only the NVIDIA driver, no CUDA toolkit.
+  `LUMA_CPU_THREADS` sets the thread count of the `cpu` backend.
 - `Context::device()` returns a `DeviceSummary { backend, name, software }`, and `Context::device_name()` the name.
 - `Array::permute_axes` and `swap_axes` (lazy views, like `transpose`), with `_mut` forms
   ([Views and writes](views.md)).
 - `Context::memory_stats()` and `Context::trim()` ([Performance guide](performance.md)).
 - `iterate_until_all` and `compile_until_all` loops replay a block of steps as one graph on backends that
   capture them (CUDA, Metal, CPU) ([Loops](loops.md#stop-conditions-iterate_until_all)).
+- `compile_until_all` and `CompiledUntil`: a loop of `iterate_until_all` traced once and run on many states
+  ([Loops](loops.md#chunked-solvers-compile_until_all)). A time-blocked stencil also covers up to four
+  `f32` arrays of an `eval` loop evaluated together ([Loops](loops.md#loops-with-eval)).
 
 ## From 0.3 to 0.4
 

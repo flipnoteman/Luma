@@ -109,7 +109,8 @@ and `ne` was false too on every device the tests ran on (NVIDIA, llvmpipe), so `
 
 ## Signed integers and casts
 
-`Array<i32>` has the arithmetic of `u32` plus unary minus, `abs` and `sign`, and `>>` is
+`Array<i32>` has the arithmetic of `u32` plus unary minus, `abs` and `sign`, the bit operators
+`& | ^ !` and shifts (`<<`, `>>`, `shl`, `shr`, and the compound forms), and `>>` is
 arithmetic (the sign bit comes in from the left). `+ - *` wrap; division and remainder follow
 WGSL: `x / 0` is `x`, `i32::MIN / -1` is `i32::MIN`, `x % 0` and `i32::MIN % -1` are 0, and
 `abs(i32::MIN)` stays `i32::MIN`. There are no rotations and no float math.

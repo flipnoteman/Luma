@@ -3,7 +3,7 @@
 A reduction turns an array into fewer numbers: a sum, a minimum, a norm. In Luma a reduction
 returns a one-element array and the expression behind it is fused into the reduction's first
 pass. Over an `f32` array, or over any lazy expression, nothing runs until the result is needed;
-over an already computed `u32`, `f64` or `Df32` array the passes are recorded at once (still
+over an already computed `u32`, `i32`, `f64` or `Df32` array the passes are recorded at once (still
 without waiting). Nothing waits for the GPU until the host asks for the value.
 
 ## Lazy one-element results
@@ -64,8 +64,8 @@ if ctx.profiling_supported() {
 # Ok::<(), luma::LumaError>(())
 ```
 
-A large array takes two launches: a first pass in which every workgroup reduces a slice of the
-expression to a partial result, and a second that combines the partials. An array small enough
+A large array takes at most two launches: a first pass in which every workgroup reduces a slice of the
+expression to a partial result, and a second that combines the partials (on CUDA the last workgroup of the first pass finishes the reduction in one launch). An array small enough
 for one workgroup takes one. Float sums combine in trees (see the `Array::sum` documentation), so the
 error stays far below that of a sequential sum.
 

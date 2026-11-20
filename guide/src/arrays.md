@@ -13,7 +13,8 @@ assert_eq!(a.shape(), Shape::from([3, 2]));
 assert_eq!(a.len(), 6);
 
 // Constants and generators. `zeros` and `full` are buffers filled at once; the generators
-// (`linspace`, `range`, `uniform`) are computed inside the kernel that reads them, not stored.
+// (`linspace`, `range`, `uniform`, `normal`, and `random_bits` for `u32`) are computed inside the
+// kernel that reads them, not stored.
 let zeros = Array::<f32>::zeros([3, 2])?;
 let twos = Array::<f32>::full([3, 2], 2.0)?;
 let ramp = Array::linspace(0.0, 1.0, 5)?;
@@ -39,9 +40,9 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 | `i32` | signed integers, [casts](integers.md#signed-integers-and-casts) |
 | `bool` | the result of comparisons: a boolean per element ([booleans](integers.md#comparisons-booleans-and-select)) |
 | `Df32` | double-float, about 48 bits of mantissa, runs on every device ([Precision](precision.md)) |
-| `f64` | 64-bit float, only on devices with `SHADER_F64` |
+| `f64` | 64-bit float, only on devices with `SHADER_F64` (CUDA, the CPU backend, some Vulkan GPUs; not Metal) |
 
-`vec2` / `vec4` element types exist for custom kernels, and [records](records.md) group several
+`[f32; 2]` / `[f32; 4]` / `[u32; 2]` / `[u32; 4]` (`vec2` / `vec4`) element types exist for custom kernels, and [records](records.md) group several
 arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `Df32` and `f64`
 (the *scalar* types); what each type supports is listed in the chapters named in the table.
 
@@ -120,8 +121,8 @@ lazy and fuse:
 | --- | --- |
 | `f32` | `sqrt`, `exp`, `ln`, `abs`, `sin`, `cos`, `tan`, `tanh`, `sign`, `floor`, `ceil`, `trunc`, `round`, `log1p`, `expm1`; `powf(exponent)`, `clamp(lo, hi)` (host scalars); `atan2(x)`, `hypot(other)`, `copysign(sign)` (array or scalar) |
 | `f64` | `sqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round` |
-| `Df32` | `sqrt`, `abs`, `sign`, `floor`, `ceil`, `log1p`, `expm1` ([Precision](precision.md)) |
-| `i32` | `abs`, `sign`, `shl`, `shr` ([Signed integers](integers.md#signed-integers-and-casts)) |
+| `Df32` | `sqrt`, `exp`, `ln`, `tanh`, `abs`, `log1p`, `expm1`, `powf(Df32)` ([Precision](precision.md)) |
+| `i32` | `abs`, `sign`, `shl`, `shr`; bit operators `& \| ^ !` ([Signed integers](integers.md#signed-integers-and-casts)) |
 | `u32` | bit operations, `shl`, `shr`, `rotate_left`, `rotate_right` ([Integers](integers.md)) |
 | every scalar type | `minimum(rhs)`, `maximum(rhs)`, `lt` `le` `gt` `ge` `eq` `ne` (booleans), `select(&cond, a, b)` |
 
@@ -215,8 +216,8 @@ assert_eq!(x.to_vec()?, vec![7.0, 8.0, 9.0]);
 `(len - kernel_len + 2 * padding) / stride + 1` elements. `x.conv1d_fft(&kernel)` is the full
 *linear convolution* (the kernel is flipped), `len + kernel_len - 1` elements, computed with FFTs:
 use it for long kernels, where it is faster than the direct loop, and expect `f32` rounding error in
-its result. Both evaluate their operands and fail (poisoned array) for a bad geometry such as a
-kernel longer than the padded input or a zero stride.
+its result. Both evaluate their operands, need 1-D arrays, and fail (poisoned array) for a bad
+geometry such as a kernel longer than the padded input or a zero stride.
 
 ```rust
 use luma::*;

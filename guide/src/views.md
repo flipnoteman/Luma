@@ -79,8 +79,8 @@ reads `1`, `n` reads `n - 1`. That is the ghost cell of a finite-volume wall, an
 `Mirror` row above equals the `Edge` row for a pad of one. Circular `shift` and `PadMode::Wrap` are the
 views that wrap; `shift_fill`, `shift_clamp` and `shift_mirror` are the shifts of a bounded domain.
 
-A slice, flip or transpose is read-only: `assign`, `write`, `+=` and `put` on it fail with
-`InvalidShape`, naming `slice_mut`, `flip_mut` and `transpose_mut`, which are the views that write
+A slice, flip or axis permutation (`transpose`, `swap_axes`, `permute_axes`) is read-only: `assign`, `write`, `+=` and `put` on it fail with
+`InvalidShape`, naming `slice_mut`, `flip_mut`, `transpose_mut`, `swap_axes_mut` and `permute_axes_mut`, which are the views that write
 through ([below](#views-that-write)). A `shift`, `pad` or `take` result accepts writes, but they
 fill its own buffer and leave what it was computed from unchanged.
 
@@ -139,7 +139,7 @@ assert_eq!(plane.to_vec()?, vec![6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
 
 ## Views that write
 
-`slice`, `flip` and `transpose` have `_mut` forms that borrow the array mutably and return a
+`slice`, `flip`, `transpose`, `swap_axes` and `permute_axes` have `_mut` forms that borrow the array mutably and return a
 [`ViewMut`](https://docs.rs/luma/latest/luma/struct.ViewMut.html): a region that writes through
 to the array it was taken from. Only views that keep every element distinct can write through; a
 `shift`, `pad` or `take` cannot (several cells would read one element), and writing to one just

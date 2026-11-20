@@ -1,7 +1,7 @@
 # Worked examples
 
-Five tours of programs in the repository. The first two have the full code here, runnable; for the
-others the chapter points to the code and says what to look at. Run the repository examples
+Six tours of programs in the repository. The heat equation, the Euler solver and the data-science
+pipeline have the full code here, runnable; for the others the chapter points to the code and says what to look at. Run the repository examples
 with `cargo run --release --example <name>` from a checkout of
 [the repository](https://github.com/flipnoteman/Luma).
 
@@ -196,8 +196,9 @@ What to look at:
   run from the program of the first (the header of the file explains).
 - The profile after the table: kernels per permutation and the reasons for the cuts.
 - The known-answer tests in `tests/keccak.rs`, and the test that a chain of eight permutations
-  (about 80 000 operations) is cut into at most 60 kernels (it is skipped on CPU and Apple
-  profiles and without timestamp queries).
+  (about 80 000 operations) is cut into at most 60 kernels (it needs timestamp queries, and allows
+  up to 120 kernels in debug builds; a device with few bindings packs the 50 state words into a
+  few buffers, [Performance](performance.md#many-arrays-in-one-kernel)).
 
 ## CPA hypothesis matrix
 

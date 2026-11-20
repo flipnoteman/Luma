@@ -139,12 +139,13 @@ becomes the load of that kernel.
 | Primitive | Computed inside the kernel | When it runs |
 | --- | --- | --- |
 | `matmul` | each pending operand (a transpose included) is computed in the tile loads | eager: the product is recorded when called and returned evaluated, so what reads it is another kernel |
-| `sum_axis`, `min_axis`, `max_axis`, `reduce_axis`, `mean_axis`, `var_axis`, `std_axis` | the operand, in the first pass over the data | eager: the result is evaluated when the call returns |
+| `sum_axis`, `min_axis`, `max_axis`, `reduce_axis`, `mean_axis`, `var_axis`, `std_axis`, `argmax_axis`, `argmin_axis` | the operand, in the first pass over the data | eager: the result is evaluated when the call returns |
+| `solve_tridiagonal`, `solve_tridiagonal_parts`, `solve_block_tridiagonal_parts` | each pending block/vector entry is computed where a cell's system is loaded | eager: the solution is evaluated when the call returns |
 | `put_add`, `put_min`, `put_max`, `bincount`, `histogram`, `group_*` | the value and the index (or code, or bucket) expressions of the scatter | an in-place write, like `put` |
 | `sort`, `argsort`, `sort_axis` and what builds on them (`quantile`, `median`, `factorize`, `unique`) | the key expression, in the first pass of the radix sort | eager: the sorted array is evaluated; `factorize` and `unique` also read the number of distinct values back, one host wait |
 
 An operand that reads circular `shift`s of other expressions, or lives in several buffers, is
-evaluated first instead. `scan` and `cumsum` always evaluate their operand (they read it twice; on CUDA integer and `min` / `max` scans of long contiguous lines read it once).
+evaluated first instead. `scan` and `cumsum` always evaluate their operand (they read it twice; on CUDA, and on the native CPU backend with `LUMA_LOOKBACK_SCAN=on`, integer and `min` / `max` scans of long contiguous lines read it once).
 Because these results are evaluated at the call, a loop that calls them every step builds one
 kernel per call rather than one fused chain: count launches with `ctx.profile(..)`. Usage is in
 [Matrices, statistics and grouping](data.md): [`matmul`](data.md#matrix-products), [axis statistics](data.md#statistics-along-an-axis), [scatters](data.md#accumulating-scatters), [sorting](data.md#sorting).
@@ -157,7 +158,7 @@ through memory, not correctness:
 | operations per kernel | 16384 | `LUMA_FUSION_MAX_NODES`, or [`fusion_limit`](https://docs.rs/luma/latest/luma/fn.fusion_limit.html) for expressions written in a scope |
 | nesting depth | 512 (256 with debug assertions) | fixed (the walk is recursive) |
 | values live at once | by GPU profile | `LUMA_FUSION_MAX_LIVE` |
-| instructions after views of lazy expressions are unfolded | 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU | `LUMA_FUSION_MAX_INLINED` |
+| instructions after views of lazy expressions are unfolded | 1536 on the NVIDIA profile, 1024 elsewhere (other GPUs and the CPU backend) | `LUMA_FUSION_MAX_INLINED` |
 | input buffers per kernel | the device's storage-buffer limit minus 3, at most 256 | `LUMA_FUSION_MAX_INPUTS` lowers it (to test a device with fewer) |
 | scalar operands | one uniform buffer | fixed |
 
@@ -167,7 +168,7 @@ share work with it), and the rest is flattened again.
 ### Many arrays in one kernel
 
 A kernel that reads many different arrays (the 50 words of a Keccak state) meets the device's
-binding limit: 16 on many integrated GPUs via WebGPU, 29 on wgpu Metal, 256 on native CUDA, native Metal (argument buffers) and discrete GPUs.
+binding limit: 16 on many integrated GPUs via WebGPU, 29 on wgpu Metal, and 256 on native CUDA, on the native CPU backend, on native Metal with tier-2 argument buffers (28 without them) and on discrete GPUs.
 Cutting such an expression on the limit alone would evaluate it a few operations at a time, because
 every round reads every array. Luma instead puts the arrays into one buffer. When a kernel would bind
 more arrays than the device allows, the evaluated arrays of one length and type it reads are copied
@@ -184,8 +185,7 @@ lives. Arrays read through a view or a circular `shift` are not read through the
 (they get a buffer of their own when the view is made). `ctx.profile(..)` shows the copies as
 `FusedStack(Id, ...)` kernels; `LUMA_FUSION_MAX_INPUTS=13` reproduces a 16-binding device on any GPU.
 
-Never fused, because they need whole-array structure: `scan`, tridiagonal solves, FFT
-convolution, and custom kernels. They read computed arrays.
+Never fused, because they need whole-array structure: `scan`, stacked block-tridiagonal solves (`solve_block_tridiagonal`), `conv1d` / `conv1d_fft`, and custom kernels. They read computed arrays.
 
 ## Caches
 
@@ -193,8 +193,8 @@ convolution, and custom kernels. They read computed arrays.
   values are wired. Scalar values are uniforms, so `&x * 2.0` and `&x * 3.0` share one pipeline,
   and an expression with the same shape built again costs the host only the flattening. Identical
   operations on the same operands are one node (hash-consing).
-- **Compiled pipelines** are cached on disk (CUDA PTX, CPU Cranelift object files, and wgpu's Vulkan `PipelineCache`) per adapter and
-  driver, and in-process on Metal, so repeated runs skip the multi-second compile of large (`Df32`) kernels. The measured cost model is kept next to it.
+- **Compiled pipelines** are cached on disk (CUDA PTX, the native CPU backend's compiled machine code, and wgpu's Vulkan `PipelineCache`) per adapter and
+  driver; the native Metal backend keeps none between processes. Repeated runs skip the multi-second compile of large (`Df32`) kernels. The measured cost model is kept next to it.
   `LUMA_CACHE=off` disables both; `LUMA_CACHE_DIR` moves them. A damaged file is ignored.
 - **Loops**: an `iterate_all` called again from the same place with the same step graph reuses the
   earlier program, and after two such calls the GPU starts before the step is traced
@@ -208,10 +208,10 @@ How you write the loop decides how much host time each step costs.
 
 | Loop | Host per step | Notes |
 | --- | --- | --- |
-| `iterate_all` of an elementwise step | none | one kernel, state in registers, launches of about 40 ms |
-| `iterate` of a stencil | none | time-blocked: several steps per pass over memory |
-| `iterate_until`, `iterate_until_all` | none | the stop rule runs on the GPU; one wait per block of steps |
-| `eval` every step | building the step | recognised as a loop for `f32` steps; never waits |
+| `iterate_all` of an elementwise `f32` or `u32` step | none | one kernel, state in registers, launches of about 40 ms |
+| `iterate` of a 1-D or 2-D stencil | none | time-blocked: several steps per pass over memory |
+| `iterate_until`, `iterate_until_all` | none | the stop rule runs on the GPU; one wait per block of steps; a block is one graph replay on CUDA, Metal and the CPU backend |
+| `eval` every step | building the step | recognised as a loop for `f32` steps (a register loop, or a stencil of up to four arrays evaluated together); never waits |
 | readback every step (`max().item()?`) | a GPU round trip | speculation hides it when the step repeats |
 
 Prefer the primitives when the step fits them ([Loops](loops.md)). Otherwise `eval` each step
@@ -231,6 +231,9 @@ The GPU is fast, the way to it is not. Data crosses it at `Array::from_slice` (u
 - Arrays beyond the memory budget move to host memory and back on demand (once-only warning). Set
   `LUMA_MEMORY_BUDGET` to something your machine can keep on the device. Arrays split over several
   buffers are never staged and cannot be passed to custom kernels.
+- `ctx.memory_stats()` reports the bytes in use, idle in the pool and spilled to host memory, and the
+  budget; `ctx.trim()` gives the idle pool back to the device, for example after a phase whose
+  temporaries the next one cannot reuse.
 
 ## A checklist for a slow program
 
@@ -251,5 +254,5 @@ The GPU is fast, the way to it is not. Data crosses it at `Array::from_slice` (u
 7. **Reuse arrays.** Allocate outside the loop; ping-pong with two arrays in custom kernels.
 8. **Cold start.** The first run compiles kernels (seconds for big `Df32` ones); the second reads
    the disk cache. Measure the second run.
-9. **Device.** `LUMA_DEVICE=cpu` is for testing; a software device is far slower. On a laptop
-   check which GPU opened ([FAQ](faq.md#choosing-a-device)).
+9. **Device.** `LUMA_DEVICE=cpu` forces the native CPU backend, a fallback that runs on the host's
+   threads. On a laptop check which GPU opened ([FAQ](faq.md#choosing-a-device)).

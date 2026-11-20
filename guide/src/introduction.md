@@ -25,8 +25,11 @@ to a project:
 luma = "0.5"
 ```
 
-Without a GPU Luma runs on its native `cpu` backend (nothing to install). It is picked
-automatically when no GPU opens, and `LUMA_DEVICE=cpu` forces it. See the [FAQ](faq.md#choosing-a-device).
+With the default settings Luma opens the first backend that has a device, in the order CUDA, Metal,
+wgpu; `LUMA_BACKEND=cuda|metal|wgpu|cpu` (or `Context::cuda()`, `Context::metal()`, `Context::wgpu()`,
+`Context::cpu()`) picks one. Without a GPU it runs on its native `cpu` backend (nothing to
+install). That backend is picked automatically when no GPU opens, and `LUMA_DEVICE=cpu` forces it.
+See the [FAQ](faq.md#choosing-a-device).
 
 ## A first program
 

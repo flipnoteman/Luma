@@ -5,6 +5,12 @@ existing shader), write the kernel in WGSL and run it on Luma arrays. A custom k
 ordered batch as the built-in operations, reads and writes `Array`s directly and needs no buffer
 management.
 
+The WGSL is the same on every backend. Luma parses and validates it with naga, then lowers it to its
+kernel IR (`luma_core::kir`): wgpu compiles the validated module itself, and the native CUDA,
+Metal and CPU backends compile the IR (to NVVM IR, MSL and Cranelift code). A construct the
+lowering cannot translate fails the build with `LumaError::Unsupported` naming it; `enable
+wgpu_cooperative_matrix;` is accepted on the wgpu backend only.
+
 ## A first kernel
 
 ```rust
@@ -53,7 +59,8 @@ The rules:
 - **Problem size.** `launch([x])`, `launch([x, y])` or `launch([x, y, z])` runs at least that many
   invocations: `ceil(size / workgroup_size)` workgroups per dimension. Guard against
   `global_invocation_id >= luma.size`. `launch_raw([wx, wy, wz], args)` runs exactly that many
-  workgroups.
+  workgroups (`luma.size` is then the workgroup counts times the workgroup size). Both fail with
+  `LumaError::InvalidShape` for a zero dimension and `KernelGridTooLarge` past the device's limit.
 - **Uniform values** are copied when you pass them. Any type
   [encase](https://docs.rs/encase) can lay out works: a struct with `#[derive(ShaderType)]`,
   scalars, vectors, matrices, arrays. `luma::encase` is a re-export of the same version Luma uses.
@@ -144,7 +151,9 @@ assert_eq!(t.to_vec()?[1], 4.0);                // t(1, 0) = a(0, 1)
 # Ok::<(), luma::LumaError>(())
 ```
 
-`Kernel::new(src)` is `default_context()?.kernel(src).build()`. Building the same source, entry point,
+`Kernel::new(src)` is `default_context()?.kernel(src).build()`. The builder also has
+`.workgroup([x, y, z])`, which asserts the size the shader declares with `@workgroup_size` (a
+different one is `KernelWorkgroup`); `kernel.workgroup()` returns it. Building the same source, entry point,
 workgroup size and label twice on a context reuses the pipeline, and a `Kernel` is cheap to clone. The shader is parsed and validated
 when you build it: a mistake comes out as `LumaError::ShaderCompile` with the WGSL error and
 line numbers that match your source (Luma appends its prelude, so it never shifts them).
@@ -314,9 +323,11 @@ assert!(matches!(Kernel::new("@compute fn main("), Err(LumaError::ShaderCompile(
 ```
 
 A poisoned array passed as an argument fails the launch with its own error. Other errors:
-`KernelArgKind` (an array where a uniform goes, or the reverse), `KernelArgUniformSize`,
-`KernelEntryPoint`, `KernelBinding` (bindings outside `@group(1)` or not numbered from 0),
-`KernelWorkgroup`, `KernelGridTooLarge`. See [`LumaError`](https://docs.rs/luma/latest/luma/enum.LumaError.html).
+`KernelArgKind` (an array where a uniform goes, or the reverse), `KernelArgUniform` (a value encase
+cannot lay out), `KernelArgUniformSize`, `KernelArgAlias` (one buffer bound twice with a writable
+binding, as arrays that share a buffer through `reshape` are), `KernelEntryPoint`, `KernelBinding`
+(bindings outside `@group(1)` or not numbered from 0), `KernelWorkgroup`, `KernelGridTooLarge`,
+`Unsupported`. See [`LumaError`](https://docs.rs/luma/latest/luma/enum.LumaError.html).
 
 ## Limits
 
@@ -324,4 +335,5 @@ A poisoned array passed as an argument fails the launch with its own error. Othe
   fails with `LumaError::Chunked`.
 - You cannot pass a read-only view as `&mut`, nor write the state of an `iterate` step.
 - The shader features the device was opened with decide what WGSL compiles (`f64` needs
-  `SHADER_F64`; check `ctx.features()`).
+  `SHADER_F64`, subgroup operations need `SUBGROUP`; check `ctx.features()`). Cooperative matrices
+  exist on the wgpu backend only.

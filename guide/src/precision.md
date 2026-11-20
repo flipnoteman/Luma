@@ -7,8 +7,8 @@ types and compensated reductions:
 | Type | Bits | Where it runs | Cost |
 | --- | --- | --- | --- |
 | `f32` | 24 of mantissa | everywhere | 1 |
-| `Df32` | about 48 | everywhere (computed with `f32` arithmetic) | about 27 to 44 `f32` operations per add or multiply on the GPUs measured, about 2 on llvmpipe |
-| `f64` | 53 | devices with `SHADER_F64` | 11 to 41 `f32` operations on the GPUs measured |
+| `Df32` | about 48 | everywhere (computed with `f32` arithmetic) | about 27 to 44 `f32` operations per add or multiply on the GPUs measured, about 2 on CPU |
+| `f64` | 53 | devices with `SHADER_F64` (CUDA, `cpu`, some Vulkan GPUs) | 11 to 41 `f32` operations on the GPUs measured, about 1 on CPU |
 
 Both wide types take 8 bytes per element. Pick the narrowest that gives the accuracy you need,
 and use wide types only where it matters: the cost model weighs `Df32` and `f64` arithmetic by
@@ -17,7 +17,7 @@ the factors it measured ([Performance](performance.md#the-cost-model)).
 ## `f64`
 
 `Array<f64>` exists on every context, but only works on devices that have 64-bit shader floats
-(`luma::Features::SHADER_F64`, in practice CUDA and some Vulkan GPUs). Without it every `f64` operation is
+(`luma::Features::SHADER_F64`: CUDA, the native `cpu` backend, and some Vulkan GPUs). Without it every `f64` operation is
 poisoned with [`LumaError::Unsupported`](https://docs.rs/luma/latest/luma/enum.LumaError.html).
 Check first:
 
@@ -100,7 +100,7 @@ assert!((back[1].to_f64() / 2000.0 - 1.0).abs() < 1e-13);
 ```
 
 **Cost.** One `Df32` add or multiply costs `df32_factor` `f32` operations: 27 on the RTX 3090
-and 44 on the integrated GPU the model was measured on, 2.3 on llvmpipe. The
+and 44 on the integrated GPU the model was measured on, 2.3 on CPU. The
 [`CostModel`](https://docs.rs/luma/latest/luma/struct.CostModel.html) of the device records the
 measured factor and the fusion decisions use it. A higher factor makes recomputing a `Df32` expression at several offsets more expensive in the
 model's estimate, which weighs it against staging and materialising it

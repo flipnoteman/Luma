@@ -5,7 +5,7 @@
 **Which device does Luma use?** `Context::new()` and the default context open CUDA, then Metal, then
 the high-performance wgpu adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls
 back to the native `cpu` backend. Software Vulkan drivers (Mesa llvmpipe) are never used.
-`LUMA_DEVICE` or `ContextOptions::device` narrow this, and `Context::device()` says what opened:
+`LUMA_BACKEND` / `ContextOptions::backend` (or `Context::cuda()`, `metal()`, `wgpu()`, `cpu()`) pick one backend, `LUMA_DEVICE` or `ContextOptions::device` narrow the kind of device, and `Context::backend()` and `Context::device()` say what opened:
 
 | Setting | Effect |
 | --- | --- |
@@ -43,14 +43,14 @@ contexts is an error. The `_on(&ctx, ..)` constructors take a context explicitly
 
 ## NVIDIA
 
-**The process hangs or aborts when it exits.** NVIDIA's Linux driver can crash or hang in its own
+**The process hangs or aborts when it exits.** (wgpu backend, Linux.) NVIDIA's Linux driver can crash or hang in its own
 shader-compiler threads during `exit`. Luma waits at exit for the GPU (up to 2 s) and for busy
 Vulkan driver threads (up to 2 s), and calls `_exit` only if they are still busy after that. That makes the problem
 rare, not impossible (driver 615.x was seen to still do it). `LUMA_EXIT_WAIT=0` skips the wait,
 which saves about 60 ms of exit time and risks the hang. A normal `main` return goes through
 this path; calling `std::process::exit` yourself does too.
 
-**Opening a second device stalls.** On NVIDIA, creating a device (`Context::new`) blocks
+**Opening a second device stalls.** On NVIDIA's Vulkan driver, creating a device (`Context::new`) blocks
 submissions of *other* devices in the process until their in-flight GPU work finishes. This
 happens once per device creation. Create your contexts up front, before starting long GPU work,
 or use one context (the default one is shared by threads).
@@ -60,8 +60,8 @@ or use one context (the default one is shared by threads).
 Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (`scan`, `cumsum`,
 axis reductions), `matmul`, sorts (and what builds on them), scatters into targets of up to 4096
 elements, workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
-cyclic solver is chosen automatically only on the NVIDIA tuning profile (a GPU detected as NVIDIA,
-or `LUMA_TUNING=nvidia`); elsewhere (and with `LUMA_TRIDIAGONAL=thomas`) the solver does not use it. If you see wrong results on such a GPU:
+cyclic solver is chosen automatically only on the NVIDIA and Apple tuning profiles (a GPU detected as such,
+or `LUMA_TUNING=nvidia` / `apple`); elsewhere (and with `LUMA_TRIDIAGONAL=thomas`) the solver does not use it. If you see wrong results on such a GPU:
 
 - `LUMA_STAGING=off` keeps expressions read through views out of workgroup memory (the cost model
   then recomputes them or evaluates them first),
@@ -85,7 +85,7 @@ array, so use it for debugging only. For `f32`, `f64` and `Df32` arrays,
 `ctx.features().contains(luma::Features::SHADER_F64)`, or use `Df32`
 ([Precision](precision.md)), which runs everywhere.
 
-**Out of memory.** Array data beyond the memory budget (80% of device memory on Vulkan GPUs)
+**Out of memory.** Array data beyond the memory budget (80% of the device's memory where the backend reports it: CUDA, Metal and Vulkan GPUs; none on the CPU backend)
 moves to host memory and back on demand, with a one-time warning. `LUMA_MEMORY_BUDGET` sets the
 budget. Custom kernels need arrays that fit one buffer (`LumaError::Chunked` otherwise).
 
@@ -139,7 +139,7 @@ assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_
 ## Performance
 
 **The first run is slow, later ones are fast.** Large kernels (especially `Df32`) take seconds
-to compile on some drivers. Luma keeps the driver's compiled pipelines and the measured cost
+to compile on some drivers. Luma keeps the driver's compiled pipelines (wgpu), the CUDA PTX, the CPU backend's machine code and the measured cost
 model in `$XDG_CACHE_HOME/luma` (`~/.cache/luma`), so the second process skips that. Set
 `LUMA_CACHE=off` to turn it off or `LUMA_CACHE_DIR` to move it.
 

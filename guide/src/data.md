@@ -394,7 +394,8 @@ assert_eq!(count.item()?, 3);
 
 `topk(k)` and `bottomk(k)` of a `u32`, `i32` or `f32` array return the `k` largest (smallest)
 values and their flat indices, largest (smallest) first, ties in input order, NaNs counting as
-the largest. They sort the whole array with `argsort`, so the cost does not depend on `k`.
+the largest. They sort the whole array with `argsort`, so the cost does not depend on `k`. `k` of
+0 or more than the length poisons both results with `InvalidShape`.
 
 ```rust
 use luma::*;
