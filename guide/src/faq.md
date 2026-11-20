@@ -30,9 +30,7 @@ match Context::cpu() {
 # Ok::<(), luma::LumaError>(())
 ```
 
-**Opening a context returns `LumaError::NoAdapter` ("Found no adapters").** There is no Vulkan, Metal or DX12 driver
-Luma can use. On Linux install `mesa-vulkan-drivers` (lavapipe) for the CPU fallback, or your GPU
-vendor's Vulkan driver. CI runners need the former.
+**Opening a context returns `LumaError::NoAdapter` ("Found no adapters").** With `LUMA_DEVICE=gpu` (or when built without the `cpu` feature), no hardware GPU driver (CUDA, Metal, Vulkan or DX12) was found. Install your GPU vendor's driver, or keep the default `cpu` feature enabled for the native SIMD CPU fallback.
 
 **I have two GPUs and want the other one.** Luma asks for the high-performance adapter and has no
 adapter-by-name setting. On Linux the Vulkan loader decides which drivers wgpu sees, so pointing

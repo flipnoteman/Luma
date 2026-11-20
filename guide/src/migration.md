@@ -51,7 +51,7 @@ workgroup counts. This matters only if you implement a backend; users of `Array`
   ([Views and writes](views.md)).
 - `Context::memory_stats()` and `Context::trim()` ([Performance guide](performance.md)).
 - `iterate_until_all` and `compile_until_all` loops replay a block of steps as one graph on backends that
-  capture them (CUDA, CPU) ([Loops](loops.md#stop-conditions-iterate_until_all)).
+  capture them (CUDA, Metal, CPU) ([Loops](loops.md#stop-conditions-iterate_until_all)).
 
 ## From 0.3 to 0.4
 

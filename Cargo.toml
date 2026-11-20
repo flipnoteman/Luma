@@ -10,7 +10,7 @@ documentation = "https://docs.rs/luma"
 keywords = ["gpu", "cuda", "metal", "array", "compute"]
 categories = ["science", "mathematics", "concurrency"]
 rust-version.workspace = true
-exclude = [".github/", "Temp.md"]
+exclude = [".github/", "Temp.md", "guide/", "benchmarks/"]
 
 [workspace]
 members = [

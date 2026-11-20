@@ -167,7 +167,7 @@ share work with it), and the rest is flattened again.
 ### Many arrays in one kernel
 
 A kernel that reads many different arrays (the 50 words of a Keccak state) meets the device's
-binding limit: 16 on llvmpipe and many integrated GPUs, 29 on Metal, 256 or more on discrete GPUs.
+binding limit: 16 on many integrated GPUs via WebGPU, 29 on wgpu Metal, 256 on native CUDA, native Metal (argument buffers) and discrete GPUs.
 Cutting such an expression on the limit alone would evaluate it a few operations at a time, because
 every round reads every array. Luma instead puts the arrays into one buffer. When a kernel would bind
 more arrays than the device allows, the evaluated arrays of one length and type it reads are copied
@@ -193,8 +193,8 @@ convolution, and custom kernels. They read computed arrays.
   values are wired. Scalar values are uniforms, so `&x * 2.0` and `&x * 3.0` share one pipeline,
   and an expression with the same shape built again costs the host only the flattening. Identical
   operations on the same operands are one node (hash-consing).
-- **Compiled pipelines** are cached on disk (wgpu's `PipelineCache`, Vulkan) per adapter and
-  driver, so a second process skips the multi-second compile of large (`Df32`) kernels. The measured cost model is kept next to it.
+- **Compiled pipelines** are cached on disk (CUDA PTX, CPU Cranelift object files, and wgpu's Vulkan `PipelineCache`) per adapter and
+  driver, and in-process on Metal, so repeated runs skip the multi-second compile of large (`Df32`) kernels. The measured cost model is kept next to it.
   `LUMA_CACHE=off` disables both; `LUMA_CACHE_DIR` moves them. A damaged file is ignored.
 - **Loops**: an `iterate_all` called again from the same place with the same step graph reuses the
   earlier program, and after two such calls the GPU starts before the step is traced
