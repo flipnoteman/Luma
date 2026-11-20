@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -277,7 +277,8 @@ and <code>ne</code> was false too on every device the tests ran on (NVIDIA, llvm
 <p><code>u32</code> has no unary minus. To use a boolean array in float arithmetic write <code>mask * &amp;x</code>,
 <code>mask.to_f32()</code> or <code>select(&amp;mask, 1.0, 0.0)</code>; all fuse.</p>
 <h2 id="signed-integers-and-casts"><a class="header" href="#signed-integers-and-casts">Signed integers and casts</a></h2>
-<p><code>Array&lt;i32&gt;</code> has the arithmetic of <code>u32</code> plus unary minus, <code>abs</code> and <code>sign</code>, and <code>&gt;&gt;</code> is
+<p><code>Array&lt;i32&gt;</code> has the arithmetic of <code>u32</code> plus unary minus, <code>abs</code> and <code>sign</code>, the bit operators
+<code>&amp; | ^ !</code> and shifts (<code>&lt;&lt;</code>, <code>&gt;&gt;</code>, <code>shl</code>, <code>shr</code>, and the compound forms), and <code>&gt;&gt;</code> is
 arithmetic (the sign bit comes in from the left). <code>+ - *</code> wrap; division and remainder follow
 WGSL: <code>x / 0</code> is <code>x</code>, <code>i32::MIN / -1</code> is <code>i32::MIN</code>, <code>x % 0</code> and <code>i32::MIN % -1</code> are 0, and
 <code>abs(i32::MIN)</code> stays <code>i32::MIN</code>. There are no rotations and no float math.</p>

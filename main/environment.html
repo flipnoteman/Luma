@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -203,7 +203,7 @@ builder methods override them:</p>
 </table>
 </div>
 <p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_FUSION_*</code>,
-<code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
+<code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
 <h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
 <div class="table-wrapper">
 <table>
@@ -211,7 +211,7 @@ builder methods override them:</p>
 <tr><th>Variable</th><th>Effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>LUMA_BACKEND</code></td><td><code>cuda</code>, <code>metal</code>, <code>wgpu</code> or <code>auto</code>: the backend (default <code>auto</code>: CUDA, then Metal, then wgpu)</td></tr>
+<tr><td><code>LUMA_BACKEND</code></td><td><code>cuda</code>, <code>metal</code>, <code>wgpu</code>, <code>cpu</code> or <code>auto</code>: the backend (default <code>auto</code>: CUDA, then Metal, then wgpu, then the native <code>cpu</code> backend when no GPU opens)</td></tr>
 <tr><td><code>LUMA_DEVICE</code></td><td><code>gpu</code> or <code>cpu</code>: restrict the device kind (default: GPU, CPU as fallback; <code>cpu</code> is the native <code>cpu</code> backend, software Vulkan adapters are never used); also accepts a backend name (<code>cuda</code>, <code>metal</code>, <code>wgpu</code>) when <code>LUMA_BACKEND</code> is not set</td></tr>
 <tr><td><code>LUMA_MEMORY_BUDGET</code></td><td>Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it). Default: 80% of the device’s memory where the backend reports it, never on CPU devices, otherwise unlimited</td></tr>
 <tr><td><code>LUMA_CHUNK_BYTES</code></td><td>Largest buffer an array is split into, in bytes: a power of two from 1024 up to the largest bindable size, otherwise opening the context fails with <code>InvalidShape</code>; a value that is not a number is ignored</td></tr>
@@ -222,23 +222,24 @@ builder methods override them:</p>
 <tr><td><code>LUMA_FUSION_MAX_NODES</code></td><td>Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_INPUTS</code></td><td>Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer (<a href="performance.html#many-arrays-in-one-kernel">Performance</a>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
-<tr><td><code>LUMA_FUSION_MAX_INLINED</code></td><td>Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on NVIDIA, 1024 on other GPUs, 192 on CPU; <code>16..=16384</code>)</td></tr>
+<tr><td><code>LUMA_FUSION_MAX_INLINED</code></td><td>Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on the NVIDIA tuning profile, 1024 on every other, the CPU one included; <code>16..=16384</code>)</td></tr>
 <tr><td><code>LUMA_STAGING</code></td><td><code>off</code> turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first</td></tr>
-<tr><td><code>LUMA_TRIDIAGONAL</code></td><td><code>thomas</code>, <code>cyclic</code> or <code>auto</code>: the algorithm of <code>solve_tridiagonal</code> / <code>solve_block_tridiagonal</code> (one invocation per line, or one workgroup per line by cyclic reduction); the default (<code>auto</code>) picks cyclic reduction for few, long lines on the NVIDIA tuning profile only</td></tr>
+<tr><td><code>LUMA_TRIDIAGONAL</code></td><td><code>thomas</code>, <code>cyclic</code> or <code>auto</code>: the algorithm of <code>solve_tridiagonal</code> / <code>solve_block_tridiagonal</code> (one invocation per line, or one workgroup per line by cyclic reduction); the default (<code>auto</code>) picks cyclic reduction for few, long lines on the NVIDIA and Apple tuning profiles only (and always for stacked blocks wider than 5 there)</td></tr>
 <tr><td><code>LUMA_SPECULATE</code></td><td><code>off</code> stops readbacks in a loop (<code>step</code> then <code>.max().item()?</code> every iteration) from computing the next steps ahead</td></tr>
 <tr><td><code>LUMA_FAST_MATH</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: allow rewrites that change values (<code>x + 0</code>, <code>x * 0</code>, <code>x - x</code>, <code>x / x</code>, constant reassociation and <code>x / c</code> as <code>x * (1 / c)</code> (both <code>f32</code> and <code>f64</code> only), <code>powf</code> with exponent 1, 2 or 0.5) and the cheaper <code>Df32</code> addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (<code>x * 1</code>, <code>-(-x)</code>) always run</td></tr>
 <tr><td><code>LUMA_DF_FMA</code></td><td><code>0</code>, <code>off</code> or <code>false</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>1</code>, <code>on</code> or <code>true</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
 <tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: fail any operation whose <code>f32</code> or <code>Df32</code> result holds a NaN or Inf (<code>f64</code> is not checked; debug mode, waits for the GPU after every evaluated array)</td></tr>
 <tr><td><code>LUMA_CALIBRATE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: skip measuring the device’s throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see <code>LUMA_CACHE</code>; a measurement that looks contended by other processes is dropped, and noted, so that processes use the profile’s numbers for a day before measuring again) and use the tuning profile’s fixed cost model</td></tr>
-<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan), the PTX that the native CUDA backend compiles with the driver’s NVVM (keyed by NVVM version and device architecture) and the measured cost model per adapter and driver (the native Metal backend keeps no compiled pipelines between processes), so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
+<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan), the PTX that the native CUDA backend compiles with the driver’s NVVM (keyed by NVVM version and device architecture), the machine code that the native <code>cpu</code> backend compiles (keyed by the host’s instruction set) and the measured cost model per adapter and driver (the native Metal backend keeps no compiled pipelines between processes), so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
 <tr><td><code>LUMA_CUDA_DUMP</code></td><td>a directory: the CUDA backend writes the NVVM IR (<code>.ll</code>), the PTX (<code>.ptx</code>) and the label (<code>.label</code>) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code</td></tr>
-<tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored</td></tr>
-<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads on Linux (saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s, or Vulkan’s) and then ends the process with <code>_exit</code></td></tr>
+<tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>%LOCALAPPDATA%\luma</code> on Windows, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored. A wgpu pipeline cache that grows past 32 MB is dropped and starts again</td></tr>
+<tr><td><code>LUMA_CPU_THREADS</code></td><td>Number of worker threads of the native <code>cpu</code> backend (default: the machine’s available parallelism; a value that is not a positive number is ignored)</td></tr>
+<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s Vulkan driver) and then ends the process with <code>_exit</code></td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="testing-variables"><a class="header" href="#testing-variables">Testing variables</a></h2>
-<p>These only affect the differential fuzzer in the crate’s own test suite (<code>cargo test fuzz::</code>):</p>
+<p>These only affect the crate’s own test suite: the first three the differential fuzzer (<code>cargo test fuzz::</code>), the last the cache directory:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -248,6 +249,7 @@ builder methods override them:</p>
 <tr><td><code>LUMA_FUZZ_CASES</code></td><td>Number of random programs per fuzz test (default 256, 24 in debug builds)</td></tr>
 <tr><td><code>LUMA_FUZZ_SEED</code></td><td>Fixed seed (default: random; failing cases are also kept in <code>tests/proptest-regressions/</code>)</td></tr>
 <tr><td><code>LUMA_FUZZ_VERBOSE</code></td><td>Set to anything: print a line for each program that ends early on a documented limit</td></tr>
+<tr><td><code>LUMA_TEST_CACHE</code></td><td><code>1</code>: the process uses a cache directory under the system temporary directory (<code>luma-test-cache</code>) instead of the user’s, unless <code>LUMA_CACHE</code> or <code>LUMA_CACHE_DIR</code> is set (unit tests always do)</td></tr>
 </tbody>
 </table>
 </div>

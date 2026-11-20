@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -305,14 +305,15 @@ becomes the load of that kernel.</p>
 </thead>
 <tbody>
 <tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
-<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code></td><td>the operand, in the first pass over the data</td><td>eager: the result is evaluated when the call returns</td></tr>
+<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td>eager: the result is evaluated when the call returns</td></tr>
+<tr><td><code>solve_tridiagonal</code>, <code>solve_tridiagonal_parts</code>, <code>solve_block_tridiagonal_parts</code></td><td>each pending block/vector entry is computed where a cell’s system is loaded</td><td>eager: the solution is evaluated when the call returns</td></tr>
 <tr><td><code>put_add</code>, <code>put_min</code>, <code>put_max</code>, <code>bincount</code>, <code>histogram</code>, <code>group_*</code></td><td>the value and the index (or code, or bucket) expressions of the scatter</td><td>an in-place write, like <code>put</code></td></tr>
 <tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
 </tbody>
 </table>
 </div>
 <p>An operand that reads circular <code>shift</code>s of other expressions, or lives in several buffers, is
-evaluated first instead. <code>scan</code> and <code>cumsum</code> always evaluate their operand (they read it twice; on CUDA integer and <code>min</code> / <code>max</code> scans of long contiguous lines read it once).
+evaluated first instead. <code>scan</code> and <code>cumsum</code> always evaluate their operand (they read it twice; on CUDA, and on the native CPU backend with <code>LUMA_LOOKBACK_SCAN=on</code>, integer and <code>min</code> / <code>max</code> scans of long contiguous lines read it once).
 Because these results are evaluated at the call, a loop that calls them every step builds one
 kernel per call rather than one fused chain: count launches with <code>ctx.profile(..)</code>. Usage is in
 <a href="data.html">Matrices, statistics and grouping</a>: <a href="data.html#matrix-products"><code>matmul</code></a>, <a href="data.html#statistics-along-an-axis">axis statistics</a>, <a href="data.html#accumulating-scatters">scatters</a>, <a href="data.html#sorting">sorting</a>.</p>
@@ -327,7 +328,7 @@ through memory, not correctness:</p>
 <tr><td>operations per kernel</td><td>16384</td><td><code>LUMA_FUSION_MAX_NODES</code>, or <a href="https://docs.rs/luma/latest/luma/fn.fusion_limit.html"><code>fusion_limit</code></a> for expressions written in a scope</td></tr>
 <tr><td>nesting depth</td><td>512 (256 with debug assertions)</td><td>fixed (the walk is recursive)</td></tr>
 <tr><td>values live at once</td><td>by GPU profile</td><td><code>LUMA_FUSION_MAX_LIVE</code></td></tr>
-<tr><td>instructions after views of lazy expressions are unfolded</td><td>1536 on NVIDIA, 1024 on other GPUs, 192 on CPU</td><td><code>LUMA_FUSION_MAX_INLINED</code></td></tr>
+<tr><td>instructions after views of lazy expressions are unfolded</td><td>1536 on the NVIDIA profile, 1024 elsewhere (other GPUs and the CPU backend)</td><td><code>LUMA_FUSION_MAX_INLINED</code></td></tr>
 <tr><td>input buffers per kernel</td><td>the device’s storage-buffer limit minus 3, at most 256</td><td><code>LUMA_FUSION_MAX_INPUTS</code> lowers it (to test a device with fewer)</td></tr>
 <tr><td>scalar operands</td><td>one uniform buffer</td><td>fixed</td></tr>
 </tbody>
@@ -337,7 +338,7 @@ through memory, not correctness:</p>
 share work with it), and the rest is flattened again.</p>
 <h3 id="many-arrays-in-one-kernel"><a class="header" href="#many-arrays-in-one-kernel">Many arrays in one kernel</a></h3>
 <p>A kernel that reads many different arrays (the 50 words of a Keccak state) meets the device’s
-binding limit: 16 on many integrated GPUs via WebGPU, 29 on wgpu Metal, 256 on native CUDA, native Metal (argument buffers) and discrete GPUs.
+binding limit: 16 on many integrated GPUs via WebGPU, 29 on wgpu Metal, and 256 on native CUDA, on the native CPU backend, on native Metal with tier-2 argument buffers (28 without them) and on discrete GPUs.
 Cutting such an expression on the limit alone would evaluate it a few operations at a time, because
 every round reads every array. Luma instead puts the arrays into one buffer. When a kernel would bind
 more arrays than the device allows, the evaluated arrays of one length and type it reads are copied
@@ -352,16 +353,15 @@ a cut, and an array of a window is kept alive by the buffer it shares while any 
 lives. Arrays read through a view or a circular <code>shift</code> are not read through the shared binding
 (they get a buffer of their own when the view is made). <code>ctx.profile(..)</code> shows the copies as
 <code>FusedStack(Id, ...)</code> kernels; <code>LUMA_FUSION_MAX_INPUTS=13</code> reproduces a 16-binding device on any GPU.</p>
-<p>Never fused, because they need whole-array structure: <code>scan</code>, tridiagonal solves, FFT
-convolution, and custom kernels. They read computed arrays.</p>
+<p>Never fused, because they need whole-array structure: <code>scan</code>, stacked block-tridiagonal solves (<code>solve_block_tridiagonal</code>), <code>conv1d</code> / <code>conv1d_fft</code>, and custom kernels. They read computed arrays.</p>
 <h2 id="caches"><a class="header" href="#caches">Caches</a></h2>
 <ul>
 <li><strong>Kernels</strong> are cached per context by the <em>structure</em> of the expression: operations, types, how
 values are wired. Scalar values are uniforms, so <code>&amp;x * 2.0</code> and <code>&amp;x * 3.0</code> share one pipeline,
 and an expression with the same shape built again costs the host only the flattening. Identical
 operations on the same operands are one node (hash-consing).</li>
-<li><strong>Compiled pipelines</strong> are cached on disk (CUDA PTX, CPU Cranelift object files, and wgpu’s Vulkan <code>PipelineCache</code>) per adapter and
-driver, and in-process on Metal, so repeated runs skip the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
+<li><strong>Compiled pipelines</strong> are cached on disk (CUDA PTX, the native CPU backend’s compiled machine code, and wgpu’s Vulkan <code>PipelineCache</code>) per adapter and
+driver; the native Metal backend keeps none between processes. Repeated runs skip the multi-second compile of large (<code>Df32</code>) kernels. The measured cost model is kept next to it.
 <code>LUMA_CACHE=off</code> disables both; <code>LUMA_CACHE_DIR</code> moves them. A damaged file is ignored.</li>
 <li><strong>Loops</strong>: an <code>iterate_all</code> called again from the same place with the same step graph reuses the
 earlier program, and after two such calls the GPU starts before the step is traced
@@ -377,10 +377,10 @@ program that cycles through gigabytes of temporaries reuses them instead of allo
 <tr><th>Loop</th><th>Host per step</th><th>Notes</th></tr>
 </thead>
 <tbody>
-<tr><td><code>iterate_all</code> of an elementwise step</td><td>none</td><td>one kernel, state in registers, launches of about 40 ms</td></tr>
-<tr><td><code>iterate</code> of a stencil</td><td>none</td><td>time-blocked: several steps per pass over memory</td></tr>
-<tr><td><code>iterate_until</code>, <code>iterate_until_all</code></td><td>none</td><td>the stop rule runs on the GPU; one wait per block of steps</td></tr>
-<tr><td><code>eval</code> every step</td><td>building the step</td><td>recognised as a loop for <code>f32</code> steps; never waits</td></tr>
+<tr><td><code>iterate_all</code> of an elementwise <code>f32</code> or <code>u32</code> step</td><td>none</td><td>one kernel, state in registers, launches of about 40 ms</td></tr>
+<tr><td><code>iterate</code> of a 1-D or 2-D stencil</td><td>none</td><td>time-blocked: several steps per pass over memory</td></tr>
+<tr><td><code>iterate_until</code>, <code>iterate_until_all</code></td><td>none</td><td>the stop rule runs on the GPU; one wait per block of steps; a block is one graph replay on CUDA, Metal and the CPU backend</td></tr>
+<tr><td><code>eval</code> every step</td><td>building the step</td><td>recognised as a loop for <code>f32</code> steps (a register loop, or a stencil of up to four arrays evaluated together); never waits</td></tr>
 <tr><td>readback every step (<code>max().item()?</code>)</td><td>a GPU round trip</td><td>speculation hides it when the step repeats</td></tr>
 </tbody>
 </table>
@@ -400,6 +400,9 @@ most expensive way: replace it with <code>iterate_until_all</code>, or test ever
 <li>Arrays beyond the memory budget move to host memory and back on demand (once-only warning). Set
 <code>LUMA_MEMORY_BUDGET</code> to something your machine can keep on the device. Arrays split over several
 buffers are never staged and cannot be passed to custom kernels.</li>
+<li><code>ctx.memory_stats()</code> reports the bytes in use, idle in the pool and spilled to host memory, and the
+budget; <code>ctx.trim()</code> gives the idle pool back to the device, for example after a phase whose
+temporaries the next one cannot reuse.</li>
 </ul>
 <h2 id="a-checklist-for-a-slow-program"><a class="header" href="#a-checklist-for-a-slow-program">A checklist for a slow program</a></h2>
 <ol>
@@ -420,8 +423,8 @@ materialises, <code>LUMA_STAGING=off</code> turns staging off.</li>
 <li><strong>Reuse arrays.</strong> Allocate outside the loop; ping-pong with two arrays in custom kernels.</li>
 <li><strong>Cold start.</strong> The first run compiles kernels (seconds for big <code>Df32</code> ones); the second reads
 the disk cache. Measure the second run.</li>
-<li><strong>Device.</strong> <code>LUMA_DEVICE=cpu</code> is for testing; a software device is far slower. On a laptop
-check which GPU opened (<a href="faq.html#choosing-a-device">FAQ</a>).</li>
+<li><strong>Device.</strong> <code>LUMA_DEVICE=cpu</code> forces the native CPU backend, a fallback that runs on the host’s
+threads. On a laptop check which GPU opened (<a href="faq.html#choosing-a-device">FAQ</a>).</li>
 </ol>
 
                     </main>

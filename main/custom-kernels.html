@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -186,6 +186,10 @@
 existing shader), write the kernel in WGSL and run it on Luma arrays. A custom kernel joins the same
 ordered batch as the built-in operations, reads and writes <code>Array</code>s directly and needs no buffer
 management.</p>
+<p>The WGSL is the same on every backend. Luma parses and validates it with naga, then lowers it to its
+kernel IR (<code>luma_core::kir</code>): wgpu compiles the validated module itself, and the native CUDA,
+Metal and CPU backends compile the IR (to NVVM IR, MSL and Cranelift code). A construct the
+lowering cannot translate fails the build with <code>LumaError::Unsupported</code> naming it; <code>enable wgpu_cooperative_matrix;</code> is accepted on the wgpu backend only.</p>
 <h2 id="a-first-kernel"><a class="header" href="#a-first-kernel">A first kernel</a></h2>
 <pre><code class="language-rust">use luma::*;
 
@@ -235,7 +239,8 @@ size you passed to <code>launch</code>). Luma appends two helpers to your source
 <p><strong>Problem size.</strong> <code>launch([x])</code>, <code>launch([x, y])</code> or <code>launch([x, y, z])</code> runs at least that many
 invocations: <code>ceil(size / workgroup_size)</code> workgroups per dimension. Guard against
 <code>global_invocation_id &gt;= luma.size</code>. <code>launch_raw([wx, wy, wz], args)</code> runs exactly that many
-workgroups.</p>
+workgroups (<code>luma.size</code> is then the workgroup counts times the workgroup size). Both fail with
+<code>LumaError::InvalidShape</code> for a zero dimension and <code>KernelGridTooLarge</code> past the device’s limit.</p>
 </li>
 <li>
 <p><strong>Uniform values</strong> are copied when you pass them. Any type
@@ -325,7 +330,9 @@ assert_eq!(t.shape(), Shape::from([3, 4]));
 assert_eq!(t.sum().item()?, 66.0);              // built-in reductions work on the output
 assert_eq!(t.to_vec()?[1], 4.0);                // t(1, 0) = a(0, 1)
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><code>Kernel::new(src)</code> is <code>default_context()?.kernel(src).build()</code>. Building the same source, entry point,
+<p><code>Kernel::new(src)</code> is <code>default_context()?.kernel(src).build()</code>. The builder also has
+<code>.workgroup([x, y, z])</code>, which asserts the size the shader declares with <code>@workgroup_size</code> (a
+different one is <code>KernelWorkgroup</code>); <code>kernel.workgroup()</code> returns it. Building the same source, entry point,
 workgroup size and label twice on a context reuses the pipeline, and a <code>Kernel</code> is cheap to clone. The shader is parsed and validated
 when you build it: a mistake comes out as <code>LumaError::ShaderCompile</code> with the WGSL error and
 line numbers that match your source (Luma appends its prelude, so it never shifts them).</p>
@@ -473,16 +480,19 @@ assert!(matches!(err, LumaError::KernelArgElementSize { .. }), "{err}");
 assert!(matches!(Kernel::new("@compute fn main("), Err(LumaError::ShaderCompile(_))));
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>A poisoned array passed as an argument fails the launch with its own error. Other errors:
-<code>KernelArgKind</code> (an array where a uniform goes, or the reverse), <code>KernelArgUniformSize</code>,
-<code>KernelEntryPoint</code>, <code>KernelBinding</code> (bindings outside <code>@group(1)</code> or not numbered from 0),
-<code>KernelWorkgroup</code>, <code>KernelGridTooLarge</code>. See <a href="https://docs.rs/luma/latest/luma/enum.LumaError.html"><code>LumaError</code></a>.</p>
+<code>KernelArgKind</code> (an array where a uniform goes, or the reverse), <code>KernelArgUniform</code> (a value encase
+cannot lay out), <code>KernelArgUniformSize</code>, <code>KernelArgAlias</code> (one buffer bound twice with a writable
+binding, as arrays that share a buffer through <code>reshape</code> are), <code>KernelEntryPoint</code>, <code>KernelBinding</code>
+(bindings outside <code>@group(1)</code> or not numbered from 0), <code>KernelWorkgroup</code>, <code>KernelGridTooLarge</code>,
+<code>Unsupported</code>. See <a href="https://docs.rs/luma/latest/luma/enum.LumaError.html"><code>LumaError</code></a>.</p>
 <h2 id="limits"><a class="header" href="#limits">Limits</a></h2>
 <ul>
 <li>Kernel arguments must be arrays that fit one buffer; an array split over several buffers
 fails with <code>LumaError::Chunked</code>.</li>
 <li>You cannot pass a read-only view as <code>&amp;mut</code>, nor write the state of an <code>iterate</code> step.</li>
 <li>The shader features the device was opened with decide what WGSL compiles (<code>f64</code> needs
-<code>SHADER_F64</code>; check <code>ctx.features()</code>).</li>
+<code>SHADER_F64</code>, subgroup operations need <code>SUBGROUP</code>; check <code>ctx.features()</code>). Cooperative matrices
+exist on the wgpu backend only.</li>
 </ul>
 
                     </main>

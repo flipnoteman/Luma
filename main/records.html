@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -281,8 +281,8 @@ element type is a compile error. Nested records count every array (<code>COUNT</
 </thead>
 <tbody>
 <tr><td>operators</td><td><code>+ - * /</code> between records, with an element value (<code>f32</code> for an <code>f32</code> record) and with an <code>Array&lt;Elem&gt;</code>, any reference/owned combination, the scalar or array on either side; <code>+= -= *= /=</code> with <code>&amp;Record</code>, a value and <code>&amp;Array</code>; unary <code>-</code> on <code>&amp;Record</code> and <code>Record</code> (not <code>u32</code>)</td></tr>
-<tr><td>views</td><td><code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>shift</code>, <code>shift_fill</code>, <code>shift_clamp</code>, <code>shift_mirror</code>, <code>take</code>, <code>broadcast_to</code>, <code>copy</code></td></tr>
-<tr><td>writes</td><td><code>slice_mut</code>, <code>flip_mut</code>, <code>transpose_mut</code> (a <a href="views.html#views-that-write"><code>ViewMut</code></a> of the record), <code>assign</code>, <code>put</code></td></tr>
+<tr><td>views</td><td><code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>swap_axes</code>, <code>permute_axes</code>, <code>shift</code>, <code>shift_fill</code>, <code>shift_clamp</code>, <code>shift_mirror</code>, <code>take</code>, <code>broadcast_to</code>, <code>copy</code></td></tr>
+<tr><td>writes</td><td><code>slice_mut</code>, <code>flip_mut</code>, <code>transpose_mut</code>, <code>swap_axes_mut</code>, <code>permute_axes_mut</code> (a <a href="views.html#views-that-write"><code>ViewMut</code></a> of the record), <code>assign</code>, <code>put</code></td></tr>
 <tr><td>helpers</td><td><code>map(f)</code>, <code>zip(&amp;other, f)</code>, <code>dot(&amp;other)</code>, <code>Fields::select(&amp;cond, &amp;a, &amp;b)</code>, <code>arrays()</code>, <code>eval()</code>, <code>cache()</code></td></tr>
 </tbody>
 </table>

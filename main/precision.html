@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -192,8 +192,8 @@ types and compensated reductions:</p>
 </thead>
 <tbody>
 <tr><td><code>f32</code></td><td>24 of mantissa</td><td>everywhere</td><td>1</td></tr>
-<tr><td><code>Df32</code></td><td>about 48</td><td>everywhere (computed with <code>f32</code> arithmetic)</td><td>about 27 to 44 <code>f32</code> operations per add or multiply on the GPUs measured, about 2 on llvmpipe</td></tr>
-<tr><td><code>f64</code></td><td>53</td><td>devices with <code>SHADER_F64</code></td><td>11 to 41 <code>f32</code> operations on the GPUs measured</td></tr>
+<tr><td><code>Df32</code></td><td>about 48</td><td>everywhere (computed with <code>f32</code> arithmetic)</td><td>about 27 to 44 <code>f32</code> operations per add or multiply on the GPUs measured, about 2 on CPU</td></tr>
+<tr><td><code>f64</code></td><td>53</td><td>devices with <code>SHADER_F64</code> (CUDA, <code>cpu</code>, some Vulkan GPUs)</td><td>11 to 41 <code>f32</code> operations on the GPUs measured, about 1 on CPU</td></tr>
 </tbody>
 </table>
 </div>
@@ -202,7 +202,7 @@ and use wide types only where it matters: the cost model weighs <code>Df32</code
 the factors it measured (<a href="performance.html#the-cost-model">Performance</a>).</p>
 <h2 id="f64"><a class="header" href="#f64"><code>f64</code></a></h2>
 <p><code>Array&lt;f64&gt;</code> exists on every context, but only works on devices that have 64-bit shader floats
-(<code>luma::Features::SHADER_F64</code>, in practice CUDA and some Vulkan GPUs). Without it every <code>f64</code> operation is
+(<code>luma::Features::SHADER_F64</code>: CUDA, the native <code>cpu</code> backend, and some Vulkan GPUs). Without it every <code>f64</code> operation is
 poisoned with <a href="https://docs.rs/luma/latest/luma/enum.LumaError.html"><code>LumaError::Unsupported</code></a>.
 Check first:</p>
 <pre><code class="language-rust">use luma::*;
@@ -270,7 +270,7 @@ let back = (t.ln()).exp().to_vec()?;
 assert!((back[1].to_f64() / 2000.0 - 1.0).abs() &lt; 1e-13);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><strong>Cost.</strong> One <code>Df32</code> add or multiply costs <code>df32_factor</code> <code>f32</code> operations: 27 on the RTX 3090
-and 44 on the integrated GPU the model was measured on, 2.3 on llvmpipe. The
+and 44 on the integrated GPU the model was measured on, 2.3 on CPU. The
 <a href="https://docs.rs/luma/latest/luma/struct.CostModel.html"><code>CostModel</code></a> of the device records the
 measured factor and the fusion decisions use it. A higher factor makes recomputing a <code>Df32</code> expression at several offsets more expensive in the
 model’s estimate, which weighs it against staging and materialising it

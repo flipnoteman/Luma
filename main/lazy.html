@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -195,7 +195,7 @@ assert_eq!(r.to_vec()?[0], 7.0); // one kernel: out[i] = a[i] * b[i] + c[i]
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Each operator creates a node in a graph that remembers its inputs. <code>r</code> is the node for the add;
 nothing is allocated for the product. When the host needs the values, Luma flattens the graph
-below <code>r</code> into one program, generates a WGSL kernel for it, and launches it. The product never
+below <code>r</code> into one program, compiles a single kernel for the active backend (CUDA, Metal, Vulkan/DX12, or native SIMD CPU), and launches it. The product never
 exists in memory: the kernel reads <code>a</code>, <code>b</code> and <code>c</code> once and writes <code>r</code> once. A chain of 20
 elementwise operations is still one launch and one pass over memory.</p>
 <p>A lazy array is the value as of when it was written. If you later change an input with <code>write</code>,
@@ -269,11 +269,11 @@ epilogue of a <a href="reductions.html">reduction</a>. A view of a lazy expressi
 reader’s index, staged in workgroup memory, or evaluated first, whichever the
 <a href="performance.html#the-cost-model">cost model</a> estimates is cheapest (within the caps below: a kernel
 that would exceed <code>LUMA_FUSION_MAX_INLINED</code> is cut whatever the model says).</p>
-<p>Not fused, because they need whole-array structure: <code>scan</code>, tridiagonal solves, FFT convolution,
+<p>Not fused, because they need whole-array structure: <code>scan</code>, stacked <code>solve_block_tridiagonal</code>, <code>conv1d</code> / <code>conv1d_fft</code>,
 and your own kernels. They read the arrays they are given, which are computed first.
-<code>matmul</code>, the axis reductions (<code>sum_axis</code>, <code>reduce_axis</code>, …), the scatters (<code>put_add</code>, …) and
+<code>matmul</code>, <code>solve_tridiagonal</code> / <code>solve_tridiagonal_parts</code> / <code>solve_block_tridiagonal_parts</code>, the axis reductions (<code>sum_axis</code>, <code>reduce_axis</code>, <code>argmax_axis</code>, …), the scatters (<code>put_add</code>, …) and
 the sorts are kernels of their own too, but they compute a pending operand <em>inside</em> their loads
-instead of storing it, and <code>matmul</code>, the axis reductions and the sorts are eager: the result is
+instead of storing it, and <code>matmul</code>, the line solves, the axis reductions and the sorts are eager: the result is
 evaluated when the call returns, so what reads it is another kernel
 (<a href="performance.html#primitives-that-read-an-expression">Performance guide</a>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
@@ -281,9 +281,10 @@ evaluated when the call returns, so what reads it is another kernel
 cheaper. <a href="https://docs.rs/luma/latest/luma/struct.Profile.html#structfield.splits"><code>Profile::splits</code></a> tells you where
 and why.</p>
 <h2 id="cache"><a class="header" href="#cache"><code>cache()</code></a></h2>
-<p><code>x.cache()</code> marks an expression as shared: it is evaluated once into a buffer and later readers
-load it instead of recomputing it. Luma decides this itself for views, so you need <code>cache()</code> only
-when you know better: an expensive expression read at many unrelated places.</p>
+<p><code>x.cache()</code> evaluates an expression now (it is recorded as a kernel, without waiting for the GPU)
+into a buffer, and later readers load it instead of recomputing it. Luma decides this itself for
+views, so you need <code>cache()</code> only when you know better: an expensive expression read at many
+unrelated places.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::linspace(0.0, 1.0, 1000)?;
@@ -294,7 +295,7 @@ assert_eq!(r.len(), 1000);
 </span><span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="looking-at-what-ran-profile"><a class="header" href="#looking-at-what-ran-profile">Looking at what ran: <code>Profile</code></a></h2>
 <p><code>ctx.profile(|| ..)</code> runs a closure and returns the GPU time of every kernel launched during it,
-by label, and the places where expressions were split. It needs timestamp queries on the adapter
+by label, and the places where expressions were split. It needs timestamp queries on the device
 (<a href="https://docs.rs/luma/latest/luma/struct.Context.html"><code>Context::profiling_supported</code></a>).</p>
 <pre><code class="language-rust">use luma::*;
 

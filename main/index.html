@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -200,8 +200,11 @@ to a project:</p>
 <pre><code class="language-toml">[dependencies]
 luma = "0.5"
 </code></pre>
-<p>Without a GPU Luma runs on its native <code>cpu</code> backend (nothing to install). It is picked
-automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces it. See the <a href="faq.html#choosing-a-device">FAQ</a>.</p>
+<p>With the default settings Luma opens the first backend that has a device, in the order CUDA, Metal,
+wgpu; <code>LUMA_BACKEND=cuda|metal|wgpu|cpu</code> (or <code>Context::cuda()</code>, <code>Context::metal()</code>, <code>Context::wgpu()</code>,
+<code>Context::cpu()</code>) picks one. Without a GPU it runs on its native <code>cpu</code> backend (nothing to
+install). That backend is picked automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces it.
+See the <a href="faq.html#choosing-a-device">FAQ</a>.</p>
 <h2 id="a-first-program"><a class="header" href="#a-first-program">A first program</a></h2>
 <pre><code class="language-rust">use luma::*;
 

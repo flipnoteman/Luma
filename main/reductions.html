@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -185,7 +185,7 @@
 <p>A reduction turns an array into fewer numbers: a sum, a minimum, a norm. In Luma a reduction
 returns a one-element array and the expression behind it is fused into the reduction’s first
 pass. Over an <code>f32</code> array, or over any lazy expression, nothing runs until the result is needed;
-over an already computed <code>u32</code>, <code>f64</code> or <code>Df32</code> array the passes are recorded at once (still
+over an already computed <code>u32</code>, <code>i32</code>, <code>f64</code> or <code>Df32</code> array the passes are recorded at once (still
 without waiting). Nothing waits for the GPU until the host asks for the value.</p>
 <h2 id="lazy-one-element-results"><a class="header" href="#lazy-one-element-results">Lazy one-element results</a></h2>
 <pre><code class="language-rust">use luma::*;
@@ -241,8 +241,8 @@ if ctx.profiling_supported() {
     assert!(profile.launches() &lt;= 2, "{profile}");
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>A large array takes two launches: a first pass in which every workgroup reduces a slice of the
-expression to a partial result, and a second that combines the partials. An array small enough
+<p>A large array takes at most two launches: a first pass in which every workgroup reduces a slice of the
+expression to a partial result, and a second that combines the partials (on CUDA the last workgroup of the first pass finishes the reduction in one launch). An array small enough
 for one workgroup takes one. Float sums combine in trees (see the <code>Array::sum</code> documentation), so the
 error stays far below that of a sequential sum.</p>
 <h3 id="epilogues"><a class="header" href="#epilogues">Epilogues</a></h3>

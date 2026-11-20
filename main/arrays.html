@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -192,7 +192,8 @@ assert_eq!(a.shape(), Shape::from([3, 2]));
 assert_eq!(a.len(), 6);
 
 // Constants and generators. `zeros` and `full` are buffers filled at once; the generators
-// (`linspace`, `range`, `uniform`) are computed inside the kernel that reads them, not stored.
+// (`linspace`, `range`, `uniform`, `normal`, and `random_bits` for `u32`) are computed inside the
+// kernel that reads them, not stored.
 let zeros = Array::&lt;f32&gt;::zeros([3, 2])?;
 let twos = Array::&lt;f32&gt;::full([3, 2], 2.0)?;
 let ramp = Array::linspace(0.0, 1.0, 5)?;
@@ -218,11 +219,11 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 <tr><td><code>i32</code></td><td>signed integers, <a href="integers.html#signed-integers-and-casts">casts</a></td></tr>
 <tr><td><code>bool</code></td><td>the result of comparisons: a boolean per element (<a href="integers.html#comparisons-booleans-and-select">booleans</a>)</td></tr>
 <tr><td><code>Df32</code></td><td>double-float, about 48 bits of mantissa, runs on every device (<a href="precision.html">Precision</a>)</td></tr>
-<tr><td><code>f64</code></td><td>64-bit float, only on devices with <code>SHADER_F64</code></td></tr>
+<tr><td><code>f64</code></td><td>64-bit float, only on devices with <code>SHADER_F64</code> (CUDA, the CPU backend, some Vulkan GPUs; not Metal)</td></tr>
 </tbody>
 </table>
 </div>
-<p><code>vec2</code> / <code>vec4</code> element types exist for custom kernels, and <a href="records.html">records</a> group several
+<p><code>[f32; 2]</code> / <code>[f32; 4]</code> / <code>[u32; 2]</code> / <code>[u32; 4]</code> (<code>vec2</code> / <code>vec4</code>) element types exist for custom kernels, and <a href="records.html">records</a> group several
 arrays behind one struct. The built-in operations exist for <code>f32</code>, <code>u32</code>, <code>i32</code>, <code>Df32</code> and <code>f64</code>
 (the <em>scalar</em> types); what each type supports is listed in the chapters named in the table.</p>
 <h3 id="booleans"><a class="header" href="#booleans">Booleans</a></h3>
@@ -297,8 +298,8 @@ lazy and fuse:</p>
 <tbody>
 <tr><td><code>f32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>abs</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>log1p</code>, <code>expm1</code>; <code>powf(exponent)</code>, <code>clamp(lo, hi)</code> (host scalars); <code>atan2(x)</code>, <code>hypot(other)</code>, <code>copysign(sign)</code> (array or scalar)</td></tr>
 <tr><td><code>f64</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code></td></tr>
-<tr><td><code>Df32</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>log1p</code>, <code>expm1</code> (<a href="precision.html">Precision</a>)</td></tr>
-<tr><td><code>i32</code></td><td><code>abs</code>, <code>sign</code>, <code>shl</code>, <code>shr</code> (<a href="integers.html#signed-integers-and-casts">Signed integers</a>)</td></tr>
+<tr><td><code>Df32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>tanh</code>, <code>abs</code>, <code>log1p</code>, <code>expm1</code>, <code>powf(Df32)</code> (<a href="precision.html">Precision</a>)</td></tr>
+<tr><td><code>i32</code></td><td><code>abs</code>, <code>sign</code>, <code>shl</code>, <code>shr</code>; bit operators <code>&amp; | ^ !</code> (<a href="integers.html#signed-integers-and-casts">Signed integers</a>)</td></tr>
 <tr><td><code>u32</code></td><td>bit operations, <code>shl</code>, <code>shr</code>, <code>rotate_left</code>, <code>rotate_right</code> (<a href="integers.html">Integers</a>)</td></tr>
 <tr><td>every scalar type</td><td><code>minimum(rhs)</code>, <code>maximum(rhs)</code>, <code>lt</code> <code>le</code> <code>gt</code> <code>ge</code> <code>eq</code> <code>ne</code> (booleans), <code>select(&amp;cond, a, b)</code></td></tr>
 </tbody>
@@ -381,8 +382,8 @@ assert_eq!(x.to_vec()?, vec![7.0, 8.0, 9.0]);
 <code>(len - kernel_len + 2 * padding) / stride + 1</code> elements. <code>x.conv1d_fft(&amp;kernel)</code> is the full
 <em>linear convolution</em> (the kernel is flipped), <code>len + kernel_len - 1</code> elements, computed with FFTs:
 use it for long kernels, where it is faster than the direct loop, and expect <code>f32</code> rounding error in
-its result. Both evaluate their operands and fail (poisoned array) for a bad geometry such as a
-kernel longer than the padded input or a zero stride.</p>
+its result. Both evaluate their operands, need 1-D arrays, and fail (poisoned array) for a bad
+geometry such as a kernel longer than the padded input or a zero stride.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0], 5)?;

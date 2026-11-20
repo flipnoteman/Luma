@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -182,8 +182,8 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="worked-examples"><a class="header" href="#worked-examples">Worked examples</a></h1>
-<p>Five tours of programs in the repository. The first two have the full code here, runnable; for the
-others the chapter points to the code and says what to look at. Run the repository examples
+<p>Six tours of programs in the repository. The heat equation, the Euler solver and the data-science
+pipeline have the full code here, runnable; for the others the chapter points to the code and says what to look at. Run the repository examples
 with <code>cargo run --release --example &lt;name&gt;</code> from a checkout of
 <a href="https://github.com/flipnoteman/Luma">the repository</a>.</p>
 <h2 id="heat-equation"><a class="header" href="#heat-equation">Heat equation</a></h2>
@@ -358,8 +358,9 @@ how many kernels it took). The <code>host ms</code> column is only the tracing o
 run from the program of the first (the header of the file explains).</li>
 <li>The profile after the table: kernels per permutation and the reasons for the cuts.</li>
 <li>The known-answer tests in <code>tests/keccak.rs</code>, and the test that a chain of eight permutations
-(about 80 000 operations) is cut into at most 60 kernels (it is skipped on CPU and Apple
-profiles and without timestamp queries).</li>
+(about 80 000 operations) is cut into at most 60 kernels (it needs timestamp queries, and allows
+up to 120 kernels in debug builds; a device with few bindings packs the 50 state words into a
+few buffers, <a href="performance.html#many-arrays-in-one-kernel">Performance</a>).</li>
 </ul>
 <h2 id="cpa-hypothesis-matrix"><a class="header" href="#cpa-hypothesis-matrix">CPA hypothesis matrix</a></h2>
 <p>A correlation power analysis of a block cipher guesses a key byte <code>k</code> and correlates the measured

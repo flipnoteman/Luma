@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -192,10 +192,11 @@ on the GPU:</p>
 <tr><th>Primitive</th><th>Use</th></tr>
 </thead>
 <tbody>
-<tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate"><code>Array::iterate</code></a></td><td><code>steps</code> applications of a step on one <code>f32</code> array; stencils run time-blocked</td></tr>
-<tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a></td><td><code>steps</code> applications of a step on several arrays of one element type; elementwise <code>f32</code>, <code>u32</code> and <code>i32</code> steps keep the state in registers</td></tr>
-<tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate_until"><code>Array::iterate_until</code></a></td><td>a step until the largest change is below a tolerance</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate"><code>Array::iterate</code></a></td><td><code>steps</code> applications of a step on one <code>f32</code> array; 1-D and 2-D stencils run time-blocked</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_all.html"><code>iterate_all</code></a></td><td><code>steps</code> applications of a step on several arrays of one element type; elementwise <code>f32</code> and <code>u32</code> steps keep the state in registers</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/struct.Array.html#method.iterate_until"><code>Array::iterate_until</code></a></td><td>a step until the largest change is at most a tolerance</td></tr>
 <tr><td><a href="https://docs.rs/luma/latest/luma/fn.iterate_until_all.html"><code>iterate_until_all</code></a></td><td>a step on any <a href="records.html">record</a> until a rule over recorded scalars holds</td></tr>
+<tr><td><a href="https://docs.rs/luma/latest/luma/fn.compile_until_all.html"><code>compile_until_all</code></a></td><td>the same loop traced once and run many times, for a solver that steps in chunks</td></tr>
 </tbody>
 </table>
 </div>
@@ -233,7 +234,8 @@ workgroup memory and runs several steps on it, so the data passes through memory
 steps rather than once per step. Any other step (shifts of a computed expression, <code>cache()</code>,
 <code>assign</code>, reductions) is traced and replayed step by step: each step is still the fused kernels
 of the step, and the loop costs no host time per step.</p>
-<p>A step that is a stencil of 2-D data looks the same: <code>u.shift([1, 0]) + u.shift([-1, 0]) + u.shift([0, 1]) + u.shift([0, -1]) - u * 4.0</code>.</p>
+<p>A step that is a stencil of 2-D data looks the same: <code>u.shift([1, 0]) + u.shift([-1, 0]) + u.shift([0, 1]) + u.shift([0, -1]) - u * 4.0</code>. Stencils exist for 1-D and 2-D arrays held in one
+buffer; a 3-D array, or one split over several buffers, runs step by step.</p>
 <h2 id="elementwise-loops-iterate_all"><a class="header" href="#elementwise-loops-iterate_all">Elementwise loops: <code>iterate_all</code></a></h2>
 <p><code>iterate_all(init, steps, step)</code> runs the step on <code>N</code> arrays at once; <code>step</code> gets <code>&amp;[Array&lt;T&gt;; N]</code>
 and returns the next <code>[Array&lt;T&gt;; N]</code>. When every result is an elementwise expression of the
@@ -252,8 +254,8 @@ let [z, count] = iterate_all([&amp;zero, &amp;zero], 64, |[z, count]| {
 assert_eq!(count.to_vec()?, vec![64.0, 64.0, 2.0, 3.0]);
 <span class="boring">z.eval()?;
 </span><span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>The states may be <code>u32</code> or <code>i32</code> as well, which makes register loops of integer recurrences, hash rounds
-and counters (see <a href="integers.html">Integer and bit operations</a>):</p>
+<p>The states may be <code>u32</code> as well, which makes register loops of integer recurrences, hash rounds
+and counters (see <a href="integers.html">Integer and bit operations</a>); all states of one loop have one type:</p>
 <pre><code class="language-rust">use luma::*;
 
 // A linear congruential generator, 5 steps per element, 32-bit wrap-around arithmetic.
@@ -267,8 +269,9 @@ let want: Vec&lt;u32&gt; = [1u32, 2, 3]
 assert_eq!(x.to_vec()?, want);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>A step that is <em>not</em> elementwise (shifts, <code>cache()</code>, <code>assign</code>), or states of another element type
-(<code>Df32</code>, <code>f64</code>), is traced once and its recorded kernels are replayed step by step. The results
-are the same; only the one-kernel register loop is lost.</p>
+(<code>i32</code>, <code>Df32</code>, <code>f64</code>), is traced once and its recorded kernels are replayed step by step (as one
+graph on CUDA, Metal and the CPU backend when the step is replayed often enough to pay for the
+capture). The results are the same; only the one-kernel register loop is lost.</p>
 <h3 id="launch-sizing"><a class="header" href="#launch-sizing">Launch sizing</a></h3>
 <p>A long register loop is not one kernel launch for ever. The cost model
 (<a href="performance.html#the-cost-model">Performance</a>) sizes its launches to about 40 ms of GPU time (at least one step per launch), which keeps them far
@@ -330,7 +333,8 @@ receives. <code>h["name"]</code> is a <a href="https://docs.rs/luma/latest/luma/
 builds a condition.</li>
 <li><strong><a href="https://docs.rs/luma/latest/luma/struct.Series.html"><code>Series</code></a></strong> turns the recorded values
 into a <a href="https://docs.rs/luma/latest/luma/struct.Stat.html"><code>Stat</code></a>: <code>last()</code>, <code>first()</code>,
-<code>peak()</code> (largest so far), <code>trough()</code>, <code>window_max(k)</code>, <code>window_min(k)</code>.</li>
+<code>peak()</code> (largest so far), <code>trough()</code>, <code>window_max(k)</code>, <code>window_min(k)</code>, <code>window_mean(k)</code> and
+<code>prev(k)</code> (the value <code>k</code> steps ago).</li>
 <li><strong><code>Stat</code></strong> combines with <code>+ - * /</code> (with other stats and <code>f32</code>) and <code>abs()</code>, and compares with
 <code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code> into a <a href="https://docs.rs/luma/latest/luma/struct.Cond.html"><code>Cond</code></a>;
 conditions combine with <code>and</code>, <code>or</code>, <code>not</code>. A comparison with a NaN never holds.</li>
@@ -363,6 +367,41 @@ assert_eq!(calls.get(), 1);                                // traced once, repla
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>A step that reads results back or uses states larger than one buffer runs on the host, with the
 same stop rule evaluated there; both evaluations agree.</p>
+<h3 id="graphs-and-fused-records"><a class="header" href="#graphs-and-fused-records">Graphs and fused records</a></h3>
+<p>On a backend that captures command graphs (CUDA, Metal and the native CPU backend; wgpu does not),
+a block of steps is one graph replay: the stop rule’s gate kernel counts the steps itself and
+passes the dispatch arguments from step to step on the device, so nothing in a block depends on the
+host. The first step of a loop reads the initial state, which no graph does, so it is launched on
+its own. A graph is captured only where it pays: the blocks of a compiled loop on first use, those of
+a one-shot loop the second time they run; until then the launches are replayed one by one, with the
+same results.</p>
+<p>When there is one record and it is a reduction of one array expression (a norm, a sum, a maximum),
+Luma traces the record together with the step, so one launch stores the next state and reduces the
+record, and where a reduction finishes in its first launch (CUDA; the CPU backend with
+<code>LUMA_SINGLE_PASS_REDUCE=on</code>) the last workgroup of that launch also evaluates the stop rule: a step
+is one launch. <code>iterate_until</code> does the same with its residual <code>max |next - prev|</code>. Several records,
+or records that are not one reduction, run after the step in launches of their own; values, steps
+and reasons are the same.</p>
+<h3 id="chunked-solvers-compile_until_all"><a class="header" href="#chunked-solvers-compile_until_all">Chunked solvers: <code>compile_until_all</code></a></h3>
+<p>Running a loop in chunks with <code>iterate_until_all</code> (to look at the state between chunks) traces the
+step again for every chunk. <code>compile_until_all(&amp;init, until, step)</code> traces it once, for the shapes
+of <code>init</code>, and returns a <a href="https://docs.rs/luma/latest/luma/struct.CompiledUntil.html"><code>CompiledUntil</code></a>;
+<code>run(state)</code> and <code>run_steps(state, n)</code> run it on any state of those shapes. Every run starts at step
+0 with an empty history. The buffers and the captured graphs stay between runs. There is no host
+fallback: a step that reads back, states that span several buffers or <code>Until::new(0)</code> return
+<code>LumaError::Unsupported</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[4.0f32, 3.0], 2)?;
+let until = Until::new(100)
+    .record("max", |s: &amp;(Array&lt;f32&gt;,)| s.0.max())
+    .stop_when(|h| h["max"].last().le(1e-3));
+let mut compiled = compile_until_all(&amp;(x.clone(),), until, |s, _| (&amp;s.0 * 0.5,))?;
+let first = compiled.run((x,))?;
+assert_eq!(first.reason, StopReason::Predicate(0));
+let again = compiled.run(first.state)?;                  // new initial state, no new trace
+assert!(again.steps &gt;= 1);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h3 id="convergence-on-one-array-iterate_until"><a class="header" href="#convergence-on-one-array-iterate_until">Convergence on one array: <code>iterate_until</code></a></h3>
 <p>For the common case of one <code>f32</code> array stopped when the largest change <code>|next - prev|</code> is at most
 <code>tol</code>, <code>u.iterate_until(max_steps, tol, step)</code> needs no records:</p>
@@ -391,7 +430,8 @@ assert!((u.to_vec()?[0] - 1.0).abs() &lt; 1e-3);
 (<a href="lazy.html#when-kernels-run">Lazy evaluation</a>). A loop of <code>x = step(&amp;x); x.eval()</code> over <code>f32</code>
 arrays is <em>recognised</em> while evaluation is postponed: the steps are not chained into an ever
 longer expression, but run together when a result is needed, as one register loop or
-a time-blocked stencil. The graph that is pending stays one step deep however long the loop runs.
+a time-blocked stencil (up to four <code>f32</code> arrays evaluated together with <code>eval_all</code> form one
+stencil that shares a tile). The graph that is pending stays one step deep however long the loop runs.
 A step that reads slices or pads of lazy expressions is evaluated step by step; each step still
 fuses.</p>
 <p>Compared with the loop primitives, an <code>eval</code> loop calls your step every iteration (host work per

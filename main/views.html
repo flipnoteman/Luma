@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -257,8 +257,8 @@ assert_eq!(x.index(0).to_vec()?, vec![0, 1, 2, 3]);
 reads <code>1</code>, <code>n</code> reads <code>n - 1</code>. That is the ghost cell of a finite-volume wall, and it is why the
 <code>Mirror</code> row above equals the <code>Edge</code> row for a pad of one. Circular <code>shift</code> and <code>PadMode::Wrap</code> are the
 views that wrap; <code>shift_fill</code>, <code>shift_clamp</code> and <code>shift_mirror</code> are the shifts of a bounded domain.</p>
-<p>A slice, flip or transpose is read-only: <code>assign</code>, <code>write</code>, <code>+=</code> and <code>put</code> on it fail with
-<code>InvalidShape</code>, naming <code>slice_mut</code>, <code>flip_mut</code> and <code>transpose_mut</code>, which are the views that write
+<p>A slice, flip or axis permutation (<code>transpose</code>, <code>swap_axes</code>, <code>permute_axes</code>) is read-only: <code>assign</code>, <code>write</code>, <code>+=</code> and <code>put</code> on it fail with
+<code>InvalidShape</code>, naming <code>slice_mut</code>, <code>flip_mut</code>, <code>transpose_mut</code>, <code>swap_axes_mut</code> and <code>permute_axes_mut</code>, which are the views that write
 through (<a href="#views-that-write">below</a>). A <code>shift</code>, <code>pad</code> or <code>take</code> result accepts writes, but they
 fill its own buffer and leave what it was computed from unchanged.</p>
 <h3 id="joining-arrays"><a class="header" href="#joining-arrays">Joining arrays</a></h3>
@@ -305,7 +305,7 @@ let plane = x.slice(2, 1..2).reshape([2, 3]);   // [2, 3, 1] -&gt; [2, 3], still
 assert_eq!(plane.to_vec()?, vec![6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="views-that-write"><a class="header" href="#views-that-write">Views that write</a></h2>
-<p><code>slice</code>, <code>flip</code> and <code>transpose</code> have <code>_mut</code> forms that borrow the array mutably and return a
+<p><code>slice</code>, <code>flip</code>, <code>transpose</code>, <code>swap_axes</code> and <code>permute_axes</code> have <code>_mut</code> forms that borrow the array mutably and return a
 <a href="https://docs.rs/luma/latest/luma/struct.ViewMut.html"><code>ViewMut</code></a>: a region that writes through
 to the array it was taken from. Only views that keep every element distinct can write through; a
 <code>shift</code>, <code>pad</code> or <code>take</code> cannot (several cells would read one element), and writing to one just

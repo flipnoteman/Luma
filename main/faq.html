@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -186,7 +186,7 @@
 <p><strong>Which device does Luma use?</strong> <code>Context::new()</code> and the default context open CUDA, then Metal, then
 the high-performance wgpu adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls
 back to the native <code>cpu</code> backend. Software Vulkan drivers (Mesa llvmpipe) are never used.
-<code>LUMA_DEVICE</code> or <code>ContextOptions::device</code> narrow this, and <code>Context::device()</code> says what opened:</p>
+<code>LUMA_BACKEND</code> / <code>ContextOptions::backend</code> (or <code>Context::cuda()</code>, <code>metal()</code>, <code>wgpu()</code>, <code>cpu()</code>) pick one backend, <code>LUMA_DEVICE</code> or <code>ContextOptions::device</code> narrow the kind of device, and <code>Context::backend()</code> and <code>Context::device()</code> say what opened:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -222,13 +222,13 @@ adapter-by-name setting. On Linux the Vulkan loader decides which drivers wgpu s
 contexts is an error. The <code>_on(&amp;ctx, ..)</code> constructors take a context explicitly, and the
 <code>default_context()</code> is shared by every constructor without it.</p>
 <h2 id="nvidia"><a class="header" href="#nvidia">NVIDIA</a></h2>
-<p><strong>The process hangs or aborts when it exits.</strong> NVIDIA’s Linux driver can crash or hang in its own
+<p><strong>The process hangs or aborts when it exits.</strong> (wgpu backend, Linux.) NVIDIA’s Linux driver can crash or hang in its own
 shader-compiler threads during <code>exit</code>. Luma waits at exit for the GPU (up to 2 s) and for busy
 Vulkan driver threads (up to 2 s), and calls <code>_exit</code> only if they are still busy after that. That makes the problem
 rare, not impossible (driver 615.x was seen to still do it). <code>LUMA_EXIT_WAIT=0</code> skips the wait,
 which saves about 60 ms of exit time and risks the hang. A normal <code>main</code> return goes through
 this path; calling <code>std::process::exit</code> yourself does too.</p>
-<p><strong>Opening a second device stalls.</strong> On NVIDIA, creating a device (<code>Context::new</code>) blocks
+<p><strong>Opening a second device stalls.</strong> On NVIDIA’s Vulkan driver, creating a device (<code>Context::new</code>) blocks
 submissions of <em>other</em> devices in the process until their in-flight GPU work finishes. This
 happens once per device creation. Create your contexts up front, before starting long GPU work,
 or use one context (the default one is shared by threads).</p>
@@ -236,8 +236,8 @@ or use one context (the default one is shared by threads).</p>
 <p>Kernels that use workgroup memory are wrong on RADV integrated GPUs: scans (<code>scan</code>, <code>cumsum</code>,
 axis reductions), <code>matmul</code>, sorts (and what builds on them), scatters into targets of up to 4096
 elements, workgroup staging of views, and the cyclic-reduction tridiagonal solver. The
-cyclic solver is chosen automatically only on the NVIDIA tuning profile (a GPU detected as NVIDIA,
-or <code>LUMA_TUNING=nvidia</code>); elsewhere (and with <code>LUMA_TRIDIAGONAL=thomas</code>) the solver does not use it. If you see wrong results on such a GPU:</p>
+cyclic solver is chosen automatically only on the NVIDIA and Apple tuning profiles (a GPU detected as such,
+or <code>LUMA_TUNING=nvidia</code> / <code>apple</code>); elsewhere (and with <code>LUMA_TRIDIAGONAL=thomas</code>) the solver does not use it. If you see wrong results on such a GPU:</p>
 <ul>
 <li><code>LUMA_STAGING=off</code> keeps expressions read through views out of workgroup memory (the cost model
 then recomputes them or evaluates them first),</li>
@@ -257,7 +257,7 @@ array, so use it for debugging only. For <code>f32</code>, <code>f64</code> and 
 <p><strong><code>Array&lt;f64&gt;</code> fails with <code>Unsupported</code>.</strong> The device has no 64-bit shader floats. Check
 <code>ctx.features().contains(luma::Features::SHADER_F64)</code>, or use <code>Df32</code>
 (<a href="precision.html">Precision</a>), which runs everywhere.</p>
-<p><strong>Out of memory.</strong> Array data beyond the memory budget (80% of device memory on Vulkan GPUs)
+<p><strong>Out of memory.</strong> Array data beyond the memory budget (80% of the device’s memory where the backend reports it: CUDA, Metal and Vulkan GPUs; none on the CPU backend)
 moves to host memory and back on demand, with a one-time warning. <code>LUMA_MEMORY_BUDGET</code> sets the
 budget. Custom kernels need arrays that fit one buffer (<code>LumaError::Chunked</code> otherwise).</p>
 <h2 id="numbers"><a class="header" href="#numbers">Numbers</a></h2>
@@ -305,7 +305,7 @@ assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_
 (<a href="data.html#matrix-products">Matrix products</a>).</p>
 <h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
 <p><strong>The first run is slow, later ones are fast.</strong> Large kernels (especially <code>Df32</code>) take seconds
-to compile on some drivers. Luma keeps the driver’s compiled pipelines and the measured cost
+to compile on some drivers. Luma keeps the driver’s compiled pipelines (wgpu), the CUDA PTX, the CPU backend’s machine code and the measured cost
 model in <code>$XDG_CACHE_HOME/luma</code> (<code>~/.cache/luma</code>), so the second process skips that. Set
 <code>LUMA_CACHE=off</code> to turn it off or <code>LUMA_CACHE_DIR</code> to move it.</p>
 <p><strong>Context creation takes about 150 ms.</strong> That is the device calibration (once per machine; the

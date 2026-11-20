@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -212,15 +212,19 @@ cargo build --no-default-features --features wgpu
 workgroup counts. This matters only if you implement a backend; users of <code>Array</code> are not affected.</p>
 <h3 id="new-in-05-that-you-may-want"><a class="header" href="#new-in-05-that-you-may-want">New in 0.5 that you may want</a></h3>
 <ul>
-<li>Choosing a backend: <code>ContextOptions::backend</code>, <code>Context::{cuda, metal, wgpu, backend}</code> and <code>LUMA_BACKEND</code>
+<li>Choosing a backend: <code>ContextOptions::backend</code>, <code>Context::{cuda, metal, wgpu, cpu, backend}</code> and <code>LUMA_BACKEND</code>
 (<a href="environment.html">Environment variables</a>, <a href="faq.html#choosing-a-device">FAQ</a>). <code>Auto</code> tries CUDA, then Metal,
-then wgpu. The CUDA backend needs only the NVIDIA driver, no CUDA toolkit.</li>
+then wgpu, then the native <code>cpu</code> backend. The CUDA backend needs only the NVIDIA driver, no CUDA toolkit.
+<code>LUMA_CPU_THREADS</code> sets the thread count of the <code>cpu</code> backend.</li>
 <li><code>Context::device()</code> returns a <code>DeviceSummary { backend, name, software }</code>, and <code>Context::device_name()</code> the name.</li>
 <li><code>Array::permute_axes</code> and <code>swap_axes</code> (lazy views, like <code>transpose</code>), with <code>_mut</code> forms
 (<a href="views.html">Views and writes</a>).</li>
 <li><code>Context::memory_stats()</code> and <code>Context::trim()</code> (<a href="performance.html">Performance guide</a>).</li>
 <li><code>iterate_until_all</code> and <code>compile_until_all</code> loops replay a block of steps as one graph on backends that
 capture them (CUDA, Metal, CPU) (<a href="loops.html#stop-conditions-iterate_until_all">Loops</a>).</li>
+<li><code>compile_until_all</code> and <code>CompiledUntil</code>: a loop of <code>iterate_until_all</code> traced once and run on many states
+(<a href="loops.html#chunked-solvers-compile_until_all">Loops</a>). A time-blocked stencil also covers up to four
+<code>f32</code> arrays of an <code>eval</code> loop evaluated together (<a href="loops.html#loops-with-eval">Loops</a>).</li>
 </ul>
 <h2 id="from-03-to-04"><a class="header" href="#from-03-to-04">From 0.3 to 0.4</a></h2>
 <p>0.4 changes the type of comparisons: they return boolean arrays (<code>Array&lt;bool&gt;</code>) instead of

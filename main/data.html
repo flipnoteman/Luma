@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-423e026e.js";
+            window.path_to_searchindex_js = "searchindex-9dd2008b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -494,7 +494,8 @@ assert_eq!(count.item()?, 3);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><code>topk(k)</code> and <code>bottomk(k)</code> of a <code>u32</code>, <code>i32</code> or <code>f32</code> array return the <code>k</code> largest (smallest)
 values and their flat indices, largest (smallest) first, ties in input order, NaNs counting as
-the largest. They sort the whole array with <code>argsort</code>, so the cost does not depend on <code>k</code>.</p>
+the largest. They sort the whole array with <code>argsort</code>, so the cost does not depend on <code>k</code>. <code>k</code> of
+0 or more than the length poisons both results with <code>InvalidShape</code>.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[3.0f32, 9.0, 1.0, 7.0], 4)?;
