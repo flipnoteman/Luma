@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -191,6 +191,7 @@ builder methods override them:</p>
 <tr><th>Variable</th><th><code>ContextOptions</code></th></tr>
 </thead>
 <tbody>
+<tr><td><code>LUMA_BACKEND</code></td><td><code>backend</code> / <code>.backend(kind)</code></td></tr>
 <tr><td><code>LUMA_DEVICE</code></td><td><code>device</code> / <code>.device(kind)</code></td></tr>
 <tr><td><code>LUMA_MEMORY_BUDGET</code></td><td><code>memory_budget</code> / <code>.memory_budget(bytes)</code></td></tr>
 <tr><td><code>LUMA_CHUNK_BYTES</code></td><td><code>chunk_bytes</code> / <code>.chunk_bytes(bytes)</code></td></tr>
@@ -201,8 +202,8 @@ builder methods override them:</p>
 </tbody>
 </table>
 </div>
-<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_FUSION_*</code>, <code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>,
-<code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
+<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_FUSION_*</code>,
+<code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
 <h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
 <div class="table-wrapper">
 <table>
@@ -210,11 +211,14 @@ builder methods override them:</p>
 <tr><th>Variable</th><th>Effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>LUMA_DEVICE</code></td><td><code>gpu</code> or <code>cpu</code>: restrict the device kind (default: GPU, CPU as fallback)</td></tr>
+<tr><td><code>LUMA_BACKEND</code></td><td><code>cuda</code>, <code>metal</code>, <code>wgpu</code> or <code>auto</code>: the backend (default <code>auto</code>: CUDA, then Metal, then wgpu)</td></tr>
+<tr><td><code>LUMA_DEVICE</code></td><td><code>gpu</code> or <code>cpu</code>: restrict the device kind (default: GPU, CPU as fallback; <code>cpu</code> is the native <code>cpu</code> backend, software Vulkan adapters are never used); also accepts a backend name (<code>cuda</code>, <code>metal</code>, <code>wgpu</code>) when <code>LUMA_BACKEND</code> is not set</td></tr>
 <tr><td><code>LUMA_MEMORY_BUDGET</code></td><td>Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it). Default: 80% of the device’s memory where the backend reports it, never on CPU devices, otherwise unlimited</td></tr>
 <tr><td><code>LUMA_CHUNK_BYTES</code></td><td>Largest buffer an array is split into, in bytes: a power of two from 1024 up to the largest bindable size, otherwise opening the context fails with <code>InvalidShape</code>; a value that is not a number is ignored</td></tr>
 <tr><td><code>LUMA_TUNING</code></td><td><code>apple</code>, <code>nvidia</code>, <code>generic</code> or <code>cpu</code>: override the kernel tuning profile</td></tr>
 <tr><td><code>LUMA_SUBGROUPS</code></td><td><code>off</code> keeps the built-in kernels off subgroup operations</td></tr>
+<tr><td><code>LUMA_SINGLE_PASS_REDUCE</code></td><td><code>off</code> makes reductions over several workgroups two launches on CUDA again (by default the last workgroup of the first pass finishes the reduction); <code>on</code> does the same single-pass reduction on the native CPU backend (other backends ignore it: WGSL does not order memory across workgroups)</td></tr>
+<tr><td><code>LUMA_LOOKBACK_SCAN</code></td><td><code>off</code> makes the scans of integers (<code>u32</code>, <code>i32</code>) and the <code>min</code> / <code>max</code> scans of long contiguous lines two passes over their input on CUDA again (by default one kernel reads the input once and its workgroups wait for each other’s prefix, a decoupled look-back, which gives the same results); <code>on</code> does the same single-pass scan on the native CPU backend (other backends ignore it: WGSL gives no forward progress or ordering of memory across workgroups). Sums and other floating-point scans keep two passes either way, so that they are reproducible run to run</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_NODES</code></td><td>Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_INPUTS</code></td><td>Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer (<a href="performance.html#many-arrays-in-one-kernel">Performance</a>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
@@ -226,9 +230,10 @@ builder methods override them:</p>
 <tr><td><code>LUMA_DF_FMA</code></td><td><code>0</code>, <code>off</code> or <code>false</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>1</code>, <code>on</code> or <code>true</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
 <tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: fail any operation whose <code>f32</code> or <code>Df32</code> result holds a NaN or Inf (<code>f64</code> is not checked; debug mode, waits for the GPU after every evaluated array)</td></tr>
 <tr><td><code>LUMA_CALIBRATE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: skip measuring the device’s throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see <code>LUMA_CACHE</code>; a measurement that looks contended by other processes is dropped, and noted, so that processes use the profile’s numbers for a day before measuring again) and use the tuning profile’s fixed cost model</td></tr>
-<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan) and the measured cost model per adapter and driver, so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
+<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan), the PTX that the native CUDA backend compiles with the driver’s NVVM (keyed by NVVM version and device architecture) and the measured cost model per adapter and driver (the native Metal backend keeps no compiled pipelines between processes), so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
+<tr><td><code>LUMA_CUDA_DUMP</code></td><td>a directory: the CUDA backend writes the NVVM IR (<code>.ll</code>), the PTX (<code>.ptx</code>) and the label (<code>.label</code>) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code</td></tr>
 <tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored</td></tr>
-<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads on Linux (saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy Vulkan driver threads, and calls <code>_exit</code> only if they are still busy after that</td></tr>
+<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads on Linux (saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s, or Vulkan’s) and then ends the process with <code>_exit</code></td></tr>
 </tbody>
 </table>
 </div>

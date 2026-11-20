@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -315,7 +315,7 @@ assert_eq!(y.clamp(-0.5, 0.5).to_vec()?, vec![0.5, -0.5, 0.0]);
 assert_eq!(y.maximum(0.25).to_vec()?, vec![1.0, 0.25, 0.25]);
 assert_eq!(y.hypot(0.0).to_vec()?, vec![1.0, 1.0, 0.0]);
 assert_eq!(Array::from_slice(&amp;[3.0f32], 1)?.copysign(&amp;y.slice(0, 1..2)).to_vec()?, vec![-3.0]);
-assert!(y.powf(2.0).to_vec()?[1].is_nan());                  // a negative base has no real power
+assert_eq!(y.abs().powf(2.0).to_vec()?, vec![1.0, 1.0, 0.0]); // powf is portable for nonnegative bases
 assert!(y.sin().to_vec()?[0] &gt; 0.84 &amp;&amp; (y.atan2(1.0).to_vec()?[0] - std::f32::consts::FRAC_PI_4).abs() &lt; 1e-5);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Operators do not return <code>Result</code>s, so a mistake shows up late. <code>try_add</code>, <code>try_sub</code>, <code>try_mul</code> and

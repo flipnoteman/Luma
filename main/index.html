@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -184,8 +184,8 @@
                         <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
 <p>Luma is an array library for Rust that runs on the GPU. You write ordinary arithmetic on <code>Array</code>s;
 Luma records it, fuses chains of elementwise operations into a single kernel, and runs the result
-on whatever hardware you have (Vulkan, Metal or DX12, through <a href="https://wgpu.rs">wgpu</a>). If no GPU
-opens it falls back to Mesa’s llvmpipe software driver.</p>
+on whatever hardware you have (CUDA, Metal, or Vulkan and DX12 through <a href="https://wgpu.rs">wgpu</a>). If
+no GPU opens it falls back to a native SIMD CPU backend.</p>
 <p>It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
 solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
 products, group-bys, sorts and statistics of data-analysis tools. You do not write
@@ -194,14 +194,14 @@ shaders, manage buffers or schedule submissions. When you need something Luma do
 <p>This guide explains how to use the library and why it behaves as it does. The
 <a href="https://docs.rs/luma">API reference</a> lists every method; the guide shows how they fit together.</p>
 <h2 id="install"><a class="header" href="#install">Install</a></h2>
-<p>You need a recent stable Rust toolchain and a GPU with Vulkan, Metal or DX12 drivers. Add Luma
+<p>You need a recent stable Rust toolchain and, for a GPU, an NVIDIA driver (the native CUDA backend needs
+no CUDA toolkit), a Metal device, or a Vulkan, Metal or DX12 driver for the wgpu backend. Add Luma
 to a project:</p>
 <pre><code class="language-toml">[dependencies]
-luma = "0.4"
+luma = "0.5"
 </code></pre>
-<p>Without a GPU, install a software Vulkan driver (<code>mesa-vulkan-drivers</code> on most Linux
-distributions). Luma picks it up automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces
-it. See the <a href="faq.html#choosing-a-device">FAQ</a>.</p>
+<p>Without a GPU Luma runs on its native <code>cpu</code> backend (nothing to install). It is picked
+automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces it. See the <a href="faq.html#choosing-a-device">FAQ</a>.</p>
 <h2 id="a-first-program"><a class="header" href="#a-first-program">A first program</a></h2>
 <pre><code class="language-rust">use luma::*;
 

@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -312,7 +312,7 @@ becomes the load of that kernel.</p>
 </table>
 </div>
 <p>An operand that reads circular <code>shift</code>s of other expressions, or lives in several buffers, is
-evaluated first instead. <code>scan</code> and <code>cumsum</code> always evaluate their operand (they read it twice).
+evaluated first instead. <code>scan</code> and <code>cumsum</code> always evaluate their operand (they read it twice; on CUDA integer and <code>min</code> / <code>max</code> scans of long contiguous lines read it once).
 Because these results are evaluated at the call, a loop that calls them every step builds one
 kernel per call rather than one fused chain: count launches with <code>ctx.profile(..)</code>. Usage is in
 <a href="data.html">Matrices, statistics and grouping</a>: <a href="data.html#matrix-products"><code>matmul</code></a>, <a href="data.html#statistics-along-an-axis">axis statistics</a>, <a href="data.html#accumulating-scatters">scatters</a>, <a href="data.html#sorting">sorting</a>.</p>

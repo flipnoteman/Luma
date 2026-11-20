@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -202,7 +202,7 @@ and use wide types only where it matters: the cost model weighs <code>Df32</code
 the factors it measured (<a href="performance.html#the-cost-model">Performance</a>).</p>
 <h2 id="f64"><a class="header" href="#f64"><code>f64</code></a></h2>
 <p><code>Array&lt;f64&gt;</code> exists on every context, but only works on devices that have 64-bit shader floats
-(<code>wgpu::Features::SHADER_F64</code>, in practice Vulkan GPUs). Without it every <code>f64</code> operation is
+(<code>luma::Features::SHADER_F64</code>, in practice CUDA and some Vulkan GPUs). Without it every <code>f64</code> operation is
 poisoned with <a href="https://docs.rs/luma/latest/luma/enum.LumaError.html"><code>LumaError::Unsupported</code></a>.
 Check first:</p>
 <pre><code class="language-rust">use luma::*;
@@ -210,7 +210,7 @@ Check first:</p>
 let ctx = Context::new()?;
 let x = Array::from_slice_on(&amp;ctx, &amp;[2.0f32, 3.0], 2)?;
 
-if ctx.features().contains(luma::wgpu::Features::SHADER_F64) {
+if ctx.features().contains(luma::Features::SHADER_F64) {
     let r = x.to_f64().sqrt();
     let got = r.to_vec()?;
     assert!((got[0] - 2.0f64.sqrt()).abs() &lt; 1e-15);

@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -183,27 +183,35 @@
                     <main>
                         <h1 id="faq-and-troubleshooting"><a class="header" href="#faq-and-troubleshooting">FAQ and troubleshooting</a></h1>
 <h2 id="choosing-a-device"><a class="header" href="#choosing-a-device">Choosing a device</a></h2>
-<p><strong>Which device does Luma use?</strong> <code>Context::new()</code> and the default context ask wgpu for the
-high-performance adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls back
-to a software Vulkan driver (Mesa llvmpipe). <code>LUMA_DEVICE</code> or <code>ContextOptions::device</code> narrow this:</p>
+<p><strong>Which device does Luma use?</strong> <code>Context::new()</code> and the default context open CUDA, then Metal, then
+the high-performance wgpu adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls
+back to the native <code>cpu</code> backend. Software Vulkan drivers (Mesa llvmpipe) are never used.
+<code>LUMA_DEVICE</code> or <code>ContextOptions::device</code> narrow this, and <code>Context::device()</code> says what opened:</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Setting</th><th>Effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>LUMA_DEVICE=gpu</code> / <code>DeviceKind::Gpu</code></td><td>a hardware GPU only; <code>LumaError::NoDevice</code> if only a software adapter exists</td></tr>
-<tr><td><code>LUMA_DEVICE=cpu</code> / <code>DeviceKind::Cpu</code> / <code>Context::cpu()</code></td><td>the software adapter, whatever GPUs exist</td></tr>
-<tr><td>unset / <code>DeviceKind::Auto</code></td><td>GPU, CPU as fallback</td></tr>
+<tr><td><code>LUMA_DEVICE=gpu</code> / <code>DeviceKind::Gpu</code></td><td>a hardware GPU only; <code>LumaError::NoDevice</code> or <code>NoAdapter</code> if none exists</td></tr>
+<tr><td><code>LUMA_DEVICE=cpu</code> / <code>DeviceKind::Cpu</code> / <code>Context::cpu()</code></td><td>the native <code>cpu</code> backend, whatever GPUs exist</td></tr>
+<tr><td>unset / <code>DeviceKind::Auto</code></td><td>GPU, the <code>cpu</code> backend as fallback</td></tr>
 </tbody>
 </table>
 </div>
 <pre><code class="language-rust">use luma::*;
 
-let cpu = Context::cpu()?;
-assert!(cpu.is_cpu());
-let x = Array::from_slice_on(&amp;cpu, &amp;[1.0f32, 2.0], 2)?;
-assert_eq!((&amp;x + &amp;x).to_vec()?, vec![2.0, 4.0]);
+match Context::cpu() {
+    Ok(cpu) =&gt; {
+        assert!(cpu.is_cpu());
+        let x = Array::from_slice_on(&amp;cpu, &amp;[1.0f32, 2.0], 2)?;
+        assert_eq!((&amp;x + &amp;x).to_vec()?, vec![2.0, 4.0]);
+    }
+    Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) =&gt; {
+        eprintln!("The cpu backend is not built");
+    }
+    Err(error) =&gt; return Err(error),
+}
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><strong>Opening a context returns <code>LumaError::NoAdapter</code> (“Found no adapters”).</strong> There is no Vulkan, Metal or DX12 driver
 Luma can use. On Linux install <code>mesa-vulkan-drivers</code> (lavapipe) for the CPU fallback, or your GPU
@@ -249,7 +257,7 @@ the first operation whose result holds a non-finite value fails with <code>LumaE
 array, so use it for debugging only. For <code>f32</code>, <code>f64</code> and <code>Df32</code> arrays,
 <code>is_finite()</code> / <code>is_nan()</code> / <code>is_inf()</code> give lazy <code>bool</code> arrays you can use in expressions.</p>
 <p><strong><code>Array&lt;f64&gt;</code> fails with <code>Unsupported</code>.</strong> The device has no 64-bit shader floats. Check
-<code>ctx.features().contains(luma::wgpu::Features::SHADER_F64)</code>, or use <code>Df32</code>
+<code>ctx.features().contains(luma::Features::SHADER_F64)</code>, or use <code>Df32</code>
 (<a href="precision.html">Precision</a>), which runs everywhere.</p>
 <p><strong>Out of memory.</strong> Array data beyond the memory budget (80% of device memory on Vulkan GPUs)
 moves to host memory and back on demand, with a one-time warning. <code>LUMA_MEMORY_BUDGET</code> sets the

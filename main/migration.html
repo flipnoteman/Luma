@@ -3,12 +3,12 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Migration from 0.3 and 0.2 - The Luma Guide</title>
+        <title>Migration - The Luma Guide</title>
 
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,11 +181,52 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="migration-from-03"><a class="header" href="#migration-from-03">Migration from 0.3</a></h1>
+                        <h1 id="migration"><a class="header" href="#migration">Migration</a></h1>
+<h2 id="from-04-to-05"><a class="header" href="#from-04-to-05">From 0.4 to 0.5</a></h2>
+<p>0.5 splits Luma into a workspace of six crates with one cargo feature per backend, adds native CUDA, Metal
+and CPU backends next to wgpu, and changes a few things that code written against 0.4 can trip over. Ordinary
+array code (<code>Array</code>, <code>iterate</code>, custom kernels) compiles as it is.</p>
+<h3 id="software-wgpu-adapters-are-never-used"><a class="header" href="#software-wgpu-adapters-are-never-used">Software wgpu adapters are never used</a></h3>
+<p>Mesa llvmpipe, SwiftShader and WARP are refused by the wgpu backend: it never requests a fallback adapter and
+refuses <code>DeviceKind::Cpu</code>. A CPU device (<code>LUMA_DEVICE=cpu</code>, <code>Context::cpu()</code>, or <code>Auto</code> without a GPU) is now the
+native <code>cpu</code> backend only, and it needs the <code>cpu</code> feature. If your program ran on a software Vulkan adapter
+before, it now runs on the native CPU backend (or returns an error when <code>LUMA_DEVICE=gpu</code> is set); build with the
+<code>cpu</code> feature to keep a CPU fallback (<a href="faq.html#choosing-a-device">Choosing a device</a>).</p>
+<h3 id="lumaerror-carries-strings-not-wgpu-types"><a class="header" href="#lumaerror-carries-strings-not-wgpu-types"><code>LumaError</code> carries strings, not wgpu types</a></h3>
+<p>Adapter, device and readback errors in <code>LumaError</code> hold backend-neutral strings instead of wgpu types, so a
+<code>match</code> that destructured a wgpu error now reads the message. <code>luma::wgpu</code> is re-exported only with the <code>wgpu</code>
+feature: code that used it needs that feature, or its own <code>wgpu</code> dependency. <code>Features</code> and the profiling types
+are re-exported from <code>luma_core</code>.</p>
+<h3 id="crates-and-features"><a class="header" href="#crates-and-features">Crates and features</a></h3>
+<p>Luma is a workspace of six crates: <code>luma-core</code> (the kernel IR and the backend interface), <code>luma-wgpu</code>,
+<code>luma-metal</code>, <code>luma-cuda</code> and <code>luma-cpu</code> (one backend each, with its own code generator), and the root <code>luma</code>
+crate. The features <code>wgpu</code>, <code>metal</code>, <code>cuda</code> and <code>cpu</code> each enable one backend, and all are on by default. To
+build with one only:</p>
+<pre><code class="language-sh">cargo build --no-default-features --features cuda
+cargo build --no-default-features --features metal
+cargo build --no-default-features --features wgpu
+</code></pre>
+<p>In <code>Cargo.toml</code>: <code>luma = { version = "0.5", default-features = false, features = ["cuda"] }</code>.</p>
+<h3 id="graphlaunch-takes-a-dispatch"><a class="header" href="#graphlaunch-takes-a-dispatch"><code>GraphLaunch</code> takes a <code>Dispatch</code></a></h3>
+<p>The graph interface of the backend trait, <code>GraphLaunch</code>, takes a <code>Dispatch</code> (direct or indirect) instead of
+workgroup counts. This matters only if you implement a backend; users of <code>Array</code> are not affected.</p>
+<h3 id="new-in-05-that-you-may-want"><a class="header" href="#new-in-05-that-you-may-want">New in 0.5 that you may want</a></h3>
+<ul>
+<li>Choosing a backend: <code>ContextOptions::backend</code>, <code>Context::{cuda, metal, wgpu, backend}</code> and <code>LUMA_BACKEND</code>
+(<a href="environment.html">Environment variables</a>, <a href="faq.html#choosing-a-device">FAQ</a>). <code>Auto</code> tries CUDA, then Metal,
+then wgpu. The CUDA backend needs only the NVIDIA driver, no CUDA toolkit.</li>
+<li><code>Context::device()</code> returns a <code>DeviceSummary { backend, name, software }</code>, and <code>Context::device_name()</code> the name.</li>
+<li><code>Array::permute_axes</code> and <code>swap_axes</code> (lazy views, like <code>transpose</code>), with <code>_mut</code> forms
+(<a href="views.html">Views and writes</a>).</li>
+<li><code>Context::memory_stats()</code> and <code>Context::trim()</code> (<a href="performance.html">Performance guide</a>).</li>
+<li><code>iterate_until_all</code> and <code>compile_until_all</code> loops replay a block of steps as one graph on backends that
+capture them (CUDA, CPU) (<a href="loops.html#stop-conditions-iterate_until_all">Loops</a>).</li>
+</ul>
+<h2 id="from-03-to-04"><a class="header" href="#from-03-to-04">From 0.3 to 0.4</a></h2>
 <p>0.4 changes the type of comparisons: they return boolean arrays (<code>Array&lt;bool&gt;</code>) instead of
 <code>Array&lt;u32&gt;</code>. Most 0.3 code compiles as it is, because booleans promote to numbers the way they do
 in NumPy (below). Everything else in 0.4 is added (<a href="#new-in-04-that-you-may-want">the list below</a>).</p>
-<h2 id="comparisons-return-arraybool"><a class="header" href="#comparisons-return-arraybool">Comparisons return <code>Array&lt;bool&gt;</code></a></h2>
+<h3 id="comparisons-return-arraybool"><a class="header" href="#comparisons-return-arraybool">Comparisons return <code>Array&lt;bool&gt;</code></a></h3>
 <p><code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code> and <code>is_finite</code> / <code>is_nan</code> / <code>is_inf</code> return <code>Array&lt;bool&gt;</code>. On the
 GPU a <code>bool</code> is one bit (<code>n</code> booleans are <code>ceil(n / 32)</code> <code>u32</code> words: a
 <a href="custom-kernels.html">custom kernel</a> that took a comparison as one <code>u32</code> per element reads
@@ -242,7 +283,7 @@ assert_eq!(select(&amp;words, &amp;x, 0.0).to_vec()?, vec![1.5, 0.0, 3.0, 0.0]);
 <p>The numeric reductions (<code>reduce_axis</code>, <code>scan</code>, <code>mean</code>, <code>norm</code>) are not defined for <code>bool</code>: convert
 with <code>to_u32()</code> or <code>to_f32()</code>. A masked-out <code>NaN</code> or infinity in <code>mask * &amp;x</code> gives 0, where a
 multiplication would give <code>NaN</code>.</p>
-<h2 id="new-in-04-that-you-may-want"><a class="header" href="#new-in-04-that-you-may-want">New in 0.4 that you may want</a></h2>
+<h3 id="new-in-04-that-you-may-want"><a class="header" href="#new-in-04-that-you-may-want">New in 0.4 that you may want</a></h3>
 <ul>
 <li><a href="arrays.html#element-types"><code>i32</code> arrays, casts and <code>bool</code></a> (<code>to_u32</code>, <code>to_i32</code>, <code>to_f32</code>; <code>count</code>,
 <code>any</code>, <code>all</code>).</li>
@@ -254,9 +295,9 @@ Axis reductions no longer evaluate a pending operand first
 <a href="arrays.html#convolution">convolution</a> and the <a href="loops.html#line-solvers-solve_tridiagonal">tridiagonal solvers</a>,
 which earlier releases already had.</li>
 </ul>
-<h1 id="migration-from-02"><a class="header" href="#migration-from-02">Migration from 0.2</a></h1>
+<h2 id="from-02-to-03"><a class="header" href="#from-02-to-03">From 0.2 to 0.3</a></h2>
 <p>0.3 changes two things your 0.2 code can trip over. Almost everything else in 0.3 is added; the few behaviour changes (a lazy <code>reshape</code> of a view, fusion decided by a cost model, a larger buffer pool) are listed under <em>Changed</em> in the changelog.</p>
-<h2 id="reductions-are-lazy-arrays"><a class="header" href="#reductions-are-lazy-arrays">Reductions are lazy arrays</a></h2>
+<h3 id="reductions-are-lazy-arrays"><a class="header" href="#reductions-are-lazy-arrays">Reductions are lazy arrays</a></h3>
 <p>In 0.2, <code>sum</code>, <code>min</code>, <code>max</code>, <code>mean</code>, <code>norm</code> and <code>reduce</code> returned host values. In 0.3 they return a
 one-element <code>Array</code> that fuses with what follows, so <code>&amp;x / &amp;x.sum()</code> stays on the GPU. Read the
 value with <code>item()?</code> (and <code>reduce</code> results with <code>to_array()?</code>):</p>
@@ -280,11 +321,11 @@ let mean_removed = &amp;x - &amp;x.mean();
 assert_eq!(mean_removed.to_vec()?, vec![-1.5, -0.5, 0.5, 1.5]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>The <code>[f32; 2]</code> and <code>[f32; 4]</code> reductions (<code>vec2</code> / <code>vec4</code> element arrays) still return host values.</p>
-<h2 id="broadcasting-per-axis"><a class="header" href="#broadcasting-per-axis">Broadcasting per axis</a></h2>
+<h3 id="broadcasting-per-axis"><a class="header" href="#broadcasting-per-axis">Broadcasting per axis</a></h3>
 <p>An extent of 1 now broadcasts: <code>[N, 1] + [1, M]</code> is <code>[N, M]</code>, also for the branches of <code>select</code> and
 in compound assignment. Code that relied on a shape mismatch being an error between such shapes
 now gets a result. <code>broadcast_to(shape)</code> makes it explicit.</p>
-<h2 id="new-in-03-that-you-may-want"><a class="header" href="#new-in-03-that-you-may-want">New in 0.3 that you may want</a></h2>
+<h3 id="new-in-03-that-you-may-want"><a class="header" href="#new-in-03-that-you-may-want">New in 0.3 that you may want</a></h3>
 <ul>
 <li><a href="views.html">Views</a> that fuse into the reading kernel (<code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>take</code>,
 <code>concat</code>, …) and mutable views with <code>assign</code>.</li>

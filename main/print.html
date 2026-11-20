@@ -9,7 +9,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,8 +182,8 @@
                         <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
 <p>Luma is an array library for Rust that runs on the GPU. You write ordinary arithmetic on <code>Array</code>s;
 Luma records it, fuses chains of elementwise operations into a single kernel, and runs the result
-on whatever hardware you have (Vulkan, Metal or DX12, through <a href="https://wgpu.rs">wgpu</a>). If no GPU
-opens it falls back to Mesa’s llvmpipe software driver.</p>
+on whatever hardware you have (CUDA, Metal, or Vulkan and DX12 through <a href="https://wgpu.rs">wgpu</a>). If
+no GPU opens it falls back to a native SIMD CPU backend.</p>
 <p>It is meant for numerical code where the interesting part is the maths: stencils, finite-volume
 solvers, Monte Carlo, bit-sliced cryptography, small machine-learning kernels, and the matrix
 products, group-bys, sorts and statistics of data-analysis tools. You do not write
@@ -192,14 +192,14 @@ shaders, manage buffers or schedule submissions. When you need something Luma do
 <p>This guide explains how to use the library and why it behaves as it does. The
 <a href="https://docs.rs/luma">API reference</a> lists every method; the guide shows how they fit together.</p>
 <h2 id="install"><a class="header" href="#install">Install</a></h2>
-<p>You need a recent stable Rust toolchain and a GPU with Vulkan, Metal or DX12 drivers. Add Luma
+<p>You need a recent stable Rust toolchain and, for a GPU, an NVIDIA driver (the native CUDA backend needs
+no CUDA toolkit), a Metal device, or a Vulkan, Metal or DX12 driver for the wgpu backend. Add Luma
 to a project:</p>
 <pre><code class="language-toml">[dependencies]
-luma = "0.4"
+luma = "0.5"
 </code></pre>
-<p>Without a GPU, install a software Vulkan driver (<code>mesa-vulkan-drivers</code> on most Linux
-distributions). Luma picks it up automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces
-it. See the <a href="#choosing-a-device">FAQ</a>.</p>
+<p>Without a GPU Luma runs on its native <code>cpu</code> backend (nothing to install). It is picked
+automatically when no GPU opens, and <code>LUMA_DEVICE=cpu</code> forces it. See the <a href="#choosing-a-device">FAQ</a>.</p>
 <h2 id="a-first-program"><a class="header" href="#a-first-program">A first program</a></h2>
 <pre><code class="language-rust">use luma::*;
 
@@ -376,7 +376,7 @@ assert_eq!(y.clamp(-0.5, 0.5).to_vec()?, vec![0.5, -0.5, 0.0]);
 assert_eq!(y.maximum(0.25).to_vec()?, vec![1.0, 0.25, 0.25]);
 assert_eq!(y.hypot(0.0).to_vec()?, vec![1.0, 1.0, 0.0]);
 assert_eq!(Array::from_slice(&amp;[3.0f32], 1)?.copysign(&amp;y.slice(0, 1..2)).to_vec()?, vec![-3.0]);
-assert!(y.powf(2.0).to_vec()?[1].is_nan());                  // a negative base has no real power
+assert_eq!(y.abs().powf(2.0).to_vec()?, vec![1.0, 1.0, 0.0]); // powf is portable for nonnegative bases
 assert!(y.sin().to_vec()?[0] &gt; 0.84 &amp;&amp; (y.atan2(1.0).to_vec()?[0] - std::f32::consts::FRAC_PI_4).abs() &lt; 1e-5);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>Operators do not return <code>Result</code>s, so a mistake shows up late. <code>try_add</code>, <code>try_sub</code>, <code>try_mul</code> and
@@ -825,7 +825,7 @@ kernel.</li>
 more computation costs less than storing it and reading it back, or staged; otherwise it is
 evaluated first.</li>
 </ul>
-<p>What does not fuse: <code>scan</code> (it reads its operand twice, so the operand is computed first) and custom
+<p>What does not fuse: <code>scan</code> (it reads its operand once or twice, so the operand is computed first) and custom
 kernels, which see the arrays computed. The operands of <code>matmul</code>, of axis reductions and of
 <code>put_add</code> / <code>put_min</code> / <code>put_max</code> are read inside their own kernels
 (<a href="#what-fuses-and-what-cuts">Performance guide</a>).</p>
@@ -975,7 +975,9 @@ assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec()?, vec![3.0, 3.0, 4.0, 4.0, 5.
 elementwise expression of its two arguments and scalars (scalars it captures are uniforms:
 changing them does not recompile); anything else poisons the result. Non-associative operators
 give unspecified results, because the kernels regroup operands. Scans do not fuse into the
-expression behind them: the array is evaluated first (it is read twice). Scans and axis
+expression behind them: the array is evaluated first (it is read twice; on CUDA the scans of
+integers and <code>min</code> / <code>max</code> of long contiguous lines read it once, with the same results:
+<a href="#environment-variables"><code>LUMA_LOOKBACK_SCAN</code></a>). Scans and axis
 reductions are available for <code>f32</code>, <code>u32</code> and <code>i32</code> arrays (<code>f64</code> and <code>Df32</code> fail with
 <code>Unsupported</code>); <code>bool</code> arrays have <code>sum_axis</code> and <code>cumsum</code> that count (<code>u32</code> results) and
 <code>min_axis</code> / <code>max_axis</code>, but no <code>scan</code> or <code>reduce_axis</code>.</p>
@@ -2032,7 +2034,7 @@ and use wide types only where it matters: the cost model weighs <code>Df32</code
 the factors it measured (<a href="#the-cost-model">Performance</a>).</p>
 <h2 id="f64"><a class="header" href="#f64"><code>f64</code></a></h2>
 <p><code>Array&lt;f64&gt;</code> exists on every context, but only works on devices that have 64-bit shader floats
-(<code>wgpu::Features::SHADER_F64</code>, in practice Vulkan GPUs). Without it every <code>f64</code> operation is
+(<code>luma::Features::SHADER_F64</code>, in practice CUDA and some Vulkan GPUs). Without it every <code>f64</code> operation is
 poisoned with <a href="https://docs.rs/luma/latest/luma/enum.LumaError.html"><code>LumaError::Unsupported</code></a>.
 Check first:</p>
 <pre><code class="language-rust">use luma::*;
@@ -2040,7 +2042,7 @@ Check first:</p>
 let ctx = Context::new()?;
 let x = Array::from_slice_on(&amp;ctx, &amp;[2.0f32, 3.0], 2)?;
 
-if ctx.features().contains(luma::wgpu::Features::SHADER_F64) {
+if ctx.features().contains(luma::Features::SHADER_F64) {
     let r = x.to_f64().sqrt();
     let got = r.to_vec()?;
     assert!((got[0] - 2.0f64.sqrt()).abs() &lt; 1e-15);
@@ -2871,7 +2873,7 @@ becomes the load of that kernel.</p>
 </table>
 </div>
 <p>An operand that reads circular <code>shift</code>s of other expressions, or lives in several buffers, is
-evaluated first instead. <code>scan</code> and <code>cumsum</code> always evaluate their operand (they read it twice).
+evaluated first instead. <code>scan</code> and <code>cumsum</code> always evaluate their operand (they read it twice; on CUDA integer and <code>min</code> / <code>max</code> scans of long contiguous lines read it once).
 Because these results are evaluated at the call, a loop that calls them every step builds one
 kernel per call rather than one fused chain: count launches with <code>ctx.profile(..)</code>. Usage is in
 <a href="#matrices-statistics-and-grouping">Matrices, statistics and grouping</a>: <a href="#matrix-products"><code>matmul</code></a>, <a href="#statistics-along-an-axis">axis statistics</a>, <a href="#accumulating-scatters">scatters</a>, <a href="#sorting">sorting</a>.</p>
@@ -3237,6 +3239,7 @@ builder methods override them:</p>
 <tr><th>Variable</th><th><code>ContextOptions</code></th></tr>
 </thead>
 <tbody>
+<tr><td><code>LUMA_BACKEND</code></td><td><code>backend</code> / <code>.backend(kind)</code></td></tr>
 <tr><td><code>LUMA_DEVICE</code></td><td><code>device</code> / <code>.device(kind)</code></td></tr>
 <tr><td><code>LUMA_MEMORY_BUDGET</code></td><td><code>memory_budget</code> / <code>.memory_budget(bytes)</code></td></tr>
 <tr><td><code>LUMA_CHUNK_BYTES</code></td><td><code>chunk_bytes</code> / <code>.chunk_bytes(bytes)</code></td></tr>
@@ -3247,8 +3250,8 @@ builder methods override them:</p>
 </tbody>
 </table>
 </div>
-<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_FUSION_*</code>, <code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>,
-<code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
+<p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_FUSION_*</code>,
+<code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
 <h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
 <div class="table-wrapper">
 <table>
@@ -3256,11 +3259,14 @@ builder methods override them:</p>
 <tr><th>Variable</th><th>Effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>LUMA_DEVICE</code></td><td><code>gpu</code> or <code>cpu</code>: restrict the device kind (default: GPU, CPU as fallback)</td></tr>
+<tr><td><code>LUMA_BACKEND</code></td><td><code>cuda</code>, <code>metal</code>, <code>wgpu</code> or <code>auto</code>: the backend (default <code>auto</code>: CUDA, then Metal, then wgpu)</td></tr>
+<tr><td><code>LUMA_DEVICE</code></td><td><code>gpu</code> or <code>cpu</code>: restrict the device kind (default: GPU, CPU as fallback; <code>cpu</code> is the native <code>cpu</code> backend, software Vulkan adapters are never used); also accepts a backend name (<code>cuda</code>, <code>metal</code>, <code>wgpu</code>) when <code>LUMA_BACKEND</code> is not set</td></tr>
 <tr><td><code>LUMA_MEMORY_BUDGET</code></td><td>Bytes of array data kept on the device before spilling to host memory (idle buffers kept for reuse take up to half of it). Default: 80% of the device’s memory where the backend reports it, never on CPU devices, otherwise unlimited</td></tr>
 <tr><td><code>LUMA_CHUNK_BYTES</code></td><td>Largest buffer an array is split into, in bytes: a power of two from 1024 up to the largest bindable size, otherwise opening the context fails with <code>InvalidShape</code>; a value that is not a number is ignored</td></tr>
 <tr><td><code>LUMA_TUNING</code></td><td><code>apple</code>, <code>nvidia</code>, <code>generic</code> or <code>cpu</code>: override the kernel tuning profile</td></tr>
 <tr><td><code>LUMA_SUBGROUPS</code></td><td><code>off</code> keeps the built-in kernels off subgroup operations</td></tr>
+<tr><td><code>LUMA_SINGLE_PASS_REDUCE</code></td><td><code>off</code> makes reductions over several workgroups two launches on CUDA again (by default the last workgroup of the first pass finishes the reduction); <code>on</code> does the same single-pass reduction on the native CPU backend (other backends ignore it: WGSL does not order memory across workgroups)</td></tr>
+<tr><td><code>LUMA_LOOKBACK_SCAN</code></td><td><code>off</code> makes the scans of integers (<code>u32</code>, <code>i32</code>) and the <code>min</code> / <code>max</code> scans of long contiguous lines two passes over their input on CUDA again (by default one kernel reads the input once and its workgroups wait for each other’s prefix, a decoupled look-back, which gives the same results); <code>on</code> does the same single-pass scan on the native CPU backend (other backends ignore it: WGSL gives no forward progress or ordering of memory across workgroups). Sums and other floating-point scans keep two passes either way, so that they are reproducible run to run</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_NODES</code></td><td>Most operations fused into one kernel (default 16384, at most 16384); an expression nests at most 512 levels (256 in builds with debug assertions)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_INPUTS</code></td><td>Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer (<a href="#many-arrays-in-one-kernel">Performance</a>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
@@ -3272,9 +3278,10 @@ builder methods override them:</p>
 <tr><td><code>LUMA_DF_FMA</code></td><td><code>0</code>, <code>off</code> or <code>false</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>1</code>, <code>on</code> or <code>true</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
 <tr><td><code>LUMA_CHECK_FINITE</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: fail any operation whose <code>f32</code> or <code>Df32</code> result holds a NaN or Inf (<code>f64</code> is not checked; debug mode, waits for the GPU after every evaluated array)</td></tr>
 <tr><td><code>LUMA_CALIBRATE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: skip measuring the device’s throughputs when a context opens (about 150 ms on a GPU, once per machine: a clean result is kept in the cache directory, see <code>LUMA_CACHE</code>; a measurement that looks contended by other processes is dropped, and noted, so that processes use the profile’s numbers for a day before measuring again) and use the tuning profile’s fixed cost model</td></tr>
-<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan) and the measured cost model per adapter and driver, so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
+<tr><td><code>LUMA_CACHE</code></td><td><code>0</code>, <code>off</code> or <code>false</code>: do not keep anything between processes. By default luma stores the driver’s compiled pipelines (wgpu <code>PipelineCache</code>, Vulkan), the PTX that the native CUDA backend compiles with the driver’s NVVM (keyed by NVVM version and device architecture) and the measured cost model per adapter and driver (the native Metal backend keeps no compiled pipelines between processes), so a second run skips the multi-second compile of large (<code>Df32</code>) kernels and the calibration</td></tr>
+<tr><td><code>LUMA_CUDA_DUMP</code></td><td>a directory: the CUDA backend writes the NVVM IR (<code>.ll</code>), the PTX (<code>.ptx</code>) and the label (<code>.label</code>) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code</td></tr>
 <tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored</td></tr>
-<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads on Linux (saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy Vulkan driver threads, and calls <code>_exit</code> only if they are still busy after that</td></tr>
+<tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads on Linux (saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s, or Vulkan’s) and then ends the process with <code>_exit</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -3295,27 +3302,35 @@ builder methods override them:</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="faq-and-troubleshooting"><a class="header" href="#faq-and-troubleshooting">FAQ and troubleshooting</a></h1>
 <h2 id="choosing-a-device"><a class="header" href="#choosing-a-device">Choosing a device</a></h2>
-<p><strong>Which device does Luma use?</strong> <code>Context::new()</code> and the default context ask wgpu for the
-high-performance adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls back
-to a software Vulkan driver (Mesa llvmpipe). <code>LUMA_DEVICE</code> or <code>ContextOptions::device</code> narrow this:</p>
+<p><strong>Which device does Luma use?</strong> <code>Context::new()</code> and the default context open CUDA, then Metal, then
+the high-performance wgpu adapter (a discrete GPU over an integrated one). If no GPU opens, Luma falls
+back to the native <code>cpu</code> backend. Software Vulkan drivers (Mesa llvmpipe) are never used.
+<code>LUMA_DEVICE</code> or <code>ContextOptions::device</code> narrow this, and <code>Context::device()</code> says what opened:</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Setting</th><th>Effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>LUMA_DEVICE=gpu</code> / <code>DeviceKind::Gpu</code></td><td>a hardware GPU only; <code>LumaError::NoDevice</code> if only a software adapter exists</td></tr>
-<tr><td><code>LUMA_DEVICE=cpu</code> / <code>DeviceKind::Cpu</code> / <code>Context::cpu()</code></td><td>the software adapter, whatever GPUs exist</td></tr>
-<tr><td>unset / <code>DeviceKind::Auto</code></td><td>GPU, CPU as fallback</td></tr>
+<tr><td><code>LUMA_DEVICE=gpu</code> / <code>DeviceKind::Gpu</code></td><td>a hardware GPU only; <code>LumaError::NoDevice</code> or <code>NoAdapter</code> if none exists</td></tr>
+<tr><td><code>LUMA_DEVICE=cpu</code> / <code>DeviceKind::Cpu</code> / <code>Context::cpu()</code></td><td>the native <code>cpu</code> backend, whatever GPUs exist</td></tr>
+<tr><td>unset / <code>DeviceKind::Auto</code></td><td>GPU, the <code>cpu</code> backend as fallback</td></tr>
 </tbody>
 </table>
 </div>
 <pre><code class="language-rust">use luma::*;
 
-let cpu = Context::cpu()?;
-assert!(cpu.is_cpu());
-let x = Array::from_slice_on(&amp;cpu, &amp;[1.0f32, 2.0], 2)?;
-assert_eq!((&amp;x + &amp;x).to_vec()?, vec![2.0, 4.0]);
+match Context::cpu() {
+    Ok(cpu) =&gt; {
+        assert!(cpu.is_cpu());
+        let x = Array::from_slice_on(&amp;cpu, &amp;[1.0f32, 2.0], 2)?;
+        assert_eq!((&amp;x + &amp;x).to_vec()?, vec![2.0, 4.0]);
+    }
+    Err(LumaError::NoAdapter(_) | LumaError::NoDevice(_)) =&gt; {
+        eprintln!("The cpu backend is not built");
+    }
+    Err(error) =&gt; return Err(error),
+}
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p><strong>Opening a context returns <code>LumaError::NoAdapter</code> (“Found no adapters”).</strong> There is no Vulkan, Metal or DX12 driver
 Luma can use. On Linux install <code>mesa-vulkan-drivers</code> (lavapipe) for the CPU fallback, or your GPU
@@ -3361,7 +3376,7 @@ the first operation whose result holds a non-finite value fails with <code>LumaE
 array, so use it for debugging only. For <code>f32</code>, <code>f64</code> and <code>Df32</code> arrays,
 <code>is_finite()</code> / <code>is_nan()</code> / <code>is_inf()</code> give lazy <code>bool</code> arrays you can use in expressions.</p>
 <p><strong><code>Array&lt;f64&gt;</code> fails with <code>Unsupported</code>.</strong> The device has no 64-bit shader floats. Check
-<code>ctx.features().contains(luma::wgpu::Features::SHADER_F64)</code>, or use <code>Df32</code>
+<code>ctx.features().contains(luma::Features::SHADER_F64)</code>, or use <code>Df32</code>
 (<a href="#precision-1">Precision</a>), which runs everywhere.</p>
 <p><strong>Out of memory.</strong> Array data beyond the memory budget (80% of device memory on Vulkan GPUs)
 moves to host memory and back on demand, with a one-time warning. <code>LUMA_MEMORY_BUDGET</code> sets the
@@ -3420,11 +3435,52 @@ result is cached). <code>LUMA_CALIBRATE=0</code> skips it and uses fixed numbers
 <code>iterate</code>/<code>iterate_all</code> where they apply, <code>eval</code> each step instead of reading, and look at
 <code>ctx.profile(..)</code> for kernel counts and split reasons.</p>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="migration-from-03"><a class="header" href="#migration-from-03">Migration from 0.3</a></h1>
+<h1 id="migration"><a class="header" href="#migration">Migration</a></h1>
+<h2 id="from-04-to-05"><a class="header" href="#from-04-to-05">From 0.4 to 0.5</a></h2>
+<p>0.5 splits Luma into a workspace of six crates with one cargo feature per backend, adds native CUDA, Metal
+and CPU backends next to wgpu, and changes a few things that code written against 0.4 can trip over. Ordinary
+array code (<code>Array</code>, <code>iterate</code>, custom kernels) compiles as it is.</p>
+<h3 id="software-wgpu-adapters-are-never-used"><a class="header" href="#software-wgpu-adapters-are-never-used">Software wgpu adapters are never used</a></h3>
+<p>Mesa llvmpipe, SwiftShader and WARP are refused by the wgpu backend: it never requests a fallback adapter and
+refuses <code>DeviceKind::Cpu</code>. A CPU device (<code>LUMA_DEVICE=cpu</code>, <code>Context::cpu()</code>, or <code>Auto</code> without a GPU) is now the
+native <code>cpu</code> backend only, and it needs the <code>cpu</code> feature. If your program ran on a software Vulkan adapter
+before, it now runs on the native CPU backend (or returns an error when <code>LUMA_DEVICE=gpu</code> is set); build with the
+<code>cpu</code> feature to keep a CPU fallback (<a href="#choosing-a-device">Choosing a device</a>).</p>
+<h3 id="lumaerror-carries-strings-not-wgpu-types"><a class="header" href="#lumaerror-carries-strings-not-wgpu-types"><code>LumaError</code> carries strings, not wgpu types</a></h3>
+<p>Adapter, device and readback errors in <code>LumaError</code> hold backend-neutral strings instead of wgpu types, so a
+<code>match</code> that destructured a wgpu error now reads the message. <code>luma::wgpu</code> is re-exported only with the <code>wgpu</code>
+feature: code that used it needs that feature, or its own <code>wgpu</code> dependency. <code>Features</code> and the profiling types
+are re-exported from <code>luma_core</code>.</p>
+<h3 id="crates-and-features"><a class="header" href="#crates-and-features">Crates and features</a></h3>
+<p>Luma is a workspace of six crates: <code>luma-core</code> (the kernel IR and the backend interface), <code>luma-wgpu</code>,
+<code>luma-metal</code>, <code>luma-cuda</code> and <code>luma-cpu</code> (one backend each, with its own code generator), and the root <code>luma</code>
+crate. The features <code>wgpu</code>, <code>metal</code>, <code>cuda</code> and <code>cpu</code> each enable one backend, and all are on by default. To
+build with one only:</p>
+<pre><code class="language-sh">cargo build --no-default-features --features cuda
+cargo build --no-default-features --features metal
+cargo build --no-default-features --features wgpu
+</code></pre>
+<p>In <code>Cargo.toml</code>: <code>luma = { version = "0.5", default-features = false, features = ["cuda"] }</code>.</p>
+<h3 id="graphlaunch-takes-a-dispatch"><a class="header" href="#graphlaunch-takes-a-dispatch"><code>GraphLaunch</code> takes a <code>Dispatch</code></a></h3>
+<p>The graph interface of the backend trait, <code>GraphLaunch</code>, takes a <code>Dispatch</code> (direct or indirect) instead of
+workgroup counts. This matters only if you implement a backend; users of <code>Array</code> are not affected.</p>
+<h3 id="new-in-05-that-you-may-want"><a class="header" href="#new-in-05-that-you-may-want">New in 0.5 that you may want</a></h3>
+<ul>
+<li>Choosing a backend: <code>ContextOptions::backend</code>, <code>Context::{cuda, metal, wgpu, backend}</code> and <code>LUMA_BACKEND</code>
+(<a href="#environment-variables">Environment variables</a>, <a href="#choosing-a-device">FAQ</a>). <code>Auto</code> tries CUDA, then Metal,
+then wgpu. The CUDA backend needs only the NVIDIA driver, no CUDA toolkit.</li>
+<li><code>Context::device()</code> returns a <code>DeviceSummary { backend, name, software }</code>, and <code>Context::device_name()</code> the name.</li>
+<li><code>Array::permute_axes</code> and <code>swap_axes</code> (lazy views, like <code>transpose</code>), with <code>_mut</code> forms
+(<a href="#views-and-writes">Views and writes</a>).</li>
+<li><code>Context::memory_stats()</code> and <code>Context::trim()</code> (<a href="#performance-guide">Performance guide</a>).</li>
+<li><code>iterate_until_all</code> and <code>compile_until_all</code> loops replay a block of steps as one graph on backends that
+capture them (CUDA, CPU) (<a href="#stop-conditions-iterate_until_all">Loops</a>).</li>
+</ul>
+<h2 id="from-03-to-04"><a class="header" href="#from-03-to-04">From 0.3 to 0.4</a></h2>
 <p>0.4 changes the type of comparisons: they return boolean arrays (<code>Array&lt;bool&gt;</code>) instead of
 <code>Array&lt;u32&gt;</code>. Most 0.3 code compiles as it is, because booleans promote to numbers the way they do
 in NumPy (below). Everything else in 0.4 is added (<a href="#new-in-04-that-you-may-want">the list below</a>).</p>
-<h2 id="comparisons-return-arraybool"><a class="header" href="#comparisons-return-arraybool">Comparisons return <code>Array&lt;bool&gt;</code></a></h2>
+<h3 id="comparisons-return-arraybool"><a class="header" href="#comparisons-return-arraybool">Comparisons return <code>Array&lt;bool&gt;</code></a></h3>
 <p><code>lt</code>, <code>le</code>, <code>gt</code>, <code>ge</code>, <code>eq</code>, <code>ne</code> and <code>is_finite</code> / <code>is_nan</code> / <code>is_inf</code> return <code>Array&lt;bool&gt;</code>. On the
 GPU a <code>bool</code> is one bit (<code>n</code> booleans are <code>ceil(n / 32)</code> <code>u32</code> words: a
 <a href="#custom-kernels">custom kernel</a> that took a comparison as one <code>u32</code> per element reads
@@ -3481,7 +3537,7 @@ assert_eq!(select(&amp;words, &amp;x, 0.0).to_vec()?, vec![1.5, 0.0, 3.0, 0.0]);
 <p>The numeric reductions (<code>reduce_axis</code>, <code>scan</code>, <code>mean</code>, <code>norm</code>) are not defined for <code>bool</code>: convert
 with <code>to_u32()</code> or <code>to_f32()</code>. A masked-out <code>NaN</code> or infinity in <code>mask * &amp;x</code> gives 0, where a
 multiplication would give <code>NaN</code>.</p>
-<h2 id="new-in-04-that-you-may-want"><a class="header" href="#new-in-04-that-you-may-want">New in 0.4 that you may want</a></h2>
+<h3 id="new-in-04-that-you-may-want"><a class="header" href="#new-in-04-that-you-may-want">New in 0.4 that you may want</a></h3>
 <ul>
 <li><a href="#element-types"><code>i32</code> arrays, casts and <code>bool</code></a> (<code>to_u32</code>, <code>to_i32</code>, <code>to_f32</code>; <code>count</code>,
 <code>any</code>, <code>all</code>).</li>
@@ -3493,9 +3549,9 @@ Axis reductions no longer evaluate a pending operand first
 <a href="#convolution">convolution</a> and the <a href="#line-solvers-solve_tridiagonal">tridiagonal solvers</a>,
 which earlier releases already had.</li>
 </ul>
-<h1 id="migration-from-02"><a class="header" href="#migration-from-02">Migration from 0.2</a></h1>
+<h2 id="from-02-to-03"><a class="header" href="#from-02-to-03">From 0.2 to 0.3</a></h2>
 <p>0.3 changes two things your 0.2 code can trip over. Almost everything else in 0.3 is added; the few behaviour changes (a lazy <code>reshape</code> of a view, fusion decided by a cost model, a larger buffer pool) are listed under <em>Changed</em> in the changelog.</p>
-<h2 id="reductions-are-lazy-arrays"><a class="header" href="#reductions-are-lazy-arrays">Reductions are lazy arrays</a></h2>
+<h3 id="reductions-are-lazy-arrays"><a class="header" href="#reductions-are-lazy-arrays">Reductions are lazy arrays</a></h3>
 <p>In 0.2, <code>sum</code>, <code>min</code>, <code>max</code>, <code>mean</code>, <code>norm</code> and <code>reduce</code> returned host values. In 0.3 they return a
 one-element <code>Array</code> that fuses with what follows, so <code>&amp;x / &amp;x.sum()</code> stays on the GPU. Read the
 value with <code>item()?</code> (and <code>reduce</code> results with <code>to_array()?</code>):</p>
@@ -3519,11 +3575,11 @@ let mean_removed = &amp;x - &amp;x.mean();
 assert_eq!(mean_removed.to_vec()?, vec![-1.5, -0.5, 0.5, 1.5]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>The <code>[f32; 2]</code> and <code>[f32; 4]</code> reductions (<code>vec2</code> / <code>vec4</code> element arrays) still return host values.</p>
-<h2 id="broadcasting-per-axis"><a class="header" href="#broadcasting-per-axis">Broadcasting per axis</a></h2>
+<h3 id="broadcasting-per-axis"><a class="header" href="#broadcasting-per-axis">Broadcasting per axis</a></h3>
 <p>An extent of 1 now broadcasts: <code>[N, 1] + [1, M]</code> is <code>[N, M]</code>, also for the branches of <code>select</code> and
 in compound assignment. Code that relied on a shape mismatch being an error between such shapes
 now gets a result. <code>broadcast_to(shape)</code> makes it explicit.</p>
-<h2 id="new-in-03-that-you-may-want"><a class="header" href="#new-in-03-that-you-may-want">New in 0.3 that you may want</a></h2>
+<h3 id="new-in-03-that-you-may-want"><a class="header" href="#new-in-03-that-you-may-want">New in 0.3 that you may want</a></h3>
 <ul>
 <li><a href="#views-and-writes">Views</a> that fuse into the reading kernel (<code>slice</code>, <code>pad</code>, <code>flip</code>, <code>transpose</code>, <code>take</code>,
 <code>concat</code>, …) and mutable views with <code>assign</code>.</li>

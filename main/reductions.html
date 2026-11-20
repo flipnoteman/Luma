@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on wgpu">
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95dd5f0c.js";
+            window.path_to_searchindex_js = "searchindex-e6970edc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e12c34ce.js"></script>
+        <script src="toc-a2c80e88.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -326,7 +326,9 @@ assert_eq!(x.scan(0, |a, b| a.maximum(b)).to_vec()?, vec![3.0, 3.0, 4.0, 4.0, 5.
 elementwise expression of its two arguments and scalars (scalars it captures are uniforms:
 changing them does not recompile); anything else poisons the result. Non-associative operators
 give unspecified results, because the kernels regroup operands. Scans do not fuse into the
-expression behind them: the array is evaluated first (it is read twice). Scans and axis
+expression behind them: the array is evaluated first (it is read twice; on CUDA the scans of
+integers and <code>min</code> / <code>max</code> of long contiguous lines read it once, with the same results:
+<a href="environment.html"><code>LUMA_LOOKBACK_SCAN</code></a>). Scans and axis
 reductions are available for <code>f32</code>, <code>u32</code> and <code>i32</code> arrays (<code>f64</code> and <code>Df32</code> fail with
 <code>Unsupported</code>); <code>bool</code> arrays have <code>sum_axis</code> and <code>cumsum</code> that count (<code>u32</code> results) and
 <code>min_axis</code> / <code>max_axis</code>, but no <code>scan</code> or <code>reduce_axis</code>.</p>
