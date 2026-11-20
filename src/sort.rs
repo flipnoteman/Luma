@@ -277,14 +277,37 @@ fn count_body(shift: u8, ballot: bool) -> String {
     let mut loads = String::new();
     let mut adds = String::new();
     for m in 0..per_thread {
-        let _ = writeln!(loads, "        var k{m} = 0xffffffffu;\n        if (base + {}u < p.n) {{ k{m} = load_key(base + {}u); }}", m * WORKGROUP, m * WORKGROUP);
-        let _ = writeln!(adds, "        if (base + {}u < p.n) {{ atomicAdd(&hist[j * {DIGITS}u + ((k{m} >> {shift}u) & {}u)], 1u); }}", m * WORKGROUP, DIGITS - 1);
+        let off = m * WORKGROUP;
+        let _ = writeln!(loads, "        var k{m} = 0xffffffffu;\n        if (base + {off}u < p.n) {{ k{m} = load_key(base + {off}u); }}");
+        if ballot {
+            let _ = writeln!(
+                adds,
+                "        {{
+            let ok = base + {off}u < p.n;
+            let d = (k{m} >> {shift}u) & {mask}u;
+            let act = subgroupBallot(ok).x;
+            if (act != 0u) {{
+                let first = firstTrailingBit(act);
+                let d0 = subgroupShuffle(d, first);
+                if (subgroupBallot(ok && d == d0).x == act) {{
+                    if (lane == first) {{ atomicAdd(&hist[j * {DIGITS}u + d0], countOneBits(act)); }}
+                }} else if (ok) {{
+                    atomicAdd(&hist[j * {DIGITS}u + d], 1u);
+                }}
+            }}
+        }}",
+                mask = DIGITS - 1
+            );
+        } else {
+            let _ = writeln!(adds, "        if (base + {off}u < p.n) {{ atomicAdd(&hist[j * {DIGITS}u + ((k{m} >> {shift}u) & {}u)], 1u); }}", DIGITS - 1);
+        }
     }
+    let lane_param = if ballot { ", @builtin(subgroup_invocation_id) lane: u32" } else { "" };
     let _ = writeln!(src, "var<workgroup> hist: array<atomic<u32>, {}>;", COUNT_TILES * DIGITS);
     let _ = write!(
         src,
         "@compute @workgroup_size({WORKGROUP})
-fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>{lane_param}) {{
     let group = wg.x + wg.y * nwg.x;
     let first_tile = group * {COUNT_TILES}u;
     if (first_tile >= p.tiles) {{ return; }}
@@ -465,6 +488,15 @@ fn ballot_scatter_body(shift: u8, last: bool, store_keys: bool, payload: Payload
     let _ = writeln!(src, "var<workgroup> gbase: array<u32, {DIGITS}>;");
     let _ = writeln!(src, "var<workgroup> sk: array<u32, {tile}>;");
     let _ = writeln!(src, "fn digit(w: u32) -> u32 {{ return (w >> {shift}u) & {}u; }}", DIGITS - 1);
+    let mut copy_writes = String::new();
+    if store_keys {
+        let _ = writeln!(copy_writes, "                let w = load_key(idx);\n                out_keys[idx] = {};", if last { "key_out(w)" } else { "w" });
+    }
+    match payload {
+        PayloadKind::None => {}
+        PayloadKind::Index => copy_writes.push_str("                out_pay[idx] = idx;\n"),
+        PayloadKind::Buffer => copy_writes.push_str("                out_pay[idx] = pay[idx];\n"),
+    }
     let _ = write!(
         src,
         "@compute @workgroup_size({WORKGROUP})
@@ -478,8 +510,24 @@ fn main(
     if (tile >= p.tiles) {{ return; }}
     let base = tile * {tile}u;
     let sg = t / {SUBGROUP}u;
+    for (var k = 0u; k < {stride}u; k++) {{ atomicStore(&wc[k * {DIGITS}u + t], 0u); }}
+    let same_d = p.n > 0u && (offs[t * p.cstride + p.tiles - 1u] - select(0u, offs[t * p.cstride - 1u], t > 0u) == p.n);
+    let sg_same = subgroupBallot(same_d).x;
+    if (lane == 0u) {{ wsum[sg] = sg_same; }}
+    workgroupBarrier();
+    if (({any_wsum}) != 0u) {{
+        let valid = min({tile}u, p.n - base);
+        for (var m = 0u; m < {BALLOT_PER_THREAD}u; m++) {{
+            let q = m * {WORKGROUP}u + t;
+            if (q < valid) {{
+                let idx = base + q;
+{copy_writes}            }}
+        }}
+        return;
+    }}
     let first_slot = sg * {run}u + lane;
 ",
+        any_wsum = (0..warps).map(|w| format!("wsum[{w}]")).collect::<Vec<_>>().join(" | "),
         run = BALLOT_PER_THREAD * SUBGROUP,
     );
     // The keys past the end get the largest key, so they rank after the real ones and are never
@@ -497,13 +545,7 @@ fn main(
             }
         }
     }
-    let _ = write!(
-        src,
-        "    for (var k = 0u; k < {stride}u; k++) {{ atomicStore(&wc[k * {DIGITS}u + t], 0u); }}
-    workgroupBarrier();
-    let below = (1u << lane) - 1u;
-"
-    );
+    src.push_str("    let below = (1u << lane) - 1u;\n");
     for j in 0..BALLOT_PER_THREAD {
         let _ = writeln!(src, "    var r{j} = 0u;\n    {{\n        let d = digit(w{j});\n        var peers = 0xffffffffu;");
         for bit in 0..DIGIT_BITS {
