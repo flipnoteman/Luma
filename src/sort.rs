@@ -464,9 +464,6 @@ fn ballot_scatter_body(shift: u8, last: bool, store_keys: bool, payload: Payload
     let _ = writeln!(src, "var<workgroup> wsum: array<u32, {warps}>;");
     let _ = writeln!(src, "var<workgroup> gbase: array<u32, {DIGITS}>;");
     let _ = writeln!(src, "var<workgroup> sk: array<u32, {tile}>;");
-    if has_pay {
-        let _ = writeln!(src, "var<workgroup> sp: array<u32, {tile}>;");
-    }
     let _ = writeln!(src, "fn digit(w: u32) -> u32 {{ return (w >> {shift}u) & {}u; }}", DIGITS - 1);
     let _ = write!(
         src,
@@ -551,44 +548,59 @@ fn main(
     }
     src.push_str("    workgroupBarrier();\n");
     for j in 0..BALLOT_PER_THREAD {
-        let _ = writeln!(src, "    {{\n        let pos = atomicLoad(&wc[digit(w{j}) * {stride}u + sg]) + r{j};\n        sk[pos] = w{j};");
-        if has_pay {
-            let _ = writeln!(src, "        sp[pos] = y{j};");
-        }
-        src.push_str("    }\n");
+        let _ = writeln!(src, "    let p{j} = atomicLoad(&wc[digit(w{j}) * {stride}u + sg]) + r{j};\n    sk[p{j}] = w{j};");
     }
-    let _ = write!(
-        src,
-        "    workgroupBarrier();
-    let valid = min({tile}u, p.n - base);
-    for (var m = 0u; m < {BALLOT_PER_THREAD}u; m++) {{
+    let _ = writeln!(src, "    workgroupBarrier();\n    let valid = min({tile}u, p.n - base);");
+    if !has_pay {
+        let _ = write!(
+            src,
+            "    for (var m = 0u; m < {BALLOT_PER_THREAD}u; m++) {{
         let q = m * {WORKGROUP}u + t;
         if (q < valid) {{
             let w = sk[q];
             let pos = gbase[digit(w)] + q;
 "
-    );
-    if store_keys {
-        let _ = writeln!(src, "            out_keys[pos] = {};", if last { "key_out(w)" } else { "w" });
+        );
+        if store_keys {
+            let _ = writeln!(src, "            out_keys[pos] = {};", if last { "key_out(w)" } else { "w" });
+        }
+        src.push_str("        }\n    }\n}\n");
+        return src;
     }
-    if has_pay {
-        src.push_str("            out_pay[pos] = sp[q];\n");
+    // With a payload the keys are written first, then `sk` is reused for the payload.
+    let at = |m: u32| if m == 0 { "t".to_string() } else { format!("({}u + t)", m * WORKGROUP) };
+    for m in 0..BALLOT_PER_THREAD {
+        let q = at(m);
+        let _ = writeln!(src, "    var d{m} = 0u;\n    if ({q} < valid) {{\n        let w = sk[{q}];\n        d{m} = gbase[digit(w)] + {q};");
+        if store_keys {
+            let _ = writeln!(src, "        out_keys[d{m}] = {};", if last { "key_out(w)" } else { "w" });
+        }
+        src.push_str("    }\n");
     }
-    src.push_str("        }\n    }\n}\n");
+    src.push_str("    workgroupBarrier();\n");
+    for j in 0..BALLOT_PER_THREAD {
+        let _ = writeln!(src, "    sk[p{j}] = y{j};");
+    }
+    src.push_str("    workgroupBarrier();\n");
+    for m in 0..BALLOT_PER_THREAD {
+        let q = at(m);
+        let _ = writeln!(src, "    if ({q} < valid) {{ out_pay[d{m}] = sk[{q}]; }}");
+    }
+    src.push_str("}\n");
     src
 }
 
 /// Bytes of workgroup memory the ballot scatter kernel declares: the counters (a word per digit and
-/// subgroup, padded), the digit bases, the subgroup totals, and the staged keys and payload.
-fn ballot_bytes(payload: bool) -> u32 {
-    let words = DIGITS * (WORKGROUP / SUBGROUP + 1) + DIGITS + WORKGROUP / SUBGROUP + WORKGROUP * BALLOT_PER_THREAD * (1 + u32::from(payload));
+/// subgroup, padded), the digit bases, the subgroup totals, and the staged keys (reused for the payload).
+fn ballot_bytes() -> u32 {
+    let words = DIGITS * (WORKGROUP / SUBGROUP + 1) + DIGITS + WORKGROUP / SUBGROUP + WORKGROUP * BALLOT_PER_THREAD;
     words * 4
 }
 
-/// Whether a sort (carrying a payload or not) ranks with ballots: subgroups of 32 invocations and
-/// room for the ballot kernel's workgroup memory.
-fn use_ballots(tuning: &Tuning, payload: bool) -> bool {
-    tuning.subgroup32 && ballot_bytes(payload) <= tuning.workgroup_storage
+/// Whether a sort ranks with ballots: subgroups of 32 invocations and room for the ballot
+/// kernel's workgroup memory.
+fn use_ballots(tuning: &Tuning) -> bool {
+    tuning.subgroup32 && ballot_bytes() <= tuning.workgroup_storage
 }
 
 /// What a sort computes.
@@ -645,7 +657,7 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
     let n = keys.len();
     let too_large = || LumaError::DimensionTooLarge { shape: [n, 1, 1, 1] };
     let n32 = u32::try_from(n).map_err(|_| too_large())?;
-    let ballot = use_ballots(ctx.tuning(), !matches!(payload, Payload::None));
+    let ballot = use_ballots(ctx.tuning());
     let tiles = n32.div_ceil(if ballot { WORKGROUP * BALLOT_PER_THREAD } else { TILE });
     let passes = spec.key_bits.clamp(1, 32).div_ceil(DIGIT_BITS);
     let bytes = n as u64 * 4;
@@ -855,6 +867,23 @@ impl<T: SortKey> Array<T> {
         let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: false };
         let sorted = self.radix(Payload::Index, spec)?;
         Ok(sorted.payload.expect("the payload was asked for"))
+    }
+
+    /// The sorted elements and the flat indices that order them (one stable sort).
+    pub(crate) fn sort_with_indices(&self) -> crate::error::Result<(Array<T>, Array<u32>)> {
+        let ctx = self.context();
+        let run = || -> Outcome<(Array<T>, Array<u32>)> {
+            if self.len() <= 1 {
+                self.storage()?;
+                return Ok((self.clone(), Array::<u32>::zeros_on(ctx, self.shape())?));
+            }
+            let spec = Spec { transform: T::TRANSFORM, descending: false, key_bits: 32, want_keys: true };
+            let sorted = self.radix(Payload::Index, spec)?;
+            let keys = Array::from_storage(ctx, self.shape(), sorted.keys.expect("keys were asked for"));
+            let perm = Array::from_storage(ctx, self.shape(), sorted.payload.expect("the payload was asked for"));
+            Ok((keys, perm))
+        };
+        run().map_err(Failure::into_error)
     }
 
     fn run_sort_axis(&self, axis: usize) -> Outcome<Array<T>> {

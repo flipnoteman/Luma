@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 
-use luma_core::kir::{BuiltinVar, FnBuilder, KernelModule, KirType, ModuleBuilder, ScalarTy, Val};
+use luma_core::kir::{BarrierScope, BuiltinVar, FnBuilder, KernelModule, KirType, ModuleBuilder, ScalarTy, Val};
 
 use crate::gpu::lower::finish;
 use crate::jit::ElemTy;
@@ -2177,27 +2177,47 @@ fn until_gate_module() -> KernelModule {
     finish(mb, None)
 }
 
-/// [`Builtin::MatmulSum`]: sums the partial products of a split product.
-fn matmul_sum_module(wg: u32) -> KernelModule {
-    let mut mb = ModuleBuilder::new("matmul_sum", "main", [wg, 1, 1]);
+/// [`Builtin::MatmulSum`]: sums the partial products of a split product. A workgroup of 32x8
+/// invocations covers 32 outputs, row `ty` of it summing every eighth slice from `ty`.
+fn matmul_sum_module() -> KernelModule {
+    let mut mb = ModuleBuilder::new("matmul_sum", "main", [32, 8, 1]);
     let params = mb.add_uniform_u32_struct("Params", &["s"]);
     let out = mb.add_storage_read_write("out", KirType::F32);
     let part = mb.add_storage_read("part", KirType::F32);
     let p = mb.add_uniform("p", KirType::Struct(params));
+    let tile = mb.add_shared("tile", KirType::F32, 256);
     let mut f = mb.entry_builder();
-    let i = element_index(&mut f, wg);
-    guard_size(&mut f, i);
+    let lid = f.builtin(BuiltinVar::LocalInvocationId);
+    let wid = f.builtin(BuiltinVar::WorkgroupId);
+    let nwg = f.builtin(BuiltinVar::NumWorkgroups);
+    let (tx, ty) = (f.field(lid, 0, KirType::U32), f.field(lid, 1, KirType::U32));
+    let group = f.field(wid, 0, KirType::U32) + f.field(wid, 1, KirType::U32) * f.field(nwg, 0, KirType::U32);
+    let i = f.let_val("i", group * f.lit_u32(32) + tx);
+    let mn = f.grid_size(0);
     let slices = f.uniform_field(p, 0, KirType::U32);
     let zero = f.lit_f32(0.0);
     let acc = f.var_decl("acc", KirType::F32, Some(zero));
-    let (start, step) = (f.lit_u32(0), f.lit_u32(1));
-    f.for_range("z", start, slices, step, |f, z| {
-        let term = f.load(part, z * f.grid_size(0) + i);
-        let next = f.read_var(acc) + term;
-        f.assign_var(acc, next);
+    let inside = f.lt(i, mn);
+    f.if_then(inside, |f| {
+        let step = f.lit_u32(8);
+        f.for_range("z", ty, slices, step, |f, z| {
+            let term = f.load(part, z * f.grid_size(0) + i);
+            let next = f.read_var(acc) + term;
+            f.assign_var(acc, next);
+        });
     });
-    let total = f.read_var(acc);
-    f.store(out, i, total);
+    let slot = ty * f.lit_u32(32) + tx;
+    let partial = f.read_var(acc);
+    f.shared_store(tile, slot, partial);
+    f.barrier(BarrierScope::Workgroup);
+    let first = f.and(f.eq(ty, f.lit_u32(0)), inside);
+    f.if_then(first, |f| {
+        let at = |f: &FnBuilder<'_>, row: u32| f.shared_load(tile, tx + f.lit_u32(row * 32));
+        let (a, b) = (at(f, 0) + at(f, 1), at(f, 2) + at(f, 3));
+        let (c, d) = (at(f, 4) + at(f, 5), at(f, 6) + at(f, 7));
+        let total = (a + b) + (c + d);
+        f.store(out, i, total);
+    });
     f.finish();
     finish(mb, None)
 }
@@ -2224,7 +2244,7 @@ impl Builtin {
             Builtin::SolveParts(spec) => wgsl(spec.source()),
             Builtin::Radix { pass, first } => wgsl(crate::sort::source(pass, first)),
             Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split)),
-            Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module(wg)),
+            Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module()),
             Builtin::FilterCount => wgsl(crate::filter::count_source()),
             Builtin::FilterScatter { words, index } => wgsl(crate::filter::scatter_source(words, index)),
             Builtin::Transpose => wgsl(crate::jit::transpose::source(ty)),

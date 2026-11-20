@@ -39,8 +39,7 @@ impl<T: SortKey> Array<T> {
         let ctx = self.context();
         let n = self.len();
         let flat = self.reshape(n);
-        let perm = flat.argsort();
-        let sorted = flat.take(&perm);
+        let (sorted, perm) = flat.sort_with_indices()?;
         // A new value starts where the key differs from its predecessor and at element 0. Two
         // NaNs are not different; comparisons with NaN are unreliable on the GPU, so floats
         // classify them instead.
@@ -53,11 +52,11 @@ impl<T: SortKey> Array<T> {
         let flags = sorted.index(0).eq(0u32) | changed;
         let ids = flags.to_u32().cumsum(0) - 1u32;
         let count = ids.slice(0, n - 1..).item()? as usize + 1;
-        let mut uniques = Array::<T>::zeros_on(ctx, count)?;
+        let mut uniques = Array::<T>::alloc(ctx, count.into())?;
         // Only the first element of a run writes, so that equal keys that differ in bits (`-0.0`
         // and `+0.0`) leave the first in sorted order, not whichever write lands last.
         uniques.put(&select(&flags, &ids, u32::MAX), &sorted)?;
-        let mut codes = Array::<u32>::zeros_on(ctx, n)?;
+        let mut codes = Array::<u32>::alloc(ctx, n.into())?;
         codes.put(&perm, &ids)?;
         Ok((uniques, codes.reshape(self.shape())))
     }

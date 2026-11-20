@@ -4,8 +4,9 @@
 //! `[K, M]`, `rhs` is `[N, K]` and the result `[N, M]`, `C[n + N m] = Σ_k A[k + K m] B[n + N k]`,
 //! the row-major `C = A B` of `M x K` and `K x N` matrices.
 //!
-//! One kernel per product, in two sizes of output tile: 128x128 (16x16 invocations of 8x8
-//! outputs each), or 32x32 (2x2 each) when `M` or `N` is below 128. Both stage 16-wide slices of
+//! One kernel per product, in four sizes of output tile: 128x128 (16x16 invocations of 8x8
+//! outputs each), 128x32 and 32x128 when only `N` or only `M` is below 128, or 32x32 (2x2 each)
+//! when both are. All stage 16-wide slices of
 //! K of the two operands in workgroup memory, see [`body`]. A product with few output tiles and a
 //! long K would leave most of the GPU idle: it is split over K, the slices written to a scratch
 //! buffer by the third grid dimension and summed by a second launch ([`split_of`]).
@@ -27,23 +28,29 @@ use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::jit::{self, MatmulSide};
-use crate::ops::{fold_grid, launch_1d, Outcome};
+use crate::ops::{fold_grid, Outcome};
 
 /// Output tile of the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum MatmulTile {
     /// 128x128, each of the 16x16 invocations computes 8x8.
     T128,
+    /// 128 rows by 32 columns, each of the 16x16 invocations computes 8x2.
+    T128x32,
+    /// 32 rows by 128 columns, each of the 16x16 invocations computes 2x8.
+    T32x128,
     /// 32x32, each of the 16x16 invocations computes 2x2.
     T32,
 }
 
 impl MatmulTile {
-    /// The edge of the tile.
-    pub(crate) fn edge(self) -> u32 {
+    /// The rows and columns of the tile.
+    pub(crate) fn edges(self) -> (u32, u32) {
         match self {
-            MatmulTile::T128 => 128,
-            MatmulTile::T32 => 32,
+            MatmulTile::T128 => (128, 128),
+            MatmulTile::T128x32 => (128, 32),
+            MatmulTile::T32x128 => (32, 128),
+            MatmulTile::T32 => (32, 32),
         }
     }
 }
@@ -143,10 +150,15 @@ fn split_of(tiles: u32, k: u32) -> Option<(u32, u32)> {
 /// dimension, `max_bytes` the most a buffer may hold (the split product's partial sums have to
 /// fit one).
 fn plan(m: u32, n: u32, k: u32, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
-    let tile = if m >= 128 && n >= 128 { MatmulTile::T128 } else { MatmulTile::T32 };
-    let edge = tile.edge();
-    let aligned = m.is_multiple_of(edge) && n.is_multiple_of(edge) && k.is_multiple_of(SLICE);
-    let (columns, rows) = (n.div_ceil(edge), m.div_ceil(edge));
+    let tile = match (m >= 128, n >= 128) {
+        (true, true) => MatmulTile::T128,
+        (true, false) => MatmulTile::T128x32,
+        (false, true) => MatmulTile::T32x128,
+        (false, false) => MatmulTile::T32,
+    };
+    let (row_edge, col_edge) = tile.edges();
+    let aligned = m.is_multiple_of(row_edge) && n.is_multiple_of(col_edge) && k.is_multiple_of(SLICE);
+    let (columns, rows) = (n.div_ceil(col_edge), m.div_ceil(row_edge));
     let tiles = columns.saturating_mul(rows);
     let (slices, kc) = split_of(tiles, k)
         .filter(|&(slices, _)| u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes)
@@ -209,10 +221,11 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
     if let Some(partial) = &partial {
         let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;
         let slices = [plan.slices];
-        launch_1d(
-            ctx,
+        let sum_groups = crate::ops::fold_workgroups(ctx, (m32 * n32).div_ceil(32))?;
+        ctx.launch(
             &sum,
-            m32 * n32,
+            sum_groups,
+            [m32 * n32, 1, 1],
             &[RawArg::write(out_pin.buffer(), out_bytes), RawArg::read(partial, target_bytes), RawArg::Uniform(bytemuck::bytes_of(&slices))],
         )?;
     }
@@ -310,6 +323,8 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
     };
     match tile {
         MatmulTile::T128 => t128(aligned, split, &loads),
+        MatmulTile::T128x32 => t128x32(aligned, split, &loads),
+        MatmulTile::T32x128 => t32x128(aligned, split, &loads),
         MatmulTile::T32 => t32(aligned, split, &loads),
     }
 }
@@ -584,6 +599,161 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     )
 }
 
+/// The statements storing accumulator `acc` (a `vec4`) at row `row`, columns from `col` of a tile.
+fn store_vec4(aligned: bool, out: &str, row: &str, col: &str, acc: &str) -> String {
+    const LANES: [&str; 4] = ["x", "y", "z", "w"];
+    let writes = if aligned {
+        format!("let i = {out}r * p.n + col;\n        c[i] = v.x; c[i + 1u] = v.y; c[i + 2u] = v.z; c[i + 3u] = v.w;")
+    } else {
+        let lanes: Vec<String> = (0..4)
+            .map(|j| format!("if (col + {j}u < p.n) {{ c[i{}] = v.{}; }}", if j == 0 { String::new() } else { format!(" + {j}u") }, LANES[j]))
+            .collect();
+        format!("if (r < p.m) {{\n            let i = {out}r * p.n + col;\n            {}\n        }}", lanes.join("\n            "))
+    };
+    format!("{{\n        let r = row0 + {row};\n        let col = col0 + {col};\n        let v = {acc};\n        {writes}\n    }}\n    ")
+}
+
+/// `MatmulTile::T128x32`: 128 rows by 32 columns, the rows staged as in `T128` and the columns
+/// as in `T32`; each invocation owns 8 rows (two groups of 4, 64 apart) of columns `lid.x` and
+/// `lid.x + 16`.
+fn t128x32(aligned: bool, split: bool, loads: &Loads) -> String {
+    const LANES: [&str; 4] = ["x", "y", "z", "w"];
+    let load_a = t128_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
+    let load_b = t32_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
+    let Range { declare, k_begin, k_end, out } = range(aligned, split);
+    let end = if aligned { "" } else { ", ke" };
+    let mut decl = String::new();
+    let mut update = String::new();
+    let mut store = String::new();
+    for i in 0..8 {
+        for h in 0..2 {
+            decl += &format!("var c{i}_{h} = 0.0;\n    ");
+            let (row, col) = (format!("{} + lid.y * 4u", (i / 4) * 64 + i % 4), format!("{} + lid.x", h * 16));
+            let guard = if aligned { String::new() } else { " if (r < p.m && col < p.n)".to_owned() };
+            let write = format!("c[{out}r * p.n + col] = c{i}_{h};");
+            store += &if aligned {
+                format!("{{ let r = row0 + {row}; let col = col0 + {col}; {write} }}\n    ")
+            } else {
+                format!("{{ let r = row0 + {row}; let col = col0 + {col};{guard} {{ {write} }} }}\n    ")
+            };
+        }
+    }
+    for u in 0..2 {
+        update += &format!(
+            "{{
+                let o = (kk + {u}u) * 32u;
+                let a0 = at[o + lid.y];
+                let a1 = at[o + lid.y + 16u];
+                let b0 = bt[o + lid.x];
+                let b1 = bt[o + lid.x + 16u];
+                "
+        );
+        for i in 0..8 {
+            let a_row = format!("a{}.{}", i / 4, LANES[i % 4]);
+            for h in 0..2 {
+                update += &format!("c{i}_{h} = fma({a_row}, b{h}, c{i}_{h});\n                ");
+            }
+        }
+        update += "}\n            ";
+    }
+    let stage = loads.stage(end);
+    format!(
+        "var<workgroup> at: array<vec4<f32>, 512>;
+var<workgroup> bt: array<f32, 512>;
+
+// Slot `e` of a slice stored k-major: k `e % 16`, row (group) `e / 16`.
+fn k_major(e: u32) -> u32 {{ return (e % 16u) * 32u + e / 16u; }}
+{load_a}
+{load_b}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // The output tiles are numbered along the folded grid (see `plan`).
+    let columns = (p.n + 31u) / 32u;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= columns * ((p.m + 127u) / 128u)) {{ return; }}
+    let row0 = (tile / columns) * 128u;
+    let col0 = (tile % columns) * 32u;
+    let t = lid.y * 16u + lid.x;
+{declare}    {decl}
+    for (var k0 = {k_begin}; k0 < {k_end}; k0 = k0 + 16u) {{
+        {stage}
+        workgroupBarrier();
+        for (var kk = 0u; kk < 16u; kk = kk + 2u) {{
+            {update}}}
+        workgroupBarrier();
+    }}
+    {store}}}
+"
+    )
+}
+
+/// `MatmulTile::T32x128`: 32 rows by 128 columns, the rows staged as in `T32` and the columns
+/// as in `T128`; each invocation owns rows `lid.y` and `lid.y + 16`, two groups of 4 columns.
+fn t32x128(aligned: bool, split: bool, loads: &Loads) -> String {
+    let load_a = t32_load(true, aligned, loads.lhs.lanes, &|index| loads.lhs(index));
+    let load_b = t128_load(false, aligned, loads.rhs.lanes, &|index| loads.rhs(index));
+    let Range { declare, k_begin, k_end, out } = range(aligned, split);
+    let end = if aligned { "" } else { ", ke" };
+    let mut decl = String::new();
+    let mut update = String::new();
+    let mut store = String::new();
+    for i in 0..2 {
+        for h in 0..2 {
+            decl += &format!("var c{} = vec4<f32>(0.0);\n    ", i * 2 + h);
+            store += &store_vec4(aligned, out, &format!("{} + lid.y", i * 16), &format!("{} + lid.x * 4u", h * 64), &format!("c{}", i * 2 + h));
+        }
+    }
+    for u in 0..2 {
+        update += &format!(
+            "{{
+                let o = (kk + {u}u) * 32u;
+                let a0 = at[o + lid.y];
+                let a1 = at[o + lid.y + 16u];
+                let b0 = bt[o + lid.x];
+                let b1 = bt[o + lid.x + 16u];
+                "
+        );
+        for i in 0..2 {
+            for h in 0..2 {
+                let acc = format!("c{}", i * 2 + h);
+                update += &format!("{acc} = fma(vec4<f32>(a{i}), b{h}, {acc});\n                ");
+            }
+        }
+        update += "}\n            ";
+    }
+    let stage = loads.stage(end);
+    format!(
+        "var<workgroup> at: array<f32, 512>;
+var<workgroup> bt: array<vec4<f32>, 512>;
+
+// Slot `e` of a slice stored k-major: k `e % 16`, row (group) `e / 16`.
+fn k_major(e: u32) -> u32 {{ return (e % 16u) * 32u + e / 16u; }}
+{load_a}
+{load_b}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // The output tiles are numbered along the folded grid (see `plan`).
+    let columns = (p.n + 127u) / 128u;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= columns * ((p.m + 31u) / 32u)) {{ return; }}
+    let row0 = (tile / columns) * 32u;
+    let col0 = (tile % columns) * 128u;
+    let t = lid.y * 16u + lid.x;
+{declare}    {decl}
+    for (var k0 = {k_begin}; k0 < {k_end}; k0 = k0 + 16u) {{
+        {stage}
+        workgroupBarrier();
+        for (var kk = 0u; kk < 16u; kk = kk + 2u) {{
+            {update}}}
+        workgroupBarrier();
+    }}
+    {store}}}
+"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,10 +785,15 @@ mod tests {
         assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T32, true, 256, [2, 2, 256]));
         // The partial sums must fit a buffer.
         assert_eq!(plan(64, 64, 1 << 20, 65535, 1000).unwrap().slices, 1);
-        // Tall products fold their row tiles over the grid.
+        // Tall products stay on the rectangular tile; the grid folds once row tiles exceed it.
         let p = plan(1 << 22, 8, 16, 65535, u64::MAX).unwrap();
-        assert_eq!((p.tile, p.groups), (MatmulTile::T32, [43691, 3, 1]));
-        assert!(p.groups[0] * p.groups[1] >= 1 << 17);
+        assert_eq!((p.tile, p.groups), (MatmulTile::T128x32, [1, 1 << 15, 1]));
+        let p = plan(8, 1 << 22, 16, 65535, u64::MAX).unwrap();
+        assert_eq!((p.tile, p.groups), (MatmulTile::T32x128, [1 << 15, 1, 1]));
+        let p = plan(1 << 22, 1 << 6, 16, 65535, u64::MAX).unwrap();
+        assert_eq!(p.tile, MatmulTile::T128x32);
+        let p = plan(1 << 22, 8, 16, 1 << 12, u64::MAX).unwrap();
+        assert!(p.groups[0] * p.groups[1] >= 1 << 15);
         assert!(plan(1 << 22, 64, 16, 65535, u64::MAX).is_ok());
     }
 }
