@@ -15,8 +15,8 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::types::{self, F32X4, F64X2, I32X4};
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp, Block, ConstantData, Endianness, Function, InstBuilder, MemFlagsData,
-    SigRef, Signature, Type, UserFuncName, Value,
+    AbiParam, AtomicRmwOp, Block, BlockArg, ConstantData, Endianness, Function, InstBuilder,
+    MemFlagsData, SigRef, Signature, Type, UserFuncName, Value,
 };
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
@@ -86,7 +86,7 @@ pub fn host_isa_key() -> String {
 
 /// Revision of the generated code, part of the disk-cache key: bump it whenever the code this
 /// module generates for the same kernel changes, so cached blobs from older builds are not reused.
-pub(crate) const REVISION: u32 = 1;
+pub(crate) const REVISION: u32 = 2;
 
 // ---------------------------------------------------------------------------------------------
 // Memory flags
@@ -142,6 +142,12 @@ struct LocalVars {
     scs: Vec<ScalarTy>,
     vars: Vec<VarPair>,
     kinds: Vec<Kind>,
+    /// A local that one `Let` defines and nothing else writes, and that no later segment reads:
+    /// it is an SSA value (`direct`), not a `Variable`. Every `Variable` costs the frontend a map
+    /// over all blocks, which for thousands of locals in a kernel of thousands of blocks is tens
+    /// of gigabytes.
+    let_only: bool,
+    direct: Vec<Leaf>,
 }
 
 struct Frame {
@@ -271,6 +277,43 @@ fn lit_index(e: &Expr) -> Option<u32> {
         Expr::LitI32(k) if *k >= 0 => Some(*k as u32),
         _ => None,
     }
+}
+
+fn lvalue_local(lv: &LValue) -> Option<LocalId> {
+    match lv {
+        LValue::Local(l) => Some(*l),
+        LValue::Index { base, .. } | LValue::Field { base, .. } => lvalue_local(base),
+        LValue::Private(_) | LValue::Storage { .. } | LValue::Shared { .. } => None,
+    }
+}
+
+/// Which of the `n` locals of `body` are defined by exactly one `Let` and written by nothing else.
+fn let_only_locals(n: usize, body: &[Stmt]) -> Vec<bool> {
+    let mut lets = vec![0u32; n];
+    let mut written = vec![false; n];
+    walk_stmts(body, &mut |s| match s {
+        Stmt::Let { local, .. } => lets[local.0 as usize] += 1,
+        Stmt::Var { local, .. } => written[local.0 as usize] = true,
+        Stmt::Assign { dst, .. } => {
+            if let Some(l) = lvalue_local(dst) {
+                written[l.0 as usize] = true;
+            }
+        }
+        Stmt::AtomicRmw { dst: Some(d), .. } => written[d.0 as usize] = true,
+        Stmt::AtomicCompareExchange {
+            dst_old,
+            dst_exchanged,
+            ..
+        } => {
+            written[dst_old.0 as usize] = true;
+            written[dst_exchanged.0 as usize] = true;
+        }
+        _ => {}
+    });
+    lets.iter()
+        .zip(&written)
+        .map(|(&c, &w)| c == 1 && !w)
+        .collect()
 }
 
 fn expr_has_mem_or_div(e: &Expr) -> bool {
@@ -456,10 +499,22 @@ impl<'a, 'f> Lower<'a, 'f> {
 
     fn emit_all(&mut self) {
         let module = self.module;
+        let mut let_only = let_only_locals(module.entry_locals.len(), &module.entry_body);
+        for (l, only) in let_only.iter_mut().enumerate() {
+            *only &= self
+                .plan
+                .local_scratch_offsets
+                .get(l)
+                .is_none_or(Option::is_none);
+        }
+        for &(_, l) in &module.entry_builtins {
+            let_only[l.0 as usize] = false;
+        }
         let locals = module
             .entry_locals
             .iter()
-            .map(|(_, ty, _)| self.make_local(ty))
+            .zip(let_only)
+            .map(|((_, ty, _), only)| self.make_local(ty, only))
             .collect();
         self.frames.push(Frame {
             locals,
@@ -790,10 +845,11 @@ impl<'a, 'f> Lower<'a, 'f> {
 // ---------------------------------------------------------------------------------------------
 
 impl<'a, 'f> Lower<'a, 'f> {
-    fn make_local(&mut self, ty: &KirType) -> LocalVars {
+    fn make_local(&mut self, ty: &KirType, let_only: bool) -> LocalVars {
         let scs = scalars_of(ty, self.structs());
         let mut vars = Vec::with_capacity(scs.len());
-        for &s in &scs {
+        let declared = if let_only { &[][..] } else { &scs[..] };
+        for &s in declared {
             let z = self.zero_leaf(s);
             let v = self.b.declare_var(vty(s));
             self.b.def_var(v, z.a);
@@ -810,6 +866,8 @@ impl<'a, 'f> Lower<'a, 'f> {
             scs,
             vars,
             kinds,
+            let_only,
+            direct: Vec::new(),
         }
     }
 
@@ -819,6 +877,12 @@ impl<'a, 'f> Lower<'a, 'f> {
 
     fn read_local(&mut self, l: LocalId) -> Val {
         let lv = &self.frames.last().unwrap().locals[l.0 as usize];
+        if lv.let_only {
+            return Val {
+                ty: lv.ty.clone(),
+                leaves: lv.direct.clone(),
+            };
+        }
         let (ty, scs, vars, kinds) = (
             lv.ty.clone(),
             lv.scs.clone(),
@@ -841,6 +905,10 @@ impl<'a, 'f> Lower<'a, 'f> {
 
     fn write_local_leaves(&mut self, l: LocalId, leaves: &[Leaf], kinds: bool) {
         let fi = self.frames.len() - 1;
+        if self.frames[fi].locals[l.0 as usize].let_only {
+            self.frames[fi].locals[l.0 as usize].direct = leaves.to_vec();
+            return;
+        }
         let vars = self.frames[fi].locals[l.0 as usize].vars.clone();
         for (i, leaf) in leaves.iter().enumerate() {
             self.b.def_var(vars[i].0, leaf.a);
@@ -2110,10 +2178,10 @@ impl<'a, 'f> Lower<'a, 'f> {
 // Memory
 // ---------------------------------------------------------------------------------------------
 
+/// One leaf of a gathered value. Its accumulator vector (and, for `f64`, the vector of lanes 2
+/// and 3) is carried through the lane blocks as block parameters, not as `Variable`s.
 struct Acc {
     s: ScalarTy,
-    a: Variable,
-    b: Option<Variable>,
     off: u32,
 }
 
@@ -2249,25 +2317,38 @@ impl<'a, 'f> Lower<'a, 'f> {
         a
     }
 
-    /// Runs `f` for `lane` only if it is active (always when the scope is statically full).
-    fn lane_guard(&mut self, exec: Value, full: bool, lane: u8, f: &mut dyn FnMut(&mut Self)) {
-        if full {
-            f(self);
-            return;
-        }
-        let m = self.b.ins().extractlane(exec, lane);
+    /// Runs `f` only when `cond` (non-zero) holds, always when it is `None`. `carried` values go
+    /// through: `f` gets them and returns their new values, the result being those or `carried`
+    /// itself when `f` was skipped. One conditional branch, the values as block parameters.
+    fn guarded(
+        &mut self,
+        cond: Option<Value>,
+        carried: &[Value],
+        f: &mut dyn FnMut(&mut Self, &[Value]) -> Vec<Value>,
+    ) -> Vec<Value> {
+        let Some(cond) = cond else {
+            return f(self, carried);
+        };
         let doit = self.b.create_block();
-        let cont = self.b.create_block();
-        self.b.ins().brif(m, doit, &[], cont, &[]);
+        let merge = self.b.create_block();
+        for &v in carried {
+            let ty = self.b.func.dfg.value_type(v);
+            self.b.append_block_param(merge, ty);
+        }
+        let skip: Vec<BlockArg> = carried.iter().map(|&v| v.into()).collect();
+        self.b.ins().brif(cond, doit, &[], merge, &skip);
         self.b.switch_to_block(doit);
-        f(self);
-        self.b.ins().jump(cont, &[]);
-        self.b.switch_to_block(cont);
+        let done: Vec<BlockArg> = f(self, carried).into_iter().map(Into::into).collect();
+        self.b.ins().jump(merge, &done);
+        self.b.switch_to_block(merge);
+        self.b.block_params(merge).to_vec()
     }
 
-    /// Like [`Self::lane_guard`], but also skips lanes whose `extent`-byte access at `base + off + dyns`
-    /// would fall outside the bound storage binding (speculative loads hoisted above a `Select`).
-    #[allow(clippy::too_many_arguments)]
+    /// Runs `f(addr, carried)` for `lane` only if it is active (always when the scope is
+    /// statically full) and its `extent`-byte access at `base + off + dyns` falls inside the
+    /// bound storage binding (speculative loads hoisted above a `Select`). The lane's result is
+    /// what `f` returns, or `carried` when it was skipped.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn lane_guard_mem(
         &mut self,
         exec: Value,
@@ -2277,52 +2358,129 @@ impl<'a, 'f> Lower<'a, 'f> {
         off: u32,
         dyns: &[(Value, u32)],
         extent: u32,
-        f: &mut dyn FnMut(&mut Self, Value),
-    ) {
-        let limit = self.limits.get(&base).copied();
-        self.lane_guard(exec, full, lane, &mut |sl| {
-            let addr = sl.lane_addr(base, off, dyns, lane);
-            let Some(lim) = limit else {
-                f(sl, addr);
-                return;
-            };
-            let rel = sl.b.ins().isub(addr, base);
-            let end = sl.b.ins().iadd_imm(rel, i64::from(extent));
-            let ok = sl.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, lim);
-            let doit = sl.b.create_block();
-            let cont = sl.b.create_block();
-            sl.b.ins().brif(ok, doit, &[], cont, &[]);
-            sl.b.switch_to_block(doit);
-            f(sl, addr);
-            sl.b.ins().jump(cont, &[]);
-            sl.b.switch_to_block(cont);
-        });
+        carried: &[Value],
+        f: &mut dyn FnMut(&mut Self, Value, &[Value]) -> Vec<Value>,
+    ) -> Vec<Value> {
+        let mut cond = (!full).then(|| self.b.ins().extractlane(exec, lane));
+        let addr = self.lane_addr(base, off, dyns, lane);
+        if let Some(lim) = self.limits.get(&base).copied() {
+            let rel = self.b.ins().isub(addr, base);
+            let end = self.b.ins().iadd_imm(rel, i64::from(extent));
+            let ok = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, lim);
+            let ok = self.b.ins().uextend(types::I32, ok);
+            cond = Some(match cond {
+                Some(m) => self.b.ins().band(m, ok),
+                None => ok,
+            });
+        }
+        self.guarded(cond, carried, &mut |sl, c| f(sl, addr, c))
     }
+
+    fn load_leaf(&mut self, s: ScalarTy, addr: Value, at: u32) -> Value {
+        let at = at as i32;
+        match s {
+            ScalarTy::F64 => self.b.ins().load(types::F64, mf(), addr, at),
+            ScalarTy::F32 => self.b.ins().load(types::F32, mf(), addr, at),
+            ScalarTy::F16 => self.b.ins().uload16(types::I32, mf(), addr, at),
+            _ => self.b.ins().load(types::I32, mf(), addr, at),
+        }
+    }
+
+    /// Reads the leaves at `base + off` when there is no per-lane index: every lane reads the
+    /// same address, so it is one bounds check and one load per leaf, splat across the packet
+    /// (inactive lanes included: WGSL leaves what a shuffle reads from them indeterminate).
+    /// Out of bounds reads zero.
+    fn uniform_gather(
+        &mut self,
+        base: Value,
+        off: u32,
+        extent: u32,
+        accs: &[Acc],
+        cur: &[Value],
+    ) -> Vec<Value> {
+        let cond = self.limits.get(&base).copied().map(|lim| {
+            let end = self.b.ins().iconst(self.ptr, i64::from(off) + i64::from(extent));
+            self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, lim)
+        });
+        self.guarded(cond, cur, &mut |sl, _| {
+            let mut out = Vec::with_capacity(cur.len());
+            // The offset is added in 64 bits: the load's own displacement is 32-bit.
+            let addr = if off == 0 { base } else { sl.b.ins().iadd_imm(base, i64::from(off)) };
+            for acc in accs {
+                let x = sl.load_leaf(acc.s, addr, acc.off);
+                match acc.s {
+                    ScalarTy::F64 => {
+                        let v = sl.b.ins().splat(F64X2, x);
+                        out.extend([v, v]);
+                    }
+                    ScalarTy::F32 => out.push(sl.b.ins().splat(F32X4, x)),
+                    _ => out.push(sl.b.ins().splat(I32X4, x)),
+                }
+            }
+            out
+        })
+    }
+
+    /// Reads the leaves at `base + off + dyns` lane by lane; lanes not read stay zero.
+    fn lane_gather(
+        &mut self,
+        base: Value,
+        off: u32,
+        dyns: &[(Value, u32)],
+        extent: u32,
+        accs: &[Acc],
+        mut cur: Vec<Value>,
+    ) -> Vec<Value> {
+        let exec = self.exec();
+        let full = self.is_full();
+        for lane in 0..4u8 {
+            cur = self.lane_guard_mem(
+                exec,
+                full,
+                lane,
+                base,
+                off,
+                dyns,
+                extent,
+                &cur,
+                &mut |sl, addr, cur| {
+                    let mut out = cur.to_vec();
+                    let mut k = 0;
+                    for acc in accs {
+                        let x = sl.load_leaf(acc.s, addr, acc.off);
+                        if acc.s == ScalarTy::F64 {
+                            let at = k + usize::from(lane >= 2);
+                            out[at] = sl.b.ins().insertlane(cur[at], x, lane % 2);
+                            k += 2;
+                        } else {
+                            out[k] = sl.b.ins().insertlane(cur[k], x, lane);
+                            k += 1;
+                        }
+                    }
+                    out
+                },
+            );
+        }
+        cur
+    }
+
     fn mem_read(&mut self, base: Value, off: u32, dyns: &[(Value, u32)], ty: &KirType) -> Val {
         let mut lay = Vec::new();
         layout_leaves(ty, self.structs(), 0, &mut lay);
         let mut accs = Vec::with_capacity(lay.len());
+        // `cur` holds the accumulator vectors, an `f64` leaf taking two.
+        let mut cur: Vec<Value> = Vec::with_capacity(lay.len());
         for &(o, s) in &lay {
-            let (ta, hi) = match s {
-                ScalarTy::F32 => (F32X4, false),
-                ScalarTy::F64 => (F64X2, true),
-                _ => (I32X4, false),
+            let z = match s {
+                ScalarTy::F32 => self.splat_f32(0.0),
+                ScalarTy::F64 => self.splat_f64(0.0),
+                _ => self.splat_i32(0),
             };
-            let a = self.b.declare_var(ta);
-            let z = if ta == F32X4 {
-                self.splat_f32(0.0)
-            } else if ta == F64X2 {
-                self.splat_f64(0.0)
-            } else {
-                self.splat_i32(0)
-            };
-            self.b.def_var(a, z);
-            let b = hi.then(|| {
-                let h = self.b.declare_var(F64X2);
-                self.b.def_var(h, z);
-                h
-            });
-            accs.push(Acc { s, a, b, off: o });
+            cur.push(z);
+            if s == ScalarTy::F64 {
+                cur.push(z);
+            }
+            accs.push(Acc { s, off: o });
         }
         let extent = lay
             .iter()
@@ -2337,50 +2495,17 @@ impl<'a, 'f> Lower<'a, 'f> {
             })
             .max()
             .unwrap_or(0);
-        let exec = self.exec();
-        let full = self.is_full();
-        for lane in 0..4u8 {
-            self.lane_guard_mem(
-                exec,
-                full,
-                lane,
-                base,
-                off,
-                dyns,
-                extent,
-                &mut |sl, addr| {
-                    for acc in &accs {
-                        match acc.s {
-                            ScalarTy::F64 => {
-                                let x = sl.b.ins().load(types::F64, mf(), addr, acc.off as i32);
-                                let var = if lane < 2 { acc.a } else { acc.b.unwrap() };
-                                let cur = sl.b.use_var(var);
-                                let n = sl.b.ins().insertlane(cur, x, lane % 2);
-                                sl.b.def_var(var, n);
-                            }
-                            s => {
-                                let x = match s {
-                                    ScalarTy::F32 => {
-                                        sl.b.ins().load(types::F32, mf(), addr, acc.off as i32)
-                                    }
-                                    ScalarTy::F16 => {
-                                        sl.b.ins().uload16(types::I32, mf(), addr, acc.off as i32)
-                                    }
-                                    _ => sl.b.ins().load(types::I32, mf(), addr, acc.off as i32),
-                                };
-                                let cur = sl.b.use_var(acc.a);
-                                let n = sl.b.ins().insertlane(cur, x, lane);
-                                sl.b.def_var(acc.a, n);
-                            }
-                        }
-                    }
-                },
-            );
-        }
+        let cur = if dyns.is_empty() {
+            self.uniform_gather(base, off, extent, &accs, &cur)
+        } else {
+            self.lane_gather(base, off, dyns, extent, &accs, cur)
+        };
         let mut leaves = Vec::with_capacity(accs.len());
+        let mut k = 0;
         for acc in &accs {
-            let a = self.b.use_var(acc.a);
-            let b = acc.b.map(|h| self.b.use_var(h));
+            let a = cur[k];
+            let b = (acc.s == ScalarTy::F64).then(|| cur[k + 1]);
+            k += if acc.s == ScalarTy::F64 { 2 } else { 1 };
             let leaf = match acc.s {
                 ScalarTy::Bool => {
                     let z = self.splat_i32(0);
@@ -2461,7 +2586,8 @@ impl<'a, 'f> Lower<'a, 'f> {
                 off,
                 dyns,
                 extent,
-                &mut |sl, addr| {
+                &[],
+                &mut |sl, addr, _| {
                     for &(o, l) in &stored {
                         match l.s {
                             ScalarTy::F64 => {
@@ -2479,6 +2605,7 @@ impl<'a, 'f> Lower<'a, 'f> {
                             }
                         }
                     }
+                    Vec::new()
                 },
             );
         }
@@ -2511,23 +2638,20 @@ impl<'a, 'f> Lower<'a, 'f> {
             let a = self.b.ins().load(vt, mf(), addr, 0);
             return self.scalar_val(s, self.lf(s, a));
         };
-        let res = self.b.declare_var(vt);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let merge = self.b.create_block();
+        let res = self.b.append_block_param(merge, vt);
         self.b.ins().brif(cond, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
         let addr = self.contig_addr(base, idx);
         let a = self.b.ins().load(vt, mf(), addr, 0);
-        self.b.def_var(res, a);
-        self.b.ins().jump(merge, &[]);
+        self.b.ins().jump(merge, &[a.into()]);
         self.b.switch_to_block(slow);
         let g = self.mem_read(base, 0, &[(idx.a, stride)], ty);
-        self.b.def_var(res, g.leaves[0].a);
-        self.b.ins().jump(merge, &[]);
+        self.b.ins().jump(merge, &[g.leaves[0].a.into()]);
         self.b.switch_to_block(merge);
-        let a = self.b.use_var(res);
-        self.scalar_val(s, self.lf(s, a))
+        self.scalar_val(s, self.lf(s, res))
     }
 
     /// Condition under which the 128-bit contiguous fast path is valid: all four lanes active and the
@@ -2606,8 +2730,9 @@ impl<'a, 'f> Lower<'a, 'f> {
         let full = self.is_full();
         let dyns: Vec<(Value, u32)> = idx.map(|i| (i, stride)).into_iter().collect();
         for lane in 0..4u8 {
-            self.lane_guard_mem(exec, full, lane, base, 0, &dyns, 4, &mut |sl, addr| {
+            self.lane_guard_mem(exec, full, lane, base, 0, &dyns, 4, &[], &mut |sl, addr, _| {
                 f(sl, addr, lane);
+                Vec::new()
             });
         }
     }
@@ -2883,13 +3008,15 @@ impl<'a, 'f> Lower<'a, 'f> {
         let module = self.module;
         let callee = &module.functions[func];
         let argv: Vec<Val> = args.iter().map(|a| self.expr(a)).collect();
+        let let_only = let_only_locals(callee.locals.len(), &callee.body);
         let locals: Vec<LocalVars> = callee
             .locals
             .iter()
-            .map(|(_, t, _)| self.make_local(t))
+            .zip(let_only)
+            .map(|((_, t, _), only)| self.make_local(t, only))
             .collect();
         let ret = callee.ret_ty.as_ref().map(|t| {
-            let lv = self.make_local(t);
+            let lv = self.make_local(t, false);
             (lv.ty, lv.scs, lv.vars)
         });
         let exec = self.exec();

@@ -124,6 +124,7 @@ All notable changes to Luma are listed here. The format follows
 - `Context::trim` on CUDA did not return the memory of the buffers it released itself to the driver: they were freed after the stream-ordered pool had been trimmed and stayed reserved until the next trim. They are freed first now.
 - The cost of a region whose assigned value is a scalar or an evaluated array was estimated at half the array whatever the region's size; it now takes the share the region's view shows (or that of a field assigned under the same mask).
 - CUDA: a step whose graph capture failed once never tried again; a capture is now retried, and a step goes without a graph after three failures.
+- CPU backend: compiling a very wide fused kernel took minutes and tens of gigabytes (a 5661-term `f64` sum cut by the 64 KiB uniform limit: 105 s and 25 GB, the reason `an_expression_with_more_scalars_than_a_uniform_holds_is_cut` skipped the CPU). The lowering kept one Cranelift `Variable` for every single-assignment local and for the accumulator of every gathered load, and the frontend's per-variable map over all blocks grew with their product; those are plain SSA values and block parameters now, and a read at a fixed address (a scalar of the uniform buffer) is one bounds check and one load instead of four guarded lane loads. The same kernel compiles and runs in 2.2 s and 0.44 GB; kernels that read scalars through a uniform buffer got smaller (`view/laplace_*` of `bench_pde` take about a third of the time on the CPU).
 
 ## [0.4.1] - 2026-11-15
 
