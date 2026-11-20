@@ -337,6 +337,9 @@ fn live_split(fused: &Fused, max_inputs: usize, max_live: usize) -> Option<(Vec<
 /// Evaluates the pending ones of `nodes` (all of the same length) in one fused kernel with one
 /// output per node. Failures are stored in the nodes, as [`Node::force`] does.
 pub(crate) fn evaluate_group(nodes: &[Arc<Node>]) {
+    if crate::host::try_eval_group(nodes) {
+        return;
+    }
     // A loop leaf has no operands to fuse: running its plan is its evaluation.
     for node in nodes.iter().filter(|node| node.is_pending() && (node.looped.get().is_some() || node.deferred.get().is_some())) {
         let _ = node.force();

@@ -62,6 +62,22 @@ impl Reduced {
         &self.operand
     }
 
+    pub(crate) fn ops(&self) -> ReduceList {
+        self.ops
+    }
+
+    pub(crate) fn finish(&self) -> Finish {
+        self.finish
+    }
+
+    pub(crate) fn ty(&self) -> ElemTy {
+        self.ty
+    }
+
+    pub(crate) fn layout(&self) -> ElemLayout {
+        self.layout
+    }
+
     /// What a kernel that reduces `operand` itself needs to run this reduction (see
     /// `jit::until::force_with_record`): the operand, the ops, what is applied to their values.
     /// `None` unless it is a reduction of `f32`s that has not been recorded, and has not failed.
@@ -111,7 +127,21 @@ impl Reduced {
 
     /// [`Reduced::force`] for the node that stands for the value: it takes the buffer itself.
     pub(crate) fn record_once(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
-        self.result.get_or_init(|| self.record(ctx).map_err(Arc::new))
+        self.result.get_or_init(|| match crate::host::try_eval_reduced(self, ctx) {
+            Some(storage) => Ok(storage),
+            None => self.record(ctx).map_err(Arc::new),
+        })
+    }
+
+    /// The buffer of the reduction computed on the host, or the one already recorded; `None` if
+    /// it cannot run on the host and has not been recorded.
+    pub(crate) fn host_result(&self, ctx: &Context) -> Option<Arc<Storage>> {
+        if self.result.get().is_none()
+            && let Some(storage) = crate::host::try_eval_reduced(self, ctx)
+        {
+            let _ = self.result.set(Ok(storage));
+        }
+        self.result.get()?.as_ref().ok().cloned()
     }
 
     fn record(&self, ctx: &Context) -> Result<Arc<Storage>> {
@@ -126,6 +156,11 @@ impl Reduced {
 
     /// The values on the host, without keeping them on the GPU.
     pub(crate) fn read<T: GpuType>(&self, ctx: &Context) -> Result<Vec<T>> {
+        if std::mem::size_of::<T::Repr>() == 4
+            && let Some(words) = crate::host::reduced_words(self, ctx)
+        {
+            return Ok(T::from_repr(bytemuck::pod_collect_to_vec(&words), self.ops.as_slice().len()));
+        }
         let array = Array::<T>::from_node(ctx, Shape::from(self.operand.len()), Arc::clone(&self.operand));
         reduce_array(&array, self.wgsl, self.ops, self.finish, !self.buffer)
     }

@@ -38,6 +38,13 @@ impl<T: SortKey> Array<T> {
     fn run_factorize(&self) -> Result<(Array<T>, Array<u32>)> {
         let ctx = self.context();
         let n = self.len();
+        if ctx.can_run_on_host()
+            && n <= crate::host::MAX_SORT_ELEMS
+            && self.error().is_none()
+            && let Some(pair) = crate::host::try_factorize(self)
+        {
+            return Ok(pair);
+        }
         let flat = self.reshape(n);
         let (sorted, perm) = flat.sort_with_indices()?;
         // A new value starts where the key differs from its predecessor and at element 0. Two

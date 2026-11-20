@@ -855,6 +855,16 @@ impl<T: ScalarType> Array<T> {
         name: &'static str,
         location: &'static Location<'static>,
     ) -> Result<()> {
+        if atomic.is_none()
+            && self.context().can_run_on_host()
+            && self.view().is_none()
+            && !self.is_read_view()
+            && self.len() <= crate::host::MAX_HOST_ELEMS
+            && indices.len() <= crate::host::MAX_HOST_ELEMS
+            && crate::host::try_put(self, indices, &values.rhs())
+        {
+            return Ok(());
+        }
         let prepared = self.scatter_args(indices, values.rhs());
         drop(values);
         let result = prepared.and_then(|(base, index, values)| {

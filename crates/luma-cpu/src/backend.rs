@@ -344,6 +344,25 @@ impl Backend for CpuBackend {
         Ok(buffer)
     }
 
+    fn host_ptr(&self, buffer: &Buffer, bytes: u64) -> Option<*mut u8> {
+        let native = raw(buffer).ok()?;
+        if bytes > buffer.size() {
+            return None;
+        }
+        Some(native.as_ptr())
+    }
+
+    fn alloc_host_buffer(&self, bytes: u64, max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
+        let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+        let reused = lock(&self.mappable).take(class);
+        match reused {
+            Some(buffer) => Ok(buffer),
+            None => AlignedBuf::new(class)
+                .map(|b| Buffer::new(class, MAPPABLE_STORAGE_USAGE, b))
+                .ok_or(BackendError::OutOfMemory { requested: class }),
+        }
+    }
+
     fn recycle_mappable(&self, buffer: Buffer) {
         // Execution is synchronous, so a recycled buffer is idle at once; over the cap it is dropped.
         let _ = lock(&self.mappable).put(buffer);

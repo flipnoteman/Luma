@@ -279,6 +279,44 @@ impl Storage {
     pub(crate) fn is_alias(&self) -> bool {
         self.owner.is_some()
     }
+
+    /// Calls `f` with the bytes of the storage when they are host-readable now (one segment, held
+    /// in host memory or in an idle directly accessible buffer).
+    pub(crate) fn with_host_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if self.segments.len() != 1 || self.is_window() {
+            return None;
+        }
+        self.segments[0].with_host_bytes(f)
+    }
+
+    /// [`Storage::with_host_bytes`] with write access; pending readers are evaluated first and an
+    /// alias or window is never written.
+    pub(crate) fn with_host_bytes_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        if self.segments.len() != 1 || self.is_window() || self.is_alias() {
+            return None;
+        }
+        self.readers.flush();
+        self.segments[0].with_host_bytes_mut(f)
+    }
+
+    /// A storage of `len` elements of `layout` that `f` fills: host-resident, or, on unified
+    /// memory, in a mappable buffer written in place.
+    pub(crate) fn alloc_host(ctx: &Context, len: usize, layout: ElemLayout, f: impl FnOnce(&mut [u8])) -> Result<Arc<Storage>> {
+        let bytes = layout.bytes(len);
+        let segment = if ctx.zero_copy() {
+            ctx.make_room(bytes)?;
+            let buffer = ctx.alloc_host_buffer(bytes)?;
+            let ptr = ctx.host_ptr(&buffer, bytes).expect("a fresh mappable buffer has a host pointer");
+            // SAFETY: `buffer` holds at least `bytes` bytes and no GPU command touches it.
+            f(unsafe { std::slice::from_raw_parts_mut(ptr, bytes as usize) });
+            Segment::filled(ctx, bytes, buffer)
+        } else {
+            let mut data = vec![0u8; bytes as usize];
+            f(&mut data);
+            Segment::host(ctx, bytes, data)
+        };
+        Ok(Arc::new(Storage::with_segments(ctx, len, layout, Box::new([segment]), None)))
+    }
 }
 
 #[derive(Debug)]
@@ -449,6 +487,17 @@ impl<T: GpuType> Array<T> {
         if data.len() != len {
             return Err(LumaError::LengthMismatch { expected: len, actual: data.len() });
         }
+        if !ctx.zero_copy() && ctx.can_run_on_host() {
+            let layout = T::LAYOUT;
+            let bytes = layout.bytes(len);
+            if bytes <= 512 * 1024 && len <= segment_len(ctx, layout) {
+                let words = T::to_repr(data);
+                let vec = bytemuck::cast_slice(&words[layout.words(0..len)]).to_vec();
+                let segment = Segment::host(ctx, bytes, vec);
+                let storage = Storage::with_segments(ctx, len, layout, Box::new([segment]), None);
+                return Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(storage))));
+            }
+        }
         if ctx.zero_copy() {
             let layout = T::LAYOUT;
             let words = T::to_repr(data);
@@ -538,6 +587,14 @@ impl<T: GpuType> Array<T> {
         match self.failed() {
             None => Ok(()),
             Some(error) => Err(LumaError::clone(error)),
+        }
+    }
+
+    /// The array's storage if it is already valid; never evaluates a lazy array.
+    pub(crate) fn storage_if_valid(&self) -> Option<&Arc<Storage>> {
+        match &self.repr {
+            Repr::Valid(storage) => Some(storage),
+            _ => None,
         }
     }
 

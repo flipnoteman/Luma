@@ -273,6 +273,18 @@ impl Segment {
         segment
     }
 
+    /// A segment of `bytes` bytes that lives in host memory as `data`; it gets a device buffer
+    /// when first pinned.
+    pub(crate) fn host(ctx: &Context, bytes: u64, data: Vec<u8>) -> Arc<Segment> {
+        Arc::new(Segment {
+            ctx: ctx.clone(),
+            bytes,
+            state: Mutex::new(State::Host(data)),
+            pins: AtomicU32::new(0),
+            stamp: AtomicU64::new(0),
+        })
+    }
+
     /// A segment of `bytes` bytes that shows `bytes` bytes of `pack` (a storage of one segment)
     /// from byte `offset`, without a buffer of its own: kernels that know windows read the
     /// range through the pack (see `jit::pack`), anything else that pins the segment gets a
@@ -393,12 +405,42 @@ impl Segment {
     /// Copies the segment's data into `dst` (`dst.len()` bytes), after everything recorded so
     /// far. A segment in host memory is copied from there and stays there.
     pub(crate) fn read_into(self: &Arc<Self>, dst: &mut [MaybeUninit<u8>]) -> Result<()> {
-        if let State::Host(data) = &*lock(&self.state) {
-            copy_parallel(&data[..dst.len()], dst);
+        if self.with_host_bytes(|data| copy_parallel(&data[..dst.len()], dst)).is_some() {
             return Ok(());
         }
         let pin = self.pin()?;
         self.ctx.read_into(pin.buffer(), dst)
+    }
+
+    /// Calls `f` with the segment's data when the host can read it right now: held in host
+    /// memory, or in an idle directly accessible device buffer. `None` otherwise.
+    pub(crate) fn with_host_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if self.ctx.recording_here() {
+            return None;
+        }
+        match &*lock(&self.state) {
+            State::Host(data) => Some(f(&data[..self.bytes as usize])),
+            State::Device(buffer) if self.pins.load(Ordering::Acquire) == 0 => self.ctx.host_ptr(buffer, self.bytes).map(|ptr| {
+                // SAFETY: `host_ptr` vouches for `self.bytes` readable bytes no GPU command writes, and the state lock keeps the buffer from being evicted.
+                f(unsafe { std::slice::from_raw_parts(ptr, self.bytes as usize) })
+            }),
+            State::Device(_) | State::Empty | State::Window(_) => None,
+        }
+    }
+
+    /// [`Segment::with_host_bytes`] with write access; a device buffer must not be pinned by a recording.
+    pub(crate) fn with_host_bytes_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        if self.ctx.recording_here() {
+            return None;
+        }
+        match &mut *lock(&self.state) {
+            State::Host(data) => Some(f(&mut data[..self.bytes as usize])),
+            State::Device(buffer) if self.pins.load(Ordering::Acquire) == 0 => self.ctx.host_ptr(buffer, self.bytes).map(|ptr| {
+                // SAFETY: as in `with_host_bytes`; the state lock and the absent pins make this the only access.
+                f(unsafe { std::slice::from_raw_parts_mut(ptr, self.bytes as usize) })
+            }),
+            State::Device(_) | State::Empty | State::Window(_) => None,
+        }
     }
 }
 

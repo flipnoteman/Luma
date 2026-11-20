@@ -99,6 +99,7 @@ mod generate;
 mod gpu;
 mod gpu_type;
 mod group;
+mod host;
 mod iterate;
 mod jit;
 mod kernel;

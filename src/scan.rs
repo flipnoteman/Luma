@@ -1054,6 +1054,12 @@ impl<T: ScalarType> Array<T> {
         }
         let mut out_dims = shape.dims();
         out_dims[axis] = 1;
+        if ctx.can_run_on_host() && self.len() <= crate::host::MAX_HOST_ELEMS && self.error().is_none() {
+            let (n, stride, lines) = self.line_geometry(axis)?;
+            if let Some(outs) = crate::host::try_axis_reduce(self, [n, stride, lines], out_dims, ops) {
+                return Ok(outs);
+            }
+        }
         let outs = ops.as_slice().iter().map(|_| Array::<T>::alloc(ctx, Shape::from(out_dims))).collect::<Result<Vec<_>>>()?;
         let storages = outs.iter().map(|out| out.storage().map(Arc::clone)).collect::<std::result::Result<Vec<_>, _>>()?;
         let pins = storages.iter().map(|storage| storage.pin_single()).collect::<Result<Vec<_>>>()?;
@@ -1086,6 +1092,13 @@ impl<T: ScalarType> Array<T> {
         let ty = ElemTy::of::<T>()?;
         if ty.layout() != ElemLayout::plain(4) {
             return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", ty.display())).into());
+        }
+        if ctx.can_run_on_host()
+            && self.len() <= crate::host::MAX_HOST_ELEMS
+            && self.error().is_none()
+            && let Some(out) = crate::host::try_arg_reduce(self, [cells.n, cells.stride, cells.lines], out_dims, op)
+        {
+            return Ok(out);
         }
         let out = Array::<u32>::alloc(ctx, Shape::from(out_dims))?;
         let storage = Arc::clone(out.storage()?);

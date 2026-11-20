@@ -885,6 +885,13 @@ impl<T: SortKey> Array<T> {
             self.storage()?;
             return Ok(self.clone());
         }
+        if ctx.can_run_on_host()
+            && self.len() <= crate::host::MAX_SORT_ELEMS
+            && self.error().is_none()
+            && let Some(sorted) = crate::host::try_sort(self, descending)
+        {
+            return Ok(sorted);
+        }
         let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: true };
         let sorted = self.radix(Payload::None, spec)?;
         Ok(Array::from_storage(ctx, self.shape(), sorted.keys.expect("keys were asked for")))
@@ -908,6 +915,13 @@ impl<T: SortKey> Array<T> {
             self.storage()?;
             return Ok(Array::<u32>::zeros_on(ctx, self.len())?.storage()?.clone());
         }
+        if ctx.can_run_on_host()
+            && self.len() <= crate::host::MAX_SORT_ELEMS
+            && self.error().is_none()
+            && let Some(storage) = crate::host::try_argsort(self, descending)
+        {
+            return Ok(storage);
+        }
         let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: false };
         let sorted = self.radix(Payload::Index, spec)?;
         Ok(sorted.payload.expect("the payload was asked for"))
@@ -920,6 +934,13 @@ impl<T: SortKey> Array<T> {
             if self.len() <= 1 {
                 self.storage()?;
                 return Ok((self.clone(), Array::<u32>::zeros_on(ctx, self.shape())?));
+            }
+            if ctx.can_run_on_host()
+                && self.len() <= crate::host::MAX_SORT_ELEMS
+                && self.error().is_none()
+                && let Some(pair) = crate::host::try_sort_with_indices(self)
+            {
+                return Ok(pair);
             }
             let spec = Spec { transform: T::TRANSFORM, descending: false, key_bits: 32, want_keys: true };
             let sorted = self.radix(Payload::Index, spec)?;

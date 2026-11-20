@@ -802,6 +802,16 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn alloc_filled(&self, data: &[u8], max_buffer_bytes: u64) -> Result<Buffer, BackendError>;
     /// Returns a `MAP_WRITE` buffer for reuse.
     fn recycle_mappable(&self, buffer: Buffer);
+    /// Host pointer to the first `bytes` of `buffer` when directly CPU-accessible and idle (no
+    /// pending or running GPU commands touch it).
+    fn host_ptr(&self, _buffer: &Buffer, _bytes: u64) -> Option<*mut u8> {
+        None
+    }
+    /// A mappable storage buffer of at least `bytes` bytes, uninitialized; recycled with
+    /// [`Backend::recycle_mappable`]. Only called when [`DeviceInfo::zero_copy`] is true.
+    fn alloc_host_buffer(&self, _bytes: u64, _max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
+        Err(BackendError::Unsupported("the backend has no mappable storage buffers".into()))
+    }
     /// Compiles a module; `used` is the entry point's binding mask, see [`CompiledKernel::used`].
     fn compile_kernel(&self, module: &crate::kir::KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError>;
     /// Compiles an already parsed naga module, `None` if the backend takes only [`KernelModule`](crate::kir::KernelModule)s.

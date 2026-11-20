@@ -1079,7 +1079,32 @@ impl Node {
     /// Evaluates the node (once): records its fused kernel into the context's batch and returns
     /// the buffer it writes. Does not wait for the GPU.
     pub(crate) fn force(self: &Arc<Self>) -> &NodeResult {
+        if self.result.get().is_none() {
+            crate::host::try_eval_node(self);
+        }
         self.result.get_or_init(|| self.compute())
+    }
+
+    /// Unique per node.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The reduction this node stands for the value of, if it is such a node.
+    pub(crate) fn deferred_reduced(&self) -> Option<&Arc<crate::reduce::Reduced>> {
+        self.deferred.get()
+    }
+
+    /// Whether the node is a state of a repeating step (see [`looped`]).
+    pub(crate) fn is_looped(&self) -> bool {
+        self.looped.get().is_some()
+    }
+
+    /// [`Node::finish_shared`] for a buffer computed on the host: the node's buffer, which is
+    /// another one if a different thread evaluated the node meanwhile.
+    pub(crate) fn finish_host(self: &Arc<Self>, storage: Arc<Storage>) -> Arc<Storage> {
+        self.finish_shared(Arc::clone(&storage));
+        self.evaluated().cloned().unwrap_or(storage)
     }
 
     fn compute(self: &Arc<Self>) -> NodeResult {

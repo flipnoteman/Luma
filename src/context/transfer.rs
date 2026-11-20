@@ -131,6 +131,32 @@ impl Context {
         })
     }
 
+    /// Host pointer to the first `bytes` of `buffer` when the host may touch it now, see [`Backend::host_ptr`].
+    pub(crate) fn host_ptr(&self, buffer: &Buffer, bytes: u64) -> Option<*mut u8> {
+        self.hal().host_ptr(buffer, bytes)
+    }
+
+    /// An uninitialized mappable storage buffer of at least `bytes` bytes, like [`Context::alloc_filled`]
+    /// without the data. Only with [`Context::zero_copy`].
+    pub(crate) fn alloc_host_buffer(&self, bytes: u64) -> Result<Buffer> {
+        let max = self.max_buffer_bytes();
+        let class = pool::size_class(bytes, max).ok_or(LumaError::BufferTooLarge { requested: bytes, max })?;
+        #[cfg(test)]
+        self.inner.created_bytes.fetch_add(class, std::sync::atomic::Ordering::Relaxed);
+        let buffer = self.relieving(class, || match self.hal().alloc_host_buffer(bytes, max) {
+            Ok(buffer) => Ok(Some(buffer)),
+            Err(BackendError::OutOfMemory { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        })?;
+        if buffer.size() == bytes
+            && let Some(ptr) = self.host_ptr(&buffer, bytes)
+        {
+            // SAFETY: the buffer is fresh and idle, so no one else touches its `bytes` bytes.
+            advise_huge_pages(unsafe { std::slice::from_raw_parts_mut(ptr.cast::<std::mem::MaybeUninit<u8>>(), bytes as usize) });
+        }
+        Ok(buffer)
+    }
+
     /// Copies the first `bytes` bytes of `buffer` into a new vector, see [`Context::read_into`].
     pub(crate) fn read<T: Pod>(&self, buffer: &Buffer, bytes: u64) -> Result<Vec<T>> {
         self.read_vec(bytes, |dst| self.read_into(buffer, dst))

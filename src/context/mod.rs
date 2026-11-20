@@ -708,6 +708,21 @@ impl Context {
         self.inner.check_finite
     }
 
+    /// Whether small jobs on host-resident data may run on the host CPU: a GPU context that is not
+    /// recording, profiling or checking results, with `LUMA_HOST_FAST` not `off`.
+    pub(crate) fn can_run_on_host(&self) -> bool {
+        #[cfg(test)]
+        if self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) || std::env::var("LUMA_HOST_FAST").as_deref() != Ok("on") {
+            return false;
+        }
+        !self.is_cpu()
+            && !self.recording_here()
+            && !self.check_finite()
+            && self.segment_bytes() >= 65536
+            && !self.is_profiling()
+            && std::env::var("LUMA_HOST_FAST").as_deref() != Ok("off")
+    }
+
     /// Largest buffer that can be allocated and bound as a storage buffer.
     pub(crate) fn max_buffer_bytes(&self) -> u64 {
         self.inner.max_buffer_bytes

@@ -1062,6 +1062,19 @@ mod imp {
             Ok(buffer)
         }
 
+        fn host_ptr(&self, buffer: &Buffer, bytes: u64) -> Option<*mut u8> {
+            let native = raw(buffer).ok()?;
+            if bytes > buffer.size() || native.last_used.load(Ordering::Acquire) > self.poll_done() {
+                return None;
+            }
+            Some(native.raw.contents().as_ptr().cast::<u8>())
+        }
+
+        fn alloc_host_buffer(&self, bytes: u64, max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
+            let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+            self.take_upload_buffer(&self.mappable, class, MAPPABLE_STORAGE_USAGE)
+        }
+
         fn recycle_mappable(&self, buffer: Buffer) {
             // The pending command buffer (committed as the next sequence number) may still read
             // the buffer. This must not take the batch lock: the caller may hold anything.

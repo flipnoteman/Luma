@@ -190,8 +190,26 @@ fn side(ctx: &Context, array: &Array<f32>) -> Outcome<MatmulSide> {
     }
 }
 
+/// The product on the host if it is small and its operands are there (before anything pins an
+/// operand to the device).
+fn host_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Option<Array<f32>> {
+    let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
+    if !ctx.can_run_on_host() || !ctx.same_as(rhs.context()) || ld[0] != rd[1] || ld[2..].iter().chain(&rd[2..]).any(|&extent| extent != 1) {
+        return None;
+    }
+    let (k, m, n) = (ld[0], ld[1], rd[0]);
+    let limit = crate::host::MAX_HOST_ELEMS as u64;
+    if (m as u64) * (n as u64) * (k as u64) > crate::host::MAX_MATMUL_FMAS || (m as u64) * (k as u64) > limit || (k as u64) * (n as u64) > limit || (m as u64) * (n as u64) > limit {
+        return None;
+    }
+    crate::host::try_matmul(ctx, lhs, rhs, m, n, k)
+}
+
 fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
     let ctx = lhs.context();
+    if let Some(out) = host_product(ctx, lhs, rhs) {
+        return Ok(out);
+    }
     // Operands first, so that a poisoned one reports its own error.
     let sides = [side(ctx, lhs)?, side(rhs.context(), rhs)?];
     if !ctx.same_as(rhs.context()) {
