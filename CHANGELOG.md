@@ -6,10 +6,6 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
-### Changed
-
-- `luma-bench` keeps calling a case for up to 150 ms (when it takes under 5 ms) before timing it, so GPUs that idled between cases are at working clocks: an NVIDIA GPU drops to 210 MHz after ~50 ms idle, which made wgpu's sub-millisecond `jit/fusion` kernels (12 us) measure 8-15x slower than CUDA's.
-
 ### Added
 
 - `KernelBuilder::unchecked_bounds` (`unsafe`): builds a custom kernel without per-access bounds checks, for kernels whose author vouches that every access is in range (`luma_core::KernelTrust::UncheckedBounds`; the backend interface takes a `KernelTrust` where it took `trusted: bool`). On wgpu this is the only way to drop WebGPU's own checks.
@@ -18,6 +14,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
+- `luma-bench` keeps calling a case for up to 150 ms (when it takes under 5 ms) before timing it, so GPUs that idled between cases are at working clocks: an NVIDIA GPU drops to 210 MHz after ~50 ms idle, which made wgpu's sub-millisecond `jit/fusion` kernels (12 us) measure 8-15x slower than CUDA's.
 - The plan constants measured on an RTX 3090 (82 multiprocessors) scale with the device's multiprocessor count and are unchanged at 82: the twisted Thomas solve's line limit (`TWISTED_LINES`) and the line count its workgroup is sized for (4096-line `tri/solve_axis1` on an RTX 3080 Laptop: 3.98 to 2.43 ms), and, upward only, the workgroups of a K-split matmul (`SPLIT_GROUPS`, `SPLIT_TILES`). Backends that cannot report the count (Metal, wgpu on other vendors) and the CPU backend keep the 3090 values.
 - Bounds checks of untrusted kernels skip the accesses they can prove in range: indices built from `local_invocation_id`, `local_invocation_index`, literals, wrap-free arithmetic and counted `for` loops (`for (var k = 0u; k < 16u; k += 2u)`) into workgroup and function arrays (a tiled SGEMM's inner loop no longer pays a select per workgroup-memory read).
 - `Array<f32>::var_axis` (and `std_axis`) is one pass instead of two: the sum and sum of squares of `self - K` (K the first element of each line, subtracted inside the reduction) come from one `reduce_axis`, and the variance is `(S2 - S1*S1/n)/n` clamped at 0 (NaN kept), accurate for data far from zero. `ml/norm/layernorm` (mean + var + normalise) takes 3 launches instead of 4 (768x8192 on an RTX 3090: 0.173 ms to 0.143 ms, 4096x1024 0.129 to 0.104, 64x65536 0.163 to 0.124).
