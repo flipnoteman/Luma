@@ -11,6 +11,7 @@ use std::time::Duration;
 
 pub mod cache;
 pub mod copy;
+mod deferred;
 
 pub use cache::DiskCache;
 pub use copy::{advise_huge_pages, copy_parallel, copy_streaming};
@@ -573,25 +574,39 @@ impl std::hash::Hash for Buffer {
 /// A backend's own compiled kernel object, held type-erased by [`RawKernel`].
 pub trait NativeKernel: Any + fmt::Debug + Send + Sync + 'static {}
 
-/// A compiled kernel of any backend.
+/// A compiled kernel of any backend, possibly still compiling (see [`RawKernel::spawn`]).
 #[derive(Clone, Debug)]
 pub struct RawKernel {
     id: u64,
-    native: Arc<dyn NativeKernel>,
+    native: Arc<deferred::Slot>,
 }
 
 impl RawKernel {
     /// Wraps a backend's kernel.
     pub fn new(native: impl NativeKernel) -> Self {
-        RawKernel { id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed), native: Arc::new(native) }
+        RawKernel { id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed), native: Arc::new(deferred::Slot::ready(native)) }
+    }
+    /// A kernel `compile` produces on a worker thread (on the calling thread when the pool is off
+    /// or its queue is full, see `LUMA_COMPILE_THREADS`). It returns at once; whatever needs the
+    /// kernel to run calls [`resolve`](Self::resolve), which waits and reports the compile error.
+    pub fn spawn<N: NativeKernel>(compile: impl FnOnce() -> Result<N, BackendError> + Send + 'static) -> Self {
+        RawKernel { id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed), native: deferred::spawn(compile) }
     }
     /// Unique per compiled kernel.
     pub fn id(&self) -> u64 {
         self.id
     }
-    /// The backend's kernel, if it is a `T`.
+    /// The backend's kernel, once compiled: waits for the compilation, fails with its error, or
+    /// with [`BackendError::Unsupported`] if the kernel is not a `T`.
+    pub fn resolve<T: 'static>(&self) -> Result<&T, BackendError> {
+        match self.native.wait() {
+            Ok(native) => (&**native as &dyn Any).downcast_ref::<T>().ok_or_else(|| BackendError::Unsupported("the kernel belongs to another backend".into())),
+            Err(error) => Err(error.clone()),
+        }
+    }
+    /// The backend's kernel, if it compiled and is a `T`. Waits for the compilation.
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        (&*self.native as &dyn Any).downcast_ref::<T>()
+        self.resolve().ok()
     }
 }
 
@@ -864,6 +879,13 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     }
     /// Compiles a module; `used` is the entry point's binding mask, see [`CompiledKernel::used`].
     fn compile_kernel(&self, module: &crate::kir::KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError>;
+    /// Like [`compile_kernel`](Backend::compile_kernel), but the compilation may carry on in the
+    /// background: a failure of the slow part then surfaces from the first use of the kernel (see
+    /// [`RawKernel::resolve`]) instead of from here. For kernels luma builds itself, which no
+    /// caller needs before a launch; the default compiles at once.
+    fn compile_kernel_deferred(&self, module: crate::kir::KernelModule, used: Option<Box<[bool]>>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+        self.compile_kernel(&module, used.as_deref(), label, trusted)
+    }
     /// Compiles an already parsed naga module, `None` if the backend takes only [`KernelModule`](crate::kir::KernelModule)s.
     fn compile_naga(&self, _module: &naga::Module, _entry: &str, _bindings: &[BindingInfo], _workgroup: [u32; 3], _label: &str, _trusted: bool) -> Option<Result<RawKernel, BackendError>> {
         None

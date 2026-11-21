@@ -4,7 +4,6 @@
 //! without the CUDA toolkit being installed.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::sync::Mutex;
 
 use libloading::Library;
 
@@ -77,7 +76,6 @@ type Res = c_int;
 
 pub(crate) struct Nvvm {
     pub version: (i32, i32),
-    lock: Mutex<()>,
     create: unsafe extern "C" fn(*mut Prog) -> Res,
     destroy: unsafe extern "C" fn(*mut Prog) -> Res,
     add: unsafe extern "C" fn(Prog, *const c_char, usize, *const c_char) -> Res,
@@ -122,7 +120,6 @@ impl Nvvm {
             sym!(b"nvvmIRVersion\0");
         let mut n = Nvvm {
             version: (0, 0),
-            lock: Mutex::new(()),
             create: sym!(b"nvvmCreateProgram\0"),
             destroy: sym!(b"nvvmDestroyProgram\0"),
             add: sym!(b"nvvmAddModuleToProgram\0"),
@@ -224,9 +221,9 @@ impl Nvvm {
         }
     }
 
-    /// IR text -> PTX text. Err = "<nvvmGetErrorString>\n<program log>".
+    /// IR text -> PTX text. Programs are independent and libNVVM is thread-safe across them, so
+    /// kernels compile on several threads at once. Err = "<nvvmGetErrorString>\n<program log>".
     pub(crate) fn compile(&self, ir: &str, major: i32, minor: i32) -> Result<String, String> {
-        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut prog: Prog = std::ptr::null_mut();
         // SAFETY: `prog` is a valid out-pointer.
         let r = unsafe { (self.create)(&mut prog) };
