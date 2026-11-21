@@ -254,6 +254,13 @@ impl Fb {
             }
         }
         let size = u64::from(size);
+        // A dynamic index keeps the byte form (`i8*` plus `index * stride`, then a bitcast): the typed
+        // `getelementptr` with its 64-bit index arithmetic made ptxas schedule the operand loads of a fused
+        // matmul worse (`attention/single` T2048 on an RTX 3090: 0.452 -> 0.526 ms).
+        if dynamic.is_some() {
+            let p = self.gep_const(ptr, u64::from(off));
+            return self.view(&p, t);
+        }
         let aligned = c % size == 0 && dynamic.as_ref().is_none_or(|&(_, stride)| u64::from(stride) % size == 0);
         if !aligned {
             let p = self.gep_const(ptr, u64::from(off));
@@ -605,22 +612,20 @@ mod tests {
     }
 
     #[test]
-    fn an_element_access_is_one_typed_getelementptr() {
+    fn a_dynamic_element_access_keeps_the_byte_form_and_a_constant_one_is_typed() {
         let mut fb = Fb::new();
         let buf: Op = "%buf0".into();
         fb.mark_entry(&buf);
         let idx: Op = "%i".into();
         let p = fb.gep_elem(&buf, &idx, 4);
         let a = fb.load(&p, 0, ScalarTy::F32, true);
-        let q = fb.gep_const(&p, 4);
-        fb.store(&q, 0, ScalarTy::F32, &a, true);
+        let c = fb.load(&buf, 8, ScalarTy::F32, true);
+        fb.store(&buf, 4, ScalarTy::F32, &a, true);
+        fb.store(&buf, 0, ScalarTy::F32, &c, true);
         let text = fb.finish();
-        // The view of the buffer is made once, in the prologue; the byte arithmetic is gone.
-        assert_eq!(text.matches("bitcast i8* %buf0 to float*").count(), 1, "{text}");
-        assert!(!text.contains("getelementptr inbounds i8"), "{text}");
-        assert!(!text.contains("mul nuw"), "{text}");
-        assert!(text.contains("load float, float* %t"), "{text}");
-        assert!(text.contains("add nuw i64"), "{text}");
+        // The dynamic index is `i8*` plus `index * stride` (see `typed_ptr`); the constant offset is a typed element.
+        assert!(text.contains("mul nuw i64"), "{text}");
+        assert!(text.contains("getelementptr inbounds float, float* %t") && text.contains("i64 2"), "{text}");
     }
 
     #[test]

@@ -5059,3 +5059,19 @@ fn a_state_a_step_hands_back_unchanged_takes_no_launch() {
         assert_eq!(k.to_vec().unwrap(), ks);
     }
 }
+
+#[test]
+fn a_standardized_operand_counts_the_reductions_it_waits_for_as_buffers() {
+    // `(x - mean) / std` reads the mean and deviation once recorded (on a GPU backend they stay
+    // pending until the product needs them): an operand of several buffers that a skinny product
+    // would recompute at every read, which `matmul` weighs by asking `is_recomputed`.
+    let ctx = ctx();
+    let (rows, feats) = (1 << 17, 8);
+    let x = Array::from_slice_on(&ctx, &values(rows * feats, 7, 0.0, 1.0), [rows, feats]).unwrap();
+    let z = (&x - &x.mean_axis(0)) / &x.std_axis(0);
+    let node = z.pending().expect("a lazy expression");
+    assert!(super::is_recomputed(node));
+    // One buffer and nothing pending stays cheap to read.
+    let scaled = &x * 2.0;
+    assert!(!super::is_recomputed(scaled.pending().expect("a lazy expression")));
+}

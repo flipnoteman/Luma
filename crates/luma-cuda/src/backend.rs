@@ -684,7 +684,7 @@ impl CudaShared {
     fn build_function(&self, source: &str, label: &str) -> Result<(CudaFunction, Phases), BackendError> {
         let (major, minor) = self.cc;
         // Last byte: emitter revision; bump whenever the emitted IR or the NVVM options change.
-        let meta = [major as u8, minor as u8, self.nvvm.version.0 as u8, self.nvvm.version.1 as u8, 7];
+        let meta = [major as u8, minor as u8, self.nvvm.version.0 as u8, self.nvvm.version.1 as u8, 8];
         let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let stem = format!("ptx-{hash:016x}");
         let load = |text: String| self.ctx.load_module(Ptx::from_src(text)).and_then(|m| m.load_function(ENTRY));

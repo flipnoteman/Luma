@@ -18,7 +18,7 @@ use crate::sort::RadixPass;
 use crate::ops::{fold_workgroups, launch_1d, len_u32};
 
 use super::codegen::direct;
-use super::{lock, Args, Edge, ElemTy, Node, OpKind, ShiftKind, Src, ViewMap};
+use super::{lock, unresolved_leaves, Args, Edge, ElemTy, Node, OpKind, ShiftKind, Src, ViewMap};
 use crate::profile::SplitReason;
 use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Tail};
 
@@ -1681,7 +1681,9 @@ fn flatten_operands(
 /// load: `node` itself if it is a pending expression, what it reads if it is a view (which stays
 /// fused: a transposed view of a stored array costs a few index operations). `None` for a view of a
 /// view, an array that is stored, or an expression of one buffer (the labels of a one-hot matrix),
-/// which costs about a load per evaluation, as much as reading it stored.
+/// which costs about a load per evaluation, as much as reading it stored. A reduction that is not
+/// recorded yet (the mean and deviation of `(x - mean) / std`) is a buffer read once recorded, so it
+/// counts like one.
 fn recomputed(node: &Arc<Node>) -> Option<Arc<Node>> {
     if !node.is_pending() {
         return None;
@@ -1694,7 +1696,8 @@ fn recomputed(node: &Arc<Node>) -> Option<Arc<Node>> {
     } else {
         Arc::clone(node)
     };
-    (target.inputs().len() >= 2).then_some(target)
+    let deferred = unresolved_leaves(&target).map_or(0, |leaves| leaves.len());
+    (target.inputs().len() + deferred >= 2).then_some(target)
 }
 
 /// Whether a product operand is an expression of several buffers that a kernel reading each of its
