@@ -9,8 +9,11 @@ pub mod ml;
 
 use crate::harness::Harness;
 
+/// A suite's entry point.
+pub type SuiteFn = fn(&mut Harness);
+
 /// Every suite: name and entry point.
-pub const ALL: &[(&str, fn(&mut Harness))] = &[
+pub const ALL: &[(&str, SuiteFn)] = &[
     ("ml", ml::run),
     ("cfd", cfd::run),
     ("datasci", datasci::run),

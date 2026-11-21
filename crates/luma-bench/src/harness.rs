@@ -158,7 +158,7 @@ impl Harness {
             Work::Items(n, u) => (Some(n / (median * 1e-3) / 1e6), u),
             Work::None => (None, ""),
         };
-        let (launches, gpu_ms) = match self.ctx.profile(|| f()) {
+        let (launches, gpu_ms) = match self.ctx.profile(&mut *f) {
             Ok(((), p)) => (Some(p.launches()), Some(p.total().as_secs_f64() * 1e3)),
             Err(_) => (None, None),
         };
