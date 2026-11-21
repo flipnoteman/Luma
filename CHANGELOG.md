@@ -6,6 +6,13 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-21
+
+### Fixed
+
+- CUDA on Windows: the NVVM compiler (`nvvm64.dll`) is looked for in the directory of the loaded NVIDIA driver (`System32\DriverStore\FileRepository\nv_dispi.inf_*`), where the driver installs it but which is not on the DLL search path. The CUDA backend never opened on Windows without that directory on `PATH`, and `Auto` fell back to wgpu.
+- CUDA: `sort`, `argsort`, `sort_axis`, `factorize` and everything built on them (`unique`, `median`, `quantile`, `searchsorted`, group-by) failed with `CUDA_ERROR_ILLEGAL_ADDRESS` on every input since the single-digit scatter bypass of 0.5.0. The scatter kernel read the digit offsets at index `-1` for digit 0 inside a `select` (both operands are evaluated); wgpu clamps out-of-bounds reads, the CUDA backend does not. The index is clamped now.
+
 ## [0.5.0] - 2026-11-20
 
 ### Added
@@ -673,7 +680,8 @@ All notable changes to Luma are listed here. The format follows
 - A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
 - A library layout, with the shader loaded from a hard-coded relative path.
 
-[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/flipnoteman/Luma/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/flipnoteman/Luma/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/flipnoteman/Luma/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/flipnoteman/Luma/compare/v0.3.0...v0.4.0
