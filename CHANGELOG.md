@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `factorize`/`unique` of `u32`/`i32` keys whose range is small (at most the larger of the key count and 4096, and 2^24) count into a presence table instead of radix sorting: one min/max readback, a scan and a gather. Same results; wide ranges and recordings keep the sort.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed
