@@ -104,6 +104,7 @@ mod iterate;
 mod jit;
 mod kernel;
 mod linalg;
+mod bmm;
 mod matmul;
 mod nan;
 mod ops;
@@ -136,6 +137,7 @@ pub use linalg::{
     solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from, solve_tridiagonal, solve_tridiagonal_from,
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,
 };
+pub use bmm::matmul_batched;
 pub use matmul::matmul;
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Condition, Operand};

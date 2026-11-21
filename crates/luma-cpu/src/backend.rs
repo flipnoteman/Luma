@@ -21,7 +21,7 @@ use luma_core::{
 use crate::codegen::CompiledCpuKernel;
 use crate::exec::{AlignedBuf, CostHint, ExecBlob, WorkgroupPool};
 use crate::fission;
-use crate::gemm::NativeMatmul;
+use crate::gemm::{NativeBatchedMatmul, NativeMatmul};
 use crate::solve::NativeLineSolve;
 
 /// Most idle bytes of recycled mappable storage kept for reuse.
@@ -203,6 +203,7 @@ enum CpuKernel<'a> {
     Compiled(&'a CompiledCpuKernel),
     LineSolve(&'a NativeLineSolve),
     Matmul(&'a NativeMatmul),
+    BatchedMatmul(&'a NativeBatchedMatmul),
 }
 
 impl CpuBackend {
@@ -294,6 +295,9 @@ fn native(kernel: &CompiledKernel) -> Result<CpuKernel<'_>, BackendError> {
     if let Some(solve) = kernel.raw.downcast_ref::<NativeLineSolve>() {
         return Ok(CpuKernel::LineSolve(solve));
     }
+    if let Some(product) = kernel.raw.downcast_ref::<NativeBatchedMatmul>() {
+        return Ok(CpuKernel::BatchedMatmul(product));
+    }
     kernel
         .raw
         .downcast_ref::<NativeMatmul>()
@@ -378,6 +382,28 @@ impl CpuBackend {
                 let uniform = bindings.last().ok_or_else(|| invalid("a matrix product without its uniform"))?;
                 // SAFETY: the uniform's storage is 16-byte aligned and at least 16 bytes.
                 let words = unsafe { uniform.cast::<[u32; 4]>().read() };
+                product.validate(&binding_bytes, words, workgroups)?;
+                let start = Instant::now();
+                self.pool.dispatch_native(
+                    product.func,
+                    std::ptr::from_ref(product).cast(),
+                    size,
+                    workgroups,
+                    &bindings,
+                    &binding_bytes,
+                    &[],
+                    0,
+                    0,
+                    false,
+                    &product.cost,
+                );
+                drop(store);
+                return Ok(start.elapsed());
+            }
+            CpuKernel::BatchedMatmul(product) => {
+                let uniform = bindings.last().ok_or_else(|| invalid("a batched matrix product without its uniform"))?;
+                // SAFETY: the uniform's storage is 16-byte aligned and at least 32 bytes (the shader's `Params`).
+                let words = unsafe { uniform.cast::<[u32; 8]>().read() };
                 product.validate(&binding_bytes, words, workgroups)?;
                 let start = Instant::now();
                 self.pool.dispatch_native(
@@ -725,6 +751,10 @@ impl Backend for CpuBackend {
 
     fn compile_matmul(&self, spec: &MatmulSpec) -> Option<RawKernel> {
         NativeMatmul::new(spec).map(RawKernel::new)
+    }
+
+    fn compile_batched_matmul(&self) -> Option<RawKernel> {
+        Some(RawKernel::new(NativeBatchedMatmul::default()))
     }
 
     fn compile_line_solve(&self, spec: &LineSolveSpec) -> Option<RawKernel> {

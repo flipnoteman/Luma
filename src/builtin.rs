@@ -860,6 +860,9 @@ pub(crate) enum Builtin {
     /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
     /// dimension and writes every slice's partial product after the previous one.
     Matmul { tile: crate::matmul::MatmulTile, aligned: bool, split: bool },
+    /// Tiled products of a batch of matrices in one launch; see [`crate::bmm`]. Arguments: out, a,
+    /// b, uniform `{m, n, k, matrices, a_stride, b_stride, _, _}`.
+    Bmm(crate::bmm::Bmm),
     /// `out[i] = Σ_z part[z * size + i]` for `p.s` slices `z`: the sum of the partial products of
     /// a split [`Builtin::Matmul`]. Arguments: out, part, uniform `{s}`; `luma.size.x` is the
     /// elements of `out`.
@@ -2575,6 +2578,7 @@ impl Builtin {
             Builtin::Radix { pass, first } => wgsl(crate::sort::source(pass, first)),
             Builtin::SortLines(sort) => wgsl(sort.source()),
             Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split)),
+            Builtin::Bmm(kernel) => wgsl(crate::bmm::source(kernel)),
             Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module()),
             Builtin::FilterCount => wgsl(crate::filter::count_source()),
             Builtin::FilterScatter { words, index } => wgsl(crate::filter::scatter_source(words, index)),

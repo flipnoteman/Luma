@@ -53,6 +53,23 @@ assert_eq!(cols.to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 
 # Ok::<(), luma::LumaError>(())
 ```
 
+`a.matmul_batched(&b)` multiplies a batch of matrices in one launch (`matmul` in a loop is one launch
+per product). The batch is axis 2 of both operands: `a` is `[K, M, B]`, `b` is `[N, K, B]` and the
+result `[N, M, B]`. An operand without the batch (`[N, K]`) is shared by every product, as the
+weights of a layer are:
+
+```rust
+use luma::*;
+
+// Two products of [[1, 2], [3, 4]] @ [[1, 0], [0, 1]] and [[5, 6], [7, 8]] @ [[1, 0], [0, 1]].
+let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 2, 2])?;
+let identity = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], [2, 2])?; // shared by both
+let c = a.matmul_batched(&identity);
+assert_eq!(c.shape(), Shape::from([2, 2, 2]));
+assert_eq!(c.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
 An operand that is a pending expression is not stored first: its expression is evaluated inside
 the product's loads, once per use. A standardised Gram (correlation-style) matrix of a table with
 one column per feature (`[samples, features]`) is one launch plus the statistics:
