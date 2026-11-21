@@ -243,7 +243,7 @@ fn trace_unrolled<T: ScalarType, const N: usize>(
 }
 
 /// The share of the time of `depth` steps one by one that the unrolled body must take, at most.
-const UNROLL_GAIN: f64 = 0.9;
+const UNROLL_GAIN: f64 = 0.6;
 
 /// The storages of the state after `steps` steps: replays of `unrolled` (`depth` steps each),
 /// then `stepper` for the rest, which takes the state where the replays left it.
