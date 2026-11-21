@@ -9,6 +9,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use super::{BackendError, NativeKernel};
 
@@ -20,9 +21,19 @@ const WORKER_STACK: usize = 32 << 20;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[derive(Default)]
+struct State {
+    queue: VecDeque<Job>,
+    /// Jobs a worker is running.
+    running: usize,
+    /// The process is exiting: nothing is queued any more.
+    closed: bool,
+}
+
 struct Pool {
-    queue: Mutex<VecDeque<Job>>,
+    state: Mutex<State>,
     wake: Condvar,
+    idle: Condvar,
     workers: usize,
 }
 
@@ -43,9 +54,32 @@ fn pool() -> Option<&'static Pool> {
     static POOL: OnceLock<Option<Pool>> = OnceLock::new();
     POOL.get_or_init(|| {
         let workers = worker_count();
-        (workers > 0).then(|| Pool { queue: Mutex::new(VecDeque::new()), wake: Condvar::new(), workers })
+        (workers > 0).then(|| Pool { state: Mutex::new(State::default()), wake: Condvar::new(), idle: Condvar::new(), workers })
     })
     .as_ref()
+}
+
+/// How long exit waits for the kernels being compiled.
+const EXIT_WAIT: Duration = Duration::from_secs(20);
+
+unsafe extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+}
+
+/// A driver's own exit handler frees what a compile still running on a worker uses, which
+/// crashes the process (a recorded step that is never replayed leaves its kernels compiling).
+/// This handler is registered after the driver's, so it runs first: it drops the jobs still
+/// queued and waits for the running ones.
+extern "C" fn at_exit() {
+    let Some(pool) = pool() else { return };
+    let mut state = lock(&pool.state);
+    state.closed = true;
+    state.queue.clear();
+    let deadline = Instant::now() + EXIT_WAIT;
+    while state.running > 0 {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else { return };
+        state = pool.idle.wait_timeout(state, left).unwrap_or_else(PoisonError::into_inner).0;
+    }
 }
 
 fn start_workers(pool: &'static Pool) {
@@ -54,32 +88,40 @@ fn start_workers(pool: &'static Pool) {
         for index in 0..pool.workers {
             let spawned = std::thread::Builder::new().name(format!("luma-compile-{index}")).stack_size(WORKER_STACK).spawn(move || loop {
                 let job = {
-                    let mut queue = lock(&pool.queue);
+                    let mut state = lock(&pool.state);
                     loop {
-                        if let Some(job) = queue.pop_front() {
+                        if let Some(job) = state.queue.pop_front() {
+                            state.running += 1;
                             break job;
                         }
-                        queue = pool.wake.wait(queue).unwrap_or_else(PoisonError::into_inner);
+                        state = pool.wake.wait(state).unwrap_or_else(PoisonError::into_inner);
                     }
                 };
                 job();
+                lock(&pool.state).running -= 1;
+                pool.idle.notify_all();
             });
             // Without a worker the queue would never drain: callers fall back to compiling inline
             // once it is full, so a failed spawn costs parallelism only.
             drop(spawned);
         }
+        // SAFETY: `at_exit` is a plain `extern "C"` function that does not unwind.
+        unsafe {
+            atexit(at_exit);
+        }
     });
 }
 
-/// Runs `job` on a worker, or on the calling thread when the pool is off or its queue is full.
+/// Runs `job` on a worker, or on the calling thread when the pool is off, closed or its queue is
+/// full.
 fn submit(job: Job) {
     let Some(pool) = pool() else { return job() };
     start_workers(pool);
     {
-        let mut queue = lock(&pool.queue);
-        if queue.len() < pool.workers * QUEUE_PER_WORKER {
-            queue.push_back(job);
-            drop(queue);
+        let mut state = lock(&pool.state);
+        if !state.closed && state.queue.len() < pool.workers * QUEUE_PER_WORKER {
+            state.queue.push_back(job);
+            drop(state);
             pool.wake.notify_one();
             return;
         }
@@ -140,10 +182,29 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
     payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("unknown panic")
 }
 
+/// Fills a slot with an error if dropped before it was filled (a job dropped at exit).
+struct Completer(Option<std::sync::Arc<Slot>>);
+
+impl Completer {
+    fn complete(mut self, result: Result<Box<dyn NativeKernel>, BackendError>) {
+        if let Some(slot) = self.0.take() {
+            slot.complete(result);
+        }
+    }
+}
+
+impl Drop for Completer {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0.take() {
+            slot.complete(Err(BackendError::ShaderCompile("the kernel was not compiled: the process is exiting".into())));
+        }
+    }
+}
+
 /// Starts `compile` on the pool and returns the slot it fills.
 pub(super) fn spawn<N: NativeKernel>(compile: impl FnOnce() -> Result<N, BackendError> + Send + 'static) -> std::sync::Arc<Slot> {
     let slot = std::sync::Arc::new(Slot::empty());
-    let target = std::sync::Arc::clone(&slot);
+    let target = Completer(Some(std::sync::Arc::clone(&slot)));
     submit(Box::new(move || {
         let result = match catch_unwind(AssertUnwindSafe(compile)) {
             Ok(result) => result.map(|native| Box::new(native) as Box<dyn NativeKernel>),
