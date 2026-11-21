@@ -538,7 +538,7 @@ pub(super) struct Shifted {
 
 /// The input `k` of `key` among `inputs`, which lack the in-place inputs of `key` (those are
 /// never read through a shift of a split array, see [`in_place_eligible`] and [`run_mapped`]).
-fn input_at<'a>(key: &FusedKey, inputs: &'a [Arc<Storage>], k: usize) -> Option<&'a Arc<Storage>> {
+pub(super) fn input_at<'a>(key: &FusedKey, inputs: &'a [Arc<Storage>], k: usize) -> Option<&'a Arc<Storage>> {
     if key.in_place.iter().any(|&(paired, _)| paired as usize == k) {
         return None;
     }
@@ -995,6 +995,9 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
     }
     if let Some(plan) = super::transpose::plan(ctx, &key, &inputs, len) {
         return Ok(vec![super::transpose::run(ctx, &plan, &inputs[0], len)?]);
+    }
+    if let Some(plan) = super::transpose::plan_fused(ctx, &key, &inputs, &scalars, len)? {
+        return Ok(vec![super::transpose::run_fused(ctx, &plan, &inputs, len, reused)?]);
     }
     let shifted = plan_shifts(ctx, &mut key, &inputs, &scalars, len)?;
     settle_staging(&mut key, len);

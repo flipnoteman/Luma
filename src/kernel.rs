@@ -34,6 +34,12 @@ impl KernelKey {
     pub(crate) fn new(source: String, entry: &str, workgroup: Option<[u32; 3]>) -> Self {
         KernelKey { source, entry: entry.to_owned(), workgroup, label: None, trust: KernelTrust::Checked }
     }
+
+    /// The key of a kernel of luma's own, entry point `main`, named `label`, whose every storage
+    /// access is in bounds by construction (see [`KernelTrust::Trusted`]).
+    pub(crate) fn trusted(source: String, label: &str) -> Self {
+        KernelKey { source, entry: "main".to_owned(), workgroup: None, label: Some(label.to_owned()), trust: KernelTrust::Trusted }
+    }
 }
 
 /// Everything about a built kernel that does not depend on the caller; cached per context.
