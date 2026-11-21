@@ -15,6 +15,50 @@ const CANDIDATES: &[&str] = &["nvvm64.dll", "nvvm70.dll", "nvvm64_40_0.dll"];
 #[cfg(not(windows))]
 const CANDIDATES: &[&str] = &["libnvidia-nvvm.so.4", "libnvidia-nvvm70.so.4", "libnvvm.so.4"];
 
+/// The libraries to try, in order. On Windows the driver keeps NVVM next to its own DLLs in the
+/// driver store (`System32\DriverStore\FileRepository\nv_dispi.inf_*`), which is not on the DLL
+/// search path; the directory of the loaded `nvcuda64.dll` (falling back to `nvcuda.dll`) is
+/// tried before the plain names.
+fn candidate_paths() -> Vec<std::path::PathBuf> {
+    let names = CANDIDATES.iter().map(std::path::PathBuf::from);
+    #[cfg(windows)]
+    if let Some(dir) = windows::driver_dir() {
+        return CANDIDATES.iter().map(|n| dir.join(n)).chain(names).collect();
+    }
+    names.collect()
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::ffi::{c_void, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::PathBuf;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn GetModuleFileNameW(module: *mut c_void, buf: *mut u16, size: u32) -> u32;
+    }
+
+    /// The directory of the CUDA driver DLL loaded in this process, if any.
+    pub(super) fn driver_dir() -> Option<PathBuf> {
+        ["nvcuda64.dll", "nvcuda.dll"].into_iter().find_map(module_path)?.parent().map(PathBuf::from)
+    }
+
+    fn module_path(name: &str) -> Option<PathBuf> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().chain([0]).collect();
+        // SAFETY: `wide` is NUL-terminated; the handle is not freed (no reference is taken).
+        let module = unsafe { GetModuleHandleW(wide.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 32768];
+        // SAFETY: `buf` holds `buf.len()` u16s and `module` is a loaded module.
+        let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        (len > 0 && len < buf.len()).then(|| PathBuf::from(OsString::from_wide(&buf[..len])))
+    }
+}
+
 const SELF_TEST: &str = r#"target triple = "nvptx64-nvidia-cuda"
 target datalayout = "e-p:64:64:64-p3:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64"
 define void @luma_main(float* %x) nounwind {
@@ -50,19 +94,20 @@ pub(crate) struct Nvvm {
 
 impl Nvvm {
     /// Tries each candidate library; the first that loads, resolves every symbol, reports IR
-    /// major 2 and compiles the self-test for the device wins.
+    /// major 2 and compiles the self-test for the device wins. Needs the CUDA driver loaded: on
+    /// Windows each candidate is looked for in the driver's own directory first.
     pub(crate) fn open(major: i32, minor: i32) -> Result<Nvvm, String> {
         let mut reasons = Vec::new();
-        for name in CANDIDATES {
-            match Self::try_open(name, major, minor) {
+        for path in candidate_paths() {
+            match Self::try_open(&path, major, minor) {
                 Ok(n) => return Ok(n),
-                Err(e) => reasons.push(format!("{name}: {e}")),
+                Err(e) => reasons.push(format!("{}: {e}", path.display())),
             }
         }
         Err(reasons.join("; "))
     }
 
-    fn try_open(name: &str, major: i32, minor: i32) -> Result<Nvvm, String> {
+    fn try_open(name: &std::path::Path, major: i32, minor: i32) -> Result<Nvvm, String> {
         // SAFETY: loading the driver's NVVM library runs its initialisers, as any driver load does.
         let lib = unsafe { Library::new(name) }.map_err(|e| e.to_string())?;
         macro_rules! sym {

@@ -511,7 +511,9 @@ fn main(
     let base = tile * {tile}u;
     let sg = t / {SUBGROUP}u;
     for (var k = 0u; k < {stride}u; k++) {{ atomicStore(&wc[k * {DIGITS}u + t], 0u); }}
-    let same_d = p.n > 0u && (offs[t * p.cstride + p.tiles - 1u] - select(0u, offs[t * p.cstride - 1u], t > 0u) == p.n);
+    // `select` evaluates both operands: the index of the previous digit's offset is clamped so that
+    // digit 0 does not read `offs[-1]` (an out-of-bounds load on backends without robust access).
+    let same_d = p.n > 0u && (offs[t * p.cstride + p.tiles - 1u] - select(0u, offs[max(t * p.cstride, 1u) - 1u], t > 0u) == p.n);
     let sg_same = subgroupBallot(same_d).x;
     if (lane == 0u) {{ wsum[sg] = sg_same; }}
     workgroupBarrier();
