@@ -423,6 +423,8 @@ fn bc(h: &mut Harness, z: &Z) {
         let group = format!("bc/ghost{d}d");
         h.guarded(&group, |h| if d == 2 { ghost_cases::<4>(h, &group, &small, &big) } else { ghost_cases::<5>(h, &group, &small, &big) });
     }
+    face_apply(h, z);
+    ghost_region(h, z);
     h.guarded("bc/assign_record", |h| {
         let ctx = h.ctx.clone();
         let (vw, vh) = (12, 9);
@@ -449,6 +451,348 @@ fn bc(h: &mut Harness, z: &Z) {
             }
         };
         h.case("bc/assign_record", &format!("4x{side}x{side}:x100"), Work::Items(100.0, "assign"), &mut f);
+    });
+}
+
+/// `v` with its momentum (fields 1..=3) reflected about the unit normal `n`: `v - 2 (v.n) n`.
+fn reflect_rec(v: &[A; 5], n: &[A; 3]) -> [A; 5] {
+    let dot = &v[1] * &n[0] + &v[2] * &n[1] + &v[3] * &n[2];
+    std::array::from_fn(|k| if (1..=3).contains(&k) { &v[k] - 2.0 * &dot * &n[k - 1] } else { v[k].clone() })
+}
+
+/// The data of one `face_apply` pass over a grid `dims` along `dir`: the face matrices `fl`, `fr` (25 arrays each over the
+/// `n + 1` faces of every line), the vector `z` over the cells, the unit normals of the two line ends (one cell along `dir`),
+/// the solid-neighbour masks and normals of the faces. Host copies are kept for the reference.
+struct FaceApply {
+    dir: usize,
+    dims: Vec<usize>,
+    host: FaceHost,
+    fl: Vec<A>,
+    fr: Vec<A>,
+    z: [A; 5],
+    ends: [[A; 3]; 2],
+    wall: [Array<bool>; 2],
+    nw: [A; 3],
+}
+
+struct FaceHost {
+    fl: Vec<Vec<f32>>,
+    fr: Vec<Vec<f32>>,
+    z: Vec<Vec<f32>>,
+    ends: [Vec<Vec<f32>>; 2],
+    wall: [Vec<bool>; 2],
+    nw: Vec<Vec<f32>>,
+}
+
+impl FaceApply {
+    fn new(ctx: &Context, dims: &[usize], dir: usize) -> FaceApply {
+        let (mut fdims, mut edims) = (dims.to_vec(), dims.to_vec());
+        fdims[dir] += 1;
+        edims[dir] = 1;
+        let (cells, faces, edge) = (cells_of(dims), cells_of(&fdims), cells_of(&edims));
+        let mut seed = 5000 + dir as u64;
+        let mut data = |n: usize, lo: f32, hi: f32| {
+            seed += 1;
+            values(n, seed, lo, hi)
+        };
+        let fl: Vec<Vec<f32>> = (0..25).map(|_| data(faces, -0.5, 0.5)).collect();
+        let fr: Vec<Vec<f32>> = (0..25).map(|_| data(faces, -0.5, 0.5)).collect();
+        let z: Vec<Vec<f32>> = (0..5).map(|_| data(cells, 0.5, 1.5)).collect();
+        let mut unit = |n: usize| -> Vec<Vec<f32>> {
+            let raw: Vec<Vec<f32>> = (0..3).map(|_| data(n, 0.2, 1.0)).collect();
+            let norm: Vec<f32> = (0..n).map(|q| (raw[0][q] * raw[0][q] + raw[1][q] * raw[1][q] + raw[2][q] * raw[2][q]).sqrt()).collect();
+            raw.iter().map(|r| (0..n).map(|q| r[q] / norm[q]).collect()).collect()
+        };
+        let ends = [unit(edge), unit(edge)];
+        let nw = unit(faces);
+        let flags = |seed: u64| -> Vec<bool> { ints(faces, seed, 16).into_iter().map(|v| v == 0).collect() };
+        let wall = [flags(31), flags(32)];
+        let up = |h: &[Vec<f32>], d: &[usize]| -> Vec<A> { h.iter().map(|v| Array::from_slice_on(ctx, v, shape(d)).unwrap()).collect() };
+        let fa = FaceApply {
+            dir,
+            dims: dims.to_vec(),
+            fl: up(&fl, &fdims),
+            fr: up(&fr, &fdims),
+            z: std::array::from_fn(|k| Array::from_slice_on(ctx, &z[k], shape(dims)).unwrap()),
+            ends: std::array::from_fn(|e| std::array::from_fn(|q| Array::from_slice_on(ctx, &ends[e][q], shape(&edims)).unwrap())),
+            wall: std::array::from_fn(|e| Array::from_slice_on(ctx, &wall[e], shape(&fdims)).unwrap()),
+            nw: std::array::from_fn(|q| Array::from_slice_on(ctx, &nw[q], shape(&fdims)).unwrap()),
+            host: FaceHost { fl, fr, z, ends, wall, nw },
+        };
+        let inputs = fa.fl.iter().chain(&fa.fr).chain(&fa.z).chain(&fa.nw).chain(fa.ends.iter().flatten());
+        inputs.for_each(|a| a.eval().unwrap());
+        fa.wall.iter().for_each(|a| a.eval().unwrap());
+        fa
+    }
+
+    /// The pass of a block line solve over the faces of the direction that reads the state across a boundary: the face matrices applied to the cells
+    /// below and above each face, `zl` and `zr`, the vector `z` extended by the reflected ghost at the line ends (a concat of the end cell) and, at
+    /// the faces of a solid neighbour, by the reflection of the other side (a select of one mask over five fields). 50 coefficient reads and 5
+    /// writes per face.
+    fn apply(&self) -> [A; 5] {
+        let (dir, z) = (self.dir, &self.z);
+        let n = self.dims[dir];
+        let lo_end = reflect_rec(&std::array::from_fn(|k| z[k].slice(dir, 0..1)), &self.ends[0]);
+        let hi_end = reflect_rec(&std::array::from_fn(|k| z[k].slice(dir, n - 1..n)), &self.ends[1]);
+        let zl: [A; 5] = std::array::from_fn(|k| concat(dir, [&lo_end[k], &z[k]]));
+        let zr: [A; 5] = std::array::from_fn(|k| concat(dir, [&z[k], &hi_end[k]]));
+        let (r_of_r, r_of_l) = (reflect_rec(&zr, &self.nw), reflect_rec(&zl, &self.nw));
+        let zl: [A; 5] = std::array::from_fn(|k| select(&self.wall[0], &r_of_r[k], &zl[k]));
+        let zr: [A; 5] = std::array::from_fn(|k| select(&self.wall[1], &r_of_l[k], &zr[k]));
+        std::array::from_fn(|q| {
+            let mut acc = &self.fl[5 * q] * &zl[0] + &self.fr[5 * q] * &zr[0];
+            for j in 1..5 {
+                acc = acc + &self.fl[5 * q + j] * &zl[j] + &self.fr[5 * q + j] * &zr[j];
+            }
+            acc
+        })
+    }
+
+    /// The double precision mirror of [`FaceApply::apply`], component-major over the faces.
+    fn reference(&self) -> Vec<Vec<f32>> {
+        let (dir, hd) = (self.dir, &self.host);
+        let g = Grid::new(&self.dims);
+        let (mut fd, mut ed) = (g.n, g.n);
+        fd[dir] += 1;
+        ed[dir] = 1;
+        let (fg, eg) = (Grid { n: fd, d: g.d }, Grid { n: ed, d: g.d });
+        let last = g.n[dir] - 1;
+        let refl = |v: [f64; 5], n: [f64; 3]| -> [f64; 5] {
+            let dot = v[1] * n[0] + v[2] * n[1] + v[3] * n[2];
+            [v[0], v[1] - 2.0 * dot * n[0], v[2] - 2.0 * dot * n[1], v[3] - 2.0 * dot * n[2], v[4]]
+        };
+        let cell = |c: [usize; 3]| -> [f64; 5] { std::array::from_fn(|k| f64::from(hd.z[k][g.flat(c)])) };
+        let mut out = vec![vec![0.0f32; fg.cells()]; 5];
+        for f in 0..fg.cells() {
+            let c = fg.coords(f);
+            let ghost = |side: usize, at: usize| -> [f64; 5] {
+                let (mut e, mut line) = (c, c);
+                e[dir] = at;
+                line[dir] = 0;
+                refl(cell(e), std::array::from_fn(|q| f64::from(hd.ends[side][q][eg.flat(line)])))
+            };
+            let mut below = if c[dir] == 0 {
+                ghost(0, 0)
+            } else {
+                let mut b = c;
+                b[dir] -= 1;
+                cell(b)
+            };
+            let mut above = if c[dir] == last + 1 { ghost(1, last) } else { cell(c) };
+            let n: [f64; 3] = std::array::from_fn(|q| f64::from(hd.nw[q][f]));
+            let (r_of_above, r_of_below) = (refl(above, n), refl(below, n));
+            if hd.wall[0][f] {
+                below = r_of_above;
+            }
+            if hd.wall[1][f] {
+                above = r_of_below;
+            }
+            for q in 0..5 {
+                out[q][f] = (0..5).map(|j| f64::from(hd.fl[5 * q + j][f]) * below[j] + f64::from(hd.fr[5 * q + j][f]) * above[j]).sum::<f64>() as f32;
+            }
+        }
+        out
+    }
+}
+
+/// `FaceApply` on every direction of a sector-like grid: the `n_apply` pass of a line solve, a record extended across the line ends
+/// (reflected ghost concats and wall selects of one mask over five fields) fused with the 5 x 5 face matrix products.
+fn face_apply(h: &mut Harness, z: &Z) {
+    h.guarded("bc/face_apply", |h| {
+        let ctx = h.ctx.clone();
+        for dir in 0..3 {
+            let small = FaceApply::new(&ctx, &[9, 8, 7], dir);
+            let got: Vec<Vec<f32>> = small.apply().iter().map(|a| a.to_vec().unwrap()).collect();
+            check_rec("bc/face_apply", &got, &small.reference(), 2e-3, 2e-3);
+        }
+        for dir in 0..3 {
+            let dims = sector_dims(z);
+            let fa = FaceApply::new(&ctx, &dims, dir);
+            let faces = cells_of(&dims) / dims[dir] * (dims[dir] + 1);
+            let mut f = || {
+                let gf = fa.apply();
+                eval_all(&gf.iter().collect::<Vec<_>>()).unwrap();
+            };
+            h.case("bc/face_apply", &format!("{}:{}", dims_str(&dims), AXES[dir]), Work::Bytes((faces * 4 * 55) as f64), &mut f);
+        }
+    });
+}
+
+/// The grid of the bowshock sector case (`bench3 --case sector`) on the GPU; the `g3` grid on the CPU and in quick runs.
+fn sector_dims(z: &Z) -> Vec<usize> {
+    if z.cpu || z.quick { z.g3.to_vec() } else { vec![196, 76, 18] }
+}
+
+const FREESTREAM: [f32; 5] = [1.0, 2.0, 0.1, 0.05, 0.714];
+
+/// The characteristic far-field ghost of the interior primitives `w` for the outward unit normal `n` (the bowshock `characteristic_ghost3`):
+/// Riemann invariants on the normal velocity, entropy and tangential velocity from the interior or the free stream, supersonic faces
+/// take one of them. Every field selects between several expressions that share the invariants.
+fn char_ghost(w: &[A; 5], n: &[A; 3]) -> [A; 5] {
+    let (g, g1) = (GAMMA, GAMMA - 1.0);
+    let fs = FREESTREAM;
+    let ci = (g * &w[4] / &w[0]).sqrt();
+    let uni = &w[1] * &n[0] + &w[2] * &n[1] + &w[3] * &n[2];
+    let m = &uni / &ci;
+    let ce = (g * fs[4] / fs[0]).sqrt();
+    let une = fs[1] * &n[0] + fs[2] * &n[1] + fs[3] * &n[2];
+    let r_out = &uni + 2.0 * &ci / g1;
+    let r_in = &une - 2.0 * ce / g1;
+    let un_b = 0.5 * (&r_out + &r_in);
+    let c_b = (0.25 * g1 * (&r_out - &r_in)).maximum(1e-8f32);
+    let from_interior = un_b.ge(0.0f32);
+    let rf: [A; 4] = std::array::from_fn(|k| select(&from_interior, &w[k], fs[k]));
+    let un_ref = select(&from_interior, &uni, &une);
+    let c_ref = select(&from_interior, &ci, ce);
+    let q = &c_b / &c_ref;
+    let q2 = &q * &q;
+    let rho = &rf[0] * (&q2 * &q2 * &q);
+    let dn = &un_b - &un_ref;
+    let riemann = [rho.clone(), &rf[1] + &dn * &n[0], &rf[2] + &dn * &n[1], &rf[3] + &dn * &n[2], &rho * &c_b * &c_b / g];
+    let super_in = m.le(-1.0f32);
+    let super_out = m.ge(1.0f32);
+    std::array::from_fn(|k| select(&super_in, fs[k], select(&super_out, &w[k], &riemann[k])))
+}
+
+/// Host mirror of [`char_ghost`] for one cell.
+fn h_char_ghost(w: [f64; 5], n: [f64; 3]) -> [f64; 5] {
+    let g = f64::from(GAMMA);
+    let fs = FREESTREAM.map(f64::from);
+    let ci = (g * w[4] / w[0]).sqrt();
+    let uni = w[1] * n[0] + w[2] * n[1] + w[3] * n[2];
+    let m = uni / ci;
+    let ce = (g * fs[4] / fs[0]).sqrt();
+    let une = fs[1] * n[0] + fs[2] * n[1] + fs[3] * n[2];
+    let r_out = uni + 2.0 * ci / (g - 1.0);
+    let r_in = une - 2.0 * ce / (g - 1.0);
+    let un_b = 0.5 * (r_out + r_in);
+    let c_b = (0.25 * (g - 1.0) * (r_out - r_in)).max(1e-8);
+    let from_interior = un_b >= 0.0;
+    let rf: [f64; 4] = std::array::from_fn(|k| if from_interior { w[k] } else { fs[k] });
+    let un_ref = if from_interior { uni } else { une };
+    let c_ref = if from_interior { ci } else { ce };
+    let q = c_b / c_ref;
+    let rho = rf[0] * q.powi(5);
+    let dn = un_b - un_ref;
+    let riemann = [rho, rf[1] + dn * n[0], rf[2] + dn * n[1], rf[3] + dn * n[2], rho * c_b * c_b / g];
+    std::array::from_fn(|k| if m <= -1.0 { fs[k] } else if m >= 1.0 { w[k] } else { riemann[k] })
+}
+
+/// The padded primitive record of the 3-D implicit step with its ghost layers written as region assigns on a padded copy (the bowshock
+/// `assign_ghosts3`): the conserved state `u` to primitives, edge pad by two, then the characteristic far field at `i = 0`, `i = ni` and
+/// `j = nj` (one expression of the edge cells over every field) and the reflection about the symmetry planes at `k = 0`, `k = nk`.
+/// Evaluating the record is one kernel that writes the five padded fields.
+struct GhostRegion {
+    dims: Vec<usize>,
+    u: [A; 5],
+    /// Normals of the `i` low, `i` high, `j` high far-field faces (one layer along their axis) and of the two `k` planes.
+    n: [[A; 3]; 5],
+    host_u: Vec<Vec<f32>>,
+    host_n: Vec<Vec<Vec<f32>>>,
+}
+
+impl GhostRegion {
+    fn new(ctx: &Context, dims: &[usize]) -> GhostRegion {
+        let (ni, nj, nk) = (dims[0], dims[1], dims[2]);
+        let host_u = init_host::<5>(dims, 1.0);
+        let planes = [[1, nj, nk], [1, nj, nk], [ni, 1, nk], [ni, nj, 1], [ni, nj, 1]];
+        let mut seed = 777u64;
+        let host_n: Vec<Vec<Vec<f32>>> = planes
+            .iter()
+            .map(|p| {
+                let len = cells_of(p);
+                let raw: Vec<Vec<f32>> = (0..3)
+                    .map(|_| {
+                        seed += 1;
+                        values(len, seed, -1.0, 1.0)
+                    })
+                    .collect();
+                let norm: Vec<f32> = (0..len).map(|q| (raw[0][q] * raw[0][q] + raw[1][q] * raw[1][q] + raw[2][q] * raw[2][q]).sqrt().max(0.1)).collect();
+                raw.iter().map(|r| (0..len).map(|q| r[q] / norm[q]).collect()).collect()
+            })
+            .collect();
+        let n = std::array::from_fn(|s| std::array::from_fn(|a| Array::from_slice_on(ctx, &host_n[s][a], shape(&planes[s])).unwrap()));
+        let gr = GhostRegion { dims: dims.to_vec(), u: upload::<5>(ctx, &host_u, dims), n, host_u, host_n };
+        gr.n.iter().flatten().for_each(|a| a.eval().unwrap());
+        gr
+    }
+
+    fn record(&self) -> [A; 5] {
+        let (ni, nj, nk) = (self.dims[0], self.dims[1], self.dims[2]);
+        let ok = "ghost layer assign";
+        let p = prim(&self.u);
+        let mut w = Fields::pad(&p, [(2, 2), (2, 2), (2, 2)], PadMode::Edge);
+        let edge_lo: [A; 5] = Fields::slice(&Fields::pad(&p, [(2, 0)], PadMode::Edge), 0, 0..2);
+        w.slice_mut(0, ..2).slice(1, 2..nj + 2).slice(2, 2..nk + 2).assign(char_ghost(&edge_lo, &self.n[0])).expect(ok);
+        let edge_hi: [A; 5] = Fields::slice(&Fields::pad(&p, [(0, 2)], PadMode::Edge), 0, ni..ni + 2);
+        w.slice_mut(0, ni + 2..).slice(1, 2..nj + 2).slice(2, 2..nk + 2).assign(char_ghost(&edge_hi, &self.n[1])).expect(ok);
+        let edge_top: [A; 5] = Fields::slice(&Fields::pad(&p, [(0, 0), (0, 2)], PadMode::Edge), 1, nj..nj + 2);
+        w.slice_mut(1, nj + 2..).slice(0, 2..ni + 2).slice(2, 2..nk + 2).assign(char_ghost(&edge_top, &self.n[2])).expect(ok);
+        let mirror_lo: [A; 5] = Fields::slice(&Fields::pad(&p, [(0, 0), (0, 0), (2, 0)], PadMode::Mirror), 2, 0..2);
+        w.slice_mut(2, ..2).slice(0, 2..ni + 2).slice(1, 2..nj + 2).assign(reflect_rec(&mirror_lo, &self.n[3])).expect(ok);
+        let mirror_hi: [A; 5] = Fields::slice(&Fields::pad(&p, [(0, 0), (0, 0), (0, 2)], PadMode::Mirror), 2, nk..nk + 2);
+        w.slice_mut(2, nk + 2..).slice(0, 2..ni + 2).slice(1, 2..nj + 2).assign(reflect_rec(&mirror_hi, &self.n[4])).expect(ok);
+        w
+    }
+
+    /// The double precision mirror of [`GhostRegion::record`], component-major over the padded grid.
+    fn reference(&self) -> Vec<Vec<f32>> {
+        let (ni, nj, nk) = (self.dims[0], self.dims[1], self.dims[2]);
+        let g = Grid::new(&self.dims);
+        let pg = Grid::new(&[ni + 4, nj + 4, nk + 4]);
+        let cells: Vec<Cell<5>> = host::to_cells::<5>(&self.host_u).into_iter().map(host::h_prim).collect();
+        let at = |c: [usize; 3]| cells[g.flat(c)];
+        let normal = |s: usize, c: [usize; 3], plane: [usize; 3]| -> [f64; 3] {
+            let pgrid = Grid::new(&plane);
+            std::array::from_fn(|a| f64::from(self.host_n[s][a][pgrid.flat(c)]))
+        };
+        let reflect = |v: [f64; 5], n: [f64; 3]| -> [f64; 5] {
+            let dot = v[1] * n[0] + v[2] * n[1] + v[3] * n[2];
+            [v[0], v[1] - 2.0 * dot * n[0], v[2] - 2.0 * dot * n[1], v[3] - 2.0 * dot * n[2], v[4]]
+        };
+        let clamp = |c: usize, n: usize| c.saturating_sub(2).min(n - 1);
+        let mut out = vec![vec![0.0f32; pg.cells()]; 5];
+        for q in 0..pg.cells() {
+            let [i, j, k] = pg.coords(q);
+            let (ci, cj, ck) = (clamp(i, ni), clamp(j, nj), clamp(k, nk));
+            let (in_j, in_k) = ((2..nj + 2).contains(&j), (2..nk + 2).contains(&k));
+            let in_i = (2..ni + 2).contains(&i);
+            let v = if i < 2 && in_j && in_k {
+                h_char_ghost(at([0, cj, ck]), normal(0, [0, cj, ck], [1, nj, nk]))
+            } else if i >= ni + 2 && in_j && in_k {
+                h_char_ghost(at([ni - 1, cj, ck]), normal(1, [0, cj, ck], [1, nj, nk]))
+            } else if j >= nj + 2 && in_i && in_k {
+                h_char_ghost(at([ci, nj - 1, ck]), normal(2, [ci, 0, ck], [ni, 1, nk]))
+            } else if k < 2 && in_i && in_j {
+                reflect(at([ci, cj, 1 - k]), normal(3, [ci, cj, 0], [ni, nj, 1]))
+            } else if k >= nk + 2 && in_i && in_j {
+                reflect(at([ci, cj, 2 * nk + 1 - k]), normal(4, [ci, cj, 0], [ni, nj, 1]))
+            } else {
+                at([ci, cj, ck])
+            };
+            for (field, &x) in out.iter_mut().zip(&v) {
+                field[q] = x as f32;
+            }
+        }
+        out
+    }
+}
+
+/// The ghost kernel of the 3-D implicit step: a padded copy of the primitives with five region assigns of shared expressions.
+fn ghost_region(h: &mut Harness, z: &Z) {
+    h.guarded("bc/ghost_region", |h| {
+        let ctx = h.ctx.clone();
+        let small = GhostRegion::new(&ctx, &[9, 8, 7]);
+        let got: Vec<Vec<f32>> = small.record().iter().map(|a| a.to_vec().unwrap()).collect();
+        check_rec("bc/ghost_region", &got, &small.reference(), 3e-3, 3e-3);
+        let dims = sector_dims(z);
+        let gr = GhostRegion::new(&ctx, &dims);
+        let padded: usize = dims.iter().map(|d| d + 4).product();
+        let mut f = || {
+            let w = gr.record();
+            eval_all(&w.iter().collect::<Vec<_>>()).unwrap();
+        };
+        h.case("bc/ghost_region", &dims_str(&dims), Work::Bytes(((cells_of(&dims) + padded) * 5 * 4) as f64), &mut f);
     });
 }
 

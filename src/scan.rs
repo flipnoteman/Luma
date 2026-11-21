@@ -235,7 +235,15 @@ pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) 
             format!("let {name} = {load}({q});")
         }
     };
-    let cell = |name: &str, j: usize| if pass.partial { format!("{name}{j}") } else { name.to_owned() };
+    // A first pass of ops that reduce different roots of the program reads one array of the roots' values per cell.
+    let roots = if pass.partial { None } else { pass.ops.roots() };
+    let cell = |name: &str, j: usize| match &roots {
+        _ if pass.partial => format!("{name}{j}"),
+        Some(roots) => format!("{name}[{}u]", roots[j]),
+        None => name.to_owned(),
+    };
+    let root_of = |j: usize| roots.as_ref().map_or(0, |roots| usize::from(roots[j]));
+    let tiles = roots.as_ref().map_or(1, |_| root_count(&pass.ops) as usize);
     let mapped = |j: usize, cell: String| if ops[j] == ReduceOp::SumSquares { elem.square(&cell) } else { cell };
     let store = |j: usize, at: &str, count: &str, value: String| {
         if pass.split { format!("out{j}[{at}] = {value};") } else { format!("out[{j}u * {count} + {at}] = {value};") }
@@ -273,7 +281,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
             src.push_str("}\n");
         }
         Pass::Rows { width, .. } => {
-            let _ = writeln!(src, "var<workgroup> tile: array<{ty}, {ROWS_TILE}>;");
+            for r in 0..tiles {
+                let name = if roots.is_some() { format!("tile{r}") } else { "tile".to_owned() };
+                let _ = writeln!(src, "var<workgroup> {name}: array<{ty}, {}>;", ROWS_TILE as usize / tiles);
+            }
             let _ = write!(
                 src,
                 "@compute @workgroup_size({width})
@@ -298,19 +309,32 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
                     src,
                     "    for (var j = t; j < cells; j += {width}u) {{
         let row = j / p.n;
-        tile[row * pitch + (j - row * p.n)] = {load}({offset}base + j);
-    }}
+"
+                );
+                if roots.is_some() {
+                    let _ = writeln!(src, "        let v = {load}({offset}base + j);");
+                    for k in 0..tiles {
+                        let _ = writeln!(src, "        tile{k}[row * pitch + (j - row * p.n)] = v[{k}u];");
+                    }
+                } else {
+                    let _ = writeln!(src, "        tile[row * pitch + (j - row * p.n)] = {load}({offset}base + j);");
+                }
+                let _ = write!(
+                    src,
+                    "    }}
     workgroupBarrier();
     if (t < cnt) {{
         let row = t * pitch;
 "
                 );
                 for &j in round {
-                    let _ = writeln!(src, "        acc{j} = {};", mapped(j, "tile[row]".to_owned()));
+                    let tile = if roots.is_some() { format!("tile{}", root_of(j)) } else { "tile".to_owned() };
+                    let _ = writeln!(src, "        acc{j} = {};", mapped(j, format!("{tile}[row]")));
                 }
                 src.push_str("        for (var s = 1u; s < p.n; s++) {\n");
                 for &j in round {
-                    let _ = writeln!(src, "            acc{j} = c{j}(acc{j}, {});", mapped(j, "tile[row + s]".to_owned()));
+                    let tile = if roots.is_some() { format!("tile{}", root_of(j)) } else { "tile".to_owned() };
+                    let _ = writeln!(src, "            acc{j} = c{j}(acc{j}, {});", mapped(j, format!("{tile}[row + s]")));
                 }
                 src.push_str("        }\n    }\n");
                 if r + 1 < rounds.len() {
@@ -744,6 +768,9 @@ enum Input<'b> {
     /// A lazy expression: computed inside the pass when it can be (see [`jit::axis_reduce`]),
     /// else evaluated into a buffer first.
     Pending(&'b Arc<Node>),
+    /// Several lazy operands computed together in the pass (see [`jit::axis_plan`]); the ops of the first pass are
+    /// [merged](ReduceList::merged) over its roots.
+    Plan(&'b jit::AxisPlan),
 }
 
 /// The cells one invocation walks in a blocked pass over strided lines, or `None` when the lines
@@ -763,9 +790,41 @@ fn rows_width(n: u32) -> u32 {
 }
 
 /// Lines of `n` cells a workgroup of the short-line pass stages at once (each row is padded to
-/// an odd length, so the invocations read different banks).
-fn rows_per_group(n: u32) -> u32 {
-    (ROWS_TILE / (n | 1)).min(rows_width(n))
+/// an odd length, so the invocations read different banks); `roots` tiles share the workgroup memory.
+fn rows_per_group(n: u32, roots: u32) -> u32 {
+    (ROWS_TILE / roots / (n | 1)).min(rows_width(n))
+}
+
+/// The roots of the program a first pass of `ops` reduces (1 unless the list is merged over several).
+pub(crate) fn root_count(ops: &ReduceList) -> u32 {
+    ops.roots().map_or(1, |roots| roots.iter().map(|&root| u32::from(root)).max().unwrap_or(0) + 1)
+}
+
+/// Most reductions along an axis recorded together in one kernel (see [`reduce_axis_planned`]): every op keeps an accumulator
+/// per invocation and a workgroup array, and every distinct operand a tile of the short-line pass.
+pub(crate) const AXIS_MULTI: usize = 8;
+
+/// The operator of the reductions, which have none of their own.
+fn no_operator() -> Operator {
+    Operator { source: String::new(), scalar_tys: Vec::new(), scalars: Vec::new(), extremum: false }
+}
+
+/// Reduces the lines `geom` of the `f32` expression `node` with `op` into `out`: the passes of [`Array::reduce_axis`] of one op,
+/// the first computing the expression where it can.
+pub(crate) fn reduce_axis_node(ctx: &Context, node: &Arc<Node>, geom: crate::reduce::AxisGeom, op: ReduceOp, out: Bound<'_>) -> Outcome<()> {
+    let operator = no_operator();
+    let mut run = Lines::new(ctx, &operator, "f32");
+    run.reduce(Input::Pending(node), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, ReduceList::new(&[op]), false, &[out])
+}
+
+/// Reduces the lines `geom` of the operands of `plan` in the passes of [`Array::reduce_axis`]: op `j` of `ops` reduces its own
+/// operand (see [`jit::AxisPlan::roots`]) into `outs[j]`, every op combining the cells of its lines in the order a reduction
+/// of that operand alone does, so the values are the same bits. One kernel computes the operands together (once what they share).
+pub(crate) fn reduce_axis_planned(ctx: &Context, plan: &jit::AxisPlan, geom: crate::reduce::AxisGeom, ops: &[ReduceOp], outs: &[Bound<'_>]) -> Outcome<()> {
+    let operator = no_operator();
+    let mut run = Lines::new(ctx, &operator, "f32");
+    let list = ReduceList::merged(ops, plan.roots(), &vec![crate::builtin::Epilogue::default(); ops.len()]);
+    run.reduce(Input::Plan(plan), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, list, false, outs)
 }
 
 /// Chunks a workgroup of [`Pass::ChunkLookback`] reads the status of at a time, one per
@@ -893,6 +952,10 @@ impl<'a> Lines<'a> {
         let evaluated;
         let input = match input {
             Input::Buffer(input) => input,
+            Input::Plan(plan) => {
+                jit::axis_reduce_planned(self.ctx, plan, pass, geometry, workgroups, size, &writes)?;
+                return Ok(());
+            }
             Input::Pending(node) => {
                 if jit::axis_reduce(self.ctx, node, pass, geometry, workgroups, size, &writes)? {
                     return Ok(());
@@ -920,7 +983,7 @@ impl<'a> Lines<'a> {
         let seq = [n, stride, lines, 1, n];
         if stride == 1 {
             if n <= SHORT_LINE {
-                return self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n), n], out, input, None);
+                return self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n, 1), n], out, input, None);
             }
             if self.ctx.tuning().lookback_scan && n > LOOKBACK_CHUNK && self.grouping_free() {
                 return self.lookback(n, lines, out, input);
@@ -959,7 +1022,7 @@ impl<'a> Lines<'a> {
     fn reduce(&mut self, input: Input<'_>, cells: Cells, ops: ReduceList, partial: bool, outs: &[Bound<'_>]) -> Outcome<()> {
         let Cells { n, stride, lines } = cells;
         if stride == 1 && n <= SHORT_LINE {
-            return self.launch_reduce(Pass::Rows { fold: true, width: rows_width(n) }, ops, partial, [n, 1, lines, rows_per_group(n), n], outs, input);
+            return self.launch_reduce(Pass::Rows { fold: true, width: rows_width(n) }, ops, partial, [n, 1, lines, rows_per_group(n, root_count(&ops)), n], outs, input);
         }
         let (pass, geometry, nb) = if stride == 1 {
             let nb = n.div_ceil(REDUCE_CHUNK);
@@ -1151,6 +1214,17 @@ impl<T: ScalarType> Array<T> {
             dims[axis] = 1;
         }
         let shape = Shape::from(dims);
+        // Left pending where they can be, so that the reductions of one operand (or of expressions that share work) that a program makes
+        // one after another are recorded in one kernel when they are used (see `jit::multireduce`).
+        if (1..=MAX_REDUCTIONS).contains(&N)
+            && axis < 4
+            && !self.is_empty()
+            && let Ok((n, stride, lines)) = self.line_geometry(axis)
+            && let Some(arrays) = self.defer_axis(&ops.map(Reduction::op), crate::reduce::AxisGeom { n, stride, lines }, shape, name, location)
+        {
+            let mut arrays = arrays.into_iter();
+            return std::array::from_fn(|_| arrays.next().expect("one array per reduction"));
+        }
         let result = if (1..=MAX_REDUCTIONS).contains(&N) {
             self.run_axis_reduce(axis, ReduceList::new(&ops.map(Reduction::op)))
         } else {
@@ -1203,6 +1277,10 @@ impl<T: Numeric> Array<T> {
 
     /// The sum along `axis`; the result has extent 1 along it. A pending operand is not
     /// evaluated first: its expression is computed inside the first pass of the reduction.
+    /// An `f32` result stays pending until it is used, like [`Array::sum`]: it is recorded then,
+    /// in one kernel with the axis reductions over the same lines that are pending (`mean_axis`
+    /// and `var_axis` of one array, the three components of a force, a table's column means and
+    /// extrema), each of them with the value it has alone (the same bits on the CPU backend, within an ulp or two on GPU backends).
     #[track_caller]
     pub fn sum_axis(&self, axis: usize) -> Array<T> {
         let [sum] = self.reduce_lines(axis, [Reduction::Sum], "sum_axis", Location::caller());
@@ -1228,7 +1306,9 @@ impl<T: Numeric> Array<T> {
     /// Up to four reductions along `axis` in one pass over the data: result `j` is the
     /// reduction `ops[j]`, with extent 1 along `axis`. Every cell is read once for all of them,
     /// and a pending operand is computed inside that first pass, never stored. Like
-    /// [`sum_axis`](Array::sum_axis), the arrays are evaluated when the call returns; another
+    /// [`sum_axis`](Array::sum_axis), `f32` results are recorded when one of them is used (on a GPU
+    /// backend, outside a step that is being recorded), the others pending over the same lines
+    /// with them in one kernel; any other result is evaluated when the call returns. Another
     /// number of reductions poisons every result with [`LumaError::InvalidShape`].
     ///
     /// [`Reduction::SumOfSquares`] of integers wraps, as [`Array::reduce`] does. Contiguous lines

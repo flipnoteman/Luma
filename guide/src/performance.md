@@ -139,7 +139,7 @@ becomes the load of that kernel.
 | Primitive | Computed inside the kernel | When it runs |
 | --- | --- | --- |
 | `matmul` | each pending operand (a transpose included) is computed in the tile loads | eager: the product is recorded when called and returned evaluated, so what reads it is another kernel |
-| `sum_axis`, `min_axis`, `max_axis`, `reduce_axis`, `mean_axis`, `var_axis`, `std_axis`, `argmax_axis`, `argmin_axis` | the operand, in the first pass over the data | eager: the result is evaluated when the call returns |
+| `sum_axis`, `min_axis`, `max_axis`, `reduce_axis`, `mean_axis`, `var_axis`, `std_axis`, `argmax_axis`, `argmin_axis` | the operand, in the first pass over the data | `f32` on a GPU backend: pending until used, then recorded with the other pending axis reductions over the same lines in one kernel (up to 8 ops); otherwise eager: the result is evaluated when the call returns |
 | `solve_tridiagonal`, `solve_tridiagonal_parts`, `solve_block_tridiagonal_parts` | each pending block/vector entry is computed where a cell's system is loaded | eager: the solution is evaluated when the call returns |
 | `put_add`, `put_min`, `put_max`, `bincount`, `histogram`, `group_*` | the value and the index (or code, or bucket) expressions of the scatter | an in-place write, like `put` |
 | `sort`, `argsort`, `sort_axis` and what builds on them (`quantile`, `quantiles`, `median`, `factorize`, `unique`) | the key expression, in the first pass of the radix sort (`sort_axis` of lines of up to 2048 elements evaluates its operand first) | eager: the sorted array is evaluated; `factorize` and `unique` also read the number of distinct values back, one host wait |

@@ -12,6 +12,13 @@
 //! of the one buffer the kernel wrote. A reduction whose operand depends on another that is not
 //! recorded yet (a variance on a mean) is not taken along: it waits for its own turn, when the
 //! dependencies have run.
+//!
+//! Reductions along an axis (`Array::sum_axis` and the methods built on `reduce_axis`, `f32` on a GPU
+//! backend outside a recording) are left pending the same way, one `Reduced` per op, and recorded
+//! together when they reduce the same lines (`AxisGeom`): at most `scan::AXIS_MULTI` ops in one
+//! kernel, whose first pass computes the distinct operands together (`jit::axis_plan`) and whose
+//! ops each combine their line in the order a reduction alone does, so every result is the same
+//! bits. A program that does not fit one kernel leaves them to record alone.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
@@ -74,15 +81,16 @@ impl JitState {
     /// Whether some registered reduction could be recorded together with `seed`: what is cheap to tell, before the
     /// expressions are walked (see [`JitState::reduction_partners`]).
     pub(crate) fn may_have_partners(&self, seed: &Reduced) -> bool {
-        lock(&self.reductions).iter().filter_map(Weak::upgrade).any(|candidate| !std::ptr::eq(Arc::as_ptr(&candidate), seed) && candidate.partners_with(seed))
+        lock(&self.reductions).iter().filter_map(Weak::upgrade).any(|candidate| !std::ptr::eq(Arc::as_ptr(&candidate), seed) && candidate.partner_of(seed))
     }
 
     /// The registered reductions to record together with `seed` (see the module documentation), oldest first.
     /// Nothing for a `seed` that cannot be merged.
     pub(crate) fn reduction_partners(&self, ctx: &crate::context::Context, seed: &Reduced) -> Vec<Arc<Reduced>> {
-        let cap = ctx.tuning().reduce_multi;
+        let axis = seed.is_axis();
+        let cap = if axis { ctx.tuning().reduce_multi.min(crate::scan::AXIS_MULTI) } else { ctx.tuning().reduce_multi };
         let mut accs = seed.ops().as_slice().len();
-        if accs >= cap || !seed.mergeable(ctx) {
+        if accs >= cap || !(if axis { seed.axis_mergeable(ctx) } else { seed.mergeable(ctx) }) {
             return Vec::new();
         }
         let list: Vec<Arc<Reduced>> = {
@@ -105,7 +113,7 @@ impl JitState {
                 break;
             }
             let ops = candidate.ops().as_slice().len();
-            if std::ptr::eq(Arc::as_ptr(candidate), seed) || accs + ops > cap || !candidate.partners_with(seed) {
+            if std::ptr::eq(Arc::as_ptr(candidate), seed) || accs + ops > cap || !candidate.partner_of(seed) {
                 continue;
             }
             let operand = candidate.operand();
@@ -119,8 +127,10 @@ impl JitState {
             let operand_inputs = self.inputs_within(operand, &inputs, false, max_inputs);
             let (shared_inputs, new_inputs) = overlap(&operand_inputs, &inputs);
             let related = shared > 0 || shared_inputs > 0 || operand.size() <= SMALL;
-            // The kernel binds the partial results, the final values, the counter and the uniform besides.
-            if !related || inputs.len() + new_inputs + 4 > max_inputs || below.len() + new_below >= MAX_NODES {
+            // The kernel binds the partial results, the final values, the counter and the uniform besides (an axis reduction a buffer of
+            // results for every op).
+            let bound = if axis { accs + ops + 2 } else { 4 };
+            if !related || inputs.len() + new_inputs + bound > max_inputs || below.len() + new_below >= MAX_NODES {
                 continue;
             }
             union_into(&mut inputs, &mut tmp, &operand_inputs);

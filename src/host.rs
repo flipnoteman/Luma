@@ -687,7 +687,7 @@ pub(crate) fn try_eval_group(nodes: &[Arc<Node>]) -> bool {
 /// The words a reduction leaves (one per op; the bit of a `bool`'s word), epilogue applied.
 pub(crate) fn reduced_words(reduced: &Reduced, ctx: &Context) -> Option<Vec<u32>> {
     let operand = reduced.operand();
-    if !host_ok(ctx) || operand.len() > MAX_HOST_ELEMS || operand.failure().is_some() {
+    if reduced.is_axis() || !host_ok(ctx) || operand.len() > MAX_HOST_ELEMS || operand.failure().is_some() {
         return None;
     }
     let ty = reduced.ty();

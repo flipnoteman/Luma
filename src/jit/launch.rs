@@ -1794,6 +1794,115 @@ pub(crate) fn axis_reduce(
     Ok(true)
 }
 
+/// The first pass of axis reductions of several operands (pending nodes of one length, `f32`) in one program that
+/// computes them together, once what they share (see [`axis_plan`]).
+pub(crate) struct AxisPlan {
+    /// Taken by the launch.
+    fused: std::cell::RefCell<Option<Fused>>,
+    /// The program's outputs: the distinct roots.
+    outputs: Vec<u32>,
+    /// The root every operand reduces.
+    roots: Vec<u8>,
+}
+
+impl AxisPlan {
+    /// The root (output of the program) that operand `k` reduces.
+    pub(crate) fn roots(&self) -> &[u8] {
+        &self.roots
+    }
+}
+
+/// Plans the first pass that reduces every operand of `operands` along an axis, with `outs` buffers bound for its results
+/// (the passes after it read what it writes): `None` if the program does not fit one kernel (see [`fusable`]), or an
+/// operand is not an `f32` expression that is still pending.
+pub(crate) fn axis_plan(ctx: &crate::context::Context, operands: &[&Arc<Node>], outs: usize) -> Option<AxisPlan> {
+    // One root per distinct operand.
+    let mut distinct: Vec<&Arc<Node>> = Vec::with_capacity(operands.len());
+    let mut operand_root = Vec::with_capacity(operands.len());
+    for node in operands {
+        if node.op().out_ty() != ElemTy::F32 {
+            return None;
+        }
+        let at = match distinct.iter().position(|known| Arc::ptr_eq(known, node)) {
+            Some(at) => at,
+            None => {
+                distinct.push(node);
+                distinct.len() - 1
+            }
+        };
+        operand_root.push(at);
+    }
+    let mut roots = Vec::with_capacity(distinct.len());
+    for node in &distinct {
+        roots.push((Arc::clone(node), node.operands()?));
+    }
+    let placeholder = crate::scan::AxisPass {
+        pass: crate::scan::Pass::Fold,
+        ops: ReduceList::new(&[ReduceOp::Sum]),
+        partial: false,
+        split: false,
+        line_major: false,
+    };
+    let fused = flatten_inner(&roots, Tail::AxisReduce(placeholder), &[]).ok()?;
+    drop(roots);
+    let fits = fused.key.outputs.len() == distinct.len()
+        && fused.key.outputs.iter().all(|&at| fused.key.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::F32))
+        && (fused.key.subs.is_empty() || (fused.key.inlines() && fused.key.staging.is_none()))
+        && fused.key.narrow()
+        && fusable(ctx, &fused, outs);
+    if !fits {
+        return None;
+    }
+    // Equal values are one root.
+    let mut outputs: Vec<u32> = Vec::with_capacity(distinct.len());
+    let mut slot_of_root = Vec::with_capacity(distinct.len());
+    for &at in &fused.key.outputs {
+        let slot = match outputs.iter().position(|&known| known == at) {
+            Some(slot) => slot,
+            None => {
+                outputs.push(at);
+                outputs.len() - 1
+            }
+        };
+        slot_of_root.push(slot);
+    }
+    let roots = operand_root.iter().map(|&root| u8::try_from(slot_of_root[root]).ok()).collect::<Option<Vec<u8>>>()?;
+    Some(AxisPlan { fused: std::cell::RefCell::new(Some(fused)), outputs, roots })
+}
+
+/// Runs the reducing pass `pass` (its ops reduce the roots of `plan`, see [`ReduceList::merged`]) over the cells of the
+/// planned program, as [`axis_reduce`] does for one expression.
+pub(crate) fn axis_reduce_planned(
+    ctx: &crate::context::Context,
+    plan: &AxisPlan,
+    pass: crate::scan::AxisPass,
+    geometry: [u32; 5],
+    workgroups: [u32; 3],
+    size: [u32; 3],
+    outs: &[RawArg<'_>],
+) -> Result<(), Failure> {
+    let Some(fused) = plan.fused.borrow_mut().take() else {
+        return Err(Failure::New(LumaError::Gpu("an axis reduction was planned once and launched twice".into())));
+    };
+    fused.mark_fused();
+    let Fused { mut key, inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
+    drop((fused_nodes, instr_nodes, sub_roots));
+    key.outputs.clone_from(&plan.outputs);
+    key.tail = Tail::AxisReduce(pass);
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+    let pins = pin_inputs(&key, &inputs, None, 0, 0)?;
+    let mut uniform = Vec::with_capacity(geometry.len() + scalars.len());
+    uniform.extend_from_slice(&geometry);
+    uniform.extend_from_slice(&scalars);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + 1);
+    raw.extend_from_slice(outs);
+    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
+    ctx.launch(&core, workgroups, size, &raw)?;
+    ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Records one kernel of the first radix sort pass over the expression behind `node`, computing
 /// the keys in the kernel instead of reading a buffer: the kernel of `pass` (counting or
 /// scattering) launched on `groups` workgroups with the uniform `words` (see `sort::PARAMS`)
