@@ -80,6 +80,83 @@ fn logreg(h: &mut Harness, n: usize, d: usize, iterate: bool) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Softmax regression
+// ---------------------------------------------------------------------------------------------
+
+/// Features (`n x d`, row-major) and class labels (`c` classes) of a softmax regression.
+fn softmax_data(n: usize, d: usize, c: usize) -> (Vec<f32>, Vec<u32>) {
+    (values(n * d, 81, -1.0, 1.0), ints(n, 82, c as u32))
+}
+
+/// `steps` of full-batch gradient descent from zero weights on the host: the `c x d` weights
+/// (row-major `c x d`; the device weights are `[c, d]`, the transpose).
+fn softmax_host(xs: &[f32], ys: &[u32], d: usize, c: usize, steps: usize, lr: f64) -> Vec<f64> {
+    let n = ys.len();
+    let mut w = vec![0.0f64; c * d];
+    for _ in 0..steps {
+        let mut g = vec![0.0f64; c * d];
+        for (row, &y) in xs.chunks(d).zip(ys) {
+            let z: Vec<f64> = (0..c).map(|k| row.iter().zip(&w[k * d..]).map(|(&x, w)| f64::from(x) * w).sum()).collect();
+            let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = z.iter().map(|v| (v - m).exp()).collect();
+            let total: f64 = e.iter().sum();
+            for k in 0..c {
+                let r = e[k] / total - f64::from(u8::from(k as u32 == y));
+                for (g, &x) in g[k * d..][..d].iter_mut().zip(row) {
+                    *g += r * f64::from(x);
+                }
+            }
+        }
+        for (w, g) in w.iter_mut().zip(&g) {
+            *w -= lr * g / n as f64;
+        }
+    }
+    w
+}
+
+/// The device loop: logits, a softmax along the classes, the one-hot residual and the gradient
+/// (`Xᵀ R`), `steps` times; `x` is `[d, n]`, `onehot` `[c, n]`, the weights `[c, d]`.
+fn softmax_fit(ctx: &Context, x: &Array<f32>, onehot: &Array<f32>, n: usize, steps: usize, lr: f32) -> Array<f32> {
+    let [d, c] = [x.shape().dims()[0], onehot.shape().dims()[0]];
+    let xt = x.transpose();
+    let mut w = Array::<f32>::zeros_on(ctx, [c, d]).unwrap();
+    for _ in 0..steps {
+        let z = matmul(x, &w);
+        let e = (&z - &z.max_axis(0)).exp();
+        let p = &e / &e.sum_axis(0);
+        w = &w - &(&matmul(&xt, &(&p - onehot)) * (lr / n as f32));
+        w.eval().unwrap();
+    }
+    w
+}
+
+fn softmax(h: &mut Harness, n: usize, d: usize, c: usize, steps: usize) {
+    let n = size(h, n / 16, n, n / 4);
+    let flops = 4.0 * (n * d * c) as f64 * steps as f64;
+    if !fits(h, flops) {
+        return;
+    }
+    let case = "classic/softmax";
+    let size = format!("N{n} D{d} C{c} x{steps}");
+    h.guarded(&format!("{case} {size}"), |h| {
+        let lr = 1.0f32;
+        // Two steps on a small problem against the host.
+        let (cn, cs) = (2048, 2);
+        let (cx, cy) = softmax_data(cn, d, c);
+        let x = arr(h, &cx, [d, cn]);
+        let onehot = |ys: &[u32], n: usize| select(&range(h, [c, n], 0).eq(&arr_u32(h, ys, [1, n])), 1.0f32, 0.0f32);
+        let got = softmax_fit(&h.ctx, &x, &onehot(&cy, cn), cn, cs, lr).to_vec().unwrap();
+        let want = softmax_host(&cx, &cy, d, c, cs, f64::from(lr));
+        let want: Vec<f64> = (0..c * d).map(|i| want[(i % c) * d + i / c]).collect();
+        check64(case, &got, &want, 2e-3, 2e-4);
+        let (xs, ys) = softmax_data(n, d, c);
+        let (x, y) = (arr(h, &xs, [d, n]), onehot(&ys, n));
+        let ctx = h.ctx.clone();
+        h.case(case, &size, Work::Flops(flops), &mut || softmax_fit(&ctx, &x, &y, n, steps, lr).eval().unwrap());
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
 // k-means
 // ---------------------------------------------------------------------------------------------
 
@@ -227,6 +304,8 @@ pub fn run(h: &mut Harness) {
     logreg(h, 262_144, 32, false);
     logreg(h, 1 << 20, 16, false);
     logreg(h, 262_144, 32, true);
+    softmax(h, 200_000, 64, 10, 20);
+    softmax(h, 1_000_000, 128, 20, 10);
     kmeans(h, 262_144, 16, 64, false);
     kmeans(h, 262_144, 16, 64, true);
     kmeans(h, 1 << 20, 8, 16, false);
