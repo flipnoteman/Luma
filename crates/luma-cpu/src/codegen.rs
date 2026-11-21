@@ -15,7 +15,7 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::types::{self, F32X4, F64X2, I32X4};
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp, Block, BlockArg, ConstantData, Endianness, Function, InstBuilder,
+    AbiParam, ValueDef, AtomicRmwOp, Block, BlockArg, ConstantData, Endianness, Function, InstBuilder,
     MemFlagsData, SigRef, Signature, Type, UserFuncName, Value,
 };
 use cranelift_codegen::isa::OwnedTargetIsa;
@@ -456,6 +456,8 @@ struct Lower<'a, 'f> {
     /// Loads of `load_leaf` read a binding nothing writes during the launch (a uniform), so
     /// they may be shared and hoisted.
     ro_loads: bool,
+    /// Per value: whether it is computed from the lane ids and uniforms alone (no memory read).
+    computed: HashMap<Value, bool>,
 }
 
 impl<'a, 'f> Lower<'a, 'f> {
@@ -502,6 +504,7 @@ impl<'a, 'f> Lower<'a, 'f> {
             sigs: HashMap::new(),
             limits: HashMap::new(),
             ro_loads: false,
+            computed: HashMap::new(),
         }
     }
 
@@ -2656,14 +2659,59 @@ impl<'a, 'f> Lower<'a, 'f> {
         self.b.ins().iadd(base, e)
     }
 
+    /// Whether `v` is computed from the packet's lane ids, uniforms and constants alone, with no
+    /// read of data memory behind it (a clamped or wrapped view coordinate, as opposed to an
+    /// index loaded from an array, which is rarely consecutive). Block parameters other than the
+    /// packet counter count as data.
+    fn is_computed(&mut self, v: Value) -> bool {
+        let mut stack = vec![v];
+        let mut seen: Vec<Value> = Vec::new();
+        while let Some(x) = stack.pop() {
+            match self.computed.get(&x) {
+                Some(true) => continue,
+                Some(false) => {
+                    self.computed.insert(v, false);
+                    return false;
+                }
+                None => {}
+            }
+            let dfg = &self.b.func.dfg;
+            let clean = match dfg.value_def(x) {
+                ValueDef::Param(..) => {
+                    x == self.pkt || x == self.ctx
+                }
+                ValueDef::Result(inst, _) => {
+                    let data = &dfg.insts[inst];
+                    if data.opcode().can_load() {
+                        data.memflags_data(dfg).is_some_and(|f| f.readonly())
+                    } else {
+                        stack.extend_from_slice(dfg.inst_args(inst));
+                        seen.push(x);
+                        continue;
+                    }
+                }
+                ValueDef::Union(..) => false,
+            };
+            if !clean {
+                self.computed.insert(v, false);
+                return false;
+            }
+            seen.push(x);
+        }
+        for x in seen {
+            self.computed.insert(x, true);
+        }
+        true
+    }
+
     /// `binding[idx]` with 128-bit loads when the index is contiguous across the packet: known
-    /// to be, or (for an index the codegen could not follow, such as a clamped or wrapped one)
-    /// checked at run time, with the lane-by-lane gather as the fallback.
+    /// to be, or (for an index computed from lane ids the codegen could not follow, such as a
+    /// clamped or wrapped one) checked at run time, with the lane-by-lane gather as the fallback.
     fn load_elem(&mut self, base: Value, idx: Leaf, stride: u32, ty: &KirType) -> Val {
         let Some(s) = Self::contig_scalar(ty, stride) else {
             return self.mem_read(base, 0, &[(idx.a, stride)], ty);
         };
-        if idx.k == Kind::Uni {
+        if idx.k == Kind::Uni || (idx.k == Kind::Gen && !self.is_computed(idx.a)) {
             return self.mem_read(base, 0, &[(idx.a, stride)], ty);
         }
         let mut cond = self.fast_cond(base, idx);
