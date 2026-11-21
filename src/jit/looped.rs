@@ -226,6 +226,9 @@ impl Drop for Node {
         if let Some((plan, j)) = self.looped.get() {
             plan.release(*j);
         }
+        if self.result.get().is_none() {
+            self.settled();
+        }
         super::bits::recycle(std::mem::take(&mut self.ids));
     }
 }

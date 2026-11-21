@@ -163,6 +163,7 @@ mod operator;
 mod multireduce;
 mod pack;
 mod params;
+mod plancache;
 
 /// Whether an array of `len` elements has indices that need the exact division (see `params::DivRemSpec`).
 pub(crate) fn is_wide(len: usize) -> bool {
@@ -181,6 +182,8 @@ mod until;
 pub(crate) mod transpose;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod plancache_tests;
 
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1093,7 +1096,20 @@ impl Node {
         if self.result.get().is_none() {
             crate::host::try_eval_node(self);
         }
-        self.result.get_or_init(|| self.compute())
+        let mut ran = false;
+        let result = self.result.get_or_init(|| {
+            ran = true;
+            self.compute()
+        });
+        if ran {
+            self.settled();
+        }
+        result
+    }
+
+    /// Notes that the node stopped being pending (it got its result): see [`JitState::pending_nodes`].
+    pub(crate) fn settled(&self) {
+        self.ctx.jit().pending_nodes.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Unique per node.
@@ -1134,6 +1150,7 @@ impl Node {
                 if let Err(error) = check_finite(&self.ctx, &storage, self.op.out_ty()) {
                     return Err(Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) }));
                 }
+                plancache::finished(self, &storage);
                 storage.set_producer(self.id);
                 storage.readers.absorb(&self.readers);
                 Ok(storage)
@@ -1153,6 +1170,7 @@ impl Node {
     fn fail(&self, error: LumaError) {
         let failed = Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) });
         if self.result.set(Err(failed)).is_ok() {
+            self.settled();
             lock(&self.args).take();
         }
     }
@@ -1166,6 +1184,8 @@ impl Node {
     /// [`Node::finish`] for a buffer that others hold too.
     pub(crate) fn finish_shared(&self, storage: Arc<Storage>) {
         if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
+            self.settled();
+            plancache::finished(self, &storage);
             storage.set_producer(self.id);
             storage.readers.absorb(&self.readers);
             lock(&self.args).take();
@@ -1941,6 +1961,7 @@ pub(crate) fn create(
         }
     }
     jit.with_live(|live| live.add_weak(weak.clone()));
+    jit.pending_nodes.fetch_add(1, Ordering::Relaxed);
     if let Some(hash) = cons_key {
         jit.cons_insert(if cut { cons_hash(&op, len, &args) } else { hash }, weak);
     }
@@ -2130,6 +2151,7 @@ pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate
     });
     let _ = node.deferred.set(reduced);
     ctx.jit().with_live(|live| live.add_weak(Arc::downgrade(&node)));
+    ctx.jit().pending_nodes.fetch_add(1, Ordering::Relaxed);
     node
 }
 
@@ -2465,6 +2487,17 @@ pub(crate) struct JitState {
     speculation: Mutex<speculate::Tracker>,
     /// The programs of register loops that ran before, by call site (see [`rerun`]).
     reruns: Mutex<rerun::Cache>,
+    /// The plans of the evaluations `eval` made (see [`plancache`]).
+    plans: Mutex<plancache::Table>,
+    /// Whether evaluations use [`JitState::plans`] (`LUMA_PLAN_CACHE=off` switches it off).
+    plan_cache: AtomicBool,
+    /// Changes whenever a setting that decides how graphs are planned does: part of every key of
+    /// [`JitState::plans`].
+    plan_epoch: AtomicU64,
+    plan_stats: plancache::Stats,
+    /// Nodes of this context that are alive and pending (see [`Node::settled`]): the plan cache
+    /// replays only if the graph it walked is all of them.
+    pending_nodes: std::sync::atomic::AtomicI64,
 }
 
 /// Counters of the fusion machinery, read by tests.
@@ -2564,6 +2597,11 @@ impl JitState {
                 !std::env::var(SPECULATE_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
             )),
             reruns: Mutex::new(rerun::Cache::default()),
+            plans: Mutex::new(plancache::Table::default()),
+            plan_cache: AtomicBool::new(!std::env::var(plancache::ENV).is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))),
+            plan_epoch: AtomicU64::new(0),
+            plan_stats: plancache::Stats::default(),
+            pending_nodes: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -2772,6 +2810,7 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_cost_override(&self, model: cost::CostModel) {
         *lock(&self.cost_override) = Some(model);
+        self.plan_epoch.fetch_add(1, Ordering::Relaxed);
         lock(&self.judgements).clear();
         lock(&self.fast_kernels).clear();
     }
@@ -2799,6 +2838,7 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_staging(&self, on: bool) {
         self.staging.store(on, Ordering::Relaxed);
+        self.plan_epoch.fetch_add(1, Ordering::Relaxed);
         lock(&self.judgements).clear();
         lock(&self.fast_kernels).clear();
     }
@@ -2865,6 +2905,23 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_speculate(&self, on: bool) {
         lock(&self.speculation).enabled = on;
+    }
+
+    /// Switches the plan cache on or off (see [`plancache`]); dropping every plan.
+    pub(crate) fn set_plan_cache(&self, on: bool) {
+        self.plan_cache.store(on, Ordering::Relaxed);
+        lock(&self.plans).clear();
+    }
+
+    /// What the plan cache did so far.
+    pub(crate) fn plan_stats(&self) -> plancache::StatsSnapshot {
+        self.plan_stats.snapshot()
+    }
+
+    /// Plans held by the cache (tests).
+    #[cfg(test)]
+    pub(crate) fn plan_entries(&self) -> usize {
+        lock(&self.plans).len()
     }
 
     #[cfg(test)]
@@ -2945,6 +3002,11 @@ impl JitState {
         if !others.is_empty() {
             lock(&self.requested).nodes.extend(others);
         }
+        plancache::evaluate(self, pending, |pending| self.evaluate_pending(pending));
+    }
+
+    /// Computes `pending` (pending nodes of this thread), those of one length together.
+    fn evaluate_pending(&self, mut pending: Vec<Arc<Node>>) {
         while let Some(first) = pending.first() {
             let len = first.len;
             let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);

@@ -969,6 +969,17 @@ fn settle_staging(key: &mut FusedKey, len: usize) {
 /// output takes over the buffer of an input that nothing else holds (see [`in_place_eligible`]),
 /// instead of a new one.
 pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
+    if !super::plancache::recording() {
+        return run_store_planned(ctx, len, fused);
+    }
+    let step = super::plancache::begin_store(len, &fused);
+    let result = run_store_planned(ctx, len, fused);
+    super::plancache::end_store(step, &result);
+    result
+}
+
+/// [`run_store`] without the plan cache's recording.
+fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) -> Result<Vec<Storage>, Failure> {
     fused.mark_fused();
     let Fused { mut key, mut inputs, mut scalars, fused_nodes, instr_nodes, sub_roots } = fused;
     // The fused nodes hold their operands; a dying input is only uniquely owned without them.
@@ -988,6 +999,7 @@ pub(super) fn run_store(ctx: &crate::context::Context, len: usize, fused: Fused)
             match Arc::try_unwrap(inputs.remove(k)) {
                 Ok(storage) => {
                     ctx.jit().note_write();
+                    super::plancache::taint("a launch took over the buffer of an input");
                     key.in_place = vec![(k as u32, 0)];
                     reused = Some(storage);
                 }
@@ -1059,7 +1071,9 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
     check_finite(ctx, target, node.op().out_ty())?;
     // Another thread cannot have evaluated this node: its operands were taken above.
-    let _ = node.result.set(Ok(Arc::clone(target)));
+    if node.result.set(Ok(Arc::clone(target))).is_ok() {
+        node.settled();
+    }
     Ok(())
 }
 

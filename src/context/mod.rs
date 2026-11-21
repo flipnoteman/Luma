@@ -649,6 +649,19 @@ impl Context {
         &self.inner.jit
     }
 
+    /// Switches the plan cache of eager evaluation on or off (it is on unless
+    /// `LUMA_PLAN_CACHE=off`), dropping the plans it holds. Results are bit-identical either way.
+    #[doc(hidden)]
+    pub fn set_plan_cache(&self, on: bool) {
+        self.jit().set_plan_cache(on);
+    }
+
+    /// How many evaluations ran from a cached plan so far.
+    #[doc(hidden)]
+    pub fn plan_cache_hits(&self) -> u64 {
+        self.jit().plan_stats().hits
+    }
+
     /// Submits the pending batch to the GPU and returns without waiting for it, so the GPU
     /// starts working while the host keeps recording. Everything recorded afterwards runs after
     /// it, in order. Does nothing if nothing is pending.
