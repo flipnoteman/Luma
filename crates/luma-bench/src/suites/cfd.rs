@@ -2,7 +2,9 @@
 //! pattern) on 2-D and 3-D structured grids, as the regression ledger for the PDE side of Luma.
 //!
 //! * `heat`, `euler`, `muscl`: explicit stencil steps replayed by `iterate_all` (ghost cells by
-//!   record assigns, Rusanov and MUSCL residuals, 5- and 7-point heat), plus the host-driven loop.
+//!   record assigns, Rusanov and MUSCL residuals, 5- and 7-point heat), plus the host-driven loop
+//!   (`*_per_step`) and, for `euler` and `muscl`, the host cost of recording a step alone
+//!   (`*_build_step`: the lazy graph of the steps built and dropped without evaluating them).
 //! * `adi`: implicit heat, a tridiagonal solve along every axis in the delta form.
 //! * `lines`, `parts`: block-tridiagonal line solves of blocks 1 to 5 along contiguous and strided
 //!   axes on stacked arrays and on parts (evaluated and lazy coefficients).

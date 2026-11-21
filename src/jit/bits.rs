@@ -74,6 +74,10 @@ pub(super) fn recycle(buffer: Box<[u64]>) {
 /// `dst |= src` word by word, over the shorter of the two.
 #[inline]
 pub(super) fn or_into(dst: &mut [u64], src: &[u64]) {
+    // Most sets are a few words: not worth a call into the vector code.
+    if src.len() <= 4 {
+        return or_into_generic(dst, src);
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2.

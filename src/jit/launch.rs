@@ -86,7 +86,7 @@ pub(super) fn loop_ops(ctx: &crate::context::Context, key: &FusedKey, states: &[
         return None;
     }
     let cost = ctx.cost_model();
-    Some(key.instrs.iter().map(|instr| super::cost::op_weight(instr.op, &cost)).sum())
+    Some(key.instrs.iter().map(|instr| super::cost::op_weight(&instr.op, &cost)).sum())
 }
 
 /// Runs `steps` iterations of the store program `fused` (one output per state, `outputs[j]` the

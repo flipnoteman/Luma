@@ -45,7 +45,9 @@
 //!   multi-output kernel, and the rest is flattened again (up to four times).
 //! * Operations that are the same (same operation, length and operands, scalars by value) are one
 //!   node: `create` looks them up in a table of weak references that is dropped whenever a buffer
-//!   is written (`JitState::note_write`), and skips nodes computed inside another kernel. A
+//!   is written (`JitState::note_write`), and skips nodes computed inside another kernel. The
+//!   lookup is skipped while a node operand has no consumer yet (an equal operation would be one),
+//!   and the masks of region assignments are remembered by their box (`MaskKey`). A
 //!   fused kernel computes a shared node once; a pending node that an expression outside the one
 //!   being flattened also reads is evaluated first only if computing it once more costs more than
 //!   writing and reading it back (`worth_storing`, the rule of circular shifts; the work of an
@@ -1537,7 +1539,7 @@ impl Drop for Flattening {
 }
 
 thread_local! {
-    static MEASURED: std::cell::RefCell<Measured> = std::cell::RefCell::default();
+    static MEASURED: std::cell::RefCell<Measured> = const { std::cell::RefCell::new(Measured { inputs: Vec::new(), below: Vec::new(), decoded: Vec::new(), tmp: Vec::new() }) };
 }
 
 /// What an operation on some operands has below it: the counts, and the ids as a [`Node`] keeps
@@ -1555,6 +1557,117 @@ struct Measure {
 
 /// The distinct nodes below and distinct buffers read by an operation on `args`.
 fn measure(args: &[Src]) -> Measure {
+    measure_nodes(args).unwrap_or_else(|| measure_any(args))
+}
+
+/// The number of ids in the union of the sorted lists `a` and `b`.
+fn union_len(a: &[u64], b: &[u64]) -> usize {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while let (Some(&x), Some(&y)) = (a.get(i), b.get(j)) {
+        i += usize::from(x <= y);
+        j += usize::from(y <= x);
+        n += 1;
+    }
+    n + (a.len() - i) + (b.len() - j)
+}
+
+/// Writes the union of the sorted lists `a` and `b` to `out` (which holds exactly [`union_len`] ids).
+fn union_write(a: &[u64], b: &[u64], out: &mut [u64]) {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while let (Some(&x), Some(&y)) = (a.get(i), b.get(j)) {
+        if let Some(slot) = out.get_mut(n) {
+            *slot = x.min(y);
+        }
+        i += usize::from(x <= y);
+        j += usize::from(y <= x);
+        n += 1;
+    }
+    for (slot, &id) in out.iter_mut().skip(n).zip(a.get(i..).unwrap_or(&[]).iter().chain(b.get(j..).unwrap_or(&[]))) {
+        *slot = id;
+    }
+}
+
+/// [`measure`] for the operations nearly every expression is made of: one or two pending
+/// operands (scalars beside them) whose sets are bit sets, read without a buffer operand. Merges
+/// the buffers on the stack instead of through the thread's working memory. `None` if `args` are
+/// anything else.
+#[inline]
+fn measure_nodes(args: &[Src]) -> Option<Measure> {
+    let mut nodes: [Option<&Arc<Node>>; 2] = [None; 2];
+    let mut count = 0;
+    let (mut buffers, mut n_buffers) = ([0u64; 3], 0);
+    for arg in args {
+        match arg {
+            Src::Scalar(_) => {}
+            Src::Buffer(storage) => {
+                *buffers.get_mut(n_buffers)? = storage.binding_id();
+                n_buffers += 1;
+            }
+            Src::Node(node) => {
+                if nodes.iter().take(count).flatten().any(|first| Arc::ptr_eq(first, node)) {
+                    continue;
+                }
+                *nodes.get_mut(count)? = Some(node);
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        // Buffers and scalars only: the sorted distinct buffers are all there is.
+        let found = buffers.get_mut(..n_buffers)?;
+        found.sort_unstable();
+        let mut distinct = 0;
+        for at in 0..found.len() {
+            if at == 0 || found[at] != found[at - 1] {
+                found[distinct] = found[at];
+                distinct += 1;
+            }
+        }
+        let mut ids = bits::zeroed(distinct);
+        ids.copy_from_slice(&found[..distinct]);
+        return Some(Measure { below: 0, inputs: distinct, ids, base: 0, words: 0, sparse: true });
+    }
+    if n_buffers > 0 {
+        return None;
+    }
+    let [Some(first), second] = nodes else { return None };
+    if first.below_sparse || second.is_some_and(|node| node.below_sparse) {
+        return None;
+    }
+    // The buffers: the operand's own, or the union of both operands'.
+    let (a, b) = (first.inputs(), second.map_or(&[][..], |node| node.inputs()));
+    let merged = !(a == b || b.is_empty() || a.is_empty());
+    let inputs_len = if merged { union_len(a, b) } else { a.len().max(b.len()) };
+    let (mut lo, mut hi, mut upper, mut used) = (u64::MAX, 0u64, 0usize, 0usize);
+    for node in [Some(first), second].into_iter().flatten() {
+        (lo, hi, upper) = (lo.min(node.id), hi.max(node.id), upper + 1 + node.below_len());
+        used += 1 + node.below_part().len();
+        if let Some((first, last)) = node.below_span() {
+            (lo, hi) = (lo.min(first), hi.max(last));
+        }
+    }
+    let width = ((hi >> 6) - (lo >> 6) + 1) as usize;
+    if width > 2 * used + 8 {
+        return None;
+    }
+    let base = lo & !63;
+    let mut ids = bits::zeroed(width + inputs_len);
+    let (dense, tail) = ids.split_at_mut(width);
+    for node in [Some(first), second].into_iter().flatten() {
+        mark(dense, base, node.id);
+        node.mark_below(dense, base);
+    }
+    if merged {
+        union_write(a, b, tail);
+    } else {
+        tail.copy_from_slice(if a.is_empty() { b } else { a });
+    }
+    let below = if second.is_none() { upper } else { bits::count_ones(dense) };
+    Some(Measure { below, inputs: inputs_len, ids, base, words: width as u32, sparse: false })
+}
+
+/// [`measure`] for any operands.
+fn measure_any(args: &[Src]) -> Measure {
     MEASURED.with_borrow_mut(|m| {
         let Measured { inputs, below, decoded, tmp } = m;
         inputs.clear();
@@ -1817,37 +1930,52 @@ fn convert_evaluated(args: &mut Args, arity: usize) -> std::result::Result<(), F
 ///
 /// This is where fusion is limited: operands that already have a consumer, and the biggest operand
 /// while the expression is too large, are evaluated first (see the module documentation).
+#[inline(always)]
 pub(crate) fn create(
     ctx: &Context,
     len: usize,
-    mut op: Op,
+    op: Op,
+    args: Args,
+    name: &'static str,
+    location: &'static Location<'static>,
+) -> std::result::Result<Arc<Node>, Failure> {
+    // By reference: an `Op` is big, and passing it by value copies it for every callee.
+    create_with(ctx, len, &op, args, name, location)
+}
+
+fn create_with(
+    ctx: &Context,
+    len: usize,
+    first_op: &Op,
     mut args: Args,
     name: &'static str,
     location: &'static Location<'static>,
 ) -> std::result::Result<Arc<Node>, Failure> {
     let jit = ctx.jit();
-    let mut arity = op.kind.arity();
+    let mut arity = first_op.kind.arity();
 
     // Operands evaluated since they were created become plain buffers.
     convert_evaluated(&mut args, arity)?;
 
     // Algebraic simplification (see [`simplify`]); the operands a rewrite takes from a pending
     // operand may have been evaluated since it was created.
+    let mut rewritten_op: Option<Op> = None;
     if jit.simplify_enabled() {
         let mut rounds = 0;
         while rounds < 4
-            && let Some((rewritten, operands)) = simplify::rewrite(&op, &args, ctx.fast_math())
+            && let Some((rewritten, operands)) = simplify::rewrite(rewritten_op.as_ref().unwrap_or(first_op), &args, ctx.fast_math())
         {
-            op = rewritten;
+            rewritten_op = Some(rewritten);
             args = operands;
             rounds += 1;
         }
         if rounds > 0 {
-            arity = op.kind.arity();
+            arity = rewritten_op.as_ref().unwrap_or(first_op).kind.arity();
             convert_evaluated(&mut args, arity)?;
         }
     }
-    check_supported(ctx, &op, name).map_err(Failure::New)?;
+    let op: &Op = rewritten_op.as_ref().unwrap_or(first_op);
+    check_supported(ctx, op, name).map_err(Failure::New)?;
     // A shift reads its source at other elements than the one it computes, which a window cannot
     // (see `pack`): the source gets the buffer of its own.
     if matches!(op.kind, OpKind::Shift(_))
@@ -1857,9 +1985,13 @@ pub(crate) fn create(
     }
 
     // Equal operations on identical operands are one node (see `ConsTable`).
-    let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(&op, len, &args));
+    let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));
+    // An equal node would read every node operand too, which counts it as a consumer: an operand
+    // nobody reads yet has no equal operation to find.
+    let may_exist = args.iter().take(arity).all(|arg| !matches!(arg, Src::Node(node) if node.consumers.load(Ordering::Relaxed) == 0));
     if let Some(hash) = cons_key
-        && let Some(found) = jit.cons_lookup(hash, &op, len, &args)
+        && may_exist
+        && let Some(found) = jit.cons_lookup(hash, op, len, &args)
     {
         rerun::reused(&found);
         return Ok(found);
@@ -1877,7 +2009,7 @@ pub(crate) fn create(
         (first, false, None)
     } else {
         drop(first);
-        settle(ctx, &op, &mut args, arity, name, location, max_nodes, max_inputs)?
+        settle(ctx, op, &mut args, arity, name, location, max_nodes, max_inputs)?
     };
     if cut {
         // Without this, a long chain built without `eval` keeps the GPU idle until its end.
@@ -1901,7 +2033,7 @@ pub(crate) fn create(
     let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight).min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
     let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
 
-    let trace = rerun::created(&op, len, &args, arity);
+    let trace = rerun::created(op, len, &args, arity);
     // Built where it lives: the node is bigger than what a move of it copies cheaply.
     let node = {
         let ptr = Arc::into_raw(Arc::<Node>::new_uninit()).cast::<Node>().cast_mut();
@@ -1912,7 +2044,7 @@ pub(crate) fn create(
             std::ptr::addr_of_mut!((*ptr).trace).write(trace);
             std::ptr::addr_of_mut!((*ptr).thread).write(current_thread());
             std::ptr::addr_of_mut!((*ptr).ctx).write(ctx.clone());
-            std::ptr::addr_of_mut!((*ptr).op).write(op);
+            std::ptr::addr_of_mut!((*ptr).op).write(*op);
             std::ptr::addr_of_mut!((*ptr).len).write(len);
             std::ptr::addr_of_mut!((*ptr).args).write(Mutex::new(Some(args.clone())));
             std::ptr::addr_of_mut!((*ptr).result).write(OnceLock::new());
@@ -1962,7 +2094,7 @@ pub(crate) fn create(
     jit.with_live(|live| live.add_weak(weak.clone()));
     jit.pending_nodes.fetch_add(1, Ordering::Relaxed);
     if let Some(hash) = cons_key {
-        jit.cons_insert(if cut { cons_hash(&op, len, &args) } else { hash }, weak);
+        jit.cons_insert(if cut { cons_hash(op, len, &args) } else { hash }, weak);
     }
     Ok(node)
 }
@@ -2222,13 +2354,38 @@ fn cons_same(op: &Op, a: &Args, b: &Args) -> bool {
 struct ConsTable {
     epoch: u64,
     map: FxMap<u64, Weak<Node>>,
+    /// The masks of region assignments (see [`MaskKey`]).
+    masks: FxMap<MaskKey, Weak<Node>>,
     /// Entries at which dead ones are pruned before the next insert: [`CONS_PRUNE_AT`], or twice
     /// what survived the last pruning (a table of live entries is not scanned at every insert).
     prune_at: usize,
 }
 
+impl ConsTable {
+    /// Forgets every entry: buffers changed since they were made (`epoch` is the new one).
+    fn clear_for(&mut self, epoch: u64) {
+        self.map.clear();
+        self.masks.clear();
+        self.epoch = epoch;
+    }
+}
+
+/// What the mask of a region assignment is a function of: the extents of the base and, per axis,
+/// the inclusive range of base coordinates the region covers (see `Array::assign_lazy`).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct MaskKey {
+    dims: [u32; 4],
+    pub(crate) ends: [(i64, i64); 4],
+}
+
+impl MaskKey {
+    pub(crate) fn new(dims: [u32; 4], ends: [(i64, i64); 4]) -> MaskKey {
+        MaskKey { dims, ends }
+    }
+}
+
 /// Entries of the table at which dead ones are pruned before the next insert, at least.
-const CONS_PRUNE_AT: usize = 4096;
+const CONS_PRUNE_AT: usize = 256;
 
 /// What a thread keeps for each context it made operations in (see [`CONS`] and [`LIVE`]).
 struct Slot<T> {
@@ -2728,8 +2885,7 @@ impl JitState {
         // The upgraded node is checked outside the table: it may be the last owner of its node.
         let node = self.with_cons(|table| {
             if table.epoch != epoch {
-                table.map.clear();
-                table.epoch = epoch;
+                table.clear_for(epoch);
                 return None;
             }
             table.map.get(&hash)?.upgrade()
@@ -2751,12 +2907,44 @@ impl JitState {
         usable.then_some(node)
     }
 
+    /// The pending mask node of `key` that no array holds, if one is still around: what the
+    /// operations that build the mask would hand out again (see [`cons_lookup`]).
+    pub(crate) fn mask_lookup(&self, key: &MaskKey) -> Option<Arc<Node>> {
+        let epoch = self.write_epoch.load(Ordering::Relaxed);
+        let node = self.with_cons(|table| {
+            if table.epoch != epoch {
+                table.clear_for(epoch);
+                return None;
+            }
+            table.masks.get(key)?.upgrade()
+        })?;
+        let usable = node.is_pending() && node.handles.load(Ordering::Relaxed) == 0 && !node.fused.load(Ordering::Relaxed) && lock(&node.args).is_some();
+        if !usable {
+            return None;
+        }
+        rerun::reused(&node);
+        Some(node)
+    }
+
+    /// Remembers `node` as the mask of `key`.
+    pub(crate) fn mask_store(&self, key: MaskKey, node: &Arc<Node>) {
+        let epoch = self.write_epoch.load(Ordering::Relaxed);
+        self.with_cons(|table| {
+            if table.epoch != epoch {
+                table.clear_for(epoch);
+            }
+            if table.masks.len() >= 64 {
+                table.masks.retain(|_, weak| weak.strong_count() > 0);
+            }
+            table.masks.insert(key, Arc::downgrade(node));
+        });
+    }
+
     fn cons_insert(&self, hash: u64, weak: Weak<Node>) {
         let epoch = self.write_epoch.load(Ordering::Relaxed);
         self.with_cons(|table| {
             if table.epoch != epoch {
-                table.map.clear();
-                table.epoch = epoch;
+                table.clear_for(epoch);
             }
             if table.map.len() > table.prune_at.max(CONS_PRUNE_AT) {
                 table.map.retain(|_, weak| weak.strong_count() > 0);
