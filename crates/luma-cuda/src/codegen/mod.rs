@@ -2,18 +2,24 @@
 //!
 //! The emitted module is self-contained apart from `libdevice`, which the compiler links in:
 //! math functions are calls to `__nv_*`. Every value is either SSA lanes (scalar or vector) or a
-//! byte-addressed temporary (struct / array); all memory is reached through `i8*` plus byte
-//! offsets, and locals are `alloca [N x i8]` slots that LLVM promotes to registers.
+//! byte-addressed temporary (struct / array); places are `i8*` plus byte offsets, which a load or
+//! store turns into one typed `getelementptr` of the pointer they came from (see `fb`). Scalar
+//! locals that are declared once and never reassigned are SSA values ([`ssa_locals`]); the others
+//! are `alloca [N x i8]` slots, which LLVM promotes to registers. The IR is kept small on purpose:
+//! NVVM parses and optimizes it for every kernel the first time it is built, and the instructions
+//! nothing uses are removed before it is handed over.
 //!
 //! Kernel ABI of `luma_main` (the order `launch_kernel` must pass the parameters in):
 //! `%LumaGrid* byval align 4` (the grid), `i8*` `luma_indirect` (not `noalias`: a gate folded into a launch rewrites the arguments it is dispatched from) (null for direct
 //! dispatches), one parameter per *active* binding in ascending original binding order (see
 //! [`CudaArgAbi`]), then one `i32` per entry of [`CudaTranslated::array_lengths`].
 
+mod conv;
 mod fb;
 mod ops;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use luma_core::BindingKind;
 use luma_core::kir::*;
@@ -156,13 +162,128 @@ fn scan(block: &[Stmt]) -> Res {
     r
 }
 
+/// The locals that can be SSA values instead of stack slots: scalars that are declared by exactly
+/// one `let` (or by the kernel's prologue, `predefined`), never written again, and used only where
+/// that `let` dominates the use (in its own block after it, or in blocks nested in the rest of that
+/// block). Everything else keeps a stack slot, which NVVM promotes itself. Vectors stay in slots:
+/// NVVM compiled the kernels that hold vectors as SSA lanes (and slots typed after their contents,
+/// likewise) into different, branchier code.
+fn ssa_locals(decls: &[(String, KirType, bool)], body: &[Stmt], predefined: &[LocalId]) -> Vec<bool> {
+    struct Scope {
+        cand: Vec<bool>,
+    }
+    impl Scope {
+        fn uses(&mut self, s: &Stmt, vis: &[bool]) {
+            s.for_each_expr(&mut |e| {
+                e.walk(&mut |x| {
+                    if let Expr::Local(l) = x
+                        && !vis[l.0 as usize]
+                    {
+                        self.cand[l.0 as usize] = false;
+                    }
+                })
+            });
+        }
+        fn block(&mut self, b: &[Stmt], vis: &mut [bool]) {
+            for s in b {
+                self.stmt(s, vis);
+            }
+        }
+        fn nested(&mut self, b: &[Stmt], vis: &[bool]) {
+            let mut v = vis.to_vec();
+            self.block(b, &mut v);
+        }
+        fn stmt(&mut self, s: &Stmt, vis: &mut [bool]) {
+            match s {
+                Stmt::Let { local, .. } => {
+                    self.uses(s, vis);
+                    vis[local.0 as usize] = true;
+                }
+                Stmt::If { then_body, else_body, .. } => {
+                    self.uses(s, vis);
+                    self.nested(then_body, vis);
+                    self.nested(else_body, vis);
+                }
+                Stmt::Loop { body, continuing, break_if } => {
+                    let mut v = vis.to_vec();
+                    self.block(body, &mut v);
+                    // The `continuing` block is also reached by a `continue`, which skips the
+                    // rest of the body.
+                    let mut skips = false;
+                    walk_stmts(body, &mut |x| skips |= matches!(x, Stmt::Continue));
+                    let mut vc = if skips { vis.to_vec() } else { v };
+                    self.block(continuing, &mut vc);
+                    if let Some(e) = break_if {
+                        e.walk(&mut |x| {
+                            if let Expr::Local(l) = x
+                                && !vc[l.0 as usize]
+                            {
+                                self.cand[l.0 as usize] = false;
+                            }
+                        });
+                    }
+                }
+                Stmt::Switch { cases, default, .. } => {
+                    self.uses(s, vis);
+                    for (_, b, _) in cases {
+                        self.nested(b, vis);
+                    }
+                    self.nested(default, vis);
+                }
+                _ => self.uses(s, vis),
+            }
+        }
+    }
+    let n = decls.len();
+    let mut cand: Vec<bool> = decls.iter().map(|(_, t, _)| matches!(t, KirType::Scalar(_))).collect();
+    let mut lets = vec![0u32; n];
+    for l in predefined {
+        lets[l.0 as usize] += 1;
+    }
+    fn root(lv: &LValue) -> Option<LocalId> {
+        match lv {
+            LValue::Local(l) => Some(*l),
+            LValue::Index { base, .. } | LValue::Field { base, .. } => root(base),
+            _ => None,
+        }
+    }
+    walk_stmts(body, &mut |s| match s {
+        Stmt::Let { local, .. } => lets[local.0 as usize] += 1,
+        Stmt::Var { local, .. } => cand[local.0 as usize] = false,
+        Stmt::Assign { dst, .. } => {
+            if let Some(l) = root(dst) {
+                cand[l.0 as usize] = false;
+            }
+        }
+        Stmt::AtomicRmw { dst: Some(d), .. } => cand[d.0 as usize] = false,
+        Stmt::AtomicCompareExchange { dst_old, dst_exchanged, .. } => {
+            cand[dst_old.0 as usize] = false;
+            cand[dst_exchanged.0 as usize] = false;
+        }
+        _ => {}
+    });
+    for (c, &l) in cand.iter_mut().zip(&lets) {
+        *c &= l == 1;
+    }
+    let mut vis = vec![false; n];
+    for l in predefined {
+        vis[l.0 as usize] = true;
+    }
+    let mut sc = Scope { cand };
+    sc.block(body, &mut vis);
+    sc.cand
+}
+
 /// Everything an expression needs to name: the function's locals and parameters and the
 /// context values (grid, bindings, shared, privates, lengths) it was handed.
 struct FnCx<'b> {
     local_decls: &'b [(String, KirType, bool)],
     param_decls: &'b [(String, KirType)],
-    /// `i8*` of each local's stack slot.
+    /// `i8*` of each local's stack slot (empty for the locals that are SSA values).
     local_ptrs: Vec<Op>,
+    /// Locals that live in SSA values, not stack slots (see [`ssa_locals`]).
+    ssa: Vec<bool>,
+    ssa_vals: RefCell<Vec<Option<Val>>>,
     param_vals: Vec<Val>,
     grid: Option<Op>,
     binds: BTreeMap<u32, Op>,
@@ -179,6 +300,8 @@ impl<'b> FnCx<'b> {
             local_decls,
             param_decls,
             local_ptrs: Vec::new(),
+            ssa: vec![false; local_decls.len()],
+            ssa_vals: RefCell::new(vec![None; local_decls.len()]),
             param_vals: Vec::new(),
             grid: None,
             binds: BTreeMap::new(),
@@ -223,6 +346,8 @@ struct Em<'a> {
     decls: BTreeSet<String>,
     helpers: BTreeMap<String, String>,
     jumps: Vec<Jump>,
+    /// The subgroup operations every lane of the warp reaches (see [`conv`]).
+    converged: HashSet<*const Expr>,
 }
 
 // ----- small value helpers ---------------------------------------------------------------
@@ -266,9 +391,7 @@ fn umin_const(fb: &mut Fb, idx: &Op, last: u32) -> Op {
 
 /// Byte address `ptr + zext(idx) * stride`.
 fn index_ptr(fb: &mut Fb, ptr: &Op, idx: &Op, stride: u32) -> Op {
-    let z = fb.def(&format!("zext i32 {idx} to i64"));
-    let off = if stride == 1 { z } else { fb.def(&format!("mul nuw i64 {z}, {stride}")) };
-    fb.gep(ptr, &off)
+    fb.gep_elem(ptr, idx, stride)
 }
 
 fn sreg(fb: &mut Fb, kind: &str, k: usize) -> Op {
@@ -278,6 +401,20 @@ fn sreg(fb: &mut Fb, kind: &str, k: usize) -> Op {
 }
 
 impl<'a> Em<'a> {
+    /// Gives the builtin local `l` its lanes (`u32`s): as an SSA value, or stored in its slot.
+    fn bind_local(&self, fb: &mut Fb, cx: &FnCx, l: LocalId, vals: Vec<Op>) {
+        let li = l.0 as usize;
+        if cx.ssa[li] {
+            // Only scalars are SSA values: one lane.
+            let elem = cx.local_decls[li].1.elem_scalar().unwrap_or(ScalarTy::U32);
+            cx.ssa_vals.borrow_mut()[li] = Some(Val::Lanes { elem, ops: vals.into_iter().take(1).collect() });
+        } else {
+            for (k, v) in vals.iter().enumerate() {
+                fb.store(&cx.local_ptrs[li], 4 * k as u32, ScalarTy::U32, v, true);
+            }
+        }
+    }
+
     fn sz(&self, ty: &KirType) -> u32 {
         size_of(ty, &self.m.structs)
     }
@@ -660,6 +797,9 @@ impl<'a> Em<'a> {
             Expr::LitF32(v) => scalar_val(ScalarTy::F32, ops::f32_lit(*v)),
             Expr::LitF64(v) => scalar_val(ScalarTy::F64, ops::f64_lit(*v)),
             Expr::ZeroVal(t) => self.zero_val(fb, t),
+            Expr::Local(l) if cx.ssa[l.0 as usize] => {
+                cx.ssa_vals.borrow()[l.0 as usize].clone().unwrap_or_else(|| invariant(format!("local {} is used before it is declared", l.0)))
+            }
             Expr::Local(l) => {
                 let ty = &cx.local_decls[l.0 as usize].1;
                 self.read_place(fb, &cx.local_ptrs[l.0 as usize], ty, true)
@@ -863,17 +1003,18 @@ impl<'a> Em<'a> {
                 scalar_val(*ty, ops::atomic_load(fb, *ty, &p))
             }
             Expr::Subgroup { op, arg, lane, .. } => {
+                let converged = self.converged.contains(&(e as *const Expr));
                 let a = arg.as_ref().map(|a| self.expr(fb, a, cx));
                 let l = lane.as_ref().map(|l| one(&self.expr(fb, l, cx)).1);
                 if *op == IrSubgroupOp::Ballot {
                     let pred = a.as_ref().map(|a| one(a).1);
-                    let b = ops::ballot(fb, pred.as_ref());
+                    let b = ops::ballot(fb, pred.as_ref(), converged);
                     return Val::Lanes { elem: ScalarTy::U32, ops: vec![b, "0".into(), "0".into(), "0".into()] };
                 }
                 let a = a.unwrap_or_else(|| invariant("a subgroup reduction needs an argument"));
                 let (s, o) = lanes_of(&a);
                 let lane = if *op == IrSubgroupOp::Shuffle { l } else { None };
-                let out = o.iter().map(|x| ops::subgroup(fb, *op, s, x, lane.as_ref())).collect();
+                let out = o.iter().map(|x| ops::subgroup(fb, *op, s, x, lane.as_ref(), converged)).collect();
                 Val::Lanes { elem: s, ops: out }
             }
             Expr::ArrayLength { binding } => {
@@ -1054,6 +1195,14 @@ impl<'a> Em<'a> {
     fn stmt(&mut self, fb: &mut Fb, s: &Stmt, cx: &FnCx) {
         let m = self.m;
         match s {
+            Stmt::Let { local, init } if cx.ssa[local.0 as usize] => {
+                let v = self.expr(fb, init, cx);
+                cx.ssa_vals.borrow_mut()[local.0 as usize] = Some(match (v, &cx.local_decls[local.0 as usize].1) {
+                    // The slot would have been read back as the declared type.
+                    (Val::Lanes { ops, .. }, KirType::Scalar(s)) => Val::Lanes { elem: *s, ops },
+                    (v, _) => v,
+                });
+            }
             Stmt::Let { local, init } => {
                 let v = self.expr(fb, init, cx);
                 self.write_place(fb, &cx.local_ptrs[local.0 as usize], &cx.local_decls[local.0 as usize].1, &v, true);
@@ -1309,7 +1458,19 @@ impl<'a> Em<'a> {
             }
         }
         params.extend(self.ctx_params(&r, &mut cx));
-        cx.local_ptrs = f.locals.iter().map(|(_, t, _)| fb.alloca(self.sz(t), self.al(t))).collect();
+        for o in cx.grid.iter().chain(cx.binds.values()).chain(cx.shared.values()).chain(cx.privs.values()) {
+            fb.mark_entry(o);
+        }
+        if let Some((ret, _)) = &cx.ret {
+            fb.mark_entry(ret);
+        }
+        for v in &cx.param_vals {
+            if let Val::Mem { ptr, .. } = v {
+                fb.mark_entry(ptr);
+            }
+        }
+        cx.ssa = ssa_locals(&f.locals, &f.body, &[]);
+        cx.local_ptrs = f.locals.iter().enumerate().map(|(i, (_, t, _))| if cx.ssa[i] { Op::new() } else { fb.alloca(self.sz(t), self.al(t)) }).collect();
         self.jumps.clear();
         self.stmts(&mut fb, &f.body, &cx);
         if !fb.terminated {
@@ -1331,8 +1492,9 @@ impl<'a> Em<'a> {
         let mut cx = FnCx::new(&m.entry_locals, &[]);
         let mut kparams: Vec<String> = vec!["%LumaGrid* byval align 4 %luma".into(), "i8* %luma_indirect".into()];
         let mut ktypes: Vec<String> = vec!["%LumaGrid*".into(), "i8*".into()];
-        cx.grid = Some(fb.def("bitcast %LumaGrid* %luma to i8*"));
+        cx.grid = Some(fb.def_entry("bitcast %LumaGrid* %luma to i8*"));
         let ind: Op = "%luma_indirect".into();
+        fb.mark_entry(&ind);
         let mut param_abis = Vec::new();
         for (i, d) in m.bindings.iter().enumerate() {
             if !self.active[i] {
@@ -1346,24 +1508,27 @@ impl<'a> Em<'a> {
                     kparams.push(format!("i8* noalias %buf{i}"));
                     ktypes.push("i8*".into());
                     cx.binds.insert(i32_, format!("%buf{i}"));
+                    fb.mark_entry(&format!("%buf{i}"));
                 }
                 (BindingKind::StorageReadWrite, _) => {
                     kparams.push(format!("i8* %buf{i}"));
                     ktypes.push("i8*".into());
                     cx.binds.insert(i32_, format!("%buf{i}"));
+                    fb.mark_entry(&format!("%buf{i}"));
                 }
                 (BindingKind::Uniform, CudaArgAbi::InlineUniform { size }) => {
                     let n = size.max(1);
                     let a = align_of(&d.elem_ty, &m.structs);
                     kparams.push(format!("[{n} x i8]* byval align {a} %unib{i}"));
                     ktypes.push(format!("[{n} x i8]*"));
-                    let p = fb.def(&format!("bitcast [{n} x i8]* %unib{i} to i8*"));
+                    let p = fb.def_entry(&format!("bitcast [{n} x i8]* %unib{i} to i8*"));
                     cx.binds.insert(i32_, p);
                 }
                 (BindingKind::Uniform, _) => {
                     kparams.push(format!("i8* noalias %uni{i}"));
                     ktypes.push("i8*".into());
                     cx.binds.insert(i32_, format!("%uni{i}"));
+                    fb.mark_entry(&format!("%uni{i}"));
                 }
             }
         }
@@ -1374,7 +1539,9 @@ impl<'a> Em<'a> {
         }
 
         // 1. Thread coordinates.
-        let tid: Vec<Op> = (0..3).map(|k| sreg(&mut fb, "tid", k)).collect();
+        // A dimension of one is never anything but 0 at launch.
+        let w = [wx, wy, wz];
+        let tid: Vec<Op> = (0..3).map(|k| if w[k] == 1 { "0".to_string() } else { sreg(&mut fb, "tid", k) }).collect();
         let ctaid: Vec<Op> = (0..3).map(|k| sreg(&mut fb, "ctaid", k)).collect();
         let nctaid: Vec<Op> = (0..3).map(|k| sreg(&mut fb, "nctaid", k)).collect();
         let t = fb.def(&format!("mul i32 {}, {wy}", tid[2]));
@@ -1405,7 +1572,7 @@ impl<'a> Em<'a> {
         for i in 0..m.shared.len() {
             let bytes = self.shared_bytes(i as u32);
             let n = bytes.max(1);
-            let p = fb.def(&format!(
+            let p = fb.def_entry(&format!(
                 "addrspacecast i8 addrspace(3)* getelementptr inbounds ([{n} x i8], [{n} x i8] addrspace(3)* @sh{i}, i64 0, i64 0) to i8*"
             ));
             cx.shared.insert(i as u32, p.clone());
@@ -1438,7 +1605,9 @@ impl<'a> Em<'a> {
             let ptr = fb.alloca(self.sz(&p.ty), self.al(&p.ty));
             cx.privs.insert(i as u32, ptr);
         }
-        cx.local_ptrs = m.entry_locals.iter().map(|(_, t, _)| fb.alloca(self.sz(t), self.al(t))).collect();
+        let builtin_locals: Vec<LocalId> = m.entry_builtins.iter().map(|(_, l)| *l).collect();
+        cx.ssa = ssa_locals(&m.entry_locals, &m.entry_body, &builtin_locals);
+        cx.local_ptrs = m.entry_locals.iter().enumerate().map(|(i, (_, t, _))| if cx.ssa[i] { Op::new() } else { fb.alloca(self.sz(t), self.al(t)) }).collect();
         for (i, p) in m.privates.iter().enumerate() {
             let ptr = cx.privs[&(i as u32)].clone();
             match &p.init {
@@ -1450,51 +1619,33 @@ impl<'a> Em<'a> {
             }
         }
 
-        // 5. Builtins.
+        // 5. Builtins: SSA values where the local is never written, else stored to its slot.
         for (b, l) in &m.entry_builtins {
-            let ptr = cx.local_ptrs[l.0 as usize].clone();
-            let w = [wx, wy, wz];
-            match b {
-                BuiltinVar::GlobalInvocationId => {
-                    for k in 0..3 {
+            let vals: Vec<Op> = match b {
+                BuiltinVar::GlobalInvocationId => (0..3)
+                    .map(|k| {
                         let t = fb.def(&format!("mul i32 {}, {}", ctaid[k], w[k]));
-                        let g = fb.def(&format!("add i32 {t}, {}", tid[k]));
-                        fb.store(&ptr, 4 * k as u32, ScalarTy::U32, &g, true);
-                    }
-                }
-                BuiltinVar::LocalInvocationId => {
-                    for (k, v) in tid.iter().enumerate() {
-                        fb.store(&ptr, 4 * k as u32, ScalarTy::U32, v, true);
-                    }
-                }
-                BuiltinVar::LocalInvocationIndex => fb.store(&ptr, 0, ScalarTy::U32, &linear, true),
-                BuiltinVar::WorkgroupId => {
-                    for (k, v) in ctaid.iter().enumerate() {
-                        fb.store(&ptr, 4 * k as u32, ScalarTy::U32, v, true);
-                    }
-                }
+                        fb.def(&format!("add i32 {t}, {}", tid[k]))
+                    })
+                    .collect(),
+                BuiltinVar::LocalInvocationId => tid.clone(),
+                BuiltinVar::LocalInvocationIndex => vec![linear.clone()],
+                BuiltinVar::WorkgroupId => ctaid.clone(),
                 BuiltinVar::NumWorkgroups => {
                     let (from_ind, from_grid, done) = (fb.label(), fb.label(), fb.label());
                     fb.cond_br(&has_ind, &from_ind, &from_grid);
                     fb.start(&from_ind);
-                    for k in 0..3 {
-                        let v = fb.load(&ind, 4 * k as u32, ScalarTy::U32, true);
-                        fb.store(&ptr, 4 * k as u32, ScalarTy::U32, &v, true);
-                    }
+                    let loaded: Vec<Op> = (0..3).map(|k| fb.load(&ind, 4 * k as u32, ScalarTy::U32, true)).collect();
                     fb.br(&done);
                     fb.start(&from_grid);
-                    for (k, v) in nctaid.iter().enumerate() {
-                        fb.store(&ptr, 4 * k as u32, ScalarTy::U32, v, true);
-                    }
                     fb.br(&done);
                     fb.start(&done);
+                    (0..3).map(|k| fb.def(&format!("phi i32 [ {}, %{from_ind} ], [ {}, %{from_grid} ]", loaded[k], nctaid[k]))).collect()
                 }
-                BuiltinVar::SubgroupInvocationId => {
-                    let v = ops::lane_id(&mut fb);
-                    fb.store(&ptr, 0, ScalarTy::U32, &v, true);
-                }
-                BuiltinVar::SubgroupSize => fb.store(&ptr, 0, ScalarTy::U32, &"32".to_string(), true),
-            }
+                BuiltinVar::SubgroupInvocationId => vec![ops::lane_id(&mut fb)],
+                BuiltinVar::SubgroupSize => vec!["32".to_string()],
+            };
+            self.bind_local(&mut fb, &cx, *l, vals);
         }
 
         // 6. Body.
@@ -1616,6 +1767,7 @@ pub fn emit_with_options(module: &KernelModule, used: Option<&[bool]>, initializ
         decls: BTreeSet::new(),
         helpers: BTreeMap::new(),
         jumps: Vec::new(),
+        converged: conv::convergent_subgroups(module),
     }
     .run()
 }
@@ -1672,4 +1824,140 @@ mod tests {
         let t = emit(&aligned, None);
         assert_eq!(t.param_abis, vec![CudaArgAbi::DevicePtr, CudaArgAbi::InlineUniform { size: 3584 }]);
     }
+
+    fn local(i: u32) -> Box<Expr> {
+        Box::new(Expr::Local(LocalId(i)))
+    }
+
+    fn lit(v: u32) -> Box<Expr> {
+        Box::new(Expr::LitU32(v))
+    }
+
+    fn add(a: Box<Expr>, b: Box<Expr>) -> Expr {
+        Expr::Binary { op: IrBinOp::Add, lhs: a, rhs: b, ty: KirType::U32 }
+    }
+
+    fn decls(n: usize) -> Vec<(String, KirType, bool)> {
+        (0..n).map(|i| (format!("l{i}"), KirType::U32, false)).collect()
+    }
+
+    fn let_(l: u32, e: Expr) -> Stmt {
+        Stmt::Let { local: LocalId(l), init: e }
+    }
+
+    #[test]
+    fn locals_are_ssa_values_only_where_their_let_dominates_every_use() {
+        // let a; let b = a + 1; if .. { let c = a + b; } use(b)
+        let body = vec![
+            let_(0, Expr::LitU32(1)),
+            let_(1, add(local(0), lit(1))),
+            Stmt::If { cond: Expr::LitBool(true), then_body: vec![let_(2, add(local(0), local(1)))], else_body: vec![] },
+            Stmt::Discard(*local(1)),
+        ];
+        assert_eq!(ssa_locals(&decls(3), &body, &[]), vec![true, true, true]);
+        // A `let` in a branch is not visible after it.
+        let body = vec![
+            Stmt::If { cond: Expr::LitBool(true), then_body: vec![let_(0, Expr::LitU32(1))], else_body: vec![] },
+            Stmt::Discard(*local(0)),
+        ];
+        assert_eq!(ssa_locals(&decls(1), &body, &[]), vec![false]);
+        // Neither is one in the other branch.
+        let body = vec![Stmt::If { cond: Expr::LitBool(true), then_body: vec![let_(0, Expr::LitU32(1))], else_body: vec![Stmt::Discard(*local(0))] }];
+        assert_eq!(ssa_locals(&decls(1), &body, &[]), vec![false]);
+        // Used before it is declared.
+        let body = vec![Stmt::Discard(*local(0)), let_(0, Expr::LitU32(1))];
+        assert_eq!(ssa_locals(&decls(1), &body, &[]), vec![false]);
+    }
+
+    #[test]
+    fn written_and_redeclared_locals_keep_their_slots() {
+        let assign = Stmt::Assign { dst: LValue::Local(LocalId(0)), val: Expr::LitU32(2) };
+        let body = vec![let_(0, Expr::LitU32(1)), assign, Stmt::Discard(*local(0))];
+        assert_eq!(ssa_locals(&decls(1), &body, &[]), vec![false]);
+        let body = vec![Stmt::Var { local: LocalId(0), init: Some(Expr::LitU32(1)) }, Stmt::Discard(*local(0))];
+        assert_eq!(ssa_locals(&decls(1), &body, &[]), vec![false]);
+        let body = vec![let_(0, Expr::LitU32(1)), let_(0, Expr::LitU32(2)), Stmt::Discard(*local(0))];
+        assert_eq!(ssa_locals(&decls(1), &body, &[]), vec![false]);
+        // The result of an atomic is stored into its local.
+        let rmw = Stmt::AtomicRmw { dst: Some(LocalId(0)), op: IrAtomicOp::Add, elem_ty: ScalarTy::U32, target: AtomicTarget::Storage { binding: 0, index: None }, val: Expr::LitU32(1) };
+        assert_eq!(ssa_locals(&decls(1), &[rmw, Stmt::Discard(*local(0))], &[]), vec![false]);
+        // Aggregates and vectors are never SSA values.
+        let mut d = decls(2);
+        d[0].1 = KirType::vec(ScalarTy::F32, 4);
+        d[1].1 = KirType::Array { elem: Box::new(KirType::U32), len: 4, stride: 4 };
+        let body = vec![let_(0, Expr::ZeroVal(d[0].1.clone())), let_(1, Expr::ZeroVal(d[1].1.clone()))];
+        assert_eq!(ssa_locals(&d, &body, &[]), vec![false, false]);
+        // The builtins the prologue declares are values.
+        assert_eq!(ssa_locals(&decls(1), &[Stmt::Discard(*local(0))], &[LocalId(0)]), vec![true]);
+    }
+
+    #[test]
+    fn a_continue_hides_the_body_from_the_continuing_block() {
+        let uses_in_continuing = |body: Vec<Stmt>| {
+            let l = Stmt::Loop { body, continuing: vec![Stmt::Discard(*local(0))], break_if: None };
+            ssa_locals(&decls(1), &[l], &[])[0]
+        };
+        assert!(uses_in_continuing(vec![let_(0, Expr::LitU32(1))]));
+        let skip = Stmt::If { cond: Expr::LitBool(true), then_body: vec![Stmt::Continue], else_body: vec![] };
+        assert!(!uses_in_continuing(vec![skip, let_(0, Expr::LitU32(1))]));
+        // The loop's own `break_if` sees the same.
+        let l = Stmt::Loop { body: vec![let_(0, Expr::LitU32(1))], continuing: vec![], break_if: Some(Expr::Local(LocalId(0))) };
+        assert!(ssa_locals(&decls(1), &[l], &[])[0]);
+    }
+
+    /// A kernel with a loop, a `let`, a subgroup reduction every lane reaches and a store.
+    fn reducing_module() -> KernelModule {
+        let mut mb = ModuleBuilder::new("t", "main", [64, 1, 1]);
+        let out = mb.add_storage_read_write("out", KirType::U32);
+        mb.entry_builder().finish();
+        let mut m = mb.finish();
+        m.entry_locals = vec![
+            ("lid".into(), KirType::U32, false),
+            ("sg".into(), KirType::U32, false),
+            ("x".into(), KirType::U32, false),
+            ("n".into(), KirType::U32, true),
+            ("s".into(), KirType::F32, false),
+        ];
+        m.entry_builtins = vec![(BuiltinVar::LocalInvocationIndex, LocalId(0)), (BuiltinVar::SubgroupSize, LocalId(1))];
+        let total = Expr::Subgroup { op: IrSubgroupOp::Add, arg: Some(Box::new(Expr::Cast { kind: CastKind::Convert, expr: local(2), src_ty: KirType::U32, dst_ty: KirType::F32 })), lane: None, ty: KirType::F32 };
+        m.entry_body = vec![
+            let_(2, add(local(0), lit(1))),
+            Stmt::Var { local: LocalId(3), init: Some(Expr::LitU32(0)) },
+            Stmt::Loop {
+                body: vec![Stmt::If { cond: Expr::Binary { op: IrBinOp::Ge, lhs: local(3), rhs: lit(4), ty: KirType::BOOL }, then_body: vec![Stmt::Break], else_body: vec![] }],
+                continuing: vec![Stmt::Assign { dst: LValue::Local(LocalId(3)), val: add(local(3), lit(1)) }],
+                break_if: None,
+            },
+            Stmt::Let { local: LocalId(4), init: total },
+            Stmt::Store {
+                binding: out,
+                index: *local(0),
+                val: add(Box::new(Expr::Cast { kind: CastKind::Convert, expr: local(4), src_ty: KirType::F32, dst_ty: KirType::U32 }), local(3)),
+            },
+        ];
+        m
+    }
+
+    #[test]
+    fn a_converged_reduction_takes_the_full_warp_path_and_no_slots_for_its_lets() {
+        let t = emit(&reducing_module(), None);
+        assert!(t.source.contains("@luma_sg_add_f32_c("), "{}", t.source);
+        assert!(!t.source.contains("activemask"), "{}", t.source);
+        // `x` and `s` are values; only the loop counter has a stack slot.
+        assert_eq!(t.source.matches("alloca").count(), 1, "{}", t.source);
+        // No typed access goes through a byte offset any more.
+        assert!(!t.source.contains("getelementptr inbounds i8"), "{}", t.source);
+    }
+
+    #[test]
+    fn emitted_ir_compiles_with_nvvm_when_the_driver_has_it() {
+        let Ok(nvvm) = crate::nvvm::Nvvm::open(7, 5) else {
+            eprintln!("no NVVM in this environment, skipped");
+            return;
+        };
+        let ptx = nvvm.compile(&emit(&reducing_module(), None).source, 7, 5).unwrap();
+        assert!(ptx.contains("shfl.sync.bfly.b32"), "{ptx}");
+        assert!(!ptx.contains("activemask"), "{ptx}");
+    }
+
 }

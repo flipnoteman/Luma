@@ -185,14 +185,18 @@ impl Nvvm {
             if r != 0 {
                 return fail(r);
             }
-            let r = (self.lazy_add)(
-                prog,
-                LIBDEVICE.as_ptr().cast(),
-                LIBDEVICE.len(),
-                c"libdevice".as_ptr(),
-            );
-            if r != 0 {
-                return fail(r);
+            // libdevice is linked in lazily, but parsing its bitcode is a fixed cost (about a third of
+            // the compile of a small kernel); a kernel that calls none of it does not need it.
+            if ir.contains("@__nv_") {
+                let r = (self.lazy_add)(
+                    prog,
+                    LIBDEVICE.as_ptr().cast(),
+                    LIBDEVICE.len(),
+                    c"libdevice".as_ptr(),
+                );
+                if r != 0 {
+                    return fail(r);
+                }
             }
             let arch = std::ffi::CString::new(format!("-arch=compute_{major}{minor}"))
                 .map_err(|e| e.to_string())?;
