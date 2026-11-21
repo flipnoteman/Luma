@@ -1018,6 +1018,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "luma-bench"
+version = "0.0.0"
+dependencies = [
+ "luma",
+]
+
+[[package]]
 name = "luma-hal-core"
 version = "0.5.1"
 dependencies = [

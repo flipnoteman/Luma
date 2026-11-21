@@ -1,0 +1,58 @@
+//! `luma-bench`: workload benchmark suites for Luma.
+//!
+//! ```text
+//! cargo run --release -p luma-bench -- [--quick] [--suite ml,cfd,...] [--only <substring>] [--json out.jsonl]
+//! ```
+//!
+//! The backend comes from the environment (`LUMA_BACKEND=cuda|wgpu|metal|cpu`, `LUMA_DEVICE`).
+//! Every case is verified against a host reference before it is timed. `tools/benchcmp.py A B`
+//! compares two JSON files and flags regressions; `tools/benchref.sh` runs a luma ref through
+//! the GPU queue.
+
+mod harness;
+mod suites;
+
+use luma::*;
+
+fn main() {
+    let mut quick = false;
+    let mut only = None;
+    let mut json = None;
+    let mut suites: Option<Vec<String>> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--quick" => quick = true,
+            "--only" => only = args.next(),
+            "--json" => json = args.next(),
+            "--suite" => suites = args.next().map(|s| s.split(',').map(str::to_string).collect()),
+            "--list" => {
+                for (name, _) in suites::ALL {
+                    println!("{name}");
+                }
+                return;
+            }
+            other => {
+                eprintln!("unknown argument {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let ctx = Context::with_options(ContextOptions::from_env()).expect("no device");
+    println!("luma-bench: backend {:?}, device {}, quick {quick}", ctx.backend(), ctx.device_name());
+    let mut h = harness::Harness::new(ctx, quick, only, json.as_deref());
+    for (name, run) in suites::ALL {
+        if suites.as_ref().is_some_and(|s| !s.iter().any(|x| x == name)) {
+            continue;
+        }
+        h.suite = name.to_string();
+        run(&mut h);
+    }
+    if !h.skipped.is_empty() {
+        println!("\n{} case(s) skipped:", h.skipped.len());
+        for (name, why) in &h.skipped {
+            println!("  {name}: {why}");
+        }
+        std::process::exit(1);
+    }
+}
