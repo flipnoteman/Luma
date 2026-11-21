@@ -155,7 +155,7 @@ fn narrow_integer_ranges() {
             }
         }
     }
-    let (ns, spans) = (&[1usize, 2, 3, 100, 4097, 100_000][..], &[1u32, 2, 10, 1000, 65536][..]);
+    let (ns, spans) = (&[1usize, 2, 3, 100, 4097, 100_000, 300_000][..], &[1u32, 2, 10, 1000, 65536][..]);
     run(0u32, |b, d| b + d * 3, ns, spans);
     run(u32::MAX - 200_000, |b, d| b + d, ns, spans);
     run(5u32, |b, d| b + d, ns, spans);

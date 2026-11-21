@@ -127,6 +127,11 @@ impl IntKey for i32 {
 /// cleared, scanned and read in place of the radix sort's eight passes over the keys.
 const MAX_SPAN: usize = 1 << 24;
 
+/// The fewest keys worth the extra synchronization of reading the range back: below it the sort
+/// is as fast (and wins when the range turns out wide; measured on wgpu, where a readback costs
+/// about 200 us).
+const MIN_KEYS: usize = 1 << 18;
+
 /// [`Array::factorize`] of integer keys whose range `max - min + 1` is small compared with the
 /// number of keys: a presence table over the range, ranked by a scan, in place of the sort. The
 /// result is the same as the sort's. `None` if the range is too wide. Reads the range back
@@ -134,10 +139,13 @@ const MAX_SPAN: usize = 1 << 24;
 fn small_range<K: IntKey>(keys: &Array<K>) -> Result<Option<(Array<K>, Array<u32>)>> {
     let ctx = keys.context();
     let n = keys.len();
+    if n < MIN_KEYS {
+        return Ok(None);
+    }
     let flat = keys.reshape(n);
     let [lo, hi] = flat.reduce([Reduction::Min, Reduction::Max]).to_array()?;
     let span = (hi.wide() - lo.wide() + 1) as usize;
-    if span > MAX_SPAN || span > n.max(1 << 12) {
+    if span > MAX_SPAN || span > n {
         return Ok(None);
     }
     let offsets = K::offsets(&flat, lo);
