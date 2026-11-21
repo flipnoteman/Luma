@@ -264,7 +264,11 @@ assert_eq!(n.argsort_descending().to_vec()?, vec![3, 1, 0, 2]);
 Floats sort in the total order of their bits: `-inf < .. < -0.0 < +0.0 < .. < +inf < NaN`, so
 NaNs come last (first when descending) and `-0.0` sorts before `+0.0` (and `+0.0` before
 `-0.0` when descending, by input order for ties). The sign of a NaN is not kept.
-`sort_axis(axis)` sorts every line along `axis` independently, stably, and keeps the shape.
+`sort_axis(axis)` sorts every line along `axis` independently and keeps the shape. Lines of up to
+2048 elements (256 on the CPU backend; any axis) are sorted in workgroup memory, in one pass over the data; longer lines
+take the radix sort of the whole array followed by a regrouping by line (and, along an axis other
+than 0, a tiled transpose back to the layout). `sort_axis` returns the NaNs as the positive quiet NaN,
+like `sort`.
 
 ## Groups
 
@@ -334,6 +338,13 @@ and `median_axis(axis)` do it for every line along an axis (extent 1 there in th
 outside `[0, 1]` (NaN included) poisons the result with `InvalidShape`. The sort is evaluated,
 the interpolation is lazy.
 
+Every call sorts, and the sort is nearly all of the cost, so ask for several quantiles in one
+call: `quantiles(&[q0, q1, ..])` gives a one-dimensional array with one entry per `q`, and
+`quantiles_axis(axis, &qs)` the shape of the array with `qs.len()` entries along `axis` (entry
+`j` is `quantile_axis(axis, qs[j])`). A describe-style table of 25% / 50% / 75% costs one sort
+instead of three. Nothing is cached between calls: a sorted copy kept for the next call would
+cost as much memory as the array.
+
 ```rust
 use luma::*;
 
@@ -347,6 +358,11 @@ assert!(x.quantile(1.5).item().is_err());
 // Two columns of four: the median of each.
 let t = Array::from_slice(&[4.0f32, 1.0, 3.0, 2.0, 10.0, 50.0, 30.0, 20.0], [4, 2])?;
 assert_eq!(t.median_axis(0).to_vec()?, vec![2.5, 25.0]);
+
+// Three quantiles of each column with one sort: [3, 2], the quantiles along axis 0.
+let q = t.quantiles_axis(0, &[0.0, 0.5, 1.0]);
+assert_eq!(q.to_vec()?, vec![1.0, 2.5, 4.0, 10.0, 25.0, 50.0]);
+assert_eq!(x.quantiles(&[0.0, 0.25, 1.0]).to_vec()?, vec![1.0, 1.75, 4.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 

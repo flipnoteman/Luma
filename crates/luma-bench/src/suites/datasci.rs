@@ -726,6 +726,18 @@ fn quantile_cases(h: &mut Harness) {
             run();
         });
     }
+    // The same table from one sort.
+    if h.want("quantile/five_multi_1m") {
+        let n = 1_000_000;
+        let qs = [0.05f32, 0.25, 0.5, 0.75, 0.95];
+        let hx = values(n, 72, -3.0, 3.0);
+        let x = up(h, &hx);
+        let mut s = hx.clone();
+        s.sort_by(f32::total_cmp);
+        let want: Vec<f32> = qs.iter().map(|&q| host_quantile(&s, q)).collect();
+        check("quantile/five_multi_1m", &x.quantiles(&qs).to_vec().unwrap(), &want, 1e-5, 1e-6);
+        case_trim(h, "quantile/five_multi_1m", &n.to_string(), Work::Items(5.0 * n as f64, "Mrow/s"), &mut || x.quantiles(&qs).eval().unwrap());
+    }
     // Median of every column of a table: 1024 samples per column.
     if h.want("quantile/median_axis0") {
         let total = if h.ctx.is_cpu() || h.quick { 1 << 20 } else { 1 << 22 };
@@ -764,6 +776,19 @@ fn quantile_cases(h: &mut Harness) {
             run();
         });
     }
+    if h.want("quantile/cols3_multi_x64") {
+        let rows = table_rows(h);
+        let qs = [0.25f32, 0.5, 0.75];
+        let hx = values(rows * 64, 74, -3.0, 3.0);
+        let x = Array::from_slice_on(&h.ctx, &hx, [rows, 64]).unwrap();
+        let sorted = host_sort_axis(&hx, [rows, 64], 0);
+        let mut want = Vec::new();
+        for c in sorted.chunks(rows) {
+            want.extend(qs.iter().map(|&q| host_quantile(c, q)));
+        }
+        check("quantile/cols3_multi_x64", &x.quantiles_axis(0, &qs).to_vec().unwrap(), &want, 1e-5, 1e-6);
+        case_trim(h, "quantile/cols3_multi_x64", &format!("{rows}x64"), Work::Items((3 * rows * 64) as f64, "Mrow/s"), &mut || x.quantiles_axis(0, &qs).eval().unwrap());
+    }
     // Seven quantiles of one long vector.
     if h.want("quantile/seven_16m") {
         let n = if h.ctx.is_cpu() || h.quick { 1 << 20 } else { 1 << 24 };
@@ -784,6 +809,17 @@ fn quantile_cases(h: &mut Harness) {
         case_trim(h, "quantile/seven_16m", &n.to_string(), Work::Items(7.0 * n as f64, "Mrow/s"), &mut || {
             run();
         });
+    }
+    if h.want("quantile/seven_multi_16m") {
+        let n = if h.ctx.is_cpu() || h.quick { 1 << 20 } else { 1 << 24 };
+        let qs = [0.01f32, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99];
+        let hx = values(n, 75, -3.0, 3.0);
+        let x = up(h, &hx);
+        let mut s = hx.clone();
+        s.sort_by(f32::total_cmp);
+        let want: Vec<f32> = qs.iter().map(|&q| host_quantile(&s, q)).collect();
+        check("quantile/seven_multi_16m", &x.quantiles(&qs).to_vec().unwrap(), &want, 1e-5, 1e-6);
+        case_trim(h, "quantile/seven_multi_16m", &n.to_string(), Work::Items(7.0 * n as f64, "Mrow/s"), &mut || x.quantiles(&qs).eval().unwrap());
     }
 }
 

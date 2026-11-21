@@ -6,6 +6,14 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `Array::quantiles(&[q])` and `quantiles_axis(axis, &[q])`: many quantiles of an `f32` array (or of every line along an axis) from one sort. A call of `quantile` / `quantile_axis` per quantile sorts every time, and the sort is nearly all of the cost (seven quantiles of 16M elements took 8.7 ms against 1.2 ms for one sort and seven reads; three quantiles per column of a 1M x 64 table 28 ms on an RTX 3090 against one sort of it). Entry `j` along the axis is the quantile `qs[j]`.
+
+### Changed
+
+- `sort_axis` (and so `quantile_axis`, `median_axis`) on lines of up to 2048 elements (256 on the CPU backend), along any axis, sorts them in workgroup memory in one kernel that reads and writes every element once (a bitonic sort of tiles of whole lines; along an axis other than 0 a tile takes neighbouring lines so that the loads stay coalesced). Longer lines still use the radix sort of the whole array, but carry the values through the regrouping by line instead of gathering them afterwards and writing them back with a strided scatter: along an axis other than 0 the lines return to their layout with the tiled transpose (the strided scatter was 6 of the 17 ms of sorting a 1M x 64 table along axis 1). `sort_axis` returns NaNs as the positive quiet NaN, as `sort` does (it used to keep their bits).
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed

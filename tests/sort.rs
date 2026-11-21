@@ -252,6 +252,70 @@ fn sort_axis_matches_the_host_per_line_sort() {
     check_axis::<f32>(&ctx, &[3000, 1], 1, 17);
 }
 
+/// Lines shorter than a tile of the line-sort kernel (padded to a power of two, several per
+/// workgroup), longer ones (the radix route and its transpose), along every axis, with ragged
+/// ends: lines that do not fill the last tile and extents on both sides of a power of two.
+#[test]
+fn sort_axis_matches_the_host_at_ragged_tiles() {
+    let ctx = Context::new().unwrap();
+    let cases: &[(&[usize], usize)] = &[
+        (&[2, 1001], 0),
+        (&[1001, 2], 1),
+        (&[3, 5000], 0),
+        (&[31, 100], 0),
+        (&[33, 77], 0),
+        (&[64, 100], 0),
+        (&[65, 33], 0),
+        (&[1000, 7], 0),
+        (&[1024, 5], 0),
+        (&[1025, 3], 0),
+        (&[2048, 4], 0),
+        (&[2049, 3], 0),
+        (&[4097, 2], 0),
+        (&[100, 33], 1),
+        (&[70, 64], 1),
+        (&[100, 1025], 1),
+        (&[1000, 1025], 1),
+        (&[9, 2048], 1),
+        (&[9, 2049], 1),
+        (&[5, 64, 7], 1),
+        (&[33, 65, 9], 1),
+        (&[7, 2048, 3], 1),
+        (&[3, 2500, 5], 1),
+        (&[3, 5, 17, 2], 2),
+        (&[3, 5, 3000], 2),
+        (&[40, 3, 2, 70], 3),
+        (&[40, 3, 2, 70], 0),
+        (&[40, 3, 2, 70], 1),
+        (&[40, 3, 2, 70], 2),
+        (&[1500, 3000], 1),
+    ];
+    for (k, &(dims, axis)) in cases.iter().enumerate() {
+        check_axis::<f32>(&ctx, dims, axis, 100 + k as u64);
+        check_axis::<u32>(&ctx, dims, axis, 200 + k as u64);
+        check_axis::<i32>(&ctx, dims, axis, 300 + k as u64);
+    }
+}
+
+/// The result of `sort_axis` is an array like any other: it feeds further operations, and a line
+/// of a sorted array sorts to itself.
+#[test]
+fn sorted_axis_results_compose() {
+    let ctx = Context::new().unwrap();
+    for dims in [[50usize, 40], [40, 3000]] {
+        let host: Vec<f32> = data(dims[0] * dims[1], 7).into_iter().map(|v: f32| if v.is_nan() { 1.0 } else { v }).collect();
+        let x = Array::from_slice_on(&ctx, &host, dims).unwrap();
+        for axis in 0..2 {
+            let once = x.sort_axis(axis);
+            let twice = once.sort_axis(axis);
+            assert_eq!(keys(&once.to_vec().unwrap()), keys(&twice.to_vec().unwrap()));
+            let shifted = (&once + 1.0).to_vec().unwrap();
+            let want: Vec<f32> = host_sort_axis(&host, [dims[0], dims[1], 1, 1], axis).iter().map(|v| v + 1.0).collect();
+            assert_eq!(keys(&shifted), keys(&want));
+        }
+    }
+}
+
 #[test]
 fn bad_axis_poisons() {
     let ctx = Context::new().unwrap();
