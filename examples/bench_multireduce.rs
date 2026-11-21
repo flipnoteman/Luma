@@ -34,7 +34,14 @@ fn time(ctx: &Context, name: &str, size: &str, f: &mut dyn FnMut()) {
         .collect();
     samples.sort_by(f64::total_cmp);
     let (kernels, gpu) = match ctx.profile(f) {
-        Ok(((), p)) => (p.launches().to_string(), format!("{:.3}", p.total().as_secs_f64() * 1e3)),
+        Ok(((), p)) => {
+            if std::env::var_os("BENCH_KERNELS").is_some() {
+                for k in &p.kernels {
+                    println!("    {:<90} {:>4} {:>9.3} ms", k.label.chars().take(90).collect::<String>(), k.launches, k.total.as_secs_f64() * 1e3);
+                }
+            }
+            (p.launches().to_string(), format!("{:.3}", p.total().as_secs_f64() * 1e3))
+        }
         Err(e) => ("err".into(), e.to_string()),
     };
     println!("{name:<30} {size:>12} {:>10.3} {:>10.3} {kernels:>8} {gpu:>9}", samples[samples.len() / 2], samples[0]);
@@ -176,6 +183,51 @@ fn main() {
             run(&mut out);
             black_box(&out);
         });
+    }
+
+    // A force monitor: `3 * classes` masked sums of components of one gathered expression, each reshaped to one
+    // element, joined by `concat_slice` and read back once (`plain` reads every sum on its own).
+    for &n in sizes {
+        for variant in ["reshape_concat", "plain"] {
+            let name = format!("forces/{variant}");
+            if !want(&name) {
+                continue;
+            }
+            let p = Array::from_slice_on(&ctx, &values(n, 300, 0.0, 1.0), n).unwrap();
+            let m = n / 4;
+            let idx: Vec<u32> = (0..m).map(|i| ((i * 3) % n) as u32).collect();
+            let idx = Array::from_slice_on(&ctx, &idx, m).unwrap();
+            let cx = Array::<f32>::full_on(&ctx, m, 0.5).unwrap();
+            let masks: Vec<Array<bool>> = (0..8u32)
+                .map(|k| Array::from_slice_on(&ctx, &(0..m).map(|i| (i % 8) as u32 == k).collect::<Vec<_>>(), m).unwrap())
+                .collect();
+            let run = |out: &mut Vec<f32>| {
+                let d = &p.take(&idx) - 1.0f32;
+                let comps = [&d * &cx, &d * 2.0f32, &d * &d];
+                let mut sums = Vec::new();
+                for mask in &masks {
+                    for comp in &comps {
+                        let s = comp.sum_where(mask);
+                        sums.push(if variant == "plain" { s } else { s.reshape([1]) });
+                    }
+                }
+                out.clear();
+                if variant == "plain" {
+                    out.extend(sums.iter().map(|s| s.item().unwrap()));
+                } else {
+                    out.extend(concat_slice(0, &sums).to_vec().unwrap());
+                }
+            };
+            let (mut out, mut again) = (Vec::new(), Vec::new());
+            run(&mut out);
+            run(&mut again);
+            assert_eq!(out.len(), 24);
+            assert!(out.iter().zip(&again).all(|(a, b)| a.to_bits() == b.to_bits()), "{name}: unstable");
+            time(&ctx, &name, &n.to_string(), &mut || {
+                run(&mut out);
+                black_box(&out);
+            });
+        }
     }
 
     // Norms of several fields and dot products that share an operand.
