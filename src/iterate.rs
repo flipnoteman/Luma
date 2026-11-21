@@ -10,6 +10,7 @@ use crate::error::LumaError;
 use crate::gpu_type::ScalarType;
 use crate::jit::{self, Plan, Stepper, Trace};
 use crate::ops::Outcome;
+use luma_core::BackendKind;
 
 /// Runs `steps` iterations of `step` on several arrays at once (of any [`ScalarType`], `f32`,
 /// [`Df32`](crate::Df32), `f64`, ...): `step` gets the current values
@@ -170,7 +171,9 @@ fn run_stepper<T: ScalarType, const N: usize>(
     mut stepper: Stepper,
     traced: Option<Duration>,
 ) -> Outcome<Vec<Arc<Storage>>> {
-    if let Some(traced) = traced {
+    // The CPU backend has no workgroup memory to stage the shifted values of fused steps in: it
+    // recomputes them, which is slower than the steps one by one for a large state.
+    if let Some(traced) = traced.filter(|_| init[0].context().backend() != BackendKind::Cpu) {
         let depth = unroll_depth(steps, stepper.plan().modeled_ns(), traced);
         if let Some(unrolled) = trace_unrolled(init, depth, step, stepper.plan())? {
             return run_unrolled(&mut stepper, &unrolled, depth, steps);
