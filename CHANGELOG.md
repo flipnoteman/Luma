@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `luma-bench` keeps calling a case for up to 150 ms (when it takes under 5 ms) before timing it, so GPUs that idled between cases are at working clocks: an NVIDIA GPU drops to 210 MHz after ~50 ms idle, which made wgpu's sub-millisecond `jit/fusion` kernels (12 us) measure 8-15x slower than CUDA's.
+
 ### Added
 
 - `KernelBuilder::unchecked_bounds` (`unsafe`): builds a custom kernel without per-access bounds checks, for kernels whose author vouches that every access is in range (`luma_core::KernelTrust::UncheckedBounds`; the backend interface takes a `KernelTrust` where it took `trusted: bool`). On wgpu this is the only way to drop WebGPU's own checks.
