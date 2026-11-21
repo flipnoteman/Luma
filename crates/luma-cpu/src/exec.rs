@@ -294,8 +294,12 @@ const COLD_NS: u64 = 16_000;
 /// Prior cost of one invocation before the first measurement.
 const PRIOR_NS_PER_INVOCATION: u64 = 1;
 /// How long an idle worker or the waiting dispatcher polls before it sleeps on a condvar
-/// (`LUMA_CPU_SPIN_US`). Long enough to bridge the host work between the launches of a loop.
-const DEFAULT_SPIN: Duration = Duration::from_micros(1000);
+/// (`LUMA_CPU_SPIN_US`). Long enough to bridge the host work between the launches of a loop
+/// (`cfd/heat` and `jit/loop` steps are 5 to 200 us apart: no polling at all makes them 1.4 to 2x
+/// slower), short enough not to compete with the host's own work between launches for the cores:
+/// at 1 ms a launch followed by a 4 MB host memset (`ml/embed/scatter_add`) took 1.4x as long, and
+/// `datasci/take/sorted_idx` and `datasci/group` 5 to 14 % longer than at 200 us.
+const DEFAULT_SPIN: Duration = Duration::from_micros(200);
 /// Launches whose threads each work longer than this (nanoseconds) amortise a wake-up by
 /// themselves: their workers sleep at once instead of polling, which leaves the cores to the
 /// kernel (spinners on the other hyperthreads and a lower all-core clock slowed memory-bound
