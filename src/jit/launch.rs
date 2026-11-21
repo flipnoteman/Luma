@@ -18,7 +18,7 @@ use crate::sort::RadixPass;
 use crate::ops::{fold_workgroups, launch_1d, len_u32};
 
 use super::codegen::direct;
-use super::{lock, Args, Edge, ElemTy, Node, OpKind, ShiftKind, Src, ViewMap};
+use super::{lock, unresolved_leaves, Args, Edge, ElemTy, Node, OpKind, ShiftKind, Src, ViewMap};
 use crate::profile::SplitReason;
 use super::program::{flatten, flatten_inner, Fused, FusedKey, Ref, Tail};
 
