@@ -1,0 +1,729 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Matrices, statistics and grouping - The Luma Guide</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/versions-b71651b3.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-73370195.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-a2c80e88.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Luma Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/flipnoteman/Luma" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/flipnoteman/Luma/edit/main/guide/src/data.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="matrices-statistics-and-grouping"><a class="header" href="#matrices-statistics-and-grouping">Matrices, statistics and grouping</a></h1>
+<p>The operations of this chapter are what table and matrix workloads are made of: products,
+statistics along an axis, counting and grouping, sorting, unique values and quantiles. They
+compose with everything in the earlier chapters: operands that are lazy expressions are computed
+inside the kernels instead of being stored first, wherever the section says so.</p>
+<p>Remember the shape convention: <strong>axis 0 varies fastest</strong>. A <code>[rows, columns]</code> array in the
+NumPy sense is a luma array of shape <code>[columns, rows]</code>, and a table with one <em>column per
+feature</em> is naturally <code>[samples, features]</code>, so that each feature is contiguous and reductions
+over the samples are <code>axis</code> 0.</p>
+<h2 id="matrix-products"><a class="header" href="#matrix-products">Matrix products</a></h2>
+<p><code>a.matmul(&amp;b)</code> (or <code>matmul(&amp;a, &amp;b)</code>) multiplies two <code>f32</code> matrices. NumPy’s <code>a @ b</code> with <code>a</code> of
+shape <code>(M, K)</code> and <code>b</code> of shape <code>(K, N)</code> becomes, with the axes reversed:</p>
+<ul>
+<li><code>a</code> has shape <code>[K, M]</code>,</li>
+<li><code>b</code> has shape <code>[N, K]</code>,</li>
+<li>the result has shape <code>[N, M]</code>, element <code>(n, m)</code> being <code>Σ_k a[k, m] * b[n, k]</code>.</li>
+</ul>
+<p>Written out as flat data, each matrix is listed row by row, which is exactly what row-major
+NumPy data looks like:</p>
+<pre><code class="language-rust">use luma::*;
+
+// [[1, 2, 3],      [[1, 0],        [[4,  5],
+//  [4, 5, 6]]  @    [0, 1],    =    [10, 11]]
+//                   [1, 1]]
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?; // K = 3, M = 2
+let b = Array::from_slice(&amp;[1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0], [2, 3])?; // N = 2, K = 3
+let c = a.matmul(&amp;b);
+assert_eq!(c.shape(), Shape::from([2, 2]));
+assert_eq!(c.to_vec()?, vec![4.0, 5.0, 10.0, 11.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>One-dimensional operands count as having extent 1 on axis 1; extents beyond axis 1 must be 1.
+<code>transpose()</code> is a view that the kernel reads in place, so products with transposed operands cost
+no copy:</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?;
+// `a` is [[1, 2, 3], [4, 5, 6]]; a @ a.T is 2 x 2, a.T @ a is 3 x 3.
+let rows = a.matmul(&amp;a.transpose());
+assert_eq!(rows.to_vec()?, vec![14.0, 32.0, 32.0, 77.0]);
+let cols = a.transpose().matmul(&amp;a);
+assert_eq!(cols.shape(), Shape::from([3, 3]));
+assert_eq!(cols.to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 45.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>An operand that is a pending expression is not stored first: its expression is evaluated inside
+the product’s loads, once per use. A standardised Gram (correlation-style) matrix of a table with
+one column per feature (<code>[samples, features]</code>) is one launch plus the statistics:</p>
+<pre><code class="language-rust">use luma::*;
+
+let samples = 8;
+let x = Array::from_slice(
+    &amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, // feature 0
+      2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, // feature 1 = 2 * feature 0
+      8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0], // feature 2 = 9 - feature 0
+    [samples, 3],
+)?;
+let z = (&amp;x - &amp;x.mean_axis(0)) / x.std_axis(0); // pending: standardised columns
+// features x samples times samples x features: the Gram matrix of the columns.
+let corr = z.matmul(&amp;z.transpose()) / (samples as f32);
+let corr = corr.to_vec()?;
+let expected = [1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0];
+for (got, want) in corr.iter().zip(expected) {
+    assert!((got - want).abs() &lt; 1e-4);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The product itself is <em>eager</em>: it is recorded when <code>matmul</code> is called and the result is an
+evaluated array, so whatever consumes the result (here the division) runs as its own kernel.
+Operands whose expressions read circular shifts are evaluated first; everything else fuses.</p>
+<p>Errors poison the result like everywhere else: <code>ShapeMismatch</code> if <code>a.shape()[0] != b.shape()[1]</code> or an operand has more than two axes above 1, <code>ContextMismatch</code> for operands of
+different contexts, and <code>Chunked</code> for operands or results that need more than one buffer.
+Only <code>f32</code> has a product.</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::&lt;f32&gt;::zeros([3, 2])?;
+let b = Array::&lt;f32&gt;::zeros([3, 2])?; // needs shape [N, 3]
+assert!(matches!(a.matmul(&amp;b).to_vec(), Err(LumaError::Op { .. })));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="statistics-along-an-axis"><a class="header" href="#statistics-along-an-axis">Statistics along an axis</a></h2>
+<p><code>reduce_axis(axis, [ops])</code> computes one to four reductions (<code>Reduction::Sum</code>, <code>Min</code>, <code>Max</code>,
+<code>SumOfSquares</code>) along an axis in <strong>one pass</strong>: every element is read once for all of them. It
+returns an array of results, one per op, each with extent 1 along <code>axis</code>. A pending operand is
+computed inside the pass and never stored.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two columns of four; reduce along axis 0.
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 10.0, 20.0], [4, 2])?;
+let [sum, sum_sq, max] = x.reduce_axis(0, [Reduction::Sum, Reduction::SumOfSquares, Reduction::Max]);
+assert_eq!(sum.to_vec()?, vec![10.0, 60.0]);
+assert_eq!(sum_sq.to_vec()?, vec![30.0, 1000.0]);
+assert_eq!(max.to_vec()?, vec![4.0, 20.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The results are evaluated when the call returns. Another number of ops poisons the results.
+<code>sum_axis</code>, <code>min_axis</code> and <code>max_axis</code> are the single-op cases. They (and <code>reduce_axis</code>) work on
+<code>f32</code>, <code>u32</code> and <code>i32</code> (<code>SumOfSquares</code> of integers wraps); <code>bool</code> arrays have <code>sum_axis</code> (a
+count, <code>u32</code>), <code>min_axis</code> and <code>max_axis</code> only.</p>
+<p>For <code>f32</code>, <code>mean_axis</code>, <code>var_axis</code> and <code>std_axis</code> give the mean, the <strong>population</strong> variance
+(divisor <code>n</code>, NumPy’s <code>ddof = 0</code>) and its square root. They are lazy expressions on top of the
+reductions, so they broadcast back against the array. <code>var_axis</code> is two-pass (the mean, then the
+mean of squared deviations), which keeps it accurate for data far from zero:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 10.0, 20.0], [4, 2])?;
+assert_eq!(x.mean_axis(0).to_vec()?, vec![2.5, 15.0]);
+assert_eq!(x.var_axis(0).to_vec()?, vec![1.25, 25.0]);
+assert_eq!(x.std_axis(0).to_vec()?[1], 5.0);
+
+// Far from zero the two-pass variance is still right.
+let y = Array::from_slice(&amp;[1.0e4f32 + 1.0, 1.0e4 + 2.0, 1.0e4 + 3.0, 1.0e4 + 4.0], 4)?;
+assert!((y.var_axis(0).item()? - 1.25).abs() &lt; 1e-3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="argmax-and-argmin"><a class="header" href="#argmax-and-argmin">Argmax and argmin</a></h2>
+<p><code>argmax</code> and <code>argmin</code> give the <strong>flat index</strong> of the largest or smallest element as a
+one-element <code>u32</code> array, recorded without waiting like <code>sum</code> and usable on the GPU at once. A
+pending operand is computed inside the first pass, never stored. <code>argmax_axis(axis)</code> and
+<code>argmin_axis(axis)</code> give, for every line along <code>axis</code>, the index <em>along the axis</em> (extent 1
+there in the result). The first of equal elements wins, and an <code>f32</code> NaN is returned before every number, by
+<code>argmin</code> as well as by <code>argmax</code> (the first NaN, as in NumPy). They work on <code>f32</code>, <code>u32</code> and <code>i32</code>
+(<code>f64</code> and <code>Df32</code> arrays poison the result with <code>Unsupported</code>, like the other reductions along
+an axis).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3.0f32, 9.0, 1.0, 9.0, 7.0, 2.0, 8.0, 0.5], [4, 2])?;
+assert_eq!(x.argmax().item()?, 1); // the first of the two 9s
+assert_eq!(x.argmin().item()?, 7);
+
+// Along axis 0 (a column of four per result): the row of the extreme of each column.
+assert_eq!(x.argmax_axis(0).to_vec()?, vec![1, 2]);
+assert_eq!(x.argmin_axis(0).to_vec()?, vec![2, 3]);
+
+// Along axis 1: which of the two columns is larger, for each row.
+assert_eq!(x.argmax_axis(1).to_vec()?, vec![1, 0, 1, 0]);
+
+// An expression is not stored: the index of the sample nearest to 7.5.
+let nearest = (&amp;x - 7.5).abs().argmin();
+assert_eq!(nearest.item()?, 4);
+
+// A NaN is found first, whichever extreme is asked for.
+let y = Array::from_slice(&amp;[1.0f32, f32::NAN, 5.0, f32::NAN], 4)?;
+assert_eq!((y.argmax().item()?, y.argmin().item()?), (1, 1));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A flat index <code>i</code> of a <code>[w, h]</code> array is the element at <code>(i % w, i / w)</code>. The passes are those of
+<code>sum_axis</code> (a workgroup per chunk of a contiguous line, blocks that an invocation walks for a
+strided one) carrying a (value, index) pair, so an <code>argmax_axis</code> reads the data once and costs
+the time of <code>max_axis</code>. Reading the result of <code>argmax()</code> back with <code>item()</code> is a host
+synchronization (about 100 µs); use it on the GPU (<code>x.take(&amp;x.argmax())</code>) to avoid it.</p>
+<h2 id="accumulating-scatters"><a class="header" href="#accumulating-scatters">Accumulating scatters</a></h2>
+<p><a href="views.html"><code>put</code></a> overwrites: of several equal indices one (unspecified) wins. <code>put_add</code>,
+<code>put_min</code> and <code>put_max</code> <em>combine</em> instead: every <code>i</code> does <code>self[indices[i]] += values[i]</code> (or
+<code>min</code>, <code>max</code>), duplicates included. They exist for <code>u32</code>, <code>i32</code> and <code>f32</code> arrays, work in place
+on top of the contents the array already has, skip indices of <code>len</code> or more, and must be called
+on the array itself, not on a view. <code>values</code> is an array of the shape of <code>indices</code> or one value;
+both are computed inside the kernel, not stored first.</p>
+<pre><code class="language-rust">use luma::*;
+
+let mut totals = Array::&lt;u32&gt;::full(4, 100)?;
+let indices = Array::from_slice(&amp;[0u32, 2, 2, 7, 2], 5)?; // 7 is out of range: skipped
+totals.put_add(&amp;indices, &amp;Array::from_slice(&amp;[1u32, 10, 20, 5, 30], 5)?)?;
+assert_eq!(totals.to_vec()?, vec![101, 100, 160, 100]);
+
+let mut lo = Array::&lt;f32&gt;::full(3, f32::INFINITY)?;
+lo.put_min(&amp;Array::from_slice(&amp;[1u32, 1, 2], 3)?, &amp;Array::from_slice(&amp;[4.0f32, 2.0, 9.0], 3)?)?;
+assert_eq!(lo.to_vec()?, vec![f32::INFINITY, 2.0, 9.0]);
+
+let mut hi = Array::&lt;i32&gt;::full(2, i32::MIN)?;
+hi.put_max(&amp;Array::from_slice(&amp;[0u32, 0, 1], 3)?, -3)?;
+assert_eq!(hi.to_vec()?, vec![-3, -3]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Integer sums wrap and are exact. <code>f32</code> sums are accumulated atomically in no fixed order, so
+their last bits can differ between runs (and from a host loop); <code>min</code> and <code>max</code> do not depend
+on the order. The scatters are atomic, so a million values into a few cells is fine.</p>
+<h2 id="counting-and-histograms"><a class="header" href="#counting-and-histograms">Counting and histograms</a></h2>
+<p><code>bincount(&amp;indices, bins)</code> is the number of occurrences of each value in <code>0..bins</code>, as a <code>u32</code>
+array; values of <code>bins</code> or more are not counted. <code>histogram(bins, lo, hi)</code> counts the elements
+of an <code>f32</code> array in <code>bins</code> equal-width bins over <code>[lo, hi)</code>. Values below <code>lo</code> and NaN go to
+bin 0, values of <code>hi</code> or more to the last bin. The bin computation runs inside the scatter
+kernel, so a pending array is not stored. <code>bins == 0</code> or <code>hi &lt;= lo</code> (or NaN bounds) poison the
+result with <code>InvalidShape</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+let codes = Array::from_slice(&amp;[2u32, 0, 2, 2, 5, 9], 6)?;
+assert_eq!(bincount(&amp;codes, 4).to_vec()?, vec![1, 0, 3, 0]); // 5 and 9 are not counted
+
+let x = Array::from_slice(&amp;[-5.0f32, 0.5, 1.5, 1.6, 3.9, 4.0, 100.0, f32::NAN], 8)?;
+assert_eq!(x.histogram(4, 0.0, 4.0).to_vec()?, vec![3, 2, 0, 3]);
+assert!(x.histogram(0, 0.0, 4.0).to_vec().is_err());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="sorting"><a class="header" href="#sorting">Sorting</a></h2>
+<p><code>sort</code>, <code>sort_descending</code>, <code>argsort</code>, <code>argsort_descending</code> and <code>sort_axis(axis)</code> order <code>u32</code>,
+<code>i32</code> and <code>f32</code> arrays with a stable radix sort on the GPU (<code>f64</code> and <code>Df32</code> fail with
+<code>Unsupported</code>; arrays over several buffers with <code>Chunked</code>). <code>sort</code> and <code>argsort</code> work on the flat
+array and keep its shape. <code>argsort</code> returns the flat indices that sort the array, and since the
+sort is stable, equal elements keep their input order. The results are recorded like any other
+operation, and a pending input is not evaluated first: the keys are computed inside the first
+pass of the sort.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3.0f32, -1.0, f32::NAN, 2.0, -1.0, 0.5], [3, 2])?;
+assert_eq!(x.argsort().to_vec()?, vec![1, 4, 5, 3, 0, 2]);
+// Sorts every line along axis 0 (the first dimension varies fastest).
+let lines = x.sort_axis(0).to_vec()?;
+assert_eq!(&amp;lines[..2], &amp;[-1.0, 3.0]);
+assert!(lines[2].is_nan());
+assert_eq!(&amp;lines[3..], &amp;[-1.0, 0.5, 2.0]);
+
+let n = Array::from_slice(&amp;[2u32, 7, 2, 9], 4)?;
+assert_eq!(n.sort().to_vec()?, vec![2, 2, 7, 9]);
+assert_eq!(n.sort_descending().to_vec()?, vec![9, 7, 2, 2]);
+// Descending is the exact reverse by key: the tied 2s still keep their input order.
+assert_eq!(n.argsort_descending().to_vec()?, vec![3, 1, 0, 2]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Floats sort in the total order of their bits: <code>-inf &lt; .. &lt; -0.0 &lt; +0.0 &lt; .. &lt; +inf &lt; NaN</code>, so
+NaNs come last (first when descending) and <code>-0.0</code> sorts before <code>+0.0</code> (and <code>+0.0</code> before
+<code>-0.0</code> when descending, by input order for ties). The sign of a NaN is not kept.
+<code>sort_axis(axis)</code> sorts every line along <code>axis</code> independently, stably, and keeps the shape.</p>
+<h2 id="groups"><a class="header" href="#groups">Groups</a></h2>
+<p><code>group_sum</code>, <code>group_min</code>, <code>group_max</code>, <code>group_mean</code> and <code>group_count</code> reduce the elements that
+share a code, a groupby over dense codes <code>0..groups</code>: result element <code>g</code> combines the elements
+<code>i</code> with <code>codes[i] == g</code>. <code>codes</code> is a <code>u32</code> array of the shape of the values (else
+<code>ShapeMismatch</code>), and codes of <code>groups</code> or more are skipped. The values (<code>u32</code>, <code>i32</code> or <code>f32</code>;
+<code>group_mean</code> is <code>f32</code> only) and the codes fuse into one scatter kernel; <code>f32</code> sums are not
+bitwise reproducible (see above).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0], 5)?;
+let codes = Array::from_slice(&amp;[0u32, 1, 0, 1, 3], 5)?; // group 2 is empty
+assert_eq!(x.group_sum(&amp;codes, 4).to_vec()?, vec![4.0, 6.0, 0.0, 5.0]);
+assert_eq!(x.group_count(&amp;codes, 4).to_vec()?, vec![2, 2, 0, 1]);
+assert_eq!(x.group_min(&amp;codes, 4).to_vec()?, vec![1.0, 2.0, f32::INFINITY, 5.0]);
+assert_eq!(x.group_max(&amp;codes, 4).to_vec()?, vec![3.0, 4.0, f32::NEG_INFINITY, 5.0]);
+let mean = x.group_mean(&amp;codes, 4).to_vec()?;
+assert_eq!(&amp;mean[..2], &amp;[2.0, 3.0]);
+assert!(mean[2].is_nan());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Empty groups give 0 for sums and counts, NaN for means and the identity of the operation for
+<code>group_min</code> / <code>group_max</code>: <code>+inf</code> / <code>-inf</code> for <code>f32</code>, the integer maximum / minimum for <code>u32</code>
+and <code>i32</code> (<code>u32::MAX</code> / <code>0</code>, <code>i32::MAX</code> / <code>i32::MIN</code>).</p>
+<p>Where the groups are labels rather than <code>0..groups</code>, <code>factorize</code> (next section) makes the codes.</p>
+<h2 id="unique-values"><a class="header" href="#unique-values">Unique values</a></h2>
+<p><code>factorize()</code> returns the sorted distinct values of an array (flat, one dimension) and, shaped
+like the array, the index of each element’s value in them: <code>uniques.take(&amp;codes)</code> is the array
+again. <code>unique()</code> is the first result alone. Both evaluate the array and read back the number of
+distinct values, which synchronises once. For floats all NaNs are one value (the last) and <code>-0.0</code>
+and <code>+0.0</code> are one value, returned as <code>-0.0</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+let labels = Array::from_slice(&amp;[50u32, 30, 50, 90, 30], 5)?;
+let (uniques, codes) = labels.factorize();
+assert_eq!(uniques.to_vec()?, vec![30, 50, 90]);
+assert_eq!(codes.to_vec()?, vec![1, 0, 1, 2, 0]);
+assert_eq!(uniques.take(&amp;codes).to_vec()?, vec![50, 30, 50, 90, 30]);
+// The codes feed the group reductions.
+let amount = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0], 5)?;
+assert_eq!(amount.group_sum(&amp;codes, uniques.len()).to_vec()?, vec![7.0, 4.0, 4.0]);
+
+let f = Array::from_slice(&amp;[0.0f32, -0.0, f32::NAN, 1.0, f32::NAN], 5)?;
+let u = f.unique().to_vec()?;
+assert_eq!(u.len(), 3);
+assert!(u[0] == 0.0 &amp;&amp; u[0].is_sign_negative());
+assert_eq!(u[1], 1.0);
+assert!(u[2].is_nan());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="quantiles"><a class="header" href="#quantiles">Quantiles</a></h2>
+<p><code>quantile(q)</code> and <code>median()</code> of an <code>f32</code> array give a one-element array, interpolating linearly
+between the sorted neighbours as NumPy’s default does: with <code>h = q * (len - 1)</code> the value at
+<code>floor(h)</code> plus <code>h - floor(h)</code> times the step to the value at <code>ceil(h)</code>. <code>quantile_axis(axis, q)</code>
+and <code>median_axis(axis)</code> do it for every line along an axis (extent 1 there in the result). <code>q</code>
+outside <code>[0, 1]</code> (NaN included) poisons the result with <code>InvalidShape</code>. The sort is evaluated,
+the interpolation is lazy.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[4.0f32, 1.0, 3.0, 2.0], 4)?;
+assert_eq!(x.median().item()?, 2.5);
+assert_eq!(x.quantile(0.0).item()?, 1.0);
+assert_eq!(x.quantile(0.25).item()?, 1.75);
+assert_eq!(x.quantile(1.0).item()?, 4.0);
+assert!(x.quantile(1.5).item().is_err());
+
+// Two columns of four: the median of each.
+let t = Array::from_slice(&amp;[4.0f32, 1.0, 3.0, 2.0, 10.0, 50.0, 30.0, 20.0], [4, 2])?;
+assert_eq!(t.median_axis(0).to_vec()?, vec![2.5, 25.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>NaNs sort last, so they only affect the high quantiles; NumPy returns NaN for every quantile of
+an array with a NaN, this does not.</p>
+<h2 id="selecting-elements"><a class="header" href="#selecting-elements">Selecting elements</a></h2>
+<p><code>x.filter(&amp;mask)</code> returns the elements where a mask holds, in flat order, as a one-dimensional
+array; the mask is an <code>Array&lt;bool&gt;</code> (a comparison, for example) or an <code>Array&lt;u32&gt;</code> whose non-zero
+elements are selected, and has the shape of <code>x</code>. <code>mask.nonzero()</code> returns the flat indices of the
+selected elements (axis 0 varies fastest, so element <code>[i0, i1]</code> of a <code>[d0, d1]</code> array has index
+<code>i0 + d0 * i1</code>). Both are a count, a scan and a scatter on the GPU, about as fast as copying the
+array.</p>
+<p>The length of the result depends on the data, so both read the count back and synchronise once
+(about 100 µs on an RTX 3090), and return <code>Result&lt;Option&lt;Array&lt;_&gt;&gt;&gt;</code>: <code>None</code> means nothing was
+selected, because luma has no arrays without elements, and selecting nothing is a result rather
+than an error.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[5.0f32, -1.0, 7.0, -3.0, 2.0], 5)?;
+let positive = x.gt(0.0);
+assert_eq!(x.filter(&amp;positive)?.unwrap().to_vec()?, vec![5.0, 7.0, 2.0]);
+assert_eq!(positive.nonzero()?.unwrap().to_vec()?, vec![0, 2, 4]);
+assert!(x.filter(&amp;x.gt(10.0))?.is_none());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>To stay on the device, <code>filter_padded(&amp;mask, fill)</code> and <code>nonzero_padded(fill)</code> return an array of
+the full length (the selected elements first, then <code>fill</code>) and the number of selected elements as
+a lazy one-element array.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[5.0f32, -1.0, 7.0, -3.0, 2.0], 5)?;
+let (kept, count) = x.filter_padded(&amp;x.gt(0.0), 0.0);
+assert_eq!(kept.to_vec()?, vec![5.0, 7.0, 2.0, 0.0, 0.0]);
+assert_eq!(count.item()?, 3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>topk(k)</code> and <code>bottomk(k)</code> of a <code>u32</code>, <code>i32</code> or <code>f32</code> array return the <code>k</code> largest (smallest)
+values and their flat indices, largest (smallest) first, ties in input order, NaNs counting as
+the largest. They sort the whole array with <code>argsort</code>, so the cost does not depend on <code>k</code>. <code>k</code> of
+0 or more than the length poisons both results with <code>InvalidShape</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3.0f32, 9.0, 1.0, 7.0], 4)?;
+let (values, indices) = x.topk(2);
+assert_eq!(values.to_vec()?, vec![9.0, 7.0]);
+assert_eq!(indices.to_vec()?, vec![1, 3]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="searching-sorted-arrays"><a class="header" href="#searching-sorted-arrays">Searching sorted arrays</a></h2>
+<p><code>sorted.searchsorted(&amp;values, side)</code> is NumPy’s <code>searchsorted</code>: element <code>i</code> of the result is the
+position where <code>values[i]</code> would be inserted into <code>sorted</code> to keep it ordered, <code>Side::Left</code> before
+the elements equal to it (the number of elements below it) and <code>Side::Right</code> after them (below or
+equal). <code>sorted</code> is one-dimensional and ascending, as <code>sort()</code> makes it (floats: NaNs last, larger
+than everything, equal to each other; <code>-0.0</code> equals <code>+0.0</code>); it works for <code>u32</code>, <code>i32</code> and <code>f32</code>.
+The result has the shape of <code>values</code>.</p>
+<p><code>x.digitize(&amp;edges, right)</code> is <code>np.digitize</code> for increasing edges: the number of the bin of each
+element, <code>0</code> below the first edge and <code>edges.len()</code> above the last, with <code>right</code> choosing whether a
+value on an edge belongs to the bin below (<code>edges[i - 1] &lt; x &lt;= edges[i]</code>) or above it
+(<code>edges[i - 1] &lt;= x &lt; edges[i]</code>). Together with <code>bincount</code> it is a histogram with uneven bins.
+<code>x.isin(&amp;set)</code> is <code>np.isin</code>: a <code>bool</code> array of whether each element is in <code>set</code> (any shape; NaN is
+in no set).</p>
+<pre><code class="language-rust">use luma::*;
+
+let edges = Array::from_slice(&amp;[0.0f32, 1.0, 2.5, 5.0], 4)?;
+let x = Array::from_slice(&amp;[-1.0f32, 0.0, 1.0, 2.5, 4.9, 9.0], 6)?;
+assert_eq!(edges.searchsorted(&amp;x, Side::Left).to_vec()?, vec![0, 0, 1, 2, 3, 4]);
+assert_eq!(edges.searchsorted(&amp;x, Side::Right).to_vec()?, vec![0, 1, 2, 3, 3, 4]);
+
+// Bins: [.., 0), [0, 1), [1, 2.5), [2.5, 5), [5, ..)
+let bins = x.digitize(&amp;edges, false);
+assert_eq!(bins.to_vec()?, vec![0, 1, 2, 3, 3, 4]);
+assert_eq!(bincount(&amp;bins, 5).to_vec()?, vec![1, 1, 1, 2, 1]);
+assert_eq!(x.digitize(&amp;edges, true).to_vec()?, vec![0, 0, 1, 2, 3, 4]);
+
+let allowed = Array::from_slice(&amp;[3u32, 5, 8], 3)?;
+let ids = Array::from_slice(&amp;[1u32, 3, 5, 7, 8], 5)?;
+assert_eq!(ids.isin(&amp;allowed).to_vec()?, vec![false, true, true, false, true]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The search is <em>lazy</em> and elementwise over the values: a lookup is one binary search per value,
+<code>ceil(log2(n + 1))</code> steps of gathers from <code>sorted</code>, and when the values are a pending expression
+(<code>(x * scale + offset)</code>) they are computed inside the kernel instead of being stored first.
+<code>sorted</code> is read as a buffer (a pending one is evaluated first). Measured on an RTX 3090,
+<code>2^24</code> values into <code>2^16</code> edges take 0.89 ms, 10% less than a hand-written WGSL binary search
+(<code>cargo run --release --example bench_datasci -- --only searchsorted</code>). <code>isin</code> sorts the set when it
+is called (eager, no host synchronisation; duplicates in the set do not matter) and then looks the
+elements up like <code>searchsorted</code> does and compares the element found. A <code>sorted</code> that is not
+one-dimensional poisons the result with <code>InvalidShape</code>.</p>
+<h2 id="nan-aware-reductions"><a class="header" href="#nan-aware-reductions">NaN-aware reductions</a></h2>
+<p><code>nansum</code>, <code>nanmean</code>, <code>nanmin</code> and <code>nanmax</code> skip the NaNs, as NumPy’s functions of the same names. Like
+<code>sum</code> and <code>min</code> they are lazy one-element arrays; <code>nansum_axis</code>, <code>nanmean_axis</code>, <code>nanmin_axis</code> and
+<code>nanmax_axis</code> reduce along an axis (extent 1 there in the result). An array of NaNs only has
+sum <code>0</code>, and mean, minimum and maximum NaN. Infinities are values: <code>nanmax</code> of <code>[NaN, inf]</code> is <code>inf</code>.
+<code>nansum</code>, <code>nanmin</code> and <code>nanmax</code> exist for <code>f32</code>, <code>f64</code> and <code>Df32</code>, the others (mean and the axis forms,
+for which <code>f64</code> and <code>Df32</code> have no reductions) for <code>f32</code>.</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two columns of three: [1, NaN, 3] and [4, NaN, NaN].
+let x = Array::from_slice(&amp;[1.0f32, f32::NAN, 3.0, 4.0, f32::NAN, f32::NAN], [3, 2])?;
+assert_eq!(x.nansum().item()?, 8.0);
+assert_eq!(x.nanmin().item()?, 1.0);
+assert_eq!(x.nanmax().item()?, 4.0);
+assert_eq!(x.nansum_axis(0).to_vec()?, vec![4.0, 4.0]);
+assert_eq!(x.nanmean_axis(0).to_vec()?, vec![2.0, 4.0]);
+assert_eq!(x.nanmin_axis(0).to_vec()?, vec![1.0, 4.0]);
+assert_eq!(x.nanmax_axis(0).to_vec()?, vec![3.0, 4.0]);
+
+let nothing = Array::from_slice(&amp;[f32::NAN; 3], 3)?;
+assert_eq!(nothing.nansum().item()?, 0.0);
+assert!(nothing.nanmean().item()?.is_nan() &amp;&amp; nothing.nanmin().item()?.is_nan());
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The masking (<code>select(!is_nan(x), x, 0)</code>) is part of the reduction’s first pass, so a pending operand
+is not stored. <code>nansum</code> reads the elements once; <code>nanmean</code> (sum and count) and <code>nanmin</code> / <code>nanmax</code>
+(the extremum, and whether any element is not NaN, which tells an array of NaNs from one whose
+minimum is <code>inf</code>) read them twice.</p>
+<h2 id="more-elementwise-functions"><a class="header" href="#more-elementwise-functions">More elementwise functions</a></h2>
+<p><code>round</code>, <code>trunc</code>, <code>log1p</code> and <code>expm1</code> are lazy <code>f32</code> functions (<code>round</code> and <code>trunc</code> also for <code>f64</code>,
+<code>log1p</code> and <code>expm1</code> also for <code>Df32</code>). <code>round</code> goes to the nearest integer and <em>halves to the even
+one</em> (<code>0.5</code> is <code>0</code>, <code>1.5</code> and <code>2.5</code> are <code>2</code>), what NumPy’s <code>round</code> and WGSL’s <code>round</code> do; <code>trunc</code>
+rounds toward zero. <code>log1p(x)</code> is <code>ln(1 + x)</code> and <code>expm1(x)</code> is <code>e^x - 1</code>, accurate where
+<code>(1.0 + x).ln()</code> and <code>x.exp() - 1.0</code> have lost the digits of a small <code>x</code>: for <code>|x|</code> below 1
+(<code>expm1</code>) or in <code>(-0.5, 1)</code> (<code>log1p</code>) they evaluate a series, elsewhere the plain formula (about <code>1e-6</code>
+relative error; <code>Df32</code>: 44 bits).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[0.5f32, 1.5, 2.5, -0.5, -2.7], 5)?;
+assert_eq!(x.round().to_vec()?, vec![0.0, 2.0, 2.0, 0.0, -3.0]);
+assert_eq!(x.trunc().to_vec()?, vec![0.0, 1.0, 2.0, 0.0, -2.0]);
+
+let tiny = Array::from_slice(&amp;[1.0e-9f32, -1.0e-9], 2)?;
+// `(1.0 + x).ln()` is 0 for both: 1 + 1e-9 rounds to 1.
+for (got, want) in tiny.log1p().to_vec()?.iter().zip([1.0e-9f32, -1.0e-9]) {
+    assert!(((got - want) / want).abs() &lt; 1e-6);
+}
+for (got, want) in tiny.expm1().to_vec()?.iter().zip([1.0e-9f32, -1.0e-9]) {
+    assert!(((got - want) / want).abs() &lt; 1e-6);
+}
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="recipes"><a class="header" href="#recipes">Recipes</a></h2>
+<p>Small statistics and array manipulations that are a line or two of the operations above, and that
+fuse like them. Axis 0 varies fastest, as everywhere.</p>
+<p><strong><code>diff</code></strong> (differences of neighbours along an axis): two slices, one subtraction, no copy:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 4.0, 9.0, 16.0], 4)?;
+let n = x.len();
+let diff = x.slice(0, 1..) - x.slice(0, ..n - 1);
+assert_eq!(diff.to_vec()?, vec![3.0, 5.0, 7.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>cumprod</code></strong>, a scan with <code>*</code> (a running sum is <code>cumsum</code>, any associative operator can be scanned):</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+assert_eq!(x.scan(0, |a, b| a * b).to_vec()?, vec![1.0, 2.0, 6.0, 24.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>softmax</code> and <code>logsumexp</code></strong> along an axis: subtract the maximum first, so that <code>exp</code> cannot
+overflow; the subtraction and <code>exp</code> are computed inside the sum:</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two rows of three logits (axis 0 is the row).
+let logits = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0], [3, 2])?;
+let max = logits.max_axis(0);
+let e = (&amp;logits - &amp;max).exp();
+let total = e.sum_axis(0);
+let softmax = (&amp;e / &amp;total).to_vec()?;
+let logsumexp = (&amp;max + &amp;total.ln()).to_vec()?;
+let third = 1.0f32 / 3.0;
+for (got, want) in softmax.iter().zip([0.09003057, 0.24472848, 0.66524094, third, third, third]) {
+    assert!((got - want).abs() &lt; 1e-6, "{got} {want}");
+}
+assert!((logsumexp[0] - 3.4076059).abs() &lt; 1e-5 &amp;&amp; (logsumexp[1] - 3.0f32.ln()).abs() &lt; 1e-5);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>one_hot</code></strong> of class labels, one column per label: compare the labels with the class index
+(<code>range</code>), which broadcasts without a copy:</p>
+<pre><code class="language-rust">use luma::*;
+
+let labels = Array::from_slice(&amp;[2u32, 0, 1, 2], 4)?;
+let classes = Array::&lt;u32&gt;::range([3, 4], 0)?; // element (c, i) is c
+let one_hot = classes.eq(&amp;labels.reshape([1, 4])).to_f32();
+assert_eq!(one_hot.to_vec()?, vec![0., 0., 1., 1., 0., 0., 0., 1., 0., 0., 0., 1.]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong>Shuffles and random permutations</strong>: sort random keys and take the order (<code>argsort</code> is stable, so a
+tie of two keys keeps the input order and the result is a permutation regardless):</p>
+<pre><code class="language-rust">use luma::*;
+
+let keys = Array::uniform(8, 42)?; // the seed picks the permutation
+let order = keys.argsort();
+let data = Array::from_slice(&amp;[10u32, 11, 12, 13, 14, 15, 16, 17], 8)?;
+let mut shuffled = data.take(&amp;order).to_vec()?;
+shuffled.sort();
+assert_eq!(shuffled, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>cov</code> and <code>corr</code></strong> of a table with one column per feature (<code>[samples, features]</code>): the product of
+the centred (or standardised) data with its transpose, the centring fused into the product’s loads:</p>
+<pre><code class="language-rust">use luma::*;
+
+let samples = 4;
+// Two features: the second is twice the first.
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0], [samples, 2])?;
+let centred = &amp;x - &amp;x.mean_axis(0);
+let cov = (centred.matmul(&amp;centred.transpose()) / (samples as f32 - 1.0)).to_vec()?;
+for (got, want) in cov.iter().zip([5.0 / 3.0, 10.0 / 3.0, 10.0 / 3.0, 20.0 / 3.0]) {
+    assert!((got - want).abs() &lt; 1e-5, "{got} {want}");
+}
+let z = &amp;centred / &amp;x.std_axis(0);
+let corr = (z.matmul(&amp;z.transpose()) / (samples as f32)).to_vec()?;
+assert!(corr.iter().all(|c| (c - 1.0).abs() &lt; 1e-5));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>clip</code></strong> is <code>clamp</code>, with the bounds as plain numbers:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[-2.0f32, 0.5, 3.0], 3)?;
+assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="reductions.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="records.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="reductions.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="records.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="theme/versions-85bad2c7.js"></script>
+
+
+
+    </div>
+    </body>
+</html>
