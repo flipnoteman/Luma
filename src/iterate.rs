@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::array::{Array, Failure, Storage};
 use crate::error::LumaError;
+use crate::gpu::lock;
 use crate::gpu_type::ScalarType;
 use crate::jit::{self, Plan, Stepper, Trace};
 use crate::ops::Outcome;
@@ -173,15 +174,26 @@ fn run_stepper<T: ScalarType, const N: usize>(
 ) -> Outcome<Vec<Arc<Storage>>> {
     // The CPU backend has no workgroup memory to stage the shifted values of fused steps in: it
     // recomputes them, which is slower than the steps one by one for a large state.
-    if let Some(traced) = traced.filter(|_| init[0].context().backend() != BackendKind::Cpu) {
+    let site = (std::any::type_name_of_val(step), init[0].len(), N);
+    if let Some(traced) = traced.filter(|_| init[0].context().backend() != BackendKind::Cpu && !lock(&NOT_UNROLLED).contains(&site)) {
         let depth = unroll_depth(steps, stepper.plan(), traced);
         if let Some(unrolled) = trace_unrolled(init, depth, step, stepper.plan())? {
             return run_unrolled(&mut stepper, &unrolled, depth, steps);
+        }
+        // Tracing the body costs host time that a loop whose steps do not fuse would pay at every call.
+        if depth >= 2 {
+            lock(&NOT_UNROLLED).insert(site);
         }
     }
     stepper.run_steps(steps)?;
     Ok(stepper.state_after(steps).to_vec())
 }
+
+/// The steps (by the type of the closure, the length of the state and the number of states) whose
+/// unrolled body did not pay, so that they are not traced again.
+type UnrollSite = (&'static str, usize, usize);
+
+static NOT_UNROLLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<UnrollSite>>> = std::sync::LazyLock::new(Default::default);
 
 /// Most steps of a pure expression traced as one body of a replayed loop (see [`trace_unrolled`]).
 const UNROLL_STEPS: usize = 16;
