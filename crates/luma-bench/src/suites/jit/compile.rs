@@ -59,7 +59,9 @@ pub fn run(h: &mut Harness) {
         let shape_steps = recipe(11, 12);
         h.case("compile/shape_variants", &size_k, per_sec(k, "kernel/s"), &mut || {
             for _ in 0..k {
-                next_len += 17;
+                // One element more per kernel: ~64k lengths never seen before; past the host buffer the lengths
+                // come round again (kernels then come from the cache, which only the warm-up calls can reach).
+                next_len = if next_len + 1 > big { 1025 } else { next_len + 1 };
                 let (xa, ya) = (A::from_slice_on(&ctx, &xh[..next_len], next_len).unwrap(), A::from_slice_on(&ctx, &yh[..next_len], next_len).unwrap());
                 force(&apply(&shape_steps, &xa, &ya));
             }
