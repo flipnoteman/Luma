@@ -329,8 +329,12 @@ impl FusedKey {
             Tail::Radix(_) => format!("FusedRadix({names}) {ty}"),
             Tail::Solve(_) => format!("FusedSolve({names}) {ty}"),
             Tail::Reduce(ops) => {
-                let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
-                format!("FusedReduce({}: {names}) {ty}", ops.join("+"))
+                let list: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
+                if ops.roots().is_some() {
+                    format!("FusedReduce[{}]({names}) {ty}", list.len())
+                } else {
+                    format!("FusedReduce({}: {names}) {ty}", list.join("+"))
+                }
             }
         }
     }

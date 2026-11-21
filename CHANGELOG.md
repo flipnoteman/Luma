@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Pending reductions that are forced together are recorded in one kernel. When a reduction is recorded (its value is read, used on the GPU or evaluated with `eval_all`), the other live, unrecorded `f32`, `u32` and `i32` reductions of the same length that read what it reads (or are small) are taken along, up to 16 accumulators per kernel (`LUMA_MULTI_REDUCE=off|n`): one program computes their operands together, so what they share (the gather behind a dozen masked sums, the columns of a `describe`) is computed and read once, and the monitor of a solver that makes dozens of `sum_where` reductions launches a handful of kernels instead of one each. Every reduction keeps its own combine order, so its value is the bits it has when recorded alone; reductions that wait for another (a variance on a mean) run after it, and reductions made while a step is being recorded, or by other threads, are never taken along.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed

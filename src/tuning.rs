@@ -22,6 +22,9 @@ const LINE_SOLVER_ENV: &str = "LUMA_TRIDIAGONAL";
 /// `LUMA_SINGLE_PASS_REDUCE=off|on` overrides [`Tuning::single_pass_reduce`] (`on` only takes
 /// effect on the CUDA and CPU backends, whose atomics and fences order memory across workgroups).
 const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
+/// `LUMA_MULTI_REDUCE=off|n` overrides [`Tuning::reduce_multi`] (`off` or `1` keeps every reduction
+/// in a kernel of its own; clamped to the most accumulators a kernel has).
+const MULTI_REDUCE_ENV: &str = "LUMA_MULTI_REDUCE";
 /// `LUMA_LOOKBACK_SCAN=off|on` overrides [`Tuning::lookback_scan`] (`on` only takes effect on the
 /// CUDA and CPU backends, for the same reason as `LUMA_SINGLE_PASS_REDUCE`; floating-point sums
 /// keep two passes either way, to stay reproducible).
@@ -60,6 +63,10 @@ pub(crate) struct Tuning {
     pub(crate) reduce_per_thread: u32,
     /// Most workgroups of a reduction pass; they stride over arrays larger than that many blocks.
     pub(crate) reduce_max_groups: u32,
+    /// Most accumulators (reductions of one operand each, ops counted) one kernel computes when several
+    /// pending reductions of the same length are forced together (see `jit::multireduce`); below 2 they are
+    /// never merged. `LUMA_MULTI_REDUCE` overrides.
+    pub(crate) reduce_multi: usize,
     /// Whether a reduction with more than one workgroup finishes in its first launch: the last
     /// workgroup to write its partial result combines them all (see `builtin::reduce_main`),
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
@@ -130,6 +137,7 @@ impl Tuning {
         stencil_tile_1d: 512,
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
+        reduce_multi: 16,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -159,6 +167,7 @@ impl Tuning {
         stencil_tile_1d: 2048,
         reduce_per_thread: 8,
         reduce_max_groups: 2048,
+        reduce_multi: 16,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -190,6 +199,7 @@ impl Tuning {
         stencil_tile_1d: 1024,
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
+        reduce_multi: 16,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -251,6 +261,11 @@ impl Tuning {
             Ok("off") => false,
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
             _ => info.backend == BackendKind::Cuda,
+        };
+        tuning.reduce_multi = match std::env::var(MULTI_REDUCE_ENV).as_deref().map(str::trim) {
+            Ok("off") => 1,
+            Ok(value) => value.parse::<usize>().map_or(tuning.reduce_multi, |n| n.clamp(1, crate::builtin::MAX_ACCS)),
+            Err(_) => tuning.reduce_multi,
         };
         tuning.lookback_scan = match std::env::var(LOOKBACK_ENV).as_deref().map(str::trim) {
             Ok("off") => false,

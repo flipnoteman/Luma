@@ -159,6 +159,7 @@ mod kirgen;
 mod launch;
 mod looped;
 mod operator;
+mod multireduce;
 mod pack;
 mod params;
 
@@ -201,7 +202,8 @@ use looped::LoopPlan;
 use program::Instr;
 pub(crate) use program::AtomicOp;
 
-pub(crate) use launch::{axis_reduce, check_finite, evaluate, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, run_loop, solve, MatmulKernel, MatmulSide, PartSide};
+pub(crate) use launch::{axis_reduce, check_finite, evaluate, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, reduce_many, run_loop, solve, MatmulKernel, MatmulSide, Member, PartSide};
+pub(crate) use multireduce::unresolved_leaves;
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};
@@ -2272,6 +2274,8 @@ pub(crate) struct JitState {
     /// Every node created and not yet known to be evaluated, oldest first, so that
     /// [`Context::sync`] can evaluate the live ones.
     live: Readers,
+    /// The reductions made and not yet recorded (see [`multireduce`]), oldest first.
+    reductions: Mutex<Vec<std::sync::Weak<crate::reduce::Reduced>>>,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
     requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
@@ -2392,6 +2396,7 @@ impl JitState {
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             live: Readers::default(),
+            reductions: Mutex::new(Vec::new()),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             inputs_limit: AtomicUsize::new(max_inputs),
