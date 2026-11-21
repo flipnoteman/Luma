@@ -142,7 +142,8 @@ fn fresh_rng() -> Rng {
     rng
 }
 
-/// `len` random steps never built before in this process or an earlier one.
+/// `len` random steps never built before in this process or an earlier one (`10^len` structures: a short recipe repeats
+/// one that was built, and a disk cache that has seen enough runs holds it).
 pub fn fresh_recipe(len: usize) -> Vec<Step> {
     let mut rng = fresh_rng();
     (0..len).map(|_| Step::random(&mut rng)).collect()

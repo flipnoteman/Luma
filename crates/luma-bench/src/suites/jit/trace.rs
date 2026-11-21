@@ -198,10 +198,14 @@ pub fn run(h: &mut Harness) {
             force(&state.0);
         });
 
-        // Loops whose kernels the context has never built: trace + compile + first launches.
+        // Loops whose kernels the context has never built: trace + compile + first launches. A recipe has 10 kinds of
+        // step, so `len` steps are `10^len` kernel structures: with 3 (1000) the calls of one run and of earlier runs
+        // (compiled kernels are cached on disk) soon met structures built before, and the case timed the state of the
+        // disk cache (a new emitter revision, which empties it, "regressed" it 1.5-2x) rather than the compile.
+        const FRESH_LEN: usize = 6;
         let fresh_n = size(h, 4, 5, 8);
         {
-            let recipes: Vec<Vec<Step>> = (0..2).map(|_| fresh_recipe(3)).collect();
+            let recipes: Vec<Vec<Step>> = (0..2).map(|_| fresh_recipe(FRESH_LEN)).collect();
             let run = until_rec((u.clone(),), 3, &|a| fresh_stages(a, &recipes), 1);
             let mut want = uh.clone();
             for _ in 0..3 {
@@ -210,7 +214,7 @@ pub fn run(h: &mut Harness) {
             check("trace/fresh_until", &run.state.0.to_vec().unwrap(), &want, 1e-3, 1e-4);
         }
         h.case("trace/fresh_until", &format!("{fresh_n}k new {side}x{side} x20"), per_sec(fresh_n, "kernel/s"), &mut || {
-            let recipes: Vec<Vec<Step>> = (0..fresh_n).map(|_| fresh_recipe(3)).collect();
+            let recipes: Vec<Vec<Step>> = (0..fresh_n).map(|_| fresh_recipe(FRESH_LEN)).collect();
             force(&until_rec((u.clone(),), 20, &|a| fresh_stages(a, &recipes), 1).state.0);
         });
     });
