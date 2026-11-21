@@ -2173,6 +2173,8 @@ impl<'a> Build<'a> {
     /// contiguous, and the loads of all of them are issued before the first store.
     fn plain(&self, fb: &mut FnBuilder<'_>) {
         let i = element_index(fb, self.wg);
+        let chunk = self.key.coarsen > 1 && std::env::var("LUMA_COARSEN_CHUNK").is_ok();
+        let i = if chunk { fb.let_val("i0", i * lu(fb, u32::from(self.key.coarsen))) } else { i };
         self.guard(fb, i);
         let index = self.global(fb, i);
         let prog = self.program(fb, i, index);
@@ -2188,7 +2190,7 @@ impl<'a> Build<'a> {
         let last = fb.grid_size(0) - lu(fb, 1);
         let mut rest = Vec::with_capacity(c as usize - 1);
         for k in 1..u32::from(c) {
-            let e = fb.let_val("e", i + stride * lu(fb, k));
+            let e = fb.let_val("e", if chunk { i + lu(fb, k) } else { i + stride * lu(fb, k) });
             let inside = fb.let_val("ok", fb.lt(e, fb.grid_size(0)));
             // Elements past the end read the last one, so that the loads need no branch; their
             // stores are skipped.
