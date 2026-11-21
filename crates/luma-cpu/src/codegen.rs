@@ -72,7 +72,7 @@ static ISA_KEY: LazyLock<String> = LazyLock::new(|| match ISA_SPEED.as_ref() {
             .map(|v| format!("{}={}", v.name, v.value_string()))
             .collect();
         format!(
-            "rev3-{}-{}-{}",
+            "rev4-{}-{}-{}",
             isa.triple(),
             cranelift_codegen::VERSION,
             feats.join(",")
@@ -813,8 +813,22 @@ impl<'a, 'f> Lower<'a, 'f> {
         r
     }
 
-    /// Calls a `CpuMathTable` routine once per lane.
+    /// Calls a `CpuMathTable` routine: once per packet when there is a vectorised `f32` one, else once per lane.
     fn math_call(&mut self, off32: i32, off64: i32, is64: bool, args: &[Value]) -> Value {
+        if !is64
+            && args.len() == 1
+            && let Some(poff) = CpuMathTable::packet_offset(off32)
+        {
+            // One call per packet: F32X4 in and out of `xmm0` (see `crate::vecmath`).
+            let mut sig = Signature::new(self.b.func.signature.call_conv);
+            sig.params.push(AbiParam::new(F32X4));
+            sig.returns.push(AbiParam::new(F32X4));
+            let sig = self.b.import_signature(sig);
+            let table = self.b.ins().load(self.ptr, mf_ro(), self.ctx, WorkgroupCtx::OFFSET_MATH);
+            let fp = self.b.ins().load(self.ptr, mf_ro(), table, poff);
+            let call = self.b.ins().call_indirect(sig, fp, args);
+            return self.b.inst_results(call)[0];
+        }
         let sig = self.math_sig(args.len() as u8, is64);
         let table = self
             .b
