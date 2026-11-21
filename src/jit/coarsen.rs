@@ -11,10 +11,12 @@
 //! reads) once for `C` elements. Each element runs the same arithmetic as without coarsening, so
 //! the results are bit-identical.
 
+use crate::builtin::UnOp;
 use crate::context::Context;
 use crate::tuning::Coarsen;
 
 use super::program::{FusedKey, Tail};
+use super::{ElemTy, OpKind, ShiftKind};
 
 /// The most elements one invocation computes.
 pub(crate) const MAX_COARSEN: u8 = 8;
@@ -38,19 +40,109 @@ pub(super) fn plan(ctx: &Context, key: &FusedKey, len: usize) -> u8 {
     if !coarsenable(key) || len > (1 << 30) {
         return 1;
     }
-    match ctx.tuning().coarsen {
+    let tuning = ctx.tuning();
+    match tuning.coarsen {
         Coarsen::Off => 1,
         Coarsen::Fixed(n) => n.clamp(1, MAX_COARSEN),
-        Coarsen::Auto => auto(ctx, key, len),
+        Coarsen::Auto => {
+            // The grid is judged before the program is looked at: a program is scanned only for
+            // launches big enough to be coarsened.
+            let waves = len as f64 / (f64::from(tuning.compute_units.max(1)) * RESIDENT_PER_UNIT);
+            if waves < MIN_WAVES {
+                return 1;
+            }
+            pick(&Features::of(key), tuning.max_live)
+        }
     }
 }
 
-fn auto(_ctx: &Context, _key: &FusedKey, _len: usize) -> u8 {
-    1
+/// Invocations a multiprocessor keeps resident (1536 on the NVIDIA GPUs of the Ampere generation,
+/// 2048 and 1024 on others): what a wave of the grid is made of.
+const RESIDENT_PER_UNIT: f64 = 1536.0;
+
+/// Fewest waves of invocations a launch has before it is coarsened: with less, the invocations
+/// that remain do not hide the latency of the longer chain each of them runs (a chain of 256
+/// operations over a million elements ran 12 % slower with 4 elements per invocation).
+const MIN_WAVES: f64 = 16.0;
+
+/// What of a program decides its coarsening (see [`pick`]).
+#[derive(Debug, Default, PartialEq)]
+struct Features {
+    /// Arithmetic operations on `f64`: the double-precision pipe is a fraction of the single-precision
+    /// one and a chain of dependent operations leaves it idle with one element per invocation.
+    wide_ops: usize,
+    /// Gathers (`take`): the load of the element waits for the load of its index.
+    gathers: usize,
+    /// Most values live at once in the main program.
+    live: usize,
 }
+
+impl Features {
+    fn of(key: &FusedKey) -> Features {
+        let mut features = Features { live: peak_live(key), ..Features::default() };
+        for instr in key.instrs.iter().chain(key.subs.iter().flatten()) {
+            match instr.op.kind {
+                OpKind::Unary(op) if op != UnOp::Id && instr.op.ty == ElemTy::F64 => features.wide_ops += 1,
+                OpKind::Binary(_) | OpKind::Clamp | OpKind::Powf if instr.op.ty == ElemTy::F64 => features.wide_ops += 1,
+                OpKind::Shift(ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => features.gathers += 1,
+                _ => {}
+            }
+        }
+        features
+    }
+}
+
+/// Most values the main program of `key` keeps live at once, the loaded inputs and the outputs it
+/// holds until the end included.
+fn peak_live(key: &FusedKey) -> usize {
+    let last = super::launch::last_uses(key);
+    let mut dying = vec![0usize; key.instrs.len()];
+    let (mut now, mut peak) = (0usize, 0usize);
+    for k in 0..key.instrs.len() {
+        now -= dying[k];
+        if last[k] > k {
+            now += 1;
+            if let Some(slot) = dying.get_mut(last[k]) {
+                *slot += 1;
+            }
+        }
+        peak = peak.max(now);
+    }
+    peak + key.input_tys.len()
+}
+
+/// The elements per invocation for a program with `features` over a grid that is big enough (see [`MIN_WAVES`]).
+///
+/// Measured on an RTX 3090 and an RTX 3080 Laptop (see the changelog): a coarsened kernel gains where
+/// the invocations wait: a chain of `f64` operations (the pipe is fed by independent elements, not
+/// by one element's chain: 4.2x at 8 elements for 16 operations) and gathers (the loads of several
+/// elements are issued together: bilinear resampling 13 % faster). A kernel bound by memory
+/// bandwidth runs the same speed, so the planner leaves those alone rather than pay for the longer
+/// kernels and the registers of every copy: the most elements it takes keep `copies * live` within
+/// the registers `max_live` allows.
+fn pick(features: &Features, max_live: usize) -> u8 {
+    let wanted: u8 = if features.wide_ops >= WIDE_OPS {
+        8
+    } else if features.gathers >= GATHERS {
+        4
+    } else {
+        1
+    };
+    let mut count = wanted;
+    while count > 1 && usize::from(count) * features.live.max(1) > max_live {
+        count /= 2;
+    }
+    count
+}
+
+/// Operations on `f64` from which a kernel is coarsened.
+const WIDE_OPS: usize = 8;
+/// Gathers from which a kernel is coarsened.
+const GATHERS: usize = 2;
 
 #[cfg(test)]
 mod tests {
+    use super::{pick, Features};
     use crate::array::Array;
     use crate::context::{Context, ContextOptions};
     use crate::jit::cost::CostModel;
@@ -190,6 +282,59 @@ mod tests {
                 vec![f32_bits(&x)]
             });
         }
+    }
+
+    #[test]
+    fn the_planner_picks_by_what_the_kernel_waits_for() {
+        let features = |wide_ops, gathers, live| Features { wide_ops, gathers, live };
+        assert_eq!(pick(&features(0, 0, 4), 96), 1, "a streaming kernel is left alone");
+        assert_eq!(pick(&features(7, 1, 4), 96), 1);
+        assert_eq!(pick(&features(16, 0, 4), 96), 8, "a chain of f64 operations");
+        assert_eq!(pick(&features(0, 4, 4), 96), 4, "gathers");
+        assert_eq!(pick(&features(16, 4, 4), 96), 8);
+        assert_eq!(pick(&features(16, 0, 30), 96), 2, "registers for no more copies than 96 values allow");
+        assert_eq!(pick(&features(16, 0, 100), 96), 1);
+    }
+
+    /// A tuning that takes a launch of 100 000 elements for many waves.
+    fn auto_context() -> Context {
+        let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| {
+            tuning.coarsen = Coarsen::Auto;
+            tuning.compute_units = 1;
+        })
+        .unwrap();
+        ctx.set_cost_model(CostModel::TEST);
+        ctx
+    }
+
+    #[test]
+    fn auto_coarsens_a_chain_of_double_floats_and_not_a_streaming_kernel() {
+        let ctx = auto_context();
+        let n = 100_000;
+        let xs: Vec<f64> = values(n, 20, 0.5, 1.5).into_iter().map(f64::from).collect();
+        let x = Array::<f64>::from_slice_on(&ctx, &xs, n).unwrap();
+        let before = ctx.jit().stats().coarsened;
+        let mut z = x.clone();
+        for i in 0..12 {
+            z = if i % 2 == 0 { &z * 0.999 } else { &z + 0.01 };
+        }
+        let got = z.to_vec().unwrap();
+        assert_eq!(ctx.jit().stats().coarsened, before + 1);
+        let want: Vec<f64> = xs.iter().map(|&v| (0..12).fold(v, |v, i| if i % 2 == 0 { v * 0.999 } else { v + 0.01 })).collect();
+        assert_eq!(got, want);
+        let before = ctx.jit().stats().coarsened;
+        let y = Array::from_slice_on(&ctx, &values(n, 21, 0.0, 1.0), n).unwrap();
+        (&y * 2.0 + 1.0).eval().unwrap();
+        assert_eq!(ctx.jit().stats().coarsened, before, "a streaming kernel keeps one element per invocation");
+        // Below the waves a launch needs, nothing is coarsened.
+        let small = Array::<f64>::from_slice_on(&ctx, &xs[..1000], 1000).unwrap();
+        let before = ctx.jit().stats().coarsened;
+        let mut z = small.clone();
+        for i in 0..12 {
+            z = if i % 2 == 0 { &z * 0.999 } else { &z + 0.01 };
+        }
+        z.eval().unwrap();
+        assert_eq!(ctx.jit().stats().coarsened, before);
     }
 
     #[test]

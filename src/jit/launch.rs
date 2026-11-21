@@ -268,7 +268,7 @@ fn flatten_bounded(node: &Arc<Node>, mut args: Args, tail: Tail) -> Result<(Fuse
 
 /// Per instruction of the main program of `key`, the index of the last instruction reading its
 /// value (its own index if none does, `usize::MAX` for an output).
-fn last_uses(key: &FusedKey) -> Vec<usize> {
+pub(super) fn last_uses(key: &FusedKey) -> Vec<usize> {
     let mut last: Vec<usize> = (0..key.instrs.len()).collect();
     for (i, instr) in key.instrs.iter().enumerate() {
         for arg in &instr.args {

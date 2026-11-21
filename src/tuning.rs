@@ -94,7 +94,8 @@ pub(crate) struct Tuning {
     pub(crate) profile: TuningProfile,
     /// Invocations per workgroup of elementwise kernels (fused and fills).
     pub(crate) elementwise_workgroup: u32,
-    /// Output elements per invocation of fused elementwise kernels; `LUMA_COARSEN` overrides.
+    /// Output elements per invocation of fused elementwise kernels (`jit::coarsen`); `LUMA_COARSEN` overrides. Automatic on the
+    /// NVIDIA profile, where it was measured; off elsewhere.
     pub(crate) coarsen: Coarsen,
     /// Tiled 1D convolution: invocations per workgroup, and outputs per invocation at stride 1.
     pub(crate) conv_workgroup: u32,
@@ -256,7 +257,7 @@ impl Tuning {
     const NVIDIA: Tuning = Tuning {
         profile: TuningProfile::Nvidia,
         elementwise_workgroup: 256,
-        coarsen: Coarsen::Off,
+        coarsen: Coarsen::Auto,
         conv_workgroup: 256,
         conv_per_thread: 32,
         stencil_tile_bytes: 32 * 1024,
