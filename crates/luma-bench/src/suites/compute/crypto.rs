@@ -44,8 +44,7 @@ fn sha3(h: &mut Harness) {
     h.guarded("keccak", |h| {
         let ctx = h.ctx.clone();
         let len = 64;
-        let sizes: Vec<usize> = if h.ctx.is_cpu() { vec![1 << 12, pick(h, 1 << 12, 1 << 14)] } else { vec![1 << 12, pick(h, 1 << 14, 1 << 16)] };
-        let mut sizes = sizes;
+        let mut sizes: Vec<usize> = if h.ctx.is_cpu() { vec![1 << 12, pick(h, 1 << 12, 1 << 14)] } else { vec![1 << 12, 1 << 16, pick(h, 1 << 16, 1 << 20)] };
         sizes.dedup();
         for n in sizes {
             let messages: Vec<Vec<u8>> = (0..n).map(|i| keccak::bytes(0x5eed + i as u64, len)).collect();
@@ -143,26 +142,33 @@ fn mlkem(h: &mut Harness) {
         let p = params::ML_KEM_768;
         verify_acvp(&ctx, p);
 
-        let n = if h.ctx.is_cpu() { pick(h, 16, 64) } else { pick(h, 128, 512) };
-        let random = |seed: u64| -> Vec<Vec<u8>> { (0..n).map(|i| keccak::bytes(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i as u64 * 7919 + 1), 32)).collect() };
-        let (d, z, m) = (upload(&ctx, &random(1)), upload(&ctx, &random(2)), upload(&ctx, &random(3)));
-        let mut kem = Kem::new(&ctx, p, n).unwrap();
-        // The round trip: Decaps(Encaps(ek)) recovers the key Encaps returned.
-        let (ek, dk) = complete(&mut kem, |kem| kem.keygen(&d, &z), |(ek, dk)| eval_all(&[ek, dk]));
-        let (ct, key) = complete(&mut kem, |kem| kem.encaps(&ek, &m), |(ct, key)| eval_all(&[ct, key]));
-        let again = complete(&mut kem, |kem| kem.decaps(&dk, &ct), |k| k.eval());
-        assert!(download(&again) == download(&key), "ML-KEM-768 round trip: decapsulated keys differ from the encapsulated ones");
-        let size = format!("{} batch {n}", p.name);
-        // `Items` reports millions per second: scale the count to read thousands of operations per second.
-        let items = Work::Items(n as f64 * 1e3, "kop/s");
-        h.case("mlkem/keygen", &size, items, &mut || {
-            complete(&mut kem, |kem| kem.keygen(&d, &z), |(ek, dk)| eval_all(&[ek, dk]));
-        });
-        h.case("mlkem/encaps", &size, items, &mut || {
-            complete(&mut kem, |kem| kem.encaps(&ek, &m), |(ct, key)| eval_all(&[ct, key]));
-        });
-        h.case("mlkem/decaps", &size, items, &mut || {
-            complete(&mut kem, |kem| kem.decaps(&dk, &ct), |k| k.eval());
-        });
+        let batches: Vec<usize> = match (h.ctx.is_cpu(), h.quick) {
+            (false, false) => vec![64, 512, 2048],
+            (false, true) => vec![64, 256],
+            (true, false) => vec![16, 64],
+            (true, true) => vec![16],
+        };
+        for n in batches {
+            let random = |seed: u64| -> Vec<Vec<u8>> { (0..n).map(|i| keccak::bytes(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i as u64 * 7919 + 1), 32)).collect() };
+            let (d, z, m) = (upload(&ctx, &random(1)), upload(&ctx, &random(2)), upload(&ctx, &random(3)));
+            let mut kem = Kem::new(&ctx, p, n).unwrap();
+            // The round trip: Decaps(Encaps(ek)) recovers the key Encaps returned.
+            let (ek, dk) = complete(&mut kem, |kem| kem.keygen(&d, &z), |(ek, dk)| eval_all(&[ek, dk]));
+            let (ct, key) = complete(&mut kem, |kem| kem.encaps(&ek, &m), |(ct, key)| eval_all(&[ct, key]));
+            let again = complete(&mut kem, |kem| kem.decaps(&dk, &ct), |k| k.eval());
+            assert!(download(&again) == download(&key), "ML-KEM-768 round trip: decapsulated keys differ from the encapsulated ones");
+            let size = format!("{} batch {n}", p.name);
+            // `Items` reports millions per second: scale the count to read thousands of operations per second.
+            let items = Work::Items(n as f64 * 1e3, "kop/s");
+            h.case("mlkem/keygen", &size, items, &mut || {
+                complete(&mut kem, |kem| kem.keygen(&d, &z), |(ek, dk)| eval_all(&[ek, dk]));
+            });
+            h.case("mlkem/encaps", &size, items, &mut || {
+                complete(&mut kem, |kem| kem.encaps(&ek, &m), |(ct, key)| eval_all(&[ct, key]));
+            });
+            h.case("mlkem/decaps", &size, items, &mut || {
+                complete(&mut kem, |kem| kem.decaps(&dk, &ct), |k| k.eval());
+            });
+        }
     });
 }

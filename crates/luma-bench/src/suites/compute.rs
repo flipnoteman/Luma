@@ -56,6 +56,16 @@ pub fn check64(name: &str, got: &[f32], want: &[f64], rel: f64, abs: f64) {
     }
 }
 
+/// [`check64`] at every `stride`-th element only, with the reference computed per element by
+/// `want(i)`: verifies large results without a host copy of the whole reference.
+pub fn check_sampled(name: &str, got: &[f32], want: impl Fn(usize) -> f64, stride: usize, rel: f64, abs: f64) {
+    for i in (0..got.len()).step_by(stride.max(1)) {
+        let w = want(i);
+        let tol = abs.max(rel * w.abs());
+        assert!((f64::from(got[i]) - w).abs() <= tol, "{name}: index {i}: got {}, want {w} (tol {tol})", got[i]);
+    }
+}
+
 pub fn run(h: &mut Harness) {
     bandwidth::run(h);
     linalg::run(h);

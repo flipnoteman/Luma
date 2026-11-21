@@ -3,7 +3,7 @@
 
 use luma::*;
 
-use super::{check64, host, pick, upload};
+use super::{check64, check_sampled, host, pick, upload};
 use crate::harness::*;
 
 pub fn run(h: &mut Harness) {
@@ -12,7 +12,9 @@ pub fn run(h: &mut Harness) {
     rng(h);
     montecarlo(h);
     fractal(h);
+    fractal_df32(h);
     integers(h);
+    gather(h);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -55,7 +57,7 @@ fn forces_host(p: [&[f32]; 3], m: &[f32], at: &[usize]) -> Vec<[f64; 3]> {
 fn nbody(h: &mut Harness) {
     h.guarded("nbody", |h| {
         let sizes: Vec<usize> = match (h.ctx.is_cpu(), h.quick) {
-            (false, false) => vec![1024, 4096, 8192],
+            (false, false) => vec![1024, 4096, 8192, 16384],
             (false, true) => vec![1024, 4096],
             (true, false) => vec![512, 2048, 4096],
             (true, true) => vec![512, 1024],
@@ -118,7 +120,7 @@ fn nbody(h: &mut Harness) {
 fn particles(h: &mut Harness) {
     h.guarded("particles", |h| {
         // Leapfrog integration with all-pairs forces, a few steps per call.
-        let n: usize = if h.ctx.is_cpu() { pick(h, 512, 1024) } else { pick(h, 1024, 2048) };
+        let n: usize = if h.ctx.is_cpu() { pick(h, 512, 1024) } else { pick(h, 1024, 4096) };
         let steps = 4;
         let dt = 1e-3f32;
         let x0 = [values(n, 71, -1.0, 1.0), values(n, 72, -1.0, 1.0), values(n, 73, -1.0, 1.0)];
@@ -164,7 +166,7 @@ fn particles(h: &mut Harness) {
 
         // Free particles bouncing in a box: a pointwise step, as one register loop and as one
         // evaluation per step.
-        let n: usize = if h.ctx.is_cpu() { pick(h, 1 << 16, 1 << 18) } else { pick(h, 1 << 18, 1 << 20) };
+        let n: usize = if h.ctx.is_cpu() { pick(h, 1 << 16, 1 << 18) } else { pick(h, 1 << 18, 1 << 22) };
         let init = [values(n, 81, 0.0, 1.0), values(n, 82, 0.0, 1.0), values(n, 83, -1.0, 1.0), values(n, 84, -1.0, 1.0)];
         let state: Vec<Array<f32>> = init.iter().map(|d| upload(h, d, n)).collect();
         let (dt, g) = (0.01f32, 9.8f32);
@@ -233,7 +235,7 @@ fn particles(h: &mut Harness) {
 fn rng(h: &mut Harness) {
     h.guarded("rng", |h| {
         let ctx = h.ctx.clone();
-        let n: usize = if h.ctx.is_cpu() { pick(h, 1 << 20, 1 << 22) } else { pick(h, 1 << 22, 1 << 24) };
+        let n: usize = if h.ctx.is_cpu() { pick(h, 1 << 20, 1 << 22) } else { pick(h, 1 << 22, 1 << 26) };
         let nf = n as f64;
         let moments = |v: &[f32]| {
             let mean = v.iter().map(|&x| f64::from(x)).sum::<f64>() / nf;
@@ -317,7 +319,7 @@ fn montecarlo(h: &mut Harness) {
 
         // pi by counting random points in the unit quarter circle: generator and reduction fused.
         let big: usize = match (cpu, h.quick) {
-            (false, false) => 1 << 26,
+            (false, false) => 1 << 28,
             (false, true) => 1 << 24,
             (true, false) => 1 << 24,
             (true, true) => 1 << 22,
@@ -347,7 +349,7 @@ fn montecarlo(h: &mut Harness) {
 
         // Black-Scholes prices of a batch of options (elementwise with ln, exp, sqrt).
         let sizes: Vec<usize> = match (cpu, h.quick) {
-            (false, false) => vec![1 << 20, 1 << 24],
+            (false, false) => vec![1 << 20, 1 << 26],
             (false, true) => vec![1 << 20],
             (true, false) => vec![1 << 18, 1 << 22],
             (true, true) => vec![1 << 18],
@@ -376,7 +378,7 @@ fn montecarlo(h: &mut Harness) {
         let drift = (RATE - 0.5 * VOL * VOL) * MATURITY;
         let diffusion = VOL * MATURITY.sqrt();
         let exact = black_scholes_exact();
-        let sizes: Vec<usize> = if cpu { vec![1 << 20, pick(h, 1 << 20, 1 << 22)] } else { vec![1 << 20, pick(h, 1 << 22, 1 << 24)] };
+        let sizes: Vec<usize> = if cpu { vec![1 << 20, pick(h, 1 << 20, 1 << 22)] } else { vec![1 << 20, pick(h, 1 << 22, 1 << 26)] };
         let mut sizes = sizes;
         sizes.dedup();
         for n in sizes {
@@ -475,7 +477,7 @@ fn escape_host(w: usize, h: usize, steps: usize, julia: Option<(f32, f32)>, samp
 fn fractal(h: &mut Harness) {
     h.guarded("fractal", |h| {
         let ctx = h.ctx.clone();
-        let side: usize = if h.ctx.is_cpu() { pick(h, 512, 1024) } else { pick(h, 1024, 2048) };
+        let side: usize = if h.ctx.is_cpu() { pick(h, 512, 1024) } else { pick(h, 1024, 4096) };
         let (w, hh) = (side, side);
         let steps = 256usize;
         let grid = |axis: usize, scale: f32, origin: f32| {
@@ -554,6 +556,64 @@ fn fractal(h: &mut Harness) {
     });
 }
 
+/// Escape counts in `f64` from the `f32` coordinates the grid holds, for the double-float loop.
+fn escape_host_f64(w: usize, h: usize, steps: usize, samples: &[(usize, usize)]) -> Vec<f32> {
+    samples
+        .iter()
+        .map(|&(i, j)| {
+            let c = (f64::from(i as f32 * (3.2 / w as f32) - 2.2), f64::from(j as f32 * (2.4 / h as f32) - 1.2));
+            let (mut zx, mut zy, mut count) = (0.0f64, 0.0f64, 0.0f32);
+            for _ in 0..steps {
+                if zx * zx + zy * zy <= 4.0 {
+                    let nx = zx * zx - zy * zy + c.0;
+                    zy = zx * zy * 2.0 + c.1;
+                    zx = nx;
+                    count += 1.0;
+                }
+            }
+            count
+        })
+        .collect()
+}
+
+/// The Mandelbrot loop in double-float arithmetic (about 48 bits of mantissa on any device):
+/// not a register loop, so it replays the traced step.
+fn fractal_df32(h: &mut Harness) {
+    h.guarded("fractal", |h| {
+        let ctx = h.ctx.clone();
+        let side: usize = if h.ctx.is_cpu() { pick(h, 128, 256) } else { pick(h, 512, 1024) };
+        let steps = 48usize;
+        let grid = |axis: usize, scale: f32, origin: f32| {
+            let a = (Array::<f32>::range_on(&ctx, [side, side], axis).unwrap() * (scale / side as f32) + origin).to_df32();
+            a.eval().unwrap();
+            a
+        };
+        let (px, py) = (grid(0, 3.2, -2.2), grid(1, 2.4, -1.2));
+        let zero = Array::<Df32>::zeros_on(&ctx, [side, side]).unwrap();
+        let two = Df32::from(2.0);
+        let run_loop = || {
+            let [_, _, count] = iterate_all([&zero, &zero, &zero], steps, |[zx, zy, count]| {
+                let inside = (zx * zx + zy * zy).le(Df32::from(4.0));
+                let nzx = zx * zx - zy * zy + &px;
+                let nzy = zx * zy * two + &py;
+                [select(&inside, &nzx, zx), select(&inside, &nzy, zy), count + select(&inside, Df32::from(1.0), Df32::from(0.0))]
+            });
+            let count = count.to_f32();
+            count.eval().unwrap();
+            count
+        };
+        let samples: Vec<(usize, usize)> = (0..side).step_by(7).flat_map(|i| (0..side).step_by(5).map(move |j| (i, j))).collect();
+        let all = host(&run_loop());
+        let got: Vec<f32> = samples.iter().map(|&(i, j)| all[i + side * j]).collect();
+        let want = escape_host_f64(side, side, steps, &samples);
+        let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert!(bad * 50 <= got.len(), "fractal/mandelbrot_df32: {bad} of {} escape counts differ", got.len());
+        h.case("fractal/mandelbrot_df32", &format!("{side}x{side} x {steps} iterations"), Work::Cells((side * side * steps) as f64), &mut || {
+            run_loop();
+        });
+    });
+}
+
 // -------------------------------------------------------------------------------------------------
 // Integer work
 // -------------------------------------------------------------------------------------------------
@@ -561,7 +621,7 @@ fn fractal(h: &mut Harness) {
 fn integers(h: &mut Harness) {
     h.guarded("int", |h| {
         let ctx = h.ctx.clone();
-        let n: usize = if h.ctx.is_cpu() { pick(h, 1 << 20, 1 << 22) } else { pick(h, 1 << 22, 1 << 24) };
+        let n: usize = if h.ctx.is_cpu() { pick(h, 1 << 20, 1 << 22) } else { pick(h, 1 << 22, 1 << 26) };
         let seeds = ints(n, 101, u32::MAX);
         let x = Array::<u32>::from_slice_on(&ctx, &seeds, n).unwrap();
         x.eval().unwrap();
@@ -640,5 +700,63 @@ fn integers(h: &mut Harness) {
         }
         assert_eq!(xs.histogram(256, 0.0, 1.0).to_vec().unwrap(), want, "int/histogram");
         h.case("int/histogram_f32", &format!("{n} values, 256 bins"), Work::Items(n as f64, "Mval/s"), &mut || xs.histogram(256, 0.0, 1.0).eval().unwrap());
+    });
+}
+
+/// Gathers and scatters: random and reversed gathers, a scatter through a permutation and an
+/// atomic scatter-add into few bins.
+fn gather(h: &mut Harness) {
+    h.guarded("gather", |h| {
+        let ctx = h.ctx.clone();
+        let n: usize = if h.ctx.is_cpu() { pick(h, 1 << 20, 1 << 22) } else { pick(h, 1 << 22, 1 << 26) };
+        let data = values(n, 131, -1.0, 1.0);
+        let x = upload(h, &data, n);
+        let stride = (n / 65536).max(1) | 1;
+        let random = ints(n, 132, n as u32);
+        let idx = Array::<u32>::from_slice_on(&ctx, &random, n).unwrap();
+        idx.eval().unwrap();
+        check_sampled("gather/random", &host(&x.take(&idx)), |i| f64::from(data[random[i] as usize]), stride, 0.0, 0.0);
+        h.case("gather/random", &format!("{n}"), Work::Bytes(12.0 * n as f64), &mut || x.take(&idx).eval().unwrap());
+
+        // The index computed inside the kernel: a reversal.
+        let reversed = |x: &Array<f32>| {
+            let i = Array::<u32>::range_on(&ctx, n, 0).unwrap();
+            x.take(&((n as u32 - 1) - &i))
+        };
+        check_sampled("gather/reverse", &host(&reversed(&x)), |i| f64::from(data[n - 1 - i]), stride, 0.0, 0.0);
+        h.case("gather/reverse", &format!("{n}"), Work::Bytes(8.0 * n as f64), &mut || reversed(&x).eval().unwrap());
+
+        // Scatter through a permutation (a bijection of 0..n: n is a power of two).
+        let perm: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2_654_435_761).wrapping_add(12345) & (n as u32 - 1)).collect();
+        let perm_idx = Array::<u32>::from_slice_on(&ctx, &perm, n).unwrap();
+        perm_idx.eval().unwrap();
+        let mut z = Array::<f32>::zeros_on(&ctx, n).unwrap();
+        z.put(&perm_idx, &x).unwrap();
+        let mut want = vec![0.0f32; n];
+        for i in 0..n {
+            want[perm[i] as usize] = data[i];
+        }
+        assert!(host(&z) == want, "gather/put_permutation");
+        h.case("gather/put_permutation", &format!("{n}"), Work::Bytes(12.0 * n as f64), &mut || {
+            z.put(&perm_idx, &x).unwrap();
+            z.eval().unwrap();
+        });
+
+        // Atomic float scatter-add into 65536 bins.
+        let bins = 1usize << 16;
+        let keys = ints(n, 133, bins as u32);
+        let key_idx = Array::<u32>::from_slice_on(&ctx, &keys, n).unwrap();
+        key_idx.eval().unwrap();
+        let mut acc = Array::<f32>::zeros_on(&ctx, bins).unwrap();
+        acc.put_add(&key_idx, &x).unwrap();
+        let mut sums = vec![0.0f64; bins];
+        for i in 0..n {
+            sums[keys[i] as usize] += f64::from(data[i]);
+        }
+        check64("gather/put_add", &host(&acc), &sums, 1e-3, 1e-2);
+        h.case("gather/put_add_f32", &format!("{n} into {bins} bins"), Work::Items(n as f64, "Madd/s"), &mut || {
+            acc.put_add(&key_idx, &x).unwrap();
+            acc.eval().unwrap();
+        });
     });
 }

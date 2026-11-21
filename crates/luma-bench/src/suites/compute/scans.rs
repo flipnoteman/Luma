@@ -24,7 +24,7 @@ pub fn run(h: &mut Harness) {
         let cpu = h.ctx.is_cpu();
 
         // Long contiguous lines.
-        let sizes: Vec<usize> = if cpu { vec![1 << 20, pick(h, 1 << 20, 1 << 22)] } else { vec![1 << 20, pick(h, 1 << 22, 1 << 24)] };
+        let sizes: Vec<usize> = if cpu { vec![1 << 20, pick(h, 1 << 20, 1 << 22)] } else { vec![1 << 20, 1 << 22, pick(h, 1 << 22, 1 << 25)] };
         let mut sizes = sizes;
         sizes.dedup();
         for n in sizes {
@@ -33,7 +33,7 @@ pub fn run(h: &mut Harness) {
             check64("scan/cumsum", &host(&x.cumsum(0)), &cumsum_host(&data, [n, 1, 1], 0), 1e-4, 1e-4);
             h.case("scan/cumsum", &format!("{n}"), Work::Bytes(8.0 * n as f64), &mut || x.cumsum(0).eval().unwrap());
         }
-        let n: usize = if cpu { pick(h, 1 << 20, 1 << 22) } else { pick(h, 1 << 22, 1 << 24) };
+        let n: usize = if cpu { pick(h, 1 << 20, 1 << 22) } else { pick(h, 1 << 22, 1 << 25) };
         {
             let data = ints(n, 52, 4);
             let x = Array::<u32>::from_slice_on(&h.ctx, &data, n).unwrap();
@@ -46,7 +46,7 @@ pub fn run(h: &mut Harness) {
             h.case("scan/cumsum_u32", &format!("{n}"), Work::Bytes(8.0 * n as f64), &mut || x.cumsum(0).eval().unwrap());
         }
         {
-            let n = n.min(1 << 22);
+            let n = n.min(1 << 24);
             let data = values(n, 53, -1.0, 1.0);
             let x = upload(h, &data, n);
             let mut want = data.clone();
@@ -59,11 +59,11 @@ pub fn run(h: &mut Harness) {
 
         // Many short lines (axis 0), mid-length lines, and strided lines (axes 1 and 2).
         let lines: [(&str, [usize; 3], usize); 5] = [
-            ("scan/cumsum_short_lines", [64, if cpu { pick(h, 1 << 14, 1 << 16) } else { pick(h, 1 << 16, 1 << 18) }, 1], 0),
-            ("scan/cumsum_mid_lines", [1024, if cpu { pick(h, 1 << 10, 1 << 12) } else { pick(h, 1 << 12, 1 << 14) }, 1], 0),
-            ("scan/cumsum_strided", { let s = if cpu { pick(h, 1024, 2048) } else { pick(h, 2048, 4096) }; [s, s, 1] }, 1),
-            ("scan/cumsum_strided_wide", [4, if cpu { pick(h, 1 << 18, 1 << 20) } else { pick(h, 1 << 20, 1 << 22) }, 1], 1),
-            ("scan/cumsum_axis2", { let s = if cpu { pick(h, 64, 128) } else { pick(h, 128, 256) }; [s, s, s] }, 2),
+            ("scan/cumsum_short_lines", [64, if cpu { pick(h, 1 << 14, 1 << 16) } else { pick(h, 1 << 16, 1 << 19) }, 1], 0),
+            ("scan/cumsum_mid_lines", [1024, if cpu { pick(h, 1 << 10, 1 << 12) } else { pick(h, 1 << 12, 1 << 15) }, 1], 0),
+            ("scan/cumsum_strided", { let (w, hh) = if cpu { pick(h, (1024, 1024), (2048, 2048)) } else { pick(h, (2048, 2048), (8192, 4096)) }; [w, hh, 1] }, 1),
+            ("scan/cumsum_strided_wide", [4, if cpu { pick(h, 1 << 18, 1 << 20) } else { pick(h, 1 << 20, 1 << 23) }, 1], 1),
+            ("scan/cumsum_axis2", { let (s, d) = if cpu { pick(h, (64, 64), (128, 128)) } else { pick(h, (128, 128), (256, 512)) }; [s, s, d] }, 2),
         ];
         for (name, dims, axis) in lines {
             let len = dims[0] * dims[1] * dims[2];

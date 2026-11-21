@@ -25,6 +25,7 @@ fn fft(h: &mut Harness) {
             cases.push((1 << 22, 16384));
             if !cpu {
                 cases.push((1 << 24, 1024));
+                cases.push((1 << 26, 4096));
             }
         }
         // Spatial (direct) convolutions at sizes where the FFT competes.

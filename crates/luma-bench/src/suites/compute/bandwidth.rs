@@ -3,7 +3,7 @@
 
 use luma::*;
 
-use super::{check64, host, pick, upload};
+use super::{check_sampled, host, pick, upload};
 use crate::harness::*;
 
 pub fn run(h: &mut Harness) {
@@ -52,39 +52,39 @@ fn elementwise(h: &mut Harness) {
         for &n in &sizes {
             let x = upload(h, &xs[..n], n);
             let y = upload(h, &ys[..n], n);
-            let got = host(&(&x * 2.5 + &y));
-            let want: Vec<f64> = (0..n).map(|i| f64::from(xs[i]) * 2.5 + f64::from(ys[i])).collect();
-            check64("ew/saxpy", &got, &want, 1e-6, 1e-6);
+            check_sampled("ew/saxpy", &host(&(&x * 2.5 + &y)), |i| f64::from(xs[i]) * 2.5 + f64::from(ys[i]), (n / 65536).max(1) | 1, 1e-6, 1e-6);
             h.case("ew/saxpy", &format!("{n}"), Work::Bytes(12.0 * n as f64), &mut || (&x * 2.5 + &y).eval().unwrap());
             if n >= 1 << 20 {
                 h.case("ew/copy", &format!("{n}"), Work::Bytes(8.0 * n as f64), &mut || x.copy().eval().unwrap());
             }
         }
 
-        // In-place update of an existing buffer.
-        let n = max_n.min(1 << 24);
+        // Everything below runs at the largest size, where it should be bandwidth-bound; results
+        // are checked at a strided sample of the whole array.
+        let n = max_n;
         let x = upload(h, &xs[..n], n);
+        let y = upload(h, &ys[..n], n);
+        let sample = 61;
+
+        // In-place update of an existing buffer.
         let mut z0 = upload(h, &ys[..n], n);
         z0 += &(&x * 0.5);
-        let got = host(&z0);
-        let want: Vec<f64> = (0..n).map(|i| f64::from(ys[i]) + f64::from(xs[i]) * 0.5).collect();
-        check64("ew/axpy_inplace", &got, &want, 1e-6, 1e-6);
+        check_sampled("ew/axpy_inplace", &host(&z0), |i| f64::from(ys[i]) + f64::from(xs[i]) * 0.5, sample, 1e-6, 1e-6);
+        drop(z0);
         let mut z = upload(h, &ys[..n], n);
         h.case("ew/axpy_inplace", &format!("{n}"), Work::Bytes(12.0 * n as f64), &mut || {
             z += &(&x * 0.5);
             z.eval().unwrap();
         });
+        drop(z);
 
         // Fused chains of 2..64 operations: the cost of a fused kernel should stay one pass.
         for m in [2usize, 4, 8, 16, 32, 64] {
-            let got = host(&chain(&x, m));
-            let want: Vec<f64> = xs[..n].iter().map(|&v| f64::from(chain_host(v, m))).collect();
-            check64("ew/chain", &got, &want, 1e-4, 1e-4);
+            check_sampled("ew/chain", &host(&chain(&x, m)), |i| f64::from(chain_host(xs[i], m)), sample, 1e-4, 1e-4);
             h.case(&format!("ew/chain{m}"), &format!("{n}"), Work::Bytes(8.0 * n as f64), &mut || chain(&x, m).eval().unwrap());
         }
 
         // Transcendentals: compute-bound.
-        let y = upload(h, &ys[..n], n);
         let sins = |x: &Array<f32>| {
             let mut z = x.clone();
             for _ in 0..16 {
@@ -92,31 +92,25 @@ fn elementwise(h: &mut Harness) {
             }
             z
         };
-        let got = host(&sins(&x));
-        let want: Vec<f64> = xs[..n]
-            .iter()
-            .map(|&v| {
-                let mut z = f64::from(v);
-                for _ in 0..16 {
-                    z = z.sin() * 0.99 + 0.01;
-                }
-                z
-            })
-            .collect();
-        check64("ew/sin16", &got, &want, 1e-4, 1e-4);
+        let sin_host = |i: usize| {
+            let mut z = f64::from(xs[i]);
+            for _ in 0..16 {
+                z = z.sin() * 0.99 + 0.01;
+            }
+            z
+        };
+        check_sampled("ew/sin16", &host(&sins(&x)), sin_host, sample, 1e-4, 1e-4);
         h.case("ew/sin16", &format!("{n}"), Work::Items(16.0 * n as f64, "Msin/s"), &mut || sins(&x).eval().unwrap());
 
         let mix = |x: &Array<f32>, y: &Array<f32>| (x.exp() + y.abs().sqrt() + 1.0).ln().tanh();
-        let got = host(&mix(&x, &y));
-        let want: Vec<f64> = (0..n).map(|i| (f64::from(xs[i]).exp() + f64::from(ys[i]).abs().sqrt() + 1.0).ln().tanh()).collect();
-        check64("ew/exp_ln_tanh", &got, &want, 1e-4, 1e-5);
+        let mix_host = |i: usize| (f64::from(xs[i]).exp() + f64::from(ys[i]).abs().sqrt() + 1.0).ln().tanh();
+        check_sampled("ew/exp_ln_tanh", &host(&mix(&x, &y)), mix_host, sample, 1e-4, 1e-5);
         h.case("ew/exp_ln_tanh", &format!("{n}"), Work::Bytes(12.0 * n as f64), &mut || mix(&x, &y).eval().unwrap());
 
         // Comparison and select (a leaky ReLU), the bool path.
         let leaky = |y: &Array<f32>| select(&y.gt(0.0), y, &(y * 0.01));
-        let got = host(&leaky(&y));
-        let want: Vec<f64> = ys[..n].iter().map(|&v| if v > 0.0 { f64::from(v) } else { f64::from(v) * 0.01 }).collect();
-        check64("ew/select", &got, &want, 1e-6, 1e-7);
+        let leaky_host = |i: usize| if ys[i] > 0.0 { f64::from(ys[i]) } else { f64::from(ys[i]) * 0.01 };
+        check_sampled("ew/select", &host(&leaky(&y)), leaky_host, sample, 1e-6, 1e-7);
         h.case("ew/select", &format!("{n}"), Work::Bytes(8.0 * n as f64), &mut || leaky(&y).eval().unwrap());
     });
 }
@@ -221,20 +215,21 @@ fn wide_types(h: &mut Harness) {
 
 fn transpose(h: &mut Harness) {
     h.guarded("transpose", |h| {
-        let sizes: Vec<usize> = if h.ctx.is_cpu() { vec![1024, pick(h, 1024, 2048)] } else { vec![1024, pick(h, 2048, 4096)] };
-        let mut sizes = sizes;
-        sizes.dedup();
+        let sizes: Vec<usize> = match (h.ctx.is_cpu(), h.quick) {
+            (false, false) => vec![1024, 4096, 8192],
+            (false, true) => vec![1024, 2048],
+            (true, false) => vec![1024, 2048],
+            (true, true) => vec![1024],
+        };
         for n in sizes {
             let data = values(n * n, 5, -1.0, 1.0);
             let b_data = values(n * n, 6, -1.0, 1.0);
             let a = upload(h, &data, [n, n]);
             let b = upload(h, &b_data, [n, n]);
-            let got = host(&a.transpose().copy());
-            let want: Vec<f32> = (0..n * n).map(|i| data[(i % n) * n + i / n]).collect();
-            assert_eq!(got, want, "transpose {n}");
-            let got = host(&(&a.transpose() + &b));
-            let want: Vec<f64> = (0..n * n).map(|i| f64::from(data[(i % n) * n + i / n]) + f64::from(b_data[i])).collect();
-            check64("transpose_add", &got, &want, 1e-6, 1e-6);
+            let stride = (n * n / 65536).max(1) | 1;
+            let at = |i: usize| f64::from(data[(i % n) * n + i / n]);
+            check_sampled("transpose/copy", &host(&a.transpose().copy()), at, stride, 0.0, 0.0);
+            check_sampled("transpose/add", &host(&(&a.transpose() + &b)), |i| at(i) + f64::from(b_data[i]), stride, 1e-6, 1e-6);
             let bytes = 8.0 * (n * n) as f64;
             h.case("transpose/copy", &format!("{n}x{n}"), Work::Bytes(bytes), &mut || a.transpose().copy().eval().unwrap());
             h.case("transpose/add", &format!("{n}x{n}"), Work::Bytes(1.5 * bytes), &mut || (&a.transpose() + &b).eval().unwrap());
@@ -256,7 +251,7 @@ fn reductions(h: &mut Harness) {
                 std::hint::black_box(x.sum().item().unwrap());
             });
         }
-        for &n in sizes.iter().filter(|&&n| n == 1 << 10 || n == 1 << 20 || n == max_n) {
+        for &n in sizes.iter().filter(|&&n| n == 1 << 10 || n == 1 << 22 || n == max_n) {
             let (x, y) = (upload(h, &xs[..n], n), upload(h, &ys[..n], n));
             let want: f64 = (0..n).map(|i| f64::from(xs[i]) * f64::from(ys[i])).sum();
             check_scalar("red/dot", f64::from((&x * &y).sum().item().unwrap()), want, 1e-4);
@@ -265,7 +260,7 @@ fn reductions(h: &mut Harness) {
             });
         }
 
-        let n = max_n.min(1 << 22);
+        let n = max_n.min(1 << 24);
         let x = upload(h, &xs[..n], n);
         let sq: f64 = xs[..n].iter().map(|&v| f64::from(v) * f64::from(v)).sum();
         check_scalar("red/norm", f64::from(x.norm().item().unwrap()), sq.sqrt(), 1e-4);
