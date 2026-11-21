@@ -152,7 +152,7 @@ const MIN_PACK: usize = 3;
 /// contents they were made against, and a write gives its array a buffer of its own again (see
 /// [`Storage::window_of`]). `false` if nothing was packed.
 pub(super) fn repack(ctx: &Context, op: Op, args: &[Src], excess: usize) -> bool {
-    pack_leaves(ctx, leaf_buffers(op, args), excess)
+    packed(pack_leaves(ctx, leaf_buffers(op, args), excess))
 }
 
 /// [`repack`] for the expressions of several pending `nodes` that are about to be evaluated
@@ -162,7 +162,7 @@ pub(super) fn repack_nodes(ctx: &Context, nodes: &[Arc<super::Node>], excess: us
         .iter()
         .map(|node| (Src::Node(Arc::clone(node)), node.op().out_ty(), false))
         .collect();
-    pack_leaves(ctx, leaf_buffers_from(roots), excess)
+    packed(pack_leaves(ctx, leaf_buffers_from(roots), excess))
 }
 
 /// [`repack`] for the inputs of a program that binds too many: the buffers it reads (except the
@@ -178,7 +178,15 @@ pub(super) fn repack_inputs(ctx: &Context, fused: &Fused, excess: usize) -> bool
         }
     }
     let leaves = fused.inputs.iter().zip(&fused.key.input_tys).zip(shifted).map(|((storage, &ty), shifted)| (Arc::clone(storage), ty, shifted)).collect();
-    pack_leaves(ctx, leaves, excess)
+    packed(pack_leaves(ctx, leaves, excess))
+}
+
+/// Tells the plan cache that buffers were packed (a plan does not replay copies), if they were.
+fn packed(packed: bool) -> bool {
+    if packed {
+        super::plancache::taint("buffers were copied into a pack");
+    }
+    packed
 }
 
 fn pack_leaves(ctx: &Context, leaves: Vec<(Arc<Storage>, ElemTy, bool)>, excess: usize) -> bool {

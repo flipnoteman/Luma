@@ -16,7 +16,7 @@ builder methods override them:
 | `LUMA_DF_FMA` | `df_fma` / `.df_fma(fused)` |
 
 The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LOOKBACK_SCAN`, `LUMA_FUSION_*`,
-`LUMA_STAGING`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_CACHE*`, `LUMA_CUDA_DUMP`, `LUMA_CPU_THREADS`, `LUMA_CPU_SPIN_US`, `LUMA_COMPILE_THREADS`, `LUMA_EXIT_WAIT`) are read from the environment only.
+`LUMA_STAGING`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_PLAN_CACHE`, `LUMA_CACHE*`, `LUMA_CUDA_DUMP`, `LUMA_CPU_THREADS`, `LUMA_CPU_SPIN_US`, `LUMA_COMPILE_THREADS`, `LUMA_EXIT_WAIT`) are read from the environment only.
 
 ## All variables
 
@@ -36,6 +36,7 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LO
 | `LUMA_FUSION_MAX_INLINED` | Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on the NVIDIA tuning profile, 1024 on every other, the CPU one included; `16..=16384`) |
 | `LUMA_STAGING` | `off` turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first |
 | `LUMA_TRIDIAGONAL` | `thomas`, `cyclic` or `auto`: the algorithm of `solve_tridiagonal` / `solve_block_tridiagonal` (one invocation per line, or one workgroup per line by cyclic reduction); the default (`auto`) picks cyclic reduction for few, long lines on the NVIDIA and Apple tuning profiles only (and always for stacked blocks wider than 5 there) |
+| `LUMA_PLAN_CACHE` | `off`, `0`, `false` or `no` switches off the plan cache of eager evaluation: an `eval` whose pending graph has the structure of an earlier one (the loop `x = step(&x); x.eval()?`) normally runs that evaluation's recorded launches over the new buffers and scalars instead of planning it again; results are bit-identical either way. `trace` prints what the cache records and why it gives up on a structure |
 | `LUMA_SPECULATE` | `off` stops readbacks in a loop (`step` then `.max().item()?` every iteration) from computing the next steps ahead |
 | `LUMA_FAST_MATH` | `1`, `on` or `true`: allow rewrites that change values (`x + 0`, `x * 0`, `x - x`, `x / x`, constant reassociation and `x / c` as `x * (1 / c)` (both `f32` and `f64` only), `powf` with exponent 1, 2 or 0.5) and the cheaper `Df32` addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (`x * 1`, `-(-x)`) always run |
 | `LUMA_DF_FMA` | `0`, `off` or `false` makes `Df32` products split their factors (Dekker) instead of taking the error of a product from `fma`; `1`, `on` or `true` trusts that the device's `fma` is fused. Default: a one-time test kernel decides per device (stored with the calibration, see `LUMA_CACHE`); the results are the same either way |
