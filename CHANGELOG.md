@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `matmul`: products with a small output and a long `K` (a Gram matrix `ZᵀZ`, one-hot labels times features, a gradient `Xᵀr`, a covariance, a matrix times a few vectors) run as a new kernel family instead of the 32-wide staged tiles split over `K`: each invocation owns up to 10x8 outputs in registers and loads both operands straight from global memory, with no workgroup staging and no barriers in the loop, and the invocations the small output does not need take other `k` (reduced pairwise through workgroup memory, in a fixed order); the slices are then summed by the existing partial-sum pass. A matrix stored along `K` times up to 8 columns reads along `K` with a few rows per invocation. A pending operand that many tiles would recompute at every load (the standardised matrix of a Gram product) is evaluated first. On an RTX 3090 (CUDA): `onehot(y)ᵀ X` over 1M x 32 takes 0.19 ms instead of 0.51, `Xᵀ r` over 1M x 64 0.33 ms instead of 1.04, the Gram matrix of 16 features over 1M samples 0.17 ms instead of 0.59 and of 64 features 1.7 ms instead of 2.3, a 2048x2048 matrix times a vector 0.03 ms instead of 0.19.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed

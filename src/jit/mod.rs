@@ -201,7 +201,7 @@ use looped::LoopPlan;
 use program::Instr;
 pub(crate) use program::AtomicOp;
 
-pub(crate) use launch::{axis_reduce, check_finite, evaluate, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, run_loop, solve, MatmulKernel, MatmulSide, PartSide};
+pub(crate) use launch::{axis_reduce, check_finite, evaluate, evaluate_for_reuse, evaluate_group, evaluate_into, force_group, matmul, stored_along_k, radix_pass, reduce_first_pass, run_loop, solve, MatmulKernel, MatmulSide, PartSide};
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};
