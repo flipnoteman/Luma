@@ -144,6 +144,20 @@ pub fn run(h: &mut Harness) {
             });
         }
 
+        // The 24-operation expression in Df32 arithmetic (each operation is ~10-20 float operations).
+        {
+            let want: Vec<f32> = xh.iter().map(|&v| heavy_host(f64::from(v).abs()) as f32).collect();
+            let xa = x.abs();
+            check("fusion/heavy_f32", &heavy(&xa).to_vec().unwrap(), &want, 1e-4, 1e-5);
+            h.case("fusion/heavy_f32", &format!("24op f32 n={n}"), Work::Bytes(bytes), &mut || {
+                force(&heavy(&xa));
+            });
+            check("fusion/df32_heavy", &heavy_df32(&xa).to_vec().unwrap(), &want, 1e-5, 1e-6);
+            h.case("fusion/df32_heavy", &format!("24op df32 n={n}"), Work::Bytes(bytes), &mut || {
+                force(&heavy_df32(&xa));
+            });
+        }
+
         // Many scalars (a uniform block of 192 values) that change from call to call: one kernel.
         let mut round = 0u32;
         let scalars = |round: u32| -> Vec<f32> {

@@ -136,6 +136,18 @@ pub fn run(h: &mut Harness) {
             }
         });
 
+        // Df32 (double-float) arithmetic expands every operation into many: bigger programs to build.
+        let kd = k.min(4);
+        {
+            let steps = fresh_df_recipe(8);
+            check("compile/df32", &apply_df(&steps, &x, &y).to_vec().unwrap(), &apply_host(&steps, &xh[..n], &yh[..n]), 2e-3, 2e-3);
+        }
+        h.case("compile/cold_df32", &format!("{kd}x8op df32 n={n}"), per_sec(kd, "kernel/s"), &mut || {
+            for _ in 0..kd {
+                force(&apply_df(&fresh_df_recipe(8), &x, &y));
+            }
+        });
+
         // A context opened in this process (what a new run of an application pays): the kernels
         // of the cases above come from the on-disk cache, not from the compiler. `newctx_empty`
         // is the opening plus one tiny kernel, `newctx_kernels` adds the `k` kernels of

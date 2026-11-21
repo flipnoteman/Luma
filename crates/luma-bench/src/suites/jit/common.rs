@@ -131,14 +131,20 @@ pub fn recipe(seed: u64, len: usize) -> Vec<Step> {
     (0..len).map(|_| Step::random(&mut rng)).collect()
 }
 
-/// `len` random steps never built before in this process or an earlier one.
-pub fn fresh_recipe(len: usize) -> Vec<Step> {
+/// A generator seeded differently at every call, in this process and the next.
+fn fresh_rng() -> Rng {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let k = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut rng = Rng((salt() ^ k.wrapping_mul(0xD6E8_FEB8_6659_FD93)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     for _ in 0..4 {
         rng.next();
     }
+    rng
+}
+
+/// `len` random steps never built before in this process or an earlier one.
+pub fn fresh_recipe(len: usize) -> Vec<Step> {
+    let mut rng = fresh_rng();
     (0..len).map(|_| Step::random(&mut rng)).collect()
 }
 
@@ -237,4 +243,58 @@ pub fn heavy_host(x: f64) -> f64 {
         e = (e * 0.9 + 0.2).sqrt().abs().max(e * 0.5);
     }
     e
+}
+
+pub type D = Array<Df32>;
+
+impl Step {
+    /// A step of the subset `Df32` arrays support (no `sin` or `tanh`).
+    pub fn random_df(rng: &mut Rng) -> Step {
+        loop {
+            let s = Step::random(rng);
+            if !matches!(s, Step::Sin | Step::Tanh) {
+                return s;
+            }
+        }
+    }
+
+    pub fn dev_df(self, x: &D, y: &D) -> D {
+        let c = |v: f32| Df32::from(v);
+        match self {
+            Step::Add(v) => x + c(v),
+            Step::Mul(v) => x * c(v),
+            Step::SqrtAbs => (x.abs() + c(0.05)).sqrt(),
+            Step::Abs => x.abs(),
+            Step::Max => x.maximum(y),
+            Step::Min => x.minimum(y * c(0.9)),
+            Step::Sub => x - y,
+            Step::MulY => &(x * y) * c(0.5),
+            Step::Sin | Step::Tanh => unreachable!("not a Df32 step"),
+        }
+    }
+}
+
+/// `len` `Df32` steps never built before.
+pub fn fresh_df_recipe(len: usize) -> Vec<Step> {
+    let mut rng = fresh_rng();
+    (0..len).map(|_| Step::random_df(&mut rng)).collect()
+}
+
+/// The recipe in `Df32` arithmetic on `f32` inputs and output.
+pub fn apply_df(steps: &[Step], x: &A, y: &A) -> A {
+    let (y, mut a) = (y.to_df32(), x.to_df32());
+    for s in steps {
+        a = s.dev_df(&a, &y);
+    }
+    a.to_f32()
+}
+
+/// [`heavy`] in `Df32` arithmetic.
+pub fn heavy_df32(x: &A) -> A {
+    let (a, b, c) = (Df32::from(0.9f32), Df32::from(0.2f32), Df32::from(0.5f32));
+    let mut e = x.to_df32();
+    for _ in 0..4 {
+        e = (&e * a + b).sqrt().abs().maximum(&e * c);
+    }
+    e.to_f32()
 }
