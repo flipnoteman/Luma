@@ -209,6 +209,56 @@ fn keep_pinned(st: &mut State, pinned: Pinned) {
     st.pinned_free.push(pinned);
 }
 
+fn check_mask(module: &KernelModule, used: Option<&[bool]>) -> Result<(), BackendError> {
+    match used {
+        Some(mask) if mask.len() != module.bindings.len() => {
+            Err(BackendError::KernelBinding(format!("the used-binding mask has {} entries for {} bindings", mask.len(), module.bindings.len())))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Where the time of building a kernel's function went (logged at debug level per kernel).
+struct Phases {
+    /// NVVM (IR to PTX); `None` when the PTX came from the disk cache.
+    nvvm: Option<Duration>,
+    /// `cuModuleLoadData` (PTX to SASS by the driver's JIT, or the driver's own cache) and the function lookup.
+    load: Duration,
+    ptx_bytes: usize,
+}
+
+impl fmt::Display for Phases {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.nvvm {
+            Some(nvvm) => write!(f, "NVVM {:.1} ms ({} bytes of PTX), module load {:.1} ms", nvvm.as_secs_f64() * 1e3, self.ptx_bytes, self.load.as_secs_f64() * 1e3),
+            None => write!(f, "PTX from the disk cache, module load {:.1} ms", self.load.as_secs_f64() * 1e3),
+        }
+    }
+}
+
+/// Generates, compiles and loads the kernel of `module`; runs on the calling thread, which may be
+/// a compile worker: the device context is bound to it here.
+fn compile_native(shared: &CudaShared, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<CudaKernel, BackendError> {
+    let started = Instant::now();
+    let checked: Cow<'_, KernelModule> = if trust.checks_bounds() { kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
+    let optimized = kir::optimize_for_target(&checked, true);
+    // `with_bounds_checks` already guards every workgroup-array index it cannot prove in range,
+    // so the emitter's own clamp (a `min` per access) would only repeat it.
+    let translated = codegen::emit_with_options(&optimized, used, trust.zero_workgroup_memory(), false);
+    let codegen_time = started.elapsed();
+    let strides: Vec<u32> = translated.array_lengths.iter().map(|&b| optimized.bindings.get(b as usize).and_then(|d| d.element_stride).unwrap_or(1)).collect();
+
+    shared.ctx.bind_to_thread().map_err(gpu)?;
+    let (func, phases) = shared.build_function(&translated.source, label)?;
+    log::debug!(
+        "luma-cuda: kernel `{label}`: codegen {:.1} ms ({} bytes of IR), {}",
+        codegen_time.as_secs_f64() * 1e3,
+        translated.source.len(),
+        phases
+    );
+    Ok(CudaKernel { func, workgroup: optimized.workgroup_size, param_abis: translated.param_abis, array_lengths: translated.array_lengths, strides })
+}
+
 /// A compiled kernel.
 #[derive(Debug)]
 struct CudaKernel {
@@ -445,6 +495,45 @@ impl CudaShared {
         let shared = Arc::new(CudaShared::open()?);
         *pool = Some(Arc::clone(&shared));
         Ok(shared)
+    }
+
+    /// The kernel compiled from NVVM IR `source`, through the disk cache.
+    fn build_function(&self, source: &str, label: &str) -> Result<(CudaFunction, Phases), BackendError> {
+        let (major, minor) = self.cc;
+        // Last byte: emitter revision; bump whenever the emitted IR or the NVVM options change.
+        let meta = [major as u8, minor as u8, self.nvvm.version.0 as u8, self.nvvm.version.1 as u8, 6];
+        let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let stem = format!("ptx-{hash:016x}");
+        let load = |text: String| self.ctx.load_module(Ptx::from_src(text)).and_then(|m| m.load_function(ENTRY));
+        let dump = |ptx: &str| {
+            if let Some(dir) = DUMP_DIR.as_deref() {
+                // Best effort: a debugging aid must not fail a compile.
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(dir.join(format!("{stem}.ll")), source);
+                let _ = std::fs::write(dir.join(format!("{stem}.ptx")), ptx);
+                let _ = std::fs::write(dir.join(format!("{stem}.label")), label);
+            }
+        };
+        if let Some(text) = self.disk.load_blob(&stem, PTX_MAGIC).and_then(|bytes| String::from_utf8(bytes).ok())
+            && !text.contains('\0')
+        {
+            dump(&text);
+            let started = Instant::now();
+            match load(text) {
+                Ok(func) => return Ok((func, Phases { nvvm: None, load: started.elapsed(), ptx_bytes: 0 })),
+                // A stale cache entry: rebuild it.
+                Err(_) => self.disk.remove_blob(&stem),
+            }
+        }
+        let started = Instant::now();
+        let text = self.nvvm.compile(source, major, minor).map_err(|e| BackendError::ShaderCompile(format!("kernel `{label}`:\n{e}")))?;
+        let nvvm = started.elapsed();
+        dump(&text);
+        let started = Instant::now();
+        let func = load(text.clone()).map_err(gpu)?;
+        let phases = Phases { nvvm: Some(nvvm), load: started.elapsed(), ptx_bytes: text.len() };
+        self.disk.store_blob(&stem, PTX_MAGIC, text.as_bytes());
+        Ok((func, phases))
     }
 
     fn open() -> Result<CudaShared, BackendError> {
@@ -841,47 +930,13 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// The kernel compiled from NVVM IR `source`, through the disk cache.
-    fn build_function(&self, source: &str, label: &str) -> Result<CudaFunction, BackendError> {
-        let (major, minor) = self.shared.cc;
-        // Last byte: emitter revision; bump whenever the emitted IR or the NVVM options change.
-        let meta = [major as u8, minor as u8, self.shared.nvvm.version.0 as u8, self.shared.nvvm.version.1 as u8, 6];
-        let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let stem = format!("ptx-{hash:016x}");
-        let load = |text: String| self.shared.ctx.load_module(Ptx::from_src(text)).and_then(|m| m.load_function(ENTRY));
-        let dump = |ptx: &str| {
-            if let Some(dir) = DUMP_DIR.as_deref() {
-                // Best effort: a debugging aid must not fail a compile.
-                let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(dir.join(format!("{stem}.ll")), source);
-                let _ = std::fs::write(dir.join(format!("{stem}.ptx")), ptx);
-                let _ = std::fs::write(dir.join(format!("{stem}.label")), label);
-            }
-        };
-        if let Some(text) = self.shared.disk.load_blob(&stem, PTX_MAGIC).and_then(|bytes| String::from_utf8(bytes).ok())
-            && !text.contains('\0')
-        {
-            dump(&text);
-            match load(text) {
-                Ok(func) => return Ok(func),
-                // A stale cache entry: rebuild it.
-                Err(_) => self.shared.disk.remove_blob(&stem),
-            }
-        }
-        let text = self.shared.nvvm.compile(source, major, minor).map_err(|e| BackendError::ShaderCompile(format!("kernel `{label}`:\n{e}")))?;
-        dump(&text);
-        let func = load(text.clone()).map_err(gpu)?;
-        self.shared.disk.store_blob(&stem, PTX_MAGIC, text.as_bytes());
-        Ok(func)
-    }
-
     fn try_capture(&self, launches: &[GraphLaunch<'_>]) -> Result<Arc<dyn ExecGraph>, BackendError> {
         if lock(&self.state).profiler.is_some() {
             return Err(BackendError::Unsupported("graphs are not captured while profiling".into()));
         }
         let natives: Vec<&CudaKernel> = launches
             .iter()
-            .map(|l| l.kernel.raw.downcast_ref::<CudaKernel>().ok_or_else(|| BackendError::Unsupported("kernel was compiled by another backend".into())))
+            .map(|l| l.kernel.raw.resolve::<CudaKernel>())
             .collect::<Result<_, _>>()?;
         let dispatches: Vec<([u32; 3], u64, Option<&Buffer>)> = launches.iter().map(|l| resolve_dispatch(l.dispatch)).collect::<Result<_, _>>()?;
 
@@ -1011,27 +1066,21 @@ impl Backend for CudaBackend {
     }
 
     fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
-        if let Some(mask) = used
-            && mask.len() != module.bindings.len()
-        {
-            return Err(BackendError::KernelBinding(format!("the used-binding mask has {} entries for {} bindings", mask.len(), module.bindings.len())));
-        }
-        let checked: Cow<'_, KernelModule> = if trust.checks_bounds() { kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
-        let optimized = kir::optimize_for_target(&checked, true);
-        // `with_bounds_checks` already guards every workgroup-array index it cannot prove in range,
-        // so the emitter's own clamp (a `min` per access) would only repeat it.
-        let translated = codegen::emit_with_options(&optimized, used, trust.zero_workgroup_memory(), false);
-        let strides: Vec<u32> = translated.array_lengths.iter().map(|&b| optimized.bindings.get(b as usize).and_then(|d| d.element_stride).unwrap_or(1)).collect();
+        check_mask(module, used)?;
+        compile_native(&self.shared, module, used, label, trust).map(RawKernel::new)
+    }
 
-        self.bind()?;
-        let func = self.build_function(&translated.source, label)?;
-        Ok(RawKernel::new(CudaKernel { func, workgroup: optimized.workgroup_size, param_abis: translated.param_abis, array_lengths: translated.array_lengths, strides }))
+    fn compile_kernel_deferred(&self, module: KernelModule, used: Option<Box<[bool]>>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
+        check_mask(&module, used.as_deref())?;
+        let shared = Arc::clone(&self.shared);
+        let label = label.to_owned();
+        Ok(RawKernel::spawn(move || compile_native(&shared, &module, used.as_deref(), &label, trust)))
     }
 
     fn record_launch(&self, kernel: &CompiledKernel, dispatch: Dispatch<'_>, size: [u32; 3], args: &[RawArg<'_>]) -> Result<u32, BackendError> {
         kernel.check_count(args.len())?;
         kernel.check_kinds(args)?;
-        let native = kernel.raw.downcast_ref::<CudaKernel>().ok_or_else(|| BackendError::Unsupported("kernel was compiled by another backend".into()))?;
+        let native = kernel.raw.resolve::<CudaKernel>()?;
         let (grid, indirect, indirect_buffer) = resolve_dispatch(dispatch)?;
         let mut st = lock(&self.state);
         if grid.contains(&0) {

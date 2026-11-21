@@ -22,10 +22,20 @@ const LINE_SOLVER_ENV: &str = "LUMA_TRIDIAGONAL";
 /// `LUMA_SINGLE_PASS_REDUCE=off|on` overrides [`Tuning::single_pass_reduce`] (`on` only takes
 /// effect on the CUDA and CPU backends, whose atomics and fences order memory across workgroups).
 const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
+/// `LUMA_MULTI_REDUCE=off|n` overrides [`Tuning::reduce_multi`] (`off` or `1` keeps every reduction
+/// in a kernel of its own; clamped to the most accumulators a kernel has).
+const MULTI_REDUCE_ENV: &str = "LUMA_MULTI_REDUCE";
 /// `LUMA_LOOKBACK_SCAN=off|on` overrides [`Tuning::lookback_scan`] (`on` only takes effect on the
 /// CUDA and CPU backends, for the same reason as `LUMA_SINGLE_PASS_REDUCE`; floating-point sums
 /// keep two passes either way, to stay reproducible).
 const LOOKBACK_ENV: &str = "LUMA_LOOKBACK_SCAN";
+/// `LUMA_NATIVE_SOLVE=off` runs the line solves of a backend that has native ones (the CPU backend)
+/// as compiled shaders, like the GPU backends (see [`Tuning::native_solve`]).
+const NATIVE_SOLVE_ENV: &str = "LUMA_NATIVE_SOLVE";
+
+/// `LUMA_NATIVE_GEMM=off` runs the matrix products of a backend that has native ones (the CPU
+/// backend) as compiled tile kernels, like the GPU backends (see [`Tuning::native_gemm`]).
+const NATIVE_GEMM_ENV: &str = "LUMA_NATIVE_GEMM";
 
 /// The algorithm of the tridiagonal and block-tridiagonal line solves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -60,6 +70,10 @@ pub(crate) struct Tuning {
     pub(crate) reduce_per_thread: u32,
     /// Most workgroups of a reduction pass; they stride over arrays larger than that many blocks.
     pub(crate) reduce_max_groups: u32,
+    /// Most accumulators (reductions of one operand each, ops counted) one kernel computes when several
+    /// pending reductions of the same length are forced together (see `jit::multireduce`); below 2 they are
+    /// never merged. `LUMA_MULTI_REDUCE` overrides.
+    pub(crate) reduce_multi: usize,
     /// Whether a reduction with more than one workgroup finishes in its first launch: the last
     /// workgroup to write its partial result combines them all (see `builtin::reduce_main`),
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
@@ -106,6 +120,14 @@ pub(crate) struct Tuning {
     pub(crate) line_strided_from: u32,
     /// Which tridiagonal solver runs; `LUMA_TRIDIAGONAL` overrides.
     pub(crate) line_solver: LineSolver,
+    /// Whether the backend runs the Thomas line solves as native code (`Backend::native_line_solve`,
+    /// `LUMA_NATIVE_SOLVE=off` clears it): the planner then never takes cyclic reduction on its own and
+    /// solves blocks of any size by the block Thomas algorithm (see `builtin::thomas_plan`).
+    pub(crate) native_solve: bool,
+    /// The cores a native matrix product spreads over (`Backend::native_matmul`; 0 if the backend has
+    /// none or `LUMA_NATIVE_GEMM=off`): the products are then planned as output tiles for that many
+    /// cores and their operands evaluated first (see `matmul::native_plan`).
+    pub(crate) native_gemm: u32,
     /// Whether a scan of long contiguous lines is one kernel that reads its input once, with a
     /// decoupled look-back (each workgroup takes a chunk from an atomic counter, publishes the
     /// chunk's aggregate and waits for the prefix of the chunks before it, see
@@ -154,6 +176,7 @@ impl Tuning {
         stencil_tile_1d: 512,
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
+        reduce_multi: 16,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -170,6 +193,8 @@ impl Tuning {
         // 32-wide SIMD groups, like NVIDIA warps: see `builtin::thomas_plan`.
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
         compute_units: REFERENCE_COMPUTE_UNITS,
     };
@@ -184,6 +209,7 @@ impl Tuning {
         stencil_tile_1d: 2048,
         reduce_per_thread: 8,
         reduce_max_groups: 2048,
+        reduce_multi: 16,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -202,6 +228,8 @@ impl Tuning {
         // RTX 3090, see `builtin::thomas_plan`.
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
         compute_units: REFERENCE_COMPUTE_UNITS,
     };
@@ -216,6 +244,7 @@ impl Tuning {
         stencil_tile_1d: 1024,
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
+        reduce_multi: 16,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -231,6 +260,8 @@ impl Tuning {
         line_cyclic_work: 0,
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
         compute_units: REFERENCE_COMPUTE_UNITS,
     };
@@ -279,6 +310,11 @@ impl Tuning {
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
             _ => info.backend == BackendKind::Cuda,
         };
+        tuning.reduce_multi = match std::env::var(MULTI_REDUCE_ENV).as_deref().map(str::trim) {
+            Ok("off") => 1,
+            Ok(value) => value.parse::<usize>().map_or(tuning.reduce_multi, |n| n.clamp(1, crate::builtin::MAX_ACCS)),
+            Err(_) => tuning.reduce_multi,
+        };
         tuning.lookback_scan = match std::env::var(LOOKBACK_ENV).as_deref().map(str::trim) {
             Ok("off") => false,
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
@@ -296,6 +332,17 @@ impl Tuning {
             _ => LineSolver::Auto,
         };
         tuning
+    }
+
+    /// Whether the line solves run natively, given whether the backend can: see
+    /// [`Tuning::native_solve`].
+    pub(crate) fn native_solve_for(supported: bool) -> bool {
+        supported && std::env::var(NATIVE_SOLVE_ENV).as_deref().map(str::trim) != Ok("off")
+    }
+
+    /// The cores of [`Tuning::native_gemm`], given the cores of the backend's native product (if it has one).
+    pub(crate) fn native_gemm_for(cores: Option<u32>) -> u32 {
+        cores.filter(|_| std::env::var(NATIVE_GEMM_ENV).as_deref().map(str::trim) != Ok("off")).unwrap_or(0)
     }
 
     /// The generic parameters, for tests that need a `Tuning` without a device.

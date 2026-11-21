@@ -57,6 +57,7 @@ use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::jit::{self, Node};
 use crate::ops::{fold_workgroups, Outcome};
 use crate::scan::{add_operator, Bound, Lines};
+use crate::segsort::{LineJob, LineSort};
 use crate::shape::Shape;
 use crate::tuning::Tuning;
 
@@ -90,7 +91,7 @@ pub enum KeyTransform {
 
 impl KeyTransform {
     /// The WGSL body of `fn key_in(b: u32) -> u32`.
-    fn forward(self) -> &'static str {
+    pub(crate) fn forward(self) -> &'static str {
         match self {
             KeyTransform::Identity => "return b;",
             KeyTransform::Signed => "return b ^ 0x80000000u;",
@@ -102,7 +103,7 @@ impl KeyTransform {
     }
 
     /// The WGSL body of `fn key_out(k: u32) -> u32`, the inverse of [`KeyTransform::forward`].
-    fn inverse(self) -> &'static str {
+    pub(crate) fn inverse(self) -> &'static str {
         match self {
             KeyTransform::Identity => "return k;",
             KeyTransform::Signed => "return k ^ 0x80000000u;",
@@ -858,10 +859,11 @@ impl<T: SortKey> Array<T> {
     }
 
     /// Sorts every line along `axis` independently (axis 0 varies fastest), keeping the shape.
-    /// Equal elements keep their input order. Order of floats as for [`Array::sort`].
+    /// Order of floats as for [`Array::sort`].
     ///
-    /// Sorts everything with [`Array::argsort`], then sorts that permutation stably by the line of
-    /// every element and writes each line's elements in order.
+    /// Sorts everything by value carrying each element's index, then sorts that stably by the line
+    /// of the index (see `sort_lines`), and for an axis that is not the fastest moves the lines
+    /// back to their place by a tiled transpose. NaNs come out as the positive quiet NaN.
     #[track_caller]
     pub fn sort_axis(&self, axis: usize) -> Array<T> {
         let location = Location::caller();
@@ -929,61 +931,99 @@ impl<T: SortKey> Array<T> {
 
     /// The sorted elements and the flat indices that order them (one stable sort).
     pub(crate) fn sort_with_indices(&self) -> crate::error::Result<(Array<T>, Array<u32>)> {
+        self.run_sort_with_indices().map_err(Failure::into_error)
+    }
+
+    fn run_sort_with_indices(&self) -> Outcome<(Array<T>, Array<u32>)> {
         let ctx = self.context();
-        let run = || -> Outcome<(Array<T>, Array<u32>)> {
-            if self.len() <= 1 {
-                self.storage()?;
-                return Ok((self.clone(), Array::<u32>::zeros_on(ctx, self.shape())?));
-            }
-            if ctx.can_run_on_host()
-                && self.len() <= crate::host::MAX_SORT_ELEMS
-                && self.error().is_none()
-                && let Some(pair) = crate::host::try_sort_with_indices(self)
-            {
-                return Ok(pair);
-            }
-            let spec = Spec { transform: T::TRANSFORM, descending: false, key_bits: 32, want_keys: true };
-            let sorted = self.radix(Payload::Index, spec)?;
-            let keys = Array::from_storage(ctx, self.shape(), sorted.keys.expect("keys were asked for"));
-            let perm = Array::from_storage(ctx, self.shape(), sorted.payload.expect("the payload was asked for"));
-            Ok((keys, perm))
-        };
-        run().map_err(Failure::into_error)
+        if self.len() <= 1 {
+            self.storage()?;
+            return Ok((self.clone(), Array::<u32>::zeros_on(ctx, self.shape())?));
+        }
+        if ctx.can_run_on_host()
+            && self.len() <= crate::host::MAX_SORT_ELEMS
+            && self.error().is_none()
+            && let Some(pair) = crate::host::try_sort_with_indices(self)
+        {
+            return Ok(pair);
+        }
+        let spec = Spec { transform: T::TRANSFORM, descending: false, key_bits: 32, want_keys: true };
+        let sorted = self.radix(Payload::Index, spec)?;
+        let keys = Array::from_storage(ctx, self.shape(), sorted.keys.expect("keys were asked for"));
+        let perm = Array::from_storage(ctx, self.shape(), sorted.payload.expect("the payload was asked for"));
+        Ok((keys, perm))
+    }
+
+    /// Every line along `axis` sorted, the lines one after the other: a flat array of `len`
+    /// elements in which line `l` (`l = s + o * stride`, `s` below and `o` above the axis) is
+    /// elements `l * n ..` `(l + 1) * n`, ascending. `axis` must be below 4 and the extent
+    /// along it above 1.
+    ///
+    /// One stable sort of everything by value, carrying the flat input index, then a stable sort of
+    /// that by the line of the index (a few bits, so one to three passes), carrying the values:
+    /// the second sort groups the lines and keeps each in order, and nothing is gathered or
+    /// scattered with a stride.
+    pub(crate) fn sort_lines(&self, axis: usize) -> Outcome<Array<T>> {
+        let ctx = self.context();
+        let dims = self.shape().dims();
+        let (len, n) = (self.len(), dims[axis]);
+        let lines = len / n;
+        let flat = self.reshape(len);
+        if lines == 1 {
+            return flat.run_sort(false);
+        }
+        let stride: usize = dims[..axis].iter().product();
+        let (keys, perm) = flat.run_sort_with_indices()?;
+        let (stride, n, lines32) = (stride as u32, n as u32, lines as u32);
+        // The line of every element in the order of the sort by value.
+        let line = (&perm % stride) + (&perm / (stride * n)) * stride;
+        let bits = u32::BITS - (lines32 - 1).leading_zeros();
+        let spec = Spec { transform: KeyTransform::Identity, descending: false, key_bits: bits, want_keys: false };
+        let by_line = line.radix(Payload::Buffer(keys.storage()?), spec)?;
+        Ok(Array::from_storage(ctx, Shape::from(len), by_line.payload.expect("the payload was asked for")))
+    }
+
+    /// Every line of `n` (at most [`crate::segsort::max_line`]) elements `stride` apart sorted in
+    /// place of its own, by one kernel (see [`crate::segsort`]).
+    fn sort_short_lines(&self, stride: usize, n: usize) -> Outcome<Array<T>> {
+        let ctx = self.context();
+        let len = self.len();
+        let too_large = || LumaError::DimensionTooLarge { shape: self.shape().dims() };
+        let job = LineJob { n: n as u32, stride: u32::try_from(stride).map_err(|_| too_large())?, lines: u32::try_from(len / n).map_err(|_| too_large())? };
+        u32::try_from(len).map_err(|_| too_large())?;
+        let bytes = len as u64 * 4;
+        let input = self.storage()?.pin_single()?;
+        let out = Arc::new(Storage::new(ctx, len, ElemLayout::plain(4)));
+        let out_pin = out.pin_single()?;
+        LineSort::new(T::TRANSFORM, job.n, job.stride).launch(ctx, job, RawArg::write(out_pin.buffer(), bytes), RawArg::read(input.buffer(), bytes))?;
+        drop((input, out_pin));
+        Ok(Array::from_storage(ctx, self.shape(), out))
     }
 
     fn run_sort_axis(&self, axis: usize) -> Outcome<Array<T>> {
-        let ctx = self.context();
         let shape = self.shape();
         let dims = shape.dims();
         if axis >= 4 {
             return Err(LumaError::InvalidShape(format!("axis {axis} of shape {shape}")).into());
         }
         self.storage()?;
-        let (len, n) = (self.len(), dims[axis]);
+        let n = dims[axis];
         if n == 1 {
             return Ok(self.clone());
         }
         let stride: usize = dims[..axis].iter().product();
-        let lines = len / n;
-        let flat = self.run_argsort(false)?;
-        if lines == 1 {
-            // One line: the argsort is the permutation (shaped like the array, so the gather is).
-            return Ok(self.take(&Array::<u32>::from_storage(ctx, shape, flat)));
+        if n <= crate::segsort::max_line(self.context()) as usize {
+            return self.sort_short_lines(stride, n);
         }
-        let perm = Array::<u32>::from_storage(ctx, Shape::from(len), flat);
-        let (stride, n, lines32) = (stride as u32, n as u32, lines as u32);
-        // The line of every element in the order of the argsort.
-        let line = (&perm % stride) + (&perm / (stride * n)) * stride;
-        let bits = u32::BITS - (lines32 - 1).leading_zeros();
-        let spec = Spec { transform: KeyTransform::Identity, descending: false, key_bits: bits, want_keys: false };
-        let by_line = line.radix(Payload::Buffer(perm.storage()?), spec)?;
-        let order = Array::<u32>::from_storage(ctx, Shape::from(len), by_line.payload.expect("the payload was asked for"));
-        // Entry `k` of line `l` is element `l * n + k` of `order`; it goes to its place in the line.
-        let at = Array::<u32>::range_on(ctx, Shape::from(len), 0)?;
-        let (l, k) = (&at / n, &at % n);
-        let dest = (&l % stride) + (&l / stride) * (stride * n) + k * stride;
-        let mut out = Array::<T>::alloc(ctx, shape)?;
-        out.put(&dest, self.take(&order))?;
-        Ok(out)
+        let sorted = self.sort_lines(axis)?;
+        if stride == 1 {
+            return Ok(sorted.reshape(shape));
+        }
+        // Line `s + o * stride` is `[n]` at `o * stride * n + s * n`: per `o` a matrix of
+        // `stride` rows of `n` that goes to `n` rows of `stride`, a tiled transpose.
+        let outer = self.len() / (n * stride);
+        let sorted = sorted.reshape([n, stride, outer]).swap_axes(0, 1).reshape(shape);
+        sorted.request().map_err(Failure::New)?;
+        Ok(sorted)
     }
 }

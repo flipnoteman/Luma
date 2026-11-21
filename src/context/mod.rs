@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, KernelTrust, Profile};
+use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, KernelTrust, MatmulSpec, Profile};
 
 use crate::builtin::{Builtin, BuiltinKernel};
 use crate::error::{LumaError, Result};
@@ -540,6 +540,8 @@ impl Context {
             },
         };
         tuning.df_sloppy_add = options.fast_math;
+        tuning.native_solve = Tuning::native_solve_for(backend.native_line_solve());
+        tuning.native_gemm = Tuning::native_gemm_for(backend.native_matmul());
         tune(&mut tuning);
 
         let ctx = Context {
@@ -768,7 +770,13 @@ impl Context {
                 match op.kernel(ty, &self.inner.tuning) {
                     BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), KernelTrust::Trusted),
                     BuiltinKernel::Wgsl(source) => {
-                        kernel::build_core(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), KernelTrust::Trusted)
+                        let native = match op {
+                            Builtin::Matmul { tile: crate::matmul::MatmulTile::Native { edge, lhs_t, rhs_t }, .. } => {
+                                Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t }))
+                            }
+                            _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),
+                        };
+                        kernel::build_core_native(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), KernelTrust::Trusted, native)
                     }
                 }
                 .map(Arc::new)

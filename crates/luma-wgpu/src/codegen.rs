@@ -24,14 +24,52 @@ const LANES: [char; 4] = ['x', 'y', 'z', 'w'];
 
 /// `module` as WGSL, declaring every binding.
 pub fn emit(module: &KernelModule) -> String {
-    emit_with(module, None)
+    emit_with(module, None, false)
 }
 
 /// `module` as WGSL, declaring only the bindings `used` marks (the entry point's binding mask, see
-/// `CompiledKernel::used`), each under its original binding number.
-pub fn emit_with(module: &KernelModule, used: Option<&[bool]>) -> String {
-    let em = Em { m: module, helpers: RefCell::new(BTreeMap::new()), f16: Cell::new(false), temps: Cell::new(0) };
+/// `CompiledKernel::used`), each under its original binding number. With `hardware_f32_atomics`
+/// (the device has `SHADER_FLOAT32_ATOMIC`) the storage bindings of `f32` atomics that are only
+/// ever added to are declared `atomic<f32>` and `atomicAdd`ed directly instead of through a
+/// compare-and-swap loop on their bits.
+pub fn emit_with(module: &KernelModule, used: Option<&[bool]>, hardware_f32_atomics: bool) -> String {
+    let hardware = if hardware_f32_atomics { hardware_f32_bindings(module) } else { vec![false; module.bindings.len()] };
+    let em = Em { m: module, helpers: RefCell::new(BTreeMap::new()), f16: Cell::new(false), temps: Cell::new(0), hardware };
     em.module(used)
+}
+
+/// Which storage bindings of `module` hold `f32` atomics that nothing but `atomicAdd` and
+/// `atomicSub` touches: those can use the device's native `f32` atomics (WGSL has no
+/// compare-exchange, min or max on them, nor a way to see their bits).
+fn hardware_f32_bindings(module: &KernelModule) -> Vec<bool> {
+    let mut hardware: Vec<bool> = module.bindings.iter().map(|d| d.kind == BindingKind::StorageReadWrite && matches!(d.elem_ty, KirType::Atomic(ScalarTy::F32))).collect();
+    if !hardware.contains(&true) {
+        return hardware;
+    }
+    let mut spoil = |target: &AtomicTarget| {
+        if let AtomicTarget::Storage { binding, .. } = target {
+            hardware[*binding as usize] = false;
+        }
+    };
+    let mut scan = |block: &[Stmt]| {
+        walk_stmts(block, &mut |stmt| {
+            match stmt {
+                Stmt::AtomicStore { target, .. } | Stmt::AtomicCompareExchange { target, .. } => spoil(target),
+                Stmt::AtomicRmw { op, target, .. } if !matches!(op, IrAtomicOp::Add | IrAtomicOp::Sub) => spoil(target),
+                _ => {}
+            }
+            stmt.for_each_expr(&mut |e| {
+                e.walk(&mut |x| {
+                    if let Expr::AtomicLoad { target, .. } = x {
+                        spoil(target);
+                    }
+                })
+            });
+        })
+    };
+    scan(&module.entry_body);
+    module.functions.iter().for_each(|f| scan(&f.body));
+    hardware
 }
 
 fn ident(s: &str) -> String {
@@ -53,6 +91,8 @@ struct Em<'m> {
     helpers: RefCell<BTreeMap<String, String>>,
     f16: Cell<bool>,
     temps: Cell<u32>,
+    /// Per binding: whether it is an `array<atomic<f32>>` of the device's native `f32` atomics.
+    hardware: Vec<bool>,
 }
 
 fn lit_i32(v: i32) -> String {
@@ -856,7 +896,8 @@ impl Em<'_> {
             IrAtomicOp::Exchange => "atomicExchange",
         };
         let float = elem_ty == ScalarTy::F32;
-        if !float {
+        let native = matches!(target, AtomicTarget::Storage { binding, .. } if self.hardware[*binding as usize]);
+        if !float || native {
             let call = direct(fun(op), &v);
             match dst {
                 Some(d) => {
@@ -1020,7 +1061,10 @@ impl Em<'_> {
                 BindingKind::StorageRead => "storage, read",
                 BindingKind::StorageReadWrite => "storage, read_write",
             };
-            let ty = self.ty(&self.binding_root_ty_decl(d));
+            let mut ty = self.ty(&self.binding_root_ty_decl(d));
+            if self.hardware[i] {
+                ty = ty.replace("atomic<u32>", "atomic<f32>");
+            }
             let _ = writeln!(body, "@group(1) @binding({i}) var<{space}> {}: {ty};", self.binding_name(i as u32));
         }
         for i in 0..m.shared.len() {
@@ -1345,6 +1389,42 @@ struct Padded { a: f32, v: vec3<f32>, c: f32, inner: Inner, t: array<vec4<f32>, 
         assert!(out.contains("storageBarrier();"));
     }
 
+    /// A module adding `1.0` to `acc[i]` (and, with `min`, also taking the minimum into it).
+    fn f32_atomic_module(min: bool) -> KernelModule {
+        let mut mb = ModuleBuilder::new("t", "main", [8, 1, 1]);
+        let acc = mb.add_storage_read_write("acc", KirType::Atomic(ScalarTy::F32));
+        let mut b = mb.entry_builder();
+        let gid = b.builtin(BuiltinVar::GlobalInvocationId);
+        let i = b.field(gid, 0, KirType::U32);
+        let one = b.lit_f32(1.0);
+        let target = AtomicTarget::Storage { binding: acc, index: Some(i.expr().boxed()) };
+        b.atomic_rmw(None, IrAtomicOp::Add, ScalarTy::F32, target.clone(), one);
+        if min {
+            b.atomic_rmw(None, IrAtomicOp::Min, ScalarTy::F32, target, one);
+        }
+        assert!(b.finish().is_none());
+        mb.finish()
+    }
+
+    #[test]
+    fn f32_atomics_are_native_only_when_nothing_needs_their_bits() {
+        let validate_native = |src: &str| {
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps() | naga::valid::Capabilities::SHADER_FLOAT32_ATOMIC)
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{}\n{src}", e.emit_to_string(src)));
+        };
+        let add = emit_with(&f32_atomic_module(false), None, true);
+        validate_native(&add);
+        assert!(add.contains("array<atomic<f32>>") && add.contains("atomicAdd(") && !add.contains("atomicCompareExchangeWeak"), "{add}");
+        let min = emit_with(&f32_atomic_module(true), None, true);
+        validate(&min);
+        assert!(min.contains("array<atomic<u32>>") && min.contains("atomicCompareExchangeWeak"), "{min}");
+        let fallback = emit_with(&f32_atomic_module(false), None, false);
+        validate(&fallback);
+        assert!(fallback.contains("array<atomic<u32>>") && fallback.contains("atomicCompareExchangeWeak"), "{fallback}");
+    }
+
     #[test]
     fn f64_rounding_and_f16_need_no_native_trunc() {
         let mut mb = ModuleBuilder::new("t", "main", [1, 1, 1]);
@@ -1436,7 +1516,7 @@ struct Padded { a: f32, v: vec3<f32>, c: f32, inner: Inner, t: array<vec4<f32>, 
         let m = mb.finish();
         let (_, mask) = used_bindings(&m);
         let mask = mask.expect("two bindings are unread");
-        let text = emit_with(&m, Some(&mask));
+        let text = emit_with(&m, Some(&mask), false);
         let module = validate(&text);
         let numbers: Vec<u32> = module.global_variables.iter().filter_map(|(_, v)| v.binding.filter(|b| b.group == 1).map(|b| b.binding)).collect();
         assert_eq!(numbers, vec![2]);

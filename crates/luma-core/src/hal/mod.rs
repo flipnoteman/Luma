@@ -11,6 +11,7 @@ use std::time::Duration;
 
 pub mod cache;
 pub mod copy;
+mod deferred;
 
 pub use cache::DiskCache;
 pub use copy::{advise_huge_pages, copy_parallel, copy_streaming};
@@ -573,25 +574,39 @@ impl std::hash::Hash for Buffer {
 /// A backend's own compiled kernel object, held type-erased by [`RawKernel`].
 pub trait NativeKernel: Any + fmt::Debug + Send + Sync + 'static {}
 
-/// A compiled kernel of any backend.
+/// A compiled kernel of any backend, possibly still compiling (see [`RawKernel::spawn`]).
 #[derive(Clone, Debug)]
 pub struct RawKernel {
     id: u64,
-    native: Arc<dyn NativeKernel>,
+    native: Arc<deferred::Slot>,
 }
 
 impl RawKernel {
     /// Wraps a backend's kernel.
     pub fn new(native: impl NativeKernel) -> Self {
-        RawKernel { id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed), native: Arc::new(native) }
+        RawKernel { id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed), native: Arc::new(deferred::Slot::ready(native)) }
+    }
+    /// A kernel `compile` produces on a worker thread (on the calling thread when the pool is off
+    /// or its queue is full, see `LUMA_COMPILE_THREADS`). It returns at once; whatever needs the
+    /// kernel to run calls [`resolve`](Self::resolve), which waits and reports the compile error.
+    pub fn spawn<N: NativeKernel>(compile: impl FnOnce() -> Result<N, BackendError> + Send + 'static) -> Self {
+        RawKernel { id: NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed), native: deferred::spawn(compile) }
     }
     /// Unique per compiled kernel.
     pub fn id(&self) -> u64 {
         self.id
     }
-    /// The backend's kernel, if it is a `T`.
+    /// The backend's kernel, once compiled: waits for the compilation, fails with its error, or
+    /// with [`BackendError::Unsupported`] if the kernel is not a `T`.
+    pub fn resolve<T: 'static>(&self) -> Result<&T, BackendError> {
+        match self.native.wait() {
+            Ok(native) => (&**native as &dyn Any).downcast_ref::<T>().ok_or_else(|| BackendError::Unsupported("the kernel belongs to another backend".into())),
+            Err(error) => Err(error.clone()),
+        }
+    }
+    /// The backend's kernel, if it compiled and is a `T`. Waits for the compilation.
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        (&*self.native as &dyn Any).downcast_ref::<T>()
+        self.resolve().ok()
     }
 }
 
@@ -817,6 +832,56 @@ impl KernelTrust {
     }
 }
 
+/// A block-tridiagonal line solve (the block Thomas algorithm) that a backend may run as native
+/// code instead of compiling the shader that describes it. The launch is the shader's: the same
+/// bindings in the same order, the same uniform, one workgroup of `lines_per_group` invocations
+/// per `lines_per_group` lines (the line `l` of invocation `i` of workgroup `g` is
+/// `g * lines_per_group + i`, the groups of a folded grid numbered row by row).
+///
+/// Bindings: the outputs, the scratch (a buffer the native solve may ignore), the inputs, `starts`
+/// if `starts`, then the uniform `{n, stride, lines}` (`u32`s). Stacked blocks (`parts` false) have
+/// one output `out` of `block` floats per cell and the inputs `lo`, `diag`, `up` (`block^2` floats
+/// per cell) and `rhs`. On `parts` every entry of every block and component is a buffer of its
+/// own with one float per cell: the outputs `out{system * block + component}`, the inputs of every
+/// system in the order `lo`, `diag`, `up` (entry `row * block + col`), `rhs`. Cell `q` of line
+/// `l` is `l % stride + (l / stride) * stride * n + s * stride` for the row `s`; the lines of
+/// `systems` systems are numbered one system after the other (`lines` per system in the uniform).
+/// With `starts` row `s` of line `l` below `starts[l]` (clamped to `n`) is not solved and its
+/// solution is 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LineSolveSpec {
+    /// The block size, `1..=8`.
+    pub block: u8,
+    /// Independent systems solved in one launch (1 unless `parts`).
+    pub systems: u8,
+    /// Whether the entries are separate buffers (see above) rather than stacked blocks.
+    pub parts: bool,
+    /// Whether every line begins at its own cell.
+    pub starts: bool,
+    /// Lines per workgroup.
+    pub lines_per_group: u32,
+}
+
+/// A matrix product that a backend may run as native code instead of compiling the tiled shader
+/// that describes it (`Builtin::Matmul` of `luma`). The launch is the shader's: the bindings `c`
+/// (written), `a` and `b` (read) and the uniform `{m, n, k, kc}` (`u32`s), one workgroup per
+/// output tile of `edge` x `edge` (the tiles numbered row by row along the folded grid: tile
+/// `x + y * num_workgroups.x`, column tile `tile % ceil(n / edge)`), the third grid dimension
+/// slicing K: workgroup layer `z` multiplies `K` from `z * kc` to `min(k, (z + 1) * kc)` and
+/// writes its tile of the `M x N` partial product at `z * m * n` of `c`. `a` is the row-major
+/// `M x K` matrix, `b` the row-major `K x N` one, `c` row-major `M x N`; `c` is overwritten. With
+/// `lhs_transposed` the buffer `a` holds the row-major `K x M` matrix instead (the product reads
+/// its transpose), with `rhs_transposed` `b` holds the row-major `N x K` one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatmulSpec {
+    /// The edge of an output tile.
+    pub edge: u32,
+    /// Whether `a` holds the transpose of the left matrix.
+    pub lhs_transposed: bool,
+    /// Whether `b` holds the transpose of the right matrix.
+    pub rhs_transposed: bool,
+}
+
 /// A GPU backend: allocates buffers, compiles kernels and records and runs work.
 pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// What is known about the device.
@@ -844,6 +909,13 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     }
     /// Compiles a module; `used` is the entry point's binding mask, see [`CompiledKernel::used`].
     fn compile_kernel(&self, module: &crate::kir::KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError>;
+    /// Like [`compile_kernel`](Backend::compile_kernel), but the compilation may carry on in the
+    /// background: a failure of the slow part then surfaces from the first use of the kernel (see
+    /// [`RawKernel::resolve`]) instead of from here. For kernels luma builds itself, which no
+    /// caller needs before a launch; the default compiles at once.
+    fn compile_kernel_deferred(&self, module: crate::kir::KernelModule, used: Option<Box<[bool]>>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
+        self.compile_kernel(&module, used.as_deref(), label, trust)
+    }
     /// Compiles an already parsed naga module, `None` if the backend takes only [`KernelModule`](crate::kir::KernelModule)s.
     fn compile_naga(&self, _module: &naga::Module, _entry: &str, _bindings: &[BindingInfo], _workgroup: [u32; 3], _label: &str, _trust: KernelTrust) -> Option<Result<RawKernel, BackendError>> {
         None
@@ -880,6 +952,26 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn is_profiling(&self) -> Result<bool, BackendError>;
     /// Captures launches into a replayable graph, `None` when unsupported.
     fn capture_graph(&self, launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>>;
+    /// Whether [`Backend::compile_line_solve`] can run the line solves of luma: the library then
+    /// plans them for it (the block Thomas algorithm, never cyclic reduction on its own).
+    fn native_line_solve(&self) -> bool {
+        false
+    }
+    /// The cores a native matrix product ([`Backend::compile_matmul`]) spreads over, `None` if the
+    /// backend has none: the library then plans the products for it (output tiles that keep that
+    /// many cores busy, see `matmul::native_plan`).
+    fn native_matmul(&self) -> Option<u32> {
+        None
+    }
+    /// The native code of a matrix product (always `None` unless [`Backend::native_matmul`]).
+    fn compile_matmul(&self, _spec: &MatmulSpec) -> Option<RawKernel> {
+        None
+    }
+    /// The native code of a line solve, `None` to compile the shader instead (always `None` unless
+    /// [`Backend::native_line_solve`]).
+    fn compile_line_solve(&self, _spec: &LineSolveSpec) -> Option<RawKernel> {
+        None
+    }
 }
 
 /// Reusable mapped `MAP_WRITE` buffers, ready to be written: upload staging or mappable storage.

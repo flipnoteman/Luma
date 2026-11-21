@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use luma_core::kir::{self, KernelModule};
 use luma_core::naga;
-use luma_core::{BackendError, CompiledKernel, KernelTrust};
+use luma_core::{Backend, BackendError, CompiledKernel, KernelTrust, LineSolveSpec, MatmulSpec, RawKernel};
 pub use luma_core::{BindingInfo, BindingKind};
 
 use crate::array::{Array, Failure};
@@ -128,14 +128,37 @@ impl<'a> KernelBuilder<'a> {
 /// The WGSL is parsed, validated and lowered once (see [`kir::parse_wgsl`]); the backend that
 /// takes naga modules (wgpu) is handed the module it validated, any other the lowered
 /// [`KernelModule`].
-pub(crate) fn build_core(
+pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>, trust: KernelTrust) -> Result<KernelCore> {
+    build_core_native(ctx, key, label, trust, None)
+}
+
+/// What a backend may run as native code instead of compiling the shader that describes it (the
+/// shader is still parsed for the bindings).
+#[derive(Clone, Copy)]
+pub(crate) enum Native {
+    /// A line solve, see [`LineSolveSpec`]; the shader is the fallback.
+    LineSolve(LineSolveSpec),
+    /// A matrix product, see [`MatmulSpec`]; its shader is not the product of the tile the spec
+    /// names, so the backend has to compile it.
+    Matmul(MatmulSpec),
+}
+
+/// [`build_core`] where the backend may run `native` as native code instead of compiling the shader.
+pub(crate) fn build_core_native(
     ctx: &Context,
     key: &KernelKey,
     label: Option<&str>,
     trust: KernelTrust,
+    native: Option<Native>,
 ) -> Result<KernelCore> {
     let info = ctx.info();
     let limits = &info.limits;
+    if let Some(dir) = std::env::var_os("LUMA_WGPU_DUMP").filter(|v| !v.is_empty()) {
+        let dir = std::path::Path::new(&dir);
+        let name: String = label.unwrap_or(&key.entry).chars().take(100).map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join(format!("{name}-{:016x}.wgsl", luma_core::hal::cache::fnv1a(key.source.as_bytes()))), &key.source);
+    }
     let (module, lowered, bindings, declared, used) = kir::parse_wgsl(
         &key.source,
         &key.entry,
@@ -149,19 +172,44 @@ pub(crate) fn build_core(
     let workgroup = lowered.workgroup_size;
     let name = label.unwrap_or(&key.entry);
     let backend = ctx.hal();
-    let raw = match backend.compile_naga(&module, &key.entry, &bindings, workgroup, name, trust) {
-        Some(raw) => raw?,
-        None => {
-            // A cooperative matrix module is lowered to its bindings and no body: only a backend
-            // that takes the naga module can run it.
-            let cooperative = module.types.iter().any(|(_, t)| matches!(t.inner, naga::TypeInner::CooperativeMatrix { .. }));
-            if cooperative && lowered.entry_body.is_empty() {
-                return Err(BackendError::Unsupported("cooperative matrix requires the wgpu backend".into()).into());
+    let requested = native;
+    // A native kernel takes its buffers by position, so every binding of the shader must be bound.
+    let all_bound = used.as_deref().is_none_or(|used| used.iter().all(|&bound| bound));
+    let native = native.filter(|_| all_bound).and_then(|spec| match spec {
+        Native::LineSolve(spec) => backend.compile_line_solve(&spec),
+        Native::Matmul(spec) => backend.compile_matmul(&spec),
+    });
+    if native.is_none() && matches!(requested, Some(Native::Matmul(_))) {
+        return Err(BackendError::Unsupported("the backend cannot compile the native matrix product it planned".into()).into());
+    }
+    let raw = match native {
+        Some(raw) => raw,
+        None => match backend.compile_naga(&module, &key.entry, &bindings, workgroup, name, trust) {
+            Some(raw) => raw?,
+            None => {
+                // A cooperative matrix module is lowered to its bindings and no body: only a backend
+                // that takes the naga module can run it.
+                let cooperative = module.types.iter().any(|(_, t)| matches!(t.inner, naga::TypeInner::CooperativeMatrix { .. }));
+                if cooperative && lowered.entry_body.is_empty() {
+                    return Err(BackendError::Unsupported("cooperative matrix requires the wgpu backend".into()).into());
+                }
+                compile(backend, lowered, used.clone(), name, trust)?
             }
-            backend.compile_kernel(&lowered, used.as_deref(), name, trust)?
-        }
+        },
     };
     Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, workgroup))
+}
+
+/// Compiles `module` on `backend`. Luma's own (`KernelTrust::Trusted`) kernels compile in the background where
+/// the backend can, so the kernels of a traced step compile side by side; the first launch waits
+/// for the kernel and reports a compile error. A caller's kernel compiles at once: building it is
+/// where its error belongs.
+fn compile(backend: &dyn Backend, module: KernelModule, used: Option<Box<[bool]>>, name: &str, trust: KernelTrust) -> std::result::Result<RawKernel, BackendError> {
+    if trust == KernelTrust::Trusted {
+        backend.compile_kernel_deferred(module, used, name, trust)
+    } else {
+        backend.compile_kernel(&module, used.as_deref(), name, trust)
+    }
 }
 
 /// Compiles a kernel luma built as a [`KernelModule`] (see `gpu::lower`), skipping the text.
@@ -179,9 +227,10 @@ pub(crate) fn build_module(
         .filter(|&(at, _)| used.as_ref().is_none_or(|used| used[at]))
         .map(|(_, binding)| binding.info())
         .collect();
-    let name = label.unwrap_or(&module.entry);
-    let raw = ctx.hal().compile_kernel(&module, used.as_deref(), name, trust)?;
-    Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, module.workgroup_size))
+    let name: Arc<str> = Arc::from(label.unwrap_or(&module.entry));
+    let workgroup = module.workgroup_size;
+    let raw = compile(ctx.hal(), module, used.clone(), &name, trust)?;
+    Ok(CompiledKernel::new(name, raw, bindings, declared, used, workgroup))
 }
 
 /// A problem size in invocations: `[x]`, `[x, y]` or `[x, y, z]` (missing dimensions are 1).

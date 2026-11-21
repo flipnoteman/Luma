@@ -199,6 +199,9 @@ async fn request_device() -> Result<Gpu, BackendError> {
     // Shader features custom kernels may use; requested whenever the adapter has them.
     required_features |= adapter.features()
         & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16 | wgpu::Features::SHADER_F64 | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+    // Hardware `f32` atomic adds for the scatter and group kernels (a compare-and-swap loop on
+    // the bits is the fallback, and collapses when many invocations add to few cells).
+    required_features |= adapter.features() & wgpu::Features::SHADER_FLOAT32_ATOMIC;
     // Only on unified memory: on a discrete GPU mappable storage buffers live in slow host memory.
     if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
         required_features |= adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;

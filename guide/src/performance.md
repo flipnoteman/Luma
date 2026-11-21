@@ -142,7 +142,7 @@ becomes the load of that kernel.
 | `sum_axis`, `min_axis`, `max_axis`, `reduce_axis`, `mean_axis`, `var_axis`, `std_axis`, `argmax_axis`, `argmin_axis` | the operand, in the first pass over the data | eager: the result is evaluated when the call returns |
 | `solve_tridiagonal`, `solve_tridiagonal_parts`, `solve_block_tridiagonal_parts` | each pending block/vector entry is computed where a cell's system is loaded | eager: the solution is evaluated when the call returns |
 | `put_add`, `put_min`, `put_max`, `bincount`, `histogram`, `group_*` | the value and the index (or code, or bucket) expressions of the scatter | an in-place write, like `put` |
-| `sort`, `argsort`, `sort_axis` and what builds on them (`quantile`, `median`, `factorize`, `unique`) | the key expression, in the first pass of the radix sort | eager: the sorted array is evaluated; `factorize` and `unique` also read the number of distinct values back, one host wait |
+| `sort`, `argsort`, `sort_axis` and what builds on them (`quantile`, `quantiles`, `median`, `factorize`, `unique`) | the key expression, in the first pass of the radix sort (`sort_axis` of lines of up to 2048 elements evaluates its operand first) | eager: the sorted array is evaluated; `factorize` and `unique` also read the number of distinct values back, one host wait |
 
 An operand that reads circular `shift`s of other expressions, or lives in several buffers, is
 evaluated first instead. `scan` and `cumsum` always evaluate their operand (they read it twice; on CUDA, and on the native CPU backend with `LUMA_LOOKBACK_SCAN=on`, integer and `min` / `max` scans of long contiguous lines read it once).

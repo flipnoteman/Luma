@@ -114,6 +114,7 @@ mod reduce;
 mod scan;
 mod scatter;
 mod search;
+mod segsort;
 mod scalar;
 mod shape;
 mod sort;

@@ -201,6 +201,8 @@ pub struct WorkgroupCtx {
     pub scratch: *mut u8,
     /// Pointer to [`MATH_TABLE`].
     pub math: *const CpuMathTable,
+    /// The kernel's own data for a native kernel (see `crate::solve`); null for compiled code.
+    pub native: *const u8,
 }
 
 impl WorkgroupCtx {

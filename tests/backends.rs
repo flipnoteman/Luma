@@ -1003,7 +1003,11 @@ fn a_block_solve_over_104_input_bindings_is_one_launch_where_the_backend_binds_t
             (solve(), None)
         };
         println!("[backends] {who}: block solve over 104 parts took {launches:?} launches");
-        if kind != BackendKind::Wgpu {
+        if kind == BackendKind::Cpu {
+            // The native solve reads buffers: one kernel computes the 52 parts, one solves (one
+            // launch with `LUMA_NATIVE_SOLVE=off`).
+            assert!(matches!(launches, Some(1 | 2)), "{who}: the parts are computed together, then solved: {launches:?} launches");
+        } else if kind != BackendKind::Wgpu {
             assert_eq!(launches, Some(1), "{who}: the 104 buffers of one block solve must be bound by a single fused kernel");
         }
         for (c, component) in solution.iter().enumerate() {

@@ -252,6 +252,111 @@ fn reductions_fuse_their_input_expression() {
 }
 
 #[test]
+fn consumers_of_pending_reductions_record_them_as_a_group() {
+    use crate::view::{concat_slice, stack_slice};
+    let ctx = ctx();
+    let n = 100_000;
+    let xs = values(n, 5, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let accs = ctx.tuning().reduce_multi;
+    // A launch count per consumer, and the values each gives (read after the counts, and bit-compared with the alone ones).
+    let make = |k: usize| -> Vec<Array<f32>> { (0..k).map(|j| (&x * (j as f32 + 1.0)).sum()).collect() };
+    let alone: Vec<u32> = make(12).iter().map(|r| r.item().unwrap().to_bits()).collect();
+    let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+
+    // Reshaped to one element and concatenated, the pattern of a force monitor.
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let joined = concat_slice(0, &sums).to_vec().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "concat: {d:?}");
+    assert_eq!(bits(joined), alone);
+
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let stacked = stack_slice(0, &sums).to_vec().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "stack: {d:?}");
+    assert_eq!(bits(stacked), alone);
+
+    // Used in an elementwise expression: the reductions are recorded together when the expression runs.
+    let sums = make(12);
+    let before = ctx.jit().stats();
+    let mut total = sums[0].reshape([1, 1]);
+    for s in &sums[1..] {
+        total = &total + &s.reshape([1, 1]);
+    }
+    let got = total.item().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "expression: {d:?}");
+    let want: f32 = alone.iter().fold(0.0, |acc, &b| acc + f32::from_bits(b));
+    assert!((got - want).abs() <= 1e-3 * want.abs().max(1.0), "{got} vs {want}");
+
+    // `eval_all` of reshaped reductions.
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let refs: Vec<&Array<f32>> = sums.iter().collect();
+    crate::eval_all(&refs).unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "eval_all: {d:?}");
+    assert_eq!(bits(sums.iter().map(|s| s.item().unwrap()).collect()), alone);
+}
+
+#[test]
+fn pending_reductions_of_shared_data_are_recorded_in_one_kernel() {
+    let ctx = ctx();
+    let n = 100_000;
+    let xs = values(n, 3, -1.0, 1.0);
+    let ys = values(n, 4, -1.0, 1.0);
+    let (x, y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+    let accs = ctx.tuning().reduce_multi;
+
+    // Twelve sums of expressions of one product: one launch (or two passes on a device that cannot finish in one).
+    let product = &x * &y;
+    let sums: Vec<_> = (0..12).map(|k| (&product * (k as f32 + 1.0)).sum()).collect();
+    let before = ctx.jit().stats();
+    let got: Vec<f32> = sums.iter().map(|sum| sum.item().unwrap()).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.elementwise_launches, 0, "the product is never materialized");
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "{d:?}");
+    let dot: f64 = xs.iter().zip(&ys).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
+    for (k, value) in got.iter().enumerate() {
+        let want = dot * (k as f64 + 1.0);
+        assert!((f64::from(*value) - want).abs() <= 1e-3 * want.abs().max(1.0), "sum {k}: {value} vs {want}");
+    }
+
+    // More than a kernel takes: as few kernels as the accumulators allow, in creation order.
+    let sums: Vec<_> = (0..40).map(|k| (&x * (k as f32 + 1.0)).sum()).collect();
+    let before = ctx.jit().stats();
+    let got: Vec<f32> = sums.iter().map(|sum| sum.item().unwrap()).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 40usize.div_ceil(accs) as u64, "{d:?}");
+    let total: f64 = xs.iter().map(|&a| f64::from(a)).sum();
+    for (k, value) in got.iter().enumerate() {
+        let want = total * (k as f64 + 1.0);
+        assert!((f64::from(*value) - want).abs() <= 1e-2 * (k as f64 + 1.0), "sum {k}: {value} vs {want}");
+    }
+
+    // A reduction that waits for another (a variance on a mean) goes after it: the means in one kernel, the variances in another
+    // (a mean is recorded where an array is made from it: it is broadcast over `x`).
+    let before = ctx.jit().stats();
+    let means: Vec<_> = (0..4).map(|k| (&x + k as f32).mean()).collect();
+    let vars: Vec<_> = means
+        .iter()
+        .enumerate()
+        .map(|(k, mean)| {
+            let centered = &(&x + k as f32) - mean;
+            (&centered * &centered).mean()
+        })
+        .collect();
+    for var in &vars {
+        var.item().unwrap();
+    }
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 2, "{d:?}");
+}
+
+#[test]
 fn reducing_an_expression_does_not_evaluate_it() {
     let ctx = ctx();
     let xs = values(777, 9, 0.0, 1.0);
@@ -1293,7 +1398,10 @@ fn eval_loops_of_threads_that_alternate_are_both_compressed() {
         threads.into_iter().map(|thread| thread.join().unwrap()).collect()
     });
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
-    assert!(launches < 40, "{launches} kernels for 2 x {steps} steps");
+    // On the CPU a plan of one step takes the fused kernel, which counts here, where on a GPU it is a
+    // (not counted) one-step stencil: the steps still run in fewer kernels than there are steps.
+    let bound = if ctx.is_cpu() { 2 * steps as u64 * 3 / 5 } else { 40 };
+    assert!(launches < bound, "{launches} kernels for 2 x {steps} steps");
     for (want, got) in results {
         assert_close(&got, &want, 1e-6, 1e-6);
     }

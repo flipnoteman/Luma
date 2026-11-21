@@ -441,7 +441,7 @@ fn run_parts(
     let per = Io::parts_per_system(block);
     let ctx = parts[per - 1].context();
     // Operands first, so that a poisoned one reports its own error.
-    let sides = parts.iter().map(|array| part_side(array.context(), array)).collect::<Outcome<Vec<_>>>()?;
+    let mut sides = parts.iter().map(|array| part_side(array.context(), array)).collect::<Outcome<Vec<_>>>()?;
     let start_ready = start.map(|s| s.ready()).transpose()?;
     if parts.iter().any(|array| !ctx.same_as(array.context())) || start.is_some_and(|start| !ctx.same_as(start.context())) {
         return Err(LumaError::ContextMismatch.into());
@@ -472,7 +472,7 @@ fn run_parts(
     let fused = sides.iter().any(|s| matches!(s, PartSide::Pending(_)));
     let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, true, fused, ctx.max_buffer_bytes()) {
         Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
-    } else if block <= UNROLLED_BLOCK as usize
+    } else if (block <= UNROLLED_BLOCK as usize || tuning.native_solve)
         && let thomas = thomas_plan(&tuning, b32, total, stride32, true)
         && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, thomas.tiled, ctx.max_buffer_bytes())
     {
@@ -480,6 +480,22 @@ fn run_parts(
     } else {
         None
     };
+    if fused && tuning.native_solve && matches!(algo, Some((Algo::Thomas { .. }, _))) {
+        // The native solve reads buffers: the parts that are expressions are computed first, all
+        // together (one kernel with an output each, sharing what they read).
+        for (array, side) in parts.iter().zip(&sides) {
+            if matches!(side, PartSide::Pending(_)) {
+                array.request()?;
+            }
+        }
+        ctx.jit().evaluate_requested();
+        for (array, side) in parts.iter().zip(&mut sides) {
+            if matches!(side, PartSide::Pending(_)) {
+                let (pin, bytes) = array.ready()?;
+                *side = PartSide::Ready(pin, bytes);
+            }
+        }
+    }
     if let Some((algo, scratch_bytes)) = algo {
         let spec = SolveSpec { algo, block: block as u8, systems: systems as u8, starts: start.is_some(), fused: [0; 4] };
         if let Some(solved) = launch_parts(ctx, sides, spec, shape, [n32, stride32, lines32], scratch_bytes, start_ready)? {
@@ -1050,7 +1066,8 @@ mod tests {
                 .unwrap();
             assert_eq!(&got.to_vec().unwrap(), if from { &want_from } else { &want }, "from = {from}");
             if binds(&ctx, 1, 1) {
-                assert_eq!(profile.launches(), 1, "from = {from}");
+                // A native solve reads buffers: the pending operands are computed together first.
+                assert_eq!(profile.launches(), if ctx.tuning().native_solve { 2 } else { 1 }, "from = {from}");
             }
         }
     }

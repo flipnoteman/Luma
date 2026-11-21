@@ -1397,6 +1397,143 @@ pub(super) fn reduce_and_store_fused(
     })
 }
 
+/// One pending reduction that [`reduce_many`] runs with others: the pending node it reduces (of
+/// `len` elements), its ops, and what is applied to their values.
+pub(crate) struct Member<'a> {
+    pub(crate) operand: &'a Arc<Node>,
+    pub(crate) ops: ReduceList,
+    pub(crate) finish: Finish,
+}
+
+/// Runs the reductions of `members` (pending nodes of one length, of element type `ty`: `f32`,
+/// `u32` or `i32`) in one kernel: the program computes the operands together, once what they share,
+/// and every op of every member has an accumulator (at most `max_accs` in all). The first pass is
+/// one launch (two with several workgroups where the device cannot finish it in the same one, see
+/// `Tuning::single_pass_reduce`); op `j` of the members taken in order is element `j` of the buffer
+/// of the returned storage, with the member's epilogue applied. Every op combines its elements in the order a
+/// reduction of the member alone does, so the values are the same bits.
+///
+/// `None` (nothing launched) where the program does not fit a single such kernel: sub-programs read
+/// through shifts, arrays split over several buffers, too many bindings.
+pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>], ty: ElemTy, max_accs: usize) -> Result<Option<Storage>, Failure> {
+    let Some(first) = members.first() else { return Ok(None) };
+    let len = first.operand.len();
+    let total: usize = members.iter().map(|member| member.ops.as_slice().len()).sum();
+    if total > max_accs.min(crate::builtin::MAX_ACCS) || !matches!(ty, ElemTy::F32 | ElemTy::U32 | ElemTy::I32) {
+        return Ok(None);
+    }
+    // One root per distinct operand.
+    let mut operands: Vec<&Arc<Node>> = Vec::with_capacity(members.len());
+    let mut member_root = Vec::with_capacity(members.len());
+    for member in members {
+        if member.operand.len() != len || member.ops.roots().is_some() {
+            return Ok(None);
+        }
+        let at = match operands.iter().position(|known| Arc::ptr_eq(known, member.operand)) {
+            Some(at) => at,
+            None => {
+                operands.push(member.operand);
+                operands.len() - 1
+            }
+        };
+        member_root.push(at);
+    }
+    let mut roots = Vec::with_capacity(operands.len());
+    for node in &operands {
+        let Some(args) = node.operands() else { return Ok(None) };
+        roots.push((Arc::clone(node), args));
+    }
+    let Ok(fused) = flatten_inner(&roots, Tail::Reduce(ReduceList::new(&[ReduceOp::Sum])), &[]) else { return Ok(None) };
+    drop(roots);
+    let max = ctx.tuning().max_recomputed;
+    if !fused.key.inlines() && fused.key.subs.iter().any(|sub| sub.len() > max || sub.iter().any(|instr| matches!(instr.args[0], Ref::Sub(_)))) {
+        return Ok(None);
+    }
+    let fits = fused.key.outputs.len() == operands.len()
+        && fused.key.outputs.iter().all(|&at| fused.key.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ty))
+        && (fused.key.subs.is_empty() || (fused.key.inlines() && fused.key.staging.is_none()))
+        && fused.key.narrow()
+        && fused.inputs.iter().all(|input| input.segments() == 1)
+        && fused.inputs.len() + 4 <= ctx.jit().max_inputs();
+    if !fits {
+        return Ok(None);
+    }
+    // The program's outputs: equal values are one root.
+    let mut outputs: Vec<u32> = Vec::with_capacity(operands.len());
+    let mut root_of_operand = Vec::with_capacity(operands.len());
+    for &at in &fused.key.outputs {
+        let slot = match outputs.iter().position(|&known| known == at) {
+            Some(slot) => slot,
+            None => {
+                outputs.push(at);
+                outputs.len() - 1
+            }
+        };
+        root_of_operand.push(slot);
+    }
+    let (mut ops, mut op_roots, mut epilogues, mut scalars_of_ops) = (Vec::with_capacity(total), Vec::with_capacity(total), Vec::with_capacity(total), Vec::new());
+    for (member, &root) in members.iter().zip(&member_root) {
+        for &op in member.ops.as_slice() {
+            ops.push(op);
+            op_roots.push(u8::try_from(root_of_operand[root]).map_err(|_| LumaError::Chunked("too many roots"))?);
+            epilogues.push(member.finish.epilogue);
+            scalars_of_ops.extend(member.finish.uniform_words());
+        }
+    }
+    let mut key = fused.key.clone();
+    let (inputs, mut scalars) = (&fused.inputs, fused.scalars.clone());
+    key.outputs = outputs;
+    let first_pass = ReduceList::merged(&ops, &op_roots, &epilogues);
+    let probe = Storage::new(ctx, len, ElemLayout::plain(ty.stride() as usize));
+    if probe.segments() != 1 {
+        return Ok(None);
+    }
+    let n = len_u32(probe.range(0).len())?;
+    let groups = ctx.tuning().reduce_groups(n);
+    let single_pass = ctx.tuning().single_pass_reduce && groups > 1;
+    let last = groups == 1;
+    key.tail = Tail::Reduce(match (single_pass, last) {
+        (true, _) => first_pass.finished(Default::default()).single_pass(),
+        (false, true) => first_pass.finished(Default::default()),
+        (false, false) => first_pass,
+    });
+    if plan_shifts(ctx, &mut key, inputs, &scalars, len)?.is_some() {
+        return Ok(None);
+    }
+    let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+
+    let elem = ty.stride();
+    let cell = elem * total as u64;
+    let pack = Storage::new(ctx, total, ElemLayout::plain(elem as usize));
+    let pack_pin = pack.pin(0)?;
+    let target = pack_pin.buffer();
+    let mut scratch = Scratch::new(ctx);
+    let out_bytes = u64::from(groups) * cell;
+    let out = if last { target.clone() } else { scratch.take(out_bytes)? };
+    let mut params = params(&key, None, Some(n), probe.range(0).start, len, None, &scalars)?;
+    if last || single_pass {
+        params.to_mut().extend(scalars_of_ops.iter().copied());
+    }
+    let pins = pin_inputs(&key, inputs, None, 0, n)?;
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(pins.len() + 4);
+    raw.push(RawArg::write(&out, out_bytes));
+    raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    if single_pass {
+        raw.push(RawArg::write(ctx.reduce_counter()?, 4));
+        raw.push(RawArg::write(target, cell));
+    }
+    raw.push(RawArg::Uniform(bytemuck::cast_slice(&params)));
+    ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+    drop(raw);
+    ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);
+    if !single_pass && !last {
+        crate::reduce::finish_passes_merged(ctx, &mut scratch, first_pass, ty.wgsl(), elem, out, groups, target, &scalars_of_ops)?;
+    }
+    drop(pack_pin);
+    fused.mark_fused();
+    Ok(Some(pack))
+}
+
 /// The finite check (see `ContextOptions::check_finite`): fails with [`LumaError::NonFinite`] if
 /// `storage`, holding elements of type `ty`, contains a NaN or an infinity. Does nothing unless
 /// the option is on and the elements are `f32` or `Df32`. Waits for the GPU (once per segment).
@@ -1472,6 +1609,15 @@ fn stored_transposed(node: &Node, dims: [u32; 2]) -> bool {
     distance[1].abs() == 1 && distance[0].abs() != 1
 }
 
+/// Whether the elements of the left operand `side` (`[K, M]`) that are neighbours along `K` are
+/// neighbours in memory: false for a view that reads its source transposed.
+pub(crate) fn stored_along_k(side: &MatmulSide, dims: [u32; 2]) -> bool {
+    match side {
+        MatmulSide::Pending(node) => !stored_transposed(node, dims),
+        MatmulSide::Ready(..) => true,
+    }
+}
+
 /// Flattens the operands in `slots` (the lazy ones, by side) into one product program, or `None`
 /// if there are none or they cannot be fused: those that cannot be fused alone (all, if only
 /// together they are too much) are then evaluated into `ready` and the rest is tried again.
@@ -1524,6 +1670,32 @@ fn flatten_operands(
             }
         }
     }
+}
+
+/// Evaluates what a product operand computes, so that a kernel that reads every element many times
+/// (a skinny product, see `matmul::skinny`) loads it from a buffer instead of recomputing it at
+/// each load: `node` itself if it is a pending expression, what it reads if it is a view (which
+/// stays fused: a transposed view of a stored array costs a few index operations). Returns whether
+/// anything was evaluated; a view of a view, or of an array that is stored, is left alone.
+pub(crate) fn evaluate_for_reuse(node: &Arc<Node>) -> Result<bool, Failure> {
+    if !node.is_pending() {
+        return Ok(false);
+    }
+    let target = if node.is_pending_view() {
+        match node.operands() {
+            Some([Src::Node(inner), _, _]) if inner.is_pending() && !matches!(inner.op().kind, OpKind::Shift(ShiftKind::View { .. })) => inner,
+            _ => return Ok(false),
+        }
+    } else {
+        Arc::clone(node)
+    };
+    // An expression of one buffer (the labels of a one-hot matrix) costs about a load per
+    // evaluation, as much as reading it stored; one that reads no buffer costs less.
+    if target.inputs().len() < 2 {
+        return Ok(false);
+    }
+    target.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
+    Ok(true)
 }
 
 /// Records the product of `sides` (`[lhs, rhs]`) into the buffer `out`: one launch of the GEMM

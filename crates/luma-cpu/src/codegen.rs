@@ -29,13 +29,15 @@ use luma_core::kir::{
 use luma_core::{BackendError, NativeKernel};
 
 use crate::abi::{CpuMathTable, CpuPlan, PhaseStmt, WorkgroupCtx};
-use crate::exec::ExecBlob;
+use crate::exec::{CostHint, ExecBlob};
 
 /// A compiled workgroup function plus the plan it was lowered against.
 #[derive(Debug)]
 pub struct CompiledCpuKernel {
     pub exec: Arc<ExecBlob>,
     pub plan: CpuPlan,
+    /// Learned run time, steering how many threads a launch uses.
+    pub cost: CostHint,
 }
 
 impl NativeKernel for CompiledCpuKernel {}
@@ -419,6 +421,7 @@ pub fn compile(
         CompiledCpuKernel {
             exec: Arc::new(blob),
             plan,
+            cost: CostHint::default(),
         },
         bytes,
     ))
@@ -4064,6 +4067,7 @@ mod tests {
             k.plan.shared_bytes,
             k.plan.scratch_bytes,
             false,
+            &k.cost,
         );
         // SAFETY: dispatch has completed; buffers are live.
         alloc

@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use luma_core::kir::{BarrierScope, BuiltinVar, FnBuilder, KernelModule, KirType, ModuleBuilder, ScalarTy, Val};
+use luma_core::LineSolveSpec;
 
 use crate::gpu::lower::finish;
 use crate::jit::ElemTy;
@@ -507,10 +508,15 @@ impl Epilogue {
     /// The fields of the `Params` uniform that hold the scalar operands: `e{k}: f32,` for every
     /// binary step `k`.
     pub(crate) fn fields(&self) -> String {
+        self.fields_tagged("")
+    }
+
+    /// [`Epilogue::fields`] with `tag` between the `e` and the step's number.
+    fn fields_tagged(&self, tag: &str) -> String {
         let mut out = String::new();
         for (k, step) in self.steps().enumerate() {
             if matches!(step, EpilogueStep::Binary { .. }) {
-                let _ = write!(out, "e{k}: f32, ");
+                let _ = write!(out, "e{tag}{k}: f32, ");
             }
         }
         out
@@ -519,13 +525,18 @@ impl Epilogue {
     /// WGSL statements applying the steps to the `f32` expression `value` (`let {prefix}{k}` is
     /// the result of step `k`) and the name of the final result (`value` if there are none).
     pub(crate) fn statements(&self, value: &str, prefix: &str) -> (String, String) {
+        self.statements_with(value, prefix, |k| format!("p.e{k}"))
+    }
+
+    /// [`Epilogue::statements`] with the scalar operand of binary step `k` named `field(k)`.
+    fn statements_with(&self, value: &str, prefix: &str, field: impl Fn(usize) -> String) -> (String, String) {
         let mut out = String::new();
         let mut last = value.to_owned();
         for (k, step) in self.steps().enumerate() {
             let expr = match step {
                 EpilogueStep::Unary(op) => substitute(op.expr(), &last, ""),
-                EpilogueStep::Binary { op, scalar_left: false } => substitute(op.expr(), &last, &format!("p.e{k}")),
-                EpilogueStep::Binary { op, scalar_left: true } => substitute(op.expr(), &format!("p.e{k}"), &last),
+                EpilogueStep::Binary { op, scalar_left: false } => substitute(op.expr(), &last, &field(k)),
+                EpilogueStep::Binary { op, scalar_left: true } => substitute(op.expr(), &field(k), &last),
             };
             let _ = writeln!(out, "        let {prefix}{k}: f32 = {expr};");
             last = format!("{prefix}{k}");
@@ -596,11 +607,65 @@ impl GateId {
     }
 }
 
+/// Most accumulators one reduction kernel computes when it reduces several operands (see
+/// [`ReduceList::merged`]).
+pub(crate) const MAX_ACCS: usize = 32;
+
+/// What a merged reduction adds to its [`ReduceList`]: which operand every op reduces, and the
+/// epilogue of every op. Interned (see [`Merged`]), so that the list stays a small `Copy` value.
+#[derive(PartialEq, Eq, Hash, Debug)]
+struct MergedSpec {
+    /// The root (index into the kernel's outputs) every op reduces; empty for the passes after the
+    /// first, which reduce partial results.
+    roots: Vec<u8>,
+    /// The epilogue of every op.
+    epilogues: Vec<Epilogue>,
+}
+
+/// The registered merged specs: by handle, and the handles by spec.
+#[derive(Default)]
+struct MergedSpecs {
+    specs: Vec<std::sync::Arc<MergedSpec>>,
+    ids: crate::gpu::hash::FxMap<(Vec<u8>, Vec<Epilogue>), u32>,
+}
+
+static MERGED_SPECS: std::sync::LazyLock<std::sync::Mutex<MergedSpecs>> = std::sync::LazyLock::new(Default::default);
+
+/// A merged reduction's roots and epilogues, by handle.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct MergedId(u32);
+
+impl MergedId {
+    fn intern(roots: &[u8], epilogues: &[Epilogue]) -> MergedId {
+        let mut specs = crate::gpu::lock(&MERGED_SPECS);
+        let key = (roots.to_vec(), epilogues.to_vec());
+        if let Some(&id) = specs.ids.get(&key) {
+            return MergedId(id);
+        }
+        let id = specs.specs.len() as u32;
+        specs.specs.push(std::sync::Arc::new(MergedSpec { roots: key.0.clone(), epilogues: key.1.clone() }));
+        specs.ids.insert(key, id);
+        MergedId(id)
+    }
+
+    fn spec(self) -> std::sync::Arc<MergedSpec> {
+        std::sync::Arc::clone(&crate::gpu::lock(&MERGED_SPECS).specs[self.0 as usize])
+    }
+}
+
+/// A [`ReduceList`] of ops over several operands, each with an epilogue of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Merged {
+    id: MergedId,
+    /// Whether the epilogues are applied by this pass (the last one).
+    applied: bool,
+}
+
 /// Reductions computed together, in order (a kernel cache key, so a fixed-size value), and what
 /// is applied to their results.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ReduceList {
-    ops: [ReduceOp; MAX_REDUCTIONS],
+    ops: [ReduceOp; MAX_ACCS],
     len: u8,
     /// Applied to every value of the pass's output; only a pass that is the last (one group,
     /// or the last workgroup of a [single-pass](ReduceList::single_pass) kernel) has one.
@@ -609,16 +674,33 @@ pub(crate) struct ReduceList {
     single_pass: bool,
     /// The gate the workgroup that has the final values runs on them (see [`ReduceList::with_gate`]).
     gate: Option<GateId>,
+    /// Set for a list of several operands (see [`ReduceList::merged`]): `epilogue` is not used then.
+    merged: Option<Merged>,
 }
 
 impl ReduceList {
     /// `ops` must hold between 1 and [`MAX_REDUCTIONS`] ops.
     pub(crate) fn new(ops: &[ReduceOp]) -> Self {
-        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0, epilogue: Epilogue::default(), single_pass: false, gate: None };
+        debug_assert!(ops.len() <= MAX_REDUCTIONS);
+        Self::with_ops(ops)
+    }
+
+    fn with_ops(ops: &[ReduceOp]) -> Self {
+        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_ACCS], len: 0, epilogue: Epilogue::default(), single_pass: false, gate: None, merged: None };
         for (slot, &op) in list.ops.iter_mut().zip(ops) {
             *slot = op;
             list.len += 1;
         }
+        list
+    }
+
+    /// The ops `ops` (at most [`MAX_ACCS`]), op `j` reducing the root `roots[j]` of the kernel's
+    /// program (all of one element type), with the epilogue `epilogues[j]` applied once the
+    /// pass is the last (see [`ReduceList::finished`]).
+    pub(crate) fn merged(ops: &[ReduceOp], roots: &[u8], epilogues: &[Epilogue]) -> Self {
+        debug_assert!(ops.len() == roots.len() && ops.len() == epilogues.len() && ops.len() <= MAX_ACCS);
+        let mut list = Self::with_ops(ops);
+        list.merged = Some(Merged { id: MergedId::intern(roots, epilogues), applied: false });
         list
     }
 
@@ -636,14 +718,27 @@ impl ReduceList {
     pub(crate) fn rest(self) -> Self {
         let mut list = self;
         list.ops.iter_mut().for_each(|op| *op = op.rest());
+        if let Some(merged) = list.merged {
+            list.merged = Some(Merged { id: MergedId::intern(&[], &merged.id.spec().epilogues), ..merged });
+        }
         list
     }
 
     /// These reductions with `epilogue` applied to the results. The kernel must run as a single
     /// group (the last pass), or be [single-pass](ReduceList::single_pass): its output is the
-    /// final value.
+    /// final value. Not for a [merged](ReduceList::merged) list (see [`ReduceList::finished`]).
     pub(crate) fn with_epilogue(self, epilogue: Epilogue) -> Self {
+        debug_assert!(self.merged.is_none());
         ReduceList { epilogue, ..self }
+    }
+
+    /// This list as the last pass applying `epilogue` to every op's value: a merged list applies
+    /// the epilogues it was made with instead.
+    pub(crate) fn finished(self, epilogue: Epilogue) -> Self {
+        match self.merged {
+            Some(merged) => ReduceList { merged: Some(Merged { applied: true, ..merged }), ..self },
+            None => self.with_epilogue(epilogue),
+        }
     }
 
     /// The kernel of a first pass over the elements that also finishes the reduction: every
@@ -665,6 +760,7 @@ impl ReduceList {
     /// the kernel's cache key.
     pub(crate) fn with_gate(self, gate: GateId) -> Self {
         debug_assert_eq!(self.as_slice().len(), 1, "a gate takes one value");
+        debug_assert!(self.merged.is_none());
         ReduceList { gate: Some(gate), ..self }
     }
 
@@ -672,8 +768,39 @@ impl ReduceList {
         self.gate
     }
 
-    pub(crate) fn epilogue(&self) -> Epilogue {
-        self.epilogue
+    /// The root (output of the kernel's program) every op of a first pass of a
+    /// [merged](ReduceList::merged) list reduces; `None` for any other list, whose ops all reduce
+    /// the program's last value.
+    pub(crate) fn roots(&self) -> Option<Vec<u8>> {
+        let roots = &self.merged?.id.spec().roots;
+        (!roots.is_empty()).then(|| roots.clone())
+    }
+
+    /// The epilogue op `j` applies to its value, if this is the pass that applies it.
+    fn epilogue_of(&self, j: usize) -> Epilogue {
+        match self.merged {
+            Some(Merged { id, applied: true }) => id.spec().epilogues[j],
+            Some(_) => Epilogue::default(),
+            None => self.epilogue,
+        }
+    }
+
+    /// The fields of the `Params` uniform that hold the scalar operands of the epilogues, in the
+    /// order of the words the pass is given (see [`Epilogue::fields`]; op `j`'s step `k` is `e{j}_{k}` of a merged list).
+    pub(crate) fn epilogue_fields(&self) -> String {
+        match self.merged {
+            None => self.epilogue.fields(),
+            Some(_) => (0..self.as_slice().len()).map(|j| self.epilogue_of(j).fields_tagged(&format!("{j}_"))).collect(),
+        }
+    }
+
+    /// WGSL statements applying the epilogue of op `j` to the `f32` expression `value`, and the name
+    /// of the result (see [`Epilogue::statements`]).
+    fn epilogue_statements(&self, j: usize, value: &str, prefix: &str) -> (String, String) {
+        match self.merged {
+            None => self.epilogue.statements(value, prefix),
+            Some(_) => self.epilogue_of(j).statements_with(value, prefix, |k| format!("p.e{j}_{k}")),
+        }
     }
 }
 
@@ -726,6 +853,9 @@ pub(crate) enum Builtin {
     /// A kernel of a radix sort pass reading its keys from a buffer; see [`crate::sort`].
     /// Element type `"u32"`. `first` passes read the user's keys.
     Radix { pass: crate::sort::RadixPass, first: bool },
+    /// Sorts the lines of an array along an axis in workgroup memory; see [`crate::segsort`].
+    /// Arguments: out, src, uniform `{n, stride, lines, tiles, tpo}`. Element type `"u32"`.
+    SortLines(crate::segsort::LineSort),
     /// Tiled matrix product of the operands (buffers) `a` and `b`; see [`crate::matmul`].
     /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
     /// dimension and writes every slice's partial product after the previous one.
@@ -755,7 +885,7 @@ pub(crate) enum Builtin {
 /// counter and the final values (`result`) after `a` (see [`reduce_main`]).
 fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String {
     // The double-float kernel takes the guard of its arithmetic (see `df_library`) as a uniform.
-    let fields = ops.epilogue().fields();
+    let fields = ops.epilogue_fields();
     let (elem, params) = match ty {
         "df32" => (ReduceElem::Df32 { guard: "p.guard", fma: tuning.df_fma }, "struct Params { n: u32, guard: u32 }".to_owned()),
         other if fields.is_empty() => (ReduceElem::Plain(other), "struct Params { n: u32 }".to_owned()),
@@ -1102,8 +1232,8 @@ struct Phase<'a> {
     load: &'a str,
     /// The statement storing the WGSL expression (second argument) as the value of op `j`.
     store: &'a dyn Fn(usize, &str) -> String,
-    /// Applied to the values before they are stored.
-    epilogue: Epilogue,
+    /// The list whose epilogues are applied to the values before they are stored, if any.
+    epilogue: Option<ReduceList>,
 }
 
 /// The statements of a stage of a reduction kernel computing every op of `ops`: every
@@ -1118,56 +1248,59 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
     let Phase { n, group, groups, segmented, segment, load, store, epilogue } = phase;
     let mut inits = String::new();
     let mut loop_body = String::new();
-    // Without segments every op reduces the same elements: load each once.
-    if !segmented {
-        loop_body += &format!("            let e0 = {load}(base);\n");
-        for s in 1..per_thread {
-            loop_body += &format!(
-                "            let in{s} = base + {wg}u * {s}u < {n};\n            var e{s} = e0;\n            if (in{s}) {{ e{s} = {load}(base + {wg}u * {s}u); }}\n"
-            );
-        }
-    }
-    for (j, &op) in ops.as_slice().iter().enumerate() {
-        let segment = if *segmented { format!("{j}u * {segment} + ") } else { String::new() };
-        if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
-            unreachable!("arg reductions have their own passes (`crate::arg`)");
-        }
-        inits += &format!("    var acc{j} = zero;\n");
-        for s in 0..per_thread {
-            if *segmented {
-                if s == 0 {
-                    loop_body += &format!("            let e{j}_0 = {load}({segment}base);\n");
-                } else {
-                    loop_body += &format!(
-                        "            let in{j}_{s} = base + {wg}u * {s}u < {n};\n            var e{j}_{s} = e{j}_0;\n            if (in{j}_{s}) {{ e{j}_{s} = {load}({segment}(base + {wg}u * {s}u)); }}\n"
-                    );
-                }
+    if let Some(roots) = ops.roots().filter(|_| !segmented) {
+        (inits, loop_body) = merged_loop(elem, ops, &roots, phase, tuning);
+    } else {
+        // Without segments every op reduces the same elements: load each once.
+        if !segmented {
+            loop_body += &format!("            let e0 = {load}(base);\n");
+            for s in 1..per_thread {
+                loop_body += &format!(
+                    "            let in{s} = base + {wg}u * {s}u < {n};\n            var e{s} = e0;\n            if (in{s}) {{ e{s} = {load}(base + {wg}u * {s}u); }}\n"
+                );
             }
-            let e = if *segmented { format!("e{j}_{s}") } else { format!("e{s}") };
-            // Out-of-range slots: sums take zero, min/max reuse the first (valid) element.
-            let value = match op {
-                ReduceOp::Sum => {
-                    if s == 0 { e } else { format!("select(zero, {e}, base + {wg}u * {s}u < {n})") }
+        }
+        for (j, &op) in ops.as_slice().iter().enumerate() {
+            let segment = if *segmented { format!("{j}u * {segment} + ") } else { String::new() };
+            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                unreachable!("arg reductions have their own passes (`crate::arg`)");
+            }
+            inits += &format!("    var acc{j} = zero;\n");
+            for s in 0..per_thread {
+                if *segmented {
+                    if s == 0 {
+                        loop_body += &format!("            let e{j}_0 = {load}({segment}base);\n");
+                    } else {
+                        loop_body += &format!(
+                            "            let in{j}_{s} = base + {wg}u * {s}u < {n};\n            var e{j}_{s} = e{j}_0;\n            if (in{j}_{s}) {{ e{j}_{s} = {load}({segment}(base + {wg}u * {s}u)); }}\n"
+                        );
+                    }
                 }
-                ReduceOp::SumSquares => {
-                    let sq = elem.square(&e);
-                    if s == 0 { sq } else { format!("select(zero, {sq}, base + {wg}u * {s}u < {n})") }
+                let e = if *segmented { format!("e{j}_{s}") } else { format!("e{s}") };
+                // Out-of-range slots: sums take zero, min/max reuse the first (valid) element.
+                let value = match op {
+                    ReduceOp::Sum => {
+                        if s == 0 { e } else { format!("select(zero, {e}, base + {wg}u * {s}u < {n})") }
+                    }
+                    ReduceOp::SumSquares => {
+                        let sq = elem.square(&e);
+                        if s == 0 { sq } else { format!("select(zero, {sq}, base + {wg}u * {s}u < {n})") }
+                    }
+                    ReduceOp::Min | ReduceOp::Max => e,
+                    ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!(),
+                };
+                loop_body += &format!("            let v{j}_{s} = {value};\n");
+            }
+            let values: Vec<String> = (0..per_thread).map(|s| format!("v{j}_{s}")).collect();
+            let pw = pairwise(&format!("c{j}"), &values);
+            loop_body += &match op {
+                ReduceOp::Min | ReduceOp::Max => {
+                    format!("            if (b == {group} * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
                 }
-                ReduceOp::Min | ReduceOp::Max => e,
-                ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!(),
+                _ => format!("            acc{j} = c{j}(acc{j}, {pw});\n"),
             };
-            loop_body += &format!("            let v{j}_{s} = {value};\n");
         }
-        let values: Vec<String> = (0..per_thread).map(|s| format!("v{j}_{s}")).collect();
-        let pw = pairwise(&format!("c{j}"), &values);
-        loop_body += &match op {
-            ReduceOp::Min | ReduceOp::Max => {
-                format!("            if (b == {group} * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
-            }
-            _ => format!("            acc{j} = c{j}(acc{j}, {pw});\n"),
-        };
     }
-
     let mut finish = String::new();
     if subgroups {
         let mut lanes = String::new();
@@ -1183,7 +1316,7 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
                 lanes += &format!("    let first{j} = subgroupBroadcastFirst(acc{j});\n    if ({group} * {block}u + lid >= {n}) {{ acc{j} = first{j}; }}\n");
             }
             lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
-            let (lets, fin) = epilogue.statements(&format!("f{j}"), &format!("g{j}_"));
+            let (lets, fin) = epilogue.map_or_else(|| (String::new(), format!("f{j}")), |list| list.epilogue_statements(j, &format!("f{j}"), &format!("g{j}_")));
             let store = store(j, &fin);
             first += &format!(
                 "        var t{j} = {ident};
@@ -1204,7 +1337,7 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
         );
     } else {
         for j in 0..ops.as_slice().len() {
-            let (lets, fin) = epilogue.statements("sh[0]", &format!("g{j}_"));
+            let (lets, fin) = epilogue.map_or_else(|| (String::new(), "sh[0]".to_owned()), |list| list.epilogue_statements(j, "sh[0]", &format!("g{j}_")));
             let store = store(j, &fin);
             finish += &format!(
                 "    sh[lid] = acc{j};
@@ -1228,6 +1361,81 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
     }}
 {finish}"
     )
+}
+
+/// The accumulation loop of a first pass over several operands (a [merged](ReduceList::merged) list, whose op `j`
+/// reduces root `roots[j]` of the array `load(i)` returns): the accumulator declarations and the loop body. An
+/// invocation computes the roots of `per_thread` elements one after the other, folding every op's values
+/// in the tree [`pairwise`] makes of them, so that only a few values per op are live at once and the results are the
+/// bits a separate reduction of each root gives. An element past the end is read at `base` instead (the value a
+/// separate reduction substitutes for it).
+fn merged_loop(elem: ReduceElem<'_>, ops: ReduceList, roots: &[u8], phase: &Phase<'_>, tuning: &Tuning) -> (String, String) {
+    let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
+    let per_thread = tuning.reduce_per_thread as usize;
+    let Phase { n, group, load, .. } = phase;
+    let count = ops.as_slice().len();
+    let mut inits = String::new();
+    for j in 0..count {
+        inits += &format!("    var acc{j} = zero;\n");
+    }
+    // The names of the value each op holds for the elements `lo..hi` once emitted.
+    let name = |j: usize, lo: usize, hi: usize| if hi - lo == 1 { format!("v{j}_{lo}") } else { format!("w{j}_{lo}_{hi}") };
+    fn emit(
+        out: &mut String,
+        lo: usize,
+        hi: usize,
+        leaf: &dyn Fn(&mut String, usize),
+        node: &dyn Fn(&mut String, usize, usize, usize),
+    ) {
+        if hi - lo == 1 {
+            leaf(out, lo);
+            return;
+        }
+        // `pairwise` splits a list in the middle, the first half the shorter.
+        let mid = lo + (hi - lo) / 2;
+        emit(out, lo, mid, leaf, node);
+        emit(out, mid, hi, leaf, node);
+        node(out, lo, mid, hi);
+    }
+    let leaf = |out: &mut String, s: usize| {
+        if s == 0 {
+            *out += &format!("            let r0 = {load}(base);\n");
+        } else {
+            *out += &format!("            let in{s} = base + {wg}u * {s}u < {n};\n            let r{s} = {load}(select(base, base + {wg}u * {s}u, in{s}));\n");
+        }
+        for (j, &op) in ops.as_slice().iter().enumerate() {
+            let e = format!("r{s}[{}]", roots[j]);
+            let value = match op {
+                ReduceOp::Sum => {
+                    if s == 0 { e } else { format!("select(zero, {e}, in{s})") }
+                }
+                ReduceOp::SumSquares => {
+                    let sq = elem.square(&e);
+                    if s == 0 { sq } else { format!("select(zero, {sq}, in{s})") }
+                }
+                ReduceOp::Min | ReduceOp::Max => e,
+                ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
+            };
+            *out += &format!("            let v{j}_{s} = {value};\n");
+        }
+    };
+    let combine = |out: &mut String, lo: usize, mid: usize, hi: usize| {
+        for j in 0..count {
+            *out += &format!("            let w{j}_{lo}_{hi} = c{j}({}, {});\n", name(j, lo, mid), name(j, mid, hi));
+        }
+    };
+    let mut loop_body = String::new();
+    emit(&mut loop_body, 0, per_thread, &leaf, &combine);
+    for (j, &op) in ops.as_slice().iter().enumerate() {
+        let pw = name(j, 0, per_thread);
+        loop_body += &match op {
+            ReduceOp::Min | ReduceOp::Max => {
+                format!("            if (b == {group} * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
+            }
+            _ => format!("            acc{j} = c{j}(acc{j}, {pw});\n"),
+        };
+    }
+    (inits, loop_body)
 }
 
 /// The entry point of a reduction pass computing every op of `ops` (see [`reduce`]). Element
@@ -1288,7 +1496,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
             load,
             store: &partial,
             // A partial result is not the final value when the last workgroup finishes it.
-            epilogue: if single_pass.is_some() { Epilogue::default() } else { ops.epilogue() },
+            epilogue: if single_pass.is_some() { None } else { Some(ops) },
         },
         subgroups,
         tuning,
@@ -1306,7 +1514,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
             let rest = reduce_phase(
                 elem,
                 ops.rest(),
-                &Phase { n: "groups", group: "0u", groups: "1u", segmented: true, segment: "groups", load: "luma_partial", store: &value, epilogue: ops.epilogue() },
+                &Phase { n: "groups", group: "0u", groups: "1u", segmented: true, segment: "groups", load: "luma_partial", store: &value, epilogue: Some(ops) },
                 subgroups,
                 tuning,
             );
@@ -1523,6 +1731,11 @@ const TWISTED_BLOCK: u32 = 4;
 /// A count for the 82 multiprocessors of an RTX 3090, scaled to the device ([`Tuning::scaled`]).
 const TWISTED_LINES: u32 = 8192;
 
+/// Lines per workgroup of a native Thomas solve (`Tuning::native_solve`): few, so that the lines
+/// of a launch spread over every core, and neighbouring ones, so that a core reads the cache
+/// lines their cells share once.
+const NATIVE_LINES: u8 = 4;
+
 /// The invocations per workgroup, the scratch layout and the line split of the Thomas solve of
 /// `lines` lines of `block`-blocks, `stride` cells apart in memory.
 ///
@@ -1570,6 +1783,9 @@ const TWISTED_LINES: u32 = 8192;
 /// not coalesce whatever the workgroup, and the wide tiled solve was 1.1x to 1.3x slower on
 /// `bench_solve --only sweep/` (blocks of 2 to 5, 100 to 1024 strided lines of 32 to 1024 cells).
 pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, parts: bool) -> ThomasPlan {
+    if tuning.native_solve {
+        return ThomasPlan { workgroup: NATIVE_LINES, tiled: false, twisted: false };
+    }
     if tuning.profile == TuningProfile::Cpu {
         return ThomasPlan { workgroup: tuning.elementwise_workgroup as u8, tiled: false, twisted: false };
     }
@@ -1590,8 +1806,12 @@ pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, 
 /// workgroup: `workgroup / 2` lines each if `twisted` (see [`tridiagonal_body`]), else
 /// `workgroup`.
 pub(crate) fn thomas_workgroups(lines: u32, workgroup: u8, twisted: bool) -> u32 {
-    let per_group = if twisted { u32::from(workgroup) / 2 } else { u32::from(workgroup) };
-    lines.div_ceil(per_group)
+    lines.div_ceil(thomas_lines_per_group(workgroup, twisted))
+}
+
+/// The lines a workgroup of the Thomas solve solves: `workgroup / 2` if `twisted`, else `workgroup`.
+pub(crate) fn thomas_lines_per_group(workgroup: u8, twisted: bool) -> u32 {
+    if twisted { u32::from(workgroup) / 2 } else { u32::from(workgroup) }
 }
 
 /// Floats of the scratch `cp` of one system of `cells` cells of `block`-blocks, in the layout
@@ -2224,6 +2444,24 @@ fn matmul_sum_module() -> KernelModule {
 }
 
 impl Builtin {
+    /// The line solve a backend may run natively instead of this kernel's shader (see
+    /// [`LineSolveSpec`]), if this is one: the Thomas solves, on stacked blocks or on parts that
+    /// are all buffers.
+    pub(crate) fn line_solve(self) -> Option<LineSolveSpec> {
+        match self {
+            Builtin::Tridiagonal { block, starts, workgroup, twisted } => {
+                Some(LineSolveSpec { block, systems: 1, parts: false, starts, lines_per_group: thomas_lines_per_group(workgroup, twisted) })
+            }
+            Builtin::SolveParts(spec) => match spec.algo {
+                crate::solve::Algo::Thomas { workgroup, twisted, .. } if spec.fused == [0; 4] => {
+                    Some(LineSolveSpec { block: spec.block, systems: spec.systems, parts: true, starts: spec.starts, lines_per_group: thomas_lines_per_group(workgroup, twisted) })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// This kernel for elements of type `ty` (`"f32"` or `"u32"`), with the parameters `tuning`
     /// gives for the GPU.
     pub(crate) fn kernel(self, ty: &str, tuning: &Tuning) -> BuiltinKernel {
@@ -2244,6 +2482,7 @@ impl Builtin {
             }
             Builtin::SolveParts(spec) => wgsl(spec.source()),
             Builtin::Radix { pass, first } => wgsl(crate::sort::source(pass, first)),
+            Builtin::SortLines(sort) => wgsl(sort.source()),
             Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split)),
             Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module()),
             Builtin::FilterCount => wgsl(crate::filter::count_source()),

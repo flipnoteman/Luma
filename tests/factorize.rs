@@ -133,3 +133,41 @@ fn the_unique_of_signed_zeros_is_the_first_in_sorted_order() {
     assert_eq!(u.to_vec().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>(), [(-0.0f32).to_bits(), 1.0f32.to_bits()]);
     assert_eq!(c.to_vec().unwrap(), [0, 0, 1, 0]);
 }
+
+/// Keys in a narrow range (the counting path) at awkward places: negative, at the ends of the
+/// type, with gaps, a single value, fewer keys than the range.
+#[test]
+fn narrow_integer_ranges() {
+    fn run<T: Host + Copy + Ord + std::fmt::Debug>(base: T, step: impl Fn(T, u32) -> T, ns: &[usize], spans: &[u32]) {
+        for &n in ns {
+            for &span in spans {
+                let mut rng = Rng(n as u64 * 31 + span as u64);
+                let data: Vec<T> = (0..n).map(|_| step(base, rng.next() % span)).collect();
+                let (u, c) = Array::from_slice(&data, n).unwrap().factorize();
+                let (u, c) = (u.to_vec().unwrap(), c.to_vec().unwrap());
+                let mut want = data.clone();
+                want.sort();
+                want.dedup();
+                assert_eq!(u, want, "n={n} span={span}");
+                for (i, &code) in c.iter().enumerate() {
+                    assert_eq!(u[code as usize], data[i]);
+                }
+            }
+        }
+    }
+    let (ns, spans) = (&[1usize, 2, 3, 100, 4097, 100_000, 300_000][..], &[1u32, 2, 10, 1000, 65536][..]);
+    run(0u32, |b, d| b + d * 3, ns, spans);
+    run(u32::MAX - 200_000, |b, d| b + d, ns, spans);
+    run(5u32, |b, d| b + d, ns, spans);
+    run(-30_000i32, |b, d| b + d as i32, ns, spans);
+    run(i32::MIN, |b, d| b + d as i32, ns, spans);
+    run(i32::MAX - 70_000, |b, d| b + d as i32, ns, spans);
+    // Wider than the counting path takes: the sort.
+    run(0u32, |b, d| b.wrapping_add(d.wrapping_mul(1 << 20)), ns, &[3, 50]);
+    // Min and max in a 2-D array.
+    let x = Array::from_slice(&[7i32, -2, 7, 5, -2, 5], [2, 3]).unwrap();
+    let (u, c) = x.factorize();
+    assert_eq!(u.to_vec().unwrap(), [-2, 5, 7]);
+    assert_eq!(c.shape().dims()[..2], [2, 3]);
+    assert_eq!(c.to_vec().unwrap(), [2, 0, 2, 1, 0, 1]);
+}
