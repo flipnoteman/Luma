@@ -227,7 +227,7 @@ fn mean_variance_and_standard_deviation() {
 }
 
 #[test]
-fn var_axis_computes_the_deviation_inside_the_reduction() {
+fn var_axis_is_one_pass_with_the_shift_inside_the_reduction() {
     let ctx = Context::new().unwrap();
     let (cols, rows) = (64usize, 1usize << 16);
     let a = values(cols * rows, 8, -1.0, 1.0);
@@ -235,10 +235,12 @@ fn var_axis_computes_the_deviation_inside_the_reduction() {
     x.eval().unwrap();
     ctx.flush().unwrap();
     let (var, profile) = ctx.profile(|| var_forced(&x)).unwrap();
-    // The one store kernel is the division of the mean, of 64 elements.
+    // The one store kernel is the finishing arithmetic on the 64 sums; the data is read once.
     let stores: u32 = profile.kernels.iter().filter(|k| k.label.starts_with("Fused(")).map(|k| k.launches).sum();
     assert_eq!(stores, 1, "{profile}");
     assert!(profile.kernels.iter().any(|k| k.label.starts_with("FusedAxisReduce")), "{profile}");
+    let reduces: u32 = profile.kernels.iter().filter(|k| k.label.contains("Reduce")).map(|k| k.launches).sum();
+    assert!(reduces <= 2, "{profile}");
     var.check().unwrap();
 }
 
@@ -271,4 +273,91 @@ fn bool_arrays_count_by_sum_and_reduce_by_min_and_max() {
     assert_eq!(m.cumsum(0).to_vec().unwrap(), vec![1u32, 1, 2, 1, 1, 1]);
     assert_eq!(m.max_axis(0).to_vec().unwrap(), vec![true, true]);
     assert_eq!(m.min_axis(0).to_vec().unwrap(), vec![false, false]);
+}
+
+/// f64 population variance of every line of `data` (luma layout) along `axis`.
+fn host_var(data: &[f32], dims: &[usize], axis: usize) -> Vec<f64> {
+    let stride: usize = dims[..axis].iter().product();
+    let n = dims[axis];
+    (0..data.len() / n)
+        .map(|l| {
+            let base = l % stride + (l / stride) * stride * n;
+            let line: Vec<f64> = (0..n).map(|s| f64::from(data[base + s * stride])).collect();
+            let mean = line.iter().sum::<f64>() / n as f64;
+            line.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64
+        })
+        .collect()
+}
+
+#[test]
+fn var_axis_is_accurate_far_from_zero_on_every_axis() {
+    let ctx = Context::new().unwrap();
+    // Odd extents, contiguous (axis 0) and strided lines, an offset of 1e4 on noise of 1.
+    for dims in [vec![37usize, 513], vec![7, 5, 9], vec![1, 33], vec![33, 1], vec![4099, 3]] {
+        let len: usize = dims.iter().product();
+        for (offset, spread) in [(1.0e4f32, 1.0f32), (-3.0e3, 0.01), (0.0, 1.0)] {
+            let a: Vec<f32> = values(len, 31, -spread, spread).iter().map(|v| v + offset).collect();
+            let x = match dims[..] {
+                [a0] => Array::from_slice_on(&ctx, &a, a0),
+                [a0, a1] => Array::from_slice_on(&ctx, &a, [a0, a1]),
+                [a0, a1, a2] => Array::from_slice_on(&ctx, &a, [a0, a1, a2]),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            for axis in 0..dims.len() {
+                let var = x.var_axis(axis).to_vec().unwrap();
+                let want = host_var(&a, &dims, axis);
+                let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
+                // n = 1 lines are exactly 0.
+                assert_close(&var, &want, 2e-4, 0.0);
+                let std = x.std_axis(axis).to_vec().unwrap();
+                let want: Vec<f32> = want.iter().map(|v| v.sqrt()).collect();
+                assert_close(&std, &want, 2e-4, 0.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn var_axis_of_constant_lines_is_zero() {
+    let ctx = Context::new().unwrap();
+    for value in [0.0f32, 1.0e4, -123.456, 1.0e-20] {
+        for dims in [[257usize, 3], [3, 257]] {
+            let x = Array::from_slice_on(&ctx, &vec![value; 257 * 3], dims).unwrap();
+            for axis in 0..2 {
+                assert!(x.var_axis(axis).to_vec().unwrap().iter().all(|&v| v == 0.0), "{value} axis {axis}");
+                assert!(x.std_axis(axis).to_vec().unwrap().iter().all(|&v| v == 0.0), "{value} axis {axis}");
+            }
+        }
+    }
+}
+
+#[test]
+fn var_axis_propagates_nan_and_infinity() {
+    let ctx = Context::new().unwrap();
+    // Lines of 5 along axis 0: clean, NaN inside, +inf inside, first element inf, first NaN, -inf and +inf.
+    let nan = f32::NAN;
+    let inf = f32::INFINITY;
+    let lines: [[f32; 5]; 7] = [
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+        [1.0, 2.0, nan, 4.0, 5.0],
+        [1.0, 2.0, inf, 4.0, 5.0],
+        [inf, 2.0, 3.0, 4.0, 5.0],
+        [nan, 2.0, 3.0, 4.0, 5.0],
+        [-inf, 2.0, 3.0, 4.0, inf],
+        [inf, inf, inf, inf, inf],
+    ];
+    let flat: Vec<f32> = lines.iter().flatten().copied().collect();
+    let x = Array::from_slice_on(&ctx, &flat, [5, 7]).unwrap();
+    let var = x.var_axis(0).to_vec().unwrap();
+    assert!((var[0] - 2.0).abs() < 1e-6, "{var:?}");
+    assert!(var[1..].iter().all(|v| v.is_nan()), "{var:?}");
+    // The same data as 7 lines of 5 along axis 1 (strided): a line is NaN iff it holds a non-finite value.
+    let t = Array::from_slice_on(&ctx, &flat, [7, 5]).unwrap();
+    let var = t.var_axis(1).to_vec().unwrap();
+    for (l, v) in var.iter().enumerate() {
+        let finite = (0..5).all(|s| flat[l + 7 * s].is_finite());
+        assert_eq!(v.is_finite(), finite, "line {l}: {var:?}");
+        assert!(finite || v.is_nan(), "line {l}: {var:?}");
+    }
 }

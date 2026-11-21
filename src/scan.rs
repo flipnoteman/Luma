@@ -1324,13 +1324,31 @@ impl Array<f32> {
     }
 
     /// The population variance along `axis` (divisor `n`, NumPy's `ddof = 0`); the result has
-    /// extent 1 along it. Two passes, so it is stable for data far from zero: the mean, then
-    /// the mean of the squared deviations, in which `self - mean` is computed inside the
-    /// reduction.
+    /// extent 1 along it. One pass over the data: with `K` the first element of each line
+    /// (a broadcast slice of the input, read inside the same pass), the sum `S1` and the sum
+    /// of squares `S2` of `self - K` come from a single [`reduce_axis`](Array::reduce_axis)
+    /// (the subtraction is computed inside the reduction, never stored), and the variance is
+    /// `(S2 - S1 * S1 / n) / n`, which is shift invariant.
+    ///
+    /// Accuracy: the cancellation in `S2 - S1 * S1 / n` loses digits in proportion to
+    /// `(mean - K)^2 / var`, not to `mean^2 / var` as the unshifted formula does, so data far
+    /// from zero but with a spread comparable to the distance of its elements from the first
+    /// (an offset of `1e4` on unit noise, a layer's activations) keeps `f32` accuracy. A line
+    /// whose first element is an outlier many standard deviations from the rest loses digits
+    /// (about `(outlier / sigma)^2` of the `f32` epsilon) where the two-pass formula would
+    /// not; a constant line has variance exactly 0. Rounding can leave the difference
+    /// slightly negative, so the result is clamped at 0 (a NaN is kept, on every backend: any NaN or infinity
+    /// in a line gives NaN, as the two-pass formula did).
     #[track_caller]
     pub fn var_axis(&self, axis: usize) -> Array<f32> {
-        let deviation = self - &self.mean_axis(axis);
-        (&deviation * &deviation).mean_axis(axis)
+        let n = self.shape().dims().get(axis).copied().unwrap_or(1);
+        let shifted = self - &self.slice(axis, ..1);
+        let [s1, s2] = shifted.reduce_axis(axis, [Reduction::Sum, Reduction::SumOfSquares]);
+        let n = n as f32;
+        let var = &(&s2 - &(&s1 * &s1) / n) / n;
+        // Clamped at 0 as `(var + |var|) / 2`, exact, keeps NaN and infinity: a compare or
+        // `max` would let a driver's NaN-dropping `fmax` turn a NaN into 0.
+        &(&var * 0.5f32) + &(&var.abs() * 0.5f32)
     }
 
     /// The population standard deviation along `axis`: the square root of
