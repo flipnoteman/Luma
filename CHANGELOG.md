@@ -8,6 +8,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Added
 
+- luma-bench `cfd` suite: `bc/face_apply` (the `n_apply` pass of a block line solve: 5 x 5 face-matrix products over ghost-extended line ends, 50 coefficient streams and 5 writes per face, i / j / k) and `bc/ghost_region` (a padded copy of the primitives with five region assigns of a shared characteristic far-field expression, one kernel writing five padded fields), both verified against double precision host mirrors, on the bowshock sector grid. Measured with ncu on the RTX 3090 (bowshock `bench3` sector f32 diag): the 85-94 us `Fused[5](Generate(ParamRange ...))` kernels of that step are the `n_apply` passes, not ghost assigns; they read 51-69 MB and run at 830 GB/s (89 % of the DRAM peak), so there is no codegen cost to remove.
 - `Array::quantiles(&[q])` and `quantiles_axis(axis, &[q])`: many quantiles of an `f32` array (or of every line along an axis) from one sort. A call of `quantile` / `quantile_axis` per quantile sorts every time, and the sort is nearly all of the cost. On an RTX 3090 (CUDA) seven quantiles of 16M elements take 1.3 ms with `quantiles` against 8.7 ms for seven `quantile` calls, and three quantiles per column of a 1M x 64 table 8.7 ms with `quantiles_axis` against 26.2 ms. Entry `j` along the axis is the quantile `qs[j]`; nothing is cached between calls (a sorted copy would cost as much memory as the array).
 
 ### Changed
