@@ -59,6 +59,9 @@ pub(crate) struct Reduced {
     axis: Option<AxisGeom>,
 }
 
+/// Most kernels of reductions whose compile [`Reduced::build_ahead`] starts at once.
+const AHEAD_KERNELS: usize = 8;
+
 /// The lines an axis reduction runs over: `lines` lines of `n` cells, `stride` apart.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct AxisGeom {
@@ -218,7 +221,7 @@ impl Reduced {
                 return Vec::new();
             }
         }
-        ctx.jit().reduction_partners(ctx, self)
+        ctx.jit().reduction_partners(ctx, self, &[])
     }
 
     /// Records the reductions `partners` (see [`Reduced::merge_partners`]) and this one in one kernel: this reduction's
@@ -226,7 +229,8 @@ impl Reduced {
     fn record_merged(&self, ctx: &Context, partners: &[Arc<Reduced>]) -> Option<Arc<Storage>> {
         let all = || std::iter::once(self).chain(partners.iter().map(|partner| &**partner));
         let members: Vec<jit::Member<'_>> = all().map(|reduced| jit::Member { operand: &reduced.operand, ops: reduced.ops, finish: reduced.finish }).collect();
-        let pack = match jit::reduce_many(ctx, &members, self.ty, ctx.tuning().reduce_multi) {
+        let ahead = || self.build_ahead(ctx, partners);
+        let pack = match jit::reduce_many(ctx, &members, self.ty, ctx.tuning().reduce_multi, jit::ManyMode::Run(&ahead)) {
             Ok(Some(pack)) => Arc::new(pack),
             _ => return None,
         };
@@ -246,6 +250,34 @@ impl Reduced {
             }
         }
         own
+    }
+
+    /// Whether this reduction would be the seed of a kernel recorded after the one of `first`, which it does not share a kernel with.
+    pub(crate) fn follows(&self, ctx: &Context, first: &Reduced) -> bool {
+        self.thread == first.thread && self.axis.is_none() && !self.in_recording && !self.forcing.load(Ordering::Relaxed) && self.mergeable(ctx)
+    }
+
+    /// Starts the compiles of the kernels the reductions pending after `first_group` (this one and its `partners`) will be
+    /// recorded in, if they are used in the order they were made, so that the compiles run side by side: a kernel that is not
+    /// compiled yet is waited for where it is launched, and the groups are recorded one after the other (a force monitor of
+    /// several dozen sums is a few kernels, each compiled from scratch the first time). Runs only when the kernel of the
+    /// first group was not built before, so it costs nothing where the kernels are known.
+    fn build_ahead(&self, ctx: &Context, partners: &[Arc<Reduced>]) {
+        let mut taken: Vec<*const Reduced> = std::iter::once(self as *const Reduced).chain(partners.iter().map(Arc::as_ptr)).collect();
+        for _ in 0..AHEAD_KERNELS {
+            let Some(seed) = ctx.jit().next_seed(ctx, self, &taken) else { return };
+            taken.push(Arc::as_ptr(&seed));
+            let others = ctx.jit().reduction_partners(ctx, &seed, &taken);
+            taken.extend(others.iter().map(Arc::as_ptr));
+            // Alone, a reduction is recorded by its own passes, not by this kind of kernel.
+            if others.is_empty() {
+                continue;
+            }
+            let members: Vec<jit::Member<'_>> =
+                std::iter::once(&*seed).chain(others.iter().map(|other| &**other)).map(|reduced| jit::Member { operand: &reduced.operand, ops: reduced.ops, finish: reduced.finish }).collect();
+            // A program that does not fit is left to the reductions' own turn.
+            let _ = jit::reduce_many(ctx, &members, seed.ty, ctx.tuning().reduce_multi, jit::ManyMode::BuildOnly);
+        }
     }
 
     /// Takes the buffer `storage` recorded together with another reduction as the result, if there is none yet.

@@ -276,6 +276,48 @@ fn many_reductions_over_a_deep_shared_expression_are_grouped_and_exact() {
 }
 
 #[test]
+fn kernels_of_later_reduction_groups_are_built_when_the_first_is() {
+    use crate::view::concat_slice;
+    let n = 100_000;
+    let xs = values(n, 7, -1.0, 1.0);
+    let accs = ctx().tuning().reduce_multi;
+    let groups = 3;
+    // The groups of `accs` sums each have a program of their own (a different number of `abs`), so each is a kernel.
+    let make = |ctx: &Context| -> Vec<Array<f32>> {
+        let x = f32s(ctx, &xs);
+        (0..groups * accs)
+            .map(|j| {
+                let mut e = &x * (j as f32 + 1.0);
+                for _ in 0..=j / accs {
+                    e = e.abs() + 0.5;
+                }
+                e.sum().reshape([1])
+            })
+            .collect()
+    };
+    // The values from a context of its own, which the kernels of the one measured are not in.
+    let other = ctx();
+    let alone: Vec<u32> = make(&other).iter().map(|r| r.to_vec().unwrap()[0].to_bits()).collect();
+    let ctx = ctx();
+    let sums = make(&ctx);
+    let before = ctx.jit().stats();
+    // The first read records the first group, and starts the others' kernels.
+    let first = sums[0].to_vec().unwrap()[0];
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 1, "{d:?}");
+    assert_eq!(d.built, groups as u64, "{d:?}");
+    let before = ctx.jit().stats();
+    let rest: Vec<f32> = (1..groups).map(|g| sums[g * accs].to_vec().unwrap()[0]).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, groups as u64 - 1, "{d:?}");
+    assert_eq!(d.built, 0, "the kernels were built already: {d:?}");
+    let all: Vec<u32> = concat_slice(0, &sums).to_vec().unwrap().into_iter().map(f32::to_bits).collect();
+    assert_eq!(all, alone);
+    assert_eq!(first.to_bits(), alone[0]);
+    assert!(rest.iter().enumerate().all(|(g, v)| v.to_bits() == alone[(g + 1) * accs]));
+}
+
+#[test]
 fn consumers_of_pending_reductions_record_them_as_a_group() {
     use crate::view::{concat_slice, stack_slice};
     let ctx = ctx();
