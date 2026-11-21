@@ -3,11 +3,12 @@
 use std::any::TypeId;
 use std::panic::Location;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::array::{Array, Failure, Storage};
 use crate::error::LumaError;
 use crate::gpu_type::ScalarType;
-use crate::jit::{self, Trace};
+use crate::jit::{self, Plan, Stepper, Trace};
 use crate::ops::Outcome;
 
 /// Runs `steps` iterations of `step` on several arrays at once (of any [`ScalarType`], `f32`,
@@ -19,8 +20,11 @@ use crate::ops::Outcome;
 /// one type). It runs in launches of about 40 ms of GPU time by the device's [`CostModel`](crate::CostModel), so a
 /// long loop is a handful of launches. Anything else, such as shifts, `cache()` or `assign` or
 /// states of another type, is traced once and its recorded kernels are replayed, step by step.
-/// `step` is called once to trace it; it must compute its results from its arguments and captured
-/// arrays only.
+/// A step of lazy expressions only (shifts, say) is also traced as the body of several steps
+/// (up to 16) when the planner fuses those into fewer launches than the steps make one by one,
+/// which the loop then replays, and the steps that do not fill a body run one by one.
+/// `step` is called once to trace it, and up to 16 times more for the body of several steps; it
+/// must compute its results from its arguments and captured arrays only.
 ///
 /// A register loop called again from the same place in the source whose step builds the same
 /// graph (the same operations and scalar values) over other arrays, states or captured, is not
@@ -108,13 +112,15 @@ fn replayed_all<T: ScalarType, const N: usize>(
     let mut attempt = jit::Attempt::begin(ctx, site, &trace.init, &trace.probe_storages, steps);
     trace.begin()?;
     let Ok(probes): std::result::Result<[Array<T>; N], _> = probes.try_into() else { unreachable!() };
+    let started = Instant::now();
     let first = step(&probes);
     if let Some(attempt) = &mut attempt {
         attempt.stepped();
     }
     let shapes_match = first.iter().zip(&init).all(|(next, array)| next.shape() == array.shape());
 
-    if trace.untouched() {
+    let lazy = trace.untouched();
+    if lazy {
         // Only lazy expressions: they may be a loop that runs in one kernel.
         trace.pause();
         let traced: Option<Vec<Arc<jit::Node>>> = first.iter().map(|next| next.pending().cloned()).collect();
@@ -146,12 +152,100 @@ fn replayed_all<T: ScalarType, const N: usize>(
         }
         return Ok(states);
     };
-    stepper.run_steps(steps)?;
-    let mut finals = stepper.state_after(steps).iter();
+    let unrolled = if lazy && shapes_match { Some(started.elapsed()) } else { None };
+    let mut finals = run_stepper(init, steps, step, stepper, unrolled)?.into_iter();
     Ok(init.map(|array| match finals.next() {
-        Some(storage) => Array::from_storage(ctx, array.shape(), Arc::clone(storage)),
+        Some(storage) => Array::from_storage(ctx, array.shape(), storage),
         None => unreachable!(),
     }))
+}
+
+/// The storages of the state after `steps` steps of `stepper`, the traced single step of a loop
+/// from `init`. With `traced`, the time tracing it took, given where `step` is lazy expressions
+/// only, the loop runs as replays of an unrolled body where that pays (see [`trace_unrolled`]).
+fn run_stepper<T: ScalarType, const N: usize>(
+    init: [&Array<T>; N],
+    steps: usize,
+    step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+    mut stepper: Stepper,
+    traced: Option<Duration>,
+) -> Outcome<Vec<Arc<Storage>>> {
+    if let Some(traced) = traced {
+        let depth = unroll_depth(steps, stepper.plan().modeled_ns(), traced);
+        if let Some(unrolled) = trace_unrolled(init, depth, step, stepper.plan())? {
+            return run_unrolled(&mut stepper, &unrolled, depth, steps);
+        }
+    }
+    stepper.run_steps(steps)?;
+    Ok(stepper.state_after(steps).to_vec())
+}
+
+/// Most steps of a pure expression traced as one body of a replayed loop (see [`trace_unrolled`]).
+const UNROLL_STEPS: usize = 16;
+
+/// The share of the time the cost model gives the loop that tracing its unrolled body may take.
+const UNROLL_TRACE_SHARE: f64 = 0.5;
+
+/// The steps in the unrolled body of a loop of `steps` steps (below 2: none) whose single step
+/// takes `step_ns` by the cost model and took `traced` to trace: as many as the tracing (one
+/// trace per step) costs less than [`UNROLL_TRACE_SHARE`] of what the loop would take step by
+/// step, which is all that fusing the steps can save.
+fn unroll_depth(steps: usize, step_ns: f64, traced: Duration) -> usize {
+    let affordable = (steps as f64 * step_ns * UNROLL_TRACE_SHARE / (traced.as_nanos() as f64).max(1.0)).min(UNROLL_STEPS as f64) as usize;
+    steps.min(affordable)
+}
+
+/// The stepper of `depth` steps of `step` traced as one body, where `depth` is at least 2: the
+/// launches the planner makes of the chain of `depth` steps of lazy expressions (it fuses steps
+/// of shifted expressions into kernels, as an eager loop that evaluates every step lazily
+/// does), when they make fewer launches than `depth` steps of `single` (the plan of one step)
+/// and the cost model gives them less time. `None` when unrolling does not help, or the
+/// traced code aborted the recording.
+fn trace_unrolled<T: ScalarType, const N: usize>(
+    init: [&Array<T>; N],
+    depth: usize,
+    step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+    single: &Plan,
+) -> Outcome<Option<Stepper>> {
+    if depth < 2 {
+        return Ok(None);
+    }
+    let (mut trace, probes) = Trace::start(&init)?;
+    let Ok(probes): std::result::Result<[Array<T>; N], _> = probes.try_into() else { unreachable!() };
+    if !trace.recording() {
+        return Ok(None);
+    }
+    let mut states = step(&probes);
+    for _ in 1..depth {
+        states = step(&states);
+    }
+    // The planner evaluates the steps it does not fuse while the chain is built: those launches are
+    // recorded with the rest.
+    let shapes_match = states.iter().zip(&init).all(|(next, array)| next.shape() == array.shape());
+    if !shapes_match || !trace.recording() {
+        return Ok(None);
+    }
+    let unrolled = trace.finish_chain(&states.each_ref(), depth * single.launches())?;
+    Ok(unrolled.filter(|unrolled| unrolled.plan().modeled_ns() < UNROLL_GAIN * depth as f64 * single.modeled_ns()))
+}
+
+/// The share of the time of `depth` steps one by one that the unrolled body must take, at most.
+const UNROLL_GAIN: f64 = 0.9;
+
+/// The storages of the state after `steps` steps: replays of `unrolled` (`depth` steps each),
+/// then `stepper` for the rest, which takes the state where the replays left it.
+fn run_unrolled(stepper: &mut Stepper, unrolled: &Stepper, depth: usize, steps: usize) -> Outcome<Vec<Arc<Storage>>> {
+    let (full, rest) = (steps / depth, steps % depth);
+    if rest > 0 && !stepper.rebind(unrolled.state_after(full)) {
+        stepper.run_steps(steps)?;
+        return Ok(stepper.state_after(steps).to_vec());
+    }
+    unrolled.run_steps(full)?;
+    if rest == 0 {
+        return Ok(unrolled.state_after(full).to_vec());
+    }
+    stepper.run_steps(rest)?;
+    Ok(stepper.state_after(rest).to_vec())
 }
 
 /// The step-by-step loop of `iterate_all` on placeholders that alias the states' buffers, for
@@ -266,8 +360,10 @@ impl Array<f32> {
     fn replayed(&self, steps: usize, step: impl Fn(&Array<f32>) -> Array<f32>) -> Outcome<Array<f32>> {
         let (mut trace, mut probes) = Trace::start(&[self])?;
         let Some(probe) = probes.pop() else { unreachable!() };
+        let started = Instant::now();
         let first = step(&probe);
-        if trace.untouched() {
+        let lazy = trace.untouched();
+        if lazy {
             trace.pause();
             if let Some(stencil) = jit::stencil_plan(&probe, &first) {
                 return stencil.run(self, steps);
@@ -282,9 +378,12 @@ impl Array<f32> {
             u.check()?;
             return Ok(u);
         };
-        stepper.run_steps(steps)?;
-        match stepper.state_after(steps).first() {
-            Some(storage) => Ok(Array::from_storage(self.context(), self.shape(), Arc::clone(storage))),
+        let shapes_match = first.shape() == self.shape();
+        drop((probe, first));
+        let traced = if lazy && shapes_match { Some(started.elapsed()) } else { None };
+        let mut finals = run_stepper([self], steps, &|[u]: &[Array<f32>; 1]| [step(u)], stepper, traced)?.into_iter();
+        match finals.next() {
+            Some(storage) => Ok(Array::from_storage(self.context(), self.shape(), storage)),
             None => unreachable!(),
         }
     }

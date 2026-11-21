@@ -18,7 +18,8 @@
 //! compute (the record of step `j` is then the output of launch `j`, and the loop makes one launch
 //! more than it has steps, whose result nobody sees: see `GateLoop`). Where a reduction finishes
 //! in its first launch (CUDA and CPU, see `Tuning::single_pass_reduce`) and the step does not read
-//! its index, the last workgroup of that launch also runs the gate: a step is one launch. Several
+//! its index, the last workgroup of that launch also runs the gate: a step is one launch. Elsewhere
+//! the gate runs in the last pass that finishes the reduction (a step is two launches). Several
 //! records, or records that are not one reduction, keep the records after the step and the gate as
 //! a launch of its own; the values are the same.
 
@@ -906,6 +907,17 @@ thread_local! {
 /// dispatch arguments each).
 const FOLD_LAUNCHES: usize = 256;
 
+/// Commands of the graph a one-shot loop replays (see [`GateLoop::run_span`]), about: capturing
+/// costs some tens of microseconds a command.
+const UNIT_LAUNCHES: usize = 64;
+
+/// Most steps of such a graph.
+const MAX_UNIT: usize = 16;
+
+/// Launches a one-shot loop makes one by one before it captures graphs: capturing a unit costs as
+/// much as a hundred launches replayed one by one, which a loop that stops sooner never gets back.
+const WARM_LAUNCHES: usize = 100;
+
 /// How the records of a traced step are computed.
 enum Records {
     /// Reductions of the new state, evaluated after the step (the general case).
@@ -990,7 +1002,7 @@ fn fold_buffers<S: Fields>(ctx: &Context, until: &Until<'_, S>, constants: usize
     if crate::jit::SEPARATE_GATE.with(std::cell::Cell::get) {
         return None;
     }
-    if until.records.len() != 1 || !ctx.tuning().single_pass_reduce {
+    if until.records.len() != 1 {
         return None;
     }
     GateBuffers::new(ctx, 1, until.max_steps, 3 * FOLD_LAUNCHES, constants, true).ok()
@@ -1174,6 +1186,10 @@ struct GateLoop {
     buffers: GateBuffers,
     /// Dispatch arguments, as many as the longest span of launches run so far.
     args: Vec<Buffer>,
+    /// Where a gate folded into the plan writes the next dispatch arguments in a span of one
+    /// launch, whose own are in `args[0]`: a buffer a dispatch reads its arguments from is
+    /// not written by the same dispatch. They are copied to `args[0]` after it.
+    spare: Option<Buffer>,
     /// Captured spans of launches, by (launches, whether the first is an even launch).
     graphs: GraphCache<(usize, bool)>,
     /// A compiled loop is run again and again: its spans are captured on first use. A one-shot
@@ -1221,6 +1237,7 @@ impl GateLoop {
             constants: spec.constants.iter().map(|c| c.to_bits()).collect(),
             buffers,
             args: Vec::new(),
+            spare: None,
             graphs: GraphCache::new(ctx),
             compiled: false,
         })
@@ -1244,6 +1261,10 @@ impl GateLoop {
             let buffers = &mut self.buffers;
             let buffer = take(&self.ctx, &mut buffers.owned, &mut buffers.held, bytes, STORAGE_USAGE | BufferUsage::INDIRECT)?;
             self.args.push(buffer);
+        }
+        if self.fold.is_some() && self.spare.is_none() {
+            let buffers = &mut self.buffers;
+            self.spare = Some(take(&self.ctx, &mut buffers.owned, &mut buffers.held, bytes, STORAGE_USAGE)?);
         }
         Ok(())
     }
@@ -1305,22 +1326,26 @@ impl GateLoop {
                     let raw = self.gate_args(next, resolved);
                     launch_1d(&self.ctx, gate, 1, &raw)?;
                 }
-                None => self.stepper.plan().replay(&self.with_next(swaps, next), Some(&self.args[k]))?,
+                None => match self.spare.as_ref().filter(|_| len == 1) {
+                    Some(spare) => {
+                        self.stepper.plan().replay(&self.with_next(swaps, spare), Some(&self.args[k]))?;
+                        self.ctx.copy(spare, 0, &self.args[0], 0, self.buffers.args_bytes())?;
+                    }
+                    None => self.stepper.plan().replay(&self.with_next(swaps, next), Some(&self.args[k]))?,
+                },
             }
         }
         Ok(())
     }
 
-    /// Launches `i0..i0 + len` (`i0 > 0`) as one graph: captured on first use in a compiled loop,
-    /// which runs its spans again and again, else the second time such a span runs (a one-shot
-    /// loop's first spans run once); `None` to launch them one by one.
-    fn graph(&self, i0: usize, len: usize) -> Result<Option<Arc<dyn ExecGraph>>> {
+    /// Launches `i0..i0 + len` (`i0 > 0`) as one graph, captured when `replays` of it are
+    /// expected (or the second time it is asked for); `None` to launch them one by one.
+    fn graph(&self, i0: usize, len: usize, replays: usize) -> Result<Option<Arc<dyn ExecGraph>>> {
         let grid = match &self.gate {
             Some(gate) => workgroups_1d(&self.ctx, gate, 1)?,
             None => [1, 1, 1],
         };
         let key = (len, (i0 + 1).is_multiple_of(2));
-        let replays = if self.compiled { jit::PAYING_REPLAYS } else { 1 };
         Ok(self.graphs.get_or_build(key, replays, || {
             let swaps = [self.stepper.subst(2), self.stepper.subst(3)];
             let resolved = [self.resolved(&swaps[0]), self.resolved(&swaps[1])];
@@ -1341,18 +1366,36 @@ impl GateLoop {
         }))
     }
 
+    /// Launches of a unit of the graphs a one-shot loop replays: an even number of launches (so
+    /// that every unit of a span starts at the same parity), about [`UNIT_LAUNCHES`] commands.
+    fn unit(&self) -> usize {
+        let per_step = self.stepper.plan().launches() + usize::from(self.gate.is_some());
+        ((UNIT_LAUNCHES / per_step.max(1)) & !1).clamp(2, MAX_UNIT)
+    }
+
     /// Runs launches `i0..i0 + len` (the first reads `init` when `i0` is 0, and always runs on its
-    /// own), as a graph when the backend has them and nothing needs the launches one by one.
-    fn run_span(&mut self, i0: usize, len: usize) -> Outcome<()> {
+    /// own), as graphs when the backend has them and nothing needs the launches one by one.
+    /// `ahead` is the number of launches the loop may still make from `i0` on.
+    ///
+    /// A compiled loop runs its spans again and again: each is captured whole on first use. A
+    /// span of a one-shot loop runs once, and capturing costs about as much as replaying a few
+    /// dozen launches one by one saves, so it runs as replays of one small graph of
+    /// [`GateLoop::unit`] launches, captured once the loop has run [`WARM_LAUNCHES`] without
+    /// stopping and is long enough for the replays to pay: what is left of the span after its
+    /// whole units is launched one by one.
+    fn run_span(&mut self, i0: usize, len: usize, ahead: usize) -> Outcome<()> {
         self.ensure_args(len)?;
-        if i0 > 0
-            && !self.ctx.recording_here()
-            && !self.ctx.is_profiling()
-            && let Some(graph) = self.graph(i0, len)?
-        {
-            let launches = len * (self.stepper.plan().launches() + usize::from(self.gate.is_some()));
-            self.ctx.launch_graph(&*graph, u32::try_from(launches).unwrap_or(u32::MAX))?;
-            return Ok(());
+        if i0 > 0 && !self.ctx.recording_here() && !self.ctx.is_profiling() {
+            let launches = self.stepper.plan().launches() + usize::from(self.gate.is_some());
+            let (unit, replays) = if self.compiled { (len, jit::PAYING_REPLAYS) } else { (self.unit(), ahead / self.unit()) };
+            if len >= unit && (self.compiled || (i0 >= WARM_LAUNCHES && replays >= jit::PAYING_REPLAYS)) && let Some(graph) = self.graph(i0, unit, replays)? {
+                let count = len / unit;
+                for _ in 0..count {
+                    self.ctx.launch_graph(&*graph, u32::try_from(unit * launches).unwrap_or(u32::MAX))?;
+                }
+                let done = count * unit;
+                return if done < len { self.replay_span(i0 + done, len - done) } else { Ok(()) };
+            }
         }
         self.replay_span(i0, len)
     }
@@ -1383,11 +1426,11 @@ impl GateLoop {
             if at == 0 {
                 // The first launch reads `init`, which no graph does: a span of its own, whose gate
                 // writes `args[0]` for the rest.
-                self.run_span(0, 1)?;
+                self.run_span(0, 1, total)?;
                 at = 1;
             }
             if end > at {
-                self.run_span(at, end - at)?;
+                self.run_span(at, end - at, total - at)?;
             }
             let [done, count, reason, ..] = ctx.read::<u32>(&self.buffers.st, self.buffers.state_bytes())?[..] else {
                 return Err(Failure::New(LumaError::Gpu("iterate_until_all state is missing".into())));
@@ -1896,8 +1939,9 @@ mod tests {
                     let record_launches = if n > 100 && !single_pass { 2 } else { 1 };
                     assert_eq!(old_launches, (1 + record_launches + 1, false), "{what}");
                     assert_eq!(fused_launches, (record_launches + 1, false), "{what}");
-                    // The gate runs in the step's launch where the backend finishes a reduction in one.
-                    assert_eq!(folded_launches, if single_pass { (1, true) } else { fused_launches }, "{what}");
+                    // The gate runs in the last launch that reduces the record: the step's own where the
+                    // reduction ends in it (one group, or a single pass), else the pass after it.
+                    assert_eq!(folded_launches, (record_launches, true), "{what}");
                 }
                 let (stopped, _) = run_heat(&ctx, &data, norm_until(12).stop_when(move |h| h["norm"].last().le(at_7)), false, false);
                 assert_eq!((stopped.steps, stopped.reason), (7, StopReason::Predicate(0)));

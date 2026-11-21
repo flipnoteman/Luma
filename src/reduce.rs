@@ -462,12 +462,33 @@ pub(crate) fn finish_passes(
     ops: ReduceList,
     wgsl: &'static str,
     elem: u64,
+    current: luma_core::Buffer,
+    n: u32,
+    per_op: bool,
+    target: Option<&luma_core::Buffer>,
+    finish: Finish,
+) -> Result<luma_core::Buffer> {
+    finish_passes_gated(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish, None)
+}
+
+/// [`finish_passes`] where the last pass also runs a gate (its id and the arguments of its
+/// buffers, see `ReduceList::with_gate`) on the final value; one op of `f32`s over partial results
+/// (`per_op`) that are more than one value, so that the last pass is a pass of one group.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_passes_gated(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    ops: ReduceList,
+    wgsl: &'static str,
+    elem: u64,
     mut current: luma_core::Buffer,
     mut n: u32,
     mut per_op: bool,
     target: Option<&luma_core::Buffer>,
     finish: Finish,
+    gate: Option<(crate::builtin::GateId, &[RawArg<'_>])>,
 ) -> Result<luma_core::Buffer> {
+    debug_assert!(gate.is_none() || (per_op && n > 1 && ops.as_slice().len() == 1), "a gate runs in a last pass over partial results");
     let count = ops.as_slice().len() as u64;
     while !per_op || n > 1 {
         let groups = ctx.tuning().reduce_groups(n);
@@ -478,6 +499,10 @@ pub(crate) fn finish_passes(
         let last = groups == 1 || single_pass;
         let list = if last { list.with_epilogue(finish.epilogue) } else { list };
         let list = if single_pass { list.single_pass() } else { list };
+        let list = match gate {
+            Some((id, _)) if last => list.with_gate(id),
+            _ => list,
+        };
         let in_bytes = u64::from(n) * elem * if per_op { count } else { 1 };
         // The last pass leaves one element per op: into `target` if there is one.
         let out = match target {
@@ -517,16 +542,13 @@ pub(crate) fn finish_passes(
             )?;
             return Ok(values);
         }
-        ctx.launch(
-            &core,
-            fold_workgroups(ctx, groups)?,
-            [n, 1, 1],
-            &[
-                RawArg::write(&out, u64::from(groups) * elem * count),
-                RawArg::read(&current, in_bytes),
-                RawArg::Uniform(bytemuck::cast_slice(&words[..used])),
-            ],
-        )?;
+        let mut raw = vec![RawArg::write(&out, u64::from(groups) * elem * count), RawArg::read(&current, in_bytes)];
+        if let Some((_, args)) = gate.filter(|_| last) {
+            raw.extend_from_slice(args);
+        }
+        raw.push(RawArg::Uniform(bytemuck::cast_slice(&words[..used])));
+        ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+        drop(raw);
         current = out;
         n = groups;
         per_op = true;

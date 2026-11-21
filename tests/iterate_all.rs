@@ -225,7 +225,8 @@ fn a_step_that_assigns_a_boundary_into_a_padded_temporary_is_replayed() {
         [w.slice(0, 1..n + 1) * 0.5 + w.slice(0, 0..n) * 0.25 + w.slice(0, 2..n + 2) * 0.25]
     };
     let [got] = iterate_all([&x], 37, step);
-    assert_eq!(calls.get(), 1, "traced once");
+    // Traced once, and for an unrolled body of up to 16 steps where that makes fewer launches.
+    assert!((1..=17).contains(&calls.get()), "traced {} times", calls.get());
     let [want] = by_hand([&x], 37, step);
     assert_close(&got.to_vec().unwrap(), &want.to_vec().unwrap(), 1e-5, 1e-6);
     // The state the loop started from is untouched.
@@ -303,4 +304,68 @@ fn an_identity_step_over_a_chunked_state_returns_an_independent_array() {
 
 fn values_of(array: &Array<f32>) -> Vec<f32> {
     array.to_vec().unwrap()
+}
+
+/// `steps` steps of the circular stencil `(u[i-1] + u[i+1]) / 4 + u / 2` on the host, in `f64`.
+fn stencil_host(x: &[f32], steps: usize) -> Vec<f32> {
+    let n = x.len();
+    let mut u: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+    for _ in 0..steps {
+        u = (0..n).map(|i| (u[(i + n - 1) % n] + u[(i + 1) % n]) * 0.25 + u[i] * 0.5).collect();
+    }
+    u.iter().map(|&v| v as f32).collect()
+}
+
+fn stencil_step(u: &Array<f32>) -> Array<f32> {
+    (u.shift([1]) + u.shift([-1])) * 0.25 + u * 0.5
+}
+
+#[test]
+fn a_shifted_step_matches_the_step_by_step_loop_for_every_remainder() {
+    // The step is traced as an unrolled body of several steps where that makes fewer launches, and the
+    // steps that do not fill a body run one by one: whatever the count, the result is the loop's.
+    let ctx = Context::new().unwrap();
+    let xs = values(1000, 21, 0.0, 1.0);
+    let x = f32s_on(&ctx, &xs);
+    for steps in [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 100] {
+        let [got] = iterate_all([&x], steps, |[u]| [stencil_step(u)]);
+        assert_close(&got.to_vec().unwrap(), &stencil_host(&xs, steps), 2e-4, 2e-4);
+    }
+    assert_eq!(x.to_vec().unwrap(), xs, "the initial array changed");
+}
+
+#[test]
+fn an_unrolled_loop_over_several_states_and_captured_arrays_matches_the_step_by_step_loop() {
+    let ctx = Context::new().unwrap();
+    let n = 777;
+    let (us, vs, cs) = (values(n, 22, 0.0, 1.0), values(n, 23, -1.0, 1.0), values(n, 24, 0.0, 0.1));
+    let (u0, v0, c) = (f32s_on(&ctx, &us), f32s_on(&ctx, &vs), f32s_on(&ctx, &cs));
+    let step = |[u, v]: &[Array<f32>; 2]| [stencil_step(u) + &c * 0.5 + v * 0.01, v * 0.9 + u.shift([1]) * 0.1];
+    for steps in [2, 5, 16, 17, 40] {
+        let got = iterate_all([&u0, &v0], steps, step);
+        let want = by_hand([&u0, &v0], steps, step);
+        for (got, want) in got.iter().zip(&want) {
+            assert_close(&got.to_vec().unwrap(), &want.to_vec().unwrap(), 5e-4, 5e-4);
+        }
+    }
+}
+
+#[test]
+fn a_shifted_step_runs_in_fewer_launches_than_steps_where_the_planner_fuses_them() {
+    let ctx = Context::new().unwrap();
+    if ctx.backend() == BackendKind::Cpu {
+        return;
+    }
+    let steps = 64;
+    let xs = values(1 << 16, 25, 0.0, 1.0);
+    let x = f32s_on(&ctx, &xs);
+    let (got, profile) = ctx
+        .profile(|| {
+            let [u] = iterate_all([&x], steps, |[u]| [stencil_step(u)]);
+            u.eval().unwrap();
+            u
+        })
+        .unwrap();
+    assert!(profile.launches() < steps as u32 / 2, "{} launches for {steps} steps", profile.launches());
+    assert_close(&got.to_vec().unwrap(), &stencil_host(&xs, steps), 2e-4, 2e-4);
 }
