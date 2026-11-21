@@ -79,10 +79,10 @@ impl Plan {
         self.cmds.len()
     }
 
-    /// The nanoseconds the cost model gives the plan's launches: a launch each, and the bytes
-    /// of the buffers they bind moved at the device's bandwidth (what the planner measures a
-    /// kernel by, see `cost::kernel_ns`).
-    pub(crate) fn modeled_ns(&self) -> f64 {
+    /// The nanoseconds the cost model gives the plan's launches, as `(launching, moving)`: a
+    /// launch each, and the bytes of the buffers they bind moved at the device's bandwidth (what the
+    /// planner measures a kernel by, see `cost::kernel_ns`).
+    pub(crate) fn modeled_ns(&self) -> (f64, f64) {
         let cost = self.ctx.cost_model();
         let bytes: u64 = self
             .cmds
@@ -93,7 +93,7 @@ impl Plan {
                 CmdArg::Uniform(_) => 0,
             })
             .sum();
-        self.cmds.len() as f64 * cost.launch_us * 1e3 + bytes as f64 / cost.bandwidth_gbs
+        (self.cmds.len() as f64 * cost.launch_us * 1e3, bytes as f64 / cost.bandwidth_gbs)
     }
 
     /// Whether some command binds `buffer` writable.

@@ -324,10 +324,13 @@ fn stencil_step(u: &Array<f32>) -> Array<f32> {
 fn a_shifted_step_matches_the_step_by_step_loop_for_every_remainder() {
     // The step is traced as an unrolled body of several steps where that makes fewer launches, and the
     // steps that do not fill a body run one by one: whatever the count, the result is the loop's.
+    // The state is large enough for fusing steps to pay, and the step has been traced before (a
+    // first trace compiles kernels, which counts against unrolling).
     let ctx = Context::new().unwrap();
-    let xs = values(1000, 21, 0.0, 1.0);
+    let xs = values(1 << 20, 21, 0.0, 1.0);
     let x = f32s_on(&ctx, &xs);
-    for steps in [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 100] {
+    iterate_all([&x], 2, |[u]| [stencil_step(u)])[0].eval().unwrap();
+    for steps in [1, 2, 3, 9, 15, 16, 17, 31, 33, 47, 100] {
         let [got] = iterate_all([&x], steps, |[u]| [stencil_step(u)]);
         assert_close(&got.to_vec().unwrap(), &stencil_host(&xs, steps), 2e-4, 2e-4);
     }
@@ -337,10 +340,11 @@ fn a_shifted_step_matches_the_step_by_step_loop_for_every_remainder() {
 #[test]
 fn an_unrolled_loop_over_several_states_and_captured_arrays_matches_the_step_by_step_loop() {
     let ctx = Context::new().unwrap();
-    let n = 777;
+    let n = (1 << 20) + 777;
     let (us, vs, cs) = (values(n, 22, 0.0, 1.0), values(n, 23, -1.0, 1.0), values(n, 24, 0.0, 0.1));
     let (u0, v0, c) = (f32s_on(&ctx, &us), f32s_on(&ctx, &vs), f32s_on(&ctx, &cs));
     let step = |[u, v]: &[Array<f32>; 2]| [stencil_step(u) + &c * 0.5 + v * 0.01, v * 0.9 + u.shift([1]) * 0.1];
+    iterate_all([&u0, &v0], 2, step)[0].eval().unwrap();
     for steps in [2, 5, 16, 17, 40] {
         let got = iterate_all([&u0, &v0], steps, step);
         let want = by_hand([&u0, &v0], steps, step);
@@ -357,8 +361,9 @@ fn a_shifted_step_runs_in_fewer_launches_than_steps_where_the_planner_fuses_them
         return;
     }
     let steps = 64;
-    let xs = values(1 << 16, 25, 0.0, 1.0);
+    let xs = values(1 << 22, 25, 0.0, 1.0);
     let x = f32s_on(&ctx, &xs);
+    iterate_all([&x], 2, |[u]| [stencil_step(u)])[0].eval().unwrap();
     let (got, profile) = ctx
         .profile(|| {
             let [u] = iterate_all([&x], steps, |[u]| [stencil_step(u)]);

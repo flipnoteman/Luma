@@ -174,7 +174,7 @@ fn run_stepper<T: ScalarType, const N: usize>(
     // The CPU backend has no workgroup memory to stage the shifted values of fused steps in: it
     // recomputes them, which is slower than the steps one by one for a large state.
     if let Some(traced) = traced.filter(|_| init[0].context().backend() != BackendKind::Cpu) {
-        let depth = unroll_depth(steps, stepper.plan().modeled_ns(), traced);
+        let depth = unroll_depth(steps, stepper.plan(), traced);
         if let Some(unrolled) = trace_unrolled(init, depth, step, stepper.plan())? {
             return run_unrolled(&mut stepper, &unrolled, depth, steps);
         }
@@ -189,12 +189,21 @@ const UNROLL_STEPS: usize = 16;
 /// The share of the time the cost model gives the loop that tracing its unrolled body may take.
 const UNROLL_TRACE_SHARE: f64 = 0.5;
 
+/// How many times the time a step moves its data takes the time of its launches, at least, for
+/// fusing steps to pay: a step that is a launch of a few microseconds costs about as much fused
+/// with others (a fused kernel is as long as the steps it holds, minus what they move).
+const UNROLL_BANDWIDTH_BOUND: f64 = 2.0;
+
 /// The steps in the unrolled body of a loop of `steps` steps (below 2: none) whose single step
-/// takes `step_ns` by the cost model and took `traced` to trace: as many as the tracing (one
-/// trace per step) costs less than [`UNROLL_TRACE_SHARE`] of what the loop would take step by
-/// step, which is all that fusing the steps can save.
-fn unroll_depth(steps: usize, step_ns: f64, traced: Duration) -> usize {
-    let affordable = (steps as f64 * step_ns * UNROLL_TRACE_SHARE / (traced.as_nanos() as f64).max(1.0)).min(UNROLL_STEPS as f64) as usize;
+/// is `single` and took `traced` to trace: none for a step that is bound by its launches, else as
+/// many as the tracing (one trace per step) costs less than [`UNROLL_TRACE_SHARE`] of what the
+/// loop would take step by step by the cost model, which is all that fusing the steps can save.
+fn unroll_depth(steps: usize, single: &Plan, traced: Duration) -> usize {
+    let (launching, moving) = single.modeled_ns();
+    if moving < UNROLL_BANDWIDTH_BOUND * launching {
+        return 0;
+    }
+    let affordable = (steps as f64 * (launching + moving) * UNROLL_TRACE_SHARE / (traced.as_nanos() as f64).max(1.0)).min(UNROLL_STEPS as f64) as usize;
     steps.min(affordable)
 }
 
@@ -229,7 +238,8 @@ fn trace_unrolled<T: ScalarType, const N: usize>(
         return Ok(None);
     }
     let unrolled = trace.finish_chain(&states.each_ref(), depth * single.launches())?;
-    Ok(unrolled.filter(|unrolled| unrolled.plan().modeled_ns() < UNROLL_GAIN * depth as f64 * single.modeled_ns()))
+    let total = |plan: &Plan| plan.modeled_ns().0 + plan.modeled_ns().1;
+    Ok(unrolled.filter(|unrolled| total(unrolled.plan()) < UNROLL_GAIN * depth as f64 * total(single)))
 }
 
 /// The share of the time of `depth` steps one by one that the unrolled body must take, at most.
