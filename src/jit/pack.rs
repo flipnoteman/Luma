@@ -241,7 +241,7 @@ fn leaf_buffers(op: Op, args: &[Src]) -> Vec<(Arc<Storage>, ElemTy, bool)> {
 fn leaf_buffers_from(mut work: Vec<(Src, ElemTy, bool)>) -> Vec<(Arc<Storage>, ElemTy, bool)> {
     let mut found: Vec<(Arc<Storage>, ElemTy, bool)> = Vec::new();
     let mut seen: FxMap<u64, ()> = FxMap::default();
-    let shifts = |op: Op, i: usize| i == 0 && matches!(op.kind, OpKind::Shift(_));
+    let shifts = |op: &Op, i: usize| i == 0 && matches!(op.kind, OpKind::Shift(_));
     while let Some((src, ty, shifted)) = work.pop() {
         let storage = match &src {
             Src::Scalar(_) => continue,

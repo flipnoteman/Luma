@@ -16,7 +16,7 @@
 use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Scalar, Src, UnOp};
 
 /// The operation and operands to create instead of `op` on `args`, if a rule applies.
-pub(super) fn rewrite(op: Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
+pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
     exact(op, args).or_else(|| if fast { self::fast(op, args) } else { None })
 }
 
@@ -63,10 +63,10 @@ fn same(a: &Src, b: &Src) -> bool {
 /// `wanted` accepts (the operands are only copied then, which takes the node's lock).
 fn inner(src: &Src, wanted: fn(Op) -> bool) -> Option<(Op, Args)> {
     let Src::Node(node) = src else { return None };
-    if !wanted(node.op()) || !node.is_pending() || is_looped(node) {
+    if !wanted(*node.op()) || !node.is_pending() || is_looped(node) {
         return None;
     }
-    node.operands().map(|args| (node.op(), args))
+    node.operands().map(|args| (*node.op(), args))
 }
 
 fn is_looped(node: &Node) -> bool {
@@ -78,12 +78,12 @@ fn args_of(a: Src, b: Src, c: Src) -> Args {
 }
 
 /// `Id(x)`: the operation yields its operand.
-fn identity(op: Op, x: &Src) -> Option<(Op, Args)> {
+fn identity(op: &Op, x: &Src) -> Option<(Op, Args)> {
     Some((Op::new(OpKind::Unary(UnOp::Id), op.out_ty()), args_of(x.clone(), Src::unused(), Src::unused())))
 }
 
 /// `Id` of the constant `value` of the operation's result type.
-fn constant(op: Op, value: f64) -> Option<(Op, Args)> {
+fn constant(op: &Op, value: f64) -> Option<(Op, Args)> {
     let ty = op.out_ty();
     let bits = const_bits(ty, value);
     Some((
@@ -101,7 +101,7 @@ fn binary(kind: BinOp, ty: ElemTy, x: &Src, y: Src) -> Option<(Op, Args)> {
 }
 
 /// The rewrites that keep every result bit.
-fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
+fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let [a, b, c] = args;
     let ty = op.ty;
     match op.kind {
@@ -180,7 +180,7 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
             if let Some(m) = scalar(a) {
                 identity(op, if m.bits & 0xffff_ffff != 0 { b } else { c })
             } else if let Some((_, iargs)) = inner(a, |inside| inside.ty == ElemTy::Bool && inside.kind == OpKind::Unary(UnOp::BitNot)) {
-                Some((op, args_of(iargs[0].clone(), c.clone(), b.clone())))
+                Some((*op, args_of(iargs[0].clone(), c.clone(), b.clone())))
             } else if same(b, c) {
                 identity(op, b)
             } else {
@@ -227,7 +227,7 @@ fn survives(ty: ElemTy, value: f64, nonzero: bool) -> bool {
 }
 
 /// The rewrites that may change rounding, the sign of zero or the handling of NaN and infinity.
-fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
+fn fast(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let [a, b, _] = args;
     let ty = op.ty;
     let float = is_float(ty);
@@ -282,7 +282,7 @@ fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
 
 /// `(x * a) * b`, `(x + a) + b`, `(x - a) + b` and `(x + a) - b` with constants `a` and `b`
 /// become one operation with a combined constant.
-fn reassociate(op: Op, args: &Args) -> Option<(Op, Args)> {
+fn reassociate(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let ty = op.ty;
     if !matches!(ty, ElemTy::F32 | ElemTy::F64) {
         return None;
@@ -522,10 +522,10 @@ mod tests {
             [Src::Scalar(Scalar::u32(m)), node(a), node(b)]
         };
         let op = Op::new(OpKind::Select, ElemTy::F32);
-        let (taken, operands) = rewrite(op, &args(1, &f, &g), false).unwrap();
+        let (taken, operands) = rewrite(&op, &args(1, &f, &g), false).unwrap();
         assert_eq!(taken.kind, OpKind::Unary(UnOp::Id));
         assert!(same(&operands[0], &args(1, &f, &g)[1]));
-        let (_, operands) = rewrite(op, &args(0, &f, &g), false).unwrap();
+        let (_, operands) = rewrite(&op, &args(0, &f, &g), false).unwrap();
         assert!(same(&operands[0], &args(0, &f, &g)[2]));
     }
 
@@ -599,13 +599,13 @@ mod tests {
         let buffer = Src::Buffer(std::sync::Arc::clone(x.storage().ok().unwrap()));
         let op = Op::new(OpKind::Binary(BinOp::Div), ElemTy::F32);
         let args = [buffer, Src::Scalar(Scalar::f32(3.0)), Src::unused()];
-        assert!(rewrite(op, &args, false).is_none());
-        let (product, operands) = rewrite(op, &args, true).unwrap();
+        assert!(rewrite(&op, &args, false).is_none());
+        let (product, operands) = rewrite(&op, &args, true).unwrap();
         assert_eq!(product.kind, OpKind::Binary(BinOp::Mul));
         let Src::Scalar(factor) = operands[1] else { panic!("no constant") };
         assert_eq!(factor.bits, u64::from((1.0f32 / 3.0).to_bits()));
         let zero = [args[0].clone(), Src::Scalar(Scalar::f32(0.0)), Src::unused()];
-        assert!(rewrite(op, &zero, true).is_none());
+        assert!(rewrite(&op, &zero, true).is_none());
     }
 
     #[test]
@@ -616,9 +616,9 @@ mod tests {
         let div = Op::new(OpKind::Binary(BinOp::Div), ElemTy::F32);
         // Dividing by infinity or a subnormal whose reciprocal overflows `f32` must not fold.
         let by_inf = [buffer.clone(), Src::Scalar(Scalar::f32(f32::INFINITY)), Src::unused()];
-        assert!(rewrite(div, &by_inf, true).is_none());
+        assert!(rewrite(&div, &by_inf, true).is_none());
         let by_subnormal = [buffer, Src::Scalar(Scalar::f32(1e-40)), Src::unused()];
-        assert!(rewrite(div, &by_subnormal, true).is_none());
+        assert!(rewrite(&div, &by_subnormal, true).is_none());
         // A combined constant outside the range of `f32` must stay two operations (`fusion_limit(1)`
         // keeps the shader compiler's own fast-math from reassociating across the two steps).
         let near = |got: Vec<f32>, want: [f32; 2]| {

@@ -1187,7 +1187,7 @@ impl Plain {
             };
         }
         let at = u32::try_from(self.flat.instrs.len()).unwrap_or(u32::MAX);
-        self.flat.instrs.push(Instr { op, args: refs });
+        self.flat.instrs.push(Instr { op: *op, args: refs });
         self.seen.push(Arc::as_ptr(&node));
         if member {
             self.members.push(node);
@@ -1416,10 +1416,11 @@ fn flatten_unpacked(
         let jit = ctx.jit();
         // Arrays split over several buffers: the sub-programs cannot run in a kernel over them.
         let splits = roots.iter().any(|(root, _)| root.len() as u64 * root.op().out_ty().stride() > ctx.segment_bytes())
-            || fused.key.instrs.iter().chain(fused.key.subs.iter().flatten()).any(|instr| {
-                matches!(instr.op.kind, OpKind::Shift(_))
-                    && matches!(instr.args[0], Ref::Input(k) if fused.inputs.get(k as usize).is_some_and(|input| input.segments() > 1))
-            });
+            || fused.inputs.iter().any(|input| input.segments() > 1)
+                && fused.key.instrs.iter().chain(fused.key.subs.iter().flatten()).any(|instr| {
+                    matches!(instr.op.kind, OpKind::Shift(_))
+                        && matches!(instr.args[0], Ref::Input(k) if fused.inputs.get(k as usize).is_some_and(|input| input.segments() > 1))
+                });
         if splits {
             let sub_roots = fused.sub_roots.clone();
             drop(fused);
@@ -1520,7 +1521,7 @@ fn flatten_once(
             // over the buffers and scalars of this one.
             let signature = jit.and_then(|_| graph.signature(&root_at, tail));
             if let (Some(jit), Some(signature)) = (jit, &signature)
-                && let Some(fused) = jit.recipe(signature).and_then(|recipe| recipe.instantiate(&graph, tail))
+                && let Some(fused) = jit.recipe(signature, &graph).and_then(|recipe| recipe.instantiate(&graph, tail))
             {
                 #[cfg(any(test, debug_assertions))]
                 verify_recipe(&graph, &root_at, tail, &fused)?;
@@ -1606,7 +1607,7 @@ fn flatten_once(
     {
         // The recipe keeps the program every equal one shares (see `JitState::intern`).
         jit.intern(&mut fused.key);
-        if let Some(recipe) = Recipe::new(signature, &fused, recorded) {
+        if let Some(recipe) = Recipe::new(signature, &graph, &fused, recorded) {
             jit.keep_recipe(recipe);
         }
     }
@@ -1686,7 +1687,7 @@ impl Graph {
         for &at in &order {
             let item = &self.items[at as usize];
             let operands: f64 = item.kids.iter().filter(|&&kid| kid != NONE).map(|&kid| weight[kid as usize]).sum();
-            let own = (cost::op_weight(item.node.op(), &cost) + operands).min(item.node.weight());
+            let own = (cost::op_weight(*item.node.op(), &cost) + operands).min(item.node.weight());
             weight[at as usize] = own;
             if is_candidate[at as usize] && super::worth_storing_at(&item.node, own) {
                 stored.push(at);
@@ -1791,7 +1792,6 @@ impl ArgSig {
 
 #[derive(PartialEq)]
 struct ItemSig {
-    op: Op,
     len: usize,
     args: [ArgSig; 3],
 }
@@ -1832,13 +1832,13 @@ impl Graph {
                     (Src::Node(node), _) => ArgSig::Input(canon(node.evaluated()?)),
                 };
             }
-            let (op, len) = (item.node.op, item.node.len);
+            let (op, len) = (&item.node.op, item.node.len);
             op.hash(&mut hasher);
             hasher.write_usize(len);
             for arg in args {
                 hasher.write_u64(arg.code());
             }
-            items.push(ItemSig { op, len, args });
+            items.push(ItemSig { len, args });
         }
         root_at.hash(&mut hasher);
         tail.hash(&mut hasher);
@@ -1851,6 +1851,10 @@ impl Graph {
 /// shares), and where the buffers, scalars and nodes of the program come from in the graph (by
 /// item).
 pub(super) struct Recipe {
+    /// The operation of every item of the graph the recipe was made from: a graph has the
+    /// recipe's signature only if its items have these (the signature hashes them, and the hash
+    /// is not what decides).
+    ops: Vec<Op>,
     sig: Signature,
     instrs: Arc<Vec<Instr>>,
     subs: Arc<Vec<Vec<Instr>>>,
@@ -1868,10 +1872,11 @@ pub(super) struct Recipe {
 }
 
 impl Recipe {
-    fn new(sig: Signature, fused: &Fused, recorded: Recorded) -> Option<Recipe> {
+    fn new(sig: Signature, graph: &Graph, fused: &Fused, recorded: Recorded) -> Option<Recipe> {
         let Recorded { record, fused_items, instr_items, sub_root_items } = recorded;
         (record.inputs.len() == fused.inputs.len()).then(|| Recipe {
             sig,
+            ops: graph.items.iter().map(|item| item.node.op).collect(),
             instrs: Arc::clone(&fused.key.instrs),
             subs: Arc::clone(&fused.key.subs),
             input_tys: fused.key.input_tys.clone(),
@@ -1985,13 +1990,14 @@ impl std::fmt::Debug for RecipeTable {
 const RECIPE_ITEMS: usize = 60_000;
 
 impl JitState {
-    /// The recipe whose signature is `signature`, if one was kept.
-    fn recipe(&self, signature: &Signature) -> Option<Arc<Recipe>> {
+    /// The recipe whose signature is `signature`, if one was kept (`graph` is the graph the
+    /// signature is of).
+    fn recipe(&self, signature: &Signature, graph: &Graph) -> Option<Arc<Recipe>> {
         let found = lock(&self.recipes)
             .map
             .get(&signature.hash)?
             .iter()
-            .find(|recipe| recipe.sig == *signature)
+            .find(|recipe| recipe.sig == *signature && recipe.ops.iter().zip(&graph.items).all(|(op, item)| *op == item.node.op))
             .cloned();
         #[cfg(test)]
         if found.is_some() {
