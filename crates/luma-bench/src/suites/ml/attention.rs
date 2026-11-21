@@ -12,14 +12,14 @@ use luma::*;
 /// `softmax(Q K^T * scale (+ causal mask)) V` for `q, k, v` of shape `[d, T]`.
 fn attention(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, scale: f32, causal: bool) -> Array<f32> {
     let s = &matmul(q, &k.transpose()) * scale;
-    let s = if causal { select(&s.index(0).gt(&s.index(1)), f32::NEG_INFINITY, &s) } else { s };
+    let s = if causal { select(&s.index(0).gt(s.index(1)), f32::NEG_INFINITY, &s) } else { s };
     let e = (&s - &s.max_axis(0)).exp();
     let p = &e / &e.sum_axis(0);
     matmul(&p, v)
 }
 
-/// Host attention output rows `rows` (queries), for row-major `T x d` `q, k, v`.
-fn host_attention(q: &[f32], k: &[f32], v: &[f32], t: usize, d: usize, scale: f64, causal: bool, rows: &[usize]) -> Vec<f64> {
+/// Host attention output rows `rows` (queries), for row-major `T x d` `[q, k, v]`.
+fn host_attention([q, k, v]: [&[f32]; 3], t: usize, d: usize, scale: f64, causal: bool, rows: &[usize]) -> Vec<f64> {
     let mut out = Vec::with_capacity(rows.len() * d);
     for &r in rows {
         let keys = if causal { r + 1 } else { t };
@@ -47,7 +47,7 @@ fn single(h: &mut Harness, t: usize, d: usize, causal: bool) {
         let (q, k, v) = (arr(h, &qs, [d, t]), arr(h, &ks, [d, t]), arr(h, &vs, [d, t]));
         let scale = 1.0 / (d as f32).sqrt();
         let rows = sample(t, 8);
-        let want = host_attention(&qs, &ks, &vs, t, d, f64::from(scale), causal, &rows);
+        let want = host_attention([&qs, &ks, &vs], t, d, f64::from(scale), causal, &rows);
         let run = || attention(&q, &k, &v, scale, causal);
         check64(case, &gather_rows(&run().to_vec().unwrap(), d, &rows), &want, 2e-3, 2e-3);
         h.case(case, &size, Work::Flops(flops), &mut || run().eval().unwrap());
@@ -73,7 +73,7 @@ fn heads(h: &mut Harness, heads: usize, t: usize, d: usize) {
         let rows = sample(t, 4);
         for i in [0, heads - 1] {
             let (a, b, c) = (&qs[i * per..][..per], &ks[i * per..][..per], &vs[i * per..][..per]);
-            let want = host_attention(a, b, c, t, d, f64::from(scale), false, &rows);
+            let want = host_attention([a, b, c], t, d, f64::from(scale), false, &rows);
             check64(case, &gather_rows(&outs[i].to_vec().unwrap(), d, &rows), &want, 2e-3, 2e-3);
         }
         h.case(case, &size, Work::Flops(flops), &mut || {
@@ -117,7 +117,7 @@ fn block(h: &mut Harness, t: usize, dm: usize, nheads: usize) {
         let mut cat = vec![0.0f32; t * dm];
         for i in 0..nheads {
             let head = |m: &[f32]| -> Vec<f32> { (0..t).flat_map(|r| m[r * dm + i * dh..][..dh].iter().copied()).collect() };
-            let o = host_attention(&head(&q), &head(&k), &head(&v), t, dh, f64::from(scale), true, &all);
+            let o = host_attention([&head(&q), &head(&k), &head(&v)], t, dh, f64::from(scale), true, &all);
             for r in 0..t {
                 for c in 0..dh {
                     cat[r * dm + i * dh + c] = o[r * dh + c] as f32;

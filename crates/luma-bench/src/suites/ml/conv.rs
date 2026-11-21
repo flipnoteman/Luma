@@ -30,7 +30,7 @@ fn direct(h: &mut Harness, ksize: usize, stride: usize) {
         let got = run().to_vec().unwrap();
         assert_eq!(got.len(), out_len, "{case}: output length");
         for i in sample(out_len, 64) {
-            let want: f64 = (0..ksize).filter_map(|j| (i * stride + j >= pad && i * stride + j - pad < len).then(|| f64::from(xs[i * stride + j - pad]) * f64::from(ks[j]))).sum();
+            let want: f64 = (0..ksize).filter(|&j| i * stride + j >= pad && i * stride + j - pad < len).map(|j| f64::from(xs[i * stride + j - pad]) * f64::from(ks[j])).sum();
             check_scalar_abs(case, f64::from(got[i]), want, 1e-4);
         }
         h.case(case, &size, Work::Flops(flops), &mut || run().eval().unwrap());
@@ -51,7 +51,7 @@ fn fft(h: &mut Harness, ksize: usize) {
         let got = run().to_vec().unwrap();
         assert_eq!(got.len(), len + ksize - 1, "{case}: output length");
         for i in sample(got.len(), 64) {
-            let want: f64 = (0..ksize).filter_map(|j| (i >= j && i - j < len).then(|| f64::from(xs[i - j]) * f64::from(ks[j]))).sum();
+            let want: f64 = (0..ksize).filter(|&j| i >= j && i - j < len).map(|j| f64::from(xs[i - j]) * f64::from(ks[j])).sum();
             check_scalar_abs(case, f64::from(got[i]), want, 2e-3);
         }
         h.case(case, &size, Work::Items(len as f64, "Msample/s"), &mut || run().eval().unwrap());

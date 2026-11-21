@@ -100,10 +100,10 @@ impl Net {
         let dl = (&(&e / &s) - &y) * inv;
         let dw3 = matmul(&h2.transpose(), &dl);
         let db3 = dl.sum_axis(1);
-        let dz2 = select(&z2.gt(0.0), &matmul(&dl, &p[4].transpose()), 0.0f32);
+        let dz2 = select(&z2.gt(0.0), matmul(&dl, &p[4].transpose()), 0.0f32);
         let dw2 = matmul(&h1.transpose(), &dz2);
         let db2 = dz2.sum_axis(1);
-        let dz1 = select(&z1.gt(0.0), &matmul(&dz2, &p[2].transpose()), 0.0f32);
+        let dz1 = select(&z1.gt(0.0), matmul(&dz2, &p[2].transpose()), 0.0f32);
         let dw1 = matmul(&self.x.transpose(), &dz1);
         let db1 = dz1.sum_axis(1);
         (loss, vec![dw1, db1, dw2, db2, dw3, db3])
