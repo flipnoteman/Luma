@@ -566,10 +566,12 @@ fn plan_shifts(
     if mixed && (len as u64 * widest > ctx.segment_bytes() || inputs.iter().any(|input| input.segments() > 1)) {
         return Err(LumaError::Chunked("mixed element sizes on arrays split over several buffers"));
     }
-    let split = key.instrs.iter().chain(key.subs.iter().flatten()).any(|instr| {
-        matches!(instr.op.kind, OpKind::Shift(_))
-            && matches!(instr.args[0], Ref::Input(k) if input_at(key, inputs, k as usize).is_some_and(|input| input.segments() > 1))
-    });
+    // Only an input in several segments splits a program (checked first: the scan reads every instruction).
+    let split = inputs.iter().any(|input| input.segments() > 1)
+        && key.instrs.iter().chain(key.subs.iter().flatten()).any(|instr| {
+            matches!(instr.op.kind, OpKind::Shift(_))
+                && matches!(instr.args[0], Ref::Input(k) if input_at(key, inputs, k as usize).is_some_and(|input| input.segments() > 1))
+        });
     if len <= c && !split {
         return Ok(None);
     }

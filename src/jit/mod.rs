@@ -584,7 +584,7 @@ impl ViewMap {
 }
 
 impl OpKind {
-    pub(crate) fn arity(self) -> usize {
+    pub(crate) fn arity(&self) -> usize {
         match self {
             OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
             OpKind::Shift(ShiftKind::ParamView { spec, .. }) if spec.edge != Edge::Fill => 1,
@@ -601,12 +601,14 @@ impl OpKind {
 
 /// An operation together with the element type of its operands.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub(crate) struct Op {
-    pub(crate) kind: OpKind,
-    pub(crate) ty: ElemTy,
     /// A hash of `kind` and `ty`, made once: operations are hashed for every node, program
-    /// and kernel lookup, and a view makes a long list of words to hash.
+    /// and kernel lookup, and a view makes a long list of words to hash. (First, with the
+    /// type, so that comparing and hashing operations reads one cache line.)
     fingerprint: u64,
+    pub(crate) ty: ElemTy,
+    pub(crate) kind: OpKind,
 }
 
 impl PartialEq for Op {
@@ -633,7 +635,7 @@ impl Op {
         Op { kind, ty, fingerprint: hasher.finish() }
     }
 
-    pub(crate) fn out_ty(self) -> ElemTy {
+    pub(crate) fn out_ty(&self) -> ElemTy {
         match self.kind {
             OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::Bool,
             OpKind::Cast(to) => to,
@@ -642,8 +644,8 @@ impl Op {
     }
 
     /// The element type operand `index` must have.
-    pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
-        match (self.kind, index) {
+    pub(crate) fn operand_ty(&self, index: usize) -> ElemTy {
+        match (&self.kind, index) {
             (OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. }), 1) => self.ty,
             (OpKind::Select, 0) => ElemTy::Bool,
             (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
@@ -734,20 +736,27 @@ static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_JIT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// One pending elementwise operation.
+///
+/// The fields the walks over an expression read (flattening, `create`, the sharing checks) come
+/// first, so that a node costs few cache lines to visit; the big operation and what only
+/// evaluating needs come after them.
+#[repr(C)]
 pub(crate) struct Node {
-    ctx: Context,
-    op: Op,
-    /// Number of elements of the result (and of every array operand).
-    len: usize,
-    /// The operands. Taken (and so released) when the node is evaluated.
-    args: Mutex<Option<Args>>,
     /// Set once the node was evaluated: its buffer, or why that failed.
     result: OnceLock<NodeResult>,
-    /// What failures of this node are reported as.
-    name: &'static str,
-    location: &'static Location<'static>,
+    /// Set when the node was found to be a state of a repeating step (see [`looped`]): its value
+    /// is output `j` of the plan, which runs all the steps at once, and the node released its
+    /// own operands.
+    looped: OnceLock<(Arc<LoopPlan>, u32)>,
     /// Unique per node.
     id: u64,
+    /// Number of elements of the result (and of every array operand).
+    len: usize,
+    below_len: usize,
+    /// The id that bit 0 of the first word stands for (a multiple of 64).
+    below_base: u64,
+    /// The operations of the expression in f32-operation units (see [`Node::weight`]).
+    weight: f64,
     /// The ids of the distinct nodes in the expression below this one (`below_len` of them) as a
     /// bit set over `below_base..` (`below_words` words), or sorted `(word, bits)` pairs (bit
     /// `id & 63` of the entry for word `id >> 6`) if they are spread too widely for that
@@ -756,44 +765,42 @@ pub(crate) struct Node {
     /// (`create` counts the buffers exactly by walking the expression whenever the bound is over
     /// the device's limit). One allocation for both.
     ids: Box<[u64]>,
-    below_len: usize,
-    /// The id that bit 0 of the first word stands for (a multiple of 64).
-    below_base: u64,
     below_words: u32,
-    below_sparse: bool,
     /// Number of nodes this one is an operand of (a pre-filter for sharing checks).
     consumers: AtomicU32,
-    /// Set once the node's value was computed inside another node's kernel (or a reduction).
-    /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
-    fused: AtomicBool,
-    /// Levels of shifted lazy expressions nested in the expression (0: none; see
-    /// [`recompute_shifted`]).
-    shift_depth: u8,
-    /// Levels of the expression below this node: 1 + the greatest of its operands' (0 for none),
-    /// shifted operands included. Bounded by [`MAX_DEPTH`].
-    depth: u16,
-    /// The operations of the expression in f32-operation units (see [`Node::weight`]).
-    weight: f64,
-    /// How many shifts, views and gathers read this node lazily, as a sub-program (see
-    /// [`recompute_shifted`]).
-    shifted_reads: AtomicU32,
     /// How many array handles ([`Held`]) are on this node. A held node is never handed out again
     /// by the hash-consing table: a write through one array must not show in another.
     handles: AtomicU32,
-    /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
-    readers: Readers,
+    /// How many shifts, views and gathers read this node lazily, as a sub-program (see
+    /// [`recompute_shifted`]).
+    shifted_reads: AtomicU32,
+    /// Levels of the expression below this node: 1 + the greatest of its operands' (0 for none),
+    /// shifted operands included. Bounded by [`MAX_DEPTH`].
+    depth: u16,
+    /// Levels of shifted lazy expressions nested in the expression (0: none; see
+    /// [`recompute_shifted`]).
+    shift_depth: u8,
+    below_sparse: bool,
+    /// Set once the node's value was computed inside another node's kernel (or a reduction).
+    /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
+    fused: AtomicBool,
     /// Whether the node is in [`JitState::requested`].
     requested: AtomicBool,
     /// Set once a walk found no reduction that is not recorded (and no loop output) below this node: that stays so, as
     /// evaluating only removes them (see [`multireduce::unresolved_leaves`]).
     leaf_free: AtomicBool,
-    /// Set when the node was found to be a state of a repeating step (see [`looped`]): its value
-    /// is output `j` of the plan, which runs all the steps at once, and the node released its
-    /// own operands.
-    looped: OnceLock<(Arc<LoopPlan>, u32)>,
+    /// The operands. Taken (and so released) when the node is evaluated.
+    args: Mutex<Option<Args>>,
+    op: Op,
+    /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
+    readers: Readers,
+    ctx: Context,
     /// Set when the node stands for a reduction that is recorded when the node is evaluated (see
     /// [`deferred`]).
     deferred: OnceLock<Arc<crate::reduce::Reduced>>,
+    /// What failures of this node are reported as.
+    name: &'static str,
+    location: &'static Location<'static>,
     /// The thread that created the node. The sweeps that evaluate "every lazy array" (`eval`,
     /// `flush`, `sync`, evaluating alongside) only take the nodes of the calling thread: another
     /// thread may be flattening the expression this very moment, or have a recording under way
@@ -1169,8 +1176,8 @@ impl Node {
         self.len
     }
 
-    pub(crate) fn op(&self) -> Op {
-        self.op
+    pub(crate) fn op(&self) -> &Op {
+        &self.op
     }
 
     pub(crate) fn context(&self) -> &Context {
@@ -1747,7 +1754,7 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 /// only the operations of its library, and neither has generators; the bitwise operations only
 /// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
 /// no float math. `bool` has no generators (their values would not be 0 or 1).
-fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(), LumaError> {
+fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<(), LumaError> {
     let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32);
     let exists = match op.kind {
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
@@ -1809,7 +1816,7 @@ pub(crate) fn create(
     if jit.simplify_enabled() {
         let mut rounds = 0;
         while rounds < 4
-            && let Some((rewritten, operands)) = simplify::rewrite(op, &args, ctx.fast_math())
+            && let Some((rewritten, operands)) = simplify::rewrite(&op, &args, ctx.fast_math())
         {
             op = rewritten;
             args = operands;
@@ -1820,7 +1827,7 @@ pub(crate) fn create(
             convert_evaluated(&mut args, arity)?;
         }
     }
-    check_supported(ctx, op, name).map_err(Failure::New)?;
+    check_supported(ctx, &op, name).map_err(Failure::New)?;
     // A shift reads its source at other elements than the one it computes, which a window cannot
     // (see `pack`): the source gets the buffer of its own.
     if matches!(op.kind, OpKind::Shift(_))
@@ -1830,9 +1837,9 @@ pub(crate) fn create(
     }
 
     // Equal operations on identical operands are one node (see `ConsTable`).
-    let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));
+    let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(&op, len, &args));
     if let Some(hash) = cons_key
-        && let Some(found) = jit.cons_lookup(hash, op, len, &args)
+        && let Some(found) = jit.cons_lookup(hash, &op, len, &args)
     {
         rerun::reused(&found);
         return Ok(found);
@@ -1840,6 +1847,123 @@ pub(crate) fn create(
 
     let max_nodes = FUSION_LIMIT.with(std::cell::Cell::get).unwrap_or_else(|| jit.max_nodes()).clamp(1, MAX_NODES_LIMIT);
     let max_inputs = jit.max_inputs();
+    // Most operations are within every limit: the cutting is in `settle`, which keeps this
+    // function short (it runs for every operation).
+    let first = measure(args.get(..arity).unwrap_or(&[]));
+    let within = first.below < max_nodes
+        && first.inputs <= max_inputs
+        && !args.iter().take(arity).any(|arg| matches!(arg, Src::Node(node) if node.depth() >= MAX_DEPTH));
+    let (measured, cut, exact_depth) = if within {
+        (first, false, None)
+    } else {
+        drop(first);
+        settle(ctx, &op, &mut args, arity, name, location, max_nodes, max_inputs)?
+    };
+    if cut {
+        // Without this, a long chain built without `eval` keeps the GPU idle until its end.
+        let _ = ctx.submit();
+    }
+    // What the operands add up to: the levels of shifts and of nesting, and an upper bound of the
+    // work of the expression (operands that are shared count once per use).
+    let is_shift = matches!(op.kind, OpKind::Shift(_));
+    let (mut shift_depth, mut deepest, mut operand_weight) = (0u8, None::<u16>, 0.0);
+    for (i, arg) in args.iter().take(arity).enumerate() {
+        if let Src::Node(operand) = arg {
+            shift_depth = shift_depth.max(operand.shift_depth().saturating_add(u8::from(i == 0 && is_shift)));
+            deepest = deepest.max(Some(operand.depth()));
+            operand_weight += operand.weight();
+        }
+    }
+    // Operands that share nodes count them once per use (`operand_weight` unfolds the expression into
+    // a tree, which doubles with every level of a flux that two readers read, say): no operation
+    // weighs more than `MAX_AVERAGE_WEIGHT` on average, so that is what an expression of that many
+    // distinct nodes is bounded by.
+    let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight).min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
+    let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
+
+    let trace = rerun::created(&op, len, &args, arity);
+    // Built where it lives: the node is bigger than what a move of it copies cheaply.
+    let node = {
+        let ptr = Arc::into_raw(Arc::<Node>::new_uninit()).cast::<Node>().cast_mut();
+        // SAFETY: `ptr` is the one reference of a fresh allocation of a `Node`, which is written
+        // whole before the `Arc` is made again.
+        unsafe {
+            ptr.write(Node {
+                trace,
+                thread: current_thread(),
+                ctx: ctx.clone(),
+                op,
+                len,
+                args: Mutex::new(Some(args.clone())),
+                result: OnceLock::new(),
+                name,
+                location,
+                id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
+                ids: measured.ids,
+                below_len: measured.below,
+                below_base: measured.base,
+                below_words: measured.words,
+                below_sparse: measured.sparse,
+                consumers: AtomicU32::new(0),
+                fused: AtomicBool::new(false),
+                shift_depth,
+                depth,
+                weight,
+                shifted_reads: AtomicU32::new(0),
+                readers: Readers::default(),
+                requested: AtomicBool::new(false),
+                leaf_free: AtomicBool::new(false),
+                looped: OnceLock::new(),
+                deferred: OnceLock::new(),
+                handles: AtomicU32::new(0),
+            });
+            Arc::from_raw(ptr)
+        }
+    };
+
+    let weak = Arc::downgrade(&node);
+    for (i, arg) in args.iter().enumerate().take(arity) {
+        let repeated = |other: &Src| match (arg, other) {
+            (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
+            (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if args.iter().take(i).any(repeated) {
+            continue;
+        }
+        match arg {
+            Src::Buffer(storage) => storage.readers.add_weak(weak.clone()),
+            Src::Node(operand) => {
+                operand.consumers.fetch_add(1, Ordering::Relaxed);
+                operand.readers.add_weak(weak.clone());
+            }
+            Src::Scalar(_) => {}
+        }
+    }
+    jit.with_live(|live| live.add_weak(weak.clone()));
+    if let Some(hash) = cons_key {
+        jit.cons_insert(if cut { cons_hash(&op, len, &args) } else { hash }, weak);
+    }
+    Ok(node)
+}
+
+/// What [`create`] does about an operation whose operands make it too big, too deep or too wide
+/// to be one kernel: measures it and evaluates operands until it fits. Returns what it measured,
+/// whether it evaluated anything, and the depth counted exactly, if it had to be.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn settle(
+    ctx: &Context,
+    op: &Op,
+    args: &mut Args,
+    arity: usize,
+    name: &'static str,
+    location: &'static Location<'static>,
+    max_nodes: usize,
+    max_inputs: usize,
+) -> std::result::Result<(Measure, bool, Option<Option<u16>>), Failure> {
+    let jit = ctx.jit();
     // The first time the expression is over a limit, its biggest operand is evaluated together
     // with the live arrays that share pending work with it (see the module documentation)
     // instead of alone.
@@ -1848,7 +1972,7 @@ pub(crate) fn create(
     let mut cut = false;
     let mut noted = false;
     let mut exact_depth: Option<Option<u16>>;
-    let measured = loop {
+    loop {
         let mut measured = measure(args.get(..arity).unwrap_or(&[]));
         let (mut below, mut inputs) = (measured.below, measured.inputs);
         if below >= max_nodes {
@@ -1873,7 +1997,7 @@ pub(crate) fn create(
             // takes one binding (see `pack`); only if that cannot be done is the expression cut.
             if inputs > max_inputs && !packed {
                 packed = true;
-                if pack::repack(ctx, op, args.get(..arity).unwrap_or(&[]), inputs - max_inputs) {
+                if pack::repack(ctx, *op, args.get(..arity).unwrap_or(&[]), inputs - max_inputs) {
                     continue;
                 }
             }
@@ -1892,7 +2016,7 @@ pub(crate) fn create(
         let deep = deepest_operand.unwrap_or(0) >= MAX_DEPTH;
         let too_big = below >= max_nodes || inputs > max_inputs;
         if !too_big && !deep {
-            break measured;
+            return Ok((measured, cut, exact_depth));
         }
         if !noted {
             noted = true;
@@ -1922,7 +2046,7 @@ pub(crate) fn create(
                 if let Some(Src::Node(seed)) = args.get(i) {
                     jit.evaluate_alongside(Arc::clone(seed));
                 }
-                evaluate_operand(&mut args, i)?;
+                evaluate_operand(&mut *args, i)?;
             }
             continue;
         }
@@ -1942,7 +2066,7 @@ pub(crate) fn create(
                 jit.evaluate_alongside(seed);
                 for i in 0..arity {
                     if matches!(args.get(i), Some(Src::Node(node)) if node.result.get().is_some()) {
-                        evaluate_operand(&mut args, i)?;
+                        evaluate_operand(&mut *args, i)?;
                     }
                 }
                 continue;
@@ -1960,89 +2084,12 @@ pub(crate) fn create(
         match biggest {
             Some((i, _)) => {
                 cut = true;
-                evaluate_operand(&mut args, i)?;
+                evaluate_operand(&mut *args, i)?;
             }
             // Only buffers and scalars left: at most three operands, within any sane limit.
-            None => break measured,
-        }
-    };
-    if cut {
-        // Without this, a long chain built without `eval` keeps the GPU idle until its end.
-        let _ = ctx.submit();
-    }
-    // What the operands add up to: the levels of shifts and of nesting, and an upper bound of the
-    // work of the expression (operands that are shared count once per use).
-    let is_shift = matches!(op.kind, OpKind::Shift(_));
-    let (mut shift_depth, mut deepest, mut operand_weight) = (0u8, None::<u16>, 0.0);
-    for (i, arg) in args.iter().take(arity).enumerate() {
-        if let Src::Node(operand) = arg {
-            shift_depth = shift_depth.max(operand.shift_depth().saturating_add(u8::from(i == 0 && is_shift)));
-            deepest = deepest.max(Some(operand.depth()));
-            operand_weight += operand.weight();
+            None => return Ok((measured, cut, exact_depth)),
         }
     }
-    // Operands that share nodes count them once per use (`operand_weight` unfolds the expression into
-    // a tree, which doubles with every level of a flux that two readers read, say): no operation
-    // weighs more than `MAX_AVERAGE_WEIGHT` on average, so that is what an expression of that many
-    // distinct nodes is bounded by.
-    let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight).min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
-    let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
-
-    let trace = rerun::created(op, len, &args, arity);
-    let node = Arc::new(Node {
-        trace,
-        thread: current_thread(),
-        ctx: ctx.clone(),
-        op,
-        len,
-        args: Mutex::new(Some(args.clone())),
-        result: OnceLock::new(),
-        name,
-        location,
-        id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
-        ids: measured.ids,
-        below_len: measured.below,
-        below_base: measured.base,
-        below_words: measured.words,
-        below_sparse: measured.sparse,
-        consumers: AtomicU32::new(0),
-        fused: AtomicBool::new(false),
-        shift_depth,
-        depth,
-        weight,
-        shifted_reads: AtomicU32::new(0),
-        readers: Readers::default(),
-        requested: AtomicBool::new(false),
-        leaf_free: AtomicBool::new(false),
-        looped: OnceLock::new(),
-        deferred: OnceLock::new(),
-        handles: AtomicU32::new(0),
-    });
-
-    let weak = Arc::downgrade(&node);
-    for (i, arg) in args.iter().enumerate().take(arity) {
-        let repeated = |other: &Src| match (arg, other) {
-            (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
-            (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        if args.iter().take(i).any(repeated) {
-            continue;
-        }
-        match arg {
-            Src::Buffer(storage) => storage.readers.add_weak(weak.clone()),
-            Src::Node(operand) => {
-                operand.consumers.fetch_add(1, Ordering::Relaxed);
-                operand.readers.add_weak(weak.clone());
-            }
-            Src::Scalar(_) => {}
-        }
-    }
-    jit.with_live(|live| live.add_weak(weak.clone()));
-    if let Some(hash) = cons_key {
-        jit.cons_insert(if cut { cons_hash(op, len, &args) } else { hash }, weak);
-    }
-    Ok(node)
 }
 
 /// A node of `len` elements of type `ty` that stands for the value of `reduced`: evaluating it
@@ -2117,7 +2164,7 @@ struct JudgementEntry {
 
 /// Hash of what makes two lazy operations the same value: the operation, the length and the
 /// operands (buffers and nodes by identity, scalars by value).
-fn cons_hash(op: Op, len: usize, args: &Args) -> u64 {
+fn cons_hash(op: &Op, len: usize, args: &Args) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = FxHasher::default();
     op.hash(&mut hasher);
@@ -2136,7 +2183,7 @@ fn cons_hash(op: Op, len: usize, args: &Args) -> u64 {
 }
 
 /// Whether `a` and `b` are the same operands of `op`: the same buffers and nodes, equal scalars.
-fn cons_same(op: Op, a: &Args, b: &Args) -> bool {
+fn cons_same(op: &Op, a: &Args, b: &Args) -> bool {
     a.iter().zip(b).take(op.kind.arity()).all(|pair| match pair {
         (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
         (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
@@ -2630,7 +2677,7 @@ impl JitState {
 
     /// The pending node that already computes the operation `op` on `args` (of `hash`, see
     /// [`cons_hash`]), if any.
-    fn cons_lookup(&self, hash: u64, op: Op, len: usize, args: &Args) -> Option<Arc<Node>> {
+    fn cons_lookup(&self, hash: u64, op: &Op, len: usize, args: &Args) -> Option<Arc<Node>> {
         let epoch = self.write_epoch.load(Ordering::Relaxed);
         // The upgraded node is checked outside the table: it may be the last owner of its node.
         let node = self.with_cons(|table| {
@@ -2651,9 +2698,9 @@ impl JitState {
             && !node.fused.load(Ordering::Relaxed)
             && match lock(&node.args).as_ref() {
                 // The table holds hashes only: a collision must not share a different value.
-                Some(theirs) => node.op == op && node.len == len && cons_same(op, theirs, args),
+                Some(theirs) => node.op == *op && node.len == len && cons_same(op, theirs, args),
                 // A loop leaf has handed its operands to the plan.
-                None => node.looped.get().is_some() && node.op == op && node.len == len,
+                None => node.looped.get().is_some() && node.op == *op && node.len == len,
             };
         usable.then_some(node)
     }

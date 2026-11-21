@@ -143,7 +143,7 @@ thread_local! {
 }
 
 /// Records that the thread created a node: the tag the node carries (0 outside a trace).
-pub(super) fn created(op: Op, len: usize, args: &Args, arity: usize) -> u64 {
+pub(super) fn created(op: &Op, len: usize, args: &Args, arity: usize) -> u64 {
     if !ACTIVE.with(Cell::get) {
         return 0;
     }
