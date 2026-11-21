@@ -10,9 +10,9 @@ array code (`Array`, `iterate`, custom kernels) compiles as it is.
 
 Mesa llvmpipe, SwiftShader and WARP are refused by the wgpu backend: it never requests a fallback adapter and
 refuses `DeviceKind::Cpu`. A CPU device (`LUMA_DEVICE=cpu`, `Context::cpu()`, or `Auto` without a GPU) is now the
-native `cpu` backend only, and it needs the `cpu` feature. If your program ran on a software Vulkan adapter
-before, it now runs on the native CPU backend (or returns an error when `LUMA_DEVICE=gpu` is set); build with the
-`cpu` feature to keep a CPU fallback ([Choosing a device](faq.md#choosing-a-device)).
+native `cpu` backend, which every build includes. If your program ran on a software Vulkan adapter before, it now
+runs on the native CPU backend (or returns an error when `LUMA_DEVICE=gpu` is set)
+([Choosing a device](faq.md#choosing-a-device)).
 
 ### `LumaError` carries strings, not wgpu types
 
@@ -25,8 +25,8 @@ are re-exported from `luma_core`.
 
 Luma is a workspace of six crates: `luma-hal-core` (the kernel IR and the backend interface), `luma-hal-wgpu`,
 `luma-hal-metal`, `luma-hal-cuda` and `luma-hal-cpu` (one backend each, with its own code generator), and the root `luma`
-crate. The features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend, and all are on by default. To
-build with one only:
+crate. The features `wgpu`, `metal` and `cuda` each enable one GPU backend, and all are on by default; the CPU
+backend is always built. To build with one GPU backend only:
 
 ```sh
 cargo build --no-default-features --features cuda

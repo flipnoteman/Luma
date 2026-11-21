@@ -30,7 +30,7 @@ match Context::cpu() {
 # Ok::<(), luma::LumaError>(())
 ```
 
-**Opening a context returns `LumaError::NoAdapter` ("Found no adapters").** With `LUMA_DEVICE=gpu` (or when built without the `cpu` feature), no hardware GPU driver (CUDA, Metal, Vulkan or DX12) was found. Install your GPU vendor's driver, or keep the default `cpu` feature enabled for the native SIMD CPU fallback.
+**Opening a context returns `LumaError::NoAdapter` ("Found no adapters").** With `LUMA_DEVICE=gpu`, no hardware GPU driver (CUDA, Metal, Vulkan or DX12) was found. Install your GPU vendor's driver, or leave `LUMA_DEVICE` unset: every build includes the native SIMD CPU backend and falls back to it.
 
 **I have two GPUs and want the other one.** Luma asks for the high-performance adapter and has no
 adapter-by-name setting. On Linux the Vulkan loader decides which drivers wgpu sees, so pointing

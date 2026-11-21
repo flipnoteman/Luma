@@ -53,18 +53,17 @@ libc = "0.2"
 libloading = "0.8"
 
 [features]
-default = ["wgpu", "metal", "cuda", "cpu"]
+default = ["wgpu", "metal", "cuda"]
 wgpu = ["dep:luma-wgpu"]
 metal = ["dep:luma-metal"]
 cuda = ["dep:luma-cuda"]
-cpu = ["dep:luma-cpu"]
 
 [dependencies]
 luma-core.workspace = true
 luma-wgpu = { workspace = true, optional = true }
 luma-metal = { workspace = true, optional = true }
 luma-cuda = { workspace = true, optional = true }
-luma-cpu = { workspace = true, optional = true }
+luma-cpu.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 encase.workspace = true

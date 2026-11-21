@@ -333,13 +333,12 @@ fn not_built(feature: &str) -> LumaError {
     LumaError::NoDevice(match feature {
         "cuda" => "luma was built without the `cuda` feature",
         "metal" => "luma was built without the `metal` feature",
-        "cpu" => "luma was built without the `cpu` feature",
         _ => "luma was built without the `wgpu` feature",
     })
 }
 
 /// Why a CPU device cannot be had from a GPU backend.
-const CPU_NEEDS_CPU_BACKEND: &str = "a CPU device needs the `cpu` backend (the `cpu` feature); GPU backends never run on software adapters";
+const CPU_NEEDS_CPU_BACKEND: &str = "a CPU device needs the `cpu` backend; GPU backends never run on software adapters";
 
 #[cfg(feature = "cuda")]
 fn open_cuda(device: DeviceKind) -> Result<Box<dyn Backend>> {
@@ -383,17 +382,11 @@ fn open_wgpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
     Err(not_built("wgpu"))
 }
 
-#[cfg(feature = "cpu")]
 fn open_cpu(device: DeviceKind) -> Result<Box<dyn Backend>> {
     if device == DeviceKind::Gpu {
         return Err(LumaError::NoDevice("the cpu backend only provides a software (CPU) device"));
     }
     Ok(luma_cpu::open()?)
-}
-
-#[cfg(not(feature = "cpu"))]
-fn open_cpu(_: DeviceKind) -> Result<Box<dyn Backend>> {
-    Err(not_built("cpu"))
 }
 
 /// Opens the backend `backend` names. `Auto` tries CUDA, then Metal, then wgpu for GPU devices

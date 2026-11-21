@@ -84,7 +84,7 @@ Add Luma to a project:
 luma = "0.5"
 ```
 
-The three GPU backends and the native CPU fallback (`cpu`) are enabled by default. To build with one GPU backend only (add `cpu` to keep the CPU fallback):
+The native CPU backend is always built, so Luma runs on any machine. The three GPU backends are enabled by default; to build with one GPU backend only:
 
 ```sh
 cargo build --no-default-features --features metal
@@ -103,7 +103,7 @@ cargo test
 
 ### Backends
 
-Luma is a Cargo workspace of six crates: `luma-hal-core` (library `luma_core`: the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-hal-wgpu`, `luma-hal-metal` and `luma-hal-cuda` (each holds one backend and its own code generator for WGSL, MSL or NVVM IR), `luma-hal-cpu` (the native SIMD backend, compiling the kernel IR with Cranelift), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal`, `cuda` and `cpu` each enable one backend crate.
+Luma is a Cargo workspace of six crates: `luma-hal-core` (library `luma_core`: the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-hal-wgpu`, `luma-hal-metal` and `luma-hal-cuda` (each holds one backend and its own code generator for WGSL, MSL or NVVM IR), `luma-hal-cpu` (the native SIMD backend, compiling the kernel IR with Cranelift), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal` and `cuda` each enable one GPU backend crate; the CPU backend is always included.
 
 With `BackendKind::Auto` (the default) a context opens the first backend that works, in the order CUDA, Metal, wgpu, and the native CPU backend when no GPU opens. Choose one with `ContextOptions::backend(BackendKind::..)`, with `Context::cuda()`, `Context::metal()`, `Context::wgpu()` or `Context::cpu()`, or with `LUMA_BACKEND`; `Context::backend()` tells which one a context uses, and `Context::device()` (a `DeviceSummary`) or `Context::device_name()` the device: its backend, name and whether it is the host CPU. The CUDA backend needs only the NVIDIA driver, loaded at run time (kernels are compiled to PTX by the driver's own NVVM library; no CUDA toolkit or NVRTC): without an NVIDIA driver the CUDA backend reports an error (and `Auto` moves on) instead of failing to start the program.
 
@@ -111,7 +111,7 @@ Custom WGSL kernels (`Context::kernel`) run on every backend: native backends tr
 
 ### No GPU
 
-Without a GPU, Luma runs on the native `cpu` backend (SIMD code on the host's threads; the `cpu` feature). It is picked automatically when no GPU opens. `LUMA_DEVICE=cpu` or `Context::cpu()` force it, and `LUMA_DEVICE=gpu` refuses it and returns an error instead. Software Vulkan adapters (Mesa llvmpipe, SwiftShader, WARP) are never used.
+Without a GPU, Luma runs on the native `cpu` backend (SIMD code on the host's threads), which every build includes. It is picked automatically when no GPU opens. `LUMA_DEVICE=cpu` or `Context::cpu()` force it, and `LUMA_DEVICE=gpu` refuses it and returns an error instead. Software Vulkan adapters (Mesa llvmpipe, SwiftShader, WARP) are never used.
 
 ### Large arrays
 
