@@ -94,6 +94,14 @@ pub fn split(a: &DevPieces, x: &Array<f32>) -> Array<f32> {
     (&a.val * x.take(&a.col)).sum_axis(0).group_sum(&a.row, a.rows)
 }
 
+/// The time of the gather and the product alone, reduced to one number: what any way of summing the
+/// products by row has to beat to be called faster than the memory system allows.
+fn floor(h: &mut Harness, name: &str, size: &str, a: &Dev, x: &Array<f32>) {
+    if h.want(name) {
+        case_trim(h, name, size, Work::Items(a.nnz as f64, "Mnnz/s"), &mut || (&a.val * x.take(&a.col)).sum().eval().unwrap());
+    }
+}
+
 /// Verifies `f()` against `want`, then times it.
 fn variant(h: &mut Harness, name: &str, size: &str, nnz: usize, want: &[f64], f: &dyn Fn() -> Array<f32>) {
     if !h.want(name) {
@@ -133,6 +141,7 @@ fn banded(h: &mut Harness, rows: usize) {
     variant(h, "spmv/banded_atomic", &size, a.nnz(), &want, &|| atomic(&dev, &x));
     variant(h, "spmv/banded_running", &size, a.nnz(), &want, &|| running(&dev, &x));
     variant(h, "spmv/banded_segments", &size, a.nnz(), &want, &|| segments(&dev, &x));
+    floor(h, "spmv/banded_floor", &size, &dev, &x);
     variant(h, "spmv/banded_ell", &size, a.nnz(), &want, &|| ell(&e, &x));
 }
 
@@ -148,6 +157,7 @@ fn uniform(h: &mut Harness, rows: usize) {
     variant(h, "spmv/uniform_atomic", &size, a.nnz(), &want, &|| atomic(&dev, &x));
     variant(h, "spmv/uniform_running", &size, a.nnz(), &want, &|| running(&dev, &x));
     variant(h, "spmv/uniform_segments", &size, a.nnz(), &want, &|| segments(&dev, &x));
+    floor(h, "spmv/uniform_floor", &size, &dev, &x);
     variant(h, "spmv/uniform_ell", &size, a.nnz(), &want, &|| ell(&e, &x));
 }
 
@@ -163,6 +173,7 @@ fn power_law(h: &mut Harness, rows: usize) {
     variant(h, "spmv/powerlaw_atomic", &size, a.nnz(), &want, &|| atomic(&dev, &x));
     variant(h, "spmv/powerlaw_running", &size, a.nnz(), &want, &|| running(&dev, &x));
     variant(h, "spmv/powerlaw_segments", &size, a.nnz(), &want, &|| segments(&dev, &x));
+    floor(h, "spmv/powerlaw_floor", &size, &dev, &x);
     let p = upload_pieces(h, &a, 16);
     variant(h, "spmv/powerlaw_split", &size, a.nnz(), &want, &|| split(&p, &x));
 }
