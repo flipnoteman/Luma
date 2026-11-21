@@ -15,12 +15,13 @@ use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel,
     CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads,
-    FusionSplit, GraphLaunch, LineSolveSpec, Profile, RawArg, RawKernel, TuningProfile,
+    FusionSplit, GraphLaunch, LineSolveSpec, MatmulSpec, Profile, RawArg, RawKernel, TuningProfile,
 };
 
 use crate::codegen::CompiledCpuKernel;
 use crate::exec::{AlignedBuf, ExecBlob, WorkgroupPool};
 use crate::fission;
+use crate::gemm::NativeMatmul;
 use crate::solve::NativeLineSolve;
 
 /// Most idle bytes of recycled mappable storage kept for reuse.
@@ -200,16 +201,20 @@ impl ExecGraph for CpuExecGraph {}
 enum CpuKernel<'a> {
     Compiled(&'a CompiledCpuKernel),
     LineSolve(&'a NativeLineSolve),
+    Matmul(&'a NativeMatmul),
 }
 
 fn native(kernel: &CompiledKernel) -> Result<CpuKernel<'_>, BackendError> {
     if let Some(compiled) = kernel.raw.downcast_ref::<CompiledCpuKernel>() {
         return Ok(CpuKernel::Compiled(compiled));
     }
+    if let Some(solve) = kernel.raw.downcast_ref::<NativeLineSolve>() {
+        return Ok(CpuKernel::LineSolve(solve));
+    }
     kernel
         .raw
-        .downcast_ref::<NativeLineSolve>()
-        .map(CpuKernel::LineSolve)
+        .downcast_ref::<NativeMatmul>()
+        .map(CpuKernel::Matmul)
         .ok_or_else(|| BackendError::Unsupported("the kernel belongs to another backend".into()))
 }
 
@@ -286,6 +291,27 @@ impl CpuBackend {
         }
         let compiled = match native {
             CpuKernel::Compiled(compiled) => compiled,
+            CpuKernel::Matmul(product) => {
+                let uniform = bindings.last().ok_or_else(|| invalid("a matrix product without its uniform"))?;
+                // SAFETY: the uniform's storage is 16-byte aligned and at least 16 bytes.
+                let words = unsafe { uniform.cast::<[u32; 4]>().read() };
+                product.validate(&binding_bytes, words, workgroups)?;
+                let start = Instant::now();
+                self.pool.dispatch_native(
+                    product.func,
+                    std::ptr::from_ref(product).cast(),
+                    size,
+                    workgroups,
+                    &bindings,
+                    &binding_bytes,
+                    &[],
+                    0,
+                    0,
+                    false,
+                );
+                drop(store);
+                return Ok(start.elapsed());
+            }
             CpuKernel::LineSolve(solve) => {
                 let uniform = bindings.last().ok_or_else(|| invalid("a line solve without its uniform"))?;
                 // SAFETY: the uniform's storage is 16-byte aligned and at least 16 bytes.
@@ -652,6 +678,14 @@ impl Backend for CpuBackend {
 
     fn native_line_solve(&self) -> bool {
         true
+    }
+
+    fn native_matmul(&self) -> Option<u32> {
+        Some(u32::try_from(self.pool.threads()).unwrap_or(u32::MAX))
+    }
+
+    fn compile_matmul(&self, spec: &MatmulSpec) -> Option<RawKernel> {
+        NativeMatmul::new(spec).map(RawKernel::new)
     }
 
     fn compile_line_solve(&self, spec: &LineSolveSpec) -> Option<RawKernel> {

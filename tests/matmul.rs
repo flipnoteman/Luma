@@ -59,8 +59,19 @@ impl Case {
     }
 }
 
-const SHAPES: [(usize, usize, usize); 7] =
-    [(16, 128, 128), (1000, 1000, 1000), (64, 1 << 16, 64), (7, 5, 3), (1, 1, 1), (1 << 16, 64, 64), (5000, 33, 70)];
+const SHAPES: [(usize, usize, usize); 10] = [
+    (16, 128, 128),
+    (1000, 1000, 1000),
+    (64, 1 << 16, 64),
+    (7, 5, 3),
+    (1, 1, 1),
+    (1 << 16, 64, 64),
+    (5000, 33, 70),
+    // Edges that are not whole tiles of a native product, without and with a K split of a slice that is not a multiple of 16.
+    (300, 200, 150),
+    (4099, 100, 100),
+    (3000, 1, 1),
+];
 
 #[test]
 fn matches_the_host_product_for_every_kernel_shape() {
@@ -191,14 +202,16 @@ fn a_lazy_operand_is_not_evaluated_separately() {
     a.eval().unwrap();
     b.eval().unwrap();
     ctx.flush().unwrap();
+    // A backend with native products (the CPU one) computes lazy operands first, together.
+    let native = ctx.backend() == luma::BackendKind::Cpu && std::env::var("LUMA_NATIVE_GEMM").as_deref().map(str::trim) != Ok("off");
     let lazy = &a * 2.0;
     let (c, profile) = ctx.profile(|| lazy.matmul(&b)).unwrap();
-    assert_eq!(profile.launches(), 1, "{profile}");
+    assert_eq!(profile.launches(), if native { 2 } else { 1 }, "{profile}");
     c.check().unwrap();
-    // Both operands lazy: still one launch.
+    // Both operands lazy: one launch for the two of them, the product being a second one if native.
     let (lazy_a, lazy_b) = (&a * 2.0, &b + 1.0);
     let (c, profile) = ctx.profile(|| lazy_a.matmul(&lazy_b)).unwrap();
-    assert_eq!(profile.launches(), 1, "{profile}");
+    assert_eq!(profile.launches(), if native { 2 } else { 1 }, "{profile}");
     c.check().unwrap();
 }
 

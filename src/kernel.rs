@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use luma_core::kir::{self, KernelModule};
 use luma_core::naga;
-use luma_core::{BackendError, CompiledKernel, LineSolveSpec};
+use luma_core::{BackendError, CompiledKernel, LineSolveSpec, MatmulSpec};
 pub use luma_core::{BindingInfo, BindingKind};
 
 use crate::array::{Array, Failure};
@@ -105,15 +105,24 @@ pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>, tr
     build_core_native(ctx, key, label, trusted, None)
 }
 
-/// [`build_core`] where the backend may run `native` (a line solve the shader describes, see
-/// [`LineSolveSpec`]) as native code instead of compiling the shader, which is still parsed for
-/// the bindings.
+/// What a backend may run as native code instead of compiling the shader that describes it (the
+/// shader is still parsed for the bindings).
+#[derive(Clone, Copy)]
+pub(crate) enum Native {
+    /// A line solve, see [`LineSolveSpec`]; the shader is the fallback.
+    LineSolve(LineSolveSpec),
+    /// A matrix product, see [`MatmulSpec`]; its shader is not the product of the tile the spec
+    /// names, so the backend has to compile it.
+    Matmul(MatmulSpec),
+}
+
+/// [`build_core`] where the backend may run `native` as native code instead of compiling the shader.
 pub(crate) fn build_core_native(
     ctx: &Context,
     key: &KernelKey,
     label: Option<&str>,
     trusted: bool,
-    native: Option<LineSolveSpec>,
+    native: Option<Native>,
 ) -> Result<KernelCore> {
     let info = ctx.info();
     let limits = &info.limits;
@@ -130,10 +139,16 @@ pub(crate) fn build_core_native(
     let workgroup = lowered.workgroup_size;
     let name = label.unwrap_or(&key.entry);
     let backend = ctx.hal();
-    // A native solve takes its buffers by position, so every binding of the shader must be bound.
-    let native = native
-        .filter(|_| used.as_deref().is_none_or(|used| used.iter().all(|&bound| bound)))
-        .and_then(|spec| backend.compile_line_solve(&spec));
+    let requested = native;
+    // A native kernel takes its buffers by position, so every binding of the shader must be bound.
+    let all_bound = used.as_deref().is_none_or(|used| used.iter().all(|&bound| bound));
+    let native = native.filter(|_| all_bound).and_then(|spec| match spec {
+        Native::LineSolve(spec) => backend.compile_line_solve(&spec),
+        Native::Matmul(spec) => backend.compile_matmul(&spec),
+    });
+    if native.is_none() && matches!(requested, Some(Native::Matmul(_))) {
+        return Err(BackendError::Unsupported("the backend cannot compile the native matrix product it planned".into()).into());
+    }
     let raw = match native {
         Some(raw) => raw,
         None => match backend.compile_naga(&module, &key.entry, &bindings, workgroup, name, trusted) {
