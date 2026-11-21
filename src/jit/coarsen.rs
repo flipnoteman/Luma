@@ -343,8 +343,13 @@ mod tests {
         }
         let got = z.to_vec().unwrap();
         assert_eq!(ctx.jit().stats().coarsened, before + 1);
-        let want: Vec<f64> = xs.iter().map(|&v| (0..12).fold(v, |v, i| if i % 2 == 0 { v * 0.999 } else { v + 0.01 })).collect();
-        assert_eq!(got, want);
+        // The bits of the same program on a context that coarsens nothing.
+        let off = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.coarsen = Coarsen::Off).unwrap();
+        let mut z = Array::<f64>::from_slice_on(&off, &xs, n).unwrap();
+        for i in 0..12 {
+            z = if i % 2 == 0 { &z * 0.999 } else { &z + 0.01 };
+        }
+        assert_eq!(got, z.to_vec().unwrap());
         let before = ctx.jit().stats().coarsened;
         let y = Array::from_slice_on(&ctx, &values(n, 21, 0.0, 1.0), n).unwrap();
         (&y * 2.0 + 1.0).eval().unwrap();
@@ -355,7 +360,8 @@ mod tests {
         let w = Array::from_slice_on(&ctx, &values(m, 22, 0.0, 1.0), m).unwrap();
         let got = (&w * 2.0 + 1.0).to_vec().unwrap();
         assert_eq!(ctx.jit().stats().coarsened, before + 1);
-        assert_eq!(got, values(m, 22, 0.0, 1.0).iter().map(|v| v * 2.0 + 1.0).collect::<Vec<f32>>());
+        let off = Array::from_slice_on(&context(Coarsen::Off), &values(m, 22, 0.0, 1.0), m).unwrap();
+        assert_eq!(got, (&off * 2.0 + 1.0).to_vec().unwrap());
         // Below the waves a launch needs, nothing is coarsened.
         let small = Array::<f64>::from_slice_on(&ctx, &xs[..1000], 1000).unwrap();
         let before = ctx.jit().stats().coarsened;
