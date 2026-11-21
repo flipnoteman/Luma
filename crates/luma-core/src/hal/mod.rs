@@ -596,6 +596,10 @@ impl RawKernel {
     pub fn id(&self) -> u64 {
         self.id
     }
+    /// Whether the kernel is compiled (or failed to compile): a launch of it would not wait.
+    pub fn is_ready(&self) -> bool {
+        self.native.is_ready()
+    }
     /// The backend's kernel, once compiled: waits for the compilation, fails with its error, or
     /// with [`BackendError::Unsupported`] if the kernel is not a `T`.
     pub fn resolve<T: 'static>(&self) -> Result<&T, BackendError> {

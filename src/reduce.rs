@@ -52,6 +52,9 @@ pub(crate) struct Reduced {
     in_recording: bool,
     /// Set while the passes are being recorded.
     forcing: AtomicBool,
+    /// Set when the group this reduction was recorded in was not recorded in one kernel because that was not due or ready (see
+    /// `Tuning::reduce_multi_after`): it is recorded alone, so that the others do not form other groups.
+    solo: AtomicBool,
     /// Where the values are when they were recorded together with other reductions' (see [`PackRead`]), and the first one's index there.
     pack: OnceLock<(Arc<PackRead>, usize)>,
     /// The lines of an axis reduction (made by [`Array::reduce_axis`] and the methods built on it); `None` for a reduction of
@@ -157,6 +160,7 @@ impl Reduced {
             && self.wgsl == self.ty.wgsl()
             && !self.layout.is_packed()
             && self.is_unforced()
+            && !self.solo.load(Ordering::Relaxed)
             && self.operand.is_pending()
             && self.operand.has_operands()
             && self.failure().is_none()
@@ -230,9 +234,17 @@ impl Reduced {
         let all = || std::iter::once(self).chain(partners.iter().map(|partner| &**partner));
         let members: Vec<jit::Member<'_>> = all().map(|reduced| jit::Member { operand: &reduced.operand, ops: reduced.ops, finish: reduced.finish }).collect();
         let ahead = || self.build_ahead(ctx, partners);
-        let pack = match jit::reduce_many(ctx, &members, self.ty, ctx.tuning().reduce_multi, jit::ManyMode::Run(&ahead)) {
+        let deferred = std::cell::Cell::new(false);
+        let pack = match jit::reduce_many(ctx, &members, self.ty, ctx.tuning().reduce_multi, jit::ManyMode::Run { ahead: &ahead, deferred: &deferred }) {
             Ok(Some(pack)) => Arc::new(pack),
-            _ => return None,
+            _ => {
+                if deferred.get() {
+                    for reduced in all() {
+                        reduced.solo.store(true, Ordering::Relaxed);
+                    }
+                }
+                return None;
+            }
         };
         drop(members);
         let shared = Arc::new(PackRead { pack: Arc::clone(&pack), words: OnceLock::new() });
@@ -584,6 +596,7 @@ impl<T: ScalarType> Array<T> {
                 thread: std::thread::current().id(),
                 in_recording: ctx.recording_here(),
                 forcing: AtomicBool::new(false),
+                solo: AtomicBool::new(false),
                 pack: OnceLock::new(),
                 axis: None,
             };
@@ -639,6 +652,7 @@ impl<T: ScalarType> Array<T> {
                     thread: std::thread::current().id(),
                     in_recording: false,
                     forcing: AtomicBool::new(false),
+                    solo: AtomicBool::new(false),
                     pack: OnceLock::new(),
                     axis: Some(geom),
                 });
@@ -682,6 +696,7 @@ impl<T: ScalarType> Array<T> {
             thread: std::thread::current().id(),
             in_recording: self.context().recording_here(),
             forcing: AtomicBool::new(false),
+            solo: AtomicBool::new(false),
             pack: OnceLock::new(),
             axis: None,
         };

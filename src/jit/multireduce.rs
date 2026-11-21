@@ -88,6 +88,19 @@ impl JitState {
         list.push(Arc::downgrade(reduced));
     }
 
+    /// Whether the kernel of the merged group of structure `hash` is due (see `Tuning::reduce_multi_after`): it has been recorded
+    /// `after` times one by one. With `count`, this recording is counted; without, it is only asked about (the group is
+    /// about to be recorded).
+    pub(crate) fn merged_due(&self, hash: u64, after: u32, count: bool) -> bool {
+        let mut seen = lock(&self.merged_seen);
+        let times = seen.entry(hash).or_insert(0);
+        let before = *times;
+        if count {
+            *times = times.saturating_add(1);
+        }
+        before >= after
+    }
+
     /// Whether some registered reduction could be recorded together with `seed`: what is cheap to tell, before the
     /// expressions are walked (see [`JitState::reduction_partners`]).
     pub(crate) fn may_have_partners(&self, seed: &Reduced) -> bool {

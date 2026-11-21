@@ -50,16 +50,21 @@ fn main() {
         let out = concat_slice(0, &sums).to_vec().unwrap();
         (t0.elapsed(), out)
     };
-    let (first, a) = run();
-    let (second, b) = run();
-    std::thread::sleep(std::time::Duration::from_secs(4));
-    let (settled, c) = run();
-    assert!(a.iter().zip(&b).chain(a.iter().zip(&c)).all(|(x, y)| x.to_bits() == y.to_bits()), "unstable");
-    println!(
-        "forces of {} sums: first call {:.0} ms, second {:.1} ms, after 4 s {:.1} ms",
-        a.len(),
-        first.as_secs_f64() * 1e3,
-        second.as_secs_f64() * 1e3,
-        settled.as_secs_f64() * 1e3
-    );
+    // Calls 1 to 12 back to back, then two more once the merged kernels have had time to compile in the background.
+    let mut times = vec![];
+    let mut reference: Vec<f32> = vec![];
+    for call in 0..14 {
+        let (t, out) = run();
+        if call == 0 {
+            reference = out;
+        } else {
+            assert!(out.iter().zip(&reference).all(|(x, y)| x.to_bits() == y.to_bits()), "unstable");
+        }
+        times.push(t.as_secs_f64() * 1e3);
+        if call == 11 {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+        }
+    }
+    let fmt = |ts: &[f64]| ts.iter().map(|t| format!("{t:.1}")).collect::<Vec<_>>().join(" ");
+    println!("forces of {} sums, calls 1-12 and 13-14 after 4 s (ms): {}", reference.len(), fmt(&times));
 }

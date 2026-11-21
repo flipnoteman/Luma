@@ -2356,6 +2356,8 @@ pub(crate) struct JitState {
     loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
     /// The reductions made and not yet recorded (see [`multireduce`]), oldest first.
     reductions: Mutex<Vec<std::sync::Weak<crate::reduce::Reduced>>>,
+    /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
+    merged_seen: Mutex<FxMap<u64, u32>>,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
     requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
@@ -2479,6 +2481,7 @@ impl JitState {
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             reductions: Mutex::new(Vec::new()),
+            merged_seen: Mutex::new(FxMap::default()),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             inputs_limit: AtomicUsize::new(max_inputs),

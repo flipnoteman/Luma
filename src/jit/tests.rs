@@ -11,7 +11,8 @@ use crate::ops::select;
 /// A context with the calibration off and the cost model pinned, so that kernel counts do not
 /// depend on the machine.
 fn ctx() -> Context {
-    let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
+    // Groups of reductions are recorded in one kernel at once (the tests count launches), whatever the backend's default.
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi_after = 0).unwrap();
     ctx.set_cost_model(CostModel::TEST);
     ctx
 }
@@ -315,6 +316,47 @@ fn kernels_of_later_reduction_groups_are_built_when_the_first_is() {
     assert_eq!(all, alone);
     assert_eq!(first.to_bits(), alone[0]);
     assert!(rest.iter().enumerate().all(|(g, v)| v.to_bits() == alone[(g + 1) * accs]));
+}
+
+#[test]
+fn a_group_of_reductions_forced_repeatedly_ends_up_in_one_kernel() {
+    use crate::view::concat_slice;
+    let after = 3;
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi_after = after).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let x = f32s(&ctx, &values(100_000, 11, -1.0, 1.0));
+    let count = 12;
+    assert!(count <= ctx.tuning().reduce_multi);
+    // The scalars differ from call to call: the group is the same structure.
+    let run = |scale: f32| -> (u64, Vec<u32>) {
+        let sums: Vec<Array<f32>> = (0..count).map(|j| (&x * (j as f32 + scale)).sum().reshape([1])).collect();
+        let before = ctx.jit().stats();
+        let joined = concat_slice(0, &sums).to_vec().unwrap();
+        (delta(before, ctx.jit().stats()).reduce_launches, joined.into_iter().map(f32::to_bits).collect())
+    };
+    let (first, bits) = run(1.5);
+    assert_eq!(first, count as u64, "recorded one by one while the group is not due");
+    for _ in 1..after {
+        let (launches, again) = run(1.5);
+        assert_eq!(launches, count as u64);
+        assert_eq!(again, bits);
+    }
+    // Due: the kernel compiles in the background and no launch waits for it; once it is ready the group is one launch.
+    let mut merged = None;
+    for _ in 0..1000 {
+        let (launches, again) = run(1.5);
+        assert_eq!(again, bits, "values are the same bits in either kernel");
+        if launches == 1 {
+            merged = Some(launches);
+            break;
+        }
+        assert_eq!(launches, count as u64);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(merged.is_some(), "the merged kernel was never used");
+    // Other values of the scalars: the same kernel, at once.
+    let (launches, _) = run(2.5);
+    assert_eq!(launches, 1);
 }
 
 #[test]
