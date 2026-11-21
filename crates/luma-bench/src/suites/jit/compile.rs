@@ -11,7 +11,7 @@ pub fn run(h: &mut Harness) {
         let ctx = h.ctx.clone();
         let n = 4096;
         let k = size(h, 4, 6, 8);
-        // `compile/shape_variants` takes 17 more elements per kernel; room for ~3800 kernels.
+        // `compile/shape_variants` takes one more element per kernel: room for ~64k kernels.
         let big = 65536;
         let xh = values(big, 1, 0.5, 1.5);
         let yh = values(big, 2, 0.5, 1.5);
