@@ -13,7 +13,7 @@ use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use luma_core::kir::KernelModule;
@@ -26,6 +26,11 @@ use luma_core::hal::copy_parallel;
 use wgpu::{BindGroupEntry, BindingResource, BufferBinding};
 
 use crate::codegen;
+
+/// `LUMA_WGPU_DUMP`: a directory that receives the WGSL (`<label>-<hash>.wgsl`) of every kernel
+/// the backend generates from luma's kernel IR.
+static DUMP_DIR: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| std::env::var_os("LUMA_WGPU_DUMP").filter(|v| !v.is_empty()).map(Into::into));
+
 use crate::device::{self, Gpu, lock};
 use crate::profiler::Profiler;
 
@@ -489,6 +494,9 @@ fn shader_capabilities(features: wgpu::Features) -> naga::valid::Capabilities {
     let mut caps = Caps::empty();
     if features.contains(wgpu::Features::SUBGROUP) {
         caps |= Caps::SUBGROUP | Caps::SUBGROUP_BARRIER;
+    }
+    if features.contains(wgpu::Features::SHADER_FLOAT32_ATOMIC) {
+        caps |= Caps::SHADER_FLOAT32_ATOMIC;
     }
     if features.contains(wgpu::Features::SHADER_F16) {
         caps |= Caps::SHADER_FLOAT16;
@@ -1189,7 +1197,12 @@ impl Backend for WgpuBackend {
         let numbers: Vec<u32> = (0..module.bindings.len() as u32).filter(|&i| used.is_none_or(|u| u[i as usize])).collect();
         let infos: Vec<BindingInfo> = numbers.iter().map(|&i| module.bindings[i as usize].info()).collect();
         let optimized = luma_core::kir::optimize_for_target(module, false);
-        let source = codegen::emit_with(optimized.as_ref(), used);
+        let source = codegen::emit_with(optimized.as_ref(), used, self.device().features().contains(wgpu::Features::SHADER_FLOAT32_ATOMIC));
+        if let Some(dir) = DUMP_DIR.as_deref() {
+            let name: String = label.chars().take(100).map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(dir.join(format!("{name}-{:016x}.wgsl", luma_core::hal::cache::fnv1a(source.as_bytes()))), &source);
+        }
         let parsed = naga::front::wgsl::parse_str(&source).map_err(|e| BackendError::ShaderCompile(e.emit_to_string(&source)))?;
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), shader_capabilities(self.device().features()))
             .validate(&parsed)

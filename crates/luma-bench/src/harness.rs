@@ -158,8 +158,17 @@ impl Harness {
             Work::Items(n, u) => (Some(n / (median * 1e-3) / 1e6), u),
             Work::None => (None, ""),
         };
+        let kernels = std::env::var_os("LUMA_BENCH_KERNELS").is_some();
         let (launches, gpu_ms) = match self.ctx.profile(&mut *f) {
-            Ok(((), p)) => (Some(p.launches()), Some(p.total().as_secs_f64() * 1e3)),
+            Ok(((), p)) => {
+                if kernels {
+                    println!("  kernels of {} {size}:", self.full(case));
+                    for k in &p.kernels {
+                        println!("    {:>9.1} us x{:<3} {}", k.total.as_secs_f64() * 1e6, k.launches, k.label.chars().take(110).collect::<String>());
+                    }
+                }
+                (Some(p.launches()), Some(p.total().as_secs_f64() * 1e3))
+            }
             Err(_) => (None, None),
         };
         let _ = self.ctx.sync();

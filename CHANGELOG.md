@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- wgpu: the scatter-add kernels (`put_add`, group-by sums, histograms, embedding gradients) use the device's native `f32` atomic add (`SHADER_FLOAT32_ATOMIC`, Vulkan `VK_EXT_shader_atomic_float`, Metal 3) when it has one, instead of a compare-and-swap loop on the bits, which collapsed when many invocations add to few cells (60x slower than CUDA on 16 hot bins). Bindings that also take `min`/`max` keep the loop. `LUMA_WGPU_DUMP=<dir>` writes the WGSL of every kernel the backend compiles, and `luma-bench` prints the per-kernel GPU times of each case with `LUMA_BENCH_KERNELS=1`.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed
