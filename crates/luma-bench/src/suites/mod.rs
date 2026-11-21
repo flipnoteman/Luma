@@ -5,6 +5,7 @@ pub mod cfd;
 pub mod compute;
 pub mod datasci;
 pub mod jit;
+pub mod sparse;
 pub mod ml;
 
 use crate::harness::Harness;
@@ -19,4 +20,5 @@ pub const ALL: &[(&str, SuiteFn)] = &[
     ("datasci", datasci::run),
     ("compute", compute::run),
     ("jit", jit::run),
+    ("sparse", sparse::run),
 ];
