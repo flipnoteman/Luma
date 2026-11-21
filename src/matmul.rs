@@ -95,10 +95,12 @@ const SKINNY_LONG_K: u32 = 65536;
 const SKINNY_MAX_OUTPUTS_ALONG_K: u32 = 1 << 22;
 /// Shortest K of a skinny product.
 const SKINNY_MIN_K: u32 = 2048;
-/// Workgroups a skinny product aims for.
-const SKINNY_GROUPS: u32 = 1024;
-/// Smallest K a workgroup of a skinny product covers.
-const SKINNY_MIN_SLICE: u32 = 256;
+/// Workgroups a skinny product aims for: one-hot 1M x 32 on an RTX 3090 takes 0.19 ms with 256 or
+/// 1024, 0.18 with 512, 0.21 with 2048.
+const SKINNY_GROUPS: u32 = 512;
+/// Smallest K a workgroup of a skinny product covers: a 64x64 product over 65536 takes 0.14 ms
+/// with 256 and 0.11 with 128 or 64 (at most 512 workgroups of 256 each otherwise).
+const SKINNY_MIN_SLICE: u32 = 128;
 /// Most accumulators an invocation of a skinny kernel holds.
 const SKINNY_ACCUMULATORS: u32 = 80;
 /// Most `f32` of workgroup memory a skinny kernel's reduction across groups uses (16 KiB, the
