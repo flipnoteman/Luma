@@ -2,8 +2,10 @@
 name = "luma-hal-cuda"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "(MIT OR Apache-2.0) AND LicenseRef-NVIDIA-CUDA-EULA"
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 description = "Native CUDA backend of the Luma GPU array library, compiled through the NVIDIA driver's NVVM"
 documentation = "https://docs.rs/luma-hal-cuda"

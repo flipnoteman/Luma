@@ -6,6 +6,7 @@ description = "Backend-agnostic lazy GPU arrays for Rust (CUDA, Metal, wgpu): fu
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
+homepage.workspace = true
 documentation = "https://docs.rs/luma"
 keywords = ["gpu", "cuda", "metal", "array", "compute"]
 categories = ["science", "mathematics", "concurrency"]
@@ -26,6 +27,7 @@ version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/flipnoteman/Luma"
+homepage = "https://flipnoteman.github.io/Luma/"
 rust-version = "1.99"
 
 [workspace.dependencies]
