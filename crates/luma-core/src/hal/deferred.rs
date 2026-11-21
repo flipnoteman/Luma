@@ -8,7 +8,7 @@
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use super::{BackendError, NativeKernel};
@@ -21,11 +21,26 @@ const WORKER_STACK: usize = 32 << 20;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// A queued job that a worker or the thread waiting for its result runs, whichever gets there first.
+struct Task(Mutex<Option<Job>>);
+
+impl Task {
+    fn run(&self) {
+        let job = lock(&self.0).take();
+        if let Some(job) = job {
+            job();
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
-    queue: VecDeque<Job>,
+    queue: VecDeque<Arc<Task>>,
     /// Jobs a worker is running.
     running: usize,
+    /// Workers started (they are never stopped) and the ones of them waiting for a job.
+    started: usize,
+    waiting: usize,
     /// The process is exiting: nothing is queued any more.
     closed: bool,
 }
@@ -82,29 +97,10 @@ extern "C" fn at_exit() {
     }
 }
 
-fn start_workers(pool: &'static Pool) {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
-        for index in 0..pool.workers {
-            let spawned = std::thread::Builder::new().name(format!("luma-compile-{index}")).stack_size(WORKER_STACK).spawn(move || loop {
-                let job = {
-                    let mut state = lock(&pool.state);
-                    loop {
-                        if let Some(job) = state.queue.pop_front() {
-                            state.running += 1;
-                            break job;
-                        }
-                        state = pool.wake.wait(state).unwrap_or_else(PoisonError::into_inner);
-                    }
-                };
-                job();
-                lock(&pool.state).running -= 1;
-                pool.idle.notify_all();
-            });
-            // Without a worker the queue would never drain: callers fall back to compiling inline
-            // once it is full, so a failed spawn costs parallelism only.
-            drop(spawned);
-        }
+/// Registers the exit handler once.
+fn hook_exit() {
+    static HOOKED: OnceLock<()> = OnceLock::new();
+    HOOKED.get_or_init(|| {
         // SAFETY: `at_exit` is a plain `extern "C"` function that does not unwind.
         unsafe {
             atexit(at_exit);
@@ -112,21 +108,57 @@ fn start_workers(pool: &'static Pool) {
     });
 }
 
-/// Runs `job` on a worker, or on the calling thread when the pool is off, closed or its queue is
-/// full.
-fn submit(job: Job) {
-    let Some(pool) = pool() else { return job() };
-    start_workers(pool);
-    {
+/// Starts the worker `index`; it takes jobs until the process exits.
+fn spawn_worker(pool: &'static Pool, index: usize) -> std::io::Result<()> {
+    std::thread::Builder::new().name(format!("luma-compile-{index}")).stack_size(WORKER_STACK).spawn(move || {
         let mut state = lock(&pool.state);
-        if !state.closed && state.queue.len() < pool.workers * QUEUE_PER_WORKER {
-            state.queue.push_back(job);
+        loop {
+            if let Some(task) = state.queue.pop_front() {
+                state.running += 1;
+                drop(state);
+                task.run();
+                state = lock(&pool.state);
+                state.running -= 1;
+                pool.idle.notify_all();
+            } else {
+                state.waiting += 1;
+                state = pool.wake.wait(state).unwrap_or_else(PoisonError::into_inner);
+                state.waiting -= 1;
+            }
+        }
+    })?;
+    Ok(())
+}
+
+/// Runs `task` on a worker, or on the calling thread when the pool is off, closed or its queue is
+/// full. Workers start on demand, when no waiting one can take the job: a compiler's first run
+/// on a thread costs milliseconds (its per-thread state, the driver's binding of the context), so
+/// a kernel compiled by itself must reach a worker that has compiled one before, not a new one.
+fn submit(task: Arc<Task>) {
+    let Some(pool) = pool() else { return task.run() };
+    hook_exit();
+    let mut state = lock(&pool.state);
+    if state.closed || state.queue.len() >= pool.workers * QUEUE_PER_WORKER {
+        drop(state);
+        return task.run();
+    }
+    state.queue.push_back(task);
+    if state.waiting >= state.queue.len() {
+        drop(state);
+        pool.wake.notify_one();
+    } else if state.started < pool.workers {
+        // Without a worker the queue would never drain: a failed start of the first one runs
+        // the job here, any other costs parallelism only.
+        if spawn_worker(pool, state.started).is_ok() {
+            state.started += 1;
+        } else if state.started == 0 {
+            let task = state.queue.pop_back();
             drop(state);
-            pool.wake.notify_one();
-            return;
+            if let Some(task) = task {
+                task.run();
+            }
         }
     }
-    job();
 }
 
 /// The result of a compilation that may still be running.
@@ -134,6 +166,8 @@ pub(super) struct Slot {
     value: OnceLock<Result<Box<dyn NativeKernel>, BackendError>>,
     gate: Mutex<()>,
     done: Condvar,
+    /// The job that fills the slot, while it is queued (see [`Slot::wait`]).
+    task: OnceLock<Weak<Task>>,
 }
 
 impl std::fmt::Debug for Slot {
@@ -154,7 +188,7 @@ impl Slot {
     }
 
     fn empty() -> Slot {
-        Slot { value: OnceLock::new(), gate: Mutex::new(()), done: Condvar::new() }
+        Slot { value: OnceLock::new(), gate: Mutex::new(()), done: Condvar::new(), task: OnceLock::new() }
     }
 
     fn complete(&self, result: Result<Box<dyn NativeKernel>, BackendError>) {
@@ -163,10 +197,18 @@ impl Slot {
         self.done.notify_all();
     }
 
-    /// Waits for the compilation to finish.
+    /// Waits for the compilation to finish. A job no worker has begun is compiled here: the thread
+    /// that needs the kernel at once (a single kernel, not one of a traced step) neither waits for a
+    /// worker to wake nor pays for a thread that never compiled before.
     pub(super) fn wait(&self) -> &Result<Box<dyn NativeKernel>, BackendError> {
         if let Some(value) = self.value.get() {
             return value;
+        }
+        if let Some(task) = self.task.get().and_then(Weak::upgrade) {
+            task.run();
+            if let Some(value) = self.value.get() {
+                return value;
+            }
         }
         let mut gate = lock(&self.gate);
         loop {
@@ -183,7 +225,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 }
 
 /// Fills a slot with an error if dropped before it was filled (a job dropped at exit).
-struct Completer(Option<std::sync::Arc<Slot>>);
+struct Completer(Option<Arc<Slot>>);
 
 impl Completer {
     fn complete(mut self, result: Result<Box<dyn NativeKernel>, BackendError>) {
@@ -202,15 +244,17 @@ impl Drop for Completer {
 }
 
 /// Starts `compile` on the pool and returns the slot it fills.
-pub(super) fn spawn<N: NativeKernel>(compile: impl FnOnce() -> Result<N, BackendError> + Send + 'static) -> std::sync::Arc<Slot> {
-    let slot = std::sync::Arc::new(Slot::empty());
-    let target = Completer(Some(std::sync::Arc::clone(&slot)));
-    submit(Box::new(move || {
+pub(super) fn spawn<N: NativeKernel>(compile: impl FnOnce() -> Result<N, BackendError> + Send + 'static) -> Arc<Slot> {
+    let slot = Arc::new(Slot::empty());
+    let target = Completer(Some(Arc::clone(&slot)));
+    let task = Arc::new(Task(Mutex::new(Some(Box::new(move || {
         let result = match catch_unwind(AssertUnwindSafe(compile)) {
             Ok(result) => result.map(|native| Box::new(native) as Box<dyn NativeKernel>),
             Err(payload) => Err(BackendError::ShaderCompile(format!("the kernel compiler panicked: {}", panic_message(&*payload)))),
         };
         target.complete(result);
-    }));
+    })))));
+    let _ = slot.task.set(Arc::downgrade(&task));
+    submit(task);
     slot
 }
