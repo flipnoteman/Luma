@@ -207,7 +207,7 @@ pub(crate) use multireduce::unresolved_leaves;
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};
-pub(crate) use replay::{force, GraphBuilder, GraphCache, Plan, Stepper, Trace, PAYING_REPLAYS};
+pub(crate) use replay::{force, force_stepped, GraphBuilder, GraphCache, Plan, Stepper, Trace, PAYING_REPLAYS};
 pub(crate) use stencil::plan as stencil_plan;
 pub(crate) use until::{force_with_record, next_block, run_until, FoldGate, FIRST_BLOCK};
 #[cfg(test)]
@@ -1199,6 +1199,15 @@ impl Node {
     /// A copy of the operands of a node that has not been evaluated.
     pub(crate) fn operands(&self) -> Option<Args> {
         lock(&self.args).clone()
+    }
+
+    /// Whether the node is pending and yields the elements of `storage` unchanged (a copy of it).
+    pub(crate) fn is_copy_of(&self, storage: &Arc<Storage>) -> bool {
+        self.is_pending()
+            && self.looped.get().is_none()
+            && self.len == storage.len()
+            && matches!(self.op.kind, OpKind::Unary(UnOp::Id))
+            && matches!(self.operands(), Some([Src::Buffer(source), ..]) if Arc::ptr_eq(&source, storage))
     }
 
     /// Whether the node has operands, which it does not once it is evaluated or being evaluated.

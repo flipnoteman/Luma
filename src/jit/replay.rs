@@ -273,6 +273,8 @@ pub(crate) struct Stepper {
     init: Vec<Buffer>,
     probes: Vec<Buffer>,
     ping: Vec<Arc<Storage>>,
+    /// The states the step hands back unchanged.
+    fixed: Vec<bool>,
     pong: Vec<Arc<Storage>>,
     ping_buffers: Vec<Buffer>,
     pong_buffers: Vec<Buffer>,
@@ -310,6 +312,14 @@ impl Stepper {
         if plan.launches() == 0 || init.len() != probes.len() || init.len() != outs.len() {
             return Err(Box::new(plan));
         }
+        // A state the step hands back unchanged has no launch and no results buffer in the plan: it
+        // is bound to `ping` at every step instead.
+        let fixed: Vec<bool> = outs.iter().zip(probes).map(|(out, probe)| Arc::ptr_eq(out, probe)).collect();
+        let outs: Vec<Arc<Storage>> = outs
+            .into_iter()
+            .zip(&fixed)
+            .map(|(out, &fixed)| if fixed { Arc::new(Storage::new(ctx, out.len(), out.layout())) } else { out })
+            .collect();
         let shaped = init.iter().zip(probes).zip(&outs).all(|((init, probe), out)| {
             [init, probe, out].iter().all(|storage| storage.segments() == 1)
                 && init.byte_len() == probe.byte_len()
@@ -341,7 +351,7 @@ impl Stepper {
             return Err(Box::new(plan));
         };
         let distinct = ping_buffers.iter().enumerate().all(|(j, out)| {
-            plan.writes(out)
+            (fixed[j] || plan.writes(out))
                 && ping_buffers[..j].iter().all(|other| other != out)
                 && init_buffers.iter().chain(&probe_buffers).all(|other| other != out)
         });
@@ -385,6 +395,7 @@ impl Stepper {
             init: init_buffers,
             probes: probe_buffers,
             ping: outs,
+            fixed,
             pong,
             ping_buffers,
             pong_buffers,
@@ -445,11 +456,21 @@ impl Stepper {
         self.placeholders.bytes()
     }
 
-    /// Runs steps `1..=steps`. The first replays on its own (it reads `init`, which `rebind`
+    /// Runs steps `1..=steps`, with the states the step hands back unchanged in place: they take no launch.
+    pub(crate) fn run_steps(&self, steps: usize) -> Result<()> {
+        if steps == 0 {
+            return Ok(());
+        }
+        self.seed_fixed()?;
+        self.step_all(steps)?;
+        self.settle(steps)
+    }
+
+    /// The steps `1..=steps` themselves. The first replays on its own (it reads `init`, which `rebind`
     /// changes); the rest cycle through two address-invariant steps (2 and 3), so a backend
     /// that can capture graphs replays them as one. While profiling or recording, and on
     /// backends without graphs, every step is replayed on its own.
-    pub(crate) fn run_steps(&self, steps: usize) -> Result<()> {
+    fn step_all(&self, steps: usize) -> Result<()> {
         if steps == 0 {
             return Ok(());
         }
@@ -506,6 +527,9 @@ impl Stepper {
         for j in 0..states {
             if t == 1 {
                 swaps.push((self.probes[j].clone(), self.init[j].clone()));
+            } else if self.fixed[j] {
+                // The same buffer at every step, whatever the parity: `seed_fixed` copied the state there.
+                swaps.push((self.probes[j].clone(), self.ping_buffers[j].clone()));
             } else if t.is_multiple_of(2) {
                 swaps.push((self.probes[j].clone(), self.ping_buffers[j].clone()));
                 swaps.push((self.ping_buffers[j].clone(), self.pong_buffers[j].clone()));
@@ -514,6 +538,35 @@ impl Stepper {
             }
         }
         swaps
+    }
+
+    /// Number of states the step hands back unchanged.
+    #[cfg(test)]
+    pub(crate) fn fixed_states(&self) -> usize {
+        self.fixed.iter().filter(|&&fixed| fixed).count()
+    }
+
+    /// Before the steps: copies every state the step hands back unchanged from `init` to `ping`,
+    /// where steps 2 and up read it and the state after an odd number of steps is.
+    pub(crate) fn seed_fixed(&self) -> Result<()> {
+        for (j, &fixed) in self.fixed.iter().enumerate() {
+            if fixed {
+                self.plan.ctx.copy_storage(&self.inits[j], &self.ping[j])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// After `steps` steps: puts every unchanged state where [`Stepper::state_after`] looks for it.
+    pub(crate) fn settle(&self, steps: usize) -> Result<()> {
+        if steps.is_multiple_of(2) {
+            for (j, &fixed) in self.fixed.iter().enumerate() {
+                if fixed {
+                    self.plan.ctx.copy_storage(&self.inits[j], &self.pong[j])?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The storages holding the state after step `t`.
@@ -631,7 +684,7 @@ impl Trace {
         results: &[&Array<T>],
         stepable: bool,
     ) -> std::result::Result<Option<Stepper>, Failure> {
-        let outs = force(results)?;
+        let outs = force_stepped(results, &self.probe_storages)?;
         let Some(plan) = self.finish_plan() else { return Ok(None) };
         let stepper = if stepable {
             Stepper::new(&self.ctx, plan, &self.init, &self.probe_storages, outs)
@@ -677,4 +730,22 @@ pub(crate) fn force<T: GpuType>(arrays: &[&Array<T>]) -> std::result::Result<Vec
         super::evaluate_group(nodes);
     }
     arrays.iter().map(|array| array.storage().map(Arc::clone)).collect()
+}
+
+/// [`force`] for the results of a step traced on `probes`: a result that is a probe handed back
+/// unchanged (see [`Array::passes_through`]) is not evaluated, and its storage is the probe's
+/// (the [`Stepper`] binds such a state to one buffer instead of copying it at every step).
+pub(crate) fn force_stepped<T: GpuType>(arrays: &[&Array<T>], probes: &[Arc<Storage>]) -> std::result::Result<Vec<Arc<Storage>>, Failure> {
+    if arrays.len() != probes.len() {
+        return force(arrays);
+    }
+    let passing: Vec<bool> = arrays.iter().zip(probes).map(|(array, probe)| array.passes_through(probe)).collect();
+    let rest: Vec<&Array<T>> = arrays.iter().zip(&passing).filter(|&(_, &passes)| !passes).map(|(array, _)| *array).collect();
+    force(&rest)?;
+    arrays
+        .iter()
+        .zip(probes)
+        .zip(&passing)
+        .map(|((array, probe), &passes)| if passes { Ok(Arc::clone(probe)) } else { array.storage().map(Arc::clone) })
+        .collect()
 }

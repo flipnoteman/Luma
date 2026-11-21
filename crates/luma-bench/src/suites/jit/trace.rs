@@ -98,6 +98,39 @@ pub fn run(h: &mut Harness) {
             force(&r);
         });
 
+        // 16 independent fields, a stage each: the launches of a step share no buffer, so a graph
+        // may run them side by side.
+        const WIDE: usize = 16;
+        let fields: Vec<A> = (0..WIDE).map(|i| A::from_slice_on(&ctx, &values(side * side, 20 + i as u64, 0.0, 1.0), [side, side]).unwrap()).collect();
+        let wide_init: [&A; WIDE] = std::array::from_fn(|i| &fields[i]);
+        let wide_step = |s: &[A; WIDE]| -> [A; WIDE] { std::array::from_fn(|i| stages(&s[i], 1)) };
+        {
+            let got = iterate_all(wide_init, 2, wide_step);
+            for i in [0, WIDE - 1] {
+                let want = stages_host(&stages_host(&values(side * side, 20 + i as u64, 0.0, 1.0), side, side, 1), side, side, 1);
+                check("trace/wide16", &got[i].to_vec().unwrap(), &want, 1e-3, 1e-4);
+            }
+        }
+        h.case("trace/wide16_replay", &format!("{WIDE}k {side}x{side} x{steps}"), per_sec(steps * WIDE, "launch/s"), &mut || {
+            let r = iterate_all(wide_init, steps, wide_step);
+            force(&r[0]);
+        });
+
+        // One evolving field and six that the step hands back unchanged: they take no launch.
+        const PASS: usize = 7;
+        let pass_init: [&A; PASS] = std::array::from_fn(|i| &fields[i]);
+        let pass_step = |s: &[A; PASS]| -> [A; PASS] { std::array::from_fn(|i| if i == 0 { stage_step(&s[0]) } else { &s[i] * 1.0 }) };
+        {
+            let got = iterate_all(pass_init, 2, pass_step);
+            let want = stages_host(&stages_host(&values(side * side, 20, 0.0, 1.0), side, side, STAGES), side, side, STAGES);
+            check("trace/pass6", &got[0].to_vec().unwrap(), &want, 1e-3, 1e-4);
+            check("trace/pass6 unchanged", &got[PASS - 1].to_vec().unwrap(), &values(side * side, 20 + (PASS - 1) as u64, 0.0, 1.0), 0.0, 0.0);
+        }
+        h.case("trace/step30_pass6_replay", &format!("{STAGES}k+6 {side}x{side} x{steps}"), per_sec(steps * STAGES, "launch/s"), &mut || {
+            let r = iterate_all(pass_init, steps, pass_step);
+            force(&r[0]);
+        });
+
         // A bigger state, where the launches are no longer free.
         let big = size(h, 256, 256, 512);
         let bh = values(big * big, 12, 0.0, 1.0);
