@@ -17,54 +17,66 @@ pub(crate) struct Readers {
     generation: AtomicU64,
 }
 
-/// Weak references to nodes. Most nodes are read by a single operation, so the first reference
-/// lives in the list itself: no allocation until a second one arrives.
+/// How many references a [`Weaks`] holds in itself.
+const INLINE: usize = 3;
+
+/// Weak references to nodes, oldest first. Most nodes are read by a few operations, so the first
+/// references live in the list itself: no allocation until a fourth one arrives.
 #[derive(Debug, Default)]
 pub(super) struct Weaks {
-    first: Option<Weak<Node>>,
+    /// The oldest references, from the front.
+    inline: [Option<Weak<Node>>; INLINE],
+    /// The others; there are some only if `inline` is full.
     rest: Vec<Weak<Node>>,
 }
 
 impl Weaks {
     fn push(&mut self, node: Weak<Node>) {
-        if self.first.is_none() {
-            self.first = Some(node);
-        } else {
-            self.rest.push(node);
+        match self.inline.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => *slot = Some(node),
+            None => self.rest.push(node),
         }
     }
 
     fn len(&self) -> usize {
-        usize::from(self.first.is_some()) + self.rest.len()
+        self.inline.iter().flatten().count() + self.rest.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inline.first().is_none_or(Option::is_none)
     }
 
     fn iter(&self) -> impl DoubleEndedIterator<Item = &Weak<Node>> {
-        self.first.iter().chain(&self.rest)
+        self.inline.iter().flatten().chain(&self.rest)
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&Weak<Node>) -> bool) {
-        if self.first.as_ref().is_some_and(|weak| !keep(weak)) {
-            self.first = None;
+        // In order, so that what is kept stays oldest first.
+        let mut kept = 0;
+        for at in 0..INLINE {
+            let Some(weak) = self.inline.get_mut(at).and_then(Option::take) else { continue };
+            if keep(&weak) {
+                if let Some(slot) = self.inline.get_mut(kept) {
+                    *slot = Some(weak);
+                }
+                kept += 1;
+            }
         }
-        self.rest.retain_mut(|weak| {
-            if !keep(weak) {
-                return false;
-            }
-            if self.first.is_none() {
-                self.first = Some(std::mem::take(weak));
-                return false;
-            }
-            true
-        });
+        self.rest.retain_mut(|weak| keep(weak));
+        // The oldest of the others take the places that were freed.
+        let moved = (INLINE - kept).min(self.rest.len());
+        for (slot, weak) in self.inline.iter_mut().skip(kept).zip(self.rest.drain(..moved)) {
+            *slot = Some(weak);
+        }
     }
 }
 
 impl IntoIterator for Weaks {
     type Item = Weak<Node>;
-    type IntoIter = std::iter::Chain<std::option::IntoIter<Weak<Node>>, std::vec::IntoIter<Weak<Node>>>;
+    type IntoIter = std::iter::Chain<std::iter::Flatten<std::array::IntoIter<Option<Weak<Node>>, INLINE>>, std::vec::IntoIter<Weak<Node>>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.first.into_iter().chain(self.rest)
+        self.inline.into_iter().flatten().chain(self.rest)
     }
 }
 
@@ -75,10 +87,43 @@ impl Extend<Weak<Node>> for Weaks {
 }
 
 #[derive(Debug, Default)]
-struct ReaderList {
+pub(super) struct ReaderList {
     nodes: Weaks,
     /// Length at which dead and evaluated entries are dropped next.
     prune_at: usize,
+}
+
+impl ReaderList {
+    pub(super) fn add_weak(&mut self, weak: Weak<Node>) {
+        self.nodes.push(weak);
+        if self.nodes.len() > self.prune_at.max(PRUNE_MIN) {
+            self.nodes.retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
+            self.prune_at = self.nodes.len().saturating_mul(2);
+        }
+    }
+
+    /// Takes the live entries `take` accepts, oldest first; the others stay registered. Dead
+    /// entries are dropped.
+    pub(super) fn take_if(&mut self, take: impl Fn(&Node) -> bool) -> Vec<Weak<Node>> {
+        self.prune_at = 0;
+        let (mut taken, mut kept) = (Vec::new(), Weaks::default());
+        for weak in std::mem::take(&mut self.nodes) {
+            let Some(node) = weak.upgrade() else { continue };
+            if take(&node) {
+                taken.push(weak);
+            } else {
+                kept.push(weak);
+            }
+        }
+        self.nodes = kept;
+        taken
+    }
+
+    /// Calls `f` with every registered node, newest first, without copying the list. `f` must
+    /// not register nodes.
+    pub(super) fn for_each_newest(&self, f: impl FnMut(&Weak<Node>)) {
+        self.nodes.iter().rev().for_each(f);
+    }
 }
 
 /// Smallest list length worth pruning.
@@ -92,12 +137,7 @@ impl Readers {
     /// [`Readers::add`] for a caller that made the weak reference already (making one is an
     /// atomic compare-and-swap; cloning one is cheaper).
     pub(super) fn add_weak(&self, weak: Weak<Node>) {
-        let mut list = lock(&self.list);
-        list.nodes.push(weak);
-        if list.nodes.len() > list.prune_at.max(PRUNE_MIN) {
-            list.nodes.retain(|weak| weak.upgrade().is_some_and(|node| node.is_pending()));
-            list.prune_at = list.nodes.len().saturating_mul(2);
-        }
+        lock(&self.list).add_weak(weak);
     }
 
     pub(super) fn take(&self) -> Weaks {
@@ -106,38 +146,14 @@ impl Readers {
         std::mem::take(&mut list.nodes)
     }
 
-    /// Takes the live entries `take` accepts, oldest first; the others stay registered. Dead
-    /// entries are dropped.
-    pub(super) fn take_if(&self, take: impl Fn(&Node) -> bool) -> Vec<Weak<Node>> {
-        let mut list = lock(&self.list);
-        list.prune_at = 0;
-        let (mut taken, mut kept) = (Vec::new(), Weaks::default());
-        for weak in std::mem::take(&mut list.nodes) {
-            let Some(node) = weak.upgrade() else { continue };
-            if take(&node) {
-                taken.push(weak);
-            } else {
-                kept.push(weak);
-            }
-        }
-        list.nodes = kept;
-        taken
-    }
-
     /// Takes over the readers of `other`: a node that was evaluated passes its readers on to the
     /// buffer it produced.
     pub(crate) fn absorb(&self, other: &Readers) {
         let moved = other.take();
-        if moved.first.is_none() {
+        if moved.is_empty() {
             return;
         }
         lock(&self.list).nodes.extend(moved);
-    }
-
-    /// Calls `f` with every registered node, newest first, without copying the list. `f` must
-    /// not register nodes.
-    pub(super) fn for_each_newest(&self, f: impl FnMut(&Weak<Node>)) {
-        lock(&self.list).nodes.iter().rev().for_each(f);
     }
 
     /// Whether a reader that `consider` accepts is still pending. Only accepted readers are

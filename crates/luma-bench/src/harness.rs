@@ -139,7 +139,9 @@ impl Harness {
         };
         let first = run(f);
         let warm = run(f).max(run(f));
-        let reps = if warm > 1000.0 {
+        let reps = if let Some(r) = std::env::var("LUMA_BENCH_REPS").ok().and_then(|v| v.parse().ok()) {
+            r
+        } else if warm > 1000.0 {
             3
         } else if self.quick {
             5

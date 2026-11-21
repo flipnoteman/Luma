@@ -151,6 +151,7 @@
 //! the newest call become *loop leaves* that stand for the step applied to the previous ones, so
 //! the pending graph stays one step deep and the postponed steps run at once (see [`looped`]).
 
+mod bits;
 pub(crate) mod assign;
 mod codegen;
 pub(crate) mod cost;
@@ -1017,9 +1018,7 @@ impl Node {
             return;
         }
         let at = ((self.below_base - base) >> 6) as usize;
-        for (word, &bits) in set.iter_mut().skip(at).zip(part) {
-            *word |= bits;
-        }
+        bits::or_into(set.get_mut(at..).unwrap_or(&mut []), part);
     }
 
     /// Ids of the distinct buffers the expression reads, sorted.
@@ -1442,7 +1441,6 @@ struct Measured {
     inputs: Vec<u64>,
     below: Vec<u64>,
     decoded: Vec<u64>,
-    dense: Vec<u64>,
     tmp: Vec<u64>,
 }
 
@@ -1519,7 +1517,7 @@ struct Measure {
 /// The distinct nodes below and distinct buffers read by an operation on `args`.
 fn measure(args: &[Src]) -> Measure {
     MEASURED.with_borrow_mut(|m| {
-        let Measured { inputs, below, decoded, tmp, dense } = m;
+        let Measured { inputs, below, decoded, tmp } = m;
         inputs.clear();
         let mut nodes: [Option<&Arc<Node>>; 3] = [None; 3];
         let mut count = 0;
@@ -1558,15 +1556,17 @@ fn measure(args: &[Src]) -> Measure {
         let width = ((hi >> 6) - (lo >> 6) + 1) as usize;
         if width <= 2 * used + 8 {
             let base = lo & !63;
-            dense.clear();
-            dense.resize(width, 0u64);
+            // One allocation: the set (zeroed, then merged into) and the buffers behind it.
+            let mut ids = bits::zeroed(width + inputs.len());
+            let (dense, tail) = ids.split_at_mut(width);
             for node in operands() {
                 mark(dense, base, node.id);
                 node.mark_below(dense, base);
             }
+            tail.copy_from_slice(inputs);
             // One operand: its set plus itself, which is not in it.
-            let below = if count == 1 { upper } else { dense.iter().map(|word| word.count_ones() as usize).sum() };
-            return Measure { below, inputs: inputs.len(), ids: concat_ids(dense, inputs), base, words: width as u32, sparse: false };
+            let below = if count == 1 { upper } else { bits::count_ones(dense) };
+            return Measure { below, inputs: inputs.len(), ids, base, words: width as u32, sparse: false };
         }
         below.clear();
         for node in operands() {
@@ -2025,7 +2025,7 @@ pub(crate) fn create(
             Src::Scalar(_) => {}
         }
     }
-    jit.live.add_weak(weak.clone());
+    jit.with_live(|live| live.add_weak(weak.clone()));
     if let Some(hash) = cons_key {
         jit.cons_insert(if cut { cons_hash(op, len, &args) } else { hash }, weak);
     }
@@ -2068,7 +2068,7 @@ pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate
         handles: AtomicU32::new(0),
     });
     let _ = node.deferred.set(reduced);
-    ctx.jit().live.add_weak(Arc::downgrade(&node));
+    ctx.jit().with_live(|live| live.add_weak(Arc::downgrade(&node)));
     node
 }
 
@@ -2147,6 +2147,73 @@ struct ConsTable {
 
 /// Entries of the table at which dead ones are pruned before the next insert, at least.
 const CONS_PRUNE_AT: usize = 4096;
+
+/// What a thread keeps for each context it made operations in (see [`CONS`] and [`LIVE`]).
+struct Slot<T> {
+    /// The [`JitState::id`] of the context.
+    jit: u64,
+    /// Dead once the context is dropped, which frees the slot.
+    alive: Weak<()>,
+    value: T,
+}
+
+/// The [`Slot`]s of one thread, the latest context last.
+struct Slots<T> {
+    slots: Vec<Slot<T>>,
+    /// Calls since slots of dropped contexts were last looked for.
+    calls: u32,
+}
+
+impl<T> Slots<T> {
+    const fn new() -> Self {
+        Slots { slots: Vec::new(), calls: 0 }
+    }
+}
+
+impl<T: Default> Slots<T> {
+    /// How many calls (a power of two minus one) pass between looks for the slots of dropped
+    /// contexts.
+    const SWEEP_MASK: u32 = (1 << 14) - 1;
+
+    /// The value of `jit`, made if the thread has none yet.
+    #[inline]
+    fn of(&mut self, jit: &JitState) -> &mut T {
+        self.calls = self.calls.wrapping_add(1);
+        // The context of the last call is the one of the next, nearly always.
+        let last = self.slots.len().wrapping_sub(1);
+        if self.calls & Self::SWEEP_MASK != 0 && self.slots.get(last).is_some_and(|slot| slot.jit == jit.id) {
+            return &mut self.slots[last].value;
+        }
+        self.find(jit)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn find(&mut self, jit: &JitState) -> &mut T {
+        self.slots.retain(|slot| slot.jit == jit.id || slot.alive.strong_count() > 0);
+        let at = match self.slots.iter().rposition(|slot| slot.jit == jit.id) {
+            Some(at) => at,
+            None => {
+                self.slots.push(Slot { jit: jit.id, alive: Arc::downgrade(&jit.alive), value: T::default() });
+                self.slots.len() - 1
+            }
+        };
+        // The latest context goes last, where `of` looks first.
+        let last = self.slots.len() - 1;
+        self.slots.swap(at, last);
+        &mut self.slots[last].value
+    }
+}
+
+thread_local! {
+    /// Every node this thread created in a context and that is not yet known to be evaluated
+    /// (oldest first), so that [`Context::sync`] can evaluate the live ones. The sweeps only take
+    /// the nodes of the calling thread, so the lists need no lock.
+    static LIVE: std::cell::RefCell<Slots<readers::ReaderList>> = const { std::cell::RefCell::new(Slots::new()) };
+    /// The [`ConsTable`]s of this thread. A thread only ever shares the nodes it made itself, so
+    /// the tables need no lock.
+    static CONS: std::cell::RefCell<Slots<ConsTable>> = const { std::cell::RefCell::new(Slots::new()) };
+}
 
 /// Most levels of shifted lazy expressions a kernel stages in workgroup memory.
 const MAX_STAGES: u8 = 3;
@@ -2271,9 +2338,6 @@ pub(crate) struct JitState {
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
     /// that a loop run again does not generate and hash its source again.
     loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
-    /// Every node created and not yet known to be evaluated, oldest first, so that
-    /// [`Context::sync`] can evaluate the live ones.
-    live: Readers,
     /// The reductions made and not yet recorded (see [`multireduce`]), oldest first.
     reductions: Mutex<Vec<std::sync::Weak<crate::reduce::Reduced>>>,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
@@ -2311,7 +2375,6 @@ pub(crate) struct JitState {
     recipe_hits: AtomicU64,
     /// Counts the writes into buffers, so that [`ConsTable`] never outlives a change of contents.
     write_epoch: AtomicU64,
-    cons: Mutex<ConsTable>,
     /// The cuts of expressions made while profiling (or recording them in tests), if on.
     splits: Mutex<Option<Vec<FusionSplit>>>,
     /// Instructions of the program of the last kernel looked up (tests).
@@ -2332,6 +2395,9 @@ pub(crate) struct JitState {
     stats: Stats,
     /// Tells this state from the ones of other contexts (the `eval` history of a thread is kept by the thread, see [`looped`]).
     id: u64,
+    /// Only held here: the per-thread lists of this context ([`Slots`]) see by it when the
+    /// context is gone.
+    alive: Arc<()>,
     /// Follows reduction readbacks to find loops that can be speculated (see [`speculate`]).
     speculation: Mutex<speculate::Tracker>,
     /// The programs of register loops that ran before, by call site (see [`rerun`]).
@@ -2395,7 +2461,6 @@ impl JitState {
             stencils: BuildCache::default(),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
-            live: Readers::default(),
             reductions: Mutex::new(Vec::new()),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
@@ -2418,7 +2483,6 @@ impl JitState {
             #[cfg(test)]
             recipe_hits: AtomicU64::new(0),
             write_epoch: AtomicU64::new(0),
-            cons: Mutex::new(ConsTable::default()),
             splits: Mutex::new(None),
             #[cfg(test)]
             last_program_len: AtomicUsize::new(0),
@@ -2431,6 +2495,7 @@ impl JitState {
             loop_work: AtomicU64::new(0),
             stats: Stats::default(),
             id: NEXT_JIT_ID.fetch_add(1, Ordering::Relaxed),
+            alive: Arc::new(()),
             speculation: Mutex::new(speculate::Tracker::new(
                 !std::env::var(SPECULATE_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
             )),
@@ -2549,20 +2614,22 @@ impl JitState {
     /// The pending node that already computes the operation `op` on `args` (of `hash`, see
     /// [`cons_hash`]), if any.
     fn cons_lookup(&self, hash: u64, op: Op, len: usize, args: &Args) -> Option<Arc<Node>> {
-        let mut table = lock(&self.cons);
         let epoch = self.write_epoch.load(Ordering::Relaxed);
-        if table.epoch != epoch {
-            table.map.clear();
-            table.epoch = epoch;
-            return None;
-        }
-        let node = table.map.get(&hash)?.upgrade()?;
+        // The upgraded node is checked outside the table: it may be the last owner of its node.
+        let node = self.with_cons(|table| {
+            if table.epoch != epoch {
+                table.map.clear();
+                table.epoch = epoch;
+                return None;
+            }
+            table.map.get(&hash)?.upgrade()
+        })?;
         // A node computed inside another kernel is a dead temporary of an earlier expression:
         // sharing it would tie this expression to that one (and to its steps in a loop).
-        // One created by another thread is that thread's (it may be recording it, flattening it or
-        // waiting for what this thread evaluates: two threads sharing a node can deadlock).
+        // (The table of a thread only holds the nodes that thread made: two threads sharing a
+        // node can deadlock, one may be recording it, flattening it or waiting for what the other
+        // evaluates.)
         let usable = node.is_pending()
-            && node.thread == current_thread()
             && node.handles.load(Ordering::Relaxed) == 0
             && !node.fused.load(Ordering::Relaxed)
             && match lock(&node.args).as_ref() {
@@ -2575,17 +2642,28 @@ impl JitState {
     }
 
     fn cons_insert(&self, hash: u64, weak: Weak<Node>) {
-        let mut table = lock(&self.cons);
         let epoch = self.write_epoch.load(Ordering::Relaxed);
-        if table.epoch != epoch {
-            table.map.clear();
-            table.epoch = epoch;
-        }
-        if table.map.len() > table.prune_at.max(CONS_PRUNE_AT) {
-            table.map.retain(|_, weak| weak.strong_count() > 0);
-            table.prune_at = 2 * table.map.len();
-        }
-        table.map.insert(hash, weak);
+        self.with_cons(|table| {
+            if table.epoch != epoch {
+                table.map.clear();
+                table.epoch = epoch;
+            }
+            if table.map.len() > table.prune_at.max(CONS_PRUNE_AT) {
+                table.map.retain(|_, weak| weak.strong_count() > 0);
+                table.prune_at = 2 * table.map.len();
+            }
+            table.map.insert(hash, weak);
+        });
+    }
+
+    /// Runs `f` on the calling thread's [`ConsTable`] of this context.
+    fn with_cons<R>(&self, f: impl FnOnce(&mut ConsTable) -> R) -> R {
+        CONS.with_borrow_mut(|slots| f(slots.of(self)))
+    }
+
+    /// Runs `f` on the calling thread's list of live nodes of this context.
+    fn with_live<R>(&self, f: impl FnOnce(&mut readers::ReaderList) -> R) -> R {
+        LIVE.with_borrow_mut(|slots| f(slots.of(self)))
     }
 
     /// Starts recording the cuts of expressions (see [`FusionSplit`]).
@@ -2829,7 +2907,7 @@ impl JitState {
     /// fused into the kernel of another one.
     fn evaluate_swept(&self, held: bool) {
         let me = current_thread();
-        let nodes = self.live.take_if(|node| node.thread == me);
+        let nodes = self.with_live(|live| live.take_if(|node| node.thread == me));
         let mut pending: Vec<Arc<Node>> = nodes.into_iter().rev().filter_map(|weak| weak.upgrade()).collect();
         while let Some(first) = pending.first() {
             let len = first.len;
@@ -2843,7 +2921,7 @@ impl JitState {
                 if !node.is_pending() || (node.fused.load(Ordering::Relaxed) && !kept) {
                     // Still wanted by a later `evaluate_held`.
                     if !held && node.is_pending() && node.handles.load(Ordering::Relaxed) > 0 {
-                        self.live.add_weak(Arc::downgrade(&node));
+                        self.with_live(|live| live.add_weak(Arc::downgrade(&node)));
                     }
                     continue;
                 }
@@ -2925,7 +3003,7 @@ impl JitState {
                 && !node.is_pending_view()
         };
         let mut candidates = Vec::new();
-        self.live.for_each_newest(|weak| {
+        self.with_live(|live| live.for_each_newest(|weak| {
             let Some(node) = weak.upgrade() else { return };
             if node.len != len
                 || node.thread != me
@@ -2939,7 +3017,7 @@ impl JitState {
                 return;
             }
             candidates.push(node);
-        });
+        }));
         let mut tmp = Vec::new();
         for (idx, node) in candidates.iter().enumerate() {
             if group.iter().any(|m| m.id == node.id) || (below.contains(node.id) && !held_in_below(node)) {
