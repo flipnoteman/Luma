@@ -6,11 +6,11 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
-## [0.5.1] - 2026-11-21
+## [0.5.2] - 2026-11-21
 
 ### Changed
 
-- Packaging only, no code changes. `luma-hal-core`, `luma-hal-cpu`, `luma-hal-cuda`, `luma-hal-metal` and `luma-hal-wgpu` each ship their own README and license files and set `homepage` (the user guide). `luma-hal-cuda`'s license is `(MIT OR Apache-2.0) AND LicenseRef-NVIDIA-CUDA-EULA`, naming the embedded NVIDIA libdevice. 0.5.0 was not published as `luma`; 0.5.1 is the first 0.5 release on crates.io.
+- Packaging only, no code changes. `luma-hal-core`, `luma-hal-cpu`, `luma-hal-cuda`, `luma-hal-metal` and `luma-hal-wgpu` each ship their own README and license files and set `homepage` (the user guide). `luma-hal-cuda`'s license is `(MIT OR Apache-2.0) AND LicenseRef-NVIDIA-CUDA-EULA`, naming the embedded NVIDIA libdevice. 0.5.0 was not published as `luma`, and 0.5.1 was skipped; 0.5.2 is the first 0.5 release on crates.io.
 
 ## [0.5.0] - 2026-11-20
 
@@ -679,8 +679,8 @@ All notable changes to Luma are listed here. The format follows
 - A WGSL compute shader and an `Executor` that doubles every value of an array (`double_test`).
 - A library layout, with the shader loaded from a hard-coded relative path.
 
-[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.5.1...HEAD
-[0.5.1]: https://github.com/flipnoteman/Luma/compare/v0.5.0...v0.5.1
+[Unreleased]: https://github.com/flipnoteman/Luma/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/flipnoteman/Luma/compare/v0.5.0...v0.5.2
 [0.5.0]: https://github.com/flipnoteman/Luma/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/flipnoteman/Luma/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/flipnoteman/Luma/compare/v0.3.0...v0.4.0
