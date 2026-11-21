@@ -22,6 +22,7 @@ cranelift-frontend.workspace = true
 cranelift-native.workspace = true
 target-lexicon.workspace = true
 log.workspace = true
+matrixmultiply.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -817,6 +817,26 @@ pub struct LineSolveSpec {
     pub lines_per_group: u32,
 }
 
+/// A matrix product that a backend may run as native code instead of compiling the tiled shader
+/// that describes it (`Builtin::Matmul` of `luma`). The launch is the shader's: the bindings `c`
+/// (written), `a` and `b` (read) and the uniform `{m, n, k, kc}` (`u32`s), one workgroup per
+/// output tile of `edge` x `edge` (the tiles numbered row by row along the folded grid: tile
+/// `x + y * num_workgroups.x`, column tile `tile % ceil(n / edge)`), the third grid dimension
+/// slicing K: workgroup layer `z` multiplies `K` from `z * kc` to `min(k, (z + 1) * kc)` and
+/// writes its tile of the `M x N` partial product at `z * m * n` of `c`. `a` is the row-major
+/// `M x K` matrix, `b` the row-major `K x N` one, `c` row-major `M x N`; `c` is overwritten. With
+/// `lhs_transposed` the buffer `a` holds the row-major `K x M` matrix instead (the product reads
+/// its transpose), with `rhs_transposed` `b` holds the row-major `N x K` one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatmulSpec {
+    /// The edge of an output tile.
+    pub edge: u32,
+    /// Whether `a` holds the transpose of the left matrix.
+    pub lhs_transposed: bool,
+    /// Whether `b` holds the transpose of the right matrix.
+    pub rhs_transposed: bool,
+}
+
 /// A GPU backend: allocates buffers, compiles kernels and records and runs work.
 pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// What is known about the device.
@@ -884,6 +904,16 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// plans them for it (the block Thomas algorithm, never cyclic reduction on its own).
     fn native_line_solve(&self) -> bool {
         false
+    }
+    /// The cores a native matrix product ([`Backend::compile_matmul`]) spreads over, `None` if the
+    /// backend has none: the library then plans the products for it (output tiles that keep that
+    /// many cores busy, see `matmul::native_plan`).
+    fn native_matmul(&self) -> Option<u32> {
+        None
+    }
+    /// The native code of a matrix product (always `None` unless [`Backend::native_matmul`]).
+    fn compile_matmul(&self, _spec: &MatmulSpec) -> Option<RawKernel> {
+        None
     }
     /// The native code of a line solve, `None` to compile the shader instead (always `None` unless
     /// [`Backend::native_line_solve`]).

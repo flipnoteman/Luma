@@ -33,6 +33,10 @@ const LOOKBACK_ENV: &str = "LUMA_LOOKBACK_SCAN";
 /// as compiled shaders, like the GPU backends (see [`Tuning::native_solve`]).
 const NATIVE_SOLVE_ENV: &str = "LUMA_NATIVE_SOLVE";
 
+/// `LUMA_NATIVE_GEMM=off` runs the matrix products of a backend that has native ones (the CPU
+/// backend) as compiled tile kernels, like the GPU backends (see [`Tuning::native_gemm`]).
+const NATIVE_GEMM_ENV: &str = "LUMA_NATIVE_GEMM";
+
 /// The algorithm of the tridiagonal and block-tridiagonal line solves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum LineSolver {
@@ -120,6 +124,10 @@ pub(crate) struct Tuning {
     /// `LUMA_NATIVE_SOLVE=off` clears it): the planner then never takes cyclic reduction on its own and
     /// solves blocks of any size by the block Thomas algorithm (see `builtin::thomas_plan`).
     pub(crate) native_solve: bool,
+    /// The cores a native matrix product spreads over (`Backend::native_matmul`; 0 if the backend has
+    /// none or `LUMA_NATIVE_GEMM=off`): the products are then planned as output tiles for that many
+    /// cores and their operands evaluated first (see `matmul::native_plan`).
+    pub(crate) native_gemm: u32,
     /// Whether a scan of long contiguous lines is one kernel that reads its input once, with a
     /// decoupled look-back (each workgroup takes a chunk from an atomic counter, publishes the
     /// chunk's aggregate and waits for the prefix of the chunks before it, see
@@ -162,6 +170,7 @@ impl Tuning {
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
         native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
     };
 
@@ -195,6 +204,7 @@ impl Tuning {
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
         native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
     };
 
@@ -225,6 +235,7 @@ impl Tuning {
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
         native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
     };
 
@@ -295,6 +306,11 @@ impl Tuning {
     /// [`Tuning::native_solve`].
     pub(crate) fn native_solve_for(supported: bool) -> bool {
         supported && std::env::var(NATIVE_SOLVE_ENV).as_deref().map(str::trim) != Ok("off")
+    }
+
+    /// The cores of [`Tuning::native_gemm`], given the cores of the backend's native product (if it has one).
+    pub(crate) fn native_gemm_for(cores: Option<u32>) -> u32 {
+        cores.filter(|_| std::env::var(NATIVE_GEMM_ENV).as_deref().map(str::trim) != Ok("off")).unwrap_or(0)
     }
 
     /// The generic parameters, for tests that need a `Tuning` without a device.

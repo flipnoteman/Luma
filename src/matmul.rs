@@ -27,7 +27,7 @@ use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
-use crate::jit::{self, MatmulSide};
+use crate::jit::{self, AxisMap, Edge, ElemTy, MatmulSide, OpKind, ShiftKind, Src};
 use crate::ops::{fold_grid, Outcome};
 
 /// Output tile of the kernel.
@@ -41,6 +41,10 @@ pub(crate) enum MatmulTile {
     T32x128,
     /// 32x32, each of the 16x16 invocations computes 2x2.
     T32,
+    /// A square tile of the given `edge` that a backend with native products multiplies as native
+    /// code (see [`native_plan`]), the buffer of an operand holding the matrix transposed if
+    /// `lhs_t` / `rhs_t`; its shader is that of `T32` (the bindings), never run.
+    Native { edge: u32, lhs_t: bool, rhs_t: bool },
 }
 
 impl MatmulTile {
@@ -51,6 +55,7 @@ impl MatmulTile {
             MatmulTile::T128x32 => (128, 32),
             MatmulTile::T32x128 => (32, 128),
             MatmulTile::T32 => (32, 32),
+            MatmulTile::Native { edge, .. } => (edge, edge),
         }
     }
 }
@@ -173,6 +178,98 @@ fn plan(m: u32, n: u32, k: u32, max_groups: u32, max_bytes: u64) -> Result<Plan,
     Ok(Plan { tile, aligned, slices, kc, groups })
 }
 
+/// Output tile edges a native product chooses from, largest first (see [`native_plan`]).
+const NATIVE_EDGES: [u32; 3] = [128, 64, 32];
+/// Output tiles per core a native product aims for: the cores take them as they free up.
+const NATIVE_TILES_PER_CORE: u32 = 2;
+/// Smallest K a slice of a split native product covers.
+const NATIVE_SPLIT_SLICE: u32 = 1024;
+
+/// The plan of an `m x k` by `k x n` product the backend multiplies as native code on `cores`
+/// cores: the largest tile of [`NATIVE_EDGES`] that leaves [`NATIVE_TILES_PER_CORE`] tiles per
+/// core, else the smallest; with fewer tiles than that and a long K, K is split over the third
+/// grid dimension like [`split_of`] does (partial products summed by a second launch).
+fn native_plan(m: u32, n: u32, k: u32, cores: u32, transposed: [bool; 2], max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    let wanted = cores.max(1).saturating_mul(NATIVE_TILES_PER_CORE);
+    let tiles_at = |edge: u32| m.div_ceil(edge).saturating_mul(n.div_ceil(edge));
+    let edge = NATIVE_EDGES.into_iter().find(|&edge| tiles_at(edge) >= wanted).unwrap_or(NATIVE_EDGES[NATIVE_EDGES.len() - 1]);
+    let (columns, rows) = (n.div_ceil(edge), m.div_ceil(edge));
+    let tiles = columns.saturating_mul(rows);
+    let split = (tiles < wanted && k >= 2 * NATIVE_SPLIT_SLICE).then(|| {
+        let kc = k.div_ceil(wanted.div_ceil(tiles).min(k / NATIVE_SPLIT_SLICE)).next_multiple_of(SLICE);
+        (k.div_ceil(kc), kc)
+    });
+    let (slices, kc) = split
+        .filter(|&(slices, _)| slices >= 2 && u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes)
+        .unwrap_or((1, k));
+    let [x, y, _] = if columns <= max_groups && rows <= max_groups { [columns, rows, 1] } else { fold_grid(tiles, max_groups) };
+    let groups = [x, y, slices];
+    if groups.iter().any(|&count| count > max_groups) {
+        return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
+    }
+    Ok(Plan { tile: MatmulTile::Native { edge, lhs_t: transposed[0], rhs_t: transposed[1] }, aligned: false, slices, kc, groups })
+}
+
+/// The operand of a native product that is a transposed view (a swap of axes 0 and 1, see
+/// `host::transposed_source`): what it is the transpose of, so that the product reads that
+/// buffer through its strides instead of the view being copied.
+fn transposed_source(array: &Array<f32>) -> Option<Src> {
+    let node = array.pending()?;
+    let op = node.op();
+    let OpKind::Shift(ShiftKind::View { map, edge: Edge::None }) = op.kind else { return None };
+    let unit = |from: u8| AxisMap { from, start: 0, step: 1 };
+    let swaps = op.ty == ElemTy::F32
+        && map.axes[0] == unit(1)
+        && map.axes[1] == unit(0)
+        && map.axes[2] == unit(2)
+        && map.axes[3] == unit(3)
+        && map.src[0] == map.out[1]
+        && map.src[1] == map.out[0]
+        && map.src[2..] == [1, 1]
+        && map.out[2..] == [1, 1];
+    if !swaps || node.failure().is_some() || node.is_looped() {
+        return None;
+    }
+    let [source, ..] = node.operands()?;
+    matches!(source, Src::Buffer(_) | Src::Node(_)).then_some(source)
+}
+
+/// The operands of a product that is multiplied natively, with whether each is read transposed:
+/// the native product reads buffers, so the operands that are expressions (or the expressions a
+/// transposed view reads) are evaluated first, together, sharing what they read.
+fn native_sides(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<([MatmulSide; 2], [bool; 2])> {
+    // A poisoned operand reports its own error.
+    let mut sources = [None, None];
+    for (array, source) in [lhs, rhs].into_iter().zip(&mut sources) {
+        *source = transposed_source(array);
+        match (&*source, array.pending()) {
+            (Some(Src::Node(node)), _) if node.is_pending() => array.context().jit().request(node),
+            (Some(_), _) => {}
+            (None, Some(node)) => array.context().jit().request(node),
+            (None, None) => drop(array.ready()?),
+        }
+    }
+    if !ctx.same_as(rhs.context()) {
+        return Err(LumaError::ContextMismatch.into());
+    }
+    ctx.jit().evaluate_requested();
+    let mut sides = Vec::with_capacity(2);
+    for (array, source) in [lhs, rhs].into_iter().zip(sources) {
+        let (storage, transposed) = match source {
+            Some(Src::Buffer(storage)) => (storage, true),
+            Some(Src::Node(node)) => (Arc::clone(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?), true),
+            _ => {
+                let (pin, bytes) = array.ready()?;
+                sides.push((MatmulSide::Ready(pin, bytes), false));
+                continue;
+            }
+        };
+        sides.push((MatmulSide::Ready(storage.pin_single()?, storage.byte_len()), transposed));
+    }
+    let [(lhs_side, lhs_t), (rhs_side, rhs_t)]: [_; 2] = sides.try_into().ok().ok_or_else(|| Failure::from(LumaError::Gpu("matrix product operands".into())))?;
+    Ok(([lhs_side, rhs_side], [lhs_t, rhs_t]))
+}
+
 /// The side of the product `array` stands for: its expression if it is pending (so it may be
 /// fused), else its buffer.
 fn side(ctx: &Context, array: &Array<f32>) -> Outcome<MatmulSide> {
@@ -211,7 +308,8 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
         return Ok(out);
     }
     // Operands first, so that a poisoned one reports its own error.
-    let sides = [side(ctx, lhs)?, side(rhs.context(), rhs)?];
+    let cores = ctx.tuning().native_gemm;
+    let (sides, transposed) = if cores > 0 { native_sides(ctx, lhs, rhs)? } else { ([side(ctx, lhs)?, side(rhs.context(), rhs)?], [false; 2]) };
     if !ctx.same_as(rhs.context()) {
         return Err(LumaError::ContextMismatch.into());
     }
@@ -222,7 +320,11 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
     let (k, m, n) = (ld[0], ld[1], rd[0]);
     let too_large = |extent: usize| u32::try_from(extent).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: [n, m, 1, 1] }));
     let (m32, n32, k32) = (too_large(m)?, too_large(n)?, too_large(k)?);
-    let plan = plan(m32, n32, k32, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?;
+    let plan = if cores > 0 {
+        native_plan(m32, n32, k32, cores, transposed, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
+    } else {
+        plan(m32, n32, k32, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
+    };
 
     let out = Array::<f32>::alloc(ctx, [n, m, 1, 1].into())?;
     let out_storage = Arc::clone(out.storage()?);
@@ -343,7 +445,7 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
         MatmulTile::T128 => t128(aligned, split, &loads),
         MatmulTile::T128x32 => t128x32(aligned, split, &loads),
         MatmulTile::T32x128 => t32x128(aligned, split, &loads),
-        MatmulTile::T32 => t32(aligned, split, &loads),
+        MatmulTile::T32 | MatmulTile::Native { .. } => t32(aligned, split, &loads),
     }
 }
 
@@ -813,5 +915,34 @@ mod tests {
         let p = plan(1 << 22, 8, 16, 1 << 12, u64::MAX).unwrap();
         assert!(p.groups[0] * p.groups[1] >= 1 << 15);
         assert!(plan(1 << 22, 64, 16, 65535, u64::MAX).is_ok());
+    }
+
+    fn native(edge: u32) -> MatmulTile {
+        MatmulTile::Native { edge, lhs_t: false, rhs_t: false }
+    }
+
+    #[test]
+    fn a_native_plan_keeps_the_cores_busy() {
+        let plan = |m, n, k, cores| native_plan(m, n, k, cores, [false; 2], 65535, u64::MAX).unwrap();
+        // The largest tile that leaves two tiles per core.
+        let p = plan(4096, 4096, 4096, 32);
+        assert_eq!((p.tile, p.slices, p.groups), (native(128), 1, [32, 32, 1]));
+        let p = plan(512, 512, 512, 32);
+        assert_eq!((p.tile, p.groups), (native(64), [8, 8, 1]));
+        let p = plan(100, 100, 100, 32);
+        assert_eq!((p.tile, p.slices, p.groups), (native(32), 1, [4, 4, 1]));
+        // Few tiles and a long K: sliced, every slice a multiple of 16 that covers K.
+        let p = plan(64, 64, 4099, 32);
+        assert_eq!((p.tile, p.groups[..2].to_vec()), (native(32), vec![2, 2]));
+        assert!(p.slices >= 2 && p.kc % SLICE == 0 && p.slices * p.kc >= 4099 && (p.slices - 1) * p.kc < 4099, "{p:?}");
+        assert_eq!(plan(64, 64, 1 << 20, 1).slices, 1);
+        // The partial sums must fit a buffer.
+        assert_eq!(native_plan(64, 64, 1 << 20, 32, [false; 2], 65535, 1000).unwrap().slices, 1);
+        // The transposed operands are the tile's.
+        let p = native_plan(512, 512, 512, 32, [true, false], 65535, u64::MAX).unwrap();
+        assert_eq!(p.tile, MatmulTile::Native { edge: 64, lhs_t: true, rhs_t: false });
+        // Tall products fold over the grid.
+        let p = native_plan(1 << 22, 8, 16, 32, [false; 2], 1 << 12, u64::MAX).unwrap();
+        assert!(p.groups[0] <= 1 << 12 && p.groups[1] <= 1 << 12 && p.groups[0] * p.groups[1] >= 1 << 15, "{p:?}");
     }
 }
