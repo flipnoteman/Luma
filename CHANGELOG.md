@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `luma-bench` keeps calling a case for up to 150 ms (when it takes under 5 ms) before timing it, so GPUs that idled between cases are at working clocks: an NVIDIA GPU drops to 210 MHz after ~50 ms idle, which made wgpu's sub-millisecond `jit/fusion` kernels (12 us) measure 8-15x slower than CUDA's.
+
 ### Added
 
 - `Array::quantiles(&[q])` and `quantiles_axis(axis, &[q])`: many quantiles of an `f32` array (or of every line along an axis) from one sort. A call of `quantile` / `quantile_axis` per quantile sorts every time, and the sort is nearly all of the cost. On an RTX 3090 (CUDA) seven quantiles of 16M elements take 1.3 ms with `quantiles` against 8.7 ms for seven `quantile` calls, and three quantiles per column of a 1M x 64 table 8.7 ms with `quantiles_axis` against 26.2 ms. Entry `j` along the axis is the quantile `qs[j]`; nothing is cached between calls (a sorted copy would cost as much memory as the array).

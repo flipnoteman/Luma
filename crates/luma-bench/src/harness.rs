@@ -139,6 +139,13 @@ impl Harness {
         };
         let first = run(f);
         let warm = run(f).max(run(f));
+        // A GPU that idled between cases runs at low clocks (NVIDIA drops to 210 MHz within
+        // ~50 ms, which made a 12 us kernel take 150 us in a case); keep calling the case for
+        // a while so the clocks are up when the timed calls start.
+        let started = Instant::now();
+        while warm < 5.0 && started.elapsed().as_millis() < 150 {
+            run(f);
+        }
         let reps = if let Some(r) = std::env::var("LUMA_BENCH_REPS").ok().and_then(|v| v.parse().ok()) {
             r
         } else if warm > 1000.0 {
