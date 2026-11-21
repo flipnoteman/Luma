@@ -137,13 +137,14 @@ impl Harness {
             ctx.sync().expect("sync");
             t.elapsed().as_secs_f64() * 1e3
         };
+        let started = Instant::now();
         let first = run(f);
         let warm = run(f).max(run(f));
         // A GPU that idled between cases runs at low clocks (NVIDIA drops to 210 MHz within
-        // ~50 ms, which made a 12 us kernel take 150 us in a case); keep calling the case for
-        // a while so the clocks are up when the timed calls start.
-        let started = Instant::now();
-        while warm < 5.0 && started.elapsed().as_millis() < 150 {
+        // ~50 ms, which made a 12 us kernel take 150 us in a case, and a laptop GPU can start a
+        // 1 ms case in P8 and take 12 ms); keep calling the case until it has run for 250 ms so
+        // the clocks are up when the timed calls start, whatever the case's length.
+        while started.elapsed().as_millis() < 250 {
             run(f);
         }
         let reps = if let Some(r) = std::env::var("LUMA_BENCH_REPS").ok().and_then(|v| v.parse().ok()) {
