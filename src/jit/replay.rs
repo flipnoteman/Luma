@@ -79,6 +79,23 @@ impl Plan {
         self.cmds.len()
     }
 
+    /// The nanoseconds the cost model gives the plan's launches, as `(launching, moving)`: a
+    /// launch each, and the bytes of the buffers they bind moved at the device's bandwidth (what the
+    /// planner measures a kernel by, see `cost::kernel_ns`).
+    pub(crate) fn modeled_ns(&self) -> (f64, f64) {
+        let cost = self.ctx.cost_model();
+        let bytes: u64 = self
+            .cmds
+            .iter()
+            .flat_map(|cmd| &cmd.args)
+            .map(|arg| match arg {
+                CmdArg::Storage { bytes, .. } => *bytes,
+                CmdArg::Uniform(_) => 0,
+            })
+            .sum();
+        (self.cmds.len() as f64 * cost.launch_us * 1e3, bytes as f64 / cost.bandwidth_gbs)
+    }
+
     /// Whether some command binds `buffer` writable.
     pub(crate) fn writes(&self, buffer: &Buffer) -> bool {
         self.cmds.iter().any(|cmd| {
@@ -611,6 +628,11 @@ impl Trace {
         self.recording && self.ctx.recording_here() && self.ctx.recorded() == 0
     }
 
+    /// Whether the recording is still going (nothing aborted it).
+    pub(crate) fn recording(&self) -> bool {
+        self.recording && self.ctx.recording_here()
+    }
+
     /// Stops recording without a plan (nothing was launched).
     pub(crate) fn pause(&mut self) {
         if std::mem::take(&mut self.recording) {
@@ -655,6 +677,24 @@ impl Trace {
         } else {
             None
         }
+    }
+
+    /// [`Trace::finish`] for `results` that are several steps of a loop applied to the probes
+    /// (the unrolled body of a loop): the stepper of the recorded launches, or `None` when it
+    /// is not worth it (the plan makes `launches` launches or more, what the steps make one
+    /// by one) or cannot be stepped. Nothing is ever run for real here, whatever the answer:
+    /// the caller still holds the single-step stepper.
+    pub(crate) fn finish_chain<T: GpuType>(
+        &mut self,
+        results: &[&Array<T>],
+        launches: usize,
+    ) -> std::result::Result<Option<Stepper>, Failure> {
+        let outs = force(results)?;
+        let Some(plan) = self.finish_plan() else { return Ok(None) };
+        if plan.launches() >= launches {
+            return Ok(None);
+        }
+        Ok(Stepper::new(&self.ctx, plan, &self.init, &self.probe_storages, outs).ok())
     }
 }
 

@@ -436,3 +436,27 @@ fn blocks_replayed_as_graphs_match_the_host_loop_and_the_launches_replayed_one_b
     }
     assert!(ran > 0, "no backend to run on");
 }
+
+/// A long one-shot loop replays the blocks after its first as repeated graphs of a few steps
+/// where the backend has them; stopping inside such a graph, or in a block that does not fill
+/// whole ones, gives the same history and state as the host loop.
+#[test]
+fn a_long_one_shot_loop_stops_at_the_same_step_whatever_the_graph_units() {
+    for every in [None, Some(7), Some(50), Some(1000)] {
+        for stop in [5.0f32, 37.0, 300.0, 301.0, 999.0, 5000.0] {
+            let ctx = Context::new().unwrap();
+            let mut until = Until::new(1000).record("v", |s: &One| s.0.max()).stop_when(move |h| h["v"].last().ge(stop));
+            if let Some(n) = every {
+                until = until.check_every(n);
+            }
+            let start = Array::from_slice_on(&ctx, &[0.0f32; 33], 33).unwrap();
+            let run = iterate_until_all((start,), until, |s, _| (&s.0 + 1.0,)).unwrap();
+            let steps = (stop as usize).min(1000);
+            let want: Vec<f32> = (1..=steps).map(|k| k as f32).collect();
+            assert_eq!(run.steps, steps, "every {every:?}, stop {stop}");
+            assert_eq!(run.reason, if stop <= 1000.0 { StopReason::Predicate(0) } else { StopReason::MaxSteps }, "every {every:?}, stop {stop}");
+            assert_eq!(run.history("v").unwrap(), &want[..], "every {every:?}, stop {stop}");
+            assert_eq!(run.state.0.to_vec().unwrap(), vec![steps as f32; 33], "every {every:?}, stop {stop}");
+        }
+    }
+}

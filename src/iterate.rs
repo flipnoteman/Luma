@@ -3,12 +3,15 @@
 use std::any::TypeId;
 use std::panic::Location;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::array::{Array, Failure, Storage};
 use crate::error::LumaError;
+use crate::gpu::lock;
 use crate::gpu_type::ScalarType;
-use crate::jit::{self, Trace};
+use crate::jit::{self, Plan, Stepper, Trace};
 use crate::ops::Outcome;
+use luma_core::BackendKind;
 
 /// Runs `steps` iterations of `step` on several arrays at once (of any [`ScalarType`], `f32`,
 /// [`Df32`](crate::Df32), `f64`, ...): `step` gets the current values
@@ -19,8 +22,11 @@ use crate::ops::Outcome;
 /// one type). It runs in launches of about 40 ms of GPU time by the device's [`CostModel`](crate::CostModel), so a
 /// long loop is a handful of launches. Anything else, such as shifts, `cache()` or `assign` or
 /// states of another type, is traced once and its recorded kernels are replayed, step by step.
-/// `step` is called once to trace it; it must compute its results from its arguments and captured
-/// arrays only.
+/// A step of lazy expressions only (shifts, say) is also traced as the body of several steps
+/// (up to 16) when the planner fuses those into fewer launches than the steps make one by one,
+/// which the loop then replays, and the steps that do not fill a body run one by one.
+/// `step` is called once to trace it, and up to 16 times more for the body of several steps; it
+/// must compute its results from its arguments and captured arrays only.
 ///
 /// A register loop called again from the same place in the source whose step builds the same
 /// graph (the same operations and scalar values) over other arrays, states or captured, is not
@@ -108,13 +114,15 @@ fn replayed_all<T: ScalarType, const N: usize>(
     let mut attempt = jit::Attempt::begin(ctx, site, &trace.init, &trace.probe_storages, steps);
     trace.begin()?;
     let Ok(probes): std::result::Result<[Array<T>; N], _> = probes.try_into() else { unreachable!() };
+    let started = Instant::now();
     let first = step(&probes);
     if let Some(attempt) = &mut attempt {
         attempt.stepped();
     }
     let shapes_match = first.iter().zip(&init).all(|(next, array)| next.shape() == array.shape());
 
-    if trace.untouched() {
+    let lazy = trace.untouched();
+    if lazy {
         // Only lazy expressions: they may be a loop that runs in one kernel.
         trace.pause();
         let traced: Option<Vec<Arc<jit::Node>>> = first.iter().map(|next| next.pending().cloned()).collect();
@@ -146,12 +154,123 @@ fn replayed_all<T: ScalarType, const N: usize>(
         }
         return Ok(states);
     };
-    stepper.run_steps(steps)?;
-    let mut finals = stepper.state_after(steps).iter();
+    let unrolled = if lazy && shapes_match { Some(started.elapsed()) } else { None };
+    let mut finals = run_stepper(init, steps, step, stepper, unrolled)?.into_iter();
     Ok(init.map(|array| match finals.next() {
-        Some(storage) => Array::from_storage(ctx, array.shape(), Arc::clone(storage)),
+        Some(storage) => Array::from_storage(ctx, array.shape(), storage),
         None => unreachable!(),
     }))
+}
+
+/// The storages of the state after `steps` steps of `stepper`, the traced single step of a loop
+/// from `init`. With `traced`, the time tracing it took, given where `step` is lazy expressions
+/// only, the loop runs as replays of an unrolled body where that pays (see [`trace_unrolled`]).
+fn run_stepper<T: ScalarType, const N: usize>(
+    init: [&Array<T>; N],
+    steps: usize,
+    step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+    mut stepper: Stepper,
+    traced: Option<Duration>,
+) -> Outcome<Vec<Arc<Storage>>> {
+    // The CPU backend has no workgroup memory to stage the shifted values of fused steps in: it
+    // recomputes them, which is slower than the steps one by one for a large state.
+    let site = (std::any::type_name_of_val(step), init[0].len(), N);
+    if let Some(traced) = traced.filter(|_| init[0].context().backend() != BackendKind::Cpu && !lock(&NOT_UNROLLED).contains(&site)) {
+        let depth = unroll_depth(steps, stepper.plan(), traced);
+        if let Some(unrolled) = trace_unrolled(init, depth, step, stepper.plan())? {
+            return run_unrolled(&mut stepper, &unrolled, depth, steps);
+        }
+        // Tracing the body costs host time that a loop whose steps do not fuse would pay at every call.
+        if depth >= 2 {
+            lock(&NOT_UNROLLED).insert(site);
+        }
+    }
+    stepper.run_steps(steps)?;
+    Ok(stepper.state_after(steps).to_vec())
+}
+
+/// The steps (by the type of the closure, the length of the state and the number of states) whose
+/// unrolled body did not pay, so that they are not traced again.
+type UnrollSite = (&'static str, usize, usize);
+
+static NOT_UNROLLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<UnrollSite>>> = std::sync::LazyLock::new(Default::default);
+
+/// Most steps of a pure expression traced as one body of a replayed loop (see [`trace_unrolled`]).
+const UNROLL_STEPS: usize = 16;
+
+/// The share of the time the cost model gives the loop that tracing its unrolled body may take.
+const UNROLL_TRACE_SHARE: f64 = 0.5;
+
+/// How many times the time a step moves its data takes the time of its launches, at least, for
+/// fusing steps to pay: a step that is a launch of a few microseconds costs about as much fused
+/// with others (a fused kernel is as long as the steps it holds, minus what they move).
+const UNROLL_BANDWIDTH_BOUND: f64 = 2.0;
+
+/// The steps in the unrolled body of a loop of `steps` steps (below 2: none) whose single step
+/// is `single` and took `traced` to trace: none for a step that is bound by its launches, else as
+/// many as the tracing (one trace per step) costs less than [`UNROLL_TRACE_SHARE`] of what the
+/// loop would take step by step by the cost model, which is all that fusing the steps can save.
+fn unroll_depth(steps: usize, single: &Plan, traced: Duration) -> usize {
+    let (launching, moving) = single.modeled_ns();
+    if moving < UNROLL_BANDWIDTH_BOUND * launching {
+        return 0;
+    }
+    let affordable = (steps as f64 * (launching + moving) * UNROLL_TRACE_SHARE / (traced.as_nanos() as f64).max(1.0)).min(UNROLL_STEPS as f64) as usize;
+    steps.min(affordable)
+}
+
+/// The stepper of `depth` steps of `step` traced as one body, where `depth` is at least 2: the
+/// launches the planner makes of the chain of `depth` steps of lazy expressions (it fuses steps
+/// of shifted expressions into kernels, as an eager loop that evaluates every step lazily
+/// does), when they make fewer launches than `depth` steps of `single` (the plan of one step)
+/// and the cost model gives them less time. `None` when unrolling does not help, or the
+/// traced code aborted the recording.
+fn trace_unrolled<T: ScalarType, const N: usize>(
+    init: [&Array<T>; N],
+    depth: usize,
+    step: &impl Fn(&[Array<T>; N]) -> [Array<T>; N],
+    single: &Plan,
+) -> Outcome<Option<Stepper>> {
+    if depth < 2 {
+        return Ok(None);
+    }
+    let (mut trace, probes) = Trace::start(&init)?;
+    let Ok(probes): std::result::Result<[Array<T>; N], _> = probes.try_into() else { unreachable!() };
+    if !trace.recording() {
+        return Ok(None);
+    }
+    let mut states = step(&probes);
+    for _ in 1..depth {
+        states = step(&states);
+    }
+    // The planner evaluates the steps it does not fuse while the chain is built: those launches are
+    // recorded with the rest.
+    let shapes_match = states.iter().zip(&init).all(|(next, array)| next.shape() == array.shape());
+    if !shapes_match || !trace.recording() {
+        return Ok(None);
+    }
+    let unrolled = trace.finish_chain(&states.each_ref(), depth * single.launches())?;
+    let total = |plan: &Plan| plan.modeled_ns().0 + plan.modeled_ns().1;
+    Ok(unrolled.filter(|unrolled| total(unrolled.plan()) < UNROLL_GAIN * depth as f64 * total(single)))
+}
+
+/// The share of the time of `depth` steps one by one that the unrolled body must take, at most.
+const UNROLL_GAIN: f64 = 0.6;
+
+/// The storages of the state after `steps` steps: replays of `unrolled` (`depth` steps each),
+/// then `stepper` for the rest, which takes the state where the replays left it.
+fn run_unrolled(stepper: &mut Stepper, unrolled: &Stepper, depth: usize, steps: usize) -> Outcome<Vec<Arc<Storage>>> {
+    let (full, rest) = (steps / depth, steps % depth);
+    if rest > 0 && !stepper.rebind(unrolled.state_after(full)) {
+        stepper.run_steps(steps)?;
+        return Ok(stepper.state_after(steps).to_vec());
+    }
+    unrolled.run_steps(full)?;
+    if rest == 0 {
+        return Ok(unrolled.state_after(full).to_vec());
+    }
+    stepper.run_steps(rest)?;
+    Ok(stepper.state_after(rest).to_vec())
 }
 
 /// The step-by-step loop of `iterate_all` on placeholders that alias the states' buffers, for
@@ -266,8 +385,10 @@ impl Array<f32> {
     fn replayed(&self, steps: usize, step: impl Fn(&Array<f32>) -> Array<f32>) -> Outcome<Array<f32>> {
         let (mut trace, mut probes) = Trace::start(&[self])?;
         let Some(probe) = probes.pop() else { unreachable!() };
+        let started = Instant::now();
         let first = step(&probe);
-        if trace.untouched() {
+        let lazy = trace.untouched();
+        if lazy {
             trace.pause();
             if let Some(stencil) = jit::stencil_plan(&probe, &first) {
                 return stencil.run(self, steps);
@@ -282,9 +403,12 @@ impl Array<f32> {
             u.check()?;
             return Ok(u);
         };
-        stepper.run_steps(steps)?;
-        match stepper.state_after(steps).first() {
-            Some(storage) => Ok(Array::from_storage(self.context(), self.shape(), Arc::clone(storage))),
+        let shapes_match = first.shape() == self.shape();
+        drop((probe, first));
+        let traced = if lazy && shapes_match { Some(started.elapsed()) } else { None };
+        let mut finals = run_stepper([self], steps, &|[u]: &[Array<f32>; 1]| [step(u)], stepper, traced)?.into_iter();
+        match finals.next() {
+            Some(storage) => Ok(Array::from_storage(self.context(), self.shape(), storage)),
             None => unreachable!(),
         }
     }

@@ -893,7 +893,13 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String
     };
     let ty = elem.storage_ty();
     let single_pass = ops.is_single_pass().then_some(2);
-    let uniform = if single_pass.is_some() { 4 } else { 2 };
+    // A gate (see `ReduceList::with_gate`) binds its buffers after `a`, before the uniform.
+    let gate = ops.gate().map(|_| 2);
+    let uniform = match (single_pass, gate) {
+        (Some(_), _) => 4,
+        (None, Some(_)) => 2 + GATE_BINDINGS,
+        (None, None) => 2,
+    };
     format!(
         "{params}
 @group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
@@ -902,7 +908,7 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String
 
 fn load_at(i: u32) -> {ty} {{ return a[i]; }}
 {}",
-        reduce_main(elem, ops, segmented, "load_at", tuning, single_pass, None)
+        reduce_main(elem, ops, segmented, "load_at", tuning, single_pass, gate)
     )
 }
 
@@ -1459,12 +1465,12 @@ fn merged_loop(elem: ReduceElem<'_>, ops: ReduceList, roots: &[u8], phase: &Phas
 /// A reduction with a [gate](ReduceList::with_gate) (one `f32` op, bindings `gate`.. `gate + GATE_BINDINGS`
 /// after `luma_result`: `st`, `args`, `tmpl`, `hist`, `agg`, `stepv`) runs the gate on the final value, in
 /// invocation 0 of the workgroup that has it (the last one of a single-pass kernel, the only one
-/// of a kernel of one group). The gate's text defines `luma_gate(v: f32)`; [`GATE_STOPPED`] is added to it. A
+/// of a kernel of one group, which may be a pass over the partial results of an earlier one). The gate's text defines `luma_gate(v: f32)`; [`GATE_STOPPED`] is added to it. A
 /// workgroup that finds `st[0]` set (the loop stopped) leaves at once, workgroup 0 after
 /// `luma_stopped()`, so that nothing of the stopped steps is computed or stored.
 pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool, load: &str, tuning: &Tuning, single_pass: Option<u32>, gate: Option<u32>) -> String {
     debug_assert!(single_pass.is_none() || !segmented, "only a first pass can finish the reduction itself");
-    debug_assert!(gate.is_none() || (!segmented && ops.gate().is_some()), "a gate needs a first pass with a gate");
+    debug_assert!(gate.is_none() || ops.gate().is_some(), "a gate needs a pass with a gate");
     let ty = elem.storage_ty();
     let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
     let mut combines = String::new();
