@@ -16,7 +16,7 @@ builder methods override them:
 | `LUMA_DF_FMA` | `df_fma` / `.df_fma(fused)` |
 
 The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LOOKBACK_SCAN`, `LUMA_FUSION_*`,
-`LUMA_STAGING`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_PLAN_CACHE`, `LUMA_CACHE*`, `LUMA_CUDA_DUMP`, `LUMA_CPU_THREADS`, `LUMA_CPU_SPIN_US`, `LUMA_COMPILE_THREADS`, `LUMA_EXIT_WAIT`) are read from the environment only.
+`LUMA_STAGING`, `LUMA_COARSEN`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_PLAN_CACHE`, `LUMA_CACHE*`, `LUMA_CUDA_DUMP`, `LUMA_CPU_THREADS`, `LUMA_CPU_SPIN_US`, `LUMA_COMPILE_THREADS`, `LUMA_EXIT_WAIT`) are read from the environment only.
 
 ## All variables
 
@@ -34,6 +34,7 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LO
 | `LUMA_FUSION_MAX_INPUTS` | Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer ([Performance](performance.md#many-arrays-in-one-kernel)) |
 | `LUMA_FUSION_MAX_LIVE` | Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, `8..=4096`) |
 | `LUMA_FUSION_MAX_INLINED` | Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on the NVIDIA tuning profile, 1024 on every other, the CPU one included; `16..=16384`) |
+| `LUMA_COARSEN` | `off`, `auto` or `1`, `2`, `4`, `8`: how many elements each invocation of a fused elementwise kernel computes (thread coarsening: elements `i`, `i + T`, `i + 2T`, ... for `T` invocations in the launch, the loads of all of them issued before the first store, results bit-identical to one per invocation). `auto` (the default on NVIDIA GPUs, `off` elsewhere) coarsens launches of at least 16 waves of invocations whose kernel waits on long dependent chains: many `f64` operations (8 elements) or gathers (4); a number forces that many wherever the kernel is a plain store (not for `bool` results, staged, segmented or scatter kernels), whatever the size |
 | `LUMA_STAGING` | `off` turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first |
 | `LUMA_TRIDIAGONAL` | `thomas`, `cyclic` or `auto`: the algorithm of `solve_tridiagonal` / `solve_block_tridiagonal` (one invocation per line, or one workgroup per line by cyclic reduction); the default (`auto`) picks cyclic reduction for few, long lines on the NVIDIA and Apple tuning profiles only (and always for stacked blocks wider than 5 there) |
 | `LUMA_PLAN_CACHE` | `off`, `0`, `false` or `no` switches off the plan cache of eager evaluation: an `eval` whose pending graph has the structure of an earlier one (the loop `x = step(&x); x.eval()?`) normally runs that evaluation's recorded launches over the new buffers and scalars instead of planning it again; results are bit-identical either way. `trace` prints what the cache records and why it gives up on a structure |

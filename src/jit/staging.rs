@@ -541,6 +541,7 @@ mod tests {
             staging: None,
             guard: None,
             params: None,
+            coarsen: 1,
         }
     }
 

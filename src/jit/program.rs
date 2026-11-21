@@ -198,6 +198,9 @@ pub(crate) struct FusedKey {
     /// Set by `JitState::kernel`: the numbers of views, gathers and the scatter are read from the
     /// uniform, and this is what the lowering of the key is (see `params`).
     pub(crate) params: Option<Arc<Parameterized>>,
+    /// Set by `launch::run_store` (see `jit::coarsen`): how many elements each invocation of a
+    /// plain store kernel computes (1, 2, 4 or 8); 1 for every other kernel.
+    pub(crate) coarsen: u8,
 }
 
 /// Whether the WGSL of `instr` calls a function of the double-float library
@@ -250,6 +253,7 @@ impl std::hash::Hash for FusedKey {
         self.staging.hash(state);
         self.guard.hash(state);
         self.params.hash(state);
+        self.coarsen.hash(state);
     }
 }
 
@@ -1030,6 +1034,7 @@ impl Flattener {
                 staging: None,
                 guard,
                 params: None,
+                coarsen: 1,
             },
             inputs: self.inputs,
             scalars: self.scalars,
@@ -1962,6 +1967,7 @@ impl Recipe {
                 staging: None,
                 guard: self.guard,
                 params: None,
+                coarsen: 1,
             },
             inputs,
             scalars,
@@ -2279,6 +2285,7 @@ mod validate_tests {
             staging: None,
             guard: None,
             params: None,
+            coarsen: 1,
         }
     }
 
