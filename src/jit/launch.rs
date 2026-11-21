@@ -1410,6 +1410,17 @@ pub(crate) struct Member<'a> {
     pub(crate) finish: Finish,
 }
 
+/// What [`reduce_many`] does with the kernel it builds.
+pub(crate) enum ManyMode<'a> {
+    /// Launch it. `ahead` runs between the build and the launch (which waits for the compile) when the kernel was not
+    /// built before: where the caller starts the compiles of the kernels it will need next. With
+    /// `Tuning::reduce_multi_after`, a group is not launched (nothing is, `deferred` is set) before it has been recorded that many
+    /// times, nor while its kernel is compiling: the caller records the reductions one by one.
+    Run { ahead: &'a dyn Fn(), deferred: &'a std::cell::Cell<bool> },
+    /// Only build it, which starts its compile in the background: nothing is launched, the result is `None`.
+    BuildOnly,
+}
+
 /// Runs the reductions of `members` (pending nodes of one length, of element type `ty`: `f32`,
 /// `u32` or `i32`) in one kernel: the program computes the operands together, once what they share,
 /// and every op of every member has an accumulator (at most `max_accs` in all). The first pass is
@@ -1420,7 +1431,7 @@ pub(crate) struct Member<'a> {
 ///
 /// `None` (nothing launched) where the program does not fit a single such kernel: sub-programs read
 /// through shifts, arrays split over several buffers, too many bindings.
-pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>], ty: ElemTy, max_accs: usize) -> Result<Option<Storage>, Failure> {
+pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>], ty: ElemTy, max_accs: usize, mode: ManyMode<'_>) -> Result<Option<Storage>, Failure> {
     let Some(first) = members.first() else { return Ok(None) };
     let len = first.operand.len();
     let total: usize = members.iter().map(|member| member.ops.as_slice().len()).sum();
@@ -1505,7 +1516,32 @@ pub(crate) fn reduce_many(ctx: &crate::context::Context, members: &[Member<'_>],
     if plan_shifts(ctx, &mut key, inputs, &scalars, len)?.is_some() {
         return Ok(None);
     }
+    let after = ctx.tuning().reduce_multi_after;
+    // The structure of the group (not the values of its scalars, which are not in the key): what is counted.
+    let structure = if after > 0 { super::fast_key_hash(&key) } else { 0 };
+    match &mode {
+        ManyMode::BuildOnly if after > 0 && !ctx.jit().merged_due(structure, after, false) => return Ok(None),
+        ManyMode::Run { deferred, .. } if after > 0 && !ctx.jit().merged_due(structure, after, true) => {
+            deferred.set(true);
+            return Ok(None);
+        }
+        _ => {}
+    }
+    let built_before = ctx.jit().stats.built.load(Ordering::Relaxed);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
+    match mode {
+        ManyMode::BuildOnly => return Ok(None),
+        ManyMode::Run { ahead, deferred } => {
+            if ctx.jit().stats.built.load(Ordering::Relaxed) != built_before {
+                ahead();
+            }
+            // Never a launch that waits for the compile of a kernel nothing needs yet.
+            if after > 0 && !core.raw.is_ready() {
+                deferred.set(true);
+                return Ok(None);
+            }
+        }
+    }
 
     let elem = ty.stride();
     let cell = elem * total as u64;

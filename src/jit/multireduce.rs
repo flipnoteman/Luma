@@ -88,15 +88,29 @@ impl JitState {
         list.push(Arc::downgrade(reduced));
     }
 
+    /// Whether the kernel of the merged group of structure `hash` is due (see `Tuning::reduce_multi_after`): it has been recorded
+    /// `after` times one by one. With `count`, this recording is counted; without, it is only asked about (the group is
+    /// about to be recorded).
+    pub(crate) fn merged_due(&self, hash: u64, after: u32, count: bool) -> bool {
+        let mut seen = lock(&self.merged_seen);
+        let times = seen.entry(hash).or_insert(0);
+        let before = *times;
+        if count {
+            *times = times.saturating_add(1);
+        }
+        before >= after
+    }
+
     /// Whether some registered reduction could be recorded together with `seed`: what is cheap to tell, before the
     /// expressions are walked (see [`JitState::reduction_partners`]).
     pub(crate) fn may_have_partners(&self, seed: &Reduced) -> bool {
         lock(&self.reductions).iter().filter_map(Weak::upgrade).any(|candidate| !std::ptr::eq(Arc::as_ptr(&candidate), seed) && candidate.partner_of(seed))
     }
 
-    /// The registered reductions to record together with `seed` (see the module documentation), oldest first.
+    /// The registered reductions to record together with `seed` (see the module documentation), oldest first, leaving out
+    /// the ones in `taken` (reductions already assigned to a kernel that is not recorded yet).
     /// Nothing for a `seed` that cannot be merged.
-    pub(crate) fn reduction_partners(&self, ctx: &crate::context::Context, seed: &Reduced) -> Vec<Arc<Reduced>> {
+    pub(crate) fn reduction_partners(&self, ctx: &crate::context::Context, seed: &Reduced, taken: &[*const Reduced]) -> Vec<Arc<Reduced>> {
         let axis = seed.is_axis();
         let cap = if axis { ctx.tuning().reduce_multi.min(crate::scan::AXIS_MULTI) } else { ctx.tuning().reduce_multi };
         let mut accs = seed.ops().as_slice().len();
@@ -123,7 +137,7 @@ impl JitState {
                 break;
             }
             let ops = candidate.ops().as_slice().len();
-            if std::ptr::eq(Arc::as_ptr(candidate), seed) || accs + ops > cap || !candidate.partner_of(seed) {
+            if std::ptr::eq(Arc::as_ptr(candidate), seed) || taken.contains(&Arc::as_ptr(candidate)) || accs + ops > cap || !candidate.partner_of(seed) {
                 continue;
             }
             let operand = candidate.operand();
@@ -149,5 +163,21 @@ impl JitState {
             partners.push(Arc::clone(candidate));
         }
         partners
+    }
+
+    /// The oldest registered reduction (not one of `taken`) that would be the seed of the next kernel after the one of `first`,
+    /// if the reductions are used in the order they were made: one that nothing is waited for to compute.
+    pub(crate) fn next_seed(&self, ctx: &crate::context::Context, first: &Reduced, taken: &[*const Reduced]) -> Option<Arc<Reduced>> {
+        let list: Vec<Arc<Reduced>> = lock(&self.reductions).iter().filter_map(Weak::upgrade).collect();
+        let flying = FLATTENING.with_borrow(Clone::clone);
+        let computing = COMPUTING.with_borrow(Clone::clone);
+        list.into_iter().take(EXAMINED).find(|candidate| {
+            let operand = candidate.operand();
+            !taken.contains(&Arc::as_ptr(candidate))
+                && candidate.follows(ctx, first)
+                && !flying.contains(&Arc::as_ptr(operand))
+                && !computing.iter().any(|&id| operand.below_contains(id) || operand.id == id)
+                && unresolved_leaves(operand).is_some_and(|leaves| leaves.is_empty())
+        })
     }
 }

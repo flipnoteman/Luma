@@ -52,12 +52,18 @@ pub(crate) struct Reduced {
     in_recording: bool,
     /// Set while the passes are being recorded.
     forcing: AtomicBool,
+    /// Set when the group this reduction was recorded in was not recorded in one kernel because that was not due or ready (see
+    /// `Tuning::reduce_multi_after`): it is recorded alone, so that the others do not form other groups.
+    solo: AtomicBool,
     /// Where the values are when they were recorded together with other reductions' (see [`PackRead`]), and the first one's index there.
     pack: OnceLock<(Arc<PackRead>, usize)>,
     /// The lines of an axis reduction (made by [`Array::reduce_axis`] and the methods built on it); `None` for a reduction of
     /// the whole array. It has one op, and its buffer holds one value per line.
     axis: Option<AxisGeom>,
 }
+
+/// Most kernels of reductions whose compile [`Reduced::build_ahead`] starts at once.
+const AHEAD_KERNELS: usize = 8;
 
 /// The lines an axis reduction runs over: `lines` lines of `n` cells, `stride` apart.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -154,6 +160,7 @@ impl Reduced {
             && self.wgsl == self.ty.wgsl()
             && !self.layout.is_packed()
             && self.is_unforced()
+            && !self.solo.load(Ordering::Relaxed)
             && self.operand.is_pending()
             && self.operand.has_operands()
             && self.failure().is_none()
@@ -218,7 +225,7 @@ impl Reduced {
                 return Vec::new();
             }
         }
-        ctx.jit().reduction_partners(ctx, self)
+        ctx.jit().reduction_partners(ctx, self, &[])
     }
 
     /// Records the reductions `partners` (see [`Reduced::merge_partners`]) and this one in one kernel: this reduction's
@@ -226,9 +233,18 @@ impl Reduced {
     fn record_merged(&self, ctx: &Context, partners: &[Arc<Reduced>]) -> Option<Arc<Storage>> {
         let all = || std::iter::once(self).chain(partners.iter().map(|partner| &**partner));
         let members: Vec<jit::Member<'_>> = all().map(|reduced| jit::Member { operand: &reduced.operand, ops: reduced.ops, finish: reduced.finish }).collect();
-        let pack = match jit::reduce_many(ctx, &members, self.ty, ctx.tuning().reduce_multi) {
+        let ahead = || self.build_ahead(ctx, partners);
+        let deferred = std::cell::Cell::new(false);
+        let pack = match jit::reduce_many(ctx, &members, self.ty, ctx.tuning().reduce_multi, jit::ManyMode::Run { ahead: &ahead, deferred: &deferred }) {
             Ok(Some(pack)) => Arc::new(pack),
-            _ => return None,
+            _ => {
+                if deferred.get() {
+                    for reduced in all() {
+                        reduced.solo.store(true, Ordering::Relaxed);
+                    }
+                }
+                return None;
+            }
         };
         drop(members);
         let shared = Arc::new(PackRead { pack: Arc::clone(&pack), words: OnceLock::new() });
@@ -246,6 +262,34 @@ impl Reduced {
             }
         }
         own
+    }
+
+    /// Whether this reduction would be the seed of a kernel recorded after the one of `first`, which it does not share a kernel with.
+    pub(crate) fn follows(&self, ctx: &Context, first: &Reduced) -> bool {
+        self.thread == first.thread && self.axis.is_none() && !self.in_recording && !self.forcing.load(Ordering::Relaxed) && self.mergeable(ctx)
+    }
+
+    /// Starts the compiles of the kernels the reductions pending after `first_group` (this one and its `partners`) will be
+    /// recorded in, if they are used in the order they were made, so that the compiles run side by side: a kernel that is not
+    /// compiled yet is waited for where it is launched, and the groups are recorded one after the other (a force monitor of
+    /// several dozen sums is a few kernels, each compiled from scratch the first time). Runs only when the kernel of the
+    /// first group was not built before, so it costs nothing where the kernels are known.
+    fn build_ahead(&self, ctx: &Context, partners: &[Arc<Reduced>]) {
+        let mut taken: Vec<*const Reduced> = std::iter::once(self as *const Reduced).chain(partners.iter().map(Arc::as_ptr)).collect();
+        for _ in 0..AHEAD_KERNELS {
+            let Some(seed) = ctx.jit().next_seed(ctx, self, &taken) else { return };
+            taken.push(Arc::as_ptr(&seed));
+            let others = ctx.jit().reduction_partners(ctx, &seed, &taken);
+            taken.extend(others.iter().map(Arc::as_ptr));
+            // Alone, a reduction is recorded by its own passes, not by this kind of kernel.
+            if others.is_empty() {
+                continue;
+            }
+            let members: Vec<jit::Member<'_>> =
+                std::iter::once(&*seed).chain(others.iter().map(|other| &**other)).map(|reduced| jit::Member { operand: &reduced.operand, ops: reduced.ops, finish: reduced.finish }).collect();
+            // A program that does not fit is left to the reductions' own turn.
+            let _ = jit::reduce_many(ctx, &members, seed.ty, ctx.tuning().reduce_multi, jit::ManyMode::BuildOnly);
+        }
     }
 
     /// Takes the buffer `storage` recorded together with another reduction as the result, if there is none yet.
@@ -552,6 +596,7 @@ impl<T: ScalarType> Array<T> {
                 thread: std::thread::current().id(),
                 in_recording: ctx.recording_here(),
                 forcing: AtomicBool::new(false),
+                solo: AtomicBool::new(false),
                 pack: OnceLock::new(),
                 axis: None,
             };
@@ -607,6 +652,7 @@ impl<T: ScalarType> Array<T> {
                     thread: std::thread::current().id(),
                     in_recording: false,
                     forcing: AtomicBool::new(false),
+                    solo: AtomicBool::new(false),
                     pack: OnceLock::new(),
                     axis: Some(geom),
                 });
@@ -650,6 +696,7 @@ impl<T: ScalarType> Array<T> {
             thread: std::thread::current().id(),
             in_recording: self.context().recording_here(),
             forcing: AtomicBool::new(false),
+            solo: AtomicBool::new(false),
             pack: OnceLock::new(),
             axis: None,
         };

@@ -220,6 +220,11 @@ impl Slot {
         self.done.notify_all();
     }
 
+    /// Whether the compilation has finished.
+    pub(super) fn is_ready(&self) -> bool {
+        self.value.get().is_some()
+    }
+
     /// Waits for the compilation to finish. A job no worker has begun is compiled here: the thread
     /// that needs the kernel at once (a single kernel, not one of a traced step) neither waits for a
     /// worker to wake nor pays for a thread that never compiled before.

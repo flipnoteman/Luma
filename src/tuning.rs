@@ -25,6 +25,8 @@ const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
 /// `LUMA_MULTI_REDUCE=off|n` overrides [`Tuning::reduce_multi`] (`off` or `1` keeps every reduction
 /// in a kernel of its own; clamped to the most accumulators a kernel has).
 const MULTI_REDUCE_ENV: &str = "LUMA_MULTI_REDUCE";
+/// `LUMA_MULTI_REDUCE_AFTER=n` overrides [`Tuning::reduce_multi_after`].
+const MULTI_REDUCE_AFTER_ENV: &str = "LUMA_MULTI_REDUCE_AFTER";
 /// `LUMA_LOOKBACK_SCAN=off|on` overrides [`Tuning::lookback_scan`] (`on` only takes effect on the
 /// CUDA and CPU backends, for the same reason as `LUMA_SINGLE_PASS_REDUCE`; floating-point sums
 /// keep two passes either way, to stay reproducible).
@@ -74,6 +76,12 @@ pub(crate) struct Tuning {
     /// pending reductions of the same length are forced together (see `jit::multireduce`); below 2 they are
     /// never merged. `LUMA_MULTI_REDUCE` overrides.
     pub(crate) reduce_multi: usize,
+    /// How many times a group of pending reductions is recorded one by one (with the kernel all reductions of their shape
+    /// share) before the kernel that computes the group together is compiled, in the background; the group is recorded in
+    /// it once it is ready, and no launch waits for it. Compiling it costs 0.1 to 1 s on CUDA, which a group recorded a few
+    /// times (a solver's final forces) never earns back. 0 records every group in its kernel at once, waiting for its compile.
+    /// `LUMA_MULTI_REDUCE_AFTER` overrides; the default is 4 on CUDA and 0 elsewhere.
+    pub(crate) reduce_multi_after: u32,
     /// Whether a reduction with more than one workgroup finishes in its first launch: the last
     /// workgroup to write its partial result combines them all (see `builtin::reduce_main`),
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
@@ -177,6 +185,7 @@ impl Tuning {
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
         reduce_multi: 16,
+        reduce_multi_after: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -210,6 +219,7 @@ impl Tuning {
         reduce_per_thread: 8,
         reduce_max_groups: 2048,
         reduce_multi: 16,
+        reduce_multi_after: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -245,6 +255,7 @@ impl Tuning {
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
         reduce_multi: 16,
+        reduce_multi_after: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -315,6 +326,10 @@ impl Tuning {
             Ok(value) => value.parse::<usize>().map_or(tuning.reduce_multi, |n| n.clamp(1, crate::builtin::MAX_ACCS)),
             Err(_) => tuning.reduce_multi,
         };
+        tuning.reduce_multi_after = std::env::var(MULTI_REDUCE_AFTER_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(if info.backend == BackendKind::Cuda { 4 } else { 0 });
         tuning.lookback_scan = match std::env::var(LOOKBACK_ENV).as_deref().map(str::trim) {
             Ok("off") => false,
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),

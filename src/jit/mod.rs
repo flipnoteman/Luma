@@ -203,7 +203,7 @@ use looped::LoopPlan;
 use program::Instr;
 pub(crate) use program::AtomicOp;
 
-pub(crate) use launch::{axis_plan, axis_reduce, axis_reduce_planned, AxisPlan, check_finite, evaluate, evaluate_for_reuse, is_recomputed, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, reduce_many, run_loop, solve, stored_along_k, MatmulKernel, MatmulSide, Member, PartSide};
+pub(crate) use launch::{axis_plan, axis_reduce, axis_reduce_planned, AxisPlan, check_finite, evaluate, evaluate_for_reuse, is_recomputed, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, reduce_many, run_loop, solve, stored_along_k, ManyMode, MatmulKernel, MatmulSide, Member, PartSide};
 pub(crate) use multireduce::unresolved_leaves;
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
@@ -2403,6 +2403,8 @@ pub(crate) struct JitState {
     loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
     /// The reductions made and not yet recorded (see [`multireduce`]), oldest first.
     reductions: Mutex<Vec<std::sync::Weak<crate::reduce::Reduced>>>,
+    /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
+    merged_seen: Mutex<FxMap<u64, u32>>,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
     requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
@@ -2526,6 +2528,7 @@ impl JitState {
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             reductions: Mutex::new(Vec::new()),
+            merged_seen: Mutex::new(FxMap::default()),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             inputs_limit: AtomicUsize::new(max_inputs),
