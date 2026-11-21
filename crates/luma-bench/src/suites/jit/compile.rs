@@ -11,7 +11,8 @@ pub fn run(h: &mut Harness) {
         let ctx = h.ctx.clone();
         let n = 4096;
         let k = size(h, 4, 6, 8);
-        let big = 8192;
+        // `compile/shape_variants` takes 17 more elements per kernel; room for ~3800 kernels.
+        let big = 65536;
         let xh = values(big, 1, 0.5, 1.5);
         let yh = values(big, 2, 0.5, 1.5);
         let x = A::from_slice_on(&ctx, &xh[..n], n).unwrap();
