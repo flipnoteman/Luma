@@ -785,6 +785,36 @@ pub struct DeviceInfo {
     pub hardware_fma: Option<bool>,
     /// The device's limits.
     pub limits: DeviceLimits,
+    /// Multiprocessors (NVIDIA SMs, AMD compute units, Apple GPU cores) or, for the CPU backend,
+    /// worker threads, if the backend can tell. Plan constants that depend on how many workgroups
+    /// fill the device scale with it.
+    pub compute_units: Option<u32>,
+}
+
+/// How much of a kernel's behaviour a backend may take on trust when it compiles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KernelTrust {
+    /// Untrusted code (user WGSL): every memory access is checked against its bounds and
+    /// workgroup memory starts zeroed.
+    Checked,
+    /// User code whose author vouches that every access is in bounds (see
+    /// `KernelBuilder::unchecked_bounds`): no bounds checks, but workgroup memory still starts
+    /// zeroed.
+    UncheckedBounds,
+    /// Luma's own kernels, in bounds by construction and writing workgroup memory before reading it.
+    Trusted,
+}
+
+impl KernelTrust {
+    /// Whether memory accesses are checked.
+    pub fn checks_bounds(self) -> bool {
+        self == KernelTrust::Checked
+    }
+
+    /// Whether workgroup memory is zeroed before the kernel runs.
+    pub fn zero_workgroup_memory(self) -> bool {
+        self != KernelTrust::Trusted
+    }
 }
 
 /// A GPU backend: allocates buffers, compiles kernels and records and runs work.
@@ -813,9 +843,9 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
         Err(BackendError::Unsupported("the backend has no mappable storage buffers".into()))
     }
     /// Compiles a module; `used` is the entry point's binding mask, see [`CompiledKernel::used`].
-    fn compile_kernel(&self, module: &crate::kir::KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError>;
+    fn compile_kernel(&self, module: &crate::kir::KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError>;
     /// Compiles an already parsed naga module, `None` if the backend takes only [`KernelModule`](crate::kir::KernelModule)s.
-    fn compile_naga(&self, _module: &naga::Module, _entry: &str, _bindings: &[BindingInfo], _workgroup: [u32; 3], _label: &str, _trusted: bool) -> Option<Result<RawKernel, BackendError>> {
+    fn compile_naga(&self, _module: &naga::Module, _entry: &str, _bindings: &[BindingInfo], _workgroup: [u32; 3], _label: &str, _trust: KernelTrust) -> Option<Result<RawKernel, BackendError>> {
         None
     }
     /// Records a launch into the pending batch; returns how many dispatches are pending.

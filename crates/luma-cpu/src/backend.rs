@@ -93,6 +93,7 @@ static SHARED: LazyLock<CpuShared> = LazyLock::new(|| {
             max_workgroup_invocations: 1024,
             max_workgroup_storage_bytes: 65536,
         },
+        compute_units: Some(pool.threads() as u32),
     };
     let key = format!(
         "cpu-{:016x}",
@@ -375,7 +376,7 @@ impl Backend for CpuBackend {
         module: &KernelModule,
         used: Option<&[bool]>,
         label: &str,
-        trusted: bool,
+        trust: luma_core::KernelTrust,
     ) -> Result<RawKernel, BackendError> {
         if let Some(mask) = used
             && mask.len() != module.bindings.len()
@@ -403,13 +404,13 @@ impl Backend for CpuBackend {
                 module.workgroup_size, limits.max_workgroup_size, limits.max_workgroup_invocations
             )));
         }
-        let checked = if trusted {
-            Cow::Borrowed(module)
-        } else {
+        let checked = if trust.checks_bounds() {
             luma_core::kir::opt::with_bounds_checks(module)
+        } else {
+            Cow::Borrowed(module)
         };
         let optimized = luma_core::kir::optimize_for_target(&checked, true);
-        let plan = fission::plan(&optimized, used, !trusted);
+        let plan = fission::plan(&optimized, used, trust.zero_workgroup_memory());
         if plan.shared_bytes > limits.max_workgroup_storage_bytes {
             return Err(BackendError::KernelWorkgroup(format!(
                 "kernel `{label}` uses {} bytes of workgroup memory, the device allows {}",
@@ -418,7 +419,7 @@ impl Backend for CpuBackend {
         }
         let identity = format!(
             "{optimized:?}\n{used:?}\n{}\n{}\n{}",
-            !trusted,
+            trust.zero_workgroup_memory(),
             crate::codegen::host_isa_key(),
             crate::codegen::REVISION
         );
@@ -432,7 +433,7 @@ impl Backend for CpuBackend {
             }));
         }
         let (compiled, bytes) =
-            crate::codegen::compile(&optimized, used, !trusted).map_err(|e| match e {
+            crate::codegen::compile(&optimized, used, trust.zero_workgroup_memory()).map_err(|e| match e {
                 BackendError::ShaderCompile(m) => {
                     BackendError::ShaderCompile(format!("kernel `{label}`: {m}"))
                 }
@@ -681,10 +682,10 @@ mod tests {
 
         let backend = open().unwrap();
         let k1 = backend
-            .compile_kernel(&m, None, "disk_cache_cpu_test", true)
+            .compile_kernel(&m, None, "disk_cache_cpu_test", luma_core::KernelTrust::Trusted)
             .unwrap();
         let k2 = backend
-            .compile_kernel(&m, None, "disk_cache_cpu_test", true)
+            .compile_kernel(&m, None, "disk_cache_cpu_test", luma_core::KernelTrust::Trusted)
             .unwrap();
         let c1 = k1.downcast_ref::<CompiledCpuKernel>().unwrap();
         let c2 = k2.downcast_ref::<CompiledCpuKernel>().unwrap();

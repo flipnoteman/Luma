@@ -330,7 +330,7 @@ fn aborting_a_recording_concerns_only_its_thread() {
 #[test]
 fn a_launch_binds_exactly_the_bindings_the_shader_reads() {
     let ctx = ctx();
-    let build = |source: &str| kernel::build_core(&ctx, &KernelKey::new(source.to_owned(), "main", None), Some("probe"), true).unwrap();
+    let build = |source: &str| kernel::build_core(&ctx, &KernelKey::new(source.to_owned(), "main", None), Some("probe"), luma_core::KernelTrust::Trusted).unwrap();
     // The uniform at the end is unread.
     let tail = build(
         "struct Params { s0: u32, }

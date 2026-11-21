@@ -25,7 +25,7 @@ use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch,
-    NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, TuningProfile,
+    KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, TuningProfile,
 };
 
 use crate::codegen::{self, CudaArgAbi};
@@ -474,6 +474,7 @@ impl CudaShared {
             attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y)?,
             attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z)?,
         ];
+        let multiprocessors = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
         let shared_bytes = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?;
         let name = ctx.name().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
         ctx.bind_to_thread().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
@@ -510,6 +511,7 @@ impl CudaShared {
                 max_workgroup_invocations: threads as u32,
                 max_workgroup_storage_bytes: shared_bytes as u32,
             },
+            compute_units: Some(multiprocessors as u32).filter(|&n| n > 0),
         };
         let pool = if attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)? != 0 { DevicePool::create(&ctx) } else { None };
         Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm, pool })
@@ -1008,15 +1010,15 @@ impl Backend for CudaBackend {
         drop(buffer);
     }
 
-    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
         if let Some(mask) = used
             && mask.len() != module.bindings.len()
         {
             return Err(BackendError::KernelBinding(format!("the used-binding mask has {} entries for {} bindings", mask.len(), module.bindings.len())));
         }
-        let checked: Cow<'_, KernelModule> = if trusted { Cow::Borrowed(module) } else { kir::opt::with_bounds_checks(module) };
+        let checked: Cow<'_, KernelModule> = if trust.checks_bounds() { kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
         let optimized = kir::optimize_for_target(&checked, true);
-        let translated = codegen::emit_with_workgroup_init(&optimized, used, !trusted);
+        let translated = codegen::emit_with_options(&optimized, used, trust.zero_workgroup_memory(), trust.checks_bounds());
         let strides: Vec<u32> = translated.array_lengths.iter().map(|&b| optimized.bindings.get(b as usize).and_then(|d| d.element_stride).unwrap_or(1)).collect();
 
         self.bind()?;

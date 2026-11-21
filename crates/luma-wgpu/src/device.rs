@@ -86,6 +86,9 @@ pub(crate) struct Gpu {
     /// Total bytes of the adapter's device-local memory heaps, if the backend can tell (Vulkan
     /// only): the basis of the default memory budget.
     pub(crate) memory: Option<u64>,
+    /// Streaming multiprocessors or compute units, if Vulkan can tell (`VK_NV_shader_sm_builtins`,
+    /// `VK_AMD_shader_core_properties`).
+    pub(crate) compute_units: Option<u32>,
     /// The device's measured cost model, set by the first context that calibrates it, so that a
     /// pooled device is calibrated once per process.
     pub(crate) cost: Arc<OnceLock<CostModel>>,
@@ -113,6 +116,38 @@ fn device_local_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
     // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
     const DEVICE_LOCAL: u32 = 1;
     Some(props.memory_heaps.iter().take(props.memory_heap_count as usize).filter(|heap| heap.flags.as_raw() & DEVICE_LOCAL != 0).map(|heap| heap.size).sum())
+}
+
+/// Multiprocessors of `adapter`: asks Vulkan through the vendor extensions that report them
+/// (NVIDIA SMs, AMD compute units); `None` for other vendors.
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+fn compute_unit_count(adapter: &wgpu::Adapter) -> Option<u32> {
+    use ash::vk;
+    // SAFETY: only reads properties of the physical device; nothing is destroyed.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let instance = hal.shared_instance().raw_instance();
+    let physical = hal.raw_physical_device();
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }.ok()?;
+    let has = |name: &std::ffi::CStr| extensions.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == name));
+    if has(vk::NV_SHADER_SM_BUILTINS_NAME) {
+        let mut sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut sm);
+        unsafe { instance.get_physical_device_properties2(physical, &mut props) };
+        return Some(sm.shader_sm_count).filter(|&n| n > 0);
+    }
+    if has(vk::AMD_SHADER_CORE_PROPERTIES_NAME) {
+        let mut core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
+        unsafe { instance.get_physical_device_properties2(physical, &mut props) };
+        let units = core.shader_engine_count * core.shader_arrays_per_engine_count * core.compute_units_per_shader_array;
+        return Some(units).filter(|&n| n > 0);
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+fn compute_unit_count(_adapter: &wgpu::Adapter) -> Option<u32> {
+    None
 }
 
 /// Other platforms cannot read the heap sizes: no automatic memory budget.
@@ -194,6 +229,7 @@ async fn request_device() -> Result<Gpu, BackendError> {
         flag.store(true, Ordering::Release);
     });
     let memory = device_local_bytes(&adapter);
+    let compute_units = compute_unit_count(&adapter);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     crate::exit::track(&device, validated);
     let info = adapter.get_info();
@@ -203,7 +239,7 @@ async fn request_device() -> Result<Gpu, BackendError> {
     if !validated {
         crate::exit::flush_at_exit(&store);
     }
-    Ok(Gpu { device, queue, adapter: info, lost, memory, cost: Arc::new(OnceLock::new()), disk, store })
+    Ok(Gpu { device, queue, adapter: info, lost, memory, compute_units, cost: Arc::new(OnceLock::new()), disk, store })
 }
 
 /// Process-wide pool of opened GPU devices.

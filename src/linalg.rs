@@ -875,6 +875,25 @@ mod tests {
     }
 
     #[test]
+    fn thomas_plan_scales_with_the_multiprocessors() {
+        let plan = |workgroup, tiled, twisted| ThomasPlan { workgroup, tiled, twisted };
+        let nvidia = |compute_units| Tuning { profile: TuningProfile::Nvidia, line_strided_from: 16, compute_units, ..Tuning::for_tests() };
+        // The RTX 3090 (82): 512 workgroups' worth of lines per step of the workgroup size, twisted below 8192 lines.
+        assert_eq!(thomas_plan(&nvidia(82), 4, 8191, 8, true), plan(16, false, true));
+        assert_eq!(thomas_plan(&nvidia(82), 4, 8192, 8, true), plan(16, false, false));
+        assert_eq!(thomas_plan(&nvidia(82), 5, 2047, 1, true), plan(8, false, false));
+        assert_eq!(thomas_plan(&nvidia(82), 5, 2048, 1, true), plan(8, false, false));
+        assert_eq!(thomas_plan(&nvidia(82), 5, 4096, 1, true), plan(8, false, false));
+        assert_eq!(thomas_plan(&nvidia(82), 5, 8192, 1, true), plan(16, false, false));
+        // The 3080 Laptop (48): 300 workgroups, twisted below 4795 lines.
+        assert_eq!(thomas_plan(&nvidia(48), 4, 4794, 8, true), plan(16, false, true));
+        assert_eq!(thomas_plan(&nvidia(48), 4, 4795, 8, true), plan(16, false, false));
+        assert_eq!(thomas_plan(&nvidia(48), 5, 4800, 1, true), plan(16, false, false));
+        assert_eq!(thomas_plan(&nvidia(48), 5, 4096, 1, true), plan(16, false, false));
+        assert_eq!(thomas_plan(&nvidia(48), 5, 2400, 1, true), plan(8, false, false));
+    }
+
+    #[test]
     fn thomas_plan_widens_strided_lines() {
         let nvidia = Tuning { profile: TuningProfile::Nvidia, line_strided_from: 16, ..Tuning::for_tests() };
         let plan = |workgroup, tiled, twisted| ThomasPlan { workgroup, tiled, twisted };

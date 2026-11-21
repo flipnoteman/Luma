@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use luma_core::kir::{used_bindings, KernelModule, KirType, ModuleBuilder};
-use luma_core::{Backend, BufferUsage, CompiledKernel, Dispatch, RawArg};
+use luma_core::{Backend, BufferUsage, CompiledKernel, Dispatch, KernelTrust, RawArg};
 
 /// `out[i] = fma(a[i], b[i], -p)` with `p` the rounded product made opaque to the compiler by the
 /// bits of `zero[i]` (all zero): a fused `fma` returns the rounding error of the product, a
@@ -85,7 +85,7 @@ pub(crate) fn probe(backend: &dyn Backend) -> Option<bool> {
         .filter(|&(at, _)| used.as_ref().is_none_or(|used| used[at]))
         .map(|(_, binding)| binding.info())
         .collect();
-    let raw = backend.compile_kernel(&module, used.as_deref(), "luma fma", true).ok()?;
+    let raw = backend.compile_kernel(&module, used.as_deref(), "luma fma", KernelTrust::Trusted).ok()?;
     let kernel = CompiledKernel::new(Arc::from("luma fma"), raw, bindings, declared, used, module.workgroup_size);
 
     let count = pairs.len() as u32;

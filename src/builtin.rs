@@ -1520,6 +1520,7 @@ const CP_TILE: u32 = 32;
 
 /// The largest block size and the line count below which the twisted solve is chosen.
 const TWISTED_BLOCK: u32 = 4;
+/// A count for the 82 multiprocessors of an RTX 3090, scaled to the device ([`Tuning::scaled`]).
 const TWISTED_LINES: u32 = 8192;
 
 /// The invocations per workgroup, the scratch layout and the line split of the Thomas solve of
@@ -1543,7 +1544,7 @@ const TWISTED_LINES: u32 = 8192;
 /// their cells far apart for neighbouring invocations, so every access is a sector of its own
 /// whatever the layout and the solve is latency bound. A small workgroup spreads the lines over
 /// all multiprocessors (a workgroup runs on one) and lanes of a warp left idle cost nothing:
-/// aiming for 512 workgroups, from 8 invocations to a warp of 32 (RTX 3090; 4096 lines,
+/// aiming for 512 workgroups (scaled to the device's multiprocessors, [`Tuning::scaled`]; 82 on the RTX 3090), from 8 invocations to a warp of 32 (RTX 3090; 4096 lines,
 /// `tri/solve_axis0`: 9.4 ms with 256, 3.9 with 32, 2.6 with 8; 1024 block-4 lines: 9.5, 2.1 ms
 /// with 32, 8 after unrolling the kernel). Software rasterizers keep the elementwise size.
 ///
@@ -1573,7 +1574,7 @@ pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, 
         return ThomasPlan { workgroup: tuning.elementwise_workgroup as u8, tiled: false, twisted: false };
     }
     // Few lines of small blocks: latency bound (see above), two invocations per line win.
-    let twisted = block <= TWISTED_BLOCK && lines < TWISTED_LINES;
+    let twisted = block <= TWISTED_BLOCK && lines < tuning.scaled(TWISTED_LINES);
     if parts && tuning.line_strided_from > 0 && stride >= tuning.line_strided_from && block <= UNROLLED_BLOCK {
         let wanted = match block {
             1 => 32,
@@ -1582,7 +1583,7 @@ pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, 
         };
         return ThomasPlan { workgroup: wanted.min(tuning.elementwise_workgroup) as u8, tiled: block > 1, twisted };
     }
-    ThomasPlan { workgroup: (lines / 512).max(1).next_power_of_two().clamp(8, 32).min(tuning.elementwise_workgroup) as u8, tiled: false, twisted }
+    ThomasPlan { workgroup: (lines / tuning.scaled(512).max(1)).max(1).next_power_of_two().clamp(8, 32).min(tuning.elementwise_workgroup) as u8, tiled: false, twisted }
 }
 
 /// The workgroups of the Thomas solve of `lines` lines with `workgroup` invocations per

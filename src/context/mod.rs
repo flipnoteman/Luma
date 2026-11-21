@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, Profile};
+use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, KernelTrust, Profile};
 
 use crate::builtin::{Builtin, BuiltinKernel};
 use crate::error::{LumaError, Result};
@@ -766,9 +766,9 @@ impl Context {
             .get_or_build(&(op, ty), || {
                 let label = format!("{op:?} {ty}");
                 match op.kernel(ty, &self.inner.tuning) {
-                    BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), true),
+                    BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), KernelTrust::Trusted),
                     BuiltinKernel::Wgsl(source) => {
-                        kernel::build_core(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), true)
+                        kernel::build_core(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), KernelTrust::Trusted)
                     }
                 }
                 .map(Arc::new)

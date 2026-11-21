@@ -15,7 +15,11 @@ pub struct HandSgemm(Kernel);
 #[allow(dead_code)]
 impl HandSgemm {
     pub fn new(ctx: &Context) -> Result<HandSgemm> {
-        ctx.kernel(&sgemm::sgemm_source(false, false)).label("hand_sgemm").build().map(HandSgemm)
+        let builder = ctx.kernel(&sgemm::sgemm_source(false, false)).label("hand_sgemm");
+        // `LUMA_HAND_UNCHECKED=1` builds the kernel without bounds checks (A/B of their cost).
+        // SAFETY: the kernel only indexes inside the operands `run` sizes for it.
+        let builder = if std::env::var_os("LUMA_HAND_UNCHECKED").is_some() { unsafe { builder.unchecked_bounds() } } else { builder };
+        builder.build().map(HandSgemm)
     }
 
     /// Records `c = a b`; `c` must hold `m * n` elements.

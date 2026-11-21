@@ -1346,6 +1346,104 @@ fn dynamic_out_of_bounds_loads_stores_and_atomics_stay_inside_the_buffers() {
     }
 }
 
+// -- Bounds checks of user kernels --
+
+#[allow(dead_code)]
+#[path = "../benches/common/sgemm.rs"]
+mod sgemm;
+
+/// The tiled SGEMM, whose workgroup-memory reads sit in a counted loop the compiler proves in
+/// range, matches the host with the default checks and with `unchecked_bounds`, at sizes that
+/// are one tile, several tiles and several slices of K.
+#[test]
+fn a_tiled_user_gemm_agrees_with_the_host_checked_and_unchecked() {
+    let source = sgemm::sgemm_source(false, false);
+    let tile = sgemm::TILE;
+    for (kind, ctx) in backends() {
+        let who = label(kind);
+        let checked = ctx.kernel(&source).label("gemm_checked").build().unwrap();
+        // SAFETY: the kernel indexes below `m * k`, `k * n` and `m * n`, the sizes below.
+        let unchecked = unsafe { ctx.kernel(&source).label("gemm_unchecked").unchecked_bounds() }.build().unwrap();
+        for (m, n, k) in [(tile, tile, 16), (tile, 2 * tile, 48), (2 * tile, tile, 32), (2 * tile, 2 * tile, 80)] {
+            let (ha, hb) = (values(m * k, 5, -1.0, 1.0), values(k * n, 6, -1.0, 1.0));
+            let want: Vec<f32> = (0..m * n).map(|i| (0..k).map(|l| f64::from(ha[i / n * k + l]) * f64::from(hb[l * n + i % n])).sum::<f64>() as f32).collect();
+            let (a, b) = (on(&ctx, &ha), on(&ctx, &hb));
+            let p = sgemm::SgemmParams { m: m as u32, n: n as u32, k: k as u32, relu: 0 };
+            let mut results = Vec::new();
+            for kernel in [&checked, &unchecked] {
+                let mut c = Array::<f32>::zeros_on(&ctx, m * n).unwrap();
+                kernel.launch_raw([(n / tile) as u32, (m / tile) as u32, 1], args![&a, &b, &mut c, uniform(&p)]).unwrap();
+                results.push(c.to_vec().unwrap());
+            }
+            must(who, &format!("checked gemm {m}x{n}x{k}"), first_far(&results[0], &want, 1e-4, 1e-4 * (k as f32).sqrt()));
+            must(who, &format!("unchecked gemm {m}x{n}x{k}"), first_far(&results[1], &want, 1e-4, 1e-4 * (k as f32).sqrt()));
+        }
+    }
+}
+
+/// Workgroup memory indexed from a loop whose counter the compiler can bound, next to indices
+/// it cannot: the bounded reads are exact, the others stay inside their array (an out-of-range
+/// read gives zero or an element; an out-of-range write leaves the neighbouring array alone).
+#[test]
+fn workgroup_arrays_stay_bounded_beside_loops_with_proven_indices() {
+    const SRC: &str = r#"
+    struct Params { n: u32, stop: u32 }
+    @group(1) @binding(0) var<storage, read_write> out: array<u32>;
+    @group(1) @binding(1) var<uniform> p: Params;
+    var<workgroup> t: array<u32, 64>;
+    var<workgroup> guard: array<u32, 64>;
+    @compute @workgroup_size(16)
+    fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+        let x = lid.x;
+        for (var j = 0u; j < 4u; j = j + 1u) { t[j * 16u + x] = j * 100u + x; guard[j * 16u + x] = 1000u; }
+        workgroupBarrier();
+        // Proven: j is 0..3, x below 16, so the index is below 64.
+        var exact = 0u;
+        for (var j = 0u; j < 4u; j = j + 1u) { exact = exact + t[j * 16u + x]; }
+        // Unproven: the bound is a runtime value and reaches past the array.
+        var sum = 0u;
+        for (var j = 0u; j < p.stop; j = j + 1u) { sum = sum + t[j * 16u + x]; }
+        workgroupBarrier();
+        // A write past the end of `t` must not reach `guard` (or anything else).
+        t[p.n + x] = 5u;
+        workgroupBarrier();
+        var g = 0u;
+        for (var j = 0u; j < 64u; j = j + 1u) { g = g + guard[j]; }
+        let o = (wid.x * 16u + x) * 4u;
+        out[o] = exact;
+        out[o + 1u] = sum;
+        out[o + 2u] = g;
+        out[o + 3u] = t[x];
+    }"#;
+    #[derive(encase::ShaderType)]
+    struct P {
+        n: u32,
+        stop: u32,
+    }
+    for (kind, ctx) in backends() {
+        let who = label(kind);
+        let kernel = ctx.kernel(SRC).label("workgroup_bounds").build().unwrap();
+        // `stop` 4 stays in range, 8 reads past the array.
+        for (n, stop) in [(0u32, 4u32), (60, 4), (64, 8), (1 << 20, 8)] {
+            let mut out = Array::<u32>::zeros_on(&ctx, 2 * 16 * 4).unwrap();
+            kernel.launch_raw([2, 1, 1], args![&mut out, uniform(&P { n, stop })]).unwrap();
+            let out = out.to_vec().unwrap();
+            for w in 0..2usize {
+                for x in 0..16usize {
+                    let o = (w * 16 + x) * 4;
+                    let exact: u32 = (0..4u32).map(|j| j * 100 + x as u32).sum();
+                    assert_eq!(out[o], exact, "{who}: proven reads, n {n} stop {stop}");
+                    let in_range: u32 = (0..stop.min(4)).map(|j| j * 100 + x as u32).sum();
+                    if stop <= 4 {
+                        assert_eq!(out[o + 1], in_range, "{who}: runtime bound in range");
+                    }
+                    assert_eq!(out[o + 2], 64 * 1000, "{who}: the write past `t` reached the array next to it (n {n})");
+                }
+            }
+        }
+    }
+}
+
 // -- Line solvers on parts --
 
 /// Solves the block-tridiagonal system of one line in f64 by dense Gaussian elimination with

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use luma_core::kir::{self, KernelModule};
 use luma_core::naga;
-use luma_core::{BackendError, CompiledKernel};
+use luma_core::{BackendError, CompiledKernel, KernelTrust};
 pub use luma_core::{BindingInfo, BindingKind};
 
 use crate::array::{Array, Failure};
@@ -26,11 +26,13 @@ pub(crate) struct KernelKey {
     /// Part of the key so that a cached kernel is named as the caller asked: the profile lists
     /// the label of the kernel it launched.
     label: Option<String>,
+    /// Whether the author vouched for the kernel's bounds (see [`KernelBuilder::unchecked_bounds`]).
+    trust: KernelTrust,
 }
 
 impl KernelKey {
     pub(crate) fn new(source: String, entry: &str, workgroup: Option<[u32; 3]>) -> Self {
-        KernelKey { source, entry: entry.to_owned(), workgroup, label: None }
+        KernelKey { source, entry: entry.to_owned(), workgroup, label: None, trust: KernelTrust::Checked }
     }
 }
 
@@ -45,6 +47,7 @@ pub struct KernelBuilder<'a> {
     entry: String,
     workgroup: Option<[u32; 3]>,
     label: Option<String>,
+    trust: KernelTrust,
 }
 
 impl<'a> KernelBuilder<'a> {
@@ -55,6 +58,7 @@ impl<'a> KernelBuilder<'a> {
             entry: "main".to_owned(),
             workgroup: None,
             label: None,
+            trust: KernelTrust::Checked,
         }
     }
 
@@ -79,6 +83,28 @@ impl<'a> KernelBuilder<'a> {
         self
     }
 
+    /// Builds the kernel without bounds checks on its memory accesses.
+    ///
+    /// By default every access to a storage array, workgroup array or local array is checked, so
+    /// that a bug in a kernel cannot read or write outside the memory it was given (a read out
+    /// of range yields zero or another element, a write out of range is dropped). The checks
+    /// cost a few percent of a tight kernel, which is why the compiler leaves out those it can
+    /// prove unnecessary (a tiled loop over workgroup memory, for example). A kernel that is
+    /// known to stay in range, benchmarked or tested, can skip the rest. Workgroup memory
+    /// still starts zeroed, integer division by zero and loops keep their guards.
+    ///
+    /// # Safety
+    ///
+    /// Every access of every invocation must be within the bounds of the array it names
+    /// (`arrayLength` for storage arrays, the declared length for workgroup and function
+    /// arrays). An access outside them is undefined behavior: it may read or overwrite other
+    /// arrays, crash the process or hang the device. Kernels built on the same source with and
+    /// without this call are separate kernels.
+    pub unsafe fn unchecked_bounds(mut self) -> Self {
+        self.trust = KernelTrust::UncheckedBounds;
+        self
+    }
+
     /// Parses and validates the shader, reflects its bindings and creates (or fetches from the
     /// context's cache) the compute pipeline.
     pub fn build(self) -> Result<Kernel> {
@@ -87,14 +113,15 @@ impl<'a> KernelBuilder<'a> {
             entry: self.entry,
             workgroup: self.workgroup,
             label: self.label,
+            trust: self.trust,
         };
         let label = key.label.as_deref();
-        let (core, _) = self.ctx.kernel_cache().get_or_build(&key, || build_core(self.ctx, &key, label, false).map(Arc::new))?;
+        let (core, _) = self.ctx.kernel_cache().get_or_build(&key, || build_core(self.ctx, &key, label, key.trust).map(Arc::new))?;
         Ok(Kernel { ctx: self.ctx.clone(), core })
     }
 }
 
-/// Compiles `key` into a kernel of the context's backend. `trusted` kernels are luma's own,
+/// Compiles `key` into a kernel of the context's backend. `KernelTrust::Trusted` kernels are luma's own,
 /// whose every storage access is in bounds by construction; the backend compiles them without
 /// per-access bounds checks.
 ///
@@ -105,7 +132,7 @@ pub(crate) fn build_core(
     ctx: &Context,
     key: &KernelKey,
     label: Option<&str>,
-    trusted: bool,
+    trust: KernelTrust,
 ) -> Result<KernelCore> {
     let info = ctx.info();
     let limits = &info.limits;
@@ -117,12 +144,12 @@ pub(crate) fn build_core(
         limits.max_workgroup_size,
         limits.max_workgroup_invocations,
         limits.max_dynamic_uniforms,
-        trusted,
+        trust == KernelTrust::Trusted,
     )?;
     let workgroup = lowered.workgroup_size;
     let name = label.unwrap_or(&key.entry);
     let backend = ctx.hal();
-    let raw = match backend.compile_naga(&module, &key.entry, &bindings, workgroup, name, trusted) {
+    let raw = match backend.compile_naga(&module, &key.entry, &bindings, workgroup, name, trust) {
         Some(raw) => raw?,
         None => {
             // A cooperative matrix module is lowered to its bindings and no body: only a backend
@@ -131,7 +158,7 @@ pub(crate) fn build_core(
             if cooperative && lowered.entry_body.is_empty() {
                 return Err(BackendError::Unsupported("cooperative matrix requires the wgpu backend".into()).into());
             }
-            backend.compile_kernel(&lowered, used.as_deref(), name, trusted)?
+            backend.compile_kernel(&lowered, used.as_deref(), name, trust)?
         }
     };
     Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, workgroup))
@@ -142,7 +169,7 @@ pub(crate) fn build_module(
     ctx: &Context,
     module: KernelModule,
     label: Option<&str>,
-    trusted: bool,
+    trust: KernelTrust,
 ) -> Result<KernelCore> {
     let (declared, used) = kir::used_bindings(&module);
     let bindings = module
@@ -153,7 +180,7 @@ pub(crate) fn build_module(
         .map(|(_, binding)| binding.info())
         .collect();
     let name = label.unwrap_or(&module.entry);
-    let raw = ctx.hal().compile_kernel(&module, used.as_deref(), name, trusted)?;
+    let raw = ctx.hal().compile_kernel(&module, used.as_deref(), name, trust)?;
     Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, module.workgroup_size))
 }
 

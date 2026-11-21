@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, BindingInfo, BindingKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo,
-    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, NativeBuffer, NativeKernel, Profile,
-    RawArg, RawKernel, TuningProfile,
+    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
+    Profile, RawArg, RawKernel, TuningProfile,
 };
 use luma_core::hal::copy_parallel;
 use wgpu::{BindGroupEntry, BindingResource, BufferBinding};
@@ -647,6 +647,7 @@ impl WgpuBackend {
                 max_workgroup_invocations: limits.max_compute_invocations_per_workgroup,
                 max_workgroup_storage_bytes: limits.max_compute_workgroup_storage_size,
             },
+            compute_units: gpu.0.compute_units,
         };
 
         let batch = Batch {
@@ -1062,7 +1063,7 @@ impl WgpuBackend {
     /// Builds the pipeline of the entry point `entry` of `module`. `numbers` are the original
     /// `@group(1)` binding numbers of the kernel's `infos`, in order.
     #[allow(clippy::too_many_arguments)]
-    fn build(&self, module: naga::Module, entry: &str, numbers: &[u32], infos: &[BindingInfo], workgroup: [u32; 3], label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+    fn build(&self, module: naga::Module, entry: &str, numbers: &[u32], infos: &[BindingInfo], workgroup: [u32; 3], label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
         let limits = &self.info.limits;
         let invocations = workgroup.iter().fold(1u64, |total, &d| total.saturating_mul(u64::from(d)));
         if workgroup.contains(&0)
@@ -1113,13 +1114,17 @@ impl WgpuBackend {
             // The module luma parsed and validated, not its text: wgpu would parse it a second time.
             source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
         };
-        let shader = if trusted {
+        let shader = if !trust.checks_bounds() {
             // Integer division keeps its guards: WGSL defines `x / 0` and `x % 0`, and user data
             // reaches luma's kernels.
-            let checks = wgpu::ShaderRuntimeChecks { bounds_checks: false, force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
+            let mut checks = wgpu::ShaderRuntimeChecks::checked();
+            checks.bounds_checks = false;
+            // User kernels keep the bound on their loops.
+            checks.force_loop_bounding &= trust != KernelTrust::Trusted;
             // SAFETY: luma's built-in and generated kernels index storage buffers only below the
             // lengths they are launched with, which never exceed the bound ranges, and all of
-            // their loops are bounded.
+            // their loops are bounded. A user kernel is only built this way on its author's word
+            // (`KernelTrust::UncheckedBounds`, see `KernelBuilder::unchecked_bounds`).
             unsafe { device.create_shader_module_trusted(shader_desc, checks) }
         } else {
             device.create_shader_module(shader_desc)
@@ -1132,7 +1137,7 @@ impl WgpuBackend {
                 module: &shader,
                 entry_point: Some(entry),
                 // Trusted kernels write their workgroup memory before reading it.
-                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: !trusted, ..Default::default() },
+                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: trust.zero_workgroup_memory(), ..Default::default() },
                 cache: store.cache(),
             })
         });
@@ -1180,7 +1185,7 @@ impl Backend for WgpuBackend {
         lock(&self.unmapped).push(buffer);
     }
 
-    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
         if let Some(mask) = used
             && mask.len() != module.bindings.len()
         {
@@ -1194,7 +1199,7 @@ impl Backend for WgpuBackend {
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), shader_capabilities(self.device().features()))
             .validate(&parsed)
             .map_err(|e| BackendError::ShaderCompile(e.emit_to_string(&source)))?;
-        self.build(parsed, codegen::ENTRY, &numbers, &infos, module.workgroup_size, label, trusted)
+        self.build(parsed, codegen::ENTRY, &numbers, &infos, module.workgroup_size, label, trust)
     }
 
     fn compile_naga(
@@ -1204,7 +1209,7 @@ impl Backend for WgpuBackend {
         bindings: &[BindingInfo],
         workgroup: [u32; 3],
         label: &str,
-        trusted: bool,
+        trust: KernelTrust,
     ) -> Option<Result<RawKernel, BackendError>> {
         Some((|| {
             let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), shader_capabilities(self.device().features()))
@@ -1232,7 +1237,7 @@ impl Backend for WgpuBackend {
                     bindings.len()
                 )));
             }
-            self.build(module.clone(), entry, &numbers, bindings, workgroup, label, trusted)
+            self.build(module.clone(), entry, &numbers, bindings, workgroup, label, trust)
         })())
     }
 
@@ -1678,7 +1683,7 @@ mod tests {
         let (declared, used) = used_bindings(&module);
         assert_eq!((declared, used.as_deref()), (2, Some(&[false, true][..])));
 
-        let raw_kernel = backend.compile_kernel(&module, used.as_deref(), "double", true).expect("compiles");
+        let raw_kernel = backend.compile_kernel(&module, used.as_deref(), "double", KernelTrust::Trusted).expect("compiles");
         let infos = vec![module.bindings[1].info()];
         let kernel = CompiledKernel::new(Arc::from("double"), raw_kernel, infos, declared, used, [64, 1, 1]);
 
