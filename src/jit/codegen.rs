@@ -238,7 +238,7 @@ fn luma_wrap_mask(c: i32, mask: u32) -> i32 { return i32(u32(c) & mask); }
 /// so the kernel is made for one or the other: `luma_udiv_wide` is exact for any dividend. No
 /// WGSL integer operation gives the high word of a product, so it is made of 16-bit halves
 /// (about 20 operations in all, about 3 times `luma_udiv`).
-const DIV_HELPERS: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
+pub(super) const DIV_HELPERS: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
     let f = bitcast<f32>(n | 0x4B000000u) - 8388608.0;
     let q = bitcast<u32>(f * bitcast<f32>(r) + 8388608.0) & 0x7FFFFFu;
     return q - select(0u, 1u, i32(n - q * d) < 0);
@@ -1016,7 +1016,7 @@ fn needed_lowered(inlined: &Inlined, roots: &[usize]) -> Vec<bool> {
 }
 
 /// Which instructions of `instrs` the instructions `outs` need, themselves included.
-fn needed(instrs: &[Instr], outs: &[usize]) -> Vec<bool> {
+pub(super) fn needed(instrs: &[Instr], outs: &[usize]) -> Vec<bool> {
     let mut keep = vec![false; instrs.len()];
     for &out in outs {
         if let Some(root) = keep.get_mut(out) {
@@ -1047,7 +1047,7 @@ fn body(instrs: &[Instr], input_tys: &[ElemTy], names: &Names, index: &str, segm
 
 /// [`body`], where `staged(k, instr)` may replace the expression of instruction `k`, and only the
 /// instructions `keep` marks (all, if `None`) are written, with the inputs they load.
-fn body_with(
+pub(super) fn body_with(
     instrs: &[Instr],
     input_tys: &[ElemTy],
     names: &Names,

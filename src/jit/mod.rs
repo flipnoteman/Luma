@@ -2330,6 +2330,8 @@ pub(crate) struct JitState {
     /// Pre-parameterized keys mapped straight to their compiled kernel and appended uniform words,
     /// so repeating a step skips lowering and rewriting `key` on every launch.
     fast_kernels: Mutex<FxMap<u64, Vec<FastKernel>>>,
+    /// Kernels of store programs with transposed operands (see [`transpose::plan_fused`]).
+    fused: transpose::FusedCache,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
     stencils: BuildCache<String, Arc<KernelCore>>,
     /// Kernels built as Kernel IR that are not keyed by a program of fused instructions
@@ -2458,6 +2460,7 @@ impl JitState {
         JitState {
             kernels: BuildCache::default(),
             fast_kernels: Mutex::new(FxMap::default()),
+            fused: transpose::FusedCache::default(),
             stencils: BuildCache::default(),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
