@@ -581,6 +581,10 @@ fn block_parts_of_every_size_on_awkward_grids() {
 #[test]
 fn a_traced_block_solve_replays_like_the_eager_loop() {
     let ctx = Context::new().unwrap();
+    // The GPU backends do not trace a step that runs a solve (`compile_until_all` is `Unsupported`).
+    if !ctx.device().software {
+        return;
+    }
     let (b, grid) = (5usize, [24usize, 9]);
     let cells = grid[0] * grid[1];
     let [lo, diag, up, forcing] = block_system(b, cells, 900);
