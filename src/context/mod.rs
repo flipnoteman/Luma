@@ -708,14 +708,22 @@ impl Context {
         self.inner.check_finite
     }
 
-    /// Whether small jobs on host-resident data may run on the host CPU: a GPU context that is not
-    /// recording, profiling or checking results, with `LUMA_HOST_FAST` not `off`.
+    /// Whether small jobs on host-resident data may run on the host CPU: a GPU context whose
+    /// device memory the host addresses directly ([`Context::zero_copy`]) that is not recording,
+    /// profiling or checking results, with `LUMA_HOST_FAST` not `off`.
+    ///
+    /// A discrete GPU (CUDA, Vulkan) is left out: its arrays live in device buffers from the
+    /// moment they are created, which keeps the memory budget, [`Context::memory_stats`] and
+    /// spilling exact, and the traces of `iterate` replayable. Arrays that stayed in host memory
+    /// until a kernel needed them would sit outside all of that, and uploading one while a step
+    /// is being traced ends the recording.
     pub(crate) fn can_run_on_host(&self) -> bool {
         #[cfg(test)]
         if self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) || std::env::var("LUMA_HOST_FAST").as_deref() != Ok("on") {
             return false;
         }
         !self.is_cpu()
+            && self.zero_copy()
             && !self.recording_here()
             && !self.check_finite()
             && self.segment_bytes() >= 65536

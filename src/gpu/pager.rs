@@ -273,18 +273,6 @@ impl Segment {
         segment
     }
 
-    /// A segment of `bytes` bytes that lives in host memory as `data`; it gets a device buffer
-    /// when first pinned.
-    pub(crate) fn host(ctx: &Context, bytes: u64, data: Vec<u8>) -> Arc<Segment> {
-        Arc::new(Segment {
-            ctx: ctx.clone(),
-            bytes,
-            state: Mutex::new(State::Host(data)),
-            pins: AtomicU32::new(0),
-            stamp: AtomicU64::new(0),
-        })
-    }
-
     /// A segment of `bytes` bytes that shows `bytes` bytes of `pack` (a storage of one segment)
     /// from byte `offset`, without a buffer of its own: kernels that know windows read the
     /// range through the pack (see `jit::pack`), anything else that pins the segment gets a

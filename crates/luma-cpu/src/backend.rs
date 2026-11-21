@@ -346,7 +346,9 @@ impl Backend for CpuBackend {
 
     fn host_ptr(&self, buffer: &Buffer, bytes: u64) -> Option<*mut u8> {
         let native = raw(buffer).ok()?;
-        if bytes > buffer.size() {
+        // Launches run when they are recorded, but a batch that has not been flushed is still
+        // pending work: reading before the flush would skip it (see `pending_dispatches`).
+        if bytes > buffer.size() || self.dispatches.load(Ordering::Relaxed) != 0 {
             return None;
         }
         Some(native.as_ptr())

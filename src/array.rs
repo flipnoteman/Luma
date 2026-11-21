@@ -299,22 +299,16 @@ impl Storage {
         self.segments[0].with_host_bytes_mut(f)
     }
 
-    /// A storage of `len` elements of `layout` that `f` fills: host-resident, or, on unified
-    /// memory, in a mappable buffer written in place.
+    /// A storage of `len` elements of `layout` in a mappable buffer that `f` fills in place. Only
+    /// with [`Context::zero_copy`], which is all [`Context::can_run_on_host`] allows.
     pub(crate) fn alloc_host(ctx: &Context, len: usize, layout: ElemLayout, f: impl FnOnce(&mut [u8])) -> Result<Arc<Storage>> {
         let bytes = layout.bytes(len);
-        let segment = if ctx.zero_copy() {
-            ctx.make_room(bytes)?;
-            let buffer = ctx.alloc_host_buffer(bytes)?;
-            let ptr = ctx.host_ptr(&buffer, bytes).expect("a fresh mappable buffer has a host pointer");
-            // SAFETY: `buffer` holds at least `bytes` bytes and no GPU command touches it.
-            f(unsafe { std::slice::from_raw_parts_mut(ptr, bytes as usize) });
-            Segment::filled(ctx, bytes, buffer)
-        } else {
-            let mut data = vec![0u8; bytes as usize];
-            f(&mut data);
-            Segment::host(ctx, bytes, data)
-        };
+        ctx.make_room(bytes)?;
+        let buffer = ctx.alloc_host_buffer(bytes)?;
+        let ptr = ctx.host_ptr(&buffer, bytes).expect("a fresh mappable buffer has a host pointer");
+        // SAFETY: `buffer` holds at least `bytes` bytes and no GPU command touches it.
+        f(unsafe { std::slice::from_raw_parts_mut(ptr, bytes as usize) });
+        let segment = Segment::filled(ctx, bytes, buffer);
         Ok(Arc::new(Storage::with_segments(ctx, len, layout, Box::new([segment]), None)))
     }
 }
@@ -486,17 +480,6 @@ impl<T: GpuType> Array<T> {
         let len = shape.validate()?;
         if data.len() != len {
             return Err(LumaError::LengthMismatch { expected: len, actual: data.len() });
-        }
-        if !ctx.zero_copy() && ctx.can_run_on_host() {
-            let layout = T::LAYOUT;
-            let bytes = layout.bytes(len);
-            if bytes <= 512 * 1024 && len <= segment_len(ctx, layout) {
-                let words = T::to_repr(data);
-                let vec = bytemuck::cast_slice(&words[layout.words(0..len)]).to_vec();
-                let segment = Segment::host(ctx, bytes, vec);
-                let storage = Storage::with_segments(ctx, len, layout, Box::new([segment]), None);
-                return Ok(Self::new(ctx, shape, Repr::Valid(Arc::new(storage))));
-            }
         }
         if ctx.zero_copy() {
             let layout = T::LAYOUT;
