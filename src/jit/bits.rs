@@ -2,6 +2,74 @@
 //! for once per word of the set. The generic code of a build for the baseline x86-64 has no
 //! population count instruction and works on two words at a time; where the processor has them
 //! the same loops are compiled for POPCNT and AVX2 and picked once per call.
+//!
+//! The sets are also what `create` allocates most of: one of the size of the expression below
+//! the node, per node, freed when the node is. Expressions made again and again (a hash of a
+//! new batch, a step of a loop) ask for the sizes the last one gave back, so the buffers of
+//! dropped nodes are kept for the next ones, within a budget.
+
+use std::cell::RefCell;
+
+/// Most words (8 bytes each) of buffers a thread keeps for later nodes.
+const POOL_WORDS: usize = 1 << 20;
+/// Longest buffer worth keeping; longer ones (an expression of more than 64 * this many ids
+/// below a node) are rare and the allocator is the better judge of them.
+const POOL_MAX_LEN: usize = 1024;
+
+/// Buffers of dropped nodes by length.
+struct Pool {
+    by_len: Vec<Vec<Box<[u64]>>>,
+    words: usize,
+}
+
+thread_local! {
+    static POOL: RefCell<Pool> = const { RefCell::new(Pool { by_len: Vec::new(), words: 0 }) };
+}
+
+/// A zeroed buffer of `len` words: one a dropped node gave back, or a new one.
+pub(super) fn zeroed(len: usize) -> Box<[u64]> {
+    let recycled = if len <= POOL_MAX_LEN {
+        POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            let buffer = pool.by_len.get_mut(len)?.pop()?;
+            pool.words -= len;
+            Some(buffer)
+        })
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    match recycled {
+        Some(mut buffer) => {
+            buffer.fill(0);
+            buffer
+        }
+        None => vec![0; len].into_boxed_slice(),
+    }
+}
+
+/// Keeps the buffer of a node that is dropped for [`zeroed`], unless the thread holds enough.
+pub(super) fn recycle(buffer: Box<[u64]>) {
+    let len = buffer.len();
+    if len == 0 || len > POOL_MAX_LEN {
+        return;
+    }
+    // `try_with`: nodes are dropped while a thread ends too.
+    let _ = POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.words + len > POOL_WORDS {
+            return;
+        }
+        if pool.by_len.len() <= len {
+            pool.by_len.resize_with(len + 1, Vec::new);
+        }
+        pool.words += len;
+        if let Some(bucket) = pool.by_len.get_mut(len) {
+            bucket.push(buffer);
+        }
+    });
+}
 
 /// `dst |= src` word by word, over the shorter of the two.
 #[inline]

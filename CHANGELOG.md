@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Host cost of building lazy expressions: a large unrolled expression (24 Keccak rounds written out, ML-KEM) spends its host time in `create`, one node per operation. The id set every node keeps of the expression below it is merged with POPCNT/AVX2 word loops (picked at run time; the generic loops are the fallback), built in one allocation, and its buffer is reused by the next node of that size once the node is dropped (up to 8 MiB per thread); the table that makes equal operations one node and the list of live nodes are kept per thread instead of behind a lock per context (a thread only ever shared or swept the nodes it made); the references a node keeps to its first three readers need no allocation. Generated kernels, kernel keys and results are unchanged.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed

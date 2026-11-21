@@ -1555,16 +1555,16 @@ fn measure(args: &[Src]) -> Measure {
         if width <= 2 * used + 8 {
             let base = lo & !63;
             // One allocation: the set (zeroed, then merged into) and the buffers behind it.
-            let mut ids = Vec::with_capacity(width + inputs.len());
-            ids.resize(width, 0u64);
+            let mut ids = bits::zeroed(width + inputs.len());
+            let (dense, tail) = ids.split_at_mut(width);
             for node in operands() {
-                mark(&mut ids, base, node.id);
-                node.mark_below(&mut ids, base);
+                mark(dense, base, node.id);
+                node.mark_below(dense, base);
             }
+            tail.copy_from_slice(inputs);
             // One operand: its set plus itself, which is not in it.
-            let below = if count == 1 { upper } else { bits::count_ones(&ids) };
-            ids.extend_from_slice(inputs);
-            return Measure { below, inputs: inputs.len(), ids: ids.into_boxed_slice(), base, words: width as u32, sparse: false };
+            let below = if count == 1 { upper } else { bits::count_ones(dense) };
+            return Measure { below, inputs: inputs.len(), ids, base, words: width as u32, sparse: false };
         }
         below.clear();
         for node in operands() {

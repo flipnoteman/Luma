@@ -17,54 +17,66 @@ pub(crate) struct Readers {
     generation: AtomicU64,
 }
 
-/// Weak references to nodes. Most nodes are read by a single operation, so the first reference
-/// lives in the list itself: no allocation until a second one arrives.
+/// How many references a [`Weaks`] holds in itself.
+const INLINE: usize = 3;
+
+/// Weak references to nodes, oldest first. Most nodes are read by a few operations, so the first
+/// references live in the list itself: no allocation until a fourth one arrives.
 #[derive(Debug, Default)]
 pub(super) struct Weaks {
-    first: Option<Weak<Node>>,
+    /// The oldest references, from the front.
+    inline: [Option<Weak<Node>>; INLINE],
+    /// The others; there are some only if `inline` is full.
     rest: Vec<Weak<Node>>,
 }
 
 impl Weaks {
     fn push(&mut self, node: Weak<Node>) {
-        if self.first.is_none() {
-            self.first = Some(node);
-        } else {
-            self.rest.push(node);
+        match self.inline.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => *slot = Some(node),
+            None => self.rest.push(node),
         }
     }
 
     fn len(&self) -> usize {
-        usize::from(self.first.is_some()) + self.rest.len()
+        self.inline.iter().flatten().count() + self.rest.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inline.first().is_none_or(Option::is_none)
     }
 
     fn iter(&self) -> impl DoubleEndedIterator<Item = &Weak<Node>> {
-        self.first.iter().chain(&self.rest)
+        self.inline.iter().flatten().chain(&self.rest)
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&Weak<Node>) -> bool) {
-        if self.first.as_ref().is_some_and(|weak| !keep(weak)) {
-            self.first = None;
+        // In order, so that what is kept stays oldest first.
+        let mut kept = 0;
+        for at in 0..INLINE {
+            let Some(weak) = self.inline.get_mut(at).and_then(Option::take) else { continue };
+            if keep(&weak) {
+                if let Some(slot) = self.inline.get_mut(kept) {
+                    *slot = Some(weak);
+                }
+                kept += 1;
+            }
         }
-        self.rest.retain_mut(|weak| {
-            if !keep(weak) {
-                return false;
-            }
-            if self.first.is_none() {
-                self.first = Some(std::mem::take(weak));
-                return false;
-            }
-            true
-        });
+        self.rest.retain_mut(|weak| keep(weak));
+        // The oldest of the others take the places that were freed.
+        let moved = (INLINE - kept).min(self.rest.len());
+        for (slot, weak) in self.inline.iter_mut().skip(kept).zip(self.rest.drain(..moved)) {
+            *slot = Some(weak);
+        }
     }
 }
 
 impl IntoIterator for Weaks {
     type Item = Weak<Node>;
-    type IntoIter = std::iter::Chain<std::option::IntoIter<Weak<Node>>, std::vec::IntoIter<Weak<Node>>>;
+    type IntoIter = std::iter::Chain<std::iter::Flatten<std::array::IntoIter<Option<Weak<Node>>, INLINE>>, std::vec::IntoIter<Weak<Node>>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.first.into_iter().chain(self.rest)
+        self.inline.into_iter().flatten().chain(self.rest)
     }
 }
 
@@ -138,7 +150,7 @@ impl Readers {
     /// buffer it produced.
     pub(crate) fn absorb(&self, other: &Readers) {
         let moved = other.take();
-        if moved.first.is_none() {
+        if moved.is_empty() {
             return;
         }
         lock(&self.list).nodes.extend(moved);
