@@ -8,6 +8,7 @@
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,12 @@ impl Task {
         let job = lock(&self.0).take();
         if let Some(job) = job {
             job();
+            // Where the driver's handlers are glibc's (see `hook_exit`); a registration per job
+            // elsewhere would only fill the handler table.
+            #[cfg(target_os = "linux")]
+            if pool().is_some() {
+                hook_exit();
+            }
         }
     }
 }
@@ -77,6 +84,10 @@ fn pool() -> Option<&'static Pool> {
 /// How long exit waits for the kernels being compiled.
 const EXIT_WAIT: Duration = Duration::from_secs(20);
 
+/// Set when the exit handler has run: it is registered many times (see [`hook_exit`]) and does
+/// its work once.
+static EXITED: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "C" {
     fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
 }
@@ -84,8 +95,12 @@ unsafe extern "C" {
 /// A driver's own exit handler frees what a compile still running on a worker uses, which
 /// crashes the process (a recorded step that is never replayed leaves its kernels compiling).
 /// This handler is registered after the driver's, so it runs first: it drops the jobs still
-/// queued and waits for the running ones.
+/// queued and waits for the running ones. It has to stay registered after the driver's (see
+/// [`hook_exit`]).
 extern "C" fn at_exit() {
+    if EXITED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let Some(pool) = pool() else { return };
     let mut state = lock(&pool.state);
     state.closed = true;
@@ -97,15 +112,23 @@ extern "C" fn at_exit() {
     }
 }
 
-/// Registers the exit handler once.
+/// Registers the exit handler as the newest one. `exit` runs handlers in the reverse order of
+/// their registration and the driver registers its own while it works (the PTX JIT,
+/// `libnvidia-ptxjitcompiler`, is loaded by the first kernel a job loads, and registers the
+/// destructors of its state then): a handler registered before them would run after them, with
+/// the compiler's state freed under the job still running. So it is registered again whenever a
+/// job has finished, and the older registrations return at once ([`EXITED`]).
 fn hook_exit() {
+    // SAFETY: `at_exit` is a plain `extern "C"` function that does not unwind.
+    unsafe {
+        atexit(at_exit);
+    }
+}
+
+/// Registers the exit handler for the first job, which may still be running at exit.
+fn hook_exit_once() {
     static HOOKED: OnceLock<()> = OnceLock::new();
-    HOOKED.get_or_init(|| {
-        // SAFETY: `at_exit` is a plain `extern "C"` function that does not unwind.
-        unsafe {
-            atexit(at_exit);
-        }
-    });
+    HOOKED.get_or_init(hook_exit);
 }
 
 /// Starts the worker `index`; it takes jobs until the process exits.
@@ -136,7 +159,7 @@ fn spawn_worker(pool: &'static Pool, index: usize) -> std::io::Result<()> {
 /// a kernel compiled by itself must reach a worker that has compiled one before, not a new one.
 fn submit(task: Arc<Task>) {
     let Some(pool) = pool() else { return task.run() };
-    hook_exit();
+    hook_exit_once();
     let mut state = lock(&pool.state);
     if state.closed || state.queue.len() >= pool.workers * QUEUE_PER_WORKER {
         drop(state);
