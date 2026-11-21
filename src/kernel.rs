@@ -141,6 +141,9 @@ pub(crate) enum Native {
     /// A matrix product, see [`MatmulSpec`]; its shader is not the product of the tile the spec
     /// names, so the backend has to compile it.
     Matmul(MatmulSpec),
+    /// A batched matrix product, see [`Backend::compile_batched_matmul`]; the shader is the
+    /// fallback.
+    BatchedMatmul,
 }
 
 /// [`build_core`] where the backend may run `native` as native code instead of compiling the shader.
@@ -178,6 +181,7 @@ pub(crate) fn build_core_native(
     let native = native.filter(|_| all_bound).and_then(|spec| match spec {
         Native::LineSolve(spec) => backend.compile_line_solve(&spec),
         Native::Matmul(spec) => backend.compile_matmul(&spec),
+        Native::BatchedMatmul => backend.compile_batched_matmul(),
     });
     if native.is_none() && matches!(requested, Some(Native::Matmul(_))) {
         return Err(BackendError::Unsupported("the backend cannot compile the native matrix product it planned".into()).into());

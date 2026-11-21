@@ -1,6 +1,7 @@
-//! Many small matrix products. `matmul` has no batch axis, so a batch is either a broadcast
-//! multiply fused into a reduction (`[K, M, 1, B] * [K, 1, N, B]` summed over axis 0, one
-//! kernel, nothing stored) or a loop of products, one launch each.
+//! Many small matrix products: `matmul_batched` (one launch for the batch, `[K, M, B]` times
+//! `[N, K, B]`, or `[N, K]` shared by every product), against the ways of doing it without: a
+//! broadcast multiply fused into a reduction (`[K, M, 1, B] * [K, 1, N, B]` summed over axis 0,
+//! one kernel, nothing stored) and a loop of `matmul`, one launch each.
 
 use super::common::*;
 use crate::harness::*;
@@ -63,7 +64,43 @@ fn looped(h: &mut Harness, batch: usize, m: usize) {
     });
 }
 
+/// The same products as one `matmul_batched`. `shared`: the right operand is one `k x n` matrix
+/// for every product (the weights of a layer), else a matrix per product.
+fn batched_matmul(h: &mut Harness, batch: usize, m: usize, shared: bool) {
+    let batch = size(h, batch / 4, batch, batch / 4);
+    let (k, n) = (m, m);
+    let flops = 2.0 * (batch * m * n * k) as f64;
+    if !fits(h, flops) {
+        return;
+    }
+    let case = if shared { "batched/matmul_batched_shared" } else { "batched/matmul_batched" };
+    let size = format!("{batch}x{m}x{k}x{n}");
+    h.guarded(&format!("{case} {size}"), |h| {
+        let a = values(batch * m * k, 85, -1.0, 1.0);
+        let b_batch = if shared { 1 } else { batch };
+        let b = values(b_batch * k * n, 86, -1.0, 1.0);
+        let aa = arr(h, &a, [k, m, batch]);
+        let bb = arr(h, &b, [n, k, b_batch]);
+        let run = || aa.matmul_batched(&bb);
+        let got = run().to_vec().unwrap();
+        for i in sample(batch, 6) {
+            let w = &b[if shared { 0 } else { i * k * n }..][..k * n];
+            let want = gemm(&a[i * m * k..][..m * k], w, m, k, n);
+            check(case, &got[i * m * n..][..m * n], &want, 1e-3, 1e-3);
+        }
+        h.case(case, &size, Work::Flops(flops), &mut || run().eval().unwrap());
+    });
+}
+
 pub fn run(h: &mut Harness) {
+    batched_matmul(h, 16384, 16, false);
+    batched_matmul(h, 4096, 32, false);
+    batched_matmul(h, 1024, 64, false);
+    batched_matmul(h, 256, 32, false);
+    batched_matmul(h, 64, 64, false);
+    batched_matmul(h, 256, 128, false);
+    batched_matmul(h, 4096, 32, true);
+    batched_matmul(h, 1024, 64, true);
     broadcast(h, 16384, 16);
     broadcast(h, 4096, 32);
     broadcast(h, 1024, 64);

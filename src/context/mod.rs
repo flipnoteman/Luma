@@ -774,6 +774,7 @@ impl Context {
                             Builtin::Matmul { tile: crate::matmul::MatmulTile::Native { edge, lhs_t, rhs_t }, .. } => {
                                 Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t }))
                             }
+                            Builtin::Bmm(_) if self.inner.tuning.native_gemm > 0 => Some(kernel::Native::BatchedMatmul),
                             _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),
                         };
                         kernel::build_core_native(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), KernelTrust::Trusted, native)

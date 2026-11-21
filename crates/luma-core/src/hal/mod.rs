@@ -967,6 +967,17 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn compile_matmul(&self, _spec: &MatmulSpec) -> Option<RawKernel> {
         None
     }
+    /// The native code of a batched matrix product (`Builtin::Bmm` of `luma`), `None` to compile
+    /// the shader instead (always `None` unless [`Backend::native_matmul`]). The launch is the
+    /// shader's: the bindings `c` (written), `a` and `b` (read) and the uniform `{m, n, k,
+    /// matrices, a_stride, b_stride, _, _}` (`u32`s), one workgroup per matrix (numbered along
+    /// the folded grid, `x + y * num_workgroups.x`; workgroups past `matrices` do nothing).
+    /// Matrix `i` is the row-major product of the `M x K` matrix at `i * a_stride` of `a` and the
+    /// `K x N` one at `i * b_stride` of `b`, written at `i * m * n` of `c` (a stride of 0 shares
+    /// one operand).
+    fn compile_batched_matmul(&self) -> Option<RawKernel> {
+        None
+    }
     /// The native code of a line solve, `None` to compile the shader instead (always `None` unless
     /// [`Backend::native_line_solve`]).
     fn compile_line_solve(&self, _spec: &LineSolveSpec) -> Option<RawKernel> {
