@@ -15,6 +15,7 @@ use crate::builtin::UnOp;
 use crate::context::Context;
 use crate::tuning::Coarsen;
 
+use super::cost::{op_weight, CostModel};
 use super::program::{FusedKey, Tail};
 use super::{ElemTy, OpKind, ShiftKind};
 
@@ -51,7 +52,7 @@ pub(super) fn plan(ctx: &Context, key: &FusedKey, len: usize) -> u8 {
             if waves < MIN_WAVES {
                 return 1;
             }
-            pick(&Features::of(key), tuning.max_live)
+            pick(&Features::of(key, &ctx.cost_model()), waves, tuning.max_live)
         }
     }
 }
@@ -60,10 +61,11 @@ pub(super) fn plan(ctx: &Context, key: &FusedKey, len: usize) -> u8 {
 /// 2048 and 1024 on others): what a wave of the grid is made of.
 const RESIDENT_PER_UNIT: f64 = 1536.0;
 
-/// Fewest waves of invocations a launch has before it is coarsened: with less, the invocations
+/// Fewest waves of invocations a launch has before it is coarsened at all: with less, the invocations
 /// that remain do not hide the latency of the longer chain each of them runs (a chain of 256
-/// operations over a million elements ran 12 % slower with 4 elements per invocation).
-const MIN_WAVES: f64 = 16.0;
+/// operations over a million elements, 8 waves on an RTX 3090, ran 12 % slower with 4 elements
+/// per invocation).
+const MIN_WAVES: f64 = 4.0;
 
 /// What of a program decides its coarsening (see [`pick`]).
 #[derive(Debug, Default, PartialEq)]
@@ -73,14 +75,18 @@ struct Features {
     wide_ops: usize,
     /// Gathers (`take`): the load of the element waits for the load of its index.
     gathers: usize,
+    /// What one element costs in `f32` operations (see `cost::op_weight`): the index math of views
+    /// and gathers, the arithmetic and the casts of the main program and of the sub-programs.
+    weight: f64,
     /// Most values live at once in the main program.
     live: usize,
 }
 
 impl Features {
-    fn of(key: &FusedKey) -> Features {
+    fn of(key: &FusedKey, cost: &CostModel) -> Features {
         let mut features = Features { live: peak_live(key), ..Features::default() };
         for instr in key.instrs.iter().chain(key.subs.iter().flatten()) {
+            features.weight += op_weight(instr.op, cost);
             match instr.op.kind {
                 OpKind::Unary(op) if op != UnOp::Id && instr.op.ty == ElemTy::F64 => features.wide_ops += 1,
                 OpKind::Binary(_) | OpKind::Clamp | OpKind::Powf if instr.op.ty == ElemTy::F64 => features.wide_ops += 1,
@@ -120,11 +126,13 @@ fn peak_live(key: &FusedKey) -> usize {
 /// bandwidth runs the same speed, so the planner leaves those alone rather than pay for the longer
 /// kernels and the registers of every copy: the most elements it takes keep `copies * live` within
 /// the registers `max_live` allows.
-fn pick(features: &Features, max_live: usize) -> u8 {
-    let wanted: u8 = if features.wide_ops >= WIDE_OPS {
+fn pick(features: &Features, waves: f64, max_live: usize) -> u8 {
+    let wanted: u8 = if features.wide_ops >= WIDE_OPS && waves >= WAITING_WAVES {
         8
-    } else if features.gathers >= GATHERS {
+    } else if features.gathers >= GATHERS && waves >= WAITING_WAVES {
         4
+    } else if features.weight <= LIGHT_WEIGHT && waves < BANDWIDTH_WAVES {
+        2
     } else {
         1
     };
@@ -135,6 +143,17 @@ fn pick(features: &Features, max_live: usize) -> u8 {
     count
 }
 
+/// Most `f32` operations per element (see [`Features::weight`]) of a light kernel, which a launch of
+/// fewer than [`BANDWIDTH_WAVES`] waves runs 2 elements per invocation: the grid is too short for
+/// the block scheduling and the per-invocation prologue (the grid size, the bounds check, the
+/// element's index) to vanish behind the memory traffic, and that is what a second element
+/// amortises. From that many waves on the traffic of a light kernel is the bandwidth of the
+/// device and the count of elements changes nothing.
+const LIGHT_WEIGHT: f64 = 40.0;
+const BANDWIDTH_WAVES: f64 = 64.0;
+/// Waves from which a kernel that waits on long chains (`f64` arithmetic, gathers) takes the
+/// elements that fill them.
+const WAITING_WAVES: f64 = 16.0;
 /// Operations on `f64` from which a kernel is coarsened.
 const WIDE_OPS: usize = 8;
 /// Gathers from which a kernel is coarsened.
@@ -286,14 +305,18 @@ mod tests {
 
     #[test]
     fn the_planner_picks_by_what_the_kernel_waits_for() {
-        let features = |wide_ops, gathers, live| Features { wide_ops, gathers, live };
-        assert_eq!(pick(&features(0, 0, 4), 96), 1, "a streaming kernel is left alone");
-        assert_eq!(pick(&features(7, 1, 4), 96), 1);
-        assert_eq!(pick(&features(16, 0, 4), 96), 8, "a chain of f64 operations");
-        assert_eq!(pick(&features(0, 4, 4), 96), 4, "gathers");
-        assert_eq!(pick(&features(16, 4, 4), 96), 8);
-        assert_eq!(pick(&features(16, 0, 30), 96), 2, "registers for no more copies than 96 values allow");
-        assert_eq!(pick(&features(16, 0, 100), 96), 1);
+        let features = |wide_ops, gathers, weight, live| Features { wide_ops, gathers, weight, live };
+        assert_eq!(pick(&features(0, 0, 100.0, 4), 200.0, 96), 1, "a heavy kernel with nothing to wait for");
+        assert_eq!(pick(&features(0, 0, 8.0, 4), 200.0, 96), 1, "a streaming kernel on a long grid is bandwidth bound");
+        assert_eq!(pick(&features(0, 0, 8.0, 4), 8.0, 96), 2, "a light kernel on a short grid");
+        assert_eq!(pick(&features(0, 0, 8.0, 100), 8.0, 96), 1, "no registers for it");
+        assert_eq!(pick(&features(7, 1, 300.0, 4), 200.0, 96), 1);
+        assert_eq!(pick(&features(16, 0, 600.0, 4), 200.0, 96), 8, "a chain of f64 operations");
+        assert_eq!(pick(&features(16, 0, 600.0, 4), 8.0, 96), 1, "on a short grid");
+        assert_eq!(pick(&features(0, 4, 100.0, 4), 200.0, 96), 4, "gathers");
+        assert_eq!(pick(&features(16, 4, 600.0, 4), 200.0, 96), 8);
+        assert_eq!(pick(&features(16, 0, 600.0, 30), 200.0, 96), 2, "registers for no more copies than 96 values allow");
+        assert_eq!(pick(&features(16, 0, 600.0, 100), 200.0, 96), 1);
     }
 
     /// A tuning that takes a launch of 100 000 elements for many waves.
@@ -326,6 +349,13 @@ mod tests {
         let y = Array::from_slice_on(&ctx, &values(n, 21, 0.0, 1.0), n).unwrap();
         (&y * 2.0 + 1.0).eval().unwrap();
         assert_eq!(ctx.jit().stats().coarsened, before, "a streaming kernel keeps one element per invocation");
+        // A light kernel on a grid of fewer waves than a bandwidth-bound one has takes two.
+        let m = 50_000;
+        let before = ctx.jit().stats().coarsened;
+        let w = Array::from_slice_on(&ctx, &values(m, 22, 0.0, 1.0), m).unwrap();
+        let got = (&w * 2.0 + 1.0).to_vec().unwrap();
+        assert_eq!(ctx.jit().stats().coarsened, before + 1);
+        assert_eq!(got, values(m, 22, 0.0, 1.0).iter().map(|v| v * 2.0 + 1.0).collect::<Vec<f32>>());
         // Below the waves a launch needs, nothing is coarsened.
         let small = Array::<f64>::from_slice_on(&ctx, &xs[..1000], 1000).unwrap();
         let before = ctx.jit().stats().coarsened;
