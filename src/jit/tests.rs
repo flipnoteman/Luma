@@ -4923,3 +4923,47 @@ fn a_failed_graph_capture_is_tried_again_until_three_have_failed() {
     }
     assert_eq!(tries, 3);
 }
+
+/// A state the step hands back unchanged (itself, or `&s * 1.0`) takes no launch per step: the
+/// plan has the launches of the other states only, the unchanged states are bound to one buffer at
+/// every step and come out as they went in, after an even or an odd number of steps.
+#[test]
+fn a_state_a_step_hands_back_unchanged_takes_no_launch() {
+    let ctx = ctx();
+    let (xs, ks, ms) = (values(1000, 40, 0.0, 1.0), values(1000, 41, 0.0, 1.0), values(1000, 42, 0.0, 1.0));
+    let (x, k, m) = (f32s(&ctx, &xs), f32s(&ctx, &ks), f32s(&ctx, &ms));
+    let step = |s: &[Array<f32>; 3]| [(s[0].shift(1) * 0.5 + &s[1] * 0.25 - s[2].shift(-1) * 0.125).cache(), s[1].clone(), &s[2] * 1.0];
+    let (mut trace, probes) = crate::jit::Trace::start(&[&x, &k, &m]).ok().unwrap();
+    let probes: [Array<f32>; 3] = probes.try_into().ok().unwrap();
+    let next = step(&probes);
+    let stepper = trace.finish(&next.each_ref(), true).ok().unwrap().expect("the step is stepable");
+    assert_eq!(stepper.plan().launches(), 1, "only the first state is computed");
+    let reference = |steps: usize| {
+        let mut a = xs.clone();
+        let n = a.len();
+        for _ in 0..steps {
+            a = (0..n).map(|i| a[(i + n - 1) % n] * 0.5 + ks[i] * 0.25 - ms[(i + 1) % n] * 0.125).collect();
+        }
+        a
+    };
+    for steps in [1, 2, 3, 4, 7] {
+        stepper.run_steps(steps).unwrap();
+        let after = stepper.state_after(steps);
+        let read = |at: usize| Array::<f32>::from_storage(&ctx, x.shape(), std::sync::Arc::clone(&after[at])).to_vec().unwrap();
+        assert_close(&read(0), &reference(steps), 1e-5, 1e-6);
+        assert_eq!(read(1), ks, "{steps} steps");
+        assert_eq!(read(2), ms, "{steps} steps");
+    }
+    assert_eq!(k.to_vec().unwrap(), ks);
+    assert_eq!(m.to_vec().unwrap(), ms);
+
+    // The same through `iterate_all`: the results are arrays of their own.
+    for steps in [1, 2, 5, 6] {
+        let [r, mut rk, rm] = crate::iterate_all([&x, &k, &m], steps, step);
+        assert_close(&r.to_vec().unwrap(), &reference(steps), 1e-5, 1e-6);
+        rk += 1.0;
+        assert_eq!(rk.to_vec().unwrap(), ks.iter().map(|v| v + 1.0).collect::<Vec<_>>());
+        assert_eq!(rm.to_vec().unwrap(), ms);
+        assert_eq!(k.to_vec().unwrap(), ks);
+    }
+}

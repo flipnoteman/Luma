@@ -667,6 +667,18 @@ impl<T: GpuType> Array<T> {
         }
     }
 
+    /// Whether this array is the placeholder `probe` of a traced step handed back unchanged: its
+    /// buffer, or a copy of it that has not run yet (`&x * 1.0`), which there is no need to run.
+    pub(crate) fn passes_through(&self, probe: &Arc<Storage>) -> bool {
+        if self.view.is_some() || self.read_view {
+            return false;
+        }
+        match self.pending() {
+            Some(node) => node.is_copy_of(probe),
+            None => matches!(&self.repr, Repr::Valid(storage) if Arc::ptr_eq(storage, probe)),
+        }
+    }
+
     /// The reduction this array is (recorded into a buffer or not), if it is one.
     pub(crate) fn reduced(&self) -> Option<&Arc<Reduced>> {
         match &self.repr {

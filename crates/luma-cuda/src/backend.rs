@@ -392,6 +392,160 @@ fn resolve_dispatch<'a>(dispatch: Dispatch<'a>) -> Result<([u32; 3], u64, Option
     }
 }
 
+/// The accesses to one buffer since it was last written, while a graph is captured.
+#[derive(Default)]
+struct Touch {
+    /// The launch that wrote it last.
+    writer: Option<usize>,
+    /// The launches that read it since.
+    readers: Vec<usize>,
+}
+
+/// Orders the launches of a graph by the buffers they touch: a launch follows the last writer of
+/// every buffer it touches (read after write, write after write) and, when it writes one, every
+/// reader since (write after read). Launches that share no buffer, or only read one together,
+/// get no edge between them and may run concurrently. Buffers are told apart by device address:
+/// every buffer is a block of its own, and a pool buffer handed out again is the same address.
+#[derive(Default)]
+struct Hazards {
+    touched: std::collections::HashMap<u64, Touch>,
+    accesses: Vec<(u64, bool)>,
+}
+
+impl Hazards {
+    /// Records the next launch (numbered `index`) and puts into `after` the earlier launches it
+    /// must follow, sorted and without repeats. `args` are the buffers it binds (device address,
+    /// whether it may write it), `counts` the buffer holding its workgroup counts, which it reads.
+    fn follow(&mut self, index: usize, args: impl Iterator<Item = (u64, bool)>, counts: Option<u64>, after: &mut Vec<usize>) {
+        self.accesses.clear();
+        self.accesses.extend(args);
+        self.accesses.extend(counts.map(|ptr| (ptr, false)));
+        // One entry per buffer, a write if any binding of it is one.
+        self.accesses.sort_unstable();
+        self.accesses.dedup_by(|later, earlier| {
+            let same = later.0 == earlier.0;
+            if same {
+                earlier.1 |= later.1;
+            }
+            same
+        });
+        after.clear();
+        for &(ptr, writes) in &self.accesses {
+            let touch = self.touched.entry(ptr).or_default();
+            after.extend(touch.writer);
+            if writes {
+                after.extend(touch.readers.iter().copied());
+                touch.writer = Some(index);
+                touch.readers.clear();
+            } else {
+                touch.readers.push(index);
+            }
+        }
+        after.sort_unstable();
+        after.dedup();
+    }
+}
+
+/// Most launches looked at to find the edges a launch has through others (see [`reduce`]).
+const REDUCE_BUDGET: usize = 512;
+
+/// Drops from `after` (sorted) the launches another one in it already follows, through `preds`
+/// (what each earlier launch follows): an edge to such a launch only costs the driver a wait.
+/// Looks at no more than [`REDUCE_BUDGET`] launches; what it did not reach stays.
+fn reduce(preds: &[Vec<usize>], after: &mut Vec<usize>, seen: &mut [u32], epoch: u32, stack: &mut Vec<usize>) {
+    let Some(&low) = after.first() else { return };
+    if after.len() < 2 {
+        return;
+    }
+    stack.clear();
+    for &d in after.iter() {
+        stack.extend(preds[d].iter().copied().filter(|&p| p >= low));
+    }
+    let mut budget = REDUCE_BUDGET;
+    while let Some(n) = stack.pop() {
+        if seen[n] == epoch {
+            continue;
+        }
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        seen[n] = epoch;
+        stack.extend(preds[n].iter().copied().filter(|&p| p >= low));
+    }
+    after.retain(|&d| seen[d] != epoch);
+}
+
+/// How many launches a graph needs per launch of its longest chain for its launches to be
+/// captured with edges of their own: a graph that is mostly a chain is captured as one (measured
+/// on an RTX 3090: as fast as with edges, and without the driver's cost of branches).
+const MIN_PARALLELISM: f64 = 1.5;
+
+/// What every launch of `launches` that runs follows (indices among those that run), from the
+/// buffers they touch; `None` when the launches have too little to run side by side to pay for
+/// the edges (see [`MIN_PARALLELISM`]).
+fn capture_order(launches: &[GraphLaunch<'_>], dispatches: &[([u32; 3], u64, Option<&Buffer>)]) -> Result<Option<Vec<Vec<usize>>>, BackendError> {
+    let mut hazards = Hazards::default();
+    let mut preds: Vec<Vec<usize>> = Vec::new();
+    let mut level: Vec<u32> = Vec::new();
+    let mut seen = vec![0u32; launches.len()];
+    let (mut after, mut stack, mut accesses) = (Vec::new(), Vec::new(), Vec::new());
+    for (launch, &(grid, _, counts)) in launches.iter().zip(dispatches) {
+        if grid.contains(&0) {
+            continue;
+        }
+        accesses.clear();
+        for (_, arg) in launch.kernel.bound(launch.args) {
+            if let RawArg::Storage { buffer, writable, .. } = arg {
+                accesses.push((device_ptr(buffer)?, *writable));
+            }
+        }
+        hazards.follow(preds.len(), accesses.iter().copied(), counts.map(device_ptr).transpose()?, &mut after);
+        reduce(&preds, &mut after, &mut seen, preds.len() as u32 + 1, &mut stack);
+        level.push(1 + after.iter().map(|&d| level[d]).max().unwrap_or(0));
+        preds.push(after.clone());
+    }
+    let longest = level.iter().copied().max().unwrap_or(0);
+    Ok((preds.len() as f64 >= MIN_PARALLELISM * f64::from(longest)).then_some(preds))
+}
+
+/// Makes the next launch captured on `stream` follow exactly the nodes `after` (indices into
+/// `nodes`), `current` being what the stream's capture follows now.
+///
+/// # Safety
+/// `stream` must be capturing and `nodes` must be nodes of its capture graph.
+unsafe fn follow_nodes(stream: &CudaStream, nodes: &[sys::CUgraphNode], after: &[usize], current: &mut Vec<usize>) -> Result<(), BackendError> {
+    if current == after {
+        return Ok(());
+    }
+    let mut handles: Vec<sys::CUgraphNode> = after.iter().map(|&n| nodes[n]).collect();
+    // SAFETY: per the caller's contract; the driver copies the handles.
+    unsafe { sys::cuStreamUpdateCaptureDependencies(stream.cu_stream(), handles.as_mut_ptr(), handles.len(), sys::CUstreamUpdateCaptureDependencies_flags::CU_STREAM_SET_CAPTURE_DEPENDENCIES as u32) }
+        .result()
+        .map_err(gpu)?;
+    current.clear();
+    current.extend_from_slice(after);
+    Ok(())
+}
+
+/// The node the last launch captured on `stream` created.
+///
+/// # Safety
+/// `stream` must be capturing.
+unsafe fn last_node(stream: &CudaStream) -> Result<sys::CUgraphNode, BackendError> {
+    let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    let mut graph = std::ptr::null_mut();
+    let mut deps: *const sys::CUgraphNode = std::ptr::null();
+    let mut count = 0usize;
+    // SAFETY: the out-pointers are live; the dependency array is read before the next call.
+    unsafe { sys::cuStreamGetCaptureInfo_v2(stream.cu_stream(), &mut status, std::ptr::null_mut(), &mut graph, &mut deps, &mut count) }.result().map_err(gpu)?;
+    if status != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE || count != 1 {
+        return Err(BackendError::Gpu(format!("a captured launch left {count} nodes to follow ({status:?})")));
+    }
+    // SAFETY: `count == 1` entries at `deps`.
+    Ok(unsafe { *deps })
+}
+
 impl Params {
     /// Fills the parameter array of `luma_main` for a launch; `uniform` gives the device address
     /// of the copy of a uniform passed by pointer.
@@ -997,7 +1151,10 @@ impl CudaBackend {
         Ok(())
     }
 
-    fn try_capture(&self, launches: &[GraphLaunch<'_>]) -> Result<Arc<dyn ExecGraph>, BackendError> {
+    /// Captures `launches` as one graph: with `edges`, the launches that touch no common buffer
+    /// (or only read it) have no edge between them and may run concurrently, otherwise each one
+    /// follows the one before it.
+    fn try_capture(&self, launches: &[GraphLaunch<'_>], edges: bool) -> Result<Arc<dyn ExecGraph>, BackendError> {
         if lock(&self.state).profiler.is_some() {
             return Err(BackendError::Unsupported("graphs are not captured while profiling".into()));
         }
@@ -1006,6 +1163,7 @@ impl CudaBackend {
             .map(|l| l.kernel.raw.resolve::<CudaKernel>())
             .collect::<Result<_, _>>()?;
         let dispatches: Vec<([u32; 3], u64, Option<&Buffer>)> = launches.iter().map(|l| resolve_dispatch(l.dispatch)).collect::<Result<_, _>>()?;
+        let order = if edges { capture_order(launches, &dispatches)? } else { None };
 
         // The uniforms passed by pointer are fixed for the life of the graph: one device copy.
         let mut staging: Vec<u8> = Vec::new();
@@ -1046,6 +1204,9 @@ impl CudaBackend {
         let mut offset = 0usize;
         let scratch_bytes = if scratch.is_some() { (staging.len() as u64).max(MIN_BUFFER) } else { 0 };
         let mut res = GraphRes { buffers: Vec::new(), kernels: Vec::new(), scratch, scratch_bytes };
+        // Without an order every launch follows the one before it (the stream's order). With one,
+        // `nodes` are the launches captured and `stream_after` what the stream's capture follows now.
+        let (mut nodes, mut stream_after): (Vec<sys::CUgraphNode>, Vec<usize>) = (Vec::new(), Vec::new());
         let recorded = (|| {
             for ((launch, native), &(grid, indirect, indirect_buffer)) in launches.iter().zip(&natives).zip(&dispatches) {
                 // A launch of no workgroups (an indirect one: of a bound of none) never runs.
@@ -1057,6 +1218,10 @@ impl CudaBackend {
                     offset += bytes.len().next_multiple_of(UNIFORM_ALIGN);
                     Ok(address)
                 })?;
+                if let Some(order) = &order {
+                    // SAFETY: the stream is capturing and `nodes` are its nodes.
+                    unsafe { follow_nodes(&stream, &nodes, &order[nodes.len()], &mut stream_after) }?;
+                }
                 // SAFETY: as in `launch_locked`; the captured node copies the parameters.
                 unsafe {
                     result::launch_kernel(
@@ -1077,6 +1242,12 @@ impl CudaBackend {
                 // The graph reads the counts when it runs: the buffer must outlive it.
                 res.buffers.extend(indirect_buffer.cloned());
                 res.kernels.push(launch.kernel.raw.clone());
+                if order.is_some() {
+                    // SAFETY: the launch just captured made a node of the capture on `stream`.
+                    nodes.push(unsafe { last_node(&stream) }?);
+                    stream_after.clear();
+                    stream_after.push(nodes.len() - 1);
+                }
             }
             Ok::<(), BackendError>(())
         })();
@@ -1418,7 +1589,11 @@ impl Backend for CudaBackend {
         if launches.is_empty() {
             return None;
         }
-        match self.try_capture(launches) {
+        let captured = self.try_capture(launches, true).or_else(|error| {
+            log::debug!("luma: CUDA graph capture with edges failed, capturing a chain: {error}");
+            self.try_capture(launches, false)
+        });
+        match captured {
             Ok(graph) => Some(graph),
             Err(error) => {
                 log::debug!("luma: CUDA graph capture failed, replaying launches one by one: {error}");
@@ -1431,6 +1606,56 @@ impl Backend for CudaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch of a test: its `(buffer, writes)` arguments, a buffer given by a number, and the
+    /// buffer of its workgroup counts.
+    type Touches<'a> = (&'a [(u64, bool)], Option<u64>);
+
+    /// What each launch of `launches` must follow.
+    fn orders(launches: &[Touches<'_>]) -> Vec<Vec<usize>> {
+        let mut hazards = Hazards::default();
+        let mut after = Vec::new();
+        launches
+            .iter()
+            .enumerate()
+            .map(|(index, (args, counts))| {
+                hazards.follow(index, args.iter().copied(), *counts, &mut after);
+                after.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_edge_through_another_launch_is_dropped() {
+        // 1 and 2 follow 0, 3 follows both.
+        let preds = vec![vec![], vec![0], vec![0], vec![1, 2]];
+        let mut seen = vec![0u32; 5];
+        let mut stack = Vec::new();
+        let mut after = vec![0, 1, 2];
+        reduce(&preds, &mut after, &mut seen, 1, &mut stack);
+        assert_eq!(after, vec![1, 2]);
+        let mut after = vec![0, 3];
+        reduce(&preds, &mut after, &mut seen, 2, &mut stack);
+        assert_eq!(after, vec![3]);
+        let mut after = vec![1, 2];
+        reduce(&preds, &mut after, &mut seen, 3, &mut stack);
+        assert_eq!(after, vec![1, 2]);
+    }
+
+    #[test]
+    fn launches_follow_the_buffers_they_share() {
+        let (a, b, c, d) = (16, 32, 48, 64);
+        let got = orders(&[
+            (&[(a, false), (b, true)], None),               // 0: b = f(a)
+            (&[(a, false), (c, true)], None),               // 1: reads a with 0, writes another buffer: independent
+            (&[(b, false), (c, false), (d, true)], None),   // 2: reads what 0 and 1 wrote (RAW)
+            (&[(a, true)], None),                           // 3: overwrites what 0 and 1 read (WAR)
+            (&[(b, true), (b, false)], None),               // 4: writes what 0 wrote and 2 read (WAW, WAR); a repeat binding is one access
+            (&[(a, false)], None),                          // 5: reads what 3 wrote (RAW) and nothing else
+            (&[(d, false), (a, true)], Some(c)),            // 6: after the writer of d and of c, the readers of a since 3 (5), the writer of a (3)
+        ]);
+        assert_eq!(got, vec![vec![], vec![], vec![0, 1], vec![0, 1], vec![0, 2], vec![3], vec![1, 2, 3, 5]]);
+    }
 
     #[test]
     fn a_missing_driver_is_no_adapter() {

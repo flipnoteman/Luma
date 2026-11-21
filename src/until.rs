@@ -767,7 +767,7 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
     drop(arrays);
 
     let plan = {
-        jit::force(&next.arrays())?;
+        jit::force_stepped(&next.arrays(), trace.as_ref().map_or(&[][..], |trace| &trace.probe_storages[..]))?;
         records.force()?;
         trace.as_mut().and_then(Trace::finish_plan)
     };
@@ -854,8 +854,7 @@ fn gated(
     if !fits {
         return Err(Some(Box::new(plan)));
     }
-    let outs: std::result::Result<Vec<Arc<Storage>>, _> =
-        next.arrays().into_iter().map(|array| array.storage().cloned()).collect();
+    let outs = jit::force_stepped(&next.arrays(), &trace.probe_storages);
     match outs {
         Ok(outs) => Stepper::new(ctx, plan, &trace.init, &trace.probe_storages, outs).map_err(Some),
         Err(_) => Err(Some(Box::new(plan))),
@@ -972,6 +971,8 @@ fn trace_records<S: Fields>(
     conds: &[Cond],
     buffers: Option<&GateBuffers>,
 ) -> Outcome<Records> {
+    // The states the step hands back unchanged stay unevaluated (see `jit::force_stepped`).
+    let probe_storages: Vec<Arc<Storage>> = probes.arrays().into_iter().filter_map(|probe| probe.storage().ok().cloned()).collect();
     if until.records.len() == 1 && !ctx.recording_writes_outside() {
         check_shapes(next, shapes)?;
         if let Some(rec) = records_of(until, shapes, probes)?.pop() {
@@ -983,14 +984,15 @@ fn trace_records<S: Fields>(
             // a recorded one is replayed (with that state set up, see `GateLoop::drive`).
             let args = buffers.filter(|_| ctx.recording_here()).and_then(|buffers| buffers.fold_args(step_pin.buffer()));
             let gate = args.as_ref().map(|args| jit::FoldGate { id: GateId::register(&gate_logic(1, conds, true).0), args, stepv: stepv_storage.id() });
-            if let Some(grouped) = jit::force_with_record(ctx, &next.arrays(), &rec, pin.buffer(), gate) {
+            let moving: Vec<&Array<S::Elem>> = next.arrays().into_iter().zip(&probe_storages).filter(|&(array, probe)| !array.passes_through(probe)).map(|(array, _)| array).collect();
+            if let Some(grouped) = jit::force_with_record(ctx, &moving, &rec, pin.buffer(), gate) {
                 return Ok(Records::Fused { value, fold: grouped?.folded });
             }
         }
     }
     // The records read the new state (a residual of it, through slices): evaluated first, they
     // read its buffers instead of recomputing the step at every index they read.
-    jit::force(&next.arrays())?;
+    jit::force_stepped(&next.arrays(), &probe_storages)?;
     Ok(Records::After(records_of(until, shapes, next)?))
 }
 
@@ -1463,7 +1465,9 @@ impl GateLoop {
         fresh: bool,
     ) -> Outcome<Run<S>> {
         let ctx = self.ctx.clone();
+        self.stepper.seed_fixed()?;
         let (steps, reason, histories) = self.drive(steps, check_every)?;
+        self.stepper.settle(steps)?;
 
         // Detaching the even state gives its buffers away, which a captured graph names: the
         // graphs would have to be captured again on the next run, which costs far more (a block is
@@ -1668,7 +1672,7 @@ fn compile<S: Fields>(
     let probes: S = state_from(probes);
     let next = step(&probes, &stepv);
     let records = trace_records(&ctx, until, &shapes, &probes, &next, &stepv, &conds, gate_buffers.as_ref())?;
-    jit::force(&next.arrays())?;
+    jit::force_stepped(&next.arrays(), &trace.probe_storages)?;
     records.force()?;
     let plan = trace.finish_plan().ok_or_else(unsupported)?;
     let rec_storages = records.storages().ok_or_else(unsupported)?;
@@ -2066,7 +2070,7 @@ mod tests {
         let (a, b) = (spike(16384), spike(16384).into_iter().rev().collect::<Vec<_>>());
         let start = || (Array::from_slice_on(&ctx, &a, a.len()).unwrap(), Array::from_slice_on(&ctx, &b, b.len()).unwrap());
         let rotate = |s: &Two, _: &Array<f32>| (&s.0 + &(&s.1 * 0.1f32), &s.1 - &(&s.0 * 0.1f32));
-        // The second array passes through: not a step to store, the record follows the step.
+        // The second array passes through: it takes no launch of the step.
         let passes = |s: &Two, _: &Array<f32>| (&s.0 * 0.9f32, s.1.clone());
         let until = || Until::new(10).record("norm", |s: &Two| s.0.norm()).stop_when(|h| h["norm"].last().gt(1.0e9));
         type Step<'a> = &'a dyn Fn(&Two, &Array<f32>) -> Two;
@@ -2088,7 +2092,8 @@ mod tests {
         let (old, old_launches) = run(&passes, true);
         let (fused, fused_launches) = run(&passes, false);
         assert_eq!(fused, old);
-        assert_eq!(fused_launches, old_launches);
+        // The record is reduced by the launch of the first array: the second takes no launch.
+        assert_eq!((old_launches, fused_launches), (Some((2, None)), Some((1, Some(0)))));
     }
 
     #[test]
@@ -2195,5 +2200,45 @@ mod tests {
             got = run.state;
         }
         assert!(compiled.gate_loop.graphs.holds_graphs(), "no span of launches was captured");
+    }
+
+    /// A state the step hands back unchanged (itself, or `&s * 1.0`) is bound to one buffer, not
+    /// copied at every step: the loop still returns it as it was, at every parity of the steps, in
+    /// one-shot and compiled runs alike.
+    #[test]
+    fn states_a_step_hands_back_unchanged_stay_as_they_were() {
+        type Two = (Array<f32>, Array<f32>, Array<f32>);
+        let ctx = Context::new().unwrap();
+        let step = |s: &Two, _: &Array<f32>| (&s.0 * 0.5 + &s.1 * 0.25 - &s.2 * 0.125, s.1.clone(), &s.2 * 1.0);
+        let until = |n: usize| Until::new(n).record("max", |s: &Two| s.0.max());
+        let (b, c) = (vec![1.0f32, 2.0, 3.0, 4.0], vec![0.5f32, -1.0, 2.0, 0.25]);
+        let start = || (Array::from_slice_on(&ctx, &[8.0f32, 4.0, 2.0, 1.0], 4).unwrap(), Array::from_slice_on(&ctx, &b, 4).unwrap(), Array::from_slice_on(&ctx, &c, 4).unwrap());
+        let host = |n: usize| {
+            let mut a = vec![8.0f32, 4.0, 2.0, 1.0];
+            for _ in 0..n {
+                a = a.iter().zip(b.iter().zip(&c)).map(|(a, (b, c))| a * 0.5 + b * 0.25 - c * 0.125).collect();
+            }
+            a
+        };
+        let mut compiled = compile_until_all(&start(), until(5), step).unwrap();
+        assert_eq!(compiled.gate_loop.stepper.fixed_states(), 2, "the unchanged states are not copied by the step");
+        for n in [5usize, 4, 1, 2, 3, 5] {
+            let init = start();
+            let run = iterate_until_all(start(), until(n), step).unwrap();
+            let compiled_run = compiled.run_steps(start(), n).unwrap();
+            for run in [&run, &compiled_run] {
+                assert_eq!(run.steps, n);
+                assert_eq!(run.state.1.to_vec().unwrap(), b, "{n} steps");
+                assert_eq!(run.state.2.to_vec().unwrap(), c, "{n} steps");
+                for (got, want) in run.state.0.to_vec().unwrap().iter().zip(host(n)) {
+                    assert!((got - want).abs() <= 1e-5 * want.abs().max(1.0), "{n} steps: {got} vs {want}");
+                }
+            }
+            // The unchanged states are not the initial ones' buffers: writing to one leaves them be.
+            let mut written = run.state.1;
+            written += 1.0;
+            assert_eq!(written.to_vec().unwrap(), b.iter().map(|v| v + 1.0).collect::<Vec<_>>());
+            assert_eq!(init.1.to_vec().unwrap(), b);
+        }
     }
 }
