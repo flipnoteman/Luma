@@ -1,6 +1,6 @@
 # Luma
 
-[**User Guide**](https://flipnoteman.github.io/Luma/) · [**API Reference (docs.rs)**](https://docs.rs/luma) · [**Environment Variables**](https://flipnoteman.github.io/Luma/v0.5.0/environment.html)
+[**User Guide**](https://flipnoteman.github.io/Luma/) · [**API Reference (docs.rs)**](https://docs.rs/luma) · [**Environment Variables**](https://flipnoteman.github.io/Luma/v0.5.1/environment.html)
 
 Async GPU compute library for Rust. Write code with ordinary arithmetic operations and methods, and Luma handles execution
 with whatever hardware you have, through a native CUDA backend, a native Metal backend, [wgpu](https://wgpu.rs) (Vulkan, Metal, DX12), or the native SIMD CPU backend.
@@ -121,7 +121,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 
 ### Environment variables
 
-Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_FAST_MATH=1`, `LUMA_CHECK_FINITE=1`, and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.0/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
+Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_FAST_MATH=1`, `LUMA_CHECK_FINITE=1`, and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.1/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
 
 ### Examples
 

@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/flipnoteman/Luma"
@@ -31,11 +31,11 @@ homepage = "https://flipnoteman.github.io/Luma/"
 rust-version = "1.99"
 
 [workspace.dependencies]
-luma-core = { package = "luma-hal-core", path = "crates/luma-core", version = "0.5.0" }
-luma-wgpu = { package = "luma-hal-wgpu", path = "crates/luma-wgpu", version = "0.5.0" }
-luma-metal = { package = "luma-hal-metal", path = "crates/luma-metal", version = "0.5.0" }
-luma-cuda = { package = "luma-hal-cuda", path = "crates/luma-cuda", version = "0.5.0" }
-luma-cpu = { package = "luma-hal-cpu", path = "crates/luma-cpu", version = "0.5.0" }
+luma-core = { package = "luma-hal-core", path = "crates/luma-core", version = "0.5.1" }
+luma-wgpu = { package = "luma-hal-wgpu", path = "crates/luma-wgpu", version = "0.5.1" }
+luma-metal = { package = "luma-hal-metal", path = "crates/luma-metal", version = "0.5.1" }
+luma-cuda = { package = "luma-hal-cuda", path = "crates/luma-cuda", version = "0.5.1" }
+luma-cpu = { package = "luma-hal-cpu", path = "crates/luma-cpu", version = "0.5.1" }
 cranelift-codegen = { version = "0.137.2", default-features = false, features = ["std", "host-arch"] }
 cranelift-frontend = "0.137.2"
 cranelift-native = "0.137.2"
