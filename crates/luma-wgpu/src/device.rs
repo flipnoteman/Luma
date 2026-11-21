@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use log::debug;
 use luma_core::hal::cache;
@@ -17,59 +18,102 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The driver's compiled pipelines of a device, kept between processes through its
 /// [`DiskCache`]. Without a cache directory, or on a device without
 /// [`wgpu::Features::PIPELINE_CACHE`], there is none: pipelines compile as usual.
+///
+/// The stored cache is up to [`cache::MAX_PIPELINES`] of data to read, check and hand to the
+/// driver, tens of milliseconds that opening a device must not wait for: a thread loads it while
+/// the rest of the open goes on, and the first pipeline built (or the first write) waits for it.
 #[derive(Debug)]
 pub(crate) struct PipelineStore {
-    cache: Option<wgpu::PipelineCache>,
+    /// The loading thread, until its result is taken.
+    loading: Mutex<Option<std::thread::JoinHandle<Option<wgpu::PipelineCache>>>>,
+    /// The loaded cache, set once by the first [`cache`](Self::cache).
+    cache: OnceLock<Option<wgpu::PipelineCache>>,
     disk: Arc<DiskCache>,
     /// Whether pipelines were built since the cache was last written.
     pending: AtomicBool,
+    /// When the cache was opened or last written, for [`checkpoint`](Self::checkpoint).
+    last_write: Mutex<Instant>,
 }
 
+/// How long a [`PipelineStore`] goes without a [`checkpoint`](PipelineStore::checkpoint) write
+/// after it was opened or written: reading the driver's cache back costs a few milliseconds per
+/// megabyte, which a program that makes and drops contexts in a loop must not pay each time.
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(5);
+
 impl PipelineStore {
-    /// Opens the store of `device`, loading the stored cache if there is one.
+    /// Opens the store of `device`, starting to load the stored cache if there is one.
     fn open(disk: Arc<DiskCache>, device: &Device) -> Arc<PipelineStore> {
         let wanted = disk.dir().is_some() && device.features().contains(wgpu::Features::PIPELINE_CACHE);
-        let cache = wanted.then(|| {
-            let stored = disk.load_pipelines();
-            // SAFETY: the data is empty or was returned by `PipelineCache::get_data` (the
-            // checksum of the disk cache guards against a damaged file), and wgpu and the driver
-            // check that it belongs to this adapter and driver; with `fallback` an unusable blob
-            // only yields an empty cache.
-            unsafe {
-                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor { label: Some("luma"), data: stored.as_deref(), fallback: true })
-            }
-        });
-        Arc::new(PipelineStore { cache, disk, pending: AtomicBool::new(false) })
+        let loading = wanted
+            .then(|| {
+                let (disk, device) = (Arc::clone(&disk), device.clone());
+                std::thread::Builder::new().name("luma-pipeline-cache".into()).spawn(move || Self::load(&disk, &device)).ok()
+            })
+            .flatten();
+        let cache = OnceLock::new();
+        if !wanted {
+            let _ = cache.set(None);
+        }
+        Arc::new(PipelineStore { loading: Mutex::new(loading), cache, disk, pending: AtomicBool::new(false), last_write: Mutex::new(Instant::now()) })
     }
 
-    /// The pipeline cache to hand to pipeline creation.
+    /// Reads the stored cache and creates the driver's cache from it (an empty one if there is
+    /// none, or it is unusable).
+    fn load(disk: &DiskCache, device: &Device) -> Option<wgpu::PipelineCache> {
+        let stored = disk.load_pipelines();
+        // SAFETY: the data is empty or was returned by `PipelineCache::get_data` (the
+        // checksum of the disk cache guards against a damaged file), and wgpu and the driver
+        // check that it belongs to this adapter and driver; with `fallback` an unusable blob
+        // only yields an empty cache.
+        Some(crate::exit::driver_call(|| unsafe {
+            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some("luma"),
+                data: stored.as_ref().map(cache::PipelineBlob::data),
+                fallback: true,
+            })
+        }))
+    }
+
+    /// The pipeline cache to hand to pipeline creation; waits until it is loaded.
     pub(crate) fn cache(&self) -> Option<&wgpu::PipelineCache> {
-        self.cache.as_ref()
+        self.cache.get_or_init(|| lock(&self.loading).take().and_then(|thread| thread.join().ok()).flatten()).as_ref()
     }
 
     /// Whether there is a cache that [`flush`](Self::flush) writes.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     pub(crate) fn is_active(&self) -> bool {
-        self.cache.is_some()
+        self.cache.get().is_none_or(Option::is_some)
     }
 
     /// Notes that a pipeline was just created with [`cache`](Self::cache). The cache is written
-    /// when the device is released and at process exit, never while pipelines are being built:
-    /// reading the driver's cache data and writing megabytes of it slowed the first launches of a
-    /// run by tens of milliseconds even from a background thread.
+    /// when a device is released (at most every [`CHECKPOINT_EVERY`]) and at process exit, never
+    /// while pipelines are being built: reading the driver's cache data and writing megabytes of
+    /// it slowed the first launches of a run by tens of milliseconds even from a background
+    /// thread.
     pub(crate) fn built(&self) {
-        if self.cache.is_some() {
-            self.pending.store(true, Ordering::Release);
-        }
+        self.pending.store(true, Ordering::Release);
     }
 
     /// Writes the pipeline cache out, on the calling thread, if pipelines were built since it was
-    /// last written.
+    /// last written. Also waits for a load still running, so that no thread of ours is inside the
+    /// driver when the process exits.
     pub(crate) fn flush(&self) {
+        let cache = self.cache();
         if self.pending.swap(false, Ordering::AcqRel)
-            && let Some(data) = self.cache.as_ref().and_then(wgpu::PipelineCache::get_data)
+            && let Some(data) = cache.and_then(wgpu::PipelineCache::get_data)
         {
             self.disk.store_pipelines(&data);
+            *lock(&self.last_write) = Instant::now();
+        }
+    }
+
+    /// [`flush`](Self::flush) for a device going idle, unless the cache was opened or written less
+    /// than [`CHECKPOINT_EVERY`] ago. A context made and dropped in a loop would otherwise copy
+    /// the whole driver cache out each time to find that it did not change; what a skipped
+    /// checkpoint leaves unwritten is written by the next one or at exit.
+    pub(crate) fn checkpoint(&self) {
+        if lock(&self.last_write).elapsed() >= CHECKPOINT_EVERY {
+            self.flush();
         }
     }
 }
@@ -239,7 +283,10 @@ async fn request_device() -> Result<Gpu, BackendError> {
     let disk = DiskCache::open(cache_dir, adapter_key(&info));
     let store = PipelineStore::open(Arc::clone(&disk), &device);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    if !validated {
+    if validated {
+        // Nothing waits for the load at exit for these devices: finish it here.
+        store.cache();
+    } else {
         crate::exit::flush_at_exit(&store);
     }
     Ok(Gpu { device, queue, adapter: info, lost, memory, compute_units, cost: Arc::new(OnceLock::new()), disk, store })
@@ -284,7 +331,7 @@ pub(crate) fn acquire(kind: DeviceKind) -> Result<Gpu, BackendError> {
 /// thread returning a device must never wait for one being created.
 pub(crate) fn release(gpu: Gpu) {
     let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
-    gpu.store.flush();
+    gpu.store.checkpoint();
     if gpu.lost.load(Ordering::Acquire) {
         return;
     }
