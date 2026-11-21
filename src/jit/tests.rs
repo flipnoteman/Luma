@@ -252,6 +252,57 @@ fn reductions_fuse_their_input_expression() {
 }
 
 #[test]
+fn consumers_of_pending_reductions_record_them_as_a_group() {
+    use crate::view::{concat_slice, stack_slice};
+    let ctx = ctx();
+    let n = 100_000;
+    let xs = values(n, 5, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let accs = ctx.tuning().reduce_multi;
+    // A launch count per consumer, and the values each gives (read after the counts, and bit-compared with the alone ones).
+    let make = |k: usize| -> Vec<Array<f32>> { (0..k).map(|j| (&x * (j as f32 + 1.0)).sum()).collect() };
+    let alone: Vec<u32> = make(12).iter().map(|r| r.item().unwrap().to_bits()).collect();
+    let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+
+    // Reshaped to one element and concatenated, the pattern of a force monitor.
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let joined = concat_slice(0, &sums).to_vec().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "concat: {d:?}");
+    assert_eq!(bits(joined), alone);
+
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let stacked = stack_slice(0, &sums).to_vec().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "stack: {d:?}");
+    assert_eq!(bits(stacked), alone);
+
+    // Used in an elementwise expression: the reductions are recorded together when the expression runs.
+    let sums = make(12);
+    let before = ctx.jit().stats();
+    let mut total = sums[0].reshape([1, 1]);
+    for s in &sums[1..] {
+        total = &total + &s.reshape([1, 1]);
+    }
+    let got = total.item().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "expression: {d:?}");
+    let want: f32 = alone.iter().fold(0.0, |acc, &b| acc + f32::from_bits(b));
+    assert!((got - want).abs() <= 1e-3 * want.abs().max(1.0), "{got} vs {want}");
+
+    // `eval_all` of reshaped reductions.
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let refs: Vec<&Array<f32>> = sums.iter().collect();
+    crate::eval_all(&refs).unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "eval_all: {d:?}");
+    assert_eq!(bits(sums.iter().map(|s| s.item().unwrap()).collect()), alone);
+}
+
+#[test]
 fn pending_reductions_of_shared_data_are_recorded_in_one_kernel() {
     let ctx = ctx();
     let n = 100_000;

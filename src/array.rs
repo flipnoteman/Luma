@@ -925,6 +925,20 @@ impl<T: GpuType> Array<T> {
                 _marker: PhantomData,
             });
         }
+        // A reduction that has not been recorded is the same pending reduction in the new shape: recorded
+        // when either is used, together with the others that are pending (see `jit::multireduce`).
+        if let Repr::Reduced(reduced) = &self.repr
+            && reduced.is_unforced()
+        {
+            return Ok(Array {
+                ctx: self.ctx.clone(),
+                shape,
+                repr: Repr::Reduced(Arc::clone(reduced)),
+                view: None,
+                read_view: self.read_view,
+                _marker: PhantomData,
+            });
+        }
         // A view shares the buffer, so the array has to exist.
         let storage = self.storage()?;
         Ok(Array {
