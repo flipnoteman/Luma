@@ -6,7 +6,9 @@
 //!   atomics, but it needs a long running sum and its rounding error scales with it);
 //! * `ell`: rows padded to the longest, products reduced with `sum_axis` over equal lines;
 //! * `split`: rows cut into pieces of 16 entries, `sum_axis` over the pieces, then a `group_sum`
-//!   of the piece sums by row (atomics only for the rows longer than a piece).
+//!   of the piece sums by row (atomics only for the rows longer than a piece);
+//! * `segments`: `sum_segments` of the products over the row pointer (entries split evenly over
+//!   the workgroups whatever the row lengths, no atomics, two launches).
 //!
 //! Values and `x` are multiples of 1/16, so every sum is exact in `f32` in any order and the
 //! results are compared for equality with the `f64` host product.
@@ -67,6 +69,11 @@ pub fn atomic(a: &Dev, x: &Array<f32>) -> Array<f32> {
     (&a.val * x.take(&a.col)).group_sum(&a.row, a.rows)
 }
 
+/// `y = A x` with `sum_segments` over the row pointer.
+pub fn segments(a: &Dev, x: &Array<f32>) -> Array<f32> {
+    (&a.val * x.take(&a.col)).sum_segments(&a.ptr)
+}
+
 /// `y = A x` from one running sum of the products.
 pub fn running(a: &Dev, x: &Array<f32>) -> Array<f32> {
     let p = (&a.val * x.take(&a.col)).cumsum(0);
@@ -125,6 +132,7 @@ fn banded(h: &mut Harness, rows: usize) {
     let size = size_of(&a);
     variant(h, "spmv/banded_atomic", &size, a.nnz(), &want, &|| atomic(&dev, &x));
     variant(h, "spmv/banded_running", &size, a.nnz(), &want, &|| running(&dev, &x));
+    variant(h, "spmv/banded_segments", &size, a.nnz(), &want, &|| segments(&dev, &x));
     variant(h, "spmv/banded_ell", &size, a.nnz(), &want, &|| ell(&e, &x));
 }
 
@@ -139,6 +147,7 @@ fn uniform(h: &mut Harness, rows: usize) {
     let size = size_of(&a);
     variant(h, "spmv/uniform_atomic", &size, a.nnz(), &want, &|| atomic(&dev, &x));
     variant(h, "spmv/uniform_running", &size, a.nnz(), &want, &|| running(&dev, &x));
+    variant(h, "spmv/uniform_segments", &size, a.nnz(), &want, &|| segments(&dev, &x));
     variant(h, "spmv/uniform_ell", &size, a.nnz(), &want, &|| ell(&e, &x));
 }
 
@@ -153,6 +162,7 @@ fn power_law(h: &mut Harness, rows: usize) {
     let size = format!("{} (longest row {})", size_of(&a), a.max_row());
     variant(h, "spmv/powerlaw_atomic", &size, a.nnz(), &want, &|| atomic(&dev, &x));
     variant(h, "spmv/powerlaw_running", &size, a.nnz(), &want, &|| running(&dev, &x));
+    variant(h, "spmv/powerlaw_segments", &size, a.nnz(), &want, &|| segments(&dev, &x));
     let p = upload_pieces(h, &a, 16);
     variant(h, "spmv/powerlaw_split", &size, a.nnz(), &want, &|| split(&p, &x));
 }
@@ -170,6 +180,7 @@ fn empty_rows(h: &mut Harness, rows: usize) {
     let size = size_of(&a);
     variant(h, "spmv/emptyrows_atomic", &size, a.nnz(), &want, &|| atomic(&dev, &x));
     variant(h, "spmv/emptyrows_running", &size, a.nnz(), &want, &|| running(&dev, &x));
+    variant(h, "spmv/emptyrows_segments", &size, a.nnz(), &want, &|| segments(&dev, &x));
     variant(h, "spmv/emptyrows_ell", &size, a.nnz(), &want, &|| ell(&e, &x));
     variant(h, "spmv/emptyrows_split", &size, a.nnz(), &want, &|| split(&p, &x));
 }

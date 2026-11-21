@@ -77,6 +77,8 @@ fn flops(a: &Csr) -> f64 {
 #[derive(Clone, Copy)]
 enum Layout {
     Csr,
+    /// CSR with `sum_segments`.
+    Segments,
     Ell,
     Grid,
 }
@@ -84,7 +86,7 @@ enum Layout {
 impl Layout {
     fn shape(self, g: usize) -> [usize; 2] {
         match self {
-            Layout::Csr => [g * g, 1],
+            Layout::Csr | Layout::Segments => [g * g, 1],
             Layout::Ell => [1, g * g],
             Layout::Grid => [g, g],
         }
@@ -93,6 +95,7 @@ impl Layout {
     fn name(self) -> &'static str {
         match self {
             Layout::Csr => "csr",
+            Layout::Segments => "segments",
             Layout::Ell => "ell",
             Layout::Grid => "stencil",
         }
@@ -122,6 +125,7 @@ impl Problem {
     fn apply(&self, layout: Layout) -> Box<dyn Fn(&A) -> A + '_> {
         match layout {
             Layout::Csr => Box::new(|p| spmv::atomic(&self.dev, p)),
+            Layout::Segments => Box::new(|p| spmv::segments(&self.dev, p)),
             Layout::Ell => Box::new(|p| spmv::ell(&self.ell, p)),
             Layout::Grid => Box::new(stencil),
         }
@@ -162,7 +166,7 @@ fn fixed_cases(h: &mut Harness, g: usize) {
     let (host_x, _) = cg_host(&p.a, &p.b, iters, 0.0);
     let want = residual(&p.a, &p.b, &host_x);
     let size = format!("{}x{} grid {} nnz x{iters}", g, g, label(p.a.nnz()));
-    for layout in [Layout::Csr, Layout::Ell, Layout::Grid] {
+    for layout in [Layout::Csr, Layout::Segments, Layout::Ell, Layout::Grid] {
         let name = format!("cg/fixed_{}", layout.name());
         if !h.want(&name) {
             continue;

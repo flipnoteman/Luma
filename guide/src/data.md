@@ -317,6 +317,32 @@ and `i32` (`u32::MAX` / `0`, `i32::MAX` / `i32::MIN`).
 
 Where the groups are labels rather than `0..groups`, `factorize` (next section) makes the codes.
 
+### Segments
+
+When the groups are contiguous runs of the array (the rows of a CSR matrix given by its row
+pointer, a sorted group-by given by the offsets of its groups), `sum_segments`, `min_segments` and
+`max_segments` reduce segment `i`, the elements `offsets[i]..offsets[i + 1]`, to element `i` of
+the result (`offsets.len() - 1` elements, `u32`, non-decreasing, the first 0 and the last the
+length of the values). An empty segment gives the identity, as for the group reductions. They
+need no codes and no atomics: the entries are split evenly over the workgroups whatever the
+lengths of the segments, so a power-law matrix with one row of 100000 entries among rows of a
+handful costs no more than a regular one, and the result is the same on every run. A pending
+operand is computed inside the kernel, so a sparse matrix-vector product is one expression:
+
+```rust
+use luma::*;
+
+// [[1, 0, 2], [0, 0, 0], [0, 3, 4]] in CSR.
+let ptr = Array::from_slice(&[0u32, 2, 2, 4], 4)?;
+let col = Array::from_slice(&[0u32, 2, 1, 2], 4)?;
+let val = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let x = Array::from_slice(&[1.0f32, 10.0, 100.0], 3)?;
+let y = (&val * x.take(&col)).sum_segments(&ptr);
+assert_eq!(y.to_vec()?, vec![201.0, 0.0, 430.0]);
+assert_eq!(val.max_segments(&ptr).to_vec()?, vec![2.0, f32::NEG_INFINITY, 4.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
 ## Unique values
 
 `factorize()` returns the sorted distinct values of an array (flat, one dimension) and, shaped

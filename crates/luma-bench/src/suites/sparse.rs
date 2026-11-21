@@ -4,14 +4,14 @@
 //!
 //! * `spmv`: CSR `y = A x` as a gather plus a segmented sum, on banded, uniform-random and
 //!   power-law matrices, with the segmented sum made by an atomic `group_sum`, by one running
-//!   sum (`cumsum`), by an ELLPACK `sum_axis` and by split rows (`sum_axis` over equal pieces
-//!   followed by a small `group_sum`);
-//! * `cg`: conjugate gradients on the 2-D Poisson matrix in CSR (atomic and ELL) and matrix-free
+//!   sum (`cumsum`), by an ELLPACK `sum_axis`, by split rows (`sum_axis` over equal pieces
+//!   followed by a small `group_sum`) and by `sum_segments` over the row pointer;
+//! * `cg`: conjugate gradients on the 2-D Poisson matrix in CSR (atomic, `sum_segments` and ELL) and matrix-free
 //!   (shifts), as fixed-count `iterate_all` loops and as an `iterate_until_all` loop;
 //! * `convert`: COO to CSR (argsort, count, scan), CSR to COO (`searchsorted`), CSR transpose and
 //!   pruning small entries (`filter`);
 //! * `pagerank`: power iterations on a power-law graph (gather + `put_add` per iteration), with
-//!   the edges in random and in destination order;
+//!   the edges in random and in destination order, and the pull form (split rows, `sum_segments`);
 //! * `bfs`: breadth-first levels from a hub, as dense edge-parallel levels (host-checked and fixed
 //!   count in a device loop) and with compacted frontiers (`nonzero`, `cumsum`, `searchsorted`);
 //! * `cc`: connected components by min-label propagation (`put_min` until no label changes),

@@ -762,6 +762,13 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             }
         }
     }
+    if let Tail::AxisReduce(pass) = key.tail
+        && pass.pass == crate::scan::Pass::Segments
+    {
+        // The offsets of the segments, after the inputs.
+        let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> offs: array<u32>;");
+        binding += 1;
+    }
     if let Some(pass) = radix {
         pass.declare_reads(&mut src, &mut binding);
     }

@@ -103,6 +103,21 @@ fn pagerank(h: &mut Harness, g: &Graph) {
         let size = format!("{} nodes {} edges x{ITERS}", label(n), label(g.m()));
         case_trim(h, name, &size, Work::Items((g.m() * ITERS) as f64, "Medge/s"), &mut || go().eval().unwrap());
     }
+
+    // Pull form with `sum_segments` over the row pointer of the transition matrix.
+    let name = "pagerank/pull_segments";
+    if h.want(name) {
+        let p = pull_matrix(g);
+        let dev = spmv::upload(h, &p);
+        let r0 = up_f32(h, &uniform, n);
+        let go = || {
+            let [r] = iterate_all([&r0], ITERS, |[r]| [spmv::segments(&dev, r) * DAMPING + tele]);
+            r
+        };
+        check(name, &go().to_vec().unwrap(), &want, 5e-4, 1e-12);
+        let size = format!("{} nodes {} edges x{ITERS}", label(n), label(g.m()));
+        case_trim(h, name, &size, Work::Items((g.m() * ITERS) as f64, "Medge/s"), &mut || go().eval().unwrap());
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
