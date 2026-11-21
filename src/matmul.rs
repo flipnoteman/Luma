@@ -36,6 +36,7 @@ use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::jit::{self, AxisMap, Edge, ElemTy, MatmulSide, OpKind, ShiftKind, Src};
 use crate::ops::{fold_grid, Outcome};
+use crate::tuning::Tuning;
 
 /// Output tile of the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -76,13 +77,16 @@ impl MatmulTile {
 /// K elements of each operand a workgroup stages at a time.
 const SLICE: u32 = 16;
 
-/// Output tiles below which a long K is split (see [`split_of`]).
+/// Output tiles below which a long K is split (see [`split_of`]); like [`SPLIT_GROUPS`] a count
+/// for the 82 multiprocessors of an RTX 3090, raised for bigger devices ([`Tuning::scaled_up`]).
 const SPLIT_TILES: u32 = 128;
 /// Shortest K that is split.
 const SPLIT_MIN_K: u32 = 4096;
 /// Workgroups a split product aims for. The 4 tiles of a 64x64 product over 2^20 take 3.0 ms
 /// with 256 (3 workgroups per multiprocessor of an RTX 3090, which cannot hide the latency of
-/// the slices), 2.5 with 512, 2.3 with 1024, 2.27 with 2048.
+/// the slices), 2.5 with 512, 2.3 with 1024, 2.27 with 2048. Raised in proportion to the
+/// multiprocessors of bigger devices ([`Tuning::scaled_up`]), never lowered: unchanged on the
+/// 3090, and on an RTX 3080 Laptop (48) 1024 groups beat the proportional 599 by 2.7 %.
 const SPLIT_GROUPS: u32 = 1024;
 /// Smallest K a slice of a split product covers.
 const SPLIT_MIN_SLICE: u32 = 1024;
@@ -181,11 +185,11 @@ struct Plan {
 /// The slices a product of `tiles` output tiles over `k` is split into, and the elements of K
 /// per slice (a multiple of the staged slice). Few tiles and a long K: about
 /// [`SPLIT_GROUPS`] workgroups, each slice at least [`SPLIT_MIN_SLICE`] long. `None` if not split.
-fn split_of(tiles: u32, k: u32) -> Option<(u32, u32)> {
-    if tiles >= SPLIT_TILES || k < SPLIT_MIN_K {
+fn split_of(tuning: &Tuning, tiles: u32, k: u32) -> Option<(u32, u32)> {
+    if tiles >= tuning.scaled_up(SPLIT_TILES) || k < SPLIT_MIN_K {
         return None;
     }
-    let wanted = SPLIT_GROUPS.div_ceil(tiles).min(k / SPLIT_MIN_SLICE);
+    let wanted = tuning.scaled_up(SPLIT_GROUPS).div_ceil(tiles).min(k / SPLIT_MIN_SLICE);
     if wanted < 2 {
         return None;
     }
@@ -277,7 +281,7 @@ fn skinny_plan(m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes
 /// neighbours in memory (not a transposed view). `max_groups` is the most workgroups per grid
 /// dimension, `max_bytes` the most a buffer may hold (the split product's partial sums have to
 /// fit one).
-fn plan(m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+fn plan(tuning: &Tuning, m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
     if let Some(plan) = skinny_plan(m, n, k, along_k, max_groups, max_bytes) {
         return Ok(plan);
     }
@@ -291,7 +295,7 @@ fn plan(m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes: u64) 
     let aligned = m.is_multiple_of(row_edge) && n.is_multiple_of(col_edge) && k.is_multiple_of(SLICE);
     let (columns, rows) = (n.div_ceil(col_edge), m.div_ceil(row_edge));
     let tiles = columns.saturating_mul(rows);
-    let (slices, kc) = split_of(tiles, k)
+    let (slices, kc) = split_of(tuning, tiles, k)
         .filter(|&(slices, _)| u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes)
         .unwrap_or((1, k));
     // Row-major tile numbers (see `body`): the grid is `[columns, rows]` if that fits, else the
@@ -450,7 +454,7 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
         native_plan(m32, n32, k32, cores, transposed, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     } else {
         let along_k = jit::stored_along_k(&sides[0], [k32, m32]);
-        plan(m32, n32, k32, along_k, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
+        plan(ctx.tuning(), m32, n32, k32, along_k, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     };
     // A skinny kernel computes a fused operand once per tile that reads it: past a few, storing
     // the expression first is cheaper.
@@ -1127,44 +1131,63 @@ mod tests {
 
     #[test]
     fn a_long_product_of_few_tiles_is_split_in_slices_of_whole_k_steps() {
+        let t = Tuning::for_tests();
         // The Gram matrix of 64 features over 2^20 samples: 4 tiles of 32x32.
-        let (slices, kc) = split_of(4, 1 << 20).unwrap();
+        let (slices, kc) = split_of(&t, 4, 1 << 20).unwrap();
         assert_eq!((slices, kc), (256, 4096));
         for k in [4096u32, 5000, 100_000, 1 << 20] {
             for tiles in [1u32, 4, 70, 127] {
-                let Some((slices, kc)) = split_of(tiles, k) else { continue };
+                let Some((slices, kc)) = split_of(&t, tiles, k) else { continue };
                 assert!(slices >= 2 && kc % SLICE == 0, "{tiles} tiles, k {k}");
                 assert_eq!(slices, k.div_ceil(kc), "no empty slice");
             }
         }
-        assert_eq!(split_of(128, 1 << 20), None);
-        assert_eq!(split_of(4, 4095), None);
-        assert_eq!(split_of(4, 4096), Some((4, 1024)));
+        assert_eq!(split_of(&t, 128, 1 << 20), None);
+        assert_eq!(split_of(&t, 4, 4095), None);
+        assert_eq!(split_of(&t, 4, 4096), Some((4, 1024)));
+    }
+
+    #[test]
+    fn the_split_aims_for_a_device_full_of_workgroups() {
+        // The reference device (82 multiprocessors) keeps the constants measured on it.
+        let reference = Tuning { compute_units: 82, ..Tuning::for_tests() };
+        assert_eq!(split_of(&reference, 4, 1 << 20), Some((256, 4096)));
+        assert_eq!(split_of(&reference, 127, 1 << 20), Some((9, 116_512)));
+        assert_eq!(split_of(&reference, 128, 1 << 20), None);
+        // A smaller device keeps them (measured on an RTX 3080 Laptop, 48 multiprocessors).
+        let laptop = Tuning { compute_units: 48, ..Tuning::for_tests() };
+        assert_eq!(split_of(&laptop, 4, 1 << 20), Some((256, 4096)));
+        assert_eq!(split_of(&laptop, 128, 1 << 20), None);
+        // A bigger one more.
+        let big = Tuning { compute_units: 128, ..Tuning::for_tests() };
+        assert_eq!(split_of(&big, 4, 1 << 20).map(|s| s.0), Some(400));
+        assert!(split_of(&big, 199, 1 << 20).is_some());
     }
 
     #[test]
     fn the_plan_picks_the_tile_alignment_and_grid() {
-        let p = plan(1024, 2048, 1024, false, 65535, u64::MAX).unwrap();
+        let t = Tuning::for_tests();
+        let p = plan(&t, 1024, 2048, 1024, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T128, true, 1, [16, 8, 1]));
-        let p = plan(1000, 1000, 1000, false, 65535, u64::MAX).unwrap();
+        let p = plan(&t, 1000, 1000, 1000, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.aligned, p.groups), (MatmulTile::T128, false, [8, 8, 1]));
-        let p = plan(64, 64, 1024, false, 65535, u64::MAX).unwrap();
+        let p = plan(&t, 64, 64, 1024, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T32, true, 1, [2, 2, 1]));
         // Tall products stay on the rectangular tile; the grid folds once row tiles exceed it.
-        let p = plan(1 << 22, 8, 16, false, 65535, u64::MAX).unwrap();
+        let p = plan(&t, 1 << 22, 8, 16, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.groups), (MatmulTile::T128x32, [1, 1 << 15, 1]));
-        let p = plan(8, 1 << 22, 16, false, 65535, u64::MAX).unwrap();
+        let p = plan(&t, 8, 1 << 22, 16, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.groups), (MatmulTile::T32x128, [1 << 15, 1, 1]));
-        let p = plan(1 << 22, 1 << 6, 16, false, 65535, u64::MAX).unwrap();
+        let p = plan(&t, 1 << 22, 1 << 6, 16, false, 65535, u64::MAX).unwrap();
         assert_eq!(p.tile, MatmulTile::T128x32);
-        let p = plan(1 << 22, 8, 16, false, 1 << 12, u64::MAX).unwrap();
+        let p = plan(&t, 1 << 22, 8, 16, false, 1 << 12, u64::MAX).unwrap();
         assert!(p.groups[0] * p.groups[1] >= 1 << 15);
-        assert!(plan(1 << 22, 64, 16, false, 65535, u64::MAX).is_ok());
+        assert!(plan(&t, 1 << 22, 64, 16, false, 65535, u64::MAX).is_ok());
     }
 
     #[test]
     fn a_small_output_over_a_long_k_is_a_skinny_product() {
-        let skinny = |m, n, k, along_k, max_bytes| plan(m, n, k, along_k, 65535, max_bytes).unwrap();
+        let skinny = |m, n, k, along_k, max_bytes| plan(&Tuning::for_tests(), m, n, k, along_k, 65535, max_bytes).unwrap();
         // One-hot labels times 32 features: 4 tiles of 10x8, 16 groups of them in a workgroup.
         let p = skinny(10, 32, 1_000_000, false, u64::MAX);
         assert_eq!(p.tile, MatmulTile::Skinny { rows: 10, cols: 8, groups: 16, width: 64, along_k: false });

@@ -3247,11 +3247,11 @@ impl JitState {
         let (core, size) = match built {
             codegen::Built::Module(module) => {
                 let statements = format!("{} statements of Kernel IR", module.entry_body.len());
-                (kernel::build_module(ctx, module, Some(&label), true)?, statements)
+                (kernel::build_module(ctx, module, Some(&label), luma_core::KernelTrust::Trusted)?, statements)
             }
             codegen::Built::Wgsl(source) => {
                 let bytes = format!("{} bytes of WGSL", source.len());
-                (kernel::build_core(ctx, &KernelKey::new(source, "main", None), Some(&label), true)?, bytes)
+                (kernel::build_core(ctx, &KernelKey::new(source, "main", None), Some(&label), luma_core::KernelTrust::Trusted)?, bytes)
             }
         };
         let core = Arc::new(core);
@@ -3279,7 +3279,7 @@ impl JitState {
         let (core, built) = self.stencils.get_or_build(&source, || {
             let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
             let key = KernelKey::new(source.clone(), "main", None);
-            let core = kernel::build_core(ctx, &key, Some(label), true).map(Arc::new);
+            let core = kernel::build_core(ctx, &key, Some(label), luma_core::KernelTrust::Trusted).map(Arc::new);
             if let Some(started) = started {
                 log::debug!("luma: compiled {label} ({} bytes of WGSL) in {:.1} ms", source.len(), started.elapsed().as_secs_f64() * 1e3);
             }
@@ -3304,7 +3304,7 @@ impl JitState {
             let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
             let module = build()?;
             let statements = module.entry_body.len();
-            let core = kernel::build_module(ctx, module, Some(label), true).map(Arc::new);
+            let core = kernel::build_module(ctx, module, Some(label), luma_core::KernelTrust::Trusted).map(Arc::new);
             if let Some(started) = started {
                 log::debug!("luma: compiled {label} ({statements} statements of Kernel IR) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
             }

@@ -33,7 +33,7 @@ mod imp {
     use luma_core::kir::KernelModule;
     use luma_core::{
         Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo, DeviceLimits,
-        DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, NativeBuffer, NativeKernel, Profile, RawArg,
+        DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg,
         RawKernel, TuningProfile,
     };
     use objc2::rc::{Retained, autoreleasepool};
@@ -327,6 +327,8 @@ mod imp {
                     max_workgroup_invocations: invocations,
                     max_workgroup_storage_bytes: device.maxThreadgroupMemoryLength() as u32,
                 },
+                // Metal does not report the GPU core count.
+                compute_units: None,
             };
             let identity = format!("{name}\n{}\n{apple_silicon}", std::env::consts::ARCH);
             let key = format!("metal-{:016x}", cache::fnv1a(identity.as_bytes()));
@@ -1084,15 +1086,15 @@ mod imp {
             lock(&self.retired).push(Retired { ready_after, item: Item::Mappable(buffer) });
         }
 
-        fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+        fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
             if let Some(mask) = used
                 && mask.len() != module.bindings.len()
             {
                 return Err(BackendError::KernelBinding(format!("the used-binding mask has {} entries for {} bindings", mask.len(), module.bindings.len())));
             }
-            let checked = if trusted { Cow::Borrowed(module) } else { luma_core::kir::opt::with_bounds_checks(module) };
+            let checked = if trust.checks_bounds() { luma_core::kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
             let optimized = luma_core::kir::optimize_for_target(&checked, false);
-            let msl = emit_with_workgroup_init(&optimized, used, !trusted);
+            let msl = emit_with_workgroup_init(&optimized, used, trust.zero_workgroup_memory());
             let array_lengths = msl
                 .array_lengths
                 .iter()

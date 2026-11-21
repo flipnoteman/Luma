@@ -126,7 +126,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// The input and output are whole device buffers of `n` elements, not array storage, so the
 /// measurement does not depend on the context's chunk size.
 fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps: u32) -> Result<f64> {
-    let core = build_core(ctx, &KernelKey::new(source, "main", None), Some(label), true)?;
+    let core = build_core(ctx, &KernelKey::new(source, "main", None), Some(label), luma_core::KernelTrust::Trusted)?;
     let bytes = u64::from(n) * 4;
     let input = ctx.alloc_buffer(bytes, STORAGE_USAGE)?;
     let output = match ctx.alloc_buffer(bytes, STORAGE_USAGE) {

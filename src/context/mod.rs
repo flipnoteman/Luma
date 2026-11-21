@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, MatmulSpec, Profile};
+use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, KernelTrust, MatmulSpec, Profile};
 
 use crate::builtin::{Builtin, BuiltinKernel};
 use crate::error::{LumaError, Result};
@@ -768,7 +768,7 @@ impl Context {
             .get_or_build(&(op, ty), || {
                 let label = format!("{op:?} {ty}");
                 match op.kernel(ty, &self.inner.tuning) {
-                    BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), true),
+                    BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), KernelTrust::Trusted),
                     BuiltinKernel::Wgsl(source) => {
                         let native = match op {
                             Builtin::Matmul { tile: crate::matmul::MatmulTile::Native { edge, lhs_t, rhs_t }, .. } => {
@@ -776,7 +776,7 @@ impl Context {
                             }
                             _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),
                         };
-                        kernel::build_core_native(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), true, native)
+                        kernel::build_core_native(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), KernelTrust::Trusted, native)
                     }
                 }
                 .map(Arc::new)

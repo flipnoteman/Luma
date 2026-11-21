@@ -25,25 +25,51 @@ use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch,
-    NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, TuningProfile,
+    KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, TuningProfile,
 };
 
 use crate::codegen::{self, CudaArgAbi};
 
-/// Uploads and readbacks larger than this go in pieces of this size.
-const TRANSFER_CHUNK: usize = 32 << 20;
+/// Pieces an upload larger than this is staged in. The copy of one piece into pinned memory
+/// overlaps the DMA of the previous one, and a piece's staging block is reused as soon as its
+/// DMA is done, so a transfer of any size cycles through a few blocks. Measured on an RTX 3090
+/// (PCIe 4.0 x16), 4 / 16 / 64 / 256 MiB uploads reach 17.8 / 23.2 / 24.7 / 22.4 GB/s with 2 MiB
+/// pieces, 14.1 / 18.1 / 23.3 / 23.7 with 8 MiB ones and 13.9 / 14.3 / 18.0 / 21.3 with 32 MiB.
+const UPLOAD_CHUNK: usize = 2 << 20;
 
-/// Readback chunks queued at once (copies overlap the host copying the previous one out).
+/// Largest piece a readback is split into.
+const READ_CHUNK: usize = 8 << 20;
+
+/// Smallest piece of a split readback; one that is shorter than twice this is not split.
+const READ_CHUNK_MIN: usize = 1 << 20;
+
+/// A readback is split in about this many pieces (within the two limits above).
+const READ_PIECES: usize = 8;
+
+/// Readback pieces queued at once (copies overlap the host copying the previous one out).
 const READ_WINDOW: usize = 4;
 
-/// Pinned staging memory held by unfinished work, above which a new request waits for it.
-const PINNED_BUSY_CAP: usize = 512 << 20;
+/// Pieces of a spilling readback (the device is full), one staging block at a time.
+const SPILL_CHUNK: usize = 32 << 20;
+
+/// Pinned staging memory held by unfinished work, above which a new request waits for it. New
+/// pinned memory costs 0.4 ms per MiB, so waiting for the GPU to finish earlier copies is
+/// cheaper than staging further ahead.
+const PINNED_BUSY_CAP: usize = 128 << 20;
 
 /// Most bytes of idle pinned staging memory kept for reuse.
-const PINNED_IDLE_CAP: usize = 256 << 20;
+const PINNED_IDLE_CAP: usize = 128 << 20;
 
 /// Smallest pinned staging allocation.
 const PINNED_MIN: usize = 4096;
+
+/// An idle block serves a request up to this many times smaller than itself: small requests
+/// get small blocks of their own instead of pinning down the big ones.
+const PINNED_FIT: usize = 4;
+
+/// Uploads whose staging block is at least this large record an event of their own, so that the
+/// block is reused when its copy is done and not only when the whole batch is.
+const MARK_MIN: usize = 256 << 10;
 
 /// Size of the chunks that uniforms too large to pass by value are copied into.
 const UNIFORM_CHUNK: usize = 1 << 20;
@@ -238,11 +264,13 @@ impl fmt::Display for Phases {
 
 /// Generates, compiles and loads the kernel of `module`; runs on the calling thread, which may be
 /// a compile worker: the device context is bound to it here.
-fn compile_native(shared: &CudaShared, module: &KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<CudaKernel, BackendError> {
+fn compile_native(shared: &CudaShared, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<CudaKernel, BackendError> {
     let started = Instant::now();
-    let checked: Cow<'_, KernelModule> = if trusted { Cow::Borrowed(module) } else { kir::opt::with_bounds_checks(module) };
+    let checked: Cow<'_, KernelModule> = if trust.checks_bounds() { kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
     let optimized = kir::optimize_for_target(&checked, true);
-    let translated = codegen::emit_with_workgroup_init(&optimized, used, !trusted);
+    // `with_bounds_checks` already guards every workgroup-array index it cannot prove in range,
+    // so the emitter's own clamp (a `min` per access) would only repeat it.
+    let translated = codegen::emit_with_options(&optimized, used, trust.zero_workgroup_memory(), false);
     let codegen_time = started.elapsed();
     let strides: Vec<u32> = translated.array_lengths.iter().map(|&b| optimized.bindings.get(b as usize).and_then(|d| d.element_stride).unwrap_or(1)).collect();
 
@@ -458,6 +486,9 @@ struct State {
     held: Held,
     last_kernel: u64,
     submitted: VecDeque<(Arc<CudaEvent>, Held)>,
+    /// Staging blocks of uploads with the event that follows their copy, oldest first: they
+    /// return to the pool when that copy is done, not when the batch they were queued in is.
+    staging: VecDeque<(CudaEvent, Pinned)>,
     free_events: Vec<CudaEvent>,
     pinned_free: Vec<Pinned>,
     pinned_idle: usize,
@@ -561,6 +592,7 @@ impl CudaShared {
             attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y)?,
             attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z)?,
         ];
+        let multiprocessors = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
         let shared_bytes = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?;
         let name = ctx.name().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
         ctx.bind_to_thread().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
@@ -597,6 +629,7 @@ impl CudaShared {
                 max_workgroup_invocations: threads as u32,
                 max_workgroup_storage_bytes: shared_bytes as u32,
             },
+            compute_units: Some(multiprocessors as u32).filter(|&n| n > 0),
         };
         let pool = if attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)? != 0 { DevicePool::create(&ctx) } else { None };
         Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm, pool })
@@ -637,6 +670,7 @@ impl CudaBackend {
             held: Held::default(),
             last_kernel: 0,
             submitted: VecDeque::new(),
+            staging: VecDeque::new(),
             free_events: Vec::new(),
             pinned_free: Vec::new(),
             pinned_idle: 0,
@@ -692,10 +726,7 @@ impl CudaBackend {
             return Ok(None);
         }
         self.bind()?;
-        let event = match st.free_events.pop() {
-            Some(event) => event,
-            None => self.shared.ctx.new_event(None).map_err(gpu)?,
-        };
+        let event = self.event(st)?;
         event.record(&self.stream).map_err(gpu)?;
         let event = Arc::new(event);
         st.dirty = false;
@@ -706,7 +737,16 @@ impl CudaBackend {
         Ok(Some(event))
     }
 
-    /// Releases the resources of every batch that has completed.
+    /// An event, recycled when there is a spare one.
+    fn event(&self, st: &mut State) -> Result<CudaEvent, BackendError> {
+        match st.free_events.pop() {
+            Some(event) => Ok(event),
+            None => self.shared.ctx.new_event(None).map_err(gpu),
+        }
+    }
+
+    /// Releases the resources of every batch that has completed, and the staging blocks whose
+    /// copy has.
     fn reap(&self, st: &mut State) -> Result<(), BackendError> {
         self.bind()?;
         while let Some((event, _)) = st.submitted.front() {
@@ -718,6 +758,23 @@ impl CudaBackend {
             if let Ok(event) = Arc::try_unwrap(event)
                 && st.free_events.len() < 64
             {
+                st.free_events.push(event);
+            }
+        }
+        self.reap_staging(st)
+    }
+
+    /// Gives the staging blocks of uploads back to the pool once the stream has copied out of
+    /// them (`State::staging`).
+    fn reap_staging(&self, st: &mut State) -> Result<(), BackendError> {
+        while let Some((event, _)) = st.staging.front() {
+            if !event.try_is_complete().map_err(gpu)? {
+                break;
+            }
+            let Some((event, pinned)) = st.staging.pop_front() else { break };
+            st.pinned_busy -= pinned.cap;
+            keep_pinned(st, pinned);
+            if st.free_events.len() < 64 {
                 st.free_events.push(event);
             }
         }
@@ -757,13 +814,15 @@ impl CudaBackend {
         Ok(start.elapsed())
     }
 
-    /// Pinned memory of at least `bytes` bytes, from the idle pool when there is some.
+    /// Pinned memory of at least `bytes` bytes: an idle block when there is a fitting one, one
+    /// that finished copying when the stream is ahead of the host, otherwise a new allocation
+    /// (`cuMemHostAlloc` pins every page: 0.4 ms per MiB, and freeing costs a third of that),
+    /// after waiting for earlier work when too much staging memory is in flight.
     fn take_pinned(&self, st: &mut State, bytes: usize) -> Result<Pinned, BackendError> {
         let class = bytes.max(PINNED_MIN).next_power_of_two();
-        // The smallest idle block that is large enough: a pool full of big blocks serves small
-        // requests without allocating.
+        // The smallest idle block that is large enough, and not much larger.
         let find = |st: &mut State| {
-            let at = st.pinned_free.iter().enumerate().filter(|(_, p)| p.cap >= class).min_by_key(|(_, p)| p.cap).map(|(at, _)| at)?;
+            let at = st.pinned_free.iter().enumerate().filter(|(_, p)| p.cap >= class && p.cap / class <= PINNED_FIT).min_by_key(|(_, p)| p.cap).map(|(at, _)| at)?;
             let pinned = st.pinned_free.swap_remove(at);
             st.pinned_idle -= pinned.cap;
             Some(pinned)
@@ -771,7 +830,19 @@ impl CudaBackend {
         if let Some(pinned) = find(st) {
             return Ok(pinned);
         }
+        if !st.submitted.is_empty() || !st.staging.is_empty() {
+            self.reap(st)?;
+            if let Some(pinned) = find(st) {
+                return Ok(pinned);
+            }
+        }
         while st.pinned_busy + class > PINNED_BUSY_CAP && st.pinned_busy > 0 {
+            if let Some((event, _)) = st.staging.front() {
+                // A copy is in flight out of one of the blocks: its end frees it.
+                event.synchronize().map_err(poll)?;
+                self.reap(st)?;
+                continue;
+            }
             if st.submitted.is_empty() {
                 self.flush_locked(st)?;
             }
@@ -1061,16 +1132,16 @@ impl Backend for CudaBackend {
         drop(buffer);
     }
 
-    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
         check_mask(module, used)?;
-        compile_native(&self.shared, module, used, label, trusted).map(RawKernel::new)
+        compile_native(&self.shared, module, used, label, trust).map(RawKernel::new)
     }
 
-    fn compile_kernel_deferred(&self, module: KernelModule, used: Option<Box<[bool]>>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+    fn compile_kernel_deferred(&self, module: KernelModule, used: Option<Box<[bool]>>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
         check_mask(&module, used.as_deref())?;
         let shared = Arc::clone(&self.shared);
         let label = label.to_owned();
-        Ok(RawKernel::spawn(move || compile_native(&shared, &module, used.as_deref(), &label, trusted)))
+        Ok(RawKernel::spawn(move || compile_native(&shared, &module, used.as_deref(), &label, trust)))
     }
 
     fn record_launch(&self, kernel: &CompiledKernel, dispatch: Dispatch<'_>, size: [u32; 3], args: &[RawArg<'_>]) -> Result<u32, BackendError> {
@@ -1134,25 +1205,32 @@ impl Backend for CudaBackend {
         }
         let mut st = lock(&self.state);
         self.bind()?;
-        for (index, piece) in data.chunks(TRANSFER_CHUNK).enumerate() {
+        let chunk = UPLOAD_CHUNK;
+        for (index, piece) in data.chunks(chunk).enumerate() {
             let pinned = self.take_pinned(&mut st, piece.len())?;
-            // SAFETY: `piece.len() <= pinned.cap`; the pinned memory is kept in the batch until
-            // the copy out of it has completed.
+            // SAFETY: `piece.len() <= pinned.cap`; the pinned memory is kept until the copy out
+            // of it has completed (the staging queue or the batch holds it).
             let staged = unsafe {
                 copy_parallel(piece, std::slice::from_raw_parts_mut(pinned.ptr.cast::<MaybeUninit<u8>>(), piece.len()));
                 std::slice::from_raw_parts(pinned.ptr, piece.len())
             };
-            let to = dptr + (index * TRANSFER_CHUNK) as u64;
+            let to = dptr + (index * chunk) as u64;
             // Held after `take_pinned` (which can flush and reap) and before the copy is queued.
             if st.held.buffers.last() != Some(dst) {
                 st.held.buffers.push(dst.clone());
             }
             // SAFETY: the destination range lies inside `dst`.
             let enqueued = unsafe { result::memcpy_htod_async(to, staged, self.stream.cu_stream()) };
-            // The staging memory stays with the batch whether or not the call reports an error.
+            // The staging memory stays alive whether or not the call reports an error. A big
+            // block is free again once the stream has copied out of it: the next piece (or the
+            // next upload) reuses it instead of pinning more memory. A small one goes with the batch.
+            let own_event = if enqueued.is_ok() && pinned.cap >= MARK_MIN { self.event(&mut st).ok().filter(|event| event.record(&self.stream).is_ok()) } else { None };
             st.pinned_busy += pinned.cap;
-            st.held.pinned.push(pinned);
             st.dirty = true;
+            match own_event {
+                Some(event) => st.staging.push_back((event, pinned)),
+                None => st.held.pinned.push(pinned),
+            }
             enqueued.map_err(gpu)?;
         }
         Ok(())
@@ -1224,7 +1302,13 @@ impl Backend for CudaBackend {
         // a few copies are queued first so copying one piece out overlaps the transfer of the
         // next.
         let window = if spill { 1 } else { READ_WINDOW };
-        let chunk = if total > 2 * TRANSFER_CHUNK || spill { TRANSFER_CHUNK.min(total) } else { total };
+        let chunk = if spill {
+            SPILL_CHUNK.min(total)
+        } else if total < 2 * READ_CHUNK_MIN {
+            total
+        } else {
+            (total / READ_PIECES).clamp(READ_CHUNK_MIN, READ_CHUNK).next_multiple_of(1 << 16).min(total)
+        };
         // Declared before the closure so that it is dropped (freeing the staging memory) only
         // after the failure path below has synchronized the stream.
         let mut queued: VecDeque<(usize, usize, Pinned, Option<Arc<CudaEvent>>)> = VecDeque::new();

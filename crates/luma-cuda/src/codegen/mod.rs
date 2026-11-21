@@ -218,6 +218,8 @@ struct Em<'a> {
     abi: Vec<Option<CudaArgAbi>>,
     res: Vec<Res>,
     init_shared: bool,
+    /// Whether indices into workgroup arrays are clamped to the array.
+    clamp_shared: bool,
     decls: BTreeSet<String>,
     helpers: BTreeMap<String, String>,
     jumps: Vec<Jump>,
@@ -532,7 +534,7 @@ impl<'a> Em<'a> {
         match self.m.shared[shared as usize].len {
             // Untrusted kernels keep WGSL's clamped indexing; trusted ones index directly.
             Some(n) => {
-                let j = if self.init_shared { umin_const(fb, idx, n.wrapping_sub(1)) } else { idx.clone() };
+                let j = if self.clamp_shared { umin_const(fb, idx, n.wrapping_sub(1)) } else { idx.clone() };
                 index_ptr(fb, &base, &j, self.shared_stride(shared))
             }
             None => base,
@@ -1595,6 +1597,13 @@ pub fn emit(module: &KernelModule, used: Option<&[bool]>) -> CudaTranslated {
 /// aggregate representations, tail padding included, start at zero) and a barrier follows.
 /// The kernel ABI is identical either way.
 pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, initialize: bool) -> CudaTranslated {
+    emit_with_options(module, used, initialize, initialize)
+}
+
+/// Like [`emit_with_workgroup_init`]; `clamp_shared` also clamps every index into a workgroup
+/// array to it, WGSL's behaviour for an index out of range. Kernels that went through
+/// `kir::opt::with_bounds_checks` need not, and trusted ones do not want to.
+pub fn emit_with_options(module: &KernelModule, used: Option<&[bool]>, initialize: bool, clamp_shared: bool) -> CudaTranslated {
     let n = module.bindings.len();
     let active: Vec<bool> = (0..n).map(|i| used.is_none_or(|u| u.get(i).copied().unwrap_or(false))).collect();
     Em {
@@ -1603,6 +1612,7 @@ pub fn emit_with_workgroup_init(module: &KernelModule, used: Option<&[bool]>, in
         abi: vec![None; n],
         res: Vec::new(),
         init_shared: initialize,
+        clamp_shared,
         decls: BTreeSet::new(),
         helpers: BTreeMap::new(),
         jumps: Vec::new(),

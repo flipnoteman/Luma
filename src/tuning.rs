@@ -138,9 +138,33 @@ pub(crate) struct Tuning {
     /// workgroups, which WGSL does not give (wgpu, Metal): only the CUDA backend sets it.
     /// `LUMA_LOOKBACK_SCAN` overrides.
     pub(crate) lookback_scan: bool,
+    /// Multiprocessors (compute units) of the device, 82 (the RTX 3090 the occupancy-derived plan
+    /// constants were measured on) when the backend cannot tell. See [`Tuning::scaled`].
+    pub(crate) compute_units: u32,
 }
 
+/// Multiprocessors of the RTX 3090, on which the plan constants that depend on how many workgroups
+/// fill the device (`matmul::SPLIT_GROUPS`, `builtin::thomas_plan`)
+/// were measured.
+pub(crate) const REFERENCE_COMPUTE_UNITS: u32 = 82;
+
 impl Tuning {
+    /// [`scaled`](Self::scaled), but never below `reference`: for counts of workgroups that keep a
+    /// device busy, where more than enough cost almost nothing (a K-split matmul on an RTX 3080
+    /// Laptop was 2.7 % slower with the 599 workgroups of its 48 multiprocessors than with 1024).
+    pub(crate) fn scaled_up(&self, reference: u32) -> u32 {
+        self.scaled(reference).max(reference)
+    }
+
+    /// A count of workgroups or lines tuned on the reference device ([`REFERENCE_COMPUTE_UNITS`]),
+    /// for this device: proportional to its multiprocessors, rounded to nearest, at least 1 for a
+    /// nonzero count and unchanged at the reference.
+    pub(crate) fn scaled(&self, reference: u32) -> u32 {
+        let units = u64::from(self.compute_units.max(1));
+        let scaled = (u64::from(reference) * units + u64::from(REFERENCE_COMPUTE_UNITS) / 2) / u64::from(REFERENCE_COMPUTE_UNITS);
+        if reference == 0 { 0 } else { scaled.clamp(1, u64::from(u32::MAX)) as u32 }
+    }
+
     const APPLE: Tuning = Tuning {
         profile: TuningProfile::Apple,
         elementwise_workgroup: 64,
@@ -172,6 +196,7 @@ impl Tuning {
         native_solve: false,
         native_gemm: 0,
         lookback_scan: false,
+        compute_units: REFERENCE_COMPUTE_UNITS,
     };
 
     const NVIDIA: Tuning = Tuning {
@@ -206,6 +231,7 @@ impl Tuning {
         native_solve: false,
         native_gemm: 0,
         lookback_scan: false,
+        compute_units: REFERENCE_COMPUTE_UNITS,
     };
 
     const GENERIC: Tuning = Tuning {
@@ -237,6 +263,7 @@ impl Tuning {
         native_solve: false,
         native_gemm: 0,
         lookback_scan: false,
+        compute_units: REFERENCE_COMPUTE_UNITS,
     };
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
@@ -293,6 +320,11 @@ impl Tuning {
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
             _ => info.backend == BackendKind::Cuda,
         };
+        // Software rasterizers and the CPU backend keep the reference: their "units" are threads,
+        // which the plans were never measured against.
+        if let Some(units) = info.compute_units.filter(|_| profile != TuningProfile::Cpu) {
+            tuning.compute_units = units.max(1);
+        }
         tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
         tuning.line_solver = match std::env::var(LINE_SOLVER_ENV).as_deref().map(str::trim) {
             Ok("thomas") => LineSolver::Thomas,
@@ -369,7 +401,22 @@ pub(crate) fn stencil_bytes(tile: (u32, u32), halo: (u32, u32)) -> u32 {
 }
 #[cfg(test)]
 mod tests {
-    use super::{conv_workgroup_bytes, stencil_bytes, DeviceLimits, Tuning, STENCIL_RADIUS};
+    use super::{conv_workgroup_bytes, stencil_bytes, DeviceLimits, Tuning, REFERENCE_COMPUTE_UNITS, STENCIL_RADIUS};
+
+    #[test]
+    fn scaling_is_the_identity_at_the_reference_device() {
+        let at = |compute_units| Tuning { compute_units, ..Tuning::NVIDIA };
+        for v in [0u32, 1, 8, 512, 1024, 8192, 1 << 20] {
+            assert_eq!(at(REFERENCE_COMPUTE_UNITS).scaled(v), v);
+        }
+        assert_eq!(at(48).scaled(1024), 599);
+        assert_eq!(at(48).scaled(8192), 4795);
+        assert_eq!(at(1).scaled(1), 1);
+        assert_eq!(at(48).scaled_up(1024), 1024);
+        assert_eq!(at(164).scaled_up(1024), 2048);
+        assert_eq!(at(164).scaled(1024), 2048);
+        assert_eq!(at(48).scaled(0), 0);
+    }
 
     #[test]
     fn tunings_fit_the_smallest_webgpu_limits() {

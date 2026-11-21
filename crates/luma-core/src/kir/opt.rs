@@ -489,6 +489,7 @@ fn needs_checks(module: &KernelModule) -> bool {
 /// Builds the condition of a [`Req`] stream.
 struct Collect<'t> {
     types: Types<'t>,
+    ranges: &'t Ranges,
     check: Check,
     whole: Option<u32>,
 }
@@ -497,6 +498,8 @@ impl Collect<'_> {
     fn emit(&mut self, req: Req<'_>) {
         let next = match req {
             Req::Never => Check::Never,
+            // An index proven below a fixed bound needs no check.
+            Req::Index(e, Bound::Fixed(n)) if self.ranges.span(e).is_some_and(|(_, hi)| hi < n) => return,
             Req::Index(e, bound) => {
                 let limit = match bound {
                     Bound::Fixed(n) => Expr::LitU32(n),
@@ -586,6 +589,211 @@ struct Scope<'a> {
     /// Statements that evaluate an effectful index once, to run before the statement being
     /// rewritten.
     pre: Vec<Stmt>,
+    /// What is known of the values of `u32` locals (see [`Ranges`]).
+    ranges: Ranges,
+    /// How many times each local is assigned in the function (declarations do not count).
+    assigns: Vec<u32>,
+    /// The counter of the loop whose body is about to be rewritten; taken by its first block.
+    loop_counter: Option<Counter>,
+}
+
+/// Inclusive bounds of the value of an expression of type `u32`.
+type Span = (u32, u32);
+
+/// A loop variable that starts at `first`, is assigned only `step` more at the end of every trip
+/// (its `continuing` block) and is left by a guard `if !(var < limit) { break }` at the top of
+/// the body: past the guard it stays within `first ..= first + step * k`.
+#[derive(Clone, Copy)]
+struct Counter {
+    var: u32,
+    first: u32,
+    step: u32,
+}
+
+/// Value ranges of the `u32` locals of one function, to leave out the checks that cannot fail:
+/// the workgroup-memory reads of a tiled loop (`tile[(k + 1u) * 32u + lid.y]`) are in bounds by
+/// construction, and a branch or clamp per access there costs a few percent of a kernel.
+///
+/// Only what is certain is recorded: immutable `let`s whose value has no wrapping arithmetic,
+/// `local_invocation_id` / `local_invocation_index` of the entry point (below the workgroup
+/// size) and loop counters of the shape [`Counter`] describes. A range exists only where the
+/// rewrite has seen the statement that proves it.
+#[derive(Default)]
+struct Ranges {
+    spans: HashMap<u32, Span>,
+    /// `let a = counter` copies that the guard of a loop may test instead of the counter.
+    aliases: HashMap<u32, u32>,
+    /// Loop counters being rewritten, with their first value and step.
+    counters: HashMap<u32, (u32, u32)>,
+    /// Variables declared with a literal initial value (or none: zero).
+    inits: HashMap<u32, u32>,
+    /// The `v = literal` assignment that was the previous statement of the block being rewritten.
+    last_assign: Option<(u32, u32)>,
+    /// The local holding `local_invocation_id` and the workgroup size.
+    local_id: Option<(u32, [u32; 3])>,
+}
+
+impl Ranges {
+    /// The builtin locals of the entry point of `m`; `assigns` and `locals` are its own.
+    fn for_entry(m: &KernelModule, assigns: &[u32]) -> Ranges {
+        let mut ranges = Ranges::default();
+        let size = m.workgroup_size;
+        let fixed = |l: LocalId| !m.entry_locals[l.0 as usize].2 && assigns.get(l.0 as usize).copied().unwrap_or(0) == 0;
+        for &(var, local) in &m.entry_builtins {
+            if !fixed(local) {
+                continue;
+            }
+            match var {
+                BuiltinVar::LocalInvocationId => ranges.local_id = Some((local.0, size)),
+                BuiltinVar::LocalInvocationIndex => {
+                    let total = u64::from(size[0]) * u64::from(size[1]) * u64::from(size[2]);
+                    if let Ok(total) = u32::try_from(total) {
+                        ranges.spans.insert(local.0, (0, total.saturating_sub(1)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        ranges
+    }
+
+    /// Bounds of `e` that hold whenever it is evaluated, if it is a `u32` made of constants,
+    /// known locals and arithmetic that cannot wrap.
+    fn span(&self, e: &Expr) -> Option<Span> {
+        match e {
+            Expr::LitU32(k) => Some((*k, *k)),
+            Expr::Local(l) => self.spans.get(&l.0).copied(),
+            Expr::Access { base, step: AccessStep::Field(i), ty, .. } if *ty == KirType::U32 => {
+                let (local, size) = self.local_id?;
+                match &**base {
+                    Expr::Local(l) if l.0 == local && *i < 3 => Some((0, size[*i as usize].checked_sub(1)?)),
+                    _ => None,
+                }
+            }
+            Expr::Binary { op, lhs, rhs, ty } if *ty == KirType::U32 => {
+                let (a, b) = (self.span(lhs)?, self.span(rhs)?);
+                let (alo, ahi, blo, bhi) = (u64::from(a.0), u64::from(a.1), u64::from(b.0), u64::from(b.1));
+                let (lo, hi) = match op {
+                    IrBinOp::Add => (alo + blo, ahi + bhi),
+                    IrBinOp::Mul => (alo * blo, ahi * bhi),
+                    IrBinOp::Sub if alo >= bhi => (alo - bhi, ahi - blo),
+                    IrBinOp::Div if blo > 0 => (alo / bhi, ahi / blo),
+                    IrBinOp::Rem if blo > 0 => (0, ahi.min(bhi - 1)),
+                    IrBinOp::Min => (alo.min(blo), ahi.min(bhi)),
+                    IrBinOp::Max => (alo.max(blo), ahi.max(bhi)),
+                    IrBinOp::BitAnd => (0, ahi.min(bhi)),
+                    IrBinOp::Shr if blo == bhi && blo < 32 => (alo >> blo, ahi >> blo),
+                    IrBinOp::Shl if blo == bhi && blo < 32 => (alo << blo, ahi << blo),
+                    _ => return None,
+                };
+                Some((u32::try_from(lo).ok()?, u32::try_from(hi).ok()?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The counter `continuing` advances, if it is one (see [`Counter`]): a variable declared
+    /// with a literal that nothing but this block assigns, by a literal step.
+    fn counter_of(&self, continuing: &[Stmt], locals: &[(String, KirType, bool)], assigns: &[u32], before: Option<(u32, u32)>) -> Option<Counter> {
+        let mut copies: Vec<(u32, u32)> = Vec::new();
+        for s in continuing {
+            match s {
+                Stmt::Let { local, init: Expr::Local(v) } => copies.push((local.0, v.0)),
+                Stmt::Assign { dst: LValue::Local(v), val: Expr::Binary { op: IrBinOp::Add, lhs, rhs, .. } } => {
+                    let Expr::LitU32(step) = **rhs else { continue };
+                    let Expr::Local(from) = **lhs else { continue };
+                    let reads_v = from == *v || copies.contains(&(from.0, v.0));
+                    // Either the declaration starts it and this block is the only assignment, or
+                    // the statement right before the loop assigns it a literal and this block is
+                    // the only other assignment.
+                    let (first, unique) = match (assigns.get(v.0 as usize).copied(), before) {
+                        (Some(1), _) => (self.inits.get(&v.0).copied(), true),
+                        (Some(2), Some((var, first))) if var == v.0 => (Some(first), true),
+                        _ => (None, false),
+                    };
+                    if reads_v && step > 0 && unique && locals[v.0 as usize].1 == KirType::U32 && let Some(first) = first {
+                        return Some(Counter { var: v.0, first, step });
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Notes what the statement `s` (as written) shows about locals, before it is rewritten.
+    /// `guard` is the counter of the loop whose body `s` is a direct statement of, if any.
+    fn note(&mut self, s: &Stmt, guard: Option<Counter>) {
+        match s {
+            Stmt::Var { local, init: Some(Expr::LitU32(k)) } => {
+                self.inits.insert(local.0, *k);
+            }
+            Stmt::Var { local, init: None } => {
+                self.inits.insert(local.0, 0);
+            }
+            Stmt::Let { local, init } => {
+                if let Expr::Local(v) = init
+                    && self.counters.contains_key(&v.0)
+                {
+                    self.aliases.insert(local.0, v.0);
+                }
+                if let Some(span) = self.span(init) {
+                    self.spans.insert(local.0, span);
+                }
+            }
+            Stmt::If { cond: Expr::Binary { op, lhs, rhs, .. }, then_body, else_body } if guard.is_some() => {
+                let counter = guard.expect("checked");
+                let leaves = match op {
+                    IrBinOp::Lt => then_body.is_empty() && matches!(else_body[..], [Stmt::Break]),
+                    IrBinOp::Ge => else_body.is_empty() && matches!(then_body[..], [Stmt::Break]),
+                    _ => false,
+                };
+                let tests_counter = matches!(**lhs, Expr::Local(a) if a.0 == counter.var || self.aliases.get(&a.0) == Some(&counter.var));
+                if let (true, true, Expr::LitU32(limit)) = (leaves, tests_counter, &**rhs)
+                    && u64::from(*limit) + u64::from(counter.step) <= 1 << 32
+                {
+                    // The values the variable takes while it is below `limit`.
+                    let last = match limit.checked_sub(1) {
+                        Some(top) if top >= counter.first => counter.first + counter.step * ((top - counter.first) / counter.step),
+                        _ => counter.first,
+                    };
+                    self.spans.insert(counter.var, (counter.first, last));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// How many times each local of a function is assigned.
+fn count_assigns(body: &[Stmt], locals: usize) -> Vec<u32> {
+    fn root(lv: &LValue) -> Option<u32> {
+        match lv {
+            LValue::Local(l) => Some(l.0),
+            LValue::Index { base, .. } | LValue::Field { base, .. } => root(base),
+            _ => None,
+        }
+    }
+    let mut counts = vec![0u32; locals];
+    let mut bump = |l: u32| {
+        if let Some(c) = counts.get_mut(l as usize) {
+            *c += 1;
+        }
+    };
+    walk_stmts(body, &mut |s| match s {
+        Stmt::Assign { dst, .. } => {
+            if let Some(l) = root(dst) {
+                bump(l);
+            }
+        }
+        Stmt::AtomicRmw { dst: Some(l), .. } => bump(l.0),
+        Stmt::AtomicCompareExchange { dst_old, dst_exchanged, .. } => {
+            bump(dst_old.0);
+            bump(dst_exchanged.0);
+        }
+        _ => {}
+    });
+    counts
 }
 
 impl Scope<'_> {
@@ -594,8 +802,8 @@ impl Scope<'_> {
     }
 
     fn collect(&mut self, f: impl FnOnce(&Types<'_>, &mut dyn FnMut(Req<'_>))) -> Check {
-        let types = self.types();
-        let mut collect = Collect { types, check: Check::Ok, whole: None };
+        let types = Types { m: self.m, locals: &self.locals[..], params: self.params };
+        let mut collect = Collect { types, ranges: &self.ranges, check: Check::Ok, whole: None };
         f(&types, &mut |req: Req<'_>| collect.emit(req));
         let (check, whole) = (collect.check, collect.whole);
         if let Some(binding) = whole {
@@ -772,9 +980,27 @@ impl Scope<'_> {
     fn block(&mut self, block: &mut Vec<Stmt>) {
         let old = std::mem::take(block);
         block.reserve(old.len());
+        // Only the statements directly in a loop body are past its guard once it has run.
+        let guard = self.loop_counter.take();
         for mut s in old {
+            let before = self.ranges.last_assign.take();
+            self.ranges.note(&s, guard);
+            if let Stmt::Assign { dst: LValue::Local(v), val: Expr::LitU32(c) } = &s {
+                self.ranges.last_assign = Some((v.0, *c));
+            }
             if let Stmt::Loop { body, continuing, break_if } = &mut s {
+                let counter = self.ranges.counter_of(continuing, &self.locals[..], &self.assigns, before);
+                if let Some(c) = counter {
+                    self.ranges.counters.insert(c.var, (c.first, c.step));
+                }
+                self.loop_counter = counter;
                 self.block(body);
+                self.loop_counter = None;
+                // The variable moves on before `continuing` reads it, and is unknown after the loop.
+                if let Some(c) = counter {
+                    self.ranges.spans.remove(&c.var);
+                    self.ranges.counters.remove(&c.var);
+                }
                 self.block(continuing);
                 if let Some(e) = break_if {
                     // Evaluated after `continuing` on every iteration, so its `let`s go there.
@@ -839,12 +1065,15 @@ pub fn with_bounds_checks(module: &KernelModule) -> Cow<'_, KernelModule> {
     let mut out = module.clone();
     let mut whole = vec![false; module.bindings.len()];
     let mut body = std::mem::take(&mut out.entry_body);
-    let mut scope = Scope { m: module, locals: &mut out.entry_locals, params: &[], whole: &mut whole, pre: Vec::new() };
+    let assigns = count_assigns(&body, module.entry_locals.len());
+    let ranges = Ranges::for_entry(module, &assigns);
+    let mut scope = Scope { m: module, locals: &mut out.entry_locals, params: &[], whole: &mut whole, pre: Vec::new(), ranges, assigns, loop_counter: None };
     scope.block(&mut body);
     out.entry_body = body;
     for f in &mut out.functions {
         let mut body = std::mem::take(&mut f.body);
-        let mut scope = Scope { m: module, locals: &mut f.locals, params: &f.params, whole: &mut whole, pre: Vec::new() };
+        let assigns = count_assigns(&body, f.locals.len());
+        let mut scope = Scope { m: module, locals: &mut f.locals, params: &f.params, whole: &mut whole, pre: Vec::new(), ranges: Ranges::default(), assigns, loop_counter: None };
         scope.block(&mut body);
         f.body = body;
     }
@@ -1493,5 +1722,72 @@ mod bounds_tests {
         let run = Machine::run(&checked, Vec::new(), Vec::new());
         assert_eq!(run.shared[0], words([0, 0, 3, 0]));
         assert_eq!(run.local(0), &V::U(0));
+    }
+    /// The number of guards (selects and `if`s the pass added) in the entry body of `src` after
+    /// the pass.
+    fn guards_of(src: &str) -> usize {
+        let parsed = crate::kir::parse_wgsl(src, "main", None, crate::hal::Features::SUBGROUP, [256, 256, 64], 256, 8, false).expect("parses").1;
+        let checked = with_bounds_checks(&parsed);
+        let mut count = 0;
+        let mut body = checked.entry_body.clone();
+        walk_stmts(&body, &mut |s| {
+            if let Stmt::If { cond, .. } = s {
+                // The kernels below have no `if` of their own besides loop guards.
+                count += usize::from(!matches!(cond, Expr::Binary { op: IrBinOp::Lt, rhs, .. } if matches!(**rhs, Expr::LitU32(_))));
+            }
+        });
+        rewrite_exprs(&mut body, &mut |e| count += usize::from(matches!(e, Expr::Ternary { op: IrTernaryOp::Select, .. })));
+        count
+    }
+
+    fn tiled(shared_len: u32, limit: &str, step: &str, body: &str) -> String {
+        format!(
+            "var<workgroup> t: array<vec4<f32>, {shared_len}>;
+@group(1) @binding(0) var<storage, read_write> out: array<f32>;
+@group(1) @binding(1) var<uniform> p: vec4<u32>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    var acc = vec4<f32>(0.0);
+    for (var kk = 0u; kk < {limit}; kk = kk + {step}) {{
+        {body}
+    }}
+    t[li] = acc;
+    out[li] = acc.x;
+}}"
+        )
+    }
+
+    #[test]
+    fn workgroup_reads_proven_in_range_need_no_guard() {
+        // `li` < 256 and the sum stays below the array; the global store is of unknown bound.
+        let unrolled = "let o = (kk + 1u) * 32u; acc = acc + t[o + lid.y] + t[o + lid.y + 16u];";
+        // kk takes 0, 2, .. 14: the largest index is 15 * 32 + 15 + 16 = 511.
+        assert_eq!(guards_of(&tiled(512, "16u", "2u", unrolled)), 1, "only the store to `out`");
+        // One element fewer and the last index is out of range: both reads (and the store) are guarded.
+        assert_eq!(guards_of(&tiled(511, "16u", "2u", unrolled)), 2, "the read past the end and the store to `out`");
+    }
+
+    #[test]
+    fn a_counter_in_a_nested_loop_is_proven_too() {
+        // The inner variable is declared and assigned inside a loop of unknown length.
+        let nested = "for (var k0 = 0u; k0 < p.x; k0 = k0 + 16u) {
+            for (var j = 0u; j < 16u; j = j + 2u) { acc = acc + t[(j + 1u) * 32u + lid.y + 16u]; }
+        }";
+        let src = tiled(512, "1u", "1u", nested);
+        assert_eq!(guards_of(&src), 2, "the outer loop's test and the store to `out`");
+        assert_eq!(guards_of(&src.replace("512", "511")), 3, "one short: the read is guarded too");
+    }
+
+    #[test]
+    fn counters_without_a_proof_keep_their_guards() {
+        let read = "acc = acc + t[kk * 32u + lid.y];";
+        // The limit is a runtime value (its test is an `if` of the kernel too).
+        assert_eq!(guards_of(&tiled(512, "p.x", "1u", read)), 3);
+        // The counter is also assigned in the body.
+        assert_eq!(guards_of(&tiled(512, "16u", "1u", "acc = acc + t[kk * 32u + lid.y]; kk = kk + 1u;")), 2);
+        // The step makes the last value 15 and 15 * 32 + 15 does not fit 480 elements.
+        assert_eq!(guards_of(&tiled(480, "16u", "1u", read)), 2);
+        // Proven: 15 * 32 + 15 = 495 < 512.
+        assert_eq!(guards_of(&tiled(512, "16u", "1u", read)), 1);
     }
 }

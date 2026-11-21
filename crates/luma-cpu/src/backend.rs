@@ -95,6 +95,7 @@ static SHARED: LazyLock<CpuShared> = LazyLock::new(|| {
             max_workgroup_invocations: 1024,
             max_workgroup_storage_bytes: 65536,
         },
+        compute_units: Some(pool.threads() as u32),
     };
     let key = format!(
         "cpu-{:016x}",
@@ -245,15 +246,15 @@ fn compile_native(
     module: &KernelModule,
     used: Option<&[bool]>,
     label: &str,
-    trusted: bool,
+    trust: luma_core::KernelTrust,
 ) -> Result<CompiledCpuKernel, BackendError> {
-    let checked = if trusted {
-        Cow::Borrowed(module)
-    } else {
+    let checked = if trust.checks_bounds() {
         luma_core::kir::opt::with_bounds_checks(module)
+    } else {
+        Cow::Borrowed(module)
     };
     let optimized = luma_core::kir::optimize_for_target(&checked, true);
-    let plan = fission::plan(&optimized, used, !trusted);
+    let plan = fission::plan(&optimized, used, trust.zero_workgroup_memory());
     if plan.shared_bytes > max_shared_bytes {
         return Err(BackendError::KernelWorkgroup(format!(
             "kernel `{label}` uses {} bytes of workgroup memory, the device allows {}",
@@ -262,7 +263,7 @@ fn compile_native(
     }
     let identity = format!(
         "{optimized:?}\n{used:?}\n{}\n{}\n{}",
-        !trusted,
+        trust.zero_workgroup_memory(),
         crate::codegen::host_isa_key(),
         crate::codegen::REVISION
     );
@@ -273,7 +274,7 @@ fn compile_native(
         return Ok(CompiledCpuKernel { exec: Arc::new(blob), plan, cost: CostHint::default() });
     }
     let (compiled, bytes) =
-        crate::codegen::compile(&optimized, used, !trusted).map_err(|e| match e {
+        crate::codegen::compile(&optimized, used, trust.zero_workgroup_memory()).map_err(|e| match e {
             BackendError::ShaderCompile(m) => {
                 BackendError::ShaderCompile(format!("kernel `{label}`: {m}"))
             }
@@ -521,10 +522,10 @@ impl Backend for CpuBackend {
         module: &KernelModule,
         used: Option<&[bool]>,
         label: &str,
-        trusted: bool,
+        trust: luma_core::KernelTrust,
     ) -> Result<RawKernel, BackendError> {
         self.check_module(module, used, label)?;
-        compile_native(&self.disk, self.info.limits.max_workgroup_storage_bytes, module, used, label, trusted).map(RawKernel::new)
+        compile_native(&self.disk, self.info.limits.max_workgroup_storage_bytes, module, used, label, trust).map(RawKernel::new)
     }
 
     fn compile_kernel_deferred(
@@ -532,13 +533,13 @@ impl Backend for CpuBackend {
         module: KernelModule,
         used: Option<Box<[bool]>>,
         label: &str,
-        trusted: bool,
+        trust: luma_core::KernelTrust,
     ) -> Result<RawKernel, BackendError> {
         self.check_module(&module, used.as_deref(), label)?;
         let disk = Arc::clone(&self.disk);
         let max_shared = self.info.limits.max_workgroup_storage_bytes;
         let label = label.to_owned();
-        Ok(RawKernel::spawn(move || compile_native(&disk, max_shared, &module, used.as_deref(), &label, trusted)))
+        Ok(RawKernel::spawn(move || compile_native(&disk, max_shared, &module, used.as_deref(), &label, trust)))
     }
 
     fn record_launch(
@@ -796,10 +797,10 @@ mod tests {
 
         let backend = open().unwrap();
         let k1 = backend
-            .compile_kernel(&m, None, "disk_cache_cpu_test", true)
+            .compile_kernel(&m, None, "disk_cache_cpu_test", luma_core::KernelTrust::Trusted)
             .unwrap();
         let k2 = backend
-            .compile_kernel(&m, None, "disk_cache_cpu_test", true)
+            .compile_kernel(&m, None, "disk_cache_cpu_test", luma_core::KernelTrust::Trusted)
             .unwrap();
         let c1 = k1.downcast_ref::<CompiledCpuKernel>().unwrap();
         let c2 = k2.downcast_ref::<CompiledCpuKernel>().unwrap();
