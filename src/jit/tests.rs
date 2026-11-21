@@ -345,7 +345,14 @@ fn a_group_of_reductions_forced_repeatedly_ends_up_in_one_kernel() {
     let mut merged = None;
     for _ in 0..1000 {
         let (launches, again) = run(1.5);
-        assert_eq!(again, bits, "values are the same bits in either kernel");
+        // The same bits on the CPU backend; a GPU kernel that holds several uses of a product rounds its multiply-adds
+        // differently, so there the merged kernel agrees to rounding.
+        if ctx.is_cpu() {
+            assert_eq!(again, bits, "values are the same bits in either kernel");
+        } else {
+            let f = |v: &[u32]| v.iter().map(|&b| f32::from_bits(b)).collect::<Vec<f32>>();
+            assert_close(&f(&again), &f(&bits), 1e-4, 1e-4);
+        }
         if launches == 1 {
             merged = Some(launches);
             break;
