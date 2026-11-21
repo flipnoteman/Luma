@@ -286,6 +286,7 @@ struct Job {
     bindings: *const *mut u8,
     binding_bytes: *const u64,
     lengths: *const u32,
+    native: *const u8,
     shared_bytes: usize,
     scratch_bytes: usize,
     initialize_shared: bool,
@@ -341,6 +342,7 @@ unsafe fn run_job(job: &Job) {
             lengths: job.lengths,
             shared: shared_ptr,
             scratch: scratch_ptr,
+            native: job.native,
             math: &MATH_TABLE,
         };
         let wx_count = u64::from(job.workgroups[0]);
@@ -464,6 +466,25 @@ impl WorkgroupPool {
         scratch_bytes: u32,
         initialize_shared: bool,
     ) {
+        self.dispatch_native(func, std::ptr::null(), grid_size, workgroups, bindings, binding_bytes, lengths, shared_bytes, scratch_bytes, initialize_shared);
+    }
+
+    /// [`WorkgroupPool::dispatch`] of a native kernel, whose function finds `native` in
+    /// [`WorkgroupCtx::native`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_native(
+        &self,
+        func: WorkgroupFn,
+        native: *const u8,
+        grid_size: [u32; 3],
+        workgroups: [u32; 3],
+        bindings: &[*mut u8],
+        binding_bytes: &[u64],
+        lengths: &[u32],
+        shared_bytes: u32,
+        scratch_bytes: u32,
+        initialize_shared: bool,
+    ) {
         let total = u64::from(workgroups[0]) * u64::from(workgroups[1]) * u64::from(workgroups[2]);
         if total == 0 {
             return;
@@ -481,6 +502,7 @@ impl WorkgroupPool {
             bindings: bindings.as_ptr(),
             binding_bytes: binding_bytes.as_ptr(),
             lengths: lengths.as_ptr(),
+            native,
             shared_bytes: shared_bytes as usize,
             scratch_bytes: scratch_bytes as usize,
             initialize_shared,

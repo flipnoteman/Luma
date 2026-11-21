@@ -15,12 +15,13 @@ use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel,
     CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads,
-    FusionSplit, GraphLaunch, Profile, RawArg, RawKernel, TuningProfile,
+    FusionSplit, GraphLaunch, LineSolveSpec, Profile, RawArg, RawKernel, TuningProfile,
 };
 
 use crate::codegen::CompiledCpuKernel;
 use crate::exec::{AlignedBuf, ExecBlob, WorkgroupPool};
 use crate::fission;
+use crate::solve::NativeLineSolve;
 
 /// Most idle bytes of recycled mappable storage kept for reuse.
 const MAPPABLE_CAP: u64 = 256 << 20;
@@ -195,10 +196,20 @@ struct CpuExecGraph {
 
 impl ExecGraph for CpuExecGraph {}
 
-fn native(kernel: &CompiledKernel) -> Result<&CompiledCpuKernel, BackendError> {
+/// What a launched kernel runs: compiled shader code or a native solve.
+enum CpuKernel<'a> {
+    Compiled(&'a CompiledCpuKernel),
+    LineSolve(&'a NativeLineSolve),
+}
+
+fn native(kernel: &CompiledKernel) -> Result<CpuKernel<'_>, BackendError> {
+    if let Some(compiled) = kernel.raw.downcast_ref::<CompiledCpuKernel>() {
+        return Ok(CpuKernel::Compiled(compiled));
+    }
     kernel
         .raw
-        .downcast_ref::<CompiledCpuKernel>()
+        .downcast_ref::<NativeLineSolve>()
+        .map(CpuKernel::LineSolve)
         .ok_or_else(|| BackendError::Unsupported("the kernel belongs to another backend".into()))
 }
 
@@ -273,7 +284,31 @@ impl CpuBackend {
                 }
             }
         }
-        let lengths: Vec<u32> = native
+        let compiled = match native {
+            CpuKernel::Compiled(compiled) => compiled,
+            CpuKernel::LineSolve(solve) => {
+                let uniform = bindings.last().ok_or_else(|| invalid("a line solve without its uniform"))?;
+                // SAFETY: the uniform's storage is 16-byte aligned and at least 16 bytes.
+                let words = unsafe { uniform.cast::<[u32; 3]>().read() };
+                solve.validate(&binding_bytes, words)?;
+                let start = Instant::now();
+                self.pool.dispatch_native(
+                    solve.func,
+                    std::ptr::from_ref(solve).cast(),
+                    size,
+                    workgroups,
+                    &bindings,
+                    &binding_bytes,
+                    &[],
+                    0,
+                    0,
+                    false,
+                );
+                drop(store);
+                return Ok(start.elapsed());
+            }
+        };
+        let lengths: Vec<u32> = compiled
             .plan
             .array_lengths
             .iter()
@@ -286,15 +321,15 @@ impl CpuBackend {
             .collect();
         let start = Instant::now();
         self.pool.dispatch(
-            native.exec.as_fn(),
+            compiled.exec.as_fn(),
             size,
             workgroups,
             &bindings,
             &binding_bytes,
             &lengths,
-            native.plan.shared_bytes,
-            native.plan.scratch_bytes,
-            native.plan.initialize_shared,
+            compiled.plan.shared_bytes,
+            compiled.plan.scratch_bytes,
+            compiled.plan.initialize_shared,
         );
         drop(store);
         Ok(start.elapsed())
@@ -613,6 +648,14 @@ impl Backend for CpuBackend {
 
     fn is_profiling(&self) -> Result<bool, BackendError> {
         Ok(lock(&self.profiler).is_some())
+    }
+
+    fn native_line_solve(&self) -> bool {
+        true
+    }
+
+    fn compile_line_solve(&self, spec: &LineSolveSpec) -> Option<RawKernel> {
+        NativeLineSolve::new(spec).map(RawKernel::new)
     }
 
     fn capture_graph(&self, launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>> {

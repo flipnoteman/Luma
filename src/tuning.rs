@@ -26,6 +26,9 @@ const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
 /// CUDA and CPU backends, for the same reason as `LUMA_SINGLE_PASS_REDUCE`; floating-point sums
 /// keep two passes either way, to stay reproducible).
 const LOOKBACK_ENV: &str = "LUMA_LOOKBACK_SCAN";
+/// `LUMA_NATIVE_SOLVE=off` runs the line solves of a backend that has native ones (the CPU backend)
+/// as compiled shaders, like the GPU backends (see [`Tuning::native_solve`]).
+const NATIVE_SOLVE_ENV: &str = "LUMA_NATIVE_SOLVE";
 
 /// The algorithm of the tridiagonal and block-tridiagonal line solves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -106,6 +109,10 @@ pub(crate) struct Tuning {
     pub(crate) line_strided_from: u32,
     /// Which tridiagonal solver runs; `LUMA_TRIDIAGONAL` overrides.
     pub(crate) line_solver: LineSolver,
+    /// Whether the backend runs the Thomas line solves as native code (`Backend::native_line_solve`,
+    /// `LUMA_NATIVE_SOLVE=off` clears it): the planner then never takes cyclic reduction on its own and
+    /// solves blocks of any size by the block Thomas algorithm (see `builtin::thomas_plan`).
+    pub(crate) native_solve: bool,
     /// Whether a scan of long contiguous lines is one kernel that reads its input once, with a
     /// decoupled look-back (each workgroup takes a chunk from an atomic counter, publishes the
     /// chunk's aggregate and waits for the prefix of the chunks before it, see
@@ -146,6 +153,7 @@ impl Tuning {
         // 32-wide SIMD groups, like NVIDIA warps: see `builtin::thomas_plan`.
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
         lookback_scan: false,
     };
 
@@ -177,6 +185,7 @@ impl Tuning {
         // RTX 3090, see `builtin::thomas_plan`.
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
         lookback_scan: false,
     };
 
@@ -205,6 +214,7 @@ impl Tuning {
         line_cyclic_work: 0,
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
         lookback_scan: false,
     };
 
@@ -264,6 +274,12 @@ impl Tuning {
             _ => LineSolver::Auto,
         };
         tuning
+    }
+
+    /// Whether the line solves run natively, given whether the backend can: see
+    /// [`Tuning::native_solve`].
+    pub(crate) fn native_solve_for(supported: bool) -> bool {
+        supported && std::env::var(NATIVE_SOLVE_ENV).as_deref().map(str::trim) != Ok("off")
     }
 
     /// The generic parameters, for tests that need a `Tuning` without a device.

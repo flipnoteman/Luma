@@ -5,7 +5,7 @@ mod common;
 use common::{assert_close, values};
 use luma::{
     solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from,
-    solve_tridiagonal, solve_tridiagonal_from, solve_tridiagonal_parts, solve_tridiagonal_parts_from, Array, Context, LumaError,
+    compile_until_all, solve_tridiagonal, solve_tridiagonal_from, solve_tridiagonal_parts, solve_tridiagonal_parts_from, Array, Context, LumaError, Until,
 };
 
 /// Solves `m x = r` (`n x n`, row-major, `k` right-hand sides in `r`) by Gaussian elimination with
@@ -490,4 +490,142 @@ fn parts_errors_poison_every_result() {
     let four = Array::from_slice_on(&ctx, &values(16, 1, 1.0, 2.0), [2, 2, 2, 2]).unwrap();
     let [x, _] = solve_block_tridiagonal_parts(0, [&four; 4], [&four; 4], [&four; 4], [&four; 2]);
     assert!(matches!(x.to_vec().unwrap_err().root(), LumaError::InvalidShape(_)));
+}
+
+/// Block systems of every size on grids whose lines do not fill the vectors and groups of a native
+/// solve (one, three, four, five, nine lines; rows of one, two, three cells), along every axis of
+/// a three-dimensional grid, stacked and from a start cell.
+#[test]
+fn block_systems_of_every_size_on_awkward_grids() {
+    let ctx = Context::new().unwrap();
+    for b in 1..=8usize {
+        for grid in [[1usize, 1, 1, 1], [3, 1, 2, 1], [5, 3, 4, 1], [2, 9, 1, 1], [7, 5, 3, 1], [4, 4, 3, 1], [13, 2, 5, 1]] {
+            let cells: usize = grid.iter().product();
+            let [lo, diag, up, rhs] = block_system(b, cells, 500 + b as u64);
+            let big = [b * b, grid[0], grid[1], grid[2]];
+            let small = [b, grid[0], grid[1], grid[2]];
+            let from = |host: &[f32], dims: [usize; 4]| Array::from_slice_on(&ctx, host, dims).unwrap();
+            let (lo_a, diag_a, up_a, rhs_a) = (from(&lo, big), from(&diag, big), from(&up, big), from(&rhs, small));
+            for axis in 1..=3usize {
+                let n = grid[axis - 1];
+                let lines = cells / n;
+                let tol = if b >= 7 { 5e-4 } else { 1e-4 };
+                let got = solve_block_tridiagonal(b, axis, &lo_a, &diag_a, &up_a, &rhs_a).to_vec().unwrap();
+                let (want, residual) = reference(b, grid, axis - 1, &lo, &diag, &up, &rhs, None);
+                assert!(residual < 1e-9);
+                assert_close(&got, &want, tol, 1e-5);
+                // Every line starts at its own cell, some past the end.
+                let start: Vec<u32> = (0..lines).map(|l| (l * 2 % (n + 2)) as u32).collect();
+                let start_a = Array::from_slice_on(&ctx, &start, lines).unwrap();
+                let got = solve_block_tridiagonal_from(b, axis, &lo_a, &diag_a, &up_a, &rhs_a, &start_a).to_vec().unwrap();
+                let (want, _) = reference(b, grid, axis - 1, &lo, &diag, &up, &rhs, Some(&start));
+                assert_close(&got, &want, tol, 1e-5);
+            }
+        }
+    }
+}
+
+macro_rules! parts_solve {
+    ($b:literal, $bb:literal, $axis:expr, $refs:expr) => {{
+        let r: &[&Array<f32>] = $refs;
+        solve_block_tridiagonal_parts::<$bb, $b>(
+            $axis,
+            std::array::from_fn::<_, $bb, _>(|k| r[k]),
+            std::array::from_fn::<_, $bb, _>(|k| r[$bb + k]),
+            std::array::from_fn::<_, $bb, _>(|k| r[2 * $bb + k]),
+            std::array::from_fn::<_, $b, _>(|k| r[3 * $bb + k]),
+        )
+        .map(|x| x.to_vec().unwrap())
+        .to_vec()
+    }};
+}
+
+/// The solve on parts for every block size (the native solve takes all of 1 to 8) on awkward
+/// grids, evaluated and lazy, along both axes.
+#[test]
+fn block_parts_of_every_size_on_awkward_grids() {
+    let ctx = Context::new().unwrap();
+    for b in 1..=8usize {
+        for grid in [[1usize, 1], [3, 2], [4, 5], [5, 4], [9, 7], [13, 3], [8, 8]] {
+            let cells = grid[0] * grid[1];
+            let host = block_system(b, cells, 700 + b as u64);
+            for lazy in [false, true] {
+                let parts = parts_of(&ctx, grid, b, &host, lazy);
+                let refs: Vec<&Array<f32>> = parts.iter().collect();
+                for axis in 0..2usize {
+                    let got = match b {
+                        1 => parts_solve!(1, 1, axis, &refs),
+                        2 => parts_solve!(2, 4, axis, &refs),
+                        3 => parts_solve!(3, 9, axis, &refs),
+                        4 => parts_solve!(4, 16, axis, &refs),
+                        5 => parts_solve!(5, 25, axis, &refs),
+                        6 => parts_solve!(6, 36, axis, &refs),
+                        7 => parts_solve!(7, 49, axis, &refs),
+                        _ => parts_solve!(8, 64, axis, &refs),
+                    };
+                    let (want, residual) = reference(b, [grid[0], grid[1], 1, 1], axis, &host[0], &host[1], &host[2], &host[3], None);
+                    assert!(residual < 1e-9);
+                    let tol = if b >= 7 { 5e-4 } else { 1e-4 };
+                    for (c, component) in got.iter().enumerate() {
+                        let expected: Vec<f32> = (0..cells).map(|q| want[q * b + c]).collect();
+                        assert_close(component, &expected, tol, 1e-5);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A traced step with a block solve, replayed many times by `compile_until_all`, matches the same
+/// steps run eagerly one by one (stacked and on parts), also from another initial state.
+#[test]
+fn a_traced_block_solve_replays_like_the_eager_loop() {
+    let ctx = Context::new().unwrap();
+    let (b, grid) = (5usize, [24usize, 9]);
+    let cells = grid[0] * grid[1];
+    let [lo, diag, up, forcing] = block_system(b, cells, 900);
+    let big = [b * b, grid[0], grid[1]];
+    let small = [b, grid[0], grid[1]];
+    let (lo_a, diag_a, up_a) = (
+        Array::from_slice_on(&ctx, &lo, big).unwrap(),
+        Array::from_slice_on(&ctx, &diag, big).unwrap(),
+        Array::from_slice_on(&ctx, &up, big).unwrap(),
+    );
+    let force_a = Array::from_slice_on(&ctx, &forcing, small).unwrap();
+    // The parts of the same blocks: entry `e` of every cell.
+    let part = |host: &[f32], width: usize, e: usize| -> Array<f32> {
+        let entry: Vec<f32> = (0..cells).map(|q| host[q * width + e]).collect();
+        Array::from_slice_on(&ctx, &entry, grid).unwrap()
+    };
+    let (lo_p, diag_p, up_p): (Vec<_>, Vec<_>, Vec<_>) = ((0..25).map(|e| part(&lo, 25, e)).collect(), (0..25).map(|e| part(&diag, 25, e)).collect(), (0..25).map(|e| part(&up, 25, e)).collect());
+    let stacked_step = |x: &Array<f32>| solve_block_tridiagonal(b, 1, &lo_a, &diag_a, &up_a, &(x * 0.5 + &force_a));
+    let parts_step = |x: &Array<f32>| {
+        let comp: Vec<Array<f32>> = (0..b).map(|c| x.slice(0, c..c + 1).reshape(grid)).collect();
+        // Lazy right-hand sides: they depend on the state, so they are computed inside the step.
+        let rhs: Vec<Array<f32>> = comp.iter().enumerate().map(|(c, v)| v * 0.5 + &part(&forcing, b, c)).collect();
+        let (l, d, u) = (lo_p.iter().collect::<Vec<_>>(), diag_p.iter().collect::<Vec<_>>(), up_p.iter().collect::<Vec<_>>());
+        let solved = solve_block_tridiagonal_parts::<25, 5>(
+            0,
+            std::array::from_fn(|k| l[k]),
+            std::array::from_fn(|k| d[k]),
+            std::array::from_fn(|k| u[k]),
+            std::array::from_fn(|k| &rhs[k]),
+        );
+        luma::stack(0, solved.each_ref()).reshape(small)
+    };
+    let steps = 12;
+    for (name, step) in [("stacked", &stacked_step as &dyn Fn(&Array<f32>) -> Array<f32>), ("parts", &parts_step as &dyn Fn(&Array<f32>) -> Array<f32>)] {
+        for seed in [11u64, 12] {
+            let init = || Array::from_slice_on(&ctx, &values(cells * b, seed, -1.0, 1.0), small).unwrap();
+            let mut eager = init();
+            for _ in 0..steps {
+                eager = step(&eager).cache();
+                eager.eval().unwrap();
+            }
+            let mut compiled = compile_until_all(&(init(),), Until::new(steps), |s: &(Array<f32>,), _: &Array<f32>| (step(&s.0),)).unwrap();
+            let run = compiled.run((init(),)).unwrap();
+            assert_eq!(run.steps, steps, "{name}");
+            assert_close(&run.state.0.to_vec().unwrap(), &eager.to_vec().unwrap(), 1e-4, 1e-5);
+        }
+    }
 }
