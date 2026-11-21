@@ -284,3 +284,78 @@ fn operands_or_a_result_split_over_several_buffers_poison_the_result() {
     assert_eq!(chunked(&(&array(8, 16) * 2.0).matmul(&array(16, 8))), None);
     assert_eq!(chunked(&array(8, 16).matmul(&array(16, 9))), Some(false));
 }
+
+/// Small outputs over a long `K` run as skinny kernels (register tiles loaded from global memory,
+/// the `K` shared out between the invocations that own the same outputs): every shape of
+/// invocation tile, tile counts that are and are not a power of two, outputs past a tile, `K`
+/// that does not divide into the slices, and both operands as buffers, views and lazy expressions.
+#[test]
+fn a_small_output_over_a_long_k_matches_the_host_product() {
+    for (k, m, n) in [
+        (1_050_003, 1, 1),
+        (40_000, 1, 40),
+        (30_001, 40, 1),
+        (100_003, 10, 32),
+        (70_001, 64, 64),
+        (20_000, 11, 9),
+        (9_999, 2, 200),
+        (66_000, 130, 70),
+        (65_600, 90, 100),
+        (2_049, 20, 25),
+        (70_000, 10, 256),
+        (1 << 18, 7, 5),
+        (20_000, 100, 3),
+        (6_000, 3_000, 2),
+        (8_195, 1_025, 1),
+        (3_000, 4_097, 8),
+        (2_100, 65, 8),
+    ] {
+        let case = Case::new(k, m, n);
+        let what = format!("k {k} m {m} n {n}");
+        let want = host(&case.a, &case.b, k, m, n);
+        let c = case.lhs().matmul(&case.rhs());
+        assert_eq!(c.shape().dims(), [n, m, 1, 1], "{what}");
+        let got = c.to_vec().unwrap();
+        check(&got, &want, k, &case.a, &case.b, &what);
+        // The sum order is fixed: the same product gives the same bits.
+        assert_eq!(got, case.lhs().matmul(&case.rhs()).to_vec().unwrap(), "{what}: not reproducible");
+        // Operands stored the other way round and read through views.
+        let a_t: Vec<f32> = (0..k * m).map(|i| case.a[(i % m) * k + i / m]).collect();
+        let b_t: Vec<f32> = (0..n * k).map(|i| case.b[(i % k) * n + i / k]).collect();
+        let lhs = Array::from_slice_on(&case.ctx, &a_t, [m, k]).unwrap().transpose();
+        let rhs = Array::from_slice_on(&case.ctx, &b_t, [k, n]).unwrap().transpose();
+        check(&lhs.matmul(&case.rhs()).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} lhs view"));
+        check(&case.lhs().matmul(&rhs).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} rhs view"));
+        check(&lhs.matmul(&rhs).to_vec().unwrap(), &want, k, &case.a, &case.b, &format!("{what} both views"));
+        // Lazy operands.
+        let (a2, b2): (Vec<f32>, Vec<f32>) = (case.a.iter().map(|&x| x * 2.0 + 1.0).collect(), case.b.iter().map(|&x| x * 0.5 - 0.25).collect());
+        let both = (&case.lhs() * 2.0 + 1.0).matmul(&(&case.rhs() * 0.5 - 0.25));
+        check(&both.to_vec().unwrap(), &host(&a2, &b2, k, m, n), k, &a2, &b2, &format!("{what} lazy"));
+    }
+}
+
+/// `onehot(codes)ᵀ X`: the class sums of a Gaussian naive Bayes fit, with the one-hot matrix a lazy
+/// transposed expression that the kernel computes in its loads.
+#[test]
+fn class_sums_through_a_lazy_one_hot_matrix_match_the_host() {
+    for (n, d, classes) in [(100_000usize, 32usize, 10usize), (20_001, 256, 10), (50_000, 7, 3), (30_000, 33, 11)] {
+        let ctx = Context::new().unwrap();
+        let x = values(n * d, 5 + d as u64, -1.0, 1.0);
+        let codes: Vec<u32> = values(n, 6, 0.0, classes as f32).iter().map(|&v| (v as u32).min(classes as u32 - 1)).collect();
+        let xs = Array::from_slice_on(&ctx, &x, [d, n]).unwrap();
+        let labels = Array::<u32>::from_slice_on(&ctx, &codes, [n]).unwrap();
+        let onehot = labels.reshape([1, n]).broadcast_to([classes, n]).eq(Array::<u32>::range_on(&ctx, [classes, n], 0).unwrap()).to_f32();
+        let sums = onehot.transpose().matmul(&xs);
+        assert_eq!(sums.shape().dims(), [d, classes, 1, 1]);
+        let mut want = vec![0.0f64; classes * d];
+        for (i, &c) in codes.iter().enumerate() {
+            for f in 0..d {
+                want[c as usize * d + f] += f64::from(x[i * d + f]);
+            }
+        }
+        let got = sums.to_vec().unwrap();
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!((f64::from(g) - w).abs() <= 1e-3 + 1e-4 * w.abs(), "n {n} d {d}: index {i}: got {g}, want {w}");
+        }
+    }
+}

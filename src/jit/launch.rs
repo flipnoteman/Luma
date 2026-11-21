@@ -1609,6 +1609,15 @@ fn stored_transposed(node: &Node, dims: [u32; 2]) -> bool {
     distance[1].abs() == 1 && distance[0].abs() != 1
 }
 
+/// Whether the elements of the left operand `side` (`[K, M]`) that are neighbours along `K` are
+/// neighbours in memory: false for a view that reads its source transposed.
+pub(crate) fn stored_along_k(side: &MatmulSide, dims: [u32; 2]) -> bool {
+    match side {
+        MatmulSide::Pending(node) => !stored_transposed(node, dims),
+        MatmulSide::Ready(..) => true,
+    }
+}
+
 /// Flattens the operands in `slots` (the lazy ones, by side) into one product program, or `None`
 /// if there are none or they cannot be fused: those that cannot be fused alone (all, if only
 /// together they are too much) are then evaluated into `ready` and the rest is tried again.
@@ -1661,6 +1670,32 @@ fn flatten_operands(
             }
         }
     }
+}
+
+/// Evaluates what a product operand computes, so that a kernel that reads every element many times
+/// (a skinny product, see `matmul::skinny`) loads it from a buffer instead of recomputing it at
+/// each load: `node` itself if it is a pending expression, what it reads if it is a view (which
+/// stays fused: a transposed view of a stored array costs a few index operations). Returns whether
+/// anything was evaluated; a view of a view, or of an array that is stored, is left alone.
+pub(crate) fn evaluate_for_reuse(node: &Arc<Node>) -> Result<bool, Failure> {
+    if !node.is_pending() {
+        return Ok(false);
+    }
+    let target = if node.is_pending_view() {
+        match node.operands() {
+            Some([Src::Node(inner), _, _]) if inner.is_pending() && !matches!(inner.op().kind, OpKind::Shift(ShiftKind::View { .. })) => inner,
+            _ => return Ok(false),
+        }
+    } else {
+        Arc::clone(node)
+    };
+    // An expression of one buffer (the labels of a one-hot matrix) costs about a load per
+    // evaluation, as much as reading it stored; one that reads no buffer costs less.
+    if target.inputs().len() < 2 {
+        return Ok(false);
+    }
+    target.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
+    Ok(true)
 }
 
 /// Records the product of `sides` (`[lhs, rhs]`) into the buffer `out`: one launch of the GEMM

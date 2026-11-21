@@ -11,6 +11,13 @@
 //! long K would leave most of the GPU idle: it is split over K, the slices written to a scratch
 //! buffer by the third grid dimension and summed by a second launch ([`split_of`]).
 //!
+//! Products with a small output and a long K (a Gram matrix, one-hot labels times features, a
+//! gradient `Xᵀ r`, a matrix times a few vectors) have mostly padding in those tiles. They run as
+//! skinny kernels instead ([`skinny_plan`]): each invocation owns up to 10x8 outputs in registers
+//! and loads straight from global memory, without staging or barriers in the loop, and the
+//! invocations the small output does not need take other `k`; a second launch sums the slices of
+//! K as above.
+//!
 //! An operand that is a pending expression is not evaluated first: its program is flattened
 //! into the kernel (`jit::program::Tail::Matmul`), which calls it as `luma_lhs(i)` /
 //! `luma_rhs(i)` where a buffer kernel indexes `a` / `b`. A transposed operand is such an
@@ -45,6 +52,11 @@ pub(crate) enum MatmulTile {
     /// code (see [`native_plan`]), the buffer of an operand holding the matrix transposed if
     /// `lhs_t` / `rhs_t`; its shader is that of `T32` (the bindings), never run.
     Native { edge: u32, lhs_t: bool, rhs_t: bool },
+    /// A small output (see [`skinny_tile`]): each invocation of a workgroup of `width` computes
+    /// `rows` x `cols` outputs straight from global memory, and the `groups` invocations that own
+    /// the same outputs take the `k` in turn. With `along_k` neighbouring invocations take
+    /// neighbouring `k` (the left operand is stored along `K`), else neighbouring output tiles.
+    Skinny { rows: u8, cols: u8, groups: u8, width: u16, along_k: bool },
 }
 
 impl MatmulTile {
@@ -56,6 +68,7 @@ impl MatmulTile {
             MatmulTile::T32x128 => (32, 128),
             MatmulTile::T32 => (32, 32),
             MatmulTile::Native { edge, .. } => (edge, edge),
+            MatmulTile::Skinny { .. } => unreachable!("a skinny product has no output tiles of fixed edges"),
         }
     }
 }
@@ -73,6 +86,33 @@ const SPLIT_MIN_K: u32 = 4096;
 const SPLIT_GROUPS: u32 = 1024;
 /// Smallest K a slice of a split product covers.
 const SPLIT_MIN_SLICE: u32 = 1024;
+
+/// Most outputs of a product that runs as a skinny kernel when its `K` is at least
+/// [`SKINNY_LONG_K`]: a 96x96 Gram matrix over 65536 samples takes 0.29 ms on an RTX 3090 against
+/// 0.38 for the staged tiles, a 128x128 one 0.35 against 0.22.
+const SKINNY_MAX_OUTPUTS: u32 = 9216;
+/// Most outputs for which a `K` of [`SKINNY_MIN_K`] is long enough (a 32x32 product is 2.5x
+/// faster at 4096, 16 x 16 at 1M 2.4x; 64x64 over 16384 is 60% slower).
+const SKINNY_SMALL_OUTPUTS: u32 = 512;
+/// Shortest K of the products with up to [`SKINNY_MAX_OUTPUTS`] outputs.
+const SKINNY_LONG_K: u32 = 65536;
+/// Most outputs of one that reads its left operand along `K` (a matrix times a few vectors).
+const SKINNY_MAX_OUTPUTS_ALONG_K: u32 = 1 << 22;
+/// Shortest K of a skinny product.
+const SKINNY_MIN_K: u32 = 2048;
+/// Workgroups a skinny product aims for: one-hot 1M x 32 on an RTX 3090 takes 0.19 ms with 256 or
+/// 1024, 0.18 with 512, 0.21 with 2048.
+const SKINNY_GROUPS: u32 = 512;
+/// Smallest K a workgroup of a skinny product covers: a 64x64 product over 65536 takes 0.14 ms
+/// with 256 and 0.11 with 128 or 64 (at most 512 workgroups of 256 each otherwise).
+const SKINNY_MIN_SLICE: u32 = 128;
+/// Most accumulators an invocation of a skinny kernel holds.
+const SKINNY_ACCUMULATORS: u32 = 80;
+/// Most `f32` of workgroup memory a skinny kernel's reduction across groups uses (16 KiB, the
+/// smallest limit of the backends).
+const SKINNY_PART: u32 = 4096;
+/// Tiles that read the same operand element from which a pending operand is evaluated first.
+const SKINNY_EVALUATE_READS: u32 = 8;
 
 impl Array<f32> {
     /// The matrix product with `rhs`. `self` has shape `[K, M]`, `rhs` `[N, K]` and the result
@@ -127,11 +167,14 @@ pub fn matmul(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
 struct Plan {
     tile: MatmulTile,
     aligned: bool,
+    /// Whether the kernel writes the slice of its workgroup at `z * M * N` (see [`body`]);
+    /// `slices > 1` unless the kernel always does.
+    split: bool,
     /// Slices of K, 1 if the product is not split.
     slices: u32,
     /// Elements of K per slice (K if not split).
     kc: u32,
-    /// `[column tiles, row tiles, slices]`.
+    /// `[column tiles, row tiles, slices]`; a skinny kernel has `[slices, 1, 1]`.
     groups: [u32; 3],
 }
 
@@ -151,10 +194,93 @@ fn split_of(tiles: u32, k: u32) -> Option<(u32, u32)> {
     (slices >= 2).then_some((slices, kc))
 }
 
-/// The plan of an `m x k` by `k x n` product. `max_groups` is the most workgroups per grid
+/// The skinny kernel of an `m x n` output and the workgroups that cover its tiles: the
+/// invocation tile (at most [`SKINNY_ACCUMULATORS`] outputs, up to 10 rows by 8 columns) that
+/// costs the least per `k`, counting a fused multiply-add as 1 and a load as 2, over all the lanes
+/// of the workgroups.
+///
+/// A workgroup is 64 invocations, or the next power of two of the tiles if there are more (up to
+/// 256); with fewer tiles than that the surplus invocations form groups that take the `k` in turn
+/// (a power of two of them, so that the groups reduce pairwise). `along_k` is for a left operand
+/// stored along `K`: neighbouring invocations then take neighbouring `k` (32 or 64 groups of a
+/// workgroup), and the output tiles are as many workgroups as they need; the right operand is
+/// then read along `K` too if it has at most 8 columns, which is all of them.
+fn skinny_tile(m: u32, n: u32, along_k: bool) -> Option<(MatmulTile, u32)> {
+    let mut best: Option<((u32, u32), (MatmulTile, u32))> = None;
+    let min_cols = if along_k { n } else { 1 };
+    // Memory bound along `K`: a tile of at most 8 rows and 64 outputs, whose right operand's
+    // columns weigh more (each is a load of its own, strided by the columns).
+    let (max_rows, max_outputs) = if along_k { (8, 64) } else { (10, SKINNY_ACCUMULATORS) };
+    for cols in min_cols..=n.min(8) {
+        for rows in 1..=m.min(max_rows) {
+            if rows * cols > max_outputs {
+                continue;
+            }
+            let tiles = m.div_ceil(rows) * n.div_ceil(cols);
+            let (width, groups) = if along_k {
+                (64, if tiles >= 2 { 32 } else { 64 })
+            } else {
+                let width = tiles.next_power_of_two().max(64);
+                if width > 256 {
+                    continue;
+                }
+                (width, 1 << (width / tiles).ilog2())
+            };
+            let tile_groups = tiles.div_ceil(width / groups);
+            if groups > 1 && rows * cols * width / 2 > SKINNY_PART {
+                continue;
+            }
+            let loads = 2 * rows + if along_k && cols > 1 { 2 * cols * cols } else { 2 * cols };
+            let cost = tile_groups * (width / groups) * (rows * cols + loads);
+            let key = (cost, u32::MAX - rows * cols);
+            if best.is_none_or(|(k, _)| key < k) {
+                let tile = MatmulTile::Skinny { rows: rows as u8, cols: cols as u8, groups: groups as u8, width: width as u16, along_k };
+                best = Some((key, (tile, tile_groups)));
+            }
+        }
+    }
+    best.map(|(_, tile)| tile)
+}
+
+/// The plan of a small output over a long K (a Gram matrix, one-hot labels times features, a
+/// gradient `Xᵀ r`, a matrix times a few vectors) as a skinny kernel: `slices` of K, each its
+/// own workgroups, about [`SKINNY_GROUPS`] workgroups in all, no slice shorter than
+/// [`SKINNY_MIN_SLICE`]. `along_k`: the left operand is stored along `K` (see [`skinny_tile`]).
+/// `None` if the product is not of that kind.
+fn skinny_plan(m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes: u64) -> Option<Plan> {
+    let along_k = along_k && n <= 8;
+    let outputs = u64::from(m) * u64::from(n);
+    let few = if along_k {
+        outputs <= u64::from(SKINNY_MAX_OUTPUTS_ALONG_K)
+    } else {
+        outputs <= u64::from(SKINNY_SMALL_OUTPUTS) || (outputs <= u64::from(SKINNY_MAX_OUTPUTS) && k >= SKINNY_LONG_K)
+    };
+    if m == 0 || n == 0 || k < SKINNY_MIN_K || !few {
+        return None;
+    }
+    let (tile, tile_groups) = skinny_tile(m, n, along_k)?;
+    let mut wanted = SKINNY_GROUPS.div_ceil(tile_groups).min(k / SKINNY_MIN_SLICE).clamp(1, max_groups);
+    loop {
+        let kc = k.div_ceil(wanted);
+        let slices = k.div_ceil(kc);
+        if wanted == 1 || u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes {
+            if tile_groups > max_groups {
+                return None;
+            }
+            return Some(Plan { tile, aligned: false, split: true, slices, kc, groups: [slices, tile_groups, 1] });
+        }
+        wanted /= 2;
+    }
+}
+
+/// The plan of an `m x k` by `k x n` product. `along_k`: the left operand's elements along `K` are
+/// neighbours in memory (not a transposed view). `max_groups` is the most workgroups per grid
 /// dimension, `max_bytes` the most a buffer may hold (the split product's partial sums have to
 /// fit one).
-fn plan(m: u32, n: u32, k: u32, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+fn plan(m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    if let Some(plan) = skinny_plan(m, n, k, along_k, max_groups, max_bytes) {
+        return Ok(plan);
+    }
     let tile = match (m >= 128, n >= 128) {
         (true, true) => MatmulTile::T128,
         (true, false) => MatmulTile::T128x32,
@@ -175,7 +301,7 @@ fn plan(m: u32, n: u32, k: u32, max_groups: u32, max_bytes: u64) -> Result<Plan,
     if groups.iter().any(|&count| count > max_groups) {
         return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
     }
-    Ok(Plan { tile, aligned, slices, kc, groups })
+    Ok(Plan { tile, aligned, split: slices > 1, slices, kc, groups })
 }
 
 /// Output tile edges a native product chooses from, largest first (see [`native_plan`]).
@@ -207,7 +333,7 @@ fn native_plan(m: u32, n: u32, k: u32, cores: u32, transposed: [bool; 2], max_gr
     if groups.iter().any(|&count| count > max_groups) {
         return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
     }
-    Ok(Plan { tile: MatmulTile::Native { edge, lhs_t: transposed[0], rhs_t: transposed[1] }, aligned: false, slices, kc, groups })
+    Ok(Plan { tile: MatmulTile::Native { edge, lhs_t: transposed[0], rhs_t: transposed[1] }, aligned: false, split: slices > 1, slices, kc, groups })
 }
 
 /// The operand of a native product that is a transposed view (a swap of axes 0 and 1, see
@@ -323,8 +449,24 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
     let plan = if cores > 0 {
         native_plan(m32, n32, k32, cores, transposed, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     } else {
-        plan(m32, n32, k32, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
+        let along_k = jit::stored_along_k(&sides[0], [k32, m32]);
+        plan(m32, n32, k32, along_k, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     };
+    // A skinny kernel computes a fused operand once per tile that reads it: past a few, storing
+    // the expression first is cheaper.
+    let mut sides = sides;
+    if let MatmulTile::Skinny { rows, cols, .. } = plan.tile {
+        let reads = [n32.div_ceil(u32::from(cols)), m32.div_ceil(u32::from(rows))];
+        let mut evaluated = false;
+        for (array, reads) in [lhs, rhs].into_iter().zip(reads) {
+            if reads >= SKINNY_EVALUATE_READS && let Some(node) = array.pending() {
+                evaluated |= jit::evaluate_for_reuse(node)?;
+            }
+        }
+        if evaluated {
+            sides = [side(ctx, lhs)?, side(rhs.context(), rhs)?];
+        }
+    }
 
     let out = Array::<f32>::alloc(ctx, [n, m, 1, 1].into())?;
     let out_storage = Arc::clone(out.storage()?);
@@ -336,7 +478,7 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
         Some(buffer) => (buffer, u64::from(plan.slices) * out_bytes),
         None => (out_pin.buffer(), out_bytes),
     };
-    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.slices > 1 };
+    let kernel = jit::MatmulKernel { tile: plan.tile, aligned: plan.aligned, split: plan.split };
     jit::matmul(ctx, sides, kernel, [m32, n32, k32, plan.kc], plan.groups, RawArg::write(target, target_bytes))?;
     if let Some(partial) = &partial {
         let sum = ctx.builtin(Builtin::MatmulSum, "f32")?;
@@ -446,6 +588,7 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
         MatmulTile::T128x32 => t128x32(aligned, split, &loads),
         MatmulTile::T32x128 => t32x128(aligned, split, &loads),
         MatmulTile::T32 | MatmulTile::Native { .. } => t32(aligned, split, &loads),
+        MatmulTile::Skinny { rows, cols, groups, width, along_k } => skinny(u32::from(rows), u32::from(cols), u32::from(groups), u32::from(width), along_k, &loads),
     }
 }
 
@@ -874,6 +1017,110 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     )
 }
 
+/// The skinny kernel (`MatmulTile::Skinny`) for products with a small output and a long `K`:
+/// each of the `width` invocations of a workgroup owns `rows` x `cols` outputs in registers and
+/// loads both operands straight from global memory, with neither staging nor barriers in the loop.
+/// The output tiles number `columns * row tiles`; a workgroup covers `width / groups` of them
+/// (grid layer `y` the tiles from `y * width / groups`) and the `groups` invocations that own the
+/// same tile take the `k` of the workgroup's slice in turn (`k = kb + group + groups * i`), then
+/// add their accumulators pairwise through workgroup memory, so that the sums have a fixed order.
+/// The workgroup of grid layer `x` covers `K` from `x * kc` to `min(K, (x + 1) * kc)` and writes its
+/// tiles at `x * M * N`. With `along_k` the invocations of a warp are neighbouring groups, else
+/// neighbouring tiles.
+///
+/// Rows and columns past the output read the last row (column) and are not stored: the loop
+/// carries no bounds checks.
+fn skinny(rows: u32, cols: u32, groups: u32, width: u32, along_k: bool, loads: &Loads) -> String {
+    let per_group = width / groups;
+    let mut decl = String::new();
+    let mut bases = String::new();
+    let mut write = String::new();
+    let mut read = String::new();
+    let mut store = String::new();
+    // Tile `(m0, n0)` owns the rows `m0..m0 + rows` and the columns `n0..n0 + cols`; consecutive
+    // loads of a row of the left operand stored along `M` (or of the right operand) are
+    // neighbours, which the compiler fuses into wide loads.
+    for i in 0..rows {
+        bases += &format!("    let ra{i} = min(m0 + {i}u, p.m - 1u) * p.k;\n");
+    }
+    for j in 0..cols {
+        bases += &format!("    let cb{j} = min(n0 + {j}u, p.n - 1u);\n");
+    }
+    for i in 0..rows {
+        for j in 0..cols {
+            let e = i * cols + j;
+            decl += &format!("    var c{i}_{j} = 0.0;\n");
+            write += &format!("            part[o + {e}u * q] = c{i}_{j};\n");
+            read += &format!("            c{i}_{j} += part[o + {e}u * q];\n");
+            store += &format!("    if (g == 0u && live && m0 + {i}u < p.m && n0 + {j}u < p.n) {{ c[ob + {i}u * p.n + {j}u] = c{i}_{j}; }}\n");
+        }
+    }
+    // One `k` of this invocation: all the loads first, then the multiply-adds.
+    let mut step = String::from("        let kn = k * p.n;\n");
+    for i in 0..rows {
+        step += &format!("        let a{i} = {};\n", loads.lhs(&format!("ra{i} + k")));
+    }
+    for j in 0..cols {
+        step += &format!("        let b{j} = {};\n", loads.rhs(&format!("kn + cb{j}")));
+    }
+    for i in 0..rows {
+        for j in 0..cols {
+            step += &format!("        c{i}_{j} = fma(a{i}, b{j}, c{i}_{j});\n");
+        }
+    }
+    // Workgroup memory of the reduction, slot `e` of the accumulators of group `g` (of those that
+    // write, `g - s`) and tile `tl`: neighbouring invocations write neighbouring words.
+    let (layout, group) = if along_k {
+        ("tl * s + (g - s)".to_owned(), "tl * s + g".to_owned())
+    } else {
+        (format!("(g - s) * {per_group}u + tl"), format!("g * {per_group}u + tl"))
+    };
+    let (part, reduce) = if groups > 1 {
+        (
+            format!("var<workgroup> part: array<f32, {}>;\n", rows * cols * width / 2),
+            format!(
+                "    for (var s = {}u; s > 0u; s = s / 2u) {{
+        let q = s * {per_group}u;
+        if (g >= s && g < 2u * s) {{
+            let o = {layout};
+{write}        }}
+        workgroupBarrier();
+        if (g < s) {{
+            let o = {group};
+{read}        }}
+        workgroupBarrier();
+    }}
+",
+                groups / 2
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let lanes = if along_k { format!("let g = tid % {groups}u;\n    let tl = tid / {groups}u;") } else { format!("let g = tid / {per_group}u;\n    let tl = tid % {per_group}u;") };
+    format!(
+        "{part}
+@compute @workgroup_size({width})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) tid: u32) {{
+    let columns = (p.n + {}u) / {cols}u;
+    let tiles = columns * ((p.m + {}u) / {rows}u);
+    {lanes}
+    let tile = wid.y * {per_group}u + tl;
+    let live = tile < tiles;
+    let m0 = (tile / columns) * {rows}u;
+    let n0 = (tile % columns) * {cols}u;
+    let kb = wid.x * p.kc;
+    let ke = min(p.k, kb + p.kc);
+    let ob = wid.x * p.m * p.n + m0 * p.n + n0;
+{bases}{decl}    for (var k = select(ke, kb + g, live); k < ke; k += {groups}u) {{
+{step}    }}
+{reduce}{store}}}
+",
+        cols - 1,
+        rows - 1
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,24 +1144,57 @@ mod tests {
 
     #[test]
     fn the_plan_picks_the_tile_alignment_and_grid() {
-        let p = plan(1024, 2048, 1024, 65535, u64::MAX).unwrap();
+        let p = plan(1024, 2048, 1024, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T128, true, 1, [16, 8, 1]));
-        let p = plan(1000, 1000, 1000, 65535, u64::MAX).unwrap();
+        let p = plan(1000, 1000, 1000, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.aligned, p.groups), (MatmulTile::T128, false, [8, 8, 1]));
-        let p = plan(64, 64, 1 << 20, 65535, u64::MAX).unwrap();
-        assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T32, true, 256, [2, 2, 256]));
-        // The partial sums must fit a buffer.
-        assert_eq!(plan(64, 64, 1 << 20, 65535, 1000).unwrap().slices, 1);
+        let p = plan(64, 64, 1024, false, 65535, u64::MAX).unwrap();
+        assert_eq!((p.tile, p.aligned, p.slices, p.groups), (MatmulTile::T32, true, 1, [2, 2, 1]));
         // Tall products stay on the rectangular tile; the grid folds once row tiles exceed it.
-        let p = plan(1 << 22, 8, 16, 65535, u64::MAX).unwrap();
+        let p = plan(1 << 22, 8, 16, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.groups), (MatmulTile::T128x32, [1, 1 << 15, 1]));
-        let p = plan(8, 1 << 22, 16, 65535, u64::MAX).unwrap();
+        let p = plan(8, 1 << 22, 16, false, 65535, u64::MAX).unwrap();
         assert_eq!((p.tile, p.groups), (MatmulTile::T32x128, [1 << 15, 1, 1]));
-        let p = plan(1 << 22, 1 << 6, 16, 65535, u64::MAX).unwrap();
+        let p = plan(1 << 22, 1 << 6, 16, false, 65535, u64::MAX).unwrap();
         assert_eq!(p.tile, MatmulTile::T128x32);
-        let p = plan(1 << 22, 8, 16, 1 << 12, u64::MAX).unwrap();
+        let p = plan(1 << 22, 8, 16, false, 1 << 12, u64::MAX).unwrap();
         assert!(p.groups[0] * p.groups[1] >= 1 << 15);
-        assert!(plan(1 << 22, 64, 16, 65535, u64::MAX).is_ok());
+        assert!(plan(1 << 22, 64, 16, false, 65535, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn a_small_output_over_a_long_k_is_a_skinny_product() {
+        let skinny = |m, n, k, along_k, max_bytes| plan(m, n, k, along_k, 65535, max_bytes).unwrap();
+        // One-hot labels times 32 features: 4 tiles of 10x8, 16 groups of them in a workgroup.
+        let p = skinny(10, 32, 1_000_000, false, u64::MAX);
+        assert_eq!(p.tile, MatmulTile::Skinny { rows: 10, cols: 8, groups: 16, width: 64, along_k: false });
+        assert!(p.split && !p.aligned && p.groups[1] == 1 && p.groups[0] == p.slices && p.slices * p.kc >= 1_000_000);
+        // A Gram matrix of 64 features: 64 tiles of 8x8, one group.
+        let p = skinny(64, 64, 1 << 20, false, u64::MAX);
+        assert_eq!(p.tile, MatmulTile::Skinny { rows: 8, cols: 8, groups: 1, width: 64, along_k: false });
+        // A dot product: one tile, every invocation of the workgroup a group.
+        let p = skinny(1, 1, 1 << 20, true, u64::MAX);
+        assert_eq!(p.tile, MatmulTile::Skinny { rows: 1, cols: 1, groups: 64, width: 64, along_k: true });
+        // Slices are whole `k` and none is empty.
+        for (m, n, k) in [(10, 32, 100_003), (1, 1, 2048), (64, 64, 70_000), (33, 7, 1 << 20), (2000, 1, 70_001)] {
+            for along_k in [false, true] {
+                let p = skinny(m, n, k, along_k, u64::MAX);
+                assert!(matches!(p.tile, MatmulTile::Skinny { .. }), "{m} {n} {k}");
+                assert_eq!(p.slices, k.div_ceil(p.kc), "no empty slice");
+                assert!(p.slices >= 1 && p.groups[0] == p.slices);
+            }
+        }
+        // The partial sums must fit a buffer.
+        assert_eq!(skinny(64, 64, 1 << 20, false, 1000).slices, 1);
+        // A matrix times a vector reads the matrix along `K`: its row tiles are workgroups.
+        let p = skinny(8192, 1, 8192, true, u64::MAX);
+        assert!(matches!(p.tile, MatmulTile::Skinny { along_k: true, .. }));
+        assert!(p.groups[1] > 1);
+        // Not skinny: too short, or too many outputs.
+        assert!(!matches!(skinny(10, 32, 1000, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(!matches!(skinny(256, 256, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(!matches!(skinny(64, 64, 16384, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(!matches!(skinny(128, 128, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
     }
 
     fn native(edge: u32) -> MatmulTile {
