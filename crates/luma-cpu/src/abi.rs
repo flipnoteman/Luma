@@ -118,7 +118,27 @@ pub struct CpuMathTable {
     pub log2: extern "C" fn(f64) -> f64,
     pub pow: extern "C" fn(f64, f64) -> f64,
     pub atan2: extern "C" fn(f64, f64) -> f64,
+    /// Four-lane `f32` routines taking and returning one packet (`xmm0`), see [`crate::vecmath`].
+    #[cfg(all(target_arch = "x86_64", unix))]
+    pub packet: PacketMath,
 }
+
+/// One `extern "C" fn(__m128) -> __m128` per vectorised `f32` function.
+#[cfg(all(target_arch = "x86_64", unix))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PacketMath {
+    pub sinf: PacketFn,
+    pub cosf: PacketFn,
+    pub tanhf: PacketFn,
+    pub expf: PacketFn,
+    pub exp2f: PacketFn,
+    pub logf: PacketFn,
+    pub log2f: PacketFn,
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+pub type PacketFn = extern "C" fn(std::arch::x86_64::__m128) -> std::arch::x86_64::__m128;
 
 impl CpuMathTable {
     pub const OFFSET_SINF: i32 = offset_of!(Self, sinf) as i32;
@@ -147,6 +167,30 @@ impl CpuMathTable {
     pub const OFFSET_LOG2: i32 = offset_of!(Self, log2) as i32;
     pub const OFFSET_POW: i32 = offset_of!(Self, pow) as i32;
     pub const OFFSET_ATAN2: i32 = offset_of!(Self, atan2) as i32;
+
+    /// Offset of the packet (four-lane) `f32` routine replacing the scalar one at `scalar_off32`,
+    /// if there is one on this target.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    pub fn packet_offset(scalar_off32: i32) -> Option<i32> {
+        let base = offset_of!(Self, packet);
+        let f = |o: usize| Some((base + o) as i32);
+        match scalar_off32 {
+            Self::OFFSET_SINF => f(offset_of!(PacketMath, sinf)),
+            Self::OFFSET_COSF => f(offset_of!(PacketMath, cosf)),
+            Self::OFFSET_TANHF => f(offset_of!(PacketMath, tanhf)),
+            Self::OFFSET_EXPF => f(offset_of!(PacketMath, expf)),
+            Self::OFFSET_EXP2F => f(offset_of!(PacketMath, exp2f)),
+            Self::OFFSET_LOGF => f(offset_of!(PacketMath, logf)),
+            Self::OFFSET_LOG2F => f(offset_of!(PacketMath, log2f)),
+            _ => None,
+        }
+    }
+
+    /// No packet routines on this target: every call is one scalar call per lane.
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    pub fn packet_offset(_scalar_off32: i32) -> Option<i32> {
+        None
+    }
 }
 
 /// Static math dispatch table shared across all workgroup invocations.
@@ -177,6 +221,16 @@ pub static MATH_TABLE: CpuMathTable = CpuMathTable {
     log2: math_log2,
     pow: math_pow,
     atan2: math_atan2,
+    #[cfg(all(target_arch = "x86_64", unix))]
+    packet: PacketMath {
+        sinf: crate::vecmath::sinf4,
+        cosf: crate::vecmath::cosf4,
+        tanhf: crate::vecmath::tanhf4,
+        expf: crate::vecmath::expf4,
+        exp2f: crate::vecmath::exp2f4,
+        logf: crate::vecmath::logf4,
+        log2f: crate::vecmath::log2f4,
+    },
 };
 
 /// Context pointer passed as the sole argument (`r0`/`rdi`/`rcx`) to every compiled workgroup.
