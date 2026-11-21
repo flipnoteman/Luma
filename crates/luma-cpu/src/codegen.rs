@@ -26,7 +26,7 @@ use luma_core::kir::{
     IrTernaryOp, IrUnOp, KernelModule, KirType, LValue, LocalId, ScalarTy, Stmt, StructDecl,
     SwitchCase, walk_stmts,
 };
-use luma_core::{BackendError, NativeKernel};
+use luma_core::{BackendError, BindingKind, NativeKernel};
 
 use crate::abi::{CpuMathTable, CpuPlan, PhaseStmt, WorkgroupCtx};
 use crate::exec::{CostHint, ExecBlob};
@@ -86,9 +86,12 @@ pub fn host_isa_key() -> String {
     ISA_KEY.clone()
 }
 
+/// Kernels with more IR instructions than this skip Cranelift's optimiser to keep compile time down.
+const FAST_COMPILE_INSTS: usize = 16_000;
+
 /// Revision of the generated code, part of the disk-cache key: bump it whenever the code this
 /// module generates for the same kernel changes, so cached blobs from older builds are not reused.
-pub(crate) const REVISION: u32 = 2;
+pub(crate) const REVISION: u32 = 4;
 
 // ---------------------------------------------------------------------------------------------
 // Memory flags
@@ -400,7 +403,9 @@ pub fn compile(
         lower.b.finalize(isa.frontend_config());
     }
 
-    let target_isa = if func.dfg.num_insts() > 2500 {
+    // Optimised compilation costs about 2.5x the unoptimised one (35 ms against 10 ms at 10k
+    // instructions), well worth it for the faster code except for the largest kernels.
+    let target_isa = if func.dfg.num_insts() > FAST_COMPILE_INSTS {
         ISA_FAST.as_ref().map_err(Clone::clone)?
     } else {
         isa
@@ -448,6 +453,9 @@ struct Lower<'a, 'f> {
     sigs: HashMap<(u8, bool), SigRef>,
     /// Byte length (i64) of each storage binding pointer produced by `binding_ptr`.
     limits: HashMap<Value, Value>,
+    /// Loads of `load_leaf` read a binding nothing writes during the launch (a uniform), so
+    /// they may be shared and hoisted.
+    ro_loads: bool,
 }
 
 impl<'a, 'f> Lower<'a, 'f> {
@@ -493,6 +501,7 @@ impl<'a, 'f> Lower<'a, 'f> {
             phase_loops: Vec::new(),
             sigs: HashMap::new(),
             limits: HashMap::new(),
+            ro_loads: false,
         }
     }
 
@@ -2381,11 +2390,12 @@ impl<'a, 'f> Lower<'a, 'f> {
 
     fn load_leaf(&mut self, s: ScalarTy, addr: Value, at: u32) -> Value {
         let at = at as i32;
+        let flags = if self.ro_loads { mf_ro() } else { mf() };
         match s {
-            ScalarTy::F64 => self.b.ins().load(types::F64, mf(), addr, at),
-            ScalarTy::F32 => self.b.ins().load(types::F32, mf(), addr, at),
-            ScalarTy::F16 => self.b.ins().uload16(types::I32, mf(), addr, at),
-            _ => self.b.ins().load(types::I32, mf(), addr, at),
+            ScalarTy::F64 => self.b.ins().load(types::F64, flags, addr, at),
+            ScalarTy::F32 => self.b.ins().load(types::F32, flags, addr, at),
+            ScalarTy::F16 => self.b.ins().uload16(types::I32, flags, addr, at),
+            _ => self.b.ins().load(types::I32, flags, addr, at),
         }
     }
 
@@ -2503,6 +2513,8 @@ impl<'a, 'f> Lower<'a, 'f> {
         } else {
             self.lane_gather(base, off, dyns, extent, &accs, cur)
         };
+        // Without a per-lane index every lane read the same address.
+        let kind = if dyns.is_empty() { Kind::Uni } else { Kind::Gen };
         let mut leaves = Vec::with_capacity(accs.len());
         let mut k = 0;
         for acc in &accs {
@@ -2517,7 +2529,7 @@ impl<'a, 'f> Lower<'a, 'f> {
                         s: acc.s,
                         a: m,
                         b: None,
-                        k: Kind::Gen,
+                        k: kind,
                     }
                 }
                 ScalarTy::F16 => {
@@ -2526,14 +2538,14 @@ impl<'a, 'f> Lower<'a, 'f> {
                         s: acc.s,
                         a: f,
                         b: None,
-                        k: Kind::Gen,
+                        k: kind,
                     }
                 }
                 s => Leaf {
                     s,
                     a,
                     b,
-                    k: Kind::Gen,
+                    k: kind,
                 },
             };
             leaves.push(leaf);
@@ -2630,13 +2642,34 @@ impl<'a, 'f> Lower<'a, 'f> {
         self.b.ins().iadd(base, e)
     }
 
-    /// `binding[idx]` with 128-bit loads when the index is contiguous across the packet.
+    /// `binding[idx]` with 128-bit loads when the index is contiguous across the packet: known
+    /// to be, or (for an index the codegen could not follow, such as a clamped or wrapped one)
+    /// checked at run time, with the lane-by-lane gather as the fallback.
     fn load_elem(&mut self, base: Value, idx: Leaf, stride: u32, ty: &KirType) -> Val {
-        let Some(s) = Self::contig_scalar(ty, stride).filter(|_| idx.k == Kind::Lin) else {
+        let Some(s) = Self::contig_scalar(ty, stride) else {
             return self.mem_read(base, 0, &[(idx.a, stride)], ty);
         };
+        if idx.k == Kind::Uni {
+            return self.mem_read(base, 0, &[(idx.a, stride)], ty);
+        }
+        let mut cond = self.fast_cond(base, idx);
+        match idx.k {
+            Kind::Lin | Kind::Uni => {}
+            Kind::Gen => {
+                let e0 = self.b.ins().extractlane(idx.a, 0u8);
+                let first = self.b.ins().splat(I32X4, e0);
+                let io = self.iota();
+                let want = self.b.ins().iadd(first, io);
+                let same = self.b.ins().icmp(IntCC::Equal, idx.a, want);
+                let ok = self.b.ins().vall_true(same);
+                cond = Some(match cond {
+                    Some(c) => self.b.ins().band(c, ok),
+                    None => ok,
+                });
+            }
+        }
         let vt = vty(s);
-        let Some(cond) = self.fast_cond(base, idx) else {
+        let Some(cond) = cond else {
             let addr = self.contig_addr(base, idx);
             let a = self.b.ins().load(vt, mf(), addr, 0);
             return self.scalar_val(s, self.lf(s, a));
@@ -2887,7 +2920,22 @@ impl<'a, 'f> Lower<'a, 'f> {
                 let start = self.storage_start_ty(*binding);
                 let (off, dyns, _) = self.mem_path(&start, &steps);
                 match self.binding_ptr(*binding) {
-                    Some(base) => self.mem_read(base, off, &dyns, ty),
+                    Some(base) => {
+                        // A uniform is bound in storage padded to the declared size of its type,
+                        // so a constant path inside the type needs no bounds check.
+                        let d = &self.module.bindings[*binding as usize];
+                        let inside = d.kind == BindingKind::Uniform
+                            && dyns.is_empty()
+                            && d.min_size.is_some_and(|m| off.saturating_add(ty.layout(self.structs()).0) <= m);
+                        let lim = if inside { self.limits.remove(&base) } else { None };
+                        self.ro_loads = inside;
+                        let v = self.mem_read(base, off, &dyns, ty);
+                        self.ro_loads = false;
+                        if let Some(lim) = lim {
+                            self.limits.insert(base, lim);
+                        }
+                        v
+                    }
                     None => self.zero_val(ty),
                 }
             }
@@ -3024,10 +3072,16 @@ impl<'a, 'f> Lower<'a, 'f> {
         });
         let exec = self.exec();
         let parent_full = self.is_full();
-        let mut has_ret = false;
+        let mut returns = 0;
         walk_stmts(&callee.body, &mut |s| {
-            has_ret |= matches!(s, Stmt::Return(_))
+            returns += usize::from(matches!(s, Stmt::Return(_)))
         });
+        // A function whose only `return` ends its body hands back the value as it is: no lane
+        // returned earlier, and the lanes of a masked-off caller are never looked at.
+        let tail = match callee.body.split_last() {
+            Some((Stmt::Return(Some(e)), head)) if returns == 1 => Some((e, head)),
+            _ => None,
+        };
         self.frames.push(Frame {
             locals,
             params: argv,
@@ -3035,10 +3089,22 @@ impl<'a, 'f> Lower<'a, 'f> {
             entry: false,
         });
         self.push_scope(exec, ScopeKind::CallRoot);
-        self.scopes.last_mut().unwrap().full = parent_full && !has_ret;
-        self.stmts(&callee.body);
+        self.scopes.last_mut().unwrap().full = parent_full && (returns == 0 || tail.is_some());
+        let tail_val = match tail {
+            Some((e, head)) => {
+                self.stmts(head);
+                Some(self.expr(e))
+            }
+            None => {
+                self.stmts(&callee.body);
+                None
+            }
+        };
         self.scopes.pop();
         let frame = self.frames.pop().unwrap();
+        if let Some(v) = tail_val {
+            return v;
+        }
         match frame.ret {
             Some((rty, scs, vars)) => {
                 let mut leaves = Vec::with_capacity(vars.len());
