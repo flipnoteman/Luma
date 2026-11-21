@@ -891,6 +891,9 @@ mod tests {
         // Stacked blocks too.
         assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, false), plan(8, false, false));
         assert_eq!(thomas_plan(&nvidia, 4, 1024, 187, false), plan(8, false, true));
+        // Stacked scalars are the parts layout: the same plan.
+        assert_eq!(thomas_plan(&nvidia, 1, 4096, 4096, false), plan(32, false, true));
+        assert_eq!(thomas_plan(&nvidia, 1, 4096, 1, false), plan(8, false, true));
         // Many lines: the plain solve.
         assert_eq!(thomas_plan(&nvidia, 4, 13090, 8, true), plan(32, false, false));
         // Other devices keep the old rule.

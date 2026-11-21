@@ -1564,17 +1564,30 @@ const TWISTED_LINES: u32 = 8192;
 /// stride of 16 a warp's cells are in runs of too few neighbours (strides 2, 4, 8: tiled 1.5x,
 /// 1.6x, 1.03x slower).
 ///
-/// Stacked blocks (`parts` false) keep the narrow workgroups and the scratch of one cell after
-/// the other: their coefficients are read `block^2` floats apart per cell, so a warp's loads do
-/// not coalesce whatever the workgroup, and the wide tiled solve was 1.1x to 1.3x slower on
-/// `bench_solve --only sweep/` (blocks of 2 to 5, 100 to 1024 strided lines of 32 to 1024 cells).
+/// Stacked blocks of 2 or more (`parts` false) keep the narrow workgroups and the scratch of one
+/// cell after the other: their coefficients are read `block^2` floats apart per cell, so a
+/// warp's loads do not coalesce whatever the workgroup, and the wide tiled solve was 1.1x to
+/// 1.3x slower on `bench_solve --only sweep/` (blocks of 2 to 5, 100 to 1024 strided lines of 32
+/// to 1024 cells). Stacked scalars are the parts layout (one float per cell and coefficient), so
+/// they take the parts plan: a warp of 32 on strided axes (RTX 3090, 4096x4096 along the strided
+/// axis, `tri/solve_axis1`: 8 invocations twisted 1.96 ms, a warp 1.74 with one row at a time;
+/// 4096 lines of 200 cells, `sweep/b1_4096x200_axis2`: 84 us -> 44 us, with four rows loaded
+/// together 0.89 ms and 42 us; `cfd/lines/few_b1` 4096x200:j 88 -> 45 us).
+///
+/// The rows of a chunk (see [`thomas_rows`]) load before the first of them is eliminated: one
+/// memory round trip per four rows instead of per row (scalar `tri/solve_axis1` 1.96 -> 0.89 ms
+/// with the wide plan, 170 -> 370 GB/s; `tri/block4_axis1` 1.14 -> 0.68 ms; 1024x1024 stacked
+/// 4x4 along axis 1 1121 -> 676 us, along axis 2 709 -> 517 us; parts of 4x4 blocks, 700x512
+/// along j, 414 -> 328 us; `cfd/implicit/2d_step` 700x512 1.99 -> 1.56 ms). The 4x4 solve of
+/// 256x64x48 lines along j and k lost 5 to 10 % (383 -> 424 us), along i it won (730 -> 630 us).
 pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, parts: bool) -> ThomasPlan {
     if tuning.profile == TuningProfile::Cpu {
         return ThomasPlan { workgroup: tuning.elementwise_workgroup as u8, tiled: false, twisted: false };
     }
     // Few lines of small blocks: latency bound (see above), two invocations per line win.
     let twisted = block <= TWISTED_BLOCK && lines < TWISTED_LINES;
-    if parts && tuning.line_strided_from > 0 && stride >= tuning.line_strided_from && block <= UNROLLED_BLOCK {
+    // Scalar systems are laid out like parts (see below), so the same plan serves them.
+    if (parts || block == 1) && tuning.line_strided_from > 0 && stride >= tuning.line_strided_from && block <= UNROLLED_BLOCK {
         let wanted = match block {
             1 => 32,
             2 => 128,
@@ -1705,6 +1718,29 @@ fn eliminate(src: &mut String, ind: &str, b: usize, w: usize) {
     }
 }
 
+/// Rows of a Thomas sweep whose loads issue together.
+const SWEEP_ROWS: usize = 4;
+
+/// The rows of a Thomas sweep whose loads issue together (forward sweep, back substitution) for
+/// `b`-blocks, see [`tridiagonal_body`]: [`SWEEP_ROWS`] for the scalar and the 4x4 solve, one row
+/// (loads and elimination row by row) for the others. Measured on an RTX 3090 (all block sizes
+/// at 1, 2, 4 and 8 rows, the forward sweep and the back substitution alike): blocks of 2, 3 and
+/// 5 gained nothing measurable (their strided solves have enough warps to hide the loads, or
+/// too many registers: 5x5 with 2 or 3 rows was 0 to 20 % slower), scalars and 4x4 blocks gained
+/// up to 1.7x (see [`thomas_plan`]); 8 rows spilled 4x4 blocks (1.1 -> 1.5 ms, 4096 lines of
+/// 1024 cells) and gained 8 % more on scalars only.
+fn thomas_rows(b: usize) -> usize {
+    match b {
+        1 | 4 => SWEEP_ROWS,
+        _ => 1,
+    }
+}
+
+/// The loops of a sweep in chunks of `rows` rows: the chunks, then the remaining rows one by one.
+fn rows_passes(rows: usize) -> Vec<usize> {
+    if rows > 1 { vec![rows, 1] } else { vec![1] }
+}
+
 /// The entry point of the straight-line Thomas solve of `systems` systems of `b`-blocks, reading
 /// and writing through `io`, after the bindings and `Params` (see [`tridiagonal_header`]; the
 /// scratch `cp` holds `b * b` floats per cell and system: entry `k` of cell `q` at `q * b * b + k`,
@@ -1740,9 +1776,10 @@ pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io
         ("p.lines".to_owned(), "    let sys = 0u;\n", "lg", "0u".to_owned())
     };
     let mut src = String::from("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
-    // The index of entry `k` of the scratch of cell `q`, from `cq` (see above).
-    let cp_at = |k: usize| if tiled { format!("cq + {}u", 32 * k) } else { format!("cq + {k}u") };
-    let cq_expr = if tiled { format!("so + (q >> 5u) * {}u + (q & 31u)", 32 * bb) } else { format!("so + q * {bb}u") };
+    // The index of entry `k` of the scratch of cell `cq` (see above), and `cq` of cell `q`.
+    let cp_at = |cq: &str, k: usize| if tiled { format!("{cq} + {}u", 32 * k) } else { format!("{cq} + {k}u") };
+    let cq_of = |q: &str| if tiled { format!("so + ({q} >> 5u) * {}u + ({q} & 31u)", 32 * bb) } else { format!("so + {q} * {bb}u") };
+    let rows = thomas_rows(b);
     let (exchange, side, step) = if twisted { (format!("var<workgroup> xch: array<f32, {}>;\n", wg * st as u32), format!("tid / {hb}u"), 2) } else { (String::new(), "0u".to_owned(), 1) };
     let _ = write!(
         src,
@@ -1784,62 +1821,94 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
         let _ = writeln!(src, "    var pd{i} = 0.0;");
     }
-    // The sweep of this invocation's half: A from `s0` down, B from `n - 1` up. The block that
-    // the row's right-hand block is taken from (A: `up`, B: `lo`) is read always, the one that
-    // couples to the previous row of the sweep (A: `lo`, B: `up`) from the second row on.
-    let _ = write!(src, "    for (var k = 0u; k < nrows; k++) {{\n        let s = select(s0 + k, p.n - 1u - k, side == 1u);\n        let q = base + s * p.stride;\n        let cq = {cq_expr};\n");
-    src.push_str(&io.load_core("        ", "q"));
-    for i in 0..b {
-        for j in 0..b {
-            let _ = writeln!(src, "        var m{i}{j} = {};\n        var r{i}{j} = 0.0;\n        var l{i}{j} = 0.0;", io.diag("q", i * b + j));
-        }
-        let _ = writeln!(src, "        var r{i}{b} = {};", io.rhs("q", i));
-    }
-    for (id, own, other) in [(0, "up", "lo"), (1, "lo", "up")].into_iter().take(if twisted { 2 } else { 1 }) {
-        let load = |name: &str, ind: &str| if name == "up" { io.load_up(ind, "q") } else { io.load_lo(ind, "q") };
-        let entry = |name: &str, k: usize| if name == "up" { io.up("q", k) } else { io.lo("q", k) };
-        let head = if !twisted { "        {" } else if id == 0 { "        if" } else { " else if" };
-        if twisted {
-            let _ = writeln!(src, "{head} (side == {id}u) {{");
-        } else {
-            let _ = writeln!(src, "{head}");
-        }
-        src.push_str(&load(own, "            "));
-        for i in 0..b {
-            for j in 0..b {
-                let _ = writeln!(src, "            r{i}{j} = {};", entry(own, i * b + j));
+    // The sweep of this invocation's half: A from `s0` down, B from `n - 1` up, in chunks of
+    // `rows` rows whose loads all issue before the chain of their eliminations (a row's loads
+    // do not depend on the sweep: each row would otherwise wait a memory round trip of its own).
+    // The block that the row's right-hand block is taken from (A: `up`, B: `lo`) is read always,
+    // the one that couples to the previous row of the sweep (A: `lo`, B: `up`) from the second
+    // row on.
+    src.push_str("    var kf = 0u;\n");
+    for rows in rows_passes(rows) {
+        let head = if rows > 1 { format!("(; kf + {rows}u <= nrows; kf += {rows}u)") } else { "(; kf < nrows; kf++)".to_owned() };
+        let _ = writeln!(src, "    for {head} {{");
+        for j in 0..rows {
+            let (jo, q) = (io.slot(j), format!("q{j}"));
+            let _ = writeln!(src, "        let k{j} = kf + {j}u;\n        let sr{j} = select(s0 + k{j}, p.n - 1u - k{j}, side == 1u);\n        let {q} = base + sr{j} * p.stride;\n        let cq{j} = {};", cq_of(&q));
+            src.push_str(&jo.load_core("        ", &q));
+            for i in 0..b {
+                for c in 0..b {
+                    let _ = writeln!(src, "        let ldm{i}{c}_{j} = {};\n        var ldr{i}{c}_{j} = 0.0;\n        var ldl{i}{c}_{j} = 0.0;", jo.diag(&q, i * b + c));
+                }
+                let _ = writeln!(src, "        let ldb{i}_{j} = {};", jo.rhs(&q, i));
             }
-        }
-        src.push_str("            if (k > 0u) {\n");
-        src.push_str(&load(other, "                "));
-        for i in 0..b {
-            for j in 0..b {
-                let _ = writeln!(src, "                l{i}{j} = {};", entry(other, i * b + j));
+            for (id, own, other) in [(0, "up", "lo"), (1, "lo", "up")].into_iter().take(if twisted { 2 } else { 1 }) {
+                let load = |name: &str, ind: &str| if name == "up" { jo.load_up(ind, &q) } else { jo.load_lo(ind, &q) };
+                let entry = |name: &str, k: usize| if name == "up" { jo.up(&q, k) } else { jo.lo(&q, k) };
+                let head = if !twisted { "        {" } else if id == 0 { "        if" } else { " else if" };
+                if twisted {
+                    let _ = writeln!(src, "{head} (side == {id}u) {{");
+                } else {
+                    let _ = writeln!(src, "{head}");
+                }
+                src.push_str(&load(own, "            "));
+                for i in 0..b {
+                    for c in 0..b {
+                        let _ = writeln!(src, "            ldr{i}{c}_{j} = {};", entry(own, i * b + c));
+                    }
+                }
+                let first = j == 0;
+                if first {
+                    src.push_str("            if (kf > 0u) {\n");
+                }
+                src.push_str(&load(other, "                "));
+                for i in 0..b {
+                    for c in 0..b {
+                        let _ = writeln!(src, "                ldl{i}{c}_{j} = {};", entry(other, i * b + c));
+                    }
+                }
+                if first {
+                    src.push_str("            }\n");
+                }
+                src.push_str("        }");
             }
+            src.push('\n');
         }
-        src.push_str("            }\n        }");
-    }
-    src.push('\n');
-    src.push_str("        if (k > 0u) {\n");
-    for i in 0..b {
-        for j in 0..b {
-            let sum = (0..b).map(|k| format!("l{i}{k} * pc{k}{j}")).collect::<Vec<_>>().join(" + ");
-            let _ = writeln!(src, "            m{i}{j} -= {sum};");
+        for j in 0..rows {
+            src.push_str("        {\n");
+            for i in 0..b {
+                for c in 0..b {
+                    let _ = writeln!(src, "            var m{i}{c} = ldm{i}{c}_{j};\n            var r{i}{c} = ldr{i}{c}_{j};");
+                }
+                let _ = writeln!(src, "            var r{i}{b} = ldb{i}_{j};");
+            }
+            if j == 0 {
+                src.push_str("            if (kf > 0u) {\n");
+            }
+            let ind = if j == 0 { "                " } else { "            " };
+            for i in 0..b {
+                for c in 0..b {
+                    let sum = (0..b).map(|k| format!("ldl{i}{k}_{j} * pc{k}{c}")).collect::<Vec<_>>().join(" + ");
+                    let _ = writeln!(src, "{ind}m{i}{c} -= {sum};");
+                }
+                let sum = (0..b).map(|k| format!("ldl{i}{k}_{j} * pd{k}")).collect::<Vec<_>>().join(" + ");
+                let _ = writeln!(src, "{ind}r{i}{b} -= {sum};");
+            }
+            if j == 0 {
+                src.push_str("            }\n");
+            }
+            eliminate(&mut src, "            ", b, w);
+            for i in 0..b {
+                for c in 0..b {
+                    let _ = writeln!(src, "            cp[{}] = r{i}{c};\n            pc{i}{c} = r{i}{c};", cp_at(&format!("cq{j}"), i * b + c));
+                }
+                let _ = writeln!(src, "            pd{i} = r{i}{b};");
+            }
+            let swept: Vec<String> = (0..b).map(|i| format!("r{i}{b}")).collect();
+            src.push_str(&io.store("            ", &format!("q{j}"), &swept));
+            src.push_str("        }\n");
         }
-        let sum = (0..b).map(|k| format!("l{i}{k} * pd{k}")).collect::<Vec<_>>().join(" + ");
-        let _ = writeln!(src, "            r{i}{b} -= {sum};");
+        src.push_str("    }\n");
     }
-    src.push_str("        }\n");
-    eliminate(&mut src, "        ", b, w);
-    for i in 0..b {
-        for j in 0..b {
-            let _ = writeln!(src, "        cp[{}] = r{i}{j};\n        pc{i}{j} = r{i}{j};", cp_at(i * b + j));
-        }
-        let _ = writeln!(src, "        pd{i} = r{i}{b};");
-    }
-    let swept: Vec<String> = (0..b).map(|i| format!("r{i}{b}")).collect();
-    src.push_str(&io.store("        ", "q", &swept));
-    src.push_str("    }\n");
     // The solution of a one row line (or of the whole line's last row) is its swept right-hand
     // side, still in `pd`.
     let write_x = |src: &mut String| {
@@ -1882,22 +1951,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         write_x(&mut src);
         src.push_str("    var back = 0u;\n    if (busy) { back = mid - s0; }\n");
     }
-    // Back substitution of the rest of the half: A from `mid - 1` down, B from `mid + 2` up.
-    let _ = write!(
-        src,
-        "    for (var k = 0u; k < back; k++) {{\n        let s = select(mid - 1u - k, mid + 2u + k, side == 1u);\n        let q = base + s * p.stride;\n        let cq = {cq_expr};\n"
-    );
-    src.push_str(&io.load_out("        ", "q", "yo"));
-    for i in 0..b {
-        let sum = (0..b).map(|k| format!("cp[{}] * x{k}", cp_at(i * b + k))).collect::<Vec<_>>().join(" + ");
-        let _ = writeln!(src, "        let y{i} = yo{i} - ({sum});");
+    // Back substitution of the rest of the half: A from `mid - 1` down, B from `mid + 2` up. The
+    // loads of a chunk of rows do not depend on the solution, so they all issue before the chain.
+    src.push_str("    var kb = 0u;\n");
+    for rows in rows_passes(rows) {
+        let head = if rows > 1 { format!("(; kb + {rows}u <= back; kb += {rows}u)") } else { "(; kb < back; kb++)".to_owned() };
+        let _ = writeln!(src, "    for {head} {{");
+        for j in 0..rows {
+            let (jo, q) = (io.slot(j), format!("q{j}"));
+            let _ = writeln!(src, "        let k{j} = kb + {j}u;\n        let sr{j} = select(mid - 1u - k{j}, mid + 2u + k{j}, side == 1u);\n        let {q} = base + sr{j} * p.stride;\n        let cq{j} = {};", cq_of(&q));
+            src.push_str(&jo.load_out("        ", &q, &format!("yo{j}_")));
+            for i in 0..b {
+                for k in 0..b {
+                    let _ = writeln!(src, "        let cf{i}{k}_{j} = cp[{}];", cp_at(&format!("cq{j}"), i * b + k));
+                }
+            }
+        }
+        for j in 0..rows {
+            src.push_str("        {\n");
+            for i in 0..b {
+                let sum = (0..b).map(|k| format!("cf{i}{k}_{j} * x{k}")).collect::<Vec<_>>().join(" + ");
+                let _ = writeln!(src, "            let y{i} = yo{j}_{i} - ({sum});");
+            }
+            let solved: Vec<String> = (0..b).map(|i| format!("y{i}")).collect();
+            src.push_str(&io.store("            ", &format!("q{j}"), &solved));
+            for i in 0..b {
+                let _ = writeln!(src, "            x{i} = y{i};");
+            }
+            src.push_str("        }\n");
+        }
+        src.push_str("    }\n");
     }
-    let solved: Vec<String> = (0..b).map(|i| format!("y{i}")).collect();
-    src.push_str(&io.store("        ", "q", &solved));
-    for i in 0..b {
-        let _ = writeln!(src, "        x{i} = y{i};");
-    }
-    src.push_str("    }\n}\n");
+    src.push_str("}\n");
     src
 }
 

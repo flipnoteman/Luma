@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Thomas line solves (`solve_tridiagonal*`, `solve_block_tridiagonal*`, on parts too) of scalars and 4x4 blocks load four rows before eliminating them instead of waiting a memory round trip per row (RTX 3090: scalar solve along a strided axis of 4096x4096 1.96 -> 0.89 ms, 4x4 blocks along axis 1 of 1024x1024 1.12 -> 0.68 ms), and stacked scalar solves on strided axes use the warp-wide plan of the parts solve.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed
