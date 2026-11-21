@@ -41,7 +41,7 @@ pub fn run(h: &mut Harness) {
     h.guarded("matmul", |h| {
         let cpu = h.ctx.is_cpu();
         let sizes: &[usize] = match (cpu, h.quick) {
-            (false, false) => &[128, 256, 512, 1024, 2048, 4096],
+            (false, false) => &[128, 256, 512, 1024, 2048, 4096, 8192],
             (false, true) => &[128, 512, 2048],
             (true, false) => &[128, 256, 512, 1024],
             (true, true) => &[128, 512],

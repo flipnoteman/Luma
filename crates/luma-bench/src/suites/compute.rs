@@ -22,6 +22,8 @@ mod physics;
 mod scans;
 mod signal;
 
+use std::time::{Duration, Instant};
+
 use luma::*;
 
 use crate::harness::Harness;
@@ -32,6 +34,24 @@ pub fn pick<T>(h: &Harness, quick: T, full: T) -> T {
         quick
     } else {
         full
+    }
+}
+
+/// Keeps the GPU busy for a moment so that the first cases do not time its clock ramp-up. The
+/// kernel shares nothing with the cases (so their first-call costs stay theirs).
+fn warm_up(h: &Harness) {
+    if h.ctx.is_cpu() {
+        return;
+    }
+    let x = Array::<f32>::linspace_on(&h.ctx, 0.0, 1.0, 1 << 24).unwrap();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(400) {
+        let mut z = x.clone();
+        for _ in 0..6 {
+            z = (z * 1.0001 + 0.1).tan().cos();
+        }
+        z.eval().unwrap();
+        h.ctx.sync().unwrap();
     }
 }
 
@@ -67,6 +87,7 @@ pub fn check_sampled(name: &str, got: &[f32], want: impl Fn(usize) -> f64, strid
 }
 
 pub fn run(h: &mut Harness) {
+    warm_up(h);
     bandwidth::run(h);
     linalg::run(h);
     scans::run(h);
