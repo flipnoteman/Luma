@@ -16,7 +16,7 @@ pub(crate) use luma_core::CostModel;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind};
 
 /// The cost of `op` per element in f32-operation units.
-pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
+pub(crate) fn op_weight(op: &Op, cost: &CostModel) -> f64 {
     let base = match op.kind {
         OpKind::Unary(u) => match u {
             UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
@@ -238,18 +238,18 @@ mod tests {
     fn weights_follow_the_table() {
         let cost = CostModel { df32_factor: 20.0, f64_factor: Some(3.0), ..CostModel::TEST };
         let mul = |ty| Op::new(OpKind::Binary(BinOp::Mul), ty);
-        assert_eq!(op_weight(mul(ElemTy::F32), &cost), 1.0);
-        assert_eq!(op_weight(mul(ElemTy::Df32), &cost), 20.0);
-        assert_eq!(op_weight(mul(ElemTy::F64), &cost), 3.0);
-        assert_eq!(op_weight(mul(ElemTy::F64), &CostModel { f64_factor: None, ..cost }), 32.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Sqrt), ElemTy::F32), &cost), 4.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Tanh), ElemTy::Df32), &cost), 480.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Exp), ElemTy::Df32), &cost), 400.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Ln), ElemTy::Df32), &cost), 320.0);
-        assert_eq!(op_weight(Op::new(OpKind::Powf, ElemTy::Df32), &cost), 800.0);
-        assert_eq!(op_weight(Op::new(OpKind::Powf, ElemTy::F32), &cost), 16.0);
-        assert_eq!(op_weight(Op::new(OpKind::Cast(ElemTy::Df32), ElemTy::F32), &cost), 4.0);
-        assert_eq!(op_weight(Op::new(OpKind::Generate(Gen::Normal), ElemTy::F32), &cost), 60.0);
+        assert_eq!(op_weight(&mul(ElemTy::F32), &cost), 1.0);
+        assert_eq!(op_weight(&mul(ElemTy::Df32), &cost), 20.0);
+        assert_eq!(op_weight(&mul(ElemTy::F64), &cost), 3.0);
+        assert_eq!(op_weight(&mul(ElemTy::F64), &CostModel { f64_factor: None, ..cost }), 32.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Sqrt), ElemTy::F32), &cost), 4.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Tanh), ElemTy::Df32), &cost), 480.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Exp), ElemTy::Df32), &cost), 400.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Ln), ElemTy::Df32), &cost), 320.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Powf, ElemTy::Df32), &cost), 800.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Powf, ElemTy::F32), &cost), 16.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Cast(ElemTy::Df32), ElemTy::F32), &cost), 4.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Generate(Gen::Normal), ElemTy::F32), &cost), 60.0);
     }
 
     #[test]

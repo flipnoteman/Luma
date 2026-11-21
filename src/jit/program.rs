@@ -1687,7 +1687,7 @@ impl Graph {
         for &at in &order {
             let item = &self.items[at as usize];
             let operands: f64 = item.kids.iter().filter(|&&kid| kid != NONE).map(|&kid| weight[kid as usize]).sum();
-            let own = (cost::op_weight(*item.node.op(), &cost) + operands).min(item.node.weight());
+            let own = (cost::op_weight(item.node.op(), &cost) + operands).min(item.node.weight());
             weight[at as usize] = own;
             if is_candidate[at as usize] && super::worth_storing_at(&item.node, own) {
                 stored.push(at);

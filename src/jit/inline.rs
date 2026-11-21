@@ -262,7 +262,7 @@ impl<'a> Lowering<'a> {
 /// The weight of a lowered instruction in f32-operation units; with `staged_reads`, a read of a
 /// sub-program (staged in workgroup memory) is an index and a workgroup load.
 fn flat_weight(flat: &Flat, cost: &CostModel, staged_reads: bool) -> f64 {
-    if staged_reads && matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(flat.op, cost) }
+    if staged_reads && matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(&flat.op, cost) }
 }
 
 /// What the least a branch must save, in f32-operation units per element that reaches the `Select`
@@ -1002,7 +1002,7 @@ fn written_out_ns(key: &FusedKey, len: usize, cost: &CostModel) -> f64 {
     let mut reads: Vec<(u32, ShiftKind)> = Vec::new();
     let mut ops = 0.0;
     for instr in key.instrs.iter() {
-        ops += op_weight(instr.op, cost);
+        ops += op_weight(&instr.op, cost);
         if let (OpKind::Shift(kind), Ref::Sub(j)) = (instr.op.kind, instr.args[0])
             && !reads.contains(&(j, kind))
         {
@@ -1182,7 +1182,7 @@ fn recomputation(key: &FusedKey, cost: &CostModel) -> (Vec<f64>, Vec<f64>) {
         }
         found
     };
-    let weight = |program: &[Instr]| program.iter().map(|instr| op_weight(instr.op, cost)).sum::<f64>();
+    let weight = |program: &[Instr]| program.iter().map(|instr| op_weight(&instr.op, cost)).sum::<f64>();
     let mut alone = vec![0.0f64; n];
     for s in 0..n {
         let own = &key.subs[s];
@@ -1670,8 +1670,8 @@ mod tests {
         assert!(inlined.region[2..25].iter().all(|&region| region == Region::Taken(select as u32)), "{:?}", inlined.region);
         assert!([0, 1, select].iter().all(|&n| inlined.region[n] == Region::Top), "{:?}", inlined.region);
         // 4 of the 64 cells take it: the operations are the program's four plus 1/16 of the expression's.
-        let all: f64 = inlined.instrs.iter().map(|flat| op_weight(flat.op, &cost)).sum();
-        let expression: f64 = inlined.instrs.iter().zip(&inlined.region).filter(|&(_, &region)| region != Region::Top).map(|(flat, _)| op_weight(flat.op, &cost)).sum();
+        let all: f64 = inlined.instrs.iter().map(|flat| op_weight(&flat.op, &cost)).sum();
+        let expression: f64 = inlined.instrs.iter().zip(&inlined.region).filter(|&(_, &region)| region != Region::Top).map(|(flat, _)| op_weight(&flat.op, &cost)).sum();
         assert!((inlined.ops - (all - expression + expression / 16.0)).abs() < 1e-9, "{} of {all}, expression {expression}", inlined.ops);
         assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
     }
@@ -1744,7 +1744,7 @@ mod tests {
             assert_eq!(count, 23 + fields);
             assert!((0..inlined.instrs.len()).filter(|&n| inside(n)).all(|n| inlined.region[n] == Region::Taken(anchor)), "{fields} fields: {:?}", inlined.region);
             // Half the cells take it: the operations are the others' plus half of those inside.
-            let weight = |n: usize| op_weight(inlined.instrs[n].op, &cost);
+            let weight = |n: usize| op_weight(&inlined.instrs[n].op, &cost);
             let all: f64 = (0..inlined.instrs.len()).map(weight).sum();
             let taken: f64 = (0..inlined.instrs.len()).filter(|&n| inside(n)).map(weight).sum();
             assert!((inlined.ops - (all - taken / 2.0)).abs() < 1e-9, "{} of {all}, inside {taken}", inlined.ops);
@@ -1889,7 +1889,7 @@ mod tests {
             Region::Taken(_) => 1.0 / 16.0,
             Region::Skipped(_) => 15.0 / 16.0,
         };
-        (0..inlined.instrs.len()).map(|n| op_weight(inlined.instrs[n].op, cost) * chance(inlined.region[n])).sum()
+        (0..inlined.instrs.len()).map(|n| op_weight(&inlined.instrs[n].op, cost) * chance(inlined.region[n])).sum()
     }
 
     #[test]
