@@ -74,6 +74,13 @@ pub(crate) struct Tuning {
     /// pending reductions of the same length are forced together (see `jit::multireduce`); below 2 they are
     /// never merged. `LUMA_MULTI_REDUCE` overrides.
     pub(crate) reduce_multi: usize,
+    /// Least weight (f32 operations per cell, see `jit::Node::weight`) of the operand of an `f32` axis reduction for it to be left
+    /// pending to be recorded with its siblings (see `Array::defer_axis`). Merged, the reductions share the operands' work and the
+    /// pass over the data, but the CPU backend returns the values of several roots as an array and combines them in lockstep, which
+    /// costs more per cell than light operands save (a table's NaN-aware column statistics ran 1.5-1.7x slower merged, its
+    /// 4-operation description and a layer norm gained less than they lost to the deferral); all-pairs forces, whose three
+    /// components share a long chain, run 3x faster. Zero on GPU backends: always deferred.
+    pub(crate) axis_defer_weight: u32,
     /// Whether a reduction with more than one workgroup finishes in its first launch: the last
     /// workgroup to write its partial result combines them all (see `builtin::reduce_main`),
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
@@ -177,6 +184,7 @@ impl Tuning {
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
         reduce_multi: 16,
+        axis_defer_weight: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -210,6 +218,7 @@ impl Tuning {
         reduce_per_thread: 8,
         reduce_max_groups: 2048,
         reduce_multi: 16,
+        axis_defer_weight: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -245,6 +254,7 @@ impl Tuning {
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
         reduce_multi: 16,
+        axis_defer_weight: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -315,6 +325,9 @@ impl Tuning {
             Ok(value) => value.parse::<usize>().map_or(tuning.reduce_multi, |n| n.clamp(1, crate::builtin::MAX_ACCS)),
             Err(_) => tuning.reduce_multi,
         };
+        if info.backend == BackendKind::Cpu {
+            tuning.axis_defer_weight = 12;
+        }
         tuning.lookback_scan = match std::env::var(LOOKBACK_ENV).as_deref().map(str::trim) {
             Ok("off") => false,
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),

@@ -405,7 +405,9 @@ fn axis_siblings(ctx: &Context, dims: &[usize], axis: usize) -> Vec<Array<f32>> 
 
 #[test]
 fn sibling_axis_reductions_are_recorded_in_one_kernel_with_the_bits_of_each_alone() {
-    let ctx = ctx();
+    // Every group is merged, however light its operands (the CPU backend's default defers only heavy ones).
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.axis_defer_weight = 0).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
     // The same program on a context that records every axis reduction on its own: the bits to match.
     let alone_ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi = 1).unwrap();
     alone_ctx.set_cost_model(CostModel::TEST);
@@ -446,6 +448,31 @@ fn sibling_axis_reductions_are_recorded_in_one_kernel_with_the_bits_of_each_alon
             assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 1, "{dims:?} axis {axis}: reading the others launches nothing");
         }
     }
+}
+
+#[test]
+fn axis_reductions_of_light_operands_are_not_left_pending_on_the_cpu() {
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.axis_defer_weight = 12).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    if !ctx.is_cpu() {
+        return;
+    }
+    let dims = [40, 300];
+    let x = Array::from_slice_on(&ctx, &values(12_000, 41, -1.0, 1.0), dims).unwrap();
+    let y = Array::from_slice_on(&ctx, &values(12_000, 42, 0.5, 2.0), dims).unwrap();
+    // Light operands: one kernel each, as soon as they are asked for.
+    let before = ctx.jit().stats();
+    let (a, b) = ((&x + 1.0).sum_axis(0), (&y * 2.0).max_axis(0));
+    a.eval().unwrap();
+    b.eval().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 2);
+    // A long chain in common: pending until used, then one kernel for both.
+    let r = ((&x * &x + &y * &y + 1.0).sqrt() + (&x - &y).abs()).exp() * (&x + &y).tanh();
+    let (a, b) = ((&r * &x).sum_axis(0), (&r * &y).sum_axis(0));
+    let before = ctx.jit().stats();
+    a.eval().unwrap();
+    b.eval().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 1);
 }
 
 #[test]

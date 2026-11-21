@@ -1041,7 +1041,7 @@ impl Node {
     /// The operations of the expression in f32-operation units, an upper bound (see
     /// [`cost::op_weight`]) that counts a node an expression reads twice twice, up to
     /// [`MAX_AVERAGE_WEIGHT`] per distinct node. A loop leaf has none: its plan evaluates its inputs.
-    fn weight(&self) -> f64 {
+    pub(crate) fn weight(&self) -> f64 {
         if self.looped.get().is_some() { 0.0 } else { self.weight }
     }
 
