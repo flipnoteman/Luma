@@ -2,10 +2,11 @@
 //! are lazy: the result is a one-element array, and the host reads it with [`Array::item`].
 
 use std::panic::Location;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::array::{Array, Failure, Storage};
-use crate::builtin::{Builtin, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_EPILOGUE, MAX_REDUCTIONS};
+use crate::builtin::{Builtin, Epilogue, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_EPILOGUE, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
@@ -22,7 +23,8 @@ use crate::shape::Shape;
 /// expressions: they extend the reduction by an epilogue that its last pass applies, so the
 /// whole is as many launches as the reduction alone (see [`Array::fuse_step`]). Such a reduction
 /// shares the operand with the one it extends but never reads its buffer (which a write through
-/// another array may change): if both are used they run separately.
+/// another array may change): if both are used they run in one kernel with the others that are
+/// pending (see `jit::multireduce`), or separately where that is not possible.
 pub(crate) struct Reduced {
     operand: Arc<Node>,
     ops: ReduceList,
@@ -44,6 +46,22 @@ pub(crate) struct Reduced {
     /// The nodes that stand for the value in expressions (see [`Reduced::leaf`]): they get the buffer when the passes are
     /// recorded for any other reason, so that what reads them is a reader of that buffer (a write into it evaluates it first).
     leaves: std::sync::Mutex<Vec<std::sync::Weak<Node>>>,
+    /// The thread that made the reduction: only that one's reductions are recorded together (see [`crate::jit`]'s `multireduce`).
+    thread: std::thread::ThreadId,
+    /// Whether it was made while this thread was recording a step, whose reductions are never taken along.
+    in_recording: bool,
+    /// Set while the passes are being recorded.
+    forcing: AtomicBool,
+    /// Where the values are when they were recorded together with other reductions' (see [`PackRead`]), and the first one's index there.
+    pack: OnceLock<(Arc<PackRead>, usize)>,
+}
+
+/// The buffer the reductions recorded in one kernel share (see `Reduced::record_merged`), and its words once a reader has
+/// copied them to the host: the first of those reductions that is read on the host reads them all, so that reading a dozen
+/// of them costs one round trip.
+struct PackRead {
+    pack: Arc<Storage>,
+    words: OnceLock<Vec<u32>>,
 }
 
 impl std::fmt::Debug for Reduced {
@@ -112,6 +130,113 @@ impl Reduced {
         self.result.get().is_none()
     }
 
+    /// Whether this reduction may be recorded together with others: a plain `f32`, `u32` or `i32` reduction of an
+    /// expression that is still pending, outside a recording.
+    pub(crate) fn mergeable(&self, ctx: &Context) -> bool {
+        ctx.tuning().reduce_multi >= 2 && !self.in_recording && !ctx.recording_here() && !ctx.check_finite() && self.eligible()
+    }
+
+    /// What [`Reduced::mergeable`] says without the context.
+    fn eligible(&self) -> bool {
+        matches!(self.ty, ElemTy::F32 | ElemTy::U32 | ElemTy::I32)
+            && self.wgsl == self.ty.wgsl()
+            && !self.layout.is_packed()
+            && self.is_unforced()
+            && self.operand.is_pending()
+            && self.operand.has_operands()
+            && self.failure().is_none()
+    }
+
+    /// Whether this reduction can be recorded together with `seed` (itself mergeable).
+    pub(crate) fn partners_with(&self, seed: &Reduced) -> bool {
+        self.thread == seed.thread
+            && !self.in_recording
+            && !self.forcing.load(Ordering::Relaxed)
+            && self.ty == seed.ty
+            && self.operand.len() == seed.operand.len()
+            && self.eligible()
+    }
+
+    /// The pending reductions to record together with this one, first running the reductions its operand
+    /// waits for. Empty if it cannot be merged.
+    pub(crate) fn merge_partners(&self, ctx: &Context) -> Vec<Arc<Reduced>> {
+        if !self.mergeable(ctx) || !ctx.jit().may_have_partners(self) {
+            return Vec::new();
+        }
+        match jit::unresolved_leaves(&self.operand) {
+            Some(leaves) => {
+                for leaf in leaves {
+                    let _ = leaf.force();
+                }
+            }
+            None => return Vec::new(),
+        }
+        if !jit::unresolved_leaves(&self.operand).is_some_and(|leaves| leaves.is_empty()) {
+            return Vec::new();
+        }
+        ctx.jit().reduction_partners(ctx, self)
+    }
+
+    /// Records the reductions `partners` (see [`Reduced::merge_partners`]) and this one in one kernel: this reduction's
+    /// buffer, once the others hold theirs. `None` (nothing recorded) if the program does not fit one kernel.
+    fn record_merged(&self, ctx: &Context, partners: &[Arc<Reduced>]) -> Option<Arc<Storage>> {
+        let all = || std::iter::once(self).chain(partners.iter().map(|partner| &**partner));
+        let members: Vec<jit::Member<'_>> = all().map(|reduced| jit::Member { operand: &reduced.operand, ops: reduced.ops, finish: reduced.finish }).collect();
+        let pack = match jit::reduce_many(ctx, &members, self.ty, ctx.tuning().reduce_multi) {
+            Ok(Some(pack)) => Arc::new(pack),
+            _ => return None,
+        };
+        drop(members);
+        let shared = Arc::new(PackRead { pack: Arc::clone(&pack), words: OnceLock::new() });
+        let mut offset = 0;
+        let mut own = None;
+        for (k, reduced) in all().enumerate() {
+            let count = reduced.ops.as_slice().len();
+            let window = Arc::new(Storage::window_of(&pack, offset, count));
+            let _ = reduced.pack.set((Arc::clone(&shared), offset));
+            offset += count;
+            if k == 0 {
+                own = Some(window);
+            } else {
+                reduced.adopt(window);
+            }
+        }
+        own
+    }
+
+    /// Takes the buffer `storage` recorded together with another reduction as the result, if there is none yet.
+    fn adopt(&self, storage: Arc<Storage>) {
+        if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
+            for leaf in std::mem::take(&mut *crate::gpu::lock(&self.leaves)) {
+                if let Some(leaf) = leaf.upgrade() {
+                    leaf.finish_shared(Arc::clone(&storage));
+                }
+            }
+        }
+    }
+
+    /// The values of a reduction recorded together with others, read from the host copy of the buffer they share
+    /// (made by the first read of any of them); `None` if it was not, or its own buffer was made since (see
+    /// [`Storage::detach`]).
+    pub(crate) fn packed_values<T: GpuType>(&self, ctx: &Context) -> Option<Result<Vec<T>>> {
+        if std::mem::size_of::<T::Repr>() != 4 {
+            return None;
+        }
+        let (shared, offset) = self.pack.get()?;
+        if !self.result.get()?.as_ref().is_ok_and(|storage| storage.is_window()) {
+            return None;
+        }
+        let words = match shared.words.get() {
+            Some(words) => words,
+            None => match ctx.read_storage::<u32>(&shared.pack) {
+                Ok(words) => shared.words.get_or_init(|| words),
+                Err(error) => return Some(Err(error)),
+            },
+        };
+        let count = self.ops.as_slice().len();
+        Some(Ok(T::from_repr(bytemuck::pod_collect_to_vec(words.get(*offset..offset + count)?), count)))
+    }
+
     /// Records the passes into a new buffer (once) and returns it. Nothing is read back.
     pub(crate) fn force(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
         let result = self.record_once(ctx);
@@ -129,7 +254,13 @@ impl Reduced {
     pub(crate) fn record_once(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
         self.result.get_or_init(|| match crate::host::try_eval_reduced(self, ctx) {
             Some(storage) => Ok(storage),
-            None => self.record(ctx).map_err(Arc::new),
+            None => {
+                self.forcing.store(true, Ordering::Relaxed);
+                let partners = self.merge_partners(ctx);
+                let result = self.record(ctx, &partners).map_err(Arc::new);
+                self.forcing.store(false, Ordering::Relaxed);
+                result
+            }
         })
     }
 
@@ -144,7 +275,12 @@ impl Reduced {
         self.result.get()?.as_ref().ok().cloned()
     }
 
-    fn record(&self, ctx: &Context) -> Result<Arc<Storage>> {
+    fn record(&self, ctx: &Context, partners: &[Arc<Reduced>]) -> Result<Arc<Storage>> {
+        if !partners.is_empty()
+            && let Some(storage) = self.record_merged(ctx, partners)
+        {
+            return Ok(storage);
+        }
         let count = self.ops.as_slice().len();
         let storage = Arc::new(Storage::new(ctx, count, self.layout));
         let pin = storage.pin(0)?;
@@ -160,6 +296,24 @@ impl Reduced {
             && let Some(words) = crate::host::reduced_words(self, ctx)
         {
             return Ok(T::from_repr(bytemuck::pod_collect_to_vec(&words), self.ops.as_slice().len()));
+        }
+        // Read with others that are pending, in one kernel, which records them all (before the speculation, which
+        // records one reduction at a time).
+        if self.is_unforced() && std::mem::size_of::<T::Repr>() == 4 {
+            let partners = self.merge_partners(ctx);
+            if !partners.is_empty() {
+                self.forcing.store(true, Ordering::Relaxed);
+                let result = self.result.get_or_init(|| self.record(ctx, &partners).map_err(Arc::new));
+                self.forcing.store(false, Ordering::Relaxed);
+                let storage = result.as_ref().map_err(|error| LumaError::clone(error))?;
+                let values = match self.packed_values::<T>(ctx) {
+                    Some(values) => values?,
+                    None => T::from_repr(ctx.read_storage::<T::Repr>(storage)?, self.ops.as_slice().len()),
+                };
+                // The leaves that stand for this value in expressions get its buffer, as `force` does.
+                self.force(ctx);
+                return Ok(values);
+            }
         }
         let array = Array::<T>::from_node(ctx, Shape::from(self.operand.len()), Arc::clone(&self.operand));
         reduce_array(&array, self.wgsl, self.ops, self.finish, !self.buffer)
@@ -299,8 +453,27 @@ impl<T: ScalarType> Array<T> {
             // write. The reader is a copy of the operand that the reduction's first pass fuses.
             let args = [operand, Src::unused(), Src::unused()];
             let reader = jit::create(ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
-            let reduced = Reduced { operand: reader, ops, wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), result: OnceLock::new(), ty: ElemTy::of::<T>()?, name, location, leaves: Default::default() };
-            return Ok(Array::from_reduced(ctx, shape, Arc::new(reduced)));
+            let reduced = Reduced {
+                operand: reader,
+                ops,
+                wgsl,
+                elem,
+                layout: T::LAYOUT,
+                buffer,
+                finish: Finish::default(),
+                result: OnceLock::new(),
+                ty: ElemTy::of::<T>()?,
+                name,
+                location,
+                leaves: Default::default(),
+                thread: std::thread::current().id(),
+                in_recording: ctx.recording_here(),
+                forcing: AtomicBool::new(false),
+                pack: OnceLock::new(),
+            };
+            let reduced = Arc::new(reduced);
+            ctx.jit().register_reduction(&reduced);
+            return Ok(Array::from_reduced(ctx, shape, reduced));
         }
         // Nothing is left to fuse: record the passes now.
         let storage = Arc::new(Storage::new(ctx, shape.len(), T::LAYOUT));
@@ -340,8 +513,14 @@ impl<T: ScalarType> Array<T> {
             name: reduced.name,
             location: reduced.location,
             leaves: Default::default(),
+            thread: std::thread::current().id(),
+            in_recording: self.context().recording_here(),
+            forcing: AtomicBool::new(false),
+            pack: OnceLock::new(),
         };
-        Some(Array::from_reduced(self.context(), self.shape(), Arc::new(derived)))
+        let derived = Arc::new(derived);
+        self.context().jit().register_reduction(&derived);
+        Some(Array::from_reduced(self.context(), self.shape(), derived))
     }
 }
 
@@ -434,13 +613,8 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
     let count = ops.as_slice().len() as u64;
     // The results of a bit-packed type are the words of a one-element array (see `Reduced`).
     debug_assert!(!bits || count == 1);
-    if let Some(node) = array.pending()
-        && speculate
-        && finish.epilogue.is_empty()
-        && matches!(wgsl, "f32" | "u32")
-        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, bits, elem, wgsl, ops, scratch, None, finish))
-    {
-        return Ok(T::from_repr(bytemuck::cast_slice(&words?).to_vec(), count as usize));
+    if let Some(values) = speculated(array, wgsl, ops, finish, speculate) {
+        return values;
     }
     let mut scratch = Scratch::new(ctx);
     let current = reduce_into(array, bits, elem, wgsl, ops, &mut scratch, None, finish)?;
@@ -449,6 +623,22 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
         return Err(LumaError::Gpu("reduction results are missing".into()));
     }
     Ok(values)
+}
+
+/// The values of the reduction of `array` that the speculation of [`crate::jit`] has ready (see [`reduce_array`]), if it has.
+fn speculated<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, finish: Finish, speculate: bool) -> Option<Result<Vec<T>>> {
+    let elem = T::LAYOUT.stride() as u64;
+    let bits = T::LAYOUT.is_packed();
+    let count = ops.as_slice().len();
+    if let Some(node) = array.pending()
+        && speculate
+        && finish.epilogue.is_empty()
+        && matches!(wgsl, "f32" | "u32")
+        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, bits, elem, wgsl, ops, scratch, None, finish))
+    {
+        return Some(words.map(|words| T::from_repr(bytemuck::cast_slice(&words).to_vec(), count)));
+    }
+    None
 }
 
 /// Runs passes over `current` (`n` elements, or `n` per op once `per_op`) until one element per
@@ -462,11 +652,54 @@ pub(crate) fn finish_passes(
     ops: ReduceList,
     wgsl: &'static str,
     elem: u64,
+    current: luma_core::Buffer,
+    n: u32,
+    per_op: bool,
+    target: Option<&luma_core::Buffer>,
+    finish: Finish,
+) -> Result<luma_core::Buffer> {
+    let mut scalars = [0u32; MAX_EPILOGUE];
+    let mut used = 0;
+    for word in finish.uniform_words() {
+        scalars[used] = word;
+        used += 1;
+    }
+    passes(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish.epilogue, &scalars[..used])
+}
+
+/// [`finish_passes`] for the partial results of a first pass of a [merged](ReduceList::merged)
+/// list (`n` per op, `ops` the list of the first pass): the last pass applies the epilogues of the
+/// list, the scalars of which are `scalars`, in the order of its uniform fields.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_passes_merged(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    ops: ReduceList,
+    wgsl: &'static str,
+    elem: u64,
+    current: luma_core::Buffer,
+    n: u32,
+    target: &luma_core::Buffer,
+    scalars: &[u32],
+) -> Result<luma_core::Buffer> {
+    passes(ctx, scratch, ops, wgsl, elem, current, n, true, Some(target), Epilogue::default(), scalars)
+}
+
+/// The passes of [`finish_passes`]: the last one applies `epilogue` (the epilogues of a merged list)
+/// with the scalar operands `scalars`.
+#[allow(clippy::too_many_arguments)]
+fn passes(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    ops: ReduceList,
+    wgsl: &'static str,
+    elem: u64,
     mut current: luma_core::Buffer,
     mut n: u32,
     mut per_op: bool,
     target: Option<&luma_core::Buffer>,
-    finish: Finish,
+    epilogue: Epilogue,
+    scalars: &[u32],
 ) -> Result<luma_core::Buffer> {
     let count = ops.as_slice().len() as u64;
     while !per_op || n > 1 {
@@ -476,7 +709,7 @@ pub(crate) fn finish_passes(
         // first pass that finishes the reduction itself.
         let single_pass = !per_op && groups > 1 && ctx.tuning().single_pass_reduce;
         let last = groups == 1 || single_pass;
-        let list = if last { list.with_epilogue(finish.epilogue) } else { list };
+        let list = if last { list.finished(epilogue) } else { list };
         let list = if single_pass { list.single_pass() } else { list };
         let in_bytes = u64::from(n) * elem * if per_op { count } else { 1 };
         // The last pass leaves one element per op: into `target` if there is one.
@@ -487,14 +720,12 @@ pub(crate) fn finish_passes(
         let core = ctx.builtin(Builtin::Reduce(list, per_op), wgsl)?;
         // The uniform: `n`; the double-float pass has a second field, the guard of its arithmetic
         // (always 0); the last pass the scalars of the epilogue.
-        let mut words = [0u32; 2 + MAX_EPILOGUE];
+        let mut words = [0u32; 2 + MAX_ACCS * MAX_EPILOGUE];
         words[0] = n;
         let mut used = if wgsl == "df32" { 2 } else { 1 };
         if last {
-            for word in finish.uniform_words() {
-                words[used] = word;
-                used += 1;
-            }
+            words[used..used + scalars.len()].copy_from_slice(scalars);
+            used += scalars.len();
         }
         ctx.jit().note_reduce_pass();
         if single_pass {

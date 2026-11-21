@@ -732,10 +732,13 @@ impl<T: GpuType> Array<T> {
     /// finished it, so this is where a poisoned array's error (or an error the GPU reported
     /// while running the batch) comes out.
     pub fn to_vec(&self) -> Result<Vec<T>> {
-        if let Repr::Reduced(reduced) = &self.repr
-            && reduced.is_unforced()
-        {
-            return reduced.read::<T>(&self.ctx);
+        if let Repr::Reduced(reduced) = &self.repr {
+            if reduced.is_unforced() {
+                return reduced.read::<T>(&self.ctx);
+            }
+            if let Some(values) = reduced.packed_values::<T>(&self.ctx) {
+                return values;
+            }
         }
         let storage = self.storage().map_err(Failure::into_error)?;
         Ok(T::from_repr(self.ctx.read_storage::<T::Repr>(storage)?, self.len()))
@@ -746,14 +749,15 @@ impl<T: GpuType> Array<T> {
     /// which cost about as much as the transfer itself on large arrays: prefer this when
     /// reading results back repeatedly.
     pub fn read_into(&self, out: &mut [T]) -> Result<()> {
-        if let Repr::Reduced(reduced) = &self.repr
-            && reduced.is_unforced()
-        {
-            if out.len() != self.len() {
-                return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
+        if let Repr::Reduced(reduced) = &self.repr {
+            let values = if reduced.is_unforced() { Some(reduced.read::<T>(&self.ctx)) } else { reduced.packed_values::<T>(&self.ctx) };
+            if let Some(values) = values {
+                if out.len() != self.len() {
+                    return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
+                }
+                out.copy_from_slice(&values?);
+                return Ok(());
             }
-            out.copy_from_slice(&reduced.read::<T>(&self.ctx)?);
-            return Ok(());
         }
         let storage = self.storage().map_err(Failure::into_error)?;
         if out.len() != self.len() {

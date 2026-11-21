@@ -722,8 +722,8 @@ fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
             .take(2)
             .filter_map(|&at| value(at))
             .collect(),
-        Tail::Reduce(_) => {
-            if key.outputs.len() > 1 {
+        Tail::Reduce(ops) => {
+            if key.outputs.len() > 1 || ops.roots().is_some() {
                 key.outputs.iter().filter_map(|&at| value(at)).collect()
             } else {
                 main.last().copied().into_iter().collect()

@@ -679,7 +679,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             let _ = write!(src, "s{k}: {}, ", ty.wgsl());
         }
         if let Tail::Reduce(ops) = key.tail {
-            src.push_str(&ops.epilogue().fields());
+            src.push_str(&ops.epilogue_fields());
         }
         src.push_str("}\n");
     }
@@ -712,7 +712,8 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
     if matmul {
         src.push_str("@group(1) @binding(0) var<storage, read_write> c: array<f32>;\n");
     }
-    let side_stores = if reduce { key.outputs.len().saturating_sub(1) } else { 0 };
+    let merged = matches!(key.tail, Tail::Reduce(ops) if ops.roots().is_some());
+    let side_stores = if reduce && !merged { key.outputs.len().saturating_sub(1) } else { 0 };
     let mut binding = outputs.len() + side_stores + usize::from(matmul) + axis_outputs;
     if let Some(pass) = radix {
         // The roots are the keys, read by `luma_key`; the kernel's own buffers go around the inputs.
@@ -854,7 +855,15 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             let guard = format!("p.s{}", key.guard.unwrap_or(0));
             let elem = if reduces_df { ReduceElem::Df32 { guard: &guard, fma: tuning.df_fma } } else { ReduceElem::Plain(ty) };
             let names = Names { views: &views, in_place: &[] };
-            if side_stores == 0 {
+            if merged {
+                // One value per root of the program, computed together (see `reduce_main`).
+                let outs: Vec<usize> = key.outputs.iter().map(|&at| at as usize).collect();
+                debug_assert!(ops.roots().is_some_and(|roots| roots.iter().all(|&root| usize::from(root) < outs.len())));
+                let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
+                let (computed, values) = computed_values(key, &outs, inlined, &names, index, segmented);
+                let returned: Vec<String> = values.iter().map(|val| format!("t{val}")).collect();
+                let _ = write!(src, "\nfn luma_eval(i: u32) -> array<{ty}, {n}> {{\n{global}{computed}    return array<{ty}, {n}>({});\n}}\n", returned.join(", "), n = outs.len());
+            } else if side_stores == 0 {
                 src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
             } else {
                 let outs: Vec<usize> = key.outputs.iter().map(|&at| at as usize).collect();

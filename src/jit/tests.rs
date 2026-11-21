@@ -252,6 +252,60 @@ fn reductions_fuse_their_input_expression() {
 }
 
 #[test]
+fn pending_reductions_of_shared_data_are_recorded_in_one_kernel() {
+    let ctx = ctx();
+    let n = 100_000;
+    let xs = values(n, 3, -1.0, 1.0);
+    let ys = values(n, 4, -1.0, 1.0);
+    let (x, y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+    let accs = ctx.tuning().reduce_multi;
+
+    // Twelve sums of expressions of one product: one launch (or two passes on a device that cannot finish in one).
+    let product = &x * &y;
+    let sums: Vec<_> = (0..12).map(|k| (&product * (k as f32 + 1.0)).sum()).collect();
+    let before = ctx.jit().stats();
+    let got: Vec<f32> = sums.iter().map(|sum| sum.item().unwrap()).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.elementwise_launches, 0, "the product is never materialized");
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "{d:?}");
+    let dot: f64 = xs.iter().zip(&ys).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
+    for (k, value) in got.iter().enumerate() {
+        let want = dot * (k as f64 + 1.0);
+        assert!((f64::from(*value) - want).abs() <= 1e-3 * want.abs().max(1.0), "sum {k}: {value} vs {want}");
+    }
+
+    // More than a kernel takes: as few kernels as the accumulators allow, in creation order.
+    let sums: Vec<_> = (0..40).map(|k| (&x * (k as f32 + 1.0)).sum()).collect();
+    let before = ctx.jit().stats();
+    let got: Vec<f32> = sums.iter().map(|sum| sum.item().unwrap()).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 40usize.div_ceil(accs) as u64, "{d:?}");
+    let total: f64 = xs.iter().map(|&a| f64::from(a)).sum();
+    for (k, value) in got.iter().enumerate() {
+        let want = total * (k as f64 + 1.0);
+        assert!((f64::from(*value) - want).abs() <= 1e-2 * (k as f64 + 1.0), "sum {k}: {value} vs {want}");
+    }
+
+    // A reduction that waits for another (a variance on a mean) goes after it: the means in one kernel, the variances in another
+    // (a mean is recorded where an array is made from it: it is broadcast over `x`).
+    let before = ctx.jit().stats();
+    let means: Vec<_> = (0..4).map(|k| (&x + k as f32).mean()).collect();
+    let vars: Vec<_> = means
+        .iter()
+        .enumerate()
+        .map(|(k, mean)| {
+            let centered = &(&x + k as f32) - mean;
+            (&centered * &centered).mean()
+        })
+        .collect();
+    for var in &vars {
+        var.item().unwrap();
+    }
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 2, "{d:?}");
+}
+
+#[test]
 fn reducing_an_expression_does_not_evaluate_it() {
     let ctx = ctx();
     let xs = values(777, 9, 0.0, 1.0);
