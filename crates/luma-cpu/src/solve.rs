@@ -29,6 +29,8 @@ use crate::abi::{WorkgroupCtx, WorkgroupFn};
 pub struct NativeLineSolve {
     pub(crate) spec: LineSolveSpec,
     pub(crate) func: WorkgroupFn,
+    /// What a workgroup costs, learned by the pool (see [`crate::exec::CostHint`]).
+    pub(crate) cost: crate::exec::CostHint,
 }
 
 impl NativeKernel for NativeLineSolve {}
@@ -50,7 +52,7 @@ impl NativeLineSolve {
             8 => group::<8>,
             _ => return None,
         };
-        Some(NativeLineSolve { spec: *spec, func })
+        Some(NativeLineSolve { spec: *spec, func, cost: crate::exec::CostHint::default() })
     }
 
     fn block(&self) -> usize {

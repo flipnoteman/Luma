@@ -19,7 +19,7 @@ use luma_core::{
 };
 
 use crate::codegen::CompiledCpuKernel;
-use crate::exec::{AlignedBuf, ExecBlob, WorkgroupPool};
+use crate::exec::{AlignedBuf, CostHint, ExecBlob, WorkgroupPool};
 use crate::fission;
 use crate::gemm::NativeMatmul;
 use crate::solve::NativeLineSolve;
@@ -270,7 +270,7 @@ fn compile_native(
     if let Some(bytes) = disk.load_blob(&stem, cache::CPU_MAGIC)
         && let Ok(blob) = ExecBlob::new(&bytes)
     {
-        return Ok(CompiledCpuKernel { exec: Arc::new(blob), plan });
+        return Ok(CompiledCpuKernel { exec: Arc::new(blob), plan, cost: CostHint::default() });
     }
     let (compiled, bytes) =
         crate::codegen::compile(&optimized, used, !trusted).map_err(|e| match e {
@@ -390,6 +390,7 @@ impl CpuBackend {
                     0,
                     0,
                     false,
+                    &product.cost,
                 );
                 drop(store);
                 return Ok(start.elapsed());
@@ -411,6 +412,7 @@ impl CpuBackend {
                     0,
                     0,
                     false,
+                    &solve.cost,
                 );
                 drop(store);
                 return Ok(start.elapsed());
@@ -438,6 +440,7 @@ impl CpuBackend {
             compiled.plan.shared_bytes,
             compiled.plan.scratch_bytes,
             compiled.plan.initialize_shared,
+            &compiled.cost,
         );
         drop(store);
         Ok(start.elapsed())

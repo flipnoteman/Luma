@@ -17,6 +17,8 @@ use crate::abi::{WorkgroupCtx, WorkgroupFn};
 pub struct NativeMatmul {
     pub(crate) spec: MatmulSpec,
     pub(crate) func: WorkgroupFn,
+    /// What a workgroup costs, learned by the pool (see [`crate::exec::CostHint`]).
+    pub(crate) cost: crate::exec::CostHint,
 }
 
 impl NativeKernel for NativeMatmul {}
@@ -27,7 +29,7 @@ const BINDINGS: usize = 4;
 impl NativeMatmul {
     /// The product of `spec`, `None` if its tile is empty.
     pub fn new(spec: &MatmulSpec) -> Option<Self> {
-        (spec.edge > 0).then_some(NativeMatmul { spec: *spec, func: group })
+        (spec.edge > 0).then(|| NativeMatmul { spec: *spec, func: group, cost: crate::exec::CostHint::default() })
     }
 
     /// Checks that the buffers of a launch hold every element the product touches (it trusts
