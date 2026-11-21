@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7698d9f6.js";
+            window.path_to_searchindex_js = "searchindex-73370195.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -189,9 +189,9 @@ array code (<code>Array</code>, <code>iterate</code>, custom kernels) compiles a
 <h3 id="software-wgpu-adapters-are-never-used"><a class="header" href="#software-wgpu-adapters-are-never-used">Software wgpu adapters are never used</a></h3>
 <p>Mesa llvmpipe, SwiftShader and WARP are refused by the wgpu backend: it never requests a fallback adapter and
 refuses <code>DeviceKind::Cpu</code>. A CPU device (<code>LUMA_DEVICE=cpu</code>, <code>Context::cpu()</code>, or <code>Auto</code> without a GPU) is now the
-native <code>cpu</code> backend only, and it needs the <code>cpu</code> feature. If your program ran on a software Vulkan adapter
-before, it now runs on the native CPU backend (or returns an error when <code>LUMA_DEVICE=gpu</code> is set); build with the
-<code>cpu</code> feature to keep a CPU fallback (<a href="faq.html#choosing-a-device">Choosing a device</a>).</p>
+native <code>cpu</code> backend, which every build includes. If your program ran on a software Vulkan adapter before, it now
+runs on the native CPU backend (or returns an error when <code>LUMA_DEVICE=gpu</code> is set)
+(<a href="faq.html#choosing-a-device">Choosing a device</a>).</p>
 <h3 id="lumaerror-carries-strings-not-wgpu-types"><a class="header" href="#lumaerror-carries-strings-not-wgpu-types"><code>LumaError</code> carries strings, not wgpu types</a></h3>
 <p>Adapter, device and readback errors in <code>LumaError</code> hold backend-neutral strings instead of wgpu types, so a
 <code>match</code> that destructured a wgpu error now reads the message. <code>luma::wgpu</code> is re-exported only with the <code>wgpu</code>
@@ -200,8 +200,8 @@ are re-exported from <code>luma_core</code>.</p>
 <h3 id="crates-and-features"><a class="header" href="#crates-and-features">Crates and features</a></h3>
 <p>Luma is a workspace of six crates: <code>luma-hal-core</code> (the kernel IR and the backend interface), <code>luma-hal-wgpu</code>,
 <code>luma-hal-metal</code>, <code>luma-hal-cuda</code> and <code>luma-hal-cpu</code> (one backend each, with its own code generator), and the root <code>luma</code>
-crate. The features <code>wgpu</code>, <code>metal</code>, <code>cuda</code> and <code>cpu</code> each enable one backend, and all are on by default. To
-build with one only:</p>
+crate. The features <code>wgpu</code>, <code>metal</code> and <code>cuda</code> each enable one GPU backend, and all are on by default; the CPU
+backend is always built. To build with one GPU backend only:</p>
 <pre><code class="language-sh">cargo build --no-default-features --features cuda
 cargo build --no-default-features --features metal
 cargo build --no-default-features --features wgpu

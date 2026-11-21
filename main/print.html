@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7698d9f6.js";
+            window.path_to_searchindex_js = "searchindex-73370195.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a2c80e88.js"></script>
@@ -3395,7 +3395,7 @@ match Context::cpu() {
     Err(error) =&gt; return Err(error),
 }
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p><strong>Opening a context returns <code>LumaError::NoAdapter</code> (“Found no adapters”).</strong> With <code>LUMA_DEVICE=gpu</code> (or when built without the <code>cpu</code> feature), no hardware GPU driver (CUDA, Metal, Vulkan or DX12) was found. Install your GPU vendor’s driver, or keep the default <code>cpu</code> feature enabled for the native SIMD CPU fallback.</p>
+<p><strong>Opening a context returns <code>LumaError::NoAdapter</code> (“Found no adapters”).</strong> With <code>LUMA_DEVICE=gpu</code>, no hardware GPU driver (CUDA, Metal, Vulkan or DX12) was found. Install your GPU vendor’s driver, or leave <code>LUMA_DEVICE</code> unset: every build includes the native SIMD CPU backend and falls back to it.</p>
 <p><strong>I have two GPUs and want the other one.</strong> Luma asks for the high-performance adapter and has no
 adapter-by-name setting. On Linux the Vulkan loader decides which drivers wgpu sees, so pointing
 <code>VK_ICD_FILENAMES</code> at one driver’s <code>.json</code> file (for example
@@ -3504,9 +3504,9 @@ array code (<code>Array</code>, <code>iterate</code>, custom kernels) compiles a
 <h3 id="software-wgpu-adapters-are-never-used"><a class="header" href="#software-wgpu-adapters-are-never-used">Software wgpu adapters are never used</a></h3>
 <p>Mesa llvmpipe, SwiftShader and WARP are refused by the wgpu backend: it never requests a fallback adapter and
 refuses <code>DeviceKind::Cpu</code>. A CPU device (<code>LUMA_DEVICE=cpu</code>, <code>Context::cpu()</code>, or <code>Auto</code> without a GPU) is now the
-native <code>cpu</code> backend only, and it needs the <code>cpu</code> feature. If your program ran on a software Vulkan adapter
-before, it now runs on the native CPU backend (or returns an error when <code>LUMA_DEVICE=gpu</code> is set); build with the
-<code>cpu</code> feature to keep a CPU fallback (<a href="#choosing-a-device">Choosing a device</a>).</p>
+native <code>cpu</code> backend, which every build includes. If your program ran on a software Vulkan adapter before, it now
+runs on the native CPU backend (or returns an error when <code>LUMA_DEVICE=gpu</code> is set)
+(<a href="#choosing-a-device">Choosing a device</a>).</p>
 <h3 id="lumaerror-carries-strings-not-wgpu-types"><a class="header" href="#lumaerror-carries-strings-not-wgpu-types"><code>LumaError</code> carries strings, not wgpu types</a></h3>
 <p>Adapter, device and readback errors in <code>LumaError</code> hold backend-neutral strings instead of wgpu types, so a
 <code>match</code> that destructured a wgpu error now reads the message. <code>luma::wgpu</code> is re-exported only with the <code>wgpu</code>
@@ -3515,8 +3515,8 @@ are re-exported from <code>luma_core</code>.</p>
 <h3 id="crates-and-features"><a class="header" href="#crates-and-features">Crates and features</a></h3>
 <p>Luma is a workspace of six crates: <code>luma-hal-core</code> (the kernel IR and the backend interface), <code>luma-hal-wgpu</code>,
 <code>luma-hal-metal</code>, <code>luma-hal-cuda</code> and <code>luma-hal-cpu</code> (one backend each, with its own code generator), and the root <code>luma</code>
-crate. The features <code>wgpu</code>, <code>metal</code>, <code>cuda</code> and <code>cpu</code> each enable one backend, and all are on by default. To
-build with one only:</p>
+crate. The features <code>wgpu</code>, <code>metal</code> and <code>cuda</code> each enable one GPU backend, and all are on by default; the CPU
+backend is always built. To build with one GPU backend only:</p>
 <pre><code class="language-sh">cargo build --no-default-features --features cuda
 cargo build --no-default-features --features metal
 cargo build --no-default-features --features wgpu
