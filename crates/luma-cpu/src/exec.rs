@@ -296,8 +296,11 @@ const PRIOR_NS_PER_INVOCATION: u64 = 1;
 /// How long an idle worker or the waiting dispatcher polls before it sleeps on a condvar
 /// (`LUMA_CPU_SPIN_US`). Long enough to bridge the host work between the launches of a loop.
 const DEFAULT_SPIN: Duration = Duration::from_micros(1000);
-/// Polling rounds that are a pure busy loop; later rounds yield the core between polls.
-const SPIN_ROUNDS: u32 = 100;
+/// Launches whose threads each work longer than this (nanoseconds) amortise a wake-up by
+/// themselves: their workers sleep at once instead of polling, which leaves the cores to the
+/// kernel (spinners on the other hyperthreads and a lower all-core clock slowed memory-bound
+/// kernels by up to 2x).
+const SPIN_BELOW_NS: u64 = 100_000;
 /// Low bits of `Shared::slots`: helper slots still free; the bits above are the job generation.
 const SLOT_BITS: u32 = 16;
 const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
@@ -359,7 +362,11 @@ struct Shared {
     job: AtomicPtr<Job>,
     /// Workers blocked on (or about to block on) `wake`.
     sleepers: AtomicUsize,
+    /// The configured polling time (see [`DEFAULT_SPIN`]).
     spin: Duration,
+    /// Nanoseconds a worker polls after finishing a job: `spin` after a short launch, none after
+    /// a long one.
+    worker_spin_ns: AtomicU64,
     dispatcher_sleeping: AtomicBool,
     shutdown: AtomicBool,
     wake_lock: Mutex<()>,
@@ -433,15 +440,11 @@ unsafe fn run_job(job: &Job) -> u64 {
     ns
 }
 
-/// One polling round of a spin wait: a short busy pause, then core yields once `round` is high.
-fn relax(round: &mut u32) {
-    if *round < SPIN_ROUNDS {
-        for _ in 0..32 {
-            std::hint::spin_loop();
-        }
-        *round += 1;
-    } else {
-        std::thread::yield_now();
+/// One polling round of a spin wait. A busy pause, never a `yield_now`: a yielding spinner on the
+/// sibling hyperthread of a worker slowed memory-bound kernels down by up to 2x.
+fn relax() {
+    for _ in 0..32 {
+        std::hint::spin_loop();
     }
 }
 
@@ -499,7 +502,6 @@ impl Shared {
 fn worker_loop(shared: Arc<Shared>) {
     let mut seen = 0u64;
     let mut deadline = Instant::now() + shared.spin;
-    let mut round = 0u32;
     loop {
         if shared.shutdown.load(Ordering::Relaxed) {
             return;
@@ -524,12 +526,12 @@ fn worker_loop(shared: Arc<Shared>) {
                 );
                 shared.done.notify_one();
             }
-            deadline = Instant::now() + shared.spin;
-            round = 0;
+            deadline = Instant::now()
+                + Duration::from_nanos(shared.worker_spin_ns.load(Ordering::Relaxed));
             continue;
         }
         if Instant::now() < deadline {
-            relax(&mut round);
+            relax();
             continue;
         }
         shared.sleep(seen);
@@ -578,6 +580,7 @@ impl WorkgroupPool {
             job: AtomicPtr::new(std::ptr::null_mut()),
             sleepers: AtomicUsize::new(0),
             spin,
+            worker_spin_ns: AtomicU64::new(spin.as_nanos() as u64),
             dispatcher_sleeping: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
@@ -643,8 +646,9 @@ impl WorkgroupPool {
         let invocations = u64::from(grid_size[0])
             .saturating_mul(u64::from(grid_size[1]))
             .saturating_mul(u64::from(grid_size[2]));
+        let est_ns = cost.estimate_ns(total, invocations);
         let (participants, wake) = if self.threads > 1 && total > 1 {
-            self.plan(cost.estimate_ns(total, invocations), total)
+            self.plan(est_ns, total)
         } else {
             (1, 0)
         };
@@ -687,6 +691,12 @@ impl WorkgroupPool {
         };
         *generation += 1;
         let shared = &*self.shared;
+        let spin = if est_ns / participants as u64 > SPIN_BELOW_NS {
+            0
+        } else {
+            shared.spin.as_nanos() as u64
+        };
+        shared.worker_spin_ns.store(spin, Ordering::Relaxed);
         shared
             .job
             .store(std::ptr::from_ref(&job).cast_mut(), Ordering::Relaxed);
@@ -726,11 +736,10 @@ impl WorkgroupPool {
         if unclaimed > 0 {
             job.pending.fetch_sub(unclaimed, Ordering::SeqCst);
         }
-        let mut round = 0;
         let mut deadline = None;
         while job.pending.load(Ordering::Acquire) != 0 {
             if *deadline.get_or_insert_with(|| Instant::now() + shared.spin) > Instant::now() {
-                relax(&mut round);
+                relax();
                 continue;
             }
             let mut guard = shared

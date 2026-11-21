@@ -1293,7 +1293,10 @@ fn eval_loops_of_threads_that_alternate_are_both_compressed() {
         threads.into_iter().map(|thread| thread.join().unwrap()).collect()
     });
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
-    assert!(launches < 40, "{launches} kernels for 2 x {steps} steps");
+    // On the CPU a plan of one step takes the fused kernel, which counts here, where on a GPU it is a
+    // (not counted) one-step stencil: the steps still run in fewer kernels than there are steps.
+    let bound = if ctx.is_cpu() { 2 * steps as u64 * 3 / 5 } else { 40 };
+    assert!(launches < bound, "{launches} kernels for 2 x {steps} steps");
     for (want, got) in results {
         assert_close(&got, &want, 1e-6, 1e-6);
     }
