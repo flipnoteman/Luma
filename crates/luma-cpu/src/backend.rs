@@ -19,7 +19,7 @@ use luma_core::{
 };
 
 use crate::codegen::CompiledCpuKernel;
-use crate::exec::{AlignedBuf, ExecBlob, WorkgroupPool};
+use crate::exec::{AlignedBuf, CostHint, ExecBlob, WorkgroupPool};
 use crate::fission;
 
 /// Most idle bytes of recycled mappable storage kept for reuse.
@@ -295,6 +295,7 @@ impl CpuBackend {
             native.plan.shared_bytes,
             native.plan.scratch_bytes,
             native.plan.initialize_shared,
+            &native.cost,
         );
         drop(store);
         Ok(start.elapsed())
@@ -429,6 +430,7 @@ impl Backend for CpuBackend {
             return Ok(RawKernel::new(CompiledCpuKernel {
                 exec: Arc::new(blob),
                 plan,
+                cost: CostHint::default(),
             }));
         }
         let (compiled, bytes) =

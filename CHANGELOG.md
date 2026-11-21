@@ -6,6 +6,14 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- CPU backend: a launch no longer wakes every worker. The pool learns how long each kernel takes (the time its threads spend in workgroups); a launch too small to pay for a hand-off runs inline on the calling thread, a larger one enlists only as many helpers as it has work for. Idle workers poll for a short while before they sleep, so back-to-back launches skip the futex round trip, and a launch is claimed with atomics instead of a global mutex and condvar.
+
+### Fixed
+
+- CPU backend: an `eval` loop of a stencil step (`u = step(&u); u.eval()`) ran every step through the time-blocked stencil kernel with one step per pass, several times slower than the fused elementwise kernel (the CPU finishes each step before the next is recorded, so a pass never got more than one). A one-step plan takes the fused path on the CPU.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed
