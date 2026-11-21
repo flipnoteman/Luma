@@ -743,6 +743,48 @@ fn quantile_cases(h: &mut Harness) {
         check("quantile/median_axis0", &x.median_axis(0).to_vec().unwrap(), &want, 1e-5, 1e-6);
         case_trim(h, "quantile/median_axis0", &format!("1024x{cols}"), Work::Items(total as f64, "Mrow/s"), &mut || x.median_axis(0).eval().unwrap());
     }
+    // Describe-style statistics of every column of a 64-column table: three quantile calls.
+    if h.want("quantile/cols3_x64") {
+        let rows = table_rows(h);
+        let qs = [0.25f32, 0.5, 0.75];
+        let hx = values(rows * 64, 74, -3.0, 3.0);
+        let x = Array::from_slice_on(&h.ctx, &hx, [rows, 64]).unwrap();
+        let sorted = host_sort_axis(&hx, [rows, 64], 0);
+        let run = || {
+            let r: Vec<Array<f32>> = qs.iter().map(|&q| x.quantile_axis(0, q)).collect();
+            let refs: Vec<&Array<f32>> = r.iter().collect();
+            eval_all(&refs).unwrap();
+            r
+        };
+        for (r, &q) in run().iter().zip(&qs) {
+            let want: Vec<f32> = sorted.chunks(rows).map(|c| host_quantile(c, q)).collect();
+            check("quantile/cols3_x64", &r.to_vec().unwrap(), &want, 1e-5, 1e-6);
+        }
+        case_trim(h, "quantile/cols3_x64", &format!("{rows}x64"), Work::Items((3 * rows * 64) as f64, "Mrow/s"), &mut || {
+            run();
+        });
+    }
+    // Seven quantiles of one long vector.
+    if h.want("quantile/seven_16m") {
+        let n = if h.ctx.is_cpu() || h.quick { 1 << 20 } else { 1 << 24 };
+        let qs = [0.01f32, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99];
+        let hx = values(n, 75, -3.0, 3.0);
+        let x = up(h, &hx);
+        let mut s = hx.clone();
+        s.sort_by(f32::total_cmp);
+        let run = || {
+            let r: Vec<Array<f32>> = qs.iter().map(|&q| x.quantile(q)).collect();
+            let refs: Vec<&Array<f32>> = r.iter().collect();
+            eval_all(&refs).unwrap();
+            r
+        };
+        for (r, &q) in run().iter().zip(&qs) {
+            check_scalar("quantile/seven_16m", f64::from(r.item().unwrap()), f64::from(host_quantile(&s, q)), 1e-5);
+        }
+        case_trim(h, "quantile/seven_16m", &n.to_string(), Work::Items(7.0 * n as f64, "Mrow/s"), &mut || {
+            run();
+        });
+    }
 }
 
 fn host_hist(hx: &[f32], bins: usize, lo: f32, hi: f32) -> Vec<u32> {
@@ -1415,6 +1457,28 @@ fn pipeline_cases(h: &mut Harness) {
 // more sorts, scans, reductions
 // -------------------------------------------------------------------------------------------------
 
+/// Rows of the 64-column tables of the sort and quantile cases: 1M on a GPU, 64k on the CPU
+/// backend and in quick runs.
+fn table_rows(h: &Harness) -> usize {
+    if h.ctx.is_cpu() || h.quick { 1 << 16 } else { 1 << 20 }
+}
+
+/// `data` (shape `[d0, d1]`, axis 0 fastest) with every line along `axis` sorted.
+fn host_sort_axis(data: &[f32], dims: [usize; 2], axis: usize) -> Vec<f32> {
+    let mut out = data.to_vec();
+    let (stride, n) = if axis == 0 { (1, dims[0]) } else { (dims[0], dims[1]) };
+    let lines = data.len() / n;
+    for l in 0..lines {
+        let base = if axis == 0 { l * n } else { l };
+        let mut line: Vec<f32> = (0..n).map(|k| data[base + k * stride]).collect();
+        line.sort_by(f32::total_cmp);
+        for (k, v) in line.into_iter().enumerate() {
+            out[base + k * stride] = v;
+        }
+    }
+    out
+}
+
 fn sort_extra_cases(h: &mut Harness) {
     let n = big(h);
     if h.want("sort/f32_desc") {
@@ -1452,6 +1516,18 @@ fn sort_extra_cases(h: &mut Harness) {
         want.chunks_mut(16).for_each(|c| c.sort_by(f32::total_cmp));
         exact("sort/axis0_len16", &x.sort_axis(0).to_vec().unwrap(), &want);
         case_trim(h, "sort/axis0_len16", &format!("{}x{}", dims[0], dims[1]), Work::Items(total as f64, "Mkey/s"), &mut || x.sort_axis(0).eval().unwrap());
+    }
+    // A table of 64 columns: sort the columns (1M-element contiguous lines), the rows (64-element
+    // strided lines, 1M of them), and a transposed table by its short contiguous lines.
+    let rows = table_rows(h);
+    for (name, dims, axis) in [("sort/axis0_x64", [rows, 64usize], 0usize), ("sort/axis1_x64", [rows, 64], 1), ("sort/axis0_len64", [64, rows], 0)] {
+        if !h.want(name) {
+            continue;
+        }
+        let hx = rand_f32(rows * 64, 15);
+        let x = Array::from_slice_on(&h.ctx, &hx, dims).unwrap();
+        exact(name, &x.sort_axis(axis).to_vec().unwrap(), &host_sort_axis(&hx, dims, axis));
+        case_trim(h, name, &format!("{}x{}", dims[0], dims[1]), Work::Items((rows * 64) as f64, "Mkey/s"), &mut || x.sort_axis(axis).eval().unwrap());
     }
 }
 
