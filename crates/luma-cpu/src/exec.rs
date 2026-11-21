@@ -300,6 +300,8 @@ const DEFAULT_SPIN: Duration = Duration::from_micros(1000);
 /// themselves: their workers sleep at once instead of polling, which leaves the cores to the
 /// kernel (spinners on the other hyperthreads and a lower all-core clock slowed memory-bound
 /// kernels by up to 2x).
+/// Polling rounds (about 0.4 us each) that are a pure busy loop; later rounds yield the core.
+const PAUSE_ROUNDS: u32 = 100;
 const SPIN_BELOW_NS: u64 = 100_000;
 /// Low bits of `Shared::slots`: helper slots still free; the bits above are the job generation.
 const SLOT_BITS: u32 = 16;
@@ -440,11 +442,17 @@ unsafe fn run_job(job: &Job) -> u64 {
     ns
 }
 
-/// One polling round of a spin wait. A busy pause, never a `yield_now`: a yielding spinner on the
-/// sibling hyperthread of a worker slowed memory-bound kernels down by up to 2x.
-fn relax() {
-    for _ in 0..32 {
-        std::hint::spin_loop();
+/// One polling round of a spin wait: a busy pause for the first rounds, then the core is offered
+/// to other threads between polls (a spinner must not hold a core an oversubscribed machine
+/// needs for real work).
+fn relax(round: &mut u32) {
+    if *round < PAUSE_ROUNDS {
+        for _ in 0..32 {
+            std::hint::spin_loop();
+        }
+        *round += 1;
+    } else {
+        std::thread::yield_now();
     }
 }
 
@@ -502,6 +510,7 @@ impl Shared {
 fn worker_loop(shared: Arc<Shared>) {
     let mut seen = 0u64;
     let mut deadline = Instant::now() + shared.spin;
+    let mut round = 0u32;
     loop {
         if shared.shutdown.load(Ordering::Relaxed) {
             return;
@@ -531,7 +540,7 @@ fn worker_loop(shared: Arc<Shared>) {
             continue;
         }
         if Instant::now() < deadline {
-            relax();
+            relax(&mut round);
             continue;
         }
         shared.sleep(seen);
@@ -737,9 +746,10 @@ impl WorkgroupPool {
             job.pending.fetch_sub(unclaimed, Ordering::SeqCst);
         }
         let mut deadline = None;
+        let mut round = 0u32;
         while job.pending.load(Ordering::Acquire) != 0 {
             if *deadline.get_or_insert_with(|| Instant::now() + shared.spin) > Instant::now() {
-                relax();
+                relax(&mut round);
                 continue;
             }
             let mut guard = shared
