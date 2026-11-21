@@ -6,6 +6,16 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `KernelBuilder::unchecked_bounds` (`unsafe`): builds a custom kernel without per-access bounds checks, for kernels whose author vouches that every access is in range (`luma_core::KernelTrust::UncheckedBounds`; the backend interface takes a `KernelTrust` where it took `trusted: bool`). On wgpu this is the only way to drop WebGPU's own checks.
+- `DeviceInfo::compute_units`: the device's multiprocessors (CUDA `MULTIPROCESSOR_COUNT`, Vulkan `VK_NV_shader_sm_builtins` / `VK_AMD_shader_core_properties` on wgpu, worker threads on the CPU backend, unknown on Metal).
+
+### Changed
+
+- The plan constants measured on an RTX 3090 (82 multiprocessors) scale with the device's multiprocessor count and are unchanged at 82: the workgroups of a K-split matmul (`SPLIT_GROUPS`, `SPLIT_TILES`), the twisted Thomas solve's line limit (`TWISTED_LINES`), the line count the strided/contiguous Thomas workgroup is sized for, and `Tuning::line_cyclic_work`. Backends that cannot report the count (Metal, wgpu on other vendors) and the CPU backend keep the 3090 values.
+- Bounds checks of untrusted kernels skip the accesses they can prove in range: indices built from `local_invocation_id`, `local_invocation_index`, literals, wrap-free arithmetic and counted `for` loops (`for (var k = 0u; k < 16u; k += 2u)`) into workgroup and function arrays (a tiled SGEMM's inner loop no longer pays a select per workgroup-memory read).
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed
