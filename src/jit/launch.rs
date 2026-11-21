@@ -1764,7 +1764,9 @@ pub(crate) fn matmul(
 /// inside the kernel (the program becomes the load `luma_eval(q)`, see `scan::reduce_body`):
 /// `geometry` are the first fields of the uniform (the scalars of the expression follow),
 /// `outs` the buffers it writes. Returns `false`, having launched nothing, when the expression
-/// cannot be fused (see [`fusable`]); the caller then reduces its evaluated buffer.
+/// cannot be fused (see [`fusable`]); the caller then reduces its evaluated buffer. `reads` are buffers
+/// the pass reads besides the expression's (bound after them, before the uniform).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn axis_reduce(
     ctx: &crate::context::Context,
     node: &Arc<Node>,
@@ -1773,11 +1775,12 @@ pub(crate) fn axis_reduce(
     workgroups: [u32; 3],
     size: [u32; 3],
     outs: &[RawArg<'_>],
+    reads: &[RawArg<'_>],
 ) -> Result<bool, Failure> {
     let Some(args) = node.operands() else { return Ok(false) };
     let (fused, args) = flatten_bounded(node, args, Tail::AxisReduce(pass))?;
     drop(args);
-    if !fusable(ctx, &fused, outs.len()) {
+    if !fusable(ctx, &fused, outs.len() + reads.len()) {
         return Ok(false);
     }
     fused.mark_fused();
@@ -1788,9 +1791,10 @@ pub(crate) fn axis_reduce(
     let mut uniform = Vec::with_capacity(geometry.len() + scalars.len());
     uniform.extend_from_slice(&geometry);
     uniform.extend_from_slice(&scalars);
-    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + 1);
+    let mut raw: Vec<RawArg<'_>> = Vec::with_capacity(outs.len() + pins.len() + reads.len() + 1);
     raw.extend_from_slice(outs);
     raw.extend(pins.iter().map(|(pin, bytes)| RawArg::read(pin.buffer(), *bytes)));
+    raw.extend_from_slice(reads);
     raw.push(RawArg::Uniform(bytemuck::cast_slice(&uniform)));
     ctx.launch(&core, workgroups, size, &raw)?;
     ctx.jit().stats.reduce_launches.fetch_add(1, Ordering::Relaxed);

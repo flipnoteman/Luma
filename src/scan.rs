@@ -110,6 +110,8 @@ pub(crate) enum Pass {
     /// Contiguous lines, same workgroups: the fold of the chunk with the invocations striding
     /// over it, so the operator must be commutative as well as associative.
     ChunkReduce,
+    /// Segmented reduction over entries cut in tiles by offsets (see [`crate::segments`]): one workgroup per tile.
+    Segments,
 }
 
 impl Pass {
@@ -124,12 +126,13 @@ impl Pass {
             Pass::ChunkScan { .. } => "ScanChunk",
             Pass::ChunkLookback => "ScanLookback",
             Pass::ChunkReduce => "ReduceChunk",
+            Pass::Segments => "SegmentsTile",
         }
     }
 
     /// Whether the pass runs one workgroup (instead of one invocation) per unit of work.
     fn per_workgroup(self) -> bool {
-        matches!(self, Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce)
+        matches!(self, Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce | Pass::Segments)
     }
 
     fn seeded(self) -> bool {
@@ -181,12 +184,15 @@ impl AxisPass {
 
     /// How many buffers the pass writes (`@binding(0..)`).
     pub(crate) fn outputs(self) -> usize {
-        if self.split { self.ops.as_slice().len() } else { 1 }
+        if self.pass == Pass::Segments { 2 } else if self.split { self.ops.as_slice().len() } else { 1 }
     }
 
     /// The declarations of the output buffers, of elements of `ty` (`u32`, the indices and the
     /// bits of the values, for an arg reduction).
     pub(crate) fn output_bindings(self, ty: &str) -> String {
+        if self.pass == Pass::Segments {
+            return crate::segments::tile_outputs(ty);
+        }
         let ty = if self.ops.as_slice().first().is_some_and(|op| op.is_arg()) { "u32" } else { ty };
         let mut src = String::new();
         for j in 0..self.outputs() {
@@ -217,6 +223,9 @@ fn reduce_source(pass: AxisPass, ty: &str, workgroup: u32) -> String {
 /// array reductions (`ReduceElem::combine`), so a NaN is handled as `Array::min` and `max` do;
 /// `SumSquares` squares the cells it reads.
 pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) -> String {
+    if pass.pass == Pass::Segments {
+        return crate::segments::tile_body(ty, pass.ops.as_slice()[0], load);
+    }
     if pass.ops.as_slice().first().is_some_and(|op| op.is_arg()) {
         return crate::arg::body(pass, ty, load, workgroup);
     }
@@ -389,7 +398,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
             }
             src.push_str("    }\n}\n");
         }
-        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback => unreachable!("scans are not reductions"),
+        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::Segments => unreachable!("scans are not reductions"),
     }
     src
 }
@@ -470,7 +479,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "
         }
-        Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce => unreachable!("workgroup passes return above"),
+        Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce | Pass::Segments => unreachable!("workgroup passes return above"),
     };
     src.push_str(&main.replace("__T__", ty));
     src
@@ -957,7 +966,7 @@ impl<'a> Lines<'a> {
                 return Ok(());
             }
             Input::Pending(node) => {
-                if jit::axis_reduce(self.ctx, node, pass, geometry, workgroups, size, &writes)? {
+                if jit::axis_reduce(self.ctx, node, pass, geometry, workgroups, size, &writes, &[])? {
                     return Ok(());
                 }
                 let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;

@@ -540,6 +540,34 @@ fn group_cases(h: &mut Harness) {
         case_trim(h, &name, &sz, Work::Bytes(bytes), &mut || vals.group_sum(&codes, groups).eval().unwrap());
     }
 
+    // Codes in sorted order (a table sorted by its key): `group_sum` by code (one atomic add per row) against
+    // `sum_segments` over the offsets of the groups.
+    for (tag, groups) in [("g16", 16usize), ("g1k", 1000), ("g1m", 1_000_000)] {
+        let (atomic, segments) = (format!("group/sum_sorted_{tag}"), format!("group/sum_sorted_seg_{tag}"));
+        if !h.want(&atomic) && !h.want(&segments) {
+            continue;
+        }
+        let mut hc = ints(n, 52, groups as u32);
+        hc.sort_unstable();
+        let mut offsets = vec![0u32; groups + 1];
+        for &c in &hc {
+            offsets[c as usize + 1] += 1;
+        }
+        for g in 0..groups {
+            offsets[g + 1] += offsets[g];
+        }
+        let (sum, mag) = host_group_sum(&hc, &hv, groups);
+        let (codes, offs) = (up(h, &hc), up(h, &offsets));
+        if h.want(&atomic) {
+            check_sums(&atomic, &vals.group_sum(&codes, groups).to_vec().unwrap(), &sum, &mag, 2e-4);
+            case_trim(h, &atomic, &sz, Work::Bytes(bytes), &mut || vals.group_sum(&codes, groups).eval().unwrap());
+        }
+        if h.want(&segments) {
+            check_sums(&segments, &vals.sum_segments(&offs).to_vec().unwrap(), &sum, &mag, 2e-4);
+            case_trim(h, &segments, &sz, Work::Bytes(bytes), &mut || vals.sum_segments(&offs).eval().unwrap());
+        }
+    }
+
     let g = 1000usize;
     let hc = ints(n, 53, g as u32);
     let codes = up(h, &hc);
