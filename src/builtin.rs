@@ -853,6 +853,9 @@ pub(crate) enum Builtin {
     /// A kernel of a radix sort pass reading its keys from a buffer; see [`crate::sort`].
     /// Element type `"u32"`. `first` passes read the user's keys.
     Radix { pass: crate::sort::RadixPass, first: bool },
+    /// Sorts the lines of an array along an axis in workgroup memory; see [`crate::segsort`].
+    /// Arguments: out, src, uniform `{n, stride, lines, tiles, tpo}`. Element type `"u32"`.
+    SortLines(crate::segsort::LineSort),
     /// Tiled matrix product of the operands (buffers) `a` and `b`; see [`crate::matmul`].
     /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
     /// dimension and writes every slice's partial product after the previous one.
@@ -2478,6 +2481,7 @@ impl Builtin {
             }
             Builtin::SolveParts(spec) => wgsl(spec.source()),
             Builtin::Radix { pass, first } => wgsl(crate::sort::source(pass, first)),
+            Builtin::SortLines(sort) => wgsl(sort.source()),
             Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split)),
             Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module()),
             Builtin::FilterCount => wgsl(crate::filter::count_source()),
