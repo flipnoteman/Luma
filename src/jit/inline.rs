@@ -1127,6 +1127,7 @@ fn rebuilt(key: &FusedKey, main: Vec<Instr>, subs: Vec<Vec<Instr>>, outputs: Vec
         staging: None,
         guard: key.guard,
         params: None,
+        coarsen: 1,
     }
 }
 
@@ -1429,6 +1430,7 @@ mod tests {
             staging: None,
             guard: None,
             params: None,
+            coarsen: 1,
         }
     }
 

@@ -948,10 +948,14 @@ fn launch_store(
     } else {
         for j in 0..first.segments() {
             let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
-            launch_1d(ctx, core, args.n, &args.raw())?;
+            let groups = args.n.div_ceil(core.workgroup[0] * u32::from(key.coarsen.max(1)));
+            ctx.launch(core, fold_workgroups(ctx, groups)?, [args.n, 1, 1], &args.raw())?;
         }
     }
     ctx.jit().stats.elementwise_launches.fetch_add(1, Ordering::Relaxed);
+    if key.coarsen > 1 {
+        ctx.jit().stats.coarsened.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -1018,6 +1022,7 @@ fn run_store_planned(ctx: &crate::context::Context, len: usize, fused: Fused) ->
     if shifted.is_none() && key.staging.is_none() {
         key.tile = super::codegen::plan_tile(&key, &scalars, len, ctx.tuning());
     }
+    key.coarsen = super::coarsen::plan(ctx, &key, len);
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
 
     let outputs = match reused {
@@ -1067,6 +1072,7 @@ pub(crate) fn evaluate_into(node: &Arc<Node>, target: &Arc<Storage>) -> Result<(
     if shifted.is_none() && key.staging.is_none() {
         key.tile = super::codegen::plan_tile(&key, &scalars, node.len(), ctx.tuning());
     }
+    key.coarsen = super::coarsen::plan(ctx, &key, node.len());
     let core = ctx.jit().kernel(ctx, &mut key, &mut scalars)?;
     launch_store(ctx, &core, &key, &[&**target], &inputs, &scalars, shifted.as_ref())?;
     check_finite(ctx, target, node.op().out_ty())?;

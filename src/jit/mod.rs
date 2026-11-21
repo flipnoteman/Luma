@@ -154,6 +154,7 @@
 mod bits;
 pub(crate) mod assign;
 mod codegen;
+mod coarsen;
 pub(crate) mod cost;
 mod inline;
 mod kirgen;
@@ -2524,6 +2525,8 @@ struct Stats {
     speculated: AtomicU64,
     /// Of the elementwise launches, the tiled transposes (see [`transpose`]).
     transposes: AtomicU64,
+    /// Of the elementwise launches, the ones that ran several elements per invocation (see [`coarsen`]).
+    coarsened: AtomicU64,
 }
 
 /// A snapshot of the counters of a context's [`JitState`].
@@ -2538,6 +2541,7 @@ pub(crate) struct StatsSnapshot {
     pub(crate) replays: u64,
     pub(crate) speculated: u64,
     pub(crate) transposes: u64,
+    pub(crate) coarsened: u64,
 }
 
 impl JitState {
@@ -2962,6 +2966,7 @@ impl JitState {
             replays: self.stats.replays.load(Ordering::Relaxed),
             speculated: self.stats.speculated.load(Ordering::Relaxed),
             transposes: self.stats.transposes.load(Ordering::Relaxed),
+            coarsened: self.stats.coarsened.load(Ordering::Relaxed),
         }
     }
 
@@ -3243,6 +3248,7 @@ impl JitState {
         let orig_staging = key.staging.clone();
         let orig_tile = key.tile.clone();
         let orig_guard = key.guard;
+        let orig_coarsen = key.coarsen;
         let base_words = scalars.len();
 
         if key.staging.is_none() && key.tile.is_none() {
@@ -3299,6 +3305,7 @@ impl JitState {
             staging: orig_staging,
             tile: orig_tile,
             guard: orig_guard,
+            coarsen: orig_coarsen,
             extra_words,
             params: params_marker,
             core: Arc::clone(&core),
@@ -3475,6 +3482,7 @@ struct FastKernel {
     staging: Option<staging::Staging>,
     tile: Option<codegen::Tile>,
     guard: Option<u32>,
+    coarsen: u8,
     extra_words: Box<[u32]>,
     params: Option<Arc<params::Parameterized>>,
     core: Arc<KernelCore>,
@@ -3496,6 +3504,7 @@ impl FastKernel {
             && self.staging == key.staging
             && self.tile == key.tile
             && self.guard == key.guard
+            && self.coarsen == key.coarsen
     }
 }
 
@@ -3510,5 +3519,6 @@ fn fast_key_hash(key: &program::FusedKey) -> u64 {
     key.staging.hash(&mut hasher);
     key.tile.hash(&mut hasher);
     key.guard.hash(&mut hasher);
+    key.coarsen.hash(&mut hasher);
     hasher.finish()
 }

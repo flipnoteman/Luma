@@ -17,6 +17,8 @@ const MAX_LIVE_ENV: &str = "LUMA_FUSION_MAX_LIVE";
 const MAX_INLINED_ENV: &str = "LUMA_FUSION_MAX_INLINED";
 /// `LUMA_STAGING=off` keeps sub-programs read through views out of workgroup memory (see `jit::staging`).
 const STAGING_ENV: &str = "LUMA_STAGING";
+/// `LUMA_COARSEN=off|auto|<n>` sets [`Tuning::coarsen`] (see `jit::coarsen`).
+const COARSEN_ENV: &str = "LUMA_COARSEN";
 /// `LUMA_TRIDIAGONAL=thomas|cyclic|auto` picks the line solver of `solve_tridiagonal` (see [`LineSolver`]).
 const LINE_SOLVER_ENV: &str = "LUMA_TRIDIAGONAL";
 /// `LUMA_SINGLE_PASS_REDUCE=off|on` overrides [`Tuning::single_pass_reduce`] (`on` only takes
@@ -39,6 +41,38 @@ const NATIVE_SOLVE_ENV: &str = "LUMA_NATIVE_SOLVE";
 /// backend) as compiled tile kernels, like the GPU backends (see [`Tuning::native_gemm`]).
 const NATIVE_GEMM_ENV: &str = "LUMA_NATIVE_GEMM";
 
+/// How many output elements one invocation of a fused elementwise kernel computes (see `jit::coarsen`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Coarsen {
+    /// One element per invocation, always.
+    Off,
+    /// The planner picks 1, 2, 4 or 8 per launch from the size of the array and the cost of the program.
+    Auto,
+    /// This many (1, 2, 4 or 8) wherever the kernel can run it, whatever the size.
+    Fixed(u8),
+}
+
+impl Coarsen {
+    /// Reads `LUMA_COARSEN`: `off`, `auto` or a count (rounded down to 1, 2, 4 or 8); `default` if unset or not understood.
+    fn from_env(default: Coarsen) -> Coarsen {
+        match std::env::var(COARSEN_ENV).as_deref().map(str::trim) {
+            Ok("off") => Coarsen::Off,
+            Ok("auto") => Coarsen::Auto,
+            Ok(value) => match value.parse::<u8>() {
+                Ok(0) => Coarsen::Off,
+                Ok(n) => Coarsen::Fixed(match n {
+                    1 => 1,
+                    2 | 3 => 2,
+                    4..=7 => 4,
+                    _ => 8,
+                }),
+                Err(_) => default,
+            },
+            Err(_) => default,
+        }
+    }
+}
+
 /// The algorithm of the tridiagonal and block-tridiagonal line solves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum LineSolver {
@@ -60,6 +94,8 @@ pub(crate) struct Tuning {
     pub(crate) profile: TuningProfile,
     /// Invocations per workgroup of elementwise kernels (fused and fills).
     pub(crate) elementwise_workgroup: u32,
+    /// Output elements per invocation of fused elementwise kernels; `LUMA_COARSEN` overrides.
+    pub(crate) coarsen: Coarsen,
     /// Tiled 1D convolution: invocations per workgroup, and outputs per invocation at stride 1.
     pub(crate) conv_workgroup: u32,
     pub(crate) conv_per_thread: u32,
@@ -183,6 +219,7 @@ impl Tuning {
     const APPLE: Tuning = Tuning {
         profile: TuningProfile::Apple,
         elementwise_workgroup: 64,
+        coarsen: Coarsen::Off,
         conv_workgroup: 128,
         conv_per_thread: 32,
         stencil_tile_bytes: 8 * 1024,
@@ -219,6 +256,7 @@ impl Tuning {
     const NVIDIA: Tuning = Tuning {
         profile: TuningProfile::Nvidia,
         elementwise_workgroup: 256,
+        coarsen: Coarsen::Off,
         conv_workgroup: 256,
         conv_per_thread: 32,
         stencil_tile_bytes: 32 * 1024,
@@ -256,6 +294,7 @@ impl Tuning {
     const GENERIC: Tuning = Tuning {
         profile: TuningProfile::Generic,
         elementwise_workgroup: 256,
+        coarsen: Coarsen::Off,
         conv_workgroup: 256,
         conv_per_thread: 16,
         stencil_tile_bytes: 16 * 1024,
@@ -292,6 +331,7 @@ impl Tuning {
     const CPU: Tuning = Tuning {
         profile: TuningProfile::Cpu,
         elementwise_workgroup: 64,
+        coarsen: Coarsen::Off,
         max_live: 256,
         max_inlined: 1024,
         line_cyclic_work: 0,
@@ -353,6 +393,7 @@ impl Tuning {
         if let Some(units) = info.compute_units.filter(|_| profile != TuningProfile::Cpu) {
             tuning.compute_units = units.max(1);
         }
+        tuning.coarsen = Coarsen::from_env(tuning.coarsen);
         tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
         tuning.line_solver = match std::env::var(LINE_SOLVER_ENV).as_deref().map(str::trim) {
             Ok("thomas") => LineSolver::Thomas,

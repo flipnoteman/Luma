@@ -2168,13 +2168,38 @@ impl<'a> Build<'a> {
         }
     }
 
-    /// The plain store kernel: one element per invocation.
+    /// The plain store kernel: one element per invocation, or `key.coarsen` elements spaced by
+    /// the number of invocations of the launch (see `jit::coarsen`): the elements of one warp stay
+    /// contiguous, and the loads of all of them are issued before the first store.
     fn plain(&self, fb: &mut FnBuilder<'_>) {
         let i = element_index(fb, self.wg);
         self.guard(fb, i);
         let index = self.global(fb, i);
         let prog = self.program(fb, i, index);
+        let c = self.key.coarsen;
+        if c <= 1 {
+            self.emit_stores(fb, &prog, i);
+            return;
+        }
+        debug_assert!(super::coarsen::coarsenable(self.key), "a coarsened kernel of a variant that cannot be");
+        let nwg = fb.builtin(BuiltinVar::NumWorkgroups);
+        let (nx, ny) = (fb.field(nwg, 0, KirType::U32), fb.field(nwg, 1, KirType::U32));
+        let stride = fb.let_val("stride", nx * ny * lu(fb, self.wg));
+        let last = fb.grid_size(0) - lu(fb, 1);
+        let mut rest = Vec::with_capacity(c as usize - 1);
+        for k in 1..u32::from(c) {
+            let e = fb.let_val("e", i + stride * lu(fb, k));
+            let inside = fb.let_val("ok", fb.lt(e, fb.grid_size(0)));
+            // Elements past the end read the last one, so that the loads need no branch; their
+            // stores are skipped.
+            let at = fb.let_val("ec", fb.select(inside, e, last));
+            let index = self.global(fb, at);
+            rest.push((e, inside, self.program(fb, at, index)));
+        }
         self.emit_stores(fb, &prog, i);
+        for (e, inside, prog) in &rest {
+            fb.if_then(*inside, |b| self.emit_stores(b, prog, *e));
+        }
     }
 
     /// An atomic scatter whose workgroups first accumulate into workgroup memory (the target is
