@@ -517,11 +517,16 @@ fn implicit<const N: usize>(h: &mut Harness, z: &Z, group: &str) {
         for dims in [&small, &big] {
             let q = upload::<N>(&ctx, &init_host::<N>(dims, 1.0), dims);
             let zero = zeros(&ctx, dims);
+            let first = std::cell::Cell::new(true);
             let mut f = || {
                 let (un, rn) = implicit_step(&q, &cfl, &zero, 2);
                 let mut all: Vec<&A> = un.iter().collect();
                 all.push(&rn);
                 eval_all(&all).unwrap();
+                if first.replace(false) {
+                    let rho_min = un[0].min().item().unwrap();
+                    assert!(rho_min.is_finite() && rho_min > 0.0, "{group}: minimum density {rho_min} after a step on {}", dims_str(dims));
+                }
             };
             h.case(&format!("{group}_step"), &dims_str(dims), Work::Cells(cells_of(dims) as f64), &mut f);
         }
@@ -631,7 +636,16 @@ fn implicit_loop<const N: usize, const M: usize>(h: &mut Harness, z: &Z, group: 
         for (dims, steps) in [(&small, steps_s), (&big, steps_l)] {
             let lp = Loop::<N, M>::new(&ctx, dims);
             let s0 = init_state::<N, M>(&ctx, dims, 1.0, 2.0);
-            let mut f = || force_state(&lp.fresh(&s0, steps).state);
+            // The big grids have no host reference: on the first call the density must be finite and positive after the run.
+            let first = std::cell::Cell::new(true);
+            let mut f = || {
+                let state = lp.fresh(&s0, steps).state;
+                force_state(&state);
+                if first.replace(false) {
+                    let rho_min = state[0].min().item().unwrap();
+                    assert!(rho_min.is_finite() && rho_min > 0.0, "{group}: minimum density {rho_min} after {steps} steps on {}", dims_str(dims));
+                }
+            };
             h.case(group, &format!("{}:{steps}st", dims_str(dims)), Work::Cells((cells_of(dims) * steps) as f64), &mut f);
         }
     });
