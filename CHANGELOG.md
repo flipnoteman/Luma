@@ -8,7 +8,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
-- CPU backend: a launch no longer wakes every worker. The pool learns how long each kernel takes (the time its threads spend in workgroups); a launch too small to pay for a hand-off runs inline on the calling thread, a larger one enlists only as many helpers as it has work for. Idle workers poll for a short while before they sleep, so back-to-back launches skip the futex round trip, and a launch is claimed with atomics instead of a global mutex and condvar.
+- CPU backend: a launch no longer wakes every worker. The pool learns how long each kernel takes (the time its threads spend in workgroups); a launch too small to pay for a hand-off runs inline on the calling thread, a larger one enlists only as many helpers as it has work for. Idle workers poll for up to a millisecond before they sleep (`LUMA_CPU_SPIN_US`, `0` to sleep at once), so back-to-back launches skip the futex round trip, and a launch is claimed with atomics instead of a global mutex and condvar.
 
 ### Fixed
 

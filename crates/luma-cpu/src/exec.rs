@@ -293,8 +293,9 @@ const HOT_NS: u64 = 5_000;
 const COLD_NS: u64 = 16_000;
 /// Prior cost of one invocation before the first measurement.
 const PRIOR_NS_PER_INVOCATION: u64 = 1;
-/// How long an idle worker or the waiting dispatcher polls before it sleeps on a condvar.
-const SPIN: Duration = Duration::from_micros(100);
+/// How long an idle worker or the waiting dispatcher polls before it sleeps on a condvar
+/// (`LUMA_CPU_SPIN_US`). Long enough to bridge the host work between the launches of a loop.
+const DEFAULT_SPIN: Duration = Duration::from_micros(1000);
 /// Polling rounds that are a pure busy loop; later rounds yield the core between polls.
 const SPIN_ROUNDS: u32 = 100;
 /// Low bits of `Shared::slots`: helper slots still free; the bits above are the job generation.
@@ -358,6 +359,7 @@ struct Shared {
     job: AtomicPtr<Job>,
     /// Workers blocked on (or about to block on) `wake`.
     sleepers: AtomicUsize,
+    spin: Duration,
     dispatcher_sleeping: AtomicBool,
     shutdown: AtomicBool,
     wake_lock: Mutex<()>,
@@ -496,7 +498,7 @@ impl Shared {
 
 fn worker_loop(shared: Arc<Shared>) {
     let mut seen = 0u64;
-    let mut deadline = Instant::now() + SPIN;
+    let mut deadline = Instant::now() + shared.spin;
     let mut round = 0u32;
     loop {
         if shared.shutdown.load(Ordering::Relaxed) {
@@ -522,7 +524,7 @@ fn worker_loop(shared: Arc<Shared>) {
                 );
                 shared.done.notify_one();
             }
-            deadline = Instant::now() + SPIN;
+            deadline = Instant::now() + shared.spin;
             round = 0;
             continue;
         }
@@ -551,7 +553,11 @@ static POOL: LazyLock<Arc<WorkgroupPool>> = LazyLock::new(|| {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
-    WorkgroupPool::new(threads)
+    let spin = std::env::var("LUMA_CPU_SPIN_US")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_SPIN, Duration::from_micros);
+    WorkgroupPool::with_spin(threads, spin)
 });
 
 impl WorkgroupPool {
@@ -560,11 +566,18 @@ impl WorkgroupPool {
     }
 
     pub fn new(threads: usize) -> Arc<Self> {
+        Self::with_spin(threads, DEFAULT_SPIN)
+    }
+
+    /// A pool of `threads` threads (the caller of `dispatch` is one) whose idle workers poll for
+    /// `spin` before they sleep.
+    pub fn with_spin(threads: usize, spin: Duration) -> Arc<Self> {
         let threads = threads.clamp(1, 4096);
         let shared = Arc::new(Shared {
             slots: Padded(AtomicU64::new(0)),
             job: AtomicPtr::new(std::ptr::null_mut()),
             sleepers: AtomicUsize::new(0),
+            spin,
             dispatcher_sleeping: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
@@ -681,13 +694,23 @@ impl WorkgroupPool {
             *generation << SLOT_BITS | (participants as u64 - 1),
             Ordering::SeqCst,
         );
-        if wake > 0 && shared.sleepers.load(Ordering::SeqCst) > 0 {
+        let sleepers = if wake > 0 {
+            shared.sleepers.load(Ordering::SeqCst)
+        } else {
+            0
+        };
+        if sleepers > 0 {
             let _guard = shared
                 .wake_lock
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            for _ in 0..wake {
-                shared.wake.notify_one();
+            if wake * 2 >= sleepers {
+                // Most of them are needed: one wake-up call instead of one syscall per worker.
+                shared.wake.notify_all();
+            } else {
+                for _ in 0..wake {
+                    shared.wake.notify_one();
+                }
             }
         }
         // SAFETY: the slices outlive the call.
@@ -706,7 +729,7 @@ impl WorkgroupPool {
         let mut round = 0;
         let mut deadline = None;
         while job.pending.load(Ordering::Acquire) != 0 {
-            if *deadline.get_or_insert_with(|| Instant::now() + SPIN) > Instant::now() {
+            if *deadline.get_or_insert_with(|| Instant::now() + shared.spin) > Instant::now() {
                 relax(&mut round);
                 continue;
             }
@@ -836,8 +859,8 @@ mod tests {
 
     #[test]
     fn dispatch_zero_one_and_many_workgroups() {
-        for threads in [1, 2, 4, 9] {
-            let pool = WorkgroupPool::new(threads);
+        for (threads, spin) in [(1, 1000), (2, 1000), (4, 1000), (9, 1000), (4, 0), (9, 0)] {
+            let pool = WorkgroupPool::with_spin(threads, Duration::from_micros(spin));
             run(&pool, [1, 1, 1]);
             run(&pool, [2, 1, 1]);
             run(&pool, [3, 1, 1]);
@@ -874,12 +897,12 @@ mod tests {
 
     #[test]
     fn dispatch_after_workers_went_to_sleep() {
-        let pool = WorkgroupPool::new(6);
+        let pool = WorkgroupPool::with_spin(6, Duration::from_micros(50));
         run_with(&pool, [256, 1, 1], &hint(1_000_000));
         let give_up = Instant::now() + Duration::from_secs(20);
         while pool.shared.sleepers.load(Ordering::SeqCst) < 5 {
             assert!(Instant::now() < give_up, "workers never went to sleep");
-            std::thread::sleep(SPIN);
+            std::thread::sleep(Duration::from_millis(1));
         }
         for _ in 0..50 {
             run_with(&pool, [256, 1, 1], &hint(1_000_000));
@@ -980,9 +1003,9 @@ mod tests {
         let pool = WorkgroupPool::new(5);
         run_with(&pool, [64, 1, 1], &hint(1_000_000));
         drop(pool);
-        let pool = WorkgroupPool::new(5);
+        let pool = WorkgroupPool::with_spin(5, Duration::from_micros(50));
         run_with(&pool, [64, 1, 1], &hint(1_000_000));
-        std::thread::sleep(SPIN * 3);
+        std::thread::sleep(Duration::from_millis(5));
         drop(pool);
     }
 }

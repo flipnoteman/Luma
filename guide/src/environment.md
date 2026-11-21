@@ -16,7 +16,7 @@ builder methods override them:
 | `LUMA_DF_FMA` | `df_fma` / `.df_fma(fused)` |
 
 The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LOOKBACK_SCAN`, `LUMA_FUSION_*`,
-`LUMA_STAGING`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_CACHE*`, `LUMA_CUDA_DUMP`, `LUMA_CPU_THREADS`, `LUMA_EXIT_WAIT`) are read from the environment only.
+`LUMA_STAGING`, `LUMA_TRIDIAGONAL`, `LUMA_SPECULATE`, `LUMA_CACHE*`, `LUMA_CUDA_DUMP`, `LUMA_CPU_THREADS`, `LUMA_CPU_SPIN_US`, `LUMA_EXIT_WAIT`) are read from the environment only.
 
 ## All variables
 
@@ -45,6 +45,7 @@ The others (`LUMA_TUNING`, `LUMA_SUBGROUPS`, `LUMA_SINGLE_PASS_REDUCE`, `LUMA_LO
 | `LUMA_CUDA_DUMP` | a directory: the CUDA backend writes the NVVM IR (`.ll`), the PTX (`.ptx`) and the label (`.label`) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code |
 | `LUMA_CACHE_DIR` | Directory of that cache (default `$XDG_CACHE_HOME/luma` when that is an absolute path, else `%LOCALAPPDATA%\luma` on Windows, else `~/.cache/luma`); files are written atomically, so processes may share it, and a damaged file is ignored. A wgpu pipeline cache that grows past 32 MB is dropped and starts again |
 | `LUMA_CPU_THREADS` | Number of worker threads of the native `cpu` backend (default: the machine's available parallelism; a value that is not a positive number is ignored) |
+| `LUMA_CPU_SPIN_US` | Microseconds an idle worker of the native `cpu` backend polls for the next launch before it sleeps (default 1000; `0` sleeps at once, which saves power and helps when the machine is oversubscribed, at the cost of a wake-up per launch) |
 | `LUMA_EXIT_WAIT` | `0` skips waiting at exit for the driver's threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver's exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA's Vulkan driver) and then ends the process with `_exit` |
 
 ## Testing variables
