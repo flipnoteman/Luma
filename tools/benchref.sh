@@ -34,6 +34,9 @@ if [ -n "$src" ]; then
 else
   git -C "$here" archive "$ref" | tar -x -C "$snap"
 fi
+# Fresh mtimes: an archive carries the commit's times, which can be older than the artifacts a
+# shared target dir holds for another ref, and cargo would then reuse those.
+find "$snap" -type f -exec touch {} +
 git -C "$snap" init -q && git -C "$snap" add -A >/dev/null && git -C "$snap" -c user.name=b -c user.email=b@b commit -qm "luma $sha" >/dev/null
 
 sargs=(); [ "$suites" = - ] || sargs=(--suite "$suites")
@@ -41,7 +44,8 @@ coldline=""; [ $cold = 1 ] && coldline='export LUMA_CACHE_DIR=$(mktemp -d)'
 run="export PATH=\$HOME/.cargo/bin:\$PATH LUMA_BENCH_REF=$sha
 mkdir -p out
 $coldline
-cargo build --release -p luma-bench 2>&1 | tail -2
+cargo build --release -p luma-bench > out/build.log 2>&1 || { tail -30 out/build.log; echo 'benchref: build failed'; exit 1; }
+tail -2 out/build.log
 BIN=\${CARGO_TARGET_DIR:-target}/release/luma-bench"
 if [ "$host" = cpu ]; then
   loop="LUMA_DEVICE=cpu CUDA_VISIBLE_DEVICES=-1 VK_ICD_FILENAMES=/nonexistent \$BIN ${sargs[*]} $quick --json out/$label-cpu.jsonl"
