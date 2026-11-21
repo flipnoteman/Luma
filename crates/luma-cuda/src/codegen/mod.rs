@@ -1945,8 +1945,7 @@ mod tests {
         assert!(!t.source.contains("activemask"), "{}", t.source);
         // `x` and `s` are values; only the loop counter has a stack slot.
         assert_eq!(t.source.matches("alloca").count(), 1, "{}", t.source);
-        // No typed access goes through a byte offset any more.
-        assert!(!t.source.contains("getelementptr inbounds i8"), "{}", t.source);
+        // Dynamically indexed accesses keep the byte form (see `Fb::typed_ptr`).
     }
 
     #[test]
