@@ -704,7 +704,8 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
     };
     let axis_outputs = match key.tail {
         Tail::AxisReduce(pass) => {
-            src.push_str(&pass.output_bindings(out_ty(key.instrs.len().saturating_sub(1))));
+            let at = if pass.ops.roots().is_some() { key.outputs.first().map_or(key.instrs.len().saturating_sub(1), |&at| at as usize) } else { key.instrs.len().saturating_sub(1) };
+            src.push_str(&pass.output_bindings(out_ty(at)));
             pass.outputs()
         }
         _ => 0,
@@ -880,8 +881,15 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         Tail::AxisReduce(pass) => {
             let names = Names { views: &views, in_place: &[] };
             let last = key.instrs.len().saturating_sub(1);
-            src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
-            src.push_str(&crate::scan::reduce_body(pass, out_ty(last), "luma_eval", wg));
+            if pass.ops.roots().is_some() {
+                // Ops that reduce several roots read the array of their values at every cell.
+                let parts: Vec<Part> = key.outputs.iter().map(|&at| Part::Root(at as usize)).collect();
+                src.push_str(&load_cell("luma_eval", key, &parts, inlined, &names, index, segmented));
+            } else {
+                src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
+            }
+            let elem_at = if pass.ops.roots().is_some() { key.outputs.first().map_or(last, |&at| at as usize) } else { last };
+            src.push_str(&crate::scan::reduce_body(pass, out_ty(elem_at), "luma_eval", wg));
         }
         Tail::Matmul { tile, aligned, split, lhs, rhs } => {
             let names = Names { views: &views, in_place: &[] };

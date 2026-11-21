@@ -729,7 +729,13 @@ fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
                 main.last().copied().into_iter().collect()
             }
         }
-        Tail::AxisReduce(_) => main.last().copied().into_iter().collect(),
+        Tail::AxisReduce(pass) => {
+            if pass.ops.roots().is_some() {
+                key.outputs.iter().filter_map(|&at| value(at)).collect()
+            } else {
+                main.last().copied().into_iter().collect()
+            }
+        }
     }
 }
 

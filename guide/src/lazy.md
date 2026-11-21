@@ -109,7 +109,7 @@ Not fused, because they need whole-array structure: `scan`, stacked `solve_block
 and your own kernels. They read the arrays they are given, which are computed first.
 `matmul`, `solve_tridiagonal` / `solve_tridiagonal_parts` / `solve_block_tridiagonal_parts`, the axis reductions (`sum_axis`, `reduce_axis`, `argmax_axis`, ...), the scatters (`put_add`, ...) and
 the sorts are kernels of their own too, but they compute a pending operand *inside* their loads
-instead of storing it, and `matmul`, the line solves, the axis reductions and the sorts are eager: the result is
+instead of storing it, and `matmul`, the line solves, the sorts and the axis reductions of types other than `f32` (and of `f32` while a step is recorded or profiled) are eager: the result is
 evaluated when the call returns, so what reads it is another kernel
 ([Performance guide](performance.md#primitives-that-read-an-expression)).
 

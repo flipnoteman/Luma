@@ -356,6 +356,56 @@ fn pending_reductions_of_shared_data_are_recorded_in_one_kernel() {
     assert_eq!(d.reduce_launches, 2, "{d:?}");
 }
 
+/// The arrays a program makes of reductions along `axis` of data it shares: sums, extrema and a variance of expressions of one product, of the
+/// arrays themselves and of their difference.
+fn axis_siblings(ctx: &Context, dims: &[usize], axis: usize) -> Vec<Array<f32>> {
+    let shape = match dims {
+        [a, b] => crate::shape::Shape::from([*a, *b]),
+        [a, b, c] => crate::shape::Shape::from([*a, *b, *c]),
+        _ => unreachable!("two or three dimensions"),
+    };
+    let len: usize = dims.iter().product();
+    let x = Array::from_slice_on(ctx, &values(len, 31, -1.0, 1.0), shape).unwrap();
+    let y = Array::from_slice_on(ctx, &values(len, 32, 0.5, 2.0), shape).unwrap();
+    let product = &x * &y;
+    vec![
+        (&product + 1.0).sum_axis(axis),
+        (&product * &product).max_axis(axis),
+        product.min_axis(axis),
+        x.sum_axis(axis),
+        (&x - &y).sum_axis(axis),
+        x.var_axis(axis),
+        y.mean_axis(axis),
+    ]
+}
+
+#[test]
+fn sibling_axis_reductions_are_recorded_in_one_kernel_with_the_bits_of_each_alone() {
+    let ctx = ctx();
+    // The same program on a context that records every axis reduction on its own: the bits to match.
+    let alone_ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi = 1).unwrap();
+    alone_ctx.set_cost_model(CostModel::TEST);
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    // Short contiguous lines (a group of lines per workgroup), long ones (a workgroup per chunk, several chunks: two passes), strided lines
+    // (one invocation per line; blocked, with partial results), the middle axis of three.
+    let cases: [(&[usize], usize); 7] = [(&[40, 300], 0), (&[300, 7], 0), (&[40_000, 3], 0), (&[5, 300], 1), (&[4, 70_000], 1), (&[6, 33, 5], 1), (&[6, 33, 5], 2)];
+    for (dims, axis) in cases {
+        let want: Vec<Vec<u32>> = axis_siblings(&alone_ctx, dims, axis).iter().map(|array| bits(array.to_vec().unwrap())).collect();
+        let arrays = axis_siblings(&ctx, dims, axis);
+        let before = ctx.jit().stats();
+        // One use records them all.
+        let first = bits(arrays[0].to_vec().unwrap());
+        let d = delta(before, ctx.jit().stats());
+        assert_eq!(d.reduce_launches, 1, "{dims:?} axis {axis}: {d:?}");
+        assert_eq!(d.elementwise_launches, 0, "{dims:?} axis {axis}: the operands are never materialized");
+        assert_eq!(first, want[0], "{dims:?} axis {axis}: sum");
+        for (k, array) in arrays.iter().enumerate().skip(1) {
+            assert_eq!(bits(array.to_vec().unwrap()), want[k], "{dims:?} axis {axis}: array {k}");
+        }
+        assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 1, "{dims:?} axis {axis}: reading the others launches nothing");
+    }
+}
+
 #[test]
 fn reducing_an_expression_does_not_evaluate_it() {
     let ctx = ctx();

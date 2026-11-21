@@ -115,7 +115,7 @@ assert_eq!(max.to_vec()?, vec![4.0, 20.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-The results are evaluated when the call returns. Another number of ops poisons the results.
+`f32` results stay pending until one is used, then it is recorded together with every other axis reduction over the same lines that is pending, in one kernel (each result has the bits it has alone); other types are evaluated when the call returns. Another number of ops poisons the results.
 `sum_axis`, `min_axis` and `max_axis` are the single-op cases. They (and `reduce_axis`) work on
 `f32`, `u32` and `i32` (`SumOfSquares` of integers wraps); `bool` arrays have `sum_axis` (a
 count, `u32`), `min_axis` and `max_axis` only.
