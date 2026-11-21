@@ -470,3 +470,14 @@ fn programs_cut_by_small_limits_match_the_uncached_path() {
     ctx.jit().set_max_inputs(usize::MAX);
     ctx.jit().set_max_live(0);
 }
+
+#[test]
+fn the_environment_variable_switches_the_cache_off() {
+    use super::plancache::enabled_by;
+    assert!(enabled_by(None));
+    assert!(enabled_by(Some("on")));
+    assert!(enabled_by(Some("trace")));
+    for off in ["off", "OFF", " 0 ", "false", "No"] {
+        assert!(!enabled_by(Some(off)), "{off}");
+    }
+}

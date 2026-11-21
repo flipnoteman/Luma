@@ -304,6 +304,16 @@ Compared with the loop primitives, an `eval` loop calls your step every iteratio
 step) but may use anything inside it, including readbacks. Use the primitive when the step fits
 and the host time matters.
 
+When `eval` computes right away (the GPU is idle, as in a loop whose steps are shorter than the host's
+work for them) and the graph it evaluates has the structure of an earlier one (the same operations,
+shapes, views and wiring, the same buffers read in the same places, equal scalars where they were
+equal), Luma runs the launches of that earlier evaluation again over the new buffers and
+scalars instead of planning the graph again: the host time per step of a step with hundreds of
+operations drops by a third to a half, the part that builds the expression stays. The results are
+bit-identical to what the planner makes, and only evaluations of plain elementwise, view and
+shift graphs with no other lazy array alive are replayed. `LUMA_PLAN_CACHE=off` switches this off
+([Environment variables](environment.md)).
+
 ### Readbacks in a loop
 
 `step` followed by `.max().item()?` every iteration waits once per step. When the same step has

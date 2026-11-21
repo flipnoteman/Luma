@@ -42,17 +42,26 @@ use super::{current_thread, ElemTy, JitState, Node, Src};
 /// print what it does (`trace`).
 pub(super) const ENV: &str = "LUMA_PLAN_CACHE";
 
+/// Whether the plan cache is on when the environment variable is `value`: on unless `off`, `0`,
+/// `false` or `no`.
+pub(super) fn enabled_by(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+}
+
 /// Plans kept per context (the least recently used goes first).
 const MAX_ENTRIES: usize = 128;
 
 /// Nodes of a graph the cache looks at; bigger evaluations are not cached.
 const MAX_NODES: usize = 1 << 14;
 
-/// Misses in a row after which the cache sits out evaluations (see [`Table::skip`]).
+/// Misses in a row after which the cache sits out evaluations (see `JitState::plan_skip`).
 const MISSES_BEFORE_SKIPPING: u32 = 6;
 
 /// Most evaluations skipped after a run of misses.
 const MAX_SKIP: u32 = 64;
+
+/// Entries of the walk's tables that stay allocated between walks.
+const SCRATCH_KEPT: usize = 1 << 14;
 
 const NONE: u32 = u32::MAX;
 
@@ -90,8 +99,6 @@ pub(super) struct Table {
     /// Evaluations in a row that found no plan (a new structure every time cannot be cached: the
     /// walk and the recording are then pure overhead).
     misses: u32,
-    /// Evaluations the cache sits out because of `misses`.
-    skip: u32,
 }
 
 impl std::fmt::Debug for Table {
@@ -129,7 +136,6 @@ impl Table {
     pub(super) fn clear(&mut self) {
         self.map.clear();
         self.misses = 0;
-        self.skip = 0;
     }
 
     #[cfg(test)]
@@ -192,8 +198,6 @@ struct Walk {
     leaf_at: FxMap<u64, u32>,
     /// The distinct scalar values (by type and bits) in the order they were met.
     classes: Vec<Class>,
-    /// How many nodes of the graph read each node.
-    readers: Vec<u32>,
     stack: Vec<u32>,
     base: u64,
     dense: Vec<u32>,
@@ -207,10 +211,16 @@ impl Walk {
         self.leaves.clear();
         self.leaf_at.clear();
         self.classes.clear();
-        self.readers.clear();
         self.stack.clear();
         self.dense.clear();
         self.spill.clear();
+        // A walk of a huge graph does not leave its tables behind.
+        if self.dense.capacity() > SCRATCH_KEPT {
+            self.dense.shrink_to(SCRATCH_KEPT);
+        }
+        if self.nodes.capacity() > SCRATCH_KEPT {
+            self.nodes.shrink_to(SCRATCH_KEPT);
+        }
     }
 
     fn lookup(&self, id: u64) -> u32 {
@@ -239,7 +249,6 @@ impl Walk {
         let at = self.nodes.len() as u32;
         self.record(node.id, at);
         self.nodes.push(Arc::clone(node));
-        self.readers.push(0);
         self.stack.push(at);
         at
     }
@@ -264,6 +273,10 @@ impl Walk {
     /// Walks the graph below `roots` and hashes what planning depends on; `None` if the graph is
     /// not one a replay can run (see [`Walk::visit`]).
     fn run(&mut self, jit: &JitState, ctx: &Context, roots: &[Arc<Node>]) -> Option<[u64; 2]> {
+        // Loops' and reductions' nodes hold no operands to walk (the commonest reason to give up).
+        if roots.iter().any(|root| root.looped.get().is_some() || root.deferred.get().is_some()) {
+            return None;
+        }
         self.clear();
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         for root in roots {
@@ -319,24 +332,14 @@ impl Walk {
         mix.word(node.op.fingerprint);
         mix.word(node.len as u64);
         mix.word(node.weight.to_bits());
-        mix.word(node.below_len as u64 | u64::from(node.depth) << 32 | u64::from(node.shift_depth) << 48 | flags << 52);
-        for (slot, arg) in args.iter().take(arity).enumerate() {
-            let repeated = args[..slot].iter().any(|other| match (arg, other) {
-                (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
-                (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            });
+        mix.word(node.below_len as u64 | u64::from(node.depth) << 32 | u64::from(node.shift_depth) << 48);
+        mix.word(flags);
+        for arg in args.iter().take(arity) {
             let word = match arg {
                 Src::Node(child) => match child.result.get() {
                     Some(Ok(storage)) => 2 << 60 | u64::from(self.leaf(storage)?),
                     Some(Err(_)) => return None,
-                    None => {
-                        let child_at = self.add(child);
-                        if !repeated {
-                            self.readers[child_at as usize] += 1;
-                        }
-                        1 << 60 | u64::from(child_at)
-                    }
+                    None => 1 << 60 | u64::from(self.add(child)),
                 },
                 Src::Buffer(storage) => 2 << 60 | u64::from(self.leaf(storage)?),
                 Src::Scalar(scalar) => {
@@ -398,18 +401,25 @@ fn stamp(jit: &JitState, ctx: &Context) -> u64 {
     mix.word(jit.max_live(ctx.tuning()) as u64);
     mix.word(jit.max_inlined(ctx.tuning()) as u64);
     mix.word(u64::from(ctx.fast_math()));
+    // The cost model decides where expressions are cut and what is stored (it is measured when
+    // the context opens, or set by tests).
+    let cost = ctx.cost_model();
+    for number in [cost.launch_us, cost.bandwidth_gbs, cost.f32_ops_per_ns, cost.df32_factor, cost.f64_factor.unwrap_or(-1.0)] {
+        mix.word(number.to_bits());
+    }
     mix.a ^ mix.b
 }
 
-/// Whether evaluations of `ctx` may use the cache now.
+/// Whether evaluations of `ctx` may use the cache now (the cheapest checks first: this runs for
+/// every `eval`).
 fn usable(jit: &JitState, ctx: &Context) -> bool {
     jit.plan_cache.load(Ordering::Relaxed)
         && !ACTIVE.with(Cell::get)
+        && !jit.splits_on.load(Ordering::Relaxed)
+        && !ctx.check_finite()
         && !ctx.recording_here()
         && !ctx.is_profiling()
-        && !ctx.check_finite()
         && !ctx.can_run_on_host()
-        && lock(&jit.splits).is_none()
 }
 
 thread_local! {
@@ -612,17 +622,21 @@ pub(super) fn finished(node: &Node, storage: &Storage) {
 /// structure left.
 pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce(Vec<Arc<Node>>)) {
     let Some(first) = pending.first() else { return run(pending) };
-    let ctx = first.context().clone();
-    if !usable(jit, &ctx) {
+    let skip = jit.plan_skip.load(Ordering::Relaxed);
+    if skip > 0 {
+        jit.plan_skip.store(skip - 1, Ordering::Relaxed);
         return run(pending);
     }
-    {
-        let mut table = lock(&jit.plans);
-        if table.skip > 0 {
-            table.skip -= 1;
-            drop(table);
-            return run(pending);
-        }
+    if !usable(jit, first.context()) {
+        return run(pending);
+    }
+    let ctx = first.context().clone();
+    // The graph can be all of the pending nodes only if they are not more than the roots stand
+    // above (an upper bound: `below_len` counts what was evaluated since too).
+    let most: i64 = pending.iter().map(|root| 1 + root.below_len() as i64).sum();
+    if jit.pending_nodes.load(Ordering::Relaxed) > most {
+        note_miss(jit);
+        return run(pending);
     }
     let mut walk = SCRATCH.with(|scratch| std::mem::take(&mut *scratch.borrow_mut()));
     let found = walk.run(jit, &ctx, &pending).map(|key| (key, lock(&jit.plans).find(key)));
@@ -714,7 +728,7 @@ fn note_miss(jit: &JitState) {
     let mut table = lock(&jit.plans);
     table.misses = table.misses.saturating_add(1);
     if table.misses >= MISSES_BEFORE_SKIPPING {
-        table.skip = (1u32 << (table.misses - MISSES_BEFORE_SKIPPING).min(6)).min(MAX_SKIP);
+        jit.plan_skip.store((1u32 << (table.misses - MISSES_BEFORE_SKIPPING).min(6)).min(MAX_SKIP), Ordering::Relaxed);
     }
 }
 

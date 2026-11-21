@@ -2494,6 +2494,10 @@ pub(crate) struct JitState {
     /// [`JitState::plans`].
     plan_epoch: AtomicU64,
     plan_stats: plancache::Stats,
+    /// Evaluations the plan cache still sits out (see [`plancache`]).
+    plan_skip: AtomicU32,
+    /// Whether [`JitState::splits`] is recording (kept apart so that looking is a load).
+    splits_on: AtomicBool,
     /// Nodes of this context that are alive and pending (see [`Node::settled`]): the plan cache
     /// replays only if the graph it walked is all of them.
     pending_nodes: std::sync::atomic::AtomicI64,
@@ -2597,9 +2601,11 @@ impl JitState {
             )),
             reruns: Mutex::new(rerun::Cache::default()),
             plans: Mutex::new(plancache::Table::default()),
-            plan_cache: AtomicBool::new(!std::env::var(plancache::ENV).is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))),
+            plan_cache: AtomicBool::new(plancache::enabled_by(std::env::var(plancache::ENV).ok().as_deref())),
             plan_epoch: AtomicU64::new(0),
             plan_stats: plancache::Stats::default(),
+            plan_skip: AtomicU32::new(0),
+            splits_on: AtomicBool::new(false),
             pending_nodes: std::sync::atomic::AtomicI64::new(0),
         }
     }
@@ -2770,10 +2776,12 @@ impl JitState {
     /// Starts recording the cuts of expressions (see [`FusionSplit`]).
     pub(crate) fn start_splits(&self) {
         *lock(&self.splits) = Some(Vec::new());
+        self.splits_on.store(true, Ordering::Relaxed);
     }
 
     /// Stops recording cuts and returns them.
     pub(crate) fn take_split_notes(&self) -> Vec<FusionSplit> {
+        self.splits_on.store(false, Ordering::Relaxed);
         lock(&self.splits).take().unwrap_or_default()
     }
 
@@ -2909,6 +2917,7 @@ impl JitState {
     /// Switches the plan cache on or off (see [`plancache`]); dropping every plan.
     pub(crate) fn set_plan_cache(&self, on: bool) {
         self.plan_cache.store(on, Ordering::Relaxed);
+        self.plan_skip.store(0, Ordering::Relaxed);
         lock(&self.plans).clear();
     }
 
