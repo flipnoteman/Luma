@@ -1239,9 +1239,9 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
         }
     }
     impl Emit<'_> {
-        /// The index of context `c`.
+        /// The index of context `c` (`ix` prefix: `i32` would collide with the WGSL type).
         fn index_of(&self, c: u32) -> String {
-            if c == 0 { self.index.to_owned() } else { format!("i{c}") }
+            if c == 0 { self.index.to_owned() } else { format!("ix{c}") }
         }
 
         /// Declares the index of context `c`, after its parents'.
@@ -1271,7 +1271,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                     shift_index(kind, &s, &from, &total)
                 }
             };
-            let _ = writeln!(self.src, "    let i{c}: u32 = {expr};");
+            let _ = writeln!(self.src, "    let ix{c}: u32 = {expr};");
         }
 
         /// Declares input `k` read at the index of context `c`.
@@ -1285,7 +1285,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
             if c == 0 {
                 let _ = writeln!(self.src, "    let a{k}: {} = {};", ty.wgsl(), input_load(self.names, ty, k, "i"));
             } else {
-                let _ = writeln!(self.src, "    let a{k}_{c}: {} = {};", ty.wgsl(), input_load(self.names, ty, k, &format!("i{c}")));
+                let _ = writeln!(self.src, "    let a{k}_{c}: {} = {};", ty.wgsl(), input_load(self.names, ty, k, &format!("ix{c}")));
             }
         }
 
