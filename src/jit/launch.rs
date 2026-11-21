@@ -1672,28 +1672,37 @@ fn flatten_operands(
     }
 }
 
-/// Evaluates what a product operand computes, so that a kernel that reads every element many times
-/// (a skinny product, see `matmul::skinny`) loads it from a buffer instead of recomputing it at
-/// each load: `node` itself if it is a pending expression, what it reads if it is a view (which
-/// stays fused: a transposed view of a stored array costs a few index operations). Returns whether
-/// anything was evaluated; a view of a view, or of an array that is stored, is left alone.
-pub(crate) fn evaluate_for_reuse(node: &Arc<Node>) -> Result<bool, Failure> {
+/// What a kernel that reads every element of a product operand many times would recompute at each
+/// load: `node` itself if it is a pending expression, what it reads if it is a view (which stays
+/// fused: a transposed view of a stored array costs a few index operations). `None` for a view of a
+/// view, an array that is stored, or an expression of one buffer (the labels of a one-hot matrix),
+/// which costs about a load per evaluation, as much as reading it stored.
+fn recomputed(node: &Arc<Node>) -> Option<Arc<Node>> {
     if !node.is_pending() {
-        return Ok(false);
+        return None;
     }
     let target = if node.is_pending_view() {
         match node.operands() {
             Some([Src::Node(inner), _, _]) if inner.is_pending() && !matches!(inner.op().kind, OpKind::Shift(ShiftKind::View { .. })) => inner,
-            _ => return Ok(false),
+            _ => return None,
         }
     } else {
         Arc::clone(node)
     };
-    // An expression of one buffer (the labels of a one-hot matrix) costs about a load per
-    // evaluation, as much as reading it stored; one that reads no buffer costs less.
-    if target.inputs().len() < 2 {
-        return Ok(false);
-    }
+    (target.inputs().len() >= 2).then_some(target)
+}
+
+/// Whether a product operand is an expression of several buffers that a kernel reading each of its
+/// elements many times would compute at every load (see [`evaluate_for_reuse`]).
+pub(crate) fn is_recomputed(node: &Arc<Node>) -> bool {
+    recomputed(node).is_some()
+}
+
+/// Evaluates what a product operand computes, so that a kernel that reads every element many times
+/// (a skinny product, see `matmul::skinny`) loads it from a buffer instead of recomputing it at
+/// each load (see [`recomputed`]). Returns whether anything was evaluated.
+pub(crate) fn evaluate_for_reuse(node: &Arc<Node>) -> Result<bool, Failure> {
+    let Some(target) = recomputed(node) else { return Ok(false) };
     target.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
     Ok(true)
 }

@@ -117,6 +117,9 @@ const SKINNY_ACCUMULATORS: u32 = 80;
 const SKINNY_PART: u32 = 4096;
 /// Tiles that read the same operand element from which a pending operand is evaluated first.
 const SKINNY_EVALUATE_READS: u32 = 8;
+/// Tiles that read the same element of a pending operand of several buffers from which the staged
+/// tiles are preferred to a skinny kernel (below [`SKINNY_EVALUATE_READS`]).
+const SKINNY_FUSED_READS: u32 = 4;
 
 impl Array<f32> {
     /// The matrix product with `rhs`. `self` has shape `[K, M]`, `rhs` `[N, K]` and the result
@@ -285,6 +288,11 @@ fn plan(tuning: &Tuning, m: u32, n: u32, k: u32, along_k: bool, max_groups: u32,
     if let Some(plan) = skinny_plan(m, n, k, along_k, max_groups, max_bytes) {
         return Ok(plan);
     }
+    tiled_plan(tuning, m, n, k, max_groups, max_bytes)
+}
+
+/// [`plan`] with the staged tiles (never a skinny kernel).
+fn tiled_plan(tuning: &Tuning, m: u32, n: u32, k: u32, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
     let tile = match (m >= 128, n >= 128) {
         (true, true) => MatmulTile::T128,
         (true, false) => MatmulTile::T128x32,
@@ -450,15 +458,24 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
     let (k, m, n) = (ld[0], ld[1], rd[0]);
     let too_large = |extent: usize| u32::try_from(extent).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: [n, m, 1, 1] }));
     let (m32, n32, k32) = (too_large(m)?, too_large(n)?, too_large(k)?);
-    let plan = if cores > 0 {
+    let mut plan = if cores > 0 {
         native_plan(m32, n32, k32, cores, transposed, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     } else {
         let along_k = jit::stored_along_k(&sides[0], [k32, m32]);
         plan(ctx.tuning(), m32, n32, k32, along_k, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     };
-    // A skinny kernel computes a fused operand once per tile that reads it: past a few, storing
-    // the expression first is cheaper.
+    // A skinny kernel computes a fused operand once per tile that reads it. A few reads of an
+    // expression of several buffers already cost more than the staged tiles, which compute each
+    // element twice (a correlation matrix, `(x - mean) / std` against itself: 1.2 ms against 1.7);
+    // past `SKINNY_EVALUATE_READS` storing the expression first is cheaper.
     let mut sides = sides;
+    if let MatmulTile::Skinny { rows, cols, .. } = plan.tile {
+        let reads = [n32.div_ceil(u32::from(cols)), m32.div_ceil(u32::from(rows))];
+        let costly = [lhs, rhs].into_iter().zip(reads).any(|(array, reads)| (SKINNY_FUSED_READS..SKINNY_EVALUATE_READS).contains(&reads) && array.pending().is_some_and(jit::is_recomputed));
+        if costly {
+            plan = tiled_plan(ctx.tuning(), m32, n32, k32, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?;
+        }
+    }
     if let MatmulTile::Skinny { rows, cols, .. } = plan.tile {
         let reads = [n32.div_ceil(u32::from(cols)), m32.div_ceil(u32::from(rows))];
         let mut evaluated = false;
