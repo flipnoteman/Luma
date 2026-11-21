@@ -126,6 +126,12 @@ pub(crate) fn build_core_native(
 ) -> Result<KernelCore> {
     let info = ctx.info();
     let limits = &info.limits;
+    if let Some(dir) = std::env::var_os("LUMA_WGPU_DUMP").filter(|v| !v.is_empty()) {
+        let dir = std::path::Path::new(&dir);
+        let name: String = label.unwrap_or(&key.entry).chars().take(100).map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join(format!("{name}-{:016x}.wgsl", luma_core::hal::cache::fnv1a(key.source.as_bytes()))), &key.source);
+    }
     let (module, lowered, bindings, declared, used) = kir::parse_wgsl(
         &key.source,
         &key.entry,
