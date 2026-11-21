@@ -82,6 +82,13 @@ pub(crate) struct Tuning {
     /// times (a solver's final forces) never earns back. 0 records every group in its kernel at once, waiting for its compile.
     /// `LUMA_MULTI_REDUCE_AFTER` overrides; the default is 4 on CUDA and 0 elsewhere.
     pub(crate) reduce_multi_after: u32,
+    /// Least weight (f32 operations per cell, see `jit::Node::weight`) of the operand of an `f32` axis reduction for it to be left
+    /// pending to be recorded with its siblings (see `Array::defer_axis`). Merged, the reductions share the operands' work and the
+    /// pass over the data, but the CPU backend returns the values of several roots as an array and combines them in lockstep, which
+    /// costs more per cell than light operands save (a table's NaN-aware column statistics ran 1.5-1.7x slower merged, its
+    /// 4-operation description and a layer norm gained less than they lost to the deferral); all-pairs forces, whose three
+    /// components share a long chain, run 3x faster. Zero on GPU backends: always deferred.
+    pub(crate) axis_defer_weight: u32,
     /// Whether a reduction with more than one workgroup finishes in its first launch: the last
     /// workgroup to write its partial result combines them all (see `builtin::reduce_main`),
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
@@ -186,6 +193,7 @@ impl Tuning {
         reduce_max_groups: 1024,
         reduce_multi: 16,
         reduce_multi_after: 0,
+        axis_defer_weight: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -220,6 +228,7 @@ impl Tuning {
         reduce_max_groups: 2048,
         reduce_multi: 16,
         reduce_multi_after: 0,
+        axis_defer_weight: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -256,6 +265,7 @@ impl Tuning {
         reduce_max_groups: 1024,
         reduce_multi: 16,
         reduce_multi_after: 0,
+        axis_defer_weight: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -330,6 +340,9 @@ impl Tuning {
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok())
             .unwrap_or(if info.backend == BackendKind::Cuda { 4 } else { 0 });
+        if info.backend == BackendKind::Cpu {
+            tuning.axis_defer_weight = 12;
+        }
         tuning.lookback_scan = match std::env::var(LOOKBACK_ENV).as_deref().map(str::trim) {
             Ok("off") => false,
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),

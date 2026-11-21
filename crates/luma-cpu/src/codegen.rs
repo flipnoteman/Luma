@@ -72,7 +72,7 @@ static ISA_KEY: LazyLock<String> = LazyLock::new(|| match ISA_SPEED.as_ref() {
             .map(|v| format!("{}={}", v.name, v.value_string()))
             .collect();
         format!(
-            "rev4-{}-{}-{}",
+            "rev5-{}-{}-{}",
             isa.triple(),
             cranelift_codegen::VERSION,
             feats.join(",")
@@ -86,12 +86,22 @@ pub fn host_isa_key() -> String {
     ISA_KEY.clone()
 }
 
-/// Kernels with more IR instructions than this skip Cranelift's optimiser to keep compile time down.
-const FAST_COMPILE_INSTS: usize = 16_000;
+/// Kernels with more IR instructions than this skip Cranelift's optimiser, unless they have run-time
+/// contiguity checks (see [`CONTIG_COMPILE_INSTS`]). The optimiser is not always a gain: it makes
+/// compute-bound kernels of up to 3300 instructions faster (the all-pairs force of the `nbody`
+/// benchmark 1.6x), but the code it makes for larger ones was slower than the unoptimised one in
+/// every case measured (`cfd` MUSCL steps of 4000 instructions 1.3-1.5x, `fractal/mandelbrot_unrolled`
+/// of 7400 1.6x, the FFT passes of `conv1d_fft` of 13000 to 16000 1.2-1.6x, the Euler steps).
+const FAST_COMPILE_INSTS: usize = 3_500;
+
+/// The limit for a kernel with run-time contiguity checks (see `Lower::load_elem`): its taps share
+/// one condition that the optimiser merges, which makes `ml/conv/stencil5x5` (25 `shift_clamp`
+/// loads, 5200 instructions) 2.5x faster than the unoptimised code.
+const CONTIG_COMPILE_INSTS: usize = 16_000;
 
 /// Revision of the generated code, part of the disk-cache key: bump it whenever the code this
 /// module generates for the same kernel changes, so cached blobs from older builds are not reused.
-pub(crate) const REVISION: u32 = 4;
+pub(crate) const REVISION: u32 = 5;
 
 // ---------------------------------------------------------------------------------------------
 // Memory flags
@@ -391,6 +401,7 @@ pub fn compile(
     sig.params.push(AbiParam::new(ptr));
     let mut func = Function::with_name_signature(UserFuncName::default(), sig);
     let mut fbc = FunctionBuilderContext::new();
+    let run_time_contig;
     {
         let mut b = FunctionBuilder::new(&mut func, &mut fbc);
         let entry = b.create_block();
@@ -401,11 +412,13 @@ pub fn compile(
         lower.emit_all();
         lower.b.seal_all_blocks();
         lower.b.finalize(isa.frontend_config());
+        run_time_contig = lower.run_time_contig;
     }
 
     // Optimised compilation costs about 2.5x the unoptimised one (35 ms against 10 ms at 10k
-    // instructions), well worth it for the faster code except for the largest kernels.
-    let target_isa = if func.dfg.num_insts() > FAST_COMPILE_INSTS {
+    // instructions), and the code it makes is not always faster: see `FAST_COMPILE_INSTS`.
+    let limit = if run_time_contig > 0 { CONTIG_COMPILE_INSTS } else { FAST_COMPILE_INSTS };
+    let target_isa = if func.dfg.num_insts() > limit {
         ISA_FAST.as_ref().map_err(Clone::clone)?
     } else {
         isa
@@ -458,6 +471,8 @@ struct Lower<'a, 'f> {
     ro_loads: bool,
     /// Per value: whether it is computed from the lane ids and uniforms alone (no memory read).
     computed: HashMap<Value, bool>,
+    /// How many loads check at run time whether their lanes are consecutive (see `load_elem`).
+    run_time_contig: usize,
 }
 
 impl<'a, 'f> Lower<'a, 'f> {
@@ -505,6 +520,7 @@ impl<'a, 'f> Lower<'a, 'f> {
             limits: HashMap::new(),
             ro_loads: false,
             computed: HashMap::new(),
+            run_time_contig: 0,
         }
     }
 
@@ -2718,6 +2734,7 @@ impl<'a, 'f> Lower<'a, 'f> {
         match idx.k {
             Kind::Lin | Kind::Uni => {}
             Kind::Gen => {
+                self.run_time_contig += 1;
                 let e0 = self.b.ins().extractlane(idx.a, 0u8);
                 let first = self.b.ins().splat(I32X4, e0);
                 let io = self.iota();

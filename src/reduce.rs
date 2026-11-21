@@ -613,7 +613,8 @@ impl<T: ScalarType> Array<T> {
     }
 
     /// The reductions `ops` along the lines `geom` of this array as lazy arrays of `shape` (one value per line), `None` where they
-    /// cannot be left pending: only `f32` reductions of an array on a GPU backend, outside a recording, with the finite check off.
+    /// cannot be left pending: only `f32` reductions of an array on a GPU backend (on the CPU backend of an expression of at least
+    /// `Tuning::axis_defer_weight` operations), outside a recording, with the finite check off.
     /// Recorded when one is used, together with the others that are pending over the same lines (see `jit::multireduce`), so that
     /// each of them is the value a reduction of its own gives (the same bits).
     pub(crate) fn defer_axis(&self, ops: &[ReduceOp], geom: AxisGeom, shape: Shape, name: &'static str, location: &'static Location<'static>) -> Option<Vec<Array<T>>> {
@@ -626,6 +627,7 @@ impl<T: ScalarType> Array<T> {
             || ctx.is_profiling()
             || self.error().is_some()
             || (ctx.can_run_on_host() && self.len() <= crate::host::MAX_HOST_ELEMS)
+            || (ctx.tuning().axis_defer_weight > 0 && self.pending().is_none_or(|node| node.weight() < f64::from(ctx.tuning().axis_defer_weight)))
         {
             return None;
         }
