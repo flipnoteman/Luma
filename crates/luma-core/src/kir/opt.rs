@@ -625,8 +625,10 @@ struct Ranges {
     aliases: HashMap<u32, u32>,
     /// Loop counters being rewritten, with their first value and step.
     counters: HashMap<u32, (u32, u32)>,
-    /// Variables declared with a literal initial value.
+    /// Variables declared with a literal initial value (or none: zero).
     inits: HashMap<u32, u32>,
+    /// The `v = literal` assignment that was the previous statement of the block being rewritten.
+    last_assign: Option<(u32, u32)>,
     /// The local holding `local_invocation_id` and the workgroup size.
     local_id: Option<(u32, [u32; 3])>,
 }
@@ -692,7 +694,7 @@ impl Ranges {
 
     /// The counter `continuing` advances, if it is one (see [`Counter`]): a variable declared
     /// with a literal that nothing but this block assigns, by a literal step.
-    fn counter_of(&self, continuing: &[Stmt], locals: &[(String, KirType, bool)], assigns: &[u32]) -> Option<Counter> {
+    fn counter_of(&self, continuing: &[Stmt], locals: &[(String, KirType, bool)], assigns: &[u32], before: Option<(u32, u32)>) -> Option<Counter> {
         let mut copies: Vec<(u32, u32)> = Vec::new();
         for s in continuing {
             match s {
@@ -701,8 +703,14 @@ impl Ranges {
                     let Expr::LitU32(step) = **rhs else { continue };
                     let Expr::Local(from) = **lhs else { continue };
                     let reads_v = from == *v || copies.contains(&(from.0, v.0));
-                    let first = self.inits.get(&v.0).copied();
-                    let unique = assigns.get(v.0 as usize).copied() == Some(1);
+                    // Either the declaration starts it and this block is the only assignment, or
+                    // the statement right before the loop assigns it a literal and this block is
+                    // the only other assignment.
+                    let (first, unique) = match (assigns.get(v.0 as usize).copied(), before) {
+                        (Some(1), _) => (self.inits.get(&v.0).copied(), true),
+                        (Some(2), Some((var, first))) if var == v.0 => (Some(first), true),
+                        _ => (None, false),
+                    };
                     if reads_v && step > 0 && unique && locals[v.0 as usize].1 == KirType::U32 && let Some(first) = first {
                         return Some(Counter { var: v.0, first, step });
                     }
@@ -719,6 +727,9 @@ impl Ranges {
         match s {
             Stmt::Var { local, init: Some(Expr::LitU32(k)) } => {
                 self.inits.insert(local.0, *k);
+            }
+            Stmt::Var { local, init: None } => {
+                self.inits.insert(local.0, 0);
             }
             Stmt::Let { local, init } => {
                 if let Expr::Local(v) = init
@@ -972,9 +983,13 @@ impl Scope<'_> {
         // Only the statements directly in a loop body are past its guard once it has run.
         let guard = self.loop_counter.take();
         for mut s in old {
+            let before = self.ranges.last_assign.take();
             self.ranges.note(&s, guard);
+            if let Stmt::Assign { dst: LValue::Local(v), val: Expr::LitU32(c) } = &s {
+                self.ranges.last_assign = Some((v.0, *c));
+            }
             if let Stmt::Loop { body, continuing, break_if } = &mut s {
-                let counter = self.ranges.counter_of(continuing, &self.locals[..], &self.assigns);
+                let counter = self.ranges.counter_of(continuing, &self.locals[..], &self.assigns, before);
                 if let Some(c) = counter {
                     self.ranges.counters.insert(c.var, (c.first, c.step));
                 }
@@ -1750,6 +1765,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_
         assert_eq!(guards_of(&tiled(512, "16u", "2u", unrolled)), 1, "only the store to `out`");
         // One element fewer and the last index is out of range: both reads (and the store) are guarded.
         assert_eq!(guards_of(&tiled(511, "16u", "2u", unrolled)), 2, "the read past the end and the store to `out`");
+    }
+
+    #[test]
+    fn a_counter_in_a_nested_loop_is_proven_too() {
+        // The inner variable is declared and assigned inside a loop of unknown length.
+        let nested = "for (var k0 = 0u; k0 < p.x; k0 = k0 + 16u) {
+            for (var j = 0u; j < 16u; j = j + 2u) { acc = acc + t[(j + 1u) * 32u + lid.y + 16u]; }
+        }";
+        let src = tiled(512, "1u", "1u", nested);
+        assert_eq!(guards_of(&src), 2, "the outer loop's test and the store to `out`");
+        assert_eq!(guards_of(&src.replace("512", "511")), 3, "one short: the read is guarded too");
     }
 
     #[test]

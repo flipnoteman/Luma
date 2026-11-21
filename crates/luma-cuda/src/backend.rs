@@ -1018,7 +1018,9 @@ impl Backend for CudaBackend {
         }
         let checked: Cow<'_, KernelModule> = if trust.checks_bounds() { kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
         let optimized = kir::optimize_for_target(&checked, true);
-        let translated = codegen::emit_with_options(&optimized, used, trust.zero_workgroup_memory(), trust.checks_bounds());
+        // `with_bounds_checks` already guards every workgroup-array index it cannot prove in range,
+        // so the emitter's own clamp (a `min` per access) would only repeat it.
+        let translated = codegen::emit_with_options(&optimized, used, trust.zero_workgroup_memory(), false);
         let strides: Vec<u32> = translated.array_lengths.iter().map(|&b| optimized.bindings.get(b as usize).and_then(|d| d.element_stride).unwrap_or(1)).collect();
 
         self.bind()?;
