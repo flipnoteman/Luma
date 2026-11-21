@@ -193,6 +193,14 @@ fn heat(h: &mut Harness, z: &Z) {
     }
 }
 
+/// Records `n` steps off `q` and drops them unevaluated.
+#[inline(never)]
+fn build_steps<const N: usize>(q: &[A; N], muscl: bool, n: usize) {
+    for _ in 0..n {
+        std::hint::black_box(explicit_step(q, muscl, true));
+    }
+}
+
 /// Explicit Euler (first order, or MUSCL for `muscl/..` groups) with the low-i wall: `iterate_all` replay at two sizes and the host loop.
 fn explicit_euler<const N: usize>(h: &mut Harness, z: &Z, group: &str, muscl: bool) {
     let d = N - 2;
@@ -226,6 +234,11 @@ fn explicit_euler<const N: usize>(h: &mut Harness, z: &Z, group: &str, muscl: bo
             }
         };
         h.case(&format!("{group}_per_step"), &format!("{}:{n}st", dims_str(&small)), Work::Cells((cells_of(&small) * n) as f64), &mut f);
+        // Host cost of recording a step alone: build the lazy graph of `n` steps off the same state and drop it unevaluated.
+        let mut f = || {
+            build_steps(&q, muscl, n);
+        };
+        h.case(&format!("{group}_build_step"), &format!("{}:{n}st", dims_str(&small)), Work::Cells((cells_of(&small) * n) as f64), &mut f);
     });
 }
 
