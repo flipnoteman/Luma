@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use log::debug;
 use luma_core::hal::cache;
@@ -30,7 +31,14 @@ pub(crate) struct PipelineStore {
     disk: Arc<DiskCache>,
     /// Whether pipelines were built since the cache was last written.
     pending: AtomicBool,
+    /// When the cache was opened or last written, for [`checkpoint`](Self::checkpoint).
+    last_write: Mutex<Instant>,
 }
+
+/// How long a [`PipelineStore`] goes without a [`checkpoint`](PipelineStore::checkpoint) write
+/// after it was opened or written: reading the driver's cache back costs a few milliseconds per
+/// megabyte, which a program that makes and drops contexts in a loop must not pay each time.
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(5);
 
 impl PipelineStore {
     /// Opens the store of `device`, starting to load the stored cache if there is one.
@@ -46,7 +54,7 @@ impl PipelineStore {
         if !wanted {
             let _ = cache.set(None);
         }
-        Arc::new(PipelineStore { loading: Mutex::new(loading), cache, disk, pending: AtomicBool::new(false) })
+        Arc::new(PipelineStore { loading: Mutex::new(loading), cache, disk, pending: AtomicBool::new(false), last_write: Mutex::new(Instant::now()) })
     }
 
     /// Reads the stored cache and creates the driver's cache from it (an empty one if there is
@@ -78,9 +86,10 @@ impl PipelineStore {
     }
 
     /// Notes that a pipeline was just created with [`cache`](Self::cache). The cache is written
-    /// when the device is released and at process exit, never while pipelines are being built:
-    /// reading the driver's cache data and writing megabytes of it slowed the first launches of a
-    /// run by tens of milliseconds even from a background thread.
+    /// when a device is released (at most every [`CHECKPOINT_EVERY`]) and at process exit, never
+    /// while pipelines are being built: reading the driver's cache data and writing megabytes of
+    /// it slowed the first launches of a run by tens of milliseconds even from a background
+    /// thread.
     pub(crate) fn built(&self) {
         self.pending.store(true, Ordering::Release);
     }
@@ -94,6 +103,17 @@ impl PipelineStore {
             && let Some(data) = cache.and_then(wgpu::PipelineCache::get_data)
         {
             self.disk.store_pipelines(&data);
+            *lock(&self.last_write) = Instant::now();
+        }
+    }
+
+    /// [`flush`](Self::flush) for a device going idle, unless the cache was opened or written less
+    /// than [`CHECKPOINT_EVERY`] ago. A context made and dropped in a loop would otherwise copy
+    /// the whole driver cache out each time to find that it did not change; what a skipped
+    /// checkpoint leaves unwritten is written by the next one or at exit.
+    pub(crate) fn checkpoint(&self) {
+        if lock(&self.last_write).elapsed() >= CHECKPOINT_EVERY {
+            self.flush();
         }
     }
 }
@@ -311,7 +331,7 @@ pub(crate) fn acquire(kind: DeviceKind) -> Result<Gpu, BackendError> {
 /// thread returning a device must never wait for one being created.
 pub(crate) fn release(gpu: Gpu) {
     let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
-    gpu.store.flush();
+    gpu.store.checkpoint();
     if gpu.lost.load(Ordering::Acquire) {
         return;
     }
