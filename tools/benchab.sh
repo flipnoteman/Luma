@@ -45,9 +45,12 @@ for s in a b; do
   (cd \$s && LUMA_BENCH_REF=\$ref cargo build --release -p luma-bench --target-dir \$T/ab-\$s > ../out/build-\$s.log 2>&1) || { tail -30 out/build-\$s.log; echo \"benchab: build \$s failed\"; exit 1; }
 done
 A=\$T/ab-a/release/luma-bench B=\$T/ab-b/release/luma-bench
+# Each side gets its own kernel/pipeline cache, empty at the start of the job: a shared cache near its size cap
+# makes context creation cost ~1 ms per cached MB and varies with whatever other runs left in it.
+CA=\$(mktemp -d) CB=\$(mktemp -d)
 one() { # side backend suite round
-  local bin=\$A lab=$la; [ \$1 = b ] && bin=\$B lab=$lb
-  LUMA_BENCH_REF=\$lab \$bin --suite \$3 $quick --json out/\$lab-\$2-\$3-\$1\$4.jsonl > /dev/null 2>> out/stderr-\$1.log || echo \"benchab: \$1 \$2 \$3 round \$4 exit \$?\"
+  local bin=\$A lab=$la cache=\$CA; [ \$1 = b ] && bin=\$B lab=$lb cache=\$CB
+  LUMA_CACHE_DIR=\$cache LUMA_BENCH_REF=\$lab \$bin --suite \$3 $quick --json out/\$lab-\$2-\$3-\$1\$4.jsonl > /dev/null 2>> out/stderr-\$1.log || echo \"benchab: \$1 \$2 \$3 round \$4 exit \$?\"
 }"
 loop="for be in BACKENDS; do
   for suite in ${suites//,/ }; do
