@@ -101,6 +101,17 @@ impl HasCtx for Context {
         self
     }
 }
+
+/// [`Harness::case`] after releasing the pooled idle buffers of the earlier cases, so that the
+/// `mem MiB` column is this case's own footprint (its arrays plus what its calls allocate)
+/// instead of the pool the whole run has grown.
+fn case_trim(h: &mut Harness, name: &str, size: &str, work: Work, f: &mut dyn FnMut()) {
+    if h.want(name) {
+        h.ctx.trim().unwrap();
+    }
+    h.case(name, size, work, f);
+}
+
 // -------------------------------------------------------------------------------------------------
 // sort / argsort
 // -------------------------------------------------------------------------------------------------
@@ -164,7 +175,7 @@ fn sort_case<T: SortKey + Copy>(h: &mut Harness, name: &str, data: &[T], key: fn
     let in_keys: Vec<u32> = data.iter().copied().map(key).collect();
     check_sorted(name, &got_keys, &in_keys);
     drop((got, got_keys, in_keys));
-    h.case(name, &n.to_string(), Work::Items(n as f64, "Mkey/s"), &mut || x.sort().eval().unwrap());
+    case_trim(h, name, &n.to_string(), Work::Items(n as f64, "Mkey/s"), &mut || x.sort().eval().unwrap());
 }
 
 fn argsort_case<T: SortKey + Copy>(h: &mut Harness, name: &str, data: &[T], key: fn(T) -> u32) {
@@ -175,7 +186,7 @@ fn argsort_case<T: SortKey + Copy>(h: &mut Harness, name: &str, data: &[T], key:
     let in_keys: Vec<u32> = data.iter().copied().map(key).collect();
     check_argsort(name, &got.to_vec().unwrap(), &in_keys);
     drop((got, in_keys));
-    h.case(name, &n.to_string(), Work::Items(n as f64, "Mkey/s"), &mut || x.argsort().eval().unwrap());
+    case_trim(h, name, &n.to_string(), Work::Items(n as f64, "Mkey/s"), &mut || x.argsort().eval().unwrap());
 }
 
 fn rand_f32(n: usize, seed: u64) -> Vec<f32> {
@@ -241,7 +252,7 @@ fn sort_cases(h: &mut Harness) {
         let got = x.sort_axis(axis);
         exact(&name, &got.to_vec().unwrap(), &want);
         drop(got);
-        h.case(&name, &format!("{}x{}", dims[0], dims[1]), Work::Items(total as f64, "Mkey/s"), &mut || x.sort_axis(axis).eval().unwrap());
+        case_trim(h, &name, &format!("{}x{}", dims[0], dims[1]), Work::Items(total as f64, "Mkey/s"), &mut || x.sort_axis(axis).eval().unwrap());
     }
 }
 
@@ -278,7 +289,7 @@ fn reduce_cases(h: &mut Harness) {
         let x = up(h, &hx);
         let want: f64 = hx.iter().map(|&v| f64::from(v)).sum();
         check_scalar(&name, f64::from(x.sum().item().unwrap()), want, 1e-4);
-        h.case(&name, &n.to_string(), Work::Bytes(4.0 * n as f64), &mut || {
+        case_trim(h, &name, &n.to_string(), Work::Bytes(4.0 * n as f64), &mut || {
             x.sum().item().unwrap();
         });
     }
@@ -292,7 +303,7 @@ fn reduce_cases(h: &mut Harness) {
         let x = up(h, &hx);
         let want = hx.iter().fold(0u32, |a, &v| a.wrapping_add(v));
         assert_eq!(x.sum().item().unwrap(), want, "reduce/sum_u32");
-        h.case("reduce/sum_u32", &sz, Work::Bytes(bytes), &mut || {
+        case_trim(h, "reduce/sum_u32", &sz, Work::Bytes(bytes), &mut || {
             x.sum().item().unwrap();
         });
     }
@@ -301,7 +312,7 @@ fn reduce_cases(h: &mut Harness) {
         let x = up(h, &hx);
         let want = hx.iter().copied().fold(f32::MIN, f32::max);
         assert_eq!(x.max().item().unwrap(), want, "reduce/max_f32");
-        h.case("reduce/max_f32", &sz, Work::Bytes(bytes), &mut || {
+        case_trim(h, "reduce/max_f32", &sz, Work::Bytes(bytes), &mut || {
             x.max().item().unwrap();
         });
     }
@@ -310,7 +321,7 @@ fn reduce_cases(h: &mut Harness) {
         let (a, b) = (up(h, &ha), up(h, &hb));
         let want: f64 = ha.iter().zip(&hb).map(|(&p, &q)| f64::from(p) * f64::from(q)).sum();
         check_scalar("reduce/dot_f32", f64::from((&a * &b).sum().item().unwrap()), want, 1e-4);
-        h.case("reduce/dot_f32", &sz, Work::Bytes(2.0 * bytes), &mut || {
+        case_trim(h, "reduce/dot_f32", &sz, Work::Bytes(2.0 * bytes), &mut || {
             (&a * &b).sum().item().unwrap();
         });
     }
@@ -319,7 +330,7 @@ fn reduce_cases(h: &mut Harness) {
         let x = up(h, &hx);
         let want = hx.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt();
         check_scalar("reduce/norm_f32", f64::from(x.norm().item().unwrap()), want, 1e-4);
-        h.case("reduce/norm_f32", &sz, Work::Bytes(bytes), &mut || {
+        case_trim(h, "reduce/norm_f32", &sz, Work::Bytes(bytes), &mut || {
             x.norm().item().unwrap();
         });
     }
@@ -334,7 +345,7 @@ fn reduce_cases(h: &mut Harness) {
         check_scalar("reduce/stats4 ssq", f64::from(got[1]), ssq, 1e-4);
         assert_eq!(got[2], hx.iter().copied().fold(f32::MAX, f32::min));
         assert_eq!(got[3], hx.iter().copied().fold(f32::MIN, f32::max));
-        h.case("reduce/stats4_f32", &sz, Work::Bytes(bytes), &mut || {
+        case_trim(h, "reduce/stats4_f32", &sz, Work::Bytes(bytes), &mut || {
             x.reduce(ops).to_array::<4>().unwrap();
         });
     }
@@ -343,7 +354,7 @@ fn reduce_cases(h: &mut Harness) {
         let x = up(h, &hx);
         let want = hx.iter().filter(|&&v| v > 0.3).count() as u32;
         assert_eq!(x.gt(0.3).count().item().unwrap(), want, "reduce/count_gt");
-        h.case("reduce/count_gt", &sz, Work::Bytes(bytes), &mut || {
+        case_trim(h, "reduce/count_gt", &sz, Work::Bytes(bytes), &mut || {
             x.gt(0.3).count().item().unwrap();
         });
     }
@@ -352,7 +363,7 @@ fn reduce_cases(h: &mut Harness) {
         let x = up(h, &hx);
         let want: f64 = hx.iter().filter(|&&v| v > 0.3).map(|&v| f64::from(v)).sum();
         check_scalar("reduce/sum_where", f64::from(x.sum_where(&x.gt(0.3)).item().unwrap()), want, 1e-4);
-        h.case("reduce/sum_where", &sz, Work::Bytes(bytes), &mut || {
+        case_trim(h, "reduce/sum_where", &sz, Work::Bytes(bytes), &mut || {
             x.sum_where(&x.gt(0.3)).item().unwrap();
         });
     }
@@ -370,7 +381,7 @@ fn reduce_cases(h: &mut Harness) {
         for (s, d) in run(&arrays).iter().zip(&data) {
             check_scalar("reduce/batch8", f64::from(s.item().unwrap()), d.iter().map(|&v| f64::from(v)).sum(), 1e-4);
         }
-        h.case("reduce/batch8", &format!("8x{m}"), Work::Bytes(8.0 * 4.0 * m as f64), &mut || {
+        case_trim(h, "reduce/batch8", &format!("8x{m}"), Work::Bytes(8.0 * 4.0 * m as f64), &mut || {
             run(&arrays);
         });
     }
@@ -398,7 +409,7 @@ fn scan_cases(h: &mut Harness) {
             })
             .collect();
         check(&name, &x.cumsum(0).to_vec().unwrap(), &want, 1e-4, 1e-3);
-        h.case(&name, &m.to_string(), Work::Bytes(8.0 * m as f64), &mut || x.cumsum(0).eval().unwrap());
+        case_trim(h, &name, &m.to_string(), Work::Bytes(8.0 * m as f64), &mut || x.cumsum(0).eval().unwrap());
     }
     if h.want("scan/cumsum_u32") {
         let hx = ints(n, 42, 16);
@@ -412,7 +423,7 @@ fn scan_cases(h: &mut Harness) {
             })
             .collect();
         exact("scan/cumsum_u32", &x.cumsum(0).to_vec().unwrap(), &want);
-        h.case("scan/cumsum_u32", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || x.cumsum(0).eval().unwrap());
+        case_trim(h, "scan/cumsum_u32", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || x.cumsum(0).eval().unwrap());
     }
     // Lines of 1024 along each axis of a table.
     let total = if h.ctx.is_cpu() || h.quick { 1 << 20 } else { 1 << 22 };
@@ -443,7 +454,7 @@ fn scan_cases(h: &mut Harness) {
             }
         }
         check(&name, &x.cumsum(axis).to_vec().unwrap(), &want, 1e-4, 1e-3);
-        h.case(&name, &format!("{}x{}", dims[0], dims[1]), Work::Bytes(8.0 * total as f64), &mut || x.cumsum(axis).eval().unwrap());
+        case_trim(h, &name, &format!("{}x{}", dims[0], dims[1]), Work::Bytes(8.0 * total as f64), &mut || x.cumsum(axis).eval().unwrap());
     }
     if h.want("scan/diff_f32") {
         let hx = values(n, 45, 0.0, 1.0);
@@ -451,7 +462,7 @@ fn scan_cases(h: &mut Harness) {
         let diff = |x: &Array<f32>| x.slice(0, 1..) - x.slice(0, ..n - 1);
         let want: Vec<f32> = hx.windows(2).map(|w| w[1] - w[0]).collect();
         check("scan/diff_f32", &diff(&x).to_vec().unwrap(), &want, 1e-6, 1e-7);
-        h.case("scan/diff_f32", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || diff(&x).eval().unwrap());
+        case_trim(h, "scan/diff_f32", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || diff(&x).eval().unwrap());
     }
     if h.want("scan/cumprod_f32") {
         let m = 1_000_000;
@@ -467,7 +478,7 @@ fn scan_cases(h: &mut Harness) {
             .collect();
         // Timed first: the accuracy check below fails on luma's `scan` with `*` (error grows
         // linearly with the position, 6e-3 at 1e6 against 9e-6 for a sequential f32 product).
-        h.case("scan/cumprod_f32", &m.to_string(), Work::Bytes(8.0 * m as f64), &mut || x.scan(0, |a, b| a * b).eval().unwrap());
+        case_trim(h, "scan/cumprod_f32", &m.to_string(), Work::Bytes(8.0 * m as f64), &mut || x.scan(0, |a, b| a * b).eval().unwrap());
         check("scan/cumprod_f32", &x.scan(0, |a, b| a * b).to_vec().unwrap(), &want, 1e-4, 0.0);
     }
 }
@@ -518,7 +529,7 @@ fn group_cases(h: &mut Harness) {
         let codes = up(h, &hc);
         let (sum, mag) = host_group_sum(&hc, &hv, groups);
         check_sums(&name, &vals.group_sum(&codes, groups).to_vec().unwrap(), &sum, &mag, 2e-4);
-        h.case(&name, &sz, Work::Bytes(bytes), &mut || vals.group_sum(&codes, groups).eval().unwrap());
+        case_trim(h, &name, &sz, Work::Bytes(bytes), &mut || vals.group_sum(&codes, groups).eval().unwrap());
     }
 
     let g = 1000usize;
@@ -531,7 +542,7 @@ fn group_cases(h: &mut Harness) {
         let got = vals.group_mean(&codes, g).to_vec().unwrap();
         let want: Vec<f32> = sum.iter().zip(&count).map(|(&s, &c)| (s / f64::from(c)) as f32).collect();
         check("group/mean_g1k", &got, &want, 1e-3, 1e-4);
-        h.case("group/mean_g1k", &sz, Work::Bytes(2.0 * bytes), &mut || vals.group_mean(&codes, g).eval().unwrap());
+        case_trim(h, "group/mean_g1k", &sz, Work::Bytes(2.0 * bytes), &mut || vals.group_mean(&codes, g).eval().unwrap());
     }
     if h.want("group/min_g1k") || h.want("group/max_g1k") {
         let mut lo = vec![f32::INFINITY; g];
@@ -542,18 +553,18 @@ fn group_cases(h: &mut Harness) {
         }
         if h.want("group/min_g1k") {
             exact("group/min_g1k", &vals.group_min(&codes, g).to_vec().unwrap(), &lo);
-            h.case("group/min_g1k", &sz, Work::Bytes(bytes), &mut || vals.group_min(&codes, g).eval().unwrap());
+            case_trim(h, "group/min_g1k", &sz, Work::Bytes(bytes), &mut || vals.group_min(&codes, g).eval().unwrap());
         }
         if h.want("group/max_g1k") {
             exact("group/max_g1k", &vals.group_max(&codes, g).to_vec().unwrap(), &hi);
-            h.case("group/max_g1k", &sz, Work::Bytes(bytes), &mut || vals.group_max(&codes, g).eval().unwrap());
+            case_trim(h, "group/max_g1k", &sz, Work::Bytes(bytes), &mut || vals.group_max(&codes, g).eval().unwrap());
         }
     }
     if h.want("group/count_g1k") {
         let mut want = vec![0u32; g];
         hc.iter().for_each(|&c| want[c as usize] += 1);
         exact("group/count_g1k", &vals.group_count(&codes, g).to_vec().unwrap(), &want);
-        h.case("group/count_g1k", &sz, Work::Bytes(4.0 * n as f64), &mut || vals.group_count(&codes, g).eval().unwrap());
+        case_trim(h, "group/count_g1k", &sz, Work::Bytes(4.0 * n as f64), &mut || vals.group_count(&codes, g).eval().unwrap());
     }
     // The usual aggregate table: sum, min, max, count in one go.
     if h.want("group/agg4_g1k") {
@@ -569,7 +580,7 @@ fn group_cases(h: &mut Harness) {
         let (sum, mag) = host_group_sum(&hc, &hv, g);
         let (s, ..) = agg();
         check_sums("group/agg4_g1k", &s.to_vec().unwrap(), &sum, &mag, 2e-4);
-        h.case("group/agg4_g1k", &sz, Work::Bytes(4.0 * bytes), &mut || {
+        case_trim(h, "group/agg4_g1k", &sz, Work::Bytes(4.0 * bytes), &mut || {
             agg();
         });
     }
@@ -581,7 +592,7 @@ fn group_cases(h: &mut Harness) {
             want[c as usize] = want[c as usize].wrapping_add(v);
         }
         exact("group/sum_i32_g1k", &iv.group_sum(&codes, g).to_vec().unwrap(), &want);
-        h.case("group/sum_i32_g1k", &sz, Work::Bytes(bytes), &mut || iv.group_sum(&codes, g).eval().unwrap());
+        case_trim(h, "group/sum_i32_g1k", &sz, Work::Bytes(bytes), &mut || iv.group_sum(&codes, g).eval().unwrap());
     }
     // Two sparse labels per row: factorize both, combine into one dense code, aggregate.
     if h.want("group/multikey_sum_mean") {
@@ -605,7 +616,7 @@ fn group_cases(h: &mut Harness) {
         let (sum, mag) = host_group_sum(&hcode, &hv, na * nb);
         let (s, _) = agg();
         check_sums("group/multikey_sum_mean", &s.to_vec().unwrap(), &sum, &mag, 2e-4);
-        h.case("group/multikey_sum_mean", &sz, Work::Bytes(4.0 * bytes), &mut || {
+        case_trim(h, "group/multikey_sum_mean", &sz, Work::Bytes(4.0 * bytes), &mut || {
             agg();
         });
     }
@@ -632,7 +643,7 @@ fn factorize_cases(h: &mut Harness) {
         let uv = u.to_vec().unwrap();
         assert!(codes.iter().zip(&hk).all(|(&c, &k)| uv[c as usize] == k), "{name}: codes");
         drop((u, c));
-        h.case(name, &rows.to_string(), Work::Items(rows as f64, "Mrow/s"), &mut || {
+        case_trim(h, name, &rows.to_string(), Work::Items(rows as f64, "Mrow/s"), &mut || {
             let (u, c) = x.factorize();
             eval_all(&[&u, &c]).unwrap();
         });
@@ -645,7 +656,7 @@ fn factorize_cases(h: &mut Harness) {
         want.sort_by(f32::total_cmp);
         want.dedup();
         exact("factorize/unique_f32_1m", &x.unique().to_vec().unwrap(), &want);
-        h.case("factorize/unique_f32_1m", &m.to_string(), Work::Items(m as f64, "Mrow/s"), &mut || x.unique().eval().unwrap());
+        case_trim(h, "factorize/unique_f32_1m", &m.to_string(), Work::Items(m as f64, "Mrow/s"), &mut || x.unique().eval().unwrap());
     }
     // Small, latency-bound: the readback of the distinct count dominates.
     if h.want("factorize/u32_10k_d100") {
@@ -656,7 +667,7 @@ fn factorize_cases(h: &mut Harness) {
         want.sort_unstable();
         want.dedup();
         exact("factorize/u32_10k_d100", &x.unique().to_vec().unwrap(), &want);
-        h.case("factorize/u32_10k_d100", &m.to_string(), Work::Items(m as f64, "Mrow/s"), &mut || x.unique().eval().unwrap());
+        case_trim(h, "factorize/u32_10k_d100", &m.to_string(), Work::Items(m as f64, "Mrow/s"), &mut || x.unique().eval().unwrap());
     }
 }
 
@@ -682,7 +693,7 @@ fn quantile_cases(h: &mut Harness) {
         let mut s = hx.clone();
         s.sort_by(f32::total_cmp);
         check_scalar(&name, f64::from(x.median().item().unwrap()), f64::from(host_quantile(&s, 0.5)), 1e-6);
-        h.case(&name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
+        case_trim(h, &name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
             x.median().item().unwrap();
         });
     }
@@ -703,7 +714,7 @@ fn quantile_cases(h: &mut Harness) {
         for (r, &q) in run().iter().zip(&qs) {
             check_scalar("quantile/five_1m", f64::from(r.item().unwrap()), f64::from(host_quantile(&s, q)), 1e-5);
         }
-        h.case("quantile/five_1m", &n.to_string(), Work::Items(5.0 * n as f64, "Mrow/s"), &mut || {
+        case_trim(h, "quantile/five_1m", &n.to_string(), Work::Items(5.0 * n as f64, "Mrow/s"), &mut || {
             run();
         });
     }
@@ -722,7 +733,7 @@ fn quantile_cases(h: &mut Harness) {
             })
             .collect();
         check("quantile/median_axis0", &x.median_axis(0).to_vec().unwrap(), &want, 1e-5, 1e-6);
-        h.case("quantile/median_axis0", &format!("1024x{cols}"), Work::Items(total as f64, "Mrow/s"), &mut || x.median_axis(0).eval().unwrap());
+        case_trim(h, "quantile/median_axis0", &format!("1024x{cols}"), Work::Items(total as f64, "Mrow/s"), &mut || x.median_axis(0).eval().unwrap());
     }
 }
 
@@ -751,7 +762,7 @@ fn hist_cases(h: &mut Harness) {
             continue;
         }
         exact(&name, &x.histogram(bins, 0.0, 1.0).to_vec().unwrap(), &host_hist(&hx, bins, 0.0, 1.0));
-        h.case(&name, &sz, Work::Bytes(4.0 * n as f64), &mut || x.histogram(bins, 0.0, 1.0).eval().unwrap());
+        case_trim(h, &name, &sz, Work::Bytes(4.0 * n as f64), &mut || x.histogram(bins, 0.0, 1.0).eval().unwrap());
     }
     // A peaked distribution: most values land in a few bins (atomic contention).
     if h.want("hist/f32_peaked_256bins") {
@@ -761,7 +772,7 @@ fn hist_cases(h: &mut Harness) {
         let hp: Vec<f32> = (0..n).map(|i| (a[i] * b[i] * c[i]).powi(3)).collect();
         let xp = up(h, &hp);
         exact("hist/f32_peaked_256bins", &xp.histogram(256, 0.0, 1.0).to_vec().unwrap(), &host_hist(&hp, 256, 0.0, 1.0));
-        h.case("hist/f32_peaked_256bins", &sz, Work::Bytes(4.0 * n as f64), &mut || xp.histogram(256, 0.0, 1.0).eval().unwrap());
+        case_trim(h, "hist/f32_peaked_256bins", &sz, Work::Bytes(4.0 * n as f64), &mut || xp.histogram(256, 0.0, 1.0).eval().unwrap());
     }
     for (name, bins) in [("hist/bincount_64", 64usize), ("hist/bincount_1m", 1_000_000)] {
         if !h.want(name) {
@@ -772,7 +783,7 @@ fn hist_cases(h: &mut Harness) {
         let mut want = vec![0u32; bins];
         hc.iter().for_each(|&c| want[c as usize] += 1);
         exact(name, &bincount(&codes, bins).to_vec().unwrap(), &want);
-        h.case(name, &sz, Work::Bytes(4.0 * n as f64), &mut || bincount(&codes, bins).eval().unwrap());
+        case_trim(h, name, &sz, Work::Bytes(4.0 * n as f64), &mut || bincount(&codes, bins).eval().unwrap());
     }
 }
 
@@ -792,7 +803,7 @@ fn topk_cases(h: &mut Harness) {
             let (gv, gi) = (v.to_vec().unwrap(), i.to_vec().unwrap());
             exact(&name, &gv, &want);
             assert!(gi.iter().zip(&gv).all(|(&i, &v)| hx[i as usize] == v), "{name}: indices");
-            h.case(&name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
+            case_trim(h, &name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
                 let (v, i) = if largest { x.topk(k) } else { x.bottomk(k) };
                 eval_all(&[&v]).unwrap();
                 i.eval().unwrap();
@@ -819,7 +830,7 @@ fn filter_cases(h: &mut Harness) {
         exact(name, &got.to_vec().unwrap(), &want);
         drop(got);
         let work = Work::Bytes(4.0 * (rows + want.len()) as f64);
-        h.case(name, &format!("{rows}->{}", want.len()), work, &mut || x.filter(&x.gt(cut)).unwrap().unwrap().eval().unwrap());
+        case_trim(h, name, &format!("{rows}->{}", want.len()), work, &mut || x.filter(&x.gt(cut)).unwrap().unwrap().eval().unwrap());
     }
     if h.want("filter/padded") {
         let hx = values(n, 102, 0.0, 1.0);
@@ -829,7 +840,7 @@ fn filter_cases(h: &mut Harness) {
         assert_eq!(c.item().unwrap() as usize, want.len());
         exact("filter/padded", &k.to_vec().unwrap()[..want.len()], &want);
         drop((k, c));
-        h.case("filter/padded", &sz, Work::Bytes(4.0 * (n + want.len()) as f64), &mut || {
+        case_trim(h, "filter/padded", &sz, Work::Bytes(4.0 * (n + want.len()) as f64), &mut || {
             let (k, c) = x.filter_padded(&x.gt(0.5), 0.0);
             k.eval().unwrap();
             c.item().unwrap();
@@ -842,7 +853,7 @@ fn filter_cases(h: &mut Harness) {
         let got = x.gt(0.9).nonzero().unwrap().unwrap();
         exact("filter/nonzero_10pct", &got.to_vec().unwrap(), &want);
         drop(got);
-        h.case("filter/nonzero_10pct", &sz, Work::Bytes(4.0 * (n + want.len()) as f64), &mut || x.gt(0.9).nonzero().unwrap().unwrap().eval().unwrap());
+        case_trim(h, "filter/nonzero_10pct", &sz, Work::Bytes(4.0 * (n + want.len()) as f64), &mut || x.gt(0.9).nonzero().unwrap().unwrap().eval().unwrap());
     }
     // A pending product, selected by a mask over two other columns.
     if h.want("filter/expr_two_cols") {
@@ -851,7 +862,7 @@ fn filter_cases(h: &mut Harness) {
         let want: Vec<f32> = ha.iter().zip(&hb).filter(|&(&p, &q)| p > 0.3 && q < 0.6).map(|(&p, &q)| p * q).collect();
         let run = || (&a * &b).filter(&(a.gt(0.3) & b.lt(0.6))).unwrap().unwrap();
         check("filter/expr_two_cols", &run().to_vec().unwrap(), &want, 1e-6, 0.0);
-        h.case("filter/expr_two_cols", &format!("{n}->{}", want.len()), Work::Bytes(4.0 * (2 * n + want.len()) as f64), &mut || run().eval().unwrap());
+        case_trim(h, "filter/expr_two_cols", &format!("{n}->{}", want.len()), Work::Bytes(4.0 * (2 * n + want.len()) as f64), &mut || run().eval().unwrap());
     }
 }
 
@@ -872,7 +883,7 @@ fn search_cases(h: &mut Harness) {
         let (x, e) = (up(h, &hx), up(h, &he));
         let want: Vec<u32> = hx.iter().map(|&v| he.partition_point(|&p| p < v) as u32).collect();
         exact(name, &e.searchsorted(&x, Side::Left).to_vec().unwrap(), &want);
-        h.case(name, &format!("{rows} in {len}"), Work::Bytes(8.0 * rows as f64), &mut || e.searchsorted(&x, Side::Left).eval().unwrap());
+        case_trim(h, name, &format!("{rows} in {len}"), Work::Bytes(8.0 * rows as f64), &mut || e.searchsorted(&x, Side::Left).eval().unwrap());
     }
     // Uneven-bin histogram: digitize against 255 edges, then bincount.
     if h.want("search/digitize_hist") {
@@ -883,7 +894,7 @@ fn search_cases(h: &mut Harness) {
         hx.iter().for_each(|&v| want[he.partition_point(|&p| p <= v)] += 1);
         let run = || bincount(&x.digitize(&e, false), 256);
         exact("search/digitize_hist", &run().to_vec().unwrap(), &want);
-        h.case("search/digitize_hist", &n.to_string(), Work::Bytes(4.0 * n as f64), &mut || run().eval().unwrap());
+        case_trim(h, "search/digitize_hist", &n.to_string(), Work::Bytes(4.0 * n as f64), &mut || run().eval().unwrap());
     }
     if h.want("search/isin_u32") {
         let rows = n;
@@ -893,7 +904,7 @@ fn search_cases(h: &mut Harness) {
         let members: std::collections::HashSet<u32> = hset.iter().copied().collect();
         let want: Vec<bool> = hid.iter().map(|v| members.contains(v)).collect();
         exact("search/isin_u32", &ids.isin(&set).to_vec().unwrap(), &want);
-        h.case("search/isin_u32", &format!("{rows} in 10000"), Work::Bytes(5.0 * rows as f64), &mut || ids.isin(&set).eval().unwrap());
+        case_trim(h, "search/isin_u32", &format!("{rows} in 10000"), Work::Bytes(5.0 * rows as f64), &mut || ids.isin(&set).eval().unwrap());
     }
     // Join-like lookup: for every left key find its row in a sorted unique key table (some
     // keys are missing) and fetch the payload.
@@ -920,7 +931,7 @@ fn search_cases(h: &mut Harness) {
             })
             .collect();
         exact("search/join_lookup", &run().to_vec().unwrap(), &want);
-        h.case("search/join_lookup", &format!("{rows} in {table}"), Work::Bytes(12.0 * rows as f64), &mut || run().eval().unwrap());
+        case_trim(h, "search/join_lookup", &format!("{rows} in {table}"), Work::Bytes(12.0 * rows as f64), &mut || run().eval().unwrap());
     }
 }
 
@@ -938,7 +949,7 @@ fn take_cases(h: &mut Harness) {
         let (x, idx) = (up(h, &hx), up(h, &hi));
         let want: Vec<f32> = hi.iter().map(|&i| hx[i as usize]).collect();
         exact(name, &x.take(&idx).to_vec().unwrap(), &want);
-        h.case(name, &rows.to_string(), Work::Bytes(12.0 * rows as f64), &mut || x.take(&idx).eval().unwrap());
+        case_trim(h, name, &rows.to_string(), Work::Bytes(12.0 * rows as f64), &mut || x.take(&idx).eval().unwrap());
     }
 }
 
@@ -1004,7 +1015,7 @@ fn table_cases(h: &mut Harness) {
         exact("table/describe min", &r[2].to_vec().unwrap(), &want.min);
         exact("table/describe max", &r[3].to_vec().unwrap(), &want.max);
         drop(r);
-        h.case("table/describe_4ops", &dims, Work::Bytes(12.0 * elems as f64), &mut || {
+        case_trim(h, "table/describe_4ops", &dims, Work::Bytes(12.0 * elems as f64), &mut || {
             run();
         });
     }
@@ -1022,7 +1033,7 @@ fn table_cases(h: &mut Harness) {
         check("table/describe_1pass std", &std, &as_f32(&want.std), 2e-2, 1e-2);
         exact("table/describe_1pass min", &r[2].to_vec().unwrap(), &want.min);
         drop(r);
-        h.case("table/describe_1pass", &dims, Work::Bytes(4.0 * elems as f64), &mut || {
+        case_trim(h, "table/describe_1pass", &dims, Work::Bytes(4.0 * elems as f64), &mut || {
             run();
         });
     }
@@ -1035,7 +1046,7 @@ fn table_cases(h: &mut Harness) {
             }
         }
         check("table/standardize", &run().to_vec().unwrap(), &z, 1e-3, 1e-4);
-        h.case("table/standardize", &dims, Work::Bytes(12.0 * elems as f64), &mut || run().eval().unwrap());
+        case_trim(h, "table/standardize", &dims, Work::Bytes(12.0 * elems as f64), &mut || run().eval().unwrap());
     }
     // Correlation matrix: standardized columns times their transpose.
     if h.want("table/corr") {
@@ -1055,7 +1066,7 @@ fn table_cases(h: &mut Harness) {
             }
         }
         check("table/corr", &got, &as_f32(&dot), 0.0, 5e-3);
-        h.case("table/corr", &dims, Work::Flops(2.0 * (feats * feats * rows) as f64 + 12.0 * elems as f64), &mut || run().eval().unwrap());
+        case_trim(h, "table/corr", &dims, Work::Flops(2.0 * (feats * feats * rows) as f64 + 12.0 * elems as f64), &mut || run().eval().unwrap());
     }
     drop(x);
 
@@ -1079,7 +1090,7 @@ fn table_cases(h: &mut Harness) {
             let g = f64::from(got[i + feats * j]);
             assert!((g - cov).abs() <= 2e-3 * cov.abs().max(1.0), "table/cov_wide: ({i},{j}): got {g}, want {cov}");
         }
-        h.case("table/cov_wide", &format!("{rows}x{feats}"), Work::Flops(2.0 * (feats * feats * rows) as f64), &mut || run().eval().unwrap());
+        case_trim(h, "table/cov_wide", &format!("{rows}x{feats}"), Work::Flops(2.0 * (feats * feats * rows) as f64), &mut || run().eval().unwrap());
     }
 
     // NaN-aware statistics of a table with 5% missing cells.
@@ -1107,7 +1118,7 @@ fn table_cases(h: &mut Harness) {
         exact("table/describe_nan min", &r[1].to_vec().unwrap(), &lo);
         exact("table/describe_nan max", &r[2].to_vec().unwrap(), &hi);
         drop(r);
-        h.case("table/describe_nan", &format!("{rows}x{feats}"), Work::Bytes(4.0 * (rows * feats) as f64 * 2.0), &mut || {
+        case_trim(h, "table/describe_nan", &format!("{rows}x{feats}"), Work::Bytes(4.0 * (rows * feats) as f64 * 2.0), &mut || {
             run();
         });
     }
@@ -1137,7 +1148,7 @@ fn pivot_cases(h: &mut Harness) {
         let flat: Vec<u32> = hr.iter().zip(&hc).map(|(&a, &b)| a * nc + b).collect();
         let (sum, mag) = host_group_sum(&flat, &hv, cells);
         check_sums(name, &run().to_vec().unwrap(), &sum, &mag, 2e-4);
-        h.case(name, &sz, Work::Bytes(12.0 * n as f64), &mut || run().eval().unwrap());
+        case_trim(h, name, &sz, Work::Bytes(12.0 * n as f64), &mut || run().eval().unwrap());
     }
     // Mean table: sums over counts, both scattered.
     if h.want("pivot/mean_100x10") {
@@ -1162,7 +1173,7 @@ fn pivot_cases(h: &mut Harness) {
         flat.iter().for_each(|&i| cnt[i as usize] += 1);
         let want: Vec<f32> = sum.iter().zip(&cnt).map(|(&s, &c)| (s / f64::from(c)) as f32).collect();
         check("pivot/mean_100x10", &run().to_vec().unwrap(), &want, 1e-3, 1e-4);
-        h.case("pivot/mean_100x10", &sz, Work::Bytes(20.0 * n as f64), &mut || {
+        case_trim(h, "pivot/mean_100x10", &sz, Work::Bytes(20.0 * n as f64), &mut || {
             run();
         });
     }
@@ -1180,7 +1191,7 @@ fn pivot_cases(h: &mut Harness) {
             want[i * classes + l as usize] = 1.0;
         }
         exact(name, &run().to_vec().unwrap(), &want);
-        h.case(name, &format!("{rows}x{classes}"), Work::Bytes(4.0 * (rows * classes) as f64), &mut || run().eval().unwrap());
+        case_trim(h, name, &format!("{rows}x{classes}"), Work::Bytes(4.0 * (rows * classes) as f64), &mut || run().eval().unwrap());
     }
 }
 
@@ -1218,7 +1229,7 @@ fn rolling_cases(h: &mut Harness) {
         let x = up(h, &hx);
         let run = || window_sum(&x, w) / w as f32;
         check(name, &run().to_vec().unwrap(), &host_window_mean(&hx, w), 1e-4, 1e-5);
-        h.case(name, &rows.to_string(), Work::Bytes(8.0 * rows as f64), &mut || run().eval().unwrap());
+        case_trim(h, name, &rows.to_string(), Work::Bytes(8.0 * rows as f64), &mut || run().eval().unwrap());
     }
     if h.want("rolling/std_w32") {
         let w = 32usize;
@@ -1235,7 +1246,7 @@ fn rolling_cases(h: &mut Harness) {
         let msq = host_window_mean(&sq, w);
         let want: Vec<f32> = mean.iter().zip(&msq).map(|(&m, &q)| (q - m * m).max(0.0).sqrt()).collect();
         check("rolling/std_w32", &run().to_vec().unwrap(), &want, 0.0, 5e-3);
-        h.case("rolling/std_w32", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || run().eval().unwrap());
+        case_trim(h, "rolling/std_w32", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || run().eval().unwrap());
     }
     // Window means from the difference of a running sum (zero-mean data keeps it accurate).
     if h.want("rolling/mean_cumsum_w16") {
@@ -1248,7 +1259,7 @@ fn rolling_cases(h: &mut Harness) {
         };
         let full = host_window_mean(&hx, w);
         check("rolling/mean_cumsum_w16", &run().to_vec().unwrap(), &full[1..], 0.0, 2e-3);
-        h.case("rolling/mean_cumsum_w16", &rows.to_string(), Work::Bytes(16.0 * rows as f64), &mut || run().eval().unwrap());
+        case_trim(h, "rolling/mean_cumsum_w16", &rows.to_string(), Work::Bytes(16.0 * rows as f64), &mut || run().eval().unwrap());
     }
     // Per-column windows of a table: the window runs along axis 0.
     if h.want("rolling/mean_table_w16") {
@@ -1258,7 +1269,7 @@ fn rolling_cases(h: &mut Harness) {
         let run = || window_sum(&x, w) / w as f32;
         let want: Vec<f32> = hx.chunks(rows).flat_map(|c| host_window_mean(c, w)).collect();
         check("rolling/mean_table_w16", &run().to_vec().unwrap(), &want, 1e-4, 1e-5);
-        h.case("rolling/mean_table_w16", &format!("{rows}x{feats}"), Work::Bytes(8.0 * (rows * feats) as f64), &mut || run().eval().unwrap());
+        case_trim(h, "rolling/mean_table_w16", &format!("{rows}x{feats}"), Work::Bytes(8.0 * (rows * feats) as f64), &mut || run().eval().unwrap());
     }
     if h.want("rolling/diff2") {
         let hx = values(n, 155, 0.0, 1.0);
@@ -1266,7 +1277,7 @@ fn rolling_cases(h: &mut Harness) {
         let run = || x.slice(0, 2..) - &(x.slice(0, 1..n - 1) * 2.0) + x.slice(0, ..n - 2);
         let want: Vec<f32> = hx.windows(3).map(|w| w[2] - 2.0 * w[1] + w[0]).collect();
         check("rolling/diff2", &run().to_vec().unwrap(), &want, 0.0, 1e-5);
-        h.case("rolling/diff2", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || run().eval().unwrap());
+        case_trim(h, "rolling/diff2", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || run().eval().unwrap());
     }
 }
 
@@ -1327,7 +1338,7 @@ fn pipeline_cases(h: &mut Harness) {
             check_scalar(&name, f64::from(out[1][r]), tot / f64::from(cnt), 1e-3);
             assert_eq!(out[2][r], best, "{name}: max of {}", keys[r]);
         }
-        h.case(&name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
+        case_trim(h, &name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
             run(&ctx);
         });
     }
@@ -1360,7 +1371,7 @@ fn pipeline_cases(h: &mut Harness) {
         let want_q: Vec<f32> = pos.iter().map(|&p| s[p as usize]).collect();
         exact(&name, &picked, &want_q);
         exact(&name, &hist, &host_hist(&hx, 64, 0.0, 1.0));
-        h.case(&name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
+        case_trim(h, &name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
             run();
         });
     }
@@ -1385,7 +1396,7 @@ fn pipeline_cases(h: &mut Harness) {
             let (count, got_mean) = run();
             assert_eq!(count, clean.len(), "{name}: kept rows");
             check_scalar(name, f64::from(got_mean), clean.iter().sum::<f64>() / clean.len() as f64, 1e-4);
-            h.case(name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
+            case_trim(h, name, &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || {
                 run();
             });
         }
@@ -1407,7 +1418,7 @@ fn sort_extra_cases(h: &mut Harness) {
         let in_keys: Vec<u32> = hx.iter().copied().map(key_f32).collect();
         check_sorted("sort/f32_desc", &got_keys, &in_keys);
         drop(got);
-        h.case("sort/f32_desc", &n.to_string(), Work::Items(n as f64, "Mkey/s"), &mut || x.sort_descending().eval().unwrap());
+        case_trim(h, "sort/f32_desc", &n.to_string(), Work::Items(n as f64, "Mkey/s"), &mut || x.sort_descending().eval().unwrap());
     }
     // Sort a table by two columns: two stable argsorts and two gathers.
     if h.want("sort/lexsort2_u32") {
@@ -1421,7 +1432,7 @@ fn sort_extra_cases(h: &mut Harness) {
         let mut want: Vec<u32> = (0..n as u32).collect();
         want.sort_by_key(|&i| (ha[i as usize], hb[i as usize], i));
         exact("sort/lexsort2_u32", &run().to_vec().unwrap(), &want);
-        h.case("sort/lexsort2_u32", &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || run().eval().unwrap());
+        case_trim(h, "sort/lexsort2_u32", &n.to_string(), Work::Items(n as f64, "Mrow/s"), &mut || run().eval().unwrap());
     }
     // Many short lines.
     let total = if h.ctx.is_cpu() || h.quick { 1 << 20 } else { 1 << 22 };
@@ -1432,7 +1443,7 @@ fn sort_extra_cases(h: &mut Harness) {
         let mut want = hx.clone();
         want.chunks_mut(16).for_each(|c| c.sort_by(f32::total_cmp));
         exact("sort/axis0_len16", &x.sort_axis(0).to_vec().unwrap(), &want);
-        h.case("sort/axis0_len16", &format!("{}x{}", dims[0], dims[1]), Work::Items(total as f64, "Mkey/s"), &mut || x.sort_axis(0).eval().unwrap());
+        case_trim(h, "sort/axis0_len16", &format!("{}x{}", dims[0], dims[1]), Work::Items(total as f64, "Mkey/s"), &mut || x.sort_axis(0).eval().unwrap());
     }
 }
 
@@ -1456,7 +1467,7 @@ fn argsort_extra_cases(h: &mut Harness) {
             want[i as usize] = rank as u32;
         }
         exact("argsort/rank_f32", &run().to_vec().unwrap(), &want);
-        h.case("argsort/rank_f32", &n.to_string(), Work::Items(2.0 * n as f64, "Mkey/s"), &mut || run().eval().unwrap());
+        case_trim(h, "argsort/rank_f32", &n.to_string(), Work::Items(2.0 * n as f64, "Mkey/s"), &mut || run().eval().unwrap());
     }
 }
 
@@ -1472,7 +1483,7 @@ fn reduce_extra_cases(h: &mut Harness) {
             }
         }
         assert_eq!(x.argmax().item().unwrap() as usize, best, "reduce/argmax_f32");
-        h.case("reduce/argmax_f32", &n.to_string(), Work::Bytes(4.0 * n as f64), &mut || {
+        case_trim(h, "reduce/argmax_f32", &n.to_string(), Work::Bytes(4.0 * n as f64), &mut || {
             x.argmax().item().unwrap();
         });
     }
@@ -1483,7 +1494,7 @@ fn reduce_extra_cases(h: &mut Harness) {
         let x = Array::from_slice_on(&h.ctx, &hx, [32, m]).unwrap();
         let want: Vec<f32> = (0..32).map(|i| (0..m).map(|j| f64::from(hx[i + 32 * j])).sum::<f64>() as f32).collect();
         check("reduce/sum_axis1_32xM", &x.sum_axis(1).to_vec().unwrap(), &want, 1e-4, 1e-3);
-        h.case("reduce/sum_axis1_32xM", &format!("32x{m}"), Work::Bytes(4.0 * (32 * m) as f64), &mut || x.sum_axis(1).eval().unwrap());
+        case_trim(h, "reduce/sum_axis1_32xM", &format!("32x{m}"), Work::Bytes(4.0 * (32 * m) as f64), &mut || x.sum_axis(1).eval().unwrap());
     }
     // Millions of 4-element lines (per-pixel channel sums).
     if h.want("reduce/sum_axis0_4xM") {
@@ -1492,7 +1503,7 @@ fn reduce_extra_cases(h: &mut Harness) {
         let x = Array::from_slice_on(&h.ctx, &hx, [4, m]).unwrap();
         let want: Vec<f32> = hx.chunks(4).map(|c| c.iter().sum()).collect();
         check("reduce/sum_axis0_4xM", &x.sum_axis(0).to_vec().unwrap(), &want, 1e-6, 1e-6);
-        h.case("reduce/sum_axis0_4xM", &format!("4x{m}"), Work::Bytes(4.0 * (4 * m + m) as f64), &mut || x.sum_axis(0).eval().unwrap());
+        case_trim(h, "reduce/sum_axis0_4xM", &format!("4x{m}"), Work::Bytes(4.0 * (4 * m + m) as f64), &mut || x.sum_axis(0).eval().unwrap());
     }
 }
 
@@ -1511,7 +1522,7 @@ fn scan_extra_cases(h: &mut Harness) {
             })
             .collect();
         exact("scan/cummax_f32", &x.scan(0, |a, b| a.maximum(b)).to_vec().unwrap(), &want);
-        h.case("scan/cummax_f32", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || x.scan(0, |a, b| a.maximum(b)).eval().unwrap());
+        case_trim(h, "scan/cummax_f32", &n.to_string(), Work::Bytes(8.0 * n as f64), &mut || x.scan(0, |a, b| a.maximum(b)).eval().unwrap());
     }
     // Many short lines: cumulative sum within groups of 16 rows.
     if h.want("scan/cumsum_len16") {
@@ -1527,7 +1538,7 @@ fn scan_extra_cases(h: &mut Harness) {
             }
         }
         check("scan/cumsum_len16", &x.cumsum(0).to_vec().unwrap(), &want, 1e-5, 1e-5);
-        h.case("scan/cumsum_len16", &format!("16x{}", total / 16), Work::Bytes(8.0 * total as f64), &mut || x.cumsum(0).eval().unwrap());
+        case_trim(h, "scan/cumsum_len16", &format!("16x{}", total / 16), Work::Bytes(8.0 * total as f64), &mut || x.cumsum(0).eval().unwrap());
     }
 }
 
@@ -1547,7 +1558,7 @@ fn pivot_extra_cases(h: &mut Harness) {
             want[dim * i..dim * (i + 1)].copy_from_slice(&hw[dim * l as usize..dim * (l as usize + 1)]);
         }
         check("pivot/onehot_matmul", &run().to_vec().unwrap(), &want, 1e-5, 1e-5);
-        h.case("pivot/onehot_matmul", &format!("{rows}x{classes}x{dim}"), Work::Flops(2.0 * (rows * classes * dim) as f64), &mut || run().eval().unwrap());
+        case_trim(h, "pivot/onehot_matmul", &format!("{rows}x{classes}x{dim}"), Work::Flops(2.0 * (rows * classes * dim) as f64), &mut || run().eval().unwrap());
     }
 }
 
@@ -1577,7 +1588,7 @@ fn small_cases(h: &mut Harness) {
         let mut want = hx.clone();
         want.sort_by(f32::total_cmp);
         exact("small/sort_10k", &x.sort().to_vec().unwrap(), &want);
-        h.case("small/sort_10k", &sz, Work::None, &mut || x.sort().eval().unwrap());
+        case_trim(h, "small/sort_10k", &sz, Work::None, &mut || x.sort().eval().unwrap());
     }
     if h.want("small/group_sum_10k_g16") {
         let hv = values(n, 202, 0.0, 1.0);
@@ -1585,13 +1596,13 @@ fn small_cases(h: &mut Harness) {
         let (v, c) = (up(h, &hv), up(h, &hc));
         let (sum, mag) = host_group_sum(&hc, &hv, 16);
         check_sums("small/group_sum_10k_g16", &v.group_sum(&c, 16).to_vec().unwrap(), &sum, &mag, 1e-5);
-        h.case("small/group_sum_10k_g16", &sz, Work::None, &mut || v.group_sum(&c, 16).eval().unwrap());
+        case_trim(h, "small/group_sum_10k_g16", &sz, Work::None, &mut || v.group_sum(&c, 16).eval().unwrap());
     }
     if h.want("small/hist_10k") {
         let hx = values(n, 204, -0.25, 1.25);
         let x = up(h, &hx);
         exact("small/hist_10k", &x.histogram(256, 0.0, 1.0).to_vec().unwrap(), &host_hist(&hx, 256, 0.0, 1.0));
-        h.case("small/hist_10k", &sz, Work::None, &mut || x.histogram(256, 0.0, 1.0).eval().unwrap());
+        case_trim(h, "small/hist_10k", &sz, Work::None, &mut || x.histogram(256, 0.0, 1.0).eval().unwrap());
     }
     if h.want("small/median_1k") {
         let hx = values(1000, 205, -3.0, 3.0);
@@ -1599,7 +1610,7 @@ fn small_cases(h: &mut Harness) {
         let mut s = hx.clone();
         s.sort_by(f32::total_cmp);
         check_scalar("small/median_1k", f64::from(x.median().item().unwrap()), f64::from(host_quantile(&s, 0.5)), 1e-6);
-        h.case("small/median_1k", "1000", Work::None, &mut || {
+        case_trim(h, "small/median_1k", "1000", Work::None, &mut || {
             x.median().item().unwrap();
         });
     }
@@ -1609,14 +1620,14 @@ fn small_cases(h: &mut Harness) {
         let mut s = hx.clone();
         s.sort_by(|a, b| b.total_cmp(a));
         exact("small/topk10_10k", &x.topk(10).0.to_vec().unwrap(), &s[..10]);
-        h.case("small/topk10_10k", &sz, Work::None, &mut || x.topk(10).0.eval().unwrap());
+        case_trim(h, "small/topk10_10k", &sz, Work::None, &mut || x.topk(10).0.eval().unwrap());
     }
     if h.want("small/filter_10k") {
         let hx = values(n, 207, 0.0, 1.0);
         let x = up(h, &hx);
         let want: Vec<f32> = hx.iter().copied().filter(|&v| v > 0.5).collect();
         exact("small/filter_10k", &x.filter(&x.gt(0.5)).unwrap().unwrap().to_vec().unwrap(), &want);
-        h.case("small/filter_10k", &sz, Work::None, &mut || x.filter(&x.gt(0.5)).unwrap().unwrap().eval().unwrap());
+        case_trim(h, "small/filter_10k", &sz, Work::None, &mut || x.filter(&x.gt(0.5)).unwrap().unwrap().eval().unwrap());
     }
     if h.want("small/cumsum_10k") {
         let hx = values(n, 208, 0.0, 1.0);
@@ -1630,7 +1641,7 @@ fn small_cases(h: &mut Harness) {
             })
             .collect();
         check("small/cumsum_10k", &x.cumsum(0).to_vec().unwrap(), &want, 1e-5, 1e-4);
-        h.case("small/cumsum_10k", &sz, Work::None, &mut || x.cumsum(0).eval().unwrap());
+        case_trim(h, "small/cumsum_10k", &sz, Work::None, &mut || x.cumsum(0).eval().unwrap());
     }
     if h.want("small/searchsorted_10k_in_100") {
         let hx = values(n, 209, -0.1, 1.1);
@@ -1638,7 +1649,7 @@ fn small_cases(h: &mut Harness) {
         let (x, e) = (up(h, &hx), up(h, &he));
         let want: Vec<u32> = hx.iter().map(|&v| he.partition_point(|&p| p < v) as u32).collect();
         exact("small/searchsorted_10k_in_100", &e.searchsorted(&x, Side::Left).to_vec().unwrap(), &want);
-        h.case("small/searchsorted_10k_in_100", &sz, Work::None, &mut || e.searchsorted(&x, Side::Left).eval().unwrap());
+        case_trim(h, "small/searchsorted_10k_in_100", &sz, Work::None, &mut || e.searchsorted(&x, Side::Left).eval().unwrap());
     }
     // A 1000 x 16 table: describe and correlate.
     let (rows, feats) = (1000usize, 16usize);
@@ -1655,7 +1666,7 @@ fn small_cases(h: &mut Harness) {
         check("small/describe_1kx16 mean", &r[0].to_vec().unwrap(), &as_f32(&want.mean), 1e-5, 1e-5);
         check("small/describe_1kx16 std", &r[1].to_vec().unwrap(), &as_f32(&want.std), 1e-4, 1e-5);
         drop(r);
-        h.case("small/describe_1kx16", "1000x16", Work::None, &mut || {
+        case_trim(h, "small/describe_1kx16", "1000x16", Work::None, &mut || {
             run();
         });
     }
@@ -1665,6 +1676,6 @@ fn small_cases(h: &mut Harness) {
             z.matmul(&z.transpose()) / rows as f32
         };
         check("small/corr_1kx16", &run().to_vec().unwrap(), &as_f32(&host_corr(&hx, rows, feats)), 0.0, 2e-3);
-        h.case("small/corr_1kx16", "1000x16", Work::None, &mut || run().eval().unwrap());
+        case_trim(h, "small/corr_1kx16", "1000x16", Work::None, &mut || run().eval().unwrap());
     }
 }
