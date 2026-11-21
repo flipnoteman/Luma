@@ -195,11 +195,87 @@ struct CpuExecGraph {
 
 impl ExecGraph for CpuExecGraph {}
 
+impl CpuBackend {
+    /// The mask and workgroup size checks of a kernel, which fail before any compiling.
+    fn check_module(&self, module: &KernelModule, used: Option<&[bool]>, label: &str) -> Result<(), BackendError> {
+        if let Some(mask) = used
+            && mask.len() != module.bindings.len()
+        {
+            return Err(BackendError::KernelBinding(format!(
+                "kernel `{label}`: the used mask has {} entries for {} bindings",
+                mask.len(),
+                module.bindings.len()
+            )));
+        }
+        let limits = &self.info.limits;
+        let invocations: u64 = module
+            .workgroup_size
+            .iter()
+            .map(|&x| u64::from(x.max(1)))
+            .product();
+        let too_wide = module
+            .workgroup_size
+            .iter()
+            .zip(limits.max_workgroup_size)
+            .any(|(&x, max)| x > max);
+        if too_wide || invocations > u64::from(limits.max_workgroup_invocations) {
+            return Err(BackendError::KernelWorkgroup(format!(
+                "kernel `{label}` has workgroup size {:?} ({invocations} invocations), the device allows {:?} and {} invocations",
+                module.workgroup_size, limits.max_workgroup_size, limits.max_workgroup_invocations
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Plans, compiles (or loads from the disk cache) the kernel of a checked `module`; runs on the
+/// calling thread, which may be a compile worker.
+fn compile_native(
+    disk: &DiskCache,
+    max_shared_bytes: u32,
+    module: &KernelModule,
+    used: Option<&[bool]>,
+    label: &str,
+    trusted: bool,
+) -> Result<CompiledCpuKernel, BackendError> {
+    let checked = if trusted {
+        Cow::Borrowed(module)
+    } else {
+        luma_core::kir::opt::with_bounds_checks(module)
+    };
+    let optimized = luma_core::kir::optimize_for_target(&checked, true);
+    let plan = fission::plan(&optimized, used, !trusted);
+    if plan.shared_bytes > max_shared_bytes {
+        return Err(BackendError::KernelWorkgroup(format!(
+            "kernel `{label}` uses {} bytes of workgroup memory, the device allows {}",
+            plan.shared_bytes, max_shared_bytes
+        )));
+    }
+    let identity = format!(
+        "{optimized:?}\n{used:?}\n{}\n{}\n{}",
+        !trusted,
+        crate::codegen::host_isa_key(),
+        crate::codegen::REVISION
+    );
+    let stem = format!("cpu-{:016x}", cache::fnv1a(identity.as_bytes()));
+    if let Some(bytes) = disk.load_blob(&stem, cache::CPU_MAGIC)
+        && let Ok(blob) = ExecBlob::new(&bytes)
+    {
+        return Ok(CompiledCpuKernel { exec: Arc::new(blob), plan });
+    }
+    let (compiled, bytes) =
+        crate::codegen::compile(&optimized, used, !trusted).map_err(|e| match e {
+            BackendError::ShaderCompile(m) => {
+                BackendError::ShaderCompile(format!("kernel `{label}`: {m}"))
+            }
+            other => other,
+        })?;
+    disk.store_blob(&stem, cache::CPU_MAGIC, &bytes);
+    Ok(compiled)
+}
+
 fn native(kernel: &CompiledKernel) -> Result<&CompiledCpuKernel, BackendError> {
-    kernel
-        .raw
-        .downcast_ref::<CompiledCpuKernel>()
-        .ok_or_else(|| BackendError::Unsupported("the kernel belongs to another backend".into()))
+    kernel.raw.resolve::<CompiledCpuKernel>()
 }
 
 fn invalid(what: &str) -> BackendError {
@@ -377,69 +453,22 @@ impl Backend for CpuBackend {
         label: &str,
         trusted: bool,
     ) -> Result<RawKernel, BackendError> {
-        if let Some(mask) = used
-            && mask.len() != module.bindings.len()
-        {
-            return Err(BackendError::KernelBinding(format!(
-                "kernel `{label}`: the used mask has {} entries for {} bindings",
-                mask.len(),
-                module.bindings.len()
-            )));
-        }
-        let limits = &self.info.limits;
-        let invocations: u64 = module
-            .workgroup_size
-            .iter()
-            .map(|&x| u64::from(x.max(1)))
-            .product();
-        let too_wide = module
-            .workgroup_size
-            .iter()
-            .zip(limits.max_workgroup_size)
-            .any(|(&x, max)| x > max);
-        if too_wide || invocations > u64::from(limits.max_workgroup_invocations) {
-            return Err(BackendError::KernelWorkgroup(format!(
-                "kernel `{label}` has workgroup size {:?} ({invocations} invocations), the device allows {:?} and {} invocations",
-                module.workgroup_size, limits.max_workgroup_size, limits.max_workgroup_invocations
-            )));
-        }
-        let checked = if trusted {
-            Cow::Borrowed(module)
-        } else {
-            luma_core::kir::opt::with_bounds_checks(module)
-        };
-        let optimized = luma_core::kir::optimize_for_target(&checked, true);
-        let plan = fission::plan(&optimized, used, !trusted);
-        if plan.shared_bytes > limits.max_workgroup_storage_bytes {
-            return Err(BackendError::KernelWorkgroup(format!(
-                "kernel `{label}` uses {} bytes of workgroup memory, the device allows {}",
-                plan.shared_bytes, limits.max_workgroup_storage_bytes
-            )));
-        }
-        let identity = format!(
-            "{optimized:?}\n{used:?}\n{}\n{}\n{}",
-            !trusted,
-            crate::codegen::host_isa_key(),
-            crate::codegen::REVISION
-        );
-        let stem = format!("cpu-{:016x}", cache::fnv1a(identity.as_bytes()));
-        if let Some(bytes) = self.disk.load_blob(&stem, cache::CPU_MAGIC)
-            && let Ok(blob) = ExecBlob::new(&bytes)
-        {
-            return Ok(RawKernel::new(CompiledCpuKernel {
-                exec: Arc::new(blob),
-                plan,
-            }));
-        }
-        let (compiled, bytes) =
-            crate::codegen::compile(&optimized, used, !trusted).map_err(|e| match e {
-                BackendError::ShaderCompile(m) => {
-                    BackendError::ShaderCompile(format!("kernel `{label}`: {m}"))
-                }
-                other => other,
-            })?;
-        self.disk.store_blob(&stem, cache::CPU_MAGIC, &bytes);
-        Ok(RawKernel::new(compiled))
+        self.check_module(module, used, label)?;
+        compile_native(&self.disk, self.info.limits.max_workgroup_storage_bytes, module, used, label, trusted).map(RawKernel::new)
+    }
+
+    fn compile_kernel_deferred(
+        &self,
+        module: KernelModule,
+        used: Option<Box<[bool]>>,
+        label: &str,
+        trusted: bool,
+    ) -> Result<RawKernel, BackendError> {
+        self.check_module(&module, used.as_deref(), label)?;
+        let disk = Arc::clone(&self.disk);
+        let max_shared = self.info.limits.max_workgroup_storage_bytes;
+        let label = label.to_owned();
+        Ok(RawKernel::spawn(move || compile_native(&disk, max_shared, &module, used.as_deref(), &label, trusted)))
     }
 
     fn record_launch(

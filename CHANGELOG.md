@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- CUDA and CPU: the kernels luma builds itself compile on a pool of worker threads (`LUMA_COMPILE_THREADS`, default the available parallelism, `0` compiles on the calling thread as before) instead of one after another on the caller's thread. A kernel is waited for where it is first launched or captured, and a compile error surfaces there with the same message; custom kernels (`Context::kernel(..).build()`) still compile, and fail, in `build`. The kernels of a traced step therefore compile side by side while the step is still being recorded, which shortens the first run after an upgrade or with a cold kernel cache. libNVVM is no longer serialized by a lock. Kernel disk caches are unchanged.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed

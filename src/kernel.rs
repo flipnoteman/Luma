@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use luma_core::kir::{self, KernelModule};
 use luma_core::naga;
-use luma_core::{BackendError, CompiledKernel};
+use luma_core::{Backend, BackendError, CompiledKernel, RawKernel};
 pub use luma_core::{BindingInfo, BindingKind};
 
 use crate::array::{Array, Failure};
@@ -131,10 +131,22 @@ pub(crate) fn build_core(
             if cooperative && lowered.entry_body.is_empty() {
                 return Err(BackendError::Unsupported("cooperative matrix requires the wgpu backend".into()).into());
             }
-            backend.compile_kernel(&lowered, used.as_deref(), name, trusted)?
+            compile(backend, lowered, used.clone(), name, trusted)?
         }
     };
     Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, workgroup))
+}
+
+/// Compiles `module` on `backend`. Luma's own (`trusted`) kernels compile in the background where
+/// the backend can, so the kernels of a traced step compile side by side; the first launch waits
+/// for the kernel and reports a compile error. A caller's kernel compiles at once: building it is
+/// where its error belongs.
+fn compile(backend: &dyn Backend, module: KernelModule, used: Option<Box<[bool]>>, name: &str, trusted: bool) -> std::result::Result<RawKernel, BackendError> {
+    if trusted {
+        backend.compile_kernel_deferred(module, used, name, true)
+    } else {
+        backend.compile_kernel(&module, used.as_deref(), name, false)
+    }
 }
 
 /// Compiles a kernel luma built as a [`KernelModule`] (see `gpu::lower`), skipping the text.
@@ -152,9 +164,10 @@ pub(crate) fn build_module(
         .filter(|&(at, _)| used.as_ref().is_none_or(|used| used[at]))
         .map(|(_, binding)| binding.info())
         .collect();
-    let name = label.unwrap_or(&module.entry);
-    let raw = ctx.hal().compile_kernel(&module, used.as_deref(), name, trusted)?;
-    Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, module.workgroup_size))
+    let name: Arc<str> = Arc::from(label.unwrap_or(&module.entry));
+    let workgroup = module.workgroup_size;
+    let raw = compile(ctx.hal(), module, used.clone(), &name, trusted)?;
+    Ok(CompiledKernel::new(name, raw, bindings, declared, used, workgroup))
 }
 
 /// A problem size in invocations: `[x]`, `[x, y]` or `[x, y, z]` (missing dimensions are 1).
