@@ -165,7 +165,7 @@ fn layout(tuning: &Tuning, block: u32, n: u32) -> (u8, u32) {
 /// these always take cyclic reduction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan(tuning: &Tuning, block: u32, n: u32, lines: u32, stride: u32, parts: bool, fused: bool, max_scratch: u64) -> Option<Plan> {
-    if tuning.line_solver == LineSolver::Thomas || n == 0 || lines == 0 {
+    if tuning.line_solver == LineSolver::Thomas || (tuning.native_solve && tuning.line_solver == LineSolver::Auto) || n == 0 || lines == 0 {
         return None;
     }
     let (shift, shared_rows) = layout(tuning, block, n);

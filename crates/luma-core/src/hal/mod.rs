@@ -787,6 +787,36 @@ pub struct DeviceInfo {
     pub limits: DeviceLimits,
 }
 
+/// A block-tridiagonal line solve (the block Thomas algorithm) that a backend may run as native
+/// code instead of compiling the shader that describes it. The launch is the shader's: the same
+/// bindings in the same order, the same uniform, one workgroup of `lines_per_group` invocations
+/// per `lines_per_group` lines (the line `l` of invocation `i` of workgroup `g` is
+/// `g * lines_per_group + i`, the groups of a folded grid numbered row by row).
+///
+/// Bindings: the outputs, the scratch (a buffer the native solve may ignore), the inputs, `starts`
+/// if `starts`, then the uniform `{n, stride, lines}` (`u32`s). Stacked blocks (`parts` false) have
+/// one output `out` of `block` floats per cell and the inputs `lo`, `diag`, `up` (`block^2` floats
+/// per cell) and `rhs`. On `parts` every entry of every block and component is a buffer of its
+/// own with one float per cell: the outputs `out{system * block + component}`, the inputs of every
+/// system in the order `lo`, `diag`, `up` (entry `row * block + col`), `rhs`. Cell `q` of line
+/// `l` is `l % stride + (l / stride) * stride * n + s * stride` for the row `s`; the lines of
+/// `systems` systems are numbered one system after the other (`lines` per system in the uniform).
+/// With `starts` row `s` of line `l` below `starts[l]` (clamped to `n`) is not solved and its
+/// solution is 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LineSolveSpec {
+    /// The block size, `1..=8`.
+    pub block: u8,
+    /// Independent systems solved in one launch (1 unless `parts`).
+    pub systems: u8,
+    /// Whether the entries are separate buffers (see above) rather than stacked blocks.
+    pub parts: bool,
+    /// Whether every line begins at its own cell.
+    pub starts: bool,
+    /// Lines per workgroup.
+    pub lines_per_group: u32,
+}
+
 /// A GPU backend: allocates buffers, compiles kernels and records and runs work.
 pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// What is known about the device.
@@ -850,6 +880,16 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     fn is_profiling(&self) -> Result<bool, BackendError>;
     /// Captures launches into a replayable graph, `None` when unsupported.
     fn capture_graph(&self, launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>>;
+    /// Whether [`Backend::compile_line_solve`] can run the line solves of luma: the library then
+    /// plans them for it (the block Thomas algorithm, never cyclic reduction on its own).
+    fn native_line_solve(&self) -> bool {
+        false
+    }
+    /// The native code of a line solve, `None` to compile the shader instead (always `None` unless
+    /// [`Backend::native_line_solve`]).
+    fn compile_line_solve(&self, _spec: &LineSolveSpec) -> Option<RawKernel> {
+        None
+    }
 }
 
 /// Reusable mapped `MAP_WRITE` buffers, ready to be written: upload staging or mappable storage.

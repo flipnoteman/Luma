@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use luma_core::kir::{self, KernelModule};
 use luma_core::naga;
-use luma_core::{BackendError, CompiledKernel};
+use luma_core::{BackendError, CompiledKernel, LineSolveSpec};
 pub use luma_core::{BindingInfo, BindingKind};
 
 use crate::array::{Array, Failure};
@@ -101,11 +101,19 @@ impl<'a> KernelBuilder<'a> {
 /// The WGSL is parsed, validated and lowered once (see [`kir::parse_wgsl`]); the backend that
 /// takes naga modules (wgpu) is handed the module it validated, any other the lowered
 /// [`KernelModule`].
-pub(crate) fn build_core(
+pub(crate) fn build_core(ctx: &Context, key: &KernelKey, label: Option<&str>, trusted: bool) -> Result<KernelCore> {
+    build_core_native(ctx, key, label, trusted, None)
+}
+
+/// [`build_core`] where the backend may run `native` (a line solve the shader describes, see
+/// [`LineSolveSpec`]) as native code instead of compiling the shader, which is still parsed for
+/// the bindings.
+pub(crate) fn build_core_native(
     ctx: &Context,
     key: &KernelKey,
     label: Option<&str>,
     trusted: bool,
+    native: Option<LineSolveSpec>,
 ) -> Result<KernelCore> {
     let info = ctx.info();
     let limits = &info.limits;
@@ -122,17 +130,24 @@ pub(crate) fn build_core(
     let workgroup = lowered.workgroup_size;
     let name = label.unwrap_or(&key.entry);
     let backend = ctx.hal();
-    let raw = match backend.compile_naga(&module, &key.entry, &bindings, workgroup, name, trusted) {
-        Some(raw) => raw?,
-        None => {
-            // A cooperative matrix module is lowered to its bindings and no body: only a backend
-            // that takes the naga module can run it.
-            let cooperative = module.types.iter().any(|(_, t)| matches!(t.inner, naga::TypeInner::CooperativeMatrix { .. }));
-            if cooperative && lowered.entry_body.is_empty() {
-                return Err(BackendError::Unsupported("cooperative matrix requires the wgpu backend".into()).into());
+    // A native solve takes its buffers by position, so every binding of the shader must be bound.
+    let native = native
+        .filter(|_| used.as_deref().is_none_or(|used| used.iter().all(|&bound| bound)))
+        .and_then(|spec| backend.compile_line_solve(&spec));
+    let raw = match native {
+        Some(raw) => raw,
+        None => match backend.compile_naga(&module, &key.entry, &bindings, workgroup, name, trusted) {
+            Some(raw) => raw?,
+            None => {
+                // A cooperative matrix module is lowered to its bindings and no body: only a backend
+                // that takes the naga module can run it.
+                let cooperative = module.types.iter().any(|(_, t)| matches!(t.inner, naga::TypeInner::CooperativeMatrix { .. }));
+                if cooperative && lowered.entry_body.is_empty() {
+                    return Err(BackendError::Unsupported("cooperative matrix requires the wgpu backend".into()).into());
+                }
+                backend.compile_kernel(&lowered, used.as_deref(), name, trusted)?
             }
-            backend.compile_kernel(&lowered, used.as_deref(), name, trusted)?
-        }
+        },
     };
     Ok(CompiledKernel::new(Arc::from(name), raw, bindings, declared, used, workgroup))
 }

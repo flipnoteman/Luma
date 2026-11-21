@@ -540,6 +540,7 @@ impl Context {
             },
         };
         tuning.df_sloppy_add = options.fast_math;
+        tuning.native_solve = Tuning::native_solve_for(backend.native_line_solve());
         tune(&mut tuning);
 
         let ctx = Context {
@@ -768,7 +769,8 @@ impl Context {
                 match op.kernel(ty, &self.inner.tuning) {
                     BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), true),
                     BuiltinKernel::Wgsl(source) => {
-                        kernel::build_core(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), true)
+                        let native = if self.inner.tuning.native_solve { op.line_solve() } else { None };
+                        kernel::build_core_native(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), true, native)
                     }
                 }
                 .map(Arc::new)

@@ -6,6 +6,10 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- CPU backend: the line solves (`solve_tridiagonal*`, `solve_block_tridiagonal*`, on stacked blocks and on parts, blocks of 1 to 8) run as native multithreaded Rust instead of compiled shader code: the block Thomas algorithm (same pivoting and arithmetic order as the shader) with the swept blocks of a line kept in a per-thread buffer, and four neighbouring lines (the lines of a strided axis, or four lines of the contiguous axis gathered) eliminated together in vector lanes. The planner never picks cyclic reduction on its own there, and blocks above 5 no longer take the slow loop form (`bench_solve`, 32 threads: 5x5 blocks of 400x200 cells 13.3 / 7.2 ms along the two axes to 0.5 ms, 3x3 5.1 / 2.1 ms to 0.15 ms, 6x6 318 / 220 ms to 1.1 ms; parts of 5x5 blocks on a 3-D grid 12.7 to 25 ms to 2.4 to 3 ms). Parts that are lazy expressions are computed together first (one extra launch) instead of being fused into the solve. `LUMA_NATIVE_SOLVE=off` restores the shader solves. New backend hooks in `luma-hal-core`: `Backend::native_line_solve`, `Backend::compile_line_solve` and `LineSolveSpec`.
+
 ## [0.5.1] - 2026-11-21
 
 ### Fixed

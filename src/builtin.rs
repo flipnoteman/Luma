@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use luma_core::kir::{BarrierScope, BuiltinVar, FnBuilder, KernelModule, KirType, ModuleBuilder, ScalarTy, Val};
+use luma_core::LineSolveSpec;
 
 use crate::gpu::lower::finish;
 use crate::jit::ElemTy;
@@ -1522,6 +1523,11 @@ const CP_TILE: u32 = 32;
 const TWISTED_BLOCK: u32 = 4;
 const TWISTED_LINES: u32 = 8192;
 
+/// Lines per workgroup of a native Thomas solve (`Tuning::native_solve`): few, so that the lines
+/// of a launch spread over every core, and neighbouring ones, so that a core reads the cache
+/// lines their cells share once.
+const NATIVE_LINES: u8 = 4;
+
 /// The invocations per workgroup, the scratch layout and the line split of the Thomas solve of
 /// `lines` lines of `block`-blocks, `stride` cells apart in memory.
 ///
@@ -1569,6 +1575,9 @@ const TWISTED_LINES: u32 = 8192;
 /// not coalesce whatever the workgroup, and the wide tiled solve was 1.1x to 1.3x slower on
 /// `bench_solve --only sweep/` (blocks of 2 to 5, 100 to 1024 strided lines of 32 to 1024 cells).
 pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, parts: bool) -> ThomasPlan {
+    if tuning.native_solve {
+        return ThomasPlan { workgroup: NATIVE_LINES, tiled: false, twisted: false };
+    }
     if tuning.profile == TuningProfile::Cpu {
         return ThomasPlan { workgroup: tuning.elementwise_workgroup as u8, tiled: false, twisted: false };
     }
@@ -1589,8 +1598,12 @@ pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, 
 /// workgroup: `workgroup / 2` lines each if `twisted` (see [`tridiagonal_body`]), else
 /// `workgroup`.
 pub(crate) fn thomas_workgroups(lines: u32, workgroup: u8, twisted: bool) -> u32 {
-    let per_group = if twisted { u32::from(workgroup) / 2 } else { u32::from(workgroup) };
-    lines.div_ceil(per_group)
+    lines.div_ceil(thomas_lines_per_group(workgroup, twisted))
+}
+
+/// The lines a workgroup of the Thomas solve solves: `workgroup / 2` if `twisted`, else `workgroup`.
+pub(crate) fn thomas_lines_per_group(workgroup: u8, twisted: bool) -> u32 {
+    if twisted { u32::from(workgroup) / 2 } else { u32::from(workgroup) }
 }
 
 /// Floats of the scratch `cp` of one system of `cells` cells of `block`-blocks, in the layout
@@ -2223,6 +2236,24 @@ fn matmul_sum_module() -> KernelModule {
 }
 
 impl Builtin {
+    /// The line solve a backend may run natively instead of this kernel's shader (see
+    /// [`LineSolveSpec`]), if this is one: the Thomas solves, on stacked blocks or on parts that
+    /// are all buffers.
+    pub(crate) fn line_solve(self) -> Option<LineSolveSpec> {
+        match self {
+            Builtin::Tridiagonal { block, starts, workgroup, twisted } => {
+                Some(LineSolveSpec { block, systems: 1, parts: false, starts, lines_per_group: thomas_lines_per_group(workgroup, twisted) })
+            }
+            Builtin::SolveParts(spec) => match spec.algo {
+                crate::solve::Algo::Thomas { workgroup, twisted, .. } if spec.fused == [0; 4] => {
+                    Some(LineSolveSpec { block: spec.block, systems: spec.systems, parts: true, starts: spec.starts, lines_per_group: thomas_lines_per_group(workgroup, twisted) })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// This kernel for elements of type `ty` (`"f32"` or `"u32"`), with the parameters `tuning`
     /// gives for the GPU.
     pub(crate) fn kernel(self, ty: &str, tuning: &Tuning) -> BuiltinKernel {
