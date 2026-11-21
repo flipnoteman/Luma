@@ -7,7 +7,7 @@
 #   HOST      local | remote | any (gpuq host) | cpu (no gpuq: run here with LUMA_DEVICE=cpu)
 #   SUITES    comma list (default: ml,cfd,datasci,compute,jit,sparse)   BACKENDS  default "cuda wgpu"
 #   --rounds  A/B pairs per side and suite (default 1: A B B A, two samples per side)
-# Results: out/<label>-<backend>-<side><n>.jsonl in the job's out dir (cpu: the scratch dir);
+# Results: out/<label>-<backend>-<suite>-<side><n>.jsonl in the job's out dir (cpu: the scratch dir);
 # compare with tools/benchcmp.py --base 'DIR/<base>-cuda-*' --new 'DIR/<new>-cuda-*'.
 set -euo pipefail
 pos=() quick="" rounds=1
@@ -47,7 +47,7 @@ done
 A=\$T/ab-a/release/luma-bench B=\$T/ab-b/release/luma-bench
 one() { # side backend suite round
   local bin=\$A lab=$la; [ \$1 = b ] && bin=\$B lab=$lb
-  LUMA_BENCH_REF=\$lab \$bin --suite \$3 $quick --json out/\$lab-\$2-\$1\$4.jsonl > /dev/null 2>> out/stderr-\$1.log || echo \"benchab: \$1 \$2 \$3 round \$4 exit \$?\"
+  LUMA_BENCH_REF=\$lab \$bin --suite \$3 $quick --json out/\$lab-\$2-\$3-\$1\$4.jsonl > /dev/null 2>> out/stderr-\$1.log || echo \"benchab: \$1 \$2 \$3 round \$4 exit \$?\"
 }"
 loop="for be in BACKENDS; do
   for suite in ${suites//,/ }; do
