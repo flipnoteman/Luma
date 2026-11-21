@@ -163,16 +163,15 @@ impl Reduced {
         if !self.mergeable(ctx) || !ctx.jit().may_have_partners(self) {
             return Vec::new();
         }
-        match jit::unresolved_leaves(&self.operand) {
-            Some(leaves) => {
-                for leaf in leaves {
-                    let _ = leaf.force();
-                }
+        let Some(leaves) = jit::unresolved_leaves(&self.operand) else { return Vec::new() };
+        if !leaves.is_empty() {
+            for leaf in leaves {
+                let _ = leaf.force();
             }
-            None => return Vec::new(),
-        }
-        if !jit::unresolved_leaves(&self.operand).is_some_and(|leaves| leaves.is_empty()) {
-            return Vec::new();
+            // Running them may have left others (a reduction that depends on a reduction).
+            if !jit::unresolved_leaves(&self.operand).is_some_and(|leaves| leaves.is_empty()) {
+                return Vec::new();
+            }
         }
         ctx.jit().reduction_partners(ctx, self)
     }
