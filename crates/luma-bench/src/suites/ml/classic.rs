@@ -144,7 +144,7 @@ fn softmax(h: &mut Harness, n: usize, d: usize, c: usize, steps: usize) {
         let (cn, cs) = (2048, 2);
         let (cx, cy) = softmax_data(cn, d, c);
         let x = arr(h, &cx, [d, cn]);
-        let onehot = |ys: &[u32], n: usize| select(&range(h, [c, n], 0).eq(&arr_u32(h, ys, [1, n])), 1.0f32, 0.0f32);
+        let onehot = |ys: &[u32], n: usize| select(&range(h, [c, n], 0).eq(arr_u32(h, ys, [1, n])), 1.0f32, 0.0f32);
         let got = softmax_fit(&h.ctx, &x, &onehot(&cy, cn), cn, cs, lr).to_vec().unwrap();
         let want = softmax_host(&cx, &cy, d, c, cs, f64::from(lr));
         let want: Vec<f64> = (0..c * d).map(|i| want[(i % c) * d + i / c]).collect();

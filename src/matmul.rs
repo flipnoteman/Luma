@@ -249,6 +249,11 @@ fn skinny_tile(m: u32, n: u32, along_k: bool) -> Option<(MatmulTile, u32)> {
     best.map(|(_, tile)| tile)
 }
 
+/// Most rows of a skinny product of more than 8 columns: above, the staged tiles are faster (`Xᵀ R` of
+/// 1M samples, 128 features and 20 classes on an RTX 3090: 0.78 ms tiled against 1.30 skinny; 128 x 32
+/// 0.81 against 1.53; 64 x 20 1.15 tiled against 0.69 skinny, 64 x 64 2.26 against 1.53).
+const SKINNY_MAX_ROWS: u32 = 96;
+
 /// The plan of a small output over a long K (a Gram matrix, one-hot labels times features, a
 /// gradient `Xᵀ r`, a matrix times a few vectors) as a skinny kernel: `slices` of K, each its
 /// own workgroups, about [`SKINNY_GROUPS`] workgroups in all, no slice shorter than
@@ -260,7 +265,7 @@ fn skinny_plan(m: u32, n: u32, k: u32, along_k: bool, max_groups: u32, max_bytes
     let few = if along_k {
         outputs <= u64::from(SKINNY_MAX_OUTPUTS_ALONG_K)
     } else {
-        outputs <= u64::from(SKINNY_SMALL_OUTPUTS) || (outputs <= u64::from(SKINNY_MAX_OUTPUTS) && k >= SKINNY_LONG_K)
+        (outputs <= u64::from(SKINNY_SMALL_OUTPUTS) || (outputs <= u64::from(SKINNY_MAX_OUTPUTS) && k >= SKINNY_LONG_K)) && (m <= SKINNY_MAX_ROWS || n <= 8)
     };
     if m == 0 || n == 0 || k < SKINNY_MIN_K || !few {
         return None;
@@ -1235,6 +1240,10 @@ mod tests {
         assert!(!matches!(skinny(256, 256, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
         assert!(!matches!(skinny(64, 64, 16384, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
         assert!(!matches!(skinny(128, 128, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        // More than 96 rows of more than 8 columns (a softmax gradient of 128 features and 20 classes) take the staged tiles.
+        assert!(!matches!(skinny(128, 20, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(matches!(skinny(64, 20, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
+        assert!(matches!(skinny(128, 8, 1 << 20, false, u64::MAX).tile, MatmulTile::Skinny { .. }));
     }
 
     fn native(edge: u32) -> MatmulTile {
