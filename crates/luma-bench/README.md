@@ -3,6 +3,10 @@
 Workload benchmark suites for Luma (`--list` shows them). Every case records first-call cost,
 median/min, GPU time, launches and memory, and is verified against a host reference.
 
+The `sparse` suite covers sparse linear algebra and graph workloads (SpMV, CG, format conversions,
+PageRank, BFS, connected components, shortest paths, SpMM); `LUMA_BENCH_KERNELS=1` lists the kernels
+of one call under each of its rows.
+
 ## Tools
 
 Run a luma ref through the GPU queue (or locally on CPU) and compare two runs:
