@@ -1280,7 +1280,7 @@ impl<T: Numeric> Array<T> {
     /// An `f32` result stays pending until it is used, like [`Array::sum`]: it is recorded then,
     /// in one kernel with the axis reductions over the same lines that are pending (`mean_axis`
     /// and `var_axis` of one array, the three components of a force, a table's column means and
-    /// extrema), each of them with the bits it has alone.
+    /// extrema), each of them with the value it has alone (the same bits on the CPU backend, within an ulp or two on GPU backends).
     #[track_caller]
     pub fn sum_axis(&self, axis: usize) -> Array<T> {
         let [sum] = self.reduce_lines(axis, [Reduction::Sum], "sum_axis", Location::caller());
