@@ -38,10 +38,10 @@ pub(super) fn coarsenable(key: &FusedKey) -> bool {
 
 /// The elements per invocation of the launch of `key` over `len` elements.
 pub(super) fn plan(ctx: &Context, key: &FusedKey, len: usize) -> u8 {
-    if !coarsenable(key) || len > (1 << 30) {
+    let tuning = ctx.tuning();
+    if tuning.coarsen == Coarsen::Off || len > (1 << 30) || !coarsenable(key) {
         return 1;
     }
-    let tuning = ctx.tuning();
     match tuning.coarsen {
         Coarsen::Off => 1,
         Coarsen::Fixed(n) => n.clamp(1, MAX_COARSEN),
