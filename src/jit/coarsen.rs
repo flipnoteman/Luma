@@ -86,7 +86,7 @@ impl Features {
     fn of(key: &FusedKey, cost: &CostModel) -> Features {
         let mut features = Features { live: peak_live(key), ..Features::default() };
         for instr in key.instrs.iter().chain(key.subs.iter().flatten()) {
-            features.weight += op_weight(instr.op, cost);
+            features.weight += op_weight(&instr.op, cost);
             match instr.op.kind {
                 OpKind::Unary(op) if op != UnOp::Id && instr.op.ty == ElemTy::F64 => features.wide_ops += 1,
                 OpKind::Binary(_) | OpKind::Clamp | OpKind::Powf if instr.op.ty == ElemTy::F64 => features.wide_ops += 1,
