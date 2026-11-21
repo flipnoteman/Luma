@@ -29,6 +29,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Fixed
 
+- CUDA and CPU: the compile worker pool starts its threads on demand and a thread that waits for a kernel no worker has begun compiles it itself. The pool started one thread per core and woke them in turn, so a kernel compiled on its own (the first launch of a new context, a cold structure in a loop) ran on a thread that had never used the compiler or the driver, which took the 0.2 ms of opening a context and building one cached kernel to 0.5 ms and added a few milliseconds to each cold kernel; now a lone kernel is built on the calling thread as before and the pool only widens when several kernels are queued at once.
 - CPU backend: an `eval` loop of a stencil step (`u = step(&u); u.eval()`) ran every step through the time-blocked stencil kernel with one step per pass, several times slower than the fused elementwise kernel (the CPU finishes each step before the next is recorded, so a pass never got more than one). A one-step plan takes the fused path on the CPU.
 
 ## [0.5.1] - 2026-11-21
