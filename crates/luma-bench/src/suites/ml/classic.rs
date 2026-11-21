@@ -44,7 +44,7 @@ fn logreg_host(data: &LogregData, d: usize, steps: usize, lr: f64) -> Vec<f64> {
 }
 
 fn logreg(h: &mut Harness, n: usize, d: usize, iterate: bool) {
-    let n = size(h, n / 4, n, n / 4);
+    let n = size(h, n / 16, n, n / 4);
     let steps = 20;
     let flops = 4.0 * (n * d) as f64 * steps as f64;
     if !fits(h, flops) {
@@ -117,7 +117,7 @@ fn kmeans_host(data: &KmeansData, d: usize, k: usize) -> Vec<f64> {
 /// `iters` Lloyd iterations on the device. Centroids are `[k, d]` so that they are the
 /// right-hand operand of the distance product directly.
 fn kmeans(h: &mut Harness, n: usize, d: usize, k: usize, group: bool) {
-    let n = size(h, n / 4, n, n / 4);
+    let n = size(h, n / 16, n, n / 4);
     let iters = 5;
     let flops = (2.0 * (n * d * k) as f64 + 2.0 * (n * d) as f64) * iters as f64;
     if !fits(h, flops) {
@@ -172,7 +172,7 @@ fn pca_data(n: usize, d: usize) -> Vec<f32> {
 }
 
 fn pca(h: &mut Harness, n: usize, d: usize) {
-    let n = size(h, n / 4, n, n / 4);
+    let n = size(h, n / 8, n, n / 4);
     let power = 30;
     let flops = 2.0 * (n * d * d) as f64;
     if !fits(h, flops) {
