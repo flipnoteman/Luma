@@ -136,6 +136,12 @@ impl Table {
     pub(super) fn len(&self) -> usize {
         self.map.len()
     }
+
+    /// The most launches one plan makes (tests).
+    #[cfg(test)]
+    pub(super) fn longest(&self) -> usize {
+        self.map.values().filter_map(|entry| entry.plan.as_ref()).map(|plan| plan.steps.len()).max().unwrap_or(0)
+    }
 }
 
 /// Where an input of a recorded launch comes from.
@@ -192,7 +198,7 @@ struct Walk {
     base: u64,
     dense: Vec<u32>,
     spill: FxMap<u64, u32>,
-    mix: Option<Mix>,
+    mix: Mix,
 }
 
 impl Walk {
@@ -205,10 +211,6 @@ impl Walk {
         self.stack.clear();
         self.dense.clear();
         self.spill.clear();
-    }
-
-    fn mix(&mut self) -> &mut Mix {
-        self.mix.get_or_insert_with(|| Mix::new(0))
     }
 
     fn lookup(&self, id: u64) -> u32 {
@@ -253,10 +255,9 @@ impl Walk {
         let at = self.leaves.len() as u32;
         self.leaf_at.insert(storage.id(), at);
         self.leaves.push(Arc::clone(storage));
-        let mix = self.mix();
-        mix.word(5);
-        mix.word(storage.len() as u64);
-        storage.layout().hash(mix);
+        self.mix.word(5);
+        self.mix.word(storage.len() as u64);
+        storage.layout().hash(&mut self.mix);
         Some(at)
     }
 
@@ -278,8 +279,8 @@ impl Walk {
         } else {
             self.base = 0;
         }
-        self.mix = Some(Mix::new(stamp(jit, ctx)));
-        self.mix().word(roots.len() as u64);
+        self.mix = Mix::new(stamp(jit, ctx));
+        self.mix.word(roots.len() as u64);
         for root in roots {
             self.add(root);
         }
@@ -300,7 +301,10 @@ impl Walk {
     /// being evaluated, a loop's or a reduction's, or one of its operands is a failure or a
     /// buffer a replay cannot rebind (split over segments, a window, a view of a state).
     fn visit(&mut self, at: u32) -> Option<()> {
-        let node = Arc::clone(&self.nodes[at as usize]);
+        // SAFETY: `self.nodes` holds a reference to the node for the whole walk and only grows, so
+        // the node outlives this function (a `Vec` that reallocates moves the `Arc`s, not the
+        // nodes they point to).
+        let node: &Node = unsafe { &*Arc::as_ptr(&self.nodes[at as usize]) };
         if node.thread != current_thread() || node.looped.get().is_some() || node.deferred.get().is_some() {
             return None;
         }
@@ -311,7 +315,7 @@ impl Walk {
             | u64::from(node.fused.load(Ordering::Relaxed)) << 1
             | u64::from(node.handles.load(Ordering::Relaxed) > 0) << 2
             | u64::from(node.shifted_reads.load(Ordering::Relaxed) == 0) << 3;
-        let mix = self.mix();
+        let mix = &mut self.mix;
         mix.word(node.op.fingerprint);
         mix.word(node.len as u64);
         mix.word(node.weight.to_bits());
@@ -352,7 +356,7 @@ impl Walk {
                     3 << 60 | (scalar.ty as u64) << 32 | at as u64
                 }
             };
-            self.mix().word(word);
+            self.mix.word(word);
         }
         Some(())
     }
@@ -364,9 +368,8 @@ impl Walk {
         let mut lens: Vec<u64> = self.nodes.iter().map(|node| node.len as u64).collect();
         lens.sort_unstable();
         lens.dedup();
-        let mut classes = std::mem::take(&mut self.classes);
-        let mix = self.mix();
-        for &(ty, bits) in &classes {
+        let mix = &mut self.mix;
+        for &(ty, bits) in &self.classes {
             // The flattening makes up a `u32` zero and the length of what a circular shift reads.
             let special = ty == ElemTy::U32 && (bits == 0 || lens.binary_search(&bits).is_ok());
             mix.word(6 | (ty as u64) << 8 | u64::from(special) << 16);
@@ -374,7 +377,6 @@ impl Walk {
                 mix.word(bits);
             }
         }
-        std::mem::swap(&mut classes, &mut self.classes);
         // Planning looks at the other arrays that are alive (what shares work with an expression
         // that is cut is evaluated alongside it, and who reads a node decides whether it is
         // computed once): a replay is right only if there are none, that is if the graph is all
@@ -382,9 +384,8 @@ impl Walk {
         if jit.pending_nodes.load(Ordering::Relaxed) != self.nodes.len() as i64 {
             return None;
         }
-        let mix = self.mix.as_mut()?;
-        mix.word(self.nodes.len() as u64);
-        Some([mix.a, mix.b])
+        self.mix.word(self.nodes.len() as u64);
+        Some([self.mix.a, self.mix.b])
     }
 }
 
@@ -652,11 +653,9 @@ pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce
             note_miss(jit);
             let recorder = Recorder::new(&walk);
             walk.clear();
-            RECORDER.with_borrow_mut(|slot| *slot = Some(recorder));
-            ACTIVE.with(|active| active.set(true));
+            let watching = Watching::begin(recorder);
             run(pending);
-            ACTIVE.with(|active| active.set(false));
-            if let Some(recorder) = RECORDER.with_borrow_mut(Option::take) {
+            if let Some(recorder) = watching.end() {
                 match recorder.finish() {
                     Ok(plan) => {
                         if trace() {
@@ -678,6 +677,29 @@ pub(super) fn evaluate(jit: &JitState, pending: Vec<Arc<Node>>, run: impl FnOnce
     }
     walk.clear();
     SCRATCH.with(|scratch| *scratch.borrow_mut() = walk);
+}
+
+/// The recording of this thread, which ends when this is dropped, whatever happens in between.
+struct Watching;
+
+impl Watching {
+    fn begin(recorder: Recorder) -> Watching {
+        RECORDER.with_borrow_mut(|slot| *slot = Some(recorder));
+        ACTIVE.with(|active| active.set(true));
+        Watching
+    }
+
+    fn end(self) -> Option<Recorder> {
+        ACTIVE.with(|active| active.set(false));
+        RECORDER.with_borrow_mut(Option::take)
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        ACTIVE.with(|active| active.set(false));
+        RECORDER.with_borrow_mut(|slot| slot.take());
+    }
 }
 
 /// Whether `LUMA_PLAN_CACHE=trace`.

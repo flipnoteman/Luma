@@ -1905,38 +1905,37 @@ pub(crate) fn create(
     // Built where it lives: the node is bigger than what a move of it copies cheaply.
     let node = {
         let ptr = Arc::into_raw(Arc::<Node>::new_uninit()).cast::<Node>().cast_mut();
-        // SAFETY: `ptr` is the one reference of a fresh allocation of a `Node`, which is written
-        // whole before the `Arc` is made again.
+        // SAFETY: `ptr` is the one reference of a fresh allocation of a `Node`, whose fields are
+        // all written (one by one: a struct literal would be built on the stack and copied) before
+        // the `Arc` is made again.
         unsafe {
-            ptr.write(Node {
-                trace,
-                thread: current_thread(),
-                ctx: ctx.clone(),
-                op,
-                len,
-                args: Mutex::new(Some(args.clone())),
-                result: OnceLock::new(),
-                name,
-                location,
-                id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
-                ids: measured.ids,
-                below_len: measured.below,
-                below_base: measured.base,
-                below_words: measured.words,
-                below_sparse: measured.sparse,
-                consumers: AtomicU32::new(0),
-                fused: AtomicBool::new(false),
-                shift_depth,
-                depth,
-                weight,
-                shifted_reads: AtomicU32::new(0),
-                readers: Readers::default(),
-                requested: AtomicBool::new(false),
-                leaf_free: AtomicBool::new(false),
-                looped: OnceLock::new(),
-                deferred: OnceLock::new(),
-                handles: AtomicU32::new(0),
-            });
+            std::ptr::addr_of_mut!((*ptr).trace).write(trace);
+            std::ptr::addr_of_mut!((*ptr).thread).write(current_thread());
+            std::ptr::addr_of_mut!((*ptr).ctx).write(ctx.clone());
+            std::ptr::addr_of_mut!((*ptr).op).write(op);
+            std::ptr::addr_of_mut!((*ptr).len).write(len);
+            std::ptr::addr_of_mut!((*ptr).args).write(Mutex::new(Some(args.clone())));
+            std::ptr::addr_of_mut!((*ptr).result).write(OnceLock::new());
+            std::ptr::addr_of_mut!((*ptr).name).write(name);
+            std::ptr::addr_of_mut!((*ptr).location).write(location);
+            std::ptr::addr_of_mut!((*ptr).id).write(NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed));
+            std::ptr::addr_of_mut!((*ptr).ids).write(measured.ids);
+            std::ptr::addr_of_mut!((*ptr).below_len).write(measured.below);
+            std::ptr::addr_of_mut!((*ptr).below_base).write(measured.base);
+            std::ptr::addr_of_mut!((*ptr).below_words).write(measured.words);
+            std::ptr::addr_of_mut!((*ptr).below_sparse).write(measured.sparse);
+            std::ptr::addr_of_mut!((*ptr).consumers).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*ptr).fused).write(AtomicBool::new(false));
+            std::ptr::addr_of_mut!((*ptr).shift_depth).write(shift_depth);
+            std::ptr::addr_of_mut!((*ptr).depth).write(depth);
+            std::ptr::addr_of_mut!((*ptr).weight).write(weight);
+            std::ptr::addr_of_mut!((*ptr).shifted_reads).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*ptr).readers).write(Readers::default());
+            std::ptr::addr_of_mut!((*ptr).requested).write(AtomicBool::new(false));
+            std::ptr::addr_of_mut!((*ptr).leaf_free).write(AtomicBool::new(false));
+            std::ptr::addr_of_mut!((*ptr).looped).write(OnceLock::new());
+            std::ptr::addr_of_mut!((*ptr).deferred).write(OnceLock::new());
+            std::ptr::addr_of_mut!((*ptr).handles).write(AtomicU32::new(0));
             Arc::from_raw(ptr)
         }
     };
@@ -2922,6 +2921,12 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn plan_entries(&self) -> usize {
         lock(&self.plans).len()
+    }
+
+    /// The most launches one cached plan makes (tests).
+    #[cfg(test)]
+    pub(crate) fn longest_plan(&self) -> usize {
+        lock(&self.plans).longest()
     }
 
     #[cfg(test)]

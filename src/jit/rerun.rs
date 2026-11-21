@@ -44,6 +44,12 @@ pub(super) struct Mix {
     pub(super) b: u64,
 }
 
+impl Default for Mix {
+    fn default() -> Self {
+        Mix::new(0)
+    }
+}
+
 impl Mix {
     const A: u64 = 0x517c_c1b7_2722_0a95;
     const B: u64 = 0x9e37_79b9_7f4a_7c15;

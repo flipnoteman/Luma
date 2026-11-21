@@ -364,3 +364,109 @@ fn the_cache_switches_off() {
     assert_eq!(ctx.jit().plan_stats(), Default::default());
     assert_eq!(ctx.jit().plan_entries(), 0);
 }
+
+#[test]
+fn threads_that_share_a_context_get_what_the_uncached_path_gets() {
+    let ctx = ctx();
+    ctx.jit().set_plan_cache(false);
+    let starts: Vec<Vec<f32>> = (0..4).map(|k| data(W * H, 40 + k)).collect();
+    let want: Vec<Vec<u32>> = starts
+        .iter()
+        .map(|start| {
+            let mut u = A::from_slice_on(&ctx, start, [W, H]).unwrap();
+            for _ in 0..10 {
+                u = heat(&u, 0.1);
+                u.eval().unwrap();
+            }
+            bits(&u.to_vec().unwrap())
+        })
+        .collect();
+    ctx.jit().set_plan_cache(true);
+    let got: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = starts
+            .iter()
+            .map(|start| {
+                let ctx = ctx.clone();
+                scope.spawn(move || {
+                    let mut u = A::from_slice_on(&ctx, start, [W, H]).unwrap();
+                    for _ in 0..10 {
+                        u = heat(&u, 0.1);
+                        u.eval().unwrap();
+                    }
+                    bits(&u.to_vec().unwrap())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    });
+    assert_eq!(got, want);
+}
+
+#[test]
+fn integer_programs_match_the_uncached_path() {
+    type U = Array<u32>;
+    let ctx = ctx();
+    let start: Vec<u32> = (0..W * H).map(|k| (k as u32).wrapping_mul(2654435761)).collect();
+    let run = |on: bool| {
+        ctx.jit().set_plan_cache(on);
+        let mut x = U::from_slice_on(&ctx, &start, [W, H]).unwrap();
+        let mut seen = Vec::new();
+        for t in 0..12u32 {
+            let key = if t % 5 == 4 { 7 } else { t * 3 + 1 };
+            let mixed = (&x * 1664525u32 + key) ^ (&x >> 7u32);
+            let wrapped = crate::ops::select(&mixed.gt(1u32 << 31), mixed.minimum(key + 100), mixed.maximum(3u32));
+            x = wrapped;
+            x.eval().unwrap();
+            seen.push(x.to_vec().unwrap());
+        }
+        seen
+    };
+    assert_eq!(run(true), run(false));
+    assert!(ctx.jit().plan_stats().hits > 0, "{:?}", ctx.jit().plan_stats());
+}
+
+/// A step whose results have three lengths, two of them read from the first: several launches,
+/// one of which reads what another wrote.
+fn lengths(u: &A, s: f32) -> [A; 3] {
+    let r1 = heat(u, 0.1);
+    let r2 = r1.slice(1, 0..1) * s + 1.0;
+    let r3 = (r1.slice(0, 0..3) - 0.5).abs();
+    [r1, r2, r3]
+}
+
+#[test]
+fn a_plan_of_several_launches_hands_results_from_one_to_the_next() {
+    let ctx = ctx();
+    let start = data(W * H, 21);
+    let run = |on: bool| {
+        ctx.jit().set_plan_cache(on);
+        let mut u = A::from_slice_on(&ctx, &start, [W, H]).unwrap();
+        let mut seen = Vec::new();
+        for t in 0..10 {
+            let [r1, r2, r3] = lengths(&u, 0.5 + (t % 3) as f32);
+            eval_all(&[&r1, &r2, &r3]).unwrap();
+            seen.push((bits(&r1.to_vec().unwrap()), bits(&r2.to_vec().unwrap()), bits(&r3.to_vec().unwrap())));
+            u = r1;
+        }
+        seen
+    };
+    let want = run(false);
+    let got = run(true);
+    assert_eq!(got, want);
+    assert!(ctx.jit().plan_stats().hits >= 5, "{:?}", ctx.jit().plan_stats());
+    assert!(ctx.jit().longest_plan() >= 2, "{}", ctx.jit().longest_plan());
+}
+
+#[test]
+fn programs_cut_by_small_limits_match_the_uncached_path() {
+    let ctx = ctx();
+    for seed in 300..340 {
+        let program = Program::random(seed, 1 + (seed % 2) as usize, false);
+        // Few bindings and live values make the planner cut expressions into several kernels.
+        ctx.jit().set_max_inputs(2 + (seed % 3) as usize);
+        ctx.jit().set_max_live(6 + (seed % 5) as usize);
+        compare(&ctx, &program, &|t| vec![0.5 + t as f32 * 0.25, -0.75, 1.25], 8, seed);
+    }
+    ctx.jit().set_max_inputs(usize::MAX);
+    ctx.jit().set_max_live(0);
+}
