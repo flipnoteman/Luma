@@ -230,6 +230,101 @@ fn main() {
         }
     }
 
+    // `wall_forces` of a 3-D body: the wall pressure is a pending expression of the whole state, read through two gathers,
+    // and `3 * masks` sums of its components are joined and read back once.
+    {
+        let (masks_n, mut faces) = if quick { (16usize, 20_000usize) } else { (64, 200_000) };
+        if let Some(n) = std::env::var("BENCH_FACES").ok().and_then(|v| v.parse().ok()) {
+            faces = n;
+        }
+        let depth: usize = std::env::var("BENCH_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let name = "forces/wall_forces";
+        if want(name) {
+            let cells = faces * 4;
+            let state: Vec<Array<f32>> = (0..5).map(|k| Array::from_slice_on(&ctx, &values(cells, 500 + k, 0.5, 1.5), cells).unwrap()).collect();
+            let ia: Vec<u32> = (0..faces).map(|i| ((i * 7) % cells) as u32).collect();
+            let ib: Vec<u32> = (0..faces).map(|i| ((i * 7 + 1) % cells) as u32).collect();
+            let (ia, ib) = (Array::from_slice_on(&ctx, &ia, faces).unwrap(), Array::from_slice_on(&ctx, &ib, faces).unwrap());
+            let k = Array::from_slice_on(&ctx, &values(faces, 510, 0.0, 1.0), faces).unwrap();
+            let weights: Vec<Array<f32>> = (0..3).map(|c| Array::from_slice_on(&ctx, &values(faces, 520 + c, -1.0, 1.0), faces).unwrap()).collect();
+            let masks: Vec<Array<bool>> = (0..masks_n)
+                .map(|c| Array::from_slice_on(&ctx, &(0..faces).map(|i| i % masks_n == c).collect::<Vec<_>>(), faces).unwrap())
+                .collect();
+            let run = |out: &mut Vec<f32>| {
+                let speed = &state[1] * &state[1] + &state[2] * &state[2] + &state[3] * &state[3];
+                let mut pall = (&state[4] - &speed * &state[0] * 0.5f32) * 0.4f32;
+                // A deep state expression (the padded state of a 3-D solver with its ghost layers), `BENCH_DEPTH` steps of it.
+                for step in 0..depth {
+                    pall = &pall * 0.999f32 + &state[step % 4] * 0.001f32;
+                }
+                let (pa, pb) = (pall.take(&ia), pall.take(&ib));
+                let pw = &pa + &k * (&pa - &pb);
+                let d = pw - 0.7f32;
+                let comps: Vec<Array<f32>> = weights.iter().map(|w| &d * w).collect();
+                let mut sums = Vec::new();
+                for mask in &masks {
+                    for comp in &comps {
+                        sums.push(comp.sum_where(mask).reshape([1]));
+                    }
+                }
+                out.clear();
+                out.extend(concat_slice(0, &sums).to_vec().unwrap());
+            };
+            let (mut out, mut again) = (Vec::new(), Vec::new());
+            run(&mut out);
+            run(&mut again);
+            assert_eq!(out.len(), masks_n * 3);
+            assert!(out.iter().zip(&again).all(|(a, b)| a.to_bits() == b.to_bits()), "{name}: unstable");
+            time(&ctx, name, &format!("{masks_n}x{faces}"), &mut || {
+                run(&mut out);
+                black_box(&out);
+            });
+        }
+    }
+
+    // The stop rule's forces at the scale of a 3-D sector: pressure and shear sums of 3 components over `classes` masks
+    // of `faces` gathered faces (about 200 reductions of two expressions), joined and read back once.
+    {
+        let (classes, mut faces) = if quick { (8usize, 100_000usize) } else { (32, 1_000_000) };
+        if let Some(n) = std::env::var("BENCH_FACES").ok().and_then(|v| v.parse().ok()) {
+            faces = n;
+        }
+        let name = "forces/scale_pressure_shear";
+        if want(name) {
+            let cells = faces * 2;
+            let p = Array::from_slice_on(&ctx, &values(cells, 400, 0.0, 1.0), cells).unwrap();
+            let tau = Array::from_slice_on(&ctx, &values(cells, 401, 0.0, 1.0), cells).unwrap();
+            let idx: Vec<u32> = (0..faces).map(|i| ((i * 7) % cells) as u32).collect();
+            let idx = Array::from_slice_on(&ctx, &idx, faces).unwrap();
+            let normals: Vec<Array<f32>> = (0..3).map(|k| Array::<f32>::full_on(&ctx, faces, 0.3 + k as f32).unwrap()).collect();
+            let masks: Vec<Array<bool>> = (0..classes)
+                .map(|c| Array::from_slice_on(&ctx, &(0..faces).map(|i| i % classes == c).collect::<Vec<_>>(), faces).unwrap())
+                .collect();
+            let run = |out: &mut Vec<f32>| {
+                let pf = &p.take(&idx) - 1.0f32;
+                let tf = &tau.take(&idx) * 0.5f32;
+                let mut sums = Vec::new();
+                for mask in &masks {
+                    for n in &normals {
+                        sums.push((&pf * n).sum_where(mask).reshape([1]));
+                        sums.push((&tf * n).sum_where(mask).reshape([1]));
+                    }
+                }
+                out.clear();
+                out.extend(concat_slice(0, &sums).to_vec().unwrap());
+            };
+            let (mut out, mut again) = (Vec::new(), Vec::new());
+            run(&mut out);
+            run(&mut again);
+            assert_eq!(out.len(), classes * 6);
+            assert!(out.iter().zip(&again).all(|(a, b)| a.to_bits() == b.to_bits()), "{name}: unstable");
+            time(&ctx, name, &format!("{classes}x{faces}"), &mut || {
+                run(&mut out);
+                black_box(&out);
+            });
+        }
+    }
+
     // Norms of several fields and dot products that share an operand.
     for &n in sizes {
         let name = "norms/6_fields_and_3_dots";
