@@ -122,11 +122,18 @@ pub(crate) struct Tuning {
 }
 
 /// Multiprocessors of the RTX 3090, on which the plan constants that depend on how many workgroups
-/// fill the device (`matmul::SPLIT_GROUPS`, `builtin::thomas_plan`, [`Tuning::line_cyclic_work`])
+/// fill the device (`matmul::SPLIT_GROUPS`, `builtin::thomas_plan`)
 /// were measured.
 pub(crate) const REFERENCE_COMPUTE_UNITS: u32 = 82;
 
 impl Tuning {
+    /// [`scaled`](Self::scaled), but never below `reference`: for counts of workgroups that keep a
+    /// device busy, where more than enough cost almost nothing (a K-split matmul on an RTX 3080
+    /// Laptop was 2.7 % slower with the 599 workgroups of its 48 multiprocessors than with 1024).
+    pub(crate) fn scaled_up(&self, reference: u32) -> u32 {
+        self.scaled(reference).max(reference)
+    }
+
     /// A count of workgroups or lines tuned on the reference device ([`REFERENCE_COMPUTE_UNITS`]),
     /// for this device: proportional to its multiprocessors, rounded to nearest, at least 1 for a
     /// nonzero count and unchanged at the reference.
@@ -281,7 +288,6 @@ impl Tuning {
         // which the plans were never measured against.
         if let Some(units) = info.compute_units.filter(|_| profile != TuningProfile::Cpu) {
             tuning.compute_units = units.max(1);
-            tuning.line_cyclic_work = tuning.scaled(tuning.line_cyclic_work);
         }
         tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
         tuning.line_solver = match std::env::var(LINE_SOLVER_ENV).as_deref().map(str::trim) {
@@ -359,6 +365,8 @@ mod tests {
         assert_eq!(at(48).scaled(1024), 599);
         assert_eq!(at(48).scaled(8192), 4795);
         assert_eq!(at(1).scaled(1), 1);
+        assert_eq!(at(48).scaled_up(1024), 1024);
+        assert_eq!(at(164).scaled_up(1024), 2048);
         assert_eq!(at(164).scaled(1024), 2048);
         assert_eq!(at(48).scaled(0), 0);
     }

@@ -60,14 +60,15 @@ impl MatmulTile {
 const SLICE: u32 = 16;
 
 /// Output tiles below which a long K is split (see [`split_of`]); like [`SPLIT_GROUPS`] a count
-/// for the 82 multiprocessors of an RTX 3090, scaled to the device ([`Tuning::scaled`]).
+/// for the 82 multiprocessors of an RTX 3090, raised for bigger devices ([`Tuning::scaled_up`]).
 const SPLIT_TILES: u32 = 128;
 /// Shortest K that is split.
 const SPLIT_MIN_K: u32 = 4096;
 /// Workgroups a split product aims for. The 4 tiles of a 64x64 product over 2^20 take 3.0 ms
 /// with 256 (3 workgroups per multiprocessor of an RTX 3090, which cannot hide the latency of
-/// the slices), 2.5 with 512, 2.3 with 1024, 2.27 with 2048. Scaled to the device's
-/// multiprocessors ([`Tuning::scaled`]): unchanged on the 3090.
+/// the slices), 2.5 with 512, 2.3 with 1024, 2.27 with 2048. Raised in proportion to the
+/// multiprocessors of bigger devices ([`Tuning::scaled_up`]), never lowered: unchanged on the
+/// 3090, and on an RTX 3080 Laptop (48) 1024 groups beat the proportional 599 by 2.7 %.
 const SPLIT_GROUPS: u32 = 1024;
 /// Smallest K a slice of a split product covers.
 const SPLIT_MIN_SLICE: u32 = 1024;
@@ -137,10 +138,10 @@ struct Plan {
 /// per slice (a multiple of the staged slice). Few tiles and a long K: about
 /// [`SPLIT_GROUPS`] workgroups, each slice at least [`SPLIT_MIN_SLICE`] long. `None` if not split.
 fn split_of(tuning: &Tuning, tiles: u32, k: u32) -> Option<(u32, u32)> {
-    if tiles >= tuning.scaled(SPLIT_TILES) || k < SPLIT_MIN_K {
+    if tiles >= tuning.scaled_up(SPLIT_TILES) || k < SPLIT_MIN_K {
         return None;
     }
-    let wanted = tuning.scaled(SPLIT_GROUPS).div_ceil(tiles).min(k / SPLIT_MIN_SLICE);
+    let wanted = tuning.scaled_up(SPLIT_GROUPS).div_ceil(tiles).min(k / SPLIT_MIN_SLICE);
     if wanted < 2 {
         return None;
     }
@@ -804,12 +805,10 @@ mod tests {
         assert_eq!(split_of(&reference, 4, 1 << 20), Some((256, 4096)));
         assert_eq!(split_of(&reference, 127, 1 << 20), Some((9, 116_512)));
         assert_eq!(split_of(&reference, 128, 1 << 20), None);
-        // A smaller device wants proportionally fewer workgroups and splits fewer tiles.
+        // A smaller device keeps them (measured on an RTX 3080 Laptop, 48 multiprocessors).
         let laptop = Tuning { compute_units: 48, ..Tuning::for_tests() };
-        let (slices, _) = split_of(&laptop, 4, 1 << 20).unwrap();
-        assert_eq!(slices, 150);
-        assert_eq!(split_of(&laptop, 75, 1 << 20), None);
-        assert!(split_of(&laptop, 74, 1 << 20).is_some());
+        assert_eq!(split_of(&laptop, 4, 1 << 20), Some((256, 4096)));
+        assert_eq!(split_of(&laptop, 128, 1 << 20), None);
         // A bigger one more.
         let big = Tuning { compute_units: 128, ..Tuning::for_tests() };
         assert_eq!(split_of(&big, 4, 1 << 20).map(|s| s.0), Some(400));

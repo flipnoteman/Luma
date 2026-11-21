@@ -13,7 +13,7 @@ All notable changes to Luma are listed here. The format follows
 
 ### Changed
 
-- The plan constants measured on an RTX 3090 (82 multiprocessors) scale with the device's multiprocessor count and are unchanged at 82: the workgroups of a K-split matmul (`SPLIT_GROUPS`, `SPLIT_TILES`), the twisted Thomas solve's line limit (`TWISTED_LINES`), the line count the strided/contiguous Thomas workgroup is sized for, and `Tuning::line_cyclic_work`. Backends that cannot report the count (Metal, wgpu on other vendors) and the CPU backend keep the 3090 values.
+- The plan constants measured on an RTX 3090 (82 multiprocessors) scale with the device's multiprocessor count and are unchanged at 82: the twisted Thomas solve's line limit (`TWISTED_LINES`) and the line count its workgroup is sized for (4096-line `tri/solve_axis1` on an RTX 3080 Laptop: 3.98 to 2.43 ms), and, upward only, the workgroups of a K-split matmul (`SPLIT_GROUPS`, `SPLIT_TILES`). Backends that cannot report the count (Metal, wgpu on other vendors) and the CPU backend keep the 3090 values.
 - Bounds checks of untrusted kernels skip the accesses they can prove in range: indices built from `local_invocation_id`, `local_invocation_index`, literals, wrap-free arithmetic and counted `for` loops (`for (var k = 0u; k < 16u; k += 2u)`) into workgroup and function arrays (a tiled SGEMM's inner loop no longer pays a select per workgroup-memory read).
 
 ## [0.5.1] - 2026-11-21
