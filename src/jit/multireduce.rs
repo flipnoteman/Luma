@@ -14,6 +14,7 @@
 //! dependencies have run.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use super::{lock, overlap, union_into, IdSet, JitState, Node, Src, COMPUTING, FLATTENING};
@@ -38,8 +39,10 @@ pub(crate) fn unresolved_leaves(root: &Arc<Node>) -> Option<Vec<Arc<Node>>> {
     let mut seen: HashSet<*const Node> = HashSet::new();
     let mut stack = vec![Arc::clone(root)];
     let mut leaves = Vec::new();
+    let mut visited: Vec<Arc<Node>> = Vec::new();
     while let Some(node) = stack.pop() {
-        if node.result.get().is_some() || !seen.insert(Arc::as_ptr(&node)) {
+        // What an earlier walk found free of them is not walked again (the state expression that many reductions read).
+        if node.result.get().is_some() || node.leaf_free.load(Ordering::Relaxed) || !seen.insert(Arc::as_ptr(&node)) {
             continue;
         }
         if seen.len() > WALK_BUDGET {
@@ -52,9 +55,16 @@ pub(crate) fn unresolved_leaves(root: &Arc<Node>) -> Option<Vec<Arc<Node>>> {
                         stack.push(Arc::clone(operand));
                     }
                 }
+                visited.push(node);
             }
             None if node.deferred.get().is_some() => leaves.push(node),
             None => return None,
+        }
+    }
+    if leaves.is_empty() {
+        // Everything walked has all it reads walked or known free: each of them is free.
+        for node in &visited {
+            node.leaf_free.store(true, Ordering::Relaxed);
         }
     }
     Some(leaves)

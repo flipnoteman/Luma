@@ -784,6 +784,9 @@ pub(crate) struct Node {
     readers: Readers,
     /// Whether the node is in [`JitState::requested`].
     requested: AtomicBool,
+    /// Set once a walk found no reduction that is not recorded (and no loop output) below this node: that stays so, as
+    /// evaluating only removes them (see [`multireduce::unresolved_leaves`]).
+    leaf_free: AtomicBool,
     /// Set when the node was found to be a state of a repeating step (see [`looped`]): its value
     /// is output `j` of the plan, which runs all the steps at once, and the node released its
     /// own operands.
@@ -2001,6 +2004,7 @@ pub(crate) fn create(
         shifted_reads: AtomicU32::new(0),
         readers: Readers::default(),
         requested: AtomicBool::new(false),
+        leaf_free: AtomicBool::new(false),
         looped: OnceLock::new(),
         deferred: OnceLock::new(),
         handles: AtomicU32::new(0),
@@ -2063,6 +2067,7 @@ pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate
         shifted_reads: AtomicU32::new(0),
         readers: Readers::default(),
         requested: AtomicBool::new(false),
+        leaf_free: AtomicBool::new(false),
         looped: OnceLock::new(),
         deferred: OnceLock::new(),
         handles: AtomicU32::new(0),

@@ -252,6 +252,30 @@ fn reductions_fuse_their_input_expression() {
 }
 
 #[test]
+fn many_reductions_over_a_deep_shared_expression_are_grouped_and_exact() {
+    let ctx = ctx();
+    let n = 20_000;
+    let x = f32s(&ctx, &values(n, 9, 0.5, 1.5));
+    let y = f32s(&ctx, &values(n, 10, 0.5, 1.5));
+    let accs = ctx.tuning().reduce_multi;
+    // A state expression of hundreds of nodes that every reduction reads (the padded state a force monitor gathers from).
+    let make = || {
+        let mut state = &x * 0.5;
+        for step in 0..300 {
+            state = &state * 0.999 + &y * (0.001 + step as f32 * 1e-6);
+        }
+        (0..96).map(|k| (&state * (k as f32 + 1.0)).sum()).collect::<Vec<_>>()
+    };
+    let alone: Vec<u32> = make().iter().map(|r| r.item().unwrap().to_bits()).collect();
+    let sums = make();
+    let before = ctx.jit().stats();
+    let got: Vec<u32> = sums.iter().map(|r| r.item().unwrap().to_bits()).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(got, alone);
+    assert!(d.reduce_launches <= 96usize.div_ceil(accs) as u64 + 1, "{d:?}");
+}
+
+#[test]
 fn consumers_of_pending_reductions_record_them_as_a_group() {
     use crate::view::{concat_slice, stack_slice};
     let ctx = ctx();
