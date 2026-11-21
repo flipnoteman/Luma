@@ -92,25 +92,37 @@ fn nan_to(x: V, r: V) -> V {
 #[inline]
 #[target_feature(enable = "sse2")]
 fn expf_v(x: V) -> V {
-    let xc = _mm_min_ps(_mm_max_ps(x, c(-104.0)), c(89.0));
+    // Results below `2^-126` are denormal, and a denormal intermediate costs a microcode assist per
+    // operation; a masked-out `-inf` (attention scores) must stay cheap. Lanes under `-104` are
+    // exactly zero; a packet with a lane in the denormal band takes the scalar routine.
+    let low = _mm_cmplt_ps(x, c(-87.33));
+    if _mm_movemask_ps(_mm_and_ps(low, _mm_cmpge_ps(x, c(-104.0)))) != 0 {
+        return lanewise(x, f32::exp);
+    }
+    let xc = _mm_min_ps(_mm_max_ps(x, c(-87.33)), c(89.0));
     let n = _mm_cvtps_epi32(mul(xc, c(std::f32::consts::LOG2_E)));
     let nf = _mm_cvtepi32_ps(n);
     let r = sub(
         sub(xc, mul(nf, c(0.693_359_375))),
         mul(nf, c(-2.121_944_4e-4)),
     );
-    nan_to(x, exp_scaled(r, n))
+    nan_to(x, _mm_andnot_ps(low, exp_scaled(r, n)))
 }
 
 #[inline]
 #[target_feature(enable = "sse2")]
 fn exp2f_v(x: V) -> V {
-    let xc = _mm_min_ps(_mm_max_ps(x, c(-151.0)), c(129.0));
+    // As `expf_v`: lanes under `-150` are zero, those in `[-150, -126)` denormal.
+    let low = _mm_cmplt_ps(x, c(-126.0));
+    if _mm_movemask_ps(_mm_and_ps(low, _mm_cmpge_ps(x, c(-150.0)))) != 0 {
+        return lanewise(x, f32::exp2);
+    }
+    let xc = _mm_min_ps(_mm_max_ps(x, c(-126.0)), c(129.0));
     let n = _mm_cvtps_epi32(xc);
     let f = sub(xc, _mm_cvtepi32_ps(n));
     // e^(f ln2) with the two-part ln2 so the product keeps a few bits beyond f32.
     let r = ma(f, c(-1.904_654_3e-9), mul(f, c(std::f32::consts::LN_2)));
-    nan_to(x, exp_scaled(r, n))
+    nan_to(x, _mm_andnot_ps(low, exp_scaled(r, n)))
 }
 
 /// Splits a positive `x` into `(e, m)` with `x = (1 + m) 2^e`, `m` in `[sqrt(.5) - 1, sqrt(2) - 1)`,
