@@ -1,7 +1,10 @@
 //! Connected-component labelling, confidence connected components, deconvolution.
 
 mod confidence;
+mod deconv;
 mod label;
+
+pub use deconv::{InverseDeconvAlgo, IterativeDeconvAlgo};
 
 use std::panic::Location;
 
@@ -162,5 +165,67 @@ impl Array<f32> {
         let sx = Array::from_slice_on(ctx, seeds_x, [seeds_x.len()])?;
         let sy = Array::from_slice_on(ctx, seeds_y, [seeds_y.len()])?;
         Ok(self.confidence_cc(&sx, &sy, radius, multiplier, iterations, segmented_value))
+    }
+}
+
+impl Array<f32> {
+    /// Iterative deconvolution of an `[H, W]` image with the point spread function `psf`
+    /// (`[PH, PW]`, centre `(PH / 2, PW / 2)`; ArrayFire's `iterativeDeconv`): `iterations` steps of
+    /// [`IterativeDeconvAlgo::Landweber`] (`x += relaxation * P^T (y - P x)`) or
+    /// [`IterativeDeconvAlgo::RichardsonLucy`] (`x *= P^T (y / (P x))`, `relaxation` unused), from
+    /// the blurred image as the first estimate. `iterations` and `relaxation` must be positive.
+    ///
+    /// The image is padded to `H + PH` x `W + PW`, each rounded up to a size whose prime factors
+    /// are at most 13, with its edge pixels; the convolutions are circular over the padded
+    /// image (see the guide).
+    ///
+    /// Differences from ArrayFire: the Landweber result is the true estimate, while ArrayFire's is
+    /// `N0 * N1` times larger (the padded pixel count: it skips the scaling of its last inverse
+    /// transform); Richardson-Lucy treats a non-positive blurred estimate as ratio 0 (ArrayFire's
+    /// division gives inf or NaN that spreads over the whole image); `f32` input only (convert
+    /// integer images with `to_f32`).
+    ///
+    /// ```
+    /// use luma::{Array, IterativeDeconvAlgo};
+    /// # fn main() -> Result<(), luma::LumaError> {
+    /// // A point spread function that is a single 1 at its centre does not blur: nothing changes.
+    /// let img = Array::from_slice(&(0..20).map(|i| 1.0 + i as f32).collect::<Vec<_>>(), [4, 5])?;
+    /// let psf = Array::from_slice(&[0.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], [3, 3])?;
+    /// let sharp = img.iterative_deconv(&psf, 3, 0.5, IterativeDeconvAlgo::Landweber);
+    /// let got = sharp.to_vec()?;
+    /// let want = img.to_vec()?;
+    /// assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-4));
+    /// # Ok(()) }
+    /// ```
+    #[track_caller]
+    pub fn iterative_deconv(&self, psf: &Array<f32>, iterations: u32, relaxation: f32, algo: IterativeDeconvAlgo) -> Array<f32> {
+        let location = Location::caller();
+        let result = deconv::iterative(self, psf, iterations, relaxation, algo);
+        Array::resolve(self.context(), self.shape(), result, "iterative_deconv", location)
+    }
+
+    /// Inverse deconvolution (ArrayFire's `inverseDeconv`): with [`InverseDeconvAlgo::Tikhonov`]
+    /// `X = Y conj(P) / (|P|^2 + gamma)` per frequency of the padded image (padding as in
+    /// [`Array::iterative_deconv`]). `gamma` must be positive.
+    ///
+    /// ArrayFire's result is `N0 * N1` times larger (the padded pixel count, an inverse transform
+    /// left unscaled); luma returns the properly scaled estimate.
+    ///
+    /// ```
+    /// use luma::{Array, InverseDeconvAlgo};
+    /// # fn main() -> Result<(), luma::LumaError> {
+    /// let img = Array::from_slice(&(0..20).map(|i| 1.0 + i as f32).collect::<Vec<_>>(), [4, 5])?;
+    /// let psf = Array::from_slice(&[0.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], [3, 3])?;
+    /// // With a unit psf the estimate is the image divided by 1 + gamma.
+    /// let got = img.inverse_deconv(&psf, 0.5, InverseDeconvAlgo::Tikhonov).to_vec()?;
+    /// let want: Vec<f32> = img.to_vec()?.iter().map(|v| v / 1.5).collect();
+    /// assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-4));
+    /// # Ok(()) }
+    /// ```
+    #[track_caller]
+    pub fn inverse_deconv(&self, psf: &Array<f32>, gamma: f32, algo: InverseDeconvAlgo) -> Array<f32> {
+        let location = Location::caller();
+        let result = deconv::inverse(self, psf, gamma, algo);
+        Array::resolve(self.context(), self.shape(), result, "inverse_deconv", location)
     }
 }
