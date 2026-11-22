@@ -36,7 +36,6 @@ fn axis(n: usize, x: f64, method: Interp, f: &dyn Fn(usize) -> f64) -> f64 {
             let a3 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
             a0 + a1 * t + a2 * t * t + a3 * t * t * t
         }
-        _ => unreachable!("every method is covered"),
     }
 }
 

@@ -198,7 +198,7 @@ fn iir_errors() {
     assert!(x.iir(&[1.0], &[]).to_vec().is_err());
     assert!(x.iir(&[f32::NAN], &[1.0]).to_vec().is_err());
     assert!(x.iir(&[1.0], &[1.0, f32::INFINITY]).to_vec().is_err());
-    assert!(x.iir(&[1.0], &vec![0.1; IIR_MAX_ORDER + 2]).to_vec().is_err(), "order too high");
+    assert!(x.iir(&[1.0], &[0.1; IIR_MAX_ORDER + 2]).to_vec().is_err(), "order too high");
     // NaN input propagates like arithmetic.
     let nan = Array::from_slice(&[1.0f32, f32::NAN, 1.0, 1.0], 4).unwrap();
     let got = nan.iir(&[1.0], &[1.0, -0.5]).to_vec().unwrap();

@@ -55,6 +55,8 @@ mod guide {
     pub mod reductions {}
     #[doc = include_str!("../guide/src/data.md")]
     pub mod data {}
+    #[doc = include_str!("../guide/src/signal.md")]
+    pub mod signal {}
     #[doc = include_str!("../guide/src/records.md")]
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
@@ -116,6 +118,7 @@ mod quantile;
 mod reduce;
 mod scan;
 mod scatter;
+mod sampler;
 mod search;
 mod signal;
 mod segments;

@@ -10,6 +10,8 @@
 //! * `fractal`: Mandelbrot and Julia sets as `iterate_all` register loops and unrolled chains;
 //! * `fft`, `image`: FFT convolution against direct convolution, and image filters built from
 //!   shifts, slices, scans and gathers;
+//! * `approx`, `warp`, `filters`: `approx1`/`approx2` interpolation, `resize`/`rotate`/`transform`
+//!   image warps, and `fir` / `iir` filters (see `resample`);
 //! * `keccak`, `mlkem`: batched SHA3 and ML-KEM in `u32` array operations (see `crypto`).
 //!
 //! Every case is checked against a host reference (`f64` where precision matters) before it is
@@ -19,6 +21,7 @@ mod bandwidth;
 mod crypto;
 mod linalg;
 mod physics;
+mod resample;
 mod scans;
 mod signal;
 
@@ -93,5 +96,6 @@ pub fn run(h: &mut Harness) {
     scans::run(h);
     physics::run(h);
     signal::run(h);
+    resample::run(h);
     crypto::run(h);
 }

@@ -5,20 +5,19 @@
 //! `y` along dimension 1, as in ArrayFire); dimensions 2 and 3 are channels or batches that all
 //! undergo the same transform. Every output pixel looks up where it comes from in the input
 //! (the *inverse* map, an affine or projective function of the pixel coordinates), and
-//! interpolates there with an [`Interp`] method. The functions are lazy elementwise expressions
-//! over gathers (see [`crate::interp`]): they run on every backend and fuse with the
-//! operations before and after them. They follow ArrayFire's `resize`, `rotate`, `translate`,
+//! interpolates there with an [`Interp`] method, all in one kernel (see [`crate::sampler`]) that
+//! runs on every backend. The input is evaluated first and must fit one buffer. They follow ArrayFire's `resize`, `rotate`, `translate`,
 //! `scale`, `skew`, `transform` and `transformCoordinates`, with its conventions for the output
 //! sizes, centres and edges.
 
 use std::panic::Location;
-use std::sync::Arc;
 
 use crate::array::{Array, Failure};
 use crate::context::{Context, default_context};
 use crate::error::{LumaError, Result};
-use crate::interp::{sample, Interp};
-use crate::ops::{select, Outcome};
+use crate::interp::Interp;
+use crate::ops::Outcome;
+use crate::sampler::{Grid, Sampling, Source};
 use crate::shape::Shape;
 
 /// A 2-D affine (2 x 3) or projective (3 x 3) matrix for [`Array::transform`]. Implemented for
@@ -106,11 +105,28 @@ fn failure<T: crate::gpu_type::GpuType>(ctx: &Context, shape: Shape, error: Luma
     Array::resolve(ctx, shape, result, op, location)
 }
 
-/// The pixel coordinates `(x, y)` along dimensions 0 and 1 of an output of `d0 x d1` pixels, as
-/// `f32` arrays of that shape.
-fn grid(ctx: &Context, d0: usize, d1: usize) -> Result<(Array<f32>, Array<f32>)> {
-    let shape = Shape::from([d0, d1]);
-    Ok((Array::<u32>::range_on(ctx, shape, 0)?.to_f32(), Array::<u32>::range_on(ctx, shape, 1)?.to_f32()))
+/// Runs the sampling kernel of `source` over `src`, producing `out`.
+fn run_sampling(src: &Array<f32>, out: Shape, mut sampling: Sampling<'_>, op: &'static str, location: &'static Location<'static>) -> Array<f32> {
+    let ctx = src.context();
+    sampling.out = out;
+    let result = src.src().and_then(|_| Ok(sampling.run(ctx)?));
+    Array::resolve(ctx, out, result, op, location)
+}
+
+fn plane_sampling(src: &Array<f32>, source: Source, method: Interp) -> Sampling<'_> {
+    Sampling {
+        src,
+        pos: [src, src],
+        out: src.shape(),
+        source,
+        method,
+        grid: &[Grid { dim: 0, start: 0.0, step: 1.0 }, Grid { dim: 1, start: 0.0, step: 1.0 }],
+        pos_strides: [0; 4],
+        off_grid: 0.0,
+        scale: [1.0; 2],
+        matrix: [0.0; 9],
+        perspective: false,
+    }
 }
 
 /// The output extent of `n` scaled by `s`: truncated, as ArrayFire does.
@@ -166,16 +182,8 @@ impl Array<f32> {
         if self.shape().validate().is_err() || out.validate().is_err() {
             return failure(ctx, out, LumaError::DimensionTooLarge { shape: out.dims() }, "resize", location);
         }
-        let axis = |d: usize, n: usize, to: usize| -> Result<Array<f32>> {
-            let mut shape = [1; 4];
-            shape[d] = to;
-            let r = Array::<u32>::range_on(ctx, shape, d)?.to_f32();
-            Ok((&r / (to as f32 / n as f32)).broadcast_to(out))
-        };
-        match (axis(0, dims[0], d0), axis(1, dims[1], d1)) {
-            (Ok(x), Ok(y)) => sample(self, out, &[(0, &x), (1, &y)], method),
-            (Err(e), _) | (_, Err(e)) => Array::poisoned(ctx, out, Arc::new(e)),
-        }
+        let sampling = Sampling { scale: [d0 as f32 / dims[0] as f32, d1 as f32 / dims[1] as f32], ..plane_sampling(self, Source::Scaled, method) };
+        run_sampling(self, out, sampling, "resize", location)
     }
 
     /// The image warped by the map `m` from output to input pixel coordinates, into `d0 x d1`
@@ -198,24 +206,8 @@ impl Array<f32> {
         if out.validate().is_err() {
             return failure(ctx, out, LumaError::DimensionTooLarge { shape: out.dims() }, op, location);
         }
-        let (x, y) = match grid(ctx, d0, d1) {
-            Ok(g) => g,
-            Err(e) => return failure(ctx, out, e, op, location),
-        };
-        let f = m.m.map(|v| v as f32);
-        let affine = |row: usize| (&x * f[row * 3] + &y * f[row * 3 + 1]) + f[row * 3 + 2];
-        let (mut xi, mut yi) = (affine(0), affine(1));
-        if m.perspective {
-            let w = (&x * f[6] + &y * f[7]) + f[8];
-            xi = &xi / &w;
-            yi = &yi / &w;
-        }
-        let (n0, n1) = (dims[0] as f32, dims[1] as f32);
-        // Sources inside the input; for `Nearest` the pixel it rounds to must exist.
-        let reach = if method == Interp::Nearest { 0.5 } else { 0.0 };
-        let ok = xi.ge(0.0) & yi.ge(0.0) & (&xi + reach).lt(n0) & (&yi + reach).lt(n1);
-        let (xi, yi) = (xi.broadcast_to(out), yi.broadcast_to(out));
-        select(&ok.broadcast_to(out), sample(self, out, &[(0, &xi), (1, &yi)], method), 0.0)
+        let sampling = Sampling { matrix: m.m.map(|v| v as f32), perspective: m.perspective, ..plane_sampling(self, Source::Warp, method) };
+        run_sampling(self, out, sampling, op, location)
     }
 
     /// The image transformed by `matrix` into `d0 x d1` pixels (both 0: the input's size), like

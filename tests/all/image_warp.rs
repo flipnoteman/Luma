@@ -29,7 +29,6 @@ fn axis(n: usize, x: f64, method: Interp, f: &dyn Fn(usize) -> f64) -> f64 {
             let (y0, y1, y2, y3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
             y1 + (-0.5 * y0 + 0.5 * y2) * t + (y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3) * t * t + (-0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3) * t * t * t
         }
-        _ => unreachable!(),
     }
 }
 

@@ -37,9 +37,9 @@ const FIR_DIRECT_MAX: usize = 256;
 /// Filters at least this long use the FFT convolution when the signal is a single vector (see
 /// `Array::fir`).
 const FIR_FFT_MIN: usize = 4096;
-/// Outputs per workgroup of the FIR kernel (`WORKGROUP * OUTPUTS_PER_THREAD`).
+/// Outputs per workgroup of the FIR kernel (`FIR_WORKGROUP` invocations of eight outputs).
 const FIR_TILE: u32 = 1024;
-const FIR_WORKGROUP: u32 = 256;
+const FIR_WORKGROUP: u32 = 128;
 /// The largest recursion order (`a.len() - 1`) of the IIR kernels.
 pub const IIR_MAX_ORDER: usize = 8;
 
@@ -56,8 +56,28 @@ struct FirParams {
     b_stride: u32,
 }
 
+/// The shared-memory address of element `a`: one pad word per 32, so that invocations reading
+/// every eighth word (their own run of eight outputs) meet 32 different banks.
+fn pad(a: usize) -> usize {
+    a + (a >> 5)
+}
+
+/// The direct FIR kernel. A workgroup computes `FIR_TILE` outputs of one signal; every invocation
+/// eight consecutive ones, in registers, over blocks of eight taps: the eight inputs a block
+/// brings in (the window of the 15 inputs that eight outputs and eight taps touch slides by
+/// eight per block) and the eight taps are all it loads from workgroup memory for 64
+/// multiply-adds. The outputs go through workgroup memory so that the global stores are
+/// coalesced.
 fn fir_source() -> String {
-    format!(
+    // Window variable of the input at offset `d` (-7..=7) from the block's first output.
+    let var = |d: i32| match d {
+        0 => "x0".to_string(),
+        d if d < 0 => format!("xm{}", -d),
+        d => format!("xp{d}"),
+    };
+    let mut w = String::new();
+    let _ = write!(
+        w,
         r#"
 struct P {{ n: u32, k: u32, tiles: u32, batch: u32, x_stride: u32, b_stride: u32 }}
 @group(1) @binding(0) var<storage, read> x: array<f32>;
@@ -67,9 +87,10 @@ struct P {{ n: u32, k: u32, tiles: u32, batch: u32, x_stride: u32, b_stride: u32
 
 const TILE: u32 = {tile}u;
 const WG: u32 = {wg}u;
-const KMAX: u32 = {kmax}u;
 var<workgroup> xs: array<f32, {xs}>;
 var<workgroup> bs: array<f32, {kmax}>;
+
+fn pad(a: u32) -> u32 {{ return a + (a >> 5u); }}
 
 @compute @workgroup_size({wg})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -78,40 +99,68 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     if (g >= p.tiles * p.batch) {{ return; }}
     let sig = g / p.tiles;
     let t0 = (g % p.tiles) * TILE;
-    let k = p.k;
+    // The taps in blocks of eight; the padding taps are 0.
+    let kp = (p.k + 7u) & 0xfffffff8u;
     let xo = sig * p.x_stride;
     let bo = sig * p.b_stride;
-    for (var j = t; j < k; j += WG) {{ bs[j] = b[bo + j]; }}
-    let span = TILE + k - 1u;
+    for (var j = t; j < kp; j += WG) {{
+        var c = 0.0;
+        if (j < p.k) {{ c = b[bo + j]; }}
+        bs[j] = c;
+    }}
+    let span = TILE + kp - 1u;
     for (var j = t; j < span; j += WG) {{
-        let gi = i32(t0) + i32(j) - i32(k - 1u);
+        let gi = i32(t0) + i32(j) - i32(kp - 1u);
         var v = 0.0;
         if (gi >= 0 && gi < i32(p.n)) {{ v = x[xo + u32(gi)]; }}
-        xs[j] = v;
+        xs[pad(j)] = v;
     }}
     workgroupBarrier();
-    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
-    let base = t + k - 1u;
-    for (var m = 0u; m < k; m += 1u) {{
-        let c = bs[m];
-        let at = base - m;
-        a0 = fma(c, xs[at], a0);
-        a1 = fma(c, xs[at + WG], a1);
-        a2 = fma(c, xs[at + 2u * WG], a2);
-        a3 = fma(c, xs[at + 3u * WG], a3);
-    }}
-    let yo = sig * p.n + t0 + t;
-    if (t0 + t < p.n) {{ y[yo] = a0; }}
-    if (t0 + t + WG < p.n) {{ y[yo + WG] = a1; }}
-    if (t0 + t + 2u * WG < p.n) {{ y[yo + 2u * WG] = a2; }}
-    if (t0 + t + 3u * WG < p.n) {{ y[yo + 3u * WG] = a3; }}
-}}
+    let o = t * 8u;
+    // The first input of the block's first output; it moves down by 8 per block.
+    var a0 = o + kp - 1u;
 "#,
         tile = FIR_TILE,
         wg = FIR_WORKGROUP,
         kmax = FIR_DIRECT_MAX,
-        xs = FIR_TILE as usize + FIR_DIRECT_MAX - 1,
-    )
+        xs = pad(FIR_TILE as usize + FIR_DIRECT_MAX + 8) + 1,
+    );
+    for r in 0..8 {
+        let _ = writeln!(w, "    var acc{r} = 0.0;");
+    }
+    for d in -7..=7i32 {
+        let _ = writeln!(w, "    var {} = xs[pad(a0 - 7u + {}u)];", var(d), (d + 7) as u32);
+    }
+    let _ = writeln!(w, "    let blocks = kp >> 3u;\n    for (var mb = 0u; mb < blocks; mb += 1u) {{");
+    for u in 0..8 {
+        let _ = writeln!(w, "        let b{u} = bs[mb * 8u + {u}u];");
+    }
+    for r in 0..8i32 {
+        for u in 0..8i32 {
+            let _ = writeln!(w, "        acc{r} = fma(b{u}, {}, acc{r});", var(r - u));
+        }
+    }
+    let _ = writeln!(w, "        if (mb + 1u < blocks) {{\n            a0 -= 8u;");
+    // Offsets 1..=7 of the next block are offsets -7..=-1 of this one.
+    for d in 1..=7i32 {
+        let _ = writeln!(w, "            {} = {};", var(d), var(d - 8));
+    }
+    for d in -7..=0i32 {
+        let _ = writeln!(w, "            {} = xs[pad(a0 - 7u + {}u)];", var(d), (d + 7) as u32);
+    }
+    let _ = writeln!(w, "        }}\n    }}\n    workgroupBarrier();");
+    for r in 0..8 {
+        let _ = writeln!(w, "    xs[pad(o + {r}u)] = acc{r};");
+    }
+    let _ = writeln!(
+        w,
+        "    workgroupBarrier();
+    for (var j = t; j < TILE; j += WG) {{
+        if (t0 + j < p.n) {{ y[sig * p.n + t0 + j] = xs[pad(j)]; }}
+    }}
+}}"
+    );
+    w
 }
 
 /// The shapes of a filter operation on `x` (`[n, batch..]`) and coefficients (`[k, batch..]`):
@@ -160,7 +209,7 @@ impl Array<f32> {
     /// use luma::Array;
     /// let x = Array::from_slice(&[1.0f32, 4.0, 2.0, 8.0], 4)?;
     /// let b = Array::from_slice(&[0.5f32, 0.25], 2)?;
-    /// assert_eq!(x.fir(&b).to_vec()?, vec![0.5, 2.25, 1.5, 4.5]);
+    /// assert_eq!(x.fir(&b).to_vec()?, vec![0.5, 2.25, 2.0, 4.5]);
     /// # Ok::<(), luma::LumaError>(())
     /// ```
     #[track_caller]

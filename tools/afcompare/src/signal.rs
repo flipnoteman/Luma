@@ -1,5 +1,5 @@
 //! Signal and image cases: `approx1`/`approx2`, `resize`, `rotate`, `transform`, `fir` and `iir`.
-//! Group names (for `--only`): `signal`, or `sig_approx`, `sig_image`, `sig_fir`, `sig_iir`.
+//! Group names (for `--only`): `signal`, or `signal_approx`, `signal_image`, `signal_fir`, `signal_iir`.
 
 use arrayfire as af;
 use luma::Interp;
@@ -54,7 +54,7 @@ pub fn signal(b: &mut Bench) {
 }
 
 fn approx(b: &mut Bench) {
-    b.guarded("sig_approx", |b| {
+    b.guarded("signal_approx", |b| {
         let ctx = b.ctx.clone();
         for n in [1_000_000usize, 4_000_000, 16_000_000] {
             let x = uniform(n, 100, -1.0, 1.0);
@@ -167,7 +167,7 @@ fn approx(b: &mut Bench) {
 }
 
 fn image(b: &mut Bench) {
-    b.guarded("sig_image", |b| {
+    b.guarded("signal_image", |b| {
         let ctx = b.ctx.clone();
         let (w1, h1, w4, h4) = (1920usize, 1080usize, 3840usize, 2160usize);
         // resize: grey up and down with every method; RGB bilinear.
@@ -311,17 +311,21 @@ fn fir_ref(x: &[f32], b: &[f32]) -> Vec<f32> {
 }
 
 fn fir(b: &mut Bench) {
-    b.guarded("sig_fir", |b| {
+    b.guarded("signal_fir", |b| {
         let ctx = b.ctx.clone();
         let cases: &[(usize, usize, usize)] = &[
             (1_000_000, 1, 8),
             (1_000_000, 1, 64),
+            (1_000_000, 1, 128),
             (1_000_000, 1, 256),
+            (1_000_000, 1, 512),
             (1_000_000, 1, 1024),
             (1_000_000, 1, 8192),
             (16_000_000, 1, 8),
             (16_000_000, 1, 64),
+            (16_000_000, 1, 128),
             (16_000_000, 1, 256),
+            (16_000_000, 1, 1024),
             (4096, 1024, 32),
         ];
         for &(n, batch, k) in cases {
@@ -373,7 +377,7 @@ fn iir_ref(x: &[f32], bc: &[f32], ac: &[f32]) -> Vec<f64> {
 }
 
 fn iir(b: &mut Bench) {
-    b.guarded("sig_iir", |b| {
+    b.guarded("signal_iir", |b| {
         let ctx = b.ctx.clone();
         let biquad_b = [0.2f32, 0.4, 0.2];
         let biquad_a = [1.0f32, -0.6, 0.2];
