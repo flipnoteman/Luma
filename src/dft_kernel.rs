@@ -84,6 +84,11 @@ pub(crate) struct DftPass {
     pub(crate) store_table: Table,
     /// Stores skip the positions `n_out` and beyond.
     pub(crate) store_limit: bool,
+    /// The last pass of a forward transform of a real signal's even and odd samples (`inner`
+    /// 1, `low > 1`, `cols` even): a tile holds rows `l` and their mirrors `low - l`, so that
+    /// the values `Z[nat]` and `Z[h - nat]` are both in workgroup memory, and the pass writes the
+    /// half spectrum `X[nat] = E + W^nat O` (`h + 1` values) instead of `Z`.
+    pub(crate) post: bool,
 }
 
 impl DftPass {
@@ -135,7 +140,11 @@ pub(crate) struct Params {
     pub(crate) mrs: u32,
     /// With `load_limit`: the positions from here on load as zero.
     pub(crate) n_lim: u32,
-    pub(crate) pad: [u32; 3],
+    /// With `post`: tiles per outer index, and the rows `l <= low / 2` that are paired with their
+    /// mirror `low - l`.
+    pub(crate) tpo: u32,
+    pub(crate) prodh: u32,
+    pub(crate) pad: u32,
 }
 
 /// The `f32` literal for `x`.
@@ -360,7 +369,7 @@ pub(crate) fn source(pass: &DftPass) -> String {
     let c = pass.cols;
     let tile = c * d;
     let mut src = String::from(
-        "struct Params { tiles: u32, rows: u32, j: u32, low: u32, mid: u32, in_rs: u32, in_ds: u32, in_os: u32, out_rs: u32, out_ds: u32, out_os: u32, den: u32, inner: u32, prod: u32, n_in: u32, n_out: u32, n_full: u32, scale: f32, cj: f32, mrs: u32, n_lim: u32, pad0: u32, pad1: u32, pad2: u32 }\n",
+        "struct Params { tiles: u32, rows: u32, j: u32, low: u32, mid: u32, in_rs: u32, in_ds: u32, in_os: u32, out_rs: u32, out_ds: u32, out_os: u32, den: u32, inner: u32, prod: u32, n_in: u32, n_out: u32, n_full: u32, scale: f32, cj: f32, mrs: u32, n_lim: u32, tpo: u32, prodh: u32, pad: u32 }\n",
     );
     let mut bindings = Vec::new();
     bindings.push(format!("var<storage, read> src: array<{}>", if pass.real_in() { "f32" } else { "vec2<f32>" }));
@@ -410,6 +419,19 @@ fn tw(num: u32, den: u32) -> vec2<f32> {{
 ",
         tile + tile / 16 + 2
     );
+    let prologue = if pass.post {
+        format!("let o = tile / p.tpo; let blk = tile - o * p.tpo; let l0 = blk * {}u;", c / 2)
+    } else {
+        format!(
+            "let rho0 = tile * {c}u;
+    let o = rho0 / p.j;
+    let j0 = rho0 - o * p.j;
+    let m0 = j0 / p.low;
+    let l0 = j0 - m0 * p.low;
+    let in_base = o * p.in_os + j0;
+    let out_base = o * p.out_os + m0 * {d}u * p.low + l0;"
+        )
+    };
     let _ = write!(
         src,
         "
@@ -421,17 +443,32 @@ fn main(
 ) {{
     let tile = wid.x + wid.y * nwg.x;
     if (tile >= p.tiles) {{ return; }}
-    let rho0 = tile * {c}u;
-    let o = rho0 / p.j;
-    let j0 = rho0 - o * p.j;
-    let m0 = j0 / p.low;
-    let l0 = j0 - m0 * p.low;
-    let in_base = o * p.in_os + j0;
-    let out_base = o * p.out_os + m0 * {d}u * p.low + l0;
+    {prologue}
 "
     );
     // Load.
     let (r_load, d_load) = if pass.in_fast { (format!("e % {c}u"), format!("e / {c}u")) } else { (format!("e / {d}u"), format!("e % {d}u")) };
+    let h2 = c / 2;
+    let rows_post = format!(
+        "let lo = l0 + (r % {h2}u); let hi = r >= {h2}u;
+    let l = select(lo, p.low - lo, hi);
+    let valid = select(lo < p.prodh, (lo >= 1u) && (lo < p.prodh) && (2u * lo != p.low), hi);"
+    );
+    let load_body_post = format!(
+        "let r = e % {c}u; let d = e / {c}u;
+    {rows_post}
+    var v = vec2<f32>(0.0, 0.0);
+    if (valid) {{
+        let gi = o * p.in_os + l + d * p.in_ds;
+        let ob = o;
+        let mrow = 0u;
+        {}
+        v.y = v.y * p.cj;
+    }}
+    sh[{}] = v;",
+        load_value(pass),
+        at(pass, "d", "r")
+    );
     let load_body = format!(
         "let r = {r_load}; let d = {d_load};
     var v = vec2<f32>(0.0, 0.0);
@@ -446,7 +483,7 @@ fn main(
         load_value(pass),
         at(pass, "d", "r")
     );
-    src.push_str(&unrolled(tile, &load_body));
+    src.push_str(&unrolled(tile, if pass.post { &load_body_post } else { &load_body }));
     src.push_str("workgroupBarrier();\n");
     for s in 0..pass.stages as usize {
         src.push_str(&stage(pass, s));
@@ -461,6 +498,34 @@ fn main(
         let _ = writeln!(reverse, "pos = pos + (kk % {r}u) * {}u; kk = kk / {r}u;", d / done);
     }
     let twiddle = if pass.twiddle { "let mrow = m0 + r * p.mrs; v = cmul(v, tw(k * mrow, p.den));\n" } else { "" };
+    let mut reverse_kp = String::from("var kq = kp; var posp = 0u;\n");
+    let mut done_p = 1u32;
+    for &r in radices {
+        done_p *= u32::from(r);
+        let _ = writeln!(reverse_kp, "posp = posp + (kq % {r}u) * {}u; kq = kq / {r}u;", d / done_p);
+    }
+    let store_body_post = format!(
+        "let r = e % {c}u; let k = e / {c}u;
+    {rows_post}
+    if (valid) {{
+        {reverse}let zk = sh[{}];
+        let self_row = (l == 0u) || (2u * l == p.low);
+        let rp = select(select(r + {h2}u, r - {h2}u, hi), r, self_row);
+        let kp = select({d}u - 1u - k, ({d}u - k) % {d}u, l == 0u);
+        {reverse_kp}let z2 = sh[{}];
+        let zc = vec2<f32>(z2.x, -z2.y);
+        let ev = (zk + zc) * 0.5;
+        let df = zk - zc;
+        let od = cmul(tw(k * p.prod + l, p.den), vec2<f32>(df.y, -df.x) * 0.5);
+        let nat = k * p.prod + l;
+        let a = ev + od;
+        let b = ev - od;
+        dst[o * p.out_os + nat] = a * p.scale;
+        if (nat == 0u) {{ dst[o * p.out_os + p.out_os - 1u] = vec2<f32>(b.x, -b.y) * p.scale; }}
+    }}",
+        at(pass, "pos", "r"),
+        at(pass, "posp", "rp")
+    );
     let store_body = format!(
         "let r = {r_store}; let k = {k_store};
     if ((rho0 + r) < p.rows) {{
@@ -472,7 +537,7 @@ fn main(
         at(pass, "pos", "r"),
         store_value(pass)
     );
-    src.push_str(&unrolled(tile, &store_body));
+    src.push_str(&unrolled(tile, if pass.post { &store_body_post } else { &store_body }));
     src.push_str("}\n");
     src
 }
@@ -497,6 +562,7 @@ mod tests {
             store: StoreKind::Complex,
             store_table: Table::None,
             store_limit: false,
+            post: false,
         }
     }
 

@@ -184,6 +184,10 @@ pub(crate) struct Lines<'a> {
     pub(crate) store_table: Option<(&'a luma_core::Buffer, u64, Table)>,
     /// The line length of the output if it is not `n`: positions beyond are not written.
     pub(crate) n_out: Option<u32>,
+    /// The last pass unpacks the half spectrum of a real signal of `2n` points (see
+    /// [`DftPass::post`]); the output has `n + 1` values per line. Needs `inner == 1` and a
+    /// last pass of at most half a tile.
+    pub(crate) post: bool,
 }
 
 fn too_large(n: usize) -> LumaError {
@@ -203,7 +207,7 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
     let line_bytes = total * 8;
     // The buffers the intermediate results go to, alternating; the output itself is one of them
     // when it is a plain complex array.
-    let reuse_out = job.store == StoreKind::Complex && job.n_out.is_none();
+    let reuse_out = job.store == StoreKind::Complex && job.n_out.is_none() && !job.post;
     let temp_a = if passes > 1 { Some(scratch.take(line_bytes)?) } else { None };
     let temp_b = if passes > 2 && !reuse_out { Some(scratch.take(line_bytes)?) } else { None };
     let mut mids: Vec<(&luma_core::Buffer, u64)> = Vec::new();
@@ -223,11 +227,14 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
     for (i, &d) in sizes.iter().enumerate() {
         let first = i == 0;
         let last = i + 1 == passes;
+        let post = last && job.post;
         let mid = n / (low / inner) / d;
         let j = mid * low;
         let rows = outer * j;
         let cmax = (tile / d).max(1);
-        let cols = if j == 1 {
+        let cols = if post {
+            (cmax / 2 * 2).max(2)
+        } else if j == 1 {
             cmax.min(outer)
         } else if low > 1 {
             divisor_up_to(low, cmax)
@@ -238,7 +245,7 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
         let list = radices_of(d);
         radices[..list.len()].copy_from_slice(&list);
         let in_os = if first && (job.n_in.is_some() || job.load == LoadKind::Hermitian) { job.n_in.unwrap_or(n) * inner } else { n * inner };
-        let out_os = if last { job.n_out.unwrap_or(n) * inner } else { n * inner };
+        let out_os = if post { (n + 1) * inner } else if last { job.n_out.unwrap_or(n) * inner } else { n * inner };
         let pass = DftPass {
             radices,
             stages: list.len() as u8,
@@ -252,6 +259,7 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
             store: if last { job.store } else { StoreKind::Complex },
             store_table: if last { job.store_table.map_or(Table::None, |t| t.2) } else { Table::None },
             store_limit: last && job.n_out.is_some(),
+            post,
         };
         let out_rs = if low > 1 {
             1
@@ -260,8 +268,10 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
         } else {
             out_os
         };
+        let prodh = low / 2 + 1;
+        let tpo = prodh.div_ceil((cols / 2).max(1));
         let params = Params {
-            tiles: rows.div_ceil(cols),
+            tiles: if post { outer * tpo } else { rows.div_ceil(cols) },
             rows,
             j,
             low,
@@ -272,7 +282,7 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
             out_rs,
             out_ds: if low > 1 { low } else { 1 },
             out_os,
-            den: d.checked_mul(mid).ok_or_else(|| too_large(n as usize))?,
+            den: if post { 2 * n } else { d.checked_mul(mid).ok_or_else(|| too_large(n as usize))? },
             inner,
             prod: low / inner,
             n_in: job.n_in.unwrap_or(n),
@@ -282,7 +292,9 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
             scale: if last { job.scale } else { 1.0 },
             cj: if job.inverse { -1.0 } else { 1.0 },
             mrs: u32::from(low == 1 && mid > 1),
-            pad: [0; 3],
+            tpo,
+            prodh,
+            pad: 0,
         };
         let kernel = ctx.builtin(Builtin::Dft(pass), "f32")?;
         let src = if first { job.src } else { mids[i - 1] };
@@ -515,6 +527,7 @@ pub(crate) fn run_axis(
                 store: io.store,
                 store_table: io.store_table,
                 n_out: io.n_out,
+                post: false,
             },
         );
     }
@@ -547,6 +560,7 @@ pub(crate) fn run_axis(
             store: StoreKind::Complex,
             store_table: Some((b_hat, u64::from(m) * 8, Table::Line)),
             n_out: None,
+            post: false,
         },
     )?;
     run_lines(
@@ -568,6 +582,7 @@ pub(crate) fn run_axis(
             store: io.store,
             store_table: Some((chirp, u64::from(n) * 8, Table::Line)),
             n_out: Some(io.n_out.unwrap_or(n)),
+            post: false,
         },
     )
 }
@@ -619,6 +634,7 @@ fn chirp_tables(ctx: &Context, n: u32, inverse: bool) -> Result<std::sync::Arc<C
             store: StoreKind::Complex,
             store_table: None,
             n_out: None,
+            post: false,
         },
     )?;
     let tables = std::sync::Arc::new(ChirpTables { m, chirp, b_hat });
@@ -676,6 +692,32 @@ fn real_forward(
         // The even and odd samples as one complex signal of half the length; the packing step
         // separates their spectra.
         let h = n / 2;
+        let sizes = partition(h, tile_elems(ctx));
+        if inner == 1 && sizes.len() >= 2 && sizes.last().is_some_and(|&d| 2 * d <= tile_elems(ctx)) {
+            // The last pass unpacks the spectrum in workgroup memory.
+            return run_lines(
+                ctx,
+                scratch,
+                &Lines {
+                    outer,
+                    n: h,
+                    inner,
+                    src,
+                    dst,
+                    inverse: false,
+                    scale: factor,
+                    load: LoadKind::RealPair,
+                    load_table: None,
+                    n_in: None,
+                    n_lim: None,
+                    n_full: 0,
+                    store: StoreKind::Complex,
+                    store_table: None,
+                    n_out: None,
+                    post: true,
+                },
+            );
+        }
         let bytes = u64::from(outer) * u64::from(h) * u64::from(inner) * 8;
         let z = scratch.take(bytes)?;
         run_lines(
@@ -697,6 +739,7 @@ fn real_forward(
                 store: StoreKind::Complex,
                 store_table: None,
                 n_out: None,
+                post: false,
             },
         )?;
         return launch_real_stage(ctx, true, (outer, h, inner), factor, (&z, bytes), dst, None);
@@ -746,6 +789,7 @@ fn real_inverse(
                 store: StoreKind::RealPair,
                 store_table: None,
                 n_out: None,
+                post: false,
             },
         );
     }
