@@ -351,7 +351,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 ";
 
 /// `T` and `tau` of a node from those of its halves and `T12 = T1 Z T2` (with a minus sign).
-fn tjoin(ctx: &crate::Context, t1: &Array<f32>, t12: &Array<f32>, t2: &Array<f32>, tau1: &Array<f32>, tau2: &Array<f32>, n1: usize, w: usize) -> Result<(Array<f32>, Array<f32>), LumaError> {
+fn tjoin(ctx: &crate::Context, [t1, t12, t2, tau1, tau2]: [&Array<f32>; 5], n1: usize, w: usize) -> Result<(Array<f32>, Array<f32>), LumaError> {
     let (mut to, mut uo) = (Array::<f32>::alloc(ctx, Shape::from([w, w, 1]))?, Array::<f32>::alloc(ctx, Shape::from([w, 1, 1]))?);
     let params = TParams { w: w as u32, n1: n1 as u32 };
     let args: [KernelArg<'_>; 8] = [view(t1), view(t12), view(t2), view(tau1), view(tau2), (&mut to).into(), (&mut uo).into(), uniform(&params)];
@@ -369,10 +369,10 @@ struct TParams {
 /// A recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Node {
     let [w, m, ..] = a.shape().dims();
-    if w <= PANEL {
-        if let Some(plan) = super::tsqr::plan(a.context(), m, w) {
-            return tsqr_panel(a, plan, op, loc);
-        }
+    if w <= PANEL
+        && let Some(plan) = super::tsqr::plan(a.context(), m, w)
+    {
+        return tsqr_panel(a, plan, op, loc);
     }
     if w <= if m <= 64 { PANEL } else { super::panel_width() } {
         return Node::of(leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc));
@@ -390,7 +390,7 @@ fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) ->
     // T12 = -T1 (V1bᵀ V2) T2.
     let z = matmul_f32(&v1b.transpose(), &v2);
     let t12 = matmul_f32(&t1, &matmul_f32(&z, &t2));
-    let joined = tjoin(a.context(), &t1, &t12, &t2, &tau1, &tau2, n1, w).and_then(|(t, tau)| join(a.context(), [&f1, &v1, &c, &f2, &v2], a.shape(), n1).map(|(qr, v)| Node { qr, v, tau, t }));
+    let joined = tjoin(a.context(), [&t1, &t12, &t2, &tau1, &tau2], n1, w).and_then(|(t, tau)| join(a.context(), [&f1, &v1, &c, &f2, &v2], a.shape(), n1).map(|(qr, v)| Node { qr, v, tau, t }));
     joined.unwrap_or_else(|e| Node::failed(a.context(), a, e, op, loc))
 }
 
@@ -404,10 +404,11 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return failed_qr(ctx, a, e, op, loc),
     };
-    if d.batch == 1 && d.cols <= PANEL {
-        if let Some(plan) = super::tsqr::plan(ctx, d.rows, d.cols) {
-            return tsqr_panel(a, plan, op, loc).into_qr();
-        }
+    if d.batch == 1
+        && d.cols <= PANEL
+        && let Some(plan) = super::tsqr::plan(ctx, d.rows, d.cols)
+    {
+        return tsqr_panel(a, plan, op, loc).into_qr();
     }
     if d.cols <= if d.batch > 1 || d.rows <= 64 { PANEL } else { super::panel_width() } {
         return leaf(a, d, op, loc);
