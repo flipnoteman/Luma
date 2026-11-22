@@ -14,7 +14,8 @@
 use std::panic::Location;
 
 use super::tri::lower_left;
-use super::{block, fail, fence, launch, nth, per_matrix, stack_batch, Dims};
+use super::lu::UNROLL;
+use super::{block, fail, fence, launch, nth, per_matrix, stack_batch, subgroups, Dims};
 use crate::array::Array;
 use crate::bmm::matmul_batched;
 use crate::dense::tri::split;
@@ -52,7 +53,7 @@ struct Params {
 /// segment. Per column `j`: the norm below the diagonal by a tree reduction; the reflector
 /// (LAPACK's `dlarfg`); the products `v_jᵀ F[:, c]` for every other column `c` (those with `c > j`
 /// are what the reflection needs, those with `c < j` the entries of the new column of `T`); the
-/// update; the scaling of `v_j`. The row loops take four rows a step with their loads issued
+/// update; the scaling of `v_j`. The row loops take [`UNROLL`] rows a step with their loads issued
 /// first (the kernel is bound by the latency of its global loads), see [`super::lu`].
 fn source(threads: usize, fence: &str) -> String {
     let groups = threads / 32;
@@ -87,16 +88,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     for (var j = 0u; j < min(m, w); j = j + 1u) {{
         var sq = 0.0;
         var k = j + 1u + t;
-        for (; k + {t3}u < m; k = k + {t4}u) {{
-            let v0 = f[base + k * w + j];
-            let v1 = f[base + (k + {t1}u) * w + j];
-            let v2 = f[base + (k + {t2}u) * w + j];
-            let v3 = f[base + (k + {t3}u) * w + j];
-            sq = fma(v0, v0, sq);
-            sq = fma(v1, v1, sq);
-            sq = fma(v2, v2, sq);
-            sq = fma(v3, v3, sq);
-        }}
+        for (; k + {tlast}u < m; k = k + {tstep}u) {{
+{norm_loads}{norm_fmas}        }}
         for (; k < m; k = k + {t1}u) {{
             let v = f[base + k * w + j];
             sq = fma(v, v, sq);
@@ -122,21 +115,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
             var acc = 0.0;
             if (g == 0u) {{ acc = f[base + j * w + c]; }}
             var i = j + 1u + g;
-            for (; i + {g3}u < m; i = i + {g4}u) {{
+            for (; i + {glast}u < m; i = i + {gstep}u) {{
                 let r0 = base + i * w;
-                let u0 = f[r0 + j];
-                let u1 = f[r0 + {g1}u * w + j];
-                let u2 = f[r0 + {g2}u * w + j];
-                let u3 = f[r0 + {g3}u * w + j];
-                let y0 = f[r0 + c];
-                let y1 = f[r0 + {g1}u * w + c];
-                let y2 = f[r0 + {g2}u * w + c];
-                let y3 = f[r0 + {g3}u * w + c];
-                acc = fma(u0 * inv, y0, acc);
-                acc = fma(u1 * inv, y1, acc);
-                acc = fma(u2 * inv, y2, acc);
-                acc = fma(u3 * inv, y3, acc);
-            }}
+{dot_loads}{dot_fmas}            }}
             for (; i < m; i = i + {g1}u) {{
                 acc = fma(f[base + i * w + j] * inv, f[base + i * w + c], acc);
             }}
@@ -162,21 +143,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
             let wc = tj * dd[c];
             if (g == 0u) {{ f[base + j * w + c] = f[base + j * w + c] - wc; }}
             var i = j + 1u + g;
-            for (; i + {g3}u < m; i = i + {g4}u) {{
+            for (; i + {glast}u < m; i = i + {gstep}u) {{
                 let r0 = base + i * w;
-                let u0 = f[r0 + j] * inv;
-                let u1 = f[r0 + {g1}u * w + j] * inv;
-                let u2 = f[r0 + {g2}u * w + j] * inv;
-                let u3 = f[r0 + {g3}u * w + j] * inv;
-                let y0 = f[r0 + c];
-                let y1 = f[r0 + {g1}u * w + c];
-                let y2 = f[r0 + {g2}u * w + c];
-                let y3 = f[r0 + {g3}u * w + c];
-                f[r0 + c] = fma(-u0, wc, y0);
-                f[r0 + {g1}u * w + c] = fma(-u1, wc, y1);
-                f[r0 + {g2}u * w + c] = fma(-u2, wc, y2);
-                f[r0 + {g3}u * w + c] = fma(-u3, wc, y3);
-            }}
+{upd_loads}{upd_stores}            }}
             for (; i < m; i = i + {g1}u) {{
                 f[base + i * w + c] = fma(-(f[base + i * w + j] * inv), wc, f[base + i * w + c]);
             }}
@@ -199,13 +168,180 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         parts = groups * 32,
         half = threads / 2,
         t1 = threads,
-        t2 = 2 * threads,
-        t3 = 3 * threads,
-        t4 = 4 * threads,
+        tlast = (UNROLL - 1) * threads,
+        tstep = UNROLL * threads,
         g1 = groups,
-        g2 = 2 * groups,
-        g3 = 3 * groups,
-        g4 = 4 * groups,
+        glast = (UNROLL - 1) * groups,
+        gstep = UNROLL * groups,
+        norm_loads = (0..UNROLL).map(|k| format!("            let v{k} = f[base + (k + {}u) * w + j];\n", k * threads)).collect::<String>(),
+        norm_fmas = (0..UNROLL).map(|k| format!("            sq = fma(v{k}, v{k}, sq);\n")).collect::<String>(),
+        dot_loads = (0..UNROLL).map(|k| format!("                let u{k} = f[r0 + {}u * w + j];\n                let y{k} = f[r0 + {}u * w + c];\n", k * groups, k * groups)).collect::<String>(),
+        dot_fmas = (0..UNROLL).map(|k| format!("                acc = fma(u{k} * inv, y{k}, acc);\n")).collect::<String>(),
+        upd_loads = (0..UNROLL).map(|k| format!("                let u{k} = f[r0 + {}u * w + j] * inv;\n                let y{k} = f[r0 + {}u * w + c];\n", k * groups, k * groups)).collect::<String>(),
+        upd_stores = (0..UNROLL).map(|k| format!("                f[r0 + {}u * w + c] = fma(-u{k}, wc, y{k});\n", k * groups)).collect::<String>(),
+    )
+}
+
+/// Columns of a panel the register kernel factors.
+const REG_COLS: usize = 8;
+/// Most rows per invocation of the register kernel.
+const REG_ROWS: usize = 8;
+
+/// The invocations and rows per invocation of the register kernel for `m` rows, if it applies.
+fn reg_shape(ctx: &crate::Context, m: usize) -> Option<(usize, usize)> {
+    if m <= 64 || std::env::var_os("LUMA_LINALG_NOREG").is_some() {
+        return None;
+    }
+    let limits = &ctx.info().limits;
+    let by_device = limits.max_workgroup_invocations.min(limits.max_workgroup_size[0]) as usize;
+    // Eight partial sums per invocation in workgroup memory, a power of two for the tree.
+    let by_memory = (limits.max_workgroup_storage_bytes as usize).saturating_sub(1024) / 32;
+    let threads = 1usize << (by_device.min(by_memory).min(512).max(1).ilog2());
+    (threads >= 128 && m <= threads * REG_ROWS).then(|| (threads, m.div_ceil(threads).next_power_of_two()))
+}
+
+/// The widest matrix a leaf of `m` rows factors in one launch.
+fn leaf_width(ctx: &crate::Context, m: usize) -> usize {
+    if reg_shape(ctx, m).is_some() { REG_COLS } else { PANEL }
+}
+
+fn split_cols(w: usize) -> usize {
+    if w <= 64 { (w / 2).next_multiple_of(REG_COLS).min(w - 1).max(1) } else { split(w) }
+}
+
+/// Register kernel: a panel of up to 8 columns with row `t + k * T` of invocation `t` held in
+/// registers during the whole factorisation. Per column, one reduction in workgroup memory of eight
+/// partial sums per invocation: the squared norm below the diagonal and the products of the column
+/// with every other one (`d'_c`), from which the reflector and the products `v_jᵀ F[:, c]` follow
+/// without a second pass (`v = x / (alpha - beta)`, so `v_jᵀ f_c = f_jc + d'_c / (alpha - beta)`).
+fn reg_source(threads: usize, rows: usize, subgroups: bool) -> String {
+    let t = threads;
+    let total = |c: usize| if subgroups { format!("tot[{c}]") } else { format!("tot{c}") };
+    let mut body = String::new();
+    for k in 0..rows {
+        body += &format!("    let row{k} = t + {}u;\n    if (row{k} < m) {{\n", k * t);
+        for c in 0..REG_COLS {
+            body += &format!("        if ({c}u < w) {{ x[{}] = a[base + row{k} * w + {c}u]; }}\n", k * REG_COLS + c);
+        }
+        body += "    }\n";
+    }
+    for j in 0..REG_COLS {
+        body += &format!("    if ({j}u < min(m, w)) {{\n");
+        for k in 0..rows {
+            body += &format!("        if (row{k} == {j}u) {{\n");
+            for c in 0..REG_COLS {
+                body += &format!("            rj[{c}] = x[{}];\n", k * REG_COLS + c);
+            }
+            body += "        }\n";
+        }
+        for c in 0..REG_COLS {
+            body += &format!("        var s{c} = 0.0;\n");
+        }
+        for k in 0..rows {
+            body += &format!("        if (row{k} > {j}u && row{k} < m) {{\n            let xj = x[{}];\n", k * REG_COLS + j);
+            for c in 0..REG_COLS {
+                body += &format!("            s{c} = fma(xj, {}, s{c});\n", if c == j { "xj".to_string() } else { format!("x[{}]", k * REG_COLS + c) });
+            }
+            body += "        }\n";
+        }
+        if subgroups {
+            for c in 0..REG_COLS {
+                body += &format!("        let r{c} = subgroupAdd(s{c});\n        if (lane == 0u) {{ rd[{}u + sgid] = r{c}; }}\n", c * t);
+            }
+            body += "        workgroupBarrier();\n        if (t < 8u) {\n            var acc = 0.0;\n            for (var q = 0u; q < nsg; q = q + 1u) { acc = acc + rd[t * ";
+            body += &format!("{t}u + q]; }}\n            tot[t] = acc;\n        }}\n        workgroupBarrier();\n");
+        } else {
+            for c in 0..REG_COLS {
+                body += &format!("        rd[{}u + t] = s{c};\n", c * t);
+            }
+            body += &format!(
+                "        workgroupBarrier();
+        for (var h = {half}u; h > 0u; h = h >> 1u) {{
+            if (t < h) {{
+",
+                half = t / 2
+            );
+            for c in 0..REG_COLS {
+                body += &format!("                rd[{0}u + t] = rd[{0}u + t] + rd[{0}u + t + h];\n", c * t);
+            }
+            body += "            }\n            workgroupBarrier();\n        }\n";
+            for c in 0..REG_COLS {
+                body += &format!("        let tot{c} = rd[{}u];\n", c * t);
+            }
+        }
+        body += &format!(
+            "        let xn2 = {};
+        let alpha = rj[{j}];
+        var beta = alpha;
+        var tj = 0.0;
+        var inv = 0.0;
+        if (xn2 != 0.0) {{
+            let nrm = sqrt(fma(alpha, alpha, xn2));
+            beta = select(nrm, -nrm, alpha >= 0.0);
+            tj = (beta - alpha) / beta;
+            inv = 1.0 / (alpha - beta);
+        }}
+",
+            total(j)
+        );
+        for c in 0..REG_COLS {
+            if c != j {
+                body += &format!("        let dd{c} = rj[{c}] + inv * {};\n", total(c));
+            }
+        }
+        // The new column of T and tau.
+        body += &format!("        if (t < {j}u) {{\n            var s = 0.0;\n");
+        for q in 0..j {
+            body += &format!("            if (t <= {q}u) {{ s = fma(tm[t * 8u + {q}u], dd{q}, s); }}\n");
+        }
+        body += &format!("            tm[t * 8u + {j}u] = -tj * s;\n        }}\n        if (t == {j}u) {{ tm[{}] = tj; tau[mi * w + {j}u] = tj; }}\n", j * REG_COLS + j);
+        for k in 0..rows {
+            body += &format!("        if (row{k} == {j}u) {{\n");
+            for c in j + 1..REG_COLS {
+                body += &format!("            x[{0}] = x[{0}] - tj * dd{c};\n", k * REG_COLS + c);
+            }
+            body += &format!("            x[{}] = beta;\n        }}\n        if (row{k} > {j}u && row{k} < m) {{\n            let v = x[{}] * inv;\n            x[{}] = v;\n", k * REG_COLS + j, k * REG_COLS + j, k * REG_COLS + j);
+            for c in j + 1..REG_COLS {
+                body += &format!("            x[{0}] = fma(-(tj * v), dd{c}, x[{0}]);\n", k * REG_COLS + c);
+            }
+            body += "        }\n";
+        }
+        body += "        workgroupBarrier();\n    }\n";
+    }
+    for k in 0..rows {
+        body += &format!("    if (row{k} < m) {{\n");
+        for c in 0..REG_COLS {
+            body += &format!("        if ({c}u < w) {{ f[base + row{k} * w + {c}u] = x[{}]; }}\n", k * REG_COLS + c);
+        }
+        body += "    }\n";
+    }
+    body += "    if (t < w * w) {\n        let i = t / w;\n        tf[mi * w * w + t] = tm[i * 8u + t - i * w];\n    }\n";
+    format!(
+        "struct Params {{ m: u32, w: u32, batch: u32 }}
+@group(1) @binding(0) var<storage, read> a: array<f32>;
+@group(1) @binding(1) var<storage, read_write> f: array<f32>;
+@group(1) @binding(2) var<storage, read_write> tau: array<f32>;
+@group(1) @binding(3) var<storage, read_write> tf: array<f32>;
+@group(1) @binding(4) var<uniform> p: Params;
+var<workgroup> rd: array<f32, {rd}>;
+var<workgroup> tot: array<f32, 8>;
+var<workgroup> rj: array<f32, 8>;
+var<workgroup> tm: array<f32, 64>;
+
+@compute @workgroup_size({t})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32{sg_args}) {{
+    let mi = wid.x + wid.y * nwg.x;
+    let m = select(0u, p.m, mi < p.batch);
+    let w = p.w;
+    let base = mi * p.m * w;
+{sg_setup}    var x: array<f32, {n}>;
+    if (t < 64u) {{ tm[t] = 0.0; }}
+{body}}}
+",
+        rd = REG_COLS * t,
+        n = rows * REG_COLS,
+        sg_args = if subgroups { ",\n    @builtin(subgroup_invocation_id) lane: u32,\n    @builtin(subgroup_size) sg: u32" } else { "" },
+        sg_setup = if subgroups { format!("    let sgid = t / sg;\n    let nsg = {t}u / sg;\n") } else { String::new() },
     )
 }
 
@@ -230,8 +366,14 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
     };
     let params = Params { m: d.rows as u32, w: n as u32, batch: d.batch as u32 };
     let args: [KernelArg<'_>; 5] = [a.into(), (&mut f).into(), (&mut tau).into(), (&mut t).into(), uniform(&params)];
-    let threads = super::lu::panel_threads(ctx, d.rows);
-    match launch(ctx, &source(threads, fence(ctx)), "qr_panel", per_matrix(ctx, d.batch), &args) {
+    let launched = match reg_shape(ctx, d.rows) {
+        Some((threads, rows)) if n <= REG_COLS => launch(ctx, &format!("qr_regs/{threads}/{rows}/{}", subgroups(ctx)), "qr_regs", || reg_source(threads, rows, subgroups(ctx)), per_matrix(ctx, d.batch), &args),
+        _ => {
+            let threads = super::lu::panel_threads(ctx, d.rows);
+            launch(ctx, &format!("qr_panel/{threads}/{}", fence(ctx).len()), "qr_panel", || source(threads, fence(ctx)), per_matrix(ctx, d.batch), &args)
+        }
+    };
+    match launched {
         Ok(()) => Qr { qr: f, tau, t },
         Err(e) => failed_qr(ctx, a, e, op, loc),
     }
@@ -248,10 +390,10 @@ pub(crate) fn unit_lower(f: &Array<f32>) -> Array<f32> {
 /// A recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
     let [w, m, ..] = a.shape().dims();
-    if w <= PANEL {
+    if w <= leaf_width(a.context(), m) {
         return leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc);
     }
-    let n1 = split(w);
+    let n1 = split_cols(w);
     let n2 = w - n1;
     let Qr { qr: f1, tau: tau1, t: t1 } = recurse(&block(a, 0..m, 0..n1), op, loc);
     let f1 = f1.cache();
@@ -286,7 +428,7 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return failed_qr(ctx, a, e, op, loc),
     };
-    if d.cols <= PANEL {
+    if d.cols <= leaf_width(ctx, d.rows) {
         return leaf(a, d, op, loc);
     }
     if d.batch > 1 {

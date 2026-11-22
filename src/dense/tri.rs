@@ -127,7 +127,7 @@ fn substitute(l: &Array<f32>, b: &Array<f32>, ld: Dims, bd: Dims, unit: bool, op
     let params = Params { n: ld.rows as u32, k: bd.cols as u32, batch: ld.batch as u32, unit: u32::from(unit) };
     let groups = grid(ctx, bd.cols.div_ceil(64), ld.batch);
     let args: [KernelArg<'_>; 4] = [l.into(), b.into(), (&mut out).into(), uniform(&params)];
-    match launch(ctx, &source(), "trsm", groups, &args) {
+    match launch(ctx, "trsm", "trsm", source, groups, &args) {
         Ok(()) => out,
         Err(e) => fail(ctx, b.shape(), e, op, loc),
     }

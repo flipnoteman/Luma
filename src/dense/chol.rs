@@ -112,7 +112,7 @@ fn small(a: &Array<f32>, d: Dims, loc: &'static Location<'static>) -> Array<f32>
     };
     let params = Params { n: d.rows as u32, batch: d.batch as u32 };
     let args: [KernelArg<'_>; 3] = [a.into(), (&mut out).into(), uniform(&params)];
-    match launch(ctx, &source(leaf(ctx)), "cholesky", per_matrix(ctx, d.batch), &args) {
+    match launch(ctx, &format!("chol/{}", leaf(ctx)), "cholesky", || source(leaf(ctx)), per_matrix(ctx, d.batch), &args) {
         Ok(()) => out,
         Err(e) => fail(ctx, a.shape(), e, "cholesky", loc),
     }

@@ -321,6 +321,27 @@ fn nan_input_propagates_and_shapes_are_checked() {
     assert!(rect.solve(&Array::<f32>::zeros_on(&ctx, [1, 3]).unwrap()).to_vec().is_err());
     assert!(rect.inverse().to_vec().is_err());
     assert!(rect.det().to_vec().is_err());
-    let wide = Array::<f32>::zeros_on(&ctx, [4, 3]).unwrap();
-    assert!(wide.lu().lu.to_vec().is_err());
+    let four_d = Array::<f32>::zeros_on(&ctx, [2, 2, 2, 2]).unwrap();
+    assert!(four_d.lu().lu.to_vec().is_err());
+}
+
+#[test]
+fn tall_matrices_factor_too() {
+    let ctx = Context::new().unwrap();
+    for &(n, m) in &[(1usize, 5usize), (5, 20), (40, 100), (70, 300), (33, 65), (100, 130), (5, 3), (40, 20), (100, 60), (300, 130)] {
+        let a = values(n * m, 5 + (n * 3 + m) as u64, -1.0, 1.0);
+        let f = mat(&ctx, &a, n, m, 1).lu();
+        assert_eq!(f.lu.shape().dims(), [n, m, 1, 1]);
+        let (l, u, perm) = (widen(&f.lower().to_vec().unwrap()), widen(&f.upper().to_vec().unwrap()), f.perm.to_vec().unwrap());
+        assert!(is_permutation(&perm), "{m}x{n}: not a permutation");
+        let k = n.min(m);
+        let lu = mul(&l, &u, m, k, n);
+        let mut pa = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                pa[i * n + j] = f64::from(a[perm[i] as usize * n + j]);
+            }
+        }
+        assert!(diff(&lu, &pa) / fro(&widen(&a)) < 2e-5, "{m}x{n}: ||PA - LU|| = {}", diff(&lu, &pa));
+    }
 }
