@@ -188,7 +188,18 @@ pub fn images(b: &mut Bench) {
             let l = || xl.moments();
             let a = || af::moments(&xa, af::MomentType::FIRST_ORDER);
             let v = compare(&lumax::host(&l()), &afx::host(&a()), 1e-3, 1e-1);
-            b.run("13 moments (M00 M01 M10 M11)", &size, v, "", &mut lr(&ctx, l), &mut ar(a));
+            b.run(
+                "13 moments (M00 M01 M10 M11)",
+                &size,
+                v,
+                "both read the four sums back (ArrayFire's reductions end in a host read)",
+                &mut || {
+                    let _ = l().to_vec().unwrap();
+                },
+                &mut || {
+                    let _ = afx::host(&a());
+                },
+            );
 
             // Colour.
             let rgb = uniform(h * w * 3, 303, 0.0, 1.0);

@@ -120,8 +120,9 @@ pub(crate) struct Window {
     pub(crate) edge: Edge,
     /// Outputs per workgroup along dimensions 0, 1, 2.
     pub(crate) tile: [u8; 3],
-    /// Outputs along dimension 1 each invocation computes (a divisor of `tile[1]`; `Correlate`
-    /// at stride 1 only).
+    /// Outputs along dimension 1 each invocation computes (a divisor of `tile[1]`). A
+    /// `Correlate` with `ry > 1` shares the rows its outputs cover (stride 1 along dimension 1
+    /// only); the other operations compute their outputs one after the other.
     pub(crate) ry: u8,
     /// Whether the weights are copied to workgroup memory first.
     pub(crate) stage_aux: bool,
@@ -182,6 +183,9 @@ fn unkey(k: u32) -> i32 { return bitcast<i32>(k ^ 0x80000000u); }"
 /// The most window cells whose median is selected with registers (an unrolled insertion
 /// selection); larger windows are selected bit by bit from workgroup memory.
 pub(crate) const MEDIAN_REGISTERS: usize = 49;
+
+/// The most cells of a median window whose kernel is repeated for several outputs per invocation.
+pub(crate) const MEDIAN_BLOCKED_CELLS: usize = 25;
 
 /// The WGSL of `w`.
 pub(crate) fn source(w: &Window) -> String {
@@ -249,21 +253,33 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
     }
     let _ = write!(
         src,
-        "    for (var i = lid; i < {total}u; i += {wg}u) {{
-        let a = i % {e0}u;
-        let rest = i / {e0}u;
-        let b = rest % {e1}u;
-        let c = rest / {e1}u;
-        let m0 = map(first0 + i32(a), p.n0);
-        let m1 = map(first1 + i32(b), p.n1);
-        let m2 = map(first2 + i32(c), p.n2);
-        var v = {fill};
-        if (m0 >= 0 && m1 >= 0 && m2 >= 0) {{ v = src[src_base + u32(m0) + p.n0 * (u32(m1) + p.n1 * u32(m2))]; }}
-        tile[i] = v;
+        "    let inside = first0 >= 0 && first1 >= 0 && first2 >= 0 && first0 + {e0} <= i32(p.n0) && first1 + {e1} <= i32(p.n1) && first2 + {e2} <= i32(p.n2);
+    if (inside) {{
+        let origin = src_base + u32(first0) + p.n0 * (u32(first1) + p.n1 * u32(first2));
+        for (var i = lid; i < {total}u; i += {wg}u) {{
+            let a = i % {e0}u;
+            let rest = i / {e0}u;
+            let b = rest % {e1}u;
+            let c = rest / {e1}u;
+            tile[i] = src[origin + a + p.n0 * (b + p.n1 * c)];
+        }}
+    }} else {{
+        for (var i = lid; i < {total}u; i += {wg}u) {{
+            let a = i % {e0}u;
+            let rest = i / {e0}u;
+            let b = rest % {e1}u;
+            let c = rest / {e1}u;
+            let m0 = map(first0 + i32(a), p.n0);
+            let m1 = map(first1 + i32(b), p.n1);
+            let m2 = map(first2 + i32(c), p.n2);
+            var v = {fill};
+            if (m0 >= 0 && m1 >= 0 && m2 >= 0) {{ v = src[src_base + u32(m0) + p.n0 * (u32(m1) + p.n1 * u32(m2))]; }}
+            tile[i] = v;
+        }}
     }}
     workgroupBarrier();
     let tx = lid % {t0}u;
-    let ty = (lid / {t0}u) % {th}u;
+    let tyb = (lid / {t0}u) % {th}u;
     let tz = lid / {plane}u;
     let u0 = o0 + tx;
     let u2 = o2 + tz;
@@ -271,7 +287,17 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
         total = e0 * e1 * e2,
         plane = t0 * th,
     );
-    src.push_str(&compute(w, ry));
+    if ry == 1 || w.op == Op::Correlate {
+        src.push_str("    let ty = tyb;\n");
+        src.push_str(&compute(w, ry));
+    } else {
+        // `ry` outputs one above the other per invocation, each its own block.
+        for r in 0..ry {
+            let _ = writeln!(src, "    {{\n    let ty = tyb * {ry}u + {r}u;");
+            src.push_str(&compute(w, 1));
+            src.push_str("    }\n");
+        }
+    }
     src.push_str("}\n");
     src
 }
@@ -489,15 +515,12 @@ fn median(w: &Window, ty: &str) -> String {
     let swap = |out: &mut String, a: &str, b: &str| {
         let _ = writeln!(out, "    {{ let lo = min({a}, {b}); let hi = max({a}, {b}); {a} = lo; {b} = hi; }}");
     };
-    let result = if n == 9 {
-        // Devillard's 19 exchange network for the median of 9.
-        let net: [(usize, usize); 19] = [
-            (1, 2), (4, 5), (7, 8), (0, 1), (3, 4), (6, 7), (1, 2), (4, 5), (7, 8), (0, 3), (5, 8), (4, 7), (3, 6), (1, 4), (2, 5), (4, 7), (4, 2), (6, 4), (4, 2),
-        ];
-        for (a, b) in net {
+    let result = if n == 9 || n == 25 {
+        let (net, at) = if n == 9 { (&MED9[..], 4) } else { (&MED25[..], 12) };
+        for &(a, b) in net {
             swap(&mut out, &names[a], &names[b]);
         }
-        names[4].clone()
+        names[at].clone()
     } else if n == 1 {
         names[0].clone()
     } else {
@@ -519,4 +542,59 @@ fn median(w: &Window, ty: &str) -> String {
     };
     out.push_str(&store("out", "o1 + ty", &result));
     out
+}
+
+/// Devillard's 19 exchange network for the median of 9 (the median ends in cell 4).
+const MED9: [(usize, usize); 19] =
+    [(1, 2), (4, 5), (7, 8), (0, 1), (3, 4), (6, 7), (1, 2), (4, 5), (7, 8), (0, 3), (5, 8), (4, 7), (3, 6), (1, 4), (2, 5), (4, 7), (4, 2), (6, 4), (4, 2)];
+
+/// The 99 exchange network for the median of 25 (Devillard's `opt_med25`; the median ends in cell 12).
+const MED25: [(usize, usize); 99] = [
+    (0, 1), (3, 4), (2, 4), (2, 3), (6, 7), (5, 7), (5, 6), (9, 10), (8, 10), (8, 9), (12, 13), (11, 13), (11, 12), (15, 16), (14, 16), (14, 15), (18, 19), (17, 19), (17, 18), (21, 22),
+    (20, 22), (20, 21), (23, 24), (2, 5), (3, 6), (0, 6), (0, 3), (4, 7), (1, 7), (1, 4), (11, 14), (8, 14), (8, 11), (12, 15), (9, 15), (9, 12), (13, 16), (10, 16), (10, 13), (20, 23),
+    (17, 23), (17, 20), (21, 24), (18, 24), (18, 21), (19, 22), (8, 17), (9, 18), (0, 18), (0, 9), (10, 19), (1, 19), (1, 10), (11, 20), (2, 20), (2, 11), (12, 21), (3, 21), (3, 12),
+    (13, 22), (4, 22), (4, 13), (14, 23), (5, 23), (5, 14), (15, 24), (6, 24), (6, 15), (7, 16), (7, 19), (13, 21), (15, 23), (7, 13), (7, 15), (1, 9), (3, 11), (5, 17), (11, 17),
+    (9, 17), (4, 10), (6, 12), (7, 14), (4, 6), (4, 7), (12, 14), (10, 14), (6, 7), (10, 12), (6, 10), (6, 17), (12, 17), (7, 17), (7, 10), (12, 18), (7, 12), (10, 18), (12, 20),
+    (10, 20), (10, 12),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// By the 0-1 principle a network puts the median in cell `at` iff it does for every input of
+    /// zeros and ones, where that cell is 1 exactly when at least `at + 1` inputs are.
+    fn median_network_is_correct(net: &[(usize, usize)], n: usize, at: usize) {
+        // 64 inputs at a time: bit `l` of word `c` is cell `c` of input `base + l`.
+        let total = 1u64 << n;
+        let mut base = 0u64;
+        while base < total {
+            let lanes = (total - base).min(64);
+            let mut cells: Vec<u64> = (0..n)
+                .map(|c| {
+                    let mut word = 0u64;
+                    for l in 0..lanes {
+                        word |= (((base + l) >> c) & 1) << l;
+                    }
+                    word
+                })
+                .collect();
+            let ones: Vec<u32> = (0..lanes).map(|l| ((base + l) as u32).count_ones()).collect();
+            for &(a, b) in net {
+                let (lo, hi) = (cells[a] & cells[b], cells[a] | cells[b]);
+                cells[a] = lo;
+                cells[b] = hi;
+            }
+            for l in 0..lanes {
+                assert_eq!((cells[at] >> l) & 1 == 1, ones[l as usize] as usize > at, "input {}", base + l);
+            }
+            base += 64;
+        }
+    }
+
+    #[test]
+    fn the_median_networks_select_the_median() {
+        median_network_is_correct(&MED9, 9, 4);
+        median_network_is_correct(&MED25, 25, 12);
+    }
 }

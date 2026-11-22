@@ -726,7 +726,7 @@ fn hist_equal_matches_the_host() {
         cdf.push(s);
     }
     let (lo, hi) = (cdf.iter().copied().fold(f64::INFINITY, f64::min), cdf.iter().copied().fold(f64::NEG_INFINITY, f64::max));
-    let norm: Vec<f64> = cdf.iter().map(|c| (c - lo) * ((h * w) as f64 - 1.0) / (hi - lo)).collect();
+    let norm: Vec<f64> = cdf.iter().map(|c| (c - lo) * (bins as f64 - 1.0) / (hi - lo)).collect();
     let got = x.hist_equal(&hist).to_vec().unwrap();
     for (i, (&g, &u)) in got.iter().zip(&us).enumerate() {
         let want = norm[u as usize] as f32 as u32;
