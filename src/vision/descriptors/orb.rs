@@ -4,18 +4,19 @@
 //! The whole call is recorded without a synchronization: the per-level candidate counts live on
 //! the device, every launch is sized by a bound known on the host (the feature cap of the level)
 //! and the groups past the real count exit at once. The only readback is the number of
-//! features each level kept, at the end. Per level (all in `src/vision/descriptors/orb.rs`):
+//! features each level kept, at the end. Per level, five launches:
 //!
 //! 1. resize of the previous level (bilinear, ArrayFire's convention);
-//! 2. FAST (arc 9) with non-maximal suppression over tiles of 32 x 8 pixels, count / scan /
-//!    scatter as in [`super::super::fast`], the scatter also computes the Harris response of
-//!    the corner (7 x 7 block, `k = 0.04`, scaled by `1e-12`);
-//! 3. the best `lvl_best` corners by Harris response: a histogram of the high bits of the
-//!    scores finds the cut, the candidates at or above the cut bin are compacted and ranked
-//!    exactly (ties by candidate order);
-//! 4. one workgroup per kept corner: orientation (31 x 31 intensity centroid), then the 256
-//!    tests of the BRIEF pattern, one per invocation, on the (optionally Gaussian blurred)
-//!    level image; the results go to the output arrays at the offset of the level.
+//! 2. FAST (arc 9) with non-maximal suppression over tiles of 32 x 8 pixels: a tile appends its
+//!    corners to the candidate list with one atomic add (a single pass; ArrayFire counts, scans
+//!    and scatters), computes the Harris response of each (7 x 7 block, `k = 0.04`, scaled by
+//!    `1e-12`) and counts its key in a histogram;
+//! 3. the cut of the ranking from the histogram (the best `lvl_best` candidates are the ones
+//!    above it) and the compaction of the candidates at or above the cut;
+//! 4. the exact ranking of the compacted candidates (ties by candidate index);
+//! 5. one workgroup per kept corner: orientation (31 x 31 intensity centroid), then the 256 tests
+//!    of the BRIEF pattern, one per invocation, on the (optionally Gaussian blurred) level image;
+//!    the results go to the output arrays at the offset of the level.
 
 use std::fmt::Write as _;
 
@@ -82,7 +83,7 @@ const KEY_FN: &str = "fn key(h: f32) -> u32 {
 ";
 
 /// FAST, arc 9, with the Harris response of the corners. The corners of a tile are appended to
-/// the list with one atomic add per tile (the order of the list is not deterministic) and counted
+/// the list with one atomic add per tile (the order of the list is not deterministic: ties of the ranking are broken arbitrarily) and counted
 /// in the histogram of the keys of their responses. Arguments: image, positions, responses,
 /// histogram, counters, uniform `{h, w, thr, edge, tiles_x, cap, level, 0}`.
 fn fast_source() -> String {
@@ -652,13 +653,13 @@ impl Array<f32> {
     /// smaller than 31 pixels, the level images are resized from the previous level to
     /// `round(side / scale^level)`, FAST asks for features at least 22 (plus 2 for the
     /// suppression) pixels from the border and at most `0.14 * H * W` of them per level survive
-    /// (after the suppression, the ones of the first tiles of 32 x 8 pixels), the Harris
+    /// (after the suppression), the Harris
     /// response is the sum over a 7 x 7 block with `k = 0.04`, and the BRIEF pattern is OpenCV's
     /// `bit_pattern_31`.
     ///
     /// Differences from ArrayFire: ties of the Harris ranking and the cut at the cap of
-    /// FAST candidates follow luma's tile order, not the (non-deterministic) order of the
-    /// CUDA blocks; ArrayFire blurs the input image in place when `blur_img` is set (luma does
+    /// FAST candidates are decided in the order the tiles append their corners (arbitrary, as
+    /// the order of ArrayFire's CUDA blocks is); ArrayFire blurs the input image in place when `blur_img` is set (luma does
     /// not touch its input); the last level takes `max_feat - sum` of the other levels' share,
     /// saturating at 0 where ArrayFire's unsigned arithmetic wraps. The ranking is exact but
     /// quadratic in the number of candidates at the cut, which stays small.

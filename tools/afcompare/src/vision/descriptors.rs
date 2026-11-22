@@ -20,7 +20,8 @@ use crate::util::*;
 unsafe extern "C" {
     fn af_sift(feat: *mut *mut c_void, desc: *mut *mut c_void, input: *mut c_void, n_layers: u32, contrast: f32, edge: f32, sigma: f32, dbl: bool, scale: f32, ratio: f32) -> i32;
     fn af_gloh(feat: *mut *mut c_void, desc: *mut *mut c_void, input: *mut c_void, n_layers: u32, contrast: f32, edge: f32, sigma: f32, dbl: bool, scale: f32, ratio: f32) -> i32;
-    fn af_get_features_num(n: *mut u32, f: *mut c_void) -> i32;
+    fn af_get_features_num(n: *mut i64, f: *mut c_void) -> i32;
+    fn af_retain_array(out: *mut *mut c_void, input: *mut c_void) -> i32;
     fn af_get_features_xpos(a: *mut *mut c_void, f: *mut c_void) -> i32;
     fn af_get_features_ypos(a: *mut *mut c_void, f: *mut c_void) -> i32;
     fn af_get_features_score(a: *mut *mut c_void, f: *mut c_void) -> i32;
@@ -109,13 +110,14 @@ fn af_sift_points(img: &af::Array<f32>, gloh: bool, layers: u32, contrast: f32, 
         }
     };
     assert_eq!(err, 0, "af sift/gloh error {err}");
-    let mut n = 0u32;
+    let mut n = 0i64;
     unsafe { af_get_features_num(&mut n, f) };
     let n = n as usize;
     let col = |get: unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> i32| {
-        let mut a: *mut c_void = std::ptr::null_mut();
+        let (mut a, mut kept): (*mut c_void, *mut c_void) = (std::ptr::null_mut(), std::ptr::null_mut());
         unsafe { get(&mut a, f) };
-        let arr: af::Array<f32> = (a as af::af_array).into();
+        unsafe { af_retain_array(&mut kept, a) };
+        let arr: af::Array<f32> = (kept as af::af_array).into();
         let mut v = vec![0f32; n];
         if n > 0 {
             arr.host(&mut v);
@@ -197,7 +199,7 @@ pub fn rows(b: &mut Bench) {
                 let l = || {
                     xl.orb(20.0, 3000, 1.5, 4, blur).unwrap();
                 };
-                let got = xl.orb(20.0, 3000, 1.5, 4, blur).unwrap().map(|(k, d)| luma_points(&k, lumax::host(&d).iter().map(|&v| f32::from_bits(v)).collect(), 8, false)).expect("luma orb found nothing");
+                let got = xl.orb(20.0, 3000, 1.5, 4, blur).unwrap().map(|(k, d)| luma_points(&k, lumax::host(&d).iter().map(|&v| f32::from_bits(v)).collect(), 8, true)).expect("luma orb found nothing");
                 let want = af_orb_points(&xa, 20.0, 3000, 1.5, 4, blur);
                 let verdict = compare_points(&got, &want, true, 0.97);
                 let name = if blur { "vision orb blur" } else { "vision orb" };
@@ -260,10 +262,10 @@ fn af_sift_points_timed(img: &af::Array<f32>, gloh: bool) -> u32 {
         }
     };
     assert_eq!(err, 0, "af sift/gloh error {err}");
-    let mut n = 0u32;
+    let mut n = 0i64;
     unsafe { af_get_features_num(&mut n, f) };
     let desc: af::Array<f32> = (d as af::af_array).into();
     drop(desc);
     unsafe { af_release_features(f) };
-    n
+    n as u32
 }

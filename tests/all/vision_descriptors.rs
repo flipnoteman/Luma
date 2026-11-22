@@ -984,12 +984,14 @@ fn sift_fields_and_errors() {
 #[ignore]
 fn sift_ref_against_arrayfire_dump() {
     // Development check: the reference against `afx sift` (ArrayFire CPU) output, /tmp/afx-descriptors/sift.txt
-    let (h, w) = (300usize, 300usize);
+    let h: usize = std::env::var("SIFT_H").map_or(300, |v| v.parse().unwrap());
+    let w: usize = std::env::var("SIFT_W").map_or(300, |v| v.parse().unwrap());
+    let file = std::env::var("SIFT_FILE").unwrap_or("/tmp/afx-descriptors/sift.txt".into());
     let args: Vec<String> = std::env::var("SIFT_ARGS").unwrap().split(' ').map(String::from).collect();
     let f = |i: usize| args[i].parse::<f32>().unwrap();
     let data = natural(h, w, 7);
     let want = sift_ref(&data, h, w, f(0) as u32, f(1), f(2), f(3), f(4) != 0.0, f(5), f(6), std::env::var("GLOH").is_ok());
-    let text = std::fs::read_to_string("/tmp/afx-descriptors/sift.txt").unwrap();
+    let text = std::fs::read_to_string(file).unwrap();
     let af: Vec<Vec<f32>> = text.lines().map(|l| l.split(' ').map(|t| t.parse().unwrap()).collect()).collect();
     println!("ref {} af {}", want.len(), af.len());
     let mut matched = 0;
@@ -1003,4 +1005,37 @@ fn sift_ref_against_arrayfire_dump() {
         }
     }
     println!("in-order matches {matched}");
+}
+
+#[test]
+#[ignore]
+fn sift_luma_against_arrayfire_dump() {
+    let h: usize = std::env::var("SIFT_H").map_or(300, |v| v.parse().unwrap());
+    let w: usize = std::env::var("SIFT_W").map_or(300, |v| v.parse().unwrap());
+    let file = std::env::var("SIFT_FILE").unwrap_or("/tmp/afx-descriptors/sift.txt".into());
+    let args: Vec<String> = std::env::var("SIFT_ARGS").unwrap().split(' ').map(String::from).collect();
+    let f = |i: usize| args[i].parse::<f32>().unwrap();
+    let data = natural(h, w, 7);
+    let ctx = ctx();
+    let img = Array::from_slice_on(&ctx, &data, [h, w]).unwrap();
+    let r = if std::env::var("GLOH").is_ok() { img.gloh(f(0) as u32, f(1), f(2), f(3), f(4) != 0.0, f(5), f(6)) } else { img.sift(f(0) as u32, f(1), f(2), f(3), f(4) != 0.0, f(5), f(6)) };
+    let got = read_sift(r.unwrap());
+    let text = std::fs::read_to_string(file).unwrap();
+    let af: Vec<SiftFeature> = text
+        .lines()
+        .map(|l| {
+            let v: Vec<f32> = l.split(' ').map(|t| t.parse().unwrap()).collect();
+            SiftFeature { x: v[0], y: v[1], score: v[2], ori: v[3], size: v[4], desc: v[5..].to_vec() }
+        })
+        .collect();
+    println!("luma {} af {}", got.len(), af.len());
+    let mut used = vec![false; got.len()];
+    let mut matched = 0;
+    for r in &af {
+        if let Some((i, _)) = got.iter().enumerate().find(|(i, g)| !used[*i] && (g.x - r.x).abs() < 0.05 && (g.y - r.y).abs() < 0.05 && (g.size - r.size).abs() < 1e-2 * r.size) {
+            used[i] = true;
+            matched += 1;
+        }
+    }
+    println!("matched {matched}");
 }

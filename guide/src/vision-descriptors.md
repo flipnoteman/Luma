@@ -85,8 +85,8 @@ following differs on purpose or by construction:
   levels (`orb`) or octaves (`sift`, `gloh`) finest first. Within an ORB level the points are sorted by
   decreasing Harris response; within a SIFT octave their order is not specified. Compare results
   as sets.
-* **ORB.** The features of a level survive the cap of `0.14 * H * W` FAST candidates in the order of
-  luma's tiles, not ArrayFire's. ArrayFire blurs its input image in place when `blur_img` is set,
+* **ORB.** The cap of `0.14 * H * W` FAST candidates per level, and ties of the Harris ranking, are
+  decided in an arbitrary order (the order tiles append their corners), as in ArrayFire. ArrayFire blurs its input image in place when `blur_img` is set,
   luma does not touch it. The last level takes what is left of `max_feat`, saturating at 0 where
   ArrayFire's unsigned arithmetic wraps. The kernel launches of all levels are queued without a
   readback; the Harris ranking uses a histogram to find the cut and ranks the candidates at the cut
