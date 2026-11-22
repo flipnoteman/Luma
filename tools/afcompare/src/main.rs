@@ -5,6 +5,7 @@ mod bench;
 mod cases;
 mod cold;
 mod linalg;
+mod linalg_svd;
 mod lumax;
 mod mlp;
 mod util;

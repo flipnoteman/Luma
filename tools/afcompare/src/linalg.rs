@@ -149,7 +149,7 @@ fn on(name: &str) -> bool {
 
 pub fn linalg(b: &mut Bench) {
     b.guarded("linalg", |b| {
-        let groups: [(&str, fn(&mut Bench)); 8] = [
+        let groups: [(&str, fn(&mut Bench)); 9] = [
             ("cholesky", cholesky),
             ("triangular", triangular),
             ("spd", spd_solve),
@@ -158,6 +158,7 @@ pub fn linalg(b: &mut Bench) {
             ("inverse_det", inverse_det),
             ("qr", qr_rows),
             ("batched", batched),
+            ("svd", crate::linalg_svd::svd_rows),
         ];
         for (name, f) in groups {
             if on(name) {
