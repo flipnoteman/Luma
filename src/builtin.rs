@@ -72,6 +72,8 @@ pub(crate) enum UnOp {
     Expm1,
     /// The identity: a copy of the operand (internal).
     Id,
+    /// The complex conjugate (`C32` only).
+    Conj,
     /// Bitwise complement (`u32` only).
     BitNot,
     /// Shift left by a constant amount `0..32` (`u32` only). The amount is part of the
@@ -153,6 +155,7 @@ impl UnOp {
             UnOp::Log1p => log1p_expr(),
             UnOp::Expm1 => expm1_expr(),
             UnOp::Id => "x",
+            UnOp::Conj => "vec2<f32>(x.r, -x.g)",
             UnOp::BitNot => "~x",
             UnOp::Shl(k) => by_constant(0, k),
             UnOp::Shr(k) => by_constant(1, k),
@@ -179,6 +182,7 @@ impl UnOp {
             UnOp::Log1p => "log1p",
             UnOp::Expm1 => "expm1",
             UnOp::Id => "copy",
+            UnOp::Conj => "conj",
             UnOp::BitNot => "not",
             UnOp::Shl(_) => "shl",
             UnOp::Shr(_) => "shr",
@@ -224,8 +228,16 @@ impl UnOp {
                 UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
                 _ => None,
             },
-            ElemTy::F32 if self.is_bitwise() => None,
+            ElemTy::F32 if self.is_bitwise() || self == UnOp::Conj => None,
             ElemTy::F32 => Some(self.expr()),
+            ElemTy::C32 => match self {
+                UnOp::Neg => Some("-x"),
+                UnOp::Conj => Some(self.expr()),
+                UnOp::Sqrt => Some("c_sqrt(x)"),
+                UnOp::Exp => Some("c_exp(x)"),
+                UnOp::Id => Some("x"),
+                _ => None,
+            },
             ElemTy::F64 => match self {
                 UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id => Some(self.expr()),
                 // The drivers' `f64` `round` and `trunc` are not exact everywhere (Mesa's lavapipe
@@ -331,6 +343,12 @@ impl BinOp {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max => Some(self.expr()),
                 _ => None,
             },
+            ElemTy::C32 => match self {
+                BinOp::Add | BinOp::Sub => Some(self.expr()),
+                BinOp::Mul => Some("c_mul(x, y)"),
+                BinOp::Div => Some("c_div(x, y)"),
+                _ => None,
+            },
             ElemTy::Df32 => match self {
                 BinOp::Add => Some("df_add(x, y)"),
                 BinOp::Sub => Some("df_add(x, -y)"),
@@ -369,9 +387,18 @@ impl CmpOp {
 }
 
 impl CmpOp {
+    /// Whether the comparison exists for elements of type `ty`: complex numbers are only equal or not.
+    pub(crate) fn exists_for(self, ty: ElemTy) -> bool {
+        ty != ElemTy::C32 || matches!(self, CmpOp::Eq | CmpOp::Ne)
+    }
+
     /// [`CmpOp::expr`] for elements of type `ty`.
     pub(crate) fn expr_for(self, ty: ElemTy) -> &'static str {
         match ty {
+            ElemTy::C32 => match self {
+                CmpOp::Ne => "select(1u, 0u, c_eq(x, y))",
+                _ => "select(0u, 1u, c_eq(x, y))",
+            },
             ElemTy::Df32 => match self {
                 CmpOp::Lt => "select(0u, 1u, df_lt(x, y))",
                 CmpOp::Le => "select(0u, 1u, df_le(x, y))",
@@ -383,6 +410,90 @@ impl CmpOp {
             _ => self.expr(),
         }
     }
+}
+
+/// A real quantity of a complex number (see [`ElemTy::C32`]): the operation maps an element
+/// `vec2<f32>` `(re, im)` to an `f32`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Part {
+    /// The real part.
+    Real,
+    /// The imaginary part.
+    Imag,
+    /// The modulus, scaled so that it neither overflows nor underflows where the result is
+    /// representable.
+    Abs,
+    /// The argument `atan2(im, re)`.
+    Arg,
+    /// `re * re + im * im`.
+    NormSqr,
+}
+
+impl Part {
+    /// The quantity as a WGSL expression of the operand `x` (its components are `r` and `g`:
+    /// [`substitute`] replaces every `x` of the template, `x.x` included).
+    pub(crate) fn expr(self) -> &'static str {
+        match self {
+            Part::Real => "x.r",
+            Part::Imag => "x.g",
+            Part::Abs => "c_abs(x)",
+            Part::Arg => "atan2(x.g, x.r)",
+            Part::NormSqr => "(x.r * x.r + x.g * x.g)",
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Part::Real => "real",
+            Part::Imag => "imag",
+            Part::Abs => "abs",
+            Part::Arg => "arg",
+            Part::NormSqr => "norm_sqr",
+        }
+    }
+}
+
+/// The complex arithmetic that is not a single `f32` operation per component, on `vec2<f32>` `(re,
+/// im)`: the functions of [`BinOp::expr_for`], [`UnOp::expr_for`], [`CmpOp::expr_for`] and
+/// [`Part::expr`] for `C32`. Pure `f32` arithmetic without the guard of [`df_library`], so that the
+/// compiler fuses the products into `fma`.
+///
+/// * `c_mul`: the textbook product.
+/// * `c_div`: Smith's algorithm (the quotient of the components of the denominator scales the
+///   rest, so no intermediate overflows where the result is representable); a zero denominator
+///   gives `(re / 0, im / 0)`, infinity or `NaN` per component as `C99` Annex G has it, with no
+///   trap.
+/// * `c_abs`: the modulus scaled by the larger component (exactly [`BinOp::Hypot`]).
+/// * `c_exp`: `e^re (cos im, sin im)`, the imaginary part of the result keeps the sign of a zero `im`
+///   (so `exp(inf + 0i)` is `inf + 0i`, not `NaN`).
+/// * `c_sqrt`: the principal square root, `(t, im / 2t)` with `t = sqrt((|z| + |re|) / 2)`
+///   on the right half-plane and the mirrored form on the left one (no cancellation).
+pub(crate) fn complex_library() -> String {
+    let hypot = BinOp::Hypot.expr();
+    format!(
+        "fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{ return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }}
+fn c_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+    let big = abs(b.y) <= abs(b.x);
+    let r = select(b.x / b.y, b.y / b.x, big);
+    let d = select(b.x * r + b.y, b.x + b.y * r, big);
+    let n = select(vec2<f32>(a.x * r + a.y, a.y * r - a.x), vec2<f32>(a.x + a.y * r, a.y - a.x * r), big);
+    return select(n / d, a / b.x, (b.x == 0.0) & (b.y == 0.0));
+}}
+fn c_abs(a: vec2<f32>) -> f32 {{ let x = a.x; let y = a.y; return {hypot}; }}
+fn c_eq(a: vec2<f32>, b: vec2<f32>) -> bool {{ return (a.x == b.x) & (a.y == b.y); }}
+fn c_exp(a: vec2<f32>) -> vec2<f32> {{
+    let e = exp(a.x);
+    return vec2<f32>(e * cos(a.y), select(e * sin(a.y), a.y, a.y == 0.0));
+}}
+fn c_sqrt(a: vec2<f32>) -> vec2<f32> {{
+    let t = sqrt(0.5 * (c_abs(a) + abs(a.x)));
+    let u = a.y / (2.0 * t);
+    let flipped = select(t, -t, (bitcast<u32>(a.y) & 0x80000000u) != 0u);
+    let root = select(vec2<f32>(abs(u), flipped), vec2<f32>(t, u), a.x >= 0.0);
+    return select(root, vec2<f32>(0.0, a.y), (a.x == 0.0) & (a.y == 0.0));
+}}
+"
+    )
 }
 
 /// A test of what kind of floating-point value an element is, read from the bits of its

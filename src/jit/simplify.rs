@@ -13,7 +13,7 @@
 //! is what the hazard analysis walks, and a copy that read `x` directly would not see that the
 //! expression below it has to be evaluated before the write.
 
-use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Scalar, Src, UnOp};
+use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Part, Scalar, Src, UnOp};
 
 /// The operation and operands to create instead of `op` on `args`, if a rule applies.
 pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
@@ -21,14 +21,14 @@ pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
 }
 
 fn is_float(ty: ElemTy) -> bool {
-    matches!(ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32)
+    matches!(ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32)
 }
 
 /// The bit pattern of the constant `value` as a scalar of type `ty` (`Df32`: `hi` is `value`,
-/// `lo` is 0).
+/// `lo` is 0; `C32`: the real part is `value`, the imaginary part 0).
 fn const_bits(ty: ElemTy, value: f64) -> u64 {
     match ty {
-        ElemTy::F32 | ElemTy::Df32 => u64::from((value as f32).to_bits()),
+        ElemTy::F32 | ElemTy::Df32 | ElemTy::C32 => u64::from((value as f32).to_bits()),
         ElemTy::F64 => value.to_bits(),
         ElemTy::U32 | ElemTy::Bool => u64::from(value as u32),
         ElemTy::I32 => u64::from(value as i32 as u32),
@@ -105,6 +105,18 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let [a, b, c] = args;
     let ty = op.ty;
     match op.kind {
+        // Not one identity of a real number holds bit for bit for a complex one: `z * 1` has
+        // `inf * 0` in it, and `z + (-0)` turns a `-0` imaginary part into `+0`.
+        OpKind::Binary(_) if ty == ElemTy::C32 => None,
+        OpKind::Part(Part::Real | Part::Imag) => {
+            let (_, iargs) = inner(a, |inside| inside.kind == OpKind::Make)?;
+            identity(op, &iargs[usize::from(op.kind == OpKind::Part(Part::Imag))])
+        }
+        OpKind::Make => {
+            let (_, real) = inner(a, |inside| inside.kind == OpKind::Part(Part::Real))?;
+            let (_, imag) = inner(b, |inside| inside.kind == OpKind::Part(Part::Imag))?;
+            if same(&real[0], &imag[0]) { identity(op, &real[0]) } else { None }
+        }
         OpKind::Binary(bin) => {
             let (sa, sb) = (scalar(a), scalar(b));
             let float = is_float(ty);
@@ -157,14 +169,14 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
         OpKind::Unary(un) => {
             if !matches!(
                 un,
-                UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_)
+                UnOp::Neg | UnOp::Conj | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_)
             ) {
                 return None;
             }
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Unary(_)))?;
             let OpKind::Unary(inner_un) = iop.kind else { return None };
             match (un, inner_un) {
-                (UnOp::Neg, UnOp::Neg) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
+                (UnOp::Neg, UnOp::Neg) | (UnOp::Conj, UnOp::Conj) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
                 (UnOp::Abs, UnOp::Abs | UnOp::Neg) => unary(UnOp::Abs, ty, &iargs[0]),
                 (UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round, UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round) => {
                     unary(inner_un, ty, &iargs[0])
@@ -187,7 +199,7 @@ fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
                 None
             }
         }
-        OpKind::Compare(cmp) if same(a, b) => match cmp {
+        OpKind::Compare(cmp) if same(a, b) && cmp.exists_for(ty) => match cmp {
             CmpOp::Lt | CmpOp::Gt => constant(op, 0.0),
             CmpOp::Le | CmpOp::Ge | CmpOp::Eq if !is_float(ty) => constant(op, 1.0),
             CmpOp::Ne if !is_float(ty) => constant(op, 0.0),

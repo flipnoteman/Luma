@@ -19,7 +19,7 @@
 use std::fmt::Write;
 
 use crate::builtin::{
-    DF_MATH_LIBRARY, ReduceElem, class_operand, df_library, reduce_main, substitute,
+    DF_MATH_LIBRARY, ReduceElem, class_operand, complex_library, df_library, reduce_main, substitute,
 };
 use crate::gpu::hash::FxMap;
 use crate::tuning::{STENCIL_RADIUS, Tuning};
@@ -31,7 +31,7 @@ use crate::error::Result;
 use super::inline::{Inlined, Lowered, Region};
 use super::kirgen;
 use super::params;
-use super::program::{FusedKey, Instr, Ref, Tail, calls_df_library, calls_df_math};
+use super::program::{FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math};
 use super::staging::Staging;
 use super::stencil::signed;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -44,7 +44,7 @@ fn name(reference: Ref, ty: ElemTy) -> String {
         Ref::Input(k) => format!("a{k}"),
         Ref::Scalar(k) => match ty {
             ElemTy::F64 => format!("(f64(p.s{k}) + f64(p.s{}) + f64(p.s{}))", k + 1, k + 2),
-            ElemTy::Df32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
+            ElemTy::Df32 | ElemTy::C32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => format!("p.s{k}"),
         },
         Ref::Tmp(k) => format!("t{k}"),
@@ -62,7 +62,7 @@ fn name(reference: Ref, ty: ElemTy) -> String {
 pub(super) fn storage_ty(ty: ElemTy) -> &'static str {
     match ty {
         ElemTy::Bool => "u32",
-        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => ty.wgsl(),
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ty.wgsl(),
     }
 }
 
@@ -89,7 +89,7 @@ pub(super) fn load(ty: ElemTy, buffer: &str, index: &str) -> String {
             let j = operand(index);
             format!("(({buffer}[{j} >> 5u] >> ({j} & 31u)) & 1u)")
         }
-        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => format!("{buffer}[{index}]"),
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("{buffer}[{index}]"),
     }
 }
 
@@ -134,6 +134,8 @@ fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
         OpKind::Binary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b),
         OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
         OpKind::Classify(class) => substitute(class.expr(), &class_operand(ty, a), ""),
+        OpKind::Part(part) => substitute(part.expr(), a, ""),
+        OpKind::Make => format!("vec2<f32>({a}, {b})"),
         OpKind::Powf if ty == ElemTy::Df32 => format!("df_pow({a}, {b})"),
         OpKind::Powf => format!("pow({a}, {b})"),
         OpKind::Clamp if ty == ElemTy::Df32 => format!("df_min(df_max({a}, {b}), {c})"),
@@ -349,7 +351,7 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
         (ElemTy::Bool, ElemTy::U32) => value.to_owned(),
         (ElemTy::Bool, ElemTy::I32) => format!("bitcast<i32>({value})"),
         (ElemTy::Bool, ElemTy::F64) => format!("f64({value})"),
-        (ElemTy::Bool, ElemTy::Df32) => format!("vec2<f32>(f32({value}), 0.0)"),
+        (ElemTy::Bool, ElemTy::Df32) | (ElemTy::Bool, ElemTy::C32) => format!("vec2<f32>(f32({value}), 0.0)"),
         _ if from == to => value.to_owned(),
         _ => unreachable!("cast {from:?} -> {to:?}"),
     }
@@ -362,10 +364,11 @@ pub(super) fn library_for(key: &FusedKey, tuning: &Tuning) -> String {
     let library = |guard: &str| df_library(guard, tuning.df_fma, tuning.df_sloppy_add);
     let instrs = || key.instrs.iter().chain(key.subs.iter().flatten());
     let math = if instrs().any(calls_df_math) { DF_MATH_LIBRARY } else { "" };
+    let complex = if instrs().any(calls_complex_library) { complex_library() } else { String::new() };
     match key.guard {
-        Some(guard) => library(&format!("p.s{guard}")) + math,
-        None if instrs().any(calls_df_library) => library("0u") + math,
-        None => String::new(),
+        Some(guard) => library(&format!("p.s{guard}")) + math + &complex,
+        None if instrs().any(calls_df_library) => library("0u") + math + &complex,
+        None => complex,
     }
 }
 
@@ -378,13 +381,13 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             ElemTy::U32 => index.to_owned(),
             ElemTy::Bool => unreachable!("bool has no generators"),
             ElemTy::I32 => format!("bitcast<i32>({index})"),
-            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({index})"),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
             ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
             ElemTy::Bool => unreachable!("bool has no generators"),
             ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
-            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32(({index} >> {a}) & {b})"),
         },
         Gen::RangeConst { .. } | Gen::ParamRange { .. } => {
             let coord = match kind {
@@ -401,7 +404,7 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
                 ElemTy::U32 => coord,
                 ElemTy::Bool => unreachable!("bool has no generators"),
                 ElemTy::I32 => format!("bitcast<i32>({coord})"),
-                ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({coord})"),
+                ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32({coord})"),
             }
         }
         Gen::Linspace => format!("({a} + f32({index}) * {b})"),
@@ -574,7 +577,7 @@ pub(super) fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
     let bytes = match ty {
         ElemTy::Bool => return false,
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => 4,
-        ElemTy::F64 | ElemTy::Df32 => 8,
+        ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => 8,
     };
     key.outputs.len() == total as usize && total > 1 && u64::from(wg) * u64::from(total) * bytes <= STACK_STAGE_BYTES
 }
@@ -1402,7 +1405,7 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                     match op.ty {
                         ElemTy::U32 => format!("u32({coord})"),
                         ElemTy::I32 => coord,
-                        ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(u32({coord}))"),
+                        ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32(u32({coord}))"),
                         ElemTy::Bool => unreachable!("bool has no generators"),
                     }
                 }

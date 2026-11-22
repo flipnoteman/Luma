@@ -20,6 +20,7 @@ mod check_finite;
 mod chunked;
 mod classify;
 mod clone;
+mod complex;
 mod cpu;
 mod df32_library;
 mod elementwise_math;
