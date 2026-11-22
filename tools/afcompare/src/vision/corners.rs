@@ -46,17 +46,19 @@ fn af_points(f: &af::Features, swap: bool) -> HashMap<(u32, u32), f32> {
 }
 
 /// The verdict of two corner sets.
-fn sets(luma: &HashMap<(u32, u32), f32>, af: &HashMap<(u32, u32), f32>) -> Verdict {
+/// `floor` is the score below which a relative difference means nothing (SUSAN's response is a
+/// difference of nearly equal numbers, so its rounding error is relative to `geom_thr`).
+fn sets(luma: &HashMap<(u32, u32), f32>, af: &HashMap<(u32, u32), f32>, floor: f32) -> Verdict {
     let only_luma = luma.keys().filter(|p| !af.contains_key(p)).count();
     let only_af = af.keys().filter(|p| !luma.contains_key(p)).count();
     let tol = (af.len() / 1000).max(3);
     let mut worst = 0.0f64;
     for (p, &s) in luma {
         if let Some(&a) = af.get(p) {
-            worst = worst.max((f64::from(s) - f64::from(a)).abs() / f64::from(a).abs().max(1e-30));
+            worst = worst.max((f64::from(s) - f64::from(a)).abs() / f64::from(a).abs().max(f64::from(floor)));
         }
     }
-    let text = format!("{} corners (ArrayFire {}), {only_luma} only in luma, {only_af} only in ArrayFire, scores of the common ones within {worst:.1e} relative", luma.len(), af.len());
+    let text = format!("{} corners (ArrayFire {}), {only_luma} only in luma, {only_af} only in ArrayFire, scores of the common ones within {worst:.1e} relative (to the larger of the score and the floor)", luma.len(), af.len());
     if only_luma <= tol && only_af <= tol && worst <= 1e-3 {
         Verdict::yes(text)
     } else {
@@ -103,14 +105,14 @@ pub fn rows(b: &mut Bench) {
             ] {
                 let l = || xl.harris(max, minr, sigma, block as usize, 0.04).unwrap();
                 let a = || af::harris(&xa, max as u32, minr, sigma, block as u32, 0.04);
-                let v = sets(&luma_points(&l()), &af_points(&a(), false));
+                let v = sets(&luma_points(&l()), &af_points(&a(), false), 1e-30);
                 b.run(&format!("14 {name}"), &size, v, note, &mut lr(&ctx, l), &mut ar(a));
             }
             // SUSAN.
             for (name, r, t, g, edge) in [("susan r3", 3usize, 32.0f32, 10.0f32, 3usize), ("susan r5", 5, 32.0, 30.0, 5)] {
                 let l = || xl.susan(r, t, g, 0.05, edge).unwrap();
                 let a = || af::susan(&xa, r as u32, t, g, 0.05, edge as u32);
-                let v = sets(&luma_points(&l()), &af_points(&a(), true));
+                let v = sets(&luma_points(&l()), &af_points(&a(), true), g * 1e-3);
                 b.run(&format!("14 {name}"), &size, v, "x and y compared swapped (ArrayFire's x is the row)", &mut lr(&ctx, l), &mut ar(a));
             }
             // Difference of Gaussians.
