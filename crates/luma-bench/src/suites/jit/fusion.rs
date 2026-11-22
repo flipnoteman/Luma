@@ -116,6 +116,12 @@ fn dag_host(x: &[f32], y: &[f32], levels: usize) -> Vec<f32> {
         .collect()
 }
 
+/// `n` complex numbers with components in `lo..hi`.
+fn complex_values(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<C32> {
+    let (re, im) = (values(n, seed, lo, hi), values(n, seed + 1000, lo, hi));
+    re.into_iter().zip(im).map(|(re, im)| C32::new(re, im)).collect()
+}
+
 pub fn run(h: &mut Harness) {
     h.guarded("fusion", |h| {
         let ctx = h.ctx.clone();
@@ -155,6 +161,32 @@ pub fn run(h: &mut Harness) {
             check("fusion/df32_heavy", &heavy_df32(&xa).to_vec().unwrap(), &want, 1e-5, 1e-6);
             h.case("fusion/df32_heavy", &format!("24op df32 n={n}"), Work::Bytes(bytes), &mut || {
                 force(&heavy_df32(&xa));
+            });
+        }
+
+        // A fused chain of complex arithmetic on `C32` arrays: products, a conjugate, a quotient and a modulus in
+        // one kernel that reads two complex arrays and writes one real one.
+        {
+            let nc = size(h, 1 << 20, 1 << 22, 1 << 22);
+            let (zh, wh) = (complex_values(nc, 8, -1.5, 1.5), complex_values(nc, 9, 0.5, 1.5));
+            let z = Array::<C32>::from_slice_on(&ctx, &zh, nc).unwrap();
+            let w = Array::<C32>::from_slice_on(&ctx, &wh, nc).unwrap();
+            let chain = |z: &Array<C32>, w: &Array<C32>| ((z * w + z).conj() / (w + 1.0f32)).abs();
+            let want: Vec<f32> = zh
+                .iter()
+                .zip(&wh)
+                .map(|(z, w)| {
+                    let (zr, zi, wr, wi) = (f64::from(z.re), f64::from(z.im), f64::from(w.re), f64::from(w.im));
+                    let (pr, pi) = (zr * wr - zi * wi + zr, zr * wi + zi * wr + zi);
+                    let (nr, ni) = (pr, -pi);
+                    let (dr, di) = (wr + 1.0, wi);
+                    let d = dr * dr + di * di;
+                    (((nr * dr + ni * di) / d).hypot((ni * dr - nr * di) / d)) as f32
+                })
+                .collect();
+            check("fusion/complex_chain", &chain(&z, &w).to_vec().unwrap(), &want, 2e-5, 1e-6);
+            h.case("fusion/complex_chain", &format!("c32 z*w+z conj / (w+1) abs n={nc}"), Work::Bytes(20.0 * nc as f64), &mut || {
+                force(&chain(&z, &w));
             });
         }
 
