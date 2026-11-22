@@ -224,6 +224,13 @@ pub fn bykey(b: &mut Bench) {
             },
         );
         drop((kl, ka, vl, va));
+    });
+}
+
+/// `set_unique`, `set_union` and `set_intersect` (group `sets`).
+pub fn sets(b: &mut Bench) {
+    b.guarded("sets", |b| {
+        let ctx = b.ctx.clone();
         // Sets of u32 below 2^24 (exact in f32 for the comparison).
         let m = 4_000_000usize;
         let sa = indices(m, 81, 1 << 23);

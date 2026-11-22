@@ -1,0 +1,174 @@
+diff --git a/src/setmerge.rs b/src/setmerge.rs
+index 70271c9..bb9dce8 100644
+--- a/src/setmerge.rs
++++ b/src/setmerge.rs
+@@ -46,6 +46,8 @@ enum Pass {
+     Partition,
+     Count,
+     Write,
++    /// Count and write in one kernel, the tiles' offsets by decoupled look-back (CUDA).
++    Fused,
+ }
+ 
+ fn source(pass: Pass, op: Op, transform: KeyTransform) -> String {
+@@ -53,8 +55,12 @@ fn source(pass: Pass, op: Op, transform: KeyTransform) -> String {
+     let float = transform == KeyTransform::Float;
+     let uniform = match pass {
+         Pass::Partition => {
+-            src.push_str("@group(1) @binding(0) var<storage, read_write> split: array<u32>;\n@group(1) @binding(1) var<storage, read> a: array<u32>;\n@group(1) @binding(2) var<storage, read> b: array<u32>;\n");
+-            3
++            src.push_str("@group(1) @binding(0) var<storage, read_write> split: array<u32>;\n@group(1) @binding(1) var<storage, read> a: array<u32>;\n@group(1) @binding(2) var<storage, read> b: array<u32>;\n@group(1) @binding(3) var<storage, read_write> st: array<atomic<u32>>;\n");
++            4
++        }
++        Pass::Fused => {
++            src.push_str("@group(1) @binding(0) var<storage, read_write> out: array<u32>;\n@group(1) @binding(1) var<storage, read> a: array<u32>;\n@group(1) @binding(2) var<storage, read> b: array<u32>;\n@group(1) @binding(3) var<storage, read> split: array<u32>;\n@group(1) @binding(4) var<storage, read_write> st: array<atomic<u32>>;\n");
++            5
+         }
+         Pass::Count => {
+             src.push_str("@group(1) @binding(0) var<storage, read_write> counts: array<u32>;\n@group(1) @binding(1) var<storage, read> a: array<u32>;\n@group(1) @binding(2) var<storage, read> b: array<u32>;\n@group(1) @binding(3) var<storage, read> split: array<u32>;\n");
+@@ -95,6 +101,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
+         if (ka_g(mid) <= kb_g(d - 1u - mid)) {{ lo = mid + 1u; }} else {{ hi = mid; }}
+     }}
+     split[g] = lo;
++    // The statuses and the ticket of the fused kernel that follows.
++    atomicStore(&st[g], 0u);
++    if (g == 0u) {{ atomicStore(&st[p.tiles + 1u], 0u); }}
+ }}
+ "
+         );
+@@ -108,16 +117,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
+         Pass::Count => "    atomicAdd(&total, mine);\n    workgroupBarrier();\n    if (t == 0u) { counts[tl] = atomicLoad(&total); }\n",
+         _ => "",
+     };
++    let fused = pass == Pass::Fused;
++    let lane_param = if fused { ", @builtin(subgroup_invocation_id) lane: u32" } else { "" };
++    let acquire = if fused {
++        "    if (wg.x + wg.y * nwg.x >= p.tiles) { return; }
++    // Tiles are numbered in the order their workgroups start, so every tile the look-back waits
++    // for has started.
++    if (t == 0u) { ticket = atomicAdd(&st[p.tiles + 1u], 1u); }
++    let tl = workgroupUniformLoad(&ticket);"
++    } else {
++        "    let tl = wg.x + wg.y * nwg.x;
++    if (tl >= p.tiles) { return; }"
++    };
+     let _ = write!(
+         src,
+         "var<workgroup> ka: array<u32, {tile}>;
+ var<workgroup> kb: array<u32, {tile}>;
+ var<workgroup> total: atomic<u32>;
+ var<workgroup> scan_a: array<u32, {w}>;
++var<workgroup> ticket: u32;
++var<workgroup> base_excl: u32;
+ @compute @workgroup_size({w})
+-fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+-    let tl = wg.x + wg.y * nwg.x;
+-    if (tl >= p.tiles) {{ return; }}
++fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>{lane_param}) {{
++{acquire}
+     let a0 = split[tl];
+     let a1 = split[tl + 1u];
+     let d0 = tl * {tile}u;
+@@ -191,6 +213,64 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
+         src.push_str("}\n");
+         return src;
+     }
++    if fused {
++        // Scan the counts, publish the tile's count, look back for the items before the tile.
++        let _ = write!(
++            src,
++            "    scan_a[t] = mine;
++    for (var d = 1u; d < {w}u; d <<= 1u) {{
++        workgroupBarrier();
++        var x = scan_a[t];
++        if (t >= d) {{ x += scan_a[t - d]; }}
++        workgroupBarrier();
++        scan_a[t] = x;
++    }}
++    workgroupBarrier();
++    let tile_count = scan_a[{last}u];
++    if (t == 0u) {{
++        if (tl == 0u) {{ atomicStore(&st[0], (2u << 30u) | tile_count); }} else {{ atomicStore(&st[tl], (1u << 30u) | tile_count); }}
++    }}
++    if (t < 32u) {{
++        var excl = 0u;
++        var j = tl;
++        loop {{
++            if (j == 0u) {{ break; }}
++            var w = 0u;
++            if (lane < j) {{
++                w = atomicLoad(&st[j - 1u - lane]);
++                while (w == 0u) {{ w = atomicLoad(&st[j - 1u - lane]); }}
++            }}
++            let inclusive = subgroupBallot(lane < j && (w >> 30u) == 2u).x;
++            var upto = 32u;
++            if (inclusive != 0u) {{ upto = firstTrailingBit(inclusive) + 1u; }}
++            excl += subgroupAdd(select(0u, w & 0x3fffffffu, lane < upto && lane < j));
++            if (inclusive != 0u) {{ break; }}
++            j -= 32u;
++        }}
++        if (t == 0u) {{
++            atomicStore(&st[tl], (2u << 30u) | (excl + tile_count));
++            base_excl = excl;
++        }}
++    }}
++    workgroupBarrier();
++    var slot = base_excl + scan_a[t] - mine;
++    ia = lo;
++    ib = dl - lo;
++    for (var s = 0u; s < steps; s++) {{
++        let from_a = ia < la && (ib >= lb || ka[ia] <= kb[ib]);
++        if (((kept_mask >> s) & 1u) != 0u) {{
++            let word = select(b[b0 + ib], a[a0 + ia], from_a);
++            out[slot] = zero_out(word);
++            slot++;
++        }}
++        if (from_a) {{ ia++; }} else {{ ib++; }}
++    }}
++}}
++",
++            last = WORKGROUP - 1,
++        );
++        return src;
++    }
+     // Write: a workgroup scan of the counts gives the first slot of every invocation.
+     let _ = write!(
+         src,
+@@ -248,9 +328,36 @@ impl<T: SortKey> Array<T> {
+         let uniform = RawArg::Uniform(bytemuck::bytes_of(&params));
+         let kernel = |pass: Pass, op: Op| ctx.jit().stencil_kernel(ctx, source(pass, op, transform), "SetMerge");
+         let (a_arg, b_arg) = (RawArg::read(a_pin.buffer(), a_bytes), RawArg::read(b_pin.buffer(), b_bytes));
++        let status = Array::<u32>::alloc(ctx, Shape::from(tiles as usize + 8))?;
++        let (status_pin, status_bytes) = status.ready()?;
+         let part = kernel(Pass::Partition, op)?;
+         let groups = fold_workgroups(ctx, (tiles + 1).div_ceil(WORKGROUP))?;
+-        ctx.launch(&part, groups, [tiles + 1, 1, 1], &[RawArg::write(split_pin.buffer(), split_bytes), a_arg, b_arg, uniform])?;
++        ctx.launch(&part, groups, [tiles + 1, 1, 1], &[RawArg::write(split_pin.buffer(), split_bytes), a_arg, b_arg, RawArg::write(status_pin.buffer(), status_bytes), uniform])?;
++        if ctx.tuning().lookback_scan && ctx.tuning().subgroup32 && total < 1 << 30 {
++            // One kernel counts, finds the tiles' offsets by look-back and writes; the result is the
++            // front of a buffer of the most items it can have.
++            let most = match op {
++                Op::Union => na + nb,
++                Op::Intersect => na.min(nb),
++            };
++            let out = Array::<T>::alloc(ctx, Shape::from(most))?;
++            let out_storage = Arc::clone(out.storage()?);
++            let out_pin = out_storage.pin_single()?;
++            let fused = kernel(Pass::Fused, op)?;
++            let tile_groups = fold_workgroups(ctx, tiles)?;
++            ctx.launch(
++                &fused,
++                tile_groups,
++                [tiles, 1, 1],
++                &[RawArg::write(out_pin.buffer(), out.byte_len()), a_arg, b_arg, RawArg::read(split_pin.buffer(), split_bytes), RawArg::write(status_pin.buffer(), status_bytes), uniform],
++            )?;
++            let kept = (status.slice(0, tiles as usize - 1..tiles as usize).item().map_err(Failure::New)? & 0x3fff_ffff) as usize;
++            return Ok(match kept {
++                0 => None,
++                k if k == most => Some(out),
++                k => Some(out.slice(0, ..k)),
++            });
++        }
+         let count = kernel(Pass::Count, op)?;
+         let tile_groups = fold_workgroups(ctx, tiles)?;
+         ctx.launch(&count, tile_groups, [tiles, 1, 1], &[RawArg::write(counts_pin.buffer(), counts_bytes), a_arg, b_arg, RawArg::read(split_pin.buffer(), split_bytes), uniform])?;
