@@ -227,3 +227,47 @@ fn histogram_is_one_scatter_kernel_and_a_fill() {
     assert_eq!(counts.iter().sum::<u32>() as usize, vals.len());
     assert!(profile.launches() <= 2, "{} launches", profile.launches());
 }
+
+/// The private kernel loads four elements per invocation and strides over the array with a
+/// resident grid: every length around the edges of a step (and fewer elements than invocations)
+/// counts, and so does every element of a combining scatter into a small target.
+#[test]
+fn private_scatters_handle_every_tail() {
+    let ctx = Context::new().unwrap();
+    let mut rng = Rng(9);
+    for n in [1usize, 2, 3, 255, 256, 257, 1023, 1025, 4097, 65_537, 100_003, 1_000_003] {
+        for bins in [5usize, 256] {
+            let host = codes(&mut rng, n, bins, true);
+            let indices = Array::from_slice_on(&ctx, &host, n).unwrap();
+            assert_eq!(bincount(&indices, bins).to_vec().unwrap(), host_count(&host, bins), "bincount n = {n}, bins {bins}");
+
+            let values: Vec<i32> = (0..n).map(|_| rng.next() as i32).collect();
+            let vals = Array::from_slice_on(&ctx, &values, n).unwrap();
+            let mut lo = Array::<i32>::full_on(&ctx, bins, i32::MAX).unwrap();
+            let mut hi = Array::<i32>::full_on(&ctx, bins, i32::MIN).unwrap();
+            lo.put_min(&indices, &vals).unwrap();
+            hi.put_max(&indices, &vals).unwrap();
+            let (mut want_lo, mut want_hi) = (vec![i32::MAX; bins], vec![i32::MIN; bins]);
+            for (&c, &v) in host.iter().zip(&values) {
+                if (c as usize) < bins {
+                    want_lo[c as usize] = want_lo[c as usize].min(v);
+                    want_hi[c as usize] = want_hi[c as usize].max(v);
+                }
+            }
+            assert_eq!(lo.to_vec().unwrap(), want_lo, "put_min n = {n}, bins {bins}");
+            assert_eq!(hi.to_vec().unwrap(), want_hi, "put_max n = {n}, bins {bins}");
+
+            let mut sum = Array::<u32>::zeros_on(&ctx, bins).unwrap();
+            let ones: Vec<u32> = (0..n).map(|k| (k % 7) as u32).collect();
+            let ones_a = Array::from_slice_on(&ctx, &ones, n).unwrap();
+            sum.put_add(&indices, &ones_a).unwrap();
+            let mut want = vec![0u32; bins];
+            for (&c, &v) in host.iter().zip(&ones) {
+                if (c as usize) < bins {
+                    want[c as usize] = want[c as usize].wrapping_add(v);
+                }
+            }
+            assert_eq!(sum.to_vec().unwrap(), want, "put_add n = {n}, bins {bins}");
+        }
+    }
+}

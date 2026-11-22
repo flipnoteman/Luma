@@ -1757,6 +1757,17 @@ struct Build<'a> {
     shared_w: Vec<Option<u32>>,
 }
 
+/// Elements every invocation of the private scatter loads before it adds any of them.
+///
+/// Measured on an RTX 3090 (histogram of 256 bins of 10M `f32`, 0.0632 ms with one element): 2
+/// elements 0.059, 4 0.058, 8 0.053 with the 1024 workgroups of the time, and 1 to 16 the same
+/// 0.0502 at the workgroups of `launch::PRIVATE_GROUPS`; 16 was slower where all the elements
+/// fall in one bin (0.083 against 0.077 ms).
+const PRIVATE_UNROLL: u32 = 4;
+/// The `f32` accumulators take one: their min and max are compare-and-exchange loops on workgroup
+/// memory, which four elements in flight made slower (`group_min` / `group_max` of 10M `f32` in
+/// 1000 groups on an RTX 3080 Laptop: 0.267 ms against 0.234).
+
 /// What a private accumulator starts as for `op` on elements of type `ty`, as bits (the merge
 /// skips the elements still holding it).
 fn seed_bits(ty: ElemTy, op: AtomicOp) -> u32 {
@@ -2230,14 +2241,27 @@ impl<'a> Build<'a> {
         });
         fb.barrier(BarrierScope::Workgroup);
         let (start, size, step) = (group * lu(fb, wg) + lx, fb.grid_size(0), nx * ny * lu(fb, wg));
-        fb.for_range("i", start, size, step, |b, i| {
-            let index = self.global(b, i);
-            let prog = self.program(b, i, index);
-            let j = self.value(b, &prog, slot as usize);
-            let value = self.value(b, &prog, stored as usize);
-            let j = b.let_val("j", j);
-            let inside = b.lt(j, lu(b, len));
-            b.if_then(inside, |b| b.atomic_rmw(None, atomic_op(op), scalar, shared_target(acc, j), value));
+        let last = size - lu(fb, 1);
+        let unroll = if scalar == ScalarTy::F32 { 1 } else { PRIVATE_UNROLL };
+        fb.for_range("i", start, size, step * lu(fb, unroll), |b, i| {
+            // The loads of all the elements come before the first atomic; elements past the end
+            // read the last one (no branch around the loads) and add nothing.
+            let mut elements = Vec::with_capacity(unroll as usize);
+            for k in 0..unroll {
+                let e = if k == 0 { i } else { b.let_val("e", i + step * lu(b, k)) };
+                let at = if k == 0 { e } else { b.let_val("ec", b.select(b.lt(e, size), e, last)) };
+                let index = self.global(b, at);
+                let prog = self.program(b, at, index);
+                let j = self.value(b, &prog, slot as usize);
+                let value = self.value(b, &prog, stored as usize);
+                let j = b.let_val("j", j);
+                let value = b.let_val("v", value);
+                elements.push((e, j, value));
+            }
+            for (e, j, value) in elements {
+                let inside = b.and(b.lt(e, size), b.lt(j, lu(b, len)));
+                b.if_then(inside, |b| b.atomic_rmw(None, atomic_op(op), scalar, shared_target(acc, j), value));
+            }
         });
         fb.barrier(BarrierScope::Workgroup);
         let target = self.env.outs.first().copied().unwrap_or(0);

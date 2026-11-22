@@ -2732,6 +2732,9 @@ pub(crate) struct JitState {
     fused: transpose::FusedCache,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
     stencils: BuildCache<String, Arc<KernelCore>>,
+    /// The kernels of `scan` (see [`JitState::scan_kernel`]) by what their source is made of, so
+    /// that a call does not generate and hash the source of a kernel it has run before.
+    scans: BuildCache<String, Arc<KernelCore>>,
     /// Kernels built as Kernel IR that are not keyed by a program of fused instructions
     /// (register loops, stencils; see [`JitState::module_kernel`]).
     modules: BuildCache<String, Arc<KernelCore>>,
@@ -2880,6 +2883,7 @@ impl JitState {
             fast_kernels: Mutex::new(FxMap::default()),
             fused: transpose::FusedCache::default(),
             stencils: BuildCache::default(),
+            scans: BuildCache::default(),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
             reductions: Mutex::new(Vec::new()),
@@ -3781,6 +3785,12 @@ impl JitState {
             self.stats.built.fetch_add(1, Ordering::Relaxed);
         }
         Ok(core)
+    }
+
+    /// The scan or reduction kernel whose WGSL `source` generates is a function of `key` alone:
+    /// `source` runs, and the kernel compiles, on first use of the key.
+    pub(crate) fn scan_kernel(&self, ctx: &Context, key: String, label: &str, source: impl FnOnce() -> String) -> Result<Arc<KernelCore>> {
+        self.scans.get_or_build(&key, || self.stencil_kernel(ctx, source(), label)).map(|(core, _)| core)
     }
 
     /// The kernel built as Kernel IR by `build`, compiled on first use; `key` names what the
