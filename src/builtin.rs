@@ -457,6 +457,34 @@ impl UnOp {
     }
 }
 
+/// `expr`, a WGSL expression of the 32-bit register of the small integer type `ty`, narrowed to
+/// the range of the type again (the wraparound of the arithmetic): a mask for the unsigned
+/// types, a shift up and an arithmetic shift back down for the signed ones.
+pub(crate) fn narrow_expr(ty: ElemTy, expr: &str) -> String {
+    match ty {
+        ElemTy::U8 => format!("(({expr}) & 255u)"),
+        ElemTy::U16 => format!("(({expr}) & 65535u)"),
+        ElemTy::I8 => format!("((({expr}) << 24u) >> 24u)"),
+        ElemTy::I16 => format!("((({expr}) << 16u) >> 16u)"),
+        _ => expr.to_owned(),
+    }
+}
+
+impl UnOp {
+    /// Whether the result of the operation on a small integer may leave the range of the type
+    /// (and is narrowed again, see [`narrow_expr`]).
+    pub(crate) fn widens(self) -> bool {
+        matches!(self, UnOp::Neg | UnOp::Abs | UnOp::BitNot | UnOp::Shl(_))
+    }
+}
+
+impl BinOp {
+    /// [`UnOp::widens`] for the binary operations.
+    pub(crate) fn widens(self) -> bool {
+        matches!(self, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Shl)
+    }
+}
+
 impl UnOp {
     /// [`UnOp::expr`] for elements of type `ty`, `None` if the operation does not exist for it
     /// (`f64` has the exact built-ins, `Df32` the library ones, see [`df_library`]).
@@ -471,7 +499,16 @@ impl UnOp {
                 UnOp::BitNot => Some("(x ^ 1u)"),
                 _ => None,
             },
-            ElemTy::I32 => match self {
+            // The result is narrowed again by the caller (`narrow_expr`).
+            ElemTy::U8 | ElemTy::U16 => match self {
+                UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Neg | UnOp::Abs => Some(match self {
+                    UnOp::Neg => "(0u - x)",
+                    UnOp::Abs => "x",
+                    _ => self.expr(),
+                }),
+                _ => None,
+            },
+            ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => match self {
                 UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
                 _ => None,
             },
@@ -617,6 +654,18 @@ impl BinOp {
                 BinOp::Shr => Some("x >> (bitcast<u32>(y) & 31u)"),
                 _ => None,
             },
+            // Narrowed again by the caller (`narrow_expr`); shift amounts are taken modulo the width.
+            ElemTy::U8 | ElemTy::U16 | ElemTy::I8 | ElemTy::I16 => {
+                let wide = ty.small_bits() == 16;
+                match self {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Min | BinOp::Max | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Some(self.expr()),
+                    BinOp::Shl if ty.is_small_signed() => Some(if wide { "x << (bitcast<u32>(y) & 15u)" } else { "x << (bitcast<u32>(y) & 7u)" }),
+                    BinOp::Shr if ty.is_small_signed() => Some(if wide { "x >> (bitcast<u32>(y) & 15u)" } else { "x >> (bitcast<u32>(y) & 7u)" }),
+                    BinOp::Shl => Some(if wide { "x << (y & 15u)" } else { "x << (y & 7u)" }),
+                    BinOp::Shr => Some(if wide { "x >> (y & 15u)" } else { "x >> (y & 7u)" }),
+                    _ => None,
+                }
+            }
             ElemTy::F32 => (!self.is_bitwise()).then(|| self.expr()),
             ElemTy::F64 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max | BinOp::Rem | BinOp::Atan2 => Some(self.expr()),

@@ -5206,6 +5206,42 @@ fn a_standardized_operand_counts_the_reductions_it_waits_for_as_buffers() {
     assert!(!super::is_recomputed(scaled.pending().expect("a lazy expression")));
 }
 
+#[test]
+fn column_statistics_of_compact_integers_are_recorded_in_one_kernel() {
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| {
+        tuning.axis_defer_weight = 0;
+        tuning.axis_defer_cells = 0;
+    })
+    .unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    for (dims, axis) in [([40usize, 300], 0usize), ([40, 300], 1), ([300, 7], 1)] {
+        let hostf: Vec<f32> = values(dims[0] * dims[1], 51, -2000.0, 2000.0).iter().map(|&v| (v as i16).into()).collect();
+        let host: Vec<i16> = hostf.iter().map(|&v| v as i16).collect();
+        let x = Array::from_slice_on(&ctx, &host, dims).unwrap();
+        let xf = Array::from_slice_on(&ctx, &hostf, dims).unwrap();
+        let (mean, var) = (x.mean_axis(axis), x.var_axis(axis));
+        let before = ctx.jit().stats();
+        let (m, v) = (bits(mean.to_vec().unwrap()), bits(var.to_vec().unwrap()));
+        let d = delta(before, ctx.jit().stats());
+        // The widening cast is computed inside the kernel that reduces, and the two reductions share it: on the CPU
+        // backend one kernel (a GPU backend may leave the variance's shifted operand to a kernel of its own).
+        assert_eq!(d.elementwise_launches, 2, "{dims:?} axis {axis}: only the two divisions: {d:?}");
+        if ctx.is_cpu() {
+            assert_eq!(d.reduce_launches, 1, "{dims:?} axis {axis}: {d:?}");
+        } else {
+            assert!((1..=3).contains(&d.reduce_launches), "{dims:?} axis {axis}: {d:?}");
+        }
+        // The same values as the `f32` array of the same numbers.
+        let (want_m, want_v) = (bits(xf.mean_axis(axis).to_vec().unwrap()), bits(xf.var_axis(axis).to_vec().unwrap()));
+        if ctx.is_cpu() {
+            assert_eq!((m, v), (want_m, want_v), "{dims:?} axis {axis}");
+        } else {
+            assert_close(&m.iter().map(|&b| f32::from_bits(b)).collect::<Vec<_>>(), &want_m.iter().map(|&b| f32::from_bits(b)).collect::<Vec<_>>(), 1e-4, 1e-4);
+        }
+    }
+}
+
 /// A triangle of a stored matrix is a select of the matrix and zero by a mask of coordinates: the
 /// elements of the zeroed half do not read the matrix.
 #[test]

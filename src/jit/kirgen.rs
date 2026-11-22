@@ -49,8 +49,8 @@ const NARROW_DIV: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
 pub(super) fn reg(ty: ElemTy) -> KirType {
     match ty {
         ElemTy::F32 => KirType::F32,
-        ElemTy::U32 | ElemTy::Bool => KirType::U32,
-        ElemTy::I32 => KirType::I32,
+        ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => KirType::U32,
+        ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => KirType::I32,
         ElemTy::F64 => KirType::Scalar(ScalarTy::F64),
         ElemTy::Df32 | ElemTy::C32 => KirType::vec(ScalarTy::F32, 2),
     }
@@ -62,9 +62,15 @@ pub(super) fn reg(ty: ElemTy) -> KirType {
 /// different invocations.
 pub(super) fn write_elem(ty: ElemTy) -> KirType {
     match ty {
-        ElemTy::Bool => KirType::Atomic(ScalarTy::U32),
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => KirType::Atomic(ScalarTy::U32),
         other => reg(other),
     }
+}
+
+/// The element type of a read-only storage buffer holding elements of `ty`: the words of a packed
+/// type, else the register type.
+pub(super) fn read_elem(ty: ElemTy) -> KirType {
+    if ty.is_small() { KirType::U32 } else { reg(ty) }
 }
 
 pub(super) fn lu(fb: &FnBuilder<'_>, v: u32) -> Val {
@@ -205,6 +211,9 @@ pub(super) struct Lower<'a> {
     /// Per input, the bindings of its segments (`in{k}_{s}`).
     pub(super) segs: Vec<Vec<u32>>,
     pub(super) outs: Vec<u32>,
+    /// Whether the small integer outputs are bound as plain words: the kernel writes them as whole
+    /// words (`Build::words`), so no atomics are needed to write or read them.
+    plain_words: bool,
     /// Pairs (input `k`, output `j`): input `k` is read from the output buffer `out{j}`.
     in_place: &'a [(u32, u32)],
     views: Vec<(ViewMap, Edge)>,
@@ -226,6 +235,7 @@ impl<'a> Lower<'a> {
             ins: Vec::new(),
             segs: Vec::new(),
             outs: Vec::new(),
+            plain_words: false,
             in_place,
             views: Vec::new(),
             view_fns: Vec::new(),
@@ -294,7 +304,7 @@ impl<'a> Lower<'a> {
                     (wide(0) + wide(1)) + wide(2)
                 }
                 ElemTy::Df32 | ElemTy::C32 => fb.compose(reg(ty), &[self.scalar(fb, k), self.scalar(fb, k + 1)]),
-                ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => self.scalar(fb, k),
+                ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => self.scalar(fb, k),
             },
             Ref::Tmp(k) => match f.t(k as usize) {
                 Some(v) => v,
@@ -369,6 +379,14 @@ impl<'a> Lower<'a> {
                 }
                 other => self.fail(fb, format!("{other:?} of a bool")),
             };
+        }
+        if matches!(ty, ElemTy::U8 | ElemTy::U16) {
+            // Unsigned: `abs` is the identity, `-x` wraps.
+            match op {
+                UnOp::Abs => return x,
+                UnOp::Neg => return lu(fb, 0) - x,
+                _ => {}
+            }
         }
         let float = |op: IrUnOp| fb.unary(op, x);
         let wide = ty == ElemTy::F64;
@@ -459,10 +477,10 @@ impl<'a> Lower<'a> {
                 other => self.fail(fb, format!("{other:?} of Df32 values")),
             };
         }
-        // A shift or rotation amount is taken modulo 32.
+        // A shift or rotation amount is taken modulo 32 (modulo the width of a small integer).
         let amount = |fb: &FnBuilder<'_>| {
-            let word = if ty == ElemTy::I32 { fb.bitcast(y, KirType::U32) } else { y };
-            word & lu(fb, 31)
+            let word = if matches!(ty, ElemTy::I32 | ElemTy::I8 | ElemTy::I16) { fb.bitcast(y, KirType::U32) } else { y };
+            word & lu(fb, if ty.is_small() { ty.small_bits() - 1 } else { 31 })
         };
         match op {
             BinOp::Add => x + y,
@@ -619,6 +637,64 @@ impl<'a> Lower<'a> {
             (ElemTy::Bool, ElemTy::Df32) => fb.compose(df, &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
             (ElemTy::Bool, ElemTy::C32) => fb.compose(reg(ElemTy::C32), &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
             _ if from == to => x,
+            _ if from.is_small() || to.is_small() => self.small_cast(fb, from, to, x),
+            _ => self.fail(fb, format!("cast {from:?} -> {to:?}")),
+        }
+    }
+
+    /// `v`, the 32-bit register of the small integer type `ty`, brought back into the range of the
+    /// type: the wraparound of the arithmetic (a mask for the unsigned types, a shift up and an
+    /// arithmetic shift back for the signed ones).
+    pub(super) fn narrow(&self, fb: &FnBuilder<'_>, ty: ElemTy, v: Val) -> Val {
+        match ty {
+            ElemTy::U8 => v & lu(fb, 0xff),
+            ElemTy::U16 => v & lu(fb, 0xffff),
+            ElemTy::I8 => fb.shr(fb.shl(v, lu(fb, 24)), lu(fb, 24)),
+            ElemTy::I16 => fb.shr(fb.shl(v, lu(fb, 16)), lu(fb, 16)),
+            _ => v,
+        }
+    }
+
+    /// A cast with a small integer at one end (see `codegen::small_cast`): widening goes by value,
+    /// narrowing wraps an integer and saturates a float (a NaN becomes 0).
+    fn small_cast(&self, fb: &mut FnBuilder<'_>, from: ElemTy, to: ElemTy, x: Val) -> Val {
+        let f64t = KirType::Scalar(ScalarTy::F64);
+        if to.is_small() {
+            let (lo, hi) = match to {
+                ElemTy::U8 => (0.0, 255.0),
+                ElemTy::I8 => (-128.0, 127.0),
+                ElemTy::U16 => (0.0, 65535.0),
+                _ => (-32768.0, 32767.0),
+            };
+            let float = match from {
+                ElemTy::F32 => Some(x),
+                ElemTy::F64 => Some(fb.convert(x, KirType::F32)),
+                ElemTy::Df32 => Some(fb.field(x, 0, KirType::F32) + fb.field(x, 1, KirType::F32)),
+                _ => None,
+            };
+            if let Some(f) = float {
+                let nan = self.classify(fb, Class::Nan, ElemTy::F32, f);
+                let clamped = fb.clamp(f, lf(fb, lo), lf(fb, hi));
+                let signed = to.is_small_signed();
+                let value = fb.float_to_int_sat(clamped, if signed { KirType::I32 } else { KirType::U32 });
+                return fb.select(fb.ne(nan, lu(fb, 0)), if signed { li(fb, 0) } else { lu(fb, 0) }, value);
+            }
+            let word = match from {
+                ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => fb.bitcast(x, KirType::U32),
+                _ => x,
+            };
+            let word = if to.is_small_signed() { fb.bitcast(word, KirType::I32) } else { word };
+            return self.narrow(fb, to, word);
+        }
+        match to {
+            ElemTy::U32 if from.is_small_signed() => fb.bitcast(x, KirType::U32),
+            ElemTy::U32 => x,
+            ElemTy::I32 if from.is_small_signed() => x,
+            ElemTy::I32 => fb.bitcast(x, KirType::I32),
+            ElemTy::Bool => fb.select(fb.ne(x, if from.is_small_signed() { li(fb, 0) } else { lu(fb, 0) }), lu(fb, 1), lu(fb, 0)),
+            ElemTy::F32 => fb.convert(x, KirType::F32),
+            ElemTy::F64 => fb.convert(x, f64t),
+            ElemTy::Df32 => fb.compose(reg(ElemTy::Df32), &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
             _ => self.fail(fb, format!("cast {from:?} -> {to:?}")),
         }
     }
@@ -629,6 +705,8 @@ impl<'a> Lower<'a> {
             ElemTy::U32 => coord,
             ElemTy::I32 => fb.bitcast(coord, KirType::I32),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => fb.convert(coord, KirType::F32),
+            ElemTy::U8 | ElemTy::U16 => self.narrow(fb, ty, coord),
+            ElemTy::I8 | ElemTy::I16 => self.narrow(fb, ty, fb.bitcast(coord, KirType::I32)),
             ElemTy::Bool => self.fail(fb, "a generator of bools"),
             ElemTy::C32 => self.fail(fb, "a generator of complex numbers"),
         }
@@ -691,6 +769,14 @@ impl<'a> Lower<'a> {
     pub(super) fn operation(&self, fb: &mut FnBuilder<'_>, op: Op, x: Val, y: Val, z: Val, index: Val) -> Option<Val> {
         let ty = op.ty;
         Some(match op.kind {
+            OpKind::Unary(u) if ty.is_small() => {
+                let v = self.unary(fb, u, ty, x);
+                if u.widens() { self.narrow(fb, ty, v) } else { v }
+            }
+            OpKind::Binary(b) if ty.is_small() => {
+                let v = self.binary(fb, b, ty, x, y);
+                if b.widens() { self.narrow(fb, ty, v) } else { v }
+            }
             OpKind::Unary(u) => self.unary(fb, u, ty, x),
             OpKind::Binary(b) => self.binary(fb, b, ty, x, y),
             OpKind::Compare(c) => self.compare(fb, c, ty, x, y),
@@ -726,7 +812,26 @@ impl<'a> Lower<'a> {
                 let word = fb.load(binding, j >> lu(fb, 5));
                 (word >> (j & lu(fb, 31))) & lu(fb, 1)
             }
+            small if small.is_small() => {
+                let j = bind(fb, "j", index);
+                let word = fb.load(binding, j >> lu(fb, small.small_shift()));
+                self.extract(fb, small, word, j)
+            }
             _ => fb.load(binding, index),
+        }
+    }
+
+    /// The register value of the small integer element `j` held by `word` (the word that holds
+    /// it): the field shifted down and zero-extended or sign-extended.
+    fn extract(&self, fb: &FnBuilder<'_>, ty: ElemTy, word: Val, j: Val) -> Val {
+        let bits = ty.small_bits();
+        let at = (j & lu(fb, 32 / bits - 1)) * lu(fb, bits);
+        match ty {
+            ElemTy::U8 | ElemTy::U16 => (word >> at) & lu(fb, (1 << bits) - 1),
+            _ => {
+                let up = fb.shl(word, lu(fb, 32 - bits) - at);
+                fb.shr(fb.bitcast(up, KirType::I32), lu(fb, 32 - bits))
+            }
         }
     }
 
@@ -738,6 +843,12 @@ impl<'a> Lower<'a> {
                 let j = bind(fb, "j", index);
                 let word = fb.atomic_load(storage_target(binding, j >> lu(fb, 5)), ScalarTy::U32);
                 (word >> (j & lu(fb, 31))) & lu(fb, 1)
+            }
+            small if small.is_small() => {
+                let j = bind(fb, "j", index);
+                let at = j >> lu(fb, small.small_shift());
+                let word = if self.plain_words { fb.load(binding, at) } else { fb.atomic_load(storage_target(binding, at), ScalarTy::U32) };
+                self.extract(fb, small, word, j)
             }
             _ => fb.load(binding, index),
         }
@@ -777,8 +888,25 @@ impl<'a> Lower<'a> {
                     |b| b.atomic_rmw(None, IrAtomicOp::And, ScalarTy::U32, target(), !m),
                 );
             }
+            small if small.is_small() => {
+                let bits = small.small_bits();
+                let j = fb.let_val("luma_j", index);
+                let shift = fb.let_val("luma_s", (j & lu(fb, 32 / bits - 1)) * lu(fb, bits));
+                let field = self.field_bits(fb, small, value);
+                let m = fb.let_val("luma_m", lu(fb, (1 << bits) - 1) << shift);
+                let word = j >> lu(fb, small.small_shift());
+                fb.atomic_rmw(None, IrAtomicOp::And, ScalarTy::U32, storage_target(binding, word), !m);
+                fb.atomic_rmw(None, IrAtomicOp::Or, ScalarTy::U32, storage_target(binding, word), field << shift);
+            }
             _ => fb.store(binding, index, value),
         }
+    }
+
+    /// The low bits of the register value `value` of the small integer type `ty`, as a `u32`: the
+    /// field it takes in a word of a buffer.
+    pub(super) fn field_bits(&self, fb: &FnBuilder<'_>, ty: ElemTy, value: Val) -> Val {
+        let word = if ty.is_small_signed() { fb.bitcast(value, KirType::U32) } else { value };
+        word & lu(fb, (1 << ty.small_bits()) - 1)
     }
 
     // ---- shifts ----
@@ -1835,6 +1963,8 @@ enum Variant {
     Runs,
     /// A store with `bool` outputs packed by the workgroup.
     Packed,
+    /// A store with 8-bit or 16-bit integer outputs, written as whole words.
+    Words,
     Plain,
 }
 
@@ -1971,10 +2101,12 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
     let mut mb = ModuleBuilder::new(key.label(), "main", [size, 1, 1]);
 
     // The bindings, in the order of the arguments of the launch.
+    build.env.plain_words = build.variant() == Variant::Words;
     for (j, &at) in build.outputs.iter().enumerate() {
         // An atomic scatter binds its target as atomics.
         let elem = match key.tail {
             Tail::ScatterAdd { .. } => KirType::Atomic(atomic_scalar(out_elem(at))),
+            _ if build.env.plain_words && out_elem(at).is_small() => KirType::U32,
             _ => write_elem(out_elem(at)),
         };
         build.env.outs.push(mb.add_storage_read_write(&format!("out{j}"), elem));
@@ -1986,10 +2118,10 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
             continue;
         }
         if !segmented || direct(&key.instrs, k as u32) {
-            build.env.ins[k] = Some(mb.add_storage_read(&format!("in{k}"), reg(ty)));
+            build.env.ins[k] = Some(mb.add_storage_read(&format!("in{k}"), read_elem(ty)));
         }
         for s in 0..slots(k) {
-            let binding = mb.add_storage_read(&format!("in{k}_{s}"), reg(ty));
+            let binding = mb.add_storage_read(&format!("in{k}_{s}"), read_elem(ty));
             build.env.segs[k].push(binding);
         }
     }
@@ -2062,6 +2194,9 @@ impl<'a> Build<'a> {
         }
         if key.tail == Tail::Store && key.writes_bits() {
             return Variant::Packed;
+        }
+        if key.pack_factor() > 1 {
+            return Variant::Words;
         }
         Variant::Plain
     }
@@ -2146,7 +2281,7 @@ impl<'a> Build<'a> {
                     self.shared.push(mb.add_shared(&format!("luma_bits{j}"), KirType::Atomic(ScalarTy::U32), words));
                 }
             }
-            Variant::Runs | Variant::Packed | Variant::Plain => {}
+            Variant::Runs | Variant::Packed | Variant::Words | Variant::Plain => {}
         }
     }
 
@@ -2158,6 +2293,7 @@ impl<'a> Build<'a> {
             Variant::StackStaged => self.stack_staged(fb),
             Variant::Runs => self.runs(fb),
             Variant::Packed => self.packed(fb),
+            Variant::Words => self.words(fb),
             Variant::Plain => self.plain(fb),
         }
     }
@@ -2311,6 +2447,71 @@ impl<'a> Build<'a> {
         self.emit_stores(fb, &prog, i);
         for (e, inside, prog) in &rest {
             fb.if_then(*inside, |b| self.emit_stores(b, prog, *e));
+        }
+    }
+
+    /// A store kernel with 8-bit or 16-bit integer outputs: invocation `w` computes the
+    /// `key.pack_factor()` consecutive elements `w * p ..` that make up whole words of every such
+    /// output and writes the words itself, so no two invocations write one word (the elements
+    /// past the end of the array contribute zeros, so the unused bytes of the last word are 0).
+    /// The other outputs are stored element by element. The program is written out once per
+    /// element, with all the loads before the first store, like a coarsened kernel's.
+    fn words(&self, fb: &mut FnBuilder<'_>) {
+        let p = self.key.pack_factor();
+        let w = element_index(fb, self.wg);
+        let size = fb.grid_size(0);
+        let first = fb.let_val("first", w * lu(fb, p));
+        let outside = fb.ge(first, size);
+        fb.if_then(outside, |b| b.ret(None));
+        let last = size - lu(fb, 1);
+        let mut elems = Vec::with_capacity(p as usize);
+        for k in 0..p {
+            let e = fb.let_val("e", first + lu(fb, k));
+            if k == 0 {
+                let index = self.global(fb, e);
+                elems.push((e, None, self.program(fb, e, index)));
+            } else {
+                let inside = fb.let_val("ok", fb.lt(e, size));
+                // Elements past the end read the last one, so that the loads need no branch.
+                let at = fb.let_val("ec", fb.select(inside, e, last));
+                let index = self.global(fb, at);
+                elems.push((e, Some(inside), self.program(fb, at, index)));
+            }
+        }
+        for (j, &at) in self.outputs.iter().enumerate() {
+            let ty = self.out_elem(at);
+            let out = self.env.outs[j];
+            if !ty.is_small() {
+                for (e, inside, prog) in &elems {
+                    let value = self.value(fb, prog, at);
+                    match inside {
+                        None => self.env.store(fb, ty, out, *e, value),
+                        Some(inside) => fb.if_then(*inside, |b| self.env.store(b, ty, out, *e, value)),
+                    }
+                }
+                continue;
+            }
+            let bits = ty.small_bits();
+            let per = 32 / bits;
+            for m in 0..p / per {
+                let mut word = lu(fb, 0);
+                for t in 0..per {
+                    let (_, inside, prog) = &elems[(m * per + t) as usize];
+                    let field = self.env.field_bits(fb, ty, self.value(fb, prog, at));
+                    let field = if t == 0 { field } else { field << lu(fb, bits * t) };
+                    let field = match inside {
+                        None => field,
+                        Some(inside) => fb.select(*inside, field, lu(fb, 0)),
+                    };
+                    word = word | field;
+                }
+                let word = fb.let_val("word", word);
+                let index = w * lu(fb, p / per) + lu(fb, m);
+                match &elems[(m * per) as usize].1 {
+                    None => fb.store(out, index, word),
+                    Some(inside) => fb.if_then(*inside, |b| b.store(out, index, word)),
+                }
+            }
         }
     }
 
@@ -2778,7 +2979,7 @@ pub(super) fn loop_module(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
         }
         inits = (0..count).map(|j| mb.add_storage_read(&format!("init{j}"), reg(state_elem))).collect();
         for (k, &ty) in key.input_tys.iter().enumerate() {
-            let binding = states.get(k).copied().flatten().is_none().then(|| mb.add_storage_read(&format!("in{k}"), reg(ty)));
+            let binding = states.get(k).copied().flatten().is_none().then(|| mb.add_storage_read(&format!("in{k}"), read_elem(ty)));
             env.ins.push(binding);
         }
         let mut fields: Vec<(String, KirType)> = vec![("steps".to_owned(), KirType::U32)];

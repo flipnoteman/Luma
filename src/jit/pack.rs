@@ -68,7 +68,7 @@ pub(super) fn read_packs(jit: &JitState, fused: &mut Fused) {
             // Read through a view or shift, which cannot be told to read the pack instead.
             let _ = input.detach();
         }
-        let window = if read_shifted || ty == ElemTy::Bool { None } else { input.window() };
+        let window = if read_shifted || ty.is_packed() { None } else { input.window() };
         let Some((pack, offset)) = window else {
             inputs.push(Arc::clone(input));
             tys.push(ty);
@@ -198,7 +198,7 @@ fn pack_leaves(ctx: &Context, leaves: Vec<(Arc<Storage>, ElemTy, bool)>, excess:
     type Kind = (usize, u64, ElemTy);
     let mut groups: FxMap<Kind, Vec<Arc<Storage>>> = FxMap::default();
     for (storage, ty, shifted) in leaves {
-        if !shifted && ty != ElemTy::Bool && storage.len() > 0 && storage.can_adopt() {
+        if !shifted && !ty.is_packed() && storage.len() > 0 && storage.can_adopt() {
             groups.entry((storage.len(), storage.layout().stride() as u64, ty)).or_default().push(storage);
         }
     }

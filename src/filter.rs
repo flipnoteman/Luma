@@ -273,6 +273,12 @@ impl<T: ScalarType> Array<T> {
     }
 
     fn run_filter(&self, mask: &Array<bool>) -> Outcome<Option<Array<T>>> {
+        if T::LAYOUT.is_packed() && !T::LAYOUT.is_bits() {
+            // Small integers are compacted as the words they widen to and narrowed again.
+            let location = Location::caller();
+            let kept = self.cast_at::<u32>(location).run_filter(mask)?;
+            return Ok(kept.map(|kept| kept.cast_at::<T>(location)));
+        }
         if T::LAYOUT.is_packed() {
             // Bits are compacted as words and compared with 0 afterwards.
             let words = self.cast_at::<u32>(Location::caller());
@@ -293,6 +299,11 @@ impl<T: ScalarType> Array<T> {
     }
 
     fn run_filter_padded(&self, mask: &Array<bool>, fill: T) -> Outcome<(Array<T>, Array<u32>)> {
+        if T::LAYOUT.is_packed() && !T::LAYOUT.is_bits() {
+            let location = Location::caller();
+            let (kept, count) = self.cast_at::<u32>(location).run_filter_padded(mask, bytemuck::cast::<_, u32>(fill.into_repr()))?;
+            return Ok((kept.cast_at::<T>(location), count));
+        }
         if T::LAYOUT.is_packed() {
             let fill = downcast::<T, bool>(fill).expect("only bool arrays are bit-packed");
             let words = self.cast_at::<u32>(Location::caller());

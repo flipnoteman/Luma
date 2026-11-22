@@ -53,7 +53,7 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 
 ## Features
 
-- Arrays of `f32`, `u32`, `i32`, `bool` (the result of comparisons, stored as one bit per element), `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; casts between `f32`, `u32` and `i32`; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
+- Arrays of `f32`, `u32`, `i32`, `u8`, `i8`, `u16`, `i16` (compact integers: 1 or 2 bytes per element, wrapping arithmetic, widening reductions), `bool` (the result of comparisons, stored as one bit per element), `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; casts between `f32`, `u32` and `i32`; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
 - `vec2`/`vec4` element types and `luma::fields!` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Views: `slice`, `pad`, `flip`, `transpose`, `swap_axes`, `permute_axes` (`ViewMut` `_mut` forms for writes), `take`, `put`, `concat`, `stack`, `broadcast_to`

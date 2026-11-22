@@ -34,6 +34,7 @@ pub(super) fn coarsenable(key: &FusedKey) -> bool {
         && key.spans.is_empty()
         && !key.outputs.is_empty()
         && !key.writes_bits()
+        && !key.writes_small()
 }
 
 /// The elements per invocation of the launch of `key` over `len` elements.
