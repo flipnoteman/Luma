@@ -481,13 +481,27 @@ fn calu_load(wp: usize, row: &str) -> String {
 
 /// First round of the tournament: workgroup `g` factors the rows `g * rc ..` of the panel (at least
 /// `w` of them) and writes the panel rows that won, in pivot order.
-fn calu_chunks_source(rows: usize, wp: usize, sg: bool) -> String {
+fn calu_chunks_source(rows: usize, wp: usize, fence: &str, sg: bool, single: bool) -> String {
+    // A panel of one chunk is done: the first round writes the factors and the permutation.
+    let (bindings, end) = if single {
+        (
+            "@group(1) @binding(2) var<storage, read_write> f: array<f32>;
+@group(1) @binding(3) var<storage, read_write> perm: array<u32>;
+@group(1) @binding(4) var<uniform> p: Params;",
+            calu_epilogue(wp, fence),
+        )
+    } else {
+        (
+            "@group(1) @binding(2) var<storage, read_write> win: array<u32>;
+@group(1) @binding(3) var<uniform> p: Params;",
+            "    if (t < w) { win[g * w + t] = piv[t]; }\n".to_string(),
+        )
+    };
     format!(
         "struct Params {{ m: u32, w: u32, g: u32, rc: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
 @group(1) @binding(1) var<uniform> av: LumaView;
-@group(1) @binding(2) var<storage, read_write> win: array<u32>;
-@group(1) @binding(3) var<uniform> p: Params;
+{bindings}
 fn ld(i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, 0u)]; }}
 
 {decl}
@@ -497,13 +511,46 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let w = p.w;
     let first = g * p.rc;
     let n = min(p.rc, p.m - first);
-{load}{lu}    if (t < w) {{ win[g * w + t] = piv[t]; }}
-}}
+{load}{lu}{end}}}
 ",
         decl = calu_declarations(rows, wp, sg),
         lane_arg = if sg { ", @builtin(subgroup_invocation_id) lane: u32" } else { "" },
         load = calu_load(wp, "first + t"),
         lu = calu_lu(wp, calu_parts(rows), "first + t", sg)
+    )
+}
+
+/// The end of a tournament panel, after its last LU: the factors of the winners are the top of `f`
+/// and the permutation is the winners on top, in order; the winners that were below the top take
+/// the places of the top rows that did not win, in order of both; the others stay.
+fn calu_epilogue(wp: usize, fence: &str) -> String {
+    format!(
+        "    for (var e = t; e < w * w; e = e + R) {{
+        let i = e / w;
+        f[e] = lu[i * {wp}u + e - i * w];
+    }}
+    for (var i = w + t; i < p.m; i = i + R) {{ perm[i] = i; }}
+    if (t < w) {{
+        perm[t] = piv[t];
+        var won = 0u;
+        for (var k = 0u; k < w; k = k + 1u) {{ if (piv[k] == t) {{ won = 1u; }} }}
+        wins[t] = won;
+    }}
+    workgroupBarrier();
+    if (t < w) {{
+        var lost_before = 0u;
+        var outside_before = 0u;
+        for (var k = 0u; k < t; k = k + 1u) {{
+            lost_before = lost_before + 1u - wins[k];
+            outside_before = outside_before + select(0u, 1u, piv[k] >= w);
+        }}
+        if (wins[t] == 0u) {{ lost[lost_before] = t; }}
+        rank[t] = outside_before;
+    }}
+    {fence}
+    workgroupBarrier();
+    if (t < w && piv[t] >= w) {{ perm[piv[t]] = lost[rank[t]]; }}
+",
     )
 }
 
@@ -542,37 +589,11 @@ fn main(@builtin(local_invocation_index) t: u32{lane_arg}) {{
         if (groups == 1u) {{ break; }}
         count = groups;
     }}
-    for (var e = t; e < w * w; e = e + R) {{
-        let i = e / w;
-        f[e] = lu[i * {wp}u + e - i * w];
-    }}
-    // The permutation: the winners on top, in order; the winners that were below the top take the
-    // places of the top rows that did not win, in order of both; the others stay.
-    for (var i = w + t; i < p.m; i = i + R) {{ perm[i] = i; }}
-    if (t < w) {{
-        perm[t] = piv[t];
-        var won = 0u;
-        for (var k = 0u; k < w; k = k + 1u) {{ if (piv[k] == t) {{ won = 1u; }} }}
-        wins[t] = won;
-    }}
-    workgroupBarrier();
-    if (t < w) {{
-        var lost_before = 0u;
-        var outside_before = 0u;
-        for (var k = 0u; k < t; k = k + 1u) {{
-            lost_before = lost_before + 1u - wins[k];
-            outside_before = outside_before + select(0u, 1u, piv[k] >= w);
-        }}
-        if (wins[t] == 0u) {{ lost[lost_before] = t; }}
-        rank[t] = outside_before;
-    }}
-    {fence}
-    workgroupBarrier();
-    if (t < w && piv[t] >= w) {{ perm[piv[t]] = lost[rank[t]]; }}
-}}
+{epilogue}}}
 ",
         decl = calu_declarations(rows, wp, sg),
         lane_arg = if sg { ", @builtin(subgroup_invocation_id) lane: u32" } else { "" },
+        epilogue = calu_epilogue(wp, fence),
         load = calu_load(wp, "panel_row"),
         lu = calu_lu(wp, calu_parts(rows), "panel_row", sg)
     )
@@ -673,12 +694,20 @@ fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'
     let wp = d.cols.next_multiple_of(8);
     let sg = ctx.tuning().subgroup32;
     let tail_groups = (d.rows - d.cols).div_ceil(CALU_TAIL) as u32;
-    let result = launch(ctx, &format!("lu_calu_chunks/{rows}/{wp}/{}", u8::from(sg)), "lu_calu_chunks", || calu_chunks_source(rows, wp, sg), [chunks as u32, 1, 1], &[view(a), (&mut win).into(), uniform(&params)])
-        .and_then(|()| {
-            let args: [KernelArg<'_>; 5] = [view(a), (&mut win).into(), (&mut f).into(), (&mut perm).into(), uniform(&params)];
-            launch(ctx, &format!("lu_calu_final/{rows2}/{wp}/{}/{}", fence.len(), u8::from(sg)), "lu_calu_final", || calu_final_source(rows2, wp, fence, sg), [1, 1, 1], &args)
+    let result = if chunks == 1 {
+        let args: [KernelArg<'_>; 4] = [view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)];
+        launch(ctx, &format!("lu_calu_single/{rows}/{wp}/{}/{}", fence.len(), u8::from(sg)), "lu_calu_single", || calu_chunks_source(rows, wp, fence, sg, true), [1, 1, 1], &args).and_then(|()| {
+            let args: [KernelArg<'_>; 4] = [view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)];
+            launch(ctx, &format!("lu_calu_tail/{wp}"), "lu_calu_tail", || calu_tail_source(wp), [tail_groups, 1, 1], &args)
         })
-        .and_then(|()| launch(ctx, &format!("lu_calu_tail/{wp}"), "lu_calu_tail", || calu_tail_source(wp), [tail_groups, 1, 1], &[view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)]));
+    } else {
+        launch(ctx, &format!("lu_calu_chunks/{rows}/{wp}/{}", u8::from(sg)), "lu_calu_chunks", || calu_chunks_source(rows, wp, fence, sg, false), [chunks as u32, 1, 1], &[view(a), (&mut win).into(), uniform(&params)])
+            .and_then(|()| {
+                let args: [KernelArg<'_>; 5] = [view(a), (&mut win).into(), (&mut f).into(), (&mut perm).into(), uniform(&params)];
+                launch(ctx, &format!("lu_calu_final/{rows2}/{wp}/{}/{}", fence.len(), u8::from(sg)), "lu_calu_final", || calu_final_source(rows2, wp, fence, sg), [1, 1, 1], &args)
+            })
+            .and_then(|()| launch(ctx, &format!("lu_calu_tail/{wp}"), "lu_calu_tail", || calu_tail_source(wp), [tail_groups, 1, 1], &[view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)]))
+    };
     Some(match result {
         Ok(()) => Lu { lu: f, perm },
         Err(e) => poisoned(e),
