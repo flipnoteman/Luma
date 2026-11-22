@@ -747,6 +747,8 @@ fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'
 
 /// Rows of the triangle a substitution leaf solves, and the most rows of a leaf's `L`.
 const LEAF: usize = 64;
+/// The most right-hand sides for which a subgroup per column solves a leaf (see [`leaf_vec_source`]).
+const VEC_LEAF_COLUMNS: usize = 16;
 
 #[derive(encase::ShaderType)]
 struct LeafParams {
@@ -814,6 +816,76 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
+/// The substitution leaf for a few right-hand sides on devices with subgroups of 32: a subgroup
+/// per column of `B`, the triangle (up to 64 rows) in workgroup memory, a row to a lane (two to
+/// the lanes of a subgroup), and the value of each row broadcast by a shuffle as it is known: a
+/// step of the substitution is a shuffle and a fused multiply-add, where one invocation per column
+/// (a single invocation for one right-hand side) takes a chain of 2000 of them.
+fn leaf_vec_source(unit: bool) -> String {
+    let mut body = String::new();
+    for half in 0..2 {
+        let (reg, rd) = if half == 0 { ("b0", "rd0") } else { ("b1", "rd1") };
+        for j in 0..32 {
+            let row = half * 32 + j;
+            let scale = if unit { String::new() } else { format!(" * subgroupShuffle({rd}, {j}u)") };
+            body += &format!("    {{\n        let xj = subgroupShuffle({reg}, {j}u){scale};\n        if (lane == {j}u && {row}u < n) {{ x[c + k * {row}u] = xj; }}\n");
+            if half == 0 {
+                body += &format!("        b0 = select(b0, fma(-ls[lane * 65u + {j}u], xj, b0), lane > {j}u);\n        b1 = fma(-ls[(lane + 32u) * 65u + {j}u], xj, b1);\n");
+            } else {
+                body += &format!("        b1 = select(b1, fma(-ls[(lane + 32u) * 65u + {row}u], xj, b1), lane > {j}u);\n");
+            }
+            body += "    }\n";
+        }
+    }
+    let mut load = String::new();
+    for e in 0..128 {
+        load += &format!(
+            "    {{
+        let idx = lane + {}u;
+        let i = idx / 64u;
+        let j = idx - i * 64u;
+        let ok = i < n && j < n && j <= i;
+        let v = l[select(0u, luma_view_idx3(lv, j, i, 0u), ok)];
+        ls[i * 65u + j] = select(0.0, v, ok);
+    }}
+",
+            e * 32
+        );
+    }
+    format!(
+        "struct Params {{ n: u32, k: u32 }}
+@group(1) @binding(0) var<storage, read> l: array<f32>;
+@group(1) @binding(1) var<uniform> lv: LumaView;
+@group(1) @binding(2) var<storage, read> b: array<f32>;
+@group(1) @binding(3) var<uniform> bv: LumaView;
+@group(1) @binding(4) var<storage, read_write> x: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+fn ldb(i: u32, c: u32) -> f32 {{ return b[luma_view_idx3(bv, c, i, 0u)]; }}
+
+var<workgroup> ls: array<f32, 4160>;
+
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32) {{
+    let n = p.n;
+    let k = p.k;
+    let c = wid.x;
+    var b0 = 0.0;
+    var b1 = 0.0;
+    if (lane < n) {{ b0 = ldb(lane, c); }}
+    if (lane + 32u < n) {{ b1 = ldb(lane + 32u, c); }}
+    var rd0 = 1.0;
+    var rd1 = 1.0;
+    if ({unit} == 0u) {{
+        if (lane < n) {{ rd0 = 1.0 / l[luma_view_idx3(lv, lane, lane, 0u)]; }}
+        if (lane + 32u < n) {{ rd1 = 1.0 / l[luma_view_idx3(lv, lane + 32u, lane + 32u, 0u)]; }}
+    }}
+{load}    workgroupBarrier();
+{body}}}
+",
+        unit = u8::from(unit)
+    )
+}
+
 /// `L X = B` for the `[n, n]` lower triangle `l` (`unit`: with ones on the diagonal, not read) and
 /// `[k, n]` right-hand sides `b`: leaves of [`LEAF`] rows by [`leaf_solve_source`], bigger triangles
 /// split about in half with a [`matmul_f32`] product, as in [`super::tri`].
@@ -835,7 +907,12 @@ fn solve_lower(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc
     let np = n.next_multiple_of(8);
     let params = LeafParams { n: n as u32, k: k as u32 };
     let args: [KernelArg<'_>; 4] = [view(l), view(b), (&mut x).into(), uniform(&params)];
-    match launch(ctx, &format!("lu_leaf_solve/{np}/{}", u8::from(unit)), "lu_leaf_solve", || leaf_solve_source(np, unit), [k.div_ceil(64) as u32, 1, 1], &args) {
+    let result = if k <= VEC_LEAF_COLUMNS && ctx.tuning().subgroup32 {
+        launch(ctx, &format!("lu_leaf_vec/{}", u8::from(unit)), "lu_leaf_vec", || leaf_vec_source(unit), [k as u32, 1, 1], &args)
+    } else {
+        launch(ctx, &format!("lu_leaf_solve/{np}/{}", u8::from(unit)), "lu_leaf_solve", || leaf_solve_source(np, unit), [k.div_ceil(64) as u32, 1, 1], &args)
+    };
+    match result {
         Ok(()) => x,
         Err(e) => fail(ctx, b.shape(), e, op, loc),
     }
@@ -1081,6 +1158,10 @@ fn solve_with(f: &Lu, b: &Array<f32>, op: &'static str, loc: &'static Location<'
 
 fn solve_matrix(f: &Lu, rhs: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
     let pb = gather_rows(rhs, &f.perm, loc);
+    if f.lu.shape().dims()[2] == 1 {
+        let y = solve_lower(&f.lu, &pb, true, op, loc);
+        return solve_lower(&f.lu.flip(0).flip(1), &y.flip(1), false, op, loc).flip(1);
+    }
     let y = lower_left(&f.lu, &pb, true, op, loc);
     lower_left(&f.lu.flip(0).flip(1), &y.flip(1), false, op, loc).flip(1)
 }
