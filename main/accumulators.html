@@ -1,0 +1,433 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Incremental accumulation - The Luma Guide</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="User guide for Luma, lazy GPU arrays for Rust on CUDA, Metal, wgpu and the CPU">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/versions-b71651b3.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-732ff444.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Luma Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/flipnoteman/Luma" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/flipnoteman/Luma/edit/main/guide/src/accumulators.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="incremental-accumulation"><a class="header" href="#incremental-accumulation">Incremental accumulation</a></h1>
+<p>Data that arrives in batches over time (a training loop’s activations, a sensor, a simulation’s
+diagnostics, a log of metrics) rarely fits in memory at once, and its size is not known up front.
+An <em>accumulator</em> folds every batch into a small <strong>state</strong> on the GPU, as the batch arrives, and
+turns the state into results (a mean, a variance, a histogram, the <code>k</code> largest values, …) at
+any time. The batches are never kept; the states of two accumulators merge, so runs on several
+threads, devices or machines combine afterwards; and a state is a few bytes you can write to a
+file.</p>
+<p>The accumulators are general building blocks: statistics, machine-learning metrics, logging
+and signal analysis all use the same few.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>State</th><th>Results</th></tr>
+</thead>
+<tbody>
+<tr><td>[<code>Accumulator</code>]</td><td>count, sum, mean, variance, skewness, kurtosis, min, max, their global indices</td><td>per position along chosen axes, or of the whole batch; of masked elements; per group label</td></tr>
+<tr><td>[<code>CoMoments</code>]</td><td>two streams: both means and variances and the sum of products</td><td>covariance, correlation, slope, per position</td></tr>
+<tr><td>[<code>Covariance</code>]</td><td>the features of one stream: mean and sums of products</td><td>covariance and correlation matrix</td></tr>
+<tr><td>[<code>Histogram</code>], [<code>Histogram2d</code>]</td><td>counts in fixed bins of one stream or of two jointly</td><td>counts, marginals, entropy, mutual information</td></tr>
+<tr><td>[<code>TopK</code>]</td><td>the <code>k</code> largest or smallest values and where they came from</td><td>values and global indices</td></tr>
+</tbody>
+</table>
+</div>
+<p>Every accumulator has the same surface: <code>push</code> folds a batch in (nothing is read back from the
+device; the work is recorded like any other luma operation, and a batch that is a lazy
+expression such as <code>(&amp;x - &amp;y).abs()</code> is computed <em>inside</em> the accumulation kernel, never stored),
+<code>merge(&amp;other)</code> adds another accumulator’s state, <code>reset()</code> clears it, <code>to_bytes()</code> and
+<code>from_bytes()</code> write and read the state, and result methods return lazy arrays.</p>
+<h2 id="per-feature-statistics"><a class="header" href="#per-feature-statistics">Per-feature statistics</a></h2>
+<p>Batches of <code>rows</code> samples of <code>features</code> features are <code>[features, rows]</code> arrays (axis 0 is the
+fast one, see the <a href="data.html">matrices chapter</a>); folding axis 1 keeps one state per feature:</p>
+<pre><code class="language-rust">use luma::*;
+
+let acc = Accumulator::&lt;Df32&gt;::builder(Fold::axis(1)).moments(2).sum().min_max().build()?;
+for step in 0..10 {
+    // 4 features, 100 rows per batch; feature f is f * 10 + step noise.
+    let data: Vec&lt;f32&gt; = (0..400).map(|i| (i % 4) as f32 * 10.0 + ((i / 4 + step) % 7) as f32).collect();
+    acc.push(&amp;Array::from_slice(&amp;data, [4, 100])?)?;
+}
+let mean = acc.mean()?.to_f32().to_vec()?;   // [4]
+let var = acc.var()?.to_f32().to_vec()?;     // population variance, [4]
+assert_eq!(acc.samples_seen(), 1000);
+assert!((mean[2] - 23.0).abs() &lt; 0.1);
+assert!(var.iter().all(|v| *v &gt; 3.5 &amp;&amp; *v &lt; 4.5));
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;acc.count()?)?, vec![1000.0; 4]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>Fold::all()</code> folds every element of the batch into one stream; <code>Fold::axes(&amp;[0, 1])</code> folds
+several axes (an image batch per channel). The results have extent 1 along the folded axes, as
+<code>mean_axis</code> does.</p>
+<p>Results are arrays of the <em>wide</em> type of the state, <code>Df32</code> or <code>f64</code> (see Precision below):
+<code>.to_f32()</code> rounds them, and [<code>Accumulator::to_f64</code>] reads exact values on the host.
+A count of <code>2^24 + 3</code> samples is exact; a plain <code>f32</code> count stops at <code>2^24</code>.</p>
+<p>The builder chooses what is tracked, so that you pay only for it: <code>moments(order)</code> (1 mean, 2
+variance, 3 skewness, 4 kurtosis; every order is one more reduction in the pass over the
+batch), <code>sum()</code>, <code>min()</code>, <code>max()</code>, <code>argmin()</code>, <code>argmax()</code>. Indices are <em>global sample
+indices</em>: the position of the sample in the stream of everything pushed (and, after a merge,
+of this accumulator’s samples followed by the other’s).</p>
+<h2 id="masks-nan-and-groups"><a class="header" href="#masks-nan-and-groups">Masks, NaN and groups</a></h2>
+<p><code>push_where(&amp;batch, &amp;mask)</code> folds in the elements where the <code>bool</code> mask is true.
+<code>NanPolicy::Skip</code> leaves NaN elements out of every statistic; with the default
+<code>NanPolicy::Propagate</code> a NaN (or infinity) in a position’s stream makes its mean and variance NaN
+for good, and its extrema unspecified (backends differ in what <code>min</code> of a NaN gives).</p>
+<p><code>groups(n)</code> keeps a state per group label and position, and <code>push_grouped(&amp;batch, &amp;labels)</code>
+folds a batch into all of them in one pass: <code>labels</code> is a <code>u32</code> array with one label per sample
+(per element when the whole batch is folded); labels of <code>n</code> or more are skipped. The results have
+<code>n</code> entries along the first folded axis: per-class means of every feature:</p>
+<pre><code class="language-rust">use luma::*;
+
+let acc = Accumulator::&lt;Df32&gt;::builder(Fold::axis(1)).groups(3).build()?;
+// 2 features, 6 samples; classes 0, 1, 2, 0, 1, 2.
+let x = Array::from_slice(&amp;[1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0, 6.0, 60.0], [2, 6])?;
+let labels = Array::from_slice(&amp;[0u32, 1, 2, 0, 1, 2], 6)?;
+acc.push_grouped(&amp;x, &amp;labels)?;
+// Shape [2, 3]: feature f of class g at f + 2 g.
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;acc.mean()?)?, vec![2.5, 25.0, 3.5, 35.0, 4.5, 45.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="merging-and-serializing"><a class="header" href="#merging-and-serializing">Merging and serializing</a></h2>
+<p>States merge exactly as if the other’s samples had been pushed after this accumulator’s. The
+merge is Chan et al.’s pairwise update, so it does not matter how the data was split or in which
+order the partial states are combined (to the rounding of the wide type):</p>
+<pre><code class="language-rust">use luma::*;
+
+let (a, b) = (Accumulator::&lt;Df32&gt;::new(Fold::all()), Accumulator::&lt;Df32&gt;::new(Fold::all()));
+a.push(&amp;Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?)?;
+b.push(&amp;Array::from_slice(&amp;[4.0f32, 5.0], 2)?)?;
+// `b` could be on another thread, another device or another machine: its state is a byte string.
+let shipped = b.to_bytes()?;
+a.merge(&amp;Accumulator::&lt;Df32&gt;::from_bytes(&amp;shipped)?)?;
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;a.mean()?)?, vec![3.0]);
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;a.var()?)?, vec![2.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>An accumulator is <code>Sync</code>: <code>push</code>, <code>merge</code> and the results take <code>&amp;self</code>, so threads can share one
+(pushes from several threads fold in some order) or each keep their own and merge at the end.
+Merging with an accumulator on another device goes through the host. The bytes are the same for
+both wide types (every value is stored as an <code>f64</code>), so an <code>f64</code> state written on one machine
+is read by a <code>Df32</code> accumulator on another.</p>
+<h2 id="histograms-joint-histograms-and-information"><a class="header" href="#histograms-joint-histograms-and-information">Histograms, joint histograms and information</a></h2>
+<p><code>Histogram::new(bins, lo, hi)</code> counts in equal-width bins over <code>[lo, hi]</code> (the top edge belongs
+to the last bin); values below, above and NaN are counted aside ([<code>Histogram::outliers</code>]).
+<code>Histogram::with_fold</code> keeps one histogram per position. <code>Histogram2d</code> counts pairs of two
+streams jointly, and derives the marginals and the information measures that need only the
+joint counts as lazy <code>f32</code> arrays:</p>
+<pre><code class="language-rust">use luma::*;
+
+let joint = Histogram2d::&lt;Df32&gt;::new((2, 2), (0.0, 1.0), (0.0, 1.0))?;
+// Two streams that always agree: all the counts are on the diagonal.
+let x = Array::from_slice(&amp;[0.1f32, 0.2, 0.8, 0.9], 4)?;
+joint.push(&amp;x, &amp;x)?;
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;joint.counts()?)?, vec![2.0, 0.0, 0.0, 2.0]);
+let mi = joint.mutual_information()?.item()?;
+assert!((mi - std::f32::consts::LN_2).abs() &lt; 1e-6); // one bit
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="top-k"><a class="header" href="#top-k">Top-k</a></h2>
+<p><code>TopK::largest(k)</code> (and <code>smallest</code>) keeps the <code>k</code> best values of the whole stream with their
+global indices; the pushes of up to 16 batches are sorted together and merged with the state’s
+<code>k</code> entries. Ties go to the earlier element; NaN and masked elements are never selected.</p>
+<pre><code class="language-rust">use luma::*;
+
+let top = TopK::&lt;f32, Df32&gt;::largest(2);
+top.push(&amp;Array::from_slice(&amp;[0.5f32, 9.0, 3.0], 3)?)?;
+top.push(&amp;Array::from_slice(&amp;[7.0f32, 1.0], 2)?)?;
+assert_eq!(top.values()?.to_vec()?, vec![9.0, 7.0]);
+assert_eq!(TopK::&lt;f32, Df32&gt;::to_f64(&amp;top.indices()?)?, vec![1.0, 3.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>TopK::largest_along(k, axis)</code> keeps the best <code>k</code> of every line along an axis instead, per
+feature for <code>[features, rows]</code> batches with <code>axis</code> 1: the results have <code>k</code> entries along the axis
+and the indices are <em>sample</em> indices along it. It costs <code>k</code> passes of an argmax over the batch
+(the elements chosen so far are masked out inside the pass), so <code>k</code> is at most 32:</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two features; the best two rows of each.
+let top = TopK::&lt;i32, Df32&gt;::largest_along(2, 1)?;
+top.push(&amp;Array::from_slice(&amp;[1i32, 50, 9, 20, 4, 30], [2, 3])?)?;
+top.push(&amp;Array::from_slice(&amp;[7i32, 10], [2, 1])?)?;
+// Shape [2, 2]: rank j of feature f at f + 2 j.
+assert_eq!(top.values()?.to_vec()?, vec![9, 50, 7, 30]);
+assert_eq!(TopK::&lt;i32, Df32&gt;::to_f64(&amp;top.indices()?)?, vec![1.0, 0.0, 3.0, 2.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="covariance"><a class="header" href="#covariance">Covariance</a></h2>
+<p>[<code>CoMoments</code>] folds two streams <code>x</code> and <code>y</code> of one shape (per position, like <code>Accumulator</code>);
+[<code>Covariance</code>] folds the features of one stream against each other: a batch is a
+<code>[features, samples]</code> array and the state is the mean and the <code>features x features</code> matrix of
+sums of products. A push is one full-precision <code>f32</code> matrix product of the centered batch with
+itself (never TF32), and the state is merged in <code>Df32</code> or <code>f64</code>:</p>
+<pre><code class="language-rust">use luma::*;
+
+let cov = Covariance::&lt;Df32&gt;::new();
+// 2 features: the second is twice the first.
+cov.push(&amp;Array::from_slice(&amp;[1.0f32, 2.0, 2.0, 4.0, 3.0, 6.0], [2, 3])?)?;
+cov.push(&amp;Array::from_slice(&amp;[4.0f32, 8.0], [2, 1])?)?;
+let c = Accumulator::&lt;Df32&gt;::to_f64(&amp;cov.cov()?)?;
+assert!((c[0] - 1.25).abs() &lt; 1e-6 &amp;&amp; (c[1] - 2.5).abs() &lt; 1e-6 &amp;&amp; (c[3] - 5.0).abs() &lt; 1e-6);
+let r = Accumulator::&lt;Df32&gt;::to_f64(&amp;cov.corr()?)?;
+assert!((r[1] - 1.0).abs() &lt; 1e-6);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="precision"><a class="header" href="#precision">Precision</a></h2>
+<p>A pushed batch is reduced in <code>f32</code> <em>relative to a pivot</em>: the running mean of the state (the
+first element of the first batch before there is a mean). The sums of <code>x - pivot</code> are small and
+their rounding errors small, however far from zero the data is; the sums are then added into
+a state kept in <code>Df32</code> (about 48 bits of mantissa, runs on every device, the default) or <code>f64</code>
+(CUDA and the CPU backend; <code>Accumulator::&lt;f64&gt;</code>). The count, the merge arithmetic and the sum
+therefore do not lose digits over <code>1e9</code> samples, and <code>f64</code> data with a huge offset keeps its
+variance (<code>1e9 + 1e-2 * noise</code> has a variance within <code>1e-3</code> of the exact one, where a plain sum
+of squares has none).</p>
+<p>What <code>f32</code> rounding remains is that of the <em>batch’s</em> reduction, a few units in the last place
+of the spread of the data. <code>.precise()</code> runs the pass in the wide type instead, which makes
+the sums as exact as the state (at the cost of the wide arithmetic over the batch). It folds the
+whole batch only (<code>Fold::all()</code>): <code>Df32</code> and <code>f64</code> arrays have no reductions along an axis, so per-position
+states use the default pass. Integer
+batches are exact in counts, sums and extrema while <code>|x - pivot|</code> and the batch’s partial sums
+stay below <code>2^24</code> (a <code>precise</code> pass is exact for all of <code>u32</code> and <code>i32</code>).</p>
+<p>A state of data whose mean drifts far during the stream keeps its accuracy: the pivot follows the
+mean at every merge of the recorded pushes.</p>
+<h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
+<p><code>push</code> records one reduction kernel over the batch; the reductions of up to
+<code>flush_every(n)</code> pushes (default 16) are then merged into the state in one more small kernel,
+so a push is about 1.6 launches. The cost is the batch’s memory traffic, and the batches never
+need to be kept: an <code>[4096, 256]</code> batch per push (4 MiB) runs at about 330 GB/s on an RTX 3090
+(CUDA), with computing the same statistics once from the concatenated array (which needs all the
+batches in memory) at about 790 GB/s; luma-bench’s <code>accum</code> suite and <code>tools/afcompare</code>’s <code>accum</code>
+group measure both and ArrayFire’s equivalent.</p>
+<ul>
+<li>Several statistics of one batch share the pass only if they are reductions over the same
+lines: asking for <code>min_max()</code> or higher moments adds passes (kurtosis and extrema together are
+about 3.5 passes’ worth).</li>
+<li>A batch that is an expression of other arrays is computed inside the pass (see the example
+above), so it costs no extra reads.</li>
+<li>Batches larger than one device buffer are processed in pieces.</li>
+<li><code>flush_every</code> trades launches for memory: pushes between merges keep their batches alive.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="vision-descriptors.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="environment.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="vision-descriptors.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="environment.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="theme/versions-85bad2c7.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

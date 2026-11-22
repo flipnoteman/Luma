@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-73370195.js";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a2c80e88.js"></script>
+        <script src="toc-732ff444.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -237,6 +237,7 @@ location of the operation that failed.</li>
 <li><a href="#arrays">Arrays</a>: creation, element types, casts, elementwise math, shapes, broadcasting, reading back.</li>
 <li><a href="#lazy-evaluation-and-fusion">Lazy evaluation and fusion</a>: when kernels run, <code>eval</code>, <code>flush</code>, <code>sync</code>, <code>cache</code>.</li>
 <li><a href="#matrices-statistics-and-grouping">Matrices, statistics and grouping</a>: <code>matmul</code>, axis statistics, scatter-add, histograms, sort, group-by, quantiles.</li>
+<li><a href="#sparse-matrices">Sparse matrices</a>: <code>Sparse</code> in CSR, CSC and COO, conversions, sparse-dense products, elementwise operations.</li>
 <li><a href="#worked-examples">Worked examples</a>: heat equation, Euler solver, ML-KEM, CPA.</li>
 <li><a href="#environment-variables">Environment variables</a> and the <a href="#faq-and-troubleshooting">FAQ</a> when something does not behave.</li>
 </ul>
@@ -281,14 +282,16 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 <tr><td><code>f32</code></td><td>the default float; every operation</td></tr>
 <tr><td><code>u32</code></td><td>indices, counters, <a href="#integer-and-bit-operations">bit operations</a></td></tr>
 <tr><td><code>i32</code></td><td>signed integers, <a href="#signed-integers-and-casts">casts</a></td></tr>
+<tr><td><code>u8</code>, <code>i8</code>, <code>u16</code>, <code>i16</code></td><td>compact integers, 1 or 2 bytes per element, wrapping arithmetic (<a href="#compact-integers-u8-i8-u16-i16">Compact integers</a>)</td></tr>
 <tr><td><code>bool</code></td><td>the result of comparisons: a boolean per element (<a href="#comparisons-booleans-and-select">booleans</a>)</td></tr>
 <tr><td><code>Df32</code></td><td>double-float, about 48 bits of mantissa, runs on every device (<a href="#precision-1">Precision</a>)</td></tr>
 <tr><td><code>f64</code></td><td>64-bit float, only on devices with <code>SHADER_F64</code> (CUDA, the CPU backend, some Vulkan GPUs; not Metal)</td></tr>
+<tr><td><code>C32</code></td><td>complex <code>f32</code> (<code>re</code>, <code>im</code>), runs on every device, the element of the FFTs (<a href="#complex-numbers">Complex numbers</a>)</td></tr>
 </tbody>
 </table>
 </div>
 <p><code>[f32; 2]</code> / <code>[f32; 4]</code> / <code>[u32; 2]</code> / <code>[u32; 4]</code> (<code>vec2</code> / <code>vec4</code>) element types exist for custom kernels, and <a href="#records">records</a> group several
-arrays behind one struct. The built-in operations exist for <code>f32</code>, <code>u32</code>, <code>i32</code>, <code>Df32</code> and <code>f64</code>
+arrays behind one struct. The built-in operations exist for <code>f32</code>, <code>u32</code>, <code>i32</code>, <code>u8</code>, <code>i8</code>, <code>u16</code>, <code>i16</code>, <code>Df32</code>, <code>f64</code> and <code>C32</code>
 (the <em>scalar</em> types); what each type supports is listed in the chapters named in the table.</p>
 <h3 id="booleans"><a class="header" href="#booleans">Booleans</a></h3>
 <p><code>bool</code> is an element type: comparisons and <code>is_nan</code> / <code>is_finite</code> / <code>is_inf</code> produce <code>Array&lt;bool&gt;</code>,
@@ -335,10 +338,12 @@ operation.</p>
 <tr><td><code>bool</code></td><td><code>to_u32</code>, <code>to_i32</code>, <code>to_f32</code>, <code>to_f64</code>, <code>to_df32</code></td><td>1 where true, 0 where false</td></tr>
 <tr><td><code>f32</code></td><td><code>to_f64</code>, <code>to_df32</code></td><td>exact (<code>to_f64</code> needs <code>SHADER_F64</code>)</td></tr>
 <tr><td><code>f64</code>, <code>Df32</code></td><td><code>to_f32</code>, <code>to_df32</code> / <code>to_f64</code></td><td>rounds to <code>f32</code>; <code>f64</code> to <code>Df32</code> is exact to 48 bits</td></tr>
+<tr><td><code>u8</code>, <code>i8</code>, <code>u16</code>, <code>i16</code></td><td><code>to_f32</code>, <code>to_f64</code>, <code>to_df32</code>, <code>to_u32</code>, <code>to_i32</code>, <code>to_bool</code> and the other three</td><td>by value (<a href="#casts-2">Compact integers</a>)</td></tr>
+<tr><td>every type but itself</td><td><code>to_u8</code>, <code>to_i8</code>, <code>to_u16</code>, <code>to_i16</code></td><td>integers wrap (the low bits), floats saturate and NaN is 0</td></tr>
 </tbody>
 </table>
 </div>
-<p>There is no cast to <code>bool</code>: write a comparison (<code>x.ne(0u32)</code>). A cast pair not in the table does
+<p>There is no cast to <code>bool</code> from the 32-bit types: write a comparison (<code>x.ne(0u32)</code>); the compact integers have <code>to_bool</code>. A cast pair not in the table does
 not exist, so a type mix-up is a compile error rather than a silent conversion.</p>
 <pre><code class="language-rust">use luma::*;
 
@@ -351,7 +356,7 @@ let k = Array::from_slice(&amp;[0u32, 1, 2], 3)?;
 assert_eq!((&amp;x * k.to_f32()).to_vec()?, vec![0.0, 2.0, 6.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="elementwise-operations"><a class="header" href="#elementwise-operations">Elementwise operations</a></h2>
-<p>Operators <code>+ - * /</code> (and <code>%</code> on integers, unary <code>-</code> on floats and <code>i32</code>) take references or
+<p>Operators <code>+ - * /</code> (and <code>%</code>, unary <code>-</code> on floats and <code>i32</code>) take references or
 values, arrays or scalars, and exist in compound forms (<code>+=</code>). Methods cover the rest; they are all
 lazy and fuse:</p>
 <div class="table-wrapper">
@@ -360,16 +365,21 @@ lazy and fuse:</p>
 <tr><th>Type</th><th>Methods</th></tr>
 </thead>
 <tbody>
-<tr><td><code>f32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>abs</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>log1p</code>, <code>expm1</code>; <code>powf(exponent)</code>, <code>clamp(lo, hi)</code> (host scalars); <code>atan2(x)</code>, <code>hypot(other)</code>, <code>copysign(sign)</code> (array or scalar)</td></tr>
-<tr><td><code>f64</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code></td></tr>
+<tr><td><code>f32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>abs</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>tanh</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>, <code>log1p</code>, <code>expm1</code>, <code>asin</code>, <code>acos</code>, <code>atan</code>, <code>sinh</code>, <code>cosh</code>, <code>asinh</code>, <code>acosh</code>, <code>atanh</code>, <code>pow2</code>, <code>log2</code>, <code>log10</code>, <code>rsqrt</code>, <code>cbrt</code>, <code>erf</code>, <code>erfc</code>, <code>lgamma</code>, <code>tgamma</code>, <code>sigmoid</code>; <code>powf(exponent)</code> (host scalar), <code>pow(exponent)</code> and <code>root(n)</code> (array or scalar), <code>rpow(base)</code> (<code>base^self</code>), <code>clamp(lo, hi)</code> (array or scalar bounds), <code>atan2(x)</code>, <code>hypot(other)</code>, <code>copysign(sign)</code> (array or scalar)</td></tr>
+<tr><td><code>f64</code></td><td><code>sqrt</code>, <code>abs</code>, <code>sign</code>, <code>floor</code>, <code>ceil</code>, <code>trunc</code>, <code>round</code>; on the CUDA and CPU backends also every <code>f32</code> math function above, <code>atan2</code>, <code>hypot</code>, <code>copysign</code>, <code>pow</code>, <code>powf</code>, <code>root</code>, <code>clamp</code> (WGSL has no <code>f64</code> math: on wgpu they poison the result with <code>Unsupported</code>)</td></tr>
 <tr><td><code>Df32</code></td><td><code>sqrt</code>, <code>exp</code>, <code>ln</code>, <code>tanh</code>, <code>abs</code>, <code>log1p</code>, <code>expm1</code>, <code>powf(Df32)</code> (<a href="#precision-1">Precision</a>)</td></tr>
+<tr><td><code>C32</code></td><td><code>conj</code>, <code>exp</code>, <code>sqrt</code>; <code>real</code>, <code>imag</code>, <code>abs</code>, <code>arg</code>, <code>norm_sqr</code> (to <code>f32</code>); <code>from_parts</code>, <code>from_polar</code> (<a href="#complex-numbers">Complex numbers</a>)</td></tr>
 <tr><td><code>i32</code></td><td><code>abs</code>, <code>sign</code>, <code>shl</code>, <code>shr</code>; bit operators <code>&amp; | ^ !</code> (<a href="#signed-integers-and-casts">Signed integers</a>)</td></tr>
 <tr><td><code>u32</code></td><td>bit operations, <code>shl</code>, <code>shr</code>, <code>rotate_left</code>, <code>rotate_right</code> (<a href="#integer-and-bit-operations">Integers</a>)</td></tr>
-<tr><td>every scalar type</td><td><code>minimum(rhs)</code>, <code>maximum(rhs)</code>, <code>lt</code> <code>le</code> <code>gt</code> <code>ge</code> <code>eq</code> <code>ne</code> (booleans), <code>select(&amp;cond, a, b)</code></td></tr>
+<tr><td><code>f32</code>, <code>f64</code>, <code>i32</code>, <code>u32</code></td><td><code>modulo(rhs)</code>: the remainder with the sign of the divisor (ArrayFire’s <code>mod</code>; <code>%</code> is C’s remainder, with the sign of the dividend); <code>clamp(lo, hi)</code> for <code>i32</code> and <code>u32</code></td></tr>
+<tr><td>every scalar type</td><td><code>is_zero()</code>, <code>minimum(rhs)</code>, <code>maximum(rhs)</code>, <code>lt</code> <code>le</code> <code>gt</code> <code>ge</code> <code>eq</code> <code>ne</code> (booleans), <code>select(&amp;cond, a, b)</code></td></tr>
 </tbody>
 </table>
 </div>
-<p><code>atan2(x)</code> is <code>atan2(self, x)</code> with <code>self</code> the <code>y</code>. The right-hand side of <code>minimum</code>, the comparisons and the
+<p><code>atan2(x)</code> is <code>atan2(self, x)</code> with <code>self</code> the <code>y</code>. <code>erf</code>, <code>erfc</code>, <code>lgamma</code>, <code>tgamma</code> and <code>cbrt</code> of <code>f32</code> are written in WGSL and
+run the same code on every backend (<code>erf</code> and <code>erfc</code> within a few <code>1e-7</code> relative, <code>tgamma</code> and <code>lgamma</code> within about <code>1e-5</code>
+relative, <code>lgamma</code> within <code>4e-6</code> absolute near its zeros at 1 and 2); <code>f64</code> uses the backend’s own libm
+(libdevice on CUDA). The right-hand side of <code>minimum</code>, the comparisons and the
 <code>try_</code> methods is an <code>Operand</code>: an array or reference to one (equal shapes, or extents of 1 that
 broadcast), a host value, or a <a href="#scalars-that-change"><code>Scalar</code></a> handle.</p>
 <pre><code class="language-rust">use luma::*;
@@ -565,7 +575,7 @@ that would exceed <code>LUMA_FUSION_MAX_INLINED</code> is cut whatever the model
 and your own kernels. They read the arrays they are given, which are computed first.
 <code>matmul</code>, <code>solve_tridiagonal</code> / <code>solve_tridiagonal_parts</code> / <code>solve_block_tridiagonal_parts</code>, the axis reductions (<code>sum_axis</code>, <code>reduce_axis</code>, <code>argmax_axis</code>, …), the scatters (<code>put_add</code>, …) and
 the sorts are kernels of their own too, but they compute a pending operand <em>inside</em> their loads
-instead of storing it, and <code>matmul</code>, the line solves, the axis reductions and the sorts are eager: the result is
+instead of storing it, and <code>matmul</code>, the line solves, the sorts and the axis reductions of types other than <code>f32</code> (and of <code>f32</code> while a step is recorded or profiled) are eager: the result is
 evaluated when the call returns, so what reads it is another kernel
 (<a href="#primitives-that-read-an-expression">Performance guide</a>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
@@ -867,7 +877,9 @@ assert_eq!((lo, hi), (1.0, 4.0));
 <tbody>
 <tr><td><code>sum()</code>, <code>min()</code>, <code>max()</code></td><td>any element type; <code>u32</code> sums wrap around</td></tr>
 <tr><td><code>mean()</code>, <code>norm()</code></td><td><code>f32</code>; the norm is the Euclidean (L2) norm</td></tr>
-<tr><td><code>reduce([Reduction; N])</code></td><td><code>N</code> of <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>SumOfSquares</code> (one to four) in one pass, as an <code>N</code>-element array</td></tr>
+<tr><td><code>prod()</code> / <code>product()</code></td><td>the product; NaN if any element is NaN, <code>u32</code> / <code>i32</code> products wrap around</td></tr>
+<tr><td><code>reduce([Reduction; N])</code></td><td><code>N</code> of <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>SumOfSquares</code>, <code>Product</code> (one to four) in one pass, as an <code>N</code>-element array</td></tr>
+<tr><td><code>norm_p(Norm)</code></td><td><code>One</code>, <code>Two</code>, <code>Inf</code>, <code>P(p)</code>, <code>Frobenius</code> and the matrix <code>MatrixOne</code> / <code>MatrixInf</code> norms, <code>f32</code> (<code>f64</code> except <code>P</code>)</td></tr>
 <tr><td><code>sum_where(&amp;cond)</code></td><td>the sum of the elements where a <code>bool</code> (or non-zero <code>u32</code>) condition is true, in one pass</td></tr>
 <tr><td><code>item()</code></td><td>the value of a one-element array</td></tr>
 <tr><td><code>to_array::&lt;N&gt;()</code></td><td>the values of an <code>N</code>-element array</td></tr>
@@ -931,7 +943,8 @@ are the ones a host loop would give.</p>
 <p><code>sum_where(&amp;cond)</code> sums where a condition (an <code>Array&lt;bool&gt;</code>, such as a comparison, or a <code>u32</code> array of
 non-zero elements) is true; the <code>sum()</code> of a boolean array is the number of true elements, as a <code>u32</code>
 array (also <code>count()</code>, as in NumPy). <code>any()</code> and <code>all()</code> are one-element <code>bool</code> arrays, and <code>bool</code>
-arrays have <code>min</code> / <code>max</code> but no <code>mean</code>, <code>norm</code> or <code>reduce</code>:</p>
+arrays have <code>min</code> / <code>max</code> but no <code>mean</code>, <code>norm</code> or <code>reduce</code>. Along an axis, <code>count_axis</code>, <code>all_axis</code> and
+<code>any_axis</code> do the same per line:</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, -4.0], 4)?;
@@ -940,6 +953,29 @@ assert_eq!(x.sum_where(&amp;positive).item()?, 4.0);
 assert_eq!(positive.count().item()?, 2);
 assert_eq!(positive.sum().item()?, 2);
 assert!(positive.any().item()?);
+
+let table = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, 4.0, 5.0, -6.0], [2, 3])?;
+let flags = table.gt(0.0);
+assert_eq!(flags.count_axis(0).to_vec()?, vec![1, 2, 1]);
+assert_eq!(flags.all_axis(1).to_vec()?, vec![true, false]);
+assert_eq!(flags.any_axis(1).to_vec()?, vec![true, true]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="products-and-norms"><a class="header" href="#products-and-norms">Products and norms</a></h3>
+<p><code>prod()</code> (alias <code>product()</code>, ArrayFire’s name) multiplies all elements, fused with the expression behind
+it like a sum; <code>prod_axis(axis)</code> does it per line. <code>norm_p</code> takes a [<code>Norm</code>]: the absolute value or power
+is computed inside the reduction, so every norm reads the data once.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3.0f32, -4.0, 2.0], 3)?;
+assert_eq!(x.prod().item()?, -24.0);
+assert_eq!(x.norm_p(Norm::One).item()?, 9.0);
+assert_eq!(x.norm_p(Norm::Inf).item()?, 4.0);
+assert!((x.norm_p(Norm::Two).item()? - 29.0f32.sqrt()).abs() &lt; 1e-6);
+
+// A matrix: axis 0 is the row index (as in ArrayFire), so MatrixOne is the largest column sum.
+let m = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, 4.0], [2, 2])?;
+assert_eq!(m.norm_p(Norm::MatrixOne).item()?, 7.0);
+assert_eq!(m.norm_p(Norm::MatrixInf).item()?, 6.0);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h3 id="vector-elements"><a class="header" href="#vector-elements">Vector elements</a></h3>
 <p>Arrays of <code>[f32; 2]</code> and <code>[f32; 4]</code> reduce per component, and these reductions return host
@@ -1051,6 +1087,39 @@ let cols = a.transpose().matmul(&amp;a);
 assert_eq!(cols.shape(), Shape::from([3, 3]));
 assert_eq!(cols.to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 45.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>a.matmul_batched(&amp;b)</code> multiplies a batch of matrices in one launch (<code>matmul</code> in a loop is one launch
+per product). The batch is axis 2 of both operands: <code>a</code> is <code>[K, M, B]</code>, <code>b</code> is <code>[N, K, B]</code> and the
+result <code>[N, M, B]</code>. An operand without the batch (<code>[N, K]</code>) is shared by every product, as the
+weights of a layer are:</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two products of [[1, 2], [3, 4]] @ [[1, 0], [0, 1]] and [[5, 6], [7, 8]] @ [[1, 0], [0, 1]].
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 2, 2])?;
+let identity = Array::from_slice(&amp;[1.0f32, 0.0, 0.0, 1.0], [2, 2])?; // shared by both
+let c = a.matmul_batched(&amp;identity);
+assert_eq!(c.shape(), Shape::from([2, 2, 2]));
+assert_eq!(c.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="tensor-cores-tf32"><a class="header" href="#tensor-cores-tf32">Tensor cores (TF32)</a></h3>
+<p>On a CUDA device with tensor cores (compute capability 8.0 and up: Ampere, Ada, Hopper) <code>matmul</code>
+runs on them by default, in TF32: the operands are rounded to TF32, which keeps the 8-bit exponent
+of <code>f32</code> but only 10 bits of mantissa, and the products are accumulated in <code>f32</code>. Each entry
+differs from the <code>f32</code> product by up to 1.5e-3 of the sum of the absolute values of its terms
+(about 2e-4 of the entries’ RMS for operands of random sign), the precision of PyTorch’s
+<code>allow_tf32</code>; infinities and NaNs go through as in <code>f32</code>. On an RTX 3090 a 4096 x 4096 x 4096
+product runs at 34 TFLOP/s instead of 20 (the card’s <code>f32</code> peak is 35.6), a 1024 x 1024 x 1024 one
+at 21 instead of 13, and the small and skinny products of a network (a 256-row batch through a
+1024-wide layer, a 2048 x 512 x 128 weight gradient) 3-4 times faster.</p>
+<p>Where the precision matters, ask for <code>f32</code>: <code>a.matmul_f32(&amp;b)</code> is the full-precision product of
+one call (a chain of fused multiply-adds in a fixed order per entry), and
+<code>ContextOptions::tf32_matmul(false)</code> (<code>LUMA_TF32_MATMUL=0</code>) makes every <code>matmul</code> of a context
+that product. <code>matmul_tf32</code> forces TF32 whatever the context says, and <code>matmul_batched</code> is always
+<code>f32</code>. On CUDA the <code>f32</code> product has kernels of its own for the shapes above (an RTX 3090: 23
+TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions
+are fused into the shader kernel as before. Products whose <code>M</code>, <code>N</code> and <code>K</code> are not all multiples of 4 and at least 32, and every other
+backend (wgpu, Metal, the CPU), compute the <code>f32</code> product, so the same program runs everywhere
+and differs only by the rounding where tensor cores are used. Transposed operands are read in
+place; other lazy operands are evaluated first, where the <code>f32</code> kernels fuse them.</p>
 <p>An operand that is a pending expression is not stored first: its expression is evaluated inside
 the product’s loads, once per use. A standardised Gram (correlation-style) matrix of a table with
 one column per feature (<code>[samples, features]</code>) is one launch plus the statistics:</p>
@@ -1098,7 +1167,7 @@ assert_eq!(sum.to_vec()?, vec![10.0, 60.0]);
 assert_eq!(sum_sq.to_vec()?, vec![30.0, 1000.0]);
 assert_eq!(max.to_vec()?, vec![4.0, 20.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>The results are evaluated when the call returns. Another number of ops poisons the results.
+<p><code>f32</code> results stay pending until one is used, then it is recorded together with every other axis reduction over the same lines that is pending, in one kernel (each result is the value it has alone: the same bits on the CPU backend, within an ulp or two on GPU backends); other types are evaluated when the call returns. Another number of ops poisons the results.
 <code>sum_axis</code>, <code>min_axis</code> and <code>max_axis</code> are the single-op cases. They (and <code>reduce_axis</code>) work on
 <code>f32</code>, <code>u32</code> and <code>i32</code> (<code>SumOfSquares</code> of integers wraps); <code>bool</code> arrays have <code>sum_axis</code> (a
 count, <code>u32</code>), <code>min_axis</code> and <code>max_axis</code> only.</p>
@@ -1116,6 +1185,29 @@ assert_eq!(x.std_axis(0).to_vec()?[1], 5.0);
 // Far from zero the two-pass variance is still right.
 let y = Array::from_slice(&amp;[1.0e4f32 + 1.0, 1.0e4 + 2.0, 1.0e4 + 3.0, 1.0e4 + 4.0], 4)?;
 assert!((y.var_axis(0).item()? - 1.25).abs() &lt; 1e-3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="variance-with-a-divisor-weights-covariance"><a class="header" href="#variance-with-a-divisor-weights-covariance">Variance with a divisor, weights, covariance</a></h3>
+<p><code>var(bias)</code>, <code>std(bias)</code> and <code>meanvar(bias)</code> do the same for the whole array (<code>f32</code> and <code>f64</code>), and
+<code>var_axis_bias(axis, bias)</code>, <code>std_axis_bias</code> and <code>meanvar_axis</code> along an axis. A [<code>Bias</code>] is ArrayFire’s
+<code>af_var_bias</code>: <code>Population</code> divides by <code>n</code>, <code>Sample</code> by <code>n - 1</code>. The mean and variance of a <code>meanvar</code>
+come from one pass over the data (the sum and the sum of squares of the data minus its first element).
+<code>mean_weighted(&amp;w)</code> and <code>meanvar_weighted(&amp;w, bias)</code> take weights of the array’s shape (or extent 1
+along the axes to broadcast), <code>mean_axis_weighted(axis, &amp;w)</code> along an axis. <code>cov(&amp;y, bias)</code> and
+<code>corrcoef(&amp;y)</code> pair two arrays of one shape element by element (the sums of the three expressions are
+recorded in one kernel); <code>cov_axis</code> and <code>corrcoef_axis</code> work per line. Axis forms are <code>f32</code> only
+(there are no axis reductions of <code>f64</code>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let y = Array::from_slice(&amp;[2.0f32, 4.0, 6.0, 8.0], 4)?;
+assert_eq!(x.var(Bias::Population).item()?, 1.25);
+assert!((x.var(Bias::Sample).item()? - 5.0 / 3.0).abs() &lt; 1e-6);
+let (mean, var) = x.meanvar(Bias::Population);
+assert_eq!((mean.item()?, var.item()?), (2.5, 1.25));
+let w = Array::from_slice(&amp;[1.0f32, 1.0, 1.0, 5.0], 4)?;
+assert_eq!(x.mean_weighted(&amp;w).item()?, 3.25);
+assert!((x.corrcoef(&amp;y).item()? - 1.0).abs() &lt; 1e-6);
+assert!((x.cov(&amp;y, Bias::Sample).item()? - 10.0 / 3.0).abs() &lt; 1e-5);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="argmax-and-argmin"><a class="header" href="#argmax-and-argmin">Argmax and argmin</a></h2>
 <p><code>argmax</code> and <code>argmin</code> give the <strong>flat index</strong> of the largest or smallest element as a
@@ -1220,7 +1312,11 @@ assert_eq!(n.argsort_descending().to_vec()?, vec![3, 1, 0, 2]);
 <p>Floats sort in the total order of their bits: <code>-inf &lt; .. &lt; -0.0 &lt; +0.0 &lt; .. &lt; +inf &lt; NaN</code>, so
 NaNs come last (first when descending) and <code>-0.0</code> sorts before <code>+0.0</code> (and <code>+0.0</code> before
 <code>-0.0</code> when descending, by input order for ties). The sign of a NaN is not kept.
-<code>sort_axis(axis)</code> sorts every line along <code>axis</code> independently, stably, and keeps the shape.</p>
+<code>sort_axis(axis)</code> sorts every line along <code>axis</code> independently and keeps the shape. Lines of up to
+2048 elements (256 on the CPU backend; any axis) are sorted in workgroup memory, in one pass over the data; longer lines
+take the radix sort of the whole array followed by a regrouping by line (and, along an axis other
+than 0, a tiled transpose back to the layout). <code>sort_axis</code> returns the NaNs as the positive quiet NaN,
+like <code>sort</code>.</p>
 <h2 id="groups"><a class="header" href="#groups">Groups</a></h2>
 <p><code>group_sum</code>, <code>group_min</code>, <code>group_max</code>, <code>group_mean</code> and <code>group_count</code> reduce the elements that
 share a code, a groupby over dense codes <code>0..groups</code>: result element <code>g</code> combines the elements
@@ -1244,6 +1340,27 @@ assert!(mean[2].is_nan());
 <code>group_min</code> / <code>group_max</code>: <code>+inf</code> / <code>-inf</code> for <code>f32</code>, the integer maximum / minimum for <code>u32</code>
 and <code>i32</code> (<code>u32::MAX</code> / <code>0</code>, <code>i32::MAX</code> / <code>i32::MIN</code>).</p>
 <p>Where the groups are labels rather than <code>0..groups</code>, <code>factorize</code> (next section) makes the codes.</p>
+<h3 id="segments"><a class="header" href="#segments">Segments</a></h3>
+<p>When the groups are contiguous runs of the array (the rows of a CSR matrix given by its row
+pointer, a sorted group-by given by the offsets of its groups), <code>sum_segments</code>, <code>min_segments</code> and
+<code>max_segments</code> reduce segment <code>i</code>, the elements <code>offsets[i]..offsets[i + 1]</code>, to element <code>i</code> of
+the result (<code>offsets.len() - 1</code> elements, <code>u32</code>, non-decreasing, the first 0 and the last the
+length of the values). An empty segment gives the identity, as for the group reductions. They
+need no codes and no atomics: the entries are split evenly over the workgroups whatever the
+lengths of the segments, so a power-law matrix with one row of 100000 entries among rows of a
+handful costs no more than a regular one, and the result is the same on every run. A pending
+operand is computed inside the kernel, so a sparse matrix-vector product is one expression:</p>
+<pre><code class="language-rust">use luma::*;
+
+// [[1, 0, 2], [0, 0, 0], [0, 3, 4]] in CSR.
+let ptr = Array::from_slice(&amp;[0u32, 2, 2, 4], 4)?;
+let col = Array::from_slice(&amp;[0u32, 2, 1, 2], 4)?;
+let val = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let x = Array::from_slice(&amp;[1.0f32, 10.0, 100.0], 3)?;
+let y = (&amp;val * x.take(&amp;col)).sum_segments(&amp;ptr);
+assert_eq!(y.to_vec()?, vec![201.0, 0.0, 430.0]);
+assert_eq!(val.max_segments(&amp;ptr).to_vec()?, vec![2.0, f32::NEG_INFINITY, 4.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="unique-values"><a class="header" href="#unique-values">Unique values</a></h2>
 <p><code>factorize()</code> returns the sorted distinct values of an array (flat, one dimension) and, shaped
 like the array, the index of each element’s value in them: <code>uniques.take(&amp;codes)</code> is the array
@@ -1275,6 +1392,12 @@ between the sorted neighbours as NumPy’s default does: with <code>h = q * (len
 and <code>median_axis(axis)</code> do it for every line along an axis (extent 1 there in the result). <code>q</code>
 outside <code>[0, 1]</code> (NaN included) poisons the result with <code>InvalidShape</code>. The sort is evaluated,
 the interpolation is lazy.</p>
+<p>Every call sorts, and the sort is nearly all of the cost, so ask for several quantiles in one
+call: <code>quantiles(&amp;[q0, q1, ..])</code> gives a one-dimensional array with one entry per <code>q</code>, and
+<code>quantiles_axis(axis, &amp;qs)</code> the shape of the array with <code>qs.len()</code> entries along <code>axis</code> (entry
+<code>j</code> is <code>quantile_axis(axis, qs[j])</code>). A describe-style table of 25% / 50% / 75% costs one sort
+instead of three. Nothing is cached between calls: a sorted copy kept for the next call would
+cost as much memory as the array.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[4.0f32, 1.0, 3.0, 2.0], 4)?;
@@ -1287,6 +1410,11 @@ assert!(x.quantile(1.5).item().is_err());
 // Two columns of four: the median of each.
 let t = Array::from_slice(&amp;[4.0f32, 1.0, 3.0, 2.0, 10.0, 50.0, 30.0, 20.0], [4, 2])?;
 assert_eq!(t.median_axis(0).to_vec()?, vec![2.5, 25.0]);
+
+// Three quantiles of each column with one sort: [3, 2], the quantiles along axis 0.
+let q = t.quantiles_axis(0, &amp;[0.0, 0.5, 1.0]);
+assert_eq!(q.to_vec()?, vec![1.0, 2.5, 4.0, 10.0, 25.0, 50.0]);
+assert_eq!(x.quantiles(&amp;[0.0, 0.25, 1.0]).to_vec()?, vec![1.0, 1.75, 4.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>NaNs sort last, so they only affect the high quantiles; NumPy returns NaN for every quantile of
 an array with a NaN, this does not.</p>
@@ -1495,6 +1623,427 @@ assert!(corr.iter().all(|c| (c - 1.0).abs() &lt; 1e-5));
 let x = Array::from_slice(&amp;[-2.0f32, 0.5, 3.0], 3)?;
 assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="tiles-diagonals-triangles-differences"><a class="header" href="#tiles-diagonals-triangles-differences">Tiles, diagonals, triangles, differences</a></h2>
+<p>ArrayFire’s structural functions are index maps and generators in luma: none is a kernel of its
+own, each fuses into the expression that reads it, and none reads or writes memory until an
+evaluation needs it. Shapes list the extents with the first dimension fastest, exactly like
+ArrayFire’s <code>dim4</code>, so the dimension arguments carry over unchanged (<code>af::tile(a, 2, 3)</code> is
+<code>a.tile([2, 3])</code>, <code>af::diff1(a, 1)</code> is <code>a.diff1(1)</code>). Element <code>(i, j)</code> has <code>i</code> along dimension 0;
+diagonal <code>k</code> holds the elements with <code>j - i = k</code>.</p>
+<p><strong><code>tile</code></strong> repeats an array along every dimension, a lazy read like a wrapping pad; <strong><code>iota</code></strong>
+counts the elements of a shape in memory order and tiles the count; <strong><code>identity</code></strong> is generated
+inside the kernel that uses it:</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+assert_eq!(a.tile([2, 2]).to_vec()?, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+assert_eq!(Array::&lt;u32&gt;::iota([2, 2], [1, 2])?.to_vec()?, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+let id = Array::&lt;f32&gt;::identity([3, 3])?;
+assert_eq!(id.to_vec()?, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>diag(k)</code></strong> extracts the <code>k</code>-th diagonal of every matrix of dimensions 0 and 1 (dimensions 2 and
+3 are batches) as a view, and <strong><code>diag_matrix(k)</code></strong> builds the matrix with a column on its
+diagonal <code>k</code>; <strong><code>lower(unit)</code></strong> and <strong><code>upper(unit)</code></strong> zero the other triangle (with <code>unit</code> the
+diagonal is one) and work on non-square matrices and batches. All of them accept every element
+type (<code>f32</code>, <code>i32</code>, <code>u32</code>, <code>bool</code>, <code>f64</code>, <code>Df32</code>), and a NaN that is not kept is zeroed, not
+propagated:</p>
+<pre><code class="language-rust">use luma::*;
+
+let m = Array::from_slice(&amp;[1.0f32, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0], [3, 3])?;
+assert_eq!(m.diag(0).to_vec()?, vec![1.0, 5.0, 9.0]);
+assert_eq!(m.diag(1).to_vec()?, vec![2.0, 6.0]);
+assert_eq!(m.diag(-1).to_vec()?, vec![4.0, 8.0]);
+assert_eq!(m.lower(false).to_vec()?, vec![1.0, 4.0, 7.0, 0.0, 5.0, 8.0, 0.0, 0.0, 9.0]);
+assert_eq!(m.upper(true).to_vec()?, vec![1.0, 0.0, 0.0, 2.0, 1.0, 0.0, 3.0, 6.0, 1.0]);
+let v = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+assert_eq!(v.diag_matrix(1).to_vec()?, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A diagonal outside the matrix would be empty, and luma has no empty arrays: it poisons the result
+with <code>InvalidShape</code> (as <code>diff1</code> does for an extent below 2).</p>
+<p><strong><code>replace(&amp;cond, b)</code></strong> is <code>af::replace</code> returning a new array (<code>a</code> where <code>cond</code>, else <code>b</code>, an
+array or a scalar: <code>select(&amp;cond, &amp;a, b)</code>), and <strong><code>diff1(axis)</code></strong> / <strong><code>diff2(axis)</code></strong> are the first
+and second differences along an axis, one and two shorter, as a fused difference of slices that
+reads the array once:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, f32::NAN, 4.0, 9.0], 4)?;
+assert_eq!(x.replace(&amp;!x.is_nan(), 0.0).to_vec()?, vec![1.0, 0.0, 4.0, 9.0]);
+let y = Array::from_slice(&amp;[0.0f32, 1.0, 4.0, 9.0, 16.0], 5)?;
+assert_eq!(y.diff1(0).to_vec()?, vec![1.0, 3.0, 5.0, 7.0]);
+assert_eq!(y.diff2(0).to_vec()?, vec![2.0, 2.0, 2.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="fourier-transforms"><a class="header" href="#fourier-transforms">Fourier transforms</a></h1>
+<p><code>Array&lt;C32&gt;</code> (complex <code>f32</code>, see <a href="https://docs.rs/luma"><code>C32</code></a>) has FFTs of any length along any
+axis, in one to three dimensions, batched over the remaining axes. They run on every backend as a
+few passes over the data, each transforming tiles in workgroup memory, and write the result in
+natural order.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[C32::new(1.0, 0.0), C32::new(2.0, 0.0), C32::new(3.0, 0.0), C32::new(4.0, 0.0)], 4)?;
+let spectrum = x.fft();                      // X[k] = sum_n x[n] e^(-2 pi i n k / N)
+assert_eq!(spectrum.to_vec()?[0], C32::new(10.0, 0.0));
+let back = spectrum.ifft();                  // divided by N: back == x
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Transform</th></tr>
+</thead>
+<tbody>
+<tr><td><code>fft()</code>, <code>ifft()</code></td><td>axis 0, batched over the others</td></tr>
+<tr><td><code>fft_axis(axis, norm)</code>, <code>ifft_axis(axis, norm)</code></td><td>one axis (0 to 3)</td></tr>
+<tr><td><code>fft2()</code>, <code>ifft2()</code>, <code>fft3()</code>, <code>ifft3()</code></td><td>axes 0 and 1, or 0, 1 and 2</td></tr>
+<tr><td><code>fft_axes(&amp;[..], norm)</code>, <code>ifft_axes(&amp;[..], norm)</code></td><td>any axes, in the order given</td></tr>
+<tr><td><code>Array&lt;f32&gt;::fft()</code>, <code>fft_axes(..)</code></td><td>the complex spectrum of real input</td></tr>
+<tr><td><code>Array&lt;f32&gt;::rfft()</code>, <code>rfft_axis</code>, <code>rfft2()</code>, <code>rfft3()</code>, <code>rfft_axes</code></td><td>real input: only the <code>N / 2 + 1</code> non-redundant frequencies along the first axis (ArrayFire’s <code>fftR2C</code>)</td></tr>
+<tr><td><code>Array&lt;C32&gt;::irfft(n)</code>, <code>irfft_axis</code>, <code>irfft2(n0)</code>, <code>irfft3(n0)</code>, <code>irfft_axes</code></td><td>the inverse of <code>rfft</code>: <code>n</code> real points from the half spectrum</td></tr>
+<tr><td><code>Array&lt;f32&gt;::fft_convolve1/2/3(&amp;kernel, mode)</code></td><td>convolution by FFTs (<code>ConvMode::Same</code> or <code>Full</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="normalisation"><a class="header" href="#normalisation">Normalisation</a></h2>
+<p><code>FftNorm</code> says how a transform is scaled. The default of <code>fft</code>/<code>ifft</code>/… (without a <code>norm</code>
+argument) is <code>Backward</code>, the convention of NumPy and ArrayFire’s <code>ifft</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>FftNorm</code></th><th>forward</th><th>inverse</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Backward</code></td><td>1</td><td>1 / N</td></tr>
+<tr><td><code>Forward</code></td><td>1 / N</td><td>1</td></tr>
+<tr><td><code>Ortho</code></td><td>1 / sqrt(N)</td><td>1 / sqrt(N)</td></tr>
+<tr><td><code>None</code></td><td>1</td><td>1</td></tr>
+<tr><td><code>Scale(s)</code></td><td><code>s</code></td><td><code>s</code> (once, however many axes)</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>N</code> is the number of points of the transformed axis; each axis of a multi-axis transform is
+scaled by its own length.</p>
+<h2 id="lengths"><a class="header" href="#lengths">Lengths</a></h2>
+<p>Any length works. Lengths whose prime factors are at most 31 (powers of two, 3, 5, 7, …) are
+transformed directly in as many passes as needed (one pass up to 4096 points per line, two up to
+about 16 million); other lengths use Bluestein’s algorithm, a circular convolution of the next
+power of two at least <code>2N - 1</code>, which costs several times as much. Even-length real transforms are
+half-size complex transforms plus one pass that packs or unpacks the spectrum.</p>
+<h2 id="convolution-1"><a class="header" href="#convolution-1">Convolution</a></h2>
+<p><code>fft_convolve2(&amp;kernel, ConvMode::Same)</code> zero-pads signal and kernel to a fast length, multiplies
+their spectra and transforms back. <code>Same</code> returns the signal’s shape with the kernel centred as
+ArrayFire does (output <code>i</code> is element <code>i + k / 2</code> of the full convolution); <code>Full</code> returns
+<code>signal + kernel - 1</code> along each convolved axis. The kernel must have extent 1 along the batch
+axes (2 and 3 for <code>fft_convolve2</code>). <code>conv1d_fft</code> is the one-dimensional full convolution with its
+own, convolution-specific passes.</p>
+<h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
+<p>Per call on an RTX 3090 (CUDA), against ArrayFire 3.10.1 (cuFFT) in <code>tools/afcompare</code> (interleaved,
+warm, synchronised; ratio = ArrayFire / luma, above 1 is faster):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>transform</th><th>size</th><th style="text-align: right">luma ms</th><th style="text-align: right">ArrayFire ms</th><th style="text-align: right">ratio</th></tr>
+</thead>
+<tbody>
+<tr><td><code>fft</code></td><td>1,000,000</td><td style="text-align: right">0.072</td><td style="text-align: right">0.084</td><td style="text-align: right">1.17</td></tr>
+<tr><td><code>fft</code></td><td>16,000,000</td><td style="text-align: right">1.11</td><td style="text-align: right">1.37</td><td style="text-align: right">1.24</td></tr>
+<tr><td><code>fft</code></td><td>2^20 / 2^24</td><td style="text-align: right">0.066 / 1.00</td><td style="text-align: right">0.079 / 1.49</td><td style="text-align: right">1.20 / 1.50</td></tr>
+<tr><td><code>fft</code> (prime, Bluestein)</td><td>1,000,003</td><td style="text-align: right">0.30</td><td style="text-align: right">0.39</td><td style="text-align: right">1.30</td></tr>
+<tr><td><code>ifft</code></td><td>1,000,000 / 16,000,000</td><td style="text-align: right">0.071 / 1.11</td><td style="text-align: right">0.107 / 1.72</td><td style="text-align: right">1.52 / 1.55</td></tr>
+<tr><td><code>rfft</code></td><td>1,000,000 / 16,000,000</td><td style="text-align: right">0.040 / 0.60</td><td style="text-align: right">0.046 / 0.74</td><td style="text-align: right">1.15 / 1.22</td></tr>
+<tr><td><code>rfft</code></td><td>2^20 / 2^24</td><td style="text-align: right">0.036 / 0.55</td><td style="text-align: right">0.036 / 0.71</td><td style="text-align: right">1.00 / 1.29</td></tr>
+<tr><td><code>fft2</code> / <code>ifft2</code></td><td>2048 x 2048</td><td style="text-align: right">0.239 / 0.236</td><td style="text-align: right">0.281 / 0.372</td><td style="text-align: right">1.18 / 1.57</td></tr>
+<tr><td><code>fft3</code></td><td>256^3</td><td style="text-align: right">0.985</td><td style="text-align: right">1.38</td><td style="text-align: right">1.40</td></tr>
+<tr><td><code>fft_convolve2</code></td><td>2048^2 with 15^2</td><td style="text-align: right">0.74</td><td style="text-align: right">1.93</td><td style="text-align: right">2.61</td></tr>
+<tr><td><code>fft_convolve2</code></td><td>4096^2 with 31^2</td><td style="text-align: right">4.9</td><td style="text-align: right">9.5</td><td style="text-align: right">1.95</td></tr>
+<tr><td><code>fft_convolve3</code></td><td>256^3 with 9^3</td><td style="text-align: right">3.1</td><td style="text-align: right">16.4</td><td style="text-align: right">5.38</td></tr>
+</tbody>
+</table>
+</div>
+<p>A one-pass transform moves the array once in and once out; a transform of up to about 4096 points
+per line is one pass, up to about 16 million two or three. Results are accurate to a few <code>f32</code>
+roundings: against an <code>f64</code> reference the rms error is 3e-7 to 8e-7 of the rms of the spectrum (up to
+about 2e-6 at the worst point), a little above cuFFT’s.</p>
+<h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
+<ul>
+<li>The transforms are computed when called (they are not fused with surrounding lazy operations);
+their inputs are evaluated first.</li>
+<li>A transform needs the whole array in one buffer: an array split over several buffers (see
+<a href="#performance-guide">Performance</a>) fails with <code>LumaError::Chunked</code>.</li>
+<li>Errors poison the result like any other operation: <code>fft_axis(4, ..)</code> gives a poisoned array.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sparse-matrices"><a class="header" href="#sparse-matrices">Sparse matrices</a></h1>
+<p><code>Sparse</code> is a sparse <code>rows x cols</code> matrix of <code>f32</code> in CSR, CSC or COO storage, with the
+operations of ArrayFire’s <code>sparse.h</code> and a sparse-dense <code>matmul</code>. It is built from luma arrays
+(a few <code>u32</code> index arrays and the <code>f32</code> values), so everything runs on the device and is recorded
+like any other operation; errors poison the result instead of panicking.</p>
+<p>Dense matrices keep the convention of <a href="#matrices-statistics-and-grouping">the previous chapter</a>: a dense <code>rows x cols</code>
+matrix is an array of shape <code>[cols, rows]</code>, and a dense right-hand side with <code>c</code> columns has shape
+<code>[c, cols]</code>.</p>
+<h2 id="building-a-matrix"><a class="header" href="#building-a-matrix">Building a matrix</a></h2>
+<pre><code class="language-rust">use luma::*;
+
+// [[1, 0, 2],
+//  [0, 0, 3]]
+let dense = Array::from_slice(&amp;[1.0f32, 0.0, 2.0, 0.0, 0.0, 3.0], [3, 2])?;
+
+// From a dense matrix (reads the entry count back: one synchronisation).
+let a = sparse(&amp;dense, SparseFormat::Csr);
+assert_eq!((a.rows(), a.cols(), a.nnz()), (2, 3, 3));
+
+// From (row, column, value) triplets, in any order; duplicates add up.
+let rows = Array::from_slice(&amp;[1u32, 0, 0], 3)?;
+let cols = Array::from_slice(&amp;[2u32, 2, 0], 3)?;
+let vals = Array::from_slice(&amp;[3.0f32, 2.0, 1.0], 3)?;
+let b = Sparse::from_triplets(2, 3, &amp;rows, &amp;cols, &amp;vals, SparseFormat::Csc);
+assert_eq!(b.to_dense().to_vec()?, dense.to_vec()?);
+
+// From the arrays of a CSR matrix.
+let ptr = Array::from_slice(&amp;[0u32, 2, 3], 3)?;
+let col = Array::from_slice(&amp;[0u32, 2, 2], 3)?;
+let csr_vals = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+let c = Sparse::from_csr(2, 3, &amp;ptr, &amp;col, &amp;csr_vals);
+assert_eq!(c.to_dense().to_vec()?, dense.to_vec()?);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>values()</code>, <code>row_idx()</code>, <code>col_idx()</code> and <code>info()</code> give the arrays back with ArrayFire’s meaning:
+the row array of CSR is the row pointer, the column array of CSC is the column pointer. luma has
+no empty arrays, so they are <code>None</code> for a matrix without entries (<code>Sparse::empty</code>, or the sparse
+form of an all-zero matrix).</p>
+<h2 id="conversions-and-the-transpose"><a class="header" href="#conversions-and-the-transpose">Conversions and the transpose</a></h2>
+<p><code>to_format</code> converts between the three formats (a stable sort by the new major index, one <code>u32</code>
+sort and a gather); <code>to_dense</code> scatters the entries into zeros. <code>transpose</code> is free: the transpose
+of a CSR matrix is the CSC matrix with the same arrays, and COO swaps its two index arrays.</p>
+<h2 id="products"><a class="header" href="#products">Products</a></h2>
+<p><code>matmul</code> multiplies by a vector (shape <code>[cols]</code>) or a dense matrix (<code>[c, cols]</code>); <code>matmul_t</code> uses
+the transpose without building it.</p>
+<pre><code class="language-rust">use luma::*;
+
+let dense = Array::from_slice(&amp;[1.0f32, 0.0, 2.0, 0.0, 0.0, 3.0], [3, 2])?;
+let a = sparse(&amp;dense, SparseFormat::Csr);
+let x = Array::from_slice(&amp;[1.0f32, 10.0, 100.0], 3)?;
+assert_eq!(a.matmul(&amp;x).to_vec()?, vec![201.0, 300.0]);
+
+let y = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+assert_eq!(a.matmul_t(&amp;y).to_vec()?, vec![1.0, 0.0, 8.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>CSR <code>A x</code> and CSC <code>A^T x</code> (the product whose output runs along the compressed axis) run on kernels
+written for the format: for a vector, a thread (or a few lanes) per row when the rows are short, a
+kernel that takes tiles of 512 consecutive entries whatever the row lengths are (the balance of a
+merge-path product; a second small pass completes the rows that cross tiles) when some are long;
+for a dense matrix
+one invocation per output element walks its row, reading <code>c</code> adjacent elements of <code>x</code> together,
+and the few very long rows of a power-law graph are cut in pieces summed by a workgroup each. No
+atomics are used, so the results are the same on every run. The first product of any other
+combination (CSC <code>A x</code>, CSR <code>A^T x</code>, COO) scatters with atomic adds, so its <code>f32</code> sums can differ in
+the last bits between runs; the second converts the matrix once to the form that suits the product
+and keeps the copy (one more copy of the entries for the life of the matrix), and results are then
+reproducible. The first product of a matrix reads its row lengths back (one synchronization) and
+finds the first row of every tile. A pending expression as <code>x</code> is evaluated first.</p>
+<h2 id="elementwise-operations-1"><a class="header" href="#elementwise-operations-1">Elementwise operations</a></h2>
+<p><code>mul_dense</code> and <code>div_dense</code> keep the pattern of the sparse matrix and give a sparse result;
+<code>mul_scalar</code>, <code>div_scalar</code>, <code>neg</code> (and the operators <code>*</code>, <code>/</code>, <code>-</code> with <code>f32</code>) do too. Sums and
+differences with a dense matrix (<code>add_dense</code>, <code>sub_dense</code>, <code>rsub_dense</code>) and with a scalar
+(<code>add_scalar</code>) fill the zeros, so their results are dense arrays.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="dense-linear-algebra"><a class="header" href="#dense-linear-algebra">Dense linear algebra</a></h1>
+<p>Factorisations and solvers for dense <code>f32</code> matrices, on every backend: Cholesky, triangular and
+symmetric positive definite solves, LU with partial pivoting, general solves, inverse and
+determinant, Householder QR and least squares. They are ordinary lazy operations: recorded, not
+waited for; the factors are arrays that stay on the device.</p>
+<h2 id="layout"><a class="header" href="#layout">Layout</a></h2>
+<p>A matrix is <code>[cols, rows]</code> like the operands of <code>matmul</code> (row <code>i</code> is contiguous, element <code>(i, j)</code>
+at <code>j + cols * i</code>), and a batch of matrices is a third axis, <code>[cols, rows, batch]</code>. A right-hand
+side of <code>k</code> columns for an <code>n</code>-row system is <code>[k, n]</code>; a plain <code>[n]</code> array is one vector and the
+solution has the shape of the right-hand side.</p>
+<pre><code class="language-rust">use luma::*;
+
+// [[4, 2], [2, 5]] x = [2, 3]  =&gt;  x = [0.25, 0.5]
+let a = Array::from_slice(&amp;[4.0f32, 2.0, 2.0, 5.0], [2, 2])?;
+let b = Array::from_slice(&amp;[2.0f32, 3.0], 2)?;
+
+let l = a.cholesky();                      // A = L Lᵀ, L lower triangular
+assert_eq!(l.to_vec()?, vec![2.0, 0.0, 1.0, 2.0]);
+let x = a.solve_spd(&amp;b);                   // Cholesky + two triangular solves
+let y = a.solve(&amp;b);                       // LU with partial pivoting
+for (u, v) in x.to_vec()?.iter().zip(y.to_vec()?) {
+    assert!((u - v).abs() &lt; 1e-5);
+}
+assert!((a.det().item()? - 16.0).abs() &lt; 1e-4);
+
+let f = a.lu();                            // P A = L U, packed, with the permutation
+let back = f.solve(&amp;b);                    // reuse the factors for more right-hand sides
+assert!((back.to_vec()?[0] - 0.25).abs() &lt; 1e-5);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cholesky()</code>, <code>cholesky_upper()</code></td><td>the factor <code>L</code> (<code>A = L Lᵀ</code>) or <code>U</code> (<code>A = Uᵀ U</code>) of an SPD matrix; reads one triangle</td></tr>
+<tr><td><code>solve_spd(&amp;b)</code>, <code>cholesky_solve(&amp;b)</code></td><td><code>A X = B</code> for SPD <code>A</code> (from <code>A</code>, or from its factor)</td></tr>
+<tr><td><code>solve_triangular(&amp;b, Triangle, transpose, unit_diag)</code></td><td><code>op(A) X = B</code> for a triangular <code>A</code></td></tr>
+<tr><td><code>lu()</code></td><td><code>Lu { lu, perm }</code>: <code>P A = L U</code>, with <code>lower()</code>, <code>upper()</code>, <code>solve</code>, <code>inverse</code>, <code>det</code></td></tr>
+<tr><td><code>solve(&amp;b)</code></td><td>square: LU; tall: least squares; wide: minimum norm</td></tr>
+<tr><td><code>inverse()</code>, <code>det()</code>, <code>slogdet()</code></td><td>inverse; determinant; sign and log of the absolute determinant (no overflow)</td></tr>
+<tr><td><code>qr()</code></td><td><code>Qr { qr, tau, t }</code> with <code>r()</code>, <code>q_thin()</code>, <code>q()</code>, <code>apply_q</code>, <code>apply_qt</code>, <code>lstsq</code></td></tr>
+<tr><td><code>lstsq(&amp;b)</code></td><td>least squares by QR</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="what-runs-where"><a class="header" href="#what-runs-where">What runs where</a></h2>
+<ul>
+<li>Small matrices and every matrix of a batch are factored by one workgroup each, in one launch:
+a batch of 4096 matrices of 16 x 16 costs one launch, where a library without batched LAPACK
+loops over calls.</li>
+<li>A big matrix is factored recursively; the leaves are small kernels and every other flop is a
+full-<code>f32</code> <code>matmul_f32</code> of the halves (never TF32: a factorisation’s accuracy depends on it).</li>
+<li>A triangular solve with up to 32 right-hand sides (<code>solve_triangular</code>, and the two solves inside
+<code>solve</code> and <code>solve_spd</code>) of a triangle of more than 64 rows is one launch on CUDA devices: one
+workgroup per block of 64 rows takes its turn from an atomic ticket, waits for the solved blocks
+before it (the words they publish are the complement of the bits, 0 meaning “not there yet”: no flags
+or fences), and solves its own block. The factorisations’ solves take the diagonal blocks as explicit
+inverses (computed while the workgroup waits; the blocks are well-conditioned triangles of a
+factorisation, a Cholesky factor or a unit <code>L</code> with bounded multipliers); <code>solve_triangular</code> of an
+arbitrary triangle substitutes. More right-hand sides, and every other backend, solve in blocks of rows
+with <code>matmul_f32</code> products.</li>
+<li>Numerical failure never poisons or raises: a matrix that is not positive definite leaves <code>NaN</code>
+on the diagonal of its Cholesky factor, a singular matrix a zero on the diagonal of <code>U</code> (the
+solve then gives <code>Inf</code>/<code>NaN</code>, the determinant 0). Shape errors poison the result as usual.</li>
+</ul>
+<h2 id="svd-pseudo-inverse-rank-and-the-symmetric-eigenproblem"><a class="header" href="#svd-pseudo-inverse-rank-and-the-symmetric-eigenproblem">SVD, pseudo-inverse, rank and the symmetric eigenproblem</a></h2>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[3.0f32, 0.0, 0.0, -2.0], [2, 2])?;
+let svd = a.svd();                         // A = U diag(s) Vᵀ, s descending
+let s = svd.s.to_vec()?;
+assert!((s[0] - 3.0).abs() &lt; 1e-5 &amp;&amp; (s[1] - 2.0).abs() &lt; 1e-5);
+assert_eq!(a.rank().to_vec()?, vec![2]);   // singular values above max(m, n) eps s_max
+
+let sym = Array::from_slice(&amp;[2.0f32, 1.0, 1.0, 2.0], [2, 2])?;
+let e = sym.eigh();                        // reads the lower triangle; values ascending
+let l = e.values.to_vec()?;
+assert!((l[0] - 1.0).abs() &lt; 1e-5 &amp;&amp; (l[1] - 3.0).abs() &lt; 1e-5);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td><code>svd()</code></td><td><code>Svd { u, s, vt }</code>, thin: <code>u</code> <code>[k, m]</code>, <code>s</code> <code>[k, 1]</code>, <code>vt</code> <code>[n, k]</code>, <code>k = min(m, n)</code>, any shape</td></tr>
+<tr><td><code>singular_values()</code></td><td>the values alone (no <code>V</code>, no vectors written)</td></tr>
+<tr><td><code>pinv()</code>, <code>pinv_tol(tol)</code></td><td>Moore-Penrose pseudo-inverse <code>[m, n]</code>; values <code>&lt;= tol s_max</code> count as zero (default <code>max(m, n) eps</code>)</td></tr>
+<tr><td><code>rank()</code>, <code>rank_tol(tol)</code></td><td>numerical rank as a <code>u32</code> <code>[1, 1]</code></td></tr>
+<tr><td><code>cond()</code></td><td><code>s_max / s_min</code></td></tr>
+<tr><td><code>eigh()</code>, <code>eigvalsh()</code></td><td><code>Eigh { values, vectors }</code> of a symmetric matrix (lower triangle read), ascending; the values alone</td></tr>
+</tbody>
+</table>
+</div>
+<p>The method is one-sided Jacobi: columns of <code>A</code> are rotated in pairs (the pairs of a round-robin
+round are disjoint, so a round is parallel) until they are orthogonal; the singular values are
+their norms. A matrix with its <code>V</code> that fits workgroup memory (up to 64 x 64 on devices with 32 KiB
+of it, 32 x 32 with 16 KiB) and every matrix of a batch is decomposed by one workgroup, in one
+launch, stopping inside the kernel when no rotation is left. A bigger matrix lives in global
+memory and one launch per round-robin round rotates <code>n / 2</code> pairs at once; the sweeps continue
+until one rotates nothing (the host looks every few sweeps, so a big <code>svd()</code> waits for the device,
+unlike the other operations). <code>eigh</code> is the SVD of <code>A + ||A||_F I</code> read from the lower triangle:
+positive semi-definite, so <code>U = V</code> holds the eigenvectors and <code>lambda = sigma - ||A||_F</code>.</p>
+<p>Accuracy in <code>f32</code>: <code>||A - U diag(s) Vᵀ||_F / ||A||_F</code> and the singular values are within a few
+<code>eps</code> of <code>s_max</code> (absolute), the orthogonality of <code>U</code> and <code>V</code> degrades as about <code>n sqrt(n) eps</code>;
+the eigenvalues of <code>eigh</code> carry an absolute error of a few <code>eps ||A||_F</code>. A zero singular value
+gets a left vector completed to an orthonormal set. <code>NaN</code> input gives <code>NaN</code> values and never
+hangs (the sweeps are bounded).</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="interpolation-image-transforms-and-filters"><a class="header" href="#interpolation-image-transforms-and-filters">Interpolation, image transforms and filters</a></h1>
+<p>These functions follow ArrayFire’s <code>approx1</code>, <code>approx2</code>, <code>resize</code>, <code>rotate</code>, <code>translate</code>, <code>scale</code>,
+<code>skew</code>, <code>transform</code>, <code>transformCoordinates</code>, <code>fir</code> and <code>iir</code>, with its conventions, on <code>f32</code>
+arrays. The first dimension is the fastest, as everywhere in Luma. They run on every backend.</p>
+<h2 id="interpolation"><a class="header" href="#interpolation">Interpolation</a></h2>
+<p><code>x.approx1(&amp;pos, method, off_grid)</code> reads the samples of <code>x</code> along dimension 0 as the values at
+the grid points <code>0, 1, .., n - 1</code> and interpolates them at the positions <code>pos</code>. Positions below
+<code>0</code>, above <code>n - 1</code> and NaN give <code>off_grid</code>. <code>approx2</code> does the same along dimensions 0 and 1
+with two position arrays. <code>Interp</code> is <code>Nearest</code>, <code>Lower</code> (floor),
+<code>Linear</code>, <code>Cosine</code>, <code>Cubic</code> and <code>CubicSpline</code> (Catmull-Rom); in two dimensions <code>Linear</code> is
+bilinear and <code>Cubic</code> bicubic. Further dimensions are batches: positions with extent 1 along
+them are shared by the whole batch. <code>approx1_uniform</code> and <code>approx2_uniform</code> take the dimension
+and the <code>start</code> and <code>step</code> of the grid (the sample <code>i</code> sits at <code>start + step * i</code>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 4.0, 2.0], 3)?;
+let pos = Array::from_slice(&amp;[0.5f32, 1.0, 1.5, 2.5], 4)?;
+assert_eq!(x.approx1(&amp;pos, Interp::Linear, -1.0).to_vec()?, vec![2.5, 4.0, 3.0, -1.0]);
+assert_eq!(x.approx1(&amp;pos, Interp::Nearest, -1.0).to_vec()?, vec![4.0, 4.0, 2.0, -1.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Each call is one kernel that finds the coordinates, gathers the taps of the method and combines
+them in registers. The input and the positions are evaluated first and must fit one buffer.</p>
+<h3 id="reading-a-source-through-the-texture-units"><a class="header" href="#reading-a-source-through-the-texture-units">Reading a source through the texture units</a></h3>
+<p>A kernel that reads a two-dimensional image at positions it computes (<code>approx2</code>, <code>resize</code>,
+<code>rotate</code>, <code>transform</code>) can fetch the four texels of a bilinear footprint, or the sixteen of a
+bicubic one as four such blocks, with the texture unit’s <em>gather</em> (<code>textureGather</code> in WGSL,
+<code>tld4</code> in CUDA) instead of one load per texel. A gather is exact: it returns the texels, unfiltered,
+and the weights are computed by the kernel as before, so the results are bit for bit those of the
+loads on every backend. Luma decides by its cost model (<a href="#reading-a-source-through-a-texture"><code>read_path</code></a>):
+on an RTX 3090 and an RTX 3080 Laptop (the CUDA backend reads the source’s own buffer as a pitched
+texture, a view that costs nothing and is kept with the array) the gather takes 25-28 % off a bicubic
+<code>rotate</code> / <code>transform</code> and <code>approx2</code> at scattered positions, 5-13 % off a bilinear one, and it is
+chosen for those; kernels bound by memory (<code>approx2</code> at smooth positions, <code>resize</code>) keep the loads.
+A backend that has to copy the source to
+make a texture (wgpu) reads the buffer, as does the CPU backend, which has no textures.
+Nothing in the API changes and the choice is not configurable.</p>
+<p><code>Interp::LinearHardware</code> is the explicit opt-in to the texture unit’s own bilinear <em>filter</em>: one
+fetch per output, but the hardware keeps 8 bits of the fraction of a position (the weights are
+multiples of 1/256), so along each axis a result is off from <code>Interp::Linear</code>’s by up to the
+difference of the two neighbouring samples over 256. Luma never chooses it. Where the source cannot
+be a texture (more than two dimensions, the CPU backend, a width the device cannot read in place on
+a copying backend) it is exactly <code>Interp::Linear</code>.</p>
+<h2 id="images"><a class="header" href="#images">Images</a></h2>
+<p>An image is an array whose dimensions 0 and 1 are the image axes; the dimensions after them
+(colour channels, a batch) all get the same transform. <code>resize(d0, d1, method)</code> (or
+<code>resize_by(scale0, scale1, method)</code>) samples the input at <code>x / (d0 / n0)</code>, so the first pixel is the
+input’s first and there is no half-pixel offset. <code>rotate(theta, crop, method)</code> turns about the
+centre (the bounding box when <code>crop</code> is false), <code>translate</code>, <code>scale</code>, <code>skew</code> and <code>transform</code>
+give every output pixel the input value at a position that is an affine or projective function
+of the output pixel’s coordinates (a 2 x 3 or 3 x 3 matrix, the output of
+<code>transform_coordinates</code> for the corners). Pixels that come from outside the image are 0.</p>
+<pre><code class="language-rust">use luma::*;
+
+let img = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], [3, 3])?;
+// An affine matrix [a, b, tx, c, d, ty]: with `inverse == false` it maps input to output
+// coordinates, so the content moves one pixel along dimension 0.
+let moved = img.transform([1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 3, Interp::Nearest, false);
+assert_eq!(moved.to_vec()?, vec![0.0, 1.0, 2.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0]);
+let big = img.resize(6, 6, Interp::Linear);
+assert_eq!(big.shape().dims(), [6, 6, 1, 1]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Where ArrayFire’s behaviour is not what its documentation says, Luma follows ArrayFire’s
+results: <code>translate(t0, t1)</code> reads the input at <code>(x + t0, y + t1)</code> (the content moves by <code>-t</code>),
+ArrayFire’s <code>rotate</code> rounds the cosine and sine to three decimals (Luma does not, so the two differ by a fraction of a pixel),
+the inverse of a general affine matrix in <code>transform(.., inverse = false)</code> is the true inverse where ArrayFire’s is
+only right for rotations, scalings and translations, and <code>Interp::Cosine</code> in two dimensions
+applies the cosine smoothing to both axes where ArrayFire’s <code>BILINEAR_COSINE</code> is plain bilinear.</p>
+<h2 id="filters"><a class="header" href="#filters">Filters</a></h2>
+<p><code>x.fir(&amp;b)</code> is the finite impulse response filter <code>y[i] = b[0] x[i] + b[1] x[i-1] + ..</code>, with the
+signal’s shape; batches (dimensions 1 to 3) are filtered independently, with one filter for all or one
+per signal. Filters up to 256 taps are one kernel; longer ones are blocks of taps, and from 384 taps
+on a single long vector uses the FFT convolution.</p>
+<p><code>x.iir(&amp;b, &amp;a)</code> is the recursive filter
+<code>a[0] y[i] = b[0] x[i] + .. - a[1] y[i-1] - ..</code> (host coefficient slices, feedback order up to
+<code>IIR_MAX_ORDER</code>), and <code>x.iir_sos(&amp;sections)</code> a cascade of biquads <code>[b0, b1, b2, a0, a1, a2]</code>. The
+recursion is evaluated in parallel over the length of the signal: the signal is cut in chunks,
+the state at the end of each chunk is found from zero, the chunk transitions (constant matrix
+powers) are folded into the state entering every chunk, and the chunks run again from there.
+A single signal of 16M samples therefore uses the whole GPU, and a batch of signals
+runs side by side.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 0.0, 0.0, 0.0], 4)?;
+// y[i] = x[i] + 0.5 y[i-1]: the impulse response is 1, 0.5, 0.25, ..
+assert_eq!(x.iir(&amp;[1.0], &amp;[1.0, -0.5]).to_vec()?, vec![1.0, 0.5, 0.25, 0.125]);
+let b = Array::from_slice(&amp;[0.5f32, 0.25], 2)?;
+assert_eq!(x.fir(&amp;b).to_vec()?, vec![0.5, 0.25, 0.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>fir</code> and <code>iir</code> read evaluated arrays (a pending expression is computed first) and need arrays
+that fit one buffer.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="records"><a class="header" href="#records">Records</a></h1>
 <p>A flow solver has four fields per cell, a Monte Carlo step has a position and a velocity, a hash
@@ -1955,6 +2504,15 @@ fuses.</p>
 <p>Compared with the loop primitives, an <code>eval</code> loop calls your step every iteration (host work per
 step) but may use anything inside it, including readbacks. Use the primitive when the step fits
 and the host time matters.</p>
+<p>When <code>eval</code> computes right away (the GPU is idle, as in a loop whose steps are shorter than the host’s
+work for them) and the graph it evaluates has the structure of an earlier one (the same operations,
+shapes, views and wiring, the same buffers read in the same places, equal scalars where they were
+equal), Luma runs the launches of that earlier evaluation again over the new buffers and
+scalars instead of planning the graph again: the host time per step of a step with hundreds of
+operations drops by a third to a half, the part that builds the expression stays. The results are
+bit-identical to what the planner makes, and only evaluations of plain elementwise, view and
+shift graphs with no other lazy array alive are replayed. <code>LUMA_PLAN_CACHE=off</code> switches this off
+(<a href="#environment-variables">Environment variables</a>).</p>
 <h3 id="readbacks-in-a-loop"><a class="header" href="#readbacks-in-a-loop">Readbacks in a loop</a></h3>
 <p><code>step</code> followed by <code>.max().item()?</code> every iteration waits once per step. When the same step has
 been seen repeating, Luma computes the next few steps and their residuals during a readback and
@@ -2260,6 +2818,66 @@ assert_eq!((&amp;x * 0.0).to_vec()?, vec![0.0, 0.0, 0.0]);
 reassociated expression. With it off (the default), a rewrite that would change any bit is not
 applied.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="complex-numbers"><a class="header" href="#complex-numbers">Complex numbers</a></h1>
+<p><code>Array&lt;C32&gt;</code> holds complex numbers of two <code>f32</code> (<code>C32 { re, im }</code>, 8 bytes per element, the layout of
+<code>vec2&lt;f32&gt;</code>, of CUDA’s <code>cufftComplex</code> and of C’s <code>float _Complex</code>). It is the element type the FFTs
+return. Like every elementwise type it is lazy and fused: a chain of complex operations is one kernel
+that reads the inputs once and writes the result once, and it runs on every device.</p>
+<pre><code class="language-rust">use luma::*;
+
+let z = Array::from_slice(&amp;[C32::new(1.0, 2.0), C32::new(-3.0, 0.5), C32::new(0.0, -1.0)], 3)?;
+let w = Array::from_slice(&amp;[C32::new(0.5, 0.0), C32::new(2.0, 2.0), C32::new(1.0, 1.0)], 3)?;
+
+// One kernel: products, a sum with a real number, the conjugate, a quotient and the modulus.
+let r = ((&amp;z * &amp;w + &amp;z).conj() / (&amp;w + 1.0f32)).abs();
+assert_eq!(r.to_vec()?.len(), 3);
+
+let c = C32::new(2.0, -1.0);
+assert_eq!((&amp;z * c).to_vec()?[0], C32::new(1.0, 2.0) * c);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="what-exists"><a class="header" href="#what-exists">What exists</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td><code>+ - * /</code>, <code>-z</code>, and the compound forms <code>+= -= *= /=</code></td><td><code>Array&lt;C32&gt;</code>; the other side is an array, a <code>C32</code> or an <code>f32</code> (<code>z * 2.0</code>, <code>1.0 / &amp;z</code>), a <code>bool</code> mask multiplies</td></tr>
+<tr><td><code>conj()</code>, <code>exp()</code>, <code>sqrt()</code></td><td><code>Array&lt;C32&gt;</code></td></tr>
+<tr><td><code>real()</code>, <code>imag()</code>, <code>abs()</code>, <code>arg()</code>, <code>norm_sqr()</code></td><td><code>Array&lt;f32&gt;</code></td></tr>
+<tr><td><code>Array::from_parts(&amp;re, &amp;im)</code>, <code>Array::from_polar(&amp;r, &amp;theta)</code>, <code>x.to_complex()</code></td><td><code>Array&lt;C32&gt;</code> from <code>f32</code> arrays (<code>to_complex</code> has zero imaginary parts)</td></tr>
+<tr><td><code>eq(rhs)</code>, <code>ne(rhs)</code>, <code>select(&amp;cond, a, b)</code></td><td><code>Array&lt;bool&gt;</code> / <code>Array&lt;C32&gt;</code>; complex numbers are not ordered: <code>lt</code>, <code>minimum</code> and friends poison with <code>LumaError::Unsupported</code></td></tr>
+<tr><td><code>sum()</code>, <code>mean()</code>, <code>sum_axis(axis)</code>, <code>mean_axis(axis)</code></td><td><code>Array&lt;C32&gt;</code>, lazy like the <code>f32</code> reductions</td></tr>
+<tr><td>views (<code>slice</code>, <code>flip</code>, <code>transpose</code>, …), <code>copy</code>, <code>zeros</code>, <code>full</code>, <code>from_slice</code>, <code>to_vec</code>, <code>item</code></td><td>as for the other element types</td></tr>
+</tbody>
+</table>
+</div>
+<p>There is no sort, scan, <code>matmul</code>, <code>min</code> or <code>max</code> of complex numbers. Take <code>real()</code> / <code>imag()</code> / <code>abs()</code>
+first, or treat the parts as two <code>f32</code> arrays; <code>Array::from_parts</code> puts them back.</p>
+<p>The parts are what the reductions work on: <code>z.sum()</code> is <code>from_parts(&amp;z.real().sum(), &amp;z.imag().sum())</code>,
+and <code>z.abs().sum()</code> computes the complex expression inside the reduction, so no array of complex
+numbers is stored for it.</p>
+<h2 id="numerics"><a class="header" href="#numerics">Numerics</a></h2>
+<ul>
+<li><strong>Products</strong> are the plain <code>f32</code> formula <code>(a.re b.re - a.im b.im, a.re b.im + a.im b.re)</code>, which fuses to
+<code>fma</code> on the devices that have it; the error is relative to <code>|a| |b|</code>, not to a result that cancels.</li>
+<li><strong>Quotients</strong> use Smith’s algorithm: the components of the denominator scale each other, so nothing
+overflows or underflows where the result is representable (<code>(1e30 + 1e30 i) / (1e30 + 1e30 i)</code> is <code>1</code>).
+A zero denominator gives <code>(re / 0, im / 0)</code>: infinity or <code>NaN</code> per component as C99’s Annex G has it, with no trap.
+(A device’s fast <code>f32</code> division returns 0 for a divisor above <code>2^126</code>, about <code>8.5e37</code>: that is the limit of <code>|b|</code> here.)</li>
+<li><strong><code>abs</code></strong> scales the components by a power of two when the larger is above <code>2^62</code> or below <code>2^-62</code> (no division), so <code>|3e30 + 4e30 i|</code> is <code>5e30</code> and <code>|3e-30 + 4e-30 i|</code> is
+<code>5e-30</code>; it is infinite when a component is infinite even if the other is <code>NaN</code>. <code>norm_sqr</code> has no scaling.</li>
+<li><strong><code>arg</code></strong> is <code>atan2(im, re)</code> in <code>[-pi, pi]</code>; <code>exp</code> is <code>e^re (cos im + i sin im)</code>; <code>sqrt</code> is the principal root.</li>
+<li><strong><code>conj</code></strong>, <code>-z</code>, <code>real</code> and <code>imag</code> are exact (a <code>NaN</code> stays one, <code>-0</code> flips its sign).</li>
+</ul>
+<p>A real number <code>s</code> in an operation (<code>z + s</code>, <code>s - z</code>, <code>z * s</code>, <code>z / s</code>) works on the parts (<code>z * s</code> is
+<code>(re * s, im * s)</code>), so <code>inf * 2.0</code> does not turn into <code>NaN</code> the way a product with <code>2 + 0i</code> does.
+<code>s / z</code> is the complex quotient.</p>
+<h2 id="building-arrays-on-the-host"><a class="header" href="#building-arrays-on-the-host">Building arrays on the host</a></h2>
+<p><code>C32::new(re, im)</code>, <code>C32::from_polar(r, theta)</code>, <code>C32::ZERO</code>, <code>C32::ONE</code>, <code>C32::I</code> and <code>C32::from(f32)</code>
+make values; <code>C32</code> has <code>+ - * /</code>, <code>conj</code>, <code>abs</code> and <code>arg</code> on the host (for checking results), and
+<code>Array::from_slice(&amp;[C32], shape)</code> uploads them. <code>to_vec()</code> returns <code>Vec&lt;C32&gt;</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="integer-and-bit-operations"><a class="header" href="#integer-and-bit-operations">Integer and bit operations</a></h1>
 <p><code>Array&lt;u32&gt;</code> is the unsigned integer type: indices, counters, and the lanes of bit-sliced
 cryptography. A <code>u32</code> array fuses, views, reduces, scans and loops like an <code>f32</code> one, and has the
@@ -2485,6 +3103,108 @@ assert_eq!(x.to_vec()?, vec![host(1), host(2), host(3)]);
 generators that fuse into the kernel that reads them; use your own recurrence when you need exact
 integer sequences.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="compact-integers-u8-i8-u16-i16"><a class="header" href="#compact-integers-u8-i8-u16-i16">Compact integers: <code>u8</code>, <code>i8</code>, <code>u16</code>, <code>i16</code></a></h1>
+<p>Sensor samples, image channels, quantized weights, symbols and trace data are 8 or 16 bits wide.
+Luma stores them that way: an <code>Array&lt;u8&gt;</code> or <code>Array&lt;i16&gt;</code> takes one or two bytes per element in
+device memory (and on the host: <code>from_slice(&amp;[u8])</code> and <code>to_vec()</code> copy the bytes, nothing is
+widened), and reading it costs one or two bytes of memory traffic per element, inside any kernel.
+Everything the 32-bit integers do works on them: operators, comparisons, <code>select</code>, <code>minimum</code> /
+<code>maximum</code>, <a href="#views-and-writes">views</a>, reductions, <code>bincount</code>, sorting, and <a href="#lazy-evaluation-and-fusion">fusion</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>Bytes</th><th>Sum accumulates in</th><th>Mean, variance</th></tr>
+</thead>
+<tbody>
+<tr><td><code>u8</code>, <code>u16</code></td><td>1, 2</td><td><code>u32</code></td><td><code>f32</code></td></tr>
+<tr><td><code>i8</code>, <code>i16</code></td><td>1, 2</td><td><code>i32</code></td><td><code>f32</code></td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-rust">use luma::*;
+
+let samples: Vec&lt;i16&gt; = vec![-3, 12000, 32767, -32768, 5];
+let x = Array::from_slice(&amp;samples, 5)?;
+
+// Casts fuse into the kernel that reads the array: this reads 2 bytes per element.
+let scaled = x.to_f32() * 0.5;
+assert_eq!(scaled.to_vec()?, vec![-1.5, 6000.0, 16383.5, -16384.0, 2.5]);
+
+// Arithmetic wraps like Rust's wrapping_* operations.
+assert_eq!((&amp;x + 1i16).to_vec()?, vec![-2, 12001, -32768, -32767, 6]);
+
+// Sums widen to 32 bits; minima and maxima keep the type; means are f32.
+assert_eq!(x.sum().item()?, -3 + 12000 + 32767 - 32768 + 5);
+assert_eq!(x.min().item()?, -32768i16);
+assert_eq!(x.max().item()?, 32767i16);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="wraparound"><a class="header" href="#wraparound">Wraparound</a></h2>
+<p>Every operation computes in a 32-bit register and wraps its result to the type again, as Rust’s
+<code>wrapping_add</code>, <code>wrapping_sub</code>, <code>wrapping_mul</code>, <code>wrapping_neg</code>, <code>wrapping_abs</code>, <code>wrapping_div</code>,
+<code>wrapping_shl</code> and <code>wrapping_shr</code> do: <code>250u8 + 10</code> is <code>4</code>, <code>i16::MIN - 1</code> is <code>i16::MAX</code>,
+<code>-i8::MIN</code> is <code>i8::MIN</code>, <code>i8::MIN / -1</code> is <code>i8::MIN</code>. A shift amount is taken modulo the width
+of the type (<code>1u8 &lt;&lt; 9</code> is <code>2</code>); <code>&gt;&gt;</code> is logical for the unsigned types and arithmetic for the
+signed ones. <code>!</code> is the bitwise complement. Division and remainder by zero are as undefined as
+for <code>u32</code> and <code>i32</code>. There are no rotations (the width of a rotation is the type’s), and no
+operators with a shared host-side <a href="#lazy-evaluation-and-fusion"><code>Scalar</code></a>: use plain values (<code>&amp;x + 3u8</code>).</p>
+<h2 id="casts-2"><a class="header" href="#casts-2">Casts</a></h2>
+<p>A cast <strong>from</strong> a compact integer is by value: <code>-1i8</code> is <code>-1i32</code>, <code>0xFFFF_FFFFu32</code> as <code>u32</code>,
+<code>-1.0f32</code>; <code>to_bool</code> is <code>!= 0</code>. A cast <strong>to</strong> one wraps an integer (it keeps the low bits: <code>300u32</code>
+is <code>44u8</code>, <code>-1i32</code> is <code>255u8</code> and <code>65535u16</code>) and saturates a float (a NaN is 0), as Rust’s <code>as</code>.
+Every dtype has <code>to_u8</code>, <code>to_i8</code>, <code>to_u16</code> and <code>to_i16</code> (except itself), and the compact types have
+<code>to_f32</code>, <code>to_f64</code> (where the device has 64-bit floats), <code>to_df32</code>, <code>to_u32</code>, <code>to_i32</code>, <code>to_bool</code>
+and the other three. A cast is lazy and fuses like any elementwise operation: it is the
+widening of <code>x.sum()</code> and <code>x.mean_axis(1)</code>, which therefore never store a widened copy.</p>
+<h2 id="reductions-sorting-and-counting"><a class="header" href="#reductions-sorting-and-counting">Reductions, sorting and counting</a></h2>
+<ul>
+<li><code>sum()</code>, <code>sum_axis()</code>, <code>cumsum()</code>: in <code>u32</code> / <code>i32</code>, so they wrap beyond 32 bits: sums of <code>u8</code>
+are exact for up to 16.8 million elements of 255, <code>u16</code> sums for 65 537 of 65 535. Widen first
+(<code>x.to_f32().sum()</code>, or <code>to_f64()</code>) for longer arrays.</li>
+<li><code>min()</code>, <code>max()</code>, <code>min_axis()</code>, <code>max_axis()</code>: the same type. <code>argmax</code>, <code>argmin</code> (and <code>_axis</code>):
+indices as for any array.</li>
+<li><code>mean()</code>, <code>mean_axis()</code>, <code>var_axis()</code>, <code>std_axis()</code>: <code>f32</code>, accumulated in <code>f32</code> like those of an
+<code>f32</code> array (every 8-bit and 16-bit value is exact in <code>f32</code>).</li>
+<li><code>sort()</code>, <code>sort_descending()</code>, <code>argsort()</code>: a stable radix sort over the bits of the elements (one pass for 8-bit types, two for 16-bit ones, where <code>u32</code> takes four), the first pass reading the elements as stored; <code>sort_axis()</code> sorts the widened lines.</li>
+<li><code>bincount(bins)</code> of <code>u8</code> and <code>u16</code>, and <code>histogram()</code> (256 or 65536 bins): the counts as a <code>u32</code> array,
+computed in one kernel that reads the elements at their own size.</li>
+</ul>
+<pre><code class="language-rust">use luma::*;
+
+// Per-column statistics of a matrix of 16-bit traces: [samples, traces], columns over axis 1.
+let (samples, traces) = (4usize, 3usize);
+let data: Vec&lt;i16&gt; = (0..(samples * traces) as i16).map(|v| v * 100 - 500).collect();
+let m = Array::from_slice(&amp;data, [samples, traces])?;
+let mean = m.mean_axis(1);
+let var = m.var_axis(1);
+assert_eq!(mean.to_vec()?, vec![-100.0, 0.0, 100.0, 200.0]);
+for v in var.to_vec()? {
+    assert!((v - 106_666.67).abs() &lt; 1.0);
+}
+
+// A histogram of bytes, read as bytes.
+let bytes = Array::from_slice(&amp;[1u8, 1, 2, 255, 1, 0], 6)?;
+let counts = bytes.histogram().to_vec()?;
+assert_eq!((counts[0], counts[1], counts[2], counts[255]), (1, 3, 1, 1));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="how-they-are-stored"><a class="header" href="#how-they-are-stored">How they are stored</a></h2>
+<p>Elements share <code>u32</code> words in device buffers: element <code>i</code> of a <code>u8</code> array is byte <code>i % 4</code> of word
+<code>i / 4</code>, and of a <code>u16</code> or <code>i16</code> array half <code>i % 2</code> of word <code>i / 2</code>, little endian: the bytes of
+the array on the host. An array of <code>n</code> elements takes <code>ceil(n / 4)</code> (or <code>ceil(n / 2)</code>) words. A
+custom <a href="#custom-kernels">kernel</a> sees an <code>array&lt;u32&gt;</code> of those words (as for <code>bool</code>, which has 32
+to a word), and arrays split over several buffers split like <code>f32</code> arrays, so mixed
+operations (a cast to <code>f32</code>) run piecewise.</p>
+<p>The kernels read the words and extract the field (<code>(word &gt;&gt; shift) &amp; mask</code>, or two shifts to
+sign-extend), and write <strong>whole words</strong>: a fused elementwise kernel with a compact output gives each
+invocation the 4 (for bytes) or 2 (for halves) neighbouring elements that make a word, so
+no two invocations ever write one word and no atomics are needed. Kernels that cannot do that (a
+<code>put</code> of scattered indices, a region assign, a <code>stack</code>) update their element with an atomic
+<code>and</code> and <code>or</code> on its word, which is also race free but slower. The CUDA and CPU backends read the
+same words; the layout is byte-identical to a plain array of <code>u8</code> or <code>i16</code>, so nothing differs
+between backends.</p>
+<p>Where it pays: memory-bound work. On an RTX 3090 (CUDA), a chain of <code>u8</code> arithmetic over 64M
+elements takes 0.17 ms where the same chain on <code>u32</code> takes 0.65 ms, and the sum of 64M <code>i16</code> takes
+0.17 ms against 0.32 ms for <code>f32</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="custom-kernels"><a class="header" href="#custom-kernels">Custom kernels</a></h1>
 <p>When an algorithm does not fit array operations (a scatter with atomics, a tuned stencil, an
 existing shader), write the kernel in WGSL and run it on Luma arrays. A custom kernel joins the same
@@ -2555,6 +3275,14 @@ scalars, vectors, matrices, arrays. <code>luma::encase</code> is a re-export of 
 <p><strong>Element sizes</strong> are checked: a binding <code>array&lt;f32&gt;</code> takes arrays of 4-byte elements,
 <code>array&lt;vec2&lt;f32&gt;&gt;</code> arrays of 8-byte ones (<code>[f32; 2]</code>, <code>Df32</code>, <code>f64</code>). Only the size is compared,
 not the type: an <code>Array&lt;u32&gt;</code> passes for <code>array&lt;f32&gt;</code>, so keep the types straight yourself.</p>
+</li>
+<li>
+<p><strong><code>Array&lt;u8&gt;</code>, <code>Array&lt;i8&gt;</code>, <code>Array&lt;u16&gt;</code> and <code>Array&lt;i16&gt;</code></strong> bind as <code>array&lt;u32&gt;</code> of words that
+hold four or two elements (<a href="#how-they-are-stored">Compact integers</a>): element <code>i</code> of
+a byte array is <code>(a[i &gt;&gt; 2u] &gt;&gt; ((i &amp; 3u) * 8u)) &amp; 0xFFu</code>, of a 16-bit one
+<code>(a[i &gt;&gt; 1u] &gt;&gt; ((i &amp; 1u) * 16u)) &amp; 0xFFFFu</code> (sign-extend the signed types). The bytes of the
+last word past the end of the array are unspecified: ignore them. A kernel that writes one writes whole words, or
+updates single fields with <code>atomicAnd</code> / <code>atomicOr</code> on an <code>array&lt;atomic&lt;u32&gt;&gt;</code> binding.</p>
 </li>
 <li>
 <p><strong><code>Array&lt;bool&gt;</code></strong> binds as <code>array&lt;u32&gt;</code> of <em>bit-packed words</em>: an array of <code>n</code> booleans is
@@ -2906,6 +3634,23 @@ numbers are used. <code>LUMA_STAGING=off</code> turns staging off; <code>Context
 decisions are based on. The model is not a tuning knob you can set: if a decision is wrong on your
 hardware, <code>x.cache()</code> forces a materialisation, and <code>LUMA_STAGING=off</code> removes the staged plan (the
 model still chooses between recomputing and materialising).</p>
+<h3 id="reading-a-source-through-a-texture"><a class="header" href="#reading-a-source-through-a-texture">Reading a source through a texture</a></h3>
+<p>The same model decides where a kernel reads a two-dimensional source (<code>jit::cost::read_path</code>): from
+the buffer (on NVIDIA GPUs through the read-only data cache, which a <code>read</code> binding gets on its own)
+or through the device’s texture units, as exact gathers. A texture is a view of the source:
+free on CUDA (the buffer itself, as a pitched texture, kept with the array while its buffer stays
+where it is), a copy of the image on wgpu (a read and a write of it and a launch, made per use). The
+saving is a share of the kernel’s time that the gathers take off (per pattern, measured on an RTX
+3090 and an RTX 3080 Laptop: bicubic warps 26 %, bilinear warps 5-13 %, scattered bicubic positions
+28-36 %, none for <code>resize</code>, smooth positions and nearest: those kernels are bound by DRAM), and a
+texture is read only where the saving is bigger than what the view costs (about 2 us on CUDA, once
+per array; a copy of the image on wgpu, 0.4 ms at 1080p, which no measured kernel recovers). The
+kernels the fusion planner builds never read through a texture: gathers from a 2-D array at computed
+or data-dependent coordinates (single <code>take</code>s, lookup tables, four-tap bilinear footprints written
+as array operations, clamped windows) ran at 0.84-1.0 of the buffer’s speed in texture reads on
+both GPUs, because they are bound by DRAM or by index arithmetic, and the planner sees flat
+indices, not a footprint a gather could take. So on wgpu and the CPU backend the sources are read from buffers,
+and on CUDA the kernels above are measurably faster; <code>Profile</code> shows no extra launch.</p>
 <p>The model also sizes loops: <a href="#launch-sizing"><code>iterate_all</code></a> cuts long register loops into
 launches of about 40 ms of GPU time by it, and it decides when a circular <code>shift</code> of an expression
 is recomputed, staged, or evaluated first.</p>
@@ -2923,10 +3668,10 @@ becomes the load of that kernel.</p>
 </thead>
 <tbody>
 <tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
-<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td>eager: the result is evaluated when the call returns</td></tr>
+<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td><code>f32</code> on a GPU backend: pending until used, then recorded with the other pending axis reductions over the same lines in one kernel (up to 8 ops); otherwise eager: the result is evaluated when the call returns</td></tr>
 <tr><td><code>solve_tridiagonal</code>, <code>solve_tridiagonal_parts</code>, <code>solve_block_tridiagonal_parts</code></td><td>each pending block/vector entry is computed where a cell’s system is loaded</td><td>eager: the solution is evaluated when the call returns</td></tr>
 <tr><td><code>put_add</code>, <code>put_min</code>, <code>put_max</code>, <code>bincount</code>, <code>histogram</code>, <code>group_*</code></td><td>the value and the index (or code, or bucket) expressions of the scatter</td><td>an in-place write, like <code>put</code></td></tr>
-<tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
+<tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>quantiles</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort (<code>sort_axis</code> of lines of up to 2048 elements evaluates its operand first)</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
 </tbody>
 </table>
 </div>
@@ -3290,6 +4035,868 @@ assert_eq!(top.to_vec()?, vec![0, 1, 2]);
 assert_eq!(feature0.take(&amp;top).to_vec()?, vec![1.0, 2.0, 3.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="images-and-filters"><a class="header" href="#images-and-filters">Images and filters</a></h1>
+<p>luma has the usual 2-D and 3-D image operations as built-in kernels that run on every backend:
+convolutions, rank and morphological filters, derivatives, the bilateral filter, summed-area
+tables, colour conversions and <code>unwrap</code> / <code>wrap</code> (im2col / col2im).</p>
+<p>An image is an <code>[H, W]</code> array (<strong>axis 0, the height, varies fastest</strong>, as in ArrayFire) or an
+<code>[H, W, C]</code> array with the channels in planes. The axes after the ones an operation works on
+are a batch: <code>conv2</code> filters every <code>[H, W]</code> plane of an <code>[H, W, N, M]</code> array, <code>conv3</code> every
+<code>[D0, D1, D2]</code> volume of an <code>[D0, D1, D2, N]</code> array. Colour conversions take <code>[H, W, 3]</code>
+(and <code>[H, W, 3, N]</code>).</p>
+<p>Like every operation they record work and poison the result on an error (a zero stride, a window
+larger than the padded image, a kernel of the wrong shape). They need arrays that fit one
+buffer.</p>
+<h2 id="convolution-2"><a class="header" href="#convolution-2">Convolution</a></h2>
+<p><code>conv2(&amp;kernel, spec)</code> and <code>conv3</code> are <em>cross-correlations</em> (like <code>conv1d</code>): the kernel is not
+flipped; flip it for a true convolution, which is what ArrayFire’s <code>convolve2</code> computes.
+<code>ConvSpec</code> gives the padding (<code>Same</code>, the default: the output has the shape of the input;
+<code>Valid</code>; <code>Full</code>; or explicit cells before and after every axis), the stride and the border
+([<code>Border</code>]: <code>Zero</code>, <code>Edge</code>, <code>Mirror</code>, <code>Wrap</code>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let img = Array::from_slice(&amp;(0..12).map(|i| i as f32).collect::&lt;Vec&lt;_&gt;&gt;(), [4, 3])?;
+let k = gaussian_kernel(3, 3, 1.0, 1.0)?;
+let blurred = img.conv2(&amp;k, ConvSpec::new().border(Border::Edge));
+let small = img.conv2(&amp;k, ConvSpec::new().padding(Padding::Valid).stride([2, 1]));
+assert_eq!(blurred.shape(), img.shape());
+assert_eq!(small.shape(), Shape::from([1, 1]));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>For a separable kernel <code>conv2_sep(&amp;along0, &amp;along1, spec)</code> does <code>k0 + k1</code> multiply-adds per
+output instead of <code>k0 * k1</code>; <code>gaussian_kernel_1d(len, sigma)</code> gives the taps of a Gaussian.</p>
+<p>A workgroup stages a tile of the image together with the halo its windows need in workgroup
+memory (the border is applied while staging) and every invocation computes several outputs
+from it, so the image is read from memory about once whatever the kernel size.</p>
+<h2 id="rank-and-morphological-filters"><a class="header" href="#rank-and-morphological-filters">Rank and morphological filters</a></h2>
+<p><code>medfilt1(len, border)</code>, <code>medfilt2([k0, k1], border)</code>, <code>minfilt</code> / <code>maxfilt([k0, k1], border)</code>
+(<code>minfilt3</code> / <code>maxfilt3</code> for volumes) work on <code>f32</code>, <code>i32</code> and <code>u32</code>. <code>dilate(&amp;mask)</code> and
+<code>erode(&amp;mask)</code> (<code>dilate3</code>, <code>erode3</code>) take any structuring element: the window cells where the
+mask is not zero. With <code>Border::Ignore</code> (the default of the morphological filters) cells outside
+the image do not take part.</p>
+<pre><code class="language-rust">use luma::*;
+
+let img = Array::from_slice(&amp;[1u32, 5, 2, 9, 3, 7, 4, 8, 6], [3, 3])?;
+let m = img.medfilt2([3, 3], Border::Edge).to_vec()?;
+assert_eq!(m[4], 5); // the median of the whole image
+let cross = Array::from_slice(&amp;[0u32, 1, 0, 1, 1, 1, 0, 1, 0], [3, 3])?;
+assert_eq!(img.dilate(&amp;cross).to_vec()?[4], 9);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="derivatives-bilateral-filter"><a class="header" href="#derivatives-bilateral-filter">Derivatives, bilateral filter</a></h2>
+<p><code>sobel()</code> returns the Sobel derivatives <code>(d0, d1)</code> along axis 0 and axis 1 from one pass over the
+image, <code>sobel_magnitude()</code> their magnitude, <code>grad()</code> the central-difference gradient (one-sided
+at the borders). <code>bilateral(spatial_sigma, range_sigma)</code> and <code>bilateral_color(..)</code> (for
+<code>[H, W, 3]</code>) are the edge-preserving smoothing filter.</p>
+<h2 id="summed-area-tables-moments-histograms"><a class="header" href="#summed-area-tables-moments-histograms">Summed-area tables, moments, histograms</a></h2>
+<p><code>sat()</code> is the double prefix sum (four lookups give the sum of any rectangle), <code>moments()</code> the raw
+moments <code>M00 M01 M10 M11</code> of every image, <code>hist_equal(&amp;hist)</code> equalises an image with the
+histogram <code>hist</code> of its (integer valued) pixels.</p>
+<h2 id="colour"><a class="header" href="#colour">Colour</a></h2>
+<p><code>rgb2gray</code>, <code>gray2rgb</code>, <code>rgb2hsv</code>, <code>hsv2rgb</code>, <code>rgb2ycbcr(YccStd)</code> and <code>ycbcr2rgb(YccStd)</code> convert
+<code>[H, W, 3]</code> images (RGB in <code>0 ..= 1</code>, hue in <code>0 .. 1</code>, Y’CbCr in the 8-bit studio range);
+<code>color_space(from, to)</code> chains them.</p>
+<h2 id="im2col-and-col2im"><a class="header" href="#im2col-and-col2im">im2col and col2im</a></h2>
+<p><code>unwrap(window, stride, pad, column)</code> lays the windows of an image out as the columns (or rows)
+of a matrix, so that a convolution is a <code>matmul</code>; <code>wrap(..)</code> sums them back (every output cell
+gathers its windows, so the sum is deterministic).</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="features-matching-and-image-analysis"><a class="header" href="#features-matching-and-image-analysis">Features, matching and image analysis</a></h1>
+<p><code>luma::vision</code> has the feature detectors, descriptors and matchers of ArrayFire’s <code>vision.h</code>
+and the analysis functions of <code>image.h</code> that are not filters (those are in
+<a href="#images-and-filters">Images and filters</a>). They are built-in kernels: every backend runs them, and
+they take <code>[H, W]</code> images (<code>H</code> along axis 0, the fastest axis, as in ArrayFire).</p>
+<p>The chapters that follow cover the rest: <a href="#vision-harris-and-susan-corners-difference-of-gaussians">Harris and SUSAN corners, difference of
+Gaussians</a>, <a href="#template-matching-nearest-neighbour-and-hamming-matchers">template matching and the nearest-neighbour and Hamming
+matchers</a>, <a href="#vision-canny-edges-anisotropic-diffusion-mean-shift">Canny edges, anisotropic diffusion and mean shift</a>,
+<a href="#connected-components-confidence-connected-components-deconvolution">connected components and deconvolution</a> and <a href="#vision-orb-sift-and-gloh">ORB, SIFT and
+GLOH</a>. This chapter has <code>fast</code> and <code>homography</code>.</p>
+<h2 id="points-keypoints"><a class="header" href="#points-keypoints">Points: <code>Keypoints</code></a></h2>
+<p>A detector returns [<code>Keypoints</code>], ArrayFire’s <code>features</code>: five one-dimensional <code>f32</code> arrays <code>x</code>,
+<code>y</code>, <code>score</code>, <code>orientation</code> and <code>size</code> of the same length. As in ArrayFire <code>x</code> is the index along
+<strong>axis 1</strong> (the column) and <code>y</code> the index along <strong>axis 0</strong> (the row). Detectors that have no use
+for the orientation and size fill them with 0 and 1.</p>
+<p>The number of points depends on the data: a detector counts them on the device, writes them
+at their final place and then reads the count back, so it <strong>synchronizes once</strong> (about as fast
+as a <code>filter</code>) and returns <code>Result&lt;Option&lt;Keypoints&gt;&gt;</code>: <code>None</code> for an image without a point (luma has
+no arrays without elements), an <code>Err</code> for a bad argument or a failed device.</p>
+<h2 id="fast"><a class="header" href="#fast"><code>fast</code></a></h2>
+<p><code>image.fast(threshold, arc_length, non_max, feature_ratio, edge)</code> is the FAST corner detector
+(ArrayFire’s <code>fast</code>): a pixel is a corner when <code>arc_length</code> (9 to 16) consecutive pixels of the
+circle of radius 3 around it are all brighter than the pixel plus <code>threshold</code> or all darker than
+it minus <code>threshold</code>. The score is the larger of the sums of <code>|ring - pixel| - threshold</code> over the
+brighter and over the darker ring pixels; <code>non_max</code> keeps a corner only if it scores strictly more
+than its eight neighbours; <code>edge</code> (at least 3) is the width of the border without corners and
+<code>feature_ratio</code> bounds the number of points to that share of the pixels.</p>
+<pre><code class="language-rust">use luma::*;
+
+// A bright dot on a dark image is one corner.
+let mut data = vec![0.0f32; 16 * 16];
+data[8 + 16 * 8] = 100.0;
+let img = Array::from_slice(&amp;data, [16, 16])?;
+let corners = img.fast(20.0, 9, true, 0.1, 3)?.expect("one corner");
+assert_eq!(corners.count(), 1);
+assert_eq!(corners.x.to_vec()?, [8.0]);
+assert_eq!(corners.y.to_vec()?, [8.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Two passes over tiles of 32 x 8 pixels do the work: the first counts the corners of every tile
+(nothing of the score image is stored), a one-workgroup scan turns the counts into offsets and the
+second recomputes the scores and writes every tile’s points at its offset. The points come in the
+order of the tiles (tiles along axis 0 first), within a tile axis 0 first; the limit
+<code>feature_ratio</code> keeps the first points of that order.</p>
+<p>Differences from ArrayFire: its <code>fast</code> limits the number of corner <em>candidates</em> before the
+non-maximal suppression and lists the points row by row; on its CPU backend the suppression
+leaves out the pixels within <code>edge + 2</code> of the border and mixes up the two axes on images that
+are not square. luma applies the limit after the suppression and suppresses everywhere inside
+<code>edge</code>.</p>
+<h2 id="homography"><a class="header" href="#homography"><code>homography</code></a></h2>
+<p><code>homography(x_src, y_src, x_dst, y_dst, method, inlier_thr, iterations)</code> estimates the perspective
+transform between matching points (ArrayFire’s <code>homography</code>): every one of <code>iterations</code>
+hypotheses is the direct linear transform of four random point pairs and is scored over all the
+points, RANSAC by the number of points that land within <code>inlier_thr</code> of their destination, least
+median of squares (<code>HomographyMethod::Lmeds</code>) by the median of the squared errors. It returns the
+<code>[3, 3]</code> matrix (its nine values in memory order are the rows of <code>H</code>, <code>(x', y', 1) ~ H (x, y, 1)</code>,
+scaled so that <code>H[2][2] = 1</code>) and the inlier count as a one-element <code>u32</code> array: nothing is read
+back until you ask.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x: Vec&lt;f32&gt; = (0..8).map(|i| (i * 7 % 11) as f32).collect();
+let y: Vec&lt;f32&gt; = (0..8).map(|i| (i * 5 % 13) as f32).collect();
+let (xd, yd): (Vec&lt;f32&gt;, Vec&lt;f32&gt;) = (x.iter().map(|v| v + 3.0).collect(), y.iter().map(|v| v - 2.0).collect());
+let up = |v: &amp;[f32]| Array::from_slice(v, v.len());
+let (h, inliers) = homography(&amp;up(&amp;x)?, &amp;up(&amp;y)?, &amp;up(&amp;xd)?, &amp;up(&amp;yd)?, HomographyMethod::Ransac, 0.5, 50);
+assert_eq!(inliers.item()?, 8);
+assert!((h.to_vec()?[2] - 3.0).abs() &lt; 1e-3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>One workgroup scores one hypothesis; the samples come from a fixed hash of the hypothesis number,
+so a call is deterministic (ArrayFire’s differ: compare the recovered transform, not the
+matrices). As in ArrayFire the matrix is the best sample’s, not refined over its inliers.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="vision-harris-and-susan-corners-difference-of-gaussians"><a class="header" href="#vision-harris-and-susan-corners-difference-of-gaussians">Vision: Harris and SUSAN corners, difference of Gaussians</a></h1>
+<p><code>harris</code>, <code>susan</code> and <code>dog</code> are ArrayFire’s functions of the same names (<code>vision.h</code>). The
+detectors take an <code>[H, W]</code> image of <code>f32</code> (axis 0, the height, is the fastest axis; a feature’s
+<code>x</code> is the index along axis 1 and <code>y</code> the one along axis 0) and return <code>Option&lt;Keypoints&gt;</code>: <code>None</code>
+if there is no corner, since luma has no arrays without elements. The number of corners depends
+on the data, so a detector reads it back and <strong>synchronizes</strong> once (like <code>fast</code> and <code>filter</code>);
+the corners themselves stay on the device. <code>orientation</code> is 0 and <code>size</code> is 1.</p>
+<p>ArrayFire’s <code>harris</code> takes <code>f32</code> and <code>f64</code>, its <code>susan</code> and <code>dog</code> every image type; luma takes
+<code>f32</code> only, like the rest of the image operations. The detectors take one <code>[H, W]</code> image and
+return an error for a batch (<code>[H, W, N]</code>); ArrayFire’s <code>harris</code> and <code>susan</code> reject those as well
+(the documentation of <code>susan</code> mentions batches, the code does not take them). A detector gives
+<code>None</code> for an image too small to have a corner. <code>dog</code> takes batches like every 2-D filter.</p>
+<h2 id="harris"><a class="header" href="#harris">Harris</a></h2>
+<pre><code class="language-rust">use luma::Array;
+
+// A bright square on a dark image has four corners.
+let mut data = vec![0.0f32; 32 * 32];
+for j in 12..20 {
+    for i in 12..20 {
+        data[i + 32 * j] = 100.0;
+    }
+}
+let img = Array::from_slice(&amp;data, [32, 32])?;
+let corners = img.harris(10, 0.0, 1.0, 0, 0.04)?.expect("corners");
+assert_eq!(corners.count(), 4);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>harris(max_corners, min_response, sigma, block_size, k_thr)</code>:</p>
+<ul>
+<li>The derivatives are the central differences <code>(in[i + 1] - in[i - 1]) / 2</code> along both axes.
+The structure tensor <code>M</code> sums their products with a separable window, and the response of a
+pixel is <code>det(M) - k_thr * trace(M)^2</code>. (Not normalised in any way: the scale is that of the
+pixel values to the fourth power, the default <code>min_response</code> of 1e5 suits pixels of 0 to 255.)</li>
+<li>The window has <code>floor(6 * sigma)</code> cells, one less if that is even, with Gaussian weights
+(<code>block_size == 0</code>, <code>sigma</code> in <code>[0.5, 5]</code>: 3 cells for <code>sigma</code> 0.5 to 0.8, 5 for 0.9 to 1.1, …).
+With <code>block_size &gt; 0</code> the window has that many cells (1 to 32): Gaussian weights of <code>sigma</code>
+if <code>sigma &gt;= 0.5</code> and equal weights otherwise. ArrayFire’s documentation only mentions the box
+window and <code>block_size</code> 3 to 31; its code does what is described here, and so does luma.</li>
+<li>A pixel is a corner if its response is positive and strictly larger than the responses of its
+eight neighbours. The response only exists where the window lies inside the image, so
+corners are at least <code>window / 2 + 2</code> cells away from the border.</li>
+<li>With <code>max_corners &gt; 0</code> the corners are ranked and the strongest <code>max_corners</code> are returned,
+strongest first (<code>min_response</code> is ignored). With <code>max_corners == 0</code> every corner of response
+at least <code>min_response</code> (which must then be positive) is returned. <code>k_thr</code> is at least 0.01.</li>
+</ul>
+<p>luma computes all of this in one kernel per tile of 32 x 8 pixels (the tile of pixels, the
+derivatives, the window passes and the decision in workgroup memory; the response is never
+stored), then scans the per-tile counts and gathers the corners: three launches and one read of
+the count. The ranking of <code>max_corners</code> is one more launch with a single workgroup (a radix
+select of the <code>max_corners</code>-th largest response, then a bitonic sort of the selected corners in
+workgroup memory; ties rank in the order of the corners, like a stable sort); for a limit above
+1024 or more than 16384 corners it is <code>topk</code> (a single workgroup is slower than the sort
+from there on).</p>
+<p>Differences from ArrayFire, besides the element types: the corners that are not ranked are
+listed tile by tile (ArrayFire’s CPU backend by column, its CUDA backend in the order its
+blocks finish), the corner set can differ from ArrayFire’s by pixels whose response ties with a
+neighbour up to float rounding (ArrayFire’s own CPU and CUDA backends differ the same way), and
+an image too small for any corner is <code>None</code>.</p>
+<h2 id="susan"><a class="header" href="#susan">SUSAN</a></h2>
+<pre><code class="language-rust">use luma::Array;
+
+let mut data = vec![0.0f32; 32 * 32];
+for j in 10..20 {
+    for i in 8..18 {
+        data[i + 32 * j] = 200.0;
+    }
+}
+let img = Array::from_slice(&amp;data, [32, 32])?;
+let corners = img.susan(3, 32.0, 10.0, 0.5, 3)?.expect("corners");
+assert_eq!(corners.count(), 4);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>susan(radius, diff_thr, geom_thr, feature_ratio, edge)</code>: the area of similar pixels around a
+pixel is <code>n = sum exp(-((c - v) / diff_thr)^6)</code> over the pixels <code>v</code> of the disc <code>i^2 + j^2 &lt; radius^2</code> around it (the centre <code>c</code> included). A pixel with <code>n &lt; geom_thr</code> has the response
+<code>geom_thr - n</code>; corners are the strict maxima of the response among their eight neighbours.
+Pixels closer than <code>edge</code> to the border have no response (so corners are at least <code>edge + 1</code>
+away). <code>radius</code> is at most 9 and at most <code>edge</code>; the thresholds are positive; <code>feature_ratio</code> in
+<code>(0, 1]</code> limits the corners to <code>floor(feature_ratio * H * W)</code>. If there are more, the first ones
+in memory order (axis 0 fastest) are kept: that is what ArrayFire’s CPU backend does, its CUDA
+backend keeps an arbitrary subset.</p>
+<p>Differences from ArrayFire: <strong><code>x</code> is the column and <code>y</code> the row</strong>, like every detector of luma;
+ArrayFire’s <code>susan</code> (CPU and CUDA backend alike) returns the row as <code>x</code>, which makes its
+coordinates unusable for the plots of the other detectors. The corners below the limit come in
+tile order, not in memory order. An <code>edge</code> larger than the image gives <code>None</code> (ArrayFire raises
+an error from half the larger dimension on).</p>
+<h2 id="difference-of-gaussians"><a class="header" href="#difference-of-gaussians">Difference of Gaussians</a></h2>
+<pre><code class="language-rust">use luma::Array;
+
+let img = Array::from_slice(&amp;[1.0f32; 25], [5, 5])?;
+// A constant image has no detail away from the (zero padded) border.
+let d = img.dog(1, 2).to_vec()?;
+assert!(d[12].abs() &lt; 1e-6);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>dog(radius1, radius2)</code> is the image blurred with the Gaussian kernel of <code>2 * radius1 + 1</code> cells
+a side minus the image blurred with the one of <code>2 * radius2 + 1</code> (the kernel of <code>gaussian_kernel</code>
+with the standard deviation <code>0.25 * cells</code>), zero border, same shape; it filters every <code>[H, W]</code>
+plane of a batch. Each blur is a separable pass pair, the result is lazy and poisons on an
+error. A radius of 0 is the identity; equal radii give zeros. ArrayFire takes signed radii (a
+negative one gives garbage), luma unsigned ones, and ArrayFire’s CUDA backend fails for kernels
+of more than 17 cells, luma has no such limit.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="template-matching-nearest-neighbour-and-hamming-matchers"><a class="header" href="#template-matching-nearest-neighbour-and-hamming-matchers">Template matching, nearest-neighbour and Hamming matchers</a></h1>
+<p><code>Array::match_template</code>, <code>nearest_neighbour</code> and <code>hamming_matcher</code> are ArrayFire’s
+<code>matchTemplate</code>, <code>nearestNeighbour</code> and <code>hammingMatcher</code>. They are built-in kernels that run on
+every backend and need arrays that fit one buffer.</p>
+<h2 id="template-matching"><a class="header" href="#template-matching">Template matching</a></h2>
+<p><code>image.match_template(&amp;template, MatchType)</code> scores, for every pixel of the <code>[H, W]</code> image, the
+window of the template’s size that <strong>starts</strong> at that pixel (axis 0 first); pixels past the image
+count as 0. The result has the shape of the image, and axes 2 and 3 of the image are a batch (the
+template is one <code>[h, w]</code> array for all planes). The metrics, with <code>w</code> the window, <code>t</code> the template
+and <code>mean</code> taken over the <code>h * w</code> pixels of the (zero-padded) window and of the template:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>MatchType</code></th><th>value</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Sad</code>, <code>Ssd</code></td><td><code>sum abs(w - t)</code>, <code>sum (w - t)^2</code></td></tr>
+<tr><td><code>Zsad</code>, <code>Zssd</code></td><td>the same with <code>w - mean(w)</code> and <code>t - mean(t)</code></td></tr>
+<tr><td><code>Lsad</code>, <code>Lssd</code></td><td>the same with <code>t</code> scaled by <code>mean(w) / mean(t)</code></td></tr>
+<tr><td><code>Ncc</code></td><td><code>sum(w t) / sqrt(sum w^2 * sum t^2)</code></td></tr>
+<tr><td><code>Zncc</code></td><td><code>Ncc</code> of <code>w - mean(w)</code> and <code>t - mean(t)</code></td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-rust">use luma::{Array, MatchType};
+
+let image = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])?;
+let template = Array::from_slice(&amp;[2.0f32, 3.0], [2, 1])?;
+// The window at the last row reaches one pixel past the image (0).
+let sad = image.match_template(&amp;template, MatchType::Sad);
+assert_eq!(sad.to_vec()?, [2.0, 0.0, 4.0, 4.0, 6.0, 7.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Differences from ArrayFire (both of its CPU and CUDA backends agree on the formulas above, which
+were checked against them):</p>
+<ul>
+<li><code>Ncc</code> and <code>Zncc</code> work; ArrayFire rejects them with an invalid argument error. A window whose
+denominator is 0 scores 0.</li>
+<li>A template of a single row or column works (ArrayFire wants a 2-D template); an image with a
+fourth axis is matched plane by plane (ArrayFire computes only the first plane).</li>
+<li>A template larger than the image is accepted, as in ArrayFire.</li>
+<li>Float sums are accumulated in another order: results agree to a few ulps per term.</li>
+</ul>
+<p>A workgroup of 32 x 8 invocations computes a tile of 128 x 32 outputs (64 x 32 on devices with
+16 KB of workgroup memory), 16 per invocation. It stages the tile’s window of the image and the
+template in workgroup memory (a template too large for it is staged in slabs, one rectangle after
+the other) and every invocation slides down the template’s columns keeping the image values of its
+outputs in registers: one shared-memory read of the image and one broadcast read of the template
+serve four accumulations. The metrics that subtract the mean of the window sum it first with the
+same walk.</p>
+<h2 id="nearest-neighbours"><a class="header" href="#nearest-neighbours">Nearest neighbours</a></h2>
+<p><code>nearest_neighbour(&amp;query, &amp;train, dist_dim, n_dist, DistType)</code> returns <code>(index, distance)</code>, both
+<code>[n_dist, nq]</code>: column <code>j</code> lists the <code>n_dist</code> train features nearest to query <code>j</code>, closest first.
+With <code>dist_dim</code> 0 a feature is a column of <code>[len, n]</code>, with 1 a row of <code>[n, len]</code>. <code>DistType</code> is
+<code>Sad</code>, <code>Ssd</code> or (for <code>u32</code> features) <code>Shd</code>, the Hamming distance; <code>hamming_matcher</code> is the last
+one on <code>u32</code> descriptors (256-bit ORB descriptors are <code>[8, n]</code>).</p>
+<pre><code class="language-rust">use luma::{hamming_matcher, nearest_neighbour, Array, DistType};
+
+let train = Array::from_slice(&amp;[0.0f32, 1.0, 4.0, 4.0, 9.0, 9.0], [2, 3])?;
+let query = Array::from_slice(&amp;[0.0f32, 0.0, 5.0, 5.0], [2, 2])?;
+let (index, dist) = nearest_neighbour(&amp;query, &amp;train, 0, 2, DistType::Ssd)?;
+assert_eq!(index.to_vec()?, [0, 1, 1, 2]);
+assert_eq!(dist.to_vec()?, [1.0, 32.0, 2.0, 32.0]);
+
+let words = Array::from_slice(&amp;[0u32, 0, 0xFF, 0, 0xF, 1], [2, 3])?;
+let probe = Array::from_slice(&amp;[0x7u32, 0], [2, 1])?;
+let (index, dist) = hamming_matcher(&amp;probe, &amp;words, 0, 2)?;
+assert_eq!((index.to_vec()?, dist.to_vec()?), (vec![2, 0], vec![2, 3]));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>Features are <code>f32</code> (<code>f32</code> distances), <code>u32</code> (<code>u32</code> distances, also for <code>Sad</code> and <code>Ssd</code>; unsigned
+differences, sums wrap) or <code>i32</code> (<code>i32</code> distances). Differences from ArrayFire:</p>
+<ul>
+<li>ArrayFire also takes <code>u8</code>, <code>u16</code>, <code>i16</code> and <code>f64</code> features; luma has no arrays of the first
+three, and <code>f64</code> is not supported here.</li>
+<li><code>Shd</code> is only defined for <code>u32</code>, as in ArrayFire (which rejects <code>f32</code>/<code>i32</code> for it).</li>
+<li><code>n_dist</code> is at most 256 and at most the number of train features (as in ArrayFire).</li>
+<li>Ties are broken by the smaller train index. ArrayFire’s CUDA backend does the same; its CPU
+backend returns equal distances in an arbitrary order.</li>
+<li>NaN distances sort after all others.</li>
+<li>The result is a <code>Result</code>: errors in the arguments are returned directly, not as poisoned arrays.
+The two arrays are lazy like every other result (nothing waits for the GPU, the number of
+neighbours is known beforehand).</li>
+</ul>
+<p>For <code>n_dist &lt;= 16</code> one kernel does everything: a workgroup takes 64 queries and a range of train
+blocks (the ranges split over workgroups when there are few queries), computes the distances 64 x
+64 at a time (operands staged 16 elements at a time in workgroup memory, 4 x 4 distances per
+invocation in registers, like a small matrix product) and keeps the sorted list of the smallest
+ones of every invocation in registers; no distance is ever written. A second launch merges the
+lists. For larger <code>n_dist</code> the distances of a chunk of queries are written to a scratch matrix and
+a workgroup per query keeps a sorted list in workgroup memory, merging 256 candidates at a time
+with a bitonic network (only the blocks that contain a candidate better than the list’s worst are
+sorted).</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="vision-canny-edges-anisotropic-diffusion-mean-shift"><a class="header" href="#vision-canny-edges-anisotropic-diffusion-mean-shift">Vision: Canny edges, anisotropic diffusion, mean shift</a></h1>
+<p>Three image operations of ArrayFire’s <code>image.h</code>, built-in kernels that run on every backend and
+follow ArrayFire’s <strong>CUDA</strong> kernels step by step (its CPU backend disagrees with its CUDA
+backend in several places; where it does, luma does what the CUDA backend does). All three take
+<code>[H, W]</code> images (axis 0, the height, varies fastest), batch over axes 2 and 3 (mean shift of a
+colour image takes <code>[H, W, 3]</code> and batches over axis 3), are lazy, record no synchronisation
+and poison their result on an error.</p>
+<h2 id="canny"><a class="header" href="#canny"><code>canny</code></a></h2>
+<pre><code class="language-rust">use luma::{Array, CannyThreshold};
+
+// A soft vertical edge near column 9 (a perfectly symmetric profile would tie between two
+// columns and have no strict maximum).
+let data: Vec&lt;f32&gt; = (0..400).map(|k| 100.0 * (1.0 + (((k / 20) as f32 - 9.2) / 1.5).tanh())).collect();
+let img = Array::from_slice(&amp;data, [20, 20])?;
+let edges = img.canny(CannyThreshold::Manual, 0.2, 0.5, 3, false).to_vec()?;
+assert!(edges[10 + 20 * 9] &amp;&amp; !edges[10 + 20 * 5]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>canny(threshold, low, high, sobel_window, fast) -&gt; Array&lt;bool&gt;</code> runs ArrayFire’s pipeline:</p>
+<ol>
+<li>a 5-tap Gaussian (<code>[0.11021, 0.23691, 0.30576, 0.23691, 0.11021]</code>, zero outside the image) in
+both directions, then the 3 x 3 Sobel derivatives of the result (the border mirrored without
+repeating the edge pixel, ArrayFire’s <code>reflect101</code>) and the magnitude <code>sqrt(gx² + gy²)</code>, or
+<code>|gx| + |gy|</code> with <code>fast</code>;</li>
+<li>non-maximal suppression of the interior pixels: a pixel keeps its magnitude if it is
+<em>strictly</em> larger than the two neighbours along the gradient direction, which fall between
+pixels and are linearly interpolated; everything else (and the outermost ring) becomes 0;</li>
+<li>thresholds. With <code>CannyThreshold::Manual</code> <code>low</code> and <code>high</code> are <strong>ratios of the largest
+suppressed magnitude of the whole array</strong> (all planes of a batch share it). With
+<code>CannyThreshold::AutoOtsu</code> the high threshold comes from Otsu’s method on the histogram of the
+suppressed magnitudes of each plane (<code>floor(max)</code> bins between 0 and the array’s maximum, the
+zeros counted, the first maximum of the between-class variance; at most 16384 bins) and <code>low</code>
+is the <em>ratio of the high threshold</em> the low one has; <code>high</code> is ignored. The bin count follows
+<code>floor(max)</code>, so the result depends on the scale of the image like in ArrayFire: use images in
+<code>0..255</code>;</li>
+<li>hysteresis: pixels at or above the high threshold are edges, and so are the pixels at or above
+the low threshold that are 8-connected to an edge through such pixels.</li>
+</ol>
+<p>Only <code>sobel_window == 3</code> exists (ArrayFire rejects every other value as well).</p>
+<p><strong>The hysteresis on the GPU.</strong> Edge pixels are rare, so the work is organised around them. A first
+kernel finds the connected components of the candidates inside every 32 x 8 tile in workgroup
+memory and records which of them contain a strong pixel; a second links the components of
+neighbouring tiles with a lock-free union-find (the larger root goes under the smaller one); a
+third gives the final roots the strong flag and the last one writes the packed bits of the result.
+The last three visit one invocation per 32 pixels and skip the empty words, so their cost follows
+the number of edge pixels, and the whole detector is 6 launches (7 with Otsu) with nothing read
+back. ArrayFire needs about twenty kernels and a host round trip per hysteresis sweep.</p>
+<p>Differences from ArrayFire: its CPU backend marks the whole outer ring and mixes up the axes of
+images that are not square (luma follows the CUDA backend: no ring, any shape). ArrayFire needs
+images of at least 5 x 5; luma accepts any shape (an image without an interior pixel has no
+edges). A constant image makes ArrayFire fail; luma gives the edges near the border that the zero
+padding of the smoothing creates. Pixels whose suppressed magnitudes tie in exact arithmetic (the
+sides of a perfectly flat square, say) can fall on either side in <code>f32</code>; luma mirrors the order of
+ArrayFire’s operations to land on the same side in most cases, but not all. The same goes for
+Otsu thresholds when several bins tie (empty bins between the classes): ArrayFire’s rounding
+picks one, luma the lowest, which moves the weak threshold slightly.</p>
+<h2 id="anisotropic_diffusion"><a class="header" href="#anisotropic_diffusion"><code>anisotropic_diffusion</code></a></h2>
+<pre><code class="language-rust">use luma::{Array, DiffusionEq, FluxFunction};
+
+let mut data = vec![0.0f32; 16 * 16];
+data[8 + 16 * 8] = 80.0;
+let img = Array::from_slice(&amp;data, [16, 16])?;
+let out = img.anisotropic_diffusion(0.1, 5.0, 3, FluxFunction::Exponential, DiffusionEq::Gradient).to_vec()?;
+assert!(out[8 + 16 * 8] &lt; 80.0 &amp;&amp; out[7 + 16 * 8] &gt; 0.0);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>anisotropic_diffusion(timestep, conductance, iterations, flux, equation)</code> runs <code>iterations</code>
+steps of Perona-Malik diffusion (<code>DiffusionEq::Gradient</code>) or modified curvature diffusion
+(<code>DiffusionEq::Mcde</code>, which always uses the exponential flux). The conductance <code>K</code> is relative:
+every step the exponent factor is <code>-1 / (2 K² mean(g²))</code> with <code>g</code> the gradient of the current
+image and the mean over every element of the array. The flux through a pixel face is <code>c(x) * (difference)</code> with <code>c = exp(x)</code> (<code>FluxFunction::Exponential</code>) or <code>c = 1 / (1 + x)</code>
+(<code>FluxFunction::Quadratic</code>) of <code>x = factor * |grad u|²</code> at the face; outside the image the
+nearest pixel is used.</p>
+<p>ArrayFire’s quadratic function has the sign of <code>x</code> inverted (the factor is negative), which makes
+it exceed 1 and blow up where the gradient is large; luma reproduces it so that the results are
+the same: prefer the exponential flux. There is no stability check of the time step (it is stable
+up to about 0.125), as in ArrayFire, which rejects only <code>iterations == 0</code> and a conductance of 0
+(luma too). A constant image comes back unchanged (ArrayFire’s is NaN).</p>
+<p>Every step is three launches: the gradient energy per tile, one workgroup that adds the tiles up
+and writes the factor (ArrayFire reads the sum back to the host after every step), and the update
+from one image into the other. luma reads and writes different images, so the result does not
+depend on the order of the pixels; ArrayFire’s CPU backend updates in place pixel by pixel. ArrayFire’s
+CUDA kernel has a bug: on images with more than about 70 columns it updates only the leading
+columns along axis 1 (72 of 128, 96 of 300 in the sizes probed) and leaves the rest unchanged.
+luma updates every pixel. On the columns ArrayFire does update one step agrees with it to <code>f32</code>
+rounding on small images; on large ones its in-place update also races between tiles and varies
+from run to run.</p>
+<h2 id="mean_shift"><a class="header" href="#mean_shift"><code>mean_shift</code></a></h2>
+<pre><code class="language-rust">use luma::Array;
+
+let mut data = vec![10.0f32; 8 * 8];
+for j in 4..8 { for i in 0..8 { data[i + 8 * j] = 200.0; } }
+let img = Array::from_slice(&amp;data, [8, 8])?;
+let out = img.mean_shift(1.0, 20.0, 2, false).to_vec()?;
+assert_eq!((out[0], out[7 + 8 * 7]), (10.0, 200.0));
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>mean_shift(spatial_sigma, chromatic_sigma, iterations, is_color)</code> starts a walk at every pixel.
+The window is <code>2 r + 1</code> pixels a side with <code>r = max(floor(1.5 * spatial_sigma), 1)</code>, cut at the
+image. A step collects the window pixels whose squared colour distance (summed over the channels,
+<code>[H, W, 3]</code> for <code>is_color</code>) from the walk’s current colour is at most <code>chromatic_sigma²</code>, and
+moves to the mean position and the mean colour of those, <strong>both truncated to integers</strong>
+(ArrayFire’s <code>__float2int_rz</code>). The walk stops early when the position did not move, or moved by
+at most one pixel with a colour change of at most one. The result is the colour the walk ends
+with. The truncation makes the filter meant for images of <code>0..255</code>: an image in <code>0..1</code> comes out
+all zero, like in ArrayFire.</p>
+<p>A workgroup stages the pixels around its 16 x 16 tile (as far as workgroup memory allows, up to
+<code>r</code>) and the first step of every walk reads only from there; later steps move the window and read
+global memory through the cache, so any number of steps stays exact. The result is bit-identical
+to ArrayFire’s (both backends of ArrayFire agree here); the reciprocal of the pixel count, whose
+rounding decides the truncations, is corrected to the correctly rounded value on every backend.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="connected-components-confidence-connected-components-deconvolution"><a class="header" href="#connected-components-confidence-connected-components-deconvolution">Connected components, confidence connected components, deconvolution</a></h1>
+<p><code>Array&lt;bool&gt;::regions</code> labels the connected components of a binary image and
+<code>Array&lt;f32&gt;::confidence_cc</code> grows a region from seed pixels by the statistics of the pixels
+around them: ArrayFire’s <code>regions</code> and <code>confidenceCC</code>. Both take an <code>[H, W]</code> image (axis 0, the
+height, varies fastest), are built-in kernels that run on every backend, need an array that fits
+one buffer, and poison their result on an error. Neither synchronizes.</p>
+<h2 id="regions"><a class="header" href="#regions"><code>regions</code></a></h2>
+<pre><code class="language-rust">use luma::{Array, Connectivity};
+
+// The 3 x 3 image, columns [1, 0, 1], [0, 0, 0], [0, 1, 1] (axis 0 fastest).
+let img = Array::from_slice(&amp;[true, false, true, false, false, false, false, true, true], [3, 3])?;
+assert_eq!(img.regions(Connectivity::Four).to_vec()?, [1, 0, 2, 0, 0, 0, 0, 3, 3]);
+// With 8-connectivity the pixels touching at a corner are one component.
+let img = Array::from_slice(&amp;[true, false, false, false, true, false, false, false, true], [3, 3])?;
+assert_eq!(img.regions(Connectivity::Four).to_vec()?, [1, 0, 0, 0, 2, 0, 0, 0, 3]);
+assert_eq!(img.regions(Connectivity::Eight).to_vec()?, [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>The result is an <code>Array&lt;u32&gt;</code>: 0 for the background, <code>1..=N</code> for the components, <strong>numbered in
+the order of their first pixel in memory order</strong> (axis 0 fastest). That is the numbering of
+both ArrayFire backends (probed on the CPU and CUDA ones), so the labels equal ArrayFire’s,
+not only the partition. Differences from ArrayFire: the labels are <code>u32</code> (convert with
+<code>to_f32()</code> and the like for ArrayFire’s <code>f32</code>, <code>i32</code>, <code>u16</code>, <code>f64</code> outputs) and the image must
+have fewer than 2^32 - 1 pixels. Like ArrayFire’s, the input has to be two-dimensional.</p>
+<h3 id="how-it-works"><a class="header" href="#how-it-works">How it works</a></h3>
+<p>A lock-free union-find over the pixels: a set’s root is always its smallest pixel (flat index), so
+the roots in ascending order are the components in ascending order of their first pixel.</p>
+<ol>
+<li>A workgroup labels a tile of 32 x 8 pixels in workgroup memory (every foreground pixel is
+unioned with its backward neighbours in the tile) and stores, for every pixel, the flat index of
+the root of its piece of the component.</li>
+<li>One thread per pixel along a tile boundary unions the roots on both sides (<code>atomicMin</code> hooks the
+larger root under the smaller one).</li>
+<li>Every pixel’s entry becomes the final root; a workgroup takes 1024 consecutive pixels, counts
+their roots and ranks them.</li>
+<li>A tiny scan turns the counts of the chunks into offsets.</li>
+<li>The entry of a pixel becomes <code>offset + rank + 1</code> of its root.</li>
+</ol>
+<p>There is no iteration over the image, so the time does not depend on the shape of the components
+(a one pixel wide spiral costs the same as noise).</p>
+<h2 id="confidence_cc"><a class="header" href="#confidence_cc"><code>confidence_cc</code></a></h2>
+<pre><code class="language-rust">use luma::Array;
+
+// A bright 2 x 2 block (10) on a dark background (1); a seed inside it.
+let mut data = vec![1.0f32; 16];
+for (i, j) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+    data[i + 4 * j] = 10.0;
+}
+let img = Array::from_slice(&amp;data, [4, 4])?;
+let seg = img.confidence_cc_at(&amp;[1], &amp;[1], 0, 1, 1, 255.0)?;
+assert_eq!(seg.to_vec()?.iter().filter(|&amp;&amp;v| v == 255.0).count(), 4);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>confidence_cc(&amp;seeds_x, &amp;seeds_y, radius, multiplier, iterations, segmented_value)</code> (also
+<code>confidence_cc_seeds</code> with an <code>[N, 2]</code> array and <code>confidence_cc_at</code> with host slices) returns an
+<code>f32</code> image holding <code>segmented_value</code> in the segmentation and 0 elsewhere. <strong><code>seeds_x</code> indexes
+axis 0 and <code>seeds_y</code> axis 1</strong>, as in ArrayFire’s <code>confidenceCC</code> (the <code>x</code> of keypoints is the column:
+pass <code>keypoints.y</code> as <code>seeds_x</code>).</p>
+<p>The algorithm is ArrayFire’s: the image is scaled linearly to <code>[1, 2]</code>; the mean and standard
+deviation of the pixels in the <code>(2 radius + 1)^2</code> windows around the seeds give the interval
+<code>[mean - multiplier * sd, mean + multiplier * sd]</code> (widened to contain the seeds’ own values); the
+first segmentation is the set of pixels in the interval that are 8-connected to a seed through
+such pixels. Each of the <code>iterations</code> further rounds takes mean and standard deviation of the
+pixels of the <em>current segmentation</em>, widens the interval likewise and segments again from the
+seeds. The rounds stop early when the segmentation is empty or a variance is below 1e-6.</p>
+<p>The whole loop runs on the device without a read-back: the control words (interval, “done” flag)
+live in a small buffer, a segmentation is the union-find labelling of <a href="#regions"><code>regions</code></a> over
+the pixels in the interval followed by marking the roots the seeds fall into, and the launches of
+rounds after the last one are no-ops that exit at once.</p>
+<h3 id="differences-from-arrayfire"><a class="header" href="#differences-from-arrayfire">Differences from ArrayFire</a></h3>
+<p>ArrayFire’s <code>confidenceCC</code> is only well defined for a <strong>single seed whose window is inside the
+image</strong>; probing it (CPU backend; the shared code behind it is the same on CUDA) showed:</p>
+<ul>
+<li>A window reaching over the border reads outside ArrayFire’s summed-area table: the statistics
+are garbage, usually a segmentation of the seed alone or of the whole image. luma clips the
+window to the image.</li>
+<li>With several seeds ArrayFire sums the windows over all <em>pairs</em> of seed rows and columns (it
+indexes its summed-area table with two index arrays) but divides by the number of seeds times the
+window size: the variance comes out negative, the interval is NaN and the first segmentation is
+just the seeds. luma uses the union of the windows of the seeds. The widening to the seeds’
+values uses the values at all row/column pairs in ArrayFire, the seeds’ own in luma.</li>
+<li>Seeds outside the image are ignored.</li>
+<li>ArrayFire’s CPU backend adds stray components not connected to the seed to the segmentation of
+the later iterations (seen with identical intervals); luma’s segmentation is always the
+component of the seeds.</li>
+<li>ArrayFire takes the window sums from an <code>f32</code> summed-area table of the whole image, which has no
+precision left on a big image (on 4K its segmentation is the seed alone). luma adds up the
+pixels of the windows from values shifted by their mean, so its intervals are exact; a pixel
+exactly on the border of an interval may go either way.</li>
+</ul>
+<p>For a single seed with its window inside the image the segmentation is the one of ArrayFire’s CUDA
+backend (identical in 31 of 31 random probes; the CPU backend adds stray components) up to the
+pixels where ArrayFire’s imprecise interval is wrong on a big image (the <code>afcompare</code> rows count
+them).</p>
+<h2 id="deconvolution"><a class="header" href="#deconvolution">Deconvolution</a></h2>
+<p><code>iterative_deconv(&amp;psf, iterations, relaxation, algo)</code> and <code>inverse_deconv(&amp;psf, gamma, algo)</code>
+(ArrayFire’s <code>iterativeDeconv</code> and <code>inverseDeconv</code>) restore an <code>[H, W]</code> image blurred by a known
+point spread function <code>[PH, PW]</code> whose centre is <code>(PH / 2, PW / 2)</code>.</p>
+<pre><code class="language-rust">use luma::{Array, InverseDeconvAlgo, IterativeDeconvAlgo};
+
+let img = Array::from_slice(&amp;(0..20).map(|i| 1.0 + i as f32).collect::&lt;Vec&lt;_&gt;&gt;(), [4, 5])?;
+// A psf that is a single 1 at its centre does not blur.
+let psf = Array::from_slice(&amp;[0.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], [3, 3])?;
+let same = img.iterative_deconv(&amp;psf, 3, 0.5, IterativeDeconvAlgo::RichardsonLucy).to_vec()?;
+assert!(same.iter().zip(img.to_vec()?).all(|(a, b)| (a - b).abs() &lt; 1e-4));
+// Tikhonov divides the spectrum by |P|^2 + gamma = 1 + gamma.
+let tik = img.inverse_deconv(&amp;psf, 0.5, InverseDeconvAlgo::Tikhonov).to_vec()?;
+assert!((tik[0] - 1.0 / 1.5).abs() &lt; 1e-4);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<ul>
+<li><strong>Landweber</strong> (<code>IterativeDeconvAlgo::Landweber</code>, ArrayFire’s default): <code>x += a P^T (y - P x)</code>
+per iteration, starting from the blurred image <code>y</code>.</li>
+<li><strong>Richardson-Lucy</strong>: <code>x *= P^T (y / (P x))</code>; <code>relaxation</code> is unused (but must be positive, as in
+ArrayFire). Needs positive data.</li>
+<li><strong>Tikhonov</strong> (<code>InverseDeconvAlgo::Tikhonov</code>): <code>X = Y conj(P) / (|P|^2 + gamma)</code> per frequency.</li>
+</ul>
+<p>The problem is solved on the image padded to <code>(H + PH) x (W + PW)</code>, each size rounded up to one whose
+prime factors are all at most 7 (the rule of ArrayFire’s CUDA backend, probed; its CPU backend
+rounds to factors of at most 13 and so pads differently, which changes the border of the result), with the nearest
+pixel; the psf is zero padded to the same size and rolled so that its centre is the origin. The
+convolutions are circular on the padded image, so the border sees a replicated, not a periodic,
+image. The result is the central <code>[H, W]</code> part.</p>
+<p>Landweber’s step is diagonal in the frequency domain (<code>X += a conj(P) (Y - P X)</code>), so any number of
+iterations costs one forward transform, one inverse transform and one elementwise pass per
+iteration; Richardson-Lucy needs two forward and two inverse real transforms per iteration.</p>
+<h3 id="differences-from-arrayfire-1"><a class="header" href="#differences-from-arrayfire-1">Differences from ArrayFire</a></h3>
+<ul>
+<li>ArrayFire’s Landweber and Tikhonov results are <code>N0 * N1</code> times larger than the estimate (the
+padded pixel count: its last inverse transform is not scaled; its Richardson-Lucy result is not
+affected). luma returns the estimate; multiply by <code>N0 * N1</code> for ArrayFire’s numbers.
+Everything else (padding, centring, update) is ArrayFire’s, to float rounding: the <code>afcompare</code>
+rows and a test compare the results with ArrayFire’s.</li>
+<li>Where the blurred estimate of Richardson-Lucy is not positive the ratio is taken as 0.
+ArrayFire’s division gives inf or NaN there, which spreads over the whole image through the next
+transform (any zero pixel of the input spoils its result).</li>
+<li>The input is <code>f32</code> (ArrayFire also takes <code>u8</code>, <code>u16</code>, <code>i16</code>; convert with <code>to_f32</code>).</li>
+<li>Like ArrayFire, <code>iterations</code>, <code>relaxation</code> and <code>gamma</code> must be positive and the arrays two-dimensional;
+the point spread function may be larger than the image.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="vision-orb-sift-and-gloh"><a class="header" href="#vision-orb-sift-and-gloh">Vision: ORB, SIFT and GLOH</a></h1>
+<p>Three feature detectors with descriptors, the functions of ArrayFire’s <code>vision.h</code> of the same
+names. Each takes an <code>[H, W]</code> <code>f32</code> image (axis 0 is the row) and returns the detected points as
+<code>Keypoints</code> with the descriptors of the points next to them, or <code>None</code> if the image has none
+(luma has no empty arrays). The count of points depends on the data, so each call <strong>synchronizes
+once</strong> to read it back; everything before that is recorded without waiting.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>function</th><th>descriptor</th><th>type</th><th>shape</th></tr>
+</thead>
+<tbody>
+<tr><td><code>orb</code></td><td>256-bit rotated BRIEF</td><td><code>u32</code></td><td><code>[8, N]</code></td></tr>
+<tr><td><code>sift</code></td><td>4 x 4 x 8 histograms of gradients</td><td><code>f32</code> (integers <code>0..=255</code>)</td><td><code>[128, N]</code></td></tr>
+<tr><td><code>gloh</code></td><td>gradient location and orientation histogram</td><td><code>f32</code> (integers <code>0..=255</code>)</td><td><code>[272, N]</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>Keypoints.x</code> is the position along axis 1 (the column) and <code>y</code> the one along axis 0, in
+the coordinates of the input image. Descriptor <code>i</code> is column <code>i</code> of the descriptor array.</p>
+<h2 id="orb"><a class="header" href="#orb">ORB</a></h2>
+<p><code>img.orb(fast_thr, max_feat, scale_factor, levels, blur_img)</code> builds a pyramid of at most
+<code>levels</code> images, each <code>scale_factor</code> times smaller than the previous one (bilinear resize), finds
+FAST corners (arc of 9) on every level, keeps the strongest by Harris response (about
+<code>max_feat / scale^level</code> on level <code>level</code>), measures the orientation of the 31 x 31 patch around
+each corner by its intensity centroid and computes 256 pair tests of OpenCV’s BRIEF pattern,
+rotated by that orientation. With <code>blur_img</code> the tests read the level image smoothed with a 9-tap
+Gaussian of sigma 2. The result has <code>score</code> the Harris response (scaled by 1e-12),
+<code>orientation</code> in radians, <code>size</code> the patch size <code>31 * scale^level</code>.</p>
+<pre><code class="language-rust">use luma::Array;
+<span class="boring">fn main() -&gt; Result&lt;(), luma::LumaError&gt; {
+</span>let mut data = vec![0.0f32; 96 * 96];
+for x in 40..60 { for y in 40..60 { data[y + 96 * x] = 200.0; } }
+let img = Array::from_slice(&amp;data, [96, 96])?;
+// (A square this small has corners only at the finest level of a 2-level pyramid.)
+if let Some((points, desc)) = img.orb(20.0, 100, 1.5, 2, false)? {
+    assert_eq!(desc.shape().dims()[1], points.count());
+}
+<span class="boring">Ok(()) }</span></code></pre>
+<p>Two descriptors are compared by the Hamming distance of their 256 bits: the number of <code>1</code> bits of
+the XOR of the eight words, <code>a.zip(b).map(|(p, q)| (p ^ q).count_ones()).sum()</code>.</p>
+<h2 id="sift-and-gloh"><a class="header" href="#sift-and-gloh">SIFT and GLOH</a></h2>
+<p><code>img.sift(n_layers, contrast_thr, edge_thr, init_sigma, double_input, intensity_scale, feature_ratio)</code>
+and <code>img.gloh(...)</code> with the same arguments (ArrayFire’s defaults are <code>3, 0.04, 10.0, 1.6, true, 1/256, 0.05</code>) detect the extrema of the difference of Gaussians of a pyramid of <code>floor(log2(min side)) - 2</code>
+octaves, refine them, reject low-contrast and edge-like ones, give every remaining point one
+orientation per peak of a 36-bin histogram and describe it. SIFT describes a point by 4 x 4
+histograms of 8 orientations, GLOH by a log-polar grid (a disc and two rings of 8 sectors, 16
+orientations each: 272 values). <code>intensity_scale</code> is one over the largest value of the image (the
+contrast thresholds are in units of the scaled image). <code>feature_ratio</code> bounds the extrema per octave
+by that fraction of its pixels.</p>
+<p><code>orientation</code> is in radians in <code>[0, 2 pi)</code> (ArrayFire returns degrees), <code>size</code> the diameter of the
+point in input pixels, <code>score</code> the absolute interpolated contrast.</p>
+<pre><code class="language-rust">use luma::Array;
+<span class="boring">fn main() -&gt; Result&lt;(), luma::LumaError&gt; {
+</span>// A Gaussian blob is a scale-space extremum.
+let mut data = vec![0.0f32; 96 * 96];
+for x in 0..96 { for y in 0..96 {
+    let (dx, dy) = (x as f32 - 48.0, y as f32 - 48.0);
+    data[y + 96 * x] = 200.0 * (-(dx * dx + dy * dy) / 50.0).exp();
+} }
+let img = Array::from_slice(&amp;data, [96, 96])?;
+let (points, sift) = img.sift(3, 0.04, 10.0, 1.6, true, 1.0 / 256.0, 0.05)?.expect("a blob");
+let (_, gloh) = img.gloh(3, 0.04, 10.0, 1.6, true, 1.0 / 256.0, 0.05)?.expect("a blob");
+assert_eq!(sift.shape().dims()[0], 128);
+assert_eq!(gloh.shape().dims()[0], 272);
+assert_eq!(sift.shape().dims()[1], points.count());
+<span class="boring">Ok(()) }</span></code></pre>
+<h2 id="differences-from-arrayfire-2"><a class="header" href="#differences-from-arrayfire-2">Differences from ArrayFire</a></h2>
+<p>Where ArrayFire’s CPU and CUDA backends differ, luma follows CUDA. On natural-like 1080p and 4K images luma
+finds every point ArrayFire’s CUDA backend finds (ORB: identical descriptors, SIFT and GLOH: the same
+points with the same orientations and descriptors up to rounding); the following differs on purpose
+or by construction:</p>
+<ul>
+<li><strong>Order.</strong> ArrayFire’s order depends on its CUDA blocks (atomics) and on a sort. luma returns the
+levels (<code>orb</code>) or octaves (<code>sift</code>, <code>gloh</code>) finest first. Within an ORB level the points are sorted by
+decreasing Harris response; within a SIFT octave their order is not specified. Compare results
+as sets.</li>
+<li><strong>ORB.</strong> The cap of <code>0.14 * H * W</code> FAST candidates per level, and ties of the Harris ranking, are
+decided in an arbitrary order (the order tiles append their corners), as in ArrayFire. ArrayFire blurs its input image in place when <code>blur_img</code> is set,
+luma does not touch it. The last level takes what is left of <code>max_feat</code>, saturating at 0 where
+ArrayFire’s unsigned arithmetic wraps. The kernel launches of all levels are queued without a
+readback; the Harris ranking uses a histogram to find the cut and ranks the candidates at the cut
+exactly.</li>
+<li><strong>SIFT and GLOH</strong> reproduce ArrayFire’s algorithm including its quirks: the 3 x 3 solver of the
+sub-pixel refinement leaves the offset along the scale at 0 (so the size of a point is the one of
+its layer), the cross derivative <code>d2D/dy ds</code> mixes in the pixel <code>(x - 1, y - 1)</code>, the first
+extremum threshold is applied to the unscaled image. Duplicates (two extrema that refine to the
+same location) are removed with a hash table, not a sort. Descriptor histograms are accumulated with
+integer atomics scaled by <code>65536 * intensity_scale</code> instead of float atomics: against ArrayFire’s
+CUDA backend the mean difference of the descriptor entries is below 1 (of 255), a point on a
+rounding boundary of its position can differ in a few entries by more, and an image whose range is
+far above <code>1 / intensity_scale</code> can overflow them.</li>
+<li><strong>Errors.</strong> Invalid arguments (<code>levels == 0</code>, <code>scale_factor &lt;= 1</code>, <code>n_layers == 0</code>, images smaller
+than 7 x 7 for ORB and 15 x 15 for SIFT) are <code>LumaError</code>s, not ArrayFire exceptions. Only <code>f32</code>
+images are supported (ArrayFire also takes <code>f64</code>).</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="incremental-accumulation"><a class="header" href="#incremental-accumulation">Incremental accumulation</a></h1>
+<p>Data that arrives in batches over time (a training loop’s activations, a sensor, a simulation’s
+diagnostics, a log of metrics) rarely fits in memory at once, and its size is not known up front.
+An <em>accumulator</em> folds every batch into a small <strong>state</strong> on the GPU, as the batch arrives, and
+turns the state into results (a mean, a variance, a histogram, the <code>k</code> largest values, …) at
+any time. The batches are never kept; the states of two accumulators merge, so runs on several
+threads, devices or machines combine afterwards; and a state is a few bytes you can write to a
+file.</p>
+<p>The accumulators are general building blocks: statistics, machine-learning metrics, logging
+and signal analysis all use the same few.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>State</th><th>Results</th></tr>
+</thead>
+<tbody>
+<tr><td>[<code>Accumulator</code>]</td><td>count, sum, mean, variance, skewness, kurtosis, min, max, their global indices</td><td>per position along chosen axes, or of the whole batch; of masked elements; per group label</td></tr>
+<tr><td>[<code>CoMoments</code>]</td><td>two streams: both means and variances and the sum of products</td><td>covariance, correlation, slope, per position</td></tr>
+<tr><td>[<code>Covariance</code>]</td><td>the features of one stream: mean and sums of products</td><td>covariance and correlation matrix</td></tr>
+<tr><td>[<code>Histogram</code>], [<code>Histogram2d</code>]</td><td>counts in fixed bins of one stream or of two jointly</td><td>counts, marginals, entropy, mutual information</td></tr>
+<tr><td>[<code>TopK</code>]</td><td>the <code>k</code> largest or smallest values and where they came from</td><td>values and global indices</td></tr>
+</tbody>
+</table>
+</div>
+<p>Every accumulator has the same surface: <code>push</code> folds a batch in (nothing is read back from the
+device; the work is recorded like any other luma operation, and a batch that is a lazy
+expression such as <code>(&amp;x - &amp;y).abs()</code> is computed <em>inside</em> the accumulation kernel, never stored),
+<code>merge(&amp;other)</code> adds another accumulator’s state, <code>reset()</code> clears it, <code>to_bytes()</code> and
+<code>from_bytes()</code> write and read the state, and result methods return lazy arrays.</p>
+<h2 id="per-feature-statistics"><a class="header" href="#per-feature-statistics">Per-feature statistics</a></h2>
+<p>Batches of <code>rows</code> samples of <code>features</code> features are <code>[features, rows]</code> arrays (axis 0 is the
+fast one, see the <a href="#matrices-statistics-and-grouping">matrices chapter</a>); folding axis 1 keeps one state per feature:</p>
+<pre><code class="language-rust">use luma::*;
+
+let acc = Accumulator::&lt;Df32&gt;::builder(Fold::axis(1)).moments(2).sum().min_max().build()?;
+for step in 0..10 {
+    // 4 features, 100 rows per batch; feature f is f * 10 + step noise.
+    let data: Vec&lt;f32&gt; = (0..400).map(|i| (i % 4) as f32 * 10.0 + ((i / 4 + step) % 7) as f32).collect();
+    acc.push(&amp;Array::from_slice(&amp;data, [4, 100])?)?;
+}
+let mean = acc.mean()?.to_f32().to_vec()?;   // [4]
+let var = acc.var()?.to_f32().to_vec()?;     // population variance, [4]
+assert_eq!(acc.samples_seen(), 1000);
+assert!((mean[2] - 23.0).abs() &lt; 0.1);
+assert!(var.iter().all(|v| *v &gt; 3.5 &amp;&amp; *v &lt; 4.5));
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;acc.count()?)?, vec![1000.0; 4]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>Fold::all()</code> folds every element of the batch into one stream; <code>Fold::axes(&amp;[0, 1])</code> folds
+several axes (an image batch per channel). The results have extent 1 along the folded axes, as
+<code>mean_axis</code> does.</p>
+<p>Results are arrays of the <em>wide</em> type of the state, <code>Df32</code> or <code>f64</code> (see Precision below):
+<code>.to_f32()</code> rounds them, and [<code>Accumulator::to_f64</code>] reads exact values on the host.
+A count of <code>2^24 + 3</code> samples is exact; a plain <code>f32</code> count stops at <code>2^24</code>.</p>
+<p>The builder chooses what is tracked, so that you pay only for it: <code>moments(order)</code> (1 mean, 2
+variance, 3 skewness, 4 kurtosis; every order is one more reduction in the pass over the
+batch), <code>sum()</code>, <code>min()</code>, <code>max()</code>, <code>argmin()</code>, <code>argmax()</code>. Indices are <em>global sample
+indices</em>: the position of the sample in the stream of everything pushed (and, after a merge,
+of this accumulator’s samples followed by the other’s).</p>
+<h2 id="masks-nan-and-groups"><a class="header" href="#masks-nan-and-groups">Masks, NaN and groups</a></h2>
+<p><code>push_where(&amp;batch, &amp;mask)</code> folds in the elements where the <code>bool</code> mask is true.
+<code>NanPolicy::Skip</code> leaves NaN elements out of every statistic; with the default
+<code>NanPolicy::Propagate</code> a NaN (or infinity) in a position’s stream makes its mean and variance NaN
+for good, and its extrema unspecified (backends differ in what <code>min</code> of a NaN gives).</p>
+<p><code>groups(n)</code> keeps a state per group label and position, and <code>push_grouped(&amp;batch, &amp;labels)</code>
+folds a batch into all of them in one pass: <code>labels</code> is a <code>u32</code> array with one label per sample
+(per element when the whole batch is folded); labels of <code>n</code> or more are skipped. The results have
+<code>n</code> entries along the first folded axis: per-class means of every feature:</p>
+<pre><code class="language-rust">use luma::*;
+
+let acc = Accumulator::&lt;Df32&gt;::builder(Fold::axis(1)).groups(3).build()?;
+// 2 features, 6 samples; classes 0, 1, 2, 0, 1, 2.
+let x = Array::from_slice(&amp;[1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0, 6.0, 60.0], [2, 6])?;
+let labels = Array::from_slice(&amp;[0u32, 1, 2, 0, 1, 2], 6)?;
+acc.push_grouped(&amp;x, &amp;labels)?;
+// Shape [2, 3]: feature f of class g at f + 2 g.
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;acc.mean()?)?, vec![2.5, 25.0, 3.5, 35.0, 4.5, 45.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="merging-and-serializing"><a class="header" href="#merging-and-serializing">Merging and serializing</a></h2>
+<p>States merge exactly as if the other’s samples had been pushed after this accumulator’s. The
+merge is Chan et al.’s pairwise update, so it does not matter how the data was split or in which
+order the partial states are combined (to the rounding of the wide type):</p>
+<pre><code class="language-rust">use luma::*;
+
+let (a, b) = (Accumulator::&lt;Df32&gt;::new(Fold::all()), Accumulator::&lt;Df32&gt;::new(Fold::all()));
+a.push(&amp;Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?)?;
+b.push(&amp;Array::from_slice(&amp;[4.0f32, 5.0], 2)?)?;
+// `b` could be on another thread, another device or another machine: its state is a byte string.
+let shipped = b.to_bytes()?;
+a.merge(&amp;Accumulator::&lt;Df32&gt;::from_bytes(&amp;shipped)?)?;
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;a.mean()?)?, vec![3.0]);
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;a.var()?)?, vec![2.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>An accumulator is <code>Sync</code>: <code>push</code>, <code>merge</code> and the results take <code>&amp;self</code>, so threads can share one
+(pushes from several threads fold in some order) or each keep their own and merge at the end.
+Merging with an accumulator on another device goes through the host. The bytes are the same for
+both wide types (every value is stored as an <code>f64</code>), so an <code>f64</code> state written on one machine
+is read by a <code>Df32</code> accumulator on another.</p>
+<h2 id="histograms-joint-histograms-and-information"><a class="header" href="#histograms-joint-histograms-and-information">Histograms, joint histograms and information</a></h2>
+<p><code>Histogram::new(bins, lo, hi)</code> counts in equal-width bins over <code>[lo, hi]</code> (the top edge belongs
+to the last bin); values below, above and NaN are counted aside ([<code>Histogram::outliers</code>]).
+<code>Histogram::with_fold</code> keeps one histogram per position. <code>Histogram2d</code> counts pairs of two
+streams jointly, and derives the marginals and the information measures that need only the
+joint counts as lazy <code>f32</code> arrays:</p>
+<pre><code class="language-rust">use luma::*;
+
+let joint = Histogram2d::&lt;Df32&gt;::new((2, 2), (0.0, 1.0), (0.0, 1.0))?;
+// Two streams that always agree: all the counts are on the diagonal.
+let x = Array::from_slice(&amp;[0.1f32, 0.2, 0.8, 0.9], 4)?;
+joint.push(&amp;x, &amp;x)?;
+assert_eq!(Accumulator::&lt;Df32&gt;::to_f64(&amp;joint.counts()?)?, vec![2.0, 0.0, 0.0, 2.0]);
+let mi = joint.mutual_information()?.item()?;
+assert!((mi - std::f32::consts::LN_2).abs() &lt; 1e-6); // one bit
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="top-k"><a class="header" href="#top-k">Top-k</a></h2>
+<p><code>TopK::largest(k)</code> (and <code>smallest</code>) keeps the <code>k</code> best values of the whole stream with their
+global indices; the pushes of up to 16 batches are sorted together and merged with the state’s
+<code>k</code> entries. Ties go to the earlier element; NaN and masked elements are never selected.</p>
+<pre><code class="language-rust">use luma::*;
+
+let top = TopK::&lt;f32, Df32&gt;::largest(2);
+top.push(&amp;Array::from_slice(&amp;[0.5f32, 9.0, 3.0], 3)?)?;
+top.push(&amp;Array::from_slice(&amp;[7.0f32, 1.0], 2)?)?;
+assert_eq!(top.values()?.to_vec()?, vec![9.0, 7.0]);
+assert_eq!(TopK::&lt;f32, Df32&gt;::to_f64(&amp;top.indices()?)?, vec![1.0, 3.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>TopK::largest_along(k, axis)</code> keeps the best <code>k</code> of every line along an axis instead, per
+feature for <code>[features, rows]</code> batches with <code>axis</code> 1: the results have <code>k</code> entries along the axis
+and the indices are <em>sample</em> indices along it. It costs <code>k</code> passes of an argmax over the batch
+(the elements chosen so far are masked out inside the pass), so <code>k</code> is at most 32:</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two features; the best two rows of each.
+let top = TopK::&lt;i32, Df32&gt;::largest_along(2, 1)?;
+top.push(&amp;Array::from_slice(&amp;[1i32, 50, 9, 20, 4, 30], [2, 3])?)?;
+top.push(&amp;Array::from_slice(&amp;[7i32, 10], [2, 1])?)?;
+// Shape [2, 2]: rank j of feature f at f + 2 j.
+assert_eq!(top.values()?.to_vec()?, vec![9, 50, 7, 30]);
+assert_eq!(TopK::&lt;i32, Df32&gt;::to_f64(&amp;top.indices()?)?, vec![1.0, 0.0, 3.0, 2.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="covariance"><a class="header" href="#covariance">Covariance</a></h2>
+<p>[<code>CoMoments</code>] folds two streams <code>x</code> and <code>y</code> of one shape (per position, like <code>Accumulator</code>);
+[<code>Covariance</code>] folds the features of one stream against each other: a batch is a
+<code>[features, samples]</code> array and the state is the mean and the <code>features x features</code> matrix of
+sums of products. A push is one full-precision <code>f32</code> matrix product of the centered batch with
+itself (never TF32), and the state is merged in <code>Df32</code> or <code>f64</code>:</p>
+<pre><code class="language-rust">use luma::*;
+
+let cov = Covariance::&lt;Df32&gt;::new();
+// 2 features: the second is twice the first.
+cov.push(&amp;Array::from_slice(&amp;[1.0f32, 2.0, 2.0, 4.0, 3.0, 6.0], [2, 3])?)?;
+cov.push(&amp;Array::from_slice(&amp;[4.0f32, 8.0], [2, 1])?)?;
+let c = Accumulator::&lt;Df32&gt;::to_f64(&amp;cov.cov()?)?;
+assert!((c[0] - 1.25).abs() &lt; 1e-6 &amp;&amp; (c[1] - 2.5).abs() &lt; 1e-6 &amp;&amp; (c[3] - 5.0).abs() &lt; 1e-6);
+let r = Accumulator::&lt;Df32&gt;::to_f64(&amp;cov.corr()?)?;
+assert!((r[1] - 1.0).abs() &lt; 1e-6);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="precision-2"><a class="header" href="#precision-2">Precision</a></h2>
+<p>A pushed batch is reduced in <code>f32</code> <em>relative to a pivot</em>: the running mean of the state (the
+first element of the first batch before there is a mean). The sums of <code>x - pivot</code> are small and
+their rounding errors small, however far from zero the data is; the sums are then added into
+a state kept in <code>Df32</code> (about 48 bits of mantissa, runs on every device, the default) or <code>f64</code>
+(CUDA and the CPU backend; <code>Accumulator::&lt;f64&gt;</code>). The count, the merge arithmetic and the sum
+therefore do not lose digits over <code>1e9</code> samples, and <code>f64</code> data with a huge offset keeps its
+variance (<code>1e9 + 1e-2 * noise</code> has a variance within <code>1e-3</code> of the exact one, where a plain sum
+of squares has none).</p>
+<p>What <code>f32</code> rounding remains is that of the <em>batch’s</em> reduction, a few units in the last place
+of the spread of the data. <code>.precise()</code> runs the pass in the wide type instead, which makes
+the sums as exact as the state (at the cost of the wide arithmetic over the batch). It folds the
+whole batch only (<code>Fold::all()</code>): <code>Df32</code> and <code>f64</code> arrays have no reductions along an axis, so per-position
+states use the default pass. Integer
+batches are exact in counts, sums and extrema while <code>|x - pivot|</code> and the batch’s partial sums
+stay below <code>2^24</code> (a <code>precise</code> pass is exact for all of <code>u32</code> and <code>i32</code>).</p>
+<p>A state of data whose mean drifts far during the stream keeps its accuracy: the pivot follows the
+mean at every merge of the recorded pushes.</p>
+<h2 id="performance-1"><a class="header" href="#performance-1">Performance</a></h2>
+<p><code>push</code> records one reduction kernel over the batch; the reductions of up to
+<code>flush_every(n)</code> pushes (default 16) are then merged into the state in one more small kernel,
+so a push is about 1.6 launches. The cost is the batch’s memory traffic, and the batches never
+need to be kept: an <code>[4096, 256]</code> batch per push (4 MiB) runs at about 330 GB/s on an RTX 3090
+(CUDA), with computing the same statistics once from the concatenated array (which needs all the
+batches in memory) at about 790 GB/s; luma-bench’s <code>accum</code> suite and <code>tools/afcompare</code>’s <code>accum</code>
+group measure both and ArrayFire’s equivalent.</p>
+<ul>
+<li>Several statistics of one batch share the pass only if they are reductions over the same
+lines: asking for <code>min_max()</code> or higher moments adds passes (kurtosis and extrema together are
+about 3.5 passes’ worth).</li>
+<li>A batch that is an expression of other arrays is computed inside the pass (see the example
+above), so it costs no extra reads.</li>
+<li>Batches larger than one device buffer are processed in pieces.</li>
+<li><code>flush_every</code> trades launches for memory: pushes between merges keep their batches alive.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h1>
 <p>Luma reads these when a context opens. <code>ContextOptions::from_env()</code> collects the ones that have
 a <a href="https://docs.rs/luma/latest/luma/struct.ContextOptions.html"><code>ContextOptions</code></a> field, and the
@@ -3312,7 +4919,7 @@ builder methods override them:</p>
 </table>
 </div>
 <p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_FUSION_*</code>,
-<code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
+<code>LUMA_STAGING</code>, <code>LUMA_COARSEN</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_PLAN_CACHE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_CPU_SPIN_US</code>, <code>LUMA_COMPILE_THREADS</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
 <h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
 <div class="table-wrapper">
 <table>
@@ -3332,8 +4939,10 @@ builder methods override them:</p>
 <tr><td><code>LUMA_FUSION_MAX_INPUTS</code></td><td>Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer (<a href="#many-arrays-in-one-kernel">Performance</a>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_INLINED</code></td><td>Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on the NVIDIA tuning profile, 1024 on every other, the CPU one included; <code>16..=16384</code>)</td></tr>
+<tr><td><code>LUMA_COARSEN</code></td><td><code>off</code>, <code>auto</code> or <code>1</code>, <code>2</code>, <code>4</code>, <code>8</code>: how many elements each invocation of a fused elementwise kernel computes (thread coarsening: elements <code>i</code>, <code>i + T</code>, <code>i + 2T</code>, … for <code>T</code> invocations in the launch, the loads of all of them issued before the first store, results bit-identical to one per invocation). <code>auto</code> (the default on NVIDIA GPUs, <code>off</code> elsewhere) coarsens launches of at least 16 waves of invocations whose kernel waits on long dependent chains: many <code>f64</code> operations (8 elements) or gathers (4); a number forces that many wherever the kernel is a plain store (not for <code>bool</code> results, staged, segmented or scatter kernels), whatever the size</td></tr>
 <tr><td><code>LUMA_STAGING</code></td><td><code>off</code> turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first</td></tr>
 <tr><td><code>LUMA_TRIDIAGONAL</code></td><td><code>thomas</code>, <code>cyclic</code> or <code>auto</code>: the algorithm of <code>solve_tridiagonal</code> / <code>solve_block_tridiagonal</code> (one invocation per line, or one workgroup per line by cyclic reduction); the default (<code>auto</code>) picks cyclic reduction for few, long lines on the NVIDIA and Apple tuning profiles only (and always for stacked blocks wider than 5 there)</td></tr>
+<tr><td><code>LUMA_PLAN_CACHE</code></td><td><code>off</code>, <code>0</code>, <code>false</code> or <code>no</code> switches off the plan cache of eager evaluation: an <code>eval</code> whose pending graph has the structure of an earlier one (the loop <code>x = step(&amp;x); x.eval()?</code>) normally runs that evaluation’s recorded launches over the new buffers and scalars instead of planning it again; results are bit-identical either way. <code>trace</code> prints what the cache records and why it gives up on a structure</td></tr>
 <tr><td><code>LUMA_SPECULATE</code></td><td><code>off</code> stops readbacks in a loop (<code>step</code> then <code>.max().item()?</code> every iteration) from computing the next steps ahead</td></tr>
 <tr><td><code>LUMA_FAST_MATH</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: allow rewrites that change values (<code>x + 0</code>, <code>x * 0</code>, <code>x - x</code>, <code>x / x</code>, constant reassociation and <code>x / c</code> as <code>x * (1 / c)</code> (both <code>f32</code> and <code>f64</code> only), <code>powf</code> with exponent 1, 2 or 0.5) and the cheaper <code>Df32</code> addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (<code>x * 1</code>, <code>-(-x)</code>) always run</td></tr>
 <tr><td><code>LUMA_DF_FMA</code></td><td><code>0</code>, <code>off</code> or <code>false</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>1</code>, <code>on</code> or <code>true</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
@@ -3343,6 +4952,8 @@ builder methods override them:</p>
 <tr><td><code>LUMA_CUDA_DUMP</code></td><td>a directory: the CUDA backend writes the NVVM IR (<code>.ll</code>), the PTX (<code>.ptx</code>) and the label (<code>.label</code>) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code</td></tr>
 <tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>%LOCALAPPDATA%\luma</code> on Windows, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored. A wgpu pipeline cache that grows past 32 MB is dropped and starts again</td></tr>
 <tr><td><code>LUMA_CPU_THREADS</code></td><td>Number of worker threads of the native <code>cpu</code> backend (default: the machine’s available parallelism; a value that is not a positive number is ignored)</td></tr>
+<tr><td><code>LUMA_COMPILE_THREADS</code></td><td>Worker threads that compile luma’s own kernels in the background on the <code>cuda</code> and <code>cpu</code> backends (default: the machine’s available parallelism; <code>0</code> compiles on the calling thread). A kernel is waited for at its first launch, which then reports a compile error. Exit waits (up to 20 s) for the compiles in progress</td></tr>
+<tr><td><code>LUMA_CPU_SPIN_US</code></td><td>Microseconds an idle worker of the native <code>cpu</code> backend polls for the next launch before it sleeps (default 200; <code>0</code> sleeps at once, which saves power and helps when the machine is oversubscribed, at the cost of a wake-up per launch). The worker on the other hardware thread of the core the launching thread runs on never polls (on Linux): it would slow the host work between launches</td></tr>
 <tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s Vulkan driver) and then ends the process with <code>_exit</code></td></tr>
 </tbody>
 </table>
@@ -3359,6 +4970,9 @@ builder methods override them:</p>
 <tr><td><code>LUMA_FUZZ_SEED</code></td><td>Fixed seed (default: random; failing cases are also kept in <code>tests/proptest-regressions/</code>)</td></tr>
 <tr><td><code>LUMA_FUZZ_VERBOSE</code></td><td>Set to anything: print a line for each program that ends early on a documented limit</td></tr>
 <tr><td><code>LUMA_TEST_CACHE</code></td><td><code>1</code>: the process uses a cache directory under the system temporary directory (<code>luma-test-cache</code>) instead of the user’s, unless <code>LUMA_CACHE</code> or <code>LUMA_CACHE_DIR</code> is set (unit tests always do)</td></tr>
+<tr><td><code>LUMA_LINALG_FENCE</code></td><td><code>1</code> / <code>0</code>: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; <code>0</code> is the opt-out)</td></tr>
+<tr><td><code>LUMA_LINALG_PANEL</code></td><td><code>8</code>, <code>16</code> or <code>32</code> (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop</td></tr>
+<tr><td><code>LUMA_QR_TSQR</code></td><td><code>0</code>: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it)</td></tr>
 </tbody>
 </table>
 </div>
@@ -3485,7 +5099,7 @@ assert_eq!(x.to_i32().to_vec()?, vec![-1, 0, 2_147_483_520, i32::MIN, 2_147_483_
 <p><strong>Which matrix shape is <code>matmul</code>’s?</strong> Axis 0 varies fastest, so the shapes are NumPy’s
 <code>a @ b</code> reversed: <code>lhs</code> <code>[K, M]</code>, <code>rhs</code> <code>[N, K]</code>, result <code>[N, M]</code>
 (<a href="#matrix-products">Matrix products</a>).</p>
-<h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
+<h2 id="performance-2"><a class="header" href="#performance-2">Performance</a></h2>
 <p><strong>The first run is slow, later ones are fast.</strong> Large kernels (especially <code>Df32</code>) take seconds
 to compile on some drivers. Luma keeps the driver’s compiled pipelines (wgpu), the CUDA PTX, the CPU backend’s machine code and the measured cost
 model in <code>$XDG_CACHE_HOME/luma</code> (<code>~/.cache/luma</code>), so the second process skips that. Set

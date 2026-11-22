@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-73370195.js";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a2c80e88.js"></script>
+        <script src="toc-732ff444.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -224,6 +224,39 @@ let cols = a.transpose().matmul(&amp;a);
 assert_eq!(cols.shape(), Shape::from([3, 3]));
 assert_eq!(cols.to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 45.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><code>a.matmul_batched(&amp;b)</code> multiplies a batch of matrices in one launch (<code>matmul</code> in a loop is one launch
+per product). The batch is axis 2 of both operands: <code>a</code> is <code>[K, M, B]</code>, <code>b</code> is <code>[N, K, B]</code> and the
+result <code>[N, M, B]</code>. An operand without the batch (<code>[N, K]</code>) is shared by every product, as the
+weights of a layer are:</p>
+<pre><code class="language-rust">use luma::*;
+
+// Two products of [[1, 2], [3, 4]] @ [[1, 0], [0, 1]] and [[5, 6], [7, 8]] @ [[1, 0], [0, 1]].
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 2, 2])?;
+let identity = Array::from_slice(&amp;[1.0f32, 0.0, 0.0, 1.0], [2, 2])?; // shared by both
+let c = a.matmul_batched(&amp;identity);
+assert_eq!(c.shape(), Shape::from([2, 2, 2]));
+assert_eq!(c.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="tensor-cores-tf32"><a class="header" href="#tensor-cores-tf32">Tensor cores (TF32)</a></h3>
+<p>On a CUDA device with tensor cores (compute capability 8.0 and up: Ampere, Ada, Hopper) <code>matmul</code>
+runs on them by default, in TF32: the operands are rounded to TF32, which keeps the 8-bit exponent
+of <code>f32</code> but only 10 bits of mantissa, and the products are accumulated in <code>f32</code>. Each entry
+differs from the <code>f32</code> product by up to 1.5e-3 of the sum of the absolute values of its terms
+(about 2e-4 of the entries’ RMS for operands of random sign), the precision of PyTorch’s
+<code>allow_tf32</code>; infinities and NaNs go through as in <code>f32</code>. On an RTX 3090 a 4096 x 4096 x 4096
+product runs at 34 TFLOP/s instead of 20 (the card’s <code>f32</code> peak is 35.6), a 1024 x 1024 x 1024 one
+at 21 instead of 13, and the small and skinny products of a network (a 256-row batch through a
+1024-wide layer, a 2048 x 512 x 128 weight gradient) 3-4 times faster.</p>
+<p>Where the precision matters, ask for <code>f32</code>: <code>a.matmul_f32(&amp;b)</code> is the full-precision product of
+one call (a chain of fused multiply-adds in a fixed order per entry), and
+<code>ContextOptions::tf32_matmul(false)</code> (<code>LUMA_TF32_MATMUL=0</code>) makes every <code>matmul</code> of a context
+that product. <code>matmul_tf32</code> forces TF32 whatever the context says, and <code>matmul_batched</code> is always
+<code>f32</code>. On CUDA the <code>f32</code> product has kernels of its own for the shapes above (an RTX 3090: 23
+TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions
+are fused into the shader kernel as before. Products whose <code>M</code>, <code>N</code> and <code>K</code> are not all multiples of 4 and at least 32, and every other
+backend (wgpu, Metal, the CPU), compute the <code>f32</code> product, so the same program runs everywhere
+and differs only by the rounding where tensor cores are used. Transposed operands are read in
+place; other lazy operands are evaluated first, where the <code>f32</code> kernels fuse them.</p>
 <p>An operand that is a pending expression is not stored first: its expression is evaluated inside
 the product’s loads, once per use. A standardised Gram (correlation-style) matrix of a table with
 one column per feature (<code>[samples, features]</code>) is one launch plus the statistics:</p>
@@ -271,7 +304,7 @@ assert_eq!(sum.to_vec()?, vec![10.0, 60.0]);
 assert_eq!(sum_sq.to_vec()?, vec![30.0, 1000.0]);
 assert_eq!(max.to_vec()?, vec![4.0, 20.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
-<p>The results are evaluated when the call returns. Another number of ops poisons the results.
+<p><code>f32</code> results stay pending until one is used, then it is recorded together with every other axis reduction over the same lines that is pending, in one kernel (each result is the value it has alone: the same bits on the CPU backend, within an ulp or two on GPU backends); other types are evaluated when the call returns. Another number of ops poisons the results.
 <code>sum_axis</code>, <code>min_axis</code> and <code>max_axis</code> are the single-op cases. They (and <code>reduce_axis</code>) work on
 <code>f32</code>, <code>u32</code> and <code>i32</code> (<code>SumOfSquares</code> of integers wraps); <code>bool</code> arrays have <code>sum_axis</code> (a
 count, <code>u32</code>), <code>min_axis</code> and <code>max_axis</code> only.</p>
@@ -289,6 +322,29 @@ assert_eq!(x.std_axis(0).to_vec()?[1], 5.0);
 // Far from zero the two-pass variance is still right.
 let y = Array::from_slice(&amp;[1.0e4f32 + 1.0, 1.0e4 + 2.0, 1.0e4 + 3.0, 1.0e4 + 4.0], 4)?;
 assert!((y.var_axis(0).item()? - 1.25).abs() &lt; 1e-3);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="variance-with-a-divisor-weights-covariance"><a class="header" href="#variance-with-a-divisor-weights-covariance">Variance with a divisor, weights, covariance</a></h3>
+<p><code>var(bias)</code>, <code>std(bias)</code> and <code>meanvar(bias)</code> do the same for the whole array (<code>f32</code> and <code>f64</code>), and
+<code>var_axis_bias(axis, bias)</code>, <code>std_axis_bias</code> and <code>meanvar_axis</code> along an axis. A [<code>Bias</code>] is ArrayFire’s
+<code>af_var_bias</code>: <code>Population</code> divides by <code>n</code>, <code>Sample</code> by <code>n - 1</code>. The mean and variance of a <code>meanvar</code>
+come from one pass over the data (the sum and the sum of squares of the data minus its first element).
+<code>mean_weighted(&amp;w)</code> and <code>meanvar_weighted(&amp;w, bias)</code> take weights of the array’s shape (or extent 1
+along the axes to broadcast), <code>mean_axis_weighted(axis, &amp;w)</code> along an axis. <code>cov(&amp;y, bias)</code> and
+<code>corrcoef(&amp;y)</code> pair two arrays of one shape element by element (the sums of the three expressions are
+recorded in one kernel); <code>cov_axis</code> and <code>corrcoef_axis</code> work per line. Axis forms are <code>f32</code> only
+(there are no axis reductions of <code>f64</code>).</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let y = Array::from_slice(&amp;[2.0f32, 4.0, 6.0, 8.0], 4)?;
+assert_eq!(x.var(Bias::Population).item()?, 1.25);
+assert!((x.var(Bias::Sample).item()? - 5.0 / 3.0).abs() &lt; 1e-6);
+let (mean, var) = x.meanvar(Bias::Population);
+assert_eq!((mean.item()?, var.item()?), (2.5, 1.25));
+let w = Array::from_slice(&amp;[1.0f32, 1.0, 1.0, 5.0], 4)?;
+assert_eq!(x.mean_weighted(&amp;w).item()?, 3.25);
+assert!((x.corrcoef(&amp;y).item()? - 1.0).abs() &lt; 1e-6);
+assert!((x.cov(&amp;y, Bias::Sample).item()? - 10.0 / 3.0).abs() &lt; 1e-5);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="argmax-and-argmin"><a class="header" href="#argmax-and-argmin">Argmax and argmin</a></h2>
 <p><code>argmax</code> and <code>argmin</code> give the <strong>flat index</strong> of the largest or smallest element as a
@@ -393,7 +449,11 @@ assert_eq!(n.argsort_descending().to_vec()?, vec![3, 1, 0, 2]);
 <p>Floats sort in the total order of their bits: <code>-inf &lt; .. &lt; -0.0 &lt; +0.0 &lt; .. &lt; +inf &lt; NaN</code>, so
 NaNs come last (first when descending) and <code>-0.0</code> sorts before <code>+0.0</code> (and <code>+0.0</code> before
 <code>-0.0</code> when descending, by input order for ties). The sign of a NaN is not kept.
-<code>sort_axis(axis)</code> sorts every line along <code>axis</code> independently, stably, and keeps the shape.</p>
+<code>sort_axis(axis)</code> sorts every line along <code>axis</code> independently and keeps the shape. Lines of up to
+2048 elements (256 on the CPU backend; any axis) are sorted in workgroup memory, in one pass over the data; longer lines
+take the radix sort of the whole array followed by a regrouping by line (and, along an axis other
+than 0, a tiled transpose back to the layout). <code>sort_axis</code> returns the NaNs as the positive quiet NaN,
+like <code>sort</code>.</p>
 <h2 id="groups"><a class="header" href="#groups">Groups</a></h2>
 <p><code>group_sum</code>, <code>group_min</code>, <code>group_max</code>, <code>group_mean</code> and <code>group_count</code> reduce the elements that
 share a code, a groupby over dense codes <code>0..groups</code>: result element <code>g</code> combines the elements
@@ -417,6 +477,27 @@ assert!(mean[2].is_nan());
 <code>group_min</code> / <code>group_max</code>: <code>+inf</code> / <code>-inf</code> for <code>f32</code>, the integer maximum / minimum for <code>u32</code>
 and <code>i32</code> (<code>u32::MAX</code> / <code>0</code>, <code>i32::MAX</code> / <code>i32::MIN</code>).</p>
 <p>Where the groups are labels rather than <code>0..groups</code>, <code>factorize</code> (next section) makes the codes.</p>
+<h3 id="segments"><a class="header" href="#segments">Segments</a></h3>
+<p>When the groups are contiguous runs of the array (the rows of a CSR matrix given by its row
+pointer, a sorted group-by given by the offsets of its groups), <code>sum_segments</code>, <code>min_segments</code> and
+<code>max_segments</code> reduce segment <code>i</code>, the elements <code>offsets[i]..offsets[i + 1]</code>, to element <code>i</code> of
+the result (<code>offsets.len() - 1</code> elements, <code>u32</code>, non-decreasing, the first 0 and the last the
+length of the values). An empty segment gives the identity, as for the group reductions. They
+need no codes and no atomics: the entries are split evenly over the workgroups whatever the
+lengths of the segments, so a power-law matrix with one row of 100000 entries among rows of a
+handful costs no more than a regular one, and the result is the same on every run. A pending
+operand is computed inside the kernel, so a sparse matrix-vector product is one expression:</p>
+<pre><code class="language-rust">use luma::*;
+
+// [[1, 0, 2], [0, 0, 0], [0, 3, 4]] in CSR.
+let ptr = Array::from_slice(&amp;[0u32, 2, 2, 4], 4)?;
+let col = Array::from_slice(&amp;[0u32, 2, 1, 2], 4)?;
+let val = Array::from_slice(&amp;[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let x = Array::from_slice(&amp;[1.0f32, 10.0, 100.0], 3)?;
+let y = (&amp;val * x.take(&amp;col)).sum_segments(&amp;ptr);
+assert_eq!(y.to_vec()?, vec![201.0, 0.0, 430.0]);
+assert_eq!(val.max_segments(&amp;ptr).to_vec()?, vec![2.0, f32::NEG_INFINITY, 4.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h2 id="unique-values"><a class="header" href="#unique-values">Unique values</a></h2>
 <p><code>factorize()</code> returns the sorted distinct values of an array (flat, one dimension) and, shaped
 like the array, the index of each element’s value in them: <code>uniques.take(&amp;codes)</code> is the array
@@ -448,6 +529,12 @@ between the sorted neighbours as NumPy’s default does: with <code>h = q * (len
 and <code>median_axis(axis)</code> do it for every line along an axis (extent 1 there in the result). <code>q</code>
 outside <code>[0, 1]</code> (NaN included) poisons the result with <code>InvalidShape</code>. The sort is evaluated,
 the interpolation is lazy.</p>
+<p>Every call sorts, and the sort is nearly all of the cost, so ask for several quantiles in one
+call: <code>quantiles(&amp;[q0, q1, ..])</code> gives a one-dimensional array with one entry per <code>q</code>, and
+<code>quantiles_axis(axis, &amp;qs)</code> the shape of the array with <code>qs.len()</code> entries along <code>axis</code> (entry
+<code>j</code> is <code>quantile_axis(axis, qs[j])</code>). A describe-style table of 25% / 50% / 75% costs one sort
+instead of three. Nothing is cached between calls: a sorted copy kept for the next call would
+cost as much memory as the array.</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[4.0f32, 1.0, 3.0, 2.0], 4)?;
@@ -460,6 +547,11 @@ assert!(x.quantile(1.5).item().is_err());
 // Two columns of four: the median of each.
 let t = Array::from_slice(&amp;[4.0f32, 1.0, 3.0, 2.0, 10.0, 50.0, 30.0, 20.0], [4, 2])?;
 assert_eq!(t.median_axis(0).to_vec()?, vec![2.5, 25.0]);
+
+// Three quantiles of each column with one sort: [3, 2], the quantiles along axis 0.
+let q = t.quantiles_axis(0, &amp;[0.0, 0.5, 1.0]);
+assert_eq!(q.to_vec()?, vec![1.0, 2.5, 4.0, 10.0, 25.0, 50.0]);
+assert_eq!(x.quantiles(&amp;[0.0, 0.25, 1.0]).to_vec()?, vec![1.0, 1.75, 4.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <p>NaNs sort last, so they only affect the high quantiles; NumPy returns NaN for every quantile of
 an array with a NaN, this does not.</p>
@@ -668,6 +760,55 @@ assert!(corr.iter().all(|c| (c - 1.0).abs() &lt; 1e-5));
 let x = Array::from_slice(&amp;[-2.0f32, 0.5, 3.0], 3)?;
 assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h2 id="tiles-diagonals-triangles-differences"><a class="header" href="#tiles-diagonals-triangles-differences">Tiles, diagonals, triangles, differences</a></h2>
+<p>ArrayFire’s structural functions are index maps and generators in luma: none is a kernel of its
+own, each fuses into the expression that reads it, and none reads or writes memory until an
+evaluation needs it. Shapes list the extents with the first dimension fastest, exactly like
+ArrayFire’s <code>dim4</code>, so the dimension arguments carry over unchanged (<code>af::tile(a, 2, 3)</code> is
+<code>a.tile([2, 3])</code>, <code>af::diff1(a, 1)</code> is <code>a.diff1(1)</code>). Element <code>(i, j)</code> has <code>i</code> along dimension 0;
+diagonal <code>k</code> holds the elements with <code>j - i = k</code>.</p>
+<p><strong><code>tile</code></strong> repeats an array along every dimension, a lazy read like a wrapping pad; <strong><code>iota</code></strong>
+counts the elements of a shape in memory order and tiles the count; <strong><code>identity</code></strong> is generated
+inside the kernel that uses it:</p>
+<pre><code class="language-rust">use luma::*;
+
+let a = Array::from_slice(&amp;[1.0f32, 2.0, 3.0], 3)?;
+assert_eq!(a.tile([2, 2]).to_vec()?, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+assert_eq!(Array::&lt;u32&gt;::iota([2, 2], [1, 2])?.to_vec()?, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+let id = Array::&lt;f32&gt;::identity([3, 3])?;
+assert_eq!(id.to_vec()?, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p><strong><code>diag(k)</code></strong> extracts the <code>k</code>-th diagonal of every matrix of dimensions 0 and 1 (dimensions 2 and
+3 are batches) as a view, and <strong><code>diag_matrix(k)</code></strong> builds the matrix with a column on its
+diagonal <code>k</code>; <strong><code>lower(unit)</code></strong> and <strong><code>upper(unit)</code></strong> zero the other triangle (with <code>unit</code> the
+diagonal is one) and work on non-square matrices and batches. All of them accept every element
+type (<code>f32</code>, <code>i32</code>, <code>u32</code>, <code>bool</code>, <code>f64</code>, <code>Df32</code>), and a NaN that is not kept is zeroed, not
+propagated:</p>
+<pre><code class="language-rust">use luma::*;
+
+let m = Array::from_slice(&amp;[1.0f32, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0], [3, 3])?;
+assert_eq!(m.diag(0).to_vec()?, vec![1.0, 5.0, 9.0]);
+assert_eq!(m.diag(1).to_vec()?, vec![2.0, 6.0]);
+assert_eq!(m.diag(-1).to_vec()?, vec![4.0, 8.0]);
+assert_eq!(m.lower(false).to_vec()?, vec![1.0, 4.0, 7.0, 0.0, 5.0, 8.0, 0.0, 0.0, 9.0]);
+assert_eq!(m.upper(true).to_vec()?, vec![1.0, 0.0, 0.0, 2.0, 1.0, 0.0, 3.0, 6.0, 1.0]);
+let v = Array::from_slice(&amp;[1.0f32, 2.0], 2)?;
+assert_eq!(v.diag_matrix(1).to_vec()?, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<p>A diagonal outside the matrix would be empty, and luma has no empty arrays: it poisons the result
+with <code>InvalidShape</code> (as <code>diff1</code> does for an extent below 2).</p>
+<p><strong><code>replace(&amp;cond, b)</code></strong> is <code>af::replace</code> returning a new array (<code>a</code> where <code>cond</code>, else <code>b</code>, an
+array or a scalar: <code>select(&amp;cond, &amp;a, b)</code>), and <strong><code>diff1(axis)</code></strong> / <strong><code>diff2(axis)</code></strong> are the first
+and second differences along an axis, one and two shorter, as a fused difference of slices that
+reads the array once:</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[1.0f32, f32::NAN, 4.0, 9.0], 4)?;
+assert_eq!(x.replace(&amp;!x.is_nan(), 0.0).to_vec()?, vec![1.0, 0.0, 4.0, 9.0]);
+let y = Array::from_slice(&amp;[0.0f32, 1.0, 4.0, 9.0, 16.0], 5)?;
+assert_eq!(y.diff1(0).to_vec()?, vec![1.0, 3.0, 5.0, 7.0]);
+assert_eq!(y.diff2(0).to_vec()?, vec![2.0, 2.0, 2.0]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 
                     </main>
 
@@ -677,7 +818,7 @@ assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="records.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="fft.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -691,7 +832,7 @@ assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="records.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="fft.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

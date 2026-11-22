@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-73370195.js";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a2c80e88.js"></script>
+        <script src="toc-732ff444.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -251,6 +251,14 @@ scalars, vectors, matrices, arrays. <code>luma::encase</code> is a re-export of 
 <p><strong>Element sizes</strong> are checked: a binding <code>array&lt;f32&gt;</code> takes arrays of 4-byte elements,
 <code>array&lt;vec2&lt;f32&gt;&gt;</code> arrays of 8-byte ones (<code>[f32; 2]</code>, <code>Df32</code>, <code>f64</code>). Only the size is compared,
 not the type: an <code>Array&lt;u32&gt;</code> passes for <code>array&lt;f32&gt;</code>, so keep the types straight yourself.</p>
+</li>
+<li>
+<p><strong><code>Array&lt;u8&gt;</code>, <code>Array&lt;i8&gt;</code>, <code>Array&lt;u16&gt;</code> and <code>Array&lt;i16&gt;</code></strong> bind as <code>array&lt;u32&gt;</code> of words that
+hold four or two elements (<a href="compact.html#how-they-are-stored">Compact integers</a>): element <code>i</code> of
+a byte array is <code>(a[i &gt;&gt; 2u] &gt;&gt; ((i &amp; 3u) * 8u)) &amp; 0xFFu</code>, of a 16-bit one
+<code>(a[i &gt;&gt; 1u] &gt;&gt; ((i &amp; 1u) * 16u)) &amp; 0xFFFFu</code> (sign-extend the signed types). The bytes of the
+last word past the end of the array are unspecified: ignore them. A kernel that writes one writes whole words, or
+updates single fields with <code>atomicAnd</code> / <code>atomicOr</code> on an <code>array&lt;atomic&lt;u32&gt;&gt;</code> binding.</p>
 </li>
 <li>
 <p><strong><code>Array&lt;bool&gt;</code></strong> binds as <code>array&lt;u32&gt;</code> of <em>bit-packed words</em>: an array of <code>n</code> booleans is
@@ -499,7 +507,7 @@ exist on the wgpu backend only.</li>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="integers.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="compact.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -513,7 +521,7 @@ exist on the wgpu backend only.</li>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="integers.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="compact.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

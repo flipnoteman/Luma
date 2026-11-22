@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-73370195.js";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a2c80e88.js"></script>
+        <script src="toc-732ff444.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -203,7 +203,7 @@ builder methods override them:</p>
 </table>
 </div>
 <p>The others (<code>LUMA_TUNING</code>, <code>LUMA_SUBGROUPS</code>, <code>LUMA_SINGLE_PASS_REDUCE</code>, <code>LUMA_LOOKBACK_SCAN</code>, <code>LUMA_FUSION_*</code>,
-<code>LUMA_STAGING</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
+<code>LUMA_STAGING</code>, <code>LUMA_COARSEN</code>, <code>LUMA_TRIDIAGONAL</code>, <code>LUMA_SPECULATE</code>, <code>LUMA_PLAN_CACHE</code>, <code>LUMA_CACHE*</code>, <code>LUMA_CUDA_DUMP</code>, <code>LUMA_CPU_THREADS</code>, <code>LUMA_CPU_SPIN_US</code>, <code>LUMA_COMPILE_THREADS</code>, <code>LUMA_EXIT_WAIT</code>) are read from the environment only.</p>
 <h2 id="all-variables"><a class="header" href="#all-variables">All variables</a></h2>
 <div class="table-wrapper">
 <table>
@@ -223,8 +223,10 @@ builder methods override them:</p>
 <tr><td><code>LUMA_FUSION_MAX_INPUTS</code></td><td>Lowers the most input buffers one fused kernel binds below what the device allows (the limit minus 3, at most 256), to behave like a device with fewer bindings; it cannot raise it. Arrays beyond it are packed into one buffer (<a href="performance.html#many-arrays-in-one-kernel">Performance</a>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_LIVE</code></td><td>Most values a fused kernel keeps live at once before it is split in two (default depends on the GPU profile, <code>8..=4096</code>)</td></tr>
 <tr><td><code>LUMA_FUSION_MAX_INLINED</code></td><td>Most operations of one kernel after nested views of lazy expressions are unfolded into it; a bigger kernel evaluates the most repeated view first (default 1536 on the NVIDIA tuning profile, 1024 on every other, the CPU one included; <code>16..=16384</code>)</td></tr>
+<tr><td><code>LUMA_COARSEN</code></td><td><code>off</code>, <code>auto</code> or <code>1</code>, <code>2</code>, <code>4</code>, <code>8</code>: how many elements each invocation of a fused elementwise kernel computes (thread coarsening: elements <code>i</code>, <code>i + T</code>, <code>i + 2T</code>, … for <code>T</code> invocations in the launch, the loads of all of them issued before the first store, results bit-identical to one per invocation). <code>auto</code> (the default on NVIDIA GPUs, <code>off</code> elsewhere) coarsens launches of at least 16 waves of invocations whose kernel waits on long dependent chains: many <code>f64</code> operations (8 elements) or gathers (4); a number forces that many wherever the kernel is a plain store (not for <code>bool</code> results, staged, segmented or scatter kernels), whatever the size</td></tr>
 <tr><td><code>LUMA_STAGING</code></td><td><code>off</code> turns off workgroup staging of expressions read through slices and pads at several offsets (fluxes, stencils of an expression), where each is computed once per cell of a workgroup tile; the cost model still chooses between recomputing them per read and evaluating them first</td></tr>
 <tr><td><code>LUMA_TRIDIAGONAL</code></td><td><code>thomas</code>, <code>cyclic</code> or <code>auto</code>: the algorithm of <code>solve_tridiagonal</code> / <code>solve_block_tridiagonal</code> (one invocation per line, or one workgroup per line by cyclic reduction); the default (<code>auto</code>) picks cyclic reduction for few, long lines on the NVIDIA and Apple tuning profiles only (and always for stacked blocks wider than 5 there)</td></tr>
+<tr><td><code>LUMA_PLAN_CACHE</code></td><td><code>off</code>, <code>0</code>, <code>false</code> or <code>no</code> switches off the plan cache of eager evaluation: an <code>eval</code> whose pending graph has the structure of an earlier one (the loop <code>x = step(&amp;x); x.eval()?</code>) normally runs that evaluation’s recorded launches over the new buffers and scalars instead of planning it again; results are bit-identical either way. <code>trace</code> prints what the cache records and why it gives up on a structure</td></tr>
 <tr><td><code>LUMA_SPECULATE</code></td><td><code>off</code> stops readbacks in a loop (<code>step</code> then <code>.max().item()?</code> every iteration) from computing the next steps ahead</td></tr>
 <tr><td><code>LUMA_FAST_MATH</code></td><td><code>1</code>, <code>on</code> or <code>true</code>: allow rewrites that change values (<code>x + 0</code>, <code>x * 0</code>, <code>x - x</code>, <code>x / x</code>, constant reassociation and <code>x / c</code> as <code>x * (1 / c)</code> (both <code>f32</code> and <code>f64</code> only), <code>powf</code> with exponent 1, 2 or 0.5) and the cheaper <code>Df32</code> addition, whose error grows with the cancellation (below 2^-47 of the larger operand); exact rewrites (<code>x * 1</code>, <code>-(-x)</code>) always run</td></tr>
 <tr><td><code>LUMA_DF_FMA</code></td><td><code>0</code>, <code>off</code> or <code>false</code> makes <code>Df32</code> products split their factors (Dekker) instead of taking the error of a product from <code>fma</code>; <code>1</code>, <code>on</code> or <code>true</code> trusts that the device’s <code>fma</code> is fused. Default: a one-time test kernel decides per device (stored with the calibration, see <code>LUMA_CACHE</code>); the results are the same either way</td></tr>
@@ -234,6 +236,8 @@ builder methods override them:</p>
 <tr><td><code>LUMA_CUDA_DUMP</code></td><td>a directory: the CUDA backend writes the NVVM IR (<code>.ll</code>), the PTX (<code>.ptx</code>) and the label (<code>.label</code>) of every kernel it builds or loads from the cache there, named like the cache entry. For inspecting generated code</td></tr>
 <tr><td><code>LUMA_CACHE_DIR</code></td><td>Directory of that cache (default <code>$XDG_CACHE_HOME/luma</code> when that is an absolute path, else <code>%LOCALAPPDATA%\luma</code> on Windows, else <code>~/.cache/luma</code>); files are written atomically, so processes may share it, and a damaged file is ignored. A wgpu pipeline cache that grows past 32 MB is dropped and starts again</td></tr>
 <tr><td><code>LUMA_CPU_THREADS</code></td><td>Number of worker threads of the native <code>cpu</code> backend (default: the machine’s available parallelism; a value that is not a positive number is ignored)</td></tr>
+<tr><td><code>LUMA_COMPILE_THREADS</code></td><td>Worker threads that compile luma’s own kernels in the background on the <code>cuda</code> and <code>cpu</code> backends (default: the machine’s available parallelism; <code>0</code> compiles on the calling thread). A kernel is waited for at its first launch, which then reports a compile error. Exit waits (up to 20 s) for the compiles in progress</td></tr>
+<tr><td><code>LUMA_CPU_SPIN_US</code></td><td>Microseconds an idle worker of the native <code>cpu</code> backend polls for the next launch before it sleeps (default 200; <code>0</code> sleeps at once, which saves power and helps when the machine is oversubscribed, at the cost of a wake-up per launch). The worker on the other hardware thread of the core the launching thread runs on never polls (on Linux): it would slow the host work between launches</td></tr>
 <tr><td><code>LUMA_EXIT_WAIT</code></td><td><code>0</code> skips waiting at exit for the driver’s threads (the wgpu backend, on Linux; saves about 60 ms; risks the driver’s exit hang or abort). By default exit waits up to 2 s for the GPU and up to 2 s for busy driver compiler threads (NVIDIA’s Vulkan driver) and then ends the process with <code>_exit</code></td></tr>
 </tbody>
 </table>
@@ -250,6 +254,9 @@ builder methods override them:</p>
 <tr><td><code>LUMA_FUZZ_SEED</code></td><td>Fixed seed (default: random; failing cases are also kept in <code>tests/proptest-regressions/</code>)</td></tr>
 <tr><td><code>LUMA_FUZZ_VERBOSE</code></td><td>Set to anything: print a line for each program that ends early on a documented limit</td></tr>
 <tr><td><code>LUMA_TEST_CACHE</code></td><td><code>1</code>: the process uses a cache directory under the system temporary directory (<code>luma-test-cache</code>) instead of the user’s, unless <code>LUMA_CACHE</code> or <code>LUMA_CACHE_DIR</code> is set (unit tests always do)</td></tr>
+<tr><td><code>LUMA_LINALG_FENCE</code></td><td><code>1</code> / <code>0</code>: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; <code>0</code> is the opt-out)</td></tr>
+<tr><td><code>LUMA_LINALG_PANEL</code></td><td><code>8</code>, <code>16</code> or <code>32</code> (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop</td></tr>
+<tr><td><code>LUMA_QR_TSQR</code></td><td><code>0</code>: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it)</td></tr>
 </tbody>
 </table>
 </div>
@@ -258,7 +265,7 @@ builder methods override them:</p>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="examples.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="accumulators.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -272,7 +279,7 @@ builder methods override them:</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="examples.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="accumulators.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

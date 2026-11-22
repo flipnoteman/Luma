@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-73370195.js";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a2c80e88.js"></script>
+        <script src="toc-732ff444.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -213,7 +213,9 @@ assert_eq!((lo, hi), (1.0, 4.0));
 <tbody>
 <tr><td><code>sum()</code>, <code>min()</code>, <code>max()</code></td><td>any element type; <code>u32</code> sums wrap around</td></tr>
 <tr><td><code>mean()</code>, <code>norm()</code></td><td><code>f32</code>; the norm is the Euclidean (L2) norm</td></tr>
-<tr><td><code>reduce([Reduction; N])</code></td><td><code>N</code> of <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>SumOfSquares</code> (one to four) in one pass, as an <code>N</code>-element array</td></tr>
+<tr><td><code>prod()</code> / <code>product()</code></td><td>the product; NaN if any element is NaN, <code>u32</code> / <code>i32</code> products wrap around</td></tr>
+<tr><td><code>reduce([Reduction; N])</code></td><td><code>N</code> of <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>SumOfSquares</code>, <code>Product</code> (one to four) in one pass, as an <code>N</code>-element array</td></tr>
+<tr><td><code>norm_p(Norm)</code></td><td><code>One</code>, <code>Two</code>, <code>Inf</code>, <code>P(p)</code>, <code>Frobenius</code> and the matrix <code>MatrixOne</code> / <code>MatrixInf</code> norms, <code>f32</code> (<code>f64</code> except <code>P</code>)</td></tr>
 <tr><td><code>sum_where(&amp;cond)</code></td><td>the sum of the elements where a <code>bool</code> (or non-zero <code>u32</code>) condition is true, in one pass</td></tr>
 <tr><td><code>item()</code></td><td>the value of a one-element array</td></tr>
 <tr><td><code>to_array::&lt;N&gt;()</code></td><td>the values of an <code>N</code>-element array</td></tr>
@@ -277,7 +279,8 @@ are the ones a host loop would give.</p>
 <p><code>sum_where(&amp;cond)</code> sums where a condition (an <code>Array&lt;bool&gt;</code>, such as a comparison, or a <code>u32</code> array of
 non-zero elements) is true; the <code>sum()</code> of a boolean array is the number of true elements, as a <code>u32</code>
 array (also <code>count()</code>, as in NumPy). <code>any()</code> and <code>all()</code> are one-element <code>bool</code> arrays, and <code>bool</code>
-arrays have <code>min</code> / <code>max</code> but no <code>mean</code>, <code>norm</code> or <code>reduce</code>:</p>
+arrays have <code>min</code> / <code>max</code> but no <code>mean</code>, <code>norm</code> or <code>reduce</code>. Along an axis, <code>count_axis</code>, <code>all_axis</code> and
+<code>any_axis</code> do the same per line:</p>
 <pre><code class="language-rust">use luma::*;
 
 let x = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, -4.0], 4)?;
@@ -286,6 +289,29 @@ assert_eq!(x.sum_where(&amp;positive).item()?, 4.0);
 assert_eq!(positive.count().item()?, 2);
 assert_eq!(positive.sum().item()?, 2);
 assert!(positive.any().item()?);
+
+let table = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, 4.0, 5.0, -6.0], [2, 3])?;
+let flags = table.gt(0.0);
+assert_eq!(flags.count_axis(0).to_vec()?, vec![1, 2, 1]);
+assert_eq!(flags.all_axis(1).to_vec()?, vec![true, false]);
+assert_eq!(flags.any_axis(1).to_vec()?, vec![true, true]);
+<span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
+<h3 id="products-and-norms"><a class="header" href="#products-and-norms">Products and norms</a></h3>
+<p><code>prod()</code> (alias <code>product()</code>, ArrayFire’s name) multiplies all elements, fused with the expression behind
+it like a sum; <code>prod_axis(axis)</code> does it per line. <code>norm_p</code> takes a [<code>Norm</code>]: the absolute value or power
+is computed inside the reduction, so every norm reads the data once.</p>
+<pre><code class="language-rust">use luma::*;
+
+let x = Array::from_slice(&amp;[3.0f32, -4.0, 2.0], 3)?;
+assert_eq!(x.prod().item()?, -24.0);
+assert_eq!(x.norm_p(Norm::One).item()?, 9.0);
+assert_eq!(x.norm_p(Norm::Inf).item()?, 4.0);
+assert!((x.norm_p(Norm::Two).item()? - 29.0f32.sqrt()).abs() &lt; 1e-6);
+
+// A matrix: axis 0 is the row index (as in ArrayFire), so MatrixOne is the largest column sum.
+let m = Array::from_slice(&amp;[1.0f32, -2.0, 3.0, 4.0], [2, 2])?;
+assert_eq!(m.norm_p(Norm::MatrixOne).item()?, 7.0);
+assert_eq!(m.norm_p(Norm::MatrixInf).item()?, 6.0);
 <span class="boring">Ok::&lt;(), luma::LumaError&gt;(())</span></code></pre>
 <h3 id="vector-elements"><a class="header" href="#vector-elements">Vector elements</a></h3>
 <p>Arrays of <code>[f32; 2]</code> and <code>[f32; 4]</code> reduce per component, and these reductions return host

@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-73370195.js";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a2c80e88.js"></script>
+        <script src="toc-732ff444.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -437,6 +437,15 @@ fuses.</p>
 <p>Compared with the loop primitives, an <code>eval</code> loop calls your step every iteration (host work per
 step) but may use anything inside it, including readbacks. Use the primitive when the step fits
 and the host time matters.</p>
+<p>When <code>eval</code> computes right away (the GPU is idle, as in a loop whose steps are shorter than the host’s
+work for them) and the graph it evaluates has the structure of an earlier one (the same operations,
+shapes, views and wiring, the same buffers read in the same places, equal scalars where they were
+equal), Luma runs the launches of that earlier evaluation again over the new buffers and
+scalars instead of planning the graph again: the host time per step of a step with hundreds of
+operations drops by a third to a half, the part that builds the expression stays. The results are
+bit-identical to what the planner makes, and only evaluations of plain elementwise, view and
+shift graphs with no other lazy array alive are replayed. <code>LUMA_PLAN_CACHE=off</code> switches this off
+(<a href="environment.html">Environment variables</a>).</p>
 <h3 id="readbacks-in-a-loop"><a class="header" href="#readbacks-in-a-loop">Readbacks in a loop</a></h3>
 <p><code>step</code> followed by <code>.max().item()?</code> every iteration waits once per step. When the same step has
 been seen repeating, Luma computes the next few steps and their residuals during a readback and

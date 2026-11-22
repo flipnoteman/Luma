@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-73370195.js";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a2c80e88.js"></script>
+        <script src="toc-732ff444.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -288,6 +288,23 @@ numbers are used. <code>LUMA_STAGING=off</code> turns staging off; <code>Context
 decisions are based on. The model is not a tuning knob you can set: if a decision is wrong on your
 hardware, <code>x.cache()</code> forces a materialisation, and <code>LUMA_STAGING=off</code> removes the staged plan (the
 model still chooses between recomputing and materialising).</p>
+<h3 id="reading-a-source-through-a-texture"><a class="header" href="#reading-a-source-through-a-texture">Reading a source through a texture</a></h3>
+<p>The same model decides where a kernel reads a two-dimensional source (<code>jit::cost::read_path</code>): from
+the buffer (on NVIDIA GPUs through the read-only data cache, which a <code>read</code> binding gets on its own)
+or through the device’s texture units, as exact gathers. A texture is a view of the source:
+free on CUDA (the buffer itself, as a pitched texture, kept with the array while its buffer stays
+where it is), a copy of the image on wgpu (a read and a write of it and a launch, made per use). The
+saving is a share of the kernel’s time that the gathers take off (per pattern, measured on an RTX
+3090 and an RTX 3080 Laptop: bicubic warps 26 %, bilinear warps 5-13 %, scattered bicubic positions
+28-36 %, none for <code>resize</code>, smooth positions and nearest: those kernels are bound by DRAM), and a
+texture is read only where the saving is bigger than what the view costs (about 2 us on CUDA, once
+per array; a copy of the image on wgpu, 0.4 ms at 1080p, which no measured kernel recovers). The
+kernels the fusion planner builds never read through a texture: gathers from a 2-D array at computed
+or data-dependent coordinates (single <code>take</code>s, lookup tables, four-tap bilinear footprints written
+as array operations, clamped windows) ran at 0.84-1.0 of the buffer’s speed in texture reads on
+both GPUs, because they are bound by DRAM or by index arithmetic, and the planner sees flat
+indices, not a footprint a gather could take. So on wgpu and the CPU backend the sources are read from buffers,
+and on CUDA the kernels above are measurably faster; <code>Profile</code> shows no extra launch.</p>
 <p>The model also sizes loops: <a href="loops.html#launch-sizing"><code>iterate_all</code></a> cuts long register loops into
 launches of about 40 ms of GPU time by it, and it decides when a circular <code>shift</code> of an expression
 is recomputed, staged, or evaluated first.</p>
@@ -305,10 +322,10 @@ becomes the load of that kernel.</p>
 </thead>
 <tbody>
 <tr><td><code>matmul</code></td><td>each pending operand (a transpose included) is computed in the tile loads</td><td>eager: the product is recorded when called and returned evaluated, so what reads it is another kernel</td></tr>
-<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td>eager: the result is evaluated when the call returns</td></tr>
+<tr><td><code>sum_axis</code>, <code>min_axis</code>, <code>max_axis</code>, <code>reduce_axis</code>, <code>mean_axis</code>, <code>var_axis</code>, <code>std_axis</code>, <code>argmax_axis</code>, <code>argmin_axis</code></td><td>the operand, in the first pass over the data</td><td><code>f32</code> on a GPU backend: pending until used, then recorded with the other pending axis reductions over the same lines in one kernel (up to 8 ops); otherwise eager: the result is evaluated when the call returns</td></tr>
 <tr><td><code>solve_tridiagonal</code>, <code>solve_tridiagonal_parts</code>, <code>solve_block_tridiagonal_parts</code></td><td>each pending block/vector entry is computed where a cell’s system is loaded</td><td>eager: the solution is evaluated when the call returns</td></tr>
 <tr><td><code>put_add</code>, <code>put_min</code>, <code>put_max</code>, <code>bincount</code>, <code>histogram</code>, <code>group_*</code></td><td>the value and the index (or code, or bucket) expressions of the scatter</td><td>an in-place write, like <code>put</code></td></tr>
-<tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
+<tr><td><code>sort</code>, <code>argsort</code>, <code>sort_axis</code> and what builds on them (<code>quantile</code>, <code>quantiles</code>, <code>median</code>, <code>factorize</code>, <code>unique</code>)</td><td>the key expression, in the first pass of the radix sort (<code>sort_axis</code> of lines of up to 2048 elements evaluates its operand first)</td><td>eager: the sorted array is evaluated; <code>factorize</code> and <code>unique</code> also read the number of distinct values back, one host wait</td></tr>
 </tbody>
 </table>
 </div>

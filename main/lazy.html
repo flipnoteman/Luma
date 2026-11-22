@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-73370195.js";
+            window.path_to_searchindex_js = "searchindex-06c5cd10.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a2c80e88.js"></script>
+        <script src="toc-732ff444.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -273,7 +273,7 @@ that would exceed <code>LUMA_FUSION_MAX_INLINED</code> is cut whatever the model
 and your own kernels. They read the arrays they are given, which are computed first.
 <code>matmul</code>, <code>solve_tridiagonal</code> / <code>solve_tridiagonal_parts</code> / <code>solve_block_tridiagonal_parts</code>, the axis reductions (<code>sum_axis</code>, <code>reduce_axis</code>, <code>argmax_axis</code>, …), the scatters (<code>put_add</code>, …) and
 the sorts are kernels of their own too, but they compute a pending operand <em>inside</em> their loads
-instead of storing it, and <code>matmul</code>, the line solves, the axis reductions and the sorts are eager: the result is
+instead of storing it, and <code>matmul</code>, the line solves, the sorts and the axis reductions of types other than <code>f32</code> (and of <code>f32</code> while a step is recorded or profiled) are eager: the result is
 evaluated when the call returns, so what reads it is another kernel
 (<a href="performance.html#primitives-that-read-an-expression">Performance guide</a>).</p>
 <p>An expression is cut into several kernels when it would grow past a limit (<code>LUMA_FUSION_MAX_NODES</code>,
