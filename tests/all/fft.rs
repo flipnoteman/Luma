@@ -191,6 +191,7 @@ fn empty_and_single_point_arrays() {
     assert_eq!(one.ifft().to_vec().unwrap(), vec![C32::new(2.0, -3.0)]);
     let bad = one.fft_axis(4, FftNorm::Backward);
     assert!(bad.to_vec().is_err());
+    assert!(one.fft_axes(&[], FftNorm::Backward).to_vec().is_err());
 }
 
 fn real_signal(n: usize, seed: u64) -> Vec<f32> {

@@ -845,6 +845,9 @@ fn run_complex(
     for &a in axes {
         check_axis(a)?;
     }
+    if axes.is_empty() {
+        return Err(LumaError::InvalidShape("fft needs at least one axis".into()).into());
+    }
     let output = Array::<C32>::alloc(ctx, Shape::from(dims))?;
     if dims.contains(&0) {
         return Ok(output);
