@@ -11,7 +11,7 @@ fn dft(x: &[Z], inverse: bool) -> Vec<Z> {
     if n <= 1 {
         return x.to_vec();
     }
-    let p = (2..=n).find(|p| n % p == 0).unwrap();
+    let p = (2..=n).find(|&p| n.is_multiple_of(p)).unwrap();
     let sign = if inverse { 1.0 } else { -1.0 };
     let w = |k: usize| {
         let a = sign * 2.0 * std::f64::consts::PI * (k % n) as f64 / n as f64;
@@ -65,7 +65,7 @@ fn check(got: &[C32], want: &[Z], tol: f64, what: &str) {
     let mut at = 0;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
         let e = ((f64::from(g.re) - w.0).powi(2) + (f64::from(g.im) - w.1).powi(2)).sqrt();
-        if !(e <= worst) {
+        if e.is_nan() || e > worst {
             worst = e;
             at = i;
         }
@@ -115,7 +115,7 @@ fn along(x: &[Z], dims: [usize; 4], axis: usize, inverse: bool) -> Vec<Z> {
     let mut out = x.to_vec();
     for i in 0..x.len() {
         // The first element of every line.
-        if (i / stride) % n != 0 {
+        if !(i / stride).is_multiple_of(n) {
             continue;
         }
         let line: Vec<Z> = (0..n).map(|k| x[i + k * stride]).collect();
@@ -348,4 +348,58 @@ fn fft_convolution_matches_direct_sums() {
     let a = Array::from_slice_on(&ctx, &real_signal(16, 1), [4, 4]).unwrap();
     let b = Array::from_slice_on(&ctx, &real_signal(8, 2), [2, 2, 2]).unwrap();
     assert!(a.fft_convolve2(&b, ConvMode::Full).to_vec().is_err());
+}
+
+#[test]
+fn large_real_transforms_unpack_in_the_last_pass() {
+    let ctx = Context::new().unwrap();
+    for &n in &[16384usize, 20000, 65536, 100000, 120000, 131072, 2 * 4099 * 3] {
+        let x = real_signal(n, 17 + n as u64);
+        let a = Array::from_slice_on(&ctx, &x, n).unwrap();
+        let want = dft(&lift(&x), false);
+        let half = a.rfft();
+        check(&half.to_vec().unwrap(), &want[..n / 2 + 1], 1e-5, &format!("rfft {n}"));
+        check_real(&lift(&half.irfft(n).to_vec().unwrap()), &x, 1e-5, &format!("irfft {n}"));
+        // A batch of lines.
+        let b = Array::from_slice_on(&ctx, &x.iter().chain(&x).copied().collect::<Vec<_>>(), [n, 2]).unwrap();
+        let hb = b.rfft().to_vec().unwrap();
+        check(&hb[n / 2 + 1..], &want[..n / 2 + 1], 1e-5, &format!("batched rfft {n}"));
+    }
+}
+
+#[test]
+fn non_finite_values_propagate_and_do_not_crash() {
+    let ctx = Context::new().unwrap();
+    for n in [8usize, 37, 1000] {
+        let mut x = signal(n, 5);
+        x[3] = C32::new(f32::NAN, 0.0);
+        let got = Array::from_slice_on(&ctx, &x, n).unwrap().fft().to_vec().unwrap();
+        assert!(got.iter().all(|c| c.re.is_nan() || c.im.is_nan()), "NaN reaches every frequency, n = {n}");
+        let mut x = signal(n, 6);
+        x[1] = C32::new(f32::INFINITY, 0.0);
+        let got = Array::from_slice_on(&ctx, &x, n).unwrap().fft().to_vec().unwrap();
+        assert!(got.iter().all(|c| !c.re.is_finite() || !c.im.is_finite()), "infinity reaches every frequency, n = {n}");
+    }
+}
+
+#[test]
+fn transforms_compose_with_complex_array_operations() {
+    let ctx = Context::new().unwrap();
+    let (n, k) = (96usize, 5usize);
+    let x = real_signal(n, 8);
+    let h = real_signal(k, 9);
+    // The circular convolution by the convolution theorem, with lazy complex arithmetic between the transforms.
+    let a = Array::from_slice_on(&ctx, &x, n).unwrap().to_complex();
+    let mut padded = h.clone();
+    padded.resize(n, 0.0);
+    let b = Array::from_slice_on(&ctx, &padded, n).unwrap().to_complex();
+    let got = (a.fft() * b.fft()).ifft().real().to_vec().unwrap();
+    let want: Vec<f64> = (0..n).map(|i| (0..k).map(|j| f64::from(h[j]) * f64::from(x[(i + n - j) % n])).sum()).collect();
+    for (g, w) in got.iter().zip(&want) {
+        assert!((f64::from(*g) - w).abs() < 1e-4, "{g} against {w}");
+    }
+    // A lazily computed input.
+    let y = (&a * C32::new(0.0, 2.0)).conj();
+    let want = dft(&y.to_vec().unwrap().iter().map(|c| (f64::from(c.re), f64::from(c.im))).collect::<Vec<_>>(), false);
+    check(&y.fft().to_vec().unwrap(), &want, 1e-5, "fft of a lazy expression");
 }

@@ -90,7 +90,7 @@ fn prime_factors(mut n: u32) -> Vec<u32> {
     let mut out = Vec::new();
     let mut p = 2;
     while p * p <= n {
-        while n % p == 0 {
+        while n.is_multiple_of(p) {
             out.push(p);
             n /= p;
         }
@@ -159,7 +159,7 @@ fn partition(n: u32, tile: u32) -> Vec<u32> {
 
 /// The largest divisor of `n` that is at most `max`.
 fn divisor_up_to(n: u32, max: u32) -> u32 {
-    (1..=max.min(n)).rev().find(|d| n % d == 0).unwrap_or(1)
+    (1..=max.min(n)).rev().find(|&d| n.is_multiple_of(d)).unwrap_or(1)
 }
 
 /// A batch of transforms along the middle axis of `[outer][n][inner]` (the first array
@@ -750,6 +750,7 @@ fn real_forward(
 
 /// The inverse of [`real_forward`]: `n` real values from the half spectrum along `axis` of
 /// `dims` (the dimensions of the output), scaled by `factor`.
+#[allow(clippy::too_many_arguments)]
 fn real_inverse(
     ctx: &Context,
     scratch: &mut Scratch<'_>,
@@ -767,6 +768,31 @@ fn real_inverse(
     }
     if n % 2 == 0 && is_smooth(n / 2) {
         let h = n / 2;
+        if inner == 1 {
+            // The first pass packs the half spectrum as it loads it.
+            return run_lines(
+                ctx,
+                scratch,
+                &Lines {
+                    outer,
+                    n: h,
+                    inner,
+                    src,
+                    dst,
+                    inverse: true,
+                    scale: factor,
+                    load: LoadKind::HalfSpectrum,
+                    load_table: product.map(|(b, bytes)| (b, bytes, Table::Slab)),
+                    n_in: Some(h + 1),
+                    n_lim: None,
+                    n_full: 0,
+                    store: StoreKind::RealPair,
+                    store_table: None,
+                    n_out: None,
+                    post: false,
+                },
+            );
+        }
         let bytes = u64::from(outer) * u64::from(h) * u64::from(inner) * 8;
         let z = scratch.take(bytes)?;
         launch_real_stage(ctx, false, (outer, h, inner), 1.0, src, (&z, bytes), product)?;
@@ -793,7 +819,7 @@ fn real_inverse(
             },
         );
     }
-    let io = AxisIo { src, dst, load: LoadKind::Hermitian, store: StoreKind::Real, n_in: Some(k as u32), n_out: None, n_full: n as u32, store_table: None, load_table: None };
+    let io = AxisIo { src, dst, load: LoadKind::Hermitian, store: StoreKind::Real, n_in: Some(k), n_out: None, n_full: n, store_table: None, load_table: None };
     run_axis(ctx, scratch, (outer, n, inner), true, factor, &io)
 }
 
@@ -1070,7 +1096,7 @@ impl Array<f32> {
     #[track_caller]
     pub fn fft_axes(&self, axes: &[usize], norm: FftNorm) -> Array<C32> {
         let location = Location::caller();
-        let result = self.ready().map_err(Into::into).and_then(|(pin, bytes): (_, u64)| {
+        let result = self.ready().and_then(|(pin, bytes): (_, u64)| {
             run_complex(self.context(), self.shape().dims(), (pin.buffer().clone(), bytes), Input::Real, axes, false, norm)
         });
         Array::resolve(self.context(), self.shape(), result, "fft", location)
@@ -1120,7 +1146,7 @@ impl Array<f32> {
 fn fft_size(n: usize) -> usize {
     let smooth = |mut m: usize| {
         for p in [2, 3, 5] {
-            while m % p == 0 {
+            while m.is_multiple_of(p) {
                 m /= p;
             }
         }

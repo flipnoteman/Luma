@@ -40,6 +40,10 @@ pub(crate) enum LoadKind {
     /// The half spectrum `0..n_in` of a real signal of `n_full` points, completed to the whole
     /// spectrum by `X[n_full - n] = conj(X[n])`.
     Hermitian,
+    /// The half spectrum `X[0..=h]` of a real signal of `2h` points (`inner` 1), packed into
+    /// the `h` values `2 (E + i O conj(W^n))` of the inverse's half-size transform (see
+    /// [`crate::spectral`]); the table, if any, multiplies `X` first.
+    HalfSpectrum,
 }
 
 /// What a pass writes to `dst`.
@@ -302,6 +306,7 @@ fn load_value(pass: &DftPass) -> String {
     let mut s = String::new();
     // `n`: the position along the transformed line (first pass only).
     let needs_n = pass.load_table != Table::None || pass.load_limit || matches!(pass.load, LoadKind::RealPair | LoadKind::Hermitian);
+    let half = pass.load == LoadKind::HalfSpectrum;
     if needs_n {
         s.push_str("let n = d * p.mid + mrow;\n");
     }
@@ -312,12 +317,26 @@ fn load_value(pass: &DftPass) -> String {
         LoadKind::RealPair => {
             "let u = gi - ob * p.in_os; let ii = u % p.inner;\nlet i0 = 2u * ob * p.in_os + 2u * u - ii;\nv = vec2<f32>(src[i0], src[i0 + p.inner]);".to_string()
         }
+        LoadKind::HalfSpectrum => {
+            let (a, b) = if pass.load_table == Table::Slab {
+                ("cmul(src[gi], ltab[u])", "cmul(src[g2], ltab[hh - u])")
+            } else {
+                ("src[gi]", "src[g2]")
+            };
+            format!(
+                "let u = gi - ob * p.in_os; let hh = p.in_os - 1u; let g2 = ob * p.in_os + (hh - u);
+let xk = {a}; let x2 = {b}; let xc = vec2<f32>(x2.x, -x2.y);
+let ev = xk + xc; let df = xk - xc; let w = tw(u, 2u * hh);
+let t = cmul(df, vec2<f32>(w.x, -w.y));
+v = ev + vec2<f32>(-t.y, t.x);"
+            )
+        }
         LoadKind::Hermitian => {
             "let u = gi - ob * p.in_os; let ii = u % p.inner;\nif (n < p.n_in) { v = src[gi]; } else { let g2 = ob * p.in_os + (p.n_full - n) * p.inner + ii; let z = src[g2]; v = vec2<f32>(z.x, -z.y); }".to_string()
         }
     };
     let _ = writeln!(s, "{guard}{{ {raw}");
-    match pass.load_table {
+    match if half { Table::None } else { pass.load_table } {
         Table::None => {}
         Table::Line => s.push_str("v = cmul(v, ltab[n]);\n"),
         Table::Slab => s.push_str("v = cmul(v, ltab[gi - ob * p.in_os]);\n"),
@@ -574,6 +593,7 @@ mod tests {
             DftPass { in_fast: false, out_fast: false, twiddle: false, ..pass(&[5, 5, 5], 4) },
             DftPass { load: LoadKind::RealPair, load_table: Table::Line, load_limit: true, store: StoreKind::RealPair, store_table: Table::Slab, store_limit: true, ..pass(&[7, 3], 8) },
             DftPass { load: LoadKind::Hermitian, load_table: Table::Slab, store_table: Table::Line, ..pass(&[31], 16) },
+            DftPass { load: LoadKind::HalfSpectrum, load_table: Table::Slab, store: StoreKind::RealPair, ..pass(&[8, 4], 2) },
             pass(&[], 256),
         ];
         for p in variants {
