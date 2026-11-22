@@ -1,5 +1,6 @@
 //! `canny`, `anisotropic_diffusion` and `mean_shift` at 1080p and 4K. Each is checked against a
 //! small host computation (ArrayFire's CUDA kernels, step by step) before it is timed.
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
 use luma::*;
 

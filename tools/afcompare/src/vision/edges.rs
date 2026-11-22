@@ -45,9 +45,10 @@ fn compare_edges(luma: &[bool], af: &[bool]) -> Verdict {
     }
 }
 
-/// One diffusion step against ArrayFire's: compared on the leading columns ArrayFire's CUDA kernel
-/// updated (it leaves the others unchanged, a bug that depends on the image size); the verdict
-/// says how many that is and how well luma agrees there.
+/// One diffusion step against ArrayFire's, compared statistically on the leading columns ArrayFire's
+/// CUDA kernel updated (it leaves the others unchanged, a size-dependent bug) and in which its in-place
+/// update also reads neighbours that other blocks have already written (a race): the mean absolute
+/// difference must stay within 15% of the mean change the step makes.
 fn diffusion_verdict(luma: &[f32], af: &[f32], input: &[f32], h: usize) -> Verdict {
     let w = input.len() / h;
     let updated = (0..w).rev().find(|&j| (0..h).any(|i| af[i + h * j] != input[i + h * j])).map_or(0, |j| j + 1);
@@ -55,8 +56,24 @@ fn diffusion_verdict(luma: &[f32], af: &[f32], input: &[f32], h: usize) -> Verdi
         return Verdict::no("ArrayFire changed nothing");
     }
     let n = h * updated;
-    let v = compare(&luma[..n], &af[..n], 1e-3, 0.05);
-    Verdict { ok: v.ok, text: format!("one step, first {updated} of {w} columns (ArrayFire's CUDA kernel updates only those): {}", v.text) }
+    let (mut diff, mut change, mut far) = (0.0f64, 0.0f64, 0usize);
+    for k in 0..n {
+        let d = f64::from((luma[k] - af[k]).abs());
+        diff += d;
+        change += f64::from((af[k] - input[k]).abs());
+        far += usize::from(d > 0.05);
+    }
+    let (diff, change) = (diff / n as f64, change / n as f64);
+    let text = format!(
+        "one step on the first {updated} of {w} columns (the only ones ArrayFire's CUDA kernel updates; its in-place update also races between tiles): mean |Δ| {diff:.3e} = {:.1}% of the mean change {change:.3e}, {:.2}% of pixels differ by more than 0.05",
+        100.0 * diff / change.max(1e-30),
+        100.0 * far as f64 / n as f64
+    );
+    if diff <= 0.15 * change {
+        Verdict::yes(text)
+    } else {
+        Verdict::no(format!("NO: {text}"))
+    }
 }
 
 pub fn rows(b: &mut Bench) {
