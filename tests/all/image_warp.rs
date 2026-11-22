@@ -333,7 +333,7 @@ fn transform_coordinates_maps_the_corners() {
 }
 
 #[test]
-fn warps_fuse_with_the_expressions_around_them() {
+fn warps_read_lazy_inputs_and_feed_lazy_expressions() {
     let img = Array::from_slice(&values(12 * 10, 8, 0.0, 1.0), [12, 10]).unwrap();
     let direct = img.resize(24, 20, Interp::Linear).to_vec().unwrap();
     let fused = ((&img * 2.0).resize(24, 20, Interp::Linear) * 0.5).to_vec().unwrap();

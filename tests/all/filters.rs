@@ -86,6 +86,19 @@ fn fir_batches() {
 }
 
 #[test]
+fn fir_long_filters_over_many_signals_use_blocks_of_taps() {
+    // 20 signals (blocks of taps over the whole batch) and 2 signals (an FFT convolution each).
+    for (batch, k) in [(20, 700), (20, 300), (2, 500), (3, 1000)] {
+        let n = 1200;
+        let x = values(n * batch, 20 + k as u64, -1.0, 1.0);
+        let taps = values(k, 21, -1.0, 1.0);
+        let got = Array::from_slice(&x, [n, batch]).unwrap().fir(&Array::from_slice(&taps, k).unwrap()).to_vec().unwrap();
+        let want: Vec<f64> = (0..batch).flat_map(|j| fir_ref(&x[j * n..(j + 1) * n], &taps)).collect();
+        close(&got, &want, 3e-5, &format!("batch {batch}, {k} taps"));
+    }
+}
+
+#[test]
 fn fir_errors() {
     let x = Array::from_slice(&values(50 * 4, 7, -1.0, 1.0), [50, 4]).unwrap();
     let mismatched = Array::from_slice(&values(5 * 3, 8, -1.0, 1.0), [5, 3]).unwrap();

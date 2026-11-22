@@ -76,6 +76,12 @@ struct Params {
     m8: f32,
 }
 
+/// Elements per invocation (1, 2 or 4).
+fn coarsen() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("LUMA_SAMPLER_COARSEN").ok().and_then(|v| v.parse().ok()).filter(|c| [1, 2, 4].contains(c)).unwrap_or(1))
+}
+
 /// One launch of the sampling kernel.
 pub(crate) struct Sampling<'a> {
     pub src: &'a Array<f32>,
@@ -170,8 +176,17 @@ impl Sampling<'_> {
             m7: m[7],
             m8: m[8],
         };
-        let kernel = ctx.kernel(&source()).build()?;
-        let grid = fold_workgroups(ctx, to_u32(count.div_ceil(WORKGROUP as usize))?)?;
+        // A grid shaped like the output saves the index arithmetic of the flat one where it fits.
+        let max = ctx.max_workgroups_per_dimension() as usize;
+        let (rows, batch) = (od[1], od[2] * od[3]);
+        let c = coarsen();
+        let per_group = WORKGROUP as usize * c;
+        let shaped = od[0].div_ceil(per_group) <= max && rows <= max && batch <= max;
+        let (kernel, grid) = if shaped {
+            (ctx.cached_kernel("sampler", c, "main2d", || source(c))?, [to_u32(od[0].div_ceil(per_group))?, to_u32(rows)?, to_u32(batch)?])
+        } else {
+            (ctx.cached_kernel("sampler", c, "main", || source(c))?, fold_workgroups(ctx, to_u32(count.div_ceil(per_group))?)?)
+        };
         let mut out = Array::<f32>::alloc(ctx, self.out)?;
         kernel.launch_raw(grid, [KernelArg::from(self.src), KernelArg::from(self.pos[0]), KernelArg::from(self.pos[1]), KernelArg::from(&mut out), uniform(&params)])?;
         Ok(out)
@@ -209,8 +224,9 @@ fn linear_fraction(w: &mut String, indent: &str, t: &str) {
 }
 
 /// The source of the sampling kernel.
-fn source() -> String {
+fn source(coarsen: usize) -> String {
     let mut w = String::new();
+    let _ = writeln!(w, "const C: u32 = {coarsen}u;");
     w.push_str(
         r#"
 struct P {
@@ -236,14 +252,48 @@ fn tap(f: f32, k: f32, hi: f32) -> u32 { return u32(clamp(f + k, 0.0, hi)); }
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_index) lid: u32) {
-    let i = (wid.x + wid.y * nwg.x) * 256u + lid;
-    if (i >= p.count) { return; }
-    let c0 = i % p.od0;
-    var r = i / p.od0;
-    let c1 = r % p.od1;
-    r = r / p.od1;
-    let c2 = r % p.od2;
-    let c3 = r / p.od2;
+    // Element `i + k * stride` for k < C: the lanes of a warp stay on neighbouring elements and
+    // the loads of the C elements are all issued before the first store.
+    let stride = nwg.x * nwg.y * 256u;
+    let first = (wid.x + wid.y * nwg.x) * 256u + lid;
+    var v: array<f32, C>;
+    for (var k = 0u; k < C; k += 1u) {
+        let i = first + k * stride;
+        if (i < p.count) {
+            let c0 = i % p.od0;
+            var r = i / p.od0;
+            let c1 = r % p.od1;
+            r = r / p.od1;
+            let c2 = r % p.od2;
+            let c3 = r / p.od2;
+            v[k] = element(c0, c1, c2, c3);
+        }
+    }
+    for (var k = 0u; k < C; k += 1u) {
+        let i = first + k * stride;
+        if (i < p.count) { out[i] = v[k]; }
+    }
+}
+
+// The same with the grid shaped like the output: x along dimension 0, y along 1, z the batch.
+@compute @workgroup_size(256)
+fn main2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let c2 = gid.z % p.od2;
+    let c3 = gid.z / p.od2;
+    let stride = nwg.x * 256u;
+    let row = p.od0 * (gid.y + p.od1 * gid.z);
+    var v: array<f32, C>;
+    for (var k = 0u; k < C; k += 1u) {
+        let x = gid.x + k * stride;
+        if (x < p.od0) { v[k] = element(x, gid.y, c2, c3); }
+    }
+    for (var k = 0u; k < C; k += 1u) {
+        let x = gid.x + k * stride;
+        if (x < p.od0) { out[row + x] = v[k]; }
+    }
+}
+
+fn element(c0: u32, c1: u32, c2: u32, c3: u32) -> f32 {
     let base = c0 * p.ib0 + c1 * p.ib1 + c2 * p.ib2 + c3 * p.ib3;
     var x = 0.0;
     var y = 0.0;
@@ -293,12 +343,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     w.push_str("                v = src[base + tap(f, 0.0, hx) * p.gs0];\n");
     w.push_str("            } else if (p.method <= 3u) {\n");
     linear_fraction(&mut w, "                ", "tx");
-    w.push_str(
-        "                v = (1.0 - txu) * src[base + tap(fx, 0.0, hx) * p.gs0] + txu * src[base + tap(fx, 1.0, hx) * p.gs0];\n",
-    );
+    w.push_str("                let i0 = tap(fx, 0.0, hx) * p.gs0;\n                var i1 = i0 + p.gs0;\n                if (fx + 1.0 > hx) { i1 = tap(fx, 1.0, hx) * p.gs0; }\n");
+    w.push_str("                v = (1.0 - txu) * src[base + i0] + txu * src[base + i1];\n");
     w.push_str("            } else {\n");
     cubic_weights(&mut w, "                ", "tx");
-    w.push_str("                v = txw0 * src[base + tap(fx, -1.0, hx) * p.gs0] + txw1 * src[base + tap(fx, 0.0, hx) * p.gs0]\n                  + txw2 * src[base + tap(fx, 1.0, hx) * p.gs0] + txw3 * src[base + tap(fx, 2.0, hx) * p.gs0];\n");
+    w.push_str("                var i0 = 0u; var i1 = 0u; var i2 = 0u; var i3 = 0u;\n");
+    w.push_str("                if (fx >= 1.0 && fx + 2.0 <= hx) {\n                    i1 = u32(fx) * p.gs0;\n                    i0 = i1 - p.gs0;\n                    i2 = i1 + p.gs0;\n                    i3 = i2 + p.gs0;\n                } else {\n");
+    w.push_str("                    i0 = tap(fx, -1.0, hx) * p.gs0;\n                    i1 = tap(fx, 0.0, hx) * p.gs0;\n                    i2 = tap(fx, 1.0, hx) * p.gs0;\n                    i3 = tap(fx, 2.0, hx) * p.gs0;\n                }\n");
+    w.push_str("                v = txw0 * src[base + i0] + txw1 * src[base + i1] + txw2 * src[base + i2] + txw3 * src[base + i3];\n");
     w.push_str("            }\n        } else {\n");
     // Two axes.
     w.push_str("            if (p.method <= 1u) {\n");
@@ -308,19 +360,25 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     w.push_str("            } else if (p.method <= 3u) {\n");
     linear_fraction(&mut w, "                ", "tx");
     linear_fraction(&mut w, "                ", "ty");
-    w.push_str("                let x0 = tap(fx, 0.0, hx) * p.gs0;\n                let x1 = tap(fx, 1.0, hx) * p.gs0;\n");
-    w.push_str("                let r0 = base + tap(fy, 0.0, hy) * p.gs1;\n                let r1 = base + tap(fy, 1.0, hy) * p.gs1;\n");
+    w.push_str("                let x0 = tap(fx, 0.0, hx) * p.gs0;\n                var x1 = x0 + p.gs0;\n                if (fx + 1.0 > hx) { x1 = tap(fx, 1.0, hx) * p.gs0; }\n");
+    w.push_str("                let r0 = base + tap(fy, 0.0, hy) * p.gs1;\n                var r1 = r0 + p.gs1;\n                if (fy + 1.0 > hy) { r1 = base + tap(fy, 1.0, hy) * p.gs1; }\n");
     w.push_str("                let a0 = (1.0 - txu) * src[r0 + x0] + txu * src[r0 + x1];\n                let a1 = (1.0 - txu) * src[r1 + x0] + txu * src[r1 + x1];\n");
     w.push_str("                v = (1.0 - tyu) * a0 + tyu * a1;\n");
     w.push_str("            } else {\n");
     cubic_weights(&mut w, "                ", "tx");
     cubic_weights(&mut w, "                ", "ty");
+    w.push_str("                var x0 = 0u; var x1 = 0u; var x2 = 0u; var x3 = 0u;\n");
+    w.push_str("                if (fx >= 1.0 && fx + 2.0 <= hx) {\n                    x1 = u32(fx) * p.gs0;\n                    x0 = x1 - p.gs0;\n                    x2 = x1 + p.gs0;\n                    x3 = x2 + p.gs0;\n                } else {\n");
     for (k, off) in ["-1.0", "0.0", "1.0", "2.0"].iter().enumerate() {
-        let _ = writeln!(w, "                let x{k} = tap(fx, {off}, hx) * p.gs0;");
+        let _ = writeln!(w, "                    x{k} = tap(fx, {off}, hx) * p.gs0;");
     }
+    w.push_str("                }\n");
+    w.push_str("                var r0 = 0u; var r1 = 0u; var r2 = 0u; var r3 = 0u;\n");
+    w.push_str("                if (fy >= 1.0 && fy + 2.0 <= hy) {\n                    r1 = base + u32(fy) * p.gs1;\n                    r0 = r1 - p.gs1;\n                    r2 = r1 + p.gs1;\n                    r3 = r2 + p.gs1;\n                } else {\n");
     for (k, off) in ["-1.0", "0.0", "1.0", "2.0"].iter().enumerate() {
-        let _ = writeln!(w, "                let r{k} = base + tap(fy, {off}, hy) * p.gs1;");
+        let _ = writeln!(w, "                    r{k} = base + tap(fy, {off}, hy) * p.gs1;");
     }
+    w.push_str("                }\n");
     for j in 0..4 {
         let _ = writeln!(
             w,
@@ -328,6 +386,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         );
     }
     w.push_str("                v = tyw0 * a0 + tyw1 * a1 + tyw2 * a2 + tyw3 * a3;\n");
-    w.push_str("            }\n        }\n        res = v;\n    }\n    out[i] = res;\n}\n");
+    w.push_str("            }\n        }\n        res = v;\n    }\n    return res;\n}\n");
     w
 }

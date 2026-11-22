@@ -485,6 +485,16 @@ pub struct Kernel {
 }
 
 impl Kernel {
+    /// The kernel of `core` on `ctx`.
+    pub(crate) fn from_core(ctx: &Context, core: Arc<KernelCore>) -> Kernel {
+        Kernel { ctx: ctx.clone(), core }
+    }
+
+    /// The compiled kernel, shared.
+    pub(crate) fn core(&self) -> Arc<KernelCore> {
+        Arc::clone(&self.core)
+    }
+
     /// Builds a kernel on the [default context](crate::default_context) with the default entry
     /// point `main`. Use [`Context::kernel`] to choose the context or other options.
     pub fn new(wgsl_src: &str) -> Result<Kernel> {

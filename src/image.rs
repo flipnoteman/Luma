@@ -131,7 +131,8 @@ fn plane_sampling(src: &Array<f32>, source: Source, method: Interp) -> Sampling<
 
 /// The output extent of `n` scaled by `s`: truncated, as ArrayFire does.
 fn scaled(n: usize, s: f32) -> usize {
-    (n as f64 * f64::from(s)) as usize
+    // In `f32`, as ArrayFire does: 1920 * 0.7 is 1344, not 1343.99997.
+    (n as f32 * s) as usize
 }
 
 impl Array<f32> {

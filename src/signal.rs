@@ -36,7 +36,10 @@ use crate::shape::Shape;
 const FIR_DIRECT_MAX: usize = 256;
 /// Filters at least this long use the FFT convolution when the signal is a single vector (see
 /// `Array::fir`).
-const FIR_FFT_MIN: usize = 4096;
+const FIR_FFT_MIN: usize = 384;
+/// Batches of this many signals or more are filtered by blocks of taps, which handle the batch
+/// in one launch, instead of one FFT convolution per signal.
+const FIR_FFT_MAX_BATCH: usize = 16;
 /// Outputs per workgroup of the FIR kernel (`FIR_WORKGROUP` invocations of eight outputs).
 const FIR_TILE: u32 = 1024;
 const FIR_WORKGROUP: u32 = 128;
@@ -198,9 +201,9 @@ impl Array<f32> {
     ///
     /// Filters of up to 256 taps run as a direct kernel (inputs of a workgroup staged in workgroup
     /// memory). Longer filters of a single vector signal use the FFT convolution
-    /// ([`Array::conv1d_fft`]) from 4096 taps on and otherwise
-    /// a direct kernel per block of 256 taps; batched signals with long filters are filtered one
-    /// by one.
+    /// ([`Array::conv1d_fft`]) from 384 taps on (a few batched signals one by one) and otherwise
+    /// a direct kernel per block of 256 taps over the whole batch (so do batches of 16 signals or
+    /// more).
     ///
     /// Fails (poisoned array) if `b` is empty or the batch extents do not match, and with
     /// [`LumaError::Chunked`] if an array is split over several buffers.
@@ -236,39 +239,35 @@ impl Array<f32> {
         let tiles = to_u32(n.div_ceil(FIR_TILE as usize))?;
         let groups = tiles.checked_mul(batch).ok_or(LumaError::DimensionTooLarge { shape: out_shape.dims() })?;
         let grid = fold_workgroups(ctx, groups)?;
-        let kernel = ctx.kernel(&fir_source()).build()?;
+        let kernel = ctx.cached_kernel("fir", 0, "main", fir_source)?;
         let mut out = Array::<f32>::alloc(ctx, out_shape)?;
         let params = FirParams { n: to_u32(n)?, k: to_u32(k)?, tiles, batch, x_stride, b_stride };
         kernel.launch_raw(grid, [KernelArg::from(self), KernelArg::from(b), KernelArg::from(&mut out), uniform(&params)])?;
         Ok(out)
     }
 
-    /// Filters longer than the direct kernel's limit: the FFT convolution for a single vector,
-    /// else one filtering per signal.
+    /// Filters longer than the direct kernel's limit: the FFT convolution for a single vector or a
+    /// few signals (one convolution each), else blocks of taps over the whole batch.
     fn fir_long(&self, b: &Array<f32>, out_shape: Shape) -> Outcome<Array<f32>> {
         let (n, k) = (self.shape().dims()[0], b.shape().dims()[0]);
         let batch = out_shape.len() / n;
-        let (xb, bb) = (self.len() / n, b.len() / k);
-        let one = |x: &Array<f32>, b: &Array<f32>| -> Array<f32> {
-            if k >= FIR_FFT_MIN {
-                x.conv1d_fft(b).slice(0, 0..n)
-            } else {
-                // Blocks of taps: y = sum over blocks of fir(block) applied to the signal delayed
-                // by the block's offset.
-                let mut sum: Option<Array<f32>> = None;
-                for start in (0..k).step_by(FIR_DIRECT_MAX) {
-                    let end = k.min(start + FIR_DIRECT_MAX);
-                    let part = x.fir(&b.slice(0, start..end).copy()).shift_fill(start as isize, 0.0);
-                    sum = Some(match sum {
-                        Some(s) => s + part,
-                        None => part,
-                    });
-                }
-                sum.expect("a filter has taps")
+        if k < FIR_FFT_MIN || batch >= FIR_FFT_MAX_BATCH {
+            // y = the sum over blocks of taps of fir(block) of the signal delayed by the block's
+            // offset: every block is one launch over the whole batch.
+            let mut sum: Option<Array<f32>> = None;
+            for start in (0..k).step_by(FIR_DIRECT_MAX) {
+                let end = k.min(start + FIR_DIRECT_MAX);
+                let part = self.fir(&b.slice(0, start..end).copy()).shift_fill(start as isize, 0.0);
+                sum = Some(match sum {
+                    Some(s) => s + part,
+                    None => part,
+                });
             }
-        };
+            return Ok(sum.expect("a filter has taps"));
+        }
+        let (xb, bb) = (self.len() / n, b.len() / k);
         if batch == 1 {
-            return Ok(one(&self.reshape([n]), &b.reshape([k])).reshape(out_shape));
+            return Ok(self.reshape([n]).conv1d_fft(&b.reshape([k])).slice(0, 0..n).reshape(out_shape));
         }
         let x2 = self.reshape([n, xb]);
         let b2 = b.reshape([k, bb]);
@@ -276,7 +275,7 @@ impl Array<f32> {
             .map(|i| {
                 let xi = x2.slice(1, if xb == 1 { 0..1 } else { i..i + 1 }).copy().reshape([n]);
                 let bi = b2.slice(1, if bb == 1 { 0..1 } else { i..i + 1 }).copy().reshape([k]);
-                one(&xi, &bi).reshape([n, 1])
+                xi.conv1d_fft(&bi).slice(0, 0..n).reshape([n, 1])
             })
             .collect();
         Ok(crate::view::concat_slice(1, &parts).reshape(out_shape))
@@ -661,9 +660,9 @@ impl Array<f32> {
         let groups = to_u32(chunks * batch)?;
         let grid = fold_workgroups(ctx, groups)?;
         let grid_signals = fold_workgroups(ctx, to_u32(batch)?)?;
-        let totals_kernel = ctx.kernel(&iir_totals_source(p)).build()?;
-        let carries_kernel = ctx.kernel(&iir_carries_source(p)).build()?;
-        let apply_kernel = ctx.kernel(&iir_apply_source(p)).build()?;
+        let totals_kernel = ctx.cached_kernel("iir_totals", p, "main", || iir_totals_source(p))?;
+        let carries_kernel = ctx.cached_kernel("iir_carries", p, "main", || iir_carries_source(p))?;
+        let apply_kernel = ctx.cached_kernel("iir_apply", p, "main", || iir_apply_source(p))?;
         let mut tot = Array::<f32>::alloc(ctx, Shape::from(chunks * batch * p))?;
         let mut carry = Array::<f32>::alloc(ctx, Shape::from(chunks * batch * p))?;
         let mut out = Array::<f32>::alloc(ctx, shape)?;

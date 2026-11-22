@@ -25,8 +25,8 @@ assert_eq!(x.approx1(&pos, Interp::Nearest, -1.0).to_vec()?, vec![4.0, 4.0, 2.0,
 # Ok::<(), luma::LumaError>(())
 ```
 
-The interpolation is built from lazy gathers (`take`), so it fuses with the expressions that
-produce the positions and the ones that use the result, and a batch of positions is one kernel.
+Each call is one kernel that finds the coordinates, gathers the taps of the method and combines
+them in registers. The input and the positions are evaluated first and must fit one buffer.
 
 ## Images
 
@@ -63,7 +63,7 @@ applies the cosine smoothing to both axes where ArrayFire's `BILINEAR_COSINE` is
 
 `x.fir(&b)` is the finite impulse response filter `y[i] = b[0] x[i] + b[1] x[i-1] + ..`, with the
 signal's shape; batches (dimensions 1 to 3) are filtered independently, with one filter for all or one
-per signal. Filters up to 256 taps are one kernel; longer ones are blocks of taps, and from 4096 taps
+per signal. Filters up to 256 taps are one kernel; longer ones are blocks of taps, and from 384 taps
 on a single long vector uses the FFT convolution.
 
 `x.iir(&b, &a)` is the recursive filter

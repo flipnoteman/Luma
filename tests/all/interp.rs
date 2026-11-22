@@ -239,8 +239,8 @@ fn approx2_with_a_grid_of_positions_and_a_uniform_grid() {
 }
 
 #[test]
-fn approximation_is_lazy_and_fuses_with_its_inputs() {
-    // Positions computed from other arrays: nothing is evaluated before the result is read.
+fn approximation_reads_lazy_inputs_and_feeds_lazy_expressions() {
+    // Positions computed from other arrays are evaluated first.
     let x = Array::from_slice(&[0.0f32, 10.0, 20.0, 30.0, 40.0], 5).unwrap();
     let pos = Array::<f32>::linspace(0.0, 4.0, 9).unwrap();
     let doubled = (x.approx1(&pos, Interp::Linear, 0.0) * 2.0).to_vec().unwrap();
@@ -253,4 +253,20 @@ fn a_poisoned_input_poisons_the_result() {
     let bad = Array::from_slice(&[1.0f32, 2.0, 3.0], 3).unwrap() + &Array::from_slice(&[1.0f32, 2.0], 2).unwrap();
     assert!(good.approx1(&bad, Interp::Linear, 0.0).to_vec().is_err());
     assert!(bad.approx1(&good, Interp::Linear, 0.0).to_vec().is_err());
+}
+
+#[test]
+fn a_batch_taller_than_the_grid_limit_runs_flat() {
+    // 70000 signals: more rows than a grid dimension holds, so the kernel runs over a flat grid.
+    let (n, b, m) = (8, 70_000, 5);
+    let x = values(n * b, 14, -1.0, 1.0);
+    let pos = [0.25f32, 1.5, 3.75, 6.0, 7.5];
+    let got = Array::from_slice(&x, [n, b]).unwrap().approx1(&Array::from_slice(&pos, m).unwrap(), Interp::Linear, 9.0).to_vec().unwrap();
+    assert_eq!(got.len(), m * b);
+    for j in [0, 1, 4_321, 65_535, 65_536, b - 1] {
+        for (k, &q) in pos.iter().enumerate() {
+            let want = if inside(q, n) { axis(n, f64::from(q), Interp::Linear, &|i| f64::from(x[j * n + i])) } else { 9.0 };
+            assert!((f64::from(got[j * m + k]) - want).abs() < 1e-5, "signal {j}, position {k}");
+        }
+    }
 }
