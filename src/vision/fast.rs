@@ -62,7 +62,7 @@ fn detect_source(arc: u8) -> String {
     s.push_str("@group(1) @binding(3) var<uniform> p: Params;\n");
     let _ = writeln!(s, "var<workgroup> tile: array<f32, {}>;", iw * ih);
     let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", sw * sh);
-    s.push_str("var<workgroup> cnt: atomic<u32>;\n");
+    s.push_str("var<workgroup> rows: array<atomic<u32>, 8>;\n");
     // The score of the pixel at (cx, cy) of the staged tile.
     let off = |v: &str, d: i32| if d >= 0 { format!("{v} + {d}u") } else { format!("{v} - {}u", -d) };
     let at = |d0: i32, d1: i32| format!("tile[({}) * {iw}u + {}]", off("cy", d1), off("cx", d0));
@@ -92,21 +92,22 @@ fn detect_source(arc: u8) -> String {
             let _ = writeln!(s, "    let r{j} = {};", at(d0, d1));
         }
     }
-    s.push_str("    var bm = 0u; var dm = 0u; var sb = 0.0; var sd = 0.0;\n");
+    s.push_str("    var bm = 0u; var dm = 0u;\n");
     for j in 0..16 {
-        let _ = writeln!(
-            s,
-            "    if (r{j} > hi) {{ bm |= {}u; sb += r{j} - hi; }}\n    if (r{j} < lo) {{ dm |= {}u; sd += lo - r{j}; }}",
-            1u32 << j,
-            1u32 << j
-        );
+        let _ = writeln!(s, "    bm |= select(0u, {0}u, r{j} > hi); dm |= select(0u, {0}u, r{j} < lo);", 1u32 << j);
     }
+    let _ = writeln!(s, "    if (countOneBits(bm) < {arc}u && countOneBits(dm) < {arc}u) {{ return 0.0; }}");
     let _ = writeln!(s, "    var b2 = bm | (bm << 16u); var d2 = dm | (dm << 16u);");
     let _ = writeln!(s, "    var tb = b2; var td = d2;");
     for i in 1..arc {
         let _ = writeln!(s, "    tb &= b2 >> {i}u; td &= d2 >> {i}u;");
     }
-    s.push_str("    var out = 0.0;\n    if ((tb & 65535u) != 0u) { out = sb; }\n    if ((td & 65535u) != 0u) { out = max(out, sd); }\n    return out;\n}\n");
+    s.push_str("    let isb = (tb & 65535u) != 0u; let isd = (td & 65535u) != 0u;\n");
+    s.push_str("    if (!isb && !isd) { return 0.0; }\n    var sb = 0.0; var sd = 0.0;\n");
+    for j in 0..16 {
+        let _ = writeln!(s, "    sb += select(0.0, r{j} - hi, r{j} > hi); sd += select(0.0, lo - r{j}, r{j} < lo);");
+    }
+    s.push_str("    var out = 0.0;\n    if (isb) { out = sb; }\n    if (isd) { out = max(out, sd); }\n    return out;\n}\n");
     let _ = write!(
         s,
         "@compute @workgroup_size(256)
@@ -116,7 +117,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     let o1 = i32(wid.y) * {TY} - {halo_in};
     let h = i32(p.h);
     let w = i32(p.w);
-    if (t == 0u) {{ atomicStore(&cnt, 0u); }}
+    if (t < 8u) {{ atomicStore(&rows[t], 0u); }}
     for (var i = t; i < {total}u; i += 256u) {{
         let cx = i % {iw}u;
         let cy = i / {iw}u;
@@ -148,12 +149,16 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
             && s0 > sc[base + {sw}u] && s0 > sc[base + {sw}u + 2u]
             && s0 > sc[base + 2u * {sw}u] && s0 > sc[base + 2u * {sw}u + 1u] && s0 > sc[base + 2u * {sw}u + 2u];
     }}
-    if (keep) {{ atomicAdd(&cnt, 1u); }}
+    if (keep) {{ atomicOr(&rows[ty], 1u << tx); }}
     let g0 = i32(wid.x) * {TX} + i32(tx);
     let g1 = i32(wid.y) * {TY} + i32(ty);
     if (g0 < h && g1 < w) {{ img[u32(g0) + p.h * u32(g1)] = select(0.0, s0, keep); }}
     workgroupBarrier();
-    if (t == 0u) {{ counts[tile_id] = atomicLoad(&cnt); }}
+    if (t == 0u) {{
+        var n = 0u;
+        for (var r = 0u; r < 8u; r++) {{ n += countOneBits(atomicLoad(&rows[r])); }}
+        counts[tile_id] = n;
+    }}
 }}
 ",
         total = iw * ih,
@@ -174,12 +179,14 @@ fn scatter_source() -> String {
 @group(1) @binding(3) var<storage, read_write> out_y: array<f32>;
 @group(1) @binding(4) var<storage, read_write> out_s: array<f32>;
 @group(1) @binding(5) var<uniform> p: Params;
-var<workgroup> rank: array<u32, 256>;
+var<workgroup> rows: array<atomic<u32>, 8>;
+var<workgroup> base: array<u32, 8>;
 var<workgroup> tot: u32;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
     let tile_id = wid.x + wid.y * p.tiles_x;
     if (t == 0u) {{ tot = offs[tile_id + 1u] - offs[tile_id]; }}
+    if (t < 8u) {{ atomicStore(&rows[t], 0u); }}
     workgroupBarrier();
     if (workgroupUniformLoad(&tot) == 0u) {{ return; }}
     let tx = t & 31u;
@@ -189,17 +196,19 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     var s0 = 0.0;
     if (g0 < p.h && g1 < p.w) {{ s0 = img[g0 + p.h * g1]; }}
     let keep = s0 > 0.0;
-    rank[t] = select(0u, 1u, keep);
+    if (keep) {{ atomicOr(&rows[ty], 1u << tx); }}
     workgroupBarrier();
-    for (var d = 1u; d < 256u; d = d << 1u) {{
-        var add = 0u;
-        if (t >= d) {{ add = rank[t - d]; }}
-        workgroupBarrier();
-        rank[t] = rank[t] + add;
-        workgroupBarrier();
+    if (t == 0u) {{
+        var acc = 0u;
+        for (var r = 0u; r < 8u; r++) {{
+            base[r] = acc;
+            acc += countOneBits(atomicLoad(&rows[r]));
+        }}
     }}
+    workgroupBarrier();
+    let rank = base[ty] + countOneBits(atomicLoad(&rows[ty]) & ((1u << tx) - 1u));
     if (keep) {{
-        let k = offs[tile_id] + rank[t] - 1u;
+        let k = offs[tile_id] + rank;
         if (k < p.cap) {{
             out_x[k] = f32(g1);
             out_y[k] = f32(g0);
