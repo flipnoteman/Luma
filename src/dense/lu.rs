@@ -348,7 +348,8 @@ fn stage1(t: u32) {{
 fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
     let mut text = String::new();
     text += "var done = t >= n;\ncv[t] = select(key(x0), 0u, done);\nworkgroupBarrier();\nstage1(t);\nworkgroupBarrier();\n";
-    for j in 0..wp {
+    let steps: usize = std::env::var("X_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(wp);
+    for j in 0..wp.min(steps) {
         text += &format!(
             "if (w > {j}u) {{
 {reduce}    if (t == bi) {{
@@ -383,6 +384,9 @@ fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
 }}
 "
         );
+    }
+    if std::env::var("X_NOBAR").is_ok() {
+        text = text.replace("workgroupBarrier();\n", "");
     }
     text
 }
