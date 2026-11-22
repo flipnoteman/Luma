@@ -46,7 +46,8 @@ numbers is stored for it.
 - **Quotients** use Smith's algorithm: the components of the denominator scale each other, so nothing
   overflows or underflows where the result is representable (`(1e30 + 1e30 i) / (1e30 + 1e30 i)` is `1`).
   A zero denominator gives `(re / 0, im / 0)`: infinity or `NaN` per component as C99's Annex G has it, with no trap.
-- **`abs`** is scaled by the larger component, so `|3e30 + 4e30 i|` is `5e30` and `|3e-30 + 4e-30 i|` is
+  (A device's fast `f32` division returns 0 for a divisor above `2^126`, about `8.5e37`: that is the limit of `|b|` here.)
+- **`abs`** scales the components by a power of two when the larger is above `2^62` or below `2^-62` (no division), so `|3e30 + 4e30 i|` is `5e30` and `|3e-30 + 4e-30 i|` is
   `5e-30`; it is infinite when a component is infinite even if the other is `NaN`. `norm_sqr` has no scaling.
 - **`arg`** is `atan2(im, re)` in `[-pi, pi]`; `exp` is `e^re (cos im + i sin im)`; `sqrt` is the principal root.
 - **`conj`**, `-z`, `real` and `imag` are exact (a `NaN` stays one, `-0` flips its sign).

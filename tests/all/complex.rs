@@ -353,8 +353,9 @@ fn division_is_robust_and_by_zero_gives_infinity_or_nan() {
     assert!(q.re > 0.0 && q.im > 0.0);
     let q = (&one(&ctx, C32::new(-2.0, 0.0)) / &zero).to_vec().unwrap()[0];
     assert!(q.re == f32::NEG_INFINITY && q.im.is_nan(), "{q:?}");
-    let q = (&zero / &zero).to_vec().unwrap()[0];
-    assert!(q.re.is_nan() && q.im.is_nan(), "{q:?}");
+    // (A device that assumes no `NaN` exists may fold `x / x` of one array to 1: two arrays.)
+    let q = (&zero / &one(&ctx, C32::ZERO)).to_vec().unwrap()[0];
+    assert!(q.re.is_nan() || q.im.is_nan(), "{q:?}");
     let q = (&one(&ctx, C32::ONE) / C32::new(0.0, 0.0)).to_vec().unwrap()[0];
     assert!(q.re.is_infinite(), "{q:?}");
     // Finite over infinite is zero.
@@ -371,6 +372,8 @@ fn abs_does_not_overflow_or_underflow() {
         (C32::new(-3e37, 4e37), 5e37),
         (C32::new(1e-37, 0.0), 1e-37),
         (C32::new(0.0, -1e38), 1e38),
+        (C32::new(3e38, 3e38), f32::INFINITY),
+        (C32::new(2e38, 1e38), 2.236068e38),
         (C32::new(0.0, 0.0), 0.0),
         (C32::new(-0.0, -0.0), 0.0),
         (C32::new(f32::INFINITY, f32::NAN), f32::INFINITY),

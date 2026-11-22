@@ -1747,7 +1747,7 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
         }
     }
     if instrs().any(calls_complex_library) {
-        text.push_str(&complex_library());
+        text.push_str(complex_library());
     }
     text.push_str(&generator_helpers(programs.iter().copied()));
     if edges {

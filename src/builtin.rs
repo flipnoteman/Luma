@@ -463,37 +463,45 @@ impl Part {
 ///   rest, so no intermediate overflows where the result is representable); a zero denominator
 ///   gives `(re / 0, im / 0)`, infinity or `NaN` per component as `C99` Annex G has it, with no
 ///   trap.
-/// * `c_abs`: the modulus scaled by the larger component (exactly [`BinOp::Hypot`]).
+/// * `c_abs`: the modulus from the components scaled by a power of two (exact) when the larger is
+///   above `2^62` or below `2^-62`, so no square overflows or underflows, and with no division
+///   (a fast division returns 0 for a divisor above `2^126`). Infinite if a component is.
 /// * `c_exp`: `e^re (cos im, sin im)`, the imaginary part of the result keeps the sign of a zero `im`
 ///   (so `exp(inf + 0i)` is `inf + 0i`, not `NaN`).
 /// * `c_sqrt`: the principal square root, `(t, im / 2t)` with `t = sqrt((|z| + |re|) / 2)`
 ///   on the right half-plane and the mirrored form on the left one (no cancellation).
-pub(crate) fn complex_library() -> String {
-    let hypot = BinOp::Hypot.expr();
-    format!(
-        "fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{ return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }}
-fn c_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+pub(crate) fn complex_library() -> &'static str {
+    "fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+fn c_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     let big = abs(b.y) <= abs(b.x);
     let r = select(b.x / b.y, b.y / b.x, big);
     let d = select(b.x * r + b.y, b.x + b.y * r, big);
     let n = select(vec2<f32>(a.x * r + a.y, a.y * r - a.x), vec2<f32>(a.x + a.y * r, a.y - a.x * r), big);
     return select(n / d, a / b.x, (b.x == 0.0) & (b.y == 0.0));
-}}
-fn c_abs(a: vec2<f32>) -> f32 {{ let x = a.x; let y = a.y; return {hypot}; }}
-fn c_eq(a: vec2<f32>, b: vec2<f32>) -> bool {{ return (a.x == b.x) & (a.y == b.y); }}
-fn c_exp(a: vec2<f32>) -> vec2<f32> {{
+}
+fn c_abs(a: vec2<f32>) -> f32 {
+    let x = abs(a.x); let y = abs(a.y);
+    let m = max(x, y);
+    let huge = m > 4.611686e18;
+    let tiny = m < 2.1684043e-19;
+    let down = select(select(1.0, 7.3786976e19, tiny), 1.3552527e-20, huge);
+    let up = select(select(1.0, 1.3552527e-20, tiny), 7.3786976e19, huge);
+    let r = sqrt((x * down) * (x * down) + (y * down) * (y * down)) * up;
+    return select(r, bitcast<f32>(0x7f800000u), (x > 3.4028235e38) | (y > 3.4028235e38));
+}
+fn c_eq(a: vec2<f32>, b: vec2<f32>) -> bool { return (a.x == b.x) & (a.y == b.y); }
+fn c_exp(a: vec2<f32>) -> vec2<f32> {
     let e = exp(a.x);
     return vec2<f32>(e * cos(a.y), select(e * sin(a.y), a.y, a.y == 0.0));
-}}
-fn c_sqrt(a: vec2<f32>) -> vec2<f32> {{
+}
+fn c_sqrt(a: vec2<f32>) -> vec2<f32> {
     let t = sqrt(0.5 * (c_abs(a) + abs(a.x)));
     let u = a.y / (2.0 * t);
     let flipped = select(t, -t, (bitcast<u32>(a.y) & 0x80000000u) != 0u);
     let root = select(vec2<f32>(abs(u), flipped), vec2<f32>(t, u), a.x >= 0.0);
     return select(root, vec2<f32>(0.0, a.y), (a.x == 0.0) & (a.y == 0.0));
-}}
+}
 "
-    )
 }
 
 /// A test of what kind of floating-point value an element is, read from the bits of its

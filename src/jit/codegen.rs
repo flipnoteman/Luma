@@ -364,7 +364,7 @@ pub(super) fn library_for(key: &FusedKey, tuning: &Tuning) -> String {
     let library = |guard: &str| df_library(guard, tuning.df_fma, tuning.df_sloppy_add);
     let instrs = || key.instrs.iter().chain(key.subs.iter().flatten());
     let math = if instrs().any(calls_df_math) { DF_MATH_LIBRARY } else { "" };
-    let complex = if instrs().any(calls_complex_library) { complex_library() } else { String::new() };
+    let complex = if instrs().any(calls_complex_library) { complex_library().to_owned() } else { String::new() };
     match key.guard {
         Some(guard) => library(&format!("p.s{guard}")) + math + &complex,
         None if instrs().any(calls_df_library) => library("0u") + math + &complex,
