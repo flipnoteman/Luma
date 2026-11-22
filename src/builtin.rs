@@ -830,6 +830,13 @@ pub(crate) enum Builtin {
     Conv1dTiled(u32, u32),
     /// One pass of the FFT convolution, see [`crate::fft`].
     Fft(crate::fft::FftPass),
+    /// One pass of a public FFT, see [`crate::dft_kernel`].
+    Dft(crate::dft_kernel::DftPass),
+    /// The packing step of a real FFT (`true`: unpack a spectrum after the forward transform),
+    /// see [`crate::spectral`].
+    RealStage(bool),
+    /// The chirp tables of Bluestein's algorithm, see [`crate::spectral`].
+    Chirp,
     /// The convergence gate between the steps of `iterate_until`; arguments: the residual, the
     /// state `[done, count]`, the indirect arguments of the next step, their template, uniform
     /// `{tol, step, words}`.
@@ -2569,6 +2576,9 @@ impl Builtin {
             Builtin::Conv1d => BuiltinKernel::Module(conv1d_module()),
             Builtin::Conv1dTiled(stride, per_thread) => wgsl(conv1d_tiled(stride, per_thread, tuning.conv_workgroup)),
             Builtin::Fft(pass) => wgsl(crate::fft::source(pass)),
+            Builtin::Dft(pass) => wgsl(crate::dft_kernel::source(&pass)),
+            Builtin::RealStage(forward) => wgsl(crate::spectral::real_stage_source(forward)),
+            Builtin::Chirp => wgsl(crate::spectral::chirp_source()),
             Builtin::UntilGate => BuiltinKernel::Module(until_gate_module()),
             Builtin::Tridiagonal { block, starts, workgroup, twisted } => wgsl(tridiagonal(block as u32, starts, u32::from(workgroup), twisted)),
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {

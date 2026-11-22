@@ -27,6 +27,7 @@ mod errors;
 mod euler_residual;
 mod factorize;
 mod fields_generic;
+mod fft;
 mod filter;
 mod fusion;
 mod generators;
