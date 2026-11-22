@@ -72,6 +72,8 @@ mod guide {
     pub mod complex {}
     #[doc = include_str!("../guide/src/integers.md")]
     pub mod integers {}
+    #[doc = include_str!("../guide/src/compact.md")]
+    pub mod compact {}
     #[doc = include_str!("../guide/src/custom-kernels.md")]
     pub mod custom_kernels {}
     #[doc = include_str!("../guide/src/performance.md")]
@@ -147,6 +149,7 @@ mod scatter;
 mod search;
 mod segments;
 mod segsort;
+mod small;
 mod setmerge;
 mod setops;
 mod scalar;

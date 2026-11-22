@@ -38,13 +38,14 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 | `f32` | the default float; every operation |
 | `u32` | indices, counters, [bit operations](integers.md) |
 | `i32` | signed integers, [casts](integers.md#signed-integers-and-casts) |
+| `u8`, `i8`, `u16`, `i16` | compact integers, 1 or 2 bytes per element, wrapping arithmetic ([Compact integers](compact.md)) |
 | `bool` | the result of comparisons: a boolean per element ([booleans](integers.md#comparisons-booleans-and-select)) |
 | `Df32` | double-float, about 48 bits of mantissa, runs on every device ([Precision](precision.md)) |
 | `f64` | 64-bit float, only on devices with `SHADER_F64` (CUDA, the CPU backend, some Vulkan GPUs; not Metal) |
 | `C32` | complex `f32` (`re`, `im`), runs on every device, the element of the FFTs ([Complex numbers](complex.md)) |
 
 `[f32; 2]` / `[f32; 4]` / `[u32; 2]` / `[u32; 4]` (`vec2` / `vec4`) element types exist for custom kernels, and [records](records.md) group several
-arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `Df32`, `f64` and `C32`
+arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `u8`, `i8`, `u16`, `i16`, `Df32`, `f64` and `C32`
 (the *scalar* types); what each type supports is listed in the chapters named in the table.
 
 ### Booleans
@@ -95,8 +96,10 @@ operation.
 | `bool` | `to_u32`, `to_i32`, `to_f32`, `to_f64`, `to_df32` | 1 where true, 0 where false |
 | `f32` | `to_f64`, `to_df32` | exact (`to_f64` needs `SHADER_F64`) |
 | `f64`, `Df32` | `to_f32`, `to_df32` / `to_f64` | rounds to `f32`; `f64` to `Df32` is exact to 48 bits |
+| `u8`, `i8`, `u16`, `i16` | `to_f32`, `to_f64`, `to_df32`, `to_u32`, `to_i32`, `to_bool` and the other three | by value ([Compact integers](compact.md#casts)) |
+| every type but itself | `to_u8`, `to_i8`, `to_u16`, `to_i16` | integers wrap (the low bits), floats saturate and NaN is 0 |
 
-There is no cast to `bool`: write a comparison (`x.ne(0u32)`). A cast pair not in the table does
+There is no cast to `bool` from the 32-bit types: write a comparison (`x.ne(0u32)`); the compact integers have `to_bool`. A cast pair not in the table does
 not exist, so a type mix-up is a compile error rather than a silent conversion.
 
 ```rust

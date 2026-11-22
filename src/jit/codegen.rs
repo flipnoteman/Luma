@@ -18,7 +18,7 @@
 
 use std::fmt::Write;
 
-use crate::builtin::{
+use crate::builtin::{narrow_expr,
     DF_MATH_LIBRARY, ReduceElem, class_operand, complex_library, df_library, reduce_main, substitute,
 };
 use crate::gpu::hash::FxMap;
@@ -45,7 +45,7 @@ fn name(reference: Ref, ty: ElemTy) -> String {
         Ref::Scalar(k) => match ty {
             ElemTy::F64 => format!("(f64(p.s{k}) + f64(p.s{}) + f64(p.s{}))", k + 1, k + 2),
             ElemTy::Df32 | ElemTy::C32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => format!("p.s{k}"),
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => format!("p.s{k}"),
         },
         Ref::Tmp(k) => format!("t{k}"),
         Ref::Sub(k) => format!("sub{k}"),
@@ -61,7 +61,7 @@ fn name(reference: Ref, ty: ElemTy) -> String {
 /// `ty.wgsl()`: a bool is a `u32` of 0 or 1 there.
 pub(super) fn storage_ty(ty: ElemTy) -> &'static str {
     match ty {
-        ElemTy::Bool => "u32",
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => "u32",
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ty.wgsl(),
     }
 }
@@ -71,7 +71,7 @@ pub(super) fn storage_ty(ty: ElemTy) -> &'static str {
 /// different invocations.
 pub(super) fn out_storage_ty(ty: ElemTy) -> &'static str {
     match ty {
-        ElemTy::Bool => "atomic<u32>",
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => "atomic<u32>",
         _ => storage_ty(ty),
     }
 }
@@ -89,7 +89,20 @@ pub(super) fn load(ty: ElemTy, buffer: &str, index: &str) -> String {
             let j = operand(index);
             format!("(({buffer}[{j} >> 5u] >> ({j} & 31u)) & 1u)")
         }
+        ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => small_load(ty, &format!("{buffer}[{} >> {}u]", operand(index), ty.small_shift()), index),
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("{buffer}[{index}]"),
+    }
+}
+
+/// The register value of the small integer element `index` of the word `word` of its buffer: the
+/// field of the word shifted down, zero-extended or sign-extended.
+fn small_load(ty: ElemTy, word: &str, index: &str) -> String {
+    let bits = ty.small_bits();
+    let per_word = 32 / bits;
+    let at = format!("(({} & {}u) * {}u)", operand(index), per_word - 1, bits);
+    match ty {
+        ElemTy::U8 | ElemTy::U16 => format!("(({word} >> {at}) & {}u)", (1u32 << bits) - 1),
+        _ => format!("(bitcast<i32>({word} << (({}u - {at}))) >> {}u)", 32 - bits, 32 - bits),
     }
 }
 
@@ -100,6 +113,9 @@ pub(super) fn load_out(ty: ElemTy, buffer: &str, index: &str) -> String {
         ElemTy::Bool => {
             let j = operand(index);
             format!("((atomicLoad(&{buffer}[{j} >> 5u]) >> ({j} & 31u)) & 1u)")
+        }
+        ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => {
+            small_load(ty, &format!("atomicLoad(&{buffer}[{} >> {}u])", operand(index), ty.small_shift()), index)
         }
         _ => load(ty, buffer, index),
     }
@@ -130,8 +146,14 @@ pub(super) const NO_NAMES: Names<'static> = Names { views: &[], in_place: &[] };
 fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
     let ty = op.ty;
     Some(match op.kind {
-        OpKind::Unary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, ""),
-        OpKind::Binary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b),
+        OpKind::Unary(op) => {
+            let value = substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, "");
+            if ty.is_small() && op.widens() { narrow_expr(ty, &value) } else { value }
+        }
+        OpKind::Binary(op) => {
+            let value = substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b);
+            if ty.is_small() && op.widens() { narrow_expr(ty, &value) } else { value }
+        }
         OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
         OpKind::Classify(class) => substitute(class.expr(), &class_operand(ty, a), ""),
         OpKind::Part(part) => substitute(part.expr(), a, ""),
@@ -354,6 +376,48 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
         (ElemTy::Bool, ElemTy::F64) => format!("f64({value})"),
         (ElemTy::Bool, ElemTy::Df32) | (ElemTy::Bool, ElemTy::C32) => format!("vec2<f32>(f32({value}), 0.0)"),
         _ if from == to => value.to_owned(),
+        _ if from.is_small() || to.is_small() => small_cast(from, to, value),
+        _ => unreachable!("cast {from:?} -> {to:?}"),
+    }
+}
+
+/// `value` of type `from` converted to `to`, where one of the two is a small integer. A small
+/// integer widens by value (`-1i8 as u32` is `0xFFFFFFFF`); a conversion to one wraps an integer
+/// (the low bits) and saturates a float (a NaN is 0), like Rust's `as`.
+fn small_cast(from: ElemTy, to: ElemTy, value: &str) -> String {
+    if to.is_small() {
+        let (lo, hi) = match to {
+            ElemTy::U8 => (0.0, 255.0),
+            ElemTy::I8 => (-128.0, 127.0),
+            ElemTy::U16 => (0.0, 65535.0),
+            _ => (-32768.0, 32767.0),
+        };
+        let word = match from {
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => {
+                let f = match from {
+                    ElemTy::F32 => value.to_owned(),
+                    ElemTy::F64 => format!("f32({value})"),
+                    _ => format!("({value}.x + {value}.y)"),
+                };
+                let clamped = format!("select(0.0, clamp({f}, {lo:.1}, {hi:.1}), {f} == {f})");
+                return match to {
+                    ElemTy::U8 | ElemTy::U16 => format!("u32({clamped})"),
+                    _ => format!("i32({clamped})"),
+                };
+            }
+            ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => value.to_owned(),
+            _ => format!("bitcast<u32>({value})"),
+        };
+        let word = if to.is_small_signed() { format!("bitcast<i32>({word})") } else { word };
+        return narrow_expr(to, &word);
+    }
+    match to {
+        ElemTy::U32 => if from == ElemTy::U8 || from == ElemTy::U16 { value.to_owned() } else { format!("bitcast<u32>({value})") },
+        ElemTy::I32 => if from.is_small_signed() { value.to_owned() } else { format!("bitcast<i32>({value})") },
+        ElemTy::Bool => format!("select(0u, 1u, {value} != 0)"),
+        ElemTy::F32 => format!("f32({value})"),
+        ElemTy::F64 => format!("f64({value})"),
+        ElemTy::Df32 => format!("vec2<f32>(f32({value}), 0.0)"),
         _ => unreachable!("cast {from:?} -> {to:?}"),
     }
 }
@@ -381,12 +445,16 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Index => match ty {
             ElemTy::U32 => index.to_owned(),
             ElemTy::Bool => unreachable!("bool has no generators"),
+            ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, index),
+            ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>({index})")),
             ElemTy::I32 => format!("bitcast<i32>({index})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
             ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
             ElemTy::Bool => unreachable!("bool has no generators"),
+            ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, &format!("(({index} >> {a}) & {b})")),
+            ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>(({index} >> {a}) & {b})")),
             ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32(({index} >> {a}) & {b})"),
         },
@@ -404,6 +472,8 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             match ty {
                 ElemTy::U32 => coord,
                 ElemTy::Bool => unreachable!("bool has no generators"),
+                ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, &coord),
+                ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>({coord})")),
                 ElemTy::I32 => format!("bitcast<i32>({coord})"),
                 ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32({coord})"),
             }
@@ -576,7 +646,7 @@ pub(super) fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
     let Tail::Stack { total, first: 0, block: 1 } = key.tail else { return false };
     // The bits of a `bool` result are written one at a time, not as the words they are in.
     let bytes = match ty {
-        ElemTy::Bool => return false,
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => return false,
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => 4,
         ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => 8,
     };
@@ -1410,6 +1480,8 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                         ElemTy::I32 => coord,
                         ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32(u32({coord}))"),
                         ElemTy::Bool => unreachable!("bool has no generators"),
+                        ElemTy::U8 | ElemTy::U16 => narrow_expr(op.ty, &format!("u32({coord})")),
+                        ElemTy::I8 | ElemTy::I16 => narrow_expr(op.ty, &coord),
                     }
                 }
                 _ => {
@@ -1568,7 +1640,7 @@ impl Tile {
 /// as functions called per shift.
 pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tuning) -> Option<Tile> {
     // Staged values are 4 bytes wide; programs of the 8-byte types call their sub-programs.
-    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || key.inlines() || !key.narrow() || key.writes_bits() {
+    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || key.inlines() || !key.plain_words() || key.writes_bits() || key.writes_small() {
         return None;
     }
     let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)).collect();

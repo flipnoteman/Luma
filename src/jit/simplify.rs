@@ -30,8 +30,8 @@ fn const_bits(ty: ElemTy, value: f64) -> u64 {
     match ty {
         ElemTy::F32 | ElemTy::Df32 | ElemTy::C32 => u64::from((value as f32).to_bits()),
         ElemTy::F64 => value.to_bits(),
-        ElemTy::U32 | ElemTy::Bool => u64::from(value as u32),
-        ElemTy::I32 => u64::from(value as i32 as u32),
+        ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => u64::from(value as u32),
+        ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => u64::from(value as i32 as u32),
     }
 }
 

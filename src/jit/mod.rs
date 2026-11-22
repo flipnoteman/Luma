@@ -295,6 +295,16 @@ pub(crate) enum ElemTy {
     /// `ElemLayout::PACKED`); the accessors `kirgen::Lower::load_in` / `kirgen::Lower::store` and the
     /// packed store of `kirgen::Build::packed` are where the layout is known.
     Bool,
+    /// 8- and 16-bit integers: a `u32` (unsigned) or `i32` (signed) register holding the value
+    /// (zero- or sign-extended, always in the range of the type), 4 or 2 elements to a `u32`
+    /// word in buffers (`ElemLayout::BYTE`, `ElemLayout::HALF`). The arithmetic wraps: every
+    /// operation that can leave the range narrows its result again (`kirgen::Lower::narrow`),
+    /// and the accessors `kirgen::Lower::load_in` / `kirgen::Lower::store` and the word-wise
+    /// store of `kirgen::Build::plain_words` are where the layout is known.
+    U8,
+    I8,
+    U16,
+    I16,
     /// 64-bit float (needs `luma_core::Features::SHADER_F64`).
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
@@ -318,6 +328,14 @@ impl ElemTy {
             Some(ElemTy::I32)
         } else if id == TypeId::of::<bool>() {
             Some(ElemTy::Bool)
+        } else if id == TypeId::of::<u8>() {
+            Some(ElemTy::U8)
+        } else if id == TypeId::of::<i8>() {
+            Some(ElemTy::I8)
+        } else if id == TypeId::of::<u16>() {
+            Some(ElemTy::U16)
+        } else if id == TypeId::of::<i16>() {
+            Some(ElemTy::I16)
         } else if id == TypeId::of::<f64>() {
             Some(ElemTy::F64)
         } else if id == TypeId::of::<crate::gpu_type::Df32>() {
@@ -336,11 +354,44 @@ impl ElemTy {
     pub(crate) fn wgsl(self) -> &'static str {
         match self {
             ElemTy::F32 => "f32",
-            ElemTy::U32 | ElemTy::Bool => "u32",
-            ElemTy::I32 => "i32",
+            ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => "u32",
+            ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => "i32",
             ElemTy::F64 => "f64",
             ElemTy::Df32 | ElemTy::C32 => "vec2<f32>",
         }
+    }
+
+    /// Whether this is an 8-bit or 16-bit integer.
+    pub(crate) fn is_small(self) -> bool {
+        matches!(self, ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16)
+    }
+
+    /// Whether elements of this type share words in buffers: the bits of a `bool`, the small integers.
+    pub(crate) fn is_packed(self) -> bool {
+        self == ElemTy::Bool || self.is_small()
+    }
+
+    /// Bits of a small integer (0 for any other type).
+    pub(crate) fn small_bits(self) -> u32 {
+        match self {
+            ElemTy::U8 | ElemTy::I8 => 8,
+            ElemTy::U16 | ElemTy::I16 => 16,
+            _ => 0,
+        }
+    }
+
+    /// `log2` of the small integers to a word: 2 for bytes, 1 for halves.
+    pub(crate) fn small_shift(self) -> u32 {
+        match self.small_bits() {
+            8 => 2,
+            16 => 1,
+            _ => 0,
+        }
+    }
+
+    /// Whether this is a signed small integer.
+    pub(crate) fn is_small_signed(self) -> bool {
+        matches!(self, ElemTy::I8 | ElemTy::I16)
     }
 
     /// How elements of this type sit in a buffer; it sets the elements per segment of an array
@@ -349,6 +400,8 @@ impl ElemTy {
         match self {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => ElemLayout::plain(4),
             ElemTy::Bool => ElemLayout::PACKED,
+            ElemTy::U8 | ElemTy::I8 => ElemLayout::BYTE,
+            ElemTy::U16 | ElemTy::I16 => ElemLayout::HALF,
             ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ElemLayout::plain(8),
         }
     }
@@ -362,6 +415,8 @@ impl ElemTy {
     pub(crate) fn traffic(self) -> f64 {
         match self {
             ElemTy::Bool => 0.125,
+            ElemTy::U8 | ElemTy::I8 => 1.0,
+            ElemTy::U16 | ElemTy::I16 => 2.0,
             other => other.layout().stride() as f64,
         }
     }
@@ -369,7 +424,7 @@ impl ElemTy {
     /// How many `f32` uniform slots a scalar of this type takes (see `Flattener::operand`).
     pub(crate) fn slots(self) -> usize {
         match self {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => 1,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => 1,
             ElemTy::Df32 | ElemTy::C32 => 2,
             ElemTy::F64 => 3,
         }
@@ -382,6 +437,10 @@ impl ElemTy {
             ElemTy::U32 => "u32",
             ElemTy::I32 => "i32",
             ElemTy::Bool => "bool",
+            ElemTy::U8 => "u8",
+            ElemTy::I8 => "i8",
+            ElemTy::U16 => "u16",
+            ElemTy::I16 => "i16",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "Df32",
             ElemTy::C32 => "C32",
@@ -724,6 +783,13 @@ impl Scalar {
             1 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()))),
             _ => bytemuck::pod_read_unaligned::<u64>(bytemuck::bytes_of(&value.into_repr())),
         };
+        // The register of a signed small integer holds the sign-extended value.
+        let bits = if ty.is_small_signed() {
+            let up = 32 - ty.small_bits();
+            u64::from((((bits as u32) << up) as i32 >> up) as u32)
+        } else {
+            bits
+        };
         Ok(Scalar { ty, bits })
     }
 
@@ -731,7 +797,7 @@ impl Scalar {
     /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32` and `C32`.
     pub(crate) fn words(self) -> [u32; 3] {
         match self.ty {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => [self.bits as u32, 0, 0],
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => [self.bits as u32, 0, 0],
             ElemTy::Df32 | ElemTy::C32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
             ElemTy::F64 => {
                 let v = f64::from_bits(self.bits);

@@ -3,6 +3,7 @@
 
 pub mod accum;
 pub mod cfd;
+pub mod compact;
 pub mod compute;
 pub mod datasci;
 pub mod jit;
@@ -20,6 +21,7 @@ pub const ALL: &[(&str, SuiteFn)] = &[
     ("cfd", cfd::run),
     ("datasci", datasci::run),
     ("compute", compute::run),
+    ("compact", compact::run),
     ("jit", jit::run),
     ("sparse", sparse::run),
     ("accum", accum::run),

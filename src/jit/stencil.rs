@@ -106,7 +106,7 @@ fn plan_inner(fused: Fused, state_of: Vec<Option<usize>>, state_count: usize, ou
         return None;
     }
     let (w, h) = (u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?);
-    if !fused.key.subs.is_empty() || !fused.key.narrow() || super::codegen::generates(&fused.key) {
+    if !fused.key.subs.is_empty() || !fused.key.plain_words() || super::codegen::generates(&fused.key) {
         return None;
     }
     if outs.iter().any(|&out| fused.key.instrs.get(out as usize).is_none_or(|instr| instr.op.out_ty() != ElemTy::F32)) {
