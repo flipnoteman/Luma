@@ -1,4 +1,4 @@
-//! `sort`, `argsort`, their descending forms and `sort_axis` against Rust's stable sorts.
+//! `sort`, `argsort`, their descending forms and `sort_axis` against a stable host sort (an LSD radix sort on the keys).
 
 use luma::{Array, Context, SortKey};
 
@@ -62,15 +62,29 @@ fn keys<T: Host>(v: &[T]) -> Vec<u32> {
     v.iter().map(|x| x.key()).collect()
 }
 
-/// The stable order of `host`: ascending, or ascending by the complemented key.
+/// The stable order of `host`: ascending, or ascending by the complemented key. A least-significant-digit radix sort
+/// on three 11-bit digits of the key is stable, and several times faster than a comparison sort of the indices on the
+/// 4M-element cases (which dominated the time of these tests).
 fn host_order<T: Host>(host: &[T], descending: bool) -> Vec<u32> {
-    let mut order: Vec<u32> = (0..host.len() as u32).collect();
-    if descending {
-        order.sort_by_key(|&i| !host[i as usize].key());
-    } else {
-        order.sort_by_key(|&i| host[i as usize].key());
+    let key = |i: usize| if descending { !host[i].key() } else { host[i].key() };
+    let mut from: Vec<(u32, u32)> = (0..host.len()).map(|i| (key(i), i as u32)).collect();
+    let mut to = from.clone();
+    for shift in [0u32, 11, 22] {
+        let mut start = [0usize; 2049];
+        for &(k, _) in &from {
+            start[((k >> shift) & 2047) as usize + 1] += 1;
+        }
+        for digit in 0..2048 {
+            start[digit + 1] += start[digit];
+        }
+        for &entry in &from {
+            let slot = &mut start[((entry.0 >> shift) & 2047) as usize];
+            to[*slot] = entry;
+            *slot += 1;
+        }
+        std::mem::swap(&mut from, &mut to);
     }
-    order
+    from.into_iter().map(|(_, i)| i).collect()
 }
 
 fn check_all<T: Host>(ctx: &Context, host: &[T]) {
