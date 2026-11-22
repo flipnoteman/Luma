@@ -321,3 +321,39 @@ fn neighbours_nan_last() {
         assert_eq!(dist, (1..=k).map(|j| (j * j) as f32).collect::<Vec<_>>(), "k {k}");
     }
 }
+
+/// Many train features (50k, as a feature matcher on large images): luma's nearest neighbour of
+/// sampled queries against an exact f64 computation, repeated to see that the result is
+/// deterministic. Too slow for the CPU backend: `cargo test --release -- --ignored`.
+#[test]
+#[ignore = "slow on the CPU backend; run on a GPU backend"]
+fn neighbours_large_set() {
+    let (n, len) = (50_000usize, 64usize);
+    let uniform = |seed: u64| -> Vec<f32> {
+        let mut s = seed;
+        (0..n * len)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s >> 40) as f32 / (1u64 << 24) as f32
+            })
+            .collect()
+    };
+    let (q, t) = (uniform(1), uniform(2));
+    let (qa, ta) = (Array::from_slice(&q, [len, n]).unwrap(), Array::from_slice(&t, [len, n]).unwrap());
+    let sampled: Vec<usize> = (0..n).step_by(997).chain([36_735, n - 1]).collect();
+    let exact = |j: usize, i: usize| -> f64 { (0..len).map(|l| (f64::from(q[j * len + l]) - f64::from(t[i * len + l])).powi(2)).sum() };
+    let want: Vec<f64> = sampled.iter().map(|&j| (0..n).map(|i| exact(j, i)).fold(f64::INFINITY, f64::min)).collect();
+    let mut first: Option<(Vec<u32>, Vec<f32>)> = None;
+    for round in 0..4 {
+        let (idx, dist) = nearest_neighbour(&qa, &ta, 0, 1, DistType::Ssd).unwrap();
+        let (idx, dist) = (idx.to_vec().unwrap(), dist.to_vec().unwrap());
+        for (&j, &w) in sampled.iter().zip(&want) {
+            assert!((f64::from(dist[j]) - w).abs() <= 1e-4 * w, "round {round}, query {j}: distance {} vs exact {w}", dist[j]);
+            assert!((exact(j, idx[j] as usize) - w).abs() <= 1e-4 * w, "round {round}, query {j}: index {} is not a nearest neighbour", idx[j]);
+        }
+        match &first {
+            None => first = Some((idx, dist)),
+            Some((i0, d0)) => assert!(*i0 == idx && *d0 == dist, "round {round}: result differs from the first round"),
+        }
+    }
+}
