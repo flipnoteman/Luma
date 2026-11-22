@@ -450,7 +450,7 @@ fn window3(window: &[usize]) -> [usize; 3] {
 /// The padding of an anchored window (rank filters): the cell `k / 2` is the output's own.
 fn anchored(k: [usize; 3]) -> ([usize; 3], [usize; 3]) {
     let before = k.map(|k| k / 2);
-    let after = [0, 1, 2].map(|d| k[d] - 1 - before[d]);
+    let after = [0, 1, 2].map(|d| k[d].saturating_sub(1 + before[d]));
     (before, after)
 }
 
