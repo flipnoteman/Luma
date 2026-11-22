@@ -168,10 +168,13 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     s
 }
 
+/// `(x, y, score)` of the selected corners.
+pub(crate) type Selected = (Array<f32>, Array<f32>, Array<f32>);
+
 /// The `k` strongest of the `count` corners `(x, y, score)` (all of one length, `count > k`),
 /// strongest first; ties in input order. `None` if `k` or `count` is out of the range of the
 /// kernel.
-pub(crate) fn strongest(x: &Array<f32>, y: &Array<f32>, score: &Array<f32>, k: usize) -> Outcome<Option<(Array<f32>, Array<f32>, Array<f32>)>> {
+pub(crate) fn strongest(x: &Array<f32>, y: &Array<f32>, score: &Array<f32>, k: usize) -> Outcome<Option<Selected>> {
     let count = score.len();
     if k == 0 || k > MAX_K || count > MAX_CORNERS || count <= k {
         return Ok(None);
