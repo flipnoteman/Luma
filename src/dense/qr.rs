@@ -23,7 +23,7 @@ use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
 use crate::shape::Shape;
-use crate::view::{concat, concat_slice};
+use crate::view::concat_slice;
 
 /// Columns of a panel one workgroup factors.
 const PANEL: usize = 32;
@@ -313,6 +313,59 @@ fn join(ctx: &crate::Context, parts: [&Array<f32>; 5], shape: Shape, n1: usize) 
     Ok((fo, vo))
 }
 
+/// `T = [[T1, -T12], [0, T2]]` and `tau = [tau1, tau2]` of a node, one element per invocation.
+const TJOIN: &str = "struct Params { w: u32, n1: u32 }
+@group(1) @binding(0) var<storage, read> t1: array<f32>;
+@group(1) @binding(1) var<uniform> t1v: LumaView;
+@group(1) @binding(2) var<storage, read> t12: array<f32>;
+@group(1) @binding(3) var<uniform> t12v: LumaView;
+@group(1) @binding(4) var<storage, read> t2: array<f32>;
+@group(1) @binding(5) var<uniform> t2v: LumaView;
+@group(1) @binding(6) var<storage, read> u1: array<f32>;
+@group(1) @binding(7) var<uniform> u1v: LumaView;
+@group(1) @binding(8) var<storage, read> u2: array<f32>;
+@group(1) @binding(9) var<uniform> u2v: LumaView;
+@group(1) @binding(10) var<storage, read_write> to: array<f32>;
+@group(1) @binding(11) var<storage, read_write> uo: array<f32>;
+@group(1) @binding(12) var<uniform> p: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let w = p.w;
+    let n1 = p.n1;
+    for (var idx = gid.x; idx < w * w; idx = idx + nwg.x * 256u) {
+        let i = idx / w;
+        let col = idx - i * w;
+        var v = 0.0;
+        if (i < n1) {
+            if (col < n1) { v = t1[luma_view_idx3(t1v, col, i, 0u)]; } else { v = -t12[luma_view_idx3(t12v, col - n1, i, 0u)]; }
+        } else if (col >= n1) {
+            v = t2[luma_view_idx3(t2v, col - n1, i - n1, 0u)];
+        }
+        to[idx] = v;
+        if (idx < w) {
+            if (idx < n1) { uo[idx] = u1[luma_view_idx3(u1v, idx, 0u, 0u)]; } else { uo[idx] = u2[luma_view_idx3(u2v, idx - n1, 0u, 0u)]; }
+        }
+    }
+}
+";
+
+/// `T` and `tau` of a node from those of its halves and `T12 = T1 Z T2` (with a minus sign).
+fn tjoin(ctx: &crate::Context, t1: &Array<f32>, t12: &Array<f32>, t2: &Array<f32>, tau1: &Array<f32>, tau2: &Array<f32>, n1: usize, w: usize) -> Result<(Array<f32>, Array<f32>), LumaError> {
+    let (mut to, mut uo) = (Array::<f32>::alloc(ctx, Shape::from([w, w, 1]))?, Array::<f32>::alloc(ctx, Shape::from([w, 1, 1]))?);
+    let params = TParams { w: w as u32, n1: n1 as u32 };
+    let args: [KernelArg<'_>; 8] = [view(t1), view(t12), view(t2), view(tau1), view(tau2), (&mut to).into(), (&mut uo).into(), uniform(&params)];
+    let groups = (w * w).div_ceil(256).min(4096) as u32;
+    launch(ctx, "qr_tjoin", "qr_tjoin", || TJOIN.to_owned(), [groups, 1, 1], &args)?;
+    Ok((to, uo))
+}
+
+#[derive(encase::ShaderType)]
+struct TParams {
+    w: u32,
+    n1: u32,
+}
+
 /// A recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Node {
     let [w, m, ..] = a.shape().dims();
@@ -336,16 +389,9 @@ fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) ->
     let v1b = block(&v1, n1..m, 0..n1).cache();
     // T12 = -T1 (V1bᵀ V2) T2.
     let z = matmul_f32(&v1b.transpose(), &v2);
-    let t12 = matmul_f32(&t1, &matmul_f32(&z, &t2)) * -1.0f32;
-    let zeros = match Array::<f32>::zeros_on(a.context(), [n1, n2]) {
-        Ok(z) => z,
-        Err(e) => return Node::failed(a.context(), a, e, op, loc),
-    };
-    let t = concat(1, [&concat(0, [&t1, &t12]), &concat(0, [&zeros, &t2])]);
-    match join(a.context(), [&f1, &v1, &c, &f2, &v2], a.shape(), n1) {
-        Ok((qr, v)) => Node { qr, v, tau: concat(0, [&tau1, &tau2]), t },
-        Err(e) => Node::failed(a.context(), a, e, op, loc),
-    }
+    let t12 = matmul_f32(&t1, &matmul_f32(&z, &t2));
+    let joined = tjoin(a.context(), &t1, &t12, &t2, &tau1, &tau2, n1, w).and_then(|(t, tau)| join(a.context(), [&f1, &v1, &c, &f2, &v2], a.shape(), n1).map(|(qr, v)| Node { qr, v, tau, t }));
+    joined.unwrap_or_else(|e| Node::failed(a.context(), a, e, op, loc))
 }
 
 fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
