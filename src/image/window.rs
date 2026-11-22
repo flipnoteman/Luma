@@ -32,7 +32,7 @@ impl Pixel {
     }
 
     /// `bits` (a `u32` expression) as a value of this type.
-    fn from_bits(self, bits: &str) -> String {
+    fn bits_as(self, bits: &str) -> String {
         match self {
             Pixel::U32 => bits.to_owned(),
             other => format!("bitcast<{}>({bits})", other.name()),
@@ -220,7 +220,7 @@ pub(crate) fn source(w: &Window) -> String {
     if w.op == Op::Median && (aux_len(w) > MEDIAN_REGISTERS) {
         let _ = writeln!(src, "{}", key_fns(w.pixel));
     }
-    let fill = w.pixel.from_bits("p.fill");
+    let fill = w.pixel.bits_as("p.fill");
     let _ = write!(
         src,
         "
@@ -245,11 +245,7 @@ fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: v
 "
     );
     if stage_aux {
-        let _ = write!(
-            src,
-            "    for (var i = lid; i < {}u; i += {wg}u) {{ wsm[i] = aux[i]; }}\n",
-            aux_len(w)
-        );
+        let _ = writeln!(src, "    for (var i = lid; i < {}u; i += {wg}u) {{ wsm[i] = aux[i]; }}", aux_len(w));
     }
     let _ = write!(
         src,
@@ -359,14 +355,14 @@ fn compute(w: &Window, ry: u32) -> String {
         }
         Op::Min | Op::Max => {
             let f = if w.op == Op::Min { "min" } else { "max" };
-            let _ = writeln!(out, "    var acc = {};", w.pixel.from_bits("p.c0"));
+            let _ = writeln!(out, "    var acc = {};", w.pixel.bits_as("p.c0"));
             out.push_str(&taps(w, &|at, _| format!("                acc = {f}(acc, tile[{at}]);\n")));
             out.push_str(&store("out", "o1 + ty", "acc"));
         }
         Op::MaskedMin | Op::MaskedMax => {
             let f = if w.op == Op::MaskedMin { "min" } else { "max" };
             let zero = w.pixel.zero();
-            let _ = writeln!(out, "    var acc = {};", w.pixel.from_bits("p.c0"));
+            let _ = writeln!(out, "    var acc = {};", w.pixel.bits_as("p.c0"));
             out.push_str(&taps(w, &|at, wi| {
                 format!("                if ({aux}[{wi}] != {zero}) {{ acc = {f}(acc, tile[{at}]); }}\n")
             }));
@@ -515,8 +511,8 @@ fn median(w: &Window, ty: &str) -> String {
         }
         for i in m..n {
             let x = names[i].clone();
-            for j in 0..m {
-                swap(&mut out, &names[j], &x);
+            for name in &names[..m] {
+                swap(&mut out, name, &x);
             }
         }
         names[m - 1].clone()

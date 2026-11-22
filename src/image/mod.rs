@@ -124,10 +124,9 @@ impl ConvSpec {
     /// Explicit padding: `before` and `after` cells on axes 0, 1, ...
     pub fn pad<const N: usize>(mut self, before: [usize; N], after: [usize; N]) -> Self {
         let (mut b, mut a) = ([0; 3], [0; 3]);
-        for d in 0..N.min(3) {
-            b[d] = before[d];
-            a[d] = after[d];
-        }
+        let n = N.min(3);
+        b[..n].copy_from_slice(&before[..n]);
+        a[..n].copy_from_slice(&after[..n]);
         self.too_many_axes |= N > 3;
         self.padding = Padding::Explicit { before: b, after: a };
         self
@@ -136,9 +135,8 @@ impl ConvSpec {
     /// Sets the stride along axes 0, 1, ... (1 for the axes not given). Zero poisons the result.
     pub fn stride<const N: usize>(mut self, stride: [usize; N]) -> Self {
         self.stride = [1; 3];
-        for d in 0..N.min(3) {
-            self.stride[d] = stride[d];
-        }
+        let n = N.min(3);
+        self.stride[..n].copy_from_slice(&stride[..n]);
         self.too_many_axes |= N > 3;
         self
     }
@@ -451,6 +449,7 @@ fn anchored(k: [usize; 3]) -> ([usize; 3], [usize; 3]) {
 }
 
 impl<T: ImagePixel> Array<T> {
+    #[allow(clippy::too_many_arguments)]
     fn rank_filter(&self, op: Op, k: [usize; 3], three_d: bool, border: Border, mask: Option<&Array<T>>, name: &'static str, location: &'static Location<'static>) -> Array<T> {
         let (before, after) = anchored(k);
         let spec = Spec { op, k, stride: [1; 3], before, after, border, three_d, c1: 0, aux_cells: mask.map_or(0, |m| m.len()) };
@@ -592,8 +591,8 @@ impl<T: ImagePixel> Array<T> {
     pub fn hist_equal(&self, hist: &Array<u32>) -> Array<T> {
         let location = Location::caller();
         let ctx = self.context();
-        if hist.len() == 0 || !ctx.same_as(hist.context()) {
-            let error = if hist.len() == 0 { LumaError::InvalidShape("empty histogram".into()) } else { LumaError::ContextMismatch };
+        if hist.is_empty() || !ctx.same_as(hist.context()) {
+            let error = if hist.is_empty() { LumaError::InvalidShape("empty histogram".into()) } else { LumaError::ContextMismatch };
             return Array::poisoned(ctx, self.shape(), Arc::new(LumaError::Op { op: "hist_equal", location, source: Arc::new(error) }));
         }
         let cdf = hist.to_f32().reshape(hist.len()).cumsum(0);
@@ -821,8 +820,8 @@ impl Array<f32> {
     }
 
     /// The raw image moments of every `[H, W]` plane (axes 2 and 3 are a batch), as a
-    /// `[4, 1, N, M]` array: `M00 = sum f`, `M01 = sum f * i`, `M10 = sum f * j`, `M11 = sum f
-    /// * i * j` with `i` the index along axis 0 and `j` the one along axis 1, counted from 0
+    /// `[4, 1, N, M]` array: `M00 = sum f`, `M01 = sum f*i`, `M10 = sum f*j`, `M11 = sum f*i*j`
+    /// with `i` the index along axis 0 and `j` the one along axis 1, counted from 0
     /// (ArrayFire's `moments` with `FIRST_ORDER`, in this order). Lazy; the four sums are
     /// reductions over the image.
     #[track_caller]

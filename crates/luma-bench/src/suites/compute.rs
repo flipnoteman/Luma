@@ -10,12 +10,15 @@
 //! * `fractal`: Mandelbrot and Julia sets as `iterate_all` register loops and unrolled chains;
 //! * `fft`, `image`: FFT convolution against direct convolution, and image filters built from
 //!   shifts, slices, scans and gathers;
+//! * `imageops`: the image operations of `luma` (convolutions, rank and morphological filters,
+//!   Sobel, bilateral, summed-area tables, colour conversions, `unwrap`) at 1080p and 4K, 3-D filters;
 //! * `keccak`, `mlkem`: batched SHA3 and ML-KEM in `u32` array operations (see `crypto`).
 //!
 //! Every case is checked against a host reference (`f64` where precision matters) before it is
 //! timed. Sizes shrink under `--quick` and on the CPU backend.
 
 mod bandwidth;
+mod imageops;
 mod crypto;
 mod linalg;
 mod physics;
@@ -93,5 +96,6 @@ pub fn run(h: &mut Harness) {
     scans::run(h);
     physics::run(h);
     signal::run(h);
+    imageops::run(h);
     crypto::run(h);
 }

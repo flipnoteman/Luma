@@ -14,6 +14,7 @@
 - [Custom kernels](custom-kernels.md)
 - [Performance guide](performance.md)
 - [Worked examples](examples.md)
+- [Images and filters](images.md)
 
 # Reference
 

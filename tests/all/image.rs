@@ -321,10 +321,10 @@ fn window_ref<T: Copy + PartialOrd + std::fmt::Debug>(v: &Vol<T>, k: [usize; 3],
                     for j2 in 0..k[2] {
                         for j1 in 0..k[1] {
                             for j0 in 0..k[0] {
-                                if let Some(m) = mask {
-                                    if !(m[j0 + k[0] * (j1 + k[1] * j2)] != zero) {
-                                        continue;
-                                    }
+                                if let Some(m) = mask
+                                    && m[j0 + k[0] * (j1 + k[1] * j2)] == zero
+                                {
+                                    continue;
                                 }
                                 let x = [o0 as i64 + j0 as i64 - before[0] as i64, o1 as i64 + j1 as i64 - before[1] as i64, o2 as i64 + j2 as i64 - before[2] as i64];
                                 match v.at(b, x, border) {
