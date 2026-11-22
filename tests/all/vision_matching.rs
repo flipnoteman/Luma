@@ -277,3 +277,27 @@ fn hamming() {
         assert_eq!(gd.to_vec().unwrap(), wd.iter().map(|&d| d as u32).collect::<Vec<_>>(), "dim {dist_dim}");
     }
 }
+
+#[test]
+fn lazy_and_view_inputs() {
+    // Operands that are still lazy expressions or views are evaluated first.
+    let (h, w) = (21, 17);
+    let img = pattern(h * w, 11, 10);
+    let tpl = pattern(6, 12, 9);
+    let image = Array::from_slice(&img, [h, w]).unwrap();
+    let template = Array::from_slice(&tpl, [3, 2]).unwrap();
+    let doubled = (&image * 2.0f32).match_template(&(&template + 1.0f32), MatchType::Sad).to_vec().unwrap();
+    let (di, dt): (Vec<f32>, Vec<f32>) = (img.iter().map(|v| v * 2.0).collect(), tpl.iter().map(|v| v + 1.0).collect());
+    close(&doubled, &template_reference(&di, [h, w, 1], &dt, [3, 2], MatchType::Sad), "lazy operands");
+
+    // Features as the transpose of a view: query rows are the columns of the stored matrix.
+    let (nq, nt, len) = (9, 40, 5);
+    let (q, t) = (ints(nq * len, 13, 20), ints(nt * len, 14, 20));
+    let (wi, wd) = neighbours_reference(&q, &t, len, 3, DistType::Ssd);
+    let to_f32 = |v: &[i64]| v.iter().map(|&x| x as f32).collect::<Vec<_>>();
+    let qa = Array::from_slice(&to_f32(&q), [len, nq]).unwrap();
+    let ta = Array::from_slice(&to_f32(&t), [len, nt]).unwrap();
+    let (gi, gd) = nearest_neighbour(&(&qa + 0.0f32), &ta.slice(1, 0..nt), 0, 3, DistType::Ssd).unwrap();
+    assert_eq!(gi.to_vec().unwrap(), wi);
+    assert_eq!(gd.to_vec().unwrap(), wd.iter().map(|&d| d as f32).collect::<Vec<_>>());
+}
