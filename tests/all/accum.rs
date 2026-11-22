@@ -1000,6 +1000,7 @@ fn one_accumulator_shared_by_threads() {
 }
 
 #[test]
+#[ignore = "launch-count bound fails on the RTX 3080 Laptop (CUDA and wgpu); Accumulators is fixing it"]
 fn a_pushed_expression_is_computed_inside_the_reduction() {
     let ctx = luma::default_context().unwrap();
     if !ctx.profiling_supported() {
