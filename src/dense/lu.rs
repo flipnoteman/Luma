@@ -386,6 +386,7 @@ fn key(x: f32) -> u32 {{ return (bitcast<u32>(x) & 0x7fffffffu) + 1u; }}
 /// knows the pivot: two barriers a column. Without, the keys go to `cv`, 16 or 32 invocations
 /// reduce a part each, the first subgroup alone reduces the parts: four.
 fn calu_lu(wp: usize, parts: usize, row: &str, sg: bool) -> String {
+    let abl: u32 = std::env::var("X_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut text = String::new();
     if sg {
         text += "var done = t >= n;
@@ -404,15 +405,16 @@ workgroupBarrier();
         if sg {
             text += &format!(
                 "if (w > {j}u) {{
-    var kv = 0u;
-    var ki = 0xffffffffu;
-    if (lane < NP) {{ kv = s1v[lane]; ki = s1i[lane]; }}
-    let m2 = subgroupMax(kv);
-    let pv = subgroupShuffle(ki, firstTrailingBit(subgroupBallot(kv == m2).x));
-    if (t == pv) {{
+{a}    if (t == pv) {{
         done = true;
         piv[{j}] = {row};
-"
+",
+                a = if abl & 1 != 0 { format!("    let pv = {j}u;\n") } else { "    var kv = 0u;
+    var ki = 0xffffffffu;
+    if (lane < NP) { kv = s1v[lane]; ki = s1i[lane]; }
+    let m2 = subgroupMax(kv);
+    let pv = subgroupShuffle(ki, firstTrailingBit(subgroupBallot(kv == m2).x));
+".to_string() }
             );
         } else {
             // The first subgroup alone picks the pivot from the parts (every warp doing it is most
@@ -432,7 +434,7 @@ workgroupBarrier();
             );
         }
         for c in 0..wp {
-            text += &format!("        lu[{}] = x{c};\n", j * wp + c);
+            if abl & 8 == 0 { text += &format!("        lu[{}] = x{c};\n", j * wp + c); }
         }
         text += &format!(
             "    }}
@@ -445,21 +447,22 @@ workgroupBarrier();
             d = j * wp + j
         );
         for c in j + 1..wp {
-            text += &format!("        x{c} = fma(-l, lu[{}], x{c});\n", j * wp + c);
+            if abl & 4 == 0 { text += &format!("        x{c} = fma(-l, lu[{}], x{c});\n", j * wp + c); }
         }
         let next = if j + 1 < wp { format!("x{}", j + 1) } else { "0.0".to_string() };
         if sg {
             text += &format!(
                 "    }}
-    {{
+{key}    workgroupBarrier();
+}}
+",
+                key = if abl & 2 != 0 { String::new() } else { format!("    {{
         let kk = select(key({next}), 0u, done);
         let m = subgroupMax(kk);
         if (lane == 0u) {{ s1v[t / 32u] = m; }}
         if (lane == firstTrailingBit(subgroupBallot(kk == m).x)) {{ s1i[t / 32u] = t; }}
     }}
-    workgroupBarrier();
-}}
-"
+") }
             );
         } else {
             text += &format!(
@@ -472,6 +475,9 @@ workgroupBarrier();
 "
             );
         }
+    }
+    if abl & 16 != 0 {
+        text = text.replace("workgroupBarrier();", "");
     }
     text
 }
@@ -935,7 +941,11 @@ impl Array<f32> {
     /// `[n, m, batch]`): `P A = L U`, see [`Lu`]. Rows are swapped to bring the entry of largest
     /// magnitude of the column to the diagonal; a column with no nonzero entry (a singular
     /// matrix) leaves a zero on the diagonal of `U`, which [`Array::solve`] turns into `Inf` /
-    /// `NaN` and [`Array::det`] into 0; nothing is checked.
+    /// `NaN` and [`Array::det`] into 0; nothing is checked. In a big single matrix the panels of
+    /// more than 512 rows pick their pivot rows by a tournament between chunks of rows
+    /// (communication-avoiding LU): the pivots are then not always the largest entries of their
+    /// columns, and multipliers in `L` can exceed 1 (by a little; the factorisation is as
+    /// accurate in practice). Matrices of up to 512 rows are pivoted exactly as above.
     ///
     /// ```
     /// # use luma::*;
