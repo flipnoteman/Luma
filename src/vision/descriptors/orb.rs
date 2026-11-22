@@ -45,7 +45,7 @@ const CHUNK: u32 = BINS / 256;
 /// The fraction of the pixels of a level that may be corners (ArrayFire's CUDA backend).
 const FAST_RATIO: f32 = 0.14;
 /// Workgroups of the selection and ranking launches (they loop over the candidates).
-const SELECT_GROUPS: u32 = 128;
+const SELECT_GROUPS: u32 = 64;
 
 /// One kernel of ORB.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -241,8 +241,10 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
 /// The cut of the ranking (the highest bin from which the bins above hold at least `best`
 /// responses, 0 if there are fewer candidates) and the compaction of the candidates with a key
 /// at or above it, by a grid-stride loop; the first invocation also stores the number of kept
-/// features of the level. Arguments: positions, responses, counters, histogram, compacted
-/// positions, responses and candidate indices, kept counts, uniform `{cap, best, level, 0}`.
+/// features of the level. Every workgroup finds the cut itself: its invocations sum a chunk of
+/// the histogram each, a scan over the chunks from the top finds the one the cut is in. Arguments:
+/// positions, responses, counters, histogram, compacted positions, responses, keys and candidate
+/// indices, kept counts, uniform `{cap, best, level, 0}`.
 fn select_source() -> String {
     format!(
         "struct Params {{ cap: u32, best: u32, level: u32, c: u32 }}
@@ -252,9 +254,10 @@ fn select_source() -> String {
 @group(1) @binding(3) var<storage, read> hist: array<u32>;
 @group(1) @binding(4) var<storage, read_write> sel_pos: array<u32>;
 @group(1) @binding(5) var<storage, read_write> sel_h: array<f32>;
-@group(1) @binding(6) var<storage, read_write> sel_g: array<u32>;
-@group(1) @binding(7) var<storage, read_write> kept: array<u32>;
-@group(1) @binding(8) var<uniform> p: Params;
+@group(1) @binding(6) var<storage, read_write> sel_k: array<u32>;
+@group(1) @binding(7) var<storage, read_write> sel_g: array<u32>;
+@group(1) @binding(8) var<storage, read_write> kept: array<u32>;
+@group(1) @binding(9) var<uniform> p: Params;
 {KEY_FN}
 var<workgroup> part: array<u32, 256>;
 var<workgroup> cutv: u32;
@@ -262,39 +265,41 @@ var<workgroup> cutv: u32;
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let n = min(atomicLoad(&counters[p.level * 4u]), p.cap);
     let hb = p.level * {BINS}u;
+    // Invocation t holds the chunk 255 - t: the scan runs from the highest bins down.
+    let top = (255u - t) * {CHUNK}u;
     var sum = 0u;
-    for (var k = 0u; k < {CHUNK}u; k++) {{ sum += hist[hb + t * {CHUNK}u + k]; }}
+    for (var k = 0u; k < {CHUNK}u; k++) {{ sum += hist[hb + top + k]; }}
     part[t] = sum;
+    if (t == 0u) {{ cutv = 0u; }}
     workgroupBarrier();
-    if (t == 0u) {{
-        var cut = 0u;
-        if (n > p.best) {{
-            var acc = 0u;
-            for (var c = 0u; c < 256u; c++) {{
-                let ci = 255u - c;
-                if (acc + part[ci] >= p.best) {{
-                    for (var b = 0u; b < {CHUNK}u; b++) {{
-                        let bi = ci * {CHUNK}u + {CHUNK}u - 1u - b;
-                        acc += hist[hb + bi];
-                        if (acc >= p.best) {{ cut = bi; break; }}
-                    }}
-                    break;
-                }}
-                acc += part[ci];
-            }}
-        }}
-        cutv = cut;
-        if (wid.x == 0u && wid.y == 0u) {{ kept[p.level] = min(n, p.best); }}
+    for (var d = 1u; d < 256u; d = d << 1u) {{
+        var add = 0u;
+        if (t >= d) {{ add = part[t - d]; }}
+        workgroupBarrier();
+        part[t] = part[t] + add;
+        workgroupBarrier();
     }}
+    let before = part[t] - sum;
+    if (n > p.best && before < p.best && part[t] >= p.best) {{
+        var acc = before;
+        for (var b = 0u; b < {CHUNK}u; b++) {{
+            let bi = top + {CHUNK}u - 1u - b;
+            acc += hist[hb + bi];
+            if (acc >= p.best) {{ cutv = bi; break; }}
+        }}
+    }}
+    if (t == 0u && wid.x == 0u && wid.y == 0u) {{ kept[p.level] = min(n, p.best); }}
     workgroupBarrier();
     let cut = workgroupUniformLoad(&cutv);
     let stride = nwg.x * nwg.y * 256u;
     for (var g = (wid.x + wid.y * nwg.x) * 256u + t; g < n; g += stride) {{
         let h = cand_h[g];
-        if ((key(h) >> {BIN_SHIFT}u) >= cut) {{
+        let kk = key(h);
+        if ((kk >> {BIN_SHIFT}u) >= cut) {{
             let k = atomicAdd(&counters[p.level * 4u + 1u], 1u);
             sel_pos[k] = cand_pos[g];
             sel_h[k] = h;
+            sel_k[k] = kk;
             sel_g[k] = g;
         }}
     }}
@@ -304,39 +309,52 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 }
 
 /// Exact ranking of the compacted candidates: the first `best` by response, ties by candidate
-/// index. Arguments: compacted positions, responses, indices, counters, kept positions and
-/// responses, uniform `{cap, best, level, 0}`.
+/// index. The candidates are compared in tiles held in workgroup memory. Arguments: compacted
+/// positions, responses, keys, indices, counters, kept positions and responses, uniform
+/// `{cap, best, level, 0}`.
 fn rank_source() -> String {
-    format!(
-        "struct Params {{ cap: u32, best: u32, level: u32, c: u32 }}
+    "struct Params { cap: u32, best: u32, level: u32, c: u32 }
 @group(1) @binding(0) var<storage, read> sel_pos: array<u32>;
 @group(1) @binding(1) var<storage, read> sel_h: array<f32>;
-@group(1) @binding(2) var<storage, read> sel_g: array<u32>;
-@group(1) @binding(3) var<storage, read> counters: array<u32>;
-@group(1) @binding(4) var<storage, read_write> kept_pos: array<u32>;
-@group(1) @binding(5) var<storage, read_write> kept_h: array<f32>;
-@group(1) @binding(6) var<uniform> p: Params;
-{KEY_FN}
+@group(1) @binding(2) var<storage, read> sel_k: array<u32>;
+@group(1) @binding(3) var<storage, read> sel_g: array<u32>;
+@group(1) @binding(4) var<storage, read> counters: array<u32>;
+@group(1) @binding(5) var<storage, read_write> kept_pos: array<u32>;
+@group(1) @binding(6) var<storage, read_write> kept_h: array<f32>;
+@group(1) @binding(7) var<uniform> p: Params;
+var<workgroup> tk: array<u32, 256>;
+var<workgroup> tg: array<u32, 256>;
+var<workgroup> wm: u32;
 @compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
-    let m = counters[p.level * 4u + 1u];
-    let stride = nwg.x * nwg.y * 256u;
-    for (var g = (wid.x + wid.y * nwg.x) * 256u + t; g < m; g += stride) {{
-        let ke = key(sel_h[g]);
-        let ge = sel_g[g];
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    if (t == 0u) { wm = counters[p.level * 4u + 1u]; }
+    workgroupBarrier();
+    let m = workgroupUniformLoad(&wm);
+    let groups = nwg.x * nwg.y;
+    for (var base = (wid.x + wid.y * nwg.x) * 256u; base < m; base += groups * 256u) {
+        let g = base + t;
+        var ke = 0u;
+        var ge = 0u;
+        if (g < m) { ke = sel_k[g]; ge = sel_g[g]; }
         var rank = 0u;
-        for (var f = 0u; f < m; f++) {{
-            let kf = key(sel_h[f]);
-            rank += select(0u, 1u, kf > ke || (kf == ke && sel_g[f] < ge));
-        }}
-        if (rank < p.best) {{
+        for (var tile = 0u; tile < m; tile += 256u) {
+            let f = tile + t;
+            if (f < m) { tk[t] = sel_k[f]; tg[t] = sel_g[f]; } else { tk[t] = 0u; tg[t] = 0xffffffffu; }
+            workgroupBarrier();
+            for (var j = 0u; j < 256u; j++) {
+                let kf = tk[j];
+                rank += select(0u, 1u, kf > ke || (kf == ke && tg[j] < ge));
+            }
+            workgroupBarrier();
+        }
+        if (g < m && rank < p.best) {
             kept_pos[rank] = sel_pos[g];
             kept_h[rank] = sel_h[g];
-        }}
-    }}
-}}
+        }
+    }
+}
 "
-    )
+    .to_string()
 }
 
 /// Orientation and descriptor of the kept corner `workgroup`. Arguments: level image, [blurred
@@ -524,6 +542,7 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
     let sel_pos = Array::<u32>::alloc(ctx, Shape::from(max_cap))?;
     let sel_h = Array::<f32>::alloc(ctx, Shape::from(max_cap))?;
     let sel_g = Array::<u32>::alloc(ctx, Shape::from(max_cap))?;
+    let sel_k = Array::<u32>::alloc(ctx, Shape::from(max_cap))?;
     let kept_pos = Array::<u32>::alloc(ctx, Shape::from(max_keep))?;
     let kept_h = Array::<f32>::alloc(ctx, Shape::from(max_keep))?;
     let hist = Array::<u32>::zeros_on(ctx, Shape::from(n_levels * BINS as usize))?;
@@ -542,6 +561,7 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
         let (sp_pin, sp_bytes) = sel_pos.ready()?;
         let (sh_pin, sh_bytes) = sel_h.ready()?;
         let (sg_pin, sg_bytes) = sel_g.ready()?;
+        let (sk_pin, sk_bytes) = sel_k.ready()?;
         let (kp_pin, kp_bytes) = kept_pos.ready()?;
         let (kh_pin, kh_bytes) = kept_h.ready()?;
         let (hist_pin, hist_bytes) = hist.ready()?;
@@ -588,6 +608,7 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
                 RawArg::read(hist_pin.buffer(), hist_bytes),
                 RawArg::write(sp_pin.buffer(), sp_bytes),
                 RawArg::write(sh_pin.buffer(), sh_bytes),
+                RawArg::write(sk_pin.buffer(), sk_bytes),
                 RawArg::write(sg_pin.buffer(), sg_bytes),
                 RawArg::write(kept_pin.buffer(), kept_bytes),
                 RawArg::Uniform(bytemuck::bytes_of(&p)),
@@ -597,6 +618,7 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
             let args = [
                 RawArg::read(sp_pin.buffer(), sp_bytes),
                 RawArg::read(sh_pin.buffer(), sh_bytes),
+                RawArg::read(sk_pin.buffer(), sk_bytes),
                 RawArg::read(sg_pin.buffer(), sg_bytes),
                 RawArg::read(ct_pin.buffer(), ct_bytes),
                 RawArg::write(kp_pin.buffer(), kp_bytes),
