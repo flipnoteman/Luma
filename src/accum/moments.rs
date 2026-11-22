@@ -182,10 +182,34 @@ impl<W: Wide> AccumulatorBuilder<W> {
 }
 
 /// The state of a stream: count, sum, mean, variance, higher moments, extrema and their indices,
-/// over the whole batch or per position, see the [module documentation](crate::accum).
+/// over the whole batch or per position along chosen axes ([`Fold`]), of the elements a mask
+/// selects or per group label. Batches are folded in with [`push`](Accumulator::push) as they
+/// arrive (nothing is read back, and a batch that is a lazy expression is computed inside the
+/// reduction); states [`merge`](Accumulator::merge), [`reset`](Accumulator::reset) and travel as
+/// bytes ([`to_bytes`](Accumulator::to_bytes)). The guide chapter "Incremental accumulation" has
+/// the overview.
 ///
 /// All methods take `&self` (the state sits behind a lock), so an accumulator can be shared
 /// between threads; pushes from several threads fold in some order.
+///
+/// # Precision
+///
+/// A pushed batch is reduced in `f32` *relative to a pivot* (the running mean of the state), so
+/// the sums are small and their rounding errors small however far from zero the data is, and
+/// the sums are added into a state kept in [`Df32`] (the default) or `f64` ([`Wide`]) arithmetic:
+/// counts are exact to 2^48 (`Df32`) or 2^53 (`f64`) samples and the merge is Chan's pairwise
+/// update, so `1e9` samples do not lose the low digits of the mean or of the variance. What
+/// `f32` rounding remains is that of the batch's own reduction, a few units in the last place of
+/// the spread of the data; [`precise`](AccumulatorBuilder::precise) reduces in the wide type
+/// instead (whole-batch folds only). Integer batches are exact in counts, sums and extrema while
+/// `|x - pivot|` and the batch's partial sums stay below 2^24.
+///
+/// # NaN
+///
+/// With [`NanPolicy::Propagate`] (the default) a NaN or infinity in a position's stream makes its
+/// mean, variance and sum NaN for good, and its minimum and maximum unspecified (backends differ
+/// in what `min` of a NaN gives). [`NanPolicy::Skip`] leaves NaN elements out of every statistic,
+/// as if the mask of `push_where` were false there.
 ///
 /// ```no_run
 /// use luma::{Accumulator, Array, Fold};

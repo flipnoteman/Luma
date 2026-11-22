@@ -34,6 +34,9 @@
 //! * **Custom kernels**: [`Kernel`] runs your own WGSL on arrays, in the same batch.
 //! * **GPU timing**: [`Context::profile`] measures the GPU time per kernel where the adapter
 //!   supports timestamp queries.
+//! * **Incremental accumulation**: [`Accumulator`], [`CoMoments`], [`Covariance`], [`Histogram`],
+//!   [`Histogram2d`] and [`TopK`] fold batches that arrive over time into mergeable states on the
+//!   GPU; see the guide chapter "Incremental accumulation".
 
 // wgpu's handle types nest deeply; proving `Context: Sync` for the global default context
 // exceeds the default limit on recent nightlies (future-compat lint

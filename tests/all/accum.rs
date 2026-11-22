@@ -1023,3 +1023,24 @@ fn a_pushed_expression_is_computed_inside_the_reduction() {
     // it is; unprofiled, the reductions of a push share a kernel.)
     assert!(profile.launches() <= 12, "a push is a few small launches, not {}", profile.launches());
 }
+
+#[test]
+fn integer_streams_give_a_confusion_matrix() {
+    // Labels and predictions in 0..5: a joint histogram with one bin per class is the confusion matrix.
+    const C: usize = 5;
+    let truth: Vec<u32> = (0..3000).map(|i| ((i * 7 + i / 11) % C) as u32).collect();
+    let guess: Vec<u32> = truth.iter().enumerate().map(|(i, &t)| if i % 4 == 0 { (t + 1) % C as u32 } else { t }).collect();
+    let joint = Histogram2d::<Df32>::new((C, C), (0.0, C as f32), (0.0, C as f32)).unwrap();
+    for (t, g) in truth.chunks(700).zip(guess.chunks(700)) {
+        joint.push(&Array::from_slice(t, t.len()).unwrap(), &Array::from_slice(g, g.len()).unwrap()).unwrap();
+    }
+    let mut want = vec![0.0; C * C];
+    for (&t, &g) in truth.iter().zip(&guess) {
+        want[t as usize + C * g as usize] += 1.0;
+    }
+    assert_eq!(read(joint.counts()), want);
+    assert_eq!(read(joint.outside()), vec![0.0]);
+    // Accuracy from the diagonal.
+    let diagonal: f64 = (0..C).map(|c| want[c + C * c]).sum();
+    assert!(diagonal / 3000.0 > 0.7);
+}
