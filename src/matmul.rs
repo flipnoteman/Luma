@@ -424,9 +424,7 @@ fn native_plan(m: u32, n: u32, k: u32, cores: u32, transposed: [bool; 2], max_gr
 static OWN_F32_KERNELS_OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("LUMA_OWN_GEMM").is_ok_and(|v| v.trim() == "off"));
 
 /// Tiles per multiprocessor a tensor-core product aims for.
-const TENSOR_TILES_PER_SM: u32 = 2;
-/// Tiles per multiprocessor an `f32` product of the backend's own kernels aims for.
-const EXACT_TILES_PER_SM: u32 = 2;
+const GEMM_HALF_TILES_PER_SM: u32 = 4;
 /// Smallest `M`, `N` and `K` of a product of the backend's own kernels (below it the tiles are
 /// mostly padding).
 const GEMM_MIN_EXTENT: usize = 32;
@@ -453,29 +451,90 @@ fn stored_operand(array: &Array<f32>) -> bool {
     }
 }
 
+/// Output tiles below which a long K of an `f32` product of the backend's own kernels is split
+/// (a count for the 82 multiprocessors of an RTX 3090, see [`Tuning::scaled_up`]), the workgroups
+/// it aims for and the shortest slice. `32 x 4096 x 4096` (the weights of a small batch) takes
+/// 0.16 ms split in 4 slices of 1024 by the shader kernels and 0.23 ms in 4 of 32 x 64 tiles;
+/// `128 x 262144 x 128` 0.63 ms with 1024 workgroups, 1.4 with 124.
+const F32_SPLIT_TILES: u32 = 128;
+const F32_SPLIT_GROUPS: u32 = 1024;
+const F32_SPLIT_MIN_SLICE: u32 = 512;
+/// Shortest K that is split.
+const F32_SPLIT_MIN_K: u32 = 4096;
+
+/// The slices an `f32` product of `tiles` output tiles over `k` is split into and their length.
+fn f32_split(tuning: &Tuning, tiles: u32, k: u32, bytes: u64, max_bytes: u64) -> Option<(u32, u32)> {
+    if tiles >= tuning.scaled_up(F32_SPLIT_TILES) || k < F32_SPLIT_MIN_K {
+        return None;
+    }
+    let wanted = tuning.scaled_up(F32_SPLIT_GROUPS).div_ceil(tiles).min(k / F32_SPLIT_MIN_SLICE);
+    if wanted < 2 {
+        return None;
+    }
+    let kc = k.div_ceil(wanted).next_multiple_of(SLICE);
+    let slices = k.div_ceil(kc);
+    (slices >= 2 && u64::from(slices) * bytes <= max_bytes).then_some((slices, kc))
+}
+
+/// The rate of an `f32` kernel of `tile` (relative to the largest, at full occupancy) times the
+/// share of the device `workgroups` of it fill and the share of its outputs that are not padding.
+/// Measured on an RTX 3090 at 4096^3: 64 x 128 22.9 TFLOP/s, 128 x 64 and 64 x 64 21.8, 64 x 32 and
+/// 32 x 64 16.5-17.3, 32 x 32 13.8 (an RTX 3080 Laptop: 9.3, 8.3-8.8, 6.0-6.7, 5.2); a workgroup is
+/// 4 warps up to 128 x 64, else 2, and it takes about 8 resident warps per multiprocessor to keep
+/// the multiply-add units busy (a 1024^3 product with 128 tiles of 64 x 128 runs at 18.5, with 256
+/// of 64 x 64 at 16.8, with 256 of 32 x 32 at 12.5, with 64 of 64 x 128 at 6.5).
+fn f32_tile_rate(tile: (u32, u32), workgroups: u32, units: u32, useful: f64) -> f64 {
+    let area = tile.0 * tile.1;
+    let (rate, warps) = match area {
+        8192.. => (1.0, 4.0),
+        4096.. => (0.95, 2.0),
+        2048.. => (0.74, 2.0),
+        _ => (0.6, 2.0),
+    };
+    rate * useful * (f64::from(workgroups) * warps / (f64::from(units.max(1)) * 8.0)).min(1.0)
+}
+
 /// The plan of an `m x k` by `k x n` product on the backend's own kernels (tensor cores, or with
-/// `exact` the ordinary cores) on `units` multiprocessors with one of `tiles` (largest first):
-/// the largest tile that gives `per_sm` tiles per multiprocessor, else the smallest; few tiles
-/// over a long K split K (see [`native_plan`]).
+/// `exact` the ordinary cores) with one of `tiles` (largest first). Tensor-core tiles: the largest
+/// that gives `half_per_sm` half tiles per multiprocessor, else the smallest; few tiles over a
+/// long K split K (see [`native_plan`]). `f32` tiles: the one with the best rate, K split as
+/// [`f32_split`] says (see [`f32_tile_rate`]).
 #[allow(clippy::too_many_arguments)]
-fn gemm_plan(m: u32, n: u32, k: u32, units: u32, per_sm: u32, tiles: &[(u32, u32)], transposed: [bool; 2], exact: bool, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
-    let per_sm = if exact { std::env::var("LUMA_SG_PERSM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(per_sm) } else { per_sm };
-    let wanted = units.max(1).saturating_mul(per_sm);
+fn gemm_plan(m: u32, n: u32, k: u32, tuning: &Tuning, half_per_sm: u32, tiles: &[(u32, u32)], transposed: [bool; 2], exact: bool, max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    let units = tuning.compute_units;
+    let wanted = units.max(1).saturating_mul(half_per_sm).div_ceil(2);
     let count = |&(rows, cols): &(u32, u32)| m.div_ceil(rows).saturating_mul(n.div_ceil(cols));
-    let forced = std::env::var("LUMA_SG_TILE").ok().and_then(|v| {
-        let parts: Vec<u32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
-        if let [rows, cols] = parts[..] { Some((rows, cols)) } else { None }
-    });
-    let (rows, cols) = forced.or_else(|| tiles.iter().find(|tile| count(tile) >= wanted).or(tiles.last()).copied()).unwrap_or((128, 128));
+    let out_bytes = u64::from(m) * u64::from(n) * 4;
+    let pick = || {
+        if !exact {
+            return tiles.iter().find(|tile| count(tile) >= wanted).or(tiles.last()).copied();
+        }
+        tiles
+            .iter()
+            .copied()
+            .fold(None::<((u32, u32), f64)>, |best, tile| {
+                let tile_count = count(&tile);
+                let slices = f32_split(tuning, tile_count, k, out_bytes, max_bytes).map_or(1, |(slices, _)| slices);
+                let useful = f64::from(m) * f64::from(n) / (f64::from(tile_count) * f64::from(tile.0 * tile.1));
+                let rate = f32_tile_rate(tile, tile_count.saturating_mul(slices), units, useful);
+                if best.is_none_or(|(_, top)| rate > top * 1.0001) { Some((tile, rate)) } else { best }
+            })
+            .map(|(tile, _)| tile)
+    };
+    let (rows, cols) = pick().unwrap_or((128, 128));
     let (columns, row_tiles) = (n.div_ceil(cols), m.div_ceil(rows));
     let tile_count = columns.saturating_mul(row_tiles);
-    let split = (tile_count < wanted && k >= 2 * NATIVE_SPLIT_SLICE).then(|| {
-        let kc = k.div_ceil(wanted.div_ceil(tile_count).min(k / NATIVE_SPLIT_SLICE)).next_multiple_of(SLICE);
-        (k.div_ceil(kc), kc)
-    });
-    let (slices, kc) = split
-        .filter(|&(slices, _)| slices >= 2 && u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes)
-        .unwrap_or((1, k));
+    let split = if exact {
+        f32_split(tuning, tile_count, k, out_bytes, max_bytes)
+    } else {
+        (tile_count < wanted && k >= 2 * NATIVE_SPLIT_SLICE)
+            .then(|| {
+                let kc = k.div_ceil(wanted.div_ceil(tile_count).min(k / NATIVE_SPLIT_SLICE)).next_multiple_of(SLICE);
+                (k.div_ceil(kc), kc)
+            })
+            .filter(|&(slices, _)| slices >= 2 && u64::from(slices) * out_bytes <= max_bytes)
+    };
+    let (slices, kc) = split.unwrap_or((1, k));
     let groups = [columns, row_tiles, slices];
     if groups.iter().any(|&count| count > max_groups) {
         return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
@@ -608,8 +667,7 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Outcome<Array<f32>> {
     let too_large = |extent: usize| u32::try_from(extent).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: [n, m, 1, 1] }));
     let (m32, n32, k32) = (too_large(m)?, too_large(n)?, too_large(k)?);
     let mut plan = if !tiles.is_empty() {
-        let per_sm = if exact { EXACT_TILES_PER_SM } else { TENSOR_TILES_PER_SM };
-        gemm_plan(m32, n32, k32, ctx.tuning().compute_units, per_sm, tiles, transposed, exact, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
+        gemm_plan(m32, n32, k32, ctx.tuning(), GEMM_HALF_TILES_PER_SM, tiles, transposed, exact, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     } else if cores > 0 {
         native_plan(m32, n32, k32, cores, transposed, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     } else {
@@ -1425,7 +1483,7 @@ mod tests {
     #[test]
     fn a_tensor_plan_picks_the_largest_tile_that_fills_the_device() {
         const TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
-        let plan = |m, n, k, transposed| gemm_plan(m, n, k, 82, 2, &TILES, transposed, false, 65535, u64::MAX).unwrap();
+        let plan = |m, n, k, transposed| gemm_plan(m, n, k, &Tuning::for_tests(), 4, &TILES, transposed, false, 65535, u64::MAX).unwrap();
         let tensor = |rows, cols| MatmulTile::Gemm { rows, cols, lhs_t: false, rhs_t: false, exact: false };
         // Two tiles per multiprocessor, the largest tile that gets them.
         let p = plan(4096, 4096, 4096, [false; 2]);
@@ -1442,9 +1500,32 @@ mod tests {
         assert_eq!((p.tile, p.groups[..2].to_vec()), (tensor(64, 64), vec![1, 1]));
         assert!(p.slices >= 2 && p.kc % SLICE == 0 && p.slices * p.kc >= 1 << 20 && (p.slices - 1) * p.kc < 1 << 20, "{p:?}");
         // The partial sums must fit a buffer.
-        assert_eq!(gemm_plan(64, 64, 1 << 20, 82, 2, &TILES, [false; 2], false, 65535, 1000).unwrap().slices, 1);
+        assert_eq!(gemm_plan(64, 64, 1 << 20, &Tuning::for_tests(), 4, &TILES, [false; 2], false, 65535, 1000).unwrap().slices, 1);
         // The transposed operands are the tile's.
         let p = plan(4096, 4096, 4096, [true, false]);
         assert_eq!(p.tile, MatmulTile::Gemm { rows: 128, cols: 128, lhs_t: true, rhs_t: false, exact: false });
+    }
+
+    #[test]
+    fn an_f32_gemm_plan_picks_the_tile_with_the_best_predicted_rate() {
+        const TILES: [(u32, u32); 6] = [(64, 128), (128, 64), (64, 64), (64, 32), (32, 64), (32, 32)];
+        let plan = |m, n, k, units: u32| gemm_plan(m, n, k, &Tuning { compute_units: units, ..Tuning::for_tests() }, GEMM_HALF_TILES_PER_SM, &TILES, [false; 2], true, 65535, u64::MAX).unwrap();
+        let tile = |rows, cols| MatmulTile::Gemm { rows, cols, lhs_t: false, rhs_t: false, exact: true };
+        assert_eq!(plan(4096, 4096, 4096, 82).tile, tile(64, 128));
+        // 128 tiles of 64 x 128 fill 78 % of the device, 256 of 64 x 64 78 % at 95 % of the rate.
+        let p = plan(1024, 1024, 1024, 82);
+        assert_eq!((p.tile, p.groups), (tile(64, 128), [8, 16, 1]));
+        // On 48 multiprocessors the same product gets the same tile; 256 x 1024 outputs take the smallest.
+        assert_eq!(plan(1024, 1024, 1024, 48).tile, tile(64, 128));
+        assert_eq!(plan(256, 1024, 1024, 82).tile, tile(32, 32));
+        // Few outputs and a short K: the smallest tile, never split below 2048.
+        let p = plan(2048, 64, 2048, 82);
+        assert_eq!((p.tile, p.slices), (tile(32, 32), 1));
+        // Long K over few outputs splits to about a thousand workgroups, a few times the multiprocessors' worth.
+        assert!(plan(64, 64, 1 << 20, 82).slices > 1);
+        let p = plan(32, 4096, 4096, 82);
+        assert!(p.slices >= 4 && p.groups.iter().product::<u32>() >= 256, "{p:?}");
+        let p = plan(128, 128, 1 << 18, 82);
+        assert!(p.groups.iter().product::<u32>() >= 900, "{p:?}");
     }
 }

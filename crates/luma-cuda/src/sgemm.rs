@@ -36,14 +36,12 @@ pub(crate) struct Config {
     pub rhs_t: bool,
     /// Rows of tiles a group of consecutive workgroups covers (0: row-major order).
     pub group: u32,
-    /// Workgroups per multiprocessor the registers are limited to fit (0: no limit).
-    pub min_ctas: u32,
-    /// Whether the fragments of step `k + 1` are loaded before the multiply-adds of step `k`.
-    pub prefetch: bool,
 }
 
-/// The tiles of the kernels, largest first: `(rows, cols)`.
-pub(crate) const TILES: [(u32, u32); 7] = [(128, 128), (128, 64), (64, 128), (64, 64), (64, 32), (32, 64), (32, 32)];
+/// The tiles of the kernels the planner picks from, largest first: `(rows, cols)`. A 128 x 128 tile
+/// (256 threads) is no faster than 64 x 128 on an RTX 3090 or an RTX 3080 Laptop, and fills the
+/// device later.
+pub(crate) const TILES: [(u32, u32); 6] = [(64, 128), (128, 64), (64, 64), (64, 32), (32, 64), (32, 32)];
 
 impl Config {
     pub(crate) fn of(spec: &GemmSpec) -> Config {
@@ -58,21 +56,11 @@ impl Config {
             (32, 32) => (4, 4, 1, 2),
             (rows, cols) => panic!("no f32 kernel of {rows}x{cols}"),
         };
-        // Debug: a thread owns 8 x 16 outputs (a warp covers 64 x 64) in the big tile.
-        let (tm, tn, wm, wn) = if (spec.rows, spec.cols) == (128, 128) && std::env::var_os("LUMA_SG_WIDE").is_some() { (8, 16, 2, 2) } else { (tm, tn, wm, wn) };
-        let mut config = Config { bm: spec.rows, bn: spec.cols, tm, tn, wm, wn, stages: 3, bk: 8, lhs_t: spec.lhs_transposed, rhs_t: spec.rhs_transposed, group: 8, min_ctas: 0, prefetch: true };
-        if let Ok(text) = std::env::var("LUMA_SG_CFG") {
-            // Debug override: `stages,bk,group,min_ctas,prefetch`.
-            let parts: Vec<u32> = text.split(',').filter_map(|p| p.trim().parse().ok()).collect();
-            if let [s, k, g, c, f] = parts[..] {
-                config.stages = s;
-                config.bk = k;
-                config.group = g;
-                config.min_ctas = c;
-                config.prefetch = f != 0;
-            }
-        }
-        config
+        // 16 `k` per stage halves the copy instructions per multiply-add: faster for the tiles that
+        // read `B` along `n` and for the smallest one (a short K); 8 where the transposing copies
+        // of `B` or a 64-thread workgroup's registers make the deeper stage lose.
+        let bk = if (spec.rows, spec.cols) == (32, 32) || ((spec.rows, spec.cols) == (64, 128) && !spec.rhs_transposed) { 16 } else { 8 };
+        Config { bm: spec.rows, bn: spec.cols, tm, tn, wm, wn, stages: 3, bk, lhs_t: spec.lhs_transposed, rhs_t: spec.rhs_transposed, group: 8 }
     }
 
     pub(crate) fn threads(&self) -> u32 {
@@ -177,7 +165,7 @@ fn setup(w: &mut Ptx, o: &Operand, threads: u32, bk: u32) {
 
 /// The PTX of the kernel `main` for `config`.
 pub(crate) fn ptx(config: &Config) -> String {
-    let Config { bm, bn, tm, tn, wm: _, wn, stages, bk, lhs_t, rhs_t, group, min_ctas, prefetch } = *config;
+    let Config { bm, bn, tm, tn, wm: _, wn, stages, bk, lhs_t, rhs_t, group } = *config;
     assert!(bk == 8 || bk == 16);
     let threads = config.threads();
     let (warp_rows, warp_cols) = (8 * tm, 4 * tn);
@@ -195,9 +183,6 @@ pub(crate) fn ptx(config: &Config) -> String {
     w.text.push_str(".extern .shared .align 16 .b8 smem[];\n\n");
     w.text.push_str(".visible .entry main(\n    .param .align 4 .b8 luma[16],\n    .param .u64 luma_indirect,\n    .param .u64 pc,\n    .param .u64 pa,\n    .param .u64 pb,\n    .param .align 16 .b8 pu[16]\n)\n");
     w.text.push_str(&format!(".maxntid {threads}, 1, 1\n"));
-    if min_ctas > 0 {
-        w.text.push_str(&format!(".minnctapersm {min_ctas}\n"));
-    }
     w.text.push_str("{\n    .reg .pred %p<16>;\n    .reg .b32 %r<80>;\n    .reg .b64 %rd<64>;\n");
     w.text.push_str(&format!("    .reg .f32 %c<{}>;\n", tm * tn));
     for buffer in 0..2 {
@@ -386,16 +371,10 @@ pub(crate) fn ptx(config: &Config) -> String {
             p!(w, "ld.shared.v4.f32 {{%fb{set}x{}, %fb{set}x{}, %fb{set}x{}, %fb{set}x{}}}, [%r22+{off}];", r, r + 1, r + 2, r + 3);
         }
     };
-    if prefetch {
-        frags(&mut w, 0);
-    }
+    frags(&mut w, 0);
     for kk in 0..bk {
-        if prefetch {
-            if kk + 1 < bk {
-                frags(&mut w, kk + 1);
-            }
-        } else {
-            frags(&mut w, kk);
+        if kk + 1 < bk {
+            frags(&mut w, kk + 1);
         }
         let set = kk % 2;
         for i in 0..tm {
@@ -460,7 +439,7 @@ mod tests {
 
     #[test]
     fn every_tile_and_layout_generates_a_kernel() {
-        for (rows, cols) in TILES {
+        for (rows, cols) in TILES.into_iter().chain([(128, 128)]) {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, false), (false, true), (true, true)] {
                 let config = Config::of(&GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact: true });
                 let text = ptx(&config);

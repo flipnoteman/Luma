@@ -88,11 +88,11 @@ fn shape_case(h: &mut Harness, m: usize, k: usize, n: usize, layout: u8) {
     let transpose = |d: &[f32], rows: usize, cols: usize| -> Vec<f32> { (0..rows * cols).map(|i| d[(i % rows) * cols + i / rows]).collect() };
     let (a, b, at, bt) = (upload(h, &ad, [k, m]), upload(h, &bd, [n, k]), upload(h, &transpose(&ad, m, k), [m, k]), upload(h, &transpose(&bd, k, n), [k, n]));
     let run = || match layout {
-        0 => a.matmul(&b),
-        1 => a.matmul(&bt.transpose()),
-        _ => at.transpose().matmul(&b),
+        0 => a.matmul_f32(&b),
+        1 => a.matmul_f32(&bt.transpose()),
+        _ => at.transpose().matmul_f32(&b),
     };
-    verify("matmul/shape", &host(&run()), &ad, &bd, m, k, n, false);
+    verify("matmul/shape", &host(&run()), &ad, &bd, m, k, n, false, false);
     h.case("matmul/shape", &format!("{name} {m}x{k}x{n}"), Work::Flops(2.0 * (m * k * n) as f64), &mut || run().eval().unwrap());
 }
 
