@@ -78,28 +78,32 @@ fn each(f: impl Fn(usize) -> String) -> String {
     (0..ROWS).map(f).collect()
 }
 
-/// A block (or the stack of `R`s, `merge`) factored in registers: see the module docs. Only the
-/// first group of 32 rows holds the diagonal of the column being reduced, the others need no
-/// masks; the Householder vectors stay unscaled (`raw`) in their column until the end, when every
-/// lane multiplies its column by the `1 / (alpha - beta)` it kept.
+/// A block (or the stack of `R`s, `merge`) factored in registers: see the module docs. A thread
+/// `(g, c)` holds rows `g + G r` of column `c`: the diagonal of the column being reduced only
+/// reaches the first `32 / G` registers, every other row needs no masks. The Householder vectors
+/// stay unscaled (`raw`) in their column until the end, when every lane multiplies its column by
+/// the `1 / (alpha - beta)` it kept.
 fn factor_source(groups: usize, merge: bool) -> String {
     let bs = groups * 32;
+    let r0 = 32usize.div_ceil(groups);
+    let ri = |r: usize| format!("ri{r}");
     let prologue = if merge {
         let rows = each(|r| {
             format!(
-                "    if (c < w && ai < p.k && c >= rr) {{ let gi = ai * p.bs + rr; if (gi < p.m) {{ x{r} = ld(gi, c); }} }}\n    rr = rr + 1u; if (rr == w) {{ rr = 0u; ai = ai + 1u; }}\n"
+                "    {{ let l = {r}u * {groups}u + g; let ai = l / w; let rr = l - ai * w; if (c < w && ai < p.k && c >= rr) {{ let gi = ai * p.bs + rr; if (gi < p.m) {{ x{r} = ld(gi, c); }} }} }}\n"
             )
         });
-        format!("    let nrows = p.k * w;\n    let out0 = 0u;\n    var ai = lb / w;\n    var rr = lb - ai * w;\n{rows}")
+        format!("    let nrows = p.k * w;\n    let out0 = 0u;\n{rows}")
     } else {
-        let rows = each(|r| format!("        if (lb + {r}u < nrows) {{ x{r} = ld(row0 + lb + {r}u, c); }}\n"));
+        let rows = each(|r| format!("        if ({r}u * {groups}u + g < nrows) {{ x{r} = ld(row0 + {r}u * {groups}u + g, c); }}\n"));
         format!("    let row0 = blk * p.bs;\n    let nrows = min(p.bs, p.m - row0);\n    let out0 = row0;\n    if (c < w) {{\n{rows}    }}\n")
     };
     let decl = each(|r| format!("    var x{r} = 0.0;\n"));
-    let owner = (0..ROWS)
-        .map(|r| format!("                let y{r} = select(0.0, x{r}, {r}u > j);\n                sq{} = fma(y{r}, y{r}, sq{});\n                ap = ap + select(0.0, x{r}, {r}u == j);\n", r % 2, r % 2))
+    let rows = (0..r0).map(|r| format!("    let ri{r} = {}u + g;\n", r * groups)).collect::<String>();
+    let owner_masked = (0..r0)
+        .map(|r| format!("            let y{r} = select(0.0, x{r}, {} > j);\n            sq{} = fma(y{r}, y{r}, sq{});\n            ap = ap + select(0.0, x{r}, {} == j);\n", ri(r), r % 2, r % 2, ri(r)))
         .collect::<String>();
-    let owner_plain = (0..ROWS).map(|r| format!("                sq{} = fma(x{r}, x{r}, sq{});\n", r % 2, r % 2)).collect::<String>();
+    let owner_plain = (r0..ROWS).map(|r| format!("            sq{} = fma(x{r}, x{r}, sq{});\n", r % 2, r % 2)).collect::<String>();
     let publish = (0..ROWS / 4)
         .map(|q| format!("            vs[g * 8u + {q}u] = vec4<f32>(x{}, x{}, x{}, x{});\n", 4 * q, 4 * q + 1, 4 * q + 2, 4 * q + 3))
         .collect::<String>();
@@ -114,10 +118,9 @@ fn factor_source(groups: usize, merge: bool) -> String {
         acc + "        let xn2 = (xs0 + xs1) + (xs2 + xs3);\n"
     };
     let raws = (0..ROWS / 4).map(|q| format!("        let raw{q} = vs[g * 8u + {q}u];\n")).collect::<String>();
-    // The unit-scaled `v` of a row of the first group (masked) and the plain `raw` rows of the others.
-    let u = |r: usize| format!("select(select(0.0, 1.0, {r}u == j), raw{}[{}] * inv, {r}u > j)", r / 4, r % 4);
-    let dots = (0..ROWS).map(|r| format!("            d{} = fma({}, x{r}, d{});\n", r % 4, u(r), r % 4)).collect::<String>();
-    let dots_plain = (0..ROWS).map(|r| format!("            d{} = fma(raw{}[{}], x{r}, d{});\n", r % 4, r / 4, r % 4, r % 4)).collect::<String>();
+    let u = |r: usize| format!("select(select(0.0, 1.0, {} == j), raw{}[{}] * inv, {} > j)", ri(r), r / 4, r % 4, ri(r));
+    let dots_masked = (0..r0).map(|r| format!("        dm = fma({}, x{r}, dm);\n", u(r))).collect::<String>();
+    let dots_plain = (r0..ROWS).map(|r| format!("        d{} = fma(raw{}[{}], x{r}, d{});\n", r % 4, r / 4, r % 4, r % 4)).collect::<String>();
     let gsum = {
         let mut acc = String::new();
         for a in 0..4 {
@@ -128,11 +131,12 @@ fn factor_source(groups: usize, merge: bool) -> String {
         }
         acc + "        let s = (ss0 + ss1) + (ss2 + ss3);\n"
     };
-    let apply = (0..ROWS).map(|r| format!("                x{r} = fma(-wc, {}, x{r});\n", u(r))).collect::<String>();
-    let apply_plain = each(|r| format!("                x{r} = fma(-wi, raw{}[{}], x{r});\n", r / 4, r % 4));
-    let pivot = each(|r| format!("                x{r} = select(x{r}, beta, {r}u == j);\n"));
-    let scale = (0..ROWS).map(|r| format!("        x{r} = select(x{r}, x{r} * myinv, {r}u > c);\n")).collect::<String>();
-    let scale_plain = each(|r| format!("        x{r} = x{r} * myinv;\n"));
+    let apply_masked = (0..r0).map(|r| format!("            x{r} = fma(-wc, {}, x{r});\n", u(r))).collect::<String>();
+    let apply_plain = (r0..ROWS).map(|r| format!("            x{r} = fma(-wi, raw{}[{}], x{r});\n", r / 4, r % 4)).collect::<String>();
+    let pivot = (0..r0).map(|r| format!("            x{r} = select(x{r}, beta, {} == j);\n", ri(r))).collect::<String>();
+    let scale = (0..ROWS)
+        .map(|r| if r < r0 { format!("    x{r} = select(x{r}, x{r} * myinv, {} > c);\n", ri(r)) } else { format!("    x{r} = x{r} * myinv;\n") })
+        .collect::<String>();
     let tdecl = each(|r| format!("        var tr{r} = 0.0;\n"));
     let tcols = (0..ROWS)
         .map(|j| {
@@ -142,7 +146,7 @@ fn factor_source(groups: usize, merge: bool) -> String {
             )
         })
         .collect::<String>();
-    let stores = each(|r| format!("    if (lb + {r}u < nrows && c < w) {{ f[(out0 + lb + {r}u) * w + c] = x{r}; }}\n"));
+    let stores = each(|r| format!("    if ({r}u * {groups}u + g < nrows && c < w) {{ f[(out0 + {r}u * {groups}u + g) * w + c] = x{r}; }}\n"));
     let src = "struct Params { m: u32, w: u32, k: u32, bs: u32 }
 @group(1) @binding(0) var<storage, read> a: array<f32>;
 @group(1) @binding(1) var<uniform> av: LumaView;
@@ -165,18 +169,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let blk = wid.x;
     let g = t / 32u;
     let c = t % 32u;
-    let lb = g * 32u;
     var myinv = 0.0;
-@DECL@@PROLOGUE@
+@ROWS@@DECL@@PROLOGUE@
     for (var j = 0u; j < w; j = j + 1u) {
         if (c == j) {
             var sq0 = 0.0;
             var sq1 = 0.0;
-            if (g == 0u) {
-                var ap = 0.0;
-@OWNER@                alphas = ap;
-            } else {
-@OWNERP@            }
+            var ap = 0.0;
+@OWNERM@@OWNERP@            if (g == j % @G@u) { alphas = ap; }
 @PUBLISH@            redq[g] = sq0 + sq1;
         }
         workgroupBarrier();
@@ -194,35 +194,21 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         var d1 = 0.0;
         var d2 = 0.0;
         var d3 = 0.0;
-        if (g == 0u) {
-@DOTS@        } else {
-@DOTSP@            d0 = d0 * inv;
-            d1 = d1 * inv;
-            d2 = d2 * inv;
-            d3 = d3 * inv;
-        }
-        part[g * 32u + c] = (d0 + d1) + (d2 + d3);
+        var dm = 0.0;
+@DOTSP@@DOTSM@        part[g * 32u + c] = fma((d0 + d1) + (d2 + d3), inv, dm);
         workgroupBarrier();
 @GSUM@        if (c > j) {
             let wc = tj * s;
-            if (g == 0u) {
-@APPLY@            } else {
-                let wi = wc * inv;
-@APPLYP@            }
-        }
+            let wi = wc * inv;
+@APPLYM@@APPLYP@        }
         if (c == j) {
             myinv = inv;
-            if (g == 0u) {
-@PIVOT@            }
-        }
+@PIVOT@        }
         if (g == 0u) { dds[j * 32u + c] = s * myinv; }
         if (t == 0u) { tauv[j] = tj; }
     }
     workgroupBarrier();
-    if (g == 0u) {
-@SCALE@    } else {
-@SCALEP@    }
-    if (t < 32u && t < w) {
+@SCALE@    if (t < 32u && t < w) {
         let ta = t;
 @TDECL@@TCOLS@    }
 @STORES@}
@@ -231,20 +217,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         .replace("@B@", &bs.to_string())
         .replace("@GP@", &(groups * 32).to_string())
         .replace("@G@", &groups.to_string())
+        .replace("@ROWS@", &rows)
         .replace("@DECL@", &decl)
         .replace("@PROLOGUE@", &prologue)
+        .replace("@OWNERM@", &owner_masked)
         .replace("@OWNERP@", &owner_plain)
-        .replace("@OWNER@", &owner)
         .replace("@PUBLISH@", &publish)
         .replace("@SUMS@", &sums)
         .replace("@RAWS@", &raws)
         .replace("@DOTSP@", &dots_plain)
-        .replace("@DOTS@", &dots)
+        .replace("@DOTSM@", &dots_masked)
         .replace("@GSUM@", &gsum)
+        .replace("@APPLYM@", &apply_masked)
         .replace("@APPLYP@", &apply_plain)
-        .replace("@APPLY@", &apply)
         .replace("@PIVOT@", &pivot)
-        .replace("@SCALEP@", &scale_plain)
         .replace("@SCALE@", &scale)
         .replace("@TDECL@", &tdecl)
         .replace("@TCOLS@", &tcols)
