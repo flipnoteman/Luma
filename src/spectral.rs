@@ -198,7 +198,7 @@ fn too_large(n: usize) -> LumaError {
 pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_>) -> Result<(), LumaError> {
     let (outer, n, inner) = (job.outer, job.n, job.inner);
     let total = u64::from(outer) * u64::from(n) * u64::from(inner);
-    if total > u64::from(u32::MAX) / 2 || n >= 1 << 28 {
+    if total > u64::from(u32::MAX) / 2 || n >= 1 << 26 {
         return Err(too_large(total as usize));
     }
     let tile = tile_elems(ctx);
@@ -260,6 +260,7 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
             store_table: if last { job.store_table.map_or(Table::None, |t| t.2) } else { Table::None },
             store_limit: last && job.n_out.is_some(),
             post,
+            unit_inner: inner == 1,
         };
         let out_rs = if low > 1 {
             1
@@ -270,7 +271,7 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
         };
         let prodh = low / 2 + 1;
         let tpo = prodh.div_ceil((cols / 2).max(1));
-        let params = Params {
+        let mut params = Params {
             tiles: if post { outer * tpo } else { rows.div_ceil(cols) },
             rows,
             j,
@@ -294,8 +295,9 @@ pub(crate) fn run_lines(ctx: &Context, scratch: &mut Scratch<'_>, job: &Lines<'_
             mrs: u32::from(low == 1 && mid > 1),
             tpo,
             prodh,
-            pad: 0,
+            inv8: 0.0,
         };
+        params.inv8 = (8.0 / f64::from(params.den)) as f32;
         let kernel = ctx.builtin(Builtin::Dft(pass), "f32")?;
         let src = if first { job.src } else { mids[i - 1] };
         let dst = if last { job.dst } else { mids[i] };

@@ -93,6 +93,8 @@ pub(crate) struct DftPass {
     /// the values `Z[nat]` and `Z[h - nat]` are both in workgroup memory, and the pass writes the
     /// half spectrum `X[nat] = E + W^nat O` (`h + 1` values) instead of `Z`.
     pub(crate) post: bool,
+    /// The inner batch is 1 (a constant in the kernel, not a parameter).
+    pub(crate) unit_inner: bool,
 }
 
 impl DftPass {
@@ -148,7 +150,8 @@ pub(crate) struct Params {
     /// mirror `low - l`.
     pub(crate) tpo: u32,
     pub(crate) prodh: u32,
-    pub(crate) pad: u32,
+    /// `8 / den`, for the twiddles.
+    pub(crate) inv8: f32,
 }
 
 /// The `f32` literal for `x`.
@@ -285,10 +288,10 @@ fn stage(pass: &DftPass, s: usize) -> String {
         // Twiddles of the block: w^k for the k-th output, e^(-2 pi i pp k / n).
         if r <= 4 {
             for k in 1..r {
-                let _ = writeln!(body, "let w{k} = tw(pp * {k}u, {n}u);");
+                let _ = writeln!(body, "let w{k} = tw(pp * {k}u, {n}u, {}f);", lit(8.0 / f64::from(n)));
             }
         } else {
-            let _ = writeln!(body, "let w1 = tw(pp, {n}u);");
+            let _ = writeln!(body, "let w1 = tw(pp, {n}u, {}f);", lit(8.0 / f64::from(n)));
             for k in 2..r {
                 let _ = writeln!(body, "let w{k} = cmul(w{}, w{});", k / 2, k - k / 2);
             }
@@ -315,7 +318,7 @@ fn load_value(pass: &DftPass) -> String {
         LoadKind::Complex => "v = src[gi];".to_string(),
         LoadKind::Real => "v = vec2<f32>(src[gi], 0.0);".to_string(),
         LoadKind::RealPair => {
-            "let u = gi - ob * p.in_os; let ii = u % p.inner;\nlet i0 = 2u * ob * p.in_os + 2u * u - ii;\nv = vec2<f32>(src[i0], src[i0 + p.inner]);".to_string()
+            "let u = gi - ob * p.in_os; let ii = u % INNER;\nlet i0 = 2u * ob * p.in_os + 2u * u - ii;\nv = vec2<f32>(src[i0], src[i0 + INNER]);".to_string()
         }
         LoadKind::HalfSpectrum => {
             let (a, b) = if pass.load_table == Table::Slab {
@@ -326,13 +329,13 @@ fn load_value(pass: &DftPass) -> String {
             format!(
                 "let u = gi - ob * p.in_os; let hh = p.in_os - 1u; let g2 = ob * p.in_os + (hh - u);
 let xk = {a}; let x2 = {b}; let xc = vec2<f32>(x2.x, -x2.y);
-let ev = xk + xc; let df = xk - xc; let w = tw(u, 2u * hh);
+let ev = xk + xc; let df = xk - xc; let w = tw(u, 2u * hh, 4.0 / f32(hh));
 let t = cmul(df, vec2<f32>(w.x, -w.y));
 v = ev + vec2<f32>(-t.y, t.x);"
             )
         }
         LoadKind::Hermitian => {
-            "let u = gi - ob * p.in_os; let ii = u % p.inner;\nif (n < p.n_in) { v = src[gi]; } else { let g2 = ob * p.in_os + (p.n_full - n) * p.inner + ii; let z = src[g2]; v = vec2<f32>(z.x, -z.y); }".to_string()
+            "let u = gi - ob * p.in_os; let ii = u % INNER;\nif (n < p.n_in) { v = src[gi]; } else { let g2 = ob * p.in_os + (p.n_full - n) * INNER + ii; let z = src[g2]; v = vec2<f32>(z.x, -z.y); }".to_string()
         }
     };
     let _ = writeln!(s, "{guard}{{ {raw}");
@@ -349,7 +352,7 @@ v = ev + vec2<f32>(-t.y, t.x);"
 fn store_value(pass: &DftPass) -> String {
     let mut s = String::new();
     s.push_str("let lrow = select(l0 + r, 0u, p.low == 1u);\n");
-    s.push_str("let ii = lrow % p.inner; let nat = k * p.prod + lrow / p.inner;\n");
+    s.push_str("let ii = lrow % INNER; let nat = k * p.prod + lrow / INNER;\n");
     s.push_str("let go = out_base + r * p.out_rs + k * p.out_ds;\n");
     match pass.store_table {
         Table::None => {}
@@ -361,7 +364,7 @@ fn store_value(pass: &DftPass) -> String {
         StoreKind::Complex => "dst[go] = v;".to_string(),
         StoreKind::Real => "dst[go] = v.x;".to_string(),
         StoreKind::RealPair => {
-            "let u = go - ob * p.out_os; let i0 = 2u * ob * p.out_os + 2u * u - ii;\ndst[i0] = v.x; dst[i0 + p.inner] = v.y;".to_string()
+            "let u = go - ob * p.out_os; let i0 = 2u * ob * p.out_os + 2u * u - ii;\ndst[i0] = v.x; dst[i0 + INNER] = v.y;".to_string()
         }
     };
     let guard = if pass.store_limit { "if (nat < p.n_out) " } else { "" };
@@ -388,7 +391,7 @@ pub(crate) fn source(pass: &DftPass) -> String {
     let c = pass.cols;
     let tile = c * d;
     let mut src = String::from(
-        "struct Params { tiles: u32, rows: u32, j: u32, low: u32, mid: u32, in_rs: u32, in_ds: u32, in_os: u32, out_rs: u32, out_ds: u32, out_os: u32, den: u32, inner: u32, prod: u32, n_in: u32, n_out: u32, n_full: u32, scale: f32, cj: f32, mrs: u32, n_lim: u32, tpo: u32, prodh: u32, pad: u32 }\n",
+        "struct Params { tiles: u32, rows: u32, j: u32, low: u32, mid: u32, in_rs: u32, in_ds: u32, in_os: u32, out_rs: u32, out_ds: u32, out_os: u32, den: u32, inner: u32, prod: u32, n_in: u32, n_out: u32, n_full: u32, scale: f32, cj: f32, mrs: u32, n_lim: u32, tpo: u32, prodh: u32, inv8: f32 }\n",
     );
     let mut bindings = Vec::new();
     bindings.push(format!("var<storage, read> src: array<{}>", if pass.real_in() { "f32" } else { "vec2<f32>" }));
@@ -413,15 +416,17 @@ fn sx(i: u32) -> u32 {{ return i + (i >> 4u); }}
 fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }}
-// e^(-2 pi i num / den) for num < den < 2^29: the angle is reduced to an octant with integers,
-// so the polynomials below see at most pi / 4.
-fn tw(num: u32, den: u32) -> vec2<f32> {{
-    let a = 8u * num;
-    let oct = a / den;
-    let rem = a - oct * den;
+// e^(-2 pi i num / den) for num < den <= 2^28 (`inv8` is 8 / den): the angle is reduced to an
+// octant with integers (the float quotient is corrected), so the polynomials below see at most
+// pi / 4.
+fn tw(num: u32, den: u32, inv8: f32) -> vec2<f32> {{
+    var oct = u32(f32(num) * inv8);
+    var rem = i32(8u * num) - i32(oct * den);
+    if (rem < 0) {{ oct = oct - 1u; rem = rem + i32(den); }}
+    if (rem >= i32(den)) {{ oct = oct + 1u; rem = rem - i32(den); }}
     let odd = (oct & 1u) == 1u;
-    let x = select(rem, den - rem, odd);
-    let th = (f32(x) / f32(den)) * 0.7853981633974483;
+    let x = select(u32(rem), den - u32(rem), odd);
+    let th = f32(x) * (inv8 * 0.09817477042468103);
     let t2 = th * th;
     let sn = th * (1.0 + t2 * (-0.16666667 + t2 * (0.008333334 + t2 * (-0.0001984127 + t2 * 0.0000027557319))));
     let cs = 1.0 + t2 * (-0.5 + t2 * (0.041666668 + t2 * (-0.0013888889 + t2 * (0.0000248015873 + t2 * -0.00000027557319))));
@@ -467,6 +472,7 @@ fn main(
     );
     // Load.
     let (r_load, d_load) = if pass.in_fast { (format!("e % {c}u"), format!("e / {c}u")) } else { (format!("e / {d}u"), format!("e % {d}u")) };
+    let inner = if pass.unit_inner { "1u" } else { "p.inner" };
     let h2 = c / 2;
     let rows_post = format!(
         "let lo = l0 + (r % {h2}u); let hi = r >= {h2}u;
@@ -485,7 +491,7 @@ fn main(
         v.y = v.y * p.cj;
     }}
     sh[{}] = v;",
-        load_value(pass),
+        load_value(pass).replace("INNER", inner),
         at(pass, "d", "r")
     );
     let load_body = format!(
@@ -499,7 +505,7 @@ fn main(
         v.y = v.y * p.cj;
     }}
     sh[{}] = v;",
-        load_value(pass),
+        load_value(pass).replace("INNER", inner),
         at(pass, "d", "r")
     );
     src.push_str(&unrolled(tile, if pass.post { &load_body_post } else { &load_body }));
@@ -516,7 +522,7 @@ fn main(
         done *= u32::from(r);
         let _ = writeln!(reverse, "pos = pos + (kk % {r}u) * {}u; kk = kk / {r}u;", d / done);
     }
-    let twiddle = if pass.twiddle { "let mrow = m0 + r * p.mrs; v = cmul(v, tw(k * mrow, p.den));\n" } else { "" };
+    let twiddle = if pass.twiddle { "let mrow = m0 + r * p.mrs; v = cmul(v, tw(k * mrow, p.den, p.inv8));\n" } else { "" };
     let mut reverse_kp = String::from("var kq = kp; var posp = 0u;\n");
     let mut done_p = 1u32;
     for &r in radices {
@@ -535,7 +541,7 @@ fn main(
         let zc = vec2<f32>(z2.x, -z2.y);
         let ev = (zk + zc) * 0.5;
         let df = zk - zc;
-        let od = cmul(tw(k * p.prod + l, p.den), vec2<f32>(df.y, -df.x) * 0.5);
+        let od = cmul(tw(k * p.prod + l, p.den, p.inv8), vec2<f32>(df.y, -df.x) * 0.5);
         let nat = k * p.prod + l;
         let a = ev + od;
         let b = ev - od;
@@ -554,7 +560,7 @@ fn main(
         {}
     }}",
         at(pass, "pos", "r"),
-        store_value(pass)
+        store_value(pass).replace("INNER", inner)
     );
     src.push_str(&unrolled(tile, if pass.post { &store_body_post } else { &store_body }));
     src.push_str("}\n");
@@ -582,6 +588,7 @@ mod tests {
             store_table: Table::None,
             store_limit: false,
             post: false,
+            unit_inner: true,
         }
     }
 
