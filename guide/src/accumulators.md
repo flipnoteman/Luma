@@ -136,9 +136,9 @@ assert!((mi - std::f32::consts::LN_2).abs() < 1e-6); // one bit
 
 ## Top-k
 
-`TopK::largest(k)` (and `smallest`) keeps the `k` best values with their global indices; each
-push sorts the batch's best `k` and merges them with the state's. Ties go to the earlier
-element; NaN and masked elements are never selected.
+`TopK::largest(k)` (and `smallest`) keeps the `k` best values of the whole stream with their
+global indices; the pushes of up to 16 batches are sorted together and merged with the state's
+`k` entries. Ties go to the earlier element; NaN and masked elements are never selected.
 
 ```rust
 use luma::*;
@@ -148,6 +148,24 @@ top.push(&Array::from_slice(&[0.5f32, 9.0, 3.0], 3)?)?;
 top.push(&Array::from_slice(&[7.0f32, 1.0], 2)?)?;
 assert_eq!(top.values()?.to_vec()?, vec![9.0, 7.0]);
 assert_eq!(TopK::<f32, Df32>::to_f64(&top.indices()?)?, vec![1.0, 3.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+`TopK::largest_along(k, axis)` keeps the best `k` of every line along an axis instead, per
+feature for `[features, rows]` batches with `axis` 1: the results have `k` entries along the axis
+and the indices are *sample* indices along it. It costs `k` passes of an argmax over the batch
+(the elements chosen so far are masked out inside the pass), so `k` is at most 32:
+
+```rust
+use luma::*;
+
+// Two features; the best two rows of each.
+let top = TopK::<i32, Df32>::largest_along(2, 1)?;
+top.push(&Array::from_slice(&[1i32, 50, 9, 20, 4, 30], [2, 3])?)?;
+top.push(&Array::from_slice(&[7i32, 10], [2, 1])?)?;
+// Shape [2, 2]: rank j of feature f at f + 2 j.
+assert_eq!(top.values()?.to_vec()?, vec![9, 50, 7, 30]);
+assert_eq!(TopK::<i32, Df32>::to_f64(&top.indices()?)?, vec![1.0, 0.0, 3.0, 2.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 

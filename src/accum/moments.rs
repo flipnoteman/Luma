@@ -212,9 +212,9 @@ impl<W: Wide> AccumulatorBuilder<W> {
 /// as if the mask of `push_where` were false there.
 ///
 /// ```no_run
-/// use luma::{Accumulator, Array, Fold};
+/// use luma::{Accumulator, Array, Df32, Fold};
 /// // per-feature statistics of batches of 256 rows of 8 features ([features, rows]: fold axis 1)
-/// let acc = Accumulator::new(Fold::axis(1));
+/// let acc = Accumulator::<Df32>::new(Fold::axis(1));
 /// for step in 0..100 {
 ///     let batch = Array::<f32>::from_slice(&vec![step as f32; 8 * 256], [8, 256])?;
 ///     acc.push(&batch)?;
