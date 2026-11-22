@@ -26,6 +26,29 @@ fn transposed(data: &[f32], len: usize, n: usize) -> Vec<f32> {
     (0..n * len).map(|p| data[(p % n) * len + p / n]).collect()
 }
 
+/// The verdict of a nearest-neighbour row with very many train features (k = 1, features as
+/// columns): luma against an exact `f64` computation for sampled queries, and how many queries
+/// ArrayFire's answer disagrees with luma's at. (ArrayFire's CUDA `nearestNeighbour` returned a
+/// wrong neighbour for some query at 50k x 50k, with a distance below the true minimum, in one
+/// run: verified against `f64`; so the comparison with ArrayFire is not a pass criterion here.)
+#[allow(clippy::too_many_arguments)]
+fn large_verdict(q: &[f32], t: &[f32], len: usize, li: &[u32], ld: &[f32], ai: &[u32], ad: &[f32]) -> Verdict {
+    let n = li.len();
+    let exact_dist = |j: usize, i: usize| -> f64 { (0..len).map(|l| (f64::from(q[j * len + l]) - f64::from(t[i * len + l])).powi(2)).sum() };
+    let sampled: Vec<usize> = (0..n).step_by(997).collect();
+    let mut worst = 0.0f64;
+    for &j in &sampled {
+        let want = (0..n).map(|i| exact_dist(j, i)).fold(f64::INFINITY, f64::min);
+        let d = (f64::from(ld[j]) - want).abs() / want.max(1e-30);
+        let picked = (exact_dist(j, li[j] as usize) - want).abs() / want.max(1e-30);
+        worst = worst.max(d).max(picked);
+    }
+    let differs = (0..n).filter(|&j| li[j] != ai[j] || (ld[j] - ad[j]).abs() > 1e-4 * ld[j].abs() + 1e-4).count();
+    let mut v = if worst <= 1e-4 { Verdict::yes(format!("luma vs f64 reference at {} sampled queries: max rel Δ {worst:.1e}", sampled.len())) } else { Verdict::no(format!("NO: luma vs f64 reference: rel Δ {worst:.2e}")) };
+    v.text.push_str(&format!("; ArrayFire differs from luma at {differs} of {n} queries"));
+    v
+}
+
 pub fn rows(b: &mut Bench) {
     b.guarded("vision/matching", |b| {
         let ctx = b.ctx.clone();
@@ -91,7 +114,11 @@ pub fn rows(b: &mut Bench) {
                         };
                         let (li, ld) = lf();
                         let (ai, ad) = af::nearest_neighbour(&qa, &ta, dist_dim as i64, k as u32, af::MatchType::SSD);
-                        let v = compare(&lumax::host(&ld), &afx::host(&ad), 1e-4, 1e-4).and(exact(&as_f32(&lumax::host(&li)), &as_f32(&afx::host(&ai))));
+                        let v = if n > 10_000 {
+                            large_verdict(&qd, &td, len, &lumax::host(&li), &lumax::host(&ld), &afx::host(&ai), &afx::host(&ad))
+                        } else {
+                            compare(&lumax::host(&ld), &afx::host(&ad), 1e-4, 1e-4).and(exact(&as_f32(&lumax::host(&li)), &as_f32(&afx::host(&ai))))
+                        };
                         let mut a = || {
                             let r = af::nearest_neighbour(&qa, &ta, dist_dim as i64, k as u32, af::MatchType::SSD);
                             r.1.eval();
