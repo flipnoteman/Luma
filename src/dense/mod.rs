@@ -158,3 +158,18 @@ pub(crate) fn gather_rows(a: &Array<f32>, perm: &Array<u32>, loc: &'static Locat
     let idx = &(&rows * w as u32 + &col) + &(&mat * (m * w) as u32);
     a.take(&idx)
 }
+
+/// Columns of the panels a big single matrix is factored in by the LU and QR panel kernels (8, 16 or
+/// 32; `LUMA_LINALG_PANEL`): the kernels stream the whole panel through one multiprocessor's cache
+/// for every column, so a narrow panel moves fewer bytes per column but leaves more levels of
+/// recursion.
+pub(crate) fn panel_width() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| std::env::var("LUMA_LINALG_PANEL").ok().and_then(|v| v.parse().ok()).filter(|w| [8, 16, 32].contains(w)).unwrap_or(32))
+}
+
+/// Where the recursion over columns splits `w` of them: about half, at a multiple of 8 for panels
+/// that are still narrow.
+pub(crate) fn split_cols(w: usize) -> usize {
+    if w <= 64 { (w / 2).next_multiple_of(8).min(w - 1).max(1) } else { tri::split(w) }
+}

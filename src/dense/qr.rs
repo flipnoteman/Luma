@@ -18,7 +18,6 @@ use super::lu::UNROLL;
 use super::{block, fail, fence, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::bmm::matmul_batched;
-use crate::dense::tri::split;
 use crate::error::LumaError;
 use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
@@ -225,10 +224,10 @@ pub(crate) fn unit_lower(f: &Array<f32>) -> Array<f32> {
 /// A recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
     let [w, m, ..] = a.shape().dims();
-    if w <= PANEL {
+    if w <= if m <= 64 { PANEL } else { super::panel_width() } {
         return leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc);
     }
-    let n1 = split(w);
+    let n1 = super::split_cols(w);
     let n2 = w - n1;
     let Qr { qr: f1, tau: tau1, t: t1 } = recurse(&block(a, 0..m, 0..n1), op, loc);
     let f1 = f1.cache();
@@ -263,7 +262,7 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return failed_qr(ctx, a, e, op, loc),
     };
-    if d.cols <= PANEL {
+    if d.cols <= if d.batch > 1 || d.rows <= 64 { PANEL } else { super::panel_width() } {
         return leaf(a, d, op, loc);
     }
     if d.batch > 1 {

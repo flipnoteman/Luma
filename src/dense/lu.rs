@@ -11,7 +11,7 @@
 
 use std::panic::Location;
 
-use super::tri::{lower_left, rhs_matrix, split};
+use super::tri::{lower_left, rhs_matrix};
 use super::{block, fail, fence, gather_rows, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::error::LumaError;
@@ -259,8 +259,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 }
 
 /// The widest matrix (in columns) a leaf of `m` rows factors in one launch.
-fn leaf_width(m: usize) -> usize {
-    if m <= SMALL { SMALL } else { PANEL }
+fn leaf_width(m: usize, batch: usize) -> usize {
+    if m <= SMALL {
+        SMALL
+    } else if batch > 1 {
+        PANEL
+    } else {
+        super::panel_width()
+    }
 }
 
 /// Factors every `[w, m, batch]` matrix of `a` (`m >= w`) with one of the two kernels.
@@ -289,10 +295,10 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
 /// The recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Lu {
     let [w, m, ..] = a.shape().dims();
-    if w <= leaf_width(m) {
+    if w <= leaf_width(m, 1) {
         return leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc);
     }
-    let n1 = split(w);
+    let n1 = super::split_cols(w);
     let n2 = w - n1;
     let Lu { lu: f1, perm: p1 } = recurse(&block(a, 0..m, 0..n1), op, loc);
     let f1 = f1.cache();
@@ -324,7 +330,7 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, Shape::from(1), Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) },
     };
-    if d.cols <= leaf_width(d.rows) {
+    if d.cols <= leaf_width(d.rows, d.batch) {
         return leaf(a, d, op, loc);
     }
     if d.batch > 1 {
