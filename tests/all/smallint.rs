@@ -522,3 +522,347 @@ macro_rules! unsigned_suite {
 
 unsigned_suite!(u8_counting, u8, bits: 8);
 unsigned_suite!(u16_counting, u16, bits: 16);
+
+/// Device memory is the size of the elements: the widening casts of reductions and expressions are
+/// never stored, a stored result takes its own type's bytes.
+#[test]
+fn compact_arrays_take_their_own_size_in_device_memory() {
+    let ctx = Context::new().unwrap();
+    let n = 1usize << 22;
+    let delta = |before: u64| ctx.memory_stats().resident_bytes.saturating_sub(before);
+    let base = ctx.memory_stats().resident_bytes;
+    let bytes = Array::from_slice_on(&ctx, &vec![7u8; n], n).unwrap();
+    bytes.eval().unwrap();
+    ctx.sync().unwrap();
+    let up = delta(base);
+    assert!(up >= n as u64 && up < n as u64 + (1 << 18), "u8 upload of {n} elements holds {up} bytes");
+
+    let halves = Array::from_slice_on(&ctx, &vec![-3i16; n], n).unwrap();
+    halves.eval().unwrap();
+    ctx.sync().unwrap();
+    let both = delta(base);
+    assert!(both >= 3 * n as u64 && both < 3 * n as u64 + (1 << 19), "u8 and i16 uploads of {n} elements hold {both} bytes");
+
+    let before = ctx.memory_stats().resident_bytes;
+    assert_eq!(halves.to_f32().sum().item().unwrap(), -3.0 * n as f32);
+    assert_eq!(bytes.to_u32().sum().item().unwrap(), 7 * n as u32);
+    ctx.sync().unwrap();
+    assert!(delta(before) < (1 << 18), "reductions of widened elements store nothing: {} bytes", delta(before));
+
+    let before = ctx.memory_stats().resident_bytes;
+    let doubled = &bytes + &bytes;
+    doubled.eval().unwrap();
+    ctx.sync().unwrap();
+    let held = delta(before);
+    assert!(held >= n as u64 && held < n as u64 + (1 << 18), "a stored u8 result holds {held} bytes");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Random programs: chains of operations and casts over all the integer types, fused by the JIT
+// into whatever kernels it likes, against a host evaluation in `i64` with an explicit wrap.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ty {
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+}
+
+const TYPES: [Ty; 6] = [Ty::U8, Ty::I8, Ty::U16, Ty::I16, Ty::U32, Ty::I32];
+
+impl Ty {
+    fn bits(self) -> u32 {
+        match self {
+            Ty::U8 | Ty::I8 => 8,
+            Ty::U16 | Ty::I16 => 16,
+            Ty::U32 | Ty::I32 => 32,
+        }
+    }
+
+    fn signed(self) -> bool {
+        matches!(self, Ty::I8 | Ty::I16 | Ty::I32)
+    }
+
+    /// `v` wrapped into the range of the type.
+    fn wrap(self, v: i64) -> i64 {
+        match self {
+            Ty::U8 => v as u8 as i64,
+            Ty::I8 => v as i8 as i64,
+            Ty::U16 => v as u16 as i64,
+            Ty::I16 => v as i16 as i64,
+            Ty::U32 => v as u32 as i64,
+            Ty::I32 => v as i32 as i64,
+        }
+    }
+
+    fn range(self) -> (i64, i64) {
+        match self {
+            Ty::U8 => (0, 255),
+            Ty::I8 => (-128, 127),
+            Ty::U16 => (0, 65535),
+            Ty::I16 => (-32768, 32767),
+            Ty::U32 => (0, u32::MAX as i64),
+            Ty::I32 => (i32::MIN as i64, i32::MAX as i64),
+        }
+    }
+}
+
+/// A device array of one of the integer types.
+enum Dev {
+    U8(Array<u8>),
+    I8(Array<i8>),
+    U16(Array<u16>),
+    I16(Array<i16>),
+    U32(Array<u32>),
+    I32(Array<i32>),
+}
+
+macro_rules! dev_unary {
+    ($d:expr, $a:ident => $body:expr) => {
+        match $d {
+            Dev::U8($a) => Dev::U8($body),
+            Dev::I8($a) => Dev::I8($body),
+            Dev::U16($a) => Dev::U16($body),
+            Dev::I16($a) => Dev::I16($body),
+            Dev::U32($a) => Dev::U32($body),
+            Dev::I32($a) => Dev::I32($body),
+        }
+    };
+}
+
+macro_rules! dev_binary {
+    ($x:expr, $y:expr, $a:ident, $b:ident => $body:expr) => {
+        match ($x, $y) {
+            (Dev::U8($a), Dev::U8($b)) => Dev::U8($body),
+            (Dev::I8($a), Dev::I8($b)) => Dev::I8($body),
+            (Dev::U16($a), Dev::U16($b)) => Dev::U16($body),
+            (Dev::I16($a), Dev::I16($b)) => Dev::I16($body),
+            (Dev::U32($a), Dev::U32($b)) => Dev::U32($body),
+            (Dev::I32($a), Dev::I32($b)) => Dev::I32($body),
+            _ => unreachable!("operands of one type"),
+        }
+    };
+}
+
+/// `$x.to_*()` for the target type `$to` of any source type (the source's own type is a copy).
+macro_rules! dev_cast {
+    ($x:expr, $to:expr, $viaf32:expr) => {{
+        let via: bool = $viaf32;
+        match ($x, $to) {
+            (Dev::U8(a), Ty::U8) => Dev::U8(a.clone()),
+            (Dev::U8(a), Ty::I8) => Dev::I8(if via { a.to_f32().to_i8() } else { a.to_i8() }),
+            (Dev::U8(a), Ty::U16) => Dev::U16(if via { a.to_f32().to_u16() } else { a.to_u16() }),
+            (Dev::U8(a), Ty::I16) => Dev::I16(if via { a.to_f32().to_i16() } else { a.to_i16() }),
+            (Dev::U8(a), Ty::U32) => Dev::U32(if via { a.to_f32().to_u32() } else { a.to_u32() }),
+            (Dev::U8(a), Ty::I32) => Dev::I32(if via { a.to_f32().to_i32() } else { a.to_i32() }),
+            (Dev::I8(a), Ty::U8) => Dev::U8(if via { a.to_f32().to_u8() } else { a.to_u8() }),
+            (Dev::I8(a), Ty::I8) => Dev::I8(a.clone()),
+            (Dev::I8(a), Ty::U16) => Dev::U16(if via { a.to_f32().to_u16() } else { a.to_u16() }),
+            (Dev::I8(a), Ty::I16) => Dev::I16(if via { a.to_f32().to_i16() } else { a.to_i16() }),
+            (Dev::I8(a), Ty::U32) => Dev::U32(if via { a.to_f32().to_u32() } else { a.to_u32() }),
+            (Dev::I8(a), Ty::I32) => Dev::I32(if via { a.to_f32().to_i32() } else { a.to_i32() }),
+            (Dev::U16(a), Ty::U8) => Dev::U8(if via { a.to_f32().to_u8() } else { a.to_u8() }),
+            (Dev::U16(a), Ty::I8) => Dev::I8(if via { a.to_f32().to_i8() } else { a.to_i8() }),
+            (Dev::U16(a), Ty::U16) => Dev::U16(a.clone()),
+            (Dev::U16(a), Ty::I16) => Dev::I16(if via { a.to_f32().to_i16() } else { a.to_i16() }),
+            (Dev::U16(a), Ty::U32) => Dev::U32(if via { a.to_f32().to_u32() } else { a.to_u32() }),
+            (Dev::U16(a), Ty::I32) => Dev::I32(if via { a.to_f32().to_i32() } else { a.to_i32() }),
+            (Dev::I16(a), Ty::U8) => Dev::U8(if via { a.to_f32().to_u8() } else { a.to_u8() }),
+            (Dev::I16(a), Ty::I8) => Dev::I8(if via { a.to_f32().to_i8() } else { a.to_i8() }),
+            (Dev::I16(a), Ty::U16) => Dev::U16(if via { a.to_f32().to_u16() } else { a.to_u16() }),
+            (Dev::I16(a), Ty::I16) => Dev::I16(a.clone()),
+            (Dev::I16(a), Ty::U32) => Dev::U32(if via { a.to_f32().to_u32() } else { a.to_u32() }),
+            (Dev::I16(a), Ty::I32) => Dev::I32(if via { a.to_f32().to_i32() } else { a.to_i32() }),
+            (Dev::U32(a), Ty::U8) => Dev::U8(if via { a.to_f32().to_u8() } else { a.to_u8() }),
+            (Dev::U32(a), Ty::I8) => Dev::I8(if via { a.to_f32().to_i8() } else { a.to_i8() }),
+            (Dev::U32(a), Ty::U16) => Dev::U16(if via { a.to_f32().to_u16() } else { a.to_u16() }),
+            (Dev::U32(a), Ty::I16) => Dev::I16(if via { a.to_f32().to_i16() } else { a.to_i16() }),
+            (Dev::U32(a), Ty::U32) => Dev::U32(a.clone()),
+            (Dev::U32(a), Ty::I32) => Dev::I32(a.to_i32()),
+            (Dev::I32(a), Ty::U8) => Dev::U8(if via { a.to_f32().to_u8() } else { a.to_u8() }),
+            (Dev::I32(a), Ty::I8) => Dev::I8(if via { a.to_f32().to_i8() } else { a.to_i8() }),
+            (Dev::I32(a), Ty::U16) => Dev::U16(if via { a.to_f32().to_u16() } else { a.to_u16() }),
+            (Dev::I32(a), Ty::I16) => Dev::I16(if via { a.to_f32().to_i16() } else { a.to_i16() }),
+            (Dev::I32(a), Ty::U32) => Dev::U32(a.to_u32()),
+            (Dev::I32(a), Ty::I32) => Dev::I32(a.clone()),
+        }
+    }};
+}
+
+impl Dev {
+    fn upload(ctx: &Context, ty: Ty, host: &[i64]) -> Dev {
+        let n = host.len();
+        match ty {
+            Ty::U8 => Dev::U8(Array::from_slice_on(ctx, &host.iter().map(|&v| v as u8).collect::<Vec<_>>(), n).unwrap()),
+            Ty::I8 => Dev::I8(Array::from_slice_on(ctx, &host.iter().map(|&v| v as i8).collect::<Vec<_>>(), n).unwrap()),
+            Ty::U16 => Dev::U16(Array::from_slice_on(ctx, &host.iter().map(|&v| v as u16).collect::<Vec<_>>(), n).unwrap()),
+            Ty::I16 => Dev::I16(Array::from_slice_on(ctx, &host.iter().map(|&v| v as i16).collect::<Vec<_>>(), n).unwrap()),
+            Ty::U32 => Dev::U32(Array::from_slice_on(ctx, &host.iter().map(|&v| v as u32).collect::<Vec<_>>(), n).unwrap()),
+            Ty::I32 => Dev::I32(Array::from_slice_on(ctx, &host.iter().map(|&v| v as i32).collect::<Vec<_>>(), n).unwrap()),
+        }
+    }
+
+    fn read(&self) -> Vec<i64> {
+        match self {
+            Dev::U8(a) => a.to_vec().unwrap().into_iter().map(i64::from).collect(),
+            Dev::I8(a) => a.to_vec().unwrap().into_iter().map(i64::from).collect(),
+            Dev::U16(a) => a.to_vec().unwrap().into_iter().map(i64::from).collect(),
+            Dev::I16(a) => a.to_vec().unwrap().into_iter().map(i64::from).collect(),
+            Dev::U32(a) => a.to_vec().unwrap().into_iter().map(i64::from).collect(),
+            Dev::I32(a) => a.to_vec().unwrap().into_iter().map(i64::from).collect(),
+        }
+    }
+}
+
+/// A value of the program: the device array and what it must hold.
+struct Value {
+    ty: Ty,
+    dev: Dev,
+    host: Vec<i64>,
+}
+
+fn pick(state: &mut u64, n: usize) -> usize {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    ((*state >> 33) as usize) % n
+}
+
+fn random_program(ctx: &Context, seed: u64, n: usize, steps: usize) {
+    let mut st = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    let mut pool: Vec<Value> = TYPES
+        .iter()
+        .map(|&ty| {
+            let (lo, hi) = ty.range();
+            let edges = [lo, hi, 0, 1, -1, lo + 1, hi - 1, hi / 2, 100];
+            let host: Vec<i64> = lcg(n, seed + ty.bits() as u64 + ty.signed() as u64)
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| if i % 4 == 0 { ty.wrap(edges[(v as usize) % edges.len()]) } else { ty.wrap(v as i64) })
+                .collect();
+            Value { ty, dev: Dev::upload(ctx, ty, &host), host }
+        })
+        .collect();
+    let mut log = Vec::new();
+    for step in 0..steps {
+        let a = pick(&mut st, pool.len());
+        let ty = pool[a].ty;
+        let same: Vec<usize> = (0..pool.len()).filter(|&i| pool[i].ty == ty).collect();
+        let b = same[pick(&mut st, same.len())];
+        let c = same[pick(&mut st, same.len())];
+        let (hx, hy, hz) = (pool[a].host.clone(), pool[b].host.clone(), pool[c].host.clone());
+        let bits = ty.bits();
+        let wrap = move |v: i64| ty.wrap(v);
+        let op = pick(&mut st, 20);
+        let (dev, host): (Dev, Vec<i64>) = match op {
+            0 => (dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x + y), hx.iter().zip(&hy).map(|(p, q)| wrap(p + q)).collect()),
+            1 => (dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x - y), hx.iter().zip(&hy).map(|(p, q)| wrap(p - q)).collect()),
+            2 => (dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x * y), hx.iter().zip(&hy).map(|(p, q)| wrap(p.wrapping_mul(*q))).collect()),
+            3 => (dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x & y), hx.iter().zip(&hy).map(|(p, q)| wrap(p & q)).collect()),
+            4 => (dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x | y), hx.iter().zip(&hy).map(|(p, q)| wrap(p | q)).collect()),
+            5 => (dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x ^ y), hx.iter().zip(&hy).map(|(p, q)| wrap(p ^ q)).collect()),
+            6 => (dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x.minimum(y)), hx.iter().zip(&hy).map(|(p, q)| *p.min(q)).collect()),
+            7 => (dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x.maximum(y)), hx.iter().zip(&hy).map(|(p, q)| *p.max(q)).collect()),
+            8 => (
+                dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x << y),
+                hx.iter().zip(&hy).map(|(p, q)| wrap(p << (((*q as u64) & (bits as u64 - 1)) as u32))).collect(),
+            ),
+            9 => (
+                dev_binary!(&pool[a].dev, &pool[b].dev, x, y => x >> y),
+                hx.iter().zip(&hy).map(|(p, q)| wrap(p >> (((*q as u64) & (bits as u64 - 1)) as u32))).collect(),
+            ),
+            10 | 11 => {
+                // A divisor that is never zero (and never -1): even, then bit 1 set.
+                let divisor: Vec<i64> = hy.iter().map(|&q| wrap((q & !1) | 2)).collect();
+                let by = Dev::upload(ctx, ty, &divisor);
+                if op == 10 {
+                    (dev_binary!(&pool[a].dev, &by, x, y => x / y), hx.iter().zip(&divisor).map(|(p, q)| wrap(p / q)).collect())
+                } else {
+                    (dev_binary!(&pool[a].dev, &by, x, y => x % y), hx.iter().zip(&divisor).map(|(p, q)| wrap(p % q)).collect())
+                }
+            }
+            12 => (dev_unary!(&pool[a].dev, x => !x), hx.iter().map(|&p| wrap(!p)).collect()),
+            13 if ty.signed() && bits < 32 => {
+                let neg = match &pool[a].dev {
+                    Dev::I8(x) => Dev::I8(-x),
+                    Dev::I16(x) => Dev::I16(-x),
+                    _ => unreachable!(),
+                };
+                (neg, hx.iter().map(|&p| wrap(-p)).collect())
+            }
+            14 if ty.signed() && bits < 32 => {
+                let abs = match &pool[a].dev {
+                    Dev::I8(x) => Dev::I8(x.abs()),
+                    Dev::I16(x) => Dev::I16(x.abs()),
+                    _ => unreachable!(),
+                };
+                (abs, hx.iter().map(|&p| wrap(p.abs())).collect())
+            }
+            15 | 16 => {
+                // A cast, directly or through f32 (exact up to 24 bits; wider values round to f32 first).
+                let to = TYPES[pick(&mut st, TYPES.len())];
+                let via = op == 16 && bits <= 16;
+                let host = hx
+                    .iter()
+                    .map(|&p| {
+                        let v = if via { p as f32 as f64 } else { p as f64 };
+                        if via {
+                            let (lo, hi) = to.range();
+                            (v as i64).clamp(lo, hi)
+                        } else {
+                            to.wrap(p)
+                        }
+                    })
+                    .collect();
+                (dev_cast!(&pool[a].dev, to, via), host)
+            }
+            17 => {
+                let (dev, host): (Dev, Vec<i64>) = (
+                    dev_binary!(&pool[a].dev, &pool[b].dev, x, y => select(&x.lt(y), x, y)),
+                    hx.iter().zip(&hy).map(|(p, q)| if p < q { *p } else { *q }).collect(),
+                );
+                (dev, host)
+            }
+            18 => (
+                dev_binary!(&pool[a].dev, &pool[b].dev, x, y => select(&x.ge(y), &(x + y), &(x ^ y))),
+                hx.iter().zip(&hy).map(|(p, q)| if p >= q { wrap(p + q) } else { wrap(p ^ q) }).collect(),
+            ),
+            _ => {
+                // A view: a circular shift, which reads the elements at other places.
+                let k = 1 + pick(&mut st, 6) as isize;
+                (dev_unary!(&pool[a].dev, x => x.shift([k])), (0..n as i64).map(|i| hx[(i - k as i64).rem_euclid(n as i64) as usize]).collect())
+            }
+        };
+        let _ = &hz;
+        log.push(format!("step {step}: op {op} on {a},{b} ({ty:?})"));
+        let out_ty = match &dev {
+            Dev::U8(_) => Ty::U8,
+            Dev::I8(_) => Ty::I8,
+            Dev::U16(_) => Ty::U16,
+            Dev::I16(_) => Ty::I16,
+            Dev::U32(_) => Ty::U32,
+            Dev::I32(_) => Ty::I32,
+        };
+        pool.push(Value { ty: out_ty, dev, host });
+    }
+    for (k, value) in pool.iter().enumerate() {
+        assert_eq!(value.dev.read(), value.host, "seed {seed}, value {k} ({:?}); program: {:#?}", value.ty, &log[..k.saturating_sub(TYPES.len()).min(log.len())]);
+    }
+}
+
+#[test]
+fn random_programs_over_every_integer_type_match_the_host() {
+    for (k, ctx) in [Context::new().unwrap(), chunked()].into_iter().enumerate() {
+        for seed in 0..40u64 {
+            for n in [37usize, 300] {
+                // Arrays of several buffers (n = 300 on 1 KiB buffers) run per segment; keep the circular shifts of the first context.
+                if k == 1 && n == 37 {
+                    continue;
+                }
+                random_program(&ctx, seed * 7 + k as u64, n, 14);
+            }
+        }
+    }
+}

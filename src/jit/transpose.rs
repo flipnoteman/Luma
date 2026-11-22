@@ -48,13 +48,16 @@ pub(super) struct Plan {
     tiles: u32,
 }
 
-/// The WGSL type the kernel moves: any 4-byte element is a `u32` (a copy of the bits), a `Df32`
-/// its two words.
+/// The type the kernel moves: any 4-byte element is a `u32` (a copy of the bits), a `Df32` its
+/// two words, a small integer the bits of a field of a word (`"u8"` or `"u16"`, which
+/// [`source`] reads as the packed kernel).
 fn word_ty(ty: ElemTy) -> Option<&'static str> {
     match ty {
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => Some("u32"),
         ElemTy::Df32 => Some("vec2<f32>"),
-        ElemTy::Bool | ElemTy::F64 | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => None,
+        ElemTy::U8 | ElemTy::I8 => Some("u8"),
+        ElemTy::U16 | ElemTy::I16 => Some("u16"),
+        ElemTy::Bool | ElemTy::F64 => None,
     }
 }
 
@@ -97,6 +100,14 @@ pub(super) fn plan(ctx: &Context, key: &FusedKey, inputs: &[Arc<Storage>], len: 
         return None;
     }
     let Geometry { params, tiles } = geometry(ctx, &map)?;
+    // Small integers are written as whole words: every row of the output the tile writes, and every
+    // batch, must start on a word and be made of whole words (see `source`).
+    if ty.is_small() {
+        let per = 32 / ty.small_bits();
+        if [params[1], params[8], params[9], params[10]].iter().any(|&v| v % per != 0) {
+            return None;
+        }
+    }
     Some(Plan { ty, params, tiles })
 }
 
@@ -601,6 +612,13 @@ pub(super) fn run(ctx: &Context, plan: &Plan, input: &Storage, len: usize) -> Re
 /// The tile is stored row by row of `b` with a row pitch of 33 words, so that neither the loads
 /// (along `a`) nor the stores (down a row of `b`) hit one bank.
 pub(crate) fn source(ty: &str) -> String {
+    if let Some(bits) = match ty {
+        "u8" => Some(8u32),
+        "u16" => Some(16),
+        _ => None,
+    } {
+        return packed_source(bits);
+    }
     format!(
         "struct Params {{ a: u32, b: u32, tx: u32, ty: u32, n1: u32, ss_p: u32, ss_1: u32, ss_2: u32, os_q: u32, os_1: u32, os_2: u32, tiles: u32 }}
 @group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
@@ -642,6 +660,71 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     }}
 }}
 "
+    )
+}
+
+/// [`source`] for elements of `bits` (8 or 16) bits sharing the words of both buffers. Loads read
+/// the field of an element out of its word, as the tile's slot; stores write whole words: a word is
+/// `32 / bits` neighbouring elements of a row of the output, which [`plan`] has made start on a
+/// word and end on one (the extent of the source axis the output's axis 0 reads, and the output
+/// strides, are multiples of the elements to a word), so no two invocations write one word. The
+/// invocations of a workgroup number the words of the tile (`32` columns of `32 / per` words) and
+/// each takes every 256th.
+fn packed_source(bits: u32) -> String {
+    let per = 32 / bits;
+    let shift = per.trailing_zeros();
+    let mask = (1u64 << bits) - 1;
+    format!(
+        "struct Params {{ a: u32, b: u32, tx: u32, ty: u32, n1: u32, ss_p: u32, ss_1: u32, ss_2: u32, os_q: u32, os_1: u32, os_2: u32, tiles: u32 }}
+@group(1) @binding(0) var<storage, read_write> out: array<u32>;
+@group(1) @binding(1) var<storage, read> src: array<u32>;
+@group(1) @binding(2) var<uniform> p: Params;
+
+var<workgroup> tile: array<u32, 1056>;
+
+@compute @workgroup_size(32, 8)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let t = wid.x + wid.y * nwg.x;
+    if (t >= p.tiles) {{ return; }}
+    let ta = t % p.tx;
+    let rest = t / p.tx;
+    let tb = rest % p.ty;
+    let batch = rest / p.ty;
+    let c1 = batch % p.n1;
+    let c2 = batch / p.n1;
+    let a0 = ta * 32u;
+    let b0 = tb * 32u;
+    let sbase = c1 * p.ss_1 + c2 * p.ss_2;
+    let obase = c1 * p.os_1 + c2 * p.os_2;
+    let la = a0 + lid.x;
+    for (var k = 0u; k < 4u; k = k + 1u) {{
+        let row = lid.y + k * 8u;
+        let b = b0 + row;
+        if (la < p.a && b < p.b) {{
+            let e = sbase + b * p.ss_p + la;
+            tile[row * 33u + lid.x] = (src[e >> {shift}u] >> ((e & {low}u) * {bits}u)) & {mask}u;
+        }}
+    }}
+    workgroupBarrier();
+    let id = lid.y * 32u + lid.x;
+    for (var m = id; m < {words}u; m = m + 256u) {{
+        let col = m / {wpc}u;
+        let wj = m % {wpc}u;
+        let a = a0 + col;
+        let sb = b0 + wj * {per}u;
+        if (a < p.a && sb < p.b) {{
+            var word = 0u;
+            for (var j = 0u; j < {per}u; j = j + 1u) {{
+                word = word | (tile[(wj * {per}u + j) * 33u + col] << (j * {bits}u));
+            }}
+            out[(obase + a * p.os_q + sb) >> {shift}u] = word;
+        }}
+    }}
+}}
+",
+        low = per - 1,
+        words = 32 * (32 / per),
+        wpc = 32 / per,
     )
 }
 
@@ -704,6 +787,44 @@ mod tests {
         check(&ctx, make, dims, [3, 0, 2, 1], true);
         // Axis 0 stays in place: the generic kernel.
         check(&ctx, make, dims, [0, 2, 1, 3], false);
+    }
+
+    /// The tiled kernel on small integers: `fast` where the output rows are whole words, the generic
+    /// kernel (which gives the same elements) where they are not.
+    fn check_small<T: ScalarType + Copy + Debug + PartialEq>(make: impl Fn(usize) -> T + Copy, per: usize) {
+        let ctx = ctx();
+        for dims in [[64, 64, 1, 1], [33, 16, 1, 1], [8192, 8, 1, 1], [3, 4096, 1, 1], [100, 36, 1, 1]] {
+            check(&ctx, make, dims, [1, 0, 2, 3], dims[1] % per == 0);
+        }
+        // Rows of 17 or 6 elements end inside a word (of 2 or 4): not tiled.
+        check(&ctx, make, [33, 17, 1, 1], [1, 0, 2, 3], false);
+        check(&ctx, make, [40, 6, 1, 1], [1, 0, 2, 3], per == 2);
+        // Batches: a batch of the output starts on a word only if the transposed plane is a multiple of it.
+        let dims = [40, 32, 3, 2];
+        check(&ctx, make, dims, [1, 0, 2, 3], true);
+        check(&ctx, make, [40, 32, 4, 2], [2, 0, 1, 3], true);
+        check(&ctx, make, [40, 32, 4, 4], [3, 2, 1, 0], true);
+        check(&ctx, make, [40, 31, 3, 2], [3, 2, 1, 0], per == 2);
+        check(&ctx, make, dims, [0, 2, 1, 3], false);
+        // Whether the rows of these end on words depends on the type; the elements are the same either way.
+        for (dims, perm) in [([40, 32, 3, 2], [2, 0, 1, 3]), ([40, 33, 2, 6], [3, 0, 1, 2]), ([7, 5, 3, 2], [1, 2, 3, 0])] {
+            let len: usize = dims.iter().product();
+            let data: Vec<T> = (0..len).map(make).collect();
+            let got = Array::from_slice_on(&ctx, &data, dims).unwrap().permute_axes(perm).to_vec().unwrap();
+            assert_eq!(got, permuted(&data, dims, perm), "{dims:?} permuted by {perm:?}");
+        }
+    }
+
+    #[test]
+    fn tiled_transpose_of_bytes_matches_the_host() {
+        check_small(|i| (i as u32).wrapping_mul(2654435761).to_be_bytes()[1], 4);
+        check_small(|i| (i as i8).wrapping_mul(-37), 4);
+    }
+
+    #[test]
+    fn tiled_transpose_of_halves_matches_the_host() {
+        check_small(|i| (i as u32).wrapping_mul(2654435761).to_be_bytes()[0] as u16 * 257 + i as u16, 2);
+        check_small(|i| (i as i16).wrapping_mul(-1357), 2);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub fn run(h: &mut Harness) {
     h.guarded("transfer", transfer_cases);
     h.guarded("cast", cast_cases);
     h.guarded("elementwise", elementwise_cases);
+    h.guarded("views", view_cases);
     h.guarded("colstats", colstats_cases);
     h.guarded("hist", hist_cases);
 }
@@ -135,6 +136,35 @@ fn ttest(x: &Array<f32>, group: &Array<f32>, n1: f32, n0: f32) -> Array<f32> {
     let v1 = &(&q1 / n1) - &(&m1 * &m1);
     let v0 = &(&q0 / n0) - &(&m0 * &m0);
     (&m1 - &m0) / (&(&v1 / n1) + &(&v0 / n0)).sqrt()
+}
+
+fn view_cases(h: &mut Harness) {
+    let (w, rows) = (2048usize, elems(h) / 2048);
+    let n = w * rows;
+    let sz = format!("{w}x{rows}");
+    let hi = traces(w, rows, 9);
+    let hf: Vec<f32> = hi.iter().map(|&v| f32::from(v)).collect();
+    let (xi, xf) = (Array::from_slice_on(&h.ctx, &hi, [w, rows]).unwrap(), Array::from_slice_on(&h.ctx, &hf, [w, rows]).unwrap());
+    // The transposed copy: element (c, r) of the result is (r, c) of the source.
+    let t = xi.transpose().to_vec().unwrap();
+    assert!((0..rows).step_by(97).all(|r| (0..w).step_by(61).all(|c| t[c * rows + r] == hi[r * w + c])), "transpose");
+    case_trim(h, "views/transpose_i16", &sz, Work::Bytes(4.0 * n as f64), &mut || xi.transpose().cache().eval().unwrap());
+    case_trim(h, "views/transpose_f32", &sz, Work::Bytes(8.0 * n as f64), &mut || xf.transpose().cache().eval().unwrap());
+    // A difference of neighbouring rows (a shifted read of the same buffer) and a flip.
+    let want: Vec<i16> = (0..n - w).map(|i| hi[i + w].wrapping_sub(hi[i])).collect();
+    let d = (xi.slice(1, 1..rows) - xi.slice(1, ..rows - 1)).to_vec().unwrap();
+    assert_eq!(d, want);
+    case_trim(h, "views/row_difference_i16", &sz, Work::Bytes(6.0 * n as f64), &mut || (xi.slice(1, 1..rows) - xi.slice(1, ..rows - 1)).eval().unwrap());
+    case_trim(h, "views/row_difference_f32", &sz, Work::Bytes(12.0 * n as f64), &mut || (xf.slice(1, 1..rows) - xf.slice(1, ..rows - 1)).eval().unwrap());
+    // A gather: random elements.
+    let idx: Vec<u32> = lcg(n, 10).map(|v| (v % n as u64) as u32).collect();
+    let ix = Array::from_slice_on(&h.ctx, &idx, n).unwrap();
+    let flat_i = xi.reshape([n]);
+    let flat_f = xf.reshape([n]);
+    let got = flat_i.take(&ix).to_vec().unwrap();
+    assert!(got.iter().zip(&idx).step_by(101).all(|(&g, &i)| g == hi[i as usize]), "take");
+    case_trim(h, "views/take_i16", &sz, Work::Bytes(6.0 * n as f64), &mut || flat_i.take(&ix).eval().unwrap());
+    case_trim(h, "views/take_f32", &sz, Work::Bytes(8.0 * n as f64), &mut || flat_f.take(&ix).eval().unwrap());
 }
 
 fn colstats_cases(h: &mut Harness) {
