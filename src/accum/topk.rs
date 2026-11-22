@@ -56,9 +56,17 @@ struct State<T: SortKey + AccumInput, W: Wide> {
     values: Array<T>,
     /// Global indices as wide numbers, `-1` for an empty slot.
     indices: V<W>,
-    /// Elements pushed so far (the base of the next batch's indices).
+    /// Elements pushed so far, those of `pending` included (the base of the next batch's indices).
     pushed: u64,
+    /// The batches (values with the elements that cannot win replaced by the identity, and the
+    /// elements that may win) pushed since the last merge: sorted together, once.
+    pending: Vec<(Array<T>, Option<Array<bool>>)>,
+    pending_elements: usize,
 }
+
+/// Pushes recorded before they are sorted together, and the most elements held back.
+const FLUSH_EVERY: usize = 16;
+const FLUSH_ELEMENTS: usize = 1 << 24;
 
 impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
     /// The `k` largest elements.
@@ -91,7 +99,7 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
         }
         // The identity: what loses against every element.
         let fill = T::extreme(ctx, !self.largest)?;
-        Ok(State { ctx: ctx.clone(), values: fill.broadcast_to(self.k), indices: V::filled(ctx, crate::Shape::from(self.k), -1.0)?, pushed: 0 })
+        Ok(State { ctx: ctx.clone(), values: fill.broadcast_to(self.k), indices: V::filled(ctx, crate::Shape::from(self.k), -1.0)?, pushed: 0, pending: Vec::new(), pending_elements: 0 })
     }
 
     /// Folds a batch in (any shape: its elements are one stream in memory order).
@@ -135,22 +143,54 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
             Some(keep) => select(keep, &flat, &T::extreme(ctx, !self.largest)?),
             None => flat,
         };
-        // A batch that does not fit one buffer is sorted in pieces.
-        let ranges = match super::split_plan(ctx, [n, 1, 1, 1], T::LAYOUT.stride() as u64, Some(0)) {
+        state.pending.push((values, skip));
+        state.pending_elements += n;
+        state.pushed += n as u64;
+        if state.pending.len() >= FLUSH_EVERY || state.pending_elements >= FLUSH_ELEMENTS {
+            self.merge_pending(state)?;
+        }
+        Ok(())
+    }
+
+    /// Sorts the pushes recorded since the last merge together (one sort of their concatenation
+    /// is cheaper than a sort per push) and merges their best into the state.
+    fn merge_pending(&self, state: &mut State<T, W>) -> Result<()> {
+        if state.pending.is_empty() {
+            return Ok(());
+        }
+        let ctx = state.ctx.clone();
+        let parts = std::mem::take(&mut state.pending);
+        let n = std::mem::take(&mut state.pending_elements);
+        let base = state.pushed - n as u64;
+        let (values, keep) = if parts.len() == 1 {
+            let (v, k) = parts.into_iter().next().expect("one part");
+            (v, k)
+        } else {
+            let masked = parts.iter().any(|p| p.1.is_some());
+            let values = crate::view::concat_slice(0, &parts.iter().map(|p| p.0.clone()).collect::<Vec<_>>());
+            let keep = if masked {
+                let keeps: Vec<Array<bool>> = parts.iter().map(|p| p.1.clone().map_or_else(|| Array::<bool>::full_on(&ctx, p.0.len(), true), Ok)).collect::<Result<_>>()?;
+                Some(crate::view::concat_slice(0, &keeps))
+            } else {
+                None
+            };
+            (values, keep)
+        };
+        // Pushes that do not fit one buffer are sorted in pieces.
+        let ranges = match super::split_plan(&ctx, [n, 1, 1, 1], T::LAYOUT.stride() as u64, Some(0)) {
             Some((_, ranges)) => ranges,
             None => vec![(0, n)],
         };
         for (a, b) in ranges {
-            let (piece, keep) = if ranges_is_whole(a, b, n) { (values.clone(), skip.clone()) } else { (values.slice(0, a..b).cache(), skip.as_ref().map(|k| k.slice(0, a..b).cache())) };
+            let (piece, keep) = if ranges_is_whole(a, b, n) { (values.clone(), keep.clone()) } else { (values.slice(0, a..b).cache(), keep.as_ref().map(|k| k.slice(0, a..b).cache())) };
             let take = self.k.min(b - a);
             let (top, local) = if self.largest { piece.topk(take) } else { piece.bottomk(take) };
-            let mut global = &V::<W>::from_u32(&local) + (state.pushed + a as u64) as f64;
+            let mut global = &V::<W>::from_u32(&local) + (base + a as u64) as f64;
             if let Some(keep) = &keep {
-                global = V::select(&keep.take(&local), &global, &V::constant(ctx, -1.0)?);
+                global = V::select(&keep.take(&local), &global, &V::constant(&ctx, -1.0)?);
             }
             self.fold(state, &top, &global)?;
         }
-        state.pushed += n as u64;
         Ok(())
     }
 
@@ -168,14 +208,18 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
 
     /// The values, best first, `k` entries.
     pub fn values(&self) -> Result<Array<T>> {
-        let guard = self.lock();
-        Ok(guard.state.as_ref().ok_or_else(|| invalid("the top-k is empty: push a batch first"))?.values.clone())
+        let mut guard = self.lock();
+        let state = guard.state.as_mut().ok_or_else(|| invalid("the top-k is empty: push a batch first"))?;
+        self.merge_pending(state)?;
+        Ok(state.values.clone())
     }
 
     /// The global indices of the values (`-1` in slots no element has filled), as wide numbers.
     pub fn indices(&self) -> Result<Array<W>> {
-        let guard = self.lock();
-        Ok(guard.state.as_ref().ok_or_else(|| invalid("the top-k is empty: push a batch first"))?.indices.0.clone())
+        let mut guard = self.lock();
+        let state = guard.state.as_mut().ok_or_else(|| invalid("the top-k is empty: push a batch first"))?;
+        self.merge_pending(state)?;
+        Ok(state.indices.0.clone())
     }
 
     /// The values of an index array on the host as `f64`.
@@ -194,8 +238,9 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
             return Err(invalid("top-k accumulators of different k or direction cannot be merged"));
         }
         let theirs = {
-            let guard = other.lock();
-            let Some(state) = guard.state.as_ref() else { return Ok(()) };
+            let mut guard = other.lock();
+            let Some(state) = guard.state.as_mut() else { return Ok(()) };
+            other.merge_pending(state)?;
             (state.ctx.clone(), state.values.clone(), state.indices.clone(), state.pushed)
         };
         let mut guard = self.lock();
@@ -203,6 +248,7 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
             Some(state) => state,
             None => guard.state.insert(self.empty(&theirs.0)?),
         };
+        self.merge_pending(state)?;
         let ctx = state.ctx.clone();
         let (values, indices) = if ctx.same_as(&theirs.0) {
             (theirs.1, theirs.2)
@@ -230,10 +276,11 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
         let mut w = Writer::new(KIND);
         w.u64(self.k as u64);
         w.u8(u8::from(self.largest));
-        let guard = self.lock();
-        match guard.state.as_ref() {
+        let mut guard = self.lock();
+        match guard.state.as_mut() {
             None => w.u8(0),
             Some(state) => {
+                self.merge_pending(state)?;
                 w.u8(1);
                 w.u64(state.pushed);
                 let values: Vec<f64> = state.values.to_vec()?.into_iter().map(|v| T::to_host_f64(v)).collect();
@@ -261,7 +308,7 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
             let values: Vec<T> = r.f64s(k)?.into_iter().map(T::from_host_f64).collect();
             let indices: Vec<W> = r.f64s(k)?.into_iter().map(W::from_f64).collect();
             r.finish()?;
-            top.lock().state = Some(State { ctx: ctx.clone(), values: Array::from_slice_on(ctx, &values, k)?, indices: V(Array::from_slice_on(ctx, &indices, k)?), pushed });
+            top.lock().state = Some(State { ctx: ctx.clone(), values: Array::from_slice_on(ctx, &values, k)?, indices: V(Array::from_slice_on(ctx, &indices, k)?), pushed, pending: Vec::new(), pending_elements: 0 });
             eval_all(&[&top.lock().state.as_ref().expect("just set").indices.0])?;
         } else {
             r.finish()?;

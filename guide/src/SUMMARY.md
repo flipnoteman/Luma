@@ -15,6 +15,7 @@
 - [Performance guide](performance.md)
 - [Worked examples](examples.md)
 - [Images and filters](images.md)
+- [Incremental accumulation](accumulators.md)
 
 # Reference
 

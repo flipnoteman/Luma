@@ -71,6 +71,8 @@ mod guide {
     pub mod examples {}
     #[doc = include_str!("../guide/src/images.md")]
     pub mod images {}
+    #[doc = include_str!("../guide/src/accumulators.md")]
+    pub mod accumulators {}
     #[doc = include_str!("../guide/src/environment.md")]
     pub mod environment {}
     #[doc = include_str!("../guide/src/faq.md")]

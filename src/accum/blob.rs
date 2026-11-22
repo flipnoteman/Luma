@@ -102,7 +102,7 @@ impl<'a> Reader<'a> {
             return Err(corrupt("array length does not match the shape"));
         }
         let raw = self.take(n.checked_mul(8).ok_or_else(|| corrupt("length"))?)?;
-        Ok(raw.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("eight bytes"))).collect())
+        Ok(raw.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect())
     }
 
     pub fn finish(self) -> Result<()> {

@@ -513,7 +513,6 @@ impl<W: Wide> CoState<W> {
             return Ok(());
         }
         let ctx = self.ctx.clone();
-        let shape = self.fields.n.0.shape();
         let pending = std::mem::take(&mut self.pending);
         let epoch = self.epoch.as_ref().expect("a push opened the epoch");
         let (kx, ky) = (epoch.kw.0.clone(), epoch.kw.1.clone());
@@ -533,7 +532,7 @@ impl<W: Wide> CoState<W> {
         }
         let n_b = match per {
             Some(per) => &per + uniform,
-            None => V::<W>::filled(&ctx, shape, uniform)?,
+            None => V::<W>::constant(&ctx, uniform)?,
         };
         let mut s: Vec<V<W>> = Vec::with_capacity(5);
         for k in 0..5 {

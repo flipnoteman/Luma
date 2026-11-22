@@ -239,6 +239,7 @@ impl<W: Wide> Histogram<W> {
         let bins = self.bins as u32;
         let scale = self.bins as f32 / (self.hi - self.lo);
         let plan = split_plan(ctx, dims, T::LAYOUT.stride() as u64, axes.iter().copied().find(|&a| dims[a] > 1));
+        #[allow(clippy::type_complexity)]
         let pieces: Vec<(Array<T>, Option<Array<bool>>, Option<(usize, usize)>)> = match plan {
             None => vec![(batch.clone(), mask.cloned(), None)],
             Some((axis, ranges)) => ranges.iter().map(|&(a, b)| (batch.slice(axis, a..b).cache(), mask.map(|m| m.slice(axis, a..b).cache()), Some((axis, a)))).collect(),
@@ -246,7 +247,7 @@ impl<W: Wide> Histogram<W> {
         for (piece, mask, split) in &pieces {
             let x = T::to_f32(piece);
             let bin = ((&x - self.lo) * scale).to_u32().minimum(bins - 1);
-            let slot = select(&x.is_nan(), bins + 2, &select(&x.lt(self.lo), bins, &select(&x.gt(self.hi), bins + 1, &bin)));
+            let slot = select(&x.is_nan(), bins + 2, select(&x.lt(self.lo), bins, select(&x.gt(self.hi), bins + 1, &bin)));
             let mut idx = state_index(ctx, piece.shape(), &axes, &slot, a0, state_dims, *split)?;
             if let Some(mask) = mask {
                 idx = select(mask, &idx, shape.len() as u32);

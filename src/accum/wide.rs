@@ -126,11 +126,11 @@ pub fn check_wide<W: Wide>(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
-/// `Df32` arrays have no reductions along an axis, only over the whole array, so a precise pass
-/// of a `Df32` state folds the whole batch.
+/// `Df32` and `f64` arrays have no reductions along an axis, only over the whole array, so a
+/// precise pass folds the whole batch.
 pub fn check_precise_axes<W: Wide>(precise: bool, dims: [usize; 4], axes: &[usize]) -> Result<()> {
-    if precise && std::any::TypeId::of::<W>() == std::any::TypeId::of::<Df32>() && !super::is_flat(dims, axes) {
-        return Err(LumaError::Unsupported("a precise pass of a Df32 state folds the whole batch (Df32 arrays have no reductions along an axis); use an f64 state or the default pass".into()));
+    if precise && !super::is_flat(dims, axes) {
+        return Err(LumaError::Unsupported(format!("a precise pass folds the whole batch ({} arrays have no reductions along an axis); use the default pass for per-position states", W::NAME)));
     }
     Ok(())
 }
@@ -528,9 +528,11 @@ pub fn reduce_axes<T: Numeric>(x: &Array<T>, axes: &[usize], ops: &[Reduction]) 
     for chunk in ops.chunks(4) {
         out.extend(first(x, axes[0], chunk));
     }
+    // The later axes combine the partial results: sums of squares add up like sums.
     for &axis in &axes[1..] {
         for (array, &op) in out.iter_mut().zip(ops) {
-            *array = array.reduce_axis(axis, [op]).into_iter().next().expect("one reduction");
+            let combine = if op == Reduction::SumOfSquares { Reduction::Sum } else { op };
+            *array = array.reduce_axis(axis, [combine]).into_iter().next().expect("one reduction");
         }
     }
     out

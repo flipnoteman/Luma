@@ -786,3 +786,172 @@ fn batches_split_over_several_buffers() {
     co.push(&batch, &batch).unwrap();
     close(read(co.corr())[0], 1.0, 0.0, 1e-5, "self correlation");
 }
+
+// ---------------------------------------------------------------------------------------------
+// More folds
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn several_axes_fold_at_once() {
+    // [3, 20, 4, 5]: fold axes 1 and 3, keep 3 x 4 positions.
+    let (a, b, c, d) = (3usize, 20usize, 4usize, 5usize);
+    let data = f32s(&normal(a * b * c * d, 60));
+    let acc = Accumulator::<Df32>::builder(Fold::axes(&[1, 3])).moments(2).sum().min_max().build().unwrap();
+    // Two pushes with different extents along the folded axes.
+    let at = |i: usize, j: usize, k: usize, l: usize| data[i + a * (j + b * (k + c * l))];
+    let part = |range: std::ops::Range<usize>| {
+        let mut out = Vec::new();
+        for l in 0..d {
+            for k in 0..c {
+                for j in range.clone() {
+                    for i in 0..a {
+                        out.push(at(i, j, k, l));
+                    }
+                }
+            }
+        }
+        Array::from_slice(&out, [a, range.len(), c, d]).unwrap()
+    };
+    acc.push(&part(0..7)).unwrap();
+    acc.push(&part(7..20)).unwrap();
+    let (mean, var, min) = (read(acc.mean()), read(acc.var()), read(acc.min()));
+    assert_eq!(mean.len(), a * c);
+    assert_eq!(read(acc.count()), vec![(b * d) as f64; a * c]);
+    for k in 0..c {
+        for i in 0..a {
+            let values: Vec<f64> = (0..d).flat_map(|l| (0..b).map(move |j| (j, l))).map(|(j, l)| at(i, j, k, l) as f64).collect();
+            let want = reference(&values);
+            close(mean[i + a * k], want.mean, 1e-5, 1e-6, "mean");
+            close(var[i + a * k], want.m2 / want.n, 1e-5, 0.0, "var");
+            close(min[i + a * k], want.min, 1e-6, 0.0, "min");
+        }
+    }
+}
+
+#[test]
+fn grouped_states_merge_and_round_trip() {
+    const F: usize = 2;
+    const G: usize = 3;
+    let rows = 900;
+    let data = f32s(&normal(F * rows, 61));
+    let labels: Vec<u32> = (0..rows).map(|r| (r % G) as u32).collect();
+    let make = || Accumulator::<Df32>::builder(Fold::axis(1)).moments(3).sum().min_max().groups(G).build().unwrap();
+    let (a, b) = (make(), make());
+    let push = |acc: &Accumulator<Df32>, from: usize, to: usize| {
+        let d = Array::from_slice(&data[from * F..to * F], [F, to - from]).unwrap();
+        acc.push_grouped(&d, &Array::from_slice(&labels[from..to], to - from).unwrap()).unwrap();
+    };
+    push(&a, 0, 400);
+    push(&a, 400, 600);
+    push(&b, 600, 900);
+    let b = Accumulator::<Df32>::from_bytes(&b.to_bytes().unwrap()).unwrap();
+    a.merge(&b).unwrap();
+    let (count, mean, var, sum) = (read(a.count()), read(a.mean()), read(a.var()), read(a.sum()));
+    for g in 0..G {
+        for f in 0..F {
+            let picked: Vec<f64> = (0..rows).filter(|&r| labels[r] == g as u32).map(|r| data[r * F + f] as f64).collect();
+            let want = reference(&picked);
+            let at = f + F * g;
+            close(count[at], want.n, 0.0, 0.0, "count");
+            close(mean[at], want.mean, 1e-4, 1e-5, "mean");
+            close(var[at], want.m2 / want.n, 1e-4, 0.0, "var");
+            close(sum[at], want.sum, 1e-4, 1e-3, "sum");
+        }
+    }
+    // A different group count is a different accumulator.
+    let other = Accumulator::<Df32>::builder(Fold::axis(1)).moments(3).sum().min_max().groups(G + 1).build().unwrap();
+    assert!(a.merge(&other).is_err());
+}
+
+#[test]
+fn argmin_argmax_with_masks_ties_and_merges() {
+    // Equal extremes: the first occurrence wins, also across pushes and merges.
+    let acc = Accumulator::<Df32>::builder(Fold::all()).arg_min_max().build().unwrap();
+    acc.push(&Array::from_slice(&[5.0f32, 1.0, 9.0, 1.0], 4).unwrap()).unwrap();
+    acc.push(&Array::from_slice(&[9.0f32, 0.5, 9.0], 3).unwrap()).unwrap();
+    assert_eq!(read(acc.argmin()), vec![5.0]);
+    assert_eq!(read(acc.argmax()), vec![2.0]);
+    // Masked-out elements are never the extreme but count as samples.
+    let masked = Accumulator::<Df32>::builder(Fold::all()).arg_min_max().build().unwrap();
+    masked.push_where(&Array::from_slice(&[7u32, 1, 9, 3], 4).unwrap(), &Array::from_slice(&[true, false, false, true], 4).unwrap()).unwrap();
+    assert_eq!(read(masked.argmin()), vec![3.0]);
+    assert_eq!(read(masked.argmax()), vec![0.0]);
+    // Per position, with the second accumulator's indices continuing after the first's.
+    let (a, b) = (Accumulator::<Df32>::builder(Fold::axis(1)).arg_min_max().build().unwrap(), Accumulator::<Df32>::builder(Fold::axis(1)).arg_min_max().build().unwrap());
+    a.push(&Array::from_slice(&[1i32, 4, 2, 5, 3, 6], [2, 3]).unwrap()).unwrap();
+    b.push(&Array::from_slice(&[0i32, 9, 8, 7], [2, 2]).unwrap()).unwrap();
+    a.merge(&b).unwrap();
+    assert_eq!(read(a.argmin()), vec![3.0, 0.0]);
+    assert_eq!(read(a.argmax()), vec![4.0, 3.0]);
+    assert_eq!(a.samples_seen(), 5);
+    // NaN elements skipped by the policy are not extremes either.
+    let skip = Accumulator::<Df32>::builder(Fold::all()).arg_min_max().nan_policy(NanPolicy::Skip).build().unwrap();
+    skip.push(&Array::from_slice(&[f32::NAN, 2.0, f32::NAN, -1.0], 4).unwrap()).unwrap();
+    assert_eq!(read(skip.argmin()), vec![3.0]);
+    assert_eq!(read(skip.argmax()), vec![1.0]);
+    // f64 and Df32 batches have no index passes.
+    let f64s = Accumulator::<Df32>::builder(Fold::all()).argmin().build().unwrap();
+    assert!(f64s.push(&Array::from_slice(&[1.0f64, 2.0], 2).unwrap()).is_err() || f64s.flush().is_err() || f64s.argmin().is_err());
+}
+
+#[test]
+fn f64_data_with_huge_offsets_per_feature_and_precise_whole() {
+    const F: usize = 3;
+    let rows = 500;
+    let noise = normal(F * rows, 62);
+    let data: Vec<f64> = noise.iter().enumerate().map(|(i, v)| 1.0e8 * (i % F) as f64 + 1.0e-3 * v).collect();
+    // Per feature: the default pass about the running mean keeps the spread of data 1e11 times
+    // smaller than its offset (a plain sum of squares has none of it left).
+    let acc = Accumulator::<f64>::builder(Fold::axis(1)).moments(4).build().unwrap();
+    for (start, count) in [(0, 200), (200, 300)] {
+        acc.push(&Array::from_slice(&data[start * F..(start + count) * F], [F, count]).unwrap()).unwrap();
+    }
+    let (mean, var, skew) = (read(acc.mean()), read(acc.var()), read(acc.skewness()));
+    for f in 0..F {
+        let column: Vec<f64> = (0..rows).map(|r| data[r * F + f]).collect();
+        let want = reference(&column);
+        close(mean[f], want.mean, 1e-15, 1e-9, "mean");
+        close(var[f], want.m2 / want.n, 1e-3, 0.0, "var");
+        close(skew[f], want.m3 / want.n / (want.m2 / want.n).powf(1.5), 0.0, 5e-2, "skewness");
+    }
+    // The whole batch with the precise pass: as exact as the state.
+    let column: Vec<f64> = (0..rows).map(|r| data[r * F]).collect();
+    let acc = Accumulator::<f64>::builder(Fold::all()).moments(4).precise().build().unwrap();
+    for chunk in column.chunks(200) {
+        acc.push(&Array::from_slice(chunk, chunk.len()).unwrap()).unwrap();
+    }
+    let want = reference(&column);
+    close(read(acc.var())[0], want.m2 / want.n, 1e-9, 0.0, "precise var");
+    close(read(acc.skewness())[0], want.m3 / want.n / (want.m2 / want.n).powf(1.5), 1e-6, 1e-8, "precise skewness");
+    // Neither wide type reduces along an axis: a precise pass folds the whole batch.
+    let df = Accumulator::<Df32>::builder(Fold::axis(1)).precise().build().unwrap();
+    assert!(df.push(&Array::from_slice(&data[..F * 10], [F, 10]).unwrap()).is_err());
+    let f64s = Accumulator::<f64>::builder(Fold::axis(1)).precise().build().unwrap();
+    assert!(f64s.push(&Array::from_slice(&data[..F * 10], [F, 10]).unwrap()).is_err());
+}
+
+#[test]
+fn bytes_of_every_accumulator_survive_a_second_trip() {
+    let x = f32s(&normal(500, 63));
+    let y = f32s(&normal(500, 64));
+    let xa = Array::from_slice(&x, 500).unwrap();
+    let ya = Array::from_slice(&y, 500).unwrap();
+    let co = CoMoments::<Df32>::new(Fold::all());
+    co.push(&xa, &ya).unwrap();
+    let co2 = CoMoments::<Df32>::from_bytes(&co.to_bytes().unwrap()).unwrap();
+    assert_eq!(co2.to_bytes().unwrap(), co.to_bytes().unwrap());
+    let hist = Histogram::<Df32>::new(10, -3.0, 3.0).unwrap();
+    hist.push(&xa).unwrap();
+    let hist2 = Histogram::<Df32>::from_bytes(&hist.to_bytes().unwrap()).unwrap();
+    assert_eq!(hist2.to_bytes().unwrap(), hist.to_bytes().unwrap());
+    let top = TopK::<f32, Df32>::smallest(4);
+    top.push(&xa).unwrap();
+    let top2 = TopK::<f32, Df32>::from_bytes(&top.to_bytes().unwrap()).unwrap();
+    assert_eq!(top2.to_bytes().unwrap(), top.to_bytes().unwrap());
+    // An accumulator's bytes are not a histogram's.
+    assert!(Histogram::<Df32>::from_bytes(&co.to_bytes().unwrap()).is_err());
+    // Empty accumulators round-trip too.
+    let empty = Accumulator::<Df32>::new(Fold::all());
+    let again = Accumulator::<Df32>::from_bytes(&empty.to_bytes().unwrap()).unwrap();
+    assert!(again.is_empty());
+}

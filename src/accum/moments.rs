@@ -140,7 +140,9 @@ impl<W: Wide> AccumulatorBuilder<W> {
     /// (Df32: about 1e-14 relative, f64: 1e-16), at the cost of the wide arithmetic in the pass
     /// over the batch (Df32 is about ten times the `f32` operations per element; f64 runs at the
     /// device's f64 rate). The default pass is `f32` about a pivot, accurate to a few `f32`
-    /// roundings relative to the spread of the data. Not available with groups.
+    /// roundings relative to the spread of the data. Only for folds of the whole batch
+    /// ([`Fold::All`], or all the axes that are not 1 deep), and not with groups: the wide types have
+    /// no reductions along an axis.
     #[must_use]
     pub fn precise(mut self) -> Self {
         self.cfg.precise = true;
@@ -169,10 +171,11 @@ impl<W: Wide> AccumulatorBuilder<W> {
         if cfg.groups.is_some() && (cfg.argmin || cfg.argmax) {
             return Err(LumaError::Unsupported("argmin / argmax with groups".into()));
         }
-        if let Fold::Axes(axes) = &cfg.fold {
-            if cfg.groups.is_some() && axes.len() != 1 {
-                return Err(invalid("a grouped accumulator folds one axis or the whole batch"));
-            }
+        if let Fold::Axes(axes) = &cfg.fold
+            && cfg.groups.is_some()
+            && axes.len() != 1
+        {
+            return Err(invalid("a grouped accumulator folds one axis or the whole batch"));
         }
         Ok(Accumulator { cfg, inner: Mutex::new(Inner { state: None }) })
     }
@@ -883,7 +886,7 @@ impl<W: Wide> State<W> {
             let real: Vec<usize> = axes.iter().copied().filter(|&a| dims[a] > 1).collect();
             let whole = is_flat(dims, axes);
             if !whole && real.is_empty() {
-                return Ok(V::zeros(ctx, Shape::new(kept_dims(dims, axes)))?);
+                return V::zeros(ctx, Shape::new(kept_dims(dims, axes)));
             }
             if !whole && real.len() != 1 {
                 return Err(LumaError::Unsupported("argmin / argmax over several axes that are not the whole batch".into()));
@@ -1035,7 +1038,6 @@ impl<W: Wide> State<W> {
             return Ok(());
         }
         let ctx = self.ctx.clone();
-        let shape = self.shape;
         let pending = std::mem::take(&mut self.pending);
         let pivot = self.epoch.as_ref().map(|e| e.k_w.clone());
         let zero = V::<W>::constant(&ctx, 0.0)?;
@@ -1056,7 +1058,7 @@ impl<W: Wide> State<W> {
         }
         let n_b = match per {
             Some(per) => &per + uniform,
-            None => V::<W>::filled(&ctx, shape, uniform)?,
+            None => V::<W>::constant(&ctx, uniform)?,
         };
         let f = &self.fields;
         let n = &f.n + &n_b;
@@ -1107,7 +1109,7 @@ impl<W: Wide> State<W> {
             let mut run = f.n.clone();
             for p in &pending {
                 let n_i = match &p.n {
-                    Count::Uniform(c) => V::<W>::filled(&ctx, shape, *c)?,
+                    Count::Uniform(c) => V::<W>::constant(&ctx, *c)?,
                     Count::Per(a) => V::<W>::from_u32(a),
                 };
                 if let (Some(b), Some(cur)) = (&p.min, next.min.as_ref()) {
