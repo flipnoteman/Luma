@@ -23,16 +23,20 @@
 //!   a flag in global memory records it, the rounds after convergence return at once, and the
 //!   host looks at the flags every few sweeps (so a big decomposition waits for the device).
 //!
+//! The rank of a big matrix does not need the singular values when two QR factorisations bound it
+//! from both sides (the `rank` module); it takes them when they do not.
+//!
 //! The matrix is scaled by a power of two (small kernel) or by its largest element (big matrix) so
 //! that the squares of the column norms neither overflow nor underflow, whatever the scale of
 //! the input.
 
 mod block;
+mod rank;
 
 use std::panic::Location;
 
 use super::{fail, launch, nth, per_matrix, stack_batch, Dims};
-use crate::array::Array;
+use crate::array::{Array, Failure};
 use crate::context::Context;
 use crate::error::LumaError;
 use crate::kernel::{uniform, KernelArg};
@@ -753,8 +757,53 @@ const NEXT_CHUNK: u32 = 2;
 /// columns per workgroup.
 const BLOCK_MIN: usize = 128;
 
+/// Columns from which a big matrix is decomposed through the QR factorisation of its tall form
+/// (see [`preconditioned`]).
+fn precondition_min() -> usize {
+    std::env::var("LUMA_SVD_PRECOND").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
+}
+
 /// Decomposes one matrix (`[cols, rows]`) in global memory.
-fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> {
+fn big(a: &Array<f32>, kind: Kind, vectors: bool, tol: f32) -> Result<Outputs, LumaError> {
+    let [cols, rows, ..] = a.shape().dims();
+    if kind == Kind::Svd && rows.min(cols) >= precondition_min() && tol == 0.0 {
+        preconditioned(a, vectors)
+    } else {
+        plain(a, kind, vectors, tol)
+    }
+}
+
+/// The decomposition of a big matrix through `A = Q R` (`A` tall, a wide matrix as its transpose):
+/// the Jacobi iteration works on `Rᵀ`, `Rᵀ = U' Σ V'ᵀ`, so `A = (Q V') Σ U'ᵀ`. The columns of the
+/// triangular `Rᵀ` are far from orthogonal in a different way than those of a dense `A` are: the
+/// iteration converges in about three quarters of the sweeps, for the price of the factorisation
+/// and one product with `Q`.
+fn preconditioned(a: &Array<f32>, vectors: bool) -> Result<Outputs, LumaError> {
+    let ctx = a.context();
+    let [cols, rows, ..] = a.shape().dims();
+    let wide = rows < cols;
+    let (rr, cc) = if wide { (cols, rows) } else { (rows, cols) };
+    let tall = if wide { a.transpose() } else { a.clone() };
+    let mx = tall.abs().max();
+    let mxs = select(&mx.gt(0.0f32), &mx, 1.0f32).cache();
+    let f = (&tall / &mxs).cache().qr();
+    let r = f.r().cache();
+    let inner = plain(&r.transpose().cache(), Kind::Svd, vectors, 0.0)?;
+    let s = (&inner.s * &mxs.reshape([1, 1, 1])).cache();
+    if !vectors {
+        return Ok(Outputs { s, u: None, vt: None });
+    }
+    let (u_r, vt_r) = (inner.u.expect("svd computes u"), inner.vt.expect("svd computes vt"));
+    // Q V', the left vectors of the tall matrix; U' are its right ones.
+    let v = vt_r.transpose();
+    let padded = if rr > cc { concat(1, [&v, &Array::<f32>::zeros_on(ctx, [cc, rr - cc])?]) } else { v };
+    let left = f.apply_q(&padded).cache();
+    let (u, vt) = if wide { (u_r, left.transpose().cache()) } else { (left, u_r.transpose().cache()) };
+    Ok(Outputs { s, u: Some(u), vt: Some(vt) })
+}
+
+/// Decomposes one matrix (`[cols, rows]`) in global memory by Jacobi iteration on its columns.
+fn plain(a: &Array<f32>, kind: Kind, vectors: bool, rank_tol: f32) -> Result<Outputs, LumaError> {
     let ctx = a.context();
     let [cols, rows, ..] = a.shape().dims();
     let wide = rows < cols;
@@ -790,7 +839,14 @@ fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> 
     let mut chg = Array::<u32>::zeros_on(ctx, [cap as usize + 1])?;
     let tol = tolerance(rr);
     if cc >= BLOCK_MIN {
-        block::sweeps(ctx, &mut w, vectors.then_some(&mut v), &mut chg, rr, cc, cap, FIRST_CHUNK, NEXT_CHUNK)?;
+        // The columns below the floor (squared) are not rotated: for counting singular values only.
+        let floor2 = if rank_tol > 0.0 && !vectors {
+            let longest = (&w * &w).sum_axis(0).max().sqrt().item()?;
+            (rank_tol * longest / (2.0 * (cc as f32).sqrt())).powi(2)
+        } else {
+            0.0
+        };
+        block::sweeps(ctx, &mut w, vectors.then_some(&mut v), &mut chg, rr, cc, floor2, cap, FIRST_CHUNK, NEXT_CHUNK)?;
     } else if cc > 1 {
         let t = big_threads(rr);
         let kernel = ctx.kernel(&round_source(t, vectors)).label("svd_round").build()?;
@@ -881,6 +937,15 @@ const NULL_SIGMA: f32 = 1.0e-18;
 
 /// The decomposition of every matrix of `a`: the entry point of the public operations.
 pub(crate) fn decompose(a: &Array<f32>, kind: Kind, vectors: bool, op: &'static str, loc: &'static Location<'static>) -> Outputs {
+    decompose_ranking(a, kind, vectors, 0.0, op, loc)
+}
+
+/// [`decompose`] for singular values that are only *counted* above `tol * s_max` (`tol > 0`, no
+/// vectors): the columns of a big matrix whose norm is below `tol * s_max / (2 sqrt(n))` are not
+/// rotated any more (the singular values they make are below the cut: `n` of them that are all
+/// parallel make `tol * s_max / 2` at most). A low-rank matrix then converges in the sweeps of
+/// its rank, the rounding noise of the rest is left alone.
+pub(crate) fn decompose_ranking(a: &Array<f32>, kind: Kind, vectors: bool, tol: f32, op: &'static str, loc: &'static Location<'static>) -> Outputs {
     let ctx = a.context();
     let poisoned = |shape: Shape, e: LumaError| {
         let bad = || fail(ctx, shape, e.clone(), op, loc);
@@ -894,9 +959,9 @@ pub(crate) fn decompose(a: &Array<f32>, kind: Kind, vectors: bool, op: &'static 
     let result = if let Some(plan) = plan(ctx, kind, vectors, rr, cc) {
         small(a, d, plan)
     } else if d.batch == 1 {
-        big(a, kind, vectors)
+        big(a, kind, vectors, tol)
     } else {
-        (0..d.batch).map(|i| big(&nth(a, i), kind, vectors)).collect::<Result<Vec<_>, _>>().map(|parts| {
+        (0..d.batch).map(|i| big(&nth(a, i), kind, vectors, tol)).collect::<Result<Vec<_>, _>>().map(|parts| {
             let join = |f: &dyn Fn(&Outputs) -> Option<Array<f32>>| -> Option<Array<f32>> {
                 let arrays: Vec<Array<f32>> = parts.iter().filter_map(f).collect();
                 (!arrays.is_empty()).then(|| stack_batch(&arrays))
@@ -999,7 +1064,12 @@ impl Array<f32> {
     }
 
     /// The numerical rank of every matrix, `[1, 1]` (`[1, 1, batch]`) as `u32`: the number of
-    /// singular values above `max(m, n) * eps * s_max`. Lazy, on the device.
+    /// singular values above `max(m, n) * eps * s_max`. Matrices that fit workgroup memory
+    /// (up to 96 columns) are decided by their singular values, lazily, on the device; a bigger
+    /// matrix is bounded from both sides by QR factorisations when that is possible (see the notes
+    /// of the `rank` module of the source: a rank that is not within the rounding errors of the
+    /// factorisations of the cut costs a QR factorisation, not a Jacobi iteration) and by the
+    /// singular values otherwise, with the same decision; that path waits for the device.
     ///
     /// ```
     /// # use luma::*;
@@ -1047,7 +1117,35 @@ fn pinv_of(a: &Array<f32>, tol: f32, op: &'static str, loc: &'static Location<'s
 }
 
 fn rank_of(a: &Array<f32>, tol: f32, op: &'static str, loc: &'static Location<'static>) -> Array<u32> {
-    let s = decompose(a, Kind::Svd, false, op, loc).s;
+    if let Ok(d) = Dims::of(a) {
+        let (rr, cc) = if d.rows >= d.cols { (d.rows, d.cols) } else { (d.cols, d.rows) };
+        if plan(a.context(), Kind::Svd, false, rr, cc).is_none() {
+            return big_rank(a, d, tol, op, loc);
+        }
+    }
+    above_cut(&decompose_ranking(a, Kind::Svd, false, tol, op, loc).s, tol)
+}
+
+/// The number of singular values above `tol * s_max` (`s` descending, `[k, 1, batch]`).
+fn above_cut(s: &Array<f32>, tol: f32) -> Array<u32> {
     let cut = &s.slice(0, 0..1) * tol;
     s.gt(&cut).sum_axis(0)
+}
+
+/// The rank of every matrix of a batch of big ones: [`rank::certified`] for each, the singular
+/// values for those it cannot decide. Waits for the device (the decisions are made on the host).
+fn big_rank(a: &Array<f32>, d: Dims, tol: f32, op: &'static str, loc: &'static Location<'static>) -> Array<u32> {
+    let ctx = a.context();
+    let one = |i: usize| -> Result<u32, LumaError> {
+        let m = if d.batch == 1 { a.clone() } else { nth(a, i) };
+        match rank::certified(&m, tol)? {
+            Some(k) => Ok(k),
+            None => above_cut(&decompose_ranking(&m, Kind::Svd, false, tol, op, loc).s, tol).item(),
+        }
+    };
+    let shape = Shape::from([1, 1, d.batch]);
+    match (0..d.batch).map(one).collect::<Result<Vec<_>, _>>().and_then(|ranks| Array::from_slice_on(ctx, &ranks, shape)) {
+        Ok(ranks) => ranks,
+        Err(e) => Array::resolve(ctx, shape, Err(Failure::New(e)), op, loc),
+    }
 }
