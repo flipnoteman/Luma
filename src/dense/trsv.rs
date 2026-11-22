@@ -8,8 +8,9 @@
 //!
 //! One workgroup a block of [`NB`] rows, taken in order from an atomic ticket (so the blocks a
 //! workgroup waits for have all started, whatever the order the device launches workgroups in).
-//! Block `b` is left-looking: for every block `j` before it, it waits for the flag of `j`, reads
-//! the solved `x_j` (published through atomics, a status word after a fence: the protocol of the
+//! Block `b` is left-looking: for every block `j` before it, it waits for the words of `j`, reads
+//! the solved `x_j` (published through atomics, every word complemented so that 0 means "not there yet":
+//! the reader spins on the words it needs, no status flag, no fence; the ticket is the one of the
 //! decoupled look-back of [`crate::scan`]) and adds `L[b, j] x_j` to its partial sums; the tiles of
 //! `L` do not depend on anything, so the next one is already in registers while the workgroup waits.
 //! Then the block's own triangle is solved by substitution in workgroup memory, `x_b` is published.
@@ -75,19 +76,28 @@ fn source(kc: usize, inv: bool) -> String {
         zero += &format!("    var p{c} = 0.0;\n");
         fma += &format!("            p{c} = fma(lq, xs[q * {ap}u + {c}u], p{c});\n");
     }
-    // Partial sums folded into `acc`: segment 0 starts it from the right-hand side.
+    // The partial sums of the segments go to `red` (the tile buffer in inverse mode: it is free by then), and
+    // every entry of `acc` starts from the right-hand side and takes all of them away.
+    let red = if inv { "lt" } else { "rs" };
     let mut fold = String::new();
-    for s in 0..SEG {
-        fold += &format!("    if (sg == {s}u && rr < rows) {{\n");
-        for c in 0..kc {
-            if s == 0 {
-                fold += &format!("        acc[rr * {ap}u + {c}u] = ldb(r0 + rr, {c}u) - p{c};\n");
-            } else {
-                fold += &format!("        acc[rr * {ap}u + {c}u] = acc[rr * {ap}u + {c}u] - p{c};\n");
-            }
-        }
-        fold += "    }\n    workgroupBarrier();\n";
+    for c in 0..kc {
+        fold += &format!("    {red}[sg * {} + rr * {ap}u + {c}u] = p{c};\n", NB * ap);
     }
+    fold += &format!(
+        "    workgroupBarrier();
+    for (var e = t; e < {NB}u * {kc}u; e = e + {T}u) {{
+        let r = e / {kc}u;
+        let c = e % {kc}u;
+        if (r < rows) {{
+            var s = ldb(r0 + r, c);
+            for (var g = 0u; g < {SEG}u; g = g + 1u) {{ s = s - {red}[g * {} + r * {ap}u + c]; }}
+            acc[r * {ap}u + c] = s;
+        }}
+    }}
+    workgroupBarrier();
+",
+        NB * ap
+    );
     let mut solve = String::new();
     for u in 0..cpt {
         solve += &format!(
@@ -107,16 +117,30 @@ fn source(kc: usize, inv: bool) -> String {
     let guard = || if words >= T { String::new() } else { format!("if (t < {words}u) ") };
     let mut xload = String::new();
     for u in 0..steps {
-        xload += &format!("        let w{u} = atomicLoad(&st[xb + j * {words}u + t + {}u]);\n", u * T);
-    }
-    for u in 0..steps {
-        xload += &format!("        {}{{ let e = t + {}u; xs[(e / {kc}u) * {ap}u + e % {kc}u] = bitcast<f32>(w{u}); }}\n", guard(), u * T);
+        xload += &format!(
+            "        {}{{
+            let e = t + {}u;
+            var w = 0u;
+            loop {{
+                w = atomicLoad(&st[xb + j * {words}u + e]);
+                if (w != 0u) {{ break; }}
+            }}
+            xs[(e / {kc}u) * {ap}u + e % {kc}u] = bitcast<f32>(~w);
+        }}\n",
+            guard(),
+            u * T
+        );
     }
     let mut publish = String::new();
     for u in 0..steps {
+        // A solved value is stored as the complement of its bits (never 0, which means not yet there: only
+        // the NaN of all ones would give 0, and it is stored as another NaN): no status word, no fence.
         publish += &format!("    {{
         let e = t + {}u;
-        if (e < {words}u && e / {kc}u < rows) {{ atomicStore(&st[xb + blk * {words}u + e], bitcast<u32>(xs[(e / {kc}u) * {ap}u + e % {kc}u])); }}
+        if (e < {words}u && e / {kc}u < rows) {{
+            let w = ~bitcast<u32>(xs[(e / {kc}u) * {ap}u + e % {kc}u]);
+            atomicStore(&st[xb + blk * {words}u + e], select(w, 1u, w == 0u));
+        }}
     }}\n", u * T);
     }
     // Inverse mode: the diagonal block is read first and inverted while the workgroup waits for the blocks before it
@@ -189,7 +213,7 @@ fn source(kc: usize, inv: bool) -> String {
 "
         )
     };
-    let extra_decls = if inv { format!("var<workgroup> dt: array<f32, {}>;\nvar<workgroup> iv: array<f32, {}>;\n", NB * (NB + 1) / 2, NB * LP) } else { String::new() };
+    let extra_decls = if inv { format!("var<workgroup> dt: array<f32, {}>;\nvar<workgroup> iv: array<f32, {}>;\n", NB * (NB + 1) / 2, NB * LP) } else { format!("var<workgroup> rs: array<f32, {}>;\n", SEG * NB * ap) };
     format!(
         "struct Params {{ n: u32, k: u32, unit: u32, nblocks: u32, ncg: u32 }}
 @group(1) @binding(0) var<storage, read> l: array<f32>;
@@ -222,8 +246,7 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     col0 = cg * {kc}u;
     let n = p.n;
     let k = p.k;
-    let fb = 1u + cg * p.nblocks;
-    let xb = 1u + p.ncg * p.nblocks + cg * n * {kc}u;
+    let xb = 1u + cg * n * {kc}u;
     let r0 = blk * {NB}u;
     let rows = min({NB}u, n - r0);
     let rr = t % {NB}u;
@@ -232,20 +255,12 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 {decls}    var c0 = 0u;
 {pre}{zero}    for (var j = 0u; j < blk; j = j + 1u) {{
         workgroupBarrier();
-{stores}{next_tile}        if (t == 0u) {{
-            loop {{
-                if (atomicLoad(&st[fb + j]) != 0u) {{ break; }}
-            }}
-        }}
-        storageBarrier();
-{xload}        workgroupBarrier();
+{stores}{next_tile}{xload}        workgroupBarrier();
         for (var q = sg * {SEGW}u; q < sg * {SEGW}u + {SEGW}u; q = q + 1u) {{
             let lq = lt[rr * {LP}u + q];
 {fma}        }}
     }}
-{tail}{publish}    storageBarrier();
-    if (t == 0u) {{ atomicStore(&st[fb + blk], 1u); }}
-    for (var e = t; e < rows * {kc}u; e = e + {T}u) {{
+{tail}{publish}    for (var e = t; e < rows * {kc}u; e = e + {T}u) {{
         let c = e % {kc}u;
         if (col0 + c < k) {{ o[(r0 + e / {kc}u) * k + col0 + c] = xs[(e / {kc}u) * {ap}u + c]; }}
     }}
@@ -264,7 +279,7 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, inverse: bo
     let nblocks = n.div_ceil(NB);
     let kc = group_columns(k.next_power_of_two());
     let ncg = k.div_ceil(kc);
-    let setup = (Array::<f32>::alloc(ctx, b.shape()), Array::<u32>::zeros_on(ctx, 1 + ncg * nblocks + ncg * n * kc));
+    let setup = (Array::<f32>::alloc(ctx, b.shape()), Array::<u32>::zeros_on(ctx, 1 + ncg * n * kc));
     let (mut out, mut st) = match setup {
         (Ok(o), Ok(s)) => (o, s),
         (Err(e), _) | (_, Err(e)) => return fail(ctx, b.shape(), e, op, loc),
