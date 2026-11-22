@@ -113,6 +113,14 @@ pub fn power_law(rows: usize, cap: usize, seed: u64) -> Csr {
     })
 }
 
+/// Rows of `lo..=hi` entries at random columns.
+pub fn uniform(rows: usize, lo: usize, hi: usize, seed: u64) -> Csr {
+    finish(rows, rows, &mut Gen::new(seed), |_, g, out| {
+        let d = lo + g.below(hi - lo + 1);
+        out.extend((0..d).map(|_| g.below(rows) as u32));
+    })
+}
+
 fn up_i32(v: &[u32]) -> Vec<i32> {
     v.iter().map(|&x| x as i32).collect()
 }
@@ -184,16 +192,17 @@ pub fn sparse(b: &mut Bench) {
             Err(e) => println!("cuSPARSE reference unavailable: {e}"),
         }
         let cs = cs.ok();
-        let mut mats: Vec<(&str, Csr)> = vec![("banded", banded(200_000, 2, 11)), ("powerlaw", power_law(100_000, 1 << 17, 31))];
+        let mut mats: Vec<(&str, Csr)> = vec![("banded", banded(200_000, 2, 11)), ("powerlaw", power_law(100_000, 1 << 17, 31)), ("uniform", uniform(60_000, 8, 24, 34))];
         if !b.quick {
             mats.push(("banded", banded(2_000_000, 2, 12)));
             mats.push(("powerlaw", power_law(800_000, 1 << 17, 32)));
+            mats.push(("uniform", uniform(600_000, 8, 24, 33)));
         }
         for (kind, a) in &mats {
             products(b, &ctx, cs.as_ref(), kind, a);
         }
         // Conversions and constructors on the big power-law matrix.
-        let (_, big) = mats.last().unwrap();
+        let (_, big) = mats.iter().rev().find(|(k, _)| *k == "powerlaw").unwrap();
         conversions(b, &ctx, cs.as_ref(), big);
         dense_forms(b, &ctx);
     });

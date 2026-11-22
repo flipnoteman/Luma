@@ -33,7 +33,7 @@
 //! segmented sum over the pointer ([`Array::sum_segments`], entries split evenly whatever the
 //! row lengths); for `c` dense columns one invocation per output element walks its row (the `c`
 //! invocations of a row read `c` adjacent elements of `x`, so the gather is coalesced) and rows of
-//! more than 512 entries are cut in pieces of 4096 that a workgroup each sums, the pieces added in
+//! more than 256 entries are cut in pieces of 2048 that a workgroup each sums, the pieces added in
 //! order. None of them uses atomics: the sums are the same on every run. The first product of
 //! any other combination scatters the products with an atomic add by output index
 //! ([`Array::group_sum`]), whose rounding depends on the order in which the atomics land; the
@@ -63,10 +63,10 @@ use crate::view::concat;
 
 /// Rows longer than this are not walked by the row kernels (their lanes would idle behind the one
 /// that holds the longest row): a workgroup of its own reduces each, see [`LONG_ROWS`].
-const LONG_ROW: u32 = 512;
+const LONG_ROW: u32 = 256;
 /// Entries of a long row one workgroup of [`LONG_ROWS`] sums (a long row is cut into pieces of this
 /// size, whose partial sums [`LONG_SUMS`] adds up in order).
-const CHUNK: u32 = 4096;
+const CHUNK: u32 = 2048;
 /// Invocations of a workgroup of every row kernel.
 const WORKGROUP: u32 = 128;
 /// Workgroups along x of the grids of the row kernels (the dispatch limit of every backend).
@@ -187,9 +187,11 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
 }
 "#;
 
-/// The rows longer than `cap`, one workgroup per (row, column `j`, piece of [`CHUNK`] entries): the
-/// 128 invocations stride over the piece and combine in workgroup memory into `part`. `shape` is
-/// the columns, `chunks` the pieces per row; exactly rows x columns x pieces workgroups run.
+/// The pieces of the rows longer than `cap`: workgroup `g` is piece `g / c` of the long rows (found
+/// by a binary search in `piece_ptr`, the offsets of the pieces of every long row) for the column
+/// `g % c`: the 128 invocations stride over the piece (`chunks` entries at most) and combine in
+/// workgroup memory into `part[g]`. `shape` is the columns, `total` the long rows; exactly
+/// pieces x columns workgroups run.
 const LONG_ROWS: &str = r#"
 struct Params { shape: u32, total: u32, cap: u32, chunks: u32 }
 @group(1) @binding(0) var<storage, read> ptr: array<u32>;
@@ -198,26 +200,31 @@ struct Params { shape: u32, total: u32, cap: u32, chunks: u32 }
 @group(1) @binding(3) var<storage, read> x: array<f32>;
 @group(1) @binding(4) var<storage, read_write> part: array<f32>;
 @group(1) @binding(5) var<storage, read> rows: array<u32>;
-@group(1) @binding(6) var<uniform> p: Params;
+@group(1) @binding(6) var<storage, read> piece_ptr: array<u32>;
+@group(1) @binding(7) var<uniform> p: Params;
 var<workgroup> sh: array<f32, 128>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let g = wg.y * 65535u + wg.x;
-    let q = g % p.chunks;
-    let ij = g / p.chunks;
     let c = p.shape;
-    let i = ij / c;
-    let j = ij - i * c;
-    let row = rows[i];
-    let b = ptr[row];
-    let e = ptr[row + 1u];
-    let lo = b + q * 4096u;
-    let hi = min(e, lo + 4096u);
-    var acc = 0.0;
-    var k = lo + li;
+    let piece = g / c;
+    let j = g - piece * c;
+    // The last long row whose first piece is at or before this one.
+    var lo = 0u;
+    var hi = p.total;
     loop {
-        if (k >= hi) { break; }
+        if (hi - lo <= 1u) { break; }
+        let mid = (lo + hi) / 2u;
+        if (piece_ptr[mid] <= piece) { lo = mid; } else { hi = mid; }
+    }
+    let row = rows[lo];
+    let b = ptr[row] + (piece - piece_ptr[lo]) * p.chunks;
+    let e = min(ptr[row + 1u], b + p.chunks);
+    var acc = 0.0;
+    var k = b + li;
+    loop {
+        if (k >= e) { break; }
         acc = acc + val[k] * x[minor[k] * c + j];
         k += 128u;
     }
@@ -234,25 +241,27 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
 }
 "#;
 
-/// The sums of the pieces of every (long row, column), in order, into `y`.
+/// The sums of the pieces of every (long row, column), in order, into `y`: `total` is rows x columns.
 const LONG_SUMS: &str = r#"
 struct Params { shape: u32, total: u32, cap: u32, chunks: u32 }
 @group(1) @binding(0) var<storage, read> part: array<f32>;
 @group(1) @binding(1) var<storage, read> rows: array<u32>;
-@group(1) @binding(2) var<storage, read_write> y: array<f32>;
-@group(1) @binding(3) var<uniform> p: Params;
+@group(1) @binding(2) var<storage, read> piece_ptr: array<u32>;
+@group(1) @binding(3) var<storage, read_write> y: array<f32>;
+@group(1) @binding(4) var<uniform> p: Params;
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
     if (t >= p.total) { return; }
-    var acc = 0.0;
-    for (var q = 0u; q < p.chunks; q += 1u) {
-        acc = acc + part[t * p.chunks + q];
-    }
     let c = p.shape;
     let i = t / c;
-    y[rows[i] * c + (t - i * c)] = acc;
+    let j = t - i * c;
+    var acc = 0.0;
+    for (var q = piece_ptr[i]; q < piece_ptr[i + 1u]; q += 1u) {
+        acc = acc + part[q * c + j];
+    }
+    y[rows[i] * c + j] = acc;
 }
 "#;
 
@@ -325,9 +334,18 @@ struct RowPlan {
     /// The longest row.
     max_len: u32,
     /// The rows longer than [`LONG_ROW`] (`None` if there are none).
-    long: Option<Array<u32>>,
-    /// Pieces of [`CHUNK`] entries of the longest row.
-    chunks: u32,
+    long: Option<LongRows>,
+}
+
+/// The rows longer than [`LONG_ROW`], each cut in pieces of [`CHUNK`] entries.
+#[derive(Clone)]
+struct LongRows {
+    /// The rows, ascending.
+    rows: Array<u32>,
+    /// `rows.len() + 1` offsets: the pieces of row `i` are `piece_ptr[i]..piece_ptr[i + 1]`.
+    piece_ptr: Array<u32>,
+    /// All the pieces.
+    pieces: usize,
 }
 
 /// Matrices whose rows are all at most this long take the row kernel for a vector product (a
@@ -931,8 +949,17 @@ impl Sparse<f32> {
             let n = ptr.len() - 1;
             let len = ptr.slice(0, 1..=n) - ptr.slice(0, 0..n);
             let max_len = len.max().item().map_err(Arc::new)?;
-            let long = if max_len > LONG_ROW { len.gt(LONG_ROW).nonzero().map_err(Arc::new)? } else { None };
-            Ok(RowPlan { max_len, long, chunks: max_len.div_ceil(CHUNK).max(1) })
+            let mut long = None;
+            if max_len > LONG_ROW
+                && let Some(rows) = len.gt(LONG_ROW).nonzero().map_err(Arc::new)?
+            {
+                let ends = ((len.take(&rows) + (CHUNK - 1)) / CHUNK).cumsum(0).cache();
+                let zero = Array::<u32>::zeros_on(&self.ctx, 1).map_err(Arc::new)?;
+                let piece_ptr = concat(0, [&zero, &ends]).cache();
+                let pieces = ends.slice(0, rows.len() - 1..rows.len()).item().map_err(Arc::new)? as usize;
+                long = Some(LongRows { rows, piece_ptr, pieces });
+            }
+            Ok(RowPlan { max_len, long })
         });
         match plan {
             Ok(plan) => Ok(plan.clone()),
@@ -973,15 +1000,15 @@ impl Sparse<f32> {
             let groups = (total as usize).div_ceil(WORKGROUP as usize);
             kernel.launch_raw(grid(groups)?, crate::args![ptr, minor, val, x, &mut y, crate::kernel::uniform(&params)])?;
         }
-        if let Some(rows) = long {
-            let pieces = rows.len() * c * plan.chunks as usize;
-            let mut part = Array::<f32>::alloc(&self.ctx, Shape::from(pieces))?;
+        if let Some(long) = long {
+            let (m, workgroups) = (long.rows.len(), long.pieces * c);
+            let mut part = Array::<f32>::alloc(&self.ctx, Shape::from(workgroups))?;
             let kernel = self.ctx.kernel(LONG_ROWS).label("sparse_long_rows").build()?;
-            let params = RowParams { shape: c as u32, total: 0, cap: LONG_ROW, chunks: plan.chunks };
-            kernel.launch_raw(grid(pieces)?, crate::args![ptr, minor, val, x, &mut part, &rows, crate::kernel::uniform(&params)])?;
+            let params = RowParams { shape: c as u32, total: m as u32, cap: LONG_ROW, chunks: CHUNK };
+            kernel.launch_raw(grid(workgroups)?, crate::args![ptr, minor, val, x, &mut part, &long.rows, &long.piece_ptr, crate::kernel::uniform(&params)])?;
             let sums = self.ctx.kernel(LONG_SUMS).label("sparse_long_sums").build()?;
-            let params = RowParams { shape: c as u32, total: (rows.len() * c) as u32, cap: LONG_ROW, chunks: plan.chunks };
-            sums.launch([(rows.len() * c) as u32], crate::args![&part, &rows, &mut y, crate::kernel::uniform(&params)])?;
+            let params = RowParams { shape: c as u32, total: (m * c) as u32, cap: LONG_ROW, chunks: CHUNK };
+            sums.launch([(m * c) as u32], crate::args![&part, &long.rows, &long.piece_ptr, &mut y, crate::kernel::uniform(&params)])?;
         }
         Ok(y)
     }
