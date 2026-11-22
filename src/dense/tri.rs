@@ -100,6 +100,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 /// right-hand sides `b`; the strict upper triangle of `l` (and the diagonal with `unit`) is not
 /// read.
 pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+    // `LUMA_TRSV_INV=1`: the inverted diagonal blocks for every solve (to measure them on `solve_triangular`).
+    lower_left_with(l, b, unit, std::env::var("LUMA_TRSV_INV").is_ok_and(|v| v == "1"), op, loc)
+}
+
+/// [`lower_left`] for the solves of a factorisation (`solve`, `solve_spd`), whose triangles are well conditioned
+/// blocks: few right-hand sides may take the diagonal blocks as explicit inverses (see [`super::trsv`]).
+pub(crate) fn lower_left_factor(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+    lower_left_with(l, b, unit, true, op, loc)
+}
+
+fn lower_left_with(l: &Array<f32>, b: &Array<f32>, unit: bool, inverse: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
     let ctx = l.context();
     let shape = b.shape();
     let dims = match (Dims::square(l), Dims::of(b)) {
@@ -115,7 +126,7 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'stati
         return substitute(l, b, ld, bd, unit, op, loc);
     }
     if super::trsv::applies(ctx, ld.rows, bd.cols, ld.batch) {
-        return super::trsv::lower_left(l, b, unit, op, loc);
+        return super::trsv::lower_left(l, b, unit, inverse, op, loc);
     }
     if ld.batch > 1 {
         let parts: Vec<Array<f32>> = (0..ld.batch).map(|i| blocked(&nth(l, i), &nth(b, i), unit, op, loc)).collect();

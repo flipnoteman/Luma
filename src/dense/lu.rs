@@ -20,7 +20,7 @@
 
 use std::panic::Location;
 
-use super::tri::{lower_left, rhs_matrix};
+use super::tri::{lower_left_factor, rhs_matrix};
 use super::{block, fail, fence, gather_rows, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::error::LumaError;
@@ -1164,8 +1164,8 @@ fn solve_matrix(f: &Lu, rhs: &Array<f32>, op: &'static str, loc: &'static Locati
         let y = solve_lower(&f.lu, &pb, true, op, loc);
         return solve_lower(&f.lu.flip(0).flip(1), &y.flip(1), false, op, loc).flip(1);
     }
-    let y = lower_left(&f.lu, &pb, true, op, loc);
-    lower_left(&f.lu.flip(0).flip(1), &y.flip(1), false, op, loc).flip(1)
+    let y = lower_left_factor(&f.lu, &pb, true, op, loc);
+    lower_left_factor(&f.lu.flip(0).flip(1), &y.flip(1), false, op, loc).flip(1)
 }
 
 fn inverse_with(f: &Lu, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {

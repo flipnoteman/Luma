@@ -56,7 +56,7 @@ pub(crate) fn applies(ctx: &crate::Context, n: usize, k: usize, batch: usize) ->
     batch == 1 && k <= KMAX && n > super::tri::BASE && ctx.tuning().lookback_scan && std::env::var("LUMA_TRSV").ok().is_none_or(|v| v != "0")
 }
 
-fn source(kc: usize) -> String {
+fn source(kc: usize, inv: bool) -> String {
     let ap = if kc == 1 { 1 } else { kc + 1 };
     let cpt = (kc / SEG).max(1);
     // The loads of a tile of `L` (columns from `c0`) into registers; the stores of those to workgroup memory.
@@ -119,6 +119,77 @@ fn source(kc: usize) -> String {
         if (e < {words}u && e / {kc}u < rows) {{ atomicStore(&st[xb + blk * {words}u + e], bitcast<u32>(xs[(e / {kc}u) * {ap}u + e % {kc}u])); }}
     }}\n", u * T);
     }
+    // Inverse mode: the diagonal block is read first and inverted while the workgroup waits for the blocks before it
+    // (a column of the inverse an invocation, `dt` the packed triangle, `iv` the inverse), then `x = iv acc` is
+    // a product, not 64 dependent steps with a barrier each (the same trick as the inverted diagonal blocks of
+    // MAGMA's `trsm`, Haidar et al.; here the inversion is off the critical path).
+    let mut dstores = String::new();
+    for u in 0..PER {
+        let (a, q) = (format!("select(e{u} % {NB}u, e{u} / {NB}u, jfast)"), format!("select(e{u} / {NB}u, e{u} % {NB}u, jfast)"));
+        dstores += &format!("    if ({q} <= {a}) {{ dt[{a} * ({a} + 1u) / 2u + {q}] = v{u}; }}\n");
+    }
+    let mut mv = String::new();
+    for u in 0..cpt {
+        mv += &format!(
+            "    {{
+        let c = sg * {cpt}u + {u}u;
+        if (c < {kc}u && rr < rows) {{
+            var s0 = 0.0;
+            for (var q = 0u; q <= rr; q = q + 1u) {{ s0 = fma(iv[rr * {LP}u + q], acc[q * {ap}u + c], s0); }}
+            xs[rr * {ap}u + c] = s0;
+        }}
+    }}\n"
+        );
+    }
+    let pre = if inv {
+        format!(
+            "    c0 = r0;
+{loads}{dstores}    workgroupBarrier();
+    if (t < rows) {{ rd[t] = select(1.0 / dt[t * (t + 1u) / 2u + t], 1.0, p.unit != 0u); }}
+    workgroupBarrier();
+    if (t < rows) {{
+        iv[t * {LP}u + t] = rd[t];
+        for (var i = t + 1u; i < rows; i = i + 1u) {{
+            let o = i * (i + 1u) / 2u;
+            var s0 = 0.0;
+            var s1 = 0.0;
+            var q = t;
+            for (; q + 1u < i; q = q + 2u) {{
+                s0 = fma(dt[o + q], iv[q * {LP}u + t], s0);
+                s1 = fma(dt[o + q + 1u], iv[(q + 1u) * {LP}u + t], s1);
+            }}
+            if (q < i) {{ s0 = fma(dt[o + q], iv[q * {LP}u + t], s0); }}
+            iv[i * {LP}u + t] = -(s0 + s1) * rd[i];
+        }}
+    }}
+    workgroupBarrier();
+    c0 = 0u;
+{loads}"
+        )
+    } else {
+        format!("    c0 = select(r0, 0u, blk > 0u);\n{loads}")
+    };
+    let next_tile = if inv {
+        format!("        if (j + 1u < blk) {{\n            c0 = (j + 1u) * {NB}u;\n{loads}        }}\n")
+    } else {
+        format!("        c0 = select(r0, (j + 1u) * {NB}u, j + 1u < blk);\n{loads}")
+    };
+    let tail = if inv {
+        format!("    workgroupBarrier();\n{fold}{mv}    workgroupBarrier();\n")
+    } else {
+        format!(
+            "    workgroupBarrier();
+{stores}    workgroupBarrier();
+    if (t < rows) {{ rd[t] = select(1.0 / lt[t * {LP}u + t], 1.0, p.unit != 0u); }}
+{fold}    for (var i = 0u; i < rows; i = i + 1u) {{
+        let ri = rd[i];
+        let li = lt[rr * {LP}u + i];
+{solve}        workgroupBarrier();
+    }}
+"
+        )
+    };
+    let extra_decls = if inv { format!("var<workgroup> dt: array<f32, {}>;\nvar<workgroup> iv: array<f32, {}>;\n", NB * (NB + 1) / 2, NB * LP) } else { String::new() };
     format!(
         "struct Params {{ n: u32, k: u32, unit: u32, nblocks: u32, ncg: u32 }}
 @group(1) @binding(0) var<storage, read> l: array<f32>;
@@ -134,7 +205,7 @@ var<workgroup> xs: array<f32, {xsize}>;
 var<workgroup> acc: array<f32, {xsize}>;
 var<workgroup> rd: array<f32, {NB}>;
 var<workgroup> ticket: u32;
-
+{extra_decls}
 fn ldl(i: u32, j: u32) -> f32 {{ return l[luma_view_idx3(lv, j, i, 0u)]; }}
 // Column `c` of the group's columns of row `i` of the right-hand side (0 past the last one).
 fn ldb(i: u32, c: u32) -> f32 {{ if (col0 + c < p.k) {{ return b[luma_view_idx3(bv, col0 + c, i, 0u)]; }} return 0.0; }}
@@ -158,11 +229,10 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     let rr = t % {NB}u;
     let sg = t / {NB}u;
     let jfast = abs(lv.stride.x) == 1;
-{decls}    var c0 = select(r0, 0u, blk > 0u);
-{loads}{zero}    for (var j = 0u; j < blk; j = j + 1u) {{
+{decls}    var c0 = 0u;
+{pre}{zero}    for (var j = 0u; j < blk; j = j + 1u) {{
         workgroupBarrier();
-{stores}        c0 = select(r0, (j + 1u) * {NB}u, j + 1u < blk);
-{loads}        if (t == 0u) {{
+{stores}{next_tile}        if (t == 0u) {{
             loop {{
                 if (atomicLoad(&st[fb + j]) != 0u) {{ break; }}
             }}
@@ -173,15 +243,7 @@ fn main(@builtin(local_invocation_index) t: u32) {{
             let lq = lt[rr * {LP}u + q];
 {fma}        }}
     }}
-    workgroupBarrier();
-{stores}    workgroupBarrier();
-    if (t < rows) {{ rd[t] = select(1.0 / lt[t * {LP}u + t], 1.0, p.unit != 0u); }}
-{fold}    for (var i = 0u; i < rows; i = i + 1u) {{
-        let ri = rd[i];
-        let li = lt[rr * {LP}u + i];
-{solve}        workgroupBarrier();
-    }}
-{publish}    storageBarrier();
+{tail}{publish}    storageBarrier();
     if (t == 0u) {{ atomicStore(&st[fb + blk], 1u); }}
     for (var e = t; e < rows * {kc}u; e = e + {T}u) {{
         let c = e % {kc}u;
@@ -195,7 +257,7 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 }
 
 /// `L X = B` for one `[n, n]` lower triangle and `[k, n]` right-hand sides, `k <= KMAX`; see the module doc.
-pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, inverse: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
     let ctx = l.context();
     let n = l.shape().dims()[1];
     let k = b.shape().dims()[0];
@@ -209,7 +271,7 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'stati
     };
     let params = Params { n: n as u32, k: k as u32, unit: u32::from(unit), nblocks: nblocks as u32, ncg: ncg as u32 };
     let args: [KernelArg<'_>; 5] = [view(l), view(b), (&mut out).into(), (&mut st).into(), uniform(&params)];
-    match launch(ctx, &format!("trsv/{kc}"), "trsv", || source(kc), [(nblocks * ncg) as u32, 1, 1], &args) {
+    match launch(ctx, &format!("trsv/{kc}/{}", u8::from(inverse)), "trsv", || source(kc, inverse), [(nblocks * ncg) as u32, 1, 1], &args) {
         Ok(()) => out,
         Err(e) => fail(ctx, b.shape(), e, op, loc),
     }
