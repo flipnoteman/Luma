@@ -2463,7 +2463,7 @@ impl ConsTable {
     #[inline]
     fn set_of(hash: u64, sets: usize) -> usize {
         // The high bits: the low ones of an `FxHasher` result are the weakest.
-        ((hash >> 24) as usize) & (sets - 1)
+        ((hash >> 40) as usize) & (sets - 1)
     }
 
     /// The node recorded for `hash`, if it is still alive.
