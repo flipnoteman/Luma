@@ -87,7 +87,7 @@ pub fn host_isa_key() -> String {
 }
 
 /// Kernels with more IR instructions than this skip Cranelift's optimiser, unless they have run-time
-/// contiguity checks (see [`CONTIG_COMPILE_INSTS`]). The optimiser is not always a gain: it makes
+/// contiguity checks (see [`CONTIG_COMPILE_INSTS`]) or deeply nested loops (see [`NESTED_LOOP_DEPTH`]). The optimiser is not always a gain: it makes
 /// compute-bound kernels of up to 3300 instructions faster (the all-pairs force of the `nbody`
 /// benchmark 1.6x), but the code it makes for larger ones was slower than the unoptimised one in
 /// every case measured (`cfd` MUSCL steps of 4000 instructions 1.3-1.5x, `fractal/mandelbrot_unrolled`
@@ -99,9 +99,33 @@ const FAST_COMPILE_INSTS: usize = 3_500;
 /// loads, 5200 instructions) 2.5x faster than the unoptimised code.
 const CONTIG_COMPILE_INSTS: usize = 16_000;
 
+/// Loops nested this deep (the lane packets of a launch count as one level) make a kernel one whose
+/// run time dominates its compile time and whose hot loop the optimiser improves, whatever its size:
+/// the tiled `conv1d` (`ml/conv/conv1d` k1023 s1 of 13500 instructions, 7.6 to 6.4 ms, k7 s2 of 8600
+/// 0.176 to 0.120 ms, `compute/fft/conv1d_direct` 15 % faster) loops over chunks, taps and
+/// outputs. The kernels that lost to the optimiser had one level (`fractal/mandelbrot_unrolled`, the
+/// larger `conv1d_fft` passes) or two (the other `conv1d_fft` passes, the MUSCL time-blocked stencil).
+const NESTED_LOOP_DEPTH: usize = 3;
+
+/// Largest kernel with [`NESTED_LOOP_DEPTH`] loops that is optimised (compiling takes about 3 ms per
+/// thousand instructions optimised).
+const NESTED_COMPILE_INSTS: usize = 40_000;
+
+/// The deepest loop nest of `func` (0 without loops).
+fn max_loop_depth(func: &cranelift_codegen::ir::Function) -> usize {
+    use cranelift_codegen::dominator_tree::DominatorTree;
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
+    use cranelift_codegen::loop_analysis::LoopAnalysis;
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let mut loops = LoopAnalysis::new();
+    loops.compute(func, &cfg, &domtree);
+    func.layout.blocks().map(|block| loops.loop_level(block).level()).max().unwrap_or(0)
+}
+
 /// Revision of the generated code, part of the disk-cache key: bump it whenever the code this
 /// module generates for the same kernel changes, so cached blobs from older builds are not reused.
-pub(crate) const REVISION: u32 = 5;
+pub(crate) const REVISION: u32 = 6;
 
 // ---------------------------------------------------------------------------------------------
 // Memory flags
@@ -418,10 +442,12 @@ pub fn compile(
     // Optimised compilation costs about 2.5x the unoptimised one (35 ms against 10 ms at 10k
     // instructions), and the code it makes is not always faster: see `FAST_COMPILE_INSTS`.
     let limit = if run_time_contig > 0 { CONTIG_COMPILE_INSTS } else { FAST_COMPILE_INSTS };
-    let target_isa = if func.dfg.num_insts() > limit {
-        ISA_FAST.as_ref().map_err(Clone::clone)?
-    } else {
+    let insts = func.dfg.num_insts();
+    let optimise = insts <= limit || (insts <= NESTED_COMPILE_INSTS && max_loop_depth(&func) >= NESTED_LOOP_DEPTH);
+    let target_isa = if optimise {
         isa
+    } else {
+        ISA_FAST.as_ref().map_err(Clone::clone)?
     };
     let mut cctx = Context::for_function(func);
     let compiled = cctx
@@ -4554,6 +4580,40 @@ mod tests {
             assert_eq!(swap[i], xs[i ^ 1], "swap {i}");
             let g = i / 4 * 4;
             assert_eq!(sums[i], xs[g..g + 4].iter().sum::<f32>(), "sum {i}");
+        }
+    }
+
+    #[test]
+    fn loop_depth_counts_nested_loops() {
+        // `depth` loops, each inside the previous one, around one block.
+        fn nest(depth: usize) -> usize {
+            let mut func = Function::new();
+            let mut fbc = FunctionBuilderContext::new();
+            let mut b = FunctionBuilder::new(&mut func, &mut fbc);
+            let entry = b.create_block();
+            let headers: Vec<Block> = (0..depth).map(|_| b.create_block()).collect();
+            let latches: Vec<Block> = (0..depth).map(|_| b.create_block()).collect();
+            let exit = b.create_block();
+            b.switch_to_block(entry);
+            let more = b.ins().iconst(types::I32, 1);
+            b.ins().jump(headers.first().copied().unwrap_or(exit), &[]);
+            for i in 0..depth {
+                b.switch_to_block(headers[i]);
+                b.ins().jump(headers.get(i + 1).copied().unwrap_or(latches[depth - 1]), &[]);
+            }
+            for i in (0..depth).rev() {
+                b.switch_to_block(latches[i]);
+                let after = if i == 0 { exit } else { latches[i - 1] };
+                b.ins().brif(more, headers[i], &[], after, &[]);
+            }
+            b.switch_to_block(exit);
+            b.ins().return_(&[]);
+            b.seal_all_blocks();
+            b.finalize(ISA_SPEED.as_ref().expect("host isa").frontend_config());
+            max_loop_depth(&func)
+        }
+        for depth in 0..5 {
+            assert_eq!(nest(depth), depth, "{depth} nested loops");
         }
     }
 }
