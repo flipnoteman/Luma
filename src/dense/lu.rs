@@ -893,6 +893,9 @@ fn solve_lower(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc
     let ctx = l.context();
     let [_, n, ..] = l.shape().dims();
     let [k, ..] = b.shape().dims();
+    if n > BLOCK && k >= BLOCK_COLUMNS && std::env::var("LUMA_LU_INVBLOCKS").ok().is_none_or(|v| v != "0") {
+        return solve_blocks(l, b, unit, op, loc);
+    }
     if n > LEAF {
         let h = super::tri::split(n).min(n - 1);
         let x1 = solve_lower(&block(l, 0..h, 0..h), &block(b, 0..h, 0..k), unit, op, loc).cache();
@@ -916,6 +919,42 @@ fn solve_lower(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc
         Ok(()) => x,
         Err(e) => fail(ctx, b.shape(), e, op, loc),
     }
+}
+
+/// Rows of a diagonal block whose inverse the wide solves multiply by, and the fewest right-hand sides they take that way.
+const BLOCK: usize = 64;
+const BLOCK_COLUMNS: usize = 64;
+
+/// `L X = B` for many right-hand sides: the inverses of all the diagonal blocks of [`BLOCK`] rows in one launch
+/// ([`super::trsv::invert_blocks`]), then the halving of [`solve_lower`] with a block of rows solved by one multiplication with its inverse
+/// ([`super::trsv::apply_inverse`], 4 us where the substitution leaf takes 15) that writes its rows into the one solution. The
+/// blocks are the diagonal blocks of a triangle of a factorisation (unit lower with multipliers of at most a few
+/// units, or a Cholesky factor), as well conditioned as their substitution.
+fn solve_blocks(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+    let ctx = l.context();
+    let invs = super::trsv::invert_blocks(l, unit, op, loc);
+    let mut out = match Array::<f32>::alloc(ctx, b.shape()) {
+        Ok(x) => x,
+        Err(e) => return fail(ctx, b.shape(), e, op, loc),
+    };
+    match solve_range(l, b, &invs, &mut out, 0) {
+        Ok(()) => out,
+        Err(e) => fail(ctx, b.shape(), e, op, loc),
+    }
+}
+
+/// Rows `row0 ..` of the solution of `L X = B` (`l` the block of the triangle, `b` its right-hand sides).
+fn solve_range(l: &Array<f32>, b: &Array<f32>, invs: &Array<f32>, out: &mut Array<f32>, row0: usize) -> Result<(), LumaError> {
+    let [_, n, ..] = l.shape().dims();
+    let [k, ..] = b.shape().dims();
+    if n <= BLOCK {
+        return super::trsv::apply_inverse(invs, b, out, row0);
+    }
+    let h = (n / 2).next_multiple_of(BLOCK).min(n - 1);
+    solve_range(&block(l, 0..h, 0..h), &block(b, 0..h, 0..k), invs, out, row0)?;
+    let x1 = out.slice(1, row0..row0 + h);
+    let update = &block(b, h..n, 0..k) - &matmul_f32(&block(l, h..n, 0..h), &x1);
+    solve_range(&block(l, h..n, h..n), &update, invs, out, row0 + h)
 }
 
 /// The widest matrix (in columns) a leaf of `m` rows factors in one launch.

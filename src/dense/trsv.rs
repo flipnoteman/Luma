@@ -57,19 +57,51 @@ pub(crate) fn applies(ctx: &crate::Context, n: usize, k: usize, batch: usize) ->
     batch == 1 && k <= KMAX && n > super::tri::BASE && ctx.tuning().lookback_scan && std::env::var("LUMA_TRSV").ok().is_none_or(|v| v != "0")
 }
 
-fn source(kc: usize, inv: bool) -> String {
-    let ap = if kc == 1 { 1 } else { kc + 1 };
-    let cpt = (kc / SEG).max(1);
-    // The loads of a tile of `L` (columns from `c0`) into registers; the stores of those to workgroup memory.
-    let mut decls = String::new();
-    let mut loads = String::new();
-    let mut stores = String::new();
+/// The pieces that read a tile of `L` through the view into the registers `v0..` of an invocation (columns from `c0`,
+/// rows from `r0`, the elements of a tile `T` apart so that the warps read along whichever axis is contiguous) and
+/// put them into `lt` (pitch [`LP`]) or, the triangle only, into the packed `dt`.
+fn tile_text() -> (String, String, String, String) {
+    let (mut decls, mut loads, mut stores, mut dstores) = (String::new(), String::new(), String::new(), String::new());
     for u in 0..PER {
         let (a, q) = (format!("select(e{u} % {NB}u, e{u} / {NB}u, jfast)"), format!("select(e{u} / {NB}u, e{u} % {NB}u, jfast)"));
         decls += &format!("    var v{u} = 0.0;\n    let e{u} = t + {}u;\n", u * T);
         loads += &format!("        if (r0 + {a} < n && c0 + {q} < n) {{ v{u} = ldl(r0 + {a}, c0 + {q}); }} else {{ v{u} = 0.0; }}\n");
         stores += &format!("        lt[{a} * {LP}u + {q}] = v{u};\n");
+        dstores += &format!("    if ({q} <= {a}) {{ dt[{a} * ({a} + 1u) / 2u + {q}] = v{u}; }}\n");
     }
+    (decls, loads, stores, dstores)
+}
+
+/// Inverts the lower triangle `dt` (packed, `rows` of it, the reciprocals of its diagonal in `rd`, 1 for `p.unit`)
+/// into `iv` (pitch [`LP`], below the diagonal and on it): an invocation a column of the inverse, `y_i = -(sum_q
+/// l_iq y_q) / l_ii`, two chains of multiply-adds. Ends with a barrier.
+fn invert_text() -> String {
+    format!(
+        "    if (t < rows) {{ rd[t] = select(1.0 / dt[t * (t + 1u) / 2u + t], 1.0, p.unit != 0u); }}
+    workgroupBarrier();
+    if (t < rows) {{
+        iv[t * {LP}u + t] = rd[t];
+        for (var i = t + 1u; i < rows; i = i + 1u) {{
+            let o = i * (i + 1u) / 2u;
+            var s0 = 0.0;
+            var s1 = 0.0;
+            var q = t;
+            for (; q + 1u < i; q = q + 2u) {{
+                s0 = fma(dt[o + q], iv[q * {LP}u + t], s0);
+                s1 = fma(dt[o + q + 1u], iv[(q + 1u) * {LP}u + t], s1);
+            }}
+            if (q < i) {{ s0 = fma(dt[o + q], iv[q * {LP}u + t], s0); }}
+            iv[i * {LP}u + t] = -(s0 + s1) * rd[i];
+        }}
+    }}
+"
+    )
+}
+
+fn source(kc: usize, inv: bool) -> String {
+    let ap = if kc == 1 { 1 } else { kc + 1 };
+    let cpt = (kc / SEG).max(1);
+    let (decls, loads, stores, dstores) = tile_text();
     let mut zero = String::new();
     let mut fma = String::new();
     for c in 0..kc {
@@ -147,11 +179,6 @@ fn source(kc: usize, inv: bool) -> String {
     // (a column of the inverse an invocation, `dt` the packed triangle, `iv` the inverse), then `x = iv acc` is
     // a product, not 64 dependent steps with a barrier each (the same trick as the inverted diagonal blocks of
     // MAGMA's `trsm`, Haidar et al.; here the inversion is off the critical path).
-    let mut dstores = String::new();
-    for u in 0..PER {
-        let (a, q) = (format!("select(e{u} % {NB}u, e{u} / {NB}u, jfast)"), format!("select(e{u} / {NB}u, e{u} % {NB}u, jfast)"));
-        dstores += &format!("    if ({q} <= {a}) {{ dt[{a} * ({a} + 1u) / 2u + {q}] = v{u}; }}\n");
-    }
     let mut mv = String::new();
     for u in 0..cpt {
         mv += &format!(
@@ -165,28 +192,12 @@ fn source(kc: usize, inv: bool) -> String {
     }}\n"
         );
     }
+    let invert = invert_text();
     let pre = if inv {
         format!(
             "    c0 = r0;
 {loads}{dstores}    workgroupBarrier();
-    if (t < rows) {{ rd[t] = select(1.0 / dt[t * (t + 1u) / 2u + t], 1.0, p.unit != 0u); }}
-    workgroupBarrier();
-    if (t < rows) {{
-        iv[t * {LP}u + t] = rd[t];
-        for (var i = t + 1u; i < rows; i = i + 1u) {{
-            let o = i * (i + 1u) / 2u;
-            var s0 = 0.0;
-            var s1 = 0.0;
-            var q = t;
-            for (; q + 1u < i; q = q + 2u) {{
-                s0 = fma(dt[o + q], iv[q * {LP}u + t], s0);
-                s1 = fma(dt[o + q + 1u], iv[(q + 1u) * {LP}u + t], s1);
-            }}
-            if (q < i) {{ s0 = fma(dt[o + q], iv[q * {LP}u + t], s0); }}
-            iv[i * {LP}u + t] = -(s0 + s1) * rd[i];
-        }}
-    }}
-    workgroupBarrier();
+{invert}    workgroupBarrier();
     c0 = 0u;
 {loads}"
         )
@@ -290,4 +301,140 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, inverse: bo
         Ok(()) => out,
         Err(e) => fail(ctx, b.shape(), e, op, loc),
     }
+}
+
+fn invert_source() -> String {
+    let (decls, loads, _, dstores) = tile_text();
+    let invert = invert_text();
+    let mut out = String::new();
+    for u in 0..PER {
+        out += &format!("    {{
+        let e = t + {}u;
+        let a = e / {NB}u;
+        let q = e % {NB}u;
+        iw[(r0 + a) * {NB}u + q] = select(0.0, iv[a * {LP}u + q], q <= a && a < rows);
+    }}\n", u * T);
+    }
+    format!(
+        "struct Params {{ n: u32, unit: u32 }}
+@group(1) @binding(0) var<storage, read> l: array<f32>;
+@group(1) @binding(1) var<uniform> lv: LumaView;
+@group(1) @binding(2) var<storage, read_write> iw: array<f32>;
+@group(1) @binding(3) var<uniform> p: Params;
+
+var<workgroup> dt: array<f32, {dsize}>;
+var<workgroup> iv: array<f32, {isize}>;
+var<workgroup> rd: array<f32, {NB}>;
+
+fn ldl(i: u32, j: u32) -> f32 {{ return l[luma_view_idx3(lv, j, i, 0u)]; }}
+
+@compute @workgroup_size({T})
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
+    let n = p.n;
+    let r0 = wid.x * {NB}u;
+    let c0 = r0;
+    let rows = min({NB}u, n - r0);
+    let jfast = abs(lv.stride.x) == 1;
+{decls}{loads}{dstores}    workgroupBarrier();
+{invert}    workgroupBarrier();
+{out}}}
+",
+        dsize = NB * (NB + 1) / 2,
+        isize = NB * LP,
+    )
+}
+
+#[derive(encase::ShaderType)]
+struct InvParams {
+    n: u32,
+    unit: u32,
+}
+
+/// The inverses of the diagonal blocks of [`NB`] rows of the `[n, n]` lower triangle `l`, stacked: `[NB, n.next_multiple_of(NB)]`,
+/// block `i` is rows `i * NB ..` (the last one's inverse is in its top left corner, zero elsewhere). One launch.
+pub(crate) fn invert_blocks(l: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+    let ctx = l.context();
+    let n = l.shape().dims()[1];
+    let nblocks = n.div_ceil(NB);
+    let shape = crate::shape::Shape::from([NB, nblocks * NB]);
+    let mut out = match Array::<f32>::alloc(ctx, shape) {
+        Ok(o) => o,
+        Err(e) => return fail(ctx, shape, e, op, loc),
+    };
+    let params = InvParams { n: n as u32, unit: u32::from(unit) };
+    let args: [KernelArg<'_>; 3] = [view(l), (&mut out).into(), uniform(&params)];
+    match launch(ctx, "trsv_invert", "trsv_invert", invert_source, [nblocks as u32, 1, 1], &args) {
+        Ok(()) => out,
+        Err(e) => fail(ctx, shape, e, op, loc),
+    }
+}
+
+fn apply_source() -> String {
+    let mut acc = String::new();
+    let mut fma = String::new();
+    let mut store = String::new();
+    for i in 0..4 {
+        for j in 0..4 {
+            acc += &format!("    var s{i}{j} = 0.0;\n");
+            fma += &format!("        s{i}{j} = fma(a{i}, b{j}, s{i}{j});\n");
+            store += &format!("    if (ty * 4u + {i}u < rows && c0 + tx * 4u + {j}u < k) {{ o[(row0 + ty * 4u + {i}u) * k + c0 + tx * 4u + {j}u] = s{i}{j}; }}\n");
+        }
+    }
+    let loads: String = (0..4).map(|i| format!("        let a{i} = iv[(ty * 4u + {i}u) * {LP}u + q];\n")).collect();
+    let bloads: String = (0..4).map(|j| format!("        let b{j} = bs[q * {LP}u + tx * 4u + {j}u];\n")).collect();
+    format!(
+        "struct Params {{ rows: u32, k: u32, row0: u32, pad: u32 }}
+@group(1) @binding(0) var<storage, read> inv: array<f32>;
+@group(1) @binding(1) var<storage, read> b: array<f32>;
+@group(1) @binding(2) var<uniform> bv: LumaView;
+@group(1) @binding(3) var<storage, read_write> o: array<f32>;
+@group(1) @binding(4) var<uniform> p: Params;
+
+var<workgroup> iv: array<f32, {size}>;
+var<workgroup> bs: array<f32, {size}>;
+
+@compute @workgroup_size({T})
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
+    let rows = p.rows;
+    let k = p.k;
+    let row0 = p.row0;
+    let c0 = wid.x * {NB}u;
+    for (var e = t; e < {NB}u * {NB}u; e = e + {T}u) {{
+        let r = e / {NB}u;
+        let q = e % {NB}u;
+        iv[r * {LP}u + q] = select(0.0, inv[(row0 + r) * {NB}u + q], r < rows && q < rows);
+        // The right-hand side tile, along whichever axis of the view the warp should run.
+        let cc = e % {NB}u;
+        let qq = e / {NB}u;
+        var v = 0.0;
+        if (qq < rows && c0 + cc < k) {{ v = b[luma_view_idx3(bv, c0 + cc, qq, 0u)]; }}
+        bs[qq * {LP}u + cc] = v;
+    }}
+    workgroupBarrier();
+    let ty = t / 16u;
+    let tx = t % 16u;
+{acc}    for (var q = 0u; q < {NB}u; q = q + 1u) {{
+{loads}{bloads}{fma}    }}
+{store}}}
+",
+        size = NB * LP,
+    )
+}
+
+#[derive(encase::ShaderType)]
+struct ApplyParams {
+    rows: u32,
+    k: u32,
+    row0: u32,
+    pad: u32,
+}
+
+/// Rows `row0 ..` of `out` (`[k, n]`, row `i` at `i * k`) `= inv_block(row0) * b`, `b` is `[k, rows]` (a view of any strides) and
+/// `invs` the output of [`invert_blocks`]: a block of at most [`NB`] rows of a triangular solve in one launch.
+pub(crate) fn apply_inverse(invs: &Array<f32>, b: &Array<f32>, out: &mut Array<f32>, row0: usize) -> Result<(), crate::error::LumaError> {
+    let ctx = invs.context();
+    let [k, rows, ..] = b.shape().dims();
+    let params = ApplyParams { rows: rows as u32, k: k as u32, row0: row0 as u32, pad: 0 };
+    let args: [KernelArg<'_>; 4] = [invs.into(), view(b), out.into(), uniform(&params)];
+    launch(ctx, "trsv_apply", "trsv_apply", apply_source, [k.div_ceil(NB) as u32, 1, 1], &args)
 }
