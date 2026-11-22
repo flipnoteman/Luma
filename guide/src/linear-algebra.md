@@ -52,6 +52,15 @@ assert!((back.to_vec()?[0] - 0.25).abs() < 1e-5);
   loops over calls.
 * A big matrix is factored recursively; the leaves are small kernels and every other flop is a
   full-`f32` `matmul_f32` of the halves (never TF32: a factorisation's accuracy depends on it).
+* A triangular solve with up to 32 right-hand sides (`solve_triangular`, and the two solves inside
+  `solve` and `solve_spd`) of a triangle of more than 64 rows is one launch on CUDA devices: one
+  workgroup per block of 64 rows takes its turn from an atomic ticket, waits for the solved blocks
+  before it (the words they publish are the complement of the bits, 0 meaning "not there yet": no flags
+  or fences), and solves its own block. The factorisations' solves take the diagonal blocks as explicit
+  inverses (computed while the workgroup waits; the blocks are well-conditioned triangles of a
+  factorisation, a Cholesky factor or a unit `L` with bounded multipliers); `solve_triangular` of an
+  arbitrary triangle substitutes. More right-hand sides, and every other backend, solve in blocks of rows
+  with `matmul_f32` products.
 * Numerical failure never poisons or raises: a matrix that is not positive definite leaves `NaN`
   on the diagonal of its Cholesky factor, a singular matrix a zero on the diagonal of `U` (the
   solve then gives `Inf`/`NaN`, the determinant 0). Shape errors poison the result as usual.

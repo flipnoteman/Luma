@@ -29,6 +29,7 @@ pub(crate) mod lu;
 pub(crate) mod svd;
 pub(crate) mod qr;
 pub(crate) mod tri;
+pub(crate) mod trsv;
 pub(crate) mod tsqr;
 
 /// Which triangle of a matrix an operation reads.

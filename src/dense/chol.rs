@@ -9,7 +9,7 @@
 
 use std::panic::Location;
 
-use super::tri::{block_size, lower_left, rhs_matrix};
+use super::tri::{block_size, lower_left_factor, rhs_matrix};
 use super::{block, fail, launch, launch_unchecked, nth, product, per_matrix, stack_batch, Dims, NAN};
 use crate::array::Array;
 use crate::context::Context;
@@ -637,10 +637,10 @@ impl Array<f32> {
 
 fn cholesky_solve(l: &Array<f32>, b: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
     let (rhs, vector) = rhs_matrix(l, b);
-    let y = lower_left(l, &rhs, false, "cholesky_solve", loc);
+    let y = lower_left_factor(l, &rhs, false, "cholesky_solve", loc);
     // Lᵀ X = Y: the transpose is upper, solved on its flip.
     let lt = l.transpose().flip(0).flip(1);
-    let x = lower_left(&lt, &y.flip(1), false, "cholesky_solve", loc).flip(1);
+    let x = lower_left_factor(&lt, &y.flip(1), false, "cholesky_solve", loc).flip(1);
     if vector { x.reshape(b.shape()) } else { x }
 }
 

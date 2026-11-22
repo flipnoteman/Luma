@@ -257,6 +257,46 @@ fn solve_triangular_every_variant() {
     }
 }
 
+/// A few right-hand sides of a triangle of many blocks of rows go through the one-launch solve of CUDA devices (columns in
+/// groups of 8, rows in blocks of 64, the last one partial): every variant, with the junk half and without the diagonal.
+#[test]
+fn solve_triangular_few_columns_of_many_blocks() {
+    let ctx = Context::new().unwrap();
+    for &n in &[65usize, 130, 257, 600] {
+        for &k in &[2usize, 8, 9, 16, 32, 33] {
+            for (tri, transpose_a, unit) in [(Triangle::Lower, false, false), (Triangle::Upper, true, true), (Triangle::Upper, false, false), (Triangle::Lower, true, false)] {
+                let (stored, mut exact) = triangular(n, (n * 11 + k) as u64, tri, 1e3);
+                if unit {
+                    for i in 0..n {
+                        exact[i * n + i] = 1.0;
+                    }
+                }
+                let b = values(n * k, 99 + n as u64, -1.0, 1.0);
+                let x = mat(&ctx, &stored, n, n, 1).solve_triangular(&mat(&ctx, &b, k, n, 1), tri, transpose_a, unit);
+                let x = widen(&x.to_vec().unwrap());
+                let op = if transpose_a { transpose(&exact, n, n) } else { exact.clone() };
+                let r = residual(&op, &x, &widen(&b), n, k);
+                assert!(r < 2e-6, "n = {n}, k = {k}, {tri:?}, transpose {transpose_a}, unit {unit}: residual {r}");
+            }
+        }
+    }
+}
+
+/// `solve_spd` of many blocks of rows with a few right-hand sides (the diagonal blocks taken as inverses on CUDA devices).
+#[test]
+fn solve_spd_few_columns_of_many_blocks() {
+    let ctx = Context::new().unwrap();
+    for &n in &[130usize, 257, 600] {
+        for &k in &[1usize, 8, 32] {
+            let a = spd(n, 700 + n as u64, 1.0);
+            let b = values(n * k, 800 + k as u64, -1.0, 1.0);
+            let x = mat(&ctx, &a, n, n, 1).solve_spd(&mat(&ctx, &b, k, n, 1)).to_vec().unwrap();
+            let r = residual(&widen(&a), &widen(&x), &widen(&b), n, k);
+            assert!(r < 5e-6, "n = {n}, k = {k}: residual {r}");
+        }
+    }
+}
+
 #[test]
 fn solve_triangular_batches_and_vectors() {
     let ctx = Context::new().unwrap();
