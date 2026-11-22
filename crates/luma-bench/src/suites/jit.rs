@@ -7,6 +7,7 @@ mod common;
 mod compile;
 mod fusion;
 mod launch;
+mod launchcost;
 mod loops;
 mod memory;
 mod readback;
@@ -20,9 +21,10 @@ use crate::harness::Harness;
 type Group = fn(&mut Harness);
 
 pub fn run(h: &mut Harness) {
-    let groups: [(&str, Group); 8] = [
+    let groups: [(&str, Group); 9] = [
         ("compile", compile::run),
         ("launch", launch::run),
+        ("launchcost", launchcost::run),
         ("loop", loops::run),
         ("fusion", fusion::run),
         ("trace", trace::run),
