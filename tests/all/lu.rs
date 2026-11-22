@@ -166,6 +166,22 @@ fn solve_residuals() {
     }
 }
 
+/// Right-hand sides from 1 to 200 of systems of many blocks of rows (one-launch solve for few columns, inverted
+/// diagonal blocks for many).
+#[test]
+fn solve_of_many_blocks_with_every_number_of_columns() {
+    let ctx = Context::new().unwrap();
+    for &n in &[130usize, 257, 520] {
+        for &k in &[1usize, 8, 32, 33, 64, 200] {
+            let a = random(n, 900 + n as u64);
+            let b = values(n * k, 950 + k as u64, -1.0, 1.0);
+            let x = mat(&ctx, &a, n, n, 1).solve(&mat(&ctx, &b, k, n, 1)).to_vec().unwrap();
+            let r = residual(&widen(&a), &widen(&x), &widen(&b), n, k);
+            assert!(r < 1e-5, "n = {n}, k = {k}: residual {r}");
+        }
+    }
+}
+
 #[test]
 fn solve_vector_batch_and_unpacked_factors() {
     let ctx = Context::new().unwrap();
