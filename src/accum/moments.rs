@@ -328,9 +328,6 @@ struct Epoch<W: Wide> {
     ty: TypeId,
     /// The rounded `f32` pivot of the default pass.
     k_f32: Option<Array<f32>>,
-    /// The pivot materialized at the shape of the batch (a broadcast operand makes the axis
-    /// reduction kernel compute its index per element, twice the time of reading a full one).
-    full: Option<([usize; 4], Array<f32>)>,
     k_w: V<W>,
 }
 
@@ -440,25 +437,12 @@ impl<W: Wide> Accumulator<W> {
         if state.epoch.is_none() {
             state.epoch = Some(if self.cfg.precise {
                 state.pivot.0.eval()?;
-                Epoch { ty, k_f32: None, full: None, k_w: state.pivot.clone() }
+                Epoch { ty, k_f32: None, k_w: state.pivot.clone() }
             } else {
                 let k = T::tidy_pivot(state.pivot.narrow());
                 k.eval()?;
-                Epoch { ty, k_w: V::from_f32(&k), k_f32: Some(k), full: None }
+                Epoch { ty, k_w: V::from_f32(&k), k_f32: Some(k) }
             });
-        }
-        // A batch with positions reads the pivot at its own shape (see `Epoch::full`).
-        if let Some(epoch) = state.epoch.as_mut()
-            && let Some(k) = epoch.k_f32.as_ref()
-            && labels.is_none()
-            && *FULL_PIVOT
-            && kept.iter().product::<usize>() > 1
-            && batch.len() > kept.iter().product::<usize>()
-            && epoch.full.as_ref().is_none_or(|(d, _)| *d != dims)
-        {
-            let full = k.broadcast_to(batch.shape()).copy();
-            full.eval()?;
-            epoch.full = Some((dims, full));
         }
         let mask = effective_mask(&self.cfg, batch, user_mask);
         let partial = state.partial(&self.cfg, batch, mask.as_ref(), labels, &axes)?;
@@ -763,9 +747,6 @@ fn as_f32<T: AccumCore>(a: &Array<T>) -> Option<Array<f32>> {
 /// Whether each push submits its reductions at once (`LUMA_ACCUM_EAGER=1`, an experiment).
 static EAGER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUMA_ACCUM_EAGER").is_some_and(|v| v != "0"));
 
-/// Whether a batch with positions reads a full-shape pivot (`LUMA_ACCUM_FULLPIVOT=0` turns it off).
-static FULL_PIVOT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUMA_ACCUM_FULLPIVOT").is_none_or(|v| v != "0"));
-
 /// Whether the error is (or wraps) the refusal of an array over several buffers.
 fn is_chunked(error: &LumaError) -> bool {
     match error {
@@ -905,8 +886,7 @@ impl<W: Wide> State<W> {
                 s.push(V(reduce_folded(&term.0, axes, &[Reduction::Sum]).remove(0)));
             }
         } else if cfg.track_mean() {
-            let dims = batch.shape().dims();
-            let pivot = epoch.full.as_ref().filter(|(d, _)| *d == dims).map(|(_, a)| a).or(epoch.k_f32.as_ref()).expect("the default pass has an f32 pivot");
+            let pivot = epoch.k_f32.as_ref().expect("the default pass has an f32 pivot");
             let mut d = T::shifted(batch, pivot);
             if let Some(mask) = mask {
                 d = select(mask, &d, 0.0f32);
