@@ -7,6 +7,7 @@
 - [Views and writes](views.md)
 - [Reductions and scans](reductions.md)
 - [Matrices, statistics and grouping](data.md)
+- [Sparse matrices](sparse.md)
 - [Records](records.md)
 - [Loops](loops.md)
 - [Precision](precision.md)

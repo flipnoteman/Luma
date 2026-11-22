@@ -69,6 +69,7 @@ Three things to notice:
 - [Arrays](arrays.md): creation, element types, casts, elementwise math, shapes, broadcasting, reading back.
 - [Lazy evaluation and fusion](lazy.md): when kernels run, `eval`, `flush`, `sync`, `cache`.
 - [Matrices, statistics and grouping](data.md): `matmul`, axis statistics, scatter-add, histograms, sort, group-by, quantiles.
+- [Sparse matrices](sparse.md): `Sparse` in CSR, CSC and COO, conversions, sparse-dense products, elementwise operations.
 - [Worked examples](examples.md): heat equation, Euler solver, ML-KEM, CPA.
 - [Environment variables](environment.md) and the [FAQ](faq.md) when something does not behave.
 

@@ -55,6 +55,8 @@ mod guide {
     pub mod reductions {}
     #[doc = include_str!("../guide/src/data.md")]
     pub mod data {}
+    #[doc = include_str!("../guide/src/sparse.md")]
+    pub mod sparse {}
     #[doc = include_str!("../guide/src/records.md")]
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
@@ -120,6 +122,7 @@ mod segsort;
 mod scalar;
 mod shape;
 mod sort;
+mod sparse;
 mod tuning;
 mod until;
 mod view;
@@ -148,6 +151,7 @@ pub use scatter::{bincount, AtomicElem};
 pub use search::Side;
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
+pub use sparse::{sparse, Sparse, SparseElem, SparseFormat, SparseInfo};
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 
 /// Plumbing of `fields!`; not part of the public API.

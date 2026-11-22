@@ -6,6 +6,7 @@ mod cases;
 mod cold;
 mod lumax;
 mod mlp;
+mod sparse;
 mod util;
 
 use std::time::{Duration, Instant};
@@ -35,12 +36,13 @@ fn main() {
             "--only" => only = args.next(),
             "--out" => out = args.next().expect("--out DIR"),
             "--reps" => reps = args.next().and_then(|v| v.parse().ok()).expect("--reps N"),
-            "cold" | "child" => mode = a,
+            "cold" | "child" | "sparse-probe" => mode = a,
             _ => rest.push(a),
         }
     }
     match mode.as_str() {
         "child" => return cold::child(&rest[0], &rest[1]),
+        "sparse-probe" => return sparse::probe(&rest[0]),
         "cold" => {
             std::fs::create_dir_all(&out).unwrap();
             let md = cold::orchestrate(reps, only.as_deref());
@@ -58,7 +60,7 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
     let mut b = bench::Bench::new(ctx.clone(), only, quick, Some(&format!("{out}/results.jsonl")));
     wake(&ctx);
-    let groups: [(&str, fn(&mut bench::Bench)); 14] = [
+    let groups: [(&str, fn(&mut bench::Bench)); 15] = [
         ("ew", cases::elementwise),
         ("small", cases::small_ops),
         ("reduce", cases::reductions),
@@ -72,6 +74,7 @@ fn main() {
         ("stencil", cases::stencil),
         ("filter", cases::filters),
         ("mlp", mlp::mlp),
+        ("sparse", sparse::sparse),
         ("end", |_| ()),
     ];
     for (_, g) in groups {
