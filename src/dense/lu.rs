@@ -486,8 +486,9 @@ fn calu_chunks_source(rows: usize, wp: usize, fence: &str, sg: bool, single: boo
     let (bindings, end) = if single {
         (
             "@group(1) @binding(2) var<storage, read_write> f: array<f32>;
-@group(1) @binding(3) var<storage, read_write> perm: array<u32>;
-@group(1) @binding(4) var<uniform> p: Params;",
+@group(1) @binding(3) var<uniform> fv: LumaView;
+@group(1) @binding(4) var<storage, read_write> perm: array<u32>;
+@group(1) @binding(5) var<uniform> p: Params;",
             calu_epilogue(wp, fence),
         )
     } else {
@@ -527,7 +528,7 @@ fn calu_epilogue(wp: usize, fence: &str) -> String {
     format!(
         "    for (var e = t; e < w * w; e = e + R) {{
         let i = e / w;
-        f[e] = lu[i * {wp}u + e - i * w];
+        f[luma_view_idx3(fv, e - i * w, i, 0u)] = lu[i * {wp}u + e - i * w];
     }}
     for (var i = w + t; i < p.m; i = i + R) {{ perm[i] = i; }}
     if (t < w) {{
@@ -565,8 +566,9 @@ fn calu_final_source(rows: usize, wp: usize, fence: &str, sg: bool) -> String {
 @group(1) @binding(1) var<uniform> av: LumaView;
 @group(1) @binding(2) var<storage, read_write> win: array<u32>;
 @group(1) @binding(3) var<storage, read_write> f: array<f32>;
-@group(1) @binding(4) var<storage, read_write> perm: array<u32>;
-@group(1) @binding(5) var<uniform> p: Params;
+@group(1) @binding(4) var<uniform> fv: LumaView;
+@group(1) @binding(5) var<storage, read_write> perm: array<u32>;
+@group(1) @binding(6) var<uniform> p: Params;
 fn ld(i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, 0u)]; }}
 
 {decl}
@@ -615,7 +617,7 @@ fn calu_tail_source(wp: usize) -> String {
         let i = idx / {wp}u;
         let c = idx - i * {wp}u;
         let ok = i < w && c < w;
-        let v = f[select(0u, i * w + c, ok)];
+        let v = f[select(0u, luma_view_idx3(fv, c, i, 0u), ok)];
         u[i * {q}u + c] = select(0.0, v, ok);
     }}
 ",
@@ -634,15 +636,16 @@ fn calu_tail_source(wp: usize) -> String {
         }
     }
     for j in 0..wp {
-        body += &format!("    if ({j}u < w) {{ f[i * w + {j}u] = y{j}; }}\n");
+        body += &format!("    if ({j}u < w) {{ f[luma_view_idx3(fv, {j}u, i, 0u)] = y{j}; }}\n");
     }
     format!(
         "struct Params {{ m: u32, w: u32, g: u32, rc: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
 @group(1) @binding(1) var<uniform> av: LumaView;
 @group(1) @binding(2) var<storage, read_write> f: array<f32>;
-@group(1) @binding(3) var<storage, read_write> perm: array<u32>;
-@group(1) @binding(4) var<uniform> p: Params;
+@group(1) @binding(3) var<uniform> fv: LumaView;
+@group(1) @binding(4) var<storage, read_write> perm: array<u32>;
+@group(1) @binding(5) var<uniform> p: Params;
 fn ld(i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, 0u)]; }}
 
 var<workgroup> u: array<f32, {usize}>;
@@ -655,7 +658,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let i = w + wid.x * {CALU_TAIL}u + t;
     let orig = perm[min(i, p.m - 1u)];
 {xload}{load}    if (t < {wp}u) {{
-        let d = f[select(0u, t * w + t, t < w)];
+        let d = f[select(0u, luma_view_idx3(fv, t, t, 0u), t < w)];
         ru[t] = select(0.0, 1.0 / d, t < w && d != 0.0);
     }}
     workgroupBarrier();
@@ -667,33 +670,40 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
+/// A permutation array that carries a failure.
+fn failed_perm(ctx: &crate::Context, rows: usize, e: LumaError, op: &'static str, loc: &'static Location<'static>) -> Array<u32> {
+    Array::resolve(ctx, Shape::from([rows, 1, 1]), Err(crate::array::Failure::New(e)), op, loc)
+}
+
 /// Factors one `[w, m]` panel (`w <= 32`, `m >= w`) by a tournament: [`calu_chunks_source`]
 /// picks `w` pivot rows in every chunk of rows, [`calu_final_source`] plays them off against one
 /// another from the original rows and [`calu_tail_source`] permutes and computes the multipliers
 /// of every row in parallel. Three launches whose workgroups all work, where the panel kernel has
-/// one workgroup stream the whole panel for every column. `None` where the device cannot hold a
-/// chunk.
-fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> Option<Lu> {
+/// one workgroup stream the whole panel for every column. The factors are written into the
+/// region of `out` at (`row0`, `col0`) and the permutation returned; `None` where the device
+/// cannot hold a chunk.
+fn calu_leaf(a: &Array<f32>, d: Dims, out: &mut Array<f32>, at: (usize, usize), op: &'static str, loc: &'static Location<'static>) -> Option<Array<u32>> {
     let ctx = a.context();
     let (rows, rows2) = calu_rows(ctx);
     if d.cols > CALU_W || rows < 64 || rows2 < 2 * d.cols || d.rows < d.cols || d.rows.div_ceil(d.rows.div_ceil(rows)) < d.cols + d.rows.div_ceil(rows) {
         return None;
     }
     let perm_shape = Shape::from([d.rows, 1, 1]);
-    let poisoned = |e: LumaError| Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, perm_shape, Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) };
     let chunks = d.rows.div_ceil(rows);
     let chunk_rows = d.rows.div_ceil(chunks);
     // Workgroups as small as the rows they factor: a pivot costs a pass of the invocations.
     let (rows, rows2) = (chunk_rows.next_power_of_two().clamp(64, rows), (chunks * d.cols).next_power_of_two().clamp(64, rows2));
     let params = CaluParams { m: d.rows as u32, w: d.cols as u32, g: chunks as u32, rc: chunk_rows as u32 };
-    let (mut win, mut f, mut perm) = match (Array::<u32>::alloc(ctx, Shape::from([chunks * d.cols])), Array::<f32>::alloc(ctx, a.shape()), Array::<u32>::alloc(ctx, perm_shape)) {
-        (Ok(w), Ok(f), Ok(p)) => (w, f, p),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return Some(poisoned(e)),
+    let (mut win, mut perm) = match (Array::<u32>::alloc(ctx, Shape::from([chunks * d.cols])), Array::<u32>::alloc(ctx, perm_shape)) {
+        (Ok(w), Ok(p)) => (w, p),
+        (Err(e), _) | (_, Err(e)) => return Some(failed_perm(ctx, d.rows, e, op, loc)),
     };
     let fence = fence(ctx);
     let wp = d.cols.next_multiple_of(8);
     let sg = ctx.tuning().subgroup32;
     let tail_groups = (d.rows - d.cols).div_ceil(CALU_TAIL) as u32;
+    let (row0, col0) = at;
+    let mut f = out.slice_mut(1, row0..row0 + d.rows).slice(0, col0..col0 + d.cols);
     let result = if chunks == 1 {
         let args: [KernelArg<'_>; 4] = [view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)];
         launch(ctx, &format!("lu_calu_single/{rows}/{wp}/{}/{}", fence.len(), u8::from(sg)), "lu_calu_single", || calu_chunks_source(rows, wp, fence, sg, true), [1, 1, 1], &args).and_then(|()| {
@@ -709,8 +719,8 @@ fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'
             .and_then(|()| launch(ctx, &format!("lu_calu_tail/{wp}"), "lu_calu_tail", || calu_tail_source(wp), [tail_groups, 1, 1], &[view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)]))
     };
     Some(match result {
-        Ok(()) => Lu { lu: f, perm },
-        Err(e) => poisoned(e),
+        Ok(()) => perm,
+        Err(e) => failed_perm(ctx, d.rows, e, op, loc),
     })
 }
 
@@ -721,16 +731,22 @@ const LEAF: usize = 32;
 struct LeafParams {
     n: u32,
     k: u32,
+    pitch: u32,
+    l0: u32,
+    x0: u32,
 }
 
-/// The substitution leaf: `X = L⁻¹ B` for a lower triangular `L` of `n <= np` rows (`np` a multiple
-/// of 8: the rows past `n` are absent) and `k` columns of `B`, an invocation per column with its
-/// column in registers, the triangle in workgroup memory (every invocation reads the same entry),
-/// unrolled: no loads or stores on the dependent chain of the substitution.
-fn leaf_solve_source(np: usize, unit: bool) -> String {
+/// The substitution leaf: `X = L⁻¹ (B - P)` (`B` alone without `sub`) for a lower triangular `L` of
+/// `n <= np` rows (`np` a multiple of 8: the rows past `n` are absent) and `k` columns, an
+/// invocation per column with its column in registers, the triangle in workgroup memory (every
+/// invocation reads the same entry), unrolled: no loads or stores on the dependent chain of the
+/// substitution. `L` and `X` are blocks of the same row-major array `xo` (`pitch` entries a row, the
+/// blocks start at `l0` and `x0`).
+fn leaf_solve_source(np: usize, unit: bool, sub: bool) -> String {
     let mut body = String::new();
     for i in 0..np {
-        body += &format!("    var x{i} = 0.0;\n    if ({i}u < n) {{ x{i} = ldb({i}u, c); }}\n");
+        let load = if sub { format!("ldb({i}u, c) - ldp({i}u, c)") } else { format!("ldb({i}u, c)") };
+        body += &format!("    var x{i} = 0.0;\n    if ({i}u < n) {{ x{i} = {load}; }}\n");
     }
     for j in 0..np {
         if !unit {
@@ -741,7 +757,7 @@ fn leaf_solve_source(np: usize, unit: bool) -> String {
         }
     }
     for i in 0..np {
-        body += &format!("    if ({i}u < n) {{ x[c + k * {i}u] = x{i}; }}\n");
+        body += &format!("    if ({i}u < n) {{ xo[p.x0 + {i}u * p.pitch + c] = x{i}; }}\n");
     }
     let mut load = String::new();
     for e in 0..np * np / 64 {
@@ -751,21 +767,34 @@ fn leaf_solve_source(np: usize, unit: bool) -> String {
         let i = idx / {np}u;
         let j = idx - i * {np}u;
         let ok = i < n && j < n && j <= i;
-        let v = l[select(0u, luma_view_idx3(lv, j, i, 0u), ok)];
+        let v = xo[select(0u, p.l0 + i * p.pitch + j, ok)];
         ls[idx] = select(select(0.0, 1.0, i == j), v, ok);
     }}
 ",
             e * 64
         );
     }
+    let (p_bindings, x_bindings) = if sub {
+        (
+            "@group(1) @binding(2) var<storage, read> pm: array<f32>;
+@group(1) @binding(3) var<uniform> pv: LumaView;
+fn ldp(i: u32, c: u32) -> f32 { return pm[luma_view_idx3(pv, c, i, 0u)]; }",
+            "@group(1) @binding(4) var<storage, read_write> xo: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;",
+        )
+    } else {
+        (
+            "",
+            "@group(1) @binding(2) var<storage, read_write> xo: array<f32>;
+@group(1) @binding(3) var<uniform> p: Params;",
+        )
+    };
     format!(
-        "struct Params {{ n: u32, k: u32 }}
-@group(1) @binding(0) var<storage, read> l: array<f32>;
-@group(1) @binding(1) var<uniform> lv: LumaView;
-@group(1) @binding(2) var<storage, read> b: array<f32>;
-@group(1) @binding(3) var<uniform> bv: LumaView;
-@group(1) @binding(4) var<storage, read_write> x: array<f32>;
-@group(1) @binding(5) var<uniform> p: Params;
+        "struct Params {{ n: u32, k: u32, pitch: u32, l0: u32, x0: u32 }}
+@group(1) @binding(0) var<storage, read> b: array<f32>;
+@group(1) @binding(1) var<uniform> bv: LumaView;
+{p_bindings}
+{x_bindings}
 fn ldb(i: u32, c: u32) -> f32 {{ return b[luma_view_idx3(bv, c, i, 0u)]; }}
 
 var<workgroup> ls: array<f32, {size}>;
@@ -783,30 +812,44 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
-/// `L X = B` for the `[n, n]` lower triangle `l` (`unit`: with ones on the diagonal, not read) and
-/// `[k, n]` right-hand sides `b`: leaves of [`LEAF`] rows by [`leaf_solve_source`], bigger triangles
-/// split about in half with a [`matmul_f32`] product, as in [`super::tri`].
-fn solve_lower(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
-    let ctx = l.context();
-    let [_, n, ..] = l.shape().dims();
+/// `L X = B - P` for the lower triangle `L` of `n` rows at `l_at` (row, column) of the matrix
+/// `out`, (`unit`: with ones on the diagonal, not read), `[k, n]` right-hand sides `b` and an
+/// optional `[k, n]` array `p` to take off them, `X` written into `out` at `x_at`: leaves of
+/// [`LEAF`] rows by [`leaf_solve_source`], bigger triangles split about in half with a
+/// [`matmul_f32`] product, as in [`super::tri`].
+fn solve_lower_into(
+    n: usize,
+    l_at: (usize, usize),
+    b: &Array<f32>,
+    p: Option<&Array<f32>>,
+    unit: bool,
+    out: &mut Array<f32>,
+    x_at: (usize, usize),
+    loc: &'static Location<'static>,
+) -> Result<(), LumaError> {
+    let ctx = b.context();
     let [k, ..] = b.shape().dims();
     if n > LEAF {
         let h = super::tri::split(n).min(n - 1);
-        let x1 = solve_lower(&block(l, 0..h, 0..h), &block(b, 0..h, 0..k), unit, op, loc).cache();
-        let update = &block(b, h..n, 0..k) - &matmul_f32(&block(l, h..n, 0..h), &x1);
-        let x2 = solve_lower(&block(l, h..n, h..n), &update, unit, op, loc);
-        return concat(1, [&x1, &x2]);
+        solve_lower_into(h, l_at, &block(b, 0..h, 0..k), p.map(|p| block(p, 0..h, 0..k)).as_ref(), unit, out, x_at, loc)?;
+        let x1 = block(out, x_at.0..x_at.0 + h, x_at.1..x_at.1 + k);
+        let l21 = block(out, l_at.0 + h..l_at.0 + n, l_at.1..l_at.1 + h);
+        let product = matmul_f32(&l21, &x1);
+        let rest = match p {
+            Some(p) => &block(p, h..n, 0..k) + &product,
+            None => product,
+        };
+        return solve_lower_into(n - h, (l_at.0 + h, l_at.1 + h), &block(b, h..n, 0..k), Some(&rest), unit, out, (x_at.0 + h, x_at.1), loc);
     }
-    let mut x = match Array::<f32>::alloc(ctx, b.shape()) {
-        Ok(x) => x,
-        Err(e) => return fail(ctx, b.shape(), e, op, loc),
-    };
     let np = n.next_multiple_of(8);
-    let params = LeafParams { n: n as u32, k: k as u32 };
-    let args: [KernelArg<'_>; 4] = [view(l), view(b), (&mut x).into(), uniform(&params)];
-    match launch(ctx, &format!("lu_leaf_solve/{np}/{}", u8::from(unit)), "lu_leaf_solve", || leaf_solve_source(np, unit), [k.div_ceil(64) as u32, 1, 1], &args) {
-        Ok(()) => x,
-        Err(e) => fail(ctx, b.shape(), e, op, loc),
+    let pitch = out.shape().dims()[0];
+    let params = LeafParams { n: n as u32, k: k as u32, pitch: pitch as u32, l0: (l_at.0 * pitch + l_at.1) as u32, x0: (x_at.0 * pitch + x_at.1) as u32 };
+    let groups = [k.div_ceil(64) as u32, 1, 1];
+    let key = format!("lu_leaf_solve/{np}/{}/{}", u8::from(unit), u8::from(p.is_some()));
+    let _ = loc;
+    match p {
+        Some(p) => launch(ctx, &key, "lu_leaf_solve", || leaf_solve_source(np, unit, true), groups, &[view(b), view(p), out.into(), uniform(&params)]),
+        None => launch(ctx, &key, "lu_leaf_solve", || leaf_solve_source(np, unit, false), groups, &[view(b), out.into(), uniform(&params)]),
     }
 }
 
@@ -824,11 +867,6 @@ fn leaf_width(m: usize, batch: usize) -> usize {
 /// Factors every `[w, m, batch]` matrix of `a` (`m >= w`) with one of the two kernels.
 fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> Lu {
     let ctx = a.context();
-    if d.batch == 1 && d.rows > SMALL {
-        if let Some(f) = calu_leaf(a, d, op, loc) {
-            return f;
-        }
-    }
     let perm_shape = Shape::from([d.rows, 1, d.batch]);
     let poisoned = |e: LumaError| Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, perm_shape, Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) };
     let (mut f, mut perm) = match (Array::<f32>::alloc(ctx, a.shape()), Array::<u32>::alloc(ctx, perm_shape)) {
@@ -849,29 +887,58 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
     }
 }
 
-/// The recursion over one `[w, m]` matrix, `m >= w`.
-fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Lu {
+/// The recursion over one `[w, m]` matrix, `m >= w`: the factors are written into the region of
+/// `out` at (`at.0`, `at.1`) (rows, columns), the permutation returned. A failure poisons the
+/// permutation.
+fn factor_into(a: &Array<f32>, out: &mut Array<f32>, at: (usize, usize), op: &'static str, loc: &'static Location<'static>) -> Array<u32> {
+    let ctx = a.context();
     let [w, m, ..] = a.shape().dims();
+    let (row0, col0) = at;
     if w <= leaf_width(m, 1) {
-        return leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc);
+        let d = Dims { rows: m, cols: w, batch: 1 };
+        if d.rows > SMALL {
+            if let Some(perm) = calu_leaf(a, d, out, at, op, loc) {
+                return perm;
+            }
+        }
+        let Lu { lu, perm } = leaf(a, d, op, loc);
+        return match out.slice_mut(1, row0..row0 + m).slice(0, col0..col0 + w).assign(&lu) {
+            Ok(()) => perm,
+            Err(e) => failed_perm(ctx, m, e, op, loc),
+        };
     }
     let n1 = super::split_cols(w);
     let n2 = w - n1;
-    let Lu { lu: f1, perm: p1 } = recurse(&block(a, 0..m, 0..n1), op, loc);
-    let f1 = f1.cache();
+    let p1 = factor_into(&block(a, 0..m, 0..n1), out, at, op, loc);
     // The right columns in the order of the left panel's pivots.
     let right = gather_rows(&block(a, 0..m, n1..w), &p1, loc);
     let a12 = block(&right, 0..n1, 0..n2);
     let a22 = block(&right, n1..m, 0..n2);
-    let u12 = solve_lower(&block(&f1, 0..n1, 0..n1), &a12, true, op, loc).cache();
-    let l21 = block(&f1, n1..m, 0..n1);
-    let s = &a22 - &matmul_f32(&l21.cache(), &u12);
-    let Lu { lu: f2, perm: p2 } = recurse(&s, op, loc);
-    let l21 = gather_rows(&l21, &p2, loc);
-    let perm = concat(0, [&p1.slice(0, 0..n1), &p1.slice(0, n1..m).take(&p2)]);
-    let top = concat(0, [&block(&f1, 0..n1, 0..n1), &u12]);
-    let bottom = concat(0, [&l21, &f2]);
-    Lu { lu: concat(1, [&top, &bottom]), perm }
+    if let Err(e) = solve_lower_into(n1, at, &a12, None, true, out, (row0, col0 + n1), loc) {
+        return failed_perm(ctx, m, e, op, loc);
+    }
+    let l21 = block(out, row0 + n1..row0 + m, col0..col0 + n1);
+    let u12 = block(out, row0..row0 + n1, col0 + n1..col0 + w);
+    let s = &a22 - &matmul_f32(&l21, &u12);
+    let p2 = factor_into(&s, out, (row0 + n1, col0 + n1), op, loc);
+    // The multipliers in the order of the second panel's pivots, in place.
+    let permuted = gather_rows(&l21, &p2, loc);
+    if let Err(e) = out.slice_mut(1, row0 + n1..row0 + m).slice(0, col0..col0 + n1).assign(&permuted) {
+        return failed_perm(ctx, m, e, op, loc);
+    }
+    concat(0, [&p1.slice(0, 0..n1), &p1.slice(0, n1..m).take(&p2)])
+}
+
+/// [`factor_into`] a fresh `[w, m]` array.
+fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Lu {
+    let ctx = a.context();
+    match Array::<f32>::alloc(ctx, a.shape()) {
+        Ok(mut out) => {
+            let perm = factor_into(a, &mut out, (0, 0), op, loc);
+            Lu { lu: out, perm }
+        }
+        Err(e) => Lu { lu: fail(ctx, a.shape(), e.clone(), op, loc), perm: failed_perm(ctx, a.shape().dims()[1], e, op, loc) },
+    }
 }
 
 fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Lu {
@@ -880,10 +947,23 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         Ok(d) if d.rows >= d.cols => d,
         Ok(d) => {
             // Wide: factor the square left block, then U12 = L11⁻¹ (P A12).
-            let left = factor(&a.slice(0, 0..d.rows), op, loc);
-            let right = gather_rows(&a.slice(0, d.rows..d.cols), &left.perm, loc);
-            let u12 = solve_lower(&left.lu, &right, true, op, loc);
-            return Lu { lu: concat(0, [&left.lu, &u12]), perm: left.perm };
+            if d.batch > 1 {
+                let left = factor(&a.slice(0, 0..d.rows), op, loc);
+                let right = gather_rows(&a.slice(0, d.rows..d.cols), &left.perm, loc);
+                let u12 = lower_left(&left.lu, &right, true, op, loc);
+                return Lu { lu: concat(0, [&left.lu, &u12]), perm: left.perm };
+            }
+            let rows = d.rows;
+            let mut out = match Array::<f32>::alloc(ctx, a.shape()) {
+                Ok(out) => out,
+                Err(e) => return Lu { lu: fail(ctx, a.shape(), e.clone(), op, loc), perm: failed_perm(ctx, rows, e, op, loc) },
+            };
+            let perm = factor_into(&a.slice(0, 0..rows), &mut out, (0, 0), op, loc);
+            let right = gather_rows(&a.slice(0, rows..d.cols), &perm, loc);
+            if let Err(e) = solve_lower_into(rows, (0, 0), &right, None, true, &mut out, (0, rows), loc) {
+                return Lu { lu: fail(ctx, a.shape(), e.clone(), op, loc), perm: failed_perm(ctx, rows, e, op, loc) };
+            }
+            return Lu { lu: out, perm };
         }
         Err(e) => return Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, Shape::from(1), Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) },
     };
