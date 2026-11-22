@@ -6,6 +6,7 @@ mod cases;
 mod cold;
 mod lumax;
 mod mlp;
+mod stats;
 mod util;
 
 use std::time::{Duration, Instant};

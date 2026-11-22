@@ -737,6 +737,7 @@ fn fold(ty: ElemTy, op: ReduceOp, mut it: impl Iterator<Item = u32>) -> Option<u
             }
             ReduceOp::Min => it.fold(f(first), |acc, w| acc.min(f(w))).to_bits(),
             ReduceOp::Max => it.fold(f(first), |acc, w| acc.max(f(w))).to_bits(),
+            ReduceOp::Prod => it.fold(f(first), |acc, w| acc * f(w)).to_bits(),
             ReduceOp::ArgMax | ReduceOp::ArgMin => return None,
         },
         ElemTy::U32 => match op {
@@ -744,6 +745,7 @@ fn fold(ty: ElemTy, op: ReduceOp, mut it: impl Iterator<Item = u32>) -> Option<u
             ReduceOp::SumSquares => it.fold(first.wrapping_mul(first), |acc, w| acc.wrapping_add(w.wrapping_mul(w))),
             ReduceOp::Min => it.fold(first, u32::min),
             ReduceOp::Max => it.fold(first, u32::max),
+            ReduceOp::Prod => it.fold(first, u32::wrapping_mul),
             ReduceOp::ArgMax | ReduceOp::ArgMin => return None,
         },
         ElemTy::I32 => match op {
@@ -754,6 +756,7 @@ fn fold(ty: ElemTy, op: ReduceOp, mut it: impl Iterator<Item = u32>) -> Option<u
             }
             ReduceOp::Min => it.fold(first as i32, |acc, w| acc.min(w as i32)) as u32,
             ReduceOp::Max => it.fold(first as i32, |acc, w| acc.max(w as i32)) as u32,
+            ReduceOp::Prod => it.fold(first, |acc, w| (acc as i32).wrapping_mul(w as i32) as u32),
             ReduceOp::ArgMax | ReduceOp::ArgMin => return None,
         },
         ElemTy::Bool => match op {

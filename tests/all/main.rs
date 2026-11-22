@@ -63,3 +63,4 @@ mod transfer;
 mod tridiagonal;
 mod vector_reductions;
 mod views;
+mod stats;

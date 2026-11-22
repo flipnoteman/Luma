@@ -7,6 +7,8 @@
 
 use std::fmt::Debug;
 
+mod stats;
+
 use crate::harness::*;
 use luma::*;
 
@@ -17,6 +19,7 @@ pub fn run(h: &mut Harness) {
     h.guarded("argsort", argsort_extra_cases);
     h.guarded("reduce", reduce_cases);
     h.guarded("reduce", reduce_extra_cases);
+    h.guarded("reduce", stats::run);
     h.guarded("scan", scan_cases);
     h.guarded("scan", scan_extra_cases);
     h.guarded("group", group_cases);
