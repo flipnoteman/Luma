@@ -87,9 +87,32 @@ pub(crate) fn per_matrix(ctx: &Context, count: usize) -> [u32; 3] {
     [x as u32, count.div_ceil(x) as u32, 1]
 }
 
-/// Builds the kernel `src` and records its launch over `groups` workgroups.
-pub(crate) fn launch(ctx: &Context, src: &str, label: &str, groups: [u32; 3], args: &[KernelArg<'_>]) -> Result<(), LumaError> {
-    ctx.kernel(src).label(label).build()?.launch_raw(groups, args)
+/// Kernels built so far, by the key of their source: the sources of the register kernels are tens of
+/// kilobytes, and generating, copying and hashing one per launch cost more host time than the
+/// launch. Each entry lists the contexts it was built on.
+static KERNELS: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<crate::Kernel>>>> = std::sync::Mutex::new(None);
+
+/// The kernel of source `make()` named by `key` (which must determine the source) on `ctx`,
+/// built once per context.
+fn kernel(ctx: &Context, key: &str, label: &str, make: impl FnOnce() -> String) -> Result<crate::Kernel, LumaError> {
+    let mut guard = KERNELS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    if let Some(kernel) = map.get(key).and_then(|list| list.iter().find(|k| k.context().same_as(ctx))) {
+        return Ok(kernel.clone());
+    }
+    let kernel = ctx.kernel(&make()).label(label).build()?;
+    let list = map.entry(key.to_owned()).or_default();
+    // A few contexts at most stay alive through this cache.
+    if list.len() >= 8 {
+        list.remove(0);
+    }
+    list.push(kernel.clone());
+    Ok(kernel)
+}
+
+/// Records the launch over `groups` workgroups of the kernel `make()` names by `key` (see [`kernel`]).
+pub(crate) fn launch(ctx: &Context, key: &str, label: &str, make: impl FnOnce() -> String, groups: [u32; 3], args: &[KernelArg<'_>]) -> Result<(), LumaError> {
+    kernel(ctx, key, label, make)?.launch_raw(groups, args)
 }
 
 /// The NaN a failed pivot leaves, as WGSL.
@@ -136,4 +159,19 @@ pub(crate) fn gather_rows(a: &Array<f32>, perm: &Array<u32>, loc: &'static Locat
     let rows = perm.reshape([1, m, batch]).broadcast_to(shape);
     let idx = &(&rows * w as u32 + &col) + &(&mat * (m * w) as u32);
     a.take(&idx)
+}
+
+/// Columns of the panels a big single matrix is factored in by the LU and QR panel kernels (8, 16 or
+/// 32; `LUMA_LINALG_PANEL`): the kernels stream the whole panel through one multiprocessor's cache
+/// for every column, so a narrow panel moves fewer bytes per column but leaves more levels of
+/// recursion.
+pub(crate) fn panel_width() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| std::env::var("LUMA_LINALG_PANEL").ok().and_then(|v| v.parse().ok()).filter(|w| [8, 16, 32].contains(w)).unwrap_or(32))
+}
+
+/// Where the recursion over columns splits `w` of them: about half, at a multiple of 8 for panels
+/// that are still narrow.
+pub(crate) fn split_cols(w: usize) -> usize {
+    if w <= 64 { (w / 2).next_multiple_of(8).min(w - 1).max(1) } else { tri::split(w) }
 }

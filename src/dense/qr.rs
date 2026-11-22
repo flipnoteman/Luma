@@ -14,12 +14,12 @@
 use std::panic::Location;
 
 use super::tri::lower_left;
+use super::lu::UNROLL;
 use super::{block, fail, fence, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::bmm::matmul_batched;
-use crate::dense::tri::split;
 use crate::error::LumaError;
-use crate::kernel::{uniform, KernelArg};
+use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
 use crate::shape::Shape;
@@ -52,17 +52,20 @@ struct Params {
 /// segment. Per column `j`: the norm below the diagonal by a tree reduction; the reflector
 /// (LAPACK's `dlarfg`); the products `v_jᵀ F[:, c]` for every other column `c` (those with `c > j`
 /// are what the reflection needs, those with `c < j` the entries of the new column of `T`); the
-/// update; the scaling of `v_j`. The row loops take four rows a step with their loads issued
+/// update; the scaling of `v_j`. The row loops take [`UNROLL`] rows a step with their loads issued
 /// first (the kernel is bound by the latency of its global loads), see [`super::lu`].
 fn source(threads: usize, fence: &str) -> String {
     let groups = threads / 32;
     format!(
         "struct Params {{ m: u32, w: u32, batch: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
-@group(1) @binding(1) var<storage, read_write> f: array<f32>;
-@group(1) @binding(2) var<storage, read_write> tau: array<f32>;
-@group(1) @binding(3) var<storage, read_write> tf: array<f32>;
-@group(1) @binding(4) var<uniform> p: Params;
+@group(1) @binding(1) var<uniform> av: LumaView;
+@group(1) @binding(2) var<storage, read_write> f: array<f32>;
+@group(1) @binding(3) var<storage, read_write> tau: array<f32>;
+@group(1) @binding(4) var<storage, read_write> tf: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+fn ld(mi: u32, i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, mi)]; }}
+
 var<workgroup> red: array<f32, {threads}>;
 var<workgroup> part: array<f32, {parts}>;
 var<workgroup> dd: array<f32, 32>;
@@ -77,7 +80,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     let g = t / 32u;
     let c = t % 32u;
     for (var idx = t; idx < m * w; idx = idx + {threads}u) {{
-        f[base + idx] = a[base + idx];
+        let i = idx / w;
+        f[base + idx] = ld(mi, i, idx - i * w);
     }}
     for (var idx = t; idx < 1024u; idx = idx + {threads}u) {{
         tm[idx] = 0.0;
@@ -87,16 +91,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     for (var j = 0u; j < min(m, w); j = j + 1u) {{
         var sq = 0.0;
         var k = j + 1u + t;
-        for (; k + {t3}u < m; k = k + {t4}u) {{
-            let v0 = f[base + k * w + j];
-            let v1 = f[base + (k + {t1}u) * w + j];
-            let v2 = f[base + (k + {t2}u) * w + j];
-            let v3 = f[base + (k + {t3}u) * w + j];
-            sq = fma(v0, v0, sq);
-            sq = fma(v1, v1, sq);
-            sq = fma(v2, v2, sq);
-            sq = fma(v3, v3, sq);
-        }}
+        for (; k + {tlast}u < m; k = k + {tstep}u) {{
+{norm_loads}{norm_fmas}        }}
         for (; k < m; k = k + {t1}u) {{
             let v = f[base + k * w + j];
             sq = fma(v, v, sq);
@@ -122,21 +118,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
             var acc = 0.0;
             if (g == 0u) {{ acc = f[base + j * w + c]; }}
             var i = j + 1u + g;
-            for (; i + {g3}u < m; i = i + {g4}u) {{
+            for (; i + {glast}u < m; i = i + {gstep}u) {{
                 let r0 = base + i * w;
-                let u0 = f[r0 + j];
-                let u1 = f[r0 + {g1}u * w + j];
-                let u2 = f[r0 + {g2}u * w + j];
-                let u3 = f[r0 + {g3}u * w + j];
-                let y0 = f[r0 + c];
-                let y1 = f[r0 + {g1}u * w + c];
-                let y2 = f[r0 + {g2}u * w + c];
-                let y3 = f[r0 + {g3}u * w + c];
-                acc = fma(u0 * inv, y0, acc);
-                acc = fma(u1 * inv, y1, acc);
-                acc = fma(u2 * inv, y2, acc);
-                acc = fma(u3 * inv, y3, acc);
-            }}
+{dot_loads}{dot_fmas}            }}
             for (; i < m; i = i + {g1}u) {{
                 acc = fma(f[base + i * w + j] * inv, f[base + i * w + c], acc);
             }}
@@ -162,21 +146,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
             let wc = tj * dd[c];
             if (g == 0u) {{ f[base + j * w + c] = f[base + j * w + c] - wc; }}
             var i = j + 1u + g;
-            for (; i + {g3}u < m; i = i + {g4}u) {{
+            for (; i + {glast}u < m; i = i + {gstep}u) {{
                 let r0 = base + i * w;
-                let u0 = f[r0 + j] * inv;
-                let u1 = f[r0 + {g1}u * w + j] * inv;
-                let u2 = f[r0 + {g2}u * w + j] * inv;
-                let u3 = f[r0 + {g3}u * w + j] * inv;
-                let y0 = f[r0 + c];
-                let y1 = f[r0 + {g1}u * w + c];
-                let y2 = f[r0 + {g2}u * w + c];
-                let y3 = f[r0 + {g3}u * w + c];
-                f[r0 + c] = fma(-u0, wc, y0);
-                f[r0 + {g1}u * w + c] = fma(-u1, wc, y1);
-                f[r0 + {g2}u * w + c] = fma(-u2, wc, y2);
-                f[r0 + {g3}u * w + c] = fma(-u3, wc, y3);
-            }}
+{upd_loads}{upd_stores}            }}
             for (; i < m; i = i + {g1}u) {{
                 f[base + i * w + c] = fma(-(f[base + i * w + j] * inv), wc, f[base + i * w + c]);
             }}
@@ -199,13 +171,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         parts = groups * 32,
         half = threads / 2,
         t1 = threads,
-        t2 = 2 * threads,
-        t3 = 3 * threads,
-        t4 = 4 * threads,
+        tlast = (UNROLL - 1) * threads,
+        tstep = UNROLL * threads,
         g1 = groups,
-        g2 = 2 * groups,
-        g3 = 3 * groups,
-        g4 = 4 * groups,
+        glast = (UNROLL - 1) * groups,
+        gstep = UNROLL * groups,
+        norm_loads = (0..UNROLL).map(|k| format!("            let v{k} = f[base + (k + {}u) * w + j];\n", k * threads)).collect::<String>(),
+        norm_fmas = (0..UNROLL).map(|k| format!("            sq = fma(v{k}, v{k}, sq);\n")).collect::<String>(),
+        dot_loads = (0..UNROLL).map(|k| format!("                let u{k} = f[r0 + {}u * w + j];\n                let y{k} = f[r0 + {}u * w + c];\n", k * groups, k * groups)).collect::<String>(),
+        dot_fmas = (0..UNROLL).map(|k| format!("                acc = fma(u{k} * inv, y{k}, acc);\n")).collect::<String>(),
+        upd_loads = (0..UNROLL).map(|k| format!("                let u{k} = f[r0 + {}u * w + j] * inv;\n                let y{k} = f[r0 + {}u * w + c];\n", k * groups, k * groups)).collect::<String>(),
+        upd_stores = (0..UNROLL).map(|k| format!("                f[r0 + {}u * w + c] = fma(-u{k}, wc, y{k});\n", k * groups)).collect::<String>(),
     )
 }
 
@@ -229,9 +205,9 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return failed_qr(ctx, a, e, op, loc),
     };
     let params = Params { m: d.rows as u32, w: n as u32, batch: d.batch as u32 };
-    let args: [KernelArg<'_>; 5] = [a.into(), (&mut f).into(), (&mut tau).into(), (&mut t).into(), uniform(&params)];
+    let args: [KernelArg<'_>; 5] = [view(a), (&mut f).into(), (&mut tau).into(), (&mut t).into(), uniform(&params)];
     let threads = super::lu::panel_threads(ctx, d.rows);
-    match launch(ctx, &source(threads, fence(ctx)), "qr_panel", per_matrix(ctx, d.batch), &args) {
+    match launch(ctx, &format!("qr_panel/{threads}/{}", fence(ctx).len()), "qr_panel", || source(threads, fence(ctx)), per_matrix(ctx, d.batch), &args) {
         Ok(()) => Qr { qr: f, tau, t },
         Err(e) => failed_qr(ctx, a, e, op, loc),
     }
@@ -248,10 +224,10 @@ pub(crate) fn unit_lower(f: &Array<f32>) -> Array<f32> {
 /// A recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
     let [w, m, ..] = a.shape().dims();
-    if w <= PANEL {
+    if w <= if m <= 64 { PANEL } else { super::panel_width() } {
         return leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc);
     }
-    let n1 = split(w);
+    let n1 = super::split_cols(w);
     let n2 = w - n1;
     let Qr { qr: f1, tau: tau1, t: t1 } = recurse(&block(a, 0..m, 0..n1), op, loc);
     let f1 = f1.cache();
@@ -286,7 +262,7 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return failed_qr(ctx, a, e, op, loc),
     };
-    if d.cols <= PANEL {
+    if d.cols <= if d.batch > 1 || d.rows <= 64 { PANEL } else { super::panel_width() } {
         return leaf(a, d, op, loc);
     }
     if d.batch > 1 {
