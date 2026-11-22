@@ -12,10 +12,12 @@ use std::time::Duration;
 pub mod cache;
 pub mod copy;
 mod deferred;
+pub mod texture;
 pub mod topology;
 
 pub use cache::DiskCache;
 pub use copy::{advise_huge_pages, copy_parallel, copy_parallel_host, copy_streaming};
+pub use texture::{TextureCaps, TextureDesc, TextureFilter, TextureFormat};
 
 /// Which backend a context runs on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -82,6 +84,11 @@ pub enum BindingKind {
     StorageReadWrite,
     /// `var<uniform>`: bound from a uniform value.
     Uniform,
+    /// `texture_2d<f32>`: bound from a texture ([`Backend::create_texture`]).
+    Texture2d,
+    /// `sampler`: bound from the same texture as the `texture_2d<f32>` it samples. Its filtering
+    /// and addressing are those of the texture ([`TextureDesc`]).
+    Sampler,
 }
 
 impl fmt::Display for BindingKind {
@@ -90,6 +97,8 @@ impl fmt::Display for BindingKind {
             BindingKind::StorageRead => "read-only storage buffer",
             BindingKind::StorageReadWrite => "read_write storage buffer",
             BindingKind::Uniform => "uniform",
+            BindingKind::Texture2d => "2-D texture",
+            BindingKind::Sampler => "sampler",
         })
     }
 }
@@ -99,7 +108,8 @@ impl fmt::Display for BindingKind {
 pub struct BindingInfo {
     /// The variable's name in the shader.
     pub name: String,
-    /// Whether the binding is a read-only storage buffer, a read-write storage buffer or a uniform.
+    /// Whether the binding is a read-only storage buffer, a read-write storage buffer, a uniform,
+    /// a texture or a sampler.
     pub kind: BindingKind,
     /// For storage bindings of `array<T>`: the byte stride of `T`. `None` when not an array.
     pub element_stride: Option<u32>,
@@ -932,6 +942,21 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// [`Backend::recycle_mappable`]. Only called when [`DeviceInfo::zero_copy`] is true.
     fn alloc_host_buffer(&self, _bytes: u64, _max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
         Err(BackendError::Unsupported("the backend has no mappable storage buffers".into()))
+    }
+    /// What the backend's textures can do, `None` when it has none (see [`Backend::create_texture`]).
+    fn texture_caps(&self) -> Option<TextureCaps> {
+        None
+    }
+    /// A texture holding the first `desc.width` x `desc.height` texels of the row-major data of
+    /// `source` at byte `offset`, rows `pitch` bytes apart (a multiple of
+    /// [`TextureCaps::pitch_align`], at least a row), in the order of the recorded work: it shows
+    /// what the work recorded so far wrote to `source`. The texture is returned as a [`Buffer`]
+    /// that only a kernel binding of kind [`BindingKind::Texture2d`] or [`BindingKind::Sampler`]
+    /// accepts, and that a launch keeps alive until it has run. The backend may let the texture
+    /// read `source` itself (the data must not change while a launch that samples the texture
+    /// is pending) or copy it.
+    fn create_texture(&self, _source: &Buffer, _offset: u64, _pitch: u64, _desc: &TextureDesc) -> Result<Buffer, BackendError> {
+        Err(BackendError::Unsupported("the backend has no textures".into()))
     }
     /// Compiles a module; `used` is the entry point's binding mask, see [`CompiledKernel::used`].
     fn compile_kernel(&self, module: &crate::kir::KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError>;

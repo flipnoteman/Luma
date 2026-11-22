@@ -1,0 +1,247 @@
+luma: backend Cuda, device NVIDIA GeForce RTX 3090
+ArrayFire 3.10.1 (CUDA backend): NVIDIA_GeForce_RTX_3090
+== signal_approx
+  luma kernels of approx1 nearest [1M samples, 1M positions]:
+         18.5 us x1   main2d
+approx1 nearest                    1M samples, 1M positions  luma    0.0209 ms  AF    0.0210 ms  AF/luma   1.00  yes (max Δ 0.0e0)
+  luma kernels of approx1 linear [1M samples, 1M positions]:
+         18.4 us x1   main2d
+approx1 linear                     1M samples, 1M positions  luma    0.0216 ms  AF    0.0211 ms  AF/luma   0.98  yes (max Δ 0.0e0)
+  luma kernels of approx1 cubic [1M samples, 1M positions]:
+         18.4 us x1   main2d
+approx1 cubic                      1M samples, 1M positions  luma    0.0216 ms  AF    0.0213 ms  AF/luma   0.99  yes (max Δ 5.4e-7)
+  luma kernels of approx1 nearest [4M samples, 4M positions]:
+         62.5 us x1   main2d
+approx1 nearest                    4M samples, 4M positions  luma    0.0651 ms  AF    0.0636 ms  AF/luma   0.98  yes (max Δ 0.0e0)
+  luma kernels of approx1 linear [4M samples, 4M positions]:
+         62.3 us x1   main2d
+approx1 linear                     4M samples, 4M positions  luma    0.0648 ms  AF    0.0639 ms  AF/luma   0.99  yes (max Δ 0.0e0)
+  luma kernels of approx1 cubic [4M samples, 4M positions]:
+         61.4 us x1   main2d
+approx1 cubic                      4M samples, 4M positions  luma    0.0654 ms  AF    0.0648 ms  AF/luma   0.99  yes (max Δ 5.1e-7)
+  luma kernels of approx1 nearest [16M samples, 16M positions]:
+        233.5 us x1   main2d
+approx1 nearest                    16M samples, 16M positions  luma    0.2365 ms  AF    0.2357 ms  AF/luma   1.00  yes (max Δ 0.0e0)
+  luma kernels of approx1 linear [16M samples, 16M positions]:
+        233.5 us x1   main2d
+approx1 linear                     16M samples, 16M positions  luma    0.2366 ms  AF    0.2372 ms  AF/luma   1.00  yes (max Δ 0.0e0)
+  luma kernels of approx1 cubic [16M samples, 16M positions]:
+        235.5 us x1   main2d
+approx1 cubic                      16M samples, 16M positions  luma    0.2396 ms  AF    0.2424 ms  AF/luma   1.01  yes (max Δ 5.4e-7)
+  luma kernels of approx1 linear [4M samples, 4M random positions]:
+        351.2 us x1   main2d
+approx1 linear                     4M samples, 4M random positions  luma    0.3552 ms  AF    0.3514 ms  AF/luma   0.99  yes (max Δ 0.0e0)
+  luma kernels of approx1 linear, batched [1024 x 4096 samples (4M positions)]:
+         63.5 us x1   main2d
+approx1 linear, batched            1024 x 4096 samples (4M positions)  luma    0.0668 ms  AF    0.0671 ms  AF/luma   1.00  yes (max Δ 0.0e0)
+  luma kernels of approx2 nearest [1080p image, 1080p positions]:
+         42.7 us x1   main2d
+approx2 nearest                    1080p image, 1080p positions  luma    0.0461 ms  AF    0.0471 ms  AF/luma   1.02  yes (max Δ 0.0e0)
+  luma kernels of approx2 bilinear [1080p image, 1080p positions]:
+         45.0 us x1   main2d
+approx2 bilinear                   1080p image, 1080p positions  luma    0.0482 ms  AF    0.0469 ms  AF/luma   0.97  yes (max Δ 0.0e0)
+  luma kernels of approx2 bicubic [1080p image, 1080p positions]:
+         51.1 us x1   main2d
+approx2 bicubic                    1080p image, 1080p positions  luma    0.0543 ms  AF    0.0513 ms  AF/luma   0.95  yes (max Δ 4.8e-7)
+  luma kernels of approx2 nearest [4K image, 4K positions]:
+        157.7 us x1   main2d
+approx2 nearest                    4K image, 4K positions  luma    0.1611 ms  AF    0.1651 ms  AF/luma   1.03  yes (max Δ 0.0e0)
+  luma kernels of approx2 bilinear [4K image, 4K positions]:
+        164.9 us x1   main2d
+approx2 bilinear                   4K image, 4K positions  luma    0.1683 ms  AF    0.1653 ms  AF/luma   0.98  yes (max Δ 0.0e0)
+  luma kernels of approx2 bicubic [4K image, 4K positions]:
+        190.4 us x1   main2d
+approx2 bicubic                    4K image, 4K positions  luma    0.1932 ms  AF    0.1837 ms  AF/luma   0.95  yes (max Δ 4.8e-7)
+
+### NVIDIA GeForce RTX 3090 - luma vs ArrayFire
+
+Steady-state per-call time, median of the timed repetitions of an interleaved (ABBA) run; ratio = AF / luma (> 1: luma faster).
+
+| case | size | luma ms | ArrayFire ms | ratio (AF/luma) | results agree? | note |
+|---|---|---:|---:|---:|---|---|
+| approx1 nearest | 1M samples, 1M positions | 0.0209 | 0.0210 | 1.00 | yes (max Δ 0.0e0) | increasing jittered positions; luma: 1 launches, 0.018 ms GPU |
+| approx1 linear | 1M samples, 1M positions | 0.0216 | 0.0211 | 0.98 | yes (max Δ 0.0e0) | increasing jittered positions; luma: 1 launches, 0.018 ms GPU |
+| approx1 cubic | 1M samples, 1M positions | 0.0216 | 0.0213 | 0.99 | yes (max Δ 5.4e-7) | increasing jittered positions; luma: 1 launches, 0.018 ms GPU |
+| approx1 nearest | 4M samples, 4M positions | 0.0651 | 0.0636 | 0.98 | yes (max Δ 0.0e0) | increasing jittered positions; luma: 1 launches, 0.062 ms GPU |
+| approx1 linear | 4M samples, 4M positions | 0.0648 | 0.0639 | 0.99 | yes (max Δ 0.0e0) | increasing jittered positions; luma: 1 launches, 0.062 ms GPU |
+| approx1 cubic | 4M samples, 4M positions | 0.0654 | 0.0648 | 0.99 | yes (max Δ 5.1e-7) | increasing jittered positions; luma: 1 launches, 0.061 ms GPU |
+| approx1 nearest | 16M samples, 16M positions | 0.2365 | 0.2357 | 1.00 | yes (max Δ 0.0e0) | increasing jittered positions; luma: 1 launches, 0.233 ms GPU |
+| approx1 linear | 16M samples, 16M positions | 0.2366 | 0.2372 | 1.00 | yes (max Δ 0.0e0) | increasing jittered positions; luma: 1 launches, 0.233 ms GPU |
+| approx1 cubic | 16M samples, 16M positions | 0.2396 | 0.2424 | 1.01 | yes (max Δ 5.4e-7) | increasing jittered positions; luma: 1 launches, 0.236 ms GPU |
+| approx1 linear | 4M samples, 4M random positions | 0.3552 | 0.3514 | 0.99 | yes (max Δ 0.0e0) | random positions; luma: 1 launches, 0.351 ms GPU |
+| approx1 linear, batched | 1024 x 4096 samples (4M positions) | 0.0668 | 0.0671 | 1.00 | yes (max Δ 0.0e0) | luma: 1 launches, 0.063 ms GPU |
+| approx2 nearest | 1080p image, 1080p positions | 0.0461 | 0.0471 | 1.02 | yes (max Δ 0.0e0) | smooth warp; luma: 1 launches, 0.043 ms GPU |
+| approx2 bilinear | 1080p image, 1080p positions | 0.0482 | 0.0469 | 0.97 | yes (max Δ 0.0e0) | smooth warp; luma: 1 launches, 0.045 ms GPU |
+| approx2 bicubic | 1080p image, 1080p positions | 0.0543 | 0.0513 | 0.95 | yes (max Δ 4.8e-7) | smooth warp; luma: 1 launches, 0.051 ms GPU |
+| approx2 nearest | 4K image, 4K positions | 0.1611 | 0.1651 | 1.03 | yes (max Δ 0.0e0) | smooth warp; luma: 1 launches, 0.158 ms GPU |
+| approx2 bilinear | 4K image, 4K positions | 0.1683 | 0.1653 | 0.98 | yes (max Δ 0.0e0) | smooth warp; luma: 1 launches, 0.165 ms GPU |
+| approx2 bicubic | 4K image, 4K positions | 0.1932 | 0.1837 | 0.95 | yes (max Δ 4.8e-7) | smooth warp; luma: 1 launches, 0.190 ms GPU |
+
+luma: backend Cuda, device NVIDIA GeForce RTX 3090
+ArrayFire 3.10.1 (CUDA backend): NVIDIA_GeForce_RTX_3090
+== image
+13 conv2 3x3                                    1920x1080  luma    0.0281 ms  AF    0.0419 ms  AF/luma   1.49  yes (max Δ 7.2e-7)
+13 conv2 7x7                                    1920x1080  luma    0.0380 ms  AF    0.0743 ms  AF/luma   1.96  yes (max Δ 2.4e-6)
+13 conv2 15x15                                  1920x1080  luma    0.0995 ms  AF    0.2392 ms  AF/luma   2.40  yes (max Δ 1.5e-5)
+13 conv2_sep 5                                  1920x1080  luma    0.0496 ms  AF    0.0617 ms  AF/luma   1.24  yes (max Δ 1.8e-7)
+13 conv2_sep 15                                 1920x1080  luma    0.0548 ms  AF    0.0772 ms  AF/luma   1.41  yes (max Δ 2.4e-7)
+13 medfilt2 3x3                                 1920x1080  luma    0.0280 ms  AF    0.0388 ms  AF/luma   1.39  yes (max Δ 0.0e0)
+13 medfilt2 5x5                                 1920x1080  luma    0.0590 ms  AF    0.0901 ms  AF/luma   1.53  yes (max Δ 0.0e0)
+13 medfilt2 7x7                                 1920x1080  luma    0.3974 ms  AF     7.749 ms  AF/luma  19.50  yes (max Δ 0.0e0)
+13 minfilt 3x3                                  1920x1080  luma    0.0281 ms  AF    0.0398 ms  AF/luma   1.42  yes (max Δ 0.0e0)
+13 maxfilt 3x3                                  1920x1080  luma    0.0279 ms  AF    0.0398 ms  AF/luma   1.42  yes (max Δ 0.0e0)
+13 minfilt 15x15                                1920x1080  luma    0.0541 ms  AF    0.2415 ms  AF/luma   4.46  yes (max Δ 0.0e0)
+13 maxfilt 15x15                                1920x1080  luma    0.0541 ms  AF    0.2413 ms  AF/luma   4.46  yes (max Δ 0.0e0)
+13 dilate 3x3 cross                             1920x1080  luma    0.0285 ms  AF    0.0377 ms  AF/luma   1.32  yes (max Δ 0.0e0)
+13 erode 3x3 cross                              1920x1080  luma    0.0285 ms  AF    0.0378 ms  AF/luma   1.33  yes (max Δ 0.0e0)
+13 sobel (dx, dy)                               1920x1080  luma    0.0367 ms  AF    0.0410 ms  AF/luma   1.12  yes (max Δ 4.8e-7); yes (max Δ 4.8e-7)
+13 grad (dx, dy)                                1920x1080  luma    0.0368 ms  AF    0.0382 ms  AF/luma   1.04  yes (max Δ 0.0e0); yes (max Δ 0.0e0)
+13 bilateral                                    1920x1080  luma    0.1130 ms  AF    0.1321 ms  AF/luma   1.17  yes (max Δ 4.2e-7)
+13 sat                                          1920x1080  luma    0.0603 ms  AF    0.0937 ms  AF/luma   1.55  yes (max Δ 1.9e-1)
+13 hist_equal                                   1920x1080  luma    0.0485 ms  AF    0.1612 ms  AF/luma   3.32  yes (max Δ 0.0e0)
+13 moments (M00 M01 M10 M11)                    1920x1080  luma    0.0393 ms  AF    0.3662 ms  AF/luma   9.33  yes (max Δ 5.8e2)
+14 rgb2gray                                     1920x1080  luma    0.0465 ms  AF    0.0482 ms  AF/luma   1.04  yes (max Δ 0.0e0)
+14 rgb2hsv                                      1920x1080  luma    0.0662 ms  AF    0.0673 ms  AF/luma   1.02  yes (max Δ 1.2e-7)
+14 hsv2rgb                                      1920x1080  luma    0.0663 ms  AF    0.0672 ms  AF/luma   1.01  yes (max Δ 0.0e0)
+14 rgb2ycbcr 601                                1920x1080  luma    0.0665 ms  AF    0.0718 ms  AF/luma   1.08  yes (max Δ 3.1e-5)
+14 ycbcr2rgb 601                                1920x1080  luma    0.0666 ms  AF    0.0704 ms  AF/luma   1.06  yes (max Δ 3.6e-7)
+14 unwrap 3x3                                   1920x1080  luma    0.1704 ms  AF    0.3256 ms  AF/luma   1.91  yes (max Δ 0.0e0)
+14 wrap 3x3                                     1920x1080  luma    0.1058 ms  AF    0.1304 ms  AF/luma   1.23  yes (max Δ 0.0e0)
+13 conv2 3x3                                    3840x2160  luma    0.0878 ms  AF    0.1423 ms  AF/luma   1.62  yes (max Δ 7.2e-7)
+13 conv2 7x7                                    3840x2160  luma    0.1225 ms  AF    0.2668 ms  AF/luma   2.18  yes (max Δ 2.4e-6)
+13 conv2 15x15                                  3840x2160  luma    0.3682 ms  AF    0.9241 ms  AF/luma   2.51  yes (max Δ 1.7e-5)
+13 conv2_sep 5                                  3840x2160  luma    0.1697 ms  AF    0.2096 ms  AF/luma   1.23  yes (max Δ 1.8e-7)
+13 conv2_sep 15                                 3840x2160  luma    0.1828 ms  AF    0.2696 ms  AF/luma   1.47  yes (max Δ 2.4e-7)
+13 medfilt2 3x3                                 3840x2160  luma    0.0877 ms  AF    0.1374 ms  AF/luma   1.57  yes (max Δ 0.0e0)
+13 medfilt2 5x5                                 3840x2160  luma    0.2072 ms  AF    0.3386 ms  AF/luma   1.63  yes (max Δ 0.0e0)
+13 medfilt2 7x7                                 3840x2160  luma     1.549 ms  AF     30.37 ms  AF/luma  19.61  yes (max Δ 0.0e0)
+13 minfilt 3x3                                  3840x2160  luma    0.0877 ms  AF    0.1302 ms  AF/luma   1.48  yes (max Δ 0.0e0)
+13 maxfilt 3x3                                  3840x2160  luma    0.0878 ms  AF    0.1302 ms  AF/luma   1.48  yes (max Δ 0.0e0)
+13 minfilt 15x15                                3840x2160  luma    0.1759 ms  AF    0.9226 ms  AF/luma   5.25  yes (max Δ 0.0e0)
+13 maxfilt 15x15                                3840x2160  luma    0.1753 ms  AF    0.9152 ms  AF/luma   5.22  yes (max Δ 0.0e0)
+13 dilate 3x3 cross                             3840x2160  luma    0.0882 ms  AF    0.1280 ms  AF/luma   1.45  yes (max Δ 0.0e0)
+13 erode 3x3 cross                              3840x2160  luma    0.0882 ms  AF    0.1281 ms  AF/luma   1.45  yes (max Δ 0.0e0)
+13 sobel (dx, dy)                               3840x2160  luma    0.1274 ms  AF    0.1421 ms  AF/luma   1.12  yes (max Δ 4.8e-7); yes (max Δ 4.8e-7)
+13 grad (dx, dy)                                3840x2160  luma    0.1274 ms  AF    0.1331 ms  AF/luma   1.04  yes (max Δ 0.0e0); yes (max Δ 0.0e0)
+13 bilateral                                    3840x2160  luma    0.4313 ms  AF    0.5043 ms  AF/luma   1.17  yes (max Δ 4.8e-7)
+13 sat                                          3840x2160  luma    0.1921 ms  AF    0.2926 ms  AF/luma   1.52  yes (max Δ 1.0e0)
+13 hist_equal                                   3840x2160  luma    0.1089 ms  AF    0.5200 ms  AF/luma   4.78  yes (max Δ 3.1e-5)
+13 moments (M00 M01 M10 M11)                    3840x2160  luma    0.0698 ms  AF     1.280 ms  AF/luma  18.33  yes (max Δ 1.1e7)
+14 rgb2gray                                     3840x2160  luma    0.1625 ms  AF    0.1644 ms  AF/luma   1.01  yes (max Δ 0.0e0)
+14 rgb2hsv                                      3840x2160  luma    0.2467 ms  AF    0.2473 ms  AF/luma   1.00  yes (max Δ 1.2e-7)
+14 hsv2rgb                                      3840x2160  luma    0.2469 ms  AF    0.2471 ms  AF/luma   1.00  yes (max Δ 0.0e0)
+14 rgb2ycbcr 601                                3840x2160  luma    0.2472 ms  AF    0.2515 ms  AF/luma   1.02  yes (max Δ 3.4e-5)
+14 ycbcr2rgb 601                                3840x2160  luma    0.2470 ms  AF    0.2506 ms  AF/luma   1.01  yes (max Δ 3.6e-7)
+14 unwrap 3x3                                   3840x2160  luma    0.6654 ms  AF     1.293 ms  AF/luma   1.94  yes (max Δ 0.0e0)
+14 wrap 3x3                                     3840x2160  luma    0.3928 ms  AF    0.5119 ms  AF/luma   1.30  yes (max Δ 0.0e0)
+13 gaussian_kernel 5x5                                     luma    0.0045 ms  AF    0.0328 ms  AF/luma   7.28  yes (max Δ 3.7e-9)
+13 gaussian_kernel 15x15                                   luma    0.0048 ms  AF    0.0327 ms  AF/luma   6.81  yes (max Δ 1.9e-9)
+13 gaussian_kernel 31x31                                   luma    0.0059 ms  AF    0.0330 ms  AF/luma   5.61  yes (max Δ 4.7e-10)
+13 conv3 3x3x3                                      256^3  luma    0.4449 ms  AF    0.6908 ms  AF/luma   1.55  yes (max Δ 1.2e-6)
+13 conv3 5x5x5                                      256^3  luma     1.340 ms  AF     1.713 ms  AF/luma   1.28  yes (max Δ 9.1e-6)
+13 dilate3 3x3x3 (6-neighbourhood)                  256^3  luma    0.4082 ms  AF    0.4956 ms  AF/luma   1.21  yes (max Δ 0.0e0)
+13 erode3 3x3x3 (6-neighbourhood)                   256^3  luma    0.4056 ms  AF    0.4947 ms  AF/luma   1.22  yes (max Δ 0.0e0)
+== signal_image
+resize nearest                                1080p -> 4K  luma    0.0587 ms  AF    0.0708 ms  AF/luma   1.21  yes (max Δ 0.0e0)
+resize bilinear                               1080p -> 4K  luma    0.0675 ms  AF    0.0856 ms  AF/luma   1.27  yes (max Δ 1.2e-7)
+resize bicubic                                1080p -> 4K  luma    0.1184 ms  AF    0.2259 ms  AF/luma   1.91  yes (max Δ 3.6e-7)
+resize nearest                                4K -> 1080p  luma    0.0384 ms  AF    0.0356 ms  AF/luma   0.93  yes (max Δ 0.0e0)
+resize bilinear                               4K -> 1080p  luma    0.0565 ms  AF    0.0537 ms  AF/luma   0.95  yes (max Δ 0.0e0)
+resize bicubic                                4K -> 1080p  luma    0.0649 ms  AF    0.0978 ms  AF/luma   1.51  yes (max Δ 0.0e0)
+resize bilinear RGB                           1080p -> 4K  luma    0.1897 ms  AF    0.2494 ms  AF/luma   1.31  yes (max Δ 1.2e-7)
+resize bilinear RGB                           4K -> 1080p  luma    0.1511 ms  AF    0.1494 ms  AF/luma   0.99  yes (max Δ 0.0e0)
+rotate nearest                       1080p, 0.3 rad, crop  luma    0.0264 ms  AF    0.0281 ms  AF/luma   1.07  yes (max Δ 0.0e0)
+rotate bilinear                      1080p, 0.3 rad, crop  luma    0.0306 ms  AF    0.0514 ms  AF/luma   1.68  yes (max Δ 0.0e0)
+transform affine bilinear              1080p, inverse map  luma    0.0280 ms  AF    0.0598 ms  AF/luma   2.13  yes (max Δ 0.0e0)
+transform perspective bilinear         1080p, inverse map  luma    0.0317 ms  AF    0.1150 ms  AF/luma   3.62  yes (max Δ 1.6e-4)
+rotate nearest                          4K, 0.3 rad, crop  luma    0.0907 ms  AF    0.0966 ms  AF/luma   1.07  yes (1 of 8294400 pixels at an edge differ)
+rotate bilinear                         4K, 0.3 rad, crop  luma    0.1049 ms  AF    0.1870 ms  AF/luma   1.78  yes (1 of 8294400 pixels at an edge differ)
+transform affine bilinear                 4K, inverse map  luma    0.0936 ms  AF    0.2131 ms  AF/luma   2.28  yes (max Δ 0.0e0)
+transform perspective bilinear            4K, inverse map  luma    0.1056 ms  AF    0.4317 ms  AF/luma   4.09  yes (max Δ 3.2e-4)
+scale bilinear                           1080p, 0.7 x 1.3  luma    0.0305 ms  AF    0.0596 ms  AF/luma   1.95  yes (max Δ 0.0e0)
+
+### NVIDIA GeForce RTX 3090 - luma vs ArrayFire
+
+Steady-state per-call time, median of the timed repetitions of an interleaved (ABBA) run; ratio = AF / luma (> 1: luma faster).
+
+| case | size | luma ms | ArrayFire ms | ratio (AF/luma) | results agree? | note |
+|---|---|---:|---:|---:|---|---|
+| 13 conv2 3x3 | 1920x1080 | 0.0281 | 0.0419 | 1.49 | yes (max Δ 7.2e-7) | luma cross-correlation = AF convolve2 (spatial) with the flipped kernel; zero border, same size; luma: 1 launches, 0.026 ms GPU |
+| 13 conv2 7x7 | 1920x1080 | 0.0380 | 0.0743 | 1.96 | yes (max Δ 2.4e-6) | luma cross-correlation = AF convolve2 (spatial) with the flipped kernel; zero border, same size; luma: 1 launches, 0.036 ms GPU |
+| 13 conv2 15x15 | 1920x1080 | 0.0995 | 0.2392 | 2.40 | yes (max Δ 1.5e-5) | luma cross-correlation = AF convolve2 (spatial) with the flipped kernel; zero border, same size; luma: 1 launches, 0.096 ms GPU |
+| 13 conv2_sep 5 | 1920x1080 | 0.0496 | 0.0617 | 1.24 | yes (max Δ 1.8e-7) | symmetric Gaussian taps along both axes; luma: 2 launches, 0.047 ms GPU |
+| 13 conv2_sep 15 | 1920x1080 | 0.0548 | 0.0772 | 1.41 | yes (max Δ 2.4e-7) | symmetric Gaussian taps along both axes; luma: 2 launches, 0.053 ms GPU |
+| 13 medfilt2 3x3 | 1920x1080 | 0.0280 | 0.0388 | 1.39 | yes (max Δ 0.0e0) | zero border; luma: 1 launches, 0.025 ms GPU |
+| 13 medfilt2 5x5 | 1920x1080 | 0.0590 | 0.0901 | 1.53 | yes (max Δ 0.0e0) | zero border; luma: 1 launches, 0.055 ms GPU |
+| 13 medfilt2 7x7 | 1920x1080 | 0.3974 | 7.749 | 19.50 | yes (max Δ 0.0e0) | zero border; luma: 1 launches, 0.394 ms GPU |
+| 13 minfilt 3x3 | 1920x1080 | 0.0281 | 0.0398 | 1.42 | yes (max Δ 0.0e0) | cells outside the image ignored (AF's only mode); luma: 1 launches, 0.025 ms GPU |
+| 13 maxfilt 3x3 | 1920x1080 | 0.0279 | 0.0398 | 1.42 | yes (max Δ 0.0e0) | cells outside the image ignored (AF's only mode); luma: 1 launches, 0.025 ms GPU |
+| 13 minfilt 15x15 | 1920x1080 | 0.0541 | 0.2415 | 4.46 | yes (max Δ 0.0e0) | cells outside the image ignored (AF's only mode); luma: 2 launches, 0.052 ms GPU |
+| 13 maxfilt 15x15 | 1920x1080 | 0.0541 | 0.2413 | 4.46 | yes (max Δ 0.0e0) | cells outside the image ignored (AF's only mode); luma: 2 launches, 0.052 ms GPU |
+| 13 dilate 3x3 cross | 1920x1080 | 0.0285 | 0.0377 | 1.32 | yes (max Δ 0.0e0) | luma: 1 launches, 0.025 ms GPU |
+| 13 erode 3x3 cross | 1920x1080 | 0.0285 | 0.0378 | 1.33 | yes (max Δ 0.0e0) | luma: 1 launches, 0.026 ms GPU |
+| 13 sobel (dx, dy) | 1920x1080 | 0.0367 | 0.0410 | 1.12 | yes (max Δ 4.8e-7); yes (max Δ 4.8e-7) | both derivatives; interior compared (the borders differ by convention); luma: 1 launches, 0.033 ms GPU |
+| 13 grad (dx, dy) | 1920x1080 | 0.0368 | 0.0382 | 1.04 | yes (max Δ 0.0e0); yes (max Δ 0.0e0) | luma: 1 launches, 0.035 ms GPU |
+| 13 bilateral | 1920x1080 | 0.1130 | 0.1321 | 1.17 | yes (max Δ 4.2e-7) | spatial sigma 2, range sigma 0.1; luma: 1 launches, 0.111 ms GPU |
+| 13 sat | 1920x1080 | 0.0603 | 0.0937 | 1.55 | yes (max Δ 1.9e-1) | f32 running sums; summation orders differ; luma: 3 launches, 0.060 ms GPU |
+| 13 hist_equal | 1920x1080 | 0.0485 | 0.1612 | 3.32 | yes (max Δ 0.0e0) | same histogram on both sides; lookup by the bin of every pixel; luma: 4 launches, 0.035 ms GPU |
+| 13 moments (M00 M01 M10 M11) | 1920x1080 | 0.0393 | 0.3662 | 9.33 | yes (max Δ 5.8e2) | both read the four sums back (ArrayFire's reductions end in a host read); luma: 9 launches, 0.107 ms GPU |
+| 14 rgb2gray | 1920x1080 | 0.0465 | 0.0482 | 1.04 | yes (max Δ 0.0e0) | luma: 1 launches, 0.044 ms GPU |
+| 14 rgb2hsv | 1920x1080 | 0.0662 | 0.0673 | 1.02 | yes (max Δ 1.2e-7) | luma: 1 launches, 0.063 ms GPU |
+| 14 hsv2rgb | 1920x1080 | 0.0663 | 0.0672 | 1.01 | yes (max Δ 0.0e0) | luma: 1 launches, 0.063 ms GPU |
+| 14 rgb2ycbcr 601 | 1920x1080 | 0.0665 | 0.0718 | 1.08 | yes (max Δ 3.1e-5) | luma: 1 launches, 0.062 ms GPU |
+| 14 ycbcr2rgb 601 | 1920x1080 | 0.0666 | 0.0704 | 1.06 | yes (max Δ 3.6e-7) | luma: 1 launches, 0.063 ms GPU |
+| 14 unwrap 3x3 | 1920x1080 | 0.1704 | 0.3256 | 1.91 | yes (max Δ 0.0e0) | column layout, pad 1; luma: 1 launches, 0.168 ms GPU |
+| 14 wrap 3x3 | 1920x1080 | 0.1058 | 0.1304 | 1.23 | yes (max Δ 0.0e0) | sum of overlapping windows (luma gathers, AF scatters); luma: 1 launches, 0.103 ms GPU |
+| 13 conv2 3x3 | 3840x2160 | 0.0878 | 0.1423 | 1.62 | yes (max Δ 7.2e-7) | luma cross-correlation = AF convolve2 (spatial) with the flipped kernel; zero border, same size; luma: 1 launches, 0.085 ms GPU |
+| 13 conv2 7x7 | 3840x2160 | 0.1225 | 0.2668 | 2.18 | yes (max Δ 2.4e-6) | luma cross-correlation = AF convolve2 (spatial) with the flipped kernel; zero border, same size; luma: 1 launches, 0.120 ms GPU |
+| 13 conv2 15x15 | 3840x2160 | 0.3682 | 0.9241 | 2.51 | yes (max Δ 1.7e-5) | luma cross-correlation = AF convolve2 (spatial) with the flipped kernel; zero border, same size; luma: 1 launches, 0.362 ms GPU |
+| 13 conv2_sep 5 | 3840x2160 | 0.1697 | 0.2096 | 1.23 | yes (max Δ 1.8e-7) | symmetric Gaussian taps along both axes; luma: 2 launches, 0.168 ms GPU |
+| 13 conv2_sep 15 | 3840x2160 | 0.1828 | 0.2696 | 1.47 | yes (max Δ 2.4e-7) | symmetric Gaussian taps along both axes; luma: 2 launches, 0.181 ms GPU |
+| 13 medfilt2 3x3 | 3840x2160 | 0.0877 | 0.1374 | 1.57 | yes (max Δ 0.0e0) | zero border; luma: 1 launches, 0.085 ms GPU |
+| 13 medfilt2 5x5 | 3840x2160 | 0.2072 | 0.3386 | 1.63 | yes (max Δ 0.0e0) | zero border; luma: 1 launches, 0.205 ms GPU |
+| 13 medfilt2 7x7 | 3840x2160 | 1.549 | 30.37 | 19.61 | yes (max Δ 0.0e0) | zero border; luma: 1 launches, 1.545 ms GPU |
+| 13 minfilt 3x3 | 3840x2160 | 0.0877 | 0.1302 | 1.48 | yes (max Δ 0.0e0) | cells outside the image ignored (AF's only mode); luma: 1 launches, 0.085 ms GPU |
+| 13 maxfilt 3x3 | 3840x2160 | 0.0878 | 0.1302 | 1.48 | yes (max Δ 0.0e0) | cells outside the image ignored (AF's only mode); luma: 1 launches, 0.085 ms GPU |
+| 13 minfilt 15x15 | 3840x2160 | 0.1759 | 0.9226 | 5.25 | yes (max Δ 0.0e0) | cells outside the image ignored (AF's only mode); luma: 2 launches, 0.174 ms GPU |
+| 13 maxfilt 15x15 | 3840x2160 | 0.1753 | 0.9152 | 5.22 | yes (max Δ 0.0e0) | cells outside the image ignored (AF's only mode); luma: 2 launches, 0.174 ms GPU |
+| 13 dilate 3x3 cross | 3840x2160 | 0.0882 | 0.1280 | 1.45 | yes (max Δ 0.0e0) | luma: 1 launches, 0.085 ms GPU |
+| 13 erode 3x3 cross | 3840x2160 | 0.0882 | 0.1281 | 1.45 | yes (max Δ 0.0e0) | luma: 1 launches, 0.085 ms GPU |
+| 13 sobel (dx, dy) | 3840x2160 | 0.1274 | 0.1421 | 1.12 | yes (max Δ 4.8e-7); yes (max Δ 4.8e-7) | both derivatives; interior compared (the borders differ by convention); luma: 1 launches, 0.125 ms GPU |
+| 13 grad (dx, dy) | 3840x2160 | 0.1274 | 0.1331 | 1.04 | yes (max Δ 0.0e0); yes (max Δ 0.0e0) | luma: 1 launches, 0.123 ms GPU |
+| 13 bilateral | 3840x2160 | 0.4313 | 0.5043 | 1.17 | yes (max Δ 4.8e-7) | spatial sigma 2, range sigma 0.1; luma: 1 launches, 0.429 ms GPU |
+| 13 sat | 3840x2160 | 0.1921 | 0.2926 | 1.52 | yes (max Δ 1.0e0) | f32 running sums; summation orders differ; luma: 3 launches, 0.193 ms GPU |
+| 13 hist_equal | 3840x2160 | 0.1089 | 0.5200 | 4.78 | yes (max Δ 3.1e-5) | same histogram on both sides; lookup by the bin of every pixel; luma: 4 launches, 0.096 ms GPU |
+| 13 moments (M00 M01 M10 M11) | 3840x2160 | 0.0698 | 1.280 | 18.33 | yes (max Δ 1.1e7) | both read the four sums back (ArrayFire's reductions end in a host read); luma: 9 launches, 0.201 ms GPU |
+| 14 rgb2gray | 3840x2160 | 0.1625 | 0.1644 | 1.01 | yes (max Δ 0.0e0) | luma: 1 launches, 0.160 ms GPU |
+| 14 rgb2hsv | 3840x2160 | 0.2467 | 0.2473 | 1.00 | yes (max Δ 1.2e-7) | luma: 1 launches, 0.244 ms GPU |
+| 14 hsv2rgb | 3840x2160 | 0.2469 | 0.2471 | 1.00 | yes (max Δ 0.0e0) | luma: 1 launches, 0.244 ms GPU |
+| 14 rgb2ycbcr 601 | 3840x2160 | 0.2472 | 0.2515 | 1.02 | yes (max Δ 3.4e-5) | luma: 1 launches, 0.245 ms GPU |
+| 14 ycbcr2rgb 601 | 3840x2160 | 0.2470 | 0.2506 | 1.01 | yes (max Δ 3.6e-7) | luma: 1 launches, 0.243 ms GPU |
+| 14 unwrap 3x3 | 3840x2160 | 0.6654 | 1.293 | 1.94 | yes (max Δ 0.0e0) | column layout, pad 1; luma: 1 launches, 0.664 ms GPU |
+| 14 wrap 3x3 | 3840x2160 | 0.3928 | 0.5119 | 1.30 | yes (max Δ 0.0e0) | sum of overlapping windows (luma gathers, AF scatters); luma: 1 launches, 0.401 ms GPU |
+| 13 gaussian_kernel 5x5 |  | 0.0045 | 0.0328 | 7.28 | yes (max Δ 3.7e-9) | default sigma; the result stays on the device; luma: 0 launches, 0.000 ms GPU |
+| 13 gaussian_kernel 15x15 |  | 0.0048 | 0.0327 | 6.81 | yes (max Δ 1.9e-9) | default sigma; the result stays on the device; luma: 0 launches, 0.000 ms GPU |
+| 13 gaussian_kernel 31x31 |  | 0.0059 | 0.0330 | 5.61 | yes (max Δ 4.7e-10) | default sigma; the result stays on the device; luma: 0 launches, 0.000 ms GPU |
+| 13 conv3 3x3x3 | 256^3 | 0.4449 | 0.6908 | 1.55 | yes (max Δ 1.2e-6) | flipped kernel for AF; zero border; luma: 1 launches, 0.442 ms GPU |
+| 13 conv3 5x5x5 | 256^3 | 1.340 | 1.713 | 1.28 | yes (max Δ 9.1e-6) | flipped kernel for AF; zero border; luma: 1 launches, 1.337 ms GPU |
+| 13 dilate3 3x3x3 (6-neighbourhood) | 256^3 | 0.4082 | 0.4956 | 1.21 | yes (max Δ 0.0e0) | luma: 1 launches, 0.406 ms GPU |
+| 13 erode3 3x3x3 (6-neighbourhood) | 256^3 | 0.4056 | 0.4947 | 1.22 | yes (max Δ 0.0e0) | luma: 1 launches, 0.402 ms GPU |
+| resize nearest | 1080p -> 4K | 0.0587 | 0.0708 | 1.21 | yes (max Δ 0.0e0) | luma: 1 launches, 0.056 ms GPU |
+| resize bilinear | 1080p -> 4K | 0.0675 | 0.0856 | 1.27 | yes (max Δ 1.2e-7) | luma: 1 launches, 0.065 ms GPU |
+| resize bicubic | 1080p -> 4K | 0.1184 | 0.2259 | 1.91 | yes (max Δ 3.6e-7) | luma: 1 launches, 0.116 ms GPU |
+| resize nearest | 4K -> 1080p | 0.0384 | 0.0356 | 0.93 | yes (max Δ 0.0e0) | luma: 1 launches, 0.036 ms GPU |
+| resize bilinear | 4K -> 1080p | 0.0565 | 0.0537 | 0.95 | yes (max Δ 0.0e0) | luma: 1 launches, 0.054 ms GPU |
+| resize bicubic | 4K -> 1080p | 0.0649 | 0.0978 | 1.51 | yes (max Δ 0.0e0) | luma: 1 launches, 0.062 ms GPU |
+| resize bilinear RGB | 1080p -> 4K | 0.1897 | 0.2494 | 1.31 | yes (max Δ 1.2e-7) | luma: 1 launches, 0.188 ms GPU |
+| resize bilinear RGB | 4K -> 1080p | 0.1511 | 0.1494 | 0.99 | yes (max Δ 0.0e0) | luma: 1 launches, 0.148 ms GPU |
+| rotate nearest | 1080p, 0.3 rad, crop | 0.0264 | 0.0281 | 1.07 | yes (max Δ 0.0e0) | AF rotate() timed; agreement checked against AF transform() with luma's matrix (AF rotate() rounds cos/sin to 3 decimals); luma: 1 launches, 0.024 ms GPU |
+| rotate bilinear | 1080p, 0.3 rad, crop | 0.0306 | 0.0514 | 1.68 | yes (max Δ 0.0e0) | AF rotate() timed; agreement checked against AF transform() with luma's matrix (AF rotate() rounds cos/sin to 3 decimals); luma: 1 launches, 0.028 ms GPU |
+| transform affine bilinear | 1080p, inverse map | 0.0280 | 0.0598 | 2.13 | yes (max Δ 0.0e0) | luma: 1 launches, 0.025 ms GPU |
+| transform perspective bilinear | 1080p, inverse map | 0.0317 | 0.1150 | 3.62 | yes (max Δ 1.6e-4) | luma: 1 launches, 0.029 ms GPU |
+| rotate nearest | 4K, 0.3 rad, crop | 0.0907 | 0.0966 | 1.07 | yes (1 of 8294400 pixels at an edge differ) | AF rotate() timed; agreement checked against AF transform() with luma's matrix (AF rotate() rounds cos/sin to 3 decimals); luma: 1 launches, 0.088 ms GPU |
+| rotate bilinear | 4K, 0.3 rad, crop | 0.1049 | 0.1870 | 1.78 | yes (1 of 8294400 pixels at an edge differ) | AF rotate() timed; agreement checked against AF transform() with luma's matrix (AF rotate() rounds cos/sin to 3 decimals); luma: 1 launches, 0.104 ms GPU |
+| transform affine bilinear | 4K, inverse map | 0.0936 | 0.2131 | 2.28 | yes (max Δ 0.0e0) | luma: 1 launches, 0.091 ms GPU |
+| transform perspective bilinear | 4K, inverse map | 0.1056 | 0.4317 | 4.09 | yes (max Δ 3.2e-4) | luma: 1 launches, 0.102 ms GPU |
+| scale bilinear | 1080p, 0.7 x 1.3 | 0.0305 | 0.0596 | 1.95 | yes (max Δ 0.0e0) | luma: 1 launches, 0.028 ms GPU |
+

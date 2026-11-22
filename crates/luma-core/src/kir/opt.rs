@@ -295,6 +295,7 @@ impl<'a> Types<'a> {
             Expr::Cast { dst_ty, .. } => Cow::Borrowed(dst_ty),
             Expr::Call { ty, .. } => Cow::Borrowed(ty.as_ref().expect("a call used as a value returns one")),
             Expr::AtomicLoad { ty, .. } => Cow::Owned(KirType::Scalar(*ty)),
+            Expr::Texture { .. } => Cow::Owned(KirType::vec(ScalarTy::F32, 4)),
         }
     }
 

@@ -443,6 +443,24 @@ pub enum IrSubgroupOp {
     Shuffle,
 }
 
+/// A read of a texture binding ([`Expr::Texture`]); the texel is a `vec4<f32>` whose channels the
+/// texture's format does not have read as 0, 0, 1 (red, green, blue) and 1 (alpha), and the
+/// addressing is clamp-to-edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextureOp {
+    /// `textureLoad(t, coords, 0)`, `coords: vec2<i32>`: the texel at integer coordinates (clamped
+    /// to the texture).
+    Load,
+    /// `textureGather(component, t, s, coords)`, `coords: vec2<f32>` normalized: the `component`
+    /// (0 red .. 3 alpha) of the four texels `(i, j)`, `(i + 1, j)`, `(i + 1, j + 1)`, `(i, j + 1)` in
+    /// that order (x, y, z, w) with `i = floor(coords.x * width - 0.5)` and `j` likewise,
+    /// unfiltered and exact; texels past the edge are the clamped ones.
+    Gather(u8),
+    /// `textureSampleLevel(t, s, coords, 0.0)`, `coords: vec2<f32>` normalized: the texture's
+    /// filter ([`crate::hal::TextureFilter`]) at the point.
+    Sample,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     LitBool(bool),
@@ -481,6 +499,8 @@ pub enum Expr {
     /// Element count of an unsized array binding (`arrayLength`); only backends that know the
     /// buffer length can honor it.
     ArrayLength { binding: u32 },
+    /// A fetch from a [`BindingKind::Texture2d`] binding; a `vec4<f32>`.
+    Texture { op: TextureOp, binding: u32, coords: Box<Expr> },
 }
 
 impl Expr {
@@ -520,6 +540,7 @@ impl Expr {
                 f(c);
             }
             Expr::Cast { expr, .. } => f(expr),
+            Expr::Texture { coords, .. } => f(coords),
             Expr::Call { args, .. } => args.iter().for_each(f),
             Expr::AtomicLoad { target, .. } => target.for_each_expr(f),
             Expr::Subgroup { arg, lane, .. } => {
@@ -577,6 +598,7 @@ impl Expr {
                 f(c);
             }
             Expr::Cast { expr, .. } => f(expr),
+            Expr::Texture { coords, .. } => f(coords),
             Expr::Call { args, .. } => args.iter_mut().for_each(f),
             Expr::AtomicLoad { target, .. } => target.for_each_expr_mut(f),
             Expr::Subgroup { arg, lane, .. } => {
