@@ -1,12 +1,22 @@
-//! ORB, SIFT and GLOH.
-//!
-//! (Stub: filled by the implementation of this group. A group owns this file and a directory of
-//! the same name for its submodules; `Kernel` is the key of its built-in kernels in the
-//! context's cache, `source` generates their WGSL.)
+//! ORB, SIFT and GLOH: oriented keypoints with descriptors on an image pyramid (ArrayFire's
+//! `orb`, `sift` and `gloh`). See [`Array::orb`](crate::Array::orb).
 
+mod orb;
+mod orb_pattern;
+mod resize;
+
+/// One kernel of this group (part of the key of its cache entry in the context).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Kernel {}
+pub(crate) enum Kernel {
+    /// The bilinear resize of the pyramids.
+    Resize,
+    /// A kernel of ORB.
+    Orb(orb::Kernel),
+}
 
 pub(crate) fn source(kernel: Kernel) -> String {
-    match kernel {}
+    match kernel {
+        Kernel::Resize => resize::source(),
+        Kernel::Orb(k) => orb::source(k),
+    }
 }
