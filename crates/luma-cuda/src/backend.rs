@@ -1677,6 +1677,22 @@ impl Backend for CudaBackend {
     }
 }
 
+/// Revision of the code generator, a hash of the sources that emit and compile the NVVM IR.
+fn cuda_code_revision() -> u64 {
+    static REVISION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *REVISION.get_or_init(|| {
+        cache::source_revision(&[
+            include_str!("codegen/mod.rs"),
+            include_str!("codegen/ops.rs"),
+            include_str!("codegen/fb.rs"),
+            include_str!("codegen/conv.rs"),
+            include_str!("nvvm.rs"),
+            include_str!("ptx.rs"),
+            include_str!("backend.rs"),
+        ])
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,20 +1764,4 @@ mod tests {
     fn open_backend() -> Result<CudaBackend, BackendError> {
         CudaBackend::new()
     }
-}
-
-/// Revision of the code generator, a hash of the sources that emit and compile the NVVM IR.
-fn cuda_code_revision() -> u64 {
-    static REVISION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *REVISION.get_or_init(|| {
-        cache::source_revision(&[
-            include_str!("codegen/mod.rs"),
-            include_str!("codegen/ops.rs"),
-            include_str!("codegen/fb.rs"),
-            include_str!("codegen/conv.rs"),
-            include_str!("nvvm.rs"),
-            include_str!("ptx.rs"),
-            include_str!("backend.rs"),
-        ])
-    })
 }
