@@ -69,6 +69,8 @@ mod guide {
     pub mod performance {}
     #[doc = include_str!("../guide/src/examples.md")]
     pub mod examples {}
+    #[doc = include_str!("../guide/src/images.md")]
+    pub mod images {}
     #[doc = include_str!("../guide/src/environment.md")]
     pub mod environment {}
     #[doc = include_str!("../guide/src/faq.md")]
@@ -123,6 +125,7 @@ mod sort;
 mod tuning;
 mod until;
 mod view;
+mod image;
 
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
@@ -149,6 +152,7 @@ pub use search::Side;
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
+pub use image::{gaussian_kernel, gaussian_kernel_1d, gaussian_kernel_1d_on, gaussian_kernel_on, Border, ColorSpace, ConvSpec, ImagePixel, Padding, YccStd};
 
 /// Plumbing of `fields!`; not part of the public API.
 #[doc(hidden)]
