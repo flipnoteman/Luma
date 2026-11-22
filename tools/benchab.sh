@@ -33,18 +33,23 @@ put() {
   else git -C "$here" archive "$1" | tar -x -C "$2"; fi
 }
 put "$base" "$snap/a"; put "$new" "$snap/b"
-# Fresh mtimes so a shared target dir never reuses another ref's artifacts.
-find "$snap" -type f -exec touch {} +
+# Build both binaries here (nice'd), before the job takes a GPU: the queue's prebuilder cannot build two trees into
+# two target dirs, and a build inside the job keeps the GPU idle for minutes. The job ships only the two binaries.
+T=${BENCHAB_TARGET:-$HOME/.cache/luma-benchref/target}
+mkdir -p "$snap/bin" "$snap/out"
+for s in a b; do
+  ref=$([ $s = a ] && sha_of "$base" || sha_of "$new")
+  # Fresh mtimes so the shared target dir never reuses another ref's artifacts.
+  find "$snap/$s" -type f -exec touch {} +
+  (cd "$snap/$s" && env -u CARGO_TARGET_DIR LUMA_BENCH_REF=$ref nice -n 10 cargo build --release -p luma-bench --target-dir "$T/ab-$s" > "$snap/out/build-$s.log" 2>&1) \
+    || { tail -30 "$snap/out/build-$s.log"; echo "benchab: build $s failed"; exit 1; }
+  cp "$T/ab-$s/release/luma-bench" "$snap/bin/$s"
+  rm -rf "${snap:?}/$s"
+done
 git -C "$snap" init -q && git -C "$snap" add -A >/dev/null && git -C "$snap" -c user.name=b -c user.email=b@b commit -qm "ab $la $lb" >/dev/null
 
-run="export PATH=\$HOME/.cargo/bin:\$PATH
-mkdir -p out
-T=\${CARGO_TARGET_DIR:-\$PWD/target}
-for s in a b; do
-  ref=\$([ \$s = a ] && echo $(sha_of "$base") || echo $(sha_of "$new"))
-  (cd \$s && LUMA_BENCH_REF=\$ref cargo build --release -p luma-bench --target-dir \$T/ab-\$s > ../out/build-\$s.log 2>&1) || { tail -30 out/build-\$s.log; echo \"benchab: build \$s failed\"; exit 1; }
-done
-A=\$T/ab-a/release/luma-bench B=\$T/ab-b/release/luma-bench
+run="mkdir -p out
+A=\$PWD/bin/a B=\$PWD/bin/b
 # Each side gets its own kernel/pipeline cache, empty at the start of the job: a shared cache near its size cap
 # makes context creation cost ~1 ms per cached MB and varies with whatever other runs left in it.
 CA=\$(mktemp -d) CB=\$(mktemp -d)
