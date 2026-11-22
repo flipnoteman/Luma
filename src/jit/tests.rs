@@ -5205,3 +5205,23 @@ fn a_standardized_operand_counts_the_reductions_it_waits_for_as_buffers() {
     let scaled = &x * 2.0;
     assert!(!super::is_recomputed(scaled.pending().expect("a lazy expression")));
 }
+
+/// A triangle of a stored matrix is a select of the matrix and zero by a mask of coordinates: the
+/// elements of the zeroed half do not read the matrix.
+#[test]
+fn a_triangle_of_a_stored_matrix_branches_and_reads_half() {
+    let ctx = ctx();
+    let n = 300usize;
+    let data = values(n * n, 77, -1.0, 1.0);
+    let a = f32s(&ctx, &data);
+    let a = a.reshape([n, n]);
+    a.eval().unwrap();
+    let got = a.lower(false).to_vec().unwrap();
+    for j in 0..n {
+        for i in 0..n {
+            let want = if j > i { 0.0 } else { data[i + n * j] };
+            assert_eq!(got[i + n * j], want, "({i}, {j})");
+        }
+    }
+    assert!(ctx.jit().last_branches() > 0, "the triangle is not a branch ({:?})", ctx.jit().last_judgement());
+}
