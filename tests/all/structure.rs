@@ -61,7 +61,7 @@ impl Elem for u32 {
 
 impl Elem for bool {
     fn make(i: usize) -> bool {
-        (i * 7 + i / 3) % 3 != 0
+        !(i * 7 + i / 3).is_multiple_of(3)
     }
     fn zero() -> bool {
         false

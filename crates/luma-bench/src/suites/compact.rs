@@ -174,7 +174,7 @@ fn colstats_cases(h: &mut Harness) {
     let sz = format!("{s}x{t}");
     let hi = traces(s, t, 5);
     let hf: Vec<f32> = hi.iter().map(|&v| f32::from(v)).collect();
-    let flags: Vec<f32> = (0..t).map(|i| if lcg(1, i as u64 + 7).next().unwrap() % 2 == 0 { 1.0 } else { 0.0 }).collect();
+    let flags: Vec<f32> = (0..t).map(|i| if lcg(1, i as u64 + 7).next().unwrap().is_multiple_of(2) { 1.0 } else { 0.0 }).collect();
     let n1 = flags.iter().sum::<f32>();
     let n0 = t as f32 - n1;
     let group = Array::from_slice_on(&h.ctx, &flags, [1, t]).unwrap();

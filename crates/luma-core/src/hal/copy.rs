@@ -126,7 +126,7 @@ impl Pool {
                 return part;
             }
             spins += 1;
-            if spins % 64 == 0 && start.elapsed() >= WORKER_SPIN {
+            if spins.is_multiple_of(64) && start.elapsed() >= WORKER_SPIN {
                 break;
             }
             std::hint::spin_loop();

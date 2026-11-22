@@ -69,9 +69,9 @@ fn wants(h: &Harness, prefix: &str) -> bool {
 }
 
 fn label(n: usize) -> String {
-    if n >= 1_000_000 && n % 100_000 == 0 {
+    if n >= 1_000_000 && n.is_multiple_of(100_000) {
         format!("{}M", n as f64 / 1e6)
-    } else if n >= 1_000 && n % 100 == 0 {
+    } else if n >= 1_000 && n.is_multiple_of(100) {
         format!("{}K", n as f64 / 1e3)
     } else {
         n.to_string()

@@ -303,6 +303,9 @@ fn tanhf_v(x: V) -> V {
 
 macro_rules! entry {
     ($($name:ident => $f:ident),* $(,)?) => {$(
+        // The JIT calls these with the System V vector convention (`__m128` in `xmm0`), so the
+        // SIMD type in an `extern "C"` signature is the intended ABI, not a C interface.
+        #[allow(improper_ctypes_definitions)]
         pub extern "C" fn $name(x: __m128) -> __m128 {
             // SAFETY: SSE2 is part of the x86-64 baseline.
             unsafe { $f(x) }
@@ -320,6 +323,8 @@ entry! {
     log2f4 => log2f_v,
 }
 
+// The packet entry points take and return `__m128` by design (see `entry!`).
+#[allow(improper_ctypes_definitions)]
 #[cfg(test)]
 mod tests {
     use super::*;

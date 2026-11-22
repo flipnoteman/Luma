@@ -323,7 +323,7 @@ fn run(input: &Array<f32>, dt: f32, k: f32, iterations: u32, flux: FluxFunction,
     // Step `s` writes `out` when `iterations - 1 - s` is even, the other image otherwise; the
     // first step reads the input and every later one what the one before wrote.
     let target = |step: u32| -> (&Buffer, u64) {
-        if (iterations - 1 - step) % 2 == 0 {
+        if (iterations - 1 - step).is_multiple_of(2) {
             (out_pin.buffer(), out_bytes)
         } else {
             (other.as_ref().expect("a second image"), out_bytes)

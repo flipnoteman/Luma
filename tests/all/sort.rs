@@ -360,7 +360,7 @@ impl Val for f32 {
 }
 impl Val for bool {
     fn of(i: u32) -> Self {
-        i % 3 == 0
+        i.is_multiple_of(3)
     }
 }
 impl Val for f64 {

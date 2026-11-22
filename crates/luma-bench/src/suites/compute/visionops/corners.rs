@@ -50,7 +50,7 @@ fn points(k: &Keypoints) -> Vec<(u32, u32)> {
 /// The Harris corners of a Gaussian window of `sigma` (5 cells at 1.0) as `(x, y)`, sorted.
 fn harris_host(data: &[f32], h: usize, w: usize, sigma: f64, kk: f64) -> Vec<(u32, u32)> {
     let floor = (6.0 * sigma).floor() as usize;
-    let n = if floor % 2 == 0 { floor - 1 } else { floor };
+    let n = if floor.is_multiple_of(2) { floor - 1 } else { floor };
     let c = (n - 1) / 2;
     let g: Vec<f64> = (0..n).map(|i| (-((i as f64 - c as f64).powi(2)) / (2.0 * sigma * sigma)).exp()).collect();
     let total: f64 = g.iter().sum();

@@ -59,9 +59,9 @@ fn huge(h: &Harness) -> Option<usize> {
 }
 
 fn label(n: usize) -> String {
-    if n >= 1_000_000 && n % 1_000_000 == 0 {
+    if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
         format!("{}m", n / 1_000_000)
-    } else if n >= 1_000 && n % 1_000 == 0 {
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
         format!("{}k", n / 1_000)
     } else {
         n.to_string()

@@ -1139,7 +1139,7 @@ impl<'a> Lines<'a> {
                 return self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n, 1), n], out, input, None);
             }
             if lines >= self.ctx.tuning().scaled(WARP_MIN_LINES) && self.ctx.tuning().subgroup32 {
-                let vec = if n % 4 == 0 { 4 } else if n % 2 == 0 { 2 } else { 1 };
+                let vec = if n.is_multiple_of(4) { 4 } else if n.is_multiple_of(2) { 2 } else { 1 };
                 return self.launch(Pass::Warp { vec }, [n, 1, lines, 1, n], out, input, None);
             }
             if self.ctx.tuning().lookback_scan && n > LOOKBACK_CHUNK && self.grouping_free() {

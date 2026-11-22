@@ -244,6 +244,8 @@ pub struct PacketMath {
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
+// `__m128` in `xmm0` (System V) is the calling convention the JIT emits for packet calls.
+#[allow(improper_ctypes_definitions)]
 pub type PacketFn = extern "C" fn(std::arch::x86_64::__m128) -> std::arch::x86_64::__m128;
 
 impl CpuMathTable {

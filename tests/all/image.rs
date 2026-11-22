@@ -154,7 +154,7 @@ fn conv2_matches_the_host_for_every_border_padding_and_stride() {
                     for stride in [[1usize, 1], [2, 1], [1, 3], [2, 2]] {
                         // Cheap subsample of the product: every case of the small sizes, a quarter of the rest.
                         case += 1;
-                        if h * w > 100 && case % 4 != 0 {
+                        if h * w > 100 && !case.is_multiple_of(4) {
                             continue;
                         }
                         let k3 = [k[0], k[1], 1];
@@ -162,7 +162,7 @@ fn conv2_matches_the_host_for_every_border_padding_and_stride() {
                         if h + before[0] + after[0] < k[0] || w + before[1] + after[1] < k[1] {
                             continue;
                         }
-                        let batch = if case % 7 == 0 { 3 } else { 1 };
+                        let batch = if case.is_multiple_of(7) { 3 } else { 1 };
                         let (v, data) = vol_f32(case, [h, w, 1], batch);
                         let kd = values(k[0] * k[1], case + 1000, -1.0, 1.0);
                         let x = array_of(&ctx, &data, [h, w, 1], batch);
