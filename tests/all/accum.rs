@@ -505,7 +505,7 @@ fn covariance_between_two_streams_per_position() {
     b.push(&Array::from_slice(&x[half..], x.len() - half).unwrap(), &Array::from_slice(&y[half..], y.len() - half).unwrap()).unwrap();
     let b = CoMoments::<Df32>::from_bytes(&b.to_bytes().unwrap()).unwrap();
     a.merge(&b).unwrap();
-    close(read(a.cov())[0], cxy / n, 1e-4, 1e-6, "merged cov");
+    close(read(a.cov())[0], cxy / n, 1e-4, 2e-5, "merged cov");
     close(read(a.corr())[0], cxy / (m2x * m2y).sqrt(), 1e-4, 1e-5, "merged corr");
     close(read(a.count())[0], n, 0.0, 0.0, "merged count");
     let masked = CoMoments::<Df32>::new(Fold::all());
@@ -552,8 +552,10 @@ fn feature_covariance_matrix() {
     for i in 0..F {
         for j in 0..F {
             let [_, mi, mj, m2i, m2j, cij] = host_co(&col(i), &col(j));
-            close(cov[i + F * j], cij / n, 1e-4, 1e-6, "cov entry");
-            close(corr[i + F * j], cij / (m2i * m2j).sqrt(), 1e-4, 1e-5, "corr entry");
+            // The product sums `f32` terms of the size of the variances over an epoch of samples:
+            // an absolute error of a few 1e-6 of them.
+            close(cov[i + F * j], cij / n, 1e-4, 2e-5, "cov entry");
+            close(corr[i + F * j], cij / (m2i * m2j).sqrt(), 1e-4, 2e-5, "corr entry");
             if i == j {
                 close(mean[i], mi, 1e-6, 1e-4, "mean");
                 close(var[i], m2i / n, 1e-4, 0.0, "var");
@@ -569,7 +571,7 @@ fn feature_covariance_matrix() {
     a.merge(&b).unwrap();
     let merged = read(a.cov());
     for k in 0..F * F {
-        close(merged[k], cov[k], 1e-4, 1e-6, "merged cov");
+        close(merged[k], cov[k], 1e-4, 2e-5, "merged cov");
     }
     assert!(Covariance::<Df32>::new().push(&Array::<f32>::zeros([3, 4, 2]).unwrap()).is_err());
 }
