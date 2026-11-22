@@ -480,12 +480,12 @@ fn small(a: &Array<f32>, d: Dims, plan: Plan) -> Result<Outputs, LumaError> {
     let (s_shape, u_shape, vt_shape) = output_shapes(plan.kind, d);
     let mut s = Array::<f32>::alloc(ctx, s_shape)?;
     let params = SmallParams { r: rr as u32, c: cc as u32, batch: d.batch as u32, wide: u32::from(wide), tol: tolerance(rr) };
-    let src = small_source(&plan);
+    let key = format!("svd_small:{plan:?}");
     let groups = per_matrix(ctx, d.batch);
     match (plan.kind, plan.vectors) {
         (_, false) => {
             let args: [KernelArg<'_>; 3] = [a.into(), (&mut s).into(), uniform(&params)];
-            launch(ctx, &src, "svd_small", groups, &args)?;
+            launch(ctx, &key, "svd_small", || small_source(&plan), groups, &args)?;
             Ok(Outputs { s, u: None, vt: None })
         }
         (Kind::Svd, true) => {
@@ -495,14 +495,14 @@ fn small(a: &Array<f32>, d: Dims, plan: Plan) -> Result<Outputs, LumaError> {
                 // The kernel's "left" output holds `X`'s left vectors: `u` for a tall matrix, `vt` for a wide one.
                 let (left, right) = if wide { (&mut vt, &mut u) } else { (&mut u, &mut vt) };
                 let args: [KernelArg<'_>; 5] = [a.into(), (&mut s).into(), left.into(), right.into(), uniform(&params)];
-                launch(ctx, &src, "svd_small", groups, &args)?;
+                launch(ctx, &key, "svd_small", || small_source(&plan), groups, &args)?;
             }
             Ok(Outputs { s, u: Some(u), vt: Some(vt) })
         }
         (Kind::Eigh, true) => {
             let mut v = Array::<f32>::alloc(ctx, vt_shape)?;
             let args: [KernelArg<'_>; 4] = [a.into(), (&mut s).into(), (&mut v).into(), uniform(&params)];
-            launch(ctx, &src, "eigh_small", groups, &args)?;
+            launch(ctx, &key, "eigh_small", || small_source(&plan), groups, &args)?;
             Ok(Outputs { s, u: None, vt: Some(v) })
         }
     }
@@ -824,13 +824,13 @@ fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> 
     let mut sig = Array::<f32>::alloc(ctx, Shape::from([cc]))?;
     {
         let args: [KernelArg<'_>; 3] = [(&w).into(), (&mut sig).into(), uniform(&dims)];
-        launch(ctx, &norms_source(), "svd_norms", per_matrix(ctx, cc), &args)?;
+        launch(ctx, "svd_norms", "svd_norms", norms_source, per_matrix(ctx, cc), &args)?;
     }
     let mut sv = Array::<f32>::alloc(ctx, Shape::from([cc, 1]))?;
     let mut ord = Array::<u32>::alloc(ctx, Shape::from([cc]))?;
     {
         let args: [KernelArg<'_>; 5] = [(&sig).into(), (&mut sv).into(), (&mut ord).into(), (&shift).into(), uniform(&dims)];
-        launch(ctx, &rank_source(eigh), "svd_rank", per_matrix(ctx, cc.div_ceil(128)), &args)?;
+        launch(ctx, &format!("svd_rank:{eigh}"), "svd_rank", || rank_source(eigh), per_matrix(ctx, cc.div_ceil(128)), &args)?;
     }
     let s = (&sv * &mxs).reshape([cc, 1, 1]);
     if !vectors {
@@ -843,7 +843,7 @@ fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> 
     if eigh {
         let mut vecs = Array::<f32>::alloc(ctx, vt_shape)?;
         let args: [KernelArg<'_>; 4] = [(&v).into(), (&ord).into(), (&mut vecs).into(), uniform(&dims3)];
-        launch(ctx, &emit_source(kind), "eigh_emit", groups, &args)?;
+        launch(ctx, "eigh_emit", "eigh_emit", || emit_source(kind), groups, &args)?;
         return Ok(Outputs { s, u: None, vt: Some(vecs) });
     }
     let mut u = Array::<f32>::alloc(ctx, u_shape)?;
@@ -851,7 +851,7 @@ fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> 
     {
         let (left, right) = if wide { (&mut vt, &mut u) } else { (&mut u, &mut vt) };
         let args: [KernelArg<'_>; 7] = [(&v).into(), (&ord).into(), right.into(), left.into(), (&w).into(), (&sv).into(), uniform(&dims3)];
-        launch(ctx, &emit_source(kind), "svd_emit", groups, &args)?;
+        launch(ctx, "svd_emit", "svd_emit", || emit_source(kind), groups, &args)?;
     }
     // Exactly zero singular values (sorted last) have no left vector: complete them to an orthonormal
     // set, the last columns of the full Q of the others. Reading the values back costs one wait.
