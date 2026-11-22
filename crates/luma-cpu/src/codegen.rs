@@ -2999,6 +2999,7 @@ impl<'a, 'f> Lower<'a, 'f> {
                 let v = self.b.ins().splat(I32X4, v);
                 self.scalar_val(ScalarTy::U32, self.uni(ScalarTy::U32, v))
             }
+            Expr::Texture { .. } => unreachable!("the CPU backend rejects texture kernels before lowering"),
             Expr::ArrayLength { binding } => {
                 let v = match self
                     .plan

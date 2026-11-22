@@ -35,6 +35,10 @@ pub enum CudaArgAbi {
     InlineUniform { size: usize },
     /// A device pointer to the uniform bytes (too large to pass by value).
     UniformPtr,
+    /// The 64-bit handle of a texture object (`CUtexObject`).
+    Texture,
+    /// No parameter: a sampler binding's state is that of the texture object it is bound from.
+    Unbound,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +154,9 @@ fn scan(block: &[Stmt]) -> Res {
                 Expr::ArrayLength { binding } => {
                     r.binds.insert(*binding);
                     r.lens.insert(*binding);
+                }
+                Expr::Texture { binding, .. } => {
+                    r.binds.insert(*binding);
                 }
                 Expr::AtomicLoad { target, .. } => tgt_res(target, &mut r),
                 Expr::Call { func, .. } => {
@@ -451,6 +458,7 @@ impl<'a> Em<'a> {
             Expr::Cast { dst_ty, .. } => dst_ty.clone(),
             Expr::Call { ty, .. } => ty.clone().unwrap_or(KirType::BOOL),
             Expr::AtomicLoad { ty, .. } => KirType::Scalar(*ty),
+            Expr::Texture { .. } => KirType::vec(ScalarTy::F32, 4),
         }
     }
 
@@ -1021,6 +1029,12 @@ impl<'a> Em<'a> {
                 let l = cx.lens.get(binding).cloned().unwrap_or_else(|| invariant(format!("length of binding {binding} is not available")));
                 scalar_val(ScalarTy::U32, l)
             }
+            Expr::Texture { op, binding, coords } => {
+                let c = self.expr(fb, coords, cx);
+                let (_, cl) = lanes_of(&c);
+                let handle = cx.binds.get(binding).unwrap_or_else(|| invariant(format!("texture binding {binding} is not available")));
+                Val::Lanes { elem: ScalarTy::F32, ops: ops::texture(fb, *op, handle, &cl[0], &cl[1]) }
+            }
         }
     }
 
@@ -1402,7 +1416,12 @@ impl<'a> Em<'a> {
             .collect();
         for (i, b) in m.bindings.iter().enumerate() {
             if self.active[i] {
-                self.abi[i] = Some(if b.kind == BindingKind::Uniform { CudaArgAbi::UniformPtr } else { CudaArgAbi::DevicePtr });
+                self.abi[i] = Some(match b.kind {
+                    BindingKind::Uniform => CudaArgAbi::UniformPtr,
+                    BindingKind::Texture2d => CudaArgAbi::Texture,
+                    BindingKind::Sampler => CudaArgAbi::Unbound,
+                    BindingKind::StorageRead | BindingKind::StorageReadWrite => CudaArgAbi::DevicePtr,
+                });
             }
         }
         // Smallest first: each uniform goes inline only if it is at most MAX_INLINE_UNIFORM bytes
@@ -1524,6 +1543,13 @@ impl<'a> Em<'a> {
                     let p = fb.def_entry(&format!("bitcast [{n} x i8]* %unib{i} to i8*"));
                     cx.binds.insert(i32_, p);
                 }
+                (BindingKind::Texture2d, _) => {
+                    kparams.push(format!("i64 %tex{i}"));
+                    ktypes.push("i64".into());
+                    let p = fb.def_entry(&format!("inttoptr i64 %tex{i} to i8*"));
+                    cx.binds.insert(i32_, p);
+                }
+                (BindingKind::Sampler, _) => {}
                 (BindingKind::Uniform, _) => {
                     kparams.push(format!("i8* noalias %uni{i}"));
                     ktypes.push("i8*".into());

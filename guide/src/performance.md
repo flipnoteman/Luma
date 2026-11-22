@@ -121,6 +121,19 @@ decisions are based on. The model is not a tuning knob you can set: if a decisio
 hardware, `x.cache()` forces a materialisation, and `LUMA_STAGING=off` removes the staged plan (the
 model still chooses between recomputing and materialising).
 
+### Reading a source through a texture
+
+The same model decides where a kernel reads a two-dimensional source (`jit::cost::read_path`): from
+the buffer (on NVIDIA GPUs through the read-only data cache, which a `read` binding gets on its own)
+or through the device's texture units, as exact gathers. A texture is a view of the source:
+free on CUDA (the buffer itself, as a pitched texture, kept with the array while its buffer stays
+where it is), a copy of the image on wgpu (a read and a write of it and a launch, made per use). The
+saving is a share of the kernel's time that the gathers take off (per pattern, measured on an RTX
+3090 and an RTX 3080 Laptop: bicubic positions 7 %, warps 12 %, bilinear `resize` 15 %, none for
+nearest and for kernels at the memory bandwidth), and a texture is read only where the saving is
+bigger than what the view costs. So on wgpu and the CPU backend the sources are read from buffers,
+and on CUDA the kernels above are measurably faster; `Profile` shows no extra launch.
+
 The model also sizes loops: [`iterate_all`](loops.md#launch-sizing) cuts long register loops into
 launches of about 40 ms of GPU time by it, and it decides when a circular `shift` of an expression
 is recomputed, staged, or evaluated first.

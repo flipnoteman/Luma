@@ -332,6 +332,7 @@ impl<'a> Em<'a> {
             Expr::Cast { dst_ty, .. } => dst_ty.clone(),
             Expr::Call { ty, .. } => ty.clone().unwrap_or(KirType::U32),
             Expr::AtomicLoad { ty, .. } => KirType::Scalar(*ty),
+            Expr::Texture { .. } => KirType::Vec { elem: ScalarTy::F32, lanes: 4 },
         }
     }
 
@@ -722,6 +723,7 @@ impl<'a> Em<'a> {
                 Some(i) => format!("_ll[{i}]"),
                 None => "0u".to_owned(),
             },
+            Expr::Texture { .. } => unreachable!("the Metal backend rejects texture kernels"),
         }
     }
 
@@ -1180,6 +1182,7 @@ impl<'a> Em<'a> {
             BindingKind::Uniform => "constant",
             BindingKind::StorageRead => "const device",
             BindingKind::StorageReadWrite => "device",
+            BindingKind::Texture2d | BindingKind::Sampler => unreachable!("the Metal backend rejects texture kernels"),
         }
     }
 

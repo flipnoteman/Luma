@@ -20,7 +20,7 @@ use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, BindingInfo, BindingKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo,
     DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
-    Profile, RawArg, RawKernel, TuningProfile,
+    Profile, RawArg, RawKernel, TextureCaps, TextureDesc, TextureFilter, TextureFormat, TuningProfile,
 };
 use luma_core::hal::copy_parallel;
 use wgpu::{BindGroupEntry, BindingResource, BufferBinding};
@@ -77,18 +77,37 @@ struct WgpuBuffer(wgpu::Buffer);
 
 impl NativeBuffer for WgpuBuffer {}
 
+/// A texture, its view and the sampler of its filter, held by a [`Buffer`] made by
+/// [`Backend::create_texture`].
+#[derive(Debug)]
+struct WgpuTexture {
+    /// Kept alive by the view; named for what it is.
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+
+impl NativeBuffer for WgpuTexture {}
+
 /// A compiled pipeline held by a [`RawKernel`].
 #[derive(Debug)]
 struct WgpuKernel {
     pipeline: wgpu::ComputePipeline,
     /// Layout of `@group(1)`.
     args_layout: wgpu::BindGroupLayout,
+    /// Whether an argument is a texture or a sampler: such a launch builds its bind group anew
+    /// (every texture is a new object, so the bind group cache could not hit).
+    textured: bool,
 }
 
 impl NativeKernel for WgpuKernel {}
 
 fn wrap(buffer: wgpu::Buffer, size: u64, usage: BufferUsage) -> Buffer {
     Buffer::new(size, usage, WgpuBuffer(buffer))
+}
+
+fn texture(buffer: &Buffer) -> Result<&WgpuTexture, BackendError> {
+    buffer.downcast_ref::<WgpuTexture>().ok_or_else(|| BackendError::KernelBinding("a texture binding was given something that is not a wgpu texture".into()))
 }
 
 fn raw(buffer: &Buffer) -> Result<&wgpu::Buffer, BackendError> {
@@ -1099,14 +1118,22 @@ impl WgpuBackend {
             .map(|(info, &binding)| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: match info.kind {
-                        BindingKind::Uniform => wgpu::BufferBindingType::Uniform,
-                        BindingKind::StorageRead => wgpu::BufferBindingType::Storage { read_only: true },
-                        BindingKind::StorageReadWrite => wgpu::BufferBindingType::Storage { read_only: false },
+                ty: match info.kind {
+                    BindingKind::Texture2d => wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    has_dynamic_offset: info.kind == BindingKind::Uniform,
-                    min_binding_size: None,
+                    BindingKind::Sampler => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    kind => wgpu::BindingType::Buffer {
+                        ty: match kind {
+                            BindingKind::Uniform => wgpu::BufferBindingType::Uniform,
+                            BindingKind::StorageRead => wgpu::BufferBindingType::Storage { read_only: true },
+                            _ => wgpu::BufferBindingType::Storage { read_only: false },
+                        },
+                        has_dynamic_offset: kind == BindingKind::Uniform,
+                        min_binding_size: None,
+                    },
                 },
                 count: None,
             })
@@ -1150,7 +1177,8 @@ impl WgpuBackend {
             })
         });
         store.built();
-        Ok(RawKernel::new(WgpuKernel { pipeline, args_layout }))
+        let textured = infos.iter().any(|b| matches!(b.kind, BindingKind::Texture2d | BindingKind::Sampler));
+        Ok(RawKernel::new(WgpuKernel { pipeline, args_layout, textured }))
     }
 }
 
@@ -1183,6 +1211,72 @@ impl Backend for WgpuBackend {
         }
         own(&buffer).unmap();
         Ok(buffer)
+    }
+
+    fn texture_caps(&self) -> Option<TextureCaps> {
+        self.device().features().contains(wgpu::Features::FLOAT32_FILTERABLE).then(|| TextureCaps {
+            max_dim: self.device().limits().max_texture_dimension_2d,
+            pitch_align: wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+            aliases: false,
+        })
+    }
+
+    fn create_texture(&self, source: &Buffer, offset: u64, pitch: u64, desc: &TextureDesc) -> Result<Buffer, BackendError> {
+        let caps = self.texture_caps().ok_or_else(|| BackendError::Unsupported("the device cannot filter f32 textures".into()))?;
+        let (w, h) = (u64::from(desc.width), u64::from(desc.height));
+        let row = w * u64::from(desc.format.texel_bytes());
+        if w == 0 || h == 0 || desc.width > caps.max_dim || desc.height > caps.max_dim {
+            return Err(BackendError::Unsupported(format!("a {w}x{h} texture (up to {0}x{0} are possible)", caps.max_dim)));
+        }
+        if pitch < row || !pitch.is_multiple_of(u64::from(caps.pitch_align)) || !offset.is_multiple_of(4) || offset + pitch * (h - 1) + row > source.size() {
+            return Err(BackendError::KernelBinding(format!("a {w}x{h} texture does not fit {} bytes at offset {offset} with rows {pitch} bytes apart", source.size())));
+        }
+        let format = match desc.format {
+            TextureFormat::R32Float => wgpu::TextureFormat::R32Float,
+            TextureFormat::Rgba32Float => wgpu::TextureFormat::Rgba32Float,
+        };
+        let size = wgpu::Extent3d { width: desc.width, height: desc.height, depth_or_array_layers: 1 };
+        let device = self.device();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("luma texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        if pollster::block_on(scope.pop()).is_some() {
+            return Err(BackendError::OutOfMemory { requested: row * h });
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mode = match desc.filter {
+            TextureFilter::Nearest => wgpu::FilterMode::Nearest,
+            TextureFilter::Linear => wgpu::FilterMode::Linear,
+        };
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("luma sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: mode,
+            min_filter: mode,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let mut guard = self.batch()?;
+        self.encoder(&mut guard).copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: raw(source)?,
+                layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch as u32), rows_per_image: Some(desc.height) },
+            },
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            size,
+        );
+        drop(guard);
+        Ok(Buffer::new(row * h, BufferUsage::TEXTURE, WgpuTexture { _texture: texture, view, sampler }))
     }
 
     fn recycle_mappable(&self, buffer: Buffer) {
@@ -1343,25 +1437,41 @@ impl Backend for WgpuBackend {
             bytes.hash(&mut hasher);
         }
         let key = hasher.finish();
-        let bucket = bind_groups.buckets.entry(key).or_default();
-        let index = match bucket.iter().position(|cached| cached.matches(kernel.id, bindings())) {
-            Some(index) => index,
-            None => {
-                let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
-                for ((binding, _), (buffer, bytes)) in kernel.bound(args).zip(bindings()) {
-                    group_entries.push(BindGroupEntry {
-                        binding,
-                        resource: BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
-                    });
-                }
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &native.args_layout, entries: &group_entries });
-                bucket.push(CachedGroup { kernel: kernel.id, entries: bindings().map(|(buffer, bytes)| (buffer.clone(), bytes)).collect(), group });
-                bind_groups.len += 1;
-                bucket.len().saturating_sub(1)
+        let textured_group;
+        let (args_group, cached) = if native.textured {
+            let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
+            for (((binding, _), (buffer, bytes)), info) in kernel.bound(args).zip(bindings()).zip(&kernel.bindings) {
+                let resource = match info.kind {
+                    BindingKind::Texture2d => BindingResource::TextureView(&texture(buffer)?.view),
+                    BindingKind::Sampler => BindingResource::Sampler(&texture(buffer)?.sampler),
+                    _ => BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
+                };
+                group_entries.push(BindGroupEntry { binding, resource });
             }
-        };
-        let Some(args_group) = bucket.get(index).map(|cached| &cached.group) else {
-            return Err(BackendError::Gpu("bind group cache entry vanished".into()));
+            textured_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &native.args_layout, entries: &group_entries });
+            (&textured_group, None)
+        } else {
+            let bucket = bind_groups.buckets.entry(key).or_default();
+            let index = match bucket.iter().position(|cached| cached.matches(kernel.id, bindings())) {
+                Some(index) => index,
+                None => {
+                    let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
+                    for ((binding, _), (buffer, bytes)) in kernel.bound(args).zip(bindings()) {
+                        group_entries.push(BindGroupEntry {
+                            binding,
+                            resource: BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
+                        });
+                    }
+                    let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &native.args_layout, entries: &group_entries });
+                    bucket.push(CachedGroup { kernel: kernel.id, entries: bindings().map(|(buffer, bytes)| (buffer.clone(), bytes)).collect(), group });
+                    bind_groups.len += 1;
+                    bucket.len().saturating_sub(1)
+                }
+            };
+            let Some(args_group) = bucket.get(index).map(|cached| &cached.group) else {
+                return Err(BackendError::Gpu("bind group cache entry vanished".into()));
+            };
+            (args_group, Some((key, index)))
         };
 
         // Record. Launches share one compute pass; a profiled launch gets a pass of its own that
@@ -1391,9 +1501,9 @@ impl Backend for WgpuBackend {
             bound.grid = grid;
         }
         // A group with uniforms is bound at new dynamic offsets by every launch.
-        if !offsets.is_empty() || bound.args != Some((key, index)) {
+        if !offsets.is_empty() || cached.is_none() || bound.args != cached {
             pass.set_bind_group(1, args_group, offsets.as_slice());
-            bound.args = Some((key, index));
+            bound.args = cached;
         }
         match (dispatch, indirect) {
             (Dispatch::Direct([x, y, z]), _) => pass.dispatch_workgroups(x, y, z),

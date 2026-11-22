@@ -60,6 +60,8 @@ pub fn used_bindings(module: &KernelModule) -> (usize, Option<Box<[bool]>>) {
             *slot = true;
         }
     };
+    // A filtered or gathering fetch needs the sampler the kernel declares.
+    let samplers: Vec<u32> = module.bindings.iter().enumerate().filter(|(_, b)| b.kind == BindingKind::Sampler).map(|(i, _)| i as u32).collect();
     let mut scan = |block: &[Stmt]| {
         walk_stmts(block, &mut |s| {
             match s {
@@ -81,7 +83,12 @@ pub fn used_bindings(module: &KernelModule) -> (usize, Option<Box<[bool]>>) {
                     Expr::Load { binding, .. }
                     | Expr::StorageRead { binding, .. }
                     | Expr::UniformRead { binding, .. }
-                    | Expr::ArrayLength { binding } => mark(*binding),
+                    | Expr::ArrayLength { binding }
+                    | Expr::Texture { op: TextureOp::Load, binding, .. } => mark(*binding),
+                    Expr::Texture { binding, .. } => {
+                        mark(*binding);
+                        samplers.iter().for_each(|&s| mark(s));
+                    }
                     Expr::AtomicLoad { target: AtomicTarget::Storage { binding, .. }, .. } => mark(*binding),
                     _ => {}
                 })
@@ -117,11 +124,21 @@ fn shader_capabilities(features: Features) -> naga::valid::Capabilities {
     caps
 }
 
-fn reflect_kind(space: naga::AddressSpace) -> Option<BindingKind> {
-    match space {
+fn reflect_kind(module: &naga::Module, var: &naga::GlobalVariable) -> Option<BindingKind> {
+    match var.space {
         naga::AddressSpace::Uniform => Some(BindingKind::Uniform),
         naga::AddressSpace::Storage { access } if access.contains(naga::StorageAccess::STORE) => Some(BindingKind::StorageReadWrite),
         naga::AddressSpace::Storage { .. } => Some(BindingKind::StorageRead),
+        // `texture_2d<f32>` and `sampler`; every other handle type has no luma binding.
+        naga::AddressSpace::Handle => match module.types[var.ty].inner {
+            naga::TypeInner::Image {
+                dim: naga::ImageDimension::D2,
+                arrayed: false,
+                class: naga::ImageClass::Sampled { kind: naga::ScalarKind::Float, multi: false },
+            } => Some(BindingKind::Texture2d),
+            naga::TypeInner::Sampler { comparison: false } => Some(BindingKind::Sampler),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -199,8 +216,8 @@ pub fn parse_wgsl(
         if rb.group != 1 {
             return Err(BackendError::KernelBinding(format!("`{name}` is in @group({}); kernel arguments must be in @group(1)", rb.group)));
         }
-        let kind = reflect_kind(var.space)
-            .ok_or_else(|| BackendError::KernelBinding(format!("`{name}` is neither a storage buffer nor a uniform")))?;
+        let kind = reflect_kind(&module, var)
+            .ok_or_else(|| BackendError::KernelBinding(format!("`{name}` is neither a storage buffer, a uniform, a `texture_2d<f32>` nor a `sampler`")))?;
         let inner = &module.types[var.ty].inner;
         let (element_stride, min_size) = match kind {
             BindingKind::Uniform => (None, inner.try_size(module.to_ctx())),
@@ -457,6 +474,20 @@ fn expr_operands(e: &Expression, f: &mut impl FnMut(Handle<Expression>)) {
             [arg1, arg2, arg3].into_iter().flatten().for_each(|a| f(*a));
         }
         Expression::ArrayLength(p) => f(*p),
+        Expression::ImageLoad { image, coordinate, array_index, sample, level } => {
+            f(*image);
+            f(*coordinate);
+            [array_index, sample, level].into_iter().flatten().for_each(|a| f(*a));
+        }
+        Expression::ImageSample { image, sampler, coordinate, array_index, offset, level, depth_ref, .. } => {
+            f(*image);
+            f(*sampler);
+            f(*coordinate);
+            [array_index, offset, depth_ref].into_iter().flatten().for_each(|a| f(*a));
+            if let naga::SampleLevel::Exact(l) | naga::SampleLevel::Bias(l) = level {
+                f(*l);
+            }
+        }
         _ => {}
     }
 }
@@ -640,10 +671,19 @@ impl<'m> Lowerer<'m> {
         for (number, &h) in decl_order.iter().enumerate() {
             let var = &m.global_variables[h];
             let name = var.name.clone().unwrap_or_default();
-            let kind = reflect_kind(var.space)
-                .ok_or_else(|| BackendError::KernelBinding(format!("`{name}` is neither a storage buffer nor a uniform")))?;
+            let kind = reflect_kind(m, var)
+                .ok_or_else(|| BackendError::KernelBinding(format!("`{name}` is neither a storage buffer, a uniform, a `texture_2d<f32>` nor a `sampler`")))?;
             let inner = &m.types[var.ty].inner;
             let decl = match (kind, inner) {
+                (BindingKind::Texture2d, _) => BindingDecl {
+                    name,
+                    kind,
+                    elem_ty: KirType::vec(ScalarTy::F32, 4),
+                    is_unsized_array: false,
+                    element_stride: None,
+                    min_size: None,
+                },
+                (BindingKind::Sampler, _) => BindingDecl { name, kind, elem_ty: KirType::U32, is_unsized_array: false, element_stride: None, min_size: None },
                 (BindingKind::Uniform, inner) => BindingDecl {
                     name,
                     kind,
@@ -703,6 +743,8 @@ impl<'m> Lowerer<'m> {
                     self.privates.push(PrivateDecl { name, ty, init });
                     self.slots[h.index()] = Slot::Private(self.privates.len() as u32 - 1);
                 }
+                // Textures and samplers are bindings (declared above).
+                naga::AddressSpace::Handle if matches!(self.slots[h.index()], Slot::Binding(_)) => {}
                 other => return unsupported(format!("global variable `{}` in address space {other:?}", var.name.as_deref().unwrap_or(""))),
             }
         }
@@ -1012,7 +1054,7 @@ impl<'m> Lowerer<'m> {
     /// more than once.
     fn bake(&mut self, ctx: &mut FnCtx<'m>, h: Handle<Expression>) -> R<()> {
         let arena = ctx.arena;
-        let is_load = matches!(arena[h], Expression::Load { .. });
+        let is_load = matches!(arena[h], Expression::Load { .. } | Expression::ImageLoad { .. } | Expression::ImageSample { .. });
         if !is_load && ctx.uses[h.index()] < 2 {
             return Ok(());
         }
@@ -1448,6 +1490,32 @@ impl<'m> Lowerer<'m> {
                 };
                 Ok(Low::Val(Expr::Cast { kind: cast, expr: e.boxed(), src_ty: src, dst_ty: dst.clone() }, dst))
             }
+            Expression::ImageLoad { image, coordinate, array_index: None, sample: None, level: _ } => {
+                let binding = self.image_binding(ctx, *image)?;
+                let (coords, ty) = self.val(ctx, *coordinate)?;
+                let coords = match ty {
+                    KirType::Vec { elem: ScalarTy::I32, lanes: 2 } => coords,
+                    KirType::Vec { elem: ScalarTy::U32, lanes: 2 } => {
+                        let to = KirType::vec(ScalarTy::I32, 2);
+                        Expr::Cast { kind: CastKind::Bitcast, expr: coords.boxed(), src_ty: ty, dst_ty: to }
+                    }
+                    other => return unsupported(format!("texture coordinates of type {other:?}")),
+                };
+                Ok(Low::Val(Expr::Texture { op: TextureOp::Load, binding, coords: coords.boxed() }, KirType::vec(ScalarTy::F32, 4)))
+            }
+            Expression::ImageSample { image, sampler: _, gather, coordinate, array_index: None, offset: None, level, depth_ref: None, clamp_to_edge: false } => {
+                let binding = self.image_binding(ctx, *image)?;
+                let (coords, ty) = self.val(ctx, *coordinate)?;
+                if ty != KirType::vec(ScalarTy::F32, 2) {
+                    return unsupported(format!("texture coordinates of type {ty:?}"));
+                }
+                let op = match (gather, level) {
+                    (Some(component), naga::SampleLevel::Zero) => TextureOp::Gather(*component as u8),
+                    (None, naga::SampleLevel::Zero | naga::SampleLevel::Exact(_)) => TextureOp::Sample,
+                    _ => return unsupported("a texture sample that is neither `textureGather` nor `textureSampleLevel`"),
+                };
+                Ok(Low::Val(Expr::Texture { op, binding, coords: coords.boxed() }, KirType::vec(ScalarTy::F32, 4)))
+            }
             Expression::ArrayLength(p) => match self.place(ctx, *p)? {
                 Place { root: Root::Storage(binding), path, .. } if path.is_empty() => Ok(Low::Val(Expr::ArrayLength { binding }, KirType::U32)),
                 _ => unsupported("arrayLength of anything but a storage binding"),
@@ -1458,6 +1526,17 @@ impl<'m> Lowerer<'m> {
             | Expression::SubgroupBallotResult
             | Expression::SubgroupOperationResult { .. } => unsupported("a statement result used before its statement"),
             other => unsupported(format!("expression {other:?}")),
+        }
+    }
+
+    /// The binding number of the `texture_2d<f32>` global that `image` names.
+    fn image_binding(&mut self, ctx: &FnCtx<'m>, image: Handle<Expression>) -> R<u32> {
+        match &ctx.arena[image] {
+            Expression::GlobalVariable(g) => match self.slots[g.index()] {
+                Slot::Binding(b) if self.bindings[b as usize].kind == BindingKind::Texture2d => Ok(b),
+                _ => unsupported("a texture that is not a kernel argument"),
+            },
+            _ => unsupported("a texture that is not a global variable"),
         }
     }
 

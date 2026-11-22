@@ -165,6 +165,7 @@ mod structure;
 mod stats;
 mod spectral;
 mod sparse;
+mod texture;
 mod tuning;
 mod until;
 mod view;

@@ -14,7 +14,7 @@ fn axis(n: usize, x: f64, method: Interp, f: &dyn Fn(usize) -> f64) -> f64 {
     match method {
         Interp::Nearest => at((x + 0.5).floor() as i64),
         Interp::Lower => at(i),
-        Interp::Linear => (1.0 - t) * at(i) + t * at(i + 1),
+        Interp::Linear | Interp::LinearHardware => (1.0 - t) * at(i) + t * at(i + 1),
         Interp::Cosine => {
             let c = (1.0 - (t * std::f64::consts::PI).cos()) * 0.5;
             (1.0 - c) * at(i) + c * at(i + 1)

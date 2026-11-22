@@ -24,7 +24,7 @@ use luma_core::hal::cache::{self, PTX_MAGIC};
 use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
-    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch,
+    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
     KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, GemmSpec, TuningProfile,
 };
 
@@ -430,6 +430,19 @@ struct Params {
 // SAFETY: `ptrs` points into the other fields of the same value and is rebuilt for every launch.
 unsafe impl Send for Params {}
 
+#[path = "texture.rs"]
+mod texture;
+use texture::CudaTexture;
+
+/// The device address that tells the buffer apart from every other one a launch touches (a
+/// texture: that of the buffer it reads, or of its own copy).
+fn access_key(buffer: &Buffer) -> Result<u64, BackendError> {
+    match buffer.downcast_ref::<CudaTexture>() {
+        Some(texture) => Ok(texture.key()),
+        None => device_ptr(buffer),
+    }
+}
+
 fn device_ptr(buffer: &Buffer) -> Result<sys::CUdeviceptr, BackendError> {
     buffer.downcast_ref::<CudaBuffer>().map(|b| b.dptr).ok_or_else(|| BackendError::KernelBinding("a buffer of another backend was passed to a CUDA kernel".into()))
 }
@@ -549,7 +562,7 @@ fn capture_order(launches: &[GraphLaunch<'_>], dispatches: &[([u32; 3], u64, Opt
         accesses.clear();
         for (_, arg) in launch.kernel.bound(launch.args) {
             if let RawArg::Storage { buffer, writable, .. } = arg {
-                accesses.push((device_ptr(buffer)?, *writable));
+                accesses.push((access_key(buffer)?, *writable));
             }
         }
         hazards.follow(preds.len(), accesses.iter().copied(), counts.map(device_ptr).transpose()?, &mut after);
@@ -634,6 +647,8 @@ impl Params {
                     let address = uniform(bytes)?;
                     self.vals.push(address);
                 }
+                (CudaArgAbi::Texture, RawArg::Storage { buffer, .. }) => self.vals.push(texture::object(buffer)?),
+                (CudaArgAbi::Unbound, RawArg::Storage { .. }) => {}
                 _ => return Err(BackendError::KernelBinding(format!("argument {position} does not match the kind of its binding"))),
             }
         }
@@ -658,6 +673,7 @@ impl Params {
                     self.ptrs.push(unsafe { self.inline.as_mut_ptr().add(at) }.cast());
                     at += size.div_ceil(16);
                 }
+                CudaArgAbi::Unbound => {}
                 _ => {
                     self.ptrs.push((&mut self.vals[value] as *mut u64).cast());
                     value += 1;
@@ -717,6 +733,8 @@ struct CudaShared {
     nvvm: crate::nvvm::Nvvm,
     /// A dedicated stream-ordered memory pool, when the device supports them.
     pool: Option<Arc<DevicePool>>,
+    /// What the texture units take, `None` when the device reports no 2-D textures.
+    textures: Option<TextureCaps>,
 }
 
 static POOL: Mutex<Option<Arc<CudaShared>>> = Mutex::new(None);
@@ -842,7 +860,8 @@ impl CudaShared {
             compute_units: Some(multiprocessors as u32).filter(|&n| n > 0),
         };
         let pool = if attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)? != 0 { DevicePool::create(&ctx) } else { None };
-        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm, pool })
+        let textures = texture::caps(&attribute);
+        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm, pool, textures })
     }
 }
 
@@ -1352,6 +1371,14 @@ impl Backend for CudaBackend {
         let buffer = self.create_buffer(bytes, usage, false).ok_or(BackendError::OutOfMemory { requested: bytes })?;
         self.record_upload(&buffer, data, max_buffer_bytes)?;
         Ok(buffer)
+    }
+
+    fn texture_caps(&self) -> Option<TextureCaps> {
+        self.shared.textures
+    }
+
+    fn create_texture(&self, source: &Buffer, offset: u64, pitch: u64, desc: &TextureDesc) -> Result<Buffer, BackendError> {
+        self.make_texture(source, offset, pitch, desc)
     }
 
     fn recycle_mappable(&self, buffer: Buffer) {

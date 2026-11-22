@@ -15,6 +15,7 @@ use crate::array::Array;
 use crate::context::Context;
 use crate::error::LumaError;
 use crate::interp::Interp;
+use crate::jit::cost::{read_path, ReadPath, ReadPattern, TextureRead};
 use crate::kernel::{uniform, KernelArg};
 use crate::ops::fold_workgroups;
 use crate::shape::Shape;
@@ -82,6 +83,18 @@ fn coarsen() -> usize {
     *C.get_or_init(|| std::env::var("LUMA_SAMPLER_COARSEN").ok().and_then(|v| v.parse().ok()).filter(|c| [1, 2, 4].contains(c)).unwrap_or(2))
 }
 
+/// The workgroup of the shaped kernel: `x` along dimension 0 and `y` rows. 32 x 8 (a warp along a row, eight rows) keeps the positions of neighbouring rows in the L1 together: scattered `approx2` on an RTX 3090 4K, bicubic 0.60 -> 0.48 ms, bilinear 0.31 -> 0.27 ms, against 256 x 1; smooth warps 1-8 % faster.
+fn tile() -> [u32; 2] {
+    static T: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("LUMA_SAMPLER_TILE")
+            .ok()
+            .and_then(|v| v.split_once('x').and_then(|(x, y)| Some([x.parse().ok()?, y.parse().ok()?])))
+            .filter(|t: &[u32; 2]| t[0] * t[1] == WORKGROUP)
+            .unwrap_or([32, 8])
+    })
+}
+
 /// One launch of the sampling kernel.
 pub(crate) struct Sampling<'a> {
     pub src: &'a Array<f32>,
@@ -137,7 +150,7 @@ impl Sampling<'_> {
         let gd = |k: usize| self.grid.get(k).copied().unwrap_or(Grid { dim: 0, start: 0.0, step: 1.0 });
         let (g0, g1) = (gd(0), gd(1));
         let m = self.matrix;
-        let params = Params {
+        let mut params = Params {
             kind: self.source as u32,
             method: self.method as u32,
             ndims: self.grid.len() as u32,
@@ -180,23 +193,95 @@ impl Sampling<'_> {
         let max = ctx.max_workgroups_per_dimension() as usize;
         let (rows, batch) = (od[1], od[2] * od[3]);
         let c = coarsen();
+        let tile = tile();
         let per_group = WORKGROUP as usize * c;
-        let shaped = od[0].div_ceil(per_group) <= max && rows <= max && batch <= max;
+        let per_tile = tile[0] as usize * c;
+        let shaped = od[0].div_ceil(per_tile) <= max && rows.div_ceil(tile[1] as usize) <= max && batch <= max;
         let rows_ok = self.source == Source::Scaled && od[0].div_ceil(WORKGROUP as usize) <= max && rows.div_ceil(ROWS) <= max && batch <= max;
+        // The source as a texture, where it is one 2-D slice the device can see as one and the
+        // read path pays (see `crate::jit::cost::source_read`).
+        let read_mode = self.read_mode(ctx);
+        let filter = if read_mode == Read::Sample { luma_core::TextureFilter::Linear } else { luma_core::TextureFilter::Nearest };
+        let texture = match read_mode {
+            Read::Buffer => None,
+            _ => ctx.texture_2d(self.src, in_dims[g0.dim], in_dims[g1.dim], filter)?,
+        };
+        let read_mode = if texture.is_some() { read_mode } else { Read::Buffer };
+        // Without a texture the hardware-filtered method is the exact bilinear one.
+        let method = if self.method == Interp::LinearHardware { Interp::Linear } else { self.method };
+        params.method = method as u32;
+        #[cfg(test)]
+        if texture.is_some() {
+            tests::TEXTURED.set(tests::TEXTURED.get() + 1);
+        }
+        let variant = c + 8 * read_mode as usize + 64 * (tile[0] as usize + 1000 * tile[1] as usize);
         let (kernel, grid) = if rows_ok {
-            (ctx.cached_kernel("sampler_rows", 0, "main_rows", || source(c, true))?, [to_u32(od[0].div_ceil(WORKGROUP as usize))?, to_u32(rows.div_ceil(ROWS))?, to_u32(batch)?])
+            (ctx.cached_kernel("sampler_rows", variant, "main_rows", || source(c, tile, true, read_mode))?, [to_u32(od[0].div_ceil(WORKGROUP as usize))?, to_u32(rows.div_ceil(ROWS))?, to_u32(batch)?])
         } else if shaped {
-            (ctx.cached_kernel("sampler", c, "main2d", || source(c, false))?, [to_u32(od[0].div_ceil(per_group))?, to_u32(rows)?, to_u32(batch)?])
+            (ctx.cached_kernel("sampler", variant, "main2d", || source(c, tile, false, read_mode))?, [to_u32(od[0].div_ceil(per_tile))?, to_u32(rows.div_ceil(tile[1] as usize))?, to_u32(batch)?])
         } else {
-            (ctx.cached_kernel("sampler", c, "main", || source(c, false))?, fold_workgroups(ctx, to_u32(count.div_ceil(per_group))?)?)
+            (ctx.cached_kernel("sampler", variant, "main", || source(c, tile, false, read_mode))?, fold_workgroups(ctx, to_u32(count.div_ceil(per_group))?)?)
         };
         let mut out = Array::<f32>::alloc(ctx, self.out)?;
-        if rows_ok {
-            kernel.launch_raw(grid, [KernelArg::from(self.src), KernelArg::from(&mut out), uniform(&params)])?;
-        } else {
-            kernel.launch_raw(grid, [KernelArg::from(self.src), KernelArg::from(self.pos[0]), KernelArg::from(self.pos[1]), KernelArg::from(&mut out), uniform(&params)])?;
+        let mut args: Vec<KernelArg<'_>> = Vec::with_capacity(6);
+        match &texture {
+            Some(texture) => {
+                args.push(KernelArg::texture(texture));
+                if matches!(read_mode, Read::Gather | Read::Sample) {
+                    args.push(KernelArg::texture(texture));
+                }
+            }
+            None => args.push(KernelArg::from(self.src)),
         }
+        if !rows_ok {
+            args.push(KernelArg::from(self.pos[0]));
+            args.push(KernelArg::from(self.pos[1]));
+        }
+        args.push(KernelArg::from(&mut out));
+        args.push(uniform(&params));
+        kernel.launch_raw(grid, args)?;
         Ok(out)
+    }
+}
+
+impl Sampling<'_> {
+    /// How this launch reads its source: [`Read::Buffer`] unless the grid is one contiguous 2-D
+    /// slice and reading it through the texture units pays.
+    fn read_mode(&self, ctx: &Context) -> Read {
+        let d = self.src.shape().dims();
+        let two_d = self.grid.len() == 2 && self.grid[0].dim == 0 && self.grid[1].dim == 1 && d[2] * d[3] == 1;
+        if !two_d {
+            return Read::Buffer;
+        }
+        #[cfg(test)]
+        if let Some(read) = tests::FORCE.get() {
+            return read;
+        }
+        // The explicit opt-in: the texture unit's filter, wherever there is a texture to filter.
+        if self.method == Interp::LinearHardware {
+            return Read::Sample;
+        }
+        let taps = match self.method {
+            Interp::Linear | Interp::Cosine => 4,
+            Interp::Cubic | Interp::CubicSpline => 16,
+            _ => return Read::Buffer,
+        };
+        let Some(caps) = ctx.hal().texture_caps() else { return Read::Buffer };
+        let read = TextureRead {
+            pattern: match self.source {
+                Source::Positions => ReadPattern::Positions,
+                Source::Scaled => ReadPattern::Scaled,
+                Source::Warp => ReadPattern::Warp,
+            },
+            taps,
+            outputs: self.out.len() as u64,
+            src_bytes: self.src.byte_len(),
+            zero_copy: caps.aliases,
+        };
+        match read_path(ctx, &read) {
+            ReadPath::Texture => Read::Gather,
+            ReadPath::Plain => Read::Buffer,
+        }
     }
 }
 
@@ -205,9 +290,10 @@ const ROWS: usize = 8;
 
 /// The source of the sampling kernel with `coarsen` elements per invocation in the generic
 /// entry points.
-fn source(coarsen: usize, rows_entry: bool) -> String {
+fn source(coarsen: usize, tile: [u32; 2], rows_entry: bool, read: Read) -> String {
     let mut w = String::new();
-    let _ = writeln!(w, "const C: u32 = {coarsen}u;\nconst ROWS: u32 = {ROWS}u;");
+    let _ = writeln!(w, "const C: u32 = {coarsen}u;\nconst ROWS: u32 = {ROWS}u;\nconst TX: u32 = {}u;\nconst TY: u32 = {}u;", tile[0], tile[1]);
+    w.push_str(&bindings(rows_entry, read));
     w.push_str(
         r#"
 struct P {
@@ -220,18 +306,6 @@ struct P {
     scale0: f32, scale1: f32, off_grid: f32, persp: u32,
     m0: f32, m1: f32, m2: f32, m3: f32, m4: f32, m5: f32, m6: f32, m7: f32, m8: f32,
 }
-// @@GENERIC
-@group(1) @binding(0) var<storage, read> src: array<f32>;
-@group(1) @binding(1) var<storage, read> pos0: array<f32>;
-@group(1) @binding(2) var<storage, read> pos1: array<f32>;
-@group(1) @binding(3) var<storage, read_write> out: array<f32>;
-@group(1) @binding(4) var<uniform> p: P;
-// @@END
-// @@ROWS
-@group(1) @binding(0) var<storage, read> src: array<f32>;
-@group(1) @binding(1) var<storage, read_write> out: array<f32>;
-@group(1) @binding(2) var<uniform> p: P;
-// @@END
 
 fn finite(x: f32) -> bool { return (bitcast<u32>(x) & 0x7f800000u) != 0x7f800000u; }
 // The clamped grid index of tap `f + k`.
@@ -242,11 +316,13 @@ fn tap(f: f32, k: f32, hi: f32) -> u32 { return u32(clamp(f + k, 0.0, hi)); }
 struct Axis {
     o0: u32, o1: u32, o2: u32, o3: u32,
     w0: f32, w1: f32, w2: f32, w3: f32,
+    f: f32,
 }
 
 fn make_axis(x: f32, h: f32, stride: u32) -> Axis {
     var a: Axis;
     let fx = floor(x);
+    a.f = fx;
     let t = x - fx;
     if (p.method <= 1u) {
         var f = fx;
@@ -289,12 +365,14 @@ fn make_axis(x: f32, h: f32, stride: u32) -> Axis {
     return a;
 }
 
+// @@ONE
 fn combine1(base: u32, a: Axis) -> f32 {
     if (p.method <= 1u) { return src[base + a.o0]; }
     if (p.method <= 3u) { return a.w0 * src[base + a.o0] + a.w1 * src[base + a.o1]; }
     return a.w0 * src[base + a.o0] + a.w1 * src[base + a.o1] + a.w2 * src[base + a.o2] + a.w3 * src[base + a.o3];
 }
-
+// @@END
+// @@TWO
 fn combine2(base: u32, a: Axis, b: Axis) -> f32 {
     if (p.method <= 1u) { return src[base + a.o0 + b.o0]; }
     if (p.method <= 3u) {
@@ -319,7 +397,8 @@ fn combine2(base: u32, a: Axis, b: Axis) -> f32 {
     w.push_str(
         r#"    return b.w0 * s0 + b.w1 * s1 + b.w2 * s2 + b.w3 * s3;
 }
-
+// @@END
+{TEXTURE}
 // @@GENERIC
 // The value of output element (c0, c1, c2, c3).
 fn element(c0: u32, c1: u32, c2: u32, c3: u32) -> f32 {
@@ -389,11 +468,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 }
 
 // The same with the grid shaped like the output: x along dimension 0, y along 1, z the batch.
-@compute @workgroup_size(256)
+@compute @workgroup_size(TX, TY)
 fn main2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    if (gid.y >= p.od1) { return; }
     let c2 = gid.z % p.od2;
     let c3 = gid.z / p.od2;
-    let stride = nwg.x * 256u;
+    let stride = nwg.x * TX;
     let row = p.od0 * (gid.y + p.od1 * gid.z);
     var v: array<f32, C>;
     for (var k = 0u; k < C; k += 1u) {
@@ -429,11 +509,121 @@ fn main_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
 // @@END
 "#,
     );
-    keep_sections(&w, if rows_entry { "ROWS" } else { "GENERIC" })
+    let mut keep = vec![if rows_entry { "ROWS" } else { "GENERIC" }];
+    if read == Read::Buffer {
+        keep.extend(["ONE", "TWO"]);
+    }
+    let mut text = keep_sections(&w, &keep).replace("{TEXTURE}\n", &texture_reads(read));
+    if read != Read::Buffer {
+        // The texture is of one 2-D slice, so the taps of an axis are texel coordinates.
+        text = text.replace("p.gs0", "1u").replace("p.gs1", "1u").replace("    if (!two) { return combine1(base, ax); }\n", "");
+    }
+    text
+}
+
+/// How the sampling kernel reads its source grid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Read {
+    /// A storage buffer, a load per tap.
+    Buffer,
+    /// A texture, a point fetch (`textureLoad`) per tap: the same taps as the buffer's.
+    Load,
+    /// A texture read by gathers (`textureGather`, one fetch for the four texels of a 2 x 2 block
+    /// of taps); only for a source that is two-dimensional. Unfiltered, so the same values.
+    Gather,
+    /// A texture read by the texture unit's own bilinear filter, one fetch per output
+    /// ([`Interp::LinearHardware`]): the weights are quantized by the hardware, so the values
+    /// differ from [`Read::Buffer`]'s.
+    Sample,
+}
+
+/// The bindings of `@group(1)` of the kernel.
+fn bindings(rows_entry: bool, read: Read) -> String {
+    let src = match read {
+        Read::Buffer => "@group(1) @binding(0) var<storage, read> src: array<f32>;\n".to_owned(),
+        Read::Load => "@group(1) @binding(0) var src: texture_2d<f32>;\n".to_owned(),
+        Read::Gather | Read::Sample => "@group(1) @binding(0) var src: texture_2d<f32>;\n@group(1) @binding(1) var smp: sampler;\n".to_owned(),
+    };
+    let first = if matches!(read, Read::Gather | Read::Sample) { 2 } else { 1 };
+    let mut out = src;
+    let mut n = first;
+    let mut add = |decl: &str| {
+        let _ = writeln!(out, "@group(1) @binding({n}) {decl};");
+        n += 1;
+    };
+    if !rows_entry {
+        add("var<storage, read> pos0: array<f32>");
+        add("var<storage, read> pos1: array<f32>");
+    }
+    add("var<storage, read_write> out: array<f32>");
+    add("var<uniform> p: P");
+    out
+}
+
+/// `combine2` of a texture read.
+fn texture_reads(read: Read) -> String {
+    if read == Read::Buffer {
+        return String::new();
+    }
+    let mut w = String::from("fn texel(x: u32, y: u32) -> f32 { return textureLoad(src, vec2<i32>(i32(x), i32(y)), 0).x; }\n");
+    if read == Read::Load {
+        w.push_str(
+            "fn combine2(base: u32, a: Axis, b: Axis) -> f32 {
+    if (p.method <= 1u) { return texel(a.o0, b.o0); }
+    if (p.method <= 3u) {
+        let s0 = a.w0 * texel(a.o0, b.o0) + a.w1 * texel(a.o1, b.o0);
+        let s1 = a.w0 * texel(a.o0, b.o1) + a.w1 * texel(a.o1, b.o1);
+        return b.w0 * s0 + b.w1 * s1;
+    }
+",
+        );
+        for j in 0..4 {
+            let _ = writeln!(w, "    let s{j} = a.w0 * texel(a.o0, b.o{j}) + a.w1 * texel(a.o1, b.o{j}) + a.w2 * texel(a.o2, b.o{j}) + a.w3 * texel(a.o3, b.o{j});");
+        }
+        w.push_str("    return b.w0 * s0 + b.w1 * s1 + b.w2 * s2 + b.w3 * s3;\n}\n");
+    } else if read == Read::Sample {
+        // The position is the grid coordinate of the taps' base plus the fraction a linear
+        // method's second weight is; texel centres sit half a texel in.
+        w.push_str(
+            "fn combine2(base: u32, a: Axis, b: Axis) -> f32 {
+    return textureSampleLevel(src, smp, vec2<f32>((a.f + a.w1 + 0.5) / f32(p.gn0), (b.f + b.w1 + 0.5) / f32(p.gn1)), 0.0).x;
+}
+",
+        );
+    } else if read == Read::Gather {
+        // The gather at the texel centre (x + 1, y + 1) / size reads the block x..x+1, y..y+1
+        // (WGSL order: (x, y+1), (x+1, y+1), (x+1, y), (x, y)), each clamped to the texture as
+        // a tap is.
+        w.push_str(
+            "fn gat(x: f32, y: f32) -> vec4<f32> {
+    return textureGather(0, src, smp, vec2<f32>((x + 1.0) / f32(p.gn0), (y + 1.0) / f32(p.gn1)));
+}
+fn combine2(base: u32, a: Axis, b: Axis) -> f32 {
+    if (p.method <= 1u) { return texel(a.o0, b.o0); }
+    if (p.method <= 3u) {
+        let g = gat(a.f, b.f);
+        let s0 = a.w0 * g.w + a.w1 * g.z;
+        let s1 = a.w0 * g.x + a.w1 * g.y;
+        return b.w0 * s0 + b.w1 * s1;
+    }
+    let g00 = gat(a.f - 1.0, b.f - 1.0);
+    let g10 = gat(a.f + 1.0, b.f - 1.0);
+    let g01 = gat(a.f - 1.0, b.f + 1.0);
+    let g11 = gat(a.f + 1.0, b.f + 1.0);
+    let s0 = a.w0 * g00.w + a.w1 * g00.z + a.w2 * g10.w + a.w3 * g10.z;
+    let s1 = a.w0 * g00.x + a.w1 * g00.y + a.w2 * g10.x + a.w3 * g10.y;
+    let s2 = a.w0 * g01.w + a.w1 * g01.z + a.w2 * g11.w + a.w3 * g11.z;
+    let s3 = a.w0 * g01.x + a.w1 * g01.y + a.w2 * g11.x + a.w3 * g11.y;
+    return b.w0 * s0 + b.w1 * s1 + b.w2 * s2 + b.w3 * s3;
+}
+",
+        );
+    }
+    w
 }
 
 /// `text` without the sections (`// @@NAME` .. `// @@END`) other than `keep`.
-fn keep_sections(text: &str, keep: &str) -> String {
+fn keep_sections(text: &str, keep: &[&str]) -> String {
     let mut out = String::new();
     let mut section: Option<&str> = None;
     for line in text.lines() {
@@ -441,10 +631,109 @@ fn keep_sections(text: &str, keep: &str) -> String {
             section = if name == "END" { None } else { Some(name) };
             continue;
         }
-        if section.is_none_or(|s| s == keep) {
+        if section.is_none_or(|s| keep.contains(&s)) {
             out.push_str(line);
             out.push('\n');
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::Read;
+    use crate::array::Array;
+    use crate::interp::Interp;
+
+    thread_local! {
+        pub(super) static FORCE: Cell<Option<Read>> = const { Cell::new(None) };
+        /// Launches that read their source through a texture.
+        pub(super) static TEXTURED: Cell<u32> = const { Cell::new(0) };
+    }
+
+    fn values(n: usize, seed: u32, lo: f32, hi: f32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(2654435761).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                lo + (hi - lo) * (x >> 8) as f32 / (1u32 << 24) as f32
+            })
+            .collect()
+    }
+
+    /// The results of every way to read the source are those of the buffer, bit for bit.
+    #[test]
+    fn texture_reads_give_the_results_of_buffer_reads() {
+        let ctx = crate::context::default_context().unwrap();
+        if ctx.hal().texture_caps().is_none() {
+            return;
+        }
+        let (w, h) = (128usize, 40usize);
+        let img = Array::from_slice(&values(w * h, 3, -4.0, 4.0), [w, h]).unwrap();
+        let m = 3000;
+        let p0 = Array::from_slice(&values(m, 4, -2.0, w as f32 + 1.0), m).unwrap();
+        let p1 = Array::from_slice(&values(m, 5, -2.0, h as f32 + 1.0), m).unwrap();
+        for method in [Interp::Nearest, Interp::Lower, Interp::Linear, Interp::Cosine, Interp::Cubic, Interp::CubicSpline] {
+            let run = || {
+                [
+                    img.approx2(&p0, &p1, method, -9.0).to_vec().unwrap(),
+                    img.resize(200, 70, method).to_vec().unwrap(),
+                    img.resize(50, 21, method).to_vec().unwrap(),
+                    img.rotate(0.3, false, method).to_vec().unwrap(),
+                    img.transform([0.9f32, 0.2, 3.0, -0.1, 1.1, 1.0], 120, 60, method, true).to_vec().unwrap(),
+                ]
+            };
+            FORCE.set(Some(Read::Buffer));
+            let base = run();
+            for read in [Read::Load, Read::Gather] {
+                FORCE.set(Some(read));
+                let got = run();
+                for (k, (g, b)) in got.iter().zip(&base).enumerate() {
+                    assert_eq!(g.len(), b.len());
+                    let bad = g.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits() && !(x.is_nan() && y.is_nan())).count();
+                    assert_eq!(bad, 0, "{read:?} {method:?} case {k}: {bad} of {} elements differ", b.len());
+                }
+            }
+            FORCE.set(None);
+        }
+        assert!(TEXTURED.get() > 0, "no launch read through a texture");
+    }
+
+    /// The hardware filter stays within its weight quantization (8 bits of fraction) of bilinear.
+    #[test]
+    fn hardware_filtering_is_within_its_quantization_of_bilinear() {
+        let ctx = crate::context::default_context().unwrap();
+        if ctx.hal().texture_caps().is_none() {
+            return;
+        }
+        let (w, h) = (128usize, 40usize);
+        let img = Array::from_slice(&values(w * h, 7, -4.0, 4.0), [w, h]).unwrap();
+        let m = 3000;
+        let p0 = Array::from_slice(&values(m, 8, -2.0, w as f32 + 1.0), m).unwrap();
+        let p1 = Array::from_slice(&values(m, 9, -2.0, h as f32 + 1.0), m).unwrap();
+        let cases = |method| {
+            [
+                img.approx2(&p0, &p1, method, -9.0).to_vec().unwrap(),
+                img.resize(300, 70, method).to_vec().unwrap(),
+                img.rotate(0.3, false, method).to_vec().unwrap(),
+            ]
+        };
+        let exact = cases(Interp::Linear);
+        TEXTURED.set(0);
+        let hardware = cases(Interp::LinearHardware);
+        assert!(TEXTURED.get() > 0, "the hardware filter did not run");
+        let mut worst = 0.0f32;
+        for (e, hw) in exact.iter().zip(&hardware) {
+            assert_eq!(e.len(), hw.len());
+            for (x, y) in e.iter().zip(hw) {
+                worst = worst.max((x - y).abs());
+            }
+        }
+        // Two axes, each weight off by at most 1/256 (8 bits of fraction) of a span of at most 8.
+        assert!(worst <= 2.0 * 8.0 / 256.0 + 1e-3, "worst difference {worst}");
+    }
 }
