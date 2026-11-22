@@ -365,6 +365,7 @@ fn stage1(t: u32) {{
 /// backend splits its phases at the barriers of the entry function only), unrolled over the
 /// columns: `row` is the number of the invocation's row in the panel, `n` and `w` are in scope.
 fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
+    let abl: u32 = std::env::var("X_ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut text = String::new();
     text += "var done = t >= n;\ncv[t] = select(key(x0), 0u, done);\nworkgroupBarrier();\nstage1(t);\nworkgroupBarrier();\n";
     for j in 0..wp {
@@ -374,17 +375,18 @@ fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
         text += &format!(
             "if (w > {j}u) {{
     if (t < 32u) {{
-{reduce}        if (t == 0u) {{ pvs = bi; }}
+{reduce}        if (t == 0u) {{ pvs = {bi}; }}
     }}
     workgroupBarrier();
     if (t == pvs) {{
         done = true;
         piv[{j}] = {row};
 ",
-            reduce = reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", "        ")
+            reduce = if abl & 1 != 0 { String::new() } else { reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", "        ") },
+            bi = if abl & 1 != 0 { format!("{j}u") } else { "bi".to_string() }
         );
         for c in 0..wp {
-            text += &format!("        lu[{}] = x{c};\n", j * wp + c);
+            if abl & 4 == 0 { text += &format!("        lu[{}] = x{c};\n", j * wp + c); }
         }
         text += &format!(
             "    }}
@@ -397,17 +399,19 @@ fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
             d = j * wp + j
         );
         for c in j + 1..wp {
-            text += &format!("        x{c} = fma(-l, lu[{}], x{c});\n", j * wp + c);
+            if abl & 2 == 0 { text += &format!("        x{c} = fma(-l, lu[{}], x{c});\n", j * wp + c); }
         }
         let next = if j + 1 < wp { format!("x{}", j + 1) } else { "0.0".to_string() };
         text += &format!(
             "    }}
-    cv[t] = select(key({next}), 0u, done);
+    {cvw}
     workgroupBarrier();
-    stage1(t);
+    {st1}
     workgroupBarrier();
 }}
-"
+",
+            cvw = if abl & 8 != 0 { String::new() } else { format!("cv[t] = select(key({next}), 0u, done);") },
+            st1 = if abl & 8 != 0 { "" } else { "stage1(t);" }
         );
     }
     text
