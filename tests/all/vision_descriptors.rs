@@ -1,4 +1,6 @@
 //! ORB, SIFT and GLOH: tests against host references.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments, clippy::excessive_precision, clippy::approx_constant, clippy::neg_cmp_op_on_partial_ord, clippy::useless_vec)]
+
 
 use std::collections::HashMap;
 
