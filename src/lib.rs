@@ -100,6 +100,8 @@ mod gpu;
 mod gpu_type;
 mod group;
 mod host;
+mod image;
+mod interp;
 mod iterate;
 mod jit;
 mod kernel;
@@ -115,6 +117,7 @@ mod reduce;
 mod scan;
 mod scatter;
 mod search;
+mod signal;
 mod segments;
 mod segsort;
 mod scalar;
@@ -133,6 +136,9 @@ pub use fields::Fields;
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
 pub use kernel::{uniform, view, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
+pub use image::{transform_coordinates, transform_coordinates_on, TransformMatrix};
+pub use interp::Interp;
+pub use signal::IIR_MAX_ORDER;
 pub use until::{compile_until_all, iterate_until_all, CompiledUntil, Cond, History, Run, Series, Stat, StopReason, Until};
 pub use linalg::{
     solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from, solve_tridiagonal, solve_tridiagonal_from,

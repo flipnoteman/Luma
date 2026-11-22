@@ -63,3 +63,6 @@ mod transfer;
 mod tridiagonal;
 mod vector_reductions;
 mod views;
+mod filters;
+mod image_warp;
+mod interp;
