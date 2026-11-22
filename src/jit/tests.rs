@@ -4893,8 +4893,15 @@ fn shape_program(ctx: &Context, shape: impl Into<crate::Shape>) {
 #[test]
 fn an_expression_on_another_shape_is_the_same_kernel() {
     // The extents and strides are not powers of two (a power of two is another structure: its
-    // index math is shifts and masks), so no shape falls into a class of its own.
-    let ctx = ctx();
+    // index math is shifts and masks), so no shape falls into a class of its own. Coarsening is
+    // off: its factor follows the element count against the device's multiprocessors, so on a
+    // smaller GPU a bigger shape takes another factor and is another kernel by design.
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| {
+        tuning.reduce_multi_after = 0;
+        tuning.coarsen = crate::tuning::Coarsen::Off;
+    })
+    .unwrap();
+    ctx.set_cost_model(CostModel::TEST);
     shape_program(&ctx, [210, 71]);
     let first = ctx.jit().stats().built;
     assert!(first > 0);
