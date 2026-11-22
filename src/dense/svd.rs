@@ -4,10 +4,10 @@
 //! `A = U Σ Vᵀ` is found by rotating pairs of columns of `A` until all of them are orthogonal:
 //! `A V = U Σ` with `V` the product of the rotations, the singular values the norms of the
 //! columns and `U` the normalised columns. Jacobi is slower than bidiagonalisation in flops but
-//! it is built from independent steps (the pairs of a round-robin round are disjoint), it needs no
-//! reflectors or divide and conquer, and it computes small singular values to high *relative*
-//! accuracy: the ill-conditioned matrices of the tests keep their small values to a few digits
-//! where a Gram-matrix method would lose them.
+//! it is built from independent steps (the pairs of a round-robin round are disjoint) and needs
+//! no reflectors or divide and conquer. It is accurate in the normwise sense (`||A - U S Vᵀ||` and
+//! the singular values within a few `eps ||A||`), and for matrices whose columns are badly scaled
+//! it computes the small singular values to high *relative* accuracy.
 //!
 //! A matrix with fewer rows than columns is decomposed through its transpose. Then:
 //!
@@ -16,15 +16,18 @@
 //!   columns and `V` live in workgroup memory, the pairs of a round-robin round are rotated in
 //!   parallel (a few invocations per pair split the dot products), and the sweeps stop inside
 //!   the kernel when no rotation is left (at most [`MAX_SWEEPS`]). A whole batch is one launch.
-//! * a bigger matrix lives in global memory, columns contiguous, and every round-robin round is
-//!   one launch (`n / 2` workgroups, one per pair). The number of sweeps cannot be decided
-//!   without reading something back, so a fixed number of them is recorded; the rounds of a sweep
-//!   after the first that found nothing to rotate return at once (the previous sweep's
-//!   "rotated" flag is a word in global memory), which makes the surplus nearly free.
+//! * a bigger matrix lives in global memory, columns contiguous. From [`BLOCK_MIN`] columns on it
+//!   is decomposed by block Jacobi (see [`block`]: a Gram matrix and a small eigenproblem per
+//!   block pair, then two thin products); below that every round-robin round is one launch of a
+//!   workgroup per column pair. Either way the sweeps run until one of them rotates nothing:
+//!   a flag in global memory records it, the rounds after convergence return at once, and the
+//!   host looks at the flags every few sweeps (so a big decomposition waits for the device).
 //!
 //! The matrix is scaled by a power of two (small kernel) or by its largest element (big matrix) so
 //! that the squares of the column norms neither overflow nor underflow, whatever the scale of
 //! the input.
+
+mod block;
 
 use std::panic::Location;
 
@@ -66,8 +69,7 @@ pub(crate) struct Outputs {
 /// `|a_p . a_q| <= tol |a_p| |a_q|`. The dot products of `rows` terms carry rounding errors of
 /// about `eps sqrt(rows)`, which is where the tolerance has to sit to be reachable.
 fn tolerance(rows: usize) -> f32 {
-    let t = std::env::var("LUMA_SVD_TOL").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.25);
-    t * 1.2e-7 * (rows as f32).sqrt().max(1.0)
+    0.25 * 1.2e-7 * (rows as f32).sqrt().max(1.0)
 }
 
 #[derive(encase::ShaderType)]
@@ -747,6 +749,10 @@ const MAX_BIG_SWEEPS: u32 = 60;
 const FIRST_CHUNK: u32 = 8;
 const NEXT_CHUNK: u32 = 2;
 
+/// Columns from which a matrix is decomposed by block Jacobi ([`block`]) instead of rotating one pair of
+/// columns per workgroup.
+const BLOCK_MIN: usize = 128;
+
 /// Decomposes one matrix (`[cols, rows]`) in global memory.
 fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> {
     let ctx = a.context();
@@ -780,12 +786,14 @@ fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> 
     } else {
         Array::<f32>::alloc(ctx, Shape::from(1))?
     };
-    let cap = std::env::var("LUMA_SVD_SWEEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_BIG_SWEEPS);
+    let cap = MAX_BIG_SWEEPS;
     let mut chg = Array::<u32>::zeros_on(ctx, [cap as usize + 1])?;
     let tol = tolerance(rr);
-    let t = big_threads(rr);
-    let kernel = ctx.kernel(&round_source(t, vectors)).label("svd_round").build()?;
-    if cc > 1 {
+    if cc >= BLOCK_MIN {
+        block::sweeps(ctx, &mut w, vectors.then_some(&mut v), &mut chg, rr, cc, cap, FIRST_CHUNK, NEXT_CHUNK)?;
+    } else if cc > 1 {
+        let t = big_threads(rr);
+        let kernel = ctx.kernel(&round_source(t, vectors)).label("svd_round").build()?;
         let pairs = (cc + (cc & 1)) / 2;
         let groups = per_matrix(ctx, pairs);
         let mut done = 0;
@@ -805,7 +813,8 @@ fn big(a: &Array<f32>, kind: Kind, vectors: bool) -> Result<Outputs, LumaError> 
             }
             done = upto;
             // Converged when the last sweep rotated nothing (the sweeps after it did not run).
-            if chg.to_vec()?[done as usize - 1] == 0 {
+            let flags = chg.to_vec()?;
+            if flags[done as usize - 1] == 0 {
                 break;
             }
         }
@@ -902,8 +911,9 @@ pub(crate) fn decompose(a: &Array<f32>, kind: Kind, vectors: bool, op: &'static 
 #[derive(Clone, Debug)]
 pub struct Svd {
     /// Left singular vectors as columns, `[k, m]` (`[k, m, batch]`), `k = min(m, n)`: `UᵀU = I`
-    /// (for a singular value that is exactly zero the column is completed to an orthonormal set
-    /// where the matrix fits in workgroup memory; elsewhere it is zero).
+    /// (the column of a singular value that is exactly zero is completed to an orthonormal set:
+    /// by Gram-Schmidt in the workgroup kernel, with the full `Q` of a QR factorisation of the
+    /// other columns for a big matrix).
     pub u: Array<f32>,
     /// The singular values in descending order, `[k, 1]` (`[k, 1, batch]`).
     pub s: Array<f32>,

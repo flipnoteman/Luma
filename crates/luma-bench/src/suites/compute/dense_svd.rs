@@ -65,7 +65,7 @@ fn eigh_error(a: &[f32], l: &[f32], v: &[f32], n: usize) -> (f64, f64) {
 }
 
 pub fn run(h: &mut Harness) {
-    h.guarded("dense_svd", |h| {
+    h.guarded("dense/svd", |h| {
         let sizes: &[usize] = if h.ctx.is_cpu() { pick(h, &[32, 64], &[32, 64, 128]) } else { pick(h, &[64, 256], &[64, 256, 1024]) };
         for &n in sizes {
             let a = values(n * n, 120 + n as u64, -1.0, 1.0);
@@ -91,7 +91,7 @@ pub fn run(h: &mut Harness) {
             let (l, v) = (host(&e.values), host(&e.vectors));
             let (res, orth) = eigh_error(&sym, &l, &v, n);
             assert!(res < 2e-5 && orth < 1e-4 && l.windows(2).all(|w| w[0] <= w[1]), "eigh {n}: residual {res}, orthogonality {orth}");
-            h.case("dense/eigh", &format!("{n}x{n}"), Work::Flops(flops), &mut || {
+            h.case("dense/svd_eigh", &format!("{n}x{n}"), Work::Flops(flops), &mut || {
                 let e = sl.eigh();
                 eval_all(&[&e.values, &e.vectors]).unwrap()
             });
@@ -126,7 +126,7 @@ pub fn run(h: &mut Harness) {
                 let (res, orth) = eigh_error(&sym[r.clone()], &l[b * n..(b + 1) * n], &v[r], n);
                 assert!(res < 2e-5 && orth < 1e-4, "batched eigh {n}x{batch}: matrix {b}: {res}, {orth}");
             }
-            h.case("dense/eigh_batched", &format!("{batch} x {n}x{n}"), Work::Flops(flops), &mut || {
+            h.case("dense/svd_eigh_batched", &format!("{batch} x {n}x{n}"), Work::Flops(flops), &mut || {
                 let e = sl.eigh();
                 eval_all(&[&e.values, &e.vectors]).unwrap()
             });

@@ -56,7 +56,7 @@ fn seconds(f: &mut dyn FnMut()) -> f64 {
 }
 
 fn sizes(b: &Bench) -> Vec<usize> {
-    if b.quick { vec![256, 1024] } else { vec![256, 1024, 4096] }
+    if b.quick { vec![256, 1024] } else { vec![64, 128, 256, 1024, 4096] }
 }
 
 /// A random `n x n` matrix of known rank `r`: `B C` with uniform factors scaled to unit-order values.
@@ -195,19 +195,19 @@ fn pinv_rank(b: &mut Bench) {
         let r = n / 2;
         let lr = low_rank(n, r, 160 + n as u64);
         let (rl, ra) = (lumax::arr(&ctx, &lr, [n, n]), afx::arr(&lr, &[n as u64, n as u64]));
-        let (got_l, got_a) = (rl.rank().item().unwrap(), af::rank(&ra, 1e-4));
+        let (got_l, got_a) = (rl.rank().item().unwrap(), af::rank(&ra, 1e-2));
         let text = format!("rank {r}: luma {got_l}, AF {got_a}");
         let v = if got_l as usize == r && got_a as usize == r { Verdict::yes(text) } else { Verdict::no(text) };
         b.run(
             "rank f32",
             &format!("{n}x{n}, rank {r}"),
             v,
-            "luma rank (singular values, count above the default tolerance); AF rank(tol 1e-4), result read back on both sides",
+            "luma rank (singular values, count above the default relative tolerance); AF rank(tol 1e-2), far cheaper than AF's own svd; result read back on both sides",
             &mut || {
                 let _ = rl.rank().item().unwrap();
             },
             &mut || {
-                let _ = af::rank(&ra, 1e-4);
+                let _ = af::rank(&ra, 1e-2);
                 afx::sync();
             },
         );

@@ -229,9 +229,9 @@ fn eigh_scales() {
             let a: Vec<f32> = symmetric(n, 6).iter().map(|&x| x * scale).collect();
             let l = mat(&ctx, &a, n, n, 1).eigvalsh().to_vec().unwrap();
             let unit = mat(&ctx, &symmetric(n, 6), n, n, 1).eigvalsh().to_vec().unwrap();
-            let top = unit.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let norm = fro(&widen(&symmetric(n, 6)));
             for j in 0..n {
-                assert!((f64::from(l[j]) / f64::from(scale) - f64::from(unit[j])).abs() < 1e-5 * f64::from(top), "scale {scale}, n = {n}, value {j}: {} vs {}", l[j], unit[j] * scale);
+                assert!((f64::from(l[j]) / f64::from(scale) - f64::from(unit[j])).abs() < 2e-6 * norm, "scale {scale}, n = {n}, value {j}: {} vs {}", l[j], unit[j] * scale);
             }
         }
     }
