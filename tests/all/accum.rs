@@ -785,6 +785,13 @@ fn batches_split_over_several_buffers() {
     let co = CoMoments::<Df32>::new(Fold::all());
     co.push(&batch, &batch).unwrap();
     close(read(co.corr())[0], 1.0, 0.0, 1e-5, "self correlation");
+    // Per-position top-k of the chunked [4, 2500] batch: the ranking of feature 1.
+    let along = TopK::<f32, Df32>::largest_along(3, 1).unwrap();
+    along.push(&wide).unwrap();
+    let mut rows: Vec<usize> = (0..2500).collect();
+    rows.sort_by(|&a, &b| data[b * 4 + 1].total_cmp(&data[a * 4 + 1]).then(a.cmp(&b)));
+    let indices = read(along.indices());
+    assert_eq!((0..3).map(|j| indices[1 + 4 * j]).collect::<Vec<_>>(), rows[..3].iter().map(|&r| r as f64).collect::<Vec<_>>());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1044,4 +1051,60 @@ fn integer_streams_give_a_confusion_matrix() {
     // Accuracy from the diagonal.
     let diagonal: f64 = (0..C).map(|c| want[c + C * c]).sum();
     assert!(diagonal / 3000.0 > 0.7);
+}
+
+#[test]
+fn top_k_per_position_along_an_axis() {
+    const F: usize = 6;
+    let rows = 400;
+    let mut data = f32s(&normal(F * rows, 80));
+    // Ties and a NaN.
+    data[3 * F + 2] = 50.0;
+    data[200 * F + 2] = 50.0;
+    data[7 * F + 4] = f32::NAN;
+    let k = 4;
+    let host_top = |f: usize, largest: bool| -> Vec<usize> {
+        let mut order: Vec<usize> = (0..rows).filter(|&r| !data[r * F + f].is_nan()).collect();
+        order.sort_by(|&a, &b| {
+            let (x, y) = (data[a * F + f], data[b * F + f]);
+            (if largest { y.total_cmp(&x) } else { x.total_cmp(&y) }).then(a.cmp(&b))
+        });
+        order.truncate(k);
+        order
+    };
+    for largest in [true, false] {
+        let top = if largest { TopK::<f32, Df32>::largest_along(k, 1).unwrap() } else { TopK::<f32, Df32>::smallest_along(k, 1).unwrap() };
+        for (start, count) in [(0, 150), (150, 1), (151, 249)] {
+            top.push(&Array::from_slice(&data[start * F..(start + count) * F], [F, count]).unwrap()).unwrap();
+        }
+        // Shape [F, k]: entry j of feature f at f + F * j.
+        let (values, indices) = (top.values().unwrap().to_vec().unwrap(), read(top.indices()));
+        assert_eq!(values.len(), F * k);
+        for f in 0..F {
+            let want = host_top(f, largest);
+            for j in 0..k {
+                assert_eq!(indices[f + F * j], want[j] as f64, "feature {f} rank {j} (largest {largest})");
+                assert_eq!(values[f + F * j], data[want[j] * F + f]);
+            }
+        }
+        assert_eq!(top.elements_seen(), rows as u64);
+    }
+    // Merging two halves, through bytes, gives the same ranking; masked elements are skipped.
+    let (a, b) = (TopK::<f32, Df32>::largest_along(k, 1).unwrap(), TopK::<f32, f64>::largest_along(k, 1).unwrap());
+    a.push(&Array::from_slice(&data[..F * 100], [F, 100]).unwrap()).unwrap();
+    b.push(&Array::from_slice(&data[F * 100..], [F, rows - 100]).unwrap()).unwrap();
+    a.merge(&TopK::<f32, Df32>::from_bytes(&b.to_bytes().unwrap()).unwrap()).unwrap();
+    let merged = read(a.indices());
+    for f in 0..F {
+        let want = host_top(f, true);
+        for j in 0..k {
+            assert_eq!(merged[f + F * j], want[j] as f64);
+        }
+    }
+    let masked = TopK::<i32, Df32>::largest_along(2, 0).unwrap();
+    // One line of 5 samples: [3, 9, 4, 8, 1], the 9 masked out.
+    masked.push_where(&Array::from_slice(&[3i32, 9, 4, 8, 1], 5).unwrap(), &Array::from_slice(&[true, false, true, true, true], 5).unwrap()).unwrap();
+    assert_eq!(masked.values().unwrap().to_vec().unwrap(), vec![8, 4]);
+    assert_eq!(read(masked.indices()), vec![3.0, 2.0]);
+    assert!(TopK::<f32, Df32>::largest_along(100, 1).is_err());
 }
