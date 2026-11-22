@@ -32,7 +32,9 @@ assert_eq!((lo, hi), (1.0, 4.0));
 | --- | --- |
 | `sum()`, `min()`, `max()` | any element type; `u32` sums wrap around |
 | `mean()`, `norm()` | `f32`; the norm is the Euclidean (L2) norm |
-| `reduce([Reduction; N])` | `N` of `Sum`, `Min`, `Max`, `SumOfSquares` (one to four) in one pass, as an `N`-element array |
+| `prod()` / `product()` | the product; NaN if any element is NaN, `u32` / `i32` products wrap around |
+| `reduce([Reduction; N])` | `N` of `Sum`, `Min`, `Max`, `SumOfSquares`, `Product` (one to four) in one pass, as an `N`-element array |
+| `norm_p(Norm)` | `One`, `Two`, `Inf`, `P(p)`, `Frobenius` and the matrix `MatrixOne` / `MatrixInf` norms, `f32` (`f64` except `P`) |
 | `sum_where(&cond)` | the sum of the elements where a `bool` (or non-zero `u32`) condition is true, in one pass |
 | `item()` | the value of a one-element array |
 | `to_array::<N>()` | the values of an `N`-element array |
@@ -113,7 +115,8 @@ are the ones a host loop would give.
 `sum_where(&cond)` sums where a condition (an `Array<bool>`, such as a comparison, or a `u32` array of
 non-zero elements) is true; the `sum()` of a boolean array is the number of true elements, as a `u32`
 array (also `count()`, as in NumPy). `any()` and `all()` are one-element `bool` arrays, and `bool`
-arrays have `min` / `max` but no `mean`, `norm` or `reduce`:
+arrays have `min` / `max` but no `mean`, `norm` or `reduce`. Along an axis, `count_axis`, `all_axis` and
+`any_axis` do the same per line:
 
 ```rust
 use luma::*;
@@ -124,6 +127,34 @@ assert_eq!(x.sum_where(&positive).item()?, 4.0);
 assert_eq!(positive.count().item()?, 2);
 assert_eq!(positive.sum().item()?, 2);
 assert!(positive.any().item()?);
+
+let table = Array::from_slice(&[1.0f32, -2.0, 3.0, 4.0, 5.0, -6.0], [2, 3])?;
+let flags = table.gt(0.0);
+assert_eq!(flags.count_axis(0).to_vec()?, vec![1, 2, 1]);
+assert_eq!(flags.all_axis(1).to_vec()?, vec![true, false]);
+assert_eq!(flags.any_axis(1).to_vec()?, vec![true, true]);
+# Ok::<(), luma::LumaError>(())
+```
+
+### Products and norms
+
+`prod()` (alias `product()`, ArrayFire's name) multiplies all elements, fused with the expression behind
+it like a sum; `prod_axis(axis)` does it per line. `norm_p` takes a [`Norm`]: the absolute value or power
+is computed inside the reduction, so every norm reads the data once.
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[3.0f32, -4.0, 2.0], 3)?;
+assert_eq!(x.prod().item()?, -24.0);
+assert_eq!(x.norm_p(Norm::One).item()?, 9.0);
+assert_eq!(x.norm_p(Norm::Inf).item()?, 4.0);
+assert!((x.norm_p(Norm::Two).item()? - 29.0f32.sqrt()).abs() < 1e-6);
+
+// A matrix: axis 0 is the row index (as in ArrayFire), so MatrixOne is the largest column sum.
+let m = Array::from_slice(&[1.0f32, -2.0, 3.0, 4.0], [2, 2])?;
+assert_eq!(m.norm_p(Norm::MatrixOne).item()?, 7.0);
+assert_eq!(m.norm_p(Norm::MatrixInf).item()?, 6.0);
 # Ok::<(), luma::LumaError>(())
 ```
 

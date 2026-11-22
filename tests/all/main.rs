@@ -65,3 +65,4 @@ mod vector_reductions;
 mod views;
 mod small_math;
 mod structure;
+mod stats;

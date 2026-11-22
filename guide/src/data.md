@@ -179,6 +179,34 @@ assert!((y.var_axis(0).item()? - 1.25).abs() < 1e-3);
 # Ok::<(), luma::LumaError>(())
 ```
 
+### Variance with a divisor, weights, covariance
+
+`var(bias)`, `std(bias)` and `meanvar(bias)` do the same for the whole array (`f32` and `f64`), and
+`var_axis_bias(axis, bias)`, `std_axis_bias` and `meanvar_axis` along an axis. A [`Bias`] is ArrayFire's
+`af_var_bias`: `Population` divides by `n`, `Sample` by `n - 1`. The mean and variance of a `meanvar`
+come from one pass over the data (the sum and the sum of squares of the data minus its first element).
+`mean_weighted(&w)` and `meanvar_weighted(&w, bias)` take weights of the array's shape (or extent 1
+along the axes to broadcast), `mean_axis_weighted(axis, &w)` along an axis. `cov(&y, bias)` and
+`corrcoef(&y)` pair two arrays of one shape element by element (the sums of the three expressions are
+recorded in one kernel); `cov_axis` and `corrcoef_axis` work per line. Axis forms are `f32` only
+(there are no axis reductions of `f64`).
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let y = Array::from_slice(&[2.0f32, 4.0, 6.0, 8.0], 4)?;
+assert_eq!(x.var(Bias::Population).item()?, 1.25);
+assert!((x.var(Bias::Sample).item()? - 5.0 / 3.0).abs() < 1e-6);
+let (mean, var) = x.meanvar(Bias::Population);
+assert_eq!((mean.item()?, var.item()?), (2.5, 1.25));
+let w = Array::from_slice(&[1.0f32, 1.0, 1.0, 5.0], 4)?;
+assert_eq!(x.mean_weighted(&w).item()?, 3.25);
+assert!((x.corrcoef(&y).item()? - 1.0).abs() < 1e-6);
+assert!((x.cov(&y, Bias::Sample).item()? - 10.0 / 3.0).abs() < 1e-5);
+# Ok::<(), luma::LumaError>(())
+```
+
 ## Argmax and argmin
 
 `argmax` and `argmin` give the **flat index** of the largest or smallest element as a

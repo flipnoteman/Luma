@@ -121,6 +121,7 @@ mod scalar;
 mod shape;
 mod sort;
 mod structure;
+mod stats;
 mod tuning;
 mod until;
 mod view;
@@ -149,6 +150,7 @@ pub use scatter::{bincount, AtomicElem};
 pub use search::Side;
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
+pub use stats::{Bias, Norm};
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
 
 /// Plumbing of `fields!`; not part of the public API.
