@@ -218,9 +218,13 @@ impl Sampling<'_> {
             tests::TEXTURED.set(tests::TEXTURED.get() + 1);
         }
         // The kernel is specialised for the method, the kind of source and the dimensions of the grid:
-        // they are constants of its source, so each launch runs only the code it needs.
-        let spec = Spec { method: params.method, kind: params.kind, ndims: params.ndims, persp: params.persp };
-        let variant = spec.variant(c, read_mode, tile, rows_per);
+        // they are constants of its source, so each launch runs only the code it needs. Not where the
+        // driver compiles the source and a texture is a copy (wgpu): a kernel that reads a texture and
+        // one that reads the buffer are then compiled apart, and with constants folded in the driver
+        // contracts their products and sums differently (up to 8e-7 on a bicubic gather), where the
+        // generic code gives the same bits for either read.
+        let spec = ctx.hal().texture_caps().is_none_or(|caps| caps.aliases).then_some(Spec { method: params.method, kind: params.kind, ndims: params.ndims, persp: params.persp });
+        let variant = spec.unwrap_or(Spec::GENERIC).variant(c, read_mode, tile, rows_per);
         let (kernel, grid) = if rows_ok {
             (ctx.cached_kernel("sampler_rows", variant, "main_rows", || source(c, tile, true, read_mode, spec, rows_per))?, [to_u32(od[0].div_ceil(WORKGROUP as usize))?, to_u32(rows.div_ceil(rows_per))?, to_u32(batch)?])
         } else if shaped {
@@ -321,6 +325,9 @@ struct Spec {
 }
 
 impl Spec {
+    /// What the generic kernel, which reads all of it from the uniform, stands for.
+    const GENERIC: Spec = Spec { method: 0, kind: 0, ndims: 1, persp: 0 };
+
     /// A number that tells the kernels of a launch apart (24 bits; the sizes are powers of two).
     fn variant(self, coarsen: usize, read: Read, tile: [u32; 2], rows: usize) -> usize {
         let bits = [
@@ -340,7 +347,7 @@ impl Spec {
 
 /// The source of the sampling kernel with `coarsen` elements per invocation in the generic
 /// entry points.
-fn source(coarsen: usize, tile: [u32; 2], rows_entry: bool, read: Read, spec: Spec, rows_per: usize) -> String {
+fn source(coarsen: usize, tile: [u32; 2], rows_entry: bool, read: Read, spec: Option<Spec>, rows_per: usize) -> String {
     let mut w = String::new();
     let _ = writeln!(w, "const C: u32 = {coarsen}u;\nconst ROWS: u32 = {}u;\nconst TX: u32 = {}u;\nconst TY: u32 = {}u;", rows_per, tile[0], tile[1]);
     w.push_str(&bindings(rows_entry, read));
@@ -568,6 +575,7 @@ fn main_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
         // The texture is of one 2-D slice, so the taps of an axis are texel coordinates.
         text = text.replace("p.gs0", "1u").replace("p.gs1", "1u").replace("    if (!two) { return combine1(base, ax); }\n", "");
     }
+    let Some(spec) = spec else { return text };
     let consts = format!("const METHOD: u32 = {}u;\nconst KIND: u32 = {}u;\nconst NDIMS: u32 = {}u;\nconst PERSP: u32 = {}u;\n", spec.method, spec.kind, spec.ndims, spec.persp);
     consts + &text.replace("p.method", "METHOD").replace("p.kind", "KIND").replace("p.ndims", "NDIMS").replace("p.persp", "PERSP")
 }
@@ -746,7 +754,8 @@ mod tests {
                 for (k, (g, b)) in got.iter().zip(&base).enumerate() {
                     assert_eq!(g.len(), b.len());
                     let bad = g.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits() && !(x.is_nan() && y.is_nan())).count();
-                    assert_eq!(bad, 0, "{read:?} {method:?} case {k}: {bad} of {} elements differ", b.len());
+                    let worst = g.iter().zip(b).map(|(x, y)| (x - y).abs()).filter(|d| !d.is_nan()).fold(0.0f32, f32::max);
+                    assert_eq!(bad, 0, "{read:?} {method:?} case {k}: {bad} of {} elements differ, worst {worst:e}", b.len());
                 }
             }
             FORCE.set(None);
