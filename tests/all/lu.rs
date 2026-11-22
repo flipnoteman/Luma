@@ -345,3 +345,23 @@ fn tall_matrices_factor_too() {
         assert!(diff(&lu, &pa) / fro(&widen(&a)) < 2e-5, "{m}x{n}: ||PA - LU|| = {}", diff(&lu, &pa));
     }
 }
+
+#[test]
+fn infinite_entries_do_not_hang_or_poison() {
+    let ctx = Context::new().unwrap();
+    for &n in &[3usize, 40, 100] {
+        let mut a = random(n, 2);
+        a[n + 1] = f32::INFINITY;
+        let m = mat(&ctx, &a, n, n, 1);
+        let lu = m.lu().lu.to_vec().unwrap();
+        assert!(lu.iter().any(|v| !v.is_finite()), "n = {n}: LU of an infinite entry is finite");
+        let q = m.qr().r().to_vec().unwrap();
+        assert!(q.iter().any(|v| !v.is_finite()), "n = {n}: QR of an infinite entry is finite");
+        let spd_inf = {
+            let mut s = spd(n, 3, 1.0);
+            s[0] = f32::INFINITY;
+            mat(&ctx, &s, n, n, 1).cholesky().to_vec().unwrap()
+        };
+        assert!(spd_inf.iter().any(|v| !v.is_finite()), "n = {n}: Cholesky of an infinite entry is finite");
+    }
+}

@@ -13,7 +13,7 @@ use std::panic::Location;
 use super::{fail, grid, launch, nth, stack_batch, Dims, Triangle};
 use crate::array::Array;
 use crate::error::LumaError;
-use crate::kernel::{uniform, KernelArg};
+use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::shape::Shape;
 
@@ -43,7 +43,7 @@ fn source() -> String {
     let mut update = String::new();
     let mut diag = String::new();
     for r in 0..ROWS {
-        accs += &format!("        var s{r} = b[bb + min(i0 + {r}u, n - 1u) * k + c];\n");
+        accs += &format!("        var s{r} = ldb(m, min(i0 + {r}u, n - 1u), c);\n");
         let row = format!("min(i0 + {r}u, n - 1u) * n + j");
         update += &format!(
             "            s{r} = fma(-ls[{row}], xa, s{r});\n            s{r} = fma(-ls[{row} + 1u], xb, s{r});\n            s{r} = fma(-ls[{row} + 2u], xc, s{r});\n            s{r} = fma(-ls[{row} + 3u], xd, s{r});\n"
@@ -59,9 +59,14 @@ fn source() -> String {
     format!(
         "struct Params {{ n: u32, k: u32, batch: u32, unit: u32 }}
 @group(1) @binding(0) var<storage, read> l: array<f32>;
-@group(1) @binding(1) var<storage, read> b: array<f32>;
-@group(1) @binding(2) var<storage, read_write> x: array<f32>;
-@group(1) @binding(3) var<uniform> p: Params;
+@group(1) @binding(1) var<uniform> lv: LumaView;
+@group(1) @binding(2) var<storage, read> b: array<f32>;
+@group(1) @binding(3) var<uniform> bv: LumaView;
+@group(1) @binding(4) var<storage, read_write> x: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+fn ldl(m: u32, i: u32, j: u32) -> f32 {{ return l[luma_view_idx3(lv, j, i, m)]; }}
+fn ldb(m: u32, i: u32, c: u32) -> f32 {{ return b[luma_view_idx3(bv, c, i, m)]; }}
+
 var<workgroup> ls: array<f32, {size}>;
 
 @compute @workgroup_size(64)
@@ -72,7 +77,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     let lb = m * p.n * p.n;
     let bb = m * p.n * k;
     for (var idx = t; idx < n * n; idx = idx + 64u) {{
-        ls[idx] = l[lb + idx];
+        ls[idx] = ldl(m, idx / n, idx % n);
     }}
     workgroupBarrier();
     let c = wid.x * 64u + t;
@@ -126,7 +131,7 @@ fn substitute(l: &Array<f32>, b: &Array<f32>, ld: Dims, bd: Dims, unit: bool, op
     };
     let params = Params { n: ld.rows as u32, k: bd.cols as u32, batch: ld.batch as u32, unit: u32::from(unit) };
     let groups = grid(ctx, bd.cols.div_ceil(64), ld.batch);
-    let args: [KernelArg<'_>; 4] = [l.into(), b.into(), (&mut out).into(), uniform(&params)];
+    let args: [KernelArg<'_>; 4] = [view(l), view(b), (&mut out).into(), uniform(&params)];
     match launch(ctx, "trsm", "trsm", source, groups, &args) {
         Ok(()) => out,
         Err(e) => fail(ctx, b.shape(), e, op, loc),

@@ -158,9 +158,3 @@ pub(crate) fn gather_rows(a: &Array<f32>, perm: &Array<u32>, loc: &'static Locat
     let idx = &(&rows * w as u32 + &col) + &(&mat * (m * w) as u32);
     a.take(&idx)
 }
-
-/// Whether the register kernels combine across an invocation's subgroup with `subgroupMax` and friends
-/// (the device has them; `LUMA_LINALG_SUBGROUPS=off` turns it off).
-pub(crate) fn subgroups(ctx: &Context) -> bool {
-    ctx.tuning().subgroups && ctx.info().subgroup_size.is_some_and(|(min, _)| min >= 4) && std::env::var("LUMA_LINALG_SUBGROUPS").as_deref() != Ok("off")
-}

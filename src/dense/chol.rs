@@ -12,7 +12,7 @@ use super::tri::{lower_left, rhs_matrix, split};
 use super::{block, fail, launch, nth, per_matrix, stack_batch, Dims, NAN};
 use crate::array::Array;
 use crate::context::Context;
-use crate::kernel::{uniform, KernelArg};
+use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::view::concat;
 
@@ -38,8 +38,11 @@ fn source(leaf: usize) -> String {
     format!(
         "struct Params {{ n: u32, batch: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
-@group(1) @binding(1) var<storage, read_write> l: array<f32>;
-@group(1) @binding(2) var<uniform> p: Params;
+@group(1) @binding(1) var<uniform> av: LumaView;
+@group(1) @binding(2) var<storage, read_write> l: array<f32>;
+@group(1) @binding(3) var<uniform> p: Params;
+fn ld(mi: u32, i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, mi)]; }}
+
 var<workgroup> s: array<f32, {size}>;
 var<workgroup> dv: array<f32, {leaf}>;
 
@@ -51,7 +54,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     for (var idx = t; idx < n * n; idx = idx + {leaf}u) {{
         let i = idx / n;
         let j = idx - i * n;
-        s[i * {pitch}u + j] = select(0.0, a[base + idx], j <= i);
+        s[i * {pitch}u + j] = select(0.0, ld(m, i, j), j <= i);
     }}
     workgroupBarrier();
     let ri = t * {pitch}u;
@@ -111,7 +114,7 @@ fn small(a: &Array<f32>, d: Dims, loc: &'static Location<'static>) -> Array<f32>
         Err(e) => return fail(ctx, a.shape(), e, "cholesky", loc),
     };
     let params = Params { n: d.rows as u32, batch: d.batch as u32 };
-    let args: [KernelArg<'_>; 3] = [a.into(), (&mut out).into(), uniform(&params)];
+    let args: [KernelArg<'_>; 3] = [view(a), (&mut out).into(), uniform(&params)];
     match launch(ctx, &format!("chol/{}", leaf(ctx)), "cholesky", || source(leaf(ctx)), per_matrix(ctx, d.batch), &args) {
         Ok(()) => out,
         Err(e) => fail(ctx, a.shape(), e, "cholesky", loc),

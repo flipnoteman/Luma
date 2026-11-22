@@ -12,10 +12,10 @@
 use std::panic::Location;
 
 use super::tri::{lower_left, rhs_matrix, split};
-use super::{block, fail, fence, gather_rows, launch, nth, per_matrix, stack_batch, subgroups, Dims};
+use super::{block, fail, fence, gather_rows, launch, nth, per_matrix, stack_batch, Dims};
 use crate::array::Array;
 use crate::error::LumaError;
-use crate::kernel::{uniform, KernelArg};
+use crate::kernel::{uniform, view, KernelArg};
 use crate::matmul::matmul_f32;
 use crate::ops::select;
 use crate::shape::Shape;
@@ -50,9 +50,12 @@ fn small_source() -> String {
     format!(
         "struct Params {{ m: u32, w: u32, batch: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
-@group(1) @binding(1) var<storage, read_write> f: array<f32>;
-@group(1) @binding(2) var<storage, read_write> perm: array<u32>;
-@group(1) @binding(3) var<uniform> p: Params;
+@group(1) @binding(1) var<uniform> av: LumaView;
+@group(1) @binding(2) var<storage, read_write> f: array<f32>;
+@group(1) @binding(3) var<storage, read_write> perm: array<u32>;
+@group(1) @binding(4) var<uniform> p: Params;
+fn ld(mi: u32, i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, mi)]; }}
+
 var<workgroup> s: array<f32, {size}>;
 var<workgroup> pm: array<u32, {SMALL}>;
 
@@ -65,7 +68,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     let base = mi * p.m * w;
     for (var idx = t; idx < m * w; idx = idx + {SMALL}u) {{
         let i = idx / w;
-        s[i * {pitch}u + idx - i * w] = a[base + idx];
+        s[i * {pitch}u + idx - i * w] = ld(mi, i, idx - i * w);
     }}
     pm[t] = t;
     workgroupBarrier();
@@ -139,9 +142,12 @@ fn panel_source(fence: &str, threads: usize) -> String {
     format!(
         "struct Params {{ m: u32, w: u32, batch: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
-@group(1) @binding(1) var<storage, read_write> f: array<f32>;
-@group(1) @binding(2) var<storage, read_write> perm: array<u32>;
-@group(1) @binding(3) var<uniform> p: Params;
+@group(1) @binding(1) var<uniform> av: LumaView;
+@group(1) @binding(2) var<storage, read_write> f: array<f32>;
+@group(1) @binding(3) var<storage, read_write> perm: array<u32>;
+@group(1) @binding(4) var<uniform> p: Params;
+fn ld(mi: u32, i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, mi)]; }}
+
 var<workgroup> rv: array<f32, {g}>;
 var<workgroup> ri: array<u32, {g}>;
 
@@ -173,7 +179,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 {copy_cands}            }}
         }}
         for (; i < m; i = i + {g1}u) {{
-            let v = a[base + i * w + c];
+            let v = ld(mi, i, c);
             f[base + i * w + c] = v;
             if (c == 0u && abs(v) > best) {{ best = abs(v); bi = i; }}
         }}
@@ -242,7 +248,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         g1 = g,
         last = (UNROLL - 1) * g,
         step = UNROLL * g,
-        copy_loads = (0..UNROLL).map(|k| format!("            let v{k} = a[r0 + {}u * w];\n", k * g)).collect::<String>(),
+        copy_loads = (0..UNROLL).map(|k| format!("            let v{k} = ld(mi, i + {}u, c);\n", k * g)).collect::<String>(),
         copy_stores = (0..UNROLL).map(|k| format!("            f[r0 + {}u * w] = v{k};\n", k * g)).collect::<String>(),
         copy_cands = (0..UNROLL).map(|k| format!("                if (abs(v{k}) > best) {{ best = abs(v{k}); bi = i + {}u; }}\n", k * g)).collect::<String>(),
         upd_l = (0..UNROLL).map(|k| format!("            let l{k} = f[r0 + {}u * w + j] * rpiv;\n", k * g)).collect::<String>(),
@@ -252,174 +258,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     )
 }
 
-/// Columns of a panel the register kernel factors.
-const REG_COLS: usize = 8;
-/// Most rows per invocation of the register kernel (`8 * REG_ROWS` registers of data).
-const REG_ROWS: usize = 8;
-
-/// How a leaf factors a `[w, m]` matrix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Leaf {
-    /// Workgroup memory, up to 64 x 64.
-    Small,
-    /// Registers: panels of up to [`REG_COLS`] columns, `rows` rows per invocation of `threads`.
-    Registers { threads: usize, rows: usize },
-    /// Global memory, panels of up to [`PANEL`] columns.
-    Panel,
-}
-
-fn leaf_kind(ctx: &crate::Context, m: usize) -> Leaf {
-    if m <= SMALL {
-        return Leaf::Small;
-    }
-    let limits = &ctx.info().limits;
-    let threads = (limits.max_workgroup_invocations.min(limits.max_workgroup_size[0]) as usize).min(1024) / 32 * 32;
-    if threads >= 128 && m <= threads * REG_ROWS && std::env::var_os("LUMA_LINALG_NOREG").is_none() {
-        return Leaf::Registers { threads, rows: m.div_ceil(threads).next_power_of_two() };
-    }
-    Leaf::Panel
-}
-
 /// The widest matrix (in columns) a leaf of `m` rows factors in one launch.
-fn leaf_width(ctx: &crate::Context, m: usize) -> usize {
-    match leaf_kind(ctx, m) {
-        Leaf::Small => SMALL,
-        Leaf::Registers { .. } => REG_COLS,
-        Leaf::Panel => PANEL,
-    }
-}
-
-/// Where the recursion splits `w` columns: about half, at a multiple of 8 for narrow panels.
-fn split_cols(w: usize) -> usize {
-    if w <= 64 { (w / 2).next_multiple_of(REG_COLS).min(w - 1).max(1) } else { split(w) }
-}
-
-/// Register kernel: a panel of up to 8 columns, row `t + k * T` of the invocation `t` held in
-/// registers for its whole factorisation (no traffic to memory between columns). Per column: the
-/// pivot by a tree reduction in workgroup memory, the pivot row and the displaced row exchanged
-/// through workgroup memory, the update in registers. The loops over columns and rows are
-/// generated unrolled so that every register is indexed statically.
-fn reg_source(fence: &str, threads: usize, rows: usize, subgroups: bool) -> String {
-    let t = threads;
-    let mut body = String::new();
-    // Load.
-    for k in 0..rows {
-        body += &format!("    let row{k} = t + {}u;\n", k * t);
-        body += &format!("    pr[{k}] = row{k};\n    if (row{k} < m) {{\n");
-        for c in 0..REG_COLS {
-            body += &format!("        if ({c}u < w) {{ x[{}] = a[base + row{k} * w + {c}u]; }}\n", k * REG_COLS + c);
-        }
-        body += "    }\n";
-    }
-    for j in 0..REG_COLS {
-        body += &format!("    if ({j}u < min(m, w)) {{\n        var best = -1.0;\n        var bi = {j}u;\n");
-        for k in 0..rows {
-            body += &format!("        if (row{k} >= {j}u && row{k} < m) {{ let av = abs(x[{}]); if (av > best) {{ best = av; bi = row{k}; }} }}\n", k * REG_COLS + j);
-        }
-        if subgroups {
-            body += &format!(
-                "        let bm = subgroupMax(best);
-        let bidx = subgroupMin(select(0xffffffffu, bi, best == bm));
-        if (lane == 0u) {{ rv[sgid] = bm; ri[sgid] = bidx; }}
-        workgroupBarrier();
-        var pvv = -2.0;
-        var pv = 0xffffffffu;
-        for (var q = 0u; q < nsg; q = q + 1u) {{
-            let ov = rv[q];
-            let oi = ri[q];
-            if (ov > pvv || (ov == pvv && oi < pv)) {{ pvv = ov; pv = oi; }}
-        }}
-"
-            );
-        } else {
-            body += &format!(
-                "        rv[t] = best;
-        ri[t] = bi;
-        workgroupBarrier();
-        for (var h = {half}u; h > 0u; h = h >> 1u) {{
-            if (t < h) {{
-                let ov = rv[t + h];
-                let oi = ri[t + h];
-                if (ov > rv[t] || (ov == rv[t] && oi < ri[t])) {{ rv[t] = ov; ri[t] = oi; }}
-            }}
-            workgroupBarrier();
-        }}
-        let pv = ri[0];
-",
-                half = t / 2
-            );
-        }
-        for k in 0..rows {
-            body += &format!("        if (row{k} == pv) {{\n");
-            for c in 0..REG_COLS {
-                body += &format!("            sp[{c}] = x[{}];\n", k * REG_COLS + c);
-            }
-            body += &format!("            spi = pr[{k}];\n        }}\n        if (row{k} == {j}u) {{\n");
-            for c in 0..REG_COLS {
-                body += &format!("            sj[{c}] = x[{}];\n", k * REG_COLS + c);
-            }
-            body += &format!("            sji = pr[{k}];\n        }}\n");
-        }
-        body += "        workgroupBarrier();\n";
-        for k in 0..rows {
-            body += &format!("        if (row{k} == {j}u) {{\n");
-            for c in 0..REG_COLS {
-                body += &format!("            x[{}] = sp[{c}];\n", k * REG_COLS + c);
-            }
-            body += &format!("            pr[{k}] = spi;\n        }} else if (row{k} == pv) {{\n");
-            for c in 0..REG_COLS {
-                body += &format!("            x[{}] = sj[{c}];\n", k * REG_COLS + c);
-            }
-            body += &format!("            pr[{k}] = sji;\n        }}\n");
-        }
-        body += &format!("        let piv = sp[{j}];\n        let rpiv = select(0.0, 1.0 / piv, piv != 0.0);\n");
-        for k in 0..rows {
-            body += &format!("        if (row{k} > {j}u && row{k} < m) {{\n            let l = x[{}] * rpiv;\n            x[{}] = l;\n", k * REG_COLS + j, k * REG_COLS + j);
-            for c in j + 1..REG_COLS {
-                body += &format!("            if ({c}u < w) {{ x[{}] = fma(-l, sp[{c}], x[{}]); }}\n", k * REG_COLS + c, k * REG_COLS + c);
-            }
-            body += "        }\n";
-        }
-        body += "        workgroupBarrier();\n    }\n";
-    }
-    // Store.
-    for k in 0..rows {
-        body += &format!("    if (row{k} < m) {{\n        perm[pb + row{k}] = pr[{k}];\n");
-        for c in 0..REG_COLS {
-            body += &format!("        if ({c}u < w) {{ f[base + row{k} * w + {c}u] = x[{}]; }}\n", k * REG_COLS + c);
-        }
-        body += "    }\n";
-    }
-    let _ = fence;
-    format!(
-        "struct Params {{ m: u32, w: u32, batch: u32 }}
-@group(1) @binding(0) var<storage, read> a: array<f32>;
-@group(1) @binding(1) var<storage, read_write> f: array<f32>;
-@group(1) @binding(2) var<storage, read_write> perm: array<u32>;
-@group(1) @binding(3) var<uniform> p: Params;
-var<workgroup> rv: array<f32, {t}>;
-var<workgroup> ri: array<u32, {t}>;
-var<workgroup> sp: array<f32, {cols}>;
-var<workgroup> sj: array<f32, {cols}>;
-var<workgroup> spi: u32;
-var<workgroup> sji: u32;
-
-@compute @workgroup_size({t})
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) t: u32{sg_args}) {{
-    let mi = wid.x + wid.y * nwg.x;
-    let m = select(0u, p.m, mi < p.batch);
-    let w = p.w;
-    let base = mi * p.m * w;
-    let pb = mi * p.m;
-{sg_setup}    var x: array<f32, {n}>;
-    var pr: array<u32, {rows}>;
-{body}}}
-",
-        cols = REG_COLS,
-        n = rows * REG_COLS,
-        sg_args = if subgroups { ",\n    @builtin(subgroup_invocation_id) lane: u32,\n    @builtin(subgroup_size) sg: u32" } else { "" },
-        sg_setup = if subgroups { format!("    let sgid = t / sg;\n    let nsg = {t}u / sg;\n") } else { String::new() },
-    )
+fn leaf_width(m: usize) -> usize {
+    if m <= SMALL { SMALL } else { PANEL }
 }
 
 /// Factors every `[w, m, batch]` matrix of `a` (`m >= w`) with one of the two kernels.
@@ -432,14 +273,12 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
         (Err(e), _) | (_, Err(e)) => return poisoned(e),
     };
     let params = Params { m: d.rows as u32, w: d.cols as u32, batch: d.batch as u32 };
-    let args: [KernelArg<'_>; 4] = [a.into(), (&mut f).into(), (&mut perm).into(), uniform(&params)];
-    let result = match leaf_kind(ctx, d.rows) {
-        Leaf::Small => launch(ctx, "lu_small", "lu_small", small_source, per_matrix(ctx, d.batch), &args),
-        Leaf::Registers { threads, rows } if d.cols <= REG_COLS => launch(ctx, &format!("lu_regs/{threads}/{rows}/{}", subgroups(ctx)), "lu_regs", || reg_source(fence(ctx), threads, rows, subgroups(ctx)), per_matrix(ctx, d.batch), &args),
-        _ => {
-            let threads = panel_threads(ctx, d.rows);
-            launch(ctx, &format!("lu_panel/{threads}/{}", fence(ctx).len()), "lu_panel", || panel_source(fence(ctx), threads), per_matrix(ctx, d.batch), &args)
-        }
+    let args: [KernelArg<'_>; 4] = [view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)];
+    let result = if d.rows <= SMALL {
+        launch(ctx, "lu_small", "lu_small", small_source, per_matrix(ctx, d.batch), &args)
+    } else {
+        let threads = panel_threads(ctx, d.rows);
+        launch(ctx, &format!("lu_panel/{threads}/{}", fence(ctx).len()), "lu_panel", || panel_source(fence(ctx), threads), per_matrix(ctx, d.batch), &args)
     };
     match result {
         Ok(()) => Lu { lu: f, perm },
@@ -450,10 +289,10 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
 /// The recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Lu {
     let [w, m, ..] = a.shape().dims();
-    if w <= leaf_width(a.context(), m) {
+    if w <= leaf_width(m) {
         return leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc);
     }
-    let n1 = split_cols(w);
+    let n1 = split(w);
     let n2 = w - n1;
     let Lu { lu: f1, perm: p1 } = recurse(&block(a, 0..m, 0..n1), op, loc);
     let f1 = f1.cache();
@@ -485,7 +324,7 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, Shape::from(1), Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) },
     };
-    if d.cols <= leaf_width(ctx, d.rows) {
+    if d.cols <= leaf_width(d.rows) {
         return leaf(a, d, op, loc);
     }
     if d.batch > 1 {
