@@ -817,8 +817,8 @@ impl Context {
                             Builtin::Matmul { tile: crate::matmul::MatmulTile::Native { edge, lhs_t, rhs_t }, .. } => {
                                 Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t }))
                             }
-                            Builtin::Matmul { tile: crate::matmul::MatmulTile::Tensor { rows, cols, lhs_t, rhs_t }, .. } => {
-                                Some(kernel::Native::TensorMatmul(luma_core::TensorSpec { rows, cols, lhs_transposed: lhs_t, rhs_transposed: rhs_t }))
+                            Builtin::Matmul { tile: crate::matmul::MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact }, .. } => {
+                                Some(kernel::Native::Gemm(luma_core::GemmSpec { rows, cols, lhs_transposed: lhs_t, rhs_transposed: rhs_t, exact }))
                             }
                             Builtin::Bmm(_) if self.inner.tuning.native_gemm > 0 => Some(kernel::Native::BatchedMatmul),
                             _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),

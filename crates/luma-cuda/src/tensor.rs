@@ -2,7 +2,7 @@
 //! compiles the text).
 //!
 //! The kernel computes `C = A B` for the row-major `M x K` and `K x N` matrices of
-//! [`TensorSpec`] (or their transposes, stored as `K x M` / `N x K`), operands rounded to TF32
+//! [`GemmSpec`] (or their transposes, stored as `K x M` / `N x K`), operands rounded to TF32
 //! (10 bits of mantissa) and accumulated in `f32`. One workgroup computes a `rows x cols` tile of
 //! `C` and slices K in steps of the stage depth `bk` through a multi-stage `cp.async` pipeline of shared
 //! memory, each warp multiplying its sub-tile with `mma.sync.aligned.m16n8k8`. The launch is
@@ -10,7 +10,9 @@
 //! `{m, n, k, kc}`; the slice of grid layer `z` is written at `z * m * n` of `c`.
 //! `m`, `n` and `k` must be multiples of 4 (16-byte `cp.async` rows).
 
-use luma_core::TensorSpec;
+use luma_core::GemmSpec;
+
+use crate::ptx::Ptx;
 
 /// The shape of a kernel: output tile, warps and pipeline depth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +33,7 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    pub(crate) fn of(spec: &TensorSpec) -> Config {
+    pub(crate) fn of(spec: &GemmSpec) -> Config {
         let (wm, wn) = match (spec.rows, spec.cols) {
             (128, 128) => (2, 4),
             _ => (2, 2),
@@ -72,22 +74,6 @@ impl Config {
     pub(crate) fn shared_bytes(&self) -> u32 {
         self.stages * self.stage_bytes()
     }
-}
-
-struct Ptx {
-    text: String,
-}
-
-impl Ptx {
-    fn line(&mut self, s: impl AsRef<str>) {
-        self.text.push_str("    ");
-        self.text.push_str(s.as_ref());
-        self.text.push('\n');
-    }
-}
-
-macro_rules! p {
-    ($w:expr, $($arg:tt)*) => { $w.line(format!($($arg)*)) };
 }
 
 /// The PTX of the kernel `main` for `config`.
@@ -423,7 +409,7 @@ mod tests {
     fn every_tile_and_layout_generates_a_kernel() {
         for (rows, cols) in [(128, 128), (128, 64), (64, 128), (64, 64)] {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, false), (false, true), (true, true)] {
-                let config = Config::of(&TensorSpec { rows, cols, lhs_transposed, rhs_transposed });
+                let config = Config::of(&GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact: false });
                 let text = ptx(&config);
                 assert!(text.contains(".entry main(") && text.trim_end().ends_with('}'));
                 let (warp_rows, warp_cols) = (rows / config.wm, cols / config.wn);
@@ -445,7 +431,7 @@ mod tests {
         };
         for (rows, cols) in [(128, 128), (64, 64)] {
             for (lhs_transposed, rhs_transposed) in [(false, false), (true, true)] {
-                let config = Config::of(&TensorSpec { rows, cols, lhs_transposed, rhs_transposed });
+                let config = Config::of(&GemmSpec { rows, cols, lhs_transposed, rhs_transposed, exact: false });
                 let (sa, sb) = (config.a_stride(), config.b_stride());
                 assert!(if lhs_transposed { banks(sa, 1, sa) } else { banks(sa, sa, 1) }, "A stride {sa}");
                 assert!(if rhs_transposed { banks(sb, sb, 1) } else { banks(sb, 1, sb) }, "B stride {sb}");
