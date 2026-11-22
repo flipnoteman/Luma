@@ -34,6 +34,8 @@ struct Params {
     w: u32,
     k: u32,
     bs: u32,
+    /// Whether the factor launch also writes the unit lower `V`.
+    wv: u32,
 }
 
 /// How a panel of `m` rows is cut.
@@ -55,7 +57,7 @@ pub(crate) fn plan(ctx: &crate::Context, m: usize, w: usize) -> Option<Plan> {
     let limits = &ctx.info().limits;
     let cap = limits.max_workgroup_invocations.min(limits.max_workgroup_size[0]) as usize / 32;
     let gmax = cap.min(16);
-    if gmax < 2 || limits.max_storage_buffers < 10 {
+    if gmax < 2 || limits.max_storage_buffers < 12 {
         return None;
     }
     if m <= gmax * 32 {
@@ -147,13 +149,20 @@ fn factor_source(groups: usize, merge: bool) -> String {
         })
         .collect::<String>();
     let stores = each(|r| format!("    if ({r}u * {groups}u + g < nrows && c < w) {{ f[(out0 + {r}u * {groups}u + g) * w + c] = x{r}; }}\n"));
-    let src = "struct Params { m: u32, w: u32, k: u32, bs: u32 }
+    let vstores = (0..ROWS)
+        .map(|r| {
+            let v = if r < r0 { format!("select(select(0.0, 1.0, {} == c), x{r}, {} > c)", ri(r), ri(r)) } else { format!("x{r}") };
+            format!("        if ({r}u * {groups}u + g < nrows && c < w) {{ vo[(out0 + {r}u * {groups}u + g) * w + c] = {v}; }}\n")
+        })
+        .collect::<String>();
+    let src = "struct Params { m: u32, w: u32, k: u32, bs: u32, wv: u32 }
 @group(1) @binding(0) var<storage, read> a: array<f32>;
 @group(1) @binding(1) var<uniform> av: LumaView;
 @group(1) @binding(2) var<storage, read_write> f: array<f32>;
 @group(1) @binding(3) var<storage, read_write> tau: array<f32>;
 @group(1) @binding(4) var<storage, read_write> tf: array<f32>;
-@group(1) @binding(5) var<uniform> p: Params;
+@group(1) @binding(5) var<storage, read_write> vo: array<f32>;
+@group(1) @binding(6) var<uniform> p: Params;
 fn ld(i: u32, c: u32) -> f32 { return a[luma_view_idx3(av, c, i, 0u)]; }
 
 var<workgroup> vs: array<vec4<f32>, @B4@>;
@@ -211,7 +220,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 @SCALE@    if (t < 32u && t < w) {
         let ta = t;
 @TDECL@@TCOLS@    }
-@STORES@}
+@STORES@    if (p.wv != 0u) {
+@VSTORES@    }
+}
 ";
     src.replace("@B4@", &(bs / 4).to_string())
         .replace("@B@", &bs.to_string())
@@ -235,6 +246,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         .replace("@TDECL@", &tdecl)
         .replace("@TCOLS@", &tcols)
         .replace("@STORES@", &stores)
+        .replace("@VSTORES@", &vstores)
 }
 
 /// `dst[a][c] = fin(Σ_q ea(a, q) eb(q, c))` for 32 x 32 matrices in workgroup memory by `threads`
@@ -297,7 +309,7 @@ fn unit_lower(src: &str, at: &str, row: &str) -> String {
 fn recon_source() -> String {
     const THREADS: usize = 256;
     let mut s = String::from(
-        "struct Params { m: u32, w: u32, k: u32, bs: u32 }
+        "struct Params { m: u32, w: u32, k: u32, bs: u32, wv: u32 }
 @group(1) @binding(0) var<storage, read_write> f1: array<f32>;
 @group(1) @binding(1) var<storage, read_write> t1: array<f32>;
 @group(1) @binding(2) var<storage, read_write> f0: array<f32>;
@@ -306,7 +318,8 @@ fn recon_source() -> String {
 @group(1) @binding(5) var<storage, read_write> tau: array<f32>;
 @group(1) @binding(6) var<storage, read_write> tf: array<f32>;
 @group(1) @binding(7) var<storage, read_write> aux: array<f32>;
-@group(1) @binding(8) var<uniform> p: Params;
+@group(1) @binding(8) var<storage, read_write> vo: array<f32>;
+@group(1) @binding(9) var<uniform> p: Params;
 var<workgroup> m0: array<f32, 1024>;
 var<workgroup> m1: array<f32, 1024>;
 var<workgroup> m2: array<f32, 1024>;
@@ -398,6 +411,7 @@ fn main(@builtin(local_invocation_index) t: u32) {
         let a = idx / w;
         let c = idx - a * w;
         f[idx] = select(m0[a * 32u + c], sg[a] * f1[idx], a <= c);
+        vo[idx] = select(select(0.0, 1.0, a == c), m0[a * 32u + c], a > c);
     }
 }
 ";
@@ -411,13 +425,14 @@ fn main(@builtin(local_invocation_index) t: u32) {
 fn down_source() -> String {
     const THREADS: usize = CHUNK;
     let mut s = String::from(
-        "struct Params { m: u32, w: u32, k: u32, bs: u32 }
+        "struct Params { m: u32, w: u32, k: u32, bs: u32, wv: u32 }
 @group(1) @binding(0) var<storage, read_write> f0: array<f32>;
 @group(1) @binding(1) var<storage, read_write> t0: array<f32>;
 @group(1) @binding(2) var<storage, read_write> f1: array<f32>;
 @group(1) @binding(3) var<storage, read_write> aux: array<f32>;
 @group(1) @binding(4) var<storage, read_write> f: array<f32>;
-@group(1) @binding(5) var<uniform> p: Params;
+@group(1) @binding(5) var<storage, read_write> vo: array<f32>;
+@group(1) @binding(6) var<uniform> p: Params;
 var<workgroup> m0: array<f32, 1024>;
 var<workgroup> m1: array<f32, 1024>;
 var<workgroup> m2: array<f32, 1024>;
@@ -484,38 +499,42 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         }
         s += "        }\n";
     }
-    s += &(0..32).map(|c| format!("        if ({c}u < w) {{ f[gr * w + {c}u] = o{c}; }}\n")).collect::<String>();
+    s += &(0..32).map(|c| format!("        if ({c}u < w) {{ f[gr * w + {c}u] = o{c}; vo[gr * w + {c}u] = o{c}; }}\n")).collect::<String>();
     s += "    }\n}\n";
     s
 }
 
-/// `a` (`[w, m]`, `w <= 32`) factored into packed `qr` (`[w, m]`), `tau` (`[w, 1]`) and `t` (`[w, w]`).
-pub(crate) fn panel(a: &Array<f32>, plan: Plan) -> Result<(Array<f32>, Array<f32>, Array<f32>), LumaError> {
+/// `a` (`[w, m]`, `w <= 32`) factored into packed `qr` (`[w, m]`), `tau` (`[w, 1]`), `t` (`[w, w]`)
+/// and the unit lower trapezoid `v` of the reflectors (`[w, m]`, zeros above the diagonal).
+pub(crate) fn panel(a: &Array<f32>, plan: Plan) -> Result<[Array<f32>; 4], LumaError> {
     let ctx = a.context();
     let [w, m, ..] = a.shape().dims();
     let Plan { groups, bs, k } = plan;
-    let params = Params { m: m as u32, w: w as u32, k: k as u32, bs: bs as u32 };
+    let mut params = Params { m: m as u32, w: w as u32, k: k as u32, bs: bs as u32, wv: 0 };
     let mut f = Array::<f32>::alloc(ctx, a.shape())?;
+    let mut v = Array::<f32>::alloc(ctx, a.shape())?;
     let mut tau = Array::<f32>::alloc(ctx, Shape::from([w, 1, 1]))?;
     let mut t = Array::<f32>::alloc(ctx, Shape::from([w, w, 1]))?;
     if k == 1 {
-        let args: [KernelArg<'_>; 5] = [view(a), (&mut f).into(), (&mut tau).into(), (&mut t).into(), uniform(&params)];
+        params.wv = 1;
+        let args: [KernelArg<'_>; 6] = [view(a), (&mut f).into(), (&mut tau).into(), (&mut t).into(), (&mut v).into(), uniform(&params)];
         launch(ctx, &format!("tsqr_factor/0/{groups}"), "tsqr_leaf", || factor_source(groups, false), [1, 1, 1], &args)?;
-        return Ok((f, tau, t));
+        return Ok([f, v, tau, t]);
     }
+    let mut nov = Array::<f32>::alloc(ctx, Shape::from([1, 1, 1]))?;
     let mut f0 = Array::<f32>::alloc(ctx, Shape::from([w, m, 1]))?;
     let mut tau0 = Array::<f32>::alloc(ctx, Shape::from([w, k, 1]))?;
     let mut t0 = Array::<f32>::alloc(ctx, Shape::from([w, w * k, 1]))?;
-    let args: [KernelArg<'_>; 5] = [view(a), (&mut f0).into(), (&mut tau0).into(), (&mut t0).into(), uniform(&params)];
+    let args: [KernelArg<'_>; 6] = [view(a), (&mut f0).into(), (&mut tau0).into(), (&mut t0).into(), (&mut nov).into(), uniform(&params)];
     launch(ctx, &format!("tsqr_factor/0/{groups}"), "tsqr_leaf", || factor_source(groups, false), [k as u32, 1, 1], &args)?;
     let g2 = (k * w).div_ceil(32);
     let mut f1 = Array::<f32>::alloc(ctx, Shape::from([w, k * w, 1]))?;
     let mut tau1 = Array::<f32>::alloc(ctx, Shape::from([w, 1, 1]))?;
     let mut t1 = Array::<f32>::alloc(ctx, Shape::from([w, w, 1]))?;
-    let args: [KernelArg<'_>; 5] = [view(&f0), (&mut f1).into(), (&mut tau1).into(), (&mut t1).into(), uniform(&params)];
+    let args: [KernelArg<'_>; 6] = [view(&f0), (&mut f1).into(), (&mut tau1).into(), (&mut t1).into(), (&mut nov).into(), uniform(&params)];
     launch(ctx, &format!("tsqr_factor/1/{g2}"), "tsqr_merge", || factor_source(g2, true), [1, 1, 1], &args)?;
     let mut aux = Array::<f32>::alloc(ctx, Shape::from([32, 64, 1]))?;
-    let args: [KernelArg<'_>; 9] = [
+    let args: [KernelArg<'_>; 10] = [
         (&mut f1).into(),
         (&mut t1).into(),
         (&mut f0).into(),
@@ -524,10 +543,11 @@ pub(crate) fn panel(a: &Array<f32>, plan: Plan) -> Result<(Array<f32>, Array<f32
         (&mut tau).into(),
         (&mut t).into(),
         (&mut aux).into(),
+        (&mut v).into(),
         uniform(&params),
     ];
     launch(ctx, "tsqr_recon", "tsqr_recon", recon_source, [1, 1, 1], &args)?;
-    let args: [KernelArg<'_>; 6] = [(&mut f0).into(), (&mut t0).into(), (&mut f1).into(), (&mut aux).into(), (&mut f).into(), uniform(&params)];
+    let args: [KernelArg<'_>; 7] = [(&mut f0).into(), (&mut t0).into(), (&mut f1).into(), (&mut aux).into(), (&mut f).into(), (&mut v).into(), uniform(&params)];
     launch(ctx, "tsqr_down", "tsqr_down", down_source, [(k * bs.div_ceil(CHUNK)) as u32, 1, 1], &args)?;
-    Ok((f, tau, t))
+    Ok([f, v, tau, t])
 }
