@@ -37,7 +37,11 @@ const TY: u32 = 8;
 /// and its non-maximal suppression drops two more pixels.
 const EDGE: u32 = 22;
 /// Bins of the histogram that finds the cut of the Harris ranking.
-const BINS: u32 = 4096;
+const BINS: u32 = 16384;
+/// Bits of a key below its bin.
+const BIN_SHIFT: u32 = 18;
+/// Bins one invocation of the cut sums.
+const CHUNK: u32 = BINS / 256;
 /// The fraction of the pixels of a level that may be corners (ArrayFire's CUDA backend).
 const FAST_RATIO: f32 = 0.14;
 /// Workgroups of the selection and ranking launches (they loop over the candidates).
@@ -222,7 +226,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
             let hv = harris(row, col);
             out_pos[k] = u32(row) + p.h * u32(col);
             out_h[k] = hv;
-            atomicAdd(&hist[p.level * {BINS}u + (key(hv) >> 20u)], 1u);
+            atomicAdd(&hist[p.level * {BINS}u + (key(hv) >> {BIN_SHIFT}u)], 1u);
         }}
     }}
 }}
@@ -259,7 +263,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     let n = min(atomicLoad(&counters[p.level * 4u]), p.cap);
     let hb = p.level * {BINS}u;
     var sum = 0u;
-    for (var k = 0u; k < 16u; k++) {{ sum += hist[hb + t * 16u + k]; }}
+    for (var k = 0u; k < {CHUNK}u; k++) {{ sum += hist[hb + t * {CHUNK}u + k]; }}
     part[t] = sum;
     workgroupBarrier();
     if (t == 0u) {{
@@ -269,8 +273,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
             for (var c = 0u; c < 256u; c++) {{
                 let ci = 255u - c;
                 if (acc + part[ci] >= p.best) {{
-                    for (var b = 0u; b < 16u; b++) {{
-                        let bi = ci * 16u + 15u - b;
+                    for (var b = 0u; b < {CHUNK}u; b++) {{
+                        let bi = ci * {CHUNK}u + {CHUNK}u - 1u - b;
                         acc += hist[hb + bi];
                         if (acc >= p.best) {{ cut = bi; break; }}
                     }}
@@ -287,7 +291,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     let stride = nwg.x * nwg.y * 256u;
     for (var g = (wid.x + wid.y * nwg.x) * 256u + t; g < n; g += stride) {{
         let h = cand_h[g];
-        if ((key(h) >> 20u) >= cut) {{
+        if ((key(h) >> {BIN_SHIFT}u) >= cut) {{
             let k = atomicAdd(&counters[p.level * 4u + 1u], 1u);
             sel_pos[k] = cand_pos[g];
             sel_h[k] = h;
