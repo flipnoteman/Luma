@@ -58,15 +58,19 @@ pub(crate) fn plan(ctx: &crate::Context, m: usize, w: usize) -> Option<Plan> {
     if gmax < 2 || limits.max_storage_buffers < 10 {
         return None;
     }
-    let bs = gmax * 32;
-    if m <= bs {
-        return Some(Plan { groups: m.div_ceil(32), bs, k: 1 });
+    if m <= gmax * 32 {
+        return Some(Plan { groups: m.div_ceil(32), bs: gmax * 32, k: 1 });
     }
-    let k = m.div_ceil(bs);
-    // One workgroup factors the stack of the `R`s, and the matrices of the other launches live in
-    // workgroup memory.
+    // Blocks of `groups` x 32 rows and a stack of `k` `R`s: the two factorisations cost about their rows.
+    let (groups, _) = (2..=gmax)
+        .rev()
+        .filter(|&g| m.div_ceil(g * 32) * w <= gmax * 32)
+        .map(|g| (g, g + (m.div_ceil(g * 32) * w).div_ceil(32)))
+        .min_by_key(|&(_, cost)| cost)?;
+    let bs = groups * 32;
+    // The matrices of the other launches live in workgroup memory.
     let smem = 4 * 1024 * 5 + 1024;
-    (k * w <= bs && limits.max_workgroup_storage_bytes as usize >= smem).then_some(Plan { groups: gmax, bs, k })
+    (limits.max_workgroup_storage_bytes as usize >= smem).then_some(Plan { groups, bs, k: m.div_ceil(bs) })
 }
 
 /// The loop over the columns of a block factorisation: `rows` are the unrolled thread rows.
@@ -74,7 +78,10 @@ fn each(f: impl Fn(usize) -> String) -> String {
     (0..ROWS).map(f).collect()
 }
 
-/// A block (or the stack of `R`s, `merge`) factored in registers: see the module docs.
+/// A block (or the stack of `R`s, `merge`) factored in registers: see the module docs. Only the
+/// first group of 32 rows holds the diagonal of the column being reduced, the others need no
+/// masks; the Householder vectors stay unscaled (`raw`) in their column until the end, when every
+/// lane multiplies its column by the `1 / (alpha - beta)` it kept.
 fn factor_source(groups: usize, merge: bool) -> String {
     let bs = groups * 32;
     let prologue = if merge {
@@ -89,26 +96,43 @@ fn factor_source(groups: usize, merge: bool) -> String {
         format!("    let row0 = blk * p.bs;\n    let nrows = min(p.bs, p.m - row0);\n    let out0 = row0;\n    if (c < w) {{\n{rows}    }}\n")
     };
     let decl = each(|r| format!("    var x{r} = 0.0;\n"));
-    let owner = each(|r| {
-        format!(
-            "            let y{r} = select(0.0, x{r}, lb + {r}u > j);\n            sq = fma(y{r}, y{r}, sq);\n            ap = ap + select(0.0, x{r}, lb + {r}u == j);\n"
-        )
-    });
+    let owner = (0..ROWS)
+        .map(|r| format!("                let y{r} = select(0.0, x{r}, {r}u > j);\n                sq{} = fma(y{r}, y{r}, sq{});\n                ap = ap + select(0.0, x{r}, {r}u == j);\n", r % 2, r % 2))
+        .collect::<String>();
+    let owner_plain = (0..ROWS).map(|r| format!("                sq{} = fma(x{r}, x{r}, sq{});\n", r % 2, r % 2)).collect::<String>();
     let publish = (0..ROWS / 4)
         .map(|q| format!("            vs[g * 8u + {q}u] = vec4<f32>(x{}, x{}, x{}, x{});\n", 4 * q, 4 * q + 1, 4 * q + 2, 4 * q + 3))
         .collect::<String>();
-    let sums = (0..groups).map(|q| format!("        xn2 = xn2 + redq[{q}];\n        alpha = alpha + reda[{q}];\n")).collect::<String>();
+    let sums = {
+        let mut acc = String::new();
+        for a in 0..4 {
+            acc += &format!("        var xs{a} = 0.0;\n");
+        }
+        for q in 0..groups {
+            acc += &format!("        xs{} = xs{} + redq[{q}];\n", q % 4, q % 4);
+        }
+        acc + "        let xn2 = (xs0 + xs1) + (xs2 + xs3);\n"
+    };
     let raws = (0..ROWS / 4).map(|q| format!("        let raw{q} = vs[g * 8u + {q}u];\n")).collect::<String>();
-    let dots = each(|r| {
-        format!(
-            "        let u{r} = select(select(0.0, 1.0, lb + {r}u == j), raw{}[{}] * inv, lb + {r}u > j);\n        d = fma(u{r}, x{r}, d);\n",
-            r / 4,
-            r % 4
-        )
-    });
-    let gsum = (0..groups).map(|q| format!("        s = s + part[{}u + c];\n", q * 32)).collect::<String>();
-    let apply = each(|r| format!("            x{r} = fma(-wc, u{r}, x{r});\n"));
-    let fin = each(|r| format!("            x{r} = select(x{r}, select(beta, u{r}, lb + {r}u > j), lb + {r}u >= j);\n"));
+    // The unit-scaled `v` of a row of the first group (masked) and the plain `raw` rows of the others.
+    let u = |r: usize| format!("select(select(0.0, 1.0, {r}u == j), raw{}[{}] * inv, {r}u > j)", r / 4, r % 4);
+    let dots = (0..ROWS).map(|r| format!("            d{} = fma({}, x{r}, d{});\n", r % 4, u(r), r % 4)).collect::<String>();
+    let dots_plain = (0..ROWS).map(|r| format!("            d{} = fma(raw{}[{}], x{r}, d{});\n", r % 4, r / 4, r % 4, r % 4)).collect::<String>();
+    let gsum = {
+        let mut acc = String::new();
+        for a in 0..4 {
+            acc += &format!("        var ss{a} = 0.0;\n");
+        }
+        for q in 0..groups {
+            acc += &format!("        ss{} = ss{} + part[{}u + c];\n", q % 4, q % 4, q * 32);
+        }
+        acc + "        let s = (ss0 + ss1) + (ss2 + ss3);\n"
+    };
+    let apply = (0..ROWS).map(|r| format!("                x{r} = fma(-wc, {}, x{r});\n", u(r))).collect::<String>();
+    let apply_plain = each(|r| format!("                x{r} = fma(-wi, raw{}[{}], x{r});\n", r / 4, r % 4));
+    let pivot = each(|r| format!("                x{r} = select(x{r}, beta, {r}u == j);\n"));
+    let scale = (0..ROWS).map(|r| format!("        x{r} = select(x{r}, x{r} * myinv, {r}u > c);\n")).collect::<String>();
+    let scale_plain = each(|r| format!("        x{r} = x{r} * myinv;\n"));
     let tdecl = each(|r| format!("        var tr{r} = 0.0;\n"));
     let tcols = (0..ROWS)
         .map(|j| {
@@ -130,7 +154,7 @@ fn ld(i: u32, c: u32) -> f32 { return a[luma_view_idx3(av, c, i, 0u)]; }
 
 var<workgroup> vs: array<vec4<f32>, @B4@>;
 var<workgroup> redq: array<f32, @G@>;
-var<workgroup> reda: array<f32, @G@>;
+var<workgroup> alphas: f32;
 var<workgroup> part: array<f32, @GP@>;
 var<workgroup> dds: array<f32, 1024>;
 var<workgroup> tauv: array<f32, 32>;
@@ -142,18 +166,22 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let g = t / 32u;
     let c = t % 32u;
     let lb = g * 32u;
+    var myinv = 0.0;
 @DECL@@PROLOGUE@
     for (var j = 0u; j < w; j = j + 1u) {
         if (c == j) {
-            var sq = 0.0;
-            var ap = 0.0;
-@OWNER@@PUBLISH@            redq[g] = sq;
-            reda[g] = ap;
+            var sq0 = 0.0;
+            var sq1 = 0.0;
+            if (g == 0u) {
+                var ap = 0.0;
+@OWNER@                alphas = ap;
+            } else {
+@OWNERP@            }
+@PUBLISH@            redq[g] = sq0 + sq1;
         }
         workgroupBarrier();
-        var xn2 = 0.0;
-        var alpha = 0.0;
-@SUMS@        var beta = alpha;
+@SUMS@        let alpha = alphas;
+        var beta = alpha;
         var tj = 0.0;
         var inv = 0.0;
         if (xn2 != 0.0) {
@@ -162,19 +190,38 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
             tj = (beta - alpha) / beta;
             inv = 1.0 / (alpha - beta);
         }
-        var d = 0.0;
-@RAWS@@DOTS@        part[g * 32u + c] = d;
+@RAWS@        var d0 = 0.0;
+        var d1 = 0.0;
+        var d2 = 0.0;
+        var d3 = 0.0;
+        if (g == 0u) {
+@DOTS@        } else {
+@DOTSP@            d0 = d0 * inv;
+            d1 = d1 * inv;
+            d2 = d2 * inv;
+            d3 = d3 * inv;
+        }
+        part[g * 32u + c] = (d0 + d1) + (d2 + d3);
         workgroupBarrier();
-        var s = 0.0;
 @GSUM@        if (c > j) {
             let wc = tj * s;
-@APPLY@        }
+            if (g == 0u) {
+@APPLY@            } else {
+                let wi = wc * inv;
+@APPLYP@            }
+        }
         if (c == j) {
-@FIN@        }
-        if (g == 0u) { dds[j * 32u + c] = s; }
+            myinv = inv;
+            if (g == 0u) {
+@PIVOT@            }
+        }
+        if (g == 0u) { dds[j * 32u + c] = s * myinv; }
         if (t == 0u) { tauv[j] = tj; }
     }
     workgroupBarrier();
+    if (g == 0u) {
+@SCALE@    } else {
+@SCALEP@    }
     if (t < 32u && t < w) {
         let ta = t;
 @TDECL@@TCOLS@    }
@@ -186,14 +233,19 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         .replace("@G@", &groups.to_string())
         .replace("@DECL@", &decl)
         .replace("@PROLOGUE@", &prologue)
+        .replace("@OWNERP@", &owner_plain)
         .replace("@OWNER@", &owner)
         .replace("@PUBLISH@", &publish)
         .replace("@SUMS@", &sums)
         .replace("@RAWS@", &raws)
+        .replace("@DOTSP@", &dots_plain)
         .replace("@DOTS@", &dots)
         .replace("@GSUM@", &gsum)
+        .replace("@APPLYP@", &apply_plain)
         .replace("@APPLY@", &apply)
-        .replace("@FIN@", &fin)
+        .replace("@PIVOT@", &pivot)
+        .replace("@SCALEP@", &scale_plain)
+        .replace("@SCALE@", &scale)
         .replace("@TDECL@", &tdecl)
         .replace("@TCOLS@", &tcols)
         .replace("@STORES@", &stores)
@@ -228,19 +280,24 @@ fn mm(threads: usize, dst: &str, ea: &str, eb: &str, fin: &str) -> String {
     )
 }
 
-/// A `w x w` matrix `expr(a, c)` (where `cond`) into the 32 x 32 `dst` (zero outside).
-fn load(threads: usize, dst: &str, cond: &str, expr: &str) -> String {
-    format!(
-        "    for (var idx = t; idx < 1024u; idx = idx + {threads}u) {{
-        let a = idx / 32u;
-        let c = idx % 32u;
-        var v = 0.0;
-        if (a < w && c < w && {cond}) {{ v = {expr}; }}
-        {dst}[idx] = v;
-    }}
-    workgroupBarrier();
-"
-    )
+/// Issues the loads of the `w x w` matrix `expr(a, c)` (where `cond`) for the elements `idx = t + THREADS e` of a
+/// 32 x 32 matrix into registers `name0..`; [`store`] puts them in workgroup memory later.
+fn fetch(threads: usize, name: &str, cond: &str, expr: &str) -> String {
+    (0..1024 / threads)
+        .map(|e| {
+            format!(
+                "    var {name}{e} = 0.0;\n    {{\n        let idx = t + {}u;\n        let a = idx / 32u;\n        let c = idx % 32u;\n        if (a < w && c < w && {cond}) {{ {name}{e} = {expr}; }}\n    }}\n",
+                e * threads
+            )
+        })
+        .collect()
+}
+
+/// Stores the registers of [`fetch`] in `dst` and waits.
+fn store(threads: usize, dst: &str, name: &str) -> String {
+    let mut s: String = (0..1024 / threads).map(|e| format!("    {dst}[t + {}u] = {name}{e};\n", e * threads)).collect();
+    s += "    workgroupBarrier();\n";
+    s
 }
 
 /// The entry `(row, c)` of the unit lower trapezoid of a packed factor `src` (rows of stride `w`), stored at row `at`.
@@ -269,43 +326,63 @@ var<workgroup> m1: array<f32, 1024>;
 var<workgroup> m2: array<f32, 1024>;
 var<workgroup> m3: array<f32, 1024>;
 var<workgroup> sg: array<f32, 32>;
+var<workgroup> pr: array<f32, 64>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) t: u32) {
     let w = p.w;
 ",
     );
+    s += &fetch(THREADS, "ft", "true", "t1[a * w + c]");
+    s += &fetch(THREADS, "fv", "true", &unit_lower("f1", "a", "a"));
+    s += &fetch(THREADS, "gv", "true", &unit_lower("f0", "a", "a"));
+    s += &fetch(THREADS, "gt", "true", "t0[a * w + c]");
     // m0 = T', m1 = V1' (unit lower).
-    s += &load(THREADS, "m0", "true", "t1[a * w + c]");
-    s += &load(THREADS, "m1", "true", &unit_lower("f1", "a", "a"));
+    s += &store(THREADS, "m0", "ft");
+    s += &store(THREADS, "m1", "fv");
     // Y = T' V1'ᵀ (kept in m2 and in aux).
     s += &mm(THREADS, "m2", "m0[@A@ * 32u + @Q@]", "m1[@C@ * 32u + @Q@]", "@ACC@");
     s += "    for (var idx = t; idx < 1024u; idx = idx + 256u) { aux[idx] = m2[idx]; }\n";
     // X0 = I - V1' Y (m3).
     s += &mm(THREADS, "m3", "m1[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@) - @ACC@");
     // The first block's top: m0 = V01 (unit lower), m1 = T0.
-    s += &load(THREADS, "m0", "true", &unit_lower("f0", "a", "a"));
-    s += &load(THREADS, "m1", "true", "t0[a * w + c]");
+    s += &store(THREADS, "m0", "gv");
+    s += &store(THREADS, "m1", "gt");
     // P = T0 V01ᵀ (m2), M = I - V01 P (m1), Q1top = M X0 (m0).
     s += &mm(THREADS, "m2", "m1[@A@ * 32u + @Q@]", "m0[@C@ * 32u + @Q@]", "@ACC@");
     s += &mm(THREADS, "m1", "m0[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@) - @ACC@");
     s += &mm(THREADS, "m0", "m1[@A@ * 32u + @Q@]", "m3[@Q@ * 32u + @C@]", "@ACC@");
-    // No pivot LU of Q1top - S, S chosen on the fly (in place: L below, U on and above the diagonal).
-    s += "    for (var j = 0u; j < w; j = j + 1u) {
-        let d = m0[j * 32u + j];
-        let sj = select(1.0, -1.0, d >= 0.0);
-        let pv = d - sj;
-        var l = 0.0;
-        if (t > j && t < w) { l = m0[t * 32u + j] / pv; }
+    // No pivot LU of Q1top - S, S chosen on the fly: a thread per row, the pivot row through `pr`.
+    s += "    var r0 = 0.0;\n";
+    s += &(1..32).map(|k| format!("    var r{k} = 0.0;\n")).collect::<String>();
+    s += "    if (t < 32u) {\n";
+    s += &(0..32).map(|k| format!("        r{k} = m0[t * 32u + {k}u];\n")).collect::<String>();
+    s += "    }\n";
+    for j in 0..32 {
+        let par = (j % 2) * 32;
+        let publish = (j + 1..32).map(|k| format!("            pr[{}u] = r{k};\n", par + k)).collect::<String>();
+        let update = (j + 1..32).map(|k| format!("            r{k} = r{k} - l * pr[{}u];\n", par + k)).collect::<String>();
+        s += &format!(
+            "    if ({j}u < w) {{
+        if (t == {j}u) {{
+            let sj = select(1.0, -1.0, r{j} >= 0.0);
+            let pv = r{j} - sj;
+            pr[{par}u + {j}u] = pv;
+            sg[{j}u] = sj;
+            r{j} = pv;
+{publish}        }}
         workgroupBarrier();
-        if (t == j) { m0[j * 33u] = pv; sg[j] = sj; }
-        if (t > j && t < w) {
-            m0[t * 32u + j] = l;
-            for (var k = j + 1u; k < w; k = k + 1u) { m0[t * 32u + k] = m0[t * 32u + k] - l * m0[j * 32u + k]; }
-        }
-        workgroupBarrier();
+        if (t > {j}u && t < w) {{
+            let l = r{j} / pr[{par}u + {j}u];
+            r{j} = l;
+{update}        }}
+    }}
+"
+        );
     }
-";
+    s += "    if (t < w) {\n";
+    s += &(0..32).map(|k| format!("        m0[t * 32u + {k}u] = r{k};\n")).collect::<String>();
+    s += "    }\n    workgroupBarrier();\n";
     // T = -U S L⁻ᵀ by rows (a warp), U⁻¹ by columns (another).
     let trow = (0..32)
         .map(|k| {
@@ -364,22 +441,41 @@ var<workgroup> nv: array<vec4<f32>, 256>;
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let w = p.w;
-    let row0 = wid.x * 128u;
-    let blk = row0 / p.bs;
-    let l0 = row0 - blk * p.bs;
+    let cpb = (p.bs + 127u) / 128u;
+    let blk = wid.x / cpb;
+    let l0 = (wid.x - blk * cpb) * 128u;
+    let l = l0 + t;
+    let gr = blk * p.bs + l;
+    let mine = l < p.bs && gr < p.m && gr >= w;
+    let top = l < w;
 ",
     );
+    s += &fetch(THREADS, "fv", "true", &unit_lower("f1", "(blk * w + a)", "(blk * w + a)"));
+    s += &fetch(THREADS, "fy", "true", "aux[idx]");
+    s += &fetch(THREADS, "gv", "blk * p.bs + a < p.m", &unit_lower("f0", "(blk * p.bs + a)", "a"));
+    s += &fetch(THREADS, "gt", "true", "t0[blk * w * w + a * w + c]");
+    s += &fetch(THREADS, "gu", "true", "aux[1024u + idx]");
+    // The thread's row of the block's `V`.
+    s += &(0..32).map(|q| format!("    var v{q} = 0.0;\n")).collect::<String>();
+    s += "    if (mine) {\n";
+    s += &(0..32)
+        .map(|q| {
+            let masked = format!("if (top) {{ v{q} = select(select(0.0, 1.0, {q}u == l), v{q}, {q}u < l); }}");
+            format!("        if ({q}u < w) {{ v{q} = f0[gr * w + {q}u]; {masked} }}\n")
+        })
+        .collect::<String>();
+    s += "    }\n";
     // X_i = [I; 0]_i - V'_i Y.
-    s += &load(THREADS, "m1", "true", &unit_lower("f1", "(blk * w + a)", "(blk * w + a)"));
-    s += &load(THREADS, "m2", "true", "aux[idx]");
+    s += &store(THREADS, "m1", "fv");
+    s += &store(THREADS, "m2", "fy");
     s += &mm(THREADS, "m0", "m1[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@ && blk == 0u) - @ACC@");
     // Z = V_{i,1}ᵀ X_i, W = T_i Z.
-    s += &load(THREADS, "m1", "blk * p.bs + a < p.m", &unit_lower("f0", "(blk * p.bs + a)", "a"));
+    s += &store(THREADS, "m1", "gv");
     s += &mm(THREADS, "m2", "m1[@Q@ * 32u + @A@]", "m0[@Q@ * 32u + @C@]", "@ACC@");
-    s += &load(THREADS, "m1", "true", "t0[blk * w * w + a * w + c]");
+    s += &store(THREADS, "m1", "gt");
     s += &mm(THREADS, "m3", "m1[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "@ACC@");
     // N = -W U⁻¹ (m2), X_i U⁻¹ (m3) where the rows of the block's top are rewritten.
-    s += &load(THREADS, "m1", "true", "aux[1024u + idx]");
+    s += &store(THREADS, "m1", "gu");
     s += &mm(THREADS, "m2", "m3[@A@ * 32u + @Q@]", "m1[@Q@ * 32u + @C@]", "-@ACC@");
     s += "    if (blk > 0u && l0 == 0u) {\n";
     s += &mm(THREADS, "m3", "m0[@A@ * 32u + @Q@]", "m1[@Q@ * 32u + @C@]", "@ACC@");
@@ -388,24 +484,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         nv[q4] = vec4<f32>(m2[4u * q4], m2[4u * q4 + 1u], m2[4u * q4 + 2u], m2[4u * q4 + 3u]);
     }
     workgroupBarrier();
-    let l = l0 + t;
-    let gr = row0 + t;
-    if (gr < p.m && gr >= w) {
-        let top = l < w;
+    if (mine) {
 ";
     s += &(0..32).map(|c| format!("        var o{c} = select(0.0, m3[min(l, 31u) * 32u + {c}u], top);\n")).collect::<String>();
-    s += "        for (var q = 0u; q < w; q = q + 1u) {
-            var v = f0[gr * w + q];
-            if (top) { v = select(select(0.0, 1.0, q == l), v, q < l); }
-";
-    for c4 in 0..8 {
-        s += &format!("            let n{c4} = nv[q * 8u + {c4}u];\n");
-        for e in 0..4 {
-            let c = 4 * c4 + e;
-            s += &format!("            o{c} = fma(v, n{c4}[{e}], o{c});\n");
+    for q in 0..32 {
+        s += "        {\n";
+        for c4 in 0..8 {
+            s += &format!("            let n{c4} = nv[{}u];\n", q * 8 + c4);
+            for e in 0..4 {
+                let c = 4 * c4 + e;
+                s += &format!("            o{c} = fma(v{q}, n{c4}[{e}], o{c});\n");
+            }
         }
+        s += "        }\n";
     }
-    s += "        }\n";
     s += &(0..32).map(|c| format!("        if ({c}u < w) {{ f[gr * w + {c}u] = o{c}; }}\n")).collect::<String>();
     s += "    }\n}\n";
     s
@@ -450,6 +542,6 @@ pub(crate) fn panel(a: &Array<f32>, plan: Plan) -> Result<(Array<f32>, Array<f32
     ];
     launch(ctx, "tsqr_recon", "tsqr_recon", recon_source, [1, 1, 1], &args)?;
     let args: [KernelArg<'_>; 6] = [(&mut f0).into(), (&mut t0).into(), (&mut f1).into(), (&mut aux).into(), (&mut f).into(), uniform(&params)];
-    launch(ctx, "tsqr_down", "tsqr_down", down_source, [m.div_ceil(CHUNK) as u32, 1, 1], &args)?;
+    launch(ctx, "tsqr_down", "tsqr_down", down_source, [(k * bs.div_ceil(CHUNK)) as u32, 1, 1], &args)?;
     Ok((f, tau, t))
 }
