@@ -1001,7 +1001,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "luma"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "luma-hal-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "log",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "luma-hal-cpu"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "luma-hal-cuda"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "cudarc",
  "libloading 0.8.6",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "luma-hal-metal"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "block2",
  "bytemuck",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "luma-hal-wgpu"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ash",
  "bytemuck",
