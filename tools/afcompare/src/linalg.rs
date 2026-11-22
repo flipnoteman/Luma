@@ -149,7 +149,9 @@ fn on(name: &str) -> bool {
 
 pub fn linalg(b: &mut Bench) {
     b.guarded("linalg", |b| {
-        let groups: [(&str, fn(&mut Bench)); 11] = [
+        let groups: [(&str, fn(&mut Bench)); 13] = [
+            ("hostprobe", host_probe),
+            ("launchprobe", launch_probe),
             ("mmprobe", mm_probe),
             ("cholprobe", chol_probe),
             ("cholesky", cholesky),
@@ -168,6 +170,98 @@ pub fn linalg(b: &mut Bench) {
             }
         }
     });
+}
+
+/// `LINALG_ROWS=hostprobe`: host time (until `eval` returns: building the graph and issuing the launches) against
+/// the wall time to the end of the GPU work, of every factorisation and solve, with the launches and the GPU
+/// time of a profiled call. Minimum and median of 21 calls.
+fn host_probe(b: &mut Bench) {
+    let ctx = b.ctx.clone();
+    let stat = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[0], v[v.len() / 2])
+    };
+    for n in sizes(b) {
+        let spd = lumax::arr(&ctx, &dd_spd(n, 70 + n as u64), [n, n]);
+        let gen_a = lumax::arr(&ctx, &gen_mat(n, 62 + n as u64), [n, n]);
+        let rhs = lumax::arr(&ctx, &uniform(n, 83, -1.0, 1.0), [1, n]);
+        let rhs16 = lumax::arr(&ctx, &uniform(16 * n, 84, -1.0, 1.0), [16, n]);
+        let lower = lumax::arr(&ctx, &dd_spd(n, 71 + n as u64), [n, n]).cholesky().cache();
+        let lu = gen_a.lu();
+        let _ = (lower.eval(), lu.lu.eval());
+        ctx.sync().unwrap();
+        let ops: Vec<(&str, Box<dyn Fn()>)> = vec![
+            ("cholesky", Box::new(|| drop(spd.cholesky().eval()))),
+            ("solve_spd", Box::new(|| drop(spd.solve_spd(&rhs).eval()))),
+            ("trsm 16", Box::new(|| drop(lower.solve_triangular(&rhs16, luma::Triangle::Lower, false, false).eval()))),
+            ("lu", Box::new(|| drop(gen_a.lu().lu.eval()))),
+            ("lu solve 1", Box::new(|| drop(lu.solve(&rhs).eval()))),
+            ("solve", Box::new(|| drop(gen_a.solve(&rhs).eval()))),
+            ("inverse", Box::new(|| drop(gen_a.inverse().eval()))),
+            ("qr", Box::new(|| drop(gen_a.qr().qr.eval()))),
+        ];
+        for (name, f) in &ops {
+            for _ in 0..4 {
+                f();
+                ctx.sync().unwrap();
+            }
+            let (mut enq, mut total) = (Vec::new(), Vec::new());
+            for _ in 0..21 {
+                let t0 = std::time::Instant::now();
+                f();
+                let t1 = t0.elapsed();
+                ctx.sync().unwrap();
+                enq.push(t1.as_secs_f64() * 1e6);
+                total.push(t0.elapsed().as_secs_f64() * 1e6);
+            }
+            let prof = ctx.profile(&mut || {
+                f();
+            });
+            let (launches, gpu) = prof.map(|(_, p)| (p.launches(), p.total().as_secs_f64() * 1e6)).unwrap_or((0, 0.0));
+            let (e, t) = (stat(&mut enq), stat(&mut total));
+            println!("hostprobe {name:<11} n={n:<5} enqueue min {:>8.1} med {:>8.1} us | total min {:>8.1} med {:>8.1} us | {launches} launches, profiled GPU {gpu:.1} us", e.0, e.1, t.0, t.1);
+        }
+    }
+}
+
+/// `LINALG_ROWS=launchprobe`: cost of a launch in a chain of dependent tiny kernels: issued one by one, and
+/// replayed by `iterate` (the traced launches, as one graph where the backend has them).
+fn launch_probe(b: &mut Bench) {
+    let ctx = b.ctx.clone();
+    for len in [1024usize, 1 << 20] {
+        let x0 = lumax::arr(&ctx, &uniform(len, 5, 0.0, 1.0), [len]);
+        for steps in [100usize, 1000] {
+            let eager = || {
+                let mut x = x0.clone();
+                for _ in 0..steps {
+                    x = (&x * 1.0001f32 + 0.1f32).cache();
+                }
+                x.eval().unwrap();
+                ctx.sync().unwrap();
+            };
+            let replay = || {
+                let x = x0.iterate(steps, |x| (x * 1.0001f32 + 0.1f32).cache());
+                x.eval().unwrap();
+                ctx.sync().unwrap();
+            };
+            let mut t = [Vec::new(), Vec::new()];
+            for _ in 0..3 {
+                eager();
+                replay();
+            }
+            for r in 0..15 {
+                for k in [r % 2, 1 - r % 2] {
+                    let t0 = std::time::Instant::now();
+                    if k == 0 { eager() } else { replay() }
+                    t[k].push(t0.elapsed().as_secs_f64() * 1e6 / steps as f64);
+                }
+            }
+            for v in &mut t {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            }
+            println!("launchprobe len {len:<8} steps {steps:<5}: eager {:.2} us/launch (min {:.2}), iterate {:.2} us/launch (min {:.2})", t[0][7], t[0][0], t[1][7], t[1][0]);
+        }
+    }
 }
 
 /// `LINALG_ROWS=mmprobe`: wall time of `matmul_f32` (A Bᵀ, as the blocked factorisations take it) over the
