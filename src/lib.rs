@@ -141,6 +141,8 @@ pub use linalg::{
 };
 pub use bmm::matmul_batched;
 pub use dense::lu::Lu;
+pub use dense::eigh::Eigh;
+pub use dense::svd::Svd;
 pub use dense::Triangle;
 pub use matmul::{matmul, matmul_f32, matmul_tf32};
 pub use jit::fusion_limit;
