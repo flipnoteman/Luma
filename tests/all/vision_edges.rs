@@ -114,7 +114,7 @@ fn mean_shift_matches_the_walk() {
         assert_eq!(got, mean_shift_ref(&data, h, w, 1, planes, s, c, iters), "{h}x{w}x{planes} sigma {s} {c} iterations {iters}");
     }
     // Colour images: [H, W, 3] and a batch of two.
-    for (h, w, batch, shape, s, c, iters) in [(13, 17, 1, [13, 17, 3, 1], 1.0f32, 40.0f32, 2u32), (10, 12, 2, [10, 12, 3, 2], 2.0, 60.0, 5)] {
+    for (h, w, batch, shape, s, c, iters) in [(13, 17, 1, [13, 17, 3, 1], 1.0f32, 40.0f32, 2u32), (10, 12, 2, [10, 12, 3, 2], 2.0, 60.0, 5), (30, 34, 1, [30, 34, 3, 1], 6.0, 80.0, 4)] {
         let data = scene(h, w, 3 * batch, 21);
         let img = Array::from_slice_on(&ctx, &data, shape).unwrap();
         let got = img.mean_shift(s, c, iters, true).to_vec().unwrap();
@@ -472,3 +472,4 @@ fn canny_edge_cases() {
     assert_eq!(out, canny_ref(&both, 40, 40, 2, false, 0.1, 0.3, false));
     assert!(out[1600..].iter().filter(|&&b| b).count() < out[..1600].iter().filter(|&&b| b).count());
 }
+

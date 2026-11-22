@@ -121,5 +121,5 @@ all zero, like in ArrayFire.
 A workgroup stages the pixels around its 16 x 16 tile (as far as workgroup memory allows, up to
 `r`) and the first step of every walk reads only from there; later steps move the window and read
 global memory through the cache, so any number of steps stays exact. The result is bit-identical
-to ArrayFire's (both backends of ArrayFire agree here) up to the rounding of the division by the
-pixel count on the GPU.
+to ArrayFire's (both backends of ArrayFire agree here); the reciprocal of the pixel count, whose
+rounding decides the truncations, is corrected to the correctly rounded value on every backend.

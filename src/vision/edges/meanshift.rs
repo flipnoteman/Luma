@@ -24,7 +24,7 @@ use crate::vision::{invalid, Kernel as Any};
 
 const TILE: u32 = 16;
 /// Words of workgroup memory the staged window may take.
-const TILE_WORDS: u32 = 3072;
+const TILE_WORDS: u32 = 4096;
 
 /// One kernel: the channel count and the staged halo are literals.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -35,34 +35,76 @@ pub(crate) struct Kernel {
 
 /// The staged halo of a window radius `r` for `channels` channels.
 fn halo_for(radius: u32, channels: u32) -> u32 {
+    // A colour pixel takes a `vec4`.
+    let words = if channels == 3 { 4 } else { 1 };
     let mut halo = radius.min(32);
-    while halo > 0 && channels * (TILE + 2 * halo) * (TILE + 2 * halo) > TILE_WORDS {
+    while halo > 0 && words * (TILE + 2 * halo) * (TILE + 2 * halo) > TILE_WORDS {
         halo -= 1;
     }
     halo
 }
 
 /// The WGSL: arguments `src`, `dst`, uniform `{h, w, tiles_y, iters, radius, cvar, _, _}`.
+///
+/// A colour tile holds one `vec4` per pixel (the three channels and a pad), so that a tap is a
+/// single 16-byte load; the window of a step is cut at the image once and, if it lies inside the
+/// staged region, walked in workgroup memory without any further test.
 pub(crate) fn source(k: Kernel) -> String {
     let ch = u32::from(k.channels);
+    let color = ch == 3;
     let halo = u32::from(k.halo);
     let tw = TILE + 2 * halo;
-    let words = ch * tw * tw;
+    let sq = tw * tw;
     let mut s = String::new();
     s.push_str("struct Params { h: u32, w: u32, tiles_y: u32, iters: u32, radius: i32, cvar: f32, a: u32, b: u32 }\n");
     s.push_str("@group(1) @binding(0) var<storage, read> src: array<f32>;\n");
     s.push_str("@group(1) @binding(1) var<storage, read_write> dst: array<f32>;\n");
     s.push_str("@group(1) @binding(2) var<uniform> p: Params;\n");
-    let _ = writeln!(s, "var<workgroup> tile: array<f32, {words}>;");
+    let (vt, zero) = if color { ("vec3<f32>", "vec3<f32>(0.0)") } else { ("f32", "0.0") };
+    let tile_ty = if color { "vec4<f32>" } else { "f32" };
+    let _ = writeln!(s, "var<workgroup> tile: array<{tile_ty}, {sq}>;");
+    // The pixel at (ti, tj) from global memory.
+    let load = |ti: &str, tj: &str| -> String {
+        if color {
+            format!("vec3<f32>(src[base + u32({ti}) + p.h * u32({tj})], src[base + p.h * p.w + u32({ti}) + p.h * u32({tj})], src[base + 2u * p.h * p.w + u32({ti}) + p.h * u32({tj})])")
+        } else {
+            format!("src[base + u32({ti}) + p.h * u32({tj})]")
+        }
+    };
+    let norm = if color { "fma(d.z, d.z, fma(d.y, d.y, d.x * d.x))" } else { "d * d" };
+    // The walk over the window (rows `tj0..=tj1`, columns `ti0..=ti1`), reading pixels with `fetch`.
+    let walk = |fetch: &dyn Fn(&str, &str) -> String| -> String {
+        format!(
+            "            for (var tj = tj0; tj <= tj1; tj++) {{
+                var hit = 0;
+                for (var ti = ti0; ti <= ti1; ti++) {{
+                    let v = {fetch};
+                    let d = cc - v;
+                    let norm = {norm};
+                    if (norm <= p.cvar) {{
+                        m += v;
+                        sx += ti;
+                        hit++;
+                    }}
+                }}
+                count += u32(hit);
+                sy += tj * hit;
+            }}
+",
+            fetch = fetch("ti", "tj")
+        )
+    };
+    let staged_fetch = |ti: &str, tj: &str| {
+        if color {
+            format!("tile[u32(({tj} - o1) * {tw} + {ti} - o0)].xyz")
+        } else {
+            format!("tile[u32(({tj} - o1) * {tw} + {ti} - o0)]")
+        }
+    };
+    let global_fetch = |ti: &str, tj: &str| load(ti, tj);
     let _ = write!(
         s,
-        "fn px(ch: u32, ti: i32, tj: i32, o0: i32, o1: i32, base: u32) -> f32 {{
-    let lx = ti - o0;
-    let ly = tj - o1;
-    if (lx >= 0 && lx < {tw} && ly >= 0 && ly < {tw}) {{ return tile[ch * {sq}u + u32(ly) * {tw}u + u32(lx)]; }}
-    return src[base + ch * p.h * p.w + u32(ti) + p.h * u32(tj)];
-}}
-@compute @workgroup_size(256)
+        "@compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
     let ty = wid.y % p.tiles_y;
     let plane = wid.y / p.tiles_y;
@@ -71,13 +113,11 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     let h = i32(p.h);
     let w = i32(p.w);
     let base = plane * {ch}u * p.h * p.w;
-    for (var i = t; i < {words}u; i += 256u) {{
-        let c = i / {sq}u;
-        let r = i % {sq}u;
-        let a0 = o0 + i32(r % {tw}u);
-        let a1 = o1 + i32(r / {tw}u);
-        var v = 0.0;
-        if (a0 >= 0 && a0 < h && a1 >= 0 && a1 < w) {{ v = src[base + c * p.h * p.w + u32(a0) + p.h * u32(a1)]; }}
+    for (var i = t; i < {sq}u; i += 256u) {{
+        let a0 = o0 + i32(i % {tw}u);
+        let a1 = o1 + i32(i / {tw}u);
+        var v = {tile_zero};
+        if (a0 >= 0 && a0 < h && a1 >= 0 && a1 < w) {{ v = {tile_load}; }}
         tile[i] = v;
     }}
     workgroupBarrier();
@@ -86,61 +126,51 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
     if (gx >= h || gy >= w) {{ return; }}
     var pi = gx;
     var pj = gy;
-",
-        sq = tw * tw
-    );
-    for c in 0..ch {
-        let _ = writeln!(s, "    var cc{c} = px({c}u, gx, gy, o0, o1, base);");
-    }
-    s.push_str("    for (var it = 0u; it < p.iters; it++) {\n        let oi = pi;\n        let oj = pj;\n        var count = 0u;\n        var sx = 0;\n        var sy = 0;\n");
-    for c in 0..ch {
-        let _ = writeln!(s, "        var m{c} = 0.0;");
-    }
-    s.push_str(
-        "        for (var wj = -p.radius; wj <= p.radius; wj++) {
-            let tj = pj + wj;
-            if (tj < 0 || tj >= w) { continue; }
-            var hit = 0;
-            for (var wi = -p.radius; wi <= p.radius; wi++) {
-                let ti = pi + wi;
-                if (ti < 0 || ti >= h) { continue; }
-                var norm = 0.0;
-",
-    );
-    for c in 0..ch {
-        let _ = writeln!(s, "                let v{c} = px({c}u, ti, tj, o0, o1, base);\n                norm += (cc{c} - v{c}) * (cc{c} - v{c});");
-    }
-    s.push_str("                if (norm <= p.cvar) {\n");
-    for c in 0..ch {
-        let _ = writeln!(s, "                    m{c} += v{c};");
-    }
-    s.push_str(
-        "                    sx += ti;
-                    hit++;
-                }
-            }
-            count += u32(hit);
-            sy += tj * hit;
-        }
-        if (count == 0u) { break; }
-        let fc = 1.0 / f32(count);
+    var cc = {center};
+    for (var it = 0u; it < p.iters; it++) {{
+        let oi = pi;
+        let oj = pj;
+        var count = 0u;
+        var sx = 0;
+        var sy = 0;
+        var m = {zero};
+        let ti0 = max(pi - p.radius, 0);
+        let ti1 = min(pi + p.radius, h - 1);
+        let tj0 = max(pj - p.radius, 0);
+        let tj1 = min(pj + p.radius, w - 1);
+        if (ti0 >= o0 && ti1 < o0 + {tw} && tj0 >= o1 && tj1 < o1 + {tw}) {{
+{staged}        }} else {{
+{global}        }}
+        if (count == 0u) {{ break; }}
+        // 1 / count correctly rounded (a GPU's `/` may be a reciprocal approximation within 2 ulp, and
+        // the truncation below is sensitive to the last bit): one Newton step with the exact residual.
+        let r0 = 1.0 / f32(count);
+        let fc = fma(fma(-f32(count), r0, 1.0), r0, r0);
         pi = i32(f32(sx) * fc);
         pj = i32(f32(sy) * fc);
-        var dist = 0.0;
+        m = {truncate};
+        let d = cc - m;
+        let dist = {dist};
+        let stop = (pj == oj && pi == oi) || (f32(abs(oj - pj) + abs(oi - pi)) + dist <= 1.0);
+        cc = m;
+        if (stop) {{ break; }}
+    }}
+{store}}}
 ",
+        tile_zero = if color { "vec4<f32>(0.0)" } else { "0.0" },
+        tile_load = if color { "vec4<f32>(".to_string() + &load("a0", "a1") + ", 0.0)" } else { load("a0", "a1") },
+        center = load("gx", "gy"),
+        staged = walk(&staged_fetch),
+        global = walk(&global_fetch),
+        truncate = if color { "vec3<f32>(vec3<i32>(m * fc))" } else { "f32(i32(m * fc))" },
+        dist = if color { "fma(d.z, d.z, fma(d.y, d.y, d.x * d.x))" } else { "d * d" },
+        store = if color {
+            "    dst[base + u32(gx) + p.h * u32(gy)] = cc.x;\n    dst[base + p.h * p.w + u32(gx) + p.h * u32(gy)] = cc.y;\n    dst[base + 2u * p.h * p.w + u32(gx) + p.h * u32(gy)] = cc.z;\n"
+        } else {
+            "    dst[base + u32(gx) + p.h * u32(gy)] = cc;\n"
+        }
     );
-    for c in 0..ch {
-        let _ = writeln!(s, "        m{c} = f32(i32(m{c} * fc));\n        dist += (cc{c} - m{c}) * (cc{c} - m{c});");
-    }
-    s.push_str("        let stop = (pj == oj && pi == oi) || (f32(abs(oj - pj) + abs(oi - pi)) + dist <= 1.0);\n");
-    for c in 0..ch {
-        let _ = writeln!(s, "        cc{c} = m{c};");
-    }
-    s.push_str("        if (stop) { break; }\n    }\n");
-    for c in 0..ch {
-        let _ = writeln!(s, "    dst[base + {c}u * p.h * p.w + u32(gx) + p.h * u32(gy)] = cc{c};");
-    }
-    s.push_str("}\n");
+    let _ = vt;
     s
 }
 
@@ -163,10 +193,9 @@ impl Array<f32> {
     /// A colour image that is not `[H, W, 3]`, `iterations == 0` and negative or non-finite
     /// sigmas poison the result (ArrayFire returns the same errors).
     ///
-    /// Differences from ArrayFire: none intended (the CUDA kernel is followed; ArrayFire's CPU
-    /// backend differs in the stopping rule). Division by the pixel count is the GPU's single
-    /// precision division, so a mean that is an integer up to rounding may truncate one lower
-    /// than ArrayFire's.
+    /// Differences from ArrayFire: none intended (both of its backends agree). The reciprocal of the pixel count is
+    /// computed correctly rounded (the GPU's own division is an approximation), so the truncations
+    /// agree with ArrayFire's.
     ///
     /// Lazy: the filter is recorded when the result is evaluated (one launch).
     ///
