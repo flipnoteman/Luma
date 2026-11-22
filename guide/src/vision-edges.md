@@ -93,7 +93,12 @@ up to about 0.125), as in ArrayFire, which rejects only `iterations == 0` and a 
 Every step is three launches: the gradient energy per tile, one workgroup that adds the tiles up
 and writes the factor (ArrayFire reads the sum back to the host after every step), and the update
 from one image into the other. luma reads and writes different images, so the result does not
-depend on the order of the pixels; ArrayFire's CPU backend updates in place pixel by pixel.
+depend on the order of the pixels; ArrayFire's CPU backend updates in place pixel by pixel. ArrayFire's
+CUDA kernel has a bug: on images with more than about 70 columns it updates only the leading
+columns along axis 1 (72 of 128, 96 of 300 in the sizes probed) and leaves the rest unchanged.
+luma updates every pixel. On the columns ArrayFire does update one step agrees with it to `f32`
+rounding on small images; on large ones its in-place update also races between tiles and varies
+from run to run.
 
 ## `mean_shift`
 
