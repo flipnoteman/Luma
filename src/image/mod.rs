@@ -15,6 +15,7 @@
 
 mod pointwise;
 mod sat;
+mod warp;
 mod window;
 
 use std::panic::Location;
@@ -34,6 +35,7 @@ use pointwise::Color;
 pub(crate) use pointwise::{color_source, unwrap_source, wrap_source, Color as ColorKernel};
 pub(crate) use sat::{source as sat_source, Pass as SatPass};
 pub(crate) use window::{source as window_source, Window};
+pub use warp::{transform_coordinates, transform_coordinates_on, TransformMatrix};
 use window::{Edge, Op, Pixel};
 
 /// What the cells outside an array are, for a filter whose window reaches past its border.

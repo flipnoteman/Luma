@@ -168,7 +168,6 @@ mod sparse;
 mod tuning;
 mod until;
 mod view;
-mod image;
 mod vision;
 
 pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoments, CoMomentsBuilder, Covariance, Fold, Histogram, Histogram2d, NanPolicy, TopK, Wide};
