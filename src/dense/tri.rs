@@ -141,7 +141,7 @@ fn substitute(l: &Array<f32>, b: &Array<f32>, ld: Dims, bd: Dims, unit: bool, op
 /// Rows of a diagonal block the blocked factorisation and solves take: the largest of 128, 64 and 32
 /// whose kernels fit in a workgroup's memory (38 KiB for 128; `LUMA_CHOL_NB` overrides).
 pub(crate) fn block_size(ctx: &crate::context::Context) -> usize {
-    if let Some(nb) = std::env::var("LUMA_CHOL_NB").ok().and_then(|v| v.parse().ok()).filter(|nb| [32, 64, 128].contains(nb)) {
+    if let Some(nb) = std::env::var("LUMA_CHOL_NB").ok().and_then(|v| v.parse().ok()).filter(|nb| [32, 64, 96, 128].contains(nb)) {
         return nb;
     }
     let bytes = ctx.info().limits.max_workgroup_storage_bytes as usize;

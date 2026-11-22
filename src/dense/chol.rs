@@ -235,6 +235,35 @@ fn diag_source(nb: usize) -> String {
         }
         solve += &format!("            let x{p} = {cur} * rv[{p}];\n            s[ri + c0 + {p}u] = x{p};\n");
     }
+    // The rank-32 update of what is left of the triangle after a panel of 32 columns: tiles of 4 x 4
+    // entries, an invocation each, 8 loads of the panel's entries for 16 multiply-adds.
+    let mut tile_setup = String::new();
+    let mut tile_body = String::new();
+    let mut tile_store = String::new();
+    for r in 0..4 {
+        tile_setup += &format!("                let ir{r} = min(i0 + {r}u, nbw - 1u);\n                let rb{r} = off(ir{r}) + c32;\n");
+        tile_setup += &format!("                let qr{r} = min(q0 + {r}u, nbw - 1u);\n                let qb{r} = off(qr{r}) + c32;\n");
+    }
+    for r in 0..4 {
+        for c in 0..4 {
+            tile_setup += &format!("                var t{r}{c} = s[off(ir{r}) + qr{c}];\n");
+        }
+    }
+    for kk in 0..4 {
+        for r in 0..4 {
+            tile_body += &format!("                    let u{r}_{kk} = s[rb{r} + kk + {kk}u];\n                    let w{r}_{kk} = s[qb{r} + kk + {kk}u];\n");
+        }
+        for r in 0..4 {
+            for c in 0..4 {
+                tile_body += &format!("                    t{r}{c} = fma(-u{r}_{kk}, w{c}_{kk}, t{r}{c});\n");
+            }
+        }
+    }
+    for r in 0..4 {
+        for c in 0..4 {
+            tile_store += &format!("                if (i0 + {r}u < nbw && q0 + {c}u <= i0 + {r}u) {{ s[off(i0 + {r}u) + q0 + {c}u] = t{r}{c}; }}\n");
+        }
+    }
     format!(
         "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32, has_c: u32, t_row0: u32, t_col0: u32, t_stride: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -274,16 +303,34 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 {solve}        }}
         workgroupBarrier();
         if (i < nbw && i >= c0 + 8u) {{
-{lds}            var q = c0 + 8u + h;
-            for (; q + 12u <= i; q = q + 16u) {{
+{lds}            let qmax = min(i, c0 - c0 % 32u + 31u);
+            var q = c0 + 8u + h;
+            for (; q + 12u <= qmax; q = q + 16u) {{
 {quad_loads}{quad_fmas}{quad_stores}            }}
-            for (; q <= i; q = q + 4u) {{
+            for (; q <= qmax; q = q + 4u) {{
                 let rq = off(q);
                 var acc = s[ri + q];
 {fmas}                s[ri + q] = acc;
             }}
         }}
         workgroupBarrier();
+        if ((c0 + 8u) % 32u == 0u && c0 + 8u < nbw) {{
+            let c32 = c0 - 24u;
+            let span = nbw - c32 - 32u;
+            let side = (span + 3u) / 4u;
+            let tiles = side * (side + 1u) / 2u;
+            for (var id = t; id < tiles; id = id + {threads}u) {{
+                var tr = u32(floor((sqrt(f32(8u * id + 1u)) - 1.0) * 0.5));
+                if (tr * (tr + 1u) / 2u > id) {{ tr = tr - 1u; }}
+                if ((tr + 1u) * (tr + 2u) / 2u <= id) {{ tr = tr + 1u; }}
+                let tc = id - tr * (tr + 1u) / 2u;
+                let i0 = c32 + 32u + 4u * tr;
+                let q0 = c32 + 32u + 4u * tc;
+{tile_setup}                for (var kk = 0u; kk < 32u; kk = kk + 4u) {{
+{tile_body}                }}
+{tile_store}            }}
+            workgroupBarrier();
+        }}
     }}
     for (var r0 = 0u; r0 < nbw; r0 = r0 + {rstep}u) {{
         let i0 = r0 + 8u * hh;
