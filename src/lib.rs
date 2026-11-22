@@ -75,6 +75,18 @@ mod guide {
     pub mod examples {}
     #[doc = include_str!("../guide/src/images.md")]
     pub mod images {}
+    #[doc = include_str!("../guide/src/vision.md")]
+    pub mod vision {}
+    #[doc = include_str!("../guide/src/vision-corners.md")]
+    pub mod vision_corners {}
+    #[doc = include_str!("../guide/src/vision-matching.md")]
+    pub mod vision_matching {}
+    #[doc = include_str!("../guide/src/vision-edges.md")]
+    pub mod vision_edges {}
+    #[doc = include_str!("../guide/src/vision-regions.md")]
+    pub mod vision_regions {}
+    #[doc = include_str!("../guide/src/vision-descriptors.md")]
+    pub mod vision_descriptors {}
     #[doc = include_str!("../guide/src/environment.md")]
     pub mod environment {}
     #[doc = include_str!("../guide/src/faq.md")]
@@ -139,6 +151,7 @@ mod tuning;
 mod until;
 mod view;
 mod image;
+mod vision;
 
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
@@ -169,6 +182,7 @@ pub use sort::SortKey;
 pub use stats::{Bias, Norm};
 pub use sparse::{sparse, Sparse, SparseElem, SparseFormat, SparseInfo};
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
+pub use vision::*;
 pub use image::{gaussian_kernel, gaussian_kernel_1d, gaussian_kernel_1d_on, gaussian_kernel_on, Border, ColorSpace, ConvSpec, ImagePixel, Padding, YccStd};
 
 /// Plumbing of `fields!`; not part of the public API.

@@ -1301,6 +1301,9 @@ pub(crate) enum Builtin {
     Wrap,
     /// One pass of the summed-area table; see `image::sat`. Element type `"f32"`, `"i32"` or `"u32"`.
     Sat(crate::image::SatPass),
+    /// A kernel of the feature detectors and image analysis of [`crate::vision`]. The element type
+    /// is the image's.
+    Vision(crate::vision::Kernel),
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -3055,6 +3058,7 @@ impl Builtin {
             Builtin::Unwrap => wgsl(crate::image::unwrap_source()),
             Builtin::Wrap => wgsl(crate::image::wrap_source()),
             Builtin::Sat(pass) => wgsl(crate::image::sat_source(pass, ty)),
+            Builtin::Vision(kernel) => wgsl(crate::vision::source(kernel)),
             Builtin::NonFinite => BuiltinKernel::Module(non_finite_module(wg)),
         }
     }
