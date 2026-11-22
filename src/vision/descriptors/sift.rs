@@ -151,8 +151,11 @@ const DOG_FN: &str = "fn dog(l: u32, r: i32, c: i32) -> f32 {
 }
 ";
 
-/// Extrema of the difference of Gaussians. Arguments: pyramid of the octave, positions, layers,
-/// counters, uniform `{h, w, n_layers, max_feat, threshold, plane, counter, 0}`.
+/// Extrema of the difference of Gaussians. A workgroup takes a tile of 32 rows by 8 columns and
+/// walks up the layers: the pyramid layers (with a one-pixel halo) enter workgroup memory one at
+/// a time, the differences of Gaussians of three consecutive layers are kept and the middle one
+/// is searched. Arguments: pyramid of the octave, positions, layers, counters, uniform
+/// `{h, w, n_layers, max_feat, threshold, plane, counter, 0}`.
 fn extrema_source() -> String {
     format!(
         "struct Params {{ h: u32, w: u32, nl: u32, max_feat: u32, thr: f32, plane: u32, ctr: u32, c: u32 }}
@@ -161,33 +164,63 @@ fn extrema_source() -> String {
 @group(1) @binding(2) var<storage, read_write> cand_layer: array<u32>;
 @group(1) @binding(3) var<storage, read_write> counters: array<atomic<u32>>;
 @group(1) @binding(4) var<uniform> p: Params;
-{DOG_FN}
-@compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
-    let row = {BORDER}u + wid.x * 16u + lid.x;
-    let col = {BORDER}u + wid.y * 16u + lid.y;
-    if (row + {BORDER}u >= p.h || col + {BORDER}u >= p.w) {{ return; }}
-    for (var l = 1u; l <= p.nl; l++) {{
-        let pv = dog(l, i32(row), i32(col));
-        if (abs(pv) > p.thr) {{
-            var ok = true;
-            for (var k = 0u; k < 27u; k++) {{
-                if (k == 13u) {{ continue; }}
-                let q = dog(l + k / 9u - 1u, i32(row) + i32((k / 3u) % 3u) - 1, i32(col) + i32(k % 3u) - 1);
-                if (pv > 0.0) {{
-                    if (!(pv > q)) {{ ok = false; break; }}
-                }} else {{
-                    if (!(pv < q)) {{ ok = false; break; }}
+var<workgroup> gs: array<f32, 680>;
+var<workgroup> dt: array<f32, 1020>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    let row0 = i32({BORDER}u + wid.x * 32u);
+    let col0 = i32({BORDER}u + wid.y * 8u);
+    let h = i32(p.h);
+    let w = i32(p.w);
+    let tx = t & 31u;
+    let ty = t >> 5u;
+    let row = row0 + i32(tx);
+    let col = col0 + i32(ty);
+    let valid = row + {BORDER} < h && col + {BORDER} < w;
+    // The tile of layer 0.
+    for (var e = t; e < 340u; e += 256u) {{
+        let gr = row0 - 1 + i32(e % 34u);
+        let gc = col0 - 1 + i32(e / 34u);
+        var v = 0.0;
+        if (gr < h && gc < w) {{ v = g[u32(gc) * p.h + u32(gr)]; }}
+        gs[e] = v;
+    }}
+    for (var l = 0u; l <= p.nl + 1u; l++) {{
+        for (var e = t; e < 340u; e += 256u) {{
+            let gr = row0 - 1 + i32(e % 34u);
+            let gc = col0 - 1 + i32(e / 34u);
+            var v = 0.0;
+            if (gr < h && gc < w) {{ v = g[(l + 1u) * p.plane + u32(gc) * p.h + u32(gr)]; }}
+            gs[((l + 1u) % 2u) * 340u + e] = v;
+            dt[(l % 3u) * 340u + e] = v - gs[(l % 2u) * 340u + e];
+        }}
+        workgroupBarrier();
+        if (l >= 2u && valid) {{
+            let cl = l - 1u;
+            let cb = (cl % 3u) * 340u;
+            let c = ty * 34u + tx + 35u;
+            let pv = dt[cb + c];
+            if (abs(pv) > p.thr) {{
+                var ok = true;
+                for (var k = 0u; k < 27u; k++) {{
+                    if (k == 13u) {{ continue; }}
+                    let q = dt[((cl + k / 9u + 2u) % 3u) * 340u + c + (k / 3u) % 3u - 1u + ((k % 3u) * 34u) - 34u];
+                    if (pv > 0.0) {{
+                        if (!(pv > q)) {{ ok = false; break; }}
+                    }} else {{
+                        if (!(pv < q)) {{ ok = false; break; }}
+                    }}
                 }}
-            }}
-            if (ok) {{
-                let idx = atomicAdd(&counters[p.ctr], 1u);
-                if (idx < p.max_feat) {{
-                    cand_pos[idx] = row + p.h * col;
-                    cand_layer[idx] = l;
+                if (ok) {{
+                    let idx = atomicAdd(&counters[p.ctr], 1u);
+                    if (idx < p.max_feat) {{
+                        cand_pos[idx] = u32(row) + p.h * u32(col);
+                        cand_layer[idx] = cl;
+                    }}
                 }}
             }}
         }}
+        workgroupBarrier();
     }}
 }}
 "
@@ -823,7 +856,7 @@ pub(crate) fn run(
                 RawArg::write(ct_pin.buffer(), ct_bytes),
                 RawArg::Uniform(bytemuck::bytes_of(&params)),
             ];
-            ctx.launch(&kernel, tile_grid(ctx, (hh - 2 * BORDER).div_ceil(16), (ww - 2 * BORDER).div_ceil(16))?, [hh, ww, 1], &args)?;
+            ctx.launch(&kernel, tile_grid(ctx, (hh - 2 * BORDER).div_ceil(32), (ww - 2 * BORDER).div_ceil(8))?, [hh, ww, 1], &args)?;
             // Interpolation.
             let params = [
                 hh,
