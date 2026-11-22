@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use luma_core::hal::copy_parallel;
+use luma_core::hal::{copy_parallel, copy_parallel_host};
 use luma_core::Buffer;
 
 use crate::array::Storage;
@@ -393,7 +393,9 @@ impl Segment {
     /// Copies the segment's data into `dst` (`dst.len()` bytes), after everything recorded so
     /// far. A segment in host memory is copied from there and stays there.
     pub(crate) fn read_into(self: &Arc<Self>, dst: &mut [MaybeUninit<u8>]) -> Result<()> {
-        if self.with_host_bytes(|data| copy_parallel(&data[..dst.len()], dst)).is_some() {
+        // On the CPU backend the segment is in the same memory as `dst`: a copy between host buffers, bound by the host's memory.
+        let copy = if self.ctx.is_cpu() { copy_parallel_host } else { copy_parallel };
+        if self.with_host_bytes(|data| copy(&data[..dst.len()], dst)).is_some() {
             return Ok(());
         }
         let pin = self.pin()?;

@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use luma_core::hal::topology;
 use luma_core::{BackendError, NativeBuffer};
 
 use crate::abi::{MATH_TABLE, WorkgroupCtx, WorkgroupFn};
@@ -310,6 +311,8 @@ const SPIN_BELOW_NS: u64 = 100_000;
 /// Low bits of `Shared::slots`: helper slots still free; the bits above are the job generation.
 const SLOT_BITS: u32 = 16;
 const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
+/// [`Shared::dispatcher_cpu`] when the platform cannot tell.
+const NO_CPU: usize = usize::MAX;
 
 impl CostHint {
     /// Estimated nanoseconds of work for `total` workgroups of `invocations` invocations.
@@ -374,6 +377,8 @@ struct Shared {
     /// Nanoseconds a worker polls after finishing a job: `spin` after a short launch, none after
     /// a long one.
     worker_spin_ns: AtomicU64,
+    /// The logical CPU the last parallel dispatch was issued from ([`NO_CPU`] if unknown).
+    dispatcher_cpu: AtomicUsize,
     dispatcher_sleeping: AtomicBool,
     shutdown: AtomicBool,
     wake_lock: Mutex<()>,
@@ -541,8 +546,13 @@ fn worker_loop(shared: Arc<Shared>) {
                 );
                 shared.done.notify_one();
             }
+            // No polling on the sibling thread of the dispatcher's core: it would slow the host work
+            // between the launches down (a 4 MB memset next to a launch took 1.5x as long with all
+            // 32 threads of a Ryzen 9 7950X polling), and the dispatcher's own thread is not
+            // polling anyway.
+            let sibling = topology::current_cpu().is_some_and(|me| topology::shares_core(me, shared.dispatcher_cpu.load(Ordering::Relaxed)));
             deadline = Instant::now()
-                + Duration::from_nanos(shared.worker_spin_ns.load(Ordering::Relaxed));
+                + if sibling { Duration::ZERO } else { Duration::from_nanos(shared.worker_spin_ns.load(Ordering::Relaxed)) };
             continue;
         }
         if Instant::now() < deadline {
@@ -595,6 +605,7 @@ impl WorkgroupPool {
             job: AtomicPtr::new(std::ptr::null_mut()),
             sleepers: AtomicUsize::new(0),
             spin,
+            dispatcher_cpu: AtomicUsize::new(NO_CPU),
             worker_spin_ns: AtomicU64::new(spin.as_nanos() as u64),
             dispatcher_sleeping: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
@@ -733,6 +744,9 @@ impl WorkgroupPool {
             shared.spin.as_nanos() as u64
         };
         shared.worker_spin_ns.store(spin, Ordering::Relaxed);
+        // The core the host thread runs on: a worker that polls on the other thread of that core
+        // takes the execution units the host thread needs between two launches.
+        shared.dispatcher_cpu.store(topology::current_cpu().unwrap_or(NO_CPU), Ordering::Relaxed);
         shared
             .job
             .store(std::ptr::from_ref(&job).cast_mut(), Ordering::Relaxed);

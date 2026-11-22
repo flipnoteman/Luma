@@ -7,6 +7,8 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
+use super::topology;
+
 /// Copies below this size stay on the calling thread.
 const PARALLEL_COPY_MIN: usize = 2 << 20;
 
@@ -14,8 +16,15 @@ const PARALLEL_COPY_MIN: usize = 2 << 20;
 /// cut into pieces that cost more to hand out than to copy.
 const PART_MIN: usize = 512 << 10;
 
-/// Most threads (the caller included) a copy is spread over.
-const MAX_THREADS: usize = 8;
+/// Most threads (the caller included) a copy between host buffers is spread over.
+const MAX_THREADS: usize = 16;
+
+/// Most threads of a copy that stages a transfer to or from a device, and the number of
+/// threads of the pool where the number of physical cores is not known.
+const STAGING_THREADS: usize = 8;
+
+/// The unit threads take from a copy between host buffers (see [`copy_parallel_host`]).
+const CHUNK: usize = 256 << 10;
 
 /// How long an idle worker polls for the next share before it parks.
 const WORKER_SPIN: Duration = Duration::from_micros(200);
@@ -24,7 +33,38 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One share of a parallel copy, waiting for a worker.
+/// The shares of one copy still to be copied by workers, or the chunks of a copy between host buffers
+/// (see [`copy_parallel_host`]) that threads take from `next` until it is all taken.
+struct Job {
+    remaining: AtomicUsize,
+    waiter: Thread,
+    src: *const u8,
+    dst: *mut MaybeUninit<u8>,
+    len: usize,
+    /// Offset of the next chunk to take.
+    next: AtomicUsize,
+}
+
+impl Job {
+    /// Copies chunks of [`CHUNK`] bytes until none is left.
+    ///
+    /// # Safety
+    /// `src` and `dst` must be valid for `len` bytes (and distinct) for the whole call.
+    unsafe fn copy_chunks(&self) {
+        loop {
+            let at = self.next.fetch_add(CHUNK, Ordering::Relaxed);
+            if at >= self.len {
+                return;
+            }
+            let len = CHUNK.min(self.len - at);
+            // SAFETY: the chunk lies within the buffers; chunks are handed out once, so no two threads
+            // copy the same bytes.
+            unsafe { copy_streaming(std::slice::from_raw_parts(self.src.add(at), len), std::slice::from_raw_parts_mut(self.dst.add(at), len)) };
+        }
+    }
+}
+
+/// One share of a parallel copy, waiting for a worker; a share of no bytes is a ticket to take chunks.
 struct Part {
     src: *const u8,
     dst: *mut MaybeUninit<u8>,
@@ -37,22 +77,20 @@ struct Part {
 // before that.
 unsafe impl Send for Part {}
 
-/// The shares of one `copy_parallel` call still to be copied by workers.
-struct Job {
-    remaining: AtomicUsize,
-    waiter: Thread,
-}
-
 impl Part {
-    /// Copies the share, then tells its caller.
+    /// Copies the share (or takes chunks), then tells its caller.
     fn run(self) {
         // SAFETY: `src` and `dst` are `len` bytes of two distinct buffers (see `Send` above); the
         // shares of a call do not overlap.
         unsafe {
-            copy_streaming(std::slice::from_raw_parts(self.src, self.len), std::slice::from_raw_parts_mut(self.dst, self.len));
+            let job = &*self.job;
+            if self.len == 0 {
+                job.copy_chunks();
+            } else {
+                copy_streaming(std::slice::from_raw_parts(self.src, self.len), std::slice::from_raw_parts_mut(self.dst, self.len));
+            }
             // The waiter is cloned before the count drops: the job lives on the caller's stack,
             // which is free to go once the count reaches zero.
-            let job = &*self.job;
             let waiter = job.waiter.clone();
             if job.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                 waiter.unpark();
@@ -129,8 +167,13 @@ impl Pool {
 }
 
 static POOL: LazyLock<Arc<Pool>> = LazyLock::new(|| {
-    // Asked once: the call reads the cgroup limits and costs tens of microseconds.
-    let threads = thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS));
+    // One thread per physical core: threads of one core share its memory bandwidth, and the workers
+    // stay where the scheduler first put them, so on a chiplet CPU (Ryzen 9 7950X) eight of them
+    // sharing four cores of one chiplet copied 16 MiB in 0.28 to 0.54 ms, depending on the run,
+    // where eight fresh threads took 0.36 ms and sixteen workers 0.31 ms. Asked once: the topology
+    // and the cgroup limits cost tens of microseconds each.
+    let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = topology::physical_cores().map_or(threads.min(STAGING_THREADS), |cores| cores.min(threads)).clamp(1, MAX_THREADS);
     let pool = Arc::new(Pool { queue: Mutex::new(VecDeque::new()), ready: Condvar::new(), queued: AtomicUsize::new(0), sleeping: AtomicUsize::new(0), threads });
     for index in 1..threads {
         let pool = Arc::clone(&pool);
@@ -147,31 +190,59 @@ static POOL: LazyLock<Arc<Pool>> = LazyLock::new(|| {
 
 /// `dst.copy_from_slice(src)` split over several threads for large copies: one core cannot
 /// saturate unified memory, and the page faults of a fresh destination spread out too. The
-/// threads store past the cache (see [`copy_streaming`]).
+/// threads store past the cache (see [`copy_streaming`]). At most [`STAGING_THREADS`] threads
+/// take part, each with one share of the copy: the transfers of a GPU backend through host
+/// memory are bound by the bus, and the copy overlaps the device's work.
 pub fn copy_parallel(src: &[u8], dst: &mut [MaybeUninit<u8>]) {
+    copy_on(src, dst, STAGING_THREADS, false);
+}
+
+/// [`copy_parallel`] for a copy between two host buffers, which nothing but the host's memory
+/// bandwidth limits: spread over one thread per physical core (at most [`MAX_THREADS`]), which
+/// take chunks of [`CHUNK`] bytes as they get to them instead of a share each, so that a thread
+/// the scheduler has put on a busy core, or on the same core as another copy thread, costs a
+/// chunk and not a share.
+pub fn copy_parallel_host(src: &[u8], dst: &mut [MaybeUninit<u8>]) {
+    copy_on(src, dst, MAX_THREADS, true);
+}
+
+/// Copies `src` to `dst` on at most `most_threads` threads: each takes one even share, or, if
+/// `chunks`, chunks of [`CHUNK`] bytes as it gets to them.
+fn copy_on(src: &[u8], dst: &mut [MaybeUninit<u8>], most_threads: usize, chunks: bool) {
     assert_eq!(src.len(), dst.len(), "source and destination lengths differ");
     if src.len() < PARALLEL_COPY_MIN {
         dst.write_copy_of_slice(src);
         return;
     }
     let pool = &*POOL;
-    let parts = (src.len() / PART_MIN).clamp(1, pool.threads);
+    let parts = (src.len() / PART_MIN).clamp(1, pool.threads.min(most_threads));
     if parts == 1 {
         dst.write_copy_of_slice(src);
         return;
     }
-    let share = src.len().div_ceil(parts).next_multiple_of(4096);
-    let job = Job { remaining: AtomicUsize::new(0), waiter: thread::current() };
-    let mut shares = src.chunks(share).zip(dst.chunks_mut(share));
-    let Some((own_src, own_dst)) = shares.next() else { return };
+    let job = Job { remaining: AtomicUsize::new(0), waiter: thread::current(), src: src.as_ptr(), dst: dst.as_mut_ptr(), len: src.len(), next: AtomicUsize::new(0) };
     let mut queued = VecDeque::with_capacity(parts - 1);
-    for (s, d) in shares {
-        queued.push_back(Part { src: s.as_ptr(), dst: d.as_mut_ptr(), len: s.len(), job: &raw const job });
+    let mut own = None;
+    if chunks {
+        for _ in 1..parts {
+            queued.push_back(Part { src: src.as_ptr(), dst: dst.as_mut_ptr(), len: 0, job: &raw const job });
+        }
+    } else {
+        let share = src.len().div_ceil(parts).next_multiple_of(4096);
+        let mut shares = src.chunks(share).zip(dst.chunks_mut(share));
+        own = shares.next();
+        for (s, d) in shares {
+            queued.push_back(Part { src: s.as_ptr(), dst: d.as_mut_ptr(), len: s.len(), job: &raw const job });
+        }
     }
     // The count is complete before any worker can see a share.
     job.remaining.store(queued.len(), Ordering::Release);
     pool.push(&mut queued);
-    copy_streaming(own_src, own_dst);
+    match own {
+        Some((own_src, own_dst)) => copy_streaming(own_src, own_dst),
+        // SAFETY: the buffers are `len` bytes of two distinct slices, which outlive the call.
+        None => unsafe { job.copy_chunks() },
+    }
     // A waiting thread copies shares too (its own, or another call's), so a pool kept busy by
     // other calls cannot leave this one without a thread to run its shares.
     while job.remaining.load(Ordering::Acquire) != 0 {
@@ -243,12 +314,14 @@ mod tests {
 
     fn check(len: usize) {
         let src: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8).collect();
-        let mut dst = vec![MaybeUninit::<u8>::uninit(); len];
-        advise_huge_pages(&mut dst);
-        copy_parallel(&src, &mut dst);
-        // SAFETY: `copy_parallel` initialised every byte of `dst`.
-        let out: Vec<u8> = dst.iter().map(|b| unsafe { b.assume_init() }).collect();
-        assert!(out == src, "copy of {len} bytes differs");
+        for copy in [copy_parallel, copy_parallel_host] {
+            let mut dst = vec![MaybeUninit::<u8>::uninit(); len];
+            advise_huge_pages(&mut dst);
+            copy(&src, &mut dst);
+            // SAFETY: the copy initialised every byte of `dst`.
+            let out: Vec<u8> = dst.iter().map(|b| unsafe { b.assume_init() }).collect();
+            assert!(out == src, "copy of {len} bytes differs");
+        }
     }
 
     #[test]
@@ -262,6 +335,10 @@ mod tests {
     fn large_copy() {
         check(PARALLEL_COPY_MIN + 4099);
         check(3 * PARALLEL_COPY_MIN);
+        // Around the chunk boundaries of a host copy: a last chunk of one byte, whole chunks.
+        check(PARALLEL_COPY_MIN + CHUNK + 1);
+        check(8 * CHUNK);
+        check(17 * CHUNK - 1);
     }
 
     #[test]
