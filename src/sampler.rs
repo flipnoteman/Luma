@@ -83,6 +83,18 @@ fn coarsen() -> usize {
     *C.get_or_init(|| std::env::var("LUMA_SAMPLER_COARSEN").ok().and_then(|v| v.parse().ok()).filter(|c| [1, 2, 4].contains(c)).unwrap_or(2))
 }
 
+/// The workgroup of the shaped kernel: `x` along dimension 0 and `y` rows.
+fn tile() -> [u32; 2] {
+    static T: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("LUMA_SAMPLER_TILE")
+            .ok()
+            .and_then(|v| v.split_once('x').and_then(|(x, y)| Some([x.parse().ok()?, y.parse().ok()?])))
+            .filter(|t: &[u32; 2]| t[0] * t[1] == WORKGROUP)
+            .unwrap_or([WORKGROUP, 1])
+    })
+}
+
 /// One launch of the sampling kernel.
 pub(crate) struct Sampling<'a> {
     pub src: &'a Array<f32>,
@@ -181,8 +193,10 @@ impl Sampling<'_> {
         let max = ctx.max_workgroups_per_dimension() as usize;
         let (rows, batch) = (od[1], od[2] * od[3]);
         let c = coarsen();
+        let tile = tile();
         let per_group = WORKGROUP as usize * c;
-        let shaped = od[0].div_ceil(per_group) <= max && rows <= max && batch <= max;
+        let per_tile = tile[0] as usize * c;
+        let shaped = od[0].div_ceil(per_tile) <= max && rows.div_ceil(tile[1] as usize) <= max && batch <= max;
         let rows_ok = self.source == Source::Scaled && od[0].div_ceil(WORKGROUP as usize) <= max && rows.div_ceil(ROWS) <= max && batch <= max;
         // The source as a texture, where it is one 2-D slice the device can see as one and the
         // read path pays (see `crate::jit::cost::source_read`).
@@ -200,13 +214,13 @@ impl Sampling<'_> {
         if texture.is_some() {
             tests::TEXTURED.set(tests::TEXTURED.get() + 1);
         }
-        let variant = c + 8 * read_mode as usize;
+        let variant = c + 8 * read_mode as usize + 64 * (tile[0] as usize + 1000 * tile[1] as usize);
         let (kernel, grid) = if rows_ok {
-            (ctx.cached_kernel("sampler_rows", variant, "main_rows", || source(c, true, read_mode))?, [to_u32(od[0].div_ceil(WORKGROUP as usize))?, to_u32(rows.div_ceil(ROWS))?, to_u32(batch)?])
+            (ctx.cached_kernel("sampler_rows", variant, "main_rows", || source(c, tile, true, read_mode))?, [to_u32(od[0].div_ceil(WORKGROUP as usize))?, to_u32(rows.div_ceil(ROWS))?, to_u32(batch)?])
         } else if shaped {
-            (ctx.cached_kernel("sampler", variant, "main2d", || source(c, false, read_mode))?, [to_u32(od[0].div_ceil(per_group))?, to_u32(rows)?, to_u32(batch)?])
+            (ctx.cached_kernel("sampler", variant, "main2d", || source(c, tile, false, read_mode))?, [to_u32(od[0].div_ceil(per_tile))?, to_u32(rows.div_ceil(tile[1] as usize))?, to_u32(batch)?])
         } else {
-            (ctx.cached_kernel("sampler", variant, "main", || source(c, false, read_mode))?, fold_workgroups(ctx, to_u32(count.div_ceil(per_group))?)?)
+            (ctx.cached_kernel("sampler", variant, "main", || source(c, tile, false, read_mode))?, fold_workgroups(ctx, to_u32(count.div_ceil(per_group))?)?)
         };
         let mut out = Array::<f32>::alloc(ctx, self.out)?;
         let mut args: Vec<KernelArg<'_>> = Vec::with_capacity(6);
@@ -276,9 +290,9 @@ const ROWS: usize = 8;
 
 /// The source of the sampling kernel with `coarsen` elements per invocation in the generic
 /// entry points.
-fn source(coarsen: usize, rows_entry: bool, read: Read) -> String {
+fn source(coarsen: usize, tile: [u32; 2], rows_entry: bool, read: Read) -> String {
     let mut w = String::new();
-    let _ = writeln!(w, "const C: u32 = {coarsen}u;\nconst ROWS: u32 = {ROWS}u;");
+    let _ = writeln!(w, "const C: u32 = {coarsen}u;\nconst ROWS: u32 = {ROWS}u;\nconst TX: u32 = {}u;\nconst TY: u32 = {}u;", tile[0], tile[1]);
     w.push_str(&bindings(rows_entry, read));
     w.push_str(
         r#"
@@ -454,11 +468,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
 }
 
 // The same with the grid shaped like the output: x along dimension 0, y along 1, z the batch.
-@compute @workgroup_size(256)
+@compute @workgroup_size(TX, TY)
 fn main2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    if (gid.y >= p.od1) { return; }
     let c2 = gid.z % p.od2;
     let c3 = gid.z / p.od2;
-    let stride = nwg.x * 256u;
+    let stride = nwg.x * TX;
     let row = p.od0 * (gid.y + p.od1 * gid.z);
     var v: array<f32, C>;
     for (var k = 0u; k < C; k += 1u) {

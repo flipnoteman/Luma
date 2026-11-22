@@ -531,6 +531,8 @@ impl Context {
         // Flushes and waits, so every recorded use of the buffer has run.
         let data = self.read_spill(&buffer, victim.bytes)?;
         *state = State::Host(data);
+        // The texture holds the buffer the data just left.
+        lock(&victim.texture).take();
         pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
         pager.spilled_bytes.fetch_add(victim.bytes, Ordering::Relaxed);
         lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&victim)));
