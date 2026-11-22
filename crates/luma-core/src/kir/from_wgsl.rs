@@ -743,6 +743,8 @@ impl<'m> Lowerer<'m> {
                     self.privates.push(PrivateDecl { name, ty, init });
                     self.slots[h.index()] = Slot::Private(self.privates.len() as u32 - 1);
                 }
+                // Textures and samplers are bindings (declared above).
+                naga::AddressSpace::Handle if matches!(self.slots[h.index()], Slot::Binding(_)) => {}
                 other => return unsupported(format!("global variable `{}` in address space {other:?}", var.name.as_deref().unwrap_or(""))),
             }
         }

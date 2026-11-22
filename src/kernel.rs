@@ -299,6 +299,14 @@ enum ArgRepr<'a> {
         writable: bool,
         desc: crate::view::RawViewDesc,
     },
+    /// A texture over an array's buffer ([`crate::texture::Texture`]), bound to a `texture_2d<f32>`
+    /// or the `sampler` of that texture.
+    Texture {
+        ctx: &'a Context,
+        /// Keeps the array the texture reads on the device.
+        _pin: Pin,
+        texture: luma_core::Buffer,
+    },
     Uniform(std::result::Result<UniformBytes, String>),
     /// The array passed here is poisoned; launching fails with its error.
     Poisoned(Arc<LumaError>),
@@ -378,6 +386,13 @@ fn view_arg<'a>(
         Err(Failure::New(error)) => ArgRepr::Poisoned(Arc::new(error)),
     };
     KernelArg { repr }
+}
+
+impl<'a> KernelArg<'a> {
+    /// A texture for a `texture_2d<f32>` binding or the `sampler` binding that samples it.
+    pub(crate) fn texture(texture: &'a crate::texture::Texture) -> Self {
+        KernelArg { repr: ArgRepr::Texture { ctx: &texture.ctx, _pin: texture.pin.dup(), texture: texture.buffer.clone() } }
+    }
 }
 
 impl<'a, T: GpuType> From<&'a Array<T>> for KernelArg<'a> {
@@ -616,6 +631,15 @@ impl Kernel {
                     check_storage(info, index, *element_size, *writable)?;
                     raw[index] = RawArg::Storage { buffer: pin.buffer(), bytes: *bytes, writable: *writable };
                 }
+                ArgRepr::Texture { ctx: arg_ctx, texture, .. } => {
+                    if !arg_ctx.same_as(ctx) {
+                        return Err(LumaError::ContextMismatch);
+                    }
+                    if !matches!(info.kind, BindingKind::Texture2d | BindingKind::Sampler) {
+                        return Err(LumaError::KernelArgKind { index, expected: info.kind, actual: BindingKind::Texture2d });
+                    }
+                    raw[index] = RawArg::Storage { buffer: texture, bytes: texture.size(), writable: false };
+                }
                 ArgRepr::Uniform(encoded) => {
                     if info.kind != BindingKind::Uniform {
                         return Err(LumaError::KernelArgKind {
@@ -657,7 +681,7 @@ impl Kernel {
 fn check_storage(info: &BindingInfo, index: usize, element_size: u32, writable: bool) -> Result<()> {
     let actual = if writable { BindingKind::StorageReadWrite } else { BindingKind::StorageRead };
     match info.kind {
-        BindingKind::Uniform => {
+        BindingKind::Uniform | BindingKind::Texture2d | BindingKind::Sampler => {
             return Err(LumaError::KernelArgKind { index, expected: info.kind, actual })
         }
         BindingKind::StorageReadWrite if !writable => return Err(LumaError::KernelArgAccess { index }),

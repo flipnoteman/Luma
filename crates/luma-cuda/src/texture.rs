@@ -70,7 +70,7 @@ pub(super) fn caps(attribute: &dyn Fn(sys::CUdevice_attribute) -> Result<i32, Ba
     .collect::<Option<Vec<u32>>>()?
     .into_iter()
     .min()?;
-    Some(TextureCaps { max_dim, pitch_align: 4, aliases: true })
+    Some(TextureCaps { max_dim, pitch_align: PITCH_ALIGN as u32, aliases: true })
 }
 
 impl CudaBackend {
