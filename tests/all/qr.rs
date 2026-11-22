@@ -115,7 +115,7 @@ fn rank_deficient_and_degenerate_inputs() {
         assert!(err < 3e-5 && orth < 3e-5, "{m}x{n}: {err}, {orth}");
         assert!(r[(n / 2) * n + n / 2].abs() < 1e-5);
     }
-    let z = mat(&ctx, &vec![0.0f32; 12], 3, 4, 1).qr();
+    let z = mat(&ctx, &[0.0f32; 12], 3, 4, 1).qr();
     assert!(z.r().to_vec().unwrap().iter().all(|v| *v == 0.0));
     let n = 6;
     let mut tri = vec![0.0f32; n * n];

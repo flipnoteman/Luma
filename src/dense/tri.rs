@@ -31,6 +31,8 @@ struct Params {
 /// Rows solved together by the substitution kernel: the entries of the earlier rows are read once
 /// for all of them, and their sums are independent chains of fused multiply-adds.
 const ROWS: usize = 8;
+// The loop over the solved rows takes four at a step (ROWS is a multiple of 4), with their loads
+// issued together: the loads of `x` are what the kernel waits for.
 
 /// The substitution kernel: `x = l^-1 b` for every matrix of a batch, an invocation per column
 /// of `b`, the triangle in workgroup memory (every invocation reads the same entry). Blocks of
@@ -42,7 +44,10 @@ fn source() -> String {
     let mut diag = String::new();
     for r in 0..ROWS {
         accs += &format!("        var s{r} = b[bb + min(i0 + {r}u, n - 1u) * k + c];\n");
-        update += &format!("            s{r} = fma(-ls[min(i0 + {r}u, n - 1u) * n + j], xj, s{r});\n");
+        let row = format!("min(i0 + {r}u, n - 1u) * n + j");
+        update += &format!(
+            "            s{r} = fma(-ls[{row}], xa, s{r});\n            s{r} = fma(-ls[{row} + 1u], xb, s{r});\n            s{r} = fma(-ls[{row} + 2u], xc, s{r});\n            s{r} = fma(-ls[{row} + 3u], xd, s{r});\n"
+        );
         let mut inner = String::new();
         for q in 0..r {
             inner += &format!("        s{r} = fma(-ls[min(i0 + {r}u, n - 1u) * n + i0 + {q}u], x{q}, s{r});\n");
@@ -73,8 +78,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
     let c = wid.x * 64u + t;
     if (c >= k) {{ return; }}
     for (var i0 = 0u; i0 < n; i0 = i0 + {ROWS}u) {{
-{accs}        for (var j = 0u; j < i0; j = j + 1u) {{
-            let xj = x[bb + j * k + c];
+{accs}        for (var j = 0u; j < i0; j = j + 4u) {{
+            let xa = x[bb + j * k + c];
+            let xb = x[bb + (j + 1u) * k + c];
+            let xc = x[bb + (j + 2u) * k + c];
+            let xd = x[bb + (j + 3u) * k + c];
 {update}        }}
 {diag}    }}
 }}

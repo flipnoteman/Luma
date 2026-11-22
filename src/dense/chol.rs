@@ -59,7 +59,26 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec
         let rj = j * {pitch}u;
         var v = s[ri + j];
         var d = s[rj + j];
-        for (var k = 0u; k < j; k = k + 1u) {{
+        var k = 0u;
+        for (; k + 4u <= j; k = k + 4u) {{
+            let b0 = s[rj + k];
+            let b1 = s[rj + k + 1u];
+            let b2 = s[rj + k + 2u];
+            let b3 = s[rj + k + 3u];
+            let a0 = s[ri + k];
+            let a1 = s[ri + k + 1u];
+            let a2 = s[ri + k + 2u];
+            let a3 = s[ri + k + 3u];
+            v = fma(-a0, b0, v);
+            v = fma(-a1, b1, v);
+            v = fma(-a2, b2, v);
+            v = fma(-a3, b3, v);
+            d = fma(-b0, b0, d);
+            d = fma(-b1, b1, d);
+            d = fma(-b2, b2, d);
+            d = fma(-b3, b3, d);
+        }}
+        for (; k < j; k = k + 1u) {{
             let lj = s[rj + k];
             v = fma(-s[ri + k], lj, v);
             d = fma(-lj, lj, d);

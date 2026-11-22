@@ -142,16 +142,28 @@ fn cholesky(b: &mut Bench) {
     }
 }
 
+/// `LINALG_ROWS=chol,lu` runs only the row groups whose name contains one of the words (default: all).
+fn on(name: &str) -> bool {
+    std::env::var("LINALG_ROWS").map_or(true, |v| v.split(',').any(|w| name.contains(w)))
+}
+
 pub fn linalg(b: &mut Bench) {
     b.guarded("linalg", |b| {
-        cholesky(b);
-        triangular(b);
-        spd_solve(b);
-        lu_rows(b);
-        general_solve(b);
-        inverse_det(b);
-        qr_rows(b);
-        batched(b);
+        let groups: [(&str, fn(&mut Bench)); 8] = [
+            ("cholesky", cholesky),
+            ("triangular", triangular),
+            ("spd", spd_solve),
+            ("lu", lu_rows),
+            ("solve", general_solve),
+            ("inverse_det", inverse_det),
+            ("qr", qr_rows),
+            ("batched", batched),
+        ];
+        for (name, f) in groups {
+            if on(name) {
+                f(b);
+            }
+        }
     });
 }
 
