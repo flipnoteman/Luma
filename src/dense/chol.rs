@@ -8,13 +8,13 @@
 
 use std::panic::Location;
 
-use super::tri::{lower_left, rhs_matrix, split};
+use super::tri::{block_size, lower_left, rhs_matrix};
 use super::{block, fail, launch, nth, per_matrix, stack_batch, Dims, NAN};
 use crate::array::Array;
 use crate::context::Context;
 use crate::kernel::{uniform, view, KernelArg};
-use crate::matmul::matmul_f32;
-use crate::view::concat;
+use crate::matmul::matmul_nt;
+use crate::shape::Shape;
 
 /// Rows of the matrix a workgroup factors in workgroup memory, at most: 64 where the device has the
 /// 16.5 KiB that takes, else 48.
@@ -121,26 +121,215 @@ fn small(a: &Array<f32>, d: Dims, loc: &'static Location<'static>) -> Array<f32>
     }
 }
 
-/// The recursion over one `[n, n]` matrix.
-fn recurse(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
-    let [n, ..] = a.shape().dims();
-    if n <= leaf(a.context()) {
-        return small(a, Dims { rows: n, cols: n, batch: 1 }, loc);
+#[derive(encase::ShaderType)]
+struct BlockParams {
+    n: u32,
+    k: u32,
+    nbw: u32,
+    has_t: u32,
+}
+
+/// The kernel that factors the diagonal block of columns `k..k + nbw`: `A_kk - T[..nbw]` (`T` the
+/// product of the finished columns, see [`blocked`]) in workgroup memory as a packed lower
+/// triangle (row `i` at `i (i + 1) / 2`, so that the 32 rows of a warp read one column without bank
+/// conflicts), two invocations per row. Panels of 8 columns: each column of a panel takes one
+/// barrier, the row's multipliers coming from the (at most 8) columns of the panel so far; then a
+/// rank-8 update of the rest of the triangle, the two invocations of a row sharing its columns.
+/// The factor goes to `dk` (the panel kernel reads it) and into its place in the output.
+fn diag_source(nb: usize) -> String {
+    let t = 2 * nb;
+    let size = nb * (nb + 1) / 2;
+    let mut cols = String::new();
+    for q in 0..8 {
+        let mut dsum = String::new();
+        let mut vsum = String::new();
+        for r in 0..q {
+            dsum += &format!("            {{ let lj = s[off(j) + c0 + {r}u]; d = fma(-lj, lj, d); }}\n");
+            vsum += &format!("                v = fma(-s[off(i) + c0 + {r}u], s[off(j) + c0 + {r}u], v);\n");
+        }
+        cols += &format!(
+            "        {{
+            let j = c0 + {q}u;
+            if (j < nbw) {{
+                if (h == 0u && i >= j && i < nbw) {{
+                    var d = s[off(j) + j];
+{dsum}                    let r = select({NAN}, sqrt(d), d > 0.0);
+                    if (i == j) {{
+                        dg[j] = r;
+                    }} else {{
+                        var v = s[off(i) + j];
+{vsum}                        s[off(i) + j] = v / r;
+                    }}
+                }}
+                workgroupBarrier();
+            }}
+        }}
+"
+        );
     }
-    let h = split(n);
-    let l11 = recurse(&block(a, 0..h, 0..h), loc);
-    // Y = L21ᵀ = L11⁻¹ A21ᵀ, `[n - h, h]`.
-    let y = lower_left(&l11, &block(a, h..n, 0..h).transpose(), false, "cholesky", loc);
-    let y = y.cache();
-    let yt = y.transpose();
-    let s = &block(a, h..n, h..n) - &matmul_f32(&yt, &y);
-    let l22 = recurse(&s, loc);
-    let zeros = Array::<f32>::zeros_on(a.context(), [n - h, h]);
-    let upper = match zeros {
-        Ok(z) => concat(0, [&l11, &z]),
-        Err(e) => return fail(a.context(), a.shape(), e, "cholesky", loc),
+    let loads = (0..8).map(|r| format!("            let l{r} = s[off(i) + c0 + {r}u];\n")).collect::<String>();
+    let fmas = (0..8).map(|r| format!("                acc = fma(-l{r}, s[off(q) + c0 + {r}u], acc);\n")).collect::<String>();
+    format!(
+        "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
+@group(1) @binding(0) var<storage, read> a: array<f32>;
+@group(1) @binding(1) var<uniform> av: LumaView;
+@group(1) @binding(2) var<storage, read> tm: array<f32>;
+@group(1) @binding(3) var<storage, read_write> dk: array<f32>;
+@group(1) @binding(4) var<storage, read_write> o: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+
+var<workgroup> s: array<f32, {size}>;
+var<workgroup> dg: array<f32, {nb}>;
+
+fn off(i: u32) -> u32 {{ return i * (i + 1u) / 2u; }}
+
+@compute @workgroup_size({t})
+fn main(@builtin(local_invocation_index) t: u32) {{
+    let nbw = p.nbw;
+    let k = p.k;
+    let n = p.n;
+    for (var idx = t; idx < nbw * nbw; idx = idx + {t}u) {{
+        let i = idx / nbw;
+        let j = idx - i * nbw;
+        if (j <= i) {{
+            var v = a[luma_view_idx3(av, k + j, k + i, 0u)];
+            if (p.has_t != 0u) {{ v = v - tm[idx]; }}
+            s[off(i) + j] = v;
+        }}
+    }}
+    workgroupBarrier();
+    let i = t % {nb}u;
+    let h = t / {nb}u;
+    for (var c0 = 0u; c0 < nbw; c0 = c0 + 8u) {{
+{cols}        if (i < nbw && i >= c0 + 8u) {{
+{loads}            for (var q = c0 + 8u + h; q <= i; q = q + 2u) {{
+                var acc = s[off(i) + q];
+{fmas}                s[off(i) + q] = acc;
+            }}
+        }}
+        workgroupBarrier();
+    }}
+    for (var idx = t; idx < nbw * nbw; idx = idx + {t}u) {{
+        let i = idx / nbw;
+        let j = idx - i * nbw;
+        let v = select(select(0.0, s[off(i) + j], j < i), dg[i], i == j);
+        dk[i * {nb}u + j] = v;
+        o[(k + i) * n + k + j] = v;
+    }}
+}}
+"
+    )
+}
+
+/// The kernel that solves the rows below a diagonal block: `X = (A_panel - T) L_kkᵀ⁻¹` by forward
+/// substitution along each row, a warp (workgroup) taking 32 rows, a lane a row. The rows live in
+/// workgroup memory column by column (pitch 33, no bank conflicts); `L_kk` is read from `dk`, the
+/// same entry by every lane. Four columns at a step share the loads of the solved ones.
+fn panel_source(nb: usize) -> String {
+    let mut acc = String::new();
+    let mut upd = String::new();
+    let mut diag = String::new();
+    for u in 0..4 {
+        acc += &format!("        var s{u} = tile[(j + {u}u) * 33u + lane];\n");
+        for v in 0..4 {
+            upd += &format!("            s{u} = fma(-dk[(j + {u}u) * {nb}u + q + {v}u], x{v}, s{u});\n");
+        }
+        for v in 0..u {
+            diag += &format!("        s{u} = fma(-dk[(j + {u}u) * {nb}u + j + {v}u], s{v}, s{u});\n");
+        }
+        diag += &format!("        s{u} = s{u} / dk[(j + {u}u) * {nb}u + j + {u}u];\n        tile[(j + {u}u) * 33u + lane] = s{u};\n");
+    }
+    let xs = (0..4).map(|v| format!("            let x{v} = tile[(q + {v}u) * 33u + lane];\n")).collect::<String>();
+    // The last block of columns may be short: the columns past `nbw` are never read or written.
+    format!(
+        "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
+@group(1) @binding(0) var<storage, read> a: array<f32>;
+@group(1) @binding(1) var<uniform> av: LumaView;
+@group(1) @binding(2) var<storage, read> tm: array<f32>;
+@group(1) @binding(3) var<storage, read> dk: array<f32>;
+@group(1) @binding(4) var<storage, read_write> o: array<f32>;
+@group(1) @binding(5) var<uniform> p: Params;
+
+var<workgroup> tile: array<f32, {size}>;
+
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lane: u32) {{
+    let nbw = p.nbw;
+    let k = p.k;
+    let n = p.n;
+    let r0 = k + nbw + wid.x * 32u;
+    let rows = min(32u, n - r0);
+    for (var rr = 0u; rr < rows; rr = rr + 1u) {{
+        for (var c = lane; c < nbw; c = c + 32u) {{
+            var v = a[luma_view_idx3(av, k + c, r0 + rr, 0u)];
+            if (p.has_t != 0u) {{ v = v - tm[(r0 + rr - k) * nbw + c]; }}
+            tile[c * 33u + rr] = v;
+        }}
+    }}
+    workgroupBarrier();
+    if (lane < rows) {{
+        for (var j = 0u; j + 4u <= nbw; j = j + 4u) {{
+{acc}            for (var q = 0u; q < j; q = q + 4u) {{
+{xs}{upd}            }}
+{diag}        }}
+        // The columns of a block short of a multiple of four, one at a time.
+        for (var j = nbw - nbw % 4u; j < nbw; j = j + 1u) {{
+            var s0 = tile[j * 33u + lane];
+            for (var q = 0u; q < j; q = q + 1u) {{
+                s0 = fma(-dk[j * {nb}u + q], tile[q * 33u + lane], s0);
+            }}
+            tile[j * 33u + lane] = s0 / dk[j * {nb}u + j];
+        }}
+    }}
+    workgroupBarrier();
+    for (var rr = 0u; rr < rows; rr = rr + 1u) {{
+        for (var c = lane; c < nbw; c = c + 32u) {{
+            o[(r0 + rr) * n + k + c] = tile[c * 33u + rr];
+        }}
+    }}
+}}
+",
+        size = nb * 33
+    )
+}
+
+/// The lower Cholesky factor of one `[n, n]` matrix, left-looking in blocks of `nb` columns. Per
+/// block: `T = L[k.., ..k] L[k..k+nb, ..k]ᵀ` (one [`matmul_nt`] over everything finished so far, the
+/// only big flops: `n³/3` in all, in `n / nb` products), the diagonal block `A_kk - T` factored by
+/// one workgroup ([`diag_source`]) and the rows below it by a launch of one warp per 32 rows
+/// ([`panel_source`]): three launches a block, every one of them writing into the one output.
+fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
+    let ctx = a.context();
+    let [n, ..] = a.shape().dims();
+    let nb = block_size(ctx);
+    let shape = Shape::from([n, n]);
+    let setup = (Array::<f32>::zeros_on(ctx, shape), Array::<f32>::alloc(ctx, Shape::from([nb, nb])), Array::<f32>::alloc(ctx, Shape::from(1)));
+    let (mut out, mut dk, dummy) = match setup {
+        (Ok(o), Ok(d), Ok(m)) => (o, d, m),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return fail(ctx, a.shape(), e, "cholesky", loc),
     };
-    concat(1, [&upper, &concat(0, [&yt, &l22])])
+    let mut k = 0;
+    while k < n {
+        let nbw = nb.min(n - k);
+        let t = (k > 0).then(|| matmul_nt(&block(&out, k..n, 0..k), &block(&out, k..k + nbw, 0..k)));
+        let params = BlockParams { n: n as u32, k: k as u32, nbw: nbw as u32, has_t: u32::from(k > 0) };
+        let tref = t.as_ref().unwrap_or(&dummy);
+        let diag: [KernelArg<'_>; 5] = [view(a), tref.into(), (&mut dk).into(), (&mut out).into(), uniform(&params)];
+        let key = format!("chol_diag/{nb}");
+        if let Err(e) = launch(ctx, &key, "chol_diag", || diag_source(nb), [1, 1, 1], &diag) {
+            return fail(ctx, a.shape(), e, "cholesky", loc);
+        }
+        let rows = n - k - nbw;
+        if rows > 0 {
+            let panel: [KernelArg<'_>; 5] = [view(a), tref.into(), (&dk).into(), (&mut out).into(), uniform(&params)];
+            let key = format!("chol_panel/{nb}");
+            if let Err(e) = launch(ctx, &key, "chol_panel", || panel_source(nb), [rows.div_ceil(32) as u32, 1, 1], &panel) {
+                return fail(ctx, a.shape(), e, "cholesky", loc);
+            }
+        }
+        k += nbw;
+    }
+    out
 }
 
 /// The lower Cholesky factor of the lower triangle of every matrix of `a`.
@@ -153,10 +342,10 @@ pub(crate) fn lower(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f3
         return small(a, d, loc);
     }
     if d.batch > 1 {
-        let parts: Vec<Array<f32>> = (0..d.batch).map(|i| recurse(&nth(a, i), loc)).collect();
+        let parts: Vec<Array<f32>> = (0..d.batch).map(|i| blocked(&nth(a, i), loc)).collect();
         return stack_batch(&parts);
     }
-    recurse(a, loc)
+    blocked(a, loc)
 }
 
 impl Array<f32> {

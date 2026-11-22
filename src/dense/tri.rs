@@ -115,10 +115,10 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'stati
         return substitute(l, b, ld, bd, unit, op, loc);
     }
     if ld.batch > 1 {
-        let parts: Vec<Array<f32>> = (0..ld.batch).map(|i| recurse(&nth(l, i), &nth(b, i), unit, op, loc)).collect();
+        let parts: Vec<Array<f32>> = (0..ld.batch).map(|i| blocked(&nth(l, i), &nth(b, i), unit, op, loc)).collect();
         return stack_batch(&parts);
     }
-    recurse(l, b, unit, op, loc)
+    blocked(l, b, unit, op, loc)
 }
 
 /// One kernel launch over the whole batch.
@@ -138,20 +138,120 @@ fn substitute(l: &Array<f32>, b: &Array<f32>, ld: Dims, bd: Dims, unit: bool, op
     }
 }
 
-/// The recursion over one `[n, n]` matrix.
-fn recurse(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
-    let [_, n, ..] = l.shape().dims();
-    let [k, ..] = b.shape().dims();
-    if n <= BASE {
-        let (ld, bd) = (Dims { rows: n, cols: n, batch: 1 }, Dims { rows: n, cols: k, batch: 1 });
-        return substitute(l, b, ld, bd, unit, op, loc);
+/// Rows of a diagonal block the blocked solve takes: 128 where a workgroup has the 33 KiB its packed
+/// lower triangle takes, else 64 (`LUMA_CHOL_NB` overrides, as it does the factorisation's).
+pub(crate) fn block_size(ctx: &crate::context::Context) -> usize {
+    if let Some(nb) = std::env::var("LUMA_CHOL_NB").ok().and_then(|v| v.parse().ok()).filter(|nb| [32, 64, 128].contains(nb)) {
+        return nb;
     }
-    let h = split(n);
-    let blk = |a: &Array<f32>, r: std::ops::Range<usize>, c: std::ops::Range<usize>| a.slice(1, r).slice(0, c);
-    let x1 = recurse(&blk(l, 0..h, 0..h), &blk(b, 0..h, 0..k), unit, op, loc).cache();
-    let update = &blk(b, h..n, 0..k) - &matmul_f32(&blk(l, h..n, 0..h).cache(), &x1);
-    let x2 = recurse(&blk(l, h..n, h..n), &update, unit, op, loc);
-    crate::view::concat(1, [&x1, &x2])
+    if ctx.info().limits.max_workgroup_storage_bytes >= (128 * 129 / 2) * 4 + 256 { 128 } else { 64 }
+}
+
+/// Columns of the right-hand sides a workgroup of the block solve takes.
+const COLS: usize = 8;
+
+#[derive(encase::ShaderType)]
+struct BlockParams {
+    n: u32,
+    k: u32,
+    j0: u32,
+    nbw: u32,
+    has_t: u32,
+    unit: u32,
+}
+
+/// The block solve kernel: `X[j0..j0+nbw] = L_jj⁻¹ (B[j0..j0+nbw] - T)` where `T` (`[k, nbw]`) is
+/// the contribution of the solved rows above. An invocation per row of the block holds [`COLS`]
+/// right-hand-side columns of it; the triangle is in workgroup memory, packed (row `i` at
+/// `i (i + 1) / 2`, a warp's rows read one column without bank conflicts). Column oriented:
+/// after row `q` is solved its `COLS` values go to workgroup memory and every row below takes its
+/// share, one barrier per row of the block.
+fn block_source(nb: usize) -> String {
+    let size = nb * (nb + 1) / 2;
+    let mut init = String::new();
+    let mut solve = String::new();
+    let mut upd = String::new();
+    for c in 0..COLS {
+        init += &format!(
+            "    var a{c} = 0.0;\n    if (col0 + {c}u < k && ii < nbw) {{
+        a{c} = b[luma_view_idx3(bv, col0 + {c}u, j0 + ii, 0u)];
+        if (p.has_t != 0u) {{ a{c} = a{c} - tm[ii * k + col0 + {c}u]; }}
+    }}\n"
+        );
+        solve += &format!(
+            "            let x{c} = a{c} / dv;\n            xs[buf * {COLS}u + {c}u] = x{c};\n            if (col0 + {c}u < k) {{ o[(j0 + q) * k + col0 + {c}u] = x{c}; }}\n"
+        );
+        upd += &format!("            a{c} = fma(-lq, xs[buf * {COLS}u + {c}u], a{c});\n");
+    }
+    format!(
+        "struct Params {{ n: u32, k: u32, j0: u32, nbw: u32, has_t: u32, unit: u32 }}
+@group(1) @binding(0) var<storage, read> l: array<f32>;
+@group(1) @binding(1) var<uniform> lv: LumaView;
+@group(1) @binding(2) var<storage, read> b: array<f32>;
+@group(1) @binding(3) var<uniform> bv: LumaView;
+@group(1) @binding(4) var<storage, read> tm: array<f32>;
+@group(1) @binding(5) var<storage, read_write> o: array<f32>;
+@group(1) @binding(6) var<uniform> p: Params;
+
+var<workgroup> ls: array<f32, {size}>;
+var<workgroup> xs: array<f32, {xsize}>;
+
+fn off(i: u32) -> u32 {{ return i * (i + 1u) / 2u; }}
+
+@compute @workgroup_size({nb})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) ii: u32) {{
+    let k = p.k;
+    let j0 = p.j0;
+    let nbw = p.nbw;
+    let col0 = wid.x * {COLS}u;
+    for (var idx = ii; idx < nbw * nbw; idx = idx + {nb}u) {{
+        let i = idx / nbw;
+        let j = idx - i * nbw;
+        if (j <= i) {{ ls[off(i) + j] = l[luma_view_idx3(lv, j0 + j, j0 + i, 0u)]; }}
+    }}
+{init}    workgroupBarrier();
+    for (var q = 0u; q < nbw; q = q + 1u) {{
+        let buf = q & 1u;
+        if (ii == q) {{
+            let dv = select(ls[off(q) + q], 1.0, p.unit != 0u);
+{solve}        }}
+        workgroupBarrier();
+        if (ii > q && ii < nbw) {{
+            let lq = ls[off(ii) + q];
+{upd}        }}
+    }}
+}}
+",
+        xsize = 2 * COLS
+    )
+}
+
+/// `L X = B` for one matrix, in blocks of rows (left-looking): the rows above a block contribute
+/// `T = L[block, ..j0] X[..j0]`, one [`matmul_f32`], and the block's own triangle is solved by one
+/// launch of [`block_source`]; two launches a block, all of them writing into the one solution.
+fn blocked(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
+    let ctx = l.context();
+    let n = l.shape().dims()[1];
+    let [k, ..] = b.shape().dims();
+    let nb = block_size(ctx);
+    let setup = (Array::<f32>::alloc(ctx, Shape::from([k, n])), Array::<f32>::alloc(ctx, Shape::from(1)));
+    let (mut out, dummy) = match setup {
+        (Ok(o), Ok(d)) => (o, d),
+        (Err(e), _) | (_, Err(e)) => return fail(ctx, b.shape(), e, op, loc),
+    };
+    let mut j0 = 0;
+    while j0 < n {
+        let nbw = nb.min(n - j0);
+        let t = (j0 > 0).then(|| matmul_f32(&l.slice(1, j0..j0 + nbw).slice(0, 0..j0), &out.slice(1, 0..j0)));
+        let params = BlockParams { n: n as u32, k: k as u32, j0: j0 as u32, nbw: nbw as u32, has_t: u32::from(j0 > 0), unit: u32::from(unit) };
+        let args: [KernelArg<'_>; 5] = [view(l), view(b), t.as_ref().unwrap_or(&dummy).into(), (&mut out).into(), uniform(&params)];
+        let key = format!("trsm_block/{nb}");
+        if let Err(e) = launch(ctx, &key, "trsm_block", || block_source(nb), [k.div_ceil(COLS) as u32, 1, 1], &args) {
+            return fail(ctx, b.shape(), e, op, loc);
+        }
+        j0 += nbw;
+    }
+    out
 }
 
 /// Where a triangle of `n` rows splits: about half, at a multiple of 32 so that the blocks of the
