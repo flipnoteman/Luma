@@ -3,7 +3,7 @@
 //! Every variant (upper or lower, transposed or not) is turned into one canonical solve,
 //! `L X = B` with `L` lower triangular, by flipping and transposing views; those fuse into the
 //! copy the kernels make of their operands. A triangle of more than [`BASE`] rows is solved in
-//! blocks of rows (left-looking): the solved rows above a block contribute one [`matmul_f32`], and
+//! blocks of rows (left-looking): the solved rows above a block contribute one `matmul_f32`, and
 //! one launch solves the block's own triangle for the whole right-hand side, an invocation per
 //! row holding a few columns of it. Below [`BASE`] rows (or for a batch of small matrices) a kernel
 //! solves by substitution, one invocation per right-hand-side column and the whole batch in one
@@ -11,11 +11,10 @@
 
 use std::panic::Location;
 
-use super::{fail, grid, launch, launch_unchecked, nth, stack_batch, Dims, Triangle};
+use super::{fail, grid, launch, launch_unchecked, nth, product, stack_batch, Dims, Triangle};
 use crate::array::Array;
 use crate::error::LumaError;
 use crate::kernel::{uniform, view, KernelArg};
-use crate::matmul::matmul_f32;
 use crate::shape::Shape;
 
 /// Largest triangle a substitution kernel solves; bigger ones go in blocks.
@@ -266,7 +265,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /// `L X = B` for one matrix, in blocks of rows (left-looking): the rows above a block contribute
-/// `T = L[block, ..j0] X[..j0]`, one [`matmul_f32`], and the block's own triangle is solved by one
+/// `T = L[block, ..j0] X[..j0]`, one `matmul_f32`, and the block's own triangle is solved by one
 /// launch of [`block_source`]; two launches a block, all of them writing into the one solution.
 fn blocked(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'static Location<'static>) -> Array<f32> {
     let ctx = l.context();
@@ -284,7 +283,7 @@ fn blocked(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'static str, loc: &'
     let mut j0 = 0;
     while j0 < n {
         let nbw = nb.min(n - j0);
-        let t = (j0 > 0).then(|| matmul_f32(&l.slice(1, j0..j0 + nbw).slice(0, 0..j0), &out.slice(1, 0..j0)));
+        let t = (j0 > 0).then(|| product(&l.slice(1, j0..j0 + nbw).slice(0, 0..j0), &out.slice(1, 0..j0)));
         let params = BlockParams { n: n as u32, k: k as u32, kp: kp as u32, j0: j0 as u32, nbw: nbw as u32, has_t: u32::from(j0 > 0), unit: u32::from(unit) };
         let args: [KernelArg<'_>; 5] = [view(l), view(b), t.as_ref().unwrap_or(&dummy).into(), (&mut out).into(), uniform(&params)];
         let key = format!("trsm_block/{nb}");
@@ -309,7 +308,7 @@ impl Array<f32> {
     /// `transpose` solves with `Aᵀ`, `unit_diag` takes the diagonal as ones without reading it.
     ///
     /// A zero on the diagonal (not `unit_diag`) gives `Inf` / `NaN` entries; it is not checked.
-    /// Big triangles are solved in blocks of rows with [`matmul_f32`] products, small ones and
+    /// Big triangles are solved in blocks of rows with `matmul_f32` products, small ones and
     /// batches in one kernel with one invocation per column of `b`. Matrices are `[cols, rows]`, as in
     /// [`matmul`](crate::matmul).
     ///

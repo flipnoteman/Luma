@@ -201,3 +201,20 @@ pub(crate) fn panel_width() -> usize {
 pub(crate) fn split_cols(w: usize) -> usize {
     if w <= 64 { (w / 2).next_multiple_of(8).min(w - 1).max(1) } else { tri::split(w) }
 }
+
+/// Whether the trailing-update products of the factorisations run on tensor cores in TF32
+/// (`LUMA_LINALG_TF32=1`; default off: every product is the exact `f32` one). The operands are
+/// rounded to a 10-bit mantissa, so the factors carry a backward error of about 1e-3 of the
+/// entries of the updates instead of 1e-7; only the CUDA backend on a device with tensor cores of
+/// compute capability 8.0 or higher takes it (see [`Array::matmul_tf32`]), every other
+/// backend computes the `f32` product anyway.
+pub(crate) fn tf32_updates() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LUMA_LINALG_TF32").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The product of the update of a factorisation: [`matmul_f32`](crate::matmul::matmul_f32), or the TF32
+/// one with [`tf32_updates`].
+pub(crate) fn product(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    if tf32_updates() { crate::matmul::matmul_tf32(lhs, rhs) } else { crate::matmul::matmul_f32(lhs, rhs) }
+}

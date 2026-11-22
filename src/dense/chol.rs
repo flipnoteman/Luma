@@ -1,7 +1,7 @@
 //! Cholesky factorisation and SPD solves.
 //!
 //! A big matrix is factored left-looking in blocks of 128 columns (64 where a workgroup has less
-//! than 33 KiB of memory): per block one product of everything finished so far ([`matmul_f32`], the
+//! than 33 KiB of memory): per block one product of everything finished so far (a matrix product, the
 //! only big flops), one workgroup that factors the diagonal block in workgroup memory and one
 //! launch of warps that solve the rows below it, all of them writing into the one output, so a
 //! matrix takes about four launches per 128 columns. Up to 64 rows, and for every matrix of a batch,
@@ -10,11 +10,10 @@
 use std::panic::Location;
 
 use super::tri::{block_size, lower_left, rhs_matrix};
-use super::{block, fail, launch, launch_unchecked, nth, per_matrix, stack_batch, Dims, NAN};
+use super::{block, fail, launch, launch_unchecked, nth, product, per_matrix, stack_batch, Dims, NAN};
 use crate::array::Array;
 use crate::context::Context;
 use crate::kernel::{uniform, view, KernelArg};
-use crate::matmul::matmul_f32;
 use crate::shape::Shape;
 
 /// Rows of the matrix a workgroup factors in workgroup memory, at most: 64 where the device has the
@@ -434,7 +433,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /// The lower Cholesky factor of one `[n, n]` matrix, left-looking in blocks of `nb` columns. Per
-/// block: `T = L[k.., ..k] L[k..k+nb, ..k]ᵀ` (one [`matmul_f32`] over everything finished so far, the
+/// block: `T = L[k.., ..k] L[k..k+nb, ..k]ᵀ` (one `matmul_f32` over everything finished so far, the
 /// only big flops: `n³/3` in all, in `n / nb` products), the diagonal block `A_kk - T` factored by
 /// one workgroup ([`diag_source`]) and the rows below it by a launch of one warp per 32 rows
 /// ([`panel_source`]): three launches a block, every one of them writing into the one output.
@@ -454,7 +453,7 @@ fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
         // The rows of the block are the first rows of the operand: one copy of the finished columns.
         let t = (k > 0).then(|| {
             let done = block(&out, k..n, 0..k).cache();
-            matmul_f32(&done, &done.slice(1, 0..nbw).transpose())
+            product(&done, &done.slice(1, 0..nbw).transpose())
         });
         let params = BlockParams { n: n as u32, k: k as u32, nbw: nbw as u32, has_t: u32::from(k > 0) };
         let tref = t.as_ref().unwrap_or(&dummy);
@@ -500,7 +499,7 @@ impl Array<f32> {
     /// A matrix that is not positive definite (a pivot that is not positive, or `NaN`) leaves a
     /// `NaN` on the diagonal of its factor from the failing column on; nothing is checked or
     /// raised. Matrices of up to 64 rows (and every matrix of a batch) are factored by one
-    /// workgroup each in one launch; bigger ones in blocks of 128 columns with [`matmul_f32`] products.
+    /// workgroup each in one launch; bigger ones in blocks of 128 columns with `matmul_f32` products.
     ///
     /// ```
     /// # use luma::*;
