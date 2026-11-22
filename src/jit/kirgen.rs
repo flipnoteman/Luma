@@ -211,6 +211,9 @@ pub(super) struct Lower<'a> {
     /// Per input, the bindings of its segments (`in{k}_{s}`).
     pub(super) segs: Vec<Vec<u32>>,
     pub(super) outs: Vec<u32>,
+    /// Whether the small integer outputs are bound as plain words: the kernel writes them as whole
+    /// words (`Build::words`), so no atomics are needed to write or read them.
+    plain_words: bool,
     /// Pairs (input `k`, output `j`): input `k` is read from the output buffer `out{j}`.
     in_place: &'a [(u32, u32)],
     views: Vec<(ViewMap, Edge)>,
@@ -232,6 +235,7 @@ impl<'a> Lower<'a> {
             ins: Vec::new(),
             segs: Vec::new(),
             outs: Vec::new(),
+            plain_words: false,
             in_place,
             views: Vec::new(),
             view_fns: Vec::new(),
@@ -749,7 +753,8 @@ impl<'a> Lower<'a> {
             }
             small if small.is_small() => {
                 let j = bind(fb, "j", index);
-                let word = fb.atomic_load(storage_target(binding, j >> lu(fb, small.small_shift())), ScalarTy::U32);
+                let at = j >> lu(fb, small.small_shift());
+                let word = if self.plain_words { fb.load(binding, at) } else { fb.atomic_load(storage_target(binding, at), ScalarTy::U32) };
                 self.extract(fb, small, word, j)
             }
             _ => fb.load(binding, index),
@@ -1982,10 +1987,12 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
     let mut mb = ModuleBuilder::new(key.label(), "main", [size, 1, 1]);
 
     // The bindings, in the order of the arguments of the launch.
+    build.env.plain_words = build.variant() == Variant::Words;
     for (j, &at) in build.outputs.iter().enumerate() {
         // An atomic scatter binds its target as atomics.
         let elem = match key.tail {
             Tail::ScatterAdd { .. } => KirType::Atomic(atomic_scalar(out_elem(at))),
+            _ if build.env.plain_words && out_elem(at).is_small() => KirType::U32,
             _ => write_elem(out_elem(at)),
         };
         build.env.outs.push(mb.add_storage_read_write(&format!("out{j}"), elem));
@@ -2387,8 +2394,8 @@ impl<'a> Build<'a> {
                 let word = fb.let_val("word", word);
                 let index = w * lu(fb, p / per) + lu(fb, m);
                 match &elems[(m * per) as usize].1 {
-                    None => fb.atomic_store(storage_target(out, index), word),
-                    Some(inside) => fb.if_then(*inside, |b| b.atomic_store(storage_target(out, index), word)),
+                    None => fb.store(out, index, word),
+                    Some(inside) => fb.if_then(*inside, |b| b.store(out, index, word)),
                 }
             }
         }
