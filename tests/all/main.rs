@@ -5,6 +5,7 @@
 #![allow(clippy::duplicate_mod)]
 
 mod common;
+mod dense_host;
 
 mod argmax;
 mod array_ops;
@@ -77,3 +78,8 @@ mod vision_matching;
 mod vision_edges;
 mod vision_regions;
 mod vision_descriptors;
+mod cholesky;
+mod lu;
+mod svd;
+mod eigh;
+mod qr;

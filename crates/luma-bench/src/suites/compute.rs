@@ -24,6 +24,8 @@ mod bandwidth;
 mod imageops;
 mod visionops;
 mod crypto;
+mod dense;
+mod dense_svd;
 mod linalg;
 mod physics;
 mod scans;
@@ -109,4 +111,6 @@ pub fn run(h: &mut Harness) {
     crypto::run(h);
     special::run(h);
     structure::run(h);
+    dense::run(h);
+    dense_svd::run(h);
 }

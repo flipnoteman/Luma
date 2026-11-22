@@ -8,6 +8,8 @@ mod cold;
 mod cusparse;
 mod diag;
 mod image;
+mod linalg;
+mod linalg_svd;
 mod lumax;
 mod mlp;
 mod smallops;
@@ -69,7 +71,7 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
     let mut b = bench::Bench::new(ctx.clone(), only, quick, Some(&format!("{out}/results.jsonl")));
     wake(&ctx);
-    let groups: [(&str, fn(&mut bench::Bench)); 20] = [
+    let groups: [(&str, fn(&mut bench::Bench)); 21] = [
         ("ew", cases::elementwise),
         ("small", cases::small_ops),
         ("reduce", cases::reductions),
@@ -89,6 +91,7 @@ fn main() {
         ("math", smallops::math),
         ("sparse", sparse::sparse),
         ("vision", vision::vision),
+        ("linalg", linalg::linalg),
         ("end", |_| ()),
     ];
     for (_, g) in groups {

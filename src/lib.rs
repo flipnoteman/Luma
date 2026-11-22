@@ -57,6 +57,8 @@ mod guide {
     pub mod data {}
     #[doc = include_str!("../guide/src/sparse.md")]
     pub mod sparse {}
+    #[doc = include_str!("../guide/src/linear-algebra.md")]
+    pub mod linear_algebra {}
     #[doc = include_str!("../guide/src/records.md")]
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
@@ -105,6 +107,7 @@ mod bykey;
 mod context;
 mod conv;
 mod cyclic;
+mod dense;
 mod solve;
 mod error;
 mod fields;
@@ -170,6 +173,11 @@ pub use linalg::{
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,
 };
 pub use bmm::matmul_batched;
+pub use dense::lu::Lu;
+pub use dense::eigh::Eigh;
+pub use dense::svd::Svd;
+pub use dense::qr::Qr;
+pub use dense::Triangle;
 pub use matmul::{dot, matmul, matmul_f32, matmul_nt, matmul_tf32, matmul_tn, matmul_tt};
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Condition, Operand};
