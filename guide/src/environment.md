@@ -63,3 +63,4 @@ These only affect the crate's own test suite: the first three the differential f
 | `LUMA_TEST_CACHE` | `1`: the process uses a cache directory under the system temporary directory (`luma-test-cache`) instead of the user's, unless `LUMA_CACHE` or `LUMA_CACHE_DIR` is set (unit tests always do) |
 | `LUMA_LINALG_FENCE` | `1` / `0`: put a storage fence before the workgroup barriers of the LU and QR panel kernels (default: on everywhere but the CPU backend; `0` is the opt-out) |
 | `LUMA_LINALG_PANEL` | `8`, `16` or `32` (default 32): columns of the panels the LU and QR of a big matrix are factored in; narrower panels measured slower on an RTX 3080 Laptop |
+| `LUMA_QR_TSQR` | `0`: factor the panels (up to 32 columns) of a single QR with the global-memory kernel that one workgroup runs through the whole panel, instead of the two level tall-skinny QR (default: the tree where the device and the panel allow it) |
