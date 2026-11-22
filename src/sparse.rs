@@ -909,7 +909,7 @@ impl Sparse<f32> {
                 Ok(plan) => plan,
                 Err(e) => return Array::poisoned(&self.ctx, out_shape, failure(op, loc, e)),
             };
-            if c == 1 && plan.max_len > SHORT_ROWS {
+            if c == 1 && plan.max_len > SHORT_ROWS && std::env::var("XP_ROWS").is_err() {
                 return (val * x.reshape(inner).take(minor)).sum_segments(ptr).reshape(out_shape);
             }
             return match self.rows_kernels(plan, (ptr, minor, val), x, c, outer) {
@@ -989,7 +989,7 @@ impl Sparse<f32> {
             // Two to four entries per lane: a barrier costs more than an idle lane, a long serial
             // walk more than a few barriers (measured on an RTX 3090: 5 entries per row best with
             // one or two lanes, 16 with eight).
-            let lanes_log = ((avg / 3.0).max(1.0).log2().ceil() as u32).min(4);
+            let lanes_log = std::env::var("XP_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(((avg / 3.0).max(1.0).log2().ceil() as u32).min(4));
             let kernel = self.ctx.kernel(SPMV_ROWS).label("sparse_spmv_rows").build()?;
             let params = RowParams { shape: lanes_log, total: outer as u32, cap: LONG_ROW, chunks: 1 };
             let groups = (outer << lanes_log).div_ceil(WORKGROUP as usize);
