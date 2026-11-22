@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, Profile};
+use luma_core::{Backend, BackendKind, Buffer, BufferUsage, CostModel, DeviceInfo, DeviceKind, Features, KernelTrust, MatmulSpec, Profile};
 
 use crate::builtin::{Builtin, BuiltinKernel};
 use crate::error::{LumaError, Result};
@@ -30,14 +30,25 @@ pub(crate) const STORAGE_USAGE: BufferUsage = BufferUsage::STORAGE
     .union(BufferUsage::COPY_DST)
     .union(BufferUsage::COPY_SRC);
 
+/// Kernels of library modules by (module, variant, entry point).
+type ModuleKernels = std::collections::HashMap<(&'static str, usize, &'static str), Arc<KernelCore>>;
+
 #[derive(Debug)]
 struct Inner {
     /// Built-in kernels, built on first use of their (operation, element type).
     builtins: BuildCache<(Builtin, &'static str), Arc<KernelCore>>,
+    /// The tables of Bluestein's algorithm by (length, inverse), see [`crate::spectral`].
+    chirps: Mutex<std::collections::HashMap<(u32, bool), Arc<crate::spectral::ChirpTables>>>,
     /// Lazy-evaluation state: fused kernels and the pending expressions.
     jit: JitState,
     /// Custom kernels, built on first use of their (source, entry, workgroup).
     kernels: BuildCache<KernelKey, Arc<KernelCore>>,
+    /// Kernels of library modules that write their WGSL themselves (see [`Context::cached_kernel`]),
+    /// by (module, variant, entry point).
+    module_kernels: Mutex<ModuleKernels>,
+    /// Kernels of the dense linear algebra by a key that determines their source (see
+    /// [`Context::keyed_kernel`]).
+    keyed_kernels: Mutex<std::collections::HashMap<String, Arc<KernelCore>>>,
     pool: Mutex<BufferPool>,
     /// Buffers the pool released; the backend drops what it caches for them (bind groups) at the
     /// next submission, which frees them.
@@ -48,6 +59,8 @@ struct Inner {
     check_finite: bool,
     /// Whether value-changing algebraic rewrites are allowed (see [`ContextOptions::fast_math`]).
     fast_math: bool,
+    /// Whether `matmul` runs on tensor cores where it can (see [`ContextOptions::tf32_matmul`]).
+    tf32_matmul: bool,
     /// Which segments of arrays hold a device buffer.
     pager: Pager,
     /// Whether `Array::from_slice` uploads into mappable storage buffers (unified memory).
@@ -183,6 +196,16 @@ pub struct ContextOptions {
     /// (below 2^-47 of the larger operand instead of 2^-46 of the result), except in reductions.
     /// Rewrites that keep every bit (`x * 1`, `-(-x)`, `min(x, x)` and the like) always run.
     pub fast_math: bool,
+    /// Runs [`Array::matmul`](crate::Array::matmul) as [`Array::matmul_tf32`](crate::Array::matmul_tf32)
+    /// does: on a device with tensor cores (the CUDA backend, compute capability 8.0 and up) the
+    /// operands of the products it can take are rounded to TF32 (a 10-bit mantissa) and the
+    /// products accumulated in `f32`, which costs about `2^-11` of the magnitudes summed in
+    /// accuracy (2e-4 of the RMS of a product of random operands) and gains up to 1.7x on large
+    /// products and several times on small ones. On by default; `false` (`LUMA_TF32_MATMUL=0`)
+    /// makes `matmul` the `f32` product on every backend, as does calling
+    /// [`Array::matmul_f32`](crate::Array::matmul_f32) for one product. No effect on other
+    /// backends, whose products are `f32` anyway.
+    pub tf32_matmul: bool,
     /// Whether the device's `fma` is a fused multiply-add, which makes the products of `Df32`
     /// arithmetic several times cheaper (see `Df32` in the crate docs). `None`: found out by a
     /// small test kernel when the device is first opened (`true` on Vulkan GPUs that fuse,
@@ -202,6 +225,7 @@ impl Default for ContextOptions {
             check_finite: false,
             calibrate: true,
             fast_math: false,
+            tf32_matmul: true,
             df_fma: None,
         }
     }
@@ -258,13 +282,21 @@ impl ContextOptions {
         self
     }
 
+    /// Runs the matrix products on tensor cores in TF32 where the device has them (the default),
+    /// or with `false` always in `f32` (see [`ContextOptions::tf32_matmul`]).
+    pub fn tf32_matmul(mut self, on: bool) -> Self {
+        self.tf32_matmul = on;
+        self
+    }
+
     /// Options from the environment: `LUMA_BACKEND` = `cuda` | `metal` | `wgpu` | `cpu` | `auto`;
     /// `LUMA_DEVICE` = `gpu` | `cpu` (anything else: `Auto`), which also takes a backend name
     /// (`cuda` | `metal` | `wgpu`) when `LUMA_BACKEND` is not set;
     /// `LUMA_MEMORY_BUDGET` and `LUMA_CHUNK_BYTES` as decimal byte counts, `LUMA_CHECK_FINITE` =
     /// `1` | `on` | `true` for the finite check, `LUMA_FAST_MATH` likewise for
-    /// [`ContextOptions::fast_math`], `LUMA_CALIBRATE` = `0` | `off` | `false` to skip
-    /// calibration.
+    /// [`ContextOptions::fast_math`], `LUMA_TF32_MATMUL` = `0` | `off` | `false` to turn
+    /// [`ContextOptions::tf32_matmul`] off, `LUMA_CALIBRATE` = `0` |
+    /// `off` | `false` to skip calibration.
     pub fn from_env() -> ContextOptions {
         let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_ascii_lowercase());
         let backend_named = |name: &str| match name {
@@ -301,6 +333,8 @@ impl ContextOptions {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
             fast_math: std::env::var("LUMA_FAST_MATH")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true")),
+            tf32_matmul: !std::env::var("LUMA_TF32_MATMUL")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")),
             df_fma: std::env::var("LUMA_DF_FMA").ok().and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
                 "1" | "on" | "true" => Some(true),
                 "0" | "off" | "false" => Some(false),
@@ -488,6 +522,12 @@ impl Context {
         self.inner.fast_math
     }
 
+    /// Whether [`Array::matmul`](crate::Array::matmul) runs on tensor cores in TF32 where it can
+    /// (see [`ContextOptions::tf32_matmul`]).
+    pub fn tf32_matmul(&self) -> bool {
+        self.inner.tf32_matmul
+    }
+
     /// Whether this context runs on a software (CPU) device.
     pub fn is_cpu(&self) -> bool {
         self.inner.backend.info().cpu
@@ -540,6 +580,8 @@ impl Context {
             },
         };
         tuning.df_sloppy_add = options.fast_math;
+        tuning.native_solve = Tuning::native_solve_for(backend.native_line_solve());
+        tuning.native_gemm = Tuning::native_gemm_for(backend.native_matmul());
         tune(&mut tuning);
 
         let ctx = Context {
@@ -552,13 +594,17 @@ impl Context {
                 cost: OnceLock::new(),
                 reduce_counter: OnceLock::new(),
                 builtins: BuildCache::default(),
+                chirps: Mutex::new(std::collections::HashMap::new()),
                 jit: JitState::new(&limits),
                 kernels: BuildCache::default(),
+                module_kernels: Mutex::default(),
+                keyed_kernels: Mutex::default(),
                 pool: Mutex::new(BufferPool::new(cap)),
                 released: Mutex::new(Vec::new()),
                 segment_bytes,
                 check_finite: options.check_finite,
                 fast_math: options.fast_math,
+                tf32_matmul: options.tf32_matmul,
                 pager: Pager::new(budget),
                 id: record::next_context_id(),
                 waits: WaitHistory::new(),
@@ -647,6 +693,19 @@ impl Context {
         &self.inner.jit
     }
 
+    /// Switches the plan cache of eager evaluation on or off (it is on unless
+    /// `LUMA_PLAN_CACHE=off`), dropping the plans it holds. Results are bit-identical either way.
+    #[doc(hidden)]
+    pub fn set_plan_cache(&self, on: bool) {
+        self.jit().set_plan_cache(on);
+    }
+
+    /// How many evaluations ran from a cached plan so far.
+    #[doc(hidden)]
+    pub fn plan_cache_hits(&self) -> u64 {
+        self.jit().plan_stats().hits
+    }
+
     /// Submits the pending batch to the GPU and returns without waiting for it, so the GPU
     /// starts working while the host keeps recording. Everything recorded afterwards runs after
     /// it, in order. Does nothing if nothing is pending.
@@ -708,6 +767,29 @@ impl Context {
         self.inner.check_finite
     }
 
+    /// Whether small jobs on host-resident data may run on the host CPU: a GPU context whose
+    /// device memory the host addresses directly ([`Context::zero_copy`]) that is not recording,
+    /// profiling or checking results, with `LUMA_HOST_FAST` not `off`.
+    ///
+    /// A discrete GPU (CUDA, Vulkan) is left out: its arrays live in device buffers from the
+    /// moment they are created, which keeps the memory budget, [`Context::memory_stats`] and
+    /// spilling exact, and the traces of `iterate` replayable. Arrays that stayed in host memory
+    /// until a kernel needed them would sit outside all of that, and uploading one while a step
+    /// is being traced ends the recording.
+    pub(crate) fn can_run_on_host(&self) -> bool {
+        #[cfg(test)]
+        if self.inner.assume_busy.load(std::sync::atomic::Ordering::Relaxed) || std::env::var("LUMA_HOST_FAST").as_deref() != Ok("on") {
+            return false;
+        }
+        !self.is_cpu()
+            && self.zero_copy()
+            && !self.recording_here()
+            && !self.check_finite()
+            && self.segment_bytes() >= 65536
+            && !self.is_profiling()
+            && std::env::var("LUMA_HOST_FAST").as_deref() != Ok("off")
+    }
+
     /// Largest buffer that can be allocated and bound as a storage buffer.
     pub(crate) fn max_buffer_bytes(&self) -> u64 {
         self.inner.max_buffer_bytes
@@ -731,6 +813,49 @@ impl Context {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// The kernel `entry` of the WGSL `source()` of a library module (`name`, one of `variant`s),
+    /// built on the first call: later calls find it by the short key without generating, cloning
+    /// or hashing the source, which for a source of kilobytes is a few microseconds of every launch.
+    pub(crate) fn cached_kernel(&self, name: &'static str, variant: usize, entry: &'static str, source: impl FnOnce() -> String) -> Result<crate::Kernel> {
+        let key = (name, variant, entry);
+        let cached = self.inner.module_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned();
+        if let Some(core) = cached {
+            return Ok(crate::Kernel::from_core(self, core));
+        }
+        let kernel = self.kernel(&source()).entry(entry).build()?;
+        self.inner.module_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, kernel.core());
+        Ok(kernel)
+    }
+
+    /// The kernel of source `make()` that `key` names (the key must determine the source), built
+    /// on the first call with `label`: later calls find it by the key. The cache belongs to this
+    /// context and holds the compiled kernels only, never a handle to a context, so it dies with
+    /// it and a finished context gives its device back to the pool.
+    pub(crate) fn keyed_kernel(&self, key: &str, label: &str, make: impl FnOnce() -> String) -> Result<crate::Kernel> {
+        self.keyed_kernel_with(key, make, |source| self.kernel(source).label(label).build())
+    }
+
+    /// [`Context::keyed_kernel`] for a kernel whose every access is in bounds by construction: built
+    /// without the per-access bounds checks.
+    ///
+    /// # Safety
+    ///
+    /// The caller vouches that every storage and workgroup access of the kernel is in bounds.
+    pub(crate) unsafe fn keyed_kernel_unchecked(&self, key: &str, label: &str, make: impl FnOnce() -> String) -> Result<crate::Kernel> {
+        // SAFETY: the caller vouches for the bounds of every access of the kernel.
+        self.keyed_kernel_with(key, make, |source| unsafe { self.kernel(source).label(label).unchecked_bounds() }.build())
+    }
+
+    fn keyed_kernel_with(&self, key: &str, make: impl FnOnce() -> String, build: impl FnOnce(&str) -> Result<crate::Kernel>) -> Result<crate::Kernel> {
+        let cached = self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned();
+        if let Some(core) = cached {
+            return Ok(crate::Kernel::from_core(self, core));
+        }
+        let kernel = build(&make())?;
+        self.inner.keyed_kernels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.to_owned(), kernel.core());
+        Ok(kernel)
+    }
+
     /// The cache of custom kernels (see [`KernelBuilder::build`]).
     pub(crate) fn kernel_cache(&self) -> &BuildCache<KernelKey, Arc<KernelCore>> {
         &self.inner.kernels
@@ -743,9 +868,19 @@ impl Context {
             .get_or_build(&(op, ty), || {
                 let label = format!("{op:?} {ty}");
                 match op.kernel(ty, &self.inner.tuning) {
-                    BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), true),
+                    BuiltinKernel::Module(module) => kernel::build_module(self, module, Some(&label), KernelTrust::Trusted),
                     BuiltinKernel::Wgsl(source) => {
-                        kernel::build_core(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), true)
+                        let native = match op {
+                            Builtin::Matmul { tile: crate::matmul::MatmulTile::Native { edge, lhs_t, rhs_t }, .. } => {
+                                Some(kernel::Native::Matmul(MatmulSpec { edge, lhs_transposed: lhs_t, rhs_transposed: rhs_t }))
+                            }
+                            Builtin::Matmul { tile: crate::matmul::MatmulTile::Gemm { rows, cols, lhs_t, rhs_t, exact }, .. } => {
+                                Some(kernel::Native::Gemm(luma_core::GemmSpec { rows, cols, lhs_transposed: lhs_t, rhs_transposed: rhs_t, exact }))
+                            }
+                            Builtin::Bmm(_) if self.inner.tuning.native_gemm > 0 => Some(kernel::Native::BatchedMatmul),
+                            _ => op.line_solve().filter(|_| self.inner.tuning.native_solve).map(kernel::Native::LineSolve),
+                        };
+                        kernel::build_core_native(self, &KernelKey::new(source.into_owned(), "main", None), Some(&label), KernelTrust::Trusted, native)
                     }
                 }
                 .map(Arc::new)
@@ -867,6 +1002,11 @@ impl Context {
     /// The kernel parameter set chosen for this context's GPU (see [`TuningProfile`]).
     pub fn tuning_profile(&self) -> TuningProfile {
         self.inner.tuning.profile
+    }
+
+    /// The cache of Bluestein tables.
+    pub(crate) fn chirps(&self) -> &Mutex<std::collections::HashMap<(u32, bool), Arc<crate::spectral::ChirpTables>>> {
+        &self.inner.chirps
     }
 
     pub(crate) fn tuning(&self) -> &Tuning {

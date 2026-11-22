@@ -19,19 +19,27 @@ pub(crate) struct Io {
     block: usize,
     systems: usize,
     parts: bool,
+    /// The row slot: the locals that hold the loaded cell are named after it, so that a sweep can
+    /// hold several rows' loads at once (see [`Io::slot`]).
+    slot: usize,
 }
 
 impl Io {
     /// The buffers `lo`, `diag`, `up` (`block^2` floats per cell, `array<vec4<f32>>` if that is a
     /// multiple of 4), `rhs` and `out` (`block` floats per cell, likewise); one system.
     pub(crate) fn buffers(block: usize) -> Io {
-        Io { block, systems: 1, parts: false }
+        Io { block, systems: 1, parts: false, slot: 0 }
     }
 
     /// The parts of `systems` systems: coefficients from the `luma_cell(sys, q)` function (see
     /// [`Io::parts_per_system`] for its result), the solution in `out{system * block + component}`.
     pub(crate) fn parts(block: usize, systems: usize) -> Io {
-        Io { block, systems, parts: true }
+        Io { block, systems, parts: true, slot: 0 }
+    }
+
+    /// This access with the locals of the loads (`load*`) and the accessors named after `slot`.
+    pub(crate) fn slot(&self, slot: usize) -> Io {
+        Io { slot, ..*self }
     }
 
     /// Parts of one system: `lo`, `diag`, `up` (`block^2` each, entry `(row, col)` at
@@ -63,7 +71,7 @@ impl Io {
     /// `diag[i].y` would load one float.
     pub(crate) fn load(&self, ind: &str, q: &str) -> String {
         if self.parts {
-            return format!("{ind}let cell = luma_cell(sys, {q});\n");
+            return format!("{ind}let cell{} = luma_cell(sys, {q});\n", self.slot);
         }
         let mut src = self.load_vec(ind, q, "diag", "bd");
         src.push_str(&self.load_vec(ind, q, "up", "bu"));
@@ -76,7 +84,7 @@ impl Io {
     /// [`Io::load_up`] for the off-diagonal blocks a sweep needs.
     pub(crate) fn load_core(&self, ind: &str, q: &str) -> String {
         if self.parts {
-            return format!("{ind}let cell = luma_cell(sys, {q});\n");
+            return format!("{ind}let cell{} = luma_cell(sys, {q});\n", self.slot);
         }
         let mut src = self.load_vec(ind, q, "diag", "bd");
         src.push_str(&self.load_rhs(ind, q));
@@ -88,7 +96,7 @@ impl Io {
         let mut src = String::new();
         if self.vec_rhs() {
             for v in 0..b / 4 {
-                let _ = writeln!(src, "{ind}let br{v} = rhs[{q} * {}u + {v}u];", b / 4);
+                let _ = writeln!(src, "{ind}let br{}_{v} = rhs[{q} * {}u + {v}u];", self.slot, b / 4);
             }
         }
         src
@@ -100,7 +108,7 @@ impl Io {
         let mut src = String::new();
         if self.vec_coef() {
             for v in 0..bb / 4 {
-                let _ = writeln!(src, "{ind}let {local}{v} = {name}[{q} * {}u + {v}u];", bb / 4);
+                let _ = writeln!(src, "{ind}let {local}{}_{v} = {name}[{q} * {}u + {v}u];", self.slot, bb / 4);
             }
         }
         src
@@ -120,9 +128,9 @@ impl Io {
     fn coef(&self, buffer: &str, local: &str, offset: usize, q: &str, k: usize) -> String {
         let bb = self.block * self.block;
         if self.parts {
-            format!("cell[{}]", offset + k)
+            format!("cell{}[{}]", self.slot, offset + k)
         } else if self.vec_coef() {
-            format!("{local}{}.{}", k / 4, ["x", "y", "z", "w"][k % 4])
+            format!("{local}{}_{}.{}", self.slot, k / 4, ["x", "y", "z", "w"][k % 4])
         } else {
             format!("{buffer}[{q} * {bb}u + {k}u]")
         }
@@ -146,9 +154,9 @@ impl Io {
     pub(crate) fn rhs(&self, q: &str, i: usize) -> String {
         let b = self.block;
         if self.parts {
-            format!("cell[{}]", 3 * b * b + i)
+            format!("cell{}[{}]", self.slot, 3 * b * b + i)
         } else if self.vec_rhs() {
-            format!("br{}.{}", i / 4, ["x", "y", "z", "w"][i % 4])
+            format!("br{}_{}.{}", self.slot, i / 4, ["x", "y", "z", "w"][i % 4])
         } else {
             format!("rhs[{q} * {b}u + {i}u]")
         }

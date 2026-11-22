@@ -11,7 +11,8 @@ use crate::ops::select;
 /// A context with the calibration off and the cost model pinned, so that kernel counts do not
 /// depend on the machine.
 fn ctx() -> Context {
-    let ctx = Context::with_options(ContextOptions::from_env().calibrate(false)).unwrap();
+    // Groups of reductions are recorded in one kernel at once (the tests count launches), whatever the backend's default.
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi_after = 0).unwrap();
     ctx.set_cost_model(CostModel::TEST);
     ctx
 }
@@ -49,6 +50,7 @@ fn delta(before: StatsSnapshot, after: StatsSnapshot) -> StatsSnapshot {
         replays: after.replays - before.replays,
         speculated: after.speculated - before.speculated,
         transposes: after.transposes - before.transposes,
+        coarsened: after.coarsened - before.coarsened,
     }
 }
 
@@ -249,6 +251,324 @@ fn reductions_fuse_their_input_expression() {
         let want_max = data.iter().map(|&v| v + 1.0).fold(f32::NEG_INFINITY, f32::max);
         assert_eq!(got_max, want_max, "{len}");
     }
+}
+
+#[test]
+fn many_reductions_over_a_deep_shared_expression_are_grouped_and_exact() {
+    let ctx = ctx();
+    let n = 20_000;
+    let x = f32s(&ctx, &values(n, 9, 0.5, 1.5));
+    let y = f32s(&ctx, &values(n, 10, 0.5, 1.5));
+    let accs = ctx.tuning().reduce_multi;
+    // A state expression of hundreds of nodes that every reduction reads (the padded state a force monitor gathers from).
+    let make = || {
+        let mut state = &x * 0.5;
+        for step in 0..300 {
+            state = &state * 0.999 + &y * (0.001 + step as f32 * 1e-6);
+        }
+        (0..96).map(|k| (&state * (k as f32 + 1.0)).sum()).collect::<Vec<_>>()
+    };
+    let alone: Vec<u32> = make().iter().map(|r| r.item().unwrap().to_bits()).collect();
+    let sums = make();
+    let before = ctx.jit().stats();
+    let got: Vec<u32> = sums.iter().map(|r| r.item().unwrap().to_bits()).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(got, alone);
+    assert!(d.reduce_launches <= 96usize.div_ceil(accs) as u64 + 1, "{d:?}");
+}
+
+#[test]
+fn kernels_of_later_reduction_groups_are_built_when_the_first_is() {
+    use crate::view::concat_slice;
+    let n = 100_000;
+    let xs = values(n, 7, -1.0, 1.0);
+    let accs = ctx().tuning().reduce_multi;
+    let groups = 3;
+    // The groups of `accs` sums each have a program of their own (a different number of `abs`), so each is a kernel.
+    let make = |ctx: &Context| -> Vec<Array<f32>> {
+        let x = f32s(ctx, &xs);
+        (0..groups * accs)
+            .map(|j| {
+                let mut e = &x * (j as f32 + 1.0);
+                for _ in 0..=j / accs {
+                    e = e.abs() + 0.5;
+                }
+                e.sum().reshape([1])
+            })
+            .collect()
+    };
+    // The values from a context of its own, which the kernels of the one measured are not in.
+    let other = ctx();
+    let alone: Vec<u32> = make(&other).iter().map(|r| r.to_vec().unwrap()[0].to_bits()).collect();
+    let ctx = ctx();
+    let sums = make(&ctx);
+    let before = ctx.jit().stats();
+    // The first read records the first group, and starts the others' kernels.
+    let first = sums[0].to_vec().unwrap()[0];
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 1, "{d:?}");
+    assert_eq!(d.built, groups as u64, "{d:?}");
+    let before = ctx.jit().stats();
+    let rest: Vec<f32> = (1..groups).map(|g| sums[g * accs].to_vec().unwrap()[0]).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, groups as u64 - 1, "{d:?}");
+    assert_eq!(d.built, 0, "the kernels were built already: {d:?}");
+    let all: Vec<u32> = concat_slice(0, &sums).to_vec().unwrap().into_iter().map(f32::to_bits).collect();
+    assert_eq!(all, alone);
+    assert_eq!(first.to_bits(), alone[0]);
+    assert!(rest.iter().enumerate().all(|(g, v)| v.to_bits() == alone[(g + 1) * accs]));
+}
+
+#[test]
+fn a_group_of_reductions_forced_repeatedly_ends_up_in_one_kernel() {
+    use crate::view::concat_slice;
+    let after = 3;
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi_after = after).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let x = f32s(&ctx, &values(100_000, 11, -1.0, 1.0));
+    let count = 12;
+    assert!(count <= ctx.tuning().reduce_multi);
+    // The scalars differ from call to call: the group is the same structure.
+    let run = |scale: f32| -> (u64, Vec<u32>) {
+        let sums: Vec<Array<f32>> = (0..count).map(|j| (&x * (j as f32 + scale)).sum().reshape([1])).collect();
+        let before = ctx.jit().stats();
+        let joined = concat_slice(0, &sums).to_vec().unwrap();
+        (delta(before, ctx.jit().stats()).reduce_launches, joined.into_iter().map(f32::to_bits).collect())
+    };
+    let (first, bits) = run(1.5);
+    assert_eq!(first, count as u64, "recorded one by one while the group is not due");
+    for _ in 1..after {
+        let (launches, again) = run(1.5);
+        assert_eq!(launches, count as u64);
+        assert_eq!(again, bits);
+    }
+    // Due: the kernel compiles in the background and no launch waits for it; once it is ready the group is one launch.
+    let mut merged = None;
+    for _ in 0..1000 {
+        let (launches, again) = run(1.5);
+        // The same bits on the CPU backend; a GPU kernel that holds several uses of a product rounds its multiply-adds
+        // differently, so there the merged kernel agrees to rounding.
+        if ctx.is_cpu() {
+            assert_eq!(again, bits, "values are the same bits in either kernel");
+        } else {
+            let f = |v: &[u32]| v.iter().map(|&b| f32::from_bits(b)).collect::<Vec<f32>>();
+            assert_close(&f(&again), &f(&bits), 1e-4, 1e-4);
+        }
+        if launches == 1 {
+            merged = Some(launches);
+            break;
+        }
+        assert_eq!(launches, count as u64);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(merged.is_some(), "the merged kernel was never used");
+    // Other values of the scalars: the same kernel, at once.
+    let (launches, _) = run(2.5);
+    assert_eq!(launches, 1);
+}
+
+#[test]
+fn consumers_of_pending_reductions_record_them_as_a_group() {
+    use crate::view::{concat_slice, stack_slice};
+    let ctx = ctx();
+    let n = 100_000;
+    let xs = values(n, 5, -1.0, 1.0);
+    let x = f32s(&ctx, &xs);
+    let accs = ctx.tuning().reduce_multi;
+    // A launch count per consumer, and the values each gives (read after the counts, and bit-compared with the alone ones).
+    let make = |k: usize| -> Vec<Array<f32>> { (0..k).map(|j| (&x * (j as f32 + 1.0)).sum()).collect() };
+    let alone: Vec<u32> = make(12).iter().map(|r| r.item().unwrap().to_bits()).collect();
+    let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+
+    // Reshaped to one element and concatenated, the pattern of a force monitor.
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let joined = concat_slice(0, &sums).to_vec().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "concat: {d:?}");
+    assert_eq!(bits(joined), alone);
+
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let stacked = stack_slice(0, &sums).to_vec().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "stack: {d:?}");
+    assert_eq!(bits(stacked), alone);
+
+    // Used in an elementwise expression: the reductions are recorded together when the expression runs.
+    let sums = make(12);
+    let before = ctx.jit().stats();
+    let mut total = sums[0].reshape([1, 1]);
+    for s in &sums[1..] {
+        total = &total + &s.reshape([1, 1]);
+    }
+    let got = total.item().unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "expression: {d:?}");
+    let want: f32 = alone.iter().fold(0.0, |acc, &b| acc + f32::from_bits(b));
+    assert!((got - want).abs() <= 1e-3 * want.abs().max(1.0), "{got} vs {want}");
+
+    // `eval_all` of reshaped reductions.
+    let sums: Vec<Array<f32>> = make(12).iter().map(|s| s.reshape([1])).collect();
+    let before = ctx.jit().stats();
+    let refs: Vec<&Array<f32>> = sums.iter().collect();
+    crate::eval_all(&refs).unwrap();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "eval_all: {d:?}");
+    assert_eq!(bits(sums.iter().map(|s| s.item().unwrap()).collect()), alone);
+}
+
+#[test]
+fn pending_reductions_of_shared_data_are_recorded_in_one_kernel() {
+    let ctx = ctx();
+    let n = 100_000;
+    let xs = values(n, 3, -1.0, 1.0);
+    let ys = values(n, 4, -1.0, 1.0);
+    let (x, y) = (f32s(&ctx, &xs), f32s(&ctx, &ys));
+    let accs = ctx.tuning().reduce_multi;
+
+    // Twelve sums of expressions of one product: one launch (or two passes on a device that cannot finish in one).
+    let product = &x * &y;
+    let sums: Vec<_> = (0..12).map(|k| (&product * (k as f32 + 1.0)).sum()).collect();
+    let before = ctx.jit().stats();
+    let got: Vec<f32> = sums.iter().map(|sum| sum.item().unwrap()).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.elementwise_launches, 0, "the product is never materialized");
+    assert_eq!(d.reduce_launches, 12usize.div_ceil(accs) as u64, "{d:?}");
+    let dot: f64 = xs.iter().zip(&ys).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
+    for (k, value) in got.iter().enumerate() {
+        let want = dot * (k as f64 + 1.0);
+        assert!((f64::from(*value) - want).abs() <= 1e-3 * want.abs().max(1.0), "sum {k}: {value} vs {want}");
+    }
+
+    // More than a kernel takes: as few kernels as the accumulators allow, in creation order.
+    let sums: Vec<_> = (0..40).map(|k| (&x * (k as f32 + 1.0)).sum()).collect();
+    let before = ctx.jit().stats();
+    let got: Vec<f32> = sums.iter().map(|sum| sum.item().unwrap()).collect();
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 40usize.div_ceil(accs) as u64, "{d:?}");
+    let total: f64 = xs.iter().map(|&a| f64::from(a)).sum();
+    for (k, value) in got.iter().enumerate() {
+        let want = total * (k as f64 + 1.0);
+        assert!((f64::from(*value) - want).abs() <= 1e-2 * (k as f64 + 1.0), "sum {k}: {value} vs {want}");
+    }
+
+    // A reduction that waits for another (a variance on a mean) goes after it: the means in one kernel, the variances in another
+    // (a mean is recorded where an array is made from it: it is broadcast over `x`).
+    let before = ctx.jit().stats();
+    let means: Vec<_> = (0..4).map(|k| (&x + k as f32).mean()).collect();
+    let vars: Vec<_> = means
+        .iter()
+        .enumerate()
+        .map(|(k, mean)| {
+            let centered = &(&x + k as f32) - mean;
+            (&centered * &centered).mean()
+        })
+        .collect();
+    for var in &vars {
+        var.item().unwrap();
+    }
+    let d = delta(before, ctx.jit().stats());
+    assert_eq!(d.reduce_launches, 2, "{d:?}");
+}
+
+/// The arrays a program makes of reductions along `axis` of data it shares: sums, extrema and a variance of expressions of one product, of the
+/// arrays themselves and of their difference.
+fn axis_siblings(ctx: &Context, dims: &[usize], axis: usize) -> Vec<Array<f32>> {
+    let shape = match dims {
+        [a, b] => crate::shape::Shape::from([*a, *b]),
+        [a, b, c] => crate::shape::Shape::from([*a, *b, *c]),
+        _ => unreachable!("two or three dimensions"),
+    };
+    let len: usize = dims.iter().product();
+    let x = Array::from_slice_on(ctx, &values(len, 31, -1.0, 1.0), shape).unwrap();
+    let y = Array::from_slice_on(ctx, &values(len, 32, 0.5, 2.0), shape).unwrap();
+    let product = &x * &y;
+    vec![
+        (&product + 1.0).sum_axis(axis),
+        (&product * &product).max_axis(axis),
+        product.min_axis(axis),
+        x.sum_axis(axis),
+        (&x - &y).sum_axis(axis),
+        x.var_axis(axis),
+        y.mean_axis(axis),
+    ]
+}
+
+#[test]
+fn sibling_axis_reductions_are_recorded_in_one_kernel_with_the_bits_of_each_alone() {
+    // Every group is merged, however light or small its operands (the defaults defer only heavy ones on the CPU backend, large ones on the others).
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| {
+        tuning.axis_defer_weight = 0;
+        tuning.axis_defer_cells = 0;
+    })
+    .unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    // The same program on a context that records every axis reduction on its own: the bits to match.
+    let alone_ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.reduce_multi = 1).unwrap();
+    alone_ctx.set_cost_model(CostModel::TEST);
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    // Short contiguous lines (a group of lines per workgroup), long ones (a workgroup per chunk, several chunks: two passes), strided lines
+    // (one invocation per line; blocked, with partial results), the middle axis of three.
+    let cases: [(&[usize], usize); 7] = [(&[40, 300], 0), (&[300, 7], 0), (&[40_000, 3], 0), (&[5, 300], 1), (&[4, 70_000], 1), (&[6, 33, 5], 1), (&[6, 33, 5], 2)];
+    // On the CPU backend the program is one kernel and every value is the bits of the one it has alone. A GPU backend may judge the
+    // variance's shifted operand (a broadcast slice of its input) differently and leave it to a kernel of its own, and fuse the
+    // multiply-adds of a kernel by what it holds, so there the launches are at most one per op and the values agree to rounding.
+    let exact = ctx.is_cpu();
+    let close = |got: &[u32], want: &[u32], what: &str| {
+        if exact {
+            assert_eq!(got, want, "{what}");
+        } else {
+            let (got, want): (Vec<f32>, Vec<f32>) = (got.iter().map(|&b| f32::from_bits(b)).collect(), want.iter().map(|&b| f32::from_bits(b)).collect());
+            assert_close(&got, &want, 1e-4, 1e-4);
+        }
+    };
+    for (dims, axis) in cases {
+        let want: Vec<Vec<u32>> = axis_siblings(&alone_ctx, dims, axis).iter().map(|array| bits(array.to_vec().unwrap())).collect();
+        let arrays = axis_siblings(&ctx, dims, axis);
+        let before = ctx.jit().stats();
+        // One use records them all.
+        let first = bits(arrays[0].to_vec().unwrap());
+        let d = delta(before, ctx.jit().stats());
+        if exact {
+            assert_eq!(d.reduce_launches, 1, "{dims:?} axis {axis}: {d:?}");
+            assert_eq!(d.elementwise_launches, 0, "{dims:?} axis {axis}: the operands are never materialized");
+        } else {
+            assert!((1..=8).contains(&d.reduce_launches), "{dims:?} axis {axis}: {d:?}");
+        }
+        close(&first, &want[0], &format!("{dims:?} axis {axis}: sum"));
+        for (k, array) in arrays.iter().enumerate().skip(1) {
+            close(&bits(array.to_vec().unwrap()), &want[k], &format!("{dims:?} axis {axis}: array {k}"));
+        }
+        if exact {
+            assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 1, "{dims:?} axis {axis}: reading the others launches nothing");
+        }
+    }
+}
+
+#[test]
+fn axis_reductions_of_light_operands_are_not_left_pending_on_the_cpu() {
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| tuning.axis_defer_weight = 12).unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    if !ctx.is_cpu() {
+        return;
+    }
+    let dims = [40, 300];
+    let x = Array::from_slice_on(&ctx, &values(12_000, 41, -1.0, 1.0), dims).unwrap();
+    let y = Array::from_slice_on(&ctx, &values(12_000, 42, 0.5, 2.0), dims).unwrap();
+    // Light operands: one kernel each, as soon as they are asked for.
+    let before = ctx.jit().stats();
+    let (a, b) = ((&x + 1.0).sum_axis(0), (&y * 2.0).max_axis(0));
+    a.eval().unwrap();
+    b.eval().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 2);
+    // A long chain in common: pending until used, then one kernel for both.
+    let r = ((&x * &x + &y * &y + 1.0).sqrt() + (&x - &y).abs()).exp() * (&x + &y).tanh();
+    let (a, b) = ((&r * &x).sum_axis(0), (&r * &y).sum_axis(0));
+    let before = ctx.jit().stats();
+    a.eval().unwrap();
+    b.eval().unwrap();
+    assert_eq!(delta(before, ctx.jit().stats()).reduce_launches, 1);
 }
 
 #[test]
@@ -1293,7 +1613,10 @@ fn eval_loops_of_threads_that_alternate_are_both_compressed() {
         threads.into_iter().map(|thread| thread.join().unwrap()).collect()
     });
     let launches = delta(before, ctx.jit().stats()).elementwise_launches;
-    assert!(launches < 40, "{launches} kernels for 2 x {steps} steps");
+    // On the CPU a plan of one step takes the fused kernel, which counts here, where on a GPU it is a
+    // (not counted) one-step stencil: the steps still run in fewer kernels than there are steps.
+    let bound = if ctx.is_cpu() { 2 * steps as u64 * 3 / 5 } else { 40 };
+    assert!(launches < bound, "{launches} kernels for 2 x {steps} steps");
     for (want, got) in results {
         assert_close(&got, &want, 1e-6, 1e-6);
     }
@@ -4570,8 +4893,15 @@ fn shape_program(ctx: &Context, shape: impl Into<crate::Shape>) {
 #[test]
 fn an_expression_on_another_shape_is_the_same_kernel() {
     // The extents and strides are not powers of two (a power of two is another structure: its
-    // index math is shifts and masks), so no shape falls into a class of its own.
-    let ctx = ctx();
+    // index math is shifts and masks), so no shape falls into a class of its own. Coarsening is
+    // off: its factor follows the element count against the device's multiprocessors, so on a
+    // smaller GPU a bigger shape takes another factor and is another kernel by design.
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| {
+        tuning.reduce_multi_after = 0;
+        tuning.coarsen = crate::tuning::Coarsen::Off;
+    })
+    .unwrap();
+    ctx.set_cost_model(CostModel::TEST);
     shape_program(&ctx, [210, 71]);
     let first = ctx.jit().stats().built;
     assert!(first > 0);
@@ -4814,4 +5144,120 @@ fn a_failed_graph_capture_is_tried_again_until_three_have_failed() {
         assert!(graph.is_none());
     }
     assert_eq!(tries, 3);
+}
+
+/// A state the step hands back unchanged (itself, or `&s * 1.0`) takes no launch per step: the
+/// plan has the launches of the other states only, the unchanged states are bound to one buffer at
+/// every step and come out as they went in, after an even or an odd number of steps.
+#[test]
+fn a_state_a_step_hands_back_unchanged_takes_no_launch() {
+    let ctx = ctx();
+    let (xs, ks, ms) = (values(1000, 40, 0.0, 1.0), values(1000, 41, 0.0, 1.0), values(1000, 42, 0.0, 1.0));
+    let (x, k, m) = (f32s(&ctx, &xs), f32s(&ctx, &ks), f32s(&ctx, &ms));
+    let step = |s: &[Array<f32>; 3]| [(s[0].shift(1) * 0.5 + &s[1] * 0.25 - s[2].shift(-1) * 0.125).cache(), s[1].clone(), &s[2] * 1.0];
+    let (mut trace, probes) = crate::jit::Trace::start(&[&x, &k, &m]).ok().unwrap();
+    let probes: [Array<f32>; 3] = probes.try_into().ok().unwrap();
+    let next = step(&probes);
+    let stepper = trace.finish(&next.each_ref(), true).ok().unwrap().expect("the step is stepable");
+    assert_eq!(stepper.plan().launches(), 1, "only the first state is computed");
+    let reference = |steps: usize| {
+        let mut a = xs.clone();
+        let n = a.len();
+        for _ in 0..steps {
+            a = (0..n).map(|i| a[(i + n - 1) % n] * 0.5 + ks[i] * 0.25 - ms[(i + 1) % n] * 0.125).collect();
+        }
+        a
+    };
+    for steps in [1, 2, 3, 4, 7] {
+        stepper.run_steps(steps).unwrap();
+        let after = stepper.state_after(steps);
+        let read = |at: usize| Array::<f32>::from_storage(&ctx, x.shape(), std::sync::Arc::clone(&after[at])).to_vec().unwrap();
+        assert_close(&read(0), &reference(steps), 1e-5, 1e-6);
+        assert_eq!(read(1), ks, "{steps} steps");
+        assert_eq!(read(2), ms, "{steps} steps");
+    }
+    assert_eq!(k.to_vec().unwrap(), ks);
+    assert_eq!(m.to_vec().unwrap(), ms);
+
+    // The same through `iterate_all`: the results are arrays of their own.
+    for steps in [1, 2, 5, 6] {
+        let [r, mut rk, rm] = crate::iterate_all([&x, &k, &m], steps, step);
+        assert_close(&r.to_vec().unwrap(), &reference(steps), 1e-5, 1e-6);
+        rk += 1.0;
+        assert_eq!(rk.to_vec().unwrap(), ks.iter().map(|v| v + 1.0).collect::<Vec<_>>());
+        assert_eq!(rm.to_vec().unwrap(), ms);
+        assert_eq!(k.to_vec().unwrap(), ks);
+    }
+}
+
+#[test]
+fn a_standardized_operand_counts_the_reductions_it_waits_for_as_buffers() {
+    // `(x - mean) / std` reads the mean and deviation once recorded (on a GPU backend they stay
+    // pending until the product needs them): an operand of several buffers that a skinny product
+    // would recompute at every read, which `matmul` weighs by asking `is_recomputed`.
+    let ctx = ctx();
+    let (rows, feats) = (1 << 17, 8);
+    let x = Array::from_slice_on(&ctx, &values(rows * feats, 7, 0.0, 1.0), [rows, feats]).unwrap();
+    let z = (&x - &x.mean_axis(0)) / &x.std_axis(0);
+    let node = z.pending().expect("a lazy expression");
+    assert!(super::is_recomputed(node));
+    // One buffer and nothing pending stays cheap to read.
+    let scaled = &x * 2.0;
+    assert!(!super::is_recomputed(scaled.pending().expect("a lazy expression")));
+}
+
+#[test]
+fn column_statistics_of_compact_integers_are_recorded_in_one_kernel() {
+    let ctx = Context::with_tuning(ContextOptions::from_env().calibrate(false), |tuning| {
+        tuning.axis_defer_weight = 0;
+        tuning.axis_defer_cells = 0;
+    })
+    .unwrap();
+    ctx.set_cost_model(CostModel::TEST);
+    let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    for (dims, axis) in [([40usize, 300], 0usize), ([40, 300], 1), ([300, 7], 1)] {
+        let hostf: Vec<f32> = values(dims[0] * dims[1], 51, -2000.0, 2000.0).iter().map(|&v| (v as i16).into()).collect();
+        let host: Vec<i16> = hostf.iter().map(|&v| v as i16).collect();
+        let x = Array::from_slice_on(&ctx, &host, dims).unwrap();
+        let xf = Array::from_slice_on(&ctx, &hostf, dims).unwrap();
+        let (mean, var) = (x.mean_axis(axis), x.var_axis(axis));
+        let before = ctx.jit().stats();
+        let (m, v) = (bits(mean.to_vec().unwrap()), bits(var.to_vec().unwrap()));
+        let d = delta(before, ctx.jit().stats());
+        // The widening cast is computed inside the kernel that reduces, and the two reductions share it: on the CPU
+        // backend one kernel (a GPU backend may leave the variance's shifted operand to a kernel of its own).
+        assert_eq!(d.elementwise_launches, 2, "{dims:?} axis {axis}: only the two divisions: {d:?}");
+        if ctx.is_cpu() {
+            assert_eq!(d.reduce_launches, 1, "{dims:?} axis {axis}: {d:?}");
+        } else {
+            assert!((1..=3).contains(&d.reduce_launches), "{dims:?} axis {axis}: {d:?}");
+        }
+        // The same values as the `f32` array of the same numbers.
+        let (want_m, want_v) = (bits(xf.mean_axis(axis).to_vec().unwrap()), bits(xf.var_axis(axis).to_vec().unwrap()));
+        if ctx.is_cpu() {
+            assert_eq!((m, v), (want_m, want_v), "{dims:?} axis {axis}");
+        } else {
+            assert_close(&m.iter().map(|&b| f32::from_bits(b)).collect::<Vec<_>>(), &want_m.iter().map(|&b| f32::from_bits(b)).collect::<Vec<_>>(), 1e-4, 1e-4);
+        }
+    }
+}
+
+/// A triangle of a stored matrix is a select of the matrix and zero by a mask of coordinates: the
+/// elements of the zeroed half do not read the matrix.
+#[test]
+fn a_triangle_of_a_stored_matrix_branches_and_reads_half() {
+    let ctx = ctx();
+    let n = 300usize;
+    let data = values(n * n, 77, -1.0, 1.0);
+    let a = f32s(&ctx, &data);
+    let a = a.reshape([n, n]);
+    a.eval().unwrap();
+    let got = a.lower(false).to_vec().unwrap();
+    for j in 0..n {
+        for i in 0..n {
+            let want = if j > i { 0.0 } else { data[i + n * j] };
+            assert_eq!(got[i + n * j], want, "({i}, {j})");
+        }
+    }
+    assert!(ctx.jit().last_branches() > 0, "the triangle is not a branch ({:?})", ctx.jit().last_judgement());
 }

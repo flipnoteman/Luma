@@ -18,7 +18,8 @@
 //! compute (the record of step `j` is then the output of launch `j`, and the loop makes one launch
 //! more than it has steps, whose result nobody sees: see `GateLoop`). Where a reduction finishes
 //! in its first launch (CUDA and CPU, see `Tuning::single_pass_reduce`) and the step does not read
-//! its index, the last workgroup of that launch also runs the gate: a step is one launch. Several
+//! its index, the last workgroup of that launch also runs the gate: a step is one launch. Elsewhere
+//! the gate runs in the last pass that finishes the reduction (a step is two launches). Several
 //! records, or records that are not one reduction, keep the records after the step and the gate as
 //! a launch of its own; the values are the same.
 
@@ -766,7 +767,7 @@ fn run<S: Fields>(init: S, until: &Until<'_, S>, step: &impl Fn(&S, &Array<f32>)
     drop(arrays);
 
     let plan = {
-        jit::force(&next.arrays())?;
+        jit::force_stepped(&next.arrays(), trace.as_ref().map_or(&[][..], |trace| &trace.probe_storages[..]))?;
         records.force()?;
         trace.as_mut().and_then(Trace::finish_plan)
     };
@@ -853,8 +854,7 @@ fn gated(
     if !fits {
         return Err(Some(Box::new(plan)));
     }
-    let outs: std::result::Result<Vec<Arc<Storage>>, _> =
-        next.arrays().into_iter().map(|array| array.storage().cloned()).collect();
+    let outs = jit::force_stepped(&next.arrays(), &trace.probe_storages);
     match outs {
         Ok(outs) => Stepper::new(ctx, plan, &trace.init, &trace.probe_storages, outs).map_err(Some),
         Err(_) => Err(Some(Box::new(plan))),
@@ -905,6 +905,17 @@ thread_local! {
 /// Launches of a traced step that the buffers of a folded gate are made for (three words of
 /// dispatch arguments each).
 const FOLD_LAUNCHES: usize = 256;
+
+/// Commands of the graph a one-shot loop replays (see [`GateLoop::run_span`]), about: capturing
+/// costs some tens of microseconds a command.
+const UNIT_LAUNCHES: usize = 64;
+
+/// Most steps of such a graph.
+const MAX_UNIT: usize = 16;
+
+/// Launches a one-shot loop makes one by one before it captures graphs: capturing a unit costs as
+/// much as a hundred launches replayed one by one, which a loop that stops sooner never gets back.
+const WARM_LAUNCHES: usize = 100;
 
 /// How the records of a traced step are computed.
 enum Records {
@@ -960,6 +971,8 @@ fn trace_records<S: Fields>(
     conds: &[Cond],
     buffers: Option<&GateBuffers>,
 ) -> Outcome<Records> {
+    // The states the step hands back unchanged stay unevaluated (see `jit::force_stepped`).
+    let probe_storages: Vec<Arc<Storage>> = probes.arrays().into_iter().filter_map(|probe| probe.storage().ok().cloned()).collect();
     if until.records.len() == 1 && !ctx.recording_writes_outside() {
         check_shapes(next, shapes)?;
         if let Some(rec) = records_of(until, shapes, probes)?.pop() {
@@ -971,14 +984,15 @@ fn trace_records<S: Fields>(
             // a recorded one is replayed (with that state set up, see `GateLoop::drive`).
             let args = buffers.filter(|_| ctx.recording_here()).and_then(|buffers| buffers.fold_args(step_pin.buffer()));
             let gate = args.as_ref().map(|args| jit::FoldGate { id: GateId::register(&gate_logic(1, conds, true).0), args, stepv: stepv_storage.id() });
-            if let Some(grouped) = jit::force_with_record(ctx, &next.arrays(), &rec, pin.buffer(), gate) {
+            let moving: Vec<&Array<S::Elem>> = next.arrays().into_iter().zip(&probe_storages).filter(|&(array, probe)| !array.passes_through(probe)).map(|(array, _)| array).collect();
+            if let Some(grouped) = jit::force_with_record(ctx, &moving, &rec, pin.buffer(), gate) {
                 return Ok(Records::Fused { value, fold: grouped?.folded });
             }
         }
     }
     // The records read the new state (a residual of it, through slices): evaluated first, they
     // read its buffers instead of recomputing the step at every index they read.
-    jit::force(&next.arrays())?;
+    jit::force_stepped(&next.arrays(), &probe_storages)?;
     Ok(Records::After(records_of(until, shapes, next)?))
 }
 
@@ -990,7 +1004,7 @@ fn fold_buffers<S: Fields>(ctx: &Context, until: &Until<'_, S>, constants: usize
     if crate::jit::SEPARATE_GATE.with(std::cell::Cell::get) {
         return None;
     }
-    if until.records.len() != 1 || !ctx.tuning().single_pass_reduce {
+    if until.records.len() != 1 {
         return None;
     }
     GateBuffers::new(ctx, 1, until.max_steps, 3 * FOLD_LAUNCHES, constants, true).ok()
@@ -1174,6 +1188,10 @@ struct GateLoop {
     buffers: GateBuffers,
     /// Dispatch arguments, as many as the longest span of launches run so far.
     args: Vec<Buffer>,
+    /// Where a gate folded into the plan writes the next dispatch arguments in a span of one
+    /// launch, whose own are in `args[0]`: a buffer a dispatch reads its arguments from is
+    /// not written by the same dispatch. They are copied to `args[0]` after it.
+    spare: Option<Buffer>,
     /// Captured spans of launches, by (launches, whether the first is an even launch).
     graphs: GraphCache<(usize, bool)>,
     /// A compiled loop is run again and again: its spans are captured on first use. A one-shot
@@ -1221,6 +1239,7 @@ impl GateLoop {
             constants: spec.constants.iter().map(|c| c.to_bits()).collect(),
             buffers,
             args: Vec::new(),
+            spare: None,
             graphs: GraphCache::new(ctx),
             compiled: false,
         })
@@ -1244,6 +1263,10 @@ impl GateLoop {
             let buffers = &mut self.buffers;
             let buffer = take(&self.ctx, &mut buffers.owned, &mut buffers.held, bytes, STORAGE_USAGE | BufferUsage::INDIRECT)?;
             self.args.push(buffer);
+        }
+        if self.fold.is_some() && self.spare.is_none() {
+            let buffers = &mut self.buffers;
+            self.spare = Some(take(&self.ctx, &mut buffers.owned, &mut buffers.held, bytes, STORAGE_USAGE)?);
         }
         Ok(())
     }
@@ -1305,22 +1328,26 @@ impl GateLoop {
                     let raw = self.gate_args(next, resolved);
                     launch_1d(&self.ctx, gate, 1, &raw)?;
                 }
-                None => self.stepper.plan().replay(&self.with_next(swaps, next), Some(&self.args[k]))?,
+                None => match self.spare.as_ref().filter(|_| len == 1) {
+                    Some(spare) => {
+                        self.stepper.plan().replay(&self.with_next(swaps, spare), Some(&self.args[k]))?;
+                        self.ctx.copy(spare, 0, &self.args[0], 0, self.buffers.args_bytes())?;
+                    }
+                    None => self.stepper.plan().replay(&self.with_next(swaps, next), Some(&self.args[k]))?,
+                },
             }
         }
         Ok(())
     }
 
-    /// Launches `i0..i0 + len` (`i0 > 0`) as one graph: captured on first use in a compiled loop,
-    /// which runs its spans again and again, else the second time such a span runs (a one-shot
-    /// loop's first spans run once); `None` to launch them one by one.
-    fn graph(&self, i0: usize, len: usize) -> Result<Option<Arc<dyn ExecGraph>>> {
+    /// Launches `i0..i0 + len` (`i0 > 0`) as one graph, captured when `replays` of it are
+    /// expected (or the second time it is asked for); `None` to launch them one by one.
+    fn graph(&self, i0: usize, len: usize, replays: usize) -> Result<Option<Arc<dyn ExecGraph>>> {
         let grid = match &self.gate {
             Some(gate) => workgroups_1d(&self.ctx, gate, 1)?,
             None => [1, 1, 1],
         };
         let key = (len, (i0 + 1).is_multiple_of(2));
-        let replays = if self.compiled { jit::PAYING_REPLAYS } else { 1 };
         Ok(self.graphs.get_or_build(key, replays, || {
             let swaps = [self.stepper.subst(2), self.stepper.subst(3)];
             let resolved = [self.resolved(&swaps[0]), self.resolved(&swaps[1])];
@@ -1341,18 +1368,36 @@ impl GateLoop {
         }))
     }
 
+    /// Launches of a unit of the graphs a one-shot loop replays: an even number of launches (so
+    /// that every unit of a span starts at the same parity), about [`UNIT_LAUNCHES`] commands.
+    fn unit(&self) -> usize {
+        let per_step = self.stepper.plan().launches() + usize::from(self.gate.is_some());
+        ((UNIT_LAUNCHES / per_step.max(1)) & !1).clamp(2, MAX_UNIT)
+    }
+
     /// Runs launches `i0..i0 + len` (the first reads `init` when `i0` is 0, and always runs on its
-    /// own), as a graph when the backend has them and nothing needs the launches one by one.
-    fn run_span(&mut self, i0: usize, len: usize) -> Outcome<()> {
+    /// own), as graphs when the backend has them and nothing needs the launches one by one.
+    /// `ahead` is the number of launches the loop may still make from `i0` on.
+    ///
+    /// A compiled loop runs its spans again and again: each is captured whole on first use. A
+    /// span of a one-shot loop runs once, and capturing costs about as much as replaying a few
+    /// dozen launches one by one saves, so it runs as replays of one small graph of
+    /// [`GateLoop::unit`] launches, captured once the loop has run [`WARM_LAUNCHES`] without
+    /// stopping and is long enough for the replays to pay: what is left of the span after its
+    /// whole units is launched one by one.
+    fn run_span(&mut self, i0: usize, len: usize, ahead: usize) -> Outcome<()> {
         self.ensure_args(len)?;
-        if i0 > 0
-            && !self.ctx.recording_here()
-            && !self.ctx.is_profiling()
-            && let Some(graph) = self.graph(i0, len)?
-        {
-            let launches = len * (self.stepper.plan().launches() + usize::from(self.gate.is_some()));
-            self.ctx.launch_graph(&*graph, u32::try_from(launches).unwrap_or(u32::MAX))?;
-            return Ok(());
+        if i0 > 0 && !self.ctx.recording_here() && !self.ctx.is_profiling() {
+            let launches = self.stepper.plan().launches() + usize::from(self.gate.is_some());
+            let (unit, replays) = if self.compiled { (len, jit::PAYING_REPLAYS) } else { (self.unit(), ahead / self.unit()) };
+            if len >= unit && (self.compiled || (i0 >= WARM_LAUNCHES && replays >= jit::PAYING_REPLAYS)) && let Some(graph) = self.graph(i0, unit, replays)? {
+                let count = len / unit;
+                for _ in 0..count {
+                    self.ctx.launch_graph(&*graph, u32::try_from(unit * launches).unwrap_or(u32::MAX))?;
+                }
+                let done = count * unit;
+                return if done < len { self.replay_span(i0 + done, len - done) } else { Ok(()) };
+            }
         }
         self.replay_span(i0, len)
     }
@@ -1383,11 +1428,11 @@ impl GateLoop {
             if at == 0 {
                 // The first launch reads `init`, which no graph does: a span of its own, whose gate
                 // writes `args[0]` for the rest.
-                self.run_span(0, 1)?;
+                self.run_span(0, 1, total)?;
                 at = 1;
             }
             if end > at {
-                self.run_span(at, end - at)?;
+                self.run_span(at, end - at, total - at)?;
             }
             let [done, count, reason, ..] = ctx.read::<u32>(&self.buffers.st, self.buffers.state_bytes())?[..] else {
                 return Err(Failure::New(LumaError::Gpu("iterate_until_all state is missing".into())));
@@ -1420,7 +1465,9 @@ impl GateLoop {
         fresh: bool,
     ) -> Outcome<Run<S>> {
         let ctx = self.ctx.clone();
+        self.stepper.seed_fixed()?;
         let (steps, reason, histories) = self.drive(steps, check_every)?;
+        self.stepper.settle(steps)?;
 
         // Detaching the even state gives its buffers away, which a captured graph names: the
         // graphs would have to be captured again on the next run, which costs far more (a block is
@@ -1625,7 +1672,7 @@ fn compile<S: Fields>(
     let probes: S = state_from(probes);
     let next = step(&probes, &stepv);
     let records = trace_records(&ctx, until, &shapes, &probes, &next, &stepv, &conds, gate_buffers.as_ref())?;
-    jit::force(&next.arrays())?;
+    jit::force_stepped(&next.arrays(), &trace.probe_storages)?;
     records.force()?;
     let plan = trace.finish_plan().ok_or_else(unsupported)?;
     let rec_storages = records.storages().ok_or_else(unsupported)?;
@@ -1896,8 +1943,9 @@ mod tests {
                     let record_launches = if n > 100 && !single_pass { 2 } else { 1 };
                     assert_eq!(old_launches, (1 + record_launches + 1, false), "{what}");
                     assert_eq!(fused_launches, (record_launches + 1, false), "{what}");
-                    // The gate runs in the step's launch where the backend finishes a reduction in one.
-                    assert_eq!(folded_launches, if single_pass { (1, true) } else { fused_launches }, "{what}");
+                    // The gate runs in the last launch that reduces the record: the step's own where the
+                    // reduction ends in it (one group, or a single pass), else the pass after it.
+                    assert_eq!(folded_launches, (record_launches, true), "{what}");
                 }
                 let (stopped, _) = run_heat(&ctx, &data, norm_until(12).stop_when(move |h| h["norm"].last().le(at_7)), false, false);
                 assert_eq!((stopped.steps, stopped.reason), (7, StopReason::Predicate(0)));
@@ -2022,7 +2070,7 @@ mod tests {
         let (a, b) = (spike(16384), spike(16384).into_iter().rev().collect::<Vec<_>>());
         let start = || (Array::from_slice_on(&ctx, &a, a.len()).unwrap(), Array::from_slice_on(&ctx, &b, b.len()).unwrap());
         let rotate = |s: &Two, _: &Array<f32>| (&s.0 + &(&s.1 * 0.1f32), &s.1 - &(&s.0 * 0.1f32));
-        // The second array passes through: not a step to store, the record follows the step.
+        // The second array passes through: it takes no launch of the step.
         let passes = |s: &Two, _: &Array<f32>| (&s.0 * 0.9f32, s.1.clone());
         let until = || Until::new(10).record("norm", |s: &Two| s.0.norm()).stop_when(|h| h["norm"].last().gt(1.0e9));
         type Step<'a> = &'a dyn Fn(&Two, &Array<f32>) -> Two;
@@ -2044,7 +2092,8 @@ mod tests {
         let (old, old_launches) = run(&passes, true);
         let (fused, fused_launches) = run(&passes, false);
         assert_eq!(fused, old);
-        assert_eq!(fused_launches, old_launches);
+        // The record is reduced by the launch of the first array: the second takes no launch.
+        assert_eq!((old_launches, fused_launches), (Some((2, None)), Some((1, Some(0)))));
     }
 
     #[test]
@@ -2151,5 +2200,45 @@ mod tests {
             got = run.state;
         }
         assert!(compiled.gate_loop.graphs.holds_graphs(), "no span of launches was captured");
+    }
+
+    /// A state the step hands back unchanged (itself, or `&s * 1.0`) is bound to one buffer, not
+    /// copied at every step: the loop still returns it as it was, at every parity of the steps, in
+    /// one-shot and compiled runs alike.
+    #[test]
+    fn states_a_step_hands_back_unchanged_stay_as_they_were() {
+        type Two = (Array<f32>, Array<f32>, Array<f32>);
+        let ctx = Context::new().unwrap();
+        let step = |s: &Two, _: &Array<f32>| (&s.0 * 0.5 + &s.1 * 0.25 - &s.2 * 0.125, s.1.clone(), &s.2 * 1.0);
+        let until = |n: usize| Until::new(n).record("max", |s: &Two| s.0.max());
+        let (b, c) = (vec![1.0f32, 2.0, 3.0, 4.0], vec![0.5f32, -1.0, 2.0, 0.25]);
+        let start = || (Array::from_slice_on(&ctx, &[8.0f32, 4.0, 2.0, 1.0], 4).unwrap(), Array::from_slice_on(&ctx, &b, 4).unwrap(), Array::from_slice_on(&ctx, &c, 4).unwrap());
+        let host = |n: usize| {
+            let mut a = vec![8.0f32, 4.0, 2.0, 1.0];
+            for _ in 0..n {
+                a = a.iter().zip(b.iter().zip(&c)).map(|(a, (b, c))| a * 0.5 + b * 0.25 - c * 0.125).collect();
+            }
+            a
+        };
+        let mut compiled = compile_until_all(&start(), until(5), step).unwrap();
+        assert_eq!(compiled.gate_loop.stepper.fixed_states(), 2, "the unchanged states are not copied by the step");
+        for n in [5usize, 4, 1, 2, 3, 5] {
+            let init = start();
+            let run = iterate_until_all(start(), until(n), step).unwrap();
+            let compiled_run = compiled.run_steps(start(), n).unwrap();
+            for run in [&run, &compiled_run] {
+                assert_eq!(run.steps, n);
+                assert_eq!(run.state.1.to_vec().unwrap(), b, "{n} steps");
+                assert_eq!(run.state.2.to_vec().unwrap(), c, "{n} steps");
+                for (got, want) in run.state.0.to_vec().unwrap().iter().zip(host(n)) {
+                    assert!((got - want).abs() <= 1e-5 * want.abs().max(1.0), "{n} steps: {got} vs {want}");
+                }
+            }
+            // The unchanged states are not the initial ones' buffers: writing to one leaves them be.
+            let mut written = run.state.1;
+            written += 1.0;
+            assert_eq!(written.to_vec().unwrap(), b.iter().map(|v| v + 1.0).collect::<Vec<_>>());
+            assert_eq!(init.1.to_vec().unwrap(), b);
+        }
     }
 }

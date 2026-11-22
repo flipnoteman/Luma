@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use luma_core::hal::copy_parallel;
+use luma_core::hal::{copy_parallel, copy_parallel_host};
 use luma_core::Buffer;
 
 use crate::array::Storage;
@@ -60,6 +60,8 @@ pub(crate) struct Segment {
     pins: AtomicU32,
     /// Value of the pager's clock at the last pin.
     stamp: AtomicU64,
+    /// The texture of this segment's data made last (see [`crate::texture`]).
+    texture: Mutex<Option<crate::texture::Cached>>,
 }
 
 /// Keeps a segment's buffer on the device while a command using it is being recorded.
@@ -70,6 +72,11 @@ pub(crate) struct Pin {
 }
 
 impl Pin {
+    /// The segment this pin keeps resident.
+    pub(crate) fn segment(&self) -> &Arc<Segment> {
+        &self.segment
+    }
+
     /// Another pin of the same segment.
     pub(crate) fn dup(&self) -> Pin {
         self.segment.pins.fetch_add(1, Ordering::Acquire);
@@ -247,6 +254,11 @@ impl Pager {
 }
 
 impl Segment {
+    /// The texture of this segment's data, see [`crate::texture`].
+    pub(crate) fn texture_slot(&self) -> &Mutex<Option<crate::texture::Cached>> {
+        &self.texture
+    }
+
     /// A segment of `bytes` bytes without a buffer; it gets one at its first pin.
     pub(crate) fn empty(ctx: &Context, bytes: u64) -> Arc<Segment> {
         Arc::new(Segment {
@@ -255,6 +267,7 @@ impl Segment {
             state: Mutex::new(State::Empty),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
+            texture: Mutex::new(None),
         })
     }
 
@@ -268,6 +281,7 @@ impl Segment {
             state: Mutex::new(State::Device(buffer)),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
+            texture: Mutex::new(None),
         });
         ctx.pager().register(&segment, size);
         segment
@@ -284,6 +298,7 @@ impl Segment {
             state: Mutex::new(State::Window(Window { pack, offset })),
             pins: AtomicU32::new(0),
             stamp: AtomicU64::new(0),
+            texture: Mutex::new(None),
         })
     }
 
@@ -393,17 +408,51 @@ impl Segment {
     /// Copies the segment's data into `dst` (`dst.len()` bytes), after everything recorded so
     /// far. A segment in host memory is copied from there and stays there.
     pub(crate) fn read_into(self: &Arc<Self>, dst: &mut [MaybeUninit<u8>]) -> Result<()> {
-        if let State::Host(data) = &*lock(&self.state) {
-            copy_parallel(&data[..dst.len()], dst);
+        // On the CPU backend the segment is in the same memory as `dst`: a copy between host buffers, bound by the host's memory.
+        let copy = if self.ctx.is_cpu() { copy_parallel_host } else { copy_parallel };
+        if self.with_host_bytes(|data| copy(&data[..dst.len()], dst)).is_some() {
             return Ok(());
         }
         let pin = self.pin()?;
         self.ctx.read_into(pin.buffer(), dst)
     }
+
+    /// Calls `f` with the segment's data when the host can read it right now: held in host
+    /// memory, or in an idle directly accessible device buffer. `None` otherwise.
+    pub(crate) fn with_host_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if self.ctx.recording_here() {
+            return None;
+        }
+        match &*lock(&self.state) {
+            State::Host(data) => Some(f(&data[..self.bytes as usize])),
+            State::Device(buffer) if self.pins.load(Ordering::Acquire) == 0 => self.ctx.host_ptr(buffer, self.bytes).map(|ptr| {
+                // SAFETY: `host_ptr` vouches for `self.bytes` readable bytes no GPU command writes, and the state lock keeps the buffer from being evicted.
+                f(unsafe { std::slice::from_raw_parts(ptr, self.bytes as usize) })
+            }),
+            State::Device(_) | State::Empty | State::Window(_) => None,
+        }
+    }
+
+    /// [`Segment::with_host_bytes`] with write access; a device buffer must not be pinned by a recording.
+    pub(crate) fn with_host_bytes_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        if self.ctx.recording_here() {
+            return None;
+        }
+        match &mut *lock(&self.state) {
+            State::Host(data) => Some(f(&mut data[..self.bytes as usize])),
+            State::Device(buffer) if self.pins.load(Ordering::Acquire) == 0 => self.ctx.host_ptr(buffer, self.bytes).map(|ptr| {
+                // SAFETY: as in `with_host_bytes`; the state lock and the absent pins make this the only access.
+                f(unsafe { std::slice::from_raw_parts_mut(ptr, self.bytes as usize) })
+            }),
+            State::Device(_) | State::Empty | State::Window(_) => None,
+        }
+    }
 }
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        // The texture reads the buffer: it goes before the buffer does.
+        self.texture.get_mut().unwrap_or_else(PoisonError::into_inner).take();
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         if let State::Device(buffer) = std::mem::replace(state, State::Empty) {
             self.ctx.pager().resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
@@ -482,6 +531,8 @@ impl Context {
         // Flushes and waits, so every recorded use of the buffer has run.
         let data = self.read_spill(&buffer, victim.bytes)?;
         *state = State::Host(data);
+        // The texture holds the buffer the data just left.
+        lock(&victim.texture).take();
         pager.resident_bytes.fetch_sub(buffer.size(), Ordering::Relaxed);
         pager.spilled_bytes.fetch_add(victim.bytes, Ordering::Relaxed);
         lock(&pager.resident).list.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&victim)));

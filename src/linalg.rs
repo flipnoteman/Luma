@@ -441,7 +441,7 @@ fn run_parts(
     let per = Io::parts_per_system(block);
     let ctx = parts[per - 1].context();
     // Operands first, so that a poisoned one reports its own error.
-    let sides = parts.iter().map(|array| part_side(array.context(), array)).collect::<Outcome<Vec<_>>>()?;
+    let mut sides = parts.iter().map(|array| part_side(array.context(), array)).collect::<Outcome<Vec<_>>>()?;
     let start_ready = start.map(|s| s.ready()).transpose()?;
     if parts.iter().any(|array| !ctx.same_as(array.context())) || start.is_some_and(|start| !ctx.same_as(start.context())) {
         return Err(LumaError::ContextMismatch.into());
@@ -472,7 +472,7 @@ fn run_parts(
     let fused = sides.iter().any(|s| matches!(s, PartSide::Pending(_)));
     let algo = if let Some(plan) = cyclic::plan(&tuning, b32, n32, total, stride32, true, fused, ctx.max_buffer_bytes()) {
         Some((Algo::Cyclic { workgroup: plan.workgroup, shift: plan.shift, shared_rows: plan.shared_rows }, plan.scratch_bytes(b32, n32, total)))
-    } else if block <= UNROLLED_BLOCK as usize
+    } else if (block <= UNROLLED_BLOCK as usize || tuning.native_solve)
         && let thomas = thomas_plan(&tuning, b32, total, stride32, true)
         && let Some(bytes) = thomas_parts_scratch(parts[0].len(), block, systems, thomas.tiled, ctx.max_buffer_bytes())
     {
@@ -480,6 +480,22 @@ fn run_parts(
     } else {
         None
     };
+    if fused && tuning.native_solve && matches!(algo, Some((Algo::Thomas { .. }, _))) {
+        // The native solve reads buffers: the parts that are expressions are computed first, all
+        // together (one kernel with an output each, sharing what they read).
+        for (array, side) in parts.iter().zip(&sides) {
+            if matches!(side, PartSide::Pending(_)) {
+                array.request()?;
+            }
+        }
+        ctx.jit().evaluate_requested();
+        for (array, side) in parts.iter().zip(&mut sides) {
+            if matches!(side, PartSide::Pending(_)) {
+                let (pin, bytes) = array.ready()?;
+                *side = PartSide::Ready(pin, bytes);
+            }
+        }
+    }
     if let Some((algo, scratch_bytes)) = algo {
         let spec = SolveSpec { algo, block: block as u8, systems: systems as u8, starts: start.is_some(), fused: [0; 4] };
         if let Some(solved) = launch_parts(ctx, sides, spec, shape, [n32, stride32, lines32], scratch_bytes, start_ready)? {
@@ -875,6 +891,25 @@ mod tests {
     }
 
     #[test]
+    fn thomas_plan_scales_with_the_multiprocessors() {
+        let plan = |workgroup, tiled, twisted| ThomasPlan { workgroup, tiled, twisted };
+        let nvidia = |compute_units| Tuning { profile: TuningProfile::Nvidia, line_strided_from: 16, compute_units, ..Tuning::for_tests() };
+        // The RTX 3090 (82): 512 workgroups' worth of lines per step of the workgroup size, twisted below 8192 lines.
+        assert_eq!(thomas_plan(&nvidia(82), 4, 8191, 8, true), plan(16, false, true));
+        assert_eq!(thomas_plan(&nvidia(82), 4, 8192, 8, true), plan(16, false, false));
+        assert_eq!(thomas_plan(&nvidia(82), 5, 2047, 1, true), plan(8, false, false));
+        assert_eq!(thomas_plan(&nvidia(82), 5, 2048, 1, true), plan(8, false, false));
+        assert_eq!(thomas_plan(&nvidia(82), 5, 4096, 1, true), plan(8, false, false));
+        assert_eq!(thomas_plan(&nvidia(82), 5, 8192, 1, true), plan(16, false, false));
+        // The 3080 Laptop (48): 300 workgroups, twisted below 4795 lines.
+        assert_eq!(thomas_plan(&nvidia(48), 4, 4794, 8, true), plan(16, false, true));
+        assert_eq!(thomas_plan(&nvidia(48), 4, 4795, 8, true), plan(16, false, false));
+        assert_eq!(thomas_plan(&nvidia(48), 5, 4800, 1, true), plan(16, false, false));
+        assert_eq!(thomas_plan(&nvidia(48), 5, 4096, 1, true), plan(16, false, false));
+        assert_eq!(thomas_plan(&nvidia(48), 5, 2400, 1, true), plan(8, false, false));
+    }
+
+    #[test]
     fn thomas_plan_widens_strided_lines() {
         let nvidia = Tuning { profile: TuningProfile::Nvidia, line_strided_from: 16, ..Tuning::for_tests() };
         let plan = |workgroup, tiled, twisted| ThomasPlan { workgroup, tiled, twisted };
@@ -891,6 +926,9 @@ mod tests {
         // Stacked blocks too.
         assert_eq!(thomas_plan(&nvidia, 5, 4488, 187, false), plan(8, false, false));
         assert_eq!(thomas_plan(&nvidia, 4, 1024, 187, false), plan(8, false, true));
+        // Stacked scalars are the parts layout: the same plan.
+        assert_eq!(thomas_plan(&nvidia, 1, 4096, 4096, false), plan(32, false, true));
+        assert_eq!(thomas_plan(&nvidia, 1, 4096, 1, false), plan(8, false, true));
         // Many lines: the plain solve.
         assert_eq!(thomas_plan(&nvidia, 4, 13090, 8, true), plan(32, false, false));
         // Other devices keep the old rule.
@@ -1031,7 +1069,8 @@ mod tests {
                 .unwrap();
             assert_eq!(&got.to_vec().unwrap(), if from { &want_from } else { &want }, "from = {from}");
             if binds(&ctx, 1, 1) {
-                assert_eq!(profile.launches(), 1, "from = {from}");
+                // A native solve reads buffers: the pending operands are computed together first.
+                assert_eq!(profile.launches(), if ctx.tuning().native_solve { 2 } else { 1 }, "from = {from}");
             }
         }
     }

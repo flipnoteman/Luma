@@ -13,12 +13,18 @@
 //!   chunks is one kernel that reads the input once instead of twice when the result does not
 //!   depend on how the operands are grouped (integers, `min`, `max`): the chunks wait for each
 //!   other's prefix (decoupled look-back, see [`Pass::ChunkLookback`]).
+//! - *Many contiguous lines* (at least [`WARP_MIN_LINES`] on the reference device) on devices
+//!   whose subgroups have 32 invocations (`Tuning::subgroup32`): one subgroup per line scans it
+//!   in registers, shuffling the totals of its vectors, in a single kernel that reads and writes
+//!   every cell once, at the bandwidth of a copy whatever the length of the line (see
+//!   [`Pass::Warp`]). The grouping of the operands is fixed by the vector width and the subgroup
+//!   width, so `f32` sums are reproducible.
 //! - *Strided lines*: invocations are numbered `block * lines + line`, so neighbours read
 //!   neighbouring cells of the same row; each walks one block of the line sequentially.
 
 use std::fmt::Write;
 use std::panic::Location;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use luma_core::Buffer;
 
@@ -65,12 +71,37 @@ const SHORT_LINE: u32 = 255;
 /// Cells of workgroup memory a group of short lines is staged in (16 KiB, the smallest limit
 /// WebGPU guarantees).
 pub(crate) const ROWS_TILE: u32 = 4096;
+/// Invocations of a workgroup of [`Pass::Warp`]: one subgroup, one line. Measured on an RTX 3090
+/// (`cumsum` of 4096 lines of 4096 `f32`): workgroups of 32 to 512 invocations and 1 to 8 steps in
+/// flight all take 0.169-0.175 ms of GPU time (an elementwise copy of the same bytes 0.166 ms),
+/// but the call (launch to sync) takes 0.175 ms with one subgroup per workgroup and one step in
+/// flight, and 0.18-0.19 ms with more.
+const WARP_GROUP: u32 = 32;
+/// Steps (of 32 vectors, one per invocation) a [`Pass::Warp`] subgroup loads ahead of the one it
+/// scans.
+const WARP_AHEAD: u32 = 1;
+/// Fewest lines (on the reference device, scaled to the multiprocessors of the device, see
+/// `Tuning::scaled`) for which a subgroup per line keeps memory busy and beats the other passes.
+/// `cumsum` of 2^24 cells in lines on an RTX 3090 (u32 / f32, ms): 128 lines 0.200 against
+/// 0.210 / 0.271 for the other passes, 256 lines 0.184 against 0.204 / 0.263, 64 lines 0.33
+/// against 0.214 / 0.255; on an RTX 3080 Laptop (48 multiprocessors) 128 lines already run at
+/// the bandwidth of a copy and 64 lines beat the other passes too.
+const WARP_MIN_LINES: u32 = 128;
 /// Strided lines up to this many cells are walked by one invocation each.
 const SHORT_STRIDED: u32 = 256;
 /// A strided pass with this many lines or more has enough invocations without blocks.
 const WIDE_LINES: u32 = 1 << 16;
-/// Invocations a blocked strided pass aims for.
-const TARGET_THREADS: u64 = 1 << 20;
+/// Invocations per compute unit a blocked strided pass aims for.
+const THREADS_PER_UNIT: u64 = 1536;
+
+/// The invocations a blocked strided pass aims for: [`THREADS_PER_UNIT`] per compute unit (about the
+/// threads a unit keeps resident). Fewer, longer blocks mean fewer partial results for the second
+/// pass to read back: a strided sum, product or mean of 4096 x 4096 over axis 1 takes 0.101 ms on an
+/// RTX 3090 with a million invocations, 0.094 ms with 262144 (ArrayFire 0.096), and on an RTX 3080
+/// Laptop 0.221 ms with a million, 0.195 ms with 65536 (ArrayFire 0.203).
+fn target_threads(tuning: &crate::tuning::Tuning) -> u64 {
+    u64::from(tuning.compute_units.max(1)) * THREADS_PER_UNIT
+}
 /// Fewest cells of a line one invocation of a blocked strided pass walks.
 const MIN_BLOCK: u32 = 16;
 
@@ -110,6 +141,20 @@ pub(crate) enum Pass {
     /// Contiguous lines, same workgroups: the fold of the chunk with the invocations striding
     /// over it, so the operator must be commutative as well as associative.
     ChunkReduce,
+    /// Contiguous lines of more than [`SHORT_LINE`] cells, a workgroup of one subgroup of 32
+    /// invocations per line, the whole scan in one kernel that reads the
+    /// input once and writes the result once, in registers, with no workgroup memory or barrier.
+    /// The subgroup walks the line 32 vectors of `vec` cells at a time, one vector per invocation
+    /// (so the global loads and stores are coalesced and `vec * 4` bytes wide): every invocation
+    /// scans its vector, the subgroup scans the totals of the vectors with shuffles (a
+    /// Hillis-Steele ladder) and the carry of the line so far comes from the last cell written
+    /// by the step before. `vec` divides the line. The grouping of the operands (and so the
+    /// rounding of `f32` sums) is fixed by `vec` and the width of the subgroup: the cells of a
+    /// vector, then the vectors of a step, then the steps, left to right. Needs
+    /// `Tuning::subgroup32` and enough lines (see [`WARP_MIN_LINES`]).
+    Warp { vec: u32 },
+    /// Segmented reduction over entries cut in tiles by offsets (see [`crate::segments`]): one workgroup per tile.
+    Segments,
 }
 
 impl Pass {
@@ -124,12 +169,14 @@ impl Pass {
             Pass::ChunkScan { .. } => "ScanChunk",
             Pass::ChunkLookback => "ScanLookback",
             Pass::ChunkReduce => "ReduceChunk",
+            Pass::Warp { .. } => "ScanWarp",
+            Pass::Segments => "SegmentsTile",
         }
     }
 
     /// Whether the pass runs one workgroup (instead of one invocation) per unit of work.
     fn per_workgroup(self) -> bool {
-        matches!(self, Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce)
+        matches!(self, Pass::Rows { .. } | Pass::Warp { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce | Pass::Segments)
     }
 
     fn seeded(self) -> bool {
@@ -181,12 +228,15 @@ impl AxisPass {
 
     /// How many buffers the pass writes (`@binding(0..)`).
     pub(crate) fn outputs(self) -> usize {
-        if self.split { self.ops.as_slice().len() } else { 1 }
+        if self.pass == Pass::Segments { 2 } else if self.split { self.ops.as_slice().len() } else { 1 }
     }
 
     /// The declarations of the output buffers, of elements of `ty` (`u32`, the indices and the
     /// bits of the values, for an arg reduction).
     pub(crate) fn output_bindings(self, ty: &str) -> String {
+        if self.pass == Pass::Segments {
+            return crate::segments::tile_outputs(ty);
+        }
         let ty = if self.ops.as_slice().first().is_some_and(|op| op.is_arg()) { "u32" } else { ty };
         let mut src = String::new();
         for j in 0..self.outputs() {
@@ -217,6 +267,9 @@ fn reduce_source(pass: AxisPass, ty: &str, workgroup: u32) -> String {
 /// array reductions (`ReduceElem::combine`), so a NaN is handled as `Array::min` and `max` do;
 /// `SumSquares` squares the cells it reads.
 pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) -> String {
+    if pass.pass == Pass::Segments {
+        return crate::segments::tile_body(ty, pass.ops.as_slice()[0], load);
+    }
     if pass.ops.as_slice().first().is_some_and(|op| op.is_arg()) {
         return crate::arg::body(pass, ty, load, workgroup);
     }
@@ -235,7 +288,15 @@ pub(crate) fn reduce_body(pass: AxisPass, ty: &str, load: &str, workgroup: u32) 
             format!("let {name} = {load}({q});")
         }
     };
-    let cell = |name: &str, j: usize| if pass.partial { format!("{name}{j}") } else { name.to_owned() };
+    // A first pass of ops that reduce different roots of the program reads one array of the roots' values per cell.
+    let roots = if pass.partial { None } else { pass.ops.roots() };
+    let cell = |name: &str, j: usize| match &roots {
+        _ if pass.partial => format!("{name}{j}"),
+        Some(roots) => format!("{name}[{}u]", roots[j]),
+        None => name.to_owned(),
+    };
+    let root_of = |j: usize| roots.as_ref().map_or(0, |roots| usize::from(roots[j]));
+    let tiles = roots.as_ref().map_or(1, |_| root_count(&pass.ops) as usize);
     let mapped = |j: usize, cell: String| if ops[j] == ReduceOp::SumSquares { elem.square(&cell) } else { cell };
     let store = |j: usize, at: &str, count: &str, value: String| {
         if pass.split { format!("out{j}[{at}] = {value};") } else { format!("out[{j}u * {count} + {at}] = {value};") }
@@ -273,7 +334,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
             src.push_str("}\n");
         }
         Pass::Rows { width, .. } => {
-            let _ = writeln!(src, "var<workgroup> tile: array<{ty}, {ROWS_TILE}>;");
+            for r in 0..tiles {
+                let name = if roots.is_some() { format!("tile{r}") } else { "tile".to_owned() };
+                let _ = writeln!(src, "var<workgroup> {name}: array<{ty}, {}>;", ROWS_TILE as usize / tiles);
+            }
             let _ = write!(
                 src,
                 "@compute @workgroup_size({width})
@@ -298,19 +362,32 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
                     src,
                     "    for (var j = t; j < cells; j += {width}u) {{
         let row = j / p.n;
-        tile[row * pitch + (j - row * p.n)] = {load}({offset}base + j);
-    }}
+"
+                );
+                if roots.is_some() {
+                    let _ = writeln!(src, "        let v = {load}({offset}base + j);");
+                    for k in 0..tiles {
+                        let _ = writeln!(src, "        tile{k}[row * pitch + (j - row * p.n)] = v[{k}u];");
+                    }
+                } else {
+                    let _ = writeln!(src, "        tile[row * pitch + (j - row * p.n)] = {load}({offset}base + j);");
+                }
+                let _ = write!(
+                    src,
+                    "    }}
     workgroupBarrier();
     if (t < cnt) {{
         let row = t * pitch;
 "
                 );
                 for &j in round {
-                    let _ = writeln!(src, "        acc{j} = {};", mapped(j, "tile[row]".to_owned()));
+                    let tile = if roots.is_some() { format!("tile{}", root_of(j)) } else { "tile".to_owned() };
+                    let _ = writeln!(src, "        acc{j} = {};", mapped(j, format!("{tile}[row]")));
                 }
                 src.push_str("        for (var s = 1u; s < p.n; s++) {\n");
                 for &j in round {
-                    let _ = writeln!(src, "            acc{j} = c{j}(acc{j}, {});", mapped(j, "tile[row + s]".to_owned()));
+                    let tile = if roots.is_some() { format!("tile{}", root_of(j)) } else { "tile".to_owned() };
+                    let _ = writeln!(src, "            acc{j} = c{j}(acc{j}, {});", mapped(j, format!("{tile}[row + s]")));
                 }
                 src.push_str("        }\n    }\n");
                 if r + 1 < rounds.len() {
@@ -365,7 +442,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
             }
             src.push_str("    }\n}\n");
         }
-        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback => unreachable!("scans are not reductions"),
+        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::Warp { .. } | Pass::Segments => unreachable!("scans are not reductions"),
     }
     src
 }
@@ -376,8 +453,12 @@ fn source(pass: Pass, ty: &str, op: &Operator, workgroup: u32) -> String {
         let _ = write!(src, "s{k}: {}, ", scalar.wgsl());
     }
     src.push_str("}\n");
-    let _ = writeln!(src, "@group(1) @binding(0) var<storage, read_write> out: array<{ty}>;");
-    let _ = writeln!(src, "@group(1) @binding(1) var<storage, read> a: array<{ty}>;");
+    let elem = match pass {
+        Pass::Warp { vec } if vec > 1 => format!("vec{vec}<{ty}>"),
+        _ => ty.to_owned(),
+    };
+    let _ = writeln!(src, "@group(1) @binding(0) var<storage, read_write> out: array<{elem}>;");
+    let _ = writeln!(src, "@group(1) @binding(1) var<storage, read> a: array<{elem}>;");
     let uniform = if pass.seeded() {
         let _ = writeln!(src, "@group(1) @binding(2) var<storage, read> pre: array<{ty}>;");
         3
@@ -390,6 +471,10 @@ fn source(pass: Pass, ty: &str, op: &Operator, workgroup: u32) -> String {
     let _ = writeln!(src, "@group(1) @binding({uniform}) var<uniform> p: Params;");
     src.push_str(&op.source);
     src.push_str("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
+    if let Pass::Warp { vec } = pass {
+        src.push_str(&warp_source(vec, ty));
+        return src;
+    }
     if pass.per_workgroup() {
         src.push_str(&chunk_source(pass, ty));
         return src;
@@ -446,9 +531,84 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "
         }
-        Pass::Rows { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce => unreachable!("workgroup passes return above"),
+        Pass::Rows { .. } | Pass::Warp { .. } | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::ChunkReduce | Pass::Segments => unreachable!("workgroup passes return above"),
     };
     src.push_str(&main.replace("__T__", ty));
+    src
+}
+
+/// The entry point of [`Pass::Warp`]: `vec` cells per invocation (`a` and `out` are arrays of
+/// vectors of that many cells, or of cells when it is 1), steps of 32 vectors. Every step the
+/// subgroup has loaded [`WARP_AHEAD`] steps ahead is scanned within the invocation, then across
+/// the invocations with a ladder of shuffles (every invocation takes part in every shuffle: the
+/// control flow is uniform over the subgroup), then seeded with the last cell of the step before
+/// (`carry`, which the first step of a line does not have: its first invocation has no prefix).
+/// Lanes past the end of the line load zeros and write nothing: they only sit above the lanes
+/// that matter, which no lane reads.
+fn warp_source(vec: u32, ty: &str) -> String {
+    let vt = if vec > 1 { format!("vec{vec}<{ty}>") } else { ty.to_owned() };
+    let comps: Vec<String> = if vec > 1 { ["x", "y", "z", "w"][..vec as usize].iter().map(|c| format!("v.{c}")).collect() } else { vec!["v".to_owned()] };
+    let last = vec as usize - 1;
+    let mut src = String::new();
+    let _ = writeln!(src, "fn ld(vbase: u32, nv: u32, lane: u32, s: u32) -> {vt} {{ let q = s * 32u + lane; if (q < nv) {{ return a[vbase + q]; }} return {vt}(); }}");
+    // One step: `step` is the expression of its number, `cur` the vector the invocation loaded.
+    let process = |step: &str, cur: &str| -> String {
+        let mut s = String::new();
+        let _ = writeln!(s, "        if ({step} < steps) {{");
+        let _ = writeln!(s, "            let v = {cur};");
+        for (k, comp) in comps.iter().enumerate() {
+            if k == 0 {
+                let _ = writeln!(s, "            let x0 = {comp};");
+            } else {
+                let _ = writeln!(s, "            let x{k} = op(x{}, {comp});", k - 1);
+            }
+        }
+        let _ = writeln!(s, "            var incl = x{last};");
+        for off in [1u32, 2, 4, 8, 16] {
+            let _ = writeln!(s, "            {{ let o = subgroupShuffle(incl, select(lane, lane - {off}u, lane >= {off}u)); if (lane >= {off}u) {{ incl = op(o, incl); }} }}");
+        }
+        let _ = writeln!(s, "            let ex = subgroupShuffle(incl, select(0u, lane - 1u, lane > 0u));");
+        let _ = writeln!(s, "            var pre = ex;");
+        let _ = writeln!(s, "            if ({step} > 0u) {{ if (lane > 0u) {{ pre = op(carry, ex); }} else {{ pre = carry; }} }}");
+        let _ = writeln!(s, "            let has = lane > 0u || {step} > 0u;");
+        for k in 0..comps.len() {
+            let _ = writeln!(s, "            let y{k} = select(x{k}, op(pre, x{k}), has);");
+        }
+        let _ = writeln!(s, "            carry = subgroupShuffle(y{last}, 31u);");
+        let all: Vec<String> = (0..comps.len()).map(|k| format!("y{k}")).collect();
+        let value = if vec > 1 { format!("{vt}({})", all.join(", ")) } else { "y0".to_owned() };
+        let _ = writeln!(s, "            let q = ({step}) * 32u + lane;\n            if (q < nv) {{ out[vbase + q] = {value}; }}");
+        s.push_str("        }\n");
+        s
+    };
+    let u = WARP_AHEAD;
+    let _ = write!(
+        src,
+        "@compute @workgroup_size({WARP_GROUP})
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32) {{
+    let line = wg.x + wg.y * nwg.x;
+    if (line >= p.lines) {{ return; }}
+    let nv = p.n / {vec}u;
+    let vbase = line * nv;
+    let steps = (nv + 31u) / 32u;
+    var carry: {ty};
+"
+    );
+    for j in 0..u {
+        let _ = writeln!(src, "    var c{j} = ld(vbase, nv, lane, {j}u);");
+    }
+    src.push_str("    for (var g = 0u; g < steps; g += ");
+    let _ = writeln!(src, "{u}u) {{");
+    for j in 0..u {
+        let _ = writeln!(src, "        let n{j} = ld(vbase, nv, lane, g + {}u);", u + j);
+    }
+    for j in 0..u {
+        src.push_str(&process(&format!("(g + {j}u)"), &format!("c{j}")));
+    }
+    for j in 0..u {
+        let _ = writeln!(src, "        c{j} = n{j};");
+    }
+    src.push_str("    }\n}\n");
     src
 }
 
@@ -744,16 +904,35 @@ enum Input<'b> {
     /// A lazy expression: computed inside the pass when it can be (see [`jit::axis_reduce`]),
     /// else evaluated into a buffer first.
     Pending(&'b Arc<Node>),
+    /// Several lazy operands computed together in the pass (see [`jit::axis_plan`]); the ops of the first pass are
+    /// [merged](ReduceList::merged) over its roots.
+    Plan(&'b jit::AxisPlan),
 }
 
 /// The cells one invocation walks in a blocked pass over strided lines, or `None` when the lines
 /// are short or numerous enough for one invocation each.
-fn strided_block(n: u32, lines: u32) -> Option<u32> {
+fn strided_block(n: u32, lines: u32, threads: u64) -> Option<u32> {
     if lines >= WIDE_LINES || n <= SHORT_STRIDED {
         return None;
     }
-    let block = (u64::from(n) * u64::from(lines)).div_ceil(TARGET_THREADS).clamp(u64::from(MIN_BLOCK), u64::from(n));
+    let block = (u64::from(n) * u64::from(lines)).div_ceil(threads).clamp(u64::from(MIN_BLOCK), u64::from(n));
     Some(block as u32)
+}
+
+/// Strided lines of at most [`SHORT_STRIDED`] cells are walked by one invocation each (see
+/// [`strided_block`]), which leaves the device idle when there are few of them: the bias gradient
+/// of a batch of 256 over 10 classes is 10 invocations of 256 cells each and took 38 us on an
+/// RTX 3090 with its operand recomputed inside (the weights of 512 units, 512 invocations: 11 us),
+/// against a block of 16 cells and a second pass that folds the 16 partial results of a line. Lines
+/// of up to [`FEW_LINES_MIN_CELLS`] cells (and the many-lined ones) keep one invocation each.
+const FEW_LINES: u32 = 1024;
+const FEW_LINES_MIN_CELLS: u32 = 64;
+
+/// [`strided_block`] for a reduction: blocked also for short lines when there are few of them.
+fn reduce_block(n: u32, lines: u32, threads: u64) -> Option<u32> {
+    strided_block(n, lines, threads).or_else(|| {
+        (lines < FEW_LINES && n > FEW_LINES_MIN_CELLS).then(|| (u64::from(n) * u64::from(lines)).div_ceil(threads).clamp(u64::from(MIN_BLOCK), u64::from(n)) as u32)
+    })
 }
 
 /// The invocations of a workgroup of the short-line pass, which is the most lines it stages at
@@ -763,9 +942,41 @@ fn rows_width(n: u32) -> u32 {
 }
 
 /// Lines of `n` cells a workgroup of the short-line pass stages at once (each row is padded to
-/// an odd length, so the invocations read different banks).
-fn rows_per_group(n: u32) -> u32 {
-    (ROWS_TILE / (n | 1)).min(rows_width(n))
+/// an odd length, so the invocations read different banks); `roots` tiles share the workgroup memory.
+fn rows_per_group(n: u32, roots: u32) -> u32 {
+    (ROWS_TILE / roots / (n | 1)).min(rows_width(n))
+}
+
+/// The roots of the program a first pass of `ops` reduces (1 unless the list is merged over several).
+pub(crate) fn root_count(ops: &ReduceList) -> u32 {
+    ops.roots().map_or(1, |roots| roots.iter().map(|&root| u32::from(root)).max().unwrap_or(0) + 1)
+}
+
+/// Most reductions along an axis recorded together in one kernel (see [`reduce_axis_planned`]): every op keeps an accumulator
+/// per invocation and a workgroup array, and every distinct operand a tile of the short-line pass.
+pub(crate) const AXIS_MULTI: usize = 8;
+
+/// The operator of the reductions, which have none of their own.
+fn no_operator() -> Operator {
+    Operator { source: String::new(), scalar_tys: Vec::new(), scalars: Vec::new(), extremum: false }
+}
+
+/// Reduces the lines `geom` of the `f32` expression `node` with `op` into `out`: the passes of [`Array::reduce_axis`] of one op,
+/// the first computing the expression where it can.
+pub(crate) fn reduce_axis_node(ctx: &Context, node: &Arc<Node>, geom: crate::reduce::AxisGeom, op: ReduceOp, out: Bound<'_>) -> Outcome<()> {
+    let operator = no_operator();
+    let mut run = Lines::new(ctx, &operator, "f32");
+    run.reduce(Input::Pending(node), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, ReduceList::new(&[op]), false, &[out])
+}
+
+/// Reduces the lines `geom` of the operands of `plan` in the passes of [`Array::reduce_axis`]: op `j` of `ops` reduces its own
+/// operand (see [`jit::AxisPlan::roots`]) into `outs[j]`, every op combining the cells of its lines in the order a reduction
+/// of that operand alone does, so the values are the same bits. One kernel computes the operands together (once what they share).
+pub(crate) fn reduce_axis_planned(ctx: &Context, plan: &jit::AxisPlan, geom: crate::reduce::AxisGeom, ops: &[ReduceOp], outs: &[Bound<'_>]) -> Outcome<()> {
+    let operator = no_operator();
+    let mut run = Lines::new(ctx, &operator, "f32");
+    let list = ReduceList::merged(ops, plan.roots(), &vec![crate::builtin::Epilogue::default(); ops.len()]);
+    run.reduce(Input::Plan(plan), Cells { n: geom.n, stride: geom.stride, lines: geom.lines }, list, false, outs)
 }
 
 /// Chunks a workgroup of [`Pass::ChunkLookback`] reads the status of at a time, one per
@@ -799,7 +1010,8 @@ impl<'a> Lines<'a> {
             return Ok(Arc::clone(core));
         }
         let workgroup = self.ctx.tuning().elementwise_workgroup;
-        let core = self.ctx.jit().stencil_kernel(self.ctx, source(pass, self.ty, self.op, workgroup), pass.label())?;
+        let key = format!("{pass:?} {} {workgroup} {:?} {}", self.ty, self.op.scalar_tys, self.op.source);
+        let core = self.ctx.jit().scan_kernel(self.ctx, key, pass.label(), || source(pass, self.ty, self.op, workgroup))?;
         self.cores.push((pass, Arc::clone(&core)));
         Ok(core)
     }
@@ -818,7 +1030,7 @@ impl<'a> Lines<'a> {
     fn grid(&self, pass: Pass, geometry: [u32; 5]) -> Result<([u32; 3], [u32; 3])> {
         let (lines, nb) = (geometry[2], geometry[3]);
         let groups = match pass {
-            Pass::Rows { .. } => lines.div_ceil(nb),
+            Pass::Rows { .. } | Pass::Warp { .. } => lines.div_ceil(nb),
             _ if pass.per_workgroup() => lines.checked_mul(nb).ok_or(LumaError::InvalidShape("too many chunks".into()))?,
             _ => {
                 let count = if pass == Pass::Seq { lines } else { lines * nb };
@@ -893,8 +1105,12 @@ impl<'a> Lines<'a> {
         let evaluated;
         let input = match input {
             Input::Buffer(input) => input,
+            Input::Plan(plan) => {
+                jit::axis_reduce_planned(self.ctx, plan, pass, geometry, workgroups, size, &writes)?;
+                return Ok(());
+            }
             Input::Pending(node) => {
-                if jit::axis_reduce(self.ctx, node, pass, geometry, workgroups, size, &writes)? {
+                if jit::axis_reduce(self.ctx, node, pass, geometry, workgroups, size, &writes, &[])? {
                     return Ok(());
                 }
                 let storage = node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?;
@@ -920,7 +1136,11 @@ impl<'a> Lines<'a> {
         let seq = [n, stride, lines, 1, n];
         if stride == 1 {
             if n <= SHORT_LINE {
-                return self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n), n], out, input, None);
+                return self.launch(Pass::Rows { fold: false, width: rows_width(n) }, [n, 1, lines, rows_per_group(n, 1), n], out, input, None);
+            }
+            if lines >= self.ctx.tuning().scaled(WARP_MIN_LINES) && self.ctx.tuning().subgroup32 {
+                let vec = if n % 4 == 0 { 4 } else if n % 2 == 0 { 2 } else { 1 };
+                return self.launch(Pass::Warp { vec }, [n, 1, lines, 1, n], out, input, None);
             }
             if self.ctx.tuning().lookback_scan && n > LOOKBACK_CHUNK && self.grouping_free() {
                 return self.lookback(n, lines, out, input);
@@ -938,7 +1158,7 @@ impl<'a> Lines<'a> {
             self.scan(totals, nb, 1, lines, prefix)?;
             return self.launch(Pass::ChunkScan { seeded: true }, geometry, out, input, Some(prefix));
         }
-        let Some(k) = strided_block(n, lines) else {
+        let Some(k) = strided_block(n, lines, target_threads(self.ctx.tuning())) else {
             return self.launch(Pass::Seq, seq, out, input, None);
         };
         let nb = n.div_ceil(k);
@@ -959,13 +1179,13 @@ impl<'a> Lines<'a> {
     fn reduce(&mut self, input: Input<'_>, cells: Cells, ops: ReduceList, partial: bool, outs: &[Bound<'_>]) -> Outcome<()> {
         let Cells { n, stride, lines } = cells;
         if stride == 1 && n <= SHORT_LINE {
-            return self.launch_reduce(Pass::Rows { fold: true, width: rows_width(n) }, ops, partial, [n, 1, lines, rows_per_group(n), n], outs, input);
+            return self.launch_reduce(Pass::Rows { fold: true, width: rows_width(n) }, ops, partial, [n, 1, lines, rows_per_group(n, root_count(&ops)), n], outs, input);
         }
         let (pass, geometry, nb) = if stride == 1 {
             let nb = n.div_ceil(REDUCE_CHUNK);
             (Pass::ChunkReduce, [n, 1, lines, nb, REDUCE_CHUNK], nb)
         } else {
-            let k = strided_block(n, lines).unwrap_or(n);
+            let k = reduce_block(n, lines, target_threads(self.ctx.tuning())).unwrap_or(n);
             let nb = n.div_ceil(k);
             (Pass::Fold, [n, stride, lines, nb, k], nb)
         };
@@ -986,8 +1206,11 @@ impl<'a> Lines<'a> {
     }
 }
 
+/// The traced operator `+` of every element type (see [`Array::sum_operator`]).
+type SumOperators = Mutex<Vec<(&'static str, Arc<Operator>)>>;
+
 /// The operator of a scan: an elementwise closure of two arguments.
-type ScanOp<'a, T> = dyn Fn(&Array<T>, &Array<T>) -> Array<T> + 'a;
+pub(crate) type ScanOp<'a, T> = dyn Fn(&Array<T>, &Array<T>) -> Array<T> + 'a;
 
 fn not_elementwise() -> Failure {
     LumaError::InvalidShape("the scan operator must be an elementwise expression of its two arguments".into()).into()
@@ -995,7 +1218,7 @@ fn not_elementwise() -> Failure {
 
 impl<T: ScalarType> Array<T> {
     /// `op` traced on two one-element placeholders as a WGSL function.
-    fn trace_operator(&self, op: &ScanOp<'_, T>) -> Outcome<Operator> {
+    pub(crate) fn trace_operator(&self, op: &ScanOp<'_, T>) -> Outcome<Operator> {
         let ctx = self.context();
         let a = Array::<T>::alloc(ctx, Shape::from(1usize))?;
         let b = Array::<T>::alloc(ctx, Shape::from(1usize))?;
@@ -1007,8 +1230,24 @@ impl<T: ScalarType> Array<T> {
         }
     }
 
-    /// Runs the scan of `op` along `axis`.
-    fn run_scan(&self, axis: usize, op: &ScanOp<'_, T>) -> Outcome<Array<T>> {
+    /// `+` as an [`Operator`], traced on the first call for the element type: the trace allocates
+    /// two arrays and builds, flattens and prints an expression, which takes a few microseconds
+    /// of a `cumsum` that a bandwidth-bound kernel of 0.17 ms leaves idle. The operator is
+    /// the same text on every device.
+    fn sum_operator(&self) -> Outcome<Arc<Operator>> {
+        static SUMS: LazyLock<SumOperators> = LazyLock::new(Mutex::default);
+        let ty = T::wgsl_type();
+        let known = SUMS.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(known, _)| *known == ty).map(|(_, op)| Arc::clone(op));
+        if let Some(op) = known {
+            return Ok(op);
+        }
+        let op = Arc::new(self.trace_operator(&add)?);
+        SUMS.lock().unwrap_or_else(PoisonError::into_inner).push((ty, Arc::clone(&op)));
+        Ok(op)
+    }
+
+    /// Runs the scan of `op` along `axis`; `sum` if `op` is `+` (see [`Array::sum_operator`]).
+    fn run_scan(&self, axis: usize, op: &ScanOp<'_, T>, sum: bool) -> Outcome<Array<T>> {
         let ctx = self.context();
         let (pin, bytes) = self.ready()?;
         if ElemTy::of::<T>()?.layout() != ElemLayout::plain(4) {
@@ -1018,7 +1257,7 @@ impl<T: ScalarType> Array<T> {
         if axis >= 4 {
             return Err(LumaError::InvalidShape(format!("axis {axis} of shape {shape}")).into());
         }
-        let operator = self.trace_operator(op)?;
+        let operator = if sum { self.sum_operator()? } else { Arc::new(self.trace_operator(op)?) };
         let out = Array::<T>::alloc(ctx, shape)?;
         let out_storage = Arc::clone(out.storage()?);
         let out_pin = out_storage.pin_single()?;
@@ -1054,6 +1293,12 @@ impl<T: ScalarType> Array<T> {
         }
         let mut out_dims = shape.dims();
         out_dims[axis] = 1;
+        if ctx.can_run_on_host() && self.len() <= crate::host::MAX_HOST_ELEMS && self.error().is_none() {
+            let (n, stride, lines) = self.line_geometry(axis)?;
+            if let Some(outs) = crate::host::try_axis_reduce(self, [n, stride, lines], out_dims, ops) {
+                return Ok(outs);
+            }
+        }
         let outs = ops.as_slice().iter().map(|_| Array::<T>::alloc(ctx, Shape::from(out_dims))).collect::<Result<Vec<_>>>()?;
         let storages = outs.iter().map(|out| out.storage().map(Arc::clone)).collect::<std::result::Result<Vec<_>, _>>()?;
         let pins = storages.iter().map(|storage| storage.pin_single()).collect::<Result<Vec<_>>>()?;
@@ -1086,6 +1331,13 @@ impl<T: ScalarType> Array<T> {
         let ty = ElemTy::of::<T>()?;
         if ty.layout() != ElemLayout::plain(4) {
             return Err(LumaError::Unsupported(format!("{name} is not available for {} arrays", ty.display())).into());
+        }
+        if ctx.can_run_on_host()
+            && self.len() <= crate::host::MAX_HOST_ELEMS
+            && self.error().is_none()
+            && let Some(out) = crate::host::try_arg_reduce(self, [cells.n, cells.stride, cells.lines], out_dims, op)
+        {
+            return Ok(out);
         }
         let out = Array::<u32>::alloc(ctx, Shape::from(out_dims))?;
         let storage = Arc::clone(out.storage()?);
@@ -1126,8 +1378,8 @@ impl<T: ScalarType> Array<T> {
     }
 
     #[track_caller]
-    fn scan_axis(&self, axis: usize, op: &ScanOp<'_, T>, name: &'static str, location: &'static Location<'static>) -> Array<T> {
-        let result = self.run_scan(axis, op);
+    fn scan_axis(&self, axis: usize, op: &ScanOp<'_, T>, sum: bool, name: &'static str, location: &'static Location<'static>) -> Array<T> {
+        let result = self.run_scan(axis, op, sum);
         Array::resolve(self.context(), self.shape(), result, name, location)
     }
 
@@ -1138,6 +1390,17 @@ impl<T: ScalarType> Array<T> {
             dims[axis] = 1;
         }
         let shape = Shape::from(dims);
+        // Left pending where they can be, so that the reductions of one operand (or of expressions that share work) that a program makes
+        // one after another are recorded in one kernel when they are used (see `jit::multireduce`).
+        if (1..=MAX_REDUCTIONS).contains(&N)
+            && axis < 4
+            && !self.is_empty()
+            && let Ok((n, stride, lines)) = self.line_geometry(axis)
+            && let Some(arrays) = self.defer_axis(&ops.map(Reduction::op), crate::reduce::AxisGeom { n, stride, lines }, shape, name, location)
+        {
+            let mut arrays = arrays.into_iter();
+            return std::array::from_fn(|_| arrays.next().expect("one array per reduction"));
+        }
         let result = if (1..=MAX_REDUCTIONS).contains(&N) {
             self.run_axis_reduce(axis, ReduceList::new(&ops.map(Reduction::op)))
         } else {
@@ -1168,7 +1431,10 @@ impl<T: Numeric> Array<T> {
     /// one-element placeholders and compiled into the scan kernels; anything else poisons the
     /// result with [`LumaError::InvalidShape`].
     ///
-    /// Contiguous lines are cut in chunks that a workgroup scans in workgroup memory (chunk
+    /// Many contiguous lines (CUDA and other devices with 32-wide subgroups) are one kernel with a
+    /// subgroup per line, reading and writing every cell once; the grouping of the operands, and
+    /// so the rounding of `f32` sums, differs from the passes below but is fixed. Otherwise
+    /// contiguous lines are cut in chunks that a workgroup scans in workgroup memory (chunk
     /// totals, a scan of the totals, a second pass seeded with them; on CUDA integer scans and
     /// `min` / `max` of long lines are one pass in which the chunks wait for each other's
     /// prefix, which gives the same results as they do not depend on the grouping), strided
@@ -1179,17 +1445,21 @@ impl<T: Numeric> Array<T> {
     /// changing them does not recompile. The results of an associative `op` are the same on every run.
     #[track_caller]
     pub fn scan(&self, axis: usize, op: impl Fn(&Array<T>, &Array<T>) -> Array<T>) -> Array<T> {
-        self.scan_axis(axis, &op, "scan", Location::caller())
+        self.scan_axis(axis, &op, false, "scan", Location::caller())
     }
 
     /// The running sum along `axis` (a [`scan`](Array::scan) with `+`).
     #[track_caller]
     pub fn cumsum(&self, axis: usize) -> Array<T> {
-        self.scan_axis(axis, &add, "cumsum", Location::caller())
+        self.scan_axis(axis, &add, true, "cumsum", Location::caller())
     }
 
     /// The sum along `axis`; the result has extent 1 along it. A pending operand is not
     /// evaluated first: its expression is computed inside the first pass of the reduction.
+    /// An `f32` result stays pending until it is used, like [`Array::sum`]: it is recorded then,
+    /// in one kernel with the axis reductions over the same lines that are pending (`mean_axis`
+    /// and `var_axis` of one array, the three components of a force, a table's column means and
+    /// extrema), each of them with the value it has alone (the same bits on the CPU backend, within an ulp or two on GPU backends).
     #[track_caller]
     pub fn sum_axis(&self, axis: usize) -> Array<T> {
         let [sum] = self.reduce_lines(axis, [Reduction::Sum], "sum_axis", Location::caller());
@@ -1215,7 +1485,9 @@ impl<T: Numeric> Array<T> {
     /// Up to four reductions along `axis` in one pass over the data: result `j` is the
     /// reduction `ops[j]`, with extent 1 along `axis`. Every cell is read once for all of them,
     /// and a pending operand is computed inside that first pass, never stored. Like
-    /// [`sum_axis`](Array::sum_axis), the arrays are evaluated when the call returns; another
+    /// [`sum_axis`](Array::sum_axis), `f32` results are recorded when one of them is used (on a GPU
+    /// backend, outside a step that is being recorded), the others pending over the same lines
+    /// with them in one kernel; any other result is evaluated when the call returns. Another
     /// number of reductions poisons every result with [`LumaError::InvalidShape`].
     ///
     /// [`Reduction::SumOfSquares`] of integers wraps, as [`Array::reduce`] does. Contiguous lines
@@ -1311,13 +1583,31 @@ impl Array<f32> {
     }
 
     /// The population variance along `axis` (divisor `n`, NumPy's `ddof = 0`); the result has
-    /// extent 1 along it. Two passes, so it is stable for data far from zero: the mean, then
-    /// the mean of the squared deviations, in which `self - mean` is computed inside the
-    /// reduction.
+    /// extent 1 along it. One pass over the data: with `K` the first element of each line
+    /// (a broadcast slice of the input, read inside the same pass), the sum `S1` and the sum
+    /// of squares `S2` of `self - K` come from a single [`reduce_axis`](Array::reduce_axis)
+    /// (the subtraction is computed inside the reduction, never stored), and the variance is
+    /// `(S2 - S1 * S1 / n) / n`, which is shift invariant.
+    ///
+    /// Accuracy: the cancellation in `S2 - S1 * S1 / n` loses digits in proportion to
+    /// `(mean - K)^2 / var`, not to `mean^2 / var` as the unshifted formula does, so data far
+    /// from zero but with a spread comparable to the distance of its elements from the first
+    /// (an offset of `1e4` on unit noise, a layer's activations) keeps `f32` accuracy. A line
+    /// whose first element is an outlier many standard deviations from the rest loses digits
+    /// (about `(outlier / sigma)^2` of the `f32` epsilon) where the two-pass formula would
+    /// not; a constant line has variance exactly 0. Rounding can leave the difference
+    /// slightly negative, so the result is clamped at 0 (a NaN is kept, on every backend: any NaN or infinity
+    /// in a line gives NaN, as the two-pass formula did).
     #[track_caller]
     pub fn var_axis(&self, axis: usize) -> Array<f32> {
-        let deviation = self - &self.mean_axis(axis);
-        (&deviation * &deviation).mean_axis(axis)
+        let n = self.shape().dims().get(axis).copied().unwrap_or(1);
+        let shifted = self - &self.slice(axis, ..1);
+        let [s1, s2] = shifted.reduce_axis(axis, [Reduction::Sum, Reduction::SumOfSquares]);
+        let n = n as f32;
+        let var = &(&s2 - &(&s1 * &s1) / n) / n;
+        // Clamped at 0 as `(var + |var|) / 2`, exact, keeps NaN and infinity: a compare or
+        // `max` would let a driver's NaN-dropping `fmax` turn a NaN into 0.
+        &(&var * 0.5f32) + &(&var.abs() * 0.5f32)
     }
 
     /// The population standard deviation along `axis`: the square root of
@@ -1328,7 +1618,7 @@ impl Array<f32> {
     }
 }
 
-fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {
+pub(crate) fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {
     x.binary(Rhs::Array(y), BinOp::Add, false, "add")
 }
 

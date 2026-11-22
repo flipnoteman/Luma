@@ -4,7 +4,6 @@
 //! without the CUDA toolkit being installed.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::sync::Mutex;
 
 use libloading::Library;
 
@@ -77,7 +76,6 @@ type Res = c_int;
 
 pub(crate) struct Nvvm {
     pub version: (i32, i32),
-    lock: Mutex<()>,
     create: unsafe extern "C" fn(*mut Prog) -> Res,
     destroy: unsafe extern "C" fn(*mut Prog) -> Res,
     add: unsafe extern "C" fn(Prog, *const c_char, usize, *const c_char) -> Res,
@@ -122,7 +120,6 @@ impl Nvvm {
             sym!(b"nvvmIRVersion\0");
         let mut n = Nvvm {
             version: (0, 0),
-            lock: Mutex::new(()),
             create: sym!(b"nvvmCreateProgram\0"),
             destroy: sym!(b"nvvmDestroyProgram\0"),
             add: sym!(b"nvvmAddModuleToProgram\0"),
@@ -188,14 +185,18 @@ impl Nvvm {
             if r != 0 {
                 return fail(r);
             }
-            let r = (self.lazy_add)(
-                prog,
-                LIBDEVICE.as_ptr().cast(),
-                LIBDEVICE.len(),
-                c"libdevice".as_ptr(),
-            );
-            if r != 0 {
-                return fail(r);
+            // libdevice is linked in lazily, but parsing its bitcode is a fixed cost (about a third of
+            // the compile of a small kernel); a kernel that calls none of it does not need it.
+            if ir.contains("@__nv_") {
+                let r = (self.lazy_add)(
+                    prog,
+                    LIBDEVICE.as_ptr().cast(),
+                    LIBDEVICE.len(),
+                    c"libdevice".as_ptr(),
+                );
+                if r != 0 {
+                    return fail(r);
+                }
             }
             let arch = std::ffi::CString::new(format!("-arch=compute_{major}{minor}"))
                 .map_err(|e| e.to_string())?;
@@ -224,9 +225,9 @@ impl Nvvm {
         }
     }
 
-    /// IR text -> PTX text. Err = "<nvvmGetErrorString>\n<program log>".
+    /// IR text -> PTX text. Programs are independent and libNVVM is thread-safe across them, so
+    /// kernels compile on several threads at once. Err = "<nvvmGetErrorString>\n<program log>".
     pub(crate) fn compile(&self, ir: &str, major: i32, minor: i32) -> Result<String, String> {
-        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut prog: Prog = std::ptr::null_mut();
         // SAFETY: `prog` is a valid out-pointer.
         let r = unsafe { (self.create)(&mut prog) };

@@ -5,9 +5,13 @@
 //! Licence: luma's code is MIT OR Apache-2.0. The embedded `vendor/libdevice.10.bc` (NVIDIA's
 //! libdevice) is redistributed under the NVIDIA CUDA Toolkit EULA, `vendor/NVIDIA-CUDA-EULA.txt`.
 
+#[macro_use]
+mod ptx;
 pub mod backend;
 pub mod codegen;
 mod nvvm;
+mod sgemm;
+mod tensor;
 
 pub use backend::CudaBackend;
 

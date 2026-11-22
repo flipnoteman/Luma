@@ -262,13 +262,18 @@ impl<'a> Lowering<'a> {
 /// The weight of a lowered instruction in f32-operation units; with `staged_reads`, a read of a
 /// sub-program (staged in workgroup memory) is an index and a workgroup load.
 fn flat_weight(flat: &Flat, cost: &CostModel, staged_reads: bool) -> f64 {
-    if staged_reads && matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(flat.op, cost) }
+    if staged_reads && matches!(flat.args[0], Ref::Sub(_)) { 2.0 } else { op_weight(&flat.op, cost) }
 }
 
 /// What the least a branch must save, in f32-operation units per element that reaches the `Select`
 /// (the branch itself costs about that much to every one of them), for it to be computed as
 /// `if`/`else`.
 const BRANCH_GAIN: f64 = 8.0;
+
+/// What not reading an input saves, in the same units: a read from memory costs far more than an
+/// arithmetic operation in a kernel that is bound by memory, which the weights of arithmetic do
+/// not show.
+const INPUT_READ: f64 = 24.0;
 
 /// The result of [`branches`].
 struct Branches {
@@ -362,7 +367,7 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
         .map(|flat| {
             matches!(flat.op.kind, OpKind::Select)
                 && matches!(flat.args[0], Ref::Tmp(mask) if coordinates.get(mask as usize).copied().unwrap_or(false))
-                && (matches!(flat.args[1], Ref::Tmp(_)) || matches!(flat.args[2], Ref::Tmp(_)))
+                && (matches!(flat.args[1], Ref::Tmp(_) | Ref::Input(_)) || matches!(flat.args[2], Ref::Tmp(_) | Ref::Input(_)))
         })
         .collect();
     if !branch.iter().any(|&b| b) {
@@ -567,6 +572,19 @@ fn branches(flats: &[Flat], ctxs: &[Ctx], roots: &[u32], cost: &CostModel, stage
                 r = parent(&region, r);
             }
         }
+        // An operand that is an input is read inside its branch: the elements that do not take it
+        // do not read it (a triangle of a matrix reads half of it).
+        for (m, flat) in flats.iter().enumerate() {
+            if !branch[m] {
+                continue;
+            }
+            let at = group[m] as usize;
+            for (slot, here) in [(1, share[m]), (2, 1.0 - share[m])] {
+                if matches!(flat.args[slot], Ref::Input(_)) {
+                    saved[at] += INPUT_READ * chance[m] * (1.0 - here);
+                }
+            }
+        }
         let mut dropped = false;
         for (anchor, members) in lists.iter().enumerate() {
             if !members.is_empty() && saved[anchor] < BRANCH_GAIN * chance[anchor] {
@@ -722,14 +740,20 @@ fn key_roots(key: &FusedKey, main: &[u32]) -> Vec<u32> {
             .take(2)
             .filter_map(|&at| value(at))
             .collect(),
-        Tail::Reduce(_) => {
-            if key.outputs.len() > 1 {
+        Tail::Reduce(ops) => {
+            if key.outputs.len() > 1 || ops.roots().is_some() {
                 key.outputs.iter().filter_map(|&at| value(at)).collect()
             } else {
                 main.last().copied().into_iter().collect()
             }
         }
-        Tail::AxisReduce(_) => main.last().copied().into_iter().collect(),
+        Tail::AxisReduce(pass) => {
+            if pass.ops.roots().is_some() {
+                key.outputs.iter().filter_map(|&at| value(at)).collect()
+            } else {
+                main.last().copied().into_iter().collect()
+            }
+        }
     }
 }
 
@@ -996,7 +1020,7 @@ fn written_out_ns(key: &FusedKey, len: usize, cost: &CostModel) -> f64 {
     let mut reads: Vec<(u32, ShiftKind)> = Vec::new();
     let mut ops = 0.0;
     for instr in key.instrs.iter() {
-        ops += op_weight(instr.op, cost);
+        ops += op_weight(&instr.op, cost);
         if let (OpKind::Shift(kind), Ref::Sub(j)) = (instr.op.kind, instr.args[0])
             && !reads.contains(&(j, kind))
         {
@@ -1121,6 +1145,7 @@ fn rebuilt(key: &FusedKey, main: Vec<Instr>, subs: Vec<Vec<Instr>>, outputs: Vec
         staging: None,
         guard: key.guard,
         params: None,
+        coarsen: 1,
     }
 }
 
@@ -1176,7 +1201,7 @@ fn recomputation(key: &FusedKey, cost: &CostModel) -> (Vec<f64>, Vec<f64>) {
         }
         found
     };
-    let weight = |program: &[Instr]| program.iter().map(|instr| op_weight(instr.op, cost)).sum::<f64>();
+    let weight = |program: &[Instr]| program.iter().map(|instr| op_weight(&instr.op, cost)).sum::<f64>();
     let mut alone = vec![0.0f64; n];
     for s in 0..n {
         let own = &key.subs[s];
@@ -1423,6 +1448,7 @@ mod tests {
             staging: None,
             guard: None,
             params: None,
+            coarsen: 1,
         }
     }
 
@@ -1664,8 +1690,8 @@ mod tests {
         assert!(inlined.region[2..25].iter().all(|&region| region == Region::Taken(select as u32)), "{:?}", inlined.region);
         assert!([0, 1, select].iter().all(|&n| inlined.region[n] == Region::Top), "{:?}", inlined.region);
         // 4 of the 64 cells take it: the operations are the program's four plus 1/16 of the expression's.
-        let all: f64 = inlined.instrs.iter().map(|flat| op_weight(flat.op, &cost)).sum();
-        let expression: f64 = inlined.instrs.iter().zip(&inlined.region).filter(|&(_, &region)| region != Region::Top).map(|(flat, _)| op_weight(flat.op, &cost)).sum();
+        let all: f64 = inlined.instrs.iter().map(|flat| op_weight(&flat.op, &cost)).sum();
+        let expression: f64 = inlined.instrs.iter().zip(&inlined.region).filter(|&(_, &region)| region != Region::Top).map(|(flat, _)| op_weight(&flat.op, &cost)).sum();
         assert!((inlined.ops - (all - expression + expression / 16.0)).abs() < 1e-9, "{} of {all}, expression {expression}", inlined.ops);
         assert_eq!(validate_inlined(&inlined, 1, false), Ok(()));
     }
@@ -1738,7 +1764,7 @@ mod tests {
             assert_eq!(count, 23 + fields);
             assert!((0..inlined.instrs.len()).filter(|&n| inside(n)).all(|n| inlined.region[n] == Region::Taken(anchor)), "{fields} fields: {:?}", inlined.region);
             // Half the cells take it: the operations are the others' plus half of those inside.
-            let weight = |n: usize| op_weight(inlined.instrs[n].op, &cost);
+            let weight = |n: usize| op_weight(&inlined.instrs[n].op, &cost);
             let all: f64 = (0..inlined.instrs.len()).map(weight).sum();
             let taken: f64 = (0..inlined.instrs.len()).filter(|&n| inside(n)).map(weight).sum();
             assert!((inlined.ops - (all - taken / 2.0)).abs() < 1e-9, "{} of {all}, inside {taken}", inlined.ops);
@@ -1883,7 +1909,7 @@ mod tests {
             Region::Taken(_) => 1.0 / 16.0,
             Region::Skipped(_) => 15.0 / 16.0,
         };
-        (0..inlined.instrs.len()).map(|n| op_weight(inlined.instrs[n].op, cost) * chance(inlined.region[n])).sum()
+        (0..inlined.instrs.len()).map(|n| op_weight(&inlined.instrs[n].op, cost) * chance(inlined.region[n])).sum()
     }
 
     #[test]

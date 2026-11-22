@@ -33,7 +33,7 @@ mod imp {
     use luma_core::kir::KernelModule;
     use luma_core::{
         Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo, DeviceLimits,
-        DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, NativeBuffer, NativeKernel, Profile, RawArg,
+        DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg,
         RawKernel, TuningProfile,
     };
     use objc2::rc::{Retained, autoreleasepool};
@@ -327,6 +327,8 @@ mod imp {
                     max_workgroup_invocations: invocations,
                     max_workgroup_storage_bytes: device.maxThreadgroupMemoryLength() as u32,
                 },
+                // Metal does not report the GPU core count.
+                compute_units: None,
             };
             let identity = format!("{name}\n{}\n{apple_silicon}", std::env::consts::ARCH);
             let key = format!("metal-{:016x}", cache::fnv1a(identity.as_bytes()));
@@ -1062,6 +1064,19 @@ mod imp {
             Ok(buffer)
         }
 
+        fn host_ptr(&self, buffer: &Buffer, bytes: u64) -> Option<*mut u8> {
+            let native = raw(buffer).ok()?;
+            if bytes > buffer.size() || native.last_used.load(Ordering::Acquire) > self.poll_done() {
+                return None;
+            }
+            Some(native.raw.contents().as_ptr().cast::<u8>())
+        }
+
+        fn alloc_host_buffer(&self, bytes: u64, max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
+            let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+            self.take_upload_buffer(&self.mappable, class, MAPPABLE_STORAGE_USAGE)
+        }
+
         fn recycle_mappable(&self, buffer: Buffer) {
             // The pending command buffer (committed as the next sequence number) may still read
             // the buffer. This must not take the batch lock: the caller may hold anything.
@@ -1071,15 +1086,18 @@ mod imp {
             lock(&self.retired).push(Retired { ready_after, item: Item::Mappable(buffer) });
         }
 
-        fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+        fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
             if let Some(mask) = used
                 && mask.len() != module.bindings.len()
             {
                 return Err(BackendError::KernelBinding(format!("the used-binding mask has {} entries for {} bindings", mask.len(), module.bindings.len())));
             }
-            let checked = if trusted { Cow::Borrowed(module) } else { luma_core::kir::opt::with_bounds_checks(module) };
+            if module.bindings.iter().any(|b| matches!(b.kind, luma_core::BindingKind::Texture2d | luma_core::BindingKind::Sampler)) {
+                return Err(BackendError::Unsupported(format!("kernel `{label}` reads a texture; the Metal backend has no textures")));
+            }
+            let checked = if trust.checks_bounds() { luma_core::kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
             let optimized = luma_core::kir::optimize_for_target(&checked, false);
-            let msl = emit_with_workgroup_init(&optimized, used, !trusted);
+            let msl = emit_with_workgroup_init(&optimized, used, trust.zero_workgroup_memory());
             let array_lengths = msl
                 .array_lengths
                 .iter()

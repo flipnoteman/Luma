@@ -20,10 +20,11 @@ members = [
     "crates/luma-metal",
     "crates/luma-cuda",
     "crates/luma-cpu",
+    "crates/luma-bench",
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/flipnoteman/Luma"
@@ -31,11 +32,11 @@ homepage = "https://flipnoteman.github.io/Luma/"
 rust-version = "1.99"
 
 [workspace.dependencies]
-luma-core = { package = "luma-hal-core", path = "crates/luma-core", version = "0.5.1" }
-luma-wgpu = { package = "luma-hal-wgpu", path = "crates/luma-wgpu", version = "0.5.1" }
-luma-metal = { package = "luma-hal-metal", path = "crates/luma-metal", version = "0.5.1" }
-luma-cuda = { package = "luma-hal-cuda", path = "crates/luma-cuda", version = "0.5.1" }
-luma-cpu = { package = "luma-hal-cpu", path = "crates/luma-cpu", version = "0.5.1" }
+luma-core = { package = "luma-hal-core", path = "crates/luma-core", version = "0.5.2" }
+luma-wgpu = { package = "luma-hal-wgpu", path = "crates/luma-wgpu", version = "0.5.2" }
+luma-metal = { package = "luma-hal-metal", path = "crates/luma-metal", version = "0.5.2" }
+luma-cuda = { package = "luma-hal-cuda", path = "crates/luma-cuda", version = "0.5.2" }
+luma-cpu = { package = "luma-hal-cpu", path = "crates/luma-cpu", version = "0.5.2" }
 cranelift-codegen = { version = "0.137.2", default-features = false, features = ["std", "host-arch"] }
 cranelift-frontend = "0.137.2"
 cranelift-native = "0.137.2"
@@ -52,7 +53,9 @@ objc2-foundation = "0.3.2"
 objc2-metal = "0.3.2"
 block2 = "0.6.2"
 libc = "0.2"
+libm = "0.2"
 libloading = "0.8"
+matrixmultiply = "0.3.11"
 
 [features]
 default = ["wgpu", "metal", "cuda"]
@@ -74,6 +77,7 @@ criterion = "0.8"
 ml-kem = "0.3.4"
 proptest = "1"
 rustfft = "6"
+libm.workspace = true
 
 [[bench]]
 name = "real_world"

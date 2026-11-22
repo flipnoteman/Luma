@@ -13,25 +13,25 @@
 //! is what the hazard analysis walks, and a copy that read `x` directly would not see that the
 //! expression below it has to be evaluated before the write.
 
-use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Scalar, Src, UnOp};
+use super::{Args, BinOp, CmpOp, ElemTy, Node, Op, OpKind, Part, Scalar, Src, UnOp};
 
 /// The operation and operands to create instead of `op` on `args`, if a rule applies.
-pub(super) fn rewrite(op: Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
+pub(super) fn rewrite(op: &Op, args: &Args, fast: bool) -> Option<(Op, Args)> {
     exact(op, args).or_else(|| if fast { self::fast(op, args) } else { None })
 }
 
 fn is_float(ty: ElemTy) -> bool {
-    matches!(ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32)
+    matches!(ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32)
 }
 
 /// The bit pattern of the constant `value` as a scalar of type `ty` (`Df32`: `hi` is `value`,
-/// `lo` is 0).
+/// `lo` is 0; `C32`: the real part is `value`, the imaginary part 0).
 fn const_bits(ty: ElemTy, value: f64) -> u64 {
     match ty {
-        ElemTy::F32 | ElemTy::Df32 => u64::from((value as f32).to_bits()),
+        ElemTy::F32 | ElemTy::Df32 | ElemTy::C32 => u64::from((value as f32).to_bits()),
         ElemTy::F64 => value.to_bits(),
-        ElemTy::U32 | ElemTy::Bool => u64::from(value as u32),
-        ElemTy::I32 => u64::from(value as i32 as u32),
+        ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => u64::from(value as u32),
+        ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => u64::from(value as i32 as u32),
     }
 }
 
@@ -63,10 +63,10 @@ fn same(a: &Src, b: &Src) -> bool {
 /// `wanted` accepts (the operands are only copied then, which takes the node's lock).
 fn inner(src: &Src, wanted: fn(Op) -> bool) -> Option<(Op, Args)> {
     let Src::Node(node) = src else { return None };
-    if !wanted(node.op()) || !node.is_pending() || is_looped(node) {
+    if !wanted(*node.op()) || !node.is_pending() || is_looped(node) {
         return None;
     }
-    node.operands().map(|args| (node.op(), args))
+    node.operands().map(|args| (*node.op(), args))
 }
 
 fn is_looped(node: &Node) -> bool {
@@ -78,12 +78,12 @@ fn args_of(a: Src, b: Src, c: Src) -> Args {
 }
 
 /// `Id(x)`: the operation yields its operand.
-fn identity(op: Op, x: &Src) -> Option<(Op, Args)> {
+fn identity(op: &Op, x: &Src) -> Option<(Op, Args)> {
     Some((Op::new(OpKind::Unary(UnOp::Id), op.out_ty()), args_of(x.clone(), Src::unused(), Src::unused())))
 }
 
 /// `Id` of the constant `value` of the operation's result type.
-fn constant(op: Op, value: f64) -> Option<(Op, Args)> {
+fn constant(op: &Op, value: f64) -> Option<(Op, Args)> {
     let ty = op.out_ty();
     let bits = const_bits(ty, value);
     Some((
@@ -101,10 +101,22 @@ fn binary(kind: BinOp, ty: ElemTy, x: &Src, y: Src) -> Option<(Op, Args)> {
 }
 
 /// The rewrites that keep every result bit.
-fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
+fn exact(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let [a, b, c] = args;
     let ty = op.ty;
     match op.kind {
+        // Not one identity of a real number holds bit for bit for a complex one: `z * 1` has
+        // `inf * 0` in it, and `z + (-0)` turns a `-0` imaginary part into `+0`.
+        OpKind::Binary(_) if ty == ElemTy::C32 => None,
+        OpKind::Part(Part::Real | Part::Imag) => {
+            let (_, iargs) = inner(a, |inside| inside.kind == OpKind::Make)?;
+            identity(op, &iargs[usize::from(op.kind == OpKind::Part(Part::Imag))])
+        }
+        OpKind::Make => {
+            let (_, real) = inner(a, |inside| inside.kind == OpKind::Part(Part::Real))?;
+            let (_, imag) = inner(b, |inside| inside.kind == OpKind::Part(Part::Imag))?;
+            if same(&real[0], &imag[0]) { identity(op, &real[0]) } else { None }
+        }
         OpKind::Binary(bin) => {
             let (sa, sb) = (scalar(a), scalar(b));
             let float = is_float(ty);
@@ -157,14 +169,14 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
         OpKind::Unary(un) => {
             if !matches!(
                 un,
-                UnOp::Neg | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_)
+                UnOp::Neg | UnOp::Conj | UnOp::Abs | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Sign | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_)
             ) {
                 return None;
             }
             let (iop, iargs) = inner(a, |inside| matches!(inside.kind, OpKind::Unary(_)))?;
             let OpKind::Unary(inner_un) = iop.kind else { return None };
             match (un, inner_un) {
-                (UnOp::Neg, UnOp::Neg) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
+                (UnOp::Neg, UnOp::Neg) | (UnOp::Conj, UnOp::Conj) | (UnOp::BitNot, UnOp::BitNot) => identity(op, &iargs[0]),
                 (UnOp::Abs, UnOp::Abs | UnOp::Neg) => unary(UnOp::Abs, ty, &iargs[0]),
                 (UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round, UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round) => {
                     unary(inner_un, ty, &iargs[0])
@@ -180,14 +192,14 @@ fn exact(op: Op, args: &Args) -> Option<(Op, Args)> {
             if let Some(m) = scalar(a) {
                 identity(op, if m.bits & 0xffff_ffff != 0 { b } else { c })
             } else if let Some((_, iargs)) = inner(a, |inside| inside.ty == ElemTy::Bool && inside.kind == OpKind::Unary(UnOp::BitNot)) {
-                Some((op, args_of(iargs[0].clone(), c.clone(), b.clone())))
+                Some((*op, args_of(iargs[0].clone(), c.clone(), b.clone())))
             } else if same(b, c) {
                 identity(op, b)
             } else {
                 None
             }
         }
-        OpKind::Compare(cmp) if same(a, b) => match cmp {
+        OpKind::Compare(cmp) if same(a, b) && cmp.exists_for(ty) => match cmp {
             CmpOp::Lt | CmpOp::Gt => constant(op, 0.0),
             CmpOp::Le | CmpOp::Ge | CmpOp::Eq if !is_float(ty) => constant(op, 1.0),
             CmpOp::Ne if !is_float(ty) => constant(op, 0.0),
@@ -227,7 +239,7 @@ fn survives(ty: ElemTy, value: f64, nonzero: bool) -> bool {
 }
 
 /// The rewrites that may change rounding, the sign of zero or the handling of NaN and infinity.
-fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
+fn fast(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let [a, b, _] = args;
     let ty = op.ty;
     let float = is_float(ty);
@@ -282,7 +294,7 @@ fn fast(op: Op, args: &Args) -> Option<(Op, Args)> {
 
 /// `(x * a) * b`, `(x + a) + b`, `(x - a) + b` and `(x + a) - b` with constants `a` and `b`
 /// become one operation with a combined constant.
-fn reassociate(op: Op, args: &Args) -> Option<(Op, Args)> {
+fn reassociate(op: &Op, args: &Args) -> Option<(Op, Args)> {
     let ty = op.ty;
     if !matches!(ty, ElemTy::F32 | ElemTy::F64) {
         return None;
@@ -522,11 +534,51 @@ mod tests {
             [Src::Scalar(Scalar::u32(m)), node(a), node(b)]
         };
         let op = Op::new(OpKind::Select, ElemTy::F32);
-        let (taken, operands) = rewrite(op, &args(1, &f, &g), false).unwrap();
+        let (taken, operands) = rewrite(&op, &args(1, &f, &g), false).unwrap();
         assert_eq!(taken.kind, OpKind::Unary(UnOp::Id));
         assert!(same(&operands[0], &args(1, &f, &g)[1]));
-        let (_, operands) = rewrite(op, &args(0, &f, &g), false).unwrap();
+        let (_, operands) = rewrite(&op, &args(0, &f, &g), false).unwrap();
         assert!(same(&operands[0], &args(0, &f, &g)[2]));
+    }
+
+    /// The parts of a complex number put together are that number, the real part of a made number
+    /// is its first part, `conj conj` is the identity; a real number in a complex product is not
+    /// a rule (`z * (1 + 0i)` is not `z`: `inf * 0`).
+    #[test]
+    fn simplify_complex_rules() {
+        use crate::complex::C32;
+        let ctx = context(false);
+        let data = [C32::new(f32::INFINITY, 1.0), C32::new(-0.0, 2.0), C32::new(f32::NAN, -3.0), C32::new(1.5, f32::NEG_INFINITY)];
+        type ComplexCase = (&'static str, bool, fn(&Array<C32>) -> Vec<C32>);
+        let cases: [ComplexCase; 4] = [
+            ("make of the parts", true, |w| {
+                let w = w.conj();
+                Array::from_parts(&w.real(), &w.imag()).to_vec().unwrap()
+            }),
+            ("real of make", true, |w| {
+                let w = w.conj();
+                Array::from_parts(&w.real(), &w.imag()).conj().to_vec().unwrap()
+            }),
+            ("conj conj", true, |w| w.conj().conj().to_vec().unwrap()),
+            ("times one", false, |w| (&w.conj() * C32::ONE).to_vec().unwrap()),
+        ];
+        for (name, shorter, case) in cases {
+            let mut results = Vec::new();
+            for simplify in [false, true] {
+                ctx.jit().set_simplify(simplify);
+                let z = Array::from_slice_on(&ctx, &data, data.len()).unwrap();
+                let got = case(&z);
+                let bits: Vec<(u32, u32)> = got.iter().map(|c| (if c.re.is_nan() { 0 } else { c.re.to_bits() }, if c.im.is_nan() { 0 } else { c.im.to_bits() })).collect();
+                results.push((bits, ctx.jit().last_program_len()));
+            }
+            ctx.jit().set_simplify(true);
+            assert_eq!(results[0].0, results[1].0, "{name}: the bits");
+            if shorter {
+                assert!(results[1].1 < results[0].1, "{name}: {} instructions against {}", results[1].1, results[0].1);
+            } else {
+                assert_eq!(results[1].1, results[0].1, "{name}: not a rule");
+            }
+        }
     }
 
     #[test]
@@ -599,13 +651,13 @@ mod tests {
         let buffer = Src::Buffer(std::sync::Arc::clone(x.storage().ok().unwrap()));
         let op = Op::new(OpKind::Binary(BinOp::Div), ElemTy::F32);
         let args = [buffer, Src::Scalar(Scalar::f32(3.0)), Src::unused()];
-        assert!(rewrite(op, &args, false).is_none());
-        let (product, operands) = rewrite(op, &args, true).unwrap();
+        assert!(rewrite(&op, &args, false).is_none());
+        let (product, operands) = rewrite(&op, &args, true).unwrap();
         assert_eq!(product.kind, OpKind::Binary(BinOp::Mul));
         let Src::Scalar(factor) = operands[1] else { panic!("no constant") };
         assert_eq!(factor.bits, u64::from((1.0f32 / 3.0).to_bits()));
         let zero = [args[0].clone(), Src::Scalar(Scalar::f32(0.0)), Src::unused()];
-        assert!(rewrite(op, &zero, true).is_none());
+        assert!(rewrite(&op, &zero, true).is_none());
     }
 
     #[test]
@@ -616,9 +668,9 @@ mod tests {
         let div = Op::new(OpKind::Binary(BinOp::Div), ElemTy::F32);
         // Dividing by infinity or a subnormal whose reciprocal overflows `f32` must not fold.
         let by_inf = [buffer.clone(), Src::Scalar(Scalar::f32(f32::INFINITY)), Src::unused()];
-        assert!(rewrite(div, &by_inf, true).is_none());
+        assert!(rewrite(&div, &by_inf, true).is_none());
         let by_subnormal = [buffer, Src::Scalar(Scalar::f32(1e-40)), Src::unused()];
-        assert!(rewrite(div, &by_subnormal, true).is_none());
+        assert!(rewrite(&div, &by_subnormal, true).is_none());
         // A combined constant outside the range of `f32` must stay two operations (`fusion_limit(1)`
         // keeps the shader compiler's own fast-math from reassociating across the two steps).
         let near = |got: Vec<f32>, want: [f32; 2]| {

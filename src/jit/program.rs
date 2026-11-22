@@ -198,6 +198,9 @@ pub(crate) struct FusedKey {
     /// Set by `JitState::kernel`: the numbers of views, gathers and the scatter are read from the
     /// uniform, and this is what the lowering of the key is (see `params`).
     pub(crate) params: Option<Arc<Parameterized>>,
+    /// Set by `launch::run_store` (see `jit::coarsen`): how many elements each invocation of a
+    /// plain store kernel computes (1, 2, 4 or 8); 1 for every other kernel.
+    pub(crate) coarsen: u8,
 }
 
 /// Whether the WGSL of `instr` calls a function of the double-float library
@@ -211,6 +214,20 @@ pub(super) fn calls_df_library(instr: &Instr) -> bool {
         OpKind::Compare(_) | OpKind::Clamp | OpKind::Powf => df,
         OpKind::Cast(to) => df || to == ElemTy::Df32,
         OpKind::Classify(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether the WGSL of `instr` calls a function of the complex library
+/// (`builtin::complex_library`): the product, quotient, modulus, equality test, `exp` and `sqrt`
+/// of `C32` values.
+pub(super) fn calls_complex_library(instr: &Instr) -> bool {
+    let c32 = instr.op.ty == ElemTy::C32;
+    match instr.op.kind {
+        OpKind::Unary(op) => c32 && op.expr_for(ElemTy::C32).is_some_and(|expr| expr.contains("c_")),
+        OpKind::Binary(op) => c32 && op.expr_for(ElemTy::C32).is_some_and(|expr| expr.contains("c_")),
+        OpKind::Compare(_) => c32,
+        OpKind::Part(part) => part.expr().contains("c_"),
         _ => false,
     }
 }
@@ -250,6 +267,7 @@ impl std::hash::Hash for FusedKey {
         self.staging.hash(state);
         self.guard.hash(state);
         self.params.hash(state);
+        self.coarsen.hash(state);
     }
 }
 
@@ -263,11 +281,20 @@ pub(super) fn shape_of(instrs: &[Instr], subs: &[Vec<Instr>]) -> u64 {
 }
 
 impl FusedKey {
-    /// Whether every value the program reads, computes or writes is 4 bytes wide: the register
-    /// loops, stencils and speculation only handle those.
+    /// Whether every value the program reads, computes or writes is 4 bytes wide (or a `bool`, a
+    /// word in registers): what the kernels of the fused reductions need.
     pub(crate) fn narrow(&self) -> bool {
         self.input_tys.iter().all(|ty| ty.slots() == 1)
             && self.instrs.iter().chain(self.subs.iter().flatten()).all(|instr| instr.op.ty.slots() == 1 && instr.op.out_ty().slots() == 1)
+    }
+
+    /// [`FusedKey::narrow`] and no value that is a small integer: the register loops, stencils,
+    /// tiles and speculation only handle words that are the elements (a small integer's elements
+    /// share words in buffers).
+    pub(crate) fn plain_words(&self) -> bool {
+        self.narrow()
+            && !self.input_tys.iter().any(|ty| ty.is_small())
+            && !self.instrs.iter().chain(self.subs.iter().flatten()).any(|instr| instr.op.ty.is_small() || instr.op.out_ty().is_small())
     }
 
     /// Whether the program is a store with a `bool` output: the workgroup packs the bits it
@@ -277,6 +304,25 @@ impl FusedKey {
             && self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::Bool))
     }
 
+    /// Whether the program is a store with an 8-bit or 16-bit integer output: unless it also
+    /// writes bits, each invocation computes the elements of whole words and writes them as words
+    /// (see `kirgen::Build::words`), so the kernel is not tiled, staged or coarsened.
+    pub(crate) fn writes_small(&self) -> bool {
+        self.tail == Tail::Store
+            && self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty().is_small()))
+    }
+
+    /// The elements each invocation of the store kernel computes: 4 if it writes an 8-bit
+    /// integer, 2 for a 16-bit one, else 1 (a kernel that also writes bits packs by workgroup and
+    /// writes its small integers one element at a time).
+    pub(crate) fn pack_factor(&self) -> u32 {
+        if !self.writes_small() || self.writes_bits() {
+            return 1;
+        }
+        let narrow = self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty().small_bits() == 8));
+        if narrow { 4 } else { 2 }
+    }
+
     /// Whether some instruction reads a sub-program through a view or a gather: the kernel is
     /// then generated from the lowered program of `jit::inline` instead of calling `sub{k}`
     /// functions. Keys whose sub-programs are read through circular shifts only keep the latter
@@ -284,6 +330,37 @@ impl FusedKey {
     pub(crate) fn inlines(&self) -> bool {
         self.instrs.iter().chain(self.subs.iter().flatten()).any(|instr| {
             matches!(instr.op.kind, OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. })) && matches!(instr.args[0], Ref::Sub(_))
+        }) || self.selects_what_it_may_not_read()
+    }
+
+    /// Whether the program selects, by a mask of the coordinates alone, between an input and
+    /// another value: where the mask does not take the input it need not be read (a triangle of a
+    /// stored matrix), which only the lowered program (see `jit::inline`) can do.
+    fn selects_what_it_may_not_read(&self) -> bool {
+        if !self.subs.is_empty()
+            || !self.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Select))
+            || self.instrs.iter().any(|instr| matches!(instr.op.kind, OpKind::Shift(_)))
+        {
+            return false;
+        }
+        let mut coordinates = vec![false; self.instrs.len()];
+        for (at, instr) in self.instrs.iter().enumerate() {
+            coordinates[at] = match instr.op.kind {
+                OpKind::Generate(super::Gen::Index | super::Gen::RangePow2 | super::Gen::RangeConst { .. } | super::Gen::ParamRange { .. }) => true,
+                OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Compare(_) | OpKind::Classify(_) | OpKind::Cast(_) | OpKind::Clamp | OpKind::Select => {
+                    instr.args.iter().take(instr.op.kind.arity()).all(|arg| match *arg {
+                        Ref::Tmp(t) => coordinates.get(t as usize).copied().unwrap_or(false),
+                        Ref::Scalar(_) | Ref::Unused => true,
+                        _ => false,
+                    })
+                }
+                _ => false,
+            };
+        }
+        self.instrs.iter().any(|instr| {
+            matches!(instr.op.kind, OpKind::Select)
+                && matches!(instr.args[0], Ref::Tmp(mask) if coordinates.get(mask as usize).copied().unwrap_or(false))
+                && (matches!(instr.args[1], Ref::Input(_)) || matches!(instr.args[2], Ref::Input(_)))
         })
     }
 
@@ -329,8 +406,12 @@ impl FusedKey {
             Tail::Radix(_) => format!("FusedRadix({names}) {ty}"),
             Tail::Solve(_) => format!("FusedSolve({names}) {ty}"),
             Tail::Reduce(ops) => {
-                let ops: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
-                format!("FusedReduce({}: {names}) {ty}", ops.join("+"))
+                let list: Vec<String> = ops.as_slice().iter().map(|op| format!("{op:?}")).collect();
+                if ops.roots().is_some() {
+                    format!("FusedReduce[{}]({names}) {ty}", list.len())
+                } else {
+                    format!("FusedReduce({}: {names}) {ty}", list.join("+"))
+                }
             }
         }
     }
@@ -1026,6 +1107,7 @@ impl Flattener {
                 staging: None,
                 guard,
                 params: None,
+                coarsen: 1,
             },
             inputs: self.inputs,
             scalars: self.scalars,
@@ -1183,7 +1265,7 @@ impl Plain {
             };
         }
         let at = u32::try_from(self.flat.instrs.len()).unwrap_or(u32::MAX);
-        self.flat.instrs.push(Instr { op, args: refs });
+        self.flat.instrs.push(Instr { op: *op, args: refs });
         self.seen.push(Arc::as_ptr(&node));
         if member {
             self.members.push(node);
@@ -1412,10 +1494,11 @@ fn flatten_unpacked(
         let jit = ctx.jit();
         // Arrays split over several buffers: the sub-programs cannot run in a kernel over them.
         let splits = roots.iter().any(|(root, _)| root.len() as u64 * root.op().out_ty().stride() > ctx.segment_bytes())
-            || fused.key.instrs.iter().chain(fused.key.subs.iter().flatten()).any(|instr| {
-                matches!(instr.op.kind, OpKind::Shift(_))
-                    && matches!(instr.args[0], Ref::Input(k) if fused.inputs.get(k as usize).is_some_and(|input| input.segments() > 1))
-            });
+            || fused.inputs.iter().any(|input| input.segments() > 1)
+                && fused.key.instrs.iter().chain(fused.key.subs.iter().flatten()).any(|instr| {
+                    matches!(instr.op.kind, OpKind::Shift(_))
+                        && matches!(instr.args[0], Ref::Input(k) if fused.inputs.get(k as usize).is_some_and(|input| input.segments() > 1))
+                });
         if splits {
             let sub_roots = fused.sub_roots.clone();
             drop(fused);
@@ -1516,7 +1599,7 @@ fn flatten_once(
             // over the buffers and scalars of this one.
             let signature = jit.and_then(|_| graph.signature(&root_at, tail));
             if let (Some(jit), Some(signature)) = (jit, &signature)
-                && let Some(fused) = jit.recipe(signature).and_then(|recipe| recipe.instantiate(&graph, tail))
+                && let Some(fused) = jit.recipe(signature, &graph).and_then(|recipe| recipe.instantiate(&graph, tail))
             {
                 #[cfg(any(test, debug_assertions))]
                 verify_recipe(&graph, &root_at, tail, &fused)?;
@@ -1602,7 +1685,7 @@ fn flatten_once(
     {
         // The recipe keeps the program every equal one shares (see `JitState::intern`).
         jit.intern(&mut fused.key);
-        if let Some(recipe) = Recipe::new(signature, &fused, recorded) {
+        if let Some(recipe) = Recipe::new(signature, &graph, &fused, recorded) {
             jit.keep_recipe(recipe);
         }
     }
@@ -1787,7 +1870,6 @@ impl ArgSig {
 
 #[derive(PartialEq)]
 struct ItemSig {
-    op: Op,
     len: usize,
     args: [ArgSig; 3],
 }
@@ -1828,13 +1910,13 @@ impl Graph {
                     (Src::Node(node), _) => ArgSig::Input(canon(node.evaluated()?)),
                 };
             }
-            let (op, len) = (item.node.op, item.node.len);
+            let (op, len) = (&item.node.op, item.node.len);
             op.hash(&mut hasher);
             hasher.write_usize(len);
             for arg in args {
                 hasher.write_u64(arg.code());
             }
-            items.push(ItemSig { op, len, args });
+            items.push(ItemSig { len, args });
         }
         root_at.hash(&mut hasher);
         tail.hash(&mut hasher);
@@ -1847,6 +1929,10 @@ impl Graph {
 /// shares), and where the buffers, scalars and nodes of the program come from in the graph (by
 /// item).
 pub(super) struct Recipe {
+    /// The operation of every item of the graph the recipe was made from: a graph has the
+    /// recipe's signature only if its items have these (the signature hashes them, and the hash
+    /// is not what decides).
+    ops: Vec<Op>,
     sig: Signature,
     instrs: Arc<Vec<Instr>>,
     subs: Arc<Vec<Vec<Instr>>>,
@@ -1864,10 +1950,11 @@ pub(super) struct Recipe {
 }
 
 impl Recipe {
-    fn new(sig: Signature, fused: &Fused, recorded: Recorded) -> Option<Recipe> {
+    fn new(sig: Signature, graph: &Graph, fused: &Fused, recorded: Recorded) -> Option<Recipe> {
         let Recorded { record, fused_items, instr_items, sub_root_items } = recorded;
         (record.inputs.len() == fused.inputs.len()).then(|| Recipe {
             sig,
+            ops: graph.items.iter().map(|item| item.node.op).collect(),
             instrs: Arc::clone(&fused.key.instrs),
             subs: Arc::clone(&fused.key.subs),
             input_tys: fused.key.input_tys.clone(),
@@ -1953,6 +2040,7 @@ impl Recipe {
                 staging: None,
                 guard: self.guard,
                 params: None,
+                coarsen: 1,
             },
             inputs,
             scalars,
@@ -1981,13 +2069,14 @@ impl std::fmt::Debug for RecipeTable {
 const RECIPE_ITEMS: usize = 60_000;
 
 impl JitState {
-    /// The recipe whose signature is `signature`, if one was kept.
-    fn recipe(&self, signature: &Signature) -> Option<Arc<Recipe>> {
+    /// The recipe whose signature is `signature`, if one was kept (`graph` is the graph the
+    /// signature is of).
+    fn recipe(&self, signature: &Signature, graph: &Graph) -> Option<Arc<Recipe>> {
         let found = lock(&self.recipes)
             .map
             .get(&signature.hash)?
             .iter()
-            .find(|recipe| recipe.sig == *signature)
+            .find(|recipe| recipe.sig == *signature && recipe.ops.iter().zip(&graph.items).all(|(op, item)| *op == item.node.op))
             .cloned();
         #[cfg(test)]
         if found.is_some() {
@@ -2131,7 +2220,7 @@ pub(super) fn flatten_step(roots: &[Arc<Node>], states: &[StateRef], tail: Tail)
     }
     let fused = flat.finish(tail, outputs);
     // Traced steps are for the 4-byte machinery (loops, speculation, stencils).
-    fused.key.narrow().then_some(Traced { fused, members: nodes })
+    fused.key.plain_words().then_some(Traced { fused, members: nodes })
 }
 
 /// Whether `a` and `b` are the same step: the same program with the same scalar values and the
@@ -2269,6 +2358,7 @@ mod validate_tests {
             staging: None,
             guard: None,
             params: None,
+            coarsen: 1,
         }
     }
 

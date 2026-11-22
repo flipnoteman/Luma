@@ -17,7 +17,7 @@ use crate::builtin::{Builtin, Finish, GateId, ReduceList, ReduceOp, GATE_BINDING
 use crate::context::{Context, RawArg, Scratch, STORAGE_USAGE};
 use crate::error::LumaError;
 use crate::ops::{fold_workgroups, launch_1d, len_u32, workgroups_1d};
-use crate::reduce::finish_passes;
+use crate::reduce::finish_passes_gated;
 
 use super::launch::{self, params, pin_inputs, store_args};
 use super::program::{flatten, flatten_inner, Fused, Tail};
@@ -144,25 +144,33 @@ pub(crate) fn force_with_record<T: GpuType>(
         // Sub-programs read through views are written out where they are read (see `inline`), which
         // a reduction does; those staged in workgroup memory need a store kernel's tiles.
         && (key.subs.is_empty() || (key.inlines() && key.staging.is_none()))
-        && key.narrow()
+        && key.plain_words()
         && fused.inputs.iter().all(|input| input.segments() == 1)
         && fused.inputs.len() + stored.len() < max_inputs;
     if !fits {
         return None;
     }
+    // The gate runs in the first pass where that one finishes the reduction (one group, or a single
+    // pass), else in the last pass over its partial results, if the device binds that many buffers.
+    let single_pass = ctx.tuning().single_pass_reduce;
+    let finishes = single_pass || ctx.tuning().reduce_groups(len_u32(len).ok()?) == 1;
     let gate = gate.filter(|gate| {
-        ctx.tuning().single_pass_reduce
-            && fused.inputs.iter().all(|input| input.id() != gate.stepv)
-            && fused.inputs.len() + stored.len() + GATE_BINDINGS + 1 < max_inputs
+        fused.inputs.iter().all(|input| input.id() != gate.stepv)
+            && if finishes { fused.inputs.len() + stored.len() + GATE_BINDINGS + 1 < max_inputs } else { 2 + GATE_BINDINGS + 1 < max_inputs }
     });
     let stored = stored.to_vec();
     let mut scratch = Scratch::new(ctx);
-    let own = ctx.recorded();
-    let (storages, partial, groups) = launch::reduce_and_store_fused(ctx, len, fused, &stored, ops, &mut scratch, Some(value), finish, gate.as_ref().map(|gate| (gate.id, gate.args))).ok()?;
+    let mut own = ctx.recorded();
+    let first_gate = gate.as_ref().filter(|_| finishes).map(|gate| (gate.id, gate.args));
+    let (storages, partial, groups) = launch::reduce_and_store_fused(ctx, len, fused, &stored, ops, &mut scratch, Some(value), finish, first_gate).ok()?;
     // Past a first pass that did not finish (several groups, no single pass): the rest, ending in `value`.
     let rest = if groups > 1 { finish } else { Finish::default() };
-    if let Err(error) = finish_passes(ctx, &mut scratch, ops, "f32", ELEMENT_BYTES, partial, groups, true, Some(value), rest) {
+    let last_gate = gate.as_ref().filter(|_| !finishes).map(|gate| (gate.id, gate.args));
+    if let Err(error) = finish_passes_gated(ctx, &mut scratch, ops, "f32", ELEMENT_BYTES, partial, groups, true, Some(value), rest, last_gate) {
         return Some(Err(Failure::New(error)));
+    }
+    if last_gate.is_some() {
+        own = ctx.recorded() - 1;
     }
     for (node, storage) in nodes.iter().zip(storages) {
         node.finish_shared(Arc::new(storage));
@@ -198,7 +206,7 @@ fn fuse(ctx: &Context, first: &Arc<Node>, residual: &Arc<Node>, probe: &Arc<Stor
         && f32_at(stored)
         && f32_at(reduced)
         && key.subs.is_empty()
-        && key.narrow()
+        && key.plain_words()
         && fused.inputs.iter().all(|input| input.segments() == 1)
         && fused.inputs.len() + 1 < ctx.jit().max_inputs();
     fits.then_some(fused)
@@ -255,8 +263,8 @@ pub(crate) fn run_until(
         || !stores_f32
         || !reads_f32
         || !one_buffer(&body)
-        || !body.key.narrow()
-        || !check.key.narrow()
+        || !body.key.plain_words()
+        || !check.key.plain_words()
         || !one_buffer(&check)
     {
         return None;

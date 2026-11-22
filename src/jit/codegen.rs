@@ -18,8 +18,8 @@
 
 use std::fmt::Write;
 
-use crate::builtin::{
-    DF_MATH_LIBRARY, ReduceElem, class_operand, df_library, reduce_main, substitute,
+use crate::builtin::{narrow_expr,
+    DF_MATH_LIBRARY, ReduceElem, class_operand, complex_library, df_library, reduce_main, substitute,
 };
 use crate::gpu::hash::FxMap;
 use crate::tuning::{STENCIL_RADIUS, Tuning};
@@ -31,7 +31,7 @@ use crate::error::Result;
 use super::inline::{Inlined, Lowered, Region};
 use super::kirgen;
 use super::params;
-use super::program::{FusedKey, Instr, Ref, Tail, calls_df_library, calls_df_math};
+use super::program::{FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math};
 use super::staging::Staging;
 use super::stencil::signed;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -44,8 +44,8 @@ fn name(reference: Ref, ty: ElemTy) -> String {
         Ref::Input(k) => format!("a{k}"),
         Ref::Scalar(k) => match ty {
             ElemTy::F64 => format!("(f64(p.s{k}) + f64(p.s{}) + f64(p.s{}))", k + 1, k + 2),
-            ElemTy::Df32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => format!("p.s{k}"),
+            ElemTy::Df32 | ElemTy::C32 => format!("vec2<f32>(p.s{k}, p.s{})", k + 1),
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => format!("p.s{k}"),
         },
         Ref::Tmp(k) => format!("t{k}"),
         Ref::Sub(k) => format!("sub{k}"),
@@ -61,8 +61,8 @@ fn name(reference: Ref, ty: ElemTy) -> String {
 /// `ty.wgsl()`: a bool is a `u32` of 0 or 1 there.
 pub(super) fn storage_ty(ty: ElemTy) -> &'static str {
     match ty {
-        ElemTy::Bool => "u32",
-        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => ty.wgsl(),
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => "u32",
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ty.wgsl(),
     }
 }
 
@@ -71,7 +71,7 @@ pub(super) fn storage_ty(ty: ElemTy) -> &'static str {
 /// different invocations.
 pub(super) fn out_storage_ty(ty: ElemTy) -> &'static str {
     match ty {
-        ElemTy::Bool => "atomic<u32>",
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => "atomic<u32>",
         _ => storage_ty(ty),
     }
 }
@@ -89,7 +89,20 @@ pub(super) fn load(ty: ElemTy, buffer: &str, index: &str) -> String {
             let j = operand(index);
             format!("(({buffer}[{j} >> 5u] >> ({j} & 31u)) & 1u)")
         }
-        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 => format!("{buffer}[{index}]"),
+        ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => small_load(ty, &format!("{buffer}[{} >> {}u]", operand(index), ty.small_shift()), index),
+        ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("{buffer}[{index}]"),
+    }
+}
+
+/// The register value of the small integer element `index` of the word `word` of its buffer: the
+/// field of the word shifted down, zero-extended or sign-extended.
+fn small_load(ty: ElemTy, word: &str, index: &str) -> String {
+    let bits = ty.small_bits();
+    let per_word = 32 / bits;
+    let at = format!("(({} & {}u) * {}u)", operand(index), per_word - 1, bits);
+    match ty {
+        ElemTy::U8 | ElemTy::U16 => format!("(({word} >> {at}) & {}u)", (1u32 << bits) - 1),
+        _ => format!("(bitcast<i32>({word} << (({}u - {at}))) >> {}u)", 32 - bits, 32 - bits),
     }
 }
 
@@ -100,6 +113,9 @@ pub(super) fn load_out(ty: ElemTy, buffer: &str, index: &str) -> String {
         ElemTy::Bool => {
             let j = operand(index);
             format!("((atomicLoad(&{buffer}[{j} >> 5u]) >> ({j} & 31u)) & 1u)")
+        }
+        ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => {
+            small_load(ty, &format!("atomicLoad(&{buffer}[{} >> {}u])", operand(index), ty.small_shift()), index)
         }
         _ => load(ty, buffer, index),
     }
@@ -130,12 +146,21 @@ pub(super) const NO_NAMES: Names<'static> = Names { views: &[], in_place: &[] };
 fn operation(op: Op, a: &str, b: &str, c: &str, index: &str) -> Option<String> {
     let ty = op.ty;
     Some(match op.kind {
-        OpKind::Unary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, ""),
-        OpKind::Binary(op) => substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b),
+        OpKind::Unary(op) => {
+            let value = substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, "");
+            if ty.is_small() && op.widens() { narrow_expr(ty, &value) } else { value }
+        }
+        OpKind::Binary(op) => {
+            let value = substitute(op.expr_for(ty).unwrap_or_else(|| op.expr()), a, b);
+            if ty.is_small() && op.widens() { narrow_expr(ty, &value) } else { value }
+        }
         OpKind::Compare(op) => substitute(op.expr_for(ty), a, b),
         OpKind::Classify(class) => substitute(class.expr(), &class_operand(ty, a), ""),
+        OpKind::Part(part) => substitute(part.expr(), a, ""),
+        OpKind::Make => format!("vec2<f32>({a}, {b})"),
         OpKind::Powf if ty == ElemTy::Df32 => format!("df_pow({a}, {b})"),
-        OpKind::Powf => format!("pow({a}, {b})"),
+        OpKind::Powf if ty == ElemTy::F64 => format!("pow({a}, {b})"),
+        OpKind::Powf => format!("luma_powf({a}, {b})"),
         OpKind::Clamp if ty == ElemTy::Df32 => format!("df_min(df_max({a}, {b}), {c})"),
         OpKind::Clamp => format!("clamp({a}, {b}, {c})"),
         OpKind::Select => format!("select({c}, {b}, {a} != 0u)"),
@@ -238,7 +263,7 @@ fn luma_wrap_mask(c: i32, mask: u32) -> i32 { return i32(u32(c) & mask); }
 /// so the kernel is made for one or the other: `luma_udiv_wide` is exact for any dividend. No
 /// WGSL integer operation gives the high word of a product, so it is made of 16-bit halves
 /// (about 20 operations in all, about 3 times `luma_udiv`).
-const DIV_HELPERS: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
+pub(super) const DIV_HELPERS: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
     let f = bitcast<f32>(n | 0x4B000000u) - 8388608.0;
     let q = bitcast<u32>(f * bitcast<f32>(r) + 8388608.0) & 0x7FFFFFu;
     return q - select(0u, 1u, i32(n - q * d) < 0);
@@ -349,8 +374,50 @@ fn cast(from: ElemTy, to: ElemTy, value: &str) -> String {
         (ElemTy::Bool, ElemTy::U32) => value.to_owned(),
         (ElemTy::Bool, ElemTy::I32) => format!("bitcast<i32>({value})"),
         (ElemTy::Bool, ElemTy::F64) => format!("f64({value})"),
-        (ElemTy::Bool, ElemTy::Df32) => format!("vec2<f32>(f32({value}), 0.0)"),
+        (ElemTy::Bool, ElemTy::Df32) | (ElemTy::Bool, ElemTy::C32) => format!("vec2<f32>(f32({value}), 0.0)"),
         _ if from == to => value.to_owned(),
+        _ if from.is_small() || to.is_small() => small_cast(from, to, value),
+        _ => unreachable!("cast {from:?} -> {to:?}"),
+    }
+}
+
+/// `value` of type `from` converted to `to`, where one of the two is a small integer. A small
+/// integer widens by value (`-1i8 as u32` is `0xFFFFFFFF`); a conversion to one wraps an integer
+/// (the low bits) and saturates a float (a NaN is 0), like Rust's `as`.
+fn small_cast(from: ElemTy, to: ElemTy, value: &str) -> String {
+    if to.is_small() {
+        let (lo, hi) = match to {
+            ElemTy::U8 => (0.0, 255.0),
+            ElemTy::I8 => (-128.0, 127.0),
+            ElemTy::U16 => (0.0, 65535.0),
+            _ => (-32768.0, 32767.0),
+        };
+        let word = match from {
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => {
+                let f = match from {
+                    ElemTy::F32 => value.to_owned(),
+                    ElemTy::F64 => format!("f32({value})"),
+                    _ => format!("({value}.x + {value}.y)"),
+                };
+                let clamped = format!("select(0.0, clamp({f}, {lo:.1}, {hi:.1}), {f} == {f})");
+                return match to {
+                    ElemTy::U8 | ElemTy::U16 => format!("u32({clamped})"),
+                    _ => format!("i32({clamped})"),
+                };
+            }
+            ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => value.to_owned(),
+            _ => format!("bitcast<u32>({value})"),
+        };
+        let word = if to.is_small_signed() { format!("bitcast<i32>({word})") } else { word };
+        return narrow_expr(to, &word);
+    }
+    match to {
+        ElemTy::U32 => if from == ElemTy::U8 || from == ElemTy::U16 { value.to_owned() } else { format!("bitcast<u32>({value})") },
+        ElemTy::I32 => if from.is_small_signed() { value.to_owned() } else { format!("bitcast<i32>({value})") },
+        ElemTy::Bool => format!("select(0u, 1u, {value} != 0)"),
+        ElemTy::F32 => format!("f32({value})"),
+        ElemTy::F64 => format!("f64({value})"),
+        ElemTy::Df32 => format!("vec2<f32>(f32({value}), 0.0)"),
         _ => unreachable!("cast {from:?} -> {to:?}"),
     }
 }
@@ -362,10 +429,11 @@ pub(super) fn library_for(key: &FusedKey, tuning: &Tuning) -> String {
     let library = |guard: &str| df_library(guard, tuning.df_fma, tuning.df_sloppy_add);
     let instrs = || key.instrs.iter().chain(key.subs.iter().flatten());
     let math = if instrs().any(calls_df_math) { DF_MATH_LIBRARY } else { "" };
+    let complex = if instrs().any(calls_complex_library) { complex_library().to_owned() } else { String::new() };
     match key.guard {
-        Some(guard) => library(&format!("p.s{guard}")) + math,
-        None if instrs().any(calls_df_library) => library("0u") + math,
-        None => String::new(),
+        Some(guard) => library(&format!("p.s{guard}")) + math + &complex,
+        None if instrs().any(calls_df_library) => library("0u") + math + &complex,
+        None => complex,
     }
 }
 
@@ -377,14 +445,18 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
         Gen::Index => match ty {
             ElemTy::U32 => index.to_owned(),
             ElemTy::Bool => unreachable!("bool has no generators"),
+            ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, index),
+            ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>({index})")),
             ElemTy::I32 => format!("bitcast<i32>({index})"),
-            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({index})"),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32({index})"),
         },
         Gen::RangePow2 => match ty {
             ElemTy::U32 => format!("(({index} >> {a}) & {b})"),
             ElemTy::Bool => unreachable!("bool has no generators"),
+            ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, &format!("(({index} >> {a}) & {b})")),
+            ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>(({index} >> {a}) & {b})")),
             ElemTy::I32 => format!("bitcast<i32>(({index} >> {a}) & {b})"),
-            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(({index} >> {a}) & {b})"),
+            ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32(({index} >> {a}) & {b})"),
         },
         Gen::RangeConst { .. } | Gen::ParamRange { .. } => {
             let coord = match kind {
@@ -400,8 +472,10 @@ fn generate(kind: Gen, ty: ElemTy, index: &str, a: &str, b: &str) -> String {
             match ty {
                 ElemTy::U32 => coord,
                 ElemTy::Bool => unreachable!("bool has no generators"),
+                ElemTy::U8 | ElemTy::U16 => narrow_expr(ty, &coord),
+                ElemTy::I8 | ElemTy::I16 => narrow_expr(ty, &format!("bitcast<i32>({coord})")),
                 ElemTy::I32 => format!("bitcast<i32>({coord})"),
-                ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32({coord})"),
+                ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32({coord})"),
             }
         }
         Gen::Linspace => format!("({a} + f32({index}) * {b})"),
@@ -572,9 +646,9 @@ pub(super) fn stack_stages(key: &FusedKey, wg: u32, ty: ElemTy) -> bool {
     let Tail::Stack { total, first: 0, block: 1 } = key.tail else { return false };
     // The bits of a `bool` result are written one at a time, not as the words they are in.
     let bytes = match ty {
-        ElemTy::Bool => return false,
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => return false,
         ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => 4,
-        ElemTy::F64 | ElemTy::Df32 => 8,
+        ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => 8,
     };
     key.outputs.len() == total as usize && total > 1 && u64::from(wg) * u64::from(total) * bytes <= STACK_STAGE_BYTES
 }
@@ -617,6 +691,8 @@ fn source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Option<&Lo
     if src.contains("luma_udiv") || src.contains("luma_urem") {
         src.push_str(DIV_HELPERS);
     }
+    let helpers = crate::builtin::special_helpers(|needle| src.contains(needle));
+    src.push_str(&helpers);
     src
 }
 
@@ -679,7 +755,7 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             let _ = write!(src, "s{k}: {}, ", ty.wgsl());
         }
         if let Tail::Reduce(ops) = key.tail {
-            src.push_str(&ops.epilogue().fields());
+            src.push_str(&ops.epilogue_fields());
         }
         src.push_str("}\n");
     }
@@ -704,7 +780,8 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
     };
     let axis_outputs = match key.tail {
         Tail::AxisReduce(pass) => {
-            src.push_str(&pass.output_bindings(out_ty(key.instrs.len().saturating_sub(1))));
+            let at = if pass.ops.roots().is_some() { key.outputs.first().map_or(key.instrs.len().saturating_sub(1), |&at| at as usize) } else { key.instrs.len().saturating_sub(1) };
+            src.push_str(&pass.output_bindings(out_ty(at)));
             pass.outputs()
         }
         _ => 0,
@@ -712,7 +789,8 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
     if matmul {
         src.push_str("@group(1) @binding(0) var<storage, read_write> c: array<f32>;\n");
     }
-    let side_stores = if reduce { key.outputs.len().saturating_sub(1) } else { 0 };
+    let merged = matches!(key.tail, Tail::Reduce(ops) if ops.roots().is_some());
+    let side_stores = if reduce && !merged { key.outputs.len().saturating_sub(1) } else { 0 };
     let mut binding = outputs.len() + side_stores + usize::from(matmul) + axis_outputs;
     if let Some(pass) = radix {
         // The roots are the keys, read by `luma_key`; the kernel's own buffers go around the inputs.
@@ -759,6 +837,13 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
                 binding += 1;
             }
         }
+    }
+    if let Tail::AxisReduce(pass) = key.tail
+        && pass.pass == crate::scan::Pass::Segments
+    {
+        // The offsets of the segments, after the inputs.
+        let _ = writeln!(src, "@group(1) @binding({binding}) var<storage, read> offs: array<u32>;");
+        binding += 1;
     }
     if let Some(pass) = radix {
         pass.declare_reads(&mut src, &mut binding);
@@ -854,7 +939,15 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
             let guard = format!("p.s{}", key.guard.unwrap_or(0));
             let elem = if reduces_df { ReduceElem::Df32 { guard: &guard, fma: tuning.df_fma } } else { ReduceElem::Plain(ty) };
             let names = Names { views: &views, in_place: &[] };
-            if side_stores == 0 {
+            if merged {
+                // One value per root of the program, computed together (see `reduce_main`).
+                let outs: Vec<usize> = key.outputs.iter().map(|&at| at as usize).collect();
+                debug_assert!(ops.roots().is_some_and(|roots| roots.iter().all(|&root| usize::from(root) < outs.len())));
+                let global = if index == "gi" { "    let gi = p.base + i;\n" } else { "" };
+                let (computed, values) = computed_values(key, &outs, inlined, &names, index, segmented);
+                let returned: Vec<String> = values.iter().map(|val| format!("t{val}")).collect();
+                let _ = write!(src, "\nfn luma_eval(i: u32) -> array<{ty}, {n}> {{\n{global}{computed}    return array<{ty}, {n}>({});\n}}\n", returned.join(", "), n = outs.len());
+            } else if side_stores == 0 {
                 src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
             } else {
                 let outs: Vec<usize> = key.outputs.iter().map(|&at| at as usize).collect();
@@ -871,8 +964,15 @@ fn kernel_source(key: &FusedKey, tuning: &Tuning, segment_len: u32, lowered: Opt
         Tail::AxisReduce(pass) => {
             let names = Names { views: &views, in_place: &[] };
             let last = key.instrs.len().saturating_sub(1);
-            src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
-            src.push_str(&crate::scan::reduce_body(pass, out_ty(last), "luma_eval", wg));
+            if pass.ops.roots().is_some() {
+                // Ops that reduce several roots read the array of their values at every cell.
+                let parts: Vec<Part> = key.outputs.iter().map(|&at| Part::Root(at as usize)).collect();
+                src.push_str(&load_cell("luma_eval", key, &parts, inlined, &names, index, segmented));
+            } else {
+                src.push_str(&load_function("luma_eval", key, last, inlined, &names, index, segmented));
+            }
+            let elem_at = if pass.ops.roots().is_some() { key.outputs.first().map_or(last, |&at| at as usize) } else { last };
+            src.push_str(&crate::scan::reduce_body(pass, out_ty(elem_at), "luma_eval", wg));
         }
         Tail::Matmul { tile, aligned, split, lhs, rhs } => {
             let names = Names { views: &views, in_place: &[] };
@@ -1007,7 +1107,7 @@ fn needed_lowered(inlined: &Inlined, roots: &[usize]) -> Vec<bool> {
 }
 
 /// Which instructions of `instrs` the instructions `outs` need, themselves included.
-fn needed(instrs: &[Instr], outs: &[usize]) -> Vec<bool> {
+pub(super) fn needed(instrs: &[Instr], outs: &[usize]) -> Vec<bool> {
     let mut keep = vec![false; instrs.len()];
     for &out in outs {
         if let Some(root) = keep.get_mut(out) {
@@ -1038,7 +1138,7 @@ fn body(instrs: &[Instr], input_tys: &[ElemTy], names: &Names, index: &str, segm
 
 /// [`body`], where `staged(k, instr)` may replace the expression of instruction `k`, and only the
 /// instructions `keep` marks (all, if `None`) are written, with the inputs they load.
-fn body_with(
+pub(super) fn body_with(
     instrs: &[Instr],
     input_tys: &[ElemTy],
     names: &Names,
@@ -1378,8 +1478,10 @@ fn lowered_body(key: &FusedKey, inlined: &Inlined, names: &Names, index: &str, s
                     match op.ty {
                         ElemTy::U32 => format!("u32({coord})"),
                         ElemTy::I32 => coord,
-                        ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => format!("f32(u32({coord}))"),
+                        ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => format!("f32(u32({coord}))"),
                         ElemTy::Bool => unreachable!("bool has no generators"),
+                        ElemTy::U8 | ElemTy::U16 => narrow_expr(op.ty, &format!("u32({coord})")),
+                        ElemTy::I8 | ElemTy::I16 => narrow_expr(op.ty, &coord),
                     }
                 }
                 _ => {
@@ -1538,7 +1640,7 @@ impl Tile {
 /// as functions called per shift.
 pub(super) fn plan_tile(key: &FusedKey, scalars: &[u32], len: usize, tuning: &Tuning) -> Option<Tile> {
     // Staged values are 4 bytes wide; programs of the 8-byte types call their sub-programs.
-    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || key.inlines() || !key.narrow() || key.writes_bits() {
+    if key.tail != Tail::Store || key.subs.is_empty() || !key.spans.is_empty() || key.inlines() || !key.plain_words() || key.writes_bits() || key.writes_small() {
         return None;
     }
     let programs: Vec<&[Instr]> = std::iter::once(key.instrs.as_slice()).chain(key.subs.iter().map(Vec::as_slice)).collect();

@@ -15,7 +15,7 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::types::{self, F32X4, F64X2, I32X4};
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp, Block, BlockArg, ConstantData, Endianness, Function, InstBuilder,
+    AbiParam, ValueDef, AtomicRmwOp, Block, BlockArg, ConstantData, Endianness, Function, InstBuilder,
     MemFlagsData, SigRef, Signature, Type, UserFuncName, Value,
 };
 use cranelift_codegen::isa::OwnedTargetIsa;
@@ -26,16 +26,18 @@ use luma_core::kir::{
     IrTernaryOp, IrUnOp, KernelModule, KirType, LValue, LocalId, ScalarTy, Stmt, StructDecl,
     SwitchCase, walk_stmts,
 };
-use luma_core::{BackendError, NativeKernel};
+use luma_core::{BackendError, BindingKind, NativeKernel};
 
 use crate::abi::{CpuMathTable, CpuPlan, PhaseStmt, WorkgroupCtx};
-use crate::exec::ExecBlob;
+use crate::exec::{CostHint, ExecBlob};
 
 /// A compiled workgroup function plus the plan it was lowered against.
 #[derive(Debug)]
 pub struct CompiledCpuKernel {
     pub exec: Arc<ExecBlob>,
     pub plan: CpuPlan,
+    /// Learned run time, steering how many threads a launch uses.
+    pub cost: CostHint,
 }
 
 impl NativeKernel for CompiledCpuKernel {}
@@ -70,7 +72,7 @@ static ISA_KEY: LazyLock<String> = LazyLock::new(|| match ISA_SPEED.as_ref() {
             .map(|v| format!("{}={}", v.name, v.value_string()))
             .collect();
         format!(
-            "rev3-{}-{}-{}",
+            "rev5-{}-{}-{}",
             isa.triple(),
             cranelift_codegen::VERSION,
             feats.join(",")
@@ -84,9 +86,46 @@ pub fn host_isa_key() -> String {
     ISA_KEY.clone()
 }
 
+/// Kernels with more IR instructions than this skip Cranelift's optimiser, unless they have run-time
+/// contiguity checks (see [`CONTIG_COMPILE_INSTS`]) or deeply nested loops (see [`NESTED_LOOP_DEPTH`]). The optimiser is not always a gain: it makes
+/// compute-bound kernels of up to 3300 instructions faster (the all-pairs force of the `nbody`
+/// benchmark 1.6x), but the code it makes for larger ones was slower than the unoptimised one in
+/// every case measured (`cfd` MUSCL steps of 4000 instructions 1.3-1.5x, `fractal/mandelbrot_unrolled`
+/// of 7400 1.6x, the FFT passes of `conv1d_fft` of 13000 to 16000 1.2-1.6x, the Euler steps).
+const FAST_COMPILE_INSTS: usize = 3_500;
+
+/// The limit for a kernel with run-time contiguity checks (see `Lower::load_elem`): its taps share
+/// one condition that the optimiser merges, which makes `ml/conv/stencil5x5` (25 `shift_clamp`
+/// loads, 5200 instructions) 2.5x faster than the unoptimised code.
+const CONTIG_COMPILE_INSTS: usize = 16_000;
+
+/// Loops nested this deep (the lane packets of a launch count as one level) make a kernel one whose
+/// run time dominates its compile time and whose hot loop the optimiser improves, whatever its size:
+/// the tiled `conv1d` (`ml/conv/conv1d` k1023 s1 of 13500 instructions, 7.6 to 6.4 ms, k7 s2 of 8600
+/// 0.176 to 0.120 ms, `compute/fft/conv1d_direct` 15 % faster) loops over chunks, taps and
+/// outputs. The kernels that lost to the optimiser had one level (`fractal/mandelbrot_unrolled`, the
+/// larger `conv1d_fft` passes) or two (the other `conv1d_fft` passes, the MUSCL time-blocked stencil).
+const NESTED_LOOP_DEPTH: usize = 3;
+
+/// Largest kernel with [`NESTED_LOOP_DEPTH`] loops that is optimised (compiling takes about 3 ms per
+/// thousand instructions optimised).
+const NESTED_COMPILE_INSTS: usize = 40_000;
+
+/// The deepest loop nest of `func` (0 without loops).
+fn max_loop_depth(func: &cranelift_codegen::ir::Function) -> usize {
+    use cranelift_codegen::dominator_tree::DominatorTree;
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
+    use cranelift_codegen::loop_analysis::LoopAnalysis;
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let mut loops = LoopAnalysis::new();
+    loops.compute(func, &cfg, &domtree);
+    func.layout.blocks().map(|block| loops.loop_level(block).level()).max().unwrap_or(0)
+}
+
 /// Revision of the generated code, part of the disk-cache key: bump it whenever the code this
 /// module generates for the same kernel changes, so cached blobs from older builds are not reused.
-pub(crate) const REVISION: u32 = 2;
+pub(crate) const REVISION: u32 = 6;
 
 // ---------------------------------------------------------------------------------------------
 // Memory flags
@@ -386,6 +425,7 @@ pub fn compile(
     sig.params.push(AbiParam::new(ptr));
     let mut func = Function::with_name_signature(UserFuncName::default(), sig);
     let mut fbc = FunctionBuilderContext::new();
+    let run_time_contig;
     {
         let mut b = FunctionBuilder::new(&mut func, &mut fbc);
         let entry = b.create_block();
@@ -396,12 +436,18 @@ pub fn compile(
         lower.emit_all();
         lower.b.seal_all_blocks();
         lower.b.finalize(isa.frontend_config());
+        run_time_contig = lower.run_time_contig;
     }
 
-    let target_isa = if func.dfg.num_insts() > 2500 {
-        ISA_FAST.as_ref().map_err(Clone::clone)?
-    } else {
+    // Optimised compilation costs about 2.5x the unoptimised one (35 ms against 10 ms at 10k
+    // instructions), and the code it makes is not always faster: see `FAST_COMPILE_INSTS`.
+    let limit = if run_time_contig > 0 { CONTIG_COMPILE_INSTS } else { FAST_COMPILE_INSTS };
+    let insts = func.dfg.num_insts();
+    let optimise = insts <= limit || (insts <= NESTED_COMPILE_INSTS && max_loop_depth(&func) >= NESTED_LOOP_DEPTH);
+    let target_isa = if optimise {
         isa
+    } else {
+        ISA_FAST.as_ref().map_err(Clone::clone)?
     };
     let mut cctx = Context::for_function(func);
     let compiled = cctx
@@ -419,6 +465,7 @@ pub fn compile(
         CompiledCpuKernel {
             exec: Arc::new(blob),
             plan,
+            cost: CostHint::default(),
         },
         bytes,
     ))
@@ -445,6 +492,13 @@ struct Lower<'a, 'f> {
     sigs: HashMap<(u8, bool), SigRef>,
     /// Byte length (i64) of each storage binding pointer produced by `binding_ptr`.
     limits: HashMap<Value, Value>,
+    /// Loads of `load_leaf` read a binding nothing writes during the launch (a uniform), so
+    /// they may be shared and hoisted.
+    ro_loads: bool,
+    /// Per value: whether it is computed from the lane ids and uniforms alone (no memory read).
+    computed: HashMap<Value, bool>,
+    /// How many loads check at run time whether their lanes are consecutive (see `load_elem`).
+    run_time_contig: usize,
 }
 
 impl<'a, 'f> Lower<'a, 'f> {
@@ -490,6 +544,9 @@ impl<'a, 'f> Lower<'a, 'f> {
             phase_loops: Vec::new(),
             sigs: HashMap::new(),
             limits: HashMap::new(),
+            ro_loads: false,
+            computed: HashMap::new(),
+            run_time_contig: 0,
         }
     }
 
@@ -810,8 +867,22 @@ impl<'a, 'f> Lower<'a, 'f> {
         r
     }
 
-    /// Calls a `CpuMathTable` routine once per lane.
+    /// Calls a `CpuMathTable` routine: once per packet when there is a vectorised `f32` one, else once per lane.
     fn math_call(&mut self, off32: i32, off64: i32, is64: bool, args: &[Value]) -> Value {
+        if !is64
+            && args.len() == 1
+            && let Some(poff) = CpuMathTable::packet_offset(off32)
+        {
+            // One call per packet: F32X4 in and out of `xmm0` (see `crate::vecmath`).
+            let mut sig = Signature::new(self.b.func.signature.call_conv);
+            sig.params.push(AbiParam::new(F32X4));
+            sig.returns.push(AbiParam::new(F32X4));
+            let sig = self.b.import_signature(sig);
+            let table = self.b.ins().load(self.ptr, mf_ro(), self.ctx, WorkgroupCtx::OFFSET_MATH);
+            let fp = self.b.ins().load(self.ptr, mf_ro(), table, poff);
+            let call = self.b.ins().call_indirect(sig, fp, args);
+            return self.b.inst_results(call)[0];
+        }
         let sig = self.math_sig(args.len() as u8, is64);
         let table = self
             .b
@@ -2378,11 +2449,12 @@ impl<'a, 'f> Lower<'a, 'f> {
 
     fn load_leaf(&mut self, s: ScalarTy, addr: Value, at: u32) -> Value {
         let at = at as i32;
+        let flags = if self.ro_loads { mf_ro() } else { mf() };
         match s {
-            ScalarTy::F64 => self.b.ins().load(types::F64, mf(), addr, at),
-            ScalarTy::F32 => self.b.ins().load(types::F32, mf(), addr, at),
-            ScalarTy::F16 => self.b.ins().uload16(types::I32, mf(), addr, at),
-            _ => self.b.ins().load(types::I32, mf(), addr, at),
+            ScalarTy::F64 => self.b.ins().load(types::F64, flags, addr, at),
+            ScalarTy::F32 => self.b.ins().load(types::F32, flags, addr, at),
+            ScalarTy::F16 => self.b.ins().uload16(types::I32, flags, addr, at),
+            _ => self.b.ins().load(types::I32, flags, addr, at),
         }
     }
 
@@ -2500,6 +2572,8 @@ impl<'a, 'f> Lower<'a, 'f> {
         } else {
             self.lane_gather(base, off, dyns, extent, &accs, cur)
         };
+        // Without a per-lane index every lane read the same address.
+        let kind = if dyns.is_empty() { Kind::Uni } else { Kind::Gen };
         let mut leaves = Vec::with_capacity(accs.len());
         let mut k = 0;
         for acc in &accs {
@@ -2514,7 +2588,7 @@ impl<'a, 'f> Lower<'a, 'f> {
                         s: acc.s,
                         a: m,
                         b: None,
-                        k: Kind::Gen,
+                        k: kind,
                     }
                 }
                 ScalarTy::F16 => {
@@ -2523,14 +2597,14 @@ impl<'a, 'f> Lower<'a, 'f> {
                         s: acc.s,
                         a: f,
                         b: None,
-                        k: Kind::Gen,
+                        k: kind,
                     }
                 }
                 s => Leaf {
                     s,
                     a,
                     b,
-                    k: Kind::Gen,
+                    k: kind,
                 },
             };
             leaves.push(leaf);
@@ -2627,13 +2701,80 @@ impl<'a, 'f> Lower<'a, 'f> {
         self.b.ins().iadd(base, e)
     }
 
-    /// `binding[idx]` with 128-bit loads when the index is contiguous across the packet.
+    /// Whether `v` is computed from the packet's lane ids, uniforms and constants alone, with no
+    /// read of data memory behind it (a clamped or wrapped view coordinate, as opposed to an
+    /// index loaded from an array, which is rarely consecutive). Block parameters other than the
+    /// packet counter count as data.
+    fn is_computed(&mut self, v: Value) -> bool {
+        let mut stack = vec![v];
+        let mut seen: Vec<Value> = Vec::new();
+        while let Some(x) = stack.pop() {
+            match self.computed.get(&x) {
+                Some(true) => continue,
+                Some(false) => {
+                    self.computed.insert(v, false);
+                    return false;
+                }
+                None => {}
+            }
+            let dfg = &self.b.func.dfg;
+            let clean = match dfg.value_def(x) {
+                ValueDef::Param(..) => {
+                    x == self.pkt || x == self.ctx
+                }
+                ValueDef::Result(inst, _) => {
+                    let data = &dfg.insts[inst];
+                    if data.opcode().can_load() {
+                        data.memflags_data(dfg).is_some_and(|f| f.readonly())
+                    } else {
+                        stack.extend_from_slice(dfg.inst_args(inst));
+                        seen.push(x);
+                        continue;
+                    }
+                }
+                ValueDef::Union(..) => false,
+            };
+            if !clean {
+                self.computed.insert(v, false);
+                return false;
+            }
+            seen.push(x);
+        }
+        for x in seen {
+            self.computed.insert(x, true);
+        }
+        true
+    }
+
+    /// `binding[idx]` with 128-bit loads when the index is contiguous across the packet: known
+    /// to be, or (for an index computed from lane ids the codegen could not follow, such as a
+    /// clamped or wrapped one) checked at run time, with the lane-by-lane gather as the fallback.
     fn load_elem(&mut self, base: Value, idx: Leaf, stride: u32, ty: &KirType) -> Val {
-        let Some(s) = Self::contig_scalar(ty, stride).filter(|_| idx.k == Kind::Lin) else {
+        let Some(s) = Self::contig_scalar(ty, stride) else {
             return self.mem_read(base, 0, &[(idx.a, stride)], ty);
         };
+        if idx.k == Kind::Uni || (idx.k == Kind::Gen && !self.is_computed(idx.a)) {
+            return self.mem_read(base, 0, &[(idx.a, stride)], ty);
+        }
+        let mut cond = self.fast_cond(base, idx);
+        match idx.k {
+            Kind::Lin | Kind::Uni => {}
+            Kind::Gen => {
+                self.run_time_contig += 1;
+                let e0 = self.b.ins().extractlane(idx.a, 0u8);
+                let first = self.b.ins().splat(I32X4, e0);
+                let io = self.iota();
+                let want = self.b.ins().iadd(first, io);
+                let same = self.b.ins().icmp(IntCC::Equal, idx.a, want);
+                let ok = self.b.ins().vall_true(same);
+                cond = Some(match cond {
+                    Some(c) => self.b.ins().band(c, ok),
+                    None => ok,
+                });
+            }
+        }
         let vt = vty(s);
-        let Some(cond) = self.fast_cond(base, idx) else {
+        let Some(cond) = cond else {
             let addr = self.contig_addr(base, idx);
             let a = self.b.ins().load(vt, mf(), addr, 0);
             return self.scalar_val(s, self.lf(s, a));
@@ -2858,6 +2999,7 @@ impl<'a, 'f> Lower<'a, 'f> {
                 let v = self.b.ins().splat(I32X4, v);
                 self.scalar_val(ScalarTy::U32, self.uni(ScalarTy::U32, v))
             }
+            Expr::Texture { .. } => unreachable!("the CPU backend rejects texture kernels before lowering"),
             Expr::ArrayLength { binding } => {
                 let v = match self
                     .plan
@@ -2884,7 +3026,22 @@ impl<'a, 'f> Lower<'a, 'f> {
                 let start = self.storage_start_ty(*binding);
                 let (off, dyns, _) = self.mem_path(&start, &steps);
                 match self.binding_ptr(*binding) {
-                    Some(base) => self.mem_read(base, off, &dyns, ty),
+                    Some(base) => {
+                        // A uniform is bound in storage padded to the declared size of its type,
+                        // so a constant path inside the type needs no bounds check.
+                        let d = &self.module.bindings[*binding as usize];
+                        let inside = d.kind == BindingKind::Uniform
+                            && dyns.is_empty()
+                            && d.min_size.is_some_and(|m| off.saturating_add(ty.layout(self.structs()).0) <= m);
+                        let lim = if inside { self.limits.remove(&base) } else { None };
+                        self.ro_loads = inside;
+                        let v = self.mem_read(base, off, &dyns, ty);
+                        self.ro_loads = false;
+                        if let Some(lim) = lim {
+                            self.limits.insert(base, lim);
+                        }
+                        v
+                    }
                     None => self.zero_val(ty),
                 }
             }
@@ -3021,10 +3178,16 @@ impl<'a, 'f> Lower<'a, 'f> {
         });
         let exec = self.exec();
         let parent_full = self.is_full();
-        let mut has_ret = false;
+        let mut returns = 0;
         walk_stmts(&callee.body, &mut |s| {
-            has_ret |= matches!(s, Stmt::Return(_))
+            returns += usize::from(matches!(s, Stmt::Return(_)))
         });
+        // A function whose only `return` ends its body hands back the value as it is: no lane
+        // returned earlier, and the lanes of a masked-off caller are never looked at.
+        let tail = match callee.body.split_last() {
+            Some((Stmt::Return(Some(e)), head)) if returns == 1 => Some((e, head)),
+            _ => None,
+        };
         self.frames.push(Frame {
             locals,
             params: argv,
@@ -3032,10 +3195,22 @@ impl<'a, 'f> Lower<'a, 'f> {
             entry: false,
         });
         self.push_scope(exec, ScopeKind::CallRoot);
-        self.scopes.last_mut().unwrap().full = parent_full && !has_ret;
-        self.stmts(&callee.body);
+        self.scopes.last_mut().unwrap().full = parent_full && (returns == 0 || tail.is_some());
+        let tail_val = match tail {
+            Some((e, head)) => {
+                self.stmts(head);
+                Some(self.expr(e))
+            }
+            None => {
+                self.stmts(&callee.body);
+                None
+            }
+        };
         self.scopes.pop();
         let frame = self.frames.pop().unwrap();
+        if let Some(v) = tail_val {
+            return v;
+        }
         match frame.ret {
             Some((rty, scs, vars)) => {
                 let mut leaves = Vec::with_capacity(vars.len());
@@ -3508,6 +3683,19 @@ impl<'a, 'f> Lower<'a, 'f> {
                     is64,
                     &[x],
                 ),
+                Sinh => sl.math_call(CpuMathTable::OFFSET_SINHF, CpuMathTable::OFFSET_SINH, is64, &[x]),
+                Cosh => sl.math_call(CpuMathTable::OFFSET_COSHF, CpuMathTable::OFFSET_COSH, is64, &[x]),
+                Asinh => sl.math_call(CpuMathTable::OFFSET_ASINHF, CpuMathTable::OFFSET_ASINH, is64, &[x]),
+                Acosh => sl.math_call(CpuMathTable::OFFSET_ACOSHF, CpuMathTable::OFFSET_ACOSH, is64, &[x]),
+                Atanh => sl.math_call(CpuMathTable::OFFSET_ATANHF, CpuMathTable::OFFSET_ATANH, is64, &[x]),
+                Log10 => sl.math_call(CpuMathTable::OFFSET_LOG10F, CpuMathTable::OFFSET_LOG10, is64, &[x]),
+                Cbrt => sl.math_call(CpuMathTable::OFFSET_CBRTF, CpuMathTable::OFFSET_CBRT, is64, &[x]),
+                Erf => sl.math_call(CpuMathTable::OFFSET_ERFF, CpuMathTable::OFFSET_ERF, is64, &[x]),
+                Erfc => sl.math_call(CpuMathTable::OFFSET_ERFCF, CpuMathTable::OFFSET_ERFC, is64, &[x]),
+                Lgamma => sl.math_call(CpuMathTable::OFFSET_LGAMMAF, CpuMathTable::OFFSET_LGAMMA, is64, &[x]),
+                Tgamma => sl.math_call(CpuMathTable::OFFSET_TGAMMAF, CpuMathTable::OFFSET_TGAMMA, is64, &[x]),
+                Log1p => sl.math_call(CpuMathTable::OFFSET_LOG1PF, CpuMathTable::OFFSET_LOG1P, is64, &[x]),
+                Expm1 => sl.math_call(CpuMathTable::OFFSET_EXPM1F, CpuMathTable::OFFSET_EXPM1, is64, &[x]),
                 _ => x,
             });
             r.k = if a.k == Kind::Uni {
@@ -4064,6 +4252,7 @@ mod tests {
             k.plan.shared_bytes,
             k.plan.scratch_bytes,
             false,
+            &k.cost,
         );
         // SAFETY: dispatch has completed; buffers are live.
         alloc
@@ -4405,6 +4594,40 @@ mod tests {
             assert_eq!(swap[i], xs[i ^ 1], "swap {i}");
             let g = i / 4 * 4;
             assert_eq!(sums[i], xs[g..g + 4].iter().sum::<f32>(), "sum {i}");
+        }
+    }
+
+    #[test]
+    fn loop_depth_counts_nested_loops() {
+        // `depth` loops, each inside the previous one, around one block.
+        fn nest(depth: usize) -> usize {
+            let mut func = Function::new();
+            let mut fbc = FunctionBuilderContext::new();
+            let mut b = FunctionBuilder::new(&mut func, &mut fbc);
+            let entry = b.create_block();
+            let headers: Vec<Block> = (0..depth).map(|_| b.create_block()).collect();
+            let latches: Vec<Block> = (0..depth).map(|_| b.create_block()).collect();
+            let exit = b.create_block();
+            b.switch_to_block(entry);
+            let more = b.ins().iconst(types::I32, 1);
+            b.ins().jump(headers.first().copied().unwrap_or(exit), &[]);
+            for i in 0..depth {
+                b.switch_to_block(headers[i]);
+                b.ins().jump(headers.get(i + 1).copied().unwrap_or(latches[depth - 1]), &[]);
+            }
+            for i in (0..depth).rev() {
+                b.switch_to_block(latches[i]);
+                let after = if i == 0 { exit } else { latches[i - 1] };
+                b.ins().brif(more, headers[i], &[], after, &[]);
+            }
+            b.switch_to_block(exit);
+            b.ins().return_(&[]);
+            b.seal_all_blocks();
+            b.finalize(ISA_SPEED.as_ref().expect("host isa").frontend_config());
+            max_loop_depth(&func)
+        }
+        for depth in 0..5 {
+            assert_eq!(nest(depth), depth, "{depth} nested loops");
         }
     }
 }

@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use crate::builtin::{df_library, BinOp, CmpOp, UnOp};
+use crate::builtin::{df_library, BinOp, CmpOp, Part, UnOp};
 use crate::context::{Context, RawArg, STORAGE_USAGE};
 use crate::error::Result;
 use crate::kernel::{build_core, KernelKey};
@@ -16,19 +16,25 @@ pub(crate) use luma_core::CostModel;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind};
 
 /// The cost of `op` per element in f32-operation units.
-pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
+pub(crate) fn op_weight(op: &Op, cost: &CostModel) -> f64 {
     let base = match op.kind {
         OpKind::Unary(u) => match u {
-            UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
+            UnOp::Neg | UnOp::Conj | UnOp::Abs | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_) => 1.0,
             UnOp::Sqrt => 4.0,
             UnOp::Exp | UnOp::Ln | UnOp::Sin | UnOp::Cos => 8.0,
             UnOp::Tan | UnOp::Tanh => 16.0,
+            UnOp::Asin | UnOp::Acos | UnOp::Atan | UnOp::Sinh | UnOp::Cosh | UnOp::Asinh | UnOp::Acosh | UnOp::Atanh => 16.0,
+            UnOp::Exp2 | UnOp::Log2 | UnOp::Log10 | UnOp::Rsqrt | UnOp::Sigmoid => 8.0,
+            UnOp::Cbrt => 12.0,
+            UnOp::Erf | UnOp::Erfc => 24.0,
+            UnOp::Lgamma | UnOp::Tgamma => 32.0,
             UnOp::Log1p | UnOp::Expm1 => 20.0,
         },
         OpKind::Binary(b) => match b {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Min | BinOp::Max | BinOp::Copysign => 1.0,
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Rotl => 1.0,
             BinOp::Div | BinOp::Rem => 4.0,
+            BinOp::Mod => 8.0,
             BinOp::Hypot => 6.0,
             BinOp::Atan2 => 16.0,
         },
@@ -37,6 +43,13 @@ pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
             CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge | CmpOp::Eq | CmpOp::Ne => 1.0,
         },
         OpKind::Select => 1.0,
+        OpKind::Part(part) => match part {
+            Part::Real | Part::Imag => 1.0,
+            Part::NormSqr => 2.0,
+            Part::Abs => 10.0,
+            Part::Arg => 16.0,
+        },
+        OpKind::Make => 1.0,
         OpKind::Classify(_) => 2.0,
         OpKind::Clamp => 2.0,
         OpKind::Cast(to) => {
@@ -61,6 +74,12 @@ pub(crate) fn op_weight(op: Op, cost: &CostModel) -> f64 {
         (ElemTy::Df32, OpKind::Unary(UnOp::Tanh)) => 24.0,
         (ElemTy::Df32, OpKind::Unary(UnOp::Log1p | UnOp::Expm1)) => 24.0,
         (ElemTy::Df32, OpKind::Powf) => 40.0,
+        // The components of a complex number are separate `f32` operations.
+        (ElemTy::C32, OpKind::Unary(UnOp::Neg | UnOp::Conj) | OpKind::Binary(BinOp::Add | BinOp::Sub)) => 2.0,
+        (ElemTy::C32, OpKind::Binary(BinOp::Mul)) => 4.0,
+        (ElemTy::C32, OpKind::Binary(BinOp::Div)) => 14.0,
+        (ElemTy::C32, OpKind::Unary(UnOp::Exp)) => 24.0,
+        (ElemTy::C32, OpKind::Unary(UnOp::Sqrt)) => 18.0,
         _ => base,
     };
     let arithmetic = matches!(op.kind, OpKind::Unary(_) | OpKind::Binary(_) | OpKind::Clamp | OpKind::Compare(_) | OpKind::Powf)
@@ -89,6 +108,91 @@ const SATURATION_PER_OP_RATE: f64 = 2.0;
 pub(crate) fn kernel_ns_on(cost: &CostModel, bytes: f64, ops: f64, invocations: f64) -> f64 {
     let busy = (invocations / (SATURATION_PER_OP_RATE * cost.f32_ops_per_ns)).clamp(1e-3, 1.0);
     cost.launch_us * 1e3 + (bytes / cost.bandwidth_gbs).max(ops / (cost.f32_ops_per_ns * busy))
+}
+
+/// The 2-D reads of a kernel that could go through the texture units, as the decision of
+/// [`read_path`] sees them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextureRead {
+    /// How the kernel finds the texels it reads.
+    pub pattern: ReadPattern,
+    /// Source texels an output element combines (4 for a bilinear method, 16 for a bicubic one).
+    pub taps: u32,
+    /// Output elements.
+    pub outputs: u64,
+    /// Bytes of the source image.
+    pub src_bytes: u64,
+    /// Whether a texture over the source's own buffer is possible: no copy to make it.
+    pub zero_copy: bool,
+}
+
+/// Where the 2-D position of a read comes from, which decides how the reads of neighbouring
+/// invocations overlap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPattern {
+    /// A position array: any pattern, with the locality of the data (`approx2`).
+    Positions,
+    /// A map of the output pixel (`transform`, `rotate`): neighbours read neighbouring texels.
+    Warp,
+    /// The output pixel over a scale (`resize`): the taps of a column are shared by all its rows.
+    Scaled,
+}
+
+/// How the source of a [`TextureRead`] is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPath {
+    /// Loads from the buffer (on NVIDIA GPUs through the read-only data cache, which a
+    /// `read`-only binding already gets).
+    Plain,
+    /// Gathers (`textureGather`: the four texels of a bilinear footprint in one fetch) from a
+    /// texture; unfiltered, so exact.
+    Texture,
+}
+
+/// The share of a kernel's time that gathers save over loads on the texture-capable NVIDIA parts
+/// measured (RTX 3090 and RTX 3080 Laptop, the sampling kernel of `crate::sampler` with its
+/// per-method specialisation, best of interleaved runs; differences within 2% are noise and count
+/// as 0). A warp reads the four taps of a bilinear footprint with one gather instead of four
+/// loads (4K: `rotate` 5%, `transform` 7-13%) and sixteen bicubic taps with four (26-28%, 1080p
+/// 25-27%); scattered `approx2` positions (within 48 pixels of the pixel, the reads of neighbouring
+/// invocations overlap only in the cache) gain 28-36% at bicubic and 1-3% at bilinear. Smooth
+/// `approx2` positions and `resize` are bound by DRAM, which a texture does not touch: no
+/// difference at any method.
+///
+/// The same measurements for the kernels the JIT generates (hand-written equivalents of
+/// `take` with 2-D data-dependent coordinates, 4-tap bilinear gathers from integer or computed
+/// positions, lookup tables, clamped 3 x 3 windows, 512x512 to 4096x4096 sources, 1 to 16 outputs per
+/// texel, texture point loads and gathers against buffer loads): they are bound by DRAM or by
+/// the index arithmetic, texture reads are between 0.84 and 1.0 of the buffer's (windows: 0.71-0.97,
+/// the texture's out-of-range read is 0, so the clamp stays in the kernel) with one outlier, 1.13
+/// on a 512x512 source of the laptop part. The JIT never reads through a texture.
+fn gather_saving(pattern: ReadPattern, taps: u32) -> f64 {
+    match (pattern, taps) {
+        (ReadPattern::Positions, 16) => 0.25,
+        (ReadPattern::Warp, 4) => 0.05,
+        (ReadPattern::Warp, 16) => 0.25,
+        _ => 0.0,
+    }
+}
+
+/// Whether `read` goes through a texture: the device must have one for the data, the kernel's
+/// saving must beat the cost of making the texture. A texture over the source's own buffer costs
+/// nothing (and is kept for the array's next reader); one that copies the source costs a read and
+/// a write of it and a launch, and is made per use, so it pays only when the saving exceeds that.
+/// The saving is the table of [`gather_saving`] where measured (NVIDIA); every other device reads
+/// from the buffer.
+pub(crate) fn read_path(ctx: &Context, read: &TextureRead) -> ReadPath {
+    if ctx.hal().texture_caps().is_none() || ctx.tuning().profile != luma_core::TuningProfile::Nvidia {
+        return ReadPath::Plain;
+    }
+    let cost = ctx.cost_model();
+    // The kernel's traffic: the source once, the output, and positions where there are some.
+    let out_bytes = read.outputs as f64 * 4.0;
+    let pos_bytes = if read.pattern == ReadPattern::Positions { read.outputs as f64 * 8.0 } else { 0.0 };
+    let work_ns = (read.src_bytes as f64 + out_bytes + pos_bytes) / cost.bandwidth_gbs;
+    let saving_ns = gather_saving(read.pattern, read.taps) * work_ns;
+    let view_ns = if read.zero_copy { 0.0 } else { cost.launch_us * 1e3 + 2.0 * read.src_bytes as f64 / cost.bandwidth_gbs };
+    if saving_ns > view_ns && saving_ns > 0.0 { ReadPath::Texture } else { ReadPath::Plain }
 }
 
 /// Times of calibration kernels are the best of this many measurements.
@@ -126,7 +230,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// The input and output are whole device buffers of `n` elements, not array storage, so the
 /// measurement does not depend on the context's chunk size.
 fn time_kernel(ctx: &Context, source: String, label: &str, n: u32, k: u32, reps: u32) -> Result<f64> {
-    let core = build_core(ctx, &KernelKey::new(source, "main", None), Some(label), true)?;
+    let core = build_core(ctx, &KernelKey::new(source, "main", None), Some(label), luma_core::KernelTrust::Trusted)?;
     let bytes = u64::from(n) * 4;
     let input = ctx.alloc_buffer(bytes, STORAGE_USAGE)?;
     let output = match ctx.alloc_buffer(bytes, STORAGE_USAGE) {
@@ -238,18 +342,18 @@ mod tests {
     fn weights_follow_the_table() {
         let cost = CostModel { df32_factor: 20.0, f64_factor: Some(3.0), ..CostModel::TEST };
         let mul = |ty| Op::new(OpKind::Binary(BinOp::Mul), ty);
-        assert_eq!(op_weight(mul(ElemTy::F32), &cost), 1.0);
-        assert_eq!(op_weight(mul(ElemTy::Df32), &cost), 20.0);
-        assert_eq!(op_weight(mul(ElemTy::F64), &cost), 3.0);
-        assert_eq!(op_weight(mul(ElemTy::F64), &CostModel { f64_factor: None, ..cost }), 32.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Sqrt), ElemTy::F32), &cost), 4.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Tanh), ElemTy::Df32), &cost), 480.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Exp), ElemTy::Df32), &cost), 400.0);
-        assert_eq!(op_weight(Op::new(OpKind::Unary(UnOp::Ln), ElemTy::Df32), &cost), 320.0);
-        assert_eq!(op_weight(Op::new(OpKind::Powf, ElemTy::Df32), &cost), 800.0);
-        assert_eq!(op_weight(Op::new(OpKind::Powf, ElemTy::F32), &cost), 16.0);
-        assert_eq!(op_weight(Op::new(OpKind::Cast(ElemTy::Df32), ElemTy::F32), &cost), 4.0);
-        assert_eq!(op_weight(Op::new(OpKind::Generate(Gen::Normal), ElemTy::F32), &cost), 60.0);
+        assert_eq!(op_weight(&mul(ElemTy::F32), &cost), 1.0);
+        assert_eq!(op_weight(&mul(ElemTy::Df32), &cost), 20.0);
+        assert_eq!(op_weight(&mul(ElemTy::F64), &cost), 3.0);
+        assert_eq!(op_weight(&mul(ElemTy::F64), &CostModel { f64_factor: None, ..cost }), 32.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Sqrt), ElemTy::F32), &cost), 4.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Tanh), ElemTy::Df32), &cost), 480.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Exp), ElemTy::Df32), &cost), 400.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Unary(UnOp::Ln), ElemTy::Df32), &cost), 320.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Powf, ElemTy::Df32), &cost), 800.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Powf, ElemTy::F32), &cost), 16.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Cast(ElemTy::Df32), ElemTy::F32), &cost), 4.0);
+        assert_eq!(op_weight(&Op::new(OpKind::Generate(Gen::Normal), ElemTy::F32), &cost), 60.0);
     }
 
     #[test]

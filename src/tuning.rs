@@ -17,15 +17,65 @@ const MAX_LIVE_ENV: &str = "LUMA_FUSION_MAX_LIVE";
 const MAX_INLINED_ENV: &str = "LUMA_FUSION_MAX_INLINED";
 /// `LUMA_STAGING=off` keeps sub-programs read through views out of workgroup memory (see `jit::staging`).
 const STAGING_ENV: &str = "LUMA_STAGING";
+/// `LUMA_COARSEN=off|auto|<n>` sets [`Tuning::coarsen`] (see `jit::coarsen`).
+const COARSEN_ENV: &str = "LUMA_COARSEN";
 /// `LUMA_TRIDIAGONAL=thomas|cyclic|auto` picks the line solver of `solve_tridiagonal` (see [`LineSolver`]).
 const LINE_SOLVER_ENV: &str = "LUMA_TRIDIAGONAL";
 /// `LUMA_SINGLE_PASS_REDUCE=off|on` overrides [`Tuning::single_pass_reduce`] (`on` only takes
 /// effect on the CUDA and CPU backends, whose atomics and fences order memory across workgroups).
 const SINGLE_PASS_ENV: &str = "LUMA_SINGLE_PASS_REDUCE";
+/// `LUMA_MULTI_REDUCE=off|n` overrides [`Tuning::reduce_multi`] (`off` or `1` keeps every reduction
+/// in a kernel of its own; clamped to the most accumulators a kernel has).
+const MULTI_REDUCE_ENV: &str = "LUMA_MULTI_REDUCE";
+/// `LUMA_MULTI_REDUCE_AFTER=n` overrides [`Tuning::reduce_multi_after`].
+const MULTI_REDUCE_AFTER_ENV: &str = "LUMA_MULTI_REDUCE_AFTER";
 /// `LUMA_LOOKBACK_SCAN=off|on` overrides [`Tuning::lookback_scan`] (`on` only takes effect on the
 /// CUDA and CPU backends, for the same reason as `LUMA_SINGLE_PASS_REDUCE`; floating-point sums
 /// keep two passes either way, to stay reproducible).
 const LOOKBACK_ENV: &str = "LUMA_LOOKBACK_SCAN";
+/// `LUMA_NATIVE_SOLVE=off` runs the line solves of a backend that has native ones (the CPU backend)
+/// as compiled shaders, like the GPU backends (see [`Tuning::native_solve`]).
+const NATIVE_SOLVE_ENV: &str = "LUMA_NATIVE_SOLVE";
+
+/// `LUMA_NATIVE_GEMM=off` runs the matrix products of a backend that has native ones (the CPU
+/// backend) as compiled tile kernels, like the GPU backends (see [`Tuning::native_gemm`]).
+const NATIVE_GEMM_ENV: &str = "LUMA_NATIVE_GEMM";
+
+/// How many output elements one invocation of a fused elementwise kernel computes (see `jit::coarsen`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Coarsen {
+    /// One element per invocation, always.
+    Off,
+    /// The planner picks 1, 2, 4 or 8 per launch from the size of the array and the cost of the program.
+    Auto,
+    /// This many (1, 2, 4 or 8) wherever the kernel can run it, whatever the size.
+    Fixed(u8),
+}
+
+impl Coarsen {
+    /// Reads `LUMA_COARSEN`: `off`, `auto` or a count (rounded down to 1, 2, 4 or 8); `default` if unset or not understood.
+    fn from_env(default: Coarsen) -> Coarsen {
+        match std::env::var(COARSEN_ENV).as_deref().map(str::trim) {
+            Ok("off") => Coarsen::Off,
+            Ok("auto") => Coarsen::Auto,
+            Ok(value) => match value.parse::<u8>() {
+                Ok(0) => Coarsen::Off,
+                Ok(n) => Coarsen::Fixed(match n {
+                    1 => 1,
+                    2 | 3 => 2,
+                    4..=7 => 4,
+                    _ => 8,
+                }),
+                Err(_) => default,
+            },
+            Err(_) => default,
+        }
+    }
+}
+
+/// [`Tuning::axis_defer_cells`] of the wgpu backend: above the 131072 cells at which leaving the reductions pending lost 9 % and below the
+/// 1048576 at which it won 7 % (an RTX 3090, `ml/train`); where in between they cross is not measured.
+const AXIS_DEFER_CELLS: usize = 1 << 19;
 
 /// The algorithm of the tridiagonal and block-tridiagonal line solves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -48,6 +98,9 @@ pub(crate) struct Tuning {
     pub(crate) profile: TuningProfile,
     /// Invocations per workgroup of elementwise kernels (fused and fills).
     pub(crate) elementwise_workgroup: u32,
+    /// Output elements per invocation of fused elementwise kernels (`jit::coarsen`); `LUMA_COARSEN` overrides. Automatic on the
+    /// NVIDIA profile, where it was measured; off elsewhere.
+    pub(crate) coarsen: Coarsen,
     /// Tiled 1D convolution: invocations per workgroup, and outputs per invocation at stride 1.
     pub(crate) conv_workgroup: u32,
     pub(crate) conv_per_thread: u32,
@@ -60,6 +113,30 @@ pub(crate) struct Tuning {
     pub(crate) reduce_per_thread: u32,
     /// Most workgroups of a reduction pass; they stride over arrays larger than that many blocks.
     pub(crate) reduce_max_groups: u32,
+    /// Most accumulators (reductions of one operand each, ops counted) one kernel computes when several
+    /// pending reductions of the same length are forced together (see `jit::multireduce`); below 2 they are
+    /// never merged. `LUMA_MULTI_REDUCE` overrides.
+    pub(crate) reduce_multi: usize,
+    /// How many times a group of pending reductions is recorded one by one (with the kernel all reductions of their shape
+    /// share) before the kernel that computes the group together is compiled, in the background; the group is recorded in
+    /// it once it is ready, and no launch waits for it. Compiling it costs 0.1 to 1 s on CUDA, which a group recorded a few
+    /// times (a solver's final forces) never earns back. 0 records every group in its kernel at once, waiting for its compile.
+    /// `LUMA_MULTI_REDUCE_AFTER` overrides; the default is 4 on CUDA and 0 elsewhere.
+    pub(crate) reduce_multi_after: u32,
+    /// Least weight (f32 operations per cell, see `jit::Node::weight`) of the operand of an `f32` axis reduction for it to be left
+    /// pending to be recorded with its siblings (see `Array::defer_axis`). Merged, the reductions share the operands' work and the
+    /// pass over the data, but the CPU backend returns the values of several roots as an array and combines them in lockstep, which
+    /// costs more per cell than light operands save (a table's NaN-aware column statistics ran 1.5-1.7x slower merged, its
+    /// 4-operation description and a layer norm gained less than they lost to the deferral); all-pairs forces, whose three
+    /// components share a long chain, run 3x faster. Zero on GPU backends: always deferred.
+    pub(crate) axis_defer_weight: u32,
+    /// Fewest cells of the operand of an `f32` axis reduction for it to be left pending to be recorded with its siblings (see
+    /// `Array::defer_axis`); smaller operands are reduced when the call is made. Recording a reduction late moves its kernel behind
+    /// the ones recorded after its operands and, because the group has to wait for its last member, behind the work that follows
+    /// it: where kernels are short that costs more than sharing the pass saves (`ml/train/sgd_medium` on an RTX 3090, three bias
+    /// gradients of 131072 cells or fewer: 0.606 ms recorded at once, 0.662 ms left pending; at 1048576 cells, `sgd_large`, pending
+    /// is 1.405 against 1.306 ms). Zero on the CPU backend, which judges by [`Tuning::axis_defer_weight`], and on CUDA and Metal, where it was not measured.
+    pub(crate) axis_defer_cells: usize,
     /// Whether a reduction with more than one workgroup finishes in its first launch: the last
     /// workgroup to write its partial result combines them all (see `builtin::reduce_main`),
     /// instead of a second launch doing it. Needs a memory model that orders the partial results
@@ -106,6 +183,14 @@ pub(crate) struct Tuning {
     pub(crate) line_strided_from: u32,
     /// Which tridiagonal solver runs; `LUMA_TRIDIAGONAL` overrides.
     pub(crate) line_solver: LineSolver,
+    /// Whether the backend runs the Thomas line solves as native code (`Backend::native_line_solve`,
+    /// `LUMA_NATIVE_SOLVE=off` clears it): the planner then never takes cyclic reduction on its own and
+    /// solves blocks of any size by the block Thomas algorithm (see `builtin::thomas_plan`).
+    pub(crate) native_solve: bool,
+    /// The cores a native matrix product spreads over (`Backend::native_matmul`; 0 if the backend has
+    /// none or `LUMA_NATIVE_GEMM=off`): the products are then planned as output tiles for that many
+    /// cores and their operands evaluated first (see `matmul::native_plan`).
+    pub(crate) native_gemm: u32,
     /// Whether a scan of long contiguous lines is one kernel that reads its input once, with a
     /// decoupled look-back (each workgroup takes a chunk from an atomic counter, publishes the
     /// chunk's aggregate and waits for the prefix of the chunks before it, see
@@ -116,12 +201,37 @@ pub(crate) struct Tuning {
     /// workgroups, which WGSL does not give (wgpu, Metal): only the CUDA backend sets it.
     /// `LUMA_LOOKBACK_SCAN` overrides.
     pub(crate) lookback_scan: bool,
+    /// Multiprocessors (compute units) of the device, 82 (the RTX 3090 the occupancy-derived plan
+    /// constants were measured on) when the backend cannot tell. See [`Tuning::scaled`].
+    pub(crate) compute_units: u32,
 }
 
+/// Multiprocessors of the RTX 3090, on which the plan constants that depend on how many workgroups
+/// fill the device (`matmul::SPLIT_GROUPS`, `builtin::thomas_plan`)
+/// were measured.
+pub(crate) const REFERENCE_COMPUTE_UNITS: u32 = 82;
+
 impl Tuning {
+    /// [`scaled`](Self::scaled), but never below `reference`: for counts of workgroups that keep a
+    /// device busy, where more than enough cost almost nothing (a K-split matmul on an RTX 3080
+    /// Laptop was 2.7 % slower with the 599 workgroups of its 48 multiprocessors than with 1024).
+    pub(crate) fn scaled_up(&self, reference: u32) -> u32 {
+        self.scaled(reference).max(reference)
+    }
+
+    /// A count of workgroups or lines tuned on the reference device ([`REFERENCE_COMPUTE_UNITS`]),
+    /// for this device: proportional to its multiprocessors, rounded to nearest, at least 1 for a
+    /// nonzero count and unchanged at the reference.
+    pub(crate) fn scaled(&self, reference: u32) -> u32 {
+        let units = u64::from(self.compute_units.max(1));
+        let scaled = (u64::from(reference) * units + u64::from(REFERENCE_COMPUTE_UNITS) / 2) / u64::from(REFERENCE_COMPUTE_UNITS);
+        if reference == 0 { 0 } else { scaled.clamp(1, u64::from(u32::MAX)) as u32 }
+    }
+
     const APPLE: Tuning = Tuning {
         profile: TuningProfile::Apple,
         elementwise_workgroup: 64,
+        coarsen: Coarsen::Off,
         conv_workgroup: 128,
         conv_per_thread: 32,
         stencil_tile_bytes: 8 * 1024,
@@ -130,6 +240,10 @@ impl Tuning {
         stencil_tile_1d: 512,
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
+        reduce_multi: 16,
+        reduce_multi_after: 0,
+        axis_defer_weight: 0,
+        axis_defer_cells: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -146,12 +260,16 @@ impl Tuning {
         // 32-wide SIMD groups, like NVIDIA warps: see `builtin::thomas_plan`.
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
+        compute_units: REFERENCE_COMPUTE_UNITS,
     };
 
     const NVIDIA: Tuning = Tuning {
         profile: TuningProfile::Nvidia,
         elementwise_workgroup: 256,
+        coarsen: Coarsen::Auto,
         conv_workgroup: 256,
         conv_per_thread: 32,
         stencil_tile_bytes: 32 * 1024,
@@ -159,6 +277,10 @@ impl Tuning {
         stencil_tile_1d: 2048,
         reduce_per_thread: 8,
         reduce_max_groups: 2048,
+        reduce_multi: 16,
+        reduce_multi_after: 0,
+        axis_defer_weight: 0,
+        axis_defer_cells: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -177,12 +299,16 @@ impl Tuning {
         // RTX 3090, see `builtin::thomas_plan`.
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
+        compute_units: REFERENCE_COMPUTE_UNITS,
     };
 
     const GENERIC: Tuning = Tuning {
         profile: TuningProfile::Generic,
         elementwise_workgroup: 256,
+        coarsen: Coarsen::Off,
         conv_workgroup: 256,
         conv_per_thread: 16,
         stencil_tile_bytes: 16 * 1024,
@@ -190,6 +316,10 @@ impl Tuning {
         stencil_tile_1d: 1024,
         reduce_per_thread: 4,
         reduce_max_groups: 1024,
+        reduce_multi: 16,
+        reduce_multi_after: 0,
+        axis_defer_weight: 0,
+        axis_defer_cells: 0,
         single_pass_reduce: false,
         subgroups: false,
         subgroup32: false,
@@ -205,7 +335,10 @@ impl Tuning {
         line_cyclic_work: 0,
         line_strided_from: 16,
         line_solver: LineSolver::Auto,
+        native_solve: false,
+        native_gemm: 0,
         lookback_scan: false,
+        compute_units: REFERENCE_COMPUTE_UNITS,
     };
 
     /// Software rasterizers: the generic parameters with the smaller elementwise workgroups
@@ -213,6 +346,7 @@ impl Tuning {
     const CPU: Tuning = Tuning {
         profile: TuningProfile::Cpu,
         elementwise_workgroup: 64,
+        coarsen: Coarsen::Off,
         max_live: 256,
         max_inlined: 1024,
         line_cyclic_work: 0,
@@ -252,11 +386,31 @@ impl Tuning {
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
             _ => info.backend == BackendKind::Cuda,
         };
+        tuning.reduce_multi = match std::env::var(MULTI_REDUCE_ENV).as_deref().map(str::trim) {
+            Ok("off") => 1,
+            Ok(value) => value.parse::<usize>().map_or(tuning.reduce_multi, |n| n.clamp(1, crate::builtin::MAX_ACCS)),
+            Err(_) => tuning.reduce_multi,
+        };
+        tuning.reduce_multi_after = std::env::var(MULTI_REDUCE_AFTER_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(if info.backend == BackendKind::Cuda { 4 } else { 0 });
+        if info.backend == BackendKind::Cpu {
+            tuning.axis_defer_weight = 12;
+        } else if info.backend == BackendKind::Wgpu {
+            tuning.axis_defer_cells = AXIS_DEFER_CELLS;
+        }
         tuning.lookback_scan = match std::env::var(LOOKBACK_ENV).as_deref().map(str::trim) {
             Ok("off") => false,
             Ok("on") => matches!(info.backend, BackendKind::Cuda | BackendKind::Cpu),
             _ => info.backend == BackendKind::Cuda,
         };
+        // Software rasterizers and the CPU backend keep the reference: their "units" are threads,
+        // which the plans were never measured against.
+        if let Some(units) = info.compute_units.filter(|_| profile != TuningProfile::Cpu) {
+            tuning.compute_units = units.max(1);
+        }
+        tuning.coarsen = Coarsen::from_env(tuning.coarsen);
         tuning.staging = std::env::var(STAGING_ENV).as_deref().map(str::trim) != Ok("off");
         tuning.line_solver = match std::env::var(LINE_SOLVER_ENV).as_deref().map(str::trim) {
             Ok("thomas") => LineSolver::Thomas,
@@ -264,6 +418,17 @@ impl Tuning {
             _ => LineSolver::Auto,
         };
         tuning
+    }
+
+    /// Whether the line solves run natively, given whether the backend can: see
+    /// [`Tuning::native_solve`].
+    pub(crate) fn native_solve_for(supported: bool) -> bool {
+        supported && std::env::var(NATIVE_SOLVE_ENV).as_deref().map(str::trim) != Ok("off")
+    }
+
+    /// The cores of [`Tuning::native_gemm`], given the cores of the backend's native product (if it has one).
+    pub(crate) fn native_gemm_for(cores: Option<u32>) -> u32 {
+        cores.filter(|_| std::env::var(NATIVE_GEMM_ENV).as_deref().map(str::trim) != Ok("off")).unwrap_or(0)
     }
 
     /// The generic parameters, for tests that need a `Tuning` without a device.
@@ -322,7 +487,22 @@ pub(crate) fn stencil_bytes(tile: (u32, u32), halo: (u32, u32)) -> u32 {
 }
 #[cfg(test)]
 mod tests {
-    use super::{conv_workgroup_bytes, stencil_bytes, DeviceLimits, Tuning, STENCIL_RADIUS};
+    use super::{conv_workgroup_bytes, stencil_bytes, DeviceLimits, Tuning, REFERENCE_COMPUTE_UNITS, STENCIL_RADIUS};
+
+    #[test]
+    fn scaling_is_the_identity_at_the_reference_device() {
+        let at = |compute_units| Tuning { compute_units, ..Tuning::NVIDIA };
+        for v in [0u32, 1, 8, 512, 1024, 8192, 1 << 20] {
+            assert_eq!(at(REFERENCE_COMPUTE_UNITS).scaled(v), v);
+        }
+        assert_eq!(at(48).scaled(1024), 599);
+        assert_eq!(at(48).scaled(8192), 4795);
+        assert_eq!(at(1).scaled(1), 1);
+        assert_eq!(at(48).scaled_up(1024), 1024);
+        assert_eq!(at(164).scaled_up(1024), 2048);
+        assert_eq!(at(164).scaled(1024), 2048);
+        assert_eq!(at(48).scaled(0), 0);
+    }
 
     #[test]
     fn tunings_fit_the_smallest_webgpu_limits() {

@@ -13,19 +13,24 @@ use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, BindingInfo, BindingKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel, CostModel, DeviceInfo,
-    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, NativeBuffer, NativeKernel, Profile,
-    RawArg, RawKernel, TuningProfile,
+    DeviceKind, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads, FusionSplit, GraphLaunch, KernelTrust, NativeBuffer, NativeKernel,
+    Profile, RawArg, RawKernel, TextureCaps, TextureDesc, TextureFilter, TextureFormat, TuningProfile,
 };
 use luma_core::hal::copy_parallel;
 use wgpu::{BindGroupEntry, BindingResource, BufferBinding};
 
 use crate::codegen;
+
+/// `LUMA_WGPU_DUMP`: a directory that receives the WGSL (`<label>-<hash>.wgsl`) of every kernel
+/// the backend generates from luma's kernel IR.
+static DUMP_DIR: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| std::env::var_os("LUMA_WGPU_DUMP").filter(|v| !v.is_empty()).map(Into::into));
+
 use crate::device::{self, Gpu, lock};
 use crate::profiler::Profiler;
 
@@ -72,18 +77,37 @@ struct WgpuBuffer(wgpu::Buffer);
 
 impl NativeBuffer for WgpuBuffer {}
 
+/// A texture, its view and the sampler of its filter, held by a [`Buffer`] made by
+/// [`Backend::create_texture`].
+#[derive(Debug)]
+struct WgpuTexture {
+    /// Kept alive by the view; named for what it is.
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+
+impl NativeBuffer for WgpuTexture {}
+
 /// A compiled pipeline held by a [`RawKernel`].
 #[derive(Debug)]
 struct WgpuKernel {
     pipeline: wgpu::ComputePipeline,
     /// Layout of `@group(1)`.
     args_layout: wgpu::BindGroupLayout,
+    /// Whether an argument is a texture or a sampler: such a launch builds its bind group anew
+    /// (every texture is a new object, so the bind group cache could not hit).
+    textured: bool,
 }
 
 impl NativeKernel for WgpuKernel {}
 
 fn wrap(buffer: wgpu::Buffer, size: u64, usage: BufferUsage) -> Buffer {
     Buffer::new(size, usage, WgpuBuffer(buffer))
+}
+
+fn texture(buffer: &Buffer) -> Result<&WgpuTexture, BackendError> {
+    buffer.downcast_ref::<WgpuTexture>().ok_or_else(|| BackendError::KernelBinding("a texture binding was given something that is not a wgpu texture".into()))
 }
 
 fn raw(buffer: &Buffer) -> Result<&wgpu::Buffer, BackendError> {
@@ -490,6 +514,9 @@ fn shader_capabilities(features: wgpu::Features) -> naga::valid::Capabilities {
     if features.contains(wgpu::Features::SUBGROUP) {
         caps |= Caps::SUBGROUP | Caps::SUBGROUP_BARRIER;
     }
+    if features.contains(wgpu::Features::SHADER_FLOAT32_ATOMIC) {
+        caps |= Caps::SHADER_FLOAT32_ATOMIC;
+    }
     if features.contains(wgpu::Features::SHADER_F16) {
         caps |= Caps::SHADER_FLOAT16;
     }
@@ -647,6 +674,7 @@ impl WgpuBackend {
                 max_workgroup_invocations: limits.max_compute_invocations_per_workgroup,
                 max_workgroup_storage_bytes: limits.max_compute_workgroup_storage_size,
             },
+            compute_units: gpu.0.compute_units,
         };
 
         let batch = Batch {
@@ -1062,7 +1090,7 @@ impl WgpuBackend {
     /// Builds the pipeline of the entry point `entry` of `module`. `numbers` are the original
     /// `@group(1)` binding numbers of the kernel's `infos`, in order.
     #[allow(clippy::too_many_arguments)]
-    fn build(&self, module: naga::Module, entry: &str, numbers: &[u32], infos: &[BindingInfo], workgroup: [u32; 3], label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+    fn build(&self, module: naga::Module, entry: &str, numbers: &[u32], infos: &[BindingInfo], workgroup: [u32; 3], label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
         let limits = &self.info.limits;
         let invocations = workgroup.iter().fold(1u64, |total, &d| total.saturating_mul(u64::from(d)));
         if workgroup.contains(&0)
@@ -1090,14 +1118,22 @@ impl WgpuBackend {
             .map(|(info, &binding)| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: match info.kind {
-                        BindingKind::Uniform => wgpu::BufferBindingType::Uniform,
-                        BindingKind::StorageRead => wgpu::BufferBindingType::Storage { read_only: true },
-                        BindingKind::StorageReadWrite => wgpu::BufferBindingType::Storage { read_only: false },
+                ty: match info.kind {
+                    BindingKind::Texture2d => wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    has_dynamic_offset: info.kind == BindingKind::Uniform,
-                    min_binding_size: None,
+                    BindingKind::Sampler => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    kind => wgpu::BindingType::Buffer {
+                        ty: match kind {
+                            BindingKind::Uniform => wgpu::BufferBindingType::Uniform,
+                            BindingKind::StorageRead => wgpu::BufferBindingType::Storage { read_only: true },
+                            _ => wgpu::BufferBindingType::Storage { read_only: false },
+                        },
+                        has_dynamic_offset: kind == BindingKind::Uniform,
+                        min_binding_size: None,
+                    },
                 },
                 count: None,
             })
@@ -1113,13 +1149,17 @@ impl WgpuBackend {
             // The module luma parsed and validated, not its text: wgpu would parse it a second time.
             source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
         };
-        let shader = if trusted {
+        let shader = if !trust.checks_bounds() {
             // Integer division keeps its guards: WGSL defines `x / 0` and `x % 0`, and user data
             // reaches luma's kernels.
-            let checks = wgpu::ShaderRuntimeChecks { bounds_checks: false, force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
+            let mut checks = wgpu::ShaderRuntimeChecks::checked();
+            checks.bounds_checks = false;
+            // User kernels keep the bound on their loops.
+            checks.force_loop_bounding &= trust != KernelTrust::Trusted;
             // SAFETY: luma's built-in and generated kernels index storage buffers only below the
             // lengths they are launched with, which never exceed the bound ranges, and all of
-            // their loops are bounded.
+            // their loops are bounded. A user kernel is only built this way on its author's word
+            // (`KernelTrust::UncheckedBounds`, see `KernelBuilder::unchecked_bounds`).
             unsafe { device.create_shader_module_trusted(shader_desc, checks) }
         } else {
             device.create_shader_module(shader_desc)
@@ -1132,12 +1172,13 @@ impl WgpuBackend {
                 module: &shader,
                 entry_point: Some(entry),
                 // Trusted kernels write their workgroup memory before reading it.
-                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: !trusted, ..Default::default() },
+                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: trust.zero_workgroup_memory(), ..Default::default() },
                 cache: store.cache(),
             })
         });
         store.built();
-        Ok(RawKernel::new(WgpuKernel { pipeline, args_layout }))
+        let textured = infos.iter().any(|b| matches!(b.kind, BindingKind::Texture2d | BindingKind::Sampler));
+        Ok(RawKernel::new(WgpuKernel { pipeline, args_layout, textured }))
     }
 }
 
@@ -1172,6 +1213,72 @@ impl Backend for WgpuBackend {
         Ok(buffer)
     }
 
+    fn texture_caps(&self) -> Option<TextureCaps> {
+        self.device().features().contains(wgpu::Features::FLOAT32_FILTERABLE).then(|| TextureCaps {
+            max_dim: self.device().limits().max_texture_dimension_2d,
+            pitch_align: wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+            aliases: false,
+        })
+    }
+
+    fn create_texture(&self, source: &Buffer, offset: u64, pitch: u64, desc: &TextureDesc) -> Result<Buffer, BackendError> {
+        let caps = self.texture_caps().ok_or_else(|| BackendError::Unsupported("the device cannot filter f32 textures".into()))?;
+        let (w, h) = (u64::from(desc.width), u64::from(desc.height));
+        let row = w * u64::from(desc.format.texel_bytes());
+        if w == 0 || h == 0 || desc.width > caps.max_dim || desc.height > caps.max_dim {
+            return Err(BackendError::Unsupported(format!("a {w}x{h} texture (up to {0}x{0} are possible)", caps.max_dim)));
+        }
+        if pitch < row || !pitch.is_multiple_of(u64::from(caps.pitch_align)) || !offset.is_multiple_of(4) || offset + pitch * (h - 1) + row > source.size() {
+            return Err(BackendError::KernelBinding(format!("a {w}x{h} texture does not fit {} bytes at offset {offset} with rows {pitch} bytes apart", source.size())));
+        }
+        let format = match desc.format {
+            TextureFormat::R32Float => wgpu::TextureFormat::R32Float,
+            TextureFormat::Rgba32Float => wgpu::TextureFormat::Rgba32Float,
+        };
+        let size = wgpu::Extent3d { width: desc.width, height: desc.height, depth_or_array_layers: 1 };
+        let device = self.device();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("luma texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        if pollster::block_on(scope.pop()).is_some() {
+            return Err(BackendError::OutOfMemory { requested: row * h });
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mode = match desc.filter {
+            TextureFilter::Nearest => wgpu::FilterMode::Nearest,
+            TextureFilter::Linear => wgpu::FilterMode::Linear,
+        };
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("luma sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: mode,
+            min_filter: mode,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let mut guard = self.batch()?;
+        self.encoder(&mut guard).copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: raw(source)?,
+                layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch as u32), rows_per_image: Some(desc.height) },
+            },
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            size,
+        );
+        drop(guard);
+        Ok(Buffer::new(row * h, BufferUsage::TEXTURE, WgpuTexture { _texture: texture, view, sampler }))
+    }
+
     fn recycle_mappable(&self, buffer: Buffer) {
         // May still be used by the unsubmitted batch, which mapping would invalidate; it is
         // mapped after the next submission. This must not take the batch lock: it can be held by
@@ -1180,7 +1287,7 @@ impl Backend for WgpuBackend {
         lock(&self.unmapped).push(buffer);
     }
 
-    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
+    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
         if let Some(mask) = used
             && mask.len() != module.bindings.len()
         {
@@ -1189,12 +1296,17 @@ impl Backend for WgpuBackend {
         let numbers: Vec<u32> = (0..module.bindings.len() as u32).filter(|&i| used.is_none_or(|u| u[i as usize])).collect();
         let infos: Vec<BindingInfo> = numbers.iter().map(|&i| module.bindings[i as usize].info()).collect();
         let optimized = luma_core::kir::optimize_for_target(module, false);
-        let source = codegen::emit_with(optimized.as_ref(), used);
+        let source = codegen::emit_with(optimized.as_ref(), used, self.device().features().contains(wgpu::Features::SHADER_FLOAT32_ATOMIC));
+        if let Some(dir) = DUMP_DIR.as_deref() {
+            let name: String = label.chars().take(100).map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(dir.join(format!("{name}-{:016x}.wgsl", luma_core::hal::cache::fnv1a(source.as_bytes()))), &source);
+        }
         let parsed = naga::front::wgsl::parse_str(&source).map_err(|e| BackendError::ShaderCompile(e.emit_to_string(&source)))?;
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), shader_capabilities(self.device().features()))
             .validate(&parsed)
             .map_err(|e| BackendError::ShaderCompile(e.emit_to_string(&source)))?;
-        self.build(parsed, codegen::ENTRY, &numbers, &infos, module.workgroup_size, label, trusted)
+        self.build(parsed, codegen::ENTRY, &numbers, &infos, module.workgroup_size, label, trust)
     }
 
     fn compile_naga(
@@ -1204,7 +1316,7 @@ impl Backend for WgpuBackend {
         bindings: &[BindingInfo],
         workgroup: [u32; 3],
         label: &str,
-        trusted: bool,
+        trust: KernelTrust,
     ) -> Option<Result<RawKernel, BackendError>> {
         Some((|| {
             let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), shader_capabilities(self.device().features()))
@@ -1232,7 +1344,7 @@ impl Backend for WgpuBackend {
                     bindings.len()
                 )));
             }
-            self.build(module.clone(), entry, &numbers, bindings, workgroup, label, trusted)
+            self.build(module.clone(), entry, &numbers, bindings, workgroup, label, trust)
         })())
     }
 
@@ -1325,25 +1437,41 @@ impl Backend for WgpuBackend {
             bytes.hash(&mut hasher);
         }
         let key = hasher.finish();
-        let bucket = bind_groups.buckets.entry(key).or_default();
-        let index = match bucket.iter().position(|cached| cached.matches(kernel.id, bindings())) {
-            Some(index) => index,
-            None => {
-                let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
-                for ((binding, _), (buffer, bytes)) in kernel.bound(args).zip(bindings()) {
-                    group_entries.push(BindGroupEntry {
-                        binding,
-                        resource: BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
-                    });
-                }
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &native.args_layout, entries: &group_entries });
-                bucket.push(CachedGroup { kernel: kernel.id, entries: bindings().map(|(buffer, bytes)| (buffer.clone(), bytes)).collect(), group });
-                bind_groups.len += 1;
-                bucket.len().saturating_sub(1)
+        let textured_group;
+        let (args_group, cached) = if native.textured {
+            let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
+            for (((binding, _), (buffer, bytes)), info) in kernel.bound(args).zip(bindings()).zip(&kernel.bindings) {
+                let resource = match info.kind {
+                    BindingKind::Texture2d => BindingResource::TextureView(&texture(buffer)?.view),
+                    BindingKind::Sampler => BindingResource::Sampler(&texture(buffer)?.sampler),
+                    _ => BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
+                };
+                group_entries.push(BindGroupEntry { binding, resource });
             }
-        };
-        let Some(args_group) = bucket.get(index).map(|cached| &cached.group) else {
-            return Err(BackendError::Gpu("bind group cache entry vanished".into()));
+            textured_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &native.args_layout, entries: &group_entries });
+            (&textured_group, None)
+        } else {
+            let bucket = bind_groups.buckets.entry(key).or_default();
+            let index = match bucket.iter().position(|cached| cached.matches(kernel.id, bindings())) {
+                Some(index) => index,
+                None => {
+                    let mut group_entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(args.len());
+                    for ((binding, _), (buffer, bytes)) in kernel.bound(args).zip(bindings()) {
+                        group_entries.push(BindGroupEntry {
+                            binding,
+                            resource: BindingResource::Buffer(BufferBinding { buffer: raw(buffer)?, offset: 0, size: std::num::NonZeroU64::new(bytes) }),
+                        });
+                    }
+                    let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &native.args_layout, entries: &group_entries });
+                    bucket.push(CachedGroup { kernel: kernel.id, entries: bindings().map(|(buffer, bytes)| (buffer.clone(), bytes)).collect(), group });
+                    bind_groups.len += 1;
+                    bucket.len().saturating_sub(1)
+                }
+            };
+            let Some(args_group) = bucket.get(index).map(|cached| &cached.group) else {
+                return Err(BackendError::Gpu("bind group cache entry vanished".into()));
+            };
+            (args_group, Some((key, index)))
         };
 
         // Record. Launches share one compute pass; a profiled launch gets a pass of its own that
@@ -1373,9 +1501,9 @@ impl Backend for WgpuBackend {
             bound.grid = grid;
         }
         // A group with uniforms is bound at new dynamic offsets by every launch.
-        if !offsets.is_empty() || bound.args != Some((key, index)) {
+        if !offsets.is_empty() || cached.is_none() || bound.args != cached {
             pass.set_bind_group(1, args_group, offsets.as_slice());
-            bound.args = Some((key, index));
+            bound.args = cached;
         }
         match (dispatch, indirect) {
             (Dispatch::Direct([x, y, z]), _) => pass.dispatch_workgroups(x, y, z),
@@ -1678,7 +1806,7 @@ mod tests {
         let (declared, used) = used_bindings(&module);
         assert_eq!((declared, used.as_deref()), (2, Some(&[false, true][..])));
 
-        let raw_kernel = backend.compile_kernel(&module, used.as_deref(), "double", true).expect("compiles");
+        let raw_kernel = backend.compile_kernel(&module, used.as_deref(), "double", KernelTrust::Trusted).expect("compiles");
         let infos = vec![module.bindings[1].info()];
         let kernel = CompiledKernel::new(Arc::from("double"), raw_kernel, infos, declared, used, [64, 1, 1]);
 

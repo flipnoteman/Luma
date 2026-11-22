@@ -2,10 +2,11 @@
 //! are lazy: the result is a one-element array, and the host reads it with [`Array::item`].
 
 use std::panic::Location;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::array::{Array, Failure, Storage};
-use crate::builtin::{Builtin, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_EPILOGUE, MAX_REDUCTIONS};
+use crate::builtin::{BinOp, Builtin, Epilogue, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_EPILOGUE, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
@@ -22,7 +23,8 @@ use crate::shape::Shape;
 /// expressions: they extend the reduction by an epilogue that its last pass applies, so the
 /// whole is as many launches as the reduction alone (see [`Array::fuse_step`]). Such a reduction
 /// shares the operand with the one it extends but never reads its buffer (which a write through
-/// another array may change): if both are used they run separately.
+/// another array may change): if both are used they run in one kernel with the others that are
+/// pending (see `jit::multireduce`), or separately where that is not possible.
 pub(crate) struct Reduced {
     operand: Arc<Node>,
     ops: ReduceList,
@@ -44,6 +46,39 @@ pub(crate) struct Reduced {
     /// The nodes that stand for the value in expressions (see [`Reduced::leaf`]): they get the buffer when the passes are
     /// recorded for any other reason, so that what reads them is a reader of that buffer (a write into it evaluates it first).
     leaves: std::sync::Mutex<Vec<std::sync::Weak<Node>>>,
+    /// The thread that made the reduction: only that one's reductions are recorded together (see [`crate::jit`]'s `multireduce`).
+    thread: std::thread::ThreadId,
+    /// Whether it was made while this thread was recording a step, whose reductions are never taken along.
+    in_recording: bool,
+    /// Set while the passes are being recorded.
+    forcing: AtomicBool,
+    /// Set when the group this reduction was recorded in was not recorded in one kernel because that was not due or ready (see
+    /// `Tuning::reduce_multi_after`): it is recorded alone, so that the others do not form other groups.
+    solo: AtomicBool,
+    /// Where the values are when they were recorded together with other reductions' (see [`PackRead`]), and the first one's index there.
+    pack: OnceLock<(Arc<PackRead>, usize)>,
+    /// The lines of an axis reduction (made by [`Array::reduce_axis`] and the methods built on it); `None` for a reduction of
+    /// the whole array. It has one op, and its buffer holds one value per line.
+    axis: Option<AxisGeom>,
+}
+
+/// Most kernels of reductions whose compile [`Reduced::build_ahead`] starts at once.
+const AHEAD_KERNELS: usize = 8;
+
+/// The lines an axis reduction runs over: `lines` lines of `n` cells, `stride` apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AxisGeom {
+    pub(crate) n: u32,
+    pub(crate) stride: u32,
+    pub(crate) lines: u32,
+}
+
+/// The buffer the reductions recorded in one kernel share (see `Reduced::record_merged`), and its words once a reader has
+/// copied them to the host: the first of those reductions that is read on the host reads them all, so that reading a dozen
+/// of them costs one round trip.
+struct PackRead {
+    pack: Arc<Storage>,
+    words: OnceLock<Vec<u32>>,
 }
 
 impl std::fmt::Debug for Reduced {
@@ -62,11 +97,27 @@ impl Reduced {
         &self.operand
     }
 
+    pub(crate) fn ops(&self) -> ReduceList {
+        self.ops
+    }
+
+    pub(crate) fn finish(&self) -> Finish {
+        self.finish
+    }
+
+    pub(crate) fn ty(&self) -> ElemTy {
+        self.ty
+    }
+
+    pub(crate) fn layout(&self) -> ElemLayout {
+        self.layout
+    }
+
     /// What a kernel that reduces `operand` itself needs to run this reduction (see
     /// `jit::until::force_with_record`): the operand, the ops, what is applied to their values.
     /// `None` unless it is a reduction of `f32`s that has not been recorded, and has not failed.
     pub(crate) fn fusable(&self) -> Option<(&Arc<Node>, ReduceList, Finish)> {
-        (self.wgsl == "f32" && self.ty == ElemTy::F32 && self.is_unforced() && self.failure().is_none()).then_some((&self.operand, self.ops, self.finish))
+        (self.axis.is_none() && self.wgsl == "f32" && self.ty == ElemTy::F32 && self.is_unforced() && self.failure().is_none()).then_some((&self.operand, self.ops, self.finish))
     }
 
     /// The error of the operand's evaluation or of the recorded passes, if any.
@@ -96,6 +147,184 @@ impl Reduced {
         self.result.get().is_none()
     }
 
+    /// Whether this reduction may be recorded together with others: a plain `f32`, `u32` or `i32` reduction of an
+    /// expression that is still pending, outside a recording.
+    pub(crate) fn mergeable(&self, ctx: &Context) -> bool {
+        ctx.tuning().reduce_multi >= 2 && !self.in_recording && !ctx.recording_here() && !ctx.check_finite() && self.eligible()
+    }
+
+    /// What [`Reduced::mergeable`] says without the context.
+    fn eligible(&self) -> bool {
+        self.axis.is_none()
+            && matches!(self.ty, ElemTy::F32 | ElemTy::U32 | ElemTy::I32)
+            && self.wgsl == self.ty.wgsl()
+            && !self.layout.is_packed()
+            && self.is_unforced()
+            && !self.solo.load(Ordering::Relaxed)
+            && self.operand.is_pending()
+            && self.operand.has_operands()
+            && self.failure().is_none()
+    }
+
+    /// Whether this reduction can be recorded together with `seed` (itself mergeable).
+    pub(crate) fn partners_with(&self, seed: &Reduced) -> bool {
+        self.thread == seed.thread
+            && !self.in_recording
+            && !self.forcing.load(Ordering::Relaxed)
+            && self.ty == seed.ty
+            && self.operand.len() == seed.operand.len()
+            && self.eligible()
+    }
+
+    /// Whether this is an axis reduction (see [`Reduced::axis`]), which is recorded with its own kind only.
+    pub(crate) fn is_axis(&self) -> bool {
+        self.axis.is_some()
+    }
+
+    /// Whether this axis reduction may be recorded together with others of the same lines: a plain `f32` reduction of an
+    /// expression that is still pending, outside a recording.
+    pub(crate) fn axis_mergeable(&self, ctx: &Context) -> bool {
+        ctx.tuning().reduce_multi >= 2 && !self.in_recording && !ctx.recording_here() && !ctx.check_finite() && self.axis_eligible()
+    }
+
+    /// What [`Reduced::axis_mergeable`] says without the context.
+    fn axis_eligible(&self) -> bool {
+        self.axis.is_some()
+            && self.ty == ElemTy::F32
+            && self.wgsl == "f32"
+            && self.is_unforced()
+            && self.operand.is_pending()
+            && self.operand.has_operands()
+            && self.failure().is_none()
+    }
+
+    /// Whether this axis reduction can be recorded together with the axis reduction `seed` (itself mergeable): the same lines.
+    pub(crate) fn axis_partners_with(&self, seed: &Reduced) -> bool {
+        self.thread == seed.thread && !self.in_recording && !self.forcing.load(Ordering::Relaxed) && self.axis == seed.axis && self.axis_eligible()
+    }
+
+    /// Whether this reduction can be recorded together with `seed`, which is mergeable (of whichever kind it is).
+    pub(crate) fn partner_of(&self, seed: &Reduced) -> bool {
+        if seed.axis.is_some() { self.axis_partners_with(seed) } else { self.partners_with(seed) }
+    }
+
+    /// The pending reductions to record together with this one, first running the reductions its operand
+    /// waits for. Empty if it cannot be merged.
+    pub(crate) fn merge_partners(&self, ctx: &Context) -> Vec<Arc<Reduced>> {
+        let mergeable = if self.axis.is_some() { self.axis_mergeable(ctx) } else { self.mergeable(ctx) };
+        if !mergeable || !ctx.jit().may_have_partners(self) {
+            return Vec::new();
+        }
+        let Some(leaves) = jit::unresolved_leaves(&self.operand) else { return Vec::new() };
+        if !leaves.is_empty() {
+            for leaf in leaves {
+                let _ = leaf.force();
+            }
+            // Running them may have left others (a reduction that depends on a reduction).
+            if !jit::unresolved_leaves(&self.operand).is_some_and(|leaves| leaves.is_empty()) {
+                return Vec::new();
+            }
+        }
+        ctx.jit().reduction_partners(ctx, self, &[])
+    }
+
+    /// Records the reductions `partners` (see [`Reduced::merge_partners`]) and this one in one kernel: this reduction's
+    /// buffer, once the others hold theirs. `None` (nothing recorded) if the program does not fit one kernel.
+    fn record_merged(&self, ctx: &Context, partners: &[Arc<Reduced>]) -> Option<Arc<Storage>> {
+        let all = || std::iter::once(self).chain(partners.iter().map(|partner| &**partner));
+        let members: Vec<jit::Member<'_>> = all().map(|reduced| jit::Member { operand: &reduced.operand, ops: reduced.ops, finish: reduced.finish }).collect();
+        let ahead = || self.build_ahead(ctx, partners);
+        let deferred = std::cell::Cell::new(false);
+        let pack = match jit::reduce_many(ctx, &members, self.ty, ctx.tuning().reduce_multi, jit::ManyMode::Run { ahead: &ahead, deferred: &deferred }) {
+            Ok(Some(pack)) => Arc::new(pack),
+            _ => {
+                if deferred.get() {
+                    for reduced in all() {
+                        reduced.solo.store(true, Ordering::Relaxed);
+                    }
+                }
+                return None;
+            }
+        };
+        drop(members);
+        let shared = Arc::new(PackRead { pack: Arc::clone(&pack), words: OnceLock::new() });
+        let mut offset = 0;
+        let mut own = None;
+        for (k, reduced) in all().enumerate() {
+            let count = reduced.ops.as_slice().len();
+            let window = Arc::new(Storage::window_of(&pack, offset, count));
+            let _ = reduced.pack.set((Arc::clone(&shared), offset));
+            offset += count;
+            if k == 0 {
+                own = Some(window);
+            } else {
+                reduced.adopt(window);
+            }
+        }
+        own
+    }
+
+    /// Whether this reduction would be the seed of a kernel recorded after the one of `first`, which it does not share a kernel with.
+    pub(crate) fn follows(&self, ctx: &Context, first: &Reduced) -> bool {
+        self.thread == first.thread && self.axis.is_none() && !self.in_recording && !self.forcing.load(Ordering::Relaxed) && self.mergeable(ctx)
+    }
+
+    /// Starts the compiles of the kernels the reductions pending after `first_group` (this one and its `partners`) will be
+    /// recorded in, if they are used in the order they were made, so that the compiles run side by side: a kernel that is not
+    /// compiled yet is waited for where it is launched, and the groups are recorded one after the other (a force monitor of
+    /// several dozen sums is a few kernels, each compiled from scratch the first time). Runs only when the kernel of the
+    /// first group was not built before, so it costs nothing where the kernels are known.
+    fn build_ahead(&self, ctx: &Context, partners: &[Arc<Reduced>]) {
+        let mut taken: Vec<*const Reduced> = std::iter::once(self as *const Reduced).chain(partners.iter().map(Arc::as_ptr)).collect();
+        for _ in 0..AHEAD_KERNELS {
+            let Some(seed) = ctx.jit().next_seed(ctx, self, &taken) else { return };
+            taken.push(Arc::as_ptr(&seed));
+            let others = ctx.jit().reduction_partners(ctx, &seed, &taken);
+            taken.extend(others.iter().map(Arc::as_ptr));
+            // Alone, a reduction is recorded by its own passes, not by this kind of kernel.
+            if others.is_empty() {
+                continue;
+            }
+            let members: Vec<jit::Member<'_>> =
+                std::iter::once(&*seed).chain(others.iter().map(|other| &**other)).map(|reduced| jit::Member { operand: &reduced.operand, ops: reduced.ops, finish: reduced.finish }).collect();
+            // A program that does not fit is left to the reductions' own turn.
+            let _ = jit::reduce_many(ctx, &members, seed.ty, ctx.tuning().reduce_multi, jit::ManyMode::BuildOnly);
+        }
+    }
+
+    /// Takes the buffer `storage` recorded together with another reduction as the result, if there is none yet.
+    fn adopt(&self, storage: Arc<Storage>) {
+        if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
+            for leaf in std::mem::take(&mut *crate::gpu::lock(&self.leaves)) {
+                if let Some(leaf) = leaf.upgrade() {
+                    leaf.finish_shared(Arc::clone(&storage));
+                }
+            }
+        }
+    }
+
+    /// The values of a reduction recorded together with others, read from the host copy of the buffer they share
+    /// (made by the first read of any of them); `None` if it was not, or its own buffer was made since (see
+    /// [`Storage::detach`]).
+    pub(crate) fn packed_values<T: GpuType>(&self, ctx: &Context) -> Option<Result<Vec<T>>> {
+        if std::mem::size_of::<T::Repr>() != 4 {
+            return None;
+        }
+        let (shared, offset) = self.pack.get()?;
+        if !self.result.get()?.as_ref().is_ok_and(|storage| storage.is_window()) {
+            return None;
+        }
+        let words = match shared.words.get() {
+            Some(words) => words,
+            None => match ctx.read_storage::<u32>(&shared.pack) {
+                Ok(words) => shared.words.get_or_init(|| words),
+                Err(error) => return Some(Err(error)),
+            },
+        };
+        let count = self.ops.as_slice().len();
+        Some(Ok(T::from_repr(bytemuck::pod_collect_to_vec(words.get(*offset..offset + count)?), count)))
+    }
+
     /// Records the passes into a new buffer (once) and returns it. Nothing is read back.
     pub(crate) fn force(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
         let result = self.record_once(ctx);
@@ -111,10 +340,38 @@ impl Reduced {
 
     /// [`Reduced::force`] for the node that stands for the value: it takes the buffer itself.
     pub(crate) fn record_once(&self, ctx: &Context) -> &std::result::Result<Arc<Storage>, Arc<LumaError>> {
-        self.result.get_or_init(|| self.record(ctx).map_err(Arc::new))
+        self.result.get_or_init(|| match crate::host::try_eval_reduced(self, ctx) {
+            Some(storage) => Ok(storage),
+            None => {
+                self.forcing.store(true, Ordering::Relaxed);
+                let partners = self.merge_partners(ctx);
+                let result = self.record(ctx, &partners).map_err(Arc::new);
+                self.forcing.store(false, Ordering::Relaxed);
+                result
+            }
+        })
     }
 
-    fn record(&self, ctx: &Context) -> Result<Arc<Storage>> {
+    /// The buffer of the reduction computed on the host, or the one already recorded; `None` if
+    /// it cannot run on the host and has not been recorded.
+    pub(crate) fn host_result(&self, ctx: &Context) -> Option<Arc<Storage>> {
+        if self.result.get().is_none()
+            && let Some(storage) = crate::host::try_eval_reduced(self, ctx)
+        {
+            let _ = self.result.set(Ok(storage));
+        }
+        self.result.get()?.as_ref().ok().cloned()
+    }
+
+    fn record(&self, ctx: &Context, partners: &[Arc<Reduced>]) -> Result<Arc<Storage>> {
+        if let Some(geom) = self.axis {
+            return self.record_axis(ctx, geom, partners);
+        }
+        if !partners.is_empty()
+            && let Some(storage) = self.record_merged(ctx, partners)
+        {
+            return Ok(storage);
+        }
         let count = self.ops.as_slice().len();
         let storage = Arc::new(Storage::new(ctx, count, self.layout));
         let pin = storage.pin(0)?;
@@ -124,8 +381,67 @@ impl Reduced {
         Ok(storage)
     }
 
+    /// Records this axis reduction into a buffer of one value per line, in one kernel with the axis reductions `partners` of the
+    /// same lines (see [`Reduced::merge_partners`]) where the program of their operands fits one: each of them then holds its own buffer.
+    fn record_axis(&self, ctx: &Context, geom: AxisGeom, partners: &[Arc<Reduced>]) -> Result<Arc<Storage>> {
+        let all: Vec<&Reduced> = std::iter::once(self).chain(partners.iter().map(|partner| &**partner)).collect();
+        let bytes = geom.lines as u64 * 4;
+        let plan = if all.len() > 1 {
+            let operands: Vec<&Arc<Node>> = all.iter().map(|reduced| &reduced.operand).collect();
+            jit::axis_plan(ctx, &operands, all.len())
+        } else {
+            None
+        };
+        // Without a plan the others are left for their own turn.
+        let all = if plan.is_some() { all } else { vec![self] };
+        let storages: Vec<Arc<Storage>> = all.iter().map(|reduced| Arc::new(Storage::new(ctx, geom.lines as usize, reduced.layout))).collect();
+        let pins = storages.iter().map(|storage| storage.pin(0)).collect::<Result<Vec<_>>>()?;
+        let outs: Vec<crate::scan::Bound<'_>> = pins.iter().map(|pin| crate::scan::Bound { buffer: pin.buffer(), bytes }).collect();
+        match plan {
+            Some(plan) => {
+                let ops: Vec<ReduceOp> = all.iter().map(|reduced| reduced.ops.as_slice()[0]).collect();
+                crate::scan::reduce_axis_planned(ctx, &plan, geom, &ops, &outs).map_err(Failure::into_error)?;
+                drop(outs);
+                drop(pins);
+                for (reduced, storage) in all.iter().zip(&storages).skip(1) {
+                    reduced.adopt(Arc::clone(storage));
+                }
+            }
+            None => crate::scan::reduce_axis_node(ctx, &self.operand, geom, self.ops.as_slice()[0], outs[0]).map_err(Failure::into_error)?,
+        }
+        Ok(Arc::clone(&storages[0]))
+    }
+
     /// The values on the host, without keeping them on the GPU.
     pub(crate) fn read<T: GpuType>(&self, ctx: &Context) -> Result<Vec<T>> {
+        if let Some(geom) = self.axis {
+            // One value per line: recorded (with the axis reductions that are pending) and read like any array.
+            let storage = self.force(ctx).as_ref().map_err(|error| LumaError::clone(error))?;
+            return Ok(T::from_repr(ctx.read_storage::<T::Repr>(storage)?, geom.lines as usize));
+        }
+        if std::mem::size_of::<T::Repr>() == 4
+            && let Some(words) = crate::host::reduced_words(self, ctx)
+        {
+            return Ok(T::from_repr(bytemuck::pod_collect_to_vec(&words), self.ops.as_slice().len()));
+        }
+        // Read with others that are pending, in one kernel, which records them all (before the speculation, which
+        // records one reduction at a time).
+        if self.is_unforced() && std::mem::size_of::<T::Repr>() == 4 {
+            let partners = self.merge_partners(ctx);
+            if !partners.is_empty() {
+                self.forcing.store(true, Ordering::Relaxed);
+                let result = self.result.get_or_init(|| self.record(ctx, &partners).map_err(Arc::new));
+                self.forcing.store(false, Ordering::Relaxed);
+                let storage = result.as_ref().map_err(|error| LumaError::clone(error))?;
+                let values = match self.packed_values::<T>(ctx) {
+                    Some(values) => values?,
+                    None => T::from_repr(ctx.read_storage::<T::Repr>(storage)?, self.ops.as_slice().len()),
+                };
+                // The leaves that stand for this value in expressions get its buffer, as `force` does.
+                self.force(ctx);
+                return Ok(values);
+            }
+        }
         let array = Array::<T>::from_node(ctx, Shape::from(self.operand.len()), Arc::clone(&self.operand));
         reduce_array(&array, self.wgsl, self.ops, self.finish, !self.buffer)
     }
@@ -151,6 +467,23 @@ impl<T: Numeric> Array<T> {
     #[track_caller]
     pub fn max(&self) -> Array<T> {
         self.reduce_at([Reduction::Max], "max", Location::caller())
+    }
+
+    /// The product of all elements, as a lazy one-element array (see [`Array::sum`]): NaN if any
+    /// element is NaN, and (as for the sum) `u32` and `i32` products wrap around. Float products combine in trees like sums do, so the rounding error stays that
+    /// of `n` multiplications; a partial product that leaves the range of the type becomes
+    /// infinity (or 0) even where later factors would bring it back, and which partial products
+    /// there are depends on the grouping. Fuses with the expression behind it
+    /// (`(&x + 1.0).prod()` is one pass) and with scalar operations on the result.
+    #[track_caller]
+    pub fn prod(&self) -> Array<T> {
+        self.reduce_at([Reduction::Product], "prod", Location::caller())
+    }
+
+    /// The product of all elements: the same as [`Array::prod`] (ArrayFire's name).
+    #[track_caller]
+    pub fn product(&self) -> Array<T> {
+        self.reduce_at([Reduction::Product], "product", Location::caller())
     }
 
     /// Several reductions of the array in one pass over it (up to four), as an array of `N`
@@ -264,8 +597,29 @@ impl<T: ScalarType> Array<T> {
             // write. The reader is a copy of the operand that the reduction's first pass fuses.
             let args = [operand, Src::unused(), Src::unused()];
             let reader = jit::create(ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::of::<T>()?), args, name, location)?;
-            let reduced = Reduced { operand: reader, ops, wgsl, elem, layout: T::LAYOUT, buffer, finish: Finish::default(), result: OnceLock::new(), ty: ElemTy::of::<T>()?, name, location, leaves: Default::default() };
-            return Ok(Array::from_reduced(ctx, shape, Arc::new(reduced)));
+            let reduced = Reduced {
+                operand: reader,
+                ops,
+                wgsl,
+                elem,
+                layout: T::LAYOUT,
+                buffer,
+                finish: Finish::default(),
+                result: OnceLock::new(),
+                ty: ElemTy::of::<T>()?,
+                name,
+                location,
+                leaves: Default::default(),
+                thread: std::thread::current().id(),
+                in_recording: ctx.recording_here(),
+                forcing: AtomicBool::new(false),
+                solo: AtomicBool::new(false),
+                pack: OnceLock::new(),
+                axis: None,
+            };
+            let reduced = Arc::new(reduced);
+            ctx.jit().register_reduction(&reduced);
+            return Ok(Array::from_reduced(ctx, shape, reduced));
         }
         // Nothing is left to fuse: record the passes now.
         let storage = Arc::new(Storage::new(ctx, shape.len(), T::LAYOUT));
@@ -275,16 +629,77 @@ impl<T: ScalarType> Array<T> {
         Ok(Array::from_storage(ctx, shape, storage))
     }
 
+    /// The reductions `ops` along the lines `geom` of this array as lazy arrays of `shape` (one value per line), `None` where they
+    /// cannot be left pending: only `f32` reductions of an array on a GPU backend (of at least `Tuning::axis_defer_cells` cells; on the CPU
+    /// backend of an expression of at least `Tuning::axis_defer_weight` operations), outside a recording, with the finite check off.
+    /// Recorded when one is used, together with the others that are pending over the same lines (see `jit::multireduce`), so that
+    /// each of them is the value a reduction of its own gives (the same bits).
+    pub(crate) fn defer_axis(&self, ops: &[ReduceOp], geom: AxisGeom, shape: Shape, name: &'static str, location: &'static Location<'static>) -> Option<Vec<Array<T>>> {
+        let ctx = self.context();
+        if ElemTy::of::<T>().ok()? != ElemTy::F32
+            || T::reduce_type() != "f32"
+            || ctx.tuning().reduce_multi < 2
+            || ctx.recording_here()
+            || ctx.check_finite()
+            || ctx.is_profiling()
+            || self.error().is_some()
+            || (ctx.can_run_on_host() && self.len() <= crate::host::MAX_HOST_ELEMS)
+            || self.len() < ctx.tuning().axis_defer_cells
+            || (ctx.tuning().axis_defer_weight > 0 && self.pending().is_none_or(|node| node.weight() < f64::from(ctx.tuning().axis_defer_weight)))
+        {
+            return None;
+        }
+        // The reductions read the operand later, so they are registered with it like any other reader (see `run_reduce`);
+        // the ops of one call read one copy of it.
+        let args = [self.src().ok()?, Src::unused(), Src::unused()];
+        let reader = jit::create(ctx, self.len(), Op::new(OpKind::Unary(UnOp::Id), ElemTy::F32), args, name, location).ok()?;
+        let arrays = ops
+            .iter()
+            .map(|&op| {
+                let reduced = Arc::new(Reduced {
+                    operand: Arc::clone(&reader),
+                    ops: ReduceList::new(&[op]),
+                    wgsl: "f32",
+                    elem: 4,
+                    layout: T::LAYOUT,
+                    buffer: false,
+                    finish: Finish::default(),
+                    result: OnceLock::new(),
+                    ty: ElemTy::F32,
+                    name,
+                    location,
+                    leaves: Default::default(),
+                    thread: std::thread::current().id(),
+                    in_recording: false,
+                    forcing: AtomicBool::new(false),
+                    solo: AtomicBool::new(false),
+                    pack: OnceLock::new(),
+                    axis: Some(geom),
+                });
+                ctx.jit().register_reduction(&reduced);
+                Array::from_reduced(ctx, shape, reduced)
+            })
+            .collect();
+        Some(arrays)
+    }
+
     /// This array, a reduction that has not been recorded yet, extended by `step` (with the
     /// value `word` of its scalar operand, as `f32` bits), as an array of `O`; `None` if the
     /// step cannot run inside the reduction's last pass: the array is not such a reduction of
     /// `f32`, or it has run or failed, or it has [`MAX_EPILOGUE`] steps already.
     pub(crate) fn fuse_step<O: ScalarType>(&self, step: EpilogueStep, word: u32) -> Option<Array<O>> {
         let reduced = self.reduced()?;
-        if reduced.wgsl != "f32" || !reduced.is_unforced() || reduced.failure().is_some() {
+        if reduced.axis.is_some() || reduced.wgsl != "f32" || !reduced.is_unforced() || reduced.failure().is_some() {
             return None;
         }
         if ElemTy::of::<T>().ok()? != ElemTy::F32 || ElemTy::of::<O>().ok()? != ElemTy::F32 || step == EpilogueStep::Unary(UnOp::Id) {
+            return None;
+        }
+        let helper = match step {
+            EpilogueStep::Unary(op) => op.needs_helper(),
+            EpilogueStep::Binary { op, .. } => op.needs_helper() || op == BinOp::Mod,
+        };
+        if helper {
             return None;
         }
         let mut finish = reduced.finish;
@@ -305,8 +720,16 @@ impl<T: ScalarType> Array<T> {
             name: reduced.name,
             location: reduced.location,
             leaves: Default::default(),
+            thread: std::thread::current().id(),
+            in_recording: self.context().recording_here(),
+            forcing: AtomicBool::new(false),
+            solo: AtomicBool::new(false),
+            pack: OnceLock::new(),
+            axis: None,
         };
-        Some(Array::from_reduced(self.context(), self.shape(), Arc::new(derived)))
+        let derived = Arc::new(derived);
+        self.context().jit().register_reduction(&derived);
+        Some(Array::from_reduced(self.context(), self.shape(), derived))
     }
 }
 
@@ -361,6 +784,8 @@ pub enum Reduction {
     Max,
     /// The sum of the squared elements.
     SumOfSquares,
+    /// The product of the elements (a NaN anywhere gives NaN, integers wrap around).
+    Product,
 }
 
 impl Reduction {
@@ -370,6 +795,7 @@ impl Reduction {
             Reduction::Min => ReduceOp::Min,
             Reduction::Max => ReduceOp::Max,
             Reduction::SumOfSquares => ReduceOp::SumSquares,
+            Reduction::Product => ReduceOp::Prod,
         }
     }
 }
@@ -399,13 +825,8 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
     let count = ops.as_slice().len() as u64;
     // The results of a bit-packed type are the words of a one-element array (see `Reduced`).
     debug_assert!(!bits || count == 1);
-    if let Some(node) = array.pending()
-        && speculate
-        && finish.epilogue.is_empty()
-        && matches!(wgsl, "f32" | "u32")
-        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, bits, elem, wgsl, ops, scratch, None, finish))
-    {
-        return Ok(T::from_repr(bytemuck::cast_slice(&words?).to_vec(), count as usize));
+    if let Some(values) = speculated(array, wgsl, ops, finish, speculate) {
+        return values;
     }
     let mut scratch = Scratch::new(ctx);
     let current = reduce_into(array, bits, elem, wgsl, ops, &mut scratch, None, finish)?;
@@ -414,6 +835,22 @@ fn reduce_array<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceLis
         return Err(LumaError::Gpu("reduction results are missing".into()));
     }
     Ok(values)
+}
+
+/// The values of the reduction of `array` that the speculation of [`crate::jit`] has ready (see [`reduce_array`]), if it has.
+fn speculated<T: GpuType>(array: &Array<T>, wgsl: &'static str, ops: ReduceList, finish: Finish, speculate: bool) -> Option<Result<Vec<T>>> {
+    let elem = T::LAYOUT.stride() as u64;
+    let bits = T::LAYOUT.is_packed();
+    let count = ops.as_slice().len();
+    if let Some(node) = array.pending()
+        && speculate
+        && finish.epilogue.is_empty()
+        && matches!(wgsl, "f32" | "u32")
+        && let Some(words) = jit::speculate::readback(node, ops, |scratch| reduce_into(array, bits, elem, wgsl, ops, scratch, None, finish))
+    {
+        return Some(words.map(|words| T::from_repr(bytemuck::cast_slice(&words).to_vec(), count)));
+    }
+    None
 }
 
 /// Runs passes over `current` (`n` elements, or `n` per op once `per_op`) until one element per
@@ -427,12 +864,78 @@ pub(crate) fn finish_passes(
     ops: ReduceList,
     wgsl: &'static str,
     elem: u64,
+    current: luma_core::Buffer,
+    n: u32,
+    per_op: bool,
+    target: Option<&luma_core::Buffer>,
+    finish: Finish,
+) -> Result<luma_core::Buffer> {
+    finish_passes_gated(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish, None)
+}
+
+/// [`finish_passes`] where the last pass also runs a gate (its id and the arguments of its
+/// buffers, see `ReduceList::with_gate`) on the final value; one op of `f32`s over partial results
+/// (`per_op`) that are more than one value, so that the last pass is a pass of one group.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_passes_gated(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    ops: ReduceList,
+    wgsl: &'static str,
+    elem: u64,
+    current: luma_core::Buffer,
+    n: u32,
+    per_op: bool,
+    target: Option<&luma_core::Buffer>,
+    finish: Finish,
+    gate: Option<(crate::builtin::GateId, &[RawArg<'_>])>,
+) -> Result<luma_core::Buffer> {
+    let mut scalars = [0u32; MAX_EPILOGUE];
+    let mut used = 0;
+    for word in finish.uniform_words() {
+        scalars[used] = word;
+        used += 1;
+    }
+    passes(ctx, scratch, ops, wgsl, elem, current, n, per_op, target, finish.epilogue, &scalars[..used], gate)
+}
+
+/// [`finish_passes`] for the partial results of a first pass of a [merged](ReduceList::merged)
+/// list (`n` per op, `ops` the list of the first pass): the last pass applies the epilogues of the
+/// list, the scalars of which are `scalars`, in the order of its uniform fields.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_passes_merged(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    ops: ReduceList,
+    wgsl: &'static str,
+    elem: u64,
+    current: luma_core::Buffer,
+    n: u32,
+    target: &luma_core::Buffer,
+    scalars: &[u32],
+) -> Result<luma_core::Buffer> {
+    passes(ctx, scratch, ops, wgsl, elem, current, n, true, Some(target), Epilogue::default(), scalars, None)
+}
+
+/// The passes of [`finish_passes`]: the last one applies `epilogue` (the epilogues of a merged list)
+/// with the scalar operands `scalars`, and runs `gate` if there is one (see
+/// [`finish_passes_gated`]).
+#[allow(clippy::too_many_arguments)]
+fn passes(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    ops: ReduceList,
+    wgsl: &'static str,
+    elem: u64,
     mut current: luma_core::Buffer,
     mut n: u32,
     mut per_op: bool,
     target: Option<&luma_core::Buffer>,
-    finish: Finish,
+    epilogue: Epilogue,
+    scalars: &[u32],
+    gate: Option<(crate::builtin::GateId, &[RawArg<'_>])>,
 ) -> Result<luma_core::Buffer> {
+    debug_assert!(gate.is_none() || (per_op && n > 1 && ops.as_slice().len() == 1), "a gate runs in a last pass over partial results");
     let count = ops.as_slice().len() as u64;
     while !per_op || n > 1 {
         let groups = ctx.tuning().reduce_groups(n);
@@ -441,8 +944,12 @@ pub(crate) fn finish_passes(
         // first pass that finishes the reduction itself.
         let single_pass = !per_op && groups > 1 && ctx.tuning().single_pass_reduce;
         let last = groups == 1 || single_pass;
-        let list = if last { list.with_epilogue(finish.epilogue) } else { list };
+        let list = if last { list.finished(epilogue) } else { list };
         let list = if single_pass { list.single_pass() } else { list };
+        let list = match gate {
+            Some((id, _)) if last => list.with_gate(id),
+            _ => list,
+        };
         let in_bytes = u64::from(n) * elem * if per_op { count } else { 1 };
         // The last pass leaves one element per op: into `target` if there is one.
         let out = match target {
@@ -452,14 +959,12 @@ pub(crate) fn finish_passes(
         let core = ctx.builtin(Builtin::Reduce(list, per_op), wgsl)?;
         // The uniform: `n`; the double-float pass has a second field, the guard of its arithmetic
         // (always 0); the last pass the scalars of the epilogue.
-        let mut words = [0u32; 2 + MAX_EPILOGUE];
+        let mut words = [0u32; 2 + MAX_ACCS * MAX_EPILOGUE];
         words[0] = n;
         let mut used = if wgsl == "df32" { 2 } else { 1 };
         if last {
-            for word in finish.uniform_words() {
-                words[used] = word;
-                used += 1;
-            }
+            words[used..used + scalars.len()].copy_from_slice(scalars);
+            used += scalars.len();
         }
         ctx.jit().note_reduce_pass();
         if single_pass {
@@ -482,16 +987,13 @@ pub(crate) fn finish_passes(
             )?;
             return Ok(values);
         }
-        ctx.launch(
-            &core,
-            fold_workgroups(ctx, groups)?,
-            [n, 1, 1],
-            &[
-                RawArg::write(&out, u64::from(groups) * elem * count),
-                RawArg::read(&current, in_bytes),
-                RawArg::Uniform(bytemuck::cast_slice(&words[..used])),
-            ],
-        )?;
+        let mut raw = vec![RawArg::write(&out, u64::from(groups) * elem * count), RawArg::read(&current, in_bytes)];
+        if let Some((_, args)) = gate.filter(|_| last) {
+            raw.extend_from_slice(args);
+        }
+        raw.push(RawArg::Uniform(bytemuck::cast_slice(&words[..used])));
+        ctx.launch(&core, fold_workgroups(ctx, groups)?, [n, 1, 1], &raw)?;
+        drop(raw);
         current = out;
         n = groups;
         per_op = true;

@@ -279,6 +279,38 @@ impl Storage {
     pub(crate) fn is_alias(&self) -> bool {
         self.owner.is_some()
     }
+
+    /// Calls `f` with the bytes of the storage when they are host-readable now (one segment, held
+    /// in host memory or in an idle directly accessible buffer).
+    pub(crate) fn with_host_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if self.segments.len() != 1 || self.is_window() {
+            return None;
+        }
+        self.segments[0].with_host_bytes(f)
+    }
+
+    /// [`Storage::with_host_bytes`] with write access; pending readers are evaluated first and an
+    /// alias or window is never written.
+    pub(crate) fn with_host_bytes_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        if self.segments.len() != 1 || self.is_window() || self.is_alias() {
+            return None;
+        }
+        self.readers.flush();
+        self.segments[0].with_host_bytes_mut(f)
+    }
+
+    /// A storage of `len` elements of `layout` in a mappable buffer that `f` fills in place. Only
+    /// with [`Context::zero_copy`], which is all [`Context::can_run_on_host`] allows.
+    pub(crate) fn alloc_host(ctx: &Context, len: usize, layout: ElemLayout, f: impl FnOnce(&mut [u8])) -> Result<Arc<Storage>> {
+        let bytes = layout.bytes(len);
+        ctx.make_room(bytes)?;
+        let buffer = ctx.alloc_host_buffer(bytes)?;
+        let ptr = ctx.host_ptr(&buffer, bytes).expect("a fresh mappable buffer has a host pointer");
+        // SAFETY: `buffer` holds at least `bytes` bytes and no GPU command touches it.
+        f(unsafe { std::slice::from_raw_parts_mut(ptr, bytes as usize) });
+        let segment = Segment::filled(ctx, bytes, buffer);
+        Ok(Arc::new(Storage::with_segments(ctx, len, layout, Box::new([segment]), None)))
+    }
 }
 
 #[derive(Debug)]
@@ -541,6 +573,14 @@ impl<T: GpuType> Array<T> {
         }
     }
 
+    /// The array's storage if it is already valid; never evaluates a lazy array.
+    pub(crate) fn storage_if_valid(&self) -> Option<&Arc<Storage>> {
+        match &self.repr {
+            Repr::Valid(storage) => Some(storage),
+            _ => None,
+        }
+    }
+
     /// The array's storage, evaluating the array first if it is still lazy (this records the
     /// work; it does not wait for the GPU). Fails with the reason the array is not valid.
     pub(crate) fn storage(&self) -> std::result::Result<&Arc<Storage>, Failure> {
@@ -627,6 +667,18 @@ impl<T: GpuType> Array<T> {
         }
     }
 
+    /// Whether this array is the placeholder `probe` of a traced step handed back unchanged: its
+    /// buffer, or a copy of it that has not run yet (`&x * 1.0`), which there is no need to run.
+    pub(crate) fn passes_through(&self, probe: &Arc<Storage>) -> bool {
+        if self.view.is_some() || self.read_view {
+            return false;
+        }
+        match self.pending() {
+            Some(node) => node.is_copy_of(probe),
+            None => matches!(&self.repr, Repr::Valid(storage) if Arc::ptr_eq(storage, probe)),
+        }
+    }
+
     /// The reduction this array is (recorded into a buffer or not), if it is one.
     pub(crate) fn reduced(&self) -> Option<&Arc<Reduced>> {
         match &self.repr {
@@ -692,10 +744,13 @@ impl<T: GpuType> Array<T> {
     /// finished it, so this is where a poisoned array's error (or an error the GPU reported
     /// while running the batch) comes out.
     pub fn to_vec(&self) -> Result<Vec<T>> {
-        if let Repr::Reduced(reduced) = &self.repr
-            && reduced.is_unforced()
-        {
-            return reduced.read::<T>(&self.ctx);
+        if let Repr::Reduced(reduced) = &self.repr {
+            if reduced.is_unforced() {
+                return reduced.read::<T>(&self.ctx);
+            }
+            if let Some(values) = reduced.packed_values::<T>(&self.ctx) {
+                return values;
+            }
         }
         let storage = self.storage().map_err(Failure::into_error)?;
         Ok(T::from_repr(self.ctx.read_storage::<T::Repr>(storage)?, self.len()))
@@ -706,14 +761,15 @@ impl<T: GpuType> Array<T> {
     /// which cost about as much as the transfer itself on large arrays: prefer this when
     /// reading results back repeatedly.
     pub fn read_into(&self, out: &mut [T]) -> Result<()> {
-        if let Repr::Reduced(reduced) = &self.repr
-            && reduced.is_unforced()
-        {
-            if out.len() != self.len() {
-                return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
+        if let Repr::Reduced(reduced) = &self.repr {
+            let values = if reduced.is_unforced() { Some(reduced.read::<T>(&self.ctx)) } else { reduced.packed_values::<T>(&self.ctx) };
+            if let Some(values) = values {
+                if out.len() != self.len() {
+                    return Err(LumaError::LengthMismatch { expected: self.len(), actual: out.len() });
+                }
+                out.copy_from_slice(&values?);
+                return Ok(());
             }
-            out.copy_from_slice(&reduced.read::<T>(&self.ctx)?);
-            return Ok(());
         }
         let storage = self.storage().map_err(Failure::into_error)?;
         if out.len() != self.len() {
@@ -876,6 +932,20 @@ impl<T: GpuType> Array<T> {
                 ctx: self.ctx.clone(),
                 shape,
                 repr: Repr::Lazy(held.share()),
+                view: None,
+                read_view: self.read_view,
+                _marker: PhantomData,
+            });
+        }
+        // A reduction that has not been recorded is the same pending reduction in the new shape: recorded
+        // when either is used, together with the others that are pending (see `jit::multireduce`).
+        if let Repr::Reduced(reduced) = &self.repr
+            && reduced.is_unforced()
+        {
+            return Ok(Array {
+                ctx: self.ctx.clone(),
+                shape,
+                repr: Repr::Reduced(Arc::clone(reduced)),
                 view: None,
                 read_view: self.read_view,
                 _marker: PhantomData,

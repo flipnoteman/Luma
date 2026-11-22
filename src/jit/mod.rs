@@ -45,7 +45,9 @@
 //!   multi-output kernel, and the rest is flattened again (up to four times).
 //! * Operations that are the same (same operation, length and operands, scalars by value) are one
 //!   node: `create` looks them up in a table of weak references that is dropped whenever a buffer
-//!   is written (`JitState::note_write`), and skips nodes computed inside another kernel. A
+//!   is written (`JitState::note_write`), and skips nodes computed inside another kernel. The
+//!   lookup is skipped while a node operand has no consumer yet (an equal operation would be one),
+//!   and the masks of region assignments are remembered by their box (`MaskKey`). A
 //!   fused kernel computes a shared node once; a pending node that an expression outside the one
 //!   being flattened also reads is evaluated first only if computing it once more costs more than
 //!   writing and reading it back (`worth_storing`, the rule of circular shifts; the work of an
@@ -151,16 +153,20 @@
 //! the newest call become *loop leaves* that stand for the step applied to the previous ones, so
 //! the pending graph stays one step deep and the postponed steps run at once (see [`looped`]).
 
+mod bits;
 pub(crate) mod assign;
 mod codegen;
+mod coarsen;
 pub(crate) mod cost;
 mod inline;
 mod kirgen;
 mod launch;
 mod looped;
 mod operator;
+mod multireduce;
 mod pack;
 mod params;
+mod plancache;
 
 /// Whether an array of `len` elements has indices that need the exact division (see `params::DivRemSpec`).
 pub(crate) fn is_wide(len: usize) -> bool {
@@ -179,13 +185,15 @@ mod until;
 pub(crate) mod transpose;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod plancache_tests;
 
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::array::{Failure, Storage};
-use crate::builtin::{BinOp, Class, CmpOp, UnOp};
+use crate::builtin::{BinOp, Class, CmpOp, Part, UnOp};
 use crate::context::Context;
 use crate::error::{LumaError, Result};
 use crate::gpu::built::BuildCache;
@@ -201,11 +209,12 @@ use looped::LoopPlan;
 use program::Instr;
 pub(crate) use program::AtomicOp;
 
-pub(crate) use launch::{axis_reduce, check_finite, evaluate, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, run_loop, solve, MatmulKernel, MatmulSide, PartSide};
+pub(crate) use launch::{axis_plan, axis_reduce, axis_reduce_planned, AxisPlan, check_finite, evaluate, evaluate_for_reuse, is_recomputed, evaluate_group, evaluate_into, force_group, matmul, radix_pass, reduce_first_pass, reduce_many, run_loop, solve, stored_along_k, ManyMode, MatmulKernel, MatmulSide, Member, PartSide};
+pub(crate) use multireduce::unresolved_leaves;
 pub(crate) use operator::{operator_source, Operator};
 pub(crate) use readers::Readers;
 pub(crate) use rerun::{Attempt, Site};
-pub(crate) use replay::{force, GraphBuilder, GraphCache, Plan, Stepper, Trace, PAYING_REPLAYS};
+pub(crate) use replay::{force, force_stepped, GraphBuilder, GraphCache, Plan, Stepper, Trace, PAYING_REPLAYS};
 pub(crate) use stencil::plan as stencil_plan;
 pub(crate) use until::{force_with_record, next_block, run_until, FoldGate, FIRST_BLOCK};
 #[cfg(test)]
@@ -286,10 +295,23 @@ pub(crate) enum ElemTy {
     /// `ElemLayout::PACKED`); the accessors `kirgen::Lower::load_in` / `kirgen::Lower::store` and the
     /// packed store of `kirgen::Build::packed` are where the layout is known.
     Bool,
+    /// 8- and 16-bit integers: a `u32` (unsigned) or `i32` (signed) register holding the value
+    /// (zero- or sign-extended, always in the range of the type), 4 or 2 elements to a `u32`
+    /// word in buffers (`ElemLayout::BYTE`, `ElemLayout::HALF`). The arithmetic wraps: every
+    /// operation that can leave the range narrows its result again (`kirgen::Lower::narrow`),
+    /// and the accessors `kirgen::Lower::load_in` / `kirgen::Lower::store` and the word-wise
+    /// store of `kirgen::Build::plain_words` are where the layout is known.
+    U8,
+    I8,
+    U16,
+    I16,
     /// 64-bit float (needs `luma_core::Features::SHADER_F64`).
     F64,
     /// Double-float: a `vec2<f32>` `(hi, lo)` with library arithmetic (see `builtin::df_library`).
     Df32,
+    /// Complex single precision: a `vec2<f32>` `(re, im)` with the arithmetic of
+    /// `builtin::complex_library`.
+    C32,
 }
 
 impl ElemTy {
@@ -306,10 +328,20 @@ impl ElemTy {
             Some(ElemTy::I32)
         } else if id == TypeId::of::<bool>() {
             Some(ElemTy::Bool)
+        } else if id == TypeId::of::<u8>() {
+            Some(ElemTy::U8)
+        } else if id == TypeId::of::<i8>() {
+            Some(ElemTy::I8)
+        } else if id == TypeId::of::<u16>() {
+            Some(ElemTy::U16)
+        } else if id == TypeId::of::<i16>() {
+            Some(ElemTy::I16)
         } else if id == TypeId::of::<f64>() {
             Some(ElemTy::F64)
         } else if id == TypeId::of::<crate::gpu_type::Df32>() {
             Some(ElemTy::Df32)
+        } else if id == TypeId::of::<crate::complex::C32>() {
+            Some(ElemTy::C32)
         } else {
             None
         }
@@ -322,11 +354,44 @@ impl ElemTy {
     pub(crate) fn wgsl(self) -> &'static str {
         match self {
             ElemTy::F32 => "f32",
-            ElemTy::U32 | ElemTy::Bool => "u32",
-            ElemTy::I32 => "i32",
+            ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => "u32",
+            ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => "i32",
             ElemTy::F64 => "f64",
-            ElemTy::Df32 => "vec2<f32>",
+            ElemTy::Df32 | ElemTy::C32 => "vec2<f32>",
         }
+    }
+
+    /// Whether this is an 8-bit or 16-bit integer.
+    pub(crate) fn is_small(self) -> bool {
+        matches!(self, ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16)
+    }
+
+    /// Whether elements of this type share words in buffers: the bits of a `bool`, the small integers.
+    pub(crate) fn is_packed(self) -> bool {
+        self == ElemTy::Bool || self.is_small()
+    }
+
+    /// Bits of a small integer (0 for any other type).
+    pub(crate) fn small_bits(self) -> u32 {
+        match self {
+            ElemTy::U8 | ElemTy::I8 => 8,
+            ElemTy::U16 | ElemTy::I16 => 16,
+            _ => 0,
+        }
+    }
+
+    /// `log2` of the small integers to a word: 2 for bytes, 1 for halves.
+    pub(crate) fn small_shift(self) -> u32 {
+        match self.small_bits() {
+            8 => 2,
+            16 => 1,
+            _ => 0,
+        }
+    }
+
+    /// Whether this is a signed small integer.
+    pub(crate) fn is_small_signed(self) -> bool {
+        matches!(self, ElemTy::I8 | ElemTy::I16)
     }
 
     /// How elements of this type sit in a buffer; it sets the elements per segment of an array
@@ -335,7 +400,9 @@ impl ElemTy {
         match self {
             ElemTy::F32 | ElemTy::U32 | ElemTy::I32 => ElemLayout::plain(4),
             ElemTy::Bool => ElemLayout::PACKED,
-            ElemTy::F64 | ElemTy::Df32 => ElemLayout::plain(8),
+            ElemTy::U8 | ElemTy::I8 => ElemLayout::BYTE,
+            ElemTy::U16 | ElemTy::I16 => ElemLayout::HALF,
+            ElemTy::F64 | ElemTy::Df32 | ElemTy::C32 => ElemLayout::plain(8),
         }
     }
 
@@ -348,6 +415,8 @@ impl ElemTy {
     pub(crate) fn traffic(self) -> f64 {
         match self {
             ElemTy::Bool => 0.125,
+            ElemTy::U8 | ElemTy::I8 => 1.0,
+            ElemTy::U16 | ElemTy::I16 => 2.0,
             other => other.layout().stride() as f64,
         }
     }
@@ -355,8 +424,8 @@ impl ElemTy {
     /// How many `f32` uniform slots a scalar of this type takes (see `Flattener::operand`).
     pub(crate) fn slots(self) -> usize {
         match self {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => 1,
-            ElemTy::Df32 => 2,
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => 1,
+            ElemTy::Df32 | ElemTy::C32 => 2,
             ElemTy::F64 => 3,
         }
     }
@@ -368,8 +437,13 @@ impl ElemTy {
             ElemTy::U32 => "u32",
             ElemTy::I32 => "i32",
             ElemTy::Bool => "bool",
+            ElemTy::U8 => "u8",
+            ElemTy::I8 => "i8",
+            ElemTy::U16 => "u16",
+            ElemTy::I16 => "i16",
             ElemTy::F64 => "f64",
             ElemTy::Df32 => "Df32",
+            ElemTy::C32 => "C32",
         }
     }
 }
@@ -387,6 +461,10 @@ pub(crate) enum OpKind {
     Powf,
     /// `clamp(x, lo, hi)`; operands: x, lo, hi (scalars).
     Clamp,
+    /// A real quantity of a complex operand (see [`Part`]); the result is an [`ElemTy::F32`].
+    Part(Part),
+    /// `complex(re, im)`; operands: re, im (of type `F32`; the op's type); the result is a [`ElemTy::C32`].
+    Make,
     /// `cond != 0 ? a : b`; operands: condition (a `bool`, or any `u32` word: non-zero is true), a, b.
     Select,
     /// Circular shift of a materialized array; operand 0 is its buffer (see [`ShiftKind`]).
@@ -458,11 +536,29 @@ pub(crate) struct AxisMap {
 }
 
 /// Reads an array of dims `src` as an array of dims `out`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ViewMap {
     pub(crate) src: [u32; 4],
     pub(crate) out: [u32; 4],
     pub(crate) axes: [AxisMap; 4],
+}
+
+impl std::hash::Hash for ViewMap {
+    /// Nine words instead of the thirty-odd a field-by-field hash writes (every write waits for
+    /// the one before it, and a view is made for nearly every other operation).
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let pair = |a: u32, b: u32| u64::from(a) | u64::from(b) << 32;
+        state.write_u64(pair(self.src[0], self.src[1]));
+        state.write_u64(pair(self.src[2], self.src[3]));
+        state.write_u64(pair(self.out[0], self.out[1]));
+        state.write_u64(pair(self.out[2], self.out[3]));
+        for axis in &self.axes {
+            state.write_u64(pair(axis.start as u32, axis.step as u32));
+        }
+        let from = self.axes.iter().fold(0u32, |word, axis| word << 8 | u32::from(axis.from));
+        state.write_u32(from);
+    }
 }
 
 /// What a view reads where the source coordinate leaves `0..src[axis]`.
@@ -581,12 +677,13 @@ impl ViewMap {
 }
 
 impl OpKind {
-    pub(crate) fn arity(self) -> usize {
+    pub(crate) fn arity(&self) -> usize {
         match self {
-            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
+            OpKind::Unary(_) | OpKind::Cast(_) | OpKind::Classify(_) | OpKind::Part(_) | OpKind::Shift(ShiftKind::Dims { .. } | ShiftKind::ParamDims { .. } | ShiftKind::View { edge: Edge::None | Edge::Clamp | Edge::Mirror | Edge::Wrap, .. }) => 1,
             OpKind::Shift(ShiftKind::ParamView { spec, .. }) if spec.edge != Edge::Fill => 1,
             OpKind::Binary(_)
             | OpKind::Compare(_)
+            | OpKind::Make
             | OpKind::Powf
             | OpKind::Shift(ShiftKind::View { edge: Edge::Fill, .. } | ShiftKind::ParamView { .. } | ShiftKind::Take { .. } | ShiftKind::ParamTake { .. }) => 2,
             OpKind::Shift(ShiftKind::Linear) | OpKind::Clamp | OpKind::Select => 3,
@@ -598,12 +695,14 @@ impl OpKind {
 
 /// An operation together with the element type of its operands.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub(crate) struct Op {
-    pub(crate) kind: OpKind,
-    pub(crate) ty: ElemTy,
     /// A hash of `kind` and `ty`, made once: operations are hashed for every node, program
-    /// and kernel lookup, and a view makes a long list of words to hash.
+    /// and kernel lookup, and a view makes a long list of words to hash. (First, with the
+    /// type, so that comparing and hashing operations reads one cache line.)
     fingerprint: u64,
+    pub(crate) ty: ElemTy,
+    pub(crate) kind: OpKind,
 }
 
 impl PartialEq for Op {
@@ -630,17 +729,19 @@ impl Op {
         Op { kind, ty, fingerprint: hasher.finish() }
     }
 
-    pub(crate) fn out_ty(self) -> ElemTy {
+    pub(crate) fn out_ty(&self) -> ElemTy {
         match self.kind {
             OpKind::Compare(_) | OpKind::Classify(_) => ElemTy::Bool,
+            OpKind::Part(_) => ElemTy::F32,
+            OpKind::Make => ElemTy::C32,
             OpKind::Cast(to) => to,
             _ => self.ty,
         }
     }
 
     /// The element type operand `index` must have.
-    pub(crate) fn operand_ty(self, index: usize) -> ElemTy {
-        match (self.kind, index) {
+    pub(crate) fn operand_ty(&self, index: usize) -> ElemTy {
+        match (&self.kind, index) {
             (OpKind::Shift(ShiftKind::View { .. } | ShiftKind::ParamView { .. }), 1) => self.ty,
             (OpKind::Select, 0) => ElemTy::Bool,
             (OpKind::Shift(ShiftKind::Linear), 1 | 2) | (OpKind::Shift(_), 1) => ElemTy::U32,
@@ -682,15 +783,22 @@ impl Scalar {
             1 => u64::from(bytemuck::pod_read_unaligned::<u32>(bytemuck::bytes_of(&value.into_repr()))),
             _ => bytemuck::pod_read_unaligned::<u64>(bytemuck::bytes_of(&value.into_repr())),
         };
+        // The register of a signed small integer holds the sign-extended value.
+        let bits = if ty.is_small_signed() {
+            let up = 32 - ty.small_bits();
+            u64::from((((bits as u32) << up) as i32 >> up) as u32)
+        } else {
+            bits
+        };
         Ok(Scalar { ty, bits })
     }
 
     /// The `f32` uniform slots (as bit patterns) this scalar occupies in a program: one for a
-    /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32`.
+    /// 4-byte type, three for `F64` (`a + b + c` adds up to the value), two for `Df32` and `C32`.
     pub(crate) fn words(self) -> [u32; 3] {
         match self.ty {
-            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => [self.bits as u32, 0, 0],
-            ElemTy::Df32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
+            ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => [self.bits as u32, 0, 0],
+            ElemTy::Df32 | ElemTy::C32 => [self.bits as u32, (self.bits >> 32) as u32, 0],
             ElemTy::F64 => {
                 let v = f64::from_bits(self.bits);
                 let a = v as f32;
@@ -731,20 +839,27 @@ static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_JIT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// One pending elementwise operation.
+///
+/// The fields the walks over an expression read (flattening, `create`, the sharing checks) come
+/// first, so that a node costs few cache lines to visit; the big operation and what only
+/// evaluating needs come after them.
+#[repr(C)]
 pub(crate) struct Node {
-    ctx: Context,
-    op: Op,
-    /// Number of elements of the result (and of every array operand).
-    len: usize,
-    /// The operands. Taken (and so released) when the node is evaluated.
-    args: Mutex<Option<Args>>,
     /// Set once the node was evaluated: its buffer, or why that failed.
     result: OnceLock<NodeResult>,
-    /// What failures of this node are reported as.
-    name: &'static str,
-    location: &'static Location<'static>,
+    /// Set when the node was found to be a state of a repeating step (see [`looped`]): its value
+    /// is output `j` of the plan, which runs all the steps at once, and the node released its
+    /// own operands.
+    looped: OnceLock<(Arc<LoopPlan>, u32)>,
     /// Unique per node.
     id: u64,
+    /// Number of elements of the result (and of every array operand).
+    len: usize,
+    below_len: usize,
+    /// The id that bit 0 of the first word stands for (a multiple of 64).
+    below_base: u64,
+    /// The operations of the expression in f32-operation units (see [`Node::weight`]).
+    weight: f64,
     /// The ids of the distinct nodes in the expression below this one (`below_len` of them) as a
     /// bit set over `below_base..` (`below_words` words), or sorted `(word, bits)` pairs (bit
     /// `id & 63` of the entry for word `id >> 6`) if they are spread too widely for that
@@ -753,41 +868,42 @@ pub(crate) struct Node {
     /// (`create` counts the buffers exactly by walking the expression whenever the bound is over
     /// the device's limit). One allocation for both.
     ids: Box<[u64]>,
-    below_len: usize,
-    /// The id that bit 0 of the first word stands for (a multiple of 64).
-    below_base: u64,
     below_words: u32,
-    below_sparse: bool,
     /// Number of nodes this one is an operand of (a pre-filter for sharing checks).
     consumers: AtomicU32,
-    /// Set once the node's value was computed inside another node's kernel (or a reduction).
-    /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
-    fused: AtomicBool,
-    /// Levels of shifted lazy expressions nested in the expression (0: none; see
-    /// [`recompute_shifted`]).
-    shift_depth: u8,
-    /// Levels of the expression below this node: 1 + the greatest of its operands' (0 for none),
-    /// shifted operands included. Bounded by [`MAX_DEPTH`].
-    depth: u16,
-    /// The operations of the expression in f32-operation units (see [`Node::weight`]).
-    weight: f64,
-    /// How many shifts, views and gathers read this node lazily, as a sub-program (see
-    /// [`recompute_shifted`]).
-    shifted_reads: AtomicU32,
     /// How many array handles ([`Held`]) are on this node. A held node is never handed out again
     /// by the hash-consing table: a write through one array must not show in another.
     handles: AtomicU32,
-    /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
-    readers: Readers,
+    /// How many shifts, views and gathers read this node lazily, as a sub-program (see
+    /// [`recompute_shifted`]).
+    shifted_reads: AtomicU32,
+    /// Levels of the expression below this node: 1 + the greatest of its operands' (0 for none),
+    /// shifted operands included. Bounded by [`MAX_DEPTH`].
+    depth: u16,
+    /// Levels of shifted lazy expressions nested in the expression (0: none; see
+    /// [`recompute_shifted`]).
+    shift_depth: u8,
+    below_sparse: bool,
+    /// Set once the node's value was computed inside another node's kernel (or a reduction).
+    /// Flushing skips such nodes: they are usually the temporaries of a fused expression.
+    fused: AtomicBool,
     /// Whether the node is in [`JitState::requested`].
     requested: AtomicBool,
-    /// Set when the node was found to be a state of a repeating step (see [`looped`]): its value
-    /// is output `j` of the plan, which runs all the steps at once, and the node released its
-    /// own operands.
-    looped: OnceLock<(Arc<LoopPlan>, u32)>,
+    /// Set once a walk found no reduction that is not recorded (and no loop output) below this node: that stays so, as
+    /// evaluating only removes them (see [`multireduce::unresolved_leaves`]).
+    leaf_free: AtomicBool,
+    /// The operands. Taken (and so released) when the node is evaluated.
+    args: Mutex<Option<Args>>,
+    op: Op,
+    /// Pending nodes that read this node's result; handed to its storage when it is evaluated.
+    readers: Readers,
+    ctx: Context,
     /// Set when the node stands for a reduction that is recorded when the node is evaluated (see
     /// [`deferred`]).
     deferred: OnceLock<Arc<crate::reduce::Reduced>>,
+    /// What failures of this node are reported as.
+    name: &'static str,
+    location: &'static Location<'static>,
     /// The thread that created the node. The sweeps that evaluate "every lazy array" (`eval`,
     /// `flush`, `sync`, evaluating alongside) only take the nodes of the calling thread: another
     /// thread may be flattening the expression this very moment, or have a recording under way
@@ -1015,9 +1131,7 @@ impl Node {
             return;
         }
         let at = ((self.below_base - base) >> 6) as usize;
-        for (word, &bits) in set.iter_mut().skip(at).zip(part) {
-            *word |= bits;
-        }
+        bits::or_into(set.get_mut(at..).unwrap_or(&mut []), part);
     }
 
     /// Ids of the distinct buffers the expression reads, sorted.
@@ -1037,7 +1151,7 @@ impl Node {
     /// The operations of the expression in f32-operation units, an upper bound (see
     /// [`cost::op_weight`]) that counts a node an expression reads twice twice, up to
     /// [`MAX_AVERAGE_WEIGHT`] per distinct node. A loop leaf has none: its plan evaluates its inputs.
-    fn weight(&self) -> f64 {
+    pub(crate) fn weight(&self) -> f64 {
         if self.looped.get().is_some() { 0.0 } else { self.weight }
     }
 
@@ -1079,7 +1193,45 @@ impl Node {
     /// Evaluates the node (once): records its fused kernel into the context's batch and returns
     /// the buffer it writes. Does not wait for the GPU.
     pub(crate) fn force(self: &Arc<Self>) -> &NodeResult {
-        self.result.get_or_init(|| self.compute())
+        if self.result.get().is_none() {
+            crate::host::try_eval_node(self);
+        }
+        let mut ran = false;
+        let result = self.result.get_or_init(|| {
+            ran = true;
+            self.compute()
+        });
+        if ran {
+            self.settled();
+        }
+        result
+    }
+
+    /// Notes that the node stopped being pending (it got its result): see [`JitState::pending_nodes`].
+    pub(crate) fn settled(&self) {
+        self.ctx.jit().pending_nodes.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Unique per node.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The reduction this node stands for the value of, if it is such a node.
+    pub(crate) fn deferred_reduced(&self) -> Option<&Arc<crate::reduce::Reduced>> {
+        self.deferred.get()
+    }
+
+    /// Whether the node is a state of a repeating step (see [`looped`]).
+    pub(crate) fn is_looped(&self) -> bool {
+        self.looped.get().is_some()
+    }
+
+    /// [`Node::finish_shared`] for a buffer computed on the host: the node's buffer, which is
+    /// another one if a different thread evaluated the node meanwhile.
+    pub(crate) fn finish_host(self: &Arc<Self>, storage: Arc<Storage>) -> Arc<Storage> {
+        self.finish_shared(Arc::clone(&storage));
+        self.evaluated().cloned().unwrap_or(storage)
     }
 
     fn compute(self: &Arc<Self>) -> NodeResult {
@@ -1098,6 +1250,7 @@ impl Node {
                 if let Err(error) = check_finite(&self.ctx, &storage, self.op.out_ty()) {
                     return Err(Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) }));
                 }
+                plancache::finished(self, &storage);
                 storage.set_producer(self.id);
                 storage.readers.absorb(&self.readers);
                 Ok(storage)
@@ -1117,6 +1270,7 @@ impl Node {
     fn fail(&self, error: LumaError) {
         let failed = Arc::new(LumaError::Op { op: self.name, location: self.location, source: Arc::new(error) });
         if self.result.set(Err(failed)).is_ok() {
+            self.settled();
             lock(&self.args).take();
         }
     }
@@ -1130,6 +1284,8 @@ impl Node {
     /// [`Node::finish`] for a buffer that others hold too.
     pub(crate) fn finish_shared(&self, storage: Arc<Storage>) {
         if self.result.set(Ok(Arc::clone(&storage))).is_ok() {
+            self.settled();
+            plancache::finished(self, &storage);
             storage.set_producer(self.id);
             storage.readers.absorb(&self.readers);
             lock(&self.args).take();
@@ -1140,8 +1296,8 @@ impl Node {
         self.len
     }
 
-    pub(crate) fn op(&self) -> Op {
-        self.op
+    pub(crate) fn op(&self) -> &Op {
+        &self.op
     }
 
     pub(crate) fn context(&self) -> &Context {
@@ -1172,6 +1328,15 @@ impl Node {
     /// A copy of the operands of a node that has not been evaluated.
     pub(crate) fn operands(&self) -> Option<Args> {
         lock(&self.args).clone()
+    }
+
+    /// Whether the node is pending and yields the elements of `storage` unchanged (a copy of it).
+    pub(crate) fn is_copy_of(&self, storage: &Arc<Storage>) -> bool {
+        self.is_pending()
+            && self.looped.get().is_none()
+            && self.len == storage.len()
+            && matches!(self.op.kind, OpKind::Unary(UnOp::Id))
+            && matches!(self.operands(), Some([Src::Buffer(source), ..]) if Arc::ptr_eq(&source, storage))
     }
 
     /// Whether the node has operands, which it does not once it is evaluated or being evaluated.
@@ -1415,7 +1580,6 @@ struct Measured {
     inputs: Vec<u64>,
     below: Vec<u64>,
     decoded: Vec<u64>,
-    dense: Vec<u64>,
     tmp: Vec<u64>,
 }
 
@@ -1473,7 +1637,7 @@ impl Drop for Flattening {
 }
 
 thread_local! {
-    static MEASURED: std::cell::RefCell<Measured> = std::cell::RefCell::default();
+    static MEASURED: std::cell::RefCell<Measured> = const { std::cell::RefCell::new(Measured { inputs: Vec::new(), below: Vec::new(), decoded: Vec::new(), tmp: Vec::new() }) };
 }
 
 /// What an operation on some operands has below it: the counts, and the ids as a [`Node`] keeps
@@ -1491,8 +1655,119 @@ struct Measure {
 
 /// The distinct nodes below and distinct buffers read by an operation on `args`.
 fn measure(args: &[Src]) -> Measure {
+    measure_nodes(args).unwrap_or_else(|| measure_any(args))
+}
+
+/// The number of ids in the union of the sorted lists `a` and `b`.
+fn union_len(a: &[u64], b: &[u64]) -> usize {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while let (Some(&x), Some(&y)) = (a.get(i), b.get(j)) {
+        i += usize::from(x <= y);
+        j += usize::from(y <= x);
+        n += 1;
+    }
+    n + (a.len() - i) + (b.len() - j)
+}
+
+/// Writes the union of the sorted lists `a` and `b` to `out` (which holds exactly [`union_len`] ids).
+fn union_write(a: &[u64], b: &[u64], out: &mut [u64]) {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while let (Some(&x), Some(&y)) = (a.get(i), b.get(j)) {
+        if let Some(slot) = out.get_mut(n) {
+            *slot = x.min(y);
+        }
+        i += usize::from(x <= y);
+        j += usize::from(y <= x);
+        n += 1;
+    }
+    for (slot, &id) in out.iter_mut().skip(n).zip(a.get(i..).unwrap_or(&[]).iter().chain(b.get(j..).unwrap_or(&[]))) {
+        *slot = id;
+    }
+}
+
+/// [`measure`] for the operations nearly every expression is made of: one or two pending
+/// operands (scalars beside them) whose sets are bit sets, read without a buffer operand. Merges
+/// the buffers on the stack instead of through the thread's working memory. `None` if `args` are
+/// anything else.
+#[inline]
+fn measure_nodes(args: &[Src]) -> Option<Measure> {
+    let mut nodes: [Option<&Arc<Node>>; 2] = [None; 2];
+    let mut count = 0;
+    let (mut buffers, mut n_buffers) = ([0u64; 3], 0);
+    for arg in args {
+        match arg {
+            Src::Scalar(_) => {}
+            Src::Buffer(storage) => {
+                *buffers.get_mut(n_buffers)? = storage.binding_id();
+                n_buffers += 1;
+            }
+            Src::Node(node) => {
+                if nodes.iter().take(count).flatten().any(|first| Arc::ptr_eq(first, node)) {
+                    continue;
+                }
+                *nodes.get_mut(count)? = Some(node);
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        // Buffers and scalars only: the sorted distinct buffers are all there is.
+        let found = buffers.get_mut(..n_buffers)?;
+        found.sort_unstable();
+        let mut distinct = 0;
+        for at in 0..found.len() {
+            if at == 0 || found[at] != found[at - 1] {
+                found[distinct] = found[at];
+                distinct += 1;
+            }
+        }
+        let mut ids = bits::zeroed(distinct);
+        ids.copy_from_slice(&found[..distinct]);
+        return Some(Measure { below: 0, inputs: distinct, ids, base: 0, words: 0, sparse: true });
+    }
+    if n_buffers > 0 {
+        return None;
+    }
+    let [Some(first), second] = nodes else { return None };
+    if first.below_sparse || second.is_some_and(|node| node.below_sparse) {
+        return None;
+    }
+    // The buffers: the operand's own, or the union of both operands'.
+    let (a, b) = (first.inputs(), second.map_or(&[][..], |node| node.inputs()));
+    let merged = !(a == b || b.is_empty() || a.is_empty());
+    let inputs_len = if merged { union_len(a, b) } else { a.len().max(b.len()) };
+    let (mut lo, mut hi, mut upper, mut used) = (u64::MAX, 0u64, 0usize, 0usize);
+    for node in [Some(first), second].into_iter().flatten() {
+        (lo, hi, upper) = (lo.min(node.id), hi.max(node.id), upper + 1 + node.below_len());
+        used += 1 + node.below_part().len();
+        if let Some((first, last)) = node.below_span() {
+            (lo, hi) = (lo.min(first), hi.max(last));
+        }
+    }
+    let width = ((hi >> 6) - (lo >> 6) + 1) as usize;
+    if width > 2 * used + 8 {
+        return None;
+    }
+    let base = lo & !63;
+    let mut ids = bits::zeroed(width + inputs_len);
+    let (dense, tail) = ids.split_at_mut(width);
+    for node in [Some(first), second].into_iter().flatten() {
+        mark(dense, base, node.id);
+        node.mark_below(dense, base);
+    }
+    if merged {
+        union_write(a, b, tail);
+    } else {
+        tail.copy_from_slice(if a.is_empty() { b } else { a });
+    }
+    let below = if second.is_none() { upper } else { bits::count_ones(dense) };
+    Some(Measure { below, inputs: inputs_len, ids, base, words: width as u32, sparse: false })
+}
+
+/// [`measure`] for any operands.
+fn measure_any(args: &[Src]) -> Measure {
     MEASURED.with_borrow_mut(|m| {
-        let Measured { inputs, below, decoded, tmp, dense } = m;
+        let Measured { inputs, below, decoded, tmp } = m;
         inputs.clear();
         let mut nodes: [Option<&Arc<Node>>; 3] = [None; 3];
         let mut count = 0;
@@ -1531,15 +1806,17 @@ fn measure(args: &[Src]) -> Measure {
         let width = ((hi >> 6) - (lo >> 6) + 1) as usize;
         if width <= 2 * used + 8 {
             let base = lo & !63;
-            dense.clear();
-            dense.resize(width, 0u64);
+            // One allocation: the set (zeroed, then merged into) and the buffers behind it.
+            let mut ids = bits::zeroed(width + inputs.len());
+            let (dense, tail) = ids.split_at_mut(width);
             for node in operands() {
                 mark(dense, base, node.id);
                 node.mark_below(dense, base);
             }
+            tail.copy_from_slice(inputs);
             // One operand: its set plus itself, which is not in it.
-            let below = if count == 1 { upper } else { dense.iter().map(|word| word.count_ones() as usize).sum() };
-            return Measure { below, inputs: inputs.len(), ids: concat_ids(dense, inputs), base, words: width as u32, sparse: false };
+            let below = if count == 1 { upper } else { bits::count_ones(dense) };
+            return Measure { below, inputs: inputs.len(), ids, base, words: width as u32, sparse: false };
         }
         below.clear();
         for node in operands() {
@@ -1704,18 +1981,21 @@ fn evaluate_operand(args: &mut [Src], i: usize) -> std::result::Result<(), Failu
 }
 
 /// Fails with [`LumaError::Unsupported`] if `op` does not exist for its element type: `f64` has
-/// no transcendental functions or `powf` (and needs a device with 64-bit shader floats), `Df32`
-/// only the operations of its library, and neither has generators; the bitwise operations only
+/// the math functions and `powf` only on the CUDA and CPU backends (and needs a device with 64-bit shader floats), `Df32`
+/// only the operations of its library, `C32` the field operations, `exp`, `sqrt`, equality and the
+/// real parts, and none of the three has generators; the bitwise operations only
 /// exist for `u32` and `i32` (the rotations for `u32` alone), `u32` has no negation, and `i32` has
 /// no float math. `bool` has no generators (their values would not be 0 or 1).
-fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(), LumaError> {
-    let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32);
+fn check_supported(ctx: &Context, op: &Op, name: &str) -> std::result::Result<(), LumaError> {
+    let wide = matches!(op.ty, ElemTy::F64 | ElemTy::Df32 | ElemTy::C32);
     let exists = match op.kind {
         OpKind::Unary(unary) => unary.expr_for(op.ty).is_some(),
         OpKind::Binary(binary) => binary.expr_for(op.ty).is_some(),
-        OpKind::Compare(_) | OpKind::Select | OpKind::Clamp | OpKind::Shift(_) | OpKind::Cast(_) => true,
-        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool),
-        OpKind::Powf => op.ty != ElemTy::F64,
+        OpKind::Compare(cmp) => cmp.exists_for(op.ty),
+        OpKind::Select | OpKind::Shift(_) | OpKind::Cast(_) | OpKind::Part(_) | OpKind::Make => true,
+        OpKind::Clamp => op.ty != ElemTy::C32,
+        OpKind::Classify(_) => !matches!(op.ty, ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::C32),
+        OpKind::Powf => matches!(op.ty, ElemTy::F32 | ElemTy::F64 | ElemTy::Df32),
         // A `bool` holds only 0 or 1, which no ramp or counter keeps.
         OpKind::Generate(_) => !wide && op.ty != ElemTy::Bool,
     };
@@ -1724,6 +2004,16 @@ fn check_supported(ctx: &Context, op: Op, name: &str) -> std::result::Result<(),
     }
     if (op.ty == ElemTy::F64 || op.out_ty() == ElemTy::F64) && !ctx.features().contains(luma_core::Features::SHADER_F64) {
         return Err(LumaError::Unsupported("f64 arrays need a GPU with 64-bit shader floats (Vulkan)".into()));
+    }
+    // WGSL has no `f64` math functions: they exist where the backend lowers them itself.
+    let math = match op.kind {
+        OpKind::Unary(unary) => unary.wide_math(),
+        OpKind::Binary(binary) => binary.wide_math(),
+        OpKind::Powf => true,
+        _ => false,
+    };
+    if op.ty == ElemTy::F64 && math && !matches!(ctx.backend(), luma_core::BackendKind::Cuda | luma_core::BackendKind::Cpu) {
+        return Err(LumaError::Unsupported(format!("{name} of f64 arrays needs the CUDA or the CPU backend")));
     }
     Ok(())
 }
@@ -1751,36 +2041,51 @@ fn convert_evaluated(args: &mut Args, arity: usize) -> std::result::Result<(), F
 ///
 /// This is where fusion is limited: operands that already have a consumer, and the biggest operand
 /// while the expression is too large, are evaluated first (see the module documentation).
+#[inline(always)]
 pub(crate) fn create(
     ctx: &Context,
     len: usize,
-    mut op: Op,
+    op: Op,
+    args: Args,
+    name: &'static str,
+    location: &'static Location<'static>,
+) -> std::result::Result<Arc<Node>, Failure> {
+    // By reference: an `Op` is big, and passing it by value copies it for every callee.
+    create_with(ctx, len, &op, args, name, location)
+}
+
+fn create_with(
+    ctx: &Context,
+    len: usize,
+    first_op: &Op,
     mut args: Args,
     name: &'static str,
     location: &'static Location<'static>,
 ) -> std::result::Result<Arc<Node>, Failure> {
     let jit = ctx.jit();
-    let mut arity = op.kind.arity();
+    let mut arity = first_op.kind.arity();
 
     // Operands evaluated since they were created become plain buffers.
     convert_evaluated(&mut args, arity)?;
 
     // Algebraic simplification (see [`simplify`]); the operands a rewrite takes from a pending
     // operand may have been evaluated since it was created.
+    let mut rewritten_op: Option<Op> = None;
     if jit.simplify_enabled() {
         let mut rounds = 0;
         while rounds < 4
-            && let Some((rewritten, operands)) = simplify::rewrite(op, &args, ctx.fast_math())
+            && let Some((rewritten, operands)) = simplify::rewrite(rewritten_op.as_ref().unwrap_or(first_op), &args, ctx.fast_math())
         {
-            op = rewritten;
+            rewritten_op = Some(rewritten);
             args = operands;
             rounds += 1;
         }
         if rounds > 0 {
-            arity = op.kind.arity();
+            arity = rewritten_op.as_ref().unwrap_or(first_op).kind.arity();
             convert_evaluated(&mut args, arity)?;
         }
     }
+    let op: &Op = rewritten_op.as_ref().unwrap_or(first_op);
     check_supported(ctx, op, name).map_err(Failure::New)?;
     // A shift reads its source at other elements than the one it computes, which a window cannot
     // (see `pack`): the source gets the buffer of its own.
@@ -1792,7 +2097,11 @@ pub(crate) fn create(
 
     // Equal operations on identical operands are one node (see `ConsTable`).
     let cons_key = (!matches!(op.kind, OpKind::Unary(UnOp::Id))).then(|| cons_hash(op, len, &args));
+    // An equal node would read every node operand too, which counts it as a consumer: an operand
+    // nobody reads yet has no equal operation to find.
+    let may_exist = args.iter().take(arity).all(|arg| !matches!(arg, Src::Node(node) if node.consumers.load(Ordering::Relaxed) == 0));
     if let Some(hash) = cons_key
+        && may_exist
         && let Some(found) = jit.cons_lookup(hash, op, len, &args)
     {
         rerun::reused(&found);
@@ -1801,6 +2110,153 @@ pub(crate) fn create(
 
     let max_nodes = FUSION_LIMIT.with(std::cell::Cell::get).unwrap_or_else(|| jit.max_nodes()).clamp(1, MAX_NODES_LIMIT);
     let max_inputs = jit.max_inputs();
+    // Most operations are within every limit: the cutting is in `settle`, which keeps this
+    // function short (it runs for every operation).
+    let first = measure(args.get(..arity).unwrap_or(&[]));
+    let within = first.below < max_nodes
+        && first.inputs <= max_inputs
+        && !args.iter().take(arity).any(|arg| matches!(arg, Src::Node(node) if node.depth() >= MAX_DEPTH));
+    let (measured, cut, exact_depth) = if within {
+        (first, false, None)
+    } else {
+        drop(first);
+        settle(ctx, op, &mut args, arity, name, location, max_nodes, max_inputs)?
+    };
+    if cut {
+        // Without this, a long chain built without `eval` keeps the GPU idle until its end.
+        let _ = ctx.submit();
+    }
+    // What the operands add up to: the levels of shifts and of nesting, and an upper bound of the
+    // work of the expression (operands that are shared count once per use).
+    let is_shift = matches!(op.kind, OpKind::Shift(_));
+    let (mut shift_depth, mut deepest, mut operand_weight) = (0u8, None::<u16>, 0.0);
+    for (i, arg) in args.iter().take(arity).enumerate() {
+        if let Src::Node(operand) = arg {
+            shift_depth = shift_depth.max(operand.shift_depth().saturating_add(u8::from(i == 0 && is_shift)));
+            deepest = deepest.max(Some(operand.depth()));
+            operand_weight += operand.weight();
+        }
+    }
+    // Operands that share nodes count them once per use (`operand_weight` unfolds the expression into
+    // a tree, which doubles with every level of a flux that two readers read, say): no operation
+    // weighs more than `MAX_AVERAGE_WEIGHT` on average, so that is what an expression of that many
+    // distinct nodes is bounded by.
+    let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight).min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
+    let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
+
+    let trace = rerun::created(op, len, &args, arity);
+    // The distinct operands the node registers with once it exists. The node owns `args` from
+    // then on, which keeps them alive, so only their addresses are noted here (an `Arc` cloned
+    // for every operand costs an atomic operation to take and another to give back).
+    let mut registered = [Registered::None; 3];
+    let mut known = 0;
+    for (i, arg) in args.iter().enumerate().take(arity) {
+        let repeated = |other: &Src| match (arg, other) {
+            (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
+            (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if args.iter().take(i).any(repeated) {
+            continue;
+        }
+        let entry = match arg {
+            Src::Buffer(storage) => Registered::Buffer(Arc::as_ptr(storage)),
+            Src::Node(operand) => Registered::Node(Arc::as_ptr(operand)),
+            Src::Scalar(_) => continue,
+        };
+        if let Some(slot) = registered.get_mut(known) {
+            *slot = entry;
+            known += 1;
+        }
+    }
+    // What the table is told: a cut changed the operands, so the hash is made again.
+    let table_hash = cons_key.map(|hash| if cut { cons_hash(op, len, &args) } else { hash });
+    // Built where it lives: the node is bigger than what a move of it copies cheaply.
+    let node = {
+        let ptr = Arc::into_raw(Arc::<Node>::new_uninit()).cast::<Node>().cast_mut();
+        // SAFETY: `ptr` is the one reference of a fresh allocation of a `Node`, whose fields are
+        // all written (one by one: a struct literal would be built on the stack and copied) before
+        // the `Arc` is made again.
+        unsafe {
+            std::ptr::addr_of_mut!((*ptr).trace).write(trace);
+            std::ptr::addr_of_mut!((*ptr).thread).write(current_thread());
+            std::ptr::addr_of_mut!((*ptr).ctx).write(ctx.clone());
+            std::ptr::addr_of_mut!((*ptr).op).write(*op);
+            std::ptr::addr_of_mut!((*ptr).len).write(len);
+            std::ptr::addr_of_mut!((*ptr).args).write(Mutex::new(Some(args)));
+            std::ptr::addr_of_mut!((*ptr).result).write(OnceLock::new());
+            std::ptr::addr_of_mut!((*ptr).name).write(name);
+            std::ptr::addr_of_mut!((*ptr).location).write(location);
+            std::ptr::addr_of_mut!((*ptr).id).write(NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed));
+            std::ptr::addr_of_mut!((*ptr).ids).write(measured.ids);
+            std::ptr::addr_of_mut!((*ptr).below_len).write(measured.below);
+            std::ptr::addr_of_mut!((*ptr).below_base).write(measured.base);
+            std::ptr::addr_of_mut!((*ptr).below_words).write(measured.words);
+            std::ptr::addr_of_mut!((*ptr).below_sparse).write(measured.sparse);
+            std::ptr::addr_of_mut!((*ptr).consumers).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*ptr).fused).write(AtomicBool::new(false));
+            std::ptr::addr_of_mut!((*ptr).shift_depth).write(shift_depth);
+            std::ptr::addr_of_mut!((*ptr).depth).write(depth);
+            std::ptr::addr_of_mut!((*ptr).weight).write(weight);
+            std::ptr::addr_of_mut!((*ptr).shifted_reads).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*ptr).readers).write(Readers::default());
+            std::ptr::addr_of_mut!((*ptr).requested).write(AtomicBool::new(false));
+            std::ptr::addr_of_mut!((*ptr).leaf_free).write(AtomicBool::new(false));
+            std::ptr::addr_of_mut!((*ptr).looped).write(OnceLock::new());
+            std::ptr::addr_of_mut!((*ptr).deferred).write(OnceLock::new());
+            std::ptr::addr_of_mut!((*ptr).handles).write(AtomicU32::new(0));
+            Arc::from_raw(ptr)
+        }
+    };
+
+    let weak = Arc::downgrade(&node);
+    for entry in &registered[..known] {
+        // SAFETY: the operand is held by `node.args`, which nothing has touched since the node
+        // was made (it is not shared yet).
+        unsafe {
+            match *entry {
+                Registered::Buffer(storage) => (*storage).readers.add_weak(weak.clone()),
+                Registered::Node(operand) => {
+                    (*operand).consumers.fetch_add(1, Ordering::Relaxed);
+                    (*operand).readers.add_weak(weak.clone());
+                }
+                Registered::None => {}
+            }
+        }
+    }
+    jit.with_live(|live| live.add_weak(weak.clone()));
+    jit.pending_nodes.fetch_add(1, Ordering::Relaxed);
+    if let Some(hash) = table_hash {
+        jit.cons_insert(hash, weak);
+    }
+    Ok(node)
+}
+
+/// An operand a new node registers with (see [`create_with`]).
+#[derive(Clone, Copy)]
+enum Registered {
+    None,
+    Buffer(*const Storage),
+    Node(*const Node),
+}
+
+/// What [`create`] does about an operation whose operands make it too big, too deep or too wide
+/// to be one kernel: measures it and evaluates operands until it fits. Returns what it measured,
+/// whether it evaluated anything, and the depth counted exactly, if it had to be.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn settle(
+    ctx: &Context,
+    op: &Op,
+    args: &mut Args,
+    arity: usize,
+    name: &'static str,
+    location: &'static Location<'static>,
+    max_nodes: usize,
+    max_inputs: usize,
+) -> std::result::Result<(Measure, bool, Option<Option<u16>>), Failure> {
+    let jit = ctx.jit();
     // The first time the expression is over a limit, its biggest operand is evaluated together
     // with the live arrays that share pending work with it (see the module documentation)
     // instead of alone.
@@ -1809,7 +2265,7 @@ pub(crate) fn create(
     let mut cut = false;
     let mut noted = false;
     let mut exact_depth: Option<Option<u16>>;
-    let measured = loop {
+    loop {
         let mut measured = measure(args.get(..arity).unwrap_or(&[]));
         let (mut below, mut inputs) = (measured.below, measured.inputs);
         if below >= max_nodes {
@@ -1834,7 +2290,7 @@ pub(crate) fn create(
             // takes one binding (see `pack`); only if that cannot be done is the expression cut.
             if inputs > max_inputs && !packed {
                 packed = true;
-                if pack::repack(ctx, op, args.get(..arity).unwrap_or(&[]), inputs - max_inputs) {
+                if pack::repack(ctx, *op, args.get(..arity).unwrap_or(&[]), inputs - max_inputs) {
                     continue;
                 }
             }
@@ -1853,7 +2309,7 @@ pub(crate) fn create(
         let deep = deepest_operand.unwrap_or(0) >= MAX_DEPTH;
         let too_big = below >= max_nodes || inputs > max_inputs;
         if !too_big && !deep {
-            break measured;
+            return Ok((measured, cut, exact_depth));
         }
         if !noted {
             noted = true;
@@ -1883,7 +2339,7 @@ pub(crate) fn create(
                 if let Some(Src::Node(seed)) = args.get(i) {
                     jit.evaluate_alongside(Arc::clone(seed));
                 }
-                evaluate_operand(&mut args, i)?;
+                evaluate_operand(&mut *args, i)?;
             }
             continue;
         }
@@ -1903,7 +2359,7 @@ pub(crate) fn create(
                 jit.evaluate_alongside(seed);
                 for i in 0..arity {
                     if matches!(args.get(i), Some(Src::Node(node)) if node.result.get().is_some()) {
-                        evaluate_operand(&mut args, i)?;
+                        evaluate_operand(&mut *args, i)?;
                     }
                 }
                 continue;
@@ -1921,88 +2377,12 @@ pub(crate) fn create(
         match biggest {
             Some((i, _)) => {
                 cut = true;
-                evaluate_operand(&mut args, i)?;
+                evaluate_operand(&mut *args, i)?;
             }
             // Only buffers and scalars left: at most three operands, within any sane limit.
-            None => break measured,
-        }
-    };
-    if cut {
-        // Without this, a long chain built without `eval` keeps the GPU idle until its end.
-        let _ = ctx.submit();
-    }
-    // What the operands add up to: the levels of shifts and of nesting, and an upper bound of the
-    // work of the expression (operands that are shared count once per use).
-    let is_shift = matches!(op.kind, OpKind::Shift(_));
-    let (mut shift_depth, mut deepest, mut operand_weight) = (0u8, None::<u16>, 0.0);
-    for (i, arg) in args.iter().take(arity).enumerate() {
-        if let Src::Node(operand) = arg {
-            shift_depth = shift_depth.max(operand.shift_depth().saturating_add(u8::from(i == 0 && is_shift)));
-            deepest = deepest.max(Some(operand.depth()));
-            operand_weight += operand.weight();
+            None => return Ok((measured, cut, exact_depth)),
         }
     }
-    // Operands that share nodes count them once per use (`operand_weight` unfolds the expression into
-    // a tree, which doubles with every level of a flux that two readers read, say): no operation
-    // weighs more than `MAX_AVERAGE_WEIGHT` on average, so that is what an expression of that many
-    // distinct nodes is bounded by.
-    let weight = (cost::op_weight(op, &ctx.cost_model()) + operand_weight).min((measured.below + 1) as f64 * MAX_AVERAGE_WEIGHT);
-    let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
-
-    let trace = rerun::created(op, len, &args, arity);
-    let node = Arc::new(Node {
-        trace,
-        thread: current_thread(),
-        ctx: ctx.clone(),
-        op,
-        len,
-        args: Mutex::new(Some(args.clone())),
-        result: OnceLock::new(),
-        name,
-        location,
-        id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
-        ids: measured.ids,
-        below_len: measured.below,
-        below_base: measured.base,
-        below_words: measured.words,
-        below_sparse: measured.sparse,
-        consumers: AtomicU32::new(0),
-        fused: AtomicBool::new(false),
-        shift_depth,
-        depth,
-        weight,
-        shifted_reads: AtomicU32::new(0),
-        readers: Readers::default(),
-        requested: AtomicBool::new(false),
-        looped: OnceLock::new(),
-        deferred: OnceLock::new(),
-        handles: AtomicU32::new(0),
-    });
-
-    let weak = Arc::downgrade(&node);
-    for (i, arg) in args.iter().enumerate().take(arity) {
-        let repeated = |other: &Src| match (arg, other) {
-            (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
-            (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        if args.iter().take(i).any(repeated) {
-            continue;
-        }
-        match arg {
-            Src::Buffer(storage) => storage.readers.add_weak(weak.clone()),
-            Src::Node(operand) => {
-                operand.consumers.fetch_add(1, Ordering::Relaxed);
-                operand.readers.add_weak(weak.clone());
-            }
-            Src::Scalar(_) => {}
-        }
-    }
-    jit.live.add_weak(weak.clone());
-    if let Some(hash) = cons_key {
-        jit.cons_insert(if cut { cons_hash(op, len, &args) } else { hash }, weak);
-    }
-    Ok(node)
 }
 
 /// A node of `len` elements of type `ty` that stands for the value of `reduced`: evaluating it
@@ -2036,12 +2416,14 @@ pub(crate) fn deferred(ctx: &Context, len: usize, ty: ElemTy, reduced: Arc<crate
         shifted_reads: AtomicU32::new(0),
         readers: Readers::default(),
         requested: AtomicBool::new(false),
+        leaf_free: AtomicBool::new(false),
         looped: OnceLock::new(),
         deferred: OnceLock::new(),
         handles: AtomicU32::new(0),
     });
     let _ = node.deferred.set(reduced);
-    ctx.jit().live.add_weak(Arc::downgrade(&node));
+    ctx.jit().with_live(|live| live.add_weak(Arc::downgrade(&node)));
+    ctx.jit().pending_nodes.fetch_add(1, Ordering::Relaxed);
     node
 }
 
@@ -2076,7 +2458,7 @@ struct JudgementEntry {
 
 /// Hash of what makes two lazy operations the same value: the operation, the length and the
 /// operands (buffers and nodes by identity, scalars by value).
-fn cons_hash(op: Op, len: usize, args: &Args) -> u64 {
+fn cons_hash(op: &Op, len: usize, args: &Args) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = FxHasher::default();
     op.hash(&mut hasher);
@@ -2095,7 +2477,7 @@ fn cons_hash(op: Op, len: usize, args: &Args) -> u64 {
 }
 
 /// Whether `a` and `b` are the same operands of `op`: the same buffers and nodes, equal scalars.
-fn cons_same(op: Op, a: &Args, b: &Args) -> bool {
+fn cons_same(op: &Op, a: &Args, b: &Args) -> bool {
     a.iter().zip(b).take(op.kind.arity()).all(|pair| match pair {
         (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
         (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
@@ -2109,17 +2491,291 @@ fn cons_same(op: Op, a: &Args, b: &Args) -> bool {
 /// [`JitState::write_epoch`]: no buffer changed its contents since, so equal operations on
 /// identical operands are equal values. Holds weak references only: a node nobody else holds
 /// stays droppable, and [`assign`] counts the owners of the nodes it walks.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ConsTable {
     epoch: u64,
-    map: FxMap<u64, Weak<Node>>,
-    /// Entries at which dead ones are pruned before the next insert: [`CONS_PRUNE_AT`], or twice
-    /// what survived the last pruning (a table of live entries is not scanned at every insert).
-    prune_at: usize,
+    /// The operations, by hash: sets of [`CONS_WAYS`] entries each (a power of two of them), made
+    /// when the first entry is stored. No node is ever looked for by walking: a lookup or an
+    /// insert reads the entries of one set (an entry of a dead node is replaced by the insert
+    /// that finds it, and [`ConsTable::sweep`] drops the others in bulk). The table grows when a
+    /// live entry would have to give way: an expression made of more operations than the table
+    /// holds would not share its common parts any more, which costs far more than the table.
+    sets: Vec<ConsSet>,
+    /// The sets that hold an entry, so that forgetting them all does not visit the others.
+    filled: Vec<u32>,
+    /// Entries stored since the dead ones were last dropped.
+    stored: usize,
+    /// Entries stored at which the dead ones are dropped next (see [`ConsTable::sweep`]).
+    sweep_at: usize,
+    /// The masks of region assignments (see [`MaskKey`]).
+    masks: FxMap<MaskKey, Weak<Node>>,
 }
 
-/// Entries of the table at which dead ones are pruned before the next insert, at least.
-const CONS_PRUNE_AT: usize = 4096;
+impl std::fmt::Debug for ConsTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConsTable({} sets, {} filled)", self.sets.len(), self.filled.len())
+    }
+}
+
+/// Entries of a [`ConsSet`].
+const CONS_WAYS: usize = 8;
+
+/// Every entry of a set in use.
+const CONS_FULL: u32 = (1 << CONS_WAYS) - 1;
+
+/// Fewest entries stored between two drops of the dead ones (see [`ConsTable::sweep`]).
+const CONS_SWEEP_MIN: usize = 16384;
+
+/// Sets a [`ConsTable`] starts with (a power of two).
+const CONS_SETS_MIN: usize = 128;
+
+/// Most sets a [`ConsTable`] grows to: 1M operations. Past that live entries are replaced.
+const CONS_SETS_MAX: usize = 1 << 17;
+
+/// The entries of one hash value range: the node that computes an operation, if the entry is in
+/// use (bit `i` of `used`), and the high half of the hash of the operation (the half that tells
+/// the set, see [`ConsTable::set_of`]). A lookup reads the first cache line only (the tags and
+/// `used`), compares the tags of all the entries without a branch per entry, and leaves a
+/// collision of tags to the comparison of the operands.
+#[derive(Default)]
+#[repr(C, align(64))]
+struct ConsSet {
+    tags: [u32; CONS_WAYS],
+    used: u32,
+    nodes: [Option<Weak<Node>>; CONS_WAYS],
+}
+
+impl ConsSet {
+    /// The entries (bit `i` for entry `i`) in use that hold the tag of `hash`.
+    #[inline]
+    fn matching(&self, hash: u64) -> u32 {
+        let tag = (hash >> 32) as u32;
+        self.used & self.tags.iter().enumerate().fold(0, |bits, (i, &entry)| bits | u32::from(entry == tag) << i)
+    }
+
+    /// Drops the entries of dead nodes; returns the entries that are still in use.
+    fn drop_dead(&mut self) -> u32 {
+        for way in 0..CONS_WAYS {
+            if self.used >> way & 1 != 0 && self.nodes[way].as_ref().is_none_or(|weak| weak.strong_count() == 0) {
+                self.nodes[way] = None;
+                self.used &= !(1 << way);
+            }
+        }
+        self.used
+    }
+
+    /// Puts `node` in entry `way`.
+    #[inline]
+    fn put(&mut self, way: usize, hash: u64, node: Weak<Node>) {
+        self.tags[way] = (hash >> 32) as u32;
+        self.nodes[way] = Some(node);
+        self.used |= 1 << way;
+    }
+}
+
+impl ConsTable {
+    /// Forgets every entry: buffers changed since they were made (`epoch` is the new one).
+    fn clear_for(&mut self, epoch: u64) {
+        for at in self.filled.drain(..) {
+            if let Some(set) = self.sets.get_mut(at as usize) {
+                set.nodes.fill_with(|| None);
+                set.used = 0;
+            }
+        }
+        self.masks.clear();
+        self.stored = 0;
+        self.epoch = epoch;
+    }
+
+    /// Drops the entries of dead nodes. A `Weak` keeps the memory of its node (a few hundred
+    /// bytes) allocated, so an entry left for the insert that replaces it keeps a whole dead
+    /// expression's nodes out of the allocator: the operations made next get fresh memory, cold
+    /// in every cache (a recorded SHA-3 of 4096 messages made 83 % more page faults and took
+    /// 1.8x the host time), where memory freed at once is reused while it is still cached.
+    /// Runs after as many inserts as entries survived the last time (at least
+    /// [`CONS_SWEEP_MIN`]), which keeps what it costs per insert constant.
+    fn sweep(&mut self) {
+        let Self { sets, filled, .. } = self;
+        let mut live = 0;
+        let mut drop_dead = |set: &mut ConsSet| {
+            let used = set.drop_dead();
+            live += used.count_ones() as usize;
+            used != 0
+        };
+        if filled.len() * 8 >= sets.len() {
+            // Most sets hold something: reading them in order is what the memory is best at.
+            filled.clear();
+            filled.extend(sets.iter_mut().enumerate().filter_map(|(at, set)| drop_dead(set).then_some(at as u32)));
+        } else {
+            filled.retain(|&at| sets.get_mut(at as usize).is_some_and(&mut drop_dead));
+        }
+        self.stored = 0;
+        self.sweep_at = live.max(CONS_SWEEP_MIN);
+    }
+
+    /// The set `hash` belongs to, of `sets` sets.
+    #[inline]
+    fn set_of(hash: u64, sets: usize) -> usize {
+        // The high bits: the low ones of an `FxHasher` result are the weakest.
+        ((hash >> 40) as usize) & (sets - 1)
+    }
+
+    /// The node recorded for `hash`, if it is still alive.
+    #[inline]
+    fn find(&self, hash: u64) -> Option<Arc<Node>> {
+        let set = self.sets.get(Self::set_of(hash, self.sets.len().max(1)))?;
+        let mut hits = set.matching(hash);
+        while hits != 0 {
+            let way = hits.trailing_zeros() as usize;
+            hits &= hits - 1;
+            if let Some(node) = set.nodes[way].as_ref().and_then(Weak::upgrade) {
+                return Some(node);
+            }
+        }
+        None
+    }
+
+    /// Records `node` for `hash`, in place of what the hash had, in a free entry, or in one whose
+    /// node is dead; if every entry of the set is alive the table grows (or, at its limit, the
+    /// hash picks the entry that gives way).
+    fn store(&mut self, hash: u64, node: Weak<Node>) {
+        if self.sets.is_empty() {
+            self.sets.resize_with(CONS_SETS_MIN, ConsSet::default);
+        }
+        self.stored += 1;
+        if self.stored >= self.sweep_at.max(CONS_SWEEP_MIN) {
+            self.sweep();
+        }
+        loop {
+            let count = self.sets.len();
+            let at = Self::set_of(hash, count);
+            let Some(set) = self.sets.get_mut(at) else { return };
+            let used = set.used;
+            let same = set.matching(hash);
+            let way = if same != 0 {
+                same.trailing_zeros() as usize
+            } else if used != CONS_FULL {
+                (!used).trailing_zeros() as usize
+            } else if let Some(way) = set.nodes.iter().position(|node| node.as_ref().is_none_or(|weak| weak.strong_count() == 0)) {
+                way
+            } else if count < CONS_SETS_MAX {
+                self.grow();
+                continue;
+            } else {
+                (hash as usize) % CONS_WAYS
+            };
+            set.put(way, hash, node);
+            if used == 0 {
+                self.filled.push(at as u32);
+            }
+            return;
+        }
+    }
+
+    /// Doubles the number of sets: the entries of set `i` go to `i` or to `i + sets`.
+    fn grow(&mut self) {
+        let old = self.sets.len();
+        let mut sets: Vec<ConsSet> = Vec::new();
+        sets.resize_with(old * 2, ConsSet::default);
+        let mut filled = Vec::with_capacity(self.filled.len() * 2);
+        for &at in &self.filled {
+            let Some(from) = self.sets.get_mut(at as usize) else { continue };
+            for way in 0..CONS_WAYS {
+                let Some(node) = from.nodes[way].take() else { continue };
+                let to = Self::set_of(u64::from(from.tags[way]) << 32, old * 2);
+                let Some(set) = sets.get_mut(to) else { continue };
+                if set.used == 0 {
+                    filled.push(to as u32);
+                }
+                let slot = (!set.used).trailing_zeros() as usize;
+                set.put(slot, u64::from(from.tags[way]) << 32, node);
+            }
+        }
+        self.sets = sets;
+        self.filled = filled;
+    }
+}
+
+/// What the mask of a region assignment is a function of: the extents of the base and, per axis,
+/// the inclusive range of base coordinates the region covers (see `Array::assign_lazy`).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct MaskKey {
+    dims: [u32; 4],
+    pub(crate) ends: [(i64, i64); 4],
+}
+
+impl MaskKey {
+    pub(crate) fn new(dims: [u32; 4], ends: [(i64, i64); 4]) -> MaskKey {
+        MaskKey { dims, ends }
+    }
+}
+
+/// What a thread keeps for each context it made operations in (see [`CONS`] and [`LIVE`]).
+struct Slot<T> {
+    /// The [`JitState::id`] of the context.
+    jit: u64,
+    /// Dead once the context is dropped, which frees the slot.
+    alive: Weak<()>,
+    value: T,
+}
+
+/// The [`Slot`]s of one thread, the latest context last.
+struct Slots<T> {
+    slots: Vec<Slot<T>>,
+    /// Calls since slots of dropped contexts were last looked for.
+    calls: u32,
+}
+
+impl<T> Slots<T> {
+    const fn new() -> Self {
+        Slots { slots: Vec::new(), calls: 0 }
+    }
+}
+
+impl<T: Default> Slots<T> {
+    /// How many calls (a power of two minus one) pass between looks for the slots of dropped
+    /// contexts.
+    const SWEEP_MASK: u32 = (1 << 14) - 1;
+
+    /// The value of `jit`, made if the thread has none yet.
+    #[inline]
+    fn of(&mut self, jit: &JitState) -> &mut T {
+        self.calls = self.calls.wrapping_add(1);
+        // The context of the last call is the one of the next, nearly always.
+        let last = self.slots.len().wrapping_sub(1);
+        if self.calls & Self::SWEEP_MASK != 0 && self.slots.get(last).is_some_and(|slot| slot.jit == jit.id) {
+            return &mut self.slots[last].value;
+        }
+        self.find(jit)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn find(&mut self, jit: &JitState) -> &mut T {
+        self.slots.retain(|slot| slot.jit == jit.id || slot.alive.strong_count() > 0);
+        let at = match self.slots.iter().rposition(|slot| slot.jit == jit.id) {
+            Some(at) => at,
+            None => {
+                self.slots.push(Slot { jit: jit.id, alive: Arc::downgrade(&jit.alive), value: T::default() });
+                self.slots.len() - 1
+            }
+        };
+        // The latest context goes last, where `of` looks first.
+        let last = self.slots.len() - 1;
+        self.slots.swap(at, last);
+        &mut self.slots[last].value
+    }
+}
+
+thread_local! {
+    /// Every node this thread created in a context and that is not yet known to be evaluated
+    /// (oldest first), so that [`Context::sync`] can evaluate the live ones. The sweeps only take
+    /// the nodes of the calling thread, so the lists need no lock.
+    static LIVE: std::cell::RefCell<Slots<readers::ReaderList>> = const { std::cell::RefCell::new(Slots::new()) };
+    /// The [`ConsTable`]s of this thread. A thread only ever shares the nodes it made itself, so
+    /// the tables need no lock.
+    static CONS: std::cell::RefCell<Slots<ConsTable>> = const { std::cell::RefCell::new(Slots::new()) };
+}
 
 /// Most levels of shifted lazy expressions a kernel stages in workgroup memory.
 const MAX_STAGES: u8 = 3;
@@ -2236,17 +2892,23 @@ pub(crate) struct JitState {
     /// Pre-parameterized keys mapped straight to their compiled kernel and appended uniform words,
     /// so repeating a step skips lowering and rewriting `key` on every launch.
     fast_kernels: Mutex<FxMap<u64, Vec<FastKernel>>>,
+    /// Kernels of store programs with transposed operands (see [`transpose::plan_fused`]).
+    fused: transpose::FusedCache,
     /// Time-blocked stencil kernels (see [`stencil`]) by their source.
     stencils: BuildCache<String, Arc<KernelCore>>,
+    /// The kernels of `scan` (see [`JitState::scan_kernel`]) by what their source is made of, so
+    /// that a call does not generate and hash the source of a kernel it has run before.
+    scans: BuildCache<String, Arc<KernelCore>>,
     /// Kernels built as Kernel IR that are not keyed by a program of fused instructions
     /// (register loops, stencils; see [`JitState::module_kernel`]).
     modules: BuildCache<String, Arc<KernelCore>>,
     /// Register-loop kernels (see [`launch::run_loop_fused`]) by program and state layout, so
     /// that a loop run again does not generate and hash its source again.
     loops: Mutex<FxMap<program::FusedKey, LoopKernels>>,
-    /// Every node created and not yet known to be evaluated, oldest first, so that
-    /// [`Context::sync`] can evaluate the live ones.
-    live: Readers,
+    /// The reductions made and not yet recorded (see [`multireduce`]), oldest first.
+    reductions: Mutex<Vec<std::sync::Weak<crate::reduce::Reduced>>>,
+    /// How many times each structure of merged reductions was recorded (see `Tuning::reduce_multi_after`), by `fast_key_hash`.
+    merged_seen: Mutex<FxMap<u64, u32>>,
     /// Nodes `eval` asked for that are not computed yet; dropped ones are skipped.
     requested: Mutex<RequestList>,
     max_nodes: AtomicUsize,
@@ -2282,7 +2944,6 @@ pub(crate) struct JitState {
     recipe_hits: AtomicU64,
     /// Counts the writes into buffers, so that [`ConsTable`] never outlives a change of contents.
     write_epoch: AtomicU64,
-    cons: Mutex<ConsTable>,
     /// The cuts of expressions made while profiling (or recording them in tests), if on.
     splits: Mutex<Option<Vec<FusionSplit>>>,
     /// Instructions of the program of the last kernel looked up (tests).
@@ -2303,10 +2964,28 @@ pub(crate) struct JitState {
     stats: Stats,
     /// Tells this state from the ones of other contexts (the `eval` history of a thread is kept by the thread, see [`looped`]).
     id: u64,
+    /// Only held here: the per-thread lists of this context ([`Slots`]) see by it when the
+    /// context is gone.
+    alive: Arc<()>,
     /// Follows reduction readbacks to find loops that can be speculated (see [`speculate`]).
     speculation: Mutex<speculate::Tracker>,
     /// The programs of register loops that ran before, by call site (see [`rerun`]).
     reruns: Mutex<rerun::Cache>,
+    /// The plans of the evaluations `eval` made (see [`plancache`]).
+    plans: Mutex<plancache::Table>,
+    /// Whether evaluations use [`JitState::plans`] (`LUMA_PLAN_CACHE=off` switches it off).
+    plan_cache: AtomicBool,
+    /// Changes whenever a setting that decides how graphs are planned does: part of every key of
+    /// [`JitState::plans`].
+    plan_epoch: AtomicU64,
+    plan_stats: plancache::Stats,
+    /// Evaluations the plan cache still sits out (see [`plancache`]).
+    plan_skip: AtomicU32,
+    /// Whether [`JitState::splits`] is recording (kept apart so that looking is a load).
+    splits_on: AtomicBool,
+    /// Nodes of this context that are alive and pending (see [`Node::settled`]): the plan cache
+    /// replays only if the graph it walked is all of them.
+    pending_nodes: std::sync::atomic::AtomicI64,
 }
 
 /// Counters of the fusion machinery, read by tests.
@@ -2328,6 +3007,8 @@ struct Stats {
     speculated: AtomicU64,
     /// Of the elementwise launches, the tiled transposes (see [`transpose`]).
     transposes: AtomicU64,
+    /// Of the elementwise launches, the ones that ran several elements per invocation (see [`coarsen`]).
+    coarsened: AtomicU64,
 }
 
 /// A snapshot of the counters of a context's [`JitState`].
@@ -2342,6 +3023,7 @@ pub(crate) struct StatsSnapshot {
     pub(crate) replays: u64,
     pub(crate) speculated: u64,
     pub(crate) transposes: u64,
+    pub(crate) coarsened: u64,
 }
 
 impl JitState {
@@ -2363,10 +3045,13 @@ impl JitState {
         JitState {
             kernels: BuildCache::default(),
             fast_kernels: Mutex::new(FxMap::default()),
+            fused: transpose::FusedCache::default(),
             stencils: BuildCache::default(),
+            scans: BuildCache::default(),
             modules: BuildCache::default(),
             loops: Mutex::new(FxMap::default()),
-            live: Readers::default(),
+            reductions: Mutex::new(Vec::new()),
+            merged_seen: Mutex::new(FxMap::default()),
             requested: Mutex::new(RequestList::default()),
             max_nodes: AtomicUsize::new(max_nodes),
             inputs_limit: AtomicUsize::new(max_inputs),
@@ -2388,7 +3073,6 @@ impl JitState {
             #[cfg(test)]
             recipe_hits: AtomicU64::new(0),
             write_epoch: AtomicU64::new(0),
-            cons: Mutex::new(ConsTable::default()),
             splits: Mutex::new(None),
             #[cfg(test)]
             last_program_len: AtomicUsize::new(0),
@@ -2401,10 +3085,18 @@ impl JitState {
             loop_work: AtomicU64::new(0),
             stats: Stats::default(),
             id: NEXT_JIT_ID.fetch_add(1, Ordering::Relaxed),
+            alive: Arc::new(()),
             speculation: Mutex::new(speculate::Tracker::new(
                 !std::env::var(SPECULATE_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")),
             )),
             reruns: Mutex::new(rerun::Cache::default()),
+            plans: Mutex::new(plancache::Table::default()),
+            plan_cache: AtomicBool::new(plancache::enabled_by(std::env::var(plancache::ENV).ok().as_deref())),
+            plan_epoch: AtomicU64::new(0),
+            plan_stats: plancache::Stats::default(),
+            plan_skip: AtomicU32::new(0),
+            splits_on: AtomicBool::new(false),
+            pending_nodes: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -2518,53 +3210,95 @@ impl JitState {
 
     /// The pending node that already computes the operation `op` on `args` (of `hash`, see
     /// [`cons_hash`]), if any.
-    fn cons_lookup(&self, hash: u64, op: Op, len: usize, args: &Args) -> Option<Arc<Node>> {
-        let mut table = lock(&self.cons);
+    fn cons_lookup(&self, hash: u64, op: &Op, len: usize, args: &Args) -> Option<Arc<Node>> {
         let epoch = self.write_epoch.load(Ordering::Relaxed);
-        if table.epoch != epoch {
-            table.map.clear();
-            table.epoch = epoch;
-            return None;
-        }
-        let node = table.map.get(&hash)?.upgrade()?;
+        // The upgraded node is checked outside the table: it may be the last owner of its node.
+        let node = self.with_cons(|table| {
+            if table.epoch != epoch {
+                table.clear_for(epoch);
+                return None;
+            }
+            table.find(hash)
+        })?;
         // A node computed inside another kernel is a dead temporary of an earlier expression:
         // sharing it would tie this expression to that one (and to its steps in a loop).
-        // One created by another thread is that thread's (it may be recording it, flattening it or
-        // waiting for what this thread evaluates: two threads sharing a node can deadlock).
+        // (The table of a thread only holds the nodes that thread made: two threads sharing a
+        // node can deadlock, one may be recording it, flattening it or waiting for what the other
+        // evaluates.)
         let usable = node.is_pending()
-            && node.thread == current_thread()
             && node.handles.load(Ordering::Relaxed) == 0
             && !node.fused.load(Ordering::Relaxed)
             && match lock(&node.args).as_ref() {
                 // The table holds hashes only: a collision must not share a different value.
-                Some(theirs) => node.op == op && node.len == len && cons_same(op, theirs, args),
+                Some(theirs) => node.op == *op && node.len == len && cons_same(op, theirs, args),
                 // A loop leaf has handed its operands to the plan.
-                None => node.looped.get().is_some() && node.op == op && node.len == len,
+                None => node.looped.get().is_some() && node.op == *op && node.len == len,
             };
         usable.then_some(node)
     }
 
-    fn cons_insert(&self, hash: u64, weak: Weak<Node>) {
-        let mut table = lock(&self.cons);
+    /// The pending mask node of `key` that no array holds, if one is still around: what the
+    /// operations that build the mask would hand out again (see [`cons_lookup`]).
+    pub(crate) fn mask_lookup(&self, key: &MaskKey) -> Option<Arc<Node>> {
         let epoch = self.write_epoch.load(Ordering::Relaxed);
-        if table.epoch != epoch {
-            table.map.clear();
-            table.epoch = epoch;
+        let node = self.with_cons(|table| {
+            if table.epoch != epoch {
+                table.clear_for(epoch);
+                return None;
+            }
+            table.masks.get(key)?.upgrade()
+        })?;
+        let usable = node.is_pending() && node.handles.load(Ordering::Relaxed) == 0 && !node.fused.load(Ordering::Relaxed) && lock(&node.args).is_some();
+        if !usable {
+            return None;
         }
-        if table.map.len() > table.prune_at.max(CONS_PRUNE_AT) {
-            table.map.retain(|_, weak| weak.strong_count() > 0);
-            table.prune_at = 2 * table.map.len();
-        }
-        table.map.insert(hash, weak);
+        rerun::reused(&node);
+        Some(node)
+    }
+
+    /// Remembers `node` as the mask of `key`.
+    pub(crate) fn mask_store(&self, key: MaskKey, node: &Arc<Node>) {
+        let epoch = self.write_epoch.load(Ordering::Relaxed);
+        self.with_cons(|table| {
+            if table.epoch != epoch {
+                table.clear_for(epoch);
+            }
+            if table.masks.len() >= 64 {
+                table.masks.retain(|_, weak| weak.strong_count() > 0);
+            }
+            table.masks.insert(key, Arc::downgrade(node));
+        });
+    }
+
+    fn cons_insert(&self, hash: u64, weak: Weak<Node>) {
+        let epoch = self.write_epoch.load(Ordering::Relaxed);
+        self.with_cons(|table| {
+            if table.epoch != epoch {
+                table.clear_for(epoch);
+            }
+            table.store(hash, weak);
+        });
+    }
+
+    /// Runs `f` on the calling thread's [`ConsTable`] of this context.
+    fn with_cons<R>(&self, f: impl FnOnce(&mut ConsTable) -> R) -> R {
+        CONS.with_borrow_mut(|slots| f(slots.of(self)))
+    }
+
+    /// Runs `f` on the calling thread's list of live nodes of this context.
+    fn with_live<R>(&self, f: impl FnOnce(&mut readers::ReaderList) -> R) -> R {
+        LIVE.with_borrow_mut(|slots| f(slots.of(self)))
     }
 
     /// Starts recording the cuts of expressions (see [`FusionSplit`]).
     pub(crate) fn start_splits(&self) {
         *lock(&self.splits) = Some(Vec::new());
+        self.splits_on.store(true, Ordering::Relaxed);
     }
 
     /// Stops recording cuts and returns them.
     pub(crate) fn take_split_notes(&self) -> Vec<FusionSplit> {
+        self.splits_on.store(false, Ordering::Relaxed);
         lock(&self.splits).take().unwrap_or_default()
     }
 
@@ -2600,6 +3334,7 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_cost_override(&self, model: cost::CostModel) {
         *lock(&self.cost_override) = Some(model);
+        self.plan_epoch.fetch_add(1, Ordering::Relaxed);
         lock(&self.judgements).clear();
         lock(&self.fast_kernels).clear();
     }
@@ -2627,6 +3362,7 @@ impl JitState {
     #[cfg(test)]
     pub(crate) fn set_staging(&self, on: bool) {
         self.staging.store(on, Ordering::Relaxed);
+        self.plan_epoch.fetch_add(1, Ordering::Relaxed);
         lock(&self.judgements).clear();
         lock(&self.fast_kernels).clear();
     }
@@ -2695,6 +3431,30 @@ impl JitState {
         lock(&self.speculation).enabled = on;
     }
 
+    /// Switches the plan cache on or off (see [`plancache`]); dropping every plan.
+    pub(crate) fn set_plan_cache(&self, on: bool) {
+        self.plan_cache.store(on, Ordering::Relaxed);
+        self.plan_skip.store(0, Ordering::Relaxed);
+        lock(&self.plans).clear();
+    }
+
+    /// What the plan cache did so far.
+    pub(crate) fn plan_stats(&self) -> plancache::StatsSnapshot {
+        self.plan_stats.snapshot()
+    }
+
+    /// Plans held by the cache (tests).
+    #[cfg(test)]
+    pub(crate) fn plan_entries(&self) -> usize {
+        lock(&self.plans).len()
+    }
+
+    /// The most launches one cached plan makes (tests).
+    #[cfg(test)]
+    pub(crate) fn longest_plan(&self) -> usize {
+        lock(&self.plans).longest()
+    }
+
     #[cfg(test)]
     pub(crate) fn requested_len(&self) -> usize {
         lock(&self.requested).nodes.len()
@@ -2716,6 +3476,7 @@ impl JitState {
             replays: self.stats.replays.load(Ordering::Relaxed),
             speculated: self.stats.speculated.load(Ordering::Relaxed),
             transposes: self.stats.transposes.load(Ordering::Relaxed),
+            coarsened: self.stats.coarsened.load(Ordering::Relaxed),
         }
     }
 
@@ -2773,6 +3534,11 @@ impl JitState {
         if !others.is_empty() {
             lock(&self.requested).nodes.extend(others);
         }
+        plancache::evaluate(self, pending, |pending| self.evaluate_pending(pending));
+    }
+
+    /// Computes `pending` (pending nodes of this thread), those of one length together.
+    fn evaluate_pending(&self, mut pending: Vec<Arc<Node>>) {
         while let Some(first) = pending.first() {
             let len = first.len;
             let (same, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|node| node.len == len);
@@ -2799,7 +3565,7 @@ impl JitState {
     /// fused into the kernel of another one.
     fn evaluate_swept(&self, held: bool) {
         let me = current_thread();
-        let nodes = self.live.take_if(|node| node.thread == me);
+        let nodes = self.with_live(|live| live.take_if(|node| node.thread == me));
         let mut pending: Vec<Arc<Node>> = nodes.into_iter().rev().filter_map(|weak| weak.upgrade()).collect();
         while let Some(first) = pending.first() {
             let len = first.len;
@@ -2813,7 +3579,7 @@ impl JitState {
                 if !node.is_pending() || (node.fused.load(Ordering::Relaxed) && !kept) {
                     // Still wanted by a later `evaluate_held`.
                     if !held && node.is_pending() && node.handles.load(Ordering::Relaxed) > 0 {
-                        self.live.add_weak(Arc::downgrade(&node));
+                        self.with_live(|live| live.add_weak(Arc::downgrade(&node)));
                     }
                     continue;
                 }
@@ -2895,7 +3661,7 @@ impl JitState {
                 && !node.is_pending_view()
         };
         let mut candidates = Vec::new();
-        self.live.for_each_newest(|weak| {
+        self.with_live(|live| live.for_each_newest(|weak| {
             let Some(node) = weak.upgrade() else { return };
             if node.len != len
                 || node.thread != me
@@ -2909,7 +3675,7 @@ impl JitState {
                 return;
             }
             candidates.push(node);
-        });
+        }));
         let mut tmp = Vec::new();
         for (idx, node) in candidates.iter().enumerate() {
             if group.iter().any(|m| m.id == node.id) || (below.contains(node.id) && !held_in_below(node)) {
@@ -2992,6 +3758,7 @@ impl JitState {
         let orig_staging = key.staging.clone();
         let orig_tile = key.tile.clone();
         let orig_guard = key.guard;
+        let orig_coarsen = key.coarsen;
         let base_words = scalars.len();
 
         if key.staging.is_none() && key.tile.is_none() {
@@ -3048,6 +3815,7 @@ impl JitState {
             staging: orig_staging,
             tile: orig_tile,
             guard: orig_guard,
+            coarsen: orig_coarsen,
             extra_words,
             params: params_marker,
             core: Arc::clone(&core),
@@ -3139,11 +3907,11 @@ impl JitState {
         let (core, size) = match built {
             codegen::Built::Module(module) => {
                 let statements = format!("{} statements of Kernel IR", module.entry_body.len());
-                (kernel::build_module(ctx, module, Some(&label), true)?, statements)
+                (kernel::build_module(ctx, module, Some(&label), luma_core::KernelTrust::Trusted)?, statements)
             }
             codegen::Built::Wgsl(source) => {
                 let bytes = format!("{} bytes of WGSL", source.len());
-                (kernel::build_core(ctx, &KernelKey::new(source, "main", None), Some(&label), true)?, bytes)
+                (kernel::build_core(ctx, &KernelKey::new(source, "main", None), Some(&label), luma_core::KernelTrust::Trusted)?, bytes)
             }
         };
         let core = Arc::new(core);
@@ -3171,7 +3939,7 @@ impl JitState {
         let (core, built) = self.stencils.get_or_build(&source, || {
             let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
             let key = KernelKey::new(source.clone(), "main", None);
-            let core = kernel::build_core(ctx, &key, Some(label), true).map(Arc::new);
+            let core = kernel::build_core(ctx, &key, Some(label), luma_core::KernelTrust::Trusted).map(Arc::new);
             if let Some(started) = started {
                 log::debug!("luma: compiled {label} ({} bytes of WGSL) in {:.1} ms", source.len(), started.elapsed().as_secs_f64() * 1e3);
             }
@@ -3181,6 +3949,12 @@ impl JitState {
             self.stats.built.fetch_add(1, Ordering::Relaxed);
         }
         Ok(core)
+    }
+
+    /// The scan or reduction kernel whose WGSL `source` generates is a function of `key` alone:
+    /// `source` runs, and the kernel compiles, on first use of the key.
+    pub(crate) fn scan_kernel(&self, ctx: &Context, key: String, label: &str, source: impl FnOnce() -> String) -> Result<Arc<KernelCore>> {
+        self.scans.get_or_build(&key, || self.stencil_kernel(ctx, source(), label)).map(|(core, _)| core)
     }
 
     /// The kernel built as Kernel IR by `build`, compiled on first use; `key` names what the
@@ -3196,7 +3970,7 @@ impl JitState {
             let started = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
             let module = build()?;
             let statements = module.entry_body.len();
-            let core = kernel::build_module(ctx, module, Some(label), true).map(Arc::new);
+            let core = kernel::build_module(ctx, module, Some(label), luma_core::KernelTrust::Trusted).map(Arc::new);
             if let Some(started) = started {
                 log::debug!("luma: compiled {label} ({statements} statements of Kernel IR) in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
             }
@@ -3224,6 +3998,7 @@ struct FastKernel {
     staging: Option<staging::Staging>,
     tile: Option<codegen::Tile>,
     guard: Option<u32>,
+    coarsen: u8,
     extra_words: Box<[u32]>,
     params: Option<Arc<params::Parameterized>>,
     core: Arc<KernelCore>,
@@ -3245,6 +4020,7 @@ impl FastKernel {
             && self.staging == key.staging
             && self.tile == key.tile
             && self.guard == key.guard
+            && self.coarsen == key.coarsen
     }
 }
 
@@ -3259,5 +4035,6 @@ fn fast_key_hash(key: &program::FusedKey) -> u64 {
     key.staging.hash(&mut hasher);
     key.tile.hash(&mut hasher);
     key.guard.hash(&mut hasher);
+    key.coarsen.hash(&mut hasher);
     hasher.finish()
 }

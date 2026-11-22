@@ -330,7 +330,7 @@ fn aborting_a_recording_concerns_only_its_thread() {
 #[test]
 fn a_launch_binds_exactly_the_bindings_the_shader_reads() {
     let ctx = ctx();
-    let build = |source: &str| kernel::build_core(&ctx, &KernelKey::new(source.to_owned(), "main", None), Some("probe"), true).unwrap();
+    let build = |source: &str| kernel::build_core(&ctx, &KernelKey::new(source.to_owned(), "main", None), Some("probe"), luma_core::KernelTrust::Trusted).unwrap();
     // The uniform at the end is unread.
     let tail = build(
         "struct Params { s0: u32, }
@@ -456,4 +456,23 @@ fn scratch_and_the_reduce_counter_are_counted_while_held() {
     assert_eq!(resident(), before + counter, "the counter stays for the life of the context");
     ctx.reduce_counter().unwrap();
     assert_eq!(resident(), before + counter, "made once");
+}
+
+/// A context is freed with its last handle, whatever ran on it: nothing process-wide may keep one
+/// alive. The kernels of the dense linear algebra were once cached in a process-wide table whose
+/// kernels hold their context, so a finished context stayed alive, and with it its GPU device,
+/// which is then never handed to the next context; the test suite of a machine with many threads
+/// ran out of the 63 or 64 devices the NVIDIA driver gives a process.
+#[test]
+fn a_context_that_ran_linear_algebra_is_freed_with_its_last_handle() {
+    let ctx = ctx();
+    let weak = Arc::downgrade(&ctx.inner);
+    let a = Array::from_slice_on(&ctx, &[4.0f32, 1.0, 0.0, 1.0, 3.0, 1.0, 0.0, 1.0, 2.0], [3, 3]).unwrap();
+    let l = a.cholesky().to_vec().unwrap();
+    assert!((l[0] - 2.0).abs() < 1e-6, "the factor was computed: {l:?}");
+    let lu = a.lu();
+    lu.lu.to_vec().unwrap();
+    drop((a, lu));
+    drop(ctx);
+    assert!(weak.upgrade().is_none(), "something outlives its context");
 }

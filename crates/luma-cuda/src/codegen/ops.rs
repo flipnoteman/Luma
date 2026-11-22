@@ -118,7 +118,7 @@ pub(crate) fn unary(fb: &mut Fb, op: IrUnOp, s: ScalarTy, a: &Op) -> (ScalarTy, 
             (I32, sel(fb, &c, "i32", &n, a))
         }
         (Abs, U32) => (U32, a.clone()),
-        (Sqrt | Exp | Ln | Sin | Cos | Tan | Tanh | Floor | Ceil | Trunc | InverseSqrt | Exp2 | Log2 | Asin | Acos | Atan | Round, F32 | F64) => {
+        (Sqrt | Exp | Ln | Sin | Cos | Tan | Tanh | Floor | Ceil | Trunc | InverseSqrt | Exp2 | Log2 | Asin | Acos | Atan | Sinh | Cosh | Asinh | Acosh | Atanh | Log10 | Cbrt | Erf | Erfc | Lgamma | Tgamma | Log1p | Expm1 | Round, F32 | F64) => {
             let base = match op {
                 Sqrt => "sqrt",
                 Exp => "exp",
@@ -136,6 +136,19 @@ pub(crate) fn unary(fb: &mut Fb, op: IrUnOp, s: ScalarTy, a: &Op) -> (ScalarTy, 
                 Asin => "asin",
                 Acos => "acos",
                 Atan => "atan",
+                Sinh => "sinh",
+                Cosh => "cosh",
+                Asinh => "asinh",
+                Acosh => "acosh",
+                Atanh => "atanh",
+                Log10 => "log10",
+                Cbrt => "cbrt",
+                Erf => "erf",
+                Erfc => "erfc",
+                Lgamma => "lgamma",
+                Tgamma => "tgamma",
+                Log1p => "log1p",
+                Expm1 => "expm1",
                 _ => "rint",
             };
             // f32 `exp`, `log`, `log2` and the trigonometric functions use the hardware
@@ -417,10 +430,6 @@ pub(crate) fn opaque(fb: &mut Fb, s: ScalarTy, a: &Op) -> Op {
     fb.def(&format!("call {t} asm sideeffect \"\", \"{c}\"({t} {a})"))
 }
 
-fn tptr(fb: &mut Fb, ptr: &Op, t: &str) -> Op {
-    fb.def(&format!("bitcast i8* {ptr} to {t}*"))
-}
-
 fn atomic_ty(s: ScalarTy) -> &'static str {
     match s {
         ScalarTy::Bool | ScalarTy::F16 => inv(format!("atomic access on `{}` is not a valid KIR atomic type", s.wgsl_name())),
@@ -430,13 +439,13 @@ fn atomic_ty(s: ScalarTy) -> &'static str {
 
 pub(crate) fn atomic_load(fb: &mut Fb, s: ScalarTy, ptr: &Op) -> Op {
     let t = atomic_ty(s);
-    let p = tptr(fb, ptr, t);
+    let p = fb.scalar_ptr(ptr, 0, s);
     fb.def(&format!("load volatile {t}, {t}* {p}, align {}", s.size_bytes()))
 }
 
 pub(crate) fn atomic_store(fb: &mut Fb, s: ScalarTy, ptr: &Op, v: &Op) {
     let t = atomic_ty(s);
-    let p = tptr(fb, ptr, t);
+    let p = fb.scalar_ptr(ptr, 0, s);
     fb.ins(&format!("store volatile {t} {v}, {t}* {p}, align {}", s.size_bytes()));
 }
 
@@ -495,7 +504,7 @@ pub(crate) fn atomic_rmw(fb: &mut Fb, op: IrAtomicOp, s: ScalarTy, ptr: &Op, v: 
     };
     match s {
         U32 | I32 => {
-            let p = tptr(fb, ptr, "i32");
+            let p = fb.typed_ptr(ptr, 0, "i32", 4);
             fb.def(&format!("atomicrmw {} i32* {p}, i32 {v} seq_cst", int_op(op, s)))
         }
         F32 | F64 => {
@@ -505,7 +514,7 @@ pub(crate) fn atomic_rmw(fb: &mut Fb, op: IrAtomicOp, s: ScalarTy, ptr: &Op, v: 
                     let name = format!("llvm.nvvm.atomic.load.add.{bits_op}");
                     fb.declare(&format!("declare {t} @{name}({t}*, {t})"));
                     let val = if op == Sub { fb.def(&format!("fsub {t} 0x8000000000000000, {v}")) } else { v.clone() };
-                    let p = tptr(fb, ptr, t);
+                    let p = fb.scalar_ptr(ptr, 0, s);
                     fb.def(&format!("call {t} @{name}({t}* {p}, {t} {val})"))
                 }
                 Min | Max => {
@@ -513,7 +522,7 @@ pub(crate) fn atomic_rmw(fb: &mut Fb, op: IrAtomicOp, s: ScalarTy, ptr: &Op, v: 
                     fb.def(&format!("call {t} @{name}(i8* {ptr}, {t} {v})"))
                 }
                 Exchange | And | Or | Xor => {
-                    let p = tptr(fb, ptr, i);
+                    let p = fb.typed_ptr(ptr, 0, i, s.size_bytes());
                     let bits = fb.def(&format!("bitcast {t} {v} to {i}"));
                     let old = fb.def(&format!("atomicrmw {} {i}* {p}, {i} {bits} seq_cst", int_op(op, s)));
                     fb.def(&format!("bitcast {i} {old} to {t}"))
@@ -532,7 +541,7 @@ pub(crate) fn atomic_cas(fb: &mut Fb, s: ScalarTy, ptr: &Op, cmp: &Op, val: &Op)
         F64 => ("i64", "double", true),
         _ => inv(format!("atomic compare-exchange on `{}` is not a valid KIR atomic type", s.wgsl_name())),
     };
-    let p = tptr(fb, ptr, i);
+    let p = fb.typed_ptr(ptr, 0, i, s.size_bytes());
     let (c, n) = if float {
         (fb.def(&format!("bitcast {t} {cmp} to {i}")), fb.def(&format!("bitcast {t} {val} to {i}")))
     } else {
@@ -551,18 +560,32 @@ pub(crate) fn lane_id(fb: &mut Fb) -> Op {
     fb.def("call i32 asm sideeffect \"mov.u32 $0, %laneid;\", \"=r\"()")
 }
 
-fn active_mask(fb: &mut Fb) -> Op {
-    fb.def("call i32 asm sideeffect \"activemask.b32 $0;\", \"=r\"()")
+/// Every subgroup instruction is `convergent`: the optimizer must not move one into a branch
+/// (or out of one, or copy it into the predecessors of its block), as that changes which lanes
+/// execute it together.
+pub(crate) fn active_mask(fb: &mut Fb) -> Op {
+    fb.def("call i32 asm sideeffect \"activemask.b32 $0;\", \"=r\"() convergent")
 }
 
-pub(crate) fn ballot(fb: &mut Fb, pred: Option<&Op>) -> Op {
-    let mask = active_mask(fb);
+/// Waits until every lane of `mask` has got here (`bar.warp.sync`).
+pub(crate) fn warp_sync(fb: &mut Fb, mask: &Op) {
+    fb.ins(&format!("call void asm sideeffect \"bar.warp.sync $0;\", \"r\"(i32 {mask}) convergent"));
+}
+
+/// The mask of the lanes a warp-wide operation involves: all of them when `converged` (see
+/// `conv`), else the active ones.
+fn warp_mask(fb: &mut Fb, converged: bool) -> Op {
+    if converged { "-1".to_string() } else { active_mask(fb) }
+}
+
+pub(crate) fn ballot(fb: &mut Fb, pred: Option<&Op>, converged: bool) -> Op {
+    let mask = warp_mask(fb, converged);
     let p = match pred {
         Some(p) => fb.def(&format!("zext i1 {p} to i32")),
         None => "1".to_string(),
     };
     fb.def(&format!(
-        "call i32 asm sideeffect \"{{ .reg .pred p; setp.ne.b32 p, $1, 0; vote.sync.ballot.b32 $0, p, $2; }}\", \"=r,r,r\"(i32 {p}, i32 {mask})"
+        "call i32 asm sideeffect \"{{ .reg .pred p; setp.ne.b32 p, $1, 0; vote.sync.ballot.b32 $0, p, $2; }}\", \"=r,r,r\"(i32 {p}, i32 {mask}) convergent"
     ))
 }
 
@@ -570,7 +593,7 @@ pub(crate) fn ballot(fb: &mut Fb, pred: Option<&Op>) -> Op {
 fn shfl32(fb: &mut Fb, kind: &str, v: &Op, lane: &Op, mask: &Op) -> Op {
     let c = if kind == "up" { "0" } else { "31" };
     fb.def(&format!(
-        "call i32 asm sideeffect \"shfl.sync.{kind}.b32 $0, $1, $2, $3, $4;\", \"=r,r,r,r,r\"(i32 {v}, i32 {lane}, i32 {c}, i32 {mask})"
+        "call i32 asm sideeffect \"shfl.sync.{kind}.b32 $0, $1, $2, $3, $4;\", \"=r,r,r,r,r\"(i32 {v}, i32 {lane}, i32 {c}, i32 {mask}) convergent"
     ))
 }
 
@@ -662,7 +685,7 @@ fn lane_loop(h: &mut Fb, pre: &str, t: &str, m: &Op, init: &Op, mut step: impl F
     accp
 }
 
-fn sg_name(op: IrSubgroupOp, s: ScalarTy, has_lane: bool) -> String {
+fn sg_name(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, converged: bool) -> String {
     let k = match (op, has_lane) {
         (IrSubgroupOp::Add, _) => "add",
         (IrSubgroupOp::Min, _) => "min",
@@ -672,13 +695,13 @@ fn sg_name(op: IrSubgroupOp, s: ScalarTy, has_lane: bool) -> String {
         (IrSubgroupOp::Shuffle, false) => "first",
         (IrSubgroupOp::Ballot, _) => inv("ballot is not a subgroup helper".to_string()),
     };
-    format!("luma_sg_{k}_{}", if s == ScalarTy::F16 { "f16" } else { s.wgsl_name() })
+    format!("luma_sg_{k}_{}{}", if s == ScalarTy::F16 { "f16" } else { s.wgsl_name() }, if converged { "_c" } else { "" })
 }
 
-fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, name: &str) -> (String, Fb) {
+fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, converged: bool, name: &str) -> (String, Fb) {
     let t = llty(s);
     let mut h = Fb::new();
-    let mask = active_mask(&mut h);
+    let mask = warp_mask(&mut h, converged);
     let v: Op = "%v".into();
     match (op, has_lane) {
         (IrSubgroupOp::Shuffle, true) => {
@@ -686,22 +709,29 @@ fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, name: &str) -> (Strin
             h.ret(&format!("ret {t} {r}"));
         }
         (IrSubgroupOp::Shuffle, false) => {
-            let l = cttz_true(&mut h, &mask);
+            // The first active lane; lane 0 when every lane is.
+            let l = if converged { "0".to_string() } else { cttz_true(&mut h, &mask) };
             let r = shfl(&mut h, "idx", s, &v, &l, &mask);
             h.ret(&format!("ret {t} {r}"));
         }
         (IrSubgroupOp::Add | IrSubgroupOp::Min | IrSubgroupOp::Max, _) => {
-            let full = h.def(&format!("icmp eq i32 {mask}, -1"));
             let (fl, pl) = (h.label(), h.label());
-            h.cond_br(&full, &fl, &pl);
+            if !converged {
+                let full = h.def(&format!("icmp eq i32 {mask}, -1"));
+                h.cond_br(&full, &fl, &pl);
+                h.start(&fl);
+            }
             // Full warp: xor butterfly.
-            h.start(&fl);
             let mut x = v.clone();
             for o in [16, 8, 4, 2, 1] {
                 let sh = shfl(&mut h, "bfly", s, &x, &o.to_string(), &mask);
                 x = combine(&mut h, op, s, &x, &sh);
             }
             h.ret(&format!("ret {t} {x}"));
+            if converged {
+                let params = if has_lane { format!("{t} %v, i32 %l") } else { format!("{t} %v") };
+                return (format!("define internal {t} @{name}({params}) alwaysinline nounwind convergent {{\n"), h);
+            }
             // Partial warp: fold the active lanes in ascending order.
             h.start(&pl);
             let f = cttz_true(&mut h, &mask);
@@ -714,11 +744,13 @@ fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, name: &str) -> (Strin
         }
         (IrSubgroupOp::ExclusiveAdd, _) => {
             let lane = lane_id(&mut h);
-            let full = h.def(&format!("icmp eq i32 {mask}, -1"));
             let (fl, pl) = (h.label(), h.label());
-            h.cond_br(&full, &fl, &pl);
+            if !converged {
+                let full = h.def(&format!("icmp eq i32 {mask}, -1"));
+                h.cond_br(&full, &fl, &pl);
+                h.start(&fl);
+            }
             // Full warp: Hillis-Steele inclusive scan, then shift by one lane.
-            h.start(&fl);
             let mut sc = v.clone();
             for o in [1, 2, 4, 8, 16] {
                 let tt = shfl(&mut h, "up", s, &sc, &o.to_string(), &mask);
@@ -730,6 +762,9 @@ fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, name: &str) -> (Strin
             let l0 = h.def(&format!("icmp eq i32 {lane}, 0"));
             let r = sel(&mut h, &l0, t, &zero(s), &ex);
             h.ret(&format!("ret {t} {r}"));
+            if converged {
+                return (format!("define internal {t} @{name}({}) alwaysinline nounwind convergent {{\n", if has_lane { format!("{t} %v, i32 %l") } else { format!("{t} %v") }), h);
+            }
             // Partial warp: sum of the active lanes below this one.
             h.start(&pl);
             let acc = lane_loop(&mut h, &pl, t, &mask, &zero(s), |h, acc, l| {
@@ -743,15 +778,15 @@ fn build_sg(op: IrSubgroupOp, s: ScalarTy, has_lane: bool, name: &str) -> (Strin
         (IrSubgroupOp::Ballot, _) => unreachable!(),
     }
     let params = if has_lane { format!("{t} %v, i32 %l") } else { format!("{t} %v") };
-    let head = format!("define internal {t} @{name}({params}) alwaysinline nounwind {{\n");
+    let head = format!("define internal {t} @{name}({params}) alwaysinline nounwind convergent {{\n");
     (head, h)
 }
 
-pub(crate) fn subgroup(fb: &mut Fb, op: IrSubgroupOp, s: ScalarTy, v: &Op, lane: Option<&Op>) -> Op {
+pub(crate) fn subgroup(fb: &mut Fb, op: IrSubgroupOp, s: ScalarTy, v: &Op, lane: Option<&Op>, converged: bool) -> Op {
     let has_lane = lane.is_some();
-    let name = sg_name(op, s, has_lane);
+    let name = sg_name(op, s, has_lane, converged);
     if !fb.helpers.contains_key(&name) {
-        let (head, h) = build_sg(op, s, has_lane, &name);
+        let (head, h) = build_sg(op, s, has_lane, converged, &name);
         fb.decls.extend(h.decls.iter().cloned());
         fb.helpers.extend(h.helpers.clone());
         let text = format!("{head}{}}}\n", h.finish());
@@ -759,7 +794,22 @@ pub(crate) fn subgroup(fb: &mut Fb, op: IrSubgroupOp, s: ScalarTy, v: &Op, lane:
     }
     let t = llty(s);
     match lane {
-        Some(l) => fb.def(&format!("call {t} @{name}({t} {v}, i32 {l})")),
-        None => fb.def(&format!("call {t} @{name}({t} {v})")),
+        Some(l) => fb.def(&format!("call {t} @{name}({t} {v}, i32 {l}) convergent")),
+        None => fb.def(&format!("call {t} @{name}({t} {v}) convergent")),
     }
+}
+
+/// A fetch from the texture object whose handle is held in `ptr` (an `i8*` made of the `i64`
+/// parameter): the four channels as `f32` lanes. `x` and `y` are `i32` texel coordinates for
+/// `Load` and `f32` normalized coordinates otherwise.
+pub(crate) fn texture(fb: &mut Fb, op: TextureOp, ptr: &Op, x: &Op, y: &Op) -> Vec<Op> {
+    let handle = fb.def(&format!("ptrtoint i8* {ptr} to i64"));
+    let (name, ct) = match op {
+        TextureOp::Load => ("llvm.nvvm.tex.unified.2d.v4f32.s32".to_string(), "i32"),
+        TextureOp::Sample => ("llvm.nvvm.tex.unified.2d.v4f32.f32".to_string(), "float"),
+        TextureOp::Gather(c) => (format!("llvm.nvvm.tld4.unified.{}.2d.v4f32.f32", ["r", "g", "b", "a"][usize::from(c & 3)]), "float"),
+    };
+    fb.declare(&format!("declare {{ float, float, float, float }} @{name}(i64, {ct}, {ct})"));
+    let r = fb.def(&format!("call {{ float, float, float, float }} @{name}(i64 {handle}, {ct} {x}, {ct} {y})"));
+    (0..4).map(|k| fb.def(&format!("extractvalue {{ float, float, float, float }} {r}, {k}"))).collect()
 }

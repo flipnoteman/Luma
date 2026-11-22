@@ -121,6 +121,25 @@ decisions are based on. The model is not a tuning knob you can set: if a decisio
 hardware, `x.cache()` forces a materialisation, and `LUMA_STAGING=off` removes the staged plan (the
 model still chooses between recomputing and materialising).
 
+### Reading a source through a texture
+
+The same model decides where a kernel reads a two-dimensional source (`jit::cost::read_path`): from
+the buffer (on NVIDIA GPUs through the read-only data cache, which a `read` binding gets on its own)
+or through the device's texture units, as exact gathers. A texture is a view of the source:
+free on CUDA (the buffer itself, as a pitched texture, kept with the array while its buffer stays
+where it is), a copy of the image on wgpu (a read and a write of it and a launch, made per use). The
+saving is a share of the kernel's time that the gathers take off (per pattern, measured on an RTX
+3090 and an RTX 3080 Laptop: bicubic warps 26 %, bilinear warps 5-13 %, scattered bicubic positions
+28-36 %, none for `resize`, smooth positions and nearest: those kernels are bound by DRAM), and a
+texture is read only where the saving is bigger than what the view costs (about 2 us on CUDA, once
+per array; a copy of the image on wgpu, 0.4 ms at 1080p, which no measured kernel recovers). The
+kernels the fusion planner builds never read through a texture: gathers from a 2-D array at computed
+or data-dependent coordinates (single `take`s, lookup tables, four-tap bilinear footprints written
+as array operations, clamped windows) ran at 0.84-1.0 of the buffer's speed in texture reads on
+both GPUs, because they are bound by DRAM or by index arithmetic, and the planner sees flat
+indices, not a footprint a gather could take. So on wgpu and the CPU backend the sources are read from buffers,
+and on CUDA the kernels above are measurably faster; `Profile` shows no extra launch.
+
 The model also sizes loops: [`iterate_all`](loops.md#launch-sizing) cuts long register loops into
 launches of about 40 ms of GPU time by it, and it decides when a circular `shift` of an expression
 is recomputed, staged, or evaluated first.
@@ -139,10 +158,10 @@ becomes the load of that kernel.
 | Primitive | Computed inside the kernel | When it runs |
 | --- | --- | --- |
 | `matmul` | each pending operand (a transpose included) is computed in the tile loads | eager: the product is recorded when called and returned evaluated, so what reads it is another kernel |
-| `sum_axis`, `min_axis`, `max_axis`, `reduce_axis`, `mean_axis`, `var_axis`, `std_axis`, `argmax_axis`, `argmin_axis` | the operand, in the first pass over the data | eager: the result is evaluated when the call returns |
+| `sum_axis`, `min_axis`, `max_axis`, `reduce_axis`, `mean_axis`, `var_axis`, `std_axis`, `argmax_axis`, `argmin_axis` | the operand, in the first pass over the data | `f32` on a GPU backend: pending until used, then recorded with the other pending axis reductions over the same lines in one kernel (up to 8 ops); otherwise eager: the result is evaluated when the call returns |
 | `solve_tridiagonal`, `solve_tridiagonal_parts`, `solve_block_tridiagonal_parts` | each pending block/vector entry is computed where a cell's system is loaded | eager: the solution is evaluated when the call returns |
 | `put_add`, `put_min`, `put_max`, `bincount`, `histogram`, `group_*` | the value and the index (or code, or bucket) expressions of the scatter | an in-place write, like `put` |
-| `sort`, `argsort`, `sort_axis` and what builds on them (`quantile`, `median`, `factorize`, `unique`) | the key expression, in the first pass of the radix sort | eager: the sorted array is evaluated; `factorize` and `unique` also read the number of distinct values back, one host wait |
+| `sort`, `argsort`, `sort_axis` and what builds on them (`quantile`, `quantiles`, `median`, `factorize`, `unique`) | the key expression, in the first pass of the radix sort (`sort_axis` of lines of up to 2048 elements evaluates its operand first) | eager: the sorted array is evaluated; `factorize` and `unique` also read the number of distinct values back, one host wait |
 
 An operand that reads circular `shift`s of other expressions, or lives in several buffers, is
 evaluated first instead. `scan` and `cumsum` always evaluate their operand (they read it twice; on CUDA, and on the native CPU backend with `LUMA_LOOKBACK_SCAN=on`, integer and `min` / `max` scans of long contiguous lines read it once).

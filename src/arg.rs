@@ -180,7 +180,7 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3
                 cell("ev", "ei", "base + s", "s"),
             );
         }
-        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback => unreachable!("scans are not reductions"),
+        Pass::Seq | Pass::Walk | Pass::ChunkFold | Pass::ChunkScan { .. } | Pass::ChunkLookback | Pass::Warp { .. } | Pass::Segments => unreachable!("scans are not reductions"),
     }
     src
 }

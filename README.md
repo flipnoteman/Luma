@@ -1,6 +1,6 @@
 # Luma
 
-[**User Guide**](https://flipnoteman.github.io/Luma/) · [**API Reference (docs.rs)**](https://docs.rs/luma) · [**Environment Variables**](https://flipnoteman.github.io/Luma/v0.5.1/environment.html)
+[**User Guide**](https://flipnoteman.github.io/Luma/) · [**API Reference (docs.rs)**](https://docs.rs/luma) · [**Environment Variables**](https://flipnoteman.github.io/Luma/v0.5.2/environment.html)
 
 Async GPU compute library for Rust. Write code with ordinary arithmetic operations and methods, and Luma handles execution
 with whatever hardware you have, through a native CUDA backend, a native Metal backend, [wgpu](https://wgpu.rs) (Vulkan, Metal, DX12), or the native SIMD CPU backend.
@@ -53,12 +53,12 @@ The **[user guide](https://flipnoteman.github.io/Luma/)** explains the model (la
 
 ## Features
 
-- Arrays of `f32`, `u32`, `i32`, `bool` (the result of comparisons, stored as one bit per element), `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; casts between `f32`, `u32` and `i32`; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
+- Arrays of `f32`, `u32`, `i32`, `u8`, `i8`, `u16`, `i16` (compact integers: 1 or 2 bytes per element, wrapping arithmetic, widening reductions), `bool` (the result of comparisons, stored as one bit per element), `Df32` (double-float, about 48-bit) and `f64` (where supported) with up to 4 dimensions; casts between `f32`, `u32` and `i32`; bitwise operations and shifts on `u32` (see `examples/keccak.rs`)
 - `vec2`/`vec4` element types and `luma::fields!` records of arrays
 - Built-in arithmetic operators, math functions, comparisons, `select` (branches can be arrays or scalars), `clamp`, circular `shift`
 - Views: `slice`, `pad`, `flip`, `transpose`, `swap_axes`, `permute_axes` (`ViewMut` `_mut` forms for writes), `take`, `put`, `concat`, `stack`, `broadcast_to`
 - Reductions: sum, min, max, mean, norm, along axes (`reduce_axis` computes several in one pass, with `mean_axis`, `var_axis`, `std_axis`); `scan` / `cumsum`; `solve_tridiagonal`
-- Data-science primitives: `matmul`; atomic scatters `put_add` / `put_min` / `put_max`, `bincount` and `histogram`; radix `sort`, `argsort`, `sort_axis`; `group_sum` / `group_mean` / `group_min` / `group_max` / `group_count`, `factorize` / `unique`; `quantile` and `median`; `searchsorted` / `digitize` / `isin`; NaN-aware reductions (`nansum`, `nanmean`, `nanmin`, `nanmax`); `round`, `trunc`, `log1p`, `expm1`. Pending operands are computed inside their kernels instead of being stored first
+- Data-science primitives: `matmul` (TF32 tensor cores on CUDA by default, `matmul_f32` for full precision), `matmul_batched`; atomic scatters `put_add` / `put_min` / `put_max`, `bincount` and `histogram`; radix `sort`, `argsort`, `sort_axis`; `group_sum` / `group_mean` / `group_min` / `group_max` / `group_count`, `factorize` / `unique`; `quantile`, `quantiles` and `median`; `searchsorted` / `digitize` / `isin`; NaN-aware reductions (`nansum`, `nanmean`, `nanmin`, `nanmax`); `round`, `trunc`, `log1p`, `expm1`. Pending operands are computed inside their kernels instead of being stored first
 - Counter-based random numbers (`uniform`, `normal`, `random_bits`), `range` and `linspace`, computed inside the kernels that read them instead of stored
 - Lazy evaluation: elementwise chains compile into a single kernel; compound assignment (`x += ..`) fuses too and overwrites the array's buffer in place
 - Batched submission
@@ -101,6 +101,22 @@ cargo build --release
 cargo test
 ```
 
+### Running the tests
+
+The integration tests are one binary (`tests/all`, one module per former test file), so that `cargo test` opens the GPU once per process, not once per test: opening a device costs 70-250 ms of driver time that does not overlap between processes, and `cargo nextest` starts a process for each of the 1000+ tests. `flush` (wall-clock timing) and `binding_limit` (sets an environment variable) keep binaries of their own.
+
+```sh
+# GPU backends (warm kernel cache: RTX 3090 20-25 s, RTX 3080 Laptop 24-30 s; a cold one takes 40 s / 100 s on CUDA; the doc tests add 20 s)
+LUMA_BACKEND=cuda cargo test --release --locked --lib --tests
+LUMA_BACKEND=wgpu cargo test --release --locked --lib --tests
+cargo test --release --locked --doc
+
+# CPU backend (tests are milliseconds there, so a process per test is fine and gives per-test timings)
+CUDA_VISIBLE_DEVICES=-1 VK_ICD_FILENAMES=/nonexistent LUMA_DEVICE=cpu cargo nextest run --release --locked --test-threads 8
+```
+
+On a job queue, one line per backend: `gpuq submit --host any -- bash -c 'LUMA_BACKEND=cuda cargo test --release --locked --no-fail-fast --lib --tests'`. `cargo nextest run` still works on every backend (`.config/nextest.toml` limits it to 8 threads and gives the CUDA tests one hardware queue per context), but each test is its own process and a GPU suite takes the time of 1000+ device opens (RTX 3090: CUDA about 55 s, wgpu about 140 s).
+
 ### Backends
 
 Luma is a Cargo workspace of six crates: `luma-hal-core` (library `luma_core`: the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-hal-wgpu`, `luma-hal-metal` and `luma-hal-cuda` (each holds one backend and its own code generator for WGSL, MSL or NVVM IR), `luma-hal-cpu` (the native SIMD backend, compiling the kernel IR with Cranelift), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal` and `cuda` each enable one GPU backend crate; the CPU backend is always included.
@@ -121,7 +137,7 @@ on demand, with a one-time warning. Custom kernels need arrays that fit one buff
 
 ### Environment variables
 
-Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_FAST_MATH=1`, `LUMA_CHECK_FINITE=1`, and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.1/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
+Common overrides: `LUMA_BACKEND` (`cuda`, `metal`, `wgpu`, `auto`), `LUMA_DEVICE` (`gpu`, `cpu`), `LUMA_MEMORY_BUDGET`, `LUMA_FAST_MATH=1`, `LUMA_CHECK_FINITE=1`, and `LUMA_CACHE=0`. See the [Environment variables reference](https://flipnoteman.github.io/Luma/v0.5.2/environment.html) in the user guide for the full list of tuning, fusion, solver, and cache variables.
 
 ### Examples
 

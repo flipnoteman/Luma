@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use luma_core::kir::{BarrierScope, BuiltinVar, FnBuilder, KernelModule, KirType, ModuleBuilder, ScalarTy, Val};
+use luma_core::LineSolveSpec;
 
 use crate::gpu::lower::finish;
 use crate::jit::ElemTy;
@@ -69,8 +70,46 @@ pub(crate) enum UnOp {
     Log1p,
     /// `e^x - 1`, accurate for small `x`.
     Expm1,
+    /// Inverse sine.
+    Asin,
+    /// Inverse cosine.
+    Acos,
+    /// Inverse tangent.
+    Atan,
+    /// Hyperbolic sine.
+    Sinh,
+    /// Hyperbolic cosine.
+    Cosh,
+    /// Inverse hyperbolic sine.
+    Asinh,
+    /// Inverse hyperbolic cosine.
+    Acosh,
+    /// Inverse hyperbolic tangent.
+    Atanh,
+    /// `2^x`.
+    Exp2,
+    /// Base-2 logarithm.
+    Log2,
+    /// Base-10 logarithm.
+    Log10,
+    /// `1 / sqrt(x)`.
+    Rsqrt,
+    /// Real cube root (negative for a negative operand).
+    Cbrt,
+    /// The error function.
+    Erf,
+    /// The complementary error function `1 - erf(x)`.
+    Erfc,
+    /// `ln |gamma(x)|`.
+    Lgamma,
+    /// The gamma function.
+    Tgamma,
+    /// The logistic function `1 / (1 + e^-x)`.
+    Sigmoid,
     /// The identity: a copy of the operand (internal).
     Id,
+    /// The complex conjugate (`C32` only).
+    Conj,
     /// Bitwise complement (`u32` only).
     BitNot,
     /// Shift left by a constant amount `0..32` (`u32` only). The amount is part of the
@@ -129,6 +168,159 @@ fn expm1_expr() -> &'static str {
     })
 }
 
+
+/// WGSL helper functions the expressions of [`UnOp`] and [`BinOp`] call (`luma_erf(x)`, ...): `f32`
+/// functions WGSL has no built-in for, written with the built-ins, so that every backend runs
+/// the same code. The kernels that use them define them, see [`special_helpers`].
+const ERF_WGSL: &str = "
+fn luma_erfc_pos(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.5 * x);
+    let p = -1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))));
+    let hi = floor(x * 16.0) / 16.0;
+    return t * exp(-hi * hi) * exp(-(x - hi) * (x + hi) + p);
+}
+fn luma_erf_series(x: f32) -> f32 {
+    let w = x * x;
+    let q = 1.0 + w * (-0.33333334 + w * (0.1 + w * (-0.023809524 + w * (0.0046296296 + w * (-0.00075757576 + w * (0.00010683761 + w * (-1.3227513e-5 + w * (1.4589169e-6 + w * (-1.4503852e-7 + w * (1.3122533e-8 + w * -1.0892221e-9))))))))));
+    return 1.1283792 * x * q;
+}
+fn luma_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let c = select(a, 10.0, a > 10.0);
+    let e = 1.0 - luma_erfc_pos(c);
+    return select(select(select(e, -e, x < 0.0), luma_erf_series(x), a < 1.0), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+fn luma_erfc(x: f32) -> f32 {
+    let a = abs(x);
+    let c = select(a, 10.0, a > 10.0);
+    let e = select(luma_erfc_pos(c), 0.0, a > 10.0);
+    return select(select(select(e, 2.0 - e, x < 0.0), 1.0 - luma_erf_series(x), a < 0.5), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+";
+const GAMMA_WGSL: &str = "
+fn luma_sinpi(r: f32) -> f32 {
+    let u = 3.14159265 * r;
+    let t = u * u;
+    return u * (1.0 + t * (-0.16666667 + t * (0.008333334 + t * (-0.0001984127 + t * (2.7557319e-6 + t * (-2.5052108e-8 + t * (1.6059044e-10 + t * -7.647163e-13)))))));
+}
+fn luma_lgamma_pos(x: f32) -> f32 {
+    let small = x < 5.0;
+    let z = select(x, x + 5.0, small);
+    let p = select(1.0, x * (x + 1.0) * (x + 2.0) * (x + 3.0) * (x + 4.0), small);
+    let i = 1.0 / z;
+    let i2 = i * i;
+    let series = i * (0.083333333 + i2 * (-0.0027777778 + i2 * (0.00079365079 + i2 * (-0.0005952381 + i2 * 0.00084175084))));
+    let r = (z - 0.5) * log(z) - z + 0.91893853 + series - log(p);
+    return select(r, bitcast<f32>(0x7f800000u), x > 1.0e37);
+}
+fn luma_gamma_pos(x: f32) -> f32 {
+    let small = x < 5.0;
+    let z = select(x, x + 5.0, small);
+    let p = select(1.0, x * (x + 1.0) * (x + 2.0) * (x + 3.0) * (x + 4.0), small);
+    let i = 1.0 / z;
+    let i2 = i * i;
+    let series = i * (0.083333333 + i2 * (-0.0027777778 + i2 * (0.00079365079 + i2 * (-0.0005952381 + i2 * 0.00084175084))));
+    return select(exp((z - 0.5) * log(z) - z + 0.91893853 + series) / p, bitcast<f32>(0x7f800000u), x > 36.0);
+}
+fn luma_lgamma(x: f32) -> f32 {
+    let pos = luma_lgamma_pos(select(1.0 - x, x, x >= 0.5));
+    let r = x - round(x);
+    let s = abs(luma_sinpi(r));
+    let v = select(log(3.14159265 / s) - pos, pos, x >= 0.5);
+    return select(select(v, bitcast<f32>(0x7f800000u), abs(x) > 1.0e37), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+fn luma_tgamma(x: f32) -> f32 {
+    let n = round(x);
+    let r = select(x - n, x, abs(x) < 0.5);
+    let odd = (n - 2.0 * floor(n * 0.5)) != 0.0;
+    let s = luma_sinpi(r) * select(1.0, -1.0, odd);
+    let g = luma_gamma_pos(select(1.0 - x, x, x >= 0.5));
+    let v = select(3.14159265 / (s * g), g, x >= 0.5);
+    return select(select(v, bitcast<f32>(0x7fc00000u), (x < 0.0) & (x == floor(x))), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+";
+const CBRT_WGSL: &str = "
+fn luma_cbrt(x: f32) -> f32 {
+    let a = abs(x);
+    let y0 = exp2(log2(a) * 0.33333334);
+    let y1 = y0 - (y0 - a / (y0 * y0)) * 0.33333334;
+    let r = select(a, y1, (a > 0.0) & (a < 3.4028235e38));
+    return select(bitcast<f32>(bitcast<u32>(r) | (bitcast<u32>(x) & 0x80000000u)), x, (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u);
+}
+";
+const POW_WGSL: &str = "
+fn luma_powf(x: f32, y: f32) -> f32 {
+    let r = pow(abs(x), y);
+    let integer = floor(y) == y;
+    let odd = integer & (abs(y) < 16777216.0) & ((y - 2.0 * floor(0.5 * y)) == 1.0);
+    let negative = (bitcast<u32>(x) >> 31u) == 1u;
+    let signed = select(r, select(-r, r, !odd), negative);
+    let c = select(signed, bitcast<f32>(0x7fc00000u), negative & !integer);
+    return select(c, 1.0, (y == 0.0) | (x == 1.0));
+}
+";
+const MOD_WGSL: &str = "
+fn luma_modf(x: f32, y: f32) -> f32 {
+    let r = select(x % y, x, (abs(y) > 3.4028235e38) & (abs(x) < 3.4028235e38));
+    return select(r, r + y, (r != 0.0) & ((r < 0.0) != (y < 0.0)));
+}
+fn luma_modi(x: i32, y: i32) -> i32 {
+    let r = x % y;
+    return select(r, r + y, (r != 0) & ((r < 0) != (y < 0)));
+}
+fn luma_modd(x: f64, y: f64) -> f64 {
+    let r = select(x % y, x, (abs(y) > 1.7976931348623157e308lf) & (abs(x) < 1.7976931348623157e308lf));
+    return select(r, r + y, (r != f64(0.0)) & ((r < f64(0.0)) != (y < f64(0.0))));
+}
+";
+const WIDE_WGSL: &str = "
+fn luma_hypotd(x: f64, y: f64) -> f64 {
+    let a = abs(x);
+    let b = abs(y);
+    let m = max(a, b);
+    let u = a / m;
+    let v = b / m;
+    return select(a + b, m * sqrt(u * u + v * v), (m > f64(0.0)) & (m < 1.7976931348623157e308lf));
+}
+fn luma_copysignd(x: f64, y: f64) -> f64 {
+    let neg = (y < f64(0.0)) | ((y == f64(0.0)) & ((f64(1.0) / y) < f64(0.0)));
+    return select(abs(x), -abs(x), neg);
+}
+";
+/// Stubs for the `f64` operations WGSL has no function for: a call of `luma_ir_<name>` lowers to the
+/// operation of that name (see `luma_core::kir::from_wgsl`), whatever the body says.
+const WIDE_STUBS: &str = "
+fn luma_ir_erf(x: f64) -> f64 { return x; }
+fn luma_ir_erfc(x: f64) -> f64 { return x; }
+fn luma_ir_lgamma(x: f64) -> f64 { return x; }
+fn luma_ir_tgamma(x: f64) -> f64 { return x; }
+fn luma_ir_cbrt(x: f64) -> f64 { return x; }
+fn luma_ir_log10(x: f64) -> f64 { return x; }
+fn luma_ir_log1p(x: f64) -> f64 { return x; }
+fn luma_ir_expm1(x: f64) -> f64 { return x; }
+";
+
+/// The WGSL helper functions among the above that the code uses: `uses(name)` says whether a
+/// function (`luma_erf(`, with its parenthesis) is called.
+pub(crate) fn special_helpers(mut uses: impl FnMut(&str) -> bool) -> String {
+    let groups: [(&[&str], &str); 7] = [
+        (&["luma_erf(", "luma_erfc("], ERF_WGSL),
+        (&["luma_lgamma(", "luma_tgamma("], GAMMA_WGSL),
+        (&["luma_cbrt("], CBRT_WGSL),
+        (&["luma_powf("], POW_WGSL),
+        (&["luma_modf(", "luma_modi(", "luma_modd("], MOD_WGSL),
+        (&["luma_hypotd(", "luma_copysignd("], WIDE_WGSL),
+        (&["luma_ir_"], WIDE_STUBS),
+    ];
+    let mut out = String::new();
+    for (needles, text) in groups {
+        if needles.iter().any(|needle| uses(needle)) {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
 impl UnOp {
     /// The operation as a WGSL expression of the operand `x`.
     pub(crate) fn expr(self) -> &'static str {
@@ -151,7 +343,27 @@ impl UnOp {
             UnOp::Round => "round(x)",
             UnOp::Log1p => log1p_expr(),
             UnOp::Expm1 => expm1_expr(),
+            UnOp::Asin => "asin(x)",
+            UnOp::Acos => "acos(x)",
+            UnOp::Atan => "atan(x)",
+            UnOp::Sinh => "sinh(x)",
+            UnOp::Cosh => "cosh(x)",
+            UnOp::Asinh => "asinh(x)",
+            UnOp::Acosh => "acosh(x)",
+            UnOp::Atanh => "atanh(x)",
+            UnOp::Exp2 => "exp2(x)",
+            UnOp::Log2 => "log2(x)",
+            // `log2(x) / log2(10)`; `log2` is the device's, exact at powers of two.
+            UnOp::Log10 => "(log2(x) * 0.30102999566398120)",
+            UnOp::Rsqrt => "inverseSqrt(x)",
+            UnOp::Cbrt => "luma_cbrt(x)",
+            UnOp::Erf => "luma_erf(x)",
+            UnOp::Erfc => "luma_erfc(x)",
+            UnOp::Lgamma => "luma_lgamma(x)",
+            UnOp::Tgamma => "luma_tgamma(x)",
+            UnOp::Sigmoid => "(1.0 / (1.0 + exp(-x)))",
             UnOp::Id => "x",
+            UnOp::Conj => "vec2<f32>(x.r, -x.g)",
             UnOp::BitNot => "~x",
             UnOp::Shl(k) => by_constant(0, k),
             UnOp::Shr(k) => by_constant(1, k),
@@ -177,7 +389,26 @@ impl UnOp {
             UnOp::Round => "round",
             UnOp::Log1p => "log1p",
             UnOp::Expm1 => "expm1",
+            UnOp::Asin => "asin",
+            UnOp::Acos => "acos",
+            UnOp::Atan => "atan",
+            UnOp::Sinh => "sinh",
+            UnOp::Cosh => "cosh",
+            UnOp::Asinh => "asinh",
+            UnOp::Acosh => "acosh",
+            UnOp::Atanh => "atanh",
+            UnOp::Exp2 => "exp2",
+            UnOp::Log2 => "log2",
+            UnOp::Log10 => "log10",
+            UnOp::Rsqrt => "rsqrt",
+            UnOp::Cbrt => "cbrt",
+            UnOp::Erf => "erf",
+            UnOp::Erfc => "erfc",
+            UnOp::Lgamma => "lgamma",
+            UnOp::Tgamma => "tgamma",
+            UnOp::Sigmoid => "sigmoid",
             UnOp::Id => "copy",
+            UnOp::Conj => "conj",
             UnOp::BitNot => "not",
             UnOp::Shl(_) => "shl",
             UnOp::Shr(_) => "shr",
@@ -187,6 +418,27 @@ impl UnOp {
 }
 
 impl UnOp {
+    /// The `f64` form of the operations whose WGSL text is the same function of `x` for every float
+    /// width (the `tanh` text is `f32`'s with a bound).
+    fn expr_f64_plain(self) -> &'static str {
+        match self {
+            UnOp::Tanh => "tanh(x)",
+            other => other.expr(),
+        }
+    }
+
+    /// Whether the operation calls a function of [`special_helpers`] (an `f32` one), which the
+    /// kernels that use it have to define; such an operation cannot run inside a reduction's last pass.
+    pub(crate) fn needs_helper(self) -> bool {
+        matches!(self, UnOp::Cbrt | UnOp::Erf | UnOp::Erfc | UnOp::Lgamma | UnOp::Tgamma)
+    }
+
+    /// Whether `f64` elements need a backend with `f64` math functions (CUDA or the CPU): WGSL
+    /// has none, so on a Vulkan device `f64` only has the arithmetic.
+    pub(crate) fn wide_math(self) -> bool {
+        !matches!(self, UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Trunc | UnOp::Round | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_))
+    }
+
     /// Whether the operation only exists for `u32`.
     pub(crate) fn is_bitwise(self) -> bool {
         matches!(self, UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Rotl(_))
@@ -205,6 +457,34 @@ impl UnOp {
     }
 }
 
+/// `expr`, a WGSL expression of the 32-bit register of the small integer type `ty`, narrowed to
+/// the range of the type again (the wraparound of the arithmetic): a mask for the unsigned
+/// types, a shift up and an arithmetic shift back down for the signed ones.
+pub(crate) fn narrow_expr(ty: ElemTy, expr: &str) -> String {
+    match ty {
+        ElemTy::U8 => format!("(({expr}) & 255u)"),
+        ElemTy::U16 => format!("(({expr}) & 65535u)"),
+        ElemTy::I8 => format!("((({expr}) << 24u) >> 24u)"),
+        ElemTy::I16 => format!("((({expr}) << 16u) >> 16u)"),
+        _ => expr.to_owned(),
+    }
+}
+
+impl UnOp {
+    /// Whether the result of the operation on a small integer may leave the range of the type
+    /// (and is narrowed again, see [`narrow_expr`]).
+    pub(crate) fn widens(self) -> bool {
+        matches!(self, UnOp::Neg | UnOp::Abs | UnOp::BitNot | UnOp::Shl(_))
+    }
+}
+
+impl BinOp {
+    /// [`UnOp::widens`] for the binary operations.
+    pub(crate) fn widens(self) -> bool {
+        matches!(self, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Shl)
+    }
+}
+
 impl UnOp {
     /// [`UnOp::expr`] for elements of type `ty`, `None` if the operation does not exist for it
     /// (`f64` has the exact built-ins, `Df32` the library ones, see [`df_library`]).
@@ -219,14 +499,47 @@ impl UnOp {
                 UnOp::BitNot => Some("(x ^ 1u)"),
                 _ => None,
             },
-            ElemTy::I32 => match self {
+            // The result is narrowed again by the caller (`narrow_expr`).
+            ElemTy::U8 | ElemTy::U16 => match self {
+                UnOp::BitNot | UnOp::Id | UnOp::Shl(_) | UnOp::Shr(_) | UnOp::Neg | UnOp::Abs => Some(match self {
+                    UnOp::Neg => "(0u - x)",
+                    UnOp::Abs => "x",
+                    _ => self.expr(),
+                }),
+                _ => None,
+            },
+            ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => match self {
                 UnOp::Neg | UnOp::Abs | UnOp::Sign | UnOp::Id | UnOp::BitNot | UnOp::Shl(_) | UnOp::Shr(_) => Some(self.expr()),
                 _ => None,
             },
-            ElemTy::F32 if self.is_bitwise() => None,
+            ElemTy::F32 if self.is_bitwise() || self == UnOp::Conj => None,
             ElemTy::F32 => Some(self.expr()),
+            ElemTy::C32 => match self {
+                UnOp::Neg => Some("-x"),
+                UnOp::Conj => Some(self.expr()),
+                UnOp::Sqrt => Some("c_sqrt(x)"),
+                UnOp::Exp => Some("c_exp(x)"),
+                UnOp::Id => Some("x"),
+                _ => None,
+            },
             ElemTy::F64 => match self {
                 UnOp::Neg | UnOp::Abs | UnOp::Sqrt | UnOp::Sign | UnOp::Floor | UnOp::Ceil | UnOp::Id => Some(self.expr()),
+                // The `f64` math functions exist on the backends with `f64` math (CUDA and the CPU, see
+                // `UnOp::wide_math`); the ones WGSL has no function for are calls of stubs the
+                // lowering replaces by the operation (see `WIDE_STUBS`).
+                UnOp::Exp | UnOp::Ln | UnOp::Sin | UnOp::Cos | UnOp::Tan | UnOp::Tanh | UnOp::Asin | UnOp::Acos | UnOp::Atan | UnOp::Sinh | UnOp::Cosh | UnOp::Asinh | UnOp::Acosh | UnOp::Atanh | UnOp::Exp2 | UnOp::Log2 => {
+                    Some(self.expr_f64_plain())
+                }
+                UnOp::Rsqrt => Some("inverseSqrt(x)"),
+                UnOp::Sigmoid => Some("(f64(1.0) / (f64(1.0) + exp(-x)))"),
+                UnOp::Log10 => Some("luma_ir_log10(x)"),
+                UnOp::Cbrt => Some("luma_ir_cbrt(x)"),
+                UnOp::Erf => Some("luma_ir_erf(x)"),
+                UnOp::Erfc => Some("luma_ir_erfc(x)"),
+                UnOp::Lgamma => Some("luma_ir_lgamma(x)"),
+                UnOp::Tgamma => Some("luma_ir_tgamma(x)"),
+                UnOp::Log1p => Some("luma_ir_log1p(x)"),
+                UnOp::Expm1 => Some("luma_ir_expm1(x)"),
                 // The drivers' `f64` `round` and `trunc` are not exact everywhere (Mesa's lavapipe
                 // rounds -2.50000000025 to -2), so both are built from `floor` of `|x|` and exact
                 // `f64` arithmetic on its remainder; a zero keeps its sign, a NaN stays NaN.
@@ -266,6 +579,8 @@ pub(crate) enum BinOp {
     Hypot,
     Copysign,
     Rem,
+    /// The modulus: the remainder with the sign of the divisor (`-1 mod 3 = 2`).
+    Mod,
     /// Bitwise operations on `u32` (shift and rotate amounts are taken modulo 32).
     BitAnd,
     BitOr,
@@ -276,6 +591,17 @@ pub(crate) enum BinOp {
 }
 
 impl BinOp {
+    /// Whether the operation calls a function of [`special_helpers`] for `f32` elements (see
+    /// [`UnOp::needs_helper`]).
+    pub(crate) fn needs_helper(self) -> bool {
+        matches!(self, BinOp::Mod)
+    }
+
+    /// Whether `f64` elements need a backend with `f64` math functions (see [`UnOp::wide_math`]).
+    pub(crate) fn wide_math(self) -> bool {
+        matches!(self, BinOp::Rem | BinOp::Atan2 | BinOp::Hypot | BinOp::Copysign | BinOp::Mod)
+    }
+
     /// Whether the operation only exists for `u32`.
     pub(crate) fn is_bitwise(self) -> bool {
         matches!(self, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Rotl)
@@ -300,6 +626,7 @@ impl BinOp {
             BinOp::Hypot => "select(select(abs(x) + abs(y), max(abs(x), abs(y)) * length(vec2<f32>(x / max(abs(x), abs(y)), y / max(abs(x), abs(y)))), max(abs(x), abs(y)) > 0.0 && max(abs(x), abs(y)) < 3.4028235e38), bitcast<f32>(0x7f800000u), abs(x) > 3.4028235e38 || abs(y) > 3.4028235e38)",
             BinOp::Copysign => "bitcast<f32>((bitcast<u32>(x) & 0x7fffffffu) | (bitcast<u32>(y) & 0x80000000u))",
             BinOp::Rem => "x % y",
+            BinOp::Mod => "luma_modf(x, y)",
             BinOp::BitAnd => "x & y",
             BinOp::BitOr => "x | y",
             BinOp::BitXor => "x ^ y",
@@ -314,6 +641,7 @@ impl BinOp {
     /// [`BinOp::expr`] for elements of type `ty`, `None` if the operation does not exist for it.
     pub(crate) fn expr_for(self, ty: ElemTy) -> Option<&'static str> {
         match ty {
+            ElemTy::U32 if self == BinOp::Mod => Some("(x % y)"),
             ElemTy::U32 => Some(self.expr()),
             ElemTy::Bool => match self {
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Min | BinOp::Max => Some(self.expr()),
@@ -321,13 +649,35 @@ impl BinOp {
             },
             ElemTy::I32 => match self {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Min | BinOp::Max | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Some(self.expr()),
+                BinOp::Mod => Some("luma_modi(x, y)"),
                 BinOp::Shl => Some("x << (bitcast<u32>(y) & 31u)"),
                 BinOp::Shr => Some("x >> (bitcast<u32>(y) & 31u)"),
                 _ => None,
             },
+            // Narrowed again by the caller (`narrow_expr`); shift amounts are taken modulo the width.
+            ElemTy::U8 | ElemTy::U16 | ElemTy::I8 | ElemTy::I16 => {
+                let wide = ty.small_bits() == 16;
+                match self {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Min | BinOp::Max | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Some(self.expr()),
+                    BinOp::Shl if ty.is_small_signed() => Some(if wide { "x << (bitcast<u32>(y) & 15u)" } else { "x << (bitcast<u32>(y) & 7u)" }),
+                    BinOp::Shr if ty.is_small_signed() => Some(if wide { "x >> (bitcast<u32>(y) & 15u)" } else { "x >> (bitcast<u32>(y) & 7u)" }),
+                    BinOp::Shl => Some(if wide { "x << (y & 15u)" } else { "x << (y & 7u)" }),
+                    BinOp::Shr => Some(if wide { "x >> (y & 15u)" } else { "x >> (y & 7u)" }),
+                    _ => None,
+                }
+            }
             ElemTy::F32 => (!self.is_bitwise()).then(|| self.expr()),
             ElemTy::F64 => match self {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max => Some(self.expr()),
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Min | BinOp::Max | BinOp::Rem | BinOp::Atan2 => Some(self.expr()),
+                BinOp::Mod => Some("luma_modd(x, y)"),
+                BinOp::Hypot => Some("luma_hypotd(x, y)"),
+                BinOp::Copysign => Some("luma_copysignd(x, y)"),
+                _ => None,
+            },
+            ElemTy::C32 => match self {
+                BinOp::Add | BinOp::Sub => Some(self.expr()),
+                BinOp::Mul => Some("c_mul(x, y)"),
+                BinOp::Div => Some("c_div(x, y)"),
                 _ => None,
             },
             ElemTy::Df32 => match self {
@@ -368,9 +718,18 @@ impl CmpOp {
 }
 
 impl CmpOp {
+    /// Whether the comparison exists for elements of type `ty`: complex numbers are only equal or not.
+    pub(crate) fn exists_for(self, ty: ElemTy) -> bool {
+        ty != ElemTy::C32 || matches!(self, CmpOp::Eq | CmpOp::Ne)
+    }
+
     /// [`CmpOp::expr`] for elements of type `ty`.
     pub(crate) fn expr_for(self, ty: ElemTy) -> &'static str {
         match ty {
+            ElemTy::C32 => match self {
+                CmpOp::Ne => "select(1u, 0u, c_eq(x, y))",
+                _ => "select(0u, 1u, c_eq(x, y))",
+            },
             ElemTy::Df32 => match self {
                 CmpOp::Lt => "select(0u, 1u, df_lt(x, y))",
                 CmpOp::Le => "select(0u, 1u, df_le(x, y))",
@@ -382,6 +741,98 @@ impl CmpOp {
             _ => self.expr(),
         }
     }
+}
+
+/// A real quantity of a complex number (see [`ElemTy::C32`]): the operation maps an element
+/// `vec2<f32>` `(re, im)` to an `f32`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Part {
+    /// The real part.
+    Real,
+    /// The imaginary part.
+    Imag,
+    /// The modulus, scaled so that it neither overflows nor underflows where the result is
+    /// representable.
+    Abs,
+    /// The argument `atan2(im, re)`.
+    Arg,
+    /// `re * re + im * im`.
+    NormSqr,
+}
+
+impl Part {
+    /// The quantity as a WGSL expression of the operand `x` (its components are `r` and `g`:
+    /// [`substitute`] replaces every `x` of the template, `x.x` included).
+    pub(crate) fn expr(self) -> &'static str {
+        match self {
+            Part::Real => "x.r",
+            Part::Imag => "x.g",
+            Part::Abs => "c_abs(x)",
+            Part::Arg => "atan2(x.g, x.r)",
+            Part::NormSqr => "(x.r * x.r + x.g * x.g)",
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Part::Real => "real",
+            Part::Imag => "imag",
+            Part::Abs => "abs",
+            Part::Arg => "arg",
+            Part::NormSqr => "norm_sqr",
+        }
+    }
+}
+
+/// The complex arithmetic that is not a single `f32` operation per component, on `vec2<f32>` `(re,
+/// im)`: the functions of [`BinOp::expr_for`], [`UnOp::expr_for`], [`CmpOp::expr_for`] and
+/// [`Part::expr`] for `C32`. Pure `f32` arithmetic without the guard of [`df_library`], so that the
+/// compiler fuses the products into `fma`.
+///
+/// * `c_mul`: the textbook product.
+/// * `c_div`: Smith's algorithm (the quotient of the components of the denominator scales the
+///   rest, so no intermediate overflows where the result is representable); a zero denominator
+///   gives `(re / 0, im / 0)`, infinity or `NaN` per component as `C99` Annex G has it, with no
+///   trap.
+/// * `c_abs`: the modulus from the components scaled by a power of two (exact) when the larger is
+///   above `2^62` or below `2^-62`, so no square overflows or underflows, and with no division
+///   (a fast division returns 0 for a divisor above `2^126`). Infinite if a component is.
+/// * `c_exp`: `e^re (cos im, sin im)`, the imaginary part of the result keeps the sign of a zero `im`
+///   (so `exp(inf + 0i)` is `inf + 0i`, not `NaN`).
+/// * `c_sqrt`: the principal square root, `(t, im / 2t)` with `t = sqrt((|z| + |re|) / 2)`
+///   on the right half-plane and the mirrored form on the left one (no cancellation).
+pub(crate) fn complex_library() -> &'static str {
+    "fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+fn c_div(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let big = abs(b.y) <= abs(b.x);
+    let r = select(b.x / b.y, b.y / b.x, big);
+    let d = select(b.x * r + b.y, b.x + b.y * r, big);
+    let n = select(vec2<f32>(a.x * r + a.y, a.y * r - a.x), vec2<f32>(a.x + a.y * r, a.y - a.x * r), big);
+    return select(n / d, a / b.x, (b.x == 0.0) & (b.y == 0.0));
+}
+fn c_abs(a: vec2<f32>) -> f32 {
+    let x = abs(a.x); let y = abs(a.y);
+    let m = max(x, y);
+    let huge = m > 4.611686e18;
+    let tiny = m < 2.1684043e-19;
+    let down = select(select(1.0, 7.3786976e19, tiny), 1.3552527e-20, huge);
+    let up = select(select(1.0, 1.3552527e-20, tiny), 7.3786976e19, huge);
+    let r = sqrt((x * down) * (x * down) + (y * down) * (y * down)) * up;
+    return select(r, bitcast<f32>(0x7f800000u), (x > 3.4028235e38) | (y > 3.4028235e38));
+}
+fn c_eq(a: vec2<f32>, b: vec2<f32>) -> bool { return (a.x == b.x) & (a.y == b.y); }
+fn c_exp(a: vec2<f32>) -> vec2<f32> {
+    let e = exp(a.x);
+    return vec2<f32>(e * cos(a.y), select(e * sin(a.y), a.y, a.y == 0.0));
+}
+fn c_sqrt(a: vec2<f32>) -> vec2<f32> {
+    let t = sqrt(0.5 * (c_abs(a) + abs(a.x)));
+    let u = a.y / (2.0 * t);
+    let flipped = select(t, -t, (bitcast<u32>(a.y) & 0x80000000u) != 0u);
+    let root = select(vec2<f32>(abs(u), flipped), vec2<f32>(t, u), a.x >= 0.0);
+    return select(root, vec2<f32>(0.0, a.y), (a.x == 0.0) & (a.y == 0.0));
+}
+"
 }
 
 /// A test of what kind of floating-point value an element is, read from the bits of its
@@ -438,6 +889,10 @@ pub(crate) enum ReduceOp {
     Max,
     /// Sum of squares of the input; the later passes over its partial results are sums.
     SumSquares,
+    /// The product of the input, identity 1 (a NaN gives NaN, integers wrap); the later passes
+    /// over its partial results are products. There is no subgroup product: the kernels combine
+    /// lanes with shuffles (`f32`, `u32`, `i32`) or in workgroup memory.
+    Prod,
     /// The index of the first largest element of a line (a NaN is the largest); the partial results
     /// of a pass are (value, index) pairs. Only the axis passes of [`crate::arg`] run it, alone in
     /// its [`ReduceList`].
@@ -507,10 +962,15 @@ impl Epilogue {
     /// The fields of the `Params` uniform that hold the scalar operands: `e{k}: f32,` for every
     /// binary step `k`.
     pub(crate) fn fields(&self) -> String {
+        self.fields_tagged("")
+    }
+
+    /// [`Epilogue::fields`] with `tag` between the `e` and the step's number.
+    fn fields_tagged(&self, tag: &str) -> String {
         let mut out = String::new();
         for (k, step) in self.steps().enumerate() {
             if matches!(step, EpilogueStep::Binary { .. }) {
-                let _ = write!(out, "e{k}: f32, ");
+                let _ = write!(out, "e{tag}{k}: f32, ");
             }
         }
         out
@@ -519,13 +979,18 @@ impl Epilogue {
     /// WGSL statements applying the steps to the `f32` expression `value` (`let {prefix}{k}` is
     /// the result of step `k`) and the name of the final result (`value` if there are none).
     pub(crate) fn statements(&self, value: &str, prefix: &str) -> (String, String) {
+        self.statements_with(value, prefix, |k| format!("p.e{k}"))
+    }
+
+    /// [`Epilogue::statements`] with the scalar operand of binary step `k` named `field(k)`.
+    fn statements_with(&self, value: &str, prefix: &str, field: impl Fn(usize) -> String) -> (String, String) {
         let mut out = String::new();
         let mut last = value.to_owned();
         for (k, step) in self.steps().enumerate() {
             let expr = match step {
                 EpilogueStep::Unary(op) => substitute(op.expr(), &last, ""),
-                EpilogueStep::Binary { op, scalar_left: false } => substitute(op.expr(), &last, &format!("p.e{k}")),
-                EpilogueStep::Binary { op, scalar_left: true } => substitute(op.expr(), &format!("p.e{k}"), &last),
+                EpilogueStep::Binary { op, scalar_left: false } => substitute(op.expr(), &last, &field(k)),
+                EpilogueStep::Binary { op, scalar_left: true } => substitute(op.expr(), &field(k), &last),
             };
             let _ = writeln!(out, "        let {prefix}{k}: f32 = {expr};");
             last = format!("{prefix}{k}");
@@ -596,11 +1061,65 @@ impl GateId {
     }
 }
 
+/// Most accumulators one reduction kernel computes when it reduces several operands (see
+/// [`ReduceList::merged`]).
+pub(crate) const MAX_ACCS: usize = 32;
+
+/// What a merged reduction adds to its [`ReduceList`]: which operand every op reduces, and the
+/// epilogue of every op. Interned (see [`Merged`]), so that the list stays a small `Copy` value.
+#[derive(PartialEq, Eq, Hash, Debug)]
+struct MergedSpec {
+    /// The root (index into the kernel's outputs) every op reduces; empty for the passes after the
+    /// first, which reduce partial results.
+    roots: Vec<u8>,
+    /// The epilogue of every op.
+    epilogues: Vec<Epilogue>,
+}
+
+/// The registered merged specs: by handle, and the handles by spec.
+#[derive(Default)]
+struct MergedSpecs {
+    specs: Vec<std::sync::Arc<MergedSpec>>,
+    ids: crate::gpu::hash::FxMap<(Vec<u8>, Vec<Epilogue>), u32>,
+}
+
+static MERGED_SPECS: std::sync::LazyLock<std::sync::Mutex<MergedSpecs>> = std::sync::LazyLock::new(Default::default);
+
+/// A merged reduction's roots and epilogues, by handle.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct MergedId(u32);
+
+impl MergedId {
+    fn intern(roots: &[u8], epilogues: &[Epilogue]) -> MergedId {
+        let mut specs = crate::gpu::lock(&MERGED_SPECS);
+        let key = (roots.to_vec(), epilogues.to_vec());
+        if let Some(&id) = specs.ids.get(&key) {
+            return MergedId(id);
+        }
+        let id = specs.specs.len() as u32;
+        specs.specs.push(std::sync::Arc::new(MergedSpec { roots: key.0.clone(), epilogues: key.1.clone() }));
+        specs.ids.insert(key, id);
+        MergedId(id)
+    }
+
+    fn spec(self) -> std::sync::Arc<MergedSpec> {
+        std::sync::Arc::clone(&crate::gpu::lock(&MERGED_SPECS).specs[self.0 as usize])
+    }
+}
+
+/// A [`ReduceList`] of ops over several operands, each with an epilogue of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Merged {
+    id: MergedId,
+    /// Whether the epilogues are applied by this pass (the last one).
+    applied: bool,
+}
+
 /// Reductions computed together, in order (a kernel cache key, so a fixed-size value), and what
 /// is applied to their results.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ReduceList {
-    ops: [ReduceOp; MAX_REDUCTIONS],
+    ops: [ReduceOp; MAX_ACCS],
     len: u8,
     /// Applied to every value of the pass's output; only a pass that is the last (one group,
     /// or the last workgroup of a [single-pass](ReduceList::single_pass) kernel) has one.
@@ -609,16 +1128,33 @@ pub(crate) struct ReduceList {
     single_pass: bool,
     /// The gate the workgroup that has the final values runs on them (see [`ReduceList::with_gate`]).
     gate: Option<GateId>,
+    /// Set for a list of several operands (see [`ReduceList::merged`]): `epilogue` is not used then.
+    merged: Option<Merged>,
 }
 
 impl ReduceList {
     /// `ops` must hold between 1 and [`MAX_REDUCTIONS`] ops.
     pub(crate) fn new(ops: &[ReduceOp]) -> Self {
-        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_REDUCTIONS], len: 0, epilogue: Epilogue::default(), single_pass: false, gate: None };
+        debug_assert!(ops.len() <= MAX_REDUCTIONS);
+        Self::with_ops(ops)
+    }
+
+    fn with_ops(ops: &[ReduceOp]) -> Self {
+        let mut list = ReduceList { ops: [ReduceOp::Sum; MAX_ACCS], len: 0, epilogue: Epilogue::default(), single_pass: false, gate: None, merged: None };
         for (slot, &op) in list.ops.iter_mut().zip(ops) {
             *slot = op;
             list.len += 1;
         }
+        list
+    }
+
+    /// The ops `ops` (at most [`MAX_ACCS`]), op `j` reducing the root `roots[j]` of the kernel's
+    /// program (all of one element type), with the epilogue `epilogues[j]` applied once the
+    /// pass is the last (see [`ReduceList::finished`]).
+    pub(crate) fn merged(ops: &[ReduceOp], roots: &[u8], epilogues: &[Epilogue]) -> Self {
+        debug_assert!(ops.len() == roots.len() && ops.len() == epilogues.len() && ops.len() <= MAX_ACCS);
+        let mut list = Self::with_ops(ops);
+        list.merged = Some(Merged { id: MergedId::intern(roots, epilogues), applied: false });
         list
     }
 
@@ -636,14 +1172,27 @@ impl ReduceList {
     pub(crate) fn rest(self) -> Self {
         let mut list = self;
         list.ops.iter_mut().for_each(|op| *op = op.rest());
+        if let Some(merged) = list.merged {
+            list.merged = Some(Merged { id: MergedId::intern(&[], &merged.id.spec().epilogues), ..merged });
+        }
         list
     }
 
     /// These reductions with `epilogue` applied to the results. The kernel must run as a single
     /// group (the last pass), or be [single-pass](ReduceList::single_pass): its output is the
-    /// final value.
+    /// final value. Not for a [merged](ReduceList::merged) list (see [`ReduceList::finished`]).
     pub(crate) fn with_epilogue(self, epilogue: Epilogue) -> Self {
+        debug_assert!(self.merged.is_none());
         ReduceList { epilogue, ..self }
+    }
+
+    /// This list as the last pass applying `epilogue` to every op's value: a merged list applies
+    /// the epilogues it was made with instead.
+    pub(crate) fn finished(self, epilogue: Epilogue) -> Self {
+        match self.merged {
+            Some(merged) => ReduceList { merged: Some(Merged { applied: true, ..merged }), ..self },
+            None => self.with_epilogue(epilogue),
+        }
     }
 
     /// The kernel of a first pass over the elements that also finishes the reduction: every
@@ -665,6 +1214,7 @@ impl ReduceList {
     /// the kernel's cache key.
     pub(crate) fn with_gate(self, gate: GateId) -> Self {
         debug_assert_eq!(self.as_slice().len(), 1, "a gate takes one value");
+        debug_assert!(self.merged.is_none());
         ReduceList { gate: Some(gate), ..self }
     }
 
@@ -672,8 +1222,39 @@ impl ReduceList {
         self.gate
     }
 
-    pub(crate) fn epilogue(&self) -> Epilogue {
-        self.epilogue
+    /// The root (output of the kernel's program) every op of a first pass of a
+    /// [merged](ReduceList::merged) list reduces; `None` for any other list, whose ops all reduce
+    /// the program's last value.
+    pub(crate) fn roots(&self) -> Option<Vec<u8>> {
+        let roots = &self.merged?.id.spec().roots;
+        (!roots.is_empty()).then(|| roots.clone())
+    }
+
+    /// The epilogue op `j` applies to its value, if this is the pass that applies it.
+    fn epilogue_of(&self, j: usize) -> Epilogue {
+        match self.merged {
+            Some(Merged { id, applied: true }) => id.spec().epilogues[j],
+            Some(_) => Epilogue::default(),
+            None => self.epilogue,
+        }
+    }
+
+    /// The fields of the `Params` uniform that hold the scalar operands of the epilogues, in the
+    /// order of the words the pass is given (see [`Epilogue::fields`]; op `j`'s step `k` is `e{j}_{k}` of a merged list).
+    pub(crate) fn epilogue_fields(&self) -> String {
+        match self.merged {
+            None => self.epilogue.fields(),
+            Some(_) => (0..self.as_slice().len()).map(|j| self.epilogue_of(j).fields_tagged(&format!("{j}_"))).collect(),
+        }
+    }
+
+    /// WGSL statements applying the epilogue of op `j` to the `f32` expression `value`, and the name
+    /// of the result (see [`Epilogue::statements`]).
+    fn epilogue_statements(&self, j: usize, value: &str, prefix: &str) -> (String, String) {
+        match self.merged {
+            None => self.epilogue.statements(value, prefix),
+            Some(_) => self.epilogue_of(j).statements_with(value, prefix, |k| format!("p.e{j}_{k}")),
+        }
     }
 }
 
@@ -703,6 +1284,13 @@ pub(crate) enum Builtin {
     Conv1dTiled(u32, u32),
     /// One pass of the FFT convolution, see [`crate::fft`].
     Fft(crate::fft::FftPass),
+    /// One pass of a public FFT, see [`crate::dft_kernel`].
+    Dft(crate::dft_kernel::DftPass),
+    /// The packing step of a real FFT (`true`: unpack a spectrum after the forward transform; the second flag: multiply the spectrum by a table first, inverse only),
+    /// see [`crate::spectral`].
+    RealStage(bool, bool),
+    /// The chirp tables of Bluestein's algorithm, see [`crate::spectral`].
+    Chirp,
     /// The convergence gate between the steps of `iterate_until`; arguments: the residual, the
     /// state `[done, count]`, the indirect arguments of the next step, their template, uniform
     /// `{tol, step, words}`.
@@ -726,10 +1314,16 @@ pub(crate) enum Builtin {
     /// A kernel of a radix sort pass reading its keys from a buffer; see [`crate::sort`].
     /// Element type `"u32"`. `first` passes read the user's keys.
     Radix { pass: crate::sort::RadixPass, first: bool },
+    /// Sorts the lines of an array along an axis in workgroup memory; see [`crate::segsort`].
+    /// Arguments: out, src, uniform `{n, stride, lines, tiles, tpo}`. Element type `"u32"`.
+    SortLines(crate::segsort::LineSort),
     /// Tiled matrix product of the operands (buffers) `a` and `b`; see [`crate::matmul`].
     /// Arguments: out, a, b, uniform `{m, n, k, kc}`. `split` slices K over the third grid
     /// dimension and writes every slice's partial product after the previous one.
     Matmul { tile: crate::matmul::MatmulTile, aligned: bool, split: bool },
+    /// Tiled products of a batch of matrices in one launch; see [`crate::bmm`]. Arguments: out, a,
+    /// b, uniform `{m, n, k, matrices, a_stride, b_stride, _, _}`.
+    Bmm(crate::bmm::Bmm),
     /// `out[i] = Σ_z part[z * size + i]` for `p.s` slices `z`: the sum of the partial products of
     /// a split [`Builtin::Matmul`]. Arguments: out, part, uniform `{s}`; `luma.size.x` is the
     /// elements of `out`.
@@ -745,6 +1339,20 @@ pub(crate) enum Builtin {
     /// memory; see `jit::transpose`. Arguments: out, src, uniform `Params`. Element type `"u32"`
     /// (any 4-byte element) or `"vec2<f32>"` (`Df32`).
     Transpose,
+    /// A windowed image kernel (convolution, rank and morphological filters, bilateral, Sobel,
+    /// gradient); see [`crate::image`]. The element type is the window's.
+    Window(crate::image::Window),
+    /// A colour-space conversion of image planes; see [`crate::image`]. Element type `"f32"`.
+    Color(crate::image::ColorKernel),
+    /// `unwrap` (im2col); see [`crate::image`]. Element type `"f32"`.
+    Unwrap,
+    /// `wrap` (col2im); see [`crate::image`]. Element type `"f32"`.
+    Wrap,
+    /// One pass of the summed-area table; see `image::sat`. Element type `"f32"`, `"i32"` or `"u32"`.
+    Sat(crate::image::SatPass),
+    /// A kernel of the feature detectors and image analysis of [`crate::vision`]. The element type
+    /// is the image's.
+    Vision(crate::vision::Kernel),
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -755,7 +1363,7 @@ pub(crate) enum Builtin {
 /// counter and the final values (`result`) after `a` (see [`reduce_main`]).
 fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String {
     // The double-float kernel takes the guard of its arithmetic (see `df_library`) as a uniform.
-    let fields = ops.epilogue().fields();
+    let fields = ops.epilogue_fields();
     let (elem, params) = match ty {
         "df32" => (ReduceElem::Df32 { guard: "p.guard", fma: tuning.df_fma }, "struct Params { n: u32, guard: u32 }".to_owned()),
         other if fields.is_empty() => (ReduceElem::Plain(other), "struct Params { n: u32 }".to_owned()),
@@ -763,7 +1371,13 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String
     };
     let ty = elem.storage_ty();
     let single_pass = ops.is_single_pass().then_some(2);
-    let uniform = if single_pass.is_some() { 4 } else { 2 };
+    // A gate (see `ReduceList::with_gate`) binds its buffers after `a`, before the uniform.
+    let gate = ops.gate().map(|_| 2);
+    let uniform = match (single_pass, gate) {
+        (Some(_), _) => 4,
+        (None, Some(_)) => 2 + GATE_BINDINGS,
+        (None, None) => 2,
+    };
     format!(
         "{params}
 @group(1) @binding(0) var<storage, read_write> out: array<{ty}>;
@@ -772,7 +1386,7 @@ fn reduce(ty: &str, ops: ReduceList, segmented: bool, tuning: &Tuning) -> String
 
 fn load_at(i: u32) -> {ty} {{ return a[i]; }}
 {}",
-        reduce_main(elem, ops, segmented, "load_at", tuning, single_pass, None)
+        reduce_main(elem, ops, segmented, "load_at", tuning, single_pass, gate)
     )
 }
 
@@ -786,6 +1400,7 @@ fn reduce_bits(ops: ReduceList, tuning: &Tuning) -> String {
     let value = match op {
         ReduceOp::Sum | ReduceOp::SumSquares => "countOneBits(w)",
         ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("boolean words have no arg reductions"),
+        ReduceOp::Prod => unreachable!("boolean words have no products"),
         ReduceOp::Max => "select(0u, 1u, w != 0u)",
         ReduceOp::Min => "select(0u, 1u, w == select(0xFFFFFFFFu, (1u << (p.len & 31u)) - 1u, i == p.n - 1u && (p.len & 31u) != 0u))",
     };
@@ -828,7 +1443,17 @@ impl<'a> ReduceElem<'a> {
             (ReduceElem::Df32 { .. }, ReduceOp::Sum | ReduceOp::SumSquares) => "df_add(u, v)",
             (ReduceElem::Df32 { .. }, ReduceOp::Min) => "df_min(u, v)",
             (ReduceElem::Df32 { .. }, ReduceOp::Max) => "df_max(u, v)",
+            (ReduceElem::Plain(_), ReduceOp::Prod) => "u * v",
+            (ReduceElem::Df32 { .. }, ReduceOp::Prod) => "df_mul(u, v)",
             (_, ReduceOp::ArgMax | ReduceOp::ArgMin) => unreachable!("arg reductions have their own passes (`crate::arg`)"),
+        }
+    }
+
+    /// The multiplicative identity of the type, as a WGSL expression.
+    fn one(self) -> String {
+        match self {
+            ReduceElem::Plain(ty) => format!("{ty}(1)"),
+            ReduceElem::Df32 { .. } => "vec2<f32>(1.0, 0.0)".to_owned(),
         }
     }
 
@@ -1102,8 +1727,8 @@ struct Phase<'a> {
     load: &'a str,
     /// The statement storing the WGSL expression (second argument) as the value of op `j`.
     store: &'a dyn Fn(usize, &str) -> String,
-    /// Applied to the values before they are stored.
-    epilogue: Epilogue,
+    /// The list whose epilogues are applied to the values before they are stored, if any.
+    epilogue: Option<ReduceList>,
 }
 
 /// The statements of a stage of a reduction kernel computing every op of `ops`: every
@@ -1118,80 +1743,91 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
     let Phase { n, group, groups, segmented, segment, load, store, epilogue } = phase;
     let mut inits = String::new();
     let mut loop_body = String::new();
-    // Without segments every op reduces the same elements: load each once.
-    if !segmented {
-        loop_body += &format!("            let e0 = {load}(base);\n");
-        for s in 1..per_thread {
-            loop_body += &format!(
-                "            let in{s} = base + {wg}u * {s}u < {n};\n            var e{s} = e0;\n            if (in{s}) {{ e{s} = {load}(base + {wg}u * {s}u); }}\n"
-            );
-        }
-    }
-    for (j, &op) in ops.as_slice().iter().enumerate() {
-        let segment = if *segmented { format!("{j}u * {segment} + ") } else { String::new() };
-        if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
-            unreachable!("arg reductions have their own passes (`crate::arg`)");
-        }
-        inits += &format!("    var acc{j} = zero;\n");
-        for s in 0..per_thread {
-            if *segmented {
-                if s == 0 {
-                    loop_body += &format!("            let e{j}_0 = {load}({segment}base);\n");
-                } else {
-                    loop_body += &format!(
-                        "            let in{j}_{s} = base + {wg}u * {s}u < {n};\n            var e{j}_{s} = e{j}_0;\n            if (in{j}_{s}) {{ e{j}_{s} = {load}({segment}(base + {wg}u * {s}u)); }}\n"
-                    );
-                }
+    if let Some(roots) = ops.roots().filter(|_| !segmented) {
+        (inits, loop_body) = merged_loop(elem, ops, &roots, phase, tuning);
+    } else {
+        // Without segments every op reduces the same elements: load each once.
+        if !segmented {
+            loop_body += &format!("            let e0 = {load}(base);\n");
+            for s in 1..per_thread {
+                loop_body += &format!(
+                    "            let in{s} = base + {wg}u * {s}u < {n};\n            var e{s} = e0;\n            if (in{s}) {{ e{s} = {load}(base + {wg}u * {s}u); }}\n"
+                );
             }
-            let e = if *segmented { format!("e{j}_{s}") } else { format!("e{s}") };
-            // Out-of-range slots: sums take zero, min/max reuse the first (valid) element.
-            let value = match op {
-                ReduceOp::Sum => {
-                    if s == 0 { e } else { format!("select(zero, {e}, base + {wg}u * {s}u < {n})") }
+        }
+        for (j, &op) in ops.as_slice().iter().enumerate() {
+            let segment = if *segmented { format!("{j}u * {segment} + ") } else { String::new() };
+            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                unreachable!("arg reductions have their own passes (`crate::arg`)");
+            }
+            inits += &format!("    var acc{j} = {};\n", if op == ReduceOp::Prod { "one" } else { "zero" });
+            for s in 0..per_thread {
+                if *segmented {
+                    if s == 0 {
+                        loop_body += &format!("            let e{j}_0 = {load}({segment}base);\n");
+                    } else {
+                        loop_body += &format!(
+                            "            let in{j}_{s} = base + {wg}u * {s}u < {n};\n            var e{j}_{s} = e{j}_0;\n            if (in{j}_{s}) {{ e{j}_{s} = {load}({segment}(base + {wg}u * {s}u)); }}\n"
+                        );
+                    }
                 }
-                ReduceOp::SumSquares => {
-                    let sq = elem.square(&e);
-                    if s == 0 { sq } else { format!("select(zero, {sq}, base + {wg}u * {s}u < {n})") }
+                let e = if *segmented { format!("e{j}_{s}") } else { format!("e{s}") };
+                // Out-of-range slots: sums take zero, min/max reuse the first (valid) element.
+                let value = match op {
+                    ReduceOp::Sum => {
+                        if s == 0 { e } else { format!("select(zero, {e}, base + {wg}u * {s}u < {n})") }
+                    }
+                    ReduceOp::SumSquares => {
+                        let sq = elem.square(&e);
+                        if s == 0 { sq } else { format!("select(zero, {sq}, base + {wg}u * {s}u < {n})") }
+                    }
+                    ReduceOp::Prod => {
+                        if s == 0 { e } else { format!("select(one, {e}, base + {wg}u * {s}u < {n})") }
+                    }
+                    ReduceOp::Min | ReduceOp::Max => e,
+                    ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!(),
+                };
+                loop_body += &format!("            let v{j}_{s} = {value};\n");
+            }
+            let values: Vec<String> = (0..per_thread).map(|s| format!("v{j}_{s}")).collect();
+            let pw = pairwise(&format!("c{j}"), &values);
+            loop_body += &match op {
+                ReduceOp::Min | ReduceOp::Max => {
+                    format!("            if (b == {group} * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
                 }
-                ReduceOp::Min | ReduceOp::Max => e,
-                ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!(),
+                _ => format!("            acc{j} = c{j}(acc{j}, {pw});\n"),
             };
-            loop_body += &format!("            let v{j}_{s} = {value};\n");
         }
-        let values: Vec<String> = (0..per_thread).map(|s| format!("v{j}_{s}")).collect();
-        let pw = pairwise(&format!("c{j}"), &values);
-        loop_body += &match op {
-            ReduceOp::Min | ReduceOp::Max => {
-                format!("            if (b == {group} * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
-            }
-            _ => format!("            acc{j} = c{j}(acc{j}, {pw});\n"),
-        };
     }
-
     let mut finish = String::new();
     if subgroups {
         let mut lanes = String::new();
         let mut first = String::new();
         for (j, &op) in ops.as_slice().iter().enumerate() {
+            let prod_name = format!("luma_sgprod{j}");
             let (group_op, ident) = match op {
                 ReduceOp::Sum | ReduceOp::SumSquares => ("subgroupAdd", "zero".to_owned()),
                 ReduceOp::Min => ("subgroupMin", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
                 ReduceOp::Max => ("subgroupMax", format!("sh[{}u]", j as u32 * MAX_SUBGROUPS)),
+                ReduceOp::Prod => (prod_name.as_str(), "one".to_owned()),
                 ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
             };
+            // The product of a subgroup is a function of the lane too (see `reduce_main`).
+            let call = |value: String| if op == ReduceOp::Prod { format!("{group_op}({value}, lane, sg)") } else { format!("{group_op}({value})") };
             if matches!(op, ReduceOp::Min | ReduceOp::Max) {
                 lanes += &format!("    let first{j} = subgroupBroadcastFirst(acc{j});\n    if ({group} * {block}u + lid >= {n}) {{ acc{j} = first{j}; }}\n");
             }
-            lanes += &format!("    let r{j} = {group_op}(acc{j});\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", j as u32 * MAX_SUBGROUPS);
-            let (lets, fin) = epilogue.statements(&format!("f{j}"), &format!("g{j}_"));
+            lanes += &format!("    let r{j} = {};\n    if (lane == 0u) {{ sh[{}u + sgid] = r{j}; }}\n", call(format!("acc{j}")), j as u32 * MAX_SUBGROUPS);
+            let (lets, fin) = epilogue.map_or_else(|| (String::new(), format!("f{j}")), |list| list.epilogue_statements(j, &format!("f{j}"), &format!("g{j}_")));
             let store = store(j, &fin);
             first += &format!(
                 "        var t{j} = {ident};
         for (var k = lane; k < nsg; k += sg) {{ t{j} = c{j}(t{j}, sh[{}u + k]); }}
-        let f{j} = {group_op}(t{j});
+        let f{j} = {};
         if (lane == 0u) {{ {lets}{store} }}
 ",
-                j as u32 * MAX_SUBGROUPS
+                j as u32 * MAX_SUBGROUPS,
+                call(format!("t{j}"))
             );
         }
         finish += &format!(
@@ -1204,7 +1840,7 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
         );
     } else {
         for j in 0..ops.as_slice().len() {
-            let (lets, fin) = epilogue.statements("sh[0]", &format!("g{j}_"));
+            let (lets, fin) = epilogue.map_or_else(|| (String::new(), "sh[0]".to_owned()), |list| list.epilogue_statements(j, "sh[0]", &format!("g{j}_")));
             let store = store(j, &fin);
             finish += &format!(
                 "    sh[lid] = acc{j};
@@ -1230,6 +1866,84 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
     )
 }
 
+/// The accumulation loop of a first pass over several operands (a [merged](ReduceList::merged) list, whose op `j`
+/// reduces root `roots[j]` of the array `load(i)` returns): the accumulator declarations and the loop body. An
+/// invocation computes the roots of `per_thread` elements one after the other, folding every op's values
+/// in the tree [`pairwise`] makes of them, so that only a few values per op are live at once and the results are the
+/// bits a separate reduction of each root gives. An element past the end is read at `base` instead (the value a
+/// separate reduction substitutes for it).
+fn merged_loop(elem: ReduceElem<'_>, ops: ReduceList, roots: &[u8], phase: &Phase<'_>, tuning: &Tuning) -> (String, String) {
+    let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
+    let per_thread = tuning.reduce_per_thread as usize;
+    let Phase { n, group, load, .. } = phase;
+    let count = ops.as_slice().len();
+    let mut inits = String::new();
+    for j in 0..count {
+        inits += &format!("    var acc{j} = {};\n", if ops.as_slice()[j] == ReduceOp::Prod { "one" } else { "zero" });
+    }
+    // The names of the value each op holds for the elements `lo..hi` once emitted.
+    let name = |j: usize, lo: usize, hi: usize| if hi - lo == 1 { format!("v{j}_{lo}") } else { format!("w{j}_{lo}_{hi}") };
+    fn emit(
+        out: &mut String,
+        lo: usize,
+        hi: usize,
+        leaf: &dyn Fn(&mut String, usize),
+        node: &dyn Fn(&mut String, usize, usize, usize),
+    ) {
+        if hi - lo == 1 {
+            leaf(out, lo);
+            return;
+        }
+        // `pairwise` splits a list in the middle, the first half the shorter.
+        let mid = lo + (hi - lo) / 2;
+        emit(out, lo, mid, leaf, node);
+        emit(out, mid, hi, leaf, node);
+        node(out, lo, mid, hi);
+    }
+    let leaf = |out: &mut String, s: usize| {
+        if s == 0 {
+            *out += &format!("            let r0 = {load}(base);\n");
+        } else {
+            *out += &format!("            let in{s} = base + {wg}u * {s}u < {n};\n            let r{s} = {load}(select(base, base + {wg}u * {s}u, in{s}));\n");
+        }
+        for (j, &op) in ops.as_slice().iter().enumerate() {
+            let e = format!("r{s}[{}]", roots[j]);
+            let value = match op {
+                ReduceOp::Sum => {
+                    if s == 0 { e } else { format!("select(zero, {e}, in{s})") }
+                }
+                ReduceOp::SumSquares => {
+                    let sq = elem.square(&e);
+                    if s == 0 { sq } else { format!("select(zero, {sq}, in{s})") }
+                }
+                ReduceOp::Prod => {
+                    if s == 0 { e } else { format!("select(one, {e}, in{s})") }
+                }
+                ReduceOp::Min | ReduceOp::Max => e,
+                ReduceOp::ArgMax | ReduceOp::ArgMin => unreachable!("arg reductions have their own passes (`crate::arg`)"),
+            };
+            *out += &format!("            let v{j}_{s} = {value};\n");
+        }
+    };
+    let combine = |out: &mut String, lo: usize, mid: usize, hi: usize| {
+        for j in 0..count {
+            *out += &format!("            let w{j}_{lo}_{hi} = c{j}({}, {});\n", name(j, lo, mid), name(j, mid, hi));
+        }
+    };
+    let mut loop_body = String::new();
+    emit(&mut loop_body, 0, per_thread, &leaf, &combine);
+    for (j, &op) in ops.as_slice().iter().enumerate() {
+        let pw = name(j, 0, per_thread);
+        loop_body += &match op {
+            ReduceOp::Min | ReduceOp::Max => {
+                format!("            if (b == {group} * {block}u) {{ acc{j} = {pw}; }} else {{ acc{j} = c{j}(acc{j}, {pw}); }}\n")
+            }
+            _ => format!("            acc{j} = c{j}(acc{j}, {pw});\n"),
+        };
+    }
+    (inits, loop_body)
+}
+
 /// The entry point of a reduction pass computing every op of `ops` (see [`reduce`]). Element
 /// `i` comes from `{load}(i)`, and a `Params` uniform `p` with the element count `n` is bound.
 /// Every invocation accumulates its elements of the strided blocks, then the workgroup combines
@@ -1251,13 +1965,14 @@ fn reduce_phase(elem: ReduceElem<'_>, ops: ReduceList, phase: &Phase<'_>, subgro
 /// A reduction with a [gate](ReduceList::with_gate) (one `f32` op, bindings `gate`.. `gate + GATE_BINDINGS`
 /// after `luma_result`: `st`, `args`, `tmpl`, `hist`, `agg`, `stepv`) runs the gate on the final value, in
 /// invocation 0 of the workgroup that has it (the last one of a single-pass kernel, the only one
-/// of a kernel of one group). The gate's text defines `luma_gate(v: f32)`; [`GATE_STOPPED`] is added to it. A
+/// of a kernel of one group, which may be a pass over the partial results of an earlier one). The gate's text defines `luma_gate(v: f32)`; [`GATE_STOPPED`] is added to it. A
 /// workgroup that finds `st[0]` set (the loop stopped) leaves at once, workgroup 0 after
 /// `luma_stopped()`, so that nothing of the stopped steps is computed or stored.
 pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool, load: &str, tuning: &Tuning, single_pass: Option<u32>, gate: Option<u32>) -> String {
     debug_assert!(single_pass.is_none() || !segmented, "only a first pass can finish the reduction itself");
-    debug_assert!(gate.is_none() || (!segmented && ops.gate().is_some()), "a gate needs a first pass with a gate");
+    debug_assert!(gate.is_none() || ops.gate().is_some(), "a gate needs a pass with a gate");
     let ty = elem.storage_ty();
+    let one = elem.one();
     let (wg, block) = (REDUCE_WORKGROUP, tuning.reduce_block());
     let mut combines = String::new();
     for (j, &op) in ops.as_slice().iter().enumerate() {
@@ -1265,7 +1980,24 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
         combines += &format!("fn c{j}(u: {ty}, v: {ty}) -> {ty} {{ return {combine}; }}\n");
     }
 
-    let subgroups = tuning.subgroups && elem.subgroups();
+    // There is no `subgroupMul`: a product of `f32`, `u32` or `i32` is combined within a subgroup by a butterfly of
+    // `subgroupShuffle`s (every lane ends with the product of all of them); other types combine in workgroup memory.
+    let products = ops.as_slice().contains(&ReduceOp::Prod);
+    let subgroups = tuning.subgroups && elem.subgroups() && (!products || matches!(elem, ReduceElem::Plain("f32" | "u32" | "i32")));
+    if subgroups {
+        for (j, &op) in ops.as_slice().iter().enumerate() {
+            if op == ReduceOp::Prod {
+                combines += &format!(
+                    "fn luma_sgprod{j}(v: {ty}, lane: u32, sg: u32) -> {ty} {{
+    var r = v;
+    for (var o = 1u; o < sg; o = o << 1u) {{ r = c{j}(r, subgroupShuffle(r, lane ^ o)); }}
+    return r;
+}}
+"
+                );
+            }
+        }
+    }
     let (shared, extra_args) = if subgroups {
         let n = ops.as_slice().len() as u32 * MAX_SUBGROUPS;
         (
@@ -1288,7 +2020,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
             load,
             store: &partial,
             // A partial result is not the final value when the last workgroup finishes it.
-            epilogue: if single_pass.is_some() { Epilogue::default() } else { ops.epilogue() },
+            epilogue: if single_pass.is_some() { None } else { Some(ops) },
         },
         subgroups,
         tuning,
@@ -1306,7 +2038,7 @@ pub(crate) fn reduce_main(elem: ReduceElem<'_>, ops: ReduceList, segmented: bool
             let rest = reduce_phase(
                 elem,
                 ops.rest(),
-                &Phase { n: "groups", group: "0u", groups: "1u", segmented: true, segment: "groups", load: "luma_partial", store: &value, epilogue: ops.epilogue() },
+                &Phase { n: "groups", group: "0u", groups: "1u", segmented: true, segment: "groups", load: "luma_partial", store: &value, epilogue: Some(ops) },
                 subgroups,
                 tuning,
             );
@@ -1371,6 +2103,7 @@ fn main(
     let groups = min((p.n + {block}u - 1u) / {block}u, {cap}u);
     if (group >= groups) {{ return; }}
 {gate_entry}    let zero = {ty}();
+    let one = {one};
 {body}{last_block}}}
 ",
         elem.library(),
@@ -1520,7 +2253,13 @@ const CP_TILE: u32 = 32;
 
 /// The largest block size and the line count below which the twisted solve is chosen.
 const TWISTED_BLOCK: u32 = 4;
+/// A count for the 82 multiprocessors of an RTX 3090, scaled to the device ([`Tuning::scaled`]).
 const TWISTED_LINES: u32 = 8192;
+
+/// Lines per workgroup of a native Thomas solve (`Tuning::native_solve`): few, so that the lines
+/// of a launch spread over every core, and neighbouring ones, so that a core reads the cache
+/// lines their cells share once.
+const NATIVE_LINES: u8 = 4;
 
 /// The invocations per workgroup, the scratch layout and the line split of the Thomas solve of
 /// `lines` lines of `block`-blocks, `stride` cells apart in memory.
@@ -1543,7 +2282,7 @@ const TWISTED_LINES: u32 = 8192;
 /// their cells far apart for neighbouring invocations, so every access is a sector of its own
 /// whatever the layout and the solve is latency bound. A small workgroup spreads the lines over
 /// all multiprocessors (a workgroup runs on one) and lanes of a warp left idle cost nothing:
-/// aiming for 512 workgroups, from 8 invocations to a warp of 32 (RTX 3090; 4096 lines,
+/// aiming for 512 workgroups (scaled to the device's multiprocessors, [`Tuning::scaled`]; 82 on the RTX 3090), from 8 invocations to a warp of 32 (RTX 3090; 4096 lines,
 /// `tri/solve_axis0`: 9.4 ms with 256, 3.9 with 32, 2.6 with 8; 1024 block-4 lines: 9.5, 2.1 ms
 /// with 32, 8 after unrolling the kernel). Software rasterizers keep the elementwise size.
 ///
@@ -1564,17 +2303,33 @@ const TWISTED_LINES: u32 = 8192;
 /// stride of 16 a warp's cells are in runs of too few neighbours (strides 2, 4, 8: tiled 1.5x,
 /// 1.6x, 1.03x slower).
 ///
-/// Stacked blocks (`parts` false) keep the narrow workgroups and the scratch of one cell after
-/// the other: their coefficients are read `block^2` floats apart per cell, so a warp's loads do
-/// not coalesce whatever the workgroup, and the wide tiled solve was 1.1x to 1.3x slower on
-/// `bench_solve --only sweep/` (blocks of 2 to 5, 100 to 1024 strided lines of 32 to 1024 cells).
+/// Stacked blocks of 2 or more (`parts` false) keep the narrow workgroups and the scratch of one
+/// cell after the other: their coefficients are read `block^2` floats apart per cell, so a
+/// warp's loads do not coalesce whatever the workgroup, and the wide tiled solve was 1.1x to
+/// 1.3x slower on `bench_solve --only sweep/` (blocks of 2 to 5, 100 to 1024 strided lines of 32
+/// to 1024 cells). Stacked scalars are the parts layout (one float per cell and coefficient), so
+/// they take the parts plan: a warp of 32 on strided axes (RTX 3090, 4096x4096 along the strided
+/// axis, `tri/solve_axis1`: 8 invocations twisted 1.96 ms, a warp 1.74 with one row at a time;
+/// 4096 lines of 200 cells, `sweep/b1_4096x200_axis2`: 84 us -> 44 us, with four rows loaded
+/// together 0.89 ms and 42 us; `cfd/lines/few_b1` 4096x200:j 88 -> 45 us).
+///
+/// The rows of a chunk (see [`thomas_rows`]) load before the first of them is eliminated: one
+/// memory round trip per four rows instead of per row (scalar `tri/solve_axis1` 1.96 -> 0.89 ms
+/// with the wide plan, 170 -> 370 GB/s; `tri/block4_axis1` 1.14 -> 0.68 ms; 1024x1024 stacked
+/// 4x4 along axis 1 1121 -> 676 us, along axis 2 709 -> 517 us; parts of 4x4 blocks, 700x512
+/// along j, 414 -> 328 us; `cfd/implicit/2d_step` 700x512 1.99 -> 1.56 ms). The 4x4 solve of
+/// 256x64x48 lines along j and k lost 5 to 10 % (383 -> 424 us), along i it won (730 -> 630 us).
 pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, parts: bool) -> ThomasPlan {
+    if tuning.native_solve {
+        return ThomasPlan { workgroup: NATIVE_LINES, tiled: false, twisted: false };
+    }
     if tuning.profile == TuningProfile::Cpu {
         return ThomasPlan { workgroup: tuning.elementwise_workgroup as u8, tiled: false, twisted: false };
     }
     // Few lines of small blocks: latency bound (see above), two invocations per line win.
-    let twisted = block <= TWISTED_BLOCK && lines < TWISTED_LINES;
-    if parts && tuning.line_strided_from > 0 && stride >= tuning.line_strided_from && block <= UNROLLED_BLOCK {
+    let twisted = block <= TWISTED_BLOCK && lines < tuning.scaled(TWISTED_LINES);
+    // Scalar systems are laid out like parts (see below), so the same plan serves them.
+    if (parts || block == 1) && tuning.line_strided_from > 0 && stride >= tuning.line_strided_from && block <= UNROLLED_BLOCK {
         let wanted = match block {
             1 => 32,
             2 => 128,
@@ -1582,15 +2337,19 @@ pub(crate) fn thomas_plan(tuning: &Tuning, block: u32, lines: u32, stride: u32, 
         };
         return ThomasPlan { workgroup: wanted.min(tuning.elementwise_workgroup) as u8, tiled: block > 1, twisted };
     }
-    ThomasPlan { workgroup: (lines / 512).max(1).next_power_of_two().clamp(8, 32).min(tuning.elementwise_workgroup) as u8, tiled: false, twisted }
+    ThomasPlan { workgroup: (lines / tuning.scaled(512).max(1)).max(1).next_power_of_two().clamp(8, 32).min(tuning.elementwise_workgroup) as u8, tiled: false, twisted }
 }
 
 /// The workgroups of the Thomas solve of `lines` lines with `workgroup` invocations per
 /// workgroup: `workgroup / 2` lines each if `twisted` (see [`tridiagonal_body`]), else
 /// `workgroup`.
 pub(crate) fn thomas_workgroups(lines: u32, workgroup: u8, twisted: bool) -> u32 {
-    let per_group = if twisted { u32::from(workgroup) / 2 } else { u32::from(workgroup) };
-    lines.div_ceil(per_group)
+    lines.div_ceil(thomas_lines_per_group(workgroup, twisted))
+}
+
+/// The lines a workgroup of the Thomas solve solves: `workgroup / 2` if `twisted`, else `workgroup`.
+pub(crate) fn thomas_lines_per_group(workgroup: u8, twisted: bool) -> u32 {
+    if twisted { u32::from(workgroup) / 2 } else { u32::from(workgroup) }
 }
 
 /// Floats of the scratch `cp` of one system of `cells` cells of `block`-blocks, in the layout
@@ -1705,6 +2464,29 @@ fn eliminate(src: &mut String, ind: &str, b: usize, w: usize) {
     }
 }
 
+/// Rows of a Thomas sweep whose loads issue together.
+const SWEEP_ROWS: usize = 4;
+
+/// The rows of a Thomas sweep whose loads issue together (forward sweep, back substitution) for
+/// `b`-blocks, see [`tridiagonal_body`]: [`SWEEP_ROWS`] for the scalar and the 4x4 solve, one row
+/// (loads and elimination row by row) for the others. Measured on an RTX 3090 (all block sizes
+/// at 1, 2, 4 and 8 rows, the forward sweep and the back substitution alike): blocks of 2, 3 and
+/// 5 gained nothing measurable (their strided solves have enough warps to hide the loads, or
+/// too many registers: 5x5 with 2 or 3 rows was 0 to 20 % slower), scalars and 4x4 blocks gained
+/// up to 1.7x (see [`thomas_plan`]); 8 rows spilled 4x4 blocks (1.1 -> 1.5 ms, 4096 lines of
+/// 1024 cells) and gained 8 % more on scalars only.
+fn thomas_rows(b: usize) -> usize {
+    match b {
+        1 | 4 => SWEEP_ROWS,
+        _ => 1,
+    }
+}
+
+/// The loops of a sweep in chunks of `rows` rows: the chunks, then the remaining rows one by one.
+fn rows_passes(rows: usize) -> Vec<usize> {
+    if rows > 1 { vec![rows, 1] } else { vec![1] }
+}
+
 /// The entry point of the straight-line Thomas solve of `systems` systems of `b`-blocks, reading
 /// and writing through `io`, after the bindings and `Params` (see [`tridiagonal_header`]; the
 /// scratch `cp` holds `b * b` floats per cell and system: entry `k` of cell `q` at `q * b * b + k`,
@@ -1740,9 +2522,10 @@ pub(crate) fn tridiagonal_body(b: usize, starts: bool, wg: u32, systems: u32, io
         ("p.lines".to_owned(), "    let sys = 0u;\n", "lg", "0u".to_owned())
     };
     let mut src = String::from("fn line_base(l: u32) -> u32 { return (l % p.stride) + (l / p.stride) * p.stride * p.n; }\n");
-    // The index of entry `k` of the scratch of cell `q`, from `cq` (see above).
-    let cp_at = |k: usize| if tiled { format!("cq + {}u", 32 * k) } else { format!("cq + {k}u") };
-    let cq_expr = if tiled { format!("so + (q >> 5u) * {}u + (q & 31u)", 32 * bb) } else { format!("so + q * {bb}u") };
+    // The index of entry `k` of the scratch of cell `cq` (see above), and `cq` of cell `q`.
+    let cp_at = |cq: &str, k: usize| if tiled { format!("{cq} + {}u", 32 * k) } else { format!("{cq} + {k}u") };
+    let cq_of = |q: &str| if tiled { format!("so + ({q} >> 5u) * {}u + ({q} & 31u)", 32 * bb) } else { format!("so + {q} * {bb}u") };
+    let rows = thomas_rows(b);
     let (exchange, side, step) = if twisted { (format!("var<workgroup> xch: array<f32, {}>;\n", wg * st as u32), format!("tid / {hb}u"), 2) } else { (String::new(), "0u".to_owned(), 1) };
     let _ = write!(
         src,
@@ -1784,62 +2567,94 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         }
         let _ = writeln!(src, "    var pd{i} = 0.0;");
     }
-    // The sweep of this invocation's half: A from `s0` down, B from `n - 1` up. The block that
-    // the row's right-hand block is taken from (A: `up`, B: `lo`) is read always, the one that
-    // couples to the previous row of the sweep (A: `lo`, B: `up`) from the second row on.
-    let _ = write!(src, "    for (var k = 0u; k < nrows; k++) {{\n        let s = select(s0 + k, p.n - 1u - k, side == 1u);\n        let q = base + s * p.stride;\n        let cq = {cq_expr};\n");
-    src.push_str(&io.load_core("        ", "q"));
-    for i in 0..b {
-        for j in 0..b {
-            let _ = writeln!(src, "        var m{i}{j} = {};\n        var r{i}{j} = 0.0;\n        var l{i}{j} = 0.0;", io.diag("q", i * b + j));
-        }
-        let _ = writeln!(src, "        var r{i}{b} = {};", io.rhs("q", i));
-    }
-    for (id, own, other) in [(0, "up", "lo"), (1, "lo", "up")].into_iter().take(if twisted { 2 } else { 1 }) {
-        let load = |name: &str, ind: &str| if name == "up" { io.load_up(ind, "q") } else { io.load_lo(ind, "q") };
-        let entry = |name: &str, k: usize| if name == "up" { io.up("q", k) } else { io.lo("q", k) };
-        let head = if !twisted { "        {" } else if id == 0 { "        if" } else { " else if" };
-        if twisted {
-            let _ = writeln!(src, "{head} (side == {id}u) {{");
-        } else {
-            let _ = writeln!(src, "{head}");
-        }
-        src.push_str(&load(own, "            "));
-        for i in 0..b {
-            for j in 0..b {
-                let _ = writeln!(src, "            r{i}{j} = {};", entry(own, i * b + j));
+    // The sweep of this invocation's half: A from `s0` down, B from `n - 1` up, in chunks of
+    // `rows` rows whose loads all issue before the chain of their eliminations (a row's loads
+    // do not depend on the sweep: each row would otherwise wait a memory round trip of its own).
+    // The block that the row's right-hand block is taken from (A: `up`, B: `lo`) is read always,
+    // the one that couples to the previous row of the sweep (A: `lo`, B: `up`) from the second
+    // row on.
+    src.push_str("    var kf = 0u;\n");
+    for rows in rows_passes(rows) {
+        let head = if rows > 1 { format!("(; kf + {rows}u <= nrows; kf += {rows}u)") } else { "(; kf < nrows; kf++)".to_owned() };
+        let _ = writeln!(src, "    for {head} {{");
+        for j in 0..rows {
+            let (jo, q) = (io.slot(j), format!("q{j}"));
+            let _ = writeln!(src, "        let k{j} = kf + {j}u;\n        let sr{j} = select(s0 + k{j}, p.n - 1u - k{j}, side == 1u);\n        let {q} = base + sr{j} * p.stride;\n        let cq{j} = {};", cq_of(&q));
+            src.push_str(&jo.load_core("        ", &q));
+            for i in 0..b {
+                for c in 0..b {
+                    let _ = writeln!(src, "        let ldm{i}{c}_{j} = {};\n        var ldr{i}{c}_{j} = 0.0;\n        var ldl{i}{c}_{j} = 0.0;", jo.diag(&q, i * b + c));
+                }
+                let _ = writeln!(src, "        let ldb{i}_{j} = {};", jo.rhs(&q, i));
             }
-        }
-        src.push_str("            if (k > 0u) {\n");
-        src.push_str(&load(other, "                "));
-        for i in 0..b {
-            for j in 0..b {
-                let _ = writeln!(src, "                l{i}{j} = {};", entry(other, i * b + j));
+            for (id, own, other) in [(0, "up", "lo"), (1, "lo", "up")].into_iter().take(if twisted { 2 } else { 1 }) {
+                let load = |name: &str, ind: &str| if name == "up" { jo.load_up(ind, &q) } else { jo.load_lo(ind, &q) };
+                let entry = |name: &str, k: usize| if name == "up" { jo.up(&q, k) } else { jo.lo(&q, k) };
+                let head = if !twisted { "        {" } else if id == 0 { "        if" } else { " else if" };
+                if twisted {
+                    let _ = writeln!(src, "{head} (side == {id}u) {{");
+                } else {
+                    let _ = writeln!(src, "{head}");
+                }
+                src.push_str(&load(own, "            "));
+                for i in 0..b {
+                    for c in 0..b {
+                        let _ = writeln!(src, "            ldr{i}{c}_{j} = {};", entry(own, i * b + c));
+                    }
+                }
+                let first = j == 0;
+                if first {
+                    src.push_str("            if (kf > 0u) {\n");
+                }
+                src.push_str(&load(other, "                "));
+                for i in 0..b {
+                    for c in 0..b {
+                        let _ = writeln!(src, "                ldl{i}{c}_{j} = {};", entry(other, i * b + c));
+                    }
+                }
+                if first {
+                    src.push_str("            }\n");
+                }
+                src.push_str("        }");
             }
+            src.push('\n');
         }
-        src.push_str("            }\n        }");
-    }
-    src.push('\n');
-    src.push_str("        if (k > 0u) {\n");
-    for i in 0..b {
-        for j in 0..b {
-            let sum = (0..b).map(|k| format!("l{i}{k} * pc{k}{j}")).collect::<Vec<_>>().join(" + ");
-            let _ = writeln!(src, "            m{i}{j} -= {sum};");
+        for j in 0..rows {
+            src.push_str("        {\n");
+            for i in 0..b {
+                for c in 0..b {
+                    let _ = writeln!(src, "            var m{i}{c} = ldm{i}{c}_{j};\n            var r{i}{c} = ldr{i}{c}_{j};");
+                }
+                let _ = writeln!(src, "            var r{i}{b} = ldb{i}_{j};");
+            }
+            if j == 0 {
+                src.push_str("            if (kf > 0u) {\n");
+            }
+            let ind = if j == 0 { "                " } else { "            " };
+            for i in 0..b {
+                for c in 0..b {
+                    let sum = (0..b).map(|k| format!("ldl{i}{k}_{j} * pc{k}{c}")).collect::<Vec<_>>().join(" + ");
+                    let _ = writeln!(src, "{ind}m{i}{c} -= {sum};");
+                }
+                let sum = (0..b).map(|k| format!("ldl{i}{k}_{j} * pd{k}")).collect::<Vec<_>>().join(" + ");
+                let _ = writeln!(src, "{ind}r{i}{b} -= {sum};");
+            }
+            if j == 0 {
+                src.push_str("            }\n");
+            }
+            eliminate(&mut src, "            ", b, w);
+            for i in 0..b {
+                for c in 0..b {
+                    let _ = writeln!(src, "            cp[{}] = r{i}{c};\n            pc{i}{c} = r{i}{c};", cp_at(&format!("cq{j}"), i * b + c));
+                }
+                let _ = writeln!(src, "            pd{i} = r{i}{b};");
+            }
+            let swept: Vec<String> = (0..b).map(|i| format!("r{i}{b}")).collect();
+            src.push_str(&io.store("            ", &format!("q{j}"), &swept));
+            src.push_str("        }\n");
         }
-        let sum = (0..b).map(|k| format!("l{i}{k} * pd{k}")).collect::<Vec<_>>().join(" + ");
-        let _ = writeln!(src, "            r{i}{b} -= {sum};");
+        src.push_str("    }\n");
     }
-    src.push_str("        }\n");
-    eliminate(&mut src, "        ", b, w);
-    for i in 0..b {
-        for j in 0..b {
-            let _ = writeln!(src, "        cp[{}] = r{i}{j};\n        pc{i}{j} = r{i}{j};", cp_at(i * b + j));
-        }
-        let _ = writeln!(src, "        pd{i} = r{i}{b};");
-    }
-    let swept: Vec<String> = (0..b).map(|i| format!("r{i}{b}")).collect();
-    src.push_str(&io.store("        ", "q", &swept));
-    src.push_str("    }\n");
     // The solution of a one row line (or of the whole line's last row) is its swept right-hand
     // side, still in `pd`.
     let write_x = |src: &mut String| {
@@ -1882,22 +2697,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         write_x(&mut src);
         src.push_str("    var back = 0u;\n    if (busy) { back = mid - s0; }\n");
     }
-    // Back substitution of the rest of the half: A from `mid - 1` down, B from `mid + 2` up.
-    let _ = write!(
-        src,
-        "    for (var k = 0u; k < back; k++) {{\n        let s = select(mid - 1u - k, mid + 2u + k, side == 1u);\n        let q = base + s * p.stride;\n        let cq = {cq_expr};\n"
-    );
-    src.push_str(&io.load_out("        ", "q", "yo"));
-    for i in 0..b {
-        let sum = (0..b).map(|k| format!("cp[{}] * x{k}", cp_at(i * b + k))).collect::<Vec<_>>().join(" + ");
-        let _ = writeln!(src, "        let y{i} = yo{i} - ({sum});");
+    // Back substitution of the rest of the half: A from `mid - 1` down, B from `mid + 2` up. The
+    // loads of a chunk of rows do not depend on the solution, so they all issue before the chain.
+    src.push_str("    var kb = 0u;\n");
+    for rows in rows_passes(rows) {
+        let head = if rows > 1 { format!("(; kb + {rows}u <= back; kb += {rows}u)") } else { "(; kb < back; kb++)".to_owned() };
+        let _ = writeln!(src, "    for {head} {{");
+        for j in 0..rows {
+            let (jo, q) = (io.slot(j), format!("q{j}"));
+            let _ = writeln!(src, "        let k{j} = kb + {j}u;\n        let sr{j} = select(mid - 1u - k{j}, mid + 2u + k{j}, side == 1u);\n        let {q} = base + sr{j} * p.stride;\n        let cq{j} = {};", cq_of(&q));
+            src.push_str(&jo.load_out("        ", &q, &format!("yo{j}_")));
+            for i in 0..b {
+                for k in 0..b {
+                    let _ = writeln!(src, "        let cf{i}{k}_{j} = cp[{}];", cp_at(&format!("cq{j}"), i * b + k));
+                }
+            }
+        }
+        for j in 0..rows {
+            src.push_str("        {\n");
+            for i in 0..b {
+                let sum = (0..b).map(|k| format!("cf{i}{k}_{j} * x{k}")).collect::<Vec<_>>().join(" + ");
+                let _ = writeln!(src, "            let y{i} = yo{j}_{i} - ({sum});");
+            }
+            let solved: Vec<String> = (0..b).map(|i| format!("y{i}")).collect();
+            src.push_str(&io.store("            ", &format!("q{j}"), &solved));
+            for i in 0..b {
+                let _ = writeln!(src, "            x{i} = y{i};");
+            }
+            src.push_str("        }\n");
+        }
+        src.push_str("    }\n");
     }
-    let solved: Vec<String> = (0..b).map(|i| format!("y{i}")).collect();
-    src.push_str(&io.store("        ", "q", &solved));
-    for i in 0..b {
-        let _ = writeln!(src, "        x{i} = y{i};");
-    }
-    src.push_str("    }\n}\n");
+    src.push_str("}\n");
     src
 }
 
@@ -2223,6 +3054,24 @@ fn matmul_sum_module() -> KernelModule {
 }
 
 impl Builtin {
+    /// The line solve a backend may run natively instead of this kernel's shader (see
+    /// [`LineSolveSpec`]), if this is one: the Thomas solves, on stacked blocks or on parts that
+    /// are all buffers.
+    pub(crate) fn line_solve(self) -> Option<LineSolveSpec> {
+        match self {
+            Builtin::Tridiagonal { block, starts, workgroup, twisted } => {
+                Some(LineSolveSpec { block, systems: 1, parts: false, starts, lines_per_group: thomas_lines_per_group(workgroup, twisted) })
+            }
+            Builtin::SolveParts(spec) => match spec.algo {
+                crate::solve::Algo::Thomas { workgroup, twisted, .. } if spec.fused == [0; 4] => {
+                    Some(LineSolveSpec { block: spec.block, systems: spec.systems, parts: true, starts: spec.starts, lines_per_group: thomas_lines_per_group(workgroup, twisted) })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// This kernel for elements of type `ty` (`"f32"` or `"u32"`), with the parameters `tuning`
     /// gives for the GPU.
     pub(crate) fn kernel(self, ty: &str, tuning: &Tuning) -> BuiltinKernel {
@@ -2236,6 +3085,9 @@ impl Builtin {
             Builtin::Conv1d => BuiltinKernel::Module(conv1d_module()),
             Builtin::Conv1dTiled(stride, per_thread) => wgsl(conv1d_tiled(stride, per_thread, tuning.conv_workgroup)),
             Builtin::Fft(pass) => wgsl(crate::fft::source(pass)),
+            Builtin::Dft(pass) => wgsl(crate::dft_kernel::source(&pass)),
+            Builtin::RealStage(forward, table) => wgsl(crate::spectral::real_stage_source(forward, table)),
+            Builtin::Chirp => wgsl(crate::spectral::chirp_source()),
             Builtin::UntilGate => BuiltinKernel::Module(until_gate_module()),
             Builtin::Tridiagonal { block, starts, workgroup, twisted } => wgsl(tridiagonal(block as u32, starts, u32::from(workgroup), twisted)),
             Builtin::CyclicTridiagonal { block, starts, workgroup, shift, shared_rows } => {
@@ -2243,11 +3095,19 @@ impl Builtin {
             }
             Builtin::SolveParts(spec) => wgsl(spec.source()),
             Builtin::Radix { pass, first } => wgsl(crate::sort::source(pass, first)),
+            Builtin::SortLines(sort) => wgsl(sort.source()),
             Builtin::Matmul { tile, aligned, split } => wgsl(crate::matmul::builtin_source(tile, aligned, split)),
+            Builtin::Bmm(kernel) => wgsl(crate::bmm::source(kernel)),
             Builtin::MatmulSum => BuiltinKernel::Module(matmul_sum_module()),
             Builtin::FilterCount => wgsl(crate::filter::count_source()),
             Builtin::FilterScatter { words, index } => wgsl(crate::filter::scatter_source(words, index)),
             Builtin::Transpose => wgsl(crate::jit::transpose::source(ty)),
+            Builtin::Window(window) => wgsl(crate::image::window_source(&window)),
+            Builtin::Color(op) => wgsl(crate::image::color_source(op)),
+            Builtin::Unwrap => wgsl(crate::image::unwrap_source()),
+            Builtin::Wrap => wgsl(crate::image::wrap_source()),
+            Builtin::Sat(pass) => wgsl(crate::image::sat_source(pass, ty)),
+            Builtin::Vision(kernel) => wgsl(crate::vision::source(kernel)),
             Builtin::NonFinite => BuiltinKernel::Module(non_finite_module(wg)),
         }
     }
@@ -2297,6 +3157,8 @@ mod tests {
             ReduceList::new(&[ReduceOp::Max]),
             ReduceList::new(&[ReduceOp::SumSquares]).with_epilogue(sqrt),
             ReduceList::new(&[ReduceOp::Sum, ReduceOp::Min, ReduceOp::Max, ReduceOp::SumSquares]),
+            ReduceList::new(&[ReduceOp::Prod]),
+            ReduceList::new(&[ReduceOp::Sum, ReduceOp::Prod, ReduceOp::Max]),
         ];
         for subgroups in [false, true] {
             let tuning = Tuning { subgroups, ..Tuning::for_tests() };

@@ -10,17 +10,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use luma_core::hal::{cache, copy_parallel};
+use luma_core::hal::{cache, copy_parallel_host};
 use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel,
     CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FreeUploads,
-    FusionSplit, GraphLaunch, Profile, RawArg, RawKernel, TuningProfile,
+    FusionSplit, GraphLaunch, LineSolveSpec, MatmulSpec, Profile, RawArg, RawKernel, TuningProfile,
 };
 
 use crate::codegen::CompiledCpuKernel;
-use crate::exec::{AlignedBuf, ExecBlob, WorkgroupPool};
+use crate::exec::{AlignedBuf, CostHint, ExecBlob, WorkgroupPool};
 use crate::fission;
+use crate::gemm::{NativeBatchedMatmul, NativeMatmul};
+use crate::solve::NativeLineSolve;
 
 /// Most idle bytes of recycled mappable storage kept for reuse.
 const MAPPABLE_CAP: u64 = 256 << 20;
@@ -93,6 +95,7 @@ static SHARED: LazyLock<CpuShared> = LazyLock::new(|| {
             max_workgroup_invocations: 1024,
             max_workgroup_storage_bytes: 65536,
         },
+        compute_units: Some(pool.threads() as u32),
     };
     let key = format!(
         "cpu-{:016x}",
@@ -195,10 +198,163 @@ struct CpuExecGraph {
 
 impl ExecGraph for CpuExecGraph {}
 
-fn native(kernel: &CompiledKernel) -> Result<&CompiledCpuKernel, BackendError> {
+/// What a launched kernel runs: compiled shader code or a native solve.
+enum CpuKernel<'a> {
+    Compiled(&'a CompiledCpuKernel),
+    LineSolve(&'a NativeLineSolve),
+    Matmul(&'a NativeMatmul),
+    BatchedMatmul(&'a NativeBatchedMatmul),
+}
+
+impl CpuBackend {
+    /// The mask and workgroup size checks of a kernel, which fail before any compiling.
+    fn check_module(&self, module: &KernelModule, used: Option<&[bool]>, label: &str) -> Result<(), BackendError> {
+        if let Some(mask) = used
+            && mask.len() != module.bindings.len()
+        {
+            return Err(BackendError::KernelBinding(format!(
+                "kernel `{label}`: the used mask has {} entries for {} bindings",
+                mask.len(),
+                module.bindings.len()
+            )));
+        }
+        if module.bindings.iter().any(|b| matches!(b.kind, luma_core::BindingKind::Texture2d | luma_core::BindingKind::Sampler)) {
+            return Err(BackendError::Unsupported(format!("kernel `{label}` reads a texture; the CPU backend has no textures")));
+        }
+        let limits = &self.info.limits;
+        let invocations: u64 = module
+            .workgroup_size
+            .iter()
+            .map(|&x| u64::from(x.max(1)))
+            .product();
+        let too_wide = module
+            .workgroup_size
+            .iter()
+            .zip(limits.max_workgroup_size)
+            .any(|(&x, max)| x > max);
+        if too_wide || invocations > u64::from(limits.max_workgroup_invocations) {
+            return Err(BackendError::KernelWorkgroup(format!(
+                "kernel `{label}` has workgroup size {:?} ({invocations} invocations), the device allows {:?} and {} invocations",
+                module.workgroup_size, limits.max_workgroup_size, limits.max_workgroup_invocations
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Revision of the code this crate generates and the tables that code calls through: a hash of
+/// the sources of the code generator, the ABI (the layout of the math table the machine code
+/// indexes), the packet math routines, the planner and the runtime, so that a blob written by a
+/// build that differs in any of them is never loaded.
+fn code_revision() -> u64 {
+    static REVISION: OnceLock<u64> = OnceLock::new();
+    *REVISION.get_or_init(|| {
+        let sources = [
+            include_str!("codegen.rs"),
+            include_str!("abi.rs"),
+            include_str!("vecmath.rs"),
+            include_str!("fission.rs"),
+            include_str!("exec.rs"),
+            include_str!("gemm.rs"),
+            include_str!("solve.rs"),
+            include_str!("backend.rs"),
+        ];
+        cache::source_revision(&sources)
+    })
+}
+
+/// The file name of the compiled blob of the optimized kernel `kir` (its text) under `revision`.
+fn cache_stem(kir: &str, used: Option<&[bool]>, zero_workgroup_memory: bool, revision: u64) -> String {
+    let identity = format!(
+        "{kir}\n{used:?}\n{zero_workgroup_memory}\n{}\n{}\n{revision:016x}",
+        crate::codegen::host_isa_key(),
+        crate::codegen::REVISION
+    );
+    format!("cpu-{:016x}", cache::fnv1a(identity.as_bytes()))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// A blob cached by one revision of the generated code is not found by another.
+    #[test]
+    fn a_blob_of_another_code_revision_is_not_used() {
+        let dir = std::env::temp_dir().join(format!("luma-cpu-revision-test-{}", std::process::id()));
+        let disk = DiskCache::open(Some(dir.clone()), "test".into());
+        let old = cache_stem("kernel", None, false, 1);
+        let new = cache_stem("kernel", None, false, 2);
+        assert_ne!(old, new);
+        assert!(disk.store_blob(&old, cache::CPU_MAGIC, b"machine code"));
+        assert_eq!(disk.load_blob(&old, cache::CPU_MAGIC).as_deref(), Some(&b"machine code"[..]));
+        assert!(disk.load_blob(&new, cache::CPU_MAGIC).is_none());
+        // The same kernel under the same revision is the same file; a different kernel is not.
+        assert_eq!(old, cache_stem("kernel", None, false, 1));
+        assert_ne!(old, cache_stem("other", None, false, 1));
+        // The revision of this build is stable within the process and depends on the sources.
+        assert_eq!(code_revision(), code_revision());
+        assert_ne!(cache::source_revision(&["a"]), cache::source_revision(&["b"]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Plans, compiles (or loads from the disk cache) the kernel of a checked `module`; runs on the
+/// calling thread, which may be a compile worker.
+fn compile_native(
+    disk: &DiskCache,
+    max_shared_bytes: u32,
+    module: &KernelModule,
+    used: Option<&[bool]>,
+    label: &str,
+    trust: luma_core::KernelTrust,
+) -> Result<CompiledCpuKernel, BackendError> {
+    let checked = if trust.checks_bounds() {
+        luma_core::kir::opt::with_bounds_checks(module)
+    } else {
+        Cow::Borrowed(module)
+    };
+    let optimized = luma_core::kir::optimize_for_target(&checked, true);
+    let plan = fission::plan(&optimized, used, trust.zero_workgroup_memory());
+    if plan.shared_bytes > max_shared_bytes {
+        return Err(BackendError::KernelWorkgroup(format!(
+            "kernel `{label}` uses {} bytes of workgroup memory, the device allows {}",
+            plan.shared_bytes, max_shared_bytes
+        )));
+    }
+    let stem = cache_stem(&format!("{optimized:?}"), used, trust.zero_workgroup_memory(), code_revision());
+    if let Some(bytes) = disk.load_blob(&stem, cache::CPU_MAGIC)
+        && let Ok(blob) = ExecBlob::new(&bytes)
+    {
+        return Ok(CompiledCpuKernel { exec: Arc::new(blob), plan, cost: CostHint::default() });
+    }
+    let (compiled, bytes) =
+        crate::codegen::compile(&optimized, used, trust.zero_workgroup_memory()).map_err(|e| match e {
+            BackendError::ShaderCompile(m) => {
+                BackendError::ShaderCompile(format!("kernel `{label}`: {m}"))
+            }
+            other => other,
+        })?;
+    disk.store_blob(&stem, cache::CPU_MAGIC, &bytes);
+    Ok(compiled)
+}
+
+/// The kernel behind `kernel`, waiting for its compilation: a compile error is reported as is.
+fn native(kernel: &CompiledKernel) -> Result<CpuKernel<'_>, BackendError> {
+    match kernel.raw.resolve::<CompiledCpuKernel>() {
+        Ok(compiled) => return Ok(CpuKernel::Compiled(compiled)),
+        Err(BackendError::Unsupported(_)) => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(solve) = kernel.raw.downcast_ref::<NativeLineSolve>() {
+        return Ok(CpuKernel::LineSolve(solve));
+    }
+    if let Some(product) = kernel.raw.downcast_ref::<NativeBatchedMatmul>() {
+        return Ok(CpuKernel::BatchedMatmul(product));
+    }
     kernel
         .raw
-        .downcast_ref::<CompiledCpuKernel>()
+        .downcast_ref::<NativeMatmul>()
+        .map(CpuKernel::Matmul)
         .ok_or_else(|| BackendError::Unsupported("the kernel belongs to another backend".into()))
 }
 
@@ -273,7 +429,76 @@ impl CpuBackend {
                 }
             }
         }
-        let lengths: Vec<u32> = native
+        let compiled = match native {
+            CpuKernel::Compiled(compiled) => compiled,
+            CpuKernel::Matmul(product) => {
+                let uniform = bindings.last().ok_or_else(|| invalid("a matrix product without its uniform"))?;
+                // SAFETY: the uniform's storage is 16-byte aligned and at least 16 bytes.
+                let words = unsafe { uniform.cast::<[u32; 4]>().read() };
+                product.validate(&binding_bytes, words, workgroups)?;
+                let start = Instant::now();
+                self.pool.dispatch_native(
+                    product.func,
+                    std::ptr::from_ref(product).cast(),
+                    size,
+                    workgroups,
+                    &bindings,
+                    &binding_bytes,
+                    &[],
+                    0,
+                    0,
+                    false,
+                    &product.cost,
+                );
+                drop(store);
+                return Ok(start.elapsed());
+            }
+            CpuKernel::BatchedMatmul(product) => {
+                let uniform = bindings.last().ok_or_else(|| invalid("a batched matrix product without its uniform"))?;
+                // SAFETY: the uniform's storage is 16-byte aligned and at least 32 bytes (the shader's `Params`).
+                let words = unsafe { uniform.cast::<[u32; 8]>().read() };
+                product.validate(&binding_bytes, words, workgroups)?;
+                let start = Instant::now();
+                self.pool.dispatch_native(
+                    product.func,
+                    std::ptr::from_ref(product).cast(),
+                    size,
+                    workgroups,
+                    &bindings,
+                    &binding_bytes,
+                    &[],
+                    0,
+                    0,
+                    false,
+                    &product.cost,
+                );
+                drop(store);
+                return Ok(start.elapsed());
+            }
+            CpuKernel::LineSolve(solve) => {
+                let uniform = bindings.last().ok_or_else(|| invalid("a line solve without its uniform"))?;
+                // SAFETY: the uniform's storage is 16-byte aligned and at least 16 bytes.
+                let words = unsafe { uniform.cast::<[u32; 3]>().read() };
+                solve.validate(&binding_bytes, words)?;
+                let start = Instant::now();
+                self.pool.dispatch_native(
+                    solve.func,
+                    std::ptr::from_ref(solve).cast(),
+                    size,
+                    workgroups,
+                    &bindings,
+                    &binding_bytes,
+                    &[],
+                    0,
+                    0,
+                    false,
+                    &solve.cost,
+                );
+                drop(store);
+                return Ok(start.elapsed());
+            }
+        };
+        let lengths: Vec<u32> = compiled
             .plan
             .array_lengths
             .iter()
@@ -286,15 +511,16 @@ impl CpuBackend {
             .collect();
         let start = Instant::now();
         self.pool.dispatch(
-            native.exec.as_fn(),
+            compiled.exec.as_fn(),
             size,
             workgroups,
             &bindings,
             &binding_bytes,
             &lengths,
-            native.plan.shared_bytes,
-            native.plan.scratch_bytes,
-            native.plan.initialize_shared,
+            compiled.plan.shared_bytes,
+            compiled.plan.scratch_bytes,
+            compiled.plan.initialize_shared,
+            &compiled.cost,
         );
         drop(store);
         Ok(start.elapsed())
@@ -340,8 +566,29 @@ impl Backend for CpuBackend {
         };
         let buf = raw(&buffer)?;
         // SAFETY: `data.len() <= class == buf.len()`; the buffer is idle and exclusively ours.
-        copy_parallel(data, unsafe { buf.as_uninit_slice_mut(data.len()) });
+        copy_parallel_host(data, unsafe { buf.as_uninit_slice_mut(data.len()) });
         Ok(buffer)
+    }
+
+    fn host_ptr(&self, buffer: &Buffer, bytes: u64) -> Option<*mut u8> {
+        let native = raw(buffer).ok()?;
+        // Launches run when they are recorded, but a batch that has not been flushed is still
+        // pending work: reading before the flush would skip it (see `pending_dispatches`).
+        if bytes > buffer.size() || self.dispatches.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        Some(native.as_ptr())
+    }
+
+    fn alloc_host_buffer(&self, bytes: u64, max_buffer_bytes: u64) -> Result<Buffer, BackendError> {
+        let class = size_class(bytes, max_buffer_bytes).ok_or(BackendError::OutOfMemory { requested: bytes })?;
+        let reused = lock(&self.mappable).take(class);
+        match reused {
+            Some(buffer) => Ok(buffer),
+            None => AlignedBuf::new(class)
+                .map(|b| Buffer::new(class, MAPPABLE_STORAGE_USAGE, b))
+                .ok_or(BackendError::OutOfMemory { requested: class }),
+        }
     }
 
     fn recycle_mappable(&self, buffer: Buffer) {
@@ -354,71 +601,24 @@ impl Backend for CpuBackend {
         module: &KernelModule,
         used: Option<&[bool]>,
         label: &str,
-        trusted: bool,
+        trust: luma_core::KernelTrust,
     ) -> Result<RawKernel, BackendError> {
-        if let Some(mask) = used
-            && mask.len() != module.bindings.len()
-        {
-            return Err(BackendError::KernelBinding(format!(
-                "kernel `{label}`: the used mask has {} entries for {} bindings",
-                mask.len(),
-                module.bindings.len()
-            )));
-        }
-        let limits = &self.info.limits;
-        let invocations: u64 = module
-            .workgroup_size
-            .iter()
-            .map(|&x| u64::from(x.max(1)))
-            .product();
-        let too_wide = module
-            .workgroup_size
-            .iter()
-            .zip(limits.max_workgroup_size)
-            .any(|(&x, max)| x > max);
-        if too_wide || invocations > u64::from(limits.max_workgroup_invocations) {
-            return Err(BackendError::KernelWorkgroup(format!(
-                "kernel `{label}` has workgroup size {:?} ({invocations} invocations), the device allows {:?} and {} invocations",
-                module.workgroup_size, limits.max_workgroup_size, limits.max_workgroup_invocations
-            )));
-        }
-        let checked = if trusted {
-            Cow::Borrowed(module)
-        } else {
-            luma_core::kir::opt::with_bounds_checks(module)
-        };
-        let optimized = luma_core::kir::optimize_for_target(&checked, true);
-        let plan = fission::plan(&optimized, used, !trusted);
-        if plan.shared_bytes > limits.max_workgroup_storage_bytes {
-            return Err(BackendError::KernelWorkgroup(format!(
-                "kernel `{label}` uses {} bytes of workgroup memory, the device allows {}",
-                plan.shared_bytes, limits.max_workgroup_storage_bytes
-            )));
-        }
-        let identity = format!(
-            "{optimized:?}\n{used:?}\n{}\n{}\n{}",
-            !trusted,
-            crate::codegen::host_isa_key(),
-            crate::codegen::REVISION
-        );
-        let stem = format!("cpu-{:016x}", cache::fnv1a(identity.as_bytes()));
-        if let Some(bytes) = self.disk.load_blob(&stem, cache::CPU_MAGIC)
-            && let Ok(blob) = ExecBlob::new(&bytes)
-        {
-            return Ok(RawKernel::new(CompiledCpuKernel {
-                exec: Arc::new(blob),
-                plan,
-            }));
-        }
-        let (compiled, bytes) =
-            crate::codegen::compile(&optimized, used, !trusted).map_err(|e| match e {
-                BackendError::ShaderCompile(m) => {
-                    BackendError::ShaderCompile(format!("kernel `{label}`: {m}"))
-                }
-                other => other,
-            })?;
-        self.disk.store_blob(&stem, cache::CPU_MAGIC, &bytes);
-        Ok(RawKernel::new(compiled))
+        self.check_module(module, used, label)?;
+        compile_native(&self.disk, self.info.limits.max_workgroup_storage_bytes, module, used, label, trust).map(RawKernel::new)
+    }
+
+    fn compile_kernel_deferred(
+        &self,
+        module: KernelModule,
+        used: Option<Box<[bool]>>,
+        label: &str,
+        trust: luma_core::KernelTrust,
+    ) -> Result<RawKernel, BackendError> {
+        self.check_module(&module, used.as_deref(), label)?;
+        let disk = Arc::clone(&self.disk);
+        let max_shared = self.info.limits.max_workgroup_storage_bytes;
+        let label = label.to_owned();
+        Ok(RawKernel::spawn(move || compile_native(&disk, max_shared, &module, used.as_deref(), &label, trust)))
     }
 
     fn record_launch(
@@ -476,7 +676,7 @@ impl Backend for CpuBackend {
             if src.id() == dst.id() {
                 std::ptr::copy(from, to, n);
             } else {
-                copy_parallel(
+                copy_parallel_host(
                     std::slice::from_raw_parts(from, n),
                     std::slice::from_raw_parts_mut(to.cast::<MaybeUninit<u8>>(), n),
                 );
@@ -496,7 +696,7 @@ impl Backend for CpuBackend {
         }
         let buf = raw(dst)?;
         // SAFETY: `data.len() <= dst.size()`; no launch is running.
-        copy_parallel(data, unsafe { buf.as_uninit_slice_mut(data.len()) });
+        copy_parallel_host(data, unsafe { buf.as_uninit_slice_mut(data.len()) });
         Ok(())
     }
 
@@ -563,7 +763,7 @@ impl Backend for CpuBackend {
             return Err(invalid("readback larger than its source buffer"));
         }
         // SAFETY: `dst.len() <= src.size()`; no launch is running.
-        copy_parallel(unsafe { raw(src)?.as_slice(dst.len()) }, dst);
+        copy_parallel_host(unsafe { raw(src)?.as_slice(dst.len()) }, dst);
         self.dispatches.store(0, Ordering::Relaxed);
         Ok(Duration::ZERO)
     }
@@ -592,6 +792,26 @@ impl Backend for CpuBackend {
 
     fn is_profiling(&self) -> Result<bool, BackendError> {
         Ok(lock(&self.profiler).is_some())
+    }
+
+    fn native_line_solve(&self) -> bool {
+        true
+    }
+
+    fn native_matmul(&self) -> Option<u32> {
+        Some(u32::try_from(self.pool.threads()).unwrap_or(u32::MAX))
+    }
+
+    fn compile_matmul(&self, spec: &MatmulSpec) -> Option<RawKernel> {
+        NativeMatmul::new(spec).map(RawKernel::new)
+    }
+
+    fn compile_batched_matmul(&self) -> Option<RawKernel> {
+        Some(RawKernel::new(NativeBatchedMatmul::default()))
+    }
+
+    fn compile_line_solve(&self, spec: &LineSolveSpec) -> Option<RawKernel> {
+        NativeLineSolve::new(spec).map(RawKernel::new)
     }
 
     fn capture_graph(&self, launches: &[GraphLaunch<'_>]) -> Option<Arc<dyn ExecGraph>> {
@@ -660,10 +880,10 @@ mod tests {
 
         let backend = open().unwrap();
         let k1 = backend
-            .compile_kernel(&m, None, "disk_cache_cpu_test", true)
+            .compile_kernel(&m, None, "disk_cache_cpu_test", luma_core::KernelTrust::Trusted)
             .unwrap();
         let k2 = backend
-            .compile_kernel(&m, None, "disk_cache_cpu_test", true)
+            .compile_kernel(&m, None, "disk_cache_cpu_test", luma_core::KernelTrust::Trusted)
             .unwrap();
         let c1 = k1.downcast_ref::<CompiledCpuKernel>().unwrap();
         let c2 = k2.downcast_ref::<CompiledCpuKernel>().unwrap();

@@ -68,7 +68,7 @@ pub(super) fn read_packs(jit: &JitState, fused: &mut Fused) {
             // Read through a view or shift, which cannot be told to read the pack instead.
             let _ = input.detach();
         }
-        let window = if read_shifted || ty == ElemTy::Bool { None } else { input.window() };
+        let window = if read_shifted || ty.is_packed() { None } else { input.window() };
         let Some((pack, offset)) = window else {
             inputs.push(Arc::clone(input));
             tys.push(ty);
@@ -152,7 +152,7 @@ const MIN_PACK: usize = 3;
 /// contents they were made against, and a write gives its array a buffer of its own again (see
 /// [`Storage::window_of`]). `false` if nothing was packed.
 pub(super) fn repack(ctx: &Context, op: Op, args: &[Src], excess: usize) -> bool {
-    pack_leaves(ctx, leaf_buffers(op, args), excess)
+    packed(pack_leaves(ctx, leaf_buffers(op, args), excess))
 }
 
 /// [`repack`] for the expressions of several pending `nodes` that are about to be evaluated
@@ -162,7 +162,7 @@ pub(super) fn repack_nodes(ctx: &Context, nodes: &[Arc<super::Node>], excess: us
         .iter()
         .map(|node| (Src::Node(Arc::clone(node)), node.op().out_ty(), false))
         .collect();
-    pack_leaves(ctx, leaf_buffers_from(roots), excess)
+    packed(pack_leaves(ctx, leaf_buffers_from(roots), excess))
 }
 
 /// [`repack`] for the inputs of a program that binds too many: the buffers it reads (except the
@@ -178,7 +178,15 @@ pub(super) fn repack_inputs(ctx: &Context, fused: &Fused, excess: usize) -> bool
         }
     }
     let leaves = fused.inputs.iter().zip(&fused.key.input_tys).zip(shifted).map(|((storage, &ty), shifted)| (Arc::clone(storage), ty, shifted)).collect();
-    pack_leaves(ctx, leaves, excess)
+    packed(pack_leaves(ctx, leaves, excess))
+}
+
+/// Tells the plan cache that buffers were packed (a plan does not replay copies), if they were.
+fn packed(packed: bool) -> bool {
+    if packed {
+        super::plancache::taint("buffers were copied into a pack");
+    }
+    packed
 }
 
 fn pack_leaves(ctx: &Context, leaves: Vec<(Arc<Storage>, ElemTy, bool)>, excess: usize) -> bool {
@@ -190,7 +198,7 @@ fn pack_leaves(ctx: &Context, leaves: Vec<(Arc<Storage>, ElemTy, bool)>, excess:
     type Kind = (usize, u64, ElemTy);
     let mut groups: FxMap<Kind, Vec<Arc<Storage>>> = FxMap::default();
     for (storage, ty, shifted) in leaves {
-        if !shifted && ty != ElemTy::Bool && storage.len() > 0 && storage.can_adopt() {
+        if !shifted && !ty.is_packed() && storage.len() > 0 && storage.can_adopt() {
             groups.entry((storage.len(), storage.layout().stride() as u64, ty)).or_default().push(storage);
         }
     }
@@ -241,7 +249,7 @@ fn leaf_buffers(op: Op, args: &[Src]) -> Vec<(Arc<Storage>, ElemTy, bool)> {
 fn leaf_buffers_from(mut work: Vec<(Src, ElemTy, bool)>) -> Vec<(Arc<Storage>, ElemTy, bool)> {
     let mut found: Vec<(Arc<Storage>, ElemTy, bool)> = Vec::new();
     let mut seen: FxMap<u64, ()> = FxMap::default();
-    let shifts = |op: Op, i: usize| i == 0 && matches!(op.kind, OpKind::Shift(_));
+    let shifts = |op: &Op, i: usize| i == 0 && matches!(op.kind, OpKind::Shift(_));
     while let Some((src, ty, shifted)) = work.pop() {
         let storage = match &src {
             Src::Scalar(_) => continue,

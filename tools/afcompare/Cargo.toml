@@ -1,0 +1,17 @@
+[package]
+name = "afcompare"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "luma vs ArrayFire 3.10 (CUDA) case-by-case GPU benchmark; standalone, never part of the luma workspace"
+
+[dependencies]
+luma = { path = "../.." }
+arrayfire = "3.8.0"
+libc = "0.2"
+
+# A workspace of its own: normal luma builds and CPU gates never need ArrayFire.
+[workspace]
+
+[profile.release]
+debug = false

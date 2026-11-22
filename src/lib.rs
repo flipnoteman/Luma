@@ -34,6 +34,9 @@
 //! * **Custom kernels**: [`Kernel`] runs your own WGSL on arrays, in the same batch.
 //! * **GPU timing**: [`Context::profile`] measures the GPU time per kernel where the adapter
 //!   supports timestamp queries.
+//! * **Incremental accumulation**: [`Accumulator`], [`CoMoments`], [`Covariance`], [`Histogram`],
+//!   [`Histogram2d`] and [`TopK`] fold batches that arrive over time into mergeable states on the
+//!   GPU; see the guide chapter "Incremental accumulation".
 
 // wgpu's handle types nest deeply; proving `Context: Sync` for the global default context
 // exceeds the default limit on recent nightlies (future-compat lint
@@ -55,20 +58,46 @@ mod guide {
     pub mod reductions {}
     #[doc = include_str!("../guide/src/data.md")]
     pub mod data {}
+    #[doc = include_str!("../guide/src/sparse.md")]
+    pub mod sparse {}
+    #[doc = include_str!("../guide/src/linear-algebra.md")]
+    pub mod linear_algebra {}
+    #[doc = include_str!("../guide/src/signal.md")]
+    pub mod signal {}
     #[doc = include_str!("../guide/src/records.md")]
     pub mod records {}
     #[doc = include_str!("../guide/src/loops.md")]
     pub mod loops {}
     #[doc = include_str!("../guide/src/precision.md")]
     pub mod precision {}
+    #[doc = include_str!("../guide/src/complex.md")]
+    pub mod complex {}
     #[doc = include_str!("../guide/src/integers.md")]
     pub mod integers {}
+    #[doc = include_str!("../guide/src/compact.md")]
+    pub mod compact {}
     #[doc = include_str!("../guide/src/custom-kernels.md")]
     pub mod custom_kernels {}
     #[doc = include_str!("../guide/src/performance.md")]
     pub mod performance {}
     #[doc = include_str!("../guide/src/examples.md")]
     pub mod examples {}
+    #[doc = include_str!("../guide/src/images.md")]
+    pub mod images {}
+    #[doc = include_str!("../guide/src/vision.md")]
+    pub mod vision {}
+    #[doc = include_str!("../guide/src/vision-corners.md")]
+    pub mod vision_corners {}
+    #[doc = include_str!("../guide/src/vision-matching.md")]
+    pub mod vision_matching {}
+    #[doc = include_str!("../guide/src/vision-edges.md")]
+    pub mod vision_edges {}
+    #[doc = include_str!("../guide/src/vision-regions.md")]
+    pub mod vision_regions {}
+    #[doc = include_str!("../guide/src/vision-descriptors.md")]
+    pub mod vision_descriptors {}
+    #[doc = include_str!("../guide/src/accumulators.md")]
+    pub mod accumulators {}
     #[doc = include_str!("../guide/src/environment.md")]
     pub mod environment {}
     #[doc = include_str!("../guide/src/faq.md")]
@@ -80,12 +109,15 @@ mod guide {
 // The derive emits `::luma::` paths, also inside this crate.
 extern crate self as luma;
 
+mod accum;
 mod arg;
 mod array;
 mod builtin;
+mod bykey;
 mod context;
 mod conv;
 mod cyclic;
+mod dense;
 mod solve;
 mod error;
 mod fields;
@@ -97,12 +129,18 @@ mod factorize;
 mod filter;
 mod generate;
 mod gpu;
+mod complex;
+mod dft_kernel;
 mod gpu_type;
 mod group;
+mod host;
+mod image;
+mod interp;
 mod iterate;
 mod jit;
 mod kernel;
 mod linalg;
+mod bmm;
 mod matmul;
 mod nan;
 mod ops;
@@ -112,29 +150,54 @@ mod quantile;
 mod reduce;
 mod scan;
 mod scatter;
+mod sampler;
 mod search;
+mod signal;
+mod segments;
+mod segsort;
+mod small;
+mod setmerge;
+mod setops;
 mod scalar;
 mod shape;
 mod sort;
+mod structure;
+mod stats;
+mod spectral;
+mod sparse;
+mod texture;
 mod tuning;
 mod until;
 mod view;
+mod vision;
 
+pub use accum::{AccumCore, AccumInput, Accumulator, AccumulatorBuilder, CoMoments, CoMomentsBuilder, Covariance, Fold, Histogram, Histogram2d, NanPolicy, TopK, Wide};
 pub use array::Array;
 pub use context::{default_context, flush, Context, ContextOptions, DeviceSummary};
 pub use gpu::pager::MemoryStats;
 pub use luma_core::{BackendKind, BindingInfo, BindingKind, CostModel, DeviceKind, Features, FusionSplit, KernelTiming, Profile, SplitReason, TuningProfile};
 pub use error::{LumaError, Result};
 pub use fields::Fields;
+pub use complex::C32;
+pub use spectral::{ConvMode, FftNorm};
 pub use gpu_type::{Df32, GpuType, Numeric, ScalarType};
 pub use kernel::{uniform, view, Kernel, KernelArg, KernelBuilder, ProblemSize, UniformValue};
 pub use iterate::iterate_all;
+pub use image::{transform_coordinates, transform_coordinates_on, TransformMatrix};
+pub use interp::Interp;
+pub use signal::IIR_MAX_ORDER;
 pub use until::{compile_until_all, iterate_until_all, CompiledUntil, Cond, History, Run, Series, Stat, StopReason, Until};
 pub use linalg::{
     solve_block_tridiagonal, solve_block_tridiagonal_from, solve_block_tridiagonal_parts, solve_block_tridiagonal_parts_from, solve_tridiagonal, solve_tridiagonal_from,
     solve_tridiagonal_parts, solve_tridiagonal_parts_from,
 };
-pub use matmul::matmul;
+pub use bmm::matmul_batched;
+pub use dense::lu::Lu;
+pub use dense::eigh::Eigh;
+pub use dense::svd::Svd;
+pub use dense::qr::Qr;
+pub use dense::Triangle;
+pub use matmul::{dot, matmul, matmul_f32, matmul_nt, matmul_tf32, matmul_tn, matmul_tt};
 pub use jit::fusion_limit;
 pub use ops::{eval_all, select, Condition, Operand};
 pub use reduce::Reduction;
@@ -143,7 +206,11 @@ pub use scatter::{bincount, AtomicElem};
 pub use search::Side;
 pub use shape::{Offsets, Shape};
 pub use sort::SortKey;
+pub use stats::{Bias, Norm};
+pub use sparse::{sparse, Sparse, SparseElem, SparseFormat, SparseInfo};
 pub use view::{concat, concat_slice, stack, stack_slice, PadMode, ViewMut};
+pub use vision::*;
+pub use image::{gaussian_kernel, gaussian_kernel_1d, gaussian_kernel_1d_on, gaussian_kernel_on, Border, ColorSpace, ConvSpec, ImagePixel, Padding, YccStd};
 
 /// Plumbing of `fields!`; not part of the public API.
 #[doc(hidden)]

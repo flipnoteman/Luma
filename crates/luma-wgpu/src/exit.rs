@@ -2,15 +2,25 @@
 //! its worker threads: the `[vk..]` ones and the compiler workers it starts while a device or a
 //! pipeline is created (they keep the name of the thread that started them). This handler,
 //! registered later and so run first, waits until the GPU and those workers are idle; it
-//! destroys nothing (see `IDLE` in `device.rs`). The compiler workers keep going after the
+//! destroys nothing (see `Pool` in `device.rs`). The compiler workers keep going after the
 //! pipelines they were started for were created (a backlog of recompiles of cached pipelines);
 //! when one is still busy after [`DRIVER_WAIT`] the driver's handler would hang (it waits for a
 //! lock the worker holds) or free memory the worker uses, so the process ends with `_exit`, with
 //! the status `exit` was given, instead of running the driver's handler.
+//!
+//! "Registered later" has to stay true while the driver works. `exit` runs the handlers newest
+//! first and the driver registers more of its own as it goes: `libnvidia-gpucomp`, its compiler,
+//! registers the destructors of its static state when the first pipeline is compiled, long after
+//! the device exists. A handler registered once, with the device, ran after them: it found the
+//! state a compiler worker was still using freed and the worker crashed (`SIGSEGV` in
+//! `libnvidia-gpucomp`, while the handler wrote the pipeline cache). The handler is therefore
+//! registered again after every call into the driver ([`driver_call`]); the newest registration
+//! does the work and the older ones return at once.
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::device::PipelineStore;
@@ -21,7 +31,9 @@ use crate::device::PipelineStore;
 static DEVICES: Mutex<Vec<wgpu::Device>> = Mutex::new(Vec::new());
 /// The pipeline caches the exit handler writes.
 static STORES: Mutex<Vec<Arc<PipelineStore>>> = Mutex::new(Vec::new());
-static REGISTER: Once = Once::new();
+/// Set when the exit handler has run: it is registered many times (see [`arm`]) and does its
+/// work once.
+static DONE: AtomicBool = AtomicBool::new(false);
 
 const GPU_WAIT: Duration = Duration::from_secs(2);
 /// How long the driver's workers must stay idle before exit goes ahead.
@@ -48,7 +60,8 @@ fn task_ids() -> HashSet<u32> {
 
 /// Runs `call`, a call into the driver (creating a device or a pipeline), and remembers the
 /// threads that exist after it and did not before as the driver's workers, which the exit
-/// handler waits for.
+/// handler waits for. The driver may have registered exit handlers of its own during the call,
+/// so the exit handler is registered again after it (see [`arm`]).
 pub(crate) fn driver_call<R>(call: impl FnOnce() -> R) -> R {
     let before = task_ids();
     let result = call();
@@ -57,24 +70,31 @@ pub(crate) fn driver_call<R>(call: impl FnOnce() -> R) -> R {
         known.retain(|id| after.contains(id));
         known.extend(after.difference(&before));
     }
+    arm();
     result
 }
 
+/// Registers the exit handler as the newest one. `exit` runs the handlers in the reverse order of
+/// their registration: one registered before the driver's would run after them, when the driver
+/// has freed what its compiler workers still use. A registration costs a few nanoseconds and a
+/// list slot; all but the first handler to run return at once ([`DONE`]).
+fn arm() {
+    // SAFETY: `at_exit` is a plain `extern "C"` function that never unwinds (it catches
+    // panics) and only touches statics that outlive `exit`.
+    unsafe {
+        on_exit(at_exit, std::ptr::null_mut());
+    }
+}
+
 /// Makes the exit handler wait for `device` too (unless its instance has `validated` layers, see
-/// [`DEVICES`]), registering the handler on first use.
+/// [`DEVICES`]), registering the handler.
 pub(crate) fn track(device: &wgpu::Device, validated: bool) {
     if !validated
         && let Ok(mut devices) = DEVICES.lock()
     {
         devices.push(device.clone());
     }
-    REGISTER.call_once(|| {
-        // SAFETY: `at_exit` is a plain `extern "C"` function that never unwinds (it catches
-        // panics) and only touches statics that outlive `exit`.
-        unsafe {
-            on_exit(at_exit, std::ptr::null_mut());
-        }
-    });
+    arm();
 }
 
 /// Has the exit handler write the pipeline cache of `store` too. Not for devices of instances
@@ -102,7 +122,7 @@ fn flush_all() {
 const OPT_OUT_ENV: &str = "LUMA_EXIT_WAIT";
 
 extern "C" fn at_exit(status: std::ffi::c_int, _arg: *mut std::ffi::c_void) {
-    if std::env::var_os(OPT_OUT_ENV).is_some_and(|value| value == "0") {
+    if DONE.swap(true, Ordering::AcqRel) || std::env::var_os(OPT_OUT_ENV).is_some_and(|value| value == "0") {
         return;
     }
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -113,7 +133,12 @@ extern "C" fn at_exit(status: std::ffi::c_int, _arg: *mut std::ffi::c_void) {
             }
         }
         flush_all();
-        if !wait_for_driver_workers() {
+        // A process that opened several devices (a test binary whose tests each have a context)
+        // has a `[vkps] Update` thread per device, and the driver's own handler segfaulted in one
+        // of them on every exit of the 400 unit tests on an RTX 3090 (driver 615.71) even though
+        // all were idle: with more than one device the driver's handler is never run.
+        let several = DEVICES.try_lock().is_ok_and(|devices| devices.len() > 1);
+        if several || !wait_for_driver_workers() {
             // SAFETY: the GPU is idle and the pipeline cache is written. What is left to run is
             // the driver's own handler, which would hang on a lock the busy worker holds or free
             // memory it uses; what other handlers release the kernel releases too.
@@ -191,5 +216,40 @@ mod tests {
         assert!(!known.is_empty(), "the thread started inside the call is remembered");
         let _ = go.send(());
         let _ = worker.join();
+    }
+
+    /// `exit` runs the handlers newest first and the driver registers its own while it works: a
+    /// handler armed again afterwards must run before them, one armed only once runs after.
+    /// Each case runs in a child process that ends with `exit`.
+    #[test]
+    fn arming_again_puts_the_handler_before_later_registrations() {
+        const CHILD: &str = "LUMA_EXIT_ORDER_CHILD";
+        const NAME: &str = "exit::tests::arming_again_puts_the_handler_before_later_registrations";
+        unsafe extern "C" {
+            fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+        }
+        /// Stands for a driver's handler: reports whether ours has run by now.
+        extern "C" fn driver_handler() {
+            println!("driver handler: ours has run = {}", DONE.load(Ordering::SeqCst));
+        }
+        if let Ok(case) = std::env::var(CHILD) {
+            arm();
+            // SAFETY: `driver_handler` is a plain `extern "C"` function that does not unwind.
+            unsafe { atexit(driver_handler) };
+            if case == "again" {
+                arm();
+            }
+            std::process::exit(0);
+        }
+        let run = |case: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, case)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        assert!(run("again").contains("ours has run = true"), "armed again after the driver's handler");
+        assert!(run("once").contains("ours has run = false"), "armed only before the driver's handler");
     }
 }

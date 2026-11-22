@@ -419,7 +419,9 @@ fn refresh_receiver(
 /// Releases a store node that ran: its operands go, and it counts as evaluated to the buffer it wrote.
 fn retire(store: &Arc<Node>, base: &Arc<Storage>) {
     lock(&store.args).take();
-    let _ = store.result.set(Ok(Arc::clone(base)));
+    if store.result.set(Ok(Arc::clone(base))).is_ok() {
+        store.settled();
+    }
 }
 
 /// Writes every region: `regions[j].rhs` into `regions[j].base` through `regions[j].map`, in one

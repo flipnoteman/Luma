@@ -9,7 +9,7 @@
 //! unwritable cache files only cost the speed-up.
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,7 +20,7 @@ use log::{debug, info};
 use super::CostModel;
 
 /// Layout version of the files; bumping it makes older files unreadable (and so replaced).
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 /// Magic of the pipeline cache file.
 pub const PIPELINES_MAGIC: [u8; 8] = *b"LUMAPIPE";
 /// Magic of compiled PTX blobs.
@@ -47,6 +47,49 @@ const HEADER: usize = 8 + 4 + 8 + 8;
 /// FNV-1a: a stable 64-bit hash, for checksums and file names.
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// A fast 64-bit checksum for the cache files (four independent multiply-rotate lanes over 8-byte
+/// words, the shape of xxHash64): several GB/s where the byte-serial [`fnv1a`] manages 1, which
+/// made a 32 MB pipeline cache cost 30 ms every time it was read or compared.
+pub fn checksum(bytes: &[u8]) -> u64 {
+    const P1: u64 = 0x9e37_79b1_85eb_ca87;
+    const P2: u64 = 0xc2b2_ae3d_27d4_eb4f;
+    const P3: u64 = 0x1656_67b1_9e37_79f9;
+    const P4: u64 = 0x85eb_ca77_c2b2_ae63;
+    const P5: u64 = 0x27d4_eb2f_1656_67c5;
+    let round = |acc: u64, word: u64| acc.wrapping_add(word.wrapping_mul(P2)).rotate_left(31).wrapping_mul(P1);
+    let mut lanes = [P1.wrapping_add(P2), P2, 0, 0u64.wrapping_sub(P1)];
+    let (blocks, tail) = bytes.as_chunks::<32>();
+    for block in blocks {
+        let (words, _) = block.as_chunks::<8>();
+        for (lane, word) in lanes.iter_mut().zip(words) {
+            *lane = round(*lane, u64::from_le_bytes(*word));
+        }
+    }
+    let mut hash = lanes[0].rotate_left(1).wrapping_add(lanes[1].rotate_left(7)).wrapping_add(lanes[2].rotate_left(12)).wrapping_add(lanes[3].rotate_left(18));
+    for lane in lanes {
+        hash = (hash ^ round(0, lane)).wrapping_mul(P1).wrapping_add(P4);
+    }
+    hash = hash.wrapping_add(bytes.len() as u64);
+    let (words, rest) = tail.as_chunks::<8>();
+    for word in words {
+        hash = (hash ^ round(0, u64::from_le_bytes(*word))).rotate_left(27).wrapping_mul(P1).wrapping_add(P4);
+    }
+    for &byte in rest {
+        hash = (hash ^ u64::from(byte).wrapping_mul(P5)).rotate_left(11).wrapping_mul(P1);
+    }
+    hash = (hash ^ (hash >> 33)).wrapping_mul(P2);
+    hash = (hash ^ (hash >> 29)).wrapping_mul(P3);
+    hash ^ (hash >> 32)
+}
+
+/// A revision of generated code, from the text of the sources that generate it (a backend passes
+/// its `include_str!`s): part of the key of every compiled blob, so a build whose code generator
+/// (or the tables its machine code calls through) differs from the one that wrote a blob never
+/// reads it. Any edit of those sources changes it, with no constant to remember to bump.
+pub fn source_revision(sources: &[&str]) -> u64 {
+    sources.iter().fold(0, |acc, text| acc.rotate_left(17) ^ checksum(text.as_bytes()).wrapping_add(text.len() as u64))
 }
 
 /// Whether the environment value `text` switches a feature off (`0`, `off`, `false`).
@@ -92,17 +135,28 @@ pub fn directory() -> Option<PathBuf> {
     resolve(|name| std::env::var_os(name))
 }
 
+/// The whole file at `path` (header included) and its checksum, if it is complete, of this
+/// format and magic, has the checksum its header states and is at most `max` bytes.
+fn read_checked(path: &Path, magic: [u8; 8], max: usize) -> Option<(Vec<u8>, u64)> {
+    let mut file = std::fs::File::open(path).ok()?;
+    // Size the buffer once: `fs::read` would too, but a file over `max` is not read at all.
+    let size = usize::try_from(file.metadata().ok()?.len()).ok().filter(|&size| size <= HEADER + max)?;
+    let mut bytes = Vec::with_capacity(size + 1);
+    file.read_to_end(&mut bytes).ok()?;
+    let header = bytes.get(..HEADER)?;
+    let format = u32::from_le_bytes(header[8..12].try_into().ok()?);
+    let length = u64::from_le_bytes(header[12..20].try_into().ok()?);
+    let stated = u64::from_le_bytes(header[20..28].try_into().ok()?);
+    let valid = header[..8] == magic && format == FORMAT && length == (bytes.len() - HEADER) as u64 && stated == checksum(&bytes[HEADER..]);
+    valid.then_some((bytes, stated))
+}
+
 /// The payload of the file at `path` if it is complete, of this format and has the checksum its
 /// header states.
 fn read_blob(path: &Path, magic: [u8; 8]) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(path).ok()?;
-    let header = bytes.get(..HEADER)?;
-    let payload = &bytes[HEADER..];
-    let format = u32::from_le_bytes(header[8..12].try_into().ok()?);
-    let length = u64::from_le_bytes(header[12..20].try_into().ok()?);
-    let checksum = u64::from_le_bytes(header[20..28].try_into().ok()?);
-    let valid = header[..8] == magic && format == FORMAT && length == payload.len() as u64 && checksum == fnv1a(payload);
-    valid.then(|| payload.to_vec())
+    let (mut bytes, _) = read_checked(path, magic, usize::MAX - HEADER)?;
+    bytes.drain(..HEADER);
+    Some(bytes)
 }
 
 /// Distinguishes the temporary files of threads of one process.
@@ -111,6 +165,11 @@ static TEMPORARY: AtomicU64 = AtomicU64::new(0);
 /// Writes `payload` to `path` atomically: a temporary file in the same directory, renamed over
 /// `path`.
 fn write_blob(path: &Path, magic: [u8; 8], payload: &[u8]) -> std::io::Result<()> {
+    write_checked(path, magic, payload, checksum(payload))
+}
+
+/// [`write_blob`] for a payload whose [`checksum`] is known.
+fn write_checked(path: &Path, magic: [u8; 8], payload: &[u8], checksum: u64) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let temporary = dir.join(format!(
@@ -125,7 +184,7 @@ fn write_blob(path: &Path, magic: [u8; 8], payload: &[u8]) -> std::io::Result<()
         head.extend_from_slice(&magic);
         head.extend_from_slice(&FORMAT.to_le_bytes());
         head.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        head.extend_from_slice(&fnv1a(payload).to_le_bytes());
+        head.extend_from_slice(&checksum.to_le_bytes());
         file.write_all(&head)?;
         file.write_all(payload)?;
         file.flush()?;
@@ -139,6 +198,18 @@ fn write_blob(path: &Path, magic: [u8; 8], payload: &[u8]) -> std::io::Result<()
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A pipeline cache file as read: the whole file, which is the header and then the driver's data.
+/// Kept in one piece so that a cache of tens of megabytes is read once, not copied to cut the
+/// header off.
+pub struct PipelineBlob(Vec<u8>);
+
+impl PipelineBlob {
+    /// The driver's cache data.
+    pub fn data(&self) -> &[u8] {
+        &self.0[HEADER..]
+    }
 }
 
 /// A device's view of the cache directory.
@@ -202,18 +273,17 @@ impl DiskCache {
     }
 
     /// The stored driver pipeline cache, if valid and not over [`MAX_PIPELINES`].
-    pub fn load_pipelines(&self) -> Option<Vec<u8>> {
-        let blob = self.load_blob(&self.pipelines_stem(), PIPELINES_MAGIC).filter(|b| b.len() <= MAX_PIPELINES)?;
-        *lock(&self.pipelines_hash) = fnv1a(&blob);
-        Some(blob)
+    pub fn load_pipelines(&self) -> Option<PipelineBlob> {
+        let path = self.dir.as_ref()?.join(format!("{}.bin", self.pipelines_stem()));
+        let (bytes, checksum) = read_checked(&path, PIPELINES_MAGIC, MAX_PIPELINES)?;
+        *lock(&self.pipelines_hash) = checksum;
+        Some(PipelineBlob(bytes))
     }
 
     /// Stores the driver pipeline cache if it changed since it was loaded or last stored; one
     /// over [`MAX_PIPELINES`] is dropped instead.
     pub fn store_pipelines(&self, data: &[u8]) {
-        if self.dir.is_none() {
-            return;
-        }
+        let Some(dir) = &self.dir else { return };
         let stem = self.pipelines_stem();
         if data.len() > MAX_PIPELINES {
             info!(
@@ -224,12 +294,13 @@ impl DiskCache {
             self.remove_blob(&stem);
             return;
         }
-        let hash = fnv1a(data);
+        let hash = checksum(data);
         if hash == *lock(&self.pipelines_hash) {
             return;
         }
-        if self.store_blob(&stem, PIPELINES_MAGIC, data) {
-            *lock(&self.pipelines_hash) = hash;
+        match write_checked(&dir.join(format!("{stem}.bin")), PIPELINES_MAGIC, data, hash) {
+            Ok(()) => *lock(&self.pipelines_hash) = hash,
+            Err(error) => debug!("luma: writing cache file {stem} failed: {error}"),
         }
     }
 
@@ -395,14 +466,40 @@ mod tests {
     fn pipelines_are_stored_and_oversize_is_dropped() {
         let dir = scratch("pipelines");
         let disk = DiskCache::open(Some(dir.clone()), "test-key".into());
-        assert_eq!(disk.load_pipelines(), None);
+        assert!(disk.load_pipelines().is_none());
         disk.store_pipelines(b"driver data");
-        assert_eq!(DiskCache::open(Some(dir.clone()), "test-key".into()).load_pipelines().as_deref(), Some(&b"driver data"[..]));
+        assert_eq!(DiskCache::open(Some(dir.clone()), "test-key".into()).load_pipelines().as_ref().map(PipelineBlob::data), Some(&b"driver data"[..]));
         std::fs::write(dir.join("pipelines-test-key.bin"), b"LUMAPIPE damaged").unwrap();
-        assert_eq!(disk.load_pipelines(), None, "a corrupt file is ignored");
+        assert!(disk.load_pipelines().is_none(), "a corrupt file is ignored");
         disk.store_pipelines(&vec![0u8; MAX_PIPELINES + 1]);
         assert!(!dir.join("pipelines-test-key.bin").exists(), "oversize cache removed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pipeline_cache_over_the_limit_is_not_loaded() {
+        let dir = scratch("oversize");
+        let path = dir.join("big.bin");
+        write_blob(&path, PIPELINES_MAGIC, &vec![1u8; 1000]).unwrap();
+        assert!(read_checked(&path, PIPELINES_MAGIC, 1000).is_some());
+        assert!(read_checked(&path, PIPELINES_MAGIC, 999).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_checksum_sees_every_byte_and_the_length() {
+        let data: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
+        let base = checksum(&data);
+        for at in 0..data.len() {
+            let mut damaged = data.clone();
+            damaged[at] ^= 0x10;
+            assert_ne!(checksum(&damaged), base, "byte {at}");
+        }
+        for len in 0..data.len() {
+            assert_ne!(checksum(&data[..len]), base, "length {len}");
+        }
+        assert_ne!(checksum(&[0; 40]), checksum(&[0; 41]), "zeros of other lengths");
+        assert_eq!(checksum(&data), base, "stable");
     }
 
     #[test]

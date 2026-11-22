@@ -19,8 +19,13 @@ impl FxHasher {
 impl Hasher for FxHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let word = chunk
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            // The same word as the byte-by-byte fold below makes of eight bytes.
+            self.add(u64::from_le_bytes(*chunk));
+        }
+        if !rest.is_empty() {
+            let word = rest
                 .iter()
                 .rev()
                 .fold(0u64, |word, &byte| (word << 8) | u64::from(byte));

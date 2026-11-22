@@ -23,5 +23,8 @@ pollster.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "android", windows))'.dependencies]
+ash = "0.38"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

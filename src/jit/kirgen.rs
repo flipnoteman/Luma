@@ -21,7 +21,7 @@ use luma_core::kir::{
     KirType, LocalId, ModuleBuilder, ScalarTy, Val,
 };
 
-use crate::builtin::{BinOp, Class, CmpOp, DF_MATH_LIBRARY, UnOp, df_library};
+use crate::builtin::{BinOp, Class, CmpOp, DF_MATH_LIBRARY, Part, UnOp, complex_library, df_library, special_helpers};
 use crate::error::{LumaError, Result};
 use crate::gpu::hash::FxMap;
 use crate::gpu::lower::{Library, finish, library};
@@ -30,7 +30,7 @@ use crate::tuning::Tuning;
 use super::codegen::{EDGE_HELPERS, Tile, direct, generates, generator_helpers, reads_scalars, stack_stages, views_of, views_of_inlined};
 use super::inline::{Inlined, Lowered, Region};
 use super::params::{self, DivRemSpec, StepSpec, ViewSpec};
-use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_df_library, calls_df_math};
+use super::program::{AtomicOp, FusedKey, Instr, Ref, Tail, calls_complex_library, calls_df_library, calls_df_math};
 use super::staging::Staging;
 use super::stencil::WORKGROUP;
 use super::{Edge, ElemTy, Gen, Op, OpKind, ShiftKind, ViewMap};
@@ -49,10 +49,10 @@ const NARROW_DIV: &str = "fn luma_udiv(n: u32, d: u32, r: u32) -> u32 {
 pub(super) fn reg(ty: ElemTy) -> KirType {
     match ty {
         ElemTy::F32 => KirType::F32,
-        ElemTy::U32 | ElemTy::Bool => KirType::U32,
-        ElemTy::I32 => KirType::I32,
+        ElemTy::U32 | ElemTy::Bool | ElemTy::U8 | ElemTy::U16 => KirType::U32,
+        ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => KirType::I32,
         ElemTy::F64 => KirType::Scalar(ScalarTy::F64),
-        ElemTy::Df32 => KirType::vec(ScalarTy::F32, 2),
+        ElemTy::Df32 | ElemTy::C32 => KirType::vec(ScalarTy::F32, 2),
     }
 }
 
@@ -62,9 +62,15 @@ pub(super) fn reg(ty: ElemTy) -> KirType {
 /// different invocations.
 pub(super) fn write_elem(ty: ElemTy) -> KirType {
     match ty {
-        ElemTy::Bool => KirType::Atomic(ScalarTy::U32),
+        ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => KirType::Atomic(ScalarTy::U32),
         other => reg(other),
     }
+}
+
+/// The element type of a read-only storage buffer holding elements of `ty`: the words of a packed
+/// type, else the register type.
+pub(super) fn read_elem(ty: ElemTy) -> KirType {
+    if ty.is_small() { KirType::U32 } else { reg(ty) }
 }
 
 pub(super) fn lu(fb: &FnBuilder<'_>, v: u32) -> Val {
@@ -205,6 +211,9 @@ pub(super) struct Lower<'a> {
     /// Per input, the bindings of its segments (`in{k}_{s}`).
     pub(super) segs: Vec<Vec<u32>>,
     pub(super) outs: Vec<u32>,
+    /// Whether the small integer outputs are bound as plain words: the kernel writes them as whole
+    /// words (`Build::words`), so no atomics are needed to write or read them.
+    plain_words: bool,
     /// Pairs (input `k`, output `j`): input `k` is read from the output buffer `out{j}`.
     in_place: &'a [(u32, u32)],
     views: Vec<(ViewMap, Edge)>,
@@ -226,6 +235,7 @@ impl<'a> Lower<'a> {
             ins: Vec::new(),
             segs: Vec::new(),
             outs: Vec::new(),
+            plain_words: false,
             in_place,
             views: Vec::new(),
             view_fns: Vec::new(),
@@ -293,8 +303,8 @@ impl<'a> Lower<'a> {
                     let wide = |j: u32| fb.convert(self.scalar(fb, k + j), KirType::Scalar(ScalarTy::F64));
                     (wide(0) + wide(1)) + wide(2)
                 }
-                ElemTy::Df32 => fb.compose(reg(ElemTy::Df32), &[self.scalar(fb, k), self.scalar(fb, k + 1)]),
-                ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool => self.scalar(fb, k),
+                ElemTy::Df32 | ElemTy::C32 => fb.compose(reg(ty), &[self.scalar(fb, k), self.scalar(fb, k + 1)]),
+                ElemTy::F32 | ElemTy::U32 | ElemTy::I32 | ElemTy::Bool | ElemTy::U8 | ElemTy::I8 | ElemTy::U16 | ElemTy::I16 => self.scalar(fb, k),
             },
             Ref::Tmp(k) => match f.t(k as usize) {
                 Some(v) => v,
@@ -347,6 +357,19 @@ impl<'a> Lower<'a> {
             };
             return self.call(fb, name, &[x]);
         }
+        if ty == ElemTy::C32 {
+            return match op {
+                UnOp::Neg => fb.neg(x),
+                UnOp::Id => x,
+                UnOp::Conj => {
+                    let (re, im) = self.parts(fb, x);
+                    fb.compose(reg(ElemTy::C32), &[re, fb.neg(im)])
+                }
+                UnOp::Sqrt => self.call(fb, "c_sqrt", &[x]),
+                UnOp::Exp => self.call(fb, "c_exp", &[x]),
+                other => self.fail(fb, format!("{other:?} of a C32")),
+            };
+        }
         if ty == ElemTy::Bool {
             return match op {
                 UnOp::Id => x,
@@ -357,9 +380,46 @@ impl<'a> Lower<'a> {
                 other => self.fail(fb, format!("{other:?} of a bool")),
             };
         }
+        if matches!(ty, ElemTy::U8 | ElemTy::U16) {
+            // Unsigned: `abs` is the identity, `-x` wraps.
+            match op {
+                UnOp::Abs => return x,
+                UnOp::Neg => return lu(fb, 0) - x,
+                _ => {}
+            }
+        }
         let float = |op: IrUnOp| fb.unary(op, x);
+        let wide = ty == ElemTy::F64;
+        // The functions without a WGSL built-in: `f32` ones are the helpers of the library, `f64`
+        // ones the operation itself (CUDA and the CPU lower it).
+        let special = |name: &str, op: IrUnOp| if wide { fb.unary(op, x) } else { self.call(fb, name, &[x]) };
         match op {
+            UnOp::Asin => float(IrUnOp::Asin),
+            UnOp::Acos => float(IrUnOp::Acos),
+            UnOp::Atan => float(IrUnOp::Atan),
+            UnOp::Sinh => float(IrUnOp::Sinh),
+            UnOp::Cosh => float(IrUnOp::Cosh),
+            UnOp::Asinh => float(IrUnOp::Asinh),
+            UnOp::Acosh => float(IrUnOp::Acosh),
+            UnOp::Atanh => float(IrUnOp::Atanh),
+            UnOp::Exp2 => float(IrUnOp::Exp2),
+            UnOp::Log2 => float(IrUnOp::Log2),
+            UnOp::Rsqrt => float(IrUnOp::InverseSqrt),
+            UnOp::Log10 if wide => float(IrUnOp::Log10),
+            UnOp::Log10 => fb.unary(IrUnOp::Log2, x) * fb.lit_f32(std::f32::consts::LOG10_2),
+            UnOp::Cbrt => special("luma_cbrt", IrUnOp::Cbrt),
+            UnOp::Erf => special("luma_erf", IrUnOp::Erf),
+            UnOp::Erfc => special("luma_erfc", IrUnOp::Erfc),
+            UnOp::Lgamma => special("luma_lgamma", IrUnOp::Lgamma),
+            UnOp::Tgamma => special("luma_tgamma", IrUnOp::Tgamma),
+            UnOp::Sigmoid => {
+                let one = if wide { fb.lit_f64(1.0) } else { fb.lit_f32(1.0) };
+                one / (one + fb.unary(IrUnOp::Exp, fb.neg(x)))
+            }
+            UnOp::Log1p if wide => float(IrUnOp::Log1p),
+            UnOp::Expm1 if wide => float(IrUnOp::Expm1),
             UnOp::Id => x,
+            UnOp::Conj => self.fail(fb, "conj of a real number"),
             UnOp::BitNot => fb.bit_not(x),
             UnOp::Shl(0) | UnOp::Shr(0) | UnOp::Rotl(0) => x,
             UnOp::Shl(k) => fb.shl(x, lu(fb, u32::from(k))),
@@ -386,7 +446,23 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The real and imaginary part of the complex value `z`.
+    fn parts(&self, fb: &FnBuilder<'_>, z: Val) -> (Val, Val) {
+        (fb.field(z, 0, KirType::F32), fb.field(z, 1, KirType::F32))
+    }
+
     fn binary(&self, fb: &mut FnBuilder<'_>, op: BinOp, ty: ElemTy, x: Val, y: Val) -> Val {
+        if ty == ElemTy::C32 {
+            let (a, b) = (self.parts(fb, x), self.parts(fb, y));
+            let c32 = reg(ElemTy::C32);
+            return match op {
+                BinOp::Add => fb.compose(c32, &[a.0 + b.0, a.1 + b.1]),
+                BinOp::Sub => fb.compose(c32, &[a.0 - b.0, a.1 - b.1]),
+                BinOp::Mul => fb.compose(c32, &[a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0]),
+                BinOp::Div => self.call(fb, "c_div", &[x, y]),
+                other => self.fail(fb, format!("{other:?} of C32 values")),
+            };
+        }
         if ty == ElemTy::Df32 {
             return match op {
                 BinOp::Add => self.call(fb, "df_add", &[x, y]),
@@ -401,10 +477,10 @@ impl<'a> Lower<'a> {
                 other => self.fail(fb, format!("{other:?} of Df32 values")),
             };
         }
-        // A shift or rotation amount is taken modulo 32.
+        // A shift or rotation amount is taken modulo 32 (modulo the width of a small integer).
         let amount = |fb: &FnBuilder<'_>| {
-            let word = if ty == ElemTy::I32 { fb.bitcast(y, KirType::U32) } else { y };
-            word & lu(fb, 31)
+            let word = if matches!(ty, ElemTy::I32 | ElemTy::I8 | ElemTy::I16) { fb.bitcast(y, KirType::U32) } else { y };
+            word & lu(fb, if ty.is_small() { ty.small_bits() - 1 } else { 31 })
         };
         match op {
             BinOp::Add => x + y,
@@ -415,7 +491,15 @@ impl<'a> Lower<'a> {
             BinOp::Min => fb.binary(IrBinOp::Min, x, y),
             BinOp::Max => fb.binary(IrBinOp::Max, x, y),
             BinOp::Atan2 => fb.binary(IrBinOp::Atan2, x, y),
+            BinOp::Hypot if ty == ElemTy::F64 => self.call(fb, "luma_hypotd", &[x, y]),
             BinOp::Hypot => self.call(fb, "luma_hypot", &[x, y]),
+            BinOp::Mod => match ty {
+                ElemTy::F32 => self.call(fb, "luma_modf", &[x, y]),
+                ElemTy::F64 => self.call(fb, "luma_modd", &[x, y]),
+                ElemTy::I32 => self.call(fb, "luma_modi", &[x, y]),
+                _ => x % y,
+            },
+            BinOp::Copysign if ty == ElemTy::F64 => self.call(fb, "luma_copysignd", &[x, y]),
             BinOp::Copysign => {
                 let (xb, yb) = (fb.bitcast(x, KirType::U32), fb.bitcast(y, KirType::U32));
                 let bits = fb.bit_or(fb.bit_and(xb, lu(fb, 0x7fff_ffff)), fb.bit_and(yb, lu(fb, 0x8000_0000)));
@@ -435,6 +519,14 @@ impl<'a> Lower<'a> {
 
     /// The comparison as a `bool`.
     fn compare_cond(&self, fb: &mut FnBuilder<'_>, op: CmpOp, ty: ElemTy, x: Val, y: Val) -> Val {
+        if ty == ElemTy::C32 {
+            let equal = self.call(fb, "c_eq", &[x, y]);
+            return match op {
+                CmpOp::Eq => equal,
+                CmpOp::Ne => fb.unary(IrUnOp::Not, equal),
+                other => self.fail(fb, format!("{other:?} of C32 values")),
+            };
+        }
         if ty == ElemTy::Df32 {
             let cond = match op {
                 CmpOp::Lt => self.call(fb, "df_lt", &[x, y]),
@@ -543,7 +635,66 @@ impl<'a> Lower<'a> {
             (ElemTy::Bool, ElemTy::U32) => x,
             (ElemTy::Bool, ElemTy::F64) => fb.convert(x, f64t),
             (ElemTy::Bool, ElemTy::Df32) => fb.compose(df, &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
+            (ElemTy::Bool, ElemTy::C32) => fb.compose(reg(ElemTy::C32), &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
             _ if from == to => x,
+            _ if from.is_small() || to.is_small() => self.small_cast(fb, from, to, x),
+            _ => self.fail(fb, format!("cast {from:?} -> {to:?}")),
+        }
+    }
+
+    /// `v`, the 32-bit register of the small integer type `ty`, brought back into the range of the
+    /// type: the wraparound of the arithmetic (a mask for the unsigned types, a shift up and an
+    /// arithmetic shift back for the signed ones).
+    pub(super) fn narrow(&self, fb: &FnBuilder<'_>, ty: ElemTy, v: Val) -> Val {
+        match ty {
+            ElemTy::U8 => v & lu(fb, 0xff),
+            ElemTy::U16 => v & lu(fb, 0xffff),
+            ElemTy::I8 => fb.shr(fb.shl(v, lu(fb, 24)), lu(fb, 24)),
+            ElemTy::I16 => fb.shr(fb.shl(v, lu(fb, 16)), lu(fb, 16)),
+            _ => v,
+        }
+    }
+
+    /// A cast with a small integer at one end (see `codegen::small_cast`): widening goes by value,
+    /// narrowing wraps an integer and saturates a float (a NaN becomes 0).
+    fn small_cast(&self, fb: &mut FnBuilder<'_>, from: ElemTy, to: ElemTy, x: Val) -> Val {
+        let f64t = KirType::Scalar(ScalarTy::F64);
+        if to.is_small() {
+            let (lo, hi) = match to {
+                ElemTy::U8 => (0.0, 255.0),
+                ElemTy::I8 => (-128.0, 127.0),
+                ElemTy::U16 => (0.0, 65535.0),
+                _ => (-32768.0, 32767.0),
+            };
+            let float = match from {
+                ElemTy::F32 => Some(x),
+                ElemTy::F64 => Some(fb.convert(x, KirType::F32)),
+                ElemTy::Df32 => Some(fb.field(x, 0, KirType::F32) + fb.field(x, 1, KirType::F32)),
+                _ => None,
+            };
+            if let Some(f) = float {
+                let nan = self.classify(fb, Class::Nan, ElemTy::F32, f);
+                let clamped = fb.clamp(f, lf(fb, lo), lf(fb, hi));
+                let signed = to.is_small_signed();
+                let value = fb.float_to_int_sat(clamped, if signed { KirType::I32 } else { KirType::U32 });
+                return fb.select(fb.ne(nan, lu(fb, 0)), if signed { li(fb, 0) } else { lu(fb, 0) }, value);
+            }
+            let word = match from {
+                ElemTy::I32 | ElemTy::I8 | ElemTy::I16 => fb.bitcast(x, KirType::U32),
+                _ => x,
+            };
+            let word = if to.is_small_signed() { fb.bitcast(word, KirType::I32) } else { word };
+            return self.narrow(fb, to, word);
+        }
+        match to {
+            ElemTy::U32 if from.is_small_signed() => fb.bitcast(x, KirType::U32),
+            ElemTy::U32 => x,
+            ElemTy::I32 if from.is_small_signed() => x,
+            ElemTy::I32 => fb.bitcast(x, KirType::I32),
+            ElemTy::Bool => fb.select(fb.ne(x, if from.is_small_signed() { li(fb, 0) } else { lu(fb, 0) }), lu(fb, 1), lu(fb, 0)),
+            ElemTy::F32 => fb.convert(x, KirType::F32),
+            ElemTy::F64 => fb.convert(x, f64t),
+            ElemTy::Df32 => fb.compose(reg(ElemTy::Df32), &[fb.convert(x, KirType::F32), lf(fb, 0.0)]),
             _ => self.fail(fb, format!("cast {from:?} -> {to:?}")),
         }
     }
@@ -554,7 +705,10 @@ impl<'a> Lower<'a> {
             ElemTy::U32 => coord,
             ElemTy::I32 => fb.bitcast(coord, KirType::I32),
             ElemTy::F32 | ElemTy::F64 | ElemTy::Df32 => fb.convert(coord, KirType::F32),
+            ElemTy::U8 | ElemTy::U16 => self.narrow(fb, ty, coord),
+            ElemTy::I8 | ElemTy::I16 => self.narrow(fb, ty, fb.bitcast(coord, KirType::I32)),
             ElemTy::Bool => self.fail(fb, "a generator of bools"),
+            ElemTy::C32 => self.fail(fb, "a generator of complex numbers"),
         }
     }
 
@@ -598,17 +752,40 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The real quantity `part` of the complex value `x`.
+    fn part(&self, fb: &mut FnBuilder<'_>, part: Part, x: Val) -> Val {
+        let (re, im) = self.parts(fb, x);
+        match part {
+            Part::Real => re,
+            Part::Imag => im,
+            Part::Abs => self.call(fb, "c_abs", &[x]),
+            Part::Arg => fb.binary(IrBinOp::Atan2, im, re),
+            Part::NormSqr => re * re + im * im,
+        }
+    }
+
     /// The operation `op` (anything but a shift) on the operands `x`, `y` and `z`; `index` is the
     /// element it is computed at. `None` for a shift.
     pub(super) fn operation(&self, fb: &mut FnBuilder<'_>, op: Op, x: Val, y: Val, z: Val, index: Val) -> Option<Val> {
         let ty = op.ty;
         Some(match op.kind {
+            OpKind::Unary(u) if ty.is_small() => {
+                let v = self.unary(fb, u, ty, x);
+                if u.widens() { self.narrow(fb, ty, v) } else { v }
+            }
+            OpKind::Binary(b) if ty.is_small() => {
+                let v = self.binary(fb, b, ty, x, y);
+                if b.widens() { self.narrow(fb, ty, v) } else { v }
+            }
             OpKind::Unary(u) => self.unary(fb, u, ty, x),
             OpKind::Binary(b) => self.binary(fb, b, ty, x, y),
             OpKind::Compare(c) => self.compare(fb, c, ty, x, y),
             OpKind::Classify(class) => self.classify(fb, class, ty, x),
+            OpKind::Part(part) => self.part(fb, part, x),
+            OpKind::Make => fb.compose(reg(ElemTy::C32), &[x, y]),
             OpKind::Powf if ty == ElemTy::Df32 => self.call(fb, "df_pow", &[x, y]),
-            OpKind::Powf => fb.binary(IrBinOp::Pow, x, y),
+            OpKind::Powf if ty == ElemTy::F64 => fb.binary(IrBinOp::Pow, x, y),
+            OpKind::Powf => self.call(fb, "luma_powf", &[x, y]),
             OpKind::Clamp if ty == ElemTy::Df32 => {
                 let above = self.call(fb, "df_max", &[x, y]);
                 self.call(fb, "df_min", &[above, z])
@@ -635,7 +812,26 @@ impl<'a> Lower<'a> {
                 let word = fb.load(binding, j >> lu(fb, 5));
                 (word >> (j & lu(fb, 31))) & lu(fb, 1)
             }
+            small if small.is_small() => {
+                let j = bind(fb, "j", index);
+                let word = fb.load(binding, j >> lu(fb, small.small_shift()));
+                self.extract(fb, small, word, j)
+            }
             _ => fb.load(binding, index),
+        }
+    }
+
+    /// The register value of the small integer element `j` held by `word` (the word that holds
+    /// it): the field shifted down and zero-extended or sign-extended.
+    fn extract(&self, fb: &FnBuilder<'_>, ty: ElemTy, word: Val, j: Val) -> Val {
+        let bits = ty.small_bits();
+        let at = (j & lu(fb, 32 / bits - 1)) * lu(fb, bits);
+        match ty {
+            ElemTy::U8 | ElemTy::U16 => (word >> at) & lu(fb, (1 << bits) - 1),
+            _ => {
+                let up = fb.shl(word, lu(fb, 32 - bits) - at);
+                fb.shr(fb.bitcast(up, KirType::I32), lu(fb, 32 - bits))
+            }
         }
     }
 
@@ -647,6 +843,12 @@ impl<'a> Lower<'a> {
                 let j = bind(fb, "j", index);
                 let word = fb.atomic_load(storage_target(binding, j >> lu(fb, 5)), ScalarTy::U32);
                 (word >> (j & lu(fb, 31))) & lu(fb, 1)
+            }
+            small if small.is_small() => {
+                let j = bind(fb, "j", index);
+                let at = j >> lu(fb, small.small_shift());
+                let word = if self.plain_words { fb.load(binding, at) } else { fb.atomic_load(storage_target(binding, at), ScalarTy::U32) };
+                self.extract(fb, small, word, j)
             }
             _ => fb.load(binding, index),
         }
@@ -686,8 +888,25 @@ impl<'a> Lower<'a> {
                     |b| b.atomic_rmw(None, IrAtomicOp::And, ScalarTy::U32, target(), !m),
                 );
             }
+            small if small.is_small() => {
+                let bits = small.small_bits();
+                let j = fb.let_val("luma_j", index);
+                let shift = fb.let_val("luma_s", (j & lu(fb, 32 / bits - 1)) * lu(fb, bits));
+                let field = self.field_bits(fb, small, value);
+                let m = fb.let_val("luma_m", lu(fb, (1 << bits) - 1) << shift);
+                let word = j >> lu(fb, small.small_shift());
+                fb.atomic_rmw(None, IrAtomicOp::And, ScalarTy::U32, storage_target(binding, word), !m);
+                fb.atomic_rmw(None, IrAtomicOp::Or, ScalarTy::U32, storage_target(binding, word), field << shift);
+            }
             _ => fb.store(binding, index, value),
         }
+    }
+
+    /// The low bits of the register value `value` of the small integer type `ty`, as a `u32`: the
+    /// field it takes in a word of a buffer.
+    pub(super) fn field_bits(&self, fb: &FnBuilder<'_>, ty: ElemTy, value: Val) -> Val {
+        let word = if ty.is_small_signed() { fb.bitcast(value, KirType::U32) } else { value };
+        word & lu(fb, (1 << ty.small_bits()) - 1)
     }
 
     // ---- shifts ----
@@ -1692,6 +1911,9 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
             text.push_str(DF_MATH_LIBRARY);
         }
     }
+    if instrs().any(calls_complex_library) {
+        text.push_str(complex_library());
+    }
     text.push_str(&generator_helpers(programs.iter().copied()));
     if edges {
         text.push_str(EDGE_HELPERS);
@@ -1708,6 +1930,17 @@ pub(super) fn helper_library(programs: &[&[Instr]], tuning: &Tuning, edges: bool
     if instrs().any(|instr| matches!(instr.op.kind, OpKind::Binary(BinOp::Hypot)) && instr.op.ty == ElemTy::F32) {
         text.push_str(&format!("fn luma_hypot(x: f32, y: f32) -> f32 {{ return {}; }}\n", BinOp::Hypot.expr()));
     }
+    // The expressions of the operations name the helpers they call (`luma_erf(x)`); `f64` ones
+    // are built in place.
+    text.push_str(&special_helpers(|needle| {
+        needle != "luma_ir_"
+            && instrs().any(|instr| match instr.op.kind {
+                OpKind::Powf => needle == "luma_powf(" && instr.op.ty == ElemTy::F32,
+                OpKind::Unary(op) => op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains(needle)),
+                OpKind::Binary(op) => op.expr_for(instr.op.ty).is_some_and(|expr| expr.contains(needle)),
+                _ => false,
+            })
+    }));
     if text.is_empty() { Ok(None) } else { library(&text).map(Some) }
 }
 
@@ -1730,6 +1963,8 @@ enum Variant {
     Runs,
     /// A store with `bool` outputs packed by the workgroup.
     Packed,
+    /// A store with 8-bit or 16-bit integer outputs, written as whole words.
+    Words,
     Plain,
 }
 
@@ -1757,6 +1992,13 @@ struct Build<'a> {
     shared_w: Vec<Option<u32>>,
 }
 
+/// Elements every invocation of the private scatter loads before it adds any of them.
+///
+/// Measured on an RTX 3090 (histogram of 256 bins of 10M `f32`, 0.0632 ms with one element): 2
+/// elements 0.059, 4 0.058, 8 0.053 with the 1024 workgroups of the time, and 1 to 16 the same
+/// 0.0502 at the workgroups of `launch::PRIVATE_GROUPS`; 16 was slower where all the elements
+/// fall in one bin (0.083 against 0.077 ms).
+const PRIVATE_UNROLL: u32 = 4;
 /// What a private accumulator starts as for `op` on elements of type `ty`, as bits (the merge
 /// skips the elements still holding it).
 fn seed_bits(ty: ElemTy, op: AtomicOp) -> u32 {
@@ -1859,10 +2101,12 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
     let mut mb = ModuleBuilder::new(key.label(), "main", [size, 1, 1]);
 
     // The bindings, in the order of the arguments of the launch.
+    build.env.plain_words = build.variant() == Variant::Words;
     for (j, &at) in build.outputs.iter().enumerate() {
         // An atomic scatter binds its target as atomics.
         let elem = match key.tail {
             Tail::ScatterAdd { .. } => KirType::Atomic(atomic_scalar(out_elem(at))),
+            _ if build.env.plain_words && out_elem(at).is_small() => KirType::U32,
             _ => write_elem(out_elem(at)),
         };
         build.env.outs.push(mb.add_storage_read_write(&format!("out{j}"), elem));
@@ -1874,10 +2118,10 @@ pub(super) fn store_module(key: &FusedKey, tuning: &Tuning, segment_len: u32, lo
             continue;
         }
         if !segmented || direct(&key.instrs, k as u32) {
-            build.env.ins[k] = Some(mb.add_storage_read(&format!("in{k}"), reg(ty)));
+            build.env.ins[k] = Some(mb.add_storage_read(&format!("in{k}"), read_elem(ty)));
         }
         for s in 0..slots(k) {
-            let binding = mb.add_storage_read(&format!("in{k}_{s}"), reg(ty));
+            let binding = mb.add_storage_read(&format!("in{k}_{s}"), read_elem(ty));
             build.env.segs[k].push(binding);
         }
     }
@@ -1950,6 +2194,9 @@ impl<'a> Build<'a> {
         }
         if key.tail == Tail::Store && key.writes_bits() {
             return Variant::Packed;
+        }
+        if key.pack_factor() > 1 {
+            return Variant::Words;
         }
         Variant::Plain
     }
@@ -2034,7 +2281,7 @@ impl<'a> Build<'a> {
                     self.shared.push(mb.add_shared(&format!("luma_bits{j}"), KirType::Atomic(ScalarTy::U32), words));
                 }
             }
-            Variant::Runs | Variant::Packed | Variant::Plain => {}
+            Variant::Runs | Variant::Packed | Variant::Words | Variant::Plain => {}
         }
     }
 
@@ -2046,6 +2293,7 @@ impl<'a> Build<'a> {
             Variant::StackStaged => self.stack_staged(fb),
             Variant::Runs => self.runs(fb),
             Variant::Packed => self.packed(fb),
+            Variant::Words => self.words(fb),
             Variant::Plain => self.plain(fb),
         }
     }
@@ -2168,13 +2416,103 @@ impl<'a> Build<'a> {
         }
     }
 
-    /// The plain store kernel: one element per invocation.
+    /// The plain store kernel: one element per invocation, or `key.coarsen` elements spaced by
+    /// the number of invocations of the launch (see `jit::coarsen`): the elements of one warp stay
+    /// contiguous, and the loads of all of them are issued before the first store.
     fn plain(&self, fb: &mut FnBuilder<'_>) {
         let i = element_index(fb, self.wg);
         self.guard(fb, i);
         let index = self.global(fb, i);
         let prog = self.program(fb, i, index);
+        let c = self.key.coarsen;
+        if c <= 1 {
+            self.emit_stores(fb, &prog, i);
+            return;
+        }
+        debug_assert!(super::coarsen::coarsenable(self.key), "a coarsened kernel of a variant that cannot be");
+        let nwg = fb.builtin(BuiltinVar::NumWorkgroups);
+        let (nx, ny) = (fb.field(nwg, 0, KirType::U32), fb.field(nwg, 1, KirType::U32));
+        let stride = fb.let_val("stride", nx * ny * lu(fb, self.wg));
+        let last = fb.grid_size(0) - lu(fb, 1);
+        let mut rest = Vec::with_capacity(c as usize - 1);
+        for k in 1..u32::from(c) {
+            let e = fb.let_val("e", i + stride * lu(fb, k));
+            let inside = fb.let_val("ok", fb.lt(e, fb.grid_size(0)));
+            // Elements past the end read the last one, so that the loads need no branch; their
+            // stores are skipped.
+            let at = fb.let_val("ec", fb.select(inside, e, last));
+            let index = self.global(fb, at);
+            rest.push((e, inside, self.program(fb, at, index)));
+        }
         self.emit_stores(fb, &prog, i);
+        for (e, inside, prog) in &rest {
+            fb.if_then(*inside, |b| self.emit_stores(b, prog, *e));
+        }
+    }
+
+    /// A store kernel with 8-bit or 16-bit integer outputs: invocation `w` computes the
+    /// `key.pack_factor()` consecutive elements `w * p ..` that make up whole words of every such
+    /// output and writes the words itself, so no two invocations write one word (the elements
+    /// past the end of the array contribute zeros, so the unused bytes of the last word are 0).
+    /// The other outputs are stored element by element. The program is written out once per
+    /// element, with all the loads before the first store, like a coarsened kernel's.
+    fn words(&self, fb: &mut FnBuilder<'_>) {
+        let p = self.key.pack_factor();
+        let w = element_index(fb, self.wg);
+        let size = fb.grid_size(0);
+        let first = fb.let_val("first", w * lu(fb, p));
+        let outside = fb.ge(first, size);
+        fb.if_then(outside, |b| b.ret(None));
+        let last = size - lu(fb, 1);
+        let mut elems = Vec::with_capacity(p as usize);
+        for k in 0..p {
+            let e = fb.let_val("e", first + lu(fb, k));
+            if k == 0 {
+                let index = self.global(fb, e);
+                elems.push((e, None, self.program(fb, e, index)));
+            } else {
+                let inside = fb.let_val("ok", fb.lt(e, size));
+                // Elements past the end read the last one, so that the loads need no branch.
+                let at = fb.let_val("ec", fb.select(inside, e, last));
+                let index = self.global(fb, at);
+                elems.push((e, Some(inside), self.program(fb, at, index)));
+            }
+        }
+        for (j, &at) in self.outputs.iter().enumerate() {
+            let ty = self.out_elem(at);
+            let out = self.env.outs[j];
+            if !ty.is_small() {
+                for (e, inside, prog) in &elems {
+                    let value = self.value(fb, prog, at);
+                    match inside {
+                        None => self.env.store(fb, ty, out, *e, value),
+                        Some(inside) => fb.if_then(*inside, |b| self.env.store(b, ty, out, *e, value)),
+                    }
+                }
+                continue;
+            }
+            let bits = ty.small_bits();
+            let per = 32 / bits;
+            for m in 0..p / per {
+                let mut word = lu(fb, 0);
+                for t in 0..per {
+                    let (_, inside, prog) = &elems[(m * per + t) as usize];
+                    let field = self.env.field_bits(fb, ty, self.value(fb, prog, at));
+                    let field = if t == 0 { field } else { field << lu(fb, bits * t) };
+                    let field = match inside {
+                        None => field,
+                        Some(inside) => fb.select(*inside, field, lu(fb, 0)),
+                    };
+                    word = word | field;
+                }
+                let word = fb.let_val("word", word);
+                let index = w * lu(fb, p / per) + lu(fb, m);
+                match &elems[(m * per) as usize].1 {
+                    None => fb.store(out, index, word),
+                    Some(inside) => fb.if_then(*inside, |b| b.store(out, index, word)),
+                }
+            }
+        }
     }
 
     /// An atomic scatter whose workgroups first accumulate into workgroup memory (the target is
@@ -2205,14 +2543,27 @@ impl<'a> Build<'a> {
         });
         fb.barrier(BarrierScope::Workgroup);
         let (start, size, step) = (group * lu(fb, wg) + lx, fb.grid_size(0), nx * ny * lu(fb, wg));
-        fb.for_range("i", start, size, step, |b, i| {
-            let index = self.global(b, i);
-            let prog = self.program(b, i, index);
-            let j = self.value(b, &prog, slot as usize);
-            let value = self.value(b, &prog, stored as usize);
-            let j = b.let_val("j", j);
-            let inside = b.lt(j, lu(b, len));
-            b.if_then(inside, |b| b.atomic_rmw(None, atomic_op(op), scalar, shared_target(acc, j), value));
+        let last = size - lu(fb, 1);
+        let unroll = if scalar == ScalarTy::F32 { 1 } else { PRIVATE_UNROLL };
+        fb.for_range("i", start, size, step * lu(fb, unroll), |b, i| {
+            // The loads of all the elements come before the first atomic; elements past the end
+            // read the last one (no branch around the loads) and add nothing.
+            let mut elements = Vec::with_capacity(unroll as usize);
+            for k in 0..unroll {
+                let e = if k == 0 { i } else { b.let_val("e", i + step * lu(b, k)) };
+                let at = if k == 0 { e } else { b.let_val("ec", b.select(b.lt(e, size), e, last)) };
+                let index = self.global(b, at);
+                let prog = self.program(b, at, index);
+                let j = self.value(b, &prog, slot as usize);
+                let value = self.value(b, &prog, stored as usize);
+                let j = b.let_val("j", j);
+                let value = b.let_val("v", value);
+                elements.push((e, j, value));
+            }
+            for (e, j, value) in elements {
+                let inside = b.and(b.lt(e, size), b.lt(j, lu(b, len)));
+                b.if_then(inside, |b| b.atomic_rmw(None, atomic_op(op), scalar, shared_target(acc, j), value));
+            }
         });
         fb.barrier(BarrierScope::Workgroup);
         let target = self.env.outs.first().copied().unwrap_or(0);
@@ -2628,7 +2979,7 @@ pub(super) fn loop_module(key: &FusedKey, states: &[Option<usize>], tuning: &Tun
         }
         inits = (0..count).map(|j| mb.add_storage_read(&format!("init{j}"), reg(state_elem))).collect();
         for (k, &ty) in key.input_tys.iter().enumerate() {
-            let binding = states.get(k).copied().flatten().is_none().then(|| mb.add_storage_read(&format!("in{k}"), reg(ty)));
+            let binding = states.get(k).copied().flatten().is_none().then(|| mb.add_storage_read(&format!("in{k}"), read_elem(ty)));
             env.ins.push(binding);
         }
         let mut fields: Vec<(String, KirType)> = vec![("steps".to_owned(), KirType::U32)];

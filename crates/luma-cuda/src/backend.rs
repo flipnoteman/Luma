@@ -24,26 +24,52 @@ use luma_core::hal::cache::{self, PTX_MAGIC};
 use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
-    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch,
-    NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, TuningProfile,
+    Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch, TextureCaps, TextureDesc, TextureFilter,
+    KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, GemmSpec, TuningProfile,
 };
 
 use crate::codegen::{self, CudaArgAbi};
 
-/// Uploads and readbacks larger than this go in pieces of this size.
-const TRANSFER_CHUNK: usize = 32 << 20;
+/// Pieces an upload larger than this is staged in. The copy of one piece into pinned memory
+/// overlaps the DMA of the previous one, and a piece's staging block is reused as soon as its
+/// DMA is done, so a transfer of any size cycles through a few blocks. Measured on an RTX 3090
+/// (PCIe 4.0 x16), 4 / 16 / 64 / 256 MiB uploads reach 17.8 / 23.2 / 24.7 / 22.4 GB/s with 2 MiB
+/// pieces, 14.1 / 18.1 / 23.3 / 23.7 with 8 MiB ones and 13.9 / 14.3 / 18.0 / 21.3 with 32 MiB.
+const UPLOAD_CHUNK: usize = 2 << 20;
 
-/// Readback chunks queued at once (copies overlap the host copying the previous one out).
+/// Largest piece a readback is split into.
+const READ_CHUNK: usize = 8 << 20;
+
+/// Smallest piece of a split readback; one that is shorter than twice this is not split.
+const READ_CHUNK_MIN: usize = 1 << 20;
+
+/// A readback is split in about this many pieces (within the two limits above).
+const READ_PIECES: usize = 8;
+
+/// Readback pieces queued at once (copies overlap the host copying the previous one out).
 const READ_WINDOW: usize = 4;
 
-/// Pinned staging memory held by unfinished work, above which a new request waits for it.
-const PINNED_BUSY_CAP: usize = 512 << 20;
+/// Pieces of a spilling readback (the device is full), one staging block at a time.
+const SPILL_CHUNK: usize = 32 << 20;
+
+/// Pinned staging memory held by unfinished work, above which a new request waits for it. New
+/// pinned memory costs 0.4 ms per MiB, so waiting for the GPU to finish earlier copies is
+/// cheaper than staging further ahead.
+const PINNED_BUSY_CAP: usize = 128 << 20;
 
 /// Most bytes of idle pinned staging memory kept for reuse.
-const PINNED_IDLE_CAP: usize = 256 << 20;
+const PINNED_IDLE_CAP: usize = 128 << 20;
 
 /// Smallest pinned staging allocation.
 const PINNED_MIN: usize = 4096;
+
+/// An idle block serves a request up to this many times smaller than itself: small requests
+/// get small blocks of their own instead of pinning down the big ones.
+const PINNED_FIT: usize = 4;
+
+/// Uploads whose staging block is at least this large record an event of their own, so that the
+/// block is reused when its copy is done and not only when the whole batch is.
+const MARK_MIN: usize = 256 << 10;
 
 /// Size of the chunks that uniforms too large to pass by value are copied into.
 const UNIFORM_CHUNK: usize = 1 << 20;
@@ -209,11 +235,113 @@ fn keep_pinned(st: &mut State, pinned: Pinned) {
     st.pinned_free.push(pinned);
 }
 
+fn check_mask(module: &KernelModule, used: Option<&[bool]>) -> Result<(), BackendError> {
+    match used {
+        Some(mask) if mask.len() != module.bindings.len() => {
+            Err(BackendError::KernelBinding(format!("the used-binding mask has {} entries for {} bindings", mask.len(), module.bindings.len())))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Where the time of building a kernel's function went (logged at debug level per kernel).
+struct Phases {
+    /// NVVM (IR to PTX); `None` when the PTX came from the disk cache.
+    nvvm: Option<Duration>,
+    /// `cuModuleLoadData` (PTX to SASS by the driver's JIT, or the driver's own cache) and the function lookup.
+    load: Duration,
+    ptx_bytes: usize,
+}
+
+impl fmt::Display for Phases {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.nvvm {
+            Some(nvvm) => write!(f, "NVVM {:.1} ms ({} bytes of PTX), module load {:.1} ms", nvvm.as_secs_f64() * 1e3, self.ptx_bytes, self.load.as_secs_f64() * 1e3),
+            None => write!(f, "PTX from the disk cache, module load {:.1} ms", self.load.as_secs_f64() * 1e3),
+        }
+    }
+}
+
+/// Generates, compiles and loads the kernel of `module`; runs on the calling thread, which may be
+/// a compile worker: the device context is bound to it here.
+fn compile_native(shared: &CudaShared, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<CudaKernel, BackendError> {
+    let started = Instant::now();
+    let checked: Cow<'_, KernelModule> = if trust.checks_bounds() { kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
+    let optimized = kir::optimize_for_target(&checked, true);
+    // `with_bounds_checks` already guards every workgroup-array index it cannot prove in range,
+    // so the emitter's own clamp (a `min` per access) would only repeat it.
+    let translated = codegen::emit_with_options(&optimized, used, trust.zero_workgroup_memory(), false);
+    let codegen_time = started.elapsed();
+    let strides: Vec<u32> = translated.array_lengths.iter().map(|&b| optimized.bindings.get(b as usize).and_then(|d| d.element_stride).unwrap_or(1)).collect();
+
+    shared.ctx.bind_to_thread().map_err(gpu)?;
+    let (func, phases) = shared.build_function(&translated.source, label)?;
+    log::debug!(
+        "luma-cuda: kernel `{label}`: codegen {:.1} ms ({} bytes of IR), {}",
+        codegen_time.as_secs_f64() * 1e3,
+        translated.source.len(),
+        phases
+    );
+    Ok(CudaKernel { func, workgroup: optimized.workgroup_size, shared_bytes: 0, param_abis: translated.param_abis, array_lengths: translated.array_lengths, strides })
+}
+
+/// The output tiles of the tensor-core products, largest first (see [`crate::tensor`]).
+const TENSOR_TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
+
+/// The matrix product of `spec` (tensor cores, or `f32` on the CUDA cores), loaded from its PTX.
+fn compile_gemm_ptx(shared: &CudaShared, spec: &GemmSpec) -> Result<CudaKernel, BackendError> {
+    let (source, threads, bytes) = if spec.exact {
+        let config = crate::sgemm::Config::of(spec);
+        (crate::sgemm::ptx(&config), config.threads(), config.shared_bytes())
+    } else {
+        let config = crate::tensor::Config::of(spec);
+        (crate::tensor::ptx(&config), config.threads(), config.shared_bytes())
+    };
+    if let Some(dir) = DUMP_DIR.as_deref() {
+        // Best effort: a debugging aid must not fail a compile.
+        let _ = std::fs::create_dir_all(dir);
+        let name = format!("{}-{}x{}-{}{}.ptx", if spec.exact { "sgemm" } else { "tensor" }, spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed));
+        let _ = std::fs::write(dir.join(name), &source);
+    }
+    shared.ctx.bind_to_thread().map_err(gpu)?;
+    let module = shared.ctx.load_module(Ptx::from_src(source)).map_err(gpu)?;
+    let func = module.load_function("main").map_err(gpu)?;
+    if bytes > 48 * 1024 {
+        func.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32).map_err(gpu)?;
+    }
+    if DUMP_DIR.is_some() {
+        // A tuning aid: registers, spills and resident workgroups per multiprocessor.
+        let spilled = func.get_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES).unwrap_or(-1);
+        eprintln!(
+            "gemm-info {} {}x{} t{}{}: {} registers, {} bytes of local memory, {} bytes of shared memory, {:?} workgroups per multiprocessor",
+            if spec.exact { "f32" } else { "tf32" },
+            spec.rows,
+            spec.cols,
+            u8::from(spec.lhs_transposed),
+            u8::from(spec.rhs_transposed),
+            func.num_regs().unwrap_or(-1),
+            spilled,
+            bytes,
+            func.occupancy_max_active_blocks_per_multiprocessor(threads, bytes as usize, None).ok()
+        );
+    }
+    Ok(CudaKernel {
+        func,
+        workgroup: [threads, 1, 1],
+        shared_bytes: bytes,
+        param_abis: vec![CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::InlineUniform { size: 16 }],
+        array_lengths: Vec::new(),
+        strides: Vec::new(),
+    })
+}
+
 /// A compiled kernel.
 #[derive(Debug)]
 struct CudaKernel {
     func: CudaFunction,
     workgroup: [u32; 3],
+    /// Dynamic shared memory of a workgroup.
+    shared_bytes: u32,
     param_abis: Vec<CudaArgAbi>,
     /// The bindings whose length is passed, and the element stride dividing their bound bytes.
     array_lengths: Vec<u32>,
@@ -302,6 +430,19 @@ struct Params {
 // SAFETY: `ptrs` points into the other fields of the same value and is rebuilt for every launch.
 unsafe impl Send for Params {}
 
+#[path = "texture.rs"]
+mod texture;
+use texture::CudaTexture;
+
+/// The device address that tells the buffer apart from every other one a launch touches (a
+/// texture: that of the buffer it reads, or of its own copy).
+fn access_key(buffer: &Buffer) -> Result<u64, BackendError> {
+    match buffer.downcast_ref::<CudaTexture>() {
+        Some(texture) => Ok(texture.key()),
+        None => device_ptr(buffer),
+    }
+}
+
 fn device_ptr(buffer: &Buffer) -> Result<sys::CUdeviceptr, BackendError> {
     buffer.downcast_ref::<CudaBuffer>().map(|b| b.dptr).ok_or_else(|| BackendError::KernelBinding("a buffer of another backend was passed to a CUDA kernel".into()))
 }
@@ -314,6 +455,160 @@ fn resolve_dispatch<'a>(dispatch: Dispatch<'a>) -> Result<([u32; 3], u64, Option
         Dispatch::Direct(workgroups) => Ok((workgroups, 0, None)),
         Dispatch::Indirect { buffer, offset, max_workgroups } => Ok((max_workgroups, device_ptr(buffer)? + offset, Some(buffer))),
     }
+}
+
+/// The accesses to one buffer since it was last written, while a graph is captured.
+#[derive(Default)]
+struct Touch {
+    /// The launch that wrote it last.
+    writer: Option<usize>,
+    /// The launches that read it since.
+    readers: Vec<usize>,
+}
+
+/// Orders the launches of a graph by the buffers they touch: a launch follows the last writer of
+/// every buffer it touches (read after write, write after write) and, when it writes one, every
+/// reader since (write after read). Launches that share no buffer, or only read one together,
+/// get no edge between them and may run concurrently. Buffers are told apart by device address:
+/// every buffer is a block of its own, and a pool buffer handed out again is the same address.
+#[derive(Default)]
+struct Hazards {
+    touched: std::collections::HashMap<u64, Touch>,
+    accesses: Vec<(u64, bool)>,
+}
+
+impl Hazards {
+    /// Records the next launch (numbered `index`) and puts into `after` the earlier launches it
+    /// must follow, sorted and without repeats. `args` are the buffers it binds (device address,
+    /// whether it may write it), `counts` the buffer holding its workgroup counts, which it reads.
+    fn follow(&mut self, index: usize, args: impl Iterator<Item = (u64, bool)>, counts: Option<u64>, after: &mut Vec<usize>) {
+        self.accesses.clear();
+        self.accesses.extend(args);
+        self.accesses.extend(counts.map(|ptr| (ptr, false)));
+        // One entry per buffer, a write if any binding of it is one.
+        self.accesses.sort_unstable();
+        self.accesses.dedup_by(|later, earlier| {
+            let same = later.0 == earlier.0;
+            if same {
+                earlier.1 |= later.1;
+            }
+            same
+        });
+        after.clear();
+        for &(ptr, writes) in &self.accesses {
+            let touch = self.touched.entry(ptr).or_default();
+            after.extend(touch.writer);
+            if writes {
+                after.extend(touch.readers.iter().copied());
+                touch.writer = Some(index);
+                touch.readers.clear();
+            } else {
+                touch.readers.push(index);
+            }
+        }
+        after.sort_unstable();
+        after.dedup();
+    }
+}
+
+/// Most launches looked at to find the edges a launch has through others (see [`reduce`]).
+const REDUCE_BUDGET: usize = 512;
+
+/// Drops from `after` (sorted) the launches another one in it already follows, through `preds`
+/// (what each earlier launch follows): an edge to such a launch only costs the driver a wait.
+/// Looks at no more than [`REDUCE_BUDGET`] launches; what it did not reach stays.
+fn reduce(preds: &[Vec<usize>], after: &mut Vec<usize>, seen: &mut [u32], epoch: u32, stack: &mut Vec<usize>) {
+    let Some(&low) = after.first() else { return };
+    if after.len() < 2 {
+        return;
+    }
+    stack.clear();
+    for &d in after.iter() {
+        stack.extend(preds[d].iter().copied().filter(|&p| p >= low));
+    }
+    let mut budget = REDUCE_BUDGET;
+    while let Some(n) = stack.pop() {
+        if seen[n] == epoch {
+            continue;
+        }
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        seen[n] = epoch;
+        stack.extend(preds[n].iter().copied().filter(|&p| p >= low));
+    }
+    after.retain(|&d| seen[d] != epoch);
+}
+
+/// How many launches a graph needs per launch of its longest chain for its launches to be
+/// captured with edges of their own: a graph that is mostly a chain is captured as one (measured
+/// on an RTX 3090: as fast as with edges, and without the driver's cost of branches).
+const MIN_PARALLELISM: f64 = 1.5;
+
+/// What every launch of `launches` that runs follows (indices among those that run), from the
+/// buffers they touch; `None` when the launches have too little to run side by side to pay for
+/// the edges (see [`MIN_PARALLELISM`]).
+fn capture_order(launches: &[GraphLaunch<'_>], dispatches: &[([u32; 3], u64, Option<&Buffer>)]) -> Result<Option<Vec<Vec<usize>>>, BackendError> {
+    let mut hazards = Hazards::default();
+    let mut preds: Vec<Vec<usize>> = Vec::new();
+    let mut level: Vec<u32> = Vec::new();
+    let mut seen = vec![0u32; launches.len()];
+    let (mut after, mut stack, mut accesses) = (Vec::new(), Vec::new(), Vec::new());
+    for (launch, &(grid, _, counts)) in launches.iter().zip(dispatches) {
+        if grid.contains(&0) {
+            continue;
+        }
+        accesses.clear();
+        for (_, arg) in launch.kernel.bound(launch.args) {
+            if let RawArg::Storage { buffer, writable, .. } = arg {
+                accesses.push((access_key(buffer)?, *writable));
+            }
+        }
+        hazards.follow(preds.len(), accesses.iter().copied(), counts.map(device_ptr).transpose()?, &mut after);
+        reduce(&preds, &mut after, &mut seen, preds.len() as u32 + 1, &mut stack);
+        level.push(1 + after.iter().map(|&d| level[d]).max().unwrap_or(0));
+        preds.push(after.clone());
+    }
+    let longest = level.iter().copied().max().unwrap_or(0);
+    Ok((preds.len() as f64 >= MIN_PARALLELISM * f64::from(longest)).then_some(preds))
+}
+
+/// Makes the next launch captured on `stream` follow exactly the nodes `after` (indices into
+/// `nodes`), `current` being what the stream's capture follows now.
+///
+/// # Safety
+/// `stream` must be capturing and `nodes` must be nodes of its capture graph.
+unsafe fn follow_nodes(stream: &CudaStream, nodes: &[sys::CUgraphNode], after: &[usize], current: &mut Vec<usize>) -> Result<(), BackendError> {
+    if current == after {
+        return Ok(());
+    }
+    let mut handles: Vec<sys::CUgraphNode> = after.iter().map(|&n| nodes[n]).collect();
+    // SAFETY: per the caller's contract; the driver copies the handles.
+    unsafe { sys::cuStreamUpdateCaptureDependencies(stream.cu_stream(), handles.as_mut_ptr(), handles.len(), sys::CUstreamUpdateCaptureDependencies_flags::CU_STREAM_SET_CAPTURE_DEPENDENCIES as u32) }
+        .result()
+        .map_err(gpu)?;
+    current.clear();
+    current.extend_from_slice(after);
+    Ok(())
+}
+
+/// The node the last launch captured on `stream` created.
+///
+/// # Safety
+/// `stream` must be capturing.
+unsafe fn last_node(stream: &CudaStream) -> Result<sys::CUgraphNode, BackendError> {
+    let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    let mut graph = std::ptr::null_mut();
+    let mut deps: *const sys::CUgraphNode = std::ptr::null();
+    let mut count = 0usize;
+    // SAFETY: the out-pointers are live; the dependency array is read before the next call.
+    unsafe { sys::cuStreamGetCaptureInfo_v2(stream.cu_stream(), &mut status, std::ptr::null_mut(), &mut graph, &mut deps, &mut count) }.result().map_err(gpu)?;
+    if status != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE || count != 1 {
+        return Err(BackendError::Gpu(format!("a captured launch left {count} nodes to follow ({status:?})")));
+    }
+    // SAFETY: `count == 1` entries at `deps`.
+    Ok(unsafe { *deps })
 }
 
 impl Params {
@@ -352,6 +647,8 @@ impl Params {
                     let address = uniform(bytes)?;
                     self.vals.push(address);
                 }
+                (CudaArgAbi::Texture, RawArg::Storage { buffer, .. }) => self.vals.push(texture::object(buffer)?),
+                (CudaArgAbi::Unbound, RawArg::Storage { .. }) => {}
                 _ => return Err(BackendError::KernelBinding(format!("argument {position} does not match the kind of its binding"))),
             }
         }
@@ -376,6 +673,7 @@ impl Params {
                     self.ptrs.push(unsafe { self.inline.as_mut_ptr().add(at) }.cast());
                     at += size.div_ceil(16);
                 }
+                CudaArgAbi::Unbound => {}
                 _ => {
                     self.ptrs.push((&mut self.vals[value] as *mut u64).cast());
                     value += 1;
@@ -410,6 +708,9 @@ struct State {
     held: Held,
     last_kernel: u64,
     submitted: VecDeque<(Arc<CudaEvent>, Held)>,
+    /// Staging blocks of uploads with the event that follows their copy, oldest first: they
+    /// return to the pool when that copy is done, not when the batch they were queued in is.
+    staging: VecDeque<(CudaEvent, Pinned)>,
     free_events: Vec<CudaEvent>,
     pinned_free: Vec<Pinned>,
     pinned_idle: usize,
@@ -432,6 +733,8 @@ struct CudaShared {
     nvvm: crate::nvvm::Nvvm,
     /// A dedicated stream-ordered memory pool, when the device supports them.
     pool: Option<Arc<DevicePool>>,
+    /// What the texture units take, `None` when the device reports no 2-D textures.
+    textures: Option<TextureCaps>,
 }
 
 static POOL: Mutex<Option<Arc<CudaShared>>> = Mutex::new(None);
@@ -445,6 +748,49 @@ impl CudaShared {
         let shared = Arc::new(CudaShared::open()?);
         *pool = Some(Arc::clone(&shared));
         Ok(shared)
+    }
+
+    /// The kernel compiled from NVVM IR `source`, through the disk cache.
+    fn build_function(&self, source: &str, label: &str) -> Result<(CudaFunction, Phases), BackendError> {
+        let (major, minor) = self.cc;
+        // Last byte: emitter revision; bump whenever the emitted IR or the NVVM options change.
+        let meta = [major as u8, minor as u8, self.nvvm.version.0 as u8, self.nvvm.version.1 as u8, 8];
+        // The NVVM IR text is part of the key, so an emitter change that alters it changes the key; the
+        // revision of the sources covers what the text does not show (the NVVM options, the PTX
+        // post-processing).
+        let revision = cuda_code_revision();
+        let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ revision.rotate_left(29);
+        let stem = format!("ptx-{hash:016x}");
+        let load = |text: String| self.ctx.load_module(Ptx::from_src(text)).and_then(|m| m.load_function(ENTRY));
+        let dump = |ptx: &str| {
+            if let Some(dir) = DUMP_DIR.as_deref() {
+                // Best effort: a debugging aid must not fail a compile.
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(dir.join(format!("{stem}.ll")), source);
+                let _ = std::fs::write(dir.join(format!("{stem}.ptx")), ptx);
+                let _ = std::fs::write(dir.join(format!("{stem}.label")), label);
+            }
+        };
+        if let Some(text) = self.disk.load_blob(&stem, PTX_MAGIC).and_then(|bytes| String::from_utf8(bytes).ok())
+            && !text.contains('\0')
+        {
+            dump(&text);
+            let started = Instant::now();
+            match load(text) {
+                Ok(func) => return Ok((func, Phases { nvvm: None, load: started.elapsed(), ptx_bytes: 0 })),
+                // A stale cache entry: rebuild it.
+                Err(_) => self.disk.remove_blob(&stem),
+            }
+        }
+        let started = Instant::now();
+        let text = self.nvvm.compile(source, major, minor).map_err(|e| BackendError::ShaderCompile(format!("kernel `{label}`:\n{e}")))?;
+        let nvvm = started.elapsed();
+        dump(&text);
+        let started = Instant::now();
+        let func = load(text.clone()).map_err(gpu)?;
+        let phases = Phases { nvvm: Some(nvvm), load: started.elapsed(), ptx_bytes: text.len() };
+        self.disk.store_blob(&stem, PTX_MAGIC, text.as_bytes());
+        Ok((func, phases))
     }
 
     fn open() -> Result<CudaShared, BackendError> {
@@ -474,6 +820,7 @@ impl CudaShared {
             attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y)?,
             attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z)?,
         ];
+        let multiprocessors = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
         let shared_bytes = attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?;
         let name = ctx.name().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
         ctx.bind_to_thread().map_err(|e| BackendError::RequestDevice(e.to_string()))?;
@@ -510,9 +857,11 @@ impl CudaShared {
                 max_workgroup_invocations: threads as u32,
                 max_workgroup_storage_bytes: shared_bytes as u32,
             },
+            compute_units: Some(multiprocessors as u32).filter(|&n| n > 0),
         };
         let pool = if attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)? != 0 { DevicePool::create(&ctx) } else { None };
-        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm, pool })
+        let textures = texture::caps(&attribute);
+        Ok(CudaShared { ctx, info, disk, cost: Arc::new(OnceLock::new()), cc: (major, minor), nvvm, pool, textures })
     }
 }
 
@@ -550,6 +899,7 @@ impl CudaBackend {
             held: Held::default(),
             last_kernel: 0,
             submitted: VecDeque::new(),
+            staging: VecDeque::new(),
             free_events: Vec::new(),
             pinned_free: Vec::new(),
             pinned_idle: 0,
@@ -605,10 +955,7 @@ impl CudaBackend {
             return Ok(None);
         }
         self.bind()?;
-        let event = match st.free_events.pop() {
-            Some(event) => event,
-            None => self.shared.ctx.new_event(None).map_err(gpu)?,
-        };
+        let event = self.event(st)?;
         event.record(&self.stream).map_err(gpu)?;
         let event = Arc::new(event);
         st.dirty = false;
@@ -619,7 +966,16 @@ impl CudaBackend {
         Ok(Some(event))
     }
 
-    /// Releases the resources of every batch that has completed.
+    /// An event, recycled when there is a spare one.
+    fn event(&self, st: &mut State) -> Result<CudaEvent, BackendError> {
+        match st.free_events.pop() {
+            Some(event) => Ok(event),
+            None => self.shared.ctx.new_event(None).map_err(gpu),
+        }
+    }
+
+    /// Releases the resources of every batch that has completed, and the staging blocks whose
+    /// copy has.
     fn reap(&self, st: &mut State) -> Result<(), BackendError> {
         self.bind()?;
         while let Some((event, _)) = st.submitted.front() {
@@ -631,6 +987,23 @@ impl CudaBackend {
             if let Ok(event) = Arc::try_unwrap(event)
                 && st.free_events.len() < 64
             {
+                st.free_events.push(event);
+            }
+        }
+        self.reap_staging(st)
+    }
+
+    /// Gives the staging blocks of uploads back to the pool once the stream has copied out of
+    /// them (`State::staging`).
+    fn reap_staging(&self, st: &mut State) -> Result<(), BackendError> {
+        while let Some((event, _)) = st.staging.front() {
+            if !event.try_is_complete().map_err(gpu)? {
+                break;
+            }
+            let Some((event, pinned)) = st.staging.pop_front() else { break };
+            st.pinned_busy -= pinned.cap;
+            keep_pinned(st, pinned);
+            if st.free_events.len() < 64 {
                 st.free_events.push(event);
             }
         }
@@ -670,13 +1043,15 @@ impl CudaBackend {
         Ok(start.elapsed())
     }
 
-    /// Pinned memory of at least `bytes` bytes, from the idle pool when there is some.
+    /// Pinned memory of at least `bytes` bytes: an idle block when there is a fitting one, one
+    /// that finished copying when the stream is ahead of the host, otherwise a new allocation
+    /// (`cuMemHostAlloc` pins every page: 0.4 ms per MiB, and freeing costs a third of that),
+    /// after waiting for earlier work when too much staging memory is in flight.
     fn take_pinned(&self, st: &mut State, bytes: usize) -> Result<Pinned, BackendError> {
         let class = bytes.max(PINNED_MIN).next_power_of_two();
-        // The smallest idle block that is large enough: a pool full of big blocks serves small
-        // requests without allocating.
+        // The smallest idle block that is large enough, and not much larger.
         let find = |st: &mut State| {
-            let at = st.pinned_free.iter().enumerate().filter(|(_, p)| p.cap >= class).min_by_key(|(_, p)| p.cap).map(|(at, _)| at)?;
+            let at = st.pinned_free.iter().enumerate().filter(|(_, p)| p.cap >= class && p.cap / class <= PINNED_FIT).min_by_key(|(_, p)| p.cap).map(|(at, _)| at)?;
             let pinned = st.pinned_free.swap_remove(at);
             st.pinned_idle -= pinned.cap;
             Some(pinned)
@@ -684,7 +1059,19 @@ impl CudaBackend {
         if let Some(pinned) = find(st) {
             return Ok(pinned);
         }
+        if !st.submitted.is_empty() || !st.staging.is_empty() {
+            self.reap(st)?;
+            if let Some(pinned) = find(st) {
+                return Ok(pinned);
+            }
+        }
         while st.pinned_busy + class > PINNED_BUSY_CAP && st.pinned_busy > 0 {
+            if let Some((event, _)) = st.staging.front() {
+                // A copy is in flight out of one of the blocks: its end frees it.
+                event.synchronize().map_err(poll)?;
+                self.reap(st)?;
+                continue;
+            }
             if st.submitted.is_empty() {
                 self.flush_locked(st)?;
             }
@@ -820,7 +1207,7 @@ impl CudaBackend {
                 native.func.cu_function(),
                 (grid[0], grid[1], grid[2]),
                 (native.workgroup[0], native.workgroup[1], native.workgroup[2]),
-                0,
+                native.shared_bytes,
                 self.stream.cu_stream(),
                 &mut params.ptrs[..],
             )
@@ -839,49 +1226,19 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// The kernel compiled from NVVM IR `source`, through the disk cache.
-    fn build_function(&self, source: &str, label: &str) -> Result<CudaFunction, BackendError> {
-        let (major, minor) = self.shared.cc;
-        // Last byte: emitter revision; bump whenever the emitted IR or the NVVM options change.
-        let meta = [major as u8, minor as u8, self.shared.nvvm.version.0 as u8, self.shared.nvvm.version.1 as u8, 6];
-        let hash = cache::fnv1a(source.as_bytes()) ^ cache::fnv1a(&meta).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let stem = format!("ptx-{hash:016x}");
-        let load = |text: String| self.shared.ctx.load_module(Ptx::from_src(text)).and_then(|m| m.load_function(ENTRY));
-        let dump = |ptx: &str| {
-            if let Some(dir) = DUMP_DIR.as_deref() {
-                // Best effort: a debugging aid must not fail a compile.
-                let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(dir.join(format!("{stem}.ll")), source);
-                let _ = std::fs::write(dir.join(format!("{stem}.ptx")), ptx);
-                let _ = std::fs::write(dir.join(format!("{stem}.label")), label);
-            }
-        };
-        if let Some(text) = self.shared.disk.load_blob(&stem, PTX_MAGIC).and_then(|bytes| String::from_utf8(bytes).ok())
-            && !text.contains('\0')
-        {
-            dump(&text);
-            match load(text) {
-                Ok(func) => return Ok(func),
-                // A stale cache entry: rebuild it.
-                Err(_) => self.shared.disk.remove_blob(&stem),
-            }
-        }
-        let text = self.shared.nvvm.compile(source, major, minor).map_err(|e| BackendError::ShaderCompile(format!("kernel `{label}`:\n{e}")))?;
-        dump(&text);
-        let func = load(text.clone()).map_err(gpu)?;
-        self.shared.disk.store_blob(&stem, PTX_MAGIC, text.as_bytes());
-        Ok(func)
-    }
-
-    fn try_capture(&self, launches: &[GraphLaunch<'_>]) -> Result<Arc<dyn ExecGraph>, BackendError> {
+    /// Captures `launches` as one graph: with `edges`, the launches that touch no common buffer
+    /// (or only read it) have no edge between them and may run concurrently, otherwise each one
+    /// follows the one before it.
+    fn try_capture(&self, launches: &[GraphLaunch<'_>], edges: bool) -> Result<Arc<dyn ExecGraph>, BackendError> {
         if lock(&self.state).profiler.is_some() {
             return Err(BackendError::Unsupported("graphs are not captured while profiling".into()));
         }
         let natives: Vec<&CudaKernel> = launches
             .iter()
-            .map(|l| l.kernel.raw.downcast_ref::<CudaKernel>().ok_or_else(|| BackendError::Unsupported("kernel was compiled by another backend".into())))
+            .map(|l| l.kernel.raw.resolve::<CudaKernel>())
             .collect::<Result<_, _>>()?;
         let dispatches: Vec<([u32; 3], u64, Option<&Buffer>)> = launches.iter().map(|l| resolve_dispatch(l.dispatch)).collect::<Result<_, _>>()?;
+        let order = if edges { capture_order(launches, &dispatches)? } else { None };
 
         // The uniforms passed by pointer are fixed for the life of the graph: one device copy.
         let mut staging: Vec<u8> = Vec::new();
@@ -922,6 +1279,9 @@ impl CudaBackend {
         let mut offset = 0usize;
         let scratch_bytes = if scratch.is_some() { (staging.len() as u64).max(MIN_BUFFER) } else { 0 };
         let mut res = GraphRes { buffers: Vec::new(), kernels: Vec::new(), scratch, scratch_bytes };
+        // Without an order every launch follows the one before it (the stream's order). With one,
+        // `nodes` are the launches captured and `stream_after` what the stream's capture follows now.
+        let (mut nodes, mut stream_after): (Vec<sys::CUgraphNode>, Vec<usize>) = (Vec::new(), Vec::new());
         let recorded = (|| {
             for ((launch, native), &(grid, indirect, indirect_buffer)) in launches.iter().zip(&natives).zip(&dispatches) {
                 // A launch of no workgroups (an indirect one: of a bound of none) never runs.
@@ -933,13 +1293,17 @@ impl CudaBackend {
                     offset += bytes.len().next_multiple_of(UNIFORM_ALIGN);
                     Ok(address)
                 })?;
+                if let Some(order) = &order {
+                    // SAFETY: the stream is capturing and `nodes` are its nodes.
+                    unsafe { follow_nodes(&stream, &nodes, &order[nodes.len()], &mut stream_after) }?;
+                }
                 // SAFETY: as in `launch_locked`; the captured node copies the parameters.
                 unsafe {
                     result::launch_kernel(
                         native.func.cu_function(),
                         (grid[0], grid[1], grid[2]),
                         (native.workgroup[0], native.workgroup[1], native.workgroup[2]),
-                        0,
+                        native.shared_bytes,
                         stream.cu_stream(),
                         &mut params.ptrs[..],
                     )
@@ -953,6 +1317,12 @@ impl CudaBackend {
                 // The graph reads the counts when it runs: the buffer must outlive it.
                 res.buffers.extend(indirect_buffer.cloned());
                 res.kernels.push(launch.kernel.raw.clone());
+                if order.is_some() {
+                    // SAFETY: the launch just captured made a node of the capture on `stream`.
+                    nodes.push(unsafe { last_node(&stream) }?);
+                    stream_after.clear();
+                    stream_after.push(nodes.len() - 1);
+                }
             }
             Ok::<(), BackendError>(())
         })();
@@ -1003,31 +1373,53 @@ impl Backend for CudaBackend {
         Ok(buffer)
     }
 
+    fn texture_caps(&self) -> Option<TextureCaps> {
+        self.shared.textures
+    }
+
+    fn create_texture(&self, source: &Buffer, offset: u64, pitch: u64, desc: &TextureDesc) -> Result<Buffer, BackendError> {
+        self.make_texture(source, offset, pitch, desc)
+    }
+
     fn recycle_mappable(&self, buffer: Buffer) {
         // Nothing is mappable here; the work still using it keeps it alive.
         drop(buffer);
     }
 
-    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trusted: bool) -> Result<RawKernel, BackendError> {
-        if let Some(mask) = used
-            && mask.len() != module.bindings.len()
-        {
-            return Err(BackendError::KernelBinding(format!("the used-binding mask has {} entries for {} bindings", mask.len(), module.bindings.len())));
-        }
-        let checked: Cow<'_, KernelModule> = if trusted { Cow::Borrowed(module) } else { kir::opt::with_bounds_checks(module) };
-        let optimized = kir::optimize_for_target(&checked, true);
-        let translated = codegen::emit_with_workgroup_init(&optimized, used, !trusted);
-        let strides: Vec<u32> = translated.array_lengths.iter().map(|&b| optimized.bindings.get(b as usize).and_then(|d| d.element_stride).unwrap_or(1)).collect();
+    fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
+        check_mask(module, used)?;
+        compile_native(&self.shared, module, used, label, trust).map(RawKernel::new)
+    }
 
-        self.bind()?;
-        let func = self.build_function(&translated.source, label)?;
-        Ok(RawKernel::new(CudaKernel { func, workgroup: optimized.workgroup_size, param_abis: translated.param_abis, array_lengths: translated.array_lengths, strides }))
+    fn gemm_tiles(&self, exact: bool) -> &[(u32, u32)] {
+        match (self.shared.cc.0 >= 8, exact) {
+            (false, _) => &[],
+            (true, false) => &TENSOR_TILES,
+            (true, true) => &crate::sgemm::TILES,
+        }
+    }
+
+    fn compile_gemm(&self, spec: &GemmSpec) -> Option<RawKernel> {
+        match compile_gemm_ptx(&self.shared, spec) {
+            Ok(kernel) => Some(RawKernel::new(kernel)),
+            Err(error) => {
+                log::warn!("luma-cuda: the matrix product {spec:?} did not compile: {error}");
+                None
+            }
+        }
+    }
+
+    fn compile_kernel_deferred(&self, module: KernelModule, used: Option<Box<[bool]>>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
+        check_mask(&module, used.as_deref())?;
+        let shared = Arc::clone(&self.shared);
+        let label = label.to_owned();
+        Ok(RawKernel::spawn(move || compile_native(&shared, &module, used.as_deref(), &label, trust)))
     }
 
     fn record_launch(&self, kernel: &CompiledKernel, dispatch: Dispatch<'_>, size: [u32; 3], args: &[RawArg<'_>]) -> Result<u32, BackendError> {
         kernel.check_count(args.len())?;
         kernel.check_kinds(args)?;
-        let native = kernel.raw.downcast_ref::<CudaKernel>().ok_or_else(|| BackendError::Unsupported("kernel was compiled by another backend".into()))?;
+        let native = kernel.raw.resolve::<CudaKernel>()?;
         let (grid, indirect, indirect_buffer) = resolve_dispatch(dispatch)?;
         let mut st = lock(&self.state);
         if grid.contains(&0) {
@@ -1085,25 +1477,32 @@ impl Backend for CudaBackend {
         }
         let mut st = lock(&self.state);
         self.bind()?;
-        for (index, piece) in data.chunks(TRANSFER_CHUNK).enumerate() {
+        let chunk = UPLOAD_CHUNK;
+        for (index, piece) in data.chunks(chunk).enumerate() {
             let pinned = self.take_pinned(&mut st, piece.len())?;
-            // SAFETY: `piece.len() <= pinned.cap`; the pinned memory is kept in the batch until
-            // the copy out of it has completed.
+            // SAFETY: `piece.len() <= pinned.cap`; the pinned memory is kept until the copy out
+            // of it has completed (the staging queue or the batch holds it).
             let staged = unsafe {
                 copy_parallel(piece, std::slice::from_raw_parts_mut(pinned.ptr.cast::<MaybeUninit<u8>>(), piece.len()));
                 std::slice::from_raw_parts(pinned.ptr, piece.len())
             };
-            let to = dptr + (index * TRANSFER_CHUNK) as u64;
+            let to = dptr + (index * chunk) as u64;
             // Held after `take_pinned` (which can flush and reap) and before the copy is queued.
             if st.held.buffers.last() != Some(dst) {
                 st.held.buffers.push(dst.clone());
             }
             // SAFETY: the destination range lies inside `dst`.
             let enqueued = unsafe { result::memcpy_htod_async(to, staged, self.stream.cu_stream()) };
-            // The staging memory stays with the batch whether or not the call reports an error.
+            // The staging memory stays alive whether or not the call reports an error. A big
+            // block is free again once the stream has copied out of it: the next piece (or the
+            // next upload) reuses it instead of pinning more memory. A small one goes with the batch.
+            let own_event = if enqueued.is_ok() && pinned.cap >= MARK_MIN { self.event(&mut st).ok().filter(|event| event.record(&self.stream).is_ok()) } else { None };
             st.pinned_busy += pinned.cap;
-            st.held.pinned.push(pinned);
             st.dirty = true;
+            match own_event {
+                Some(event) => st.staging.push_back((event, pinned)),
+                None => st.held.pinned.push(pinned),
+            }
             enqueued.map_err(gpu)?;
         }
         Ok(())
@@ -1175,7 +1574,13 @@ impl Backend for CudaBackend {
         // a few copies are queued first so copying one piece out overlaps the transfer of the
         // next.
         let window = if spill { 1 } else { READ_WINDOW };
-        let chunk = if total > 2 * TRANSFER_CHUNK || spill { TRANSFER_CHUNK.min(total) } else { total };
+        let chunk = if spill {
+            SPILL_CHUNK.min(total)
+        } else if total < 2 * READ_CHUNK_MIN {
+            total
+        } else {
+            (total / READ_PIECES).clamp(READ_CHUNK_MIN, READ_CHUNK).next_multiple_of(1 << 16).min(total)
+        };
         // Declared before the closure so that it is dropped (freeing the staging memory) only
         // after the failure path below has synchronized the stream.
         let mut queued: VecDeque<(usize, usize, Pinned, Option<Arc<CudaEvent>>)> = VecDeque::new();
@@ -1285,7 +1690,11 @@ impl Backend for CudaBackend {
         if launches.is_empty() {
             return None;
         }
-        match self.try_capture(launches) {
+        let captured = self.try_capture(launches, true).or_else(|error| {
+            log::debug!("luma: CUDA graph capture with edges failed, capturing a chain: {error}");
+            self.try_capture(launches, false)
+        });
+        match captured {
             Ok(graph) => Some(graph),
             Err(error) => {
                 log::debug!("luma: CUDA graph capture failed, replaying launches one by one: {error}");
@@ -1295,9 +1704,75 @@ impl Backend for CudaBackend {
     }
 }
 
+/// Revision of the code generator, a hash of the sources that emit and compile the NVVM IR.
+fn cuda_code_revision() -> u64 {
+    static REVISION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *REVISION.get_or_init(|| {
+        cache::source_revision(&[
+            include_str!("codegen/mod.rs"),
+            include_str!("codegen/ops.rs"),
+            include_str!("codegen/fb.rs"),
+            include_str!("codegen/conv.rs"),
+            include_str!("nvvm.rs"),
+            include_str!("ptx.rs"),
+            include_str!("backend.rs"),
+        ])
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch of a test: its `(buffer, writes)` arguments, a buffer given by a number, and the
+    /// buffer of its workgroup counts.
+    type Touches<'a> = (&'a [(u64, bool)], Option<u64>);
+
+    /// What each launch of `launches` must follow.
+    fn orders(launches: &[Touches<'_>]) -> Vec<Vec<usize>> {
+        let mut hazards = Hazards::default();
+        let mut after = Vec::new();
+        launches
+            .iter()
+            .enumerate()
+            .map(|(index, (args, counts))| {
+                hazards.follow(index, args.iter().copied(), *counts, &mut after);
+                after.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_edge_through_another_launch_is_dropped() {
+        // 1 and 2 follow 0, 3 follows both.
+        let preds = vec![vec![], vec![0], vec![0], vec![1, 2]];
+        let mut seen = vec![0u32; 5];
+        let mut stack = Vec::new();
+        let mut after = vec![0, 1, 2];
+        reduce(&preds, &mut after, &mut seen, 1, &mut stack);
+        assert_eq!(after, vec![1, 2]);
+        let mut after = vec![0, 3];
+        reduce(&preds, &mut after, &mut seen, 2, &mut stack);
+        assert_eq!(after, vec![3]);
+        let mut after = vec![1, 2];
+        reduce(&preds, &mut after, &mut seen, 3, &mut stack);
+        assert_eq!(after, vec![1, 2]);
+    }
+
+    #[test]
+    fn launches_follow_the_buffers_they_share() {
+        let (a, b, c, d) = (16, 32, 48, 64);
+        let got = orders(&[
+            (&[(a, false), (b, true)], None),               // 0: b = f(a)
+            (&[(a, false), (c, true)], None),               // 1: reads a with 0, writes another buffer: independent
+            (&[(b, false), (c, false), (d, true)], None),   // 2: reads what 0 and 1 wrote (RAW)
+            (&[(a, true)], None),                           // 3: overwrites what 0 and 1 read (WAR)
+            (&[(b, true), (b, false)], None),               // 4: writes what 0 wrote and 2 read (WAW, WAR); a repeat binding is one access
+            (&[(a, false)], None),                          // 5: reads what 3 wrote (RAW) and nothing else
+            (&[(d, false), (a, true)], Some(c)),            // 6: after the writer of d and of c, the readers of a since 3 (5), the writer of a (3)
+        ]);
+        assert_eq!(got, vec![vec![], vec![], vec![0, 1], vec![0, 1], vec![0, 2], vec![3], vec![1, 2, 3, 5]]);
+    }
 
     #[test]
     fn a_missing_driver_is_no_adapter() {

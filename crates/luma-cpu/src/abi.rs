@@ -87,6 +87,85 @@ extern "C" fn math_atan2(y: f64, x: f64) -> f64 {
     y.atan2(x)
 }
 
+extern "C" fn math_sinhf(x: f32) -> f32 {
+    x.sinh()
+}
+extern "C" fn math_coshf(x: f32) -> f32 {
+    x.cosh()
+}
+extern "C" fn math_asinhf(x: f32) -> f32 {
+    x.asinh()
+}
+extern "C" fn math_acoshf(x: f32) -> f32 {
+    x.acosh()
+}
+extern "C" fn math_atanhf(x: f32) -> f32 {
+    x.atanh()
+}
+extern "C" fn math_log10f(x: f32) -> f32 {
+    x.log10()
+}
+extern "C" fn math_cbrtf(x: f32) -> f32 {
+    x.cbrt()
+}
+extern "C" fn math_erff(x: f32) -> f32 {
+    libm::erff(x)
+}
+extern "C" fn math_erfcf(x: f32) -> f32 {
+    libm::erfcf(x)
+}
+extern "C" fn math_lgammaf(x: f32) -> f32 {
+    libm::lgammaf(x)
+}
+extern "C" fn math_tgammaf(x: f32) -> f32 {
+    libm::tgammaf(x)
+}
+extern "C" fn math_log1pf(x: f32) -> f32 {
+    x.ln_1p()
+}
+extern "C" fn math_expm1f(x: f32) -> f32 {
+    x.exp_m1()
+}
+extern "C" fn math_sinh(x: f64) -> f64 {
+    x.sinh()
+}
+extern "C" fn math_cosh(x: f64) -> f64 {
+    x.cosh()
+}
+extern "C" fn math_asinh(x: f64) -> f64 {
+    x.asinh()
+}
+extern "C" fn math_acosh(x: f64) -> f64 {
+    x.acosh()
+}
+extern "C" fn math_atanh(x: f64) -> f64 {
+    x.atanh()
+}
+extern "C" fn math_log10(x: f64) -> f64 {
+    x.log10()
+}
+extern "C" fn math_cbrt(x: f64) -> f64 {
+    x.cbrt()
+}
+extern "C" fn math_erf(x: f64) -> f64 {
+    libm::erf(x)
+}
+extern "C" fn math_erfc(x: f64) -> f64 {
+    libm::erfc(x)
+}
+extern "C" fn math_lgamma(x: f64) -> f64 {
+    libm::lgamma(x)
+}
+extern "C" fn math_tgamma(x: f64) -> f64 {
+    libm::tgamma(x)
+}
+extern "C" fn math_log1p(x: f64) -> f64 {
+    x.ln_1p()
+}
+extern "C" fn math_expm1(x: f64) -> f64 {
+    x.exp_m1()
+}
+
 /// Function pointer table for transcendental math routines called from position-independent JIT
 /// code without ELF/Mach-O relocations.
 #[repr(C)]
@@ -118,7 +197,54 @@ pub struct CpuMathTable {
     pub log2: extern "C" fn(f64) -> f64,
     pub pow: extern "C" fn(f64, f64) -> f64,
     pub atan2: extern "C" fn(f64, f64) -> f64,
+    /// Four-lane `f32` routines taking and returning one packet (`xmm0`), see [`crate::vecmath`].
+    #[cfg(all(target_arch = "x86_64", unix))]
+    pub packet: PacketMath,
+    // Appended after `packet`: compiled kernels cached on disk keep the offsets of everything above.
+    pub sinhf: extern "C" fn(f32) -> f32,
+    pub coshf: extern "C" fn(f32) -> f32,
+    pub asinhf: extern "C" fn(f32) -> f32,
+    pub acoshf: extern "C" fn(f32) -> f32,
+    pub atanhf: extern "C" fn(f32) -> f32,
+    pub log10f: extern "C" fn(f32) -> f32,
+    pub cbrtf: extern "C" fn(f32) -> f32,
+    pub erff: extern "C" fn(f32) -> f32,
+    pub erfcf: extern "C" fn(f32) -> f32,
+    pub lgammaf: extern "C" fn(f32) -> f32,
+    pub tgammaf: extern "C" fn(f32) -> f32,
+    pub log1pf: extern "C" fn(f32) -> f32,
+    pub expm1f: extern "C" fn(f32) -> f32,
+    pub sinh: extern "C" fn(f64) -> f64,
+    pub cosh: extern "C" fn(f64) -> f64,
+    pub asinh: extern "C" fn(f64) -> f64,
+    pub acosh: extern "C" fn(f64) -> f64,
+    pub atanh: extern "C" fn(f64) -> f64,
+    pub log10: extern "C" fn(f64) -> f64,
+    pub cbrt: extern "C" fn(f64) -> f64,
+    pub erf: extern "C" fn(f64) -> f64,
+    pub erfc: extern "C" fn(f64) -> f64,
+    pub lgamma: extern "C" fn(f64) -> f64,
+    pub tgamma: extern "C" fn(f64) -> f64,
+    pub log1p: extern "C" fn(f64) -> f64,
+    pub expm1: extern "C" fn(f64) -> f64,
 }
+
+/// One `extern "C" fn(__m128) -> __m128` per vectorised `f32` function.
+#[cfg(all(target_arch = "x86_64", unix))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PacketMath {
+    pub sinf: PacketFn,
+    pub cosf: PacketFn,
+    pub tanhf: PacketFn,
+    pub expf: PacketFn,
+    pub exp2f: PacketFn,
+    pub logf: PacketFn,
+    pub log2f: PacketFn,
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+pub type PacketFn = extern "C" fn(std::arch::x86_64::__m128) -> std::arch::x86_64::__m128;
 
 impl CpuMathTable {
     pub const OFFSET_SINF: i32 = offset_of!(Self, sinf) as i32;
@@ -147,6 +273,56 @@ impl CpuMathTable {
     pub const OFFSET_LOG2: i32 = offset_of!(Self, log2) as i32;
     pub const OFFSET_POW: i32 = offset_of!(Self, pow) as i32;
     pub const OFFSET_ATAN2: i32 = offset_of!(Self, atan2) as i32;
+    pub const OFFSET_SINHF: i32 = offset_of!(Self, sinhf) as i32;
+    pub const OFFSET_SINH: i32 = offset_of!(Self, sinh) as i32;
+    pub const OFFSET_COSHF: i32 = offset_of!(Self, coshf) as i32;
+    pub const OFFSET_COSH: i32 = offset_of!(Self, cosh) as i32;
+    pub const OFFSET_ASINHF: i32 = offset_of!(Self, asinhf) as i32;
+    pub const OFFSET_ASINH: i32 = offset_of!(Self, asinh) as i32;
+    pub const OFFSET_ACOSHF: i32 = offset_of!(Self, acoshf) as i32;
+    pub const OFFSET_ACOSH: i32 = offset_of!(Self, acosh) as i32;
+    pub const OFFSET_ATANHF: i32 = offset_of!(Self, atanhf) as i32;
+    pub const OFFSET_ATANH: i32 = offset_of!(Self, atanh) as i32;
+    pub const OFFSET_LOG10F: i32 = offset_of!(Self, log10f) as i32;
+    pub const OFFSET_LOG10: i32 = offset_of!(Self, log10) as i32;
+    pub const OFFSET_CBRTF: i32 = offset_of!(Self, cbrtf) as i32;
+    pub const OFFSET_CBRT: i32 = offset_of!(Self, cbrt) as i32;
+    pub const OFFSET_ERFF: i32 = offset_of!(Self, erff) as i32;
+    pub const OFFSET_ERF: i32 = offset_of!(Self, erf) as i32;
+    pub const OFFSET_ERFCF: i32 = offset_of!(Self, erfcf) as i32;
+    pub const OFFSET_ERFC: i32 = offset_of!(Self, erfc) as i32;
+    pub const OFFSET_LGAMMAF: i32 = offset_of!(Self, lgammaf) as i32;
+    pub const OFFSET_LGAMMA: i32 = offset_of!(Self, lgamma) as i32;
+    pub const OFFSET_TGAMMAF: i32 = offset_of!(Self, tgammaf) as i32;
+    pub const OFFSET_TGAMMA: i32 = offset_of!(Self, tgamma) as i32;
+    pub const OFFSET_LOG1PF: i32 = offset_of!(Self, log1pf) as i32;
+    pub const OFFSET_LOG1P: i32 = offset_of!(Self, log1p) as i32;
+    pub const OFFSET_EXPM1F: i32 = offset_of!(Self, expm1f) as i32;
+    pub const OFFSET_EXPM1: i32 = offset_of!(Self, expm1) as i32;
+
+    /// Offset of the packet (four-lane) `f32` routine replacing the scalar one at `scalar_off32`,
+    /// if there is one on this target.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    pub fn packet_offset(scalar_off32: i32) -> Option<i32> {
+        let base = offset_of!(Self, packet);
+        let f = |o: usize| Some((base + o) as i32);
+        match scalar_off32 {
+            Self::OFFSET_SINF => f(offset_of!(PacketMath, sinf)),
+            Self::OFFSET_COSF => f(offset_of!(PacketMath, cosf)),
+            Self::OFFSET_TANHF => f(offset_of!(PacketMath, tanhf)),
+            Self::OFFSET_EXPF => f(offset_of!(PacketMath, expf)),
+            Self::OFFSET_EXP2F => f(offset_of!(PacketMath, exp2f)),
+            Self::OFFSET_LOGF => f(offset_of!(PacketMath, logf)),
+            Self::OFFSET_LOG2F => f(offset_of!(PacketMath, log2f)),
+            _ => None,
+        }
+    }
+
+    /// No packet routines on this target: every call is one scalar call per lane.
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    pub fn packet_offset(_scalar_off32: i32) -> Option<i32> {
+        None
+    }
 }
 
 /// Static math dispatch table shared across all workgroup invocations.
@@ -177,6 +353,42 @@ pub static MATH_TABLE: CpuMathTable = CpuMathTable {
     log2: math_log2,
     pow: math_pow,
     atan2: math_atan2,
+    #[cfg(all(target_arch = "x86_64", unix))]
+    packet: PacketMath {
+        sinf: crate::vecmath::sinf4,
+        cosf: crate::vecmath::cosf4,
+        tanhf: crate::vecmath::tanhf4,
+        expf: crate::vecmath::expf4,
+        exp2f: crate::vecmath::exp2f4,
+        logf: crate::vecmath::logf4,
+        log2f: crate::vecmath::log2f4,
+    },
+    sinhf: math_sinhf,
+    sinh: math_sinh,
+    coshf: math_coshf,
+    cosh: math_cosh,
+    asinhf: math_asinhf,
+    asinh: math_asinh,
+    acoshf: math_acoshf,
+    acosh: math_acosh,
+    atanhf: math_atanhf,
+    atanh: math_atanh,
+    log10f: math_log10f,
+    log10: math_log10,
+    cbrtf: math_cbrtf,
+    cbrt: math_cbrt,
+    erff: math_erff,
+    erf: math_erf,
+    erfcf: math_erfcf,
+    erfc: math_erfc,
+    lgammaf: math_lgammaf,
+    lgamma: math_lgamma,
+    tgammaf: math_tgammaf,
+    tgamma: math_tgamma,
+    log1pf: math_log1pf,
+    log1p: math_log1p,
+    expm1f: math_expm1f,
+    expm1: math_expm1,
 };
 
 /// Context pointer passed as the sole argument (`r0`/`rdi`/`rcx`) to every compiled workgroup.
@@ -201,6 +413,8 @@ pub struct WorkgroupCtx {
     pub scratch: *mut u8,
     /// Pointer to [`MATH_TABLE`].
     pub math: *const CpuMathTable,
+    /// The kernel's own data for a native kernel (see `crate::solve`); null for compiled code.
+    pub native: *const u8,
 }
 
 impl WorkgroupCtx {

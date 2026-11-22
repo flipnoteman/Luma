@@ -180,6 +180,11 @@ impl LoopPlan {
                 return result;
             }
         } else if (1..=4).contains(&states.len())
+            // One step per pass gains nothing from time blocking: the fused kernel reads the shifts
+            // straight from memory, where the tile kernel stages them through workgroup memory
+            // (several times slower on the CPU, which finishes every step before the next is
+            // recorded and so never accumulates more than one).
+            && !(ctx.is_cpu() && self.steps < 2)
             // Tiles load circular halos from one buffer.
             && states.iter().all(|s| s.segments() == 1)
             && let Some(stencil) = stencil::plan_multi(body.clone(), states.len(), self.shape)
@@ -221,6 +226,10 @@ impl Drop for Node {
         if let Some((plan, j)) = self.looped.get() {
             plan.release(*j);
         }
+        if self.result.get().is_none() {
+            self.settled();
+        }
+        super::bits::recycle(std::mem::take(&mut self.ids));
     }
 }
 

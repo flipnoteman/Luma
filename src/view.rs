@@ -64,7 +64,7 @@ pub(crate) fn swapped(a: usize, b: usize) -> [usize; 4] {
 }
 
 /// The dimensions of `shape` as `u32`.
-fn dims32(shape: Shape) -> Result<[u32; 4], LumaError> {
+pub(crate) fn dims32(shape: Shape) -> Result<[u32; 4], LumaError> {
     let dims = shape.dims();
     let mut out = [1u32; 4];
     for (slot, &dim) in out.iter_mut().zip(&dims) {
@@ -269,8 +269,10 @@ impl<T: ScalarType> Array<T> {
         location: &'static Location<'static>,
     ) -> Array<T> {
         let (start, end) = (range.start_bound().cloned(), range.end_bound().cloned());
-        let result = self.run_slice(axis, start, end, writable, location);
-        Array::resolve(self.context(), self.slice_shape(axis, start, end), result, "slice", location)
+        match self.run_slice(axis, start, end, writable, location) {
+            Ok(array) => array,
+            failed => Array::resolve(self.context(), self.slice_shape(axis, start, end), failed, "slice", location),
+        }
     }
 
     /// The `start..end` of a slice along `axis`, or `None` if it is out of range.
@@ -760,29 +762,50 @@ impl<T: ScalarType> Array<T> {
         let ty = ElemTy::of::<T>()?;
         let too_large = || LumaError::DimensionTooLarge { shape: self.shape().dims() };
 
-        // The cells of the base the region covers: a box, as a mask over the base.
+        // The cells of the base the region covers: a box, as a mask over the base. The masks of
+        // the fields of one record (the same box of arrays of one shape) are one node.
         let base_shape = Shape::new(map.src.map(|d| d as usize));
-        let mut mask: Option<Array<bool>> = None;
-        for a in 0..4 {
+        let key = jit::MaskKey::new(map.src, std::array::from_fn(|a| {
             let (first, last) = map.ends(a);
-            let (lo, hi) = (first.min(last), first.max(last));
-            if lo == 0 && hi == i64::from(map.src[a]) - 1 {
-                continue;
+            (first.min(last), first.max(last))
+        }));
+        let covers_base = |a: usize| key.ends[a] == (0, i64::from(map.src[a]) - 1);
+        let mask: Option<Src> = if (0..4).all(covers_base) {
+            None
+        } else if let Some(node) = ctx.jit().mask_lookup(&key) {
+            Some(Src::Node(node))
+        } else {
+            let mut mask: Option<Array<bool>> = None;
+            for a in 0..4 {
+                if covers_base(a) {
+                    continue;
+                }
+                let (lo, hi) = key.ends[a];
+                let at = Array::<u32>::range_on(ctx, base_shape, a)?;
+                // The side that touches the edge of the base needs no comparison.
+                let below = (lo > 0).then(|| at.compare_at(Rhs::Scalar(lo as u32), CmpOp::Ge, "ge", location));
+                let above = (hi < i64::from(map.src[a]) - 1).then(|| at.compare_at(Rhs::Scalar(hi as u32), CmpOp::Le, "le", location));
+                let inside = match (below, above) {
+                    (Some(below), Some(above)) => below.binary_at(Rhs::Array(&above), BinOp::BitAnd, false, "bitand", location),
+                    (Some(side), None) | (None, Some(side)) => side,
+                    (None, None) => continue,
+                };
+                mask = Some(match mask {
+                    Some(rest) => rest.binary_at(Rhs::Array(&inside), BinOp::BitAnd, false, "bitand", location),
+                    None => inside,
+                });
             }
-            let at = Array::<u32>::range_on(ctx, base_shape, a)?;
-            // The side that touches the edge of the base needs no comparison.
-            let below = (lo > 0).then(|| at.compare_at(Rhs::Scalar(lo as u32), CmpOp::Ge, "ge", location));
-            let above = (hi < i64::from(map.src[a]) - 1).then(|| at.compare_at(Rhs::Scalar(hi as u32), CmpOp::Le, "le", location));
-            let inside = match (below, above) {
-                (Some(below), Some(above)) => below.binary_at(Rhs::Array(&above), BinOp::BitAnd, false, "bitand", location),
-                (Some(side), None) | (None, Some(side)) => side,
-                (None, None) => continue,
-            };
-            mask = Some(match mask {
-                Some(rest) => rest.binary_at(Rhs::Array(&inside), BinOp::BitAnd, false, "bitand", location),
-                None => inside,
-            });
-        }
+            match mask {
+                Some(mask) => {
+                    let src = mask.src()?;
+                    if let Src::Node(node) = &src {
+                        ctx.jit().mask_store(key, node);
+                    }
+                    Some(src)
+                }
+                None => None,
+            }
+        };
 
         // The right-hand side at base coordinates: base axis `a` reads region axis `from` at
         // `step * (c - start)`.
@@ -800,9 +823,9 @@ impl<T: ScalarType> Array<T> {
             }
         };
 
-        let new = match &mask {
+        let new = match mask {
             Some(mask) => {
-                let args = [mask.src()?, back, Src::Node(Arc::clone(old))];
+                let args = [mask, back, Src::Node(Arc::clone(old))];
                 jit::create(ctx, old.len(), Op::new(OpKind::Select, ty), args, "assign", location)?
             }
             // The whole base: its new value is the right-hand side.
@@ -855,6 +878,16 @@ impl<T: ScalarType> Array<T> {
         name: &'static str,
         location: &'static Location<'static>,
     ) -> Result<()> {
+        if atomic.is_none()
+            && self.context().can_run_on_host()
+            && self.view().is_none()
+            && !self.is_read_view()
+            && self.len() <= crate::host::MAX_HOST_ELEMS
+            && indices.len() <= crate::host::MAX_HOST_ELEMS
+            && crate::host::try_put(self, indices, &values.rhs())
+        {
+            return Ok(());
+        }
         let prepared = self.scatter_args(indices, values.rhs());
         drop(values);
         let result = prepared.and_then(|(base, index, values)| {
@@ -1370,7 +1403,12 @@ assign_rhs_value!(f32);
 assign_rhs_value!(u32);
 assign_rhs_value!(i32);
 assign_rhs_value!(bool);
+assign_rhs_value!(u8);
+assign_rhs_value!(i8);
+assign_rhs_value!(u16);
+assign_rhs_value!(i16);
 assign_rhs_value!(Df32);
+assign_rhs_value!(crate::complex::C32);
 assign_rhs_host!(f32);
 assign_rhs_host!(u32);
 assign_rhs_host!(i32);
@@ -1460,6 +1498,7 @@ view_arithmetic_values!(f32);
 view_arithmetic_values!(u32);
 view_arithmetic_values!(f64);
 view_arithmetic_values!(Df32);
+view_arithmetic_values!(crate::complex::C32);
 view_arithmetic_host!(f32);
 view_arithmetic_host!(u32);
 

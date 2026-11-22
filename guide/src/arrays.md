@@ -38,12 +38,14 @@ instead of the lazily opened default one. Arrays of different contexts cannot be
 | `f32` | the default float; every operation |
 | `u32` | indices, counters, [bit operations](integers.md) |
 | `i32` | signed integers, [casts](integers.md#signed-integers-and-casts) |
+| `u8`, `i8`, `u16`, `i16` | compact integers, 1 or 2 bytes per element, wrapping arithmetic ([Compact integers](compact.md)) |
 | `bool` | the result of comparisons: a boolean per element ([booleans](integers.md#comparisons-booleans-and-select)) |
 | `Df32` | double-float, about 48 bits of mantissa, runs on every device ([Precision](precision.md)) |
 | `f64` | 64-bit float, only on devices with `SHADER_F64` (CUDA, the CPU backend, some Vulkan GPUs; not Metal) |
+| `C32` | complex `f32` (`re`, `im`), runs on every device, the element of the FFTs ([Complex numbers](complex.md)) |
 
 `[f32; 2]` / `[f32; 4]` / `[u32; 2]` / `[u32; 4]` (`vec2` / `vec4`) element types exist for custom kernels, and [records](records.md) group several
-arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `Df32` and `f64`
+arrays behind one struct. The built-in operations exist for `f32`, `u32`, `i32`, `u8`, `i8`, `u16`, `i16`, `Df32`, `f64` and `C32`
 (the *scalar* types); what each type supports is listed in the chapters named in the table.
 
 ### Booleans
@@ -94,8 +96,10 @@ operation.
 | `bool` | `to_u32`, `to_i32`, `to_f32`, `to_f64`, `to_df32` | 1 where true, 0 where false |
 | `f32` | `to_f64`, `to_df32` | exact (`to_f64` needs `SHADER_F64`) |
 | `f64`, `Df32` | `to_f32`, `to_df32` / `to_f64` | rounds to `f32`; `f64` to `Df32` is exact to 48 bits |
+| `u8`, `i8`, `u16`, `i16` | `to_f32`, `to_f64`, `to_df32`, `to_u32`, `to_i32`, `to_bool` and the other three | by value ([Compact integers](compact.md#casts)) |
+| every type but itself | `to_u8`, `to_i8`, `to_u16`, `to_i16` | integers wrap (the low bits), floats saturate and NaN is 0 |
 
-There is no cast to `bool`: write a comparison (`x.ne(0u32)`). A cast pair not in the table does
+There is no cast to `bool` from the 32-bit types: write a comparison (`x.ne(0u32)`); the compact integers have `to_bool`. A cast pair not in the table does
 not exist, so a type mix-up is a compile error rather than a silent conversion.
 
 ```rust
@@ -113,20 +117,25 @@ assert_eq!((&x * k.to_f32()).to_vec()?, vec![0.0, 2.0, 6.0]);
 
 ## Elementwise operations
 
-Operators `+ - * /` (and `%` on integers, unary `-` on floats and `i32`) take references or
+Operators `+ - * /` (and `%`, unary `-` on floats and `i32`) take references or
 values, arrays or scalars, and exist in compound forms (`+=`). Methods cover the rest; they are all
 lazy and fuse:
 
 | Type | Methods |
 | --- | --- |
-| `f32` | `sqrt`, `exp`, `ln`, `abs`, `sin`, `cos`, `tan`, `tanh`, `sign`, `floor`, `ceil`, `trunc`, `round`, `log1p`, `expm1`; `powf(exponent)`, `clamp(lo, hi)` (host scalars); `atan2(x)`, `hypot(other)`, `copysign(sign)` (array or scalar) |
-| `f64` | `sqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round` |
+| `f32` | `sqrt`, `exp`, `ln`, `abs`, `sin`, `cos`, `tan`, `tanh`, `sign`, `floor`, `ceil`, `trunc`, `round`, `log1p`, `expm1`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `asinh`, `acosh`, `atanh`, `pow2`, `log2`, `log10`, `rsqrt`, `cbrt`, `erf`, `erfc`, `lgamma`, `tgamma`, `sigmoid`; `powf(exponent)` (host scalar), `pow(exponent)` and `root(n)` (array or scalar), `rpow(base)` (`base^self`), `clamp(lo, hi)` (array or scalar bounds), `atan2(x)`, `hypot(other)`, `copysign(sign)` (array or scalar) |
+| `f64` | `sqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`; on the CUDA and CPU backends also every `f32` math function above, `atan2`, `hypot`, `copysign`, `pow`, `powf`, `root`, `clamp` (WGSL has no `f64` math: on wgpu they poison the result with `Unsupported`) |
 | `Df32` | `sqrt`, `exp`, `ln`, `tanh`, `abs`, `log1p`, `expm1`, `powf(Df32)` ([Precision](precision.md)) |
+| `C32` | `conj`, `exp`, `sqrt`; `real`, `imag`, `abs`, `arg`, `norm_sqr` (to `f32`); `from_parts`, `from_polar` ([Complex numbers](complex.md)) |
 | `i32` | `abs`, `sign`, `shl`, `shr`; bit operators `& \| ^ !` ([Signed integers](integers.md#signed-integers-and-casts)) |
 | `u32` | bit operations, `shl`, `shr`, `rotate_left`, `rotate_right` ([Integers](integers.md)) |
-| every scalar type | `minimum(rhs)`, `maximum(rhs)`, `lt` `le` `gt` `ge` `eq` `ne` (booleans), `select(&cond, a, b)` |
+| `f32`, `f64`, `i32`, `u32` | `modulo(rhs)`: the remainder with the sign of the divisor (ArrayFire's `mod`; `%` is C's remainder, with the sign of the dividend); `clamp(lo, hi)` for `i32` and `u32` |
+| every scalar type | `is_zero()`, `minimum(rhs)`, `maximum(rhs)`, `lt` `le` `gt` `ge` `eq` `ne` (booleans), `select(&cond, a, b)` |
 
-`atan2(x)` is `atan2(self, x)` with `self` the `y`. The right-hand side of `minimum`, the comparisons and the
+`atan2(x)` is `atan2(self, x)` with `self` the `y`. `erf`, `erfc`, `lgamma`, `tgamma` and `cbrt` of `f32` are written in WGSL and
+run the same code on every backend (`erf` and `erfc` within a few `1e-7` relative, `tgamma` and `lgamma` within about `1e-5`
+relative, `lgamma` within `4e-6` absolute near its zeros at 1 and 2); `f64` uses the backend's own libm
+(libdevice on CUDA). The right-hand side of `minimum`, the comparisons and the
 `try_` methods is an `Operand`: an array or reference to one (equal shapes, or extents of 1 that
 broadcast), a host value, or a [`Scalar`](lazy.md#scalars-that-change) handle.
 

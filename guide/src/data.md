@@ -53,6 +53,46 @@ assert_eq!(cols.to_vec()?, vec![17.0, 22.0, 27.0, 22.0, 29.0, 36.0, 27.0, 36.0, 
 # Ok::<(), luma::LumaError>(())
 ```
 
+`a.matmul_batched(&b)` multiplies a batch of matrices in one launch (`matmul` in a loop is one launch
+per product). The batch is axis 2 of both operands: `a` is `[K, M, B]`, `b` is `[N, K, B]` and the
+result `[N, M, B]`. An operand without the batch (`[N, K]`) is shared by every product, as the
+weights of a layer are:
+
+```rust
+use luma::*;
+
+// Two products of [[1, 2], [3, 4]] @ [[1, 0], [0, 1]] and [[5, 6], [7, 8]] @ [[1, 0], [0, 1]].
+let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 2, 2])?;
+let identity = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], [2, 2])?; // shared by both
+let c = a.matmul_batched(&identity);
+assert_eq!(c.shape(), Shape::from([2, 2, 2]));
+assert_eq!(c.to_vec()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+### Tensor cores (TF32)
+
+On a CUDA device with tensor cores (compute capability 8.0 and up: Ampere, Ada, Hopper) `matmul`
+runs on them by default, in TF32: the operands are rounded to TF32, which keeps the 8-bit exponent
+of `f32` but only 10 bits of mantissa, and the products are accumulated in `f32`. Each entry
+differs from the `f32` product by up to 1.5e-3 of the sum of the absolute values of its terms
+(about 2e-4 of the entries' RMS for operands of random sign), the precision of PyTorch's
+`allow_tf32`; infinities and NaNs go through as in `f32`. On an RTX 3090 a 4096 x 4096 x 4096
+product runs at 34 TFLOP/s instead of 20 (the card's `f32` peak is 35.6), a 1024 x 1024 x 1024 one
+at 21 instead of 13, and the small and skinny products of a network (a 256-row batch through a
+1024-wide layer, a 2048 x 512 x 128 weight gradient) 3-4 times faster.
+
+Where the precision matters, ask for `f32`: `a.matmul_f32(&b)` is the full-precision product of
+one call (a chain of fused multiply-adds in a fixed order per entry), and
+`ContextOptions::tf32_matmul(false)` (`LUMA_TF32_MATMUL=0`) makes every `matmul` of a context
+that product. `matmul_tf32` forces TF32 whatever the context says, and `matmul_batched` is always
+`f32`. On CUDA the `f32` product has kernels of its own for the shapes above (an RTX 3090: 23
+TFLOP/s at 8192 x 8192 x 8192, 18 at 1024 x 1024 x 1024); operands that are lazy expressions
+are fused into the shader kernel as before. Products whose `M`, `N` and `K` are not all multiples of 4 and at least 32, and every other
+backend (wgpu, Metal, the CPU), compute the `f32` product, so the same program runs everywhere
+and differs only by the rounding where tensor cores are used. Transposed operands are read in
+place; other lazy operands are evaluated first, where the `f32` kernels fuse them.
+
 An operand that is a pending expression is not stored first: its expression is evaluated inside
 the product's loads, once per use. A standardised Gram (correlation-style) matrix of a table with
 one column per feature (`[samples, features]`) is one launch plus the statistics:
@@ -115,7 +155,7 @@ assert_eq!(max.to_vec()?, vec![4.0, 20.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
-The results are evaluated when the call returns. Another number of ops poisons the results.
+`f32` results stay pending until one is used, then it is recorded together with every other axis reduction over the same lines that is pending, in one kernel (each result is the value it has alone: the same bits on the CPU backend, within an ulp or two on GPU backends); other types are evaluated when the call returns. Another number of ops poisons the results.
 `sum_axis`, `min_axis` and `max_axis` are the single-op cases. They (and `reduce_axis`) work on
 `f32`, `u32` and `i32` (`SumOfSquares` of integers wraps); `bool` arrays have `sum_axis` (a
 count, `u32`), `min_axis` and `max_axis` only.
@@ -136,6 +176,34 @@ assert_eq!(x.std_axis(0).to_vec()?[1], 5.0);
 // Far from zero the two-pass variance is still right.
 let y = Array::from_slice(&[1.0e4f32 + 1.0, 1.0e4 + 2.0, 1.0e4 + 3.0, 1.0e4 + 4.0], 4)?;
 assert!((y.var_axis(0).item()? - 1.25).abs() < 1e-3);
+# Ok::<(), luma::LumaError>(())
+```
+
+### Variance with a divisor, weights, covariance
+
+`var(bias)`, `std(bias)` and `meanvar(bias)` do the same for the whole array (`f32` and `f64`), and
+`var_axis_bias(axis, bias)`, `std_axis_bias` and `meanvar_axis` along an axis. A [`Bias`] is ArrayFire's
+`af_var_bias`: `Population` divides by `n`, `Sample` by `n - 1`. The mean and variance of a `meanvar`
+come from one pass over the data (the sum and the sum of squares of the data minus its first element).
+`mean_weighted(&w)` and `meanvar_weighted(&w, bias)` take weights of the array's shape (or extent 1
+along the axes to broadcast), `mean_axis_weighted(axis, &w)` along an axis. `cov(&y, bias)` and
+`corrcoef(&y)` pair two arrays of one shape element by element (the sums of the three expressions are
+recorded in one kernel); `cov_axis` and `corrcoef_axis` work per line. Axis forms are `f32` only
+(there are no axis reductions of `f64`).
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let y = Array::from_slice(&[2.0f32, 4.0, 6.0, 8.0], 4)?;
+assert_eq!(x.var(Bias::Population).item()?, 1.25);
+assert!((x.var(Bias::Sample).item()? - 5.0 / 3.0).abs() < 1e-6);
+let (mean, var) = x.meanvar(Bias::Population);
+assert_eq!((mean.item()?, var.item()?), (2.5, 1.25));
+let w = Array::from_slice(&[1.0f32, 1.0, 1.0, 5.0], 4)?;
+assert_eq!(x.mean_weighted(&w).item()?, 3.25);
+assert!((x.corrcoef(&y).item()? - 1.0).abs() < 1e-6);
+assert!((x.cov(&y, Bias::Sample).item()? - 10.0 / 3.0).abs() < 1e-5);
 # Ok::<(), luma::LumaError>(())
 ```
 
@@ -264,7 +332,11 @@ assert_eq!(n.argsort_descending().to_vec()?, vec![3, 1, 0, 2]);
 Floats sort in the total order of their bits: `-inf < .. < -0.0 < +0.0 < .. < +inf < NaN`, so
 NaNs come last (first when descending) and `-0.0` sorts before `+0.0` (and `+0.0` before
 `-0.0` when descending, by input order for ties). The sign of a NaN is not kept.
-`sort_axis(axis)` sorts every line along `axis` independently, stably, and keeps the shape.
+`sort_axis(axis)` sorts every line along `axis` independently and keeps the shape. Lines of up to
+2048 elements (256 on the CPU backend; any axis) are sorted in workgroup memory, in one pass over the data; longer lines
+take the radix sort of the whole array followed by a regrouping by line (and, along an axis other
+than 0, a tiled transpose back to the layout). `sort_axis` returns the NaNs as the positive quiet NaN,
+like `sort`.
 
 ## Groups
 
@@ -295,6 +367,32 @@ Empty groups give 0 for sums and counts, NaN for means and the identity of the o
 and `i32` (`u32::MAX` / `0`, `i32::MAX` / `i32::MIN`).
 
 Where the groups are labels rather than `0..groups`, `factorize` (next section) makes the codes.
+
+### Segments
+
+When the groups are contiguous runs of the array (the rows of a CSR matrix given by its row
+pointer, a sorted group-by given by the offsets of its groups), `sum_segments`, `min_segments` and
+`max_segments` reduce segment `i`, the elements `offsets[i]..offsets[i + 1]`, to element `i` of
+the result (`offsets.len() - 1` elements, `u32`, non-decreasing, the first 0 and the last the
+length of the values). An empty segment gives the identity, as for the group reductions. They
+need no codes and no atomics: the entries are split evenly over the workgroups whatever the
+lengths of the segments, so a power-law matrix with one row of 100000 entries among rows of a
+handful costs no more than a regular one, and the result is the same on every run. A pending
+operand is computed inside the kernel, so a sparse matrix-vector product is one expression:
+
+```rust
+use luma::*;
+
+// [[1, 0, 2], [0, 0, 0], [0, 3, 4]] in CSR.
+let ptr = Array::from_slice(&[0u32, 2, 2, 4], 4)?;
+let col = Array::from_slice(&[0u32, 2, 1, 2], 4)?;
+let val = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], 4)?;
+let x = Array::from_slice(&[1.0f32, 10.0, 100.0], 3)?;
+let y = (&val * x.take(&col)).sum_segments(&ptr);
+assert_eq!(y.to_vec()?, vec![201.0, 0.0, 430.0]);
+assert_eq!(val.max_segments(&ptr).to_vec()?, vec![2.0, f32::NEG_INFINITY, 4.0]);
+# Ok::<(), luma::LumaError>(())
+```
 
 ## Unique values
 
@@ -334,6 +432,13 @@ and `median_axis(axis)` do it for every line along an axis (extent 1 there in th
 outside `[0, 1]` (NaN included) poisons the result with `InvalidShape`. The sort is evaluated,
 the interpolation is lazy.
 
+Every call sorts, and the sort is nearly all of the cost, so ask for several quantiles in one
+call: `quantiles(&[q0, q1, ..])` gives a one-dimensional array with one entry per `q`, and
+`quantiles_axis(axis, &qs)` the shape of the array with `qs.len()` entries along `axis` (entry
+`j` is `quantile_axis(axis, qs[j])`). A describe-style table of 25% / 50% / 75% costs one sort
+instead of three. Nothing is cached between calls: a sorted copy kept for the next call would
+cost as much memory as the array.
+
 ```rust
 use luma::*;
 
@@ -347,6 +452,11 @@ assert!(x.quantile(1.5).item().is_err());
 // Two columns of four: the median of each.
 let t = Array::from_slice(&[4.0f32, 1.0, 3.0, 2.0, 10.0, 50.0, 30.0, 20.0], [4, 2])?;
 assert_eq!(t.median_axis(0).to_vec()?, vec![2.5, 25.0]);
+
+// Three quantiles of each column with one sort: [3, 2], the quantiles along axis 0.
+let q = t.quantiles_axis(0, &[0.0, 0.5, 1.0]);
+assert_eq!(q.to_vec()?, vec![1.0, 2.5, 4.0, 10.0, 25.0, 50.0]);
+assert_eq!(x.quantiles(&[0.0, 0.25, 1.0]).to_vec()?, vec![1.0, 1.75, 4.0]);
 # Ok::<(), luma::LumaError>(())
 ```
 
@@ -617,5 +727,69 @@ use luma::*;
 
 let x = Array::from_slice(&[-2.0f32, 0.5, 3.0], 3)?;
 assert_eq!(x.clamp(0.0, 1.0).to_vec()?, vec![0.0, 0.5, 1.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+## Tiles, diagonals, triangles, differences
+
+ArrayFire's structural functions are index maps and generators in luma: none is a kernel of its
+own, each fuses into the expression that reads it, and none reads or writes memory until an
+evaluation needs it. Shapes list the extents with the first dimension fastest, exactly like
+ArrayFire's `dim4`, so the dimension arguments carry over unchanged (`af::tile(a, 2, 3)` is
+`a.tile([2, 3])`, `af::diff1(a, 1)` is `a.diff1(1)`). Element `(i, j)` has `i` along dimension 0;
+diagonal `k` holds the elements with `j - i = k`.
+
+**`tile`** repeats an array along every dimension, a lazy read like a wrapping pad; **`iota`**
+counts the elements of a shape in memory order and tiles the count; **`identity`** is generated
+inside the kernel that uses it:
+
+```rust
+use luma::*;
+
+let a = Array::from_slice(&[1.0f32, 2.0, 3.0], 3)?;
+assert_eq!(a.tile([2, 2]).to_vec()?, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+assert_eq!(Array::<u32>::iota([2, 2], [1, 2])?.to_vec()?, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+let id = Array::<f32>::identity([3, 3])?;
+assert_eq!(id.to_vec()?, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+**`diag(k)`** extracts the `k`-th diagonal of every matrix of dimensions 0 and 1 (dimensions 2 and
+3 are batches) as a view, and **`diag_matrix(k)`** builds the matrix with a column on its
+diagonal `k`; **`lower(unit)`** and **`upper(unit)`** zero the other triangle (with `unit` the
+diagonal is one) and work on non-square matrices and batches. All of them accept every element
+type (`f32`, `i32`, `u32`, `bool`, `f64`, `Df32`), and a NaN that is not kept is zeroed, not
+propagated:
+
+```rust
+use luma::*;
+
+let m = Array::from_slice(&[1.0f32, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0], [3, 3])?;
+assert_eq!(m.diag(0).to_vec()?, vec![1.0, 5.0, 9.0]);
+assert_eq!(m.diag(1).to_vec()?, vec![2.0, 6.0]);
+assert_eq!(m.diag(-1).to_vec()?, vec![4.0, 8.0]);
+assert_eq!(m.lower(false).to_vec()?, vec![1.0, 4.0, 7.0, 0.0, 5.0, 8.0, 0.0, 0.0, 9.0]);
+assert_eq!(m.upper(true).to_vec()?, vec![1.0, 0.0, 0.0, 2.0, 1.0, 0.0, 3.0, 6.0, 1.0]);
+let v = Array::from_slice(&[1.0f32, 2.0], 2)?;
+assert_eq!(v.diag_matrix(1).to_vec()?, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
+# Ok::<(), luma::LumaError>(())
+```
+
+A diagonal outside the matrix would be empty, and luma has no empty arrays: it poisons the result
+with `InvalidShape` (as `diff1` does for an extent below 2).
+
+**`replace(&cond, b)`** is `af::replace` returning a new array (`a` where `cond`, else `b`, an
+array or a scalar: `select(&cond, &a, b)`), and **`diff1(axis)`** / **`diff2(axis)`** are the first
+and second differences along an axis, one and two shorter, as a fused difference of slices that
+reads the array once:
+
+```rust
+use luma::*;
+
+let x = Array::from_slice(&[1.0f32, f32::NAN, 4.0, 9.0], 4)?;
+assert_eq!(x.replace(&!x.is_nan(), 0.0).to_vec()?, vec![1.0, 0.0, 4.0, 9.0]);
+let y = Array::from_slice(&[0.0f32, 1.0, 4.0, 9.0, 16.0], 5)?;
+assert_eq!(y.diff1(0).to_vec()?, vec![1.0, 3.0, 5.0, 7.0]);
+assert_eq!(y.diff2(0).to_vec()?, vec![2.0, 2.0, 2.0]);
 # Ok::<(), luma::LumaError>(())
 ```
