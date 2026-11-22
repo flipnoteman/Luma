@@ -14,6 +14,7 @@
 //! an error.
 
 mod pointwise;
+mod sat;
 mod window;
 
 use std::panic::Location;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 
 use crate::array::{Array, Failure};
 use crate::builtin::Builtin;
-use crate::context::{Context, RawArg};
+use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::gpu::pager::Pin;
 use crate::gpu_type::{Numeric, ScalarType};
@@ -31,6 +32,7 @@ use crate::view::PadMode;
 
 use pointwise::Color;
 pub(crate) use pointwise::{color_source, unwrap_source, wrap_source, Color as ColorKernel};
+pub(crate) use sat::{source as sat_source, Pass as SatPass};
 pub(crate) use window::{source as window_source, Window};
 use window::{Edge, Op, Pixel};
 
@@ -611,10 +613,60 @@ impl<T: Numeric + ImagePixel> Array<T> {
     /// The summed-area table: the inclusive running sum along axis 0 and then along axis 1 (axes
     /// 2 and 3 are a batch), so that element `(i, j)` is the sum of the rectangle
     /// `[0, i] x [0, j]`. The sum of any rectangle is then four lookups.
+    ///
+    /// Three launches read and write the image twice: axis 1 is scanned in chunks of 64 cells,
+    /// one invocation each (neighbouring invocations on neighbouring lines, coalesced), their
+    /// sums are turned into carries, and a workgroup per column scans axis 0 in workgroup memory
+    /// adding the carry. `f32` sums are accumulated in a different order than a scan along each
+    /// axis would; integers wrap on overflow.
     #[track_caller]
     pub fn sat(&self) -> Array<T> {
-        self.cumsum(0).cumsum(1)
+        let location = Location::caller();
+        match run_sat(self) {
+            Ok(table) => table,
+            // An array over several buffers: two scans.
+            Err(Failure::New(LumaError::Chunked(_))) => self.cumsum(0).cumsum(1),
+            Err(failure) => Array::resolve(self.context(), self.shape(), Err(failure), "sat", location),
+        }
     }
+}
+
+/// The summed-area table of `input` in one buffer.
+fn run_sat<T: ImagePixel>(input: &Array<T>) -> Outcome<Array<T>> {
+    let ctx = input.context();
+    let dims = input.shape().dims();
+    let (n0, n1, planes) = (to_u32(dims[0], "axis")?, to_u32(dims[1], "axis")?, to_u32(dims[2] * dims[3], "batch")?);
+    let chunks = n1.div_ceil(sat::CHUNK);
+    let too_large = || LumaError::DimensionTooLarge { shape: dims };
+    let sums_len = n0.checked_mul(chunks).and_then(|v| v.checked_mul(planes)).ok_or_else(too_large)?;
+    let lines = n1.checked_mul(planes).ok_or_else(too_large)?;
+    let out = Array::<T>::alloc(ctx, input.shape())?;
+    let (src_pin, src_bytes) = input.ready()?;
+    let (out_pin, out_bytes) = out.ready()?;
+    let mut scratch = Scratch::new(ctx);
+    let sums_bytes = u64::from(sums_len) * 4;
+    let sums = scratch.take(sums_bytes)?;
+    let ty = T::pixel().name();
+    let params = |total: u32| -> [u32; sat::PARAM_WORDS] { [n0, n1, planes, chunks, total, 0, 0, 0] };
+    let groups = |n: u32| fold_workgroups(ctx, n.div_ceil(sat::GROUP));
+    // 1: scan the chunks.
+    let (uniform, kernel) = (params(sums_len), ctx.builtin(Builtin::Sat(SatPass::Chunks), ty)?);
+    let args = [
+        RawArg::write(out_pin.buffer(), out_bytes),
+        RawArg::read(src_pin.buffer(), src_bytes),
+        RawArg::write(&sums, sums_bytes),
+        RawArg::Uniform(bytemuck::bytes_of(&uniform)),
+    ];
+    ctx.launch(&kernel, groups(sums_len)?, [sums_len, 1, 1], &args)?;
+    // 2: the carries.
+    let (uniform, kernel) = (params(n0 * planes), ctx.builtin(Builtin::Sat(SatPass::Carry), ty)?);
+    let args = [RawArg::write(&sums, sums_bytes), RawArg::Uniform(bytemuck::bytes_of(&uniform))];
+    ctx.launch(&kernel, groups(n0 * planes)?, [n0 * planes, 1, 1], &args)?;
+    // 3: the lines along axis 0.
+    let (uniform, kernel) = (params(lines), ctx.builtin(Builtin::Sat(SatPass::Lines), ty)?);
+    let args = [RawArg::write(out_pin.buffer(), out_bytes), RawArg::read(&sums, sums_bytes), RawArg::Uniform(bytemuck::bytes_of(&uniform))];
+    ctx.launch(&kernel, fold_workgroups(ctx, lines)?, [lines, 1, 1], &args)?;
+    Ok(out)
 }
 
 impl Array<f32> {

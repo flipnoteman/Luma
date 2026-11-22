@@ -179,6 +179,26 @@ fn conv2_matches_the_host_for_every_border_padding_and_stride() {
 }
 
 #[test]
+fn conv2_with_large_kernels() {
+    let ctx = ctx();
+    for k in [17usize, 31] {
+        let (v, data) = vol_f32(k as u64, [70, 90, 1], 1);
+        let kd = values(k * k, 3, -0.1, 0.1);
+        let x = array_of(&ctx, &data, [70, 90, 1], 1);
+        let kern = Array::from_slice_on(&ctx, &kd, [k, k]).unwrap();
+        let got = x.conv2(&kern, ConvSpec::new().border(Border::Mirror)).to_vec().unwrap();
+        let (before, after) = pads(Padding::Same, [k, k, 1], 2);
+        let want = conv_ref(&v, &kd, [k, k, 1], [1; 3], before, after, Border::Mirror);
+        close(&got, &want.data, 1e-4, 1e-4, &format!("conv2 {k}x{k}"));
+        let ints = small_ints(k as u64, 70 * 90);
+        let vi = Vol { n: [70, 90, 1], batch: 1, data: ints.clone() };
+        let xi = array_of(&ctx, &ints, [70, 90, 1], 1);
+        let max = |v: Vec<i32>| *v.iter().max().unwrap();
+        assert_eq!(xi.maxfilt([k, k], Border::Ignore).to_vec().unwrap(), window_ref(&vi, [k, k, 1], 0, Border::Ignore, None, &max), "maxfilt {k}x{k}");
+    }
+}
+
+#[test]
 fn conv2_of_pending_inputs_and_batches() {
     let ctx = ctx();
     let (h, w) = (40usize, 70usize);
@@ -683,6 +703,49 @@ fn sat_is_the_double_prefix_sum() {
     let got = array_of(&ctx, &us, [h, w, 1], 2).sat().to_vec().unwrap();
     for b in 0..2 {
         assert_eq!(got[b * h * w + h * w - 1], us[b * h * w..(b + 1) * h * w].iter().sum::<u32>());
+    }
+}
+
+#[test]
+fn sat_at_ragged_sizes_and_chunk_boundaries() {
+    let ctx = ctx();
+    // Lines past one segment (1024 cells) of axis 0, past one chunk (64 cells) of axis 1, and 1-wide.
+    for (h, w, planes) in [(1usize, 1usize, 1usize), (1, 200, 2), (5, 64, 1), (5, 65, 3), (1025, 3, 1), (2100, 130, 1), (300, 129, 2), (1024, 128, 1), (1023, 191, 1)] {
+        let ints = small_ints((h * w) as u64, h * w * planes);
+        let x = Array::from_slice_on(&ctx, &ints, [h, w, planes]).unwrap();
+        let got = x.sat().to_vec().unwrap();
+        let mut want = vec![0i64; ints.len()];
+        for p in 0..planes {
+            let at = |i: usize, j: usize| p * h * w + i + h * j;
+            for j in 0..w {
+                for i in 0..h {
+                    let mut s = i64::from(ints[at(i, j)]);
+                    if i > 0 {
+                        s += want[at(i - 1, j)];
+                    }
+                    if j > 0 {
+                        s += want[at(i, j - 1)];
+                    }
+                    if i > 0 && j > 0 {
+                        s -= want[at(i - 1, j - 1)];
+                    }
+                    want[at(i, j)] = s;
+                }
+            }
+        }
+        let want: Vec<i32> = want.iter().map(|&v| v as i32).collect();
+        assert_eq!(got, want, "i32 {h}x{w}x{planes}");
+        let fs = values(h * w * planes, h as u64, -1.0, 1.0);
+        let xf = Array::from_slice_on(&ctx, &fs, [h, w, planes]).unwrap();
+        let sat = xf.sat().to_vec().unwrap();
+        for p in 0..planes {
+            let mut total = 0.0f64;
+            for k in 0..h * w {
+                total += f64::from(fs[p * h * w + k]);
+            }
+            let last = f64::from(sat[p * h * w + h * w - 1]);
+            assert!((last - total).abs() < 1e-3 * (1.0 + (h * w) as f64).sqrt(), "f32 {h}x{w}: {last} vs {total}");
+        }
     }
 }
 

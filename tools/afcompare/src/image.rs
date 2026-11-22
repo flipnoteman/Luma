@@ -240,6 +240,14 @@ pub fn images(b: &mut Bench) {
             b.run("14 wrap 3x3", &size, v, "sum of overlapping windows (luma gathers, AF scatters)", &mut lr(&ctx, l), &mut ar(a));
         }
 
+        // Gaussian kernels.
+        for (r, c) in [(5usize, 5usize), (15, 15), (31, 31)] {
+            let l = || luma::gaussian_kernel_on(&ctx, r, c, 0.0, 0.0).unwrap();
+            let a = || af::gaussian_kernel(r as i32, c as i32, 0.0, 0.0);
+            let v = compare(&lumax::host(&l()), &afx::host(&a()), 1e-4, 1e-6);
+            b.run(&format!("13 gaussian_kernel {r}x{c}"), "", v, "default sigma; the result stays on the device", &mut lr(&ctx, l), &mut ar(a));
+        }
+
         // 3-D, on a volume.
         let n = if b.quick { 128 } else { 256 };
         let size = format!("{n}^3");

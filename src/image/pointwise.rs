@@ -215,19 +215,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let k = p.w0 * p.w1;
     let wins = p.nw0 * p.nw1;
     var acc = 0.0;
-    for (var c1 = 0u; c1 < p.w1; c1++) {{
-        if (x1 < c1) {{ break; }}
-        let t1 = x1 - c1;
-        if (t1 % p.s1 != 0u) {{ continue; }}
-        let v1 = t1 / p.s1;
-        if (v1 >= p.nw1) {{ continue; }}
-        for (var c0 = 0u; c0 < p.w0; c0++) {{
-            if (x0 < c0) {{ break; }}
-            let t0 = x0 - c0;
-            if (t0 % p.s0 != 0u) {{ continue; }}
-            let v0 = t0 / p.s0;
-            if (v0 >= p.nw0) {{ continue; }}
-            let cell = c0 + p.w0 * c1;
+    // The windows whose cell range covers `x`: `v * s <= x < v * s + w`.
+    let hi0 = min(x0 / p.s0, p.nw0 - 1u);
+    let hi1 = min(x1 / p.s1, p.nw1 - 1u);
+    var lo0 = 0u;
+    if (x0 + 1u > p.w0) {{ lo0 = (x0 + 1u - p.w0 + p.s0 - 1u) / p.s0; }}
+    var lo1 = 0u;
+    if (x1 + 1u > p.w1) {{ lo1 = (x1 + 1u - p.w1 + p.s1 - 1u) / p.s1; }}
+    for (var v1 = lo1; v1 <= hi1; v1++) {{
+        let c1 = x1 - v1 * p.s1;
+        for (var v0 = lo0; v0 <= hi0; v0++) {{
+            let cell = (x0 - v0 * p.s0) + p.w0 * c1;
             let win = v0 + p.nw0 * v1;
             var at = 0u;
             if (p.column != 0u) {{ at = cell + k * (win + wins * plane); }} else {{ at = win + wins * (cell + k * plane); }}
