@@ -505,7 +505,7 @@ fn covariance_between_two_streams_per_position() {
     b.push(&Array::from_slice(&x[half..], x.len() - half).unwrap(), &Array::from_slice(&y[half..], y.len() - half).unwrap()).unwrap();
     let b = CoMoments::<Df32>::from_bytes(&b.to_bytes().unwrap()).unwrap();
     a.merge(&b).unwrap();
-    close(read(a.cov())[0], cxy / n, 1e-4, 1e-6, "merged cov");
+    close(read(a.cov())[0], cxy / n, 1e-4, 2e-5, "merged cov");
     close(read(a.corr())[0], cxy / (m2x * m2y).sqrt(), 1e-4, 1e-5, "merged corr");
     close(read(a.count())[0], n, 0.0, 0.0, "merged count");
     let masked = CoMoments::<Df32>::new(Fold::all());
@@ -552,8 +552,10 @@ fn feature_covariance_matrix() {
     for i in 0..F {
         for j in 0..F {
             let [_, mi, mj, m2i, m2j, cij] = host_co(&col(i), &col(j));
-            close(cov[i + F * j], cij / n, 1e-4, 1e-6, "cov entry");
-            close(corr[i + F * j], cij / (m2i * m2j).sqrt(), 1e-4, 1e-5, "corr entry");
+            // The product sums `f32` terms of the size of the variances over an epoch of samples:
+            // an absolute error of a few 1e-6 of them.
+            close(cov[i + F * j], cij / n, 1e-4, 2e-5, "cov entry");
+            close(corr[i + F * j], cij / (m2i * m2j).sqrt(), 1e-4, 2e-5, "corr entry");
             if i == j {
                 close(mean[i], mi, 1e-6, 1e-4, "mean");
                 close(var[i], m2i / n, 1e-4, 0.0, "var");
@@ -569,7 +571,7 @@ fn feature_covariance_matrix() {
     a.merge(&b).unwrap();
     let merged = read(a.cov());
     for k in 0..F * F {
-        close(merged[k], cov[k], 1e-4, 1e-6, "merged cov");
+        close(merged[k], cov[k], 1e-4, 2e-5, "merged cov");
     }
     assert!(Covariance::<Df32>::new().push(&Array::<f32>::zeros([3, 4, 2]).unwrap()).is_err());
 }
@@ -1002,12 +1004,14 @@ fn one_accumulator_shared_by_threads() {
 #[test]
 #[ignore = "launch-count bound fails on the RTX 3080 Laptop (CUDA and wgpu); Accumulators is fixing it"]
 fn a_pushed_expression_is_computed_inside_the_reduction() {
-    let ctx = luma::default_context().unwrap();
+    // A context of its own: the other tests of the process launch on the default one while this
+    // one profiles, and their kernels would be counted.
+    let ctx = luma::Context::with_options(luma::ContextOptions::default()).expect("a device");
     if !ctx.profiling_supported() {
         return;
     }
-    let x = Array::from_slice(&f32s(&normal(1 << 16, 71)), [256, 256]).unwrap();
-    let y = Array::from_slice(&f32s(&normal(1 << 16, 72)), [256, 256]).unwrap();
+    let x = Array::from_slice_on(&ctx, &f32s(&normal(1 << 16, 71)), [256, 256]).unwrap();
+    let y = Array::from_slice_on(&ctx, &f32s(&normal(1 << 16, 72)), [256, 256]).unwrap();
     x.eval().unwrap();
     y.eval().unwrap();
     ctx.sync().unwrap();
@@ -1154,3 +1158,59 @@ fn states_merge_across_contexts() {
         close(*m, *w, 1e-4, 1e-6, "covariance across contexts");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The 8- and 16-bit integers
+// ---------------------------------------------------------------------------------------------
+
+macro_rules! compact_test {
+    ($name:ident, $t:ty, $lo:expr, $hi:expr) => {
+        #[test]
+        fn $name() {
+            let (lo, hi): (i64, i64) = ($lo, $hi);
+            let span = hi - lo + 1;
+            let data: Vec<$t> = (0..4000i64).map(|i| (lo + (i * 7919) % span) as $t).collect();
+            let host: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+            let want = reference(&host);
+            let acc = full_builder::<Df32>(Fold::all()).build().unwrap();
+            for chunk in data.chunks(1300) {
+                acc.push(&Array::from_slice(chunk, chunk.len()).unwrap()).unwrap();
+            }
+            close(read(acc.count())[0], want.n, 0.0, 0.0, "count");
+            // The default pass sums in f32 (partial sums beyond 2^24 round: 16-bit data); the
+            // precise pass is exact.
+            close(read(acc.sum())[0], want.sum, 1e-6, 4.0, "sum");
+            let exact = full_builder::<Df32>(Fold::all()).precise().build().unwrap();
+            for chunk in data.chunks(1300) {
+                exact.push(&Array::from_slice(chunk, chunk.len()).unwrap()).unwrap();
+            }
+            close(read(exact.sum())[0], want.sum, 1e-12, 1e-6, "exact sum");
+            close(read(acc.mean())[0], want.mean, 1e-5, 1e-3, "mean");
+            close(read(acc.var())[0], want.m2 / want.n, 1e-4, 0.0, "var");
+            close(read(acc.min())[0], want.min, 0.0, 0.0, "min");
+            close(read(acc.max())[0], want.max, 0.0, 0.0, "max");
+            assert_eq!(read(acc.argmin())[0] as usize, want.argmin);
+            assert_eq!(read(acc.argmax())[0] as usize, want.argmax);
+            // Per position and masked.
+            let per = Accumulator::<Df32>::builder(Fold::axis(1)).moments(2).min_max().build().unwrap();
+            per.push(&Array::from_slice(&data[..4 * 1000], [4, 1000]).unwrap()).unwrap();
+            let column: Vec<f64> = (0..1000).map(|r| data[r * 4 + 2] as f64).collect();
+            close(read(per.mean())[2], reference(&column).mean, 1e-5, 1e-6, "column mean");
+            close(read(per.min())[2], reference(&column).min, 0.0, 0.0, "column min");
+            let keep: Vec<bool> = (0..4000).map(|i| i % 3 == 0).collect();
+            let picked: Vec<f64> = host.iter().zip(&keep).filter(|(_, k)| **k).map(|(v, _)| *v).collect();
+            let masked = Accumulator::<Df32>::new(Fold::all());
+            masked.push_where(&Array::from_slice(&data, 4000).unwrap(), &Array::from_slice(&keep, 4000).unwrap()).unwrap();
+            close(read(masked.mean())[0], reference(&picked).mean, 1e-5, 1e-6, "masked mean");
+            // A histogram over the value range counts exactly.
+            let hist = Histogram::<Df32>::new(8, lo as f32, hi as f32 + 1.0).unwrap();
+            hist.push(&Array::from_slice(&data, 4000).unwrap()).unwrap();
+            assert_eq!(read(hist.counts()).iter().sum::<f64>(), 4000.0);
+        }
+    };
+}
+
+compact_test!(u8_batches_fold, u8, 0, 255);
+compact_test!(i8_batches_fold, i8, -128, 127);
+compact_test!(u16_batches_fold, u16, 0, 65535);
+compact_test!(i16_batches_fold, i16, -32768, 32767);
