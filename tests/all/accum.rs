@@ -1001,12 +1001,14 @@ fn one_accumulator_shared_by_threads() {
 
 #[test]
 fn a_pushed_expression_is_computed_inside_the_reduction() {
-    let ctx = luma::default_context().unwrap();
+    // A context of its own: the other tests of the process launch on the default one while this
+    // one profiles, and their kernels would be counted.
+    let ctx = luma::Context::with_options(luma::ContextOptions::default()).expect("a device");
     if !ctx.profiling_supported() {
         return;
     }
-    let x = Array::from_slice(&f32s(&normal(1 << 16, 71)), [256, 256]).unwrap();
-    let y = Array::from_slice(&f32s(&normal(1 << 16, 72)), [256, 256]).unwrap();
+    let x = Array::from_slice_on(&ctx, &f32s(&normal(1 << 16, 71)), [256, 256]).unwrap();
+    let y = Array::from_slice_on(&ctx, &f32s(&normal(1 << 16, 72)), [256, 256]).unwrap();
     x.eval().unwrap();
     y.eval().unwrap();
     ctx.sync().unwrap();
