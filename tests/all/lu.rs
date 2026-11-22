@@ -88,7 +88,9 @@ fn lu_factors_every_size() {
         assert!(is_permutation(&perm), "n = {n}: not a permutation");
         let (err, lmax) = lu_error(&lu, &perm, &a, n);
         assert!(err < 3e-6 * (n as f64).sqrt().max(1.0) * 4.0, "n = {n}: ||PA - LU|| / ||A|| = {err}");
-        assert!(lmax <= 1.0 + 1e-6, "n = {n}: |l| = {lmax}");
+        // Partial pivoting bounds the multipliers by 1; a tall panel is pivoted by a tournament
+        // over chunks of rows (the multipliers can exceed 1, mildly) wherever it has several.
+        assert!(lmax <= if n > 64 { 8.0 } else { 1.0 + 1e-6 }, "n = {n}: |l| = {lmax}");
     }
 }
 
@@ -110,7 +112,7 @@ fn lu_needs_pivoting() {
         let f = mat(&ctx, &b, n, n, 1).lu();
         let (lu, perm) = (f.lu.to_vec().unwrap(), f.perm.to_vec().unwrap());
         let (err, lmax) = lu_error(&lu, &perm, &b, n);
-        assert!(err < 3e-6 * 4.0 && lmax <= 1.0 + 1e-6, "n = {n}: {err}, {lmax}");
+        assert!(err < 3e-6 * 4.0 && lmax <= if n > 64 { 8.0 } else { 1.0 + 1e-6 }, "n = {n}: {err}, {lmax}");
         assert_ne!(perm[0], 0);
     }
 }
