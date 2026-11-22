@@ -297,6 +297,21 @@ macro_rules! accum_input_self {
 
 accum_input_self!(u32, i32, f32, f64, Df32);
 
+/// The 8- and 16-bit integers are processed as `i32`: the cast is by value and exact, and fuses
+/// into the reduction that reads it (a `u8` batch is read at one byte per element).
+macro_rules! accum_input_compact {
+    ($($t:ty),*) => {$(
+        impl AccumInput for $t {
+            type Core = i32;
+            fn to_core(a: &Array<Self>) -> Array<i32> {
+                a.to_i32()
+            }
+        }
+    )*};
+}
+
+accum_input_compact!(u8, i8, u16, i16);
+
 /// What the accumulators need of an element type to process it: conversions to the wide types,
 /// the pivot shift, the identities of the extrema and the index passes. Implemented for `u32`,
 /// `i32`, `f32`, `f64` and `Df32`; other element types are cast to one of them (see
