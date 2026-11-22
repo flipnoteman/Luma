@@ -14,7 +14,7 @@ use crate::shape::Shape;
 
 use super::blob::{Reader, Writer};
 use super::wide::{reduce_axes, reduce_flat, AccumCore, AccumInput, Wide, V};
-use super::{folded_extent, invalid, is_flat, kept_dims, split_plan, state_index, Fold, NanPolicy};
+use super::{flat_index, folded_extent, invalid, is_flat, kept_dims, split_plan, state_index, Fold, NanPolicy};
 
 const KIND: u8 = 1;
 const DEFAULT_FLUSH_EVERY: usize = 16;
@@ -906,11 +906,11 @@ impl<W: Wide> State<W> {
         // The index of the first extreme within this batch, over the folded axes; split into
         // pieces along one axis when the batch does not fit one buffer (the arg reductions
         // need one).
-        let shape_idx = |max_: bool, x: &Array<T>| -> Result<V<W>> {
+        let shape_idx = |max_: bool, x: &Array<T>| -> Result<(V<W>, Option<Array<u32>>)> {
             let real: Vec<usize> = axes.iter().copied().filter(|&a| dims[a] > 1).collect();
             let whole = is_flat(dims, axes);
             if !whole && real.is_empty() {
-                return V::zeros(ctx, Shape::new(kept_dims(dims, axes)));
+                return Ok((V::zeros(ctx, Shape::new(kept_dims(dims, axes)))?, None));
             }
             if !whole && real.len() != 1 {
                 return Err(LumaError::Unsupported("argmin / argmax over several axes that are not the whole batch".into()));
@@ -918,7 +918,7 @@ impl<W: Wide> State<W> {
             let arg = |piece: &Array<T>, axis: usize| if whole { T::argmin_flat(piece, max_) } else { T::argmin_axis(piece, axis, max_) };
             let direct = arg(x, real.first().copied().unwrap_or(0))?;
             match direct.check() {
-                Ok(()) => return Ok(V::from_u32(&direct)),
+                Ok(()) => return Ok((V::from_u32(&direct), Some(direct))),
                 Err(e) if is_chunked(&e) => {}
                 Err(e) => return Err(e),
             }
@@ -954,7 +954,7 @@ impl<W: Wide> State<W> {
                     });
                 }
                 if fits {
-                    return Ok(best.expect("a piece").1);
+                    return Ok((best.expect("a piece").1, None));
                 }
                 if pieces >= extent {
                     return Err(LumaError::Chunked("argmin / argmax of a batch whose pieces still need several buffers"));
@@ -966,23 +966,38 @@ impl<W: Wide> State<W> {
             let (lo_src, hi_src) = if mask.is_some() { (Some(extreme(true)?), Some(extreme(false)?)) } else { (None, None) };
             let lo_x = lo_src.as_ref().unwrap_or(batch);
             let hi_x = hi_src.as_ref().unwrap_or(batch);
-            if mask.is_none() && cfg.wants_min() && cfg.wants_max() {
+            // The index passes find the extreme too: its value is a gather, not another pass.
+            let value_at = |x: &Array<T>, raw: &Array<u32>| -> Result<V<W>> {
+                let real: Vec<usize> = axes.iter().copied().filter(|&a| dims[a] > 1).collect();
+                let flat = if is_flat(dims, axes) { raw.clone() } else { flat_index(ctx, raw, dims, real[0])? };
+                Ok(widen(&x.take(&flat)))
+            };
+            if cfg.argmin {
+                let (index, raw) = shape_idx(false, lo_x)?;
+                if let Some(raw) = raw {
+                    min = Some(value_at(lo_x, &raw)?);
+                }
+                imin = Some(global(index));
+            }
+            if cfg.argmax {
+                let (index, raw) = shape_idx(true, hi_x)?;
+                if let Some(raw) = raw {
+                    max = Some(value_at(hi_x, &raw)?);
+                }
+                imax = Some(global(index));
+            }
+            let (need_min, need_max) = (cfg.wants_min() && min.is_none(), cfg.wants_max() && max.is_none());
+            if mask.is_none() && need_min && need_max {
                 let mm = reduce_folded(batch, axes, &[Reduction::Min, Reduction::Max]);
                 min = Some(widen(&mm[0]));
                 max = Some(widen(&mm[1]));
             } else {
-                if cfg.wants_min() {
+                if need_min {
                     min = Some(widen(&reduce_folded(lo_x, axes, &[Reduction::Min]).remove(0)));
                 }
-                if cfg.wants_max() {
+                if need_max {
                     max = Some(widen(&reduce_folded(hi_x, axes, &[Reduction::Max]).remove(0)));
                 }
-            }
-            if cfg.argmin {
-                imin = Some(global(shape_idx(false, lo_x)?));
-            }
-            if cfg.argmax {
-                imax = Some(global(shape_idx(true, hi_x)?));
             }
         }
         Ok(Partial { n, s, min, max, imin, imax })

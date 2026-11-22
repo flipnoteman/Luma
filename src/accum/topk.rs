@@ -13,7 +13,7 @@ use crate::view::{concat, concat_slice};
 
 use super::blob::{Reader, Writer};
 use super::wide::{check_wide, AccumCore, Wide, V};
-use super::{invalid, kept_dims, split_plan, strides};
+use super::{flat_index, invalid, kept_dims, split_plan};
 
 const KIND: u8 = 6;
 
@@ -479,22 +479,6 @@ impl<T: SortKey + AccumCore, W: Wide> TopK<T, W> {
         }
         Ok(top)
     }
-}
-
-/// The flat index into an array of shape `dims` of the elements at index `idx` along `axis` of
-/// every line (`idx` has extent 1 or more along `axis`, the shape of the other axes of `dims`).
-fn flat_index(ctx: &Context, idx: &Array<u32>, dims: [usize; 4], axis: usize) -> Result<Array<u32>> {
-    let st = strides(dims);
-    let mut kept = dims;
-    kept[axis] = 1;
-    let kept_shape = Shape::new(kept);
-    let mut flat = idx * st[axis];
-    for k in 0..4 {
-        if k != axis && dims[k] > 1 {
-            flat = &flat + &(&Array::<u32>::range_on(ctx, kept_shape, k)? * st[k]);
-        }
-    }
-    Ok(flat)
 }
 
 impl<T: SortKey + AccumCore, W: Wide> std::fmt::Debug for TopK<T, W> {

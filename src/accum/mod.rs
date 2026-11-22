@@ -192,3 +192,19 @@ pub(crate) fn state_index(
     }
     Ok(idx.broadcast_to(shape))
 }
+
+/// The flat index into an array of shape `dims` of the elements at index `idx` along `axis` of
+/// every line (`idx` has extent 1 or more along `axis` and the shape of the other axes of `dims`).
+pub(crate) fn flat_index(ctx: &crate::Context, idx: &crate::Array<u32>, dims: [usize; 4], axis: usize) -> Result<crate::Array<u32>> {
+    let st = strides(dims);
+    let mut kept = dims;
+    kept[axis] = 1;
+    let kept_shape = crate::Shape::new(kept);
+    let mut flat = idx * st[axis];
+    for k in 0..4 {
+        if k != axis && dims[k] > 1 {
+            flat = &flat + &(&crate::Array::<u32>::range_on(ctx, kept_shape, k)? * st[k]);
+        }
+    }
+    Ok(flat)
+}

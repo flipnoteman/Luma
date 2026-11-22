@@ -1108,3 +1108,48 @@ fn top_k_per_position_along_an_axis() {
     assert_eq!(read(masked.indices()), vec![3.0, 2.0]);
     assert!(TopK::<f32, Df32>::largest_along(100, 1).is_err());
 }
+
+#[test]
+fn states_merge_across_contexts() {
+    use luma::{Context, ContextOptions};
+    // Two contexts stand for two devices: the other's state travels through the host.
+    let other = Context::with_options(ContextOptions::default()).expect("a device");
+    let data = f32s(&normal(3000, 90));
+    let host: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+    let (first, second) = data.split_at(1800);
+    let on_default = |d: &[f32]| Array::from_slice(d, d.len()).unwrap();
+    let on_other = |d: &[f32]| Array::from_slice_on(&other, d, d.len()).unwrap();
+
+    let (a, b) = (full_builder::<Df32>(Fold::all()).build().unwrap(), full_builder::<Df32>(Fold::all()).build().unwrap());
+    a.push(&on_default(first)).unwrap();
+    b.push(&on_other(second)).unwrap();
+    a.merge(&b).unwrap();
+    check_whole(&a, &host, 1e-5);
+    // Mixing contexts in one accumulator's pushes is an error.
+    assert!(a.push(&on_other(first)).is_err());
+
+    let (ha, hb) = (Histogram::<Df32>::new(10, -3.0, 3.0).unwrap(), Histogram::<Df32>::new(10, -3.0, 3.0).unwrap());
+    ha.push(&on_default(first)).unwrap();
+    hb.push(&on_other(second)).unwrap();
+    ha.merge(&hb).unwrap();
+    assert_eq!(read(ha.counts()), host_hist(&data, 10, -3.0, 3.0).0);
+
+    let (ta, tb) = (TopK::<f32, Df32>::largest(5), TopK::<f32, Df32>::largest(5));
+    ta.push(&on_default(first)).unwrap();
+    tb.push(&on_other(second)).unwrap();
+    ta.merge(&tb).unwrap();
+    let mut order: Vec<usize> = (0..data.len()).collect();
+    order.sort_by(|&x, &y| data[y].total_cmp(&data[x]).then(x.cmp(&y)));
+    assert_eq!(read(ta.indices()), order[..5].iter().map(|&i| i as f64).collect::<Vec<_>>());
+
+    let (ca, cb) = (Covariance::<Df32>::new(), Covariance::<Df32>::new());
+    ca.push(&Array::from_slice(&data[..1200], [3, 400]).unwrap()).unwrap();
+    cb.push(&Array::from_slice_on(&other, &data[1200..2400], [3, 400]).unwrap()).unwrap();
+    ca.merge(&cb).unwrap();
+    let whole = Covariance::<Df32>::new();
+    whole.push(&Array::from_slice(&data[..2400], [3, 800]).unwrap()).unwrap();
+    let (merged, want) = (read(ca.cov()), read(whole.cov()));
+    for (m, w) in merged.iter().zip(&want) {
+        close(*m, *w, 1e-4, 1e-6, "covariance across contexts");
+    }
+}
