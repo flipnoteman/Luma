@@ -101,6 +101,22 @@ cargo build --release
 cargo test
 ```
 
+### Running the tests
+
+The integration tests are one binary (`tests/all`, one module per former test file), so that `cargo test` opens the GPU once per process, not once per test: opening a device costs 70-250 ms of driver time that does not overlap between processes, and `cargo nextest` starts a process for each of the 1000+ tests. `flush` (wall-clock timing) and `binding_limit` (sets an environment variable) keep binaries of their own.
+
+```sh
+# GPU backends (RTX 3090: about 30 s with a warm kernel cache; the doc tests add 20 s)
+LUMA_BACKEND=cuda cargo test --release --locked --lib --tests
+LUMA_BACKEND=wgpu cargo test --release --locked --lib --tests
+cargo test --release --locked --doc
+
+# CPU backend (tests are milliseconds there, so a process per test is fine and gives per-test timings)
+CUDA_VISIBLE_DEVICES=-1 VK_ICD_FILENAMES=/nonexistent LUMA_DEVICE=cpu cargo nextest run --release --locked --test-threads 8
+```
+
+On a job queue, one line per backend: `gpuq submit --host any -- bash -c 'LUMA_BACKEND=cuda cargo test --release --locked --no-fail-fast --lib --tests'`. `cargo nextest run` still works on every backend (`.config/nextest.toml` limits it to 8 threads and gives the CUDA tests one hardware queue per context), but each test is its own process and a GPU suite takes the time of 1000+ device opens (CUDA about 55 s, wgpu about 140 s on an RTX 3090).
+
 ### Backends
 
 Luma is a Cargo workspace of six crates: `luma-hal-core` (library `luma_core`: the kernel IR, `luma_core::kir`, and the backend interface, `luma_core::hal`), `luma-hal-wgpu`, `luma-hal-metal` and `luma-hal-cuda` (each holds one backend and its own code generator for WGSL, MSL or NVVM IR), `luma-hal-cpu` (the native SIMD backend, compiling the kernel IR with Cranelift), and the root `luma` crate with the arrays and the JIT. The root crate's features `wgpu`, `metal` and `cuda` each enable one GPU backend crate; the CPU backend is always included.

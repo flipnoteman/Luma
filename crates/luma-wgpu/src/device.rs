@@ -200,6 +200,9 @@ fn device_local_bytes(_adapter: &wgpu::Adapter) -> Option<u64> {
     None
 }
 
+/// The process's wgpu instance and the adapter picked on it, once there is one.
+static ADAPTER: Mutex<Option<(wgpu::Instance, wgpu::Adapter)>> = Mutex::new(None);
+
 /// Picks an adapter of the wanted kind and opens a [Device] / [Queue] pair on it. Only
 /// [`acquire`] calls this.
 async fn request_device() -> Result<Gpu, BackendError> {
@@ -220,15 +223,24 @@ async fn request_device() -> Result<Gpu, BackendError> {
     instance_desc.flags.remove(wgpu::InstanceFlags::DEBUG);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let validated = instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION);
-    let instance = wgpu::Instance::new(instance_desc);
-
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: PowerPreference::HighPerformance,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| BackendError::NoAdapter(e.to_string()))?;
+    // The instance and the adapter are opened once per process: the Vulkan loader and the driver
+    // take about 70 ms for them, and every further device of the process (contexts alive at the
+    // same time each have one) reuses them. Only `acquire` calls this, under `OPENING`.
+    let adapter = {
+        let mut shared = lock(&ADAPTER);
+        if shared.is_none() {
+            let instance = wgpu::Instance::new(instance_desc);
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: PowerPreference::HighPerformance,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| BackendError::NoAdapter(e.to_string()))?;
+            *shared = Some((instance, adapter));
+        }
+        shared.as_ref().map(|(_, adapter)| adapter.clone()).expect("set above")
+    };
     // Software rasterizers (llvmpipe, SwiftShader, WARP) are never used: the cpu backend runs
     // on the CPU natively and faster.
     if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
