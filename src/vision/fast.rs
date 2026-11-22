@@ -188,38 +188,38 @@ fn scatter_source() -> String {
 @group(1) @binding(5) var<uniform> p: Params;
 var<workgroup> rows: array<atomic<u32>, 8>;
 var<workgroup> base: array<u32, 8>;
-var<workgroup> red: array<u32, 256>;
+var<workgroup> off: atomic<u32>;
 var<workgroup> tot: u32;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec3<u32>) {{
     let tile_id = wid.x + wid.y * p.tiles_x;
-    if (t == 0u) {{ tot = tally[1u + p.c + tile_id]; }}
-    if (t < 8u) {{ atomicStore(&rows[t], 0u); }}
-    workgroupBarrier();
-    if (workgroupUniformLoad(&tot) == 0u) {{ return; }}
-    // The offset of the tile: the counts of the blocks of 256 tiles before its block and of the
-    // tiles before it in its block.
+    let tx = t & 31u;
+    let ty = t >> 5u;
+    let g0 = wid.x * {TX}u + tx;
+    let g1 = wid.y * {TY}u + ty;
+    // Everything this tile reads is requested before the first barrier: its count, its scores,
+    // and the counts that come before it (the blocks of 256 tiles before its block and the tiles
+    // before it in its block).
+    var s0 = 0.0;
+    if (g0 < p.h && g1 < p.w) {{ s0 = img[g0 + p.h * g1]; }}
     let blk = tile_id / 256u;
     let lt = tile_id - blk * 256u;
     var part = 0u;
     for (var b = t; b < blk; b += 256u) {{ part += tally[1u + b]; }}
     if (t < lt) {{ part += tally[1u + p.c + blk * 256u + t]; }}
-    red[t] = part;
-    let tx = t & 31u;
-    let ty = t >> 5u;
-    let g0 = wid.x * {TX}u + tx;
-    let g1 = wid.y * {TY}u + ty;
-    var s0 = 0.0;
-    if (g0 < p.h && g1 < p.w) {{ s0 = img[g0 + p.h * g1]; }}
+    if (t == 0u) {{
+        tot = tally[1u + p.c + tile_id];
+        atomicStore(&off, 0u);
+    }}
+    if (t < 8u) {{ atomicStore(&rows[t], 0u); }}
+    workgroupBarrier();
+    if (workgroupUniformLoad(&tot) == 0u) {{ return; }}
     let keep = s0 > 0.0;
     if (keep) {{ atomicOr(&rows[ty], 1u << tx); }}
+    if (part > 0u) {{ atomicAdd(&off, part); }}
     workgroupBarrier();
-    for (var s = 128u; s > 0u; s = s >> 1u) {{
-        if (t < s) {{ red[t] = red[t] + red[t + s]; }}
-        workgroupBarrier();
-    }}
     if (t == 0u) {{
-        var acc = red[0];
+        var acc = atomicLoad(&off);
         for (var r = 0u; r < 8u; r++) {{
             base[r] = acc;
             acc += countOneBits(atomicLoad(&rows[r]));
