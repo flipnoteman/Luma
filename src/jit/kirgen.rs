@@ -1764,10 +1764,6 @@ struct Build<'a> {
 /// 0.0502 at the workgroups of `launch::PRIVATE_GROUPS`; 16 was slower where all the elements
 /// fall in one bin (0.083 against 0.077 ms).
 const PRIVATE_UNROLL: u32 = 4;
-/// The `f32` accumulators take one: their min and max are compare-and-exchange loops on workgroup
-/// memory, which four elements in flight made slower (`group_min` / `group_max` of 10M `f32` in
-/// 1000 groups on an RTX 3080 Laptop: 0.267 ms against 0.234).
-
 /// What a private accumulator starts as for `op` on elements of type `ty`, as bits (the merge
 /// skips the elements still holding it).
 fn seed_bits(ty: ElemTy, op: AtomicOp) -> u32 {
