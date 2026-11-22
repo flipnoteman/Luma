@@ -103,6 +103,100 @@ casts! { Df32 =>
     to_f64 -> f64;
 }
 
+// -- Casts to and from the 8-bit and 16-bit integers --
+//
+// A conversion *to* a small integer wraps an integer (the low bits are kept, like Rust's `as`:
+// `300u32` is `44u8`, `-1i32` is `255u8` and `65535u16`) and saturates a float (a NaN is 0, like
+// `as` on floats). A conversion *from* one is by value (`-1i8` is `-1i32`, `0xFFFF_FFFFu32` as
+// `u32`, `-1.0f32`), exact for every target
+// (every value of the small types is exactly representable in all of them). `to_bool` is `!= 0`. The casts fuse into the kernel that reads them:
+// an `Array<i16>` read through `to_f32()` loads 2 bytes per element.
+
+macro_rules! small_casts {
+    ($($from:ty),*) => {$(
+        casts! { $from =>
+            /// The elements as `u8`: wraps an integer (keeps the low 8 bits), saturates a float
+            /// (NaN becomes 0); `true` is 1.
+            to_u8 -> u8;
+            /// The elements as `i8`: wraps an integer (keeps the low 8 bits as two's complement),
+            /// saturates a float (NaN becomes 0); `true` is 1.
+            to_i8 -> i8;
+            /// The elements as `u16`: wraps an integer (keeps the low 16 bits), saturates a float
+            /// (NaN becomes 0); `true` is 1.
+            to_u16 -> u16;
+            /// The elements as `i16`: wraps an integer (keeps the low 16 bits as two's
+            /// complement), saturates a float (NaN becomes 0); `true` is 1.
+            to_i16 -> i16;
+        }
+    )*};
+}
+
+small_casts!(f32, f64, Df32, u32, i32, bool);
+
+macro_rules! small_source_casts {
+    ($($from:ty, $self_to:ident;)*) => {$(
+        casts! { $from =>
+            /// The elements as `f32` (exact).
+            to_f32 -> f32;
+            /// The elements as `f64` (exact). Needs a device with 64-bit shader floats;
+            /// otherwise the result is poisoned with [`LumaError::Unsupported`](crate::LumaError).
+            to_f64 -> f64;
+            /// The elements as double-floats (exact).
+            to_df32 -> Df32;
+            /// The elements as `u32`, by value: a negative number becomes its two's complement
+            /// (`-1i8` is `0xFFFF_FFFF`).
+            to_u32 -> u32;
+            /// The elements as `i32`, by value.
+            to_i32 -> i32;
+            /// `true` where the element is not 0.
+            to_bool -> bool;
+        }
+    )*};
+}
+
+small_source_casts! {
+    u8, to_u8;
+    i8, to_i8;
+    u16, to_u16;
+    i16, to_i16;
+}
+
+casts! { u8 =>
+    /// The elements as `i8`: the same bits.
+    to_i8 -> i8;
+    /// The elements as `u16`: zero-extended.
+    to_u16 -> u16;
+    /// The elements as `i16`: zero-extended.
+    to_i16 -> i16;
+}
+
+casts! { i8 =>
+    /// The elements as `u8`: the same bits.
+    to_u8 -> u8;
+    /// The elements as `u16`: sign-extended (`-1i8` is `0xFFFF`).
+    to_u16 -> u16;
+    /// The elements as `i16`: sign-extended.
+    to_i16 -> i16;
+}
+
+casts! { u16 =>
+    /// The elements as `u8`: the low 8 bits.
+    to_u8 -> u8;
+    /// The elements as `i8`: the low 8 bits as two's complement.
+    to_i8 -> i8;
+    /// The elements as `i16`: the same bits.
+    to_i16 -> i16;
+}
+
+casts! { i16 =>
+    /// The elements as `u8`: the low 8 bits.
+    to_u8 -> u8;
+    /// The elements as `i8`: the low 8 bits as two's complement.
+    to_i8 -> i8;
+    /// The elements as `u16`: the same bits.
+    to_u16 -> u16;
+}
+
 impl Array<f32> {
     /// The sum of all elements, accumulated in double-float arithmetic and rounded to `f32` at
     /// the end: a lazy one-element array like [`Array::sum`]. The accumulator keeps roughly twice

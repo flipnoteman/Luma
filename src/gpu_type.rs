@@ -5,6 +5,10 @@ pub(crate) mod sealed {
 impl sealed::Sealed for u32 {}
 impl sealed::Sealed for i32 {}
 impl sealed::Sealed for bool {}
+impl sealed::Sealed for u8 {}
+impl sealed::Sealed for i8 {}
+impl sealed::Sealed for u16 {}
+impl sealed::Sealed for i16 {}
 impl sealed::Sealed for f32 {}
 impl sealed::Sealed for f64 {}
 impl sealed::Sealed for Df32 {}
@@ -65,45 +69,66 @@ pub trait GpuType: Zeroable + Copy + Send + Sync + std::fmt::Debug + sealed::Sea
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ElemLayout {
     stride: usize,
-    packed: bool,
+    /// Elements to a `u32` word: 1 for elements of a word or more, 2 (`u16`, `i16`), 4 (`u8`,
+    /// `i8`) or 32 (`bool`) for the types that share words.
+    per_word: u8,
 }
 
 impl ElemLayout {
     /// Elements of `bytes` bytes each, one after the other.
     pub const fn plain(bytes: usize) -> Self {
-        ElemLayout { stride: bytes, packed: false }
+        ElemLayout { stride: bytes, per_word: 1 }
     }
 
     /// One bit per element: 32 to a `u32` word, element `i` at bit `i % 32` of word `i / 32`.
     /// Arrays split over several buffers split like arrays of 4-byte elements (see
     /// [`ElemLayout::stride`]), so every buffer starts on a word.
-    pub const PACKED: ElemLayout = ElemLayout { stride: 4, packed: true };
+    pub const PACKED: ElemLayout = ElemLayout { stride: 4, per_word: 32 };
+
+    /// Two bytes per element: 2 to a `u32` word, element `i` in the bits `16 * (i % 2)..` of word
+    /// `i / 2` (little endian, the layout of a plain array of 16-bit integers).
+    pub const HALF: ElemLayout = ElemLayout { stride: 4, per_word: 2 };
+
+    /// One byte per element: 4 to a `u32` word, element `i` in the bits `8 * (i % 4)..` of word
+    /// `i / 4` (little endian, the layout of a plain array of bytes).
+    pub const BYTE: ElemLayout = ElemLayout { stride: 4, per_word: 4 };
 
     /// The bytes that set the elements a segment of an array holds, `segment_bytes / stride`:
-    /// the element size, or 4 for packed elements (arrays of `bool` and `f32` are split alike).
+    /// the element size, or 4 for elements that share words (arrays of `bool`, `u8`, `i16`, ... and
+    /// `f32` are split alike, so that an operation between them runs per segment).
     pub const fn stride(self) -> usize {
         self.stride
     }
 
-    /// Whether elements are bits of words.
+    /// Whether several elements share a word (`bool`, 8-bit and 16-bit integers).
     pub const fn is_packed(self) -> bool {
-        self.packed
+        self.per_word > 1
+    }
+
+    /// Whether elements are bits of words.
+    pub const fn is_bits(self) -> bool {
+        self.per_word == 32
+    }
+
+    /// Elements to a word: 1 when they do not share words.
+    pub const fn per_word(self) -> usize {
+        self.per_word as usize
     }
 
     /// The bytes of a buffer holding `len` elements. Never compute `len * stride` for a packed
     /// layout.
     pub const fn bytes(self, len: usize) -> u64 {
-        if self.packed {
-            len.div_ceil(32) as u64 * 4
+        if self.is_packed() {
+            len.div_ceil(self.per_word as usize) as u64 * 4
         } else {
             len as u64 * self.stride as u64
         }
     }
 
-    /// The `Repr` words holding the elements `range` (which starts on a multiple of 32 if the
-    /// layout is packed).
+    /// The `Repr` words holding the elements `range` (which starts on a multiple of the
+    /// elements per word if the layout is packed).
     pub const fn words(self, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
-        if self.packed { range.start / 32..range.end.div_ceil(32) } else { range }
+        if self.is_packed() { range.start / self.per_word as usize..range.end.div_ceil(self.per_word as usize) } else { range }
     }
 }
 
@@ -180,6 +205,52 @@ impl GpuType for bool {
     }
 }
 
+/// `GpuType` for the 8-bit and 16-bit integers: `4` or `2` elements to a `u32` word (little
+/// endian, the bytes of the host slice), see [`ElemLayout::BYTE`] and [`ElemLayout::HALF`]. The
+/// host values go to the device as they are (a copy of the bytes, padded to a whole word, no
+/// widening) and come back the same way.
+macro_rules! small_gpu_type {
+    ($($ty:ty => $layout:ident),*) => {$(
+        impl GpuType for $ty {
+            type Repr = u32;
+
+            const LAYOUT: ElemLayout = ElemLayout::$layout;
+
+            fn to_repr(host: &[Self]) -> std::borrow::Cow<'_, [Self::Repr]> {
+                let bytes: &[u8] = bytemuck::cast_slice(host);
+                if bytes.len().is_multiple_of(4)
+                    && let Ok(words) = bytemuck::try_cast_slice::<u8, u32>(bytes)
+                {
+                    return std::borrow::Cow::Borrowed(words);
+                }
+                let mut words = vec![0u32; bytes.len().div_ceil(4)];
+                bytemuck::cast_slice_mut::<u32, u8>(&mut words)[..bytes.len()].copy_from_slice(bytes);
+                std::borrow::Cow::Owned(words)
+            }
+
+            fn from_repr(repr: Vec<Self::Repr>, len: usize) -> Vec<Self> {
+                let bytes: &[u8] = bytemuck::cast_slice(&repr);
+                bytemuck::pod_collect_to_vec(&bytes[..len * std::mem::size_of::<$ty>()])
+            }
+
+            fn repr_mut(host: &mut [Self]) -> Option<&mut [Self::Repr]> {
+                let bytes: &mut [u8] = bytemuck::cast_slice_mut(host);
+                if !bytes.len().is_multiple_of(4) {
+                    return None;
+                }
+                bytemuck::try_cast_slice_mut::<u8, u32>(bytes).ok()
+            }
+
+            fn into_repr(self) -> Self::Repr {
+                // The word of a one-element array: the value in the low bits.
+                (self as u32) & (u32::MAX >> (32 - 8 * std::mem::size_of::<$ty>()))
+            }
+        }
+    )*};
+}
+
+small_gpu_type!(u8 => BYTE, i8 => BYTE, u16 => HALF, i16 => HALF);
+
 /// The element types of arithmetic: `u32`, `i32`, `f32`, `f64` and [`Df32`]. Sums, running sums,
 /// products and the generic reductions exist for these; `bool` has its own counting versions
 /// (see [`Array<bool>`](crate::Array#impl-Array%3Cbool%3E)) because NumPy's sum of booleans is an integer.
@@ -210,6 +281,32 @@ impl ScalarType for i32 {
 impl ScalarType for bool {
     fn wgsl_type() -> &'static str {
         "u32"
+    }
+}
+
+// The WGSL type of the register holding a small integer, and of the words of its buffers
+// (`GpuType::LAYOUT`): the kernels widen on load and narrow on store (`jit::kirgen`).
+impl ScalarType for u8 {
+    fn wgsl_type() -> &'static str {
+        "u32"
+    }
+}
+
+impl ScalarType for u16 {
+    fn wgsl_type() -> &'static str {
+        "u32"
+    }
+}
+
+impl ScalarType for i8 {
+    fn wgsl_type() -> &'static str {
+        "i32"
+    }
+}
+
+impl ScalarType for i16 {
+    fn wgsl_type() -> &'static str {
+        "i32"
     }
 }
 

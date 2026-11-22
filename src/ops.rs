@@ -83,6 +83,10 @@ impl_value_operand!(f32);
 impl_value_operand!(u32);
 impl_value_operand!(i32);
 impl_value_operand!(bool);
+impl_value_operand!(u8);
+impl_value_operand!(i8);
+impl_value_operand!(u16);
+impl_value_operand!(i16);
 impl_value_operand!(Df32);
 // There is deliberately no `Operand<f64> for f64`: a second float type among the scalar
 // operands would make `select(&mask, 1.0, 0.0)` and every other call that only has float
@@ -576,6 +580,20 @@ impl<T: ScalarType> Array<T> {
         }
         let out = Array::<T>::alloc(ctx, shape)?;
         let storage = out.storage().map_err(Failure::into_error)?;
+        if T::LAYOUT.is_packed() && !T::LAYOUT.is_bits() {
+            // Small integers: every word holds the value in all of its fields (the unused bytes of
+            // the last word too, which nothing reads).
+            let per_word = T::LAYOUT.per_word() as u32;
+            let field = bytemuck::cast::<_, u32>(value.into_repr());
+            let word = (0..per_word).fold(0u32, |word, k| word | field << (k * (32 / per_word)));
+            let core = ctx.builtin(Builtin::Fill, "u32")?;
+            for j in 0..storage.segments() {
+                let bytes = storage.segment_byte_len(j);
+                let pin = storage.pin(j)?;
+                launch_1d(ctx, &core, len_u32((bytes / 4) as usize)?, &[RawArg::write(pin.buffer(), bytes), RawArg::Uniform(bytemuck::bytes_of(&word))])?;
+            }
+            return Ok(out);
+        }
         if T::LAYOUT.is_packed() {
             // The words of the bits: the kernel runs over words, and knows the elements.
             let core = ctx.builtin(Builtin::FillBits, "u32")?;
@@ -1202,6 +1220,108 @@ impl_binary_scalar!(i32, Rem, rem, BinOp::Rem, "rem");
 impl_assign_operator!(i32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 impl_assign_scalar!(i32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 
+// -- The 8-bit and 16-bit integers: wrapping arithmetic --
+//
+// Every operation computes in a 32-bit register and wraps the result to the type again, like
+// Rust's `wrapping_add`, `wrapping_sub`, `wrapping_mul`, `wrapping_neg`, `wrapping_abs`,
+// `wrapping_div` (`i8::MIN / -1` is `i8::MIN`), `wrapping_shl` and `wrapping_shr` (the shift
+// amount is taken modulo the width of the type: `1u8 << 9` is `2`) and `!` (bitwise
+// complement), so `250u8 + 10` is `4` and `i16::MIN - 1` is `i16::MAX`. Division and remainder
+// by zero are as undefined as they are for `u32` and `i32`. There are no operators with a shared
+// host-side [`crate::Scalar`] for these types: use the value (`&x + 3u8`).
+
+macro_rules! impl_small_operators {
+    ($($t:ty),*) => {$(
+        impl_operators!($t);
+        impl_binary_operator!($t, Rem, rem, BinOp::Rem, "rem");
+        impl_assign_operator!($t, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
+        impl_binary_operator!($t, BitAnd, bitand, BinOp::BitAnd, "bitand");
+        impl_binary_operator!($t, BitOr, bitor, BinOp::BitOr, "bitor");
+        impl_binary_operator!($t, BitXor, bitxor, BinOp::BitXor, "bitxor");
+        impl_binary_operator!($t, Shl, shl, BinOp::Shl, "shl");
+        impl_binary_operator!($t, Shr, shr, BinOp::Shr, "shr");
+        impl_assign_operator!($t, BitAndAssign, bitand_assign, BinOp::BitAnd, "bitand_assign");
+        impl_assign_operator!($t, BitOrAssign, bitor_assign, BinOp::BitOr, "bitor_assign");
+        impl_assign_operator!($t, BitXorAssign, bitxor_assign, BinOp::BitXor, "bitxor_assign");
+        impl_assign_operator!($t, ShlAssign, shl_assign, BinOp::Shl, "shl_assign");
+        impl_assign_operator!($t, ShrAssign, shr_assign, BinOp::Shr, "shr_assign");
+
+        impl Not for &Array<$t> {
+            type Output = Array<$t>;
+
+            /// Elementwise bitwise complement.
+            #[track_caller]
+            fn not(self) -> Array<$t> {
+                let location = Location::caller();
+                let result = self.run_unary(UnOp::BitNot, location);
+                Array::resolve(self.context(), self.shape(), result, "not", location)
+            }
+        }
+
+        impl Not for Array<$t> {
+            type Output = Array<$t>;
+
+            #[track_caller]
+            fn not(self) -> Array<$t> {
+                !&self
+            }
+        }
+
+        impl Array<$t> {
+            /// Elementwise `self << amount` (an array of the same shape or a single value), the
+            /// amount taken modulo the width of the type and the bits shifted out lost.
+            #[track_caller]
+            pub fn shl(&self, amount: impl Operand<$t>) -> Array<$t> {
+                self.binary(amount.rhs(), BinOp::Shl, false, "shl")
+            }
+
+            /// Elementwise `self >> amount` (logical for the unsigned types, arithmetic for the
+            /// signed ones), the amount taken modulo the width of the type.
+            #[track_caller]
+            pub fn shr(&self, amount: impl Operand<$t>) -> Array<$t> {
+                self.binary(amount.rhs(), BinOp::Shr, false, "shr")
+            }
+        }
+    )*};
+}
+
+impl_small_operators!(u8, i8, u16, i16);
+
+macro_rules! impl_small_signed {
+    ($($t:ty),*) => {$(
+        impl Neg for &Array<$t> {
+            type Output = Array<$t>;
+
+            /// Elementwise negation, wrapping (`-i8::MIN` is `i8::MIN`).
+            #[track_caller]
+            fn neg(self) -> Array<$t> {
+                self.neg_at(Location::caller())
+            }
+        }
+
+        impl Neg for Array<$t> {
+            type Output = Array<$t>;
+
+            #[track_caller]
+            fn neg(self) -> Array<$t> {
+                self.neg_at(Location::caller())
+            }
+        }
+
+        impl Array<$t> {
+            /// Elementwise absolute value, wrapping (`i8::MIN.abs()` is `i8::MIN`).
+            #[track_caller]
+            pub fn abs(&self) -> Array<$t> {
+                let location = Location::caller();
+                let result = self.run_unary(UnOp::Abs, location);
+                Array::resolve(self.context(), self.shape(), result, "abs", location)
+            }
+        }
+    )*};
+}
+
+impl_small_signed!(i8, i16);
+
 // -- Bitwise operations on u32 and i32 arrays --
 
 macro_rules! impl_bitwise_operator {
@@ -1540,11 +1660,19 @@ impl_promotions!(u32);
 impl_promotions!(i32);
 impl_promotions!(f64);
 impl_promotions!(Df32);
+impl_promotions!(u8);
+impl_promotions!(i8);
+impl_promotions!(u16);
+impl_promotions!(i16);
 // No `f64` scalar: with two float types among the scalars, `bool_array * 2.0` would infer `f64`.
 impl_promotions_scalar!(f32);
 impl_promotions_scalar!(u32);
 impl_promotions_scalar!(i32);
 impl_promotions_scalar!(Df32);
+impl_promotions_scalar!(u8);
+impl_promotions_scalar!(i8);
+impl_promotions_scalar!(u16);
+impl_promotions_scalar!(i16);
 
 impl Array<i32> {
     /// Elementwise `self << amount`, with an array of the same shape or a single `i32` as the

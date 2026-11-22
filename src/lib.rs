@@ -119,6 +119,7 @@ mod scatter;
 mod search;
 mod segments;
 mod segsort;
+mod small;
 mod scalar;
 mod shape;
 mod sort;

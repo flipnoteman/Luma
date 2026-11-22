@@ -56,6 +56,7 @@ mod scan;
 mod scatter_add;
 mod search;
 mod segments;
+mod smallint;
 mod sort;
 mod spill;
 mod threads;

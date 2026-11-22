@@ -270,8 +270,10 @@ impl FusedKey {
     /// Whether every value the program reads, computes or writes is 4 bytes wide: the register
     /// loops, stencils and speculation only handle those.
     pub(crate) fn narrow(&self) -> bool {
-        self.input_tys.iter().all(|ty| ty.slots() == 1)
-            && self.instrs.iter().chain(self.subs.iter().flatten()).all(|instr| instr.op.ty.slots() == 1 && instr.op.out_ty().slots() == 1)
+        self.input_tys.iter().all(|ty| ty.slots() == 1 && !ty.is_small())
+            && self.instrs.iter().chain(self.subs.iter().flatten()).all(|instr| {
+                instr.op.ty.slots() == 1 && instr.op.out_ty().slots() == 1 && !instr.op.ty.is_small() && !instr.op.out_ty().is_small()
+            })
     }
 
     /// Whether the program is a store with a `bool` output: the workgroup packs the bits it
@@ -279,6 +281,25 @@ impl FusedKey {
     pub(crate) fn writes_bits(&self) -> bool {
         self.tail == Tail::Store
             && self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty() == ElemTy::Bool))
+    }
+
+    /// Whether the program is a store with an 8-bit or 16-bit integer output: unless it also
+    /// writes bits, each invocation computes the elements of whole words and writes them as words
+    /// (see `kirgen::Build::words`), so the kernel is not tiled, staged or coarsened.
+    pub(crate) fn writes_small(&self) -> bool {
+        self.tail == Tail::Store
+            && self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty().is_small()))
+    }
+
+    /// The elements each invocation of the store kernel computes: 4 if it writes an 8-bit
+    /// integer, 2 for a 16-bit one, else 1 (a kernel that also writes bits packs by workgroup and
+    /// writes its small integers one element at a time).
+    pub(crate) fn pack_factor(&self) -> u32 {
+        if !self.writes_small() || self.writes_bits() {
+            return 1;
+        }
+        let narrow = self.outputs.iter().any(|&at| self.instrs.get(at as usize).is_some_and(|instr| instr.op.out_ty().small_bits() == 8));
+        if narrow { 4 } else { 2 }
     }
 
     /// Whether some instruction reads a sub-program through a view or a gather: the kernel is

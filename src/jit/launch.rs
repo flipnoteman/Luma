@@ -408,7 +408,7 @@ fn flatten_packed(roots: &[(Arc<Node>, Args)]) -> Result<Fused, Failure> {
 /// Whether `count` arrays of `len` elements of `ty` fit one pack (see [`run_packed`]): one buffer of
 /// elements that sit one after the other.
 pub(super) fn packable(ctx: &crate::context::Context, count: usize, len: usize, ty: ElemTy) -> bool {
-    ty != ElemTy::Bool
+    !ty.is_packed()
         && count > 1
         && len > 0
         && count.checked_mul(len).is_some_and(|total| u32::try_from(total).is_ok() && (total as u64).saturating_mul(ty.stride()) <= ctx.segment_bytes())
@@ -948,7 +948,7 @@ fn launch_store(
     } else {
         for j in 0..first.segments() {
             let args = store_args(key, outputs, inputs, scalars, shifted, j)?;
-            let groups = args.n.div_ceil(core.workgroup[0] * u32::from(key.coarsen.max(1)));
+            let groups = args.n.div_ceil(core.workgroup[0] * u32::from(key.coarsen.max(1)) * key.pack_factor());
             ctx.launch(core, fold_workgroups(ctx, groups)?, [args.n, 1, 1], &args.raw())?;
         }
     }
@@ -1341,8 +1341,8 @@ pub(super) fn reduce_and_store_fused(
     finish: Finish,
     gate: Option<(GateId, &[RawArg<'_>])>,
 ) -> Result<(Vec<Storage>, Buffer, u32), Failure> {
-    if store_outs.iter().any(|&at| fused.key.instrs.get(at as usize).is_none_or(|instr| instr.op.out_ty() == ElemTy::Bool)) {
-        return Err(LumaError::Chunked("a fused store and reduction on a packed bool output").into());
+    if store_outs.iter().any(|&at| fused.key.instrs.get(at as usize).is_none_or(|instr| instr.op.out_ty().is_packed())) {
+        return Err(LumaError::Chunked("a fused store and reduction on a packed output").into());
     }
     let last = fused.key.instrs.len() as u32 - 1;
     fused.key.outputs = store_outs.iter().copied().chain(std::iter::once(last)).collect();
