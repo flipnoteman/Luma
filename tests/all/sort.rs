@@ -336,3 +336,187 @@ fn bad_axis_poisons() {
     let x = Array::from_slice_on(&ctx, &[3.0f32, 1.0, 2.0], 3).unwrap();
     assert!(x.sort_axis(4).to_vec().is_err());
 }
+
+// sort_by_key
+
+/// A type of values the tests carry: made from a number, compared exactly.
+trait Val: luma::ScalarType + PartialEq {
+    fn of(i: u32) -> Self;
+}
+impl Val for u32 {
+    fn of(i: u32) -> Self {
+        i
+    }
+}
+impl Val for i32 {
+    fn of(i: u32) -> Self {
+        i as i32 - 100_000
+    }
+}
+impl Val for f32 {
+    fn of(i: u32) -> Self {
+        i as f32 * 0.5
+    }
+}
+impl Val for bool {
+    fn of(i: u32) -> Self {
+        i % 3 == 0
+    }
+}
+impl Val for f64 {
+    fn of(i: u32) -> Self {
+        f64::from(i) * 0.25
+    }
+}
+
+fn check_by_key<T: Host, V: Val + std::fmt::Debug>(ctx: &Context, host: &[T], what: &str) {
+    let n = host.len();
+    let vals: Vec<V> = (0..n as u32).map(V::of).collect();
+    let (Ok(x), Ok(v)) = (Array::from_slice_on(ctx, host, n), Array::from_slice_on(ctx, &vals, n)) else {
+        return;
+    };
+    for descending in [false, true] {
+        let order = host_order(host, descending);
+        let want_keys: Vec<T> = order.iter().map(|&i| host[i as usize]).collect();
+        let want_vals: Vec<V> = order.iter().map(|&i| V::of(i)).collect();
+        let (k, w) = if descending { x.sort_by_key_descending(&v) } else { x.sort_by_key(&v) };
+        let got_keys = k.to_vec().unwrap();
+        assert_eq!(keys(&got_keys), keys(&want_keys), "{what} keys, n={n} descending={descending}");
+        assert_eq!(w.to_vec().unwrap(), want_vals, "{what} values, n={n} descending={descending}");
+    }
+}
+
+fn check_by_key_types<T: Host>(ctx: &Context, host: &[T]) {
+    let name = std::any::type_name::<T>();
+    check_by_key::<T, u32>(ctx, host, &format!("{name}/u32"));
+    check_by_key::<T, i32>(ctx, host, &format!("{name}/i32"));
+    check_by_key::<T, f32>(ctx, host, &format!("{name}/f32"));
+    check_by_key::<T, bool>(ctx, host, &format!("{name}/bool"));
+    check_by_key::<T, f64>(ctx, host, &format!("{name}/f64"));
+}
+
+/// Keys of every type with every value type, ascending and descending, at odd sizes (tile
+/// boundaries of the radix kernels among them): the values follow their keys, equal keys keep
+/// their input order (the values are the input positions, so the host order checks stability),
+/// NaN keys sort last (first when descending).
+#[test]
+fn sort_by_key_matches_the_host_for_every_type_and_size() {
+    let ctx = Context::new().unwrap();
+    for n in [2usize, 3, 255, 256, 2047, 2049, 4095, 4096, 4097, 8193, 5000, 100_001] {
+        check_by_key_types::<u32>(&ctx, &data(n, 21));
+        check_by_key_types::<i32>(&ctx, &data(n, 22));
+        check_by_key_types::<f32>(&ctx, &data(n, 23));
+    }
+}
+
+#[test]
+fn sort_by_key_with_many_equal_keys_is_stable() {
+    let ctx = Context::new().unwrap();
+    for n in [100_000usize, 4096, 4097, 70_000] {
+        let few: Vec<u32> = data::<u32>(n, 24).iter().map(|x| x % 5).collect();
+        check_by_key_types(&ctx, &few);
+        check_by_key_types(&ctx, &vec![7u32; n]);
+        let signed: Vec<i32> = few.iter().map(|&x| x as i32 - 2).collect();
+        check_by_key_types(&ctx, &signed);
+        // Only the low byte differs: the upper passes move every key to the place it has.
+        let low: Vec<u32> = data::<u32>(n, 25).iter().map(|x| x & 0xff).collect();
+        check_by_key_types(&ctx, &low);
+        // Only the high byte differs.
+        let high: Vec<u32> = data::<u32>(n, 26).iter().map(|x| x & 0xff00_0000).collect();
+        check_by_key_types(&ctx, &high);
+        // NaNs and signed zeros among few distinct floats.
+        let floats: Vec<f32> = few.iter().enumerate().map(|(i, &x)| [f32::NAN, -0.0, 0.0, -1.5, 2.0][x as usize] * if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        check_by_key_types(&ctx, &floats);
+    }
+}
+
+#[test]
+fn sort_by_key_keys_may_be_pending() {
+    let ctx = Context::new().unwrap();
+    let host: Vec<f32> = data::<f32>(70_001, 27).into_iter().map(|v| if v.is_nan() { 3.0 } else { v }).collect();
+    let x = Array::from_slice_on(&ctx, &host, host.len()).unwrap();
+    let vals: Vec<u32> = (0..host.len() as u32).collect();
+    let v = Array::from_slice_on(&ctx, &vals, host.len()).unwrap();
+    let lazy = &x * 2.0 - 1.0;
+    let eager: Vec<f32> = host.iter().map(|h| h * 2.0 - 1.0).collect();
+    let (k, w) = lazy.sort_by_key(&(&v + 1));
+    let order = host_order(&eager, false);
+    assert_eq!(keys(&k.to_vec().unwrap()), keys(&order.iter().map(|&i| eager[i as usize]).collect::<Vec<_>>()));
+    assert_eq!(w.to_vec().unwrap(), order.iter().map(|&i| i + 1).collect::<Vec<_>>());
+}
+
+fn check_by_key_axis<T: Host>(ctx: &Context, dims: &[usize], axis: usize, seed: u64) {
+    let len: usize = dims.iter().product();
+    let host: Vec<T> = data(len, seed);
+    let mut full = [1usize; 4];
+    full[..dims.len()].copy_from_slice(dims);
+    let vals: Vec<u32> = (0..len as u32).collect();
+    let x = Array::from_slice_on(ctx, &host, full).unwrap();
+    let v = Array::from_slice_on(ctx, &vals, full).unwrap();
+    for descending in [false, true] {
+        let (n, stride) = (full[axis], full[..axis].iter().product::<usize>());
+        let mut want_keys = host.clone();
+        let mut want_vals = vals.clone();
+        for line in 0..len / n {
+            let base = line % stride + (line / stride) * stride * n;
+            let cells: Vec<T> = (0..n).map(|k| host[base + k * stride]).collect();
+            let order = host_order(&cells, descending);
+            for (k, &o) in order.iter().enumerate() {
+                want_keys[base + k * stride] = cells[o as usize];
+                want_vals[base + k * stride] = vals[base + o as usize * stride];
+            }
+        }
+        let (k, w) = if descending { x.sort_by_key_axis_descending(axis, &v) } else { x.sort_by_key_axis(axis, &v) };
+        assert_eq!(keys(&k.to_vec().unwrap()), keys(&want_keys), "keys dims {dims:?} axis {axis} descending {descending}");
+        assert_eq!(w.to_vec().unwrap(), want_vals, "values dims {dims:?} axis {axis} descending {descending}");
+        assert_eq!(k.shape().dims(), full);
+    }
+}
+
+#[test]
+fn sort_by_key_axis_matches_the_host_per_line_sort() {
+    let ctx = Context::new().unwrap();
+    let cases: &[(&[usize], usize)] = &[
+        (&[37, 1000], 1),
+        (&[1000, 37], 0),
+        (&[5, 7, 11], 1),
+        (&[5, 7, 11, 3], 2),
+        (&[2, 7000], 1),
+        (&[1, 4097], 1),
+        (&[3000], 0),
+        (&[3000, 1], 1),
+        (&[33, 65, 9], 1),
+        (&[3, 5, 3000], 2),
+        (&[40, 3, 2, 70], 3),
+        (&[40, 3, 2, 70], 0),
+    ];
+    for (k, &(dims, axis)) in cases.iter().enumerate() {
+        check_by_key_axis::<f32>(&ctx, dims, axis, 400 + k as u64);
+        check_by_key_axis::<u32>(&ctx, dims, axis, 500 + k as u64);
+        check_by_key_axis::<i32>(&ctx, dims, axis, 600 + k as u64);
+    }
+}
+
+#[test]
+fn sort_by_key_errors_poison_both_results() {
+    let ctx = Context::new().unwrap();
+    let x = Array::from_slice_on(&ctx, &[3.0f32, 1.0, 2.0], 3).unwrap();
+    let v = Array::from_slice_on(&ctx, &[1u32, 2], 2).unwrap();
+    let (k, w) = x.sort_by_key(&v);
+    assert!(k.to_vec().is_err() && w.to_vec().is_err());
+    let (k, w) = x.sort_by_key_axis(4, &x);
+    assert!(k.to_vec().is_err() && w.to_vec().is_err());
+}
+
+/// Many duplicates, NaNs and both zeros over several tiles of the sweep kernels.
+#[test]
+fn sorts_floats_with_many_duplicates_nans_and_zeros() {
+    let ctx = Context::new().unwrap();
+    let mut rng = Rng(5 + 30_000);
+    for n in [8191usize, 8192, 8193, 16_384, 30_000, 100_001] {
+        let host: Vec<f32> = (0..n)
+            .map(|i| if i % 97 == 5 { f32::NAN } else if i % 89 == 3 { -0.0 } else if i % 91 == 4 { 0.0 } else { (rng.next() % 2000) as f32 - 1000.0 })
+            .collect();
+        check_all::<f32>(&ctx, &host);
+    }
+}

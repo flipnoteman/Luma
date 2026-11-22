@@ -1059,7 +1059,7 @@ impl<'a> Lines<'a> {
 }
 
 /// The operator of a scan: an elementwise closure of two arguments.
-type ScanOp<'a, T> = dyn Fn(&Array<T>, &Array<T>) -> Array<T> + 'a;
+pub(crate) type ScanOp<'a, T> = dyn Fn(&Array<T>, &Array<T>) -> Array<T> + 'a;
 
 fn not_elementwise() -> Failure {
     LumaError::InvalidShape("the scan operator must be an elementwise expression of its two arguments".into()).into()
@@ -1067,7 +1067,7 @@ fn not_elementwise() -> Failure {
 
 impl<T: ScalarType> Array<T> {
     /// `op` traced on two one-element placeholders as a WGSL function.
-    fn trace_operator(&self, op: &ScanOp<'_, T>) -> Outcome<Operator> {
+    pub(crate) fn trace_operator(&self, op: &ScanOp<'_, T>) -> Outcome<Operator> {
         let ctx = self.context();
         let a = Array::<T>::alloc(ctx, Shape::from(1usize))?;
         let b = Array::<T>::alloc(ctx, Shape::from(1usize))?;
@@ -1448,7 +1448,7 @@ impl Array<f32> {
     }
 }
 
-fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {
+pub(crate) fn add<T: ScalarType>(x: &Array<T>, y: &Array<T>) -> Array<T> {
     x.binary(Rhs::Array(y), BinOp::Add, false, "add")
 }
 

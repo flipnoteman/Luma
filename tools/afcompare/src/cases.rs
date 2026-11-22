@@ -599,10 +599,7 @@ pub fn sorts(b: &mut Bench) {
                 // sort_by_key: values are the original positions (exact in f32 below 2^24).
                 let vals: Vec<f32> = (0..n).map(|i| i as f32).collect();
                 let (vl, va) = (lumax::arr(&ctx, &vals, n), afx::arr(&vals, &[n as u64]));
-                let by_key_l = || {
-                    let idx = xl.argsort();
-                    (xl.take(&idx), vl.take(&idx))
-                };
+                let by_key_l = || xl.sort_by_key(&vl);
                 let (lk, lv) = by_key_l();
                 let (ak, av) = af::sort_by_key(&xa, &va, 0, true);
                 let (lk, lv, ak, av) = (lumax::host(&lk), lumax::host(&lv), afx::host(&ak), afx::host(&av));
@@ -614,7 +611,7 @@ pub fn sorts(b: &mut Bench) {
                     "7 sort_by_key f32 keys, f32 values",
                     &human(n),
                     v,
-                    "luma has no sort_by_key: argsort + two takes (gathers); AF sort_by_key",
+                    "luma sort_by_key (keys and values move together in the radix passes) vs AF sort_by_key",
                     &mut || {
                         let (k, v) = by_key_l();
                         luma::eval_all(&[&k, &v]).unwrap();
