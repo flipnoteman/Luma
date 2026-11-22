@@ -14,7 +14,7 @@ use crate::shape::Shape;
 
 use super::blob::{Reader, Writer};
 use super::wide::{reduce_axes, reduce_flat, AccumInput, Wide, V};
-use super::{folded_extent, invalid, is_flat, kept_dims, Fold, NanPolicy};
+use super::{folded_extent, invalid, is_flat, kept_dims, split_plan, state_index, Fold, NanPolicy};
 
 const KIND: u8 = 1;
 const DEFAULT_FLUSH_EVERY: usize = 16;
@@ -704,6 +704,15 @@ fn effective_mask<T: AccumInput>(cfg: &Config, batch: &Array<T>, mask: Option<&A
     }
 }
 
+/// Whether the error is (or wraps) the refusal of an array over several buffers.
+fn is_chunked(error: &LumaError) -> bool {
+    match error {
+        LumaError::Chunked(_) => true,
+        LumaError::Op { source, .. } => is_chunked(source),
+        _ => false,
+    }
+}
+
 /// Reductions of `x` over the folded axes (the reduction of one array, or per line).
 pub(super) fn reduce_folded<T: crate::gpu_type::Numeric>(x: &Array<T>, axes: &[usize], ops: &[Reduction]) -> Vec<Array<T>> {
     let dims = x.shape().dims();
@@ -713,7 +722,36 @@ pub(super) fn reduce_folded<T: crate::gpu_type::Numeric>(x: &Array<T>, axes: &[u
     let real: Vec<usize> = axes.iter().copied().filter(|&a| dims[a] > 1).collect();
     // Nothing to reduce but extent-1 axes: reducing one of them is the identity (and the square).
     let real = if real.is_empty() { vec![axes[0]] } else { real };
+    if x.len() as u64 * T::LAYOUT.stride() as u64 > x.context().segment_bytes() {
+        return reduce_pieces(x, &real, ops);
+    }
     reduce_axes(x, &real, ops)
+}
+
+/// [`reduce_axes`] of an array that does not fit one buffer: pieces along the first reduced
+/// axis, each reduced on its own and the partial results combined (sums add, extrema compare).
+fn reduce_pieces<T: crate::gpu_type::Numeric>(x: &Array<T>, real: &[usize], ops: &[Reduction]) -> Vec<Array<T>> {
+    let split = real[0];
+    let extent = x.shape().dims()[split];
+    let bytes = x.len() as u64 * T::LAYOUT.stride() as u64;
+    let pieces = ((2 * bytes).div_ceil(x.context().segment_bytes()) as usize).min(extent);
+    if pieces < 2 {
+        return reduce_axes(x, real, ops);
+    }
+    let len = extent.div_ceil(pieces);
+    let parts: Vec<Vec<Array<T>>> = (0..extent).step_by(len).map(|a| reduce_axes(&x.slice(split, a..(a + len).min(extent)).cache(), real, ops)).collect();
+    (0..ops.len())
+        .map(|j| {
+            let joined = crate::view::concat_slice(split, &parts.iter().map(|p| p[j].clone()).collect::<Vec<_>>());
+            let combine = match ops[j] {
+                Reduction::Min => Reduction::Min,
+                Reduction::Max => Reduction::Max,
+                _ => Reduction::Sum,
+            };
+            let [out] = joined.reduce_axis(split, [combine]);
+            out
+        })
+        .collect()
 }
 
 impl<W: Wide> State<W> {
@@ -837,17 +875,64 @@ impl<W: Wide> State<W> {
         let (mut min, mut max) = (None, None);
         let (mut imin, mut imax) = (None, None);
         let base = self.pushed as f64;
-        let global = |local: Array<u32>| -> V<W> { &V::<W>::from_u32(&local) + base };
-        let shape_idx = |max_: bool, hi: &Array<T>| -> Result<Array<u32>> {
+        let global = |local: V<W>| -> V<W> { &local + base };
+        // The index of the first extreme within this batch, over the folded axes; split into
+        // pieces along one axis when the batch does not fit one buffer (the arg reductions
+        // need one).
+        let shape_idx = |max_: bool, x: &Array<T>| -> Result<V<W>> {
             let real: Vec<usize> = axes.iter().copied().filter(|&a| dims[a] > 1).collect();
-            if is_flat(dims, axes) {
-                T::argmin_flat(hi, max_)
-            } else if real.len() == 1 {
-                T::argmin_axis(hi, real[0], max_)
-            } else if real.is_empty() {
-                Array::zeros_on(ctx, Shape::new(kept_dims(dims, axes)))
-            } else {
-                Err(LumaError::Unsupported("argmin / argmax over several axes that are not the whole batch".into()))
+            let whole = is_flat(dims, axes);
+            if !whole && real.is_empty() {
+                return Ok(V::zeros(ctx, Shape::new(kept_dims(dims, axes)))?);
+            }
+            if !whole && real.len() != 1 {
+                return Err(LumaError::Unsupported("argmin / argmax over several axes that are not the whole batch".into()));
+            }
+            let arg = |piece: &Array<T>, axis: usize| if whole { T::argmin_flat(piece, max_) } else { T::argmin_axis(piece, axis, max_) };
+            let direct = arg(x, real.first().copied().unwrap_or(0))?;
+            match direct.check() {
+                Ok(()) => return Ok(V::from_u32(&direct)),
+                Err(e) if is_chunked(&e) => {}
+                Err(e) => return Err(e),
+            }
+            let split = if whole { (0..4).rev().find(|&k| dims[k] > 1).unwrap_or(0) } else { real[0] };
+            let unit = if whole { dims[..split].iter().product::<usize>() } else { 1 };
+            let extent = dims[split];
+            let op = if max_ { Reduction::Max } else { Reduction::Min };
+            let mut pieces = 2usize;
+            loop {
+                pieces = pieces.min(extent);
+                let len = extent.div_ceil(pieces);
+                let mut best: Option<(V<W>, V<W>)> = None;
+                let mut fits = true;
+                for a in (0..extent).step_by(len) {
+                    let piece = x.slice(split, a..(a + len).min(extent)).cache();
+                    let idx = arg(&piece, split)?;
+                    match idx.check() {
+                        Ok(()) => {}
+                        Err(e) if is_chunked(&e) => {
+                            fits = false;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    let value = V(T::widen::<W>(&reduce_folded(&piece, axes, &[op]).remove(0)));
+                    let index = &V::<W>::from_u32(&idx) + (a * unit) as f64;
+                    best = Some(match best {
+                        None => (value, index),
+                        Some((bv, bi)) => {
+                            let better = if max_ { value.gt(&bv) } else { value.lt(&bv) };
+                            (V::select(&better, &value, &bv), V::select(&better, &index, &bi))
+                        }
+                    });
+                }
+                if fits {
+                    return Ok(best.expect("a piece").1);
+                }
+                if pieces >= extent {
+                    return Err(LumaError::Chunked("argmin / argmax of a batch whose pieces still need several buffers"));
+                }
+                pieces *= 2;
             }
         };
         if cfg.wants_min() || cfg.wants_max() {
@@ -882,11 +967,6 @@ impl<W: Wide> State<W> {
         let groups = cfg.groups.expect("grouped push");
         let ga = axes[0];
         let pivot = self.epoch.as_ref().expect("the epoch is open").k_f32.as_ref().expect("grouped pushes use the f32 pass");
-        // The batch-shaped flat index into the state of every element.
-        let strides: [u32; 4] = {
-            let sd = self.shape.dims();
-            [1, sd[0] as u32, (sd[0] * sd[1]) as u32, (sd[0] * sd[1] * sd[2]) as u32]
-        };
         let whole = axes.len() == 4;
         let expected = if whole { batch.len() } else { dims[ga] };
         if labels.len() != expected {
@@ -900,49 +980,53 @@ impl<W: Wide> State<W> {
             Shape::new(d)
         };
         let labels = labels.reshape(label_shape);
-        let mut idx = &labels * strides[ga];
-        for k in 0..4 {
-            if !axes.contains(&k) && dims[k] > 1 {
-                idx = &idx + &(&Array::<u32>::range_on(ctx, batch.shape(), k)? * strides[k]);
-            }
-        }
-        let idx = idx.broadcast_to(batch.shape());
-        let mut ok = labels.lt(groups as u32).broadcast_to(batch.shape());
-        if let Some(mask) = mask {
-            ok = &ok & mask;
-        }
-        let idx = select(&ok, &idx, self.shape.len() as u32);
-        let mut s = Vec::new();
-        if cfg.track_mean() {
-            let d = T::shifted(batch, &pivot.take(&idx));
-            let order = cfg.order.max(1);
-            let mut powers = vec![d.clone()];
-            if order >= 2 {
-                powers.push(&d * &d);
-            }
-            if order >= 3 {
-                powers.push(&(&d * &d) * &d);
-            }
-            if order >= 4 {
-                let d2 = &d * &d;
-                powers.push(&d2 * &d2);
-            }
-            for p in &powers {
-                let mut target = Array::<f32>::zeros_on(ctx, self.shape)?;
-                target.put_add(&idx, p)?;
-                s.push(V::from_f32(&target));
-            }
-        }
+        // The scatters need arrays of one buffer: cut a bigger batch into pieces.
+        let plan = split_plan(ctx, dims, T::LAYOUT.stride() as u64, axes.iter().copied().find(|&a| dims[a] > 1));
+        #[allow(clippy::type_complexity)]
+        let pieces: Vec<(Array<T>, Option<Array<bool>>, Array<u32>, Option<(usize, usize)>)> = match plan {
+            None => vec![(batch.clone(), mask.cloned(), labels.clone(), None)],
+            Some((axis, ranges)) => ranges
+                .iter()
+                .map(|&(a, b)| {
+                    let l = if label_shape.dims()[axis] > 1 { labels.slice(axis, a..b) } else { labels.clone() };
+                    (batch.slice(axis, a..b).cache(), mask.map(|m| m.slice(axis, a..b).cache()), l, Some((axis, a)))
+                })
+                .collect(),
+        };
+        let order = cfg.order.max(1) as usize;
+        let mut sums: Vec<Array<f32>> = if cfg.track_mean() { (0..order).map(|_| Array::<f32>::zeros_on(ctx, self.shape)).collect::<Result<_>>()? } else { Vec::new() };
         let mut counts = Array::<u32>::zeros_on(ctx, self.shape)?;
-        counts.put_add(&idx, 1u32)?;
-        let (mut min, mut max) = (None, None);
-        if cfg.wants_min() {
-            min = Some(V(T::widen::<W>(&T::scatter_extreme(ctx, self.shape, &idx, batch, false)?)));
+        let mut mins = if cfg.wants_min() { Some(T::extreme_target(ctx, self.shape, false)?) } else { None };
+        let mut maxs = if cfg.wants_max() { Some(T::extreme_target(ctx, self.shape, true)?) } else { None };
+        for (piece, mask, labels, split) in &pieces {
+            // The flat index into the state of every element; skipped ones are out of range.
+            let idx = state_index(ctx, piece.shape(), axes, &labels.clone(), ga, self.shape.dims(), *split)?;
+            let mut ok = labels.lt(groups as u32).broadcast_to(piece.shape());
+            if let Some(mask) = mask {
+                ok = &ok & mask;
+            }
+            let idx = select(&ok, &idx, self.shape.len() as u32);
+            if cfg.track_mean() {
+                let d = T::shifted(piece, &pivot.take(&idx));
+                let mut p = d.clone();
+                for (k, target) in sums.iter_mut().enumerate() {
+                    if k > 0 {
+                        p = &p * &d;
+                    }
+                    target.put_add(&idx, &p)?;
+                }
+            }
+            counts.put_add(&idx, 1u32)?;
+            if let Some(target) = mins.as_mut() {
+                T::scatter_extreme(target, &idx, piece, false)?;
+            }
+            if let Some(target) = maxs.as_mut() {
+                T::scatter_extreme(target, &idx, piece, true)?;
+            }
         }
-        if cfg.wants_max() {
-            max = Some(V(T::widen::<W>(&T::scatter_extreme(ctx, self.shape, &idx, batch, true)?)));
-        }
-        Ok(Partial { n: Count::Per(counts), s, min, max, imin: None, imax: None })
+        let s = sums.iter().map(V::from_f32).collect();
+        let widen = |t: Option<Array<T>>| t.map(|t| V(T::widen::<W>(&t)));
+        Ok(Partial { n: Count::Per(counts), s, min: widen(mins), max: widen(maxs), imin: None, imax: None })
     }
 
     /// Folds the recorded pushes into the committed state.

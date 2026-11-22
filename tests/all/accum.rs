@@ -742,3 +742,47 @@ fn top_k_keeps_the_best_with_global_indices() {
     assert_eq!(masked.values().unwrap().to_vec().unwrap(), [8, 7]);
     assert_eq!(read(masked.indices()), vec![1.0, 2.0]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Arrays split over several buffers
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn batches_split_over_several_buffers() {
+    use luma::{Context, ContextOptions};
+    // 1024 f32 to a buffer: 10_001 elements are ten full segments and a partial one.
+    let ctx = Context::with_options(ContextOptions::default().chunk_bytes(4096)).expect("a device");
+    let n = 10_001;
+    let data = f32s(&normal(n, 50));
+    let host: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+    let batch = Array::from_slice_on(&ctx, &data, n).unwrap();
+    let acc = full_builder::<Df32>(Fold::all()).build().unwrap();
+    acc.push(&batch).unwrap();
+    acc.push(&batch).unwrap();
+    let want = reference(&host);
+    close(read(acc.count())[0], 2.0 * n as f64, 0.0, 0.0, "count");
+    close(read(acc.mean())[0], want.mean, 1e-5, 1e-6, "mean");
+    close(read(acc.var())[0], want.m2 / want.n, 1e-5, 0.0, "var");
+    close(read(acc.min())[0], want.min, 1e-6, 0.0, "min");
+    // The first minimum, and the second push's copy of it after the first batch.
+    assert_eq!(read(acc.argmin())[0] as usize, want.argmin);
+    assert_eq!(read(acc.argmax())[0] as usize, want.argmax);
+    // Per feature along the long axis, and the other kinds of accumulators.
+    let wide = Array::from_slice_on(&ctx, &data[..10_000], [4, 2500]).unwrap();
+    let per = full_builder::<Df32>(Fold::axis(1)).build().unwrap();
+    per.push(&wide).unwrap();
+    let column: Vec<f64> = (0..2500).map(|r| data[r * 4 + 1] as f64).collect();
+    close(read(per.mean())[1], reference(&column).mean, 1e-5, 1e-6, "chunked per-feature mean");
+    assert_eq!(read(per.argmax())[1] as usize, reference(&column).argmax);
+    let hist = Histogram::<Df32>::new(10, -3.0, 3.0).unwrap();
+    hist.push(&batch).unwrap();
+    assert_eq!(read(hist.counts()), host_hist(&data, 10, -3.0, 3.0).0);
+    let top = TopK::<f32, Df32>::largest(5);
+    top.push(&batch).unwrap();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| data[b].total_cmp(&data[a]).then(a.cmp(&b)));
+    assert_eq!(read(top.indices()), order[..5].iter().map(|&i| i as f64).collect::<Vec<_>>());
+    let co = CoMoments::<Df32>::new(Fold::all());
+    co.push(&batch, &batch).unwrap();
+    close(read(co.corr())[0], 1.0, 0.0, 1e-5, "self correlation");
+}

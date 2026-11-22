@@ -16,6 +16,10 @@ use super::invalid;
 
 const KIND: u8 = 6;
 
+fn ranges_is_whole(a: usize, b: usize, n: usize) -> bool {
+    a == 0 && b == n
+}
+
 /// The `k` largest (or smallest) elements seen so far, best first, with their global indices:
 /// the position of the element in the stream of all elements pushed (the elements of every batch
 /// in memory order, batches one after the other; merging another `TopK` continues the indices
@@ -131,13 +135,21 @@ impl<T: SortKey + AccumInput, W: Wide> TopK<T, W> {
             Some(keep) => select(keep, &flat, &T::extreme(ctx, !self.largest)?),
             None => flat,
         };
-        let take = self.k.min(n);
-        let (top, local) = if self.largest { values.topk(take) } else { values.bottomk(take) };
-        let mut global = &V::<W>::from_u32(&local) + state.pushed as f64;
-        if let Some(keep) = &skip {
-            global = V::select(&keep.take(&local), &global, &V::constant(ctx, -1.0)?);
+        // A batch that does not fit one buffer is sorted in pieces.
+        let ranges = match super::split_plan(ctx, [n, 1, 1, 1], T::LAYOUT.stride() as u64, Some(0)) {
+            Some((_, ranges)) => ranges,
+            None => vec![(0, n)],
+        };
+        for (a, b) in ranges {
+            let (piece, keep) = if ranges_is_whole(a, b, n) { (values.clone(), skip.clone()) } else { (values.slice(0, a..b).cache(), skip.as_ref().map(|k| k.slice(0, a..b).cache())) };
+            let take = self.k.min(b - a);
+            let (top, local) = if self.largest { piece.topk(take) } else { piece.bottomk(take) };
+            let mut global = &V::<W>::from_u32(&local) + (state.pushed + a as u64) as f64;
+            if let Some(keep) = &keep {
+                global = V::select(&keep.take(&local), &global, &V::constant(ctx, -1.0)?);
+            }
+            self.fold(state, &top, &global)?;
         }
-        self.fold(state, &top, &global)?;
         state.pushed += n as u64;
         Ok(())
     }

@@ -135,3 +135,60 @@ pub(crate) fn is_flat(dims: [usize; 4], axes: &[usize]) -> bool {
 pub(crate) fn invalid(msg: impl Into<String>) -> LumaError {
     LumaError::InvalidShape(msg.into())
 }
+
+/// Strides of an array of shape `dims` (axis 0 fastest).
+pub(crate) fn strides(dims: [usize; 4]) -> [u32; 4] {
+    [1, dims[0] as u32, (dims[0] * dims[1]) as u32, (dims[0] * dims[1] * dims[2]) as u32]
+}
+
+/// How a batch of `elem_bytes`-byte elements is cut when it does not fit one buffer (the
+/// operations that write at computed indices need single-buffer arrays): the axis to cut along
+/// (`prefer` if it has more than one entry, else the slowest axis that has) and the ranges of
+/// the pieces; `None` if it fits.
+pub(crate) fn split_plan(ctx: &crate::Context, dims: [usize; 4], elem_bytes: u64, prefer: Option<usize>) -> Option<(usize, Vec<(usize, usize)>)> {
+    let len: u64 = dims.iter().map(|&d| d as u64).product();
+    let bytes = len * elem_bytes;
+    let seg = ctx.segment_bytes();
+    if bytes <= seg {
+        return None;
+    }
+    let axis = prefer.filter(|&a| dims[a] > 1).or_else(|| (0..4).rev().find(|&k| dims[k] > 1))?;
+    let extent = dims[axis];
+    let pieces = ((2 * bytes).div_ceil(seg) as usize).min(extent);
+    if pieces < 2 {
+        return None;
+    }
+    let step = extent.div_ceil(pieces);
+    Some((axis, (0..extent).step_by(step).map(|a| (a, (a + step).min(extent))).collect()))
+}
+
+/// The flat index into a state of shape `state_dims` of every element of a batch of shape
+/// `shape`: `slot` (the coordinate along `slot_axis`, one of the folded axes) plus the position
+/// of the element along the axes that are not folded. `split` is the axis and the offset of a
+/// piece cut from a bigger batch.
+pub(crate) fn state_index(
+    ctx: &crate::Context,
+    shape: crate::Shape,
+    axes: &[usize],
+    slot: &crate::Array<u32>,
+    slot_axis: usize,
+    state_dims: [usize; 4],
+    split: Option<(usize, usize)>,
+) -> Result<crate::Array<u32>> {
+    let dims = shape.dims();
+    let st = strides(state_dims);
+    let mut idx = slot * st[slot_axis];
+    for k in 0..4 {
+        if !axes.contains(&k) && dims[k] > 1 {
+            let mut range = crate::Array::<u32>::range_on(ctx, shape, k)?;
+            if let Some((axis, offset)) = split
+                && axis == k
+                && offset > 0
+            {
+                range = &range + offset as u32;
+            }
+            idx = &idx + &(&range * st[k]);
+        }
+    }
+    Ok(idx.broadcast_to(shape))
+}

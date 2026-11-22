@@ -305,9 +305,12 @@ pub trait AccumInput: Numeric {
     fn to_host_f64(self) -> f64;
     #[doc(hidden)]
     fn from_host_f64(v: f64) -> Self;
-    /// Scatter-min or -max into `len` elements starting at the identity.
+    /// An array starting at the identity of the minimum (maximum) for scatters.
     #[doc(hidden)]
-    fn scatter_extreme(ctx: &Context, len: crate::Shape, idx: &Array<u32>, values: &Array<Self>, max: bool) -> Result<Array<Self>>;
+    fn extreme_target(ctx: &Context, shape: crate::Shape, max: bool) -> Result<Array<Self>>;
+    /// Scatter-min or -max of `values` into `target`.
+    #[doc(hidden)]
+    fn scatter_extreme(target: &mut Array<Self>, idx: &Array<u32>, values: &Array<Self>, max: bool) -> Result<()>;
 }
 
 fn unsupported<T>(what: &str) -> Result<T> {
@@ -322,16 +325,13 @@ macro_rules! arg_impls_atomic {
         fn argmin_flat(a: &Array<Self>, max: bool) -> Result<Array<u32>> {
             Ok(if max { a.argmax() } else { a.argmin() })
         }
-        fn scatter_extreme(ctx: &Context, shape: crate::Shape, idx: &Array<u32>, values: &Array<Self>, max: bool) -> Result<Array<Self>> {
+        fn extreme_target(ctx: &Context, shape: crate::Shape, max: bool) -> Result<Array<Self>> {
             use crate::scatter::AtomicElem;
             let fill = if max { <Self as AtomicElem>::MAX_IDENTITY } else { <Self as AtomicElem>::MIN_IDENTITY };
-            let mut target = Array::<Self>::full_on(ctx, shape, fill)?;
-            if max {
-                target.put_max(idx, values)?;
-            } else {
-                target.put_min(idx, values)?;
-            }
-            Ok(target)
+            Array::<Self>::full_on(ctx, shape, fill)
+        }
+        fn scatter_extreme(target: &mut Array<Self>, idx: &Array<u32>, values: &Array<Self>, max: bool) -> Result<()> {
+            if max { target.put_max(idx, values) } else { target.put_min(idx, values) }
         }
     };
 }
@@ -452,7 +452,10 @@ impl AccumInput for f64 {
     fn argmin_flat(_: &Array<Self>, _: bool) -> Result<Array<u32>> {
         unsupported("argmin / argmax of f64 batches")
     }
-    fn scatter_extreme(_: &Context, _: crate::Shape, _: &Array<u32>, _: &Array<Self>, _: bool) -> Result<Array<Self>> {
+    fn extreme_target(_: &Context, _: crate::Shape, _: bool) -> Result<Array<Self>> {
+        unsupported("grouped extrema of f64 batches")
+    }
+    fn scatter_extreme(_: &mut Array<Self>, _: &Array<u32>, _: &Array<Self>, _: bool) -> Result<()> {
         unsupported("grouped extrema of f64 batches")
     }
 }
@@ -488,7 +491,10 @@ impl AccumInput for Df32 {
     fn argmin_flat(_: &Array<Self>, _: bool) -> Result<Array<u32>> {
         unsupported("argmin / argmax of Df32 batches")
     }
-    fn scatter_extreme(_: &Context, _: crate::Shape, _: &Array<u32>, _: &Array<Self>, _: bool) -> Result<Array<Self>> {
+    fn extreme_target(_: &Context, _: crate::Shape, _: bool) -> Result<Array<Self>> {
+        unsupported("grouped extrema of Df32 batches")
+    }
+    fn scatter_extreme(_: &mut Array<Self>, _: &Array<u32>, _: &Array<Self>, _: bool) -> Result<()> {
         unsupported("grouped extrema of Df32 batches")
     }
 }

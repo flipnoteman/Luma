@@ -11,7 +11,7 @@ use crate::shape::Shape;
 
 use super::blob::{Reader, Writer};
 use super::wide::{check_wide, AccumInput, Wide, V};
-use super::{invalid, kept_dims, Fold};
+use super::{invalid, kept_dims, split_plan, state_index, Fold};
 
 const KIND_HIST: u8 = 4;
 const KIND_HIST2: u8 = 5;
@@ -131,11 +131,6 @@ fn from_host<W: Wide>(ctx: &Context, host: Vec<f64>, shape: Shape) -> Result<V<W
     Ok(V(Array::from_slice_on(ctx, &host, shape)?))
 }
 
-/// `[0, 0, ..]` strides of a state shape.
-fn strides(dims: [usize; 4]) -> [u32; 4] {
-    [1, dims[0] as u32, (dims[0] * dims[1]) as u32, (dims[0] * dims[1] * dims[2]) as u32]
-}
-
 // -------------------------------------------------------------------------------------------------
 // Histogram
 // -------------------------------------------------------------------------------------------------
@@ -242,21 +237,23 @@ impl<W: Wide> Histogram<W> {
             return Err(LumaError::ShapeMismatch { lhs: dims, rhs: state.kept });
         }
         let bins = self.bins as u32;
-        let x = T::to_f32(batch);
         let scale = self.bins as f32 / (self.hi - self.lo);
-        let bin = ((&x - self.lo) * scale).to_u32().minimum(bins - 1);
-        let slot = select(&x.is_nan(), bins + 2, &select(&x.lt(self.lo), bins, &select(&x.gt(self.hi), bins + 1, &bin)));
-        let st = strides(state_dims);
-        let mut idx = &slot * st[a0];
-        for k in 0..4 {
-            if !axes.contains(&k) && dims[k] > 1 {
-                idx = &idx + &(&Array::<u32>::range_on(ctx, batch.shape(), k)? * st[k]);
+        let plan = split_plan(ctx, dims, T::LAYOUT.stride() as u64, axes.iter().copied().find(|&a| dims[a] > 1));
+        let pieces: Vec<(Array<T>, Option<Array<bool>>, Option<(usize, usize)>)> = match plan {
+            None => vec![(batch.clone(), mask.cloned(), None)],
+            Some((axis, ranges)) => ranges.iter().map(|&(a, b)| (batch.slice(axis, a..b).cache(), mask.map(|m| m.slice(axis, a..b).cache()), Some((axis, a)))).collect(),
+        };
+        for (piece, mask, split) in &pieces {
+            let x = T::to_f32(piece);
+            let bin = ((&x - self.lo) * scale).to_u32().minimum(bins - 1);
+            let slot = select(&x.is_nan(), bins + 2, &select(&x.lt(self.lo), bins, &select(&x.gt(self.hi), bins + 1, &bin)));
+            let mut idx = state_index(ctx, piece.shape(), &axes, &slot, a0, state_dims, *split)?;
+            if let Some(mask) = mask {
+                idx = select(mask, &idx, shape.len() as u32);
             }
+            state.table.add(&idx, piece.len() as u64)?;
         }
-        if let Some(mask) = mask {
-            idx = select(mask, &idx, shape.len() as u32);
-        }
-        state.table.add(&idx, batch.len() as u64)
+        Ok(())
     }
 
     fn settled(&self) -> Result<(Shape, usize, V<W>)> {
