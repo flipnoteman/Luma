@@ -213,6 +213,14 @@ fn leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'stati
     }
 }
 
+/// One panel of up to [`PANEL`] columns of a single matrix by [`super::tsqr`].
+fn tsqr_panel(a: &Array<f32>, plan: super::tsqr::Plan, op: &'static str, loc: &'static Location<'static>) -> Qr {
+    match super::tsqr::panel(a, plan) {
+        Ok((qr, tau, t)) => Qr { qr, tau, t },
+        Err(e) => failed_qr(a.context(), a, e, op, loc),
+    }
+}
+
 /// The unit lower trapezoid `V` of a packed `[w, m]` factor (ones on the diagonal, zeros above).
 pub(crate) fn unit_lower(f: &Array<f32>) -> Array<f32> {
     let rows = f.index(1);
@@ -224,6 +232,11 @@ pub(crate) fn unit_lower(f: &Array<f32>) -> Array<f32> {
 /// A recursion over one `[w, m]` matrix, `m >= w`.
 fn recurse(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> Qr {
     let [w, m, ..] = a.shape().dims();
+    if w <= PANEL {
+        if let Some(plan) = super::tsqr::plan(a.context(), m, w) {
+            return tsqr_panel(a, plan, op, loc);
+        }
+    }
     if w <= if m <= 64 { PANEL } else { super::panel_width() } {
         return leaf(a, Dims { rows: m, cols: w, batch: 1 }, op, loc);
     }
@@ -262,6 +275,11 @@ fn factor(a: &Array<f32>, op: &'static str, loc: &'static Location<'static>) -> 
         }
         Err(e) => return failed_qr(ctx, a, e, op, loc),
     };
+    if d.batch == 1 && d.cols <= PANEL {
+        if let Some(plan) = super::tsqr::plan(ctx, d.rows, d.cols) {
+            return tsqr_panel(a, plan, op, loc);
+        }
+    }
     if d.cols <= if d.batch > 1 || d.rows <= 64 { PANEL } else { super::panel_width() } {
         return leaf(a, d, op, loc);
     }

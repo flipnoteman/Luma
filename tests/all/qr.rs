@@ -221,3 +221,32 @@ fn solve_handles_tall_and_wide_systems() {
         assert!(diff(&x, &want) / fro(&want) < 2e-3, "{m}x{n}: minimum norm differs by {}", diff(&x, &want) / fro(&want));
     }
 }
+
+/// Tall panels are factored by blocks of rows and a second factorisation of their `R`s: shapes
+/// around the block size, a last block of fewer rows than columns, many blocks, a panel of one
+/// column, scaled columns.
+#[test]
+fn tall_matrices_are_cut_into_blocks() {
+    let ctx = Context::new().unwrap();
+    for &(n, m, scale) in &[(32usize, 600usize, false), (32, 520, false), (32, 513, false), (1, 2000, false), (17, 1100, false), (40, 1100, false), (70, 3000, false), (32, 4100, true), (32, 8192, false), (32, 9000, false), (33, 2048, true)] {
+        let mut a = values(n * m, 91 + (n * 13 + m) as u64, -1.0, 1.0);
+        if scale {
+            for i in 0..m {
+                for j in 0..n {
+                    a[i * n + j] *= 10f32.powf(-3.0 * j as f32 / (n - 1) as f32);
+                }
+            }
+        }
+        let f = mat(&ctx, &a, n, m, 1).qr();
+        let (err, orth) = check_thin(&f.q_thin().to_vec().unwrap(), &f.r().to_vec().unwrap(), &a, m, n);
+        assert!(err < 3e-5 && orth < 3e-5 * (m as f64 / 100.0).sqrt().max(1.0), "{m}x{n}: ||QR - A|| / ||A|| = {err}, ||QtQ - I|| = {orth}");
+        let tau = f.tau.to_vec().unwrap();
+        assert!(tau.iter().all(|t| (0.0..=2.0 + 1e-5).contains(t)), "{m}x{n}: tau out of range");
+        let b = values(2 * m, 5, -1.0, 1.0);
+        let x = widen(&f.lstsq(&mat(&ctx, &b, 2, m, 1)).to_vec().unwrap());
+        let ad = widen(&a);
+        let r: Vec<f64> = mul(&ad, &x, m, n, 2).iter().zip(&widen(&b)).map(|(p, q)| p - q).collect();
+        let atr = mul(&transpose(&ad, m, n), &r, n, m, 2);
+        assert!(fro(&atr) < 5e-5 * fro(&ad) * fro(&r), "{m}x{n}: Aᵀ r = {}", fro(&atr));
+    }
+}
