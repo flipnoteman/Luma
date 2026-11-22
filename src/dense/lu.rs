@@ -263,14 +263,14 @@ const CALU_W: usize = 32;
 /// Pitch of a row in workgroup memory: odd, so that rows at a stride are in different banks.
 const CALU_P: usize = CALU_W | 1;
 
-/// Rows of a chunk of the tournament: what a workgroup factors in workgroup memory, `256` where
-/// the device has the memory and the invocations, fewer (maybe 0: the old panel kernel then) where
-/// it has not.
-fn calu_rows(ctx: &crate::Context) -> usize {
+/// Rows of the chunks of the first round of the tournament and of the groups of the later ones:
+/// an invocation holds a row (up to 32 values in registers) of the chunk it factors, so a chunk is as
+/// many rows as the device has invocations in a workgroup, at most 512 and 1024. 0 where the device
+/// has fewer than 64 (the old panel kernel then).
+fn calu_rows(ctx: &crate::Context) -> (usize, usize) {
     let limits = &ctx.info().limits;
-    let by_threads = limits.max_workgroup_invocations.min(limits.max_workgroup_size[0]) as usize / 16 * 16;
-    let by_storage = (limits.max_workgroup_storage_bytes as usize).saturating_sub(256) / (CALU_P * 4 + 8) / 16 * 16;
-    256.min(by_threads).min(by_storage)
+    let cap = limits.max_workgroup_invocations.min(limits.max_workgroup_size[0]) as usize / 32 * 32;
+    if cap < 64 { (0, 0) } else { (512.min(cap), 1024.min(cap)) }
 }
 
 #[derive(encase::ShaderType)]
@@ -283,25 +283,31 @@ struct CaluParams {
     rc: u32,
 }
 
-/// The part shared by the two tournament kernels: partial-pivoting LU of `n <= rows` rows of `w`
-/// columns held in workgroup memory (row `r` at `s[r * P]`, its row in the original matrix in
-/// `idx[r]`), an invocation per row. The next pivot comes from the magnitudes the rows have just
-/// updated: they are in `cv`, 16 invocations reduce a sixteenth each and everybody reduces the 16
-/// results (three barriers per column).
-fn calu_core(rows: usize) -> String {
+/// What the two tournament kernels share: partial-pivoting LU of `n <= rows` rows of `w <= wp`
+/// columns, a row in the registers `x0 ..` of an invocation, the rows of the invocations `>= n`
+/// absent. A pivot row is not swapped to the top: the invocation that holds it is done and copies
+/// its row to `lu` (row `j` of the packed `L` and `U` of the winners) and its place in the panel
+/// to `piv[j]`; the others eliminate with the row from `lu`. The next pivot comes from the keys
+/// the invocations have just updated: they are in `cv`, one invocation per part reduces its part
+/// and everybody reduces the parts (three barriers per column, no loop over the row's columns).
+fn calu_declarations(rows: usize, wp: usize) -> String {
+    let parts = if rows <= 256 { 16 } else { 32 };
     format!(
         "const R: u32 = {rows}u;
-const P: u32 = {CALU_P}u;
+const NP: u32 = {parts}u;
 const PER: u32 = {per}u;
-var<workgroup> s: array<f32, {size}>;
-var<workgroup> idx: array<u32, {rows}>;
-var<workgroup> cv: array<f32, {rows}>;
-var<workgroup> s1v: array<f32, 16>;
-var<workgroup> s1i: array<u32, 16>;
+var<workgroup> cv: array<u32, {rows}>;
+var<workgroup> s1v: array<u32, {parts}>;
+var<workgroup> s1i: array<u32, {parts}>;
+var<workgroup> lu: array<f32, {size}>;
+var<workgroup> piv: array<u32, {wp}>;
+
+// The key of a magnitude: larger is bigger (NaN above all), 0 is for a row that is done.
+fn key(x: f32) -> u32 {{ return (bitcast<u32>(x) & 0x7fffffffu) + 1u; }}
 
 fn stage1(t: u32) {{
-    if (t < 16u) {{
-        var bv = -1.0;
+    if (t < NP) {{
+        var bv = 0u;
         var bi = 0xffffffffu;
         for (var k = 0u; k < PER; k = k + 1u) {{
             let v = cv[t * PER + k];
@@ -312,60 +318,77 @@ fn stage1(t: u32) {{
     }}
 }}
 ",
-        per = rows / 16,
-        size = rows * CALU_P
+        per = rows / parts,
+        size = wp * wp
     )
 }
 
-/// The LU of `n` rows of `w` columns in `s` and `idx` (every invocation has passed a barrier since
-/// they were loaded) as statements for the body of a kernel, not a function: the CPU backend splits
-/// its phases at the barriers of the entry function only.
-const CALU_LU: &str = "cv[t] = select(-1.0, abs(s[t * P]), t < n);
-workgroupBarrier();
-stage1(t);
-workgroupBarrier();
-for (var j = 0u; j < w; j = j + 1u) {
-    var bv = -1.0;
+/// The LU of the rows in `x0 ..` as statements for the body of a kernel, not a function (the CPU
+/// backend splits its phases at the barriers of the entry function only), unrolled over the
+/// columns: `row` is the number of the invocation's row in the panel, `n` and `w` are in scope.
+fn calu_lu(wp: usize, row: &str) -> String {
+    let mut text = String::new();
+    text += "var done = t >= n;\ncv[t] = select(key(x0), 0u, done);\nworkgroupBarrier();\nstage1(t);\nworkgroupBarrier();\n";
+    for j in 0..wp {
+        text += &format!(
+            "if (w > {j}u) {{
+    var bv = 0u;
     var pv = 0xffffffffu;
-    for (var q = 0u; q < 16u; q = q + 1u) {
-        if (s1v[q] > bv) { bv = s1v[q]; pv = s1i[q]; }
-    }
-    if (pv == 0xffffffffu) { pv = j; }
-    if (pv != j) {
-        if (t < w) {
-            let x = s[j * P + t];
-            s[j * P + t] = s[pv * P + t];
-            s[pv * P + t] = x;
+    for (var q = 0u; q < NP; q = q + 1u) {{
+        if (s1v[q] > bv) {{ bv = s1v[q]; pv = s1i[q]; }}
+    }}
+    if (t == pv) {{
+        done = true;
+        piv[{j}] = {row};
+"
+        );
+        for c in 0..wp {
+            text += &format!("        lu[{}] = x{c};\n", j * wp + c);
         }
-        if (t == 0u) {
-            let x = idx[j];
-            idx[j] = idx[pv];
-            idx[pv] = x;
-        }
-    }
+        text += &format!(
+            "    }}
     workgroupBarrier();
-    var nv = -1.0;
-    if (t > j && t < n) {
-        let rj = j * P;
-        let ri = t * P;
-        let piv = s[rj + j];
-        let l = select(0.0, s[ri + j] / piv, piv != 0.0);
-        s[ri + j] = l;
-        for (var c = j + 1u; c < w; c = c + 1u) {
-            s[ri + c] = fma(-l, s[rj + c], s[ri + c]);
+    if (!done) {{
+        let pr = lu[{d}];
+        let l = select(0.0, x{j} / pr, pr != 0.0);
+        x{j} = l;
+",
+            d = j * wp + j
+        );
+        for c in j + 1..wp {
+            text += &format!("        x{c} = fma(-l, lu[{}], x{c});\n", j * wp + c);
         }
-        if (j + 1u < w) { nv = abs(s[ri + j + 1u]); }
-    }
-    cv[t] = nv;
+        let next = if j + 1 < wp { format!("x{}", j + 1) } else { "0.0".to_string() };
+        text += &format!(
+            "    }}
+    cv[t] = select(key({next}), 0u, done);
     workgroupBarrier();
     stage1(t);
     workgroupBarrier();
+}}
+"
+        );
+    }
+    text
 }
-";
+
+/// Statements that declare the registers of a row and load row `row` of the panel into them.
+fn calu_load(wp: usize, row: &str) -> String {
+    let mut text = String::new();
+    for c in 0..wp {
+        text += &format!("var x{c} = 0.0;\n");
+    }
+    text += &format!("if (t < n) {{\n    let row = {row};\n");
+    for c in 0..wp {
+        text += &format!("    if ({c}u < w) {{ x{c} = ld(row, {c}u); }}\n");
+    }
+    text += "}\n";
+    text
+}
 
 /// First round of the tournament: workgroup `g` factors the rows `g * rc ..` of the panel (at least
-/// `w` of them) in workgroup memory and writes the panel rows that won, in pivot order.
-fn calu_chunks_source(rows: usize) -> String {
+/// `w` of them) and writes the panel rows that won, in pivot order.
+fn calu_chunks_source(rows: usize, wp: usize) -> String {
     format!(
         "struct Params {{ m: u32, w: u32, g: u32, rc: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -374,25 +397,19 @@ fn calu_chunks_source(rows: usize) -> String {
 @group(1) @binding(3) var<uniform> p: Params;
 fn ld(i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, 0u)]; }}
 
-{core}
+{decl}
 @compute @workgroup_size({rows})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let g = wid.x;
     let w = p.w;
-    let r0 = g * p.rc;
-    let n = min(p.rc, p.m - r0);
-    for (var e = t; e < n * w; e = e + R) {{
-        let i = e / w;
-        s[i * P + e - i * w] = ld(r0 + i, e - i * w);
-    }}
-    idx[t] = r0 + t;
-    workgroupBarrier();
-    {lu}
-    if (t < w) {{ win[g * w + t] = idx[t]; }}
+    let first = g * p.rc;
+    let n = min(p.rc, p.m - first);
+{load}{lu}    if (t < w) {{ win[g * w + t] = piv[t]; }}
 }}
 ",
-        core = calu_core(rows),
-        lu = CALU_LU
+        decl = calu_declarations(rows, wp),
+        load = calu_load(wp, "first + t"),
+        lu = calu_lu(wp, "first + t")
     )
 }
 
@@ -400,7 +417,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 /// again from the original rows until one group is left, whose factors of the winners are the
 /// top of `f` and whose order is the first `w` entries of `perm`. The winners of a group replace
 /// the sets of the group in `win` (the sets of a group lie at or after the place of its winners).
-fn calu_final_source(rows: usize, fence: &str) -> String {
+fn calu_final_source(rows: usize, wp: usize, fence: &str) -> String {
     format!(
         "struct Params {{ m: u32, w: u32, g: u32, rc: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
@@ -411,7 +428,7 @@ fn calu_final_source(rows: usize, fence: &str) -> String {
 @group(1) @binding(5) var<uniform> p: Params;
 fn ld(i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, 0u)]; }}
 
-{core}
+{decl}
 @compute @workgroup_size({rows})
 fn main(@builtin(local_invocation_index) t: u32) {{
     let w = p.w;
@@ -420,18 +437,11 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     loop {{
         let groups = (count + per_group - 1u) / per_group;
         for (var grp = 0u; grp < groups; grp = grp + 1u) {{
-            let sets = min(per_group, count - grp * per_group);
-            let n = sets * w;
+            let n = min(per_group, count - grp * per_group) * w;
             let base = grp * per_group * w;
-            if (t < n) {{ idx[t] = win[base + t]; }}
-            workgroupBarrier();
-            for (var e = t; e < n * w; e = e + R) {{
-                let i = e / w;
-                s[i * P + e - i * w] = ld(idx[i], e - i * w);
-            }}
-            workgroupBarrier();
-            {lu}
-            if (t < w) {{ win[grp * w + t] = idx[t]; }}
+            var panel_row = 0u;
+            if (t < n) {{ panel_row = win[base + t]; }}
+{load}{lu}            if (t < w) {{ win[grp * w + t] = piv[t]; }}
             {fence}
             workgroupBarrier();
         }}
@@ -440,13 +450,14 @@ fn main(@builtin(local_invocation_index) t: u32) {{
     }}
     for (var e = t; e < w * w; e = e + R) {{
         let i = e / w;
-        f[e] = s[i * P + e - i * w];
+        f[e] = lu[i * {wp}u + e - i * w];
     }}
-    if (t < w) {{ perm[t] = idx[t]; }}
+    if (t < w) {{ perm[t] = piv[t]; }}
 }}
 ",
-        core = calu_core(rows),
-        lu = CALU_LU
+        decl = calu_declarations(rows, wp),
+        load = calu_load(wp, "panel_row"),
+        lu = calu_lu(wp, "panel_row")
     )
 }
 
@@ -543,8 +554,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 /// chunk.
 fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'static>) -> Option<Lu> {
     let ctx = a.context();
-    let rows = calu_rows(ctx);
-    if d.cols > CALU_W || rows < 2 * d.cols.max(16) || d.rows < d.cols || d.rows.div_ceil(d.rows.div_ceil(rows)) < d.cols + d.rows.div_ceil(rows) {
+    let (rows, rows2) = calu_rows(ctx);
+    if d.cols > CALU_W || rows < 64 || rows2 < 2 * d.cols || d.rows < d.cols || d.rows.div_ceil(d.rows.div_ceil(rows)) < d.cols + d.rows.div_ceil(rows) {
         return None;
     }
     let perm_shape = Shape::from([d.rows, 1, 1]);
@@ -558,10 +569,10 @@ fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'
     let fence = fence(ctx);
     let wp = d.cols.next_multiple_of(8);
     let tail_groups = (d.rows - d.cols).div_ceil(CALU_TAIL) as u32;
-    let result = launch(ctx, &format!("lu_calu_chunks/{rows}"), "lu_calu_chunks", || calu_chunks_source(rows), [chunks as u32, 1, 1], &[view(a), (&mut win).into(), uniform(&params)])
+    let result = launch(ctx, &format!("lu_calu_chunks/{rows}/{wp}"), "lu_calu_chunks", || calu_chunks_source(rows, wp), [chunks as u32, 1, 1], &[view(a), (&mut win).into(), uniform(&params)])
         .and_then(|()| {
             let args: [KernelArg<'_>; 5] = [view(a), (&mut win).into(), (&mut f).into(), (&mut perm).into(), uniform(&params)];
-            launch(ctx, &format!("lu_calu_final/{rows}/{}", fence.len()), "lu_calu_final", || calu_final_source(rows, fence), [1, 1, 1], &args)
+            launch(ctx, &format!("lu_calu_final/{rows2}/{wp}/{}", fence.len()), "lu_calu_final", || calu_final_source(rows2, wp, fence), [1, 1, 1], &args)
         })
         .and_then(|()| launch(ctx, &format!("lu_calu_tail/{wp}"), "lu_calu_tail", || calu_tail_source(wp), [tail_groups, 1, 1], &[view(a), (&mut f).into(), (&mut perm).into(), uniform(&params)]));
     Some(match result {
