@@ -314,8 +314,6 @@ struct Partial<W: Wide> {
     max: Option<V<W>>,
     imin: Option<V<W>>,
     imax: Option<V<W>>,
-    /// The `f32` reductions behind the fields: submitted at once when pushes are eager.
-    eager: Vec<Array<f32>>,
 }
 
 enum Count {
@@ -446,12 +444,6 @@ impl<W: Wide> Accumulator<W> {
         }
         let mask = effective_mask(&self.cfg, batch, user_mask);
         let partial = state.partial(&self.cfg, batch, mask.as_ref(), labels, &axes)?;
-        if *EAGER {
-            let refs: Vec<&Array<f32>> = partial.eager.iter().collect();
-            if !refs.is_empty() {
-                eval_all(&refs)?;
-            }
-        }
         state.pending.push(partial);
         state.pushed += folded_extent(dims, &axes);
         let limit = if state.merged_once { self.cfg.flush_every } else { 1 };
@@ -739,14 +731,6 @@ fn effective_mask<T: AccumCore>(cfg: &Config, batch: &Array<T>, mask: Option<&Ar
     }
 }
 
-/// The array as `f32` where it is one.
-fn as_f32<T: AccumCore>(a: &Array<T>) -> Option<Array<f32>> {
-    (a as &dyn std::any::Any).downcast_ref::<Array<f32>>().cloned()
-}
-
-/// Whether each push submits its reductions at once (`LUMA_ACCUM_EAGER=1`, an experiment).
-static EAGER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LUMA_ACCUM_EAGER").is_some_and(|v| v != "0"));
-
 /// Whether the error is (or wraps) the refusal of an array over several buffers.
 fn is_chunked(error: &LumaError) -> bool {
     match error {
@@ -867,7 +851,6 @@ impl<W: Wide> State<W> {
         // Sums of powers of the shifted values.
         let mut s: Vec<V<W>> = Vec::new();
         let order = cfg.order.max(1);
-        let mut eager: Vec<Array<f32>> = Vec::new();
         if cfg.track_mean() && cfg.precise {
             let mut d = &V(T::widen::<W>(batch)) - &epoch.k_w;
             if let Some(mask) = mask {
@@ -895,16 +878,14 @@ impl<W: Wide> State<W> {
             if order >= 2 {
                 ops.push(Reduction::SumOfSquares);
             }
-            let mut raw = reduce_folded(&d, axes, &ops);
+            s.extend(reduce_folded(&d, axes, &ops).iter().map(V::from_f32));
             if order >= 3 {
                 let d2 = &d * &d;
-                raw.extend(reduce_folded(&(&d2 * &d), axes, &[Reduction::Sum]));
+                s.extend(reduce_folded(&(&d2 * &d), axes, &[Reduction::Sum]).iter().map(V::from_f32));
                 if order >= 4 {
-                    raw.extend(reduce_folded(&d2, axes, &[Reduction::SumOfSquares]));
+                    s.extend(reduce_folded(&d2, axes, &[Reduction::SumOfSquares]).iter().map(V::from_f32));
                 }
             }
-            s.extend(raw.iter().map(V::from_f32));
-            eager.extend(raw);
         }
         let n = match mask {
             Some(mask) => Count::Per(reduce_folded(&mask.to_u32(), axes, &[Reduction::Sum]).remove(0)),
@@ -1008,23 +989,18 @@ impl<W: Wide> State<W> {
             let (need_min, need_max) = (cfg.wants_min() && min.is_none(), cfg.wants_max() && max.is_none());
             if mask.is_none() && need_min && need_max {
                 let mm = reduce_folded(batch, axes, &[Reduction::Min, Reduction::Max]);
-                eager.extend(mm.iter().filter_map(as_f32));
                 min = Some(widen(&mm[0]));
                 max = Some(widen(&mm[1]));
             } else {
                 if need_min {
-                    let r = reduce_folded(lo_x, axes, &[Reduction::Min]).remove(0);
-                    eager.extend(as_f32(&r));
-                    min = Some(widen(&r));
+                    min = Some(widen(&reduce_folded(lo_x, axes, &[Reduction::Min]).remove(0)));
                 }
                 if need_max {
-                    let r = reduce_folded(hi_x, axes, &[Reduction::Max]).remove(0);
-                    eager.extend(as_f32(&r));
-                    max = Some(widen(&r));
+                    max = Some(widen(&reduce_folded(hi_x, axes, &[Reduction::Max]).remove(0)));
                 }
             }
         }
-        Ok(Partial { n, s, min, max, imin, imax, eager })
+        Ok(Partial { n, s, min, max, imin, imax })
     }
 
     fn partial_grouped<T: AccumCore>(&self, cfg: &Config, batch: &Array<T>, mask: Option<&Array<bool>>, labels: &Array<u32>, axes: &[usize]) -> Result<Partial<W>> {
@@ -1092,7 +1068,7 @@ impl<W: Wide> State<W> {
         }
         let s = sums.iter().map(V::from_f32).collect();
         let widen = |t: Option<Array<T>>| t.map(|t| V(T::widen::<W>(&t)));
-        Ok(Partial { n: Count::Per(counts), s, min: widen(mins), max: widen(maxs), imin: None, imax: None, eager: Vec::new() })
+        Ok(Partial { n: Count::Per(counts), s, min: widen(mins), max: widen(maxs), imin: None, imax: None })
     }
 
     /// Folds the recorded pushes into the committed state.
