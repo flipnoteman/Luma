@@ -33,6 +33,12 @@ const SEGW: usize = NB / SEG;
 const PER: usize = NB * NB / T;
 /// Most right-hand sides this kernel takes.
 pub(crate) const KMAX: usize = 32;
+/// Columns of the right-hand sides a workgroup takes (`LUMA_TRSV_KC`): more are solved by workgroups of their own,
+/// which read the triangle again but do not lengthen the chain from block to block.
+fn group_columns(kp: usize) -> usize {
+    let kc = std::env::var("LUMA_TRSV_KC").ok().and_then(|v| v.parse().ok()).filter(|kc| [1, 2, 4, 8, 16, 32].contains(kc)).unwrap_or(8);
+    kp.min(kc)
+}
 /// Pitch of a tile in workgroup memory.
 const LP: usize = NB + 1;
 
@@ -42,16 +48,17 @@ struct Params {
     k: u32,
     unit: u32,
     nblocks: u32,
+    ncg: u32,
 }
 
 /// Whether `L X = B` of `n` rows and `k` columns goes to this kernel.
 pub(crate) fn applies(ctx: &crate::Context, n: usize, k: usize, batch: usize) -> bool {
-    batch == 1 && k <= KMAX && n > super::tri::BASE && ctx.tuning().lookback_scan && std::env::var("LUMA_TRSV").map_or(true, |v| v != "0")
+    batch == 1 && k <= KMAX && n > super::tri::BASE && ctx.tuning().lookback_scan && std::env::var("LUMA_TRSV").ok().is_none_or(|v| v != "0")
 }
 
-fn source(kp: usize) -> String {
-    let ap = if kp == 1 { 1 } else { kp + 1 };
-    let cpt = (kp / SEG).max(1);
+fn source(kc: usize) -> String {
+    let ap = if kc == 1 { 1 } else { kc + 1 };
+    let cpt = (kc / SEG).max(1);
     // The loads of a tile of `L` (columns from `c0`) into registers; the stores of those to workgroup memory.
     let mut decls = String::new();
     let mut loads = String::new();
@@ -64,7 +71,7 @@ fn source(kp: usize) -> String {
     }
     let mut zero = String::new();
     let mut fma = String::new();
-    for c in 0..kp {
+    for c in 0..kc {
         zero += &format!("    var p{c} = 0.0;\n");
         fma += &format!("            p{c} = fma(lq, xs[q * {ap}u + {c}u], p{c});\n");
     }
@@ -72,7 +79,7 @@ fn source(kp: usize) -> String {
     let mut fold = String::new();
     for s in 0..SEG {
         fold += &format!("    if (sg == {s}u && rr < rows) {{\n");
-        for c in 0..kp {
+        for c in 0..kc {
             if s == 0 {
                 fold += &format!("        acc[rr * {ap}u + {c}u] = ldb(r0 + rr, {c}u) - p{c};\n");
             } else {
@@ -86,7 +93,7 @@ fn source(kp: usize) -> String {
         solve += &format!(
             "        {{
             let c = sg * {cpt}u + {u}u;
-            if (c < {kp}u) {{
+            if (c < {kc}u) {{
                 let xi = acc[i * {ap}u + c] * ri;
                 if (rr > i) {{ acc[rr * {ap}u + c] = fma(-li, xi, acc[rr * {ap}u + c]); }}
                 if (rr == i) {{ xs[i * {ap}u + c] = xi; }}
@@ -94,8 +101,26 @@ fn source(kp: usize) -> String {
         }}\n"
         );
     }
+    // The solved block `x_j` of the column group, `NB * kc` words, read `T` at a time with all the loads first.
+    let words = NB * kc;
+    let steps = words.div_ceil(T);
+    let guard = || if words >= T { String::new() } else { format!("if (t < {words}u) ") };
+    let mut xload = String::new();
+    for u in 0..steps {
+        xload += &format!("        let w{u} = atomicLoad(&st[xb + j * {words}u + t + {}u]);\n", u * T);
+    }
+    for u in 0..steps {
+        xload += &format!("        {}{{ let e = t + {}u; xs[(e / {kc}u) * {ap}u + e % {kc}u] = bitcast<f32>(w{u}); }}\n", guard(), u * T);
+    }
+    let mut publish = String::new();
+    for u in 0..steps {
+        publish += &format!("    {{
+        let e = t + {}u;
+        if (e < {words}u && e / {kc}u < rows) {{ atomicStore(&st[xb + blk * {words}u + e], bitcast<u32>(xs[(e / {kc}u) * {ap}u + e % {kc}u])); }}
+    }}\n", u * T);
+    }
     format!(
-        "struct Params {{ n: u32, k: u32, unit: u32, nblocks: u32 }}
+        "struct Params {{ n: u32, k: u32, unit: u32, nblocks: u32, ncg: u32 }}
 @group(1) @binding(0) var<storage, read> l: array<f32>;
 @group(1) @binding(1) var<uniform> lv: LumaView;
 @group(1) @binding(2) var<storage, read> b: array<f32>;
@@ -111,17 +136,23 @@ var<workgroup> rd: array<f32, {NB}>;
 var<workgroup> ticket: u32;
 
 fn ldl(i: u32, j: u32) -> f32 {{ return l[luma_view_idx3(lv, j, i, 0u)]; }}
-fn ldb(i: u32, c: u32) -> f32 {{ if (c < p.k) {{ return b[luma_view_idx3(bv, c, i, 0u)]; }} return 0.0; }}
+// Column `c` of the group's columns of row `i` of the right-hand side (0 past the last one).
+fn ldb(i: u32, c: u32) -> f32 {{ if (col0 + c < p.k) {{ return b[luma_view_idx3(bv, col0 + c, i, 0u)]; }} return 0.0; }}
+
+var<private> col0: u32;
 
 @compute @workgroup_size({T})
 fn main(@builtin(local_invocation_index) t: u32) {{
     if (t == 0u) {{ ticket = atomicAdd(&st[0], 1u); }}
     for (var e = t; e < {xsize}u; e = e + {T}u) {{ xs[e] = 0.0; }}
     workgroupBarrier();
-    let blk = ticket;
+    let blk = ticket / p.ncg;
+    let cg = ticket % p.ncg;
+    col0 = cg * {kc}u;
     let n = p.n;
     let k = p.k;
-    let xoff = 1u + p.nblocks;
+    let fb = 1u + cg * p.nblocks;
+    let xb = 1u + p.ncg * p.nblocks + cg * n * {kc}u;
     let r0 = blk * {NB}u;
     let rows = min({NB}u, n - r0);
     let rr = t % {NB}u;
@@ -133,14 +164,11 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 {stores}        c0 = select(r0, (j + 1u) * {NB}u, j + 1u < blk);
 {loads}        if (t == 0u) {{
             loop {{
-                if (atomicLoad(&st[1u + j]) != 0u) {{ break; }}
+                if (atomicLoad(&st[fb + j]) != 0u) {{ break; }}
             }}
         }}
         storageBarrier();
-        for (var e = t; e < {NB}u * k; e = e + {T}u) {{
-            xs[(e / k) * {ap}u + e % k] = bitcast<f32>(atomicLoad(&st[xoff + j * {NB}u * k + e]));
-        }}
-        workgroupBarrier();
+{xload}        workgroupBarrier();
         for (var q = sg * {SEGW}u; q < sg * {SEGW}u + {SEGW}u; q = q + 1u) {{
             let lq = lt[rr * {LP}u + q];
 {fma}        }}
@@ -153,16 +181,11 @@ fn main(@builtin(local_invocation_index) t: u32) {{
         let li = lt[rr * {LP}u + i];
 {solve}        workgroupBarrier();
     }}
-    for (var e = t; e < rows * k; e = e + {T}u) {{
-        let r = e / k;
-        let c = e % k;
-        let v = xs[r * {ap}u + c];
-        atomicStore(&st[xoff + (r0 + r) * k + c], bitcast<u32>(v));
-    }}
-    storageBarrier();
-    if (t == 0u) {{ atomicStore(&st[1u + blk], 1u); }}
-    for (var e = t; e < rows * k; e = e + {T}u) {{
-        o[(r0 + e / k) * k + e % k] = xs[(e / k) * {ap}u + e % k];
+{publish}    storageBarrier();
+    if (t == 0u) {{ atomicStore(&st[fb + blk], 1u); }}
+    for (var e = t; e < rows * {kc}u; e = e + {T}u) {{
+        let c = e % {kc}u;
+        if (col0 + c < k) {{ o[(r0 + e / {kc}u) * k + col0 + c] = xs[(e / {kc}u) * {ap}u + c]; }}
     }}
 }}
 ",
@@ -177,15 +200,16 @@ pub(crate) fn lower_left(l: &Array<f32>, b: &Array<f32>, unit: bool, op: &'stati
     let n = l.shape().dims()[1];
     let k = b.shape().dims()[0];
     let nblocks = n.div_ceil(NB);
-    let kp = k.next_power_of_two();
-    let setup = (Array::<f32>::alloc(ctx, b.shape()), Array::<u32>::zeros_on(ctx, 1 + nblocks + n * k));
+    let kc = group_columns(k.next_power_of_two());
+    let ncg = k.div_ceil(kc);
+    let setup = (Array::<f32>::alloc(ctx, b.shape()), Array::<u32>::zeros_on(ctx, 1 + ncg * nblocks + ncg * n * kc));
     let (mut out, mut st) = match setup {
         (Ok(o), Ok(s)) => (o, s),
         (Err(e), _) | (_, Err(e)) => return fail(ctx, b.shape(), e, op, loc),
     };
-    let params = Params { n: n as u32, k: k as u32, unit: u32::from(unit), nblocks: nblocks as u32 };
+    let params = Params { n: n as u32, k: k as u32, unit: u32::from(unit), nblocks: nblocks as u32, ncg: ncg as u32 };
     let args: [KernelArg<'_>; 5] = [view(l), view(b), (&mut out).into(), (&mut st).into(), uniform(&params)];
-    match launch(ctx, &format!("trsv/{kp}"), "trsv", || source(kp), [nblocks as u32, 1, 1], &args) {
+    match launch(ctx, &format!("trsv/{kc}"), "trsv", || source(kc), [(nblocks * ncg) as u32, 1, 1], &args) {
         Ok(()) => out,
         Err(e) => fail(ctx, b.shape(), e, op, loc),
     }
