@@ -269,7 +269,7 @@ const CALU_P: usize = CALU_W | 1;
 /// has fewer than 64 (the old panel kernel then).
 fn calu_rows(ctx: &crate::Context) -> (usize, usize) {
     let limits = &ctx.info().limits;
-    let cap = limits.max_workgroup_invocations.min(limits.max_workgroup_size[0]) as usize / 32 * 32;
+    let cap = (limits.max_workgroup_invocations.min(limits.max_workgroup_size[0]) as usize).checked_ilog2().map_or(0, |l| 1 << l);
     if cap < 64 { (0, 0) } else { (512.min(cap), 1024.min(cap)) }
 }
 
@@ -324,6 +324,10 @@ var<workgroup> s1v: array<u32, {parts}>;
 var<workgroup> s1i: array<u32, {parts}>;
 var<workgroup> lu: array<f32, {size}>;
 var<workgroup> piv: array<u32, {wp}>;
+var<workgroup> pvs: u32;
+var<workgroup> wins: array<u32, {wp}>;
+var<workgroup> lost: array<u32, {wp}>;
+var<workgroup> rank: array<u32, {wp}>;
 
 // The key of a magnitude: larger is bigger (NaN above all), 0 is for a row that is done.
 fn key(x: f32) -> u32 {{ return (bitcast<u32>(x) & 0x7fffffffu) + 1u; }}
@@ -348,15 +352,21 @@ fn stage1(t: u32) {{
 fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
     let mut text = String::new();
     text += "var done = t >= n;\ncv[t] = select(key(x0), 0u, done);\nworkgroupBarrier();\nstage1(t);\nworkgroupBarrier();\n";
-    let steps: usize = std::env::var("X_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(wp);
-    for j in 0..wp.min(steps) {
+    for j in 0..wp {
+        // The first warp alone picks the pivot from the parts (every warp doing it is most of the
+        // instructions of a column), the invocation that holds the row copies it, the others
+        // eliminate, the parts are reduced again.
         text += &format!(
             "if (w > {j}u) {{
-{reduce}    if (t == bi) {{
+    if (t < 32u) {{
+{reduce}        if (t == 0u) {{ pvs = bi; }}
+    }}
+    workgroupBarrier();
+    if (t == pvs) {{
         done = true;
         piv[{j}] = {row};
 ",
-            reduce = reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", "    ")
+            reduce = reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", "        ")
         );
         for c in 0..wp {
             text += &format!("        lu[{}] = x{c};\n", j * wp + c);
@@ -384,9 +394,6 @@ fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
 }}
 "
         );
-    }
-    if std::env::var("X_NOBAR").is_ok() {
-        text = text.replace("workgroupBarrier();\n", "");
     }
     text
 }
@@ -471,7 +478,29 @@ fn main(@builtin(local_invocation_index) t: u32) {{
         let i = e / w;
         f[e] = lu[i * {wp}u + e - i * w];
     }}
-    if (t < w) {{ perm[t] = piv[t]; }}
+    // The permutation: the winners on top, in order; the winners that were below the top take the
+    // places of the top rows that did not win, in order of both; the others stay.
+    for (var i = w + t; i < p.m; i = i + R) {{ perm[i] = i; }}
+    if (t < w) {{
+        perm[t] = piv[t];
+        var won = 0u;
+        for (var k = 0u; k < w; k = k + 1u) {{ if (piv[k] == t) {{ won = 1u; }} }}
+        wins[t] = won;
+    }}
+    workgroupBarrier();
+    if (t < w) {{
+        var lost_before = 0u;
+        var outside_before = 0u;
+        for (var k = 0u; k < t; k = k + 1u) {{
+            lost_before = lost_before + 1u - wins[k];
+            outside_before = outside_before + select(0u, 1u, piv[k] >= w);
+        }}
+        if (wins[t] == 0u) {{ lost[lost_before] = t; }}
+        rank[t] = outside_before;
+    }}
+    {fence}
+    workgroupBarrier();
+    if (t < w && piv[t] >= w) {{ perm[piv[t]] = lost[rank[t]]; }}
 }}
 ",
         decl = calu_declarations(rows, wp),
@@ -483,13 +512,26 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 /// Invocations of the kernel that finishes the panel.
 const CALU_TAIL: usize = 64;
 
-/// The last kernel of a tournament panel, over the rows below the top `w`. The winners go to the
-/// top rows in their order; the winners that were below the top take the places of the top rows
-/// that did not win, in order of both. Row `i` then is row `orig` of the panel, and its
-/// multipliers are `a[orig] U11⁻¹` (a row of `w` unknowns by substitution, on registers; `wp`
-/// columns, the padding is zero).
+/// The last kernel of a tournament panel, over the rows below the top `w`: row `i` is row
+/// `perm[i]` of the panel and its multipliers are `a[perm[i]] U11⁻¹` (a row of `w` unknowns by
+/// substitution, on registers; `wp` columns, the padding is zero).
 fn calu_tail_source(wp: usize) -> String {
     let q = CALU_P;
+    let mut load = String::new();
+    for e in 0..wp * wp / CALU_TAIL {
+        load += &format!(
+            "    {{
+        let idx = t + {}u;
+        let i = idx / {wp}u;
+        let c = idx - i * {wp}u;
+        let ok = i < w && c < w;
+        let v = f[select(0u, i * w + c, ok)];
+        u[i * {q}u + c] = select(0.0, v, ok);
+    }}
+",
+            e * CALU_TAIL
+        );
+    }
     let mut body = String::new();
     for j in 0..wp {
         body += &format!("    var acc{j} = 0.0;\n    if ({j}u < w) {{ acc{j} = ld(orig, {j}u); }}\n");
@@ -514,51 +556,18 @@ fn ld(i: u32, c: u32) -> f32 {{ return a[luma_view_idx3(av, c, i, 0u)]; }}
 
 var<workgroup> u: array<f32, {usize}>;
 var<workgroup> ru: array<f32, {wp}>;
-var<workgroup> piv: array<u32, {wp}>;
-var<workgroup> isw: array<u32, {wp}>;
-var<workgroup> disp: array<u32, {wp}>;
-var<workgroup> slot: array<u32, {wp}>;
-var<workgroup> nd: u32;
 
 @compute @workgroup_size({CALU_TAIL})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let w = p.w;
-    for (var e = t; e < {wp}u * {wp}u; e = e + {CALU_TAIL}u) {{
-        let i = e / {wp}u;
-        let c = e - i * {wp}u;
-        u[i * {q}u + c] = select(0.0, f[i * w + c], i < w && c < w);
-    }}
-    if (t < w) {{ piv[t] = perm[t]; }}
-    workgroupBarrier();
-    if (t < {wp}u) {{
-        let d = u[t * {q}u + t];
-        ru[t] = select(0.0, 1.0 / d, d != 0.0);
-        var won = 0u;
-        for (var k = 0u; k < w; k = k + 1u) {{
-            if (piv[k] == t) {{ won = 1u; }}
-        }}
-        isw[t] = won;
-    }}
-    workgroupBarrier();
-    if (t == 0u) {{
-        var r = 0u;
-        for (var k = 0u; k < w; k = k + 1u) {{
-            if (piv[k] >= w) {{ slot[r] = piv[k]; r = r + 1u; }}
-        }}
-        var q = 0u;
-        for (var i = 0u; i < w; i = i + 1u) {{
-            if (isw[i] == 0u) {{ disp[q] = i; q = q + 1u; }}
-        }}
-        nd = r;
+{load}    if (t < {wp}u) {{
+        let d = f[select(0u, t * w + t, t < w)];
+        ru[t] = select(0.0, 1.0 / d, t < w && d != 0.0);
     }}
     workgroupBarrier();
     let i = w + wid.x * {CALU_TAIL}u + t;
     if (i >= p.m) {{ return; }}
-    var orig = i;
-    for (var r = 0u; r < nd; r = r + 1u) {{
-        if (slot[r] == i) {{ orig = disp[r]; }}
-    }}
-    perm[i] = orig;
+    let orig = perm[i];
 {body}}}
 ",
         usize = wp * q
@@ -580,7 +589,10 @@ fn calu_leaf(a: &Array<f32>, d: Dims, op: &'static str, loc: &'static Location<'
     let perm_shape = Shape::from([d.rows, 1, 1]);
     let poisoned = |e: LumaError| Lu { lu: fail(ctx, a.shape(), e, op, loc), perm: Array::resolve(ctx, perm_shape, Err(crate::array::Failure::New(LumaError::InvalidShape("lu failed".into()))), op, loc) };
     let chunks = d.rows.div_ceil(rows);
-    let params = CaluParams { m: d.rows as u32, w: d.cols as u32, g: chunks as u32, rc: d.rows.div_ceil(chunks) as u32 };
+    let chunk_rows = d.rows.div_ceil(chunks);
+    // Workgroups as small as the rows they factor: a pivot costs a pass of the invocations.
+    let (rows, rows2) = (chunk_rows.next_power_of_two().clamp(64, rows), (chunks * d.cols).next_power_of_two().clamp(64, rows2));
+    let params = CaluParams { m: d.rows as u32, w: d.cols as u32, g: chunks as u32, rc: chunk_rows as u32 };
     let (mut win, mut f, mut perm) = match (Array::<u32>::alloc(ctx, Shape::from([chunks * d.cols])), Array::<f32>::alloc(ctx, a.shape()), Array::<u32>::alloc(ctx, perm_shape)) {
         (Ok(w), Ok(f), Ok(p)) => (w, f, p),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return Some(poisoned(e)),
