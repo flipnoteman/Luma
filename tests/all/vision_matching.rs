@@ -218,7 +218,7 @@ fn neighbours_f32() {
 fn neighbours_wide_k() {
     check_f32(5, 600, 8, 256, DistType::Ssd, 0, 50);
     check_f32(5, 600, 8, 129, DistType::Sad, 1, 50);
-    check_f32(3, 300, 4, 300.min(256), DistType::Ssd, 0, 5);
+    check_f32(3, 300, 4, 256, DistType::Ssd, 0, 5);
 }
 
 #[test]
