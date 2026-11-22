@@ -328,7 +328,7 @@ fn blur(data: &[f32], h: usize, w: usize, r: usize) -> Vec<f64> {
 #[test]
 fn dog_is_the_difference_of_blurs() {
     let ctx = ctx();
-    for (h, w, r1, r2) in [(12, 14, 1, 2), (12, 14, 2, 1), (20, 17, 3, 5), (9, 31, 0, 1), (16, 16, 2, 2), (10, 10, 1, 7)] {
+    for (h, w, r1, r2) in [(12, 14, 1, 2), (12, 14, 2, 1), (20, 17, 3, 5), (9, 31, 0, 1), (16, 16, 2, 2), (10, 10, 1, 7), (20, 21, 1, 40), (9, 8, 2, 300), (33, 70, 12, 14)] {
         let data = values(h * w, (h * w + r1 + r2) as u64, 0.0, 255.0);
         let img = Array::from_slice_on(&ctx, &data, [h, w]).unwrap();
         let (a, b) = (blur(&data, h, w, r1), blur(&data, h, w, r2));

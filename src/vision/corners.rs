@@ -26,6 +26,8 @@ pub(crate) enum Kernel {
     Susan(susan::Kernel),
     /// Compacts the per-tile lists of a detector.
     Gather(detect::Gather),
+    /// The difference of Gaussians, see [`Array::dog`].
+    Dog(dog::Kernel),
 }
 
 /// The WGSL of a kernel of this group.
@@ -34,5 +36,6 @@ pub(crate) fn source(kernel: Kernel) -> String {
         Kernel::Harris(k) => harris::source(k),
         Kernel::Susan(k) => susan::source(k),
         Kernel::Gather(k) => detect::gather_source(k),
+        Kernel::Dog(k) => dog::source(k),
     }
 }
