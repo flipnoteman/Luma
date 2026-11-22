@@ -283,6 +283,29 @@ struct CaluParams {
     rc: u32,
 }
 
+/// Parts a chunk of `rows` keys is reduced in first.
+fn calu_parts(rows: usize) -> usize {
+    if rows <= 256 { 16 } else { 32 }
+}
+
+/// The largest of `n` keys (the first of equals) and its index as statements declaring `bv` and
+/// `bi`: `key` and `index` are the expressions of entry `{k}`. The loads come first, the
+/// comparisons are branch-free, so that no load waits for the comparison before it.
+fn reduce_text(key: &str, index: &str, n: usize, bv: &str, bi: &str, indent: &str) -> String {
+    let mut text = String::new();
+    for k in 0..n {
+        text += &format!("{indent}let k{k} = {};\n", key.replace("{k}", &k.to_string()));
+    }
+    for k in 0..n {
+        text += &format!("{indent}let i{k} = {};\n", index.replace("{k}", &k.to_string()));
+    }
+    text += &format!("{indent}var {bv} = k0;\n{indent}var {bi} = i0;\n");
+    for k in 1..n {
+        text += &format!("{indent}{bi} = select({bi}, i{k}, k{k} > {bv});\n{indent}{bv} = max({bv}, k{k});\n");
+    }
+    text
+}
+
 /// What the two tournament kernels share: partial-pivoting LU of `n <= rows` rows of `w <= wp`
 /// columns, a row in the registers `x0 ..` of an invocation, the rows of the invocations `>= n`
 /// absent. A pivot row is not swapped to the top: the invocation that holds it is done and copies
@@ -291,7 +314,7 @@ struct CaluParams {
 /// the invocations have just updated: they are in `cv`, one invocation per part reduces its part
 /// and everybody reduces the parts (three barriers per column, no loop over the row's columns).
 fn calu_declarations(rows: usize, wp: usize) -> String {
-    let parts = if rows <= 256 { 16 } else { 32 };
+    let parts = calu_parts(rows);
     format!(
         "const R: u32 = {rows}u;
 const NP: u32 = {parts}u;
@@ -307,40 +330,32 @@ fn key(x: f32) -> u32 {{ return (bitcast<u32>(x) & 0x7fffffffu) + 1u; }}
 
 fn stage1(t: u32) {{
     if (t < NP) {{
-        var bv = 0u;
-        var bi = 0xffffffffu;
-        for (var k = 0u; k < PER; k = k + 1u) {{
-            let v = cv[t * PER + k];
-            if (v > bv) {{ bv = v; bi = t * PER + k; }}
-        }}
-        s1v[t] = bv;
+        let b = t * PER;
+{stage1}        s1v[t] = bv;
         s1i[t] = bi;
     }}
 }}
 ",
         per = rows / parts,
-        size = wp * wp
+        size = wp * wp,
+        stage1 = reduce_text("cv[b + {k}u]", "b + {k}u", rows / parts, "bv", "bi", "        ")
     )
 }
 
 /// The LU of the rows in `x0 ..` as statements for the body of a kernel, not a function (the CPU
 /// backend splits its phases at the barriers of the entry function only), unrolled over the
 /// columns: `row` is the number of the invocation's row in the panel, `n` and `w` are in scope.
-fn calu_lu(wp: usize, row: &str) -> String {
+fn calu_lu(wp: usize, parts: usize, row: &str) -> String {
     let mut text = String::new();
     text += "var done = t >= n;\ncv[t] = select(key(x0), 0u, done);\nworkgroupBarrier();\nstage1(t);\nworkgroupBarrier();\n";
     for j in 0..wp {
         text += &format!(
             "if (w > {j}u) {{
-    var bv = 0u;
-    var pv = 0xffffffffu;
-    for (var q = 0u; q < NP; q = q + 1u) {{
-        if (s1v[q] > bv) {{ bv = s1v[q]; pv = s1i[q]; }}
-    }}
-    if (t == pv) {{
+{reduce}    if (t == bi) {{
         done = true;
         piv[{j}] = {row};
-"
+",
+            reduce = reduce_text("s1v[{k}]", "s1i[{k}]", parts, "bv", "bi", "    ")
         );
         for c in 0..wp {
             text += &format!("        lu[{}] = x{c};\n", j * wp + c);
@@ -409,7 +424,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 ",
         decl = calu_declarations(rows, wp),
         load = calu_load(wp, "first + t"),
-        lu = calu_lu(wp, "first + t")
+        lu = calu_lu(wp, calu_parts(rows), "first + t")
     )
 }
 
@@ -457,7 +472,7 @@ fn main(@builtin(local_invocation_index) t: u32) {{
 ",
         decl = calu_declarations(rows, wp),
         load = calu_load(wp, "panel_row"),
-        lu = calu_lu(wp, "panel_row")
+        lu = calu_lu(wp, calu_parts(rows), "panel_row")
     )
 }
 
