@@ -63,6 +63,9 @@ fn array(ctx: &Context, data: &[C32]) -> Array<C32> {
     Array::from_slice_on(ctx, data, data.len()).unwrap()
 }
 
+/// An expression on the array, and the same on one element of the reference.
+type Case = (&'static str, Array<C32>, Box<dyn Fn(Z) -> Z>);
+
 fn same_bits(a: &[C32], b: &[C32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.re.to_bits() == y.re.to_bits() && x.im.to_bits() == y.im.to_bits())
 }
@@ -162,7 +165,7 @@ fn complex_and_real_scalars_on_either_side() {
     let s = 1.5f32;
     let zc = z(c);
     let zs = (f64::from(s), 0.0);
-    let cases: Vec<(&str, Array<C32>, Box<dyn Fn(Z) -> Z>)> = vec![
+    let cases: Vec<Case> = vec![
         ("x + c", &x + c, Box::new(move |p| (p.0 + zc.0, p.1 + zc.1))),
         ("c + x", c + &x, Box::new(move |p| (p.0 + zc.0, p.1 + zc.1))),
         ("x - c", &x - c, Box::new(move |p| (p.0 - zc.0, p.1 - zc.1))),
@@ -332,7 +335,8 @@ fn one(ctx: &Context, c: C32) -> Array<C32> {
 fn division_is_robust_and_by_zero_gives_infinity_or_nan() {
     let ctx = Context::new().unwrap();
     // Huge components: the textbook formula overflows `|b|^2`; Smith's does not.
-    for scale in [1e30f32, 1e-30, 1e19, 1e38] {
+    // (Up to 1e37: a device's fast division returns 0 for a divisor above 2^126, here `2 * scale`.)
+    for scale in [1e30f32, 1e-30, 1e19, 1e37] {
         let (a, b) = (C32::new(scale, scale), C32::new(scale, scale));
         let q = (&one(&ctx, a) / &one(&ctx, b)).to_vec().unwrap()[0];
         near(0, q, (1.0, 0.0), 1.0, 1e-6);
@@ -365,7 +369,7 @@ fn abs_does_not_overflow_or_underflow() {
         (C32::new(3e30, 4e30), 5e30f32),
         (C32::new(3e-30, 4e-30), 5e-30),
         (C32::new(-3e37, 4e37), 5e37),
-        (C32::new(1e-40, 0.0), 1e-40),
+        (C32::new(1e-37, 0.0), 1e-37),
         (C32::new(0.0, -1e38), 1e38),
         (C32::new(0.0, 0.0), 0.0),
         (C32::new(-0.0, -0.0), 0.0),

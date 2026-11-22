@@ -61,6 +61,8 @@ mod guide {
     pub mod loops {}
     #[doc = include_str!("../guide/src/precision.md")]
     pub mod precision {}
+    #[doc = include_str!("../guide/src/complex.md")]
+    pub mod complex {}
     #[doc = include_str!("../guide/src/integers.md")]
     pub mod integers {}
     #[doc = include_str!("../guide/src/custom-kernels.md")]

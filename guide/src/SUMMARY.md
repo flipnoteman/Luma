@@ -10,6 +10,7 @@
 - [Records](records.md)
 - [Loops](loops.md)
 - [Precision](precision.md)
+- [Complex numbers](complex.md)
 - [Integer and bit operations](integers.md)
 - [Custom kernels](custom-kernels.md)
 - [Performance guide](performance.md)
