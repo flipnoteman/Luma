@@ -403,4 +403,12 @@ fn harris_ranking_handles_ties_and_large_limits() {
         let top = big.harris(k, 0.0, 0.5, 0, 0.04).unwrap().unwrap();
         assert_eq!(top.score.to_vec().unwrap(), s[..k].to_vec(), "k = {k}");
     }
+    // More corners than the selection kernel takes.
+    let noise = Array::from_slice_on(&ctx, &values(640 * 640, 11, 0.0, 255.0), [640, 640]).unwrap();
+    let want = noise.harris(0, 1e-20, 0.5, 0, 0.04).unwrap().unwrap();
+    let mut s = want.score.to_vec().unwrap();
+    s.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    assert!(s.len() > 16384, "{}", s.len());
+    let top = noise.harris(300, 0.0, 0.5, 0, 0.04).unwrap().unwrap();
+    assert_eq!(top.score.to_vec().unwrap(), s[..300].to_vec());
 }

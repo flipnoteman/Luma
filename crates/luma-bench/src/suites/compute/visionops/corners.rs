@@ -24,7 +24,12 @@ fn label(dims: [usize; 2]) -> String {
 
 /// Blocks of different brightness plus noise: corners of every kind, about as many as a photograph.
 fn scene(h: usize, w: usize, seed: u64) -> Vec<f32> {
-    let noise = values(h * w, seed, 0.0, 12.0);
+    scene_noise(h, w, seed, 12.0)
+}
+
+/// [`scene`] with noise of amplitude `noise`: 0 leaves only the corners of the blocks.
+fn scene_noise(h: usize, w: usize, seed: u64, noise: f32) -> Vec<f32> {
+    let noise = values(h * w, seed, 0.0, noise.max(1e-6));
     let blocks = values(256, seed + 1, 0.0, 255.0);
     (0..h * w)
         .map(|k| {
@@ -158,6 +163,10 @@ pub fn run(h: &mut Harness) {
             let tag = label(dims);
             h.case("visionops/corners_harris_500", &tag, pix(dims), &mut || {
                 img.harris(500, 1e5, 1.0, 0, 0.04).unwrap();
+            });
+            let clean = upload(h, &scene_noise(dims[0], dims[1], 8, 0.0), dims);
+            h.case("visionops/corners_harris_500_clean", &tag, pix(dims), &mut || {
+                clean.harris(500, 1e5, 1.0, 0, 0.04).unwrap();
             });
             h.case("visionops/corners_harris_all", &tag, pix(dims), &mut || {
                 img.harris(0, 1e5, 1.0, 0, 0.04).unwrap();

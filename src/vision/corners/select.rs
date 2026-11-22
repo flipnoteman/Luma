@@ -5,7 +5,7 @@
 //! input order, so that ties rank like a stable sort) are listed by a scan; the list of at most
 //! 1024 entries is sorted by a bitonic network in workgroup memory and the corners gathered. It
 //! replaces a radix sort of every corner (about twenty launches) for the usual `k` of a few
-//! hundred; larger `k` or more than [`MAX_CORNERS`] corners use [`Array::topk`].
+//! hundred and up to [`MAX_CORNERS`] corners; larger `k` or more corners use [`Array::topk`].
 
 use std::fmt::Write as _;
 
@@ -19,8 +19,10 @@ use crate::vision::{to_u32, Kernel as Any};
 
 /// Largest `k` of the kernel.
 pub(crate) const MAX_K: usize = 1024;
-/// Most corners it selects from.
-pub(crate) const MAX_CORNERS: usize = 1 << 20;
+/// Most corners it selects from: it is one workgroup and every pass walks the list, which beats
+/// the radix sort of [`Array::topk`] (about 0.12 ms of launches on an RTX 3090) below about 16K
+/// corners and loses to it above.
+pub(crate) const MAX_CORNERS: usize = 16384;
 
 const THREADS: u32 = 256;
 

@@ -20,7 +20,12 @@ use crate::util::*;
 
 /// Blocks of different brightness plus noise (about as many corners as a photograph has).
 fn scene(h: usize, w: usize, seed: u64) -> Vec<f32> {
-    let noise = uniform(h * w, seed, 0.0, 12.0);
+    scene_noise(h, w, seed, 12.0)
+}
+
+/// [`scene`] with noise of amplitude `noise` (0: only the corners of the blocks).
+fn scene_noise(h: usize, w: usize, seed: u64, noise: f32) -> Vec<f32> {
+    let noise = uniform(h * w, seed, 0.0, noise.max(1e-6));
     let blocks = uniform(256, seed + 1, 0.0, 255.0);
     (0..h * w)
         .map(|k| {
@@ -107,6 +112,15 @@ pub fn rows(b: &mut Bench) {
                 let a = || af::harris(&xa, max as u32, minr, sigma, block as u32, 0.04);
                 let v = sets(&luma_points(&l()), &af_points(&a(), false), 1e-30);
                 b.run(&format!("14 {name}"), &size, v, note, &mut lr(&ctx, l), &mut ar(a));
+            }
+            // The same without noise: few corners, so the ranking has little to sort.
+            {
+                let clean = scene_noise(h, w, 402, 0.0);
+                let (cl, ca) = (lumax::arr(&ctx, &clean, [h, w]), afx::arr(&clean, &[h as u64, w as u64]));
+                let l = || cl.harris(500, 1e5, 1.0, 0, 0.04).unwrap();
+                let a = || af::harris(&ca, 500, 1e5, 1.0, 0, 0.04);
+                let v = sets(&luma_points(&l()), &af_points(&a(), false), 1e-30);
+                b.run("14 harris 500, no noise", &size, v, "image of blocks without noise (few corners); the strongest 500", &mut lr(&ctx, l), &mut ar(a));
             }
             // SUSAN.
             for (name, r, t, g, edge) in [("susan r3", 3usize, 32.0f32, 10.0f32, 3usize), ("susan r5", 5, 32.0, 30.0, 5)] {
