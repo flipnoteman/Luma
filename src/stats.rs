@@ -144,6 +144,18 @@ macro_rules! float_stats {
                 }
             }
 
+            /// The sum of `weights` over the whole array or along `axis`. Along an axis the sum of the
+            /// bare weights would be a reduction of an array that exists, which cannot share a kernel
+            /// with the sum of `weights * x` (the axis kernels merge reductions of expressions), so
+            /// it is half the sum of `w + w`: the doubling and halving are exact, and the weights
+            /// are read once for both sums.
+            fn weight_sum(weights: &Array<$t>, axis: Option<usize>) -> Array<$t> {
+                match axis {
+                    Some(axis) => &(weights + weights).sum_axis(axis) * 0.5,
+                    None => weights.sum(),
+                }
+            }
+
             /// The cells reduced together: all elements, or the extent along `axis`.
             fn count_over(&self, axis: Option<usize>) -> usize {
                 match axis {
@@ -196,7 +208,7 @@ macro_rules! float_stats {
                         }
                         let weights = if weights.shape() == self.shape() { weights.clone() } else { weights.broadcast_to(self.shape()) };
                         let weighted = &weights * &shifted;
-                        let s0 = weights.sum_over(axis);
+                        let s0 = Self::weight_sum(&weights, axis);
                         let s1 = weighted.sum_over(axis);
                         let s2 = (&weighted * &shifted).sum_over(axis);
                         let mean = &shift + &(&s1 / &s0);
@@ -259,7 +271,7 @@ macro_rules! float_stats {
                     return mismatch(self, weights, reduced_shape(self.shape(), axis), name, location);
                 }
                 let weights = if weights.shape() == self.shape() { weights.clone() } else { weights.broadcast_to(self.shape()) };
-                &(&weights * self).sum_over(axis) / &weights.sum_over(axis)
+                &(&weights * self).sum_over(axis) / &Self::weight_sum(&weights, axis)
             }
 
             /// The covariance of all elements of `self` and `y` (arrays of one shape, paired
