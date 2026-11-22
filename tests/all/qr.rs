@@ -250,3 +250,26 @@ fn tall_matrices_are_cut_into_blocks() {
         assert!(fro(&atr) < 5e-5 * fro(&ad) * fro(&r), "{m}x{n}: Aᵀ r = {}", fro(&atr));
     }
 }
+
+/// Zero columns and an all-zero matrix of the tall shapes the tree factors: `R` has the zero on the
+/// diagonal and `Q` stays orthogonal.
+#[test]
+fn tall_degenerate_panels() {
+    let ctx = Context::new().unwrap();
+    for &(n, m, zero) in &[(32usize, 1100usize, Some(7usize)), (40, 700, Some(20)), (32, 2000, Some(0)), (32, 600, None)] {
+        let mut a = if zero.is_some() { values(n * m, 17, -1.0, 1.0) } else { vec![0.0f32; n * m] };
+        if let Some(z) = zero {
+            for i in 0..m {
+                a[i * n + z] = 0.0;
+            }
+        }
+        let f = mat(&ctx, &a, n, m, 1).qr();
+        let r = f.r().to_vec().unwrap();
+        let (err, orth) = check_thin(&f.q_thin().to_vec().unwrap(), &r, &a, m, n);
+        assert!(err < 3e-5 && orth < 5e-5, "{m}x{n}: {err}, {orth}");
+        match zero {
+            Some(z) => assert!(r[z * n + z].abs() < 1e-5, "{m}x{n}: R[{z}][{z}] = {}", r[z * n + z]),
+            None => assert!(r.iter().all(|v| *v == 0.0), "{m}x{n}: R of a zero matrix"),
+        }
+    }
+}
