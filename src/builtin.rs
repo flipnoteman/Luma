@@ -878,6 +878,15 @@ pub(crate) enum Builtin {
     /// memory; see `jit::transpose`. Arguments: out, src, uniform `Params`. Element type `"u32"`
     /// (any 4-byte element) or `"vec2<f32>"` (`Df32`).
     Transpose,
+    /// A windowed image kernel (convolution, rank and morphological filters, bilateral, Sobel,
+    /// gradient); see [`crate::image`]. The element type is the window's.
+    Window(crate::image::Window),
+    /// A colour-space conversion of image planes; see [`crate::image`]. Element type `"f32"`.
+    Color(crate::image::ColorKernel),
+    /// `unwrap` (im2col); see [`crate::image`]. Element type `"f32"`.
+    Unwrap,
+    /// `wrap` (col2im); see [`crate::image`]. Element type `"f32"`.
+    Wrap,
 }
 
 /// One reduction pass over `a` for every op of `ops`: each workgroup reduces its share of the `p.n`
@@ -2583,6 +2592,10 @@ impl Builtin {
             Builtin::FilterCount => wgsl(crate::filter::count_source()),
             Builtin::FilterScatter { words, index } => wgsl(crate::filter::scatter_source(words, index)),
             Builtin::Transpose => wgsl(crate::jit::transpose::source(ty)),
+            Builtin::Window(window) => wgsl(crate::image::window_source(&window)),
+            Builtin::Color(op) => wgsl(crate::image::color_source(op)),
+            Builtin::Unwrap => wgsl(crate::image::unwrap_source()),
+            Builtin::Wrap => wgsl(crate::image::wrap_source()),
             Builtin::NonFinite => BuiltinKernel::Module(non_finite_module(wg)),
         }
     }
