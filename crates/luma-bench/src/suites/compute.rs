@@ -21,6 +21,7 @@ mod linalg;
 mod physics;
 mod scans;
 mod signal;
+mod spectral;
 
 use std::time::{Duration, Instant};
 
@@ -93,5 +94,6 @@ pub fn run(h: &mut Harness) {
     scans::run(h);
     physics::run(h);
     signal::run(h);
+    spectral::run(h);
     crypto::run(h);
 }

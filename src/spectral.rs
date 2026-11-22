@@ -16,6 +16,8 @@ use crate::context::{Context, RawArg, Scratch};
 use crate::dft_kernel::{DftPass, LoadKind, MAX_RADIX, MAX_STAGES, Params, StoreKind, Table, WORKGROUP};
 use crate::error::LumaError;
 use crate::ops::{fold_workgroups, Outcome};
+use crate::shape::Shape;
+use crate::view::PadMode;
 
 /// How a transform is scaled.
 ///
@@ -335,7 +337,7 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 /// The kernel of [`Builtin::RealStage`]: the step between a half-size complex transform and the
 /// spectrum of a real signal (`forward`: unpack `h + 1` frequencies from `h` values; else pack
 /// them, doubled, for the inverse). Bindings: `src`, `dst`, `Params { total, h, inner, scale }`.
-pub(crate) fn real_stage_source(forward: bool) -> String {
+pub(crate) fn real_stage_source(forward: bool, table: bool) -> String {
     let body = if forward {
         // Z[k mod h] and conj(Z[(h - k) mod h]) give the even and odd samples' spectra E and O;
         // X[k] = E + W^k O.
@@ -359,8 +361,8 @@ pub(crate) fn real_stage_source(forward: bool) -> String {
     let k = (i / p.inner) % p.h;
     let o = i / (p.inner * p.h);
     let base = o * (p.h + 1u) * p.inner + ii;
-    let xk = src[base + k * p.inner];
-    let x2 = src[base + (p.h - k) * p.inner];
+    let xk = TAB_K;
+    let x2 = TAB_X2;
     let xc = vec2<f32>(x2.x, -x2.y);
     let e = xk + xc;
     let d = xk - xc;
@@ -368,11 +370,21 @@ pub(crate) fn real_stage_source(forward: bool) -> String {
     let od = cmul(d, vec2<f32>(w.x, -w.y));
     dst[i] = (e + vec2<f32>(-od.y, od.x)) * p.scale;"
     };
+    let (xk, x2, binding) = if table {
+        (
+            "cmul(src[base + k * p.inner], tab[ii + k * p.inner])",
+            "cmul(src[base + (p.h - k) * p.inner], tab[ii + (p.h - k) * p.inner])",
+            "@group(1) @binding(2) var<storage, read> tab: array<vec2<f32>>;\n@group(1) @binding(3) var<uniform> p: Params;",
+        )
+    } else {
+        ("src[base + k * p.inner]", "src[base + (p.h - k) * p.inner]", "@group(1) @binding(2) var<uniform> p: Params;")
+    };
+    let body = body.replace("TAB_K", xk).replace("TAB_X2", x2);
     format!(
         "struct Params {{ outer: u32, h: u32, inner: u32, scale: f32 }}
 @group(1) @binding(0) var<storage, read> src: array<vec2<f32>>;
 @group(1) @binding(1) var<storage, read_write> dst: array<vec2<f32>>;
-@group(1) @binding(2) var<uniform> p: Params;
+{binding}
 {TW_FUNCTION}
 @compute @workgroup_size({WORKGROUP})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
@@ -460,6 +472,7 @@ pub(crate) struct AxisIo<'a> {
     pub(crate) n_out: Option<u32>,
     pub(crate) n_full: u32,
     pub(crate) store_table: Option<(&'a luma_core::Buffer, u64, Table)>,
+    pub(crate) load_table: Option<(&'a luma_core::Buffer, u64, Table)>,
 }
 
 /// Records the transform of `n` points along the middle axis of `[outer][n][inner]`, by the
@@ -485,7 +498,7 @@ pub(crate) fn run_axis(
                 inverse,
                 scale,
                 load: io.load,
-                load_table: None,
+                load_table: io.load_table,
                 n_in: io.n_in,
                 n_lim: None,
                 n_full: io.n_full,
@@ -497,7 +510,7 @@ pub(crate) fn run_axis(
     }
     // Bluestein: X[k] = w[k] sum_j (x[j] w[j]) conj(w)[k - j], a circular convolution of
     // length m >= 2n - 1.
-    if io.load == LoadKind::RealPair || io.store == StoreKind::RealPair || io.store_table.is_some() {
+    if io.load == LoadKind::RealPair || io.store == StoreKind::RealPair || io.store_table.is_some() || io.load_table.is_some() {
         return Err(LumaError::InvalidShape("internal: Bluestein with packed or tabled ends".into()));
     }
     let m = pow2_at_least(2 * n - 1)?;
@@ -591,22 +604,149 @@ fn check_axis(axis: usize) -> Result<(), LumaError> {
     Ok(())
 }
 
-/// The complex transform of `input` along each of `axes` in turn (the first one reading real
-/// values if `real_input`).
-fn run_complex(input: &Array<C32>, axes: &[usize], inverse: bool, norm: FftNorm) -> Outcome<Array<C32>> {
-    let ctx = input.context();
-    let dims = input.shape().dims();
+/// Launches the real-transform packing kernel over `total` outputs.
+fn launch_real_stage(
+    ctx: &Context,
+    forward: bool,
+    (outer, h, inner): (u32, u32, u32),
+    scale: f32,
+    src: (&luma_core::Buffer, u64),
+    dst: (&luma_core::Buffer, u64),
+    table: Option<(&luma_core::Buffer, u64)>,
+) -> Result<(), LumaError> {
+    let total = u64::from(outer) * u64::from(h + u32::from(forward)) * u64::from(inner);
+    let total = u32::try_from(total).map_err(|_| too_large(total as usize))?;
+    let params = [outer, h, inner, scale.to_bits()];
+    let kernel = ctx.builtin(Builtin::RealStage(forward, table.is_some()), "f32")?;
+    let groups = fold_workgroups(ctx, total.div_ceil(WORKGROUP))?;
+    let mut args = vec![RawArg::read(src.0, src.1), RawArg::write(dst.0, dst.1)];
+    if let Some((b, bytes)) = table {
+        args.push(RawArg::read(b, bytes));
+    }
+    args.push(RawArg::Uniform(bytemuck::bytes_of(&params)));
+    ctx.launch(&kernel, groups, [total, 1, 1], &args)
+}
+
+/// The transform of real values along `axis` of `dims` into the half spectrum (`n / 2 + 1`
+/// values), scaled by `factor`.
+fn real_forward(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    dims: [usize; 4],
+    axis: usize,
+    factor: f32,
+    src: (&luma_core::Buffer, u64),
+    dst: (&luma_core::Buffer, u64),
+) -> Result<(), LumaError> {
+    let (outer, n, inner) = geometry(dims, axis)?;
+    if n % 2 == 0 && is_smooth(n / 2) {
+        // The even and odd samples as one complex signal of half the length; the packing step
+        // separates their spectra.
+        let h = n / 2;
+        let bytes = u64::from(outer) * u64::from(h) * u64::from(inner) * 8;
+        let z = scratch.take(bytes)?;
+        run_lines(
+            ctx,
+            scratch,
+            &Lines {
+                outer,
+                n: h,
+                inner,
+                src,
+                dst: (&z, bytes),
+                inverse: false,
+                scale: 1.0,
+                load: LoadKind::RealPair,
+                load_table: None,
+                n_in: None,
+                n_lim: None,
+                n_full: 0,
+                store: StoreKind::Complex,
+                store_table: None,
+                n_out: None,
+            },
+        )?;
+        return launch_real_stage(ctx, true, (outer, h, inner), factor, (&z, bytes), dst, None);
+    }
+    let io = AxisIo { src, dst, load: LoadKind::Real, store: StoreKind::Complex, n_in: None, n_out: Some(n / 2 + 1), n_full: 0, store_table: None, load_table: None };
+    run_axis(ctx, scratch, (outer, n, inner), false, factor, &io)
+}
+
+/// The inverse of [`real_forward`]: `n` real values from the half spectrum along `axis` of
+/// `dims` (the dimensions of the output), scaled by `factor`.
+fn real_inverse(
+    ctx: &Context,
+    scratch: &mut Scratch<'_>,
+    dims: [usize; 4],
+    axis: usize,
+    factor: f32,
+    src: (&luma_core::Buffer, u64),
+    dst: (&luma_core::Buffer, u64),
+    product: Option<(&luma_core::Buffer, u64)>,
+) -> Result<(), LumaError> {
+    let (outer, n, inner) = geometry(dims, axis)?;
+    let k = n / 2 + 1;
+    if product.is_some() && !(n % 2 == 0 && is_smooth(n / 2)) {
+        return Err(LumaError::InvalidShape("internal: a spectrum product needs an even smooth length".into()));
+    }
+    if n % 2 == 0 && is_smooth(n / 2) {
+        let h = n / 2;
+        let bytes = u64::from(outer) * u64::from(h) * u64::from(inner) * 8;
+        let z = scratch.take(bytes)?;
+        launch_real_stage(ctx, false, (outer, h, inner), 1.0, src, (&z, bytes), product)?;
+        return run_lines(
+            ctx,
+            scratch,
+            &Lines {
+                outer,
+                n: h,
+                inner,
+                src: (&z, bytes),
+                dst,
+                inverse: true,
+                scale: factor,
+                load: LoadKind::Complex,
+                load_table: None,
+                n_in: None,
+                n_lim: None,
+                n_full: 0,
+                store: StoreKind::RealPair,
+                store_table: None,
+                n_out: None,
+            },
+        );
+    }
+    let io = AxisIo { src, dst, load: LoadKind::Hermitian, store: StoreKind::Real, n_in: Some(k as u32), n_out: None, n_full: n as u32, store_table: None, load_table: None };
+    run_axis(ctx, scratch, (outer, n, inner), true, factor, &io)
+}
+
+/// What the first axis of a transform reads.
+#[derive(Clone, Copy, PartialEq)]
+enum Input {
+    Complex,
+    Real,
+}
+
+/// The complex transform of the array in `src` (of `dims`) along each of `axes` in turn.
+fn run_complex(
+    ctx: &Context,
+    dims: [usize; 4],
+    src: (luma_core::Buffer, u64),
+    input: Input,
+    axes: &[usize],
+    inverse: bool,
+    norm: FftNorm,
+) -> Outcome<Array<C32>> {
     for &a in axes {
         check_axis(a)?;
     }
-    let output = Array::<C32>::alloc(ctx, input.shape())?;
-    if input.len() == 0 {
+    let output = Array::<C32>::alloc(ctx, Shape::from(dims))?;
+    if dims.contains(&0) {
         return Ok(output);
     }
-    let (in_pin, in_bytes) = input.ready()?;
     let (out_pin, out_bytes) = output.ready()?;
     let mut scratch = Scratch::new(ctx);
-    let mut current = (in_pin.buffer().clone(), in_bytes);
+    let mut current = src;
     for (i, &axis) in axes.iter().enumerate() {
         let last = i + 1 == axes.len();
         let target = if last { (out_pin.buffer().clone(), out_bytes) } else { (scratch.take(bytes_of(dims))?, bytes_of(dims)) };
@@ -614,30 +754,133 @@ fn run_complex(input: &Array<C32>, axes: &[usize], inverse: bool, norm: FftNorm)
             FftNorm::Scale(_) if i > 0 => 1.0,
             other => other.factor(dims[axis], inverse),
         };
+        let load = if i == 0 && input == Input::Real { LoadKind::Real } else { LoadKind::Complex };
         run_axis(
             ctx,
             &mut scratch,
             geometry(dims, axis)?,
             inverse,
             factor,
-            &AxisIo { src: (&current.0, current.1), dst: (&target.0, target.1), load: LoadKind::Complex, store: StoreKind::Complex, n_in: None, n_out: None, n_full: 0, store_table: None },
+            &AxisIo { src: (&current.0, current.1), dst: (&target.0, target.1), load, store: StoreKind::Complex, n_in: None, n_out: None, n_full: 0, store_table: None, load_table: None },
         )?;
         current = target;
     }
     Ok(output)
 }
 
+/// The half spectrum of real input: the first of `axes` is halved, the others are complex
+/// transforms of the result.
+fn run_real_forward(input: &Array<f32>, axes: &[usize], norm: FftNorm) -> Outcome<Array<C32>> {
+    let ctx = input.context();
+    let mut dims = input.shape().dims();
+    for &a in axes {
+        check_axis(a)?;
+    }
+    let Some(&first) = axes.first() else {
+        return Err(LumaError::InvalidShape("rfft needs at least one axis".into()).into());
+    };
+    let n = dims[first];
+    let mut half = dims;
+    half[first] = n / 2 + 1;
+    let output = Array::<C32>::alloc(ctx, Shape::from(half))?;
+    if dims.contains(&0) {
+        return Ok(output);
+    }
+    let (in_pin, in_bytes) = input.ready()?;
+    let (out_pin, out_bytes) = output.ready()?;
+    let mut scratch = Scratch::new(ctx);
+    let half_bytes = bytes_of(half);
+    let rest = &axes[1..];
+    let target = if rest.is_empty() { (out_pin.buffer().clone(), out_bytes) } else { (scratch.take(half_bytes)?, half_bytes) };
+    real_forward(ctx, &mut scratch, dims, first, norm.factor(n, false), (in_pin.buffer(), in_bytes), (&target.0, target.1))?;
+    dims = half;
+    let mut current = target;
+    for (i, &axis) in rest.iter().enumerate() {
+        let last = i + 1 == rest.len();
+        let next = if last { (out_pin.buffer().clone(), out_bytes) } else { (scratch.take(half_bytes)?, half_bytes) };
+        let factor = if matches!(norm, FftNorm::Scale(_)) { 1.0 } else { norm.factor(dims[axis], false) };
+        run_axis(
+            ctx,
+            &mut scratch,
+            geometry(dims, axis)?,
+            false,
+            factor,
+            &AxisIo { src: (&current.0, current.1), dst: (&next.0, next.1), load: LoadKind::Complex, store: StoreKind::Complex, n_in: None, n_out: None, n_full: 0, store_table: None, load_table: None },
+        )?;
+        current = next;
+    }
+    Ok(output)
+}
+
+/// The real signal of `n` points along the first of `axes` from a half spectrum: the other
+/// axes are inverse complex transforms first.
+fn run_real_inverse(
+    input: &Array<C32>,
+    axes: &[usize],
+    n: usize,
+    norm: FftNorm,
+    product: Option<&Array<C32>>,
+) -> Outcome<Array<f32>> {
+    let ctx = input.context();
+    let dims = input.shape().dims();
+    for &a in axes {
+        check_axis(a)?;
+    }
+    let Some(&first) = axes.first() else {
+        return Err(LumaError::InvalidShape("irfft needs at least one axis".into()).into());
+    };
+    if n == 0 || dims[first] != n / 2 + 1 {
+        return Err(LumaError::InvalidShape(format!("irfft of {n} points needs {} frequencies along axis {first}, not {}", n / 2 + 1, dims[first])).into());
+    }
+    let mut out_dims = dims;
+    out_dims[first] = n;
+    let output = Array::<f32>::alloc(ctx, Shape::from(out_dims))?;
+    if dims.contains(&0) {
+        return Ok(output);
+    }
+    let (in_pin, in_bytes) = input.ready()?;
+    let (out_pin, out_bytes) = output.ready()?;
+    let table = product.map(|t| t.ready()).transpose()?;
+    let table = table.as_ref().map(|(pin, bytes)| (pin.buffer(), *bytes));
+    let mut scratch = Scratch::new(ctx);
+    let rest = &axes[1..];
+    let mut current = (in_pin.buffer().clone(), in_bytes);
+    for (i, &axis) in rest.iter().enumerate() {
+        let load_table = if i == 0 { table.map(|(b, bytes)| (b, bytes, Table::Slab)) } else { None };
+        let next = (scratch.take(bytes_of(dims))?, bytes_of(dims));
+        let factor = if matches!(norm, FftNorm::Scale(_)) { 1.0 } else { norm.factor(dims[axis], true) };
+        run_axis(
+            ctx,
+            &mut scratch,
+            geometry(dims, axis)?,
+            true,
+            factor,
+            &AxisIo { src: (&current.0, current.1), dst: (&next.0, next.1), load: LoadKind::Complex, store: StoreKind::Complex, n_in: None, n_out: None, n_full: 0, store_table: None, load_table },
+        )?;
+        current = next;
+    }
+    let product = if rest.is_empty() { table } else { None };
+    real_inverse(ctx, &mut scratch, out_dims, first, norm.factor(n, true), (&current.0, current.1), (out_pin.buffer(), out_bytes), product)?;
+    Ok(output)
+}
+
+fn complex_input(input: &Array<C32>) -> Outcome<(luma_core::Buffer, u64)> {
+    let (pin, bytes) = input.ready()?;
+    Ok((pin.buffer().clone(), bytes))
+}
+
 impl Array<C32> {
     /// The discrete Fourier transform along axis 0, batched over the other axes:
-    /// `X[k] = sum_n x[n] e^(-2 pi i n k / N)`. Any length is allowed (powers of two and products
-    /// of small primes run as a few passes over the data; other lengths use Bluestein's
-    /// algorithm, a few times slower). Errors poison the result like other operations.
+    /// `X[k] = sum_n x[n] e^(-2 pi i n k / N)`, unscaled. Any length is allowed: powers of two
+    /// and products of small primes run as a few passes over the data, other lengths use
+    /// Bluestein's algorithm (several times slower). Errors poison the result like other
+    /// operations.
     #[track_caller]
     pub fn fft(&self) -> Array<C32> {
         self.fft_axes(&[0], FftNorm::Backward)
     }
 
-    /// The inverse transform along axis 0 ([`FftNorm::Backward`]: divided by `N`).
+    /// The inverse transform along axis 0, divided by `N` (so `x.fft().ifft()` is `x`).
     #[track_caller]
     pub fn ifft(&self) -> Array<C32> {
         self.ifft_axes(&[0], FftNorm::Backward)
@@ -661,7 +904,7 @@ impl Array<C32> {
         self.fft_axes(&[0, 1], FftNorm::Backward)
     }
 
-    /// The two-dimensional inverse transform over axes 0 and 1.
+    /// The two-dimensional inverse transform over axes 0 and 1, divided by `N0 N1`.
     #[track_caller]
     pub fn ifft2(&self) -> Array<C32> {
         self.ifft_axes(&[0, 1], FftNorm::Backward)
@@ -679,12 +922,12 @@ impl Array<C32> {
         self.ifft_axes(&[0, 1, 2], FftNorm::Backward)
     }
 
-    /// The transform over several axes (in the order given), scaled by `norm` (for
-    /// [`FftNorm::Scale`], once in all).
+    /// The transform over several axes (one after the other, in the order given), scaled by
+    /// `norm` ([`FftNorm::Scale`] once in all).
     #[track_caller]
     pub fn fft_axes(&self, axes: &[usize], norm: FftNorm) -> Array<C32> {
         let location = Location::caller();
-        let result = run_complex(self, axes, false, norm);
+        let result = complex_input(self).and_then(|src| run_complex(self.context(), self.shape().dims(), src, Input::Complex, axes, false, norm));
         Array::resolve(self.context(), self.shape(), result, "fft", location)
     }
 
@@ -692,7 +935,204 @@ impl Array<C32> {
     #[track_caller]
     pub fn ifft_axes(&self, axes: &[usize], norm: FftNorm) -> Array<C32> {
         let location = Location::caller();
-        let result = run_complex(self, axes, true, norm);
+        let result = complex_input(self).and_then(|src| run_complex(self.context(), self.shape().dims(), src, Input::Complex, axes, true, norm));
         Array::resolve(self.context(), self.shape(), result, "ifft", location)
+    }
+
+    /// The real signal of `n` points along axis 0 whose half spectrum (`n / 2 + 1` values) this
+    /// is, divided by `n` ([`FftNorm::Backward`]): the inverse of [`Array::<f32>::rfft`]. The
+    /// imaginary parts of the zero and (for even `n`) Nyquist frequencies are ignored.
+    #[track_caller]
+    pub fn irfft(&self, n: usize) -> Array<f32> {
+        self.irfft_axes(&[0], n, FftNorm::Backward)
+    }
+
+    /// The inverse of [`Array::<f32>::rfft2`]: complex inverse transform along axis 1, then the
+    /// real one along axis 0, which has `n0` points.
+    #[track_caller]
+    pub fn irfft2(&self, n0: usize) -> Array<f32> {
+        self.irfft_axes(&[0, 1], n0, FftNorm::Backward)
+    }
+
+    /// The inverse of [`Array::<f32>::rfft3`].
+    #[track_caller]
+    pub fn irfft3(&self, n0: usize) -> Array<f32> {
+        self.irfft_axes(&[0, 1, 2], n0, FftNorm::Backward)
+    }
+
+    /// The inverse of [`Array::<f32>::rfft_axes`]: the first axis of `axes` is the real one and
+    /// gets `n` points, the others are inverse complex transforms.
+    #[track_caller]
+    pub fn irfft_axes(&self, axes: &[usize], n: usize, norm: FftNorm) -> Array<f32> {
+        let location = Location::caller();
+        let mut dims = self.shape().dims();
+        if let Some(&a) = axes.first().filter(|&&a| a < 4) {
+            dims[a] = n;
+        }
+        let result = run_real_inverse(self, axes, n, norm, None);
+        Array::resolve(self.context(), Shape::from(dims), result, "irfft", location)
+    }
+}
+
+impl Array<f32> {
+    /// The transform of a real signal along axis 0: all `N` frequencies (the upper half is the
+    /// conjugate of the lower), see [`Array::<C32>::fft`]. [`Array::<f32>::rfft`] computes only the
+    /// half that is not redundant, in about half the time.
+    #[track_caller]
+    pub fn fft(&self) -> Array<C32> {
+        self.fft_axes(&[0], FftNorm::Backward)
+    }
+
+    /// The transform of a real array along `axis`.
+    #[track_caller]
+    pub fn fft_axis(&self, axis: usize, norm: FftNorm) -> Array<C32> {
+        self.fft_axes(&[axis], norm)
+    }
+
+    /// The transform of a real array over several axes.
+    #[track_caller]
+    pub fn fft_axes(&self, axes: &[usize], norm: FftNorm) -> Array<C32> {
+        let location = Location::caller();
+        let result = self.ready().map_err(Into::into).and_then(|(pin, bytes): (_, u64)| {
+            run_complex(self.context(), self.shape().dims(), (pin.buffer().clone(), bytes), Input::Real, axes, false, norm)
+        });
+        Array::resolve(self.context(), self.shape(), result, "fft", location)
+    }
+
+    /// The transform of a real signal along axis 0, batched over the other axes: the first
+    /// `N / 2 + 1` frequencies (the rest is their conjugate mirror), which is what
+    /// ArrayFire's `fftR2C` returns. Even lengths run as a complex transform of half the length.
+    #[track_caller]
+    pub fn rfft(&self) -> Array<C32> {
+        self.rfft_axes(&[0], FftNorm::Backward)
+    }
+
+    /// The half spectrum along `axis`.
+    #[track_caller]
+    pub fn rfft_axis(&self, axis: usize, norm: FftNorm) -> Array<C32> {
+        self.rfft_axes(&[axis], norm)
+    }
+
+    /// The two-dimensional transform of real input: halved along axis 0, complete along axis 1.
+    #[track_caller]
+    pub fn rfft2(&self) -> Array<C32> {
+        self.rfft_axes(&[0, 1], FftNorm::Backward)
+    }
+
+    /// The three-dimensional transform of real input: halved along axis 0.
+    #[track_caller]
+    pub fn rfft3(&self) -> Array<C32> {
+        self.rfft_axes(&[0, 1, 2], FftNorm::Backward)
+    }
+
+    /// The transform of real input over several axes: the first of `axes` is halved (to
+    /// `N / 2 + 1`), the others are complex transforms of the result.
+    #[track_caller]
+    pub fn rfft_axes(&self, axes: &[usize], norm: FftNorm) -> Array<C32> {
+        let location = Location::caller();
+        let mut dims = self.shape().dims();
+        if let Some(&a) = axes.first().filter(|&&a| a < 4) {
+            dims[a] = dims[a] / 2 + 1;
+        }
+        let result = run_real_forward(self, axes, norm);
+        Array::resolve(self.context(), Shape::from(dims), result, "rfft", location)
+    }
+}
+
+/// The smallest even length of at least `n` that is a product of 2, 3 and 5.
+fn fft_size(n: usize) -> usize {
+    let smooth = |mut m: usize| {
+        for p in [2, 3, 5] {
+            while m % p == 0 {
+                m /= p;
+            }
+        }
+        m == 1
+    };
+    (n.max(2)..).find(|&m| m % 2 == 0 && smooth(m)).expect("a smooth number exists")
+}
+
+/// The convolution of the first `nd` axes of `signal` with `kernel`, batched over the others.
+fn run_convolve(signal: &Array<f32>, kernel: &Array<f32>, nd: usize, mode: ConvMode) -> Outcome<Array<f32>> {
+    if !signal.context().same_as(kernel.context()) {
+        return Err(LumaError::ContextMismatch.into());
+    }
+    let (s, k) = (signal.shape().dims(), kernel.shape().dims());
+    for d in 0..4 {
+        let ok = if d < nd { s[d] > 0 && k[d] > 0 } else { k[d] == 1 };
+        if !ok {
+            return Err(LumaError::InvalidShape(format!(
+                "fft_convolve{nd}: signal {s:?} and kernel {k:?} (the kernel must be non-empty along the first {nd} axes and 1 along the others)"
+            ))
+            .into());
+        }
+    }
+    let mut padded = s;
+    let mut widths_s = [(0usize, 0usize); 4];
+    let mut widths_k = [(0usize, 0usize); 4];
+    for d in 0..nd {
+        padded[d] = fft_size(s[d] + k[d] - 1);
+        widths_s[d] = (0, padded[d] - s[d]);
+        widths_k[d] = (0, padded[d] - k[d]);
+    }
+    let pad = |a: &Array<f32>, w: [(usize, usize); 4]| a.pad(w, PadMode::Zero);
+    let axes: Vec<usize> = (0..nd).collect();
+    let spectrum = pad(signal, widths_s).rfft_axes(&axes, FftNorm::None);
+    let kernel_spectrum = pad(kernel, widths_k).rfft_axes(&axes, FftNorm::None);
+    // Inverse in the reverse order: the last forward axis first, where the product happens.
+    let mut inverse_axes = vec![0];
+    inverse_axes.extend((1..nd).rev());
+    let full = run_real_inverse(&spectrum, &inverse_axes, padded[0], FftNorm::Backward, Some(&kernel_spectrum))?;
+    let mut out = full;
+    for d in 0..nd {
+        let (start, len) = match mode {
+            ConvMode::Full => (0, s[d] + k[d] - 1),
+            ConvMode::Same => (k[d] / 2, s[d]),
+        };
+        if len != padded[d] || start != 0 {
+            out = out.slice(d, start..start + len);
+        }
+    }
+    Ok(out)
+}
+
+impl Array<f32> {
+    /// The convolution of the signal with a kernel along axis 0 by FFTs (batched over the other
+    /// axes; the kernel must be 1 along them): both are zero-padded to a fast length, multiplied
+    /// in the frequency domain and transformed back. [`ConvMode::Same`] returns the signal's
+    /// shape (the kernel centred as ArrayFire does), [`ConvMode::Full`] the whole
+    /// `signal + kernel - 1` points.
+    #[track_caller]
+    pub fn fft_convolve1(&self, kernel: &Array<f32>, mode: ConvMode) -> Array<f32> {
+        self.fft_convolve_nd(kernel, 1, mode)
+    }
+
+    /// The two-dimensional convolution over axes 0 and 1 by FFTs, batched over axes 2 and 3 (see
+    /// [`Array::fft_convolve1`]).
+    #[track_caller]
+    pub fn fft_convolve2(&self, kernel: &Array<f32>, mode: ConvMode) -> Array<f32> {
+        self.fft_convolve_nd(kernel, 2, mode)
+    }
+
+    /// The three-dimensional convolution over axes 0, 1 and 2 by FFTs, batched over axis 3 (see
+    /// [`Array::fft_convolve1`]).
+    #[track_caller]
+    pub fn fft_convolve3(&self, kernel: &Array<f32>, mode: ConvMode) -> Array<f32> {
+        self.fft_convolve_nd(kernel, 3, mode)
+    }
+
+    #[track_caller]
+    fn fft_convolve_nd(&self, kernel: &Array<f32>, nd: usize, mode: ConvMode) -> Array<f32> {
+        let location = Location::caller();
+        let (s, k) = (self.shape().dims(), kernel.shape().dims());
+        let mut dims = s;
+        for d in 0..nd {
+            dims[d] = match mode {
+                ConvMode::Same => s[d],
+                ConvMode::Full => s[d] + k[d].max(1) - 1,
+            };
+        }
+        let result = run_convolve(self, kernel, nd, mode);
+        Array::resolve(self.context(), Shape::from(dims), result, "fft_convolve", location)
     }
 }

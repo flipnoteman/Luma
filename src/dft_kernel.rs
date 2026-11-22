@@ -301,17 +301,17 @@ fn load_value(pass: &DftPass) -> String {
         LoadKind::Complex => "v = src[gi];".to_string(),
         LoadKind::Real => "v = vec2<f32>(src[gi], 0.0);".to_string(),
         LoadKind::RealPair => {
-            "let u = gi - o * p.in_os; let ii = u % p.inner;\nlet i0 = 2u * o * p.in_os + 2u * u - ii;\nv = vec2<f32>(src[i0], src[i0 + p.inner]);".to_string()
+            "let u = gi - ob * p.in_os; let ii = u % p.inner;\nlet i0 = 2u * ob * p.in_os + 2u * u - ii;\nv = vec2<f32>(src[i0], src[i0 + p.inner]);".to_string()
         }
         LoadKind::Hermitian => {
-            "let u = gi - o * p.in_os; let ii = u % p.inner;\nif (n < p.n_in) { v = src[gi]; } else { let g2 = o * p.in_os + (p.n_full - n) * p.inner + ii; let z = src[g2]; v = vec2<f32>(z.x, -z.y); }".to_string()
+            "let u = gi - ob * p.in_os; let ii = u % p.inner;\nif (n < p.n_in) { v = src[gi]; } else { let g2 = ob * p.in_os + (p.n_full - n) * p.inner + ii; let z = src[g2]; v = vec2<f32>(z.x, -z.y); }".to_string()
         }
     };
     let _ = writeln!(s, "{guard}{{ {raw}");
     match pass.load_table {
         Table::None => {}
         Table::Line => s.push_str("v = cmul(v, ltab[n]);\n"),
-        Table::Slab => s.push_str("v = cmul(v, ltab[gi - o * p.in_os]);\n"),
+        Table::Slab => s.push_str("v = cmul(v, ltab[gi - ob * p.in_os]);\n"),
     }
     s.push_str("}\n");
     s
@@ -326,14 +326,14 @@ fn store_value(pass: &DftPass) -> String {
     match pass.store_table {
         Table::None => {}
         Table::Line => s.push_str("v = cmul(v, stab[nat]);\n"),
-        Table::Slab => s.push_str("v = cmul(v, stab[go - o * p.out_os]);\n"),
+        Table::Slab => s.push_str("v = cmul(v, stab[go - ob * p.out_os]);\n"),
     }
     s.push_str("v = v * p.scale;\n");
     let write = match pass.store {
         StoreKind::Complex => "dst[go] = v;".to_string(),
         StoreKind::Real => "dst[go] = v.x;".to_string(),
         StoreKind::RealPair => {
-            "let u = go - o * p.out_os; let i0 = 2u * o * p.out_os + 2u * u - ii;\ndst[i0] = v.x; dst[i0 + p.inner] = v.y;".to_string()
+            "let u = go - ob * p.out_os; let i0 = 2u * ob * p.out_os + 2u * u - ii;\ndst[i0] = v.x; dst[i0 + p.inner] = v.y;".to_string()
         }
     };
     let guard = if pass.store_limit { "if (nat < p.n_out) " } else { "" };
@@ -427,6 +427,7 @@ fn main(
     var v = vec2<f32>(0.0, 0.0);
     if ((rho0 + r) < p.rows) {{
         let gi = in_base + r * p.in_rs + d * p.in_ds;
+        let ob = o + select(0u, r, p.j == 1u);
         let mrow = m0 + r * p.mrs;
         {}
         v.y = v.y * p.cj;
@@ -456,6 +457,7 @@ workgroupBarrier();
         "for (var e = lid; e < {tile}u; e = e + {WORKGROUP}u) {{
     let r = {r_store}; let k = {k_store};
     if ((rho0 + r) < p.rows) {{
+        let ob = o + select(0u, r, p.j == 1u);
         {reverse}var v = sh[{}];
         {twiddle}v.y = v.y * p.cj;
         {}

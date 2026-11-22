@@ -1,7 +1,7 @@
 //! Fourier transforms against an `f64` host reference.
 
 use crate::common::values;
-use luma::{Array, Context, FftNorm, C32};
+use luma::{Array, ConvMode, Context, FftNorm, C32};
 
 type Z = (f64, f64);
 
@@ -191,4 +191,161 @@ fn empty_and_single_point_arrays() {
     assert_eq!(one.ifft().to_vec().unwrap(), vec![C32::new(2.0, -3.0)]);
     let bad = one.fft_axis(4, FftNorm::Backward);
     assert!(bad.to_vec().is_err());
+}
+
+fn real_signal(n: usize, seed: u64) -> Vec<f32> {
+    values(n, seed, -1.0, 1.0)
+}
+
+fn lift(x: &[f32]) -> Vec<Z> {
+    x.iter().map(|&v| (f64::from(v), 0.0)).collect()
+}
+
+#[test]
+fn real_input_fft_and_rfft() {
+    let ctx = Context::new().unwrap();
+    for &n in &[1usize, 2, 3, 4, 5, 6, 8, 9, 10, 12, 16, 30, 31, 37, 64, 74, 100, 127, 128, 250, 1000, 1024, 2050, 4096, 8192, 10007, 10010] {
+        let x = real_signal(n, 11 + n as u64);
+        let a = Array::from_slice_on(&ctx, &x, n).unwrap();
+        let want = dft(&lift(&x), false);
+        check(&a.fft().to_vec().unwrap(), &want, 1e-5, &format!("real fft {n}"));
+        let half = a.rfft();
+        assert_eq!(half.shape().dims()[0], n / 2 + 1);
+        check(&half.to_vec().unwrap(), &want[..n / 2 + 1], 1e-5, &format!("rfft {n}"));
+        let back = half.irfft(n).to_vec().unwrap();
+        let got: Vec<Z> = lift(&back);
+        check_real(&got, &x, 1e-5, &format!("irfft {n}"));
+    }
+}
+
+fn check_real(got: &[Z], want: &[f32], tol: f64, what: &str) {
+    let w: Vec<Z> = lift(want);
+    let g: Vec<C32> = got.iter().map(|z| C32::new(z.0 as f32, z.1 as f32)).collect();
+    check(&g, &w, tol, what);
+}
+
+#[test]
+fn rfft_along_other_axes_and_in_2d_and_3d() {
+    let ctx = Context::new().unwrap();
+    for dims in [[10usize, 6, 3, 2], [7, 12, 4, 1], [16, 16, 16, 1], [9, 20, 2, 3]] {
+        let len: usize = dims.iter().product();
+        let x = real_signal(len, 9 + len as u64);
+        let a = Array::from_slice_on(&ctx, &x, dims).unwrap();
+        let full = to_z_real(&x);
+        for axis in 0..4 {
+            let want = along(&full, dims, axis, false);
+            let got = a.rfft_axis(axis, FftNorm::None);
+            let mut d = dims;
+            d[axis] = dims[axis] / 2 + 1;
+            assert_eq!(got.shape().dims(), d);
+            let want = take_half(&want, dims, axis);
+            check(&got.to_vec().unwrap(), &want, 1e-5, &format!("{dims:?} rfft axis {axis}"));
+            let back = got.irfft_axes(&[axis], dims[axis], FftNorm::None).to_vec().unwrap();
+            let scaled: Vec<f32> = x.iter().map(|v| v * dims[axis] as f32).collect();
+            check_real(&lift(&back), &scaled, 1e-5, &format!("{dims:?} irfft axis {axis}"));
+        }
+        let w2 = along(&along(&full, dims, 0, false), dims, 1, false);
+        let h2 = a.rfft2();
+        check(&h2.to_vec().unwrap(), &take_half(&w2, dims, 0), 1e-5, &format!("{dims:?} rfft2"));
+        check_real(&lift(&h2.irfft2(dims[0]).to_vec().unwrap()), &x, 1e-5, &format!("{dims:?} irfft2"));
+        let w3 = along(&w2, dims, 2, false);
+        let h3 = a.rfft3();
+        check(&h3.to_vec().unwrap(), &take_half(&w3, dims, 0), 1e-5, &format!("{dims:?} rfft3"));
+        check_real(&lift(&h3.irfft3(dims[0]).to_vec().unwrap()), &x, 1e-5, &format!("{dims:?} irfft3"));
+    }
+}
+
+fn to_z_real(x: &[f32]) -> Vec<Z> {
+    lift(x)
+}
+
+/// The first `dims[axis] / 2 + 1` entries along `axis`.
+fn take_half(x: &[Z], dims: [usize; 4], axis: usize) -> Vec<Z> {
+    let stride: usize = dims[..axis].iter().product();
+    let keep = dims[axis] / 2 + 1;
+    x.iter().enumerate().filter(|(i, _)| (i / stride) % dims[axis] < keep).map(|(_, z)| *z).collect()
+}
+
+/// The full linear convolution of the first `nd` axes of `x` (dims `sd`) with `k` (dims `kd`),
+/// batched over the rest, in `f64`.
+fn convolve_ref(x: &[f32], sd: [usize; 4], k: &[f32], kd: [usize; 4], nd: usize) -> (Vec<f64>, [usize; 4]) {
+    let mut od = sd;
+    for d in 0..nd {
+        od[d] = sd[d] + kd[d] - 1;
+    }
+    let mut out = vec![0.0f64; od.iter().product()];
+    let at = |dims: [usize; 4], c: [usize; 4]| c[0] + dims[0] * (c[1] + dims[1] * (c[2] + dims[2] * c[3]));
+    for c3 in 0..sd[3] {
+        for c2 in 0..sd[2] {
+            for c1 in 0..sd[1] {
+                for c0 in 0..sd[0] {
+                    let v = f64::from(x[at(sd, [c0, c1, c2, c3])]);
+                    for j2 in 0..kd[2] {
+                        for j1 in 0..kd[1] {
+                            for j0 in 0..kd[0] {
+                                let o = at(od, [c0 + j0, c1 + j1, c2 + j2, c3]);
+                                out[o] += v * f64::from(k[at(kd, [j0, j1, j2, 0])]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (out, od)
+}
+
+fn crop(full: &[f64], od: [usize; 4], sd: [usize; 4], kd: [usize; 4], nd: usize) -> Vec<f64> {
+    let mut out = Vec::new();
+    for c3 in 0..sd[3] {
+        for c2 in 0..sd[2] {
+            for c1 in 0..sd[1] {
+                for c0 in 0..sd[0] {
+                    let mut c = [c0, c1, c2, c3];
+                    for d in 0..nd {
+                        c[d] += kd[d] / 2;
+                    }
+                    out.push(full[c[0] + od[0] * (c[1] + od[1] * (c[2] + od[2] * c[3]))]);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn fft_convolution_matches_direct_sums() {
+    let ctx = Context::new().unwrap();
+    let cases: &[(usize, [usize; 4], [usize; 4])] = &[
+        (1, [100, 1, 1, 1], [7, 1, 1, 1]),
+        (1, [33, 4, 2, 1], [8, 1, 1, 1]),
+        (2, [20, 17, 1, 1], [5, 3, 1, 1]),
+        (2, [16, 16, 3, 2], [4, 6, 1, 1]),
+        (2, [31, 9, 2, 1], [1, 1, 1, 1]),
+        (3, [10, 9, 8, 2], [3, 4, 2, 1]),
+        (3, [12, 12, 12, 1], [5, 5, 5, 1]),
+    ];
+    for &(nd, sd, kd) in cases {
+        let (sl, kl): (usize, usize) = (sd.iter().product(), kd.iter().product());
+        let x = real_signal(sl, 21 + sl as u64);
+        let k = real_signal(kl, 22 + kl as u64);
+        let (a, b) = (Array::from_slice_on(&ctx, &x, sd).unwrap(), Array::from_slice_on(&ctx, &k, kd).unwrap());
+        let (full, od) = convolve_ref(&x, sd, &k, kd, nd);
+        let run = |mode| match nd {
+            1 => a.fft_convolve1(&b, mode),
+            2 => a.fft_convolve2(&b, mode),
+            _ => a.fft_convolve3(&b, mode),
+        };
+        let got = run(ConvMode::Full);
+        assert_eq!(got.shape().dims(), od, "full shape {nd}");
+        check_real(&got.to_vec().unwrap().iter().map(|&v| (f64::from(v), 0.0)).collect::<Vec<_>>(), &full.iter().map(|&v| v as f32).collect::<Vec<_>>(), 1e-4, &format!("{nd}-D full {sd:?} * {kd:?}"));
+        let got = run(ConvMode::Same);
+        assert_eq!(got.shape().dims(), sd, "same shape {nd}");
+        let want = crop(&full, od, sd, kd, nd);
+        check_real(&got.to_vec().unwrap().iter().map(|&v| (f64::from(v), 0.0)).collect::<Vec<_>>(), &want.iter().map(|&v| v as f32).collect::<Vec<_>>(), 1e-4, &format!("{nd}-D same {sd:?} * {kd:?}"));
+    }
+    // A kernel with a batch dimension is rejected.
+    let a = Array::from_slice_on(&ctx, &real_signal(16, 1), [4, 4]).unwrap();
+    let b = Array::from_slice_on(&ctx, &real_signal(8, 2), [2, 2, 2]).unwrap();
+    assert!(a.fft_convolve2(&b, ConvMode::Full).to_vec().is_err());
 }
