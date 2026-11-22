@@ -71,7 +71,7 @@ pub(crate) fn plan(ctx: &crate::Context, m: usize, w: usize) -> Option<Plan> {
         .min_by_key(|&(_, cost)| cost)?;
     let bs = groups * 32;
     // The matrices of the other launches live in workgroup memory.
-    let smem = 4 * 1024 * 5 + 1024;
+    let smem = 4 * 1024 * 7 + 1024;
     (limits.max_workgroup_storage_bytes as usize >= smem).then_some(Plan { groups, bs, k: m.div_ceil(bs) })
 }
 
@@ -303,54 +303,31 @@ fn unit_lower(src: &str, at: &str, row: &str) -> String {
     format!("select(select(0.0, 1.0, {row} == c), {src}[({at}) * w + c], {row} > c)")
 }
 
-/// One workgroup: from the stack's factor `f1`, `t1` and the first block's factor `f0`, `t0` the
-/// top block of the panel's factor (written to `f`), its `T` and `tau`, and for the launch that follows
-/// `aux`: `Y = T' V1'ᵀ` (at 0) and the inverse of `U` (at 1024), both 32 x 32 with a row stride of 32.
-fn recon_source() -> String {
-    const THREADS: usize = 256;
-    let mut s = String::from(
-        "struct Params { m: u32, w: u32, k: u32, bs: u32, wv: u32 }
-@group(1) @binding(0) var<storage, read_write> f1: array<f32>;
-@group(1) @binding(1) var<storage, read_write> t1: array<f32>;
-@group(1) @binding(2) var<storage, read_write> f0: array<f32>;
-@group(1) @binding(3) var<storage, read_write> t0: array<f32>;
-@group(1) @binding(4) var<storage, read_write> f: array<f32>;
-@group(1) @binding(5) var<storage, read_write> tau: array<f32>;
-@group(1) @binding(6) var<storage, read_write> tf: array<f32>;
-@group(1) @binding(7) var<storage, read_write> aux: array<f32>;
-@group(1) @binding(8) var<storage, read_write> vo: array<f32>;
-@group(1) @binding(9) var<uniform> p: Params;
-var<workgroup> m0: array<f32, 1024>;
-var<workgroup> m1: array<f32, 1024>;
-var<workgroup> m2: array<f32, 1024>;
-var<workgroup> m3: array<f32, 1024>;
-var<workgroup> sg: array<f32, 32>;
-var<workgroup> pr: array<f32, 64>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(local_invocation_index) t: u32) {
-    let w = p.w;
-",
-    );
-    s += &fetch(THREADS, "ft", "true", "t1[a * w + c]");
-    s += &fetch(THREADS, "fv", "true", &unit_lower("f1", "a", "a"));
-    s += &fetch(THREADS, "gv", "true", &unit_lower("f0", "a", "a"));
-    s += &fetch(THREADS, "gt", "true", "t0[a * w + c]");
+/// The part of [`down_source`] every workgroup computes for itself (the first one writes the
+/// results): from the stack's factor `f1`, `t1` and the first block's factor `f0`, `t0` the top
+/// block of the panel's factor (to `f` and `vo`), its `T` and `tau`, and for the rows below `Y = T' V1'ᵀ`
+/// (in `yy`) and the inverse of `U` (in `ui`), both 32 x 32 with a row stride of 32.
+fn recon_body(threads: usize) -> String {
+    let mut s = String::new();
+    s += &fetch(threads, "rft", "true", "t1[a * w + c]");
+    s += &fetch(threads, "rfv", "true", &unit_lower("f1", "a", "a"));
+    s += &fetch(threads, "rgv", "true", &unit_lower("f0", "a", "a"));
+    s += &fetch(threads, "rgt", "true", "t0[a * w + c]");
     // m0 = T', m1 = V1' (unit lower).
-    s += &store(THREADS, "m0", "ft");
-    s += &store(THREADS, "m1", "fv");
-    // Y = T' V1'ᵀ (kept in m2 and in aux).
-    s += &mm(THREADS, "m2", "m0[@A@ * 32u + @Q@]", "m1[@C@ * 32u + @Q@]", "@ACC@");
-    s += "    for (var idx = t; idx < 1024u; idx = idx + 256u) { aux[idx] = m2[idx]; }\n";
+    s += &store(threads, "m0", "rft");
+    s += &store(threads, "m1", "rfv");
+    // Y = T' V1'ᵀ (kept in m2 and in yy).
+    s += &mm(threads, "m2", "m0[@A@ * 32u + @Q@]", "m1[@C@ * 32u + @Q@]", "@ACC@");
+    s += &format!("    for (var idx = t; idx < 1024u; idx = idx + {threads}u) {{ yy[idx] = m2[idx]; }}\n");
     // X0 = I - V1' Y (m3).
-    s += &mm(THREADS, "m3", "m1[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@) - @ACC@");
+    s += &mm(threads, "m3", "m1[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@) - @ACC@");
     // The first block's top: m0 = V01 (unit lower), m1 = T0.
-    s += &store(THREADS, "m0", "gv");
-    s += &store(THREADS, "m1", "gt");
+    s += &store(threads, "m0", "rgv");
+    s += &store(threads, "m1", "rgt");
     // P = T0 V01ᵀ (m2), M = I - V01 P (m1), Q1top = M X0 (m0).
-    s += &mm(THREADS, "m2", "m1[@A@ * 32u + @Q@]", "m0[@C@ * 32u + @Q@]", "@ACC@");
-    s += &mm(THREADS, "m1", "m0[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@) - @ACC@");
-    s += &mm(THREADS, "m0", "m1[@A@ * 32u + @Q@]", "m3[@Q@ * 32u + @C@]", "@ACC@");
+    s += &mm(threads, "m2", "m1[@A@ * 32u + @Q@]", "m0[@C@ * 32u + @Q@]", "@ACC@");
+    s += &mm(threads, "m1", "m0[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@) - @ACC@");
+    s += &mm(threads, "m0", "m1[@A@ * 32u + @Q@]", "m3[@Q@ * 32u + @C@]", "@ACC@");
     // No pivot LU of Q1top - S, S chosen on the fly: a thread per row, the pivot row through `pr`.
     s += "    var r0 = 0.0;\n";
     s += &(1..32).map(|k| format!("    var r{k} = 0.0;\n")).collect::<String>();
@@ -387,7 +364,7 @@ fn main(@builtin(local_invocation_index) t: u32) {
         .map(|k| {
             let sub = (0..k).map(|q| format!("            acc = acc - m0[{}u] * tw{q};\n", k * 32 + q)).collect::<String>();
             format!(
-                "        if ({k}u < w) {{\n            var acc = -select(0.0, m0[a * 32u + {k}u], {k}u >= a) * sg[{k}];\n{sub}            tw{k} = acc;\n            tf[a * w + {k}u] = acc;\n            if (a == {k}u) {{ tau[a] = acc; }}\n        }}\n"
+                "        if ({k}u < w) {{\n            var acc = -select(0.0, m0[a * 32u + {k}u], {k}u >= a) * sg[{k}];\n{sub}            tw{k} = acc;\n            if (wid.x == 0u) {{ tf[a * w + {k}u] = acc; }}\n            if (wid.x == 0u && a == {k}u) {{ tau[a] = acc; }}\n        }}\n"
             )
         })
         .collect::<String>();
@@ -398,7 +375,7 @@ fn main(@builtin(local_invocation_index) t: u32) {
         .map(|k| {
             let sub = (k + 1..32).map(|q| format!("            acc = acc - m0[{}u] * z{q};\n", k * 32 + q)).collect::<String>();
             format!(
-                "        if ({k}u < w) {{\n            var acc = select(0.0, 1.0, cj == {k}u);\n{sub}            z{k} = acc / m0[{}u];\n            aux[1024u + {}u * 32u + cj] = z{k};\n        }}\n",
+                "        if ({k}u < w) {{\n            var acc = select(0.0, 1.0, cj == {k}u);\n{sub}            z{k} = acc / m0[{}u];\n            ui[{}u * 32u + cj] = z{k};\n        }}\n",
                 k * 33,
                 k
             )
@@ -407,21 +384,26 @@ fn main(@builtin(local_invocation_index) t: u32) {
     let zdecl = (0..32).map(|k| format!("        var z{k} = 0.0;\n")).collect::<String>();
     s += &format!("    if (t >= 32u && t < 64u && t - 32u < w) {{\n        let cj = t - 32u;\n{zdecl}{zrow}    }}\n");
     // The top block of the panel's factor: R = S R_tsqr above and on the diagonal, L below.
-    s += "    for (var idx = t; idx < w * w; idx = idx + 256u) {
-        let a = idx / w;
-        let c = idx - a * w;
-        f[idx] = select(m0[a * 32u + c], sg[a] * f1[idx], a <= c);
-        vo[idx] = select(select(0.0, 1.0, a == c), m0[a * 32u + c], a > c);
-    }
-}
-";
+    s += &format!(
+        "    if (wid.x == 0u) {{
+        for (var idx = t; idx < w * w; idx = idx + {threads}u) {{
+            let a = idx / w;
+            let c = idx - a * w;
+            f[idx] = select(m0[a * 32u + c], sg[a] * f1[idx], a <= c);
+            vo[idx] = select(select(0.0, 1.0, a == c), m0[a * 32u + c], a > c);
+        }}
+    }}
+    workgroupBarrier();
+"
+    );
     s
 }
 
-/// The rows of the panel's `V` below the top block: row `l` of block `i` is
+/// The rows of the panel's `V` below the top block, with the panel's top block (the first workgroup
+/// writes it, see [`recon_body`]): row `l` of block `i` is
 /// `V_i[l] N_i` (`+ X_i[l] U⁻¹` for the first `w` rows of a block but the first), with
 /// `X_i = [I; 0]_i - V'_i Y` the block's piece of the stack's `Q`, `W_i = T_i V_{i,1}ᵀ X_i`,
-/// `N_i = -W_i U⁻¹`.
+/// `N_i = -W_i U⁻¹`. Every workgroup computes the `w x w` matrices of its block itself.
 fn down_source() -> String {
     const THREADS: usize = CHUNK;
     let mut s = String::from(
@@ -429,14 +411,20 @@ fn down_source() -> String {
 @group(1) @binding(0) var<storage, read_write> f0: array<f32>;
 @group(1) @binding(1) var<storage, read_write> t0: array<f32>;
 @group(1) @binding(2) var<storage, read_write> f1: array<f32>;
-@group(1) @binding(3) var<storage, read_write> aux: array<f32>;
+@group(1) @binding(3) var<storage, read_write> t1: array<f32>;
 @group(1) @binding(4) var<storage, read_write> f: array<f32>;
 @group(1) @binding(5) var<storage, read_write> vo: array<f32>;
-@group(1) @binding(6) var<uniform> p: Params;
+@group(1) @binding(6) var<storage, read_write> tau: array<f32>;
+@group(1) @binding(7) var<storage, read_write> tf: array<f32>;
+@group(1) @binding(8) var<uniform> p: Params;
 var<workgroup> m0: array<f32, 1024>;
 var<workgroup> m1: array<f32, 1024>;
 var<workgroup> m2: array<f32, 1024>;
 var<workgroup> m3: array<f32, 1024>;
+var<workgroup> yy: array<f32, 1024>;
+var<workgroup> ui: array<f32, 1024>;
+var<workgroup> sg: array<f32, 32>;
+var<workgroup> pr: array<f32, 64>;
 var<workgroup> nv: array<vec4<f32>, 256>;
 
 @compute @workgroup_size(128)
@@ -452,10 +440,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 ",
     );
     s += &fetch(THREADS, "fv", "true", &unit_lower("f1", "(blk * w + a)", "(blk * w + a)"));
-    s += &fetch(THREADS, "fy", "true", "aux[idx]");
     s += &fetch(THREADS, "gv", "blk * p.bs + a < p.m", &unit_lower("f0", "(blk * p.bs + a)", "a"));
     s += &fetch(THREADS, "gt", "true", "t0[blk * w * w + a * w + c]");
-    s += &fetch(THREADS, "gu", "true", "aux[1024u + idx]");
     // The thread's row of the block's `V`.
     s += &(0..32).map(|q| format!("    var v{q} = 0.0;\n")).collect::<String>();
     s += "    if (mine) {\n";
@@ -466,20 +452,19 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         })
         .collect::<String>();
     s += "    }\n";
+    s += &recon_body(THREADS);
     // X_i = [I; 0]_i - V'_i Y.
     s += &store(THREADS, "m1", "fv");
-    s += &store(THREADS, "m2", "fy");
-    s += &mm(THREADS, "m0", "m1[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@ && blk == 0u) - @ACC@");
+    s += &mm(THREADS, "m0", "m1[@A@ * 32u + @Q@]", "yy[@Q@ * 32u + @C@]", "select(0.0, 1.0, @A@ == @C@ && blk == 0u) - @ACC@");
     // Z = V_{i,1}ᵀ X_i, W = T_i Z.
     s += &store(THREADS, "m1", "gv");
     s += &mm(THREADS, "m2", "m1[@Q@ * 32u + @A@]", "m0[@Q@ * 32u + @C@]", "@ACC@");
     s += &store(THREADS, "m1", "gt");
     s += &mm(THREADS, "m3", "m1[@A@ * 32u + @Q@]", "m2[@Q@ * 32u + @C@]", "@ACC@");
     // N = -W U⁻¹ (m2), X_i U⁻¹ (m3) where the rows of the block's top are rewritten.
-    s += &store(THREADS, "m1", "gu");
-    s += &mm(THREADS, "m2", "m3[@A@ * 32u + @Q@]", "m1[@Q@ * 32u + @C@]", "-@ACC@");
+    s += &mm(THREADS, "m2", "m3[@A@ * 32u + @Q@]", "ui[@Q@ * 32u + @C@]", "-@ACC@");
     s += "    if (blk > 0u && l0 == 0u) {\n";
-    s += &mm(THREADS, "m3", "m0[@A@ * 32u + @Q@]", "m1[@Q@ * 32u + @C@]", "@ACC@");
+    s += &mm(THREADS, "m3", "m0[@A@ * 32u + @Q@]", "ui[@Q@ * 32u + @C@]", "@ACC@");
     s += "    }\n";
     s += "    for (var q4 = t; q4 < 256u; q4 = q4 + 128u) {
         nv[q4] = vec4<f32>(m2[4u * q4], m2[4u * q4 + 1u], m2[4u * q4 + 2u], m2[4u * q4 + 3u]);
@@ -533,21 +518,17 @@ pub(crate) fn panel(a: &Array<f32>, plan: Plan) -> Result<[Array<f32>; 4], LumaE
     let mut t1 = Array::<f32>::alloc(ctx, Shape::from([w, w, 1]))?;
     let args: [KernelArg<'_>; 6] = [view(&f0), (&mut f1).into(), (&mut tau1).into(), (&mut t1).into(), (&mut nov).into(), uniform(&params)];
     launch(ctx, &format!("tsqr_factor/1/{g2}"), "tsqr_merge", || factor_source(g2, true), [1, 1, 1], &args)?;
-    let mut aux = Array::<f32>::alloc(ctx, Shape::from([32, 64, 1]))?;
-    let args: [KernelArg<'_>; 10] = [
-        (&mut f1).into(),
-        (&mut t1).into(),
+    let args: [KernelArg<'_>; 9] = [
         (&mut f0).into(),
         (&mut t0).into(),
+        (&mut f1).into(),
+        (&mut t1).into(),
         (&mut f).into(),
+        (&mut v).into(),
         (&mut tau).into(),
         (&mut t).into(),
-        (&mut aux).into(),
-        (&mut v).into(),
         uniform(&params),
     ];
-    launch(ctx, "tsqr_recon", "tsqr_recon", recon_source, [1, 1, 1], &args)?;
-    let args: [KernelArg<'_>; 7] = [(&mut f0).into(), (&mut t0).into(), (&mut f1).into(), (&mut aux).into(), (&mut f).into(), (&mut v).into(), uniform(&params)];
     launch(ctx, "tsqr_down", "tsqr_down", down_source, [(k * bs.div_ceil(CHUNK)) as u32, 1, 1], &args)?;
     Ok([f, v, tau, t])
 }
