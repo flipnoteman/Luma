@@ -22,7 +22,8 @@ fn wide(a: &luma::Array<Df32>) -> Vec<f32> {
 pub fn accumulate(b: &mut Bench) {
     b.guarded("accum", |b| {
         meanvar(b);
-        covariance(b);
+        covariance(b, 512, 1024, "A2 accumulate feature covariance matrix");
+        covariance(b, 4096, 256, "A2b accumulate feature covariance matrix (4096 features)");
         histogram(b);
         topk(b);
     });
@@ -93,18 +94,17 @@ fn meanvar(b: &mut Bench) {
     );
 }
 
-fn covariance(b: &mut Bench) {
+fn covariance(b: &mut Bench, f: usize, r: usize, name: &str) {
     let ctx = b.ctx.clone();
-    const F: usize = 512;
-    const R: usize = 1024;
+    let (feat, rows) = (f, r);
     let count = if b.quick { 8 } else { 32 };
-    let host: Vec<Vec<f32>> = (0..count).map(|i| uniform(F * R, 2000 + i as u64, 0.0, 1.0)).collect();
-    let lb: Vec<L> = host.iter().map(|d| lumax::arr(&ctx, d, [F, R])).collect();
-    let ab: Vec<A> = host.iter().map(|d| afx::arr(d, &[F as u64, R as u64])).collect();
+    let host: Vec<Vec<f32>> = (0..count).map(|i| uniform(feat * rows, 2000 + i as u64, 0.0, 1.0)).collect();
+    let lb: Vec<L> = host.iter().map(|d| lumax::arr(&ctx, d, [feat, rows])).collect();
+    let ab: Vec<A> = host.iter().map(|d| afx::arr(d, &[feat as u64, rows as u64])).collect();
     let all = af::join_many(1, ab.iter().collect());
     all.eval();
     afx::sync();
-    let n = (count * R) as f32;
+    let n = (count * rows) as f32;
     let acc = Covariance::<Df32>::new();
     let luma_run = |acc: &Covariance<Df32>| {
         acc.reset();
@@ -121,9 +121,9 @@ fn covariance(b: &mut Bench) {
     let lc = wide(&acc.cov().unwrap());
     let ac = afx::host(&af_cov());
     let verdict = compare(&lc, &ac, 5e-3, 2e-5);
-    let size = format!("{count} batches of 1024 x 512 (512 x 512 matrix)");
+    let size = format!("{count} batches of {rows} x {feat} ({feat} x {feat} matrix)");
     b.run(
-        "A2 accumulate feature covariance matrix",
+        name,
         &size,
         verdict,
         "luma: incremental pushes (full-f32 matmul of the centered batch, Df32 state); ArrayFire: center + SGEMM of the concatenated array (concatenation not timed)",
