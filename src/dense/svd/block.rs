@@ -7,13 +7,18 @@
 //!    one workgroup per pair and run of rows (the rows stream through workgroup memory [`TR`] at a
 //!    time, every invocation owns a 4 x 4 tile of the Gram matrix in registers);
 //! 2. `svd_eigen`: one workgroup per pair sums the partials, diagonalises `G` with cyclic
-//!    two-sided Jacobi in workgroup memory (`G = Q Λ Qᵀ`, up to [`INNER_SWEEPS`] sweeps) and writes `Q`;
+//!    two-sided Jacobi in workgroup memory (`G = Q Λ Qᵀ`, up to [`INNER_SWEEPS`] sweeps), makes `Q`
+//!    orthogonal to the last bit with a Newton-Schulz step (the product of the rotations is
+//!    orthogonal to a few 1e-7 only, and `V` is multiplied by thousands of them: without it the
+//!    backward error of a 4096 x 4096 decomposition was 5e-5, with it 7e-6) and writes `Q`;
 //! 3. `svd_apply`: the `2B` columns of `W` and of `V` are multiplied by `Q`, an invocation per row.
 //!
 //! One block round does the work of up to `2B - 1` rounds of the plain algorithm (which has `B`
 //! times more, `B` times shorter launches), and what streams over the rows is two reads and one
 //! write of the columns instead of a read and a write per rotation. A pair whose Gram matrix is
-//! diagonal enough to the tolerance is not rotated.
+//! diagonal enough to the tolerance is not rotated, nor is a pair with a column of a squared norm
+//! of at most `floor2` (when the singular values are only to be counted above a cut, see
+//! `decompose_ranking`).
 
 use super::{per_matrix, tolerance, ROTATION};
 use crate::array::Array;

@@ -757,16 +757,23 @@ const NEXT_CHUNK: u32 = 2;
 /// columns per workgroup.
 const BLOCK_MIN: usize = 128;
 
-/// Columns from which a big matrix is decomposed through the QR factorisation of its tall form
-/// (see [`preconditioned`]).
-fn precondition_min() -> usize {
-    std::env::var("LUMA_SVD_PRECOND").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
+/// Whether a big matrix of `rr >= cc` is decomposed through the QR factorisation of its tall form
+/// (see [`preconditioned`]): from 2048 columns on, and from [`BLOCK_MIN`] columns on when it is
+/// three times taller than wide (the Jacobi sweeps then work on the square `R` instead of on
+/// columns of all the rows). `LUMA_SVD_PRECOND=off` turns it off, a number changes the 2048.
+fn precondition(rr: usize, cc: usize) -> bool {
+    let setting = std::env::var("LUMA_SVD_PRECOND").ok();
+    if setting.as_deref() == Some("off") {
+        return false;
+    }
+    let min = setting.and_then(|v| v.parse().ok()).unwrap_or(2048);
+    cc >= min || (cc >= BLOCK_MIN && rr >= 3 * cc)
 }
 
 /// Decomposes one matrix (`[cols, rows]`) in global memory.
 fn big(a: &Array<f32>, kind: Kind, vectors: bool, tol: f32) -> Result<Outputs, LumaError> {
     let [cols, rows, ..] = a.shape().dims();
-    if kind == Kind::Svd && rows.min(cols) >= precondition_min() && tol == 0.0 {
+    if kind == Kind::Svd && tol == 0.0 && precondition(rows.max(cols), rows.min(cols)) {
         preconditioned(a, vectors)
     } else {
         plain(a, kind, vectors, tol)
@@ -1147,5 +1154,58 @@ fn big_rank(a: &Array<f32>, d: Dims, tol: f32, op: &'static str, loc: &'static L
     match (0..d.batch).map(one).collect::<Result<Vec<_>, _>>().and_then(|ranks| Array::from_slice_on(ctx, &ranks, shape)) {
         Ok(ranks) => ranks,
         Err(e) => Array::resolve(ctx, shape, Err(Failure::New(e)), op, loc),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Context;
+
+    fn matrix(ctx: &Context, rows: usize, cols: usize, rank: usize, seed: u64) -> Array<f32> {
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / 16777216.0) * 2.0 - 1.0
+        };
+        let b: Vec<f32> = (0..rows * rank).map(|_| next()).collect();
+        let c: Vec<f32> = (0..rank * cols).map(|_| next()).collect();
+        Array::from_slice_on(ctx, &b, [rank, rows]).unwrap().matmul_f32(&Array::from_slice_on(ctx, &c, [cols, rank]).unwrap()).cache()
+    }
+
+    fn max_abs(x: &Array<f32>) -> f32 {
+        x.abs().max().item().unwrap()
+    }
+
+    /// The decomposition through the QR factorisation (used from 2048 columns on) of tall, wide,
+    /// square and rank-deficient matrices: backward error, orthogonality, the values of the
+    /// decomposition without vectors.
+    #[test]
+    fn the_qr_preconditioned_decomposition_is_a_decomposition() {
+        let ctx = Context::new().unwrap();
+        for (rows, cols, rank) in [(150, 150, 150), (200, 130, 130), (130, 200, 130), (150, 150, 70)] {
+            let a = matrix(&ctx, rows, cols, rank, 9 + rows as u64);
+            let k = rows.min(cols);
+            let o = preconditioned(&a, true).unwrap();
+            let (u, s, vt) = (o.u.unwrap(), o.s.reshape([k, 1]), o.vt.unwrap());
+            assert_eq!(u.shape().dims()[..2], [k, rows]);
+            assert_eq!(vt.shape().dims()[..2], [cols, k]);
+            // A = U diag(s) Vt.
+            let recon = (&u * &s).matmul_f32(&vt);
+            let scale = max_abs(&a);
+            assert!(max_abs(&(&recon - &a)) <= 3e-5 * scale * (k as f32).sqrt(), "{rows}x{cols} rank {rank}: backward error {}", max_abs(&(&recon - &a)) / scale);
+            // Orthonormal columns of U, orthonormal rows of Vt.
+            let eye = |n: usize| {
+                let shape = Shape::from([n, n]);
+                select(&Array::<u32>::range_on(&ctx, shape, 0).unwrap().eq(Array::<u32>::range_on(&ctx, shape, 1).unwrap()), 1.0f32, 0.0f32)
+            };
+            assert!(max_abs(&(&u.matmul_tn(&u) - &eye(k))) < 1e-4, "{rows}x{cols}: U");
+            assert!(max_abs(&(&vt.matmul_nt(&vt) - &eye(k))) < 1e-4, "{rows}x{cols}: Vt");
+            // The values alone are the same, and sorted.
+            let alone = preconditioned(&a, false).unwrap().s.to_vec().unwrap();
+            let s = s.to_vec().unwrap();
+            assert!(alone.windows(2).all(|w| w[0] >= w[1]));
+            assert!(alone.iter().zip(&s).all(|(x, y)| (x - y).abs() <= 1e-4 * s[0]), "{rows}x{cols}: values");
+        }
     }
 }
