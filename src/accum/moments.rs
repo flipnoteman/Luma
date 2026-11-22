@@ -575,7 +575,7 @@ impl<W: Wide> Accumulator<W> {
     /// `other` may live on another device (the state travels through the host). Both must have
     /// the same settings and position shape; merging an empty accumulator changes nothing.
     pub fn merge(&self, other: &Accumulator<W>) -> Result<()> {
-        if self.cfg != other.cfg {
+        if (Config { flush_every: other.cfg.flush_every, ..self.cfg.clone() }) != other.cfg {
             return Err(invalid("accumulators with different settings cannot be merged"));
         }
         let snapshot = if std::ptr::eq(self, other) { self.snapshot()? } else { other.snapshot()? };

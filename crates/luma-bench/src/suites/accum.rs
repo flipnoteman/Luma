@@ -202,6 +202,53 @@ fn cov_cases(h: &mut Harness) {
             (matmul_f32(&d.transpose(), &d) / n).eval().unwrap();
         });
     }
+
+    // The full [256 rows, 4096 features] shape: a 4096 x 4096 matrix of sums of products (a
+    // product of 8.6 GFLOP per push).
+    if !h.ctx.is_cpu() && (h.want("cov/push_4096f") || h.want("cov/concat_4096f")) {
+        const FB: usize = 4096;
+        const RB: usize = 256;
+        let pushes = if h.quick { 8 } else { 32 };
+        let distinct = pushes.min(4);
+        let data = batches(h, distinct, [FB, RB], 550, 0.0, 1.0);
+        let parts: Vec<Array<f32>> = (0..pushes).map(|i| data[i % distinct].clone()).collect();
+        let size = format!("{pushes}x{FB}x{RB}");
+        let bytes = (pushes * FB * RB * 4) as f64;
+        {
+            // Verification: sampled entries against the host.
+            let acc = Covariance::<Df32>::new();
+            for p in &parts[..2] {
+                acc.push(p).unwrap();
+            }
+            let cov = host(&acc.cov().unwrap());
+            let rows: Vec<Vec<f32>> = parts[..2].iter().map(|p| p.to_vec().unwrap()).collect();
+            let n = (2 * RB) as f64;
+            let column = |f: usize| -> Vec<f64> { rows.iter().flat_map(|m| (0..RB).map(move |r| f64::from(m[r * FB + f]))).collect() };
+            for (i, j) in [(0usize, 0usize), (3, 4000), (1234, 2345), (4095, 4095)] {
+                let (ci, cj) = (column(i), column(j));
+                let (mi, mj) = (ci.iter().sum::<f64>() / n, cj.iter().sum::<f64>() / n);
+                let want = ci.iter().zip(&cj).map(|(a, b)| (a - mi) * (b - mj)).sum::<f64>() / n;
+                assert!((cov[i + FB * j] - want).abs() <= 1e-4 * want.abs().max(1e-3), "accum cov entry ({i}, {j}): got {}, want {want}", cov[i + FB * j]);
+            }
+        }
+        let acc = Covariance::<Df32>::new();
+        h.case("cov/push_4096f", &size, Work::Bytes(bytes), &mut || {
+            acc.reset();
+            for p in &parts {
+                acc.push(p).unwrap();
+            }
+            acc.cov().unwrap().eval().unwrap();
+        });
+        if h.want("cov/concat_4096f") {
+            let all = concat_slice(1, &parts);
+            all.eval().unwrap();
+            let n = (pushes * RB) as f32;
+            h.case("cov/concat_4096f", &size, Work::Bytes(bytes), &mut || {
+                let d = &all - &all.mean_axis(1);
+                (matmul_f32(&d.transpose(), &d) / n).eval().unwrap();
+            });
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------------------

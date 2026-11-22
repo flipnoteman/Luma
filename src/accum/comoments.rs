@@ -317,7 +317,7 @@ impl<W: Wide> CoMoments<W> {
     /// Folds `other`'s state in. Both must have the same settings and position shape; `other` may
     /// live on another device.
     pub fn merge(&self, other: &CoMoments<W>) -> Result<()> {
-        if self.cfg != other.cfg {
+        if (CoConfig { flush_every: other.cfg.flush_every, ..self.cfg.clone() }) != other.cfg {
             return Err(invalid("accumulators with different settings cannot be merged"));
         }
         let theirs = {
