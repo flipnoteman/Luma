@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use luma_core::hal::{cache, copy_parallel};
+use luma_core::hal::{cache, copy_parallel_host};
 use luma_core::kir::KernelModule;
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, COPY_BUFFER_ALIGNMENT, CompiledKernel,
@@ -513,7 +513,7 @@ impl Backend for CpuBackend {
         };
         let buf = raw(&buffer)?;
         // SAFETY: `data.len() <= class == buf.len()`; the buffer is idle and exclusively ours.
-        copy_parallel(data, unsafe { buf.as_uninit_slice_mut(data.len()) });
+        copy_parallel_host(data, unsafe { buf.as_uninit_slice_mut(data.len()) });
         Ok(buffer)
     }
 
@@ -623,7 +623,7 @@ impl Backend for CpuBackend {
             if src.id() == dst.id() {
                 std::ptr::copy(from, to, n);
             } else {
-                copy_parallel(
+                copy_parallel_host(
                     std::slice::from_raw_parts(from, n),
                     std::slice::from_raw_parts_mut(to.cast::<MaybeUninit<u8>>(), n),
                 );
@@ -643,7 +643,7 @@ impl Backend for CpuBackend {
         }
         let buf = raw(dst)?;
         // SAFETY: `data.len() <= dst.size()`; no launch is running.
-        copy_parallel(data, unsafe { buf.as_uninit_slice_mut(data.len()) });
+        copy_parallel_host(data, unsafe { buf.as_uninit_slice_mut(data.len()) });
         Ok(())
     }
 
@@ -710,7 +710,7 @@ impl Backend for CpuBackend {
             return Err(invalid("readback larger than its source buffer"));
         }
         // SAFETY: `dst.len() <= src.size()`; no launch is running.
-        copy_parallel(unsafe { raw(src)?.as_slice(dst.len()) }, dst);
+        copy_parallel_host(unsafe { raw(src)?.as_slice(dst.len()) }, dst);
         self.dispatches.store(0, Ordering::Relaxed);
         Ok(Duration::ZERO)
     }

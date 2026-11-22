@@ -12,9 +12,10 @@ use std::time::Duration;
 pub mod cache;
 pub mod copy;
 mod deferred;
+pub mod topology;
 
 pub use cache::DiskCache;
-pub use copy::{advise_huge_pages, copy_parallel, copy_streaming};
+pub use copy::{advise_huge_pages, copy_parallel, copy_parallel_host, copy_streaming};
 
 /// Which backend a context runs on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
