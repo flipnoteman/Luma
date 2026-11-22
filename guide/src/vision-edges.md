@@ -96,8 +96,9 @@ from one image into the other. luma reads and writes different images, so the re
 depend on the order of the pixels; ArrayFire's CPU backend updates in place pixel by pixel. ArrayFire's
 CUDA kernel has a bug: on images with more than about 70 columns it updates only the leading
 columns along axis 1 (72 of 128, 96 of 300 in the sizes probed) and leaves the rest unchanged.
-luma updates every pixel; on the columns ArrayFire does update one step agrees with it to `f32`
-rounding.
+luma updates every pixel. On the columns ArrayFire does update one step agrees with it to `f32`
+rounding on small images; on large ones its in-place update also races between tiles and varies
+from run to run.
 
 ## `mean_shift`
 

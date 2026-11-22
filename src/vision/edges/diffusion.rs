@@ -262,9 +262,10 @@ impl Array<f32> {
     /// not depend on the order of the pixels (ArrayFire's CPU backend updates in place, pixel by
     /// pixel). ArrayFire's CUDA kernel has a bug: on images with more than about 70 columns it
     /// updates only the first few columns along axis 1 (72 of 128, 80 of 130, 88 of 200, 96 of
-    /// 300 in the sizes probed) and leaves the others as they were. luma updates every pixel; on
-    /// the columns ArrayFire does update, one step agrees with it to `f32` rounding (about
-    /// `1e-5`).
+    /// 300 in the sizes probed) and leaves the others as they were. luma updates every pixel. On the columns ArrayFire does update, one step agrees
+    /// with it to `f32` rounding (about `1e-5`) on small images; on large ones its in-place update
+    /// also races between tiles (a tile reads neighbours another tile has already written), so
+    /// its result varies from run to run (differences of 0.3% to 43% of the step were measured).
     /// Poisons the result for `iterations == 0` or a conductance of 0 (as ArrayFire errors), and
     /// for non-finite arguments.
     ///
