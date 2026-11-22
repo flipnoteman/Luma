@@ -1,7 +1,20 @@
-//! Sorting: `sort`, `argsort` and `sort_axis` for `u32`, `i32` and `f32` arrays.
+//! Sorting: `sort`, `argsort`, `sort_by_key` and `sort_axis` for `u32`, `i32` and `f32` arrays.
 //!
-//! An LSD radix sort on 8-bit digits, one pass per digit, every pass in three steps (reduce, scan,
-//! scatter; no decoupled look-back, which needs forward-progress guarantees WGSL does not give):
+//! An LSD radix sort on 8-bit digits, one pass per digit. Two ways of running the passes:
+//!
+//! *Single sweep* (CUDA: where the device orders memory across workgroups, `Tuning::lookback_scan`,
+//! and ranks with ballots, see below; CUB's onesweep, Adinets and Merrill 2022): one kernel
+//! reads the keys and counts the digits of all passes at once ([`RadixKind::Histogram`]); then
+//! every pass is one kernel ([`RadixKind::Sweep`]): a workgroup takes a tile of keys, ranks it by
+//! the digit, publishes the tile's count of every digit in a status word (aggregate flag and count
+//! in one word), looks back over the statuses of the tiles before it until it finds an inclusive
+//! prefix of each digit (decoupled look-back, as the scan of `scan.rs`), and writes the keys
+//! (and payload) to their places. Per pass a key is read once and written once; the count
+//! and scan kernels of the other way are gone. See [`radix_sweep`].
+//!
+//! *Count, scan, scatter* (wgpu, CPU, and anywhere else the single sweep does not apply: no
+//! decoupled look-back, which needs forward-progress guarantees WGSL does not give), every pass in
+//! three steps:
 //!
 //! 1. *Count*: a workgroup counts the digits of [`COUNT_TILES`] tiles in workgroup memory (every
 //!    invocation loads all its keys of a tile before counting them, so the loads overlap) and
@@ -55,7 +68,7 @@ use crate::context::{Context, RawArg, Scratch};
 use crate::error::LumaError;
 use crate::gpu_type::{ElemLayout, ScalarType};
 use crate::jit::{self, Node};
-use crate::ops::{fold_workgroups, Outcome};
+use crate::ops::{fold_workgroups, launch_1d, Outcome};
 use crate::scan::{add_operator, Bound, Lines};
 use crate::segsort::{LineJob, LineSort};
 use crate::shape::Shape;
@@ -150,6 +163,14 @@ pub(crate) enum RadixKind {
     /// `last` passes store keys through the inverse of the transform; `store_keys == false`
     /// stores the payload only.
     Scatter { last: bool, store_keys: bool, payload: PayloadKind, ballot: bool },
+    /// One read of the keys that adds the counts of the digits of the first `digits` passes (bits
+    /// `0..8 * digits`) to the global counts at the start of `st` (see [`SweepWork`]).
+    Histogram { digits: u8 },
+    /// One pass of the single-sweep sort (Merrill and Garland's decoupled look-back, as CUB's
+    /// onesweep): ranks a tile by the digit like the ballot scatter, takes the position of every
+    /// digit from the tiles before it (look-back over the statuses in `st`) and the global
+    /// counts, and writes keys and payload; see [`sweep_body`].
+    Sweep { last: bool, store_keys: bool, payload: PayloadKind, per_thread: u8 },
 }
 
 /// One kernel of a radix sort pass on the bits `shift..shift + 8`. The transform and the
@@ -189,12 +210,16 @@ impl RadixPass {
     pub(crate) fn declare_writes(self, src: &mut String, binding: &mut usize) {
         match self.kind {
             RadixKind::Count { .. } => declare(src, binding, "read_write", "counts", "vec4<u32>"),
-            RadixKind::Scatter { store_keys, payload, .. } => {
+            RadixKind::Histogram { .. } => declare(src, binding, "read_write", "st", "atomic<u32>"),
+            RadixKind::Scatter { store_keys, payload, .. } | RadixKind::Sweep { store_keys, payload, .. } => {
                 if store_keys {
                     declare(src, binding, "read_write", "out_keys", "u32");
                 }
                 if payload != PayloadKind::None {
                     declare(src, binding, "read_write", "out_pay", "u32");
+                }
+                if matches!(self.kind, RadixKind::Sweep { .. }) {
+                    declare(src, binding, "read_write", "st", "atomic<u32>");
                 }
             }
         }
@@ -203,11 +228,19 @@ impl RadixPass {
     /// Declares the buffers the kernel reads besides the keys: the payload (`PayloadKind::Buffer`)
     /// and the inclusive scan of the counts.
     pub(crate) fn declare_reads(self, src: &mut String, binding: &mut usize) {
-        if let RadixKind::Scatter { payload, .. } = self.kind {
-            if payload == PayloadKind::Buffer {
-                declare(src, binding, "read", "pay", "u32");
+        match self.kind {
+            RadixKind::Scatter { payload, .. } => {
+                if payload == PayloadKind::Buffer {
+                    declare(src, binding, "read", "pay", "u32");
+                }
+                declare(src, binding, "read", "offs", "u32");
             }
-            declare(src, binding, "read", "offs", "u32");
+            RadixKind::Sweep { payload, .. } => {
+                if payload == PayloadKind::Buffer {
+                    declare(src, binding, "read", "pay", "u32");
+                }
+            }
+            RadixKind::Count { .. } | RadixKind::Histogram { .. } => {}
         }
     }
 }
@@ -263,8 +296,93 @@ fn body(pass: RadixPass) -> String {
     match pass.kind {
         RadixKind::Count { ballot } => count_body(pass.shift, ballot),
         RadixKind::Scatter { last, store_keys, payload, ballot: false } => scatter_body(pass.shift, last, store_keys, payload),
-        RadixKind::Scatter { last, store_keys, payload, ballot: true } => ballot_scatter_body(pass.shift, last, store_keys, payload),
+        RadixKind::Scatter { last, store_keys, payload, ballot: true } => ballot_scatter_body(pass.shift, last, store_keys, payload, None),
+        RadixKind::Sweep { last, store_keys, payload, per_thread } => ballot_scatter_body(pass.shift, last, store_keys, payload, Some(u32::from(per_thread))),
+        RadixKind::Histogram { digits } => histogram_body(digits),
     }
+}
+
+/// Counters of the digits of every pass at the start of the work buffer of a sweep sort (see
+/// [`SweepWork`]), then one ticket counter per pass.
+const SWEEP_TICKETS: u32 = 4 * DIGITS;
+/// Words of the work buffer before the statuses of the first pass.
+const SWEEP_HEADER: u32 = SWEEP_TICKETS + 8;
+/// Keys an invocation owns in a tile of the sweep kernels, the most of 32 (16 with a payload), 24
+/// and 16 whose workgroup memory fits (more keys per tile make longer runs of equal digits to write, and fewer
+/// statuses).
+fn sweep_per_thread(tuning: &Tuning, payload: bool) -> u32 {
+    // With a payload the registers of the tile are twice as many and 16 keys per invocation was
+    // measured faster (RTX 3090, 10M keys: argsort 0.83 ms against 0.85 at 24 and 0.90 at 32).
+    let wanted: u32 = if payload { 16 } else { 32 };
+    [32, 24, 16].into_iter().filter(|&k| k <= wanted).find(|&k| sweep_bytes(k) <= tuning.workgroup_storage).unwrap_or(16)
+}
+
+/// Bytes of workgroup memory of the sweep kernel with `per_thread` keys per invocation: the
+/// counters, the digit bases, two arrays of subgroup totals, a ticket and the staged keys.
+fn sweep_bytes(per_thread: u32) -> u32 {
+    let words = DIGITS * (WORKGROUP / SUBGROUP + 1) + DIGITS + 2 * (WORKGROUP / SUBGROUP) + 1 + WORKGROUP * per_thread;
+    words * 4
+}
+
+/// Keys an invocation of the histogram kernel loads before it counts them.
+const HIST_PER_THREAD: u32 = 8;
+
+/// The histogram kernel of a sweep sort: workgroups stride over tiles of
+/// `WORKGROUP * HIST_PER_THREAD` keys (`p.tiles` of them are launched), count the digits of the
+/// first `digits` passes in workgroup memory, and add their counts to the global ones once. Equal
+/// digits of a subgroup are counted with one atomic (the common case of skewed keys, which would
+/// otherwise serialise on one counter).
+fn histogram_body(digits: u8) -> String {
+    let tile = WORKGROUP * HIST_PER_THREAD;
+    let digits_n = u32::from(digits);
+    let mut src = String::new();
+    let _ = writeln!(src, "var<workgroup> hist: array<atomic<u32>, {}>;", digits_n * DIGITS);
+    let mut full = String::new();
+    let mut tail = String::new();
+    let digit = |k: u32, key: &str| format!("(({key} >> {}u) & {}u)", k * DIGIT_BITS, DIGITS - 1);
+    for m in 0..HIST_PER_THREAD {
+        let _ = writeln!(full, "        let k{m} = load_key(base + {}u + t);", m * WORKGROUP);
+    }
+    for m in 0..HIST_PER_THREAD {
+        // A subgroup whose lanes hold the same key adds 32 to the counter of each digit once; the
+        // others add one per lane (skewed keys would otherwise serialise on a counter).
+        let _ = writeln!(full, "        {{\n            let kf = subgroupShuffle(k{m}, 0u);\n            if (subgroupBallot(k{m} == kf).x == 0xffffffffu) {{\n                if (lane == 0u) {{");
+        for k in 0..digits_n {
+            let _ = writeln!(full, "                    atomicAdd(&hist[{}u + {}], 32u);", k * DIGITS, digit(k, "kf"));
+        }
+        full.push_str("                }\n            } else {\n");
+        for k in 0..digits_n {
+            let _ = writeln!(full, "                atomicAdd(&hist[{}u + {}], 1u);", k * DIGITS, digit(k, &format!("k{m}")));
+        }
+        full.push_str("            }\n        }\n");
+        let _ = writeln!(tail, "        {{\n            let i = base + {}u + t;\n            if (i < p.n) {{\n                let k = load_key(i);", m * WORKGROUP);
+        for k in 0..digits_n {
+            let _ = writeln!(tail, "                atomicAdd(&hist[{}u + {}], 1u);", k * DIGITS, digit(k, "k"));
+        }
+        tail.push_str("            }\n        }\n");
+    }
+    let _ = write!(
+        src,
+        "@compute @workgroup_size({WORKGROUP})
+fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32) {{
+    let group = wg.x + wg.y * nwg.x;
+    if (group >= p.tiles) {{ return; }}
+    for (var k = 0u; k < {digits}u; k++) {{ atomicStore(&hist[k * {DIGITS}u + t], 0u); }}
+    workgroupBarrier();
+    for (var base = group * {tile}u; base < p.n; base += p.tiles * {tile}u) {{
+        if (base + {tile}u <= p.n) {{
+{full}        }} else {{
+{tail}        }}
+    }}
+    workgroupBarrier();
+    for (var k = 0u; k < {digits}u; k++) {{
+        let v = atomicLoad(&hist[k * {DIGITS}u + t]);
+        if (v != 0u) {{ atomicAdd(&st[k * {DIGITS}u + t], v); }}
+    }}
+}}
+"
+    );
+    src
 }
 
 /// The counting kernel of the pass that sorts by bits `shift..shift + 8`: a workgroup counts the
@@ -477,17 +595,23 @@ const SUBGROUP: u32 = 32;
 /// within a digit is (subgroup, round, lane) = input order, so the ranking is stable. The ranked
 /// tile is staged in workgroup memory and written out in slot order, so that the invocations
 /// of a subgroup write consecutive addresses of a digit's run.
-fn ballot_scatter_body(shift: u8, last: bool, store_keys: bool, payload: PayloadKind) -> String {
+fn ballot_scatter_body(shift: u8, last: bool, store_keys: bool, payload: PayloadKind, sweep_pt: Option<u32>) -> String {
+    let sweep = sweep_pt.is_some();
+    let bpt = sweep_pt.unwrap_or(BALLOT_PER_THREAD);
     let warps = WORKGROUP / SUBGROUP;
     // Counters of a digit are `warps + 1` words apart: no bank conflicts in the scan.
     let stride = warps + 1;
     let has_pay = payload != PayloadKind::None;
-    let tile = WORKGROUP * BALLOT_PER_THREAD;
+    let tile = WORKGROUP * bpt;
     let mut src = String::new();
     let _ = writeln!(src, "var<workgroup> wc: array<atomic<u32>, {}>;", DIGITS * stride);
     let _ = writeln!(src, "var<workgroup> wsum: array<u32, {warps}>;");
     let _ = writeln!(src, "var<workgroup> gbase: array<u32, {DIGITS}>;");
     let _ = writeln!(src, "var<workgroup> sk: array<u32, {tile}>;");
+    if sweep {
+        let _ = writeln!(src, "var<workgroup> wsum2: array<u32, {warps}>;");
+        let _ = writeln!(src, "var<workgroup> ticket: u32;");
+    }
     let _ = writeln!(src, "fn digit(w: u32) -> u32 {{ return (w >> {shift}u) & {}u; }}", DIGITS - 1);
     let mut copy_writes = String::new();
     if store_keys {
@@ -507,7 +631,47 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(subgroup_invocation_id) lane: u32,
 ) {{
-    let tile = wg.x + wg.y * nwg.x;
+    {head}",
+        head = if sweep {
+            format!(
+                "let group = wg.x + wg.y * nwg.x;
+    if (group >= p.tiles) {{ return; }}
+    let sg = t / {SUBGROUP}u;
+    let sb = p.cstride;
+    for (var k = 0u; k < {stride}u; k++) {{ atomicStore(&wc[k * {DIGITS}u + t], 0u); }}
+    // The count of every key of digit `t` in this pass (see `SweepWork`): all keys in one digit
+    // make the pass a copy.
+    let gcnt = atomicLoad(&st[{gh}u + t]);
+    let same_d = p.n > 0u && gcnt == p.n;
+    let sg_same = subgroupBallot(same_d).x;
+    if (lane == 0u) {{ wsum[sg] = sg_same; }}
+    workgroupBarrier();
+    if (({any_wsum}) != 0u) {{
+        let base = group * {tile}u;
+        let valid = min({tile}u, p.n - base);
+        for (var m = 0u; m < {bpt}u; m++) {{
+            let q = m * {WORKGROUP}u + t;
+            if (q < valid) {{
+                let idx = base + q;
+{copy_writes}            }}
+        }}
+        return;
+    }}
+    // Tiles are numbered in the order their workgroups start, so every tile a look-back waits
+    // for has started.
+    if (t == 0u) {{ ticket = atomicAdd(&st[{tk}u], 1u); }}
+    let tile = workgroupUniformLoad(&ticket);
+    let base = tile * {tile}u;
+    let first_slot = sg * {run}u + lane;
+",
+                gh = (shift as u32 / DIGIT_BITS) * DIGITS,
+                tk = SWEEP_TICKETS + shift as u32 / DIGIT_BITS,
+                run = bpt * SUBGROUP,
+                any_wsum = (0..warps).map(|w| format!("wsum[{w}]")).collect::<Vec<_>>().join(" | "),
+            )
+        } else {
+            format!(
+                "let tile = wg.x + wg.y * nwg.x;
     if (tile >= p.tiles) {{ return; }}
     let base = tile * {tile}u;
     let sg = t / {SUBGROUP}u;
@@ -520,7 +684,7 @@ fn main(
     workgroupBarrier();
     if (({any_wsum}) != 0u) {{
         let valid = min({tile}u, p.n - base);
-        for (var m = 0u; m < {BALLOT_PER_THREAD}u; m++) {{
+        for (var m = 0u; m < {bpt}u; m++) {{
             let q = m * {WORKGROUP}u + t;
             if (q < valid) {{
                 let idx = base + q;
@@ -530,12 +694,14 @@ fn main(
     }}
     let first_slot = sg * {run}u + lane;
 ",
-        any_wsum = (0..warps).map(|w| format!("wsum[{w}]")).collect::<Vec<_>>().join(" | "),
-        run = BALLOT_PER_THREAD * SUBGROUP,
+                run = bpt * SUBGROUP,
+                any_wsum = (0..warps).map(|w| format!("wsum[{w}]")).collect::<Vec<_>>().join(" | "),
+            )
+        },
     );
     // The keys past the end get the largest key, so they rank after the real ones and are never
     // written.
-    for j in 0..BALLOT_PER_THREAD {
+    for j in 0..bpt {
         let _ = writeln!(src, "    let i{j} = base + first_slot + {}u;", j * SUBGROUP);
         let _ = writeln!(src, "    var w{j} = 0xffffffffu;\n    if (i{j} < p.n) {{ w{j} = load_key(i{j}); }}");
         match payload {
@@ -549,7 +715,7 @@ fn main(
         }
     }
     src.push_str("    let below = (1u << lane) - 1u;\n");
-    for j in 0..BALLOT_PER_THREAD {
+    for j in 0..bpt {
         let _ = writeln!(src, "    var r{j} = 0u;\n    {{\n        let d = digit(w{j});\n        var peers = 0xffffffffu;");
         for bit in 0..DIGIT_BITS {
             let _ = writeln!(src, "        {{ let on = ((d >> {bit}u) & 1u) == 1u; let m = subgroupBallot(on).x; peers &= select(~m, m, on); }}");
@@ -575,31 +741,73 @@ fn main(
     let before_in_group = subgroupExclusiveAdd(total);
     let group_total = subgroupAdd(total);
     if (lane == 0u) {{ wsum[sg] = group_total; }}
-    workgroupBarrier();
+{sweep_scan}    workgroupBarrier();
     var groups_before = 0u;
     for (var s = 0u; s < {warps}u; s++) {{ groups_before += select(0u, wsum[s], s < sg); }}
     let start = groups_before + before_in_group;
-    {{
+{gbase_init}    atomicStore(&wc[t * {stride}u], start);
+",
+        sweep_scan = if sweep {
+            // The aggregate of the tile is published as soon as it is known; the first tile's is
+            // its inclusive prefix. The other half: the digits' global first positions.
+            "    if (tile == 0u) { atomicStore(&st[sb + t], (2u << 30u) | total); } else { atomicStore(&st[sb + tile * 256u + t], (1u << 30u) | total); }
+    let gb_in = subgroupExclusiveAdd(gcnt);
+    let gb_tot = subgroupAdd(gcnt);
+    if (lane == 0u) { wsum2[sg] = gb_tot; }
+"
+        } else {
+            ""
+        },
+        gbase_init = if sweep {
+            ""
+        } else {
+            "    {
         let q = t * p.cstride + tile;
         var o = 0u;
-        if (q > 0u) {{ o = offs[q - 1u]; }}
+        if (q > 0u) { o = offs[q - 1u]; }
         gbase[t] = o - start;
-    }}
-    atomicStore(&wc[t * {stride}u], start);
+    }
 "
+        },
     );
     for k in 1..warps {
         let _ = writeln!(src, "    atomicStore(&wc[t * {stride}u + {k}u], start + e{k});");
     }
     src.push_str("    workgroupBarrier();\n");
-    for j in 0..BALLOT_PER_THREAD {
+    for j in 0..bpt {
         let _ = writeln!(src, "    let p{j} = atomicLoad(&wc[digit(w{j}) * {stride}u + sg]) + r{j};\n    sk[p{j}] = w{j};");
+    }
+    if sweep {
+        // The first position of digit `t` in the output: the counts of the smaller digits, plus
+        // the counts of `t` in the tiles before this one, found by looking back over their
+        // statuses (aggregate: flag 1, inclusive prefix: flag 2, in bits 30 and 31 of a word with
+        // the count; one word, so a reader never sees a flag without its count).
+        src.push_str(
+            "    {
+        var excl = 0u;
+        if (tile > 0u) {
+            var j = tile;
+            loop {
+                j -= 1u;
+                var w = atomicLoad(&st[sb + j * 256u + t]);
+                while (w == 0u) { w = atomicLoad(&st[sb + j * 256u + t]); }
+                excl += w & 0x3fffffffu;
+                if ((w >> 30u) == 2u) { break; }
+            }
+            atomicStore(&st[sb + tile * 256u + t], (2u << 30u) | (excl + total));
+        }
+        var gb = gb_in;
+        for (var s = 0u; s < 8u; s++) { gb += select(0u, wsum2[s], s < sg); }
+        gbase[t] = gb + excl - start;
+    }
+",
+        );
     }
     let _ = writeln!(src, "    workgroupBarrier();\n    let valid = min({tile}u, p.n - base);");
     if !has_pay {
         let _ = write!(
             src,
-            "    for (var m = 0u; m < {BALLOT_PER_THREAD}u; m++) {{
+            "    for (var m = 0u; m < {bpt}u; m++) {{
         let q = m * {WORKGROUP}u + t;
         if (q < valid) {{
             let w = sk[q];
@@ -614,7 +822,7 @@ fn main(
     }
     // With a payload the keys are written first, then `sk` is reused for the payload.
     let at = |m: u32| if m == 0 { "t".to_string() } else { format!("({}u + t)", m * WORKGROUP) };
-    for m in 0..BALLOT_PER_THREAD {
+    for m in 0..bpt {
         let q = at(m);
         let _ = writeln!(src, "    var d{m} = 0u;\n    if ({q} < valid) {{\n        let w = sk[{q}];\n        d{m} = gbase[digit(w)] + {q};");
         if store_keys {
@@ -623,11 +831,11 @@ fn main(
         src.push_str("    }\n");
     }
     src.push_str("    workgroupBarrier();\n");
-    for j in 0..BALLOT_PER_THREAD {
+    for j in 0..bpt {
         let _ = writeln!(src, "    sk[p{j}] = y{j};");
     }
     src.push_str("    workgroupBarrier();\n");
-    for m in 0..BALLOT_PER_THREAD {
+    for m in 0..bpt {
         let q = at(m);
         let _ = writeln!(src, "    if ({q} < valid) {{ out_pay[d{m}] = sk[{q}]; }}");
     }
@@ -702,6 +910,9 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
     let n = keys.len();
     let too_large = || LumaError::DimensionTooLarge { shape: [n, 1, 1, 1] };
     let n32 = u32::try_from(n).map_err(|_| too_large())?;
+    if use_sweep(ctx, n32) {
+        return radix_sweep(ctx, keys, payload, spec, n32);
+    }
     let ballot = use_ballots(ctx.tuning());
     let tiles = n32.div_ceil(if ballot { WORKGROUP * BALLOT_PER_THREAD } else { TILE });
     let passes = spec.key_bits.clamp(1, 32).div_ceil(DIGIT_BITS);
@@ -818,6 +1029,135 @@ pub(crate) fn radix_sort(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, sp
         ctx.launch(&scatter, groups, [n32, 1, 1], &args)?;
     }
     drop((lines, scratch));
+    Ok(Sorted { keys: out_keys, payload: out_pay })
+}
+
+/// Whether a sort runs as the single sweep (see [`radix_sweep`]): the device orders memory
+/// across workgroups (the look-back of the scan needs the same), ranks with ballots, and every
+/// count fits the 30 bits of a status word.
+fn use_sweep(ctx: &Context, n: u32) -> bool {
+    let tuning = ctx.tuning();
+    tuning.lookback_scan && use_ballots(tuning) && sweep_bytes(16) <= tuning.workgroup_storage && n < 1 << 30
+}
+
+/// The sort as CUB's onesweep does it (Adinets and Merrill 2022): one pass over the keys counts
+/// the digits of every radix pass ([`RadixKind::Histogram`]), then each pass is one kernel
+/// ([`RadixKind::Sweep`]) that ranks its tile of keys, finds where the tile's keys of every
+/// digit go from the statuses of the tiles before it (decoupled look-back: a tile publishes its
+/// counts, then walks back over the earlier tiles' until one has the inclusive prefix) and
+/// scatters. That is `2 + digits` reads or writes of the keys per element less than the three
+/// kernels per pass of [`radix_sort`]'s other path (count, scan of the counts, scatter).
+///
+/// The work buffer holds, in words: the counters of the digits of every pass (written by the
+/// histogram, read by the sweeps), the ticket counters of the passes, and the statuses, `tiles *
+/// 256` words per pass. It is zeroed by one launch ahead of the kernels.
+fn radix_sweep(ctx: &Context, keys: Keys<'_>, payload: Payload<'_>, spec: Spec, n32: u32) -> Outcome<Sorted> {
+    let n = n32 as usize;
+    let per_thread = sweep_per_thread(ctx.tuning(), !matches!(payload, Payload::None));
+    let tile_keys = WORKGROUP * per_thread;
+    let tiles = n32.div_ceil(tile_keys);
+    let passes = spec.key_bits.clamp(1, 32).div_ceil(DIGIT_BITS);
+    let bytes = n as u64 * 4;
+    let work_words = u64::from(SWEEP_HEADER) + u64::from(passes) * u64::from(tiles) * u64::from(DIGITS);
+    let work_bytes = work_words * 4;
+    let hist_groups = n32.div_ceil(WORKGROUP * HIST_PER_THREAD).min(ctx.tuning().compute_units.max(1) * 4).max(1);
+
+    let mut key_pin = match keys {
+        Keys::Ready(storage) => Some(storage.pin_single()?),
+        Keys::Pending(_) => {
+            if bytes > ctx.segment_bytes() {
+                return Err(LumaError::Chunked("a sort of an array split over several buffers").into());
+            }
+            None
+        }
+    };
+    let input_pay = match payload {
+        Payload::Buffer(storage) => Some(storage.pin_single()?),
+        _ => None,
+    };
+    let first_kind = match payload {
+        Payload::None => PayloadKind::None,
+        Payload::Index => PayloadKind::Index,
+        Payload::Buffer(_) => PayloadKind::Buffer,
+    };
+    let out_keys = spec.want_keys.then(|| Arc::new(Storage::new(ctx, n, ElemLayout::plain(4))));
+    let out_pay = (first_kind != PayloadKind::None).then(|| Arc::new(Storage::new(ctx, n, ElemLayout::plain(4))));
+    let out_keys_pin = out_keys.as_ref().map(|storage| storage.pin_single()).transpose()?;
+    let out_pay_pin = out_pay.as_ref().map(|storage| storage.pin_single()).transpose()?;
+
+    let mut scratch = Scratch::new(ctx);
+    let work = scratch.take(work_bytes)?;
+    let mids = passes.saturating_sub(1).min(2) as usize;
+    let mid_keys = (0..mids).map(|_| scratch.take(bytes)).collect::<std::result::Result<Vec<Buffer>, LumaError>>()?;
+    let mid_pay = if first_kind == PayloadKind::None {
+        Vec::new()
+    } else {
+        (0..mids).map(|_| scratch.take(bytes)).collect::<std::result::Result<Vec<Buffer>, LumaError>>()?
+    };
+    let zero = ctx.builtin(Builtin::Fill, "u32")?;
+    let zeroed = u32::try_from(work_words).map_err(|_| LumaError::DimensionTooLarge { shape: [n, 1, 1, 1] })?;
+    launch_1d(ctx, &zero, zeroed, &[RawArg::write(&work, work_bytes), RawArg::Uniform(bytemuck::bytes_of(&0u32))])?;
+
+    let groups = fold_workgroups(ctx, tiles)?;
+    let hist_grid = fold_workgroups(ctx, hist_groups)?;
+    let hist_params = [n32, hist_groups, 0];
+    let hist_pass = RadixPass { kind: RadixKind::Histogram { digits: passes as u8 }, shift: 0, transform: spec.transform, descending: spec.descending };
+    let hist_writes = [RawArg::write(&work, work_bytes)];
+    // Whether the first pass computes the keys (decided by the histogram kernel).
+    let mut fused = false;
+    let worst_bindings = 4;
+    if let Keys::Pending(node) = keys {
+        fused = jit::radix_pass(ctx, node, hist_pass, hist_params, hist_grid, &hist_writes, &[], worst_bindings)?;
+        if !fused {
+            key_pin = Some(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?.pin_single()?);
+        }
+    }
+    if !fused {
+        let src_keys = key_pin.as_ref().expect("the first pass has keys").buffer();
+        let hist = ctx.builtin(Builtin::Radix { pass: hist_pass, first: true }, "u32")?;
+        ctx.launch(&hist, hist_grid, [n32, 1, 1], &[hist_writes[0], RawArg::read(src_keys, bytes), RawArg::Uniform(bytemuck::bytes_of(&hist_params))])?;
+    }
+
+    for pass in 0..passes {
+        let (first, last) = (pass == 0, pass + 1 == passes);
+        let shift = (pass * DIGIT_BITS) as u8;
+        let src_pay = if first { input_pay.as_ref().map(|pin| pin.buffer()) } else { mid_pay.get((pass as usize - 1) % 2) };
+        let dst_keys = if last { out_keys_pin.as_ref().map(|pin| pin.buffer()) } else { Some(&mid_keys[pass as usize % 2]) };
+        let dst_pay = if last { out_pay_pin.as_ref().map(|pin| pin.buffer()) } else { mid_pay.get(pass as usize % 2) };
+        let kind = if first { first_kind } else if first_kind == PayloadKind::None { PayloadKind::None } else { PayloadKind::Buffer };
+        let (transform, descending) = if first || last { (spec.transform, spec.descending) } else { (KeyTransform::Identity, false) };
+        let store_keys = dst_keys.is_some();
+        let sweep_pass = RadixPass { kind: RadixKind::Sweep { last, store_keys, payload: kind, per_thread: per_thread as u8 }, shift, transform, descending };
+        let params = [n32, tiles, SWEEP_HEADER + pass * tiles * DIGITS];
+        let mut writes = Vec::with_capacity(3);
+        if let Some(buffer) = dst_keys {
+            writes.push(RawArg::write(buffer, bytes));
+        }
+        if kind != PayloadKind::None {
+            writes.push(RawArg::write(dst_pay.expect("a payload sort has payload buffers"), bytes));
+        }
+        writes.push(RawArg::write(&work, work_bytes));
+        let mut reads = Vec::with_capacity(1);
+        if kind == PayloadKind::Buffer {
+            reads.push(RawArg::read(src_pay.expect("a payload sort has payload buffers"), bytes));
+        }
+        if let (true, Keys::Pending(node), true) = (first, keys, fused) {
+            if jit::radix_pass(ctx, node, sweep_pass, params, groups, &writes, &reads, worst_bindings)? {
+                continue;
+            }
+            // Evaluated by someone else since the histogram kernel fused it: the counts stay
+            // valid, so the buffer kernel sweeps.
+            key_pin = Some(node.force().as_ref().map_err(|error| Failure::Inherited(Arc::clone(error)))?.pin_single()?);
+        }
+        let src_keys = if first { key_pin.as_ref().expect("the first pass has keys").buffer() } else { &mid_keys[(pass as usize - 1) % 2] };
+        let mut args = writes;
+        args.push(RawArg::read(src_keys, bytes));
+        args.extend(reads);
+        args.push(RawArg::Uniform(bytemuck::bytes_of(&params)));
+        let sweep = ctx.builtin(Builtin::Radix { pass: sweep_pass, first }, "u32")?;
+        ctx.launch(&sweep, groups, [n32, 1, 1], &args)?;
+    }
+    drop(scratch);
     Ok(Sorted { keys: out_keys, payload: out_pay })
 }
 
@@ -998,6 +1338,149 @@ impl<T: SortKey> Array<T> {
         LineSort::new(T::TRANSFORM, job.n, job.stride).launch(ctx, job, RawArg::write(out_pin.buffer(), bytes), RawArg::read(input.buffer(), bytes))?;
         drop((input, out_pin));
         Ok(Array::from_storage(ctx, self.shape(), out))
+    }
+
+    /// Sorts the elements of this array (the keys) in ascending order and moves the elements of
+    /// `values`, which has the same shape, along with them: `(keys, values)` sorted, flat order
+    /// (for one dimension per axis see [`Array::sort_by_key_axis`]). Stable: equal keys keep
+    /// their input order, so their values do too. Order of floats as for [`Array::sort`]
+    /// (`-inf < .. < -0.0 < +0.0 < .. < +inf < NaN`; the sign and payload of a NaN key are not
+    /// kept).
+    ///
+    /// `values` may have any element type. A `u32`, `i32` or `f32` array travels through the
+    /// radix passes with its keys (one pass moves both); other types are gathered by the
+    /// permutation of an [`Array::argsort`]. A pending `self` is not evaluated first, as for
+    /// [`Array::sort`]; `values` is evaluated. Errors (different shapes or contexts, an array
+    /// split over several buffers) poison both results.
+    #[track_caller]
+    pub fn sort_by_key<V: ScalarType>(&self, values: &Array<V>) -> (Array<T>, Array<V>) {
+        self.sorted_by_key(values, false, "sort_by_key", Location::caller())
+    }
+
+    /// [`Array::sort_by_key`] with the keys in descending order, the exact reverse by key: equal
+    /// keys keep their input order, NaNs come first.
+    #[track_caller]
+    pub fn sort_by_key_descending<V: ScalarType>(&self, values: &Array<V>) -> (Array<T>, Array<V>) {
+        self.sorted_by_key(values, true, "sort_by_key_descending", Location::caller())
+    }
+
+    /// [`Array::sort_by_key`] for every line along `axis` independently (axis 0 varies fastest):
+    /// the keys of each line in ascending order and the values of `values` (the same shape)
+    /// carried along, keeping the shape.
+    #[track_caller]
+    pub fn sort_by_key_axis<V: ScalarType>(&self, axis: usize, values: &Array<V>) -> (Array<T>, Array<V>) {
+        let location = Location::caller();
+        let result = self.run_sort_by_key_axis(axis, values, false);
+        self.resolve_pair(values, result, "sort_by_key_axis", location)
+    }
+
+    /// [`Array::sort_by_key_axis`] with every line in descending key order (as
+    /// [`Array::sort_by_key_descending`]).
+    #[track_caller]
+    pub fn sort_by_key_axis_descending<V: ScalarType>(&self, axis: usize, values: &Array<V>) -> (Array<T>, Array<V>) {
+        let location = Location::caller();
+        let result = self.run_sort_by_key_axis(axis, values, true);
+        self.resolve_pair(values, result, "sort_by_key_axis_descending", location)
+    }
+
+    fn sorted_by_key<V: ScalarType>(&self, values: &Array<V>, descending: bool, name: &'static str, location: &'static Location<'static>) -> (Array<T>, Array<V>) {
+        let result = self.run_sort_by_key(values, descending);
+        self.resolve_pair(values, result, name, location)
+    }
+
+    /// The two arrays of a pair result, or both poisoned.
+    fn resolve_pair<V: ScalarType>(&self, values: &Array<V>, result: Outcome<(Array<T>, Array<V>)>, op: &'static str, location: &'static Location<'static>) -> (Array<T>, Array<V>) {
+        match result {
+            Ok(pair) => pair,
+            Err(failure) => {
+                let error = match failure {
+                    Failure::Inherited(error) => error,
+                    Failure::New(error) => Arc::new(LumaError::Op { op, location, source: Arc::new(error) }),
+                };
+                let ctx = self.context();
+                (Array::poisoned(ctx, self.shape(), Arc::clone(&error)), Array::poisoned(ctx, values.shape(), error))
+            }
+        }
+    }
+
+    fn check_pair<V: ScalarType>(&self, values: &Array<V>) -> Outcome<()> {
+        if !self.context().same_as(values.context()) {
+            return Err(LumaError::ContextMismatch.into());
+        }
+        if self.shape() != values.shape() {
+            return Err(LumaError::ShapeMismatch { lhs: self.shape().dims(), rhs: values.shape().dims() }.into());
+        }
+        Ok(())
+    }
+
+    fn run_sort_by_key<V: ScalarType>(&self, values: &Array<V>, descending: bool) -> Outcome<(Array<T>, Array<V>)> {
+        let ctx = self.context();
+        self.check_pair(values)?;
+        if self.len() <= 1 {
+            self.storage()?;
+            values.storage()?;
+            return Ok((self.clone(), values.clone()));
+        }
+        if V::LAYOUT == ElemLayout::plain(4) && !(ctx.can_run_on_host() && self.len() <= crate::host::MAX_SORT_ELEMS) {
+            let spec = Spec { transform: T::TRANSFORM, descending, key_bits: 32, want_keys: true };
+            let sorted = self.radix(Payload::Buffer(values.storage()?), spec)?;
+            let keys = Array::from_storage(ctx, self.shape(), sorted.keys.expect("keys were asked for"));
+            let moved = Array::from_storage(ctx, self.shape(), sorted.payload.expect("the payload was asked for"));
+            return Ok((keys, moved));
+        }
+        let (keys, perm) = if descending {
+            let perm = Array::<u32>::from_storage(ctx, self.shape(), self.run_argsort(true)?);
+            (self.take(&perm), perm)
+        } else {
+            self.run_sort_with_indices()?
+        };
+        Ok((keys, values.take(&perm)))
+    }
+
+    fn run_sort_by_key_axis<V: ScalarType>(&self, axis: usize, values: &Array<V>, descending: bool) -> Outcome<(Array<T>, Array<V>)> {
+        let ctx = self.context();
+        let shape = self.shape();
+        let dims = shape.dims();
+        if axis >= 4 {
+            return Err(LumaError::InvalidShape(format!("axis {axis} of shape {shape}")).into());
+        }
+        self.check_pair(values)?;
+        let n = dims[axis];
+        if n == 1 {
+            self.storage()?;
+            values.storage()?;
+            return Ok((self.clone(), values.clone()));
+        }
+        let len = self.len();
+        let flat = self.reshape(len);
+        let flat_values = values.reshape(len);
+        if len == n {
+            let (keys, moved) = flat.run_sort_by_key(&flat_values, descending)?;
+            return Ok((keys.reshape(shape), moved.reshape(shape)));
+        }
+        // Sort everything by key carrying the flat index, then sort that stably by the line of
+        // the index carrying the index again (see `sort_lines`): the result is, line by line, the
+        // input positions in key order; keys and values are gathered from them.
+        let stride: usize = dims[..axis].iter().product();
+        let lines = len / n;
+        let perm = Array::<u32>::from_storage(ctx, Shape::from(len), flat.run_argsort(descending)?);
+        let (stride32, n32, lines32) = (stride as u32, n as u32, lines as u32);
+        let line = (&perm % stride32) + (&perm / (stride32 * n32)) * stride32;
+        let bits = u32::BITS - (lines32 - 1).leading_zeros();
+        let spec = Spec { transform: KeyTransform::Identity, descending: false, key_bits: bits, want_keys: false };
+        let by_line = line.radix(Payload::Buffer(perm.storage()?), spec)?;
+        let order = Array::<u32>::from_storage(ctx, Shape::from(len), by_line.payload.expect("the payload was asked for"));
+        let (keys, moved) = (flat.take(&order), flat_values.take(&order));
+        if stride == 1 {
+            return Ok((keys.reshape(shape), moved.reshape(shape)));
+        }
+        let outer = len / (n * stride);
+        let untranspose = |a: Array<T>| a.reshape([n, stride, outer]).swap_axes(0, 1).reshape(shape);
+        let keys = untranspose(keys);
+        keys.request().map_err(Failure::New)?;
+        let moved = moved.reshape([n, stride, outer]).swap_axes(0, 1).reshape(shape);
+        moved.request().map_err(Failure::New)?;
+        Ok((keys, moved))
     }
 
     fn run_sort_axis(&self, axis: usize) -> Outcome<Array<T>> {
