@@ -133,7 +133,12 @@ extern "C" fn at_exit(status: std::ffi::c_int, _arg: *mut std::ffi::c_void) {
             }
         }
         flush_all();
-        if !wait_for_driver_workers() {
+        // A process that opened several devices (a test binary whose tests each have a context)
+        // has a `[vkps] Update` thread per device, and the driver's own handler segfaulted in one
+        // of them on every exit of the 400 unit tests on an RTX 3090 (driver 615.71) even though
+        // all were idle: with more than one device the driver's handler is never run.
+        let several = DEVICES.try_lock().is_ok_and(|devices| devices.len() > 1);
+        if several || !wait_for_driver_workers() {
             // SAFETY: the GPU is idle and the pipeline cache is written. What is left to run is
             // the driver's own handler, which would hang on a lock the busy worker holds or free
             // memory it uses; what other handlers release the kernel releases too.
