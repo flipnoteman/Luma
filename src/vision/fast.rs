@@ -248,9 +248,9 @@ impl Array<f32> {
     /// brighter and over the darker ring pixels. With `non_max` a corner has to score strictly
     /// more than its eight neighbours. `edge` (at least 3, the radius of the circle) is the
     /// width of the border of the image without corners. At most `ceil(feature_ratio * H * W)`
-    /// points are returned, the ones of the first tiles of 32 x 8 pixels (tiles along axis 0
-    /// first, in a tile axis 0 first); `None` if there are none. `orientation` is 0 and `size`
-    /// 1.
+    /// points are returned, the first ones in the order of the points (tiles of 32 x 8 pixels,
+    /// tiles along axis 0 first, within a tile axis 0 first); `None` if there are none.
+    /// `orientation` is 0 and `size` 1.
     ///
     /// Differences from ArrayFire: the limit applies after the non-maximal suppression (ArrayFire's
     /// CPU backend limits the candidates before it), the order of the points is the one of the

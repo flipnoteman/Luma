@@ -5,6 +5,12 @@ and the analysis functions of `image.h` that are not filters (those are in
 [Images and filters](images.md)). They are built-in kernels: every backend runs them, and
 they take `[H, W]` images (`H` along axis 0, the fastest axis, as in ArrayFire).
 
+The chapters that follow cover the rest: [Harris and SUSAN corners, difference of
+Gaussians](vision-corners.md), [template matching and the nearest-neighbour and Hamming
+matchers](vision-matching.md), [Canny edges, anisotropic diffusion and mean shift](vision-edges.md),
+[connected components and deconvolution](vision-regions.md) and [ORB, SIFT and
+GLOH](vision-descriptors.md). This chapter has `fast` and `homography`.
+
 ## Points: `Keypoints`
 
 A detector returns [`Keypoints`], ArrayFire's `features`: five one-dimensional `f32` arrays `x`,
