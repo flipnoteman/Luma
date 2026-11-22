@@ -684,7 +684,8 @@ pub(crate) fn run(
     if n_layers == 0 {
         return Err(invalid(format!("{name}: n_layers is 0")));
     }
-    if !(contrast_thr > 0.0) || !(edge_thr >= 1.0) || !(init_sigma > 0.5) || !(img_scale > 0.0) || !(feature_ratio > 0.0) {
+    let valid = |v: f32, min: f32| v.is_finite() && v > min;
+    if !valid(contrast_thr, 0.0) || !(edge_thr.is_finite() && edge_thr >= 1.0) || !valid(init_sigma, 0.5) || !valid(img_scale, 0.0) || !valid(feature_ratio, 0.0) {
         return Err(invalid(format!(
             "{name}: contrast_thr {contrast_thr} and intensity_scale {img_scale} and feature_ratio {feature_ratio} must be positive, edge_thr {edge_thr} at least 1, init_sigma {init_sigma} above 0.5"
         )));

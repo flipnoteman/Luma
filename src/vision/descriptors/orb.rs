@@ -522,13 +522,13 @@ pub(crate) fn run(image: &Array<f32>, fast_thr: f32, max_feat: u32, scl: f32, le
     if h < 7 || w < 7 {
         return Err(invalid(format!("orb takes an image of at least 7 x 7, got {h} x {w}")));
     }
-    if !(fast_thr > 0.0) {
+    if fast_thr.is_nan() || fast_thr <= 0.0 {
         return Err(invalid(format!("orb: fast_thr {fast_thr} is not positive")));
     }
     if max_feat == 0 {
         return Err(invalid("orb: max_feat is 0"));
     }
-    if !(scl > 1.0 && scl.is_finite()) {
+    if scl.is_nan() || scl <= 1.0 || scl.is_infinite() {
         return Err(invalid(format!("orb: scale_factor {scl} is not greater than 1")));
     }
     if levels == 0 {
