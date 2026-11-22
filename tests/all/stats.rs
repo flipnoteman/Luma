@@ -55,6 +55,23 @@ fn f32_product_of_every_length() {
     }
 }
 
+/// Ones with a factor in 0.9..1.1 in every 997th place: few enough roundings that the product is
+/// right to a few ulps whatever the grouping (a tree of products of many values within 1e-4 of 1 is
+/// biased by f32 rounding, in ArrayFire as well).
+#[test]
+fn f32_product_is_accurate_with_sparse_factors() {
+    let ctx = Context::new().unwrap();
+    for n in [997usize, 5000, 100_003, (1 << 20) + 17] {
+        let mut data = vec![1.0f32; n];
+        for (slot, v) in data.iter_mut().step_by(997).zip(values(n / 997 + 1, 17, 0.9, 1.1)) {
+            *slot = v;
+        }
+        let x = Array::from_slice_on(&ctx, &data, n).unwrap();
+        let want: f64 = f64s(&data).iter().product();
+        near(f64::from(x.prod().item().unwrap()), want, 2e-6 * (n as f64 / 997.0), 0.0, &format!("sparse prod n={n}"));
+    }
+}
+
 #[test]
 fn f32_product_special_values() {
     let ctx = Context::new().unwrap();

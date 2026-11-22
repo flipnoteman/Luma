@@ -50,13 +50,17 @@ fn whole_array(b: &mut Bench) {
     let ctx = b.ctx.clone();
     for n in [1_000_000usize, 100_000_000] {
         let size = human(n);
-        // Values near 1, so that the product of all of them stays in range.
-        let near_one = uniform(n, 31, 0.9999, 1.0001);
+        // Ones, with a factor near 1 in every 5000th place: the product of all of them stays in range and f32
+        // rounding (a tree of products of values that close to 1 is biased by it) does not hide a wrong result.
+        let mut near_one = vec![1.0f32; n];
+        for (slot, v) in near_one.iter_mut().step_by(5000).zip(uniform(n / 5000 + 1, 31, 0.9, 1.1)) {
+            *slot = v;
+        }
         let (xl, xa) = (lumax::arr(&ctx, &near_one, n), afx::arr(&near_one, &[n as u64]));
         let want: f64 = near_one.iter().map(|&v| f64::from(v)).product();
         drop(near_one);
         let (lp, ap) = (lumax::host(&xl.prod()), afx::host(&af::product(&xa, 0)));
-        let v = compare(&lp, &ap, 2e-3, 0.0).and(compare_ref("luma", &lp, &[want], 2e-3, 0.0)).and(compare_ref("AF", &ap, &[want], 2e-3, 0.0));
+        let v = compare(&lp, &ap, 1e-3, 0.0).and(compare_ref("luma", &lp, &[want], 1e-3, 0.0)).and(compare_ref("AF", &ap, &[want], 1e-3, 0.0));
         b.run(
             "3 reduce prod",
             &size,
@@ -530,11 +534,12 @@ fn norms(b: &mut Bench) {
     let one = (0..n).map(|c| (0..n).map(|r| at(r, c)).sum::<f64>()).fold(0.0, f64::max);
     let inf = (0..n).map(|r| (0..n).map(|c| at(r, c)).sum::<f64>()).fold(0.0, f64::max);
     let fro = data.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt();
-    // ArrayFire's Frobenius norm is the L(p, q) matrix norm with p = q = 2.
+    // ArrayFire's VECTOR_2 of a matrix is the Euclidean norm of all its elements (the Frobenius norm); its L(p, q) norm
+    // is not (it gives other values).
     let matrix: [(&str, Norm, af::NormType, f64); 3] =
-        [("matrix 1-norm", Norm::MatrixOne, af::NormType::MATRIX_1, one), ("matrix inf-norm", Norm::MatrixInf, af::NormType::MATRIX_INF, inf), ("Frobenius", Norm::Frobenius, af::NormType::MATRIX_L_PQ, fro)];
+        [("matrix 1-norm", Norm::MatrixOne, af::NormType::MATRIX_1, one), ("matrix inf-norm", Norm::MatrixInf, af::NormType::MATRIX_INF, inf), ("Frobenius", Norm::Frobenius, af::NormType::VECTOR_2, fro)];
     for (label, ln, an, want) in matrix {
-        let pq = if an == af::NormType::MATRIX_L_PQ { 2.0 } else { 1.0 };
+        let pq = 2.0;
         let (lv, av) = (xl.norm_p(ln).item().unwrap(), af::norm(&xa, an, pq, pq));
         let v = compare(&[lv], &[av as f32], 1e-3, 0.0).and(compare_ref("luma", &[lv], &[want], 1e-3, 0.0));
         b.run(

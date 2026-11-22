@@ -24,10 +24,14 @@ fn whole_cases(h: &mut Harness) {
     let size = n.to_string();
     let bytes = Work::Bytes(4.0 * n as f64);
     if h.want("reduce/prod_f32") {
-        let hx = values(n, 201, 0.9999, 1.0001);
+        // Ones with a factor near 1 in every 5000th place (a tree of products of values very close to 1 is biased by f32 rounding).
+        let mut hx = vec![1.0f32; n];
+        for (slot, v) in hx.iter_mut().step_by(5000).zip(values(n / 5000 + 1, 201, 0.9, 1.1)) {
+            *slot = v;
+        }
         let x = up(h, &hx);
         let want: f64 = hx.iter().map(|&v| f64::from(v)).product();
-        check_scalar("reduce/prod_f32", f64::from(x.prod().item().unwrap()), want, 2e-3);
+        check_scalar("reduce/prod_f32", f64::from(x.prod().item().unwrap()), want, 1e-3);
         case_trim(h, "reduce/prod_f32", &size, bytes, &mut || x.prod().eval().unwrap());
     }
     if h.want("reduce/prod_u32") {

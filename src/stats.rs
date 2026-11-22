@@ -194,7 +194,7 @@ macro_rules! float_stats {
                             let bad = mismatch(self, weights, shape, name, location);
                             return (bad.clone(), bad);
                         }
-                        let weights = weights.broadcast_to(self.shape());
+                        let weights = if weights.shape() == self.shape() { weights.clone() } else { weights.broadcast_to(self.shape()) };
                         let weighted = &weights * &shifted;
                         let s0 = weights.sum_over(axis);
                         let s1 = weighted.sum_over(axis);
@@ -258,7 +258,7 @@ macro_rules! float_stats {
                 if weights.shape().dims().iter().zip(self.shape().dims()).any(|(&w, x)| w != x && w != 1) {
                     return mismatch(self, weights, reduced_shape(self.shape(), axis), name, location);
                 }
-                let weights = weights.broadcast_to(self.shape());
+                let weights = if weights.shape() == self.shape() { weights.clone() } else { weights.broadcast_to(self.shape()) };
                 &(&weights * self).sum_over(axis) / &weights.sum_over(axis)
             }
 
