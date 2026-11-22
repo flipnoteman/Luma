@@ -218,6 +218,9 @@ impl CpuBackend {
                 module.bindings.len()
             )));
         }
+        if module.bindings.iter().any(|b| matches!(b.kind, luma_core::BindingKind::Texture2d | luma_core::BindingKind::Sampler)) {
+            return Err(BackendError::Unsupported(format!("kernel `{label}` reads a texture; the CPU backend has no textures")));
+        }
         let limits = &self.info.limits;
         let invocations: u64 = module
             .workgroup_size

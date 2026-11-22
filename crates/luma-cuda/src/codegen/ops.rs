@@ -790,3 +790,18 @@ pub(crate) fn subgroup(fb: &mut Fb, op: IrSubgroupOp, s: ScalarTy, v: &Op, lane:
         None => fb.def(&format!("call {t} @{name}({t} {v})")),
     }
 }
+
+/// A fetch from the texture object whose handle is held in `ptr` (an `i8*` made of the `i64`
+/// parameter): the four channels as `f32` lanes. `x` and `y` are `i32` texel coordinates for
+/// `Load` and `f32` normalized coordinates otherwise.
+pub(crate) fn texture(fb: &mut Fb, op: TextureOp, ptr: &Op, x: &Op, y: &Op) -> Vec<Op> {
+    let handle = fb.def(&format!("ptrtoint i8* {ptr} to i64"));
+    let (name, ct) = match op {
+        TextureOp::Load => ("llvm.nvvm.tex.unified.2d.v4f32.s32".to_string(), "i32"),
+        TextureOp::Sample => ("llvm.nvvm.tex.unified.2d.v4f32.f32".to_string(), "float"),
+        TextureOp::Gather(c) => (format!("llvm.nvvm.tld4.unified.{}.2d.v4f32.f32", ["r", "g", "b", "a"][usize::from(c & 3)]), "float"),
+    };
+    fb.declare(&format!("declare {{ float, float, float, float }} @{name}(i64, {ct}, {ct})"));
+    let r = fb.def(&format!("call {{ float, float, float, float }} @{name}(i64 {handle}, {ct} {x}, {ct} {y})"));
+    (0..4).map(|k| fb.def(&format!("extractvalue {{ float, float, float, float }} {r}, {k}"))).collect()
+}

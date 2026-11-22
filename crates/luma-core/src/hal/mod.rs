@@ -504,6 +504,8 @@ impl BufferUsage {
     pub const MAP_READ: Self = Self(1 << 5);
     /// Mappable for writing by the host.
     pub const MAP_WRITE: Self = Self(1 << 6);
+    /// A texture ([`Backend::create_texture`]): only a texture or sampler binding takes it.
+    pub const TEXTURE: Self = Self(1 << 7);
 
     /// No usage.
     pub const fn empty() -> Self {
@@ -679,7 +681,10 @@ impl CompiledKernel {
             // layout; a uniform where a storage buffer is expected (or the reverse) does.
             let (passed, fits) = match arg {
                 RawArg::Uniform(_) => ("uniform", info.kind == BindingKind::Uniform),
-                RawArg::Storage { .. } => ("storage buffer", info.kind != BindingKind::Uniform),
+                RawArg::Storage { buffer, .. } if buffer.usage().contains(BufferUsage::TEXTURE) => {
+                    ("texture", matches!(info.kind, BindingKind::Texture2d | BindingKind::Sampler))
+                }
+                RawArg::Storage { .. } => ("storage buffer", matches!(info.kind, BindingKind::StorageRead | BindingKind::StorageReadWrite)),
             };
             if !fits {
                 return Err(BackendError::KernelBinding(format!(

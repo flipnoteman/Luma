@@ -1092,6 +1092,9 @@ mod imp {
             {
                 return Err(BackendError::KernelBinding(format!("the used-binding mask has {} entries for {} bindings", mask.len(), module.bindings.len())));
             }
+            if module.bindings.iter().any(|b| matches!(b.kind, luma_core::BindingKind::Texture2d | luma_core::BindingKind::Sampler)) {
+                return Err(BackendError::Unsupported(format!("kernel `{label}` reads a texture; the Metal backend has no textures")));
+            }
             let checked = if trust.checks_bounds() { luma_core::kir::opt::with_bounds_checks(module) } else { Cow::Borrowed(module) };
             let optimized = luma_core::kir::optimize_for_target(&checked, false);
             let msl = emit_with_workgroup_init(&optimized, used, trust.zero_workgroup_memory());

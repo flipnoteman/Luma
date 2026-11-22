@@ -139,7 +139,7 @@ impl An {
                 AccessStep::Index(i) => self.uniform(i),
                 AccessStep::Field(_) => true,
             }),
-            Expr::FnParam(_) | Expr::Private(_) | Expr::Load { .. } | Expr::StorageRead { .. } | Expr::SharedLoad { .. } | Expr::SharedRead { .. } | Expr::Call { .. } | Expr::AtomicLoad { .. } | Expr::Subgroup { .. } => false,
+            Expr::FnParam(_) | Expr::Private(_) | Expr::Load { .. } | Expr::StorageRead { .. } | Expr::SharedLoad { .. } | Expr::SharedRead { .. } | Expr::Call { .. } | Expr::AtomicLoad { .. } | Expr::Subgroup { .. } | Expr::Texture { .. } => false,
             Expr::Access { base, step, .. } => {
                 self.uniform(base)
                     && match step {

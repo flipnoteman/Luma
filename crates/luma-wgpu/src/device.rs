@@ -272,6 +272,8 @@ async fn request_device(fresh: bool) -> Result<Gpu, BackendError> {
     // Hardware `f32` atomic adds for the scatter and group kernels (a compare-and-swap loop on
     // the bits is the fallback, and collapses when many invocations add to few cells).
     required_features |= adapter.features() & wgpu::Features::SHADER_FLOAT32_ATOMIC;
+    // Textures of `f32` texels that a filtering sampler may read (kernels read textures through one).
+    required_features |= adapter.features() & wgpu::Features::FLOAT32_FILTERABLE;
     // Only on unified memory: on a discrete GPU mappable storage buffers live in slow host memory.
     if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
         required_features |= adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;

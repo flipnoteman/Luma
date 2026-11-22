@@ -60,6 +60,8 @@ pub fn used_bindings(module: &KernelModule) -> (usize, Option<Box<[bool]>>) {
             *slot = true;
         }
     };
+    // A filtered or gathering fetch needs the sampler the kernel declares.
+    let samplers: Vec<u32> = module.bindings.iter().enumerate().filter(|(_, b)| b.kind == BindingKind::Sampler).map(|(i, _)| i as u32).collect();
     let mut scan = |block: &[Stmt]| {
         walk_stmts(block, &mut |s| {
             match s {
@@ -82,7 +84,11 @@ pub fn used_bindings(module: &KernelModule) -> (usize, Option<Box<[bool]>>) {
                     | Expr::StorageRead { binding, .. }
                     | Expr::UniformRead { binding, .. }
                     | Expr::ArrayLength { binding }
-                    | Expr::Texture { binding, .. } => mark(*binding),
+                    | Expr::Texture { op: TextureOp::Load, binding, .. } => mark(*binding),
+                    Expr::Texture { binding, .. } => {
+                        mark(*binding);
+                        samplers.iter().for_each(|&s| mark(s));
+                    }
                     Expr::AtomicLoad { target: AtomicTarget::Storage { binding, .. }, .. } => mark(*binding),
                     _ => {}
                 })

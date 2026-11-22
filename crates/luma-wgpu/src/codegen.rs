@@ -259,6 +259,7 @@ impl Em<'_> {
         match e {
             Expr::LitBool(_) => KirType::BOOL,
             Expr::LitU32(_) | Expr::GridSize(_) | Expr::ArrayLength { .. } => KirType::U32,
+            Expr::Texture { .. } => KirType::vec(ScalarTy::F32, 4),
             Expr::LitI32(_) => KirType::I32,
             Expr::LitF16(_) => KirType::Scalar(ScalarTy::F16),
             Expr::LitF32(_) => KirType::F32,
@@ -457,6 +458,9 @@ impl Em<'_> {
                 }
             }
             Expr::ArrayLength { binding } => format!("arrayLength(&{})", self.binding_name(*binding)),
+            // A kernel that samples a texture reaches this backend as a naga module (`compile_naga`),
+            // never through this emitter.
+            Expr::Texture { .. } => unreachable!("texture kernels are compiled from their naga module"),
         }
     }
 
@@ -1070,6 +1074,7 @@ impl Em<'_> {
                 BindingKind::Uniform => "uniform",
                 BindingKind::StorageRead => "storage, read",
                 BindingKind::StorageReadWrite => "storage, read_write",
+                BindingKind::Texture2d | BindingKind::Sampler => unreachable!("texture kernels are compiled from their naga module"),
             };
             let mut ty = self.ty(&self.binding_root_ty_decl(d));
             if self.hardware[i] {
