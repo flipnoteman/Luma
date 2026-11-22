@@ -50,21 +50,35 @@ fn af_points(f: &af::Features, swap: bool) -> HashMap<(u32, u32), f32> {
     (0..x.len()).map(|i| (if swap { (y[i] as u32, x[i] as u32) } else { (x[i] as u32, y[i] as u32) }, s[i])).collect()
 }
 
-/// The verdict of two corner sets.
-/// `floor` is the score below which a relative difference means nothing (SUSAN's response is a
-/// difference of nearly equal numbers, so its rounding error is relative to `geom_thr`).
-fn sets(luma: &HashMap<(u32, u32), f32>, af: &HashMap<(u32, u32), f32>, floor: f32) -> Verdict {
-    let only_luma = luma.keys().filter(|p| !af.contains_key(p)).count();
-    let only_af = af.keys().filter(|p| !luma.contains_key(p)).count();
-    let tol = (af.len() / 1000).max(3);
+/// The verdict of two corner sets. With `ranked` (the strongest `k` of more) the corners that
+/// are in only one set must tie, within float rounding, with the weakest corner of the other
+/// set: which of equally strong corners are kept is arbitrary; otherwise a few differences
+/// (0.1 % of the corners, at least 3) are allowed for neighbours whose responses tie up to
+/// rounding.
+fn sets(luma: &HashMap<(u32, u32), f32>, af: &HashMap<(u32, u32), f32>, floor: f32, ranked: bool) -> Verdict {
+    let only_luma: Vec<f32> = luma.iter().filter(|(p, _)| !af.contains_key(p)).map(|(_, &s)| s).collect();
+    let only_af: Vec<f32> = af.iter().filter(|(p, _)| !luma.contains_key(p)).map(|(_, &s)| s).collect();
     let mut worst = 0.0f64;
     for (p, &s) in luma {
         if let Some(&a) = af.get(p) {
             worst = worst.max((f64::from(s) - f64::from(a)).abs() / f64::from(a).abs().max(f64::from(floor)));
         }
     }
-    let text = format!("{} corners (ArrayFire {}), {only_luma} only in luma, {only_af} only in ArrayFire, scores of the common ones within {worst:.1e} relative (to the larger of the score and the floor)", luma.len(), af.len());
-    if only_luma <= tol && only_af <= tol && worst <= 1e-3 {
+    let ties = |only: &[f32], other: &HashMap<(u32, u32), f32>| {
+        let bound = other.values().copied().fold(f32::INFINITY, f32::min);
+        only.iter().all(|&s| (f64::from(s) - f64::from(bound)).abs() <= 1e-4 * f64::from(bound).abs())
+    };
+    let tol = (af.len() / 1000).max(3);
+    let same = if ranked { ties(&only_luma, af) && ties(&only_af, luma) && only_luma.len() == only_af.len() } else { only_luma.len() <= tol && only_af.len() <= tol };
+    let text = format!(
+        "{} corners (ArrayFire {}), {} only in luma, {} only in ArrayFire{}, scores of the common ones within {worst:.1e} relative (to the larger of the score and the floor)",
+        luma.len(),
+        af.len(),
+        only_luma.len(),
+        only_af.len(),
+        if ranked { " (all tied with the weakest of the other)" } else { "" }
+    );
+    if same && worst <= 1e-3 {
         Verdict::yes(text)
     } else {
         Verdict::no(format!("NO: {text}"))
@@ -110,7 +124,7 @@ pub fn rows(b: &mut Bench) {
             ] {
                 let l = || xl.harris(max, minr, sigma, block as usize, 0.04).unwrap();
                 let a = || af::harris(&xa, max as u32, minr, sigma, block as u32, 0.04);
-                let v = sets(&luma_points(&l()), &af_points(&a(), false), 1e-30);
+                let v = sets(&luma_points(&l()), &af_points(&a(), false), 1e-30, max > 0);
                 b.run(&format!("14 {name}"), &size, v, note, &mut lr(&ctx, l), &mut ar(a));
             }
             // The same without noise: few corners, so the ranking has little to sort.
@@ -119,14 +133,14 @@ pub fn rows(b: &mut Bench) {
                 let (cl, ca) = (lumax::arr(&ctx, &clean, [h, w]), afx::arr(&clean, &[h as u64, w as u64]));
                 let l = || cl.harris(500, 1e5, 1.0, 0, 0.04).unwrap();
                 let a = || af::harris(&ca, 500, 1e5, 1.0, 0, 0.04);
-                let v = sets(&luma_points(&l()), &af_points(&a(), false), 1e-30);
+                let v = sets(&luma_points(&l()), &af_points(&a(), false), 1e-30, true);
                 b.run("14 harris 500, no noise", &size, v, "image of blocks without noise (few corners); the strongest 500", &mut lr(&ctx, l), &mut ar(a));
             }
             // SUSAN.
             for (name, r, t, g, edge) in [("susan r3", 3usize, 32.0f32, 10.0f32, 3usize), ("susan r5", 5, 32.0, 30.0, 5)] {
                 let l = || xl.susan(r, t, g, 0.05, edge).unwrap();
                 let a = || af::susan(&xa, r as u32, t, g, 0.05, edge as u32);
-                let v = sets(&luma_points(&l()), &af_points(&a(), true), g * 1e-3);
+                let v = sets(&luma_points(&l()), &af_points(&a(), true), g * 1e-3, false);
                 b.run(&format!("14 {name}"), &size, v, "x and y compared swapped (ArrayFire's x is the row)", &mut lr(&ctx, l), &mut ar(a));
             }
             // Difference of Gaussians.
