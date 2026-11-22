@@ -5,7 +5,7 @@
 //! A texture is an implementation detail of how luma reads an `f32` array: nothing is exposed to
 //! the user, and the reads are exact (point fetches and gathers, no hardware filtering) unless the
 //! caller asked for [filtered sampling](crate::Interp). The decision to read through one is made by
-//! [`crate::jit::cost::texture_pays`], which weighs what making the view costs.
+//! [`crate::jit::cost::read_path`], which weighs what making the view costs.
 
 use luma_core::{Buffer, TextureDesc, TextureFilter, TextureFormat};
 
@@ -45,7 +45,7 @@ impl Context {
         }
         let pitch = u64::from(w) * 4;
         // The device wants rows this many bytes apart: a texture of another width is not made
-        // (building it would copy the image, see `jit::cost::texture_pays`).
+        // (building it would copy the image, see `jit::cost::read_path`).
         if !pitch.is_multiple_of(u64::from(caps.pitch_align)) {
             return Ok(None);
         }
