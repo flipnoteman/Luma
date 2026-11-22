@@ -127,6 +127,10 @@ struct BlockParams {
     k: u32,
     nbw: u32,
     has_t: u32,
+    has_c: u32,
+    t_row0: u32,
+    t_col0: u32,
+    t_stride: u32,
 }
 
 /// The kernel that factors the diagonal block of columns `k..k + nbw`: `A_kk - T[..nbw]` (`T` the
@@ -155,8 +159,10 @@ fn diag_source(nb: usize) -> String {
         let rr{u} = min(i0 + {u}u, nbw - 1u);
         let cc{u} = min(cid, nbw - 1u);
         let g{u} = a[luma_view_idx3(av, k + cc{u}, k + rr{u}, 0u)];
-        let t{u} = tm[select(0u, rr{u} * nbw + cc{u}, p.has_t != 0u)];
-        let v{u} = select(g{u}, g{u} - t{u}, p.has_t != 0u);
+        let t{u} = tm[select(0u, (rr{u} + p.t_row0) * p.t_stride + p.t_col0 + cc{u}, p.has_t != 0u)];
+        let c{u} = tc[select(0u, rr{u} * nbw + cc{u}, p.has_c != 0u)];
+        let w{u} = select(g{u}, g{u} - t{u}, p.has_t != 0u);
+        let v{u} = select(w{u}, w{u} - c{u}, p.has_c != 0u);
 "
         );
         stores += &format!("        if (live{u}) {{ s[off(i0 + {u}u) + cid] = v{u}; }}\n");
@@ -230,13 +236,14 @@ fn diag_source(nb: usize) -> String {
         solve += &format!("            let x{p} = {cur} * rv[{p}];\n            s[ri + c0 + {p}u] = x{p};\n");
     }
     format!(
-        "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
+        "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32, has_c: u32, t_row0: u32, t_col0: u32, t_stride: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
 @group(1) @binding(1) var<uniform> av: LumaView;
 @group(1) @binding(2) var<storage, read> tm: array<f32>;
-@group(1) @binding(3) var<storage, read_write> dk: array<f32>;
-@group(1) @binding(4) var<storage, read_write> o: array<f32>;
-@group(1) @binding(5) var<uniform> p: Params;
+@group(1) @binding(3) var<storage, read> tc: array<f32>;
+@group(1) @binding(4) var<storage, read_write> dk: array<f32>;
+@group(1) @binding(5) var<storage, read_write> o: array<f32>;
+@group(1) @binding(6) var<uniform> p: Params;
 
 var<workgroup> rv: array<f32, 8>;
 var<workgroup> s: array<f32, {size}>;
@@ -341,8 +348,10 @@ fn panel_source(nb: usize) -> String {
                 "        let ro{u}_{cb} = min(rr + {u}u, rows - 1u);
         let co{u}_{cb} = min({cb}u * 32u + lane, nbw - 1u);
         let g{u}_{cb} = a[luma_view_idx3(av, k + co{u}_{cb}, r0 + ro{u}_{cb}, 0u)];
-        let t{u}_{cb} = tm[select(0u, (r0 + ro{u}_{cb} - k) * nbw + co{u}_{cb}, p.has_t != 0u)];
-        let v{u}_{cb} = select(g{u}_{cb}, g{u}_{cb} - t{u}_{cb}, p.has_t != 0u);
+        let t{u}_{cb} = tm[select(0u, (r0 + ro{u}_{cb} - k + p.t_row0) * p.t_stride + p.t_col0 + co{u}_{cb}, p.has_t != 0u)];
+        let c{u}_{cb} = tc[select(0u, (r0 + ro{u}_{cb} - k) * nbw + co{u}_{cb}, p.has_c != 0u)];
+        let w{u}_{cb} = select(g{u}_{cb}, g{u}_{cb} - t{u}_{cb}, p.has_t != 0u);
+        let v{u}_{cb} = select(w{u}_{cb}, w{u}_{cb} - c{u}_{cb}, p.has_c != 0u);
 "
             );
             stores += &format!("        if (rr + {u}u < rows && {cb}u * 32u + lane < nbw) {{ tile[({cb}u * 32u + lane) * 33u + rr + {u}u] = v{u}_{cb}; }}\n");
@@ -364,13 +373,14 @@ fn panel_source(nb: usize) -> String {
         ss += &format!("        if (i{w} < total) {{ lb[i{w}] = w{w}; }}\n");
     }
     format!(
-        "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32 }}
+        "struct Params {{ n: u32, k: u32, nbw: u32, has_t: u32, has_c: u32, t_row0: u32, t_col0: u32, t_stride: u32 }}
 @group(1) @binding(0) var<storage, read> a: array<f32>;
 @group(1) @binding(1) var<uniform> av: LumaView;
 @group(1) @binding(2) var<storage, read> tm: array<f32>;
-@group(1) @binding(3) var<storage, read> dk: array<f32>;
-@group(1) @binding(4) var<storage, read_write> o: array<f32>;
-@group(1) @binding(5) var<uniform> p: Params;
+@group(1) @binding(3) var<storage, read> tc: array<f32>;
+@group(1) @binding(4) var<storage, read> dk: array<f32>;
+@group(1) @binding(5) var<storage, read_write> o: array<f32>;
+@group(1) @binding(6) var<uniform> p: Params;
 
 var<workgroup> tile: array<f32, {tsize}>;
 var<workgroup> lb: array<vec4<f32>, {lsize}>;
@@ -441,36 +451,58 @@ fn blocked(a: &Array<f32>, loc: &'static Location<'static>) -> Array<f32> {
     let ctx = a.context();
     let [n, ..] = a.shape().dims();
     let nb = block_size(ctx);
+    // The columns an outer step brings up to date together with one product: a product of 128 columns
+    // only fills a fifth of the multiprocessors, one of 512 runs about twice as fast.
+    let wide = std::env::var("LUMA_CHOL_WIDE").ok().and_then(|v| v.parse().ok()).filter(|w: &usize| w % nb == 0 && *w >= nb).unwrap_or(4 * nb);
     let shape = Shape::from([n, n]);
     let setup = (Array::<f32>::zeros_on(ctx, shape), Array::<f32>::alloc(ctx, Shape::from([nb, nb])), Array::<f32>::alloc(ctx, Shape::from(1)));
     let (mut out, mut dk, dummy) = match setup {
         (Ok(o), Ok(d), Ok(m)) => (o, d, m),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return fail(ctx, a.shape(), e, "cholesky", loc),
     };
-    let mut k = 0;
-    while k < n {
-        let nbw = nb.min(n - k);
-        // The rows of the block are the first rows of the operand: one copy of the finished columns.
-        let t = (k > 0).then(|| {
-            let done = block(&out, k..n, 0..k).cache();
-            product(&done, &done.slice(1, 0..nbw).transpose())
+    let mut ko = 0;
+    while ko < n {
+        let wo = wide.min(n - ko);
+        // The rows of the outer step are the first rows of the operand: one copy of the finished columns.
+        let big = (ko > 0).then(|| {
+            let done = block(&out, ko..n, 0..ko).cache();
+            product(&done, &done.slice(1, 0..wo).transpose())
         });
-        let params = BlockParams { n: n as u32, k: k as u32, nbw: nbw as u32, has_t: u32::from(k > 0) };
-        let tref = t.as_ref().unwrap_or(&dummy);
-        let diag: [KernelArg<'_>; 5] = [view(a), tref.into(), (&mut dk).into(), (&mut out).into(), uniform(&params)];
-        let key = format!("chol_diag/{nb}");
-        if let Err(e) = launch_unchecked(ctx, &key, "chol_diag", || diag_source(nb), [1, 1, 1], &diag) {
-            return fail(ctx, a.shape(), e, "cholesky", loc);
-        }
-        let rows = n - k - nbw;
-        if rows > 0 {
-            let panel: [KernelArg<'_>; 5] = [view(a), tref.into(), (&dk).into(), (&mut out).into(), uniform(&params)];
-            let key = format!("chol_panel/{nb}");
-            if let Err(e) = launch_unchecked(ctx, &key, "chol_panel", || panel_source(nb), [rows.div_ceil(32) as u32, 1, 1], &panel) {
+        let mut k = ko;
+        while k < ko + wo {
+            let nbw = nb.min(ko + wo - k);
+            // The columns of this outer step before the block, `K = k - ko` of them.
+            let corr = (k > ko).then(|| {
+                let done = block(&out, k..n, ko..k).cache();
+                product(&done, &done.slice(1, 0..nbw).transpose())
+            });
+            let params = BlockParams {
+                n: n as u32,
+                k: k as u32,
+                nbw: nbw as u32,
+                has_t: u32::from(big.is_some()),
+                has_c: u32::from(corr.is_some()),
+                t_row0: (k - ko) as u32,
+                t_col0: (k - ko) as u32,
+                t_stride: wo as u32,
+            };
+            let (tref, cref) = (big.as_ref().unwrap_or(&dummy), corr.as_ref().unwrap_or(&dummy));
+            let diag: [KernelArg<'_>; 6] = [view(a), tref.into(), cref.into(), (&mut dk).into(), (&mut out).into(), uniform(&params)];
+            let key = format!("chol_diag/{nb}");
+            if let Err(e) = launch_unchecked(ctx, &key, "chol_diag", || diag_source(nb), [1, 1, 1], &diag) {
                 return fail(ctx, a.shape(), e, "cholesky", loc);
             }
+            let rows = n - k - nbw;
+            if rows > 0 {
+                let panel: [KernelArg<'_>; 6] = [view(a), tref.into(), cref.into(), (&dk).into(), (&mut out).into(), uniform(&params)];
+                let key = format!("chol_panel/{nb}");
+                if let Err(e) = launch_unchecked(ctx, &key, "chol_panel", || panel_source(nb), [rows.div_ceil(32) as u32, 1, 1], &panel) {
+                    return fail(ctx, a.shape(), e, "cholesky", loc);
+                }
+            }
+            k += nbw;
         }
-        k += nbw;
+        ko += wo;
     }
     out
 }

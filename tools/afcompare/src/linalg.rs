@@ -149,7 +149,8 @@ fn on(name: &str) -> bool {
 
 pub fn linalg(b: &mut Bench) {
     b.guarded("linalg", |b| {
-        let groups: [(&str, fn(&mut Bench)); 10] = [
+        let groups: [(&str, fn(&mut Bench)); 11] = [
+            ("mmprobe", mm_probe),
             ("cholprobe", chol_probe),
             ("cholesky", cholesky),
             ("triangular", triangular),
@@ -167,6 +168,29 @@ pub fn linalg(b: &mut Bench) {
             }
         }
     });
+}
+
+/// `LINALG_ROWS=mmprobe`: wall time of `matmul_f32` (A Bᵀ, as the blocked factorisations take it) over the
+/// shapes of their trailing updates, to see what the width of a block costs.
+fn mm_probe(b: &mut Bench) {
+    let ctx = b.ctx.clone();
+    for (m, k, n) in [(2048usize, 2048usize, 128usize), (2048, 2048, 256), (2048, 2048, 512), (4096, 512, 128), (4096, 512, 256), (1024, 1024, 128), (1024, 1024, 256), (3072, 1024, 128), (3072, 1024, 256), (2048, 2048, 2048)] {
+        let a = lumax::arr(&ctx, &uniform(m * k, 1, -1.0, 1.0), [k, m]);
+        let bt = lumax::arr(&ctx, &uniform(n * k, 2, -1.0, 1.0), [k, n]);
+        let run = |a: &L, bt: &L| luma::matmul_f32(a, &bt.transpose());
+        for _ in 0..5 {
+            run(&a, &bt).eval().unwrap();
+        }
+        ctx.sync().unwrap();
+        let reps = 40;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            run(&a, &bt).eval().unwrap();
+        }
+        ctx.sync().unwrap();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        println!("mmprobe M={m} K={k} N={n}: {us:.1} us, {:.2} TFlops", 2.0 * (m * k * n) as f64 / us / 1e6);
+    }
 }
 
 /// `LINALG_ROWS=cholprobe`: small single-block sizes of the Cholesky factorisation, to read the time of
