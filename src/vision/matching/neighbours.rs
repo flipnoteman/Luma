@@ -186,7 +186,8 @@ fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: vec
             ts[e * {BT}u + f] = b;
         }}
         workgroupBarrier();
-        for (var e = 0u; e < {KL}u; e++) {{
+        let ne = min({KL}u, p.len - e0);
+        for (var e = 0u; e < ne; e++) {{
 ",
         words = KL * BQ
     );
