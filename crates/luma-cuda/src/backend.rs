@@ -25,7 +25,7 @@ use luma_core::hal::copy_parallel;
 use luma_core::kir::{self, KernelModule};
 use luma_core::{
     Backend, BackendError, BackendKind, Buffer, BufferUsage, CompiledKernel, CostModel, DeviceInfo, DeviceLimits, DiskCache, Dispatch, ExecGraph, Features, FusionSplit, GraphLaunch,
-    KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, TuningProfile,
+    KernelTrust, NativeBuffer, NativeKernel, Profile, RawArg, RawKernel, TensorSpec, TuningProfile,
 };
 
 use crate::codegen::{self, CudaArgAbi};
@@ -282,7 +282,36 @@ fn compile_native(shared: &CudaShared, module: &KernelModule, used: Option<&[boo
         translated.source.len(),
         phases
     );
-    Ok(CudaKernel { func, workgroup: optimized.workgroup_size, param_abis: translated.param_abis, array_lengths: translated.array_lengths, strides })
+    Ok(CudaKernel { func, workgroup: optimized.workgroup_size, shared_bytes: 0, param_abis: translated.param_abis, array_lengths: translated.array_lengths, strides })
+}
+
+/// The output tiles of the tensor-core products, largest first (see [`crate::tensor`]).
+const TENSOR_TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
+
+/// The tensor-core product of `spec`, loaded from its PTX.
+fn compile_tensor(shared: &CudaShared, spec: &TensorSpec) -> Result<CudaKernel, BackendError> {
+    let config = crate::tensor::Config::of(spec);
+    let source = crate::tensor::ptx(&config);
+    if let Some(dir) = DUMP_DIR.as_deref() {
+        // Best effort: a debugging aid must not fail a compile.
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join(format!("tensor-{}x{}-{}{}.ptx", spec.rows, spec.cols, u8::from(spec.lhs_transposed), u8::from(spec.rhs_transposed))), &source);
+    }
+    shared.ctx.bind_to_thread().map_err(gpu)?;
+    let module = shared.ctx.load_module(Ptx::from_src(source)).map_err(gpu)?;
+    let func = module.load_function("main").map_err(gpu)?;
+    let bytes = config.shared_bytes();
+    if bytes > 48 * 1024 {
+        func.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32).map_err(gpu)?;
+    }
+    Ok(CudaKernel {
+        func,
+        workgroup: [config.threads(), 1, 1],
+        shared_bytes: bytes,
+        param_abis: vec![CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::DevicePtr, CudaArgAbi::InlineUniform { size: 16 }],
+        array_lengths: Vec::new(),
+        strides: Vec::new(),
+    })
 }
 
 /// A compiled kernel.
@@ -290,6 +319,8 @@ fn compile_native(shared: &CudaShared, module: &KernelModule, used: Option<&[boo
 struct CudaKernel {
     func: CudaFunction,
     workgroup: [u32; 3],
+    /// Dynamic shared memory of a workgroup.
+    shared_bytes: u32,
     param_abis: Vec<CudaArgAbi>,
     /// The bindings whose length is passed, and the element stride dividing their bound bytes.
     array_lengths: Vec<u32>,
@@ -1132,7 +1163,7 @@ impl CudaBackend {
                 native.func.cu_function(),
                 (grid[0], grid[1], grid[2]),
                 (native.workgroup[0], native.workgroup[1], native.workgroup[2]),
-                0,
+                native.shared_bytes,
                 self.stream.cu_stream(),
                 &mut params.ptrs[..],
             )
@@ -1228,7 +1259,7 @@ impl CudaBackend {
                         native.func.cu_function(),
                         (grid[0], grid[1], grid[2]),
                         (native.workgroup[0], native.workgroup[1], native.workgroup[2]),
-                        0,
+                        native.shared_bytes,
                         stream.cu_stream(),
                         &mut params.ptrs[..],
                     )
@@ -1306,6 +1337,20 @@ impl Backend for CudaBackend {
     fn compile_kernel(&self, module: &KernelModule, used: Option<&[bool]>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {
         check_mask(module, used)?;
         compile_native(&self.shared, module, used, label, trust).map(RawKernel::new)
+    }
+
+    fn tensor_matmul_tiles(&self) -> &[(u32, u32)] {
+        if self.shared.cc.0 >= 8 { &TENSOR_TILES } else { &[] }
+    }
+
+    fn compile_tensor_matmul(&self, spec: &TensorSpec) -> Option<RawKernel> {
+        match compile_tensor(&self.shared, spec) {
+            Ok(kernel) => Some(RawKernel::new(kernel)),
+            Err(error) => {
+                log::warn!("luma-cuda: the tensor-core product {spec:?} did not compile: {error}");
+                None
+            }
+        }
     }
 
     fn compile_kernel_deferred(&self, module: KernelModule, used: Option<Box<[bool]>>, label: &str, trust: KernelTrust) -> Result<RawKernel, BackendError> {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use luma_core::kir::{self, KernelModule};
 use luma_core::naga;
-use luma_core::{Backend, BackendError, CompiledKernel, KernelTrust, LineSolveSpec, MatmulSpec, RawKernel};
+use luma_core::{Backend, BackendError, CompiledKernel, KernelTrust, LineSolveSpec, MatmulSpec, RawKernel, TensorSpec};
 pub use luma_core::{BindingInfo, BindingKind};
 
 use crate::array::{Array, Failure};
@@ -147,6 +147,9 @@ pub(crate) enum Native {
     /// A matrix product, see [`MatmulSpec`]; its shader is not the product of the tile the spec
     /// names, so the backend has to compile it.
     Matmul(MatmulSpec),
+    /// A matrix product on tensor cores, see [`TensorSpec`]; like [`Native::Matmul`] the backend
+    /// has to compile it.
+    TensorMatmul(TensorSpec),
     /// A batched matrix product, see [`Backend::compile_batched_matmul`]; the shader is the
     /// fallback.
     BatchedMatmul,
@@ -187,9 +190,10 @@ pub(crate) fn build_core_native(
     let native = native.filter(|_| all_bound).and_then(|spec| match spec {
         Native::LineSolve(spec) => backend.compile_line_solve(&spec),
         Native::Matmul(spec) => backend.compile_matmul(&spec),
+        Native::TensorMatmul(spec) => backend.compile_tensor_matmul(&spec),
         Native::BatchedMatmul => backend.compile_batched_matmul(),
     });
-    if native.is_none() && matches!(requested, Some(Native::Matmul(_))) {
+    if native.is_none() && matches!(requested, Some(Native::Matmul(_) | Native::TensorMatmul(_))) {
         return Err(BackendError::Unsupported("the backend cannot compile the native matrix product it planned".into()).into());
     }
     let raw = match native {

@@ -887,6 +887,23 @@ pub struct MatmulSpec {
     pub rhs_transposed: bool,
 }
 
+/// A matrix product on tensor cores, with the operands rounded to TF32 (10 bits of mantissa) and
+/// accumulated in `f32` (`Builtin::Matmul` of `luma` with a `Tensor` tile). The launch is that of
+/// [`MatmulSpec`] (the bindings, the uniform `{m, n, k, kc}`, the slices of K), but one workgroup
+/// computes a tile of `rows` x `cols` outputs and the grid is `[column tiles, row tiles, slices]`
+/// (never folded). `m`, `n` and `k` are multiples of 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TensorSpec {
+    /// Rows of an output tile.
+    pub rows: u32,
+    /// Columns of an output tile.
+    pub cols: u32,
+    /// Whether `a` holds the transpose of the left matrix.
+    pub lhs_transposed: bool,
+    /// Whether `b` holds the transpose of the right matrix.
+    pub rhs_transposed: bool,
+}
+
 /// A GPU backend: allocates buffers, compiles kernels and records and runs work.
 pub trait Backend: fmt::Debug + Send + Sync + 'static {
     /// What is known about the device.
@@ -970,6 +987,15 @@ pub trait Backend: fmt::Debug + Send + Sync + 'static {
     }
     /// The native code of a matrix product (always `None` unless [`Backend::native_matmul`]).
     fn compile_matmul(&self, _spec: &MatmulSpec) -> Option<RawKernel> {
+        None
+    }
+    /// The output tiles (rows, columns) of the tensor-core products ([`Backend::compile_tensor_matmul`])
+    /// the backend runs, largest first; empty if it has none.
+    fn tensor_matmul_tiles(&self) -> &[(u32, u32)] {
+        &[]
+    }
+    /// The code of a tensor-core matrix product with one of the tiles of [`Backend::tensor_matmul_tiles`].
+    fn compile_tensor_matmul(&self, _spec: &TensorSpec) -> Option<RawKernel> {
         None
     }
     /// The native code of a batched matrix product (`Builtin::Bmm` of `luma`), `None` to compile

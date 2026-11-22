@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod codegen;
 mod nvvm;
+mod tensor;
 
 pub use backend::CudaBackend;
 

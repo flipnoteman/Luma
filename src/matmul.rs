@@ -53,6 +53,10 @@ pub(crate) enum MatmulTile {
     /// code (see [`native_plan`]), the buffer of an operand holding the matrix transposed if
     /// `lhs_t` / `rhs_t`; its shader is that of `T32` (the bindings), never run.
     Native { edge: u32, lhs_t: bool, rhs_t: bool },
+    /// A tile of `rows` x `cols` a backend multiplies on tensor cores in TF32 (see
+    /// [`tensor_plan`]), the buffer of an operand holding the matrix transposed if `lhs_t` /
+    /// `rhs_t`; its shader is that of `T32` (the bindings), never run.
+    Tensor { rows: u32, cols: u32, lhs_t: bool, rhs_t: bool },
     /// A small output (see [`skinny_tile`]): each invocation of a workgroup of `width` computes
     /// `rows` x `cols` outputs straight from global memory, and the `groups` invocations that own
     /// the same outputs take the `k` in turn. With `along_k` neighbouring invocations take
@@ -69,6 +73,7 @@ impl MatmulTile {
             MatmulTile::T32x128 => (32, 128),
             MatmulTile::T32 => (32, 32),
             MatmulTile::Native { edge, .. } => (edge, edge),
+            MatmulTile::Tensor { rows, cols, .. } => (rows, cols),
             MatmulTile::Skinny { .. } => unreachable!("a skinny product has no output tiles of fixed edges"),
         }
     }
@@ -156,14 +161,49 @@ impl Array<f32> {
     pub fn matmul(&self, rhs: &Array<f32>) -> Array<f32> {
         matmul(self, rhs)
     }
+
+    /// [`Array::matmul`] on the tensor cores of the device, with the operands rounded to TF32
+    /// (a 10-bit mantissa, the range of `f32`) and the products accumulated in `f32`: the result
+    /// differs from the `f32` product by about `2^-11` of the magnitudes summed (a relative error
+    /// of 1e-3 to 1e-4 for sums of random signs), which is the precision of PyTorch's
+    /// `allow_tf32`. Opt-in: [`Array::matmul`] never rounds its operands. (An infinite operand
+    /// makes the entries it meets NaN instead of infinite, and an operand within 2^-11 of the
+    /// largest `f32` rounds up to NaN: the rounding is an integer addition.)
+    ///
+    /// Only the CUDA backend on a device with tensor cores of compute capability 8.0 or higher
+    /// runs it, and only for products whose `M`, `N` and `K` are multiples of 4 and at least 32
+    /// (operands that are transposed views are read in place, other expressions evaluated
+    /// first, as for any native product); every other product, and every other backend, computes
+    /// the plain `f32` product, so a program that calls this gives the same results as `matmul`
+    /// up to rounding wherever tensor cores are not available. Like `matmul`, the result is
+    /// reproducible (the sum order is fixed).
+    ///
+    /// # Errors
+    ///
+    /// As [`Array::matmul`].
+    #[track_caller]
+    pub fn matmul_tf32(&self, rhs: &Array<f32>) -> Array<f32> {
+        matmul_tf32(self, rhs)
+    }
 }
 
 /// [`Array::matmul`] as a function: the product of `lhs` (`[K, M]`) and `rhs` (`[N, K]`) as an
 /// array of shape `[N, M]`.
 #[track_caller]
 pub fn matmul(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    product(lhs, rhs, false)
+}
+
+/// [`Array::matmul_tf32`] as a function.
+#[track_caller]
+pub fn matmul_tf32(lhs: &Array<f32>, rhs: &Array<f32>) -> Array<f32> {
+    product(lhs, rhs, true)
+}
+
+#[track_caller]
+fn product(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Array<f32> {
     let location = Location::caller();
-    let result = run(lhs, rhs);
+    let result = run(lhs, rhs, tf32 || lhs.context().tf32_matmul());
     let shape = [rhs.shape().dims()[0], lhs.shape().dims()[1], 1, 1];
     let shape = if shape.contains(&0) { lhs.shape() } else { shape.into() };
     Array::resolve(lhs.context(), shape, result, "matmul", location)
@@ -353,6 +393,43 @@ fn native_plan(m: u32, n: u32, k: u32, cores: u32, transposed: [bool; 2], max_gr
     Ok(Plan { tile: MatmulTile::Native { edge, lhs_t: transposed[0], rhs_t: transposed[1] }, aligned: false, split: slices > 1, slices, kc, groups })
 }
 
+/// Tiles per multiprocessor a tensor-core product aims for.
+const TENSOR_TILES_PER_SM: u32 = 2;
+/// Smallest `M`, `N` and `K` of a tensor-core product (below it the tiles are mostly padding).
+const TENSOR_MIN_EXTENT: usize = 32;
+
+/// Whether the product of `lhs` and `rhs` has the shapes the tensor-core kernels take: `M`, `N`, `K`
+/// multiples of 4 and at least [`TENSOR_MIN_EXTENT`] (the extents are checked again by [`run`]).
+fn tensor_shape(lhs: &Array<f32>, rhs: &Array<f32>) -> bool {
+    let (ld, rd) = (lhs.shape().dims(), rhs.shape().dims());
+    let ok = |extent: usize| extent >= TENSOR_MIN_EXTENT && extent.is_multiple_of(4);
+    ld[0] == rd[1] && ld[2..].iter().chain(&rd[2..]).all(|&extent| extent == 1) && ok(ld[0]) && ok(ld[1]) && ok(rd[0])
+}
+
+/// The plan of an `m x k` by `k x n` product on tensor cores on `units` multiprocessors with one
+/// of `tiles` (largest first): the largest tile that gives [`TENSOR_TILES_PER_SM`] per
+/// multiprocessor, else the smallest; few tiles over a long K split K (see [`native_plan`]).
+#[allow(clippy::too_many_arguments)]
+fn tensor_plan(m: u32, n: u32, k: u32, units: u32, tiles: &[(u32, u32)], transposed: [bool; 2], max_groups: u32, max_bytes: u64) -> Result<Plan, LumaError> {
+    let wanted = units.max(1).saturating_mul(TENSOR_TILES_PER_SM);
+    let count = |&(rows, cols): &(u32, u32)| m.div_ceil(rows).saturating_mul(n.div_ceil(cols));
+    let (rows, cols) = tiles.iter().find(|tile| count(tile) >= wanted).or(tiles.last()).copied().unwrap_or((128, 128));
+    let (columns, row_tiles) = (n.div_ceil(cols), m.div_ceil(rows));
+    let tile_count = columns.saturating_mul(row_tiles);
+    let split = (tile_count < wanted && k >= 2 * NATIVE_SPLIT_SLICE).then(|| {
+        let kc = k.div_ceil(wanted.div_ceil(tile_count).min(k / NATIVE_SPLIT_SLICE)).next_multiple_of(SLICE);
+        (k.div_ceil(kc), kc)
+    });
+    let (slices, kc) = split
+        .filter(|&(slices, _)| slices >= 2 && u64::from(slices) * u64::from(m) * u64::from(n) * 4 <= max_bytes)
+        .unwrap_or((1, k));
+    let groups = [columns, row_tiles, slices];
+    if groups.iter().any(|&count| count > max_groups) {
+        return Err(LumaError::KernelGridTooLarge { workgroups: groups, max: max_groups });
+    }
+    Ok(Plan { tile: MatmulTile::Tensor { rows, cols, lhs_t: transposed[0], rhs_t: transposed[1] }, aligned: false, split: slices > 1, slices, kc, groups })
+}
+
 /// The operand of a native product that is a transposed view (a swap of axes 0 and 1, see
 /// `host::transposed_source`): what it is the transpose of, so that the product reads that
 /// buffer through its strides instead of the view being copied.
@@ -445,14 +522,15 @@ fn host_product(ctx: &Context, lhs: &Array<f32>, rhs: &Array<f32>) -> Option<Arr
     crate::host::try_matmul(ctx, lhs, rhs, m, n, k)
 }
 
-fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
+fn run(lhs: &Array<f32>, rhs: &Array<f32>, tf32: bool) -> Outcome<Array<f32>> {
     let ctx = lhs.context();
     if let Some(out) = host_product(ctx, lhs, rhs) {
         return Ok(out);
     }
     // Operands first, so that a poisoned one reports its own error.
     let cores = ctx.tuning().native_gemm;
-    let (sides, transposed) = if cores > 0 { native_sides(ctx, lhs, rhs)? } else { ([side(ctx, lhs)?, side(rhs.context(), rhs)?], [false; 2]) };
+    let tiles = if tf32 && tensor_shape(lhs, rhs) { ctx.hal().tensor_matmul_tiles() } else { &[] };
+    let (sides, transposed) = if cores > 0 || !tiles.is_empty() { native_sides(ctx, lhs, rhs)? } else { ([side(ctx, lhs)?, side(rhs.context(), rhs)?], [false; 2]) };
     if !ctx.same_as(rhs.context()) {
         return Err(LumaError::ContextMismatch.into());
     }
@@ -463,7 +541,9 @@ fn run(lhs: &Array<f32>, rhs: &Array<f32>) -> Outcome<Array<f32>> {
     let (k, m, n) = (ld[0], ld[1], rd[0]);
     let too_large = |extent: usize| u32::try_from(extent).map_err(|_| Failure::from(LumaError::DimensionTooLarge { shape: [n, m, 1, 1] }));
     let (m32, n32, k32) = (too_large(m)?, too_large(n)?, too_large(k)?);
-    let mut plan = if cores > 0 {
+    let mut plan = if !tiles.is_empty() {
+        tensor_plan(m32, n32, k32, ctx.tuning().compute_units, tiles, transposed, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
+    } else if cores > 0 {
         native_plan(m32, n32, k32, cores, transposed, ctx.max_workgroups_per_dimension(), ctx.segment_bytes())?
     } else {
         let along_k = jit::stored_along_k(&sides[0], [k32, m32]);
@@ -613,7 +693,7 @@ pub(crate) fn body(tile: MatmulTile, aligned: bool, split: bool, lhs: MatmulOper
         MatmulTile::T128 => t128(aligned, split, &loads),
         MatmulTile::T128x32 => t128x32(aligned, split, &loads),
         MatmulTile::T32x128 => t32x128(aligned, split, &loads),
-        MatmulTile::T32 | MatmulTile::Native { .. } => t32(aligned, split, &loads),
+        MatmulTile::T32 | MatmulTile::Native { .. } | MatmulTile::Tensor { .. } => t32(aligned, split, &loads),
         MatmulTile::Skinny { rows, cols, groups, width, along_k } => skinny(u32::from(rows), u32::from(cols), u32::from(groups), u32::from(width), along_k, &loads),
     }
 }
@@ -1273,5 +1353,31 @@ mod tests {
         // Tall products fold over the grid.
         let p = native_plan(1 << 22, 8, 16, 32, [false; 2], 1 << 12, u64::MAX).unwrap();
         assert!(p.groups[0] <= 1 << 12 && p.groups[1] <= 1 << 12 && p.groups[0] * p.groups[1] >= 1 << 15, "{p:?}");
+    }
+
+    #[test]
+    fn a_tensor_plan_picks_the_largest_tile_that_fills_the_device() {
+        const TILES: [(u32, u32); 4] = [(128, 128), (128, 64), (64, 128), (64, 64)];
+        let plan = |m, n, k, transposed| tensor_plan(m, n, k, 82, &TILES, transposed, 65535, u64::MAX).unwrap();
+        let tensor = |rows, cols| MatmulTile::Tensor { rows, cols, lhs_t: false, rhs_t: false };
+        // Two tiles per multiprocessor, the largest tile that gets them.
+        let p = plan(4096, 4096, 4096, [false; 2]);
+        assert_eq!((p.tile, p.slices, p.groups), (tensor(128, 128), 1, [32, 32, 1]));
+        let p = plan(2048, 2048, 2048, [false; 2]);
+        assert_eq!((p.tile, p.groups), (tensor(128, 128), [16, 16, 1]));
+        let p = plan(1024, 1024, 1024, [false; 2]);
+        assert_eq!((p.tile, p.groups), (tensor(64, 64), [16, 16, 1]));
+        // Never fewer than the smallest tile: `[columns, rows, slices]`, with columns along `N`.
+        let p = plan(256, 1024, 1024, [false; 2]);
+        assert_eq!((p.tile, p.groups), (tensor(64, 64), [16, 4, 1]));
+        // Few tiles and a long K: sliced in whole stages, every slice non-empty.
+        let p = plan(64, 64, 1 << 20, [false; 2]);
+        assert_eq!((p.tile, p.groups[..2].to_vec()), (tensor(64, 64), vec![1, 1]));
+        assert!(p.slices >= 2 && p.kc % SLICE == 0 && p.slices * p.kc >= 1 << 20 && (p.slices - 1) * p.kc < 1 << 20, "{p:?}");
+        // The partial sums must fit a buffer.
+        assert_eq!(tensor_plan(64, 64, 1 << 20, 82, &TILES, [false; 2], 65535, 1000).unwrap().slices, 1);
+        // The transposed operands are the tile's.
+        let p = plan(4096, 4096, 4096, [true, false]);
+        assert_eq!(p.tile, MatmulTile::Tensor { rows: 128, cols: 128, lhs_t: true, rhs_t: false });
     }
 }
