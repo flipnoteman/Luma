@@ -1,5 +1,5 @@
-//! Connected-component labelling (`regions`) on images of different structure and
-//! `confidence_cc` with a few seeds, at 1080p and 4K. Each kind is checked against a host
+//! Connected-component labelling (`regions`) on images of different structure, `confidence_cc`
+//! with a few seeds and the deconvolutions, at 1080p and 4K. Each kind is checked against a host
 //! computation on a small image before it is timed.
 
 use luma::*;
@@ -188,7 +188,7 @@ fn blobby(h: usize, w: usize) -> Vec<f32> {
 }
 
 pub fn run(h: &mut Harness) {
-    h.guarded("visionops/regions", |h| {
+    h.guarded("regions", |h| {
         // Small checks against the host.
         let (sh, sw) = (61usize, 83usize);
         for kind in KINDS {
@@ -203,6 +203,18 @@ pub fn run(h: &mut Harness) {
         let a = upload(h, &simg, [sh, sw]);
         let got = a.confidence_cc_at(&[30], &[40], 2, 2, 2, 1.0).unwrap().to_vec().unwrap();
         check64("confidence_cc", &got, &seg_host(&simg, sh, sw, (30, 40), 2, 2.0, 2), 0.0, 0.0);
+
+        // A unit psf leaves the image alone (Landweber, Richardson-Lucy) or divides it by 1 + gamma (Tikhonov).
+        let unit = {
+            let mut p = vec![0.0f32; 25];
+            p[12] = 1.0;
+            upload(h, &p, [5, 5])
+        };
+        let sd: Vec<f64> = simg.iter().map(|&v| f64::from(v)).collect();
+        check64("iterative_deconv/landweber", &a.iterative_deconv(&unit, 3, 0.5, IterativeDeconvAlgo::Landweber).to_vec().unwrap(), &sd, 1e-4, 1e-4);
+        check64("iterative_deconv/richardson_lucy", &a.iterative_deconv(&unit, 3, 0.5, IterativeDeconvAlgo::RichardsonLucy).to_vec().unwrap(), &sd, 1e-4, 1e-4);
+        let tik: Vec<f64> = sd.iter().map(|v| v / 1.25).collect();
+        check64("inverse_deconv/tikhonov", &a.inverse_deconv(&unit, 0.25, InverseDeconvAlgo::Tikhonov).to_vec().unwrap(), &tik, 1e-4, 1e-4);
 
         for dims in sizes(h) {
             let [ih, iw] = dims;
@@ -225,11 +237,22 @@ pub fn run(h: &mut Harness) {
             let (cx, cy) = (6 * ih / 20 + 3, 7 * iw / 21 + 4);
             let one = (vec![cx as u32], vec![cy as u32]);
             for (name, iterations) in [("0", 0u32), ("3", 3)] {
-                h.case(&format!("confidence_cc/1seed_{name}it"), &tag, pix(dims), &mut || img.confidence_cc_at(&one.0, &one.1, 2, 2, iterations, 1.0).unwrap().eval().unwrap());
+                h.case(&format!("regions/confidence_cc_1seed_{name}it"), &tag, pix(dims), &mut || img.confidence_cc_at(&one.0, &one.1, 2, 2, iterations, 1.0).unwrap().eval().unwrap());
             }
             let sx: Vec<u32> = (0..8).map(|k| (k * 131 % ih) as u32).collect();
             let sy: Vec<u32> = (0..8).map(|k| (k * 211 % iw) as u32).collect();
-            h.case("confidence_cc/8seeds_3it", &tag, pix(dims), &mut || img.confidence_cc_at(&sx, &sy, 2, 2, 3, 1.0).unwrap().eval().unwrap());
+            h.case("regions/confidence_cc_8seeds_3it", &tag, pix(dims), &mut || img.confidence_cc_at(&sx, &sy, 2, 2, 3, 1.0).unwrap().eval().unwrap());
+            // Deconvolution of a positive image with a 7 x 7 Gaussian.
+            let pos = upload(h, &values(ih * iw, 31, 0.1, 1.0), dims);
+            let gauss: Vec<f32> = {
+                let v: Vec<f32> = (0..49).map(|i| (-(((i % 7) as f32 - 3.0).powi(2) + ((i / 7) as f32 - 3.0).powi(2)) / 4.0).exp()).collect();
+                let s: f32 = v.iter().sum();
+                v.into_iter().map(|x| x / s).collect()
+            };
+            let psf = upload(h, &gauss, [7, 7]);
+            h.case("regions/deconv_landweber_10it", &tag, pix(dims), &mut || pos.iterative_deconv(&psf, 10, 0.5, IterativeDeconvAlgo::Landweber).eval().unwrap());
+            h.case("regions/deconv_richardson_lucy_5it", &tag, pix(dims), &mut || pos.iterative_deconv(&psf, 5, 0.5, IterativeDeconvAlgo::RichardsonLucy).eval().unwrap());
+            h.case("regions/deconv_tikhonov", &tag, pix(dims), &mut || pos.inverse_deconv(&psf, 0.1, InverseDeconvAlgo::Tikhonov).eval().unwrap());
         }
     });
 }

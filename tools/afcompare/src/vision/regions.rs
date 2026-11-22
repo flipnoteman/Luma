@@ -1,10 +1,13 @@
-//! `regions` and `confidence_cc` against ArrayFire's `regions` and `confidenceCC`.
+//! `regions`, `confidence_cc` and the deconvolutions against ArrayFire's `regions`, `confidenceCC`,
+//! `iterativeDeconv` and `inverseDeconv`.
 //!
 //! The labels of `regions` are compared exactly (both number the components in the order of
-//! their first pixel in memory). `confidenceCC` of ArrayFire is only well defined for a single
-//! seed whose window is inside the image and, past the first segmentation, its CPU backend
-//! returns stray components (seen as differing pixels below): those rows report the number of
-//! differing pixels instead of failing.
+//! their first pixel in memory). `confidenceCC` of ArrayFire takes its window statistics from an
+//! `f32` summed-area table of the whole image (on a 4K image that has no precision left: its
+//! segmentation is the seed alone), is undefined for several seeds and adds stray components after
+//! the first segmentation on its CPU backend: those rows report the number of differing pixels
+//! instead of failing. The Landweber and Tikhonov results of ArrayFire are `N0 * N1` times
+//! larger than luma's (the padded pixel count), which is divided out.
 
 use arrayfire as af;
 
@@ -139,16 +142,84 @@ pub fn rows(b: &mut Bench) {
                 let (lh, ah) = (lumax::host(&l()), afx::host(&a()));
                 let differ = lh.iter().zip(&ah).filter(|(p, q)| p != q).count();
                 let count = |v: &[f32]| v.iter().filter(|&&x| x != 0.0).count();
-                let v = if iterations == 0 && seeds.0.len() == 1 {
-                    exact(&lh, &ah)
-                } else {
-                    Verdict::yes(format!("{differ} pixels differ (luma {} set, ArrayFire {}): documented, see confidence_cc", count(&lh), count(&ah)))
-                };
+                let v = Verdict::yes(format!("{differ} pixels differ (luma {} set, ArrayFire {}): documented, see confidence_cc", count(&lh), count(&ah)));
                 b.run(
                     &format!("vr confidence_cc {name}"),
                     &size,
                     v,
-                    "radius 2, multiplier 2; ArrayFire's result is undefined for several seeds and after the first iteration on its CPU backend",
+                    "radius 2, multiplier 2; ArrayFire's statistics come from an f32 summed-area table (imprecise on big images) and are undefined for several seeds",
+                    &mut || {
+                        l().eval().unwrap();
+                        ctx.sync().unwrap();
+                    },
+                    &mut || {
+                        a().eval();
+                        afx::sync();
+                    },
+                );
+            }
+        }
+
+        // Deconvolution: a Gaussian psf, a positive image (Richardson-Lucy divides by it).
+        for &(h, w) in sizes {
+            let size = format!("{w}x{h}");
+            let d = [h as u64, w as u64];
+            let img = uniform(h * w, 17, 0.1, 1.0);
+            let (xl, xa) = (lumax::arr(&ctx, &img, [h, w]), afx::arr(&img, &d));
+            for k in [5usize, 15] {
+                let g: Vec<f32> = {
+                    let c = (k / 2) as f32;
+                    let v: Vec<f32> = (0..k * k).map(|i| (-(((i % k) as f32 - c).powi(2) + ((i / k) as f32 - c).powi(2)) / (2.0 * (k as f32 / 6.0).powi(2))).exp()).collect();
+                    let s: f32 = v.iter().sum();
+                    v.into_iter().map(|x| x / s).collect()
+                };
+                let (pl, pa) = (lumax::arr(&ctx, &g, [k, k]), afx::arr(&g, &[k as u64, k as u64]));
+                // The padded pixel count of ArrayFire's scaling.
+                let friendly = |mut n: usize| loop {
+                    let mut m = n;
+                    for p in [2, 3, 5, 7, 11, 13] {
+                        while m % p == 0 {
+                            m /= p;
+                        }
+                    }
+                    if m == 1 {
+                        break n;
+                    }
+                    n += 1;
+                };
+                let scale = (friendly(h + k) * friendly(w + k)) as f32;
+                for (name, iterations, algo, af_algo, scaled) in [
+                    ("landweber 10 it", 10u32, luma::IterativeDeconvAlgo::Landweber, af::IterativeDeconvAlgo::LANDWEBER, true),
+                    ("richardson-lucy 5 it", 5, luma::IterativeDeconvAlgo::RichardsonLucy, af::IterativeDeconvAlgo::RICHARDSONLUCY, false),
+                ] {
+                    let l = || xl.iterative_deconv(&pl, iterations, 0.5, algo);
+                    let a = || af::iterative_deconv(&xa, &pa, iterations, 0.5, af_algo);
+                    let ah: Vec<f32> = afx::host(&a()).into_iter().map(|v| if scaled { v / scale } else { v }).collect();
+                    let v = compare(&lumax::host(&l()), &ah, 2e-3, 2e-3);
+                    b.run(
+                        &format!("vr iterative_deconv {name} psf {k}x{k}"),
+                        &size,
+                        v,
+                        "image padded with its edge pixels; ArrayFire's Landweber result divided by N0 * N1",
+                        &mut || {
+                            l().eval().unwrap();
+                            ctx.sync().unwrap();
+                        },
+                        &mut || {
+                            a().eval();
+                            afx::sync();
+                        },
+                    );
+                }
+                let l = || xl.inverse_deconv(&pl, 0.1, luma::InverseDeconvAlgo::Tikhonov);
+                let a = || af::inverse_deconv(&xa, &pa, 0.1, af::InverseDeconvAlgo::TIKHONOV);
+                let ah: Vec<f32> = afx::host(&a()).into_iter().map(|v| v / scale).collect();
+                let v = compare(&lumax::host(&l()), &ah, 2e-3, 2e-3);
+                b.run(
+                    &format!("vr inverse_deconv tikhonov psf {k}x{k}"),
+                    &size,
+                    v,
+                    "ArrayFire's result divided by N0 * N1",
                     &mut || {
                         l().eval().unwrap();
                         ctx.sync().unwrap();
