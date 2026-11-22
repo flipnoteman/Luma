@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::array::{Array, Failure, Storage};
-use crate::builtin::{Builtin, Epilogue, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_EPILOGUE, MAX_REDUCTIONS};
+use crate::builtin::{BinOp, Builtin, Epilogue, EpilogueStep, Finish, ReduceList, ReduceOp, UnOp, MAX_ACCS, MAX_EPILOGUE, MAX_REDUCTIONS};
 use crate::context::{Context, RawArg, Scratch};
 use crate::error::{LumaError, Result};
 use crate::gpu_type::{ElemLayout, GpuType, Numeric, ScalarType};
@@ -676,6 +676,13 @@ impl<T: ScalarType> Array<T> {
             return None;
         }
         if ElemTy::of::<T>().ok()? != ElemTy::F32 || ElemTy::of::<O>().ok()? != ElemTy::F32 || step == EpilogueStep::Unary(UnOp::Id) {
+            return None;
+        }
+        let helper = match step {
+            EpilogueStep::Unary(op) => op.needs_helper(),
+            EpilogueStep::Binary { op, .. } => op.needs_helper() || op == BinOp::Mod,
+        };
+        if helper {
             return None;
         }
         let mut finish = reduced.finish;

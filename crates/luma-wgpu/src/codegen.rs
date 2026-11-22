@@ -631,6 +631,16 @@ impl Em<'_> {
             IrUnOp::Asin => plain("asin"),
             IrUnOp::Acos => plain("acos"),
             IrUnOp::Atan => plain("atan"),
+            IrUnOp::Sinh => plain("sinh"),
+            IrUnOp::Cosh => plain("cosh"),
+            IrUnOp::Asinh => plain("asinh"),
+            IrUnOp::Acosh => plain("acosh"),
+            IrUnOp::Atanh => plain("atanh"),
+            // WGSL has no function for these: the library (`luma`) lowers `f32` ones to its own
+            // code, and the `f64` ones need a backend with `f64` math (CUDA, CPU).
+            IrUnOp::Log10 | IrUnOp::Cbrt | IrUnOp::Erf | IrUnOp::Erfc | IrUnOp::Lgamma | IrUnOp::Tgamma | IrUnOp::Log1p | IrUnOp::Expm1 => {
+                format!("luma_unsupported_{op:?}({a})")
+            }
             IrUnOp::All => plain("all"),
             IrUnOp::Any => plain("any"),
         }

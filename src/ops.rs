@@ -521,6 +521,72 @@ impl<T: ScalarType> Array<T> {
         self.binary(rhs.rhs(), BinOp::Max, false, "maximum")
     }
 
+    /// Elementwise modulus: `self - rhs * floor(self / rhs)`, the remainder with the sign of the
+    /// divisor (`-1 mod 3 = 2`, where `-1 % 3 = -1`; ArrayFire's `mod`). For `u32` it is `%`; for
+    /// floats a zero divisor gives `NaN`, for integers `0`. `rhs` is an array of the same shape
+    /// (or broadcast to it) or a scalar. Fuses like any elementwise operation.
+    #[track_caller]
+    pub fn modulo(&self, rhs: impl Operand<T>) -> Array<T> {
+        self.binary(rhs.rhs(), BinOp::Mod, false, "modulo")
+    }
+
+    /// Elementwise `self` raised to `exponent` (an array of the same shape, broadcast to it, or a
+    /// scalar), for the floating-point types. Negative bases give `NaN` unless the exponent is an
+    /// integer, as `pow` does. Fuses like any elementwise operation; a constant exponent of
+    /// `0`, `1`, `2`, `0.5` or `-1` becomes the cheaper operation.
+    #[track_caller]
+    pub fn pow(&self, exponent: impl Operand<T>) -> Array<T> {
+        let location = Location::caller();
+        let result = self.run_binary(exponent.rhs(), false, OpKind::Powf, "pow", location);
+        Array::resolve(self.context(), self.shape(), result, "pow", location)
+    }
+
+    /// Elementwise `base` raised to the elements of this array: the scalar-base counterpart of
+    /// [`Array::pow`] (`2^x` is `x.rpow(2.0)`).
+    #[track_caller]
+    pub fn rpow(&self, base: T) -> Array<T> {
+        let location = Location::caller();
+        let result = self.run_binary(Rhs::Scalar(base), true, OpKind::Powf, "rpow", location);
+        Array::resolve(self.context(), self.shape(), result, "rpow", location)
+    }
+
+    /// `self == 0` elementwise as an `Array<bool>` (`-0.0` is zero, `NaN` is not).
+    #[track_caller]
+    pub fn is_zero(&self) -> Array<bool> {
+        self.compare_at(Rhs::Scalar(T::zeroed()), CmpOp::Eq, "is_zero", Location::caller())
+    }
+
+    /// `min(max(self, lo), hi)` with bounds that are arrays of the same shape (or broadcast to
+    /// it) or scalars, fused into the expression. A `NaN` element stays `NaN` where the bounds are
+    /// finite numbers.
+    #[track_caller]
+    pub(crate) fn clamp_by(&self, lo: Rhs<'_, T>, hi: Rhs<'_, T>) -> Array<T> {
+        let location = Location::caller();
+        let result = self.run_clamp(lo, hi, location);
+        Array::resolve(self.context(), self.shape(), result, "clamp", location)
+    }
+
+    fn run_clamp(&self, lo: Rhs<'_, T>, hi: Rhs<'_, T>, location: &'static Location<'static>) -> Outcome<Array<T>> {
+        let ctx = self.context();
+        let mut shape = self.shape();
+        for bound in [&lo, &hi] {
+            if let Rhs::Array(array) = bound {
+                if !ctx.same_as(array.context()) {
+                    return Err(LumaError::ContextMismatch.into());
+                }
+                shape = broadcast_shape(shape, array.shape())
+                    .ok_or(LumaError::ShapeMismatch { lhs: self.shape().dims(), rhs: array.shape().dims() })?;
+            }
+        }
+        let operand = self.broadcast_operand(shape, location)?;
+        let bound = |rhs: Rhs<'_, T>| match rhs {
+            Rhs::Array(array) => array.broadcast_operand(shape, location),
+            Rhs::Scalar(value) => Ok(Src::Scalar(Scalar::of(value)?)),
+        };
+        let (lo, hi) = (bound(lo)?, bound(hi)?);
+        lazy(ctx, shape, Op::new(OpKind::Clamp, ElemTy::of::<T>()?), [operand, lo, hi], "clamp", location)
+    }
+
     // -- Comparisons --
 
     /// `self < rhs` as an `Array<bool>`.
@@ -874,19 +940,6 @@ impl Array<f32> {
         Array::resolve(self.context(), self.shape(), result, "powf", location)
     }
 
-    /// Elementwise clamp into `lo..=hi`.
-    #[track_caller]
-    pub fn clamp(&self, lo: f32, hi: f32) -> Array<f32> {
-        let location = Location::caller();
-        let result = self.run_scalars(
-            OpKind::Clamp,
-            [Some(Scalar::f32(lo)), Some(Scalar::f32(hi))],
-            "clamp",
-            location,
-        );
-        Array::resolve(self.context(), self.shape(), result, "clamp", location)
-    }
-
     /// `f(self, scalars...)` for an operation whose other operands are scalars.
     fn run_scalars(
         &self,
@@ -917,6 +970,173 @@ impl Neg for Array<f32> {
     fn neg(self) -> Array<f32> {
         -&self
     }
+}
+
+macro_rules! impl_float_math {
+    ($($t:ty),*) => {$(
+        impl Array<$t> {
+            /// Elementwise inverse sine (radians); `NaN` outside `-1..=1`.
+            #[track_caller]
+            pub fn asin(&self) -> Array<$t> { self.math(UnOp::Asin) }
+            /// Elementwise inverse cosine (radians); `NaN` outside `-1..=1`.
+            #[track_caller]
+            pub fn acos(&self) -> Array<$t> { self.math(UnOp::Acos) }
+            /// Elementwise inverse tangent (radians), in `-pi/2..=pi/2`.
+            #[track_caller]
+            pub fn atan(&self) -> Array<$t> { self.math(UnOp::Atan) }
+            /// Elementwise hyperbolic sine.
+            #[track_caller]
+            pub fn sinh(&self) -> Array<$t> { self.math(UnOp::Sinh) }
+            /// Elementwise hyperbolic cosine.
+            #[track_caller]
+            pub fn cosh(&self) -> Array<$t> { self.math(UnOp::Cosh) }
+            /// Elementwise inverse hyperbolic sine.
+            #[track_caller]
+            pub fn asinh(&self) -> Array<$t> { self.math(UnOp::Asinh) }
+            /// Elementwise inverse hyperbolic cosine; `NaN` below 1.
+            #[track_caller]
+            pub fn acosh(&self) -> Array<$t> { self.math(UnOp::Acosh) }
+            /// Elementwise inverse hyperbolic tangent; `NaN` outside `-1..=1`, infinite at `+-1`.
+            #[track_caller]
+            pub fn atanh(&self) -> Array<$t> { self.math(UnOp::Atanh) }
+            /// Elementwise `2^x` (ArrayFire's `pow2`).
+            #[track_caller]
+            pub fn pow2(&self) -> Array<$t> { self.math(UnOp::Exp2) }
+            /// Elementwise base-2 logarithm.
+            #[track_caller]
+            pub fn log2(&self) -> Array<$t> { self.math(UnOp::Log2) }
+            /// Elementwise base-10 logarithm.
+            #[track_caller]
+            pub fn log10(&self) -> Array<$t> { self.math(UnOp::Log10) }
+            /// Elementwise reciprocal square root, `1 / sqrt(x)`.
+            #[track_caller]
+            pub fn rsqrt(&self) -> Array<$t> { self.math(UnOp::Rsqrt) }
+            /// Elementwise real cube root; negative for a negative element.
+            #[track_caller]
+            pub fn cbrt(&self) -> Array<$t> { self.math(UnOp::Cbrt) }
+            /// Elementwise error function `2/sqrt(pi) * integral of e^(-t^2) from 0 to x`.
+            #[track_caller]
+            pub fn erf(&self) -> Array<$t> { self.math(UnOp::Erf) }
+            /// Elementwise complementary error function `1 - erf(x)`, accurate for large `x`.
+            #[track_caller]
+            pub fn erfc(&self) -> Array<$t> { self.math(UnOp::Erfc) }
+            /// Elementwise natural logarithm of the absolute value of the gamma function; `+inf`
+            /// at zero and the negative integers.
+            #[track_caller]
+            pub fn lgamma(&self) -> Array<$t> { self.math(UnOp::Lgamma) }
+            /// Elementwise gamma function (`(n - 1)!` at the positive integers `n`); `NaN` at the
+            /// negative integers, infinite at `+-0` and above the largest finite result.
+            #[track_caller]
+            pub fn tgamma(&self) -> Array<$t> { self.math(UnOp::Tgamma) }
+            /// Elementwise logistic function `1 / (1 + e^-x)`.
+            #[track_caller]
+            pub fn sigmoid(&self) -> Array<$t> { self.math(UnOp::Sigmoid) }
+        }
+    )*};
+}
+
+impl_float_math!(f32, f64);
+
+impl<T: ScalarType> Array<T> {
+    #[track_caller]
+    fn math(&self, op: UnOp) -> Array<T> {
+        let location = Location::caller();
+        let result = self.run_unary(op, location);
+        Array::resolve(self.context(), self.shape(), result, op.name(), location)
+    }
+}
+
+impl Array<f32> {
+    /// Elementwise `n`-th root, `self^(1/n)` (ArrayFire's `root(n, x)`): `NaN` for a negative
+    /// element. `n` is an array of the same shape (or broadcast to it) or a scalar.
+    #[track_caller]
+    pub fn root(&self, n: impl Operand<f32>) -> Array<f32> {
+        match n.rhs() {
+            Rhs::Scalar(n) => self.pow(1.0 / n),
+            Rhs::Array(n) => self.pow(&(1.0 / n)),
+        }
+    }
+
+    /// Elementwise clamp into `lo..=hi`; each bound is an array of the same shape (or broadcast to
+    /// it) or a scalar.
+    #[track_caller]
+    pub fn clamp(&self, lo: impl Operand<f32>, hi: impl Operand<f32>) -> Array<f32> {
+        self.clamp_by(lo.rhs(), hi.rhs())
+    }
+}
+
+impl Array<f64> {
+    /// Elementwise `atan2(self, x)`: the angle of the point `(x, self)`, `self` being `y` (CUDA
+    /// and CPU backends).
+    #[track_caller]
+    pub fn atan2(&self, x: impl Operand<f64>) -> Array<f64> {
+        self.binary(x.rhs(), BinOp::Atan2, false, "atan2")
+    }
+
+    /// Elementwise `sqrt(self^2 + other^2)` without intermediate overflow (CUDA and CPU backends).
+    #[track_caller]
+    pub fn hypot(&self, other: impl Operand<f64>) -> Array<f64> {
+        self.binary(other.rhs(), BinOp::Hypot, false, "hypot")
+    }
+
+    /// Elementwise magnitude of `self` with the sign of `sign` (CUDA and CPU backends).
+    #[track_caller]
+    pub fn copysign(&self, sign: impl Operand<f64>) -> Array<f64> {
+        self.binary(sign.rhs(), BinOp::Copysign, false, "copysign")
+    }
+
+    /// Elementwise `x` raised to the scalar `exponent`.
+    #[track_caller]
+    pub fn powf(&self, exponent: f64) -> Array<f64> {
+        self.pow_scalar(exponent)
+    }
+
+    /// Elementwise `n`-th root, `self^(1/n)`: `NaN` for a negative element.
+    #[track_caller]
+    pub fn root(&self, n: f64) -> Array<f64> {
+        self.pow_scalar(1.0 / n)
+    }
+
+    /// Elementwise clamp into the scalars `lo..=hi`.
+    #[track_caller]
+    pub fn clamp(&self, lo: f64, hi: f64) -> Array<f64> {
+        self.clamp_by(Rhs::Scalar(lo), Rhs::Scalar(hi))
+    }
+
+    /// Elementwise clamp into the arrays `lo..=hi` (of the shape of this array or broadcast to it).
+    #[track_caller]
+    pub fn clamp_arrays(&self, lo: &Array<f64>, hi: &Array<f64>) -> Array<f64> {
+        self.clamp_by(Rhs::Array(lo), Rhs::Array(hi))
+    }
+
+    #[track_caller]
+    fn pow_scalar(&self, exponent: f64) -> Array<f64> {
+        let location = Location::caller();
+        let result = self.run_binary(Rhs::Scalar(exponent), false, OpKind::Powf, "pow", location);
+        Array::resolve(self.context(), self.shape(), result, "pow", location)
+    }
+}
+
+macro_rules! impl_int_clamp {
+    ($($t:ty),*) => {$(
+        impl Array<$t> {
+            /// Elementwise clamp into `lo..=hi`; each bound is an array of the same shape (or broadcast
+            /// to it) or a scalar.
+            #[track_caller]
+            pub fn clamp(&self, lo: impl Operand<$t>, hi: impl Operand<$t>) -> Array<$t> {
+                self.clamp_by(lo.rhs(), hi.rhs())
+            }
+        }
+    )*};
+}
+
+impl_int_clamp!(i32, u32);
+
+macro_rules! impl_float_rem {
+    ($t:ty) => {
+        impl_binary_operator!($t, Rem, rem, BinOp::Rem, "rem");
+        impl_assign_operator!($t, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
+    };
 }
 
 // -- Math functions on the 8-byte types --
@@ -971,6 +1191,22 @@ wide_unary_methods! { f64;
     trunc => UnOp::Trunc;
     /// Elementwise nearest integer, halves to the even one (as [`Array<f32>::round`](Array::round)).
     round => UnOp::Round;
+    /// Elementwise `e^x` (CUDA and CPU backends).
+    exp => UnOp::Exp;
+    /// Elementwise natural logarithm (CUDA and CPU backends).
+    ln => UnOp::Ln;
+    /// Elementwise sine (radians; CUDA and CPU backends).
+    sin => UnOp::Sin;
+    /// Elementwise cosine (radians; CUDA and CPU backends).
+    cos => UnOp::Cos;
+    /// Elementwise tangent (radians; CUDA and CPU backends).
+    tan => UnOp::Tan;
+    /// Elementwise hyperbolic tangent (CUDA and CPU backends).
+    tanh => UnOp::Tanh;
+    /// Elementwise `ln(1 + x)`, accurate for `x` near 0 (CUDA and CPU backends).
+    log1p => UnOp::Log1p;
+    /// Elementwise `e^x - 1`, accurate for `x` near 0 (CUDA and CPU backends).
+    expm1 => UnOp::Expm1;
 }
 
 wide_unary_methods! { i32;
@@ -1193,6 +1429,10 @@ impl_operators!(Df32);
 impl_scalar_operators!(f32);
 impl_scalar_operators!(u32);
 impl_scalar_operators!(i32);
+impl_float_rem!(f32);
+impl_float_rem!(f64);
+impl_binary_scalar!(f32, Rem, rem, BinOp::Rem, "rem");
+impl_assign_scalar!(f32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");
 impl_binary_operator!(u32, Rem, rem, BinOp::Rem, "rem");
 impl_binary_scalar!(u32, Rem, rem, BinOp::Rem, "rem");
 impl_assign_operator!(u32, RemAssign, rem_assign, BinOp::Rem, "rem_assign");

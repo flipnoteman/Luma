@@ -53,6 +53,7 @@ objc2-foundation = "0.3.2"
 objc2-metal = "0.3.2"
 block2 = "0.6.2"
 libc = "0.2"
+libm = "0.2"
 libloading = "0.8"
 matrixmultiply = "0.3.11"
 
@@ -76,6 +77,7 @@ criterion = "0.8"
 ml-kem = "0.3.4"
 proptest = "1"
 rustfft = "6"
+libm.workspace = true
 
 [[bench]]
 name = "real_world"

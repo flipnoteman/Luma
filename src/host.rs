@@ -245,10 +245,16 @@ impl<'a> Eval<'a> {
                 Some(match kind {
                     OpKind::Unary(u) => {
                         u.expr_for(ty)?;
+                        if u.needs_helper() || ty == ElemTy::F64 {
+                            return None;
+                        }
                         zip(len, &a, &b, &c, |x, _, _| unary(u, ty, x))
                     }
                     OpKind::Binary(bin) => {
                         bin.expr_for(ty)?;
+                        if bin.needs_helper() || bin == BinOp::Mod || ty == ElemTy::F64 {
+                            return None;
+                        }
                         zip(len, &a, &b, &c, |x, y, _| binary(bin, ty, x, y))
                     }
                     OpKind::Compare(cmp) => zip(len, &a, &b, &c, |x, y, _| compare(cmp, ty, x, y)),
@@ -488,6 +494,19 @@ fn unary(op: UnOp, ty: ElemTy, x: u32) -> u32 {
                 UnOp::Round => v.round_ties_even(),
                 UnOp::Log1p => v.ln_1p(),
                 UnOp::Expm1 => v.exp_m1(),
+                UnOp::Asin => v.asin(),
+                UnOp::Acos => v.acos(),
+                UnOp::Atan => v.atan(),
+                UnOp::Sinh => v.sinh(),
+                UnOp::Cosh => v.cosh(),
+                UnOp::Asinh => v.asinh(),
+                UnOp::Acosh => v.acosh(),
+                UnOp::Atanh => v.atanh(),
+                UnOp::Exp2 => v.exp2(),
+                UnOp::Log2 => v.log2(),
+                UnOp::Log10 => v.log2() * std::f32::consts::LOG10_2,
+                UnOp::Rsqrt => 1.0 / v.sqrt(),
+                UnOp::Sigmoid => 1.0 / (1.0 + (-v).exp()),
                 _ => v,
             };
             r.to_bits()

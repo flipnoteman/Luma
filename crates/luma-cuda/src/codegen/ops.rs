@@ -118,7 +118,7 @@ pub(crate) fn unary(fb: &mut Fb, op: IrUnOp, s: ScalarTy, a: &Op) -> (ScalarTy, 
             (I32, sel(fb, &c, "i32", &n, a))
         }
         (Abs, U32) => (U32, a.clone()),
-        (Sqrt | Exp | Ln | Sin | Cos | Tan | Tanh | Floor | Ceil | Trunc | InverseSqrt | Exp2 | Log2 | Asin | Acos | Atan | Round, F32 | F64) => {
+        (Sqrt | Exp | Ln | Sin | Cos | Tan | Tanh | Floor | Ceil | Trunc | InverseSqrt | Exp2 | Log2 | Asin | Acos | Atan | Sinh | Cosh | Asinh | Acosh | Atanh | Log10 | Cbrt | Erf | Erfc | Lgamma | Tgamma | Log1p | Expm1 | Round, F32 | F64) => {
             let base = match op {
                 Sqrt => "sqrt",
                 Exp => "exp",
@@ -136,6 +136,19 @@ pub(crate) fn unary(fb: &mut Fb, op: IrUnOp, s: ScalarTy, a: &Op) -> (ScalarTy, 
                 Asin => "asin",
                 Acos => "acos",
                 Atan => "atan",
+                Sinh => "sinh",
+                Cosh => "cosh",
+                Asinh => "asinh",
+                Acosh => "acosh",
+                Atanh => "atanh",
+                Log10 => "log10",
+                Cbrt => "cbrt",
+                Erf => "erf",
+                Erfc => "erfc",
+                Lgamma => "lgamma",
+                Tgamma => "tgamma",
+                Log1p => "log1p",
+                Expm1 => "expm1",
                 _ => "rint",
             };
             // f32 `exp`, `log`, `log2` and the trigonometric functions use the hardware
