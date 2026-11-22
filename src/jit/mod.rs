@@ -467,11 +467,29 @@ pub(crate) struct AxisMap {
 }
 
 /// Reads an array of dims `src` as an array of dims `out`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ViewMap {
     pub(crate) src: [u32; 4],
     pub(crate) out: [u32; 4],
     pub(crate) axes: [AxisMap; 4],
+}
+
+impl std::hash::Hash for ViewMap {
+    /// Nine words instead of the thirty-odd a field-by-field hash writes (every write waits for
+    /// the one before it, and a view is made for nearly every other operation).
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let pair = |a: u32, b: u32| u64::from(a) | u64::from(b) << 32;
+        state.write_u64(pair(self.src[0], self.src[1]));
+        state.write_u64(pair(self.src[2], self.src[3]));
+        state.write_u64(pair(self.out[0], self.out[1]));
+        state.write_u64(pair(self.out[2], self.out[3]));
+        for axis in &self.axes {
+            state.write_u64(pair(axis.start as u32, axis.step as u32));
+        }
+        let from = self.axes.iter().fold(0u32, |word, axis| word << 8 | u32::from(axis.from));
+        state.write_u32(from);
+    }
 }
 
 /// What a view reads where the source coordinate leaves `0..src[axis]`.
@@ -2035,6 +2053,32 @@ fn create_with(
     let depth = exact_depth.unwrap_or(deepest).map_or(0, |deepest| deepest.saturating_add(1));
 
     let trace = rerun::created(op, len, &args, arity);
+    // The distinct operands the node registers with once it exists. The node owns `args` from
+    // then on, which keeps them alive, so only their addresses are noted here (an `Arc` cloned
+    // for every operand costs an atomic operation to take and another to give back).
+    let mut registered = [Registered::None; 3];
+    let mut known = 0;
+    for (i, arg) in args.iter().enumerate().take(arity) {
+        let repeated = |other: &Src| match (arg, other) {
+            (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
+            (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if args.iter().take(i).any(repeated) {
+            continue;
+        }
+        let entry = match arg {
+            Src::Buffer(storage) => Registered::Buffer(Arc::as_ptr(storage)),
+            Src::Node(operand) => Registered::Node(Arc::as_ptr(operand)),
+            Src::Scalar(_) => continue,
+        };
+        if let Some(slot) = registered.get_mut(known) {
+            *slot = entry;
+            known += 1;
+        }
+    }
+    // What the table is told: a cut changed the operands, so the hash is made again.
+    let table_hash = cons_key.map(|hash| if cut { cons_hash(op, len, &args) } else { hash });
     // Built where it lives: the node is bigger than what a move of it copies cheaply.
     let node = {
         let ptr = Arc::into_raw(Arc::<Node>::new_uninit()).cast::<Node>().cast_mut();
@@ -2047,7 +2091,7 @@ fn create_with(
             std::ptr::addr_of_mut!((*ptr).ctx).write(ctx.clone());
             std::ptr::addr_of_mut!((*ptr).op).write(*op);
             std::ptr::addr_of_mut!((*ptr).len).write(len);
-            std::ptr::addr_of_mut!((*ptr).args).write(Mutex::new(Some(args.clone())));
+            std::ptr::addr_of_mut!((*ptr).args).write(Mutex::new(Some(args)));
             std::ptr::addr_of_mut!((*ptr).result).write(OnceLock::new());
             std::ptr::addr_of_mut!((*ptr).name).write(name);
             std::ptr::addr_of_mut!((*ptr).location).write(location);
@@ -2074,30 +2118,34 @@ fn create_with(
     };
 
     let weak = Arc::downgrade(&node);
-    for (i, arg) in args.iter().enumerate().take(arity) {
-        let repeated = |other: &Src| match (arg, other) {
-            (Src::Buffer(a), Src::Buffer(b)) => Arc::ptr_eq(a, b),
-            (Src::Node(a), Src::Node(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        if args.iter().take(i).any(repeated) {
-            continue;
-        }
-        match arg {
-            Src::Buffer(storage) => storage.readers.add_weak(weak.clone()),
-            Src::Node(operand) => {
-                operand.consumers.fetch_add(1, Ordering::Relaxed);
-                operand.readers.add_weak(weak.clone());
+    for entry in &registered[..known] {
+        // SAFETY: the operand is held by `node.args`, which nothing has touched since the node
+        // was made (it is not shared yet).
+        unsafe {
+            match *entry {
+                Registered::Buffer(storage) => (*storage).readers.add_weak(weak.clone()),
+                Registered::Node(operand) => {
+                    (*operand).consumers.fetch_add(1, Ordering::Relaxed);
+                    (*operand).readers.add_weak(weak.clone());
+                }
+                Registered::None => {}
             }
-            Src::Scalar(_) => {}
         }
     }
     jit.with_live(|live| live.add_weak(weak.clone()));
     jit.pending_nodes.fetch_add(1, Ordering::Relaxed);
-    if let Some(hash) = cons_key {
-        jit.cons_insert(if cut { cons_hash(op, len, &args) } else { hash }, weak);
+    if let Some(hash) = table_hash {
+        jit.cons_insert(hash, weak);
     }
     Ok(node)
+}
+
+/// An operand a new node registers with (see [`create_with`]).
+#[derive(Clone, Copy)]
+enum Registered {
+    None,
+    Buffer(*const Storage),
+    Node(*const Node),
 }
 
 /// What [`create`] does about an operation whose operands make it too big, too deep or too wide
@@ -2351,23 +2399,136 @@ fn cons_same(op: &Op, a: &Args, b: &Args) -> bool {
 /// [`JitState::write_epoch`]: no buffer changed its contents since, so equal operations on
 /// identical operands are equal values. Holds weak references only: a node nobody else holds
 /// stays droppable, and [`assign`] counts the owners of the nodes it walks.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ConsTable {
     epoch: u64,
-    map: FxMap<u64, Weak<Node>>,
+    /// The operations, by hash: sets of [`CONS_WAYS`] entries each (a power of two of them), made
+    /// when the first entry is stored. No node is ever looked for by walking: a lookup or an
+    /// insert reads one cache line, with no sweep for dead entries (a node is made per
+    /// operation, and nearly all of them die young). The table grows when a live entry would have
+    /// to give way: an expression made of more operations than the table holds would not share
+    /// its common parts any more, which costs far more than the table.
+    sets: Vec<ConsSet>,
+    /// The sets that hold an entry, so that forgetting them all does not visit the others.
+    filled: Vec<u32>,
     /// The masks of region assignments (see [`MaskKey`]).
     masks: FxMap<MaskKey, Weak<Node>>,
-    /// Entries at which dead ones are pruned before the next insert: [`CONS_PRUNE_AT`], or twice
-    /// what survived the last pruning (a table of live entries is not scanned at every insert).
-    prune_at: usize,
+}
+
+impl std::fmt::Debug for ConsTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConsTable({} sets, {} filled)", self.sets.len(), self.filled.len())
+    }
+}
+
+/// Entries of a [`ConsSet`].
+const CONS_WAYS: usize = 4;
+
+/// Sets a [`ConsTable`] starts with (a power of two).
+const CONS_SETS_MIN: usize = 256;
+
+/// Most sets a [`ConsTable`] grows to: 1M operations. Past that live entries are replaced.
+const CONS_SETS_MAX: usize = 1 << 18;
+
+/// One entry of the table: the hash of an operation and the node that computes it, if the entry
+/// is in use.
+#[derive(Default)]
+struct ConsEntry {
+    hash: u64,
+    node: Option<Weak<Node>>,
+}
+
+/// The entries of one hash value range, on a cache line of their own.
+#[derive(Default)]
+#[repr(align(64))]
+struct ConsSet {
+    entries: [ConsEntry; CONS_WAYS],
 }
 
 impl ConsTable {
     /// Forgets every entry: buffers changed since they were made (`epoch` is the new one).
     fn clear_for(&mut self, epoch: u64) {
-        self.map.clear();
+        for at in self.filled.drain(..) {
+            if let Some(set) = self.sets.get_mut(at as usize) {
+                for entry in &mut set.entries {
+                    entry.node = None;
+                }
+            }
+        }
         self.masks.clear();
         self.epoch = epoch;
+    }
+
+    /// The set `hash` belongs to, of `sets` sets.
+    #[inline]
+    fn set_of(hash: u64, sets: usize) -> usize {
+        // The high bits: the low ones of an `FxHasher` result are the weakest.
+        ((hash >> 24) as usize) & (sets - 1)
+    }
+
+    /// The node recorded for `hash`, if it is still alive.
+    #[inline]
+    fn find(&self, hash: u64) -> Option<Arc<Node>> {
+        let set = self.sets.get(Self::set_of(hash, self.sets.len().max(1)))?;
+        set.entries.iter().find(|entry| entry.hash == hash).and_then(|entry| entry.node.as_ref()?.upgrade())
+    }
+
+    /// Records `node` for `hash`, in place of what the hash had, in a free entry, or in one whose
+    /// node is dead; if every entry of the set is alive the table grows (or, at its limit, the
+    /// hash picks the entry that gives way).
+    fn store(&mut self, hash: u64, node: Weak<Node>) {
+        if self.sets.is_empty() {
+            self.sets.resize_with(CONS_SETS_MIN, ConsSet::default);
+        }
+        loop {
+            let count = self.sets.len();
+            let at = Self::set_of(hash, count);
+            let Some(set) = self.sets.get_mut(at) else { return };
+            let was_empty = set.entries[0].node.is_none();
+            let way = set
+                .entries
+                .iter()
+                .position(|entry| entry.hash == hash && entry.node.is_some())
+                .or_else(|| set.entries.iter().position(|entry| entry.node.as_ref().is_none_or(|weak| weak.strong_count() == 0)));
+            let way = match way {
+                Some(way) => way,
+                None if count < CONS_SETS_MAX => {
+                    self.grow();
+                    continue;
+                }
+                None => (hash as usize) & (CONS_WAYS - 1),
+            };
+            let Some(set) = self.sets.get_mut(at) else { return };
+            set.entries[way] = ConsEntry { hash, node: Some(node) };
+            if was_empty {
+                self.filled.push(at as u32);
+            }
+            return;
+        }
+    }
+
+    /// Doubles the number of sets: the entries of set `i` go to `i` or to `i + sets`.
+    fn grow(&mut self) {
+        let old = self.sets.len();
+        let mut sets: Vec<ConsSet> = Vec::new();
+        sets.resize_with(old * 2, ConsSet::default);
+        let mut filled = Vec::with_capacity(self.filled.len() * 2);
+        for &at in &self.filled {
+            let Some(from) = self.sets.get_mut(at as usize) else { continue };
+            for entry in &mut from.entries {
+                let Some(node) = entry.node.take() else { continue };
+                let to = Self::set_of(entry.hash, old * 2);
+                let Some(set) = sets.get_mut(to) else { continue };
+                if set.entries[0].node.is_none() {
+                    filled.push(to as u32);
+                }
+                if let Some(slot) = set.entries.iter_mut().find(|slot| slot.node.is_none()) {
+                    *slot = ConsEntry { hash: entry.hash, node: Some(node) };
+                }
+            }
+        }
+        self.sets = sets;
+        self.filled = filled;
     }
 }
 
@@ -2384,9 +2545,6 @@ impl MaskKey {
         MaskKey { dims, ends }
     }
 }
-
-/// Entries of the table at which dead ones are pruned before the next insert, at least.
-const CONS_PRUNE_AT: usize = 256;
 
 /// What a thread keeps for each context it made operations in (see [`CONS`] and [`LIVE`]).
 struct Slot<T> {
@@ -2892,7 +3050,7 @@ impl JitState {
                 table.clear_for(epoch);
                 return None;
             }
-            table.map.get(&hash)?.upgrade()
+            table.find(hash)
         })?;
         // A node computed inside another kernel is a dead temporary of an earlier expression:
         // sharing it would tie this expression to that one (and to its steps in a loop).
@@ -2950,11 +3108,7 @@ impl JitState {
             if table.epoch != epoch {
                 table.clear_for(epoch);
             }
-            if table.map.len() > table.prune_at.max(CONS_PRUNE_AT) {
-                table.map.retain(|_, weak| weak.strong_count() > 0);
-                table.prune_at = 2 * table.map.len();
-            }
-            table.map.insert(hash, weak);
+            table.store(hash, weak);
         });
     }
 

@@ -6,6 +6,11 @@ All notable changes to Luma are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Recording lazy operations costs less host time: the table that makes equal operations on equal operands one node (`ConsTable`) is a fixed, growing 4-way set table instead of a hash map swept for dead entries, a node takes its operands over instead of cloning them, a `ViewMap` hashes in nine words instead of thirty-odd and `FxHasher::write` reads eight bytes at a time. The host time of recording a CFD step (`cfd/*_build_step`) drops by about 10 % on an RTX 3090 host; results are unchanged.
+- luma-bench `jit` suite: `launchcost/*` cases (dependent chains of tiny elementwise, reduction, matmul launches and scalar readbacks).
+
 ### Added
 
 - `Array::matmul_batched` / `matmul_batched()`: a batch of matrix products in one launch, `[K, M, B]` times `[N, K, B]` as `[N, M, B]` (the batch along axes 2 and 3; an operand without the batch, `[N, K]`, is shared by every product, like the weights of a layer). Products up to 128 on a side (`K` up to 1024) run in a kernel in which a workgroup computes the output tile of one product or of several small ones (4x4 outputs per invocation, 16-wide slices of `K` staged in workgroup memory, `src/bmm.rs`); bigger ones are one `matmul` each, as is a single product. On the CPU backend a workgroup is a whole product multiplied by `matrixmultiply`, spread over the cores (a few big products are left to `matmul`'s tiles). On an RTX 3090 4096 products of 32x32x32 take 0.07 ms (CUDA; 3.9 TFLOP/s, at the memory bandwidth), against 1.3 ms for the same batch as a broadcast multiply fused into a reduction (`(&a * &b).sum_axis(0)`, 200 GFLOP/s) and 0.87 ms for 256 of them as a loop of `matmul` (19 GFLOP/s). The `ml/batched` bench cases compare the three.
