@@ -226,9 +226,10 @@ async fn request_device() -> Result<Gpu, BackendError> {
     // The instance and the adapter are opened once per process: the Vulkan loader and the driver
     // take about 70 ms for them, and every further device of the process (contexts alive at the
     // same time each have one) reuses them. Only `acquire` calls this, under `OPENING`.
-    let adapter = {
-        let mut shared = lock(&ADAPTER);
-        if shared.is_none() {
+    let cached = lock(&ADAPTER).as_ref().map(|(_, adapter)| adapter.clone());
+    let adapter = match cached {
+        Some(adapter) => adapter,
+        None => {
             let instance = wgpu::Instance::new(instance_desc);
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
@@ -237,9 +238,9 @@ async fn request_device() -> Result<Gpu, BackendError> {
                 })
                 .await
                 .map_err(|e| BackendError::NoAdapter(e.to_string()))?;
-            *shared = Some((instance, adapter));
+            *lock(&ADAPTER) = Some((instance, adapter.clone()));
+            adapter
         }
-        shared.as_ref().map(|(_, adapter)| adapter.clone()).expect("set above")
     };
     // Software rasterizers (llvmpipe, SwiftShader, WARP) are never used: the cpu backend runs
     // on the CPU natively and faster.

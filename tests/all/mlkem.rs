@@ -4,10 +4,10 @@
 
 #[allow(dead_code)]
 #[path = "../../examples/mlkem.rs"]
-mod mlkem;
+mod example;
 
 use luma::*;
-use mlkem::{complete, download, params, upload, verify, verify_acvp};
+use example::{complete, download, params, upload, verify, verify_acvp};
 
 #[test]
 fn random_instances_match_the_ml_kem_crate() {
@@ -30,12 +30,12 @@ fn keygen_from(blocks: usize) -> usize {
     let n = 16;
     let d: Vec<Vec<u8>> = (0..n).map(|i| (0..32).map(|b| (i * 31 + b * 7 + 1) as u8).collect()).collect();
     let z: Vec<Vec<u8>> = (0..n).map(|i| (0..32).map(|b| (i * 13 + b * 11 + 5) as u8).collect()).collect();
-    let mut kem = mlkem::Kem::new(&ctx, p, n).unwrap();
+    let mut kem = example::Kem::new(&ctx, p, n).unwrap();
     kem.blocks = blocks;
     let (d_w, z_w) = (upload(&ctx, &d).unwrap(), upload(&ctx, &z).unwrap());
     let (ek, _) = complete(&mut kem, |kem| kem.keygen(&d_w, &z_w), |(ek, dk)| eval_all(&[ek, dk])).unwrap();
     for (i, ek) in download(&ek).unwrap().iter().enumerate() {
-        assert_eq!(*ek, mlkem::host::keygen(p, d[i].as_slice().try_into().unwrap(), z[i].as_slice().try_into().unwrap()).ek, "instance {i}");
+        assert_eq!(*ek, example::host::keygen(p, d[i].as_slice().try_into().unwrap(), z[i].as_slice().try_into().unwrap()).ek, "instance {i}");
     }
     kem.blocks
 }

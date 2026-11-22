@@ -5,9 +5,9 @@
 
 #[allow(dead_code)]
 #[path = "../../examples/keccak.rs"]
-mod keccak;
+mod example;
 
-use keccak::{bytes, instance_bytes, message_words, read_all, sponge, sponge_host};
+use example::{bytes, instance_bytes, message_words, read_all, sponge, sponge_host};
 use luma::*;
 
 #[test]

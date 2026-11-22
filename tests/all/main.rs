@@ -1,6 +1,8 @@
 //! Every integration test in one binary: the tests run as threads of one process, so the device is opened once.
 //! `flush` (wall-clock timing) and `binding_limit` (sets an environment variable) own their processes.
 #![recursion_limit = "256"]
+// `keccak` and `mlkem` each load the example they test, and the mlkem example loads the keccak one: two copies, as in separate binaries.
+#![allow(clippy::duplicate_mod)]
 
 mod common;
 
